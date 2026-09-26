@@ -51,6 +51,7 @@ pub mod panel;
 mod paragraph;
 pub mod pasteboard;
 mod pasteboard_manager;
+pub mod quartzcore;
 pub mod raster;
 mod responder;
 pub mod screen;
@@ -93,6 +94,7 @@ pub fn bootstrap() {
         paragraph::install();
         backing::install();
         layer::install();
+        quartzcore::install();
         text::install();
         input_context::install();
         opengl::install();
@@ -238,6 +240,7 @@ pub fn data_symbols() -> Vec<(String, u64)> {
     let mut out = classes::class_data();
     out.extend(coretext::data_symbols());
     out.extend(cgcontext::data_symbols());
+    out.extend(appearance::name_cells());
     out.push(("_NSApp".to_string(), ns_app_cell()));
     out.push((
         "_CGAffineTransformIdentity".to_string(),

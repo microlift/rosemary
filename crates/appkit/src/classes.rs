@@ -28,6 +28,12 @@ static HIERARCHY: &[(&str, Option<&str>, usize)] = &[
         Some("CALayer"),
         crate::layer::METAL_INSTANCE_SIZE,
     ),
+    // QuartzCore's transaction scope. The guest opens and commits these around
+    // single property changes - ten `+begin` and nineteen `+commit` - so
+    // without the class the first one aborts by name; see `crate::quartzcore`.
+    // The runtime's own unbound-import report names it and where it comes from:
+    // "_OBJC_CLASS_$_CATransaction from .../QuartzCore.framework".
+    ("CATransaction", None, 0),
     ("NSControl", Some("NSView"), 0),
     ("NSButton", Some("NSControl"), 0),
     ("NSTextField", Some("NSControl"), 0),
@@ -91,6 +97,13 @@ static HIERARCHY: &[(&str, Option<&str>, usize)] = &[
         None,
         crate::cursor::TRACKING_AREA_INSTANCE_SIZE,
     ),
+    // Apple's header puts this one in Foundation rather than AppKit, so
+    // `crates/foundation/src/classes.rs` is where it belongs; it is here only
+    // because that file is not this one's to edit. `register` returns an
+    // existing class rather than failing, so declaring it twice is harmless.
+    // The unbound-import report agrees about the framework:
+    // "_OBJC_CLASS_$_NSAssertionHandler from .../Foundation.framework".
+    ("NSAssertionHandler", None, 0),
 ];
 
 pub fn install() {

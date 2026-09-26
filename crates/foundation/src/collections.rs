@@ -411,6 +411,125 @@ unsafe extern "C" fn dictionary_with_contents_of_file(_class: Id, _sel: Sel, pat
     crate::objectify::object(&value, &path)
 }
 
+/// `NSCocoaErrorDomain`'s codes for the ways reading a property list can fail,
+/// from the enumeration Apple documents as `NSCocoaErrorDomain`.
+///
+/// Each is chosen from the condition that actually happened rather than from one
+/// catch-all, because a code that names the wrong cause is worse than one that
+/// names none - a caller switches on it. `NSFileNoSuchFileError` is `4`,
+/// `NSFileReadUnknownError` is `256`, `NSFileReadNoPermissionError` is `257`,
+/// `NSFileReadUnsupportedSchemeError` is `262`, and
+/// `NSPropertyListReadCorruptError` is `3840` - the last being the same number,
+/// with the same meaning, that `crate::json` already reports for a document that
+/// is not a readable plist.
+mod cocoa {
+    pub const FILE_NO_SUCH_FILE: i64 = 4;
+    pub const FILE_READ_UNKNOWN: i64 = 256;
+    pub const FILE_READ_NO_PERMISSION: i64 = 257;
+    pub const FILE_READ_UNSUPPORTED_SCHEME: i64 = 262;
+    pub const PROPERTY_LIST_READ_CORRUPT: i64 = 3840;
+}
+
+/// `+[NSDictionary dictionaryWithContentsOfURL:error:]`: the two-argument
+/// spelling of the same question `+dictionaryWithContentsOfFile:` answers, with
+/// the out-parameter Apple's signature adds.
+///
+/// Both halves of the out-parameter's contract are load-bearing, and the second
+/// is the one that is easy to get wrong:
+///
+/// * **`*error` is written on every path, including success** - where it is
+///   written with nil. The guest pre-zeroes its slot at `0x470eec3`
+///   (`mov QWORD PTR [rbp-0x80], 0x0`) and reads it back at `0x470eeed`, so a
+///   success that did not write would leave the caller's own zero in place by
+///   luck and anything else by a stack that happened to hold something.
+/// * **a null `error:` is never written through.** Four of this guest's five
+///   sites pass `xor ecx,ecx`. A null out-parameter means the caller does not
+///   want to be told, and writing through it anyway is a store to whatever that
+///   address happens to be.
+///
+/// Only a `file:` URL is read, which is what
+/// `corefoundation::url::Contents::file_path` already refuses to answer for
+/// anything else - so an `https:` URL is a *named* failure here rather than a
+/// path component that would be opened.
+unsafe extern "C" fn dictionary_with_contents_of_url_error(
+    _class: Id,
+    _sel: Sel,
+    url: Id,
+    error: *mut Id,
+) -> Id {
+    let fail = |code: i64, message: String| -> Id {
+        // A null out-parameter means the caller does not want to be told.
+        if !error.is_null() {
+            let object = crate::error::make("NSCocoaErrorDomain", code, &message);
+            // SAFETY: the caller said this is where the error goes, and `object`
+            // is the autoreleased error this call just made.
+            unsafe { *error = object };
+        }
+        std::ptr::null_mut()
+    };
+
+    // SAFETY: the caller's `NSURL`, or null.
+    let contents = match unsafe { corefoundation::url::as_url(url.cast()) } {
+        Some(contents) if contents.is_file_url() => contents,
+        Some(contents) => {
+            return fail(
+                cocoa::FILE_READ_UNSUPPORTED_SCHEME,
+                format!(
+                    "a {} URL is not a file, and a property list is read from disk",
+                    contents.scheme()
+                ),
+            );
+        }
+        None => {
+            return fail(
+                cocoa::FILE_READ_UNSUPPORTED_SCHEME,
+                "not a URL this runtime can read a file from".to_string(),
+            );
+        }
+    };
+    let Some(path) = contents.file_path() else {
+        return fail(
+            cocoa::FILE_READ_UNSUPPORTED_SCHEME,
+            "a file URL with no path".to_string(),
+        );
+    };
+    // The guest named it, so it is read at this host's spelling.
+    let bytes = match std::fs::read(prefix::ns::host_path(&path)) {
+        Ok(bytes) => bytes,
+        Err(problem) => {
+            let code = match problem.kind() {
+                std::io::ErrorKind::NotFound => cocoa::FILE_NO_SUCH_FILE,
+                std::io::ErrorKind::PermissionDenied => cocoa::FILE_READ_NO_PERMISSION,
+                _ => cocoa::FILE_READ_UNKNOWN,
+            };
+            return fail(code, format!("{path}: {problem}"));
+        }
+    };
+    let value = match crate::plist::parse(&bytes) {
+        Ok(value) => value,
+        Err(problem) => {
+            return fail(
+                cocoa::PROPERTY_LIST_READ_CORRUPT,
+                format!("{path}: {problem}"),
+            );
+        }
+    };
+    if !matches!(value, crate::plist::Value::Dictionary(_)) {
+        return fail(
+            cocoa::PROPERTY_LIST_READ_CORRUPT,
+            format!("{path}: the property list's root is not a dictionary"),
+        );
+    }
+    // Success writes nil through the out-parameter, which is the half of the
+    // contract a caller that inspects its own slot depends on.
+    if !error.is_null() {
+        // SAFETY: the caller said this is where the error goes, and there is
+        // none to report.
+        unsafe { *error = std::ptr::null_mut() };
+    }
+    crate::objectify::object(&value, &path)
+}
+
 /// `-writeToFile:atomically:`.
 ///
 /// The atomic flag is honoured by writing beside the target and renaming, which
@@ -1352,6 +1471,96 @@ unsafe extern "C" fn number_with_bool(_class: Id, _sel: Sel, value: bool) -> Id 
     collections::boolean(value) as Id
 }
 
+// ---------------------------------------------------------------- the unsigned family
+//
+// Every `unsigned` spelling is the same two lines of arithmetic, so they are one
+// function each and the interesting part is the *width*, which is read off the
+// call sites rather than assumed:
+//
+//   `mov edx, 0x10a00`                     -> 32-bit in `edx`  -> `I`, `numberWithUnsignedInt:`
+//   `mov rdx, rax` (a 64-bit value)        -> 64-bit in `rdx`  -> `Q`, `numberWithUnsignedLong:`
+//   `mov rdx, rax` (a 64-bit value)        -> 64-bit in `rdx`  -> `Q`, `numberWithUnsignedInteger:`
+//
+// `unsigned long` and `NSUInteger` are both eight bytes on LP64, which is why
+// the two `Q` encodings above are the same and not a guess about which is which:
+// `test/tools/raw-range.py 0x80533a1:0x80533c1` for the first and
+// `0x3a87113:0x3a87120` for the second, and both load a full `rax`.
+//
+// There is no unsigned `CFNumberType` - Apple has `SInt8`..`SInt64` and
+// `Float32`/`Float64` and nothing else - so an unsigned value is stored in the
+// signed type of the same width, which is what `canonical_number_type` already
+// returns. The value widens by sign extension, because that is the conversion
+// from the 32- or 64-bit unsigned the caller passed to the 64-bit signed cell
+// this runtime keeps it in, and it is the conversion the already-installed
+// truncating accessors undo: `-unsignedIntValue` of `numberWithUnsignedInt:` is
+// `0xffff_ffff` for a caller who passed `0xffff_ffff`, and `-longLongValue` of
+// it is `-1`.
+
+unsafe extern "C" fn number_with_unsigned_char(_class: Id, _sel: Sel, value: u8) -> Id {
+    // SAFETY: a fresh object.
+    unsafe {
+        api::CFAutorelease(collections::new_number_of_type(
+            collections::Number::Integer(value as i64),
+            collections::number_type::SINT8,
+        )) as Id
+    }
+}
+
+unsafe extern "C" fn number_with_unsigned_short(_class: Id, _sel: Sel, value: u16) -> Id {
+    // SAFETY: a fresh object.
+    unsafe {
+        api::CFAutorelease(collections::new_number_of_type(
+            // Sign extension, as above: the cell is `SINT16`.
+            collections::Number::Integer(value as i16 as i64),
+            collections::number_type::SINT16,
+        )) as Id
+    }
+}
+
+unsafe extern "C" fn number_with_unsigned_int(_class: Id, _sel: Sel, value: u32) -> Id {
+    // SAFETY: a fresh object.
+    unsafe {
+        api::CFAutorelease(collections::new_number_of_type(
+            // **Sign** extension, per the rule at the top of this group: the
+            // cell is `SINT32`, so the caller's `u32` is reinterpreted as the
+            // `i32` of the same width and *that* widens. `value as i64` would
+            // zero-extend, which puts `0x8000_0000` in a signed cell as
+            // `+2147483648` and makes `-longLongValue` disagree with
+            // `-intValue` for the same object.
+            collections::Number::Integer(value as i32 as i64),
+            collections::number_type::SINT32,
+        )) as Id
+    }
+}
+
+unsafe extern "C" fn number_with_unsigned_long(_class: Id, _sel: Sel, value: u64) -> Id {
+    // SAFETY: a fresh object.
+    unsafe {
+        api::CFAutorelease(collections::new_number_of_type(
+            // Sign extension, as above: the cell is `SINT64`, so the caller's
+            // `u64` is reinterpreted as the `i64` of the same width.
+            collections::Number::Integer(value as i64),
+            collections::number_type::SINT64,
+        )) as Id
+    }
+}
+
+/// `+[NSNumber numberWithFloat:]`: a `float`, so a 32-bit value in `xmm0`.
+///
+/// Read off the call site rather than assumed, because the difference is
+/// observable and silent: `0x804d413` is `movss xmm0, DWORD PTR [rcx+0x4]` - a
+/// 32-bit load - where a `double` would be `movsd` over eight. The stored value
+/// is widened to the `f64` this runtime keeps, which is exact for every `f32`.
+unsafe extern "C" fn number_with_float(_class: Id, _sel: Sel, value: f32) -> Id {
+    // SAFETY: a fresh object.
+    unsafe {
+        api::CFAutorelease(collections::new_number_of_type(
+            collections::Number::Float(value as f64),
+            collections::number_type::FLOAT32,
+        )) as Id
+    }
+}
+
 unsafe extern "C" fn set_with_object(_class: Id, _sel: Sel, object: Id) -> Id {
     let values: &[CFTypeRef] = match object.is_null() {
         true => &[],
@@ -1476,6 +1685,7 @@ pub(crate) fn install() {
         "dictionaryWithObjects:forKeys:count:" => dictionary_with_objects_for_keys_count, c"@40@0:8^@16^@24Q32";
         "dictionaryWithObject:forKey:" => dictionary_with_object_for_key, c"@32@0:8@16@24";
         "dictionaryWithContentsOfFile:" => dictionary_with_contents_of_file, c"@24@0:8@16";
+        "dictionaryWithContentsOfURL:error:" => dictionary_with_contents_of_url_error, c"@32@0:8@16^@24";
     });
     methods!(mutable_dictionary, {
         "init" => init_mutable_dictionary, c"@16@0:8";
@@ -1584,6 +1794,7 @@ pub(crate) fn install() {
         "numberWithLongLong:" => number_with_integer, c"@24@0:8q16";
         "numberWithDouble:" => number_with_double, c"@24@0:8d16";
         "numberWithBool:" => number_with_bool, c"@24@0:8B16";
+<<<<<<< HEAD
         "numberWithUnsignedInteger:" => number_with_unsigned_long, c"@24@0:8Q16";
         "numberWithUnsignedLong:" => number_with_unsigned_long, c"@24@0:8Q16";
         "numberWithUnsignedLongLong:" => number_with_unsigned_long, c"@24@0:8Q16";
@@ -1592,6 +1803,344 @@ pub(crate) fn install() {
         "numberWithUnsignedShort:" => number_with_unsigned_short, c"@24@0:8S16";
         "numberWithChar:" => number_with_char, c"@24@0:8c16";
         "numberWithUnsignedChar:" => number_with_unsigned_char, c"@24@0:8C16";
+=======
+        // The unsigned spellings, each with the width its call site loads. The
+        // guest sends `numberWithUnsignedInt:`, `numberWithUnsignedLong:`,
+        // `numberWithUnsignedInteger:`, `numberWithFloat:` and
+        // `numberWithUnsignedChar:`; the short and long-long pair complete the
+        // family and cost one line each.
+        "numberWithUnsignedChar:" => number_with_unsigned_char, c"@24@0:8C16";
+        "numberWithUnsignedShort:" => number_with_unsigned_short, c"@24@0:8S16";
+        "numberWithUnsignedInt:" => number_with_unsigned_int, c"@24@0:8I16";
+        "numberWithUnsignedLong:" => number_with_unsigned_long, c"@24@0:8Q16";
+        "numberWithUnsignedLongLong:" => number_with_unsigned_long, c"@24@0:8Q16";
+        "numberWithUnsignedInteger:" => number_with_unsigned_long, c"@24@0:8Q16";
+>>>>>>> d861fbb (wtv)
         "numberWithFloat:" => number_with_float, c"@24@0:8f16";
     });
+}
+
+#[cfg(test)]
+mod tier1_tests {
+    use super::*;
+
+    fn class(name: &std::ffi::CStr) -> Id {
+        crate::bootstrap();
+        objc::class::ptr(objc::class::lookup(name).expect("registered")) as Id
+    }
+
+    /// Send through the runtime's own dispatch, the way a guest does, so the
+    /// test exercises the installed method rather than the function beside it.
+    ///
+    /// # Safety
+    ///
+    /// `A` and `R` must be the method's real argument and return types.
+    unsafe fn send<A, R>(receiver: Id, name: &str, arg: A) -> R {
+        // SAFETY: the caller's obligation.
+        unsafe {
+            let f: unsafe extern "C" fn(Id, Sel, A) -> R =
+                std::mem::transmute(objc::msg::entry());
+            f(receiver, objc::sel::get(name), arg)
+        }
+    }
+
+    /// A number made by a `+numberWith…` factory reads back the value that was
+    /// written, through **both** the signed and the unsigned accessor of the
+    /// same width.
+    ///
+    /// Both halves matter and the pair is the point: a factory that stored the
+    /// value zero-extended would pass a `-longLongValue` check and fail
+    /// `-unsignedIntValue`, and the reverse is equally silent. The values are
+    /// chosen to have different top bits, so an accidental sign or zero extension
+    /// cannot pass both.
+    #[test]
+    fn an_unsigned_number_reads_back_as_signed_and_unsigned() {
+        crate::bootstrap();
+        let number = class(c"NSNumber");
+        // SAFETY: each prototype is the one its selector declares, and the
+        // widths are those read off the guest's call sites.
+        unsafe {
+            let from_unsigned_int = send(number, "numberWithUnsignedInt:", 0x8000_0001u32);
+            assert_eq!(crate::number_of(from_unsigned_int), Some(-2147483647));
+            assert_eq!(
+                send::<(), u32>(from_unsigned_int, "unsignedIntValue", ()),
+                0x8000_0001
+            );
+
+            // The 64-bit spellings: `unsigned long` and `NSUInteger`, both of
+            // which the guest loads as a full `rax`.
+            let from_unsigned_long = send(number, "numberWithUnsignedLong:", 0x8000_0000_0000_0001u64);
+            assert_eq!(
+                crate::number_of(from_unsigned_long),
+                Some(i64::MIN + 1),
+                "an unsigned 64-bit value widens by sign extension"
+            );
+            assert_eq!(
+                send::<(), u64>(from_unsigned_long, "unsignedLongLongValue", ()),
+                0x8000_0000_0000_0001,
+                "and the unsigned accessor recovers the bits that were written"
+            );
+
+            let from_unsigned_integer =
+                send(number, "numberWithUnsignedInteger:", 0xffff_ffff_ffff_ffffu64);
+            assert_eq!(
+                send::<(), u64>(from_unsigned_integer, "unsignedLongLongValue", ()),
+                u64::MAX
+            );
+        }
+    }
+
+    /// `+numberWithFloat:` is a `float`, so a value a `double` could not hold
+    /// exactly must not come back as one that it can - that would mean the 32-bit
+    /// argument was widened somewhere it should not have been.
+    #[test]
+    fn a_float_is_stored_at_float_precision() {
+        crate::bootstrap();
+        let number = class(c"NSNumber");
+        // 0.1 is not representable in binary; its `f32` neighbour is what the
+        // guest's `movss` load produces, and reading it back must give that
+        // neighbour rather than the `f64` the caller wrote in the source.
+        let made = unsafe { send(number, "numberWithFloat:", 0.1f32) };
+        // SAFETY: the value is a number.
+        let as_f32 = unsafe { send::<(), f32>(made, "floatValue", ()) };
+        assert_eq!(as_f32, 0.1f32);
+        // SAFETY: the value is a number.
+        let as_f64 = unsafe { send::<(), f64>(made, "doubleValue", ()) };
+        assert_eq!(
+            as_f64,
+            0.1f32 as f64,
+            "the value widened from the float that was passed, not from a double"
+        );
+        assert_ne!(as_f64, 0.1f64, "so it is not the double the source spelled");
+    }
+
+    /// The whole `numberWith` family is installed, and each carries the encoding
+    /// its argument width implies.
+    ///
+    /// Asserted on the encodings rather than only on behaviour, because a wrong
+    /// width is what makes an `objc_msgSend` read the wrong register: the guest
+    /// loads a 32-bit immediate for `numberWithUnsignedInt:` and a full `rax` for
+    /// `numberWithUnsignedInteger:`, and an implementation declaring the other's
+    /// width would still pass a value round-trip on a host where both arrive in
+    /// the same register.
+    #[test]
+    fn the_number_factory_encodings_are_the_widths_the_guest_loads() {
+        crate::bootstrap();
+        let number = objc::class::lookup(c"NSNumber").expect("NSNumber");
+        let expected = [
+            ("numberWithInt:", c"@24@0:8i16"),
+            ("numberWithInteger:", c"@24@0:8q16"),
+            ("numberWithLong:", c"@24@0:8q16"),
+            ("numberWithLongLong:", c"@24@0:8q16"),
+            ("numberWithDouble:", c"@24@0:8d16"),
+            ("numberWithBool:", c"@24@0:8B16"),
+            ("numberWithUnsignedChar:", c"@24@0:8C16"),
+            ("numberWithUnsignedShort:", c"@24@0:8S16"),
+            ("numberWithUnsignedInt:", c"@24@0:8I16"),
+            ("numberWithUnsignedLong:", c"@24@0:8Q16"),
+            ("numberWithUnsignedLongLong:", c"@24@0:8Q16"),
+            ("numberWithUnsignedInteger:", c"@24@0:8Q16"),
+            ("numberWithFloat:", c"@24@0:8f16"),
+        ];
+        for (name, types) in expected {
+            let method = number
+                .metaclass()
+                .method(objc::sel::get(name))
+                .unwrap_or_else(|| panic!("+[{name}] is not installed"));
+            // SAFETY: a registered method's types are a NUL-terminated string.
+            let declared = unsafe { std::ffi::CStr::from_ptr(method.types()) };
+            assert_eq!(declared, types, "+[{name}] declares the wrong width");
+        }
+    }
+
+    /// `+[NSDictionary dictionaryWithContentsOfURL:error:]` reads a real plist
+    /// and clears the out-parameter.
+    ///
+    /// The clearing is the half a caller can be hurt by silently: the guest
+    /// zeroes its own slot and reads it back (`0x470eec3` / `0x470eeed`), so a
+    /// success that did not write would leave whatever the stack held. The slot
+    /// is therefore pre-loaded with a **non-null canary** - not a null, which
+    /// would pass whether or not anything was written - and the assertion is that
+    /// the call cleared it.
+    #[test]
+    fn a_plist_url_reads_the_dictionary_and_clears_the_error_out_parameter() {
+        crate::bootstrap();
+        let directory = std::env::temp_dir().join("rosetta3-tier1-plist");
+        std::fs::create_dir_all(&directory).expect("a temporary directory");
+        let path = directory.join("Brand.plist");
+        std::fs::write(
+            &path,
+            br#"<?xml version="1.0"?>
+               <plist version="1.0"><dict>
+                 <key>KSBrandID</key><string>GGGL</string>
+                 <key>CFBundleName</key><string>Chromium</string>
+               </dict></plist>"#,
+        )
+        .expect("a plist to write");
+
+        // SAFETY: `+fileURLWithPath:` is `id (Class, SEL, NSString *)`.
+        let url: Id = unsafe {
+            send(
+                class(c"NSURL"),
+                "fileURLWithPath:",
+                crate::string::from_str(&path.to_string_lossy()),
+            )
+        };
+        assert!(!url.is_null());
+
+        let canary = crate::string::from_str("not an error, and not nil");
+        let mut out = canary;
+        // SAFETY: `+dictionaryWithContentsOfURL:error:` is
+        // `id (Class, SEL, id, NSError **)`.
+        let dictionary = unsafe {
+            let f: unsafe extern "C" fn(Id, Sel, Id, *mut Id) -> Id =
+                std::mem::transmute(objc::msg::entry());
+            f(
+                class(c"NSDictionary"),
+                objc::sel::get("dictionaryWithContentsOfURL:error:"),
+                url,
+                &raw mut out,
+            )
+        };
+        assert!(!dictionary.is_null(), "the plist did not read");
+        assert!(
+            out.is_null(),
+            "success must write nil through the out-parameter, not leave it"
+        );
+
+        // Read the way the guest reads it: `-objectForKey:`.
+        // SAFETY: `-objectForKey:` is `id (id, SEL, id)`.
+        let brand = unsafe {
+            send(
+                dictionary,
+                "objectForKey:",
+                crate::string::from_str("KSBrandID"),
+            )
+        };
+        // SAFETY: the value is a string.
+        assert_eq!(unsafe { crate::string::bytes(brand) }, b"GGGL");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// The out-parameter is written on **failure** too, with an error that names
+    /// the cause, and a null out-parameter is never written through.
+    #[test]
+    fn a_failure_writes_an_error_and_a_null_out_parameter_is_left_alone() {
+        crate::bootstrap();
+        // SAFETY: `+fileURLWithPath:` is `id (Class, SEL, NSString *)`.
+        let url = unsafe {
+            send(
+                class(c"NSURL"),
+                "fileURLWithPath:",
+                crate::string::from_str("/nonexistent/rosetta3/no-such.plist"),
+            )
+        };
+        let mut out = crate::string::from_str("canary");
+        // SAFETY: `+dictionaryWithContentsOfURL:error:` is
+        // `id (Class, SEL, id, NSError **)`.
+        let dictionary = unsafe {
+            let f: unsafe extern "C" fn(Id, Sel, Id, *mut Id) -> Id =
+                std::mem::transmute(objc::msg::entry());
+            f(
+                class(c"NSDictionary"),
+                objc::sel::get("dictionaryWithContentsOfURL:error:"),
+                url,
+                &raw mut out,
+            )
+        };
+        assert!(dictionary.is_null(), "a missing file is not a dictionary");
+        assert!(!out.is_null(), "the failure must be reported");
+
+        // SAFETY: `out` is an NSError this runtime made.
+        let code = unsafe { send::<(), i64>(out, "code", ()) };
+        assert_eq!(
+            code, 4,
+            "NSFileNoSuchFileError, which is what a missing file is"
+        );
+        // SAFETY: `out` is an NSError this runtime made.
+        let domain = unsafe { send::<(), Id>(out, "domain", ()) };
+        // SAFETY: the domain is a string.
+        assert_eq!(unsafe { crate::string::bytes(domain) }, b"NSCocoaErrorDomain");
+
+        // Four of the guest's five sites pass a null out-parameter. Writing
+        // through it would be a store to whatever that address happens to be,
+        // so this must answer nil without faulting and without writing.
+        // SAFETY: as above, with a null out-parameter.
+        let none = unsafe {
+            let f: unsafe extern "C" fn(Id, Sel, Id, *mut Id) -> Id =
+                std::mem::transmute(objc::msg::entry());
+            f(
+                class(c"NSDictionary"),
+                objc::sel::get("dictionaryWithContentsOfURL:error:"),
+                url,
+                std::ptr::null_mut(),
+            )
+        };
+        assert!(none.is_null());
+    }
+
+    /// A plist whose root is not a dictionary is a *different* failure from a
+    /// missing file, and reports a different code - a caller switches on it.
+    #[test]
+    fn a_plist_that_is_not_a_dictionary_reports_a_corrupt_plist() {
+        crate::bootstrap();
+        let path = std::env::temp_dir().join("rosetta3-tier1-array.plist");
+        std::fs::write(
+            &path,
+            br#"<?xml version="1.0"?>
+               <plist version="1.0"><array><string>a</string></array></plist>"#,
+        )
+        .expect("a plist to write");
+        // SAFETY: `+fileURLWithPath:` is `id (Class, SEL, NSString *)`.
+        let url: Id = unsafe {
+            send(
+                class(c"NSURL"),
+                "fileURLWithPath:",
+                crate::string::from_str(&path.to_string_lossy()),
+            )
+        };
+        let mut out = crate::string::from_str("canary");
+        // SAFETY: `+dictionaryWithContentsOfURL:error:` is
+        // `id (Class, SEL, id, NSError **)`.
+        let dictionary = unsafe {
+            let f: unsafe extern "C" fn(Id, Sel, Id, *mut Id) -> Id =
+                std::mem::transmute(objc::msg::entry());
+            f(
+                class(c"NSDictionary"),
+                objc::sel::get("dictionaryWithContentsOfURL:error:"),
+                url,
+                &raw mut out,
+            )
+        };
+        assert!(dictionary.is_null());
+        // SAFETY: `out` is an NSError this runtime made.
+        let code = unsafe { send::<(), i64>(out, "code", ()) };
+        assert_eq!(
+            code, 3840,
+            "NSPropertyListReadCorruptError - the same code crate::json reports"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// The two-argument selector is a class method with the four-word encoding,
+    /// and `^@` for the out-parameter - a mistake there would have the guest's
+    /// stack slot read as an object.
+    #[test]
+    fn the_url_error_spelling_is_a_class_method_with_an_out_parameter() {
+        crate::bootstrap();
+        let dictionary = objc::class::lookup(c"NSDictionary").expect("NSDictionary");
+        let sel = objc::sel::get("dictionaryWithContentsOfURL:error:");
+        assert!(
+            dictionary.method(sel).is_none(),
+            "not an instance method"
+        );
+        let method = dictionary
+            .metaclass()
+            .method(sel)
+            .expect("a + method on NSDictionary");
+        // SAFETY: a registered method's types are a NUL-terminated string.
+        let types = unsafe { std::ffi::CStr::from_ptr(method.types()) };
+        assert_eq!(types, c"@32@0:8@16^@24");
+        assert!(!method.implementation().is_null());
+    }
 }

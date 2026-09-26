@@ -152,6 +152,64 @@ fn covering(placed: &[Placed], pc: u64) -> Option<&Placed> {
     (pc < end).then_some(entry)
 }
 
+/// Report the first guest instruction executed inside a nominated address range,
+/// once, with the registers the instruction was about to use.
+///
+/// This exists because **breakpoints do not work on guest code in this setup**,
+/// and the only other way to observe a guest pc is to ask the runtime, which
+/// already knows it. LLDB reports a breakpoint on a guest address `unresolved`
+/// with zero hits - *including at the faulting address itself*, which by
+/// definition executes - so a debugger cannot answer "did the guest ever reach
+/// here?", and a zero hit count from one proves nothing at all.
+///
+/// Named by environment variable, as a pair of guest offsets:
+/// `ROSETTA3_PC_WATCH=0x5d29050,0x5d29300`.
+///
+/// Off unless set. One line per hit, and only the first hit per distinct
+/// address inside the range, so a hot loop cannot flood the log.
+pub fn watch_guest_pc(pc: u64) {
+    /// `ROSETTA3_PC_WATCH=start,end` - guest offsets, not host addresses.
+    const ENV: &str = "ROSETTA3_PC_WATCH";
+    /// Cap on distinct addresses reported, so a loop inside the range cannot
+    /// produce an unbounded log.
+    const MAX_REPORTED: usize = 8;
+
+    use std::sync::Mutex;
+    static SEEN: Mutex<Vec<u64>> = Mutex::new(Vec::new());
+
+    let Attribution::Instruction { guest_va, .. } = attribute(pc) else {
+        return;
+    };
+    let Ok(spec) = std::env::var(ENV) else {
+        return;
+    };
+    let Some((start, end)) = spec.split_once(',').and_then(|(a, b)| {
+        let a = u64::from_str_radix(a.trim().trim_start_matches("0x"), 16).ok()?;
+        let b = u64::from_str_radix(b.trim().trim_start_matches("0x"), 16).ok()?;
+        Some((a, b))
+    }) else {
+        return;
+    };
+    if guest_va < start || guest_va >= end {
+        return;
+    }
+    {
+        let Ok(mut seen) = SEEN.lock() else {
+            return;
+        };
+        if seen.contains(&guest_va) || seen.len() >= MAX_REPORTED {
+            return;
+        }
+        seen.push(guest_va);
+    }
+    let line = format!(
+        "rosetta3: PC_WATCH guest instruction at Framework+{guest_va:#x} \
+         (host {pc:#x})\n"
+    );
+    // SAFETY: a live buffer for the length written.
+    unsafe { libc::write(2, line.as_ptr().cast(), line.len()) };
+}
+
 /// Which guest code a host `pc` is, if it is any.
 pub fn attribute(pc: u64) -> Attribution {
     let placed = PLACED.lock().unwrap_or_else(|e| e.into_inner());
@@ -806,6 +864,9 @@ fn say_controller(out: &mut Buffer, context: *mut libc::c_void) {
         return;
     };
     let pc = offset;
+    // Report a nominated range from here too, so `ROSETTA3_PC_WATCH` still works
+    // on a run that faults inside the range. See `watch_guest_pc`.
+    watch_guest_pc(host_pc(context).unwrap_or(0));
     // second base's vptr at the subobject offset, and every caller of this
     // function passes `this - 0xf0`, so `r14` is the `ThreadControllerImpl*`.
     #[cfg(target_arch = "x86_64")]
@@ -890,9 +951,14 @@ fn say_controller(out: &mut Buffer, context: *mut libc::c_void) {
     out.str("\n       either the bind did not run or its effect is gone.");
     out.str("\n    -> the vtable pair above is 0x108 apart, which is the 0x270");
     out.str("\n       class (0xe268490/0xe268598), NOT the 0x180 one (0xb8 apart).");
-    out.str("\n       So this IS the class the bound factory builds, and that");
-    out.str("\n       factory calls the bind at 0x5d29254. The contradiction is");
-    out.str("\n       real and unexplained: do not paper over it.");
+    out.str("\n    -> RESOLVED: +0x150 is set at Framework+0x5d454f1, four");
+    out.str("\n       instructions AFTER the +0x218 store at 0x5d454d7, in the");
+    out.str("\n       same function. So +0x150 == 1 PROVES the bind ran to");
+    out.str("\n       completion - the field WAS written.");
+    out.str("\n    -> and something cleared it: the destructor at 0x5d45030");
+    out.str("\n       frees the cell and then does");
+    out.str("\n         5d4514e  mov QWORD PTR [rbx+0x218], 0x0");
+    out.str("\n       So the object was torn down and then pumped again.");
 }
 
 /// Name the unbound import a jump to zero went through.

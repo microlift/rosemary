@@ -85,12 +85,66 @@ unsafe fn autorelease(font: *const std::ffi::c_void) -> Id {
     unsafe { corefoundation::api::CFAutorelease(font) as Id }
 }
 
+/// `+[NSFont systemFontSize]`.
+///
+/// **Refused by name, because no source for the number was found - not because
+/// the number is hard to compute.**
+///
+/// Apple's own documentation for the symbol is the whole of what it says, and
+/// it names no value:
+///
+/// > Returns the size of the standard system font.
+/// >
+/// > The standard system font size in points.
+///
+/// (`NSFont/systemFontSize`, developer.apple.com, fetched while writing this.)
+/// There is no value to copy, and on a current macOS there would not be a
+/// constant to copy: the answer tracks the Accessibility "Text size" setting.
+/// This host has no such setting, so it has no such number.
+///
+/// The guest's use of the answer is what makes a guess worse than a refusal
+/// rather than merely no better. `Framework+[0x6949100,0x69491b0)` is a shared
+/// accessor for `systemFontOfSize:`, `menuFontOfSize:` and `toolTipsFontOfSize:`,
+/// and when its argument is 0 it asks this method for the default
+/// (`Framework+0x694914b`, then `cvttsd2si` at `+0x6949151`, so that site wants
+/// only an integer). `Framework+[0x694a470,0x694a500)` truncates the same way at
+/// `+0x694a498`. But `Framework+0x8b6d9fd` passes the answer **straight back**
+/// into `+[NSFont systemFontOfSize:]` with the full `CGFloat` still in `xmm0`,
+/// so there the value becomes the point size of a real font. Nothing on that
+/// path faults and nothing on it reports anything: a wrong number produces text
+/// laid out at a size nobody chose, which is the outcome this project treats as
+/// the worst one available.
+///
+/// Under `ROSETTA3_LOG_UNRECOGNIZED` it says so once and answers 0.0, so a
+/// diagnostic run can walk past it to the rest of the queue - the same trade the
+/// runtime's own unrecognized-selector path makes, and said in as many words,
+/// because a 0-point font is not an answer.
+unsafe extern "C" fn system_font_size(_class: Id, _sel: Sel) -> f64 {
+    const WHY: &str = "+[NSFont systemFontSize]: Apple's documentation names no value for it \
+         (it tracks the Accessibility \"Text size\" setting, and this host has no such \
+         setting), and Framework+0x8b6d9fd feeds the answer straight into \
+         +[NSFont systemFontOfSize:] as a point size - so any number here would be a wrong \
+         font size that reported nothing";
+    if objc::msg::logging_unrecognised() {
+        static REPORTED: std::sync::Once = std::sync::Once::new();
+        REPORTED.call_once(|| {
+            eprintln!("rosetta3: appkit: {WHY}; answering 0.0 so the run can continue");
+        });
+        return 0.0;
+    }
+    objc::fail!(
+        "{WHY}. Refusing is the answer; give this host a system font size deliberately \
+         if it is to have one"
+    );
+}
+
 pub(crate) fn install() {
     let class = objc::class::lookup(c"NSFont").expect("declared before its methods");
     class_methods!(class, {
         "fontWithName:size:" => font_with_name, c"@32@0:8@16d24";
         "systemFontOfSize:" => system_font_of_size, c"@24@0:8d16";
         "boldSystemFontOfSize:" => system_font_of_size, c"@24@0:8d16";
+        "systemFontSize" => system_font_size, c"d16@0:8";
     });
 
     let class = objc::class::lookup(c"NSFontManager").expect("declared before its methods");
@@ -138,5 +192,42 @@ mod tests {
             corefoundation::api::CFRelease(family.cast());
             corefoundation::api::CFRelease(face.cast());
         }
+    }
+
+    /// `+[NSFont systemFontSize]` refuses, so there is no value to assert. What
+    /// *is* assertable, and is the point, is that the class **answers** the
+    /// selector: a bound method that stops and names itself, not an
+    /// unrecognized-selector abort and not a silent number.
+    ///
+    /// The distinction is the whole of it. Left unregistered, the guest's send
+    /// lands on the runtime's unrecognized path, which under
+    /// `ROSETTA3_LOG_UNRECOGNIZED` answers 0 in `xmm0` without a word - and
+    /// `Framework+0x8b6d9fd` feeds that straight into a point size. A 0-point
+    /// font is invisible text and says nothing, which is the failure this
+    /// project is built to avoid.
+    #[test]
+    fn the_system_font_size_is_a_bound_named_refusal() {
+        crate::bootstrap();
+        let class = objc::class::lookup(c"NSFont").expect("NSFont");
+        let method = class
+            .metaclass()
+            .method(objc::sel::get("systemFontSize"))
+            .expect("+[NSFont systemFontSize] is answered");
+        // Not the runtime's forwarding placeholder, which is what an
+        // unimplemented selector resolves to.
+        assert_ne!(
+            method.implementation() as usize,
+            objc::msg::forward() as usize
+        );
+        // And the guest reads the answer as a `CGFloat` out of `xmm0`, so the
+        // encoding has to be the one that says so.
+        // SAFETY: a method's type encoding is a NUL-terminated string the
+        // runtime owns.
+        let types = unsafe { std::ffi::CStr::from_ptr(method.types()) };
+        assert_eq!(
+            types.to_str().ok(),
+            Some("d16@0:8"),
+            "+[NSFont systemFontSize] takes self and _cmd and returns a CGFloat"
+        );
     }
 }

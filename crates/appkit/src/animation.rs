@@ -16,7 +16,7 @@ const BLOCK_INVOKE_OFFSET: usize = 16;
 /// # Safety
 ///
 /// `block` must be null or a block literal.
-unsafe fn invoke(block: Id) -> Option<*const c_void> {
+pub(crate) unsafe fn invoke(block: Id) -> Option<*const c_void> {
     if block.is_null() {
         return None;
     }

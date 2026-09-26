@@ -31,6 +31,8 @@ pub mod audit;
 pub mod backtrace;
 pub mod bsd;
 pub mod callback;
+#[cfg(not(target_os = "macos"))]
+pub mod cg_unavailable;
 pub mod clock;
 pub mod commoncrypto;
 #[cfg(not(target_os = "macos"))]
@@ -403,6 +405,8 @@ static MODULES: &[exports::Module] = &[
     #[cfg(not(target_os = "macos"))]
     wait::MODULE,
     unavailable::MODULE,
+    #[cfg(not(target_os = "macos"))]
+    cg_unavailable::MODULE,
     xpc::MODULE,
 ];
 
