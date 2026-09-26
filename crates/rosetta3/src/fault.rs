@@ -1380,12 +1380,20 @@ mod tests {
 
     fn image(start: u64, end: u64, text: &str) -> Image {
         let (name, used) = named(text);
-        Image { range: (start, end), name, used }
+        Image {
+            range: (start, end),
+            name,
+            used,
+        }
     }
 
     fn stub(at: u64, text: &str) -> Unbound {
         let (name, used) = named(text);
-        Unbound { stub: at, name, used }
+        Unbound {
+            stub: at,
+            name,
+            used,
+        }
     }
 
     #[test]
@@ -1393,16 +1401,27 @@ mod tests {
         // The launcher, then the framework it dlopens - the shape of every
         // Chromium run. Both must stay nameable.
         let mut table = Vec::new();
-        merge_images(&mut table, [image(0x1_0000_0000, 0x1_0003_0000, "Chromium")].into_iter());
         merge_images(
             &mut table,
-            [image(0x7fe9_42e8_4000, 0x7fe9_50f0_0000, "Chromium Framework")].into_iter(),
+            [image(0x1_0000_0000, 0x1_0003_0000, "Chromium")].into_iter(),
+        );
+        merge_images(
+            &mut table,
+            [image(
+                0x7fe9_42e8_4000,
+                0x7fe9_50f0_0000,
+                "Chromium Framework",
+            )]
+            .into_iter(),
         );
         let names: Vec<&[u8]> = table.iter().map(|i| &i.name[..i.used]).collect();
         assert_eq!(names, [&b"Chromium"[..], &b"Chromium Framework"[..]]);
 
         // An image mapped over an old one's range supersedes it.
-        merge_images(&mut table, [image(0x1_0001_0000, 0x1_0002_0000, "later")].into_iter());
+        merge_images(
+            &mut table,
+            [image(0x1_0001_0000, 0x1_0002_0000, "later")].into_iter(),
+        );
         let names: Vec<&[u8]> = table.iter().map(|i| &i.name[..i.used]).collect();
         assert_eq!(names, [&b"later"[..], &b"Chromium Framework"[..]]);
     }
@@ -1410,7 +1429,10 @@ mod tests {
     #[test]
     fn every_links_unbound_stubs_stay_findable_and_sorted() {
         let mut table = Vec::new();
-        merge_unbound(&mut table, [stub(0x1_0002_5a3e, "___cxa_atexit")].into_iter());
+        merge_unbound(
+            &mut table,
+            [stub(0x1_0002_5a3e, "___cxa_atexit")].into_iter(),
+        );
         merge_unbound(
             &mut table,
             [
@@ -1426,8 +1448,14 @@ mod tests {
                 .map(|i| &table[i].name[..table[i].used])
         }
         assert_eq!(find(&table, 0x1_0002_5a3e), Some(&b"___cxa_atexit"[..]));
-        assert_eq!(find(&table, 0x7fe9_4fb2_441a), Some(&b"_os_unfair_lock_trylock"[..]));
-        assert_eq!(find(&table, 0x7fe9_4fb2_4414), Some(&b"_os_unfair_lock_unlock"[..]));
+        assert_eq!(
+            find(&table, 0x7fe9_4fb2_441a),
+            Some(&b"_os_unfair_lock_trylock"[..])
+        );
+        assert_eq!(
+            find(&table, 0x7fe9_4fb2_4414),
+            Some(&b"_os_unfair_lock_unlock"[..])
+        );
 
         // The same stub from a later link replaces, rather than duplicates.
         merge_unbound(&mut table, [stub(0x1_0002_5a3e, "_other")].into_iter());

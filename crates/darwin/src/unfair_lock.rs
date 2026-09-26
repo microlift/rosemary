@@ -129,7 +129,10 @@ fn unlock(word: &AtomicU32) {
     if owner(current) != me {
         // Covers an unlocked lock too: its owner reads as `NOWAITERS`, which is
         // nobody's `me`.
-        crash("Unlock of an os_unfair_lock not owned by current thread", current);
+        crash(
+            "Unlock of an os_unfair_lock not owned by current thread",
+            current,
+        );
     }
     let previous = word.swap(0, Ordering::Release);
     if previous & NOWAITERS == 0 {
@@ -209,7 +212,10 @@ pub unsafe extern "C" fn os_unfair_lock_assert_not_owner(lock: *mut u32) {
     // SAFETY: the caller's contract.
     let current = unsafe { word(lock) }.load(Ordering::Relaxed);
     if owner(current) == me() {
-        crash("Assertion failed: Lock unexpectedly owned by current thread", current);
+        crash(
+            "Assertion failed: Lock unexpectedly owned by current thread",
+            current,
+        );
     }
 }
 
@@ -339,7 +345,10 @@ mod tests {
             .env(CHILD, "1")
             .output()
             .ok()?;
-        Some((String::from_utf8_lossy(&out.stderr).into_owned(), out.status))
+        Some((
+            String::from_utf8_lossy(&out.stderr).into_owned(),
+            out.status,
+        ))
     }
 
     fn assert_died_saying(what: &str) {

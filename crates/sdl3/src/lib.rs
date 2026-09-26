@@ -1074,6 +1074,39 @@ pub mod clipboard {
             unsafe { entry::<unsafe extern "C" fn() -> bool>(handle, "SDL_HasClipboardText")? };
         Some(unsafe { has() })
     }
+
+    /// Whether SDL can be given the desktop clipboard to hand out, which is
+    /// what [`set_text`] asks it to become the owner of.
+    ///
+    /// It can on every backend but one. SDL's X11 backend frees the list of
+    /// formats it was given with the text - on the next
+    /// `SDL_CancelClipboardData`, which that backend calls on itself as soon
+    /// as the clipboard's owner changes to another program - while the part of
+    /// it that answers a `SelectionRequest` keeps pointing at the freed list
+    /// and the count it was given. The next program to ask this one what it
+    /// has to offer is then answered out of memory that has been handed on,
+    /// and SDL passes the first eight bytes of each entry to `XInternAtom` as a
+    /// name: an entry that has since been reused for a small integer is a
+    /// `strlen` of that address, and the process dies inside libX11. SDL
+    /// 3.4.14 does exactly the same, so a newer package is not the way out of
+    /// it, and nothing outside SDL can keep those two copies in step except
+    /// not letting SDL own the selection: a caller that would rather keep the
+    /// process than the desktop clipboard asks this first.
+    ///
+    /// Reading the clipboard stays safe either way - see [`text`], whose data
+    /// SDL fetches from the program that owns it rather than from a list of
+    /// its own - but a board that reads the desktop and cannot publish to it
+    /// is two boards wearing one name, so a caller with a choice should treat
+    /// this as the whole of the answer.
+    ///
+    /// False before video has started, which is also when there is no
+    /// clipboard to hand anything to.
+    pub fn may_own_selection() -> bool {
+        match video::driver_name() {
+            Some(name) => name != c"x11",
+            None => false,
+        }
+    }
 }
 
 pub mod virtual_joystick {
@@ -2836,16 +2869,22 @@ pub mod video {
         unsafe { f(name.as_ptr(), value.as_ptr()) }
     }
 
-    /// Whether SDL's video driver is Wayland's. False until video has
-    /// started, as SDL has no driver to name before then.
-    pub fn is_wayland() -> bool {
+    /// The driver SDL's video came up on, or `None` while there is no video at
+    /// all: SDL has no driver to name before then.
+    pub(crate) fn driver_name() -> Option<&'static CStr> {
         let Some(f) = api().and_then(|a| a.SDL_GetCurrentVideoDriver) else {
-            return false;
+            return None;
         };
         // SAFETY: takes nothing; the answer is null or a static string.
         let name = unsafe { f() };
         // SAFETY: a NUL-terminated string SDL keeps for the process.
-        !name.is_null() && unsafe { CStr::from_ptr(name) } == c"wayland"
+        (!name.is_null()).then(|| unsafe { CStr::from_ptr(name) })
+    }
+
+    /// Whether SDL's video driver is Wayland's. False until video has
+    /// started, as SDL has no driver to name before then.
+    pub fn is_wayland() -> bool {
+        driver_name() == Some(c"wayland")
     }
 
     /// A window's `wl_display` and `wl_surface`, on Wayland.

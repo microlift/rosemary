@@ -441,6 +441,10 @@ unsafe fn receive(
         Ok(taken) => taken,
         Err(code) => return code,
     };
+    // The message is off the port's queue now, which is the only event this
+    // transport can be certain of, and it is what `mach_port_peek`'s sequence
+    // numbers are counted from.
+    seqno::took(arrived_on);
 
     let bytes = &message.bytes;
     if bytes.len() < envelope::FIXED
@@ -702,6 +706,451 @@ pub unsafe extern "C" fn mach_msg_destroy(msg: *mut c_void) {
                 super::space::mach_port_deallocate(space::TASK_SELF, name);
             }
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// `mach_port_peek`: the head of a receive right's queue, read without taking it.
+//
+// ## The return value is the interface, and it has two answers
+//
+// `KERN_SUCCESS` when a message is waiting and `KERN_FAILURE` when none is - not
+// `MACH_RCV_TIMED_OUT`, and not a success reporting a queue of length zero.
+// `ipc_mqueue_peek_locked` answers `1` for a message at the requested sequence
+// number and `0` for nothing there, and `osfmk/ipc/mach_port.c` turns exactly
+// those into `KERN_SUCCESS` and `KERN_FAILURE`.
+//
+// Chromium's `base::WaitableEvent::PeekPort`
+// (`base/synchronization/waitable_event_apple.cc:244`, read at
+// `refs/branch-heads/6723`) is
+//
+// ```c
+//   kern_return_t kr = mach_port_peek(mach_task_self(), port,
+//       MACH_RCV_TRAILER_TYPE(MACH_RCV_TRAILER_NULL), &seqno, &size, &id,
+//       reinterpret_cast<mach_msg_trailer_info_t>(&trailer), &trailer_size);
+//   if (kr == KERN_SUCCESS) return true;
+//   else { MACH_CHECK(kr == KERN_FAILURE, kr) << "mach_port_peek"; return false; }
+// ```
+//
+// and the machine code the shipped framework actually runs, at
+// `Chromium Framework+0x5d9a3a4` with the call at `+0x5d9a3ec`, branches on
+// nothing else: `test eax,eax` for the success, then `cmp eax,0x5` for
+// `KERN_FAILURE`, then a `CHECK` naming `waitable_event_apple.cc` line 251. So a
+// port with an empty queue must answer `KERN_FAILURE`: a success, a timeout, or
+// an invalid-name code all abort the browser instead of letting it poll. This
+// is the first thing a MANUAL-reset `WaitableEvent` meets, because
+// `IsSignaled()` is `PeekPort(name, policy_ == ResetPolicy::AUTOMATIC)` and
+// MANUAL is the default.
+//
+// ## Eight arguments, and the trailer is not what the kernel calls it
+//
+// The header declares nine parameter *types* for the kernel routine and the
+// user call takes eight, because `mach_msg_trailer_info_t` is `char *` and
+// carries the buffer rather than a pointer to a buffer: the argument is the
+// caller's trailer storage itself. The eight, in register order, and where the
+// guest puts each one at `+0x5d9a3c0`:
+//
+// | | argument | guest |
+// |---|---|---|
+// | `rdi` | `ipc_space_t space` | `*mach_task_self_` read through the GOT |
+// | `rsi` | `mach_port_name_t name` | `mov esi,eax` - the caller's own argument |
+// | `rdx` | `mach_msg_trailer_type_t trailer_type` | `xor edx,edx` |
+// | `rcx` | `mach_port_seqno_t *seqno` | `lea rcx,[rbp-0x18]` |
+// | `r8` | `mach_msg_size_t *size` | `lea r8,[rbp-0x14]` |
+// | `r9` | `mach_msg_id_t *id` | `lea r9,[rbp-0x10]` |
+// | `rsp` | `mach_msg_trailer_info_t trailer` | `lea r11,[rbp-0x40]`, pushed |
+// | `rsp+8` | `mach_msg_type_number_t *trailer_size` | `lea r10,[rbp-0xc]`, pushed |
+//
+// The last two are an in/out pair, and the `mov DWORD PTR [rbp-0xc],0x8` just
+// above the call is the guest storing `sizeof(trailer)` into `*trailer_size` -
+// the buffer is eight bytes, and it is the kernel that fills it in.
+
+/// `MACH_RCV_TRAILER_NULL`: the element type that asks for nothing at all.
+///
+/// `MACH_RCV_TRAILER_TYPE(x)` is `((x & 0xf) << 28)`, so the whole word is zero
+/// for the null element type, and `GET_RCV_ELEMENTS(y)` - the field the kernel
+/// reads the element type out of - is `(y >> 24) & 0xf`.
+const TRAILER_NULL: u32 = 0;
+const TRAILER_SEQNO: u32 = 1;
+const TRAILER_SENDER: u32 = 2;
+/// `MACH_RCV_TRAILER_AUDIT`, the largest element type `mach_port_peek` accepts;
+/// anything above it is `KERN_INVALID_VALUE` before the name is even looked up.
+/// The two above it are only here so that a refusal can name what it refused.
+const TRAILER_AUDIT: u32 = 3;
+const TRAILER_CTX: u32 = 4;
+const TRAILER_AV: u32 = 7;
+const TRAILER_LABELS: u32 = 8;
+
+fn trailer_elements(trailer_type: u32) -> u32 {
+    (trailer_type >> 24) & 0xf
+}
+
+/// The trailers `<mach/message.h>` publishes, in the order
+/// `REQUESTED_TRAILER_SIZE_NATIVE` names them.
+///
+/// **The public `mach_msg_trailer_t` is `{msgh_trailer_type, msgh_trailer_size}`
+/// and not `{msgh_seqno, msgh_trailer_type}`**, which is the shape a reader
+/// remembers from the kernel's own `osfmk/mach/message.h` and which the
+/// `_KERNEL` copy of that header does use. The two agree on their first two
+/// words, so the bytes [`receive`] appends to a message - `MACH_MSG_TRAILER_FORMAT_0`
+/// and `sizeof(mach_msg_trailer_t)` - are right either way, and this file's
+/// existing receive path was already writing the SDK's pair. What the difference
+/// moves is `msgh_seqno`, from offset 0 to offset 8, and with it the *sizes*: a
+/// size read off the wrong structure is `KERN_INVALID_VALUE` for a caller whose
+/// buffer is comfortably big enough.
+#[repr(C)]
+struct TrailerNull {
+    msgh_trailer_type: u32,
+    msgh_trailer_size: u32,
+}
+#[repr(C)]
+struct TrailerSeqno {
+    msgh_trailer_type: u32,
+    msgh_trailer_size: u32,
+    msgh_seqno: u32,
+}
+#[repr(C)]
+struct TrailerSender {
+    msgh_trailer_type: u32,
+    msgh_trailer_size: u32,
+    msgh_seqno: u32,
+    /// `security_token_t` is `{unsigned int val[2]}`.
+    msgh_sender: [u32; 2],
+}
+#[repr(C)]
+struct TrailerAudit {
+    msgh_trailer_type: u32,
+    msgh_trailer_size: u32,
+    msgh_seqno: u32,
+    msgh_sender: [u32; 2],
+    /// `audit_token_t` is `{unsigned int val[8]}`.
+    msgh_audit: [u32; 8],
+}
+
+const _: () = {
+    assert!(size_of::<TrailerNull>() == 8);
+    assert!(size_of::<TrailerSeqno>() == 12);
+    assert!(size_of::<TrailerSender>() == 20);
+    assert!(size_of::<TrailerAudit>() == 52);
+    assert!(std::mem::offset_of!(TrailerSeqno, msgh_seqno) == 8);
+};
+
+/// `sizeof` of the trailer `REQUESTED_TRAILER_SIZE(TRUE, trailer_type)` asks
+/// for, or `None` for an element type the kernel rejects outright.
+fn requested_trailer_size(elements: u32) -> Option<u32> {
+    Some(match elements {
+        TRAILER_NULL => size_of::<TrailerNull>() as u32,
+        TRAILER_SEQNO => size_of::<TrailerSeqno>() as u32,
+        TRAILER_SENDER => size_of::<TrailerSender>() as u32,
+        TRAILER_AUDIT => size_of::<TrailerAudit>() as u32,
+        _ => return None,
+    })
+}
+
+/// The trailer a message of this transport carries, written where a caller
+/// asked for one.
+///
+/// The same eight bytes [`receive`] appends to every message it hands back, and
+/// the same eight bytes a caller of `mach_port_peek` gets back: the trailer is a
+/// property of the message, not of the call that looked at it.
+///
+/// # Safety
+///
+/// `trailer` addresses at least [`TRAILER`] writable bytes.
+unsafe fn write_trailer(trailer: *mut u8) {
+    // SAFETY: the caller's trailer buffer, sized by its `trailer_size` out-value
+    // and no smaller than one `mach_msg_trailer_t`.
+    unsafe {
+        write_word(trailer, 0, TRAILER_FORMAT_0);
+        write_word(trailer, 4, TRAILER as u32);
+    }
+}
+
+/// How many messages this namespace has taken off each port.
+///
+/// Mach's `mach_port_seqno_t` is assigned by the kernel as a message is
+/// enqueued, and it is the one part of a port's state this transport cannot ask
+/// the host for: a unix datagram socket has no sequence numbers, and
+/// `FIONREAD` counts bytes rather than datagrams. What it *can* count is how
+/// many messages this namespace has received, and that is the same number for
+/// as long as a message is waiting - the transport is strictly first in first
+/// out and nothing is ever put back ahead of a message already in the socket -
+/// so the head of a non-empty queue is numbered `taken + 1` exactly as long as
+/// Mach would number it `taken + 1`. A caller that orders messages by it gets
+/// the right answer; a caller that uses it to name a message for a later peek
+/// gets a number that counts this namespace's history of the port rather than
+/// the host's.
+///
+/// Keyed by name, so a right that is moved to another name, or into another
+/// process, starts again at one. That is a divergence from Mach, and the
+/// alternative is a table that outlives the ports in it.
+mod seqno {
+    use super::*;
+
+    /// Above this many entries the table is swept against the space.
+    ///
+    /// A destroyed port leaves its counter behind and nothing announces it:
+    /// `mach_port_destroy` is not this module's to hook. Sweeping is O(entries)
+    /// and only happens once the table has more names than any program has live
+    /// ports, so a program that creates and destroys ports normally never pays
+    /// for it and a program that does pays for it rarely.
+    const BOUND: usize = 4096;
+
+    fn taken() -> &'static Mutex<std::collections::HashMap<Name, u32>> {
+        static TAKEN: OnceLock<Mutex<HashMap<Name, u32>>> = OnceLock::new();
+        TAKEN.get_or_init(|| Mutex::new(HashMap::new()))
+    }
+
+    /// The number Mach would give the message at the head of `name`'s queue.
+    pub fn head(name: Name) -> u32 {
+        let guard = taken().lock().unwrap_or_else(|e| e.into_inner());
+        guard.get(&name).copied().unwrap_or(0).wrapping_add(1)
+    }
+
+    /// `name` just gave a message to a receiver.
+    pub fn took(name: Name) {
+        let mut guard = taken().lock().unwrap_or_else(|e| e.into_inner());
+        let count = guard.entry(name).or_default();
+        *count = count.wrapping_add(1);
+        if guard.len() <= BOUND {
+            return;
+        }
+        guard.retain(|held, _| space::with_right(*held, |_| ()).is_some());
+    }
+
+    use std::collections::HashMap;
+    use std::sync::{Mutex, OnceLock};
+}
+
+/// The `msgh_size` and `msgh_id` of the message at the head of `port`'s queue,
+/// read without taking it.
+///
+/// `MSG_PEEK` rather than a receive, because that message is not this call's to
+/// take - the caller's own next `mach_msg` has to get it, and a peek that
+/// consumed it would turn a poll into a dequeue.
+///
+/// `None` when the head is not sitting on the socket. That happens in two cases
+/// worth telling apart, because Chromium produces both:
+///
+/// * a message held back from a receive whose buffer was too small. Chromium's
+///   `Wait()` on a MANUAL-reset event is exactly that - `MACH_RCV_LARGE` with
+///   `rcv_size = 0` - and the message then waits in this namespace's own
+///   one-message holding place rather than on the socket. `Receiver::ready()`
+///   sees it, which is why the queue is reported as non-empty, and there is no
+///   way to read its words without taking it out of there.
+/// * a datagram from a process that is not this runtime, or one another thread
+///   took between the readiness test and this read.
+///
+/// The caller learns the head's *existence* and nothing else in either case,
+/// which is the difference between an answer and a number invented here.
+fn head_message(port: &Receiver) -> Option<(u32, u32)> {
+    let mut bytes = vec![0u8; envelope::FIXED];
+    let mut iov = libc::iovec {
+        iov_base: bytes.as_mut_ptr().cast(),
+        iov_len: bytes.len(),
+    };
+    // SAFETY: a plain C structure, zeroed as its header's own examples do.
+    let mut message: libc::msghdr = unsafe { core::mem::zeroed() };
+    message.msg_iov = &mut iov;
+    message.msg_iovlen = 1;
+    // SAFETY: `message` describes `bytes` and the descriptor `port` holds, and
+    // neither is touched by anything else. A short read is a truncated peek,
+    // which is why only the fixed part of the envelope is asked for.
+    let got =
+        unsafe { libc::recvmsg(port.fd(), &mut message, libc::MSG_PEEK | libc::MSG_DONTWAIT) };
+    if got < envelope::FIXED as isize
+        || word(&bytes, 0) != envelope::MAGIC
+        || word(&bytes, 4) != envelope::VERSION
+    {
+        return None;
+    }
+    let count = word(&bytes, 16) as usize;
+    if count > MAX_RIGHTS {
+        return None;
+    }
+    // The `msgh_size` [`receive`] would have written, from the same three words.
+    let body = match count > 0 || word(&bytes, 8) & BITS_COMPLEX != 0 {
+        true => BODY + count * DESCRIPTOR,
+        false => 0,
+    };
+    let size = HEADER
+        .checked_add(body)?
+        .checked_add(word(&bytes, 20) as usize)?;
+    Some((size as u32, word(&bytes, 12)))
+}
+
+/// `kern_return_t mach_port_peek(ipc_space_t space, mach_port_name_t name,
+/// mach_msg_trailer_type_t trailer_type, mach_port_seqno_t *seqno,
+/// mach_msg_size_t *size, mach_msg_id_t *id, mach_msg_trailer_info_t trailer,
+/// mach_msg_type_number_t *trailer_size)`
+///
+/// The order of the work is the kernel's, because two of its steps are visible
+/// to a caller: `*trailer_size` is written **before** the name is looked up, so
+/// a caller gets the requested size back even when the answer is
+/// `KERN_INVALID_NAME`, and nothing at all is written through `seqno`, `size` or
+/// `id` when the answer is `KERN_FAILURE`.
+///
+/// **What is served, and what is not.** `MACH_RCV_TRAILER_NULL` and
+/// `MACH_RCV_TRAILER_SEQNO` are answered in full. `MACH_RCV_TRAILER_SENDER` and
+/// `MACH_RCV_TRAILER_AUDIT` are refused, and the reason is not convenience: a
+/// security token and an audit token identify a sender by Mach's own
+/// accounting of tasks and threads, and this namespace has none of it. Filling
+/// those eight and thirty-two bytes with zeros would hand a caller a
+/// *confident* identity for "the sender is the null audit token", which is a
+/// claim a sandbox decides on.
+///
+/// # Safety
+///
+/// `seqno`, `size`, `id` and `trailer_size` are writable `natural_t`s, and
+/// `trailer` is at least `*trailer_size` writable bytes.
+pub unsafe extern "C" fn mach_port_peek(
+    task: Name,
+    name: Name,
+    trailer_type: u32,
+    seqno: *mut u32,
+    size: *mut u32,
+    id: *mut u32,
+    trailer: *mut u8,
+    trailer_size: *mut u32,
+) -> i32 {
+    // MIG's generated server checks its out-parameters before it reaches the
+    // kernel, and answers `KERN_INVALID_ARGUMENT` for a null one; the kernel
+    // itself would fault. A null here is a caller bug either way, and faulting
+    // is not an answer this runtime gives.
+    if seqno.is_null()
+        || size.is_null()
+        || id.is_null()
+        || trailer.is_null()
+        || trailer_size.is_null()
+    {
+        return KERN_INVALID_ARGUMENT;
+    }
+    if task != space::TASK_SELF {
+        return KERN_INVALID_TASK;
+    }
+    // `MACH_PORT_VALID(name)`: neither null nor dead. Checked before the trailer,
+    // as the kernel does.
+    if name == MACH_PORT_NULL || name == MACH_PORT_DEAD {
+        return KERN_INVALID_RIGHT;
+    }
+    let elements = trailer_elements(trailer_type);
+    // Two trailer tests before the name is looked up, both of them the kernel's
+    // and in the kernel's order. The first is about what the *caller* asked for
+    // and has to fit: an element type above `MACH_RCV_TRAILER_AUDIT` is not
+    // defined at all, and a buffer smaller than the trailer requested is
+    // `KERN_INVALID_VALUE` however willing the port is.
+    // SAFETY: the caller's writable `mach_msg_type_number_t`, checked above.
+    let offered = unsafe { trailer_size.read() };
+    let Some(requested) = requested_trailer_size(elements) else {
+        return refused_peek_trailer(trailer_type, name, offered, TRAILER_REFUSED_UNDEFINED);
+    };
+    if requested > offered {
+        return refused_peek_trailer(trailer_type, name, offered, TRAILER_REFUSED_TOO_SMALL);
+    }
+    // The second is about what *this* namespace can report rather than about the
+    // request, and it is the reason the two element types above `SEQNO` are
+    // refused instead of filled with zeros.
+    if elements > TRAILER_SEQNO {
+        return refused_peek_trailer(trailer_type, name, offered, TRAILER_REFUSED_IDENTITY);
+    }
+    // SAFETY: the caller's writable `mach_msg_type_number_t`, checked above, and
+    // this happens before the name is looked up, as it does in the kernel.
+    unsafe { trailer_size.write(requested) };
+
+    let Some(port) = space::receiver(name) else {
+        return match space::with_right(name, |_| ()) {
+            // The name is one of ours and is not a receive right - a port set, a
+            // send right, one of the special names. Mach says
+            // "Name doesn't denote receive rights".
+            Some(()) => KERN_INVALID_RIGHT,
+            None => KERN_INVALID_NAME,
+        };
+    };
+
+    if !port.ready() {
+        // Nothing at the head. Mach leaves `seqno`, `size` and `id` alone here
+        // and answers `KERN_FAILURE`, which is the code Chromium's `MACH_CHECK`
+        // is waiting for.
+        return KERN_FAILURE;
+    }
+
+    // SAFETY: the caller's writable `mach_port_seqno_t`.
+    unsafe { seqno.write(seqno::head(name)) };
+    match head_message(&port) {
+        Some((size_of_message, id_of_message)) => {
+            // SAFETY: the caller's writable `mach_msg_size_t` and
+            // `mach_msg_id_t`.
+            unsafe {
+                size.write(size_of_message);
+                id.write(id_of_message);
+            }
+        }
+        None => announce_unreadable_head(),
+    }
+    // SAFETY: the caller's trailer buffer, at least `*trailer_size` bytes as
+    // just written, and the only element types reachable here are the two whose
+    // trailer is `mach_msg_trailer_t` plus, for `SEQNO`, one more word.
+    unsafe {
+        write_trailer(trailer);
+        if elements == TRAILER_SEQNO {
+            write_word(trailer, 8, seqno::head(name));
+        }
+    }
+    KERN_SUCCESS
+}
+
+/// The element-type name a refusal speaks, in `<mach/message.h>`'s order.
+fn elements_name(trailer_type: u32) -> &'static str {
+    match trailer_elements(trailer_type) {
+        TRAILER_NULL => "MACH_RCV_TRAILER_NULL",
+        TRAILER_SEQNO => "MACH_RCV_TRAILER_SEQNO",
+        TRAILER_SENDER => "MACH_RCV_TRAILER_SENDER",
+        TRAILER_AUDIT => "MACH_RCV_TRAILER_AUDIT",
+        TRAILER_CTX => "MACH_RCV_TRAILER_CTX",
+        TRAILER_AV => "MACH_RCV_TRAILER_AV",
+        TRAILER_LABELS => "MACH_RCV_TRAILER_LABELS",
+        _ => "an element type mach_port_peek does not define",
+    }
+}
+
+/// Why a trailer was refused, when the answer is not the size of anything.
+///
+/// Named as constants rather than inlined so that the one message the refusal
+/// prints has one wording per cause, and so that a test can assert which of the
+/// two refusals a given word gets.
+const TRAILER_REFUSED_UNDEFINED: &str =
+    "that element type is above MACH_RCV_TRAILER_AUDIT, which is as far as mach_port_peek goes";
+const TRAILER_REFUSED_TOO_SMALL: &str =
+    "the caller\'s buffer is smaller than the trailer it asked for";
+const TRAILER_REFUSED_IDENTITY: &str = "a security token and an audit token name a sender by Mach\'s own accounting of tasks and \
+     threads, and a datagram socket has none of it - the words would be zeros, which is a \
+     confident answer to \"who sent this\" that is not true";
+
+/// Say once that a peek asked for a trailer this does not report, and say which.
+fn refused_peek_trailer(trailer_type: u32, name: Name, offered: u32, because: &str) -> i32 {
+    static SAID: std::sync::Once = std::sync::Once::new();
+    SAID.call_once(|| {
+        eprintln!(
+            "rosetta3: mach_port_peek: port {name:#x} asked for trailer type {trailer_type:#x} \
+             ({}), and the caller offered {offered} bytes, but {because}",
+            elements_name(trailer_type)
+        );
+    });
+    KERN_INVALID_VALUE
+}
+
+/// Say once that a port reported a head whose words could not be read.
+fn announce_unreadable_head() {
+    static SAID: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if !SAID.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        eprintln!(
+            "rosetta3: mach_port_peek found a message waiting on a port and did not report its \
+             msgh_size or msgh_id: the head of the queue is not on the socket, so there is nothing \
+             to read them out of - it is most often a message held back from a receive whose \
+             buffer was too small, which is what Chromium's Wait() on a manual-reset event leaves \
+             behind. The queue is reported as non-empty, which is true, and those two words are \
+             left as the caller wrote them"
+        );
     }
 }
 
@@ -1187,6 +1636,534 @@ mod tests {
         space::destroy(set);
         space::destroy(first);
         space::destroy(second);
+    }
+
+    /// A `mach_port_peek`, and what a guest is told.
+    ///
+    /// The out-parameters come back as `(kr, seqno, size, id, *trailer_size)`, the
+    /// trailer itself in `out.6` - which is how the *guest*'s stack frame is laid
+    /// out, since Chromium's `PeekPort` has five locals and the call pushes two of
+    /// them.
+    #[allow(clippy::type_complexity)]
+    fn peek(port: Name) -> (i32, u32, u32, u32, u32, [u8; 12]) {
+        let (mut seqno, mut size, mut id) = (0xaaaa_aaaa, 0xaaaa_aaaa, 0xaaaa_aaaa);
+        let mut trailer = [0xaa; 12];
+        let mut offered = TRAILER as u32;
+        // SAFETY: three live `natural_t`s, a live `mach_msg_type_number_t` and a
+        // twelve-byte trailer buffer that is more than the eight `offered` says.
+        let kr = unsafe {
+            mach_port_peek(
+                space::TASK_SELF,
+                port,
+                TRAILER_NULL,
+                &mut seqno,
+                &mut size,
+                &mut id,
+                trailer.as_mut_ptr(),
+                &mut offered,
+            )
+        };
+        (kr, seqno, size, id, offered, trailer)
+    }
+
+    /// The answer Chromium's `MACH_CHECK` is built on. An empty port is
+    /// `KERN_FAILURE` and nothing else - not `MACH_RCV_TIMED_OUT`, and not a
+    /// success with a queue of length zero, either of which aborts the browser
+    /// at `waitable_event_apple.cc:251` instead of letting it poll. And a
+    /// `KERN_FAILURE` writes nothing through the three out-parameters, so the
+    /// caller's own uninitialised values are still there.
+    #[test]
+    fn an_empty_port_is_kern_failure_and_writes_nothing() {
+        let port = allocate_receive();
+        let (kr, seqno, size, id, offered, trailer) = peek(port);
+        assert_eq!(kr, KERN_FAILURE);
+        assert_eq!(
+            (seqno, size, id),
+            (0xaaaa_aaaa, 0xaaaa_aaaa, 0xaaaa_aaaa),
+            "the kernel leaves all three alone when it finds no message"
+        );
+        assert_eq!(
+            offered, TRAILER as u32,
+            "the requested trailer size is written before the name is looked up"
+        );
+        assert_eq!(trailer, [0xaa; 12], "and no trailer is written");
+        space::destroy(port);
+    }
+
+    /// The other half, and the one the default MANUAL-reset event reaches on its
+    /// first `IsSignaled()`. The queue is polled, not drained: three rounds of
+    /// signal, peek, receive, and the sequence number rises by one each time.
+    #[test]
+    fn a_port_with_a_message_reports_it_and_the_sequence_number_rises() {
+        let port = allocate_receive();
+        let mut previous = 0;
+        for round in 0..3u32 {
+            let mut sent = message(0, port, MACH_PORT_NULL, 0x1f + round as i32, &[]);
+            // SAFETY: a whole message of the size in its header.
+            assert_eq!(
+                unsafe {
+                    mach_msg(
+                        sent.as_mut_ptr().cast(),
+                        SEND_MSG,
+                        sent.len() as u32,
+                        0,
+                        MACH_PORT_NULL,
+                        0,
+                        MACH_PORT_NULL,
+                    )
+                },
+                MACH_MSG_SUCCESS
+            );
+
+            let (kr, seqno, size, id, _, trailer) = peek(port);
+            assert_eq!(kr, KERN_SUCCESS, "round {round}");
+            assert_eq!(
+                size, HEADER as u32,
+                "an empty message is a header and nothing else"
+            );
+            assert_eq!(
+                id,
+                0x1f + round as u32,
+                "msgh_id of the message at the head"
+            );
+            assert!(
+                seqno > previous,
+                "round {round}: the sequence number rises, {previous} then {seqno}"
+            );
+            previous = seqno;
+            let mut expected = Vec::new();
+            expected.extend_from_slice(&TRAILER_FORMAT_0.to_ne_bytes());
+            expected.extend_from_slice(&(TRAILER as u32).to_ne_bytes());
+            assert_eq!(
+                &trailer[..TRAILER],
+                expected.as_slice(),
+                "the trailer is the one a receive would have appended"
+            );
+
+            // Polling twice must not consume: this is a peek.
+            assert_eq!(peek(port).0, KERN_SUCCESS, "round {round}: still there");
+
+            let mut buf = vec![0u8; 64];
+            // SAFETY: 64 writable bytes.
+            let rc = unsafe {
+                mach_msg(
+                    buf.as_mut_ptr().cast(),
+                    RCV_MSG | RCV_TIMEOUT,
+                    0,
+                    buf.len() as u32,
+                    port,
+                    1000,
+                    MACH_PORT_NULL,
+                )
+            };
+            assert_eq!(
+                rc, MACH_MSG_SUCCESS,
+                "round {round}: the message was received"
+            );
+            assert_eq!(
+                peek(port).0,
+                KERN_FAILURE,
+                "round {round}: and the queue is empty again"
+            );
+        }
+        assert_eq!(previous, 3, "the first message of a port is numbered one");
+        space::destroy(port);
+    }
+
+    /// The two questions a caller can ask about a name, and neither of them is
+    /// `KERN_FAILURE`: a name this namespace never issued is `KERN_INVALID_NAME`
+    /// and a name that is not a receive right is `KERN_INVALID_RIGHT`. Chromium
+    /// aborts on all three equally, so which one it is matters.
+    #[test]
+    fn a_name_that_is_not_a_receive_right_is_told_which_kind_of_wrong_it_is() {
+        let mut set = MACH_PORT_NULL;
+        // SAFETY: a live local for the out-parameter.
+        unsafe { space::mach_port_allocate(space::TASK_SELF, space::RIGHT_PORT_SET, &mut set) };
+        for (name, expected) in [
+            (set, KERN_INVALID_RIGHT),
+            (0x7fff_0000, KERN_INVALID_NAME),
+            (MACH_PORT_NULL, KERN_INVALID_RIGHT), // !MACH_PORT_VALID
+            (MACH_PORT_DEAD, KERN_INVALID_RIGHT), // !MACH_PORT_VALID
+        ] {
+            assert_eq!(peek(name).0, expected, "name {name:#x}");
+        }
+        // A send right is a name and not a receive right.
+        let mut receive = MACH_PORT_NULL;
+        // SAFETY: a live local for the out-parameter.
+        unsafe { space::mach_port_allocate(space::TASK_SELF, space::RIGHT_RECEIVE, &mut receive) };
+        let (mut send, mut kind) = (MACH_PORT_NULL, 0);
+        // SAFETY: two live locals for the out-parameters.
+        unsafe {
+            space::mach_port_extract_right(
+                space::TASK_SELF,
+                receive,
+                MAKE_SEND,
+                &mut send,
+                &mut kind,
+            )
+        };
+        assert_eq!(peek(send).0, KERN_INVALID_RIGHT);
+        assert_eq!(peek(space::TASK_SELF).0, KERN_INVALID_RIGHT);
+
+        // Another task's space is refused before anything else is looked at,
+        // which is what `mach_port_construct` and the rest of the file do.
+        let (mut seqno, mut size, mut id, mut offered) = (0u32, 0u32, 0u32, 8u32);
+        let mut trailer = [0u8; 8];
+        // SAFETY: live out-parameters and an eight-byte trailer buffer.
+        let kr = unsafe {
+            mach_port_peek(
+                space::HOST_SELF,
+                receive,
+                TRAILER_NULL,
+                &mut seqno,
+                &mut size,
+                &mut id,
+                trailer.as_mut_ptr(),
+                &mut offered,
+            )
+        };
+        assert_eq!(kr, KERN_INVALID_TASK);
+
+        // A null out-parameter is `KERN_INVALID_ARGUMENT`, which is what MIG's
+        // server answers rather than faulting.
+        // SAFETY: a null out-parameter is the case being tested.
+        assert_eq!(
+            unsafe {
+                mach_port_peek(
+                    space::TASK_SELF,
+                    receive,
+                    TRAILER_NULL,
+                    std::ptr::null_mut(),
+                    &mut size,
+                    &mut id,
+                    trailer.as_mut_ptr(),
+                    &mut offered,
+                )
+            },
+            KERN_INVALID_ARGUMENT
+        );
+
+        space::destroy(set);
+        space::mach_port_deallocate(space::TASK_SELF, send);
+        space::destroy(receive);
+    }
+
+    /// `MACH_RCV_TRAILER_SEQNO` is answered, because the sequence number is
+    /// the one trailer element this namespace does know. The two above it are
+    /// refused rather than filled with zeros, and a buffer too small for what
+    /// was asked for is `KERN_INVALID_VALUE` the way the kernel says.
+    #[test]
+    fn the_trailer_element_types_are_answered_or_refused_by_number() {
+        let port = allocate_receive();
+        let mut sent = message(0, port, MACH_PORT_NULL, 1, &[]);
+        // SAFETY: a whole message of the size in its header.
+        unsafe {
+            mach_msg(
+                sent.as_mut_ptr().cast(),
+                SEND_MSG,
+                sent.len() as u32,
+                0,
+                MACH_PORT_NULL,
+                0,
+                MACH_PORT_NULL,
+            )
+        };
+
+        // `MACH_RCV_TRAILER_ELEMENTS(MACH_RCV_TRAILER_SEQNO)` is `1 << 24`.
+        let ask = |elements: u32, offered: u32| {
+            let (mut seqno, mut size, mut id) = (0u32, 0u32, 0u32);
+            let mut trailer = [0u8; 64];
+            let mut out = offered;
+            // SAFETY: live out-parameters and a 64-byte trailer buffer.
+            let kr = unsafe {
+                mach_port_peek(
+                    space::TASK_SELF,
+                    port,
+                    elements << 24,
+                    &mut seqno,
+                    &mut size,
+                    &mut id,
+                    trailer.as_mut_ptr(),
+                    &mut out,
+                )
+            };
+            (kr, out, trailer)
+        };
+        let (kr, out, trailer) = ask(TRAILER_SEQNO, 12);
+        assert_eq!(kr, KERN_SUCCESS);
+        assert_eq!(out, 12, "sizeof(mach_msg_seqno_trailer_t)");
+        assert_eq!(
+            u32::from_ne_bytes(trailer[8..12].try_into().unwrap()),
+            1,
+            "msgh_seqno"
+        );
+
+        // `MACH_RCV_TRAILER_SENDER` and `_AUDIT` are refused, and so is a
+        // `MACH_RCV_TRAILER_CTX`, which the kernel rejects before the name.
+        for elements in [TRAILER_SENDER, TRAILER_AUDIT, TRAILER_CTX] {
+            assert_eq!(
+                ask(elements, 64).0,
+                KERN_INVALID_VALUE,
+                "elements {elements}"
+            );
+        }
+        // A buffer too small for the trailer that was asked for.
+        assert_eq!(ask(TRAILER_SEQNO, 8).0, KERN_INVALID_VALUE);
+
+        // Chromium's own call: `MACH_RCV_TRAILER_TYPE(MACH_RCV_TRAILER_NULL)`
+        // is the whole word zero, with eight bytes offered for eight bytes.
+        let (kr, out, trailer) = ask(TRAILER_NULL, TRAILER as u32);
+        assert_eq!(kr, KERN_SUCCESS);
+        assert_eq!(out, TRAILER as u32);
+        assert_eq!(
+            u32::from_ne_bytes(trailer[0..4].try_into().unwrap()),
+            TRAILER_FORMAT_0
+        );
+        assert_eq!(
+            u32::from_ne_bytes(trailer[4..8].try_into().unwrap()),
+            TRAILER as u32
+        );
+        space::destroy(port);
+    }
+
+    /// The trailer sizes are read off the *published* structures, and the shape
+    /// the kernel's own `<mach/message.h>` uses is a different one: the SDK's
+    /// `mach_msg_trailer_t` is `{msgh_trailer_type, msgh_trailer_size}`, not
+    /// `{msgh_seqno, msgh_trailer_type}`. Getting it wrong is a `KERN_INVALID_VALUE`
+    /// for a caller whose buffer is big enough.
+    #[test]
+    fn the_trailer_sizes_are_the_ones_the_published_header_declares() {
+        assert_eq!(size_of::<TrailerNull>(), 8);
+        assert_eq!(size_of::<TrailerSeqno>(), 12);
+        assert_eq!(size_of::<TrailerSender>(), 20);
+        assert_eq!(size_of::<TrailerAudit>(), 52);
+        assert_eq!(requested_trailer_size(TRAILER_NULL), Some(8));
+        assert_eq!(requested_trailer_size(TRAILER_AUDIT), Some(52));
+        assert_eq!(
+            requested_trailer_size(TRAILER_AUDIT + 1),
+            None,
+            "the kernel stops here"
+        );
+        // `GET_RCV_ELEMENTS(y)` is `(y >> 24) & 0xf`, so the element type lives
+        // in bits 24 to 27 and `MACH_RCV_TRAILER_TYPE`'s format in bits 28 to
+        // 31. The kernel reads the first and ignores the second, so a word that
+        // puts the element type where the format belongs is read as "no
+        // trailer" - which is worth asserting, because the two nibbles being
+        // adjacent is how a value that looks right is not.
+        assert_eq!(
+            trailer_elements(TRAILER_NULL),
+            0,
+            "the whole word, for no trailer at all"
+        );
+        assert_eq!(trailer_elements(TRAILER_SEQNO << 24), TRAILER_SEQNO);
+        assert_eq!(
+            trailer_elements(TRAILER_SEQNO << 28),
+            0,
+            "the format nibble is not one"
+        );
+    }
+
+    /// A `mach_port_peek` and a `kevent64` filter ask the same question about
+    /// the same port, so they must never disagree: a peek that reports a
+    /// message `poll` cannot see is the failure that sends Chromium into a
+    /// `mach_msg` that never returns. The two are checked against each other in
+    /// `kevent64`'s own test, where both are reachable.
+    #[test]
+    fn a_peek_agrees_with_what_a_receive_can_take() {
+        let port = allocate_receive();
+        assert_eq!(peek(port).0, KERN_FAILURE);
+        // A receive with a zero timeout is the same question asked the other
+        // way round, and it is what `MACH_RCV_TIMED_OUT` answers.
+        let mut buf = vec![0u8; 64];
+        // SAFETY: 64 writable bytes.
+        let rc = unsafe {
+            mach_msg(
+                buf.as_mut_ptr().cast(),
+                RCV_MSG | RCV_TIMEOUT,
+                0,
+                buf.len() as u32,
+                port,
+                0,
+                MACH_PORT_NULL,
+            )
+        };
+        assert_eq!(rc, MACH_RCV_TIMED_OUT);
+
+        let mut sent = message(0, port, MACH_PORT_NULL, 1, &[]);
+        // SAFETY: a whole message of the size in its header.
+        unsafe {
+            mach_msg(
+                sent.as_mut_ptr().cast(),
+                SEND_MSG,
+                sent.len() as u32,
+                0,
+                MACH_PORT_NULL,
+                0,
+                MACH_PORT_NULL,
+            )
+        };
+        assert_eq!(peek(port).0, KERN_SUCCESS);
+        // SAFETY: 64 writable bytes.
+        let rc = unsafe {
+            mach_msg(
+                buf.as_mut_ptr().cast(),
+                RCV_MSG | RCV_TIMEOUT,
+                0,
+                buf.len() as u32,
+                port,
+                0,
+                MACH_PORT_NULL,
+            )
+        };
+        assert_eq!(rc, MACH_MSG_SUCCESS, "and it is there to be taken");
+        space::destroy(port);
+    }
+
+    /// The whole of `base::WaitableEvent`'s MANUAL-reset path, in the order
+    /// Chromium runs it and with the arguments it passes - because a MANUAL-reset
+    /// event is the default, so this is the first thing a guest does with a
+    /// `WaitableEvent` and the only way to know the two halves of the port queue
+    /// agree.
+    ///
+    /// * `IsSignaled()` is `PeekPort(name, policy_ == AUTOMATIC)`, so a MANUAL
+    ///   event is a **peek** - it must report without taking.
+    /// * `Signal()` sends a 24-byte `mach_msg_empty_send_t` with
+    ///   `MACH_SEND_MSG | MACH_SEND_TIMEOUT`.
+    /// * `Wait()` receives with `MACH_RCV_LARGE` and `rcv_size = 0`, so the
+    ///   message stays queued and the answer is `MACH_RCV_TOO_LARGE`.
+    /// * `Reset()` is `PeekPort(name, true)`: a real receive with
+    ///   `MACH_RCV_TIMEOUT` and a zero timeout.
+    #[test]
+    fn a_manual_reset_event_polls_signals_waits_and_resets() {
+        let port = allocate_receive();
+
+        // IsSignaled(), before anything has been sent.
+        assert_eq!(peek(port).0, KERN_FAILURE, "not signalled");
+
+        // Signal().
+        let mut sent = message(0, port, MACH_PORT_NULL, 0, &[]);
+        assert_eq!(sent.len(), HEADER);
+        // SAFETY: a whole message of the size in its header.
+        assert_eq!(
+            unsafe {
+                mach_msg(
+                    sent.as_mut_ptr().cast(),
+                    SEND_MSG | SEND_TIMEOUT,
+                    sent.len() as u32,
+                    0,
+                    MACH_PORT_NULL,
+                    0,
+                    MACH_PORT_NULL,
+                )
+            },
+            MACH_MSG_SUCCESS
+        );
+
+        // IsSignaled(), twice, and a MANUAL-reset event must not drain.
+        assert_eq!(peek(port).0, KERN_SUCCESS);
+        assert_eq!(
+            peek(port).0,
+            KERN_SUCCESS,
+            "still signalled: nothing was dequeued"
+        );
+
+        // Wait(): a zero-sized receive with MACH_RCV_LARGE, which is how Chromium
+        // waits on a MANUAL event without resetting it.
+        let mut buf = vec![0u8; 0];
+        // SAFETY: zero writable bytes, which is what the caller asked for.
+        let rc = unsafe {
+            mach_msg(
+                buf.as_mut_ptr().cast(),
+                RCV_MSG | RCV_TIMEOUT | RCV_LARGE,
+                0,
+                0,
+                port,
+                0,
+                MACH_PORT_NULL,
+            )
+        };
+        assert_eq!(
+            rc, MACH_RCV_TOO_LARGE,
+            "Chromium's Wait() on a MANUAL event"
+        );
+        assert_eq!(peek(port).0, KERN_SUCCESS, "MACH_RCV_LARGE left it queued");
+
+        // Reset(): PeekPort(port, true). `mach_msg_empty_rcv_t` is a header *and*
+        // a `mach_msg_trailer_t` - 32 bytes, not 24 - and this is the one place
+        // that shows the trailer is accounted for: `rcv_size` has to cover the
+        // trailer or the receive is `MACH_RCV_TOO_LARGE` and takes nothing.
+        let mut buf = vec![0u8; HEADER + TRAILER];
+        // SAFETY: a header's worth of writable bytes.
+        let rc = unsafe {
+            mach_msg(
+                buf.as_mut_ptr().cast(),
+                RCV_MSG | RCV_TIMEOUT,
+                0,
+                buf.len() as u32,
+                port,
+                0,
+                MACH_PORT_NULL,
+            )
+        };
+        assert_eq!(rc, MACH_MSG_SUCCESS, "the message was taken");
+        assert_eq!(peek(port).0, KERN_FAILURE, "and the event is reset");
+        // A second Reset() has nothing to take, which is what it says.
+        // SAFETY: a header's worth of writable bytes.
+        let rc = unsafe {
+            mach_msg(
+                buf.as_mut_ptr().cast(),
+                RCV_MSG | RCV_TIMEOUT,
+                0,
+                buf.len() as u32,
+                port,
+                0,
+                MACH_PORT_NULL,
+            )
+        };
+        assert_eq!(
+            rc, MACH_RCV_TIMED_OUT,
+            "PeekPort's own MACH_CHECK accepts this"
+        );
+        space::destroy(port);
+    }
+
+    /// The same object as an AUTOMATIC-reset event, where `IsSignaled()` is
+    /// `PeekPort(name, true)` and therefore *does* dequeue. This is the case
+    /// `WaitManyImpl` takes when it reports a triggered index.
+    #[test]
+    fn an_automatic_reset_event_drains_itself_when_it_is_polled() {
+        let port = allocate_receive();
+        let mut sent = message(0, port, MACH_PORT_NULL, 0, &[]);
+        // SAFETY: a whole message of the size in its header.
+        unsafe {
+            mach_msg(
+                sent.as_mut_ptr().cast(),
+                SEND_MSG | SEND_TIMEOUT,
+                sent.len() as u32,
+                0,
+                MACH_PORT_NULL,
+                0,
+                MACH_PORT_NULL,
+            )
+        };
+        // `IsSignaled()` on an AUTOMATIC event is PeekPort(port, true), whose
+        // buffer is a `mach_msg_empty_rcv_t`: a header and a trailer.
+        let mut buf = vec![0u8; HEADER + TRAILER];
+        // SAFETY: a header's worth of writable bytes.
+        let rc = unsafe {
+            mach_msg(
+                buf.as_mut_ptr().cast(),
+                RCV_MSG | RCV_TIMEOUT,
+                0,
+                buf.len() as u32,
+                port,
+                0,
+                MACH_PORT_NULL,
+            )
+        };
+        assert_eq!(rc, MACH_MSG_SUCCESS);
+        assert_eq!(peek(port).0, KERN_FAILURE, "polled and reset in one call");
+        space::destroy(port);
     }
 
     #[test]

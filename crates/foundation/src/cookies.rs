@@ -650,8 +650,17 @@ fn life(cookie: &Cookie) -> String {
 fn attributes(header: &str) -> String {
     let mut parts = header.split(';');
     let first = parts.next().unwrap_or_default();
-    let name = first.split_once('=').map_or(first, |(name, _)| name);
-    std::iter::once(format!("{}=<{} bytes>", name.trim(), first.len()))
+    // The elided *value*, not the whole `name=value` token. The point of the
+    // trace is how much was withheld, so a length that included the name and its
+    // `=` would report 16 for a 6-byte secret - which both misstates the size
+    // and reads as though more had been hidden than had.
+    let (name, value_len) = match first.split_once('=') {
+        Some((name, value)) => (name, value.len()),
+        // No `=` at all: there is no value, so nothing was elided, and saying
+        // "0 bytes" is the truth rather than the length of a bare name.
+        None => (first, 0),
+    };
+    std::iter::once(format!("{}=<{value_len} bytes>", name.trim()))
         .chain(parts.map(|a| a.trim().to_string()))
         .collect::<Vec<_>>()
         .join("; ")

@@ -1770,7 +1770,6 @@ pub static SIGNATURES: &[FunctionAbi] = &[
     sig!("fseeko", I32, P, I64, I32),
     sig!("fsetpos", I32, P, P),
     sig!("fstat", I32, I32, P),
-    sig!("fstatat", I32, I32, P, P, I32),
     sig!("fstatfs", I32, I32, P),
     sig!("fstatvfs", I32, I32, P),
     sig!("fsync", I32, I32),
@@ -2516,6 +2515,10 @@ pub static SIGNATURES: &[FunctionAbi] = &[
     // BSD event notification, which is how `steamclient.dylib` waits on its
     // sockets and its pipe to the client.
     sig!("kevent", I32, I32, P, I32, P, I32, P),
+    // The sixth argument is an `unsigned int` *value* and the seventh a
+    // `timespec *`; reading that pair the other way round makes the
+    // implementation dereference an integer.
+    sig!("kevent64", I32, I32, P, I32, P, I32, U32, P),
     sig!("kill", I32, I32, I32),
     sig!("kqueue", I32),
     sig!("labs", I64, I64),
@@ -2568,6 +2571,14 @@ pub static SIGNATURES: &[FunctionAbi] = &[
     sig!("mach_msg", I32, P, I32, U32, U32, U32, U32, U32),
     sig!("mach_msg_destroy", V, P),
     sig!("mach_port_allocate", I32, U32, U32, P),
+    // `kern_return_t mach_port_construct(ipc_space_t, mach_port_options_t *,
+    // vm_offset_t, mach_port_t *)` - **four** arguments, the options and the
+    // context always being there. There is no two-argument form, and a
+    // two-argument prototype reads `options` as the name: Chromium's
+    // `WaitableEvent` constructor passes `MPO_INSERT_SEND_RIGHT` and a
+    // `mach_port_t` it has not written yet, so the port it gets back is a
+    // number that was never one.
+    sig!("mach_port_construct", I32, U32, P, U64, P),
     sig!("mach_port_deallocate", I32, U32, U32),
     // `kern_return_t mach_port_extract_right(ipc_space_t, mach_port_name_t,
     // mach_msg_type_name_t, mach_port_t *poly, mach_msg_type_name_t *polyPoly)`
@@ -2576,6 +2587,7 @@ pub static SIGNATURES: &[FunctionAbi] = &[
     sig!("mach_port_extract_right", I32, U32, U32, U32, P, P),
     sig!("mach_port_insert_right", I32, U32, U32, U32, U32),
     sig!("mach_port_mod_refs", I32, U32, U32, U32, I32),
+    sig!("mach_port_peek", I32, U32, U32, U32, P, P, P, P, P),
     sig!("mach_port_type", I32, U32, U32, P),
     //
     // Passthrough, and unlike `mmap` they need no shim: none of these carries
@@ -2585,8 +2597,21 @@ pub static SIGNATURES: &[FunctionAbi] = &[
     sig!("mach_vm_allocate", I32, U32, P, U64, I32),
     sig!("mach_vm_deallocate", I32, U32, U64, U64),
     sig!("mach_vm_read_overwrite", I32, U32, U64, U64, U64, P),
-    sig!("vm_allocate", I32, U32, P, U64, I32),
+    // `vm_allocate` is **four** arguments here, not the five `mach/vm_prot.h`
+    // declares, and that is not an oversight to be tidied up: the guest's two
+    // call sites (`Chromium Framework+0x6311fe` and `+0x6312ab`, in
+    // `mojo/core/channel_mac.cc`) set `edi`, `rsi`, `rdx` and `ecx` and leave
+    // `r8` as whatever `getpagesize()` returned - read directly out of the
+    // instruction stream, not inferred. So there is no `prot` to translate and
+    // the fourth argument is a flags word carrying a `vm_tag_t` in its high
+    // sixteen bits, not a `boolean_t`. A five-argument row would read past the
+    // call into whatever the guest happened to have in `rcx`.
+    sig!("vm_allocate", I32, U32, P, U64, U32),
     sig!("vm_deallocate", I32, U32, U64, U64),
+    // `vm_map`'s five trailing arguments: `memory_object`, `offset`, the
+    // protection pair, `inheritance`, the two `wired` flags and the tag.
+    sig!("vm_map", I32, U32, P, U64, U32, U64, I32, I32, I32, U32, U32, U32),
+    sig!("vm_protect", I32, U32, U64, U64, I32, I32),
     sig!("vm_read_overwrite", I32, U32, U64, U64, U64, P),
     sig!("vm_region_64", I32, U32, P, P, I32, P, P, P),
     sig!("vm_region_recurse_64", I32, U32, P, P, P, P, P),
@@ -2774,6 +2799,7 @@ pub static SIGNATURES: &[FunctionAbi] = &[
     // The thread's Mach port name. One task, one port namespace - see
     // `mach_task_self_` in `shims::runtime`.
     sig!("pthread_mach_thread_np", U32, U64),
+    sig!("pthread_from_mach_thread_np", U64, U32),
     sig!("pthread_main_np", I32),
     sig!("pthread_mutex_destroy", I32, P),
     sig!("pthread_mutex_init", I32, P, P),
@@ -3058,6 +3084,15 @@ pub static SIGNATURES: &[FunctionAbi] = &[
     // means by them - unlike the register-state pair above.
     sig!("thread_policy_get", I32, U32, U32, P, P, P),
     sig!("thread_policy_set", I32, U32, U32, P, U32),
+    // The task-side pair, and `task_self_trap` and `thread_switch`. The last of
+    // those is the one the Framework calls 1235 times, always with
+    // `MACH_PORT_NULL`, `SWITCH_OPTION_WAIT` and a one-tick timeout - read out
+    // of the image by comparing the thirteen bytes before each `call`, so the
+    // count is exact rather than a sample.
+    sig!("task_policy_get", I32, U32, U32, P, P, P),
+    sig!("task_policy_set", I32, U32, U32, P, U32),
+    sig!("task_self_trap", I32),
+    sig!("thread_switch", I32, U32, I32, I32),
     // The exception-port family.
     sig!("thread_get_exception_ports", I32, U32, U32, P, P, P, P, P),
     sig!("thread_set_exception_ports", I32, U32, U32, U32, I32, I32),

@@ -66,15 +66,30 @@ fn board_mut(all: &mut Boards, receiver: Id) -> Option<&mut Board> {
         .find_map(|(_, board)| ((board.object as Id) == receiver).then_some(board))
 }
 
+/// Whether the general board is the desktop's own clipboard, rather than one
+/// more board of this process like every named one.
+///
+/// SDL is that desktop clipboard wherever it can be given one as well as read,
+/// which is everywhere except its X11 backend - where handing SDL the clipboard
+/// costs the process its life, for the reasons
+/// [`sdl3::clipboard::may_own_selection`] sets out. There the general board
+/// keeps its name and its change count and nothing else: it is process-local,
+/// exactly like a named board, rather than half of a desktop clipboard that
+/// this process is unable to publish to.
+fn shares_desktop(name: &[u8]) -> bool {
+    name == CLIPBOARD && sdl3::clipboard::may_own_selection()
+}
+
 fn is_general(all: &Boards, receiver: Id) -> bool {
     all.boards
         .iter()
-        .any(|(name, board)| name == GENERAL.as_bytes() && board.object as Id == receiver)
+        .any(|(name, board)| shares_desktop(name) && (board.object as Id) == receiver)
 }
 
 /// Pull a text change made by another desktop application into the general
 /// board before answering a read. SDL is the authority for that one board;
-/// named boards remain process-local AppKit objects.
+/// named boards remain process-local AppKit objects, and so does the general
+/// board wherever [`shares_desktop`] says SDL cannot speak for it.
 fn sync_system_text(board: &mut Board) {
     if sdl3::clipboard::has_text() != Some(true) {
         return;
@@ -125,11 +140,12 @@ pub(crate) const CLIPBOARD: &[u8] = GENERAL.as_bytes();
 
 /// The flavour types a named board currently holds.
 ///
-/// The general board is synchronised with the desktop's clipboard first, for the
-/// reason [`sync_system_text`] gives: a read has to see what another application
-/// copied.
+/// The general board is synchronised with the desktop's clipboard first, where
+/// it is the desktop's clipboard at all - see [`shares_desktop`] - for the
+/// reason [`sync_system_text`] gives: a read has to see what another
+/// application copied.
 pub(crate) fn flavors(name: &[u8]) -> Vec<Vec<u8>> {
-    let general = name == CLIPBOARD;
+    let general = shares_desktop(name);
     let receiver = named(name);
     let mut all = boards().lock().unwrap_or_else(|e| e.into_inner());
     let Some(board) = board_mut(&mut all, receiver) else {
@@ -143,7 +159,7 @@ pub(crate) fn flavors(name: &[u8]) -> Vec<Vec<u8>> {
 
 /// One flavour's bytes, or `None` for a flavour the board does not hold.
 pub(crate) fn flavor_data(name: &[u8], ty: &[u8]) -> Option<Vec<u8>> {
-    let general = name == CLIPBOARD;
+    let general = shares_desktop(name);
     let receiver = named(name);
     let mut all = boards().lock().unwrap_or_else(|e| e.into_inner());
     let board = board_mut(&mut all, receiver)?;
@@ -159,7 +175,7 @@ pub(crate) fn flavor_data(name: &[u8], ty: &[u8]) -> Option<Vec<u8>> {
 
 /// Write one flavour, replacing whatever that flavour held.
 pub(crate) fn put_flavor(name: &[u8], ty: &[u8], bytes: Vec<u8>) {
-    let general = name == CLIPBOARD;
+    let general = shares_desktop(name);
     let receiver = named(name);
     let mut all = boards().lock().unwrap_or_else(|e| e.into_inner());
     let Some(board) = board_mut(&mut all, receiver) else {
@@ -180,7 +196,7 @@ pub(crate) fn put_flavor(name: &[u8], ty: &[u8], bytes: Vec<u8>) {
 
 /// Empty a named board, and return its new change count.
 pub(crate) fn clear_named(name: &[u8]) -> isize {
-    let general = name == CLIPBOARD;
+    let general = shares_desktop(name);
     let receiver = named(name);
     let mut all = boards().lock().unwrap_or_else(|e| e.into_inner());
     let count = board_mut(&mut all, receiver).map_or(0, clear);
@@ -192,7 +208,7 @@ pub(crate) fn clear_named(name: &[u8]) -> isize {
 
 /// A named board's change count, after taking in anything the desktop changed.
 pub(crate) fn change_count_of(name: &[u8]) -> isize {
-    let general = name == CLIPBOARD;
+    let general = shares_desktop(name);
     let receiver = named(name);
     let mut all = boards().lock().unwrap_or_else(|e| e.into_inner());
     let Some(board) = board_mut(&mut all, receiver) else {

@@ -2,7 +2,7 @@ use machish::image::EntryPoint;
 use machish::loader::Loader;
 use machish::memory::MmapSpace;
 use machish::report::LinkReport;
-use machish::resolve::{NativeDylibProvider, SymbolProvider, SyntheticDylib, eager_binding_shims};
+use machish::resolve::{NativeDylibProvider, SymbolProvider, eager_binding_shims};
 use machish::spec::constants::{CPU_SUBTYPE_ARM64E, subtype_of};
 use machish::spec::{MachSpec, NativelyExecutable};
 
@@ -128,7 +128,12 @@ impl Native {
         crate::opengl::deny_host_gl(&mut host);
 
         let eager = eager_binding_shims();
-        let tlv = tlv_provider();
+        // The thread-local bootstrap comes from here rather than from a
+        // provider of its own: `HostProviders::chain` reaches the same one for
+        // a `dlopen`ed image, and a name two providers answer differently is a
+        // name that is right on one link path and wrong on the other - which is
+        // exactly how a `dlopen`ed `__thread_vars` ended up bound to the plain
+        // `bootstrap` and losing the guest's registers.
         let runtime = crate::shims::runtime::provider();
         let platform = darwin::provider();
         let objc = crate::objc::dispatch::provider();
@@ -140,7 +145,6 @@ impl Native {
         let mut providers: Vec<&dyn SymbolProvider> = match crate::frameworks::using_builtin() {
             true => vec![
                 &eager,
-                &tlv,
                 &runtime,
                 &platform,
                 &objc,
@@ -150,7 +154,7 @@ impl Native {
                 &opengl,
                 &openal,
             ],
-            false => vec![&eager, &tlv, &runtime, &platform, &steam],
+            false => vec![&eager, &runtime, &platform, &steam],
         };
         match darwin::strict::enabled() {
             true => crate::program::announce_strict(),
@@ -438,15 +442,6 @@ impl crate::objc::Realizer for Native {
     fn class_value(&self, rt: &crate::objc::ObjcRuntime, guest_va: u64) -> u64 {
         rt.host_or(guest_va)
     }
-}
-
-fn tlv_provider() -> SyntheticDylib {
-    let mut lib = SyntheticDylib::new("<rosetta3 tlv>");
-    lib.flat(true);
-    for name in machish::extensions::tlv::BOOTSTRAP_SYMBOLS {
-        lib.define_fn(name, crate::tls::bootstrap_thunk as *const ());
-    }
-    lib
 }
 
 /// Flush the instruction cache over every executable segment.

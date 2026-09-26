@@ -8,10 +8,19 @@ pub mod bootstrap;
 pub mod clock;
 pub mod info;
 pub mod kern;
+// `kevent64` is declared here rather than in a second `exports!` block inside
+// its own file, because a `MODULE` nobody includes is how a name ends up
+// implemented and unbound - which is what its first attempt at this did.
+pub mod kevent64;
 pub mod msg;
+// `policy` is declared here rather than in an `exports!` block inside its own
+// file for the reason `kevent64` is: a `MODULE` nobody includes is how a name
+// ends up implemented and unbound.
+pub mod policy;
 pub mod space;
 pub mod sync;
 pub mod task;
+pub mod thread;
 pub mod vm;
 pub mod wire;
 
@@ -122,10 +131,19 @@ exports::exports! {
             | "host_swap_exception_ports"
             | "thread_swap_exception_ports" => task::task_swap_exception_ports,
 
+        // A thread's machine state, and the suspension pair that would give it
+        // meaning. See `mach::thread`, whose module note is why the first is
+        // published as an assembler entry point rather than a `fn` item.
+        "thread_get_state" => thread::THREAD_GET_STATE,
+        "thread_suspend" => thread::thread_suspend,
+        "thread_resume" => thread::thread_resume,
+
         "mach_port_allocate" => space::mach_port_allocate,
+        "mach_port_construct" => space::mach_port_construct,
         "mach_port_deallocate" => space::mach_port_deallocate,
         "mach_port_destroy" => space::mach_port_destroy,
         "mach_port_mod_refs" => space::mach_port_mod_refs,
+        "mach_port_peek" => msg::mach_port_peek,
         "mach_port_get_refs" => space::mach_port_get_refs,
         "mach_port_insert_right" => space::mach_port_insert_right,
         "mach_port_extract_right" => space::mach_port_extract_right,
@@ -138,10 +156,24 @@ exports::exports! {
         "vm_region_64" => vm::vm_region_64,
         "vm_deallocate" => vm::vm_deallocate,
         "vm_read_overwrite" => vm::vm_read_overwrite,
+        "vm_allocate" => vm::vm_allocate,
+        "vm_map" => vm::vm_map,
+        "vm_protect" => vm::vm_protect,
+
+        // The scheduling-policy and per-CPU-load calls, which this runtime
+        // answers for the arguments the guest passes and refuses by name for
+        // the rest. See `mach::policy`'s module note, which has the call sites.
+        "thread_policy_set" => policy::thread_policy_set,
+        "task_policy_get" => policy::task_policy_get,
+        "task_policy_set" => policy::task_policy_set,
+        "task_self_trap" => policy::task_self_trap,
+        "thread_switch" => policy::thread_switch,
+        "host_processor_info" => policy::host_processor_info,
 
         "mach_msg" => msg::mach_msg,
         "mach_msg_overwrite" => msg::mach_msg_overwrite,
         "mach_msg_destroy" => msg::mach_msg_destroy,
+        "kevent64" => kevent64::kevent64,
         "mig_get_reply_port" => msg::mig_get_reply_port,
         "mig_put_reply_port" => msg::mig_put_reply_port,
         "mig_dealloc_reply_port" => msg::mig_dealloc_reply_port,

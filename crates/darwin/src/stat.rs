@@ -1,9 +1,6 @@
 #![cfg(not(target_os = "macos"))]
 
-use std::{
-    ffi::{CStr, c_char, c_int},
-    mem::MaybeUninit,
-};
+use std::ffi::{CStr, c_char, c_int};
 
 /// Darwin's `struct stat` as an x86-64 guest sees it - the `_DARWIN_FEATURE_64_BIT_INODE`
 /// layout, which is the only one arm64 and modern x86-64 code has.
@@ -282,22 +279,16 @@ pub unsafe extern "C" fn fstatat(
     // path, so the host is handed the one spelling of "no path" that reaches
     // it: this host's `fstatat` answers `ENOENT` for a null path even with the
     // flag set, where Darwin accepts the null one and a guest may pass it.
+    //
+    // Deliberately *not* through `with_fallback_at`: that translates the path
+    // through the prefix namespace, and there is no path here to translate -
+    // the answer is about `dirfd` whatever the caller passed.
     if flags & DARWIN_AT_EMPTY_PATH != 0 {
         return ask(c"".as_ptr()).0;
     }
-    if path.is_null() {
-        return ask(path).0;
-    }
-    // SAFETY: non-null, and a `const char *` is NUL-terminated by contract.
-    let host = prefix::ns::to_host_at(dirfd, unsafe { CStr::from_ptr(path) });
-    let (result, ok) = ask(host.as_ptr());
-    if ok || crate::errno::get() != libc::ENOENT {
-        return result;
-    }
-    let Some(found) = prefix::ns::fold_at(dirfd, &host) else {
-        return result;
-    };
-    ask(found.as_ptr()).0
+    // Which passes a null path straight through, and otherwise does the
+    // case-folding retry `access`, `openat` and `faccessat` all share.
+    with_fallback_at(dirfd, path, ask)
 }
 
 /// Translate a Darwin `AT_` word for a [`fstatat`], refusing bits that cannot be
@@ -609,44 +600,6 @@ pub unsafe extern "C" fn faccessat(
     };
     with_fallback_at(dirfd, path, |path| {
         let rc = unsafe { libc::faccessat(dirfd, path, mode, host_flag) };
-        (rc, rc == 0)
-    })
-}
-
-/// `int fstatat(int fd, const char *path, struct stat *buf, int flag)`
-///
-/// Only `AT_SYMLINK_NOFOLLOW` has a host equivalent. `AT_REALDEV`,
-/// `AT_FDONLY` and `AT_SYMLINK_NOFOLLOW_ANY` change what is looked up or what
-/// `st_dev` means, so they are refused with `EINVAL` rather than dropped.
-///
-/// # Safety
-///
-/// `path` is a NUL-terminated string, `dirfd` is either a directory descriptor
-/// or Darwin's `AT_FDCWD`, and `out` is null or a writable Darwin `struct stat`.
-pub unsafe extern "C" fn fstatat(
-    dirfd: c_int,
-    path: *const c_char,
-    out: *mut Stat,
-    flag: c_int,
-) -> c_int {
-    if flag & !DARWIN_AT_SYMLINK_NOFOLLOW != 0 {
-        crate::errno::set(libc::EINVAL);
-        return -1;
-    }
-    let host_flag = match flag & DARWIN_AT_SYMLINK_NOFOLLOW != 0 {
-        true => libc::AT_SYMLINK_NOFOLLOW,
-        false => 0,
-    };
-    let dirfd = match dirfd {
-        DARWIN_AT_FDCWD => libc::AT_FDCWD,
-        fd => fd,
-    };
-    with_fallback_at(dirfd, path, |path| {
-        let mut host = MaybeUninit::<libc::stat>::uninit();
-        let rc = unsafe { libc::fstatat(dirfd, path, host.as_mut_ptr(), host_flag) };
-        if rc == 0 && !out.is_null() {
-            unsafe { *out = from_host(&host.assume_init()) };
-        }
         (rc, rc == 0)
     })
 }

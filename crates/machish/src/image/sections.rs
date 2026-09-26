@@ -138,6 +138,17 @@ impl<'a> Section<'a> {
         self.section_type() == constants::S_THREAD_LOCAL_ZEROFILL
     }
 
+    /// `__thread_bss_init_func`: the functions that construct a thread's
+    /// zero-initialised thread-locals.
+    ///
+    /// A list of calls rather than part of a block's layout, which is why
+    /// [`tlv_template`](crate::extensions::tlv::tlv_template) ignores it while
+    /// [`Self::is_thread_local`] counts it: an image carrying a constructor and
+    /// no variables is odd but not a reason to skip the image.
+    pub fn is_thread_local_init_functions(&self) -> bool {
+        self.section_type() == constants::S_THREAD_LOCAL_INIT_FUNCTION_POINTERS
+    }
+
     /// How many entries a fixed-stride table holds.
     pub fn entry_count(&self, stride: u64) -> u64 {
         self.size.checked_div(stride).unwrap_or(0)

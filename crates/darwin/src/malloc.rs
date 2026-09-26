@@ -611,7 +611,10 @@ fn page() -> usize {
                 0,
             )
         };
-        assert!(page != libc::MAP_FAILED, "no page for the default malloc zones");
+        assert!(
+            page != libc::MAP_FAILED,
+            "no page for the default malloc zones"
+        );
         let page = page as usize;
         let introspect = (page + INTROSPECTION_AT) as *mut Introspection;
         // SAFETY: three non-overlapping, aligned objects inside a writable page
@@ -663,7 +666,10 @@ fn is_ours(zone: *mut c_void) -> bool {
     let at = zone as usize;
     at == page() + DEFAULT_AT
         || at == page() + PURGEABLE_AT
-        || created().read().unwrap_or_else(|e| e.into_inner()).contains(&at)
+        || created()
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains(&at)
 }
 
 /// The zones [`malloc_create_zone`] made, which are this crate's as much as the
@@ -880,8 +886,12 @@ mod abort_report {
     }
 
     unsafe extern "C" {
-        fn vsnprintf(buffer: *mut c_char, size: usize, format: *const c_char, ap: *mut VaList)
-        -> c_int;
+        fn vsnprintf(
+            buffer: *mut c_char,
+            size: usize,
+            format: *const c_char,
+            ap: *mut VaList,
+        ) -> c_int;
     }
 
     /// How the message is rendered before the first heap fallback. Long enough
@@ -974,8 +984,7 @@ mod abort_report {
         while at < bytes.len() {
             // SAFETY: `bytes` is live for the length passed, and `write` only
             // reads it.
-            let written =
-                unsafe { libc::write(2, bytes[at..].as_ptr().cast(), bytes.len() - at) };
+            let written = unsafe { libc::write(2, bytes[at..].as_ptr().cast(), bytes.len() - at) };
             if written > 0 {
                 at += written as usize;
                 continue;
@@ -1096,7 +1105,12 @@ fn abort_naming(zone: *mut c_void, what: &str, why: &str) -> ! {
 /// `zone` is a live zone: one of this crate's or one a guest registered.
 pub unsafe extern "C" fn malloc_zone_malloc(zone: *mut c_void, size: usize) -> *mut c_void {
     // SAFETY: the caller's zone; `+0x18` is `malloc` in every version.
-    let f = callable(zone, unsafe { slot(zone, 0x18) }, vtable::malloc as *const () as usize, "malloc");
+    let f = callable(
+        zone,
+        unsafe { slot(zone, 0x18) },
+        vtable::malloc as *const () as usize,
+        "malloc",
+    );
     // SAFETY: a zone's `malloc` has this type.
     let f: unsafe extern "C" fn(*mut c_void, usize) -> *mut c_void =
         unsafe { std::mem::transmute(f) };
@@ -1115,7 +1129,12 @@ pub unsafe extern "C" fn malloc_zone_calloc(
     size: usize,
 ) -> *mut c_void {
     // SAFETY: the caller's zone; `+0x20` is `calloc` in every version.
-    let f = callable(zone, unsafe { slot(zone, 0x20) }, vtable::calloc as *const () as usize, "calloc");
+    let f = callable(
+        zone,
+        unsafe { slot(zone, 0x20) },
+        vtable::calloc as *const () as usize,
+        "calloc",
+    );
     // SAFETY: a zone's `calloc` has this type.
     let f: unsafe extern "C" fn(*mut c_void, usize, usize) -> *mut c_void =
         unsafe { std::mem::transmute(f) };
@@ -1130,7 +1149,12 @@ pub unsafe extern "C" fn malloc_zone_calloc(
 /// As [`malloc_zone_malloc`].
 pub unsafe extern "C" fn malloc_zone_valloc(zone: *mut c_void, size: usize) -> *mut c_void {
     // SAFETY: the caller's zone; `+0x28` is `valloc` in every version.
-    let f = callable(zone, unsafe { slot(zone, 0x28) }, vtable::valloc as *const () as usize, "valloc");
+    let f = callable(
+        zone,
+        unsafe { slot(zone, 0x28) },
+        vtable::valloc as *const () as usize,
+        "valloc",
+    );
     // SAFETY: a zone's `valloc` has this type.
     let f: unsafe extern "C" fn(*mut c_void, usize) -> *mut c_void =
         unsafe { std::mem::transmute(f) };
@@ -1148,7 +1172,12 @@ pub unsafe extern "C" fn malloc_zone_free(zone: *mut c_void, ptr: *mut c_void) {
         return;
     }
     // SAFETY: the caller's zone; `+0x30` is `free` in every version.
-    let f = callable(zone, unsafe { slot(zone, 0x30) }, vtable::free as *const () as usize, "free");
+    let f = callable(
+        zone,
+        unsafe { slot(zone, 0x30) },
+        vtable::free as *const () as usize,
+        "free",
+    );
     // SAFETY: a zone's `free` has this type.
     let f: unsafe extern "C" fn(*mut c_void, *mut c_void) = unsafe { std::mem::transmute(f) };
     // SAFETY: as [`malloc_zone_malloc`], with the caller's block.
@@ -1166,7 +1195,12 @@ pub unsafe extern "C" fn malloc_zone_realloc(
     size: usize,
 ) -> *mut c_void {
     // SAFETY: the caller's zone; `+0x38` is `realloc` in every version.
-    let f = callable(zone, unsafe { slot(zone, 0x38) }, vtable::realloc as *const () as usize, "realloc");
+    let f = callable(
+        zone,
+        unsafe { slot(zone, 0x38) },
+        vtable::realloc as *const () as usize,
+        "realloc",
+    );
     // SAFETY: a zone's `realloc` has this type.
     let f: unsafe extern "C" fn(*mut c_void, *mut c_void, usize) -> *mut c_void =
         unsafe { std::mem::transmute(f) };
@@ -1193,7 +1227,12 @@ pub unsafe extern "C" fn malloc_zone_memalign(
         return std::ptr::null_mut();
     }
     // SAFETY: a version-5 zone has `memalign` at `+0x70`.
-    let f = callable(zone, unsafe { slot(zone, 0x70) }, vtable::memalign as *const () as usize, "memalign");
+    let f = callable(
+        zone,
+        unsafe { slot(zone, 0x70) },
+        vtable::memalign as *const () as usize,
+        "memalign",
+    );
     // SAFETY: a zone's `memalign` has this type.
     let f: unsafe extern "C" fn(*mut c_void, usize, usize) -> *mut c_void =
         unsafe { std::mem::transmute(f) };
@@ -1257,7 +1296,11 @@ pub unsafe extern "C" fn malloc_set_zone_name(zone: *mut c_void, name: *const c_
             let page = libc::sysconf(libc::_SC_PAGESIZE) as usize;
             let start = (zone as usize) & !(page - 1);
             let end = (zone as usize + size_of::<Zone>()).next_multiple_of(page);
-            libc::mprotect(start as *mut c_void, end - start, libc::PROT_READ | libc::PROT_WRITE);
+            libc::mprotect(
+                start as *mut c_void,
+                end - start,
+                libc::PROT_READ | libc::PROT_WRITE,
+            );
         }
     }
     // SAFETY: the zone's name field, writable - ours always are, and a guest's
@@ -1485,12 +1528,19 @@ mod tests {
             }
             // SAFETY: `version` is a 32-bit field at `+0x68`.
             let version = unsafe { zone.cast::<u8>().add(0x68).cast::<u32>().read() };
-            assert_eq!(version, 13, "the version whose slots end at try_free_default");
+            assert_eq!(
+                version, 13,
+                "the version whose slots end at try_free_default"
+            );
             let introspect = word(zone, 0x60) as *mut c_void;
             assert!(!introspect.is_null());
             // Every one of the sixteen slots Chromium's own table fills.
             for slot in 0..16 {
-                assert_ne!(word(introspect, slot * 8), 0, "introspection slot {slot} is null");
+                assert_ne!(
+                    word(introspect, slot * 8),
+                    0,
+                    "introspection slot {slot} is null"
+                );
             }
             // And `good_size` answers at least what was asked, in whole quanta.
             // SAFETY: the introspection table's `good_size`.
@@ -1534,7 +1584,10 @@ mod tests {
         // `protection` is the first field; `VM_PROT_WRITE` is 2.
         assert_ne!(info[0] & 2, 0, "the guest must be able to write its slots");
         // Both zones and their table share the page, and nothing else does.
-        assert_eq!(zone as usize & !4095, malloc_default_purgeable_zone() as usize & !4095);
+        assert_eq!(
+            zone as usize & !4095,
+            malloc_default_purgeable_zone() as usize & !4095
+        );
         assert_eq!(word(zone, 0x60) & !4095, zone as usize & !4095);
     }
 
@@ -1566,9 +1619,14 @@ mod tests {
     /// be renamed where a guest reads names.
     #[test]
     fn the_zone_calls_dispatch_through_the_zone() {
-        let _serialised = ONE_ZONE_LIST_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+        let _serialised = ONE_ZONE_LIST_AT_A_TIME
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let zone = malloc_create_zone(0, 0);
-        assert!(all_zones().contains(&(zone as u64)), "created zones are registered");
+        assert!(
+            all_zones().contains(&(zone as u64)),
+            "created zones are registered"
+        );
         assert_eq!(word(zone, 0x48), 0, "and unnamed until named");
         // SAFETY: a zone this crate made, and a NUL-terminated name.
         unsafe { malloc_set_zone_name(zone, c"MyZone".as_ptr()) };
@@ -1583,11 +1641,19 @@ mod tests {
             block.cast::<u8>().write_bytes(0xa5, 40);
             let grown = malloc_zone_realloc(zone, block, 4000);
             assert!(!grown.is_null());
-            assert!(std::slice::from_raw_parts(grown.cast::<u8>(), 40).iter().all(|b| *b == 0xa5));
+            assert!(
+                std::slice::from_raw_parts(grown.cast::<u8>(), 40)
+                    .iter()
+                    .all(|b| *b == 0xa5)
+            );
             malloc_zone_free(zone, grown);
 
             let zeroed = malloc_zone_calloc(zone, 4, 8);
-            assert!(std::slice::from_raw_parts(zeroed.cast::<u8>(), 32).iter().all(|b| *b == 0));
+            assert!(
+                std::slice::from_raw_parts(zeroed.cast::<u8>(), 32)
+                    .iter()
+                    .all(|b| *b == 0)
+            );
             malloc_zone_free(zone, zeroed);
 
             let paged = malloc_zone_valloc(zone, 10);
@@ -1631,7 +1697,12 @@ mod tests {
             let zone = malloc_create_zone(0, 0);
             // SAFETY: the `malloc` slot of a zone this test owns, written as a
             // guest writes it.
-            unsafe { zone.cast::<u8>().add(0x18).cast::<usize>().write(counting_malloc as *const () as usize) };
+            unsafe {
+                zone.cast::<u8>()
+                    .add(0x18)
+                    .cast::<usize>()
+                    .write(counting_malloc as *const () as usize)
+            };
             // SAFETY: a zone whose `malloc` slot allocates from this allocator.
             let block = unsafe { malloc_zone_malloc(zone, 8) };
             assert!(!block.is_null());
@@ -1644,7 +1715,11 @@ mod tests {
             eprintln!("skipping: cannot re-exec this test binary");
             return;
         };
-        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
     }
 
     /// Under emulation the same call is refused by name rather than made: a
@@ -1655,7 +1730,12 @@ mod tests {
             crate::sysctl::set_runs_host_instructions(false);
             let zone = malloc_create_zone(0, 0);
             // SAFETY: as above.
-            unsafe { zone.cast::<u8>().add(0x18).cast::<usize>().write(counting_malloc as *const () as usize) };
+            unsafe {
+                zone.cast::<u8>()
+                    .add(0x18)
+                    .cast::<usize>()
+                    .write(counting_malloc as *const () as usize)
+            };
             // SAFETY: a live zone; this call aborts.
             unsafe { malloc_zone_malloc(zone, 8) };
             return;
@@ -1714,7 +1794,10 @@ mod tests {
 
         // SAFETY: `zeroed` is this vtable's own block of 64 bytes.
         let grown = unsafe { (vtable.realloc)(zone, zeroed, 256) };
-        assert!(!grown.is_null(), "a resize that fails is a lie about memory");
+        assert!(
+            !grown.is_null(),
+            "a resize that fails is a lie about memory"
+        );
         // SAFETY: the first 64 bytes of `grown` are the copy of `zeroed`.
         assert!(
             unsafe { std::slice::from_raw_parts(grown.cast::<u8>(), 64) }
@@ -1741,7 +1824,9 @@ mod tests {
     /// to the next allocation and make a stale entry look current.
     #[test]
     fn registering_and_unregistering_a_zone_round_trips() {
-        let _serialised = ONE_ZONE_LIST_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+        let _serialised = ONE_ZONE_LIST_AT_A_TIME
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         // A `Zone` of the declared layout, leaked so the address the registry
         // keeps stays meaningful. Its contents are this crate's own vtable, so
         // nothing here depends on what a guest would put in one.
@@ -1759,7 +1844,10 @@ mod tests {
         // Registering twice is one zone, not two.
         malloc_zone_register(zone.cast());
         assert_eq!(
-            all_zones().iter().filter(|held| **held == zone as u64).count(),
+            all_zones()
+                .iter()
+                .filter(|held| **held == zone as u64)
+                .count(),
             1
         );
 
@@ -1783,7 +1871,9 @@ mod tests {
     /// reached and nothing in the log to say why.
     #[test]
     fn the_zone_list_answers_for_this_task() {
-        let _serialised = ONE_ZONE_LIST_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+        let _serialised = ONE_ZONE_LIST_AT_A_TIME
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let mut array: *mut u64 = std::ptr::null_mut();
         let mut count = 0;
         // SAFETY: a writable `vm_address_t *` slot, deliberately null as the
@@ -1817,7 +1907,9 @@ mod tests {
     /// already dealt with - as the winner.
     #[test]
     fn the_zone_registered_before_the_others_is_reported_first() {
-        let _serialised = ONE_ZONE_LIST_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+        let _serialised = ONE_ZONE_LIST_AT_A_TIME
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let listed = || {
             let mut array: *mut u64 = std::ptr::null_mut();
             let mut count = 0;
@@ -1864,7 +1956,11 @@ mod tests {
             Some(&(delegating as u64)),
             "a guest reads zones[0] to confirm the zone it installed won"
         );
-        assert_eq!(after.len(), 3, "and the two it re-registered are still there");
+        assert_eq!(
+            after.len(),
+            3,
+            "and the two it re-registered are still there"
+        );
 
         // Put the process back the way it was, so a test running after this one
         // sees the two-zone list it expects.
@@ -1881,9 +1977,8 @@ mod tests {
         let mut array: *mut u64 = std::ptr::null_mut();
         let mut count = 0u32;
         // SAFETY: a writable slot and count, with a task that is not this one.
-        let rc = unsafe {
-            malloc_get_all_zones(Name::from(0x9abcu32), None, &mut array, &mut count)
-        };
+        let rc =
+            unsafe { malloc_get_all_zones(Name::from(0x9abcu32), None, &mut array, &mut count) };
         assert_eq!(rc, KERN_INVALID_TASK);
         // Nothing was handed over and no count was invented, so a caller that
         // ignored the code cannot read the untouched pointer as an answer.

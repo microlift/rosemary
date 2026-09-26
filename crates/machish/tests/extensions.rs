@@ -338,6 +338,119 @@ fn a_bare_loader_reports_nothing_optional() {
     let img = report.root().unwrap();
     assert!(img.initializers.is_empty());
     assert!(img.thread_locals.is_empty());
+    assert!(img.tlv_init_funcs.is_empty());
     // Binding still happened; only the optional passes were skipped.
     assert!(!img.bindings.is_empty());
+}
+
+/// The guest this project exists to run, if it is on this checkout.
+///
+/// Everything below is skipped without it, deliberately: the invariants worth
+/// testing here are the ones a synthetic fixture cannot check, because a
+/// fixture's `__thread_vars` is however many variables its source declares
+/// while a real image has whatever its toolchain emitted.
+fn chromium_framework() -> Option<Vec<u8>> {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../test/Chromium/Chromium.app/Contents/Frameworks")
+        .join("Chromium Framework.framework/Versions/130.0.6723.91")
+        .join("Chromium Framework");
+    let bytes = std::fs::read(path).ok()?;
+    common::is_mach_o(&bytes).then_some(bytes)
+}
+
+/// Every one of the Framework's 116 thread-locals has to come out of a link
+/// with a bound thunk and an offset that lands inside the block its own sections
+/// describe.
+///
+/// The offset check is the one that matters, because it is the only arithmetic
+/// in the thread-local contract and nothing else can catch it: `initial_va` is
+/// the block's byte zero, `offset` is relative to it, and a bootstrap that
+/// returns `initial_va + offset` hands the guest a pointer it will read and
+/// write. One byte out and the write lands in whatever the allocator put next -
+/// silently, because a thread-local's neighbours are other thread-locals.
+///
+/// `__DATA,__thread_data` is 0xa4 bytes and `__DATA,__thread_bss` is 0x388 at
+/// 0xc0, so the block is 0x448 and the largest offset is 0x440: the last
+/// variable ends exactly on the end of the block, which is the shape that
+/// proves the padding between the two sections is inside the arithmetic and not
+/// dropped from it.
+#[test]
+fn every_descriptor_of_the_real_framework_lands_inside_its_block() {
+    let Some(bytes) = chromium_framework() else {
+        skip!("the Chromium Framework is not on this checkout")
+    };
+    let mut mem = BufferSpace::new(0x1_0000_0000);
+    let mut tlv_shim = SyntheticDylib::new("<tlv shims>");
+    tlv_shim
+        .flat(true)
+        .define_fn("__tlv_bootstrap", 0x7f00_0000 as *const ())
+        .define_fn("_tlv_bootstrap", 0x7f00_0000 as *const ());
+    let shims = eager_binding_shims();
+    let native = NativeDylibProvider::system();
+    let providers: [&dyn SymbolProvider; 3] = [&tlv_shim, &shims, &native];
+
+    let report = Loader::new(X86_64)
+        .link(
+            &bytes,
+            "/tmp/Chromium Framework",
+            &mut mem,
+            &providers,
+        )
+        .expect("the Framework links");
+    let img = report.root().unwrap();
+    let template = img
+        .tlv_template
+        .expect("116 descriptors and no block layout would mean a mis-read section");
+
+    assert_eq!(
+        img.thread_locals.len(),
+        116,
+        "0xae0 bytes of __thread_vars is 116 descriptors"
+    );
+    // The block is `__thread_data` followed by the alignment padding in front of
+    // `__thread_bss`, so it is larger than either.
+    assert_eq!(template.initial_size, 0xa4);
+    assert_eq!(template.total_size, 0x448);
+    assert!(template.total_size > template.initial_size);
+    // The section type counts `__thread_bss_init_func`, which this image does not
+    // have: a current toolchain constructs a `thread_local` with a dynamic
+    // initialiser inline at the access instead.
+    assert!(
+        img.tlv_init_funcs.is_empty(),
+        "this image has no __thread_bss_init_func to report"
+    );
+
+    let mut lowest = u64::MAX;
+    let mut highest = 0u64;
+    for d in &img.thread_locals {
+        assert_eq!(
+            d.thunk,
+            0x7f00_0000,
+            "descriptor {:#x} has no bootstrap bound into it",
+            d.at
+        );
+        assert!(
+            d.offset < template.total_size,
+            "descriptor {:#x} indexes {:#x}, past the {:#x}-byte block",
+            d.at,
+            d.offset,
+            template.total_size
+        );
+        // What a bootstrap will return, and the arithmetic has to stay inside
+        // the allocation it will be indexing.
+        let answer = template.initial_va.wrapping_add(d.offset);
+        assert!(answer >= template.initial_va);
+        assert!(
+            answer.wrapping_add(8) <= template.initial_va.wrapping_add(template.total_size),
+            "the variable at offset {:#x} runs off the end of the block",
+            d.offset
+        );
+        lowest = lowest.min(d.offset);
+        highest = highest.max(d.offset);
+    }
+    assert_eq!(lowest, 0, "byte zero of the block is a variable");
+    assert_eq!(
+        highest, 0x440,
+        "the last variable ends exactly on the end of the block"
+    );
 }

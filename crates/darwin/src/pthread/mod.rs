@@ -1,6 +1,7 @@
 pub mod attr;
 mod cond;
 pub mod consts;
+mod mach_thread;
 mod mutex;
 pub mod object;
 mod once;
@@ -143,6 +144,32 @@ mod thread_ids {
                 }
                 0 => return None,
                 _ => {}
+            }
+        }
+        None
+    }
+
+    /// The other direction: the handle registered under `id`.
+    ///
+    /// Needed by `pthread_from_mach_thread_np`, whose whole contract is the
+    /// reverse of [`get`] - see `pthread::mach_thread` for why that direction is
+    /// a search rather than a cast. The forward direction is anchored at the
+    /// caller's own handle, so it can stop at the first empty slot; this one has
+    /// no such anchor, so it reads the whole table, and it reads the pair the
+    /// way [`register`] published it, so a concurrent registration cannot be
+    /// seen half-made.
+    pub fn thread_of(id: u32) -> Option<u64> {
+        for index in 0..CAPACITY {
+            let thread = THREADS[index].load(Ordering::Acquire);
+            if thread == 0 {
+                continue;
+            }
+            // SAFETY: `register` fills the handle with a release store before it
+            // fills the id, so a handle read here is published and the id read
+            // after it is the one that belongs to it.
+            let seen = IDS[index].load(Ordering::Acquire);
+            if seen == id {
+                return (thread != 0).then_some(thread);
             }
         }
         None
@@ -428,6 +455,29 @@ pub unsafe extern "C" fn kill(thread: u64, signal: u64) -> i32 {
     err::from_host(unsafe { libc::pthread_kill(thread_of(thread), host) })
 }
 
+/// What `libpthread` returns for a thread it does not know: the `errno` value
+/// cast to a pointer.
+///
+/// ```c
+/// if (!_pthread_validate_thread_and_list_lock(t)) {
+///         return (void *)(uintptr_t)ESRCH; // XXX bug?
+/// }
+/// ```
+/// (`apple-oss-distributions/libpthread`, `src/pthread.c:1069-1071`) - flagged
+/// upstream as a bug, and kept here for the same reason it is kept there: a
+/// guest that range-checks its stack base the way Chromium's
+/// `SuspendableThreadDelegateMac` does is told the answer is nonsense by
+/// arithmetic, and one that dereferences it faults on Darwin too.
+///
+/// A near-null answer is also the only safe one, and this tree produces the null
+/// handle on purpose: `pthread_from_mach_thread_np` answers zero for a port it
+/// cannot resolve, and that zero arrives here as the handle. A guest that walks
+/// the pair the way Chromium's `SuspendableThreadDelegateMac` does must get
+/// nonsense it can range-check rather than a plausible address from a thread
+/// that is not the one it asked about.
+#[cfg(not(target_os = "macos"))]
+const UNKNOWN_STACK: u64 = err::ESRCH as u64;
+
 /// `void *pthread_get_stackaddr_np(pthread_t)` - the **highest** address of the
 /// thread's stack, which is where a stack that grows down begins.
 ///
@@ -436,17 +486,20 @@ pub unsafe extern "C" fn kill(thread: u64, signal: u64) -> i32 {
 /// address instead gets a stack it believes lies above its real one, which is
 /// how a crash reporter comes to walk unmapped memory.
 ///
-/// Zero when the host will not say, which is what Darwin answers for a thread
-/// it does not know.
-///
 /// # Safety
 ///
-/// `thread` is a `pthread_t` this process issued.
+/// `thread` is a `pthread_t` this process issued, or the null handle
+/// `pthread_from_mach_thread_np` answers with - which is refused here rather
+/// than passed down, because glibc reads its argument as a `struct pthread *`
+/// and a null one is not a thread.
 #[cfg(not(target_os = "macos"))]
 pub unsafe extern "C" fn get_stackaddr_np(thread: u64) -> u64 {
+    if thread == 0 {
+        return UNKNOWN_STACK;
+    }
     match unsafe { stack_of(thread) } {
         Some((low, size)) => low.wrapping_add(size as u64),
-        None => 0,
+        None => UNKNOWN_STACK,
     }
 }
 
@@ -457,6 +510,9 @@ pub unsafe extern "C" fn get_stackaddr_np(thread: u64) -> u64 {
 /// As [`get_stackaddr_np`].
 #[cfg(not(target_os = "macos"))]
 pub unsafe extern "C" fn get_stacksize_np(thread: u64) -> u64 {
+    if thread == 0 {
+        return 0;
+    }
     unsafe { stack_of(thread) }.map_or(0, |(_, size)| size as u64)
 }
 
@@ -1087,6 +1143,7 @@ exports::exports! {
         "pthread_main_np" => main_np,
         "pthread_threadid_np" => threadid_np,
         "pthread_mach_thread_np" => mach_thread_np,
+        "pthread_from_mach_thread_np" => mach_thread::from_mach_thread_np,
         "pthread_yield_np" => yield_np,
         "pthread_set_qos_class_self_np" => set_qos_class_self_np,
         "pthread_get_qos_class_np" => get_qos_class_np,

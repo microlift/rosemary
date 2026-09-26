@@ -198,8 +198,21 @@ pub fn provider() -> SyntheticDylib {
         "___stack_chk_guard",
         &STACK_CHK_GUARD as *const u64 as usize as u64,
     );
+    // `bootstrap_thunk`, never `bootstrap`. The two are the same function
+    // except for the calling convention dyld's `_tlv_get_addr` has and the
+    // System V ABI does not: a `tlv_descriptor` thunk preserves *every*
+    // register except the result, because a thread-local access is emitted
+    // without spilling anything first. The plain `bootstrap` is an ordinary
+    // C function and freely clobbers `rdi`..`r11` and `xmm0`..`xmm7`, so
+    // publishing it loses a value the guest still needs - in Chromium
+    // Framework, the `rsi` holding a moved-from object, and the next
+    // instruction after the bootstrap is a load through it.
+    //
+    // This is the *only* provider in the `dlopen` chain that defines these
+    // names, so a `dlopen`ed image's `__thread_vars` binds here, and the
+    // program's own link reaches the same function through this provider too.
     for name in machish::extensions::tlv::BOOTSTRAP_SYMBOLS {
-        lib.define_fn(name, crate::tls::bootstrap as *const ());
+        lib.define_fn(name, crate::tls::bootstrap_thunk as *const ());
     }
     let atexit = crate::host::symbol("_tlv_atexit")
         .map_or(tlv_atexit as *const (), |f| f as usize as *const ());

@@ -164,6 +164,21 @@ pub(super) static RUNTIME: &[Runtime] = &[
     // makes that answer usable from guest code, and it returns a `ptrdiff_t`.
     rt!("ivar_getName", P, P),
     rt!("ivar_getOffset", I64, P),
+    //
+    // The other way to swizzle, and the one a framework reaches for: the two
+    // implementations trade places rather than one replacing the other, so the
+    // original stays reachable and a caller that saved the `IMP` first has kept
+    // it. Chromium swaps methods in five places in the Framework, two of them in
+    // its allocator interception, so this is not a corner of the surface.
+    //
+    // Pure passthrough, and both arguments are host `Method` objects on the
+    // emulated backend: a guest gets them from `class_getInstanceMethod`, whose
+    // row hands back the runtime's own handle untranslated, and every `IMP` inside
+    // one is already either a host function or a thunk this runtime installed. So
+    // there is nothing to translate on the way in, nothing to re-enter, and the
+    // invalidation a swizzle needs is the one `method_setImplementation` above
+    // already gets - see the probe on `objc::class::method_implementation`.
+    rt!("method_exchangeImplementations", V, P, P),
     rtb!([1], "method_setImplementation", P, P, P),
     // ARC and the `objc_msgSend` optimisations clang emits at `-O` whether or
     // not the file uses ARC.
@@ -259,6 +274,19 @@ pub(super) static RUNTIME: &[Runtime] = &[
         protocols: &[],
         struct_return: None,
     },
+    //
+    // The per-exception preprocessor slot, and the return of whatever was in it.
+    // Passthrough for the reason the weak-reference note above gives, and for the
+    // same reason a *thunk would be wrong here*: the slot is keyed by the
+    // exception's address, which is a real address in this process on both sides,
+    // and the value is the guest's own function pointer stored and returned
+    // unchanged - a host thunk handed back to the guest is an address it cannot
+    // call, which would break the chaining this entry point exists for.
+    //
+    // Nothing calls it. `objc_exception_throw` is refused below, so a guest that
+    // installs a preprocessor is told by name that the throw it was for did not
+    // happen; see `objc::api::objc_setExceptionPreprocessor`.
+    rt!("objc_setExceptionPreprocessor", P, P, P),
     // See the note on `objc_getProperty` for why the argument order is not the
     // same in the general entry point as in the four specialized ones.
     rtc!([0, 3], "objc_setProperty", V, P, P, I64, P, U8, U8),
@@ -277,6 +305,15 @@ pub(super) static RUNTIME: &[Runtime] = &[
     rt!("objc_terminate", V),
     // The `__unsafe_unretained` end of the autoreleased-return-value handshake.
     rtc!([0], "objc_unsafeClaimAutoreleasedReturnValue", P, P),
+    //
+    // Destroy the receiver and hand it back. The argument is a class position for
+    // the reason `objc_retain`'s is - an `id` here can be a class, and a class is
+    // the one pointer that means something different on the two sides - and the
+    // *return* is translated for a reason of its own: it is the argument, so a
+    // guest that disposed a class and read the class back has to get the class it
+    // still holds. Translating only one direction would be a runtime that hands
+    // back a host class object to a guest holding a guest one.
+    rtc!([0] -> true, "object_dispose", P, P),
     rtc!([0] -> true, "object_getClass", P, P),
     rtc!([0], "object_getClassName", P, P),
     rt!("object_getIndexedIvars", P, P),
@@ -541,7 +578,39 @@ pub fn provider() -> SyntheticDylib {
         // it is the runtime that answers for it: `objc_retainBlock` and
         // `_Block_copy` are one function, and whichever runtime has one has the
         // other.
-        .chain(objc::block::names());
+        .chain(objc::block::names())
+        // The rest of `objc`'s own `exports!` table - `class_getName`,
+        // `class_getClassMethod`, `method_getImplementation`, `object_dispose`
+        // and the rest of the introspection surface.
+        //
+        // Publishing this is *not* the only way one of those names reaches a
+        // guest, and the difference is worth being exact about, because getting
+        // it wrong is what made this look like dead code when it was not.
+        //
+        // Under **emulated** execution a guest call is intercepted: it arrives at
+        // `abi::call_import`, is looked up in [`RUNTIME`], and [`serve`] runs the
+        // reimplementation. So the 69 of these 98 names that also have a
+        // [`RUNTIME`] row are already answered on that backend, and
+        // [`super::fast`] can inline the ones that provably never re-enter the
+        // guest. Nothing about that path needs the import bound, which is why
+        // the gap is invisible from the emulated side.
+        //
+        // Under **native** execution there is no such interception: a guest
+        // import is a direct call through its slot, so the name has to be
+        // *published* or the slot is a zero. A name missing from this list does
+        // not fall through to the host - the provider is consulted first, and
+        // its silence is the answer - so on this backend it was a jump through a
+        // zero slot.
+        //
+        // Which is exactly what Chromium's allocator interception hit:
+        // `class_getClassMethod` has no [`RUNTIME`] row, so it was unreachable on
+        // *either* backend, and it stopped before `main` with the runtime
+        // reporting a name it had an implementation for all along. The other 28
+        // that have no row are in the same position.
+        //
+        // None of the three [`BUILTIN_GAPS`] is in this table, so publishing it
+        // does not quietly answer what that list exists to leave unanswered.
+        .chain(objc::names());
     for name in names {
         // Never dropped. A name this provider does not define falls through to
         // the native provider - or, on a host that denies the family, goes

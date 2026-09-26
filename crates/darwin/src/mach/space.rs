@@ -1,6 +1,7 @@
 #![cfg(not(target_os = "macos"))]
 
 use std::collections::HashMap;
+use std::ffi::c_void;
 use std::sync::{Arc, RwLock};
 
 use super::kern::*;
@@ -269,6 +270,345 @@ pub fn destroy(name: Name) -> i32 {
         Some(_) => KERN_SUCCESS,
         None => KERN_INVALID_NAME,
     })
+}
+
+// ---------------------------------------------------------------------------
+// `mach_port_construct` and the `mach_port_options_t` it reads.
+//
+// **The structure is a struct, not a union, and `flags` is a bitmask of
+// independent attributes rather than a tag.** The SDK's `mach/port.h` - the same
+// text in 10.15, 11.0 and 11.3, and the same as `osfmk/mach/port.h` - says:
+//
+// ```c
+// typedef struct mach_port_options {
+//         uint32_t                flags;    /* Flags defining attributes for port */
+//         mach_port_limits_t      mpl;      /* Message queue limit for port */
+//         union {
+//                 uint64_t        reserved[2];
+//                 mach_port_name_t work_interval_port;
+//         };
+// } mach_port_options_t;
+//
+// typedef struct mach_port_limits {
+//         mach_port_msgcount_t    mpl_qlimit;     /* number of msgs */
+// } mach_port_limits_t;                          /* mach_port_msgcount_t is natural_t */
+//
+// #define MPO_QLIMIT              0x02
+// #define MPO_INSERT_SEND_RIGHT   0x10
+// ```
+//
+// 24 bytes: `flags` at +0, `mpl.mpl_qlimit` at +4, and sixteen bytes of
+// `reserved` after that. **Both of the fields a caller writes are one 32-bit
+// word**, which is the whole of the puzzle below. There is no
+// `MPO_EXTRACT_SEND_RIGHT`, no `MPO_MOVE_*` and no `mach_port_port_t` in the
+// header any more: the insert/extract/move encoding an earlier draft of this
+// file assumed is not one Darwin declares, and the `0x8` that draft gave
+// `MPO_INSERT_SEND_RIGHT` is `MPO_IMPORTANCE_RECEIVER`.
+//
+// ## The encoding, read out of the guest
+//
+// A header is not evidence about a binary that was compiled against a possibly
+// different one, so the layout was read from Chromium 130's Framework itself
+// (`test/Chromium/.../Chromium Framework`, 244 MB; `test/tools/macho.py` parses
+// it, `test/tools/raw-range.py` disassembles a range of it). It imports
+// `_mach_port_construct` through the stub at `0xcca167a` and has exactly two
+// `call`s to that stub in the whole image; no other Mach-O in the app bundle
+// imports it at all.
+//
+// **1. `WaitableEvent::WaitableEvent` at `0x5d9a090`**, the constructor whose
+// `CHECK` is the one that fires: the failure path calls `Check(file, line,
+// condition)` at `0x5d9a2a0` with `line = 0x27` = 39 and
+// `"./../base/synchronization/waitable_event_apple.cc"`, so the two statements
+// below are lines 32 to 38:
+//
+// ```text
+//  5d9a0ce  xorps  xmm0,xmm0
+//  5d9a0d1  movups XMMWORD PTR [rbp-0x50],xmm0    ; 16 bytes of `reserved`, zeroed
+//  5d9a0d5  movabs rax,0x100000010
+//  5d9a0df  mov    QWORD PTR [rbp-0x58],rax      ; <- the option word
+//  5d9a0e3  mov    DWORD PTR [rbp-0x2c],0xaaaaaaaa   ; mach_port_t name, unwritten
+//  5d9a0f5  lea    rsi,[rbp-0x58]                 ; &options
+//  5d9a0f9  lea    rcx,[rbp-0x2c]                 ; &name
+//  5d9a0fd  xor    edx,edx                        ; context
+//  5d9a0ff  call   _mach_port_construct
+// ```
+//
+// which is
+//
+// ```c
+// mach_port_options_t options{};
+// options.flags = MPO_INSERT_SEND_RIGHT;
+// options.mpl.mpl_qlimit = 1;
+// ```
+//
+// **So `0x100000010` is not a Mach port name and not a Mach port of any kind.**
+// It is two adjacent 32-bit fields of one structure, read across as a single
+// 64-bit word: the low half is `flags` and the high half is `mpl.mpl_qlimit`,
+// and the compiler folded two constant stores into one. A `mach_port_name_t` is
+// 32 bits wide, so no Mach name can have bit 32 set at all - the shape
+// `(1 << 32) | index` is not a name this kernel, or this namespace, can issue.
+//
+// **2. `base::apple::CreateMachPort` at `0x5d94340`**, which builds the same
+// word out of runtime values and is what fixes the two field widths and the
+// two constants independently of the folded store above:
+//
+// ```text
+//  5d94362  xorps  xmm0,xmm0
+//  5d94365  movaps XMMWORD PTR [rbp-0x60],xmm0    ; 16 bytes, zeroed
+//  5d94369  mov    QWORD PTR [rbp-0x50],0x0       ; ...all 24
+//  5d9435c  test   rsi,rsi                        ; send != nullptr
+//  5d94371  shl    eax,0x4                        ; << 4 = MPO_INSERT_SEND_RIGHT
+//  5d94374  mov    DWORD PTR [rbp-0x60],eax       ; options.flags, 4 bytes at +0
+//  5d94377  bt     rdx,0x20                       ; queue_limit.has_value()
+//  5d9437e  or     eax,0x2                        ; MPO_QLIMIT
+//  5d94381  mov    DWORD PTR [rbp-0x60],eax
+//  5d94384  mov    DWORD PTR [rbp-0x5c],edx       ; options.mpl.mpl_qlimit at +4
+// ```
+//
+// from `base/apple/scoped_mach_port.cc:40-46`. A 4-byte store at +0 and a
+// 4-byte store at +4, with the shift fixing `MPO_INSERT_SEND_RIGHT` at `0x10`
+// and the or fixing `MPO_QLIMIT` at `0x2` - the values `<mach/port.h>` gives
+// them. **Both call sites in the entire guest are served below.**
+
+/// `mach_port_construct`'s `options.flags`: set the queue limit for the new
+/// port's message queue, from `options.mpl.mpl_qlimit`.
+///
+/// Accepted and the value dropped - see [`mach_port_construct`]. The other
+/// attribute bits are named in [`ATTRIBUTES`] because a refusal that says which
+/// bit it refused is a refusal a caller can act on.
+pub const MPO_QLIMIT: u32 = 0x2;
+
+/// `mach_port_construct`'s `options.flags`: also insert a send right to the new
+/// port, so the caller can send on it as well as receive.
+///
+/// `0x10`, not the `0x8` an earlier draft of this file carried: that draft read
+/// `mach_port_options_t` as a union, and `0x8` is `MPO_IMPORTANCE_RECEIVER`.
+pub const MPO_INSERT_SEND_RIGHT: u32 = 0x10;
+
+/// Every attribute bit `options.flags` may carry: `MPO_OPTIONS_MASK`.
+pub const MPO_OPTIONS_MASK: u32 = 0x23ff;
+
+/// The port-type bits of `options.flags`: `MPO_PORT_TYPE_MASK`. The type is
+/// `MPO_PORT`, zero, for a plain port - so `flags == 0` is a complete request
+/// for one, and is served.
+pub const MPO_PORT_TYPE_MASK: u32 = 0x1dc00;
+
+/// `MPO_UNUSED_BITS`: everything outside the two masks above. Mach checks this
+/// first and answers `KERN_INVALID_ARGUMENT`, and so does [`mach_port_construct`].
+pub const MPO_UNUSED_BITS: u32 = !(MPO_OPTIONS_MASK | MPO_PORT_TYPE_MASK);
+
+/// The attribute bits, by name, in `<mach/port.h>`'s order. Carries no logic:
+/// it is the message a refusal speaks, and the test that the mask above is
+/// exactly the union of the bits in it.
+const ATTRIBUTES: &[(u32, &str)] = &[
+    (0x01, "MPO_CONTEXT_AS_GUARD"),
+    (MPO_QLIMIT, "MPO_QLIMIT"),
+    (0x04, "MPO_TEMPOWNER"),
+    (0x08, "MPO_IMPORTANCE_RECEIVER"),
+    (MPO_INSERT_SEND_RIGHT, "MPO_INSERT_SEND_RIGHT"),
+    (0x20, "MPO_STRICT"),
+    (0x40, "MPO_DENAP_RECEIVER"),
+    (0x80, "MPO_IMMOVABLE_RECEIVE"),
+    (0x100, "MPO_FILTER_MSG"),
+    (0x200, "MPO_TG_BLOCK_TRACKING"),
+    (0x2000, "MPO_ENFORCE_REPLY_PORT_SEMANTICS"),
+];
+
+/// The port types, by name. `MPO_PORT` is 0 and so is not here: it is the one
+/// type this namespace answers, and `mach_port_type` then reports an ordinary
+/// receive right.
+const PORT_TYPES: &[(u32, &str)] = &[
+    (0x400, "MPO_SERVICE_PORT"),
+    (0x800, "MPO_CONNECTION_PORT"),
+    (0x1000, "MPO_REPLY_PORT"),
+    (0x4000, "MPO_PROVISIONAL_REPLY_PORT"),
+    (0x8000, "MPO_EXCEPTION_PORT"),
+    (0x10000, "MPO_CONNECTION_PORT_WITH_PORT_ARRAY"),
+];
+
+/// The named bits of `bits`, for a message: nothing for no bits, since a
+/// caller reading "asks for " has to be able to see the end of the list. Bits
+/// that name nothing stay as their number, because inventing a name for one is
+/// how a diagnostic starts lying.
+fn named(bits: u32, names: &[(u32, &str)]) -> String {
+    if bits == 0 {
+        return String::new();
+    }
+    let mut left = bits;
+    let mut out: Vec<&str> = Vec::new();
+    for (bit, name) in names {
+        if left & bit != 0 {
+            out.push(name);
+            left &= !bit;
+        }
+    }
+    match out.is_empty() {
+        true => format!("{left:#x}"),
+        false if left == 0 => out.join("|"),
+        false => format!("{}|{left:#x}", out.join("|")),
+    }
+}
+
+/// `kern_return_t mach_port_construct(ipc_space_t, mach_port_options_t *,
+/// uint64_t context, mach_port_t *)`
+///
+/// Creates a port and hands the caller a name for it in one call. There is no
+/// two-argument form: the options and the context are always there, which is
+/// worth recording because a two-argument prototype reads `options` as the
+/// name and answers about a value the caller never put there.
+///
+/// **What is served, and what is not.** The one request this answers is an
+/// ordinary port - `MPO_PORT`, which is to say `options.flags == 0` - with
+/// nothing else asked of it, or with [`MPO_INSERT_SEND_RIGHT`] and/or
+/// [`MPO_QLIMIT`] alongside:
+///
+/// * Mach's answer to `MPO_INSERT_SEND_RIGHT` is `IP_INIT_MAKE_SEND_RIGHT`:
+///   one entry in the space whose type is receive *and* send
+///   (`ipc_port_alloc` sets `type = MACH_PORT_TYPE_RECEIVE | MACH_PORT_TYPE_SEND`
+///   under one name), which is why a caller may send on what it just received
+///   and why Chromium assigns the one name to both of its handles. Not a
+///   special case here: a receive right in this namespace is already a legal
+///   message destination ([`destination`]), so the single right this inserts
+///   serves both. The one difference worth naming is that `mach_port_type`
+///   reports an ordinary receive right where a real kernel reports
+///   `MACH_PORT_TYPE(RECEIVE) | MACH_PORT_TYPE(SEND)`, because this namespace
+///   has one right per name and a name that means two things cannot be
+///   reference counted as two.
+/// * `MPO_QLIMIT` is accepted and its value dropped. Mach sets the depth of a
+///   queue that does not exist here, and the only thing a caller can observe
+///   about a queue's depth is what `mach_msg` returns to the *receiver* - which
+///   in this namespace is the empty message Chromium sends as the signal, not
+///   the number of messages waiting. Chromium's own reason for asking for a
+///   limit of one is that a second send to an already-signalled event should
+///   block rather than succeed, and blocking is what a send to a socket here
+///   does once the receiver is not waiting.
+///
+/// Everything else is refused **by name**, and that is the point rather than a
+/// limitation of convenience. `mach_port_construct` can also be asked for a
+/// guarded port, a port with a temp owner the kernel deallocates when the task
+/// dies, an importance or app-nap donation receiver, an immovable receive
+/// right, a message filter, thread-group blocking tracking, reply-port
+/// semantics, or any of the six port types that are not a plain port - a
+/// service port launchd can look up, a connection port, an exception port.
+/// Answering any of those with a fresh receive right hands the caller a port it
+/// did not ask for and silently does not do what it said, and a wrong answer is
+/// invisible where a refusal names itself. Both of Chromium's call sites are in
+/// the served set, which is what lets the remaining nine attribute bits and all
+/// six other port types be refused honestly instead of waved through.
+///
+/// `context` is Mach's value to associate with the port, which a real kernel
+/// keeps on the port itself (`port->ip_context = context`) for the guard
+/// machinery. Nothing in this namespace has anywhere to put one and nothing
+/// here reads one back, so it is accepted and dropped rather than refused for
+/// being present. The one option that gives it meaning, `MPO_CONTEXT_AS_GUARD`,
+/// is refused above.
+///
+/// # Safety
+///
+/// `options` is null or a readable `mach_port_options_t`; `name` is a writable
+/// `mach_port_name_t`.
+pub unsafe extern "C" fn mach_port_construct(
+    task: Name,
+    options: *mut c_void,
+    context: u64,
+    name: *mut Name,
+) -> i32 {
+    if name.is_null() {
+        return KERN_INVALID_ADDRESS;
+    }
+    if task != TASK_SELF {
+        // Constructing a right in *another* task's space is a privilege this
+        // process does not have and the runtime cannot express: the namespace
+        // here is one flat space for this process, so there is no other task's
+        // to insert into. Mach refuses a task that is not this one too.
+        return KERN_INVALID_TASK;
+    }
+    // `flags` and `mpl.mpl_qlimit`, the two fields a caller writes, each one
+    // 32-bit value - see the note above this file's first `MPO_` constant for how
+    // that was established from the guest's own stores. A null `options` is the
+    // same request as a zeroed structure, because every bit in `flags` is opt-in
+    // and `MPO_PORT` is zero.
+    let (flags, _qlimit) = if options.is_null() {
+        (0, 0)
+    } else {
+        // SAFETY: the caller states `options` is readable, and the first two
+        // fields of the structure are 32-bit integers.
+        unsafe {
+            let fields = options.cast::<u32>();
+            (fields.read(), fields.add(1).read())
+        }
+    };
+    let port_type = flags & MPO_PORT_TYPE_MASK;
+    let attributes = flags & MPO_OPTIONS_MASK;
+    // Mach's own first test is `options->flags & MPO_UNUSED_BITS`; the two after
+    // it are this file's, for the requests it does not do. The queue limit is
+    // read and dropped on purpose: there is no queue here for a limit to bound,
+    // and the comment above says what a caller can and cannot observe about that.
+    if flags & MPO_UNUSED_BITS != 0
+        || port_type != 0
+        || attributes & !(MPO_INSERT_SEND_RIGHT | MPO_QLIMIT) != 0
+    {
+        return refused_construct(flags, attributes, port_type, context, task, options, name);
+    }
+    let port = match Receiver::bind() {
+        Ok(port) => port,
+        Err(_) => return KERN_RESOURCE_SHORTAGE,
+    };
+    let inserted = insert_receive(port);
+    // SAFETY: the caller states `name` is a writable `mach_port_name_t`.
+    unsafe { name.write(inserted) };
+    KERN_SUCCESS
+}
+
+/// Say once that a construct asked for something this does not do, and say what.
+///
+/// The words are in the message because a caller that only checks the return
+/// code cannot say anything else: `KERN_INVALID_ARGUMENT` is a number, and
+/// Chromium's own report of it names only its file and line. Naming the *bits*
+/// is what makes the number actionable - `MPO_SERVICE_PORT` can be looked up in
+/// `<mach/port.h>` and reasoned about, `0x400` cannot.
+fn refused_construct(
+    flags: u32,
+    attributes: u32,
+    port_type: u32,
+    context: u64,
+    task: Name,
+    options: *mut c_void,
+    name: *mut Name,
+) -> i32 {
+    static SAID: std::sync::Once = std::sync::Once::new();
+    SAID.call_once(|| {
+        let mut asked = named(flags & MPO_UNUSED_BITS, &[]);
+        if !asked.is_empty() {
+            asked.push_str(", which mach_port_construct does not define at all");
+        }
+        let bits = named(
+            attributes & !(MPO_INSERT_SEND_RIGHT | MPO_QLIMIT),
+            ATTRIBUTES,
+        );
+        if !bits.is_empty() {
+            if !asked.is_empty() {
+                asked.push_str(", and ");
+            }
+            asked.push_str(&bits);
+        }
+        if port_type != 0 {
+            if !asked.is_empty() {
+                asked.push_str(", and ");
+            }
+            asked.push_str(&format!("port type {}", named(port_type, PORT_TYPES)));
+        }
+        eprintln!(
+            "rosetta3: mach_port_construct: task={task:#x} options={options:p} \
+             context={context:#x} name={name:p}; options.flags={flags:#x} asks for {asked}, \
+             and only MPO_INSERT_SEND_RIGHT ({MPO_INSERT_SEND_RIGHT:#x}) and MPO_QLIMIT \
+             ({MPO_QLIMIT:#x}) are answered. A name in this namespace is one entry in one flat \
+             table, so a guard, a temp owner to deallocate, an app-nap or importance donation, \
+             a message filter, reply-port semantics and a launchd to look a service port up in \
+             are all outside what a construct can give a caller here"
+        );
+    });
+    KERN_INVALID_ARGUMENT
 }
 
 /// `kern_return_t mach_port_allocate(ipc_space_t, mach_port_right_t, mach_port_name_t *)`
@@ -637,6 +977,172 @@ mod tests {
         assert_eq!(type_of(RIGHT_SEND), 0x0001_0000);
         assert_eq!(type_of(RIGHT_RECEIVE), 0x0002_0000);
         assert_eq!(type_of(RIGHT_DEAD_NAME), 0x0010_0000);
+    }
+
+    /// The two masks `mach_port_construct` tests are exactly the union of the
+    /// bits named beside them, so a bit added to a table without being added to
+    /// a mask is caught here rather than becoming a construct this file refuses
+    /// for no reason it can name.
+    #[test]
+    fn the_option_masks_are_the_union_of_the_bits_named_beside_them() {
+        let attributes = ATTRIBUTES.iter().fold(0, |mask, (bit, _)| mask | bit);
+        assert_eq!(attributes, MPO_OPTIONS_MASK);
+        let port_types = PORT_TYPES.iter().fold(0, |mask, (bit, _)| mask | bit);
+        assert_eq!(port_types, MPO_PORT_TYPE_MASK);
+        assert_eq!(MPO_UNUSED_BITS & (MPO_OPTIONS_MASK | MPO_PORT_TYPE_MASK), 0);
+    }
+
+    /// The message a refusal speaks is the whole of what a caller gets to know
+    /// about a construct this file will not do, so it has to name the bit and
+    /// nothing but the bit.
+    #[test]
+    fn a_refusal_names_the_bits_it_refused() {
+        assert_eq!(named(0, ATTRIBUTES), "", "no bits, no list");
+        assert_eq!(named(MPO_QLIMIT, ATTRIBUTES), "MPO_QLIMIT");
+        assert_eq!(named(0x04, ATTRIBUTES), "MPO_TEMPOWNER");
+        assert_eq!(
+            named(0x04 | 0x08, ATTRIBUTES),
+            "MPO_TEMPOWNER|MPO_IMPORTANCE_RECEIVER"
+        );
+        assert_eq!(named(0x400, PORT_TYPES), "MPO_SERVICE_PORT");
+        assert_eq!(
+            named(0x400 | 0x1_0000, PORT_TYPES),
+            "MPO_SERVICE_PORT|MPO_CONNECTION_PORT_WITH_PORT_ARRAY"
+        );
+        // A bit with no name in the table stays its number: it is not this
+        // file's job to guess, and a wrong name is worse than none.
+        assert_eq!(named(0x4000_0000, ATTRIBUTES), "0x40000000");
+    }
+
+    /// The two stores Chromium's `WaitableEvent` constructor makes
+    /// (`Framework+0x5d9a0df`, from `options.flags = MPO_INSERT_SEND_RIGHT`
+    /// and `options.mpl.mpl_qlimit = 1`) and the guest word the compiler folds
+    /// them into. Read back the way a guest would read it: 64 bits at once.
+    #[test]
+    fn the_option_word_chromium_writes_is_two_adjacent_u32_fields() {
+        let mut block = [0u8; 24];
+        block[0..4].copy_from_slice(&MPO_INSERT_SEND_RIGHT.to_ne_bytes());
+        block[4..8].copy_from_slice(&1u32.to_ne_bytes());
+        let word = u64::from_ne_bytes(block[0..8].try_into().unwrap());
+        assert_eq!(
+            word, 0x0000_0001_0000_0010,
+            "the guest's movabs immediate is flags in the low half and mpl.mpl_qlimit in the high one"
+        );
+
+        // The halves are not interchangeable, and that is the layout rather than
+        // an accident of the fold: a word with the two fields the other way
+        // round is one this file refuses, because `MPO_INSERT_SEND_RIGHT` in the
+        // high half is a bit `mach_port_construct` does not define at all.
+        block[0..8].copy_from_slice(&0x0000_0010_0000_0001u64.to_ne_bytes());
+        let mut name = 0xaaaa_aaaau32;
+        // SAFETY: `block` is a live 24-byte structure and `name` a live `Name`.
+        let rc = unsafe { mach_port_construct(TASK_SELF, block.as_mut_ptr().cast(), 0, &mut name) };
+        assert_eq!(rc, KERN_INVALID_ARGUMENT, "the halves are not swappable");
+        assert_eq!(name, 0xaaaa_aaaa, "and no name was invented for it");
+    }
+
+    /// What a guest observes for Chromium's own construct: the word the guest
+    /// stores is accepted, and the name it gets back is what its two handles
+    /// need - a receive right it can wait on, and a destination it can send to.
+    #[test]
+    fn the_construct_chromium_performs_gives_a_name_it_can_wait_on_and_send_to() {
+        // The guest's exact 24 bytes: its folded 8-byte store, then the 16
+        // bytes of `reserved` it zeroed and never touched again.
+        let mut block = [0u8; 24];
+        block[0..8].copy_from_slice(&0x0000_0001_0000_0010u64.to_ne_bytes());
+
+        let mut name = 0xaaaa_aaaau32;
+        // SAFETY: `block` is a live 24-byte structure and `name` a live `Name`.
+        let rc = unsafe { mach_port_construct(TASK_SELF, block.as_mut_ptr().cast(), 0, &mut name) };
+        assert_eq!(rc, KERN_SUCCESS, "options.flags = MPO_INSERT_SEND_RIGHT");
+        assert_ne!(name, 0xaaaa_aaaa, "the name was written");
+        assert_ne!(name, MACH_PORT_NULL);
+
+        // `receive_right_ = new ReceiveRight(name)`
+        let mut bits = 0;
+        // SAFETY: `bits` is a live `mach_port_type_t`.
+        assert_eq!(
+            unsafe { mach_port_type(TASK_SELF, name, &mut bits) },
+            KERN_SUCCESS
+        );
+        assert_eq!(bits, type_of(RIGHT_RECEIVE));
+        // ... and `send_right_.reset(name)`, which needs the same name to be a
+        // legal destination.
+        assert!(
+            destination(name).is_ok(),
+            "Chromium sends an empty message to this name to signal"
+        );
+        mach_port_destroy(TASK_SELF, name);
+    }
+
+    /// `base::apple::CreateMachPort`'s other shape: no send right at all
+    /// (`options.flags = 0`, Mach's `MPO_PORT`), and a queue limit with it.
+    /// Both are the whole of what the two call sites in the guest ask for.
+    #[test]
+    fn a_plain_port_with_a_queue_limit_is_constructed() {
+        for (flags, qlimit) in [
+            (0u32, 0u32),
+            (MPO_INSERT_SEND_RIGHT, 0),
+            (MPO_QLIMIT, 1),
+            (MPO_INSERT_SEND_RIGHT | MPO_QLIMIT, 5),
+        ] {
+            let mut block = [0u8; 24];
+            block[0..4].copy_from_slice(&flags.to_ne_bytes());
+            block[4..8].copy_from_slice(&qlimit.to_ne_bytes());
+            let mut name = MACH_PORT_NULL;
+            // SAFETY: a live structure and a live `Name`.
+            let rc =
+                unsafe { mach_port_construct(TASK_SELF, block.as_mut_ptr().cast(), 0, &mut name) };
+            assert_eq!(rc, KERN_SUCCESS, "flags {flags:#x} qlimit {qlimit}");
+            assert_ne!(name, MACH_PORT_NULL);
+            mach_port_destroy(TASK_SELF, name);
+        }
+    }
+
+    /// The standard a refusal has to meet: a caller must be able to tell that it
+    /// got nothing. So a construct this file will not do leaves the out-parameter
+    /// exactly as the caller left it - Chromium's uninitialised
+    /// `mach_port_t name;` - and says so in its return code.
+    #[test]
+    fn a_construct_asking_for_something_else_is_refused_and_writes_no_name() {
+        // A service port, which is the one named here: a real kernel registers
+        // it with launchd, and this namespace has no launchd and no way to
+        // tell a caller its port was not that.
+        for flags in [
+            MPO_INSERT_SEND_RIGHT | 0x400,
+            0x04,
+            0x01,
+            0x20,
+            0x80,
+            0x2000,
+            0x4000_0000,
+        ] {
+            let mut block = [0u8; 24];
+            block[0..4].copy_from_slice(&flags.to_ne_bytes());
+            let mut name = 0xaaaa_aaaau32;
+            // SAFETY: a live structure and a live `Name`.
+            let rc =
+                unsafe { mach_port_construct(TASK_SELF, block.as_mut_ptr().cast(), 0, &mut name) };
+            assert_eq!(rc, KERN_INVALID_ARGUMENT, "flags {flags:#x}");
+            assert_eq!(name, 0xaaaa_aaaa, "no name was invented for {flags:#x}");
+        }
+    }
+
+    /// A construct in another task's space is refused before the options are
+    /// read, and a null `name` is refused before anything else.
+    #[test]
+    fn a_construct_needs_a_task_and_a_place_to_put_the_name() {
+        // SAFETY: a null out-parameter is the case being tested.
+        assert_eq!(
+            unsafe {
+                mach_port_construct(TASK_SELF, std::ptr::null_mut(), 0, std::ptr::null_mut())
+            },
+            KERN_INVALID_ADDRESS
+        );
+        let mut name = MACH_PORT_NULL;
+        // SAFETY: a null `options` is a legal request and `name` is live.
+        let rc = unsafe { mach_port_construct(HOST_SELF, std::ptr::null_mut(), 0, &mut name) };
+        assert_eq!(rc, KERN_INVALID_TASK);
     }
 
     #[test]

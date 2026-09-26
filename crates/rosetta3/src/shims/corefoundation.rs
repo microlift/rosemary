@@ -142,7 +142,8 @@ pub fn run_loop_perform_block(
 }
 
 /// Call this tree's own implementation with the three integer arguments given.
-fn forward(symbol: &str, ctx: &mut RegisterContext, args: &[u64; 3]) -> Result<()> {    let host = crate::frameworks::symbol(crate::darwin_name(symbol)).ok_or(
+fn forward(symbol: &str, ctx: &mut RegisterContext, args: &[u64; 3]) -> Result<()> {
+    let host = crate::frameworks::symbol(crate::darwin_name(symbol)).ok_or(
         crate::abi::AbiError::Unsatisfied {
             symbol: symbol.to_string(),
         },

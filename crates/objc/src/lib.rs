@@ -70,6 +70,7 @@ exports::exports! {
         "method_getTypeEncoding" => api::method_getTypeEncoding,
         "method_getName" => api::method_getName,
         "method_setImplementation" => api::method_setImplementation,
+        "method_exchangeImplementations" => api::method_exchangeImplementations,
         "ivar_getOffset" => api::ivar_getOffset,
         "ivar_getName" => api::ivar_getName,
         "class_copyPropertyList" => api::class_copyPropertyList,
@@ -85,8 +86,18 @@ exports::exports! {
         "object_getIndexedIvars" => api::object_getIndexedIvars,
         "object_getIvar" => api::object_getIvar,
         "object_setIvar" => api::object_setIvar,
+        // The destruction entry point, and the one most easily confused with
+        // `objc_destructInstance` two rows down: that one unwinds C++ ivars and
+        // stops, and this one destroys the object. Nothing comes back from either
+        // to tell a guest which it got. See `api::object_dispose`.
+        "object_dispose" => api::object_dispose,
         "objc_constructInstance" => api::objc_constructInstance,
         "objc_destructInstance" => api::objc_destructInstance,
+        // The per-exception preprocessor slot, and the return of the one that was
+        // in it. Stored and handed back; never called, because the exception
+        // machinery that would call it is refused by name. See
+        // `api::objc_setExceptionPreprocessor`.
+        "objc_setExceptionPreprocessor" => api::objc_setExceptionPreprocessor,
         "objc_loadClassref" => api::objc_loadClassref,
         "objc_getProtocol" => api::objc_getProtocol,
         "objc_allocateProtocol" => api::objc_allocateProtocol,

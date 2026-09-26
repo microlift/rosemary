@@ -4,6 +4,10 @@ unsafe extern "C" fn close(fd: i32) -> i32 {
     let rc = unsafe { libc::close(fd) };
     if rc == 0 || crate::errno::get() == libc::EBADF {
         super::sockopt::forget(fd);
+        // A kqueue's registrations are keyed by its descriptor number, so a
+        // number handed to a *new* `kqueue()` would otherwise inherit whatever
+        // the last queue at that number had registered.
+        crate::mach::kevent64::forget_queue(fd);
     }
     rc
 }

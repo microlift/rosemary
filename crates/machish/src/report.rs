@@ -102,6 +102,39 @@ pub struct ImageReport {
     pub interpositions: Vec<Interposition>,
     /// Thread-local descriptors, enumerated and not otherwise honoured.
     pub thread_locals: Vec<ThreadLocalDescriptor>,
+    /// Slid addresses of the image's `__thread_bss_init_func` entries, in
+    /// section order.
+    ///
+    /// The one part of the thread-local contract that cannot be recovered from
+    /// the descriptors, and the reason this is a field of its own rather than
+    /// part of [`TlvTemplate`]: a template is where a block's bytes come from,
+    /// and this is a list of functions to *call* once a thread first has one.
+    ///
+    /// What a caller owes them, from `tlv_allocate_and_initialize_for_key` in
+    /// dyld-852.2 (`src/threadLocalVariables.c`) - the last Apple code that ran
+    /// this section at all:
+    ///
+    /// * the type is `void (*)(void)` - **not** a function of the block, which
+    ///   `tlv_get_addr` itself has already turned into an address;
+    /// * they run on the first use of *any* thread-local in this image on a
+    ///   given thread, not on the first use of the variable each belongs to;
+    /// * they run **back to front** - `for (size_t j=count; j > 0; --j)`, so a
+    ///   later-registered constructor is torn down first;
+    /// * the block is already in the thread's storage when they run, because
+    ///   dyld does `pthread_setspecific(key, buffer)` *before* this pass. An
+    ///   initialiser that reads another thread-local of the same image
+    ///   therefore finds it constructed rather than re-entering the slow path.
+    ///
+    /// Expect this to be empty in anything built with a current toolchain: clang
+    /// stopped emitting `__thread_bss_init_func` years ago and constructs a
+    /// `thread_local` with a dynamic initialiser inline, under a guard byte in
+    /// the variable, at the access. `Chromium Framework` 130.0.6723.91 has 116
+    /// descriptors and no such section, which is why a link that honoured only
+    /// this list would be complete for that image by having nothing to do.
+    ///
+    /// Collected, never called: running them means executing guest code, which
+    /// is the driver's job, exactly as for [`initializers`](Self::initializers).
+    pub tlv_init_funcs: Vec<Word>,
     /// The image's thread-local block layout, if it has one. Present exactly
     /// when [`thread_locals`](ImageReport::thread_locals) is non-empty and the
     /// image carries a `__thread_data` or `__thread_bss` section.
@@ -193,10 +226,26 @@ pub struct ThreadLocalDescriptor {
     pub at: Word,
     /// The thunk a guest calls to get the variable's per-thread address. In an
     /// unbound image this is a `__tlv_bootstrap` import.
+    ///
+    /// The call is `lea rdi, [desc]; call *desc.thunk`, and what comes back is
+    /// **the variable's own address**, not the block's: `_tlv_get_addr` ends
+    /// with `addq 16(%rdi),%rax` (dyld-852.2 `src/threadLocalHelpers.s`), and
+    /// the code clang emits for a `thread_local` then indexes the variable at
+    /// offset zero. `offset` is added by the thunk, which is why a descriptor's
+    /// `offset` is invisible to the instruction that follows the call.
+    ///
+    /// The thunk also has a calling convention of its own: dyld's own comment
+    /// on it is "returns address of TLV in %rax, all other registers
+    /// preserved", and the reason is that computing a thread-local's address is
+    /// emitted without spilling anything first. Anything bound here has to keep
+    /// every register but the result, including `rdi`-`r11` and `xmm0`-`xmm7`.
     pub thunk: Word,
     /// The pthread key, zero until the runtime allocates one. We never do.
     pub key: Word,
     /// Byte offset of this variable within the thread's block.
+    ///
+    /// Relative to [`TlvTemplate::initial_va`], which is where the block's byte
+    /// zero is: `__thread_data` if the image has one, `__thread_bss` if not.
     pub offset: Word,
 }
 
