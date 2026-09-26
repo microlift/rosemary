@@ -87,6 +87,16 @@ pub struct ArrayContents {
     /// is a field, and a mutation of an immutable array is refused *by name*
     /// rather than quietly allowed - which is what Apple's raise amounts to.
     pub mutable: bool,
+    /// Something the array owns that is not one of its values.
+    ///
+    /// `CFStringCreateArrayWithFindResults` returns an array of **pointers** to
+    /// `CFRange`, and Apple's value release callback is what frees them.  There
+    /// is no policy to route that through here, because the values are not
+    /// objects and must not be retained - so the array keeps the boxes itself
+    /// and `Drop` gives them back when its count reaches zero.  A pointer a guest
+    /// still holds after releasing the array dangles, which is exactly what it
+    /// does on a Mac.
+    pub keep_alive: Option<Box<dyn std::any::Any + Send + Sync>>,
 }
 
 impl Drop for ArrayContents {
@@ -94,6 +104,8 @@ impl Drop for ArrayContents {
         for value in self.values.drain(..) {
             self.policy.release(value);
         }
+        // Dropping `keep_alive` is the point; the field exists to be dropped.
+        drop(self.keep_alive.take());
     }
 }
 
@@ -118,8 +130,21 @@ pub fn new_array(values: &[CFTypeRef], policy: Policy, mutable: bool) -> CFTypeR
             values,
             policy,
             mutable,
+            keep_alive: None,
         },
     )
+}
+
+/// Give `array` something of its own to keep, freed when the array is.
+///
+/// For the case where the array's values are pointers rather than objects: see
+/// [`ArrayContents::keep_alive`].
+pub fn keep_alive(object: CFTypeRef, owned: Box<dyn std::any::Any + Send + Sync>) {
+    // SAFETY: an array this crate made.  A null return from `new_array` means
+    // the allocation failed, and then there is nothing to attach anything to.
+    if let Some(contents) = unsafe { array(object) } {
+        contents.keep_alive = Some(owned);
+    }
 }
 
 /// # Safety
@@ -234,6 +259,13 @@ impl DictionaryContents {
         self.entries
             .iter()
             .position(|(k, _)| self.keys.equal(*k, key))
+    }
+
+    /// The value stored under `key`, or null - which is what
+    /// `CFDictionaryGetValue` answers, and what `_CFURLCreateFromPropertyList-
+    /// Representation` in `CFURL.c` tests each of its four keys against.
+    pub fn get(&self, key: CFTypeRef) -> CFTypeRef {
+        self.position(key).map_or(std::ptr::null(), |at| self.entries[at].1)
     }
 
     /// Insert or replace, retaining both as the policies say.

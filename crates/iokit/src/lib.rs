@@ -5,6 +5,7 @@ pub mod hid;
 pub mod manager;
 pub mod power;
 pub mod registry;
+pub mod sysconfig;
 pub mod value;
 
 /// Emit HID discovery diagnostics when `ROSETTA3_TRACE_HID` is set.
@@ -47,6 +48,15 @@ exports::exports! {
         "IOHIDElementGetType" => api::IOHIDElementGetType,
         "IOHIDElementGetLogicalMin" => api::IOHIDElementGetLogicalMin,
         "IOHIDElementGetLogicalMax" => api::IOHIDElementGetLogicalMax,
+        // The tree walk, the device that owns an element, and the two halves of
+        // "where in the report is this value". Each is answered from the same
+        // element tree `api::Device` publishes; see each function for what the
+        // honest answer is when there is no report.
+        "IOHIDElementGetParent" => api::IOHIDElementGetParent,
+        "IOHIDElementGetDevice" => api::IOHIDElementGetDevice,
+        "IOHIDElementGetReportSize" => api::IOHIDElementGetReportSize,
+        "IOHIDElementGetReportID" => api::IOHIDElementGetReportID,
+        "IOHIDValueGetBytePtr" => api::IOHIDValueGetBytePtr,
         "IOHIDElementGetChildren" => api::IOHIDElementGetChildren,
         "IOHIDElementGetTypeID" => api::IOHIDElementGetTypeID,
         "IOHIDValueGetElement" => api::IOHIDValueGetElement,
@@ -66,6 +76,7 @@ exports::exports! {
     groups {
         power,
         registry,
+        sysconfig,
     }
 }
 

@@ -139,6 +139,44 @@ pub unsafe extern "C" fn CFGetTypeID(object: CFTypeRef) -> CFTypeID {
     unsafe { crate::base::class_of(object) }.map_or(0, crate::base::type_id_of)
 }
 
+/// `CFStringRef CFCopyTypeIDDescription(CFTypeID type_id)`
+///
+/// A *description of the type*, not of any object: what a caller wants when it
+/// holds a `CFTypeRef` and does not know what it is.  Apple's answer is built
+/// from the type's `copyDescription` callback, so for a type this runtime made it
+/// is the class's name - which is the one string in a process that names both
+/// the type and the `isKindOfClass:` a caller would reach for next.
+///
+/// A type ID that is not one of this runtime's classes has no name to give.
+/// `0` is the ID `CFGetTypeID` reports for every object that is not a
+/// CoreFoundation type, so it is not a type and there is nothing to describe;
+/// this runtime says that in the string rather than inventing a type name, and
+/// says it on stderr, because the string ends up in a log line somewhere and a
+/// log line that lies is worse than one that admits it.
+///
+/// The guest's only uses are two log messages in
+/// `chrome/browser/mac/install_from_dmg.mm` and `metrics.mm`, of the shape
+/// `"DiskImageURL: expected CFString, observed "` followed by this
+/// (`0x5afa8df` and `0x5afaa2f`), behind a `LOG(INFO)` level test.
+pub unsafe extern "C" fn CFCopyTypeIDDescription(type_id: CFTypeID) -> CFTypeRef {
+    if let Some(name) = crate::base::type_name(type_id) {
+        return crate::string::from_bytes(name.as_bytes(), false);
+    }
+    crate::base::refuse_once(
+        "CFCopyTypeIDDescription",
+        format!(
+            "type id {type_id:#x} is not a CoreFoundation type this runtime registered, so there \
+             is no name for it.  Answering with the name of a type that merely sounds plausible \
+             would put a wrong type name into a diagnostic, which is the one place a wrong name \
+             costs the most."
+        ),
+    );
+    crate::string::from_bytes(
+        format!("<unknown CoreFoundation type {type_id:#x}>").as_bytes(),
+        false,
+    )
+}
+
 /// `CFEqual`, which is `-isEqual:` and nothing more.
 ///
 /// Two strings with the same characters are equal, because `__NSCFString`
@@ -883,7 +921,13 @@ pub unsafe extern "C" fn CFStringCompare(a: CFTypeRef, b: CFTypeRef, options: u6
     }
 }
 
+/// `CFRange`, which is two `CFIndex` and nothing else.
+///
+/// `Copy` because it is passed and returned by value through registers and
+/// stack on both 64-bit ABIs, and a caller building a range out of another one
+/// has no reason to have to clone it to do so.
 #[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct CFRange {
     pub location: CFIndex,
     pub length: CFIndex,
@@ -961,6 +1005,165 @@ pub unsafe extern "C" fn CFStringFindWithOptions(
         };
     }
     1
+}
+
+/// `CFArrayRef CFStringCreateArrayWithFindResults(CFAllocatorRef, CFStringRef, CFStringRef, CFRange, CFStringCompareFlags)`
+///
+/// An array of **pointers to** `CFRange` - the header says "an array of CFRange
+/// pointers", and it means it: the guest reads `CFArrayGetValueAtIndex(...)`
+/// and then dereferences the result (`mov rax, [rax]` at `0x4dd1778`), so an
+/// array of `CFRange` by value would hand it a `location` where it expects an
+/// address.
+///
+/// The rules, all from the header's own comment and all of them things a caller
+/// can observe:
+///
+/// * `NULL` if there are no matches - not an empty array, which a caller can
+///   tell apart and which would be a different answer.
+/// * **Overlapping instances are not found**, so "AA" in "AAA" is one range.
+/// * An empty `stringToFind` finds nothing.
+/// * `kCFCompareBackwards` scans from the end *and stores the results backwards*,
+///   so the last match is in slot 0.
+/// * `kCFCompareAnchored` reports only the consecutive instances at the start
+///   (or at the end, backwards) - "AB" in "ABABXAB" is two ranges, not three.
+/// * `kCFCompareNumerically` is ignored.
+/// * Only `rangeToSearch` is searched.
+///
+/// The guest's caller (`0x4dd1664`, in `chrome/browser/mac/shims`'s requirement
+/// parser) passes a one-character needle, the whole string as the range and no
+/// options, then requires more than one match to take a branch.
+pub unsafe extern "C" fn CFStringCreateArrayWithFindResults(
+    _alloc: CFAllocatorRef,
+    the_string: CFTypeRef,
+    string_to_find: CFTypeRef,
+    range_to_search: CFRange,
+    compare_options: u64,
+) -> CFTypeRef {
+    const CASE_INSENSITIVE: u64 = 1;
+    const BACKWARDS: u64 = 4;
+    const ANCHORED: u64 = 8;
+    // SAFETY: live strings or null.
+    let (Some(searched), Some(needle)) = (unsafe { string::as_string(the_string) }, unsafe {
+        string::as_string(string_to_find)
+    }) else {
+        return std::ptr::null();
+    };
+    let mut haystack = searched.utf16();
+    let mut needle = needle.utf16();
+    // An empty needle finds nothing, and that is the header's rule rather than a
+    // degenerate case: it is what stops a caller looping over a find that can
+    // never advance.
+    if needle.is_empty() {
+        return std::ptr::null();
+    }
+    let (Ok(start), Ok(length)) = (
+        usize::try_from(range_to_search.location),
+        usize::try_from(range_to_search.length),
+    ) else {
+        return std::ptr::null();
+    };
+    let Some(end) = start
+        .checked_add(length)
+        .filter(|end| *end <= haystack.len())
+    else {
+        return std::ptr::null();
+    };
+    if compare_options & CASE_INSENSITIVE != 0 {
+        // ASCII case folding, for the reason `CFStringFindWithOptions` gives:
+        // a full Unicode case mapping can change a string's length, and a range
+        // measured in the original string would then name the wrong characters.
+        for unit in haystack.iter_mut().chain(needle.iter_mut()) {
+            if let Ok(byte) = u8::try_from(*unit) {
+                *unit = u16::from(byte.to_ascii_lowercase());
+            }
+        }
+    }
+    let matches = find_all(
+        &haystack,
+        &needle,
+        start,
+        end,
+        compare_options & ANCHORED != 0,
+        compare_options & BACKWARDS != 0,
+    );
+    if matches.is_empty() {
+        return std::ptr::null();
+    }
+    // The ranges are the array's to give back, so they go in a box the array
+    // holds and drops.  A pointer a guest still holds after releasing the array
+    // dangles - which is exactly what it does in Apple's, whose value release
+    // callback frees them.
+    let ranges: Vec<Box<CFRange>> = matches
+        .into_iter()
+        .map(|location| Box::new(CFRange {
+            location: location as CFIndex,
+            length: needle.len() as CFIndex,
+        }))
+        .collect();
+    let values: Vec<CFTypeRef> = ranges.iter().map(|r| &**r as *const CFRange as CFTypeRef).collect();
+    let array = collections::new_array(&values, crate::callbacks::Policy::NONE, false);
+    collections::keep_alive(array, Box::new(ranges));
+    array
+}
+
+/// Every non-overlapping match of `needle` in `haystack[start..end]`.
+///
+/// Backwards is a separate walk rather than a reversed one so that the
+/// *order* the header describes - last match in slot 0 - falls out of the walk
+/// itself and cannot drift from it.
+fn find_all(
+    haystack: &[u16],
+    needle: &[u16],
+    start: usize,
+    end: usize,
+    anchored: bool,
+    backwards: bool,
+) -> Vec<usize> {
+    let width = needle.len();
+    if width == 0 || width > end.saturating_sub(start) {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    if backwards {
+        let mut at = end - width;
+        loop {
+            if haystack[at..at + width] == *needle {
+                out.push(at);
+                // Anchored means *consecutive* instances at the end, so the next
+                // candidate is one needle-width further back - and there is no
+                // room for one below that.
+                if anchored {
+                    if at < start + width {
+                        break;
+                    }
+                    at -= width;
+                    continue;
+                }
+            } else if anchored {
+                break;
+            }
+            if at == start {
+                break;
+            }
+            at -= 1;
+        }
+    } else {
+        let mut at = start;
+        while at + width <= end {
+            if haystack[at..at + width] == *needle {
+                out.push(at);
+                // Skipping the whole match is what "overlapping instances are
+                // not found" means: "AAA" has one "AA", at 0, not two.
+                at += width;
+                continue;
+            }
+            if anchored {
+                break;
+            }
+            at += 1;
+        }
+    }
+    out
 }
 
 /// `CFRange` is flattened to its two `CFIndex` fields by both 64-bit ABIs.
@@ -2928,6 +3131,26 @@ pub unsafe extern "C" fn CFRunLoopTimerSetNextFireDate(timer: CFTypeRef, fire_da
     }
 }
 
+/// `void CFRunLoopTimerSetTolerance(CFRunLoopTimerRef, CFTimeInterval)`
+///
+/// A *permission*, not a delay: the header says the timer "may fire at any
+/// time between its scheduled fire date and the scheduled fire date plus the
+/// tolerance" and "will not fire before the scheduled fire date".  This run loop
+/// fires every timer at its exact date, which is inside that window for every
+/// tolerance, so the value is recorded and clamped as `CFRunLoop.c` clamps it -
+/// see [`runloop::Timer::set_tolerance`] - and nothing else has to change.
+///
+/// The guest's call is at `0x5d9595a`, in the same run-loop module as the
+/// `CFRunLoopTimerSetNextFireDate` and `CFAbsoluteTimeGetCurrent` calls around
+/// it, and the tolerance it computes is `(fire_date - now)` in seconds.  This is
+/// the one unbound CoreFoundation import in that module, so it is the next one a
+/// run that gets past `0x5d46240` reaches.
+pub unsafe extern "C" fn CFRunLoopTimerSetTolerance(timer: CFTypeRef, tolerance: f64) {
+    if let Some(t) = unsafe { borrow::<Timer>(timer) } {
+        t.set_tolerance(tolerance);
+    }
+}
+
 pub unsafe extern "C" fn CFRunLoopTimerInvalidate(timer: CFTypeRef) {
     if let Some(t) = unsafe { borrow::<Timer>(timer) } {
         t.invalidate();
@@ -3716,5 +3939,228 @@ mod tests {
     fn a_non_data_has_no_bytes() {
         // SAFETY: null is the documented "not an object" case.
         assert!(unsafe { CFDataGetBytePtr(std::ptr::null()) }.is_null());
+    }
+}
+
+#[cfg(test)]
+mod find_result_tests {
+    use super::*;
+    use crate::bootstrap;
+
+    /// Every match, as `(location, length)`.
+    ///
+    /// The array holds **pointers** to `CFRange`, so reading one is two steps -
+    /// which is what the guest does at `0x4dd1778`, `mov rax, [rax]`.
+    fn find_all_of(
+        haystack: &str,
+        needle: &str,
+        options: u64,
+    ) -> Vec<(CFIndex, CFIndex)> {
+        let searched = string::from_bytes(haystack.as_bytes(), false);
+        let wanted = string::from_bytes(needle.as_bytes(), false);
+        // SAFETY: two strings this test made, and a range covering the whole of
+        // the haystack.
+        let array = unsafe {
+            CFStringCreateArrayWithFindResults(
+                std::ptr::null(),
+                searched,
+                wanted,
+                CFRange {
+                    location: 0,
+                    length: CFStringGetLength(searched),
+                },
+                options,
+            )
+        };
+        // SAFETY: strings this test made.
+        unsafe { CFRelease(wanted) };
+        // SAFETY: strings this test made.
+        unsafe { CFRelease(searched) };
+        if array.is_null() {
+            return Vec::new();
+        }
+        // SAFETY: an array this call made.
+        let count = unsafe { CFArrayGetCount(array) };
+        let mut out = Vec::new();
+        for index in 0..count {
+            // SAFETY: an index inside the count.
+            let element = unsafe { CFArrayGetValueAtIndex(array, index) };
+            // SAFETY: the element is a `CFRange *` this call allocated.
+            let range = unsafe { *(element as *const CFRange) };
+            out.push((range.location, range.length));
+        }
+        // SAFETY: nothing else holds a reference.
+        unsafe { CFRelease(array) };
+        out
+    }
+
+    /// The rule the header states first, because it is the one a caller can
+    /// most easily get wrong: overlapping instances are not found.
+    #[test]
+    fn overlapping_matches_are_not_found() {
+        assert_eq!(find_all_of("AAA", "AA", 0), [(0, 2)], "'AA' in 'AAA' is one range");
+        assert_eq!(find_all_of("aaaa", "aa", 0), [(0, 2), (2, 2)], "and two of them, not three");
+    }
+
+    /// No matches is *null*, not an empty array - which a caller can tell apart
+    /// and which is the difference between "nothing matched" and "here is a
+    /// list of nothing".
+    #[test]
+    fn no_matches_is_null() {
+        assert_eq!(find_all_of("abc", "z", 0), Vec::<(CFIndex, CFIndex)>::new());
+        // An empty needle finds nothing, per the header, and that is what stops
+        // a caller looping over a find that can never advance.
+        assert_eq!(find_all_of("abc", "", 0), Vec::<(CFIndex, CFIndex)>::new());
+    }
+
+    /// Backwards scans from the end *and* stores the results backwards, so the
+    /// last match is in slot 0.
+    #[test]
+    fn backwards_scans_from_the_end_and_reverses() {
+        const BACKWARDS: u64 = 4;
+        assert_eq!(find_all_of("a,b,c", ",", 0), [(1, 1), (3, 1)]);
+        assert_eq!(
+            find_all_of("a,b,c", ",", BACKWARDS),
+            [(3, 1), (1, 1)],
+            "the last match is in slot 0"
+        );
+    }
+
+    /// `kCFCompareAnchored` reports only the consecutive instances at the start
+    /// - or at the end, backwards.
+    #[test]
+    fn anchored_reports_only_the_consecutive_run() {
+        const ANCHORED: u64 = 8;
+        const BACKWARDS: u64 = 4;
+        assert_eq!(find_all_of("ABABXAB", "AB", 0), [(0, 2), (2, 2), (5, 2)]);
+        assert_eq!(
+            find_all_of("ABABXAB", "AB", ANCHORED),
+            [(0, 2), (2, 2)],
+            "the first two, and not the third"
+        );
+        assert_eq!(
+            find_all_of("ABABXAB", "AB", ANCHORED | BACKWARDS),
+            [(5, 2)],
+            "backwards and anchored is the run at the end, which is one"
+        );
+    }
+
+    /// Only the range is searched, and case folding does not change the reported
+    /// length - which is why the fold here is ASCII-only.
+    #[test]
+    fn the_range_and_the_case_fold_both_show_in_the_answer() {
+        // SAFETY: a string this test made.
+        let searched = string::from_bytes(b"xxAAyyAA", false);
+        // SAFETY: a string this test made.
+        let wanted = string::from_bytes(b"AA", false);
+        // SAFETY: two strings this test made and an out-of-the-middle range.
+        let array = unsafe {
+            CFStringCreateArrayWithFindResults(
+                std::ptr::null(),
+                searched,
+                wanted,
+                CFRange {
+                    location: 2,
+                    length: 4,
+                },
+                0,
+            )
+        };
+        assert!(!array.is_null());
+        // SAFETY: an array this call made.
+        assert_eq!(unsafe { CFArrayGetCount(array) }, 1, "only the range is searched");
+        // SAFETY: an array this call made and an index inside it.
+        let element = unsafe { CFArrayGetValueAtIndex(array, 0) };
+        // SAFETY: the element is a `CFRange *` this call allocated.
+        let range = unsafe { *(element as *const CFRange) };
+        assert_eq!((range.location, range.length), (2, 2), "in the range, not the whole string");
+        // SAFETY: nothing else holds a reference.
+        unsafe {
+            CFRelease(array);
+            CFRelease(wanted);
+            CFRelease(searched);
+        }
+    }
+
+    /// A type ID is described by the class that carries it, and one this runtime
+    /// has never heard of is not given a name that sounds right.
+    #[test]
+    fn a_type_id_is_described_by_its_class() {
+        bootstrap();
+        // SAFETY: a string this test made.
+        let s = string::from_bytes(b"x", false);
+        // SAFETY: a string this test made.
+        let described = unsafe { CFCopyTypeIDDescription(CFGetTypeID(s)) };
+        assert!(!described.is_null());
+        // SAFETY: a string this call made.
+        let name = unsafe { string::as_string(described) }.expect("a string");
+        // Copied out before the release: `utf8` reads the object's own bytes,
+        // and the release below is what gives them back.
+        let name = String::from_utf8_lossy(&name.utf8()).into_owned();
+        // SAFETY: a string this call made.
+        unsafe { CFRelease(described) };
+        // SAFETY: a string this test made.
+        unsafe { CFRelease(s) };
+        assert!(
+            name.contains("String"),
+            "the name of a string's class, not a guess: {name:?}"
+        );
+    }
+
+    /// A tolerance is a permission, and the value is clamped the way
+    /// `CFRunLoop.c` clamps it: a repeating timer to half an interval, a one-shot
+    /// to zero.
+    #[test]
+    fn a_tolerance_is_clamped_the_way_corefoundation_clamps_it() {
+        bootstrap();
+        // SAFETY: two nulls, a date far away and an interval.
+        let repeating = unsafe {
+            CFRunLoopTimerCreate(
+                std::ptr::null(),
+                CFAbsoluteTimeGetCurrent() + 3600.0,
+                60.0,
+                0,
+                0,
+                None,
+                std::ptr::null_mut(),
+            )
+        };
+        // SAFETY: a timer this call made and a tolerance.
+        unsafe { CFRunLoopTimerSetTolerance(repeating, 100.0) };
+        // SAFETY: a timer this call made.
+        let t = unsafe { borrow::<Timer>(repeating) }.expect("a timer");
+        assert_eq!(
+            t.tolerance(),
+            30.0,
+            "MIN(tolerance, interval / 2) - a tolerance past the next fire is \
+             meaningless"
+        );
+        // SAFETY: a timer this call made.
+        unsafe { CFRelease(repeating) };
+
+        // SAFETY: two nulls, a date far away and an interval of zero: a one-shot.
+        let one_shot = unsafe {
+            CFRunLoopTimerCreate(
+                std::ptr::null(),
+                CFAbsoluteTimeGetCurrent() + 3600.0,
+                0.0,
+                0,
+                0,
+                None,
+                std::ptr::null_mut(),
+            )
+        };
+        // SAFETY: a timer this call made and a negative tolerance.
+        unsafe { CFRunLoopTimerSetTolerance(one_shot, -5.0) };
+        // SAFETY: a timer this call made.
+        let t = unsafe { borrow::<Timer>(one_shot) }.expect("a timer");
+        assert_eq!(
+            t.tolerance(),
+            0.0,
+            "a negative tolerance would authorise firing before the fire date, which the \
+             CFRunLoop.h comment forbids outright"
+        );
+        // SAFETY: nothing else holds a reference.
+        unsafe { CFRelease(one_shot) };
     }
 }

@@ -60,6 +60,21 @@ pub static TYPE_KEY_CALLBACKS: KeyCallBacks = KeyCallBacks {
     hash: Some(hash),
 };
 
+/// `kCFTypeSetCallBacks`.
+///
+/// `CFSetCallBacks` and `CFDictionaryKeyCallBacks` are the same six fields in
+/// the same order, so this is the same structure with the same five functions -
+/// which is not an approximation but the two declarations Apple's `CFSet.h` and
+/// `CFDictionary.h` actually make.
+pub static TYPE_SET_CALLBACKS: KeyCallBacks = KeyCallBacks {
+    version: 0,
+    retain: Some(retain),
+    release: Some(release),
+    copy_description: None,
+    equal: Some(equal),
+    hash: Some(hash),
+};
+
 /// How a collection treats the things it holds, resolved from the two
 /// structures a caller may or may not have passed.
 #[derive(Clone, Copy)]

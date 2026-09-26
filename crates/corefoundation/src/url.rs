@@ -1,3 +1,6 @@
+// The C spellings are the interface, as they are in `api`.
+#![allow(non_snake_case)]
+
 use std::ffi::c_void;
 
 use objc::class::Class;
@@ -226,6 +229,171 @@ pub unsafe fn as_url<'a>(url: CFTypeRef) -> Option<&'a Contents> {
     }
 }
 
+//
+// -- the private property-list representation --------------------------------
+//
+// `_CFURLCopyPropertyListRepresentation` and `_CFURLCreateFromPropertyList-
+// Representation`, which the Mach-O exports as `__CFURLCopyPropertyList-
+// Representation` - the single underscore of the C name plus the Mach-O's own.
+// The Finder uses them to hand a URL to another process as a property list, and
+// `CFURL.c` carries both with the comment "Private API for Finder to use".
+//
+// Chromium's only caller is `chrome/browser/mac/dock.mm`, which reads the
+// `com.apple.dock` `persistent-apps` plist and turns each app's `file-data` into
+// a URL so it can add its own tile (`0x5af6fe6`-`0x5af708d`, and the nil check at
+// `0x5af708d`'s `test rax,rax`).  So a null answer is a path the caller already
+// handles - and the whole feature is macOS shell integration that a headless run
+// has no use for.
+//
+// The dictionary is four keys, and its shape is not a guess: it is
+// `__CFURLCopyPropertyListKeysAndValues` in `CFURL.c`, which is the function
+// `_CFURLCopyPropertyListRepresentation` is a two-line wrapper around.
+
+/// `FULL_URL_REPRESENTATION`, the value of `_CFURLStringType` that means "the
+/// string is the whole URL" rather than a path in some `CFURLPathStyle`.
+///
+/// `CFURL.c` says of it: "The value of FULL_URL_REPRESENTATION must not be in
+/// the CFURLPathStyle enums. Also, its value is exposed via
+/// `_CFURLCopyPropertyListRepresentation` to the Finder so don't change it."
+const FULL_URL_REPRESENTATION: i64 = 0xF;
+
+/// The `CFURLPathStyle` values a `_...StringType` may carry instead: 0, 1 and 2.
+const PATH_STYLES: [i64; 3] = [
+    0, // kCFURLPOSIXPathStyle
+    1, // kCFURLHFSPathStyle
+    2, // kCFURLWindowsPathStyle
+];
+
+/// `CFPropertyListRef _CFURLCopyPropertyListRepresentation(CFURLRef url)`
+pub unsafe extern "C" fn _CFURLCopyPropertyListRepresentation(url: CFTypeRef) -> CFTypeRef {
+    let Some(contents) = (unsafe { as_url(url) }) else {
+        return std::ptr::null();
+    };
+    let key = |name: &str| crate::base::interned_name(name) as CFTypeRef;
+    let text = contents.string();
+    // SAFETY: a live string of ours; the dictionary retains it.
+    let string_value = unsafe { crate::api::CFRetain(text) };
+    let pairs = [
+        (
+            key("_CFURLStringType"),
+            number(FULL_URL_REPRESENTATION) as usize as CFTypeRef,
+        ),
+        (key("_CFURLString"), string_value),
+    ];
+    let dict = crate::collections::new_dictionary(
+        &pairs,
+        crate::callbacks::Policy::from_key_callbacks(),
+        crate::callbacks::Policy::from_type_callbacks(),
+        false,
+    );
+    // SAFETY: the value was retained for the dictionary above and the dictionary
+    // has taken its own reference.
+    unsafe { crate::api::CFRelease(string_value) };
+    dict
+}
+
+/// `CFURLRef _CFURLCreateFromPropertyListRepresentation(CFAllocatorRef, CFPropertyListRef)`
+///
+/// Null for anything that is not exactly the dictionary
+/// `_CFURLCopyPropertyListRepresentation` produces, which is what `CFURL.c`
+/// returns in every one of its failure cases: the type is not a dictionary, the
+/// string is missing or is not a string, a type number is missing or is not a
+/// number or is not one of the four accepted values, or the base string is
+/// present without its type.
+pub unsafe extern "C" fn _CFURLCreateFromPropertyListRepresentation(
+    _alloc: crate::api::CFAllocatorRef,
+    plist: CFTypeRef,
+) -> CFTypeRef {
+    // SAFETY: the property list, which may be null.
+    let Some(dictionary) = (unsafe { crate::collections::dictionary(plist) }) else {
+        return std::ptr::null();
+    };
+    let get = |name: &str| -> CFTypeRef {
+        let key = crate::base::interned_name(name) as CFTypeRef;
+        dictionary.get(key)
+    };
+    // Two values out of a live dictionary, both checked for type below.
+    let text = get("_CFURLString");
+    let style = get("_CFURLStringType");
+    if text.is_null() || style.is_null() {
+        return std::ptr::null();
+    }
+    if unsafe { crate::api::CFGetTypeID(text) } != unsafe { crate::api::CFStringGetTypeID() } {
+        return std::ptr::null();
+    }
+    let Some(style) = number_value(style) else {
+        return std::ptr::null();
+    };
+    if style != FULL_URL_REPRESENTATION && !PATH_STYLES.contains(&style) {
+        return std::ptr::null();
+    }
+    // The base is optional, and its type number is not: a base string with no
+    // type is one of `CFURL.c`'s refusals.
+    let base = match get("_CFURLBaseURLString") {
+        base if base.is_null() => std::ptr::null(),
+        base => {
+            if unsafe { crate::api::CFGetTypeID(base) } != unsafe { crate::api::CFStringGetTypeID() }
+            {
+                return std::ptr::null();
+            }
+            let base_style = get("_CFURLBaseStringType");
+            let Some(base_style) = number_value(base_style) else {
+                return std::ptr::null();
+            };
+            if base_style != FULL_URL_REPRESENTATION && !PATH_STYLES.contains(&base_style) {
+                return std::ptr::null();
+            }
+            unsafe { build(base, base_style) }
+        }
+    };
+    let url = unsafe { build(text, style) };
+    // SAFETY: `build` handed back a reference of its own, and the dictionary is
+    // still holding its base until this point.
+    unsafe {
+        if !base.is_null() {
+            crate::api::CFRelease(base);
+        }
+    }
+    url
+}
+
+/// A URL from one of the representation's two string-and-style pairs.
+unsafe fn build(text: CFTypeRef, style: i64) -> CFTypeRef {
+    // SAFETY: a string; the text is read and copied.
+    let Some(contents) = (unsafe { crate::string::as_string(text) }) else {
+        return std::ptr::null();
+    };
+    let value = String::from_utf8_lossy(&contents.utf8()).into_owned();
+    match style {
+        FULL_URL_REPRESENTATION => new(&value),
+        // A path style, and the last character says whether it names a
+        // directory - which is what `CFURLCreateWithFileSystemPathRelativeToBase`
+        // takes.  The style itself is a `CFURLPathStyle`, of which this runtime
+        // implements the POSIX one; a caller asking for an HFS or Windows path
+        // gets a POSIX path, which is the only kind that exists here, and the
+        // value is a four-number enumeration rather than a request this runtime
+        // could confuse with anything.
+        _ => new_file_url(&value, value.ends_with('/')),
+    }
+}
+
+/// A `CFNumberRef` of `kCFNumberSInt32Type` holding `value`.
+fn number(value: i64) -> CFTypeRef {
+    crate::collections::new_number_of_type(
+        crate::collections::Number::Integer(value),
+        crate::collections::number_type::SINT32,
+    )
+}
+
+/// The `SInt32` out of a `CFNumberRef`, or `None` for anything else.
+fn number_value(number: CFTypeRef) -> Option<i64> {
+    // SAFETY: null-safe; `number_value` reads only a number of this runtime.
+    match unsafe { crate::collections::number_value(number) } {
+        Some((crate::collections::Number::Integer(value), _)) => Some(value),
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -275,6 +443,102 @@ mod tests {
         assert_eq!(contents.file_path(), None, "not a file to be opened");
         // SAFETY: nothing else holds a reference.
         unsafe { crate::api::CFRelease(url) };
+    }
+
+
+    /// The Finder's URL property-list pair, round-tripped.
+    ///
+    /// The dictionary is not a guess: `CFURL.c`'s
+    /// `__CFURLCopyPropertyListKeysAndValues` builds it with four keys, and
+    /// `_CFURLCreateFromPropertyListRepresentation` reads exactly those four
+    /// back and refuses anything else.
+    #[test]
+    fn a_url_survives_the_property_list_representation() {
+        crate::bootstrap();
+        for text in [
+            "file:///Applications/Chromium.app/",
+            "https://example.com/a/b?c=d#e",
+        ] {
+            let url = new(text);
+            // SAFETY: a URL this test made.
+            let plist = unsafe { _CFURLCopyPropertyListRepresentation(url) };
+            assert!(!plist.is_null(), "{text}: a dictionary");
+            // SAFETY: a dictionary this call made, and the guest checks exactly
+            // this - `CFGetTypeID` against `CFDictionaryGetTypeID` at
+            // `0x5af78a4`.
+            assert_eq!(
+                unsafe { crate::api::CFGetTypeID(plist) },
+                unsafe { crate::api::CFDictionaryGetTypeID() }
+            );
+            // SAFETY: a dictionary this call made and a null allocator.
+            let back = unsafe { _CFURLCreateFromPropertyListRepresentation(std::ptr::null(), plist) };
+            assert!(!back.is_null(), "{text}: and a URL back");
+            // SAFETY: a URL this call made.
+            let contents = unsafe { as_url(back) }.expect("a URL");
+            assert_eq!(contents.text, text);
+            // SAFETY: nothing else holds a reference.
+            unsafe {
+                crate::api::CFRelease(back);
+                crate::api::CFRelease(plist);
+                crate::api::CFRelease(url);
+            }
+        }
+    }
+
+    /// Every refusal `_CFURLCreateFromPropertyListRepresentation` in `CFURL.c`
+    /// has, because a caller that gets a URL where it should have got null is
+    /// worse than one that gets the refusal it can see.
+    #[test]
+    fn a_malformed_representation_is_null() {
+        crate::bootstrap();
+        let string = crate::string::from_bytes(b"file:///tmp", false);
+        let good_type = number(FULL_URL_REPRESENTATION);
+
+        // A dictionary with the two keys, and one with each of them missing.
+        let cases: Vec<Vec<(CFTypeRef, CFTypeRef)>> = vec![
+            // Not a dictionary at all.
+            Vec::new(),
+            // No string.
+            vec![(crate::base::interned_name("_CFURLStringType") as CFTypeRef, good_type)],
+            // No type.
+            vec![(crate::base::interned_name("_CFURLString") as CFTypeRef, string)],
+            // A type that is not one of the four accepted values.
+            vec![
+                (crate::base::interned_name("_CFURLString") as CFTypeRef, string),
+                (crate::base::interned_name("_CFURLStringType") as CFTypeRef, number(99)),
+            ],
+            // A base string with no base type.
+            vec![
+                (crate::base::interned_name("_CFURLString") as CFTypeRef, string),
+                (crate::base::interned_name("_CFURLStringType") as CFTypeRef, good_type),
+                (
+                    crate::base::interned_name("_CFURLBaseURLString") as CFTypeRef,
+                    string,
+                ),
+            ],
+        ];
+        for (index, pairs) in cases.into_iter().enumerate() {
+            let plist = if pairs.is_empty() {
+                // A non-dictionary object: a string is the cheapest one.
+                string
+            } else {
+                crate::collections::new_dictionary(
+                    &pairs,
+                    crate::callbacks::Policy::from_key_callbacks(),
+                    crate::callbacks::Policy::from_type_callbacks(),
+                    false,
+                )
+            };
+            // SAFETY: whatever this case is, which is what the point is.
+            let url = unsafe { _CFURLCreateFromPropertyListRepresentation(std::ptr::null(), plist) };
+            assert!(url.is_null(), "case {index} is refused");
+            if !pairs.is_empty() {
+                // SAFETY: a dictionary this test made.
+                unsafe { crate::api::CFRelease(plist) };
+            }
+        }
+        // SAFETY: a string this test made.
+        unsafe { crate::api::CFRelease(string) };
     }
 
     /// Text with a colon in it is not a scheme just because it has one.

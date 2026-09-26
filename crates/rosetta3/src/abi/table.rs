@@ -1032,6 +1032,17 @@ pub static SIGNATURES: &[FunctionAbi] = &[
     sig!("IOHIDElementGetCollectionType", U32, P),
     sig!("IOHIDElementGetName", P, P),
     sig!("IOHIDElementGetParent", P, P),
+    // These two are **32-bit**, unlike `IOHIDElementGetLogicalMin` and its
+    // neighbours above. The guest zero-extends the report size itself -
+    // `mov eax, eax` right after the call at `Framework+0x83bd7a0` - which only
+    // a compiler that believed the return was 32 bits wide emits, and it keeps
+    // only the low byte of the report id (`movzx esi, BYTE PTR`). The binary
+    // settles the width; the header is not consulted here.
+    sig!("IOHIDElementGetReportSize", U32, P, U32),
+    sig!("IOHIDElementGetReportID", U32, P),
+    // A `Get`, so the bytes belong to whoever registered the report buffer and
+    // this only says where they are.
+    sig!("IOHIDValueGetBytePtr", P, P),
     sig!("IOHIDElementGetPhysicalMax", I64, P),
     sig!("IOHIDElementGetPhysicalMin", I64, P),
     sig!("IOHIDElementGetUnit", U32, P),
@@ -1112,6 +1123,14 @@ pub static SIGNATURES: &[FunctionAbi] = &[
         P
     ),
     sig!("IOPMAssertionRelease", I32, U32),
+    // `IOPMAssertionCreateWithName(CFStringRef type, IOPMAssertionLevel level,
+    // CFStringRef name, IOPMAssertionID *id)`. The level is a four-byte
+    // `IOPMAssertionLevel`, and `kIOPMAssertionLevelOn` is 0xff - which is the
+    // value the guest passes.
+    sig!("IOPMAssertionCreateWithName", I32, P, U32, P, P),
+    // `IOReturn IOPMCopyCPUPowerStatus(CFDictionaryRef *status)`: one out
+    // parameter and nothing in.
+    sig!("IOPMCopyCPUPowerStatus", I32, P),
     // The sleep/wake notification family is the *other* power API, and it is
     // the one an application registers with in order to be told before the
     // machine sleeps.
@@ -1122,6 +1141,9 @@ pub static SIGNATURES: &[FunctionAbi] = &[
     // `IONotificationPortRef` is opaque, and the run-loop source it vends is
     // what puts the notification on the application's own run loop.
     sig!("IONotificationPortGetRunLoopSource", P, P),
+    // `IONotificationPortSetDispatchQueue(port, queue)` is `void` and takes two
+    // opaque pointers - the port this crate made and a libdispatch queue.
+    sig!("IONotificationPortSetDispatchQueue", V, P, P),
     sig!("IONotificationPortDestroy", V, P),
     // The power-source family is pure CoreFoundation: an opaque blob, a list
     // over it, and a dictionary per source. Every one is a `CFTypeRef`.
@@ -1141,6 +1163,28 @@ pub static SIGNATURES: &[FunctionAbi] = &[
     sig!("IORegistryEntryFromPath", U32, U32, P),
     sig!("IORegistryEntrySearchCFProperty", P, U32, P, P, P, U32),
     sig!("IORegistryEntryGetParentEntry", I32, U32, P, P),
+    // `IORegistryEntryGetName(entry, io_name_t name)`: the 128-byte name buffer
+    // is the out parameter, and it is a plain pointer.
+    sig!("IORegistryEntryGetName", I32, U32, P),
+    // `boolean_t IOObjectConformsTo(io_object_t, const io_name_t)` - a
+    // `boolean_t` is an `unsigned int`, and the class name is a fixed 128-byte
+    // buffer rather than a C string.
+    sig!("IOObjectConformsTo", U32, U32, P),
+    sig!("IOObjectCopyClass", P, U32),
+    // The user-client pair, and the two ways of calling a method on one. Both
+    // take the connection first and the *sizes* as four-byte counts; only the
+    // input struct's address differs.
+    sig!("IOServiceOpen", I32, U32, U32, U32, P),
+    sig!("IOServiceClose", I32, U32),
+    sig!("IOConnectCallMethod", I32, U32, U32, P, U32, P, P),
+    sig!("IOConnectCallStructMethod", I32, U32, U32, P, U32, P, P),
+    // `IOCreatePlugInInterfaceForService(service, interfaceID, interfaceType,
+    // void **plugInInterface)`.
+    sig!("IOCreatePlugInInterfaceForService", I32, U32, P, P, P),
+    // `IOServiceAddInterestNotification(notifyPort, service, type, callback,
+    // refcon, iterator)` - the callback is the fourth argument, counting from
+    // zero, and is guest code the host would invoke on a match.
+    cbsig!([3], "IOServiceAddInterestNotification", I32, P, U32, P, P, P, P),
     sig!("IOServiceGetMatchingServices", I32, U32, P, P),
     sig!("IOServiceMatching", P, P),
     // `PhysicalKeyboardLayoutType KBGetLayoutType(SInt16)`. Its OSType result
@@ -3493,6 +3537,35 @@ pub static SIGNATURES: &[FunctionAbi] = &[
     ),
     sig!("mach_vm_read", I32, U32, U64, U64, P, P),
     sig!("mach_vm_region_recurse", I32, U32, P, P, P, P, P),
+    //
+    // The `mach_vm_*` family `darwin::mach::vm` now answers, listed with the
+    // prototypes from `usr/include/mach/mach_vm.h` and checked against the
+    // argument registers of every call site in `Chromium Framework`:
+    // `mach_vm_map` at `+0x7e5f255`, `+0x7e60668`, `+0x7e6069b` and
+    // `mach_vm_remap` at `+0x7e60727` are **eleven** arguments, the seventh
+    // onward on the stack, and `mach_vm_region` at the eleven sites listed in
+    // `mach/vm.rs` is the same seven words as `vm_region_64` because
+    // `osfmk/mach/mach_vm.defs` publishes one MIG routine under both names.
+    // `mach_vm_map`'s fourth argument is `mach_vm_offset_t mask` - an alignment
+    // mask - and its sixth is the `mem_entry_name_port_t`, **not** the
+    // out-parameter; the in/out address is the second.
+    sig!("mach_vm_map", I32, U32, P, U64, U64, U32, U32, U64, U32, I32, I32, U32),
+    sig!(
+        "mach_vm_remap",
+        I32,
+        U32,
+        P,
+        U64,
+        U64,
+        U32,
+        U32,
+        U64,
+        U32,
+        P,
+        P,
+        U32
+    ),
+    sig!("mach_vm_region", I32, U32, P, P, I32, P, P, P),
     sig!("mig_dealloc_reply_port", V, U32),
     sig!("mig_get_reply_port", U32),
     sig!("mig_put_reply_port", V, U32),

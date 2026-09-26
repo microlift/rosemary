@@ -475,6 +475,119 @@ element_field!(/// The lowest value this element reports.
 element_field!(/// The highest.
     IOHIDElementGetLogicalMax, CFIndex, |e: &crate::hid::Element| e.logical_max as CFIndex, 0);
 
+/// `IOHIDElementRef IOHIDElementGetParent(IOHIDElementRef)`.
+///
+/// The tree this module publishes is one collection deep, and
+/// [`crate::hid::describe`] says so where it builds it: element zero is the
+/// root collection and every other element is its child. So the answer is the
+/// root for everything and null for the root itself, which is what "the root has
+/// no parent" means.
+///
+/// That is not a convenience answer, it is the tree: a guest that walks up from
+/// an axis to find the `kHIDPage_GenericDesktop`/`kHIDUsage_Gamepad` collection
+/// above it gets there, and one that walks up from the root stops. The guest
+/// does exactly that at `Framework+0x83bd5d3`, testing the result for null
+/// (`test rax,rax; je <next element>`) so the walk terminates either way - but
+/// with no parent at all it would never find the usage it is looking for and
+/// would silently report no buttons and no axes.
+pub unsafe extern "C" fn IOHIDElementGetParent(element: *const c_void) -> CFTypeRef {
+    let Some((device, cookie)) = (unsafe { value::element(element) }) else {
+        return std::ptr::null();
+    };
+    match cookie {
+        0 => std::ptr::null(),
+        _ => device.handle(0) as CFTypeRef,
+    }
+}
+
+/// `IOHIDDeviceRef IOHIDElementGetDevice(IOHIDElementRef)`.
+///
+/// The `IOHIDDeviceRef` that owns the element, which is the device itself: in
+/// this crate an `IOHIDDeviceRef` *is* the `*const Device`
+/// ([`IOHIDDeviceGetService`] reads it that way), and
+/// [`crate::value::ElementRef`] records the owning device for exactly this
+/// answer.
+///
+/// The guest compares the result for pointer identity against the devices it
+/// enumerated - `cmp QWORD [r15+0x28], rax` at `Framework+0x83be8bc` - so
+/// returning the same address the enumeration handed out is what makes the
+/// comparison succeed. Returning a fresh object per call would match nothing
+/// and silently drop every value.
+pub unsafe extern "C" fn IOHIDElementGetDevice(element: *const c_void) -> CFTypeRef {
+    let Some((device, _cookie)) = (unsafe { value::element(element) }) else {
+        return std::ptr::null();
+    };
+    std::ptr::from_ref(device) as CFTypeRef
+}
+
+/// `uint32_t IOHIDElementGetReportSize(IOHIDElementRef, IOOptionBits options)`.
+///
+/// The width of the element's own value in the device's report - which is what
+/// [`IOHIDValueGetLength`] already answers for the same element, from the same
+/// model, and is the only report this crate produces. See that function for why
+/// a `Collection` is zero bytes wide.
+///
+/// **32-bit, not `CFIndex`.** The guest zero-extends the result itself -
+/// `mov eax, eax` at `Framework+0x83bd7a0`, immediately after the call - which
+/// only a compiler that believed the return was 32 bits wide would emit. The
+/// binary is the authority on the width, and `IOHIDValueGetLength`'s `CFIndex`
+/// is a different function with a different declared type.
+///
+/// The options are reserved and ignored; the guest passes none.
+pub unsafe extern "C" fn IOHIDElementGetReportSize(
+    element: *const c_void,
+    _options: u32,
+) -> u32 {
+    // SAFETY: forwarded unchanged - the same element pointer and the same
+    // precondition, and `IOHIDValueGetLength` reads nothing `GetReportSize`
+    // does not. The width is this function's own, narrowed on purpose.
+    unsafe { IOHIDValueGetLength(element) as u32 }
+}
+
+/// `CFIndex IOHIDElementGetReportID(IOHIDElementRef)`.
+///
+/// **0**, the report id of the single synthetic report
+/// [`crate::hid::Device::input_report`] describes, and the one
+/// [`IOHIDDeviceGetReport`] answers for `kIOHIDReportTypeInput` with an id of
+/// 0. The guest uses only the low byte of this (`movzx esi, BYTE PTR
+/// [rbp-0x2c]` at `Framework+0x83bd8e2`) as the report id to hand the raw
+/// bytes to, so 0 is the id those bytes actually have.
+pub unsafe extern "C" fn IOHIDElementGetReportID(_element: *const c_void) -> u32 {
+    0
+}
+
+/// `const uint8_t *IOHIDValueGetBytePtr(IOHIDValueRef)`.
+///
+/// A pointer into the report the device delivered, and **null** when this
+/// runtime has no such report for it.
+///
+/// The distinction is the API's own: `IOHIDValueGetBytePtr` is documented as
+/// returning "a pointer to the value's data, or NULL if the value has no data",
+/// and a value synthesised from SDL's per-element getters has no report behind
+/// it - there is no byte in any buffer that means "this axis is at 12000"
+/// unless a device delivered a real HID report, and inventing one would be a
+/// plausible-looking number for a value nobody measured.
+///
+/// Where a real report *does* exist the pointer is into the caller's own
+/// registered buffer: [`crate::hid::Device::set_report_callback`] records the
+/// `report`/`length` pair the guest handed
+/// `IOHIDDeviceRegisterInputReportCallback`, and that buffer is filled from the
+/// device before the callback runs. Handing back its address is then literally
+/// true - it is the same memory the guest wrote.
+///
+/// # Safety
+///
+/// `value` must be an `IOHIDValueRef` this module made, or null.
+pub unsafe extern "C" fn IOHIDValueGetBytePtr(v: CFTypeRef) -> *const u8 {
+    let Some(value) = (unsafe { value::borrow(v) }) else {
+        return std::ptr::null();
+    };
+    let Some(device) = (unsafe { value::device(value) }) else {
+        return std::ptr::null();
+    };
+    device.report_bytes()
+}
+
 /// `IOHIDElementGetChildren`: everything under a collection.
 ///
 /// Only the root collection has children here, and its children are every other

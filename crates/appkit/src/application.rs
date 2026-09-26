@@ -426,6 +426,28 @@ unsafe extern "C" fn stop(receiver: Id, _sel: Sel, _sender: Id) {
     corefoundation::runloop::main().stop();
 }
 
+/// `-cancelTerminate:`, the inverse of `-terminate:`'s "later" arm.
+///
+/// Apple reaches this from `-terminate:`: a delegate that answers
+/// `applicationShouldTerminate:` with `NSTerminateLater` puts the application
+/// into a nested `NSModalPanelRunLoopMode` loop, and the only thing that ends
+/// that wait is `-replyToApplicationShouldTerminate:` or this.
+///
+/// The [`terminate`] above deliberately does not ask the delegate at all and so
+/// never defers, which means the state this method cancels is never created
+/// here and there is nothing for it to do. That is a statement about this
+/// runtime's contract rather than a shrug: a program that wanted to veto its
+/// own exit has no way to ask for one here (see [`terminate`]), so there is
+/// nothing for it to take back. Chromium sends this from
+/// `chrome_browser_application_mac::CancelTerminate()` but overrides it in
+/// `BrowserCrApplication` - verified at `Chromium Framework+0x56a54b0` - so this
+/// implementation is not reached by the browser at all.
+///
+/// Accepting the call rather than refusing it is deliberate: a refusal here
+/// would abort a shutdown over a request whose answer is knowably "nothing to
+/// undo", which is the wrong place for a runtime to stop a program.
+unsafe extern "C" fn cancel_terminate(_receiver: Id, _sel: Sel, _sender: Id) {}
+
 /// `-terminate:`.
 ///
 /// Apple asks the delegate `applicationShouldTerminate:` first and may be told
@@ -433,7 +455,8 @@ unsafe extern "C" fn stop(receiver: Id, _sel: Sel, _sender: Id) {
 /// program sends back asynchronously, so it is not half-implemented here: the
 /// delegate is asked nothing, and the process ends after the notification. A
 /// program that wanted to veto its own exit gets no chance to, which is worth
-/// saying out loud rather than discovering.
+/// saying out loud rather than discovering. See [`cancel_terminate`] for the
+/// other end of the same omission.
 unsafe extern "C" fn terminate(receiver: Id, _sel: Sel, _sender: Id) {
     // SAFETY: an application.
     let delegate = unsafe { (*(receiver as *const Application)).delegate };
@@ -556,6 +579,39 @@ unsafe extern "C" fn windows(_receiver: Id, _sel: Sel) -> Id {
     );
     // SAFETY: a fresh array.
     unsafe { corefoundation::api::CFAutorelease(array) as Id }
+}
+
+/// `-orderedWindows`, which is `-windows` **in front-to-back order**.
+///
+/// Refused by name. The distinction is the whole point of the selector - Apple
+/// says `-windows` has no promised order and `-orderedWindows` is the ordered
+/// one - and this runtime has no order to give: `crate::window::all()` is
+/// creation order, documented as such, and the only stacking fact it keeps is
+/// which one window is key. There is no window server here to ask.
+///
+/// Answering with `all()`, or with `all()` reversed, would be a plausible lie:
+/// Chromium reads this to find the frontmost window (it walks
+/// `[[NSApp orderedWindows] reverseObjectEnumerator]`, so it needs back-to-front,
+/// at `Chromium Framework+0x569ef79`), and a wrong-but-reversed list makes it
+/// raise the wrong window rather than fail.
+///
+/// It is not on the start-up path, and that is checked rather than assumed: the
+/// selector has exactly five call sites in this binary, at
+/// `Chromium Framework+0x4834f9`, `+0x3a8dd89`, `+0x569ef79`, `+0x6a8ca1a` and
+/// `+0x88c21a4`, and none of them lies inside `+[BrowserCrApplication
+/// sharedApplication]` (`+0x56a5210`..`+0x56a5290`), `-[BrowserCrApplication
+/// finishLaunching]` (`+0x56a5290`..`+0x56a52f0`),
+/// `MessagePumpNSApplication::DoRun` (`+0x5d96cd0`..`+0x5d97130`),
+/// `message_pump_apple::Create` (`+0x5d97220`..`+0x5d97360`) or
+/// `RegisterBrowserCrApp` (`+0x56a50e0`..`+0x56a5140`).
+unsafe extern "C" fn ordered_windows(_receiver: Id, sel: Sel) -> ! {
+    objc::fail!(
+        "NSApplication: -[{} orderedWindows] needs a front-to-back window order, and this \
+         runtime has none: its windows are an SDL window each on one display, kept in creation \
+         order with a single key window and no stacking between them. -windows answers the same \
+         set in creation order, which is not the order this selector promises.",
+        std::ffi::CStr::from_ptr(sel).to_string_lossy()
+    )
 }
 
 unsafe extern "C" fn key_window(_receiver: Id, _sel: Sel) -> Id {
@@ -875,6 +931,7 @@ pub(crate) fn install() {
         "run" => run, c"v16@0:8";
         "stop:" => stop, c"v24@0:8@16";
         "terminate:" => terminate, c"v24@0:8@16";
+        "cancelTerminate:" => cancel_terminate, c"v24@0:8@16";
         "activateIgnoringOtherApps:" => activate, c"v20@0:8c16";
         "setActivationPolicy:" => set_activation_policy, c"c24@0:8q16";
         "currentSystemPresentationOptions" => presentation_options, c"Q16@0:8";
@@ -882,6 +939,7 @@ pub(crate) fn install() {
         "setPresentationOptions:" => set_presentation_options, c"v24@0:8Q16";
         "nextEventMatchingMask:untilDate:inMode:dequeue:" => next_event, c"@48@0:8Q16@24@32B40";
         "windows" => windows, c"@16@0:8";
+        "orderedWindows" => ordered_windows, c"@16@0:8";
         "windowWithWindowNumber:" => window_with_window_number, c"@24@0:8q16";
         "keyWindow" => key_window, c"@16@0:8";
         "mainWindow" => key_window, c"@16@0:8";
@@ -918,6 +976,38 @@ pub(crate) fn install() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `-cancelTerminate:` is accepted and does nothing, which is the whole of
+    /// its contract here.
+    ///
+    /// It exists to end the wait `-terminate:` starts when a delegate answers
+    /// `NSTerminateLater`, and [`terminate`] never asks the delegate, so the
+    /// wait is never created. The test is that the call is *survivable*: a
+    /// refusal here would abort a shutdown, which is the one place a runtime has
+    /// no business stopping a program over a request whose answer is knowably
+    /// "nothing to undo".
+    ///
+    /// Sent through dispatch, because that is how Chromium sends it
+    /// (`chrome_browser_application_mac::CancelTerminate()` does
+    /// `[NSApp cancelTerminate:nil]`) and it is the *registration* that is being
+    /// claimed, not merely the function.
+    #[test]
+    fn cancelling_a_termination_that_never_deferred_is_accepted() {
+        crate::bootstrap();
+        let app = objc::object::create_instance(
+            objc::class::lookup(c"NSApplication").expect("NSApplication"),
+            0,
+        );
+        // SAFETY: `-cancelTerminate:` is `void (id, SEL, id)`.
+        unsafe {
+            let f: unsafe extern "C" fn(Id, Sel, Id) = std::mem::transmute(objc::msg::entry());
+            f(
+                app,
+                objc::sel::get("cancelTerminate:"),
+                std::ptr::null_mut(),
+            );
+        }
+    }
 
     /// No window has the number zero or a number nothing was given, and
     /// asking for one is nil rather than the first window.

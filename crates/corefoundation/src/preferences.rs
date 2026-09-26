@@ -155,6 +155,49 @@ pub unsafe extern "C" fn CFPreferencesSetAppValue(
     }
 }
 
+/// `Boolean CFPreferencesAppValueIsForced(CFStringRef key, CFStringRef applicationID)`
+///
+/// "Forced" is the managed-preferences mechanism: a value installed by a
+/// configuration profile the user is not allowed to change, so that reading the
+/// *user's* value answers something the user did not choose.  It is a separate
+/// store from the user's own, which is why the question is a question at all.
+///
+/// There is no managed store on this host - no configuration profiles, no
+/// directory of them, nothing that has ever written one - and Apple's own
+/// open-source `CFPreferences.c` does not contain this function either.  So the
+/// answer is derived rather than hardcoded: [`MANAGED`] is a real prefix in this
+/// store's domain names, no domain under it has ever been created, and the
+/// question is whether `key` is in the one for `applicationID`.
+///
+/// The guest's call (`0x484451`, in a `bool*`-taking predicate) reads the
+/// preference `MetricsReportingEnabled` and asks this only after
+/// `CFPreferencesGetAppBooleanValue` found it, so on a machine with no
+/// `MetricsReportingEnabled` preference the function is never reached at all.
+pub unsafe extern "C" fn CFPreferencesAppValueIsForced(
+    key: CFTypeRef,
+    application: CFTypeRef,
+) -> crate::api::Boolean {
+    let (Some(key), Some(application)) = (unsafe { text(key) }, unsafe { text(application) })
+    else {
+        return 0;
+    };
+    // Per application, because that is how a profile scopes itself: a machine
+    // managed for one application is not managed for another, and a store that
+    // filed every forced value together could not say which.
+    let domain = format!("{MANAGED}/{application}");
+    let store = store().lock().unwrap_or_else(|e| e.into_inner());
+    store
+        .get(&domain)
+        .is_some_and(|domain| domain.contains_key(&key)) as crate::api::Boolean
+}
+
+/// The prefix the managed, user-unalterable domains are filed under.
+///
+/// Named after what it is rather than after the mechanism, because the
+/// mechanism - Mobile Directory Services, then MCX, then Configuration Profiles -
+/// is three names for a store that does not exist here.
+const MANAGED: &str = "com.rosetta3.managed";
+
 /// `CFPropertyListRef CFPreferencesCopyValue(CFStringRef key, CFStringRef
 /// applicationID, CFStringRef userName, CFStringRef hostName)`
 ///

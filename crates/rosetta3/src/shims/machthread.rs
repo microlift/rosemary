@@ -118,7 +118,27 @@ fn pthread_get_stackaddr_np(
 ) -> Result<()> {
     match guest_thread_of(ctx.rdi) {
         Some(thread) => ctx.rax = thread.stack().end,
-        None => return passthrough(symbol, ctx),
+        // A `pthread_t` this runtime did not issue names no thread whose stack
+        // it knows, and `NULL` is the honest answer for that - but it is also
+        // what `pthread_from_mach_thread_np` returns for a port that is not a
+        // live thread here, so it is a *contractual* input and not an error.
+        //
+        // It must not reach the host. `pthread_get_stackaddr_np` is a Darwin
+        // function: glibc has none, so the passthrough resolves to nothing and
+        // the caller's `pthread_t` is dereferenced as if it were a host
+        // `pthread_t`. Worse than a null answer, the guest then walks from
+        // whatever came back: Chromium's `SuspendableThreadDelegateMac`
+        // constructor inlines exactly
+        //
+        // ```c
+        // stack_base_address_(pthread_get_stackaddr_np(pthread_from_mach_thread_np(thread_port_)))
+        // ```
+        //
+        // and its profiler treats a non-null base as a real stack to copy
+        // (`base/profiler/suspendable_thread_delegate_mac.cc`,
+        // `base/profiler/stack_copier_suspend.cc`). A guest that gets a
+        // plausible-looking address here gets a stack that belongs to nothing.
+        None => ctx.rax = 0,
     }
     Ok(())
 }
@@ -134,7 +154,9 @@ fn pthread_get_stacksize_np(
             let range = thread.stack();
             ctx.rax = range.end - range.start;
         }
-        None => return passthrough(symbol, ctx),
+        // As above: no thread, so no size. Zero is the answer, and forwarding
+        // it would hand the guest a host thread's stack extent.
+        None => ctx.rax = 0,
     }
     Ok(())
 }

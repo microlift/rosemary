@@ -1925,6 +1925,41 @@ unsafe extern "C" fn are_cursor_rects_enabled(_receiver: Id, _sel: Sel) -> u8 {
     crate::cursor::rects_enabled() as u8
 }
 
+/// `+[NSWindow allowsAutomaticWindowTabbing]` / `+setAllowsAutomaticWindowTabbing:`.
+///
+/// A **class** property - `@property (class) BOOL allowsAutomaticWindowTabbing;`,
+/// added in 10.12 - and a process-wide one, so it does not live in `Window` and
+/// there is no receiver to read it out of.
+///
+/// Apple's own words for the default: "By default, this will be set to `YES`,
+/// but applications can explicitly opt out of all automatic tabbing by setting
+/// it to NO, and can still adopt explicit window tabbing, if desired." So the
+/// value starts at one.
+///
+/// Kept and reported rather than acted on, for the same reason
+/// `-[NSApplication setPresentationOptions:]` is: a window in this runtime is
+/// an SDL window and there is no tab bar, no tab overview and no tab group, so
+/// the *effect* of turning tabbing off is already the case. What a program needs
+/// is for the value it set to be the value it reads back, because Chromium sets
+/// it and compares nothing - but a program that reads it back and branches is
+/// entitled to its own answer.
+///
+/// Chromium sends the setter as the very first statement of
+/// `-[AppController applicationWillFinishLaunching:]` (verified at
+/// `Chromium Framework+0x569a3b1`, `NSWindow.allowsAutomaticWindowTabbing = NO`),
+/// which is the first delegate method `-[NSApplication finishLaunching]` raises -
+/// so this is on the start-up path and not merely present.
+static AUTOMATIC_WINDOW_TABBING: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(true);
+
+unsafe extern "C" fn allows_automatic_window_tabbing(_class: Id, _sel: Sel) -> u8 {
+    AUTOMATIC_WINDOW_TABBING.load(std::sync::atomic::Ordering::Acquire) as u8
+}
+
+unsafe extern "C" fn set_allows_automatic_window_tabbing(_class: Id, _sel: Sel, value: u8) {
+    AUTOMATIC_WINDOW_TABBING.store(value != 0, std::sync::atomic::Ordering::Release);
+}
+
 pub(crate) fn install() {
     let responder = objc::class::lookup(c"NSResponder").expect("declared before its methods");
     methods!(responder, {
@@ -1938,6 +1973,9 @@ pub(crate) fn install() {
     });
     let class = objc::class::lookup(c"NSWindow").expect("declared before its methods");
     class_methods!(class, {
+        "allowsAutomaticWindowTabbing" => allows_automatic_window_tabbing, c"c16@0:8";
+        "setAllowsAutomaticWindowTabbing:" => set_allows_automatic_window_tabbing,
+            c"v20@0:8c16";
         "windowNumberAtPoint:belowWindowWithWindowNumber:" => window_number_at_point,
             c"q40@0:8{CGPoint=dd}16q32";
         "contentRectForFrameRect:styleMask:" => content_rect_for_frame_style,
@@ -2080,6 +2118,40 @@ pub(crate) fn install() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `allowsAutomaticWindowTabbing` starts at Apple's default of YES and
+    /// reports back what the program set.
+    ///
+    /// The round trip is the whole of the contract here - a window in this
+    /// runtime is an SDL window with no tab bar to suppress, so the only thing
+    /// owed is that the value read back is the value written. Chromium writes
+    /// NO as the first statement of `-applicationWillFinishLaunching:` and never
+    /// reads it, but a program that reads it and branches is entitled to its own
+    /// answer.
+    #[test]
+    fn automatic_window_tabbing_defaults_to_yes_and_reports_what_was_set() {
+        crate::bootstrap();
+        let class = objc::class::ptr(objc::class::lookup(c"NSWindow").expect("NSWindow")) as Id;
+        // Sent through dispatch, which is what Chromium does
+        // (`NSWindow.allowsAutomaticWindowTabbing = NO` at
+        // `Chromium Framework+0x569a3b1`): it is the *registration* on the
+        // metaclass that is being claimed, and a class method only resolves if
+        // it really landed there.
+        // SAFETY: both are `BOOL`-shaped class methods taking NSWindow as the
+        // receiver, and `class` is the receiver a class method is sent to.
+        unsafe {
+            let get: unsafe extern "C" fn(Id, Sel) -> u8 = std::mem::transmute(objc::msg::entry());
+            let set: unsafe extern "C" fn(Id, Sel, u8) = std::mem::transmute(objc::msg::entry());
+            let read = objc::sel::get("allowsAutomaticWindowTabbing");
+            let write = objc::sel::get("setAllowsAutomaticWindowTabbing:");
+
+            assert_eq!(get(class, read), 1, "Apple's default is YES");
+            set(class, write, 0);
+            assert_eq!(get(class, read), 0);
+            set(class, write, 1);
+            assert_eq!(get(class, read), 1);
+        }
+    }
 
     /// What a window is, is read off its style mask and its level together -
     /// and is read again at every ordering, because a toolkit reuses one window

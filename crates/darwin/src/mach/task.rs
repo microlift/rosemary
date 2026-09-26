@@ -3,6 +3,14 @@
 use super::kern::*;
 use super::space::{self, BOOTSTRAP, HOST_SELF, MACH_PORT_NULL, Name, Right, TASK_SELF};
 
+/// The exception-port family, refused rather than accepted.
+///
+/// Declared from here rather than from `mach/mod.rs` so that the `exports!`
+/// entries there keep naming `task::…` and need no edit: the six names
+/// `mach/mod.rs` publishes are thin forwarders below. See the module for why a
+/// refusal is the answer and what it replaced.
+pub mod exception;
+
 /// `mach_port_t mach_task_self_` - the data symbol behind the `mach_task_self()`
 /// macro.
 pub static TASK_SELF_PORT: Name = TASK_SELF;
@@ -77,148 +85,56 @@ pub extern "C" fn task_set_special_port(_task: Name, _which: i32, _port: Name) -
     KERN_NOT_RECEIVER
 }
 
-/// What a `…_set_exception_ports` call asked for.
-///
-/// Kept so that the matching `…_get_exception_ports` answers with what the
-/// caller registered rather than with nothing: a crash reporter that installs a
-/// handler, reads the ports back, and finds none concludes its installation
-/// failed.
-struct Registration {
-    mask: u32,
-    port: Name,
-    behavior: i32,
-    flavor: i32,
-}
-
-fn registrations() -> &'static std::sync::Mutex<Vec<Registration>> {
-    static PORTS: std::sync::OnceLock<std::sync::Mutex<Vec<Registration>>> =
-        std::sync::OnceLock::new();
-    PORTS.get_or_init(Default::default)
-}
-
-fn record(symbol: &str, mask: u32, port: Name, behavior: i32, flavor: i32) {
-    announce(symbol);
-    let mut held = registrations().lock().unwrap_or_else(|e| e.into_inner());
-    held.retain(|existing| existing.mask & mask != existing.mask);
-    if port != MACH_PORT_NULL {
-        held.push(Registration {
-            mask,
-            port,
-            behavior,
-            flavor,
-        });
-    }
-}
-
-fn announce(symbol: &str) {
-    static SAID: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-    if !SAID.swap(true, std::sync::atomic::Ordering::Relaxed) {
-        eprintln!(
-            "rosetta3: {symbol} accepted but not honoured - a Mach exception message carries this \
-             CPU's thread state for a fault inside a translation, not the guest's registers, so \
-             the registration is recorded and no exception is ever delivered"
-        );
-    }
-}
-
-/// Fill in the five out-parameter arrays a `…_get_exception_ports` takes.
-///
-/// # Safety
-///
-/// `count` is a writable `mach_msg_type_number_t` and the four arrays hold at
-/// least `*count` elements, which is what the caller declared.
-unsafe fn answer_registrations(
-    mask: u32,
-    count: *mut u32,
-    masks: *mut u32,
-    ports: *mut Name,
-    behaviors: *mut i32,
-    flavors: *mut i32,
-) -> i32 {
-    if count.is_null() {
-        return KERN_INVALID_ADDRESS;
-    }
-    // SAFETY: the caller's count, which states its arrays' capacity.
-    let capacity = unsafe { count.read() } as usize;
-    let held = registrations().lock().unwrap_or_else(|e| e.into_inner());
-    let matching: Vec<&Registration> = held
-        .iter()
-        .filter(|entry| entry.mask & mask != 0)
-        .take(capacity)
-        .collect();
-
-    for (i, entry) in matching.iter().enumerate() {
-        // SAFETY: `i` is below `capacity`, which the caller declared each array
-        // holds; a null array is skipped.
-        unsafe {
-            if !masks.is_null() {
-                masks.add(i).write(entry.mask);
-            }
-            if !ports.is_null() {
-                ports.add(i).write(entry.port);
-            }
-            if !behaviors.is_null() {
-                behaviors.add(i).write(entry.behavior);
-            }
-            if !flavors.is_null() {
-                flavors.add(i).write(entry.flavor);
-            }
-        }
-    }
-    // SAFETY: the caller's count.
-    unsafe { count.write(matching.len() as u32) };
-    KERN_SUCCESS
-}
-
 /// `kern_return_t task_set_exception_ports(task_t, exception_mask_t,
 /// mach_port_t, exception_behavior_t, thread_state_flavor_t)`
+///
+/// Refused. The forwarding is here only so that `mach/mod.rs`'s `exports!`
+/// entry keeps naming `task::`; the reasoning, and what this replaced, are in
+/// [`exception`].
 pub extern "C" fn task_set_exception_ports(
-    _task: Name,
+    task: Name,
     mask: u32,
     port: Name,
     behavior: i32,
     flavor: i32,
 ) -> i32 {
-    record("task_set_exception_ports", mask, port, behavior, flavor);
-    KERN_SUCCESS
+    exception::task_set_exception_ports(task, mask, port, behavior, flavor)
 }
 
-/// `thread_set_exception_ports`, which differs only in what the first argument
-/// names. The registrations are kept in one list: nothing delivers from it, so
-/// a per-thread one would only be a longer way of recording the same thing.
+/// `thread_set_exception_ports`, refused for the same reason.
 pub extern "C" fn thread_set_exception_ports(
-    _thread: Name,
+    thread: Name,
     mask: u32,
     port: Name,
     behavior: i32,
     flavor: i32,
 ) -> i32 {
-    record("thread_set_exception_ports", mask, port, behavior, flavor);
-    KERN_SUCCESS
+    exception::thread_set_exception_ports(thread, mask, port, behavior, flavor)
 }
 
-/// `host_set_exception_ports`, which needs a `host_priv_t` a program without
-/// host privileges could not have had in the first place.
+/// `host_set_exception_ports`, refused for the same reason.
 pub extern "C" fn host_set_exception_ports(
-    _host: Name,
+    host: Name,
     mask: u32,
     port: Name,
     behavior: i32,
     flavor: i32,
 ) -> i32 {
-    record("host_set_exception_ports", mask, port, behavior, flavor);
-    KERN_SUCCESS
+    exception::host_set_exception_ports(host, mask, port, behavior, flavor)
 }
 
 /// `kern_return_t task_get_exception_ports(task_t, exception_mask_t,
 /// exception_mask_array_t, mach_msg_type_number_t *, exception_port_array_t,
 /// exception_behavior_array_t, thread_state_flavor_array_t)`
 ///
+/// `KERN_SUCCESS` with a count of zero, because nothing was ever registered.
+/// See [`exception`].
+///
 /// # Safety
 ///
-/// As [`answer_registrations`].
+/// As [`exception::task_get_exception_ports`].
 pub unsafe extern "C" fn task_get_exception_ports(
-    _task: Name,
+    task: Name,
     mask: u32,
     masks: *mut u32,
     count: *mut u32,
@@ -226,8 +142,10 @@ pub unsafe extern "C" fn task_get_exception_ports(
     behaviors: *mut i32,
     flavors: *mut i32,
 ) -> i32 {
-    // SAFETY: the caller's arrays, as documented.
-    unsafe { answer_registrations(mask, count, masks, ports, behaviors, flavors) }
+    // SAFETY: forwarded with the caller's own declarations, unchanged.
+    unsafe {
+        exception::task_get_exception_ports(task, mask, masks, count, ports, behaviors, flavors)
+    }
 }
 
 /// `kern_return_t task_swap_exception_ports(task_t, exception_mask_t,
@@ -237,14 +155,16 @@ pub unsafe extern "C" fn task_get_exception_ports(
 ///
 /// **Ten parameters.** The seventh - the count - is past the six integer
 /// registers SysV AMD64 has, so it arrives on the stack; a prototype one
-/// argument short reads the caller's return address as a pointer.
+/// argument short reads the caller's return address as a pointer. That is the
+/// one thing about this signature that is easy to get wrong and is why the
+/// forwarder spells every argument out.
 ///
 /// # Safety
 ///
-/// As [`answer_registrations`].
+/// As [`exception::task_swap_exception_ports`].
 #[allow(clippy::too_many_arguments)]
 pub unsafe extern "C" fn task_swap_exception_ports(
-    _task: Name,
+    task: Name,
     mask: u32,
     port: Name,
     behavior: i32,
@@ -255,11 +175,12 @@ pub unsafe extern "C" fn task_swap_exception_ports(
     behaviors: *mut i32,
     flavors: *mut i32,
 ) -> i32 {
-    // SAFETY: the caller's arrays, as documented. The old registrations are
-    // answered before the new one replaces them, which is what "swap" means.
-    let rc = unsafe { answer_registrations(mask, count, masks, ports, behaviors, flavors) };
-    record("task_swap_exception_ports", mask, port, behavior, flavor);
-    rc
+    // SAFETY: forwarded with the caller's own declarations, unchanged.
+    unsafe {
+        exception::task_swap_exception_ports(
+            task, mask, port, behavior, flavor, masks, count, ports, behaviors, flavors,
+        )
+    }
 }
 
 #[cfg(test)]
@@ -293,10 +214,18 @@ mod tests {
         assert_ne!(other, first);
     }
 
-    /// Registering exception ports and reading them back has to agree, or a
-    /// crash reporter that checks its own installation concludes it failed.
+    /// The exception ports are **refused**, and this is the test that says so
+    /// from the outside: a registration must not answer `KERN_SUCCESS`, and a
+    /// refused registration must not read back as one.
+    ///
+    /// It used to assert the opposite - that a registered port read back as the
+    /// port that was registered - which is the hazard `mach::task::exception`
+    /// exists to remove. A crash reporter that installs a handler, reads the
+    /// ports back, and finds them has been told it is protected when nothing
+    /// will ever be delivered to it. The assertions here are the ones that make
+    /// that impossible to reintroduce by accident.
     #[test]
-    fn the_exception_ports_read_back_as_the_ones_that_were_registered() {
+    fn the_exception_ports_refuse_rather_than_agree_with_each_other() {
         /// `EXC_MASK_BAD_ACCESS | EXC_MASK_CRASH`, near enough.
         const MASK: u32 = 0x0000_2002;
         let mut port = MACH_PORT_NULL;
@@ -305,7 +234,8 @@ mod tests {
 
         assert_eq!(
             task_set_exception_ports(TASK_SELF, MASK, port, 1, 0),
-            KERN_SUCCESS
+            exception::NOT_HONOURED,
+            "nothing will be delivered to that port, so success would be a lie"
         );
 
         let mut count = 4u32;
@@ -326,13 +256,11 @@ mod tests {
             )
         };
         assert_eq!(rc, KERN_SUCCESS);
-        assert_eq!(count, 1);
-        assert_eq!(masks[0], MASK);
-        assert_eq!(ports[0], port);
-        assert_eq!(behaviors[0], 1);
-
-        // Clearing puts it back, so this test does not leak into the next.
-        task_set_exception_ports(TASK_SELF, MASK, MACH_PORT_NULL, 0, 0);
+        assert_eq!(
+            count, 0,
+            "and the get must agree with the set, or the pair tells the caller its \
+             handler is installed when it is not"
+        );
         space::destroy(port);
     }
 

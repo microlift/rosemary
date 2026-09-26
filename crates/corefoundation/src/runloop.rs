@@ -86,6 +86,18 @@ pub struct Timer {
     callback: Option<TimerCallback>,
     info: usize,
     valid: AtomicBool,
+    /// The window past the fire date within which firing is still correct.
+    ///
+    /// Apple's header: "The timer may fire at any time between its scheduled
+    /// fire date and the scheduled fire date plus the tolerance. The timer will
+    /// not fire before the scheduled fire date. ... The default value is zero,
+    /// which means no additional tolerance is applied."
+    ///
+    /// This run loop fires every timer at its exact fire date, which is inside
+    /// that window for any tolerance at all, so the value is never *needed* -
+    /// it is kept because it is what the caller asked for and because the
+    /// invariant it states is checkable: see [`Timer::tolerance`].
+    tolerance: Mutex<f64>,
 }
 
 // SAFETY: as [`Source`].
@@ -105,6 +117,41 @@ impl Timer {
     /// Apple's reports one, and what a caller testing "does this repeat" reads.
     pub fn interval_seconds(&self) -> f64 {
         self.interval.map_or(0.0, |i| i.as_secs_f64())
+    }
+
+    /// Record the tolerance `CFRunLoopTimerSetTolerance` was given, clamped the
+    /// way `CFRunLoop.c` clamps it.
+    ///
+    /// Apple's own words for the two arms, from `CFRunLoopTimerSetTolerance`:
+    ///
+    /// ```c
+    /// if (rlt->_interval > 0) {
+    ///     rlt->_tolerance = MIN(tolerance, rlt->_interval / 2);
+    /// } else {
+    ///     if (tolerance < 0) tolerance = 0.0;
+    ///     rlt->_tolerance = tolerance;
+    /// }
+    /// ```
+    ///
+    /// A repeating timer is limited to half an interval so a tolerance can never
+    /// reach past the timer's own next fire, and a one-shot is limited to zero
+    /// because a negative tolerance would authorise firing *before* the date,
+    /// which the header forbids outright.
+    pub fn set_tolerance(&self, tolerance: f64) {
+        let clamped = match self.interval {
+            Some(interval) => tolerance.min(interval.as_secs_f64() / 2.0),
+            None => tolerance.max(0.0),
+        };
+        *self.tolerance.lock().unwrap_or_else(|e| e.into_inner()) = clamped;
+    }
+
+    /// The tolerance in force, in seconds.
+    ///
+    /// The invariant this run loop keeps, and the reason the value is worth
+    /// keeping: a timer fires at `next`, never later than `next + tolerance`, and
+    /// `next` itself is always inside that window.
+    pub fn tolerance(&self) -> f64 {
+        *self.tolerance.lock().unwrap_or_else(|e| e.into_inner())
     }
 
     /// Move the next fire date, as `CFRunLoopTimerSetNextFireDate` does.
@@ -846,6 +893,7 @@ pub fn new_timer(
         callback,
         info,
         valid: AtomicBool::new(true),
+        tolerance: Mutex::new(0.0),
     });
     note(Arc::as_ptr(&timer));
     timer

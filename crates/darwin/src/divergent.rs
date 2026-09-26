@@ -258,6 +258,69 @@ pub const NAMES: &[(&str, &str)] = &[
         "ioctl",
         "BSD ioctl requests need translation before reaching the host",
     ),
+    // VideoToolbox's *session* half is real video work rather than a feature
+    // probe - a decode or encode path this runtime has no hardware, and no
+    // software decoder, it could be built on. So these are refused by name
+    // instead of being left unbound, because an unbound import is a jump
+    // through a zero slot (PLAN.md §4) whereas a refusal says what it is.
+    //
+    // The two *probes* in the same family are answered for real - see
+    // `crate::unavailable`, which returns false for
+    // `VTIsHardwareDecodeSupported`, which is the truth on this host.
+    (
+        "VTDecompressionSessionCreate",
+        "there is no VideoToolbox on this host, and no decoder it could be built on",
+    ),
+    (
+        "VTCompressionSessionCreate",
+        "there is no VideoToolbox on this host, and no encoder it could be built on",
+    ),
+    (
+        "VTDecompressionSessionInvalidate",
+        "as VTDecompressionSessionCreate: no session can exist to invalidate",
+    ),
+    (
+        "VTCompressionSessionInvalidate",
+        "as VTCompressionSessionCreate: no session can exist to invalidate",
+    ),
+    (
+        "VTDecompressionSessionDecodeFrame",
+        "as VTDecompressionSessionCreate",
+    ),
+    (
+        "VTCompressionSessionEncodeFrame",
+        "as VTCompressionSessionCreate",
+    ),
+    (
+        "VTCompressionSessionCompleteFrames",
+        "as VTCompressionSessionCreate",
+    ),
+    (
+        "VTDecompressionSessionCanAcceptFormatDescription",
+        "as VTDecompressionSessionCreate",
+    ),
+    ("VTSessionCopyProperty", "as VTDecompressionSessionCreate"),
+    ("VTSessionSetProperty", "as VTDecompressionSessionCreate"),
+    (
+        "VTSessionCopySupportedPropertyDictionary",
+        "as VTDecompressionSessionCreate",
+    ),
+    (
+        "VTPixelTransferSessionCreate",
+        "as VTDecompressionSessionCreate: pixel transfer needs VideoToolbox",
+    ),
+    (
+        "VTPixelTransferSessionInvalidate",
+        "as VTPixelTransferSessionCreate",
+    ),
+    (
+        "VTPixelTransferSessionTransferImage",
+        "as VTPixelTransferSessionCreate",
+    ),
+    (
+        "VTCreateCGImageFromCVPixelBuffer",
+        "as VTDecompressionSessionCreate: needs VideoToolbox to make the image",
+    ),
 ];
 
 #[cfg(target_os = "macos")]
@@ -367,9 +430,16 @@ mod tests {
         // itself was here until `crate::dirent` answered it, and is asserted
         // the other way round below.
         assert_eq!(reason("getdirentries"), Some(DIRENT));
-        // A Mach call that reaches the kernel about *memory*, which is the half
-        // of the family `crate::mach` does not answer.
-        assert_eq!(reason("mach_vm_allocate"), Some(MACH));
+        // A Mach call that reaches the kernel about *memory*, which is the part
+        // of the family `crate::mach` still does not answer.
+        //
+        // `mach_vm_allocate` used to be the name here. It is not any more:
+        // `crate::mach::vm` now answers the whole `mach_vm_*` map/region
+        // family, so naming it would assert the opposite of the truth. The
+        // Framework still imports `mach_vm_purgable_control` (at
+        // `+0x81c4106`) and nothing here implements it, so it is the honest
+        // witness for "a Mach memory call this crate declines".
+        assert_eq!(reason("mach_vm_purgable_control"), Some(MACH));
         assert_eq!(
             reason("strlen"),
             None,
@@ -386,6 +456,17 @@ mod tests {
         for name in [
             "mach_absolute_time",
             "mach_timebase_info",
+            // The `mach_vm_*` map/region family, answered by `crate::mach::vm`
+            // off the back of the verified `vm_map`/`vm_region_64` work. Named
+            // here because the `mach_` prefix denies them wholesale, and a name
+            // this crate answers for must be excused from its own family.
+            "mach_vm_map",
+            "mach_vm_remap",
+            "mach_vm_region",
+            "mach_vm_allocate",
+            "mach_vm_deallocate",
+            "mach_vm_read",
+            "mach_vm_write",
             // The synthetic port namespace; see [`crate::mach`]. The `mach_`,
             // `task_`, `host_`, `semaphore_` and `bootstrap_` prefixes are all
             // denied wholesale so that exactly this list can be carved back out.
@@ -402,6 +483,15 @@ mod tests {
             "dispatch_async",
             "dispatch_semaphore_wait",
             "dispatch_queue_create",
+            // A Mach receive source over a real port, and the four names the
+            // guest's `WaitableEventWatcher` and `base::apple` call sites need to
+            // drive it. See `crate::dispatch::source`, which is also where the
+            // source *types* this crate refuses are refused.
+            "dispatch_source_create",
+            "dispatch_source_set_event_handler",
+            "dispatch_source_set_cancel_handler",
+            "dispatch_source_cancel",
+            "dispatch_resume",
             // The directory family, denied by name so the host's `struct
             // dirent` never becomes the guest's.
             "readdir",
@@ -411,11 +501,18 @@ mod tests {
             assert_eq!(reason(name), None, "{name} is implemented and still denied");
         }
         // And the families around them are still shut: a member of one that this
-        // crate has *not* implemented is refused rather than passed through.
-        assert!(contains("dispatch_source_create"));
+        // crate has *not* implemented is refused rather than passed through. A
+        // `dispatch_source_*` name outside the seven above is in exactly that
+        // position - the rest of the source API is about data, timers and source
+        // types this crate does not model, and none of it is answered.
+        assert!(contains("dispatch_source_get_data"));
+        assert!(contains("dispatch_source_set_timer"));
+        assert!(contains("dispatch_source_testcancel"));
         // The half of Mach that is still refused: anything asking the kernel
-        // about a task's memory, or about another process at all.
-        assert!(contains("mach_vm_read"));
+        // about a task's memory, or about another process at all. As above,
+        // `mach_vm_read` is answered now, so the witness is a `mach_vm_*` name
+        // that is not.
+        assert!(contains("mach_vm_purgable_control"));
         assert!(contains("task_for_pid"));
         assert!(contains("task_threads"));
     }

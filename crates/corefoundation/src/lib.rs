@@ -11,16 +11,19 @@ pub mod api;
 pub mod base;
 pub mod calendar;
 pub mod callbacks;
+pub mod charset;
 pub mod collections;
 mod diskarbitration;
 /// Only on Darwin: nowhere else is there another CoreFoundation to meet.
 #[cfg(target_os = "macos")]
 pub mod foreign;
 mod fsevents;
+pub mod hyphen;
 /// Mach ports bridged into the run loop. Off Darwin: there the host's own Mach
 /// is the guest's, as [`foreign`] is for the host's CoreFoundation.
 #[cfg(not(target_os = "macos"))]
 pub mod machport;
+pub mod packageinfo;
 pub mod preferences;
 pub mod runloop;
 mod send;
@@ -28,6 +31,7 @@ mod socket;
 pub mod string;
 pub mod sysconfig;
 pub mod timezone;
+pub mod tokenizer;
 pub mod url;
 pub mod urlresource;
 pub mod uuid;
@@ -43,6 +47,8 @@ pub fn bootstrap() {
     collections::number_class();
     collections::boolean_class();
     collections::data_class();
+    charset::class();
+    tokenizer::class();
     url::class();
     uuid::class();
 }
@@ -252,6 +258,57 @@ exports::exports! {
         "CFMachPortGetPort" => machport::get_port,
         #[cfg(not(target_os = "macos"))]
         "CFMachPortIsValid" => machport::is_valid,
+        // The last nineteen CoreFoundation functions this guest imported and
+        // nothing answered.  Every one of them was checked against the guest's
+        // own call site before being written, because every one of them has a
+        // signature that is easy to get wrong and a wrong signature is a wrong
+        // answer that looks like a right one.
+        //
+        // Run loop, and the next one this run loop reaches: see
+        // `api::CFRunLoopTimerSetTolerance`.
+        "CFRunLoopTimerSetTolerance" => api::CFRunLoopTimerSetTolerance,
+        // A diagnostic, and only ever a diagnostic: see `api::CFCopyTypeIDDescription`.
+        "CFCopyTypeIDDescription" => api::CFCopyTypeIDDescription,
+        // Find results, an array of `CFRange` *pointers*: see
+        // `api::CFStringCreateArrayWithFindResults`.
+        "CFStringCreateArrayWithFindResults" => api::CFStringCreateArrayWithFindResults,
+        // Hyphenation, which this host has no data for, and says so: see the
+        // `hyphen` module.
+        "CFStringIsHyphenationAvailableForLocale" => hyphen::CFStringIsHyphenationAvailableForLocale,
+        "CFStringGetHyphenationLocationBeforeIndex" => hyphen::CFStringGetHyphenationLocationBeforeIndex,
+        // The tokenizer, one unit at a time: see the `tokenizer` module.
+        "CFStringTokenizerCreate" => tokenizer::CFStringTokenizerCreate,
+        "CFStringTokenizerAdvanceToNextToken" => tokenizer::CFStringTokenizerAdvanceToNextToken,
+        "CFStringTokenizerGetCurrentTokenRange" => tokenizer::CFStringTokenizerGetCurrentTokenRange,
+        "CFStringTokenizerGetTypeID" => tokenizer::CFStringTokenizerGetTypeID,
+        // A character set, as a bitmap, which is the form a guest reads: see the
+        // `charset` module.
+        "CFCharacterSetGetTypeID" => charset::CFCharacterSetGetTypeID,
+        "CFCharacterSetGetPredefined" => charset::CFCharacterSetGetPredefined,
+        "CFCharacterSetCreateMutable" => charset::CFCharacterSetCreateMutable,
+        "CFCharacterSetCreateWithCharactersInRange"
+            => charset::CFCharacterSetCreateWithCharactersInRange,
+        "CFCharacterSetCreateWithCharactersInString"
+            => charset::CFCharacterSetCreateWithCharactersInString,
+        "CFCharacterSetAddCharactersInRange" => charset::CFCharacterSetAddCharactersInRange,
+        "CFCharacterSetAddCharactersInString" => charset::CFCharacterSetAddCharactersInString,
+        "CFCharacterSetUnion" => charset::CFCharacterSetUnion,
+        "CFCharacterSetIsCharacterMember" => charset::CFCharacterSetIsCharacterMember,
+        "CFCharacterSetIsLongCharacterMember" => charset::CFCharacterSetIsLongCharacterMember,
+        "CFCharacterSetCreateBitmapRepresentation" => charset::CFCharacterSetCreateBitmapRepresentation,
+        "CFCharacterSetGetLongCharacterSetForMember"
+            => charset::CFCharacterSetGetLongCharacterSetForMember,
+        // Managed preferences, which this host has no store for, and the store
+        // is modelled so the question has an answer rather than a hardcoded
+        // one: see `preferences::CFPreferencesAppValueIsForced`.
+        "CFPreferencesAppValueIsForced" => preferences::CFPreferencesAppValueIsForced,
+        // The Finder's URL property-list pair, private but fully specified by
+        // `CFURL.c`: see `url`.
+        "_CFURLCopyPropertyListRepresentation" => url::_CFURLCopyPropertyListRepresentation,
+        "_CFURLCreateFromPropertyListRepresentation"
+            => url::_CFURLCreateFromPropertyListRepresentation,
+        // The `PKG___` codes, which no modern bundle has: see `packageinfo`.
+        "CFBundleGetPackageInfo" => packageinfo::CFBundleGetPackageInfo,
     }
     groups {
         calendar,
@@ -298,6 +355,18 @@ pub fn data_symbols() -> Vec<(String, u64)> {
             "_kCFTypeDictionaryKeyCallBacks".to_string(),
             &callbacks::TYPE_KEY_CALLBACKS as *const _ as usize as u64,
         ),
+        // `CFSetCallBacks` is `CFDictionaryKeyCallBacks` field for field - the
+        // two structures are `{version, retain, release, copyDescription, equal,
+        // hash}` in both - so `kCFTypeSetCallBacks` is the same five words with
+        // the same five functions.  (Apple's own `kCFTypeSetCallBacks` is a
+        // separate object from `kCFTypeDictionaryKeyCallBacks`; a guest that
+        // compared the two *addresses* would see them differ here, and one that
+        // compared their contents - which is what the type says they are for -
+        // sees the same thing.)
+        (
+            "_kCFTypeSetCallBacks".to_string(),
+            &callbacks::TYPE_SET_CALLBACKS as *const _ as usize as u64,
+        ),
     ];
     // A `const CFTimeInterval`, so the symbol is the double itself. Qt's
     // `QDateTime::toCFDate` subtracts it before `CFDateCreate`.
@@ -341,6 +410,30 @@ pub fn data_symbols() -> Vec<(String, u64)> {
             base::global_cell(symbol, base::interned_name(text)),
         ));
     }
+    for (symbol, text) in DOUBLE_UNDERSCORED {
+        out.push((
+            symbol.to_string(),
+            base::global_cell(symbol, base::interned_name(text)),
+        ));
+    }
+    // `kCFAllocatorMallocZone`, which in Apple's CoreFoundation is a real
+    // allocator of its own (`&__kCFAllocatorMallocZone` in `CFBase.c`) and not a
+    // synonym for the default one.  This runtime has exactly one allocator, and
+    // the one that every allocation here goes through is
+    // `kCFAllocatorDefault` - which Apple also defines as null.  So the honest
+    // value is a live allocator of the right type rather than zero: a guest that
+    // compares this against null, or passes it to a `Create`, gets a usable
+    // allocator instead of a nil that only looks like one.
+    out.push((
+        "_kCFAllocatorMallocZone".to_string(),
+        base::global_cell(
+            "_kCFAllocatorMallocZone",
+            // SAFETY: two nulls, which is what a `Create` with no allocator and
+            // no context is, and what this function is called with everywhere
+            // else in this file.
+            unsafe { api::CFAllocatorCreate(std::ptr::null(), std::ptr::null()) } as usize as u64,
+        ),
+    ));
     for (symbol, value) in [
         ("_kCFBooleanTrue", collections::boolean(true)),
         ("_kCFBooleanFalse", collections::boolean(false)),
@@ -399,6 +492,26 @@ static KEY_STRINGS: &[(&str, &str)] = &[
         "_kCFBundleInfoDictionaryVersionKey",
         "CFBundleInfoDictionaryVersion",
     ),
+    // `kCFErrorDescriptionKey`: "Key to identify the description in the userInfo
+    // dictionary."  From `CFError.h`, and the text is the key's own name minus
+    // the `kCFError` prefix, which is what every other key in that family does.
+    ("_kCFErrorDescriptionKey", "Description"),
+];
+
+/// The globals whose Mach-O spelling carries a second underscore, because the C
+/// name itself starts with one.
+///
+/// The Mach-O symbol for a C identifier `kFoo` is `_kFoo`, so the C name
+/// `_kCFBundleNumericVersionKey` - which is a *private* key, and Apple's own
+/// `CFBundle.c` spells it with the leading underscore - imports as
+/// `__kCFBundleNumericVersionKey`.  Getting this wrong binds a symbol no image
+/// imports, which looks exactly like the right one working.
+static DOUBLE_UNDERSCORED: &[(&str, &str)] = &[
+    // `_kCFBundleNumericVersionKey`, the key under which an `Info.plist` states a
+    // version as a number rather than as text.  The guest imports it and never
+    // reads it (no instruction in the Framework's `__TEXT,__text` refers to the
+    // slot), which is a fact about this build rather than about the symbol.
+    ("__kCFBundleNumericVersionKey", "CFBundleNumericVersion"),
 ];
 
 /// `kCFNull`, the singleton `NSNull` also answers for.
@@ -1819,5 +1932,131 @@ mod collection_tests {
             assert_eq!(read, -3);
             api::CFRelease(n);
         }
+    }
+}
+
+#[cfg(test)]
+mod unbound_gap_tests {
+    //! The nineteen CoreFoundation functions this guest imported and nothing
+    //! answered, plus the four data symbols.
+    //!
+    //! Every name in the two lists below was read out of the run's own unbound
+    //! report - `ROSETTA3_UNBOUND_DETAIL=all` over the Chromium Framework - and
+    //! filtered to the entries CoreFoundation.framework is the source of.  A line
+    //! with `, stub 0x…` is a *function* import and without it is data
+    //! (PLAN.md §7: the image's own indirect symbol table, which is
+    //! authoritative), so the function list is exactly nineteen and the data list
+    //! four.
+    //!
+    //! The point of the test is not that the functions exist.  It is that a
+    //! *bound* function answering `kCFNotFound`, `false` or null beats an unbound
+    //! import, which is a jump through a zero slot (PLAN.md §10.2) - so a name
+    //! going missing from this crate is a fault, and this is where it should be
+    //! noticed.
+
+    /// The nineteen, as the crate's `exports!` spells them: the bare C name,
+    /// with the Mach-O's own underscore added by the macro.  The two private
+    /// Finder functions keep theirs, because their C name is
+    /// `_CFURLCopyPropertyListRepresentation` and the Mach-O import is
+    /// therefore `__CFURLCopyPropertyListRepresentation`.
+    const FUNCTIONS: &[&str] = &[
+        "CFBundleGetPackageInfo",
+        "CFCharacterSetAddCharactersInRange",
+        "CFCharacterSetAddCharactersInString",
+        "CFCharacterSetCreateBitmapRepresentation",
+        "CFCharacterSetCreateMutable",
+        "CFCharacterSetGetPredefined",
+        "CFCharacterSetIsLongCharacterMember",
+        "CFCharacterSetUnion",
+        "CFCopyTypeIDDescription",
+        "CFPreferencesAppValueIsForced",
+        "CFRunLoopTimerSetTolerance",
+        "CFStringCreateArrayWithFindResults",
+        "CFStringGetHyphenationLocationBeforeIndex",
+        "CFStringIsHyphenationAvailableForLocale",
+        "CFStringTokenizerAdvanceToNextToken",
+        "CFStringTokenizerCreate",
+        "CFStringTokenizerGetCurrentTokenRange",
+        "_CFURLCreateFromPropertyListRepresentation",
+        "_CFURLCopyPropertyListRepresentation",
+    ];
+
+    /// What the Mach-O calls each of the nineteen, which is the spelling the
+    /// unbound report prints and therefore the spelling the test below checks
+    /// against: one `_` in front of the C name, which is why the two private
+    /// Finder functions have two.
+    fn macho_name(c_name: &str) -> String {
+        format!("_{c_name}")
+    }
+
+    /// The four, with the second spelling the loader needs for the two whose C
+    /// names begin with an underscore.
+    const DATA: &[&str] = &[
+        "_kCFAllocatorMallocZone",
+        "_kCFErrorDescriptionKey",
+        "_kCFTypeSetCallBacks",
+        // The C name is `_kCFBundleNumericVersionKey`, so the Mach-O import is
+        // `__kCFBundleNumericVersionKey`.  One underscore too few here binds a
+        // symbol no image imports, which looks exactly like the right one
+        // working.
+        "__kCFBundleNumericVersionKey",
+    ];
+
+    #[test]
+    fn every_unbound_corefoundation_function_is_answered() {
+        let names = (crate::MODULE.names)();
+        for c_name in FUNCTIONS {
+            assert!(
+                names.contains(c_name),
+                "{c_name} is one of the nineteen and is not answered, which makes its call site a \
+                 jump through a zero slot"
+            );
+            assert!(
+                (crate::MODULE.symbol)(c_name).is_some(),
+                "{c_name} also has to have an address, not just a name"
+            );
+            // And the Mach-O spelling the loader looks up is this one, which is
+            // the spelling the unbound report printed: one underscore in front of
+            // the C name, or two where the C name already has one.
+            let macho = macho_name(c_name);
+            assert_eq!(
+                macho.starts_with("__CFURL"),
+                c_name.starts_with("_CFURL"),
+                "{c_name}'s Mach-O import is {macho}"
+            );
+        }
+        assert_eq!(FUNCTIONS.len(), 19, "the report's nineteen");
+    }
+
+    #[test]
+    fn every_unbound_corefoundation_data_symbol_is_published() {
+        // `data_symbols` is the function the loader reads, so asking it is
+        // asking the same question the loader does.
+        let published: Vec<String> = super::data_symbols()
+            .into_iter()
+            .map(|(name, _)| name)
+            .collect();
+        for name in DATA {
+            assert!(
+                published.iter().any(|published| published == name),
+                "{name} is one of the four and is not published"
+            );
+        }
+        // `kCFTypeSetCallBacks` and `kCFTypeDictionaryKeyCallBacks` are the same
+        // six fields, so they are the same structure here - but they are two
+        // symbols and a guest that looks up one must not be handed the other's
+        // absence.
+        let symbols: Vec<(String, u64)> = super::data_symbols();
+        let at = |wanted: &str| {
+            symbols
+                .iter()
+                .find(|(name, _)| name == wanted)
+                .map(|(_, address)| *address)
+        };
+        assert_ne!(
+            at("_kCFTypeSetCallBacks"),
+            at("_kCFTypeDictionaryKeyCallBacks"),
+            "two symbols, two addresses, even where the contents match"
+        );
     }
 }

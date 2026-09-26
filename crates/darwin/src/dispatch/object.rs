@@ -12,6 +12,7 @@ pub enum Kind {
     Group,
     Semaphore,
     Data,
+    Source,
 }
 
 /// The header every dispatch object begins with.
@@ -118,6 +119,11 @@ pub unsafe fn release(handle: u64) {
             Kind::Group => drop(Box::from_raw(handle as *mut super::sync::Group)),
             Kind::Semaphore => drop(Box::from_raw(handle as *mut super::sync::Semaphore)),
             Kind::Data => drop(Box::from_raw(handle as *mut super::data::Data)),
+            // A source is not dropped like the rest: it holds a reference on its
+            // target queue, holds its handlers, and may be in the watcher's `poll`
+            // set. All three are released in order, and the allocation goes last,
+            // so none of them can outlive the object they name.
+            Kind::Source => super::source::dispose(handle),
         }
     }
 }

@@ -160,6 +160,21 @@ exports::exports! {
         "vm_map" => vm::vm_map,
         "vm_protect" => vm::vm_protect,
 
+        // The `mach_vm_*` family: the 64-bit-wide spellings, which
+        // `osfmk/mach/mach_vm.defs` publishes as the *same* MIG routine under a
+        // second name. `mach_vm_region` is answered by the same body as
+        // `vm_region_64` and `mach_vm_remap` is `mremap(2)`. Each one's own
+        // note carries its call sites in the image and what it refuses. The
+        // four the image does not import are here because an unbound import is
+        // a jump through a zero slot, which is worse than a bound refusal.
+        "mach_vm_map" => vm::mach_vm_map,
+        "mach_vm_remap" => vm::mach_vm_remap,
+        "mach_vm_region" => vm::mach_vm_region,
+        "mach_vm_allocate" => vm::mach_vm_allocate,
+        "mach_vm_deallocate" => vm::mach_vm_deallocate,
+        "mach_vm_read" => vm::mach_vm_read,
+        "mach_vm_write" => vm::mach_vm_write,
+
         // The scheduling-policy and per-CPU-load calls, which this runtime
         // answers for the arguments the guest passes and refuses by name for
         // the rest. See `mach::policy`'s module note, which has the call sites.

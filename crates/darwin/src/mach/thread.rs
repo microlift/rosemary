@@ -214,8 +214,8 @@ macro_rules! offsets {
     };
 }
 offsets!(
-    rax, rbx, rcx, rdx, rdi, rsi, rbp, rsp, r8, r9, r10, r11, r12, r13, r14, r15, rip,
-    rflags, cs, fs, gs,
+    rax, rbx, rcx, rdx, rdi, rsi, rbp, rsp, r8, r9, r10, r11, r12, r13, r14, r15, rip, rflags, cs,
+    fs, gs,
 );
 
 const _: () = {
@@ -716,7 +716,10 @@ mod tests {
             (there..there + 4096).contains(&rip_b),
             "rip {rip_b:#x} is not inside ask_there, which is at {there:#x}"
         );
-        assert_ne!(rip_a, rip_b, "one fixed value cannot be both return addresses");
+        assert_ne!(
+            rip_a, rip_b,
+            "one fixed value cannot be both return addresses"
+        );
 
         // `rsp` is the frame that asked: at or below its own locals, within a
         // frame of them, and pointing at nothing that looks like code.
@@ -735,11 +738,18 @@ mod tests {
         // kernel saves: it traps *after* the caller wrote them. `rdi` is the
         // target and `rsi` the flavour, so those two are checkable exactly.
         assert_eq!(a[4], u64::from(crate::pthread::id()), "__rdi is the target");
-        assert_eq!(a[5], u64::from(X86_THREAD_STATE64 as u32), "__rsi is the flavour");
+        assert_eq!(
+            a[5],
+            u64::from(X86_THREAD_STATE64 as u32),
+            "__rsi is the flavour"
+        );
         // `rdx` is the out-parameter and `rcx` the count, and the 42 now in
         // `*count` is the proof that the callee wrote through `rcx`.
         assert_eq!(a[3], a.as_ptr() as u64, "__rdx is the out-parameter");
-        assert_eq!(a[2], &count_a as *const _ as u64, "__rcx is the count pointer");
+        assert_eq!(
+            a[2], &count_a as *const _ as u64,
+            "__rcx is the count pointer"
+        );
         // And the flags are this thread's, not a constant: bit 1 is always set
         // and the carry is clear after a call.
         assert_eq!(a[17] & 0x2, 0x2, "rflags is not this thread's");
@@ -767,7 +777,14 @@ mod tests {
         }
         let before = out;
         // SAFETY: a live 21-word buffer and a live count.
-        let rc = unsafe { asked(crate::pthread::id(), X86_THREAD_STATE64, &mut out, &mut count) };
+        let rc = unsafe {
+            asked(
+                crate::pthread::id(),
+                X86_THREAD_STATE64,
+                &mut out,
+                &mut count,
+            )
+        };
         assert_eq!(rc, KERN_SUCCESS);
         for (word, (was, now)) in before.iter().zip(out.iter()).enumerate() {
             assert_ne!(
@@ -793,8 +810,14 @@ mod tests {
         // A flavour this runtime does not answer.
         let rc = // SAFETY: a live buffer and count.
             unsafe { asked(crate::pthread::id(), X86_FLOAT_STATE64, &mut out, &mut count) };
-        assert_eq!(rc, KERN_INVALID_ARGUMENT, "a float state is not a register state");
-        assert!(out.iter().all(|w| *w == POISON), "the flavour refusal wrote to out");
+        assert_eq!(
+            rc, KERN_INVALID_ARGUMENT,
+            "a float state is not a register state"
+        );
+        assert!(
+            out.iter().all(|w| *w == POISON),
+            "the flavour refusal wrote to out"
+        );
         assert_eq!(count, X86_THREAD_STATE64_COUNT, "and left the count alone");
 
         // A buffer too short for the flavour, which `xnu` calls an argument and
@@ -810,7 +833,10 @@ mod tests {
             )
         };
         assert_eq!(rc, KERN_INVALID_ARGUMENT);
-        assert!(out.iter().all(|w| *w == POISON), "the short-count refusal wrote to out");
+        assert!(
+            out.iter().all(|w| *w == POISON),
+            "the short-count refusal wrote to out"
+        );
 
         // Null out-parameters are addresses, not arguments.
         // SAFETY: a null `old_state`, which is what is being tested.
@@ -842,14 +868,18 @@ mod tests {
         // register.
         let foreign = super::super::task::mach_thread_self();
         assert_ne!(foreign, 0, "`mach_thread_self` always names something");
-        for target in [0u32, foreign, foreign.wrapping_add(4), crate::pthread::id() + 1] {
+        for target in [
+            0u32,
+            foreign,
+            foreign.wrapping_add(4),
+            crate::pthread::id() + 1,
+        ] {
             let mut out = [POISON; 21];
             let mut count = X86_THREAD_STATE64_COUNT;
             // SAFETY: a live buffer and count.
             let rc = unsafe { asked(target, X86_THREAD_STATE64, &mut out, &mut count) };
             assert_eq!(
-                rc,
-                KERN_FAILURE,
+                rc, KERN_FAILURE,
                 "target {target:#x} was answered instead of refused"
             );
             assert!(
@@ -880,7 +910,10 @@ mod tests {
         );
         for name in ["thread_suspend", "thread_resume"] {
             assert!(crate::symbol(name).is_some(), "{name} is not published");
-            assert!(!crate::divergent::contains(name), "{name} is refused by family");
+            assert!(
+                !crate::divergent::contains(name),
+                "{name} is refused by family"
+            );
         }
     }
 
@@ -890,7 +923,11 @@ mod tests {
     #[test]
     fn suspension_is_refused_with_the_reason_named() {
         let mine = crate::pthread::id();
-        assert_eq!(thread_suspend(mine), KERN_FAILURE, "a self-suspend must refuse");
+        assert_eq!(
+            thread_suspend(mine),
+            KERN_FAILURE,
+            "a self-suspend must refuse"
+        );
         assert_eq!(thread_suspend(mine + 1), KERN_FAILURE);
         assert_eq!(thread_suspend(0), KERN_FAILURE);
         assert_eq!(thread_resume(mine), KERN_FAILURE);

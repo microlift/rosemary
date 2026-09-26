@@ -4,6 +4,7 @@ pub mod block;
 pub mod data;
 pub mod object;
 pub mod queue;
+pub mod source;
 pub mod sync;
 pub mod time;
 
@@ -111,6 +112,20 @@ exports::exports! {
         "dispatch_sync_f" => queue::sync_f,
         "dispatch_after" => queue::after,
         "dispatch_after_f" => queue::after_f,
+        // `dispatch_resume` and `dispatch_suspend` take a `dispatch_object_t`,
+        // which is a source or a queue; see `source`, which answers for a source
+        // and declines for a queue because a queue is never suspended.
+        "dispatch_resume" => source::resume,
+        "dispatch_suspend" => source::suspend,
+        // The `dispatch_source_*` family, which is one `DISPATCH_SOURCE_TYPE_MACH_RECV`
+        // over a real Mach port and nothing else. See `source`'s module note for
+        // the call sites and for the two source types it refuses by name.
+        "dispatch_source_create" => source::create,
+        "dispatch_source_set_event_handler" => source::set_event_handler,
+        "dispatch_source_set_event_handler_f" => source::set_event_handler_f,
+        "dispatch_source_set_cancel_handler" => source::set_cancel_handler,
+        "dispatch_source_set_cancel_handler_f" => source::set_cancel_handler_f,
+        "dispatch_source_cancel" => source::cancel,
         "dispatch_once" => once,
         "dispatch_once_f" => once_f,
         "dispatch_group_create" => sync::group_create,
@@ -136,6 +151,15 @@ exports::exports! {
         "__dispatch_main_q" => main_queue(),
         "__dispatch_queue_attr_concurrent" => queue::concurrent_attr(),
         "__dispatch_data_destructor_free" => data::destructor_free(),
+        // A source type is the *address* of a `dispatch_source_type_s` and
+        // nothing else, so the three the guest imports are three distinct
+        // addresses. Publishing the two this runtime refuses to build a source
+        // from is deliberate: a guest that reads one and compares it, or branches
+        // on it being non-null, gets the truth, and the refusal happens in
+        // `dispatch_source_create` where the source would be made.
+        "__dispatch_source_type_mach_recv" => source::mach_recv_token(),
+        "__dispatch_source_type_proc" => source::proc_token(),
+        "__dispatch_source_type_memorypressure" => source::memorypressure_token(),
     }
 }
 

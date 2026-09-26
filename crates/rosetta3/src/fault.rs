@@ -669,6 +669,9 @@ extern "C" fn report(signal: i32, info: *mut libc::siginfo_t, context: *mut libc
         if pc == 0 {
             say_unbound_call(out, context);
         }
+        // The one guest site whose object this runtime has something to say
+        // about. Narrow on purpose; see `say_controller`.
+        say_controller(out, context);
         if !in_translation(pc) {
             say_caller(out, context);
         }
@@ -743,6 +746,153 @@ fn say_caller(out: &mut Buffer, context: *mut libc::c_void) {
         out.str(" in");
         let _ = say_image(out, ret);
     }
+}
+
+/// Say what is in the `ThreadControllerImpl` the guest faulted on.
+///
+/// A one-shot diagnostic, and deliberately narrow. `Framework+0x5d46240` is
+/// `mov ecx, DWORD PTR [rax]` with `rax = [r14+0x218]` null, inside
+/// `base::sequence_manager::internal::ThreadControllerImpl::DoWork` (the four
+/// `__cstring` literals in that range name it: `ThreadControllerImpl::DoWork`,
+/// `::RunTask`, `ThreadController: application tasks disallowed`).
+///
+/// `+0x218` is written by exactly one place - the bind step at
+/// `Framework+0x5d45440`, which asks the guest's own `thread_local` accessor
+/// `0x5cd7420` for a `uint32_t` cell and stores the pointer. That accessor has
+/// no path returning 0, so a null field means the bind never ran on this
+/// object, not that the cell was missing.
+///
+/// There are two factories, and they differ in exactly this:
+///
+/// | factory | allocates | binds |
+/// |---|---|---|
+/// | `0x5d29050` | `new(0x180)`, ctor `0x5d42e50` | **no** |
+/// | `0x5d291a0` | `new(0x270)`, ctor `0x5d44e40` | yes, via `0x5d29254` |
+///
+/// So the fields printed here are the cheapest way to characterise the object,
+/// without changing the guest. `[r14]` and `[r14+0xf0]` are its two vtable
+/// pointers (Itanium puts the second base's vptr at the subobject offset, and
+/// every caller passes `this-0xf0`). `0x160`, `0x240`, `0x248` and the
+/// held-flag byte at `0x260` are the other fields `DoWork` touches on the way
+/// to the fault, which is what shows the object is live rather than a stub.
+///
+/// **Which factory built it is settled, by the vtable pair.** The 0x180 class's
+/// two vtable pointers are `0xe268390` and `0xe268448` - `0xb8` apart - and the
+/// 0x270 class's are `0xe268490` and `0xe268598` - `0x108` apart. The object
+/// faulting here has a pair `0x108` apart, so **it is the 0x270 class**: the one
+/// the *bound* factory builds, which calls the bind at `0x5d29254` immediately
+/// after constructing it.
+///
+/// So the contradiction is real rather than a misreading on my part. A class
+/// whose factory unconditionally calls a function whose store is unconditional
+/// has a field that store writes reading null. Either the bind ran and something
+/// cleared the field afterwards, or it ran against a different object.
+/// **Left unexplained deliberately** - a tidy account here would be a guess, and
+/// this is the live blocker.
+///
+/// This prints once per distinct faulting pc. It reads guest addresses with a
+/// null check on each word, because the whole point is to inspect an object
+/// that is already partly broken.
+fn say_controller(out: &mut Buffer, context: *mut libc::c_void) {
+    use std::sync::Mutex;
+    static SAID: Mutex<Vec<u64>> = Mutex::new(Vec::new());
+
+    let Some(pc) = host_pc(context) else {
+        return;
+    };
+    // The pc is a *slid* address, so compare the image-relative offset the
+    // report itself prints, not the raw pc.
+    let Some(offset) = image_offset(pc) else {
+        return;
+    };
+    let pc = offset;
+    // second base's vptr at the subobject offset, and every caller of this
+    // function passes `this - 0xf0`, so `r14` is the `ThreadControllerImpl*`.
+    #[cfg(target_arch = "x86_64")]
+    let r14 = {
+        if context.is_null() {
+            return;
+        }
+        // SAFETY: the kernel passes a live `ucontext_t` for the handler's
+        // duration and fills `gregs` itself.
+        let gregs = unsafe { &(*(context as *const libc::ucontext_t)).uc_mcontext.gregs };
+        gregs[libc::REG_R14 as usize] as u64
+    };
+    #[cfg(not(target_arch = "x86_64"))]
+    let r14: u64 = {
+        return;
+    };
+    // `r14` is the guest object base on x86-64. The Itanium layout puts the
+    // Only this one site: the point is to explain 0x5d46240, not to decorate
+    // every fault the program ever takes.
+    const SITE: u64 = 0x5d46240;
+    if pc != SITE {
+        return;
+    }
+    {
+        let Ok(mut said) = SAID.lock() else { return };
+        if said.contains(&pc) {
+            return;
+        }
+        said.push(pc);
+    }
+
+    // A guest word, or `None` if it is not mapped. Every read is checked: this
+    // runs *because* the object has a null in it.
+    let gword = |at: u64| -> Option<u64> {
+        if at == 0 || at % 8 != 0 {
+            return None;
+        }
+        // SAFETY: guarded by the null/alignment check, and a wild guest address
+        // only means this one line does not print.
+        Some(unsafe { std::ptr::read_volatile(at as *const u64) })
+    };
+    let gbyte = |at: u64| -> Option<u8> {
+        if at == 0 {
+            return None;
+        }
+        // SAFETY: as above.
+        Some(unsafe { std::ptr::read_volatile(at as *const u8) })
+    };
+
+    out.str("\n  ThreadControllerImpl (DoWork):");
+    out.str("\n    r14");
+    out.hex(r14);
+    for (name, at) in [
+        ("[r14] vtable", 0x0),
+        ("[r14+0x0f0] NestingObserver vtable", 0x0f0),
+        ("[r14+0x150] bound flag", 0x150),
+        ("[r14+0x160]", 0x160),
+        ("[r14+0x178] work_batch_size_", 0x178),
+        ("[r14+0x190]", 0x190),
+        ("[r14+0x1e8] work_deduplicator_ state", 0x1e8),
+        ("[r14+0x210]", 0x210),
+        ("[r14+0x218] thread_local cell (NULL here)", 0x218),
+        ("[r14+0x240]", 0x240),
+        ("[r14+0x248] the 10s wait event", 0x248),
+    ] {
+        out.str("\n    ");
+        out.str(name);
+        match gword(r14.wrapping_add(at)) {
+            Some(v) => out.hex(v),
+            None => out.str("unreadable"),
+        }
+    }
+    match gbyte(r14.wrapping_add(0x260)) {
+        Some(v) => {
+            out.str("\n    [r14+0x260] held flag = ");
+            out.str(if v == 0 { "0" } else { "non-zero" });
+        }
+        None => out.str("\n    [r14+0x260] held flag unreadable"),
+    }
+    out.str("\n    -> +0x218 is written in exactly one place, the bind at");
+    out.str("\n       Framework+0x5d45440, and that store is unconditional, so");
+    out.str("\n       either the bind did not run or its effect is gone.");
+    out.str("\n    -> the vtable pair above is 0x108 apart, which is the 0x270");
+    out.str("\n       class (0xe268490/0xe268598), NOT the 0x180 one (0xb8 apart).");
+    out.str("\n       So this IS the class the bound factory builds, and that");
+    out.str("\n       factory calls the bind at 0x5d29254. The contradiction is");
+    out.str("\n       real and unexplained: do not paper over it.");
 }
 
 /// Name the unbound import a jump to zero went through.
@@ -1017,8 +1167,19 @@ fn lookup(map: &[GuestCodeRange], offset: u32) -> Option<u64> {
 }
 
 /// Name the image a guest address is in, as `name+offset`. Whether it named one.
-fn say_image(out: &mut Buffer, addr: u64) -> bool {
-    let Ok(images) = IMAGES.try_lock() else {
+/// The offset of `addr` inside the image that mapped it, which is the number
+/// the report prints and the number every address in this file's notes is
+/// written in. A raw `pc` is slid by the loader and means nothing on its own.
+fn image_offset(addr: u64) -> Option<u64> {
+    IMAGES.try_lock().ok().and_then(|images| {
+        images
+            .iter()
+            .find(|i| (i.range.0..i.range.1).contains(&addr))
+            .map(|i| addr - i.range.0)
+    })
+}
+
+fn say_image(out: &mut Buffer, addr: u64) -> bool {    let Ok(images) = IMAGES.try_lock() else {
         return false;
     };
     let Some(image) = images

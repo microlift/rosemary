@@ -680,7 +680,10 @@ fn cpu_load() -> Vec<CpuLoad> {
         }
         let mut fields = rest.split_ascii_whitespace();
         // The processor number, which is not a tick count.
-        let Some(index) = fields.next().filter(|f| f.bytes().all(|b| b.is_ascii_digit())) else {
+        let Some(index) = fields
+            .next()
+            .filter(|f| f.bytes().all(|b| b.is_ascii_digit()))
+        else {
             continue;
         };
         debug_assert!(index.parse::<u32>().is_ok());
@@ -740,7 +743,9 @@ pub unsafe extern "C" fn host_processor_info(
     static SAID_FLAVOUR: AtomicBool = AtomicBool::new(false);
     static SAID_READ: AtomicBool = AtomicBool::new(false);
 
-    if out_processor_count.is_null() || out_processor_info.is_null() || out_processor_info_count.is_null()
+    if out_processor_count.is_null()
+        || out_processor_info.is_null()
+        || out_processor_info_count.is_null()
     {
         note(
             "host_processor_info",
@@ -840,11 +845,7 @@ pub unsafe extern "C" fn host_processor_info(
     // SAFETY: `held.len >= bytes` above, so the mapping covers every word about
     // to be written, and it is `PROT_READ | PROT_WRITE`.
     unsafe {
-        std::ptr::copy_nonoverlapping(
-            load.as_ptr().cast::<u8>(),
-            held.base as *mut u8,
-            bytes,
-        );
+        std::ptr::copy_nonoverlapping(load.as_ptr().cast::<u8>(), held.base as *mut u8, bytes);
         out_processor_count.write(load.len() as u32);
         out_processor_info.write(held.base as *mut u32);
         out_processor_info_count.write(4);
@@ -868,12 +869,17 @@ mod tests {
             unsafe { thread_policy_set(mine, THREAD_STANDARD_POLICY, &mut standard, 1) },
             KERN_SUCCESS
         );
-        assert_eq!(standard, 0, "THREAD_STANDARD_POLICY has no parameters to write");
+        assert_eq!(
+            standard, 0,
+            "THREAD_STANDARD_POLICY has no parameters to write"
+        );
 
         let mut precedence = [63i32];
         // SAFETY: a live one-word array and a count of 1.
         assert_eq!(
-            unsafe { thread_policy_set(mine, THREAD_PRECEDENCE_POLICY, precedence.as_mut_ptr(), 1) },
+            unsafe {
+                thread_policy_set(mine, THREAD_PRECEDENCE_POLICY, precedence.as_mut_ptr(), 1)
+            },
             KERN_INVALID_ARGUMENT
         );
         assert_eq!(precedence, [63], "a refusal wrote to the policy");
@@ -928,7 +934,14 @@ mod tests {
         // A null policy is an address, not an argument, whichever thread.
         // SAFETY: the null is what is being tested.
         assert_eq!(
-            unsafe { thread_policy_set(crate::pthread::id(), THREAD_STANDARD_POLICY, std::ptr::null_mut(), 1) },
+            unsafe {
+                thread_policy_set(
+                    crate::pthread::id(),
+                    THREAD_STANDARD_POLICY,
+                    std::ptr::null_mut(),
+                    1,
+                )
+            },
             KERN_INVALID_ADDRESS
         );
     }
@@ -940,8 +953,13 @@ mod tests {
     #[test]
     fn task_policy_get_leaves_every_out_parameter_as_the_caller_wrote_it() {
         const POISON: u32 = 0xaaaa_aaaa;
-        for flavor in [TASK_CATEGORY_POLICY, TASK_SUPPRESSION_POLICY, TASK_BASE_QOS_POLICY, 4, 77]
-        {
+        for flavor in [
+            TASK_CATEGORY_POLICY,
+            TASK_SUPPRESSION_POLICY,
+            TASK_BASE_QOS_POLICY,
+            4,
+            77,
+        ] {
             let mut policy = [POISON; 16];
             let mut count = 1u32;
             let mut get_default = POISON;
@@ -961,7 +979,10 @@ mod tests {
                 "flavor {flavor}: the policy was written"
             );
             assert_eq!(count, 1, "flavor {flavor}: the count was written");
-            assert_eq!(get_default, POISON, "flavor {flavor}: get_default was written");
+            assert_eq!(
+                get_default, POISON,
+                "flavor {flavor}: get_default was written"
+            );
         }
         // Another task is a different code entirely, and still writes nothing.
         let mut policy = [POISON; 16];
@@ -1001,7 +1022,9 @@ mod tests {
             let mut policy = vec![0xffff_ffffu32; count];
             let before = policy.clone();
             // SAFETY: a live `count`-word buffer and a matching count.
-            let rc = unsafe { task_policy_set(TASK_SELF, flavor, policy.as_mut_ptr().cast(), count as u32) };
+            let rc = unsafe {
+                task_policy_set(TASK_SELF, flavor, policy.as_mut_ptr().cast(), count as u32)
+            };
             assert_eq!(rc, KERN_FAILURE, "flavor {flavor} was answered");
             assert_eq!(policy, before, "flavor {flavor}: the policy was written");
         }
@@ -1009,7 +1032,14 @@ mod tests {
         let mut policy = vec![0xffff_ffffu32; 1];
         // SAFETY: as above.
         assert_eq!(
-            unsafe { task_policy_set(TASK_SELF + 4, TASK_CATEGORY_POLICY, policy.as_mut_ptr().cast(), 1) },
+            unsafe {
+                task_policy_set(
+                    TASK_SELF + 4,
+                    TASK_CATEGORY_POLICY,
+                    policy.as_mut_ptr().cast(),
+                    1,
+                )
+            },
             KERN_INVALID_TASK
         );
         assert_eq!(policy, vec![0xffff_ffffu32; 1]);
@@ -1025,7 +1055,10 @@ mod tests {
         // number has to be a `kern_return_t` and not, say, a trap.
         let stored = task_self_trap() as i32;
         assert_eq!(stored, KERN_FAILURE);
-        assert!(super::super::kern::describe(stored).is_some(), "and it has a name");
+        assert!(
+            super::super::kern::describe(stored).is_some(),
+            "and it has a name"
+        );
     }
 
     /// **The one the image makes: the current thread, wait, one tick.** It
@@ -1035,7 +1068,10 @@ mod tests {
     #[test]
     fn switching_the_calling_thread_off_yields_and_succeeds() {
         let before = std::time::Instant::now();
-        assert_eq!(thread_switch(MACH_PORT_NULL, SWITCH_OPTION_WAIT, 1), KERN_SUCCESS);
+        assert_eq!(
+            thread_switch(MACH_PORT_NULL, SWITCH_OPTION_WAIT, 1),
+            KERN_SUCCESS
+        );
         assert!(
             before.elapsed() < std::time::Duration::from_millis(500),
             "thread_switch blocked, which is not a yield"
@@ -1049,13 +1085,23 @@ mod tests {
     fn switching_to_a_named_thread_or_dispatching_is_refused() {
         let foreign = super::super::task::mach_thread_self();
         assert_ne!(foreign, 0);
-        assert_eq!(thread_switch(foreign, SWITCH_OPTION_WAIT, 1), KERN_INVALID_ARGUMENT);
         assert_eq!(
-            thread_switch(MACH_PORT_NULL, SWITCH_OPTION_WAIT | SWITCH_OPTION_DISPATCH, 1),
+            thread_switch(foreign, SWITCH_OPTION_WAIT, 1),
+            KERN_INVALID_ARGUMENT
+        );
+        assert_eq!(
+            thread_switch(
+                MACH_PORT_NULL,
+                SWITCH_OPTION_WAIT | SWITCH_OPTION_DISPATCH,
+                1
+            ),
             KERN_INVALID_ARGUMENT
         );
         // An option bit that is not one of the two.
-        assert_eq!(thread_switch(MACH_PORT_NULL, 0x40, 1), KERN_INVALID_ARGUMENT);
+        assert_eq!(
+            thread_switch(MACH_PORT_NULL, 0x40, 1),
+            KERN_INVALID_ARGUMENT
+        );
     }
 
     /// `host_processor_info`'s answer, read the way the guest reads it: the
@@ -1071,7 +1117,13 @@ mod tests {
         let mut words = 0u32;
         // SAFETY: three live out-parameters.
         let rc = unsafe {
-            host_processor_info(HOST_SELF, HOST_PROCESSOR_CPU_LOAD_INFO, &mut count, &mut array, &mut words)
+            host_processor_info(
+                HOST_SELF,
+                HOST_PROCESSOR_CPU_LOAD_INFO,
+                &mut count,
+                &mut array,
+                &mut words,
+            )
         };
         assert_eq!(rc, KERN_SUCCESS);
         assert!(!array.is_null());
@@ -1127,7 +1179,13 @@ mod tests {
         let mut words = 0xaaaa_aaaau32;
         // SAFETY: three live out-parameters.
         let rc = unsafe {
-            host_processor_info(HOST_SELF, HOST_PROCESSOR_BASIC_INFO, &mut count, &mut array, &mut words)
+            host_processor_info(
+                HOST_SELF,
+                HOST_PROCESSOR_BASIC_INFO,
+                &mut count,
+                &mut array,
+                &mut words,
+            )
         };
         assert_eq!(rc, KERN_INVALID_ARGUMENT);
         assert_eq!(count, 0xaaaa_aaaa, "the count was written");
@@ -1144,12 +1202,28 @@ mod tests {
         );
         // SAFETY: as above.
         assert_eq!(
-            unsafe { host_processor_info(HOST_SELF + 4, HOST_PROCESSOR_CPU_LOAD_INFO, &mut count, &mut array, &mut words) },
+            unsafe {
+                host_processor_info(
+                    HOST_SELF + 4,
+                    HOST_PROCESSOR_CPU_LOAD_INFO,
+                    &mut count,
+                    &mut array,
+                    &mut words,
+                )
+            },
             KERN_INVALID_ARGUMENT
         );
         // SAFETY: as above; the null is what is being tested.
         assert_eq!(
-            unsafe { host_processor_info(HOST_SELF, HOST_PROCESSOR_CPU_LOAD_INFO, std::ptr::null_mut(), &mut array, &mut words) },
+            unsafe {
+                host_processor_info(
+                    HOST_SELF,
+                    HOST_PROCESSOR_CPU_LOAD_INFO,
+                    std::ptr::null_mut(),
+                    &mut array,
+                    &mut words,
+                )
+            },
             KERN_INVALID_ADDRESS
         );
     }
@@ -1170,13 +1244,28 @@ mod tests {
             .split_ascii_whitespace()
             .map(|f| f.parse().unwrap())
             .collect();
-        assert!(fields.len() >= 4, "the line is shorter than the four states");
+        assert!(
+            fields.len() >= 4,
+            "the line is shorter than the four states"
+        );
         let load = cpu_load();
         let first = load.first().expect("cpu_load found cpu0");
         assert_eq!(u64::from(first.user), fields[0], "user is field 0");
-        assert_eq!(u64::from(first.nice), fields[1], "nice is field 1, not field 3");
-        assert_eq!(u64::from(first.system), fields[2], "system is field 2, not field 1");
-        assert_eq!(u64::from(first.idle), fields[3], "idle is field 3, not field 2");
+        assert_eq!(
+            u64::from(first.nice),
+            fields[1],
+            "nice is field 1, not field 3"
+        );
+        assert_eq!(
+            u64::from(first.system),
+            fields[2],
+            "system is field 2, not field 1"
+        );
+        assert_eq!(
+            u64::from(first.idle),
+            fields[3],
+            "idle is field 3, not field 2"
+        );
         // And the aggregate `cpu ` line is not counted as a processor, which
         // would make the count one too many and every index off by one.
         assert_eq!(

@@ -232,6 +232,20 @@ impl Device {
         *self.removal.lock().unwrap_or_else(|e| e.into_inner()) = (callback, context);
     }
 
+    /// The address of the report buffer a caller registered with
+    /// `IOHIDDeviceRegisterInputReportCallback`, or null when there is none.
+    ///
+    /// What `IOHIDValueGetBytePtr` needs and nothing else should use: the bytes
+    /// belong to the guest that registered them, and this only says where they
+    /// are.
+    pub fn report_bytes(&self) -> *const u8 {
+        let registered = self.report.lock().unwrap_or_else(|e| e.into_inner());
+        match registered.buffer {
+            0 => std::ptr::null(),
+            buffer => buffer as *const u8,
+        }
+    }
+
     pub fn notify_removed(&self) {
         let (callback, context) = *self.removal.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(callback) = callback {

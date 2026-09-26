@@ -222,8 +222,37 @@ impl Layout {
         out
     }
 
-    /// Localization identifiers declared by the bundle and present as
-    /// `Resources/*.lproj` directories.
+    /// What localizations this bundle has, which is
+    /// `CFBundleCopyBundleLocalizations`.
+    ///
+    /// Three sources, in Apple's order (`CFBundle_Locale.c` in
+    /// `apple-oss-distributions/CF`, tag `CF-1153.18`): `CFBundleLocalizations`
+    /// from the plist, the `Resources/*.lproj` directories, and - but only
+    /// where the first two say nothing - the development region. That third
+    /// one is the rule with a condition in it, and the condition is most of it:
+    ///
+    /// * neither of the others, so the answer is the development region, or an
+    ///   empty array where there is no development region either. This is the
+    ///   only case in which the development region stands in for a
+    ///   localization rather than joining the list.
+    /// * the list is not empty and one of its entries is `Base` - so the
+    ///   development region is appended, unless it is already there under
+    ///   another spelling (`en` and `English` name one language, and adding
+    ///   `en` beside an existing `English` would report the language twice).
+    ///   `Base.lproj` *is* the development region's resources, so a lookup that
+    ///   did not find it named would reach for some other language instead.
+    /// * the list is not empty and none of its entries is `Base` - the
+    ///   development region is left out. `en.lproj` is a real localization in
+    ///   its own right, and putting `en` on the list when `en.lproj` is what
+    ///   supplies it would misreport what the bundle ships.
+    ///
+    /// The plist array and the directory listing are merged and sorted, where
+    /// Apple returns the plist's own entries followed by the directories in
+    /// `readdir` order. Sorting is the whole of the difference and it is
+    /// deliberate: this list is what decides which localization a bundle that
+    /// has none of the user's falls back to, and a filesystem ordering would
+    /// make that answer a property of how the directory happens to be laid out
+    /// on disk.
     pub fn localization_names(&self) -> Vec<String> {
         let mut names = self
             .info
@@ -232,6 +261,9 @@ impl Layout {
             .into_iter()
             .flatten()
             .filter_map(Value::as_str)
+            // An empty entry is not a localization; Apple's filters them out
+            // with `CFStringGetLength(oneEntry) > 0` for the same reason.
+            .filter(|name| !name.is_empty())
             .map(str::to_owned)
             .collect::<Vec<_>>();
         if let Ok(entries) = std::fs::read_dir(&self.resources) {
@@ -245,6 +277,18 @@ impl Layout {
         }
         names.sort();
         names.dedup();
+        if names.is_empty() {
+            return self.info_string("CFBundleDevelopmentRegion").map_or_else(Vec::new, |region| vec![region.to_owned()]);
+        }
+        let Some(region) = self.info_string("CFBundleDevelopmentRegion") else {
+            return names;
+        };
+        if !names.iter().any(|name| name == "Base") {
+            return names;
+        }
+        if preference::found_in(&names, region).is_none() {
+            names.push(region.to_owned());
+        }
         names
     }
 
@@ -299,6 +343,253 @@ impl Layout {
     pub fn principal_class(&self) -> Option<&str> {
         self.info_string("NSPrincipalClass")
     }
+}
+
+/// Which of a bundle's localizations to use, and in what order, which is the
+/// whole of what `-[NSBundle preferredLocalizations]` is.
+///
+/// Read out of Apple's own open-source CoreFoundation rather than out of the
+/// header, because the header does not say what happens when nothing matches
+/// and the binary has to be satisfied: `CFBundle_Locale.c` in
+/// `apple-oss-distributions/CF` at tag `CF-1153.18`, which is the release that
+/// still carries `CFBundleCopyPreferredLocalizationsFromArray`. The chain of
+/// calls there is
+///
+/// ```text
+/// CFBundleCopyPreferredLocalizationsFromArray(localizations)
+///   -> _CFBundleCopyLocalizationsForPreferences(localizations, user, considerMain)
+///        -> _CFBundleCopyPreferredLanguagesInList(localizations, NULL, user, ...)
+///             -> _CFBundleCreateMutableArrayOfFallbackLanguages(localizations, language)
+///                  -> _CFBundleCopyLanguageFoundInLocalizations(localizations, language)
+///                  -> ualoc_getAppleParent, in a loop
+/// ```
+///
+/// and what it adds up to is: the *first* user language the bundle has anything
+/// for, in the bundle's own spelling, followed by that language's less specific
+/// forms; failing that `en_US`; failing that the bundle's own first
+/// localization; and failing that, for a bundle with no localizations at all,
+/// `en`. Note "the first user language" and not "every user language the
+/// bundle has": the loop in `_CFBundleCopyPreferredLanguagesInList` breaks at
+/// the first preference that resolves, and it is the *user's* order that
+/// decides which one that is.
+///
+/// Two steps of the walk are not implemented here, and both are named rather
+/// than approximated:
+///
+/// * `ualoc_getAppleParent` walks a *tree* of locales, not a suffix, so the
+///   parent of `en_IN` is `en_GB`, whose parent is `en_001`, whose parent is
+///   `en`. Those intermediate parents are ICU data and this tree carries no
+///   ICU data. A rule read off the shape of the identifier instead - "drop the
+///   last subtag" - would answer `en` where Apple answers `en_001`, and would
+///   do it silently, so it is not here.
+/// * `_CFBundleCopyLanguageFoundInLocalizations` finishes by comparing
+///   `CFLocaleCreateCanonicalLanguageIdentifierFromString` forms, which is a
+///   language-subtag database and not a string operation.
+///
+/// What *is* implemented is the last hop of the parent walk, because Apple's
+/// own comment states it as a rule rather than leaving it to ICU:
+/// `_CFBundleCopyPreferredLanguagesInList` is documented as "The users list
+/// can contain region names (like "en_US" for US English). In this case, if
+/// the region lproj exists, it will be added, and, if the region's associated
+/// language lproj exists that will be added." So a preference of `en-US`
+/// against a bundle with `en.lproj` and no `en_US.lproj` answers `en`, which
+/// is what macOS answers, and which is the case this guest actually hits.
+pub(crate) mod preference {
+    /// The user's language preferences, in the order Apple would ask for them.
+    ///
+    /// Apple's is `_CFBundleCopyUserLanguages()`, which reads the
+    /// `AppleLanguages` preference. This host has no preferences database -
+    /// `crate::locale` says so once and answers every other "which language is
+    /// this" question from the environment - so this is built from the same two
+    /// accessors `+[NSLocale preferredLanguages]` builds its one entry from.
+    /// Reading them rather than re-deriving them from `LANG` is what stops the
+    /// class and the bundle being told two different things about one user.
+    pub(crate) fn user_languages() -> Vec<String> {
+        vec![format!(
+            "{}-{}",
+            crate::locale::language(),
+            crate::locale::country_code()
+        )]
+    }
+
+    /// The localizations to use, in the order to use them.
+    ///
+    /// `main` is the main bundle's answer to the same question, which Apple
+    /// consults *before* the user's own preferences - but only for a bundle
+    /// that is not the main bundle, so a caller asking about the main bundle
+    /// passes `None`.
+    pub(crate) fn resolve(
+        supported: &[String],
+        user: &[String],
+        main: Option<&[String]>,
+    ) -> Vec<String> {
+        // `_CFBundleCopyLocalizationsForPreferences` does none of the choosing
+        // when there is nothing to choose from, and its backstops sit outside
+        // that branch: "Total backstop behavior to avoid having an empty
+        // array" is a one-element array holding `en`.
+        if supported.is_empty() {
+            return vec![String::from("en")];
+        }
+        let mut result = Vec::new();
+        if let Some(main) = main {
+            if let Some(first) = main.first() {
+                result = chain(supported, first);
+            }
+        }
+        if result.is_empty() {
+            for wanted in user {
+                result = chain(supported, wanted);
+                if !result.is_empty() {
+                    break;
+                }
+            }
+        }
+        // "use development region and U.S. English as backstops". The
+        // development region is `NULL` on this path: that is what
+        // `_CFBundleCopyLocalizationsForPreferences` passes, and it is why this
+        // is `en_US` alone.
+        if result.is_empty() {
+            result = chain(supported, "en_US");
+        }
+        // "Additional backstop behavior: use first entry as backstop".
+        if result.is_empty() {
+            result.push(supported[0].clone());
+        }
+        result
+    }
+
+    /// One language preference, as the localizations that cover it, most
+    /// specific first.
+    ///
+    /// `_CFBundleCreateMutableArrayOfFallbackLanguages` puts the language
+    /// itself in first and then appends each parent the bundle also has; this
+    /// is the language itself and the last of those parents, which is the one
+    /// this module's note explains. A preference that names no region is tried
+    /// once, because its own parent is the root.
+    fn chain(supported: &[String], language: &str) -> Vec<String> {
+        let bare = language
+            .split(['-', '_'])
+            .next()
+            .filter(|bare| bare.len() < language.len())
+            .unwrap_or(language);
+        let mut out = Vec::new();
+        for wanted in [language, bare] {
+            if let Some(found) = found_in(supported, wanted)
+                && !out.contains(&found)
+            {
+                out.push(found);
+            }
+        }
+        out
+    }
+
+    /// `language` as `supported` spells it, or `None` for a language this
+    /// bundle has nothing for.
+    ///
+    /// `_CFBundleCopyLanguageFoundInLocalizations`, in its own order: the
+    /// identifier itself, then the full language name for the seven languages
+    /// Apple keeps one for, then the identifier with the separator swapped.
+    /// Its canonicalising last step is the one this module's note declines.
+    pub(crate) fn found_in(supported: &[String], language: &str) -> Option<String> {
+        let holds = |name: &str| supported.iter().any(|held| held == name);
+        if holds(language) {
+            return Some(language.to_owned());
+        }
+        // `__CFBundleCommonLanguageNamesArray` and the abbreviations beside
+        // it: seven languages, in each direction, which are the only
+        // full-name/abbreviation pairs Apple checks for.
+        const NAMED: [(&str, &str); 7] = [
+            ("en", "English"),
+            ("fr", "French"),
+            ("de", "German"),
+            ("it", "Italian"),
+            ("nl", "Dutch"),
+            ("es", "Spanish"),
+            ("ja", "Japanese"),
+        ];
+        for (abbreviation, name) in NAMED {
+            for (mine, theirs) in [(abbreviation, name), (name, abbreviation)] {
+                if language == mine && holds(theirs) {
+                    return Some(theirs.to_owned());
+                }
+            }
+        }
+        separator_swapped(language).filter(|swapped| holds(swapped))
+    }
+
+    /// `name` with `_` and `-` exchanged at the third character, which is
+    /// where a language and its region meet: `en-US` becomes `en_US`, `zh_CN`
+    /// becomes `zh-CN`.
+    ///
+    /// `_CFBundleCopyModifiedLocalization` rewrites the character at index 2
+    /// and only that one, and only for a name of four characters or more -
+    /// three cannot hold both a language and a region, so `en-` stays `en-`.
+    /// Not ASCII, this does not: an identifier with a non-ASCII character in it
+    /// is one there is no rule here for, and the rules of another are worse
+    /// than none.
+    pub(crate) fn separator_swapped(name: &str) -> Option<String> {        if !name.is_ascii() || name.len() < 4 {
+            return None;
+        }
+        let mut bytes = name.as_bytes().to_vec();
+        match bytes[2] {
+            b'-' => bytes[2] = b'_',
+            b'_' => bytes[2] = b'-',
+            _ => return None,
+        }
+        String::from_utf8(bytes).ok()
+    }
+}
+
+/// A guest's array of `NSString`s, as the text they spell.
+///
+/// Anything that is not a string is left out rather than refused, which is what
+/// the arrays this is asked about are: a localization array, which is a
+/// question about which languages a bundle has, and a wrong answer there is
+/// better than no answer only if it is a wrong one nobody can see.
+///
+/// # Safety
+///
+/// `array` must be null or a `CFArray` this runtime allocated.
+unsafe fn strings_of(array: objc::object::Id) -> Vec<String> {
+    // SAFETY: as this function's safety note.
+    let Some(array) = (unsafe { corefoundation::collections::array(array as corefoundation::base::CFTypeRef) })
+    else {
+        return Vec::new();
+    };
+    array
+        .values
+        .iter()
+        .filter_map(|value| {
+            // SAFETY: an element of an array of localizations is an `NSString`.
+            let bytes = unsafe { crate::string::bytes(*value as objc::object::Id) };
+            std::str::from_utf8(&bytes).ok().map(str::to_owned)
+        })
+        .collect()
+}
+
+/// An array of `NSString`s the caller owns, as every `CFBundleCopy…` hands
+/// back.
+///
+/// # Safety
+///
+/// Each name is copied into a string of its own and the array retains it, so
+/// the only reference this creates is the one it returns.
+fn string_array(names: &[String]) -> corefoundation::base::CFTypeRef {
+    let values = names
+        .iter()
+        .map(|name| crate::string::from_str(name) as corefoundation::base::CFTypeRef)
+        .collect::<Vec<_>>();
+    let array = corefoundation::collections::new_array(
+        &values,
+        corefoundation::callbacks::Policy::from_type_callbacks(),
+        false,
+    );
+    for value in values {
+        // SAFETY: each is the live object made a line above, and the array
+        // retained a reference of its own to it.
+        unsafe { corefoundation::api::CFRelease(value) };
+    }
+    array
 }
 
 /// `CFBundleRef` is `NSBundle *`, so the CoreFoundation spellings live beside
@@ -414,56 +705,47 @@ pub mod cf {
 
     /// `CFArrayRef CFBundleCopyBundleLocalizations(CFBundleRef)`.
     unsafe extern "C" fn CFBundleCopyBundleLocalizations(_bundle: Id) -> Id {
-        let Some(bundle) = super::main() else {
-            return std::ptr::null_mut();
-        };
-        let strings = bundle
-            .localization_names()
-            .iter()
-            .map(|name| crate::string::from_str(name) as CFTypeRef)
-            .collect::<Vec<_>>();
-        let array = corefoundation::collections::new_array(
-            &strings,
-            corefoundation::callbacks::Policy::from_type_callbacks(),
-            false,
-        );
-        for string in strings {
-            // The array retained each newly-created string and now owns it.
-            // SAFETY: each is the live object made immediately above.
-            unsafe { corefoundation::api::CFRelease(string) };
+        let names = super::main().map(|bundle| bundle.localization_names());
+        match names {
+            // A `Copy`, so the caller owns the array this returns.
+            Some(names) => super::string_array(&names) as Id,
+            None => std::ptr::null_mut(),
         }
-        array as Id
     }
 
     /// `CFArrayRef CFBundleCopyPreferredLocalizationsFromArray(CFArrayRef)`.
+    ///
+    /// The whole contract is [`super::preference`]; this moves the caller's
+    /// array in and the answer out. Two things about the answer are Apple's
+    /// and worth stating where they are decided: it is a `Copy`, so the caller
+    /// owns what it gets back, and an empty or null input answers `["en"]`
+    /// rather than an empty array, which is `CFBundleCopyPreferred-
+    /// LocalizationsFromArray` inheriting
+    /// `_CFBundleCopyLocalizationsForPreferences`'s "Total backstop behavior to
+    /// avoid having an empty array".
     unsafe extern "C" fn CFBundleCopyPreferredLocalizationsFromArray(localizations: Id) -> Id {
         // SAFETY: a CFArray or null.
-        let Some(array) =
-            (unsafe { corefoundation::collections::array(localizations as CFTypeRef) })
-        else {
-            return std::ptr::null_mut();
-        };
-        let language = crate::locale::language();
-        let preferred = array.values.iter().copied().find(|value| {
-            // SAFETY: localization arrays contain CFStrings.
-            let bytes = unsafe { crate::string::bytes(*value as Id) };
-            std::str::from_utf8(&bytes).is_ok_and(|name| {
-                name.eq_ignore_ascii_case(&language)
-                    || name
-                        .split(['-', '_'])
-                        .next()
-                        .is_some_and(|base| base.eq_ignore_ascii_case(&language))
-            })
-        });
-        let values = preferred
-            .or_else(|| array.values.first().copied())
-            .into_iter()
-            .collect::<Vec<_>>();
-        corefoundation::collections::new_array(
-            &values,
-            corefoundation::callbacks::Policy::from_type_callbacks(),
-            false,
-        ) as Id
+        let candidates = unsafe { super::strings_of(localizations) };
+        let user = super::preference::user_languages();
+        super::string_array(&super::preference::resolve(&candidates, &user, None)) as Id
+    }
+
+    /// `CFArrayRef CFBundleCopyLocalizationsForPreferences(CFArrayRef locArray,
+    /// CFArrayRef prefArray)`.
+    ///
+    /// The same order with the preferences named rather than taken from the
+    /// process, and without the main bundle: Apple's own comment on the pair of
+    /// functions is that this is the one which answers "what localizations
+    /// would *that* application use", so it must not consult this
+    /// application's own.
+    unsafe extern "C" fn CFBundleCopyLocalizationsForPreferences(
+        localizations: Id,
+        preferred: Id,
+    ) -> Id {
+        // SAFETY: two CFArrays or null.
+        let (candidates, preferences) =
+            unsafe { (super::strings_of(localizations), super::strings_of(preferred)) };
+        super::string_array(&super::preference::resolve(&candidates, &preferences, None)) as Id
     }
 
     /// `CFStringRef CFBundleGetIdentifier(CFBundleRef)`
@@ -586,6 +868,7 @@ pub mod cf {
             "CFBundleCopyBuiltInPlugInsURL" => CFBundleCopyBuiltInPlugInsURL,
             "CFBundleCopyBundleLocalizations" => CFBundleCopyBundleLocalizations,
             "CFBundleCopyPreferredLocalizationsFromArray" => CFBundleCopyPreferredLocalizationsFromArray,
+            "CFBundleCopyLocalizationsForPreferences" => CFBundleCopyLocalizationsForPreferences,
             "CFBundleGetIdentifier" => CFBundleGetIdentifier,
             "CFBundleGetInfoDictionary" => CFBundleGetInfoDictionary,
             "CFBundleGetValueForInfoDictionaryKey" => CFBundleGetValueForInfoDictionaryKey,
@@ -747,6 +1030,294 @@ mod tests {
         let exe = scratch("broken", "not a plist at all");
         assert!(Layout::enclosing(&exe).is_none());
     }
+
+    /// The development region joins the list only where Apple says it does:
+    /// not at all for a bundle whose `.lproj` directories are already
+    /// localizations of their own, and appended for one whose only entry is
+    /// `Base`, which *is* the development region's resources.
+    #[test]
+    fn the_development_region_joins_only_where_base_lproj_is() {
+        let without_base = scratch(
+            "dev-region-unused",
+            &INFO.replace(
+                "<key>CFBundleDevelopmentRegion</key><string>English</string>",
+                "",
+            ),
+        );
+        let layout = Layout::enclosing(&without_base).expect("a bundle");
+        // `en` and `English` name one language, and `English.lproj` is a real
+        // localization: the development region is left out entirely.
+        assert_eq!(layout.localization_names(), ["English"]);
+
+        let base = scratch("dev-region-base", INFO);
+        let resources = base.parent().unwrap().parent().unwrap().join("Resources");
+        std::fs::create_dir_all(resources.join("Base.lproj")).unwrap();
+        let layout = Layout::enclosing(&base).expect("a bundle");
+        assert_eq!(layout.localization_names(), ["Base", "English"]);
+
+        // Nothing but a development region to report, which is the one case in
+        // which it stands in for a localization rather than joining the list.
+        let empty = scratch("dev-region-alone", INFO);
+        std::fs::remove_dir_all(
+            empty
+                .parent()
+                .unwrap()
+                .parent()
+                .unwrap()
+                .join("Resources/English.lproj"),
+        )
+        .unwrap();
+        let layout = Layout::enclosing(&empty).expect("a bundle");
+        assert_eq!(layout.localization_names(), ["English"]);
+    }
+}
+
+#[cfg(test)]
+mod preference_tests {
+    use super::preference::{resolve, separator_swapped};
+    use super::cf;
+
+    fn names(list: &[&str]) -> Vec<String> {
+        list.iter().map(|name| String::from(*name)).collect()
+    }
+
+    /// The order is the *user's*, and it is the first preference the bundle has
+    /// anything for that decides it - not the bundle's own order, and not every
+    /// preference at once.
+    #[test]
+    fn the_first_preference_the_bundle_has_decides() {
+        let supported = names(&["en", "en_GB", "fr", "zh_CN"]);
+        assert_eq!(
+            resolve(&supported, &names(&["fr-FR", "en-US"]), None),
+            names(&["fr"]),
+            "fr comes first and the bundle has it, so en is not consulted"
+        );
+        assert_eq!(
+            resolve(&supported, &names(&["en-US", "fr-FR"]), None),
+            names(&["en"]),
+            "the same two preferences the other way round"
+        );
+    }
+
+    /// The case this guest actually hits: Chromium.app has `en.lproj` and
+    /// `en_GB.lproj` and no `en_US.lproj`, and the one language this host has
+    /// is `en-US`. Apple's parent walk sends that to the bare language, so the
+    /// answer is `en` and element zero is `en` - which is what macOS answers,
+    /// and what the guest at `Framework+0x692c821` expects to be able to
+    /// rewrite into `en-US`.
+    #[test]
+    fn a_regional_preference_falls_back_to_the_bare_language() {
+        let chromium = names(&[
+            "af", "am", "ar", "en", "en_GB", "fr", "fr_CA", "pt_BR", "zh_CN",
+        ]);
+        assert_eq!(
+            resolve(&chromium, &names(&["en-US"]), None),
+            names(&["en"])
+        );
+        // And with the region spelled the other way, which is what a
+        // `.lproj` directory is named.
+        assert_eq!(
+            resolve(&names(&["en_GB", "en_US"]), &names(&["en_US"]), None),
+            names(&["en_US"])
+        );
+    }
+
+    /// The fallback ladder, in Apple's order: nothing the user asked for, then
+    /// `en_US`, then the bundle's own first localization.
+    #[test]
+    fn the_fallbacks_are_in_apples_order() {
+        // `en_US` is the second backstop, and it is reached before the bundle's
+        // first localization.
+        assert_eq!(
+            resolve(&names(&["af", "am", "en_US"]), &names(&["ja"]), None),
+            names(&["en_US"])
+        );
+        // With no `en_US`, the bundle's own first localization. `af` is first
+        // because `localization_names` sorts, which is deliberate: readdir
+        // order would make this a property of the filesystem.
+        assert_eq!(
+            resolve(&names(&["af", "am", "ar"]), &names(&["ja"]), None),
+            names(&["af"])
+        );
+        // And a bundle with no localizations at all answers `en`, which is
+        // `CFBundleCopyLocalizationsForPreferences`'s "total backstop behavior
+        // to avoid having an empty array" - not an empty array a caller could
+        // index into.
+        assert_eq!(resolve(&[], &names(&["ja"]), None), names(&["en"]));
+        assert_eq!(resolve(&[], &[], None), names(&["en"]));
+    }
+
+    /// The main bundle leads the search for a bundle that is not the main
+    /// bundle, so a framework that has none of the user's languages still
+    /// answers with the application's language.
+    #[test]
+    fn the_main_bundle_leads_for_another_bundle() {
+        let framework = names(&["ja"]);
+        let main = names(&["fr"]);
+        assert_eq!(
+            resolve(&framework, &names(&["ja"]), Some(&main)),
+            names(&["ja"]),
+            "the main bundle's language leads, but only if this bundle has it"
+        );
+        assert_eq!(
+            resolve(&names(&["fr"]), &names(&["ja"]), Some(&main)),
+            names(&["fr"])
+        );
+    }
+
+    /// A language is found under the spelling the bundle uses: the identifier
+    /// itself, the full name Apple keeps for seven languages, or the identifier
+    /// with its separator the other way round.
+    #[test]
+    fn a_language_is_found_in_whichever_spelling_the_bundle_uses() {
+        assert_eq!(
+            super::preference::found_in(&names(&["English"]), "en"),
+            Some(String::from("English"))
+        );
+        assert_eq!(
+            super::preference::found_in(&names(&["en"]), "English"),
+            Some(String::from("en"))
+        );
+        assert_eq!(
+            super::preference::found_in(&names(&["en_US"]), "en-US"),
+            Some(String::from("en_US"))
+        );
+        // Only those seven have a full name Apple checks for, so a language
+        // outside them is not matched by one.
+        assert_eq!(
+            super::preference::found_in(&names(&["Polish"]), "pl"),
+            None
+        );
+    }
+
+    /// The swap is at the third character and needs four characters to do
+    /// anything, because three cannot hold a language and a region.
+    #[test]
+    fn the_separator_swaps_only_where_a_region_could_be() {
+        assert_eq!(separator_swapped("en-US"), Some(String::from("en_US")));
+        assert_eq!(separator_swapped("zh_CN"), Some(String::from("zh-CN")));
+        assert_eq!(separator_swapped("en-"), None, "too short to have a region");
+        assert_eq!(separator_swapped("en"), None, "no separator at all");
+        assert_eq!(
+            separator_swapped("en-Latn"),
+            Some(String::from("en_Latn")),
+            "index 2 is the separator even when a script subtag follows it"
+        );
+        assert_eq!(
+            separator_swapped("en-Latn-US").as_deref(),
+            Some("en_Latn-US"),
+            "index 2 is the language/region boundary however many subtags follow"
+        );
+    }
+
+    /// The array half of the contract, which the pure tests above cannot see: a
+    /// guest's array in, an array of `NSString`s out, in the order the contract
+    /// says.
+    #[test]
+    fn a_guests_localization_array_comes_back_in_that_order() {
+        crate::bootstrap();
+
+        /// A `CFArray` of localizations, which the test owns.
+        fn array(list: &[&str]) -> objc::object::Id {
+            let values: Vec<corefoundation::base::CFTypeRef> = list
+                .iter()
+                .map(|name| crate::string::from_str(name) as corefoundation::base::CFTypeRef)
+                .collect();
+            corefoundation::collections::new_array(
+                &values,
+                corefoundation::callbacks::Policy::from_type_callbacks(),
+                false,
+            ) as objc::object::Id
+        }
+
+        let address = cf::symbol("CFBundleCopyLocalizationsForPreferences")
+            .expect("the name has to resolve");
+        // SAFETY: the address of `CFBundleCopyLocalizationsForPreferences`,
+        // which takes two arrays and returns one the caller owns.
+        let for_preferences: unsafe extern "C" fn(
+            objc::object::Id,
+            objc::object::Id,
+        ) -> objc::object::Id = unsafe { std::mem::transmute(address as usize) };
+
+        let answer_to = |candidates: &[&str], preferences: &[&str]| {
+            // SAFETY: both arrays are live objects this test just made.
+            let answer =
+                unsafe { for_preferences(array(candidates), array(preferences)) };
+            assert!(!answer.is_null(), "a Copy function hands back a reference");
+            // SAFETY: an `NSArray` this runtime made, holding `NSString`s.
+            let values = unsafe {
+                corefoundation::collections::array(answer as corefoundation::base::CFTypeRef)
+            }
+            .expect("a localization array")
+            .values
+            .iter()
+            .map(|value| {
+                // SAFETY: each value is an `NSString`.
+                let bytes = unsafe { crate::string::bytes(*value as objc::object::Id) };
+                String::from_utf8(bytes).expect("utf-8")
+            })
+            .collect::<Vec<_>>();
+            // SAFETY: an array this test owns, by the function's own contract.
+            unsafe { corefoundation::api::CFRelease(answer) };
+            values
+        };
+
+        // The candidates in one order and the preferences in another, so a
+        // result that merely echoed either input would show.
+        assert_eq!(answer_to(&["af", "en", "en_GB", "fr", "fr_CA"], &["fr-FR", "en-US"]), ["fr"]);
+        // A preference the candidates have nothing for falls back to `en_US`
+        // before the candidates' own first entry.
+        assert_eq!(answer_to(&["af", "am", "en_US"], &["ja"]), ["en_US"]);
+        // With no `en_US` either, the candidates' first localization - `af`,
+        // because `localization_names` sorts rather than leaving the answer to
+        // the filesystem.
+        assert_eq!(answer_to(&["af", "am", "ar"], &["ja"]), ["af"]);
+        // An empty candidate list is `["en"]` and not an empty array, which is
+        // `CFBundleCopyLocalizationsForPreferences`' own total backstop.
+        assert_eq!(answer_to(&[], &["ja"]), ["en"]);
+    }
+
+    /// The selectors are installed on the side of the class they are sent from:
+    /// the instance ones on the class, `+preferredLocalizationsForPreferences:`
+    /// on the metaclass, each with the encoding the ABI declares. A
+    /// `preferredLocalizations` on the metaclass would be a class method no
+    /// guest can reach, and a wrong frame size is a caller that reads its
+    /// arguments off the stack.
+    #[test]
+    fn the_localization_selectors_are_installed_where_they_are_sent() {
+        crate::bootstrap();
+        let class = objc::class::lookup(c"NSBundle").expect("NSBundle is registered");
+        for (name, types) in [
+            ("localizations", c"@16@0:8"),
+            ("preferredLocalizations", c"@16@0:8"),
+            ("developmentLocalization", c"@16@0:8"),
+        ] {
+            let method = class
+                .method(objc::sel::get(name))
+                .unwrap_or_else(|| panic!("-[NSBundle {name}] is not installed"));
+            // `Method::types` answers a raw pointer; the encoding is the text
+            // it names, which is what the ABI is checked against.
+            // SAFETY: a registered method's types are a NUL-terminated string.
+            let text = unsafe { std::ffi::CStr::from_ptr(method.types()) };
+            assert_eq!(text, types, "-[{name}]");
+        }
+        let class_method = class
+            .metaclass()
+            .method(objc::sel::get("preferredLocalizationsForPreferences:"))
+            .expect("+[NSBundle preferredLocalizationsForPreferences:] is not installed");
+        // SAFETY: a registered method's types are a NUL-terminated string.
+        let class_types = unsafe { std::ffi::CStr::from_ptr(class_method.types()) };
+        assert_eq!(class_types, c"@24@0:8@16");
+        // And not on the other side, where a guest would not find them: the
+        // selector `047.log` names is sent to an *instance*.
+        assert!(
+            class
+                .metaclass()
+                .method(objc::sel::get("preferredLocalizations"))
+                .is_none(),
+            "preferredLocalizations is an instance method"
+        );
+    }
 }
 
 /// `NSBundle`, over the layout above.
@@ -864,12 +1435,37 @@ pub(crate) mod class {
         }
     }
 
+    /// Whether this object *is* the main bundle, which is a question about the
+    /// object rather than about the directory it answers for, and which
+    /// `-[NSBundle preferredLocalizations]` needs.
+    ///
+    /// A null second word is the main bundle's own mark: `of` creates the
+    /// singleton without a layout so that it keeps answering through
+    /// `super::main()`, and `bundle_at` hands that same object out for the main
+    /// root.
+    ///
+    /// # Safety
+    ///
+    /// As [`layout_of`].
+    unsafe fn is_main(receiver: Id) -> bool {
+        !receiver.is_null()
+            // SAFETY: every `NSBundle` is a `Body`.
+            && unsafe { (*(receiver as *const Body)).layout }.is_null()
+    }
+
     /// The main bundle, for a caller that has no class object in hand.
     pub(crate) fn main_object() -> Id {
         match objc::class::lookup(c"NSBundle") {
             Some(class) => of(class),
             None => std::ptr::null_mut(),
         }
+    }
+
+    /// Localizations as an autoreleased `NSArray` of `NSString`, which is what
+    /// a method hands back and what a `Copy` function does not.
+    fn autoreleased_localizations(names: &[String]) -> Id {
+        // SAFETY: an array this call just made.
+        unsafe { corefoundation::api::CFAutorelease(super::string_array(names)) as Id }
     }
 
     /// An `Info.plist` string as an autoreleased `NSString`, or nil.
@@ -1064,6 +1660,80 @@ pub(crate) mod class {
         std::ptr::null()
     }
 
+    /// `-[NSBundle localizations]`, which is
+    /// `CFBundleCopyBundleLocalizations` for the same bundle.
+    ///
+    /// The guest reads this one too, and reads it by fast enumeration rather
+    /// than by index: `Chromium Framework+0x2840` sends `localizations` to the
+    /// main bundle and then enumerates it, splitting each name on `-` and
+    /// collecting the pieces, so the answer has to be a real `NSArray` of real
+    /// `NSString`s rather than something that merely counts.
+    unsafe extern "C" fn localizations(receiver: Id, _sel: Sel) -> Id {
+        // SAFETY: the receiver is an `NSBundle`.
+        let names = match unsafe { layout_of(receiver) } {
+            Some(bundle) => bundle.localization_names(),
+            None => Vec::new(),
+        };
+        autoreleased_localizations(&names)
+    }
+
+    /// `-[NSBundle preferredLocalizations]`, the selector this guest is
+    /// stopped on, which `047.log` names:
+    /// `unrecognized selector sent to instance of NSBundle:
+    /// preferredLocalizations`.
+    ///
+    /// `Chromium Framework+0x692c821` sends it to the main bundle, keeps the
+    /// first element, and rewrites the `_` in it to a `-` - so what matters
+    /// here is both the order and the spelling of element zero.
+    unsafe extern "C" fn preferred_localizations(receiver: Id, _sel: Sel) -> Id {
+        // SAFETY: the receiver is an `NSBundle`.
+        let Some(bundle) = (unsafe { layout_of(receiver) }) else {
+            return std::ptr::null_mut();
+        };
+        let supported = bundle.localization_names();
+        let user = super::preference::user_languages();
+        // `_CFBundleCopyPreferredLanguagesInList` lets the main bundle's own
+        // preferred language lead the search - but only for a bundle that is
+        // not the main bundle, and the main bundle is the only bundle there
+        // is in this runtime unless a guest has asked for another.
+        let main = match unsafe { is_main(receiver) } {
+            true => None,
+            false => super::main().map(|main| {
+                let names = main.localization_names();
+                super::preference::resolve(&names, &user, None)
+            }),
+        };
+        autoreleased_localizations(&super::preference::resolve(
+            &supported,
+            &user,
+            main.as_deref(),
+        ))
+    }
+
+    /// `+[NSBundle preferredLocalizationsForPreferences:]`, the class-level
+    /// twin: the candidates come from the argument and the order from the same
+    /// [`super::preference`] contract, minus the main bundle - Apple's own
+    /// comment is that this is the function which answers "what would *that*
+    /// application use", so it must not consult this application's own.
+    unsafe extern "C" fn preferred_localizations_for_preferences(
+        _class: Id,
+        _sel: Sel,
+        candidates: Id,
+    ) -> Id {
+        // SAFETY: an `NSArray` or nil.
+        let candidates = unsafe { super::strings_of(candidates) };
+        let user = super::preference::user_languages();
+        autoreleased_localizations(&super::preference::resolve(&candidates, &user, None))
+    }
+
+    /// `-[NSBundle developmentLocalization]`, which is the
+    /// `CFBundleDevelopmentRegion` the plist names: the language this bundle
+    /// was written in, as opposed to any of the ones it has translations for.
+    unsafe extern "C" fn development_localization(receiver: Id, _sel: Sel) -> Id {
+        // SAFETY: the receiver is an `NSBundle`.
+        unsafe { info(receiver, "CFBundleDevelopmentRegion") }
+    }
+
     pub(crate) fn install() {
         let class =
             corefoundation::base::register(c"NSBundle", None, std::mem::size_of::<Body>(), false);
@@ -1082,12 +1752,16 @@ pub(crate) mod class {
             "URLForResource:withExtension:" => url_for_resource, c"@32@0:8@16@24";
             "pathForResource:ofType:inDirectory:" => path_for_resource_in_directory, c"@40@0:8@16@24@32";
             "infoDictionary" => info_dictionary, c"@16@0:8";
-            "executableName" => executable_name, c"*16@0:8"
+            "executableName" => executable_name, c"*16@0:8";
+            "localizations" => localizations, c"@16@0:8";
+            "preferredLocalizations" => preferred_localizations, c"@16@0:8";
+            "developmentLocalization" => development_localization, c"@16@0:8"
         });
         class_methods!(class, {
             "mainBundle" => main_bundle, c"@16@0:8";
             "bundleWithPath:" => bundle_with_path, c"@24@0:8@16";
-            "bundleWithURL:" => bundle_with_url, c"@24@0:8@16"
+            "bundleWithURL:" => bundle_with_url, c"@24@0:8@16";
+            "preferredLocalizationsForPreferences:" => preferred_localizations_for_preferences, c"@24@0:8@16"
         });
     }
 }

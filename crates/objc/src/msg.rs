@@ -1,7 +1,85 @@
 use std::ffi::c_void;
+use std::sync::Mutex;
 
 use crate::object::Id;
 use crate::sel::Sel;
+
+/// Classes whose `+initialize` has already run, so it runs exactly once.
+///
+/// Apple's rule is that `+initialize` is called on a class the first time a
+/// message is sent to it, and on every superclass that has not been initialised
+/// yet, superclass first. Chromium depends on this: `+[BrowserCrApplication
+/// initialize]` (`Framework+0x56a51b0`) installs its ObjC exception
+/// preprocessor and applies forced-RTL, and neither happens unless something
+/// sends this class a message.
+///
+/// Without it the guest gets a class that looks right and silently never runs
+/// its own setup, which is the worst shape a missing feature can take - so the
+/// call is made here, on the one path every message goes through.
+///
+/// Keyed by the class pointer, which is a leaked `&'static Class`, so the key
+/// cannot be reused and cannot dangle.
+static INITIALISED: Mutex<Vec<usize>> = Mutex::new(Vec::new());
+
+/// Run `+initialize` for `class` and its uninitialised superclasses, if it has
+/// not run already.
+///
+/// Superclass first, because that is the order the runtime uses and a subclass
+/// `+initialize` may reasonably call something its superclass set up. A class
+/// with no `+initialize` of its own still counts as initialised, so the walk
+/// stops there rather than repeating the superclass chain for every subclass.
+///
+/// Best-effort by design: this runs *before* the guest's message is dispatched,
+/// so a `+initialize` that fails must not take the process down. A guest
+/// `+initialize` that aborts aborts on its own terms, inside the guest.
+fn initialize_class(class: &'static crate::class::Class) {
+    /// Walk to the root collecting each class, then run them in reverse. The
+    /// chain is a handful deep; a guest cannot make it longer than it has
+    /// ancestors.
+    const MAX_DEPTH: usize = 64;
+
+    let mut chain: Vec<&'static crate::class::Class> = Vec::new();
+    let mut at: Option<&'static crate::class::Class> = Some(class);
+    while let Some(c) = at {
+        if chain.len() >= MAX_DEPTH {
+            break;
+        }
+        chain.push(c);
+        // SAFETY: a `&'static Class` from the registry; `superclass` is either
+        // null or another leaked class, and `Class::superclass` returns `None`
+        // for the root rather than inventing one.
+        at = unsafe { c.superclass() };
+    }
+
+    let Ok(mut done) = INITIALISED.lock() else {
+        // A poisoned lock means a `+initialize` panicked. Running it again
+        // would be worse than not running it.
+        return;
+    };
+
+    // Superclass first.
+    for c in chain.iter().rev() {
+        let key = crate::class::ptr(*c) as usize;
+        if done.contains(&key) {
+            // Already initialised: this class and everything above it.
+            return;
+        }
+        done.push(key);
+        let Some(method) = c.metaclass().method(crate::sel::get("initialize")) else {
+            // No `+initialize` of its own. Marked above, so the walk does not
+            // come back through it.
+            continue;
+        };
+        let imp = method.implementation();
+        // SAFETY: `+initialize` is `void (Class, SEL)`. The class is live - it
+        // is in the registry - and the method was just resolved from it.
+        unsafe {
+            let f: unsafe extern "C" fn(Id, Sel) =
+                std::mem::transmute::<*const c_void, unsafe extern "C" fn(Id, Sel)>(imp);
+            f(crate::class::ptr(*c) as Id, crate::sel::get("initialize"));
+        }
+    }
+}
 
 /// The `IMP` to jump to for `(receiver, sel)`, or the "unrecognised" trampoline.
 ///
@@ -19,6 +97,7 @@ unsafe extern "C" fn lookup(receiver: Id, sel: Sel) -> *const c_void {
     let Some(class) = (unsafe { crate::object::class_of(receiver) }) else {
         return refused;
     };
+    initialize_class(class);
     match class.method(sel) {
         Some(method) => method.implementation(),
         None => refused,
@@ -124,6 +203,7 @@ unsafe extern "C" fn lookup_stret(receiver: Id, sel: Sel) -> *const c_void {
     let Some(class) = (unsafe { crate::object::class_of(receiver) }) else {
         return refused;
     };
+    initialize_class(class);
     match class.method(sel) {
         Some(method) => method.implementation(),
         None => refused,
@@ -377,6 +457,10 @@ unsafe extern "C" fn lookup_super2(sup: *const Super, sel: Sel) -> *const c_void
 }
 
 fn imp_or_unrecognised(class: &'static crate::class::Class, sel: Sel) -> *const c_void {
+    // A `super` send is still a message to a class, and Chromium's
+    // `objc_msgSendSuper2 finishLaunching` is how it reaches the inherited
+    // `+initialize` path, so the initialisation walk belongs here too.
+    initialize_class(class);
     match class.method(sel) {
         Some(method) => method.implementation(),
         None => unrecognised as *const c_void,

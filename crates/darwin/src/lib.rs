@@ -99,6 +99,7 @@ pub mod tls;
 pub mod translation;
 pub mod ulock;
 pub mod unfair_lock;
+pub mod unavailable;
 #[cfg(not(target_os = "macos"))]
 pub mod utmpx;
 pub mod uuid;
@@ -110,6 +111,7 @@ pub mod wait;
 mod wait_word;
 pub mod xattr;
 pub mod xlocale;
+pub mod xpc;
 
 /// The environment a guest's `main` receives as `envp`, as `NAME=VALUE`.
 ///
@@ -397,6 +399,8 @@ static MODULES: &[exports::Module] = &[
     vis::MODULE,
     #[cfg(not(target_os = "macos"))]
     wait::MODULE,
+    unavailable::MODULE,
+    xpc::MODULE,
 ];
 
 fn implemented(name: &str) -> Option<u64> {

@@ -508,6 +508,16 @@ pub fn concurrent_attr() -> u64 {
 /// rather than queued: queueing the original would run a block whose captures live
 /// in the caller's frame, long after that frame is gone.
 pub unsafe extern "C" fn async_(handle: u64, block: u64) {
+    async_block(handle, block);
+}
+
+/// The block half of [`async_`], for a caller in this directory that has a block
+/// and no context to pass with it - a dispatch source's cancel handler, which
+/// libdispatch runs on the target queue like any other.
+///
+/// Takes its own copy, so the caller keeps its reference; see [`block::copy`] for
+/// why a copy that fails is not queued.
+pub fn async_block(handle: u64, block: u64) {
     let Some(copied) = block::copy(block) else {
         return;
     };

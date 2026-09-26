@@ -29,7 +29,37 @@ pub fn type_id(class: &'static Class) -> CFTypeID {
 /// rather than the heap.
 static TYPES: std::sync::Mutex<Vec<usize>> = std::sync::Mutex::new(Vec::new());
 
+/// The name of each registered type, beside its id.
+///
+/// `CFCopyTypeIDDescription` is asked for a type's *name*, and the class is
+/// where the name lives, so the two are recorded together.  Without the name
+/// that function could only say "some type", which is the one answer a caller
+/// logging an unexpected type can do without.
+static TYPE_NAMES: std::sync::Mutex<Vec<(usize, &'static std::ffi::CStr)>> =
+    std::sync::Mutex::new(Vec::new());
+
+/// The name of the type `type_id` names, if this runtime registered it.
+pub fn type_name(type_id: CFTypeID) -> Option<&'static str> {
+    TYPE_NAMES
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+        .find(|(id, _)| *id == type_id)
+        .map(|(_, name)| name.to_str().unwrap_or("?"))
+}
+
 fn note_type(class: &'static Class) {
+    {
+        let mut names = TYPE_NAMES.lock().unwrap_or_else(|e| e.into_inner());
+        let id = objc::class::ptr(class) as usize;
+        if !names.iter().any(|(known, _)| *known == id) {
+            // The class's name is a leaked NUL-terminated string, and a
+            // `&'static Class` outlives the process, so this is `&'static`.
+            // SAFETY: `Class::name` is set at registration to a leaked C string.
+            let name = unsafe { std::ffi::CStr::from_ptr(class.name()) };
+            names.push((id, name));
+        }
+    }
     let mut types = TYPES.lock().unwrap_or_else(|e| e.into_inner());
     let id = objc::class::ptr(class) as usize;
     // Idempotent, because a `...GetTypeID` a guest can call in a loop would
@@ -324,6 +354,35 @@ pub fn interned_name(text: &str) -> u64 {
     let address = object as usize as u64;
     strings.push((text.to_string(), address));
     address
+}
+
+/// Say once, on stderr, that a call was refused and why.
+///
+/// Every refusal in this tree names itself, and a refusal that names itself once
+/// is better than a value that looks like an answer. `KERN_INVALID_ARGUMENT` and
+/// a null `CFTypeRef` are both four bytes and no sentence; a caller that only
+/// checks the return - which is what every caller of a `Create` that can fail
+/// does - turns one into a log line naming its own file and this runtime's
+/// silence. The sentence says what is missing and where it would have to come
+/// from, so the next thing to implement is named by the refusal rather than by a
+/// debugger session.
+///
+/// Once per `(what, why)` pair, because these are called from loops - a
+/// character-set lookup happens once per identifier per process, but a
+/// tokenizer's refusal would be once per token.
+pub fn refuse_once(what: &str, why: String) {
+    use std::collections::HashSet;
+    use std::sync::Mutex;
+    static SAID: Mutex<Option<HashSet<(String, String)>>> = Mutex::new(None);
+    let key = (what.to_string(), why.clone());
+    let fresh = SAID
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get_or_insert_default()
+        .insert(key);
+    if fresh {
+        eprintln!("rosetta3: corefoundation: {what}: refused - {why}");
+    }
 }
 
 /// The address of the **variable** a pointer-typed global names.
