@@ -630,6 +630,51 @@ pub static SIGNATURES: &[FunctionAbi] = &[
     sig!("CFStringGetSystemEncoding", U32),
     sig!("CFStringGetTypeID", U64),
     sig!("CFStringHasPrefix", BOOL, P, P),
+    sig!("CFStringHasSuffix", BOOL, P, P),
+    // `CFRange` by value in the return, which no signature in this table can
+    // place - the same reason `CVDisplayLinkGetNominalOutputVideoRefreshPeriod`
+    // takes an out-parameter - so the range travels through the third argument
+    // instead. `CFIndex` is `long`, and flattened like every other `CFRange`
+    // here: a `CFRange` is two `CFIndex`.
+    sig!("CFStringGetRangeOfCharacterClusterAtIndex", V, P, I64, P),
+    // The mode is a retained copy, so the caller owns it; `CFRunLoopCopyCurrentMode`
+    // answers a borrowed one and the caller does not.
+    sig!("CFRunLoopCopyCurrentMode", P, P),
+    // Not `cbsig!`, deliberately: the third argument is a **block**, so its
+    // `invoke` lives inside the block and there is nothing for the marshaller's
+    // per-parameter substitution to thunk. What it needs instead is the block
+    // rewritten before the host can reach it - see `shims::corefoundation`.
+    sig!("CFRunLoopPerformBlock", V, P, P, P),
+    // `CFMachPortCreateRunLoopSource(port, allocator, order)`. The order is a
+    // `CFIndex` and is signed, because a negative order is how CoreFoundation
+    // spells "after everything already in the loop".
+    sig!("CFMachPortCreateRunLoopSource", P, P, P, I64),
+    sig!("CFMachPortInvalidate", V, P),
+    sig!("CFMachPortCreateWithPort", P, P, U32, BOOL),
+    sig!("CFMachPortGetPort", U32, P),
+    sig!("CFMachPortIsValid", BOOL, P),
+    sig!("CFMachPortGetTypeID", U64),
+    // `CFLocaleCreate(allocator, identifier)`. Both `CFLocaleGetIdentifier` and
+    // `CFLocaleGetValue` are Foundation's and answer for the host's one locale
+    // whatever they are handed, so the identifier is accepted and not stored -
+    // see the note on the function.
+    sig!("CFLocaleCreate", P, P, P),
+    // `CFSetCallBacks` is `CFDictionaryKeyCallBacks` member for member, so the
+    // callback table is one pointer here as it is for every other collection's.
+    sig!("CFSetCreate", P, P, I64, P, P),
+    sig!("CFSetAddValue", V, P, P),
+    sig!("CFSetCreateMutable", P, P, I64, P),
+    // `CFIndex` is `long`; a `CFError`'s code is an `NSInteger` and is routinely
+    // negative, which is the whole of what `CFErrorGetCode` reports.
+    sig!("CFErrorGetTypeID", U64),
+    sig!("CFErrorGetCode", I64, P),
+    sig!("CFErrorGetDomain", P, P),
+    sig!("CFErrorCopyDescription", P, P),
+    sig!("CFErrorCopyUserInfo", P, P),
+    // Asked of `darwin::symbol`, the same lookup the loader answers a guest's
+    // *import* with. Two disagreeing lookups is how a guest ends up with an
+    // import that works and a `dlsym` of the same name that answers null.
+    sig!("CFBundleGetFunctionPointerForName", P, P, P),
     sig!(
         "CFURLCreateStringByAddingPercentEscapes",
         P,
@@ -1265,6 +1310,12 @@ pub static SIGNATURES: &[FunctionAbi] = &[
     sig!("SecCodeCopySelf", I32, U32, P),
     sig!("SecCodeCheckValidity", I32, P, U32, P),
     sig!("SecStaticCodeCheckValidityWithErrors", I32, P, U64, P, P),
+    // The running process's signing identity (`security::task`).
+    sig!("SecTaskCreateFromSelf", P, P),
+    sig!("SecTaskCopyValueForEntitlement", P, P, P, P),
+    sig!("SecTaskCopySigningIdentifier", P, P, P),
+    sig!("SecTaskGetCodeSignStatus", U32, P),
+    sig!("SecTaskGetTypeID", U64),
     //
     // SDL3 asks the current layout for its Unicode key-layout data so it can
     // translate a virtual key code into characters.
@@ -1422,6 +1473,13 @@ pub static SIGNATURES: &[FunctionAbi] = &[
     sig!("accept", I32, I32, P, P),
     sig!("access", I32, P, I32),
     sig!("faccessat", I32, I32, P, I32, I32),
+    // `int fstatat(int dirfd, const char *path, struct stat *buf, int flags)` -
+    // Darwin's spelling of what glibc also calls `fstatat`, and the sixth
+    // `$INODE64` alias `crate::stat` publishes. Without this row the address
+    // binds and the call does not: a guest's call site is not promoted, and
+    // `abi::call_import` finds no signature and refuses the call by name.
+    // `lookup` folds the suffix, so no variant entry is needed.
+    sig!("fstatat", I32, I32, P, P, I32),
     sig!("acl_free", I32, P),
     sig!("acl_get_entry", I32, P, I32, P),
     sig!("acl_get_fd_np", P, I32, I32),
@@ -3367,6 +3425,14 @@ pub static SIGNATURES: &[FunctionAbi] = &[
     sig!("os_log_create", P, P, P),
     sig!("os_log_type_enabled", BOOL, P, U8),
     sig!("os_release", V, P),
+    // libplatform's lock (`darwin::unfair_lock`). The options are a `uint32_t`
+    // bitmask.
+    sig!("os_unfair_lock_lock", V, P),
+    sig!("os_unfair_lock_lock_with_options", V, P, U32),
+    sig!("os_unfair_lock_trylock", BOOL, P),
+    sig!("os_unfair_lock_unlock", V, P),
+    sig!("os_unfair_lock_assert_owner", V, P),
+    sig!("os_unfair_lock_assert_not_owner", V, P),
     //
     // The exception-port family is **not** here - it is in [`crate::signal`],
     // for `task_set_exception_ports`' reason.
@@ -3453,8 +3519,23 @@ pub static SIGNATURES: &[FunctionAbi] = &[
     // Imported by the interposing mimalloc rather than by the guest itself, which is
     // what makes most of it passthrough: a zone from `malloc_default_zone` is
     // libsystem_malloc's own structure, so calling through it is the host allocating
-    // for itself. `malloc_zone_register` and `malloc_get_all_zones` are refused -
-    // they hand the host a structure of *guest* function pointers.
+    // for itself.
+    //
+    // `malloc_zone_register` and `malloc_get_all_zones` are the two that are **not**
+    // passthrough, and were refused here for a reason that was right and a conclusion
+    // that was wrong. What they hand the host is a structure of *guest* function
+    // pointers, and calling one would be a call with this host's convention into code
+    // compiled for the guest's - which is harmless here and fatal on a host whose
+    // architecture differs, and neither is a thing to leave to chance. They are
+    // implemented instead (`darwin::malloc`) by keeping the invariant rather than
+    // refusing the name: a registered zone is **recorded as an address and never
+    // dereferenced**, so no host path can reach a vtable slot a guest filled in, and
+    // allocation always goes to the host/adopted allocator. `malloc_get_all_zones`
+    // answers for `TASK_SELF` only, reading the caller's own buffers directly rather
+    // than through the `memory_reader_t` a foreign task would need - which is also
+    // what Darwin's own fast path does, and which means the guest's callback is never
+    // called from here. Any other task gets `KERN_INVALID_TASK`, the answer
+    // `darwin::mach::info` already gives for a task this runtime does not have.
     sig!("malloc_default_zone", P),
     sig!("malloc_default_purgeable_zone", P),
     sig!("malloc_create_zone", P, U64, U32),
@@ -3475,7 +3556,18 @@ pub static SIGNATURES: &[FunctionAbi] = &[
     sig!("malloc_zone_print", V, P, I32),
     sig!("malloc_zone_print_ptr_info", V, P),
     sig!("malloc_zone_unregister", V, P),
+    // `void malloc_zone_register(malloc_zone_t *)` and
+    // `kern_return_t malloc_get_all_zones(task_t, memory_reader_t, vm_address_t *,
+    // unsigned *)` - see the block above for why these two are implemented rather
+    // than refused, and `darwin::malloc` for the invariant they keep.
+    sig!("malloc_zone_register", V, P),
+    sig!("malloc_get_all_zones", I32, U32, P, P, P),
     sig!("malloc_good_size", U64, U64),
+    // `void abort_report_np(const char *, ...)` - libsystem_malloc's assertion
+    // reporter. Variadic, and the two are the same fact: `darwin::malloc` builds
+    // the `va_list` in the callee's own frame and hands it to the host's
+    // `vsnprintf`, as `darwin::printf_l` does for the `_l` family.
+    vsig!("abort_report_np", V, P),
     // `void *valloc(size_t)` and its private counterpart `vfree`, which
     // libsystem_malloc exports without a header.
     sig!("valloc", P, U64),
@@ -3767,19 +3859,6 @@ pub static REFUSED: &[(&str, &str)] = &[
     (
         "IODispatchCalloutFromMessage",
         "calls a guest function pointer carried inside a Mach message the host would read",
-    ),
-    // `void malloc_zone_register(malloc_zone_t *)` - hands libsystem_malloc a
-    // structure of **guest** function pointers and asks it to allocate through
-    // them.
-    (
-        "malloc_zone_register",
-        "registers a zone of guest function pointers the host would call as arm64",
-    ),
-    // `kern_return_t malloc_get_all_zones(task_t, memory_reader_t *,
-    // vm_address_t **, unsigned *)` - the same shape once removed.
-    (
-        "malloc_get_all_zones",
-        "walks another task's zones through a guest reader callback",
     ),
 ];
 

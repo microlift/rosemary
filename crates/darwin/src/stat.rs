@@ -38,6 +38,11 @@ pub struct Timespec {
 
 const _: () = {
     assert!(size_of::<Stat>() == 144);
+    // The two fields this host's own `struct stat` places somewhere else
+    // entirely, so a fill that reached the guest's buffer unconverted would
+    // pass every size check this block makes.
+    assert!(std::mem::offset_of!(Stat, mode) == 4);
+    assert!(std::mem::offset_of!(Stat, nlink) == 6);
     assert!(std::mem::offset_of!(Stat, ino) == 8);
     assert!(std::mem::offset_of!(Stat, rdev) == 24);
     assert!(std::mem::offset_of!(Stat, atime) == 32);
@@ -209,6 +214,118 @@ pub unsafe extern "C" fn fstat(fd: c_int, out: *mut Stat) -> c_int {
         unsafe { *out = from_host(&host) };
     }
     rc
+}
+
+/// Darwin's `AT_SYMLINK_FOLLOW` and `AT_EMPTY_PATH`.
+///
+/// `AT_EMPTY_PATH` is the one Darwin flag whose number carries across intact.
+/// `AT_SYMLINK_FOLLOW` is not, and the reason is worth having written down:
+/// this host defines a bit of that name too, at `0x400`, and the call it would
+/// be passed to answers `EINVAL` to it - a flag the host knows by name and
+/// refuses by value. What the guest asks for is what the host does anyway, so
+/// it becomes no bit at all; see [`fstatat_flags`].
+const DARWIN_AT_SYMLINK_FOLLOW: c_int = 0x40;
+const DARWIN_AT_EMPTY_PATH: c_int = 0x1000;
+
+/// `int fstatat(int dirfd, const char *path, struct stat *buf, int flags)`
+///
+/// Darwin's spelling of glibc's `fstatat`, and the name a guest's file I/O is
+/// linked against - Chromium's included, which is why this is here rather than
+/// left to the host's own.
+///
+/// Three things do not survive being passed through, and only the first is
+/// obvious. The structure is [`Stat`] and not the host's, which [`from_host`]
+/// converts field by field; the two are the *same* 144 bytes, so a copy that
+/// skipped the conversion would pass every size check there is and answer with
+/// the mode where the guest reads its link count. The flags are Darwin's words
+/// - see [`fstatat_flags`]. And `AT_FDCWD` is `-2` here against `-100` there,
+/// so a `dirfd` passed through unchanged makes every relative lookup fail with
+/// `EBADF`, an error a guest cannot tell from a descriptor of its own that it
+/// has already closed.
+///
+/// # Safety
+///
+/// `path` is a NUL-terminated string, or null with Darwin's `AT_EMPTY_PATH`;
+/// `out` is null or a writable Darwin `struct stat`; and `dirfd` is either a
+/// directory descriptor or Darwin's `AT_FDCWD`.
+pub unsafe extern "C" fn fstatat(
+    dirfd: c_int,
+    path: *const c_char,
+    out: *mut Stat,
+    flags: c_int,
+) -> c_int {
+    let Some(host_flags) = fstatat_flags(flags) else {
+        return -1;
+    };
+    let dirfd = match dirfd {
+        DARWIN_AT_FDCWD => libc::AT_FDCWD,
+        fd => fd,
+    };
+    let ask = |path| {
+        // SAFETY: a zeroed `struct stat` is what the host is asked to fill.
+        let mut host: libc::stat = unsafe { std::mem::zeroed() };
+        // SAFETY: the caller's obligation for `path` and `dirfd`, and `host` is
+        // a live local of the host's own layout, which is what this asks it to
+        // fill; the call itself is made as Darwin.
+        let rc =
+            unsafe { crate::call_as_darwin!(libc::fstatat(dirfd, path, &mut host, host_flags)) };
+        if rc == 0 && !out.is_null() {
+            // SAFETY: the caller states `out` is writable for a Darwin `stat`.
+            unsafe { *out = from_host(&host) };
+        }
+        (rc, rc == 0)
+    };
+    // `AT_EMPTY_PATH` asks about the descriptor and says nothing about the
+    // path, so the host is handed the one spelling of "no path" that reaches
+    // it: this host's `fstatat` answers `ENOENT` for a null path even with the
+    // flag set, where Darwin accepts the null one and a guest may pass it.
+    if flags & DARWIN_AT_EMPTY_PATH != 0 {
+        return ask(c"".as_ptr()).0;
+    }
+    if path.is_null() {
+        return ask(path).0;
+    }
+    // SAFETY: non-null, and a `const char *` is NUL-terminated by contract.
+    let host = prefix::ns::to_host_at(dirfd, unsafe { CStr::from_ptr(path) });
+    let (result, ok) = ask(host.as_ptr());
+    if ok || crate::errno::get() != libc::ENOENT {
+        return result;
+    }
+    let Some(found) = prefix::ns::fold_at(dirfd, &host) else {
+        return result;
+    };
+    ask(found.as_ptr()).0
+}
+
+/// Translate a Darwin `AT_` word for a [`fstatat`], refusing bits that cannot be
+/// honoured here.
+///
+/// `AT_SYMLINK_NOFOLLOW` is this host's own bit and crosses as itself.
+/// `AT_SYMLINK_FOLLOW` becomes no bit, which is neither a refusal nor a loss:
+/// following the link is what the host does unless a bit says otherwise, so
+/// the answer is the answer the guest asked for. `AT_EMPTY_PATH` crosses as
+/// itself, and is the one flag whose *effect* also has to be respelled, since
+/// the host will not take a null path for it - see [`fstatat`].
+///
+/// `AT_NO_AUTOMOUNT` is the fourth bit a Darwin caller may pass, and it is
+/// refused. There is no automounter on this host for it to hold back, and
+/// accepting it would be a claim about the host's mounts that nothing here
+/// backs - which is the same reason `open` refuses a flag it cannot honour
+/// rather than dropping it.
+fn fstatat_flags(flags: c_int) -> Option<c_int> {
+    let known = DARWIN_AT_SYMLINK_NOFOLLOW | DARWIN_AT_SYMLINK_FOLLOW | DARWIN_AT_EMPTY_PATH;
+    if flags & !known != 0 {
+        crate::errno::set(libc::EINVAL);
+        return None;
+    }
+    let mut host_flags = 0;
+    if flags & DARWIN_AT_SYMLINK_NOFOLLOW != 0 {
+        host_flags |= libc::AT_SYMLINK_NOFOLLOW;
+    }
+    if flags & DARWIN_AT_EMPTY_PATH != 0 {
+        host_flags |= libc::AT_EMPTY_PATH;
+    }
+    Some(host_flags)
 }
 
 /// `int access(const char *, int)`, with the same fallback.
@@ -526,8 +643,6 @@ fn say_unknown_open_flags(unknown: c_int) {
     eprintln!("rosetta3: open: no equivalent on this host for Darwin O_ flags {unknown:#x}");
 }
 
-/// Every name this module answers, in both spellings a Mach-O may import them
-/// by - see the module note on why `$INODE64` is not the same name.
 /// Darwin's `struct statfs`, which is 2168 bytes to this host's 120.
 ///
 /// The two do not merely differ in layout, they differ in *kind*: Darwin
@@ -652,11 +767,16 @@ pub unsafe extern "C" fn fstatfs(fd: c_int, out: *mut Statfs) -> c_int {
     result
 }
 
+// Every name this module answers, in both spellings a Mach-O may import them
+// by - see `crate::base_name` for why `$INODE64` is not a name of its own, and
+// `crate::divergent` for the list that stops the host's own being bound
+// instead where this crate has not answered it.
 exports::exports! {
     functions {
         "stat" | "stat$INODE64" => stat,
         "lstat" | "lstat$INODE64" => lstat,
         "fstat" | "fstat$INODE64" => fstat,
+        "fstatat" | "fstatat$INODE64" => fstatat,
         "statfs" | "statfs$INODE64" => statfs,
         "fstatfs" | "fstatfs$INODE64" => fstatfs,
         "access" => access,
@@ -726,6 +846,225 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         assert_eq!(rc, 0, "the lowercased path was not found");
         assert_eq!(out.size, 3);
+    }
+
+    /// The claim of the whole entry, end to end: the name a Mach-O imports
+    /// binds, with the underscore and with the variant suffix, and the refusal
+    /// list that used to name it does not get to deny what is answered here.
+    #[test]
+    fn a_published_fstatat_binds_and_is_not_refused() {
+        assert!(
+            crate::symbol("_fstatat").is_some(),
+            "_fstatat is published and unanswered"
+        );
+        assert!(crate::symbol("_fstatat$INODE64").is_some());
+        assert_eq!(crate::divergent::reason("fstatat"), None);
+    }
+
+    /// The structure, then: a guest reads it at Darwin's offsets, and this
+    /// host's own is the same 144 bytes rearranged. So the answer is checked as
+    /// *bytes* at the offsets Darwin's headers put the fields at, and not only
+    /// through the field names - a call that filled the guest's buffer with
+    /// this host's layout would satisfy every name-based assertion below and put
+    /// nothing where a guest reads its size.
+    #[test]
+    fn fstatat_agrees_with_stat_and_lands_its_fields_at_darwin_offsets() {
+        const WRITTEN: &[u8] = b"fstatat";
+        let at = std::env::temp_dir().join(format!("r3-fstatat-{}", std::process::id()));
+        let _ = std::fs::remove_file(&at);
+        std::fs::write(&at, WRITTEN).expect("a file");
+        let path = CString::new(at.to_str().expect("utf-8")).expect("no NUL");
+
+        let mut out = Stat::default();
+        // SAFETY: a NUL-terminated path, Darwin's AT_FDCWD, no flags, and a
+        // writable Darwin `struct stat`.
+        let rc = unsafe { fstatat(DARWIN_AT_FDCWD, path.as_ptr(), &mut out, 0) };
+        assert_eq!(rc, 0, "fstatat failed: {}", std::io::Error::last_os_error());
+
+        // The same question the way `stat` asks it, which is the whole claim:
+        // one structure, filled one way, whichever entry asks.
+        let mut expected = Stat::default();
+        // SAFETY: a NUL-terminated path and a writable Darwin `stat`.
+        let rc = unsafe { stat(path.as_ptr(), &mut expected) };
+        let _ = std::fs::remove_file(&at);
+        assert_eq!(rc, 0);
+        assert_eq!(out.ino, expected.ino);
+        assert_eq!(out.mode, expected.mode);
+        assert_eq!(out.size, expected.size);
+        assert_eq!(out.size, WRITTEN.len() as i64);
+
+        // And as the bytes a guest reading its own buffer would see. `Stat` has
+        // no padding and every field in it is an integer, so all 144 bytes of
+        // it are defined.
+        let bytes = unsafe {
+            std::slice::from_raw_parts((&out as *const Stat).cast::<u8>(), size_of::<Stat>())
+        };
+        let size = std::mem::offset_of!(Stat, size);
+        let mode = std::mem::offset_of!(Stat, mode);
+        assert_eq!(
+            i64::from_le_bytes(bytes[size..size + 8].try_into().expect("eight bytes")),
+            WRITTEN.len() as i64,
+            "the size is not where Darwin's headers put it"
+        );
+        assert_eq!(
+            u16::from_le_bytes(bytes[mode..mode + 2].try_into().expect("two bytes")) & 0o170000,
+            libc::S_IFREG as u16,
+            "the mode is not where Darwin's headers put it"
+        );
+        // Which the two layouts have nothing to do with: this host puts the mode
+        // and the size at offsets of its own, so a copy in either direction
+        // would have answered every assertion above.
+        assert_ne!(std::mem::offset_of!(libc::stat, st_mode), mode);
+        assert_ne!(std::mem::offset_of!(libc::stat, st_size), size);
+    }
+
+    /// The flag does the work: a link is not what it points at, and a caller
+    /// that asked about the link is asking about a different file.
+    #[test]
+    fn fstatat_without_symlink_nofollow_reports_the_link() {
+        let dir = std::env::temp_dir().join(format!("r3-fstatat-link-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("a directory");
+        let target = dir.join("target");
+        std::fs::write(&target, b"x").expect("a file");
+        std::os::unix::fs::symlink(&target, dir.join("link")).expect("a symlink");
+        let link = CString::new(dir.join("link").to_str().expect("utf-8")).expect("no NUL");
+
+        let mut of_link = Stat::default();
+        // SAFETY: a NUL-terminated path, Darwin's AT_FDCWD, and a flag from the
+        // set this entry answers.
+        let rc = unsafe {
+            fstatat(
+                DARWIN_AT_FDCWD,
+                link.as_ptr(),
+                &mut of_link,
+                DARWIN_AT_SYMLINK_NOFOLLOW,
+            )
+        };
+        assert_eq!(rc, 0, "{}", std::io::Error::last_os_error());
+        let mut of_target = Stat::default();
+        // SAFETY: as above, with no flag: the same call, following the link.
+        let rc = unsafe { fstatat(DARWIN_AT_FDCWD, link.as_ptr(), &mut of_target, 0) };
+        assert_eq!(rc, 0);
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert_eq!(
+            of_link.mode & 0o170000,
+            libc::S_IFLNK as u16,
+            "the link itself"
+        );
+        assert_eq!(
+            of_target.mode & 0o170000,
+            libc::S_IFREG as u16,
+            "what it points at"
+        );
+        assert_ne!(of_link.ino, of_target.ino, "two different files");
+    }
+
+    /// The spelling a guest cannot get right by passing the path it happens to
+    /// have: Darwin's `fstatat` takes a null path with `AT_EMPTY_PATH`, and
+    /// this host's takes an empty one.
+    #[test]
+    fn fstatat_with_empty_path_reports_the_descriptor_itself() {
+        const WRITTEN: &[u8] = b"descriptor";
+        let at = std::env::temp_dir().join(format!("r3-fstatat-empty-{}", std::process::id()));
+        let _ = std::fs::remove_file(&at);
+        std::fs::write(&at, WRITTEN).expect("a file");
+        let path = CString::new(at.to_str().expect("utf-8")).expect("no NUL");
+        // SAFETY: a NUL-terminated path and Darwin scalar arguments.
+        let fd = unsafe { open(path.as_ptr(), crate::fcntl::oflag::O_RDONLY, 0) };
+        assert!(fd >= 0, "open failed: {}", std::io::Error::last_os_error());
+
+        let mut by_descriptor = Stat::default();
+        // SAFETY: a live descriptor, a null path with the one flag that allows
+        // it, and a writable Darwin `struct stat`.
+        let rc = unsafe {
+            fstatat(
+                fd,
+                std::ptr::null(),
+                &mut by_descriptor,
+                DARWIN_AT_EMPTY_PATH,
+            )
+        };
+        let mut by_fstat = Stat::default();
+        // SAFETY: a live descriptor and a writable Darwin `struct stat`.
+        let answered = unsafe { fstat(fd, &mut by_fstat) };
+        // SAFETY: a descriptor this test just opened.
+        unsafe { libc::close(fd) };
+        let _ = std::fs::remove_file(&at);
+        assert_eq!(
+            rc,
+            0,
+            "AT_EMPTY_PATH failed: {}",
+            std::io::Error::last_os_error()
+        );
+        assert_eq!(answered, 0);
+
+        assert_eq!(by_descriptor.ino, by_fstat.ino);
+        assert_eq!(by_descriptor.size, WRITTEN.len() as i64);
+    }
+
+    #[test]
+    fn fstatat_refuses_a_flag_the_host_cannot_honor() {
+        // Darwin's AT_NO_AUTOMOUNT asks an automounter to hold an unmount back.
+        const AT_NO_AUTOMOUNT: c_int = 0x0080;
+        let path = c"/dev/null";
+        crate::errno::set(0);
+        // SAFETY: a static NUL-terminated path, Darwin's AT_FDCWD, a flag, and a
+        // null `struct stat` the call must not write through.
+        let rc = unsafe {
+            fstatat(
+                DARWIN_AT_FDCWD,
+                path.as_ptr(),
+                std::ptr::null_mut(),
+                AT_NO_AUTOMOUNT,
+            )
+        };
+        assert_eq!(rc, -1);
+        assert_eq!(crate::errno::get(), libc::EINVAL);
+
+        // AT_SYMLINK_FOLLOW is the bit that is *not* refused: it asks for what
+        // this host does anyway, so it needs no bit of its own to get it.
+        // SAFETY: as above.
+        let rc = unsafe {
+            fstatat(
+                DARWIN_AT_FDCWD,
+                path.as_ptr(),
+                std::ptr::null_mut(),
+                DARWIN_AT_SYMLINK_FOLLOW,
+            )
+        };
+        assert_eq!(rc, 0, "{}", std::io::Error::last_os_error());
+        crate::errno::set(0);
+    }
+
+    /// And the case-insensitive fallback stays relative to the descriptor, as
+    /// [`openat`]'s does.
+    #[test]
+    fn fstatat_case_folds_relative_to_its_descriptor() {
+        let dir = std::env::temp_dir().join(format!("r3-fstatat-case-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("Contents")).expect("a directory");
+        std::fs::write(dir.join("Contents").join("Game.ios"), b"x").expect("a file");
+        let directory = CString::new(dir.to_str().expect("utf-8")).expect("no NUL");
+        // SAFETY: a NUL-terminated directory path and Darwin scalar arguments.
+        let dirfd = unsafe { open(directory.as_ptr(), crate::fcntl::oflag::O_RDONLY, 0) };
+        assert!(dirfd >= 0);
+
+        let mut out = Stat::default();
+        // SAFETY: a live directory descriptor, a NUL-terminated relative path,
+        // and no flags.
+        let rc = unsafe { fstatat(dirfd, c"contents/game.ios".as_ptr(), &mut out, 0) };
+        // SAFETY: a descriptor this test just opened.
+        unsafe { libc::close(dirfd) };
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(
+            rc,
+            0,
+            "the lowercased path was not found: {}",
+            std::io::Error::last_os_error()
+        );
+        assert_eq!(out.size, 1);
     }
 
     #[test]

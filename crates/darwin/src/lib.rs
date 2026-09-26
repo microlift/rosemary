@@ -96,6 +96,7 @@ pub mod termios;
 pub mod tls;
 pub mod translation;
 pub mod ulock;
+pub mod unfair_lock;
 pub mod uuid;
 #[cfg(not(target_os = "macos"))]
 pub mod vis;
@@ -310,6 +311,7 @@ static MODULES: &[exports::Module] = &[
     #[cfg(not(target_os = "macos"))]
     ioctl::MODULE,
     ulock::MODULE,
+    unfair_lock::MODULE,
     spawn::MODULE,
     dispatch::MODULE,
     data::MODULE,

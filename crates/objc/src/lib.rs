@@ -4,6 +4,7 @@ pub mod allocator;
 pub mod api;
 pub mod arc;
 pub mod block;
+pub mod cache;
 pub mod census;
 pub mod class;
 pub mod debug;
@@ -151,16 +152,22 @@ exports::exports! {
 /// One, and it is the one the system's libobjc owns too.
 pub const ROOT_CLASSES: &[&str] = &["NSObject"];
 
-/// The class objects this runtime exports as *data*.
+/// The words a guest's class structures bind as *data*, Mach-O spelling and
+/// all.
 ///
-/// A guest's `Greeter : NSObject` binds `_OBJC_CLASS_$_NSObject` and stores the
-/// address it gets as its own superclass pointer, so the symbol has to be the
-/// class itself and not a function that returns it.
+/// Two kinds, and they are bound by different machinery for different reasons.
 ///
-/// Names as a Mach-O spells them, leading underscore and all.
+/// A class object: a guest's `Greeter : NSObject` binds `_OBJC_CLASS_$_NSObject`
+/// and stores the address it gets as its own superclass pointer, so the symbol
+/// has to be the class itself and not a function that returns it.
+///
+/// The empty cache: the third word of every `objc_class` the compiler emits, for
+/// every class in the image, and the runtime *writes* into it. See
+/// [`cache::empty_cache`] for why one page for the whole process is the answer
+/// and why a nil check is not.
 pub fn class_data() -> Vec<(String, u64)> {
     bootstrap();
-    let mut data = Vec::new();
+    let mut data = vec![(cache::EMPTY_CACHE.to_string(), cache::empty_cache())];
     for name in ROOT_CLASSES {
         let Some(class) = std::ffi::CString::new(*name)
             .ok()
@@ -196,6 +203,26 @@ mod tests {
         assert!(std::ptr::eq(meta.superclass().unwrap(), nsobject));
         // And its own `isa` is itself, which is what stops the walk.
         assert!(std::ptr::eq(meta.metaclass(), meta));
+    }
+
+    /// The cache is published under the name a Mach-O spells it, and to the page
+    /// [`cache::empty_cache`] hands out rather than to a second mapping of this
+    /// module's own.
+    ///
+    /// The name is the fragile half. There are three underscores' worth of
+    /// spelling here - `objc_empty_cache` in C, `__objc_empty_cache` in a
+    /// Mach-O - and getting either wrong produces a symbol nothing imports,
+    /// which looks exactly like the bug this fixed.
+    #[test]
+    fn the_empty_cache_is_published_as_data_under_its_mach_o_name() {
+        let data = class_data();
+        let (name, at) = data
+            .iter()
+            .find(|(name, _)| name == cache::EMPTY_CACHE)
+            .expect("the empty cache is data this runtime publishes");
+        assert_eq!(name, "__objc_empty_cache", "verbatim, underscore and all");
+        assert_eq!(*at, cache::empty_cache(), "one page, not one per ask");
+        assert_ne!(*at, 0, "an unbound data import is a store through nil");
     }
 }
 

@@ -134,6 +134,29 @@ pub unsafe fn array<'a>(object: CFTypeRef) -> Option<&'a mut ArrayContents> {
 pub struct SetContents {
     pub values: Vec<CFTypeRef>,
     pub policy: Policy,
+    /// As [`ArrayContents::mutable`]: `__NSCFSet` has to descend from
+    /// `NSMutableSet` for a guest's `isKindOfClass:` to work, so whether this
+    /// particular set may be changed is a field and not a class.
+    pub mutable: bool,
+}
+
+impl SetContents {
+    /// Add `value` unless the set already holds an equal one.
+    ///
+    /// The duplicate check is `CFSetAddValue`'s whole contract - a set has no
+    /// repeats and adding one is not an error - and it is by whatever the set's
+    /// own callbacks call equality, so a set of integers and a set of strings each
+    /// get the right answer.
+    pub fn add(&mut self, value: CFTypeRef) {
+        if self
+            .values
+            .iter()
+            .any(|held| self.policy.equal(*held, value))
+        {
+            return;
+        }
+        self.values.push(self.policy.retain(value));
+    }
 }
 
 impl Drop for SetContents {
@@ -157,17 +180,25 @@ pub fn set_class() -> &'static Class {
 }
 
 pub fn new_set(values: &[CFTypeRef], policy: Policy) -> CFTypeRef {
-    let mut unique = Vec::with_capacity(values.len());
+    let mut contents = SetContents {
+        values: Vec::with_capacity(values.len()),
+        policy,
+        mutable: false,
+    };
     for value in values {
-        if !unique.iter().any(|v| policy.equal(*v, *value)) {
-            unique.push(policy.retain(*value));
-        }
+        contents.add(*value);
     }
+    make(set_class(), contents)
+}
+
+/// An empty set that may be added to, as `CFSetCreateMutable` makes one.
+pub fn new_mutable_set(policy: Policy) -> CFTypeRef {
     make(
         set_class(),
         SetContents {
-            values: unique,
+            values: Vec::new(),
             policy,
+            mutable: true,
         },
     )
 }

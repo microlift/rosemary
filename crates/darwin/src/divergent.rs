@@ -33,6 +33,12 @@ pub const NAMES: &[(&str, &str)] = &[
     ("stat", STAT),
     ("fstat", STAT),
     ("lstat", STAT),
+    // Kept listed although `crate::stat` now answers `fstatat`: the entry is what
+    // stops the *host's* own being bound instead, and `reason` carves an
+    // implemented name back out. It still has one live use - `deny_in` refuses
+    // `_fstatat` in the host provider, so a `dlopen`ed host dylib importing it is
+    // turned away rather than handed a glibc `struct stat` a guest would read at
+    // Darwin's offsets.
     ("fstatat", STAT),
     ("statfs", STAT),
     ("fstatfs", STAT),

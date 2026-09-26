@@ -30,10 +30,43 @@ pub fn type_id(class: &'static Class) -> CFTypeID {
 static TYPES: std::sync::Mutex<Vec<usize>> = std::sync::Mutex::new(Vec::new());
 
 fn note_type(class: &'static Class) {
-    TYPES
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .push(objc::class::ptr(class) as usize);
+    let mut types = TYPES.lock().unwrap_or_else(|e| e.into_inner());
+    let id = objc::class::ptr(class) as usize;
+    // Idempotent, because a `...GetTypeID` a guest can call in a loop would
+    // otherwise grow this by one entry per call. `type_id_of` only ever asks
+    // whether an id is present, so a repeated note is a leak with no other
+    // effect - but it is a leak in a function a program may call at will.
+    if types.contains(&id) {
+        return;
+    }
+    types.push(id);
+}
+
+/// The class of a CoreFoundation type whose class is **Foundation's**, and which
+/// is therefore marked as a CoreFoundation type on the way out.
+///
+/// `NSNull` and `NSError` are the two such types: this crate publishes
+/// `CFNullGetTypeID` and `CFErrorGetTypeID` for them while Foundation owns the
+/// objects, the way Apple's CoreFoundation owns neither and toll-free bridges to
+/// both. Marking the class is what makes the two answers agree - `CFGetTypeID` of
+/// such an object has to equal the `...GetTypeID` that names its type, and without
+/// the note it answers zero, which is also what it answers for every object that
+/// is not a CoreFoundation type at all.
+///
+/// Where Foundation has not registered the class, it is registered here so that a
+/// process linking only this crate still has a nonzero, stable type ID for a type
+/// it has no instances of. `size` is the instance size Foundation's own
+/// registration uses, so a process that *does* have Foundation gets that class
+/// and this registration has cost nothing: [`register`] hands back a name that is
+/// already taken.
+pub fn bridged_class(name: &std::ffi::CStr, size: usize) -> &'static Class {
+    let class = match objc::class::lookup(name) {
+        Some(class) => class,
+        None => register(name, None, size, true),
+    };
+    // The class may be Foundation's, in which case the `is_type` above never ran.
+    note_type(class);
+    class
 }
 
 /// The `CFTypeID` an object of `class` reports: the nearest ancestor that is a
@@ -99,7 +132,7 @@ pub fn register(
 ) -> &'static Class {
     objc::bootstrap();
     if let Some(existing) = objc::class::lookup(name) {
-        return existing;
+        return noted(existing, is_type);
     }
     let superclass = superclass.unwrap_or_else(|| {
         objc::class::lookup(c"NSObject").expect("NSObject is the runtime's own")
@@ -108,14 +141,29 @@ pub fn register(
     // for. `class_addIvar` is not used: the fields are this crate's, and naming
     // them to the runtime would only invite something to move them.
     let extra = instance_size.saturating_sub(superclass.instance_size());
-    let class = match objc::class::allocate_pair(Some(superclass), name, extra) {
-        Some(class) => class,
+    match objc::class::allocate_pair(Some(superclass), name, extra) {
+        Some(class) => {
+            objc::class::register_pair(class);
+            noted(class, is_type)
+        }
         // Another thread registered this name between the lookup above and
         // here. Its class is as good as this one would have been, and two
         // classes of one name is the outcome that must not happen.
-        None => return objc::class::lookup(name).expect("taken by another thread"),
-    };
-    objc::class::register_pair(class);
+        //
+        // The `noted` is not decoration: that other thread may not have got as
+        // far as `note_type` yet, and returning its class un-noted makes
+        // `type_id_of` answer zero for the type - so a `CFGetTypeID` racing a
+        // `...GetTypeID` gets zero for an object that *is* that type, and the two
+        // disagree about an object neither of them is wrong about.
+        None => noted(
+            objc::class::lookup(name).expect("taken by another thread"),
+            is_type,
+        ),
+    }
+}
+
+/// `class`, marked as a CoreFoundation type when `is_type` says it is one.
+fn noted(class: &'static Class, is_type: bool) -> &'static Class {
     if is_type {
         note_type(class);
     }

@@ -230,7 +230,8 @@ struct Image {
     used: usize,
 }
 
-/// Where the guest's images landed. Filled once, before any guest code runs.
+/// Where the guest's images landed: the program's before any guest code runs,
+/// and each `dlopen`ed image as it is linked.
 static IMAGES: Mutex<Vec<Image>> = Mutex::new(Vec::new());
 
 /// One import nothing satisfied, flattened so a handler can search it.
@@ -255,18 +256,36 @@ static UNBOUND: Mutex<Vec<Unbound>> = Mutex::new(Vec::new());
 /// register on AAPCS64, the word the call pushed on x86-64 - and the call
 /// instruction immediately before it names its own target. That is enough to
 /// recover the stub, and this table turns the stub back into a name.
+///
+/// Called once per link - the program's, then every `dlopen` - and each call
+/// *adds* to the table. Replacing it instead is what made a call through one of
+/// Chromium Framework's unbound stubs unnameable: the Framework's list
+/// overwrote the launcher's, and the reverse would have been as bad.
 pub fn note_unbound(entries: &[(&str, &machish::report::MissingSymbol)]) {
     let mut unbound = UNBOUND.lock().unwrap_or_else(|e| e.into_inner());
-    unbound.clear();
-    for (_, m) in entries {
-        let Some(stub) = m.stub_va else { continue };
-        let bytes = m.symbol.as_bytes();
-        let used = bytes.len().min(NAME);
-        let mut name = [0u8; NAME];
-        name[..used].copy_from_slice(&bytes[..used]);
-        unbound.push(Unbound { stub, name, used });
+    merge_unbound(
+        &mut unbound,
+        entries.iter().filter_map(|(_, m)| {
+            let stub = m.stub_va?;
+            let bytes = m.symbol.as_bytes();
+            let used = bytes.len().min(NAME);
+            let mut name = [0u8; NAME];
+            name[..used].copy_from_slice(&bytes[..used]);
+            Some(Unbound { stub, name, used })
+        }),
+    );
+}
+
+/// Add `fresh` to `table`, keeping it sorted by stub for the handler's binary
+/// search. A stub already present is replaced: the same address in a later link
+/// is a later image mapped where an earlier one was.
+fn merge_unbound(table: &mut Vec<Unbound>, fresh: impl Iterator<Item = Unbound>) {
+    for entry in fresh {
+        match table.binary_search_by_key(&entry.stub, |u| u.stub) {
+            Ok(i) => table[i] = entry,
+            Err(i) => table.insert(i, entry),
+        }
     }
-    unbound.sort_by_key(|u| u.stub);
 }
 
 /// Record the guest's image map, so a fault can name a guest address rather
@@ -275,29 +294,48 @@ pub fn note_unbound(entries: &[(&str, &machish::report::MissingSymbol)]) {
 /// Without this the report's guest range is a number that needs a second run
 /// with `ROSETTA3_TRACE_VM` to interpret - and the whole reason this module
 /// exists is that the interesting crash is the one that does not come back.
+///
+/// Called for the program's own link and again for every `dlopen`, and each
+/// call adds to the map. A `dlopen`ed image missing from it is not a cosmetic
+/// gap: [`say_unbound_call`] only decodes a return address inside a known
+/// image, so a call through an unbound stub in a framework the launcher
+/// `dlopen`s - Chromium Framework, which is all of Chromium - was reported as
+/// "in no guest image" with no symbol, and cost a debugger session to name.
 pub fn note_images(report: &machish::report::LinkReport) {
     let mut images = IMAGES.lock().unwrap_or_else(|e| e.into_inner());
-    images.clear();
-    for image in &report.images {
-        let end = image
-            .segments
-            .iter()
-            .filter(|s| s.vmsize != 0)
-            .map(|s| s.vmaddr.wrapping_add(s.vmsize))
-            .max();
-        let Some(end) = end else { continue };
-        let leaf = image.name.rsplit('/').next().unwrap_or(&image.name);
-        let bytes = leaf.as_bytes();
-        let used = bytes.len().min(NAME);
-        let mut name = [0u8; NAME];
-        name[..used].copy_from_slice(&bytes[..used]);
-        images.push(Image {
-            range: (image.base, end),
-            name,
-            used,
-        });
+    merge_images(
+        &mut images,
+        report.images.iter().filter_map(|image| {
+            let end = image
+                .segments
+                .iter()
+                .filter(|s| s.vmsize != 0)
+                .map(|s| s.vmaddr.wrapping_add(s.vmsize))
+                .max()?;
+            let leaf = image.name.rsplit('/').next().unwrap_or(&image.name);
+            let bytes = leaf.as_bytes();
+            let used = bytes.len().min(NAME);
+            let mut name = [0u8; NAME];
+            name[..used].copy_from_slice(&bytes[..used]);
+            Some(Image {
+                range: (image.base, end),
+                name,
+                used,
+            })
+        }),
+    );
+}
+
+/// Add `fresh` to `table`, sorted by start. An image overlapping one already
+/// recorded replaces it: two live images cannot share an address, so the older
+/// entry is one that has since been unmapped.
+fn merge_images(table: &mut Vec<Image>, fresh: impl Iterator<Item = Image>) {
+    for image in fresh {
+        let (start, end) = image.range;
+        table.retain(|i| i.range.1 <= start || end <= i.range.0);
+        let at = table.partition_point(|i| i.range.0 < start);
+        table.insert(at, image);
     }
-    images.sort_by_key(|i| i.range.0);
 }
 
 /// Install the reporter for the faults a translation can raise.
@@ -1333,6 +1371,69 @@ impl Buffer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn named(text: &str) -> ([u8; NAME], usize) {
+        let mut name = [0u8; NAME];
+        name[..text.len()].copy_from_slice(text.as_bytes());
+        (name, text.len())
+    }
+
+    fn image(start: u64, end: u64, text: &str) -> Image {
+        let (name, used) = named(text);
+        Image { range: (start, end), name, used }
+    }
+
+    fn stub(at: u64, text: &str) -> Unbound {
+        let (name, used) = named(text);
+        Unbound { stub: at, name, used }
+    }
+
+    #[test]
+    fn a_dlopened_image_joins_the_program_rather_than_replacing_it() {
+        // The launcher, then the framework it dlopens - the shape of every
+        // Chromium run. Both must stay nameable.
+        let mut table = Vec::new();
+        merge_images(&mut table, [image(0x1_0000_0000, 0x1_0003_0000, "Chromium")].into_iter());
+        merge_images(
+            &mut table,
+            [image(0x7fe9_42e8_4000, 0x7fe9_50f0_0000, "Chromium Framework")].into_iter(),
+        );
+        let names: Vec<&[u8]> = table.iter().map(|i| &i.name[..i.used]).collect();
+        assert_eq!(names, [&b"Chromium"[..], &b"Chromium Framework"[..]]);
+
+        // An image mapped over an old one's range supersedes it.
+        merge_images(&mut table, [image(0x1_0001_0000, 0x1_0002_0000, "later")].into_iter());
+        let names: Vec<&[u8]> = table.iter().map(|i| &i.name[..i.used]).collect();
+        assert_eq!(names, [&b"later"[..], &b"Chromium Framework"[..]]);
+    }
+
+    #[test]
+    fn every_links_unbound_stubs_stay_findable_and_sorted() {
+        let mut table = Vec::new();
+        merge_unbound(&mut table, [stub(0x1_0002_5a3e, "___cxa_atexit")].into_iter());
+        merge_unbound(
+            &mut table,
+            [
+                stub(0x7fe9_4fb2_441a, "_os_unfair_lock_trylock"),
+                stub(0x7fe9_4fb2_4414, "_os_unfair_lock_unlock"),
+            ]
+            .into_iter(),
+        );
+        fn find(table: &[Unbound], at: u64) -> Option<&[u8]> {
+            table
+                .binary_search_by_key(&at, |u| u.stub)
+                .ok()
+                .map(|i| &table[i].name[..table[i].used])
+        }
+        assert_eq!(find(&table, 0x1_0002_5a3e), Some(&b"___cxa_atexit"[..]));
+        assert_eq!(find(&table, 0x7fe9_4fb2_441a), Some(&b"_os_unfair_lock_trylock"[..]));
+        assert_eq!(find(&table, 0x7fe9_4fb2_4414), Some(&b"_os_unfair_lock_unlock"[..]));
+
+        // The same stub from a later link replaces, rather than duplicates.
+        merge_unbound(&mut table, [stub(0x1_0002_5a3e, "_other")].into_iter());
+        assert_eq!(table.len(), 3);
+        assert_eq!(find(&table, 0x1_0002_5a3e), Some(&b"_other"[..]));
+    }
 
     #[test]
     fn hex_has_no_leading_zeros_and_a_zero_is_a_zero() {

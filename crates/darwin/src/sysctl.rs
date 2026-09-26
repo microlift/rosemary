@@ -487,6 +487,13 @@ pub fn set_runs_host_instructions(native: bool) {
     RUNS_HOST_INSTRUCTIONS.store(native, Ordering::Release);
 }
 
+/// Whether the program executes this CPU's instructions directly - which is
+/// what makes a guest function pointer something host code can call.
+#[cfg(not(target_os = "macos"))]
+pub fn runs_host_instructions() -> bool {
+    RUNS_HOST_INSTRUCTIONS.load(Ordering::Acquire)
+}
+
 #[cfg(not(target_os = "macos"))]
 fn host_has(feature: &str) -> bool {
     if !RUNS_HOST_INSTRUCTIONS.load(Ordering::Acquire) {

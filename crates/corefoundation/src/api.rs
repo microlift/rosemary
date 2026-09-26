@@ -6,6 +6,7 @@ use std::ffi::{c_char, c_void};
 use objc::object::Id;
 
 use crate::base::{CFIndex, CFTypeID, CFTypeRef};
+use crate::send;
 use crate::string;
 
 /// `Boolean`, which is one byte.
@@ -884,8 +885,8 @@ pub unsafe extern "C" fn CFStringCompare(a: CFTypeRef, b: CFTypeRef, options: u6
 
 #[repr(C)]
 pub struct CFRange {
-    location: CFIndex,
-    length: CFIndex,
+    pub location: CFIndex,
+    pub length: CFIndex,
 }
 
 /// Find a string inside a caller-selected UTF-16 range.
@@ -1105,8 +1106,337 @@ pub unsafe extern "C" fn CFArrayGetValueAtIndex(array: CFTypeRef, index: CFIndex
 
 //
 
+/// `Boolean CFStringHasPrefix(CFStringRef string, CFStringRef prefix)`
+///
+/// A plain character comparison, in the units `CFStringGetLength` counts - which
+/// is the only question a caller asking "does this start with that" can be
+/// asking, whichever of the two representations either string happens to keep.
+///
+/// A null on either side is false rather than a fault. CoreFoundation traps, and
+/// a guest that got here has a bug; a `false` it can branch on is more use than
+/// a crash with no mention of either string in the frame.
+pub unsafe extern "C" fn CFStringHasPrefix(string: CFTypeRef, prefix: CFTypeRef) -> Boolean {
+    // SAFETY: two `CFStringRef`s or null.
+    let (Some(string), Some(prefix)) = (unsafe { string::as_string(string) }, unsafe {
+        string::as_string(prefix)
+    }) else {
+        return 0;
+    };
+    let (string, prefix) = (string.units(), prefix.units());
+    u8::from(string.len() >= prefix.len() && string[..prefix.len()] == prefix[..])
+}
+
+/// `Boolean CFStringHasSuffix(CFStringRef string, CFStringRef suffix)`
+///
+/// [`CFStringHasPrefix`], from the other end.
+pub unsafe extern "C" fn CFStringHasSuffix(string: CFTypeRef, suffix: CFTypeRef) -> Boolean {
+    // SAFETY: two `CFStringRef`s or null.
+    let (Some(string), Some(suffix)) = (unsafe { string::as_string(string) }, unsafe {
+        string::as_string(suffix)
+    }) else {
+        return 0;
+    };
+    let (string, suffix) = (string.units(), suffix.units());
+    u8::from(string.len() >= suffix.len() && string[string.len() - suffix.len()..] == suffix[..])
+}
+
+/// `CFRange CFStringGetRangeOfCharacterClusterAtIndex(CFStringRef theString,
+/// CFIndex theIndex, CFRange *range)`
+///
+/// The range is written through `range` as well as returned, because the
+/// returned `CFRange` is a sixteen-byte aggregate that no signature in this
+/// tree can place - see `crates/rosetta3/src/abi/table.rs` - whereas the out
+/// parameter is a plain pointer and always carries the answer. A caller that
+/// passes null gets the documented out-of-bounds range and nothing else, which
+/// is Apple's behaviour for a string that has no character at the index.
+///
+/// ## What a cluster is
+///
+/// A *composed character sequence*: one base character followed by the marks
+/// that combine with it, so `e` and a following U+0301 are one character that
+/// happens to be two units. Which is the question a caller asking this has: it
+/// is measuring where a *character* begins, and counting code units would put
+/// the boundary in the middle of one.
+///
+/// The cases that decide it, and no others:
+///
+/// - a surrogate pair, which is one character in two units;
+/// - a combining mark, a variation selector, or a zero-width joiner, which
+///   attach to whatever precedes them - and, after a joiner, to the character
+///   that joiner brought in, which is how a family emoji stays one cluster;
+/// - a pair of regional indicators, which together are one flag and whose
+///   single half is its own cluster.
+///
+/// An index outside the string is the empty range, which is what the header
+/// documents. `theIndex == length` counts as outside: CoreFoundation's real
+/// answer there is the last cluster, but the header says zero and every caller
+/// in this tree's guest space guards the case rather than relying on it.
+pub unsafe extern "C" fn CFStringGetRangeOfCharacterClusterAtIndex(
+    the_string: CFTypeRef,
+    the_index: CFIndex,
+    range: *mut CFRange,
+) -> CFRange {
+    /// The empty range, for an index that is not in the string.
+    const NOTHING: CFRange = CFRange {
+        location: 0,
+        length: 0,
+    };
+    // "Containing" is the whole of the contract, so the index may be *inside* a
+    // character rather than at its start: `e` followed by a combining acute is one
+    // character, and asking about the accent has to give the `e` too.
+    let found = match unsafe { string::as_string(the_string) } {
+        // SAFETY: a `CFStringRef` or null.
+        Some(string) => {
+            let units = string.units();
+            match usize::try_from(the_index)
+                .ok()
+                .filter(|at| *at < units.len())
+            {
+                Some(index) => {
+                    let start = character_start(&units, index);
+                    CFRange {
+                        location: start as CFIndex,
+                        length: character_length(&units, start) as CFIndex,
+                    }
+                }
+                None => NOTHING,
+            }
+        }
+        None => NOTHING,
+    };
+    // Written on every path, including the out-of-bounds one: the header says the
+    // range is stored there when the parameter is non-null, and a caller that
+    // passed a buffer and reads it back must not be left holding whatever was in
+    // it.
+    if !range.is_null() {
+        // SAFETY: the caller supplied writable storage for one `CFRange`.
+        unsafe { *range = CFRange { ..found } };
+    }
+    found
+}
+
+/// The index at which the character covering `at` begins.
+///
+/// Walks back over the units that attach to what came before, and over a joiner -
+/// which means the character that joiner brought in, so an index in the middle
+/// of an emoji sequence still gets the whole sequence.
+fn character_start(units: &[u16], at: usize) -> usize {
+    let mut start = at;
+    while start > 0
+        && (continuation_length(units, start) != 0
+            || units
+                .get(start - 1)
+                .copied()
+                .map(u32::from)
+                .and_then(char::from_u32)
+                .is_some_and(is_joiner))
+    {
+        start -= 1;
+    }
+    // A flag is a *pair* of regional indicators, and which of the two an index
+    // lands on decides whether it is inside a character or at the start of one.
+    // An odd number of them before it means it is the second half of a pair.
+    if units.get(start).copied().is_some_and(is_regional_indicator) {
+        let before = (0..start)
+            .rev()
+            .take_while(|i| is_regional_indicator(units[*i]))
+            .count();
+        start -= usize::from(before % 2 == 1);
+    }
+    start
+}
+
+/// How many units the character beginning at `start` occupies.
+///
+/// `start` must be a character boundary: the answer for a unit in the middle of
+/// one is meaningless, which is why the caller asks
+/// [`character_start`] first.
+fn character_length(units: &[u16], start: usize) -> usize {
+    if start >= units.len() {
+        return 0;
+    }
+    // Two units for a surrogate pair - a character above the BMP - and, for a
+    // regional indicator, two again, because a flag is a pair of them.
+    let mut end = start
+        + 1
+        + usize::from(
+            is_high_surrogate(units[start])
+                && units.get(start + 1).copied().is_some_and(is_low_surrogate),
+        );
+    if end == start + 1
+        && is_regional_indicator(units[start])
+        && units
+            .get(start + 1)
+            .copied()
+            .is_some_and(is_regional_indicator)
+    {
+        end += 1;
+    }
+    // Then everything that attaches to the character: marks, variation selectors,
+    // and a joiner with whatever it joined in.
+    while end < units.len() {
+        match continuation_length(units, end) {
+            0 => break,
+            taken => end += taken,
+        }
+    }
+    end - start
+}
+
+/// How many units at `at` belong to the character that came *before* `at`, or
+/// zero if `at` begins a character of its own.
+///
+/// This is the whole of the cluster rule. It is asked twice per unit of the
+/// string at most - once walking back, once walking forward - so the answer is
+/// written as ranges over the code space rather than a table of every combining
+/// mark Unicode has ever added: the blocks below have not moved in the twenty
+/// years the callers in this tree's guest space have existed, and the emoji
+/// modifier range is the one that has been added to most recently.
+fn continuation_length(units: &[u16], at: usize) -> usize {
+    let Some(unit) = units.get(at).copied() else {
+        return 0;
+    };
+    // The low half of a surrogate pair belongs to its high half, so it continues
+    // that character. A low surrogate with no high surrogate before it is a unit
+    // of text in its own right - a malformed string, which this runtime does not
+    // refuse to answer about - and begins a character.
+    if is_low_surrogate(unit) {
+        return usize::from(
+            at.checked_sub(1)
+                .and_then(|i| units.get(i))
+                .copied()
+                .is_some_and(is_high_surrogate),
+        );
+    }
+    let Some(character) = char::from_u32(u32::from(unit)) else {
+        return 0;
+    };
+    if is_combining(character) || matches!(character, '\u{FE00}'..='\u{FE0F}') {
+        return 1;
+    }
+    // A joiner joins what comes after it, so it continues a character only when
+    // something does - and then it brings that something in with it.
+    if is_joiner(character) {
+        return match units.get(at + 1) {
+            None => 0,
+            Some(_) => 1 + character_length(units, at + 1),
+        };
+    }
+    0
+}
+
+/// Whether `c` is a mark: non-spacing, enclosing or spacing, or an emoji
+/// modifier.
+///
+/// A base glyph and one of these are one character, which is the only reason any
+/// of this exists.
+fn is_combining(c: char) -> bool {
+    matches!(c as u32,
+        0x0300..=0x036F      // combining diacritical marks
+        | 0x0483..=0x0489    // Cyrillic
+        | 0x0591..=0x05BD    // Hebrew
+        | 0x0610..=0x061A    // Arabic
+        | 0x064B..=0x065F    // Arabic
+        | 0x0670            // Arabic superscript alef
+        | 0x06D6..=0x06DC    // Arabic
+        | 0x0E31            // Thai
+        | 0x0E34..=0x0E3A    // Thai
+        | 0x0E47..=0x0E4E    // Thai
+        | 0x1AB0..=0x1AFF    // combining marks extended
+        | 0x1DC0..=0x1DFF    // combining marks supplement
+        | 0x20D0..=0x20F0    // combining marks for symbols
+        | 0xFE20..=0xFE2F    // combining half marks
+        | 0x1F3FB..=0x1F3FF  // emoji modifiers: skin tones
+    )
+}
+
+/// A zero-width joiner, or one of the object-replacement controls Apple's text
+/// system puts in the middle of an emoji sequence.
+fn is_joiner(c: char) -> bool {
+    c == '\u{200D}' || matches!(c, '\u{FFF9}'..='\u{FFFB}')
+}
+
+fn is_high_surrogate(unit: u16) -> bool {
+    (0xD800..0xDC00).contains(&unit)
+}
+
+fn is_low_surrogate(unit: u16) -> bool {
+    (0xDC00..0xE000).contains(&unit)
+}
+
+fn is_regional_indicator(unit: u16) -> bool {
+    // U+1F1E6..=U+1F1FF, which is above the BMP and so only reachable as a
+    // surrogate pair's halves.
+    (0xD83C..0xD83E).contains(&unit)
+}
+
+//
+
 pub unsafe extern "C" fn CFSetGetTypeID() -> CFTypeID {
     crate::base::type_id_of(collections::set_class())
+}
+
+/// `CFSetCallBacks`, which is [`callbacks::KeyCallBacks`] member for member.
+///
+/// Named here so the signatures below say what the guest actually passed. A set
+/// needs the same callbacks a dictionary needs *as keys* - including the hash,
+/// which is why [`Policy::from_key`] is the reader - because a set's elements are
+/// exactly a dictionary's keys without the values.
+pub type SetCallBacks = KeyCallBacks;
+
+/// `CFSetRef CFSetCreate(CFAllocatorRef, CFIndex numValues, const void **values,
+/// const CFSetCallBacks *callbacks)`
+///
+/// The values are retained as the callbacks say, and a value equal to one the
+/// set already holds is *not* added twice: a set has no repeats, and the second
+/// add is how a caller discovers that.
+pub unsafe extern "C" fn CFSetCreate(
+    _allocator: CFAllocatorRef,
+    num_values: CFIndex,
+    values: *const CFTypeRef,
+    callbacks: *const SetCallBacks,
+) -> CFTypeRef {
+    if num_values < 0 || (values.is_null() && num_values > 0) {
+        return std::ptr::null();
+    }
+    // SAFETY: the caller says `values` covers `num_values` entries.
+    let slice = match num_values {
+        0 => &[][..],
+        _ => unsafe { std::slice::from_raw_parts(values, num_values as usize) },
+    };
+    // SAFETY: null, or a live callbacks structure.
+    collections::new_set(slice, unsafe { Policy::from_key(callbacks) })
+}
+
+/// `CFMutableSetRef CFSetCreateMutable(CFAllocatorRef, CFIndex capacity,
+/// const CFSetCallBacks *callbacks)`
+///
+/// The capacity is a hint, exactly as [`CFArrayCreateMutable`]'s is: the set
+/// grows either way, so there is nothing to reserve and nothing to get wrong by
+/// ignoring it.
+pub unsafe extern "C" fn CFSetCreateMutable(
+    _allocator: CFAllocatorRef,
+    _capacity: CFIndex,
+    callbacks: *const SetCallBacks,
+) -> CFTypeRef {
+    // SAFETY: null, or a live callbacks structure.
+    collections::new_mutable_set(unsafe { Policy::from_key(callbacks) })
+}
+
+/// `void CFSetAddValue(CFMutableSetRef theSet, const void *value)`
+///
+/// A no-op for a set that was not created mutable, which is what Apple's raise
+/// amounts to: `__NSCFSet` has to descend from `NSMutableSet` for a guest's
+/// `isKindOfClass:` to agree with the object, so mutability is a field and the
+/// refusal is by name rather than by class. See [`collections::SetContents`].
+pub unsafe extern "C" fn CFSetAddValue(set: CFTypeRef, value: CFTypeRef) {
+    let Some(set) = (unsafe { collections::set(set) }) else {
+        return;
+    };
+    if !set.mutable {
+        return;
+    }
+    set.add(value);
 }
 
 pub unsafe extern "C" fn CFSetGetCount(set: CFTypeRef) -> CFIndex {
@@ -3041,6 +3371,255 @@ pub struct CFUUIDBytes(pub crate::uuid::Bytes);
 pub unsafe extern "C" fn CFUUIDGetUUIDBytes(uuid: CFTypeRef) -> CFUUIDBytes {
     // SAFETY: a UUID this runtime made, or null.
     CFUUIDBytes(unsafe { crate::uuid::bytes_of(uuid) }.unwrap_or([0; 16]))
+}
+
+//
+
+/// The class a `CFLocaleRef` is, which is Foundation's `NSLocale`.
+///
+/// A locale is not one of this crate's types: `CFLocaleGetIdentifier`,
+/// `CFLocaleGetValue` and the three `...Copy` spellings all live in `foundation`,
+/// above this crate, and they answer for the one locale the host's environment
+/// names. What CoreFoundation itself contributes is the *constructor*, and a
+/// constructor has to build something of the class the readers expect - so the
+/// name is registered here, idempotently, and Foundation's `install` adds its
+/// methods to whichever registration got there first.
+fn locale_class() -> &'static objc::class::Class {
+    crate::base::register(c"NSLocale", None, std::mem::size_of::<usize>(), false)
+}
+
+/// `CFLocaleRef CFLocaleCreate(CFAllocatorRef, CFStringRef localeIdentifier)`
+///
+/// A null identifier is the current locale, which is what the header says and
+/// what a caller with nothing to say about the locale means. Anything that is
+/// not a string at all is refused: a locale built from a pointer that is not a
+/// string would be a locale that answers questions about a locale.
+///
+/// ## What the identifier is not used for
+///
+/// [`CFLocaleGetIdentifier`] and [`CFLocaleGetValue`] are Foundation's, and they
+/// answer for the host's one locale whatever locale object they are handed.
+/// Storing the identifier here would buy a guest nothing it can read back, so it
+/// is not stored; what a guest can rely on is that every locale in this process
+/// agrees with every other one, which is the property a caller comparing
+/// `CFLocaleGetIdentifier` against an expected string actually needs.
+pub unsafe extern "C" fn CFLocaleCreate(
+    _allocator: CFAllocatorRef,
+    locale_identifier: CFTypeRef,
+) -> CFTypeRef {
+    if !locale_identifier.is_null() {
+        // SAFETY: a `CFStringRef` or null.
+        if unsafe { string::as_string(locale_identifier) }.is_none() {
+            return std::ptr::null();
+        }
+    }
+    // A `Create`, so the caller owns a reference and will release it.
+    objc::object::create_instance(locale_class(), 0) as CFTypeRef
+}
+
+/// `CFTypeID CFNullGetTypeID(void)`
+///
+/// The class of `kCFNull`, which is Foundation's `NSNull` - the same object the
+/// `kCFNull` symbol publishes and `+[NSNull null]` hands back, so a guest that
+/// compares a value against that global and a guest that compares a type ID
+/// against this function are asking one question.
+pub unsafe extern "C" fn CFNullGetTypeID() -> CFTypeID {
+    // One word, which is what Foundation registers `NSNull` with: it carries no
+    // ivars of its own.
+    crate::base::bridged_class(c"NSNull", std::mem::size_of::<usize>()) as *const _ as CFTypeID
+}
+
+//
+
+/// `CFTypeID CFErrorGetTypeID(void)`
+///
+/// Foundation's `NSError`, for [`CFNullGetTypeID`]'s reason: `CFErrorRef` is
+/// toll-free bridged to it, and marking the class is what makes
+/// `CFGetTypeID(error) == CFErrorGetTypeID()` true.
+///
+/// Two words, because Foundation's `NSError` carries an isa and a pointer to its
+/// contents - the same layout its own `error::make` allocates.
+pub unsafe extern "C" fn CFErrorGetTypeID() -> CFTypeID {
+    crate::base::bridged_class(c"NSError", 2 * std::mem::size_of::<usize>()) as *const _ as CFTypeID
+}
+
+/// `CFIndex CFErrorGetCode(CFErrorRef error)`
+///
+/// Sent as `-code`, so an error this runtime has not made is read the same way as
+/// one it has: a guest holding an `NSError` from a Foundation call and a guest
+/// holding one from CoreFoundation are holding the same kind of object, and
+/// switching on the type to decide which accessor to use is exactly what a caller
+/// should not have to get right.
+pub unsafe extern "C" fn CFErrorGetCode(error: CFTypeRef) -> CFIndex {
+    // SAFETY: a `CFErrorRef` or null; `send0_usize` answers zero for null and for
+    // an object with no `-code`, and `-code` returns a `NSInteger`.
+    unsafe { send::send0_usize(error as Id, objc::sel::get("code")) as i64 as CFIndex }
+}
+
+/// `CFStringRef CFErrorGetDomain(CFErrorRef error)`
+///
+/// A `Get`, not a `Copy`: the string is not the caller's to release, and it is
+/// the autoreleased one `-domain` hands back, which lives at least as long as the
+/// error does - which is the lifetime Apple's documents.
+pub unsafe extern "C" fn CFErrorGetDomain(error: CFTypeRef) -> CFTypeRef {
+    // SAFETY: a `CFErrorRef` or null; as above.
+    unsafe { send::send0_usize(error as Id, objc::sel::get("domain")) as CFTypeRef }
+}
+
+/// `CFStringRef CFErrorCopyDescription(CFErrorRef error)`
+///
+/// The *localized* description, which is what CoreFoundation's own
+/// documentation calls this function: `CFErrorCopyDescription` and
+/// `-localizedDescription` are the same string, and a guest that formats an error
+/// for a human wants that one.
+///
+/// A `Copy`, so the caller owns a reference. `-localizedDescription` is
+/// autoreleased, so the reference the caller will release is one taken here on
+/// top of the pool's.
+pub unsafe extern "C" fn CFErrorCopyDescription(error: CFTypeRef) -> CFTypeRef {
+    // SAFETY: a `CFErrorRef` or null.
+    let described =
+        unsafe { send::send0_usize(error as Id, objc::sel::get("localizedDescription")) }
+            as CFTypeRef;
+    match described.is_null() {
+        true => described,
+        // SAFETY: an object this runtime's own `-localizedDescription` returned.
+        false => unsafe { CFRetain(described) },
+    }
+}
+
+/// `CFDictionaryRef CFErrorCopyUserInfo(CFErrorRef error)`
+///
+/// A `Copy`, for the same reason as [`CFErrorCopyDescription`]. Null when there
+/// is no user info, which is what `-userInfo` answers and what a caller has to
+/// cope with either way.
+pub unsafe extern "C" fn CFErrorCopyUserInfo(error: CFTypeRef) -> CFTypeRef {
+    // SAFETY: a `CFErrorRef` or null.
+    let info = unsafe { send::send0_usize(error as Id, objc::sel::get("userInfo")) } as CFTypeRef;
+    match info.is_null() {
+        true => info,
+        // SAFETY: an object this runtime's own `-userInfo` returned.
+        false => unsafe { CFRetain(info) },
+    }
+}
+
+//
+
+/// `void *CFBundleGetFunctionPointerForName(CFBundleRef bundle, CFStringRef
+/// functionName)`
+///
+/// A function inside a loaded Mach-O image. There is no image here: every
+/// framework a guest links against is this runtime's own code, linked into this
+/// binary, and `rosetta3`'s symbol lookup is the one the loader answers a guest's
+/// *import* with. So the question "what is the address of this symbol" is asked
+/// the same way for a bundle lookup as for a link, and gets the same answer - for
+/// `carbon`'s reason, which is that the two disagreeing is how a guest ends up
+/// holding a working `FSRefMakePath` and a `CFURLCreateFromFSRef` that answers
+/// null.
+///
+/// Null when nothing defines the name, which is exactly what Apple answers for a
+/// symbol a bundle does not export, and what every caller of this checks.
+pub unsafe extern "C" fn CFBundleGetFunctionPointerForName(
+    _bundle: CFTypeRef,
+    function_name: CFTypeRef,
+) -> *mut c_void {
+    // SAFETY: a `CFStringRef` or null.
+    let Some(name) = (unsafe { string::as_string(function_name) }) else {
+        return std::ptr::null_mut();
+    };
+    let bytes = name.utf8();
+    let Ok(name) = std::str::from_utf8(&bytes) else {
+        return std::ptr::null_mut();
+    };
+    darwin::symbol(name).map_or(std::ptr::null_mut(), |address| {
+        address as usize as *mut c_void
+    })
+}
+
+//
+
+/// `CFStringRef CFRunLoopCopyCurrentMode(CFRunLoopRef rl)`
+///
+/// A `Copy`, so the caller owns the string and will release it - which is the
+/// only difference between this and the mode name inside the loop.
+///
+/// Null for a loop that is not running, which is what the header documents and
+/// what a caller logging "the loop is in `X`" needs: a loop that is not in a mode
+/// has no mode, and naming one anyway would put a mode in a log line that never
+/// happened.
+pub unsafe extern "C" fn CFRunLoopCopyCurrentMode(loop_: CFTypeRef) -> CFTypeRef {
+    let mode = match unsafe { borrow::<RunLoop>(loop_) } {
+        // SAFETY: `borrow` only answers with a `RunLoop` this crate made.
+        Some(loop_) => loop_.current_mode(),
+        None => return std::ptr::null(),
+    };
+    match mode {
+        Some(mode) => string::from_bytes(mode.as_bytes(), false),
+        None => std::ptr::null(),
+    }
+}
+
+/// `void CFRunLoopPerformBlock(CFRunLoopRef rl, CFTypeRef mode, void (^block)(void))`
+///
+/// The block is queued and this returns: running it is the loop's job, on the
+/// next turn in `mode`, which is the whole difference between this and calling
+/// the block. `mode` is the same string `CFRunLoopAddSource` takes, and null is
+/// the default mode, as it is there.
+///
+/// The block is **copied**, as Apple's is: it is handed a pointer that outlives
+/// the caller's frame, and a stack block would be a pointer into a frame that is
+/// gone. A copy that cannot be made means there is no block runtime registered,
+/// and nothing is queued - see [`darwin::dispatch::block::copy`] for why
+/// treating that as success is a crash some time later and somewhere else.
+///
+/// ## The block's code has to be callable from here
+///
+/// A guest's block literal has guest code in its `invoke`, and this crate cannot
+/// make that callable: only the runtime can, and it does it by rewriting the
+/// block in guest memory before handing it to the host. So this function expects
+/// to be reached through `rosetta3`'s shim for
+/// `CFRunLoopPerformBlock`, which substitutes the block's code pointers and then
+/// calls through here - the same arrangement as `dispatch_async`, and for the
+/// same reason.
+pub unsafe extern "C" fn CFRunLoopPerformBlock(loop_: CFTypeRef, mode: CFTypeRef, block: u64) {
+    // A null block is a no-op rather than a fault, as it is in `dispatch_async`'s
+    // own reading of it: a caller that built nothing has asked for nothing.
+    if block == 0 {
+        return;
+    }
+    // A loop this crate did not make has no block queue, so the current thread's
+    // is used - which is also what a null handle means to every other caller here.
+    // `into_inner` rather than letting the `ManuallyDrop` fall out of scope as
+    // one: the reference belongs to the loop, not to this call.
+    let running = match unsafe { borrow::<RunLoop>(loop_) } {
+        Some(loop_) => std::mem::ManuallyDrop::into_inner(loop_),
+        None => runloop::current(),
+    };
+    // SAFETY: null, or a `CFStringRef` naming the mode.
+    let mode = unsafe { mode_name(mode) };
+    // The heap copy outlives the caller's frame, so the closure below may hold
+    // its address for as long as the loop takes to get to it.
+    let Some(owned) = darwin::dispatch::block::copy(block) else {
+        return;
+    };
+    // `invoke` sits at a fixed offset in a `Block_layout`; `darwin` owns that
+    // constant and its own `invoke` is the caller of it.
+    // SAFETY: `owned` is a block `_Block_copy` returned, and the Block ABI puts
+    // `invoke` at offset 16 of it.
+    let entry = (owned + 16_u64) as *const u64;
+    // SAFETY: as above.
+    let entry = unsafe { *entry };
+    running.perform_block(&mode, move || {
+        if entry != 0 {
+            // SAFETY: a `void (*)(void *)` by the Block ABI for a block taking no
+            // arguments, reached through the `invoke` a caller may substitute -
+            // see the note on the shim above.
+            unsafe {
+                std::mem::transmute::<u64, extern "C" fn(u64)>(entry)(owned);
+            }
+        }
+        darwin::dispatch::block::release(owned);
+    });
 }
 
 #[cfg(test)]

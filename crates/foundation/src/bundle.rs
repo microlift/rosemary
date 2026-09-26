@@ -124,7 +124,7 @@ impl Layout {
         let contents = root.join("Contents");
         let info_path = contents.join("Info.plist");
         if !info_path.is_file() {
-            return None;
+            return Layout::framework_at(root);
         }
         let info = plist::parse(&std::fs::read(&info_path).ok()?).ok()?;
         let executable = info
@@ -139,6 +139,35 @@ impl Layout {
             plugins: plugins_of(&contents),
             executable,
             contents,
+            info,
+        })
+    }
+
+    /// A framework's bundle, which has no `Contents`: `Resources/Info.plist`
+    /// and the binary sit directly in the version directory, and the
+    /// `.framework` directory itself reaches them through the `Resources` and
+    /// executable symlinks into `Versions/Current`.
+    ///
+    /// Chromium opens its own framework this way before anything else -
+    /// `base::apple::SetOverrideFrameworkBundlePath` sends `+bundleWithURL:` the
+    /// `Chromium Framework.framework/Versions/<version>` directory and `CHECK`s
+    /// that a bundle came back - so a loader that only knows the `.app` shape
+    /// stops Chromium at its first line of `ChromeMain`.
+    fn framework_at(root: &Path) -> Option<Layout> {
+        let resources = root.join("Resources");
+        let info = plist::parse(&std::fs::read(resources.join("Info.plist")).ok()?).ok()?;
+        let executable = info
+            .get("CFBundleExecutable")
+            .and_then(|name| name.as_str())
+            .map(|name| root.join(name))
+            .unwrap_or_default();
+        Some(Layout {
+            root: root.to_path_buf(),
+            resources,
+            frameworks: root.join("Frameworks"),
+            plugins: plugins_of(root),
+            executable,
+            contents: root.to_path_buf(),
             info,
         })
     }
@@ -682,6 +711,35 @@ mod tests {
         assert!(Layout::enclosing(Path::new("/bin/ls")).is_none());
     }
 
+    /// Chromium's shape: a versioned framework, opened both at its version
+    /// directory and at the `.framework` itself through the `Versions/Current`
+    /// symlinks.
+    #[test]
+    fn a_framework_is_a_bundle_at_its_version_and_at_its_top() {
+        let root = std::env::temp_dir().join("rosetta3-bundle-framework");
+        let _ = std::fs::remove_dir_all(&root);
+        let framework = root.join("Thing Framework.framework");
+        let version = framework.join("Versions/1.2.3");
+        std::fs::create_dir_all(version.join("Resources")).unwrap();
+        let info = INFO.replace("<string>Thing</string>", "<string>Thing Framework</string>");
+        std::fs::write(version.join("Resources/Info.plist"), info).unwrap();
+        std::fs::write(version.join("Thing Framework"), b"").unwrap();
+        std::os::unix::fs::symlink("1.2.3", framework.join("Versions/Current")).unwrap();
+        std::os::unix::fs::symlink("Versions/Current/Resources", framework.join("Resources"))
+            .unwrap();
+
+        let layout = Layout::at(&version).expect("the version directory is a bundle");
+        assert_eq!(layout.identifier(), Some("com.example.thing"));
+        assert_eq!(layout.executable, version.canonicalize().unwrap().join("Thing Framework"));
+        assert!(layout.resource("Info", "plist").is_some());
+
+        let layout = Layout::at(&framework).expect("and so is the .framework");
+        assert_eq!(layout.identifier(), Some("com.example.thing"));
+
+        // Neither shape: no `Contents/Info.plist`, no `Resources/Info.plist`.
+        assert!(Layout::at(&root).is_none());
+    }
+
     /// An `Info.plist` that cannot be read is a bundle this runtime declines to
     /// recognise, rather than one with an empty identity.
     #[test]
@@ -744,6 +802,28 @@ pub(crate) mod class {
         let Ok(path) = std::str::from_utf8(&path) else {
             return std::ptr::null_mut();
         };
+        // SAFETY: `class` is the receiver this method was sent to.
+        unsafe { bundle_at(class, path) }
+    }
+
+    /// `+bundleWithURL:`, autoreleased: `+bundleWithPath:` for a `file:` URL,
+    /// and nil for any other, as Apple's is.
+    unsafe extern "C" fn bundle_with_url(class: Id, _sel: Sel, url: Id) -> Id {
+        // SAFETY: an `NSURL`, or nil.
+        let url = unsafe { corefoundation::url::as_url(url as corefoundation::base::CFTypeRef) };
+        let Some(path) = url.and_then(|url| url.file_path()) else {
+            return std::ptr::null_mut();
+        };
+        // SAFETY: `class` is the receiver this method was sent to.
+        unsafe { bundle_at(class, &path) }
+    }
+
+    /// The bundle at a guest path, autoreleased, or nil where there is none.
+    ///
+    /// # Safety
+    ///
+    /// `class` is `NSBundle` or nil.
+    unsafe fn bundle_at(class: Id, path: &str) -> Id {
         // The guest named it, so it is opened at this crate's spelling.
         let path = super::opened(std::path::Path::new(path));
         if super::main().is_some_and(|main| main.root == path) {
@@ -1006,7 +1086,8 @@ pub(crate) mod class {
         });
         class_methods!(class, {
             "mainBundle" => main_bundle, c"@16@0:8";
-            "bundleWithPath:" => bundle_with_path, c"@24@0:8@16"
+            "bundleWithPath:" => bundle_with_path, c"@24@0:8@16";
+            "bundleWithURL:" => bundle_with_url, c"@24@0:8@16"
         });
     }
 }

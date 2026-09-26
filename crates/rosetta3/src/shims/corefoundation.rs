@@ -118,9 +118,31 @@ pub fn run_loop_timer_create(
     Ok(())
 }
 
+/// `void CFRunLoopPerformBlock(CFRunLoopRef rl, CFTypeRef mode, void (^block)(void))`
+///
+/// Needs a shim for the same reason `dispatch_async` does, and not for the
+/// reason the table's signature suggests. The marshaller substitutes a *bare
+/// function pointer*; a block is a structure whose `invoke` slot holds one, so
+/// substituting the third argument as though it were the callback would rewrite
+/// the block's descriptor instead of its body and leave the host calling guest
+/// memory it has no way back into. [`substitute_block`] rewrites the block in
+/// place, which is why this cannot be a `sig!` alone.
+pub fn run_loop_perform_block(
+    symbol: &str,
+    ctx: &mut RegisterContext,
+    mem: &mut dyn GuestMemory,
+    callbacks: &dyn Callbacks,
+) -> Result<()> {
+    let (loop_ref, mode, block) = (ctx.rdi, ctx.rsi, ctx.rdx);
+    if block == 0 {
+        return Err(super::bad_pointer(symbol, block));
+    }
+    super::block::substitute_block(symbol, block, mem, callbacks)?;
+    forward(symbol, ctx, &[loop_ref, mode, block])
+}
+
 /// Call this tree's own implementation with the three integer arguments given.
-fn forward(symbol: &str, ctx: &mut RegisterContext, args: &[u64; 3]) -> Result<()> {
-    let host = crate::frameworks::symbol(crate::darwin_name(symbol)).ok_or(
+fn forward(symbol: &str, ctx: &mut RegisterContext, args: &[u64; 3]) -> Result<()> {    let host = crate::frameworks::symbol(crate::darwin_name(symbol)).ok_or(
         crate::abi::AbiError::Unsatisfied {
             symbol: symbol.to_string(),
         },
@@ -152,6 +174,7 @@ pub fn shim_for(name: &str) -> Option<CallbackShim> {
     match name {
         "CFRunLoopSourceCreate" => Some(run_loop_source_create),
         "CFRunLoopTimerCreate" => Some(run_loop_timer_create),
+        "CFRunLoopPerformBlock" => Some(run_loop_perform_block),
         _ => None,
     }
 }

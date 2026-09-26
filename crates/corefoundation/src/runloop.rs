@@ -22,9 +22,23 @@ pub struct Source {
     info: usize,
     /// Set when the source is invalidated, after which the loop drops it.
     valid: AtomicBool,
+    /// "Is there anything waiting for you?", asked just before `perform` runs
+    /// and given the same `info` the callback is.
+    ///
+    /// For a source whose readiness lives somewhere this crate does not own - a
+    /// Mach port's queue - and which is therefore looked at by a *process-wide*
+    /// sweep rather than by the loop that owns it. That sweep can signal a source
+    /// belonging to another thread's loop, and by the time that loop reaches it
+    /// the port may be empty; without this the source would report a source
+    /// handled for work it did not do, and `CFRunLoopRunInMode` would answer
+    /// `kCFRunLoopRunHandledSource` for a turn on which nothing was delivered.
+    ///
+    /// A bare function taking the source's own `info` rather than a closure, so
+    /// one of them serves every source of a kind and a port costs nothing.
+    ready: Option<fn(usize) -> bool>,
 }
 
-// SAFETY: the callback is a code address that outlives the process and `info` is
+// SAFETY: the callbacks are code addresses that outlive the process and `info` is
 // an opaque number this crate never dereferences - it is handed back to the
 // callback, which is the only thing that knows what it is.
 unsafe impl Send for Source {}
@@ -54,6 +68,11 @@ impl Source {
         let Some(perform) = self.perform else {
             return false;
         };
+        // A source that says nothing is waiting for it has nothing to deliver,
+        // however it came to be signalled. See `Source::ready`.
+        if self.ready.is_some_and(|ready| !ready(self.info)) {
+            return false;
+        }
         // SAFETY: `perform` is a `void (*)(void *)` the creator supplied, and
         // `info` is the pointer it asked to be given back.
         unsafe { perform(self.info as *mut c_void) };
@@ -214,6 +233,20 @@ struct Mode {
     observers: Vec<Arc<Observer>>,
 }
 
+/// Work `CFRunLoopPerformBlock` has queued, waiting for the loop to reach a
+/// mode it is scheduled in.
+///
+/// Not a source and not a timer, because a block is neither: it is not added to
+/// a mode, not signalled, and not invalidated, and it runs *once*. The list is
+/// per-loop rather than per-mode precisely because the mode a block is scheduled
+/// for is resolved when the loop gets there - so a mode made common after the
+/// block was queued under the alias runs it, exactly as it runs the sources that
+/// were added under that alias before it.
+struct ScheduledBlock {
+    mode: String,
+    run: Box<dyn FnOnce() + Send + 'static>,
+}
+
 pub struct RunLoop {
     modes: Mutex<BTreeMap<String, Mode>>,
     /// What `kCFRunLoopCommonModes` stands for: the modes in the set, and every
@@ -221,6 +254,14 @@ pub struct RunLoop {
     ///
     /// Never held while `modes` is locked by the same call.
     common: Mutex<Common>,
+    /// The mode this loop is running in, or `None` when it is not running:
+    /// `CFRunLoopCopyCurrentMode`'s whole answer.
+    ///
+    /// A property of the loop rather than of the thread asking, which is what
+    /// Apple does too: the mode belongs to the loop, and a run loop belongs to
+    /// one thread, so nothing else can be the one running it.
+    running: Mutex<Option<String>>,
+    blocks: Mutex<Vec<ScheduledBlock>>,
     stopped: AtomicBool,
     waker: (Mutex<bool>, Condvar),
     /// Set while the loop is asleep, for `CFRunLoopIsWaiting`. A caller asks it
@@ -246,6 +287,8 @@ impl RunLoop {
                 names: vec![DEFAULT_MODE.to_string()],
                 items: Mode::default(),
             }),
+            running: Mutex::new(None),
+            blocks: Mutex::new(Vec::new()),
             stopped: AtomicBool::new(false),
             waker: (Mutex::new(false), Condvar::new()),
             waiting: AtomicBool::new(false),
@@ -418,6 +461,98 @@ impl RunLoop {
         self.waiting.load(Ordering::Acquire)
     }
 
+    /// The mode this loop is running in, or `None` when it is not running.
+    ///
+    /// `CFRunLoopCopyCurrentMode` asks exactly this, and Apple's contract is the
+    /// one adopted here: a loop that is not running has no current mode, and
+    /// saying so with `None` is what a caller that compares modes against a
+    /// sentinel *wants* - a mode name for a loop that is not in a mode would be a
+    /// lie the caller could not detect.
+    pub fn current_mode(&self) -> Option<String> {
+        self.running
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    /// Queue `run` for the next turn of the loop in `mode`.
+    ///
+    /// `CFRunLoopPerformBlock` returns before the block runs - that is the whole
+    /// difference between it and calling the block - so the work and the mode it
+    /// was asked for are recorded and nothing happens until the loop is turned.
+    /// The wake-up is the other half of that promise: a loop asleep with nothing
+    /// else to do has to come back to run what was just queued for it, or
+    /// `CFRunLoopPerformBlock` from another thread is a message to nobody.
+    pub fn perform_block(&self, mode: &str, run: impl FnOnce() + Send + 'static) {
+        self.blocks
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(ScheduledBlock {
+                mode: mode.to_string(),
+                run: Box::new(run),
+            });
+        self.wake();
+    }
+
+    /// Whether a block queued for `scheduled` runs while the loop is in `running`.
+    ///
+    /// The common-modes alias cuts both ways, and both directions are load
+    /// bearing: work queued under the alias must run in any mode of the set, and
+    /// work queued in a member mode must run when the loop is asked to run the
+    /// alias - which is what `CFRunLoopRunInMode(kCFRunLoopCommonModes, ...)`
+    /// does, and a guest does it.
+    fn accepts(&self, scheduled: &str, running: &str) -> bool {
+        if scheduled == running {
+            return true;
+        }
+        let members = self.names(COMMON_MODES);
+        (scheduled == COMMON_MODES && members.iter().any(|name| name == running))
+            || (running == COMMON_MODES && members.iter().any(|name| name == scheduled))
+    }
+
+    /// Whether `mode` has a block waiting, which is something to service.
+    ///
+    /// Asked by [`RunLoop::is_empty`] for the reason sources are: a loop with
+    /// only queued work in it is not finished, it has not done that work yet, and
+    /// answering `kCFRunLoopRunFinished` to a caller whose only reason for
+    /// running the loop was to be called back is the one answer it cannot use.
+    fn has_blocks(&self, mode: &str) -> bool {
+        self.blocks
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .any(|block| self.accepts(&block.mode, mode))
+    }
+
+    /// Run the blocks due in `mode`, and say whether any ran.
+    ///
+    /// Taken out from under the lock before running, for the reason
+    /// [`RunLoop::contents`] takes its sources out: a block is arbitrary work, and
+    /// it is entitled to queue another one - which is what every `dispatch_async`
+    /// from inside a block does.
+    fn run_blocks(&self, mode: &str) -> bool {
+        let mut due = Vec::new();
+        {
+            let mut queued = self.blocks.lock().unwrap_or_else(|e| e.into_inner());
+            if queued.is_empty() {
+                return false;
+            }
+            let mut waiting = Vec::with_capacity(queued.len());
+            for block in queued.drain(..) {
+                match self.accepts(&block.mode, mode) {
+                    true => due.push(block),
+                    false => waiting.push(block),
+                }
+            }
+            *queued = waiting;
+        }
+        let ran = !due.is_empty();
+        for block in due {
+            (block.run)();
+        }
+        ran
+    }
+
     /// Tell every observer of `what` in `mode` that it has happened.
     ///
     /// Copied out from under the lock for [`RunLoop::contents`]' reason: an
@@ -457,6 +592,9 @@ impl RunLoop {
     /// waiting out its timeout: a loop with no sources is one nothing can ever
     /// wake, and sleeping in it is indistinguishable from a hang.
     pub fn is_empty(&self, mode: &str) -> bool {
+        if self.has_blocks(mode) {
+            return false;
+        }
         let modes = self.modes.lock().unwrap_or_else(|e| e.into_inner());
         self.names(mode).iter().all(|name| {
             modes.get(name).is_none_or(|m| {
@@ -500,7 +638,22 @@ impl RunLoop {
     }
 
     /// Run `mode` for at most `seconds`, as `CFRunLoopRunInMode` does.
+    ///
+    /// The mode is recorded for as long as the call lasts, so
+    /// `CFRunLoopCopyCurrentMode` has an answer while it does and `None` after
+    /// it. The bookkeeping is here rather than in each of the four exits in
+    /// [`RunLoop::turn`] so that there is one place where "running" is set and
+    /// one where it is cleared, which is what makes the two impossible to forget
+    /// as exits are added.
     pub fn run_in_mode(&self, mode: &str, seconds: f64, return_after_source: bool) -> i32 {
+        *self.running.lock().unwrap_or_else(|e| e.into_inner()) = Some(mode.to_string());
+        let result = self.turn(mode, seconds, return_after_source);
+        *self.running.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        result
+    }
+
+    /// One `run_in_mode`, with the mode bookkeeping already done.
+    fn turn(&self, mode: &str, seconds: f64, return_after_source: bool) -> i32 {
         self.stopped.store(false, Ordering::Release);
         self.observe(mode, activity::ENTRY);
         let deadline = match seconds.is_finite() && seconds >= 0.0 {
@@ -521,7 +674,14 @@ impl RunLoop {
             let now = Instant::now();
             let (sources, timers) = self.contents(mode);
             let mut handled = false;
+            // Everything the loop cannot see by itself is asked before anything is
+            // serviced, the way a real run loop asks the kernel what is ready
+            // before it dispatches: a descriptor or a Mach port that became
+            // readable since the last turn is what turns a silent turn into one
+            // that delivers.
             crate::socket::poll();
+            #[cfg(not(target_os = "macos"))]
+            crate::machport::poll();
             self.observe(mode, activity::BEFORE_TIMERS);
             for timer in &timers {
                 handled |= timer.fire(now);
@@ -530,6 +690,10 @@ impl RunLoop {
             for source in &sources {
                 handled |= source.fire();
             }
+            // After the sources and before the sleep, which is where
+            // CoreFoundation runs them - so a block queued from a source's
+            // `perform` runs on this turn rather than the next one.
+            handled |= self.run_blocks(mode);
             if handled && return_after_source {
                 self.observe(mode, activity::EXIT);
                 return result::HANDLED_SOURCE;
@@ -577,6 +741,16 @@ impl RunLoop {
     }
 }
 
+/// A run loop of its own, not the thread's.
+///
+/// Only for the tests: a guest's loop is [`current`]'s, and there is exactly one
+/// of those per thread.
+impl Default for RunLoop {
+    fn default() -> RunLoop {
+        RunLoop::new()
+    }
+}
+
 /// Build an observer.
 pub fn new_observer(
     activities: u32,
@@ -599,11 +773,25 @@ pub fn new_observer(
 
 /// Build a version-0 source.
 pub fn new_source(perform: Option<Perform>, info: usize) -> Arc<Source> {
+    new_source_ready(perform, info, None)
+}
+
+/// Build a version-0 source that asks `ready` whether it has anything to do.
+///
+/// As [`new_source`], for a source whose work is waiting somewhere the loop
+/// cannot see - see [`Source::ready`]. `ready` is handed the same `info` the
+/// callback is.
+pub fn new_source_ready(
+    perform: Option<Perform>,
+    info: usize,
+    ready: Option<fn(usize) -> bool>,
+) -> Arc<Source> {
     let source = Arc::new(Source {
         signalled: AtomicBool::new(false),
         perform,
         info,
         valid: AtomicBool::new(true),
+        ready,
     });
     note(Arc::as_ptr(&source));
     source
@@ -977,6 +1165,205 @@ mod tests {
             result::HANDLED_SOURCE
         );
         assert_eq!(calls(), 1);
+    }
+
+    /// A loop that is not running has no current mode, and one that is running has
+    /// exactly the mode it was asked for.
+    ///
+    /// Both halves matter, and the second is the one a caller comparing modes
+    /// depends on: a modal session runs the loop in a mode of its own, and code
+    /// that asks what mode it is in has to be told *that* one rather than the
+    /// default it was scheduled in.
+    #[test]
+    fn the_current_mode_is_the_one_being_run_and_none_when_idle() {
+        let loop_ = Arc::new(RunLoop::new());
+        let (calls, perform, _) = counter!();
+        let source = new_source(Some(perform), 0);
+        loop_.add_source(&source, DEFAULT_MODE);
+        assert_eq!(loop_.current_mode(), None, "not running yet");
+
+        // Read from inside a turn, which is the only time a guest can ask: the
+        // mode has to be there for the whole of the call, not just after it.
+        static SEEN: Mutex<Vec<Option<String>>> = Mutex::new(Vec::new());
+        unsafe extern "C" fn note(_info: *mut c_void) {
+            let running = LOOP.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(loop_) = running.as_ref() {
+                SEEN.lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .push(loop_.current_mode());
+            }
+        }
+        static LOOP: Mutex<Option<Arc<RunLoop>>> = Mutex::new(None);
+        let observer_source = new_source(Some(note), 0);
+        loop_.add_source(&observer_source, "Modal");
+        *LOOP.lock().unwrap_or_else(|e| e.into_inner()) = Some(Arc::clone(&loop_));
+        loop_.add_common_mode("Modal");
+
+        observer_source.signal();
+        assert_eq!(
+            loop_.run_in_mode("Modal", 1.0, true),
+            result::HANDLED_SOURCE
+        );
+        assert_eq!(
+            SEEN.lock().unwrap_or_else(|e| e.into_inner()).as_slice(),
+            [Some("Modal".to_string())],
+            "a turn in a mode is in that mode"
+        );
+        assert_eq!(
+            loop_.current_mode(),
+            None,
+            "and not in one after it returns"
+        );
+        *LOOP.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        let _ = calls;
+    }
+
+    /// A block runs on the next turn of the loop, in the mode it was scheduled
+    /// for, and only once.
+    ///
+    /// The property a caller of `CFRunLoopPerformBlock` is buying is the delay:
+    /// the call returns first, and the work happens when the loop is turned.
+    #[test]
+    fn a_queued_block_runs_on_the_next_turn_and_only_once() {
+        static RAN: AtomicUsize = AtomicUsize::new(0);
+        let loop_ = Arc::new(RunLoop::new());
+        loop_.perform_block(DEFAULT_MODE, || {
+            RAN.fetch_add(1, Ordering::SeqCst);
+        });
+        assert_eq!(
+            RAN.load(Ordering::SeqCst),
+            0,
+            "queueing it is not running it"
+        );
+        // A loop with only queued work in it is not finished: the work is what it
+        // was run for.
+        assert_eq!(
+            loop_.run_in_mode(DEFAULT_MODE, 0.0, true),
+            result::HANDLED_SOURCE,
+            "a block that ran is a source that was handled"
+        );
+        assert_eq!(RAN.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            loop_.run_in_mode(DEFAULT_MODE, 0.0, true),
+            result::FINISHED,
+            "and the block is spent, so there is nothing left to do"
+        );
+        assert_eq!(RAN.load(Ordering::SeqCst), 1);
+    }
+
+    /// The mode a block is queued for decides which turn runs it, and the
+    /// common-modes alias works in both directions.
+    #[test]
+    fn a_block_runs_only_in_the_mode_it_was_queued_for() {
+        static RAN: Mutex<Vec<&'static str>> = Mutex::new(Vec::new());
+        let loop_ = Arc::new(RunLoop::new());
+        loop_.perform_block("Modal", || RAN.lock().unwrap().push("Modal"));
+        loop_.perform_block(COMMON_MODES, || RAN.lock().unwrap().push("Common"));
+        loop_.perform_block(DEFAULT_MODE, || RAN.lock().unwrap().push("Default"));
+
+        // A mode that holds none of them: nothing runs, and the blocks wait.
+        assert_eq!(loop_.run_in_mode("Private", 0.0, true), result::FINISHED);
+        assert!(RAN.lock().unwrap().is_empty());
+
+        // The default mode runs the block queued for it and the one queued under
+        // the alias, because the default mode is a member of the common set.
+        assert_eq!(
+            loop_.run_in_mode(DEFAULT_MODE, 0.0, true),
+            result::HANDLED_SOURCE
+        );
+        let mut ran = RAN.lock().unwrap().clone();
+        ran.sort_unstable();
+        assert_eq!(ran, ["Common", "Default"]);
+
+        // And running the alias itself picks up the member-mode block, which is
+        // what `CFRunLoopRunInMode(kCFRunLoopCommonModes, ...)` asks.
+        loop_.perform_block(DEFAULT_MODE, || RAN.lock().unwrap().push("Default"));
+        assert_eq!(
+            loop_.run_in_mode(COMMON_MODES, 0.0, true),
+            result::HANDLED_SOURCE
+        );
+        assert_eq!(RAN.lock().unwrap().len(), 3);
+    }
+
+    /// A block queued for a mode that is made common *afterwards* runs in it, for
+    /// the same reason a source added under the alias does: the mode is resolved
+    /// when the loop gets there, not when the work was queued.
+    #[test]
+    fn a_block_queued_under_the_alias_runs_in_a_mode_made_common_later() {
+        static RAN: AtomicUsize = AtomicUsize::new(0);
+        let loop_ = Arc::new(RunLoop::new());
+        loop_.perform_block(COMMON_MODES, || {
+            RAN.fetch_add(1, Ordering::SeqCst);
+        });
+        loop_.add_common_mode("Tracking");
+        assert_eq!(
+            loop_.run_in_mode("Tracking", 0.0, true),
+            result::HANDLED_SOURCE
+        );
+        assert_eq!(RAN.load(Ordering::SeqCst), 1);
+    }
+
+    /// A block queued from inside a block runs on the *following* turn, not the
+    /// one it was queued from.
+    ///
+    /// CoreFoundation's queue is drained into an array and then called, so work
+    /// handed on from inside a block joins the next pass - and a test that says
+    /// otherwise would be asserting a turn of the loop that does not exist. A
+    /// block queued from a *source* is different, and does run on the same turn:
+    /// sources are serviced before the block queue is reached.
+    #[test]
+    fn a_block_queued_from_a_block_runs_on_the_next_turn() {
+        static RAN: Mutex<Vec<u32>> = Mutex::new(Vec::new());
+        let loop_ = Arc::new(RunLoop::new());
+        let second = Arc::clone(&loop_);
+        loop_.perform_block(DEFAULT_MODE, move || {
+            RAN.lock().unwrap().push(1);
+            second.perform_block(DEFAULT_MODE, || {
+                RAN.lock().unwrap().push(2);
+            });
+        });
+        loop_.run_in_mode(DEFAULT_MODE, 0.0, false);
+        assert_eq!(RAN.lock().unwrap().as_slice(), [1], "one block ran");
+        loop_.run_in_mode(DEFAULT_MODE, 0.0, false);
+        assert_eq!(
+            RAN.lock().unwrap().as_slice(),
+            [1, 2],
+            "and the one it queued"
+        );
+    }
+
+    /// A block queued from another thread wakes a loop that is asleep, which is
+    /// the whole point of the call being asynchronous.
+    ///
+    /// A timer is what the loop is asleep *on*: a mode with nothing in it returns
+    /// at once rather than waiting, so a loop waiting for a block has to be
+    /// waiting for something else too.
+    #[test]
+    fn a_block_queued_from_another_thread_wakes_the_loop() {
+        static RAN: AtomicUsize = AtomicUsize::new(0);
+        let loop_ = Arc::new(RunLoop::new());
+        let (_, _, callback) = counter!();
+        // Far enough out that the wait is the loop's and the block's arrival is
+        // what ends it.
+        let timer = new_timer(Duration::from_secs(30), None, Some(callback), 0);
+        loop_.add_timer(&timer, DEFAULT_MODE);
+        let waker = Arc::clone(&loop_);
+        let started = Instant::now();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(10));
+            waker.perform_block(DEFAULT_MODE, || {
+                RAN.fetch_add(1, Ordering::SeqCst);
+            });
+        });
+        assert_eq!(
+            loop_.run_in_mode(DEFAULT_MODE, 30.0, true),
+            result::HANDLED_SOURCE
+        );
+        assert_eq!(RAN.load(Ordering::SeqCst), 1);
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "it slept the timeout out"
+        );
     }
 
     /// A mode made common later still runs what was added under the alias

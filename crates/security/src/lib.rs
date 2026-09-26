@@ -1,9 +1,11 @@
 pub mod codesign;
 pub mod keychain;
+pub mod task;
 
 exports::group! {
     codesign,
     keychain,
+    task,
 }
 
 /// The `kSec*` key globals, each a cell holding an `NSString *`.

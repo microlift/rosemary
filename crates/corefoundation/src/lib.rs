@@ -17,6 +17,10 @@ mod diskarbitration;
 #[cfg(target_os = "macos")]
 pub mod foreign;
 mod fsevents;
+/// Mach ports bridged into the run loop. Off Darwin: there the host's own Mach
+/// is the guest's, as [`foreign`] is for the host's CoreFoundation.
+#[cfg(not(target_os = "macos"))]
+pub mod machport;
 pub mod preferences;
 pub mod runloop;
 mod send;
@@ -109,6 +113,9 @@ exports::exports! {
         "CFSetApplyFunction" => api::CFSetApplyFunction,
         "CFSetGetCount" => api::CFSetGetCount,
         "CFSetGetValues" => api::CFSetGetValues,
+        "CFSetCreate" => api::CFSetCreate,
+        "CFSetAddValue" => api::CFSetAddValue,
+        "CFSetCreateMutable" => api::CFSetCreateMutable,
         "CFDictionaryGetTypeID" => api::CFDictionaryGetTypeID,
         "CFDictionaryCreate" => api::CFDictionaryCreate,
         "CFDictionaryGetCount" => api::CFDictionaryGetCount,
@@ -180,6 +187,8 @@ exports::exports! {
         "CFRunLoopRun" => api::CFRunLoopRun,
         "CFRunLoopStop" => api::CFRunLoopStop,
         "CFRunLoopWakeUp" => api::CFRunLoopWakeUp,
+        "CFRunLoopCopyCurrentMode" => api::CFRunLoopCopyCurrentMode,
+        "CFRunLoopPerformBlock" => api::CFRunLoopPerformBlock,
         "CFRunLoopSourceCreate" => api::CFRunLoopSourceCreate,
         "CFRunLoopSourceSignal" => api::CFRunLoopSourceSignal,
         "CFRunLoopSourceInvalidate" => api::CFRunLoopSourceInvalidate,
@@ -218,6 +227,31 @@ exports::exports! {
         "CFRunLoopRemoveTimer" => api::CFRunLoopRemoveTimer,
         "CFRunLoopTimerInvalidate" => api::CFRunLoopTimerInvalidate,
         "CFRunLoopTimerIsValid" => api::CFRunLoopTimerIsValid,
+        "CFStringHasPrefix" => api::CFStringHasPrefix,
+        "CFStringHasSuffix" => api::CFStringHasSuffix,
+        "CFStringGetRangeOfCharacterClusterAtIndex" => api::CFStringGetRangeOfCharacterClusterAtIndex,
+        "CFNullGetTypeID" => api::CFNullGetTypeID,
+        "CFLocaleCreate" => api::CFLocaleCreate,
+        "CFErrorGetTypeID" => api::CFErrorGetTypeID,
+        "CFErrorGetCode" => api::CFErrorGetCode,
+        "CFErrorGetDomain" => api::CFErrorGetDomain,
+        "CFErrorCopyDescription" => api::CFErrorCopyDescription,
+        "CFErrorCopyUserInfo" => api::CFErrorCopyUserInfo,
+        "CFBundleGetFunctionPointerForName" => api::CFBundleGetFunctionPointerForName,
+        // The Mach port family, which is absent on Darwin: there the host's own
+        // Mach is the guest's and this tree's port space is not the one in play.
+        #[cfg(not(target_os = "macos"))]
+        "CFMachPortCreateRunLoopSource" => machport::create_run_loop_source,
+        #[cfg(not(target_os = "macos"))]
+        "CFMachPortInvalidate" => machport::invalidate,
+        #[cfg(not(target_os = "macos"))]
+        "CFMachPortGetTypeID" => machport::get_type_id,
+        #[cfg(not(target_os = "macos"))]
+        "CFMachPortCreateWithPort" => machport::create_with_port,
+        #[cfg(not(target_os = "macos"))]
+        "CFMachPortGetPort" => machport::get_port,
+        #[cfg(not(target_os = "macos"))]
+        "CFMachPortIsValid" => machport::is_valid,
     }
     groups {
         calendar,
@@ -369,13 +403,19 @@ static KEY_STRINGS: &[(&str, &str)] = &[
 
 /// `kCFNull`, the singleton `NSNull` also answers for.
 fn null_object() -> u64 {
-    let class = objc::class::lookup(c"NSNull");
-    let Some(class) = class else {
+    let Some(class) = objc::class::lookup(c"NSNull") else {
         // Foundation registers `NSNull`, and a process using CoreFoundation
         // without it has no null to publish. Zero here is the same as not
         // publishing the symbol, which is what it was before.
         return 0;
     };
+    // `CFNullGetTypeID` registers the name in a process that has no Foundation to
+    // install `+null` on it, so the class being found is not the same statement as
+    // there being a null to hand out. Sending `+null` to a class that has never
+    // had it is a message to nothing, and the answer is the same zero.
+    if class.method(objc::sel::get("null")).is_none() {
+        return 0;
+    }
     let sel = objc::sel::get("null");
     // SAFETY: `+null` is `id (Class, SEL)` and hands back a singleton kept for
     // the process.
@@ -860,6 +900,509 @@ mod tests {
             api::CFRelease(object);
             api::CFRelease(object);
             assert_eq!(api::CFStringGetLength(object), 14);
+        }
+    }
+
+    /// A prefix is a *character* prefix, in whichever representation each side
+    /// happens to keep - and a string is a prefix of itself, which is the case a
+    /// caller testing "starts with" relies on when it passes its own buffer.
+    #[test]
+    fn a_prefix_is_compared_by_characters_in_either_representation() {
+        bootstrap();
+        // "cafe" with the accent as a *combining* mark, so its wide form is five
+        // code units for four characters: an 8-bit string and a wide one that
+        // spell the same thing must agree about the prefix.
+        let narrow = string::from_bytes("com.example.app".as_bytes(), false);
+        let units: Vec<u16> = "com.example".encode_utf16().collect();
+        let wide = string::from_utf16(&units);
+        let accented_units: Vec<u16> = "cafe\u{0301}".encode_utf16().collect();
+        let accented = string::from_utf16(&accented_units);
+
+        // SAFETY: four strings this test made.
+        unsafe {
+            assert_eq!(api::CFStringHasPrefix(narrow, wide), 1);
+            assert_eq!(api::CFStringHasPrefix(wide, narrow), 0, "not symmetric");
+            assert_eq!(
+                api::CFStringHasPrefix(narrow, narrow),
+                1,
+                "a string is its own prefix"
+            );
+            assert_eq!(
+                api::CFStringHasSuffix(narrow, string::from_bytes(b"app", false)),
+                1
+            );
+            assert_eq!(api::CFStringHasSuffix(narrow, wide), 0);
+
+            // A prefix is a run of *code units*, which is what this function
+            // compares and what a caller matching text expects: the mark after
+            // "cafe" does not stop "cafe" from being a prefix, and nothing after
+            // it does either.
+            let cafe: Vec<u16> = "cafe".encode_utf16().collect();
+            assert_eq!(
+                api::CFStringHasPrefix(accented, string::from_utf16(&cafe)),
+                1,
+                "the base spelling is still a prefix of the combined one"
+            );
+            let beyond: Vec<u16> = "cafe\u{0301}!".encode_utf16().collect();
+            assert_eq!(
+                api::CFStringHasPrefix(accented, string::from_utf16(&beyond)),
+                0,
+                "but one character longer is not"
+            );
+            // A character above the BMP is two units, and either half of it is
+            // half a prefix - so the two halves are prefixes and the whole is too.
+            let emoji_units: Vec<u16> = "\u{1F600}x".encode_utf16().collect();
+            let with_emoji = string::from_utf16(&emoji_units);
+            let whole_emoji: Vec<u16> = "\u{1F600}".encode_utf16().collect();
+            assert_eq!(
+                api::CFStringHasPrefix(with_emoji, string::from_utf16(&whole_emoji)),
+                1
+            );
+            let half_emoji = vec![whole_emoji[0]];
+            assert_eq!(
+                api::CFStringHasPrefix(with_emoji, string::from_utf16(&half_emoji)),
+                1,
+                "an unpaired surrogate is one unit of text like any other"
+            );
+            let one_more: Vec<u16> = "\u{1F600}y".encode_utf16().collect();
+            assert_eq!(
+                api::CFStringHasPrefix(with_emoji, string::from_utf16(&one_more)),
+                0
+            );
+
+            // Nothing to compare is not a match, rather than a fault.
+            assert_eq!(api::CFStringHasPrefix(narrow, std::ptr::null()), 0);
+            assert_eq!(api::CFStringHasSuffix(std::ptr::null(), narrow), 0);
+            assert_eq!(api::CFStringHasSuffix(narrow, narrow), 1);
+
+            for made in [narrow, wide, accented, with_emoji] {
+                api::CFRelease(made);
+            }
+        }
+    }
+
+    /// What a character is, as a caller measuring where one begins can see it.
+    ///
+    /// Every case here is a case where counting code units puts the boundary in
+    /// the wrong place, which is the whole reason the function exists.
+    #[test]
+    fn a_character_cluster_is_a_character_and_not_its_code_units() {
+        bootstrap();
+        // "e" + combining acute, an emoji above the BMP, a family emoji, a flag,
+        // and two ordinary characters. Fifteen code units, six characters.
+        let text = "e\u{0301}\u{1F600}\u{1F469}\u{200D}\u{1F4BB}\u{1F1FA}\u{1F1F8}ab";
+        let units: Vec<u16> = text.encode_utf16().collect();
+        let s = string::from_utf16(&units);
+        assert_eq!(
+            units.len(),
+            15,
+            "the count the boundaries below are written for"
+        );
+        // The boundaries, as a caller walking the string would meet them.
+        let expected = [(0, 2), (2, 2), (4, 5), (9, 2), (13, 1), (14, 1)];
+
+        // SAFETY: a string this test made and an out-parameter below.
+        unsafe {
+            for &(location, length) in &expected {
+                let mut range = api::CFRange {
+                    location: -1,
+                    length: -1,
+                };
+                // Probed at the *start* of each character, which is the index a
+                // caller walking a string asks about.
+                let found = api::CFStringGetRangeOfCharacterClusterAtIndex(
+                    s,
+                    location as base::CFIndex,
+                    &mut range,
+                );
+                assert_eq!(
+                    (found.location, found.length),
+                    (location as base::CFIndex, length as base::CFIndex),
+                    "the returned range for the character at {location} of {text:?}"
+                );
+                assert_eq!(
+                    (range.location, range.length),
+                    (found.location, found.length),
+                    "and the out-parameter carries the same answer, which is the \
+                     one no signature in this tree can return"
+                );
+                // Every unit inside the cluster answers for the whole of it.
+                for inside in location..location + length {
+                    let mut inner = api::CFRange {
+                        location: -1,
+                        length: -1,
+                    };
+                    api::CFStringGetRangeOfCharacterClusterAtIndex(
+                        s,
+                        inside as base::CFIndex,
+                        &mut inner,
+                    );
+                    assert_eq!(
+                        (inner.location, inner.length),
+                        (found.location, found.length),
+                        "unit {inside} is inside the character, so it must answer \
+                         for the whole of it"
+                    );
+                }
+            }
+
+            // Outside the string, and a null string, are the empty range - which is
+            // what the header documents, including for an index equal to the
+            // length.
+            for index in [units.len() as base::CFIndex, 999, -1] {
+                let mut range = api::CFRange {
+                    location: -1,
+                    length: -1,
+                };
+                let found = api::CFStringGetRangeOfCharacterClusterAtIndex(s, index, &mut range);
+                assert_eq!((found.location, found.length), (0, 0), "index {index}");
+                assert_eq!(
+                    (range.location, range.length),
+                    (0, 0),
+                    "and through the pointer"
+                );
+            }
+            let empty = string::from_utf16(&[]);
+            let mut range = api::CFRange {
+                location: -1,
+                length: -1,
+            };
+            let found = api::CFStringGetRangeOfCharacterClusterAtIndex(empty, 0, &mut range);
+            assert_eq!((found.location, found.length), (0, 0));
+            let found = api::CFStringGetRangeOfCharacterClusterAtIndex(
+                std::ptr::null(),
+                0,
+                std::ptr::null_mut(),
+            );
+            assert_eq!(
+                (found.location, found.length),
+                (0, 0),
+                "and a null string is not a fault"
+            );
+
+            api::CFRelease(empty);
+            api::CFRelease(s);
+        }
+    }
+
+    /// `kCFNull`'s type ID has to be the type `CFGetTypeID` reports for the object
+    /// behind that symbol, or a guest testing for a null by either spelling
+    /// disagrees with itself.
+    #[test]
+    fn the_null_type_id_is_the_class_of_the_null() {
+        bootstrap();
+        // SAFETY: a `CFTypeID` and the class it names; both null-safe.
+        unsafe {
+            let id = api::CFNullGetTypeID();
+            assert_ne!(
+                id, 0,
+                "a type ID of zero is every non-CoreFoundation object"
+            );
+            // Asked twice it is the same value, which also says the class is
+            // registered once however many times a guest asks.
+            assert_eq!(api::CFNullGetTypeID(), id);
+            // And `CFGetTypeID` of the null itself agrees - which only holds
+            // because the class is *marked*, so the two cannot drift apart.
+            let null = null_object() as base::CFTypeRef;
+            if !null.is_null() {
+                assert_eq!(api::CFGetTypeID(null), id);
+                assert_ne!(api::CFGetTypeID(null), api::CFStringGetTypeID());
+            }
+        }
+    }
+
+    /// A locale is an object the caller owns, and every locale in the process
+    /// answers the same questions - which is the property a caller comparing an
+    /// identifier has and the reason the identifier is not stored.
+    #[test]
+    fn a_locale_is_an_object_and_a_string_is_not_one() {
+        bootstrap();
+        // SAFETY: strings and calls this test makes.
+        unsafe {
+            let identifier = string::from_bytes(b"fr_CA", false);
+            let locale = api::CFLocaleCreate(std::ptr::null(), identifier);
+            assert!(!locale.is_null(), "a locale is a live CF object");
+            assert_eq!(
+                api::CFGetRetainCount(locale),
+                1,
+                "a Create hands over a reference"
+            );
+            // `CFRetain`/`CFRelease` work on it, which is the part that matters: it
+            // is a real object of this runtime and not a handle.
+            api::CFRetain(locale);
+            assert_eq!(api::CFGetRetainCount(locale), 2);
+            api::CFRelease(locale);
+            api::CFRelease(locale);
+
+            // A null identifier is the current locale, and a pointer that is not a
+            // string is not a locale at all.
+            assert!(!api::CFLocaleCreate(std::ptr::null(), std::ptr::null()).is_null());
+            assert!(
+                !api::CFLocaleCreate(std::ptr::null(), identifier).is_null(),
+                "and the same identifier twice is two objects"
+            );
+            let number = collections::new_number(collections::Number::Integer(1));
+            assert!(
+                api::CFLocaleCreate(std::ptr::null(), number).is_null(),
+                "a number is not a locale identifier"
+            );
+
+            api::CFRelease(number);
+            api::CFRelease(locale);
+            api::CFRelease(identifier);
+        }
+    }
+
+    /// A set holds each value once, keeps what it holds, and only a set created
+    /// mutable may be added to - the same three things an array does, which is
+    /// why the code is shared.
+    #[test]
+    fn a_set_holds_each_value_once_and_only_a_mutable_one_grows() {
+        bootstrap();
+        // SAFETY: objects and calls this test makes.
+        unsafe {
+            let one = string::from_bytes(b"one", false);
+            let other = string::from_bytes(b"other", false);
+            let values = [one, one, other];
+            let set = api::CFSetCreate(
+                std::ptr::null(),
+                3,
+                values.as_ptr(),
+                &callbacks::TYPE_KEY_CALLBACKS,
+            );
+            assert!(!set.is_null());
+            assert_eq!(api::CFSetGetCount(set), 2, "the repeat is not in the set");
+            assert_eq!(api::CFGetTypeID(set), api::CFSetGetTypeID());
+            // The set took its own reference, so releasing the creator's leaves it
+            // readable - which is what a guest that puts a local into a set and
+            // drops the local relies on.
+            assert_eq!(api::CFGetRetainCount(one), 2);
+            api::CFRelease(one);
+            api::CFRelease(other);
+            let mut read: [base::CFTypeRef; 2] = [std::ptr::null(); 2];
+            api::CFSetGetValues(set, read.as_mut_ptr());
+            assert!(read.contains(&one), "the elements are still there");
+
+            // An immutable set does not grow, by name rather than by class.
+            api::CFSetAddValue(set, string::from_bytes(b"third", false));
+            assert_eq!(api::CFSetGetCount(set), 2, "an immutable set does not grow");
+
+            // A mutable one does, and equality is by characters: a *different*
+            // string object with the same text is already in the set.
+            let mutable_set =
+                api::CFSetCreateMutable(std::ptr::null(), 0, &callbacks::TYPE_KEY_CALLBACKS);
+            assert_eq!(api::CFSetGetCount(mutable_set), 0);
+            api::CFSetAddValue(mutable_set, one);
+            api::CFSetAddValue(mutable_set, one);
+            api::CFSetAddValue(mutable_set, string::from_bytes(b"one", false));
+            assert_eq!(
+                api::CFSetGetCount(mutable_set),
+                1,
+                "equal values are one value"
+            );
+            api::CFSetAddValue(mutable_set, other);
+            assert_eq!(api::CFSetGetCount(mutable_set), 2);
+            // And it is a set a guest can mutate: `isKindOfClass:` on the
+            // Foundation side has to say so, which is why mutability is a field
+            // and not a class.
+            let mutable_class = objc::class::lookup(c"NSMutableSet").expect("registered");
+            assert!(base::is_kind_of(mutable_set, mutable_class));
+            assert!(base::is_kind_of(
+                set,
+                objc::class::lookup(c"NSSet").unwrap()
+            ));
+
+            // A negative count, and a count with no array, are refused.
+            assert!(
+                api::CFSetCreate(std::ptr::null(), -1, values.as_ptr(), std::ptr::null()).is_null()
+            );
+            assert!(
+                api::CFSetCreate(std::ptr::null(), 2, std::ptr::null(), std::ptr::null()).is_null()
+            );
+            // Null callbacks means "not objects": nothing is retained and
+            // equality is by pointer, which is what a set of integers needs.
+            let raw = [
+                7 as base::CFTypeRef,
+                7 as base::CFTypeRef,
+                9 as base::CFTypeRef,
+            ];
+            let by_pointer = api::CFSetCreate(std::ptr::null(), 3, raw.as_ptr(), std::ptr::null());
+            assert_eq!(
+                api::CFSetGetCount(by_pointer),
+                2,
+                "the same pointer is one value"
+            );
+
+            api::CFRelease(by_pointer);
+            api::CFRelease(mutable_set);
+            api::CFRelease(set);
+        }
+    }
+
+    /// The error accessors are asked about an object this crate did not make, so
+    /// they are sent rather than read out of it - and the `...Copy` spellings hand
+    /// over a reference the caller owns while the `Get` does not.
+    #[test]
+    fn an_error_answers_its_code_domain_description_and_user_info() {
+        bootstrap();
+        // An `NSError` laid out the way `foundation`'s is, with a class this test
+        // registers and the three methods these four functions send.
+        #[repr(C)]
+        struct Body {
+            isa: *const objc::class::Class,
+            code: i64,
+        }
+        let class = base::register(c"NSError", None, std::mem::size_of::<Body>(), true);
+        unsafe extern "C" fn code(receiver: objc::object::Id, _sel: objc::sel::Sel) -> i64 {
+            // SAFETY: the receiver is a `Body` this test laid out.
+            unsafe { (*(receiver as *const Body)).code }
+        }
+        unsafe extern "C" fn domain(
+            receiver: objc::object::Id,
+            _sel: objc::sel::Sel,
+        ) -> base::CFTypeRef {
+            // SAFETY: the receiver is a `Body` this test laid out.
+            let _ = unsafe { &*(receiver as *const Body) };
+            string::from_bytes(b"com.example.test", false)
+        }
+        unsafe extern "C" fn description(
+            receiver: objc::object::Id,
+            _sel: objc::sel::Sel,
+        ) -> base::CFTypeRef {
+            // SAFETY: the receiver is a `Body` this test laid out.
+            let _ = unsafe { &*(receiver as *const Body) };
+            string::from_bytes(b"something went wrong", false)
+        }
+        class.add_method(
+            objc::sel::get("code"),
+            code as *const std::ffi::c_void,
+            c"q16@0:8",
+        );
+        class.add_method(
+            objc::sel::get("domain"),
+            domain as *const std::ffi::c_void,
+            c"@16@0:8",
+        );
+        class.add_method(
+            objc::sel::get("localizedDescription"),
+            description as *const std::ffi::c_void,
+            c"@16@0:8",
+        );
+        class.add_method(
+            objc::sel::get("userInfo"),
+            description as *const std::ffi::c_void,
+            c"@16@0:8",
+        );
+
+        // SAFETY: `Body` begins with `isa` and is the layout `class` was
+        // registered with.
+        let body: *mut Body = unsafe { base::allocate(class) };
+        // SAFETY: a live instance whose second word is this test's.
+        unsafe { (*body).code = -42 };
+        let error = body as base::CFTypeRef;
+
+        // SAFETY: an object this test made.
+        unsafe {
+            assert_eq!(api::CFErrorGetCode(error), -42);
+            // A negative code is a failure, and a wide one survives - which is the
+            // case a POSIX `errno` mapped into an error lands in.
+            let wide = -((1i64 << 40) + 7);
+            (*body).code = wide;
+            assert_eq!(api::CFErrorGetCode(error), wide as base::CFIndex);
+
+            // The type ID is the class, and `CFGetTypeID` agrees.
+            assert_eq!(api::CFGetTypeID(error), api::CFErrorGetTypeID());
+            assert_ne!(api::CFErrorGetTypeID(), 0);
+            assert_ne!(api::CFErrorGetTypeID(), api::CFNullGetTypeID());
+
+            // A `Get`: the object is not the caller's to release, and asking twice
+            // gives the same string.
+            let domain = api::CFErrorGetDomain(error);
+            assert!(!domain.is_null());
+            assert_eq!(
+                string::as_string(domain).unwrap().utf8(),
+                b"com.example.test"
+            );
+
+            // A `Copy`: the caller owns it, so the count is the creator's plus one
+            // and the caller's release balances.
+            let described = api::CFErrorCopyDescription(error);
+            assert_eq!(
+                api::CFGetRetainCount(described),
+                2,
+                "a Copy hands over a reference"
+            );
+            assert_eq!(
+                string::as_string(described).unwrap().utf8(),
+                b"something went wrong"
+            );
+            api::CFRelease(described);
+
+            let info = api::CFErrorCopyUserInfo(error);
+            assert!(!info.is_null(), "a `Copy` of whatever -userInfo answered");
+            api::CFRelease(info);
+
+            // Nothing at all is answered rather than a fault: zero for the code, and
+            // null for the three object-valued ones.
+            assert_eq!(api::CFErrorGetCode(std::ptr::null()), 0);
+            assert!(api::CFErrorGetDomain(std::ptr::null()).is_null());
+            assert!(api::CFErrorCopyDescription(std::ptr::null()).is_null());
+            assert!(api::CFErrorCopyUserInfo(std::ptr::null()).is_null());
+            // And an object that is not an error at all answers the same way, since
+            // it has none of the methods.
+            let not_an_error = string::from_bytes(b"x", false);
+            assert_eq!(api::CFErrorGetCode(not_an_error), 0);
+            assert!(api::CFErrorCopyDescription(not_an_error).is_null());
+            api::CFRelease(not_an_error);
+
+            (*body).code = 0;
+        }
+    }
+
+    /// A bundle's function pointer is this runtime's own answer to "where does
+    /// this symbol live", and null for one nothing defines.
+    ///
+    /// The lookup is the runtime's, not this crate's - a bundle function lives in
+    /// a linked image and here every framework is linked into the host. A
+    /// provider registered for the test stands in for the framework list the
+    /// runtime installs at start-up, so what is being checked is that the name
+    /// is *asked of the right place* rather than that a particular symbol exists.
+    #[test]
+    fn a_bundle_function_pointer_is_the_runtime_s_own_symbol() {
+        bootstrap();
+        /// The one name this test's provider answers, and the address it answers
+        /// with.
+        const FOUND: &str = "CFStringGetFunctionPointerForNameFixture";
+        extern "C" fn entry() -> u32 {
+            0xC0FF_EE00
+        }
+        fn provider(name: &str) -> Option<u64> {
+            (name == FOUND).then_some(entry as *const () as usize as u64)
+        }
+        darwin::register_provider(provider);
+
+        // SAFETY: strings and calls this test makes.
+        unsafe {
+            let known = string::from_bytes(FOUND.as_bytes(), false);
+            let found = api::CFBundleGetFunctionPointerForName(std::ptr::null(), known);
+            assert_eq!(found as *const (), entry as *const ());
+            // It is an address that can be called as what it names, which is what
+            // a guest holding this pointer does with it.
+            let call: extern "C" fn() -> u32 = std::mem::transmute(found);
+            assert_eq!(call(), 0xC0FF_EE00);
+
+            // Nothing defines this one, which is what Apple answers for a symbol a
+            // bundle does not export.
+            let unknown = string::from_bytes(b"NoSuchFrameworkFunction12345", false);
+            assert!(api::CFBundleGetFunctionPointerForName(std::ptr::null(), unknown).is_null());
+            // And a name that is not a string is not a function name.
+            assert!(
+                api::CFBundleGetFunctionPointerForName(std::ptr::null(), std::ptr::null())
+                    .is_null()
+            );
+
+            api::CFRelease(unknown);
+            api::CFRelease(known);
         }
     }
 
