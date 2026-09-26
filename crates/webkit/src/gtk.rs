@@ -62,6 +62,10 @@ pub const USER_SCRIPT_INJECT_AT_DOCUMENT_END: c_int = 1;
 /// `WEBKIT_NETWORK_ERROR_CANCELLED`.
 pub const NETWORK_ERROR_CANCELLED: c_int = 302;
 
+pub const SCRIPT_DIALOG_ALERT: c_int = 0;
+pub const SCRIPT_DIALOG_CONFIRM: c_int = 1;
+pub const SCRIPT_DIALOG_PROMPT: c_int = 2;
+
 macro_rules! api {
     ($( $name:ident: fn($($arg:ty),* $(,)?) $(-> $ret:ty)?; )*) => {
         #[allow(non_snake_case)]
@@ -129,8 +133,18 @@ api! {
     webkit_settings_set_user_agent: fn(Ptr, *const c_char);
     webkit_settings_set_enable_developer_extras: fn(Ptr, c_int);
     webkit_settings_set_hardware_acceleration_policy: fn(Ptr, c_int);
+    webkit_settings_set_allow_file_access_from_file_urls: fn(Ptr, c_int);
+    webkit_settings_set_allow_universal_access_from_file_urls: fn(Ptr, c_int);
     webkit_settings_set_enable_write_console_messages_to_stdout: fn(Ptr, c_int);
     webkit_web_view_load_uri: fn(Ptr, *const c_char);
+    webkit_web_view_load_html: fn(Ptr, *const c_char, *const c_char);
+    webkit_web_view_reload: fn(Ptr);
+    webkit_web_view_get_title: fn(Ptr) -> *const c_char;
+    webkit_script_dialog_get_dialog_type: fn(Ptr) -> c_int;
+    webkit_script_dialog_get_message: fn(Ptr) -> *const c_char;
+    webkit_script_dialog_prompt_get_default_text: fn(Ptr) -> *const c_char;
+    webkit_script_dialog_prompt_set_text: fn(Ptr, *const c_char);
+    webkit_script_dialog_confirm_set_confirmed: fn(Ptr, c_int);
     webkit_web_view_stop_loading: fn(Ptr);
     webkit_web_view_get_uri: fn(Ptr) -> *const c_char;
     webkit_web_view_set_background_color: fn(Ptr, *const Rgba);

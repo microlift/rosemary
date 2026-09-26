@@ -113,6 +113,11 @@ impl Timer {
         self.valid.load(Ordering::Acquire)
     }
 
+    /// The `info` word the timer was created with.
+    pub fn info(&self) -> usize {
+        self.info
+    }
+
     /// The repeat interval in seconds, or zero for a one-shot - which is how
     /// Apple's reports one, and what a caller testing "does this repeat" reads.
     pub fn interval_seconds(&self) -> f64 {

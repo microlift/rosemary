@@ -10,6 +10,7 @@ exports.workspace = true
 appkit.workspace = true
 objc.workspace = true
 corefoundation.workspace = true
+prefix.workspace = true
 darwin.workspace = true
 foundation.workspace = true
 libc.workspace = true

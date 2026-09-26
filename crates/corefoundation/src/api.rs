@@ -437,13 +437,15 @@ pub unsafe extern "C" fn CFStringGetCString(
         {
             return 0;
         }
-        _ => {
-            let utf8 = s.utf8();
-            if utf8.iter().any(|b| *b >= 0x80) {
-                return 0;
+        e if crate::eightbit::is_table(e) => {
+            let encoded: Option<Vec<u8>> =
+                s.units().into_iter().map(|u| crate::eightbit::encode(u, e)).collect();
+            match encoded {
+                Some(bytes) => bytes,
+                None => return 0,
             }
-            utf8
         }
+        _ => return 0,
     };
     if bytes.len() + 1 > buffer_size as usize {
         return 0;
@@ -498,12 +500,19 @@ pub unsafe extern "C" fn CFStringGetBytes(
         | string::encoding::ISO_LATIN_1
         | string::encoding::MAC_ROMAN
         | string::encoding::WINDOWS_LATIN1 => {
-            let utf8 = s.utf8();
-            if start > utf8.len() {
-                return 0;
-            }
-            let end = (start + length).min(utf8.len());
-            (utf8[start..end].to_vec(), 1, 0)
+            // SAFETY: the caller's buffer and out-parameter, as for the others.
+            return unsafe {
+                get_bytes_by_character(
+                    &s.units(),
+                    start,
+                    length,
+                    encoding,
+                    _loss_byte,
+                    buffer,
+                    max_buffer_length,
+                    used_buffer_length,
+                )
+            };
         }
         string::encoding::UTF16 | string::encoding::UTF16_BE | string::encoding::UTF16_LE => {
             let units = s.units();
@@ -575,6 +584,69 @@ pub unsafe extern "C" fn CFStringGetBytes(
         unsafe { *used_buffer_length = moved as CFIndex };
     }
     (moved.saturating_sub(prefix) / per_character) as CFIndex
+}
+
+/// `CFStringGetBytes` for UTF-8 and the one-byte encodings: the range is in
+/// characters, as every range is, and each is converted whole - a buffer that
+/// runs out, or a character the encoding lacks with no loss byte to stand in,
+/// ends the conversion at the character before.
+///
+/// # Safety
+///
+/// `buffer` is null or holds `max_buffer_length` bytes; `used_buffer_length` is
+/// null or writable.
+#[allow(clippy::too_many_arguments)]
+unsafe fn get_bytes_by_character(
+    units: &[u16],
+    start: usize,
+    length: usize,
+    encoding: u32,
+    loss_byte: u8,
+    buffer: *mut u8,
+    max_buffer_length: CFIndex,
+    used_buffer_length: *mut CFIndex,
+) -> CFIndex {
+    if start > units.len() {
+        return 0;
+    }
+    let end = (start + length).min(units.len());
+    let room = match buffer.is_null() {
+        true => usize::MAX,
+        false => max_buffer_length.max(0) as usize,
+    };
+    let (mut converted, mut used, mut at) = (0usize, 0usize, start);
+    while at < end {
+        // One character: a surrogate pair is two units and one character.
+        let pair = at + 1 < end
+            && (0xD800..0xDC00).contains(&units[at])
+            && (0xDC00..0xE000).contains(&units[at + 1]);
+        let span = 1 + pair as usize;
+        let piece: Option<Vec<u8>> = match encoding {
+            string::encoding::UTF8 => Some(String::from_utf16_lossy(&units[at..at + span]).into_bytes()),
+            _ if pair => None,
+            code => crate::eightbit::encode(units[at], code).map(|b| vec![b]),
+        };
+        let piece = match piece {
+            Some(piece) => piece,
+            None if loss_byte != 0 => vec![loss_byte],
+            None => break,
+        };
+        if used + piece.len() > room {
+            break;
+        }
+        if !buffer.is_null() {
+            // SAFETY: within the `room` bytes the caller provided.
+            unsafe { std::ptr::copy_nonoverlapping(piece.as_ptr(), buffer.add(used), piece.len()) };
+        }
+        used += piece.len();
+        converted += span;
+        at += span;
+    }
+    if !used_buffer_length.is_null() {
+        // SAFETY: the caller's out-parameter.
+        unsafe { *used_buffer_length = used as CFIndex };
+    }
+    converted as CFIndex
 }
 
 pub unsafe extern "C" fn CFStringCreateExternalRepresentation(
@@ -2191,7 +2263,8 @@ pub unsafe extern "C" fn CFURLCreateFromFSRef(
         return std::ptr::null();
     };
     let path = String::from_utf8_lossy(&bytes[..end]);
-    let directory = std::fs::metadata(path.as_ref()).is_ok_and(|metadata| metadata.is_dir());
+    // The path is the guest's spelling; the host's answers whether it is a folder.
+    let directory = std::fs::metadata(prefix::ns::host_path(&path)).is_ok_and(|metadata| metadata.is_dir());
     crate::url::new_file_url(&path, directory)
 }
 
@@ -2234,6 +2307,120 @@ pub unsafe extern "C" fn CFURLGetFSRef(url: CFTypeRef, fs_ref: *mut c_void) -> B
     let make_ref: unsafe extern "C" fn(*const u8, *mut c_void, *mut u8) -> i32 =
         unsafe { std::mem::transmute(entry) };
     u8::from(unsafe { make_ref(path.as_ptr().cast(), fs_ref, std::ptr::null_mut()) } == 0)
+}
+
+/// What starts every bookmark this tree makes; the guest path of the item
+/// follows. Apple's format records volume and file identifiers this host
+/// cannot supply, and a bookmark is opaque to the program that holds one.
+const BOOKMARK_MAGIC: &[u8] = b"R3Bookmark\0";
+
+/// The guest path of a file URL, and the host path it names.
+fn url_paths(url: CFTypeRef) -> Option<(String, std::path::PathBuf)> {
+    // SAFETY: a URL or null.
+    let path = unsafe { crate::url::as_url(url) }?.file_path()?;
+    let host = prefix::ns::host_path(&path);
+    Some((path, host))
+}
+
+/// The guest path a bookmark from [`CFURLCreateBookmarkData`] records.
+fn bookmark_path(data: CFTypeRef) -> Option<String> {
+    // SAFETY: a data object or null.
+    let bytes = unsafe { collections::data(data) }?;
+    let path = bytes.strip_prefix(BOOKMARK_MAGIC)?;
+    String::from_utf8(path.to_vec()).ok()
+}
+
+/// `CFDataRef CFURLCreateBookmarkData(CFAllocatorRef, CFURLRef,
+/// CFURLBookmarkCreationOptions, CFArrayRef, CFURLRef, CFErrorRef *)`
+///
+/// Null, as on a Mac, for an item that is not there. No error object is made.
+pub unsafe extern "C" fn CFURLCreateBookmarkData(
+    _allocator: CFAllocatorRef,
+    url: CFTypeRef,
+    _options: u64,
+    _properties: CFTypeRef,
+    _relative_to: CFTypeRef,
+    _error: *mut CFTypeRef,
+) -> CFTypeRef {
+    let Some((path, host)) = url_paths(url) else {
+        return std::ptr::null();
+    };
+    if std::fs::symlink_metadata(&host).is_err() {
+        return std::ptr::null();
+    }
+    let mut bytes = BOOKMARK_MAGIC.to_vec();
+    bytes.extend_from_slice(path.as_bytes());
+    collections::new_data(bytes)
+}
+
+/// `CFURLRef CFURLCreateByResolvingBookmarkData(CFAllocatorRef, CFDataRef,
+/// CFURLBookmarkResolutionOptions, CFURLRef, CFArrayRef, Boolean *, CFErrorRef *)`
+pub unsafe extern "C" fn CFURLCreateByResolvingBookmarkData(
+    _allocator: CFAllocatorRef,
+    bookmark: CFTypeRef,
+    _options: u64,
+    _relative_to: CFTypeRef,
+    _properties: CFTypeRef,
+    is_stale: *mut Boolean,
+    _error: *mut CFTypeRef,
+) -> CFTypeRef {
+    let Some(path) = bookmark_path(bookmark) else {
+        return std::ptr::null();
+    };
+    let Ok(metadata) = std::fs::metadata(prefix::ns::host_path(&path)) else {
+        return std::ptr::null();
+    };
+    if !is_stale.is_null() {
+        // SAFETY: the caller's writable `Boolean`.
+        unsafe { *is_stale = 0 };
+    }
+    crate::url::new_file_url(&path, metadata.is_dir())
+}
+
+/// `Boolean CFURLWriteBookmarkDataToFile(CFDataRef, CFURLRef,
+/// CFURLBookmarkFileCreationOptions, CFErrorRef *)`
+///
+/// A Finder alias file is a format the host cannot follow, so the alias is
+/// written as a symlink, which both a Mac and this host resolve.
+pub unsafe extern "C" fn CFURLWriteBookmarkDataToFile(
+    bookmark: CFTypeRef,
+    file: CFTypeRef,
+    _options: u64,
+    _error: *mut CFTypeRef,
+) -> Boolean {
+    let (Some(target), Some((_, at))) = (bookmark_path(bookmark), url_paths(file)) else {
+        return 0;
+    };
+    let Ok(c_at) = std::ffi::CString::new(at.as_os_str().as_encoded_bytes()) else {
+        return 0;
+    };
+    if prefix::ns::may_write_at(libc::AT_FDCWD, &c_at).is_err() {
+        return 0;
+    }
+    if std::fs::symlink_metadata(&at).is_ok_and(|m| !m.is_dir()) {
+        let _ = std::fs::remove_file(&at);
+    }
+    u8::from(std::os::unix::fs::symlink(prefix::ns::host_path(&target), &at).is_ok())
+}
+
+/// `CFDataRef CFURLCreateBookmarkDataFromFile(CFAllocatorRef, CFURLRef, CFErrorRef *)`
+///
+/// Reads back what [`CFURLWriteBookmarkDataToFile`] wrote: a symlink.
+pub unsafe extern "C" fn CFURLCreateBookmarkDataFromFile(
+    _allocator: CFAllocatorRef,
+    file: CFTypeRef,
+    _error: *mut CFTypeRef,
+) -> CFTypeRef {
+    let Some((_, at)) = url_paths(file) else {
+        return std::ptr::null();
+    };
+    let Ok(target) = std::fs::read_link(&at) else {
+        return std::ptr::null();
+    };
+    let guest = prefix::ns::to_guest(&target).unwrap_or(target);
+    let mut bytes = BOOKMARK_MAGIC.to_vec();
+    bytes.extend_from_slice(guest.as_os_str().as_encoded_bytes());
+    collections::new_data(bytes)
 }
 
 /// `kCFURLPOSIXPathStyle`, which is how a path on this host is written.
@@ -3111,6 +3298,26 @@ pub unsafe extern "C" fn CFRunLoopRemoveTimer(loop_: CFTypeRef, timer: CFTypeRef
         return;
     };
     l.remove_timer(&t, &unsafe { mode_name(mode) });
+}
+
+/// `void CFRunLoopTimerGetContext(CFRunLoopTimerRef, CFRunLoopTimerContext *)`
+///
+/// The `info` word as given. The context's retain, release and description
+/// callbacks are not kept past creation, so they come back null.
+pub unsafe extern "C" fn CFRunLoopTimerGetContext(timer: CFTypeRef, context: *mut CFRunLoopTimerContext) {
+    let (Some(t), false) = (unsafe { borrow::<Timer>(timer) }, context.is_null()) else {
+        return;
+    };
+    // SAFETY: the caller's writable context structure.
+    unsafe {
+        context.write(CFRunLoopTimerContext {
+            version: 0,
+            info: t.info() as *mut c_void,
+            retain: std::ptr::null(),
+            release: std::ptr::null(),
+            copy_description: std::ptr::null(),
+        })
+    };
 }
 
 /// `CFTimeInterval CFRunLoopTimerGetInterval(CFRunLoopTimerRef)`

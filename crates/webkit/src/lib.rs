@@ -7,6 +7,7 @@ mod data_store;
 mod engine;
 mod gtk;
 mod input;
+mod legacy;
 mod web_view;
 
 /// Send a message: `send!(receiver, "selector:", argument => Type, ...; Return)`.
@@ -68,6 +69,11 @@ const CLASSES: &[&std::ffi::CStr] = &[
     c"WKFrameInfo",
     c"WKSecurityOrigin",
     c"WKWindowFeatures",
+    c"WebView",
+    c"WebFrame",
+    c"WebDataSource",
+    c"WebScriptObject",
+    c"WebUndefined",
 ];
 
 pub fn bootstrap() {
@@ -78,6 +84,7 @@ pub fn bootstrap() {
         configuration::install();
         data_store::install();
         web_view::install();
+        legacy::install();
 
         let preferences = corefoundation::base::abstract_class(c"WebPreferences", None);
         class_methods!(preferences, {

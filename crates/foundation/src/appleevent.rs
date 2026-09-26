@@ -901,6 +901,8 @@ pub unsafe fn dispatch(event: Id) -> Id {
         );
     }
     let Some((handler, selector)) = found else {
+        // SAFETY: descriptors this module made.
+        unsafe { dispatch_to_c(event, reply, event_class, event_id) };
         return reply;
     };
     let previous = CURRENT.with(|c| c.replace((event, reply)));
@@ -910,6 +912,166 @@ pub unsafe fn dispatch(event: Id) -> Id {
     unsafe { call_handler(handler, selector, event, reply) };
     CURRENT.with(|c| c.set(previous));
     reply
+}
+
+// -- The Apple Event Manager's C interface -----------------------------------
+
+/// `AEDesc`: a type code and an opaque handle. The handle here is one of this
+/// module's descriptor objects, retained, so the C calls and the Objective-C
+/// ones read the same payload.
+#[repr(C)]
+pub struct AeDesc {
+    descriptor_type: u32,
+    data_handle: Id,
+}
+
+/// `OSErr (*AEEventHandlerProcPtr)(const AppleEvent *, AppleEvent *, SRefCon)`
+type CHandlerProc = unsafe extern "C" fn(*const AeDesc, *mut AeDesc, usize) -> i16;
+
+/// One `AEInstallEventHandler`, keyed as the Objective-C table is.
+struct CHandler {
+    event_class: u32,
+    event_id: u32,
+    proc_: usize,
+    refcon: usize,
+}
+
+static C_HANDLERS: std::sync::Mutex<Vec<CHandler>> = std::sync::Mutex::new(Vec::new());
+
+/// `errAEEventNotHandled`, `errAEHandlerNotFound` and `paramErr`.
+const EVENT_NOT_HANDLED: i16 = -1708;
+const HANDLER_NOT_FOUND: i16 = -1717;
+const PARAM_ERR: i16 = -50;
+
+/// Hand an event no Objective-C handler took to a C one, as the Apple Event
+/// Manager consults one table for both.
+///
+/// # Safety
+///
+/// `event` and `reply` are descriptors this module made.
+unsafe fn dispatch_to_c(event: Id, reply: Id, event_class: u32, event_id: u32) {
+    let found = C_HANDLERS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+        .find(|h| (h.event_class, h.event_id) == (event_class, event_id))
+        .map(|h| (h.proc_, h.refcon));
+    let Some((proc_, refcon)) = found else {
+        return;
+    };
+    let event = AeDesc { descriptor_type: TYPE_APPLE_EVENT, data_handle: event };
+    let mut reply = AeDesc { descriptor_type: TYPE_APPLE_EVENT, data_handle: reply };
+    // SAFETY: the guest registered a function of this type; a callable thunk
+    // under emulation, as the ABI table describes the argument.
+    let f: CHandlerProc = unsafe { std::mem::transmute(proc_) };
+    unsafe { f(&event, &mut reply, refcon) };
+}
+
+/// `OSErr AEInstallEventHandler(AEEventClass, AEEventID, AEEventHandlerUPP,
+/// SRefCon, Boolean isSysHandler)`
+#[allow(non_snake_case)]
+pub unsafe extern "C" fn AEInstallEventHandler(
+    event_class: u32,
+    event_id: u32,
+    handler: usize,
+    refcon: usize,
+    _system: u8,
+) -> i16 {
+    if handler == 0 {
+        return PARAM_ERR;
+    }
+    let mut handlers = C_HANDLERS.lock().unwrap_or_else(|e| e.into_inner());
+    handlers.retain(|h| (h.event_class, h.event_id) != (event_class, event_id));
+    handlers.push(CHandler { event_class, event_id, proc_: handler, refcon });
+    0
+}
+
+/// `OSErr AERemoveEventHandler(AEEventClass, AEEventID, AEEventHandlerUPP,
+/// Boolean isSysHandler)`
+#[allow(non_snake_case)]
+pub unsafe extern "C" fn AERemoveEventHandler(
+    event_class: u32,
+    event_id: u32,
+    handler: usize,
+    _system: u8,
+) -> i16 {
+    let mut handlers = C_HANDLERS.lock().unwrap_or_else(|e| e.into_inner());
+    let before = handlers.len();
+    handlers.retain(|h| {
+        (h.event_class, h.event_id) != (event_class, event_id) || (handler != 0 && h.proc_ != handler)
+    });
+    match handlers.len() == before {
+        true => HANDLER_NOT_FOUND,
+        false => 0,
+    }
+}
+
+/// `OSErr AECreateDesc(DescType, const void *, Size, AEDesc *)`
+#[allow(non_snake_case)]
+pub unsafe extern "C" fn AECreateDesc(kind: u32, bytes: *const u8, size: isize, out: *mut AeDesc) -> i16 {
+    if out.is_null() || size < 0 || (bytes.is_null() && size > 0) {
+        return PARAM_ERR;
+    }
+    let data = match size {
+        0 => Vec::new(),
+        // SAFETY: the caller says `bytes` covers `size` bytes.
+        _ => unsafe { std::slice::from_raw_parts(bytes, size as usize) }.to_vec(),
+    };
+    // SAFETY: the caller's writable `AEDesc`.
+    unsafe { out.write(AeDesc { descriptor_type: kind, data_handle: wrap(Desc::leaf(kind, data)) }) };
+    0
+}
+
+/// `OSErr AEDisposeDesc(AEDesc *)`, which leaves the null descriptor behind.
+#[allow(non_snake_case)]
+pub unsafe extern "C" fn AEDisposeDesc(desc: *mut AeDesc) -> i16 {
+    if desc.is_null() {
+        return PARAM_ERR;
+    }
+    // SAFETY: the caller's `AEDesc`, whose handle is one of this module's or null.
+    unsafe {
+        objc::arc::release((*desc).data_handle);
+        desc.write(AeDesc { descriptor_type: TYPE_NULL, data_handle: std::ptr::null_mut() });
+    }
+    0
+}
+
+/// `Size AEGetDescDataSize(const AEDesc *)`
+#[allow(non_snake_case)]
+pub unsafe extern "C" fn AEGetDescDataSize(desc: *const AeDesc) -> isize {
+    // SAFETY: the caller's `AEDesc`.
+    let handle = match desc.is_null() {
+        true => return 0,
+        false => unsafe { (*desc).data_handle },
+    };
+    unsafe { desc_of(handle) }.map_or(0, |d| d.data.len() as isize)
+}
+
+/// `OSErr AEGetDescData(const AEDesc *, void *, Size)`: as much as fits.
+#[allow(non_snake_case)]
+pub unsafe extern "C" fn AEGetDescData(desc: *const AeDesc, out: *mut u8, max: isize) -> i16 {
+    if desc.is_null() || (out.is_null() && max > 0) {
+        return PARAM_ERR;
+    }
+    // SAFETY: the caller's `AEDesc`.
+    let Some(d) = (unsafe { desc_of((*desc).data_handle) }) else {
+        return EVENT_NOT_HANDLED;
+    };
+    let count = d.data.len().min(max.max(0) as usize);
+    // SAFETY: the caller says `out` holds `max` bytes.
+    unsafe { std::ptr::copy_nonoverlapping(d.data.as_ptr(), out, count) };
+    0
+}
+
+exports::exports! {
+    functions {
+        "AEInstallEventHandler" => AEInstallEventHandler,
+        "AERemoveEventHandler" => AERemoveEventHandler,
+        "AECreateDesc" => AECreateDesc,
+        "AEDisposeDesc" => AEDisposeDesc,
+        "AEGetDescDataSize" => AEGetDescDataSize,
+        "AEGetDescData" => AEGetDescData,
+    }
 }
 
 /// Build and dispatch a parameterless event, for the ones this runtime raises.

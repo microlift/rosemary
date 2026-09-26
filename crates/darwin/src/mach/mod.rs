@@ -154,6 +154,7 @@ exports::exports! {
         "mach_port_request_notification" => space::mach_port_request_notification,
 
         "vm_region_64" => vm::vm_region_64,
+        "vm_region_recurse_64" | "mach_vm_region_recurse" => vm::vm_region_recurse_64,
         "vm_deallocate" => vm::vm_deallocate,
         "vm_read_overwrite" => vm::vm_read_overwrite,
         "vm_allocate" => vm::vm_allocate,

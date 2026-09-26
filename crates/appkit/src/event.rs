@@ -22,7 +22,10 @@ pub fn pump(app: Id) {
     while let Some(event) = sdl3::video::poll() {
         deliver(event);
     }
-    for hook in PUMP_HOOKS.lock().unwrap_or_else(|e| e.into_inner()).clone() {
+    // Copied out first: a guard in the loop's head would be held across every
+    // hook, and a hook that runs guest code can turn this pump again.
+    let hooks = PUMP_HOOKS.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    for hook in hooks {
         hook();
     }
     crate::application::check_last_window_closed();
@@ -215,7 +218,7 @@ fn trace_views() {
 
 pub(crate) fn deliver(event: sdl3::video::Event) {
     use sdl3::video::Event;
-    if crate::dialog::deliver(&event) {
+    if crate::dialog::deliver_modal(&event) || crate::dialog::deliver(&event) {
         return;
     }
     match event {
@@ -292,6 +295,11 @@ pub(crate) fn deliver(event: sdl3::video::Event) {
         Event::WindowMouse { window, entered } => {
             if !entered {
                 crate::decor::pointer_left(window);
+            }
+            // A menu's popup is chrome from its first pixel; anything else
+            // is decided by the moves that follow.
+            if entered {
+                crate::cursor::set_over_chrome(crate::decor::is_chrome_popup(window));
             }
             // A resize is performed from outside the client area. SDL reports
             // the resulting leave and re-entry as window events rather than
@@ -405,7 +413,9 @@ pub(crate) fn deliver(event: sdl3::video::Event) {
             if take_warp_echo(x, y) {
                 return;
             }
-            if crate::decor::pointer_moved(id, x, y) {
+            let on_chrome = crate::decor::pointer_moved(id, x, y);
+            crate::cursor::set_over_chrome(on_chrome);
+            if on_chrome {
                 return;
             }
             // A window being dragged by `-performWindowDragWithEvent:` consumes

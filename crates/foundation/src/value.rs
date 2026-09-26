@@ -63,7 +63,7 @@ unsafe extern "C" fn null(class: Id, _sel: Sel) -> Id {
 ///
 /// Sent rather than called, so a guest that replaced `+null` is the one
 /// answering - `NSNull` is a class a guest may categorise.
-pub(crate) fn null_object() -> Id {
+pub fn null_object() -> Id {
     let class = objc::class::lookup(c"NSNull").expect("Foundation registered NSNull");
     // SAFETY: `+null` is `id (Class, SEL)`, installed below.
     unsafe {

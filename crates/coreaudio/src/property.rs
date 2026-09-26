@@ -28,6 +28,20 @@ const SPATIALIZATION: &[u32] = &[
     // and `ReverbPreset`.
     3000, 3002, 3003, 3004, 3010, 3012,
 ];
+/// `kAudioUnitProperty_MatrixLevels`: the matrix mixer's gain table, a
+/// `Float32` for each of `(inputs + 1) * (outputs + 1)` cells.
+const MATRIX_LEVELS: u32 = 3006;
+/// `kAudioUnitProperty_MatrixDimensions`: the matrix mixer's total input and
+/// output channels, which size that table.
+const MATRIX_DIMENSIONS: u32 = 3009;
+
+/// A matrix mixer's `(input channels, output channels)`: every input bus's
+/// channels together, and the output format's.
+fn matrix_dimensions(unit: &crate::Unit) -> (u32, u32) {
+    let inputs = unit.inputs.iter().map(|input| input.format.channels_per_frame).sum();
+    (inputs, unit.format.channels_per_frame)
+}
+
 /// `kAudioUnitProperty_MaximumFramesPerSlice`, which a guest reads to size its
 /// own mixing buffer.
 const MAXIMUM_FRAMES_PER_SLICE: u32 = 14;
@@ -198,6 +212,10 @@ unsafe fn set(
         return PARAM_ERROR;
     }
     let mut unit = unit.lock().unwrap_or_else(|e| e.into_inner());
+    crate::trace::say(
+        format_args!("set property {id} scope {scope} element {element} size {size}"),
+        SUCCESS,
+    );
     // A mixer's input scope is its elements, each with a format and a callback
     // of its own - so the same two property ids mean "this bus" there and "the
     // whole unit" everywhere else.
@@ -207,6 +225,21 @@ unsafe fn set(
     // choice changes nothing - and refusing it fails the voice outright, which
     // is why this comes before the element dispatch rather than inside it.
     if unit.kind == crate::Kind::Mixer && SPATIALIZATION.contains(&id) {
+        return SUCCESS;
+    }
+    if unit.matrix && id == MATRIX_LEVELS {
+        // SAFETY: the caller's `size` bytes of floats.
+        let levels = unsafe { std::slice::from_raw_parts(data as *const f32, size as usize / 4) };
+        unit.levels = levels.to_vec();
+        // FIXME (ACCURACY): the levels are kept and read back but not applied;
+        // this mixer sums every input into the output as the other mixers do.
+        static SAID: std::sync::Once = std::sync::Once::new();
+        SAID.call_once(|| {
+            eprintln!(
+                "rosetta3: coreaudio: a matrix mixer's levels are kept but not applied; every \
+                 input is mixed to the output at unity"
+            )
+        });
         return SUCCESS;
     }
     if unit.kind == crate::Kind::Mixer && scope == scope::INPUT && id != ELEMENT_COUNT {
@@ -381,6 +414,36 @@ pub unsafe extern "C" fn AudioUnitGetProperty(
     }
     let unit = unit.lock().unwrap_or_else(|e| e.into_inner());
     let capacity = unsafe { *size };
+    crate::trace::say(
+        format_args!("get property {id} scope {scope} element {element} capacity {capacity}"),
+        SUCCESS,
+    );
+    if unit.matrix && (id == MATRIX_DIMENSIONS || id == MATRIX_LEVELS) {
+        let (inputs, outputs) = matrix_dimensions(&unit);
+        let words: Vec<u32> = match id {
+            MATRIX_DIMENSIONS => vec![inputs, outputs],
+            _ => {
+                let cells = ((inputs + 1) * (outputs + 1)) as usize;
+                let mut levels = unit.levels.clone();
+                levels.resize(cells, 0.0);
+                levels.into_iter().map(f32::to_bits).collect()
+            }
+        };
+        let wanted = (words.len() * 4) as u32;
+        // SAFETY: the caller's out-parameters, with the capacity checked
+        // before the table is written.
+        unsafe {
+            *size = wanted;
+            if out.is_null() {
+                return SUCCESS;
+            }
+            if capacity < wanted {
+                return INVALID_PROPERTY_VALUE;
+            }
+            std::ptr::copy_nonoverlapping(words.as_ptr(), out as *mut u32, words.len());
+        }
+        return SUCCESS;
+    }
     match id {
         STREAM_FORMAT => {
             let wanted = size_of::<Format>() as u32;

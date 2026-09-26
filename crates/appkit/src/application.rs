@@ -200,6 +200,9 @@ unsafe extern "C" fn finish_launching(receiver: Id, _sel: Sel) {
         unsafe { send_if_implemented(delegate, selector, notification) };
         foundation::notification::post(name, receiver, std::ptr::null_mut());
     }
+    // After the delegate has built its menus, and before any key press, so
+    // Control-Command-F works without the menu having been opened.
+    crate::menu::add_full_screen_item();
 }
 
 /// The URLs this launch was asked to open, in the order they were given.
@@ -670,7 +673,11 @@ unsafe extern "C" fn post_event(_receiver: Id, _sel: Sel, event: Id, at_start: u
 ///
 /// `receiver` is a live application.
 unsafe fn dispatch_posted_events(receiver: Id) {
-    while let Some(event) = posted_events().pop_front() {
+    // Taken as one batch, with the lock released before any is sent: a
+    // `-sendEvent:` override that posts another event must not find the queue
+    // locked, and what it posts is for the next turn, not this one.
+    let batch = std::mem::take(&mut *posted_events());
+    for event in batch {
         let event = event as Id;
         CURRENT_EVENT.store(event as usize, Ordering::Release);
         // SAFETY: the caller's obligation; `-sendEvent:` is `void (id, SEL, id)`.

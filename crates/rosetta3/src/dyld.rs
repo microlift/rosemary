@@ -447,10 +447,11 @@ pub fn set_executable_header(va: u64) {
 
 /// Record where the guest executable came from, and where it landed.
 pub fn set_executable_path(path: &str, slide: u64) {
-    let canonical = std::fs::canonicalize(path)
+    // Symlinks kept, as `Layout::enclosing` keeps them.
+    let absolute = std::path::absolute(path)
         .map(|p| p.to_string_lossy().into_owned())
         .unwrap_or_else(|_| path.to_string());
-    *EXECUTABLE.lock().unwrap_or_else(|e| e.into_inner()) = Some((canonical, slide));
+    *EXECUTABLE.lock().unwrap_or_else(|e| e.into_inner()) = Some((absolute, slide));
 }
 
 /// The path presented to guest process-introspection calls.
@@ -459,7 +460,7 @@ pub fn executable_path() -> Option<String> {
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .as_ref()
-        .map(|(path, _)| path.clone())
+        .map(|(path, _)| guest_spelling(path))
 }
 
 /// How many images are loaded, and the address range they span.
@@ -1493,8 +1494,15 @@ fn interned(text: &str) -> u64 {
     leaked.as_ptr() as usize as u64
 }
 
+/// An image path as the guest spells it: the table keeps host paths, which a
+/// guest joining onto them would find translated into the prefix's root.
+fn guest_spelling(path: &str) -> String {
+    prefix::ns::to_guest(std::path::Path::new(path))
+        .map_or_else(|| path.to_string(), |p| p.to_string_lossy().into_owned())
+}
+
 fn path_cstr(path: &str) -> u64 {
-    interned(path)
+    interned(&guest_spelling(path))
 }
 
 /// The symbol name as C sees it: `dladdr` reports `main`, not `_main`.

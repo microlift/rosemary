@@ -188,12 +188,23 @@ unsafe extern "C" fn run_modal(receiver: Id, _sel: Sel) -> i64 {
         eprintln!("rosetta3: guest alert: buttons {}", buttons.join(" / "));
     }
 
-    // The second button is the one that declines; with fewer than two there is
-    // nothing to decline with and the first is the only answer.
-    let index = match buttons.len() >= 2 {
+    let request = crate::dialog::Request {
+        title: message.clone(),
+        message: message.clone(),
+        informative: informative.clone(),
+        buttons: match buttons.is_empty() {
+            true => vec!["OK".to_string()],
+            false => buttons.to_vec(),
+        },
+        cancel: None,
+        application_icon: true,
+    };
+    // With no dialog to show, the second button is the one that declines;
+    // with fewer than two there is nothing to decline with.
+    let index = crate::dialog::run(&request).unwrap_or(match buttons.len() >= 2 {
         true => 1,
         false => 0,
-    };
+    });
     let answer = FIRST_BUTTON_RETURN + index as i64;
     let chosen = buttons.get(index).map_or("<none>", |t| t.as_str());
     eprintln!("rosetta3: guest alert: answered {answer} ({chosen})");

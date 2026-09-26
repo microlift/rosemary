@@ -70,6 +70,16 @@ fn mixer_component() -> *mut c_void {
     &MIXER_COMPONENT as *const u8 as *mut c_void
 }
 
+/// `kAudioUnitSubType_MatrixMixer`, a component of its own because it has
+/// properties the others do not and a different default shape.
+const SUBTYPE_MATRIX_MIXER: u32 = fourcc(b"mxmx");
+
+static MATRIX_MIXER_COMPONENT: u8 = 0;
+
+fn matrix_mixer_component() -> *mut c_void {
+    &MATRIX_MIXER_COMPONENT as *const u8 as *mut c_void
+}
+
 /// `kAudioUnitType_FormatConverter` and the plain converter subtype.
 const TYPE_CONVERTER: u32 = fourcc(b"aufc");
 const SUBTYPE_CONVERTER: u32 = fourcc(b"conv");
@@ -78,6 +88,21 @@ static CONVERTER_COMPONENT: u8 = 0;
 
 fn converter_component() -> *mut c_void {
     &CONVERTER_COMPONENT as *const u8 as *mut c_void
+}
+
+/// `kAudioUnitSubType_Varispeed`: a converter whose rate the program sets.
+const SUBTYPE_VARISPEED: u32 = fourcc(b"vari");
+
+static VARISPEED_COMPONENT: u8 = 0;
+
+fn varispeed_component() -> *mut c_void {
+    &VARISPEED_COMPONENT as *const u8 as *mut c_void
+}
+
+fn describes_varispeed(d: &ComponentDescription) -> bool {
+    d.kind == TYPE_CONVERTER
+        && d.subtype == SUBTYPE_VARISPEED
+        && (d.manufacturer == 0 || d.manufacturer == MANUFACTURER_APPLE)
 }
 
 fn describes_converter(d: &ComponentDescription) -> bool {
@@ -154,6 +179,13 @@ pub struct Unit {
     running: bool,
     /// Frames pulled so far, which is the `mSampleTime` a guest integrates.
     rendered: u64,
+    /// A matrix mixer, with [`Unit::levels`].
+    pub(crate) matrix: bool,
+    /// `kAudioUnitProperty_MatrixLevels` as the guest last set it.
+    pub(crate) levels: Vec<f32>,
+    /// A varispeed's playback rate, which scales how fast it consumes its
+    /// input; `None` for every other unit.
+    pub(crate) varispeed: Option<f64>,
 }
 
 // SAFETY: `stream` is SDL's own handle, used only through `sdl3::audio`, and the
@@ -192,7 +224,13 @@ pub unsafe extern "C" fn AudioComponentFindNext(
         return output_component();
     }
     if describes_mixer(&wanted) {
-        return mixer_component();
+        return match wanted.subtype == SUBTYPE_MATRIX_MIXER {
+            true => matrix_mixer_component(),
+            false => mixer_component(),
+        };
+    }
+    if describes_varispeed(&wanted) {
+        return varispeed_component();
     }
     match describes_converter(&wanted) {
         true => converter_component(),
@@ -212,17 +250,26 @@ pub unsafe extern "C" fn AudioComponentInstanceNew(
     if out.is_null() {
         return PARAM_ERROR;
     }
+    let matrix = component == matrix_mixer_component();
     let kind = match component {
         c if c == output_component() => Kind::Output,
-        c if c == mixer_component() => Kind::Mixer,
-        c if c == converter_component() => Kind::Converter,
+        c if c == mixer_component() || matrix => Kind::Mixer,
+        c if c == converter_component() || c == varispeed_component() => Kind::Converter,
         _ => return INVALID_COMPONENT,
     };
     let unit = Arc::new(Mutex::new(Unit {
         kind,
         // A mixer starts with no elements: a guest sets how many it wants with
         // `kAudioUnitProperty_ElementCount` before it configures any of them.
-        inputs: Vec::new(),
+        // Apple's matrix mixer has one input bus from the start, and a program
+        // configures it without asking for any.
+        inputs: match matrix {
+            true => vec![mixer::Element::default()],
+            false => Vec::new(),
+        },
+        matrix,
+        levels: Vec::new(),
+        varispeed: (component == varispeed_component()).then_some(1.0),
         source: 0,
         input_format: Format::default(),
         pending: Vec::new(),
@@ -451,6 +498,49 @@ pub unsafe extern "C" fn AudioUnitRender(
 /// and gain; everything else is accepted by a unit that has the element and
 /// refused by one that does not, which is what tells a guest whether its voice
 /// exists.
+/// `OSStatus AudioUnitAddPropertyListener(AudioUnit, AudioUnitPropertyID,
+/// AudioUnitPropertyListenerProc, void *)`, and the two ways of removing one.
+///
+/// Accepted for a live unit and never called back: a unit's properties here
+/// change only when the program sets them, never behind its back (no device
+/// is unplugged, no stream format renegotiated).
+pub unsafe extern "C" fn AudioUnitAddPropertyListener(
+    handle: *mut c_void,
+    _id: u32,
+    _listener: *const c_void,
+    _data: *mut c_void,
+) -> i32 {
+    match unit_for(handle) {
+        Some(_) => 0,
+        None => INVALID_COMPONENT,
+    }
+}
+
+pub unsafe extern "C" fn AudioUnitRemovePropertyListenerWithUserData(
+    handle: *mut c_void,
+    _id: u32,
+    _listener: *const c_void,
+    _data: *mut c_void,
+) -> i32 {
+    // SAFETY: the same check.
+    unsafe { AudioUnitAddPropertyListener(handle, 0, std::ptr::null(), std::ptr::null_mut()) }
+}
+
+/// `OSStatus AudioUnitReset(AudioUnit, AudioUnitScope, AudioUnitElement)`:
+/// a unit here keeps no rendering history between cycles, so there is none to
+/// clear.
+pub unsafe extern "C" fn AudioUnitReset(handle: *mut c_void, _scope: u32, _element: u32) -> i32 {
+    match unit_for(handle) {
+        Some(_) => 0,
+        None => INVALID_COMPONENT,
+    }
+}
+
+/// `kVarispeedParam_PlaybackRate`, a factor, and `kVarispeedParam_PlaybackCents`,
+/// the same rate in cents.
+const VARISPEED_RATE: u32 = 0;
+const VARISPEED_CENTS: u32 = 1;
+
 pub unsafe extern "C" fn AudioUnitSetParameter(
     handle: *mut c_void,
     id: u32,
@@ -463,6 +553,16 @@ pub unsafe extern "C" fn AudioUnitSetParameter(
         return INVALID_COMPONENT;
     };
     let mut unit = unit.lock().unwrap_or_else(|e| e.into_inner());
+    if unit.varispeed.is_some() {
+        // Apple's ranges: a quarter to four times, and two octaves either way.
+        let rate = match id {
+            VARISPEED_RATE => f64::from(value).clamp(0.25, 4.0),
+            VARISPEED_CENTS => 2f64.powf(f64::from(value).clamp(-2400.0, 2400.0) / 1200.0),
+            _ => return INVALID_PARAMETER,
+        };
+        unit.varispeed = Some(rate);
+        return SUCCESS;
+    }
     if unit.kind != Kind::Mixer {
         return INVALID_PARAMETER;
     }
@@ -514,6 +614,17 @@ pub unsafe extern "C" fn AudioUnitGetParameter(
         return INVALID_COMPONENT;
     };
     let unit = unit.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(rate) = unit.varispeed {
+        // SAFETY: the caller's out-parameter, checked non-null above.
+        unsafe {
+            *out = match id {
+                VARISPEED_RATE => rate as f32,
+                VARISPEED_CENTS => (1200.0 * rate.log2()) as f32,
+                _ => return INVALID_PARAMETER,
+            }
+        };
+        return SUCCESS;
+    }
     const SCOPE_INPUT: u32 = 1;
     if unit.kind != Kind::Mixer || scope != SCOPE_INPUT {
         return INVALID_PARAMETER;
@@ -612,6 +723,9 @@ exports::exports! {
         "AudioUnitSetProperty" => property::AudioUnitSetProperty,
         "AudioUnitRender" => AudioUnitRender,
         "AudioUnitSetParameter" => AudioUnitSetParameter,
+        "AudioUnitAddPropertyListener" => AudioUnitAddPropertyListener,
+        "AudioUnitRemovePropertyListenerWithUserData" => AudioUnitRemovePropertyListenerWithUserData,
+        "AudioUnitReset" => AudioUnitReset,
         "AudioUnitGetParameter" => AudioUnitGetParameter,
         "AudioGetCurrentHostTime" => AudioGetCurrentHostTime,
         "AudioConvertHostTimeToNanos" => AudioConvertHostTimeToNanos,

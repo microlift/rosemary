@@ -217,43 +217,53 @@ pub fn load(path: &str, index: u32) -> Option<Arc<LoadedFace>> {
 
 /// A glyph's outline as line and curve segments, in font units, y up.
 pub fn outline(face: &owned_ttf_parser::Face<'_>, glyph: u16) -> Vec<Segment> {
-    struct Builder {
-        segments: Vec<Segment>,
-        start: (f32, f32),
-        at: (f32, f32),
-    }
-    impl owned_ttf_parser::OutlineBuilder for Builder {
-        fn move_to(&mut self, x: f32, y: f32) {
-            self.start = (x, y);
-            self.at = (x, y);
-        }
-        fn line_to(&mut self, x: f32, y: f32) {
-            self.segments.push(Segment::Line(self.at, (x, y)));
-            self.at = (x, y);
-        }
-        fn quad_to(&mut self, x1: f32, y1: f32, x: f32, y: f32) {
-            self.segments.push(Segment::Quad(self.at, (x1, y1), (x, y)));
-            self.at = (x, y);
-        }
-        fn curve_to(&mut self, x1: f32, y1: f32, x2: f32, y2: f32, x: f32, y: f32) {
-            self.segments
-                .push(Segment::Cubic(self.at, (x1, y1), (x2, y2), (x, y)));
-            self.at = (x, y);
-        }
-        fn close(&mut self) {
-            if self.at != self.start {
-                self.segments.push(Segment::Line(self.at, self.start));
-            }
-            self.at = self.start;
-        }
-    }
-    let mut builder = Builder {
-        segments: Vec::new(),
-        start: (0.0, 0.0),
-        at: (0.0, 0.0),
-    };
+    let mut builder = OutlineCollector::default();
     face.outline_glyph(owned_ttf_parser::GlyphId(glyph), &mut builder);
-    builder.segments
+    builder.finish()
+}
+
+/// Collects a glyph's outline, closing every contour: CFF2 charstrings have
+/// no closepath and ttf-parser leaves their contours open, and an open
+/// contour's unbalanced winding fills the rest of the glyph's box.
+#[derive(Default)]
+struct OutlineCollector {
+    segments: Vec<Segment>,
+    start: (f32, f32),
+    at: (f32, f32),
+}
+
+impl OutlineCollector {
+    fn finish(mut self) -> Vec<Segment> {
+        owned_ttf_parser::OutlineBuilder::close(&mut self);
+        self.segments
+    }
+}
+
+impl owned_ttf_parser::OutlineBuilder for OutlineCollector {
+    fn move_to(&mut self, x: f32, y: f32) {
+        self.close();
+        self.start = (x, y);
+        self.at = (x, y);
+    }
+    fn line_to(&mut self, x: f32, y: f32) {
+        self.segments.push(Segment::Line(self.at, (x, y)));
+        self.at = (x, y);
+    }
+    fn quad_to(&mut self, x1: f32, y1: f32, x: f32, y: f32) {
+        self.segments.push(Segment::Quad(self.at, (x1, y1), (x, y)));
+        self.at = (x, y);
+    }
+    fn curve_to(&mut self, x1: f32, y1: f32, x2: f32, y2: f32, x: f32, y: f32) {
+        self.segments
+            .push(Segment::Cubic(self.at, (x1, y1), (x2, y2), (x, y)));
+        self.at = (x, y);
+    }
+    fn close(&mut self) {
+        if self.at != self.start {
+            self.segments.push(Segment::Line(self.at, self.start));
+        }
+        self.at = self.start;
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -340,6 +350,39 @@ mod tests {
         assert!(face.italic);
         assert!(!face.monospace);
         assert!(parse_fc_line("Bitmap\tRegular\t/fonts/fixed.pcf.gz\t0\t80\t0\t100\t").is_none());
+    }
+
+    #[test]
+    fn closes_contours_the_font_leaves_open() {
+        use owned_ttf_parser::OutlineBuilder;
+        let mut builder = OutlineCollector::default();
+        builder.move_to(0.0, 0.0);
+        builder.line_to(2.0, 0.0);
+        builder.line_to(2.0, 2.0);
+        builder.move_to(5.0, 0.0);
+        builder.line_to(6.0, 0.0);
+        builder.line_to(6.0, 1.0);
+        builder.close();
+        builder.move_to(8.0, 0.0);
+        builder.line_to(9.0, 0.0);
+        builder.line_to(9.0, 1.0);
+        let segments = builder.finish();
+        let closing: Vec<_> = segments
+            .iter()
+            .filter_map(|segment| match *segment {
+                Segment::Line(a, b) if b.1 == 0.0 && a.1 != 0.0 => Some((a, b)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            closing,
+            [
+                ((2.0, 2.0), (0.0, 0.0)),
+                ((6.0, 1.0), (5.0, 0.0)),
+                ((9.0, 1.0), (8.0, 0.0)),
+            ]
+        );
+        assert_eq!(segments.len(), 9);
     }
 
     #[test]

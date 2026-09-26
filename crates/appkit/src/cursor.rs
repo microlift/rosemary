@@ -388,6 +388,10 @@ pub unsafe fn discard_rects_in_tree(view: Id) {
 /// to whatever the program last `-set`. Called wherever either half can have
 /// changed: a rectangle added or discarded, and every mouse move.
 pub fn apply() {
+    if OVER_CHROME.load(std::sync::atomic::Ordering::Acquire) {
+        show(std::ptr::null_mut());
+        return;
+    }
     let current = CURRENT.load(std::sync::atomic::Ordering::Acquire) as Id;
     let chosen = match rects_enabled() {
         true => holding_rect().unwrap_or(current),
@@ -776,6 +780,33 @@ unsafe extern "C" fn named_cursor(_class: Id, sel: Sel) -> Id {
     }
 }
 
+/// Whether the pointer is on Rosetta 3's own chrome (the titlebar, the menu
+/// strip, or an open menu). That is not the program's to dress: a game that
+/// hid the pointer or set a crosshair would otherwise leave nothing visible to
+/// pick a menu item with, so the chrome always gets the desktop's arrow.
+static OVER_CHROME: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Record whether the pointer is on the chrome, putting the arrow up on the
+/// way in and the program's cursor and hide level back on the way out.
+pub fn set_over_chrome(over: bool) {
+    if OVER_CHROME.swap(over, std::sync::atomic::Ordering::AcqRel) == over {
+        return;
+    }
+    if tracing() {
+        eprintln!(
+            "rosetta3: appkit: the pointer is {} the chrome",
+            match over {
+                true => "on",
+                false => "off",
+            }
+        );
+    }
+    if HIDDEN.load(std::sync::atomic::Ordering::Acquire) > 0 {
+        sdl3::video::set_cursor_visible(over);
+    }
+    apply();
+}
+
 /// The cursor a program last set, which `+currentCursor` answers.
 static CURRENT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
@@ -786,7 +817,9 @@ unsafe extern "C" fn set(receiver: Id, _sel: Sel) {
     }
     // A named cursor has no SDL cursor, which restores the desktop's own: a
     // program that sets `+arrowCursor` back is taking its custom cursor off.
-    show(receiver);
+    if !OVER_CHROME.load(std::sync::atomic::Ordering::Acquire) {
+        show(receiver);
+    }
 }
 
 unsafe extern "C" fn current_cursor(_class: Id, _sel: Sel) -> Id {
@@ -809,7 +842,7 @@ fn hide_cursor() {
     if tracing() {
         eprintln!("rosetta3: appkit: cursor hidden {count} deep");
     }
-    if count == 1 {
+    if count == 1 && !OVER_CHROME.load(std::sync::atomic::Ordering::Acquire) {
         sdl3::video::set_cursor_visible(false);
     }
 }

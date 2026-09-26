@@ -12,7 +12,51 @@ exports::exports! {
         "NSClassFromString" => NSClassFromString,
         "NSStringFromClass" => NSStringFromClass,
         "NSFileTypeForHFSTypeCode" => NSFileTypeForHFSTypeCode,
+        "NSUserName" => NSUserName,
+        "NSFullUserName" => NSFullUserName,
+        "NSSetUncaughtExceptionHandler" => NSSetUncaughtExceptionHandler,
+        "NSGetUncaughtExceptionHandler" => NSGetUncaughtExceptionHandler,
     }
+}
+
+/// `NSString *NSUserName(void)`: the login name, which names `/Users/<name>`.
+unsafe extern "C" fn NSUserName() -> Id {
+    autoreleased(&prefix::layout::user_name())
+}
+
+/// `NSString *NSFullUserName(void)`: the first field of the passwd comment,
+/// or the login name when that is empty, as Darwin falls back.
+unsafe extern "C" fn NSFullUserName() -> Id {
+    // SAFETY: `getpwuid` answers null or a record in a static buffer, read
+    // before anything else can call it on this thread.
+    let full = unsafe {
+        let passwd = libc::getpwuid(libc::geteuid());
+        match passwd.is_null() || (*passwd).pw_gecos.is_null() {
+            true => None,
+            false => std::ffi::CStr::from_ptr((*passwd).pw_gecos)
+                .to_str()
+                .ok()
+                .and_then(|g| g.split(',').next())
+                .filter(|name| !name.is_empty())
+                .map(str::to_owned),
+        }
+    };
+    autoreleased(&full.unwrap_or_else(prefix::layout::user_name))
+}
+
+/// The handler `NSSetUncaughtExceptionHandler` was given, for the getter.
+/// Kept, not called: an uncaught exception already ends the run here with its
+/// reason and backtrace, which is what the handler of a game reports anyway.
+static UNCAUGHT_HANDLER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// `void NSSetUncaughtExceptionHandler(NSUncaughtExceptionHandler *)`
+unsafe extern "C" fn NSSetUncaughtExceptionHandler(handler: *const std::ffi::c_void) {
+    UNCAUGHT_HANDLER.store(handler as usize, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// `NSUncaughtExceptionHandler *NSGetUncaughtExceptionHandler(void)`
+unsafe extern "C" fn NSGetUncaughtExceptionHandler() -> *const std::ffi::c_void {
+    UNCAUGHT_HANDLER.load(std::sync::atomic::Ordering::Relaxed) as *const std::ffi::c_void
 }
 
 /// The text of an `NSString` argument, or `None` when it is nil or not one.

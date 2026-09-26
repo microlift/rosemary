@@ -220,6 +220,40 @@ pub unsafe extern "C" fn CGLDescribeRenderer(
 /// with more than two gigabytes would otherwise be reported as a negative
 /// number.
 fn memory_bytes() -> Option<i32> {
+    // The last driver answer, since the question is often asked before any
+    // context exists - a launcher checking the hardware before the game makes
+    // one - and a GPU's memory does not change between contexts.
+    static LAST: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
+    if let Some(bytes) = memory_from_driver() {
+        LAST.store(bytes, std::sync::atomic::Ordering::Relaxed);
+        return Some(bytes);
+    }
+    match LAST.load(std::sync::atomic::Ordering::Relaxed) {
+        0 => memory_from_sysfs(),
+        bytes => Some(bytes),
+    }
+}
+
+/// With no context: the largest dedicated memory a DRM driver reports, which
+/// amdgpu and xe publish as `mem_info_vram_total`, in bytes.
+#[cfg(target_os = "linux")]
+fn memory_from_sysfs() -> Option<i32> {
+    let cards = std::fs::read_dir("/sys/class/drm").ok()?;
+    let largest = cards
+        .filter_map(Result::ok)
+        .filter_map(|card| std::fs::read_to_string(card.path().join("device/mem_info_vram_total")).ok())
+        .filter_map(|text| text.trim().parse::<u64>().ok())
+        .max()?;
+    Some(i32::try_from(largest).unwrap_or(i32::MAX))
+}
+
+#[cfg(not(target_os = "linux"))]
+fn memory_from_sysfs() -> Option<i32> {
+    None
+}
+
+/// The current context's driver, through a vendor extension.
+fn memory_from_driver() -> Option<i32> {
     /// `GL_GPU_MEMORY_INFO_DEDICATED_VIDMEM_NVX`, in kilobytes.
     const NVX_DEDICATED_VIDMEM: u32 = 0x9047;
     /// `GL_TEXTURE_FREE_MEMORY_ATI`, whose first word is the free pool in

@@ -472,6 +472,15 @@ pub unsafe fn set_utf16(string: CFTypeRef, units: &[u16]) -> bool {
 /// so that `CFStringGetCStringPtr` can answer without copying - which is the one
 /// thing a caller of it is entitled to expect.
 pub fn from_bytes(bytes: &[u8], wide: bool) -> CFTypeRef {
+    // 8-bit storage counts bytes as characters, which is only true of ASCII:
+    // other UTF-8 is kept as UTF-16, so its length and indices are the ones a
+    // Mac reports, and a caller sizing a buffer from them does not cut a
+    // character in half.
+    if !wide && !bytes.is_ascii() {
+        if let Ok(text) = std::str::from_utf8(bytes) {
+            return from_utf16(&text.encode_utf16().collect::<Vec<u16>>());
+        }
+    }
     if wide {
         // An odd trailing byte is not a code unit and there is nothing to pair
         // it with, so it is dropped rather than paired with whatever follows.
@@ -575,6 +584,12 @@ pub unsafe fn set_bytes(string: CFTypeRef, bytes: &[u8]) -> bool {
     if !unsafe { is_mutable(string) } {
         return false;
     }
+    // Non-ASCII text is kept as code units, for the reason `from_bytes` does.
+    if !bytes.is_ascii()
+        && let Ok(text) = std::str::from_utf8(bytes)
+    {
+        return unsafe { set_utf16(string, &text.encode_utf16().collect::<Vec<u16>>()) };
+    }
     let object = string as *mut CFString;
     // SAFETY: a mutable `__NSCFString`, whose storage this crate allocated.
     unsafe {
@@ -594,16 +609,15 @@ pub unsafe fn set_bytes(string: CFTypeRef, bytes: &[u8]) -> bool {
 /// runtime does not carry a table for.
 pub fn from_encoded(bytes: &[u8], encoding: u32) -> CFTypeRef {
     if is_eight_bit(encoding) {
-        // Above 0x7F the eight-bit encodings disagree and this runtime has no
-        // tables, so a non-ASCII byte under a non-UTF-8 encoding is refused
-        // rather than reinterpreted. UTF-8 is passed through whole: its bytes
-        // are its bytes, and `length` then counts bytes rather than characters,
-        // which is what an all-ASCII string makes true and what every caller in
-        // this tree so far relies on.
-        if encoding != encoding::UTF8 && bytes.iter().any(|b| *b >= 0x80) {
-            return std::ptr::null();
+        // UTF-8 is its own storage; the one-byte encodings go through their
+        // tables, and ASCII refuses anything above 0x7F.
+        if encoding == encoding::UTF8 || bytes.is_ascii() {
+            return from_bytes(bytes, false);
         }
-        return from_bytes(bytes, false);
+        return match crate::eightbit::decode_all(bytes, encoding) {
+            Some(units) => from_utf16(&units),
+            None => std::ptr::null(),
+        };
     }
     if is_utf16(encoding) {
         let units: Vec<u16> = units::<2>(bytes, encoding, encoding::UTF16_BE, encoding::UTF16_LE)

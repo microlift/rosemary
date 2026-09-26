@@ -496,6 +496,79 @@ unsafe fn region(
     KERN_SUCCESS
 }
 
+/// `kern_return_t vm_region_recurse_64(vm_map_t target_task, vm_address_t
+/// *address, vm_size_t *size, natural_t *nesting_depth,
+/// vm_region_recurse_info_t info, mach_msg_type_number_t *infoCnt)`
+///
+/// Answers `struct vm_region_submap_info_64`, packed to four bytes, as far as
+/// the caller's count reaches: the first sixteen words are every version's,
+/// the seventeenth (`pages_reusable`) the newer ones'. There are no submaps
+/// here, so every region is at depth zero and none is one. Page counts are
+/// not tracked and read zero.
+///
+/// # Safety
+///
+/// `address`, `size`, `depth` and `count` are writable, and `info` is writable
+/// for `*count` 32-bit words.
+pub unsafe extern "C" fn vm_region_recurse_64(
+    task: Name,
+    address: *mut u64,
+    size: *mut u64,
+    depth: *mut u32,
+    info: *mut u32,
+    count: *mut u32,
+) -> i32 {
+    /// `VM_REGION_SUBMAP_INFO_V0_COUNT_64` and `_V1_`.
+    const V0_WORDS: usize = 16;
+    const V1_WORDS: usize = 17;
+    if address.is_null() || size.is_null() || info.is_null() || count.is_null() {
+        return KERN_INVALID_ARGUMENT;
+    }
+    if task != TASK_SELF {
+        return KERN_INVALID_ARGUMENT;
+    }
+    // SAFETY: the caller states `count` is readable.
+    let capacity = unsafe { *count } as usize;
+    if capacity < V0_WORDS {
+        return KERN_INVALID_ARGUMENT;
+    }
+    // SAFETY: the caller states `address` is readable.
+    let Some(region) = region_at_or_after(unsafe { *address }) else {
+        return KERN_INVALID_ADDRESS;
+    };
+    let words = capacity.min(V1_WORDS);
+    let mut out = vec![0u32; words];
+    out[0] = region.protection as u32;
+    out[1] = region.protection as u32;
+    out[2] = match region.shared {
+        true => VM_INHERIT_SHARE,
+        false => VM_INHERIT_COPY,
+    };
+    // `offset`, a 64-bit field at byte 12.
+    out[3] = region.offset as u32;
+    out[4] = (region.offset >> 32) as u32;
+    // user_tag, pages_resident, _shared_now_private, _swapped_out, _dirtied.
+    // ref_count, at word 10.
+    out[10] = 1;
+    // shadow_depth (u16), external_pager (u8), share_mode (u8) at word 11:
+    // `SM_PRIVATE` is 1 and `SM_SHARED` 3.
+    let share_mode: u32 = if region.shared { 3 } else { 1 };
+    out[11] = share_mode << 24;
+    // is_submap (12), behavior (13), object_id (14), user_wired_count (15).
+    out[13] = VM_BEHAVIOR_DEFAULT as u32;
+    // SAFETY: the caller's obligations, with `words` within its capacity.
+    unsafe {
+        *address = region.start;
+        *size = region.end - region.start;
+        if !depth.is_null() {
+            *depth = 0;
+        }
+        std::ptr::copy_nonoverlapping(out.as_ptr(), info, words);
+        *count = words as u32;
+    }
+    KERN_SUCCESS
+}
+
 /// `kern_return_t vm_deallocate(vm_map_t target_task, vm_address_t address,
 /// vm_size_t size)`
 ///

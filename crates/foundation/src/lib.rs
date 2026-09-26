@@ -35,6 +35,7 @@ pub mod processinfo;
 pub mod runtime;
 mod signature;
 pub mod string;
+pub mod strings;
 pub mod thread;
 pub mod timer;
 mod timezone;
@@ -98,6 +99,7 @@ exports::group! {
     locale::cf,
     formatter::cf,
     timer::cf,
+    appleevent,
 }
 
 /// This user's home directory, as the guest spells it.
@@ -311,6 +313,9 @@ fn zeroed<T>() -> u64 {
 pub const STRING_GLOBALS: &[(&str, &str)] = &[
     ("_NSLocalizedDescriptionKey", "NSLocalizedDescription"),
     ("_NSArgumentDomain", "NSArgumentDomain"),
+    ("_NSFilePosixPermissions", "NSFilePosixPermissions"),
+    ("_NSPOSIXErrorDomain", "NSPOSIXErrorDomain"),
+    ("_NSUnderlyingErrorKey", "NSUnderlyingError"),
     ("_NSHTTPCookieDiscard", "Discard"),
     ("_NSHTTPCookieDomain", "Domain"),
     ("_NSHTTPCookieExpires", "Expires"),

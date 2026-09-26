@@ -9,3 +9,4 @@ license.workspace = true
 exports.workspace = true
 darwin.workspace = true
 foundation.workspace = true
+prefix.workspace = true

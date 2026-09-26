@@ -367,6 +367,29 @@ fn parent() -> sdl3::Window {
     }
 }
 
+thread_local! {
+    /// The window of the dialog `-runModal` is waiting on, and the events a
+    /// debug input script sent it, which reach no event queue of SDL's.
+    static MODAL: std::cell::RefCell<Option<(sdl3::Window, std::collections::VecDeque<sdl3::video::Event>)>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// The window of the modal dialog up now, which is the only one taking input.
+pub(crate) fn modal_window() -> Option<sdl3::Window> {
+    MODAL.with_borrow(|modal| modal.as_ref().map(|(window, _)| *window))
+}
+
+/// Queue a scripted `event` for the modal dialog; false when there is none.
+pub(crate) fn deliver_modal(event: &sdl3::video::Event) -> bool {
+    MODAL.with_borrow_mut(|modal| match modal {
+        Some((_, queue)) => {
+            queue.push_back(event.clone());
+            true
+        }
+        None => false,
+    })
+}
+
 /// Show `request` and wait for a button: its index, or `None` when no dialog
 /// could be shown at all, which is the caller's cue to ask some other way.
 ///
@@ -375,7 +398,9 @@ fn parent() -> sdl3::Window {
 /// the rest of what happens to them is still delivered.
 pub fn run(request: &Request) -> Option<usize> {
     let mut dialog = Dialog::open(request, true)?;
+    let outer = MODAL.replace(Some((dialog.window, Default::default())));
     let (answer, quit) = modal_loop(&mut dialog);
+    MODAL.set(outer);
     let started_video = dialog.started_video;
     dialog.close();
     if quit && !started_video {
@@ -475,7 +500,9 @@ fn modal_loop(dialog: &mut Dialog) -> (usize, bool) {
         // A thread waiting on a GL context the main thread holds would wait
         // for as long as the dialog is up.
         crate::opengl::release_for_other_threads();
-        let Some(event) = sdl3::video::wait(50) else {
+        crate::script::run();
+        let scripted = MODAL.with_borrow_mut(|modal| modal.as_mut()?.1.pop_front());
+        let Some(event) = scripted.or_else(|| sdl3::video::wait(50)) else {
             continue;
         };
         match dialog.handle(&event) {

@@ -563,6 +563,17 @@ unsafe extern "C" fn current_directory(_receiver: Id, _sel: Sel) -> Id {
     crate::string::from_str(&path.to_string_lossy())
 }
 
+/// `-URLForUbiquityContainerIdentifier:` and `-ubiquityIdentityToken`: nil,
+/// which is what a Mac signed out of iCloud answers, and what tells a program
+/// to keep its saves locally.
+unsafe extern "C" fn no_ubiquity(_receiver: Id, _sel: Sel) -> Id {
+    std::ptr::null_mut()
+}
+
+unsafe extern "C" fn no_ubiquity_container(_receiver: Id, _sel: Sel, _identifier: Id) -> Id {
+    std::ptr::null_mut()
+}
+
 pub(crate) fn install() {
     let class =
         corefoundation::base::register(c"NSFileManager", None, std::mem::size_of::<usize>(), false);
@@ -595,6 +606,8 @@ pub(crate) fn install() {
             => url_for_directory, c"@52@0:8Q16Q24@32c40^@44";
         "getRelationship:ofDirectoryAtURL:toItemAtURL:error:"
             => get_relationship, c"B48@0:8^q16@24@32^@40";
+        "URLForUbiquityContainerIdentifier:" => no_ubiquity_container, c"@24@0:8@16";
+        "ubiquityIdentityToken" => no_ubiquity, c"@16@0:8";
     });
 
     // Foundation's `NSFileAttributes` category: how a program reads the result

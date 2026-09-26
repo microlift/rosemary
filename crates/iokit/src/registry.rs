@@ -698,7 +698,9 @@ pub unsafe extern "C" fn IORegistryEntryCreateCFProperties(
 /// An `IONotificationPortRef`. Opaque to the guest and never dereferenced by
 /// it; it exists so that the pointer is not null.
 struct NotificationPort {
-    _private: u64,
+    /// The run loop source `IONotificationPortGetRunLoopSource` answers,
+    /// made on first request and owned by the port.
+    source: CFTypeRef,
 }
 
 /// `IONotificationPortRef IONotificationPortCreate(mach_port_t)`.
@@ -707,7 +709,7 @@ struct NotificationPort {
 /// `GetMachPort`, `AddMatchingNotification` - are made without checking, and a
 /// null here faults inside the first of them rather than saying anything.
 pub unsafe extern "C" fn IONotificationPortCreate(_port: u32) -> *mut c_void {
-    Box::into_raw(Box::new(NotificationPort { _private: 0 })).cast()
+    Box::into_raw(Box::new(NotificationPort { source: std::ptr::null() })).cast()
 }
 
 /// `void IONotificationPortDestroy(IONotificationPortRef)`.
@@ -717,7 +719,170 @@ pub unsafe extern "C" fn IONotificationPortDestroy(port: *mut c_void) {
     }
     // SAFETY: the guest hands back what `IONotificationPortCreate` returned,
     // which is this crate's own `Box`.
-    drop(unsafe { Box::from_raw(port.cast::<NotificationPort>()) });
+    let port = unsafe { Box::from_raw(port.cast::<NotificationPort>()) };
+    if !port.source.is_null() {
+        // SAFETY: the source this port made and owns.
+        unsafe {
+            corefoundation::api::CFRunLoopSourceInvalidate(port.source);
+            corefoundation::api::CFRelease(port.source);
+        }
+    }
+}
+
+/// `CFRunLoopSourceRef IONotificationPortGetRunLoopSource(IONotificationPortRef)`.
+///
+/// A source with nothing behind it, which is added to a run loop and never
+/// signalled - as no IOKit message ever arrives here.
+pub unsafe extern "C" fn IONotificationPortGetRunLoopSource(port: *mut c_void) -> CFTypeRef {
+    if port.is_null() {
+        return std::ptr::null();
+    }
+    // SAFETY: a port `IONotificationPortCreate` made.
+    let port = unsafe { &mut *port.cast::<NotificationPort>() };
+    if port.source.is_null() {
+        let context = corefoundation::api::CFRunLoopSourceContext {
+            version: 0,
+            info: std::ptr::null_mut(),
+            retain: std::ptr::null(),
+            release: std::ptr::null(),
+            copy_description: std::ptr::null(),
+            equal: std::ptr::null(),
+            hash: std::ptr::null(),
+            schedule: std::ptr::null(),
+            cancel: std::ptr::null(),
+            perform: None,
+        };
+        // SAFETY: a context that outlives the call, which copies it.
+        port.source = unsafe { corefoundation::api::CFRunLoopSourceCreate(std::ptr::null(), 0, &context) };
+    }
+    port.source
+}
+
+/// `kern_return_t IOMasterPort(mach_port_t bootstrap, mach_port_t *master)`:
+/// `MACH_PORT_NULL`, the default the constant `kIOMasterPortDefault` names.
+pub unsafe extern "C" fn IOMasterPort(_bootstrap: u32, master: *mut u32) -> KernReturn {
+    if !master.is_null() {
+        // SAFETY: the caller's out-parameter.
+        unsafe { master.write(0) };
+    }
+    SUCCESS
+}
+
+/// A one-key matching dictionary, as each `IO...Matching` builds.
+///
+/// # Safety
+///
+/// `name` is null or a C string.
+unsafe fn matching_on(key: &[u8], name: *const c_char) -> CFTypeRef {
+    // SAFETY: the caller's obligation.
+    let Some(bytes) = (unsafe { corefoundation::string::cstr_bytes(name) }) else {
+        return empty_dictionary();
+    };
+    collections::new_dictionary(
+        &[(
+            corefoundation::string::from_bytes(key, false),
+            corefoundation::string::from_bytes(bytes, false),
+        )],
+        Policy::from_key_callbacks(),
+        Policy::from_type_callbacks(),
+        true,
+    )
+}
+
+/// `CFMutableDictionaryRef IOServiceNameMatching(const char *name)`.
+pub unsafe extern "C" fn IOServiceNameMatching(name: *const c_char) -> CFTypeRef {
+    // SAFETY: the caller's C string.
+    unsafe { matching_on(b"IONameMatch", name) }
+}
+
+/// `CFMutableDictionaryRef IOBSDNameMatching(mach_port_t, uint32_t, const char *)`.
+pub unsafe extern "C" fn IOBSDNameMatching(_port: u32, _options: u32, name: *const c_char) -> CFTypeRef {
+    // SAFETY: the caller's C string.
+    unsafe { matching_on(b"BSD Name", name) }
+}
+
+/// `kern_return_t IORegistryEntryCreateIterator(entry, plane, options, io_iterator_t *)`:
+/// an empty iterator, as the registry here has no children to walk.
+pub unsafe extern "C" fn IORegistryEntryCreateIterator(
+    _entry: IoObject,
+    _plane: *const c_char,
+    _options: u32,
+    iterator: *mut IoObject,
+) -> KernReturn {
+    if !iterator.is_null() {
+        // SAFETY: the caller's out-parameter.
+        unsafe { iterator.write(0) };
+    }
+    SUCCESS
+}
+
+/// `boolean_t IOObjectConformsTo(io_object_t, const io_name_t className)`:
+/// no object here is an instance of any IOKit class.
+pub unsafe extern "C" fn IOObjectConformsTo(_object: IoObject, _class: *const c_char) -> u32 {
+    0
+}
+
+/// `kIOReturnUnsupported`.
+const UNSUPPORTED: IOReturn = -536_870_201;
+
+/// `IOReturn IOCreatePlugInInterfaceForService(service, pluginType,
+/// interfaceType, IOCFPlugInInterface ***, SInt32 *score)`: refused, as no
+/// service here has a user-space driver plug-in.
+pub unsafe extern "C" fn IOCreatePlugInInterfaceForService(
+    _service: IoObject,
+    _plugin_type: CFTypeRef,
+    _interface_type: CFTypeRef,
+    interface: *mut *mut c_void,
+    score: *mut i32,
+) -> IOReturn {
+    // SAFETY: the caller's out-parameters.
+    unsafe {
+        if !interface.is_null() {
+            interface.write(std::ptr::null_mut());
+        }
+        if !score.is_null() {
+            score.write(0);
+        }
+    }
+    UNSUPPORTED
+}
+
+/// `kern_return_t IODestroyPlugInInterface(IOCFPlugInInterface **)`.
+pub unsafe extern "C" fn IODestroyPlugInInterface(_interface: *mut c_void) -> KernReturn {
+    SUCCESS
+}
+
+/// The `io_connect_t` `IORegisterForSystemPower` answers: any live-looking
+/// port name, since the calls it is passed to accept and ignore it.
+const ROOT_POWER_DOMAIN: IoObject = 0x5057_5200;
+
+/// `io_connect_t IORegisterForSystemPower(void *refcon, IONotificationPortRef *,
+/// IOServiceInterestCallback, io_object_t *notifier)`
+///
+/// Registered, and never called back: this host's sleep and wake do not reach
+/// the guest, so a program is not told to prepare for either.
+pub unsafe extern "C" fn IORegisterForSystemPower(
+    _refcon: *mut c_void,
+    port: *mut *mut c_void,
+    _callback: *const c_void,
+    notifier: *mut IoObject,
+) -> IoObject {
+    // SAFETY: the caller's out-parameters.
+    unsafe {
+        if !port.is_null() {
+            port.write(IONotificationPortCreate(0));
+        }
+        if !notifier.is_null() {
+            notifier.write(ROOT_POWER_DOMAIN);
+        }
+    }
+    ROOT_POWER_DOMAIN
+}
+
+/// `IOReturn IOAllowPowerChange(io_connect_t, intptr_t)` and
+/// `IOCancelPowerChange`: answers to a notification that never comes.
+pub unsafe extern "C" fn IOAllowPowerChange(_kernel_port: IoObject, _notification: isize) -> IOReturn {
+    SUCCESS
 }
 
 /// `mach_port_t IONotificationPortGetMachPort(IONotificationPortRef)`.
@@ -900,6 +1065,16 @@ exports::exports! {
         "IOConnectCallStructMethod" => IOConnectCallStructMethod,
         "IOCreatePlugInInterfaceForService" => IOCreatePlugInInterfaceForService,
         "IODispatchCalloutFromMessage" => IODispatchCalloutFromMessage,
+        "IONotificationPortGetRunLoopSource" => IONotificationPortGetRunLoopSource,
+        "IOMasterPort" => IOMasterPort,
+        "IOServiceNameMatching" => IOServiceNameMatching,
+        "IOBSDNameMatching" => IOBSDNameMatching,
+        "IORegistryEntryCreateIterator" => IORegistryEntryCreateIterator,
+        "IOObjectConformsTo" => IOObjectConformsTo,
+        "IOCreatePlugInInterfaceForService" => IOCreatePlugInInterfaceForService,
+        "IODestroyPlugInInterface" => IODestroyPlugInInterface,
+        "IORegisterForSystemPower" => IORegisterForSystemPower,
+        "IOAllowPowerChange" | "IOCancelPowerChange" => IOAllowPowerChange,
     }
 }
 

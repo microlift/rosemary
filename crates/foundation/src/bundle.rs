@@ -83,9 +83,10 @@ impl Layout {
         // Absolute, always. Apple's `-bundlePath` is, and a program that joins
         // it onto another directory - which is exactly what a game does to find
         // its data beside its save files - turns a relative one into a path
-        // that does not exist. `canonicalize` also resolves the symlinks a
-        // `.app` in a library folder is often reached through.
-        let absolute = executable.canonicalize().ok();
+        // that does not exist. Symlinks are kept, as `_NSGetExecutablePath`
+        // keeps them: a `.app` linked in from elsewhere looks for its data
+        // beside the link, not beside its target.
+        let absolute = std::path::absolute(executable).ok();
         let executable = absolute.as_deref().unwrap_or(executable);
         let macos = executable.parent()?;
         if macos.file_name()? != "MacOS" {
@@ -222,6 +223,52 @@ impl Layout {
         out
     }
 
+    /// The `.lproj` directories a localized string is looked for in, most
+    /// preferred first: this process's language, then the development region
+    /// and the names an English bundle may use for it.
+    fn string_localizations(&self) -> Vec<PathBuf> {
+        let language = crate::locale::language();
+        let mut names = vec![language.clone()];
+        if let Some(region) = self.info_string("CFBundleDevelopmentRegion") {
+            names.push(region.to_string());
+        }
+        names.extend(["en", "English", "Base"].map(str::to_owned));
+        let mut seen = Vec::new();
+        for name in names {
+            let path = self.resources.join(format!("{name}.lproj"));
+            if !seen.contains(&path) {
+                seen.push(path);
+            }
+        }
+        seen
+    }
+
+    /// `-localizedStringForKey:value:table:`: the key's entry in the first
+    /// table of that name that has one, else `value`, else the key itself -
+    /// Apple's fallback order.
+    pub fn localized_string(&self, key: &str, value: Option<&str>, table: Option<&str>) -> String {
+        use std::collections::HashMap;
+        use std::sync::Mutex;
+        type Tables = HashMap<PathBuf, Option<HashMap<String, String>>>;
+        static TABLES: Mutex<Option<Tables>> = Mutex::new(None);
+
+        let table = table.filter(|t| !t.is_empty()).unwrap_or("Localizable");
+        let mut cache = TABLES.lock().unwrap_or_else(|e| e.into_inner());
+        let cache = cache.get_or_insert_with(HashMap::new);
+        for directory in self.string_localizations() {
+            let path = directory.join(format!("{table}.strings"));
+            let parsed = cache.entry(path.clone()).or_insert_with(|| {
+                std::fs::read(&path).ok().and_then(|bytes| crate::strings::parse(&bytes))
+            });
+            if let Some(found) = parsed.as_ref().and_then(|t| t.get(key)) {
+                return found.clone();
+            }
+        }
+        value.filter(|v| !v.is_empty()).unwrap_or(key).to_string()
+    }
+
+    /// Localization identifiers declared by the bundle and present as
+    /// `Resources/*.lproj` directories.
     /// What localizations this bundle has, which is
     /// `CFBundleCopyBundleLocalizations`.
     ///
@@ -857,8 +904,16 @@ pub mod cf {
         }
     }
 
+    /// `CFStringRef CFBundleCopyLocalizedString(CFBundleRef, CFStringRef key,
+    /// CFStringRef value, CFStringRef tableName)`
+    unsafe extern "C" fn CFBundleCopyLocalizedString(bundle: Id, key: Id, value: Id, table: Id) -> Id {
+        // SAFETY: a bundle and strings or nil, as the caller passed them.
+        unsafe { super::class::copy_localized_string(bundle, key, value, table) }
+    }
+
     exports::exports! {
         functions {
+            "CFBundleCopyLocalizedString" => CFBundleCopyLocalizedString,
             "CFBundleGetMainBundle" => CFBundleGetMainBundle,
             "CFBundleCopyResourceURL" => CFBundleCopyResourceURL,
             "CFBundleCopyExecutableURL" => CFBundleCopyExecutableURL,
@@ -1480,6 +1535,44 @@ pub(crate) mod class {
         }
     }
 
+    /// The text of an `NSString` argument, or `None` for nil.
+    ///
+    /// # Safety
+    ///
+    /// `string` is nil or a string object.
+    unsafe fn text(string: Id) -> Option<String> {
+        (!string.is_null())
+            .then(|| String::from_utf8_lossy(&unsafe { crate::string::bytes(string) }).into_owned())
+    }
+
+    unsafe extern "C" fn localized_string_for_key(
+        receiver: Id,
+        _sel: Sel,
+        key: Id,
+        value: Id,
+        table: Id,
+    ) -> Id {
+        // SAFETY: strings or nil.
+        let (key, value, table) = unsafe { (text(key), text(value), text(table)) };
+        let Some(key) = key else {
+            // A nil key answers the value, or the empty string.
+            return autoreleased(value.as_deref().unwrap_or(""));
+        };
+        // SAFETY: an `NSBundle`.
+        match unsafe { layout_of(receiver) } {
+            Some(layout) => autoreleased(&layout.localized_string(&key, value.as_deref(), table.as_deref())),
+            None => autoreleased(value.as_deref().filter(|v| !v.is_empty()).unwrap_or(&key)),
+        }
+    }
+
+    /// `CFBundleCopyLocalizedString`, the same lookup at +1.
+    pub(crate) unsafe fn copy_localized_string(bundle: Id, key: Id, value: Id, table: Id) -> Id {
+        // SAFETY: forwarded; the answer is autoreleased and this spelling owns it.
+        objc::arc::retain(unsafe {
+            localized_string_for_key(bundle, objc::sel::get("localizedStringForKey:value:table:"), key, value, table)
+        })
+    }
+
     fn autoreleased(text: &str) -> Id {
         let string = crate::string::from_str(text);
         // SAFETY: a string this call just created.
@@ -1753,6 +1846,7 @@ pub(crate) mod class {
             "pathForResource:ofType:inDirectory:" => path_for_resource_in_directory, c"@40@0:8@16@24@32";
             "infoDictionary" => info_dictionary, c"@16@0:8";
             "executableName" => executable_name, c"*16@0:8";
+            "localizedStringForKey:value:table:" => localized_string_for_key, c"@40@0:8@16@24@32"
             "localizations" => localizations, c"@16@0:8";
             "preferredLocalizations" => preferred_localizations, c"@16@0:8";
             "developmentLocalization" => development_localization, c"@16@0:8"

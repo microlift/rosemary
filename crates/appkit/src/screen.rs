@@ -293,6 +293,103 @@ pub unsafe extern "C" fn CGMainDisplayID() -> u32 {
     sdl3::video::primary_display()
 }
 
+/// Gamma tables a program set, per display, as red, green and blue ramps.
+///
+/// Kept so a program reads back what it wrote - one that fades by stepping its
+/// own table depends on that - but not applied: SDL 3 has no gamma ramp
+/// control, so the screen's colours do not change.
+static GAMMA: std::sync::Mutex<Vec<(u32, [Vec<f32>; 3])>> = std::sync::Mutex::new(Vec::new());
+
+/// `CGError CGGetDisplayTransferByTable(CGDirectDisplayID, uint32_t capacity,
+/// CGGammaValue *red, CGGammaValue *green, CGGammaValue *blue, uint32_t *count)`
+///
+/// # Safety
+///
+/// Each table is null or holds `capacity` values; `count` is null or writable.
+#[allow(non_snake_case)]
+pub unsafe extern "C" fn CGGetDisplayTransferByTable(
+    display: u32,
+    capacity: u32,
+    red: *mut f32,
+    green: *mut f32,
+    blue: *mut f32,
+    count: *mut u32,
+) -> i32 {
+    let size = capacity.min(1024) as usize;
+    let tables = GAMMA.lock().unwrap_or_else(|e| e.into_inner());
+    let set = tables.iter().find(|(d, _)| *d == display).map(|(_, t)| t.clone());
+    drop(tables);
+    // Identity until a program sets one, sampled to the caller's size.
+    let sample = |channel: usize, at: usize| -> f32 {
+        let position = match size > 1 {
+            true => at as f32 / (size - 1) as f32,
+            false => 0.0,
+        };
+        match &set {
+            Some(t) if !t[channel].is_empty() => {
+                let index = (position * (t[channel].len() - 1) as f32).round() as usize;
+                t[channel][index.min(t[channel].len() - 1)]
+            }
+            _ => position,
+        }
+    };
+    for (channel, table) in [red, green, blue].into_iter().enumerate() {
+        if table.is_null() {
+            continue;
+        }
+        for at in 0..size {
+            // SAFETY: the caller's table of `capacity` values.
+            unsafe { *table.add(at) = sample(channel, at) };
+        }
+    }
+    if !count.is_null() {
+        // SAFETY: the caller's out-parameter.
+        unsafe { *count = size as u32 };
+    }
+    0
+}
+
+/// `CGError CGSetDisplayTransferByTable(CGDirectDisplayID, uint32_t size,
+/// const CGGammaValue *red, const CGGammaValue *green, const CGGammaValue *blue)`
+///
+/// # Safety
+///
+/// Each table holds `size` values.
+#[allow(non_snake_case)]
+pub unsafe extern "C" fn CGSetDisplayTransferByTable(
+    display: u32,
+    size: u32,
+    red: *const f32,
+    green: *const f32,
+    blue: *const f32,
+) -> i32 {
+    if red.is_null() || green.is_null() || blue.is_null() {
+        // `kCGErrorIllegalArgument`.
+        return 1001;
+    }
+    static SAID: std::sync::Once = std::sync::Once::new();
+    SAID.call_once(|| {
+        eprintln!(
+            "rosetta3: appkit: the program set a display gamma table; it is kept but not \
+             applied, as SDL has no gamma ramp control"
+        )
+    });
+    let size = size.min(1024) as usize;
+    // SAFETY: the caller's tables of `size` values.
+    let read = |table: *const f32| unsafe { std::slice::from_raw_parts(table, size) }.to_vec();
+    let entry = [read(red), read(green), read(blue)];
+    let mut tables = GAMMA.lock().unwrap_or_else(|e| e.into_inner());
+    tables.retain(|(d, _)| *d != display);
+    tables.push((display, entry));
+    0
+}
+
+/// `void CGDisplayRestoreColorSyncSettings(void)`: every table back to identity.
+#[allow(non_snake_case)]
+pub unsafe extern "C" fn CGDisplayRestoreColorSyncSettings() {
+    GAMMA.lock().unwrap_or_else(|e| e.into_inner()).clear();
+}
+
 /// `CGRect CGDisplayBounds(CGDirectDisplayID)`.
 ///
 /// CoreGraphics measures the global display space from the **top left** with y

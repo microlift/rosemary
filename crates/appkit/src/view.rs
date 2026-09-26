@@ -38,6 +38,10 @@ pub struct View {
     /// `-setTranslatesAutoresizingMaskIntoConstraints:`, inverted like
     /// `does_not_autoresize_subviews` so that zero is AppKit's `YES`.
     constrained: usize,
+    /// `-setNextResponder:`, unretained as AppKit's is; null means the
+    /// superview, which is a view's next responder until something is put
+    /// between them.
+    next_responder: Id,
 }
 
 /// The bits of [`View::posts`].
@@ -1100,6 +1104,40 @@ unsafe extern "C" fn superview(receiver: Id, _sel: Sel) -> Id {
     view_of(receiver).superview
 }
 
+unsafe extern "C" fn next_responder(receiver: Id, _sel: Sel) -> Id {
+    let view = view_of(receiver);
+    match view.next_responder.is_null() {
+        true => view.superview,
+        false => view.next_responder,
+    }
+}
+
+unsafe extern "C" fn set_next_responder(receiver: Id, _sel: Sel, responder: Id) {
+    view_of(receiver).next_responder = responder;
+}
+
+/// `-setSubviews:`: the current subviews removed and these added, in order.
+unsafe extern "C" fn set_subviews(receiver: Id, _sel: Sel, views: Id) {
+    // SAFETY: a copy of the current list, so removing does not disturb the
+    // walk, and the new list, each an `NSArray` of views or nil.
+    unsafe {
+        let current = corefoundation::collections::array(subviews(receiver, objc::sel::get("subviews")) as _)
+            .map(|a| a.values.clone())
+            .unwrap_or_default();
+        let wanted = corefoundation::collections::array(views as _)
+            .map(|a| a.values.clone())
+            .unwrap_or_default();
+        for view in current {
+            if !wanted.contains(&view) {
+                remove_from_superview(view as Id, objc::sel::get("removeFromSuperview"));
+            }
+        }
+        for view in wanted {
+            add_subview(receiver, objc::sel::get("addSubview:"), view as Id);
+        }
+    }
+}
+
 unsafe extern "C" fn subviews(receiver: Id, _sel: Sel) -> Id {
     let view = view_of(receiver);
     if view.subviews.is_null() {
@@ -1437,6 +1475,9 @@ pub(crate) fn install() {
         "window" => window, c"@16@0:8";
         "isInFullScreenMode" => is_in_full_screen_mode, c"c16@0:8";
         "superview" => superview, c"@16@0:8";
+        "nextResponder" => next_responder, c"@16@0:8";
+        "setNextResponder:" => set_next_responder, c"v24@0:8@16";
+        "setSubviews:" => set_subviews, c"v24@0:8@16";
         "subviews" => subviews, c"@16@0:8";
         "hitTest:" => hit_test_method, c"@32@0:8{CGPoint=dd}16";
         "addSubview:" => add_subview, c"v24@0:8@16";

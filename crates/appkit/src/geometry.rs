@@ -78,6 +78,21 @@ pub fn contains(rect: NSRect, point: NSPoint) -> bool {
     point.x >= x && point.x < x + width && point.y >= y && point.y < y + height
 }
 
+/// `void NSDisableScreenUpdates(void)` and `NSEnableScreenUpdates`: they hold
+/// back the window server's flushes so several windows change at once. Each
+/// window here presents on its own, so there is nothing to hold back.
+#[allow(non_snake_case)]
+pub extern "C" fn NSDisableScreenUpdates() {}
+
+#[allow(non_snake_case)]
+pub extern "C" fn NSEnableScreenUpdates() {}
+
+/// `bool CGRectEqualToRect(CGRect, CGRect)`, compared standardized.
+#[allow(non_snake_case)]
+pub unsafe extern "C" fn CGRectEqualToRect(a: NSRect, b: NSRect) -> u8 {
+    u8::from(standardized(a) == standardized(b))
+}
+
 /// `BOOL NSPointInRect(NSPoint, NSRect)`.
 #[allow(non_snake_case)]
 pub unsafe extern "C" fn NSPointInRect(point: NSPoint, rect: NSRect) -> u8 {

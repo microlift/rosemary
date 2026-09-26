@@ -35,6 +35,7 @@ pub mod clock;
 pub mod commoncrypto;
 #[cfg(not(target_os = "macos"))]
 pub mod compat;
+pub mod copyfile;
 pub mod data;
 pub mod dirent;
 pub mod dispatch;
@@ -341,6 +342,8 @@ static MODULES: &[exports::Module] = &[
     net::MODULE,
     #[cfg(not(target_os = "macos"))]
     xattr::MODULE,
+    #[cfg(not(target_os = "macos"))]
+    copyfile::MODULE,
     #[cfg(not(target_os = "macos"))]
     uuid::MODULE,
     #[cfg(not(target_os = "macos"))]

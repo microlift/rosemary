@@ -52,10 +52,23 @@ unsafe extern "C" fn set_menu(receiver: Id, _sel: Sel, value: Id) {
 /// `receiver` is null or an object this runtime allocated, and `sel` is a
 /// `void (id, SEL, NSEvent *)` method.
 pub(crate) unsafe fn forward(receiver: Id, sel: Sel, event: Id) {
+    // A next responder set with `-setNextResponder:` comes first: a program
+    // puts a controller between a view and its superview that way.
+    let set = match crate::view::is_view(receiver) || crate::window::is_window(receiver) {
+        // SAFETY: `-nextResponder` is `id (id, SEL)` on views and windows.
+        true => unsafe {
+            let f: unsafe extern "C" fn(Id, Sel) -> Id = std::mem::transmute(objc::msg::entry());
+            f(receiver, objc::sel::get("nextResponder"))
+        },
+        false => std::ptr::null_mut(),
+    };
     // SAFETY: null or an object this runtime allocated.
-    let next = match unsafe { crate::view::superview_of(receiver) } {
-        next if next.is_null() => unsafe { crate::view::window_of(receiver) },
-        next => next,
+    let next = match set {
+        next if !next.is_null() => next,
+        _ => match unsafe { crate::view::superview_of(receiver) } {
+            next if next.is_null() => unsafe { crate::view::window_of(receiver) },
+            next => next,
+        },
     };
     if next.is_null() {
         return;
@@ -371,6 +384,11 @@ pub(crate) fn install() {
         "rightMouseDragged:" => forward_event, c"v24@0:8@16";
         "otherMouseDragged:" => forward_event, c"v24@0:8@16";
         "scrollWheel:" => forward_event, c"v24@0:8@16";
+        "keyDown:" => forward_event, c"v24@0:8@16";
+        "keyUp:" => forward_event, c"v24@0:8@16";
+        "flagsChanged:" => forward_event, c"v24@0:8@16";
+        "mouseEntered:" => forward_event, c"v24@0:8@16";
+        "mouseExited:" => forward_event, c"v24@0:8@16";
         "interpretKeyEvents:" => interpret_key_events, c"v24@0:8@16";
         "tryToPerform:with:" => try_to_perform, c"c32@0:8:16@24";
     });

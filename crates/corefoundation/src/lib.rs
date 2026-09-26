@@ -13,6 +13,7 @@ pub mod calendar;
 pub mod callbacks;
 pub mod charset;
 pub mod collections;
+pub mod eightbit;
 mod diskarbitration;
 /// Only on Darwin: nowhere else is there another CoreFoundation to meet.
 #[cfg(target_os = "macos")]
@@ -168,6 +169,10 @@ exports::exports! {
         "CFTimeZoneGetName" => timezone::get_name,
         "CFURLCreateFromFSRef" => api::CFURLCreateFromFSRef,
         "CFURLGetFSRef" => api::CFURLGetFSRef,
+        "CFURLCreateBookmarkData" => api::CFURLCreateBookmarkData,
+        "CFURLCreateByResolvingBookmarkData" => api::CFURLCreateByResolvingBookmarkData,
+        "CFURLWriteBookmarkDataToFile" => api::CFURLWriteBookmarkDataToFile,
+        "CFURLCreateBookmarkDataFromFile" => api::CFURLCreateBookmarkDataFromFile,
         "CFURLCreateWithFileSystemPath" => api::CFURLCreateWithFileSystemPath,
         "CFURLCreateWithFileSystemPathRelativeToBase" => api::CFURLCreateWithFileSystemPathRelativeToBase,
         "CFURLCreateWithString" => api::CFURLCreateWithString,
@@ -229,6 +234,7 @@ exports::exports! {
         "CFRunLoopContainsSource" => api::CFRunLoopContainsSource,
         "CFAbsoluteTimeGetCurrent" => api::CFAbsoluteTimeGetCurrent,
         "CFRunLoopTimerCreate" => api::CFRunLoopTimerCreate,
+        "CFRunLoopTimerGetContext" => api::CFRunLoopTimerGetContext,
         "CFRunLoopAddTimer" => api::CFRunLoopAddTimer,
         "CFRunLoopRemoveTimer" => api::CFRunLoopRemoveTimer,
         "CFRunLoopTimerInvalidate" => api::CFRunLoopTimerInvalidate,

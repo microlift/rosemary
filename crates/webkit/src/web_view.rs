@@ -19,7 +19,7 @@ const SNAPSHOT_INTERVAL: Duration = Duration::from_millis(50);
 /// What WebKit on macOS sends; with Studio's application name appended, as
 /// `applicationNameForUserAgent` appends it. Sites choose their Mac layout, and
 /// their Studio-specific paths, by this.
-const USER_AGENT: &str =
+pub(crate) const USER_AGENT: &str =
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko)";
 
 struct View {
@@ -69,6 +69,50 @@ fn with_object<R>(object: Id, body: impl FnOnce(&mut View) -> R) -> Option<R> {
             .find(|v| v.object == object as usize)
             .map(body)
     })
+}
+
+/// The id GTK's callbacks for `object` carry, its `WebKitWebView`, and its
+/// configuration, for the WebKit1 `WebView` built on this one.
+pub(crate) fn parts_of(object: Id) -> Option<(usize, Ptr, Id)> {
+    with_object(object, |v| (v.id, v.gtk as Ptr, v.configuration as Id)).filter(|p| !p.1.is_null())
+}
+
+/// A `file:` URL with its path respelled by `respell`; anything else as is.
+fn respell_file_url(url: &str, respell: impl FnOnce(&str) -> Option<String>) -> String {
+    if !url.starts_with("file://") {
+        return url.to_string();
+    }
+    let at = url.find(['?', '#']).unwrap_or(url.len());
+    let (address, suffix) = url.split_at(at);
+    let parsed = corefoundation::url::new(address);
+    // SAFETY: a URL this call just made.
+    let path = unsafe { corefoundation::url::as_url(parsed) }.and_then(|u| u.file_path());
+    unsafe { corefoundation::api::CFRelease(parsed) };
+    let Some(respelled) = path.and_then(|p| respell(&p)) else {
+        return url.to_string();
+    };
+    let rebuilt = corefoundation::url::new_file_url(&respelled, address.ends_with('/'));
+    // SAFETY: as above.
+    let text = unsafe { corefoundation::url::as_url(rebuilt) }.map(|u| u.text.clone());
+    unsafe { corefoundation::api::CFRelease(rebuilt) };
+    text.map_or_else(|| url.to_string(), |text| text + suffix)
+}
+
+/// A guest's `file:` URL as the web process, a host process, has to open it.
+pub(crate) fn host_url(url: &str) -> String {
+    respell_file_url(url, |path| Some(prefix::ns::host_path(path).to_string_lossy().into_owned()))
+}
+
+/// A `file:` URL WebKitGTK reports, as the guest spells it.
+pub(crate) fn guest_url(url: &str) -> String {
+    respell_file_url(url, |path| {
+        prefix::ns::to_guest(std::path::Path::new(path)).map(|p| p.to_string_lossy().into_owned())
+    })
+}
+
+/// The object a callback's id belongs to.
+pub(crate) fn object_of(id: usize) -> Option<Id> {
+    with_view(id, |v| v.object as Id)
 }
 
 /// The `WebKitWebView` behind a `WKWebView`, with the engine to call it with.
@@ -634,7 +678,7 @@ unsafe extern "C" fn create(gtk: Ptr, action: Ptr, data: Ptr) -> Ptr {
     std::ptr::null_mut()
 }
 
-fn connect(engine: &Engine, gtk: Ptr, signal: &std::ffi::CStr, handler: *const (), id: usize) {
+pub(crate) fn connect(engine: &Engine, gtk: Ptr, signal: &std::ffi::CStr, handler: *const (), id: usize) {
     // SAFETY: a live widget, a signal it has and a handler of that signal's
     // prototype; the data is a plain integer and needs no destructor.
     unsafe {
@@ -1191,7 +1235,7 @@ unsafe extern "C" fn load_request(receiver: Id, _sel: Sel, request: Id) -> Id {
         std::mem::replace(&mut v.navigation, navigation as usize)
     });
     objc::arc::release(old.unwrap_or_default() as Id);
-    let url = gtk::c_string(&url);
+    let url = gtk::c_string(&host_url(&url));
     // SAFETY: the view's widget and a string it copies.
     unsafe { (engine.api.webkit_web_view_load_uri)(gtk, url.as_ptr()) };
     navigation
@@ -1213,7 +1257,7 @@ unsafe extern "C" fn url(receiver: Id, _sel: Sel) -> Id {
     if text.is_empty() {
         return std::ptr::null_mut();
     }
-    objc::arc::autorelease(corefoundation::url::new(&text) as Id)
+    objc::arc::autorelease(corefoundation::url::new(&guest_url(&text)) as Id)
 }
 
 /// A JavaScript value as the Objective-C object WebKit bridges it to.
@@ -1221,7 +1265,7 @@ unsafe extern "C" fn url(receiver: Id, _sel: Sel) -> Id {
 /// # Safety
 ///
 /// `value` must be a live `JSCValue`.
-unsafe fn bridge(api: &gtk::Api, value: Ptr) -> Id {
+pub(crate) unsafe fn bridge(api: &gtk::Api, value: Ptr) -> Id {
     unsafe {
         if (api.jsc_value_is_undefined)(value) != 0 || (api.jsc_value_is_null)(value) != 0 {
             return std::ptr::null_mut();

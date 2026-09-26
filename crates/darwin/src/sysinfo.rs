@@ -455,9 +455,39 @@ unsafe extern "C" fn gestalt(selector: u32, response: *mut i32) -> i16 {
 // Not the same list on both hosts: `Gestalt` is CoreServices' and is passed
 // through where there is one, and `sysconf`'s names are Darwin's already on a
 // Mac.
+/// Darwin's `NXArchInfo`.
+#[repr(C)]
+pub struct ArchInfo {
+    name: *const std::ffi::c_char,
+    cputype: i32,
+    cpusubtype: i32,
+    byteorder: u32,
+    description: *const std::ffi::c_char,
+}
+
+// SAFETY: every pointer is to a `'static` string literal.
+unsafe impl Sync for ArchInfo {}
+
+/// The architecture the guest is running as: an x86-64 guest asks, and an
+/// x86-64 Mac answers `x86_64`, `CPU_TYPE_X86_64` and `CPU_SUBTYPE_X86_64_ALL`.
+static LOCAL_ARCH: ArchInfo = ArchInfo {
+    name: c"x86_64".as_ptr(),
+    cputype: 0x0100_0007,
+    cpusubtype: 3,
+    // `NX_LittleEndian`.
+    byteorder: 1,
+    description: c"Intel x86-64".as_ptr(),
+};
+
+/// `const NXArchInfo *NXGetLocalArchInfo(void)`
+pub extern "C" fn nx_get_local_arch_info() -> *const ArchInfo {
+    &LOCAL_ARCH
+}
+
 exports::exports! {
     functions {
         "uname" => uname,
+        "NXGetLocalArchInfo" => nx_get_local_arch_info,
         "compat_mode" => compat_mode,
         #[cfg(not(target_os = "macos"))]
         "Gestalt" => gestalt,

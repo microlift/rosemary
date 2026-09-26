@@ -442,6 +442,11 @@ struct Chrome {
     pressed: Option<(Row, Part)>,
     dark: bool,
     rounded: bool,
+    /// Drawn for a full-screen window's reveal rather than over its top rows.
+    revealed: bool,
+    /// The height of the rows, in points.
+    height: f32,
+    pixels: Arc<Pixels>,
     generation: u64,
 }
 
@@ -529,10 +534,19 @@ pub(crate) fn pump() {
     }
     let dark = DARK.load(Ordering::Relaxed);
     let mut live = Vec::new();
+    let revealing = revealing_window();
     for window in crate::window::all() {
-        let Some(facts) = crate::window::facts(window) else {
+        let Some(mut facts) = crate::window::facts(window) else {
             continue;
         };
+        // A full-screen window's chrome is drawn only while it slides in, as
+        // if the window were not full screen, and shown in a popup of its own.
+        let revealed = facts.fullscreen && revealing == Some(window);
+        if revealed {
+            facts.fullscreen = false;
+            // AppKit disables minimizing a full-screen window.
+            facts.miniaturizable = false;
+        }
         let (titlebar_height, strip_height) = rows(config, &facts);
         if !facts.shown || titlebar_height + strip_height <= 0.0 {
             continue;
@@ -569,6 +583,7 @@ pub(crate) fn pump() {
                 c.sdl == sdl as usize
                     && c.dark == dark
                     && c.rounded == rounded
+                    && c.revealed == revealed
                     && c.size == size
                     && c.titlebar == titlebar
                     && c.strip == strip
@@ -620,6 +635,13 @@ pub(crate) fn pump() {
                 .chain(&strip_layout.parts)
                 .map(|(_, rect)| *rect)
                 .collect();
+            let pixels = Arc::new(Pixels {
+                width: size.0,
+                height: size.1,
+                pixels,
+                generation,
+                radius,
+            });
             chromes.insert(
                 window as usize,
                 Chrome {
@@ -634,28 +656,27 @@ pub(crate) fn pump() {
                     pressed,
                     dark,
                     rounded,
+                    revealed,
+                    height: inset,
+                    pixels: pixels.clone(),
                     generation,
                 },
             );
-            Some((
-                Pixels {
-                    width: size.0,
-                    height: size.1,
-                    pixels,
-                    generation,
-                    radius,
-                },
-                controls,
-            ))
+            Some((pixels, controls))
         });
         let Some((pixels, controls)) = painted else {
             continue;
         };
+        if revealed {
+            // The content fills the window; nothing is composited over it.
+            forget_sdl(sdl);
+            continue;
+        }
         PIXELS
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .get_or_insert_with(HashMap::new)
-            .insert(sdl as usize, Arc::new(pixels));
+            .insert(sdl as usize, pixels);
         if config.decorations == Decorations::Client {
             let wayland = sdl3::video::wayland_surface(sdl);
             if let Some((display, _)) = wayland {
@@ -696,6 +717,7 @@ pub(crate) fn pump() {
     for (_, sdl) in gone {
         forget_sdl(sdl as sdl3::Window);
     }
+    step_reveal();
 }
 
 /// Drop everything kept for an SDL window, before it is destroyed or when it
@@ -783,10 +805,22 @@ pub(crate) fn pointer_moved(id: u32, x: f32, y: f32) -> bool {
         tracking_motion(id, x, y);
         return true;
     }
-    let window = crate::event::object_for(id);
-    if window.is_null() {
-        return false;
-    }
+    let (window, y) = match reveal_of_popup(id) {
+        Some((window, offset)) => (window, y + offset),
+        None => {
+            let window = crate::event::object_for(id);
+            if window.is_null() {
+                return false;
+            }
+            // Under the reveal the chrome is the popup's, and the rest is
+            // the guest's.
+            if crate::window::is_full_screen_titled(window) {
+                full_screen_pointer(window, y);
+                return false;
+            }
+            (window, y)
+        }
+    };
     let Some((row, part)) = locate(window, x, y) else {
         set_hover(window, None);
         return false;
@@ -803,9 +837,18 @@ pub(crate) fn pointer_moved(id: u32, x: f32, y: f32) -> bool {
     true
 }
 
+/// Whether `id` is one of the chrome's own popups: an open menu or the
+/// full-screen reveal.
+pub(crate) fn is_chrome_popup(id: u32) -> bool {
+    tracking_popup(id) || reveal_of_popup(id).is_some()
+}
+
 /// The pointer left a window.
 pub(crate) fn pointer_left(id: u32) {
-    let window = crate::event::object_for(id);
+    let window = match reveal_of_popup(id) {
+        Some((window, _)) => window,
+        None => crate::event::object_for(id),
+    };
     if !window.is_null() {
         set_hover(window, None);
     }
@@ -821,11 +864,18 @@ pub(crate) fn pointer_button(id: u32, button: u8, down: bool, clicks: u8, x: f32
         }
         return true;
     }
-    let window = crate::event::object_for(id);
-    let located = match window.is_null() {
-        true => None,
-        false => locate(window, x, y),
+    let (window, located) = match reveal_of_popup(id) {
+        Some((window, offset)) => (window, locate(window, x, y + offset)),
+        None => {
+            let window = crate::event::object_for(id);
+            let located = match window.is_null() || crate::window::is_full_screen_titled(window) {
+                true => None,
+                false => locate(window, x, y),
+            };
+            (window, located)
+        }
     };
+    let full_screen = crate::window::is_full_screen_titled(window);
     // A press anywhere but on a menu title ends menu tracking, and does
     // nothing else: it is the click that dismisses the menu.
     if down && tracking_window().is_some() {
@@ -855,10 +905,10 @@ pub(crate) fn pointer_button(id: u32, button: u8, down: bool, clicks: u8, x: f32
                 false => open_overflow(window, row, first),
             }
         }
-        (true, None) if button == LEFT && clicks >= 2 && row == Row::Titlebar => {
+        (true, None) if button == LEFT && clicks >= 2 && row == Row::Titlebar && !full_screen => {
             send(window, "zoom:");
         }
-        (true, None) if button == RIGHT && row == Row::Titlebar => {
+        (true, None) if button == RIGHT && row == Row::Titlebar && !full_screen => {
             // SAFETY: a window this crate made.
             let sdl = unsafe { crate::window::sdl_window(window) };
             sdl3::video::show_window_system_menu(sdl, x as i32, y as i32);
@@ -871,6 +921,8 @@ pub(crate) fn pointer_button(id: u32, button: u8, down: bool, clicks: u8, x: f32
                 match part {
                     Part::Close => send(window, "performClose:"),
                     Part::Minimize => send(window, "performMiniaturize:"),
+                    // A full-screen window's green button leaves full screen.
+                    Part::Zoom if full_screen => send(window, "toggleFullScreen:"),
                     Part::Zoom => send(window, "performZoom:"),
                     _ => {}
                 }
@@ -918,6 +970,11 @@ pub(crate) fn window_closed(id: u32) -> bool {
         close_menus();
         return true;
     }
+    // A compositor dismissing the reveal's popup.
+    if reveal_of_popup(id).is_some() {
+        end_reveal();
+        return true;
+    }
     false
 }
 
@@ -931,6 +988,236 @@ pub(crate) fn focus_changed(id: u32, gained: bool) {
     if !window.is_null() && tracking_window().is_some_and(|tracking| tracking != window) {
         close_menus();
     }
+}
+
+// The full-screen reveal: a full-screen window has no chrome until the
+// pointer reaches the top of the screen, when its titlebar slides down over
+// the content as a Mac's does. It is a popup of its own rather than rows of
+// the window's presentation, so it neither disturbs the content under it nor
+// waits for the guest to present a frame, which a game may not do while idle.
+
+/// How near the top of a full-screen window the pointer reveals the chrome,
+/// in points.
+const REVEAL_EDGE: f32 = 3.0;
+
+/// How long the chrome takes to slide all the way in or out.
+const REVEAL_SECONDS: f32 = 0.25;
+
+struct Reveal {
+    window: Id,
+    /// Whether the pointer wants the chrome shown.
+    wanted: bool,
+    /// How far in the chrome has slid, from 0 to 1, linear in time.
+    progress: f32,
+    last: std::time::Instant,
+    popup: Option<(sdl3::Window, u32)>,
+    /// The chrome generation and height in points the popup last showed.
+    shown: (u64, i32),
+    /// The visible height in points, from the last step.
+    visible: i32,
+}
+
+thread_local! {
+    static REVEAL: RefCell<Option<Reveal>> = const { RefCell::new(None) };
+}
+
+/// The window whose chrome is revealed or on its way in or out.
+fn revealing_window() -> Option<Id> {
+    REVEAL.with(|r| r.borrow().as_ref().map(|r| r.window))
+}
+
+/// The window a reveal popup belongs to, and how far its top is below the
+/// top of the chrome, in points.
+fn reveal_of_popup(id: u32) -> Option<(Id, f32)> {
+    let (window, visible) = REVEAL.with(|r| {
+        let r = r.borrow();
+        let r = r.as_ref()?;
+        (r.popup?.1 == id).then_some((r.window, r.visible))
+    })?;
+    let height = with_chromes(|chromes| chromes.get(&(window as usize)).map(|c| c.height))?;
+    Some((window, height - visible as f32))
+}
+
+/// The reveal's popup, for a script to drive.
+pub(crate) fn reveal_popup() -> Option<sdl3::Window> {
+    REVEAL.with(|r| r.borrow().as_ref()?.popup.map(|(popup, _)| popup))
+}
+
+/// Pointer motion over a full-screen window's content, at `y` points from
+/// its top: at the top edge the chrome slides in, and once the pointer is
+/// below it again the chrome slides out.
+fn full_screen_pointer(window: Id, y: f32) {
+    if inset_for(config(), true, false, false) <= 0.0 {
+        return;
+    }
+    // SAFETY: a window this crate made.
+    let sdl = unsafe { crate::window::sdl_window(window) };
+    // A game that has taken the pointer, or a drag in progress, is not
+    // reaching for the chrome.
+    let held = sdl3::video::mouse_state().is_some_and(|(_, _, buttons)| buttons != 0);
+    let captured = sdl3::video::relative_mouse_mode(sdl);
+    let height = with_chromes(|chromes| chromes.get(&(window as usize)).map(|c| c.height));
+    REVEAL.with(|r| {
+        let mut r = r.borrow_mut();
+        match r.as_mut().filter(|r| r.window == window) {
+            Some(reveal) => {
+                if y < REVEAL_EDGE && !captured && !held {
+                    reveal.wanted = true;
+                } else if height.is_some_and(|height| y >= height) {
+                    reveal.wanted = false;
+                }
+            }
+            None if y < REVEAL_EDGE && !captured && !held => {
+                if let Some(old) = r.take() {
+                    destroy_reveal(old);
+                }
+                *r = Some(Reveal {
+                    window,
+                    wanted: true,
+                    progress: 0.0,
+                    last: std::time::Instant::now(),
+                    popup: None,
+                    shown: (0, 0),
+                    visible: 0,
+                });
+            }
+            None => {}
+        }
+    });
+}
+
+/// Take the reveal down at once.
+fn end_reveal() {
+    if let Some(reveal) = REVEAL.with(|r| r.borrow_mut().take()) {
+        destroy_reveal(reveal);
+    }
+}
+
+fn destroy_reveal(reveal: Reveal) {
+    if let Some((popup, _)) = reveal.popup {
+        sdl3::video::destroy_window(popup);
+    }
+    if tracking_window() == Some(reveal.window) {
+        close_menus();
+    }
+    set_hover(reveal.window, None);
+    set_pressed(reveal.window, None);
+}
+
+/// Move `progress` toward `wanted` by `seconds` of sliding.
+fn advance(progress: f32, wanted: bool, seconds: f32) -> f32 {
+    let step = seconds / REVEAL_SECONDS;
+    match wanted {
+        true => (progress + step).min(1.0),
+        false => (progress - step).max(0.0),
+    }
+}
+
+/// How much of `height` points of chrome shows `progress` of the way in:
+/// eased at both ends, and never nothing while it is on its way.
+fn visible_height(progress: f32, height: f32) -> i32 {
+    let eased = progress * progress * (3.0 - 2.0 * progress);
+    ((eased * height).round() as i32).clamp(1, height.ceil().max(1.0) as i32)
+}
+
+/// Slide the reveal one step and show it, once per pump after the chrome is
+/// painted.
+fn step_reveal() {
+    let Some(window) = revealing_window() else {
+        return;
+    };
+    let facts = crate::window::facts(window);
+    let chrome = with_chromes(|chromes| {
+        chromes
+            .get(&(window as usize))
+            .filter(|c| c.revealed)
+            .map(|c| (c.pixels.clone(), c.height))
+    });
+    // The window left full screen, closed or was hidden.
+    let (Some(facts), Some((pixels, height))) = (facts, chrome) else {
+        end_reveal();
+        return;
+    };
+    if !facts.fullscreen || !facts.shown {
+        end_reveal();
+        return;
+    }
+    let sdl = facts.sdl as sdl3::Window;
+    let Some((width, _)) = sdl3::video::window_size(sdl) else {
+        return;
+    };
+    // A menu hanging from the chrome keeps it in.
+    let menu_open = tracking_window() == Some(window);
+    let done = REVEAL.with(|r| {
+        let mut r = r.borrow_mut();
+        let Some(reveal) = r.as_mut() else {
+            return false;
+        };
+        let now = std::time::Instant::now();
+        let seconds = now.duration_since(reveal.last).as_secs_f32();
+        reveal.last = now;
+        reveal.progress = advance(reveal.progress, reveal.wanted || menu_open, seconds);
+        if reveal.progress <= 0.0 {
+            return true;
+        }
+        let visible = visible_height(reveal.progress, height);
+        reveal.visible = visible;
+        let popup = match reveal.popup {
+            Some((popup, _)) => {
+                if sdl3::video::window_size(popup) != Some((width, visible)) {
+                    sdl3::video::set_window_size(popup, width, visible);
+                }
+                popup
+            }
+            None => {
+                // Not focusable: the keyboard stays with the game under it.
+                let flags = sdl3::video::flags::POPUP_MENU
+                    | sdl3::video::flags::NOT_FOCUSABLE
+                    | sdl3::video::flags::HIGH_PIXEL_DENSITY;
+                let Some(popup) =
+                    sdl3::video::create_popup_window(sdl, 0, 0, width, visible, flags)
+                else {
+                    crate::window::trace(format_args!(
+                        "the full-screen reveal could not be made: {}",
+                        sdl3::error()
+                    ));
+                    return true;
+                };
+                reveal.popup = Some((popup, sdl3::video::window_id(popup)));
+                reveal.shown = (0, 0);
+                popup
+            }
+        };
+        if reveal.shown != (pixels.generation, visible) {
+            reveal.shown = (pixels.generation, visible);
+            paint_reveal(popup, &pixels);
+        }
+        false
+    });
+    if done {
+        end_reveal();
+    }
+}
+
+/// Show the bottom rows of the chrome that fit in the popup: the chrome
+/// slides down from above the top of the screen.
+fn paint_reveal(popup: sdl3::Window, chrome: &Pixels) {
+    sdl3::video::present_window(popup, |surface| {
+        let rows = (surface.height.max(0) as usize).min(chrome.height as usize);
+        let columns = (surface.width.max(0) as usize).min(chrome.width as usize);
+        let skip = chrome.height as usize - rows;
+        let length = surface.pitch as usize * surface.height.max(0) as usize;
+        // SAFETY: SDL reported `pitch` bytes per row for `height` rows, and
+        // the surface is locked for the duration of this call.
+        let pixels = unsafe { std::slice::from_raw_parts_mut(surface.pixels, length) };
+        for row in 0..rows {
+            let from = (skip + row) * chrome.width as usize * 4;
+            let to = row * surface.pitch as usize;
+            pixels[to..to + columns * 4].copy_from_slice(&chrome.pixels[from..from + columns * 4]);
+        }
+        dump_popup("reveal", sdl3::video::window_id(popup), surface, pixels);
+        rows > 0 && columns > 0
+    });
 }
 
 // Menu tracking.
@@ -1080,10 +1367,13 @@ fn panel_item(item: Id) -> Item {
         return Item::separator();
     }
     let submenu = !crate::menu::submenu_of(item).is_null();
+    // Validation first: a validator may retitle the item, as a window does
+    // "Enter Full Screen".
+    let enabled = crate::menu::is_item_enabled(item);
     Item {
         title: crate::menu::display_title(item),
         shortcut: crate::menu::shortcut_label(item),
-        enabled: crate::menu::is_item_enabled(item),
+        enabled,
         state: match crate::menu::state_of(item) {
             1 => chrome::menu::State::On,
             -1 => chrome::menu::State::Mixed,
@@ -1117,7 +1407,7 @@ fn paint_level(level: &Level) {
             scale,
         );
         level.panel.paint(&mut canvas, &level.layout, theme);
-        dump_panel(level.popup_id, surface, pixels);
+        dump_popup("menu", level.popup_id, surface, pixels);
         true
     });
 }
@@ -1131,9 +1421,10 @@ fn repaint_menus() {
     });
 }
 
-/// `ROSETTA3_STORE_OUT=DIR` writes each menu panel as it is painted, beside
-/// the window stores, for a session with no screen to look at.
-fn dump_panel(id: u32, surface: &sdl3::video::Presentation, pixels: &[u8]) {
+/// `ROSETTA3_STORE_OUT=DIR` writes each menu panel and full-screen reveal as
+/// it is painted, beside the window stores, for a session with no screen to
+/// look at.
+fn dump_popup(kind: &str, id: u32, surface: &sdl3::video::Presentation, pixels: &[u8]) {
     let Some(directory) = std::env::var_os("ROSETTA3_STORE_OUT") else {
         return;
     };
@@ -1146,7 +1437,7 @@ fn dump_panel(id: u32, surface: &sdl3::video::Presentation, pixels: &[u8]) {
         }
     }
     let _ = std::fs::write(
-        std::path::Path::new(&directory).join(format!("menu-{id}.ppm")),
+        std::path::Path::new(&directory).join(format!("{kind}-{id}.ppm")),
         out,
     );
 }
@@ -1447,6 +1738,28 @@ mod tests {
         assert_eq!(inset_for(server, true, true, false), 0.0);
         let server_bare = Config::parse(Some("server"), Some("none"), None);
         assert_eq!(inset_for(server_bare, true, false, false), 0.0);
+    }
+
+    /// The reveal slides in and out over `REVEAL_SECONDS`, may turn back
+    /// part of the way, and shows at least a row while it moves.
+    #[test]
+    fn the_full_screen_reveal_slides_in_and_out() {
+        let quarter = REVEAL_SECONDS / 4.0;
+        let mut progress = 0.0;
+        for _ in 0..2 {
+            progress = advance(progress, true, quarter);
+        }
+        assert_eq!(progress, 0.5);
+        assert_eq!(visible_height(progress, 28.0), 14);
+        progress = advance(progress, false, quarter);
+        assert_eq!(progress, 0.25);
+        assert_eq!(advance(progress, false, REVEAL_SECONDS), 0.0);
+        assert_eq!(advance(progress, true, REVEAL_SECONDS * 2.0), 1.0);
+
+        assert_eq!(visible_height(0.01, 28.0), 1, "a sliver while moving");
+        assert_eq!(visible_height(1.0, 28.0), 28);
+        // Eased: slow to start, so less than a linear slide.
+        assert!(visible_height(0.25, 28.0) < 7);
     }
 
     #[test]

@@ -364,6 +364,30 @@ unsafe extern "C" fn data_with_contents_of_file(_class: Id, _sel: Sel, path: Id)
     unsafe { api::CFAutorelease(data) as Id }
 }
 
+/// `+dataWithContentsOfFile:options:error:`. The reading options only tune
+/// how the file is read (mapped, uncached), not what is answered.
+unsafe extern "C" fn data_with_contents_of_file_options(
+    class: Id,
+    sel: Sel,
+    path: Id,
+    _options: u64,
+    error: *mut Id,
+) -> Id {
+    // SAFETY: forwarded unchanged.
+    let data = unsafe { data_with_contents_of_file(class, sel, path) };
+    if !error.is_null() {
+        // `NSFileReadNoSuchFileError` or nothing: the caller passed a writable
+        // `NSError **`.
+        unsafe {
+            *error = match data.is_null() {
+                true => crate::error::make("NSCocoaErrorDomain", 260, "The file couldn't be opened."),
+                false => std::ptr::null_mut(),
+            };
+        }
+    }
+    data
+}
+
 /// `+[NSDictionary dictionaryWithContentsOfFile:]`.
 ///
 /// This convenience constructor accepts XML and binary property lists through
@@ -944,6 +968,237 @@ unsafe extern "C" fn data_with_bytes_no_copy(
     }
 }
 
+/// The bytes of a data object, or empty for nil or anything else.
+///
+/// # Safety
+///
+/// `object` is nil or a live object.
+unsafe fn data_contents<'a>(object: Id) -> &'a [u8] {
+    match unsafe { collections::data(object as CFTypeRef) } {
+        Some(bytes) => bytes.as_slice(),
+        None => &[],
+    }
+}
+
+/// `bytes` for `length` bytes as a slice; empty for a null pointer.
+///
+/// # Safety
+///
+/// Non-null `bytes` covers `length` bytes.
+unsafe fn raw<'a>(bytes: *const u8, length: usize) -> &'a [u8] {
+    match bytes.is_null() || length == 0 {
+        true => &[],
+        false => unsafe { std::slice::from_raw_parts(bytes, length) },
+    }
+}
+
+/// Every `-init...` below answers a new object in place of the one `+alloc`
+/// made, as the string initialisers do: data here is a CoreFoundation object
+/// whatever class was asked for, and one class serves both mutabilities.
+fn replace_receiver(receiver: Id, bytes: Vec<u8>) -> Id {
+    objc::arc::release(receiver);
+    collections::new_data(bytes) as Id
+}
+
+fn autoreleased_data(bytes: Vec<u8>) -> Id {
+    // SAFETY: a fresh object.
+    unsafe { api::CFAutorelease(collections::new_data(bytes)) as Id }
+}
+
+unsafe extern "C" fn data_init(receiver: Id, _sel: Sel) -> Id {
+    replace_receiver(receiver, Vec::new())
+}
+
+unsafe extern "C" fn data_init_with_data(receiver: Id, _sel: Sel, other: Id) -> Id {
+    // SAFETY: a data object or nil.
+    replace_receiver(receiver, unsafe { data_contents(other) }.to_vec())
+}
+
+unsafe extern "C" fn data_init_with_bytes(receiver: Id, _sel: Sel, bytes: *const u8, length: usize) -> Id {
+    // SAFETY: the caller says `bytes` covers `length` bytes.
+    replace_receiver(receiver, unsafe { raw(bytes, length) }.to_vec())
+}
+
+/// `-initWithBytesNoCopy:length:freeWhenDone:`. Copied, as
+/// [`data_with_bytes_no_copy`] explains, and the caller's buffer released
+/// now when it handed it over.
+unsafe extern "C" fn data_init_no_copy_free(
+    receiver: Id,
+    _sel: Sel,
+    bytes: *mut u8,
+    length: usize,
+    free: bool,
+) -> Id {
+    // SAFETY: the caller says `bytes` covers `length` bytes.
+    let copy = unsafe { raw(bytes, length) }.to_vec();
+    if free && !bytes.is_null() {
+        // SAFETY: a `malloc` block the caller gave away.
+        unsafe { darwin::heap::free(bytes.cast()) };
+    }
+    replace_receiver(receiver, copy)
+}
+
+unsafe extern "C" fn data_init_no_copy(receiver: Id, sel: Sel, bytes: *mut u8, length: usize) -> Id {
+    // SAFETY: forwarded; `-initWithBytesNoCopy:length:` frees when done.
+    unsafe { data_init_no_copy_free(receiver, sel, bytes, length, true) }
+}
+
+unsafe extern "C" fn data_init_with_contents_of_file(receiver: Id, sel: Sel, path: Id) -> Id {
+    objc::arc::release(receiver);
+    // SAFETY: forwarded; the answer is autoreleased, and `-init` answers +1.
+    objc::arc::retain(unsafe { data_with_contents_of_file(receiver, sel, path) })
+}
+
+unsafe extern "C" fn data_init_with_capacity(receiver: Id, _sel: Sel, capacity: usize) -> Id {
+    replace_receiver(receiver, Vec::with_capacity(capacity.min(1 << 24)))
+}
+
+unsafe extern "C" fn data_init_with_length(receiver: Id, _sel: Sel, length: usize) -> Id {
+    replace_receiver(receiver, vec![0; length])
+}
+
+unsafe extern "C" fn data_empty(_class: Id, _sel: Sel) -> Id {
+    autoreleased_data(Vec::new())
+}
+
+unsafe extern "C" fn data_with_data(_class: Id, _sel: Sel, other: Id) -> Id {
+    // SAFETY: a data object or nil.
+    autoreleased_data(unsafe { data_contents(other) }.to_vec())
+}
+
+unsafe extern "C" fn data_with_capacity(_class: Id, _sel: Sel, capacity: usize) -> Id {
+    autoreleased_data(Vec::with_capacity(capacity.min(1 << 24)))
+}
+
+unsafe extern "C" fn data_with_length(_class: Id, _sel: Sel, length: usize) -> Id {
+    autoreleased_data(vec![0; length])
+}
+
+unsafe extern "C" fn data_copy(receiver: Id, _sel: Sel) -> Id {
+    // SAFETY: a data object.
+    collections::new_data(unsafe { data_contents(receiver) }.to_vec()) as Id
+}
+
+unsafe extern "C" fn data_copy_with_zone(receiver: Id, sel: Sel, _zone: *mut std::ffi::c_void) -> Id {
+    // SAFETY: forwarded.
+    unsafe { data_copy(receiver, sel) }
+}
+
+unsafe extern "C" fn data_is_equal(receiver: Id, _sel: Sel, other: Id) -> bool {
+    // SAFETY: a data object, and nil or a live object; anything that is not
+    // data is not equal.
+    let Some(theirs) = (unsafe { collections::data(other as CFTypeRef) }) else {
+        return false;
+    };
+    (unsafe { data_contents(receiver) }) == theirs.as_slice()
+}
+
+unsafe extern "C" fn data_hash(receiver: Id, _sel: Sel) -> usize {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    // SAFETY: a data object.
+    unsafe { data_contents(receiver) }.hash(&mut hasher);
+    hasher.finish() as usize
+}
+
+unsafe extern "C" fn data_get_bytes_length(receiver: Id, _sel: Sel, out: *mut u8, length: usize) {
+    // SAFETY: a data object.
+    let bytes = unsafe { data_contents(receiver) };
+    let count = length.min(bytes.len());
+    if !out.is_null() {
+        // SAFETY: the caller says `out` holds `length` bytes.
+        unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), out, count) };
+    }
+}
+
+unsafe extern "C" fn data_get_bytes(receiver: Id, sel: Sel, out: *mut u8) {
+    // SAFETY: the caller's buffer holds the whole of the data.
+    let length = unsafe { data_contents(receiver) }.len();
+    unsafe { data_get_bytes_length(receiver, sel, out, length) };
+}
+
+/// The bytes `location..location+length`, or `NSRangeException` by name.
+///
+/// # Safety
+///
+/// `receiver` is a data object.
+unsafe fn data_range<'a>(receiver: Id, location: usize, length: usize, what: &str) -> &'a [u8] {
+    let bytes = unsafe { data_contents(receiver) };
+    match location.checked_add(length).filter(|end| *end <= bytes.len()) {
+        Some(end) => &bytes[location..end],
+        None => objc::fail!(
+            "{what}: range {{{location}, {length}}} exceeds data length {}",
+            bytes.len()
+        ),
+    }
+}
+
+unsafe extern "C" fn data_get_bytes_range(
+    receiver: Id,
+    _sel: Sel,
+    out: *mut u8,
+    location: usize,
+    length: usize,
+) {
+    // SAFETY: a data object.
+    let bytes = unsafe { data_range(receiver, location, length, "-getBytes:range:") };
+    if !out.is_null() {
+        // SAFETY: the caller says `out` holds `length` bytes.
+        unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), out, bytes.len()) };
+    }
+}
+
+unsafe extern "C" fn data_subdata(receiver: Id, _sel: Sel, location: usize, length: usize) -> Id {
+    // SAFETY: a data object.
+    autoreleased_data(unsafe { data_range(receiver, location, length, "-subdataWithRange:") }.to_vec())
+}
+
+unsafe extern "C" fn data_set_length(receiver: Id, _sel: Sel, length: usize) {
+    // SAFETY: a data object.
+    if let Some(bytes) = unsafe { collections::data(receiver as CFTypeRef) } {
+        bytes.resize(length, 0);
+    }
+}
+
+unsafe extern "C" fn data_increase_length(receiver: Id, _sel: Sel, extra: usize) {
+    // SAFETY: a data object.
+    if let Some(bytes) = unsafe { collections::data(receiver as CFTypeRef) } {
+        let length = bytes.len().saturating_add(extra);
+        bytes.resize(length, 0);
+    }
+}
+
+unsafe extern "C" fn data_append_data(receiver: Id, _sel: Sel, other: Id) {
+    // SAFETY: data objects; copied first, since `other` may be the receiver.
+    let theirs = unsafe { data_contents(other) }.to_vec();
+    if let Some(bytes) = unsafe { collections::data(receiver as CFTypeRef) } {
+        bytes.extend_from_slice(&theirs);
+    }
+}
+
+unsafe extern "C" fn data_replace_bytes(
+    receiver: Id,
+    _sel: Sel,
+    location: usize,
+    length: usize,
+    with: *const u8,
+) {
+    // SAFETY: a data object; `with` covers `length` bytes by contract.
+    unsafe { data_range(receiver, location, length, "-replaceBytesInRange:withBytes:") };
+    let replacement = unsafe { raw(with, length) }.to_vec();
+    if let Some(bytes) = unsafe { collections::data(receiver as CFTypeRef) } {
+        bytes[location..location + length].copy_from_slice(&replacement);
+    }
+}
+
+unsafe extern "C" fn data_reset_bytes(receiver: Id, _sel: Sel, location: usize, length: usize) {
+    // SAFETY: a data object.
+    unsafe { data_range(receiver, location, length, "-resetBytesInRange:") };
+    if let Some(bytes) = unsafe { collections::data(receiver as CFTypeRef) } {
+        bytes[location..location + length].fill(0);
+    }
+}
+
 unsafe extern "C" fn append_bytes(receiver: Id, _sel: Sel, bytes: *const u8, length: usize) {
     // SAFETY: a data object.
     let Some(d) = (unsafe { collections::data(receiver as CFTypeRef) }) else {
@@ -1045,6 +1300,43 @@ unsafe extern "C" fn number_with_integer(_class: Id, _sel: Sel, value: i64) -> I
     unsafe {
         api::CFAutorelease(collections::new_number(collections::Number::Integer(value))) as Id
     }
+}
+
+/// The unsigned 64-bit constructors. A value past `i64::MAX` is kept as its bit
+/// pattern, which `-unsignedLongLongValue` reads back unchanged.
+unsafe extern "C" fn number_with_unsigned_long(class: Id, sel: Sel, value: u64) -> Id {
+    // SAFETY: the same receiver and selector, forwarded.
+    unsafe { number_with_integer(class, sel, value as i64) }
+}
+
+unsafe extern "C" fn number_with_unsigned_int(class: Id, sel: Sel, value: u32) -> Id {
+    // SAFETY: as above.
+    unsafe { number_with_integer(class, sel, i64::from(value)) }
+}
+
+unsafe extern "C" fn number_with_short(class: Id, sel: Sel, value: i16) -> Id {
+    // SAFETY: as above.
+    unsafe { number_with_int(class, sel, i32::from(value)) }
+}
+
+unsafe extern "C" fn number_with_unsigned_short(class: Id, sel: Sel, value: u16) -> Id {
+    // SAFETY: as above.
+    unsafe { number_with_int(class, sel, i32::from(value)) }
+}
+
+unsafe extern "C" fn number_with_char(class: Id, sel: Sel, value: i8) -> Id {
+    // SAFETY: as above.
+    unsafe { number_with_int(class, sel, i32::from(value)) }
+}
+
+unsafe extern "C" fn number_with_unsigned_char(class: Id, sel: Sel, value: u8) -> Id {
+    // SAFETY: as above.
+    unsafe { number_with_int(class, sel, i32::from(value)) }
+}
+
+unsafe extern "C" fn number_with_float(class: Id, sel: Sel, value: f32) -> Id {
+    // SAFETY: as above.
+    unsafe { number_with_double(class, sel, f64::from(value)) }
 }
 
 unsafe extern "C" fn number_with_double(_class: Id, _sel: Sel, value: f64) -> Id {
@@ -1222,13 +1514,47 @@ pub(crate) fn install() {
         "dataWithBytes:length:" => data_with_bytes, c"@32@0:8^v16Q24";
         "dataWithBytesNoCopy:length:" => data_with_bytes_no_copy, c"@32@0:8^v16Q24";
         "dataWithContentsOfFile:" => data_with_contents_of_file, c"@24@0:8@16";
+        "dataWithContentsOfFile:options:error:"
+            => data_with_contents_of_file_options, c"@40@0:8@16Q24^@32";
     });
     methods!(data, {
         "writeToFile:atomically:" => write_to_file, c"B28@0:8@16c24";
+        "init" => data_init, c"@16@0:8";
+        "initWithData:" => data_init_with_data, c"@24@0:8@16";
+        "initWithBytes:length:" => data_init_with_bytes, c"@32@0:8r^v16Q24";
+        "initWithBytesNoCopy:length:" => data_init_no_copy, c"@32@0:8^v16Q24";
+        "initWithBytesNoCopy:length:freeWhenDone:" => data_init_no_copy_free, c"@36@0:8^v16Q24B32";
+        "initWithContentsOfFile:" => data_init_with_contents_of_file, c"@24@0:8@16";
+        "copy" => data_copy, c"@16@0:8";
+        "copyWithZone:" => data_copy_with_zone, c"@24@0:8^v16";
+        "mutableCopy" => data_copy, c"@16@0:8";
+        "mutableCopyWithZone:" => data_copy_with_zone, c"@24@0:8^v16";
+        "isEqual:" => data_is_equal, c"B24@0:8@16";
+        "isEqualToData:" => data_is_equal, c"B24@0:8@16";
+        "hash" => data_hash, c"Q16@0:8";
+        "getBytes:" => data_get_bytes, c"v24@0:8^v16";
+        "getBytes:length:" => data_get_bytes_length, c"v32@0:8^v16Q24";
+        "getBytes:range:" => data_get_bytes_range, c"v40@0:8^v16{_NSRange=QQ}24";
+        "subdataWithRange:" => data_subdata, c"@32@0:8{_NSRange=QQ}16";
+    });
+    class_methods!(data, {
+        "data" => data_empty, c"@16@0:8";
+        "dataWithData:" => data_with_data, c"@24@0:8@16";
     });
     methods!(mutable_data, {
         "appendBytes:length:" => append_bytes, c"v32@0:8^v16Q24";
         "mutableBytes" => data_bytes, c"^v16@0:8";
+        "initWithCapacity:" => data_init_with_capacity, c"@24@0:8Q16";
+        "initWithLength:" => data_init_with_length, c"@24@0:8Q16";
+        "setLength:" => data_set_length, c"v24@0:8Q16";
+        "increaseLengthBy:" => data_increase_length, c"v24@0:8Q16";
+        "appendData:" => data_append_data, c"v24@0:8@16";
+        "replaceBytesInRange:withBytes:" => data_replace_bytes, c"v40@0:8{_NSRange=QQ}16r^v32";
+        "resetBytesInRange:" => data_reset_bytes, c"v32@0:8{_NSRange=QQ}16";
+    });
+    class_methods!(mutable_data, {
+        "dataWithCapacity:" => data_with_capacity, c"@24@0:8Q16";
+        "dataWithLength:" => data_with_length, c"@24@0:8Q16";
     });
 
     let number = objc::class::lookup(c"NSNumber").expect("CoreFoundation registered NSNumber");
@@ -1258,5 +1584,14 @@ pub(crate) fn install() {
         "numberWithLongLong:" => number_with_integer, c"@24@0:8q16";
         "numberWithDouble:" => number_with_double, c"@24@0:8d16";
         "numberWithBool:" => number_with_bool, c"@24@0:8B16";
+        "numberWithUnsignedInteger:" => number_with_unsigned_long, c"@24@0:8Q16";
+        "numberWithUnsignedLong:" => number_with_unsigned_long, c"@24@0:8Q16";
+        "numberWithUnsignedLongLong:" => number_with_unsigned_long, c"@24@0:8Q16";
+        "numberWithUnsignedInt:" => number_with_unsigned_int, c"@24@0:8I16";
+        "numberWithShort:" => number_with_short, c"@24@0:8s16";
+        "numberWithUnsignedShort:" => number_with_unsigned_short, c"@24@0:8S16";
+        "numberWithChar:" => number_with_char, c"@24@0:8c16";
+        "numberWithUnsignedChar:" => number_with_unsigned_char, c"@24@0:8C16";
+        "numberWithFloat:" => number_with_float, c"@24@0:8f16";
     });
 }

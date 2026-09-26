@@ -63,14 +63,49 @@ unsafe extern "C" fn length(receiver: Id, _sel: Sel) -> usize {
     unsafe { api::CFStringGetLength(receiver as CFTypeRef) as usize }
 }
 
+/// The string's own storage when it already is the C string, or else a
+/// NUL-terminated copy in an autoreleased buffer - `-UTF8String` never answers
+/// NULL for a string, whatever `CFStringGetCStringPtr` may.
+///
+/// # Safety
+///
+/// `receiver` is nil or a string object.
+unsafe fn c_string_in(receiver: Id, cf: u32) -> *const c_char {
+    if receiver.is_null() {
+        return std::ptr::null();
+    }
+    // SAFETY: a string object.
+    let direct = unsafe { api::CFStringGetCStringPtr(receiver as CFTypeRef, cf) };
+    if !direct.is_null() {
+        return direct;
+    }
+    let text = match cf {
+        encoding::UTF8 => Some(unsafe { bytes(receiver) }),
+        code if corefoundation::eightbit::is_table(code) => unsafe { units(receiver) }
+            .into_iter()
+            .map(|unit| corefoundation::eightbit::encode(unit, code))
+            .collect(),
+        _ => None,
+    };
+    // A character the encoding has not got makes the conversion fail, as
+    // `-cStringUsingEncoding:` answers NULL for.
+    let Some(mut text) = text else {
+        return std::ptr::null();
+    };
+    text.push(0);
+    let data = objc::arc::autorelease(corefoundation::collections::new_data(text) as Id);
+    // SAFETY: a data object this call made, alive until the pool drains.
+    unsafe { api::CFDataGetBytePtr(data as CFTypeRef) }.cast()
+}
+
 unsafe extern "C" fn utf8_string(receiver: Id, _sel: Sel) -> *const c_char {
     // SAFETY: an `NSString`.
-    unsafe { api::CFStringGetCStringPtr(receiver as CFTypeRef, encoding::UTF8) }
+    unsafe { c_string_in(receiver, encoding::UTF8) }
 }
 
 unsafe extern "C" fn c_string_using_encoding(receiver: Id, _sel: Sel, ns: usize) -> *const c_char {
     // SAFETY: an `NSString`.
-    unsafe { api::CFStringGetCStringPtr(receiver as CFTypeRef, cf_encoding(ns)) }
+    unsafe { c_string_in(receiver, cf_encoding(ns)) }
 }
 
 unsafe extern "C" fn get_c_string(
@@ -98,12 +133,29 @@ unsafe extern "C" fn is_equal_to_string(receiver: Id, _sel: Sel, other: Id) -> b
     unsafe { api::CFEqual(receiver as CFTypeRef, other as CFTypeRef) != 0 }
 }
 
+/// The UTF-16 code units, which `-length` counts and every index and range a
+/// guest passes is in.
+///
+/// # Safety
+///
+/// `receiver` is nil or a string object.
+unsafe fn units(receiver: Id) -> Vec<u16> {
+    unsafe { corefoundation::string::as_string(receiver as CFTypeRef) }
+        .map(|s| s.units())
+        .unwrap_or_default()
+}
+
+/// A new autoreleased string of `units[from..to]`, clamped to its length.
+fn unit_slice(units: &[u16], from: usize, to: usize) -> Id {
+    let (from, to) = (from.min(units.len()), to.min(units.len()));
+    let s = corefoundation::string::from_utf16(&units[from.min(to)..to]);
+    // SAFETY: a fresh object.
+    unsafe { api::CFAutorelease(s) as Id }
+}
+
 unsafe extern "C" fn character_at_index(receiver: Id, _sel: Sel, index: usize) -> u16 {
     // SAFETY: an `NSString`.
-    let bytes = unsafe { bytes(receiver) };
-    // The strings this runtime builds are UTF-8 whose characters are its bytes
-    // for everything ASCII, which is what a guest indexing into one expects.
-    bytes.get(index).map_or(0, |b| *b as u16)
+    unsafe { units(receiver) }.get(index).copied().unwrap_or(0)
 }
 
 unsafe extern "C" fn append_string(receiver: Id, _sel: Sel, other: Id) -> Id {
@@ -111,6 +163,27 @@ unsafe extern "C" fn append_string(receiver: Id, _sel: Sel, other: Id) -> Id {
     let mut joined = unsafe { bytes(receiver) };
     joined.extend_from_slice(&unsafe { bytes(other) });
     let s = corefoundation::string::from_bytes(&joined, false);
+    // SAFETY: a fresh object.
+    unsafe { api::CFAutorelease(s) as Id }
+}
+
+/// `-stringByReplacingOccurrencesOfString:withString:`: a literal search, so
+/// matching UTF-8 bytes finds exactly the matches UTF-16 units would.
+unsafe extern "C" fn replacing_occurrences(receiver: Id, _sel: Sel, target: Id, with: Id) -> Id {
+    // SAFETY: `NSString`s, or nil.
+    let (haystack, needle, with) = unsafe { (bytes(receiver), bytes(target), bytes(with)) };
+    if needle.is_empty() {
+        return objc::arc::autorelease(objc::arc::retain(receiver));
+    }
+    let mut out = Vec::with_capacity(haystack.len());
+    let mut rest = haystack.as_slice();
+    while let Some(at) = rest.windows(needle.len()).position(|w| w == needle.as_slice()) {
+        out.extend_from_slice(&rest[..at]);
+        out.extend_from_slice(&with);
+        rest = &rest[at + needle.len()..];
+    }
+    out.extend_from_slice(rest);
+    let s = corefoundation::string::from_bytes(&out, false);
     // SAFETY: a fresh object.
     unsafe { api::CFAutorelease(s) as Id }
 }
@@ -522,7 +595,7 @@ const NOT_FOUND: usize = usize::MAX >> 1;
 
 unsafe extern "C" fn range_of_string(receiver: Id, _sel: Sel, needle: Id) -> NSRange {
     // SAFETY: two `NSString`s, or nil.
-    let (haystack, needle) = unsafe { (bytes(receiver), bytes(needle)) };
+    let (haystack, needle) = unsafe { (units(receiver), units(needle)) };
     if needle.is_empty() {
         return NSRange {
             location: NOT_FOUND,
@@ -654,20 +727,20 @@ unsafe extern "C" fn trimming_characters(receiver: Id, _sel: Sel, set: Id) -> Id
 
 unsafe extern "C" fn substring_from_index(receiver: Id, _sel: Sel, index: usize) -> Id {
     // SAFETY: an `NSString`.
-    let whole = unsafe { bytes(receiver) };
-    slice(&whole, index, whole.len())
+    let whole = unsafe { units(receiver) };
+    unit_slice(&whole, index, whole.len())
 }
 
 unsafe extern "C" fn substring_to_index(receiver: Id, _sel: Sel, index: usize) -> Id {
     // SAFETY: an `NSString`.
-    let whole = unsafe { bytes(receiver) };
-    slice(&whole, 0, index)
+    let whole = unsafe { units(receiver) };
+    unit_slice(&whole, 0, index)
 }
 
 unsafe extern "C" fn substring_with_range(receiver: Id, _sel: Sel, range: NSRange) -> Id {
     // SAFETY: an `NSString`.
-    let whole = unsafe { bytes(receiver) };
-    slice(
+    let whole = unsafe { units(receiver) };
+    unit_slice(
         &whole,
         range.location,
         range.location.saturating_add(range.length),
@@ -1034,6 +1107,8 @@ pub(crate) fn install() {
         "stringByAddingPercentEncodingWithAllowedCharacters:" => adding_percent_encoding, c"@24@0:8@16";
         "stringByTrimmingCharactersInSet:" => trimming_characters, c"@24@0:8@16";
         "stringByAppendingString:" => append_string, c"@24@0:8@16";
+        "stringByReplacingOccurrencesOfString:withString:"
+            => replacing_occurrences, c"@32@0:8@16@24";
     });
     let mutable = objc::class::lookup(c"NSMutableString").expect("NSMutableString");
     methods!(mutable, {

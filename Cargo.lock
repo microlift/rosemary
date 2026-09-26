@@ -343,6 +343,7 @@ dependencies = [
  "darwin",
  "exports",
  "foundation",
+ "prefix",
 ]
 
 [[package]]
@@ -2021,6 +2022,7 @@ dependencies = [
  "foundation",
  "libc",
  "objc",
+ "prefix",
  "sdl3",
 ]
 

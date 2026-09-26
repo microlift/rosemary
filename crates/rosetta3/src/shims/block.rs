@@ -211,6 +211,22 @@ fn dispatch_group_notify(
     Ok(())
 }
 
+/// `void dispatch_group_async(dispatch_group_t, dispatch_queue_t, dispatch_block_t)`
+fn dispatch_group_async(
+    symbol: &str,
+    ctx: &mut RegisterContext,
+    mem: &mut dyn GuestMemory,
+    callbacks: &dyn Callbacks,
+) -> Result<()> {
+    let (group, queue, block) = (ctx.rdi, ctx.rsi, ctx.rdx);
+    if block == 0 {
+        return Err(bad_pointer(symbol, 0));
+    }
+    substitute_block(symbol, block, mem, callbacks)?;
+    call_block(symbol, host_or_refuse(symbol)?, &[group, queue, block]);
+    Ok(())
+}
+
 /// `CFRunLoopObserverRef CFRunLoopObserverCreateWithHandler(CFAllocatorRef allocator,
 /// CFOptionFlags activities, Boolean repeats, CFIndex order, void
 /// (^block)(CFRunLoopObserverRef, CFRunLoopActivity))`
@@ -275,6 +291,7 @@ pub fn shim_for(name: &str) -> Option<Shim> {
         "dispatch_once" => Some(dispatch_once),
         "dispatch_data_create" => Some(dispatch_data_create),
         "dispatch_group_notify" => Some(dispatch_group_notify),
+        "dispatch_group_async" => Some(dispatch_group_async),
         "CFRunLoopObserverCreateWithHandler" => Some(run_loop_observer_create_with_handler),
         // Both spellings.
         "_Block_copy" | "Block_copy" => Some(block_copy),

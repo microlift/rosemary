@@ -24,6 +24,11 @@ pub struct Window {
     /// whether it may go full screen.
     collection_behavior: usize,
     first_responder: Id,
+    /// `-initialFirstResponder`, a nib outlet and so not retained: made the
+    /// first responder when the window is first ordered front without one.
+    initial_first_responder: Id,
+    /// `-setNextResponder:`, unretained; a window has none until given one.
+    next_responder: Id,
     minimum: NSSize,
     maximum: NSSize,
     fullscreen: usize,
@@ -410,6 +415,17 @@ fn inset_of(object: Id, style_mask: usize, fullscreen: bool) -> CGFloat {
 
 fn is_fullscreen(sdl: sdl3::Window) -> bool {
     !sdl.is_null() && sdl3::video::window_flags(sdl) & sdl3::video::flags::FULLSCREEN != 0
+}
+
+/// Whether a titled toplevel is in full screen, where its chrome is hidden
+/// until the pointer asks for it. Cheaper than [`facts`], for pointer motion.
+pub(crate) fn is_full_screen_titled(object: Id) -> bool {
+    // SAFETY: null or an object this runtime allocated.
+    let sdl = unsafe { sdl_window(object) };
+    !sdl.is_null()
+        && window_of(object).style_mask & style::TITLED != 0
+        && presentation_of_sdl(sdl) == Presentation::Toplevel
+        && is_fullscreen(sdl)
 }
 
 /// What `crate::decor` draws a window's chrome from.
@@ -1195,6 +1211,12 @@ unsafe extern "C" fn make_key_and_order_front(receiver: Id, _sel: Sel, _sender: 
     if want != Presentation::Tooltip {
         KEY.store(receiver as usize, std::sync::atomic::Ordering::Release);
     }
+    let window = window_of(receiver);
+    if window.first_responder.is_null() && !window.initial_first_responder.is_null() {
+        let initial = window.initial_first_responder;
+        // SAFETY: this window, and a responder the guest named.
+        unsafe { make_first_responder(receiver, objc::sel::get("makeFirstResponder:"), initial) };
+    }
     // Where the window actually ended up. On a Mac a window is placed exactly
     // where it was asked to be, so a toolkit has no reason to look again; here
     // the compositor chooses, and a toolkit which never hears about it maps
@@ -1612,6 +1634,29 @@ unsafe extern "C" fn first_responder(receiver: Id, _sel: Sel) -> Id {
     }
 }
 
+pub(crate) fn is_window(object: Id) -> bool {
+    // SAFETY: null or an object this runtime allocated, which every caller has.
+    unsafe { objc::object::class_of(object) }.is_some_and(|c| {
+        objc::class::lookup(c"NSWindow").is_some_and(|k| c.chain().any(|x| std::ptr::eq(x, k)))
+    })
+}
+
+unsafe extern "C" fn next_responder(receiver: Id, _sel: Sel) -> Id {
+    window_of(receiver).next_responder
+}
+
+unsafe extern "C" fn set_next_responder(receiver: Id, _sel: Sel, responder: Id) {
+    window_of(receiver).next_responder = responder;
+}
+
+unsafe extern "C" fn set_initial_first_responder(receiver: Id, _sel: Sel, responder: Id) {
+    window_of(receiver).initial_first_responder = responder;
+}
+
+unsafe extern "C" fn initial_first_responder(receiver: Id, _sel: Sel) -> Id {
+    window_of(receiver).initial_first_responder
+}
+
 unsafe extern "C" fn make_first_responder(receiver: Id, _sel: Sel, responder: Id) -> u8 {
     if crate::event::tracing() {
         // SAFETY: null or a live object this runtime allocated.
@@ -1737,6 +1782,48 @@ unsafe extern "C" fn toggle_full_screen(receiver: Id, _sel: Sel, _sender: Id) {
     if sdl3::video::set_window_fullscreen(window.sdl, wanted) {
         window.fullscreen = wanted as usize;
     }
+}
+
+/// The `NSWindowCollectionBehavior` bits that decide full screen.
+mod behavior {
+    pub const FULL_SCREEN_PRIMARY: usize = 1 << 7;
+    pub const FULL_SCREEN_AUXILIARY: usize = 1 << 8;
+    pub const FULL_SCREEN_NONE: usize = 1 << 9;
+}
+
+/// Whether the window may go full screen: one that opted in, or, as AppKit has
+/// defaulted to since 10.11, any resizable window that did not opt out.
+fn can_go_full_screen(window: &Window) -> bool {
+    use behavior::*;
+    let behavior = window.collection_behavior;
+    behavior & (FULL_SCREEN_NONE | FULL_SCREEN_AUXILIARY) == 0
+        && (behavior & FULL_SCREEN_PRIMARY != 0 || window.style_mask & style::RESIZABLE != 0)
+}
+
+/// `-validateMenuItem:`: AppKit's window retitles the full-screen item for the
+/// way it would go, and enables it only for a window that can go full screen.
+/// Every other item the window is sent stays enabled.
+unsafe extern "C" fn validate_menu_item(receiver: Id, _sel: Sel, item: Id) -> u8 {
+    // SAFETY: a menu item answers `-action`, which is `SEL (id, SEL)`.
+    let action = unsafe {
+        let f: unsafe extern "C" fn(Id, Sel) -> Sel = std::mem::transmute(objc::msg::entry());
+        f(item, objc::sel::get("action"))
+    };
+    if !std::ptr::eq(action, objc::sel::get("toggleFullScreen:")) {
+        return 1;
+    }
+    let window = window_of(receiver);
+    let title = foundation::string::from_str(match window.fullscreen != 0 {
+        true => "Exit Full Screen",
+        false => "Enter Full Screen",
+    });
+    // SAFETY: `-setTitle:` is `void (id, SEL, id)`.
+    unsafe {
+        let f: unsafe extern "C" fn(Id, Sel, Id) = std::mem::transmute(objc::msg::entry());
+        f(item, objc::sel::get("setTitle:"), title);
+    }
+    objc::arc::release(title);
+    (window.fullscreen != 0 || can_go_full_screen(window)) as u8
 }
 
 unsafe extern "C" fn is_full_screen(receiver: Id, _sel: Sel) -> u8 {
@@ -2080,7 +2167,12 @@ pub(crate) fn install() {
         "setCollectionBehavior:" => set_collection_behavior, c"v24@0:8Q16";
         "firstResponder" => first_responder, c"@16@0:8";
         "makeFirstResponder:" => make_first_responder, c"c24@0:8@16";
+        "initialFirstResponder" => initial_first_responder, c"@16@0:8";
+        "nextResponder" => next_responder, c"@16@0:8";
+        "setNextResponder:" => set_next_responder, c"v24@0:8@16";
+        "setInitialFirstResponder:" => set_initial_first_responder, c"v24@0:8@16";
         "toggleFullScreen:" => toggle_full_screen, c"v24@0:8@16";
+        "validateMenuItem:" => validate_menu_item, c"c24@0:8@16";
         "isInFullScreenMode" => is_full_screen, c"c16@0:8";
         "minSize" => min_size, c"{CGSize=dd}16@0:8";
         "setMinSize:" => set_min_size, c"v32@0:8{CGSize=dd}16";

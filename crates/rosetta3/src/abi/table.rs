@@ -282,6 +282,10 @@ pub static SIGNATURES: &[FunctionAbi] = &[
     // UInt32 bufferOffsetInFrames)` - the value is a `Float32`, so it arrives in
     // `xmm0` while the four words before it are integers.
     sig!("AudioUnitSetParameter", I32, P, U32, U32, U32, F32, U32),
+    // The listener is never called, so it need not cross as a thunk.
+    sig!("AudioUnitAddPropertyListener", I32, P, U32, P, P),
+    sig!("AudioUnitRemovePropertyListenerWithUserData", I32, P, U32, P, P),
+    sig!("AudioUnitReset", I32, P, U32, U32),
     //
     // `FillComplexBuffer`'s second argument is the guest's input callback, which
     // the host calls, so it crosses as a thunk.
@@ -377,6 +381,7 @@ pub static SIGNATURES: &[FunctionAbi] = &[
     // CFStringRef type, CFStringRef subDirName)` - three `CFStringRef`s, any of
     // which may be null.
     sig!("CFBundleCopyResourceURL", P, P, P, P, P),
+    sig!("CFBundleCopyLocalizedString", P, P, P, P, P),
     sig!("CFBundleCopyBundleURL", P, P),
     sig!("CFBundleCreate", P, P, P),
     sig!("CFBundleGetIdentifier", P, P),
@@ -402,6 +407,11 @@ pub static SIGNATURES: &[FunctionAbi] = &[
     sig!("CFURLEnumeratorGetNextURL", I64, P, P, P),
     sig!("CFURLCreateFromFSRef", P, P, P),
     sig!("CFURLGetFSRef", BOOL, P, P),
+    sig!("CFRunLoopTimerGetContext", V, P, P),
+    sig!("CFURLCreateBookmarkData", P, P, P, U64, P, P, P),
+    sig!("CFURLCreateByResolvingBookmarkData", P, P, P, U64, P, P, P, P),
+    sig!("CFURLWriteBookmarkDataToFile", BOOL, P, P, U64, P),
+    sig!("CFURLCreateBookmarkDataFromFile", P, P, P, P),
     sig!("CFUUIDGetTypeID", U64),
     sig!("CFBooleanGetValue", BOOL, P),
     sig!("CFDateCreate", P, P, F64),
@@ -879,6 +889,10 @@ pub static SIGNATURES: &[FunctionAbi] = &[
     sig!("CGImageSourceCreateImageAtIndex", P, P, U64, P),
     sig!("CGImageSourceCreateWithData", P, P, P),
     sig!("CGMainDisplayID", U32),
+    sig!("CGDisplayRestoreColorSyncSettings", V),
+    sig!("NXGetLocalArchInfo", P),
+    sig!("NSDisableScreenUpdates", V),
+    sig!("NSEnableScreenUpdates", V),
     sig!("CGSessionCopyCurrentDictionary", P),
     sig!("CGReleaseDisplayFadeReservation", I32, U32),
     // A `CGWindowLevel` and a `CGWindowLevelKey` are both `int32_t`.
@@ -1187,6 +1201,10 @@ pub static SIGNATURES: &[FunctionAbi] = &[
     cbsig!([3], "IOServiceAddInterestNotification", I32, P, U32, P, P, P, P),
     sig!("IOServiceGetMatchingServices", I32, U32, P, P),
     sig!("IOServiceMatching", P, P),
+    sig!("IOServiceNameMatching", P, P),
+    sig!("IOObjectConformsTo", U32, U32, P),
+    sig!("IOCreatePlugInInterfaceForService", I32, U32, P, P, P, P),
+    sig!("IODestroyPlugInInterface", I32, P),
     // `PhysicalKeyboardLayoutType KBGetLayoutType(SInt16)`. Its OSType result
     // and narrow argument travel through the integer registers as 32-bit
     // values, which is the shape SDL's call site also uses.
@@ -1222,6 +1240,14 @@ pub static SIGNATURES: &[FunctionAbi] = &[
     sig!("SetSystemUIMode", I32, U32, U32),
     // `OSErr FSFindFolder(FSVolumeRefNum, OSType, Boolean, FSRef *)`.
     sig!("FSFindFolder", I16, I16, U32, U8, P),
+    // The handler is a guest function the Apple Event Manager calls when an
+    // event arrives, so it crosses as a thunk; removal names the same one.
+    cbsig!([2], "AEInstallEventHandler", I16, U32, U32, P, P, U8),
+    cbsig!([2], "AERemoveEventHandler", I16, U32, U32, P, U8),
+    sig!("AECreateDesc", I16, U32, P, I64, P),
+    sig!("AEDisposeDesc", I16, P),
+    sig!("AEGetDescDataSize", I64, P),
+    sig!("AEGetDescData", I16, P, P, I64),
     // `OSStatus FSPathMakeRef(const UInt8 *, FSRef *, Boolean *)`, and the
     // reverse - `OSStatus FSRefMakePath(const FSRef *, UInt8 *, UInt32)`.
     sig!("FSPathMakeRef", I32, P, P, P),
@@ -1269,6 +1295,9 @@ pub static SIGNATURES: &[FunctionAbi] = &[
     // argument, so the entry names five pointers before the tail.
     vsig!("NSRunAlertPanel", I64, P, P, P, P, P),
     sig!("NSHomeDirectory", P),
+    sig!("NSUserName", P),
+    sig!("NSFullUserName", P),
+    sig!("NSGetUncaughtExceptionHandler", P),
     sig!("NSClassFromString", P, P),
     // `SEL NSSelectorFromString(NSString *)` - two pointers, and the reason it
     // needs no translation is.
@@ -1664,6 +1693,7 @@ pub static SIGNATURES: &[FunctionAbi] = &[
     sig!("dispatch_get_context", P, P),
     sig!("dispatch_get_global_queue", P, I64, U64),
     cbsig!([3], "dispatch_group_async_f", V, P, P, P, P),
+    cbsig!([3], "dispatch_apply_f", V, U64, P, P, P),
     sig!("dispatch_group_create", P),
     sig!("dispatch_group_wait", I64, P, U64),
     cbsig!([2], "dispatch_once_f", V, P, P, P),
@@ -3818,6 +3848,7 @@ pub static REFUSED: &[(&str, &str)] = &[
     ("NSLocalizedDescriptionKey", DATA),
     ("NSLocalizedFailureReasonErrorKey", DATA),
     ("NSOSStatusErrorDomain", DATA),
+    ("NSFilePosixPermissions", DATA),
     ("NSPOSIXErrorDomain", DATA),
     ("NSParagraphStyleAttributeName", DATA),
     ("NSPasteboardTypeString", DATA),

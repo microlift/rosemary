@@ -54,10 +54,10 @@ static GUEST_EXECUTABLE: std::sync::Mutex<String> = std::sync::Mutex::new(String
 /// its arguments: the path has to be the one the guest thinks it is running
 /// from, not this runtime's.
 ///
-/// Canonical, because a caller joins onto it: `Layout::enclosing` resolves the
-/// same symlinks for the same reason.
+/// Absolute, because a caller joins onto it, but with its symlinks kept, as
+/// `Layout::enclosing` keeps them.
 pub fn set_executable_path(path: &std::path::Path) {
-    let resolved = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    let resolved = std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf());
     // What the guest is told, so the *guest* spelling: a program outside the
     // prefix is named through the `/Volumes/Host` mount rather than by a host
     // path it would go on to compare and store. See `docs/prefixes.md`.

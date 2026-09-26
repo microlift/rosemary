@@ -213,6 +213,43 @@ pub unsafe extern "C" fn group_async_f(handle: u64, q: u64, context: u64, functi
     }
 }
 
+/// `void dispatch_apply_f(size_t iterations, dispatch_queue_t, void *context,
+/// void (*work)(void *, size_t))`
+///
+/// Every iteration, in order, on the calling thread. libdispatch may spread
+/// them over a concurrent queue's threads but promises only that all have run
+/// when this returns, and a guest function called on a thread this runtime
+/// did not start for the guest would find none of its thread state.
+pub unsafe extern "C" fn apply_f(iterations: usize, _queue: u64, context: u64, work: u64) {
+    if work == 0 {
+        return;
+    }
+    // SAFETY: the guest's `void (*)(void *, size_t)`, called with its context.
+    let f = unsafe { std::mem::transmute::<u64, unsafe extern "C" fn(*mut c_void, usize)>(work) };
+    for index in 0..iterations {
+        unsafe { f(context as *mut c_void, index) };
+    }
+}
+
+/// `void dispatch_group_async(dispatch_group_t, dispatch_queue_t, dispatch_block_t)`.
+///
+/// The block is copied, as `dispatch_async` copies one, and run through the
+/// function form with a trampoline that invokes and then releases it.
+pub unsafe extern "C" fn group_async(handle: u64, q: u64, block: u64) {
+    let Some(copied) = super::block::copy(block) else {
+        return;
+    };
+    // SAFETY: a live group and queue; the trampoline takes the copy.
+    unsafe { group_async_f(handle, q, copied, run_block as *const () as usize as u64) };
+}
+
+/// Invoke and release a block `group_async` copied.
+unsafe extern "C" fn run_block(block: *mut c_void) {
+    // SAFETY: the copy `group_async` made, handed back here exactly once.
+    unsafe { super::block::invoke(block as u64) };
+    super::block::release(block as u64);
+}
+
 /// Runs the guest's function, then leaves the group it was entered into.
 unsafe extern "C" fn leave_after(boxed: *mut c_void) {
     // SAFETY: the box `group_async_f` leaked, handed back here exactly once.

@@ -134,6 +134,8 @@ exports::exports! {
         "dispatch_group_notify" => sync::group_notify,
         "dispatch_group_notify_f" => sync::group_notify_f,
         "dispatch_group_async_f" => sync::group_async_f,
+        "dispatch_group_async" => sync::group_async,
+        "dispatch_apply_f" => sync::apply_f,
         "dispatch_group_wait" => sync::group_wait,
         "dispatch_semaphore_create" => sync::semaphore_create,
         "dispatch_semaphore_signal" => sync::semaphore_signal,

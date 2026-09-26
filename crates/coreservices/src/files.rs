@@ -27,6 +27,9 @@ const FS_REF_BYTES: usize = 80;
 const MAGIC: u64 = u64::from_le_bytes(*b"R3FSRef\0");
 
 /// Every path a reference has been made for, and the index of each.
+///
+/// Host paths, since every call here opens them; a guest's spelling is
+/// translated on the way in ([`FSPathMakeRef`]) and out ([`FSRefMakePath`]).
 static PATHS: Mutex<Option<Interned>> = Mutex::new(None);
 
 #[derive(Default)]
@@ -169,12 +172,13 @@ pub unsafe extern "C" fn FSFindFolder(
         return FNF_ERR as i16;
     };
     // The temporary folder is the one answer that does not hang off a domain:
-    // Apple's is per-user and per-boot, and this host's is `$TMPDIR`.
-    let path = match &kind.to_be_bytes() {
-        b"temp" => std::env::temp_dir(),
-        _ if relative.is_empty() => PathBuf::from(&root),
-        _ => PathBuf::from(format!("{root}/{relative}")),
+    // Apple's is per-user and per-boot, and the guest's is `/tmp`.
+    let guest = match &kind.to_be_bytes() {
+        b"temp" => "/tmp".to_string(),
+        _ if relative.is_empty() => root,
+        _ => format!("{root}/{relative}"),
     };
+    let path = prefix::ns::host_path(&guest);
     if create != 0 && !path.is_dir() {
         // A failure here is reported rather than ignored: `/Library/Frameworks`
         // cannot be made by an unprivileged process, and a reference to a
@@ -208,7 +212,7 @@ pub unsafe extern "C" fn FSPathMakeRef(
     let Ok(text) = text.to_str() else {
         return PARAM_ERR;
     };
-    let path = PathBuf::from(text);
+    let path = prefix::ns::host_path(text);
     let Ok(metadata) = std::fs::metadata(&path) else {
         return FNF_ERR;
     };
@@ -238,9 +242,10 @@ pub unsafe extern "C" fn FSRefMakePath(
     if out.is_null() || max == 0 {
         return PARAM_ERR;
     }
-    let Some(path) = (unsafe { load(reference) }) else {
+    let Some(host) = (unsafe { load(reference) }) else {
         return PARAM_ERR;
     };
+    let path = prefix::ns::to_guest(&host).unwrap_or(host);
     let bytes = path.as_os_str().as_encoded_bytes();
     // Apple reports `pathTooLongErr` rather than truncating, and a truncated
     // path names a different file.
@@ -420,7 +425,7 @@ mod tests {
         let path = unsafe { load(reference.as_ptr().cast()) }.unwrap();
         assert_eq!(
             path,
-            PathBuf::from(format!(
+            prefix::ns::host_path(&format!(
                 "{}/Library/Application Support",
                 foundation::home_directory()
             ))

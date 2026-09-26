@@ -135,23 +135,12 @@ fn program_path(path: &str) -> String {
 /// A host path as the guest spells it, or the path itself when no mount
 /// reaches it - which is every path in identity mode.
 ///
-/// Only the directory is canonicalized, never the final name: resolving that
-/// symlink would turn `/bin/sh` into `/bin/bash`, and a multi-call program
-/// picks its personality from `argv[0]`.
+/// Made absolute but never resolved: a multi-call program picks its
+/// personality from `argv[0]`, and a `.app` reached through a symlink finds
+/// its data beside the link, as `_NSGetExecutablePath` reports it on a Mac.
 fn guest_spelling(path: &str) -> String {
     let path = std::path::Path::new(path);
-    let host = match (path.parent(), path.file_name()) {
-        (Some(dir), Some(name)) => {
-            let dir = if dir.as_os_str().is_empty() {
-                std::path::Path::new(".")
-            } else {
-                dir
-            };
-            std::fs::canonicalize(dir).map(|dir| dir.join(name))
-        }
-        _ => std::fs::canonicalize(path),
-    }
-    .unwrap_or_else(|_| path.to_path_buf());
+    let host = std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf());
     prefix::ns::to_guest(&host)
         .unwrap_or(host)
         .to_string_lossy()

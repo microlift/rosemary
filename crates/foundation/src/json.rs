@@ -558,6 +558,26 @@ unsafe extern "C" fn json_object_with_data(
     unsafe { corefoundation::api::CFAutorelease(object) as Id }
 }
 
+/// `object` as JSON text, fragments included, or why it cannot be.
+pub fn to_text(object: Id) -> Result<String, String> {
+    let mut out = Vec::new();
+    write(object as CFTypeRef, &mut out, 0, 0)?;
+    String::from_utf8(out).map_err(|e| e.to_string())
+}
+
+/// The object a JSON text describes, fragments included, autoreleased.
+pub fn from_text(text: &str) -> Result<Id, String> {
+    let mut reader = Reader { bytes: text.as_bytes(), at: 0, mutable: false };
+    let object = reader.value(0)?;
+    reader.skip_space();
+    if reader.at != reader.bytes.len() {
+        release_each(&[object]);
+        return Err(format!("garbage after the document, at byte {}", reader.at));
+    }
+    // SAFETY: a fresh object this function owns a reference to.
+    Ok(unsafe { corefoundation::api::CFAutorelease(object) as Id })
+}
+
 unsafe extern "C" fn is_valid_json_object(_class: Id, _sel: Sel, object: Id) -> bool {
     let root = object as CFTypeRef;
     is_container(root) && write(root, &mut Vec::new(), 0, 0).is_ok()

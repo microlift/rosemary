@@ -436,7 +436,8 @@ fn convert(
     // rates are equal - when it is always weighted zero - would add a one-frame
     // render call to every buffer, and a guest whose callback decodes a block
     // per call loses the rest of that block to it.
-    let ratio = source_format.sample_rate / format.sample_rate;
+    // A varispeed consumes its input faster or slower by its rate.
+    let ratio = source_format.sample_rate * unit.varispeed.unwrap_or(1.0) / format.sample_rate;
     let last = unit.phase + ratio * frames.saturating_sub(1) as f64;
     let between = last.fract() > 0.0;
     let needed = last.floor() as usize + 1 + between as usize;

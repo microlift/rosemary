@@ -773,6 +773,8 @@ fn tell_delegate(menu: Id, selector: &str) {
 /// to rebuild them, each retained for the caller - see [`release_items`].
 pub(crate) fn prepare(menu: Id) -> Vec<Id> {
     tell_delegate(menu, "menuNeedsUpdate:");
+    // A program may set its menus after launching; AppKit adds to them too.
+    add_full_screen_item();
     shown_items(menu)
         .into_iter()
         .map(objc::arc::retain)
@@ -824,6 +826,148 @@ pub(crate) fn perform(item: Id) {
         menu,
         std::ptr::null_mut(),
     );
+}
+
+// The item AppKit adds for full screen, which a program's own menus never
+// carry: Apple puts it in on the program's behalf.
+
+/// The menu the full-screen item last went into, so an item a program took
+/// out is not put back each time a menu opens.
+static FULL_SCREEN_MENU: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// `id (id, SEL)`, for the handful of getters read here.
+fn send_id(receiver: Id, selector: &str) -> Id {
+    // SAFETY: every selector passed here is a getter of that shape.
+    unsafe {
+        let f: unsafe extern "C" fn(Id, Sel) -> Id = std::mem::transmute(objc::msg::entry());
+        f(receiver, objc::sel::get(selector))
+    }
+}
+
+/// Whether any item under `menu` already sends `action`.
+fn sends_action(menu: Id, action: Sel, depth: usize) -> bool {
+    if depth > 16 || !is_menu(menu) {
+        return false;
+    }
+    items_of(menu).values.iter().any(|value| {
+        let item = *value as Id;
+        is_menu_item(item)
+            && (std::ptr::eq(item_of(item).action, action)
+                || sends_action(item_of(item).submenu, action, depth + 1))
+    })
+}
+
+/// A top-level menu titled View, which AppKit prefers to the Window menu.
+fn view_menu(root: Id) -> Id {
+    shown_items(root)
+        .into_iter()
+        .map(submenu_of)
+        .find(|menu| is_menu(*menu) && string_of(menu_of(*menu).title) == "View")
+        .unwrap_or(std::ptr::null_mut())
+}
+
+/// `NSFullScreenMenuItemEverywhere` set to NO is the user's way of keeping
+/// AppKit's item out; unset means AppKit adds it.
+fn full_screen_item_refused() -> bool {
+    let Some(class) = objc::class::lookup(c"NSUserDefaults") else {
+        return false;
+    };
+    let defaults = send_id(objc::class::ptr(class) as Id, "standardUserDefaults");
+    if defaults.is_null() {
+        return false;
+    }
+    let key = foundation::string::from_str("NSFullScreenMenuItemEverywhere");
+    // SAFETY: `-objectForKey:` is `id (id, SEL, id)` and `-boolForKey:` is
+    // `BOOL (id, SEL, id)`.
+    let (set, on) = unsafe {
+        let object: unsafe extern "C" fn(Id, Sel, Id) -> Id =
+            std::mem::transmute(objc::msg::entry());
+        let flag: unsafe extern "C" fn(Id, Sel, Id) -> u8 = std::mem::transmute(objc::msg::entry());
+        (
+            !object(defaults, objc::sel::get("objectForKey:"), key).is_null(),
+            flag(defaults, objc::sel::get("boolForKey:"), key) != 0,
+        )
+    };
+    objc::arc::release(key);
+    set && !on
+}
+
+/// Put "Enter Full Screen" (Control-Command-F) where AppKit does: at the end
+/// of the View menu, or after Minimize and Zoom in the Window menu when there
+/// is no View menu. The window's `-validateMenuItem:` keeps the title in step
+/// with the window.
+pub(crate) fn add_full_screen_item() {
+    let root = main_menu();
+    let action = objc::sel::get("toggleFullScreen:");
+    if !is_menu(root) || sends_action(root, action, 0) || full_screen_item_refused() {
+        return;
+    }
+    let view = view_menu(root);
+    let menu = match view.is_null() {
+        true => send_id(crate::application::shared(), "windowsMenu"),
+        false => view,
+    };
+    let order = std::sync::atomic::Ordering::Relaxed;
+    if !is_menu(menu) || FULL_SCREEN_MENU.swap(menu as usize, order) == menu as usize {
+        return;
+    }
+    let Some(class) = objc::class::lookup(c"NSMenuItem") else {
+        return;
+    };
+    let item = objc::object::create_instance(class, 0);
+    let (title, key) = (
+        foundation::string::from_str("Enter Full Screen"),
+        foundation::string::from_str("f"),
+    );
+    // SAFETY: each prototype is the one its selector declares.
+    unsafe {
+        init_item(
+            item,
+            objc::sel::get("initWithTitle:action:keyEquivalent:"),
+            title,
+            action,
+            key,
+        )
+    };
+    objc::arc::release(title);
+    objc::arc::release(key);
+    use crate::keymap::flags;
+    item_of(item).modifier_mask = (flags::CONTROL | flags::COMMAND) as usize;
+    let list = &items_of(menu).values;
+    let at = match view.is_null() {
+        // After the last of Minimize and Zoom, or first when neither is there.
+        true => {
+            let window_actions = [
+                objc::sel::get("performMiniaturize:"),
+                objc::sel::get("performZoom:"),
+            ];
+            list.iter()
+                .rposition(|value| {
+                    is_menu_item(*value as Id)
+                        && window_actions.contains(&item_of(*value as Id).action)
+                })
+                .map_or(0, |at| at + 1)
+        }
+        // At the end of the View menu, set off from what the program put there.
+        false => {
+            if list.last().is_some_and(|last| !is_separator(*last as Id)) {
+                let separator = send_id(objc::class::ptr(class) as Id, "separatorItem");
+                // SAFETY: `-addItem:` is `void (id, SEL, id)`.
+                unsafe { add_item(menu, objc::sel::get("addItem:"), separator) };
+            }
+            items_of(menu).values.len()
+        }
+    };
+    // SAFETY: `-insertItem:atIndex:` is `void (id, SEL, id, NSInteger)`.
+    unsafe {
+        insert_item(
+            menu,
+            objc::sel::get("insertItem:atIndex:"),
+            item,
+            at as isize,
+        )
+    };
+    objc::arc::release(item);
 }
 
 /// The modifiers a key equivalent is compared by.
@@ -1159,5 +1303,98 @@ mod tests {
             remove_item_at_index(menu, objc::sel::get("removeItemAtIndex:"), 0);
             assert_eq!(number_of_items(menu, objc::sel::get("numberOfItems")), 0);
         }
+    }
+
+    fn titles(menu: Id) -> Vec<String> {
+        shown_items(menu)
+            .into_iter()
+            .map(|item| match is_separator(item) {
+                true => "-".to_owned(),
+                false => display_title(item),
+            })
+            .collect()
+    }
+
+    fn titled(title: &str, action: &str) -> Id {
+        let object = item(0);
+        // SAFETY: each prototype is the one its selector declares.
+        unsafe {
+            init_plain_item(object, objc::sel::get("init"));
+            set_item_title(
+                object,
+                objc::sel::get("setTitle:"),
+                foundation::string::from_str(title),
+            );
+            set_item_action(object, objc::sel::get("setAction:"), objc::sel::get(action));
+        }
+        object
+    }
+
+    /// A menu bar of `menus`, installed as the application's, whose Windows
+    /// menu is `windows`.
+    fn install_menu_bar(menus: &[Id], windows: Id) {
+        crate::bootstrap();
+        let class = objc::class::ptr(objc::class::lookup(c"NSApplication").expect("NSApplication"));
+        // SAFETY: each message is the shape its selector declares.
+        unsafe {
+            let get: unsafe extern "C" fn(Id, Sel) -> Id = std::mem::transmute(objc::msg::entry());
+            let set: unsafe extern "C" fn(Id, Sel, Id) = std::mem::transmute(objc::msg::entry());
+            let app = get(class as Id, objc::sel::get("sharedApplication"));
+            let root = menu("Main");
+            for submenu in menus {
+                let holder = item(0);
+                set_item_submenu(holder, objc::sel::get("setSubmenu:"), *submenu);
+                add_item(root, objc::sel::get("addItem:"), holder);
+            }
+            set(app, objc::sel::get("setMainMenu:"), root);
+            set(app, objc::sel::get("setWindowsMenu:"), windows);
+        }
+    }
+
+    /// With no View menu, AppKit's item goes after Minimize and Zoom in the
+    /// Window menu, once however often it is asked for, with AppKit's key.
+    /// Given a View menu, it goes at the end of that instead.
+    #[test]
+    fn full_screen_item_joins_the_window_menu_or_the_view_menu() {
+        let window = menu("Window");
+        // SAFETY: each prototype is the one its selector declares.
+        unsafe {
+            for (title, action) in [
+                ("Minimize", "performMiniaturize:"),
+                ("Zoom", "performZoom:"),
+                ("Bring All to Front", "arrangeInFront:"),
+            ] {
+                add_item(window, objc::sel::get("addItem:"), titled(title, action));
+            }
+        }
+        install_menu_bar(&[menu("Edit"), window], window);
+        add_full_screen_item();
+        add_full_screen_item();
+        assert_eq!(
+            titles(window),
+            [
+                "Minimize",
+                "Zoom",
+                "Enter Full Screen",
+                "Bring All to Front"
+            ]
+        );
+        let added = shown_items(window)[2];
+        assert_eq!(shortcut_label(added), "\u{2303}\u{2318}F");
+
+        let view = menu("View");
+        let other = menu("Window");
+        // SAFETY: `-addItem:` is `void (id, SEL, id)`.
+        unsafe {
+            add_item(
+                view,
+                objc::sel::get("addItem:"),
+                titled("Show Sidebar", "toggleSidebar:"),
+            )
+        };
+        install_menu_bar(&[view, other], other);
+        add_full_screen_item();
+        assert_eq!(titles(view), ["Show Sidebar", "-", "Enter Full Screen"]);
+        assert!(titles(other).is_empty());
     }
 }
