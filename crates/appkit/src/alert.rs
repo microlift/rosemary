@@ -1,4 +1,4 @@
-use std::ffi::{CString, c_void};
+use std::ffi::c_void;
 
 use objc::object::Id;
 use objc::sel::Sel;
@@ -25,34 +25,45 @@ pub const INSTANCE_SIZE: usize = size_of::<Alert>();
 /// `NSAlertFirstButtonReturn`. The rest count up from it.
 const FIRST_BUTTON_RETURN: i64 = 1000;
 
-/// `NSAlertDefaultReturn`, returned by the legacy `NSRunAlertPanel` function.
+/// `NSAlertDefaultReturn`, `NSAlertAlternateReturn` and `NSAlertOtherReturn`:
+/// what the legacy `NSRunAlertPanel` function answers for each of its buttons.
 pub const ALERT_DEFAULT_RETURN: i64 = 1;
+pub const ALERT_ALTERNATE_RETURN: i64 = 0;
+pub const ALERT_OTHER_RETURN: i64 = -1;
 
-/// `NSAlertErrorReturn`, returned when SDL cannot display the panel.
+/// `NSAlertErrorReturn`, returned when no panel could be displayed.
 const ALERT_ERROR_RETURN: i64 = -2;
 
 /// Display the legacy `NSRunAlertPanel` UI after its format has been rendered.
 ///
-/// `SDL_ShowSimpleMessageBox` has one acknowledgment button, so that button is
-/// the panel's default button. The legacy alternate and other titles cannot be
-/// represented by this SDL API.
-pub fn run_alert_panel(title: &[u8], message: &[u8]) -> i64 {
-    let title = CString::new(title).unwrap_or_else(|_| c"Alert".to_owned());
-    let message = CString::new(message).unwrap_or_else(|_| {
-        CString::new(
-            message
-                .iter()
-                .map(|byte| if *byte == 0 { b' ' } else { *byte })
-                .collect::<Vec<_>>(),
-        )
-        .expect("embedded NUL bytes were replaced")
-    });
-    match sdl3::show_simple_message_box(sdl3::message_box::INFORMATION, &title, &message) {
-        true => ALERT_DEFAULT_RETURN,
-        false => {
-            eprintln!("rosetta3: could not show guest alert: {}", sdl3::error());
-            ALERT_ERROR_RETURN
-        }
+/// The title is the alert's message and the rendered format its informative
+/// text, as AppKit lays the function out today. A missing default button is
+/// OK; a missing alternate or other button is left out.
+pub fn run_alert_panel(
+    title: &[u8],
+    message: &[u8],
+    default: Option<&[u8]>,
+    alternate: Option<&[u8]>,
+    other: Option<&[u8]>,
+) -> i64 {
+    let text = |bytes: &[u8]| String::from_utf8_lossy(bytes).into_owned();
+    let mut buttons = vec![(
+        default.map_or_else(|| "OK".to_string(), text),
+        ALERT_DEFAULT_RETURN,
+    )];
+    buttons.extend(alternate.map(|t| (text(t), ALERT_ALTERNATE_RETURN)));
+    buttons.extend(other.map(|t| (text(t), ALERT_OTHER_RETURN)));
+    let request = crate::dialog::Request {
+        title: text(title),
+        message: text(title),
+        informative: text(message),
+        buttons: buttons.iter().map(|(title, _)| title.clone()).collect(),
+        cancel: None,
+        application_icon: true,
+    };
+    match crate::dialog::run(&request) {
+        Some(chosen) => buttons[chosen].1,
+        None => ALERT_ERROR_RETURN,
     }
 }
 

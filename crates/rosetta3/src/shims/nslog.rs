@@ -66,7 +66,14 @@ pub fn run_alert_panel(
     );
 
     if crate::frameworks::using_builtin() {
-        ctx.rax = appkit::alert::run_alert_panel(&title, &out) as u64;
+        let [default, alternate, other] = [ctx.rdx, ctx.rcx, ctx.r8].map(cf_string_bytes);
+        ctx.rax = appkit::alert::run_alert_panel(
+            &title,
+            &out,
+            default.as_deref(),
+            alternate.as_deref(),
+            other.as_deref(),
+        ) as u64;
         return Ok(());
     }
 
@@ -478,14 +485,22 @@ pub mod native {
     unsafe extern "C" fn render_alert_native(
         title: u64,
         format: u64,
-        _default_button: u64,
-        _alternate_button: u64,
-        _other_button: u64,
+        default_button: u64,
+        alternate_button: u64,
+        other_button: u64,
         tail: u64,
     ) -> i64 {
         let title = cf_string_bytes(title).unwrap_or_default();
         let message = render_tail("NSRunAlertPanel", format, tail).unwrap_or_default();
-        appkit::alert::run_alert_panel(&title, &message)
+        let [default, alternate, other] =
+            [default_button, alternate_button, other_button].map(cf_string_bytes);
+        appkit::alert::run_alert_panel(
+            &title,
+            &message,
+            default.as_deref(),
+            alternate.as_deref(),
+            other.as_deref(),
+        )
     }
 
     /// Darwin's AArch64 ABI passes every variadic argument on the stack, so

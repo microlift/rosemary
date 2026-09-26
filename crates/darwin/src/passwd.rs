@@ -96,15 +96,23 @@ unsafe fn publish(host: *const libc::passwd) -> *mut Passwd {
     let host = unsafe { &*host };
     let strings = unsafe { strings_of(host) };
     let guest = entry(host, |i| strings[i].as_ptr().cast_mut());
-    ANSWER.with(|slot| {
+    let answer = Box::new(Entry {
+        guest,
+        _strings: strings.into(),
+    });
+    let mut answer = Some(answer);
+    let published = ANSWER.try_with(|slot| {
         let mut slot = slot.borrow_mut();
-        slot.entry = Some(Box::new(Entry {
-            guest,
-            _strings: strings.into(),
-        }));
+        slot.entry = answer.take();
         slot.entry
             .as_mut()
             .map_or(std::ptr::null_mut(), |e| &raw mut e.guest)
+    });
+    // A guest `atexit` handler runs after glibc has destroyed the main thread's
+    // storage; the process is ending, so the entry is leaked instead.
+    published.unwrap_or_else(|_| {
+        let leaked = Box::leak(answer.take().expect("not consumed by try_with"));
+        &raw mut leaked.guest
     })
 }
 
@@ -431,8 +439,60 @@ pub extern "C" fn group_from_gid(gid: u32, nogroup: c_int) -> *const c_char {
     }
 }
 
+/// `int32_t getgrouplist_2(const char *name, gid_t basegid, gid_t **groups)`
+///
+/// Libinfo's private form of `getgrouplist`, which allocates the list instead
+/// of filling the caller's. The caller frees it, so it comes from the guest's
+/// allocator. `basegid` leads and no gid repeats, as Libinfo's merge leaves it.
+///
+/// # Safety
+///
+/// `name` is NUL-terminated and `groups` is writable.
+pub unsafe extern "C" fn getgrouplist_2(
+    name: *const c_char,
+    basegid: u32,
+    groups: *mut *mut u32,
+) -> i32 {
+    if name.is_null() || groups.is_null() {
+        return -1;
+    }
+    let mut host: Vec<u32> = Vec::new();
+    let mut count: c_int = 32;
+    loop {
+        host.resize(count as usize, 0);
+        let offered = count;
+        // SAFETY: `host` holds `count` slots, and glibc writes no more.
+        if unsafe { libc::getgrouplist(name, basegid, host.as_mut_ptr(), &mut count) } >= 0 {
+            host.truncate(count as usize);
+            break;
+        }
+        // glibc reports the size it needed; grow regardless, in case the
+        // group database changed between the two calls.
+        count = count.max(offered.saturating_mul(2));
+    }
+    let mut merged = vec![basegid];
+    for gid in host {
+        if !merged.contains(&gid) {
+            merged.push(gid);
+        }
+    }
+    // SAFETY: a block of exactly `merged`'s bytes, filled immediately.
+    let list = unsafe { crate::heap::malloc(size_of_val(merged.as_slice())) }.cast::<u32>();
+    if list.is_null() {
+        crate::errno::set(libc::ENOMEM);
+        return -1;
+    }
+    // SAFETY: the block just allocated, and the caller's slot.
+    unsafe {
+        std::ptr::copy_nonoverlapping(merged.as_ptr(), list, merged.len());
+        *groups = list;
+    }
+    merged.len() as i32
+}
+
 exports::exports! {
     functions {
+        "getgrouplist_2" => getgrouplist_2,
         "getpwuid" => getpwuid,
         "getpwnam" => getpwnam,
         "getpwuid_r" => getpwuid_r,
@@ -506,6 +566,28 @@ mod tests {
             let rc = getpwuid_r(uid, &mut pwd, tiny.as_mut_ptr(), tiny.len(), &mut result);
             assert_eq!(rc, libc::ERANGE);
             assert!(result.is_null());
+        }
+    }
+
+    #[test]
+    fn getgrouplist_2_allocates_the_users_groups_base_first() {
+        // SAFETY: this process's own user, and a list this test frees.
+        unsafe {
+            let me = libc::getpwuid(libc::getuid());
+            assert!(!me.is_null());
+            let base = (*me).pw_gid;
+            let mut groups: *mut u32 = std::ptr::null_mut();
+            let count = getgrouplist_2((*me).pw_name, base, &mut groups);
+            assert!(count >= 1);
+            let list = std::slice::from_raw_parts(groups, count as usize);
+            assert_eq!(list[0], base);
+            let mut unique = list.to_vec();
+            unique.sort_unstable();
+            unique.dedup();
+            assert_eq!(unique.len(), list.len(), "no gid repeats");
+            crate::heap::free(groups.cast());
+
+            assert_eq!(getgrouplist_2(std::ptr::null(), base, &mut groups), -1);
         }
     }
 

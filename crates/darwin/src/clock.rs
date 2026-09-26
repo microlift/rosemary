@@ -268,6 +268,30 @@ unsafe extern "C" fn getres(clock: id::clockid_t, ts: *mut c_void) -> i32 {
     unsafe { libc::clock_getres(host, ts as *mut libc::timespec) }
 }
 
+/// `int clock_settime(clockid_t, const struct timespec *)`.
+///
+/// Darwin's libc sets only the wall clock, through `settimeofday`, so every
+/// other id is `EINVAL` and the nanoseconds are truncated to microseconds. As
+/// with [`settimeofday`], the host's privilege policy decides the rest.
+///
+/// # Safety
+///
+/// `ts` is a readable `struct timespec *`.
+#[cfg(not(target_os = "macos"))]
+unsafe extern "C" fn settime(clock: id::clockid_t, ts: *const c_void) -> i32 {
+    if clock != id::REALTIME {
+        crate::errno::set(libc::EINVAL);
+        return -1;
+    }
+    // SAFETY: the caller's guarantee, and the two layouts agree.
+    let ts = unsafe { (ts as *const libc::timespec).read_unaligned() };
+    let tv = libc::timeval {
+        tv_sec: ts.tv_sec,
+        tv_usec: ts.tv_nsec / 1000,
+    };
+    unsafe { host_settimeofday(&tv, core::ptr::null()) }
+}
+
 /// `uint64_t clock_gettime_nsec_np(clockid_t)`, which has no host spelling at all.
 ///
 /// Zero is the failure Darwin reports, with `errno` set; there is no other value a
@@ -307,6 +331,7 @@ exports::exports! {
     functions {
         "clock_gettime" => gettime,
         "clock_getres" => getres,
+        "clock_settime" => settime,
         "clock_gettime_nsec_np" => gettime_nsec_np,
         "clock" => clock,
         "gettimeofday" => gettimeofday,
@@ -343,6 +368,17 @@ mod tests {
         assert_eq!(translate(99), None);
         // SAFETY: no memory is touched on the refusing path.
         assert_eq!(unsafe { gettime_nsec_np(99) }, 0);
+        assert_eq!(crate::errno::get(), libc::EINVAL);
+        crate::errno::set(0);
+    }
+
+    /// Only the wall clock is settable on Darwin; the refusal must come before
+    /// the time is read, let alone reaches the host.
+    #[test]
+    #[cfg(not(target_os = "macos"))]
+    fn only_the_wall_clock_can_be_set() {
+        // SAFETY: the refusing path does not read the pointer.
+        assert_eq!(unsafe { settime(id::MONOTONIC, core::ptr::null()) }, -1);
         assert_eq!(crate::errno::get(), libc::EINVAL);
         crate::errno::set(0);
     }

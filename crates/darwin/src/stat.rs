@@ -1,6 +1,9 @@
 #![cfg(not(target_os = "macos"))]
 
-use std::ffi::{CStr, c_char, c_int};
+use std::{
+    ffi::{CStr, c_char, c_int},
+    mem::MaybeUninit,
+};
 
 /// Darwin's `struct stat` as an x86-64 guest sees it - the `_DARWIN_FEATURE_64_BIT_INODE`
 /// layout, which is the only one arm64 and modern x86-64 code has.
@@ -529,13 +532,26 @@ pub unsafe extern "C" fn openat(
         fd => fd,
     };
     let mode = open_mode(flags, mode);
-    let ask = |path| {
+    with_fallback_at(dirfd, path, |path| {
         if writes(host_flags) && !may_write_at(dirfd, path) {
             return (-1, false);
         }
         let fd = unsafe { libc::openat(dirfd, path, host_flags, mode) };
         (fd, fd >= 0)
-    };
+    })
+}
+
+/// [`with_fallback`] for a path interpreted against `dirfd`, a host descriptor
+/// or the host's `AT_FDCWD`.
+///
+/// The fold stays relative to `dirfd`: a relative path under a real directory
+/// descriptor is already a host path, and mapping it again would apply the
+/// prefix twice.
+fn with_fallback_at<T>(
+    dirfd: c_int,
+    path: *const c_char,
+    mut ask: impl FnMut(*const c_char) -> (T, bool),
+) -> T {
     if path.is_null() {
         return ask(path).0;
     }
@@ -591,23 +607,48 @@ pub unsafe extern "C" fn faccessat(
         DARWIN_AT_FDCWD => libc::AT_FDCWD,
         fd => fd,
     };
-    let ask = |path| {
+    with_fallback_at(dirfd, path, |path| {
         let rc = unsafe { libc::faccessat(dirfd, path, mode, host_flag) };
         (rc, rc == 0)
-    };
-    if path.is_null() {
-        return ask(path).0;
+    })
+}
+
+/// `int fstatat(int fd, const char *path, struct stat *buf, int flag)`
+///
+/// Only `AT_SYMLINK_NOFOLLOW` has a host equivalent. `AT_REALDEV`,
+/// `AT_FDONLY` and `AT_SYMLINK_NOFOLLOW_ANY` change what is looked up or what
+/// `st_dev` means, so they are refused with `EINVAL` rather than dropped.
+///
+/// # Safety
+///
+/// `path` is a NUL-terminated string, `dirfd` is either a directory descriptor
+/// or Darwin's `AT_FDCWD`, and `out` is null or a writable Darwin `struct stat`.
+pub unsafe extern "C" fn fstatat(
+    dirfd: c_int,
+    path: *const c_char,
+    out: *mut Stat,
+    flag: c_int,
+) -> c_int {
+    if flag & !DARWIN_AT_SYMLINK_NOFOLLOW != 0 {
+        crate::errno::set(libc::EINVAL);
+        return -1;
     }
-    // SAFETY: non-null, and a `const char *` is NUL-terminated by contract.
-    let host = prefix::ns::to_host_at(dirfd, unsafe { CStr::from_ptr(path) });
-    let (result, ok) = ask(host.as_ptr());
-    if ok || crate::errno::get() != libc::ENOENT {
-        return result;
-    }
-    let Some(found) = prefix::ns::fold_at(dirfd, &host) else {
-        return result;
+    let host_flag = match flag & DARWIN_AT_SYMLINK_NOFOLLOW != 0 {
+        true => libc::AT_SYMLINK_NOFOLLOW,
+        false => 0,
     };
-    ask(found.as_ptr()).0
+    let dirfd = match dirfd {
+        DARWIN_AT_FDCWD => libc::AT_FDCWD,
+        fd => fd,
+    };
+    with_fallback_at(dirfd, path, |path| {
+        let mut host = MaybeUninit::<libc::stat>::uninit();
+        let rc = unsafe { libc::fstatat(dirfd, path, host.as_mut_ptr(), host_flag) };
+        if rc == 0 && !out.is_null() {
+            unsafe { *out = from_host(&host.assume_init()) };
+        }
+        (rc, rc == 0)
+    })
 }
 
 /// Translate a Darwin `O_` word, refusing bits whose semantics cannot be kept.
@@ -1197,6 +1238,67 @@ mod tests {
             libc::close(dirfd);
         }
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn fstatat_translates_at_fdcwd() {
+        let at = std::env::temp_dir().join(format!("r3-fstatat-cwd-{}", std::process::id()));
+        std::fs::write(&at, vec![0u8; 321]).expect("a file");
+        let path = CString::new(at.to_str().expect("utf-8")).expect("no NUL");
+        let mut out = Stat::default();
+        // SAFETY: a NUL-terminated path, Darwin's AT_FDCWD and a writable `stat`.
+        let rc = unsafe { fstatat(DARWIN_AT_FDCWD, path.as_ptr(), &mut out, 0) };
+        let _ = std::fs::remove_file(&at);
+        assert_eq!(rc, 0, "{}", std::io::Error::last_os_error());
+        assert_eq!(out.size, 321);
+    }
+
+    #[test]
+    fn fstatat_resolves_relative_to_its_descriptor_and_honours_nofollow() {
+        let dir = std::env::temp_dir().join(format!("r3-fstatat-dir-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("Contents")).expect("a directory");
+        std::fs::write(dir.join("Contents").join("Game.ios"), b"xyz").expect("a file");
+        std::os::unix::fs::symlink("Contents/Game.ios", dir.join("link")).expect("a symlink");
+        let directory = CString::new(dir.to_str().expect("utf-8")).expect("no NUL");
+        // SAFETY: a NUL-terminated directory path and Darwin scalar arguments.
+        let dirfd = unsafe { open(directory.as_ptr(), crate::fcntl::oflag::O_RDONLY, 0) };
+        assert!(dirfd >= 0);
+
+        let stat_at = |name: &CStr, flag| {
+            let mut out = Stat::default();
+            // SAFETY: a live directory descriptor, a NUL-terminated relative
+            // path and a writable `stat`.
+            let rc = unsafe { fstatat(dirfd, name.as_ptr(), &mut out, flag) };
+            (rc, out)
+        };
+        let (rc, followed) = stat_at(c"link", 0);
+        assert_eq!(rc, 0);
+        assert_eq!(followed.mode as u32 & 0o170000, libc::S_IFREG);
+        assert_eq!(followed.size, 3);
+        let (rc, link) = stat_at(c"link", DARWIN_AT_SYMLINK_NOFOLLOW);
+        assert_eq!(rc, 0);
+        assert_eq!(link.mode as u32 & 0o170000, libc::S_IFLNK);
+        let (rc, folded) = stat_at(c"contents/game.ios", 0);
+        assert_eq!(rc, 0, "the case fold stays relative to the descriptor");
+        assert_eq!(folded.size, 3);
+
+        // SAFETY: a descriptor this test just opened.
+        unsafe { libc::close(dirfd) };
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn fstatat_refuses_flags_without_a_host_equivalent() {
+        const DARWIN_AT_REALDEV: c_int = 0x200;
+        let mut out = Stat::default();
+        crate::errno::set(0);
+        // SAFETY: a static NUL-terminated path, Darwin's AT_FDCWD and a
+        // writable `stat`.
+        let rc = unsafe { fstatat(DARWIN_AT_FDCWD, c"/".as_ptr(), &mut out, DARWIN_AT_REALDEV) };
+        assert_eq!(rc, -1);
+        assert_eq!(crate::errno::get(), libc::EINVAL);
+        crate::errno::set(0);
     }
 
     /// The process umask, restored immediately after reading it.

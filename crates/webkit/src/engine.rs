@@ -44,6 +44,16 @@ fn start() -> Result<Engine, String> {
     if std::env::var_os("ROSETTA3_WEBKIT").is_some_and(|value| value == "0") {
         return Err("disabled by ROSETTA3_WEBKIT=0".to_string());
     }
+    if appkit::decor::config().decorations == appkit::decor::Decorations::Server
+        && std::env::var_os("WAYLAND_DISPLAY").is_some()
+    {
+        // SDL may have loaded libdecor's GTK 3 plugin for the host titlebar,
+        // and GTK 3 and the GTK 4 loaded next cannot share a process.
+        warn_once(
+            "ROSETTA3_DECORATIONS=server lets libdecor load GTK 3 next to \
+             WebKit's GTK 4; if the program crashes, use the default client decorations",
+        );
+    }
     let api = gtk::api()?;
     // GTK would otherwise call `setlocale(LC_ALL, "")`, which changes how the
     // host's C library formats numbers under the guest's feet.

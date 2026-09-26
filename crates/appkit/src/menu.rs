@@ -16,6 +16,9 @@ pub struct Menu {
     /// The item this menu is the submenu of. `-supermenu` answers that item's
     /// menu rather than the item, so it follows the item when it moves.
     supermenu: Id,
+    /// `-autoenablesItems`, inverted so that a fresh menu's zero is AppKit's
+    /// `YES`.
+    no_autoenable: usize,
 }
 
 #[repr(C)]
@@ -42,8 +45,13 @@ pub struct MenuItem {
     modifier_mask: usize,
     tool_tip: Id,
     image: Id,
-    /// Kept and never drawn, like everything else here.
+    /// A custom view for the item. Kept, and not drawn: the item's title is
+    /// shown in its place.
     view: Id,
+    /// `-isAlternate`: shown only while its extra modifier is held, which a
+    /// menu here never does, so an alternate is never shown.
+    alternate: usize,
+    indentation: isize,
 }
 
 pub const MENU_INSTANCE_SIZE: usize = size_of::<Menu>();
@@ -264,6 +272,16 @@ unsafe extern "C" fn init_item(
     item.action = action;
     item.key_equivalent = objc::arc::retain(key_equivalent);
     item.enabled = 1;
+    item.modifier_mask = crate::keymap::flags::COMMAND as usize;
+    receiver
+}
+
+/// `-init`: an enabled item whose key equivalent, once set, takes Command -
+/// AppKit's defaults, which a nib and `-initWithTitle:...` both assume.
+unsafe extern "C" fn init_plain_item(receiver: Id, _sel: Sel) -> Id {
+    let item = item_of(receiver);
+    item.enabled = 1;
+    item.modifier_mask = crate::keymap::flags::COMMAND as usize;
     receiver
 }
 
@@ -436,7 +454,70 @@ unsafe extern "C" fn index_of_item_with_submenu(receiver: Id, _sel: Sel, submenu
         .map_or(-1, |at| at as isize)
 }
 
-unsafe extern "C" fn ignored_flag(_receiver: Id, _sel: Sel, _flag: u8) {}
+unsafe extern "C" fn autoenables_items(receiver: Id, _sel: Sel) -> u8 {
+    (menu_of(receiver).no_autoenable == 0) as u8
+}
+
+unsafe extern "C" fn set_autoenables_items(receiver: Id, _sel: Sel, value: u8) {
+    menu_of(receiver).no_autoenable = (value == 0) as usize;
+}
+
+unsafe extern "C" fn is_alternate(receiver: Id, _sel: Sel) -> u8 {
+    item_of(receiver).alternate as u8
+}
+
+unsafe extern "C" fn set_alternate(receiver: Id, _sel: Sel, value: u8) {
+    item_of(receiver).alternate = value as usize;
+}
+
+unsafe extern "C" fn indentation_level(receiver: Id, _sel: Sel) -> isize {
+    item_of(receiver).indentation
+}
+
+unsafe extern "C" fn set_indentation_level(receiver: Id, _sel: Sel, value: isize) {
+    item_of(receiver).indentation = value.clamp(0, 15);
+}
+
+/// `-[NSMenu update]`: validation happens as a menu opens, so there is
+/// nothing to bring up to date ahead of that.
+unsafe extern "C" fn update(_receiver: Id, _sel: Sel) {}
+
+/// `-[NSMenu performKeyEquivalent:]`: find the item whose key equivalent the
+/// event is, here or in a submenu, and choose it if it is enabled.
+unsafe extern "C" fn perform_key_equivalent(receiver: Id, _sel: Sel, event: Id) -> u8 {
+    // SAFETY: an event, which answers both; sent rather than read so a
+    // guest's own `NSEvent` subclass answers for itself.
+    let (characters, modifiers) = unsafe {
+        let text: unsafe extern "C" fn(Id, Sel) -> Id = std::mem::transmute(objc::msg::entry());
+        let flags: unsafe extern "C" fn(Id, Sel) -> u64 = std::mem::transmute(objc::msg::entry());
+        (
+            text(event, objc::sel::get("charactersIgnoringModifiers")),
+            flags(event, objc::sel::get("modifierFlags")),
+        )
+    };
+    if characters.is_null() {
+        return 0;
+    }
+    // SAFETY: an `NSString`.
+    let characters =
+        String::from_utf8_lossy(&unsafe { foundation::string::bytes(characters) }).into_owned();
+    let Some(item) = find_key_equivalent(receiver, &characters, modifiers, 0) else {
+        return 0;
+    };
+    if !is_item_enabled(item) {
+        return 0;
+    }
+    perform(item);
+    1
+}
+
+/// `-performActionForItemAtIndex:`.
+unsafe extern "C" fn perform_action_for_item_at_index(receiver: Id, _sel: Sel, index: isize) {
+    let list = items_of(receiver);
+    if let Some(at) = corefoundation::collections::at(index, list.values.len()) {
+        perform(list.values[at] as Id);
+    }
+}
 
 unsafe extern "C" fn ignored_object(_receiver: Id, _sel: Sel, _object: Id) {}
 
@@ -462,7 +543,11 @@ pub(crate) fn install() {
         "delegate" => menu_delegate, c"@16@0:8";
         "setDelegate:" => set_menu_delegate, c"v24@0:8@16";
         "supermenu" => supermenu, c"@16@0:8";
-        "setAutoenablesItems:" => ignored_flag, c"v20@0:8c16";
+        "autoenablesItems" => autoenables_items, c"c16@0:8";
+        "setAutoenablesItems:" => set_autoenables_items, c"v20@0:8c16";
+        "update" => update, c"v16@0:8";
+        "performKeyEquivalent:" => perform_key_equivalent, c"c24@0:8@16";
+        "performActionForItemAtIndex:" => perform_action_for_item_at_index, c"v24@0:8q16";
         "setSubmenu:forItem:" => ignored_object, c"v32@0:8@16@24";
         "indexOfItemWithSubmenu:" => index_of_item_with_submenu, c"q24@0:8@16";
     });
@@ -472,7 +557,12 @@ pub(crate) fn install() {
         "separatorItem" => separator_item, c"@16@0:8";
     });
     methods!(item, {
+        "init" => init_plain_item, c"@16@0:8";
         "initWithTitle:action:keyEquivalent:" => init_item, c"@40@0:8@16:24@32";
+        "isAlternate" => is_alternate, c"c16@0:8";
+        "setAlternate:" => set_alternate, c"v20@0:8c16";
+        "indentationLevel" => indentation_level, c"q16@0:8";
+        "setIndentationLevel:" => set_indentation_level, c"v24@0:8q16";
         "title" => item_title, c"@16@0:8";
         "setTitle:" => set_item_title, c"v24@0:8@16";
         "action" => item_action, c":16@0:8";
@@ -509,6 +599,289 @@ pub(crate) fn install() {
     });
 }
 
+// What the chrome reads off a menu, and what choosing an item does.
+
+/// `[NSApp mainMenu]`, or nil.
+pub(crate) fn main_menu() -> Id {
+    let app = crate::application::shared();
+    if app.is_null() {
+        return app;
+    }
+    // SAFETY: `-mainMenu` is `id (id, SEL)` on the application.
+    unsafe {
+        let f: unsafe extern "C" fn(Id, Sel) -> Id = std::mem::transmute(objc::msg::entry());
+        f(app, objc::sel::get("mainMenu"))
+    }
+}
+
+fn is_menu_item(object: Id) -> bool {
+    // SAFETY: null or an object this runtime allocated.
+    unsafe { objc::object::class_of(object) }.is_some_and(|c| {
+        objc::class::lookup(c"NSMenuItem").is_some_and(|k| c.chain().any(|x| std::ptr::eq(x, k)))
+    })
+}
+
+fn is_menu(object: Id) -> bool {
+    // SAFETY: null or an object this runtime allocated.
+    unsafe { objc::object::class_of(object) }.is_some_and(|c| {
+        objc::class::lookup(c"NSMenu").is_some_and(|k| c.chain().any(|x| std::ptr::eq(x, k)))
+    })
+}
+
+/// A menu's items that are shown: neither hidden nor alternates.
+pub(crate) fn shown_items(menu: Id) -> Vec<Id> {
+    if !is_menu(menu) {
+        return Vec::new();
+    }
+    items_of(menu)
+        .values
+        .iter()
+        .map(|value| *value as Id)
+        .filter(|item| is_menu_item(*item))
+        .filter(|item| item_of(*item).hidden == 0 && item_of(*item).alternate == 0)
+        .collect()
+}
+
+fn string_of(object: Id) -> String {
+    match object.is_null() {
+        true => String::new(),
+        // SAFETY: an `NSString`.
+        false => {
+            String::from_utf8_lossy(&unsafe { foundation::string::bytes(object) }).into_owned()
+        }
+    }
+}
+
+/// The title an item shows: its own, or its submenu's when it has none.
+pub(crate) fn display_title(item: Id) -> String {
+    let own = string_of(item_of(item).title);
+    match own.is_empty() && !item_of(item).submenu.is_null() {
+        true => string_of(menu_of(item_of(item).submenu).title),
+        false => own,
+    }
+}
+
+pub(crate) fn submenu_of(item: Id) -> Id {
+    item_of(item).submenu
+}
+
+pub(crate) fn is_separator(item: Id) -> bool {
+    item_of(item).separator != 0
+}
+
+pub(crate) fn state_of(item: Id) -> isize {
+    item_of(item).state
+}
+
+pub(crate) fn indentation(item: Id) -> isize {
+    item_of(item).indentation
+}
+
+/// `-setSeparatorItem` has no setter of AppKit's; a nib says so with a flag.
+pub(crate) fn mark_separator(item: Id) {
+    item_of(item).separator = 1;
+}
+
+/// The item's key equivalent as a Mac menu shows it.
+pub(crate) fn shortcut_label(item: Id) -> String {
+    let item = item_of(item);
+    let key = string_of(item.key_equivalent);
+    let mask = item.modifier_mask as u64;
+    use crate::keymap::flags;
+    chrome::menu::shortcut_label(
+        &key,
+        chrome::menu::Modifiers {
+            command: mask & flags::COMMAND != 0,
+            shift: mask & flags::SHIFT != 0,
+            option: mask & flags::OPTION != 0,
+            control: mask & flags::CONTROL != 0,
+        },
+    )
+}
+
+/// The object an item's action goes to: its target, or the first responder
+/// in the application's chain that implements the action.
+fn target_of(item: Id) -> Id {
+    let item = item_of(item);
+    if item.action.is_null() {
+        return std::ptr::null_mut();
+    }
+    crate::responder::target_for_action(item.action, item.target)
+}
+
+/// Whether `object` implements `sel`.
+fn implements(object: Id, sel: Sel) -> bool {
+    // SAFETY: a live object this runtime allocated.
+    unsafe { objc::object::class_of(object) }.is_some_and(|c| c.method(sel).is_some())
+}
+
+/// Whether choosing the item would do anything, as AppKit decides it: an
+/// item in a menu that enables its items is enabled when something takes
+/// its action and, if that asks to, agrees.
+pub(crate) fn is_item_enabled(item: Id) -> bool {
+    let body = item_of(item);
+    let menu = body.menu;
+    let automatic = is_menu(menu) && menu_of(menu).no_autoenable == 0;
+    if !automatic {
+        return body.enabled != 0;
+    }
+    if !body.submenu.is_null() {
+        return true;
+    }
+    let target = target_of(item);
+    if target.is_null() {
+        return false;
+    }
+    for validator in ["validateMenuItem:", "validateUserInterfaceItem:"] {
+        let sel = objc::sel::get(validator);
+        if implements(target, sel) {
+            // SAFETY: both validators are `BOOL (id, SEL, id)`.
+            return unsafe {
+                let f: unsafe extern "C" fn(Id, Sel, Id) -> u8 =
+                    std::mem::transmute(objc::msg::entry());
+                f(target, sel, item) != 0
+            };
+        }
+    }
+    true
+}
+
+/// Whether the item is enabled as it was last set, with no validation:
+/// what a menu bar title shows, which is asked every frame.
+pub(crate) fn is_enabled_flag(item: Id) -> bool {
+    item_of(item).enabled != 0 || !item_of(item).submenu.is_null()
+}
+
+/// Send the menu's delegate `selector` with the menu, if it implements it.
+fn tell_delegate(menu: Id, selector: &str) {
+    if !is_menu(menu) {
+        return;
+    }
+    let delegate = menu_of(menu).delegate;
+    let sel = objc::sel::get(selector);
+    if delegate.is_null() || !implements(delegate, sel) {
+        return;
+    }
+    // SAFETY: each delegate message here is `void (id, SEL, NSMenu *)`.
+    unsafe {
+        let f: unsafe extern "C" fn(Id, Sel, Id) = std::mem::transmute(objc::msg::entry());
+        f(delegate, sel, menu);
+    }
+}
+
+/// The items of a menu about to open, after its delegate has had the chance
+/// to rebuild them, each retained for the caller - see [`release_items`].
+pub(crate) fn prepare(menu: Id) -> Vec<Id> {
+    tell_delegate(menu, "menuNeedsUpdate:");
+    shown_items(menu)
+        .into_iter()
+        .map(objc::arc::retain)
+        .collect()
+}
+
+pub(crate) fn release_items(items: Vec<Id>) {
+    items.into_iter().for_each(objc::arc::release);
+}
+
+pub(crate) fn will_open(menu: Id) {
+    tell_delegate(menu, "menuWillOpen:");
+}
+
+pub(crate) fn did_close(menu: Id) {
+    tell_delegate(menu, "menuDidClose:");
+}
+
+/// Choose `item`: its action is sent to its target, bracketed by the two
+/// notifications AppKit posts about it.
+pub(crate) fn perform(item: Id) {
+    let body = item_of(item);
+    if body.action.is_null() {
+        return;
+    }
+    let (menu, action, target) = (body.menu, body.action, body.target);
+    foundation::notification::post(
+        "NSMenuWillSendActionNotification",
+        menu,
+        std::ptr::null_mut(),
+    );
+    let app = crate::application::shared();
+    if !app.is_null() {
+        // SAFETY: `-sendAction:to:from:` is `BOOL (id, SEL, SEL, id, id)`.
+        unsafe {
+            let f: unsafe extern "C" fn(Id, Sel, Sel, Id, Id) -> u8 =
+                std::mem::transmute(objc::msg::entry());
+            f(
+                app,
+                objc::sel::get("sendAction:to:from:"),
+                action,
+                target,
+                item,
+            );
+        }
+    }
+    foundation::notification::post(
+        "NSMenuDidSendActionNotification",
+        menu,
+        std::ptr::null_mut(),
+    );
+}
+
+/// The modifiers a key equivalent is compared by.
+const EQUIVALENT_MODIFIERS: u64 = crate::keymap::flags::SHIFT
+    | crate::keymap::flags::CONTROL
+    | crate::keymap::flags::OPTION
+    | crate::keymap::flags::COMMAND;
+
+/// Whether an item with key equivalent `key` and modifier mask `mask` is what
+/// a key press of `characters` (ignoring modifiers) with `modifiers` held
+/// means.
+pub(crate) fn matches_key_equivalent(
+    key: &str,
+    mask: u64,
+    characters: &str,
+    modifiers: u64,
+) -> bool {
+    let mut chars = key.chars();
+    let (Some(wanted), None) = (chars.next(), chars.next()) else {
+        return false;
+    };
+    let mut required = mask & EQUIVALENT_MODIFIERS;
+    // An upper-case equivalent is the shifted key.
+    if wanted.is_alphabetic() && wanted.is_uppercase() {
+        required |= crate::keymap::flags::SHIFT;
+    }
+    let mut pressed = characters.chars();
+    let (Some(pressed), None) = (pressed.next(), pressed.next()) else {
+        return false;
+    };
+    let same_key = wanted.to_lowercase().eq(pressed.to_lowercase())
+        // Return and Enter are one key equivalent.
+        || (matches!(wanted, '\r' | '\u{3}') && matches!(pressed, '\r' | '\u{3}'));
+    same_key && modifiers & EQUIVALENT_MODIFIERS == required
+}
+
+/// The first item, depth first, whose key equivalent is this key press.
+fn find_key_equivalent(menu: Id, characters: &str, modifiers: u64, depth: usize) -> Option<Id> {
+    if depth > 16 {
+        return None;
+    }
+    for item in shown_items(menu) {
+        let body = item_of(item);
+        if !body.submenu.is_null() {
+            if let Some(found) = find_key_equivalent(body.submenu, characters, modifiers, depth + 1)
+            {
+                return Some(found);
+            }
+            continue;
+        }
+        let key = string_of(body.key_equivalent);
+        if matches_key_equivalent(&key, body.modifier_mask as u64, characters, modifiers) {
+            return Some(item);
+        }
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -536,6 +909,140 @@ mod tests {
         // SAFETY: `-setTag:` is `void (id, SEL, NSInteger)`.
         unsafe { set_item_tag(object, objc::sel::get("setTag:"), tag) };
         object
+    }
+
+    #[test]
+    fn a_key_equivalent_is_its_key_and_exactly_its_modifiers() {
+        use crate::keymap::flags::{CAPS_LOCK, COMMAND, CONTROL, OPTION, SHIFT};
+        assert!(matches_key_equivalent("s", COMMAND, "s", COMMAND));
+        assert!(!matches_key_equivalent("s", COMMAND, "s", COMMAND | SHIFT));
+        assert!(!matches_key_equivalent("s", COMMAND, "s", CONTROL));
+        assert!(!matches_key_equivalent("s", COMMAND, "d", COMMAND));
+        // An upper-case equivalent is the shifted key.
+        assert!(matches_key_equivalent("S", COMMAND, "s", COMMAND | SHIFT));
+        assert!(matches_key_equivalent(
+            "z",
+            COMMAND | OPTION,
+            "z",
+            COMMAND | OPTION
+        ));
+        // Caps lock is not a modifier an equivalent is chosen by.
+        assert!(matches_key_equivalent(
+            "s",
+            COMMAND,
+            "s",
+            COMMAND | CAPS_LOCK
+        ));
+        assert!(!matches_key_equivalent("", COMMAND, "s", COMMAND));
+    }
+
+    static SAVES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    static ALLOWED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+
+    unsafe extern "C" fn save(_receiver: Id, _sel: Sel, _sender: Id) {
+        SAVES.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    unsafe extern "C" fn validate(_receiver: Id, _sel: Sel, _item: Id) -> u8 {
+        ALLOWED.load(std::sync::atomic::Ordering::SeqCst) as u8
+    }
+
+    /// Command-S reaches a Save item two menus down, is refused while the
+    /// target says the item is disabled, and is not taken by another key.
+    #[test]
+    fn a_key_equivalent_chooses_its_item_when_the_target_agrees() {
+        crate::bootstrap();
+        let class = objc::class::ptr(objc::class::lookup(c"NSApplication").expect("NSApplication"));
+        // SAFETY: `+sharedApplication` is `id (Class, SEL)`.
+        unsafe {
+            let f: unsafe extern "C" fn(Id, Sel) -> Id = std::mem::transmute(objc::msg::entry());
+            f(class as Id, objc::sel::get("sharedApplication"));
+        }
+        let target_class =
+            objc::class::allocate_pair(objc::class::lookup(c"NSObject"), c"R3TestMenuTarget", 0)
+                .expect("a class of this name is not declared elsewhere");
+        target_class.add_method(
+            objc::sel::get("r3TestSave:"),
+            save as objc::class::Imp,
+            c"v24@0:8@16",
+        );
+        target_class.add_method(
+            objc::sel::get("validateMenuItem:"),
+            validate as objc::class::Imp,
+            c"c24@0:8@16",
+        );
+        objc::class::register_pair(target_class);
+        let target = objc::object::create_instance(target_class, 0);
+
+        let root = menu("Main");
+        let file = menu("File");
+        let holder = item(0);
+        let save_item = item(1);
+        // SAFETY: each prototype is the one its selector declares.
+        unsafe {
+            init_plain_item(save_item, objc::sel::get("init"));
+            set_item_action(
+                save_item,
+                objc::sel::get("setAction:"),
+                objc::sel::get("r3TestSave:"),
+            );
+            set_item_target(save_item, objc::sel::get("setTarget:"), target);
+            set_key_equivalent(
+                save_item,
+                objc::sel::get("setKeyEquivalent:"),
+                foundation::string::from_str("s"),
+            );
+            set_item_submenu(holder, objc::sel::get("setSubmenu:"), file);
+            add_item(root, objc::sel::get("addItem:"), holder);
+            add_item(file, objc::sel::get("addItem:"), save_item);
+        }
+        let press = |characters: &str, modifiers: u64| {
+            let event = crate::nsevent::make(crate::nsevent::Fields {
+                kind: crate::nsevent::kind::KEY_DOWN,
+                modifiers,
+                characters: foundation::string::from_str(characters),
+                ..crate::nsevent::Fields::default()
+            });
+            // SAFETY: `-performKeyEquivalent:` is `BOOL (id, SEL, NSEvent *)`.
+            unsafe { perform_key_equivalent(root, objc::sel::get("performKeyEquivalent:"), event) }
+        };
+        let command = crate::keymap::flags::COMMAND;
+        let before = SAVES.load(std::sync::atomic::Ordering::SeqCst);
+        ALLOWED.store(true, std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(press("s", command), 1);
+        assert_eq!(SAVES.load(std::sync::atomic::Ordering::SeqCst), before + 1);
+        assert_eq!(press("d", command), 0, "no item has Command-D");
+
+        ALLOWED.store(false, std::sync::atomic::Ordering::SeqCst);
+        assert!(!is_item_enabled(save_item));
+        assert_eq!(press("s", command), 0, "a disabled item is not chosen");
+        assert_eq!(SAVES.load(std::sync::atomic::Ordering::SeqCst), before + 1);
+
+        // A menu that does not enable its own items goes by the flag alone.
+        // SAFETY: `-setAutoenablesItems:` is `void (id, SEL, BOOL)`.
+        unsafe { set_autoenables_items(file, objc::sel::get("setAutoenablesItems:"), 0) };
+        assert!(is_item_enabled(save_item));
+        ALLOWED.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// An item nothing can take the action of is disabled, as AppKit greys
+    /// out a menu item with nowhere to send it.
+    #[test]
+    fn an_action_nothing_implements_disables_its_item() {
+        let file = menu("Edit");
+        let orphan = item(3);
+        // SAFETY: each prototype is the one its selector declares.
+        unsafe {
+            init_plain_item(orphan, objc::sel::get("init"));
+            set_item_action(
+                orphan,
+                objc::sel::get("setAction:"),
+                objc::sel::get("r3TestNobodyImplementsThis:"),
+            );
+            add_item(file, objc::sel::get("addItem:"), orphan);
+        }
+        assert!(!is_item_enabled(orphan));
+        assert!(is_enabled_flag(orphan), "the flag itself is still set");
     }
 
     /// A separator answers `-isSeparatorItem` and an ordinary item does not,

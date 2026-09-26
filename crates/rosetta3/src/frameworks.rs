@@ -138,6 +138,14 @@ static FRAMEWORKS: &[Framework] = &[
         symbol: None,
     },
     Framework {
+        leaf: "AVFoundation",
+        version: 'A',
+        umbrellas: &[],
+        provide: None,
+        data: Some(avfoundation::data_symbols),
+        symbol: None,
+    },
+    Framework {
         leaf: "Security",
         version: 'A',
         umbrellas: &[],

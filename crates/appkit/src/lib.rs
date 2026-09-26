@@ -10,6 +10,7 @@
     clippy::useless_conversion
 )]
 
+mod about;
 pub mod alert;
 mod animation;
 pub mod appearance;
@@ -25,11 +26,13 @@ mod controls;
 pub mod coretext;
 pub mod cursor;
 pub(crate) mod decode;
+pub mod decor;
 mod define;
+pub mod dialog;
 pub mod dock;
 pub mod event;
 mod font;
-pub mod fonts;
+pub use chrome::fonts;
 pub mod geometry;
 pub mod graphics;
 pub mod icon;
@@ -64,6 +67,7 @@ pub fn bootstrap() {
     static ONCE: std::sync::Once = std::sync::Once::new();
     ONCE.call_once(|| {
         foundation::bootstrap();
+        decor::install();
         classes::install();
         alert::install();
         panel::install();

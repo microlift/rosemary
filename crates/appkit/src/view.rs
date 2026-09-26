@@ -655,16 +655,20 @@ pub unsafe fn presentation_frame(view: Id) -> Option<Frame> {
     };
     // A view with no frame of its own - one a guest made with
     // `-initWithFrame:` of a zero rect and then never sized - covers its
-    // window rather than nothing, which is what AppKit's own autoresizing
-    // would have made of it.
+    // window's content rather than nothing, which is what AppKit's own
+    // autoresizing would have made of it.
     match frame.width == 0 || frame.height == 0 {
-        true => Some(Frame {
-            x: 0,
-            y: 0,
-            width: frame.window_width,
-            height: frame.window_height,
-            ..frame
-        }),
+        true => {
+            let inset = (crate::window::content_inset(window) * density).round() as u32;
+            let inset = inset.min(frame.window_height);
+            Some(Frame {
+                x: 0,
+                y: inset as i32,
+                width: frame.window_width,
+                height: frame.window_height - inset,
+                ..frame
+            })
+        }
         false => Some(frame),
     }
 }
@@ -1450,6 +1454,9 @@ pub(crate) fn install() {
         "isOpaque" => yes, c"c16@0:8";
         "isFlipped" => no, c"c16@0:8";
         "isHidden" => is_hidden, c"c16@0:8";
+        // No live-resize session is ever started here: the window system resizes
+        // a window in one step and nothing posts NSWindowWillStartLiveResize.
+        "inLiveResize" => no, c"c16@0:8";
         "isHiddenOrHasHiddenAncestor" => is_hidden_or_has_hidden_ancestor_method, c"c16@0:8";
         "display" => display, c"v16@0:8";
         "displayIfNeeded" => display, c"v16@0:8";

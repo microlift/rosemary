@@ -55,6 +55,23 @@ impl GuestArch {
             GuestArch::Arm64 => "arm",
         }
     }
+
+    /// `cpu_type_t` as `<mach/machine.h>` numbers it: `CPU_ARCH_ABI64`
+    /// (`0x0100_0000`) over the 32-bit type.
+    pub fn cpu_type(self) -> i32 {
+        match self {
+            GuestArch::X86_64 => 0x0100_0007,
+            GuestArch::Arm64 => 0x0100_000c,
+        }
+    }
+
+    /// `CPU_SUBTYPE_X86_64_ALL` and `CPU_SUBTYPE_ARM64_ALL`.
+    pub fn cpu_subtype(self) -> i32 {
+        match self {
+            GuestArch::X86_64 => 3,
+            GuestArch::Arm64 => 0,
+        }
+    }
 }
 
 /// Zero until [`set_guest_arch`], which is how "nobody said" is told from "x86-64".
@@ -226,7 +243,7 @@ fn hostname() -> String {
 }
 
 #[cfg(not(target_os = "macos"))]
-fn ncpu() -> u32 {
+pub(crate) fn ncpu() -> u32 {
     std::thread::available_parallelism().map_or(1, |n| n.get() as u32)
 }
 
@@ -236,7 +253,7 @@ fn page_size() -> u32 {
 }
 
 #[cfg(not(target_os = "macos"))]
-fn memsize() -> u64 {
+pub(crate) fn memsize() -> u64 {
     // SAFETY: as above; both parameters are plain counts.
     let pages = unsafe { libc::sysconf(libc::_SC_PHYS_PAGES) };
     if pages <= 0 {
@@ -408,17 +425,8 @@ fn named(name: &str) -> Option<Value> {
         ))),
         "hw.optional.arm64" => Some(Value::U32(u32::from(guest_arch() == GuestArch::Arm64))),
         "machdep.cpu.brand_string" => Some(Value::Str(brand_string())),
-        // `cpu_type_t`/`cpu_subtype_t` as `<mach/machine.h>` numbers them:
-        // `CPU_ARCH_ABI64` (`0x0100_0000`) over the 32-bit type.
-        "hw.cputype" => Some(Value::U32(match guest_arch() {
-            GuestArch::X86_64 => 0x0100_0007,
-            GuestArch::Arm64 => 0x0100_000c,
-        })),
-        "hw.cpusubtype" => Some(Value::U32(match guest_arch() {
-            // `CPU_SUBTYPE_X86_64_ALL` and `CPU_SUBTYPE_ARM64_ALL`.
-            GuestArch::X86_64 => 3,
-            GuestArch::Arm64 => 0,
-        })),
+        "hw.cputype" => Some(Value::U32(guest_arch().cpu_type() as u32)),
+        "hw.cpusubtype" => Some(Value::U32(guest_arch().cpu_subtype() as u32)),
         // `CPUFAMILY_UNKNOWN`. The real values are opaque hashes of a specific
         // Apple or Intel part, and a caller that recognises one acts on what it
         // knows about that part - so naming a family this is not is worse than

@@ -226,9 +226,8 @@ pub const NAMES: &[(&str, &str)] = &[
     ("nl_langinfo", "the nl_item values differ"),
     ("nl_langinfo_l", "the nl_item values differ"),
     ("dladdr", "Dl_info is laid out differently"),
-    // The reading half of the clock family is reimplemented; see darwin::clock for
-    // why the `clockid_t` cannot be passed through. Setting the clock is refused
-    // rather than translated: it would be the *host's* clock a guest moved.
+    // The clock family is reimplemented; see darwin::clock for why the
+    // `clockid_t` cannot be passed through.
     (
         "clock_settime",
         "the clockid_t values differ; see darwin::clock",

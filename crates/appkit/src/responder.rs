@@ -258,6 +258,95 @@ unsafe extern "C" fn interpret_key_events(receiver: Id, _sel: Sel, events: Id) {
     }
 }
 
+/// Where an action goes: `target` when there is one and it implements the
+/// action, otherwise the first object in the application's responder chain
+/// that does. Nil when nothing takes it.
+pub(crate) fn target_for_action(action: Sel, target: Id) -> Id {
+    let implements = |object: Id| {
+        // SAFETY: null or a live object this runtime allocated.
+        unsafe { objc::object::class_of(object) }.is_some_and(|c| c.method(action).is_some())
+    };
+    if action.is_null() {
+        return std::ptr::null_mut();
+    }
+    if !target.is_null() {
+        return match implements(target) {
+            true => target,
+            false => std::ptr::null_mut(),
+        };
+    }
+    let application = crate::application::shared();
+    if application.is_null() {
+        return std::ptr::null_mut();
+    }
+    chain(application)
+        .into_iter()
+        .find(|object| implements(*object))
+        .unwrap_or(std::ptr::null_mut())
+}
+
+/// `-[NSApplication sendAction:to:from:]`.
+unsafe extern "C" fn send_action(_receiver: Id, _sel: Sel, action: Sel, to: Id, from: Id) -> u8 {
+    let target = target_for_action(action, to);
+    if target.is_null() {
+        return 0;
+    }
+    // SAFETY: an action method is `void (id, SEL, id)`; sent rather than
+    // called so a guest's forwarding runs.
+    unsafe {
+        let f: unsafe extern "C" fn(Id, Sel, Id) = std::mem::transmute(objc::msg::entry());
+        f(target, action, from);
+    }
+    1
+}
+
+/// `-[NSApplication targetForAction:to:from:]`.
+unsafe extern "C" fn target_for_action_to_from(
+    _receiver: Id,
+    _sel: Sel,
+    action: Sel,
+    to: Id,
+    _from: Id,
+) -> Id {
+    target_for_action(action, to)
+}
+
+/// `-[NSApplication targetForAction:]`.
+unsafe extern "C" fn target_for_action_only(_receiver: Id, _sel: Sel, action: Sel) -> Id {
+    target_for_action(action, std::ptr::null_mut())
+}
+
+/// `-performKeyEquivalent:` on a view: offered to each subview in turn, and
+/// taken by none unless one of them - a guest's override - takes it.
+unsafe extern "C" fn view_perform_key_equivalent(receiver: Id, sel: Sel, event: Id) -> u8 {
+    // SAFETY: a view this method was installed on.
+    for child in unsafe { crate::view::children(receiver) } {
+        // SAFETY: `-performKeyEquivalent:` is `BOOL (id, SEL, NSEvent *)`.
+        let taken = unsafe {
+            let f: unsafe extern "C" fn(Id, Sel, Id) -> u8 =
+                std::mem::transmute(objc::msg::entry());
+            f(child, sel, event)
+        };
+        if taken != 0 {
+            return 1;
+        }
+    }
+    0
+}
+
+/// `-[NSWindow performKeyEquivalent:]`: the window's views are asked.
+unsafe extern "C" fn window_perform_key_equivalent(receiver: Id, sel: Sel, event: Id) -> u8 {
+    let content = crate::window::content_view_of(receiver);
+    if content.is_null() {
+        return 0;
+    }
+    // SAFETY: `-performKeyEquivalent:` is `BOOL (id, SEL, NSEvent *)`.
+    unsafe {
+        let f: unsafe extern "C" fn(Id, Sel, Id) -> u8 = std::mem::transmute(objc::msg::entry());
+        f(content, sel, event)
+    }
+}
+
 /// An `NSResponder` event method: a responder that does not handle the event
 /// passes it up. These methods also matter when a guest override calls `super`;
 /// they are real methods on AppKit's base class rather than absent selectors.
@@ -284,6 +373,20 @@ pub(crate) fn install() {
         "scrollWheel:" => forward_event, c"v24@0:8@16";
         "interpretKeyEvents:" => interpret_key_events, c"v24@0:8@16";
         "tryToPerform:with:" => try_to_perform, c"c32@0:8:16@24";
+    });
+    let application = objc::class::lookup(c"NSApplication").expect("declared before its methods");
+    methods!(application, {
+        "sendAction:to:from:" => send_action, c"c40@0:8:16@24@32";
+        "targetForAction:to:from:" => target_for_action_to_from, c"@40@0:8:16@24@32";
+        "targetForAction:" => target_for_action_only, c"@24@0:8:16";
+    });
+    let view = objc::class::lookup(c"NSView").expect("declared before its methods");
+    methods!(view, {
+        "performKeyEquivalent:" => view_perform_key_equivalent, c"c24@0:8@16";
+    });
+    let window = objc::class::lookup(c"NSWindow").expect("declared before its methods");
+    methods!(window, {
+        "performKeyEquivalent:" => window_perform_key_equivalent, c"c24@0:8@16";
     });
 }
 

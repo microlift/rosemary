@@ -1527,6 +1527,14 @@ pub(crate) mod entry {
         super::indexed_image(index).map_or(0, |(header, _, _)| header)
     }
 
+    /// `const struct mach_header_64 *_NSGetMachExecuteHeader(void)`
+    ///
+    /// The guest's main image, which is what `__mh_execute_header` names inside
+    /// it - never this runtime's own header.
+    pub extern "C" fn ns_get_mach_execute_header() -> u64 {
+        super::MAIN_HEADER.load(Ordering::Acquire)
+    }
+
     /// `intptr_t _dyld_get_image_vmaddr_slide(uint32_t)`
     pub extern "C" fn dyld_get_image_vmaddr_slide(index: u32) -> u64 {
         super::indexed_image(index).map_or(0, |(_, slide, _)| slide)
@@ -1766,7 +1774,7 @@ pub(crate) mod entry {
 }
 
 /// Every name [`provider`] defines, and the function it binds to.
-fn entries() -> [(&'static str, *const ()); 14] {
+fn entries() -> [(&'static str, *const ()); 15] {
     [
         ("_dlopen", entry::dlopen as *const ()),
         ("_dlsym", entry::dlsym as *const ()),
@@ -1777,6 +1785,10 @@ fn entries() -> [(&'static str, *const ()); 14] {
         (
             "__dyld_get_image_header",
             entry::dyld_get_image_header as *const (),
+        ),
+        (
+            "__NSGetMachExecuteHeader",
+            entry::ns_get_mach_execute_header as *const (),
         ),
         (
             "__dyld_get_image_vmaddr_slide",

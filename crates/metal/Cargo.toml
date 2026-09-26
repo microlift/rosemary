@@ -13,6 +13,7 @@ darwin.workspace = true
 foundation.workspace = true
 objc.workspace = true
 metal_translate.workspace = true
+rspirv.workspace = true
 appkit.workspace = true
 sdl3.workspace = true
 static_init.workspace = true

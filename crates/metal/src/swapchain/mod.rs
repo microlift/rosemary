@@ -1,3 +1,4 @@
+mod corners;
 mod present;
 #[cfg(test)]
 mod tests;
@@ -58,6 +59,9 @@ struct Swapchain {
     /// The layers which have presented to this window. Its length is what
     /// decides whether the composite is needed.
     layers: Vec<usize>,
+    /// For a window whose surface shows its alpha, the pass that makes its
+    /// content opaque and rounds its corners. `None` presents opaque.
+    corners: Option<corners::Corners>,
     pool: vk::CommandPool,
     frames: Vec<Frame>,
     frame: usize,
@@ -182,8 +186,8 @@ fn present_impl(
     {
         return Ok(false);
     }
-    let mut all = SWAPCHAINS.lock().expect("window swapchains");
-    let all = all.get_or_insert_with(HashMap::new);
+    let mut guard = SWAPCHAINS.lock().expect("window swapchains");
+    let all = guard.get_or_insert_with(HashMap::new);
     let extent = vk::Extent2D {
         width: frame.window_width.max(1),
         height: frame.window_height.max(1),
@@ -193,6 +197,11 @@ fn present_impl(
         match Swapchain::create(gpu, frame.window, extent) {
             Ok(swapchain) => {
                 gpu::milestone("window swapchain");
+                // Without the pass the surface ignores alpha, and the
+                // chrome's corners would show black where they are cut.
+                if swapchain.corners.is_none() {
+                    appkit::decor::presented_opaque(frame.window);
+                }
                 slot.insert(swapchain);
             }
             Err(reason) => {
@@ -209,7 +218,8 @@ fn present_impl(
         }
     }
     let swapchain = all.get_mut(&window).expect("just created");
-    if !swapchain.layers.contains(&layer) {
+    let joined = !swapchain.layers.contains(&layer);
+    if joined {
         swapchain.layers.push(layer);
     }
     // The window resized, or the presentation engine said the last image no
@@ -237,7 +247,16 @@ fn present_impl(
             &holes,
         )),
     };
-    swapchain.present(frame, source, regions.as_deref(), owner.take())
+    let presented = swapchain.present(frame, source, regions.as_deref(), owner.take());
+    drop(guard);
+    // A layer's first frame starts the window's accumulator, which holds
+    // nothing of the window's store yet: the store may have gone straight to
+    // the screen before there was a layer to leave room for. Have it
+    // presented again, around the layer this time.
+    if joined && layer != window {
+        appkit::backing::present_again(frame.window);
+    }
+    presented
 }
 
 fn finish_source(source: Option<usize>) {
@@ -378,6 +397,19 @@ impl Swapchain {
                 source: None,
             });
         }
+        // Only a window made with room for rounded corners has a surface
+        // that shows alpha; see `appkit::window`.
+        let transparent = sdl3::video::window_flags(window) & sdl3::video::flags::TRANSPARENT != 0;
+        let corners = match transparent {
+            true => corners::Corners::new(gpu)
+                .inspect_err(|reason| {
+                    gpu::trace(format!(
+                        "window corners unavailable, presenting opaque: {reason}"
+                    ))
+                })
+                .ok(),
+            false => None,
+        };
         let mut swapchain = Self {
             gpu,
             surface: surface.take(),
@@ -390,6 +422,7 @@ impl Swapchain {
             presented: Vec::new(),
             composite: None,
             layers: Vec::new(),
+            corners,
             pool: pool.take(),
             frames: frames.take(),
             frame: 0,
@@ -423,6 +456,7 @@ impl Swapchain {
         }
         .map_err(|error| format!("vkGetPhysicalDeviceSurfacePresentModesKHR failed: {error:?}"))?;
         let present_mode = choose_present_mode(&present_modes);
+        let alpha = composite_alpha(&capabilities, self.corners.is_some());
 
         // `0xffff_ffff` in either direction is a surface which takes its size
         // from the swapchain rather than the other way round.
@@ -460,7 +494,7 @@ impl Swapchain {
             .image_usage(vk::ImageUsageFlags::TRANSFER_DST)
             .image_sharing_mode(vk::SharingMode::EXCLUSIVE)
             .pre_transform(capabilities.current_transform)
-            .composite_alpha(composite_alpha(&capabilities))
+            .composite_alpha(alpha)
             .present_mode(present_mode)
             .clipped(true)
             .old_swapchain(self.handle);
@@ -542,6 +576,14 @@ impl Swapchain {
         if let Some(composite) = self.composite.take() {
             self.gpu.destroy_image(composite);
         }
+        // A surface that cannot show premultiplied alpha is presented
+        // opaque, which the pass would only get wrong.
+        if alpha != vk::CompositeAlphaFlagsKHR::PRE_MULTIPLIED {
+            self.corners = None;
+        }
+        if let Some(corners) = self.corners.as_mut() {
+            corners.forget_output();
+        }
         Ok(())
     }
 
@@ -593,21 +635,27 @@ impl Swapchain {
     /// The image layers accumulate into, made on the first frame that needs
     /// one and kept in `GENERAL` for the same reason every other image in
     /// this crate is.
+    ///
+    /// With the corners pass, the composite is one the pass can read.
     fn composite(&mut self) -> Result<vk::Image, String> {
         if self.composite.is_none() {
-            let image = self.gpu.create_image(&ImageDescription {
-                image_type: vk::ImageType::TYPE_2D,
-                view_type: vk::ImageViewType::TYPE_2D,
-                format: self.format,
-                width: self.extent.width,
-                height: self.extent.height,
-                depth: 1,
-                levels: 1,
-                layers: 1,
-                samples: 1,
-                usage: gpu::USAGE_RENDER_TARGET,
-                cube: false,
-            })?;
+            let description = match self.corners {
+                Some(_) => corners::storage(self.extent.width, self.extent.height),
+                None => ImageDescription {
+                    image_type: vk::ImageType::TYPE_2D,
+                    view_type: vk::ImageViewType::TYPE_2D,
+                    format: self.format,
+                    width: self.extent.width,
+                    height: self.extent.height,
+                    depth: 1,
+                    levels: 1,
+                    layers: 1,
+                    samples: 1,
+                    usage: gpu::USAGE_RENDER_TARGET,
+                    cube: false,
+                },
+            };
+            let image = self.gpu.create_image(&description)?;
             // A fresh image's contents are undefined, and the frame that
             // brings the composite into existence has only the one layer
             // that asked for it - so everywhere the other layers have not
@@ -651,11 +699,19 @@ impl Swapchain {
         // One layer covering the window needs no accumulator: what it draws
         // is the whole of what the window shows, so it goes straight into the
         // image the presentation engine hands back.
-        let direct = self.layers.len() <= 1 && frame.covers_window() && regions.is_none();
+        // The corners pass reads the composite, so a window with it always
+        // has one.
+        let direct = self.layers.len() <= 1
+            && frame.covers_window()
+            && regions.is_none()
+            && self.corners.is_none();
         let composite = match direct {
             true => None,
             false => Some(self.composite()?),
         };
+        if let Some(corners) = self.corners.as_mut() {
+            corners.prepare(self.extent.width, self.extent.height)?;
+        }
 
         let slot = self.frame % self.frames.len().max(1);
         let this = &self.frames[slot];
@@ -774,21 +830,36 @@ impl Swapchain {
                             }
                         }
                     }
-                    // The blit above must land before the one below reads it.
-                    barrier(
-                        device,
-                        command_buffer,
-                        composite,
-                        vk::ImageLayout::GENERAL,
-                        vk::ImageLayout::GENERAL,
-                        vk::AccessFlags::TRANSFER_WRITE,
-                        vk::AccessFlags::TRANSFER_READ,
-                    );
+                    let shown = match &self.corners {
+                        Some(corners) => {
+                            let shape = corners::Shape::of(
+                                frame.window,
+                                self.extent.width,
+                                self.extent.height,
+                            );
+                            let image = self.composite.as_ref().expect("made above");
+                            corners.record(command_buffer, slot, image, shape)
+                        }
+                        None => {
+                            // The blit above must land before the one below
+                            // reads it.
+                            barrier(
+                                device,
+                                command_buffer,
+                                composite,
+                                vk::ImageLayout::GENERAL,
+                                vk::ImageLayout::GENERAL,
+                                vk::AccessFlags::TRANSFER_WRITE,
+                                vk::AccessFlags::TRANSFER_READ,
+                            );
+                            composite
+                        }
+                    };
                     transition_to_transfer_dst(device, command_buffer, target);
                     blit(
                         device,
                         command_buffer,
-                        composite,
+                        shown,
                         whole,
                         target,
                         vk::ImageLayout::TRANSFER_DST_OPTIMAL,

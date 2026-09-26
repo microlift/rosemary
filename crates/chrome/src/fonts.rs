@@ -201,7 +201,8 @@ impl LoadedFace {
 
 /// The parsed face at `path` and `index`, from the cache.
 pub fn load(path: &str, index: u32) -> Option<Arc<LoadedFace>> {
-    static CACHE: Mutex<Option<HashMap<(String, u32), Option<Arc<LoadedFace>>>>> = Mutex::new(None);
+    type Cache = HashMap<(String, u32), Option<Arc<LoadedFace>>>;
+    static CACHE: Mutex<Option<Cache>> = Mutex::new(None);
     let mut cache = CACHE.lock().unwrap_or_else(|e| e.into_inner());
     cache
         .get_or_insert_with(HashMap::new)

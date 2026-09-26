@@ -594,6 +594,9 @@ fn blit_to_window(
     let Some(window) = window else {
         return;
     };
+    // A window with room for rounded corners shows its surface's alpha, and
+    // a Mac's content never shows the guest's.
+    let opaque = sdl3::video::window_flags(window) & sdl3::video::flags::TRANSPARENT != 0;
     sdl3::video::present_window(window, |surface| {
         let rows = height.min(surface.height.max(0) as u32);
         let columns = width.min(surface.width.max(0) as u32) as usize;
@@ -609,6 +612,12 @@ fn blit_to_window(
                 // SAFETY: `columns * 4` bytes, from a slice of that length into
                 // a row which is at least `width * 4` bytes wide.
                 unsafe { std::ptr::copy_nonoverlapping(from.as_ptr(), to, columns * 4) };
+                if opaque {
+                    for column in 0..columns {
+                        // SAFETY: `column` is below `columns`, inside this row.
+                        unsafe { to.add(column * 4 + 3).write(0xff) };
+                    }
+                }
                 continue;
             }
             for (column, texel) in from.as_chunks::<4>().0.iter().enumerate() {

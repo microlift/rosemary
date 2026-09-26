@@ -119,12 +119,153 @@ pub(crate) fn build(builder: &mut dyn Builder, uid: Uid, class_name: &str) -> Op
         "NSWindowTemplate" => window_template(builder, uid),
         "NSCustomView" => custom_view(builder, uid),
         "NSView" => view(builder, uid, "NSView"),
+        "NSMenu" => menu(builder, uid),
+        "NSMenuItem" => menu_item(builder, uid),
         _ => None,
     }
 }
 
 /// The class names [`build`] decodes, for the report and for the tests.
-pub(crate) const DECODED: &[&str] = &["NSWindowTemplate", "NSCustomView", "NSView"];
+pub(crate) const DECODED: &[&str] = &[
+    "NSWindowTemplate",
+    "NSCustomView",
+    "NSView",
+    "NSMenu",
+    "NSMenuItem",
+];
+
+/// A boolean field, which an archive writes as a boolean or as an integer.
+fn flag(builder: &dyn Builder, uid: Uid, key: &str) -> Option<bool> {
+    match builder.archive().field(uid, key)? {
+        foundation::plist::Value::Bool(value) => Some(*value),
+        other => other.as_i64().map(|value| value != 0),
+    }
+}
+
+fn integer(builder: &dyn Builder, uid: Uid, key: &str) -> Option<i64> {
+    builder
+        .archive()
+        .field(uid, key)
+        .and_then(foundation::plist::Value::as_i64)
+}
+
+/// `NSMenu`. A menu named `_NSMainMenu` is the application's menu bar, which
+/// AppKit installs as it loads the main nib.
+fn menu(builder: &mut dyn Builder, uid: Uid) -> Option<Id> {
+    let Some(object) = allocate("NSMenu") else {
+        builder.note_missing("NSMenu");
+        return None;
+    };
+    let title = foundation::string::from_str(text(builder, uid, "NSTitle").unwrap_or(""));
+    // SAFETY: `-initWithTitle:` takes one object and returns the menu.
+    let menu = unsafe {
+        let f: unsafe extern "C" fn(Id, Sel, Id) -> Id = std::mem::transmute(objc::msg::entry());
+        f(object, objc::sel::get("initWithTitle:"), title)
+    };
+    objc::arc::release(title);
+    if menu.is_null() {
+        return None;
+    }
+    if flag(builder, uid, "NSNoAutoenable") == Some(true) {
+        // SAFETY: `-setAutoenablesItems:` takes one `BOOL`.
+        unsafe { send_flag(menu, "setAutoenablesItems:", false) };
+    }
+    if let Some(items) = builder.archive().field_object(uid, "NSMenuItems") {
+        for entry in builder.archive().array(items) {
+            if let Some(item) = builder.object_at(entry) {
+                // SAFETY: `-addItem:` takes one object.
+                unsafe { send_object(menu, "addItem:", item) };
+            }
+        }
+    }
+    let application = crate::application::shared();
+    let setter = match text(builder, uid, "NSName") {
+        Some("_NSMainMenu") => Some("setMainMenu:"),
+        Some("_NSWindowsMenu") => Some("setWindowsMenu:"),
+        Some("_NSServicesMenu") => Some("setServicesMenu:"),
+        _ => None,
+    };
+    if let Some(setter) = setter
+        && !application.is_null()
+    {
+        // SAFETY: each setter takes one menu.
+        unsafe { send_object(application, setter, menu) };
+    }
+    Some(menu)
+}
+
+/// `NSMenuItem`. The item's action usually arrives separately, as a control
+/// connection the loader applies.
+fn menu_item(builder: &mut dyn Builder, uid: Uid) -> Option<Id> {
+    let Some(object) = allocate("NSMenuItem") else {
+        builder.note_missing("NSMenuItem");
+        return None;
+    };
+    // SAFETY: `-init` is `id (id, SEL)`.
+    let item = unsafe {
+        let f: unsafe extern "C" fn(Id, Sel) -> Id = std::mem::transmute(objc::msg::entry());
+        f(object, objc::sel::get("init"))
+    };
+    if item.is_null() {
+        return None;
+    }
+    if flag(builder, uid, "NSIsSeparator") == Some(true) {
+        crate::menu::mark_separator(item);
+        return Some(item);
+    }
+    for (key, setter) in [
+        ("NSTitle", "setTitle:"),
+        ("NSKeyEquiv", "setKeyEquivalent:"),
+    ] {
+        if let Some(value) = text(builder, uid, key) {
+            let value = foundation::string::from_str(value);
+            // SAFETY: both setters take one string.
+            unsafe { send_object(item, setter, value) };
+            objc::arc::release(value);
+        }
+    }
+    for (key, setter) in [
+        ("NSKeyEquivModMask", "setKeyEquivalentModifierMask:"),
+        ("NSTag", "setTag:"),
+        ("NSState", "setState:"),
+        ("NSIndent", "setIndentationLevel:"),
+    ] {
+        if let Some(value) = integer(builder, uid, key) {
+            // SAFETY: each setter takes one integer.
+            unsafe { send_integer(item, setter, value as usize) };
+        }
+    }
+    for (key, setter, when) in [
+        ("NSIsDisabled", "setEnabled:", false),
+        ("NSIsHidden", "setHidden:", true),
+        ("NSIsAlternate", "setAlternate:", true),
+    ] {
+        if flag(builder, uid, key) == Some(true) {
+            // SAFETY: each setter takes one `BOOL`.
+            unsafe { send_flag(item, setter, when) };
+        }
+    }
+    if let Some(action) = text(builder, uid, "NSAction") {
+        // SAFETY: `-setAction:` takes one selector.
+        unsafe {
+            let f: unsafe extern "C" fn(Id, Sel, Sel) = std::mem::transmute(objc::msg::entry());
+            f(item, objc::sel::get("setAction:"), objc::sel::get(action));
+        }
+    }
+    if let Some(target) = builder.archive().field_object(uid, "NSTarget")
+        && let Some(target) = builder.object_at(target)
+    {
+        // SAFETY: `-setTarget:` takes one object.
+        unsafe { send_object(item, "setTarget:", target) };
+    }
+    if let Some(submenu) = builder.archive().field_object(uid, "NSSubmenu")
+        && let Some(submenu) = builder.object_at(submenu)
+    {
+        // SAFETY: `-setSubmenu:` takes one menu.
+        unsafe { send_object(item, "setSubmenu:", submenu) };
+    }
+    Some(item)
+}
 
 fn text<'a>(builder: &'a dyn Builder, uid: Uid, key: &str) -> Option<&'a str> {
     let value = builder.archive().field_object(uid, key)?;

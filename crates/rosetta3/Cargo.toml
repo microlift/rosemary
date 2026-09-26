@@ -22,6 +22,7 @@ sdl3.workspace = true
 corevideo.workspace = true
 coreaudio.workspace = true
 contacts.workspace = true
+avfoundation.workspace = true
 security.workspace = true
 gamecontroller.workspace = true
 webkit.workspace = true

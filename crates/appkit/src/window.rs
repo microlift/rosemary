@@ -45,6 +45,9 @@ pub struct Window {
     immovable: usize,
     /// `-setShowsToolbarButton:`.
     shows_toolbar_button: usize,
+    /// The chrome above the content the SDL window was last sized for, in
+    /// points; see [`content_inset`].
+    inset: CGFloat,
     /// The frame the guest last asked for, in AppKit's screen coordinates.
     ///
     /// Kept as well as asked of SDL because the two need not agree: a Wayland
@@ -88,6 +91,7 @@ pub const DID_END_LIVE_RESIZE: &str = "NSWindowDidEndLiveResizeNotification";
 mod style {
     pub const TITLED: usize = 1;
     pub const CLOSABLE: usize = 1 << 1;
+    pub const MINIATURIZABLE: usize = 1 << 2;
     pub const RESIZABLE: usize = 1 << 3;
 }
 
@@ -292,6 +296,7 @@ pub fn add_destroy_hook(hook: fn(sdl3::Window)) {
 /// Destroy an SDL window, telling everything keyed on it first.
 fn destroy_sdl_window(sdl: sdl3::Window) {
     crate::backing::forget_window(sdl);
+    crate::decor::destroyed(sdl);
     for hook in DESTROY_HOOKS
         .lock()
         .unwrap_or_else(|e| e.into_inner())
@@ -374,6 +379,90 @@ pub fn content_view_of(object: Id) -> Id {
     }
 }
 
+/// Whether `object` is an `NSPanel`, which gets a titlebar and no menu bar.
+fn is_panel(object: Id) -> bool {
+    // SAFETY: an object this runtime allocated, or a class.
+    unsafe { objc::object::class_of(object) }.is_some_and(|c| {
+        objc::class::lookup(c"NSPanel").is_some_and(|k| c.chain().any(|x| std::ptr::eq(x, k)))
+    })
+}
+
+/// The height of the chrome this runtime draws above a window's content, in
+/// points: the SDL window is the frame, and this much of its top is not the
+/// content view's.
+pub(crate) fn content_inset(object: Id) -> CGFloat {
+    // SAFETY: null or an object this runtime allocated.
+    if unsafe { sdl_window(object) }.is_null() {
+        return 0.0;
+    }
+    let window = window_of(object);
+    inset_of(object, window.style_mask, is_fullscreen(window.sdl))
+}
+
+fn inset_of(object: Id, style_mask: usize, fullscreen: bool) -> CGFloat {
+    crate::decor::inset_for(
+        crate::decor::config(),
+        style_mask & style::TITLED != 0,
+        is_panel(object),
+        fullscreen,
+    )
+}
+
+fn is_fullscreen(sdl: sdl3::Window) -> bool {
+    !sdl.is_null() && sdl3::video::window_flags(sdl) & sdl3::video::flags::FULLSCREEN != 0
+}
+
+/// What `crate::decor` draws a window's chrome from.
+pub(crate) fn facts(object: Id) -> Option<crate::decor::Facts> {
+    // SAFETY: null or an object this runtime allocated.
+    let sdl = unsafe { sdl_window(object) };
+    if sdl.is_null() || presentation_of_sdl(sdl) != Presentation::Toplevel {
+        return None;
+    }
+    let window = window_of(object);
+    let mask = window.style_mask;
+    Some(crate::decor::Facts {
+        sdl: sdl as usize,
+        titled: mask & style::TITLED != 0,
+        closable: mask & style::CLOSABLE != 0,
+        miniaturizable: mask & style::MINIATURIZABLE != 0,
+        resizable: mask & style::RESIZABLE != 0,
+        panel: is_panel(object),
+        fullscreen: is_fullscreen(sdl),
+        shown: window.shown != 0 && window.miniaturized == 0,
+        key: key_window() == object,
+        title: sdl3::video::window_title(sdl)
+            .to_string_lossy()
+            .into_owned(),
+    })
+}
+
+/// Give the content view the part of the window below the chrome, after the
+/// window or its chrome changed size.
+pub(crate) fn fit_content_view(object: Id) {
+    let window = window_of(object);
+    if window.sdl.is_null() || window.content_view.is_null() {
+        return;
+    }
+    let Some((width, height)) = sdl3::video::window_size(window.sdl) else {
+        return;
+    };
+    let frame = NSRect {
+        origin: NSPoint::default(),
+        size: NSSize {
+            width: f64::from(width),
+            height: (f64::from(height) - content_inset(object)).max(0.0),
+        },
+    };
+    // Sent rather than written, so a view that tracks its own size hears
+    // about it.
+    // SAFETY: `-setFrame:` is `void (id, SEL, NSRect)`.
+    unsafe {
+        let f: unsafe extern "C" fn(Id, Sel, NSRect) = std::mem::transmute(objc::msg::entry());
+        f(window.content_view, objc::sel::get("setFrame:"), frame);
+    }
+}
+
 /// A window's own first responder, nil when it has none - not the window
 /// itself, which is what `-firstResponder` answers then.
 pub fn first_responder_of(object: Id) -> Id {
@@ -418,6 +507,11 @@ unsafe extern "C" fn init_with_content_rect(
 ) -> Id {
     let window = window_of(receiver);
     window.style_mask = style_mask;
+    // The content rectangle grows upwards by the chrome, as a Mac's frame
+    // rectangle does: the SDL window is the whole frame.
+    let inset = inset_of(receiver, style_mask, false);
+    window.inset = inset;
+    let rect = frame_for_content(rect, inset);
     window.requested = rect;
 
     let flags = creation_flags(style_mask, Api::Undecided);
@@ -426,7 +520,7 @@ unsafe extern "C" fn init_with_content_rect(
         // A guest which sizes its first window to a fraction of the screen is
         // unusable in a headless or scripted session, where nothing can drag
         // it larger. This says how large every window it makes must be.
-        Some((forced_width, forced_height)) => (forced_width, forced_height),
+        Some((forced_width, forced_height)) => (forced_width, forced_height + inset.round() as i32),
         None => (width, height),
     };
     let title = crate::metadata::name();
@@ -528,10 +622,22 @@ fn creation_flags(style_mask: usize, api: Api) -> u64 {
     if style_mask & style::RESIZABLE != 0 {
         flags |= sdl3::video::flags::RESIZABLE;
     }
-    if style_mask & style::TITLED == 0 {
+    if style_mask & style::TITLED == 0 || draws_own_titlebar() {
         flags |= sdl3::video::flags::BORDERLESS;
     }
+    // Room for the chrome's rounded corners. Only on Wayland: an X11 window
+    // with alpha needs a compositing manager to be anything but black there,
+    // and its GL and Vulkan visuals would pass the guest's alpha through.
+    if style_mask & style::TITLED != 0 && draws_own_titlebar() && sdl3::video::is_wayland() {
+        flags |= sdl3::video::flags::TRANSPARENT;
+    }
     flags
+}
+
+/// Whether a titled window's titlebar is this runtime's rather than the
+/// window manager's.
+fn draws_own_titlebar() -> bool {
+    crate::decor::config().decorations == crate::decor::Decorations::Client
 }
 
 /// The graphics API a window is created for.
@@ -798,25 +904,56 @@ unsafe extern "C" fn convert_rect_to_screen(receiver: Id, sel: Sel, rect: NSRect
     }
 }
 
-/// `-contentRectForFrameRect:` and its inverse are the identity here.
-///
-/// SDL's window size is already the content size - the title bar is outside it -
-/// so the two rectangles AppKit distinguishes are the same one, and converting
-/// between them would subtract a title bar height this runtime does not know.
-unsafe extern "C" fn identity_rect(_receiver: Id, _sel: Sel, rect: NSRect) -> NSRect {
-    rect
+/// The frame that holds a content rectangle under `inset` of chrome.
+fn frame_for_content(rect: NSRect, inset: CGFloat) -> NSRect {
+    NSRect {
+        origin: rect.origin,
+        size: NSSize {
+            width: rect.size.width,
+            height: rect.size.height + inset,
+        },
+    }
 }
 
-/// The class-level spelling takes the style explicitly. Some older programs
-/// also send it to a window instance, so both method tables publish the same
-/// conversion.
-unsafe extern "C" fn identity_rect_style(
-    _receiver: Id,
+fn content_for_frame(rect: NSRect, inset: CGFloat) -> NSRect {
+    NSRect {
+        origin: rect.origin,
+        size: NSSize {
+            width: rect.size.width,
+            height: (rect.size.height - inset).max(0.0),
+        },
+    }
+}
+
+/// `-contentRectForFrameRect:`: the frame less the chrome this runtime draws
+/// above the content. With the host's decorations that is nothing, since the
+/// host's title bar is outside SDL's window.
+unsafe extern "C" fn content_rect_for_frame(receiver: Id, _sel: Sel, rect: NSRect) -> NSRect {
+    content_for_frame(rect, content_inset(receiver))
+}
+
+unsafe extern "C" fn frame_rect_for_content(receiver: Id, _sel: Sel, rect: NSRect) -> NSRect {
+    frame_for_content(rect, content_inset(receiver))
+}
+
+/// The spellings that take the style explicitly, on the class and - for some
+/// older programs - on an instance. A class has no fullscreen state to ask.
+unsafe extern "C" fn content_rect_for_frame_style(
+    receiver: Id,
     _sel: Sel,
     rect: NSRect,
-    _style_mask: usize,
+    style_mask: usize,
 ) -> NSRect {
-    rect
+    content_for_frame(rect, inset_of(receiver, style_mask, false))
+}
+
+unsafe extern "C" fn frame_rect_for_content_style(
+    receiver: Id,
+    _sel: Sel,
+    rect: NSRect,
+    style_mask: usize,
+) -> NSRect {
+    frame_for_content(rect, inset_of(receiver, style_mask, false))
 }
 
 unsafe extern "C" fn set_frame(receiver: Id, _sel: Sel, rect: NSRect) {
@@ -883,7 +1020,12 @@ unsafe extern "C" fn set_frame_origin(
 }
 
 unsafe extern "C" fn set_content_size(receiver: Id, _sel: Sel, size: NSSize) {
+    let inset = content_inset(receiver);
     let window = window_of(receiver);
+    let size = NSSize {
+        width: size.width,
+        height: size.height + inset,
+    };
     window.requested.size = size;
     let sdl = window.sdl;
     if !sdl.is_null() {
@@ -918,21 +1060,7 @@ unsafe extern "C" fn set_content_view(receiver: Id, _sel: Sel, view: Id) {
     if view.is_null() || window.sdl.is_null() {
         return;
     }
-    let (width, height) = sdl3::video::window_size(window.sdl).unwrap_or((0, 0));
-    let frame = NSRect {
-        origin: foundation::geometry::NSPoint::default(),
-        size: NSSize {
-            width: width as f64,
-            height: height as f64,
-        },
-    };
-    // Sent rather than written, so a view that tracks its own size - which a
-    // guest's `-setFrame:` override is for - hears about it.
-    // SAFETY: `-setFrame:` is `void (id, SEL, NSRect)`.
-    unsafe {
-        let f: unsafe extern "C" fn(Id, Sel, NSRect) = std::mem::transmute(objc::msg::entry());
-        f(view, objc::sel::get("setFrame:"), frame);
-    }
+    fit_content_view(receiver);
     // SAFETY: a view this crate made, now this window's.
     unsafe { crate::view::update_tracking_areas(view) };
 }
@@ -1121,9 +1249,13 @@ unsafe extern "C" fn dealloc(receiver: Id, sel: Sel) {
     objc::arc::finalize(receiver);
 }
 
+/// `-close`: the delegate hears `-windowWillClose:` while the window is still
+/// on screen, and the application then decides whether that was its last one.
 unsafe extern "C" fn close(receiver: Id, sel: Sel) {
+    crate::event::post_for(receiver, WILL_CLOSE);
     // SAFETY: `-orderOut:` is `void (id, SEL, id)`.
     unsafe { order_out(receiver, sel, std::ptr::null_mut()) };
+    crate::application::window_closed();
 }
 
 /// Consult the delegate before closing, falling back to the window itself.
@@ -1420,8 +1552,10 @@ fn apply_style(receiver: Id) {
     if sdl.is_null() || presentation_of_sdl(sdl) != Presentation::Toplevel {
         return;
     }
-    sdl3::video::set_window_bordered(sdl, window.style_mask & style::TITLED != 0);
+    let titled = window.style_mask & style::TITLED != 0;
+    sdl3::video::set_window_bordered(sdl, titled && !draws_own_titlebar());
     sdl3::video::set_window_always_on_top(sdl, window.level >= window_level::FLOATING);
+    refit_inset(receiver);
     // The resizable bit is the one that is not simply followed once the
     // window is on the screen. Qt clears it on a window for as long as a popup
     // of that window is open - QTBUG-30266, "a window should not be resizable
@@ -1436,6 +1570,28 @@ fn apply_style(receiver: Id) {
     if window.shown == 0 {
         sdl3::video::set_window_resizable(sdl, window.style_mask & style::RESIZABLE != 0);
     }
+}
+
+/// Keep the content the size it was when the chrome above it changes height
+/// - a window that gains or loses its titlebar, or goes full screen - by
+/// growing or shrinking the frame.
+pub(crate) fn refit_inset(receiver: Id) {
+    let inset = content_inset(receiver);
+    let window = window_of(receiver);
+    let (sdl, before) = (window.sdl, window.inset);
+    if sdl.is_null() || inset == before {
+        return;
+    }
+    window.inset = inset;
+    // A full-screen window's size is the screen's: nothing to keep.
+    if !is_fullscreen(sdl)
+        && let Some((width, height)) = sdl3::video::window_size(sdl)
+    {
+        let height = (f64::from(height) + inset - before).round() as i32;
+        window.requested.size.height += inset - before;
+        sdl3::video::set_window_size(sdl, width, height.max(1));
+    }
+    fit_content_view(receiver);
 }
 
 unsafe extern "C" fn collection_behavior(receiver: Id, _sel: Sel) -> usize {
@@ -1591,16 +1747,61 @@ unsafe extern "C" fn is_miniaturized(receiver: Id, _sel: Sel) -> u8 {
     (window_of(receiver).miniaturized != 0) as u8
 }
 
+/// `-miniaturize:`: the window manager's minimize, where it has one, and
+/// otherwise off the screen.
 unsafe extern "C" fn miniaturize(receiver: Id, sel: Sel, sender: Id) {
-    window_of(receiver).miniaturized = 1;
-    // SAFETY: `-orderOut:` is `void (id, SEL, id)`.
-    unsafe { order_out(receiver, sel, sender) };
+    let window = window_of(receiver);
+    window.miniaturized = 1;
+    if window.sdl.is_null() || !sdl3::video::minimize_window(window.sdl) {
+        // SAFETY: `-orderOut:` is `void (id, SEL, id)`.
+        unsafe { order_out(receiver, sel, sender) };
+    }
 }
 
 unsafe extern "C" fn deminiaturize(receiver: Id, sel: Sel, sender: Id) {
-    window_of(receiver).miniaturized = 0;
+    let window = window_of(receiver);
+    window.miniaturized = 0;
+    if !window.sdl.is_null() {
+        sdl3::video::restore_window(window.sdl);
+    }
     // SAFETY: `-makeKeyAndOrderFront:` is `void (id, SEL, id)`.
     unsafe { make_key_and_order_front(receiver, sel, sender) };
+}
+
+/// Follow the window manager minimizing or restoring a window, from the
+/// event pump; answers the notification to post, if any.
+pub(crate) fn window_state_changed(receiver: Id) -> Option<&'static str> {
+    let window = window_of(receiver);
+    if window.sdl.is_null() {
+        return None;
+    }
+    let flags = sdl3::video::window_flags(window.sdl);
+    let fullscreen = flags & sdl3::video::flags::FULLSCREEN != 0;
+    let entered = fullscreen != (window.fullscreen != 0);
+    window.fullscreen = fullscreen as usize;
+    let minimized = flags & sdl3::video::flags::MINIMIZED != 0;
+    let changed = minimized != (window.miniaturized != 0);
+    window.miniaturized = minimized as usize;
+    refit_inset(receiver);
+    match (changed, minimized, entered, fullscreen) {
+        (true, true, ..) => Some(DID_MINIATURIZE),
+        (true, false, ..) => Some(DID_DEMINIATURIZE),
+        (_, _, true, true) => Some(DID_ENTER_FULL_SCREEN),
+        (_, _, true, false) => Some(DID_EXIT_FULL_SCREEN),
+        _ => None,
+    }
+}
+
+/// `-zoom:`: the window manager's maximize, and back.
+unsafe extern "C" fn zoom(receiver: Id, _sel: Sel, _sender: Id) {
+    let window = window_of(receiver);
+    if window.sdl.is_null() || window.style_mask & style::RESIZABLE == 0 {
+        return;
+    }
+    match sdl3::video::window_flags(window.sdl) & sdl3::video::flags::MAXIMIZED != 0 {
+        true => sdl3::video::restore_window(window.sdl),
+        false => sdl3::video::maximize_window(window.sdl),
+    };
 }
 
 /// `-isZoomed`: whether the window fills its screen.
@@ -1669,8 +1870,6 @@ unsafe extern "C" fn window_number(receiver: Id, _sel: Sel) -> isize {
 unsafe extern "C" fn ignored_flag(_receiver: Id, _sel: Sel, _flag: u8) {}
 
 unsafe extern "C" fn ignored(_receiver: Id, _sel: Sel) {}
-
-unsafe extern "C" fn ignored_object(_receiver: Id, _sel: Sel, _object: Id) {}
 
 unsafe extern "C" fn ignored_size(_receiver: Id, _sel: Sel, _size: NSSize) {}
 
@@ -1741,9 +1940,9 @@ pub(crate) fn install() {
     class_methods!(class, {
         "windowNumberAtPoint:belowWindowWithWindowNumber:" => window_number_at_point,
             c"q40@0:8{CGPoint=dd}16q32";
-        "contentRectForFrameRect:styleMask:" => identity_rect_style,
+        "contentRectForFrameRect:styleMask:" => content_rect_for_frame_style,
             c"{CGRect={CGPoint=dd}{CGSize=dd}}56@0:8{CGRect={CGPoint=dd}{CGSize=dd}}16Q48";
-        "frameRectForContentRect:styleMask:" => identity_rect_style,
+        "frameRectForContentRect:styleMask:" => frame_rect_for_content_style,
             c"{CGRect={CGPoint=dd}{CGSize=dd}}56@0:8{CGRect={CGPoint=dd}{CGSize=dd}}16Q48";
     });
     methods!(class, {
@@ -1752,13 +1951,13 @@ pub(crate) fn install() {
         "initWithContentRect:styleMask:backing:defer:screen:" => init_with_content_rect_screen,
             c"@80@0:8{CGRect={CGPoint=dd}{CGSize=dd}}16Q48Q56c64@72";
         "frame" => frame, c"{CGRect={CGPoint=dd}{CGSize=dd}}16@0:8";
-        "contentRectForFrameRect:" => identity_rect,
+        "contentRectForFrameRect:" => content_rect_for_frame,
             c"{CGRect={CGPoint=dd}{CGSize=dd}}48@0:8{CGRect={CGPoint=dd}{CGSize=dd}}16";
-        "frameRectForContentRect:" => identity_rect,
+        "frameRectForContentRect:" => frame_rect_for_content,
             c"{CGRect={CGPoint=dd}{CGSize=dd}}48@0:8{CGRect={CGPoint=dd}{CGSize=dd}}16";
-        "contentRectForFrameRect:styleMask:" => identity_rect_style,
+        "contentRectForFrameRect:styleMask:" => content_rect_for_frame_style,
             c"{CGRect={CGPoint=dd}{CGSize=dd}}56@0:8{CGRect={CGPoint=dd}{CGSize=dd}}16Q48";
-        "frameRectForContentRect:styleMask:" => identity_rect_style,
+        "frameRectForContentRect:styleMask:" => frame_rect_for_content_style,
             c"{CGRect={CGPoint=dd}{CGSize=dd}}56@0:8{CGRect={CGPoint=dd}{CGSize=dd}}16Q48";
         "setFrame:" => set_frame, c"v48@0:8{CGRect={CGPoint=dd}{CGSize=dd}}16";
         "setFrame:display:" => set_frame_display, c"v52@0:8{CGRect={CGPoint=dd}{CGSize=dd}}16c48";
@@ -1793,6 +1992,8 @@ pub(crate) fn install() {
         "isKeyWindow" => is_key_window, c"c16@0:8";
         "isMainWindow" => is_key_window, c"c16@0:8";
         "isVisible" => is_visible, c"c16@0:8";
+        // No window is ever attached as a sheet: nothing implements -beginSheet:.
+        "isSheet" => no, c"c16@0:8";
         "screen" => screen, c"@16@0:8";
         "backingScaleFactor" => backing_scale_factor, c"d16@0:8";
         "backgroundColor" => background_color, c"@16@0:8";
@@ -1854,8 +2055,8 @@ pub(crate) fn install() {
         "setContentAspectRatio:" => ignored_size, c"v32@0:8{CGSize=dd}16";
         "setAspectRatio:" => ignored_size, c"v32@0:8{CGSize=dd}16";
         "setContentResizeIncrements:" => ignored_size, c"v32@0:8{CGSize=dd}16";
-        "zoom:" => ignored_object, c"v24@0:8@16";
-        "performZoom:" => ignored_object, c"v24@0:8@16";
+        "zoom:" => zoom, c"v24@0:8@16";
+        "performZoom:" => zoom, c"v24@0:8@16";
         "miniaturize:" => miniaturize, c"v24@0:8@16";
         "performMiniaturize:" => miniaturize, c"v24@0:8@16";
         "deminiaturize:" => deminiaturize, c"v24@0:8@16";
@@ -2114,6 +2315,35 @@ mod tests {
         }
     }
 
+    #[test]
+    fn close_tells_the_delegate_the_window_will_close() {
+        crate::bootstrap();
+        static TOLD: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        unsafe extern "C" fn will_close(_receiver: Id, _sel: Sel, notification: Id) {
+            assert!(!notification.is_null());
+            TOLD.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        let class =
+            objc::class::allocate_pair(objc::class::lookup(c"NSObject"), c"WillCloseDelegate", 0)
+                .unwrap();
+        class.add_method(
+            objc::sel::get("windowWillClose:"),
+            will_close as objc::class::Imp,
+            c"v24@0:8@16",
+        );
+        objc::class::register_pair(class);
+        let window = objc::object::create_instance(objc::class::lookup(c"NSWindow").unwrap(), 0);
+        window_of(window).delegate = objc::object::create_instance(class, 0);
+        window_of(window).shown = 1;
+        // SAFETY: a live runtime window; `-close` is `void (id, SEL)`.
+        unsafe {
+            let send: unsafe extern "C" fn(Id, Sel) = std::mem::transmute(objc::msg::entry());
+            send(window, objc::sel::get("close"));
+        }
+        assert_eq!(TOLD.load(std::sync::atomic::Ordering::Relaxed), 1);
+        assert_eq!(window_of(window).shown, 0);
+    }
+
     static REDIRECT: std::sync::Mutex<(usize, usize)> = std::sync::Mutex::new((0, 0));
 
     unsafe extern "C" fn redirecting_become(_receiver: Id, _sel: Sel) -> u8 {
@@ -2155,7 +2385,11 @@ mod tests {
         // The rest of the mapping is unchanged by any of it.
         let api = Api::Undecided;
         assert_ne!(creation_flags(style::RESIZABLE, api) & flags::RESIZABLE, 0);
-        assert_eq!(creation_flags(style::TITLED, api) & flags::BORDERLESS, 0);
+        assert_eq!(
+            creation_flags(style::TITLED, api) & flags::BORDERLESS != 0,
+            draws_own_titlebar(),
+            "a titled window is bordered exactly when the host draws its titlebar"
+        );
         assert_ne!(creation_flags(0, api) & flags::BORDERLESS, 0);
         assert_ne!(creation_flags(0, api) & flags::HIDDEN, 0);
     }
@@ -2224,6 +2458,54 @@ mod tests {
         // Asking twice is not two rebuilds.
         assert!(rebuild_for_opengl(object));
         assert_eq!(unsafe { sdl_window(object) }, after);
+    }
+
+    /// Under this runtime's own titlebar the SDL window is the frame, and the
+    /// content rectangle a window was made with is what its content view
+    /// gets - the two conversions agreeing on the difference.
+    #[test]
+    fn a_titled_window_is_its_content_plus_the_chrome() {
+        crate::bootstrap();
+        let object =
+            objc::object::create_instance(objc::class::lookup(c"NSWindow").expect("NSWindow"), 0);
+        let content = NSRect {
+            origin: NSPoint { x: 40.0, y: 60.0 },
+            size: NSSize {
+                width: 400.0,
+                height: 300.0,
+            },
+        };
+        // SAFETY: a fresh window this test made.
+        if !unsafe { init_with_content_rect_for_tests(object, content) } {
+            return;
+        }
+        let inset = content_inset(object);
+        assert_eq!(
+            inset,
+            crate::decor::inset_for(crate::decor::config(), true, false, false)
+        );
+        // SAFETY: a window this test made.
+        let sdl = unsafe { sdl_window(object) };
+        let (_, height) = sdl3::video::window_size(sdl).expect("a window");
+        assert_eq!(f64::from(height), 300.0 + inset);
+
+        // SAFETY: both conversions are `NSRect (id, SEL, NSRect)`.
+        let (frame, back) = unsafe {
+            let frame =
+                frame_rect_for_content(object, objc::sel::get("frameRectForContentRect:"), content);
+            let back =
+                content_rect_for_frame(object, objc::sel::get("contentRectForFrameRect:"), frame);
+            (frame, back)
+        };
+        assert_eq!(frame.size.height, 300.0 + inset);
+        assert_eq!(frame.origin, content.origin, "the frame grows upwards");
+        assert_eq!(back, content);
+
+        let view =
+            objc::object::create_instance(objc::class::lookup(c"NSView").expect("NSView"), 0);
+        // SAFETY: `-setContentView:` is `void (id, SEL, id)`.
+        unsafe { set_content_view(object, objc::sel::get("setContentView:"), view) };
+        assert_eq!(crate::view::frame_of(view).size.height, 300.0);
     }
 
     #[test]

@@ -3,7 +3,7 @@
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
-use super::kern::{KERN_INVALID_ARGUMENT, KERN_SUCCESS};
+use super::kern::{KERN_FAILURE, KERN_INVALID_ARGUMENT, KERN_SUCCESS};
 use super::space::{HOST_SELF, Name, TASK_SELF};
 
 const TASK_THREAD_TIMES_INFO: i32 = 3;
@@ -526,6 +526,212 @@ pub unsafe extern "C" fn host_statistics64(
     }
 }
 
+const HOST_BASIC_INFO: i32 = 1;
+const HOST_SCHED_INFO: i32 = 3;
+const HOST_PRIORITY_INFO: i32 = 5;
+const HOST_PREFERRED_USER_ARCH: i32 = 12;
+
+/// How many words of [`HostBasicInfo`] predate the CPU counts and `max_mem`.
+///
+/// Callers built against old headers pass this count, and the kernel still
+/// answers them with the prefix they know about.
+const HOST_BASIC_INFO_OLD_COUNT: u32 = 5;
+
+/// `host_basic_info_data_t`.
+#[repr(C, packed(4))]
+#[derive(Clone, Copy, Default)]
+struct HostBasicInfo {
+    max_cpus: i32,
+    avail_cpus: i32,
+    memory_size: u32,
+    cpu_type: i32,
+    cpu_subtype: i32,
+    cpu_threadtype: i32,
+    physical_cpu: i32,
+    physical_cpu_max: i32,
+    logical_cpu: i32,
+    logical_cpu_max: i32,
+    max_mem: u64,
+}
+
+/// `host_sched_info_data_t`, both in milliseconds.
+#[repr(C, packed(4))]
+#[derive(Clone, Copy, Default)]
+struct HostSchedInfo {
+    min_timeout: i32,
+    min_quantum: i32,
+}
+
+/// `host_priority_info_data_t`.
+#[repr(C, packed(4))]
+#[derive(Clone, Copy, Default)]
+struct HostPriorityInfo {
+    kernel_priority: i32,
+    system_priority: i32,
+    server_priority: i32,
+    user_priority: i32,
+    depress_priority: i32,
+    idle_priority: i32,
+    minimum_priority: i32,
+    maximum_priority: i32,
+}
+
+/// `host_preferred_user_arch_data_t`.
+#[repr(C, packed(4))]
+#[derive(Clone, Copy, Default)]
+struct HostPreferredUserArch {
+    cpu_type: i32,
+    cpu_subtype: i32,
+}
+
+const _: () = {
+    assert!(size_of::<HostBasicInfo>() == 48);
+    assert!(std::mem::offset_of!(HostBasicInfo, max_mem) == 40);
+    assert!(size_of::<HostPriorityInfo>() == 32);
+};
+
+/// Physical cores, counted as distinct sibling sets in sysfs.
+///
+/// Falls back to the logical count when sysfs is not there to ask, which is
+/// what a machine without SMT would answer anyway.
+fn physical_cores(logical: i32) -> i32 {
+    let Ok(entries) = std::fs::read_dir("/sys/devices/system/cpu") else {
+        return logical;
+    };
+    let mut cores = std::collections::BTreeSet::new();
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(index) = name.to_str().and_then(|n| n.strip_prefix("cpu")) else {
+            continue;
+        };
+        if index.is_empty() || !index.bytes().all(|b| b.is_ascii_digit()) {
+            continue;
+        }
+        if let Ok(siblings) =
+            std::fs::read_to_string(entry.path().join("topology/thread_siblings_list"))
+        {
+            cores.insert(siblings.trim().to_string());
+        }
+    }
+    match cores.len() {
+        0 => logical,
+        n => (n as i32).min(logical),
+    }
+}
+
+fn host_basic_info() -> HostBasicInfo {
+    let arch = crate::sysctl::guest_arch();
+    let logical = crate::sysctl::ncpu() as i32;
+    // SAFETY: `sysconf` reads a count and touches no memory of ours.
+    let configured = (unsafe { libc::sysconf(libc::_SC_NPROCESSORS_CONF) } as i32).max(logical);
+    let physical = physical_cores(logical);
+    let max_mem = crate::sysctl::memsize();
+    HostBasicInfo {
+        max_cpus: configured,
+        avail_cpus: logical,
+        // `natural_t`, which XNU clamps at 2 GiB; `max_mem` is the real figure.
+        memory_size: max_mem.min(0x8000_0000) as u32,
+        cpu_type: arch.cpu_type(),
+        cpu_subtype: arch.cpu_subtype(),
+        // `CPU_THREADTYPE_INTEL_HTT` when an Intel part has more threads than
+        // cores; XNU reports no thread type for anything else.
+        cpu_threadtype: i32::from(arch == crate::sysctl::GuestArch::X86_64 && logical > physical),
+        physical_cpu: physical,
+        physical_cpu_max: physical,
+        logical_cpu: logical,
+        logical_cpu_max: configured,
+        max_mem,
+    }
+}
+
+/// `kern_return_t host_info(host_t, host_flavor_t, host_info_t,
+/// mach_msg_type_number_t *)`
+///
+/// # Safety
+///
+/// As [`task_info`]: `out` is writable for `*count` words.
+pub unsafe extern "C" fn host_info(
+    host: Name,
+    flavor: i32,
+    out: *mut c_void,
+    count: *mut u32,
+) -> i32 {
+    if out.is_null() || count.is_null() || host != HOST_SELF {
+        return KERN_INVALID_ARGUMENT;
+    }
+    match flavor {
+        HOST_BASIC_INFO => {
+            // SAFETY: the caller states `count` is readable.
+            let available = unsafe { *count };
+            if available < HOST_BASIC_INFO_OLD_COUNT {
+                return KERN_FAILURE;
+            }
+            let info = host_basic_info();
+            if available as usize * size_of::<u32>() >= size_of::<HostBasicInfo>() {
+                // SAFETY: the caller's obligation, checked against the size.
+                return unsafe { publish(info, out, count) };
+            }
+            // The old layout is a prefix of the new one.
+            // SAFETY: the caller's buffer holds at least the old count of
+            // words, which is all that is written.
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    (&raw const info).cast::<u8>(),
+                    out.cast::<u8>(),
+                    HOST_BASIC_INFO_OLD_COUNT as usize * size_of::<u32>(),
+                );
+                *count = HOST_BASIC_INFO_OLD_COUNT;
+            }
+            KERN_SUCCESS
+        }
+        // XNU answers both with its standard quantum, 10 ms.
+        HOST_SCHED_INFO => unsafe {
+            publish(
+                HostSchedInfo {
+                    min_timeout: 10,
+                    min_quantum: 10,
+                },
+                out,
+                count,
+            )
+        },
+        // XNU's band boundaries from `<kern/sched.h>`. Darwin priorities are
+        // not this host's nice values, so these are the constants a caller
+        // compares its own `thread_policy` numbers against.
+        HOST_PRIORITY_INFO => unsafe {
+            publish(
+                HostPriorityInfo {
+                    kernel_priority: 80,
+                    system_priority: 80,
+                    server_priority: 64,
+                    user_priority: 31,
+                    depress_priority: 0,
+                    idle_priority: 0,
+                    minimum_priority: 0,
+                    maximum_priority: 79,
+                },
+                out,
+                count,
+            )
+        },
+        HOST_PREFERRED_USER_ARCH => {
+            let arch = crate::sysctl::guest_arch();
+            // SAFETY: the caller's obligation, checked against the size.
+            unsafe {
+                publish(
+                    HostPreferredUserArch {
+                        cpu_type: arch.cpu_type(),
+                        cpu_subtype: arch.cpu_subtype(),
+                    },
+                    out,
+                    count,
+                )
+            }
+        }
+        _ => KERN_INVALID_ARGUMENT,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -712,5 +918,95 @@ mod tests {
             },
             KERN_INVALID_ARGUMENT
         );
+    }
+
+    #[test]
+    fn host_basic_info_describes_the_guests_machine() {
+        let mut info = [0u8; size_of::<HostBasicInfo>()];
+        let mut count = (info.len() / 4) as u32;
+        // SAFETY: a buffer this test sized, and a live count.
+        let rc = unsafe {
+            host_info(
+                HOST_SELF,
+                HOST_BASIC_INFO,
+                info.as_mut_ptr().cast(),
+                &raw mut count,
+            )
+        };
+        assert_eq!(rc, KERN_SUCCESS);
+        assert_eq!(count, 12);
+        let at = |offset: usize| {
+            i32::from_le_bytes(info[offset..offset + 4].try_into().expect("four bytes"))
+        };
+        assert!(at(4) >= 1, "at least one CPU is available");
+        assert!(at(0) >= at(4), "max covers available");
+        assert_eq!(at(12), crate::sysctl::guest_arch().cpu_type());
+        assert!(
+            at(24) >= 1 && at(24) <= at(32),
+            "cores do not outnumber threads"
+        );
+        assert_eq!(word(&info, 40), crate::sysctl::memsize());
+    }
+
+    #[test]
+    fn host_basic_info_answers_an_old_count_with_the_old_prefix() {
+        let mut info = [0xAAu8; size_of::<HostBasicInfo>()];
+        let mut count = HOST_BASIC_INFO_OLD_COUNT;
+        // SAFETY: the buffer is larger than the count claims.
+        let rc = unsafe {
+            host_info(
+                HOST_SELF,
+                HOST_BASIC_INFO,
+                info.as_mut_ptr().cast(),
+                &raw mut count,
+            )
+        };
+        assert_eq!(rc, KERN_SUCCESS);
+        assert_eq!(count, HOST_BASIC_INFO_OLD_COUNT);
+        assert!(
+            info[20..].iter().all(|b| *b == 0xAA),
+            "nothing past the old layout"
+        );
+
+        let mut count = HOST_BASIC_INFO_OLD_COUNT - 1;
+        // SAFETY: as above.
+        let rc = unsafe {
+            host_info(
+                HOST_SELF,
+                HOST_BASIC_INFO,
+                info.as_mut_ptr().cast(),
+                &raw mut count,
+            )
+        };
+        assert_eq!(rc, KERN_FAILURE);
+    }
+
+    #[test]
+    fn host_info_refuses_what_it_does_not_answer() {
+        let mut info = [0u8; 64];
+        let mut count = (info.len() / 4) as u32;
+        // SAFETY: a buffer this test sized, and a live count.
+        let ask = |host, flavor, count: &mut u32, info: &mut [u8; 64]| unsafe {
+            host_info(host, flavor, info.as_mut_ptr().cast(), count)
+        };
+        assert_eq!(
+            ask(HOST_SELF, 999, &mut count, &mut info),
+            KERN_INVALID_ARGUMENT
+        );
+        assert_eq!(
+            ask(TASK_SELF, HOST_BASIC_INFO, &mut count, &mut info),
+            KERN_INVALID_ARGUMENT,
+            "a task port is not the host"
+        );
+        let mut small = 1;
+        assert_eq!(
+            ask(HOST_SELF, HOST_PRIORITY_INFO, &mut small, &mut info),
+            KERN_INVALID_ARGUMENT
+        );
+        assert_eq!(
+            ask(HOST_SELF, HOST_PREFERRED_USER_ARCH, &mut count, &mut info),
+            KERN_SUCCESS
+        );
+        assert_eq!(count, 2);
     }
 }

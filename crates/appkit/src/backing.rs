@@ -116,6 +116,9 @@ struct WindowState {
     damage: Rect,
     placed: Vec<(usize, Rect)>,
     holes: Vec<Hole>,
+    /// The generation of `crate::decor`'s chrome last copied in, zero for
+    /// none.
+    chrome: u64,
 }
 
 static WINDOWS: Mutex<Option<HashMap<usize, WindowState>>> = Mutex::new(None);
@@ -443,6 +446,7 @@ pub(crate) fn display_view(view: Id) {
 
 /// Draw everything marked for display and present every window that changed.
 pub fn pump() {
+    crate::decor::pump();
     for window in crate::window::all() {
         if !crate::window::is_shown(window) {
             continue;
@@ -521,12 +525,13 @@ fn place_tree(window: Id, sdl: sdl3::Window) -> Vec<Placed> {
         height: i64::from(pixel_height),
     };
     let content = crate::window::content_view_of(window);
-    // The window's base coordinates: not flipped, origin at the bottom.
+    // The window's base coordinates: not flipped, origin at the bottom, and
+    // taller than the content by the chrome above it.
     let base = NSRect {
         origin: NSPoint::default(),
         size: NSSize {
             width: f64::from(points_wide),
-            height: f64::from(points_high),
+            height: (f64::from(points_high) - crate::window::content_inset(window)).max(0.0),
         },
     };
     let geometry = Geometry {
@@ -621,7 +626,9 @@ fn compose_window(window: Id) {
     let composed_before = stores
         .as_ref()
         .is_some_and(|stores| stores.contains_key(&(sdl as usize)));
-    if !composed_before && holes.is_empty() {
+    // A window with chrome always has something of its own to show.
+    let chrome = crate::decor::pixels(sdl);
+    if !composed_before && holes.is_empty() && chrome.is_none() {
         let views = VIEW_STORES.lock().unwrap_or_else(|e| e.into_inner());
         let drawn = views.as_ref().is_some_and(|views| {
             placed
@@ -673,9 +680,16 @@ fn compose_window(window: Id) {
             .zip(&holes)
             .any(|(a, b)| a.layer != b.layer || a.rect != b.rect);
     state.holes = holes;
+    let chrome_generation = chrome.as_ref().map_or(0, |chrome| chrome.generation);
+    let chrome_changed =
+        std::mem::replace(&mut state.chrome, chrome_generation) != chrome_generation;
     drop(windows);
     let region = region.intersection(&whole);
     if region.is_empty() {
+        if let Some(chrome) = chrome.as_ref().filter(|_| chrome_changed || resized) {
+            copy_chrome(store, chrome);
+            store.dirty = true;
+        }
         if holes_changed {
             store.dirty = true;
         }
@@ -701,7 +715,46 @@ fn compose_window(window: Id) {
             );
         }
     }
+    if let Some(chrome) = &chrome {
+        copy_chrome(store, chrome);
+    }
     store.dirty = true;
+}
+
+/// Put a window's chrome over the top rows of its store.
+fn copy_chrome(store: &mut Store, chrome: &crate::decor::Pixels) {
+    let columns = store.width.min(chrome.width) as usize;
+    for row in 0..store.height.min(chrome.height) as usize {
+        let from = row * chrome.width as usize * 4;
+        let to = row * store.width as usize * 4;
+        store.pixels[to..to + columns * 4]
+            .copy_from_slice(&chrome.pixels[from..from + columns * 4]);
+    }
+}
+
+/// Present a window's store again at the next pump, without recomposing it:
+/// for a presenter that lost what it last showed.
+pub fn present_again(sdl: sdl3::Window) {
+    let mut stores = STORES.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(store) = stores
+        .as_mut()
+        .and_then(|stores| stores.get_mut(&(sdl as usize)))
+    {
+        store.dirty = true;
+    }
+}
+
+/// Have a window's chrome composited again, from `crate::decor` when it
+/// repaints it.
+pub(crate) fn chrome_changed(sdl: sdl3::Window) {
+    let mut windows = WINDOWS.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(state) = windows
+        .as_mut()
+        .and_then(|windows| windows.get_mut(&(sdl as usize)))
+    {
+        // Zero is "none", so any real generation differs from it.
+        state.chrome = 0;
+    }
 }
 
 /// Draw `source` with its top-left corner at `left`, `top` of `store`,
@@ -776,6 +829,8 @@ fn present_dirty() {
         if crate::window::draws_with_opengl(window) {
             continue;
         }
+        let transparent = sdl3::video::window_flags(window) & sdl3::video::flags::TRANSPARENT != 0;
+        let chrome = crate::decor::pixels(window).filter(|_| transparent);
         sdl3::video::present_window(window, |surface| {
             let rows = store.height.min(surface.height.max(0) as u32) as usize;
             let columns = store.width.min(surface.width.max(0) as u32) as usize;
@@ -790,8 +845,36 @@ fn present_dirty() {
                     )
                 };
             }
+            if transparent && rows > 0 && columns > 0 {
+                // SAFETY: SDL reported `pitch` bytes per row for `height` rows.
+                let pixels = unsafe {
+                    std::slice::from_raw_parts_mut(surface.pixels, surface.pitch as usize * rows)
+                };
+                let pitch = surface.pitch as usize;
+                let chrome_rows = chrome.as_ref().map_or(0, |chrome| chrome.height as usize);
+                make_opaque(pixels, columns, rows, pitch, chrome_rows);
+                if let Some(chrome) = chrome.as_ref().filter(|chrome| chrome.radius > 0.0) {
+                    chrome::corners::clip(pixels, columns, rows, pitch, chrome.radius, false, true);
+                }
+            }
             rows > 0 && columns > 0
         });
+    }
+}
+
+/// Give every pixel from row `from` down full alpha.
+///
+/// A window with room for rounded corners shows its alpha, which a Mac's
+/// window content never does: what no view drew is transparent in the
+/// store, and there it would be a hole through to the desktop. Premultiplied
+/// pixels given full alpha are as if drawn over black, which is what an
+/// opaque window shows for them too.
+fn make_opaque(pixels: &mut [u8], width: usize, height: usize, pitch: usize, from: usize) {
+    for row in from..height {
+        let start = row * pitch;
+        for pixel in pixels[start..start + width * 4].as_chunks_mut::<4>().0 {
+            pixel[3] = 255;
+        }
     }
 }
 

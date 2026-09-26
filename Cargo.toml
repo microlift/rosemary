@@ -18,12 +18,14 @@ foundation = { path = "crates/foundation" }
 sdl3 = { path = "crates/sdl3" }
 iokit = { path = "crates/iokit" }
 appkit = { path = "crates/appkit" }
+chrome = { path = "crates/chrome" }
 applicationservices = { path = "crates/applicationservices" }
 coreservices = { path = "crates/coreservices" }
 audiotoolbox = { path = "crates/audiotoolbox" }
 corevideo = { path = "crates/corevideo" }
 coreaudio = { path = "crates/coreaudio" }
 contacts = { path = "crates/contacts" }
+avfoundation = { path = "crates/avfoundation" }
 security = { path = "crates/security" }
 gamecontroller = { path = "crates/gamecontroller" }
 webkit = { path = "crates/webkit" }

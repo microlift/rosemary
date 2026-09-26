@@ -27,6 +27,13 @@ fn bundled() -> Option<&'static Bitmap> {
     .as_ref()
 }
 
+/// The application's icon: what `-setApplicationIconImage:` set, else the
+/// bundle's.
+pub fn current() -> Option<Bitmap> {
+    let replacement = REPLACEMENT.lock().unwrap_or_else(|e| e.into_inner());
+    replacement.as_ref().or_else(|| bundled()).cloned()
+}
+
 /// Give `window` the application's icon, if there is one.
 pub fn apply(window: sdl3::Window) {
     let replacement = REPLACEMENT.lock().unwrap_or_else(|e| e.into_inner());

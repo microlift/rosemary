@@ -195,7 +195,7 @@ unsafe extern "C" fn current_modifier_flags(_class: Id, _sel: Sel) -> u64 {
 /// What an event is made of, named rather than positional: eleven fields of
 /// which most are zero for any one event, and a builder is how a caller says
 /// which.
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct Fields {
     pub kind: u64,
     pub modifiers: u64,

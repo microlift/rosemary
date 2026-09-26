@@ -1,0 +1,11 @@
+[package]
+name = "avfoundation"
+description = "Minimal reimplementation of the AVFoundation framework"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+objc.workspace = true
+corefoundation.workspace = true
+foundation.workspace = true

@@ -25,6 +25,7 @@ const DENY_EXACT: &[&str] = &[
     // The image list is the host's, and answering with it makes the guest
     // believe it is running as this process.
     "__dyld_get_image_header",
+    "__NSGetMachExecuteHeader",
     "__dyld_image_count",
 ];
 

@@ -30,16 +30,20 @@ pub(super) fn choose_present_mode(modes: &[vk::PresentModeKHR]) -> vk::PresentMo
     }
 }
 
-/// `OPAQUE` where the surface offers it, which is what a game's window is.
+/// `OPAQUE` where the surface offers it, which is what a game's window is -
+/// unless the window's corners are to be `see_through`, which takes
+/// `PRE_MULTIPLIED` wherever it is offered.
 pub(super) fn composite_alpha(
     capabilities: &vk::SurfaceCapabilitiesKHR,
+    see_through: bool,
 ) -> vk::CompositeAlphaFlagsKHR {
-    for candidate in [
+    let wanted = see_through.then_some(vk::CompositeAlphaFlagsKHR::PRE_MULTIPLIED);
+    for candidate in wanted.into_iter().chain([
         vk::CompositeAlphaFlagsKHR::OPAQUE,
         vk::CompositeAlphaFlagsKHR::INHERIT,
         vk::CompositeAlphaFlagsKHR::PRE_MULTIPLIED,
         vk::CompositeAlphaFlagsKHR::POST_MULTIPLIED,
-    ] {
+    ]) {
         if capabilities.supported_composite_alpha.contains(candidate) {
             return candidate;
         }

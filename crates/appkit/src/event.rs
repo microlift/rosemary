@@ -25,6 +25,7 @@ pub fn pump(app: Id) {
     for hook in PUMP_HOOKS.lock().unwrap_or_else(|e| e.into_inner()).clone() {
         hook();
     }
+    crate::application::check_last_window_closed();
     crate::backing::pump();
 }
 
@@ -214,6 +215,9 @@ fn trace_views() {
 
 pub(crate) fn deliver(event: sdl3::video::Event) {
     use sdl3::video::Event;
+    if crate::dialog::deliver(&event) {
+        return;
+    }
     match event {
         // A quit is the whole application, and is the one event that is not
         // about a window: it is what a program's `-applicationShouldTerminate:`
@@ -231,34 +235,42 @@ pub(crate) fn deliver(event: sdl3::video::Event) {
                 }
             }
         }
+        // The compositor's close button, or its shortcut, which is what the
+        // title bar's close button is on a Mac: `-performClose:`, so the
+        // delegate may refuse and `-close` does the rest.
         Event::WindowClosed { window } => {
-            post(window, window::WILL_CLOSE);
+            if crate::decor::window_closed(window) {
+                return;
+            }
+            let object = object_for(window);
+            if !object.is_null() {
+                // SAFETY: `-performClose:` is `void (id, SEL, id)` on a window
+                // this crate made.
+                unsafe {
+                    let f: unsafe extern "C" fn(Id, objc::sel::Sel, Id) =
+                        std::mem::transmute(objc::msg::entry());
+                    f(object, objc::sel::get("performClose:"), object);
+                }
+            }
         }
-        Event::WindowResized {
-            window,
-            width,
-            height,
-        } => {
+        Event::WindowHitTest { window } => crate::decor::hit_test_pressed(window),
+        Event::WindowState { window } => {
+            let object = object_for(window);
+            if !object.is_null()
+                && let Some(name) = window::window_state_changed(object)
+            {
+                post(window, name);
+            }
+        }
+        Event::WindowResized { window, .. } => {
             // The content view follows the window, as it does on
             // `-setContentView:` and for the same reason: a view that kept its
             // old size after a resize would draw into part of the window and
             // report a backing store the window does not have.
             let object = object_for(window);
             let content = window::content_view_of(object);
-            if !content.is_null() {
-                let frame = foundation::geometry::NSRect {
-                    origin: foundation::geometry::NSPoint::default(),
-                    size: foundation::geometry::NSSize {
-                        width: width as f64,
-                        height: height as f64,
-                    },
-                };
-                // SAFETY: `-setFrame:` is `void (id, SEL, NSRect)`.
-                unsafe {
-                    let f: unsafe extern "C" fn(Id, objc::sel::Sel, foundation::geometry::NSRect) =
-                        std::mem::transmute(objc::msg::entry());
-                    f(content, objc::sel::get("setFrame:"), frame);
-                }
+            if !object.is_null() {
+                window::fit_content_view(object);
             }
             // A resized view's tracking rectangle is the wrong shape, and
             // AppKit asks for a new one here rather than resizing the old.
@@ -278,6 +290,9 @@ pub(crate) fn deliver(event: sdl3::video::Event) {
             post(window, window::DID_CHANGE_BACKING_PROPERTIES);
         }
         Event::WindowMouse { window, entered } => {
+            if !entered {
+                crate::decor::pointer_left(window);
+            }
             // A resize is performed from outside the client area. SDL reports
             // the resulting leave and re-entry as window events rather than
             // mouse-motion events; dropping them leaves an NSTrackingArea
@@ -292,6 +307,7 @@ pub(crate) fn deliver(event: sdl3::video::Event) {
             }
         }
         Event::WindowFocus { window, gained } => {
+            crate::decor::focus_changed(window, gained);
             let object = object_for(window);
             if !object.is_null() && gained {
                 window::set_key_window(object);
@@ -315,6 +331,9 @@ pub(crate) fn deliver(event: sdl3::video::Event) {
             down,
             repeat,
         } => {
+            if crate::decor::key(scancode, down) {
+                return;
+            }
             let modifiers = crate::keymap::modifiers(modifiers);
             let code = crate::keymap::virtual_key(scancode);
             let text = crate::keymap::characters(scancode, key);
@@ -334,6 +353,14 @@ pub(crate) fn deliver(event: sdl3::video::Event) {
                 window,
                 ..Fields::default()
             };
+            // A key equivalent is the menu's, offered before the key reaches
+            // the first responder, as `-[NSApplication sendEvent:]` does.
+            if down
+                && !crate::keymap::is_modifier(scancode)
+                && key_equivalent(object_for(id), fields(object_for(id)), &text)
+            {
+                return;
+            }
             // A modifier is `-flagsChanged:`, not a key down: AppKit has no
             // key-up for one, and a guest that treated it as a key would see
             // shift as a character.
@@ -376,6 +403,9 @@ pub(crate) fn deliver(event: sdl3::video::Event) {
             buttons,
         } => {
             if take_warp_echo(x, y) {
+                return;
+            }
+            if crate::decor::pointer_moved(id, x, y) {
                 return;
             }
             // A window being dragged by `-performWindowDragWithEvent:` consumes
@@ -444,6 +474,9 @@ pub(crate) fn deliver(event: sdl3::video::Event) {
             x,
             y,
         } => {
+            if crate::decor::pointer_button(id, button, down, clicks, x, y) {
+                return;
+            }
             let kind = crate::button::event_kind(button, down);
             // The release ends a window drag. The event is still delivered: a
             // guest that started the drag from its own `-mouseDown:` is holding
@@ -521,8 +554,55 @@ fn current_modifiers() -> u64 {
     crate::keymap::modifiers(sdl3::video::keyboard_modifiers())
 }
 
+/// Offer a key press to whatever takes it as a key equivalent: the window's
+/// views, then the main menu. True when something did.
+///
+/// With [`crate::decor::Config::control_shortcuts`], Control also reaches a
+/// menu item whose equivalent is Command, once nothing took it as it was.
+fn key_equivalent(window: Id, fields: Fields, text: &str) -> bool {
+    use crate::keymap::flags;
+    let modifiers = fields.modifiers;
+    let function_key = text
+        .chars()
+        .next()
+        .is_some_and(|c| ('\u{F700}'..='\u{F8FF}').contains(&c));
+    if modifiers & (flags::COMMAND | flags::CONTROL) == 0 && !function_key {
+        return false;
+    }
+    let sel = objc::sel::get("performKeyEquivalent:");
+    let offer = |receiver: Id, event: Id| {
+        if receiver.is_null() {
+            return false;
+        }
+        // SAFETY: `-performKeyEquivalent:` is `BOOL (id, SEL, NSEvent *)` on
+        // windows and menus, both of which this crate installs it on.
+        unsafe {
+            let f: unsafe extern "C" fn(Id, objc::sel::Sel, Id) -> u8 =
+                std::mem::transmute(objc::msg::entry());
+            f(receiver, sel, event) != 0
+        }
+    };
+    let menu = crate::menu::main_menu();
+    let event = nsevent::make(fields.clone());
+    if offer(window, event) || offer(menu, event) {
+        return true;
+    }
+    let control_only = modifiers & flags::CONTROL != 0 && modifiers & flags::COMMAND == 0;
+    if !(control_only && crate::decor::config().control_shortcuts) {
+        return false;
+    }
+    let aliased = nsevent::make(Fields {
+        modifiers: (modifiers & !flags::CONTROL) | flags::COMMAND,
+        ..fields
+    });
+    offer(menu, aliased)
+}
+
 /// A pointer position SDL reports against the window's top-left, in the
 /// bottom-left frame `-locationInWindow` promises.
+///
+/// The base coordinate system is the whole frame, so a titlebar this runtime
+/// draws is above the content view's top.
 fn location(window: Id, x: f32, y: f32) -> NSPoint {
     let content = window::content_view_of(window);
     let height = match content.is_null() {
@@ -536,6 +616,7 @@ fn location(window: Id, x: f32, y: f32) -> NSPoint {
             f(content, objc::sel::get("bounds")).size.height
         },
     };
+    let height = height + window::content_inset(window);
     crate::geometry::point_in_window(x as f64, y as f64, height)
 }
 
@@ -886,7 +967,7 @@ fn responder_of(window: Id) -> Id {
 /// everywhere else, and `crates/sdl3` does not expose the mapping - so this
 /// walks the windows this crate made and asks each one. There are never more
 /// than a handful.
-fn object_for(id: u32) -> Id {
+pub(crate) fn object_for(id: u32) -> Id {
     for object in window::all() {
         // SAFETY: a window this crate made.
         let sdl = unsafe { window::sdl_window(object) };
@@ -924,6 +1005,12 @@ fn post(id: u32, name: &str) {
         }
         return;
     }
+    post_for(object, name);
+}
+
+/// Send the window notification `name` about `object` to its delegate and to
+/// observers.
+pub(crate) fn post_for(object: Id, name: &str) {
     let delegate = window::delegate_of(object);
     if tracing() {
         eprintln!("rosetta3: appkit: {name}: window {object:p}, delegate {delegate:p}");

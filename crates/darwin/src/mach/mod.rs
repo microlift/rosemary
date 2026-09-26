@@ -5,6 +5,7 @@
 use std::ffi::c_void;
 
 pub mod bootstrap;
+pub mod clock;
 pub mod info;
 pub mod kern;
 pub mod msg;
@@ -102,6 +103,9 @@ exports::exports! {
         "host_page_size" => info::host_page_size,
         "host_statistics" => info::host_statistics,
         "host_statistics64" => info::host_statistics64,
+        "host_info" => info::host_info,
+        "host_get_clock_service" => clock::host_get_clock_service,
+        "clock_get_time" => clock::clock_get_time,
         "task_get_special_port" => task::task_get_special_port,
         "task_set_special_port" => task::task_set_special_port,
 

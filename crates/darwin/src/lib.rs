@@ -26,6 +26,8 @@ use std::ffi::CString;
 pub mod acl;
 mod atomics;
 pub mod attrlist;
+#[cfg(not(target_os = "macos"))]
+pub mod audit;
 pub mod backtrace;
 pub mod bsd;
 pub mod callback;
@@ -97,6 +99,8 @@ pub mod tls;
 pub mod translation;
 pub mod ulock;
 pub mod unfair_lock;
+#[cfg(not(target_os = "macos"))]
+pub mod utmpx;
 pub mod uuid;
 #[cfg(not(target_os = "macos"))]
 pub mod vis;
@@ -348,6 +352,8 @@ static MODULES: &[exports::Module] = &[
     #[cfg(not(target_os = "macos"))]
     passwd::MODULE,
     #[cfg(not(target_os = "macos"))]
+    audit::MODULE,
+    #[cfg(not(target_os = "macos"))]
     dirent::MODULE,
     #[cfg(not(target_os = "macos"))]
     rlimit::MODULE,
@@ -385,6 +391,8 @@ static MODULES: &[exports::Module] = &[
     progname::MODULE,
     #[cfg(target_os = "linux")]
     stream::MODULE,
+    #[cfg(not(target_os = "macos"))]
+    utmpx::MODULE,
     #[cfg(not(target_os = "macos"))]
     vis::MODULE,
     #[cfg(not(target_os = "macos"))]

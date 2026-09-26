@@ -1,0 +1,10 @@
+[package]
+name = "chrome"
+description = "Host-side toolkit that draws Rosetta 3's own Mac-style window chrome and menus"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+owned_ttf_parser.workspace = true
+ab_glyph_rasterizer.workspace = true

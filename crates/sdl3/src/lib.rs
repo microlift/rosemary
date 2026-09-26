@@ -5,6 +5,7 @@ use std::sync::OnceLock;
 
 pub mod keycodes;
 pub mod mouse;
+pub mod wayland;
 
 pub mod init {
     pub const VIDEO: u32 = 0x0000_0020;
@@ -100,9 +101,7 @@ struct Api {
     SDL_SetAppMetadataProperty: Option<unsafe extern "C" fn(*const c_char, *const c_char) -> bool>,
     SDL_GetError: Option<unsafe extern "C" fn() -> *const c_char>,
     SDL_PumpEvents: Option<unsafe extern "C" fn()>,
-    SDL_ShowSimpleMessageBox:
-        Option<unsafe extern "C" fn(u32, *const c_char, *const c_char, Window) -> bool>,
-    SDL_ShowMessageBox: Option<unsafe extern "C" fn(*const MessageBoxData, *mut c_int) -> bool>,
+    SDL_QuitSubSystem: Option<unsafe extern "C" fn(u32)>,
 
     SDL_GetJoysticks: Option<unsafe extern "C" fn(*mut c_int) -> *mut JoystickId>,
     SDL_OpenJoystick: Option<unsafe extern "C" fn(JoystickId) -> Joystick>,
@@ -155,9 +154,18 @@ struct Api {
     SDL_ShowWindow: Option<unsafe extern "C" fn(Window) -> bool>,
     SDL_HideWindow: Option<unsafe extern "C" fn(Window) -> bool>,
     SDL_RaiseWindow: Option<unsafe extern "C" fn(Window) -> bool>,
+    SDL_SetWindowParent: Option<unsafe extern "C" fn(Window, Window) -> bool>,
+    SDL_SetWindowModal: Option<unsafe extern "C" fn(Window, bool) -> bool>,
     SDL_SetWindowFullscreen: Option<unsafe extern "C" fn(Window, bool) -> bool>,
     SDL_SetWindowResizable: Option<unsafe extern "C" fn(Window, bool) -> bool>,
     SDL_SetWindowBordered: Option<unsafe extern "C" fn(Window, bool) -> bool>,
+    SDL_MinimizeWindow: Option<unsafe extern "C" fn(Window) -> bool>,
+    SDL_MaximizeWindow: Option<unsafe extern "C" fn(Window) -> bool>,
+    SDL_RestoreWindow: Option<unsafe extern "C" fn(Window) -> bool>,
+    SDL_SetWindowMinimumSize: Option<unsafe extern "C" fn(Window, c_int, c_int) -> bool>,
+    SDL_ShowWindowSystemMenu: Option<unsafe extern "C" fn(Window, c_int, c_int) -> bool>,
+    SDL_SetWindowHitTest:
+        Option<unsafe extern "C" fn(Window, Option<video::HitTest>, *mut c_void) -> bool>,
     SDL_SetWindowAlwaysOnTop: Option<unsafe extern "C" fn(Window, bool) -> bool>,
     SDL_SetWindowFocusable: Option<unsafe extern "C" fn(Window, bool) -> bool>,
     SDL_GetWindowPixelDensity: Option<unsafe extern "C" fn(Window) -> f32>,
@@ -184,6 +192,8 @@ struct Api {
     SDL_GL_CreateContext: Option<unsafe extern "C" fn(Window) -> GlContext>,
     SDL_GL_DestroyContext: Option<unsafe extern "C" fn(GlContext) -> bool>,
     SDL_GL_MakeCurrent: Option<unsafe extern "C" fn(Window, GlContext) -> bool>,
+    SDL_GL_GetCurrentContext: Option<unsafe extern "C" fn() -> GlContext>,
+    SDL_GL_GetCurrentWindow: Option<unsafe extern "C" fn() -> Window>,
     SDL_GL_SwapWindow: Option<unsafe extern "C" fn(Window) -> bool>,
     SDL_GL_SetAttribute: Option<unsafe extern "C" fn(c_int, c_int) -> bool>,
     SDL_GL_SetSwapInterval: Option<unsafe extern "C" fn(c_int) -> bool>,
@@ -205,6 +215,7 @@ struct Api {
         Option<unsafe extern "C" fn(u32, *mut c_int) -> *mut *mut DisplayMode>,
 
     SDL_PollEvent: Option<unsafe extern "C" fn(*mut Event) -> bool>,
+    SDL_WaitEventTimeout: Option<unsafe extern "C" fn(*mut Event, i32) -> bool>,
     SDL_StartTextInput: Option<unsafe extern "C" fn(Window) -> bool>,
     SDL_StopTextInput: Option<unsafe extern "C" fn(Window) -> bool>,
     SDL_SetTextInputArea: Option<unsafe extern "C" fn(Window, *const Rect, c_int) -> bool>,
@@ -222,6 +233,11 @@ struct Api {
     SDL_GetWindowRelativeMouseMode: Option<unsafe extern "C" fn(Window) -> bool>,
     SDL_GetModState: Option<unsafe extern "C" fn() -> u16>,
     SDL_SetHint: Option<unsafe extern "C" fn(*const c_char, *const c_char) -> bool>,
+    SDL_GetSystemTheme: Option<unsafe extern "C" fn() -> c_int>,
+    SDL_GetCurrentVideoDriver: Option<unsafe extern "C" fn() -> *const c_char>,
+    SDL_GetWindowProperties: Option<unsafe extern "C" fn(Window) -> PropertiesId>,
+    SDL_GetPointerProperty:
+        Option<unsafe extern "C" fn(PropertiesId, *const c_char, *mut c_void) -> *mut c_void>,
 
     SDL_OpenAudioDeviceStream: Option<
         unsafe extern "C" fn(
@@ -317,8 +333,7 @@ fn api() -> Option<&'static Api> {
             SDL_SetAppMetadataProperty,
             SDL_GetError,
             SDL_PumpEvents,
-            SDL_ShowSimpleMessageBox,
-            SDL_ShowMessageBox,
+            SDL_QuitSubSystem,
             SDL_GetJoysticks,
             SDL_OpenJoystick,
             SDL_CloseJoystick,
@@ -368,9 +383,17 @@ fn api() -> Option<&'static Api> {
             SDL_ShowWindow,
             SDL_HideWindow,
             SDL_RaiseWindow,
+            SDL_SetWindowParent,
+            SDL_SetWindowModal,
             SDL_SetWindowFullscreen,
             SDL_SetWindowResizable,
             SDL_SetWindowBordered,
+            SDL_MinimizeWindow,
+            SDL_MaximizeWindow,
+            SDL_RestoreWindow,
+            SDL_SetWindowMinimumSize,
+            SDL_ShowWindowSystemMenu,
+            SDL_SetWindowHitTest,
             SDL_SetWindowAlwaysOnTop,
             SDL_SetWindowFocusable,
             SDL_GetWindowPixelDensity,
@@ -390,6 +413,8 @@ fn api() -> Option<&'static Api> {
             SDL_GL_CreateContext,
             SDL_GL_DestroyContext,
             SDL_GL_MakeCurrent,
+            SDL_GL_GetCurrentContext,
+            SDL_GL_GetCurrentWindow,
             SDL_GL_SwapWindow,
             SDL_GL_SetAttribute,
             SDL_GL_SetSwapInterval,
@@ -405,6 +430,7 @@ fn api() -> Option<&'static Api> {
             SDL_GetDesktopDisplayMode,
             SDL_GetFullscreenDisplayModes,
             SDL_PollEvent,
+            SDL_WaitEventTimeout,
             SDL_StartTextInput,
             SDL_StopTextInput,
             SDL_SetTextInputArea,
@@ -422,6 +448,10 @@ fn api() -> Option<&'static Api> {
             SDL_GetWindowRelativeMouseMode,
             SDL_GetModState,
             SDL_SetHint,
+            SDL_GetSystemTheme,
+            SDL_GetCurrentVideoDriver,
+            SDL_GetWindowProperties,
+            SDL_GetPointerProperty,
             SDL_OpenAudioDeviceStream,
             SDL_DestroyAudioStream,
             SDL_PutAudioStreamData,
@@ -465,98 +495,6 @@ pub fn error() -> String {
             .to_string_lossy()
             .into_owned(),
     }
-}
-
-/// Show a platform-native message box with a single acknowledgment button.
-pub fn show_simple_message_box(flags: u32, title: &CStr, message: &CStr) -> bool {
-    let Some(show) = api().and_then(|a| a.SDL_ShowSimpleMessageBox) else {
-        return false;
-    };
-    // SAFETY: both strings are NUL-terminated and a null parent window is
-    // explicitly allowed by SDL.
-    unsafe {
-        show(
-            flags,
-            title.as_ptr(),
-            message.as_ptr(),
-            std::ptr::null_mut(),
-        )
-    }
-}
-
-pub mod message_box {
-    pub const ERROR: u32 = 0x0000_0010;
-    pub const WARNING: u32 = 0x0000_0020;
-    pub const INFORMATION: u32 = 0x0000_0040;
-
-    /// `SDL_MESSAGEBOX_BUTTON_RETURNKEY_DEFAULT`
-    pub const RETURN_KEY_DEFAULT: u32 = 0x0000_0001;
-    /// `SDL_MESSAGEBOX_BUTTON_ESCAPEKEY_DEFAULT`
-    pub const ESCAPE_KEY_DEFAULT: u32 = 0x0000_0002;
-}
-
-/// `SDL_MessageBoxButtonData`
-#[repr(C)]
-struct MessageBoxButtonData {
-    flags: u32,
-    button_id: c_int,
-    text: *const c_char,
-}
-
-/// `SDL_MessageBoxData`
-#[repr(C)]
-struct MessageBoxData {
-    flags: u32,
-    window: Window,
-    title: *const c_char,
-    message: *const c_char,
-    num_buttons: c_int,
-    buttons: *const MessageBoxButtonData,
-    color_scheme: *const c_void,
-}
-
-/// One button: its [`message_box`] button flags, the id reported when it is
-/// pressed, and its label.
-pub struct Button<'a> {
-    pub flags: u32,
-    pub id: i32,
-    pub text: &'a CStr,
-}
-
-/// Show a platform-native message box with `buttons`, and wait for one.
-///
-/// `None` when no box could be shown - no SDL, or no display - which is the
-/// signal to ask some other way. `Some(-1)` when it was closed without a
-/// button.
-pub fn show_message_box(
-    flags: u32,
-    title: &CStr,
-    message: &CStr,
-    buttons: &[Button],
-) -> Option<i32> {
-    let show = api()?.SDL_ShowMessageBox?;
-    let raw: Vec<MessageBoxButtonData> = buttons
-        .iter()
-        .map(|button| MessageBoxButtonData {
-            flags: button.flags,
-            button_id: button.id,
-            text: button.text.as_ptr(),
-        })
-        .collect();
-    let data = MessageBoxData {
-        flags,
-        window: std::ptr::null_mut(),
-        title: title.as_ptr(),
-        message: message.as_ptr(),
-        num_buttons: raw.len() as c_int,
-        buttons: raw.as_ptr(),
-        color_scheme: std::ptr::null(),
-    };
-    let mut pressed: c_int = -1;
-    // SAFETY: `data` and every pointer in it - the strings and `raw` - outlive
-    // the call, a null parent window and a null colour scheme are both allowed,
-    // and `pressed` is a live local.
-    unsafe { show(&data, &mut pressed) }.then_some(pressed)
 }
 
 /// What the desktop is told this program is.
@@ -651,6 +589,10 @@ fn claim_video_thread() {
         std::sync::atomic::Ordering::AcqRel,
         std::sync::atomic::Ordering::Relaxed,
     );
+}
+
+fn release_video_thread() {
+    VIDEO_THREAD.store(0, std::sync::atomic::Ordering::Release);
 }
 
 /// Service SDL's own event queue, which is what makes the state below change.
@@ -1346,12 +1288,15 @@ pub mod video {
         pub const HIDDEN: u64 = 0x0000_0008;
         pub const BORDERLESS: u64 = 0x0000_0010;
         pub const RESIZABLE: u64 = 0x0000_0020;
+        pub const MINIMIZED: u64 = 0x0000_0040;
+        pub const MAXIMIZED: u64 = 0x0000_0080;
         pub const HIGH_PIXEL_DENSITY: u64 = 0x0000_2000;
         pub const ALWAYS_ON_TOP: u64 = 0x0001_0000;
         pub const UTILITY: u64 = 0x0002_0000;
         pub const TOOLTIP: u64 = 0x0004_0000;
         pub const POPUP_MENU: u64 = 0x0008_0000;
         pub const VULKAN: u64 = 0x1000_0000;
+        pub const TRANSPARENT: u64 = 0x4000_0000;
         pub const NOT_FOCUSABLE: u64 = 0x0000_0000_8000_0000;
     }
 
@@ -1395,14 +1340,22 @@ pub mod video {
     /// The `SDL_EventType` values this tree acts on.
     pub mod event_type {
         pub const QUIT: u32 = 0x100;
+        pub const SYSTEM_THEME_CHANGED: u32 = 0x108;
+        pub const WINDOW_EXPOSED: u32 = 0x204;
         pub const WINDOW_RESIZED: u32 = 0x206;
         pub const WINDOW_PIXEL_SIZE_CHANGED: u32 = 0x207;
+        pub const WINDOW_MINIMIZED: u32 = 0x209;
+        pub const WINDOW_MAXIMIZED: u32 = 0x20a;
+        pub const WINDOW_RESTORED: u32 = 0x20b;
         pub const WINDOW_MOUSE_ENTER: u32 = 0x20c;
         pub const WINDOW_MOUSE_LEAVE: u32 = 0x20d;
         pub const WINDOW_FOCUS_GAINED: u32 = 0x20e;
         pub const WINDOW_FOCUS_LOST: u32 = 0x20f;
         pub const WINDOW_CLOSE_REQUESTED: u32 = 0x210;
+        pub const WINDOW_HIT_TEST: u32 = 0x211;
         pub const WINDOW_DISPLAY_SCALE_CHANGED: u32 = 0x214;
+        pub const WINDOW_ENTER_FULLSCREEN: u32 = 0x217;
+        pub const WINDOW_LEAVE_FULLSCREEN: u32 = 0x218;
         pub const KEY_DOWN: u32 = 0x300;
         pub const KEY_UP: u32 = 0x301;
         pub const TEXT_EDITING: u32 = 0x302;
@@ -1557,6 +1510,16 @@ pub mod video {
             window: u32,
             entered: bool,
         },
+        /// A press the hit test gave to the window manager. Only X11 reports
+        /// it; Wayland's is seen through [`crate::wayland`].
+        WindowHitTest {
+            window: u32,
+        },
+        /// Minimized, maximized, restored, or in or out of fullscreen: read
+        /// [`window_flags`] for which.
+        WindowState {
+            window: u32,
+        },
         Key {
             window: u32,
             scancode: u32,
@@ -1624,9 +1587,26 @@ pub mod video {
         if !unsafe { poll(&mut raw) } {
             return None;
         }
+        Some(translate(&raw))
+    }
+
+    /// The next event, waiting up to `milliseconds` for one: for a loop with
+    /// nothing to do between events, which [`poll`] would spin.
+    pub fn wait(milliseconds: i32) -> Option<Event> {
+        let wait = api()?.SDL_WaitEventTimeout?;
+        let mut raw = super::Event::default();
+        // SAFETY: a writable event of SDL's own size.
+        if !unsafe { wait(&mut raw, milliseconds) } {
+            return None;
+        }
+        Some(translate(&raw))
+    }
+
+    fn translate(raw: &super::Event) -> Event {
+        let raw = *raw;
         let tag = kind(&raw);
         // SAFETY: each arm names the structure SDL documents for that tag.
-        Some(unsafe {
+        unsafe {
             match tag {
                 event_type::QUIT => Event::Quit,
                 event_type::WINDOW_RESIZED => {
@@ -1646,6 +1626,10 @@ pub mod video {
                     let e: WindowEvent = decode(&raw);
                     Event::WindowClosed { window: e.window }
                 }
+                event_type::WINDOW_HIT_TEST => {
+                    let e: WindowEvent = decode(&raw);
+                    Event::WindowHitTest { window: e.window }
+                }
                 event_type::WINDOW_FOCUS_GAINED | event_type::WINDOW_FOCUS_LOST => {
                     let e: WindowEvent = decode(&raw);
                     Event::WindowFocus {
@@ -1659,6 +1643,14 @@ pub mod video {
                         window: e.window,
                         entered: tag == event_type::WINDOW_MOUSE_ENTER,
                     }
+                }
+                event_type::WINDOW_MINIMIZED
+                | event_type::WINDOW_MAXIMIZED
+                | event_type::WINDOW_RESTORED
+                | event_type::WINDOW_ENTER_FULLSCREEN
+                | event_type::WINDOW_LEAVE_FULLSCREEN => {
+                    let e: WindowEvent = decode(&raw);
+                    Event::WindowState { window: e.window }
                 }
                 event_type::KEY_DOWN | event_type::KEY_UP => {
                     let e: KeyboardEvent = decode(&raw);
@@ -1731,7 +1723,7 @@ pub mod video {
                 }
                 other => Event::Other(other),
             }
-        })
+        }
     }
 
     /// Start the video subsystem, once.
@@ -1739,16 +1731,39 @@ pub mod video {
     /// SDL refuses to create a window without it, and there is no earlier point
     /// to do it from: a program that never opens a window should not have paid
     /// for a display connection.
-    fn init_video() -> bool {
-        static READY: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        *READY.get_or_init(|| {
-            let up = super::init(super::init::VIDEO).is_ok();
-            if up {
+    pub fn init_video() -> bool {
+        let mut up = VIDEO_UP.lock().unwrap_or_else(|e| e.into_inner());
+        if !*up {
+            *up = super::init(super::init::VIDEO).is_ok();
+            if *up {
                 // This thread now owns the event queue: see [`super::pump`].
                 super::claim_video_thread();
             }
-            up
-        })
+        }
+        *up
+    }
+
+    static VIDEO_UP: std::sync::Mutex<bool> = std::sync::Mutex::new(false);
+
+    /// Whether the video subsystem is running.
+    pub fn video_up() -> bool {
+        *VIDEO_UP.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Stop the video subsystem, for a caller that brought it up early and
+    /// has finished with it. Hints and app metadata are read when video
+    /// starts, so leaving it running would keep the early ones.
+    pub fn quit_video() {
+        let mut up = VIDEO_UP.lock().unwrap_or_else(|e| e.into_inner());
+        if !*up {
+            return;
+        }
+        if let Some(quit) = api().and_then(|a| a.SDL_QuitSubSystem) {
+            // SAFETY: takes a flag word, for a subsystem this crate started.
+            unsafe { quit(super::init::VIDEO) };
+        }
+        *up = false;
+        super::release_video_thread();
     }
 
     /// Vulkan surfaces for a window SDL already owns.
@@ -1828,7 +1843,35 @@ pub mod video {
     /// `body` is called only when SDL has a surface for the window; its
     /// return value says whether anything was drawn and so whether the
     /// surface is worth presenting.
+    ///
+    /// The calling thread's GL context is kept; see [`keep_gl_context`].
     pub fn present_window(window: Window, body: impl FnOnce(&Presentation) -> bool) -> bool {
+        keep_gl_context(|| present_window_surface(window, body))
+    }
+
+    /// Run `f`, then put back the calling thread's GL context if SDL changed
+    /// it - including back to none.
+    ///
+    /// A window surface may be backed by a renderer of SDL's own, whose GL
+    /// context SDL makes current to draw and again to destroy, and leaves
+    /// current (or leaves none) afterwards. The thread's context is usually a
+    /// guest's, and its next GL call would otherwise land where none of its
+    /// objects exist.
+    fn keep_gl_context<T>(f: impl FnOnce() -> T) -> T {
+        let context = gl_current_context();
+        let window = match api().and_then(|a| a.SDL_GL_GetCurrentWindow) {
+            // SAFETY: takes nothing.
+            Some(f) => unsafe { f() },
+            None => std::ptr::null_mut(),
+        };
+        let result = f();
+        if gl_current_context() != context {
+            gl_make_current(window, context);
+        }
+        result
+    }
+
+    fn present_window_surface(window: Window, body: impl FnOnce(&Presentation) -> bool) -> bool {
         let Some(api) = api() else {
             return false;
         };
@@ -1898,6 +1941,21 @@ pub mod video {
         (!window.is_null()).then_some(window)
     }
 
+    /// Make `window` a dialog of `parent` that blocks input to it until it
+    /// closes; the compositor may also centre and attach it.
+    pub fn set_window_modal_for(window: Window, parent: Window) -> bool {
+        let Some(api) = api() else {
+            return false;
+        };
+        let (Some(set_parent), Some(set_modal)) = (api.SDL_SetWindowParent, api.SDL_SetWindowModal)
+        else {
+            return false;
+        };
+        // SAFETY: two windows this crate created; modal needs the parent set
+        // first.
+        unsafe { set_parent(window, parent) && set_modal(window, true) }
+    }
+
     /// The window a popup is positioned against, or null for a toplevel.
     pub fn window_parent(window: Window) -> Window {
         match api().and_then(|a| a.SDL_GetWindowParent) {
@@ -1926,6 +1984,9 @@ pub mod video {
         show_window => SDL_ShowWindow,
         hide_window => SDL_HideWindow,
         raise_window => SDL_RaiseWindow,
+        minimize_window => SDL_MinimizeWindow,
+        maximize_window => SDL_MaximizeWindow,
+        restore_window => SDL_RestoreWindow,
         swap_window => SDL_GL_SwapWindow,
         start_text_input => SDL_StartTextInput,
         stop_text_input => SDL_StopTextInput,
@@ -1943,12 +2004,13 @@ pub mod video {
         unsafe { f(window, &area, cursor) }
     }
 
+    /// The calling thread's GL context is kept; see [`keep_gl_context`].
     pub fn destroy_window(window: Window) {
         let Some(f) = api().and_then(|a| a.SDL_DestroyWindow) else {
             return;
         };
         // SAFETY: a window this crate created.
-        unsafe { f(window) };
+        keep_gl_context(|| unsafe { f(window) });
     }
 
     pub fn set_window_title(window: Window, title: &CStr) -> bool {
@@ -2120,6 +2182,65 @@ pub mod video {
         unsafe { f(window, on) }
     }
 
+    /// `SDL_SetWindowMinimumSize`, in window coordinates.
+    pub fn set_window_minimum_size(window: Window, width: i32, height: i32) -> bool {
+        let Some(f) = api().and_then(|a| a.SDL_SetWindowMinimumSize) else {
+            return false;
+        };
+        // SAFETY: a window this crate created.
+        unsafe { f(window, width, height) }
+    }
+
+    /// `SDL_ShowWindowSystemMenu`: the window manager's own menu for the
+    /// window, at a point in window coordinates.
+    pub fn show_window_system_menu(window: Window, x: i32, y: i32) -> bool {
+        let Some(f) = api().and_then(|a| a.SDL_ShowWindowSystemMenu) else {
+            return false;
+        };
+        // SAFETY: a window this crate created.
+        unsafe { f(window, x, y) }
+    }
+
+    /// `SDL_HitTestResult`: what a point of a borderless window is to the
+    /// window manager.
+    #[repr(C)]
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum HitTestResult {
+        Normal = 0,
+        Draggable = 1,
+        ResizeTopLeft = 2,
+        ResizeTop = 3,
+        ResizeTopRight = 4,
+        ResizeRight = 5,
+        ResizeBottomRight = 6,
+        ResizeBottom = 7,
+        ResizeBottomLeft = 8,
+        ResizeLeft = 9,
+    }
+
+    /// `SDL_HitTest`. SDL may call it from whichever thread pumps events, and
+    /// the point is in window coordinates.
+    pub type HitTest = unsafe extern "C" fn(Window, *const Point, *mut c_void) -> HitTestResult;
+
+    /// `SDL_Point`.
+    #[repr(C)]
+    #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+    pub struct Point {
+        pub x: c_int,
+        pub y: c_int,
+    }
+
+    /// `SDL_SetWindowHitTest`: let the window manager move and resize a
+    /// borderless window from regions `callback` names, or stop with `None`.
+    pub fn set_window_hit_test(window: Window, callback: Option<HitTest>) -> bool {
+        let Some(f) = api().and_then(|a| a.SDL_SetWindowHitTest) else {
+            return false;
+        };
+        // SAFETY: a window this crate created and a callback that ignores its
+        // data pointer.
+        unsafe { f(window, callback, std::ptr::null_mut()) }
+    }
+
     pub fn set_window_always_on_top(window: Window, on: bool) -> bool {
         let Some(f) = api().and_then(|a| a.SDL_SetWindowAlwaysOnTop) else {
             return false;
@@ -2199,6 +2320,15 @@ pub mod video {
         };
         // SAFETY: a context this crate created.
         unsafe { f(context) };
+    }
+
+    /// The context current on this thread, or null.
+    pub fn gl_current_context() -> GlContext {
+        match api().and_then(|a| a.SDL_GL_GetCurrentContext) {
+            // SAFETY: takes nothing.
+            Some(f) => unsafe { f() },
+            None => std::ptr::null_mut(),
+        }
     }
 
     pub fn gl_make_current(window: Window, context: GlContext) -> bool {
@@ -2706,9 +2836,74 @@ pub mod video {
         unsafe { f(name.as_ptr(), value.as_ptr()) }
     }
 
+    /// Whether SDL's video driver is Wayland's. False until video has
+    /// started, as SDL has no driver to name before then.
+    pub fn is_wayland() -> bool {
+        let Some(f) = api().and_then(|a| a.SDL_GetCurrentVideoDriver) else {
+            return false;
+        };
+        // SAFETY: takes nothing; the answer is null or a static string.
+        let name = unsafe { f() };
+        // SAFETY: a NUL-terminated string SDL keeps for the process.
+        !name.is_null() && unsafe { CStr::from_ptr(name) } == c"wayland"
+    }
+
+    /// A window's `wl_display` and `wl_surface`, on Wayland.
+    pub fn wayland_surface(window: Window) -> Option<(*mut c_void, *mut c_void)> {
+        let api = api()?;
+        let (props, get) = (api.SDL_GetWindowProperties?, api.SDL_GetPointerProperty?);
+        // SAFETY: a window from SDL, and property names SDL documents.
+        let (display, surface) = unsafe {
+            let id = props(window);
+            (
+                get(
+                    id,
+                    c"SDL.window.wayland.display".as_ptr(),
+                    std::ptr::null_mut(),
+                ),
+                get(
+                    id,
+                    c"SDL.window.wayland.surface".as_ptr(),
+                    std::ptr::null_mut(),
+                ),
+            )
+        };
+        (!display.is_null() && !surface.is_null()).then_some((display, surface))
+    }
+
+    /// `SDL_SystemTheme`.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum SystemTheme {
+        Unknown,
+        Light,
+        Dark,
+    }
+
+    /// The desktop's light or dark preference. SDL keeps it current from the
+    /// platform (the settings portal on Linux), so reading it is cheap.
+    pub fn system_theme() -> SystemTheme {
+        let Some(f) = api().and_then(|a| a.SDL_GetSystemTheme) else {
+            return SystemTheme::Unknown;
+        };
+        // SAFETY: takes nothing and returns an enum value.
+        match unsafe { f() } {
+            1 => SystemTheme::Light,
+            2 => SystemTheme::Dark,
+            _ => SystemTheme::Unknown,
+        }
+    }
+
     /// `SDL_HINT_MOUSE_RELATIVE_CURSOR_VISIBLE`: whether the pointer stays
     /// visible while relative mouse mode is on. SDL hides it by default.
     pub const HINT_RELATIVE_CURSOR_VISIBLE: &CStr = c"SDL_MOUSE_RELATIVE_CURSOR_VISIBLE";
+
+    /// `SDL_HINT_VIDEO_WAYLAND_ALLOW_LIBDECOR`. libdecor's GTK plugin loads
+    /// GTK 3, which cannot share a process with the GTK 4 WebKit uses, so a
+    /// runtime drawing its own decorations turns it off before video starts.
+    pub const HINT_WAYLAND_ALLOW_LIBDECOR: &CStr = c"SDL_VIDEO_WAYLAND_ALLOW_LIBDECOR";
+
+    /// `SDL_HINT_VIDEO_WAYLAND_PREFER_LIBDECOR`.
+    pub const HINT_WAYLAND_PREFER_LIBDECOR: &CStr = c"SDL_VIDEO_WAYLAND_PREFER_LIBDECOR";
 
     /// Hold the pointer in place over `window` and report motion only as
     /// deltas, or stop doing so.

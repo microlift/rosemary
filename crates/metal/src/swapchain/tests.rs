@@ -238,6 +238,89 @@ fn two_layers_in_a_window_are_composited_into_one_image() {
     sdl3::video::destroy_window(window);
 }
 
+/// A window made with room for rounded corners is presented through the
+/// corners pass, on a surface that shows its alpha, whatever size it is.
+#[test]
+fn a_transparent_window_is_presented_through_the_corners_pass() {
+    if std::env::var_os("ROSETTA3_TEST_VULKAN").is_none() {
+        return;
+    }
+    let Ok(adapters) = crate::vulkan::adapters() else {
+        return;
+    };
+    let Some(gpu) = adapters.first().and_then(|adapter| adapter.gpu().ok()) else {
+        return;
+    };
+    let flags = sdl3::video::flags::HIGH_PIXEL_DENSITY | sdl3::video::flags::TRANSPARENT;
+    let Some(window) = sdl3::video::create_window(c"rosetta3 corners", 320, 240, flags) else {
+        return;
+    };
+    sdl3::video::show_window(window);
+    let frame_of = |window| {
+        let (width, height) =
+            sdl3::video::window_size_in_pixels(window).expect("a window SDL made");
+        appkit::view::Frame {
+            window,
+            x: 0,
+            y: 0,
+            width: width as u32,
+            height: height as u32,
+            window_width: width as u32,
+            window_height: height as u32,
+        }
+    };
+    let frame = frame_of(window);
+    let source = gpu
+        .create_image(&ImageDescription {
+            image_type: vk::ImageType::TYPE_2D,
+            view_type: vk::ImageViewType::TYPE_2D,
+            format: vk::Format::B8G8R8A8_UNORM,
+            width: frame.width,
+            height: frame.height,
+            depth: 1,
+            levels: 1,
+            layers: 1,
+            samples: 1,
+            usage: gpu::USAGE_RENDER_TARGET,
+            cube: false,
+        })
+        .expect("a colour image");
+    // Enough frames to reuse every frame slot's descriptor set.
+    for _ in 0..8 {
+        assert_eq!(present(gpu, 1, &frame, &source, &[]), Ok(true));
+    }
+    let sealed = |check: fn(&Swapchain) -> bool| {
+        SWAPCHAINS
+            .lock()
+            .expect("window swapchains")
+            .as_ref()
+            .and_then(|all| all.get(&(window as usize)))
+            .is_some_and(check)
+    };
+    // A surface that cannot show premultiplied alpha is presented opaque
+    // instead, which is not this test's subject.
+    if sealed(|swapchain| swapchain.corners.is_some()) {
+        assert!(
+            sealed(|swapchain| swapchain.composite.is_some()),
+            "the corners pass ran without a composite to read"
+        );
+        sdl3::video::set_window_size(window, 400, 300);
+        let resized = frame_of(window);
+        for _ in 0..4 {
+            assert_eq!(present(gpu, 1, &resized, &source, &[]), Ok(true));
+        }
+        assert!(sealed(|swapchain| swapchain.corners.is_some()));
+    }
+
+    SWAPCHAINS
+        .lock()
+        .expect("window swapchains")
+        .as_mut()
+        .and_then(|all| all.remove(&(window as usize)));
+    gpu.destroy_image(source);
+    sdl3::video::destroy_window(window);
+}
+
 /// An OpenGL window is never converted into a Vulkan one.
 ///
 /// SDL will do it, and on Wayland the result kills the process: the

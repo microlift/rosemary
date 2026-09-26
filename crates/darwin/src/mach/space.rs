@@ -34,6 +34,10 @@ pub const fn type_of(right: u32) -> u32 {
 pub const TASK_SELF: Name = 0x103;
 pub const HOST_SELF: Name = 0x203;
 pub const BOOTSTRAP: Name = 0x303;
+/// The two clock services `host_get_clock_service` hands out. Fixed because
+/// every caller asking for the same clock gets the same port on a real system.
+pub const SYSTEM_CLOCK: Name = 0x403;
+pub const CALENDAR_CLOCK: Name = 0x503;
 /// The first name [`allocate`] hands out. Above the fixed ones, and stepped by
 /// four the way a real space's names are, so a caller that assumes a name is
 /// not a small integer is not surprised.
@@ -56,7 +60,7 @@ pub enum Right {
     /// A Mach semaphore, which is named out of the same space and is not a port.
     Semaphore(Arc<super::sync::Semaphore>),
     /// A name this runtime answers for without a port behind it: the task, the
-    /// host, a thread, the bootstrap server.
+    /// host, a thread, the bootstrap server, a clock.
     Special,
 }
 
@@ -89,6 +93,8 @@ fn space() -> &'static RwLock<Space> {
         names.insert(TASK_SELF, Right::Special);
         names.insert(HOST_SELF, Right::Special);
         names.insert(BOOTSTRAP, Right::Special);
+        names.insert(SYSTEM_CLOCK, Right::Special);
+        names.insert(CALENDAR_CLOCK, Right::Special);
         RwLock::new(Space {
             names,
             next: FIRST_DYNAMIC,

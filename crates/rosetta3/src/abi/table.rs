@@ -1452,6 +1452,7 @@ pub static SIGNATURES: &[FunctionAbi] = &[
     // Served by [`crate::dyld::entry`] under both backends.
     sig!("_dyld_image_count", U32),
     sig!("_dyld_get_image_header", P, U32),
+    sig!("_NSGetMachExecuteHeader", P),
     sig!("_dyld_get_image_vmaddr_slide", U64, U32),
     sig!("_dyld_image_containing_address", P, P),
     cbsig!([0], "_dyld_register_func_for_add_image", V, P),
@@ -1549,11 +1550,13 @@ pub static SIGNATURES: &[FunctionAbi] = &[
     sig!("clearerr", V, P),
     // `clock_t clock(void)`.
     sig!("clock", U64),
+    // `kern_return_t clock_get_time(clock_serv_t, mach_timespec_t *)`.
+    sig!("clock_get_time", I32, U32, P),
     // `struct timespec` is two 64-bit words on both architectures, and the
     // guest passes it by address, so the host fills it in place.
-    sig!("clock_get_time", I32, U32, P),
     sig!("clock_gettime", I32, U32, P),
     sig!("clock_getres", I32, U32, P),
+    sig!("clock_settime", I32, U32, P),
     sig!("clock_gettime_nsec_np", U64, I32),
     // `kern_return_t clock_sleep(mach_port_t, sleep_type_t, mach_timespec_t,
     // mach_timespec_t *)`.
@@ -1767,6 +1770,7 @@ pub static SIGNATURES: &[FunctionAbi] = &[
     sig!("fseeko", I32, P, I64, I32),
     sig!("fsetpos", I32, P, P),
     sig!("fstat", I32, I32, P),
+    sig!("fstatat", I32, I32, P, P, I32),
     sig!("fstatfs", I32, I32, P),
     sig!("fstatvfs", I32, I32, P),
     sig!("fsync", I32, I32),
@@ -1798,6 +1802,7 @@ pub static SIGNATURES: &[FunctionAbi] = &[
     sig!("geteuid", U32),
     sig!("getgid", U32),
     sig!("getgroups", I32, I32, P),
+    sig!("getgrouplist_2", I32, P, U32, P),
     //
     // `struct passwd` is five pointers, two 32-bit ids and two `time_t`s;
     // `struct group` is two pointers, a `gid_t` and a pointer.
@@ -1855,6 +1860,7 @@ pub static SIGNATURES: &[FunctionAbi] = &[
     sig!("getsockopt", I32, I32, I32, I32, P, P),
     sig!("gettimeofday", I32, P, P),
     sig!("getuid", U32),
+    sig!("getaudit_addr", I32, P, U32),
     sig!("getwc", I32, P),
     sig!("getxattr", I64, P, P, P, U64, U32, I32),
     sig!("getentropy", I32, P, U64),
@@ -3151,6 +3157,7 @@ pub static SIGNATURES: &[FunctionAbi] = &[
     sig!("wmemcmp", I32, P, P, U64),
     sig!("write", I64, I32, P, U64),
     sig!("writev", I64, I32, P, I32),
+    sig!("wtmpxname", I32, P),
     sig!("zError", P, I32),
     sig!("zlibVersion", P),
     // Metal symbols

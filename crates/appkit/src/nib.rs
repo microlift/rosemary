@@ -73,6 +73,7 @@ pub fn load(path: &Path, owner: Id) -> Result<Loaded, String> {
             unwired: Vec::new(),
         },
     };
+    builder.build_menus(root);
     builder.connect(root);
     builder.show_visible_windows(root);
     builder.awake();
@@ -143,15 +144,70 @@ impl Builder<'_> {
                         self.outlet(source, destination, &label);
                     }
                 }
-                "NSNibControlConnector" => self.loaded.unwired.push(format!(
-                    "the action \"{label}\" on a {source_class} is not connected until there \
-                     are controls"
-                )),
+                "NSNibControlConnector" => {
+                    let destination = self.archive.field_object(connector, "NSDestination");
+                    self.action(source, destination, &label, &source_class);
+                }
                 other => self
                     .loaded
                     .unwired
                     .push(format!("a connector of an unknown kind, {other}")),
             }
+        }
+    }
+
+    /// Build the menus the nib names for the application - its menu bar
+    /// above all - which nothing else in the nib refers to.
+    fn build_menus(&mut self, root: Uid) {
+        let Some(objects) = self.archive.field_object(root, "NSObjectsKeys") else {
+            return;
+        };
+        for entry in self.archive.array(objects) {
+            let named = self.archive.class_name(entry) == Some("NSMenu")
+                && self
+                    .archive
+                    .field_object(entry, "NSName")
+                    .and_then(|name| self.archive.string(name))
+                    .is_some_and(|name| name.starts_with("_NS"));
+            if named {
+                self.instantiate(entry);
+            }
+        }
+    }
+
+    /// `[source setTarget:destination]` and `[source setAction:label]`: a
+    /// menu item's or a control's action. The first responder placeholder
+    /// is a nil target, which sends the action up the responder chain.
+    fn action(&mut self, source: Uid, destination: Option<Uid>, label: &str, source_class: &str) {
+        let takes_action = self.instantiate(source).filter(|object| {
+            // SAFETY: an object this loader built.
+            unsafe { objc::object::class_of(*object) }
+                .is_some_and(|c| c.method(objc::sel::get("setAction:")).is_some())
+        });
+        let Some(object) = takes_action else {
+            self.loaded.unwired.push(format!(
+                "the action \"{label}\" on a {source_class} is not connected: it takes no action"
+            ));
+            return;
+        };
+        let first_responder = destination.is_some_and(|uid| {
+            self.archive.class_name(uid) == Some("NSCustomObject")
+                && self.custom_class_name(uid).as_deref() == Some("FirstResponder")
+        });
+        let target = match (destination, first_responder) {
+            (Some(uid), false) => self.instantiate(uid).unwrap_or(std::ptr::null_mut()),
+            _ => std::ptr::null_mut(),
+        };
+        // SAFETY: `-setAction:` is `void (id, SEL, SEL)` and `-setTarget:`
+        // `void (id, SEL, id)`, which is what an object that answers the first
+        // has.
+        unsafe {
+            let set_action: unsafe extern "C" fn(Id, objc::sel::Sel, objc::sel::Sel) =
+                std::mem::transmute(objc::msg::entry());
+            set_action(object, objc::sel::get("setAction:"), objc::sel::get(label));
+            let set_target: unsafe extern "C" fn(Id, objc::sel::Sel, Id) =
+                std::mem::transmute(objc::msg::entry());
+            set_target(object, objc::sel::get("setTarget:"), target);
         }
     }
 
@@ -557,6 +613,164 @@ mod tests {
             "{:?}",
             loaded.unwired
         );
+    }
+
+    /// A main menu whose one item quits: named `_NSMainMenu`, with the item's
+    /// action a control connection to the first responder.
+    const MENU_NIB: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
+<plist version="1.0">
+<dict>
+	<key>$archiver</key>
+	<string>NSKeyedArchiver</string>
+	<key>$objects</key>
+	<array>
+		<string>$null</string>
+		<dict>
+			<key>$class</key><dict><key>CF$UID</key><integer>21</integer></dict>
+			<key>NSRoot</key><dict><key>CF$UID</key><integer>2</integer></dict>
+			<key>NSConnections</key><dict><key>CF$UID</key><integer>4</integer></dict>
+			<key>NSObjectsKeys</key><dict><key>CF$UID</key><integer>5</integer></dict>
+		</dict>
+		<dict>
+			<key>$class</key><dict><key>CF$UID</key><integer>22</integer></dict>
+			<key>NSClassName</key><dict><key>CF$UID</key><integer>3</integer></dict>
+		</dict>
+		<string>NSApplication</string>
+		<dict>
+			<key>$class</key><dict><key>CF$UID</key><integer>23</integer></dict>
+			<key>NS.objects</key><array><dict><key>CF$UID</key><integer>6</integer></dict></array>
+		</dict>
+		<dict>
+			<key>$class</key><dict><key>CF$UID</key><integer>23</integer></dict>
+			<key>NS.objects</key><array><dict><key>CF$UID</key><integer>7</integer></dict></array>
+		</dict>
+		<dict>
+			<key>$class</key><dict><key>CF$UID</key><integer>24</integer></dict>
+			<key>NSSource</key><dict><key>CF$UID</key><integer>10</integer></dict>
+			<key>NSDestination</key><dict><key>CF$UID</key><integer>8</integer></dict>
+			<key>NSLabel</key><dict><key>CF$UID</key><integer>9</integer></dict>
+		</dict>
+		<dict>
+			<key>$class</key><dict><key>CF$UID</key><integer>25</integer></dict>
+			<key>NSTitle</key><dict><key>CF$UID</key><integer>11</integer></dict>
+			<key>NSMenuItems</key><dict><key>CF$UID</key><integer>12</integer></dict>
+			<key>NSName</key><dict><key>CF$UID</key><integer>13</integer></dict>
+		</dict>
+		<dict>
+			<key>$class</key><dict><key>CF$UID</key><integer>22</integer></dict>
+			<key>NSClassName</key><dict><key>CF$UID</key><integer>14</integer></dict>
+		</dict>
+		<string>terminate:</string>
+		<dict>
+			<key>$class</key><dict><key>CF$UID</key><integer>26</integer></dict>
+			<key>NSTitle</key><dict><key>CF$UID</key><integer>15</integer></dict>
+			<key>NSKeyEquiv</key><dict><key>CF$UID</key><integer>16</integer></dict>
+			<key>NSKeyEquivModMask</key><integer>1048576</integer>
+		</dict>
+		<string>Main</string>
+		<dict>
+			<key>$class</key><dict><key>CF$UID</key><integer>23</integer></dict>
+			<key>NS.objects</key><array><dict><key>CF$UID</key><integer>17</integer></dict></array>
+		</dict>
+		<string>_NSMainMenu</string>
+		<string>FirstResponder</string>
+		<string>Quit</string>
+		<string>q</string>
+		<dict>
+			<key>$class</key><dict><key>CF$UID</key><integer>26</integer></dict>
+			<key>NSTitle</key><dict><key>CF$UID</key><integer>18</integer></dict>
+			<key>NSSubmenu</key><dict><key>CF$UID</key><integer>19</integer></dict>
+		</dict>
+		<string>App</string>
+		<dict>
+			<key>$class</key><dict><key>CF$UID</key><integer>25</integer></dict>
+			<key>NSTitle</key><dict><key>CF$UID</key><integer>18</integer></dict>
+			<key>NSMenuItems</key><dict><key>CF$UID</key><integer>20</integer></dict>
+		</dict>
+		<dict>
+			<key>$class</key><dict><key>CF$UID</key><integer>23</integer></dict>
+			<key>NS.objects</key><array><dict><key>CF$UID</key><integer>10</integer></dict></array>
+		</dict>
+		<dict>
+			<key>$classes</key><array><string>NSIBObjectData</string></array>
+			<key>$classname</key><string>NSIBObjectData</string>
+		</dict>
+		<dict>
+			<key>$classes</key><array><string>NSCustomObject</string></array>
+			<key>$classname</key><string>NSCustomObject</string>
+		</dict>
+		<dict>
+			<key>$classes</key><array><string>NSMutableArray</string><string>NSArray</string></array>
+			<key>$classname</key><string>NSMutableArray</string>
+		</dict>
+		<dict>
+			<key>$classes</key><array><string>NSNibControlConnector</string></array>
+			<key>$classname</key><string>NSNibControlConnector</string>
+		</dict>
+		<dict>
+			<key>$classes</key><array><string>NSMenu</string></array>
+			<key>$classname</key><string>NSMenu</string>
+		</dict>
+		<dict>
+			<key>$classes</key><array><string>NSMenuItem</string></array>
+			<key>$classname</key><string>NSMenuItem</string>
+		</dict>
+	</array>
+	<key>$top</key>
+	<dict>
+		<key>IB.objectdata</key><dict><key>CF$UID</key><integer>1</integer></dict>
+	</dict>
+	<key>$version</key>
+	<integer>100000</integer>
+</dict>
+</plist>"#;
+
+    /// The menu bar a main nib names becomes the application's, and its
+    /// items get the actions their connections give them.
+    #[test]
+    fn a_nibs_main_menu_is_installed_with_its_actions() {
+        crate::bootstrap();
+        let class = objc::class::ptr(objc::class::lookup(c"NSApplication").expect("NSApplication"));
+        // SAFETY: `+sharedApplication` is `id (Class, SEL)`.
+        let app = unsafe {
+            let f: unsafe extern "C" fn(Id, objc::sel::Sel) -> Id =
+                std::mem::transmute(objc::msg::entry());
+            f(class as Id, objc::sel::get("sharedApplication"))
+        };
+        let path = write("menu", MENU_NIB);
+        let loaded = load(&path, app).expect("a nib");
+        let _ = std::fs::remove_file(&path);
+        assert!(
+            !loaded.unwired.iter().any(|u| u.contains("terminate:")),
+            "{:?}",
+            loaded.unwired
+        );
+
+        let main = crate::menu::main_menu();
+        assert!(!main.is_null(), "the nib's menu bar was not installed");
+        let holders = crate::menu::shown_items(main);
+        assert_eq!(holders.len(), 1);
+        assert_eq!(crate::menu::display_title(holders[0]), "App");
+        let items = crate::menu::shown_items(crate::menu::submenu_of(holders[0]));
+        assert_eq!(items.len(), 1);
+        let quit = items[0];
+        assert_eq!(crate::menu::display_title(quit), "Quit");
+        assert_eq!(crate::menu::shortcut_label(quit), "\u{2318}Q");
+        // SAFETY: `-action` is `SEL (id, SEL)` and `-target` `id (id, SEL)`.
+        unsafe {
+            let action: unsafe extern "C" fn(Id, objc::sel::Sel) -> objc::sel::Sel =
+                std::mem::transmute(objc::msg::entry());
+            assert_eq!(
+                action(quit, objc::sel::get("action")),
+                objc::sel::get("terminate:")
+            );
+            let target: unsafe extern "C" fn(Id, objc::sel::Sel) -> Id =
+                std::mem::transmute(objc::msg::entry());
+            assert!(
+                target(quit, objc::sel::get("target")).is_null(),
+                "the first responder is a nil target"
+            );
+        }
     }
 
     #[test]

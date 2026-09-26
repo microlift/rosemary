@@ -44,8 +44,13 @@ enum Action {
     Down(u8),
     Up(u8),
     Scroll(f32, f32),
-    /// One key, by the name [`crate::event::scancode`] knows.
-    Key(u32),
+    /// One key, by the name [`crate::event::scancode`] knows or the
+    /// character it types, with `ctrl+`, `shift+`, `alt+` or `cmd+` held.
+    Key {
+        scancode: u32,
+        character: u32,
+        modifiers: u16,
+    },
     /// Each character in turn, as the key that types it.
     Type(String),
     /// Drive a different window from here on, by the names
@@ -103,11 +108,41 @@ fn action(rest: &str) -> Option<Action> {
         "down" => Some(Action::Down(argument.parse().unwrap_or(1))),
         "up" => Some(Action::Up(argument.parse().unwrap_or(1))),
         "scroll" => point(argument).map(|(x, y)| Action::Scroll(x, y)),
-        "key" => crate::event::scancode(argument).map(Action::Key),
+        "key" => chord(argument),
         "type" => Some(Action::Type(argument.to_owned())),
         "window" => Some(Action::Window(argument.to_owned())),
         _ => None,
     }
+}
+
+/// `[MODIFIER+]...KEY`, e.g. `ctrl+q` or `escape`.
+fn chord(argument: &str) -> Option<Action> {
+    let mut parts: Vec<&str> = argument.split('+').map(str::trim).collect();
+    let name = parts.pop()?;
+    let mut modifiers = 0u16;
+    for part in parts {
+        // `SDL_KMOD_L*`, which `-modifierFlags` reports as the left key.
+        modifiers |= match part.to_ascii_lowercase().as_str() {
+            "shift" => 0x0001,
+            "ctrl" | "control" => 0x0040,
+            "alt" | "option" => 0x0100,
+            "cmd" | "command" | "gui" | "super" => 0x0400,
+            _ => return None,
+        };
+    }
+    let mut chars = name.chars();
+    let (scancode, character) = match (chars.next(), chars.next()) {
+        (Some(c), None) => (
+            typed(c.to_ascii_lowercase())?.0,
+            c.to_ascii_lowercase() as u32,
+        ),
+        _ => (crate::event::scancode(name)?, 0),
+    };
+    Some(Action::Key {
+        scancode,
+        character,
+        modifiers,
+    })
 }
 
 fn point(argument: &str) -> Option<(f32, f32)> {
@@ -217,6 +252,8 @@ fn target_window() -> Option<sdl3::Window> {
         // interface is in: a script that drives an application whose window
         // the compositor has not given focus to cannot ask for the key one.
         "main" => main_window(),
+        // The innermost open menu of the chrome's, which is no NSWindow.
+        "menu" => crate::decor::menu_popup(),
         // The most recently shown window, which is the menu or dialog that has
         // just opened: the one a script has to drive to answer whether a popup
         // responds to the pointer at all.
@@ -282,7 +319,11 @@ fn perform(action: &Action) {
             x: *dx,
             y: *dy,
         }),
-        Action::Key(scancode) => key(window, *scancode, 0, 0),
+        Action::Key {
+            scancode,
+            character,
+            modifiers,
+        } => key(window, *scancode, *character, *modifiers),
         Action::Window(name) => {
             *CHOSEN.lock().unwrap_or_else(|e| e.into_inner()) = Some(name.clone());
         }
@@ -331,8 +372,10 @@ fn key(window: u32, scancode: u32, character: u32, modifiers: u16) {
     };
     crate::event::deliver(event(true));
     // SDL places a committed text event between the physical press and
-    // release. Keep scripted typing on the same path as a real keyboard.
-    if let Some(text) = char::from_u32(character).filter(|c| !c.is_control()) {
+    // release. Keep scripted typing on the same path as a real keyboard,
+    // which commits no text for a Control or Command chord.
+    let chord = modifiers & (0x0040 | 0x0080 | 0x0400 | 0x0800) != 0;
+    if let Some(text) = char::from_u32(character).filter(|c| !c.is_control() && !chord) {
         crate::event::deliver(Event::Text {
             window,
             text: text.to_string(),
