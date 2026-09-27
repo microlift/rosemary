@@ -718,11 +718,12 @@ struct NotificationPort {
 /// `GetMachPort`, `AddMatchingNotification` - are made without checking, and a
 /// null here faults inside the first of them rather than saying anything.
 pub unsafe extern "C" fn IONotificationPortCreate(_port: u32) -> *mut c_void {
+    // One allocation, and it is a real one. Upstream's grew a `source` field to
+    // cache a `CFRunLoopSource` in, and the merge left half of that
+    // initialiser behind here after the second `GetRunLoopSource` that read it
+    // was removed - so the field is gone too, and `NotificationPort` is back to
+    // the single word it needs to be.
     Box::into_raw(Box::new(NotificationPort { _private: 0 })).cast()
-    Box::into_raw(Box::new(NotificationPort {
-        source: std::ptr::null(),
-    }))
-    .cast()
 }
 
 /// `void IONotificationPortDestroy(IONotificationPortRef)`.
@@ -762,34 +763,23 @@ pub unsafe extern "C" fn IONotificationPortDestroy(port: *mut c_void) {
 /// # Safety
 ///
 /// `port` is not read: a null port answers null, and so does a real one.
+///
+/// **The merge put a second `IONotificationPortGetRunLoopSource` here and this
+/// one is the one that stays**, because the two disagree about what a source
+/// with nothing behind it should be. The other built a real
+/// `CFRunLoopSourceContext` with a `perform` of `None` and described it as "a
+/// source with nothing behind it, which is added to a run loop and never
+/// signalled - as no IOKit message ever arrives here". That is the same shape
+/// `dispatch_source_create` refuses for `DISPATCH_SOURCE_TYPE_MEMORYPRESSURE`,
+/// and for the same reason: a null `perform` is not a source that never fires, it
+/// is a source that **faults** the moment anything does signal it. The comment
+/// above this function says so, and it was written before the merge.
+///
+/// So the answer is null, and the open question - which predates the merge and is
+/// not settled by it - is whether the guest nil-checks it before
+/// `CFRunLoopAddSource`. That is a milestone question, not a merge question.
 pub unsafe extern "C" fn IONotificationPortGetRunLoopSource(_port: *mut c_void) -> CFTypeRef {
     std::ptr::null_mut()
-/// A source with nothing behind it, which is added to a run loop and never
-/// signalled - as no IOKit message ever arrives here.
-pub unsafe extern "C" fn IONotificationPortGetRunLoopSource(port: *mut c_void) -> CFTypeRef {
-    if port.is_null() {
-        return std::ptr::null();
-    }
-    // SAFETY: a port `IONotificationPortCreate` made.
-    let port = unsafe { &mut *port.cast::<NotificationPort>() };
-    if port.source.is_null() {
-        let context = corefoundation::api::CFRunLoopSourceContext {
-            version: 0,
-            info: std::ptr::null_mut(),
-            retain: std::ptr::null(),
-            release: std::ptr::null(),
-            copy_description: std::ptr::null(),
-            equal: std::ptr::null(),
-            hash: std::ptr::null(),
-            schedule: std::ptr::null(),
-            cancel: std::ptr::null(),
-            perform: None,
-        };
-        // SAFETY: a context that outlives the call, which copies it.
-        port.source =
-            unsafe { corefoundation::api::CFRunLoopSourceCreate(std::ptr::null(), 0, &context) };
-    }
-    port.source
 }
 
 /// `kern_return_t IOMasterPort(mach_port_t bootstrap, mach_port_t *master)`:
@@ -823,67 +813,36 @@ unsafe fn matching_on(key: &[u8], name: *const c_char) -> CFTypeRef {
     )
 }
 
+// The four functions above were each defined twice by the merge: once here and
+// once in an appended run of upstream's IOKit surface, and the compiler's
+// E0428 is what found them. **Ours is the one that was kept in each case**, and
+// the differences are not cosmetic:
+//
+// * `IORegistryEntryCreateIterator` - ours answers `NO_DEVICE` for a null
+//   entry; the other answered `SUCCESS` unconditionally, so a caller passing a
+//   null entry got a success and an out-parameter of 0.
+// * `IOBSDNameMatching` - ours builds the `IOKitBSDName` key and returns null for
+//   a null name; the other used the key `BSD Name`.
+// * `IOCreatePlugInInterfaceForService` - ours writes both out-parameters
+//   (`NULL` and `0`) before answering `UNSUPPORTED`; the other wrote them too,
+//   but through a differently-named pair, which is the kind of drift a second
+//   definition invites.
+// * `IOObjectConformsTo` - both answer 0; identical, so the choice is free.
+//
+// `UNSUPPORTED` was duplicated the same way and ours, at the top of this file,
+// is the one referenced by the table and by the test that pins its numeric
+// value against `iokit_common_err(0x2c7)`.
+
 /// `CFMutableDictionaryRef IOServiceNameMatching(const char *name)`.
 pub unsafe extern "C" fn IOServiceNameMatching(name: *const c_char) -> CFTypeRef {
     // SAFETY: the caller's C string.
     unsafe { matching_on(b"IONameMatch", name) }
 }
 
-/// `CFMutableDictionaryRef IOBSDNameMatching(mach_port_t, uint32_t, const char *)`.
-pub unsafe extern "C" fn IOBSDNameMatching(
-    _port: u32,
-    _options: u32,
-    name: *const c_char,
-) -> CFTypeRef {
-    // SAFETY: the caller's C string.
-    unsafe { matching_on(b"BSD Name", name) }
-}
 
-/// `kern_return_t IORegistryEntryCreateIterator(entry, plane, options, io_iterator_t *)`:
-/// an empty iterator, as the registry here has no children to walk.
-pub unsafe extern "C" fn IORegistryEntryCreateIterator(
-    _entry: IoObject,
-    _plane: *const c_char,
-    _options: u32,
-    iterator: *mut IoObject,
-) -> KernReturn {
-    if !iterator.is_null() {
-        // SAFETY: the caller's out-parameter.
-        unsafe { iterator.write(0) };
-    }
-    SUCCESS
-}
 
-/// `boolean_t IOObjectConformsTo(io_object_t, const io_name_t className)`:
-/// no object here is an instance of any IOKit class.
-pub unsafe extern "C" fn IOObjectConformsTo(_object: IoObject, _class: *const c_char) -> u32 {
-    0
-}
 
-/// `kIOReturnUnsupported`.
-const UNSUPPORTED: IOReturn = -536_870_201;
 
-/// `IOReturn IOCreatePlugInInterfaceForService(service, pluginType,
-/// interfaceType, IOCFPlugInInterface ***, SInt32 *score)`: refused, as no
-/// service here has a user-space driver plug-in.
-pub unsafe extern "C" fn IOCreatePlugInInterfaceForService(
-    _service: IoObject,
-    _plugin_type: CFTypeRef,
-    _interface_type: CFTypeRef,
-    interface: *mut *mut c_void,
-    score: *mut i32,
-) -> IOReturn {
-    // SAFETY: the caller's out-parameters.
-    unsafe {
-        if !interface.is_null() {
-            interface.write(std::ptr::null_mut());
-        }
-        if !score.is_null() {
-            score.write(0);
-        }
-    }
-    UNSUPPORTED
-}
 
 /// `kern_return_t IODestroyPlugInInterface(IOCFPlugInInterface **)`.
 pub unsafe extern "C" fn IODestroyPlugInInterface(_interface: *mut c_void) -> KernReturn {

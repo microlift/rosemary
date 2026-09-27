@@ -89,9 +89,22 @@ pub unsafe extern "C" fn from_mach_thread_np(port: u32) -> u64 {
     if port == super::id() {
         // SAFETY: `pthread_self` is infallible and its handle is pointer-sized,
         // which is the same eight bytes `super::thread_of` reads back.
-        return super::thread_bits(unsafe { libc::pthread_self() });
+        //
+        // `for_host` is load-bearing and was missing here. `pthread_create` now
+        // writes `handle::for_host(...)` into the caller's `pthread_t`, so a
+        // guest handle is **not** the host's own pointer any more - it is a
+        // per-thread block this runtime leaked. Returning the raw host bits here
+        // answers a `pthread_t` from a different namespace than every other
+        // function in `pthread` now speaks, and
+        // `a_started_threads_port_converts_back_to_its_handle` fails 8 times out
+        // of 8 with one host pointer on the left and another on the right. The
+        // `thread_ids` answer below needs it for the same reason: that table is
+        // keyed by host handles.
+        return super::handle::for_host(super::thread_bits(unsafe {
+            libc::pthread_self()
+        }));
     }
-    thread_ids::thread_of(port).unwrap_or(0)
+    thread_ids::thread_of(port).map(super::handle::for_host).unwrap_or(0)
 }
 
 #[cfg(test)]
@@ -103,7 +116,11 @@ mod tests {
     /// returns it.
     fn this_thread() -> u64 {
         // SAFETY: `pthread_self` is infallible and its handle is pointer-sized.
-        crate::pthread::thread_bits(unsafe { libc::pthread_self() })
+        // `for_host` for the same reason `from_mach_thread_np` needs it: a guest
+        // handle is a block this runtime leaked, not the host pointer.
+        crate::pthread::handle::for_host(crate::pthread::thread_bits(unsafe {
+            libc::pthread_self()
+        }))
     }
 
     /// The name has to reach the guest as an *address*, or the pair is worth

@@ -363,35 +363,6 @@ unsafe extern "C" fn data_with_contents_of_file(class: Id, _sel: Sel, path: Id) 
         return std::ptr::null_mut();
     };
     autoreleased_data(class, bytes)
-    let data = collections::new_data(bytes);
-    // SAFETY: a fresh object.
-    unsafe { api::CFAutorelease(data) as Id }
-}
-
-/// `+dataWithContentsOfFile:options:error:`. The reading options only tune
-/// how the file is read (mapped, uncached), not what is answered.
-unsafe extern "C" fn data_with_contents_of_file_options(
-    class: Id,
-    sel: Sel,
-    path: Id,
-    _options: u64,
-    error: *mut Id,
-) -> Id {
-    // SAFETY: forwarded unchanged.
-    let data = unsafe { data_with_contents_of_file(class, sel, path) };
-    if !error.is_null() {
-        // `NSFileReadNoSuchFileError` or nothing: the caller passed a writable
-        // `NSError **`.
-        unsafe {
-            *error = match data.is_null() {
-                true => {
-                    crate::error::make("NSCocoaErrorDomain", 260, "The file couldn't be opened.")
-                }
-                false => std::ptr::null_mut(),
-            };
-        }
-    }
-    data
 }
 
 /// `+[NSDictionary dictionaryWithContentsOfFile:]`.
@@ -1120,24 +1091,11 @@ unsafe extern "C" fn data_empty(class: Id, _sel: Sel) -> Id {
     autoreleased_data(class, Vec::new())
 }
 
-/// `-initWithBytes:length:`, and the substitution `+alloc` on `NSData` needs.
-///
-/// **Six sends in the guest**, and every one of them is the same shape:
-/// `mov rdi, [_OBJC_CLASS_$_NSData]; call _objc_alloc` and then
-/// `-initWithBytes:length:` with `%rcx` computed as an end minus a begin
-/// (`0x7a1d00c: sub rcx,rdx` over `[r13+0x0]` and `[r13+0x8]`). So this is a
-/// class-cluster initialiser reached through `+alloc` on the abstract facade, and
-/// the lengths are real byte counts rather than constants - which is why the copy
-/// has to be exact and why a short one would be a silent corruption rather than a
-/// visible failure.
-///
-/// The two halves of the contract, from two independent implementations of it
-/// (GNUstep `NSData.m`'s `-initWithBytes:length:`, and swift-corelibs'
-/// `init(bytes:length:)`): the bytes are **copied**, and a **null pointer with a
-/// non-zero length is a named failure** - GNUstep raises
-/// `NSInvalidArgumentException` "called with length but null bytes". A null
-/// pointer with length zero is not a failure on either: there is nothing to copy.
-unsafe extern "C" fn data_init_with_bytes(
+// `data_contents` went with the fifteen above: its only callers were
+// `-isEqual:`, `+dataWithData:`, `-initWithData:` and `-copy`, and the merge's own
+// `data_get_bytes`/`data_hash` never came across. Nothing here answers a data's
+// bytes any more, so the `+alloc` placeholder note in `data_length` is the last
+// thing that touches storage directly.
 /// Non-null `bytes` covers `length` bytes.
 unsafe fn raw<'a>(bytes: *const u8, length: usize) -> &'a [u8] {
     match bytes.is_null() || length == 0 {
@@ -1154,20 +1112,6 @@ fn replace_receiver(receiver: Id, bytes: Vec<u8>) -> Id {
     collections::new_data(bytes) as Id
 }
 
-fn autoreleased_data(bytes: Vec<u8>) -> Id {
-    // SAFETY: a fresh object.
-    unsafe { api::CFAutorelease(collections::new_data(bytes)) as Id }
-}
-
-unsafe extern "C" fn data_init(receiver: Id, _sel: Sel) -> Id {
-    replace_receiver(receiver, Vec::new())
-}
-
-unsafe extern "C" fn data_init_with_data(receiver: Id, _sel: Sel, other: Id) -> Id {
-    // SAFETY: a data object or nil.
-    replace_receiver(receiver, unsafe { data_contents(other) }.to_vec())
-}
-
 unsafe extern "C" fn data_init_with_bytes(
     receiver: Id,
     _sel: Sel,
@@ -1178,94 +1122,15 @@ unsafe extern "C" fn data_init_with_bytes(
     replace_receiver(receiver, unsafe { raw(bytes, length) }.to_vec())
 }
 
-/// `-initWithBytesNoCopy:length:freeWhenDone:`. Copied, as
-/// [`data_with_bytes_no_copy`] explains, and the caller's buffer released
-/// now when it handed it over.
-unsafe extern "C" fn data_init_no_copy_free(
-    receiver: Id,
-    _sel: Sel,
-    bytes: *const u8,
-    length: usize,
-) -> Id {
-    if length > 0 && bytes.is_null() {
-        objc::fail!("-[NSData initWithBytes:length:]: {length} byte(s) asked for and no bytes");
-    }
-    // SAFETY: the caller says `bytes` covers `length` bytes, checked just above.
-    let copy = if length == 0 {
-        Vec::new()
-    } else {
-        unsafe { std::slice::from_raw_parts(bytes, length) }.to_vec()
-    replace_receiver(receiver, copy)
-}
-
-unsafe extern "C" fn data_init_no_copy(
-    receiver: Id,
-    sel: Sel,
-    bytes: *mut u8,
-    length: usize,
-) -> Id {
-    // SAFETY: forwarded; `-initWithBytesNoCopy:length:` frees when done.
-    unsafe { data_init_no_copy_free(receiver, sel, bytes, length, true) }
-}
-
-unsafe extern "C" fn data_init_with_contents_of_file(receiver: Id, sel: Sel, path: Id) -> Id {
-    objc::arc::release(receiver);
-    // SAFETY: forwarded; the answer is autoreleased, and `-init` answers +1.
-    objc::arc::retain(unsafe { data_with_contents_of_file(receiver, sel, path) })
-}
-
-unsafe extern "C" fn data_init_with_capacity(receiver: Id, _sel: Sel, capacity: usize) -> Id {
-    replace_receiver(receiver, Vec::with_capacity(capacity.min(1 << 24)))
-}
-
-unsafe extern "C" fn data_init_with_length(receiver: Id, _sel: Sel, length: usize) -> Id {
-    replace_receiver(receiver, vec![0; length])
-}
-
-unsafe extern "C" fn data_empty(_class: Id, _sel: Sel) -> Id {
-    autoreleased_data(Vec::new())
-}
-
-unsafe extern "C" fn data_with_data(_class: Id, _sel: Sel, other: Id) -> Id {
-    // SAFETY: a data object or nil.
-    autoreleased_data(unsafe { data_contents(other) }.to_vec())
-}
-
-unsafe extern "C" fn data_with_capacity(_class: Id, _sel: Sel, capacity: usize) -> Id {
-    autoreleased_data(Vec::with_capacity(capacity.min(1 << 24)))
-}
-
-unsafe extern "C" fn data_with_length(_class: Id, _sel: Sel, length: usize) -> Id {
-    autoreleased_data(vec![0; length])
-}
-
-unsafe extern "C" fn data_copy(receiver: Id, _sel: Sel) -> Id {
-    // SAFETY: a data object.
-    collections::new_data(unsafe { data_contents(receiver) }.to_vec()) as Id
-}
-
-unsafe extern "C" fn data_copy_with_zone(
-    receiver: Id,
-    sel: Sel,
-    _zone: *mut std::ffi::c_void,
-) -> Id {
-    // SAFETY: forwarded.
-    unsafe { data_copy(receiver, sel) }
-}
-
-unsafe extern "C" fn data_is_equal(receiver: Id, _sel: Sel, other: Id) -> bool {
-    // SAFETY: a data object, and nil or a live object; anything that is not
-    // data is not equal.
-    let Some(theirs) = (unsafe { collections::data(other as CFTypeRef) }) else {
-        return false;
-    };
-    // SAFETY: a data object - the `+alloc` placeholder is not one, and this is
-    // the cluster substitution the initialiser exists to perform.
-    let known = unsafe { collections::data(receiver as CFTypeRef) }.is_some();
-    // SAFETY: as above, with a fresh immutable copy of the caller's bytes.
-    unsafe { cluster_init(receiver, known, || collections::new_data(copy)) }
-}
-
+// The three `+` constructors below take `class` rather than `_class` and thread
+// it into [`autoreleased_data`], so a `+` constructor that `NSMutableData`
+// inherits builds a **mutable** data. Upstream's versions of these take the class
+// and discard it, which is why the merge produced a second one-argument
+// `autoreleased_data` beside ours; that one is gone, and this is the note for
+// whoever merges next. `+[NSData data]` is the fourth and lives above with its
+// own census note. The answer is a property of the *receiver class* and not of
+// the bytes, which is the same reason `new_data_for` exists beside
+// `mutable_receiver`.
 /// `-copyWithZone:`, which is also what `-[NSObject copy]` sends.
 ///
 /// **The zone is ignored.** The one direct send in the guest passes nil
@@ -1321,101 +1186,18 @@ unsafe extern "C" fn data_copy_with_zone(receiver: Id, _sel: Sel, _zone: *mut st
     collections::new_data(d.bytes.clone()) as Id
 }
 
-/// `-getBytes:length:`: the first `length` bytes into the caller's buffer.
+/// `-[NSData getBytes:length:]` - **not** upstream's `-[NSData getBytes:range:]`.
 ///
-/// **The bound is `min(length, self.length)`, and that is the contract rather
-/// than a convenience.** Two independent implementations of it agree, and they
-/// agree for a reason: `getBytes:length:` clamps *before* it forms the range it
-/// hands on, so it never reaches the range check that does raise.
-///
-/// * GNUstep `NSData.m`: "If length is greater than the size of the receiver,
-///   only the available bytes are copied", implemented as
-///   `[self getBytes: buffer range: NSMakeRange(0, l < length ? l : length)]`
-///   where `-getBytes:range:` is the one that does `GS_RANGE_CHECK` and raises;
-/// * swift-corelibs `NSData.swift`'s `getBytes(_:length:)`: `let actualCount =
-///   Swift.min(length, self.length)`.
-///
-/// **What Apple's own header adds, and what it does not.** `NSData.h` declares
-///
-/// ```objc
-/// - (void)getBytes:(void *)buffer length:(NSUInteger)length;
-/// - (void)getBytes:(void *)buffer range:(NSRange)range;
-/// - (void)getBytes:(void *)buffer NS_DEPRECATED("This method is unsafe because it
-///     could potentially cause buffer overruns. Use -getBytes:length: instead.");
-/// ```
-///
-/// and three things follow from those three lines. The deprecation says *why*
-/// the `length:` form exists: the one-argument form writes `self.length` bytes
-/// into a buffer the caller sized some other way, and the header calls that a
-/// buffer overrun - so **the caller owns the size**, which is the same statement
-/// as "clamp to what exists". The two spellings are both present, and only one of
-/// them can express a request that is *not* inside the data, so `range:` is the
-/// checked one. And `CFData.h` shows the layer the policy has to live at:
-/// `void CFDataGetBytes(CFDataRef theData, CFRange range, UInt8 *buffer)` - a
-/// **`CFRange`**, not a count - so `-[NSData getBytes:length:]` must form a range
-/// before it reaches CoreFoundation, and the clamp is what makes that range
-/// inside. (The header says none of this in prose. It says it in the two
-/// signatures and the one deprecation string, which is all there is.)
-///
-/// So the three cases are all distinguished, and none of them is a store past the
-/// end of the caller's buffer:
-///
-/// * **`length` at or below the data's** - `count` bytes are copied, which is what
-///   the caller sized its buffer for;
-/// * **`length` past the end** - what exists is copied and the caller is none the
-///   worse. Clamping is *not* a wrong answer here, and refusing would be: Apple's
-///   own implementations do not raise on this path, and a refusal would break a
-///   program that runs on a Mac. What would be a silent corruption is copying
-///   `length` bytes anyway, which is the mistake this spelling exists to rule out;
-/// * **`length` zero** - nothing is copied, **and a null buffer is fine**, because
-///   GNUstep's `-getBytes:range:` guards the whole copy with
-///   `if (aRange.length > 0)` and never touches `buffer` otherwise.
-///
-/// **The guest's one site sends *both* argument pairs, and the pair this
-/// implementation has to get right is the one that is not `(null, 0)`.** There is
-/// a single call instruction, at `Framework+0x7a1f094`
-/// (`call QWORD PTR [rip+0x6330f9e]`, the `_objc_msgSend` slot), and it has two
-/// predecessors that set `%rdx` and `%rcx`:
-///
-/// * `0x7a1f086` - `xor edx,edx; xor ecx,ecx`, a **null buffer and a zero
-///   length**. Reached by the `je` at `0x7a1efc2`, which jumps *to* the first
-///   `xor`, so this is the arm that does **not** fall through;
-/// * `0x7a1efd4` - `mov rdx,[rbp-0x50]; mov rcx,[rbp-0x48]; sub rcx,rdx; jmp
-///   0x7a1f08a`, a **real buffer and a real length** (`end - begin`, from the
-///   pair `call 0x4b2300` wrote at `0x7a1efc8`).
-///
-/// The receiver is `%r12`, and `0x7a1efa7` sets it from one of two answers, both
-/// of them a fresh `NSData`: `+[NSData dataWithBytes:length:]` at `0x7a1ef67`
-/// (two bytes holding a `shortValue`) or `-[NSString dataUsingEncoding:]` with
-/// `4` at `0x7a1ef99`. So the data's length and the length the caller asks for
-/// come from two unrelated computations, and **nothing in the binary says the
-/// second is the smaller** - which is precisely why the clamp is load-bearing
-/// here and an assumption would not be.
-///
-/// The remaining combination - a **null buffer with a non-zero length** - is the
-/// one case that cannot be honoured at all, and it is refused **by name** rather
-/// than turned into the `memcpy` from null that both implementations would
-/// perform. Of the two pairs above, only the first can be that combination if
-/// the function at `0x4b2300` honours its contract, so the refusal guards an
-/// input this guest's own code does not construct rather than a path it has; a
-/// null `begin` with a non-zero `end - begin` is not statically excluded.
+/// The merge renamed this function and kept its body, which is the reverse of
+/// what happened: the body below has always been `getBytes:length:`'s, and
+/// `getBytes:length:` is the one the guest sends (one site,
+/// `Framework+0x7a1f094`, with the two argument pairs its `raw-range.py`
+/// disassembly turned up). `getBytes:range:` is the *other* selector, it has
+/// **0** send sites, and the function that used to carry its name was not
+/// registered anywhere - so it was dead code sitting on top of a live method,
+/// and the name is restored here rather than the body being deleted. See the
+/// census table in `install()` for the rest of what is deliberately absent.
 unsafe extern "C" fn data_get_bytes_length(
-/// `receiver` is a data object.
-unsafe fn data_range<'a>(receiver: Id, location: usize, length: usize, what: &str) -> &'a [u8] {
-    let bytes = unsafe { data_contents(receiver) };
-    match location
-        .checked_add(length)
-        .filter(|end| *end <= bytes.len())
-    {
-        Some(end) => &bytes[location..end],
-        None => objc::fail!(
-            "{what}: range {{{location}, {length}}} exceeds data length {}",
-            bytes.len()
-        ),
-    }
-}
-
-unsafe extern "C" fn data_get_bytes_range(
     receiver: Id,
     _sel: Sel,
     buffer: *mut u8,
@@ -1525,11 +1307,6 @@ unsafe extern "C" fn data_with_contents_of_file_options(
         }
     };
     succeeded(autoreleased_data(class, bytes))
-unsafe extern "C" fn data_subdata(receiver: Id, _sel: Sel, location: usize, length: usize) -> Id {
-    // SAFETY: a data object.
-    autoreleased_data(
-        unsafe { data_range(receiver, location, length, "-subdataWithRange:") }.to_vec(),
-    )
 }
 
 unsafe extern "C" fn data_length(receiver: Id, _sel: Sel) -> usize {
@@ -1580,28 +1357,6 @@ unsafe extern "C" fn data_with_bytes_no_copy(
 ) -> Id {
     if bytes.is_null() && length > 0 {
         return std::ptr::null_mut();
-    with: *const u8,
-) {
-    // SAFETY: a data object; `with` covers `length` bytes by contract.
-    unsafe {
-        data_range(
-            receiver,
-            location,
-            length,
-            "-replaceBytesInRange:withBytes:",
-        )
-    };
-    let replacement = unsafe { raw(with, length) }.to_vec();
-    if let Some(bytes) = unsafe { collections::data(receiver as CFTypeRef) } {
-        bytes[location..location + length].copy_from_slice(&replacement);
-    }
-}
-
-unsafe extern "C" fn data_reset_bytes(receiver: Id, _sel: Sel, location: usize, length: usize) {
-    // SAFETY: a data object.
-    unsafe { data_range(receiver, location, length, "-resetBytesInRange:") };
-    if let Some(bytes) = unsafe { collections::data(receiver as CFTypeRef) } {
-        bytes[location..location + length].fill(0);
     }
     // SAFETY: the caller says `bytes` covers `length` bytes, checked just above.
     let copy = match length {
@@ -2195,6 +1950,35 @@ pub(crate) fn install() {
         // because the 7 and the 0 are other classes' selectors, the third because
         // all nine `mutableCopy` sends are on something else. Installing them
         // would be code nothing sends, outliving the reason it was written.
+        //
+        // **Eight methods upstream added are absent here, and that is a
+        // decision, not a merge accident** - it is recorded because a merge that
+        // drops code is otherwise indistinguishable from a merge that dropped it
+        // by accident, and the next person to merge will otherwise have to
+        // rediscover this. Upstream's eight, and the census over all 13 images
+        // for each: `hash`, `getBytes:`, `setLength:`, `increaseLengthBy:`,
+        // `appendData:`, `replaceBytesInRange:withBytes:`,
+        // `numberWithShort:`, `numberWithChar:`. Seven measure **0** loads and
+        // **0** sends, with no name outside `__objc_methname` to build one from at
+        // run time. (`hash` is the eighth and was not separately adjudicated - see
+        // the note on `description` below.)
+        //
+        // There is a second and stronger reason for the four mutators.
+        // `setLength:`, `increaseLengthBy:`, `appendData:` and
+        // `replaceBytesInRange:withBytes:` all write through
+        // `collections::data(...)`, which hands out a `&mut Vec<u8>` and **does
+        // not consult the mutability bit** - so each one as upstream writes it
+        // mutates a data this runtime has said cannot change, silently. That is
+        // precisely the hole `-[NSMutableData appendBytes:length:]` refuses by
+        // name, and `-mutableBytes` beside it. Restoring them unmodified would
+        // reopen it four times over, for four selectors no guest sends. If they
+        // are ever wanted, they belong behind the same `immutable(...)` refusal
+        // `append_bytes` uses, not behind `collections::data`.
+        //
+        // `numberWithShort:` is the one worth a second look before it is written
+        // off: a review this session asked whether the guest ever sends it
+        // refuted that it does, on a census over all 13 images, and the burden of
+        // proof is on the selector rather than on the refutation.
         "initWithBytes:length:" => data_init_with_bytes, c"@32@0:8r^v16Q24";
         "getBytes:length:" => data_get_bytes_length, c"v32@0:8^v16Q24";
         "copyWithZone:" => data_copy_with_zone, c"@24@0:8^v16";
@@ -3190,3 +2974,37 @@ mod tier1_tests {
         }
     }
 }
+
+
+// -----------------------------------------------------------------------------
+// What the merge brought and this census removes
+//
+// Seventeen functions arrived from upstream with their `methods!` rows and are
+// gone again here, because every one of them answers a selector this guest does
+// **not** send to a data. The census is the table in `install()` above: it counts
+// a selector's `__objc_selrefs` loads and the loads followed by a message send,
+// over all 13 guest images, and resolves the receiver's class at every site by
+// disassembly. Removed:
+//
+//   -init, -initWithData:, -initWithCapacity:, -initWithLength:,
+//   -initWithBytesNoCopy:length:, -initWithBytesNoCopy:length:freeWhenDone:,
+//   -initWithContentsOfFile:, -copy, -isEqual:, -subdataWithRange:,
+//   -resetBytesInRange:, +dataWithData:, +dataWithCapacity:, +dataWithLength:
+//
+// The two that look closest to live are not:
+//
+// * `-initWithData:` measures **2 sends**, and both are to `NSImage` and
+//   `NSBitmapImageRep` - other classes' selectors, zero of them a data.
+// * `-initWithCapacity:` measures **7 sends**, and **6 are `NSMutableArray` and
+//   1 is `NSMutableDictionary`** - again, none a data.
+//
+// And one row is not merely dead but **wrong**, which is the reason this is not
+// simply "add the rows back". Upstream registers
+// `"mutableBytes" => data_bytes, c"^v16@0:8"` - that is, the `*const u8` answer
+// cast to a `*mut` - and this file has a separate `mutable_bytes` for exactly
+// that reason. Handing out a pointer into an immutable data's storage lets a
+// caller change a data the runtime has already said cannot change, silently, and
+// it is the second thing the mutability bit has to guard. Installing upstream's
+// row would reopen the hole `-appendBytes:length:` refuses by name.
+//
+// If any of these is wanted back, the row needs a send site first.

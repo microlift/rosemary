@@ -44,16 +44,15 @@ fn class() -> &'static Class {
 
 /// An autoreleased `NSError`.
 pub fn make(domain: &str, code: i64, description: &str) -> Id {
-    let domain = crate::string::from_str(domain);
-    let user_info = make_user_info(description);
-    let made = with_objects(domain, code, user_info, description.to_string());
-    // The two objects above were made for this error alone and it holds the only
-    // reference to each; an autoreleased error is the owner now.
-    unsafe {
-        corefoundation::api::CFRelease(domain as corefoundation::base::CFTypeRef);
-        corefoundation::api::CFRelease(user_info as corefoundation::base::CFTypeRef);
-    }
-    made
+    // `made` takes ownership of both objects, and these two were made for this
+    // error alone, so there is nothing to release afterwards: the error holds the
+    // only reference to each and an autoreleased error is its owner.
+    objc::arc::autorelease(made(Contents {
+        domain: crate::string::from_str(domain),
+        code,
+        user_info: make_user_info(description),
+        description: description.to_string(),
+    }))
 }
 
 /// An autoreleased `NSError` carrying a `userInfo` the caller built.
@@ -62,69 +61,72 @@ pub fn make(domain: &str, code: i64, description: &str) -> Id {
 /// lives and `-userInfo` hands back the object that was written rather than an
 /// equal one.
 pub fn make_with_user_info(domain: Id, code: i64, user_info: Id) -> Id {
-    with_objects(domain, code, user_info, String::new())
+    // **Both** objects, not just `user_info`: `Contents` holds `domain` as a
+    // retained `Id` too (see its doc comment), so a caller that did not take a
+    // reference for the domain would leave the error pointing at storage it does
+    // not own. This function is the only path into `made` that does not already
+    // own both, so both are taken here.
+    objc::arc::retain(domain);
+    objc::arc::retain(user_info);
+    objc::arc::autorelease(made(Contents {
+        domain,
+        code,
+        user_info,
+        description: String::new(),
+    }))
 }
 
 /// The one allocation path, so every error in this runtime has the same shape.
-fn with_objects(domain: Id, code: i64, user_info: Id, description: String) -> Id {
+///
+/// **At +1, and it retains nothing and autoreleases nothing.** [`Contents`]
+/// holds `domain` and `user_info` as *retained objects*, so this takes ownership
+/// of a reference to each: every caller above already holds one (having just made
+/// it, or having retained the caller's) and hands it over by calling this. That
+/// is the whole ownership contract, stated once, instead of each caller
+/// remembering to retain on the way in and release on the way out.
+fn made(contents: Contents) -> Id {
     // SAFETY: `Body` begins with `isa` and is the layout `class` was registered
     // with.
     let body: *mut Body = unsafe { corefoundation::base::allocate(class()) };
     if body.is_null() {
         return std::ptr::null_mut();
     }
-    // SAFETY: the objects are live and the error takes its own reference to
-    // each from here.
-    unsafe {
-        objc::arc::retain(domain);
-        objc::arc::retain(user_info);
-    }
-    let contents = Contents {
     // SAFETY: a live instance whose second word is ours to fill in.
     unsafe { (*body).contents = Box::into_raw(Box::new(contents)) };
     body as Id
 }
 
-/// The text of a string object, or `None` for nil or anything else.
+/// Upstream's eager half of this module is gone, and the reason is a
+/// behavioural difference rather than a merge accident.
 ///
-/// # Safety
+/// Upstream builds a description **at construction**: `from_parts` reads
+/// `NSLocalizedDescription` out of the caller's dictionary and, when the
+/// dictionary has none, synthesises Apple's text - "The operation couldn't be
+/// completed. (<domain> error <code>.)". This module reads the same key
+/// **lazily**, in `-localizedDescription`, and refuses **by name** when the
+/// dictionary has no such key, because that text is a *localised* string and a
+/// hard-coded English sentence under a localised key is a claim this runtime
+/// cannot make. The lazy read is also the more faithful of the two: Apple retains
+/// the dictionary, so a caller that adds the key afterwards sees its own value.
 ///
-/// `object` is nil or a live object.
-unsafe fn string_text(object: Id) -> Option<String> {
-    unsafe { corefoundation::string::as_string(object as corefoundation::base::CFTypeRef) }
-        .map(|s| String::from_utf16_lossy(&s.utf16()))
-}
-
-/// An error from a guest's domain, code and dictionary, at +1.
+/// So `string_text`, `from_parts`, `error_with_domain` and `init_with_domain` are
+/// all unreachable from the installed table and are removed. Measured, with
+/// `strings -a` over the Framework and a positive control of three selectors
+/// known to be sent (`localizedDescription`, `appearanceNamed:`,
+/// `copyWithZone:`, one occurrence each):
 ///
-/// # Safety
+/// | selector | occurrences | installed here |
+/// |---|--:|---|
+/// | `errorWithDomain:code:userInfo:` | 1 | yes, as `error_with_domain_code_user_info` |
+/// | `initWithDomain:code:userInfo:` | **0** | no, and cannot be called |
+/// | `localizedDescription` | 1 | yes |
+/// | `NSLocalizedDescription` | 0 | written and read by us both, never by the guest |
 ///
-/// `domain` is a string or nil, and `info` a dictionary or nil.
-unsafe fn from_parts(domain: Id, code: i64, info: Id) -> Id {
-    let domain = unsafe { string_text(domain) }.unwrap_or_default();
-    let described = (!info.is_null())
-        .then(|| {
-            let key = crate::string::from_str("NSLocalizedDescription");
-            // SAFETY: a dictionary and a key this call owns.
-            let value =
-                unsafe { corefoundation::api::CFDictionaryGetValue(info as _, key as _) as Id };
-            unsafe { corefoundation::api::CFRelease(key as _) };
-            unsafe { string_text(value) }
-        })
-        .flatten();
-    let description = described.unwrap_or_else(|| {
-        format!("The operation couldn\u{2019}t be completed. ({domain} error {code}.)")
-    });
-    made(Contents {
-        domain,
-        code,
-        user_info,
-        description,
-    };
-    // SAFETY: a live instance whose second word is ours to fill in.
-    unsafe { (*body).contents = Box::into_raw(Box::new(contents)) };
-    objc::arc::autorelease(body as Id)
-}
+/// `initWithDomain:code:userInfo:` being absent from the image is why
+/// `init_with_domain` was never registered upstream either: there is nothing to
+/// receive the message. What is left installed is the one selector the guest
+/// sends, and it refuses a nil domain by name rather than making an error with
+/// no domain to report.
 
 /// The one-entry `userInfo` a `make()`-built error reports.
 ///
@@ -149,31 +151,6 @@ fn make_user_info(description: &str) -> Id {
         corefoundation::api::CFRelease(value as corefoundation::base::CFTypeRef);
         corefoundation::api::CFAutorelease(dictionary) as Id
     }
-        user_info: objc::arc::retain(info),
-    })
-}
-
-unsafe extern "C" fn error_with_domain(
-    _class: Id,
-    _sel: Sel,
-    domain: Id,
-    code: i64,
-    info: Id,
-) -> Id {
-    // SAFETY: the caller's string and dictionary.
-    objc::arc::autorelease(unsafe { from_parts(domain, code, info) })
-}
-
-unsafe extern "C" fn init_with_domain(
-    receiver: Id,
-    _sel: Sel,
-    domain: Id,
-    code: i64,
-    info: Id,
-) -> Id {
-    objc::arc::release(receiver);
-    // SAFETY: as above.
-    unsafe { from_parts(domain, code, info) }
 }
 
 /// # Safety
@@ -314,7 +291,7 @@ unsafe extern "C" fn error_with_domain_code_user_info(
              no domain cannot be reported as one"
         );
     }
-    with_objects(domain, code, user_info, String::new())
+    make_with_user_info(domain, code, user_info)
 }
 
 pub(crate) fn install() {
