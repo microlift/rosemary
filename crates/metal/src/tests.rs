@@ -623,6 +623,7 @@ fn triangle_library() -> metal_translate::TranslatedLibrary {
                         interpolation: None,
                     },
                     name: Some("position".to_string()),
+                    signed: false,
                 }],
                 outputs: vec![ir::StageOutput {
                     field: None,

@@ -179,7 +179,14 @@ impl Emitter {
                 .get(input.argument as usize)
                 .ok_or_else(|| emission("stage input names a missing argument"))?;
             self.storage_type(&parameter.ty, StorageClass::Input)?;
-            let ty = self.type_id(&parameter.ty)?;
+            let ty = match parameter.ty.signed_integer().filter(|_| input.signed) {
+                Some(signed) => {
+                    let signed = self.type_id(&signed)?;
+                    self.signed_inputs.insert(parameter.value, signed);
+                    signed
+                }
+                None => self.type_id(&parameter.ty)?,
+            };
             let pointer = self.builder.type_pointer(None, StorageClass::Input, ty);
             let variable = self
                 .builder
@@ -469,9 +476,24 @@ impl Emitter {
                 continue;
             };
             let ty = self.type_id(&parameter.ty)?;
-            self.builder
-                .load(ty, Some(values[&parameter.value]), variable, None, [])
-                .map_err(build_error)?;
+            let result = values[&parameter.value];
+            match self.signed_inputs.get(&parameter.value).copied() {
+                // The body reads the signless parameter it was written against.
+                Some(signed) => {
+                    let loaded = self
+                        .builder
+                        .load(signed, None, variable, None, [])
+                        .map_err(build_error)?;
+                    self.builder
+                        .bitcast(ty, Some(result), loaded)
+                        .map_err(build_error)?;
+                }
+                None => {
+                    self.builder
+                        .load(ty, Some(result), variable, None, [])
+                        .map_err(build_error)?;
+                }
+            }
         }
         Ok(())
     }

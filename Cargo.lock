@@ -1639,7 +1639,11 @@ dependencies = [
  "corefoundation",
  "exports",
  "foundation",
+ "getrandom 0.3.4",
  "objc",
+ "rustls-pki-types",
+ "rustls-webpki",
+ "webpki-roots",
 ]
 
 [[package]]

@@ -80,6 +80,42 @@ fn with_objects(domain: Id, code: i64, user_info: Id, description: String) -> Id
         objc::arc::retain(user_info);
     }
     let contents = Contents {
+    // SAFETY: a live instance whose second word is ours to fill in.
+    unsafe { (*body).contents = Box::into_raw(Box::new(contents)) };
+    body as Id
+}
+
+/// The text of a string object, or `None` for nil or anything else.
+///
+/// # Safety
+///
+/// `object` is nil or a live object.
+unsafe fn string_text(object: Id) -> Option<String> {
+    unsafe { corefoundation::string::as_string(object as corefoundation::base::CFTypeRef) }
+        .map(|s| String::from_utf16_lossy(&s.utf16()))
+}
+
+/// An error from a guest's domain, code and dictionary, at +1.
+///
+/// # Safety
+///
+/// `domain` is a string or nil, and `info` a dictionary or nil.
+unsafe fn from_parts(domain: Id, code: i64, info: Id) -> Id {
+    let domain = unsafe { string_text(domain) }.unwrap_or_default();
+    let described = (!info.is_null())
+        .then(|| {
+            let key = crate::string::from_str("NSLocalizedDescription");
+            // SAFETY: a dictionary and a key this call owns.
+            let value =
+                unsafe { corefoundation::api::CFDictionaryGetValue(info as _, key as _) as Id };
+            unsafe { corefoundation::api::CFRelease(key as _) };
+            unsafe { string_text(value) }
+        })
+        .flatten();
+    let description = described.unwrap_or_else(|| {
+        format!("The operation couldn\u{2019}t be completed. ({domain} error {code}.)")
+    });
+    made(Contents {
         domain,
         code,
         user_info,
@@ -113,6 +149,31 @@ fn make_user_info(description: &str) -> Id {
         corefoundation::api::CFRelease(value as corefoundation::base::CFTypeRef);
         corefoundation::api::CFAutorelease(dictionary) as Id
     }
+        user_info: objc::arc::retain(info),
+    })
+}
+
+unsafe extern "C" fn error_with_domain(
+    _class: Id,
+    _sel: Sel,
+    domain: Id,
+    code: i64,
+    info: Id,
+) -> Id {
+    // SAFETY: the caller's string and dictionary.
+    objc::arc::autorelease(unsafe { from_parts(domain, code, info) })
+}
+
+unsafe extern "C" fn init_with_domain(
+    receiver: Id,
+    _sel: Sel,
+    domain: Id,
+    code: i64,
+    info: Id,
+) -> Id {
+    objc::arc::release(receiver);
+    // SAFETY: as above.
+    unsafe { from_parts(domain, code, info) }
 }
 
 /// # Safety

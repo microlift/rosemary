@@ -24,14 +24,19 @@ impl DarwinTranslation<libc::sched_param> for SchedParam {
 /// On some operating systems, particularly Windows and some BSDs, inputting a NULL `policy` or `param` is considered invalid and not optional.
 /// Additionally, SCHED_ constants are different between systems.
 pub unsafe extern "C" fn pthread_getschedparam(
-    thread: libc::pthread_t,
+    thread: u64,
     policy: *mut c_int,
     param: *mut SchedParam,
 ) -> c_int {
     let mut host_policy: i32 = 0;
     let mut host_param = std::mem::MaybeUninit::<libc::sched_param>::uninit();
-    let result =
-        unsafe { libc::pthread_getschedparam(thread, &mut host_policy, host_param.as_mut_ptr()) };
+    let result = unsafe {
+        libc::pthread_getschedparam(
+            super::thread_of(thread),
+            &mut host_policy,
+            host_param.as_mut_ptr(),
+        )
+    };
     if result != 0 {
         // MAYBE_INACCURATE: Darwin can only return ESRCH - do we emulate those semantics?
         return crate::errno::from_host(result);
@@ -49,7 +54,7 @@ pub unsafe extern "C" fn pthread_getschedparam(
 }
 
 pub unsafe extern "C" fn pthread_setschedparam(
-    thread: libc::pthread_t,
+    thread: u64,
     policy: c_int,
     param: *const SchedParam,
 ) -> i32 {
@@ -68,6 +73,6 @@ pub unsafe extern "C" fn pthread_setschedparam(
     };
     host_param.sched_priority = priority;
     crate::errno::from_host(unsafe {
-        libc::pthread_setschedparam(thread, host_policy, &host_param)
+        libc::pthread_setschedparam(super::thread_of(thread), host_policy, &host_param)
     })
 }

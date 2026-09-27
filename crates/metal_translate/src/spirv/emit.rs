@@ -40,6 +40,9 @@ pub(super) struct Emitter {
     pub(super) global_invocation_id: Option<u32>,
     pub(super) glsl_std_450: u32,
     pub(super) stage_inputs: HashMap<ValueId, u32>,
+    /// The signed type a stage input is declared with, where it differs from
+    /// its signless parameter.
+    pub(super) signed_inputs: HashMap<ValueId, u32>,
     /// Output variables in the order of the entry point's output list; each
     /// receives one component of the returned value.
     pub(super) stage_outputs: Vec<u32>,
@@ -79,6 +82,7 @@ impl Emitter {
             global_invocation_id: None,
             glsl_std_450,
             stage_inputs: HashMap::new(),
+            signed_inputs: HashMap::new(),
             stage_outputs: Vec::new(),
             return_type: None,
             writes_depth: false,

@@ -9,7 +9,11 @@ pub fn parse(bytes: &[u8]) -> Option<HashMap<String, String>> {
         return from_plist(bytes);
     }
     let text = decode(bytes)?;
-    Parser { chars: text.chars().collect(), at: 0 }.pairs()
+    Parser {
+        chars: text.chars().collect(),
+        at: 0,
+    }
+    .pairs()
 }
 
 fn from_plist(bytes: &[u8]) -> Option<HashMap<String, String>> {
@@ -61,7 +65,8 @@ impl Parser {
                 (Some('/'), Some('*')) => {
                     self.at += 2;
                     while self.at < self.chars.len()
-                        && !(self.chars[self.at] == '*' && self.chars.get(self.at + 1) == Some(&'/'))
+                        && !(self.chars[self.at] == '*'
+                            && self.chars.get(self.at + 1) == Some(&'/'))
                     {
                         self.at += 1;
                     }
@@ -155,7 +160,8 @@ mod tests {
 
     #[test]
     fn reads_utf16_pairs_with_comments_and_escapes() {
-        let text = "/* note */\n\"Play\" = \"Jouer\";\n// line\n\"Quote\" = \"a \\\"b\\\"\\n\";\nSame;";
+        let text =
+            "/* note */\n\"Play\" = \"Jouer\";\n// line\n\"Quote\" = \"a \\\"b\\\"\\n\";\nSame;";
         let mut bytes = vec![0xff, 0xfe];
         for unit in text.encode_utf16() {
             bytes.extend_from_slice(&unit.to_le_bytes());

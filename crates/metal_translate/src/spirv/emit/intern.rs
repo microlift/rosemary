@@ -243,8 +243,9 @@ impl Emitter {
             }
             Type::Texture(texture) => {
                 let texture = texture.clone();
-                self.arithmetic_type(&texture.texel)?;
-                let scalar = self.type_id(&texture.texel)?;
+                let scalar = texture.sampled_scalar();
+                self.arithmetic_type(&scalar)?;
+                let scalar = self.type_id(&scalar)?;
                 let dimension = match texture.dimension {
                     TextureDimension::D1 => Dim::Dim1D,
                     TextureDimension::D2 => Dim::Dim2D,

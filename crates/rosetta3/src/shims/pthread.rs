@@ -66,7 +66,11 @@ pub fn pthread_create(
 
     match result {
         Ok(thread) => {
-            mem.write_u64(out, thread as u64, symbol)?;
+            mem.write_u64(
+                out,
+                darwin::pthread::handle::for_host(thread as u64),
+                symbol,
+            )?;
             set_int_return(ctx, 0);
         }
         Err(rc) => set_int_return(ctx, rc),

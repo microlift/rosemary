@@ -53,6 +53,19 @@ static POSTED_EVENTS: Mutex<VecDeque<usize>> = Mutex::new(VecDeque::new());
 /// The event inside `-sendEvent:`, for `-currentEvent`.
 static CURRENT_EVENT: AtomicUsize = AtomicUsize::new(0);
 
+/// The main run loop's source for posted events, which exists to end its wait.
+///
+/// A program that runs work on the main thread by posting an event and waiting
+/// for its `-sendEvent:` - Feral's ports do, several times a frame - pays for
+/// every round trip whatever the loop's slice is. On a Mac the event queue is a
+/// run loop source, so posting from another thread wakes the loop at once.
+static POSTED_SOURCE: std::sync::OnceLock<std::sync::Arc<corefoundation::runloop::Source>> =
+    std::sync::OnceLock::new();
+
+/// Nothing to do: the events are sent by `turn`, or taken by
+/// `-nextEventMatchingMask:`, once the loop returns for this source.
+unsafe extern "C" fn posted_source_fired(_info: *mut c_void) {}
+
 fn posted_events() -> std::sync::MutexGuard<'static, VecDeque<usize>> {
     POSTED_EVENTS.lock().unwrap_or_else(|e| e.into_inner())
 }
@@ -302,6 +315,9 @@ fn register_common_modes() {
         let loop_ = corefoundation::runloop::main();
         loop_.add_common_mode(MODAL_PANEL_MODE);
         loop_.add_common_mode("NSEventTrackingRunLoopMode");
+        let source = POSTED_SOURCE
+            .get_or_init(|| corefoundation::runloop::new_source(Some(posted_source_fired), 0));
+        loop_.add_source(source, corefoundation::runloop::COMMON_MODES);
     });
 }
 
@@ -340,7 +356,9 @@ unsafe fn turn(receiver: Id, mode: &str) {
 /// Called on the main thread, from a place a run loop callback may reenter.
 unsafe fn service_run_loop(mode: &str, seconds: f64) {
     darwin::dispatch::queue::drain_main();
-    let result = corefoundation::runloop::main().run_in_mode(mode, seconds, false);
+    // Returning after a source lets an event posted from another thread be sent
+    // now rather than when the slice ends - see `POSTED_SOURCE`.
+    let result = corefoundation::runloop::main().run_in_mode(mode, seconds, true);
     if result == corefoundation::runloop::result::FINISHED && seconds > 0.0 {
         // Nothing scheduled: a program with no display link and no source is
         // waiting to be told to stop, and spinning on that would be a core at a
@@ -664,6 +682,11 @@ unsafe extern "C" fn post_event(_receiver: Id, _sel: Sel, event: Id, at_start: u
     match at_start != 0 {
         true => queue.push_front(event),
         false => queue.push_back(event),
+    }
+    drop(queue);
+    if let Some(source) = POSTED_SOURCE.get() {
+        source.signal();
+        corefoundation::runloop::main().wake();
     }
 }
 

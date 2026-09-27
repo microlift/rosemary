@@ -38,7 +38,11 @@ const MATRIX_DIMENSIONS: u32 = 3009;
 /// A matrix mixer's `(input channels, output channels)`: every input bus's
 /// channels together, and the output format's.
 fn matrix_dimensions(unit: &crate::Unit) -> (u32, u32) {
-    let inputs = unit.inputs.iter().map(|input| input.format.channels_per_frame).sum();
+    let inputs = unit
+        .inputs
+        .iter()
+        .map(|input| input.format.channels_per_frame)
+        .sum();
     (inputs, unit.format.channels_per_frame)
 }
 

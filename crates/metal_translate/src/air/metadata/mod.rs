@@ -430,6 +430,7 @@ impl Metadata {
                     argument,
                     binding: input_binding(tag, rest)?,
                     name: argument_name(&items),
+                    signed: *tag == "air.vertex_input" && signed_integer_argument(&items),
                 }),
             }
         }

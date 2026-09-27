@@ -10,3 +10,7 @@ exports.workspace = true
 objc.workspace = true
 corefoundation.workspace = true
 foundation.workspace = true
+getrandom.workspace = true
+rustls-pki-types.workspace = true
+webpki.workspace = true
+webpki-roots.workspace = true

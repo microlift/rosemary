@@ -167,10 +167,10 @@ fn guest_thread_of(pthread: u64) -> Option<&'static crate::thread::GuestThread> 
         return None;
     }
     // SAFETY: `pthread` is a `pthread_t` the guest holds - from `pthread_self` or
-    // `pthread_create`, both of which are the host's own, so the value is one
-    // libpthread issued. `pthread_mach_thread_np` reads the port name out of it and
-    // sends nothing.
-    let port = unsafe { libc::pthread_mach_thread_np(pthread as libc::pthread_t) };
+    // `pthread_create` - mapped back to the host's, so the value is one libpthread
+    // issued. `pthread_mach_thread_np` reads the port name out of it and sends
+    // nothing.
+    let port = unsafe { libc::pthread_mach_thread_np(darwin::pthread::thread_of(pthread)) };
     crate::thread::by_key(port)
 }
 

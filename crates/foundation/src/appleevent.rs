@@ -959,8 +959,14 @@ unsafe fn dispatch_to_c(event: Id, reply: Id, event_class: u32, event_id: u32) {
     let Some((proc_, refcon)) = found else {
         return;
     };
-    let event = AeDesc { descriptor_type: TYPE_APPLE_EVENT, data_handle: event };
-    let mut reply = AeDesc { descriptor_type: TYPE_APPLE_EVENT, data_handle: reply };
+    let event = AeDesc {
+        descriptor_type: TYPE_APPLE_EVENT,
+        data_handle: event,
+    };
+    let mut reply = AeDesc {
+        descriptor_type: TYPE_APPLE_EVENT,
+        data_handle: reply,
+    };
     // SAFETY: the guest registered a function of this type; a callable thunk
     // under emulation, as the ABI table describes the argument.
     let f: CHandlerProc = unsafe { std::mem::transmute(proc_) };
@@ -982,7 +988,12 @@ pub unsafe extern "C" fn AEInstallEventHandler(
     }
     let mut handlers = C_HANDLERS.lock().unwrap_or_else(|e| e.into_inner());
     handlers.retain(|h| (h.event_class, h.event_id) != (event_class, event_id));
-    handlers.push(CHandler { event_class, event_id, proc_: handler, refcon });
+    handlers.push(CHandler {
+        event_class,
+        event_id,
+        proc_: handler,
+        refcon,
+    });
     0
 }
 
@@ -998,7 +1009,8 @@ pub unsafe extern "C" fn AERemoveEventHandler(
     let mut handlers = C_HANDLERS.lock().unwrap_or_else(|e| e.into_inner());
     let before = handlers.len();
     handlers.retain(|h| {
-        (h.event_class, h.event_id) != (event_class, event_id) || (handler != 0 && h.proc_ != handler)
+        (h.event_class, h.event_id) != (event_class, event_id)
+            || (handler != 0 && h.proc_ != handler)
     });
     match handlers.len() == before {
         true => HANDLER_NOT_FOUND,
@@ -1008,7 +1020,12 @@ pub unsafe extern "C" fn AERemoveEventHandler(
 
 /// `OSErr AECreateDesc(DescType, const void *, Size, AEDesc *)`
 #[allow(non_snake_case)]
-pub unsafe extern "C" fn AECreateDesc(kind: u32, bytes: *const u8, size: isize, out: *mut AeDesc) -> i16 {
+pub unsafe extern "C" fn AECreateDesc(
+    kind: u32,
+    bytes: *const u8,
+    size: isize,
+    out: *mut AeDesc,
+) -> i16 {
     if out.is_null() || size < 0 || (bytes.is_null() && size > 0) {
         return PARAM_ERR;
     }
@@ -1018,7 +1035,12 @@ pub unsafe extern "C" fn AECreateDesc(kind: u32, bytes: *const u8, size: isize, 
         _ => unsafe { std::slice::from_raw_parts(bytes, size as usize) }.to_vec(),
     };
     // SAFETY: the caller's writable `AEDesc`.
-    unsafe { out.write(AeDesc { descriptor_type: kind, data_handle: wrap(Desc::leaf(kind, data)) }) };
+    unsafe {
+        out.write(AeDesc {
+            descriptor_type: kind,
+            data_handle: wrap(Desc::leaf(kind, data)),
+        })
+    };
     0
 }
 
@@ -1031,7 +1053,10 @@ pub unsafe extern "C" fn AEDisposeDesc(desc: *mut AeDesc) -> i16 {
     // SAFETY: the caller's `AEDesc`, whose handle is one of this module's or null.
     unsafe {
         objc::arc::release((*desc).data_handle);
-        desc.write(AeDesc { descriptor_type: TYPE_NULL, data_handle: std::ptr::null_mut() });
+        desc.write(AeDesc {
+            descriptor_type: TYPE_NULL,
+            data_handle: std::ptr::null_mut(),
+        });
     }
     0
 }

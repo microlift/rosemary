@@ -77,7 +77,11 @@ mod tests {
 
     #[test]
     fn each_table_round_trips_its_upper_half() {
-        for code in [encoding::MAC_ROMAN, encoding::WINDOWS_LATIN1, encoding::ISO_LATIN_1] {
+        for code in [
+            encoding::MAC_ROMAN,
+            encoding::WINDOWS_LATIN1,
+            encoding::ISO_LATIN_1,
+        ] {
             for byte in 0x80..=0xFFu8 {
                 let unit = decode(byte, code).unwrap();
                 assert_eq!(encode(unit, code), Some(byte), "{code:#x} {byte:#x}");

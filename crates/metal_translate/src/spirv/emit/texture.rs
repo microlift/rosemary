@@ -1,4 +1,11 @@
 use super::*;
+use crate::ir::TextureType;
+
+/// The IR's signless result a signed image access is bitcast into.
+struct Unsigned {
+    ty: u32,
+    result_id: Option<u32>,
+}
 
 impl Emitter {
     /// Emit one such instruction.
@@ -16,10 +23,21 @@ impl Emitter {
                 array_index,
                 value,
             } => {
+                let Some(Type::Texture(image_type)) = operand_type(function, texture) else {
+                    return Err(emission("texture write has no texture operand"));
+                };
+                let written = operand_type(function, value)
+                    .ok_or_else(|| emission("texture write has no value type"))?;
                 let image = self.operand(texture, values)?;
                 let coordinate =
                     self.texture_coordinate(function, coordinate, array_index.as_ref(), values)?;
-                let value = self.operand(value, values)?;
+                let mut value = self.operand(value, values)?;
+                if let Some(signed) = self.signed_texels(&image_type, &written)? {
+                    value = self
+                        .builder
+                        .bitcast(signed, None, value)
+                        .map_err(build_error)?;
+                }
                 self.builder
                     .image_write(image, coordinate, value, None, [])
                     .map_err(build_error)?;
@@ -37,10 +55,11 @@ impl Emitter {
                 let result = instruction
                     .result
                     .ok_or_else(|| emission("texture sample has no result"))?;
-                let ty = self.type_id(&function.values[result.0 as usize])?;
                 let Some(Type::Texture(image_type)) = operand_type(function, texture) else {
                     return Err(emission("texture sample has no texture operand"));
                 };
+                let (ty, result_id, signed) =
+                    self.texel_result(&image_type, &function.values[result.0 as usize], result_id)?;
                 let image_id = self.type_id(&Type::Texture(image_type))?;
                 let sampled_type = self.builder.type_sampled_image(image_id);
                 let image = self.operand(texture, values)?;
@@ -119,6 +138,7 @@ impl Emitter {
                             .map_err(build_error)?;
                     }
                 }
+                self.unsign_texels(signed, result_id)?;
             }
             InstructionKind::TextureRead {
                 texture,
@@ -130,10 +150,11 @@ impl Emitter {
                 let result = instruction
                     .result
                     .ok_or_else(|| emission("texture read has no result"))?;
-                let ty = self.type_id(&function.values[result.0 as usize])?;
                 let Some(Type::Texture(image_type)) = operand_type(function, texture) else {
                     return Err(emission("texture read has no texture operand"));
                 };
+                let (ty, result_id, signed) =
+                    self.texel_result(&image_type, &function.values[result.0 as usize], result_id)?;
                 let image = self.operand(texture, values)?;
                 let coordinate =
                     self.texture_coordinate(function, coordinate, array_index.as_ref(), values)?;
@@ -157,6 +178,7 @@ impl Emitter {
                         .image_read(ty, result_id, image, coordinate, Some(mask), extra)
                         .map_err(build_error)?;
                 }
+                self.unsign_texels(signed, result_id)?;
             }
             InstructionKind::TextureQuerySize {
                 texture,
@@ -213,6 +235,54 @@ impl Emitter {
             }
             _ => unreachable!("not a texture instruction"),
         }
+        Ok(())
+    }
+
+    /// The signed form of `ty` where `texture` holds signed integers and `ty`
+    /// is an integer value, which is the type Vulkan requires an image access
+    /// to use; `None` where the IR's own signless type already matches.
+    fn signed_texels(
+        &mut self,
+        texture: &TextureType,
+        ty: &Type,
+    ) -> Result<Option<u32>, TranslateError> {
+        match ty.signed_integer().filter(|_| texture.signed) {
+            Some(signed) => self.type_id(&signed).map(Some),
+            None => Ok(None),
+        }
+    }
+
+    /// The result type and id an image access is emitted with. A signed
+    /// access gets a fresh id, and `unsign_texels` later bitcasts it into the
+    /// IR's signless result under the original id.
+    fn texel_result(
+        &mut self,
+        texture: &TextureType,
+        result: &Type,
+        result_id: Option<u32>,
+    ) -> Result<(u32, Option<u32>, Option<Unsigned>), TranslateError> {
+        let ty = self.type_id(result)?;
+        Ok(match self.signed_texels(texture, result)? {
+            Some(signed) => (
+                signed,
+                Some(self.builder.id()),
+                Some(Unsigned { ty, result_id }),
+            ),
+            None => (ty, result_id, None),
+        })
+    }
+
+    fn unsign_texels(
+        &mut self,
+        unsigned: Option<Unsigned>,
+        value: Option<u32>,
+    ) -> Result<(), TranslateError> {
+        let (Some(Unsigned { ty, result_id }), Some(value)) = (unsigned, value) else {
+            return Ok(());
+        };
+        self.builder
+            .bitcast(ty, result_id, value)
+            .map_err(build_error)?;
         Ok(())
     }
 }

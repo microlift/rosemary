@@ -34,6 +34,7 @@ pub(super) fn writable_float_texture(dimension: TextureDimension) -> Type {
         multisampled: false,
         depth: false,
         texel: Box::new(Type::Float { bits: 32 }),
+        signed: false,
         access: Access::Write,
     })
 }

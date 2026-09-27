@@ -270,7 +270,10 @@ unsafe extern "C" fn replacing_occurrences(receiver: Id, _sel: Sel, target: Id, 
     }
     let mut out = Vec::with_capacity(haystack.len());
     let mut rest = haystack.as_slice();
-    while let Some(at) = rest.windows(needle.len()).position(|w| w == needle.as_slice()) {
+    while let Some(at) = rest
+        .windows(needle.len())
+        .position(|w| w == needle.as_slice())
+    {
         out.extend_from_slice(&rest[..at]);
         out.extend_from_slice(&with);
         rest = &rest[at + needle.len()..];

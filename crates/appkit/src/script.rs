@@ -51,6 +51,14 @@ enum Action {
         character: u32,
         modifiers: u16,
     },
+    /// One key pressed or released alone, for a program that acts on a key
+    /// for as long as it is held - walking, in a game.
+    Hold {
+        scancode: u32,
+        character: u32,
+        modifiers: u16,
+        down: bool,
+    },
     /// Each character in turn, as the key that types it.
     Type(String),
     /// Drive a different window from here on, by the names
@@ -109,6 +117,19 @@ fn action(rest: &str) -> Option<Action> {
         "up" => Some(Action::Up(argument.parse().unwrap_or(1))),
         "scroll" => point(argument).map(|(x, y)| Action::Scroll(x, y)),
         "key" => chord(argument),
+        "keydown" | "keyup" => match chord(argument)? {
+            Action::Key {
+                scancode,
+                character,
+                modifiers,
+            } => Some(Action::Hold {
+                scancode,
+                character,
+                modifiers,
+                down: verb == "keydown",
+            }),
+            _ => None,
+        },
         "type" => Some(Action::Type(argument.to_owned())),
         "window" => Some(Action::Window(argument.to_owned())),
         _ => None,
@@ -330,6 +351,19 @@ fn perform(action: &Action) {
             character,
             modifiers,
         } => key(window, *scancode, *character, *modifiers),
+        Action::Hold {
+            scancode,
+            character,
+            modifiers,
+            down,
+        } => crate::event::deliver(Event::Key {
+            window,
+            scancode: *scancode,
+            key: *character,
+            modifiers: *modifiers,
+            down: *down,
+            repeat: false,
+        }),
         Action::Window(name) => {
             *CHOSEN.lock().unwrap_or_else(|e| e.into_inner()) = Some(name.clone());
         }
@@ -445,6 +479,19 @@ fn typed(character: char) -> Option<(u32, bool)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_held_key_is_pressed_and_released_by_separate_steps() {
+        let steps = parse("1: keydown w; 2: keyup w");
+        let down = |down| Action::Hold {
+            scancode: 26,
+            character: 'w' as u32,
+            modifiers: 0,
+            down,
+        };
+        assert_eq!(steps[0].action, down(true));
+        assert_eq!(steps[1].action, down(false));
+    }
 
     #[test]
     fn a_script_is_read_in_time_order_whatever_order_it_is_written_in() {

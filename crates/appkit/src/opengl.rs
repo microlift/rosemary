@@ -360,15 +360,18 @@ unsafe extern "C" fn get_values(
 /// Silently skipping one is how a program that asked for a depth buffer gets a
 /// context without one and fails much later, drawing with no depth test and no
 /// diagnostic anywhere.
-fn apply(format: Id) {
+///
+/// Whether the format asks for a core profile.
+fn apply(format: Id) -> bool {
     use sdl3::video::attr;
     let Some(list) = (match format.is_null() {
         true => None,
         // SAFETY: a pixel format this crate made; the pointer is its own.
         false => unsafe { format_of(format).attributes.as_ref() },
     }) else {
-        return;
+        return false;
     };
+    let mut core = false;
 
     let mut i = 0;
     while i < list.len() {
@@ -408,19 +411,13 @@ fn apply(format: Id) {
                     attr::CONTEXT_PROFILE_MASK,
                     sdl3::video::profile::COMPATIBILITY,
                 ),
-                attribute::PROFILE_3_2_CORE => {
-                    sdl3::video::gl_set_attribute(
-                        attr::CONTEXT_PROFILE_MASK,
-                        sdl3::video::profile::CORE,
-                    ) && sdl3::video::gl_set_attribute(attr::CONTEXT_MAJOR_VERSION, 3)
-                        && sdl3::video::gl_set_attribute(attr::CONTEXT_MINOR_VERSION, 2)
-                }
-                attribute::PROFILE_4_1_CORE => {
-                    sdl3::video::gl_set_attribute(
-                        attr::CONTEXT_PROFILE_MASK,
-                        sdl3::video::profile::CORE,
-                    ) && sdl3::video::gl_set_attribute(attr::CONTEXT_MAJOR_VERSION, 4)
-                        && sdl3::video::gl_set_attribute(attr::CONTEXT_MINOR_VERSION, 1)
+                // A Mac answers either core request with its newest core
+                // profile, 4.1, and a program asking for 3.2 is written against
+                // that. A host driver instead answers with exactly what was
+                // asked - NVIDIA's 3.2 is a 3.2 - so 4.1 is what is asked for.
+                attribute::PROFILE_3_2_CORE | attribute::PROFILE_4_1_CORE => {
+                    core = true;
+                    request_core(4, 1)
                 }
                 other => objc::fail!(
                     "-[NSOpenGLContext initWithFormat:]: NSOpenGLPFAOpenGLProfile {other:#x} is \
@@ -470,6 +467,15 @@ fn apply(format: Id) {
             _ => unreachable!("every attribute above is one `takes_value` classified"),
         };
     }
+    core
+}
+
+/// Ask SDL for a core profile of `major.minor`.
+fn request_core(major: i32, minor: i32) -> bool {
+    use sdl3::video::attr;
+    sdl3::video::gl_set_attribute(attr::CONTEXT_PROFILE_MASK, sdl3::video::profile::CORE)
+        && sdl3::video::gl_set_attribute(attr::CONTEXT_MAJOR_VERSION, major)
+        && sdl3::video::gl_set_attribute(attr::CONTEXT_MINOR_VERSION, minor)
 }
 
 unsafe extern "C" fn init_with_format(receiver: Id, _sel: Sel, format: Id, _share: Id) -> Id {
@@ -645,8 +651,15 @@ fn ensure(receiver: Id, sent: &str) -> sdl3::Window {
         }
     };
     if context.sdl.is_null() {
-        apply(context.format);
-        let Some(sdl) = sdl3::video::gl_create_context(window) else {
+        let core = apply(context.format);
+        // A host that has no 4.1 is a Mac that has none either, and that Mac
+        // hands a core request 3.2 instead.
+        let created = sdl3::video::gl_create_context(window).or_else(|| {
+            (core && request_core(3, 2))
+                .then(|| sdl3::video::gl_create_context(window))
+                .flatten()
+        });
+        let Some(sdl) = created else {
             objc::fail!(
                 "-[NSOpenGLContext {sent}]: SDL could not create a GL context: {}",
                 sdl3::error()

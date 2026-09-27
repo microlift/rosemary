@@ -131,6 +131,10 @@ pub struct TextureType {
     pub depth: bool,
     /// The scalar type of one texel component.
     pub texel: Box<Type>,
+    /// Whether an integer texel is signed. `texel` stays signless like the
+    /// values AIR reads, but Vulkan requires the image's sampled type to match
+    /// the signedness of the view's format.
+    pub signed: bool,
     pub access: Access,
 }
 
@@ -152,6 +156,18 @@ impl TextureType {
     pub fn sampled_image(&self) -> bool {
         !matches!(self.access, Access::Write | Access::ReadWrite)
     }
+
+    /// The scalar type Vulkan's image type names, which carries the
+    /// signedness `texel` leaves out.
+    pub fn sampled_scalar(&self) -> Type {
+        match *self.texel {
+            Type::Int { bits, .. } => Type::Int {
+                bits,
+                signed: self.signed,
+            },
+            ref texel => texel.clone(),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
@@ -170,6 +186,24 @@ pub struct StructField {
 }
 
 impl Type {
+    /// The signed form of an integer scalar or vector; `None` for any other
+    /// type.
+    pub fn signed_integer(&self) -> Option<Type> {
+        match self {
+            Type::Int { bits, .. } => Some(Type::Int {
+                bits: *bits,
+                signed: true,
+            }),
+            Type::Vector { element, lanes } if matches!(**element, Type::Int { .. }) => {
+                Some(Type::Vector {
+                    element: Box::new(element.signed_integer()?),
+                    lanes: *lanes,
+                })
+            }
+            _ => None,
+        }
+    }
+
     pub fn u32() -> Self {
         Self::Int {
             bits: 32,
@@ -261,6 +295,10 @@ pub struct StageInput {
     pub argument: u32,
     pub binding: StageBinding,
     pub name: Option<String>,
+    /// A vertex attribute Metal declares as a signed integer. The parameter
+    /// stays signless, but Vulkan matches the input's signedness against the
+    /// attribute's `SINT` or `UINT` format.
+    pub signed: bool,
 }
 
 /// One component of an entry point's returned value.

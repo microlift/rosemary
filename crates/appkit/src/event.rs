@@ -217,8 +217,17 @@ fn trace_views() {
 }
 
 pub(crate) fn deliver(event: sdl3::video::Event) {
+    if !crate::dialog::deliver_modal(&event) {
+        deliver_past_modal(event);
+    }
+}
+
+/// [`deliver`] for the modal dialog's own loop, which has already had its
+/// turn at `event`: queueing it for the dialog again would hand it straight
+/// back, and the loop would never wait for input again.
+pub(crate) fn deliver_past_modal(event: sdl3::video::Event) {
     use sdl3::video::Event;
-    if crate::dialog::deliver_modal(&event) || crate::dialog::deliver(&event) {
+    if crate::dialog::deliver(&event) {
         return;
     }
     match event {
@@ -265,6 +274,13 @@ pub(crate) fn deliver(event: sdl3::video::Event) {
                 post(window, name);
             }
         }
+        // A program that keeps its own copy of where its window is - a Win32
+        // layer mapping client rectangles to the desktop does - learns of a move
+        // from this alone. On Wayland SDL first reports the position it was
+        // asked for and corrects it once the compositor has placed the window;
+        // a missed correction leaves that copy out by the difference, and every
+        // pointer position the program checks against it with it.
+        Event::WindowMoved { window } => post(window, window::DID_MOVE),
         Event::WindowResized { window, .. } => {
             // The content view follows the window, as it does on
             // `-setContentView:` and for the same reason: a view that kept its
@@ -322,6 +338,11 @@ pub(crate) fn deliver(event: sdl3::video::Event) {
                 // SDL drops relative mouse mode when focus goes, and a window
                 // made while the guest was disassociated never entered it.
                 crate::screen::apply_mouse_association();
+                // SAFETY: a window this crate made.
+                let sdl = unsafe { window::sdl_window(object) };
+                if !sdl.is_null() {
+                    crate::screen::confine_pointer(sdl);
+                }
             }
             post(
                 window,
@@ -342,9 +363,12 @@ pub(crate) fn deliver(event: sdl3::video::Event) {
             if crate::decor::key(scancode, down) {
                 return;
             }
+            let text = crate::keymap::characters(
+                scancode,
+                crate::keymap::typed_key(scancode, key, modifiers),
+            );
             let modifiers = crate::keymap::modifiers(modifiers);
             let code = crate::keymap::virtual_key(scancode);
-            let text = crate::keymap::characters(scancode, key);
             if down && !crate::keymap::is_modifier(scancode) {
                 let window = object_for(id);
                 crate::text::begin_key_interpretation(responder_of(window));

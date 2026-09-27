@@ -61,7 +61,8 @@ pub(super) fn texture_type(items: &[Item<'_>], access: Access) -> Result<Type, T
     };
     // Metal spells a texture's element signedness in its type, but the AIR
     // body reads texels as signless LLVM integers, so keep the storage width
-    // and let the reading operation carry the interpretation.
+    // here and record the signedness beside it.
+    let signed = matches!(texel, "int" | "short");
     let texel = match texel {
         "float" => Type::Float { bits: 32 },
         "half" => Type::Float { bits: 16 },
@@ -106,6 +107,7 @@ pub(super) fn texture_type(items: &[Item<'_>], access: Access) -> Result<Type, T
         multisampled,
         depth,
         texel: Box::new(texel),
+        signed,
         access,
     }))
 }
@@ -115,6 +117,19 @@ pub(super) fn argument_name(items: &[Item<'_>]) -> Option<String> {
         [Item::Text(name), ..] => Some((*name).to_string()),
         _ => None,
     }
+}
+
+/// Whether `air.arg_type_name` spells a signed integer scalar or vector,
+/// such as `int`, `short2` or `char4`.
+pub(super) fn signed_integer_argument(items: &[Item<'_>]) -> bool {
+    let [Item::Text(name), ..] = keyed(items, "air.arg_type_name") else {
+        return false;
+    };
+    let name = name.strip_prefix("packed_").unwrap_or(name);
+    matches!(
+        name.trim_end_matches(|c: char| c.is_ascii_digit()),
+        "int" | "short" | "char" | "long"
+    )
 }
 
 /// The items following a string key, up to the end of the descriptor.

@@ -52,8 +52,17 @@ pub struct Semaphore {
     /// protocol's.
     #[allow(dead_code)]
     header: Header,
-    state: Mutex<i64>,
+    state: Mutex<SemaphoreState>,
     signalled: Condvar,
+}
+
+struct SemaphoreState {
+    /// Darwin's value: negative is the number of threads waiting.
+    value: i64,
+    /// Signals owed to waiters and not yet claimed. The value alone cannot say
+    /// which waiter a signal was for: with two waiting it goes from -2 to -1, and
+    /// a woken waiter that read that as "not mine" slept through its own signal.
+    wakeups: u64,
 }
 
 /// # Safety
@@ -306,7 +315,7 @@ pub unsafe extern "C" fn semaphore_create(value: i64) -> u64 {
     }
     Box::into_raw(Box::new(Semaphore {
         header: Header::new(Kind::Semaphore),
-        state: Mutex::new(value),
+        state: Mutex::new(SemaphoreState { value, wakeups: 0 }),
         signalled: Condvar::new(),
     })) as u64
 }
@@ -320,12 +329,14 @@ pub unsafe extern "C" fn semaphore_signal(handle: u64) -> i64 {
     let Some(s) = (unsafe { semaphore(handle) }) else {
         return 0;
     };
-    let mut count = s.state.lock().unwrap_or_else(|e| e.into_inner());
-    // Negative means threads are waiting; the increment is what releases one.
-    let woke = *count < 0;
-    *count += 1;
-    drop(count);
-    s.signalled.notify_one();
+    let mut state = s.state.lock().unwrap_or_else(|e| e.into_inner());
+    let woke = state.value < 0;
+    state.value += 1;
+    if woke {
+        state.wakeups += 1;
+        drop(state);
+        s.signalled.notify_one();
+    }
     woke as i64
 }
 
@@ -338,37 +349,37 @@ pub unsafe extern "C" fn semaphore_wait(handle: u64, timeout: u64) -> i64 {
     let Some(s) = (unsafe { semaphore(handle) }) else {
         return 0;
     };
-    let mut count = s.state.lock().unwrap_or_else(|e| e.into_inner());
-    *count -= 1;
-    if *count >= 0 {
+    let mut state = s.state.lock().unwrap_or_else(|e| e.into_inner());
+    state.value -= 1;
+    if state.value >= 0 {
         return 0;
     }
     loop {
+        if state.wakeups > 0 {
+            state.wakeups -= 1;
+            return 0;
+        }
         match time::remaining(timeout) {
             None => {
-                count = s.signalled.wait(count).unwrap_or_else(|e| e.into_inner());
+                state = s.signalled.wait(state).unwrap_or_else(|e| e.into_inner());
             }
-            Some(0) => {
-                *count += 1;
-                return 1;
-            }
+            Some(0) => break,
             Some(left) => {
                 let (next, expired) = s
                     .signalled
-                    .wait_timeout(count, std::time::Duration::from_nanos(left))
+                    .wait_timeout(state, std::time::Duration::from_nanos(left))
                     .unwrap_or_else(|e| e.into_inner());
-                count = next;
-                if expired.timed_out() {
-                    *count += 1;
-                    return 1;
+                state = next;
+                if expired.timed_out() && state.wakeups == 0 {
+                    break;
                 }
             }
         }
-        // A signal raised the count past the debt this wait took, so it is ours.
-        if *count >= 0 {
-            return 0;
-        }
     }
+    // Checked under the same lock a signal takes, so no wakeup is owed to this
+    // waiter: withdrawing it leaves every signal for someone still waiting.
+    state.value += 1;
+    1
 }
 
 #[cfg(test)]
@@ -498,6 +509,39 @@ mod tests {
             });
             assert_eq!(semaphore_wait(s, time::FOREVER), 0);
             signaller.join().expect("the signaller finishes");
+            object::release(s);
+        }
+    }
+
+    /// With two waiters parked, each signal must release one of them. Life Is
+    /// Strange's engine mutex hung here when a woken waiter saw the value still
+    /// negative and went back to sleep.
+    #[test]
+    fn each_signal_releases_one_of_several_waiters() {
+        // SAFETY: live objects, and the handle outlives every thread.
+        unsafe {
+            let s = semaphore_create(0);
+            let (done, finished) = std::sync::mpsc::channel();
+            let waiters: Vec<_> = (0..2)
+                .map(|_| {
+                    let done = done.clone();
+                    std::thread::spawn(move || {
+                        let deadline = time::time(time::NOW, 5_000_000_000);
+                        done.send(semaphore_wait(s, deadline))
+                            .expect("the test listens");
+                    })
+                })
+                .collect();
+            let patience = std::time::Duration::from_secs(2);
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            for _ in 0..2 {
+                assert_eq!(semaphore_signal(s), 1, "a waiter is parked");
+                // One signal at a time, so the woken waiter looks before the next.
+                assert_eq!(finished.recv_timeout(patience), Ok(0), "and it wakes");
+            }
+            for waiter in waiters {
+                waiter.join().expect("the waiter finishes");
+            }
             object::release(s);
         }
     }

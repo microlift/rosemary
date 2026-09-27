@@ -100,7 +100,9 @@ fn respell_file_url(url: &str, respell: impl FnOnce(&str) -> Option<String>) -> 
 
 /// A guest's `file:` URL as the web process, a host process, has to open it.
 pub(crate) fn host_url(url: &str) -> String {
-    respell_file_url(url, |path| Some(prefix::ns::host_path(path).to_string_lossy().into_owned()))
+    respell_file_url(url, |path| {
+        Some(prefix::ns::host_path(path).to_string_lossy().into_owned())
+    })
 }
 
 /// A `file:` URL WebKitGTK reports, as the guest spells it.
@@ -678,7 +680,13 @@ unsafe extern "C" fn create(gtk: Ptr, action: Ptr, data: Ptr) -> Ptr {
     std::ptr::null_mut()
 }
 
-pub(crate) fn connect(engine: &Engine, gtk: Ptr, signal: &std::ffi::CStr, handler: *const (), id: usize) {
+pub(crate) fn connect(
+    engine: &Engine,
+    gtk: Ptr,
+    signal: &std::ffi::CStr,
+    handler: *const (),
+    id: usize,
+) {
     // SAFETY: a live widget, a signal it has and a handler of that signal's
     // prototype; the data is a plain integer and needs no destructor.
     unsafe {

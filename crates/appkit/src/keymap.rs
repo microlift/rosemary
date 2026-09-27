@@ -314,6 +314,19 @@ pub fn is_modifier(scancode: u32) -> bool {
     (scancode::LCTRL..=scancode::RGUI).contains(&scancode) || scancode == scancode::CAPSLOCK
 }
 
+/// The keycode a key types with its shift-like modifiers applied.
+///
+/// SDL's event keycode is the unshifted key, but AppKit's `-characters` and
+/// `-charactersIgnoringModifiers` both honor shift: Shift-/ is "?", not "/".
+/// A guest that sees "/" there acts on a slash the user never typed.
+pub fn typed_key(scancode: u32, keycode: u32, sdl_modifiers: u16) -> u32 {
+    let shifting = sdl_modifiers & (keymod::SHIFT | keymod::CAPS | keymod::MODE);
+    if shifting == 0 {
+        return keycode;
+    }
+    sdl3::video::key_from_scancode(scancode, shifting).unwrap_or(keycode)
+}
+
 /// The text `-characters` reports, from SDL's keycode.
 ///
 /// SDL's keycode for a printable key *is* its Unicode scalar, so those need no

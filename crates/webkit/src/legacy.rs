@@ -213,7 +213,8 @@ unsafe extern "C" fn evaluated(source: Ptr, result: Ptr, data: Ptr) {
     let api = engine.api;
     let mut error = std::ptr::null_mut();
     // SAFETY: the view and result this callback was invoked with.
-    let value = unsafe { (api.webkit_web_view_evaluate_javascript_finish)(source, result, &mut error) };
+    let value =
+        unsafe { (api.webkit_web_view_evaluate_javascript_finish)(source, result, &mut error) };
     let object = match unsafe { gtk::take_error(api, error) } {
         Some((_, message)) => {
             eprintln!("rosetta3: webkit: a script native code ran threw: {message}");
@@ -238,7 +239,10 @@ fn evaluate_now(object: Id, script: &str) -> Id {
         return std::ptr::null_mut();
     };
     let api = engine.api;
-    let slot = std::rc::Rc::new(RefCell::new(Slot { done: false, value: std::ptr::null_mut() }));
+    let slot = std::rc::Rc::new(RefCell::new(Slot {
+        done: false,
+        value: std::ptr::null_mut(),
+    }));
     let source = gtk::c_string(script);
     // SAFETY: the view's widget, a script it copies, and a reference the
     // callback takes back.
@@ -306,7 +310,9 @@ fn web_methods(object: Id) -> Vec<(String, Sel)> {
             // SAFETY: the class answers each selector asked, with these
             // prototypes.
             let excluded = !decides
-                || unsafe { send!(class_object, "isSelectorExcludedFromWebScript:", sel => Sel; u8) } != 0;
+                || unsafe {
+                    send!(class_object, "isSelectorExcludedFromWebScript:", sel => Sel; u8)
+                } != 0;
             if excluded {
                 continue;
             }
@@ -332,12 +338,18 @@ fn web_methods(object: Id) -> Vec<(String, Sel)> {
 /// object as a set of functions that call it.
 fn set_window_value(object: Id, key: &str, value: Id) {
     if let Some(data) = expression(value) {
-        run_script(object, format!("window[{}] = {data};", crate::input::quote(key)));
+        run_script(
+            object,
+            format!("window[{}] = {data};", crate::input::quote(key)),
+        );
         return;
     }
     let methods = web_methods(value);
     let id = NEXT_EXPORT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let names: Vec<String> = methods.iter().map(|(n, _)| crate::input::quote(n)).collect();
+    let names: Vec<String> = methods
+        .iter()
+        .map(|(n, _)| crate::input::quote(n))
+        .collect();
     if engine::tracing() {
         eprintln!(
             "rosetta3: webkit: window.{key} is an Objective-C object answering {}",
@@ -345,7 +357,11 @@ fn set_window_value(object: Id, key: &str, value: Id) {
         );
     }
     with(object, |v| {
-        v.exported.push(Exported { id, object: objc::arc::retain(value) as usize, methods })
+        v.exported.push(Exported {
+            id,
+            object: objc::arc::retain(value) as usize,
+            methods,
+        })
     });
     run_script(
         object,
@@ -427,15 +443,23 @@ unsafe fn send_words(receiver: Id, sel: Sel, args: &[usize]) -> Option<usize> {
     let entry = objc::msg::entry();
     unsafe {
         Some(match *args {
-            [] => std::mem::transmute::<_, unsafe extern "C" fn(Id, Sel) -> W>(entry)(receiver, sel),
-            [a] => std::mem::transmute::<_, unsafe extern "C" fn(Id, Sel, W) -> W>(entry)(receiver, sel, a),
-            [a, b] => std::mem::transmute::<_, unsafe extern "C" fn(Id, Sel, W, W) -> W>(entry)(receiver, sel, a, b),
-            [a, b, c] => std::mem::transmute::<_, unsafe extern "C" fn(Id, Sel, W, W, W) -> W>(entry)(
-                receiver, sel, a, b, c,
+            [] => {
+                std::mem::transmute::<_, unsafe extern "C" fn(Id, Sel) -> W>(entry)(receiver, sel)
+            }
+            [a] => std::mem::transmute::<_, unsafe extern "C" fn(Id, Sel, W) -> W>(entry)(
+                receiver, sel, a,
             ),
-            [a, b, c, d] => std::mem::transmute::<_, unsafe extern "C" fn(Id, Sel, W, W, W, W) -> W>(entry)(
-                receiver, sel, a, b, c, d,
+            [a, b] => std::mem::transmute::<_, unsafe extern "C" fn(Id, Sel, W, W) -> W>(entry)(
+                receiver, sel, a, b,
             ),
+            [a, b, c] => std::mem::transmute::<_, unsafe extern "C" fn(Id, Sel, W, W, W) -> W>(
+                entry,
+            )(receiver, sel, a, b, c),
+            [a, b, c, d] => {
+                std::mem::transmute::<_, unsafe extern "C" fn(Id, Sel, W, W, W, W) -> W>(entry)(
+                    receiver, sel, a, b, c, d,
+                )
+            }
             _ => return None,
         })
     }
@@ -472,9 +496,11 @@ fn answer(value: usize, code: u8) -> Result<Option<String>, String> {
             let object = value as Id;
             match object.is_null() || object == undefined() {
                 true => None,
-                false => Some(foundation::json::to_text(object).map_err(|why| {
-                    format!("an answer the bridge cannot give the page: {why}")
-                })?),
+                false => {
+                    Some(foundation::json::to_text(object).map_err(|why| {
+                        format!("an answer the bridge cannot give the page: {why}")
+                    })?)
+                }
             }
         }
         b'c' | b'B' | b'C' => Some(((value & 0xff) != 0).to_string()),
@@ -509,14 +535,18 @@ fn call(object: Id, message: Id) -> Result<Option<String>, String> {
     })
     .flatten();
     let Some((receiver, sel)) = found else {
-        return Err(format!("{name} is not a method of the object it was called on"));
+        return Err(format!(
+            "{name} is not a method of the object it was called on"
+        ));
     };
     // SAFETY: a live object that declared `sel`.
     let method = unsafe { objc::object::class_of(receiver) }
         .and_then(|class| class.method(sel))
         .ok_or_else(|| format!("{name} has no implementation"))?;
     // SAFETY: a method's type encoding is a live C string.
-    let types = unsafe { std::ffi::CStr::from_ptr(method.types()) }.to_string_lossy().into_owned();
+    let types = unsafe { std::ffi::CStr::from_ptr(method.types()) }
+        .to_string_lossy()
+        .into_owned();
     let codes = signature(&types);
     let (ret, params) = match codes.as_slice() {
         [ret, _, _, params @ ..] => (*ret, params.to_vec()),
@@ -618,7 +648,8 @@ unsafe extern "C" fn script_dialog(_gtk: Ptr, dialog: Ptr, data: Ptr) -> c_int {
         )
     };
     if kind == gtk::SCRIPT_DIALOG_PROMPT && message == MAGIC {
-        let request = unsafe { gtk::text((api.webkit_script_dialog_prompt_get_default_text)(dialog)) };
+        let request =
+            unsafe { gtk::text((api.webkit_script_dialog_prompt_get_default_text)(dialog)) };
         let reply = gtk::c_string(&handle(object, &request));
         // SAFETY: a prompt dialog, and text it copies.
         unsafe { (api.webkit_script_dialog_prompt_set_text)(dialog, reply.as_ptr()) };
@@ -633,23 +664,31 @@ unsafe extern "C" fn script_dialog(_gtk: Ptr, dialog: Ptr, data: Ptr) -> c_int {
     unsafe {
         match kind {
             gtk::SCRIPT_DIALOG_ALERT
-                if engine::responds(ui, "webView:runJavaScriptAlertPanelWithMessage:initiatedByFrame:") =>
+                if engine::responds(
+                    ui,
+                    "webView:runJavaScriptAlertPanelWithMessage:initiatedByFrame:",
+                ) =>
             {
                 send!(ui, "webView:runJavaScriptAlertPanelWithMessage:initiatedByFrame:",
                     object => Id, text => Id, frame => Id; ());
             }
             gtk::SCRIPT_DIALOG_CONFIRM => {
-                let confirmed = engine::responds(ui, "webView:runJavaScriptConfirmPanelWithMessage:initiatedByFrame:")
-                    && send!(ui, "webView:runJavaScriptConfirmPanelWithMessage:initiatedByFrame:",
-                        object => Id, text => Id, frame => Id; u8) != 0;
+                let confirmed = engine::responds(
+                    ui,
+                    "webView:runJavaScriptConfirmPanelWithMessage:initiatedByFrame:",
+                ) && send!(ui, "webView:runJavaScriptConfirmPanelWithMessage:initiatedByFrame:",
+                        object => Id, text => Id, frame => Id; u8)
+                    != 0;
                 (api.webkit_script_dialog_confirm_set_confirmed)(dialog, c_int::from(confirmed));
             }
             gtk::SCRIPT_DIALOG_PROMPT => {
-                const SELECTOR: &str = "webView:runJavaScriptTextInputPanelWithPrompt:defaultText:initiatedByFrame:";
+                const SELECTOR: &str =
+                    "webView:runJavaScriptTextInputPanelWithPrompt:defaultText:initiatedByFrame:";
                 if engine::responds(ui, SELECTOR) {
-                    let default = engine::string(&gtk::text(
-                        (api.webkit_script_dialog_prompt_get_default_text)(dialog),
-                    ));
+                    let default = engine::string(&gtk::text((api
+                        .webkit_script_dialog_prompt_get_default_text)(
+                        dialog
+                    )));
                     let answer = send!(ui, "webView:runJavaScriptTextInputPanelWithPrompt:defaultText:initiatedByFrame:",
                         object => Id, text => Id, default => Id, frame => Id; Id);
                     if !answer.is_null() {
@@ -686,7 +725,13 @@ unsafe extern "C" fn load_changed(_gtk: Ptr, event: c_int, data: Ptr) {
     }
 }
 
-unsafe extern "C" fn load_failed(_gtk: Ptr, event: c_int, uri: *const std::ffi::c_char, error: *mut gtk::GError, data: Ptr) -> c_int {
+unsafe extern "C" fn load_failed(
+    _gtk: Ptr,
+    event: c_int,
+    uri: *const std::ffi::c_char,
+    error: *mut gtk::GError,
+    data: Ptr,
+) -> c_int {
     let Some(object) = view_of(data) else {
         return 0;
     };
@@ -750,7 +795,9 @@ unsafe extern "C" fn decide_policy(_gtk: Ptr, decision: Ptr, kind: c_int, data: 
     // SAFETY: a decision this listener now holds a reference to.
     let listener = objc::arc::autorelease(boxed::make(
         listener_class(),
-        Listener { decision: unsafe { (api.g_object_ref)(decision) } as usize },
+        Listener {
+            decision: unsafe { (api.g_object_ref)(decision) } as usize,
+        },
     ));
     let third = match kind {
         gtk::POLICY_DECISION_NAVIGATION_ACTION => field(object, |v| v.main_frame),
@@ -761,8 +808,17 @@ unsafe extern "C" fn decide_policy(_gtk: Ptr, decision: Ptr, kind: c_int, data: 
     }
     // SAFETY: the delegate answers the selector, `void (id, SEL, id x5)`.
     unsafe {
-        let f: unsafe extern "C" fn(Id, Sel, Id, Id, Id, Id, Id) = std::mem::transmute(objc::msg::entry());
-        f(delegate, objc::sel::get(selector), object, information, request, third, listener);
+        let f: unsafe extern "C" fn(Id, Sel, Id, Id, Id, Id, Id) =
+            std::mem::transmute(objc::msg::entry());
+        f(
+            delegate,
+            objc::sel::get(selector),
+            object,
+            information,
+            request,
+            third,
+            listener,
+        );
     }
     1
 }
@@ -776,7 +832,10 @@ fn action_information(url: &str, navigation_type: c_int) -> Id {
     };
     let url = objc::arc::autorelease(corefoundation::url::new(url) as Id);
     let entries = [
-        (engine::string("WebActionNavigationTypeKey"), number(i64::from(navigation_type))),
+        (
+            engine::string("WebActionNavigationTypeKey"),
+            number(i64::from(navigation_type)),
+        ),
         (engine::string("WebActionOriginalURLKey"), url),
         (engine::string("WebActionModifierFlagsKey"), number(0)),
         (engine::string("WebActionButtonKey"), number(-1)),
@@ -784,7 +843,12 @@ fn action_information(url: &str, navigation_type: c_int) -> Id {
     let pairs: Vec<_> = entries
         .iter()
         .filter(|(_, v)| !v.is_null())
-        .map(|(k, v)| (*k as corefoundation::base::CFTypeRef, *v as corefoundation::base::CFTypeRef))
+        .map(|(k, v)| {
+            (
+                *k as corefoundation::base::CFTypeRef,
+                *v as corefoundation::base::CFTypeRef,
+            )
+        })
         .collect();
     let dictionary = corefoundation::collections::new_dictionary(
         &pairs,
@@ -800,8 +864,18 @@ fn action_information(url: &str, navigation_type: c_int) -> Id {
 
 /// Everything a new `WebView` needs beside its `WKWebView`.
 fn set_up(object: Id) {
-    let frame = boxed::make(frame_class(), Frame { view: object as usize });
-    let window = boxed::make(script_object_class(), ScriptObject { view: object as usize });
+    let frame = boxed::make(
+        frame_class(),
+        Frame {
+            view: object as usize,
+        },
+    );
+    let window = boxed::make(
+        script_object_class(),
+        ScriptObject {
+            view: object as usize,
+        },
+    );
     VIEWS.with(|views| {
         views.borrow_mut().push(Legacy {
             object: object as usize,
@@ -821,7 +895,9 @@ fn set_up(object: Id) {
             draws_background: true,
         })
     });
-    let (Some(engine), Some((id, gtk, configuration))) = (engine::get(), web_view::parts_of(object)) else {
+    let (Some(engine), Some((id, gtk, configuration))) =
+        (engine::get(), web_view::parts_of(object))
+    else {
         return;
     };
     let api = engine.api;
@@ -850,10 +926,22 @@ fn set_up(object: Id) {
         (api.webkit_settings_set_allow_file_access_from_file_urls)(settings, 1);
         (api.webkit_settings_set_allow_universal_access_from_file_urls)(settings, 1);
     }
-    web_view::connect(engine, gtk, c"script-dialog", script_dialog as *const (), id);
+    web_view::connect(
+        engine,
+        gtk,
+        c"script-dialog",
+        script_dialog as *const (),
+        id,
+    );
     web_view::connect(engine, gtk, c"load-changed", load_changed as *const (), id);
     web_view::connect(engine, gtk, c"load-failed", load_failed as *const (), id);
-    web_view::connect(engine, gtk, c"decide-policy", decide_policy as *const (), id);
+    web_view::connect(
+        engine,
+        gtk,
+        c"decide-policy",
+        decide_policy as *const (),
+        id,
+    );
 }
 
 fn forget(object: Id) {
@@ -881,11 +969,18 @@ fn inherited(name: &str) -> objc::class::Imp {
         .expect("WKWebView is installed first")
 }
 
-unsafe extern "C" fn init_with_frame_names(receiver: Id, _sel: Sel, frame: NSRect, _name: Id, _group: Id) -> Id {
+unsafe extern "C" fn init_with_frame_names(
+    receiver: Id,
+    _sel: Sel,
+    frame: NSRect,
+    _name: Id,
+    _group: Id,
+) -> Id {
     let sel = "initWithFrame:configuration:";
     // SAFETY: WKWebView's designated initializer has this prototype.
     let receiver = unsafe {
-        let f: unsafe extern "C" fn(Id, Sel, NSRect, Id) -> Id = std::mem::transmute(inherited(sel));
+        let f: unsafe extern "C" fn(Id, Sel, NSRect, Id) -> Id =
+            std::mem::transmute(inherited(sel));
         f(receiver, objc::sel::get(sel), frame, std::ptr::null_mut())
     };
     if !receiver.is_null() {
@@ -1147,7 +1242,13 @@ unsafe extern "C" fn frame_data_source(receiver: Id, _sel: Sel) -> Id {
         return std::ptr::null_mut();
     }
     let url = web_view::guest_url(&url);
-    objc::arc::autorelease(boxed::make(data_source_class(), DataSource { view: view as usize, url }))
+    objc::arc::autorelease(boxed::make(
+        data_source_class(),
+        DataSource {
+            view: view as usize,
+            url,
+        },
+    ))
 }
 
 unsafe extern "C" fn frame_window_object(receiver: Id, _sel: Sel) -> Id {
@@ -1208,7 +1309,10 @@ unsafe extern "C" fn script_value(receiver: Id, _sel: Sel, key: Id) -> Id {
 }
 
 unsafe extern "C" fn script_remove_key(receiver: Id, _sel: Sel, key: Id) {
-    let script = format!("delete window[{}];", crate::input::quote(&engine::text_of(key)));
+    let script = format!(
+        "delete window[{}];",
+        crate::input::quote(&engine::text_of(key))
+    );
     run_script(script_view(receiver), script);
 }
 
@@ -1219,7 +1323,9 @@ unsafe extern "C" fn script_call(receiver: Id, _sel: Sel, name: Id, arguments: I
         false => match foundation::json::to_text(arguments) {
             Ok(text) => text,
             Err(why) => {
-                eprintln!("rosetta3: webkit: {name} was not called: its arguments are not data ({why})");
+                eprintln!(
+                    "rosetta3: webkit: {name} was not called: its arguments are not data ({why})"
+                );
                 return undefined();
             }
         },
@@ -1267,7 +1373,8 @@ unsafe extern "C" fn undefined_description(_receiver: Id, _sel: Sel) -> Id {
 
 fn decide(receiver: Id, answer: fn(&gtk::Api, Ptr)) {
     // SAFETY: a listener, or anything else, which answers `None`.
-    let Some(listener) = (unsafe { boxed::contents::<Listener>(receiver, listener_class()) }) else {
+    let Some(listener) = (unsafe { boxed::contents::<Listener>(receiver, listener_class()) })
+    else {
         return;
     };
     let decision = std::mem::take(&mut listener.decision);
@@ -1282,16 +1389,24 @@ fn decide(receiver: Id, answer: fn(&gtk::Api, Ptr)) {
 
 unsafe extern "C" fn listener_use(receiver: Id, _sel: Sel) {
     // SAFETY: a decision this listener held a reference to.
-    decide(receiver, |api, d| unsafe { (api.webkit_policy_decision_use)(d) });
+    decide(receiver, |api, d| unsafe {
+        (api.webkit_policy_decision_use)(d)
+    });
 }
 
 unsafe extern "C" fn listener_ignore(receiver: Id, _sel: Sel) {
-    decide(receiver, |api, d| unsafe { (api.webkit_policy_decision_ignore)(d) });
+    decide(receiver, |api, d| unsafe {
+        (api.webkit_policy_decision_ignore)(d)
+    });
 }
 
 unsafe extern "C" fn listener_download(receiver: Id, _sel: Sel) {
-    eprintln!("rosetta3: webkit: a policy delegate asked for a download, which is not supported; ignored");
-    decide(receiver, |api, d| unsafe { (api.webkit_policy_decision_ignore)(d) });
+    eprintln!(
+        "rosetta3: webkit: a policy delegate asked for a download, which is not supported; ignored"
+    );
+    decide(receiver, |api, d| unsafe {
+        (api.webkit_policy_decision_ignore)(d)
+    });
 }
 
 pub fn install() {

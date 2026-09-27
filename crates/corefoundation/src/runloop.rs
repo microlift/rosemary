@@ -999,6 +999,11 @@ impl RunLoop {
         (sources, timers)
     }
 
+    /// When the soonest valid timer in `mode` is due, if any is.
+    pub fn next_timer(&self, mode: &str) -> Option<Instant> {
+        self.contents(mode).1.iter().filter_map(|t| t.due()).min()
+    }
+
     /// Run `mode` for at most `seconds`, as `CFRunLoopRunInMode` does.
     ///
     /// The call is on the stack for as long as it lasts, so
@@ -1591,6 +1596,24 @@ mod tests {
             result::TIMED_OUT
         );
         assert_eq!(calls(), 1);
+    }
+
+    #[test]
+    fn the_next_timer_is_the_soonest_valid_one_in_the_mode() {
+        let (_, _, tick) = counter!();
+        let loop_ = Arc::new(RunLoop::new());
+        assert_eq!(loop_.next_timer(DEFAULT_MODE), None, "nothing scheduled");
+
+        let soon = new_timer(Duration::from_secs(10), None, Some(tick), 0);
+        let later = new_timer(Duration::from_secs(20), None, Some(tick), 0);
+        loop_.add_timer(&later, DEFAULT_MODE);
+        loop_.add_timer(&soon, DEFAULT_MODE);
+        let due = soon.due().expect("a valid timer is due");
+        assert_eq!(loop_.next_timer(DEFAULT_MODE), Some(due));
+        assert_eq!(loop_.next_timer("other"), None, "another mode is not asked");
+
+        soon.invalidate();
+        assert_eq!(loop_.next_timer(DEFAULT_MODE), later.due());
     }
 
     /// A counter that also records which activities it was told about.

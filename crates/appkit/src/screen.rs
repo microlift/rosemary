@@ -753,7 +753,10 @@ pub unsafe extern "C" fn CGGetDisplayTransferByTable(
 ) -> i32 {
     let size = capacity.min(1024) as usize;
     let tables = GAMMA.lock().unwrap_or_else(|e| e.into_inner());
-    let set = tables.iter().find(|(d, _)| *d == display).map(|(_, t)| t.clone());
+    let set = tables
+        .iter()
+        .find(|(d, _)| *d == display)
+        .map(|(_, t)| t.clone());
     drop(tables);
     // Identity until a program sets one, sampled to the caller's size.
     let sample = |channel: usize, at: usize| -> f32 {
@@ -1611,6 +1614,25 @@ pub unsafe extern "C" fn CGWarpMouseCursorPosition(point: foundation::geometry::
     0
 }
 
+/// `CGError CGSetLocalEventsSuppressionInterval(CFTimeInterval)`.
+///
+/// How long real mouse input is ignored after a warp. [`CGWarpMouseCursorPosition`]
+/// never suppresses anything, which is the interval games set - zero, so mouse
+/// look keeps its deltas. Any other interval is reported once rather than kept.
+#[allow(non_snake_case)]
+pub unsafe extern "C" fn CGSetLocalEventsSuppressionInterval(seconds: f64) -> i32 {
+    static TOLD: std::sync::Once = std::sync::Once::new();
+    if seconds != 0.0 {
+        TOLD.call_once(|| {
+            eprintln!(
+                "rosetta3: appkit: CGSetLocalEventsSuppressionInterval({seconds}) is not honoured; \
+                 input is never suppressed after a warp"
+            )
+        });
+    }
+    0
+}
+
 fn local_warp_point(point: (f32, f32), origin: (i32, i32)) -> (f32, f32) {
     (point.0 - origin.0 as f32, point.1 - origin.1 as f32)
 }
@@ -1660,6 +1682,25 @@ static ASSOCIATED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool
 /// cursor to follow the pointer.
 pub fn mouse_is_associated() -> bool {
     ASSOCIATED.load(std::sync::atomic::Ordering::Acquire)
+}
+
+/// `ROSETTA3_CONFINE_POINTER=1`: keep the pointer inside whichever window has
+/// focus.
+///
+/// FIXME (ACCURACY): a workaround, not AppKit. Some ports confine the cursor
+/// with a Win32 `ClipCursor` emulation that only clamps once and relies on
+/// macOS delivering drags outside the window to warp it back; Wayland neither
+/// delivers those nor lets a warp reach a pointer outside the window. Life Is
+/// Strange's drag interactions stop short without this, on macOS too.
+pub const CONFINE_ENV: &str = "ROSETTA3_CONFINE_POINTER";
+
+/// Confine the pointer to `window` if [`CONFINE_ENV`] asks for it.
+pub fn confine_pointer(window: sdl3::Window) {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let on = *ON.get_or_init(|| std::env::var_os(CONFINE_ENV).is_some_and(|v| v != "0"));
+    if on {
+        sdl3::video::set_mouse_grab(window, true);
+    }
 }
 
 /// Put every window into relative mouse mode, or take it out, to match the last

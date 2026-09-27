@@ -1121,9 +1121,10 @@ unsafe extern "C" fn set_subviews(receiver: Id, _sel: Sel, views: Id) {
     // SAFETY: a copy of the current list, so removing does not disturb the
     // walk, and the new list, each an `NSArray` of views or nil.
     unsafe {
-        let current = corefoundation::collections::array(subviews(receiver, objc::sel::get("subviews")) as _)
-            .map(|a| a.values.clone())
-            .unwrap_or_default();
+        let current =
+            corefoundation::collections::array(subviews(receiver, objc::sel::get("subviews")) as _)
+                .map(|a| a.values.clone())
+                .unwrap_or_default();
         let wanted = corefoundation::collections::array(views as _)
             .map(|a| a.values.clone())
             .unwrap_or_default();

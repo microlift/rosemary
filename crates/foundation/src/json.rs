@@ -567,7 +567,11 @@ pub fn to_text(object: Id) -> Result<String, String> {
 
 /// The object a JSON text describes, fragments included, autoreleased.
 pub fn from_text(text: &str) -> Result<Id, String> {
-    let mut reader = Reader { bytes: text.as_bytes(), at: 0, mutable: false };
+    let mut reader = Reader {
+        bytes: text.as_bytes(),
+        at: 0,
+        mutable: false,
+    };
     let object = reader.value(0)?;
     reader.skip_space();
     if reader.at != reader.bytes.len() {

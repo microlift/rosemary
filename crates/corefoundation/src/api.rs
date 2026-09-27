@@ -503,8 +503,11 @@ pub unsafe extern "C" fn CFStringGetCString(
             return 0;
         }
         e if crate::eightbit::is_table(e) => {
-            let encoded: Option<Vec<u8>> =
-                s.units().into_iter().map(|u| crate::eightbit::encode(u, e)).collect();
+            let encoded: Option<Vec<u8>> = s
+                .units()
+                .into_iter()
+                .map(|u| crate::eightbit::encode(u, e))
+                .collect();
             match encoded {
                 Some(bytes) => bytes,
                 None => return 0,
@@ -687,7 +690,9 @@ unsafe fn get_bytes_by_character(
             && (0xDC00..0xE000).contains(&units[at + 1]);
         let span = 1 + pair as usize;
         let piece: Option<Vec<u8>> = match encoding {
-            string::encoding::UTF8 => Some(String::from_utf16_lossy(&units[at..at + span]).into_bytes()),
+            string::encoding::UTF8 => {
+                Some(String::from_utf16_lossy(&units[at..at + span]).into_bytes())
+            }
             _ if pair => None,
             code => crate::eightbit::encode(units[at], code).map(|b| vec![b]),
         };
@@ -2231,6 +2236,87 @@ pub unsafe extern "C" fn CFStringGetSystemEncoding() -> u32 {
     string::encoding::UTF8
 }
 
+/// `kCFStringEncodingInvalidId`.
+const INVALID_ENCODING: u32 = 0xffff_ffff;
+
+/// Apple's encodings by Windows code page and by IANA name, for the conversions
+/// below. Only encodings CoreFoundation names; an unknown one answers
+/// `kCFStringEncodingInvalidId`, as Apple's does.
+const NAMED_ENCODINGS: &[(u32, &str, u32)] = &[
+    (65001, "utf-8", string::encoding::UTF8),
+    (1200, "utf-16le", string::encoding::UTF16_LE),
+    (1201, "utf-16be", string::encoding::UTF16_BE),
+    (12000, "utf-32le", string::encoding::UTF32_LE),
+    (12001, "utf-32be", string::encoding::UTF32_BE),
+    (20127, "us-ascii", string::encoding::ASCII),
+    (10000, "macintosh", string::encoding::MAC_ROMAN),
+    (1252, "windows-1252", string::encoding::WINDOWS_LATIN1),
+    (1250, "windows-1250", 0x0501),
+    (1251, "windows-1251", 0x0502),
+    (1253, "windows-1253", 0x0503),
+    (1254, "windows-1254", 0x0504),
+    (1255, "windows-1255", 0x0505),
+    (1256, "windows-1256", 0x0506),
+    (1257, "windows-1257", 0x0507),
+    (1258, "windows-1258", 0x0508),
+    (28591, "iso-8859-1", string::encoding::ISO_LATIN_1),
+    (28592, "iso-8859-2", 0x0202),
+    (28593, "iso-8859-3", 0x0203),
+    (28594, "iso-8859-4", 0x0204),
+    (28595, "iso-8859-5", 0x0205),
+    (28596, "iso-8859-6", 0x0206),
+    (28597, "iso-8859-7", 0x0207),
+    (28598, "iso-8859-8", 0x0208),
+    (28599, "iso-8859-9", 0x0209),
+    (28605, "iso-8859-15", 0x020f),
+    (437, "ibm437", 0x0400),
+    (850, "ibm850", 0x0410),
+    (852, "ibm852", 0x0411),
+    (866, "ibm866", 0x041b),
+    (932, "shift_jis", 0x0a01),
+    (936, "gbk", 0x0421),
+    (949, "ks_c_5601-1987", 0x0422),
+    (950, "big5", 0x0a03),
+    (20866, "koi8-r", 0x0a02),
+    (21866, "koi8-u", 0x0a08),
+    (51932, "euc-jp", 0x0920),
+    (51936, "gb2312", 0x0930),
+    (51949, "euc-kr", 0x0940),
+    (54936, "gb18030", 0x0632),
+];
+
+/// `CFStringEncoding CFStringConvertWindowsCodepageToEncoding(UInt32)`.
+pub unsafe extern "C" fn CFStringConvertWindowsCodepageToEncoding(codepage: u32) -> u32 {
+    NAMED_ENCODINGS
+        .iter()
+        .find(|(page, _, _)| *page == codepage)
+        .map_or(INVALID_ENCODING, |(_, _, encoding)| *encoding)
+}
+
+/// `CFStringEncoding CFStringConvertIANACharSetNameToEncoding(CFStringRef)`.
+///
+/// Names compare without regard to case, as charset names do.
+pub unsafe extern "C" fn CFStringConvertIANACharSetNameToEncoding(name: CFTypeRef) -> u32 {
+    let Some(name) = (unsafe { string::as_string(name) }) else {
+        return INVALID_ENCODING;
+    };
+    let name = String::from_utf8_lossy(&name.utf8()).to_ascii_lowercase();
+    let name = match name.as_str() {
+        "utf8" => "utf-8",
+        "ascii" => "us-ascii",
+        "latin1" | "iso_8859-1" => "iso-8859-1",
+        "cp1252" => "windows-1252",
+        "sjis" | "x-sjis" => "shift_jis",
+        "utf-16" => return string::encoding::UTF16,
+        "utf-32" => return string::encoding::UTF32,
+        other => other,
+    };
+    NAMED_ENCODINGS
+        .iter()
+        .find(|(_, iana, _)| *iana == name)
+        .map_or(INVALID_ENCODING, |(_, _, encoding)| *encoding)
+}
+
 /// `Boolean CFArrayContainsValue(CFArrayRef, CFRange, const void *)`, with the
 /// range flattened.
 ///
@@ -2336,7 +2422,8 @@ pub unsafe extern "C" fn CFURLCreateFromFSRef(
     };
     let path = String::from_utf8_lossy(&bytes[..end]);
     // The path is the guest's spelling; the host's answers whether it is a folder.
-    let directory = std::fs::metadata(prefix::ns::host_path(&path)).is_ok_and(|metadata| metadata.is_dir());
+    let directory =
+        std::fs::metadata(prefix::ns::host_path(&path)).is_ok_and(|metadata| metadata.is_dir());
     crate::url::new_file_url(&path, directory)
 }
 
@@ -3394,7 +3481,10 @@ pub unsafe extern "C" fn CFRunLoopRemoveTimer(loop_: CFTypeRef, timer: CFTypeRef
 ///
 /// The `info` word as given. The context's retain, release and description
 /// callbacks are not kept past creation, so they come back null.
-pub unsafe extern "C" fn CFRunLoopTimerGetContext(timer: CFTypeRef, context: *mut CFRunLoopTimerContext) {
+pub unsafe extern "C" fn CFRunLoopTimerGetContext(
+    timer: CFTypeRef,
+    context: *mut CFRunLoopTimerContext,
+) {
     let (Some(t), false) = (unsafe { borrow::<Timer>(timer) }, context.is_null()) else {
         return;
     };
@@ -3451,6 +3541,23 @@ pub unsafe extern "C" fn CFRunLoopTimerSetTolerance(timer: CFTypeRef, tolerance:
 pub unsafe extern "C" fn CFRunLoopTimerInvalidate(timer: CFTypeRef) {
     if let Some(t) = unsafe { borrow::<Timer>(timer) } {
         t.invalidate();
+    }
+}
+
+/// `CFAbsoluteTime CFRunLoopGetNextTimerFireDate(CFRunLoopRef, CFRunLoopMode)`
+///
+/// Zero when no valid timer is scheduled in the mode, as Apple's returns.
+pub unsafe extern "C" fn CFRunLoopGetNextTimerFireDate(loop_: CFTypeRef, mode: CFTypeRef) -> f64 {
+    let Some(l) = (unsafe { borrow::<RunLoop>(loop_) }) else {
+        return 0.0;
+    };
+    let Some(next) = l.next_timer(&unsafe { mode_name(mode) }) else {
+        return 0.0;
+    };
+    let now = std::time::Instant::now();
+    match next.checked_duration_since(now) {
+        Some(ahead) => absolute_time() + ahead.as_secs_f64(),
+        None => absolute_time() - now.duration_since(next).as_secs_f64(),
     }
 }
 
@@ -4176,6 +4283,40 @@ mod path_style_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_windows_code_page_or_charset_name_names_its_encoding() {
+        // SAFETY: plain calls; the strings are live NUL-terminated literals.
+        unsafe {
+            assert_eq!(
+                CFStringConvertWindowsCodepageToEncoding(1252),
+                string::encoding::WINDOWS_LATIN1
+            );
+            assert_eq!(
+                CFStringConvertWindowsCodepageToEncoding(65001),
+                string::encoding::UTF8
+            );
+            assert_eq!(
+                CFStringConvertWindowsCodepageToEncoding(1),
+                INVALID_ENCODING
+            );
+            let name = |text: &core::ffi::CStr| {
+                CFStringCreateWithCString(core::ptr::null(), text.as_ptr(), string::encoding::UTF8)
+            };
+            assert_eq!(
+                CFStringConvertIANACharSetNameToEncoding(name(c"Windows-1252")),
+                string::encoding::WINDOWS_LATIN1
+            );
+            assert_eq!(
+                CFStringConvertIANACharSetNameToEncoding(name(c"UTF-8")),
+                string::encoding::UTF8
+            );
+            assert_eq!(
+                CFStringConvertIANACharSetNameToEncoding(name(c"no-such-charset")),
+                INVALID_ENCODING
+            );
+        }
+    }
 
     #[test]
     fn an_opaque_cf_handle_uses_its_registered_type_without_an_isa() {

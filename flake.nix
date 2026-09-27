@@ -49,7 +49,10 @@
               pkgs.python3 # tools/guest-symbolicate.py
               # metal_translate
               pkgs.llvm
+              # helpful for debugging metal
               pkgs.vkdevicechooser
+              pkgs.vulkan-validation-layers
+              pkgs.renderdoc
               # tools/steamclient: cross-compiles the guest-facing SteamClient
               # dylib to Mach-O without a macOS SDK.
               pkgs.llvmPackages.clang-unwrapped
@@ -66,6 +69,7 @@
               (lib.makeLibraryPath runtimeLibs);
             DYLD_FALLBACK_LIBRARY_PATH = lib.optionalString pkgs.stdenv.hostPlatform.isDarwin
               (lib.makeLibraryPath runtimeLibs);
+            VK_LAYER_PATH="${pkgs.vulkan-validation-layers}/share/vulkan/explicit_layer.d";
           };
         });
     };

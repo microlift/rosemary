@@ -2,7 +2,7 @@ use metal_translate::ir::{
     Access, AddressSpace, AtomicOp, BarrierMemory, BarrierScope, Block, BlockId, ConvertOp,
     EntryPoint, FloatPredicate, FloatUnaryOp, Function, Instruction, InstructionKind,
     IntegerBinaryOp, MemoryOrder, Module, Operand, Parameter, Resource, ResourceKind, Stage,
-    Terminator, TextureDimension, TextureType, Type, ValueId,
+    StageBinding, StageInput, Terminator, TextureDimension, TextureType, Type, ValueId,
 };
 use metal_translate::{
     AirInput, Phase, TargetProfile, emit_spirv, metallib_air, parse_air, parse_msl, translate,
@@ -534,6 +534,7 @@ fn emits_a_writable_3d_texture_descriptor_in_its_metal_namespace() {
         multisampled: false,
         depth: false,
         texel: Box::new(Type::Float { bits: 32 }),
+        signed: false,
         access: Access::Write,
     });
     let module = Module {
@@ -1598,4 +1599,192 @@ fn fragment_demote_is_negotiated_and_fully_reflected() {
         target.unsupported_requirement(&entry.required),
         Some("DemoteToHelperInvocation")
     );
+}
+
+fn uvec(lanes: u8) -> Type {
+    Type::Vector {
+        element: Box::new(Type::u32()),
+        lanes,
+    }
+}
+
+/// The instructions of `op` in the module's function bodies.
+fn body_instructions(module: &rspirv::dr::Module, op: Op) -> Vec<rspirv::dr::Instruction> {
+    module
+        .functions
+        .iter()
+        .flat_map(|function| &function.blocks)
+        .flat_map(|block| &block.instructions)
+        .filter(|instruction| instruction.class.opcode == op)
+        .cloned()
+        .collect()
+}
+
+/// Whether `id` names `OpTypeInt 32 1`, or a vector of it.
+fn is_signed_int32(module: &rspirv::dr::Module, id: u32) -> bool {
+    use rspirv::dr::Operand as O;
+    let Some(ty) = module
+        .types_global_values
+        .iter()
+        .find(|instruction| instruction.result_id == Some(id))
+    else {
+        return false;
+    };
+    match ty.class.opcode {
+        Op::TypeInt => ty.operands == [O::LiteralBit32(32), O::LiteralBit32(1)],
+        Op::TypeVector => {
+            matches!(ty.operands[0], O::IdRef(element) if is_signed_int32(module, element))
+        }
+        _ => false,
+    }
+}
+
+/// Vulkan requires an image's sampled type to carry its format's
+/// signedness, while the IR reads texels signless: the fetch is signed and a
+/// bitcast gives the body back its unsigned value.
+#[test]
+fn a_signed_texture_is_read_through_a_signed_image_type() {
+    let texture = Type::Texture(TextureType {
+        dimension: TextureDimension::D2,
+        array: false,
+        multisampled: false,
+        depth: false,
+        texel: Box::new(Type::u32()),
+        signed: true,
+        access: Access::Read,
+    });
+    let coordinate = Operand::Composite {
+        ty: uvec(2),
+        elements: vec![
+            Operand::Integer {
+                ty: Type::u32(),
+                value: 0,
+            };
+            2
+        ],
+    };
+    let module = Module {
+        static_initializers: Vec::new(),
+        globals: Vec::new(),
+        functions: vec![Function {
+            name: "read_ids".to_string(),
+            result: Type::Void,
+            parameters: vec![Parameter {
+                value: ValueId(0),
+                name: "ids".to_string(),
+                ty: texture.clone(),
+            }],
+            values: vec![texture.clone(), uvec(4)],
+            blocks: vec![Block {
+                id: BlockId(0),
+                name: "entry".to_string(),
+                instructions: vec![Instruction {
+                    result: Some(ValueId(1)),
+                    kind: InstructionKind::TextureRead {
+                        texture: Operand::Value(ValueId(0)),
+                        coordinate,
+                        array_index: None,
+                        lod: None,
+                        sample: None,
+                    },
+                }],
+                terminator: Terminator::Return(None),
+            }],
+        }],
+        entries: vec![EntryPoint {
+            function: 0,
+            stage: Stage::Kernel,
+            resources: vec![Resource {
+                argument: 0,
+                kind: ResourceKind::Texture,
+                index: 0,
+                count: 1,
+                access: Access::Read,
+                ty: texture,
+                name: Some("ids".to_string()),
+            }],
+            inputs: Vec::new(),
+            outputs: Vec::new(),
+        }],
+    };
+
+    let artifact = emit_spirv(&module, &TargetProfile::vulkan_1_3())
+        .unwrap()
+        .entries
+        .remove(0);
+    let parsed = rspirv::dr::load_words(&artifact.words).unwrap();
+    let image = parsed
+        .types_global_values
+        .iter()
+        .find(|instruction| instruction.class.opcode == Op::TypeImage)
+        .expect("an image type");
+    assert!(is_signed_int32(&parsed, image.operands[0].unwrap_id_ref()));
+    let [fetch] = &body_instructions(&parsed, Op::ImageFetch)[..] else {
+        panic!("expected one fetch");
+    };
+    assert!(is_signed_int32(&parsed, fetch.result_type.unwrap()));
+    let [bitcast] = &body_instructions(&parsed, Op::Bitcast)[..] else {
+        panic!("expected one bitcast");
+    };
+    assert_eq!(
+        bitcast.operands[0].unwrap_id_ref(),
+        fetch.result_id.unwrap()
+    );
+    assert!(!is_signed_int32(&parsed, bitcast.result_type.unwrap()));
+}
+
+/// A `short4` attribute has a `SINT` Vulkan format, so the input it lands in
+/// must be signed even though the body reads it signless.
+#[test]
+fn a_signed_vertex_attribute_is_declared_signed() {
+    let module = Module {
+        static_initializers: Vec::new(),
+        globals: Vec::new(),
+        functions: vec![Function {
+            name: "vertex_ids".to_string(),
+            result: Type::Void,
+            parameters: vec![Parameter {
+                value: ValueId(0),
+                name: "ids".to_string(),
+                ty: uvec(4),
+            }],
+            values: vec![uvec(4)],
+            blocks: vec![Block {
+                id: BlockId(0),
+                name: "entry".to_string(),
+                instructions: Vec::new(),
+                terminator: Terminator::Return(None),
+            }],
+        }],
+        entries: vec![EntryPoint {
+            function: 0,
+            stage: Stage::Vertex,
+            resources: Vec::new(),
+            inputs: vec![StageInput {
+                argument: 0,
+                binding: StageBinding::Location {
+                    location: 0,
+                    interpolation: None,
+                },
+                name: Some("ids".to_string()),
+                signed: true,
+            }],
+            outputs: Vec::new(),
+        }],
+    };
+
+    let artifact = emit_spirv(&module, &TargetProfile::vulkan_1_3())
+        .unwrap()
+        .entries
+        .remove(0);
+    let parsed = rspirv::dr::load_words(&artifact.words).unwrap();
+    let [load] = &body_instructions(&parsed, Op::Load)[..] else {
+        panic!("expected one load");
+    };
+    assert!(is_signed_int32(&parsed, load.result_type.unwrap()));
+    let [bitcast] = &body_instructions(&parsed, Op::Bitcast)[..] else {
+        panic!("expected one bitcast");
+    };
+    assert_eq!(bitcast.operands[0].unwrap_id_ref(), load.result_id.unwrap());
+    assert!(!is_signed_int32(&parsed, bitcast.result_type.unwrap()));
 }

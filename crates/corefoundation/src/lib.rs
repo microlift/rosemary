@@ -13,8 +13,8 @@ pub mod calendar;
 pub mod callbacks;
 pub mod charset;
 pub mod collections;
-pub mod eightbit;
 mod diskarbitration;
+pub mod eightbit;
 /// Only on Darwin: nowhere else is there another CoreFoundation to meet.
 #[cfg(target_os = "macos")]
 pub mod foreign;
@@ -228,6 +228,8 @@ exports::exports! {
         "CFDataCreateMutable" => api::CFDataCreateMutable,
         "CFDataGetBytes" => api::CFDataGetBytes,
         "CFStringGetSystemEncoding" => api::CFStringGetSystemEncoding,
+        "CFStringConvertWindowsCodepageToEncoding" => api::CFStringConvertWindowsCodepageToEncoding,
+        "CFStringConvertIANACharSetNameToEncoding" => api::CFStringConvertIANACharSetNameToEncoding,
         "CFArrayContainsValue" => api::CFArrayContainsValue,
         "CFArrayAppendArray" => api::CFArrayAppendArray,
         "CFRunLoopRemoveSource" => api::CFRunLoopRemoveSource,
@@ -315,6 +317,7 @@ exports::exports! {
             => url::_CFURLCreateFromPropertyListRepresentation,
         // The `PKG___` codes, which no modern bundle has: see `packageinfo`.
         "CFBundleGetPackageInfo" => packageinfo::CFBundleGetPackageInfo,
+        "CFRunLoopGetNextTimerFireDate" => api::CFRunLoopGetNextTimerFireDate,
     }
     groups {
         calendar,

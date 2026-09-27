@@ -363,10 +363,11 @@ pub(super) unsafe extern "C" fn copy_texture_to_texture(
             y: destination_checked.origin[1] as i32,
             z: destination_checked.origin[2] as i32,
         })
+        // One extent serves both images, and each clamps to its own level.
         .extent(vk::Extent3D {
-            width: source_checked.size[0],
-            height: source_checked.size[1],
-            depth: source_checked.size[2],
+            width: source_checked.size[0].min(destination_checked.size[0]),
+            height: source_checked.size[1].min(destination_checked.size[1]),
+            depth: source_checked.size[2].min(destination_checked.size[2]),
         });
     // SAFETY: recording into this command buffer; both images are in GENERAL.
     unsafe {

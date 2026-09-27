@@ -524,7 +524,7 @@ fn modal_loop(dialog: &mut Dialog) -> (usize, bool) {
             | Event::MouseButton { .. }
             | Event::MouseWheel { .. } => {}
             Event::WindowClosed { .. } | Event::WindowHitTest { .. } => {}
-            other => crate::event::deliver(other),
+            other => crate::event::deliver_past_modal(other),
         }
     }
 }

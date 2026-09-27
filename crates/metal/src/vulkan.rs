@@ -46,6 +46,9 @@ struct State {
     /// with the extension - a headless host has no surface extension at all,
     /// and presentation falls back to the readback path there.
     surface_api: Option<ash::khr::surface::Instance>,
+    /// `VK_EXT_surface_maintenance1`, which a device's
+    /// `VK_EXT_swapchain_maintenance1` requires of its instance.
+    surface_maintenance1: bool,
     _entry: Entry,
     adapters: Vec<Adapter>,
 }
@@ -100,6 +103,7 @@ fn initialize() -> Result<State, String> {
     let surface_api = surface_extensions
         .contains(&ash::khr::surface::NAME)
         .then(|| ash::khr::surface::Instance::new(&entry, &instance));
+    let surface_maintenance1 = surface_extensions.contains(&ash::ext::surface_maintenance1::NAME);
 
     // SAFETY: `instance` is live and ash owns its loaded instance functions.
     let physical = unsafe { instance.enumerate_physical_devices() }
@@ -180,6 +184,7 @@ fn initialize() -> Result<State, String> {
     Ok(State {
         instance,
         surface_api,
+        surface_maintenance1,
         _entry: entry,
         adapters,
     })
@@ -269,7 +274,19 @@ fn surface_extensions(entry: &Entry) -> Vec<&'static std::ffi::CStr> {
             wanted.push(name);
         }
     }
+    if has(ash::khr::get_surface_capabilities2::NAME) && has(ash::ext::surface_maintenance1::NAME) {
+        wanted.push(ash::khr::get_surface_capabilities2::NAME);
+        wanted.push(ash::ext::surface_maintenance1::NAME);
+    }
     wanted
+}
+
+/// Whether the instance enabled `VK_EXT_surface_maintenance1`.
+pub fn surface_maintenance1() -> bool {
+    STATE
+        .get()
+        .and_then(|state| state.as_ref().ok())
+        .is_some_and(|state| state.surface_maintenance1)
 }
 
 /// `VK_KHR_surface`'s instance functions, where the instance has it.

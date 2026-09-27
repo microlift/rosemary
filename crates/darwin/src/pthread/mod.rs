@@ -2,6 +2,7 @@ pub mod attr;
 mod cond;
 pub mod consts;
 mod mach_thread;
+pub mod handle;
 mod mutex;
 pub mod object;
 mod once;
@@ -59,15 +60,12 @@ pub fn null_thread() -> libc::pthread_t {
     unsafe { core::mem::zeroed() }
 }
 
-/// A guest `pthread_t` as this host's.
-///
-/// Both are eight opaque bytes, and every value a guest can hold was produced by a
-/// `pthread_create` this runtime serviced - so the handle is the host's already and
-/// this is a cast rather than a lookup.
-fn thread_of(guest: u64) -> libc::pthread_t {
-    // SAFETY: `pthread_t` is pointer-sized on both platforms, and `guest` is a value
+/// A guest `pthread_t` as this host's. See [`handle`] for why they differ.
+pub fn thread_of(guest: u64) -> libc::pthread_t {
+    let host = handle::host_of(guest);
+    // SAFETY: `pthread_t` is pointer-sized on both platforms, and `host` is a value
     // the host's own `pthread_create` produced.
-    unsafe { core::mem::transmute_copy(&guest) }
+    unsafe { core::mem::transmute_copy(&host) }
 }
 
 fn thread_bits(thread: libc::pthread_t) -> u64 {
@@ -189,6 +187,7 @@ mod thread_ids {
 pub fn publish_self() {
     // SAFETY: this thread is live by definition.
     thread_ids::register(thread_bits(unsafe { libc::pthread_self() }), id(), 0);
+    handle::begin();
 }
 
 /// Build the `init`/`destroy`/`setter`/`getter` quartet for an attribute object whose
@@ -629,7 +628,7 @@ pub unsafe extern "C" fn threadid_np(thread: u64, out: u64) -> i32 {
     if thread != 0 {
         // SAFETY: `thread` is a live handle; `pthread_equal` only compares.
         if unsafe { libc::pthread_equal(thread_of(thread), libc::pthread_self()) } == 0 {
-            let Some(id) = thread_ids::get(thread) else {
+            let Some(id) = thread_ids::get(handle::host_of(thread)) else {
                 return err::ESRCH;
             };
             unsafe { *(out as usize as *mut u64) = u64::from(id) };
@@ -653,7 +652,7 @@ pub unsafe extern "C" fn mach_thread_np(thread: u64) -> u32 {
     if thread != 0 {
         // SAFETY: `thread` is a live handle; `pthread_equal` only compares.
         if unsafe { libc::pthread_equal(thread_of(thread), libc::pthread_self()) } == 0 {
-            return thread_ids::get(thread).unwrap_or(0);
+            return thread_ids::get(handle::host_of(thread)).unwrap_or(0);
         }
     }
     id()
@@ -733,7 +732,7 @@ pub unsafe extern "C" fn get_qos_class_np(thread: u64, class: u64, relative: u64
     {
         CURRENT_QOS.with(std::cell::Cell::get)
     } else {
-        let Some(qos) = thread_ids::qos(thread) else {
+        let Some(qos) = thread_ids::qos(handle::host_of(thread)) else {
             return err::ESRCH;
         };
         qos
@@ -969,6 +968,7 @@ extern "C" fn run(context: *mut core::ffi::c_void) -> *mut core::ffi::c_void {
     // SAFETY: this thread is live by definition.
     let qos = u64::from(start.qos_class) | ((start.qos_relative_priority as u32 as u64) << 32);
     thread_ids::register(thread_bits(unsafe { libc::pthread_self() }), id(), qos);
+    handle::begin();
     start
         .registered
         .store(true, std::sync::atomic::Ordering::Release);
@@ -1048,7 +1048,7 @@ pub unsafe extern "C" fn create(out: u64, attr: u64, start: u64, arg: u64) -> i3
     }
     // SAFETY: the caller states `out` is a writable `pthread_t`, which is eight
     // opaque bytes on both platforms - see [`thread_of`], which reads it back.
-    unsafe { (out as usize as *mut u64).write(thread as u64) };
+    unsafe { (out as usize as *mut u64).write(handle::for_host(thread_bits(thread))) };
     0
 }
 
@@ -1211,8 +1211,8 @@ exports::exports! {
         "pthread_getschedparam" => sched::pthread_getschedparam,
         "pthread_setschedparam" => sched::pthread_setschedparam,
 
-        "pthread_self" => libc::pthread_self,
-        "pthread_equal" => libc::pthread_equal,
+        "pthread_self" => handle::pthread_self,
+        "pthread_equal" => handle::pthread_equal,
         "pthread_exit" => libc::pthread_exit,
         "pthread_testcancel" => pthread_testcancel,
         "pthread_getconcurrency" => pthread_getconcurrency,

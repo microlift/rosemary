@@ -231,7 +231,9 @@ struct Api {
     SDL_WarpMouseGlobal: Option<unsafe extern "C" fn(f32, f32) -> bool>,
     SDL_SetWindowRelativeMouseMode: Option<unsafe extern "C" fn(Window, bool) -> bool>,
     SDL_GetWindowRelativeMouseMode: Option<unsafe extern "C" fn(Window) -> bool>,
+    SDL_SetWindowMouseGrab: Option<unsafe extern "C" fn(Window, bool) -> bool>,
     SDL_GetModState: Option<unsafe extern "C" fn() -> u16>,
+    SDL_GetKeyFromScancode: Option<unsafe extern "C" fn(u32, u16, bool) -> u32>,
     SDL_SetHint: Option<unsafe extern "C" fn(*const c_char, *const c_char) -> bool>,
     SDL_GetSystemTheme: Option<unsafe extern "C" fn() -> c_int>,
     SDL_GetCurrentVideoDriver: Option<unsafe extern "C" fn() -> *const c_char>,
@@ -446,7 +448,9 @@ fn api() -> Option<&'static Api> {
             SDL_WarpMouseGlobal,
             SDL_SetWindowRelativeMouseMode,
             SDL_GetWindowRelativeMouseMode,
+            SDL_SetWindowMouseGrab,
             SDL_GetModState,
+            SDL_GetKeyFromScancode,
             SDL_SetHint,
             SDL_GetSystemTheme,
             SDL_GetCurrentVideoDriver,
@@ -1375,6 +1379,7 @@ pub mod video {
         pub const QUIT: u32 = 0x100;
         pub const SYSTEM_THEME_CHANGED: u32 = 0x108;
         pub const WINDOW_EXPOSED: u32 = 0x204;
+        pub const WINDOW_MOVED: u32 = 0x205;
         pub const WINDOW_RESIZED: u32 = 0x206;
         pub const WINDOW_PIXEL_SIZE_CHANGED: u32 = 0x207;
         pub const WINDOW_MINIMIZED: u32 = 0x209;
@@ -1522,6 +1527,11 @@ pub mod video {
     #[derive(Clone, Debug, PartialEq)]
     pub enum Event {
         Quit,
+        /// The window's desktop position changed, including a compositor
+        /// correcting one SDL had only been asked for.
+        WindowMoved {
+            window: u32,
+        },
         WindowResized {
             window: u32,
             width: i32,
@@ -1642,6 +1652,10 @@ pub mod video {
         unsafe {
             match tag {
                 event_type::QUIT => Event::Quit,
+                event_type::WINDOW_MOVED => {
+                    let e: WindowEvent = decode(&raw);
+                    Event::WindowMoved { window: e.window }
+                }
                 event_type::WINDOW_RESIZED => {
                     let e: WindowEvent = decode(&raw);
                     Event::WindowResized {
@@ -2820,6 +2834,16 @@ pub mod video {
             .map_or(0, |f| unsafe { f() })
     }
 
+    /// The keycode the current layout produces for `scancode` with `modifiers`
+    /// held, or `None` when SDL cannot say.
+    pub fn key_from_scancode(scancode: u32, modifiers: u16) -> Option<u32> {
+        let f = api()?.SDL_GetKeyFromScancode?;
+        // Not `key_event`: that asks for what a key event would carry, which
+        // SDL leaves unshifted by default, so Shift-/ would still be "/".
+        // SAFETY: plain values in, a keycode out.
+        Some(unsafe { f(scancode, modifiers, false) })
+    }
+
     /// The pointer in desktop coordinates, and which buttons are down.
     pub fn global_mouse_state() -> Option<(f32, f32, u32)> {
         let f = api()?.SDL_GetGlobalMouseState?;
@@ -2956,6 +2980,16 @@ pub mod video {
         };
         // SAFETY: a window from SDL.
         unsafe { f(window, enabled) }
+    }
+
+    /// Keep the pointer inside `window` while it has focus, still moving and
+    /// still reporting positions, or let it go.
+    pub fn set_mouse_grab(window: Window, grabbed: bool) -> bool {
+        let Some(f) = api().and_then(|a| a.SDL_SetWindowMouseGrab) else {
+            return false;
+        };
+        // SAFETY: a window from SDL.
+        unsafe { f(window, grabbed) }
     }
 
     /// Whether `window` is holding the pointer, asked of SDL rather than

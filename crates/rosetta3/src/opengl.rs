@@ -102,7 +102,7 @@ fn resolve(symbol: &str) -> Option<Resolved> {
 fn address(name: &str) -> Option<u64> {
     // A few entry points are this runtime's rather than the driver's, because
     // what passes through them needs changing on the way. See [`crate::glsl`].
-    if let Some(ours) = crate::glsl::address(name) {
+    if let Some(ours) = crate::glsl::address(name).or_else(|| crate::macgl::address(name)) {
         return Some(ours);
     }
     if name == "glDrawElements" {

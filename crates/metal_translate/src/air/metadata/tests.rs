@@ -106,6 +106,7 @@ fn decodes_a_fragment_stage_interface_from_metadata() {
                 }),
             },
             name: Some("IN_Color".to_string()),
+            signed: false,
         }]
     );
     let [buffer] = interface.resources.as_slice() else {
@@ -133,6 +134,7 @@ fn decodes_texture_shapes_from_their_metal_type_name() {
             multisampled: false,
             depth: false,
             texel: Box::new(Type::Float { bits: 32 }),
+            signed: false,
             access: Access::Sample,
         })
     );
@@ -144,6 +146,7 @@ fn decodes_texture_shapes_from_their_metal_type_name() {
             multisampled: false,
             depth: true,
             texel: Box::new(Type::Float { bits: 32 }),
+            signed: false,
             access: Access::Sample,
         })
     );
@@ -155,6 +158,7 @@ fn decodes_texture_shapes_from_their_metal_type_name() {
             multisampled: true,
             depth: false,
             texel: Box::new(Type::Float { bits: 16 }),
+            signed: false,
             access: Access::Read,
         })
     );
@@ -162,9 +166,16 @@ fn decodes_texture_shapes_from_their_metal_type_name() {
         panic!("expected a texture type");
     };
     assert!(array.array);
-    // Metal's element signedness is not a storage difference, so it is
-    // carried by the reading operation rather than by the type.
+    // The texel stays signless like AIR's reads; signedness rides beside it
+    // for the Vulkan image type.
     assert_eq!(array.texel.as_ref(), &Type::u32());
+    assert!(!array.signed);
+    let Type::Texture(signed) = shape("texture2d<int>", Access::Read).unwrap() else {
+        panic!("expected a texture type");
+    };
+    assert_eq!(signed.texel.as_ref(), &Type::u32());
+    assert!(signed.signed);
+    assert_eq!(signed.sampled_scalar(), Type::i32());
     assert!(shape("texture4d<float>", Access::Sample).is_err());
     assert!(shape("texture2d<double>", Access::Sample).is_err());
 }
@@ -252,4 +263,20 @@ fn decodes_packed_metadata_string_table() {
         metadata_strings(&blob, 2, offset as u64).unwrap(),
         ["AIR", "air.kernel"]
     );
+}
+
+#[test]
+fn a_vertex_attribute_spelled_as_a_signed_integer_is_signed() {
+    let signed =
+        |name: &str| signed_integer_argument(&[Item::Text("air.arg_type_name"), Item::Text(name)]);
+    for name in ["int", "short2", "char4", "packed_int3"] {
+        assert!(signed(name), "{name}");
+    }
+    for name in ["uint", "ushort4", "uchar2", "float4", "half2"] {
+        assert!(!signed(name), "{name}");
+    }
+    assert!(!signed_integer_argument(&[
+        Item::Text("air.arg_name"),
+        Item::Text("int")
+    ]));
 }

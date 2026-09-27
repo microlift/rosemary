@@ -227,7 +227,12 @@ pub unsafe extern "C" fn copyfile(
 /// # Safety
 ///
 /// `from` and `to` are open descriptors.
-pub unsafe extern "C" fn fcopyfile(from: c_int, to: c_int, _state: *mut c_void, flags: u32) -> c_int {
+pub unsafe extern "C" fn fcopyfile(
+    from: c_int,
+    to: c_int,
+    _state: *mut c_void,
+    flags: u32,
+) -> c_int {
     use std::io::{Seek, SeekFrom};
     use std::os::fd::FromRawFd;
 
@@ -294,7 +299,8 @@ mod tests {
     use super::*;
 
     fn scratch(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("darwin-copyfile-{name}-{}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("darwin-copyfile-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir

@@ -50,7 +50,7 @@ exports::group! {
 /// The `kSec*` key globals, each a cell holding an `NSString *`.
 pub fn data_symbols() -> Vec<(String, u64)> {
     foundation::bootstrap();
-    keychain::KEYS
+    let mut symbols: Vec<_> = keychain::KEYS
         .iter()
         .map(|(symbol, text)| {
             (
@@ -61,5 +61,12 @@ pub fn data_symbols() -> Vec<(String, u64)> {
                 ),
             )
         })
-        .collect()
+        .collect();
+    // `const SecRandomRef kSecRandomDefault = NULL`: a word the guest reads.
+    let random = "_kSecRandomDefault";
+    symbols.push((
+        random.to_string(),
+        corefoundation::base::global_cell(random, 0),
+    ));
+    symbols
 }

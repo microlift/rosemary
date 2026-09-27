@@ -241,7 +241,9 @@ fn memory_from_sysfs() -> Option<i32> {
     let cards = std::fs::read_dir("/sys/class/drm").ok()?;
     let largest = cards
         .filter_map(Result::ok)
-        .filter_map(|card| std::fs::read_to_string(card.path().join("device/mem_info_vram_total")).ok())
+        .filter_map(|card| {
+            std::fs::read_to_string(card.path().join("device/mem_info_vram_total")).ok()
+        })
         .filter_map(|text| text.trim().parse::<u64>().ok())
         .max()?;
     Some(i32::try_from(largest).unwrap_or(i32::MAX))

@@ -287,7 +287,9 @@ impl Layout {
         for directory in self.string_localizations() {
             let path = directory.join(format!("{table}.strings"));
             let parsed = cache.entry(path.clone()).or_insert_with(|| {
-                std::fs::read(&path).ok().and_then(|bytes| crate::strings::parse(&bytes))
+                std::fs::read(&path)
+                    .ok()
+                    .and_then(|bytes| crate::strings::parse(&bytes))
             });
             if let Some(found) = parsed.as_ref().and_then(|t| t.get(key)) {
                 return found.clone();
@@ -987,7 +989,12 @@ pub mod cf {
 
     /// `CFStringRef CFBundleCopyLocalizedString(CFBundleRef, CFStringRef key,
     /// CFStringRef value, CFStringRef tableName)`
-    unsafe extern "C" fn CFBundleCopyLocalizedString(bundle: Id, key: Id, value: Id, table: Id) -> Id {
+    unsafe extern "C" fn CFBundleCopyLocalizedString(
+        bundle: Id,
+        key: Id,
+        value: Id,
+        table: Id,
+    ) -> Id {
         // SAFETY: a bundle and strings or nil, as the caller passed them.
         unsafe { super::class::copy_localized_string(bundle, key, value, table) }
     }
@@ -1776,7 +1783,9 @@ pub(crate) mod class {
         };
         // SAFETY: an `NSBundle`.
         match unsafe { layout_of(receiver) } {
-            Some(layout) => autoreleased(&layout.localized_string(&key, value.as_deref(), table.as_deref())),
+            Some(layout) => {
+                autoreleased(&layout.localized_string(&key, value.as_deref(), table.as_deref()))
+            }
             None => autoreleased(value.as_deref().filter(|v| !v.is_empty()).unwrap_or(&key)),
         }
     }
@@ -1785,7 +1794,13 @@ pub(crate) mod class {
     pub(crate) unsafe fn copy_localized_string(bundle: Id, key: Id, value: Id, table: Id) -> Id {
         // SAFETY: forwarded; the answer is autoreleased and this spelling owns it.
         objc::arc::retain(unsafe {
-            localized_string_for_key(bundle, objc::sel::get("localizedStringForKey:value:table:"), key, value, table)
+            localized_string_for_key(
+                bundle,
+                objc::sel::get("localizedStringForKey:value:table:"),
+                key,
+                value,
+                table,
+            )
         })
     }
 

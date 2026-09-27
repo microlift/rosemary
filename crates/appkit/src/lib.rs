@@ -154,6 +154,7 @@ exports::exports! {
         "CGDisplayShowCursor" => cursor::CGDisplayShowCursor,
         "CGCursorIsVisible" => cursor::CGCursorIsVisible,
         "CGWarpMouseCursorPosition" => screen::CGWarpMouseCursorPosition,
+        "CGSetLocalEventsSuppressionInterval" => screen::CGSetLocalEventsSuppressionInterval,
         "CGAssociateMouseAndMouseCursorPosition" => screen::CGAssociateMouseAndMouseCursorPosition,
         "CGEventSourceKeyState" => screen::CGEventSourceKeyState,
         "CGEventCreate" => cgevent::CGEventCreate,

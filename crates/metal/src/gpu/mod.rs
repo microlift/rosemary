@@ -393,14 +393,19 @@ impl Gpu {
         if presents {
             enabled.push(ash::khr::swapchain::NAME.as_ptr());
         }
-        let swapchain_maintenance1 = presents && has(ash::ext::swapchain_maintenance1::NAME) && {
-            let mut maintenance = vk::PhysicalDeviceSwapchainMaintenance1FeaturesEXT::default();
-            let mut features = vk::PhysicalDeviceFeatures2::default().push_next(&mut maintenance);
-            // SAFETY: the extension is advertised and both structures
-            // live across the query.
-            unsafe { instance.get_physical_device_features2(physical, &mut features) };
-            maintenance.swapchain_maintenance1 == vk::TRUE
-        };
+        // The device extension requires its surface counterpart on the instance.
+        let swapchain_maintenance1 = presents
+            && crate::vulkan::surface_maintenance1()
+            && has(ash::ext::swapchain_maintenance1::NAME)
+            && {
+                let mut maintenance = vk::PhysicalDeviceSwapchainMaintenance1FeaturesEXT::default();
+                let mut features =
+                    vk::PhysicalDeviceFeatures2::default().push_next(&mut maintenance);
+                // SAFETY: the extension is advertised and both structures
+                // live across the query.
+                unsafe { instance.get_physical_device_features2(physical, &mut features) };
+                maintenance.swapchain_maintenance1 == vk::TRUE
+            };
         if swapchain_maintenance1 {
             enabled.push(ash::ext::swapchain_maintenance1::NAME.as_ptr());
         }
@@ -714,7 +719,8 @@ impl GpuImage {
         // The bound is the level rounded up to whole blocks, not the level.
         // A compressed level below one block - the 2x2 and 1x1 tail of any BC
         // mip chain - still occupies a full 4x4 block, and both Metal and
-        // Vulkan let a copy that reaches the edge of the level cover it. A
+        // Vulkan let a copy that reaches the edge of the level cover it - Metal
+        // by naming the whole block, Vulkan by stopping at the edge. A
         // check against the level itself refuses every BC mip tail a game
         // uploads, which is most of its textures.
         let (block_width, block_height) = block_extent(self.format);
@@ -741,8 +747,17 @@ impl GpuImage {
                     extent[axis], bound[axis]
                 ));
             }
+            // Vulkan covers a partial block by reaching the level's edge, not
+            // by overhanging it, so the extent stops at the level.
+            let inside = u64::from(extent[axis]).saturating_sub(start);
+            if inside == 0 {
+                return Err(format!(
+                    "a region starting at {start} on axis {axis}, past level {level}'s {} texels",
+                    extent[axis]
+                ));
+            }
             checked.origin[axis] = start as u32;
-            checked.size[axis] = span as u32;
+            checked.size[axis] = span.min(inside) as u32;
         }
         Ok(checked)
     }
@@ -858,11 +873,12 @@ mod tests {
         image.format = vk::Format::BC3_UNORM_BLOCK;
         // Level three is 2x2 texels and level four 1x1, and a BC3 upload
         // names the 4x4 block each of them sits in.
-        for level in 3..5 {
+        // Vulkan is handed the level's own extent, which reaches its edge.
+        for (level, texels) in [(3, 2), (4, 1)] {
             let checked = image
                 .region(region(level, 0, [0, 0, 0], [4, 4, 1]))
                 .expect("a whole block of the mip tail");
-            assert_eq!(checked.size, [4, 4, 1]);
+            assert_eq!(checked.size, [texels, texels, 1]);
         }
         // One block, and no further.
         assert!(image.region(region(4, 0, [0, 0, 0], [8, 4, 1])).is_err());

@@ -363,6 +363,35 @@ unsafe extern "C" fn data_with_contents_of_file(class: Id, _sel: Sel, path: Id) 
         return std::ptr::null_mut();
     };
     autoreleased_data(class, bytes)
+    let data = collections::new_data(bytes);
+    // SAFETY: a fresh object.
+    unsafe { api::CFAutorelease(data) as Id }
+}
+
+/// `+dataWithContentsOfFile:options:error:`. The reading options only tune
+/// how the file is read (mapped, uncached), not what is answered.
+unsafe extern "C" fn data_with_contents_of_file_options(
+    class: Id,
+    sel: Sel,
+    path: Id,
+    _options: u64,
+    error: *mut Id,
+) -> Id {
+    // SAFETY: forwarded unchanged.
+    let data = unsafe { data_with_contents_of_file(class, sel, path) };
+    if !error.is_null() {
+        // `NSFileReadNoSuchFileError` or nothing: the caller passed a writable
+        // `NSError **`.
+        unsafe {
+            *error = match data.is_null() {
+                true => {
+                    crate::error::make("NSCocoaErrorDomain", 260, "The file couldn't be opened.")
+                }
+                false => std::ptr::null_mut(),
+            };
+        }
+    }
+    data
 }
 
 /// `+[NSDictionary dictionaryWithContentsOfFile:]`.
@@ -1109,6 +1138,50 @@ unsafe extern "C" fn data_empty(class: Id, _sel: Sel) -> Id {
 /// `NSInvalidArgumentException` "called with length but null bytes". A null
 /// pointer with length zero is not a failure on either: there is nothing to copy.
 unsafe extern "C" fn data_init_with_bytes(
+/// Non-null `bytes` covers `length` bytes.
+unsafe fn raw<'a>(bytes: *const u8, length: usize) -> &'a [u8] {
+    match bytes.is_null() || length == 0 {
+        true => &[],
+        false => unsafe { std::slice::from_raw_parts(bytes, length) },
+    }
+}
+
+/// Every `-init...` below answers a new object in place of the one `+alloc`
+/// made, as the string initialisers do: data here is a CoreFoundation object
+/// whatever class was asked for, and one class serves both mutabilities.
+fn replace_receiver(receiver: Id, bytes: Vec<u8>) -> Id {
+    objc::arc::release(receiver);
+    collections::new_data(bytes) as Id
+}
+
+fn autoreleased_data(bytes: Vec<u8>) -> Id {
+    // SAFETY: a fresh object.
+    unsafe { api::CFAutorelease(collections::new_data(bytes)) as Id }
+}
+
+unsafe extern "C" fn data_init(receiver: Id, _sel: Sel) -> Id {
+    replace_receiver(receiver, Vec::new())
+}
+
+unsafe extern "C" fn data_init_with_data(receiver: Id, _sel: Sel, other: Id) -> Id {
+    // SAFETY: a data object or nil.
+    replace_receiver(receiver, unsafe { data_contents(other) }.to_vec())
+}
+
+unsafe extern "C" fn data_init_with_bytes(
+    receiver: Id,
+    _sel: Sel,
+    bytes: *const u8,
+    length: usize,
+) -> Id {
+    // SAFETY: the caller says `bytes` covers `length` bytes.
+    replace_receiver(receiver, unsafe { raw(bytes, length) }.to_vec())
+}
+
+/// `-initWithBytesNoCopy:length:freeWhenDone:`. Copied, as
+/// [`data_with_bytes_no_copy`] explains, and the caller's buffer released
+/// now when it handed it over.
+unsafe extern "C" fn data_init_no_copy_free(
     receiver: Id,
     _sel: Sel,
     bytes: *const u8,
@@ -1122,6 +1195,69 @@ unsafe extern "C" fn data_init_with_bytes(
         Vec::new()
     } else {
         unsafe { std::slice::from_raw_parts(bytes, length) }.to_vec()
+    replace_receiver(receiver, copy)
+}
+
+unsafe extern "C" fn data_init_no_copy(
+    receiver: Id,
+    sel: Sel,
+    bytes: *mut u8,
+    length: usize,
+) -> Id {
+    // SAFETY: forwarded; `-initWithBytesNoCopy:length:` frees when done.
+    unsafe { data_init_no_copy_free(receiver, sel, bytes, length, true) }
+}
+
+unsafe extern "C" fn data_init_with_contents_of_file(receiver: Id, sel: Sel, path: Id) -> Id {
+    objc::arc::release(receiver);
+    // SAFETY: forwarded; the answer is autoreleased, and `-init` answers +1.
+    objc::arc::retain(unsafe { data_with_contents_of_file(receiver, sel, path) })
+}
+
+unsafe extern "C" fn data_init_with_capacity(receiver: Id, _sel: Sel, capacity: usize) -> Id {
+    replace_receiver(receiver, Vec::with_capacity(capacity.min(1 << 24)))
+}
+
+unsafe extern "C" fn data_init_with_length(receiver: Id, _sel: Sel, length: usize) -> Id {
+    replace_receiver(receiver, vec![0; length])
+}
+
+unsafe extern "C" fn data_empty(_class: Id, _sel: Sel) -> Id {
+    autoreleased_data(Vec::new())
+}
+
+unsafe extern "C" fn data_with_data(_class: Id, _sel: Sel, other: Id) -> Id {
+    // SAFETY: a data object or nil.
+    autoreleased_data(unsafe { data_contents(other) }.to_vec())
+}
+
+unsafe extern "C" fn data_with_capacity(_class: Id, _sel: Sel, capacity: usize) -> Id {
+    autoreleased_data(Vec::with_capacity(capacity.min(1 << 24)))
+}
+
+unsafe extern "C" fn data_with_length(_class: Id, _sel: Sel, length: usize) -> Id {
+    autoreleased_data(vec![0; length])
+}
+
+unsafe extern "C" fn data_copy(receiver: Id, _sel: Sel) -> Id {
+    // SAFETY: a data object.
+    collections::new_data(unsafe { data_contents(receiver) }.to_vec()) as Id
+}
+
+unsafe extern "C" fn data_copy_with_zone(
+    receiver: Id,
+    sel: Sel,
+    _zone: *mut std::ffi::c_void,
+) -> Id {
+    // SAFETY: forwarded.
+    unsafe { data_copy(receiver, sel) }
+}
+
+unsafe extern "C" fn data_is_equal(receiver: Id, _sel: Sel, other: Id) -> bool {
+    // SAFETY: a data object, and nil or a live object; anything that is not
+    // data is not equal.
+    let Some(theirs) = (unsafe { collections::data(other as CFTypeRef) }) else {
+        return false;
     };
     // SAFETY: a data object - the `+alloc` placeholder is not one, and this is
     // the cluster substitution the initialiser exists to perform.
@@ -1264,6 +1400,22 @@ unsafe extern "C" fn data_copy_with_zone(receiver: Id, _sel: Sel, _zone: *mut st
 /// input this guest's own code does not construct rather than a path it has; a
 /// null `begin` with a non-zero `end - begin` is not statically excluded.
 unsafe extern "C" fn data_get_bytes_length(
+/// `receiver` is a data object.
+unsafe fn data_range<'a>(receiver: Id, location: usize, length: usize, what: &str) -> &'a [u8] {
+    let bytes = unsafe { data_contents(receiver) };
+    match location
+        .checked_add(length)
+        .filter(|end| *end <= bytes.len())
+    {
+        Some(end) => &bytes[location..end],
+        None => objc::fail!(
+            "{what}: range {{{location}, {length}}} exceeds data length {}",
+            bytes.len()
+        ),
+    }
+}
+
+unsafe extern "C" fn data_get_bytes_range(
     receiver: Id,
     _sel: Sel,
     buffer: *mut u8,
@@ -1373,6 +1525,11 @@ unsafe extern "C" fn data_with_contents_of_file_options(
         }
     };
     succeeded(autoreleased_data(class, bytes))
+unsafe extern "C" fn data_subdata(receiver: Id, _sel: Sel, location: usize, length: usize) -> Id {
+    // SAFETY: a data object.
+    autoreleased_data(
+        unsafe { data_range(receiver, location, length, "-subdataWithRange:") }.to_vec(),
+    )
 }
 
 unsafe extern "C" fn data_length(receiver: Id, _sel: Sel) -> usize {
@@ -1423,6 +1580,28 @@ unsafe extern "C" fn data_with_bytes_no_copy(
 ) -> Id {
     if bytes.is_null() && length > 0 {
         return std::ptr::null_mut();
+    with: *const u8,
+) {
+    // SAFETY: a data object; `with` covers `length` bytes by contract.
+    unsafe {
+        data_range(
+            receiver,
+            location,
+            length,
+            "-replaceBytesInRange:withBytes:",
+        )
+    };
+    let replacement = unsafe { raw(with, length) }.to_vec();
+    if let Some(bytes) = unsafe { collections::data(receiver as CFTypeRef) } {
+        bytes[location..location + length].copy_from_slice(&replacement);
+    }
+}
+
+unsafe extern "C" fn data_reset_bytes(receiver: Id, _sel: Sel, location: usize, length: usize) {
+    // SAFETY: a data object.
+    unsafe { data_range(receiver, location, length, "-resetBytesInRange:") };
+    if let Some(bytes) = unsafe { collections::data(receiver as CFTypeRef) } {
+        bytes[location..location + length].fill(0);
     }
     // SAFETY: the caller says `bytes` covers `length` bytes, checked just above.
     let copy = match length {
