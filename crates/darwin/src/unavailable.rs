@@ -794,7 +794,10 @@ mod imp {
     /// What `cupsLastErrorString` says. This is the sentence the whole CUPS
     /// family exists to make reachable: on Darwin it would be a message from
     /// `cupsd`; here it is the reason there is no `cupsd`.
-    const NO_PRINT_SYSTEM: &str = "rosetta3: no print system on this host - no CUPS server, no \
+    ///
+    /// A **C string literal**, and the difference is the whole safety of this
+    /// entry - see [`c_string`].
+    const NO_PRINT_SYSTEM: &CStr = c"rosetta3: no print system on this host - no CUPS server, no \
          destinations and no PPDs, so there is nothing here to answer a printing request";
 
     /// `ipp_status_t cupsLastError(void)`.
@@ -812,7 +815,7 @@ mod imp {
     /// [`NO_PRINT_SYSTEM`]. The one string in this file that exists to be read by
     /// a human, through the guest's own logging, and it says what is missing.
     unsafe extern "C" fn cups_last_error_string() -> *const c_char {
-        NO_PRINT_SYSTEM.as_ptr().cast()
+        c_string(NO_PRINT_SYSTEM)
     }
 
     /// `const char *ppdErrorString(ppd_status_t status)`.
@@ -822,41 +825,106 @@ mod imp {
     /// content is that table and a wrong entry would be a wrong sentence about a
     /// real PPD error.
     unsafe extern "C" fn ppd_error_string(status: i32) -> *const c_char {
-        /// `messages[]` from `cups/ppd.c`, in `ppd_status_t` order.
-        const MESSAGES: [&str; 25] = [
-            "OK",
-            "Unable to open PPD file",
-            "NULL PPD file pointer",
-            "Memory allocation error",
-            "Missing PPD-Adobe-4.x header",
-            "Missing value string",
-            "Internal error",
-            "Bad OpenGroup",
-            "OpenGroup without a CloseGroup first",
-            "Bad OpenUI/JCLOpenUI",
-            "OpenUI/JCLOpenUI without a CloseUI/JCLCloseUI first",
-            "Bad OrderDependency",
-            "Bad UIConstraints",
-            "Missing asterisk in column 1",
-            "Line longer than the maximum allowed (255 characters)",
-            "Illegal control character",
-            "Illegal main keyword string",
-            "Illegal option keyword string",
-            "Illegal translation string",
-            "Illegal whitespace character",
-            "Bad custom parameter",
-            "Missing option keyword",
-            "Bad value string",
-            "Missing CloseGroup",
-            "Missing CloseUI/JCLCloseUI",
-        ];
         // Out of range in either direction is `Unknown`, which is what CUPS
         // returns for a status it does not have a sentence for.
         let text = match MESSAGES.get(status.max(0) as usize) {
             Some(text) if status >= 0 => *text,
-            _ => "Unknown error",
+            _ => UNKNOWN,
         };
-        text.as_ptr().cast()
+        c_string(text)
+    }
+
+    /// `messages[]` from `cups/ppd.c`, in `ppd_status_t` order.
+    ///
+    /// At module scope rather than inside [`ppd_error_string`] so that a test can
+    /// read the table itself, which is the thing that has to be CUPS's own and
+    /// not a summary of it.
+    const MESSAGES: [&CStr; 25] = [
+        c"OK",
+        c"Unable to open PPD file",
+        c"NULL PPD file pointer",
+        c"Memory allocation error",
+        c"Missing PPD-Adobe-4.x header",
+        c"Missing value string",
+        c"Internal error",
+        c"Bad OpenGroup",
+        c"OpenGroup without a CloseGroup first",
+        c"Bad OpenUI/JCLOpenUI",
+        c"OpenUI/JCLOpenUI without a CloseUI/JCLCloseUI first",
+        c"Bad OrderDependency",
+        c"Bad UIConstraints",
+        c"Missing asterisk in column 1",
+        c"Line longer than the maximum allowed (255 characters)",
+        c"Illegal control character",
+        c"Illegal main keyword string",
+        c"Illegal option keyword string",
+        c"Illegal translation string",
+        c"Illegal whitespace character",
+        c"Bad custom parameter",
+        c"Missing option keyword",
+        c"Bad value string",
+        c"Missing CloseGroup",
+        c"Missing CloseUI/JCLCloseUI",
+    ];
+
+    /// What `ppdErrorString` answers for a status the table does not have, which
+    /// is CUPS's own overflow string.
+    const UNKNOWN: &CStr = c"Unknown error";
+
+    /// The one way this file turns a Rust string into a `const char *` a guest
+    /// reads, and why it is this way.
+    ///
+    /// A published `const char *` is read by the guest with `strlen` or
+    /// `CStr::from_ptr`, and **nothing on the Rust side checks anything**: the C
+    /// signature carries no length, so a pointer to a `&'static str` is a pointer
+    /// with a terminator *somewhere* after it and no way to know where. That is
+    /// not a theoretical defect - this is what both of this file's published
+    /// strings were doing. Measured, on the tree as it stood:
+    ///
+    /// | published | sentence | what a guest actually read |
+    /// |---|--:|--:|
+    /// | `cupsLastErrorString` | 139 B | **3639 B** |
+    /// | `ppdErrorString(1)` | 23 B | **4239 B** |
+    /// | `ppdErrorString(22)` | 16 B | 112 B |
+    ///
+    /// and all 28 of them over-read. `ppdErrorString`'s walk ran on through the
+    /// other 24 sentences, `Unknown error`, [`NO_PRINT_SYSTEM`], and every
+    /// published symbol name in this module in both spellings - ending in
+    /// `...the same size is what makes the swap silentStreamCipherError`, a
+    /// string belonging to a *different module*. It stopped only where a NUL
+    /// happened to be, and the stop position is linker layout, so whether the
+    /// read is even valid UTF-8 - and therefore whether a Rust-side assertion on
+    /// it passes - is a different answer in every build.
+    ///
+    /// Three fixes were available. A `CString` is the same guarantee paid for
+    /// with an allocation per call plus a deliberate leak for the storage to
+    /// outlive the call, which [`cups_user`] already does and which is the right
+    /// trade for a login name and the wrong one for 25 compile-time-known
+    /// sentences. `b"...\0"` is the same guarantee written out by hand, and it
+    /// costs a table of English prose its `&str`-ness with a mistyped `\0` as
+    /// the new failure mode. `c"..."` **gives it away**: `&CStr` has no
+    /// constructor that omits the terminator, so a future edit cannot
+    /// reintroduce this bug without first changing the type.
+    ///
+    /// Which of the three would have made the intermittent test pass and left
+    /// the guest unsafe: **none of them, and that is worth being exact about.**
+    /// All three put a NUL where the sentence ends, so all three make the guest
+    /// safe; a test that went green under any of them was not lying about the
+    /// guest, it was lying about *itself*, because `CStr::from_ptr` succeeds on
+    /// a string that runs on into its neighbour and the old assertions read the
+    /// pointer exactly that way. Each of the three fixes the guest and leaves the
+    /// lottery running.
+    ///
+    /// The change that *would* have made the test green and left the guest
+    /// reading 3.6 KB past a Rust string is the obvious one, and it is the reason
+    /// this is written down: bounding the read in the test - `&p[..len]`, or a
+    /// `CStr::from_ptr` followed by a length check - turns both named tests
+    /// permanently green while `as_ptr()` on a `&str` goes on handing the guest a
+    /// pointer with no terminator. That fix looks like a memory-safety fix and
+    /// is the opposite of one. So the two had to be done separately, and this is
+    /// the record that the test half was not accepted on its own.
+    const fn c_string(text: &'static CStr) -> *const c_char {
+        text.as_ptr()
     }
 
     /// `ppd_status_t ppdLastError(int *line)`.
@@ -1672,22 +1740,199 @@ mod imp {
     mod tests {
         use super::*;
 
-        /// Read a `const char *` a refusal function returned.
+        /// Read a `const char *` this file published and check it against
+        /// `expected`.
+        ///
+        /// `expected` is what makes this deterministic. A bare `from_ptr` read
+        /// runs until it finds a NUL, so on a pointer into a `&str` it returns a
+        /// sentence plus whatever `.rodata` followed - and whether that is even
+        /// valid UTF-8 is a different answer in every build. Bounding the read
+        /// by *this test's* sentence turns a layout lottery into a comparison.
+        /// [`a_published_string_stops_where_its_sentence_does`] is the same
+        /// check without a sentence to compare against.
         ///
         /// # Safety
         ///
-        /// `at` must be a pointer a function in this file returned, which for
-        /// the `&'static str` constants it always is.
-        unsafe fn text(at: *const c_char) -> &'static str {
-            assert!(!at.is_null(), "expected a string, got null");
-            // SAFETY: the caller's obligation, per the doc comment.
+        /// `at` must be a pointer one of this module's string functions
+        /// returned, and `expected` must be the sentence it promises.
+        unsafe fn text(at: *const c_char, expected: &'static CStr) -> &'static str {
+            // SAFETY: the caller's obligation, restated by `is_exactly`.
+            unsafe { is_exactly(at, expected) }.unwrap_or_else(|why| panic!("{why}"));
+            // SAFETY: `is_exactly` proved both the terminator and the bytes.
             unsafe { CStr::from_ptr(at) }.to_str().expect("a UTF-8 C string")
+        }
+
+        /// Assert that a published `const char *` is exactly `expected`, and
+        /// report the two ways it can be wrong separately.
+        ///
+        /// The two are separated because only the first is the defect. A
+        /// `CStr::from_ptr` read *succeeds* on a string that runs on into
+        /// whatever follows it, so `CStr::from_ptr(at) == expected` is a
+        /// statement about layout as much as about the code, and a layout
+        /// statement is what flipped [`the_ppd_error_table_is_cups_own`] and
+        /// [`the_refusals_name_themselves`] between builds on an unmodified
+        /// tree. Reading the byte *at the end of the sentence* is true exactly
+        /// when the terminator is where the sentence says it is, and it is
+        /// indifferent to everything after it - so it cannot pass by luck and
+        /// cannot fail by luck either.
+        ///
+        /// # Safety
+        ///
+        /// `at` must be a pointer one of this module's string functions
+        /// returned, and `expected` must be the sentence it promises.
+        unsafe fn is_exactly(at: *const c_char, expected: &CStr) -> Result<(), String> {
+            assert!(!at.is_null(), "expected a string, got null");
+            let want = expected.to_bytes();
+            let bytes = at.cast::<u8>();
+            // SAFETY: the caller's obligation. `want.len()` bytes of readable
+            // image-resident data, and one byte past them, which is the
+            // terminator this checks for.
+            let terminator = unsafe { *bytes.add(want.len()) };
+            if terminator != 0 {
+                // SAFETY: the caller's obligation, restated by `over_read`.
+                let walk = unsafe { over_read(at, want.len()) };
+                return Err(format!(
+                    "{:?} does not end at byte {}: that byte is {terminator:#04x}, so a \
+                     guest reading this gets {walk}",
+                    expected,
+                    want.len(),
+                ));
+            }
+            // SAFETY: a NUL was just found where the sentence ends.
+            let read = unsafe { CStr::from_ptr(at) };
+            if read != expected {
+                return Err(format!("{read:?} is not {expected:?}"));
+            }
+            Ok(())
+        }
+
+        /// What a `CStr::from_ptr` on `at` actually does instead of returning
+        /// `expected`, for the message. Called only when the terminator was not
+        /// where the sentence ends, so this is the read that already went wrong.
+        ///
+        /// Both directions are reported, because they are different defects and
+        /// only one of them is the over-read: a walk that stops *short* means
+        /// the pointer is not even this module's string, and a helper that
+        /// assumed otherwise would subtract its own length off the end.
+        ///
+        /// # Safety
+        ///
+        /// As [`is_exactly`], and the walk below stops at a NUL.
+        unsafe fn over_read(at: *const c_char, intended: usize) -> String {
+            let bytes = at.cast::<u8>();
+            let mut walk = 0usize;
+            // SAFETY: read-only, and bounded by the NUL this is looking for.
+            while unsafe { *bytes.add(walk) } != 0 && walk < (1 << 20) {
+                walk += 1;
+            }
+            let from = walk.saturating_sub(24);
+            // SAFETY: as above, `from <= walk`, and `walk - from <= 24`.
+            let tail = unsafe { std::slice::from_raw_parts(bytes.add(from), walk - from) };
+            let what = if walk >= intended {
+                format!("{} byte(s) past it", walk - intended)
+            } else {
+                format!("{} byte(s) short of it", intended - walk)
+            };
+            format!(
+                "{what}, ending at ...{:?}",
+                String::from_utf8_lossy(tail).into_owned()
+            )
+        }
+
+        /// A published `const char *` stops where its sentence stops.
+        ///
+        /// **The test that could not have passed before the fix.** It reads one
+        /// byte, at the offset the sentence ends, and asks whether it is zero -
+        /// so its answer is a property of [`c_string`] and not of what the
+        /// linker put next in `.rodata`. On the tree as it stood all 28
+        /// published pointers in this file failed it, every one, deterministically
+        /// and in every build; see [`c_string`] for the measurements.
+        #[test]
+        fn a_published_string_stops_where_its_sentence_does() {
+            // SAFETY: every pointer below is one of this module's own string
+            // functions' answer, and `expected` is what that function promises.
+            unsafe {
+                if let Err(why) = is_exactly(cups_last_error_string(), NO_PRINT_SYSTEM) {
+                    panic!("cupsLastErrorString: {why}");
+                }
+                for (status, expected) in MESSAGES.iter().enumerate() {
+                    if let Err(why) = is_exactly(ppd_error_string(status as i32), expected) {
+                        panic!("ppdErrorString({status}): {why}");
+                    }
+                }
+                for status in [-1, -2, 25, 999, i32::MAX, i32::MIN] {
+                    if let Err(why) = is_exactly(ppd_error_string(status), UNKNOWN) {
+                        panic!("ppdErrorString({status}): {why}");
+                    }
+                }
+            }
+        }
+
+        /// The names this module publishes, counted against the table in its own
+        /// note.
+        ///
+        /// A census and not a behaviour test, and hardcoded on purpose: the note
+        /// at the top of the file claims `9 + 15 + 14 + 2 + 65`, and the way that
+        /// claim goes stale is somebody adding a row and the note staying quiet.
+        /// `exports!` publishes `"_" + row`, so this also pins the Mach-O
+        /// spelling of the two names whose entire content is a string - the
+        /// leading-underscore trap this tree has been bitten by three times, and
+        /// which a clean build and a green suite both accept.
+        ///
+        /// Counted per family rather than only in total, because families are
+        /// contiguous in the `exports!` block: a row that moved from one family
+        /// to another would leave the total untouched.
+        #[test]
+        fn the_published_names_are_the_ones_the_module_note_claims() {
+            /// `(first name of the family, how many rows the note claims)`.
+            const FAMILIES: [(&str, usize); 5] = [
+                ("launch_data_alloc", 9),
+                ("DADiskCreateFromBSDName", 15),
+                ("MIDIClientCreate", 14),
+                ("VTIsHardwareDecodeSupported", 2),
+                ("cupsGetDests2", 65),
+            ];
+            let names: Vec<&str> = (MODULE.names)();
+            assert_eq!(
+                names.len(),
+                FAMILIES.iter().map(|(_, n)| n).sum::<usize>(),
+                "{} name(s) published; the module note claims {}",
+                names.len(),
+                FAMILIES
+                    .iter()
+                    .map(|(n, c)| format!("{c} `{n}...`"))
+                    .collect::<Vec<_>>()
+                    .join(" + ")
+            );
+            for (at, (first, claimed)) in FAMILIES.iter().enumerate() {
+                let from = names
+                    .iter()
+                    .position(|n| n == first)
+                    .unwrap_or_else(|| panic!("`{first}` is not published at all"));
+                let to = match FAMILIES.get(at + 1) {
+                    Some((next, _)) => names
+                        .iter()
+                        .position(|n| *n == *next)
+                        .unwrap_or_else(|| panic!("`{next}` is not published at all")),
+                    None => names.len(),
+                };
+                assert_eq!(to - from, *claimed, "the family starting at `{first}`");
+            }
+            // And the two string answers, in the spelling the loader looks up.
+            for name in ["cupsLastErrorString", "ppdErrorString"] {
+                assert!(names.contains(&name), "{name} is not published");
+                assert!(
+                    (MODULE.symbol)(name).is_some(),
+                    "`{name}` does not resolve to an address"
+                );
+            }
         }
 
         #[test]
         fn the_refusals_name_themselves() {
-            // SAFETY: both are this module's own `&'static str` constants.
-            let said = unsafe { text(cups_last_error_string()) };
+            // SAFETY: a pointer this module's own function returned, against the
+            // sentence that function promises.
+            let said = unsafe { text(cups_last_error_string(), NO_PRINT_SYSTEM) };
             assert!(said.contains("no print system"), "{said}");
             // And the number that goes with it is the one the header defines.
             assert_eq!(IPP_NO_SERVER, 0x0501);
@@ -1714,17 +1959,71 @@ mod imp {
             assert_eq!(status, IPP_NO_SERVER);
         }
 
+        /// The table is CUPS's own `messages[]`, entry for entry.
+        ///
+        /// Written out here as literals rather than read back out of
+        /// [`MESSAGES`], because a table compared against itself is always
+        /// equal and the name of this test is a claim about `cups/ppd.c`. All
+        /// twenty-five are listed for the same reason: a partial check would be
+        /// a list of sentences that quietly agrees with whatever the rest of
+        /// the table says.
         #[test]
         fn the_ppd_error_table_is_cups_own() {
-            // SAFETY: the function reads nothing but its argument.
+            const CUPS_MESSAGES: [&CStr; 25] = [
+                c"OK",
+                c"Unable to open PPD file",
+                c"NULL PPD file pointer",
+                c"Memory allocation error",
+                c"Missing PPD-Adobe-4.x header",
+                c"Missing value string",
+                c"Internal error",
+                c"Bad OpenGroup",
+                c"OpenGroup without a CloseGroup first",
+                c"Bad OpenUI/JCLOpenUI",
+                c"OpenUI/JCLOpenUI without a CloseUI/JCLCloseUI first",
+                c"Bad OrderDependency",
+                c"Bad UIConstraints",
+                c"Missing asterisk in column 1",
+                c"Line longer than the maximum allowed (255 characters)",
+                c"Illegal control character",
+                c"Illegal main keyword string",
+                c"Illegal option keyword string",
+                c"Illegal translation string",
+                c"Illegal whitespace character",
+                c"Bad custom parameter",
+                c"Missing option keyword",
+                c"Bad value string",
+                c"Missing CloseGroup",
+                c"Missing CloseUI/JCLCloseUI",
+            ];
+            // The safety of the read, at every entry, is
+            // `a_published_string_stops_where_its_sentence_does`'s job; this
+            // test is about the *words*, so it compares them.
+            for (status, own) in CUPS_MESSAGES.iter().enumerate() {
+                assert_eq!(MESSAGES[status], *own, "ppdErrorString({status})");
+            }
+            // `PPD_NO_FILE` is the status this file answers, and it is CUPS's
+            // own second sentence rather than a paraphrase of it.
+            assert_eq!(PPD_NO_FILE, 1);
+            // SAFETY: the function reads nothing but its argument, and each
+            // pointer is bounded by the literal the test already checked above.
             unsafe {
-                assert_eq!(text(ppd_error_string(PPD_NO_FILE)), "Unable to open PPD file");
-                assert_eq!(text(ppd_error_string(0)), "OK");
-                assert_eq!(text(ppd_error_string(2)), "NULL PPD file pointer");
-                assert_eq!(text(ppd_error_string(24)), "Missing CloseUI/JCLCloseUI");
+                assert_eq!(
+                    text(ppd_error_string(PPD_NO_FILE), c"Unable to open PPD file"),
+                    "Unable to open PPD file"
+                );
+                assert_eq!(text(ppd_error_string(0), c"OK"), "OK");
+                assert_eq!(
+                    text(ppd_error_string(2), c"NULL PPD file pointer"),
+                    "NULL PPD file pointer"
+                );
+                assert_eq!(
+                    text(ppd_error_string(24), c"Missing CloseUI/JCLCloseUI"),
+                    "Missing CloseUI/JCLCloseUI"
+                );
                 // Out of range in both directions is CUPS's own "Unknown".
-                assert_eq!(text(ppd_error_string(-1)), "Unknown error");
-                assert_eq!(text(ppd_error_string(999)), "Unknown error");
+                assert_eq!(text(ppd_error_string(-1), c"Unknown error"), "Unknown error");
+                assert_eq!(text(ppd_error_string(999), c"Unknown error"), "Unknown error");
             }
         }
 

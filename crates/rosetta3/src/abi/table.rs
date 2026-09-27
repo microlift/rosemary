@@ -523,6 +523,23 @@ pub static SIGNATURES: &[FunctionAbi] = &[
     sig!("CFRunLoopAddObserver", V, P, P, P),
     sig!("CFRunLoopRemoveObserver", V, P, P, P),
     sig!("CFRunLoopObserverInvalidate", V, P),
+    // `CFRunLoopAddCommonMode(CFRunLoopRef, CFStringRef)`. The runtime's own
+    // `abi:` output named it as having no signature, which under `emulated` made
+    // it a `NoSignature` refusal at the call site.
+    sig!("CFRunLoopAddCommonMode", V, P, P),
+    // `CFRunLoopObserverCreate(CFAllocatorRef, CFOptionFlags activities, Boolean
+    // repeats, CFIndex order, CFRunLoopObserverCallBack, CFRunLoopObserverContext *)`.
+    // `cbsig!` and not `sig!`: the *host* calls that callback, so the marshaller
+    // has to thunk it. Argument 4 is the callback, 0-based and counting the
+    // return - read off the guest at `Framework+0x5d95c39`, which sets
+    // rdi/esi/edx/ecx/r8/r9 in that order (activities 0xa4, repeats 1, order 0).
+    cbsig!([4], "CFRunLoopObserverCreate", P, P, U32, BOOL, I64, P, P),
+    // `CFRunLoopTimerSetNextFireDate(CFRunLoopTimerRef, CFAbsoluteTime)` and
+    // `CFRunLoopTimerSetTolerance(CFRunLoopTimerRef, CFTimeInterval)`. Both are
+    // a pointer and a `double`; verified at `Framework+0x5d959f8` and
+    // `+0x5d9595a`, where the timer is `rdi` and the value arrives in `xmm0`.
+    sig!("CFRunLoopTimerSetNextFireDate", V, P, F64),
+    sig!("CFRunLoopTimerSetTolerance", V, P, F64),
     sig!("CFRunLoopAddSource", V, P, P, P),
     sig!("CFRunLoopGetCurrent", P),
     sig!("CFRunLoopGetMain", P),
@@ -892,6 +909,19 @@ pub static SIGNATURES: &[FunctionAbi] = &[
     sig!("CGDisplayRestoreColorSyncSettings", V),
     sig!("NXGetLocalArchInfo", P),
     sig!("NSDisableScreenUpdates", V),
+    // Foundation/AppKit functions the guest imports. Prototypes read from the
+    // call sites in the guest, not from the headers - see
+    // `crates/appkit/src/{geometry,accessibility,killring}.rs`.
+    sig!("NSStringFromPoint", P, F64, F64),
+    sig!("NSBeep", V),
+    sig!("NSPerformService", V, P, P),
+    sig!("NSAccessibilityPostNotification", V, P, P),
+    sig!("NSAccessibilityPostNotificationWithUserInfo", V, P, P, P),
+    sig!("NSAccessibilityUnignoredAncestor", P, P),
+    sig!("NSAccessibilityUnignoredChildren", P, P),
+    sig!("NSAccessibilityRoleDescription", P, P),
+    sig!("NSAccessibilityActionDescription", P, P),
+    sig!("NSLogv", V, P, P),
     sig!("NSEnableScreenUpdates", V),
     sig!("CGSessionCopyCurrentDictionary", P),
     sig!("CGReleaseDisplayFadeReservation", I32, U32),
@@ -1192,9 +1222,6 @@ pub static SIGNATURES: &[FunctionAbi] = &[
     sig!("IOServiceClose", I32, U32),
     sig!("IOConnectCallMethod", I32, U32, U32, P, U32, P, P),
     sig!("IOConnectCallStructMethod", I32, U32, U32, P, U32, P, P),
-    // `IOCreatePlugInInterfaceForService(service, interfaceID, interfaceType,
-    // void **plugInInterface)`.
-    sig!("IOCreatePlugInInterfaceForService", I32, U32, P, P, P),
     // `IOServiceAddInterestNotification(notifyPort, service, type, callback,
     // refcon, iterator)` - the callback is the fourth argument, counting from
     // zero, and is guest code the host would invoke on a match.
@@ -1202,7 +1229,17 @@ pub static SIGNATURES: &[FunctionAbi] = &[
     sig!("IOServiceGetMatchingServices", I32, U32, P, P),
     sig!("IOServiceMatching", P, P),
     sig!("IOServiceNameMatching", P, P),
-    sig!("IOObjectConformsTo", U32, U32, P),
+    // `kern_return_t IOCreatePlugInInterfaceForService(io_service_t service,
+    // CFTypeRef interfaceID, CFTypeRef interfaceType, void **plugInInterface,
+    // SInt32 *score)` - **five** parameters, the last of which is the
+    // interface's match score, and which is easy to mistake for a
+    // four-argument function. The guest sets all five argument registers at
+    // every one of its six call sites, and `Framework+0x83bfef5` is the
+    // clearest of them: `lea rcx,[rbp-0x70]` (&plugInInterface) then
+    // `lea r8,[rbp-0x44]` (&score, a *four-byte* slot) then `mov edi,r12d`
+    // (service), `mov rsi,rbx` (interfaceID), `mov rdx,rax` (interfaceType).
+    // Chromium's own source says the same - `device/gamepad/xbox_controller_mac.mm`
+    // line 365 passes `&score` and calls it "Unused, but required".
     sig!("IOCreatePlugInInterfaceForService", I32, U32, P, P, P, P),
     sig!("IODestroyPlugInInterface", I32, P),
     // `PhysicalKeyboardLayoutType KBGetLayoutType(SInt16)`. Its OSType result
@@ -3833,6 +3870,15 @@ pub static REFUSED: &[(&str, &str)] = &[
     ("CGRectContainsPoint", AGGREGATE),
     ("CGRectInset", AGGREGATE),
     ("NSMouseInRect", AGGREGATE),
+    // A 32-byte aggregate in or out is not describable in a `sig!` row, for the
+    // same reason and with the same consequence as the rows above: the name is
+    // refused rather than described, so a call reaches the implementation and a
+    // promotion does not invent a prototype for it.
+    ("NSContainsRect", AGGREGATE),
+    ("NSIntersectsRect", AGGREGATE),
+    ("NSOffsetRect", AGGREGATE),
+    ("NSRectFill", AGGREGATE),
+    ("NSEqualSizes", AGGREGATE),
     ("CTFontGetBoundingBox", AGGREGATE),
     ("CTFontGetBoundingRectsForGlyphs", AGGREGATE),
     // `NSApp` is data like the rest of this block, and the least obvious of
@@ -3899,8 +3945,24 @@ pub static REFUSED: &[(&str, &str)] = &[
     // as guest code, rather than through this table - which is what these
     // refusals mean: a personality routine reached through an import slot is a
     // call nothing makes. `crate::cxxlib` binds the C++ one to the vendored
-    // `libc++abi`, and `crate::objcexc` points the Objective-C spelling at the
-    // same routine, because on 64-bit macOS it is the same routine.
+    // `libc++abi`.
+    //
+    // The Objective-C spelling is a **separate refusal, for a separate reason**,
+    // and the two are not interchangeable. `__objc_personality_v0` and
+    // `__gxx_personality_v0` are two different routines in two different
+    // libraries, speaking two different exception ABIs: libobjc's matches a
+    // catch against one-word `objc_exception_type` records, and the Itanium one
+    // matches `__si_class_type_info` records and reads a base pointer at offset
+    // 16 out of the record - a word an `objc_exception_type` does not have, so
+    // on those records the comparison is of unrelated bytes.
+    //
+    // `Chromium Framework` imports `___objc_personality_v0` and imports **no**
+    // `__gxx_personality_v0`: it carries its own statically linked routine at
+    // `Framework+0x417640` and links no libc++abi. So the name is refused rather
+    // than served, and a program that reaches it gets a name rather than a
+    // routine that would silently mismatch. `crate::objcexc` used to point it
+    // at the vendored libc++abi's routine; that is removed, and the reason is
+    // on `crate::objcexc::bind`.
     (
         "__gxx_personality_v0",
         "a personality routine, named by an LSDA and called by the unwinder",
@@ -3908,7 +3970,8 @@ pub static REFUSED: &[(&str, &str)] = &[
     ("__mb_cur_max", DATA),
     (
         "__objc_personality_v0",
-        "as __gxx_personality_v0, which it is",
+        "libobjc's exception personality routine, which speaks a different \
+         exception ABI from the Itanium one and is not libc++abi's",
     ),
     ("__stack_chk_guard", DATA),
     ("__stderrp", DATA),

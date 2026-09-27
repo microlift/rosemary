@@ -10,43 +10,130 @@ fn fixture_dir() -> PathBuf {
     dir
 }
 
-/// Whether this host can build x86_64 Mach-O binaries.
-pub fn can_build_x86_64() -> bool {
-    static OK: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *OK.get_or_init(|| {
+/// How a guest fixture is built on this host.
+///
+/// Two ways, and the order matters: a host that can do it the ordinary way must
+/// keep doing it the ordinary way, so a Mac - where `cc -arch x86_64` has a real
+/// SDK behind it, so `-framework Foundation` and `<stdio.h>` mean something -
+/// gets exactly the fixtures it always got, and only a host with no Mac SDK
+/// falls through to the second.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Builder {
+    /// A `cc` whose driver takes `-arch x86_64`: Apple's, and a host whose
+    /// toolchain is built to emit Mach-O. Unchanged from before this existed.
+    Cc,
+    /// `test/tools/build-macho.sh`: `clang -target x86_64-apple-darwin` for the
+    /// compile and the rustup toolchain's `ld64.lld` for the link.
+    ///
+    /// This is the whole of why the directory used to be silent. Probing
+    /// `cc -arch x86_64` on a host with no Mac toolchain does not fail to find
+    /// a compiler - it finds gcc, which has no `-arch` option at all, and the
+    /// answer was false. So *every* fixture-based test in `crates/rosetta3/
+    /// tests/` was green because it never ran, which is the third way this
+    /// project's suite has lied and the one PLAN.md §1 calls a wrong answer
+    /// that looks like success.
+    MachOScript,
+}
+
+/// `test/tools/build-macho.sh`, if this checkout has it.
+fn build_macho_script() -> Option<PathBuf> {
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../test/tools/build-macho.sh");
+    path.is_file().then_some(path)
+}
+
+/// Whether `cc` here is a driver that takes `-arch x86_64`.
+///
+/// Probed with a *link*, not a compile: `clang` accepts `-arch x86_64` and then
+/// finds no linker for the target, so a compile-only probe would say yes on a
+/// host that cannot produce a Mach-O.
+fn cc_builds_x86_64(src: &std::path::Path, out: &std::path::Path) -> bool {
+    // `stderr` to null: this probe's job is to answer a question, and on a host
+    // with no Mach-O toolchain the answer is always no, so its `cc: error:
+    // unrecognized command-line option '-arch'` would otherwise be printed once
+    // per test binary into the middle of a real test run. A fixture that fails
+    // to build still says so - the probe is the only thing silenced.
+    Command::new("cc")
+        .args(["-arch", "x86_64", "-o"])
+        .arg(out)
+        .arg(src)
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+        && host_macho(&out.to_string_lossy())
+}
+
+/// Whether [`build_macho_script`]` can build one here.
+///
+/// Also checked with a link and the magic number, for the same reason, and
+/// because a script that exists is not a script that works: it needs a `clang`
+/// that targets Darwin *and* an `ld64.lld`, and the second is reached through a
+/// symlink because the linker dispatches on `argv[0]`.
+fn script_builds_x86_64(src: &std::path::Path, out: &std::path::Path) -> bool {
+    let Some(script) = build_macho_script() else {
+        return false;
+    };
+    Command::new(script)
+        .arg(src)
+        .arg(out)
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+        && host_macho(&out.to_string_lossy())
+}
+
+/// How a fixture is built here, or `None` if this host cannot.
+fn builder() -> Option<Builder> {
+    static WHICH: std::sync::OnceLock<Option<Builder>> = std::sync::OnceLock::new();
+    *WHICH.get_or_init(|| {
         let dir = fixture_dir();
         let src = dir.join("probe.c");
-        if std::fs::write(&src, "int main(void){return 0;}").is_err() {
-            return false;
+        std::fs::write(&src, "int main(void){return 0;}").ok()?;
+        // Probed one after the other and not with `||`, because which one works
+        // is the answer: a host where `cc` takes the flag must not be answered
+        // for by the script, which has no SDK behind it.
+        let out = dir.join("probe_cc");
+        if cc_builds_x86_64(&src, &out) {
+            return Some(Builder::Cc);
         }
-        Command::new("cc")
-            .args(["-arch", "x86_64", "-o"])
-            .arg(dir.join("probe"))
-            .arg(&src)
-            .status()
-            .map(|s| s.success())
-            .unwrap_or(false)
+        let out = dir.join("probe_macho");
+        script_builds_x86_64(&src, &out).then_some(Builder::MachOScript)
     })
+}
+
+/// Whether this host can build x86_64 Mach-O binaries.
+pub fn can_build_x86_64() -> bool {
+    builder().is_some()
 }
 
 /// Compile `source` into an x86_64 Mach-O and return its path.
 pub fn build_x86_64(name: &str, source: &str, extra: &[&str]) -> Option<String> {
-    if !can_build_x86_64() {
-        return None;
-    }
+    let builder = builder()?;
     let dir = fixture_dir();
     let src = dir.join(format!("{name}.c"));
     let out = dir.join(name);
     std::fs::write(&src, source).ok()?;
 
-    let status = Command::new("cc")
-        .args(["-arch", "x86_64"])
-        .args(extra)
-        .arg("-o")
-        .arg(&out)
-        .arg(&src)
-        .status()
-        .ok()?;
+    let status = match builder {
+        Builder::Cc => Command::new("cc")
+            .args(["-arch", "x86_64"])
+            .args(extra)
+            .arg("-o")
+            .arg(&out)
+            .arg(&src)
+            .status()
+            .ok()?,
+        // The script's own order is `source out [extra clang args...]`, and it
+        // puts the extra flags ahead of the input - so a `-x c++` that arrives
+        // last, as `cc` would have accepted it, is still seen before the file.
+        Builder::MachOScript => Command::new(build_macho_script()?)
+            .arg(&src)
+            .arg(&out)
+            .args(extra)
+            .status()
+            .ok()?,
+    };
     status.success().then(|| out.to_string_lossy().into_owned())
 }
 
@@ -624,8 +711,56 @@ pub fn longjmp_across_fixture() -> Option<String> {
         .clone()
 }
 
+/// Where the freestanding declarations for a Darwin target on an SDK-less host
+/// live, if this checkout has them.
+///
+/// `None` on a host that does not need them, because a host that has an SDK
+/// must use it: a real `<cstdio>` is the platform's, and a fixture built against
+/// these would be testing this repository's declarations instead of macOS's.
+/// `tests/fixtures/include`, absolute, as the compiler sees this crate.
+const FREESTANDING_INCLUDE: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/include");
+
+fn freestanding_include() -> Option<&'static str> {
+    match builder() {
+        Some(Builder::MachOScript) => Some(FREESTANDING_INCLUDE),
+        Some(Builder::Cc) | None => None,
+    }
+}
+
+/// A C++ fixture, with the freestanding declarations prepended when this host
+/// has no SDK to supply the C++ headers from.
+///
+/// `-std=gnu++17` stated rather than left to clang's default, so a fixture that
+/// compiles is compiling as the language it is written in: they all use
+/// `noexcept` and `override`, and a toolchain whose default were C++98 would
+/// turn that into an error rather than a working build.
+///
+/// `-nostdlibinc` and **not** `-nostdinc`: the first drops this host's glibc
+/// headers - `/usr/include/stdio.h:191` is a hard error for a Darwin target,
+/// `__nonnull` being a glibc annotation the Darwin `sys/cdefs.h` does not
+/// define - and the second would also drop clang's own resource directory,
+/// which is where `stdarg.h` and friends live. What is *left* on the search
+/// path is this directory, so a fixture asking for a header these do not
+/// provide - `<string>`, `<mutex>`, `<stdexcept>` - still fails, which is the
+/// answer it should get: a freestanding `std::string` would be this
+/// repository's reimplementation wearing the standard's name. See
+/// `tests/fixtures/include/freestanding.h`.
 pub fn build_cpp(name: &str, source: &str) -> Option<String> {
-    build_x86_64(name, source, &["-x", "c++", "-lc++"])
+    let mut flags = vec!["-x", "c++", "-std=gnu++17"];
+    match freestanding_include() {
+        // A host with no SDK, so `-lc++` is **dropped** rather than satisfied
+        // by whatever `clang` finds: it would link this host's libstdc++/libc++
+        // into a Mach-O, which is a different library wearing the name, and it
+        // fails anyway with `ld64.lld: error: library not found for -lc++`.
+        // The fixture's `__cxa_*` and `operator new` imports are left to
+        // `-undefined dynamic_lookup`, and at load time they reach the vendored
+        // `libc++abi.dylib` that `cxxlib` installs at
+        // `/usr/lib/libc++abi.1.dylib` - which is the library a real guest
+        // binds, so this is the *same* binding, not a substitute for it.
+        Some(include) => flags.extend(["-nostdlibinc", "-I", include]),
+        None => flags.push("-lc++"),
+    }
+    build_x86_64(name, source, &flags)
 }
 
 pub fn build_objcpp(name: &str, source: &str) -> Option<String> {
@@ -2066,20 +2201,31 @@ pub fn build_app(name: &str, source: &str, info: &str, nib: Option<&str>) -> Opt
     let src = fixture_dir().join(format!("{name}.m"));
     std::fs::write(&src, source).ok()?;
     let out = contents.join("MacOS").join(name);
-    let status = Command::new("cc")
-        .args([
-            "-arch",
-            "x86_64",
-            "-x",
-            "objective-c",
-            "-framework",
-            "Cocoa",
-        ])
-        .arg("-o")
-        .arg(&out)
-        .arg(&src)
-        .status()
-        .ok()?;
+    // An Objective-C fixture like any other: through the builder, so it is
+    // gated on the same toolchain and gets the same `-x objective-c` whether
+    // that is Apple's `cc` or the script.
+    let status = match builder()? {
+        Builder::Cc => Command::new("cc")
+            .args([
+                "-arch",
+                "x86_64",
+                "-x",
+                "objective-c",
+                "-framework",
+                "Cocoa",
+            ])
+            .arg("-o")
+            .arg(&out)
+            .arg(&src)
+            .status()
+            .ok()?,
+        Builder::MachOScript => Command::new(build_macho_script()?)
+            .arg(&src)
+            .arg(&out)
+            .args(["-x", "objective-c", "-framework", "Cocoa"])
+            .status()
+            .ok()?,
+    };
     status.success().then(|| out.to_string_lossy().into_owned())
 }
 
@@ -2131,11 +2277,90 @@ pub fn globals_fixture() -> Option<String> {
         .clone()
 }
 
-/// Skip the calling test with an explanatory note.
+/// The reason a C++ fixture that **built** still cannot be run here, or `None`
+/// if it can.
+///
+/// ## Measured, not declared
+///
+/// The C++ fixtures build on this host as of `test/logs/test-hygiene.md` - the
+/// gap was `<cstdio>`, `<exception>`, `<pthread.h>`, `<cstdlib>` and
+/// `<cstring>`, and `tests/fixtures/include/` declares all five. What stops
+/// them is a different thing, and it is in the runtime rather than in the
+/// harness: `clang -target x86_64-apple-darwin` emits **DWARF** CFI in
+/// `__eh_frame` for these frames, and `rosetta3::unwind` parses only the
+/// compact encodings in `__unwind_info`. 25 of the 27 common entries in a built
+/// fixture's `__unwind_info` header are `UNWIND_SECTION_MODE_DWARF`. The
+/// runtime says so itself, by name, and this is that sentence:
+///
+///     rosetta3: <fixture>: __cxa_throw: not callable: a frame unwinds
+///     through __eh_frame, which this runtime does not parse (M5)
+///
+/// No optimisation level and no `-f` flag moves it - `-O0`, `-O1`, `-Os`,
+/// `-O2 -fno-omit-frame-pointer`, `-fexceptions -funwind-tables` and the
+/// default were each built and run, and all six refuse identically.
+///
+/// ## Why it is read out of the run rather than hard-coded
+///
+/// So that a test gating on it cannot rot into a green tick: when the wall is
+/// lifted this returns `None`, the gate opens, and the eleven specifications
+/// in `tests/unwind.rs` run with no edit. A constant `false` here would be a
+/// second silent skip wearing the first one's clothes.
+pub fn cxx_unwinding_refusal() -> Option<String> {
+    static WALL: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    WALL.get_or_init(|| {
+        let path = exceptions_fixture()?;
+        let (_, _, err) = run_guest(&path, &[]);
+        // The runtime's own sentence, not a paraphrase of it, so the reason a
+        // test gives is the reason the runtime gave.
+        let line = err
+            .lines()
+            .find(|line| line.contains("not callable:"))?
+            .trim()
+            .to_string();
+        Some(line)
+    })
+    .clone()
+}
+
+/// Skip the calling test, **loudly**.
+///
+/// ## Why this is not `eprintln!`
+///
+/// A test that returns early is `ok`. The summary says `11 passed; 0 failed`
+/// and the reason - the only thing in the whole system that says the test did
+/// not run - goes into a buffer libtest throws away for a test that passed.
+/// `eprintln!` is captured exactly as `println!` is, so for eleven skipped
+/// `unwind.rs` tests the run printed **11 passed** and said nothing else. That
+/// is how `test/logs/macho-fixtures.md` came to record "9 of 11": the nine were
+/// the ones whose skip line happened to be the only output, and the other two
+/// were the same skip next to a compiler error. Nobody counted passes; nobody
+/// counted runs. `test/PLAN.md` §1 calls a green suite a wrong answer that
+/// looks like success, and this macro is where the looking like success came
+/// from.
+///
+/// So the line is written with `libc::write(2, ...)` - the same call
+/// `darwin::data_unavailable::announce` makes, and for the same stated reason:
+/// a message that has to be out cannot be buffered. It lands on the terminal
+/// as the test runs, it survives a passing test, and `cargo test ... 2>&1 |
+/// grep '^SKIP'` is a census of everything in the suite that did not execute.
+///
+/// `file:line` is in the line because a census of skips is worth nothing
+/// without a place to go and read what the skip is guarding.
 #[macro_export]
 macro_rules! skip {
     ($($arg:tt)*) => {{
-        eprintln!("skipping {}: {}", module_path!(), format!($($arg)*));
+        let reason = format!($($arg)*);
+        let line = format!(
+            "SKIP {}:{} [{}] {}\n",
+            file!(),
+            line!(),
+            module_path!(),
+            reason
+        );
+        // SAFETY: a live buffer, written whole or not at all.
+        unsafe {
+            libc::write(2, line.as_ptr().cast(), line.len());
+        }
         return;
     }};
 }

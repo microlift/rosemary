@@ -2071,8 +2071,28 @@ pub(crate) fn install() {
             c"{CGRect={CGPoint=dd}{CGSize=dd}}56@0:8{CGRect={CGPoint=dd}{CGSize=dd}}16Q48";
     });
     methods!(class, {
+        // The frame here read **56**, which does not even reach this method's
+        // own last argument at offset 64. The guest declares this selector as
+        // `@68@0:8{CGRect={CGPoint=dd}{CGSize=dd}}16Q48Q56c64`, and it does so
+        // from three independent classes — `NativeWidgetMacNSWindow`,
+        // `BrowserNativeWidgetWindow` and `RenderWidgetPopupWindow` — so 68 is
+        // Apple's own number rather than an inference. Identity is established,
+        // not guessed: `NativeWidgetMacNSWindow` also declares 9 other
+        // `NSWindow` selectors installed in this crate.
+        //
+        // The 32-byte `CGRect` is 4 words but 1 argument, which is why the
+        // offsets are 16/48/56/64 and not 16/48/64/72. The frame size is *not*
+        // derivable from the string — the guest itself emits both `v20@0:8c16`
+        // and `v24@0:8c16` for the same shape — so a `char` argument is one of
+        // the cases where only the guest's own declaration settles it.
+        //
+        // Inert for every send, because `objc_msgSend` never reads a declared
+        // frame size; it matters to a frame-size consumer such as
+        // `-[NSMethodSignature frameSize]`. Found by `test/tools/objcenc.py
+        // diff`; 8 references, at `0x3a7df7c`, `0x3a7e477`, `0x814f93c`,
+        // `0x8153e0a`, `0x8158e2d`, `0xbc8694f`, `0xbc88775`, `0xbc92357`.
         "initWithContentRect:styleMask:backing:defer:" => init_with_content_rect,
-            c"@56@0:8{CGRect={CGPoint=dd}{CGSize=dd}}16Q48Q56c64";
+            c"@68@0:8{CGRect={CGPoint=dd}{CGSize=dd}}16Q48Q56c64";
         "initWithContentRect:styleMask:backing:defer:screen:" => init_with_content_rect_screen,
             c"@80@0:8{CGRect={CGPoint=dd}{CGSize=dd}}16Q48Q56c64@72";
         "frame" => frame, c"{CGRect={CGPoint=dd}{CGSize=dd}}16@0:8";

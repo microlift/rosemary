@@ -103,14 +103,64 @@ unsafe fn forwarded(_name: &std::ffi::CStr, object: CFTypeRef) -> bool {
     crate::base::is_opaque(object)
 }
 
+/// Refuse a reference operation on a handle whose references this runtime has
+/// already been given back.
+///
+/// `CFRelease` after the last one, while a run loop is still holding the handle,
+/// is a guest bug. There is no answer to give: the C world's reference is gone
+/// and both remaining paths through `CFRelease` - Apple's `objc_release` and this
+/// tree's own - would read and write an allocation the caller does not own. So it
+/// is refused *by name*, which is the project's answer for a question it cannot
+/// answer truthfully, and which is also what Apple does by crashing.
+///
+/// The case this catches is the entry still being in the table, which is the
+/// common one: a source that is released and then released again, or released
+/// and then retained, while a loop is running it. The other case - a release
+/// after the entry is gone - cannot be caught at all, and [`crate::base`] says
+/// why: the address is then indistinguishable from any other the allocator owns.
+/// That one is a use-after-free here exactly as it is in Apple's CoreFoundation.
+fn refuse_if_spent(call: &str, object: CFTypeRef) {
+    objc::fail!(
+        "corefoundation: {call} on {object:p}, and this runtime has already been given back every \
+         reference it held to that handle, so the caller does not hold the one it is asking \
+         about.  A caller cannot retain or release a reference it does not hold; Apple's \
+         CoreFoundation frees it here too, and the difference is that this one says so.  \
+         Refusing rather than touching an allocation that is not the caller's any more."
+    );
+}
+
 pub unsafe extern "C" fn CFRetain(object: CFTypeRef) -> CFTypeRef {
+    // A handle the C world owns a reference to, counted. This has to be asked
+    // before `forwarded`, which on every host but Darwin *is* the opaque check
+    // and would answer "handled" and return without retaining anything.
+    match crate::base::retain_opaque(object) {
+        crate::base::CRef::Counted => return object,
+        crate::base::CRef::Spent => refuse_if_spent("CFRetain", object),
+        crate::base::CRef::Unknown => (),
+    }
     if unsafe { forwarded(c"CFRetain", object) } {
         return object;
     }
     objc::arc::retain(object as Id) as CFTypeRef
 }
 
+/// `CFRelease`, which for four of this tree's handle kinds is the only thing that
+/// can end them.
+///
+/// A `CFRunLoopSourceRef` here is a `leak`ed `Arc` the guest owns, and Apple has
+/// no `CFRunLoopSourceRelease` - the guest's `CFRelease` is the only reference
+/// it can give back. Answering it as a no-op (which is what a bare `is_opaque`
+/// does) means the handle, its `Arc` and both registry entries outlive the
+/// guest's use of them forever, and the allocator hands the address out again
+/// while the table still claims it. So the count is kept here and the reference
+/// is really dropped; a release past the last is refused by name rather than
+/// freeing the allocation twice.
 pub unsafe extern "C" fn CFRelease(object: CFTypeRef) {
+    match crate::base::release_opaque(object) {
+        crate::base::CRef::Counted => return,
+        crate::base::CRef::Spent => refuse_if_spent("CFRelease", object),
+        crate::base::CRef::Unknown => (),
+    }
     if unsafe { forwarded(c"CFRelease", object) } {
         return;
     }
@@ -118,6 +168,9 @@ pub unsafe extern "C" fn CFRelease(object: CFTypeRef) {
 }
 
 pub unsafe extern "C" fn CFAutorelease(object: CFTypeRef) -> CFTypeRef {
+    if crate::base::spent(object) {
+        refuse_if_spent("CFAutorelease", object);
+    }
     if unsafe { forwarded(c"CFAutorelease", object) } {
         return object;
     }
@@ -125,6 +178,18 @@ pub unsafe extern "C" fn CFAutorelease(object: CFTypeRef) -> CFTypeRef {
 }
 
 pub unsafe extern "C" fn CFGetRetainCount(object: CFTypeRef) -> CFIndex {
+    // The count the C world actually holds, for a handle that has one - and
+    // **zero** included, because a count is a table read and asking for it is
+    // safe even when the answer is that the caller holds none. The flat `1`
+    // further down is the answer for a handle that is not a reference at all - a
+    // device, a pasteboard - and it was also, until this was asked separately,
+    // the answer for every source and timer, which is a count that cannot go
+    // down and does not go up. It is worth stating what this does *not* include:
+    // a run loop holds its own strong reference to a source it is running, and
+    // that one is not in the number.
+    if let Some(count) = crate::base::c_retain_count(object) {
+        return count;
+    }
     if crate::base::is_opaque(object) {
         return 1;
     }
@@ -2105,6 +2170,13 @@ pub unsafe extern "C" fn CFDataGetLength(data: CFTypeRef) -> CFIndex {
 ///
 /// The capacity is a hint, and a zero one means "no limit" - neither is a length,
 /// so the data starts empty either way.
+///
+/// `CFData.h` declares **one** C type with two constnesses -
+/// `CF_BRIDGED_TYPE(NSData) CFDataRef` against
+/// `CF_BRIDGED_MUTABLE_TYPE(NSMutableData) CFMutableDataRef` - so the
+/// distinction belongs to the reference and nowhere else. This is the one C
+/// entry point whose entire contract is to hand back the **mutable** one, so
+/// building an immutable data here was the flag's half not being carried.
 pub unsafe extern "C" fn CFDataCreateMutable(
     _allocator: CFAllocatorRef,
     capacity: CFIndex,
@@ -2113,7 +2185,7 @@ pub unsafe extern "C" fn CFDataCreateMutable(
     if let Ok(capacity) = usize::try_from(capacity) {
         bytes.reserve(capacity.min(1 << 24));
     }
-    collections::new_data(bytes)
+    collections::new_mutable_data(bytes)
 }
 
 /// `void CFDataGetBytes(CFDataRef, CFRange, UInt8 *buffer)`, with the range
@@ -2972,12 +3044,15 @@ pub struct CFRunLoopTimerContext {
 
 /// A leaked `Arc`, as the C world holds one.
 ///
-/// Never reclaimed. A `CFRunLoopSourceRef` is owned by the loop it was added to
-/// as much as by the guest that made it, and freeing one on the guest's last
-/// release would take the loop's out from under it - which is a use-after-free
-/// where the leak is a few dozen bytes.
-fn leak<T>(value: Arc<T>) -> CFTypeRef {
-    Arc::into_raw(value) as CFTypeRef
+/// Never reclaimed by anything but the C world's own `CFRelease`, and only for
+/// the kinds that say they own one - see [`runloop::leak`]. A `CFRunLoopSourceRef`
+/// is owned by the loop it was added to as much as by the guest that made it, and
+/// the loop's half is a real `Arc` the loop holds, so the guest's release cannot
+/// take the source out from under it: that is a use-after-free where the extra
+/// bookkeeping is a few dozen bytes. What the guest's release *can* do is end
+/// the last reference, and that is what ends the registry entries too.
+fn leak<T: 'static>(value: Arc<T>) -> CFTypeRef {
+    runloop::leak(value)
 }
 
 /// Borrow a leaked `Arc` without changing its count.
@@ -3059,7 +3134,7 @@ pub unsafe extern "C" fn CFRunLoopWakeUp(loop_: CFTypeRef) {
 
 pub unsafe extern "C" fn CFRunLoopSourceCreate(
     _allocator: CFAllocatorRef,
-    _order: CFIndex,
+    order: CFIndex,
     context: *const CFRunLoopSourceContext,
 ) -> CFTypeRef {
     if context.is_null() {
@@ -3068,15 +3143,29 @@ pub unsafe extern "C" fn CFRunLoopSourceCreate(
     // SAFETY: a live context structure.
     let context = unsafe { &*context };
     if context.version != 0 {
-        // A version-1 source is a mach port, and this runtime has no Mach.
-        // Accepting one would produce a source that is never fired, which is a
-        // program that hangs with nothing anywhere to say why.
-        objc::fail!(
-            "CFRunLoopSourceCreate: version {} is a mach-port source, which this runtime has no Mach for",
-            context.version
+        // A version-1 source is a mach port, and this runtime has no Mach for a
+        // *CoreFoundation* mach port. Apple's own answer for a version it does not
+        // implement is null - and null is what a caller here would then fail to
+        // schedule, rather than a source that is never fired, which is a program
+        // that hangs with nothing anywhere to say why. Refused by name rather
+        // than aborting: a `Create` that cannot be satisfied is a null, not a
+        // process kill.
+        crate::base::refuse_once(
+            "CFRunLoopSourceCreate",
+            format!(
+                "a version-{} run loop source is a mach port, which this runtime has no \
+                 CoreFoundation mach port for; Apple answers null for a source version it does \
+                 not implement, and so does this",
+                context.version
+            ),
         );
+        return std::ptr::null();
     }
-    leak(runloop::new_source(context.perform, context.info as usize))
+    leak(runloop::new_source_ordered(
+        context.perform,
+        context.info as usize,
+        order,
+    ))
 }
 
 /// `CFRunLoopObserverRef CFRunLoopObserverCreate(CFAllocatorRef,
@@ -3266,7 +3355,7 @@ pub unsafe extern "C" fn CFRunLoopTimerCreate(
     fire_date: f64,
     interval: f64,
     _flags: u32,
-    _order: CFIndex,
+    order: CFIndex,
     callback: Option<runloop::TimerCallback>,
     context: *mut CFRunLoopTimerContext,
 ) -> CFTypeRef {
@@ -3274,11 +3363,12 @@ pub unsafe extern "C" fn CFRunLoopTimerCreate(
     let info = unsafe { context.as_ref() }.map_or(0, |c| c.info as usize);
     // An interval of zero or less is a one-shot, which is what Apple's does.
     let repeat = (interval > 0.0).then(|| Duration::from_secs_f64(interval.min(1e9)));
-    leak(runloop::new_timer(
+    leak(runloop::new_timer_ordered(
         delay_until(fire_date),
         repeat,
         callback,
         info,
+        order,
     ))
 }
 
@@ -4101,6 +4191,15 @@ mod tests {
             assert_eq!(CFRetain(handle), handle);
             CFRelease(handle);
         }
+        // The pairing, on the one handle this test invents. A `static u8` cannot be
+        // handed out again, so nothing here can be *wrong* - but an entry left
+        // behind is a claim about a handle nobody made, and the table is shared
+        // with every other test in this binary.
+        crate::base::forget_opaque(handle);
+        assert!(
+            !crate::base::is_opaque(handle),
+            "an entry that outlives its note claims an address for a handle that is not there"
+        );
     }
 
     /// An empty `CFData` must still answer a byte pointer that can be read.
@@ -4369,5 +4468,95 @@ mod find_result_tests {
         );
         // SAFETY: nothing else holds a reference.
         unsafe { CFRelease(one_shot) };
+    }
+
+    /// A run loop source version this runtime cannot serve is refused by name and
+    /// answers null - it does not abort the process.
+    ///
+    /// `CFRunLoopSourceCreate` is a `Create`, and the contract for a `Create` that
+    /// cannot be satisfied is null: Apple's own answer for a context version it
+    /// does not implement is to return no source. Aborting turned a refusal into
+    /// a `SIGABRT` with no name on it, which is this project's worst outcome by
+    /// construction - and it was reachable from any guest that asked for a
+    /// version-1 (mach port) source, which is a documented thing to ask for.
+    ///
+    /// The check that it *named* itself rather than merely returning null is the
+    /// second half: a null with nothing said is indistinguishable from "there was
+    /// no memory", which is the failure mode PLAN §1 is about.
+    #[test]
+    fn a_source_version_this_runtime_cannot_serve_is_a_named_refusal_and_not_an_abort() {
+        bootstrap();
+        // A version-1 context, which is the mach-port source: the two words the
+        // version-1 layout puts where a version-0 context has `retain`/`release`.
+        #[repr(C)]
+        struct MachPortSource {
+            version: CFIndex,
+            info: *mut c_void,
+            mach_port: u32,
+            reserved: [u32; 7],
+        }
+        let context = MachPortSource {
+            version: 1,
+            info: std::ptr::null_mut(),
+            mach_port: 0,
+            reserved: [0; 7],
+        };
+        // SAFETY: `context` is exactly the layout `CFRunLoopSourceCreate` reads a
+        // version-1 context from, and it outlives the call.
+        let source = unsafe {
+            CFRunLoopSourceCreate(
+                std::ptr::null(),
+                0,
+                &context as *const MachPortSource as *const CFRunLoopSourceContext,
+            )
+        };
+        assert!(
+            source.is_null(),
+            "Apple answers null for a source version it does not implement, and so does this"
+        );
+
+        // And a version it does not have any business being asked about - a
+        // negative version, and one past the highest real one - is refused the
+        // same way rather than being taken as a version-0 source.
+        for version in [-1 as CFIndex, 7] {
+            let context = CFRunLoopSourceContext {
+                version,
+                info: std::ptr::null_mut(),
+                retain: std::ptr::null(),
+                release: std::ptr::null(),
+                copy_description: std::ptr::null(),
+                equal: std::ptr::null(),
+                hash: std::ptr::null(),
+                schedule: std::ptr::null(),
+                cancel: std::ptr::null(),
+                perform: None,
+            };
+            // SAFETY: a live context this test built.
+            let made = unsafe { CFRunLoopSourceCreate(std::ptr::null(), 0, &context) };
+            assert!(made.is_null(), "version {version} is not a version");
+        }
+
+        // A version-0 source is still made, and a null context is still null, so
+        // the refusal above is not "always null".
+        let good = CFRunLoopSourceContext {
+            version: 0,
+            info: 0x1234 as *mut c_void,
+            retain: std::ptr::null(),
+            release: std::ptr::null(),
+            copy_description: std::ptr::null(),
+            equal: std::ptr::null(),
+            hash: std::ptr::null(),
+            schedule: std::ptr::null(),
+            cancel: std::ptr::null(),
+            perform: None,
+        };
+        // SAFETY: a live context this test built.
+        let made = unsafe { CFRunLoopSourceCreate(std::ptr::null(), 3, &good) };
+        assert!(!made.is_null(), "a version-0 source is not refused");
+        // SAFETY: a source this call made.
+        let source = unsafe { borrow::<Source>(made) }.expect("a source of ours");
+        assert_eq!(source.order(), 3, "and the order it was created with is kept");
+        // SAFETY: a null context, which is what Apple answers for.
+        assert!(unsafe { CFRunLoopSourceCreate(std::ptr::null(), 0, std::ptr::null()) }.is_null());
     }
 }

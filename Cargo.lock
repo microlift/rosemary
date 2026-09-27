@@ -337,6 +337,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "corelocation"
+version = "0.1.0"
+dependencies = [
+ "corefoundation",
+ "foundation",
+ "objc",
+]
+
+[[package]]
 name = "coreservices"
 version = "0.1.0"
 dependencies = [
@@ -354,6 +363,15 @@ dependencies = [
  "exports",
  "objc",
  "sdl3",
+]
+
+[[package]]
+name = "corewlan"
+version = "0.1.0"
+dependencies = [
+ "corefoundation",
+ "foundation",
+ "objc",
 ]
 
 [[package]]
@@ -1285,6 +1303,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9f7c3e4beb33f85d45ae3e3a1792185706c8e16d043238c593331cc7cd313b50"
 
 [[package]]
+name = "opendirectory"
+version = "0.1.0"
+dependencies = [
+ "corefoundation",
+ "foundation",
+ "objc",
+]
+
+[[package]]
 name = "owned_ttf_parser"
 version = "0.25.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1465,8 +1492,10 @@ dependencies = [
  "contacts",
  "coreaudio",
  "corefoundation",
+ "corelocation",
  "coreservices",
  "corevideo",
+ "corewlan",
  "darwin",
  "exports",
  "forcefeedback",
@@ -1481,7 +1510,9 @@ dependencies = [
  "microlift",
  "mimalloc",
  "objc",
+ "opendirectory",
  "prefix",
+ "sandbox",
  "sdl3",
  "security",
  "static_init",
@@ -1577,6 +1608,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "fad02996bfc73da3e301efe90b1837be9ed8f4a462b6ed410aa35d00381de89f"
 dependencies = [
  "twox-hash",
+]
+
+[[package]]
+name = "sandbox"
+version = "0.1.0"
+dependencies = [
+ "darwin",
+ "exports",
+ "libc",
 ]
 
 [[package]]

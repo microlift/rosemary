@@ -43,6 +43,35 @@ pub fn nslog(symbol: &str, ctx: &mut RegisterContext, mem: &mut dyn GuestMemory)
     Ok(())
 }
 
+/// Service `NSLogv`.
+///
+/// `void NSLogv(NSString *format, va_list args)` - `NSLog`'s other half, with
+/// the arguments already collected into a list by the caller rather than passed
+/// in registers.
+///
+/// **The format is still an `NSString`, not a C string**, which is the whole
+/// reason this is a shim rather than a `sig!` row: read from the guest at
+/// `0x4dc397b`, where the caller passes an `NSString *` in `rdi` and
+/// `CFRelease`s it at `+0x4dc3989`, and a 24-byte SysV `va_list` pointer in
+/// `rsi`. `VarArgs::from_va_list` already reads that layout, so the list is
+/// walked by the same code `printf` uses.
+pub fn nslogv(symbol: &str, ctx: &mut RegisterContext, mem: &mut dyn GuestMemory) -> Result<()> {
+    let Some(fmt) = cf_string_bytes(ctx.rdi) else {
+        // As `NSLog`: a null or unreadable format prints nothing, and `NSLogv`
+        // returns void, so there is nothing to report and nothing to set.
+        return Ok(());
+    };
+    let out = match VarArgs::from_list(symbol, ctx, &*mem, ctx.rsi) {
+        Ok(mut args) => render(&fmt, &mut args)?,
+        // A list that cannot be walked is the guest's own error. Printing the
+        // format unexpanded would be a plausible-looking lie about what was
+        // logged, so nothing is printed at all.
+        Err(_) => return Ok(()),
+    };
+    emit(&out);
+    Ok(())
+}
+
 /// Service `NSRunAlertPanel`.
 ///
 /// `NSInteger NSRunAlertPanel(NSString *title, NSString *msgFormat, NSString
@@ -412,6 +441,24 @@ pub mod native {
         trampoline as *const c_void
     }
 
+    /// The address `_NSLogv` is bound to.
+    ///
+    /// `NSLogv` takes its `va_list` as a **named** second argument - a pointer
+    /// to the list, not a variadic tail - so the call needs none of the spilling
+    /// [`trampoline`] does. The guest has already built the list and handed over
+    /// its address in `rsi`, which is the same register the variadic path fills
+    /// in with the address of the list it builds here. So `render_v_native` has
+    /// the identical shape and the trampoline is a single tail jump.
+    ///
+    /// This is the thirty-eighth and last unbound function import against the
+    /// Framework. It could not be answered from `darwin` because the two values
+    /// it needs are Foundation objects, not Mach or libc vocabulary, which is
+    /// why it lives here beside `nslog` and reads the *same* bytes through the
+    /// *same* [`render_tail`].
+    pub fn nslogv() -> *const c_void {
+        nslogv_trampoline as *const c_void
+    }
+
     /// The address `_NSRunAlertPanel` is bound to by the built-in frameworks.
     pub fn run_alert_panel() -> *const c_void {
         alert_trampoline as *const c_void
@@ -480,6 +527,36 @@ pub mod native {
         if let Some(out) = render_tail("NSLog", fmt, tail) {
             emit(&out);
         }
+    }
+
+    /// `NSLogv`'s renderer. Same two registers as [`render_native`]; only the
+    /// name in the diagnostic differs, and it differs because a refusal or a bad
+    /// format here must name the entry the guest actually called.
+    unsafe extern "C" fn render_v_native(fmt: u64, tail: u64) {
+        if let Some(out) = render_tail("NSLogv", fmt, tail) {
+            emit(&out);
+        }
+    }
+
+    /// `NSLogv(NSString *format, va_list args)`.
+    ///
+    /// `args` is a named parameter and arrives in `rsi` already pointing at the
+    /// 24-byte list, so this only has to hand both registers on. The `jmp` is a
+    /// tail call: this frame is the guest's, and building another one between
+    /// the guest and the renderer would only move the return address.
+    #[cfg(not(target_arch = "aarch64"))]
+    #[unsafe(naked)]
+    unsafe extern "C" fn nslogv_trampoline() {
+        core::arch::naked_asm!("jmp {render}", render = sym render_v_native)
+    }
+
+    /// AArch64's `va_list` is a bare `char *` to the first variadic argument,
+    /// which is the address the renderer wants just the same, so the shape of
+    /// this trampoline is identical.
+    #[cfg(target_arch = "aarch64")]
+    #[unsafe(naked)]
+    unsafe extern "C" fn nslogv_trampoline() {
+        core::arch::naked_asm!("b {render}", render = sym render_v_native)
     }
 
     unsafe extern "C" fn render_alert_native(

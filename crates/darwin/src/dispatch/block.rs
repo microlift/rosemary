@@ -1,4 +1,47 @@
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicPtr, Ordering};
+
+/// Called immediately before a block's guest code is entered, on whichever
+/// thread is about to run it.
+///
+/// **This exists because a dispatch pool worker is a thread this runtime
+/// started, and it was invisible as a guest thread.** `DarwinThread::enter`
+/// gives it a Darwin thread pointer - so `pthread_self`, `errno` and a stack
+/// canary read correctly - but registers nothing, so `rosetta3::thread::
+/// current()` is `None` on it. Guest code entered from here therefore ran with
+/// no thread state, which costs at least the indirect-call cache
+/// (`rosetta3::vm::dispatch_indirect` takes `None` and skips its lookup) and
+/// leaves anything keyed on the current thread unanswered.
+///
+/// `rosetta3` installs [`adopt_thread`], because `darwin` must not depend on it.
+/// The default is null, which is exactly the previous behaviour, so this is inert
+/// until something supplies it.
+static ADOPT_THREAD: AtomicPtr<()> = AtomicPtr::new(std::ptr::null_mut());
+
+/// The hook [`ADOPT_THREAD`] calls, as a `fn()`. Registered by `rosetta3`.
+type AdoptThread = fn();
+
+/// Install the "about to enter guest code" hook. `None` restores the default.
+pub fn set_thread_adopt_hook(hook: Option<AdoptThread>) {
+    ADOPT_THREAD.store(
+        hook.map_or(std::ptr::null_mut(), |f| f as *mut ()),
+        Ordering::Release,
+    );
+}
+
+/// Run the hook, if one is installed. Best-effort: it must not be able to stop
+/// the block from running, so its failure is the caller's to have noticed rather
+/// than something to propagate from here.
+#[inline]
+pub(crate) fn adopt_thread() {
+    let raw = ADOPT_THREAD.load(Ordering::Acquire);
+    if raw.is_null() {
+        return;
+    }
+    // SAFETY: a `fn()` installed by `set_thread_adopt_hook`, which only ever
+    // stores the address of a `fn()` item.
+    let f: AdoptThread = unsafe { std::mem::transmute(raw) };
+    f();
+}
 
 /// Byte offset of `invoke` in a `Block_layout`, after `isa`, `flags` and `reserved`.
 const INVOKE_OFFSET: u64 = 16;
@@ -54,6 +97,10 @@ pub unsafe fn invoke(block: u64) {
     if block == 0 {
         return;
     }
+    // Before the guest's code is entered, and on this thread, which may be one
+    // this runtime started rather than one the guest created. See
+    // [`adopt_thread`].
+    adopt_thread();
     // SAFETY: the caller's guarantee; `invoke` is at a fixed offset by the Block ABI.
     let entry = unsafe { ((block + INVOKE_OFFSET) as *const u64).read() };
     if entry == 0 {

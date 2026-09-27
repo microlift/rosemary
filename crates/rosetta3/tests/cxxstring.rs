@@ -145,10 +145,19 @@ fn fixture() -> Option<String> {
         .clone()
 }
 
+/// Why the C++ fixtures in this file do not run, in one place.
+///
+/// A freestanding `std::string` or `std::mutex` would be *this repository's*
+/// reimplementation wearing the standard's name, and a fixture built against one
+/// would be testing it - so the honest answer on a host with no macOS SDK is that
+/// there is no C++ standard library here, and these say so rather than saying
+/// "no toolchain", which stopped being true. See `test/logs/test-hygiene.md`.
+const CXX_STANDARD_LIBRARY_ABSENT: &str = "the fixture needs the C++ standard library headers (`<string>`, `<mutex>`), which no host without a macOS SDK has; see test/logs/test-hygiene.md";
+
 #[test]
 fn the_same_binary_agrees_with_itself() {
     let Some(path) = fixture() else {
-        skip!("no x86_64 C++ toolchain");
+        skip!("{CXX_STANDARD_LIBRARY_ABSENT}");
     };
     let Some((native_status, native)) = run_native(&path) else {
         skip!("cannot run an x86_64 binary natively");
@@ -165,7 +174,7 @@ fn the_same_binary_agrees_with_itself() {
 #[test]
 fn the_slow_path_agrees_too() {
     let Some(path) = fixture() else {
-        skip!("no x86_64 C++ toolchain");
+        skip!("{CXX_STANDARD_LIBRARY_ABSENT}");
     };
     let (status, fast, fast_err) = run_guest(&path, &[]);
     let (slow_status, slow, slow_err) =
@@ -180,7 +189,7 @@ fn the_slow_path_agrees_too() {
 #[test]
 fn every_string_call_lands_in_the_vendored_libcxx() {
     let Some(path) = fixture() else {
-        skip!("no x86_64 C++ toolchain");
+        skip!("{CXX_STANDARD_LIBRARY_ABSENT}");
     };
     let program = rosetta3::Program::load(&path, &[]).expect("load");
 
@@ -241,7 +250,7 @@ fn mutex_fixture() -> Option<String> {
 #[test]
 fn no_inlined_import_targets_guest_memory() {
     let Some(path) = mutex_fixture() else {
-        skip!("no x86_64 C++ toolchain");
+        skip!("{CXX_STANDARD_LIBRARY_ABSENT}");
     };
     // `load_executable`, not `load`: the question is about real mappings, and
     // the inspectable form places images nominally.
@@ -286,7 +295,7 @@ fn no_inlined_import_targets_guest_memory() {
 #[test]
 fn the_mutex_fixture_agrees_with_itself() {
     let Some(path) = mutex_fixture() else {
-        skip!("no x86_64 C++ toolchain");
+        skip!("{CXX_STANDARD_LIBRARY_ABSENT}");
     };
     let Some((native_status, native)) = run_native(&path) else {
         skip!("cannot run an x86_64 binary natively");

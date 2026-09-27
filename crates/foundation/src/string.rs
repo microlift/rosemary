@@ -10,6 +10,99 @@ use objc::sel::Sel;
 
 use crate::define::{class_methods, methods};
 
+/// `-intValue`, `-integerValue`, `-longLongValue`, `-doubleValue`, `-floatValue`
+/// and `-boolValue`, as pure functions of a string's UTF-16 code units.
+///
+/// Its own file, and reached with `#[path]` rather than a `lib.rs` line so that
+/// everything this selector family needs lives inside the two files that own
+/// `NSString`. Its doc comment is where the sources are named: these are ports
+/// of `__CFStringScanInteger` and `__CFStringScanDouble` from Apple's
+/// open-source CoreFoundation, and of the `-boolValue` clause in `NSString.h`.
+#[path = "string_scan.rs"]
+mod scan;
+
+/// The `NSStringCompareOptions` bits, from `NSString.h`'s `NS_OPTIONS` typedef.
+///
+/// The gaps are as load-bearing as the values: `64`, `128` and `256` are not
+/// consecutive, and `NSForcedOrderingSearch` is documented as applying to the
+/// compare methods only.
+mod option {
+    pub const CASE_INSENSITIVE: usize = 1;
+    pub const LITERAL: usize = 2;
+    pub const BACKWARDS: usize = 4;
+    pub const ANCHORED: usize = 8;
+    pub const NUMERIC: usize = 64;
+    pub const DIACRITIC_INSENSITIVE: usize = 128;
+    pub const WIDTH_INSENSITIVE: usize = 256;
+    pub const FORCED_ORDERING: usize = 512;
+    pub const REGULAR_EXPRESSION: usize = 1024;
+
+    /// The bits of `mask` this runtime can answer, and refuse the rest by name.
+    ///
+    /// A refusal here is the whole point rather than a fallback: a search that
+    /// silently dropped `NSRegularExpressionSearch` would answer "not found" for
+    /// every pattern that is not a literal, and the caller has no way to tell
+    /// that from a real miss. Each refused bit names the capability that is
+    /// missing, because each is a different missing thing:
+    ///
+    /// * `NSNumericSearch` - numeric collation (`Foo2.txt < Foo7.txt < Foo25.txt`);
+    /// * `NSDiacriticInsensitiveSearch` - canonical decomposition;
+    /// * `NSWidthInsensitiveSearch` - compatibility decomposition;
+    /// * `NSRegularExpressionSearch` - an ICU regular-expression engine.
+    ///
+    /// # Safety
+    ///
+    /// Nothing is dereferenced; `selector` is only printed.
+    pub unsafe fn derivable(selector: &str, mask: usize) -> usize {
+        let mut unknown = mask;
+        for known in [
+            CASE_INSENSITIVE,
+            LITERAL,
+            BACKWARDS,
+            ANCHORED,
+            FORCED_ORDERING,
+        ] {
+            unknown &= !known;
+        }
+        if unknown != 0 {
+            for (bit, name, missing) in [
+                (
+                    REGULAR_EXPRESSION,
+                    "NSRegularExpressionSearch",
+                    "an ICU regular-expression engine",
+                ),
+                (
+                    NUMERIC,
+                    "NSNumericSearch",
+                    "a numeric collation, so that Foo2.txt sorts before Foo7.txt",
+                ),
+                (
+                    DIACRITIC_INSENSITIVE,
+                    "NSDiacriticInsensitiveSearch",
+                    "Unicode canonical decomposition",
+                ),
+                (
+                    WIDTH_INSENSITIVE,
+                    "NSWidthInsensitiveSearch",
+                    "Unicode compatibility decomposition",
+                ),
+            ] {
+                if unknown & bit != 0 {
+                    objc::fail!(
+                        "-[{selector} options:]: bit {bit:#x} is {name}, which needs {missing}; \
+                         this host has none, and answering the search without it would report \
+                         every non-literal as absent"
+                    );
+                }
+            }
+            objc::fail!(
+                "-[{selector} options:]: mask {mask:#x} has bits this runtime does not name"
+            );
+        }
+        mask
+    }
+}
+
 /// `NSStringEncoding`, which is *not* `CFStringEncoding`: Foundation numbers its
 /// encodings separately and the two are converted at the boundary.
 pub mod ns_encoding {
@@ -626,6 +719,246 @@ unsafe extern "C" fn contains_string(receiver: Id, sel: Sel, needle: Id) -> bool
     unsafe { range_of_string(receiver, sel, needle) }.location != NOT_FOUND
 }
 
+/// ASCII-lowercased, or `None` if the string is not ASCII.
+///
+/// CF's own case-insensitive fast path is `+= 'a' - 'A'` on a byte below `0x80`
+/// and nothing else; see [`case_insensitive_compare`] for the code and for why
+/// the non-ASCII case is a different function.
+fn ascii_fold(units: &[u16]) -> Option<Vec<u16>> {
+    units
+        .iter()
+        .map(|unit| {
+            let byte = u8::try_from(*unit).ok()?;
+            Some(u16::from(byte.to_ascii_lowercase()))
+        })
+        .collect()
+}
+
+/// `-rangeOfString:options:`.
+///
+/// The mask is a runtime value, so the answer is a function of it, and this
+/// runtime's answer is only truthful for the bits that need nothing but string
+/// arithmetic. The Framework sends this selector twice, and the two masks are
+/// the two halves of that split: `0x400` (`NSRegularExpressionSearch`) against
+/// `"(^|,)\\s*dc="` at `Framework+0x5d9c68e`, which **this refuses by name**, and
+/// `0x1` (`NSCaseInsensitiveSearch`) against
+/// `"CN=com.apple.idms.appleid.prd"` at `Framework+0x5d9c88e`, which it answers.
+///
+/// `NSBackwardsSearch` searches from the end and `NSAnchoredSearch` restricts
+/// the match to the start (or the end, backwards) of the receiver; both are
+/// position arithmetic, so both are real here. `NSForcedOrderingSearch` is
+/// documented as a compare-method flag and is accepted and ignored here for the
+/// same reason - a search returns a range, not an ordering.
+///
+/// The ranges are in UTF-16 units, which is what the return value's
+/// `{_NSRange=QQ}` counts and what `NSString.h` means by "the length of the
+/// target string".
+unsafe extern "C" fn range_of_string_options(
+    receiver: Id,
+    _sel: Sel,
+    needle: Id,
+    mask: usize,
+) -> NSRange {
+    // SAFETY: `NSStringCompareOptions` is a mask of named bits.
+    let mask = unsafe { option::derivable("-rangeOfString:options:", mask) };
+    // SAFETY: two `NSString`s, or nil.
+    let (haystack, needle) = unsafe { (units(receiver), units(needle)) };
+    let found = if mask & option::CASE_INSENSITIVE != 0 {
+        // SAFETY: the refusal above has already stopped the non-ASCII case.
+        match (ascii_fold(&haystack), ascii_fold(&needle)) {
+            (Some(haystack), Some(needle)) => {
+                find(&haystack, &needle, mask & option::BACKWARDS != 0)
+            }
+            _ => unreachable!("case-insensitive search over non-ASCII is refused above"),
+        }
+    } else {
+        find(&haystack, &needle, mask & option::BACKWARDS != 0)
+    };
+    match found {
+        Some(at) => NSRange {
+            location: at,
+            length: needle.len(),
+        },
+        None => NSRange {
+            location: NOT_FOUND,
+            length: 0,
+        },
+    }
+}
+
+/// The first index of `needle` in `haystack`, from the front or the back.
+///
+/// `NSBackwardsSearch` means the *last* match, not a match of a reversed string:
+/// the first match found scanning down is the last one in the string.
+fn find(haystack: &[u16], needle: &[u16], backwards: bool) -> Option<usize> {
+    if needle.is_empty() || needle.len() > haystack.len() {
+        return None;
+    }
+    let at = |from: usize| haystack[from..].windows(needle.len()).position(|w| w == needle);
+    if backwards {
+        (0..=haystack.len() - needle.len()).rev().find(|from| at(*from).is_some())
+    } else {
+        at(0)
+    }
+}
+
+/// `-rangeOfCharacterFromSet:`, which `NSString.h` describes as returning "the
+/// range of the first character from the set in the string, **not** the range of
+/// a sequence of characters" - so `{location, length: 1}`, and `NSNotFound` with
+/// a length of 0 when nothing in the string is a member.
+unsafe extern "C" fn range_of_character_from_set(receiver: Id, _sel: Sel, set: Id) -> NSRange {
+    if set.is_null() {
+        objc::fail!("-[NSString rangeOfCharacterFromSet:]: the character set is nil");
+    }
+    // SAFETY: an `NSString` and the caller's live `NSCharacterSet`.
+    let whole = unsafe { units(receiver) };
+    match whole.iter().position(|unit| unsafe { set_admits(set, *unit) }) {
+        Some(at) => NSRange {
+            location: at,
+            length: 1,
+        },
+        None => NSRange {
+            location: NOT_FOUND,
+            length: 0,
+        },
+    }
+}
+
+/// Whether `set` admits `unit`, for either kind of set this runtime has.
+///
+/// Two, and they are not interchangeable. `crate::characterset`'s
+/// `+[NSCharacterSet URLPathAllowedCharacterSet]` is a *stand-in* of this crate's
+/// own making - a subclass with a tag word and no CoreFoundation payload - and
+/// only that module can read its tag. A real `NSCharacterSet`, whether
+/// `+whitespaceCharacterSet` or one built by `CFCharacterSetCreateWithCharactersInRange`,
+/// is CoreFoundation's, and `CFCharacterSetIsCharacterMember` answers for it.
+///
+/// Consulting only the first is a wrong answer rather than a missing one: a
+/// `+[NSCharacterSet whitespaceCharacterSet]` a guest passes to
+/// `-stringByTrimmingCharactersInSet:` would admit nothing, the trim would
+/// remove nothing, and the method would hand back the string it was given.
+unsafe fn set_admits(set: Id, unit: u16) -> bool {
+    if set.is_null() {
+        return false;
+    }
+    if let Ok(byte) = u8::try_from(unit) {
+        // SAFETY: `set` is the caller's live character set.
+        if unsafe { crate::characterset::contains(set, byte) } {
+            return true;
+        }
+    }
+    // SAFETY: `set` is a live object; CoreFoundation's own membership test
+    // answers false for anything that is not one of its sets.
+    unsafe { corefoundation::charset::CFCharacterSetIsCharacterMember(set.cast(), unit) != 0 }
+}
+
+/// `-replaceOccurrencesOfString:withString:options:range:`, on a mutable string.
+///
+/// Returns the **number** of replacements, which is what makes it different from
+/// `-stringByReplacingOccurrencesOfString:withString:options:range:` - and what
+/// makes a wrong count silent, since a caller that only wants the string never
+/// looks at it. The Framework sends this selector once, with
+/// `NSLiteralSearch` (`0x2`) at `Framework+0x8b6da76`.
+///
+/// The range is clamped to the string, as the header's own advice
+/// (`NSMakeRange(0, [receiver length])`) implies callers do, and an empty
+/// target replaces nothing: `-replaceOccurrencesOfString:` with an empty target
+/// is documented to be a no-op rather than an insertion per position.
+unsafe extern "C" fn replace_occurrences_options_range(
+    receiver: Id,
+    _sel: Sel,
+    target: Id,
+    with: Id,
+    mask: usize,
+    range: NSRange,
+) -> usize {
+    // SAFETY: `NSStringCompareOptions` is a mask of named bits.
+    let mask = unsafe { option::derivable("-replaceOccurrencesOfString:withString:options:range:", mask) };
+    // SAFETY: `NSString`s and a mutable string this runtime allocated.
+    let (whole, target, with) = unsafe { (units(receiver), units(target), units(with)) };
+    if target.is_empty() {
+        return 0;
+    }
+    let lo = range.location.min(whole.len());
+    let hi = range
+        .location
+        .saturating_add(range.length)
+        .clamp(lo, whole.len());
+    let (subject, rest) = whole.split_at(hi);
+    let subject = &subject[lo..];
+
+    let folded = mask & option::CASE_INSENSITIVE != 0;
+    let (Some(subject), Some(needle)) = (
+        folded.then(|| ascii_fold(subject)).flatten(),
+        folded.then(|| ascii_fold(&target)).flatten(),
+    ) else {
+        objc::fail!(
+            "-[NSMutableString replaceOccurrencesOfString:withString:options:range:]: \
+             NSCaseInsensitiveSearch over a non-ASCII string, which needs ICU full case folding \
+             - see -[NSString caseInsensitiveCompare:] for the same refusal and why"
+        );
+    };
+
+    // The match positions first, then the output.  The count and the text have to
+    // come out of the *same* search, or a caller that reads only one of them gets
+    // an answer the other was not derived from - and this selector returns the
+    // count, which is the half nobody looks at.
+    let anchored = mask & option::ANCHORED != 0;
+    let backwards = mask & option::BACKWARDS != 0;
+    let mut hits: Vec<usize> = Vec::new();
+    let mut at = 0usize;
+    while at <= subject.len().saturating_sub(needle.len()) {
+        let next = if backwards {
+            (at..=subject.len().saturating_sub(needle.len()))
+                .rev()
+                .find(|from| subject[*from..].starts_with(&needle.as_slice()))
+        } else {
+            subject[at..]
+                .windows(needle.len())
+                .position(|w| w == needle.as_slice())
+                .map(|off| at + off)
+        };
+        match next {
+            Some(hit) => {
+                hits.push(hit);
+                at = hit + needle.len();
+                if anchored {
+                    break;
+                }
+            }
+            None => break,
+        }
+    }
+
+    let mut out: Vec<u16> = Vec::with_capacity(whole.len());
+    let mut cursor = 0usize;
+    for hit in &hits {
+        out.extend_from_slice(&subject[cursor..*hit]);
+        out.extend_from_slice(&with);
+        cursor = hit + needle.len();
+    }
+    out.extend_from_slice(&subject[cursor.min(subject.len())..]);
+    out.extend_from_slice(rest);
+    if !hits.is_empty() {
+        let text = String::from_utf16_lossy(&out);
+        // SAFETY: the receiver is a mutable string this runtime allocated.
+        unsafe { replace(receiver, "replaceOccurrencesOfString:", text.as_bytes()) };
+    }
+    hits.len()
+}
+
+/// `-stringByAppendingFormat:`, which is `-appendFormat:` returning a new string
+/// rather than filling the receiver in - and which arrives already rendered, for
+/// the reason [`string_with_format`] gives.
+unsafe extern "C" fn string_by_appending_format(receiver: Id, _sel: Sel, format: Id) -> Id {
+    // SAFETY: two `NSString`s, or nil.
+    let mut joined = unsafe { bytes(receiver) };
+    joined.extend_from_slice(&unescape_rendered(&unsafe { bytes(format) }));
+    let s = corefoundation::string::from_bytes(&joined, false);
+    // SAFETY: a fresh object.
+    unsafe { api::CFAutorelease(s) as Id }
+}
+
 unsafe extern "C" fn has_prefix(receiver: Id, _sel: Sel, prefix: Id) -> bool {
     // SAFETY: two `NSString`s, or nil.
     let (whole, prefix) = unsafe { (bytes(receiver), bytes(prefix)) };
@@ -705,24 +1038,28 @@ unsafe extern "C" fn adding_percent_encoding(receiver: Id, _sel: Sel, allowed: I
     slice(&encoded, 0, encoded.len())
 }
 
+/// `-stringByTrimmingCharactersInSet:`.
+///
+/// In **code units**, and against both kinds of character set this runtime has -
+/// see [`set_admits`] for why that is two and not one. Trimming bytes would be a
+/// different method: `NBSP` and `IDEOGRAPHIC SPACE` are three bytes each, and a
+/// caller that trimmed a byte at a time would leave half a character behind.
 unsafe extern "C" fn trimming_characters(receiver: Id, _sel: Sel, set: Id) -> Id {
     if set.is_null() {
-        return std::ptr::null_mut();
+        objc::fail!("-[NSString stringByTrimmingCharactersInSet:]: the character set is nil");
     }
-    // SAFETY: the receiver is an NSString.
-    let original = unsafe { bytes(receiver) };
-    let start = original
+    // SAFETY: an `NSString` and the caller's live `NSCharacterSet`.
+    let whole = unsafe { units(receiver) };
+    let member = |unit: &u16| unsafe { set_admits(set, *unit) };
+    let start = whole.iter().position(|unit| !member(unit)).unwrap_or(whole.len());
+    let end = whole
         .iter()
-        .position(|byte| {
-            // SAFETY: `set` is the caller's live NSCharacterSet.
-            !unsafe { crate::characterset::contains(set, *byte) }
-        })
-        .unwrap_or(original.len());
-    let end = original
-        .iter()
-        .rposition(|byte| !unsafe { crate::characterset::contains(set, *byte) })
+        .rposition(|unit| !member(unit))
         .map_or(start, |index| index + 1);
-    slice(&original, start, end)
+    let sliced: Vec<u16> = whole[start.min(end)..end].to_vec();
+    let s = corefoundation::string::from_utf16(&sliced);
+    // SAFETY: a fresh object.
+    unsafe { api::CFAutorelease(s) as Id }
 }
 
 unsafe extern "C" fn substring_from_index(receiver: Id, _sel: Sel, index: usize) -> Id {
@@ -819,6 +1156,15 @@ unsafe extern "C" fn uppercase(receiver: Id, _sel: Sel) -> Id {
     unsafe { api::CFAutorelease(s) as Id }
 }
 
+/// `-compare:`, which is `CFStringCompare` with no options.
+///
+/// The comparison is over **characters**, in code-point order: CF walks the
+/// inline buffer with `CFStringGetCharacterFromInlineBuffer` and rejoins
+/// surrogate pairs (`CFUniCharIsSurrogateHighCharacter`), so an emoji sorts
+/// before `U+E000`..`U+FFFF`, not after it. Comparing UTF-8 bytes gives the same
+/// order, because UTF-8 is order-preserving over code points - which is why this
+/// stays on `bytes()` and not on the UTF-16 units, where that order would be
+/// wrong.
 unsafe extern "C" fn compare(receiver: Id, _sel: Sel, other: Id) -> isize {
     // SAFETY: two `NSString`s, or nil.
     let (a, b) = unsafe { (bytes(receiver), bytes(other)) };
@@ -829,38 +1175,107 @@ unsafe extern "C" fn compare(receiver: Id, _sel: Sel, other: Id) -> isize {
     }
 }
 
+/// `-caseInsensitiveCompare:`, which is `CFStringCompare` with
+/// `kCFCompareCaseInsensitive`.
+///
+/// **The ASCII line is CF's own line, not a convenient one.**
+/// `CFStringFindWithOptionsAndLocale` and
+/// `CFStringCompareWithOptionsAndLocale` both have this shape:
+///
+/// ```c
+/// if ((strByte < 0x80) && ((NULL == langCode) || ('I' != strByte))) {
+///     if (caseInsensitive && (strByte >= 'A') && (strByte <= 'Z')) strByte += ('a' - 'A');
+///     *strBuf1 = strByte; strBuf1Len = 1;
+/// } else {
+///     strBuf1Len = __CFStringFoldCharacterClusterAtIndex(...);   /* ICU */
+/// }
+/// ```
+///
+/// so for ASCII CF folds with `+= 'a' - 'A'` and never consults a case table,
+/// while anything else goes to `__CFStringFoldCharacterClusterAtIndex`, which is
+/// ICU **full case folding** over a character cluster. Full case folding is not
+/// Rust's `char::to_lowercase`: `U+1E9E` folds to `ss` and `U+00DF` folds to
+/// `ss`, where simple lowercase gives `U+00DF` and `U+00DF`.
+///
+/// So the ASCII answer here is exact, and a string with any unit at or above
+/// `U+0080` in it is **refused by name** rather than answered. The previous
+/// answer - `-caseInsensitiveCompare:` wired to the case-sensitive `compare` -
+/// was not merely approximate: it reported `"ABC"` and `"abc"` as *unequal*, and
+/// a `test` on the result of this selector is how a guest asks "are these the
+/// same?", so that wrong answer selects a branch and nothing reports it.
+unsafe extern "C" fn case_insensitive_compare(receiver: Id, _sel: Sel, other: Id) -> isize {
+    // SAFETY: two `NSString`s, or nil.
+    let (a, b) = unsafe { (units(receiver), units(other)) };
+    if a.iter().any(|unit| *unit >= 0x80) || b.iter().any(|unit| *unit >= 0x80) {
+        objc::fail!(
+            "-[NSString caseInsensitiveCompare:]: at least one string has a character outside \
+             ASCII.  CoreFoundation answers those through ICU full case folding \
+             (__CFStringFoldCharacterClusterAtIndex), so U+1E9E compares equal to \"ss\" and \
+             U+00DF does too - which is not what any case table this host can build says, and \
+             a comparison result is a branch the caller cannot audit"
+        );
+    }
+    let fold = |unit: &u16| {
+        let byte = *unit as u8;
+        byte.to_ascii_lowercase() as u16
+    };
+    match a.iter().map(fold).cmp(b.iter().map(fold)) {
+        std::cmp::Ordering::Less => -1,
+        std::cmp::Ordering::Equal => 0,
+        std::cmp::Ordering::Greater => 1,
+    }
+}
+
+/// `-intValue`: `CFStringGetIntValue`, which is a **32-bit** saturating scan.
 unsafe extern "C" fn int_value(receiver: Id, _sel: Sel) -> i32 {
     // SAFETY: an `NSString`.
-    parse_leading(&unsafe { bytes(receiver) }).map_or(0, |v| v as i32)
+    let whole = unsafe { units(receiver) };
+    // The scan saturates inside `i32`'s range, so this truncation never wraps.
+    scan::scan_integer(&whole, scan::Width::Int).unwrap_or(0) as i32
 }
 
+/// `-integerValue` and `-longLongValue`: the same scan with a 64-bit
+/// accumulator, promoted from the 32-bit one on the first digit that does not
+/// fit in it.
 unsafe extern "C" fn integer_value(receiver: Id, _sel: Sel) -> i64 {
     // SAFETY: an `NSString`.
-    parse_leading(&unsafe { bytes(receiver) }).unwrap_or(0)
+    let whole = unsafe { units(receiver) };
+    scan::scan_integer(&whole, scan::Width::LongLong).unwrap_or(0)
 }
 
+/// `-doubleValue`: `CFStringGetDoubleValue` over the `__CFNumberSet` run.
 unsafe extern "C" fn double_value(receiver: Id, _sel: Sel) -> f64 {
     // SAFETY: an `NSString`.
-    let text = unsafe { bytes(receiver) };
-    let text = String::from_utf8_lossy(&text);
-    let end = text
-        .char_indices()
-        .position(|(_, c)| !(c.is_ascii_digit() || "+-.eE".contains(c)))
-        .unwrap_or(text.len());
-    text[..end].parse().unwrap_or(0.0)
+    let whole = unsafe { units(receiver) };
+    scan::scan_double(&whole)
 }
 
-/// The leading integer, as `-intValue` reads one: skip spaces, take a sign and
-/// digits, and answer zero for anything else. Never an error - Foundation's
-/// does not have one.
-fn parse_leading(bytes: &[u8]) -> Option<i64> {
-    let text = String::from_utf8_lossy(bytes);
-    let text = text.trim_start();
-    let end = text
-        .char_indices()
-        .position(|(i, c)| !(c.is_ascii_digit() || (i == 0 && (c == '-' || c == '+'))))
-        .unwrap_or(text.len());
-    text[..end].parse().ok()
+/// `-floatValue`, which is `-doubleValue` narrowed to `f32`.
+///
+/// **The encoding is `f16@0:8` and it has to be.** The two differ only in the low
+/// 32 bits of `xmm0`, so a `d16@0:8` row wired to a function returning `f64` put
+/// a *double*'s bits where the guest reads a *float*: `3.0f64` is
+/// `0x4008000000000000`, whose low half is `0x00000000`, so this selector
+/// answered `0.0` for almost every input and the guest had no way to know. A
+/// method encoding is never consulted at dispatch, so nothing checks this -
+/// which is why it is worth saying out loud.
+unsafe extern "C" fn float_value(receiver: Id, _sel: Sel) -> f32 {
+    // SAFETY: an `NSString`.
+    let whole = unsafe { units(receiver) };
+    scan::scan_double(&whole) as f32
+}
+
+/// `-boolValue`, which is the only selector here with no `strtol`-shaped
+/// grammar: the clause is `NSString.h`'s own, and the whole of it is
+/// implemented in [`scan::bool_value`].
+///
+/// The measured run reaches this at `Framework+0x5d92a5b` on the value of
+/// `LSUIElement`, which every one of the five `Chromium Helper` bundles carries
+/// as `<string>1</string>`, so the answer is `YES`.
+unsafe extern "C" fn bool_value(receiver: Id, _sel: Sel) -> bool {
+    // SAFETY: an `NSString`.
+    let whole = unsafe { units(receiver) };
+    scan::bool_value(&whole)
 }
 
 unsafe extern "C" fn last_path_component(receiver: Id, _sel: Sel) -> Id {
@@ -1070,6 +1485,8 @@ pub(crate) fn install() {
         "copyWithZone:" => copy, c"@24@0:8^v16";
         "mutableCopy" => mutable_copy, c"@16@0:8";
         "rangeOfString:" => range_of_string, c"{_NSRange=QQ}24@0:8@16";
+        "rangeOfString:options:" => range_of_string_options, c"{_NSRange=QQ}32@0:8@16Q24";
+        "rangeOfCharacterFromSet:" => range_of_character_from_set, c"{_NSRange=QQ}24@0:8@16";
         "containsString:" => contains_string, c"B24@0:8@16";
         "hasPrefix:" => has_prefix, c"B24@0:8@16";
         "hasSuffix:" => has_suffix, c"B24@0:8@16";
@@ -1080,12 +1497,13 @@ pub(crate) fn install() {
         "lowercaseString" => lowercase, c"@16@0:8";
         "uppercaseString" => uppercase, c"@16@0:8";
         "compare:" => compare, c"q24@0:8@16";
-        "caseInsensitiveCompare:" => compare, c"q24@0:8@16";
+        "caseInsensitiveCompare:" => case_insensitive_compare, c"q24@0:8@16";
         "intValue" => int_value, c"i16@0:8";
         "integerValue" => integer_value, c"q16@0:8";
         "longLongValue" => integer_value, c"q16@0:8";
+        "boolValue" => bool_value, c"B16@0:8";
         "doubleValue" => double_value, c"d16@0:8";
-        "floatValue" => double_value, c"d16@0:8";
+        "floatValue" => float_value, c"f16@0:8";
         "lastPathComponent" => last_path_component, c"@16@0:8";
         "stringByDeletingLastPathComponent" => delete_last_path_component, c"@16@0:8";
         "pathExtension" => path_extension, c"@16@0:8";
@@ -1107,6 +1525,7 @@ pub(crate) fn install() {
         "stringByAddingPercentEncodingWithAllowedCharacters:" => adding_percent_encoding, c"@24@0:8@16";
         "stringByTrimmingCharactersInSet:" => trimming_characters, c"@24@0:8@16";
         "stringByAppendingString:" => append_string, c"@24@0:8@16";
+        "stringByAppendingFormat:" => string_by_appending_format, c"@24@0:8@16";
         "stringByReplacingOccurrencesOfString:withString:"
             => replacing_occurrences, c"@32@0:8@16@24";
     });
@@ -1115,6 +1534,8 @@ pub(crate) fn install() {
         "appendString:" => append_string_in_place, c"v24@0:8@16";
         "appendFormat:" => append_format, c"v24@0:8@16";
         "setString:" => set_string, c"v24@0:8@16";
+        "replaceOccurrencesOfString:withString:options:range:"
+            => replace_occurrences_options_range, c"Q64@0:8@16@24Q32{_NSRange=QQ}40";
         "init" => init_mutable, c"@16@0:8"
     });
     class_methods!(mutable, {
@@ -1263,6 +1684,237 @@ mod tests {
             .expect("an array");
             assert_eq!(array.values.len(), 1, "separator {separator:?}");
         }
+    }
+
+    /// The string `__CFStringScanDouble` is handed, for the inputs where the
+    /// collected run is not the whole string.  This is the half of the contract a
+    /// libc diff cannot check - libc has no `__CFNumberSet` - so it is pinned
+    /// here, and `test/tools/strtod-diff/` diffs the other half against the real
+    /// `strtod` over 124 inputs.
+    #[test]
+    fn the_number_run_stops_at_the_first_character_the_scanner_will_not_pass_on() {
+        let run = |text: &str| {
+            let units: Vec<u16> = text.encode_utf16().collect();
+            scan::number_run(&units)
+        };
+        // A newline is not in `whitespaceSet` and not in the set, so it ends the
+        // run before anything else does.
+        assert_eq!(run("\n3.14"), b"");
+        // A space is NOT in the set, so the run stops there.  It is easy to
+        // assume otherwise from the table row that holds it.
+        assert_eq!(run("3 14"), b"3");
+        // Nor are '#', '%', '&', ',' or '/': the whole printable run of that row
+        // of the table is *not* in the set - only '+', '-' and '.' are.
+        for absent in ["1#2", "1%2", "1&2", "1,2", "1/2"] {
+            assert_eq!(run(absent), b"1", "{absent}");
+        }
+        assert_eq!(run("()"), b"");
+        // The whole set, in one string: 15 characters, and this is the line that
+        // says which fifteen.
+        assert_eq!(run("+-.0123456789Ee"), b"+-.0123456789Ee");
+        // 'x' is not in the set, so no hexadecimal form can ever be reached.
+        assert_eq!(run("0x10"), b"0");
+        // Nor 'i', 'n' or 'a', so no inf/nan can ever be reached.
+        assert_eq!(run("inf"), b"");
+        assert_eq!(run("NaN"), b"");
+        // Leading whitespaceSet is skipped before the run starts.
+        assert_eq!(run("  \t 42"), b"42");
+        assert_eq!(run("1.2.3"), b"1.2.3");
+        // Anything at U+0080 or above ends the run: the C test is `ch < 128`.
+        assert_eq!(run("12\u{00e9}"), b"12");
+    }
+
+    /// `-boolValue` through dispatch, on the string the measured run sends, and
+    /// on the byte a wrong `NO` would be indistinguishable from.
+    #[test]
+    fn bool_value_is_installed_on_the_class_the_receiver_is() {
+        crate::bootstrap();
+        let source = from_str("1");
+        // Sent rather than called: the receiver on the measured path is a
+        // `__NSCFString` (a bridged constant from a plist), not this crate's own
+        // string, and only going through dispatch proves the method is installed
+        // on the class such a receiver has.
+        // SAFETY: `-boolValue` is `BOOL (id, SEL)`.
+        let value = unsafe {
+            let send: unsafe extern "C" fn(Id, Sel) -> bool =
+                std::mem::transmute(objc::msg::entry());
+            send(source, objc::sel::get("boolValue"))
+        };
+        assert!(value, "LSUIElement is <string>1</string> in every helper bundle");
+        // SAFETY: `source` is a string this test made.
+        unsafe { api::CFRelease(source as CFTypeRef) };
+    }
+
+    /// `-caseInsensitiveCompare:` and `-floatValue` both used to be wired to the
+    /// wrong thing; these pin the two answers that were silently wrong.
+    #[test]
+    fn case_insensitive_and_float_are_not_the_case_sensitive_and_double_answers() {
+        crate::bootstrap();
+        let a = from_str("ABC");
+        let b = from_str("abc");
+        // SAFETY: `NSComparisonResult (id, SEL, id)`.
+        let compared = unsafe {
+            let send: unsafe extern "C" fn(Id, Sel, Id) -> isize =
+                std::mem::transmute(objc::msg::entry());
+            send(a, objc::sel::get("caseInsensitiveCompare:"), b)
+        };
+        assert_eq!(compared, 0, "\"ABC\" and \"abc\" are the same string");
+
+        let three = from_str("3");
+        // SAFETY: `float (id, SEL)`.
+        let value = unsafe {
+            let send: unsafe extern "C" fn(Id, Sel) -> f32 = std::mem::transmute(objc::msg::entry());
+            send(three, objc::sel::get("floatValue"))
+        };
+        // 3.0f64 is 0x4008000000000000, whose low 32 bits are 0 - so a `d16@0:8`
+        // row wired to a function returning f64 answered 0.0 here.
+        assert_eq!(value, 3.0f32);
+        assert_eq!(value.to_bits(), 0x4040_0000);
+        for object in [a, b, three] {
+            // SAFETY: each is a string this test made.
+            unsafe { api::CFRelease(object as CFTypeRef) };
+        }
+    }
+
+    /// `-stringByTrimmingCharactersInSet:` has to consult a real `NSCharacterSet`.
+    /// Consulting only this crate's own URL-path stand-in would make every other
+    /// set admit nothing, and the trim would then remove nothing - a wrong answer
+    /// that looks exactly like "no trimming was needed".
+    ///
+    /// The set is built through CoreFoundation's own
+    /// `CFCharacterSetGetPredefined(kCFCharacterSetWhitespace)` rather than
+    /// through `+[NSCharacterSet whitespaceCharacterSet]`, which this tree does
+    /// not install and whose absence would abort the test instead of testing
+    /// anything.
+    #[test]
+    fn trimming_consults_a_character_set_corefoundation_built() {
+        crate::bootstrap();
+        // SAFETY: a documented nullary constructor with a documented identifier.
+        let whitespace = unsafe {
+            corefoundation::charset::CFCharacterSetGetPredefined(
+                corefoundation::charset::Predefined::Whitespace.identifier() as isize,
+            )
+        } as Id;
+        if whitespace.is_null() {
+            return;
+        }
+        // A non-ASCII member as well, so the test is not only about ASCII: U+00A0
+        // NO-BREAK SPACE is three UTF-8 bytes and one UTF-16 unit, and trimming
+        // bytes would leave two thirds of a character behind.
+        let padded = from_str(" \u{00a0}padded\u{00a0} ");
+        // SAFETY: `id (id, SEL, id)`.
+        let trimmed = unsafe {
+            let send: unsafe extern "C" fn(Id, Sel, Id) -> Id = std::mem::transmute(objc::msg::entry());
+            send(
+                padded,
+                objc::sel::get("stringByTrimmingCharactersInSet:"),
+                whitespace,
+            )
+        };
+        // SAFETY: a string this call made.
+        assert_eq!(unsafe { bytes(trimmed) }, "padded".as_bytes());
+    }
+
+    /// `-stringByAppendingFormat:`, and the mask-valued searches, exist because the
+    /// guest sends them; these are the two masks it actually sends.
+    #[test]
+    fn the_search_options_the_guest_sends_answer_and_the_regex_one_is_named() {
+        crate::bootstrap();
+        let haystack = from_str("apple_id CN=com.apple.idms.appleid.prd trailer");
+        // The needle differs from the haystack's copy in case only, so the two
+        // masks must disagree - otherwise this test cannot tell them apart.
+        let needle = from_str("cn=com.apple.idms.appleid.prd");
+        // SAFETY: `NSRange (id, SEL, id, NSStringCompareOptions)`.
+        let found = unsafe {
+            let send: unsafe extern "C" fn(Id, Sel, Id, usize) -> NSRange =
+                std::mem::transmute(objc::msg::entry());
+            send(
+                haystack,
+                objc::sel::get("rangeOfString:options:"),
+                needle,
+                0x1, // NSCaseInsensitiveSearch
+            )
+        };
+        assert_eq!(found.location, 9, "the range is in UTF-16 units");
+        // SAFETY: `needle` is a string this test made.
+        assert_eq!(found.length, unsafe { units(needle) }.len());
+
+        // The Framework's other site passes 0x400, NSRegularExpressionSearch, and
+        // is answered by a refusal naming the missing ICU engine.  Calling it here
+        // would abort the test process, so only the accepted mask is exercised.
+        let literal = unsafe {
+            let send: unsafe extern "C" fn(Id, Sel, Id, usize) -> NSRange =
+                std::mem::transmute(objc::msg::entry());
+            send(
+                haystack,
+                objc::sel::get("rangeOfString:options:"),
+                needle,
+                0x2, // NSLiteralSearch
+            )
+        };
+        assert_eq!(literal.location, NOT_FOUND, "case matters without the mask");
+    }
+
+    /// The abort this selector caused, replayed from the guest's own bytes.
+    ///
+    /// `test/logs/188.log:370` is `unrecognized selector sent to instance of
+    /// __NSCFString: boolValue`, reached from `Framework+0x891217b`, whose
+    /// instruction sequence is:
+    ///
+    /// ```text
+    /// 8912176:  call   0x5d929e0
+    /// 891217b:  test   al,al
+    /// 891217d:  je     0x89121e3
+    /// ```
+    ///
+    /// and `0x5d929e0` is a wrapper that sends, in order, `mainBundle`
+    /// (`+[NSBundle mainBundle]`), `infoDictionary`, `objectForKey:` with the
+    /// `__cfstring` at `0xe674830`, and then `boolValue`. That `__cfstring`'s
+    /// length field at `+24` is `0xb`, and its bytes at `+16` are
+    /// `LSUIElement`. So the whole of the measured expression is
+    /// `[[[NSBundle mainBundle] infoDictionary] objectForKey:@"LSUIElement"] boolValue`,
+    /// and the answer is decided by what the bundle's plist says.
+    ///
+    /// This test reads the real `Info.plist` of the real helper bundle with this
+    /// crate's own plist parser and asks.  It is the difference between
+    /// answering the selector correctly and answering the *question* the guest
+    /// was asking correctly, and the run cannot show the second one: the wall in
+    /// front of that call site is another module's, so the process that would
+    /// reach it does not start.
+    #[test]
+    fn the_guests_own_lsuielement_string_answers_yes() {
+        crate::bootstrap();
+        const PLIST: &str = "test/Chromium/Chromium.app/Contents/Frameworks/\
+             Chromium Framework.framework/Versions/130.0.6723.91/Helpers/\
+             Chromium Helper (GPU).app/Contents/Info.plist";
+        let Ok(raw) = std::fs::read(PLIST) else {
+            // The guest bundle is not present in every checkout; a skip is
+            // honest here and a fabricated value is not.
+            return;
+        };
+        let Ok(value) = crate::plist::parse(&raw) else {
+            panic!("could not parse {PLIST}");
+        };
+        let element = value
+            .get("LSUIElement")
+            .and_then(|v| v.as_str())
+            .expect("LSUIElement in the GPU helper's Info.plist");
+        assert_eq!(element, "1", "the value the guest hands -boolValue");
+        let bridged = from_str(element);
+        // Sent, not called: the abort names `__NSCFString`, and only dispatch
+        // shows the method is on the class a bridged string has.
+        // SAFETY: `-boolValue` is `BOOL (id, SEL)`.
+        let answer = unsafe {
+            let send: unsafe extern "C" fn(Id, Sel) -> bool = std::mem::transmute(objc::msg::entry());
+            send(bridged, objc::sel::get("boolValue"))
+        };
+        assert!(
+            answer,
+            "NO here is the byte a correct NO would also be, and it would record a \
+             background-only bundle as a foreground one"
+        );
+        // SAFETY: `bridged` is a string this test made.
+        unsafe { api::CFRelease(bridged as CFTypeRef) };
     }
 
     #[test]

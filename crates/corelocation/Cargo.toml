@@ -1,0 +1,11 @@
+[package]
+name = "corelocation"
+description = "The one CoreLocation class Chromium Framework imports, and the answers this host can truthfully give it"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+objc.workspace = true
+corefoundation.workspace = true
+foundation.workspace = true

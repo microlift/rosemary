@@ -29,7 +29,18 @@ fn objc_debug_is_accepted_with_the_default_builtin_runtime() {
     let err = String::from_utf8_lossy(&output.stderr);
     assert!(!err.contains("usage:"), "{err}");
     assert!(!err.contains("--objc-debug requires"), "{err}");
-    assert!(err.starts_with("rosetta3: /etc/hosts:"), "{err}");
+    // The last two are the claim: `--objc-debug` was *accepted* and the run
+    // carried on far enough to try to load the file. Searched for rather than
+    // required at the start of stderr, for the reason
+    // `an_untranslatable_stop_names_itself_instead_of_crashing` gives - and on
+    // this path it happens to be the first line, because the option is refused
+    // before the loader publishes anything, which is itself worth not relying
+    // on: publishing is not this test's business and may move.
+    assert!(
+        err.lines()
+            .any(|line| line.starts_with("rosetta3: /etc/hosts:")),
+        "{err}"
+    );
 }
 
 #[test]
@@ -187,10 +198,31 @@ fn an_untranslatable_stop_names_itself_instead_of_crashing() {
     // `/usr/bin/true` is not a Mach-O this loader accepts on every system, so
     // the case chosen is one that is always available and always wrong - a
     // path that is not an executable at all.
+    //
+    // The sentence is looked for *anywhere* on stderr, and it used to be
+    // required to be the first line. That was an assumption about a different
+    // component's scheduling, and it was wrong: `darwin::data_unavailable`
+    // announces its 504 zeroed data refusals from the loader's first publish,
+    // which happens while the executable is still being opened, so the banner is
+    // genuinely on stderr first. The test's claim is about *this* stop, not
+    // about being the first thing the process says - and the banner is a real
+    // notice that has to be out before the guest runs, so it is not the thing
+    // to move.
     let (status, out, err) = run_guest("/etc/hosts", &[]);
     assert_eq!(status, Some(1));
     assert!(out.is_empty());
-    assert!(err.starts_with("rosetta3: /etc/hosts:"), "{err:?}");
+
+    let refusal = err
+        .lines()
+        .find(|line| line.starts_with("rosetta3: /etc/hosts:"))
+        .unwrap_or_else(|| panic!("the stop did not name the file it could not run:\n{err}"));
+    // And it says *why*, rather than echoing the path back: a named refusal
+    // with no reason in it is the shape of the failure this test exists to
+    // catch, and `not a Mach-O file (magic 0x74532023)` is the reason.
+    assert!(
+        refusal.len() > "rosetta3: /etc/hosts: ".len(),
+        "the refusal names the file and nothing else: {refusal:?}"
+    );
 }
 
 #[test]

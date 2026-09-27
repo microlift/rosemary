@@ -824,8 +824,15 @@ fn host_cancel_asynchronous() -> libc::c_int {
 ///
 /// Called only through an import slot this crate defines.
 pub unsafe extern "C" fn key_delete(key: u64) -> i32 {
-    // SAFETY: `key` is one this process's `pthread_key_create` produced.
-    err::from_host(unsafe { libc::pthread_key_delete(key as libc::pthread_key_t) })
+    #[cfg(not(target_os = "macos"))]
+    {
+        return crate::tls::key_delete(key);
+    }
+    #[cfg(target_os = "macos")]
+    {
+        // SAFETY: `key` is one this process's `pthread_key_create` produced.
+        err::from_host(unsafe { libc::pthread_key_delete(key as libc::pthread_key_t) })
+    }
 }
 
 /// `int pthread_key_create(pthread_key_t *, void (*destructor)(void *))`
@@ -850,16 +857,44 @@ pub unsafe extern "C" fn key_create(
     if out.is_null() {
         return err::EINVAL;
     }
-    let mut key: libc::pthread_key_t = 0;
-    // SAFETY: a live local, and the caller's destructor.
-    let rc = unsafe { libc::pthread_key_create(&mut key, destructor) };
-    if rc == 0 {
-        // SAFETY: the caller's eight bytes.
-        // `pthread_key_t` is unsigned on Linux and signed on FreeBSD, so it is
-        // widened with a cast rather than a `From`.
-        unsafe { out.write_unaligned(key as u64) };
+    // The key this hands out is a **word index into this process's own `%gs`
+    // block**, not a glibc key, and that is the whole point.
+    //
+    // The Framework inlines `pthread_getspecific` rather than calling it, and
+    // the inlined form indexes `%gs` with the key directly - `mov rax,gs:[key*8]`
+    // (148 such sites in the image, across five keys). A glibc key number is
+    // meaningless in that block, so a guest reading `gs:[key*8]` got zero, and a
+    // guest thread-local accessor that tolerates null simply *returned* null. The
+    // bind then stored that null and every one of its seven readers dereferenced
+    // it: the fault at `Framework+0x5d46240` in `ThreadControllerImpl::DoWork`.
+    //
+    // Handing out a word index makes the two agree by construction, for every
+    // key, rather than by fitting the one index that faulted. See
+    // `crate::tls`, where the storage and the numbering live.
+    #[cfg(not(target_os = "macos"))]
+    {
+        return match crate::tls::key_create(destructor) {
+            Ok(key) => {
+                // SAFETY: the caller's eight bytes, and `out` was checked above.
+                unsafe { out.write_unaligned(key) };
+                0
+            }
+            Err(rc) => rc,
+        };
     }
-    err::from_host(rc)
+    #[cfg(target_os = "macos")]
+    {
+        let mut key: libc::pthread_key_t = 0;
+        // SAFETY: a live local, and the caller's destructor.
+        let rc = unsafe { libc::pthread_key_create(&mut key, destructor) };
+        if rc == 0 {
+            // SAFETY: the caller's eight bytes.
+            // `pthread_key_t` is unsigned on Linux and signed on FreeBSD, so it is
+            // widened with a cast rather than a `From`.
+            unsafe { out.write_unaligned(key as u64) };
+        }
+        err::from_host(rc)
+    }
 }
 
 /// `int pthread_join(pthread_t, void **)`
@@ -1030,8 +1065,18 @@ pub unsafe extern "C" fn detach(thread: u64) -> i32 {
 ///
 /// As [`key_delete`].
 pub unsafe extern "C" fn getspecific(key: u64) -> u64 {
-    // SAFETY: as above; a key nobody created reads null, which is what Darwin does.
-    unsafe { libc::pthread_getspecific(key as libc::pthread_key_t) as usize as u64 }
+    // Reads the **block**, not the host key, so it answers the same word the
+    // guest's own inlined `mov rax,gs:[key*8]` reads. The two cannot disagree
+    // because every write went through `setspecific` below, which writes both.
+    #[cfg(not(target_os = "macos"))]
+    {
+        return crate::tls::key_get(key);
+    }
+    #[cfg(target_os = "macos")]
+    {
+        // SAFETY: as above; a key nobody created reads null, which is what Darwin does.
+        unsafe { libc::pthread_getspecific(key as libc::pthread_key_t) as usize as u64 }
+    }
 }
 
 /// # Safety
@@ -1039,12 +1084,25 @@ pub unsafe extern "C" fn getspecific(key: u64) -> u64 {
 /// As [`key_delete`]; `value` is the guest's own pointer, which only guest code
 /// dereferences.
 pub unsafe extern "C" fn setspecific(key: u64, value: u64) -> i32 {
-    err::from_host(unsafe {
-        libc::pthread_setspecific(
-            key as libc::pthread_key_t,
-            value as usize as *const libc::c_void,
-        )
-    })
+    // Writes **both** the `%gs` word and the host key, and stores `value`
+    // verbatim - tag bits included. The guest sets bits 0-1 on the value itself
+    // (`or rsi,0x3` at `Framework+0x5d6996c`) and strips them in its own key
+    // destructor (`and r14,~3` at `+0x5d69483`); masking them off on the way in
+    // would lose the very distinction that destructor is written against. The
+    // host key exists only so libpthread still runs that destructor at exit.
+    #[cfg(not(target_os = "macos"))]
+    {
+        return crate::tls::key_set(key, value);
+    }
+    #[cfg(target_os = "macos")]
+    {
+        err::from_host(unsafe {
+            libc::pthread_setspecific(
+                key as libc::pthread_key_t,
+                value as usize as *const libc::c_void,
+            )
+        })
+    }
 }
 
 unsafe extern "C" {

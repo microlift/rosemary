@@ -349,7 +349,10 @@ unsafe extern "C" fn dictionary_description(receiver: Id, _sel: Sel) -> Id {
 /// Nil for a file that cannot be read, which is Apple's answer and the one a
 /// caller checks for - a program asking for a file it may not have is asking a
 /// question, not making a mistake.
-unsafe extern "C" fn data_with_contents_of_file(_class: Id, _sel: Sel, path: Id) -> Id {
+///
+/// **One send in the guest**, at `Framework+0x4fe2033`, with
+/// `_OBJC_CLASS_$_NSData` as the receiver.
+unsafe extern "C" fn data_with_contents_of_file(class: Id, _sel: Sel, path: Id) -> Id {
     // SAFETY: an `NSString`, or nil.
     let path = unsafe { crate::string::bytes(path) };
     let Ok(path) = String::from_utf8(path) else {
@@ -359,33 +362,7 @@ unsafe extern "C" fn data_with_contents_of_file(_class: Id, _sel: Sel, path: Id)
     let Ok(bytes) = std::fs::read(prefix::ns::host_path(&path)) else {
         return std::ptr::null_mut();
     };
-    let data = collections::new_data(bytes);
-    // SAFETY: a fresh object.
-    unsafe { api::CFAutorelease(data) as Id }
-}
-
-/// `+dataWithContentsOfFile:options:error:`. The reading options only tune
-/// how the file is read (mapped, uncached), not what is answered.
-unsafe extern "C" fn data_with_contents_of_file_options(
-    class: Id,
-    sel: Sel,
-    path: Id,
-    _options: u64,
-    error: *mut Id,
-) -> Id {
-    // SAFETY: forwarded unchanged.
-    let data = unsafe { data_with_contents_of_file(class, sel, path) };
-    if !error.is_null() {
-        // `NSFileReadNoSuchFileError` or nothing: the caller passed a writable
-        // `NSError **`.
-        unsafe {
-            *error = match data.is_null() {
-                true => crate::error::make("NSCocoaErrorDomain", 260, "The file couldn't be opened."),
-                false => std::ptr::null_mut(),
-            };
-        }
-    }
-    data
+    autoreleased_data(class, bytes)
 }
 
 /// `+[NSDictionary dictionaryWithContentsOfFile:]`.
@@ -422,10 +399,21 @@ unsafe extern "C" fn dictionary_with_contents_of_file(_class: Id, _sel: Sel, pat
 /// `NSPropertyListReadCorruptError` is `3840` - the last being the same number,
 /// with the same meaning, that `crate::json` already reports for a document that
 /// is not a readable plist.
+///
+/// Three more are needed by the *data* reader below, and they are the same
+/// enumeration at the read end rather than at the operation end:
+/// `NSFileReadInvalidFileNameError` is `258` and `NSFileReadNoSuchFileError` is
+/// `260`. `260` rather than `4` is what a **read** of a missing file reports -
+/// GNUstep's `getContentsOfFile` uses it, and so does
+/// `+[NSData dataWithContentsOfFile:options:error:]`. The two numbers name the
+/// same condition one level apart, and a caller switching on the code is
+/// switching on which call failed.
 mod cocoa {
     pub const FILE_NO_SUCH_FILE: i64 = 4;
     pub const FILE_READ_UNKNOWN: i64 = 256;
     pub const FILE_READ_NO_PERMISSION: i64 = 257;
+    pub const FILE_READ_INVALID_FILE_NAME: i64 = 258;
+    pub const FILE_READ_NO_SUCH_FILE: i64 = 260;
     pub const FILE_READ_UNSUPPORTED_SCHEME: i64 = 262;
     pub const PROPERTY_LIST_READ_CORRUPT: i64 = 3840;
 }
@@ -1051,6 +1039,342 @@ unsafe extern "C" fn dictionary_with_objects_for_keys_count(
     }
 }
 
+/// An autoreleased data object holding `bytes`, which every `+` constructor
+/// below answers.
+///
+/// **Whether it may be changed is the class it was sent to**, because all five
+/// of these constructors are declared on `NSData` and inherited by
+/// `NSMutableData`, so one method answers for both and only the receiver says
+/// which was asked for.  That is [`mutable_receiver`]'s argument, verbatim from
+/// the array: `+[NSMutableArray arrayWithObject:]` is the same case, and
+/// `+[NSMutableData data]` is a mutable data on a Mac for the same reason
+/// `+[NSMutableArray array]` is a mutable array - the constructor is
+/// `[[self alloc] init]` and `self` is what changed.
+fn autoreleased_data(class: Id, bytes: Vec<u8>) -> Id {
+    // SAFETY: a fresh object.
+    unsafe { api::CFAutorelease(new_data_for(class, bytes)) as Id }
+}
+
+/// A data object for a `+` constructor that `NSMutableData` inherits.
+///
+/// The two CoreFoundation constructors are `new_data` and `new_mutable_data`,
+/// the same pair `new_set` and `new_mutable_set` are; which one this call wants
+/// is decided here, beside [`mutable_receiver`], because the answer is a
+/// property of the *receiver class* and not of the bytes.
+fn new_data_for(class: Id, bytes: Vec<u8>) -> CFTypeRef {
+    match mutable_receiver(class, c"NSMutableData") {
+        true => collections::new_mutable_data(bytes),
+        false => collections::new_data(bytes),
+    }
+}
+
+/// `+[NSData data]`: an empty, autoreleased data object.
+///
+/// **Four sends in the guest** (`Framework+[0x3a92716, 0x3a92984, 0x68fde68,
+/// 0x68fe318)`), and all four load `_OBJC_CLASS_$_NSData` into `%rdi` first, so
+/// this is a class method; three of them call
+/// `_objc_retainAutoreleasedReturnValue` on the answer and the fourth tail-calls
+/// into a block that does the same, so an autoreleased answer is what the caller
+/// is built for.
+///
+/// (Three of the four have the selector load within a byte of the send; the
+/// fourth, `0x3a92984`, loads it into a stack slot at `0x3a92915` and sends it
+/// later, which is why a "selector load followed by a call inside 96 bytes"
+/// census reports three here and not four.)
+///
+/// Apple hands back a *shared* immutable empty instance, so two `+data` results
+/// are `==` there and are not here. Nothing in the guest can observe that - the
+/// only comparison available on an `NSData` in this runtime is `NSObject`'s
+/// pointer identity - and a process-lifetime object would be a claim about
+/// sharing that nothing here needs, so this answers a fresh empty one.
+unsafe extern "C" fn data_empty(class: Id, _sel: Sel) -> Id {
+    autoreleased_data(class, Vec::new())
+}
+
+/// `-initWithBytes:length:`, and the substitution `+alloc` on `NSData` needs.
+///
+/// **Six sends in the guest**, and every one of them is the same shape:
+/// `mov rdi, [_OBJC_CLASS_$_NSData]; call _objc_alloc` and then
+/// `-initWithBytes:length:` with `%rcx` computed as an end minus a begin
+/// (`0x7a1d00c: sub rcx,rdx` over `[r13+0x0]` and `[r13+0x8]`). So this is a
+/// class-cluster initialiser reached through `+alloc` on the abstract facade, and
+/// the lengths are real byte counts rather than constants - which is why the copy
+/// has to be exact and why a short one would be a silent corruption rather than a
+/// visible failure.
+///
+/// The two halves of the contract, from two independent implementations of it
+/// (GNUstep `NSData.m`'s `-initWithBytes:length:`, and swift-corelibs'
+/// `init(bytes:length:)`): the bytes are **copied**, and a **null pointer with a
+/// non-zero length is a named failure** - GNUstep raises
+/// `NSInvalidArgumentException` "called with length but null bytes". A null
+/// pointer with length zero is not a failure on either: there is nothing to copy.
+unsafe extern "C" fn data_init_with_bytes(
+    receiver: Id,
+    _sel: Sel,
+    bytes: *const u8,
+    length: usize,
+) -> Id {
+    if length > 0 && bytes.is_null() {
+        objc::fail!("-[NSData initWithBytes:length:]: {length} byte(s) asked for and no bytes");
+    }
+    // SAFETY: the caller says `bytes` covers `length` bytes, checked just above.
+    let copy = if length == 0 {
+        Vec::new()
+    } else {
+        unsafe { std::slice::from_raw_parts(bytes, length) }.to_vec()
+    };
+    // SAFETY: a data object - the `+alloc` placeholder is not one, and this is
+    // the cluster substitution the initialiser exists to perform.
+    let known = unsafe { collections::data(receiver as CFTypeRef) }.is_some();
+    // SAFETY: as above, with a fresh immutable copy of the caller's bytes.
+    unsafe { cluster_init(receiver, known, || collections::new_data(copy)) }
+}
+
+/// `-copyWithZone:`, which is also what `-[NSObject copy]` sends.
+///
+/// **The zone is ignored.** The one direct send in the guest passes nil
+/// (`Framework+0x79364e0: xor edx,edx`), and this runtime has no `NSZone` to
+/// honour - a zone chooses an allocator, and the storage behind an `NSData` here
+/// is a `Vec` that owns itself.
+///
+/// **The answer is the receiver for an immutable data and a new immutable one for
+/// a mutable data**, which is what Apple does, and it can be answered because
+/// the body carries the bit: `collections::DataContents::mutable`, the same field
+/// an array's `ArrayContents` has and for Apple's own stated reason - `CFData.h`
+/// declares *one* `__CFData` type, `const` in `CFDataRef` and not in
+/// `CFMutableDataRef`, so the distinction belongs to the reference and a runtime
+/// with one class has nowhere else to keep it. Two independent implementations
+/// agree on the split: GNUstep's `-copyWithZone:` returns `RETAIN(self)` and
+/// swift-corelibs' `copy(with:)` returns `self`, and both return a *new* object
+/// from `-mutableCopy`.
+///
+/// **Which branch the guest takes is measured, not assumed.** Its single
+/// `copyWithZone:` send is at `Framework+0x79364e3` - `call r13`, with `rsi`
+/// loaded from the selref at `0x79364d6` and `edx` cleared at `0x79364e0` - and
+/// its receiver `%rdi` is `%r12`, which `0x79364b3` set from
+/// `+[NSData dataWithBytes:length:]` sent at `0x79364a8` (`mov rdi,[rip+0xe6e72c0]`,
+/// which is `_OBJC_CLASS_$_NSData`). So the guest takes the **receiver** branch,
+/// and while there was no bit to read it was answered a fresh copy: the same
+/// bytes under a different object, and an O(n) copy where Apple is O(1).
+///
+/// The mutable branch is not reachable from this guest - the census note on
+/// `-mutableCopy` below says why - so what exercises it is the test, and what
+/// makes it *right* is that `CFDataCreateMutable` and the `+` constructors a
+/// guest can send to `NSMutableData` both produce a data with the bit set.
+unsafe extern "C" fn data_copy_with_zone(receiver: Id, _sel: Sel, _zone: *mut std::ffi::c_void) -> Id {
+    // SAFETY: a data object.
+    let Some(d) = (unsafe { collections::data_contents(receiver as CFTypeRef) }) else {
+        // A `+alloc` placeholder: an isa and no storage, so there is no
+        // mutability to read and no bytes to copy, and an empty data is what a
+        // copy of no bytes is. Not reachable from the guest, whose one site has
+        // a concrete data as its receiver.
+        return collections::new_data(Vec::new()) as Id;
+    };
+    // SAFETY: as above; the body is this runtime's.
+    if !d.mutable {
+        // **Not** autoreleased: `-copyWithZone:` is in the `copy`/`init`/`new`
+        // family, so the answer is +1 and belongs to the caller. The guest's one
+        // site uses the return value straight away with no
+        // `_objc_retainAutoreleasedReturnValue`, which is what a +1 answer looks
+        // like.
+        return objc::arc::retain(receiver);
+    }
+    // A mutable data's copy is a **new immutable** one, and the bytes are cloned
+    // rather than shared, so a later `-appendBytes:length:` on either object
+    // cannot reach the other.
+    collections::new_data(d.bytes.clone()) as Id
+}
+
+/// `-getBytes:length:`: the first `length` bytes into the caller's buffer.
+///
+/// **The bound is `min(length, self.length)`, and that is the contract rather
+/// than a convenience.** Two independent implementations of it agree, and they
+/// agree for a reason: `getBytes:length:` clamps *before* it forms the range it
+/// hands on, so it never reaches the range check that does raise.
+///
+/// * GNUstep `NSData.m`: "If length is greater than the size of the receiver,
+///   only the available bytes are copied", implemented as
+///   `[self getBytes: buffer range: NSMakeRange(0, l < length ? l : length)]`
+///   where `-getBytes:range:` is the one that does `GS_RANGE_CHECK` and raises;
+/// * swift-corelibs `NSData.swift`'s `getBytes(_:length:)`: `let actualCount =
+///   Swift.min(length, self.length)`.
+///
+/// **What Apple's own header adds, and what it does not.** `NSData.h` declares
+///
+/// ```objc
+/// - (void)getBytes:(void *)buffer length:(NSUInteger)length;
+/// - (void)getBytes:(void *)buffer range:(NSRange)range;
+/// - (void)getBytes:(void *)buffer NS_DEPRECATED("This method is unsafe because it
+///     could potentially cause buffer overruns. Use -getBytes:length: instead.");
+/// ```
+///
+/// and three things follow from those three lines. The deprecation says *why*
+/// the `length:` form exists: the one-argument form writes `self.length` bytes
+/// into a buffer the caller sized some other way, and the header calls that a
+/// buffer overrun - so **the caller owns the size**, which is the same statement
+/// as "clamp to what exists". The two spellings are both present, and only one of
+/// them can express a request that is *not* inside the data, so `range:` is the
+/// checked one. And `CFData.h` shows the layer the policy has to live at:
+/// `void CFDataGetBytes(CFDataRef theData, CFRange range, UInt8 *buffer)` - a
+/// **`CFRange`**, not a count - so `-[NSData getBytes:length:]` must form a range
+/// before it reaches CoreFoundation, and the clamp is what makes that range
+/// inside. (The header says none of this in prose. It says it in the two
+/// signatures and the one deprecation string, which is all there is.)
+///
+/// So the three cases are all distinguished, and none of them is a store past the
+/// end of the caller's buffer:
+///
+/// * **`length` at or below the data's** - `count` bytes are copied, which is what
+///   the caller sized its buffer for;
+/// * **`length` past the end** - what exists is copied and the caller is none the
+///   worse. Clamping is *not* a wrong answer here, and refusing would be: Apple's
+///   own implementations do not raise on this path, and a refusal would break a
+///   program that runs on a Mac. What would be a silent corruption is copying
+///   `length` bytes anyway, which is the mistake this spelling exists to rule out;
+/// * **`length` zero** - nothing is copied, **and a null buffer is fine**, because
+///   GNUstep's `-getBytes:range:` guards the whole copy with
+///   `if (aRange.length > 0)` and never touches `buffer` otherwise.
+///
+/// **The guest's one site sends *both* argument pairs, and the pair this
+/// implementation has to get right is the one that is not `(null, 0)`.** There is
+/// a single call instruction, at `Framework+0x7a1f094`
+/// (`call QWORD PTR [rip+0x6330f9e]`, the `_objc_msgSend` slot), and it has two
+/// predecessors that set `%rdx` and `%rcx`:
+///
+/// * `0x7a1f086` - `xor edx,edx; xor ecx,ecx`, a **null buffer and a zero
+///   length**. Reached by the `je` at `0x7a1efc2`, which jumps *to* the first
+///   `xor`, so this is the arm that does **not** fall through;
+/// * `0x7a1efd4` - `mov rdx,[rbp-0x50]; mov rcx,[rbp-0x48]; sub rcx,rdx; jmp
+///   0x7a1f08a`, a **real buffer and a real length** (`end - begin`, from the
+///   pair `call 0x4b2300` wrote at `0x7a1efc8`).
+///
+/// The receiver is `%r12`, and `0x7a1efa7` sets it from one of two answers, both
+/// of them a fresh `NSData`: `+[NSData dataWithBytes:length:]` at `0x7a1ef67`
+/// (two bytes holding a `shortValue`) or `-[NSString dataUsingEncoding:]` with
+/// `4` at `0x7a1ef99`. So the data's length and the length the caller asks for
+/// come from two unrelated computations, and **nothing in the binary says the
+/// second is the smaller** - which is precisely why the clamp is load-bearing
+/// here and an assumption would not be.
+///
+/// The remaining combination - a **null buffer with a non-zero length** - is the
+/// one case that cannot be honoured at all, and it is refused **by name** rather
+/// than turned into the `memcpy` from null that both implementations would
+/// perform. Of the two pairs above, only the first can be that combination if
+/// the function at `0x4b2300` honours its contract, so the refusal guards an
+/// input this guest's own code does not construct rather than a path it has; a
+/// null `begin` with a non-zero `end - begin` is not statically excluded.
+unsafe extern "C" fn data_get_bytes_length(
+    receiver: Id,
+    _sel: Sel,
+    buffer: *mut u8,
+    length: usize,
+) {
+    // SAFETY: a data object; a `+alloc` placeholder has no storage, and its
+    // `-length` is 0, so it clamps to 0 here too rather than inventing bytes.
+    let count = match unsafe { collections::data(receiver as CFTypeRef) } {
+        Some(bytes) => length.min(bytes.len()),
+        None => 0,
+    };
+    if count == 0 {
+        return;
+    }
+    if buffer.is_null() {
+        objc::fail!("-[NSData getBytes:length:]: {count} byte(s) asked for and no buffer to put them in");
+    }
+    // SAFETY: `count` is at most the receiver's own length, and the caller said
+    // the buffer holds `length` bytes, which is at least `count`.
+    unsafe { api::CFDataGetBytes(receiver as CFTypeRef, 0, count as isize, buffer) };
+}
+
+/// `+dataWithContentsOfFile:options:error:`, the spelling with the
+/// out-parameter.
+///
+/// **One send in the guest**, at `Framework+0x4fe0237`, and every half of the
+/// contract is readable off it:
+///
+/// * `mov QWORD PTR [rbp-0x80], 0x0` then `lea r8, [rbp-0x80]` - the caller
+///   pre-zeroes its own `NSError *` and then passes its address, so `*error` is
+///   read back after the call. It is written on **every** path here, with nil on
+///   success, rather than left to the caller's zero;
+/// * `xor ecx,ecx` - the options are **zero** at the only site, so no reading
+///   option is in use;
+/// * `_objc_retainAutoreleasedReturnValue` on the answer, so the answer is
+///   autoreleased;
+/// * `test r14, r14; je 0x4fe04c1` at `0x4fe0265` - **the result is nil-checked**
+///   before `-length` is sent to it and before it is handed to
+///   `+[NSKeyedUnarchiver initForReadingFromData:error:]`. So a truthful nil for a
+///   file that cannot be read is a path the guest has, not a crash.
+///
+/// The options are **not** honoured, and that is a statement about `what` rather
+/// than `how`: all four `NSDataReadingOptions` bits tune how the file is reached
+/// (cached, uncached, mapped), and the bytes answered are the file's either way.
+/// The one difference a caller could observe is `NSDataReadingMappedAlways`, whose
+/// answer on a Mac is backed by the mapping and so reflects a later change to the
+/// file; nothing in this runtime maps a file, so the answer is a snapshot.
+unsafe extern "C" fn data_with_contents_of_file_options(
+    class: Id,
+    _sel: Sel,
+    path: Id,
+    _options: u64,
+    error: *mut Id,
+) -> Id {
+    // A null out-parameter means the caller does not want to be told, and
+    // writing through it is a store to whatever that address happens to be.
+    let fail = |code: i64, message: String| -> Id {
+        if !error.is_null() {
+            // SAFETY: the caller said this is where the error goes, and
+            // `error::make` answers an autoreleased error this call owns.
+            unsafe { *error = crate::error::make("NSCocoaErrorDomain", code, &message) };
+        }
+        std::ptr::null_mut()
+    };
+    // Success writes nil through the out-parameter, which is the half of the
+    // contract a caller that inspects its own slot depends on.
+    let succeeded = |data: Id| -> Id {
+        if !error.is_null() {
+            // SAFETY: the caller said this is where the error goes, and there is
+            // none to report.
+            unsafe { *error = std::ptr::null_mut() };
+        }
+        data
+    };
+
+    // A path that is not a string, and a nil path, are the same failure and it is
+    // not "no such file": it is a name this call cannot even read. Read through
+    // `as_string` rather than `crate::string::bytes`, which answers an empty
+    // string for both and would report a nil path as a missing one.
+    // SAFETY: an `NSString` or null, both of which `as_string` answers for.
+    let Some(name) = (unsafe { corefoundation::string::as_string(path as CFTypeRef) }) else {
+        return fail(
+            cocoa::FILE_READ_INVALID_FILE_NAME,
+            "the path is null, or not a string".to_string(),
+        );
+    };
+    let name = name.utf8();
+    let Ok(name) = String::from_utf8(name) else {
+        return fail(
+            cocoa::FILE_READ_INVALID_FILE_NAME,
+            "the path is not text this runtime can spell".to_string(),
+        );
+    };
+    // The guest named it, so it is read at this host's spelling.
+    let bytes = match std::fs::read(prefix::ns::host_path(&name)) {
+        Ok(bytes) => bytes,
+        Err(problem) => {
+            // Each code names the condition that actually happened. A directory
+            // and a path that is not there are different failures and a caller
+            // switches on the code.
+            let code = match problem.kind() {
+                std::io::ErrorKind::NotFound => cocoa::FILE_READ_NO_SUCH_FILE,
+                std::io::ErrorKind::PermissionDenied => cocoa::FILE_READ_NO_PERMISSION,
+                _ => cocoa::FILE_READ_UNKNOWN,
+            };
+            return fail(code, format!("{name}: {problem}"));
+        }
+    };
+    succeeded(autoreleased_data(class, bytes))
+}
+
 unsafe extern "C" fn data_length(receiver: Id, _sel: Sel) -> usize {
     // SAFETY: a data object.
     unsafe { api::CFDataGetLength(receiver as CFTypeRef) as usize }
@@ -1061,273 +1385,109 @@ unsafe extern "C" fn data_bytes(receiver: Id, _sel: Sel) -> *const u8 {
     unsafe { api::CFDataGetBytePtr(receiver as CFTypeRef) }
 }
 
-unsafe extern "C" fn data_with_bytes(_class: Id, _sel: Sel, bytes: *const u8, length: usize) -> Id {
-    // SAFETY: the caller says `bytes` covers `length` bytes.
-    unsafe { api::CFAutorelease(api::CFDataCreate(std::ptr::null(), bytes, length as isize)) as Id }
+/// `+[NSData dataWithBytes:length:]`.
+///
+/// **Twenty-four sends in the guest** (23 in the Framework, 1 in `libGLESv2`),
+/// every one of them to `_OBJC_CLASS_$_NSData` as the receiver of a `+` method,
+/// and the lengths are real: `mov ecx,0x20` (32) at `0x79364a0`, `mov ecx,2` at
+/// `0x7a1ef62`, and a `lea rdx,[r12]` that names a caller-owned buffer. So the
+/// copy has to be exact in both directions.
+unsafe extern "C" fn data_with_bytes(class: Id, _sel: Sel, bytes: *const u8, length: usize) -> Id {
+    // `CFDataCreate`'s own answer for a null pointer and a non-zero length,
+    // which is null rather than a data of invented bytes.
+    if bytes.is_null() && length > 0 {
+        return std::ptr::null_mut();
+    }
+    // SAFETY: the caller says `bytes` covers `length` bytes, checked just above.
+    let copy = match length {
+        0 => Vec::new(),
+        _ => unsafe { std::slice::from_raw_parts(bytes, length) }.to_vec(),
+    };
+    autoreleased_data(class, copy)
 }
 
 /// `+[NSData dataWithBytesNoCopy:length:]` with an owned compatibility copy.
 ///
 /// CoreFoundation's data storage owns a `Vec`, so use the same compatibility
 /// behavior as `CFDataCreateWithBytesNoCopy` rather than borrowing guest memory.
+///
+/// **Not sent by this guest** - the selector has no `__objc_selrefs` slot in any
+/// of the 13 images and its name appears nowhere outside `__TEXT,__objc_methname`
+/// - so it is here because it is a declared `NSData` constructor and costs one
+/// row, not because anything needs it.
 unsafe extern "C" fn data_with_bytes_no_copy(
-    _class: Id,
+    class: Id,
     _sel: Sel,
     bytes: *const u8,
     length: usize,
 ) -> Id {
-    // SAFETY: the caller says `bytes` covers `length` bytes.
-    unsafe {
-        api::CFAutorelease(api::CFDataCreateWithBytesNoCopy(
-            std::ptr::null(),
-            bytes,
-            length as isize,
-            std::ptr::null(),
-        )) as Id
+    if bytes.is_null() && length > 0 {
+        return std::ptr::null_mut();
     }
-}
-
-/// The bytes of a data object, or empty for nil or anything else.
-///
-/// # Safety
-///
-/// `object` is nil or a live object.
-unsafe fn data_contents<'a>(object: Id) -> &'a [u8] {
-    match unsafe { collections::data(object as CFTypeRef) } {
-        Some(bytes) => bytes.as_slice(),
-        None => &[],
-    }
-}
-
-/// `bytes` for `length` bytes as a slice; empty for a null pointer.
-///
-/// # Safety
-///
-/// Non-null `bytes` covers `length` bytes.
-unsafe fn raw<'a>(bytes: *const u8, length: usize) -> &'a [u8] {
-    match bytes.is_null() || length == 0 {
-        true => &[],
-        false => unsafe { std::slice::from_raw_parts(bytes, length) },
-    }
-}
-
-/// Every `-init...` below answers a new object in place of the one `+alloc`
-/// made, as the string initialisers do: data here is a CoreFoundation object
-/// whatever class was asked for, and one class serves both mutabilities.
-fn replace_receiver(receiver: Id, bytes: Vec<u8>) -> Id {
-    objc::arc::release(receiver);
-    collections::new_data(bytes) as Id
-}
-
-fn autoreleased_data(bytes: Vec<u8>) -> Id {
-    // SAFETY: a fresh object.
-    unsafe { api::CFAutorelease(collections::new_data(bytes)) as Id }
-}
-
-unsafe extern "C" fn data_init(receiver: Id, _sel: Sel) -> Id {
-    replace_receiver(receiver, Vec::new())
-}
-
-unsafe extern "C" fn data_init_with_data(receiver: Id, _sel: Sel, other: Id) -> Id {
-    // SAFETY: a data object or nil.
-    replace_receiver(receiver, unsafe { data_contents(other) }.to_vec())
-}
-
-unsafe extern "C" fn data_init_with_bytes(receiver: Id, _sel: Sel, bytes: *const u8, length: usize) -> Id {
-    // SAFETY: the caller says `bytes` covers `length` bytes.
-    replace_receiver(receiver, unsafe { raw(bytes, length) }.to_vec())
-}
-
-/// `-initWithBytesNoCopy:length:freeWhenDone:`. Copied, as
-/// [`data_with_bytes_no_copy`] explains, and the caller's buffer released
-/// now when it handed it over.
-unsafe extern "C" fn data_init_no_copy_free(
-    receiver: Id,
-    _sel: Sel,
-    bytes: *mut u8,
-    length: usize,
-    free: bool,
-) -> Id {
-    // SAFETY: the caller says `bytes` covers `length` bytes.
-    let copy = unsafe { raw(bytes, length) }.to_vec();
-    if free && !bytes.is_null() {
-        // SAFETY: a `malloc` block the caller gave away.
-        unsafe { darwin::heap::free(bytes.cast()) };
-    }
-    replace_receiver(receiver, copy)
-}
-
-unsafe extern "C" fn data_init_no_copy(receiver: Id, sel: Sel, bytes: *mut u8, length: usize) -> Id {
-    // SAFETY: forwarded; `-initWithBytesNoCopy:length:` frees when done.
-    unsafe { data_init_no_copy_free(receiver, sel, bytes, length, true) }
-}
-
-unsafe extern "C" fn data_init_with_contents_of_file(receiver: Id, sel: Sel, path: Id) -> Id {
-    objc::arc::release(receiver);
-    // SAFETY: forwarded; the answer is autoreleased, and `-init` answers +1.
-    objc::arc::retain(unsafe { data_with_contents_of_file(receiver, sel, path) })
-}
-
-unsafe extern "C" fn data_init_with_capacity(receiver: Id, _sel: Sel, capacity: usize) -> Id {
-    replace_receiver(receiver, Vec::with_capacity(capacity.min(1 << 24)))
-}
-
-unsafe extern "C" fn data_init_with_length(receiver: Id, _sel: Sel, length: usize) -> Id {
-    replace_receiver(receiver, vec![0; length])
-}
-
-unsafe extern "C" fn data_empty(_class: Id, _sel: Sel) -> Id {
-    autoreleased_data(Vec::new())
-}
-
-unsafe extern "C" fn data_with_data(_class: Id, _sel: Sel, other: Id) -> Id {
-    // SAFETY: a data object or nil.
-    autoreleased_data(unsafe { data_contents(other) }.to_vec())
-}
-
-unsafe extern "C" fn data_with_capacity(_class: Id, _sel: Sel, capacity: usize) -> Id {
-    autoreleased_data(Vec::with_capacity(capacity.min(1 << 24)))
-}
-
-unsafe extern "C" fn data_with_length(_class: Id, _sel: Sel, length: usize) -> Id {
-    autoreleased_data(vec![0; length])
-}
-
-unsafe extern "C" fn data_copy(receiver: Id, _sel: Sel) -> Id {
-    // SAFETY: a data object.
-    collections::new_data(unsafe { data_contents(receiver) }.to_vec()) as Id
-}
-
-unsafe extern "C" fn data_copy_with_zone(receiver: Id, sel: Sel, _zone: *mut std::ffi::c_void) -> Id {
-    // SAFETY: forwarded.
-    unsafe { data_copy(receiver, sel) }
-}
-
-unsafe extern "C" fn data_is_equal(receiver: Id, _sel: Sel, other: Id) -> bool {
-    // SAFETY: a data object, and nil or a live object; anything that is not
-    // data is not equal.
-    let Some(theirs) = (unsafe { collections::data(other as CFTypeRef) }) else {
-        return false;
+    // SAFETY: the caller says `bytes` covers `length` bytes, checked just above.
+    let copy = match length {
+        0 => Vec::new(),
+        _ => unsafe { std::slice::from_raw_parts(bytes, length) }.to_vec(),
     };
-    (unsafe { data_contents(receiver) }) == theirs.as_slice()
+    autoreleased_data(class, copy)
 }
 
-unsafe extern "C" fn data_hash(receiver: Id, _sel: Sel) -> usize {
-    use std::hash::{Hash, Hasher};
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    // SAFETY: a data object.
-    unsafe { data_contents(receiver) }.hash(&mut hasher);
-    hasher.finish() as usize
-}
-
-unsafe extern "C" fn data_get_bytes_length(receiver: Id, _sel: Sel, out: *mut u8, length: usize) {
-    // SAFETY: a data object.
-    let bytes = unsafe { data_contents(receiver) };
-    let count = length.min(bytes.len());
-    if !out.is_null() {
-        // SAFETY: the caller says `out` holds `length` bytes.
-        unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), out, count) };
-    }
-}
-
-unsafe extern "C" fn data_get_bytes(receiver: Id, sel: Sel, out: *mut u8) {
-    // SAFETY: the caller's buffer holds the whole of the data.
-    let length = unsafe { data_contents(receiver) }.len();
-    unsafe { data_get_bytes_length(receiver, sel, out, length) };
-}
-
-/// The bytes `location..location+length`, or `NSRangeException` by name.
+/// `-[NSMutableData appendBytes:length:]`, and the one place the mutability bit
+/// is *enforced*.
 ///
-/// # Safety
+/// Apple declares it on `NSMutableData` alone, and a data that is not mutable is
+/// not entitled to answer it at all.  Here it is reachable from an immutable one
+/// - `__NSCFData` descends from `NSMutableData`, or a guest's `isKindOfClass:`
+/// would be wrong - so the bit is what decides, and a data without it is refused
+/// **by name** rather than quietly grown.  That is the array's convention
+/// (`immutable("NSArray", "addObject:")`) and Apple's own behaviour: on a Mac the
+/// message raises `NSInvalidArgumentException`.
 ///
-/// `receiver` is a data object.
-unsafe fn data_range<'a>(receiver: Id, location: usize, length: usize, what: &str) -> &'a [u8] {
-    let bytes = unsafe { data_contents(receiver) };
-    match location.checked_add(length).filter(|end| *end <= bytes.len()) {
-        Some(end) => &bytes[location..end],
-        None => objc::fail!(
-            "{what}: range {{{location}, {length}}} exceeds data length {}",
-            bytes.len()
-        ),
-    }
-}
-
-unsafe extern "C" fn data_get_bytes_range(
-    receiver: Id,
-    _sel: Sel,
-    out: *mut u8,
-    location: usize,
-    length: usize,
-) {
-    // SAFETY: a data object.
-    let bytes = unsafe { data_range(receiver, location, length, "-getBytes:range:") };
-    if !out.is_null() {
-        // SAFETY: the caller says `out` holds `length` bytes.
-        unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), out, bytes.len()) };
-    }
-}
-
-unsafe extern "C" fn data_subdata(receiver: Id, _sel: Sel, location: usize, length: usize) -> Id {
-    // SAFETY: a data object.
-    autoreleased_data(unsafe { data_range(receiver, location, length, "-subdataWithRange:") }.to_vec())
-}
-
-unsafe extern "C" fn data_set_length(receiver: Id, _sel: Sel, length: usize) {
-    // SAFETY: a data object.
-    if let Some(bytes) = unsafe { collections::data(receiver as CFTypeRef) } {
-        bytes.resize(length, 0);
-    }
-}
-
-unsafe extern "C" fn data_increase_length(receiver: Id, _sel: Sel, extra: usize) {
-    // SAFETY: a data object.
-    if let Some(bytes) = unsafe { collections::data(receiver as CFTypeRef) } {
-        let length = bytes.len().saturating_add(extra);
-        bytes.resize(length, 0);
-    }
-}
-
-unsafe extern "C" fn data_append_data(receiver: Id, _sel: Sel, other: Id) {
-    // SAFETY: data objects; copied first, since `other` may be the receiver.
-    let theirs = unsafe { data_contents(other) }.to_vec();
-    if let Some(bytes) = unsafe { collections::data(receiver as CFTypeRef) } {
-        bytes.extend_from_slice(&theirs);
-    }
-}
-
-unsafe extern "C" fn data_replace_bytes(
-    receiver: Id,
-    _sel: Sel,
-    location: usize,
-    length: usize,
-    with: *const u8,
-) {
-    // SAFETY: a data object; `with` covers `length` bytes by contract.
-    unsafe { data_range(receiver, location, length, "-replaceBytesInRange:withBytes:") };
-    let replacement = unsafe { raw(with, length) }.to_vec();
-    if let Some(bytes) = unsafe { collections::data(receiver as CFTypeRef) } {
-        bytes[location..location + length].copy_from_slice(&replacement);
-    }
-}
-
-unsafe extern "C" fn data_reset_bytes(receiver: Id, _sel: Sel, location: usize, length: usize) {
-    // SAFETY: a data object.
-    unsafe { data_range(receiver, location, length, "-resetBytesInRange:") };
-    if let Some(bytes) = unsafe { collections::data(receiver as CFTypeRef) } {
-        bytes[location..location + length].fill(0);
-    }
-}
-
+/// **Not sent by this guest**: `appendBytes:length:` has no `__objc_selrefs` slot
+/// in any of the 13 images, no RIP-relative reference to one from any section, and
+/// its name appears nowhere outside `__TEXT,__objc_methname` - so it cannot even
+/// be built at run time through `NSSelectorFromString`, which this Framework does
+/// import.  So this refusal cannot break a live path, and leaving the write
+/// unguarded could not have helped one either.
 unsafe extern "C" fn append_bytes(receiver: Id, _sel: Sel, bytes: *const u8, length: usize) {
     // SAFETY: a data object.
-    let Some(d) = (unsafe { collections::data(receiver as CFTypeRef) }) else {
+    let Some(d) = (unsafe { collections::data_contents(receiver as CFTypeRef) }) else {
         return;
     };
+    if !d.mutable {
+        immutable("NSMutableData", "appendBytes:length:");
+    }
     if bytes.is_null() {
         return;
     }
     // SAFETY: the caller says `bytes` covers `length` bytes.
-    d.extend_from_slice(unsafe { std::slice::from_raw_parts(bytes, length) });
+    d.bytes
+        .extend_from_slice(unsafe { std::slice::from_raw_parts(bytes, length) });
+}
+
+/// `-[NSMutableData mutableBytes]`, which is a `void *` **into** the receiver.
+///
+/// The writeable counterpart of `-bytes`, so it is the second thing the bit has
+/// to guard: handing out a pointer into an immutable data's storage would let a
+/// caller change a data this runtime has already said cannot change, silently.
+///
+/// Apple declares it on `NSMutableData` alone, so an immutable data refuses it
+/// **by name** for the same reason `-appendBytes:length:` does.  Not sent by this
+/// guest either - `mutableBytes` has a `__objc_methname` string and **no**
+/// `__objc_selrefs` slot in any of the 13 images.
+unsafe extern "C" fn mutable_bytes(receiver: Id, _sel: Sel) -> *mut u8 {
+    // SAFETY: a data object.
+    let Some(d) = (unsafe { collections::data_contents(receiver as CFTypeRef) }) else {
+        return std::ptr::null_mut();
+    };
+    if !d.mutable {
+        immutable("NSMutableData", "mutableBytes");
+    }
+    // An empty data has no byte to point at, and `Vec::as_mut_ptr` on a `Vec`
+    // that never allocated is address 1 - a pointer a caller may write to and
+    // corrupt the heap with. Null is what `CFDataGetMutableBytePtr` answers for
+    // the same case, and a null is a thing a caller checks.
+    d.bytes.as_mut_ptr()
 }
 
 unsafe extern "C" fn int_value(receiver: Id, _sel: Sel) -> i32 {
@@ -1419,43 +1579,6 @@ unsafe extern "C" fn number_with_integer(_class: Id, _sel: Sel, value: i64) -> I
     unsafe {
         api::CFAutorelease(collections::new_number(collections::Number::Integer(value))) as Id
     }
-}
-
-/// The unsigned 64-bit constructors. A value past `i64::MAX` is kept as its bit
-/// pattern, which `-unsignedLongLongValue` reads back unchanged.
-unsafe extern "C" fn number_with_unsigned_long(class: Id, sel: Sel, value: u64) -> Id {
-    // SAFETY: the same receiver and selector, forwarded.
-    unsafe { number_with_integer(class, sel, value as i64) }
-}
-
-unsafe extern "C" fn number_with_unsigned_int(class: Id, sel: Sel, value: u32) -> Id {
-    // SAFETY: as above.
-    unsafe { number_with_integer(class, sel, i64::from(value)) }
-}
-
-unsafe extern "C" fn number_with_short(class: Id, sel: Sel, value: i16) -> Id {
-    // SAFETY: as above.
-    unsafe { number_with_int(class, sel, i32::from(value)) }
-}
-
-unsafe extern "C" fn number_with_unsigned_short(class: Id, sel: Sel, value: u16) -> Id {
-    // SAFETY: as above.
-    unsafe { number_with_int(class, sel, i32::from(value)) }
-}
-
-unsafe extern "C" fn number_with_char(class: Id, sel: Sel, value: i8) -> Id {
-    // SAFETY: as above.
-    unsafe { number_with_int(class, sel, i32::from(value)) }
-}
-
-unsafe extern "C" fn number_with_unsigned_char(class: Id, sel: Sel, value: u8) -> Id {
-    // SAFETY: as above.
-    unsafe { number_with_int(class, sel, i32::from(value)) }
-}
-
-unsafe extern "C" fn number_with_float(class: Id, sel: Sel, value: f32) -> Id {
-    // SAFETY: as above.
-    unsafe { number_with_double(class, sel, f64::from(value)) }
 }
 
 unsafe extern "C" fn number_with_double(_class: Id, _sel: Sel, value: f64) -> Id {
@@ -1615,20 +1738,163 @@ unsafe extern "C" fn set_any_object(receiver: Id, _sel: Sel) -> Id {
         .map_or(std::ptr::null_mut(), |value| value as Id)
 }
 
+/// `+[NSMutableSet new]`, and what `[[NSMutableSet alloc] init]` substitutes to.
+///
+/// The guest's own source for the set it builds at start-up is
+/// `chrome/browser/web_applications/os_integration/mac/app_shim_termination_observer.mm`:
+///
+/// ```objc
+/// + (NSMutableSet<AppShimTerminationObserver*>*)allObservers {
+///   static NSMutableSet<AppShimTerminationObserver*>* set = [NSMutableSet set];
+///   return set;
+/// }
+/// ```
+///
+/// and the compiled form is `mov rdi, [rip+_OBJC_CLASS_$_NSMutableSet];
+/// mov rsi, [rip@"set"]; call objc_msgSend` - a single message to the *class*,
+/// with no `objc_alloc` in between, at `Framework+0x46f15f3` and
+/// `Framework+0x8158783`. `Foundation has no +set`, so that message refuses by
+/// name here rather than answering a value; the other five sites for this class
+/// are the ordinary `[[NSMutableSet alloc] init]`, compiled as
+/// `mov rdi, [rip+class]; call _objc_alloc_init`, and those are what this answers.
+unsafe extern "C" fn new_set(_class: Id, _sel: Sel) -> Id {
+    collections::new_mutable_set(Policy::from_type_callbacks()) as Id
+}
+
+/// `-[NSMutableSet init]`, the class-cluster substitution.
+///
+/// `+alloc` on `NSMutableSet` answers an instance of the abstract facade -
+/// an `isa` and nothing else - because that is all an abstract class has room
+/// for, and the contents live on the concrete `__NSCFSet` this module's
+/// `mutable_pair` registers. A placeholder handed straight back answers empty to
+/// every question and swallows every write, silently: nothing about it is wrong
+/// enough to fail on, and the program carries on with a set that never fills.
+/// Apple's clusters substitute here too, which is why `-init` is documented
+/// there as returning "an object other than the receiver".
+unsafe extern "C" fn init_mutable_set(receiver: Id, _sel: Sel) -> Id {
+    // SAFETY: an object of this class.
+    let known = unsafe { collections::set(receiver as CFTypeRef) }.is_some();
+    // SAFETY: as `cluster_init`'s.
+    unsafe { cluster_init(receiver, known, new_set_receiver) }
+}
+
+/// `cluster_init` wants a `CFTypeRef`; `+new` is written for a receiver.
+fn new_set_receiver() -> corefoundation::base::CFTypeRef {
+    // SAFETY: a fresh object.
+    unsafe { api::CFAutorelease(collections::new_mutable_set(Policy::from_type_callbacks())) }
+}
+
+/// `-[NSMutableSet initWithCapacity:]`, where the capacity is a hint this store
+/// has no use for.
+unsafe extern "C" fn init_mutable_set_with_capacity(receiver: Id, _sel: Sel, _capacity: usize) -> Id {
+    // SAFETY: identical to `-init`; the argument is ignored.
+    unsafe { init_mutable_set(receiver, std::ptr::null_mut()) }
+}
+
+/// `-[NSSet init]`, the same substitution on the immutable side.
+unsafe extern "C" fn init_set(receiver: Id, _sel: Sel) -> Id {
+    // SAFETY: an object of this class.
+    let known = unsafe { collections::set(receiver as CFTypeRef) }.is_some();
+    // SAFETY: as `cluster_init`'s.
+    unsafe {
+        cluster_init(receiver, known, || {
+            api::CFAutorelease(collections::new_set(&[], Policy::from_type_callbacks()))
+        })
+    }
+}
+
+/// `+setWithArray:`, which is how the guest makes the immutable one it sends
+/// `setWithObject:` to a peer: `+[NSSet setWithObject:]` at
+/// `Framework+0x3a8a3d4`, inside `-[RenderWidgetHostViewCocoa makeTouchBar]`.
+unsafe extern "C" fn set_with_array(_class: Id, _sel: Sel, array: Id) -> Id {
+    let values: Vec<CFTypeRef> = match unsafe { collections::array(array as CFTypeRef) } {
+        // SAFETY: a set made here copies what it is given.
+        Some(a) => a.values.clone(),
+        None => {
+            if array.is_null() {
+                Vec::new()
+            } else {
+                // A named refusal rather than an empty set: the argument was
+                // not an array, and answering empty would look like a set that
+                // legitimately holds nothing.
+                objc::fail!("+[NSSet setWithArray:]: the argument is not an array");
+            }
+        }
+    };
+    // SAFETY: a fresh object.
+    unsafe { api::CFAutorelease(collections::new_set(&values, Policy::from_type_callbacks())) as Id }
+}
+
+/// `-[NSMutableSet removeObject:]`.
+unsafe extern "C" fn set_remove_object(receiver: Id, _sel: Sel, object: Id) {
+    // SAFETY: a set.
+    let Some(set) = (unsafe { collections::set(receiver as CFTypeRef) }) else {
+        return;
+    };
+    let object = object as CFTypeRef;
+    let mut removed = Vec::new();
+    set.values.retain(|value| {
+        let equal = set.policy.equal(*value, object);
+        if equal {
+            removed.push(*value);
+        }
+        !equal
+    });
+    // Released outside the borrow: an equality callback can run arbitrary guest
+    // code, and this one runs after the set's own storage has been shortened.
+    for value in removed {
+        set.policy.release(value);
+    }
+}
+
+/// `-[NSMutableSet removeAllObjects]`.
+unsafe extern "C" fn set_remove_all_objects(receiver: Id, _sel: Sel) {
+    // SAFETY: a set.
+    let Some(set) = (unsafe { collections::set(receiver as CFTypeRef) }) else {
+        return;
+    };
+    let drained: Vec<CFTypeRef> = set.values.drain(..).collect();
+    for value in drained {
+        set.policy.release(value);
+    }
+}
+
+/// `-[NSMutableSet copy]`, which the guest's `NSSpeechSynthesizer` path reaches
+/// through `-mutableCopy` on an immutable set.
+unsafe extern "C" fn set_mutable_copy(receiver: Id, _sel: Sel) -> Id {
+    // SAFETY: a set.
+    let Some(set) = (unsafe { collections::set(receiver as CFTypeRef) }) else {
+        return std::ptr::null_mut();
+    };
+    let values = set.values.clone();
+    // SAFETY: a fresh object.
+    unsafe { api::CFAutorelease(collections::new_set(&values, Policy::from_type_callbacks())) as Id }
+}
+
 pub(crate) fn install() {
     let set = objc::class::lookup(c"NSSet").expect("CoreFoundation registered NSSet");
     class_methods!(set, {
         "setWithObject:" => set_with_object, c"@24@0:8@16";
         "setWithCapacity:" => set_with_capacity, c"@24@0:8Q16";
+        "setWithArray:" => set_with_array, c"@24@0:8@16";
     });
     methods!(set, {
+        "init" => init_set, c"@16@0:8";
         "count" => set_count, c"Q16@0:8";
         "containsObject:" => set_contains_object, c"B24@0:8@16";
         "anyObject" => set_any_object, c"@16@0:8";
     });
     let mutable_set = objc::class::lookup(c"NSMutableSet").expect("NSMutableSet");
+    class_methods!(mutable_set, {
+        "new" => new_set, c"@16@0:8";
+    });
     methods!(mutable_set, {
+        "init" => init_mutable_set, c"@16@0:8";
+        "initWithCapacity:" => init_mutable_set_with_capacity, c"@24@0:8Q16";
         "addObject:" => set_add_object, c"v24@0:8@16";
+        "removeObject:" => set_remove_object, c"v24@0:8@16";
+        "removeAllObjects" => set_remove_all_objects, c"v16@0:8";
+        "mutableCopy" => set_mutable_copy, c"@16@0:8";
     });
 
     let array = objc::class::lookup(c"NSArray").expect("CoreFoundation registered NSArray");
@@ -1719,8 +1985,47 @@ pub(crate) fn install() {
     methods!(data, {
         "length" => data_length, c"Q16@0:8";
         "bytes" => data_bytes, c"^v16@0:8";
+        // Three of the instance methods a merge dropped, restored because the
+        // guest's own `__objc_selrefs` name them: each is reached either through
+        // `+alloc` on `NSData` or through `NSObject`'s `-copy`. Each function's
+        // doc comment carries the send sites it was measured at. The `data_census`
+        // test at the bottom of this file prints the whole table, so the next
+        // person can diff it rather than trust this comment.
+        //
+        // **What is deliberately *not* here, and why** - the census over all 13
+        // guest images, counting a selector's `__objc_selrefs` loads and the
+        // loads followed by a message send, then resolving the receiver's class
+        // at every site by disassembly:
+        //
+        // | selector | loads | sends | whose |
+        // |---|---|---|---|
+        // | `initWithBytes:length:` | 8 | 8 | all `+[NSData alloc]`, 6 direct and 2 through a stack-hoisted selector |
+        // | `getBytes:length:` | 1 | 1 | one site, two argument pairs |
+        // | `copyWithZone:` | 1 | 1 | one site, an immutable receiver |
+        // | `data` | 4 | 4 | all `+[NSData data]` |
+        // | `dataWithBytes:length:` | 24 | 24 | all `+[NSData …]` |
+        // | `dataWithContentsOfFile:` | 1 | 1 | `_OBJC_CLASS_$_NSData` |
+        // | `dataWithContentsOfFile:options:error:` | 1 | 1 | `_OBJC_CLASS_$_NSData` |
+        // | `initWithCapacity:` | 7 | 7 | **6 `NSMutableArray`, 1 `NSMutableDictionary`, 0 data** |
+        // | `mutableCopy` | 11 | 9 | **arrays, a dictionary, a paragraph style, a window - 0 data** |
+        // | `initWithData:` | 2 | 2 | **`NSImage` and `NSBitmapImageRep`, 0 data** |
+        // | `appendBytes:length:`, `mutableBytes`, `setData:`, `increaseLengthBy:`, `dataWithCapacity:`, `dataWithLength:`, `isEqualToData:`, `subdataWithRange:`, `dataWithData:`, `writeToFile:options:error:`, `getBytes:range:`, `initWithBytesNoCopy:length:`, `setLength:` | 0 | 0 | nothing, and no name outside `__objc_methname` to build one from |
+        //
+        // So `-[NSMutableData initWithCapacity:]`, `+[NSMutableData dataWithCapacity:]`
+        // and `-[NSMutableData mutableCopy]` are **not** installed: the first two
+        // because the 7 and the 0 are other classes' selectors, the third because
+        // all nine `mutableCopy` sends are on something else. Installing them
+        // would be code nothing sends, outliving the reason it was written.
+        "initWithBytes:length:" => data_init_with_bytes, c"@32@0:8r^v16Q24";
+        "getBytes:length:" => data_get_bytes_length, c"v32@0:8^v16Q24";
+        "copyWithZone:" => data_copy_with_zone, c"@24@0:8^v16";
     });
     class_methods!(data, {
+        // The two `+` methods restored here, measured at four and one guest send
+        // respectively; see their doc comments. Every one of these five is
+        // declared on `NSData` and inherited by `NSMutableData`, so each takes
+        // its mutability from the receiver class - `new_data_for`.
+        "data" => data_empty, c"@16@0:8";
         "dataWithBytes:length:" => data_with_bytes, c"@32@0:8^v16Q24";
         "dataWithBytesNoCopy:length:" => data_with_bytes_no_copy, c"@32@0:8^v16Q24";
         "dataWithContentsOfFile:" => data_with_contents_of_file, c"@24@0:8@16";
@@ -1729,42 +2034,13 @@ pub(crate) fn install() {
     });
     methods!(data, {
         "writeToFile:atomically:" => write_to_file, c"B28@0:8@16c24";
-        "init" => data_init, c"@16@0:8";
-        "initWithData:" => data_init_with_data, c"@24@0:8@16";
-        "initWithBytes:length:" => data_init_with_bytes, c"@32@0:8r^v16Q24";
-        "initWithBytesNoCopy:length:" => data_init_no_copy, c"@32@0:8^v16Q24";
-        "initWithBytesNoCopy:length:freeWhenDone:" => data_init_no_copy_free, c"@36@0:8^v16Q24B32";
-        "initWithContentsOfFile:" => data_init_with_contents_of_file, c"@24@0:8@16";
-        "copy" => data_copy, c"@16@0:8";
-        "copyWithZone:" => data_copy_with_zone, c"@24@0:8^v16";
-        "mutableCopy" => data_copy, c"@16@0:8";
-        "mutableCopyWithZone:" => data_copy_with_zone, c"@24@0:8^v16";
-        "isEqual:" => data_is_equal, c"B24@0:8@16";
-        "isEqualToData:" => data_is_equal, c"B24@0:8@16";
-        "hash" => data_hash, c"Q16@0:8";
-        "getBytes:" => data_get_bytes, c"v24@0:8^v16";
-        "getBytes:length:" => data_get_bytes_length, c"v32@0:8^v16Q24";
-        "getBytes:range:" => data_get_bytes_range, c"v40@0:8^v16{_NSRange=QQ}24";
-        "subdataWithRange:" => data_subdata, c"@32@0:8{_NSRange=QQ}16";
-    });
-    class_methods!(data, {
-        "data" => data_empty, c"@16@0:8";
-        "dataWithData:" => data_with_data, c"@24@0:8@16";
     });
     methods!(mutable_data, {
+        // Both of these are declared on `NSMutableData` alone and both refuse an
+        // immutable data by name; see their doc comments for why the guest's
+        // silence about them is a measurement rather than an omission.
         "appendBytes:length:" => append_bytes, c"v32@0:8^v16Q24";
-        "mutableBytes" => data_bytes, c"^v16@0:8";
-        "initWithCapacity:" => data_init_with_capacity, c"@24@0:8Q16";
-        "initWithLength:" => data_init_with_length, c"@24@0:8Q16";
-        "setLength:" => data_set_length, c"v24@0:8Q16";
-        "increaseLengthBy:" => data_increase_length, c"v24@0:8Q16";
-        "appendData:" => data_append_data, c"v24@0:8@16";
-        "replaceBytesInRange:withBytes:" => data_replace_bytes, c"v40@0:8{_NSRange=QQ}16r^v32";
-        "resetBytesInRange:" => data_reset_bytes, c"v32@0:8{_NSRange=QQ}16";
-    });
-    class_methods!(mutable_data, {
-        "dataWithCapacity:" => data_with_capacity, c"@24@0:8Q16";
-        "dataWithLength:" => data_with_length, c"@24@0:8Q16";
+        "mutableBytes" => mutable_bytes, c"^v16@0:8";
     });
 
     let number = objc::class::lookup(c"NSNumber").expect("CoreFoundation registered NSNumber");
@@ -1794,16 +2070,6 @@ pub(crate) fn install() {
         "numberWithLongLong:" => number_with_integer, c"@24@0:8q16";
         "numberWithDouble:" => number_with_double, c"@24@0:8d16";
         "numberWithBool:" => number_with_bool, c"@24@0:8B16";
-<<<<<<< HEAD
-        "numberWithUnsignedInteger:" => number_with_unsigned_long, c"@24@0:8Q16";
-        "numberWithUnsignedLong:" => number_with_unsigned_long, c"@24@0:8Q16";
-        "numberWithUnsignedLongLong:" => number_with_unsigned_long, c"@24@0:8Q16";
-        "numberWithUnsignedInt:" => number_with_unsigned_int, c"@24@0:8I16";
-        "numberWithShort:" => number_with_short, c"@24@0:8s16";
-        "numberWithUnsignedShort:" => number_with_unsigned_short, c"@24@0:8S16";
-        "numberWithChar:" => number_with_char, c"@24@0:8c16";
-        "numberWithUnsignedChar:" => number_with_unsigned_char, c"@24@0:8C16";
-=======
         // The unsigned spellings, each with the width its call site loads. The
         // guest sends `numberWithUnsignedInt:`, `numberWithUnsignedLong:`,
         // `numberWithUnsignedInteger:`, `numberWithFloat:` and
@@ -1815,7 +2081,6 @@ pub(crate) fn install() {
         "numberWithUnsignedLong:" => number_with_unsigned_long, c"@24@0:8Q16";
         "numberWithUnsignedLongLong:" => number_with_unsigned_long, c"@24@0:8Q16";
         "numberWithUnsignedInteger:" => number_with_unsigned_long, c"@24@0:8Q16";
->>>>>>> d861fbb (wtv)
         "numberWithFloat:" => number_with_float, c"@24@0:8f16";
     });
 }
@@ -2142,5 +2407,607 @@ mod tier1_tests {
         let types = unsafe { std::ffi::CStr::from_ptr(method.types()) };
         assert_eq!(types, c"@32@0:8@16^@24");
         assert!(!method.implementation().is_null());
+    }
+
+    /// `[[NSMutableSet alloc] init]` is what five of the guest's six sites for
+    /// this class compile to, so it has to return something that holds what is
+    /// put in it.
+    ///
+    /// The write-then-read is the whole test. `+alloc` on the abstract facade
+    /// answers an object with an `isa` and nothing else; if `-init` handed that
+    /// back, `-addObject:` would find no contents, return early, and the program
+    /// would carry on with a set that silently never fills - which is why the
+    /// substitution has to be here and not merely plausible.
+    #[test]
+    fn a_guest_built_mutable_set_holds_what_is_added_to_it() {
+        crate::bootstrap();
+        // SAFETY: each prototype is the one its selector declares.
+        unsafe {
+            let send0: unsafe extern "C" fn(Id, Sel) -> Id = std::mem::transmute(objc::msg::entry());
+            let send1: unsafe extern "C" fn(Id, Sel, Id) = std::mem::transmute(objc::msg::entry());
+            let count: unsafe extern "C" fn(Id, Sel) -> usize = std::mem::transmute(objc::msg::entry());
+            let contains: unsafe extern "C" fn(Id, Sel, Id) -> bool =
+                std::mem::transmute(objc::msg::entry());
+
+            let set = send0(
+                send0(
+                    objc::class::ptr(objc::class::lookup(c"NSMutableSet").unwrap()) as Id,
+                    objc::sel::get("alloc"),
+                ),
+                objc::sel::get("init"),
+            );
+            assert!(!set.is_null());
+            let element = crate::string::from_str("AppShimTerminationObserver");
+            send1(set, objc::sel::get("addObject:"), element);
+            assert_eq!(count(set, objc::sel::get("count")), 1);
+            assert!(contains(set, objc::sel::get("containsObject:"), element));
+
+            send1(set, objc::sel::get("removeObject:"), element);
+            assert_eq!(
+                count(set, objc::sel::get("count")),
+                0,
+                "-removeObject: left the element in place"
+            );
+            send1(set, objc::sel::get("addObject:"), element);
+            send0(set, objc::sel::get("removeAllObjects"));
+            assert_eq!(count(set, objc::sel::get("count")), 0);
+        }
+    }
+
+    /// `+[NSMutableSet new]` and `-[NSMutableSet initWithCapacity:]` both hand
+    /// back a set that will hold what is put in it, which is what the guest's
+    /// `allObservers` static is built from.
+    ///
+    /// `initWithCapacity:` is sent to an *instance*: it is the initialiser, not
+    /// a convenience constructor, and sending it to the class would look for it
+    /// on the metaclass.
+    #[test]
+    fn a_mutable_set_from_new_and_from_capacity_are_the_same_kind_of_thing() {
+        crate::bootstrap();
+        // SAFETY: each prototype is the one its selector declares.
+        unsafe {
+            let send0: unsafe extern "C" fn(Id, Sel) -> Id = std::mem::transmute(objc::msg::entry());
+            let with: unsafe extern "C" fn(Id, Sel, usize) -> Id =
+                std::mem::transmute(objc::msg::entry());
+            let count: unsafe extern "C" fn(Id, Sel) -> usize = std::mem::transmute(objc::msg::entry());
+            let class = objc::class::ptr(objc::class::lookup(c"NSMutableSet").unwrap()) as Id;
+            let from_new = send0(class, objc::sel::get("new"));
+            assert_eq!(count(from_new, objc::sel::get("count")), 0);
+            let from_capacity = with(
+                send0(class, objc::sel::get("alloc")),
+                objc::sel::get("initWithCapacity:"),
+                16,
+            );
+            assert_eq!(count(from_capacity, objc::sel::get("count")), 0);
+        }
+    }
+
+    /// `+setWithArray:` over the guest's own `-[RenderWidgetHostViewCocoa
+    /// makeTouchBar]`, which is the site that reaches `+[NSSet setWithObject:]`
+    /// next door.
+    #[test]
+    fn a_set_built_from_an_array_holds_the_arrays_elements() {
+        crate::bootstrap();
+        // SAFETY: each prototype is the one its selector declares.
+        unsafe {
+            let send0: unsafe extern "C" fn(Id, Sel) -> Id = std::mem::transmute(objc::msg::entry());
+            let with: unsafe extern "C" fn(Id, Sel, Id) -> Id = std::mem::transmute(objc::msg::entry());
+            let count: unsafe extern "C" fn(Id, Sel) -> usize = std::mem::transmute(objc::msg::entry());
+            let array_class = objc::class::ptr(objc::class::lookup(c"NSArray").unwrap()) as Id;
+            let set_class = objc::class::ptr(objc::class::lookup(c"NSSet").unwrap()) as Id;
+            let one = with(array_class, objc::sel::get("arrayWithObject:"), crate::string::from_str("a"));
+            let two = with(array_class, objc::sel::get("arrayWithObject:"), crate::string::from_str("b"));
+            let both = send0(
+                objc::class::ptr(objc::class::lookup(c"NSMutableArray").unwrap()) as Id,
+                objc::sel::get("array"),
+            );
+            let add: unsafe extern "C" fn(Id, Sel, Id) = std::mem::transmute(objc::msg::entry());
+            add(both, objc::sel::get("addObject:"), one);
+            add(both, objc::sel::get("addObject:"), two);
+            let set = with(set_class, objc::sel::get("setWithArray:"), both);
+            assert_eq!(count(set, objc::sel::get("count")), 2);
+        }
+    }
+
+    /// `-init` on `NSSet` and `-mutableCopy` off it: both substitute, because
+    /// both are clusters.
+    #[test]
+    fn an_immutable_set_substitutes_on_init_and_copies_into_a_mutable_one() {
+        crate::bootstrap();
+        // SAFETY: each prototype is the one its selector declares.
+        unsafe {
+            let send0: unsafe extern "C" fn(Id, Sel) -> Id = std::mem::transmute(objc::msg::entry());
+            let send1: unsafe extern "C" fn(Id, Sel, Id) -> Id = std::mem::transmute(objc::msg::entry());
+            let count: unsafe extern "C" fn(Id, Sel) -> usize = std::mem::transmute(objc::msg::entry());
+            let set_class = objc::class::ptr(objc::class::lookup(c"NSSet").unwrap()) as Id;
+            let set = send0(send0(set_class, objc::sel::get("alloc")), objc::sel::get("init"));
+            assert!(!set.is_null());
+            // An immutable set is filled through its class, not by writing to it.
+            let one = send1(
+                set_class,
+                objc::sel::get("setWithObject:"),
+                crate::string::from_str("x"),
+            );
+            assert_eq!(count(one, objc::sel::get("count")), 1);
+            let copy = send0(one, objc::sel::get("mutableCopy"));
+            assert_eq!(
+                count(copy, objc::sel::get("count")),
+                1,
+                "-mutableCopy did not copy what the set held"
+            );
+            send1(copy, objc::sel::get("addObject:"), crate::string::from_str("y"));
+            assert_eq!(count(copy, objc::sel::get("count")), 2);
+            assert_eq!(
+                count(one, objc::sel::get("count")),
+                1,
+                "writing to the copy changed the original"
+            );
+        }
+    }
+
+    /// Print every selector `NSData` and `NSMutableData` answer, with the
+    /// encoding each declares, so a change to this module's `install()` can be
+    /// **diffed** rather than taken on trust.
+    ///
+    /// This exists because a test pass is not evidence in this project: a wrong
+    /// spelling, a method installed on the wrong class, or a method installed
+    /// and never reached all look identical to `cargo test`. The guest's own
+    /// `__objc_selrefs` are the other half - this says what the runtime offers,
+    /// and the census over the images says what the guest asks for, and the
+    /// intersection is the only thing worth having.
+    ///
+    ///     cargo test -p foundation --lib -- --test-threads=1 --nocapture \
+    ///         data_census
+    #[test]
+    fn data_census() {
+        crate::bootstrap();
+        for name in [c"NSData", c"NSMutableData"] {
+            let class = objc::class::lookup(name).expect("registered");
+            println!("== {} (metaclass = {})", class.name_str(), {
+                // SAFETY: a registered class's name is a NUL-terminated string.
+                unsafe { std::ffi::CStr::from_ptr(class.metaclass().name()) }
+                    .to_string_lossy()
+            });
+            for (label, on) in [("instance", class), ("class", class.metaclass())] {
+                println!("-- {} {label}", class.name_str());
+                let mut rows: Vec<String> = on
+                    .chain()
+                    .flat_map(|c| c.own_methods())
+                    .map(|m| {
+                        // SAFETY: a registered method's selector and types are
+                        // NUL-terminated strings.
+                        let (sel, types) = unsafe {
+                            (
+                                std::ffi::CStr::from_ptr(objc::sel::name(m.sel)),
+                                std::ffi::CStr::from_ptr(m.types()),
+                            )
+                        };
+                        format!(
+                            "{} {} {}", sel.to_string_lossy(), types.to_string_lossy(),
+                            if m.implementation().is_null() { "NULL-IMP" } else { "ok" }
+                        )
+                    })
+                    .collect();
+                rows.sort();
+                rows.dedup();
+                for row in rows {
+                    println!("   {row}");
+                }
+            }
+        }
+    }
+
+    /// The five restored selectors are installed, with the **exact** spelling the
+    /// guest's `__objc_selrefs` name and the encoding each one's arguments
+    /// imply.
+    ///
+    /// The spelling is the point. A selector off by one character is a
+    /// *different* selector: it is registered, the suite is green, and the guest
+    /// still aborts by name on the one it actually sends. So each name here is
+    /// looked up through `sel::get` and the method has to be found under *that*
+    /// selector, which fails loudly if a string and its registration ever drift
+    /// apart.
+    ///
+    /// The encodings are checked because a wrong one fails the same way: a `^v16`
+    /// where the guest loads a `char *` still round-trips on a host where both
+    /// arrive in the same register, and only the declared encoding says which it
+    /// was.
+    #[test]
+    fn the_restored_data_selectors_are_installed_with_the_guests_spellings() {
+        crate::bootstrap();
+        let data = objc::class::lookup(c"NSData").expect("NSData");
+        let expected = [
+            // (selector, encoding, is it a + method?)
+            ("data", c"@16@0:8", true),
+            ("dataWithContentsOfFile:options:error:", c"@40@0:8@16Q24^@32", true),
+            ("initWithBytes:length:", c"@32@0:8r^v16Q24", false),
+            ("getBytes:length:", c"v32@0:8^v16Q24", false),
+            ("copyWithZone:", c"@24@0:8^v16", false),
+        ];
+        for (name, types, is_class) in expected {
+            let (on, where_) = match is_class {
+                true => (data.metaclass(), "a + method"),
+                false => (data, "an instance method"),
+            };
+            let method = on.method(objc::sel::get(name)).unwrap_or_else(|| {
+                panic!("[{name}] is not installed on NSData as {where_}")
+            });
+            // SAFETY: a registered method's types are a NUL-terminated string.
+            let declared = unsafe { std::ffi::CStr::from_ptr(method.types()) };
+            assert_eq!(declared, types, "[{name}] declares the wrong encoding");
+            assert!(!method.implementation().is_null(), "[{name}] has no IMP");
+        }
+        // `NSMutableData` inherits all three instance methods from `NSData`, so
+        // the guest's `[[NSMutableData alloc] initWithBytes:length:]` reaches them
+        // without a second registration. Asserted rather than assumed, because
+        // `mutable_pair` is what makes it true and that is a fact about
+        // corefoundation's class table rather than about this file.
+        let mutable = objc::class::lookup(c"NSMutableData").expect("NSMutableData");
+        for name in ["initWithBytes:length:", "getBytes:length:", "copyWithZone:"] {
+            assert!(
+                mutable.method(objc::sel::get(name)).is_some(),
+                "NSMutableData does not inherit -[{name}] from NSData"
+            );
+        }
+    }
+
+    /// `+[NSData data]` answers an empty data rather than nil, which is the
+    /// answer all four of the guest's sites are built around.
+    #[test]
+    fn empty_data_is_empty_and_not_null() {
+        crate::bootstrap();
+        // SAFETY: `+data` is `id (Class, SEL)`.
+        let data: Id = unsafe { send(class(c"NSData"), "data", ()) };
+        assert!(!data.is_null(), "+[NSData data] answered nil");
+        // SAFETY: the value is a data object.
+        assert!(unsafe { data_of(data) }.is_empty());
+    }
+
+    /// `-initWithBytes:length:` **copies**, and it substitutes for the `+alloc`
+    /// placeholder.
+    ///
+    /// The copy is what the assertion is for: the caller's buffer is overwritten
+    /// afterwards and the data is read again. A borrowing implementation would
+    /// answer the caller's new bytes, and every one of the guest's six sites
+    /// passes a pointer into a vector the caller goes on to use, so "copied" is
+    /// the property the whole thing rests on. `length == 0` is the other end, and
+    /// neither implementation of the contract treats a null pointer there as a
+    /// failure.
+    #[test]
+    fn init_with_bytes_copies_rather_than_borrows() {
+        crate::bootstrap();
+        let mut source = b"Chromium".to_vec();
+        // SAFETY: `+alloc` is `id (Class, SEL)` and the initialiser is
+        // `id (id, SEL, const void *, NSUInteger)`.
+        let data: Id = unsafe {
+            let f: unsafe extern "C" fn(Id, Sel, *const u8, usize) -> Id =
+                std::mem::transmute(objc::msg::entry());
+            let allocated: Id = send(class(c"NSData"), "alloc", ());
+            f(
+                allocated,
+                objc::sel::get("initWithBytes:length:"),
+                source.as_mut_ptr(),
+                source.len(),
+            )
+        };
+        assert!(!data.is_null(), "-initWithBytes:length: answered nil");
+        // SAFETY: both values are data objects.
+        assert_eq!(unsafe { data_of(data) }, b"Chromium");
+        source.fill(b'X');
+        // SAFETY: as above.
+        assert_eq!(
+            unsafe { data_of(data) },
+            b"Chromium",
+            "-initWithBytes:length: borrowed the caller's buffer"
+        );
+
+        // A null pointer with a zero length: not a failure on either
+        // implementation, and the case an empty vector reduces to.
+        // SAFETY: as above, with a null pointer and no length.
+        let empty: Id = unsafe {
+            let f: unsafe extern "C" fn(Id, Sel, *const u8, usize) -> Id =
+                std::mem::transmute(objc::msg::entry());
+            f(
+                send(class(c"NSData"), "alloc", ()),
+                objc::sel::get("initWithBytes:length:"),
+                std::ptr::null(),
+                0,
+            )
+        };
+        assert!(!empty.is_null(), "a null pointer with length 0 must not fail");
+        // SAFETY: the value is a data object.
+        assert!(unsafe { data_of(empty) }.is_empty());
+    }
+
+    /// `-getBytes:length:` copies **no more than the data holds**, and the
+    /// caller's buffer is not written past that.
+    ///
+    /// The canary is the assertion that matters. The buffer is pre-filled with a
+    /// pattern and the tail beyond the data's length has to come back untouched:
+    /// an implementation that copied `length` bytes regardless - the mistake that
+    /// corrupts a guest's stack silently - would write over the canary, and a
+    /// caller that sized its buffer for what it asked for would never know.
+    ///
+    /// The three cases are the three the contract distinguishes: a length inside
+    /// the data, a length past the end (clamped, not refused), and the guest's
+    /// own `(null, 0)`.
+    #[test]
+    fn get_bytes_length_never_writes_past_what_the_data_holds() {
+        crate::bootstrap();
+        // SAFETY: `+dataWithBytes:length:` is
+        // `id (Class, SEL, const void *, NSUInteger)`.
+        let data: Id = unsafe {
+            let f: unsafe extern "C" fn(Id, Sel, *const u8, usize) -> Id =
+                std::mem::transmute(objc::msg::entry());
+            f(
+                class(c"NSData"),
+                objc::sel::get("dataWithBytes:length:"),
+                b"0123456789".as_ptr(),
+                10,
+            )
+        };
+        const CANARY: u8 = 0xa5;
+        let mut buffer = [CANARY; 32];
+        // SAFETY: `-getBytes:length:` is `void (id, SEL, void *, NSUInteger)` and
+        // the buffer is 32 bytes belonging to this test.
+        let get: unsafe extern "C" fn(Id, Sel, *mut u8, usize) =
+            unsafe { std::mem::transmute(objc::msg::entry()) };
+
+        // A length inside the data copies exactly that much and nothing else.
+        unsafe { get(data, objc::sel::get("getBytes:length:"), buffer.as_mut_ptr(), 4) };
+        assert_eq!(&buffer[..4], b"0123");
+        assert!(
+            buffer[4..].iter().all(|b| *b == CANARY),
+            "wrote past the length that was asked for"
+        );
+
+        // A length past the end copies what exists - the contract, per GNUstep's
+        // "only the available bytes are copied" and swift-corelibs'
+        // `min(length, self.length)` - and stops at the end of the data.
+        buffer.fill(CANARY);
+        unsafe { get(data, objc::sel::get("getBytes:length:"), buffer.as_mut_ptr(), 32) };
+        assert_eq!(&buffer[..10], b"0123456789");
+        assert!(
+            buffer[10..].iter().all(|b| *b == CANARY),
+            "a length past the end overwrote {} canary byte(s)",
+            buffer[10..].iter().filter(|b| **b != CANARY).count()
+        );
+
+        // Zero length with a null buffer: the guest's one site, instruction for
+        // instruction (`Framework+0x7a1f086: xor edx,edx; xor ecx,ecx`). It has
+        // to return rather than fault, and to write nothing.
+        buffer.fill(CANARY);
+        unsafe { get(data, objc::sel::get("getBytes:length:"), std::ptr::null_mut(), 0) };
+        assert!(
+            buffer.iter().all(|b| *b == CANARY),
+            "a zero-length read wrote to the buffer"
+        );
+    }
+
+    /// `-copyWithZone:` answers **the receiver** for an immutable data and a
+    /// **new immutable** one for a mutable data, and both branches are asserted
+    /// here because the answer is the whole contract.
+    ///
+    /// This is the test the missing mutability bit made impossible to write.
+    /// While `__NSCFData`'s body was a bare `Vec<u8>`, `-copyWithZone:` had to
+    /// answer a fresh copy in both cases, and the only property that could be
+    /// checked was "the copy does not share storage" - which is true of the
+    /// wrong answer too.  The identity of the immutable answer is what
+    /// distinguishes Apple's answer from the workaround, and it is what the
+    /// guest's one `-copyWithZone:` send actually gets.
+    ///
+    /// `-copy` is sent rather than `-copyWithZone:` because `NSObject`'s own
+    /// implementation *sends* `-copyWithZone:`, so the path exercised is the one
+    /// a guest takes.
+    #[test]
+    fn a_copy_of_a_data_is_the_receiver_unless_it_was_mutable() {
+        crate::bootstrap();
+        // SAFETY: `+dataWithBytes:length:` is `id (Class, SEL, const void *, NSUInteger)`.
+        let with: unsafe extern "C" fn(Id, Sel, *const u8, usize) -> Id =
+            unsafe { std::mem::transmute(objc::msg::entry()) };
+        let sel = objc::sel::get("dataWithBytes:length:");
+
+        // The immutable case: sent to `NSData`, so the copy is the data itself.
+        // SAFETY: as above, with three bytes of our own.
+        let immutable = unsafe { with(class(c"NSData"), sel, b"abc".as_ptr(), 3) };
+        // SAFETY: `-copy` is `id (id, SEL)`.
+        let copied: Id = unsafe { send(immutable, "copy", ()) };
+        assert!(!copied.is_null(), "-copy on a data answered nil");
+        assert_eq!(
+            copied, immutable,
+            "an immutable data's copy must be the data itself, which is what \
+             Apple returns and what the guest's one -copyWithZone: send gets"
+        );
+        // SAFETY: the value is a data object.
+        assert_eq!(unsafe { data_of(copied) }, b"abc");
+
+        // The mutable case: the same constructor sent to `NSMutableData` gives a
+        // data that may be changed, and its copy is a different, immutable one.
+        // SAFETY: as above.
+        let mutable = unsafe { with(class(c"NSMutableData"), sel, b"abc".as_ptr(), 3) };
+        assert_ne!(
+            mutable, immutable,
+            "two data objects, and not one object handed back twice"
+        );
+        // SAFETY: as above.
+        let mutable_copy: Id = unsafe { send(mutable, "copy", ()) };
+        assert!(!mutable_copy.is_null(), "-copy on a mutable data answered nil");
+        assert_ne!(
+            mutable_copy, mutable,
+            "a mutable data's copy must be a new object, or -appendBytes:length: \
+             on the copy would change the data that was copied"
+        );
+        // SAFETY: the value is a data object.
+        assert_eq!(unsafe { data_of(mutable_copy) }, b"abc");
+
+        // And the write that motivated the old workaround is now made on the
+        // object it is legal on. `-appendBytes:length:` on the *immutable* copy
+        // would abort by name, so this is the mutable original: a write to it
+        // must not reach its own copy either.
+        // SAFETY: `-appendBytes:length:` is
+        // `void (id, SEL, const void *, NSUInteger)`.
+        unsafe {
+            let f: unsafe extern "C" fn(Id, Sel, *const u8, usize) =
+                std::mem::transmute(objc::msg::entry());
+            f(mutable, objc::sel::get("appendBytes:length:"), b"def".as_ptr(), 3);
+        }
+        // SAFETY: both values are data objects.
+        assert_eq!(unsafe { data_of(mutable) }, b"abcdef");
+        assert_eq!(
+            unsafe { data_of(mutable_copy) },
+            b"abc",
+            "writing to the data reached the copy taken from it"
+        );
+    }
+
+    /// The bit is on the body, and it is set by **the class the constructor was
+    /// sent to** - which is the only place the distinction exists, because
+    /// `+dataWithBytes:length:` is declared on `NSData` and inherited.
+    ///
+    /// White-box on purpose, and it is white-box for a reason: the *behaviour*
+    /// that follows from the bit is asserted in
+    /// [`a_copy_of_a_data_is_the_receiver_unless_it_was_mutable`], and the other
+    /// behaviour it drives - refusing `-appendBytes:length:` on an immutable data
+    /// - ends in `objc::fail!`, which is `abort()` and cannot be caught by a
+    /// test.  So this says where the bit is, and that test says what it decides.
+    #[test]
+    fn a_data_records_the_class_its_constructor_was_sent_to() {
+        crate::bootstrap();
+        // SAFETY: `+dataWithBytes:length:` is `id (Class, SEL, const void *, NSUInteger)`.
+        let with: unsafe extern "C" fn(Id, Sel, *const u8, usize) -> Id =
+            unsafe { std::mem::transmute(objc::msg::entry()) };
+        let sel = objc::sel::get("dataWithBytes:length:");
+        for (name, mutable) in [(c"NSData", false), (c"NSMutableData", true)] {
+            // SAFETY: as above, with three bytes of our own.
+            let data = unsafe { with(class(name), sel, b"abc".as_ptr(), 3) };
+            // SAFETY: the value is a data object this runtime made.
+            let recorded = unsafe { collections::data_contents(data as CFTypeRef) }
+                .expect("a data with a body")
+                .mutable;
+            assert_eq!(recorded, mutable, "{name:?}");
+        }
+    }
+
+    /// `-appendBytes:length:` **works** on a data made mutable, which is the
+    /// only way this bit is observable without aborting: the same message on an
+    /// immutable data is refused by name, and a refusal is a process abort.
+    ///
+    /// So this is half a test, and it is labelled as one.  What it does prove is
+    /// that the write path is live on a mutable data and that `+[NSMutableData
+    /// dataWithBytes:length:]` produces one - i.e. that the mutability flag is
+    /// carried from the CoreFoundation constructor all the way through the
+    /// bridged class cluster to a method the guest could send.
+    #[test]
+    fn a_mutable_data_grows() {
+        crate::bootstrap();
+        // SAFETY: `+dataWithBytes:length:` is `id (Class, SEL, const void *, NSUInteger)`.
+        let data: Id = unsafe {
+            let f: unsafe extern "C" fn(Id, Sel, *const u8, usize) -> Id =
+                std::mem::transmute(objc::msg::entry());
+            f(
+                class(c"NSMutableData"),
+                objc::sel::get("dataWithBytes:length:"),
+                b"ab".as_ptr(),
+                2,
+            )
+        };
+        assert!(!data.is_null(), "+[NSMutableData dataWithBytes:length:] answered nil");
+        // SAFETY: `-appendBytes:length:` is
+        // `void (id, SEL, const void *, NSUInteger)`.
+        unsafe {
+            let f: unsafe extern "C" fn(Id, Sel, *const u8, usize) =
+                std::mem::transmute(objc::msg::entry());
+            f(data, objc::sel::get("appendBytes:length:"), b"cde".as_ptr(), 3);
+        }
+        // SAFETY: the value is a data object.
+        assert_eq!(unsafe { data_of(data) }, b"abcde");
+    }
+
+    /// `+dataWithContentsOfFile:options:error:` writes the out-parameter on
+    /// **both** paths, answers nil with a code that names the condition for a
+    /// file that is not there, and leaves a null out-parameter alone.
+    ///
+    /// The canary is a live object rather than a null, because a null would pass
+    /// whether or not anything was written - the reason the property-list test in
+    /// this module uses one.
+    #[test]
+    fn data_with_contents_of_file_writes_the_error_on_both_paths() {
+        crate::bootstrap();
+        // SAFETY: the prototype is the one the selector declares.
+        let read: unsafe extern "C" fn(Id, Sel, Id, u64, *mut Id) -> Id =
+            unsafe { std::mem::transmute(objc::msg::entry()) };
+        let sel = objc::sel::get("dataWithContentsOfFile:options:error:");
+        let ns_data = class(c"NSData");
+
+        // A real file, and the out-parameter cleared.
+        let path = std::env::temp_dir().join("rosetta3-data-census.bin");
+        std::fs::write(&path, b"contents").expect("a file to read");
+        let mut out = crate::string::from_str("not an error, and not nil");
+        // SAFETY: the prototype is the one the selector declares.
+        let data = unsafe {
+            read(
+                ns_data,
+                sel,
+                crate::string::from_str(&path.to_string_lossy()),
+                0,
+                &raw mut out,
+            )
+        };
+        assert!(!data.is_null(), "the file did not read");
+        assert!(
+            out.is_null(),
+            "success must write nil through the out-parameter, not leave it"
+        );
+        // SAFETY: the value is a data object.
+        assert_eq!(unsafe { data_of(data) }, b"contents");
+
+        // A file that is not there: nil, and a code that names the condition.
+        let mut out = crate::string::from_str("canary");
+        // SAFETY: as above.
+        let missing = unsafe {
+            read(
+                ns_data,
+                sel,
+                crate::string::from_str("/nonexistent/rosetta3/no-such.bin"),
+                0,
+                &raw mut out,
+            )
+        };
+        assert!(missing.is_null(), "a missing file is not a data object");
+        assert!(!out.is_null(), "the failure must be reported");
+        // SAFETY: the value is a number.
+        assert_eq!(
+            unsafe { send::<(), i64>(out, "code", ()) },
+            260,
+            "NSFileReadNoSuchFileError, which is what a *read* of a missing file is"
+        );
+
+        // A null out-parameter is never written through - the `xor ecx,ecx`
+        // shape four of this guest's five property-list sites use.
+        // SAFETY: as above, with a null out-parameter.
+        let none = unsafe {
+            read(
+                ns_data,
+                sel,
+                crate::string::from_str("/nonexistent/rosetta3/no-such.bin"),
+                0,
+                std::ptr::null_mut(),
+            )
+        };
+        assert!(none.is_null());
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// The bytes of a data object, for the assertions above.
+    ///
+    /// # Safety
+    ///
+    /// `data` must be null or a data object this runtime made.
+    unsafe fn data_of(data: Id) -> Vec<u8> {
+        // SAFETY: the caller's obligation.
+        match unsafe { collections::data(data as CFTypeRef) } {
+            Some(bytes) => bytes.clone(),
+            None => Vec::new(),
+        }
     }
 }

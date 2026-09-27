@@ -77,6 +77,35 @@ fn plugins_of(contents: &Path) -> PathBuf {
     found.unwrap_or(exact)
 }
 
+/// `name` and `extension` as the one filename a resource lookup is for.
+///
+/// An empty `extension` means the name already carries one, which is how
+/// `[NSBundle pathForResource:@"MainMenu" ofType:@"nib"]` and
+/// `[... pathForResource:@"MainMenu" ofType:@""]` both reach the same file.
+/// Every form below goes through this, so there is one spelling of "name plus
+/// type" in this crate rather than one per selector.
+fn leaf_of(name: &str, extension: &str) -> String {
+    match extension.is_empty() {
+        true => name.to_string(),
+        false => format!("{name}.{extension}"),
+    }
+}
+
+/// `root`/`directory`/`leaf`, with an empty `directory` meaning the root itself.
+///
+/// Apple's `inDirectory:` is a *subdirectory of the bundle's resource
+/// directory*, and nil or `""` is how a caller spells "no subdirectory" -
+/// which is not the same as a directory whose name is the empty string. The
+/// branch is here rather than left to `Path::join`, whose `join("")` writes a
+/// trailing separator and would make the two spellings differ in the string
+/// handed back even where they name one file.
+fn under(root: &Path, directory: &str, leaf: &str) -> PathBuf {
+    match directory.is_empty() {
+        true => root.join(leaf),
+        false => root.join(directory).join(leaf),
+    }
+}
+
 impl Layout {
     /// The bundle `executable` is inside, or `None` for a loose binary.
     pub fn enclosing(executable: &Path) -> Option<Layout> {
@@ -352,14 +381,66 @@ impl Layout {
     /// `-pathForResource:ofType:inDirectory:`, with `directory` relative to
     /// each resource root.
     pub fn resource_in(&self, name: &str, extension: &str, directory: &str) -> Option<PathBuf> {
-        let leaf = match extension.is_empty() {
-            true => name.to_string(),
-            false => format!("{name}.{extension}"),
-        };
+        let leaf = leaf_of(name, extension);
         std::iter::once(self.resources.clone())
             .chain(self.localizations())
-            .map(|root| root.join(directory).join(&leaf))
+            .map(|root| under(&root, directory, &leaf))
             .find(|p| p.exists())
+    }
+
+    /// `-pathForResource:ofType:inDirectory:forLocalization:`.
+    ///
+    /// `localization` is the whole difference from [`Layout::resource_in`], and
+    /// it is the argument that makes this four-argument form exist at all: it
+    /// names **one** `.lproj`, and that directory is the only place searched.
+    /// There is no walk down to another localization and no fall back to the
+    /// unlocalized `Resources`, because a caller that passed a language wants
+    /// that language's file *or nothing* - handing it back the unlocalized copy
+    /// would answer with a file whose contents are in some other language while
+    /// claiming otherwise, which is the one thing this whole lookup must not do.
+    ///
+    /// `None` - a nil `forLocalization:` - is not that case but the opposite one:
+    /// nil means "search the bundle's own preferred localizations", which is
+    /// exactly what the two shorter forms do, so it is answered by them rather
+    /// than by a rule of its own. Chromium's own source makes the same
+    /// distinction, and the guest's copy of its branch is the `test r12,r12` at
+    /// `+0x692c003` that chooses between the four- and the two-argument send -
+    /// `r12` there is `[mac_locale length]`, so a nil localization never reaches
+    /// this method at all and a non-empty one always does.
+    ///
+    /// An **empty** `localization` is a third thing again, and gets no special
+    /// case: it is taken literally, so the directory searched is
+    /// `Resources/.lproj`, which is not a directory any bundle ships, and the
+    /// answer is nil. Guessing that `""` "meant" nil - or the unlocalized
+    /// resources - would answer a question nobody asked; a real directory by
+    /// that name would still be found, because the lookup is the filesystem's.
+    /// No guest reaches it, for the reason in the paragraph above.
+    ///
+    /// `inDirectory` keeps the meaning [`Layout::resource_in`] gives it: a
+    /// subdirectory of the resource root, and `""` or nil for the resource
+    /// directory itself. Chromium passes `CFSTR("")` here and that is a real
+    /// spelling of "the bundle's own `Resources`", not a directory named by the
+    /// empty string - the guest's `+0x692c016` loads exactly that constant and
+    /// the file it reaches is `Resources/en.lproj/locale.pak`.
+    pub fn resource_in_localized(
+        &self,
+        name: &str,
+        extension: &str,
+        directory: &str,
+        localization: Option<&str>,
+    ) -> Option<PathBuf> {
+        // Nil is the shorter forms' question, so it is *answered by* them.
+        let localization = match localization {
+            None => return self.resource_in(name, extension, directory),
+            Some(localization) => localization,
+        };
+        let leaf = leaf_of(name, extension);
+        let path = under(
+            &self.resources.join(format!("{localization}.lproj")),
+            directory,
+            &leaf,
+        );
+        path.exists().then_some(path)
     }
 
     /// The main nib, if the `Info.plist` names one and it is there.
@@ -1021,6 +1102,109 @@ mod tests {
         );
     }
 
+    /// The shape Chromium's own bundles have: an unlocalized pak in
+    /// `Resources`, a *different* pak of the same name in every `.lproj`, and
+    /// no `CFBundleLocalizations` to say which exist - only the directories.
+    fn pak_bundle(name: &str) -> PathBuf {
+        let exe = scratch(name, INFO);
+        let resources = exe.parent().unwrap().parent().unwrap().join("Resources");
+        std::fs::write(resources.join("chrome_100_percent.pak"), b"common").unwrap();
+        for (language, body) in [("en", &b"english"[..]), ("fr", &b"french"[..])] {
+            std::fs::create_dir_all(resources.join(format!("{language}.lproj"))).unwrap();
+            std::fs::write(resources.join(format!("{language}.lproj/locale.pak")), body).unwrap();
+        }
+        exe
+    }
+
+    /// `forLocalization:` names one `.lproj` and nothing else is searched. The
+    /// two assertions that matter are the ones a *fallback* would break: a
+    /// language the bundle has no pak for is nil, not some other language's,
+    /// and not the unlocalized file that sits one directory up.
+    #[test]
+    fn a_named_localization_is_the_only_directory_searched() {
+        let layout = Layout::enclosing(&pak_bundle("for-localization")).expect("a bundle");
+        let pak = |language: Option<&str>| {
+            layout.resource_in_localized("locale", "pak", "", language)
+        };
+        assert_eq!(
+            pak(Some("en")),
+            Some(layout.resources.join("en.lproj/locale.pak"))
+        );
+        assert_eq!(
+            pak(Some("fr")),
+            Some(layout.resources.join("fr.lproj/locale.pak"))
+        );
+        assert_eq!(pak(Some("de")), None, "and not en's, or the unlocalized one");
+        // Nil is the *shorter* forms' question and has to answer as they do.
+        // `Resources` has no `locale.pak` at all in this bundle, so the
+        // unlocalized search misses it too - which is the point: a nil
+        // localization must not be answered out of some `.lproj`.
+        assert_eq!(pak(None), layout.resource("locale", "pak"));
+        assert_eq!(pak(None), None);
+        assert_eq!(
+            layout.resource_in_localized("chrome_100_percent", "pak", "", None),
+            Some(layout.resources.join("chrome_100_percent.pak"))
+        );
+    }
+
+    /// An empty localization is taken literally rather than read as nil: it
+    /// names `Resources/.lproj`, which nothing ships, so the answer is nil and
+    /// not a file from somewhere else.
+    #[test]
+    fn an_empty_localization_is_not_nil() {
+        let layout = Layout::enclosing(&pak_bundle("empty-localization")).expect("a bundle");
+        assert_eq!(layout.resource_in_localized("locale", "pak", "", Some("")), None);
+        assert_eq!(
+            layout.resource_in_localized("chrome_100_percent", "pak", "", Some("")),
+            None,
+            "the unlocalized pak is one directory up, and is not what was asked for"
+        );
+    }
+
+    /// `inDirectory:` keeps its meaning with a localization in play: a
+    /// subdirectory *of the resource root*, so of the `.lproj` and not of
+    /// `Resources`, and `""` for no subdirectory at all.
+    #[test]
+    fn a_resource_directory_is_relative_to_the_lproj_too() {
+        let exe = pak_bundle("localized-directory");
+        let resources = exe.parent().unwrap().parent().unwrap().join("Resources");
+        std::fs::create_dir_all(resources.join("en.lproj/nested")).unwrap();
+        std::fs::write(resources.join("en.lproj/nested/locale.pak"), b"english").unwrap();
+        let layout = Layout::enclosing(&exe).expect("a bundle");
+        assert_eq!(
+            layout.resource_in_localized("locale", "pak", "nested", Some("en")),
+            Some(resources.join("en.lproj/nested/locale.pak"))
+        );
+        assert_eq!(
+            layout.resource_in_localized("locale", "pak", "nested", Some("fr")),
+            None,
+            "fr.lproj has the pak, not fr.lproj/nested"
+        );
+        // `""` is the resource directory itself, and the empty string does not
+        // become a directory of its own on the way.
+        assert_eq!(
+            layout.resource_in_localized("locale", "pak", "", Some("en")),
+            Some(resources.join("en.lproj/locale.pak"))
+        );
+    }
+
+    /// `ofType:@""` reaches the same file as spelling the extension in the
+    /// name, in this form too - the type is joined, not checked.
+    #[test]
+    fn an_empty_type_is_the_name_as_given() {
+        let layout = Layout::enclosing(&pak_bundle("empty-type")).expect("a bundle");
+        let resources = &layout.resources;
+        assert_eq!(
+            layout.resource_in_localized("locale.pak", "", "", Some("en")),
+            Some(resources.join("en.lproj/locale.pak"))
+        );
+        assert_eq!(
+            layout.resource_in_localized("locale.pak", "pak", "", Some("en")),
+            None,
+            "the type is joined to the name, not checked against it"
+        );
+    }
+
     /// `CFBundleIconFile` is written with the extension as often as without,
     /// and a bundle whose icon is named the other way still has to be found.
     #[test]
@@ -1371,6 +1555,38 @@ mod preference_tests {
                 .method(objc::sel::get("preferredLocalizations"))
                 .is_none(),
             "preferredLocalizations is an instance method"
+        );
+    }
+
+    /// The four-argument resource lookup, which is the one selector with five
+    /// words in it, so the encoding is the whole ABI: a frame sized for four
+    /// arguments would read `r9` off the guest's stack.
+    ///
+    /// The selector string is spelled out here rather than shared with the
+    /// `install` table, because a spelling that is wrong in one place is wrong
+    /// in the other and a test that quotes the same literal proves nothing. This
+    /// one is the spelling, and the image's own `__objc_methname` for it is
+    /// `pathForResource:ofType:inDirectory:forLocalization:` - 51 bytes, verified
+    /// against the Mach-O rather than against a header, and the only reference
+    /// to it in the whole 214 MB of `__TEXT,__text` is the one call site at
+    /// `+0x692c008`.
+    #[test]
+    fn the_four_argument_resource_lookup_is_an_instance_method_of_five_words() {
+        crate::bootstrap();
+        const SELECTOR: &str = "pathForResource:ofType:inDirectory:forLocalization:";
+        const TYPES: &std::ffi::CStr = c"@48@0:8@16@24@32@40";
+        let class = objc::class::lookup(c"NSBundle").expect("NSBundle is registered");
+        let method = class
+            .method(objc::sel::get(SELECTOR))
+            .unwrap_or_else(|| panic!("-[NSBundle {SELECTOR}] is not installed"));
+        // SAFETY: a registered method's types are a NUL-terminated string.
+        let text = unsafe { std::ffi::CStr::from_ptr(method.types()) };
+        assert_eq!(text, TYPES);
+        // An instance method, which is where `GetResourcesPakFilePath` sends it:
+        // the receiver is a bundle, not a class.
+        assert!(
+            class.metaclass().method(objc::sel::get(SELECTOR)).is_none(),
+            "{SELECTOR} is an instance method"
         );
     }
 }
@@ -1734,6 +1950,55 @@ pub(crate) mod class {
         path(unsafe { layout_of(receiver) }.and_then(|b| b.resource_in(name, kind, directory)))
     }
 
+    /// `-pathForResource:ofType:inDirectory:forLocalization:`, which is the
+    /// only form of this question that names a localization, and the only
+    /// reason the guest reaches for four arguments instead of two:
+    /// `GetResourcesPakFilePath` in `ui/base/resource/resource_bundle_mac.mm`
+    /// sends it to fetch *this* helper process's locale pak rather than
+    /// whatever `NSBundle` would pick for itself.
+    unsafe extern "C" fn path_for_resource_localized(
+        receiver: Id,
+        _sel: Sel,
+        name: Id,
+        kind: Id,
+        directory: Id,
+        localization: Id,
+    ) -> Id {
+        // Whether the localization was nil at all, which `bytes` cannot report:
+        // it answers `""` for nil and for an empty string alike. Taken before
+        // the argument is shadowed by its own bytes.
+        let absent = localization.is_null();
+        // SAFETY: each argument is an `NSString` or nil.
+        let (name, kind, directory, localization) = unsafe {
+            (
+                crate::string::bytes(name),
+                crate::string::bytes(kind),
+                crate::string::bytes(directory),
+                crate::string::bytes(localization),
+            )
+        };
+        let (Ok(name), Ok(kind), Ok(directory), Ok(localization)) = (
+            std::str::from_utf8(&name),
+            std::str::from_utf8(&kind),
+            std::str::from_utf8(&directory),
+            std::str::from_utf8(&localization),
+        ) else {
+            return std::ptr::null_mut();
+        };
+        // A nil localization and an empty one are different questions, and only
+        // one of them is this method's. Nil is the shorter forms' question - "the
+        // bundle's own order" - so it is routed back to them; see
+        // `Layout::resource_in_localized` for why the empty one is then taken
+        // literally.
+        let localization = match absent {
+            true => None,
+            false => Some(localization),
+        };
+        // SAFETY: the receiver is an `NSBundle`.
+        path(unsafe { layout_of(receiver) }
+            .and_then(|b| b.resource_in_localized(name, kind, directory, localization)))
+    }
+
     /// `-infoDictionary`: the whole `Info.plist` as objects.
     ///
     /// This was refused until `crate::objectify` existed, and the reason is
@@ -1844,9 +2109,10 @@ pub(crate) mod class {
             "pathForResource:ofType:" => path_for_resource, c"@32@0:8@16@24";
             "URLForResource:withExtension:" => url_for_resource, c"@32@0:8@16@24";
             "pathForResource:ofType:inDirectory:" => path_for_resource_in_directory, c"@40@0:8@16@24@32";
+            "pathForResource:ofType:inDirectory:forLocalization:" => path_for_resource_localized, c"@48@0:8@16@24@32@40";
             "infoDictionary" => info_dictionary, c"@16@0:8";
             "executableName" => executable_name, c"*16@0:8";
-            "localizedStringForKey:value:table:" => localized_string_for_key, c"@40@0:8@16@24@32"
+            "localizedStringForKey:value:table:" => localized_string_for_key, c"@40@0:8@16@24@32";
             "localizations" => localizations, c"@16@0:8";
             "preferredLocalizations" => preferred_localizations, c"@16@0:8";
             "developmentLocalization" => development_localization, c"@16@0:8"

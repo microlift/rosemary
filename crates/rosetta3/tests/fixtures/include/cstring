@@ -1,0 +1,7 @@
+/* `<cstring>` - see cstdio for why these are in the global namespace. */
+#ifndef ROSETTA3_TEST_CSTRING
+#define ROSETTA3_TEST_CSTRING
+
+#include "string.h"
+
+#endif /* ROSETTA3_TEST_CSTRING */

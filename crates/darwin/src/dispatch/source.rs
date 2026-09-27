@@ -3,18 +3,70 @@
 //!
 //! ## What the guest asks for
 //!
-//! Four verified `dispatch_source_create` call sites in `Chromium Framework`.
-//! Three of them are `DISPATCH_SOURCE_TYPE_MACH_RECV`; the fourth is another type
-//! and is refused, by name - see the refusals section below.
+//! **The census, and it is small.** `dispatch_source_create` has **four** call
+//! sites in the 214 MB of `Chromium Framework` text, and the type argument at
+//! each is a `mov rdi, QWORD PTR [rip+…]` naming a `__dispatch_source_type_*`
+//! import. There are exactly **three** such imports in the whole 244 MB image -
+//! `__dispatch_source_type_mach_recv`, `__dispatch_source_type_proc` and
+//! `__dispatch_source_type_memorypressure` - so every site is accounted for and
+//! no fourth type exists to account for.
 //!
-//! | where | what |
-//! |---|---|
-//! | `+0x5dae491` | `base::WaitableEventWatcher::StartWatching` |
-//! | `+0x5d927ed` | a `base::apple` observer, with a cancel handler and a semaphore |
-//! | `+0x3b3b73f` | `SystemMemoryPressureEvaluator` - `MEMORYPRESSURE`, refused |
-//! | `+0x5da33a6` | a child-process exit watcher - `PROC`, refused |
+//! | where | type (GOT slot) | what the guest does with the source | waited on? |
+//! |---|---|---|---|
+//! | `+0x5dae491` | `mach_recv` `0xdd50850` | stored in the watcher; the event handler cancels the source from inside itself | **yes** - the watcher's whole purpose |
+//! | `+0x5d927ed` | `mach_recv` `0xdd50850` | stored; a **cancel** handler signals a semaphore the destructor waits on | **yes** - `dispatch_semaphore_wait(sem, DISPATCH_TIME_FOREVER)` |
+//! | `+0x3b3b73f` | `memorypressure` `0xdd50568` | stored at `+0x18`, then **null-checked** and skipped if null | no |
+//! | `+0x5da33a6` | `proc` `0xdd508c0` | stored in a `std::map<pid_t, ClientData>`; **no null check anywhere** | no |
 //!
-//! The first is the one on Chromium's critical path, and its call is this:
+//! **The two that are waited on are the two this file implements.** That is the
+//! whole of why a `NULL` here is survivable rather than a hang, and it is worth
+//! stating as the property rather than leaving it to be re-derived per site:
+//!
+//! * `+0x3b3b73f` - `+0x3b3b8a5  mov rdi,[rbx+0x18]` / `+0x3b3b8a9  test rdi,rdi`
+//!   / `+0x3b3b8ac  je 0x3b3b94d`, so a `NULL` source skips both the handler and
+//!   the resume. `SystemMemoryPressureEvaluator`'s only other input is the
+//!   `kern.memorystatus_vm_pressure_level` `sysctl`, which this runtime answers
+//!   `ENOENT`, so the evaluator reports "normal" for the life of the process.
+//!   That is the true state of a host with no memory-pressure condition to
+//!   report, not a fiction.
+//! * `+0x5da33a6` - `MachPortRendezvousServer::RegisterPortsForPid` in
+//!   `base/mac/mach_port_rendezvous.cc`, called from `LaunchProcess`
+//!   (`+0x5dab23a`, whose `__FILE__` is `base/process/launch_mac.cc` and whose
+//!   string argument is `"LaunchProcess"`). It installs a handler that calls
+//!   `OnClientExited(pid)` and **waits for nothing**: no semaphore, no condvar,
+//!   no second pass. The only consequence of the `NULL` is that the Mach rights
+//!   a child was launched with are never `Destroy()`ed, which is a leak until
+//!   the process exits and is not on the path to anything. Its null-safety is
+//!   visible in the guest's own code: `+0x5da341f`/`+0x5da3423` and
+//!   `+0x5da3556`/`+0x5da3559` test the handle before `dispatch_retain` and
+//!   `dispatch_release`, and every function here returns early for a null
+//!   handle, so no null ever reaches an allocator.
+//! * `+0x5d927ed` is the one that would hang, and it cannot: it is a
+//!   `mach_recv` over a real receive right, so the only way to get a `NULL` is
+//!   `refuse_port` - a port name that does not resolve in this task's space -
+//!   which already announces itself per call rather than once.
+//!
+//! ### There is no timer source in this guest, and that is measured
+//!
+//! `__dispatch_source_type_timer`, `dispatch_timer_create`,
+//! `dispatch_source_set_timer`, `dispatch_source_get_type`,
+//! `dispatch_source_get_data`, `dispatch_source_get_handle`,
+//! `dispatch_source_get_mask`, `dispatch_source_merge_data` and
+//! `dispatch_source_testcancel` are each **zero occurrences** in the image -
+//! not bound, not named in either of the two symbol-name tables, not present as
+//! bytes. Five controls scanned in the same pass each fire twice, once in the
+//! name table at `0xe74xxxx` and once in the one at `0xe76fxxxx`:
+//! `_dispatch_source_create`, `_dispatch_semaphore_wait`, `_dispatch_resume`,
+//! `_notify_register_dispatch` and `__dispatch_source_type_mach_recv`.
+//!
+//! So there is no `DISPATCH_SOURCE_TYPE_TIMER` to wire to the `timerfd` that
+//! `crate::mach::kevent64` already uses for `EVFILT_TIMER`. Chromium on macOS
+//! does its timing through `CFRunLoopTimerCreate` and `dispatch_after`, both of
+//! which it imports and both of which are answered here. Building a timer
+//! source would be answering a question this guest never asks, and a source
+//! type with no call site is a source type nobody has checked against one.
+//!
+//! The first site is the one on Chromium's critical path, and its call is this:
 //!
 //! ```text
 //!  5dae47b  xor    edi,edi                    ; DISPATCH_QUEUE_PRIORITY_DEFAULT
@@ -124,15 +176,22 @@
 //! the guest actually uses besides it are named rather than left to be found:
 //!
 //! * `DISPATCH_SOURCE_TYPE_PROC` (`+0x5da33a6`, mask the child's pid, handle
-//!   `NOTE_EXITSTATUS`) is a knote on a pid's exit status. Linux has no
-//!   equivalent port, and a source that never fires is a `dispatch_semaphore_wait`
-//!   that never returns.
+//!   `NOTE_EXITSTATUS`) is a knote on a pid's exit status. **This one is
+//!   answerable and is not answered**, because the honest cost is a `pidfd` in
+//!   this module's `poll` set and the guest does not wait on it; see the table
+//!   above for why the `NULL` costs a port leak and not a hang. The refusal is
+//!   correct as an answer and incomplete as a feature.
 //! * `DISPATCH_SOURCE_TYPE_MEMORYPRESSURE` (`+0x3b3b73f`, mask `0x7`) is a knote
-//!   on the kernel's memory-pressure notifications. The host has
-//!   `/proc/pressure/memory` and cgroup events, but mapping one onto the
-//!   `NOTE_MEMORYSTATUS_*` bits a macOS guest reads by name is a second project,
-//!   and answering the request with a source that never reports pressure is the
-//!   failure this file is written to avoid.
+//!   on the kernel's memory-pressure notifications. **The reason is sharper than
+//!   "it would be a second project", and it is worth stating precisely because
+//!   `/proc/pressure/memory` exists on this host** (Linux 7.2.6) and does carry
+//!   `some`/`full` `avg10`/`avg60`/`avg300` and a monotonic `total` in
+//!   microseconds. What it does not carry is `DISPATCH_MEMORYPRESSURE_WARN` or
+//!   `DISPATCH_MEMORYPRESSURE_CRITICAL`: those are a macOS kernel *policy*, and
+//!   the guest's mask is `0x7` - all three levels - so any level this runtime
+//!   reported would be a threshold this file invented, and an invented level is
+//!   the one answer the guest would act on. The condition is pollable and the
+//!   *value* is not derivable, and the guest wants the value.
 //!
 //! The type *tokens* for all three are still published, as the distinct stable
 //! addresses they are in libdispatch: a guest that compares two of them, or that

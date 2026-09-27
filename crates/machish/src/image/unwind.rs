@@ -125,8 +125,21 @@ impl UnwindInfo {
         Ok(UnwindInfo { entries, end })
     }
 
+    /// Find the entry covering `va`.
+    ///
+    /// **`va > end`, not `>=`.** A caller here is a *return address*, so it is
+    /// the instruction **after** a `call`. When the last function in the image
+    /// ends in a `call`, that return address is exactly `end` - one past the
+    /// final instruction - and the call site at `end - 1` is unambiguously in
+    /// the last entry. Rejecting `va == end` therefore drops the frame for the
+    /// last function in the image, and an unwinder that loses a frame is worse
+    /// than one that gains one: it resumes the *caller's* landing pad with this
+    /// frame's context, which is a silent wrong answer rather than a refusal.
+    ///
+    /// Measured: a fixture built by `test/tools/build-macho.sh` put a `call` as
+    /// the final instruction, and `lookup` returned `None` for it.
     pub fn lookup(&self, va: Word) -> Option<&UnwindEntry> {
-        if self.entries.is_empty() || va >= self.end {
+        if self.entries.is_empty() || va > self.end {
             return None;
         }
         let i = match self.entries.binary_search_by_key(&va, |e| e.function) {

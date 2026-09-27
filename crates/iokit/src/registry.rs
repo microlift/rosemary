@@ -490,7 +490,17 @@ pub extern "C" fn IOConnectCallStructMethod(
 }
 
 /// `kern_return_t IOCreatePlugInInterfaceForService(service, interfaceID,
-/// interfaceType, void **plugInInterface)`.
+/// interfaceType, void **plugInInterface, SInt32 *score)`.
+///
+/// Five parameters, the last of which is the interface's match score, and which
+/// is easy to leave off: `device/gamepad/xbox_controller_mac.mm:365` passes
+/// `&score` and calls it "Unused, but required", and the guest sets all five
+/// argument registers at each of its six call sites (`lea r8,[rbp-0x44]`
+/// immediately after the `lea rcx` for the out-parameter, at `+0x83bfef5`
+/// among them). The score is **not written**, and nothing misses it: the guest
+/// poisons the slot before the call (`mov DWORD PTR [rbp-0x44],0xaaaaaaaa`) and
+/// no load ever reads it back afterwards - in the two functions where the same
+/// stack slot is used again later, the guest writes it again first.
 ///
 /// **`kIOReturnUnsupported`, and the out-parameter is not written.** There is
 /// no IOKit plug-in bundle for any class here, and there is no
@@ -510,6 +520,7 @@ pub extern "C" fn IOCreatePlugInInterfaceForService(
     _interface_id: CFTypeRef,
     _interface_type: CFTypeRef,
     _plug_in_interface: *mut *mut std::ffi::c_void,
+    _score: *mut i32,
 ) -> KernReturn {
     UNSUPPORTED
 }
@@ -698,9 +709,7 @@ pub unsafe extern "C" fn IORegistryEntryCreateCFProperties(
 /// An `IONotificationPortRef`. Opaque to the guest and never dereferenced by
 /// it; it exists so that the pointer is not null.
 struct NotificationPort {
-    /// The run loop source `IONotificationPortGetRunLoopSource` answers,
-    /// made on first request and owned by the port.
-    source: CFTypeRef,
+    _private: u64,
 }
 
 /// `IONotificationPortRef IONotificationPortCreate(mach_port_t)`.
@@ -709,7 +718,7 @@ struct NotificationPort {
 /// `GetMachPort`, `AddMatchingNotification` - are made without checking, and a
 /// null here faults inside the first of them rather than saying anything.
 pub unsafe extern "C" fn IONotificationPortCreate(_port: u32) -> *mut c_void {
-    Box::into_raw(Box::new(NotificationPort { source: std::ptr::null() })).cast()
+    Box::into_raw(Box::new(NotificationPort { _private: 0 })).cast()
 }
 
 /// `void IONotificationPortDestroy(IONotificationPortRef)`.
@@ -719,43 +728,38 @@ pub unsafe extern "C" fn IONotificationPortDestroy(port: *mut c_void) {
     }
     // SAFETY: the guest hands back what `IONotificationPortCreate` returned,
     // which is this crate's own `Box`.
-    let port = unsafe { Box::from_raw(port.cast::<NotificationPort>()) };
-    if !port.source.is_null() {
-        // SAFETY: the source this port made and owns.
-        unsafe {
-            corefoundation::api::CFRunLoopSourceInvalidate(port.source);
-            corefoundation::api::CFRelease(port.source);
-        }
-    }
+    drop(unsafe { Box::from_raw(port.cast::<NotificationPort>()) });
 }
 
 /// `CFRunLoopSourceRef IONotificationPortGetRunLoopSource(IONotificationPortRef)`.
 ///
-/// A source with nothing behind it, which is added to a run loop and never
-/// signalled - as no IOKit message ever arrives here.
-pub unsafe extern "C" fn IONotificationPortGetRunLoopSource(port: *mut c_void) -> CFTypeRef {
-    if port.is_null() {
-        return std::ptr::null();
-    }
-    // SAFETY: a port `IONotificationPortCreate` made.
-    let port = unsafe { &mut *port.cast::<NotificationPort>() };
-    if port.source.is_null() {
-        let context = corefoundation::api::CFRunLoopSourceContext {
-            version: 0,
-            info: std::ptr::null_mut(),
-            retain: std::ptr::null(),
-            release: std::ptr::null(),
-            copy_description: std::ptr::null(),
-            equal: std::ptr::null(),
-            hash: std::ptr::null(),
-            schedule: std::ptr::null(),
-            cancel: std::ptr::null(),
-            perform: None,
-        };
-        // SAFETY: a context that outlives the call, which copies it.
-        port.source = unsafe { corefoundation::api::CFRunLoopSourceCreate(std::ptr::null(), 0, &context) };
-    }
-    port.source
+/// **Null**, and null is the answer that says the right thing here.
+///
+/// A real port has a real source, so returning a source would be a claim that
+/// something can be delivered to it. Nothing can: this registry has no
+/// notifier, so no IOKit message is ever posted to any port
+/// [`IONotificationPortCreate`] makes. Null says "you have no source, so you
+/// will hear nothing", which is the whole truth, and it is what
+/// [`crate::power::IOPSNotificationCreateRunLoopSource`] already answers for
+/// the same reason.
+///
+/// Null is also the safe answer here, which is worth stating because none of
+/// the call sites check: all six
+/// (`Framework+0x3cef600`, `+0x3d029a3`, `+0x5cfe150`, `+0x5da9684`,
+/// `+0x83c1832`, `+0x83ff1f8`) pass the result straight to
+/// `CFRunLoopAddSource` or `CFRunLoopRemoveSource` with no test, and
+/// `corefoundation`'s implementations of both return early for a null source
+/// (`crates/corefoundation/src/api.rs:3207` and `:3216`). A guest that gets a
+/// source it can never signal from is worse off than one that knows it is not
+/// listening - and a source built here would have had to be a
+/// `CFRunLoopSourceContext` with a null `perform`, which is the shape that
+/// faults the moment anything does signal it.
+///
+/// # Safety
+///
+/// `port` is not read: a null port answers null, and so does a real one.
+pub unsafe extern "C" fn IONotificationPortGetRunLoopSource(_port: *mut c_void) -> CFTypeRef {
+    std::ptr::null_mut()
 }
 
 /// `kern_return_t IOMasterPort(mach_port_t bootstrap, mach_port_t *master)`:
@@ -795,93 +799,8 @@ pub unsafe extern "C" fn IOServiceNameMatching(name: *const c_char) -> CFTypeRef
     unsafe { matching_on(b"IONameMatch", name) }
 }
 
-/// `CFMutableDictionaryRef IOBSDNameMatching(mach_port_t, uint32_t, const char *)`.
-pub unsafe extern "C" fn IOBSDNameMatching(_port: u32, _options: u32, name: *const c_char) -> CFTypeRef {
-    // SAFETY: the caller's C string.
-    unsafe { matching_on(b"BSD Name", name) }
-}
-
-/// `kern_return_t IORegistryEntryCreateIterator(entry, plane, options, io_iterator_t *)`:
-/// an empty iterator, as the registry here has no children to walk.
-pub unsafe extern "C" fn IORegistryEntryCreateIterator(
-    _entry: IoObject,
-    _plane: *const c_char,
-    _options: u32,
-    iterator: *mut IoObject,
-) -> KernReturn {
-    if !iterator.is_null() {
-        // SAFETY: the caller's out-parameter.
-        unsafe { iterator.write(0) };
-    }
-    SUCCESS
-}
-
-/// `boolean_t IOObjectConformsTo(io_object_t, const io_name_t className)`:
-/// no object here is an instance of any IOKit class.
-pub unsafe extern "C" fn IOObjectConformsTo(_object: IoObject, _class: *const c_char) -> u32 {
-    0
-}
-
-/// `kIOReturnUnsupported`.
-const UNSUPPORTED: IOReturn = -536_870_201;
-
-/// `IOReturn IOCreatePlugInInterfaceForService(service, pluginType,
-/// interfaceType, IOCFPlugInInterface ***, SInt32 *score)`: refused, as no
-/// service here has a user-space driver plug-in.
-pub unsafe extern "C" fn IOCreatePlugInInterfaceForService(
-    _service: IoObject,
-    _plugin_type: CFTypeRef,
-    _interface_type: CFTypeRef,
-    interface: *mut *mut c_void,
-    score: *mut i32,
-) -> IOReturn {
-    // SAFETY: the caller's out-parameters.
-    unsafe {
-        if !interface.is_null() {
-            interface.write(std::ptr::null_mut());
-        }
-        if !score.is_null() {
-            score.write(0);
-        }
-    }
-    UNSUPPORTED
-}
-
 /// `kern_return_t IODestroyPlugInInterface(IOCFPlugInInterface **)`.
 pub unsafe extern "C" fn IODestroyPlugInInterface(_interface: *mut c_void) -> KernReturn {
-    SUCCESS
-}
-
-/// The `io_connect_t` `IORegisterForSystemPower` answers: any live-looking
-/// port name, since the calls it is passed to accept and ignore it.
-const ROOT_POWER_DOMAIN: IoObject = 0x5057_5200;
-
-/// `io_connect_t IORegisterForSystemPower(void *refcon, IONotificationPortRef *,
-/// IOServiceInterestCallback, io_object_t *notifier)`
-///
-/// Registered, and never called back: this host's sleep and wake do not reach
-/// the guest, so a program is not told to prepare for either.
-pub unsafe extern "C" fn IORegisterForSystemPower(
-    _refcon: *mut c_void,
-    port: *mut *mut c_void,
-    _callback: *const c_void,
-    notifier: *mut IoObject,
-) -> IoObject {
-    // SAFETY: the caller's out-parameters.
-    unsafe {
-        if !port.is_null() {
-            port.write(IONotificationPortCreate(0));
-        }
-        if !notifier.is_null() {
-            notifier.write(ROOT_POWER_DOMAIN);
-        }
-    }
-    ROOT_POWER_DOMAIN
-}
-
-/// `IOReturn IOAllowPowerChange(io_connect_t, intptr_t)` and
-/// `IOCancelPowerChange`: answers to a notification that never comes.
-pub unsafe extern "C" fn IOAllowPowerChange(_kernel_port: IoObject, _notification: isize) -> IOReturn {
     SUCCESS
 }
 
@@ -892,34 +811,6 @@ pub unsafe extern "C" fn IOAllowPowerChange(_kernel_port: IoObject, _notificatio
 /// cannot receive - which is the same nothing, arrived at more expensively.
 pub unsafe extern "C" fn IONotificationPortGetMachPort(_port: *mut c_void) -> u32 {
     0
-}
-
-/// `CFRunLoopSourceRef IONotificationPortGetRunLoopSource(IONotificationPortRef)`.
-///
-/// **Null**, and null is the answer that says the right thing here.
-///
-/// A real port has a real source, so returning a source would be a claim that
-/// something can be delivered to it. Nothing can: this registry has no
-/// notifier, so no IOKit message is ever posted to any port
-/// [`IONotificationPortCreate`] makes. Null says "you have no source, so you
-/// will hear nothing", which is the whole truth, and it is what
-/// [`crate::power::IOPSNotificationCreateRunLoopSource`] already answers for
-/// the same reason.
-///
-/// Null is also the safe answer here, which is worth stating because none of
-/// the call sites check: all six
-/// (`Framework+0x3cef600`, `+0x3d029a3`, `+0x5cfe150`, `+0x5da9684`,
-/// `+0x83c1832`, `+0x83ff1f8`) pass the result straight to
-/// `CFRunLoopAddSource` or `CFRunLoopRemoveSource` with no test, and
-/// `corefoundation`'s implementations of both return early for a null source
-/// (`crates/corefoundation/src/api.rs:2817`). A guest that gets a source it
-/// can never signal from is worse off than one that knows it is not listening.
-///
-/// # Safety
-///
-/// `port` is not read: a null port answers null, and so does a real one.
-pub unsafe extern "C" fn IONotificationPortGetRunLoopSource(_port: *mut c_void) -> CFTypeRef {
-    std::ptr::null_mut()
 }
 
 /// `void IONotificationPortSetDispatchQueue(IONotificationPortRef, dispatch_queue_t)`.
@@ -1065,16 +956,9 @@ exports::exports! {
         "IOConnectCallStructMethod" => IOConnectCallStructMethod,
         "IOCreatePlugInInterfaceForService" => IOCreatePlugInInterfaceForService,
         "IODispatchCalloutFromMessage" => IODispatchCalloutFromMessage,
-        "IONotificationPortGetRunLoopSource" => IONotificationPortGetRunLoopSource,
         "IOMasterPort" => IOMasterPort,
         "IOServiceNameMatching" => IOServiceNameMatching,
-        "IOBSDNameMatching" => IOBSDNameMatching,
-        "IORegistryEntryCreateIterator" => IORegistryEntryCreateIterator,
-        "IOObjectConformsTo" => IOObjectConformsTo,
-        "IOCreatePlugInInterfaceForService" => IOCreatePlugInInterfaceForService,
         "IODestroyPlugInInterface" => IODestroyPlugInInterface,
-        "IORegisterForSystemPower" => IORegisterForSystemPower,
-        "IOAllowPowerChange" | "IOCancelPowerChange" => IOAllowPowerChange,
     }
 }
 
@@ -1117,6 +1001,7 @@ mod tests {
         assert_eq!(
             IOCreatePlugInInterfaceForService(
                 7,
+                std::ptr::null_mut(),
                 std::ptr::null_mut(),
                 std::ptr::null_mut(),
                 std::ptr::null_mut(),

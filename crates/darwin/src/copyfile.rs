@@ -8,6 +8,32 @@ use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
+/// The flag values, from Apple's own `copyfile.h`
+/// (`apple-oss-distributions/copyfile`), which is the authority rather than a
+/// recollection:
+///
+/// ```c
+/// #define COPYFILE_ACL	    (1<<0)
+/// #define COPYFILE_STAT	    (1<<1)
+/// #define COPYFILE_XATTR	    (1<<2)
+/// #define COPYFILE_DATA	    (1<<3)
+/// #define COPYFILE_SECURITY   (COPYFILE_STAT | COPYFILE_ACL)
+/// #define COPYFILE_METADATA   (COPYFILE_SECURITY | COPYFILE_XATTR)
+/// #define COPYFILE_ALL	    (COPYFILE_METADATA | COPYFILE_DATA)   /* 0x0f */
+/// #define COPYFILE_RECURSIVE	(1<<15)
+/// #define COPYFILE_CHECK		(1<<16)
+/// #define COPYFILE_EXCL		(1<<17)
+/// #define COPYFILE_NOFOLLOW_SRC	(1<<18)
+/// #define COPYFILE_NOFOLLOW_DST	(1<<19)
+/// #define COPYFILE_MOVE		(1<<20)
+/// #define COPYFILE_UNLINK		(1<<21)
+/// ```
+///
+/// `COPYFILE_DATA` being `1<<3` is the load-bearing one. A second `copyfile`
+/// used to live in `crate::media_unavailable` with `DATA = 0x4` and `STAT = 0x8`,
+/// and it won every guest import; see the note there. `base::CopyFile` is the
+/// guest's only `_copyfile` call site and it passes `COPYFILE_DATA` and nothing
+/// else, so this row is the one that has to be right.
 const ACL: u32 = 1 << 0;
 const STAT: u32 = 1 << 1;
 const XATTR: u32 = 1 << 2;
@@ -142,8 +168,17 @@ fn copy(from: &Path, to: &Path, flags: u32, from_text: &[u8]) -> std::io::Result
 
 /// `int copyfile(const char *from, const char *to, copyfile_state_t, copyfile_flags_t)`
 ///
-/// ACLs and extended attributes are not copied: the host keeps neither in a
-/// form a Darwin program could tell apart from their absence.
+/// ACLs and extended attributes are **refused**, with `EINVAL`, rather than
+/// quietly skipped.
+///
+/// Everything else is answered for real: `COPYFILE_DATA`, `COPYFILE_STAT`,
+/// `COPYFILE_RECURSIVE`, `COPYFILE_CHECK`, `COPYFILE_EXCL`,
+/// `COPYFILE_NOFOLLOW_SRC`, `COPYFILE_MOVE` and `COPYFILE_UNLINK`. A caller
+/// that asked for an ACL and got a data copy and a `0` back has been told a
+/// thing that did not happen, which is the one outcome this tree may not
+/// produce. The guest cannot reach that path - `base::CopyFile` passes
+/// `COPYFILE_DATA` alone, at `Framework+0x5d94848` - but a program that asked
+/// for one deserves to be told no.
 ///
 /// # Safety
 ///
@@ -157,8 +192,12 @@ pub unsafe extern "C" fn copyfile(
     let (Some(source), Some(destination)) = (host(from), host(to)) else {
         return -1;
     };
+    if flags & (ACL | XATTR) != 0 {
+        return fail(std::io::Error::from_raw_os_error(libc::EINVAL));
+    }
     if flags & CHECK != 0 {
-        // What would be copied: everything asked for that there is.
+        // What would be copied: everything asked for that there is, which after
+        // the line above is never an ACL or an xattr.
         return match std::fs::symlink_metadata(&source) {
             Ok(_) => (flags & ALL & !(ACL | XATTR)) as c_int,
             Err(e) => fail(e),
@@ -268,13 +307,19 @@ mod tests {
         unsafe { copyfile(from.as_ptr(), to.as_ptr(), std::ptr::null_mut(), flags) }
     }
 
+    /// What this host can do, which is `COPYFILE_ALL` without the two flags it
+    /// refuses. The three tests below used to pass `ALL` and pass only because
+    /// the ACL and xattr bits were being ignored; they are spelled out now so
+    /// that the refusal above is what the tests are measuring.
+    const DOABLE: u32 = STAT | DATA;
+
     #[test]
     fn copies_a_tree_recursively_into_a_new_directory() {
         let dir = scratch("tree");
         std::fs::create_dir_all(dir.join("src/sub")).unwrap();
         std::fs::write(dir.join("src/a.plist"), b"a").unwrap();
         std::fs::write(dir.join("src/sub/b.plist"), b"b").unwrap();
-        assert_eq!(call(&dir.join("src"), &dir.join("dst"), ALL | RECURSIVE), 0);
+        assert_eq!(call(&dir.join("src"), &dir.join("dst"), DOABLE | RECURSIVE), 0);
         assert_eq!(std::fs::read(dir.join("dst/a.plist")).unwrap(), b"a");
         assert_eq!(std::fs::read(dir.join("dst/sub/b.plist")).unwrap(), b"b");
     }
@@ -285,7 +330,7 @@ mod tests {
         std::fs::create_dir_all(dir.join("src")).unwrap();
         std::fs::create_dir_all(dir.join("dst")).unwrap();
         std::fs::write(dir.join("src/a"), b"a").unwrap();
-        assert_eq!(call(&dir.join("src"), &dir.join("dst"), ALL | RECURSIVE), 0);
+        assert_eq!(call(&dir.join("src"), &dir.join("dst"), DOABLE | RECURSIVE), 0);
         assert_eq!(std::fs::read(dir.join("dst/src/a")).unwrap(), b"a");
     }
 
@@ -294,9 +339,72 @@ mod tests {
         let dir = scratch("excl");
         std::fs::write(dir.join("a"), b"a").unwrap();
         std::fs::write(dir.join("b"), b"b").unwrap();
-        assert_eq!(call(&dir.join("a"), &dir.join("b"), ALL | EXCL), -1);
+        assert_eq!(call(&dir.join("a"), &dir.join("b"), DOABLE | EXCL), -1);
         assert_eq!(crate::errno::get(), libc::EEXIST);
-        assert_eq!(call(&dir.join("a"), &dir.join("c"), ALL), 0);
+        assert_eq!(call(&dir.join("a"), &dir.join("c"), DOABLE), 0);
         assert_eq!(std::fs::read(dir.join("c")).unwrap(), b"a");
+    }
+
+    /// The guest's own call, with the guest's own flags.
+    ///
+    /// `base::CopyFile` in `base/files/file_util_apple.mm` is
+    ///
+    /// ```c
+    /// return (copyfile(from_path.value().c_str(), to_path.value().c_str(),
+    ///                  /*state=*/nullptr, COPYFILE_DATA) == 0);
+    /// ```
+    ///
+    /// and the binary agrees: `Framework+0x5d94843` is `mov ecx,0x8` and
+    /// `+0x5d94848` is `call _copyfile` - re-disassembled, and the only
+    /// `_copyfile` call site in the guest (`test/tools/callers.py _copyfile`).
+    /// `8` is `COPYFILE_DATA`, `(1<<3)`.
+    ///
+    /// So this is the assertion a second `copyfile` with `DATA = 0x4` would
+    /// fail: it copied no bytes, silently rewrote the destination's mode and
+    /// timestamps instead, and returned `0` - and `sete bl` at `+0x5d9484f`
+    /// turned that into `base::CopyFile` returning **true**. A file reported
+    /// copied that had not been. The constants above are quoted from Apple's
+    /// `copyfile.h`; this test is what holds them to the guest's call.
+    #[test]
+    fn the_guests_only_call_copies_the_bytes() {
+        let dir = scratch("guest");
+        std::fs::write(dir.join("from"), b"the bytes the guest asked to copy").unwrap();
+        assert_eq!(DATA, 8, "COPYFILE_DATA is (1<<3); the guest passes 8");
+        assert_eq!(call(&dir.join("from"), &dir.join("to"), DATA), 0);
+        assert_eq!(
+            std::fs::read(dir.join("to")).unwrap(),
+            b"the bytes the guest asked to copy",
+            "`COPYFILE_DATA` alone must copy the data, not the stat"
+        );
+    }
+
+    /// An ACL or an xattr is refused, and says so, rather than being skipped.
+    ///
+    /// Each of these returned `0` having copied only the data. That is the
+    /// fabricated success this tree may not produce: a caller that asked for an
+    /// ACL cannot tell an absent ACL from a copied one, and `0` says it was
+    /// copied.
+    #[test]
+    fn an_acl_or_an_xattr_is_refused_rather_than_skipped() {
+        let dir = scratch("refuse");
+        std::fs::write(dir.join("from"), b"a").unwrap();
+        for (name, flags) in [
+            ("COPYFILE_ACL", ACL),
+            ("COPYFILE_XATTR", XATTR),
+            ("COPYFILE_ALL", ALL),
+            ("COPYFILE_SECURITY", STAT | ACL),
+            ("COPYFILE_METADATA", STAT | ACL | XATTR),
+        ] {
+            assert_eq!(
+                call(&dir.join("from"), &dir.join("to"), flags),
+                -1,
+                "{name} is not something this host does, so it must not answer 0"
+            );
+            assert_eq!(crate::errno::get(), libc::EINVAL, "{name}");
+            assert!(
+                !dir.join("to").exists(),
+                "{name}: nothing may be written when the request is refused"
+            );
+        }
     }
 }

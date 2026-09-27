@@ -388,11 +388,41 @@ pub fn reason(name: &str) -> Option<&'static str> {
 
 /// Whether `crate` answers for `name` itself.
 ///
+/// **This deliberately uses the non-reducing [`crate::implemented`], and the
+/// reason is worth recording precisely because it is *not* a live bug.** A
+/// prior review claimed this was a defect and it is not; do not "rediscover"
+/// it as one, and do not revert this as noise.
+///
+/// The public [`crate::is_implemented`] wraps [`crate::implemented`] in a
+/// `base_name` reduction, and every path that reaches here has *already*
+/// reduced — `crate::refusal` and `crate::symbol` do `base_name(symbol)` first,
+/// and `rosetta3::shims::host::host_or_refuse` does `c_name(symbol)` first. So
+/// the old `is_implemented` here reduced **twice**.
+///
+/// That can only change an answer for a name carrying a **leading** underscore,
+/// because `base_name` strips one leading underscore and nothing else. And
+/// `implemented_here` only *matters* when the name would otherwise be caught by
+/// the `NAMES` or `PREFIXES` scan below — every one of which begins with a
+/// letter, so a name starting with `_` can never match one. The two conditions
+/// are therefore mutually exclusive and the reduction is unreachable.
+///
+/// Measured, not argued: `mach_absolute_time`, `dispatch_once_f`,
+/// `pthread_create`, `pthread_mutex_init`, `pthread_getspecific` and
+/// `pthread_key_create` all return `None` from [`reason`] and all resolve
+/// through [`crate::symbol`]; and `__mach_`, `__pthread_`, `__dispatch_`,
+/// `_mach_` all return `None`.
+///
+/// It stays changed because the argument here is a *reduced* name, and
+/// `is_implemented` is documented to take a Mach-O name — so this is the
+/// function whose contract matches what it is handed. That is worth having
+/// before someone edits one of the two call sites above.
+///
 /// The threading family needs two more lists than the others: `PASSED_THROUGH`
 /// is what this crate has looked at and vouched for, and `SHIMMED_ABOVE` what it
 /// leaves to the runtime above. Neither has a `symbol` entry.
 fn implemented_here(name: &str) -> bool {
-    crate::is_implemented(name)
+    // `name` arrives reduced, so this must not reduce again.
+    crate::implemented(name).is_some()
 }
 
 pub fn contains(name: &str) -> bool {
@@ -430,16 +460,27 @@ mod tests {
         // itself was here until `crate::dirent` answered it, and is asserted
         // the other way round below.
         assert_eq!(reason("getdirentries"), Some(DIRENT));
-        // A Mach call that reaches the kernel about *memory*, which is the part
-        // of the family `crate::mach` still does not answer.
+        // A Mach call that reaches the kernel about another process, which is
+        // the part of the family `crate::mach` still does not answer.
         //
-        // `mach_vm_allocate` used to be the name here. It is not any more:
-        // `crate::mach::vm` now answers the whole `mach_vm_*` map/region
-        // family, so naming it would assert the opposite of the truth. The
-        // Framework still imports `mach_vm_purgable_control` (at
-        // `+0x81c4106`) and nothing here implements it, so it is the honest
-        // witness for "a Mach memory call this crate declines".
-        assert_eq!(reason("mach_vm_purgable_control"), Some(MACH));
+        // This witness used to be `mach_vm_purgable_control`, and it moved for a
+        // reason worth recording. `crate::mach::vm` now answers the whole
+        // `mach_vm_*` map/region family, so that name was the last member of the
+        // `mach_` prefix this crate declined - and it is no longer declined at
+        // all: `crate::last_unavailable` now publishes it, because the Framework
+        // imports it at `+0x81c4106` and the instruction *after* the call,
+        // `+0x81c410b`, reads its out-parameter with no status test whatsoever.
+        // Leaving it here would have meant leaving that import **unbound** - a
+        // zero in its slot, and a jump through it on every Mach VM walk - which
+        // is the one outcome in this project that is strictly worse than a
+        // refusal. `divergent` denies a name; it cannot publish one.
+        //
+        // So the witness moves rather than disappears. `task_for_pid` is still
+        // declined by the `task_` prefix (asserted independently, with
+        // `task_threads`, in the test below), it carries the same `MACH` reason
+        // (`PREFIXES` maps `mach_` and `task_` to the same string), and it is
+        // still true: the kernel is not asked about another process here.
+        assert_eq!(reason("task_for_pid"), Some(MACH));
         assert_eq!(
             reason("strlen"),
             None,
@@ -509,10 +550,14 @@ mod tests {
         assert!(contains("dispatch_source_set_timer"));
         assert!(contains("dispatch_source_testcancel"));
         // The half of Mach that is still refused: anything asking the kernel
-        // about a task's memory, or about another process at all. As above,
-        // `mach_vm_read` is answered now, so the witness is a `mach_vm_*` name
-        // that is not.
-        assert!(contains("mach_vm_purgable_control"));
+        // about a task's memory, or about another process at all. `mach_vm_read`
+        // is answered now, and so is `mach_vm_purgable_control` - `crate::mach::vm`
+        // takes the first, and `crate::last_unavailable` publishes the second,
+        // because the guest reads that one's out-parameter without testing the
+        // status and an unbound slot there is a jump through a zero. The
+        // `task_` prefix is therefore the witness now, and it is a *live* one:
+        // `reason` returns `None` for anything `crate::is_implemented` answers
+        // for, so this assertion would fail the moment one of them was published.
         assert!(contains("task_for_pid"));
         assert!(contains("task_threads"));
     }

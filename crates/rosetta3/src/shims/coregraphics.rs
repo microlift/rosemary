@@ -131,21 +131,6 @@ fn rect_accessor(symbol: &str, ctx: &mut RegisterContext, mem: &mut dyn GuestMem
     Ok(())
 }
 
-/// `bool CGRectEqualToRect(CGRect, CGRect)`: both on the guest's stack, one
-/// after the other. Compared standardized, as CoreGraphics compares them, so a
-/// rectangle with a negative size equals the one it describes.
-fn rect_equal(symbol: &str, ctx: &mut RegisterContext, mem: &mut dyn GuestMemory) -> Result<()> {
-    let standard = |r: CgRect| {
-        let (x, width) = if r.width < 0.0 { (r.x + r.width, -r.width) } else { (r.x, r.width) };
-        let (y, height) = if r.height < 0.0 { (r.y + r.height, -r.height) } else { (r.y, r.height) };
-        [x, y, width, height]
-    };
-    let a = standard(rect_argument(symbol, ctx, mem, 0)?);
-    let b = standard(rect_argument(symbol, ctx, mem, 32)?);
-    ctx.rax = u64::from(a == b);
-    Ok(())
-}
-
 /// `CGPoint CGEventGetLocation(CGEventRef)`
 ///
 /// Sixteen bytes of two `double`s, which is the case the two ABIs **agree** about -
@@ -290,7 +275,17 @@ pub fn shim_for(name: &str) -> Option<Shim> {
         "CGContextDrawImage" => Some(context_draw_image),
         "CGEventGetLocation" => Some(event_location),
         "NSInsetRect" => Some(inset_rect),
-        "CGRectEqualToRect" | "NSEqualRects" => Some(rect_equal),
+        // `CGRectEqualToRect` is deliberately **not** shimmed. It used to be,
+        // comparing standardized, while `darwin::cg_unavailable` compared the
+        // four fields — and because `shims::dispatch` runs *before* the bound
+        // address is called (`abi/mod.rs:256`), the shim won every call while
+        // the published row won every `dlsym`. Three definitions, two
+        // disagreeing answers, one name. Apple's contract is the field
+        // comparison: "equal size and origin values", and `origin`/`size` are
+        // the stored fields, so `darwin::cg_unavailable` is right and the
+        // shim was wrong. Removing the arm leaves one publisher. Removing it
+        // *without* the appkit row would have left the same split-brain with
+        // the two sides swapped, so the two edits are not separable.
         // A `CGPoint` **argument** in the middle of three scalars; see
         // [`event_create_mouse`] for why that moves `mouseButton` a register.
         "CGEventCreateMouseEvent" => Some(event_create_mouse),

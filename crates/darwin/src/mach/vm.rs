@@ -215,10 +215,19 @@ fn parse(line: &str) -> Option<Region> {
 /// - `VM_REGION_TOP_INFO` (**12**) at `Chromium Framework+0x5d98f22`, in the
 ///   function that deallocates a `ScopedMachSendRight`. Its `obj_id` and
 ///   `ref_count` are ipc-kernel object identities; a real Mac answers with the
-///   name of the memory object the send right refers to, and this tree mints no
-///   such names. The site stores the return code in `r12d` and only turns it
-///   into a `bool` at the end (`cmp r12d, 1 / adc eax, 1` at `+0x5d990ab`), so
-///   a refusal is `false` and nothing more.
+///   name of the memory object the send right refers to, and **this tree mints
+///   memory objects now** - see [`super::memory_object`] - but it still cannot
+///   answer this, and the reason is different from the one this note used to
+///   give. A port's cross-process identity here is its `Address`, and
+///   `mach::space` has no direction from an `Address` back to a name: a
+///   receiving process *draws* its own name for an address it was sent, so a
+///   region of a memory entry may be backed by an entry this process never
+///   minted and holds a name it chose. Reporting a name would be reporting
+///   whichever name happened to be in the table, which is not the same thing as
+///   naming the object. `obj_id` and `ref_count` are kernel counters with no
+///   host equivalent at all. The site stores the return code in `r12d` and only
+///   turns it into a `bool` at the end (`cmp r12d, 1 / adc eax, 1` at
+///   `+0x5d990ab`), so a refusal is `false` and nothing more.
 /// - `VM_REGION_EXTENDED_INFO` (**13**) at `+0x81c40c5`, in the GPU process's
 ///   IOSurface memory accounting - the same function's strings are `iosurface`,
 ///   `resident_size`, `swapped_out_size` and `dirty_size`, and it reads
@@ -239,8 +248,10 @@ fn unsupported(symbol: &str, flavor: i32) {
     said.push((symbol.to_string(), flavor));
     let because = match flavor {
         12 => {
-            "VM_REGION_TOP_INFO: obj_id and ref_count are ipc-kernel object identities, and \
-                this tree mints no names for VM objects"
+            "VM_REGION_TOP_INFO: obj_id and ref_count are ipc-kernel object identities with no \
+                host equivalent, and a region's memory object has no name to report either - a \
+                port's cross-process identity here is its Address, and mach::space has no \
+                direction from an Address back to the name this process happens to hold it under"
         }
         13 => {
             "VM_REGION_EXTENDED_INFO: pages_resident, pages_swapped_out, pages_dirtied and \
@@ -586,9 +597,16 @@ pub unsafe extern "C" fn vm_deallocate(task: Name, address: u64, size: u64) -> i
     }
     // SAFETY: the caller states this is its own mapping.
     let out = unsafe { libc::munmap(address as *mut c_void, size as usize) };
-    match out {
-        0 => KERN_SUCCESS,
-        _ => KERN_INVALID_ADDRESS,
+    if out == 0 {
+        // A mapping of a memory entry is remembered so that a later
+        // `mach_make_memory_entry_64` over one of its addresses can find the
+        // pages behind it. Once the range is gone the record is worse than
+        // useless: it would name a file for an address that is now something
+        // else.
+        super::memory_object::forget(address, size);
+        KERN_SUCCESS
+    } else {
+        KERN_INVALID_ADDRESS
     }
 }
 
@@ -807,31 +825,126 @@ pub unsafe extern "C" fn vm_allocate(
 }
 
 /// `kern_return_t vm_map(vm_map_t target_task, vm_address_t *address,
-/// vm_size_t size, memory_object_t memory_object, vm_offset_t offset,
-/// vm_prot_t current_protection, vm_prot_t max_protection,
-/// vm_inherit_t inheritance, boolean_t wired, boolean_t user_wired,
-/// vm_tag_t tag)`
+/// vm_size_t size, vm_offset_t offset, boolean_t anywhere, memory_object_t
+/// memory_object, vm_offset_t file_offset, boolean_t docow, vm_prot_t
+/// current_protection, vm_prot_t max_protection, vm_inherit_t inheritance)`
 ///
-/// **Implemented for the anonymous map, refused for the file-backed one.** All
-/// three call sites in the image are in
-/// `base/memory/platform_shared_memory_region_apple.cc` - the file's own
-/// strings for `mach_make_memory_entry_64`, `vm_deallocate`, `vm_map` and
-/// `"VM region has a wrong protection mask: it is"` are in the same
-/// translation unit as the call sites, at `+0x5d94adc`, `+0x5d94bd9` and
-/// `+0x5d952db` - and **all three pass `MACH_PORT_NULL` in `rcx`**, the fourth
-/// argument, which is the `memory_object`. So all three are anonymous, and an
-/// `mmap` is the whole of what they need.
+/// # The parameter order, which this function used to get wrong
 ///
-/// A `memory_object` that is not null is refused rather than answered with an
-/// anonymous mapping, because that is the one case where the answer would be a
-/// plausible lie: the guest asked for two processes to share a page and would
-/// be handed two private copies. The third site is exactly that shape - it
-/// sits in the function that calls `mach_make_memory_entry_64` to make a memory
-/// entry from a file descriptor, and that call is *itself* still unbound, so
-/// the site is unreachable in this runtime today.
+/// **Eleven parameters, and the fourth is `offset` and the sixth is
+/// `memory_object`.** That is `<mach/vm_prot.h>`'s declaration and XNU's MIG
+/// definition, `osfmk/mach/vm_map.defs`:
 ///
-/// `wired` memory is refused for the same reason: pinning a page is a real,
-/// different thing that `mmap` cannot do.
+/// ```text
+/// routine vm_map(
+///         target_task     : vm_map_read_t;
+/// inout  address         : vm_address_t;
+///         size            : vm_size_t;
+///         offset          : vm_offset_t;
+///         anywhere        : boolean_t;
+///         object          : memory_object_t;
+///         file_offset     : vm_offset_t;
+///         docow           : boolean_t;
+///         cur_protection  : vm_prot_t;
+///         max_protection  : vm_prot_t;
+///         inheritance     : vm_inherit_t);
+/// ```
+///
+/// The signature this function carried instead was
+/// `(task, address, size, memory_object, offset, current_protection,
+/// max_protection, inheritance, wired, user_wired, tag)`, which is wrong from
+/// the **fourth** parameter on and wrong in a way that a reader could not see
+/// from the count: it has eleven parameters too, and the same eleven *kinds*
+/// in the same *kinds* of order, because `wired`/`user_wired`/`tag` and
+/// `file_offset`/`docow` are all integers. The trailing five were a
+/// four-byte-wide tail read as
+/// `max_protection, inheritance, wired, user_wired, tag`, while the real
+/// trailing five start with an **eight**-byte `file_offset` - so the old list
+/// was not merely misnamed, it was *shifted by four bytes* against the stack
+/// the caller had actually built, and `inheritance` was never read at all.
+///
+/// Three call sites in the image reach this, all in
+/// `base/memory/platform_shared_memory_region_apple.cc`: a byte scan of every
+/// `e8 rel32` in `__TEXT,__text` (214 MB) for **both** `_vm_map` stubs -
+/// `0xcca16a4` and `0xcca3ba6`, which `macho.py`'s `stub_at` answers with the
+/// same name - finds `+0x5d94adc`, `+0x5d94bd9` and `+0x5d952db` against the
+/// first and **zero** against the second. The three that is a real count only
+/// because the same scan reports three for the first stub; a scan of one stub
+/// alone would have been a coin toss.
+///
+/// | | `+0x5d94adc` | `+0x5d94bd9` | `+0x5d952db` |
+/// |---|---|---|---|
+/// | function | `MapAt` | `CheckPlatformHandlePermissionsCorrespondToMode` | `ConvertToReadOnly` |
+/// | `size` (`rdx`) | `r14` = its 6th argument | `r15` = its 5th | `[r12+0x18]` |
+/// | `offset` (`rcx`) | `xor ecx,ecx` - 0 | `xor ecx,ecx` - 0 | `xor ecx,ecx` - 0 |
+/// | `anywhere` (`r8d`) | `mov r8d,0x1` | `mov r8d,0x1` | `mov r8d,0x1` |
+/// | `memory_object` (`r9d`) | its 3rd argument | `[rsi+8]` - `handle_` | `ebx` - the handle |
+/// | `file_offset` | `rax` = its 5th argument | `push 0x0` | `push 0x0` |
+/// | `docow` | `push 0x0` | `push 0x0` | `push 0x0` |
+/// | `current_protection` | `r10` = `permissions*2+1` | `push 0x3` | `push 0x1` |
+/// | `max_protection` | `r10` | `push 0x3` | `push 0x1` |
+/// | `inheritance` | `push 0x2` | `push 0x2` | `push 0x2` |
+///
+/// The register half is `lea r10d,[rcx*2+0x1]` for the protection pair at
+/// `+0x5d94ab8`, and the stack half is five pushes whose order in memory is
+/// fixed by the fact that the *last* push is the lowest address - read at
+/// `+0x5d952d1..+0x5d952db` as `0, 0, 1, 1, 2` for `file_offset, docow,
+/// VM_PROT_READ, VM_PROT_READ, VM_INHERIT_NONE`, which is
+/// `vm_map(mach_task_self(), &temp_addr, size_, 0, VM_FLAGS_ANYWHERE,
+/// handle_copy.get(), 0, FALSE, VM_PROT_READ, VM_PROT_READ, VM_INHERIT_NONE)`
+/// as `base/memory/platform_shared_memory_region_apple.cc` writes it. The
+/// `permissions*2+1` is the same file's protection table: `0 -> VM_PROT_READ`,
+/// `1 -> VM_PROT_READ|VM_PROT_WRITE`, `2 -> VM_PROT_READ|VM_PROT_EXECUTE`.
+///
+/// ## What the old order did to those three sites
+///
+/// It made the memory-object check **dead code**: it read `rcx`, which is zero
+/// at all three, so the branch never ran. The port then landed in
+/// `current_protection` (`r9`) and was turned away there as a protection mask
+/// with bits outside `VM_PROT_ALL` - a refusal that fires and names the wrong
+/// argument, which is the failure mode this file is written to avoid. The
+/// correct `memory_object != MACH_PORT_NULL` refusal fires at the same three
+/// sites, returns the **same** `KERN_INVALID_ARGUMENT` (so nothing the guest
+/// branches on changes), and names the argument that is actually wrong.
+///
+/// The fifth argument is a **`boolean_t anywhere`**, not a `VM_FLAGS_*` word.
+/// `VM_FLAGS_ANYWHERE` happens to be 1 and the image passes 1 at all three
+/// sites, so the two cannot be told apart from the values alone - but
+/// [`mach_vm_map`]'s fifth argument *is* a flag word, and reading this one as
+/// flags would be a different mistake. It is honoured here as the boolean it
+/// is: a non-zero `anywhere` lets the host choose the address, and a zero one
+/// means "at `*address`", which is refused if anything is already mapped there
+/// (Mach has no `VM_FLAGS_OVERWRITE` to say "replace it", and that is the
+/// refusal `vm_map_locate_space_fixed` produces).
+///
+/// # What is answered, and what is not
+///
+/// - **A `memory_object` is mapped, and it is the same pages.** The entry is a
+///   file in a per-user directory named by the port's `Address`, mapped
+///   `MAP_SHARED`, so this process and a child that was sent the port see one
+///   page cache. See [`super::memory_object`] for how the port reaches the
+///   child, which is the half that made an earlier refusal of this branch
+///   unavoidable.
+/// - **`memory_object` with a protection above the entry's own maximum is
+///   `KERN_INVALID_RIGHT`**, and that is the code
+///   `CheckPlatformHandlePermissionsCorrespondToMode` reads to decide a region
+///   is read-only.
+/// - **`offset != 0` with a memory object is refused by name.** `offset` is an
+///   address in the *target task* - the object already mapped there - and
+///   ignoring it would answer a different request as asked.
+/// - **`docow != 0` is refused by name**: a copy-on-write clone of a memory
+///   object, which an anonymous mapping has no meaning for.
+/// - **`inheritance` must be `VM_INHERIT_SHARE`, `VM_INHERIT_COPY` or
+///   `VM_INHERIT_NONE`**, for [`mach_vm_map`]'s reason: `VM_INHERIT_DONATE_COPY`
+///   deletes the parent's mapping and `mmap(2)` cannot say that.
+/// - **`offset` and `file_offset` are ignored when there is no memory object**,
+///   because there is nothing for either to index into and Mach ignores them
+///   too. Stated rather than left to be inferred from their absence.
+/// - **`max_protection` is not recorded as a ceiling**, for [`vm_protect`]'s
+///   reason: Linux has no per-mapping limit on later protection changes. For a
+///   range backed by a memory entry the *entry's* ceiling is enforced instead,
+///   by [`vm_protect`], because that one is a promise about the pages rather
+///   than about the mapping.
 ///
 /// # Safety
 ///
@@ -841,20 +954,21 @@ pub unsafe extern "C" fn vm_map(
     task: Name,
     address: *mut u64,
     size: u64,
-    memory_object: Name,
     offset: u64,
+    anywhere: u32,
+    memory_object: Name,
+    file_offset: u64,
+    docow: u32,
     current_protection: i32,
     max_protection: i32,
-    inheritance: i32,
-    wired: u32,
-    user_wired: u32,
-    tag: u32,
+    inheritance: u32,
 ) -> i32 {
     static SAID_TASK: Flag = Flag::new(false);
     static SAID_NULL: Flag = Flag::new(false);
-    static SAID_OBJECT: Flag = Flag::new(false);
-    static SAID_WIRED: Flag = Flag::new(false);
+    static SAID_DCOW: Flag = Flag::new(false);
+    static SAID_INHERIT: Flag = Flag::new(false);
     static SAID_PROT: Flag = Flag::new(false);
+    static SAID_CLASH: Flag = Flag::new(false);
 
     if address.is_null() {
         note("vm_map", &SAID_NULL, "a null `vm_address_t *`");
@@ -869,27 +983,101 @@ pub unsafe extern "C" fn vm_map(
         return KERN_INVALID_ARGUMENT;
     }
     if memory_object != MACH_PORT_NULL {
+        if docow != 0 {
+            note(
+                "vm_map",
+                &SAID_DCOW,
+                &format!(
+                    "docow {docow} asks for a copy-on-write clone of memory object \
+                     {memory_object:#x}; the pages would be a second mapping of the same object \
+                     that a later write does not reach, and this host does not build one"
+                ),
+            );
+            return KERN_INVALID_ARGUMENT;
+        }
+        if inheritance > VM_INHERIT_NONE {
+            note(
+                "vm_map",
+                &SAID_INHERIT,
+                &format!(
+                    "inheritance {inheritance} is not one of VM_INHERIT_SHARE (0), \
+                     VM_INHERIT_COPY (1) or VM_INHERIT_NONE ({VM_INHERIT_NONE})"
+                ),
+            );
+            return KERN_INVALID_ARGUMENT;
+        }
+        let Some(prot) = host_protection(current_protection) else {
+            note(
+                "vm_map",
+                &SAID_PROT,
+                &format!(
+                    "current_protection {current_protection:#x} has a bit outside VM_PROT_ALL \
+                     ({VM_PROT_ALL:#x}) in it"
+                ),
+            );
+            return KERN_INVALID_ARGUMENT;
+        };
+        let _ = prot;
+        let page = page_size();
+        if page == 0 {
+            return KERN_INVALID_ARGUMENT;
+        }
+        // The caller's hint, read before anything is mapped: a fixed request
+        // hands it on, and an anywhere request hands back whatever the host
+        // chose.
+        //
+        // SAFETY: the caller's `address`, checked non-null above.
+        let hint = unsafe { std::ptr::read(address) };
+        let status = super::memory_object::map(super::memory_object::Request {
+            object: memory_object,
+            offset,
+            file_offset,
+            size,
+            protection: current_protection,
+            max_protection,
+            anywhere: anywhere != 0,
+            hint,
+            page,
+            symbol: "vm_map",
+        });
+        let Some(got) = status.ok() else {
+            return status.err().unwrap_or(KERN_FAILURE);
+        };
+        // SAFETY: the caller's `address`, checked non-null above.
+        unsafe { *address = got };
+        if max_protection != current_protection {
+            note(
+                "vm_map",
+                &SAID_PROT,
+                &format!(
+                    "max_protection {max_protection:#x} is not recorded as a ceiling on this \
+                     range: Linux has no per-mapping limit on later protection changes, so the \
+                     ceiling that does exist is the memory entry's, and vm_protect enforces that \
+                     one instead - see super::memory_object"
+                ),
+            );
+        }
+        return KERN_SUCCESS;
+    }
+    if docow != 0 {
         note(
             "vm_map",
-            &SAID_OBJECT,
+            &SAID_DCOW,
             &format!(
-                "memory_object {memory_object:#x} asks for a file- or pager-backed mapping; the \
-                 pages would have to be shared with whatever holds that object, and an anonymous \
-                 mapping would answer with private copies - which is a plausible wrong answer, \
-                 not a slow one. This is the shape base/memory/\
-                 platform_shared_memory_region_apple.cc's MapAt() takes"
+                "docow {docow} asks for a copy-on-write clone of a memory object; with memory \
+                 object MACH_PORT_NULL there is nothing to clone"
             ),
         );
         return KERN_INVALID_ARGUMENT;
     }
-    if wired != 0 || user_wired != 0 {
+    if inheritance > VM_INHERIT_NONE {
         note(
             "vm_map",
-            &SAID_WIRED,
+            &SAID_INHERIT,
             &format!(
-                "wired {wired}, user_wired {user_wired}: a wired mapping is locked in physical \
-                 memory, which mmap(2) cannot do and which a caller that asked for it will rely \
-                 on"
+                "inheritance {inheritance} is not one of VM_INHERIT_SHARE (0), VM_INHERIT_COPY \
+                 (1) or VM_INHERIT_NONE ({VM_INHERIT_NONE}); VM_INHERIT_DONATE_COPY (3) deletes \
+                 the parent's mapping, which mmap(2) has no way to express"
             ),
         );
         return KERN_INVALID_ARGUMENT;
@@ -925,28 +1113,115 @@ pub unsafe extern "C" fn vm_map(
         unsafe { *address = std::ptr::read(address) };
         return KERN_SUCCESS;
     }
-    // `offset` is only meaningful with a memory object; with `MACH_PORT_NULL`
-    // Mach ignores it and so does this, which is why a non-zero offset is not
-    // a refusal. `inheritance` and `tag` are the other two: `VM_INHERIT_COPY`
-    // is what a private mapping does across a `fork(2)`, and a `vm_tag_t` is an
-    // accounting label with no zones to record it in.
-    let _ = (offset, inheritance, tag);
-    // SAFETY: an anonymous mapping of `size` bytes, or `MAP_FAILED`.
+    // `offset` and `file_offset` index into an object, and there is no object:
+    // Mach ignores both here and so does this, which is why a non-zero one is
+    // not a refusal. Stated rather than left to be inferred.
+    let _ = (offset, file_offset);
+    let page = page_size();
+    if page == 0 {
+        return KERN_INVALID_ARGUMENT;
+    }
+    // SAFETY: the caller's `address`, checked non-null above.
+    let hint = unsafe { std::ptr::read(address) };
+    let anywhere_requested = anywhere != 0;
+    if !anywhere_requested {
+        // `vm_map` has no `VM_FLAGS_OVERWRITE` - its fifth argument is the
+        // boolean, not a flag word - so there is no way to ask for a fixed
+        // mapping to replace what is there, and Mach refuses instead. That is
+        // `vm_map_locate_space_fixed` returning `KERN_MEMORY_PRESENT`, turned
+        // into `KERN_NO_SPACE` for the caller, which is the reading
+        // [`mach_vm_map`] uses for the same thing.
+        if hint & (page - 1) != 0 {
+            note(
+                "vm_map",
+                &SAID_CLASH,
+                &format!(
+                    "anywhere is FALSE, so the mapping has to be exactly at {hint:#x}, which is \
+                     not a multiple of the {page:#x} page size; a Mach mapping is page-granular \
+                     and MAP_FIXED cannot round one without moving the range the caller asked to \
+                     be exactly here"
+                ),
+            );
+            return KERN_INVALID_ARGUMENT;
+        }
+        match range_is_mapped(hint, hint + size) {
+            Some(true) => {
+                note(
+                    "vm_map",
+                    &SAID_CLASH,
+                    &format!(
+                        "{hint:#x}+{size:#x} is already mapped and vm_map has no \
+                         VM_FLAGS_OVERWRITE to ask for it to be replaced, so Mach answers \
+                         KERN_NO_SPACE; MAP_FIXED would have replaced it"
+                    ),
+                );
+                return KERN_NO_SPACE;
+            }
+            // Nothing was read, so nothing is claimed: the call is refused and
+            // the refusal says why rather than asserting a clash it did not see.
+            None => {
+                note(
+                    "vm_map",
+                    &SAID_CLASH,
+                    &format!(
+                        "{hint:#x}+{size:#x} was asked for as a fixed mapping and \
+                         /proc/self/maps could not be read, so whether anything is there is \
+                         unknown. MAP_FIXED would have replaced it without asking, so the call \
+                         is refused instead"
+                    ),
+                );
+                return KERN_NO_SPACE;
+            }
+            Some(false) => {}
+        }
+    }
+    // `MAP_NORESERVE` because Mach does not commit a range at map time either,
+    // and `MAP_PRIVATE|MAP_ANONYMOUS` because `VM_INHERIT_COPY` - the default,
+    // and the only inheritance a `fork(2)` child can be given over a private
+    // range - is exactly what those two mean.
+    let host_flags = libc::MAP_PRIVATE
+        | libc::MAP_ANONYMOUS
+        | libc::MAP_NORESERVE
+        | if anywhere_requested { 0 } else { libc::MAP_FIXED };
+    // SAFETY: an anonymous mapping of `size` bytes, or `MAP_FAILED`. A fixed
+    // request names a page-aligned address the caller checked is free above; an
+    // anywhere request passes 0 and lets the host choose.
     let got = unsafe {
         libc::mmap(
-            0 as *mut c_void,
+            if anywhere_requested {
+                std::ptr::null_mut()
+            } else {
+                hint as *mut c_void
+            },
             size as usize,
             prot,
-            libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+            host_flags,
             -1,
             0,
         )
     };
     if got == libc::MAP_FAILED {
-        return KERN_RESOURCE_SHORTAGE;
+        let err = std::io::Error::last_os_error();
+        return match err.raw_os_error() {
+            Some(libc::EINVAL) => KERN_INVALID_ARGUMENT,
+            Some(libc::ENOMEM) => KERN_NO_SPACE,
+            _ => KERN_RESOURCE_SHORTAGE,
+        };
     }
     // SAFETY: `got` is a whole mapping of `size` bytes from the call above.
     unsafe { *address = got as u64 };
+    if max_protection != current_protection {
+        note(
+            "vm_map",
+            &SAID_PROT,
+            &format!(
+                "max_protection {max_protection:#x} is not recorded as a ceiling: Linux has no \
+                 per-mapping limit on later protection changes and mmap(2) takes a protection \
+                 with no maximum beside it, so this range can be re-opened beyond \
+                 {max_protection:#x}. current_protection {current_protection:#x} was applied"
+            ),
+        );
+    }
     KERN_SUCCESS
 }
 
@@ -992,6 +1267,7 @@ pub unsafe extern "C" fn vm_protect(
     static SAID_TASK: Flag = Flag::new(false);
     static SAID_PROT: Flag = Flag::new(false);
     static SAID_RANGE: Flag = Flag::new(false);
+    static SAID_CEILING_ENTRY: Flag = Flag::new(false);
 
     if task != TASK_SELF {
         note(
@@ -1016,6 +1292,34 @@ pub unsafe extern "C" fn vm_protect(
     // a zero length succeeds too, and saying so here keeps the two agreeing.
     if size == 0 {
         return KERN_SUCCESS;
+    }
+    // **The one ceiling this does enforce is a memory entry's**, and it is a
+    // different kind of promise from the caller's own `max_protection`. A caller
+    // names its own ceiling and can be trusted to stay under it; a memory
+    // entry's is a property of the *pages*, and a guest that could re-open a
+    // read-only region with `vm_protect` would be writing into memory
+    // `ConvertToReadOnly` promised nobody could write to - a silent security
+    // hole rather than a slow answer. XNU refuses it in `vm_protect` itself
+    // (`if ((max_protection & protbits) != max_protection) return
+    // KERN_PROTECTION_FAILURE;`), so this is the kernel's own code and its own
+    // return value. `None` is the answer for a range that is not a memory
+    // entry's, and the ordinary "not honoured" note below still applies there.
+    if let Some(ceiling) = super::memory_object::ceiling_of(address) {
+        let asked = current_protection | max_protection;
+        if asked & !ceiling != 0 {
+            note(
+                "vm_protect",
+                &SAID_CEILING_ENTRY,
+                &format!(
+                    "{address:#x}+{size:#x} is a mapping of a memory entry whose maximum \
+                     protection is {ceiling:#x}, and {asked:#x} was asked of it. Mach answers \
+                     KERN_PROTECTION_FAILURE here, and the promise being enforced is the one \
+                     base::subtle::PlatformSharedMemoryRegion::ConvertToReadOnly makes when it \
+                     replaces a writable handle with a read-only one"
+                ),
+            );
+            return KERN_PROTECTION_FAILURE;
+        }
     }
     // SAFETY: the caller's obligation - `address` and `size` describe a mapping
     // this process made. `mprotect` writes nothing.
@@ -1180,7 +1484,7 @@ fn page_size() -> u64 {
 /// silently replaced an existing mapping would be the worst possible outcome,
 /// and it must not be reported as "it was already mapped" when nothing was
 /// actually read.
-fn range_is_mapped(start: u64, end: u64) -> Option<bool> {
+pub(crate) fn range_is_mapped(start: u64, end: u64) -> Option<bool> {
     let maps = std::fs::read_to_string("/proc/self/maps").ok()?;
     Some(
         maps.lines()
@@ -1256,11 +1560,11 @@ fn range_is_mapped(start: u64, end: u64) -> Option<bool> {
 ///
 /// ### What is answered, and what is not
 ///
-/// - **`object != MACH_PORT_NULL` is refused by name.** A memory entry is an
-///   ipc-kernel name standing for a memory object; mapping one is how a Mach
-///   process shares pages with another, and an anonymous `mmap` would answer
-///   with private copies - a plausible wrong answer, not a slow one. This is
-///   the same policy [`vm_map`] already applies to the same argument.
+/// - **`object != MACH_PORT_NULL` is refused by name**, and the message says
+///   which shape it is: the three sites that reach a non-null object here are
+///   `v8::Sandbox`'s own reservation, not a shared region. A memory entry **is**
+///   mapped - by [`vm_map`], whose sixth argument is the same word, through
+///   [`super::memory_object`].
 /// - **`copy != 0` is refused by name**: a copy-on-write clone of a memory
 ///   object, which an anonymous mapping has no meaning for.
 /// - **`VM_FLAGS_PURGABLE` and every other unlisted flag is refused by name**,
@@ -1337,11 +1641,17 @@ pub unsafe extern "C" fn mach_vm_map(
             "mach_vm_map",
             &SAID_OBJECT,
             &format!(
-                "object {object:#x} is a memory entry, so the pages have to be shared with \
-                 whatever holds that memory object; an anonymous mapping would answer with \
-                 private copies, which is a plausible wrong answer rather than a slow one. The \
-                 mach_make_memory_entry_64 that would mint one is not implemented either, so this \
-                 call is not reachable from the image today"
+                "object {object:#x} is a memory entry, and the pages have to be shared with \
+                 whatever holds it; an anonymous mapping would answer with private copies, which \
+                 is a plausible wrong answer rather than a slow one. **This call is refused even \
+                 though a memory entry is now something this tree can map** - see \
+                 super::memory_object - because the three sites that reach a non-null object here \
+                 (+0x7e60668, +0x7e6069b and +0x7e5f255) are v8::Sandbox's own reservation, \
+                 not a shared region: the function at +0x7e60610 range-checks its second argument \
+                 against 6 and indexes the six-entry protection table at +0xd3caf60 (0, 1, 3, 7, \
+                 5, 0 - v8::Sandbox::Protection, kNone .. kRemoved), and +0x7e5f255 is in the \
+                 function carrying VirtualAddressSubspace::FreePages. A memory entry is mapped by \
+                 vm_map, whose sixth argument is the same word and which answers it"
             ),
         );
         return KERN_INVALID_ARGUMENT;
@@ -2025,6 +2335,7 @@ pub unsafe extern "C" fn mach_vm_write(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use super::super::space::MACH_PORT_DEAD;
 
     /// The structure is 36 bytes with `offset` at 20, which is the whole reason
     /// this file declares it packed. A caller that offers the 9 words the image
@@ -2279,6 +2590,311 @@ mod tests {
         };
         assert_eq!(status, KERN_INVALID_ARGUMENT);
         assert_eq!(address, 0, "a refusal leaves *address alone");
+    }
+
+    /// **The signature's fifth argument, which is the witness that the order is
+    /// now the real one.** Darwin's `vm_map` takes a `boolean_t anywhere` there
+    /// and nothing else; under the order this function used to carry, `r8` was
+    /// `offset` and `r9` was `current_protection`, so *both* of these calls
+    /// would have had their hint ignored and been answered with an anonymous
+    /// mapping wherever the host liked. One now succeeds at a page-aligned
+    /// address the caller named and the other is refused for asking for an
+    /// unaligned one, which is `vm_map_locate_space_fixed`'s
+    /// `VM_MAP_PAGE_ALIGNED` check and cannot be true of a word nobody read.
+    #[test]
+    fn the_fifth_argument_is_the_anywhere_boolean_and_not_a_flags_word() {
+        let page = page_size();
+        let want = 0x7004_0000_0000_u64 & !(page - 1);
+        let mut fixed = want;
+        // SAFETY: `fixed` is a live word and the range is free - the address is
+        // outside everything this binary's other fixed-map tests use.
+        let status = unsafe {
+            vm_map(
+                TASK_SELF,
+                &mut fixed,
+                page,
+                0, // offset
+                0, // anywhere = FALSE: map exactly here
+                MACH_PORT_NULL,
+                0, // file_offset
+                0, // docow
+                VM_PROT_READ | VM_PROT_WRITE,
+                VM_PROT_READ | VM_PROT_WRITE,
+                VM_INHERIT_COPY,
+            )
+        };
+        assert_eq!(status, KERN_SUCCESS, "a fixed map at {want:#x}");
+        assert_eq!(fixed, want, "anywhere = FALSE must be honoured exactly");
+        // SAFETY: the mapping the call above made.
+        unsafe { assert_eq!(libc::munmap(fixed as *mut c_void, page as usize), 0) };
+
+        // The same request with `anywhere` set: the address is a hint now, so
+        // whatever comes back is the host's answer and only has to be a real
+        // page-granular mapping. Nothing here depends on which address the
+        // allocator picks, because the *fixed* call above is the witness: this
+        // function used to pass 0 to `mmap` whatever the fifth argument said,
+        // so it could not have returned `want` exactly.
+        let mut anywhere_else = want;
+        // SAFETY: as above.
+        let status = unsafe {
+            vm_map(
+                TASK_SELF,
+                &mut anywhere_else,
+                page,
+                0,
+                1, // anywhere = TRUE
+                MACH_PORT_NULL,
+                0,
+                0,
+                VM_PROT_READ | VM_PROT_WRITE,
+                VM_PROT_READ | VM_PROT_WRITE,
+                VM_INHERIT_COPY,
+            )
+        };
+        assert_eq!(status, KERN_SUCCESS);
+        assert_ne!(anywhere_else, 0);
+        assert_eq!(anywhere_else & (page - 1), 0, "a mapping is page-granular");
+        // SAFETY: the mapping the call above made.
+        unsafe { assert_eq!(libc::munmap(anywhere_else as *mut c_void, page as usize), 0) };
+
+        // And a *fixed* request for an unaligned address is refused rather than
+        // rounded, which is the case that would have been silently answered
+        // anywhere had the fifth argument gone unread.
+        let mut unaligned = want + 1;
+        // SAFETY: the call refuses before it maps anything.
+        assert_eq!(
+            unsafe {
+                vm_map(
+                    TASK_SELF,
+                    &mut unaligned,
+                    page,
+                    0,
+                    0,
+                    MACH_PORT_NULL,
+                    0,
+                    0,
+                    VM_PROT_READ,
+                    VM_PROT_READ,
+                    VM_INHERIT_COPY,
+                )
+            },
+            KERN_INVALID_ARGUMENT
+        );
+    }
+
+    /// **The wiring this file's corrected order exists for.** `vm_map` with a
+    /// non-null sixth argument maps the pages the memory entry stands for -
+    /// and the test goes through `vm_map` rather than through
+    /// [`super::memory_object`] directly, because the thing that was wrong was
+    /// this function reading its arguments, not the object behind them.
+    ///
+    /// Under the old parameter order the handle arrived in `current_protection`
+    /// and was refused as an out-of-range protection mask, so no mapping was ever
+    /// made and `*address` stayed zero. Here `*address` comes back with a
+    /// mapping in it, and two of them are **one** page cache.
+    #[test]
+    fn vm_map_maps_the_pages_of_a_memory_entry_rather_than_refusing_it() {
+        let page = page_size();
+        let size = 2 * page;
+        let entry = super::super::memory_object::make(super::super::memory_object::Make::Fresh {
+            size,
+            protection: VM_PROT_READ | VM_PROT_WRITE,
+        })
+        .expect("a host with a writable namespace mints one");
+
+        let mut first = 0_u64;
+        // SAFETY: `first` is a live word and the mapping this makes is this
+        // process's.
+        let status = unsafe {
+            vm_map(
+                TASK_SELF,
+                &mut first,
+                size,
+                0, // offset
+                1, // anywhere
+                entry,
+                0, // file_offset
+                0, // docow
+                VM_PROT_READ | VM_PROT_WRITE,
+                VM_PROT_READ | VM_PROT_WRITE,
+                VM_INHERIT_NONE,
+            )
+        };
+        assert_eq!(status, KERN_SUCCESS, "a memory entry maps");
+        assert_ne!(first, 0, "and *address comes back with a mapping in it");
+
+        let mut second = 0_u64;
+        // SAFETY: as above.
+        assert_eq!(
+            unsafe {
+                vm_map(
+                    TASK_SELF,
+                    &mut second,
+                    size,
+                    0,
+                    1,
+                    entry,
+                    0,
+                    0,
+                    VM_PROT_READ | VM_PROT_WRITE,
+                    VM_PROT_READ | VM_PROT_WRITE,
+                    VM_INHERIT_NONE,
+                )
+            },
+            KERN_SUCCESS
+        );
+        assert_ne!(second, first);
+        // SAFETY: two whole mappings of `size` bytes this test made, and both
+        // buffers are inside them.
+        unsafe {
+            let marker = b"vm_map memory entry";
+            std::ptr::copy_nonoverlapping(marker.as_ptr(), first as *mut u8, marker.len());
+            let mut seen = [0_u8; 6];
+            std::ptr::copy_nonoverlapping((second as *const u8).add(7), seen.as_mut_ptr(), 6);
+            assert_eq!(&seen, b"memory", "two mappings of one object");
+            assert_eq!(libc::munmap(first as *mut c_void, size as usize), 0);
+            assert_eq!(libc::munmap(second as *mut c_void, size as usize), 0);
+        }
+        super::super::memory_object::forget(first, size);
+        super::super::memory_object::forget(second, size);
+    }
+
+    /// A name this process holds that is **not** a memory entry is refused by
+    /// name, and is *not* answered with an anonymous mapping. That is the one
+    /// thing the memory-object branch must never do: a plausible wrong answer
+    /// here would be a mapping of fresh private memory handed to a caller that
+    /// asked to share pages, and nothing downstream could tell.
+    ///
+    /// ## The port is drawn here, not written down
+    ///
+    /// This used to name `0x1003` and say that whether the run had drawn it was
+    /// immaterial. **It is not immaterial, and the test said so falsely.** `0x1003`
+    /// is `mach::space`'s `FIRST_DYNAMIC` - the *first* name any allocation in
+    /// the process gets - so the first memory entry minted anywhere in this test
+    /// binary takes it. Run alone with the entry test above it, `vm_map` was
+    /// handed a real memory entry and answered `KERN_SUCCESS`, and the whole
+    /// suite passed only because some earlier test happened to draw `0x1003`
+    /// first. A test whose result depends on the order of unrelated tests is not
+    /// a witness, and this one was quietly one.
+    ///
+    /// So the two cases are built rather than assumed. `MACH_PORT_DEAD` is a name
+    /// no allocation in this space can ever return, so "this process holds no
+    /// right to it" is a property of the space and not of the run. The second is
+    /// a **live send right to an address with no memory-object directory**,
+    /// which is the harder case - a name this process legitimately holds, of the
+    /// shape a caller really passes, standing for something that is not a memory
+    /// entry. Both must be refused; only `KERN_SUCCESS` would be wrong.
+    #[test]
+    fn vm_map_never_answers_a_memory_object_with_anonymous_memory() {
+        let page = page_size();
+        let probe = |object: Name, what: &str| {
+            let mut address = 0_u64;
+            // SAFETY: `address` is a live word; the call refuses or maps, and
+            // nothing else is dereferenced either way.
+            let status = unsafe {
+                vm_map(
+                    TASK_SELF,
+                    &mut address,
+                    page,
+                    0,
+                    1,
+                    object,
+                    0,
+                    0,
+                    VM_PROT_READ,
+                    VM_PROT_READ,
+                    VM_INHERIT_NONE,
+                )
+            };
+            assert_ne!(status, KERN_SUCCESS, "{what}");
+            if status == KERN_SUCCESS {
+                // SAFETY: only reachable if the assertion above is wrong, and
+                // then it is this process's own mapping.
+                unsafe { libc::munmap(address as *mut c_void, page as usize) };
+            }
+        };
+        probe(MACH_PORT_DEAD, "a name no allocation in this space can return");
+        // A send right this process holds, for an address no entry was minted
+        // at. `fresh_address` is 64 random bits (`getrandom`), so it cannot be an
+        // entry another test minted - and if it somehow were, this fails loudly
+        // rather than passing by luck.
+        let stranger = super::super::space::insert_send(super::super::wire::fresh_address());
+        probe(stranger, "a live right that is not a memory entry");
+        super::super::space::destroy(stranger);
+    }
+
+    /// A fixed `vm_map` over something that is already mapped is
+    /// `KERN_NO_SPACE`: `vm_map`'s fifth argument is a boolean, so there is no
+    /// `VM_FLAGS_OVERWRITE` to ask for a replacement, and `MAP_FIXED` would
+    /// have replaced a live range without being asked to.
+    #[test]
+    fn a_fixed_vm_map_over_something_mapped_is_no_space() {
+        let page = page_size();
+        let page_vec = vec![0_u8; page as usize];
+        let start = (page_vec.as_ptr() as u64) & !(page - 1);
+        let mut address = start;
+        // SAFETY: `address` is a live word; the range belongs to `page_vec`.
+        let status = unsafe {
+            vm_map(
+                TASK_SELF,
+                &mut address,
+                page,
+                0,
+                0,
+                MACH_PORT_NULL,
+                0,
+                0,
+                VM_PROT_READ,
+                VM_PROT_READ,
+                VM_INHERIT_NONE,
+            )
+        };
+        assert_eq!(status, KERN_NO_SPACE);
+        assert_eq!(address, start, "a refusal leaves *address alone");
+    }
+
+    /// The two arguments the real signature has and the invented one did not:
+    /// `docow`, a copy-on-write clone of a memory object, and
+    /// `VM_INHERIT_DONATE_COPY`, which deletes the parent's mapping. Neither is
+    /// an `mmap(2)` operation, so both are refused by name rather than
+    /// approximated.
+    #[test]
+    fn docow_and_a_donating_inheritance_are_refused_by_name() {
+        let page = page_size();
+        let mut address = 0_u64;
+        // SAFETY: both calls refuse before they map anything.
+        let copying = unsafe {
+            vm_map(
+                TASK_SELF,
+                &mut address,
+                page,
+                0,
+                1,
+                MACH_PORT_NULL,
+                0,
+                1, // docow
+                VM_PROT_READ,
+                VM_PROT_READ,
+                VM_INHERIT_NONE,
+            )
+        };
+        assert_eq!(copying, KERN_INVALID_ARGUMENT);
+        let donating = unsafe {
+            vm_map(
+                TASK_SELF,
+                &mut address,
+                page,
+                0,
+                1,
+                MACH_PORT_NULL,
+                0,
+                0,
+                VM_PROT_READ,
+                VM_PROT_READ,
+                3, // VM_INHERIT_DONATE_COPY
+            )
+        };
+        assert_eq!(donating, KERN_INVALID_ARGUMENT);
     }
 
     /// A fixed request that would land on an existing mapping is refused, not

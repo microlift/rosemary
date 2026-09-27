@@ -17,6 +17,16 @@ pub const KERN_UREFS_OVERFLOW: i32 = 19;
 pub const KERN_INVALID_CAPABILITY: i32 = 20;
 pub const KERN_RIGHT_EXISTS: i32 = 21;
 pub const KERN_NOT_IN_SET: i32 = 23;
+/// `KERN_NOT_SUPPORTED`, 46.
+///
+/// Darwin's own comment for it is "Empty thread activation (No thread linked to
+/// it)", which is narrower than the uses it has; the meaning a caller should
+/// read is "this kernel does not implement the operation", and that is the
+/// answer `media_unavailable`'s `mach_make_memory_entry_64` gives. It is kept
+/// next to `KERN_OPERATION_TIMED_OUT` (49) rather than in numeric order
+/// because the whole block above is in the order `<mach/kern_return.h>`
+/// declares, and this one is simply the last of that order that is used.
+pub const KERN_NOT_SUPPORTED: i32 = 46;
 pub const KERN_OPERATION_TIMED_OUT: i32 = 49;
 
 /// The `mach_msg` half of the numbering. `0x1000_0xxx` is a send failure and
@@ -65,6 +75,7 @@ pub fn describe(code: i32) -> Option<&'static str> {
         KERN_INVALID_CAPABILITY => "(os/kern) invalid capability",
         KERN_RIGHT_EXISTS => "(os/kern) right exists",
         KERN_NOT_IN_SET => "(os/kern) not in set",
+        KERN_NOT_SUPPORTED => "(os/kern) not supported",
         KERN_OPERATION_TIMED_OUT => "(os/kern) operation timed out",
         MACH_SEND_INVALID_DEST => "(ipc/send) invalid destination port",
         MACH_SEND_TIMED_OUT => "(ipc/send) send timed out",

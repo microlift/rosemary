@@ -1,0 +1,7 @@
+/* `<cstdlib>` - see cstdio for why these are in the global namespace. */
+#ifndef ROSETTA3_TEST_CSTDLIB
+#define ROSETTA3_TEST_CSTDLIB
+
+#include "stdlib.h"
+
+#endif /* ROSETTA3_TEST_CSTDLIB */

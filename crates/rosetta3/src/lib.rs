@@ -50,6 +50,7 @@ pub mod tls;
 pub mod trace;
 pub mod trampoline;
 pub mod unwind;
+pub mod unwind_native;
 pub mod userland;
 pub mod vm;
 

@@ -95,14 +95,94 @@ unsafe extern "C" fn fpathconf(fd: i32, name: i32) -> i64 {
         }
     }
 }
+/// Darwin's three per-user directory keys, as `libc` numbers them for
+/// apple targets (`libc-0.2.189/src/unix/bsd/apple/mod.rs:3165-3167`).
+///
+/// **The binary is what fixed these.** `_confstr` has one thunk and four call
+/// sites; three of them are consecutive in `content/browser/sandbox_parameters_mac.mm`'s
+/// `AddDarwinDirs` and pass `0x10002`, `0x10000` and `0x10001` as immediates -
+/// so the numbering here is read off the guest's own instruction stream, and
+/// only the *names* come from the header. `0x10001`/`0x10002` are not the
+/// `0x0300`-range one would guess.
+const CS_DARWIN_USER_DIR: i32 = 0x10000;
+const CS_DARWIN_USER_TEMP_DIR: i32 = 0x10001;
+const CS_DARWIN_USER_CACHE_DIR: i32 = 0x10002;
+
+/// The host directory that answers each Darwin key.
+///
+/// Each of the three is a real, existing, per-user directory on this host, and
+/// that is what makes the answer true rather than merely plausible: a Darwin
+/// path (`/Users/<name>`, `/var/folders/zz/…/T/`) would be a fabrication about a
+/// filesystem that does not exist here, whereas "the user's home directory",
+/// "the user's temporary directory" and "the user's cache directory" are facts
+/// about this machine with real paths behind them.
+///
+/// The *naming* differs from macOS and cannot be helped - macOS puts the temp
+/// and cache directories under a per-boot `/var/folders/…` hash, Linux puts
+/// them under `$TMPDIR` and `$XDG_CACHE_HOME`. What the guest asked for is a
+/// usable per-user directory of that kind, and that is what it gets.
+fn darwin_user_dir(name: i32) -> Option<std::ffi::OsString> {
+    let from_env = |key: &str, fallback: &dyn Fn() -> Option<std::ffi::OsString>| {
+        match std::env::var_os(key) {
+            Some(value) if !value.is_empty() => Some(value),
+            _ => fallback(),
+        }
+    };
+    let home = || std::env::var_os("HOME").filter(|home| !home.is_empty());
+    match name {
+        CS_DARWIN_USER_DIR => home(),
+        CS_DARWIN_USER_TEMP_DIR => from_env("TMPDIR", &|| Some(std::ffi::OsString::from("/tmp"))),
+        CS_DARWIN_USER_CACHE_DIR => from_env("XDG_CACHE_HOME", &|| {
+            // `OsString::push` rather than `Path::join`: this is a string, and
+            // `HOME` is not required to be a syntactically clean path.
+            home().map(|mut home| {
+                home.push("/.cache");
+                home
+            })
+        }),
+        _ => None,
+    }
+}
+
+/// Copy `value` into the guest's `buf` the way `confstr(3)` does, and return the
+/// length **including** the NUL.
+///
+/// Three conventions, all from the man page, and the middle one is the one a
+/// plausible-looking implementation gets wrong:
+///
+/// * at most `len - 1` bytes are copied, and the copy is always NUL-terminated;
+/// * the return is the length **including** that terminator - the page's own
+///   example prints `len:50` for the 49-character `/var/folders/…/T/`;
+/// * a buffer too small is an **error**, not a truncation: `0` with `ERANGE`,
+///   and nothing written. Returning the untruncated length would have the
+///   caller trust a path that is not there.
+fn confstr_put(value: &std::ffi::OsStr, out: *mut libc::c_char, len: usize) -> usize {
+    use std::os::unix::ffi::OsStrExt as _;
+    let bytes = value.as_bytes();
+    if len == 0 || bytes.len() >= len {
+        crate::errno::set(libc::ERANGE);
+        return 0;
+    }
+    // SAFETY: the caller guarantees `out` is writable for `len` bytes, and
+    // `len - 1 >= bytes.len()` was just checked, so the NUL at `bytes.len()`
+    // is inside it.
+    unsafe {
+        std::ptr::copy_nonoverlapping(bytes.as_ptr(), out.cast::<u8>(), bytes.len());
+        out.add(bytes.len()).write(0);
+    }
+    bytes.len() + 1
+}
+
 #[cfg(not(target_os = "macos"))]
 unsafe extern "C" fn confstr(name: i32, out: *mut libc::c_char, len: usize) -> usize {
     if name == 1 {
-        unsafe { libc::confstr(libc::_CS_PATH, out, len) }
-    } else {
-        crate::errno::set(libc::EINVAL);
-        0
+        return unsafe { libc::confstr(libc::_CS_PATH, out, len) };
     }
+    if let Some(value) = darwin_user_dir(name) {
+        return confstr_put(&value, out, len);
+    }
+    crate::errno::set(libc::EINVAL);
+    0
 }
 
 /// `_SYS_NAMELEN`, the width of every field in Darwin's `struct utsname`.
@@ -625,6 +705,76 @@ mod tests {
     fn an_unmapped_name_is_einval() {
         // SAFETY: an integer argument; 9999 names nothing on either side.
         assert_eq!(unsafe { sysconf(9999) }, -1);
+        assert_eq!(crate::errno::get(), libc::EINVAL);
+    }
+
+    /// The three keys are the numbers the **guest** passes, not the ones a
+    /// header recollection suggests. `_confstr` has one thunk and four call
+    /// sites; the three in `AddDarwinDirs` carry `0x10002`, `0x10000` and
+    /// `0x10001` as immediates. Asserting the literals is what stops a
+    /// plausible-looking `0x0300`-range renumbering from being "fixed" in.
+    #[test]
+    #[cfg(not(target_os = "macos"))]
+    fn the_darwin_user_dir_keys_are_the_guests_immediates() {
+        assert_eq!(CS_DARWIN_USER_DIR, 0x10000);
+        assert_eq!(CS_DARWIN_USER_TEMP_DIR, 0x10001);
+        assert_eq!(CS_DARWIN_USER_CACHE_DIR, 0x10002);
+    }
+
+    /// The load-bearing property: each answer is a directory that **exists**.
+    ///
+    /// A path to nothing is not a path to a user's cache directory, and this
+    /// test is what distinguishes "a plausible macOS-looking string" from an
+    /// answer that is true about this host. The cache directory is the one at
+    /// risk, because `$XDG_CACHE_HOME` need not be set and `$HOME/.cache` need
+    /// not exist yet.
+    #[test]
+    #[cfg(not(target_os = "macos"))]
+    fn each_darwin_user_dir_is_a_directory_that_exists() {
+        for name in [CS_DARWIN_USER_DIR, CS_DARWIN_USER_TEMP_DIR, CS_DARWIN_USER_CACHE_DIR] {
+            let mut buf = [0i8; 1024];
+            // SAFETY: `buf` is 1024 writable bytes and `name` is one of ours.
+            let len = unsafe { confstr(name, buf.as_mut_ptr(), buf.len()) };
+            assert_ne!(len, 0, "key {name:#x} was refused");
+            // The return includes the NUL, so the last byte written is at
+            // `len - 1` and must be the terminator.
+            assert_eq!(buf[len - 1], 0, "key {name:#x} is not NUL-terminated");
+            let bytes =
+                unsafe { std::slice::from_raw_parts(buf.as_ptr().cast::<u8>(), len - 1) };
+            use std::os::unix::ffi::OsStrExt as _;
+            let path = std::path::Path::new(std::ffi::OsStr::from_bytes(bytes));
+            assert!(
+                path.is_dir(),
+                "key {name:#x} answered {:?}, which is not a directory",
+                path
+            );
+        }
+    }
+
+    /// A buffer too small is an **error**, not a truncation. `confstr(3)` says
+    /// the copy is always terminated and at most `len - 1` bytes; returning
+    /// the untruncated length would have the caller go on trusting a path that
+    /// is not in its buffer. `confstr(3)` returns 0 and sets `ERANGE`.
+    #[test]
+    #[cfg(not(target_os = "macos"))]
+    fn a_buffer_one_byte_short_is_erange_and_writes_nothing() {
+        let mut buf = [0x7fi8; 64];
+        let before = buf;
+        // SAFETY: `buf` is 64 writable bytes; the key needs far more than 63.
+        let len = unsafe { confstr(CS_DARWIN_USER_DIR, buf.as_mut_ptr(), 1) };
+        assert_eq!(len, 0);
+        assert_eq!(crate::errno::get(), libc::ERANGE);
+        assert_eq!(buf, before, "a refused call must not write the buffer");
+    }
+
+    /// A key this mapping does not carry stays `EINVAL`, so the three new arms
+    /// have not quietly turned `confstr` into something that answers anything.
+    #[test]
+    #[cfg(not(target_os = "macos"))]
+    fn a_darwin_key_that_is_not_a_directory_is_einval() {
+        let mut buf = [0i8; 1024];
+        // SAFETY: `buf` is 1024 writable bytes; 0x10003 names nothing.
+        assert_eq!(unsafe { confstr(0x10003, buf.as_mut_ptr(), buf.len()) }, 0);
         assert_eq!(crate::errno::get(), libc::EINVAL);
     }
 }

@@ -28,9 +28,6 @@ struct Contents {
     code: i64,
     user_info: Id,
     description: String,
-    /// The dictionary a guest made the error with, retained, or null for one
-    /// this runtime made, whose `-userInfo` is built from `description`.
-    user_info: Id,
 }
 
 pub const NSURL_ERROR_DOMAIN: &str = "NSURLErrorDomain";
@@ -47,18 +44,6 @@ fn class() -> &'static Class {
 
 /// An autoreleased `NSError`.
 pub fn make(domain: &str, code: i64, description: &str) -> Id {
-<<<<<<< HEAD
-    objc::arc::autorelease(made(Contents {
-        domain: domain.to_string(),
-        code,
-        description: description.to_string(),
-        user_info: std::ptr::null_mut(),
-    }))
-}
-
-/// A new error holding `contents`, at +1.
-fn made(contents: Contents) -> Id {
-=======
     let domain = crate::string::from_str(domain);
     let user_info = make_user_info(description);
     let made = with_objects(domain, code, user_info, description.to_string());
@@ -82,15 +67,12 @@ pub fn make_with_user_info(domain: Id, code: i64, user_info: Id) -> Id {
 
 /// The one allocation path, so every error in this runtime has the same shape.
 fn with_objects(domain: Id, code: i64, user_info: Id, description: String) -> Id {
->>>>>>> d861fbb (wtv)
     // SAFETY: `Body` begins with `isa` and is the layout `class` was registered
     // with.
     let body: *mut Body = unsafe { corefoundation::base::allocate(class()) };
     if body.is_null() {
         return std::ptr::null_mut();
     }
-<<<<<<< HEAD
-=======
     // SAFETY: the objects are live and the error takes its own reference to
     // each from here.
     unsafe {
@@ -103,60 +85,9 @@ fn with_objects(domain: Id, code: i64, user_info: Id, description: String) -> Id
         user_info,
         description,
     };
->>>>>>> d861fbb (wtv)
     // SAFETY: a live instance whose second word is ours to fill in.
     unsafe { (*body).contents = Box::into_raw(Box::new(contents)) };
-    body as Id
-}
-
-/// The text of a string object, or `None` for nil or anything else.
-///
-/// # Safety
-///
-/// `object` is nil or a live object.
-unsafe fn string_text(object: Id) -> Option<String> {
-    unsafe { corefoundation::string::as_string(object as corefoundation::base::CFTypeRef) }
-        .map(|s| String::from_utf16_lossy(&s.utf16()))
-}
-
-/// An error from a guest's domain, code and dictionary, at +1.
-///
-/// # Safety
-///
-/// `domain` is a string or nil, and `info` a dictionary or nil.
-unsafe fn from_parts(domain: Id, code: i64, info: Id) -> Id {
-    let domain = unsafe { string_text(domain) }.unwrap_or_default();
-    let described = (!info.is_null())
-        .then(|| {
-            let key = crate::string::from_str("NSLocalizedDescription");
-            // SAFETY: a dictionary and a key this call owns.
-            let value = unsafe {
-                corefoundation::api::CFDictionaryGetValue(info as _, key as _) as Id
-            };
-            unsafe { corefoundation::api::CFRelease(key as _) };
-            unsafe { string_text(value) }
-        })
-        .flatten();
-    let description = described.unwrap_or_else(|| {
-        format!("The operation couldn\u{2019}t be completed. ({domain} error {code}.)")
-    });
-    made(Contents {
-        domain,
-        code,
-        description,
-        user_info: objc::arc::retain(info),
-    })
-}
-
-unsafe extern "C" fn error_with_domain(_class: Id, _sel: Sel, domain: Id, code: i64, info: Id) -> Id {
-    // SAFETY: the caller's string and dictionary.
-    objc::arc::autorelease(unsafe { from_parts(domain, code, info) })
-}
-
-unsafe extern "C" fn init_with_domain(receiver: Id, _sel: Sel, domain: Id, code: i64, info: Id) -> Id {
-    objc::arc::release(receiver);
-    // SAFETY: as above.
-    unsafe { from_parts(domain, code, info) }
+    objc::arc::autorelease(body as Id)
 }
 
 /// The one-entry `userInfo` a `make()`-built error reports.
@@ -269,26 +200,6 @@ unsafe extern "C" fn user_info(receiver: Id, _sel: Sel) -> Id {
     };
     if !c.user_info.is_null() {
         return c.user_info;
-<<<<<<< HEAD
-    }
-    let key = crate::string::from_str("NSLocalizedDescription");
-    let value = crate::string::from_str(&c.description);
-    let dictionary = corefoundation::collections::new_dictionary(
-        &[(
-            key as corefoundation::base::CFTypeRef,
-            value as corefoundation::base::CFTypeRef,
-        )],
-        corefoundation::callbacks::Policy::from_type_callbacks(),
-        corefoundation::callbacks::Policy::from_type_callbacks(),
-        false,
-    );
-    // SAFETY: the dictionary retained both, and this call owns the two it made.
-    unsafe {
-        corefoundation::api::CFRelease(key as corefoundation::base::CFTypeRef);
-        corefoundation::api::CFRelease(value as corefoundation::base::CFTypeRef);
-        corefoundation::api::CFAutorelease(dictionary) as Id
-=======
->>>>>>> d861fbb (wtv)
     }
     let dictionary = make_user_info(&c.description);
     // SAFETY: a dictionary this call just made.
@@ -301,14 +212,9 @@ unsafe extern "C" fn dealloc(receiver: Id, _sel: Sel) {
     unsafe {
         let body = receiver as *mut Body;
         if !(*body).contents.is_null() {
-<<<<<<< HEAD
-            objc::arc::release((*(*body).contents).user_info);
-            drop(Box::from_raw((*body).contents));
-=======
             let contents = Box::from_raw((*body).contents);
             objc::arc::release(contents.domain);
             objc::arc::release(contents.user_info);
->>>>>>> d861fbb (wtv)
             (*body).contents = std::ptr::null_mut();
         }
     }
@@ -342,7 +248,7 @@ unsafe extern "C" fn error_with_domain_code_user_info(
     user_info: Id,
 ) -> Id {
     if domain.is_null() {
-        return objc::fail!(
+        objc::fail!(
             "+[NSError errorWithDomain:code:userInfo:]: the domain is nil, and an NSError with \
              no domain cannot be reported as one"
         );
@@ -359,10 +265,6 @@ pub(crate) fn install() {
         "description" => localized_description, c"@16@0:8";
         "userInfo" => user_info, c"@16@0:8";
         "dealloc" => dealloc, c"v16@0:8";
-        "initWithDomain:code:userInfo:" => init_with_domain, c"@40@0:8@16q24@32";
-    });
-    crate::define::class_methods!(class, {
-        "errorWithDomain:code:userInfo:" => error_with_domain, c"@40@0:8@16q24@32";
     });
     class_methods!(class, {
         "errorWithDomain:code:userInfo:" => error_with_domain_code_user_info, c"@40@0:8@16q24@32";

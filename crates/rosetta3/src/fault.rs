@@ -152,6 +152,104 @@ fn covering(placed: &[Placed], pc: u64) -> Option<&Placed> {
     (pc < end).then_some(entry)
 }
 
+/// Say once that a dispatch worker was adopted as a guest thread, and whether
+/// it had to be.
+///
+/// Without this, "the fault did not move" and "the hook never fired" look
+/// identical, and this investigation has already published two conclusions
+/// drawn from an instrument that had not been shown to work.
+pub fn note_block_adopted(was_untracked: bool) {
+    use std::sync::Mutex;
+    static STATE: Mutex<(u8, bool)> = Mutex::new((0, false));
+
+    let Ok(mut state) = STATE.lock() else {
+        return;
+    };
+    let first = state.0 == 0;
+    if state.0 < 2 {
+        state.0 += 1;
+    }
+    if was_untracked {
+        state.1 = true;
+    }
+    if !first {
+        return;
+    }
+    let line = format!(
+        "rosetta3: a dispatch worker entered guest code on a thread this runtime started \
+         (adopted; at least one such thread had no guest thread state before this)\n"
+    );
+    // SAFETY: a live buffer for the length written.
+    unsafe { libc::write(2, line.as_ptr().cast(), line.len()) };
+}
+
+/// Say once, per process, what the guest-thread registry looked like at the moment a
+/// fault was reported on it: the kernel's thread id, the **host** thread name, whether
+/// *this* thread had guest thread state, how many threads were registered at all, and
+/// which backend is running.
+///
+/// Off unless `ROSETTA3_THREAD_WHO` is set. Nothing about the report changes either
+/// way - this writes its own line and returns.
+///
+/// **Why it exists.** `say_thread`'s "not a guest thread" is derived from
+/// `crate::thread::current()`, which is `None` unless `install` has run on this
+/// thread - and on the **native** backend `install` never runs, for any thread,
+/// because imports are bound straight to host addresses and nothing is intercepted
+/// (see `exec::native::Native::load`). So on native the line is printed for the main
+/// thread too and carries no information about the faulting thread at all, and a
+/// reader who takes it at face value goes looking for a thread-registration race that
+/// cannot exist. This line says which backend ran and how big the registry was, so the
+/// claim is checkable in the run that made it rather than inferred from the code.
+///
+/// The two fields are deliberately independent: `backend` and `registered` are facts
+/// about the process, `here` is a fact about this thread. A run where `registered` is
+/// zero while `backend` is `emulated` would be a *different* bug - a guest thread
+/// that was created and never adopted - and this line is what would tell the two
+/// apart.
+pub fn note_thread_who(here: bool) {
+    /// `ROSETTA3_THREAD_WHO=1` - off by default, and the only thing this reads.
+    const ENV: &str = "ROSETTA3_THREAD_WHO";
+
+    use std::sync::Mutex;
+    static ONCE: Mutex<bool> = Mutex::new(false);
+
+    if !std::env::var_os(ENV).is_some_and(|v| v != "0") {
+        return;
+    }
+    let Ok(mut once) = ONCE.lock() else {
+        return;
+    };
+    if *once {
+        return;
+    }
+    *once = true;
+    drop(once);
+
+    // The host's own name for this thread, which is the only place a thread name is
+    // readable without the guest's help. `pthread_getname_np` is a `prctl` read on
+    // Linux: no allocation, no lock, nothing that can fault in a handler.
+    let mut name = [0u8; 32];
+    // SAFETY: `name` is a live local of the length passed, and this thread is live.
+    let named = unsafe {
+        libc::pthread_getname_np(libc::pthread_self(), name.as_mut_ptr().cast(), name.len())
+    } == 0;
+    let end = name.iter().position(|&b| b == 0).unwrap_or(name.len());
+    let name = match named {
+        true => format!("{:?}", String::from_utf8_lossy(&name[..end])),
+        false => "<unnamed>".to_string(),
+    };
+
+    let line = format!(
+        "rosetta3: THREAD_WHO tid {:#x} host name {name} guest thread state here: {here}, \
+         registered guest threads: {}, backend {}\n",
+        crate::thread::key(),
+        crate::thread::registered(),
+        crate::exec::active().map_or("none", |e| e.engine().name()),
+    );
+    // SAFETY: a live buffer for the length written.
+    unsafe { libc::write(2, line.as_ptr().cast(), line.len()) };
+}
+
 /// Report the first guest instruction executed inside a nominated address range,
 /// once, with the registers the instruction was about to use.
 ///
@@ -412,7 +510,41 @@ pub fn install() {
     // `abort`, with no pc, no image and no registers. The handler restores the
     // previous disposition and returns, so the abort still happens - this only
     // adds the sentence in front of it.
-    for signal in [libc::SIGSEGV, libc::SIGBUS, libc::SIGABRT] {
+    //
+    // `SIGTRAP` joins them only when [`STACK_WHO_ENV`] is set, and that is not
+    // politeness - it is the only way to see the fault this run actually dies
+    // of. A Chromium `LOG(FATAL)` in an official build does **not** reach
+    // `abort()`: `base::CheckError::~CheckError` prints the message from
+    // `~LogMessage` and then runs `base::ImmediateCrash()`, which on x86-64 is
+    // `int3` - `CheckError::~CheckError` at `Framework+0x5cb8770` ends in
+    // `cmp r14d,0x3; je; int3; ud2` at `0x5cb87b7`. So the process dies of
+    // **SIGTRAP** and exits 133, not 134, and a runtime that reports only
+    // SIGSEGV, SIGBUS and SIGABRT reports nothing at all - which is why runs 090
+    // and 092 carry no `rosetta3: fault:` block and this abort looks as though
+    // it has no stack.
+    //
+    // **Unconditional now, and it used to be gated on `stack_who()`.** The gate
+    // was justified by "a guest that uses SIGTRAP as a control-flow signal would
+    // be interrupted" — and that fear is already handled by
+    // [`keep_the_fault_signals`]: a guest that uses SIGTRAP installs a handler
+    // for it, and `ROSETTA3_KEEP_FAULT_HANDLER` (which the test script sets, so
+    // every run log carries the "will be accepted and ignored" line) makes the
+    // guest's handler win. So the gate bought nothing, and it cost the
+    // diagnostic: **the current wall is a bare `int3` at
+    // `Framework+0x3ab0d2b` in Chromium's sandbox-parameter setter**, so a
+    // default `run-chromium.sh` printed `exit 133` and *no `fault:` block at
+    // all*, and "no fault line" had to be read as "a trap the runtime does not
+    // catch" rather than "no fault".
+    //
+    // A guest that has installed no SIGTRAP handler of its own cannot be
+    // disturbed by ours, because it has no handler to disturb.
+    let signals: Vec<i32> = vec![
+        libc::SIGSEGV,
+        libc::SIGBUS,
+        libc::SIGABRT,
+        libc::SIGTRAP,
+    ];
+    for signal in signals {
         // SAFETY: `action` and `old` are live locals of the right type;
         // `sa_sigaction` holds a handler with the `SA_SIGINFO` signature, which
         // is what `SA_SIGINFO` in the flags declares it to be. Installing a
@@ -460,7 +592,15 @@ fn keep_the_fault_signals() {
     if !std::env::var_os(KEEP_FAULT_HANDLER_ENV).is_some_and(|v| v != "0") {
         return;
     }
-    for signal in [libc::SIGSEGV, libc::SIGBUS, libc::SIGABRT, libc::SIGILL] {
+    // `SIGTRAP` alongside `SIGILL`, and for the same reason they are both
+    // already here: `ImmediateCrash` is a trap, and a guest's own crash
+    // reporter takes a `SIGTRAP` handler for a breakpoint long before it takes
+    // one for `ud2`.
+    let mut signals: Vec<i32> = vec![libc::SIGSEGV, libc::SIGBUS, libc::SIGABRT, libc::SIGILL];
+    if stack_who() {
+        signals.push(libc::SIGTRAP);
+    }
+    for signal in signals {
         // The registry is keyed by Darwin's numbering, which is what the guest's
         // `sigaction` is given. `SIGBUS` is 10 there and 7 here.
         if let Some(darwin) = darwin::signal::signal_from_host(signal) {
@@ -538,11 +678,14 @@ const fn saved() -> Saved {
 static SEGV: Saved = saved();
 static BUS: Saved = saved();
 static ABRT: Saved = saved();
+/// Written only when [`STACK_WHO_ENV`] is set; see [`install`].
+static TRAP: Saved = saved();
 
 fn saved_for(signal: i32) -> &'static Saved {
     match signal {
         libc::SIGBUS => &BUS,
         libc::SIGABRT => &ABRT,
+        libc::SIGTRAP => &TRAP,
         _ => &SEGV,
     }
 }
@@ -660,6 +803,7 @@ extern "C" fn report(signal: i32, info: *mut libc::siginfo_t, context: *mut libc
             libc::SIGBUS => "SIGBUS",
             libc::SIGSEGV => "SIGSEGV",
             libc::SIGABRT => "SIGABRT",
+            libc::SIGTRAP => "SIGTRAP",
             _ => "signal",
         });
         line.str(" on thread ");
@@ -684,6 +828,7 @@ extern "C" fn report(signal: i32, info: *mut libc::siginfo_t, context: *mut libc
         libc::SIGBUS => "SIGBUS",
         libc::SIGSEGV => "SIGSEGV",
         libc::SIGABRT => "SIGABRT",
+        libc::SIGTRAP => "SIGTRAP",
         _ => "signal",
     });
 
@@ -693,7 +838,13 @@ extern "C" fn report(signal: i32, info: *mut libc::siginfo_t, context: *mut libc
     let addr = unsafe { info.as_ref() }.map_or(0, |i| unsafe { darwin::signal::fault_address(i) });
     out.str(" at ");
     out.hex(addr);
-    say_access(out, info);
+    // `say_access` reads `si_code` against SIGSEGV's meanings, and those are 1
+    // for "unmapped" and 2 for "not permitted". SIGTRAP's are 1 for *breakpoint*
+    // and 2 for *divide by zero*, so the same lookup would name both wrongly.
+    // Silent is the correct answer for anything it was not written for.
+    if matches!(signal, libc::SIGSEGV | libc::SIGBUS) {
+        say_access(out, info);
+    }
     if let Some(text) = ascii_word(addr) {
         out.str(" (ascii \"");
         out.bytes(&text);
@@ -735,10 +886,16 @@ extern "C" fn report(signal: i32, info: *mut libc::siginfo_t, context: *mut libc
         }
     }
     // An abort has no interesting pc of its own - it is always inside the C
-    // library - so the frame walk is the whole report.
-    else if signal == libc::SIGABRT {
+    // library - so the frame walk is the whole report. Nor does a trap: the
+    // `int3` is in guest code, but the `pc` the kernel hands back is only as
+    // good as the handler below, and the walk is what says anything.
+    else if matches!(signal, libc::SIGABRT | libc::SIGTRAP) {
         say_caller(out, context);
     }
+    // The whole guest stack, not just its first guest frame. Additive, and off
+    // unless `ROSETTA3_ABORT_WHO` is set; see `say_guest_stack` for why the
+    // report above cannot answer "which of the many identical reports fired".
+    say_guest_stack(out, context);
 
     stage(6);
     out.str("\n");
@@ -946,19 +1103,1041 @@ fn say_controller(out: &mut Buffer, context: *mut libc::c_void) {
         }
         None => out.str("\n    [r14+0x260] held flag unreadable"),
     }
-    out.str("\n    -> +0x218 is written in exactly one place, the bind at");
-    out.str("\n       Framework+0x5d45440, and that store is unconditional, so");
-    out.str("\n       either the bind did not run or its effect is gone.");
-    out.str("\n    -> the vtable pair above is 0x108 apart, which is the 0x270");
-    out.str("\n       class (0xe268490/0xe268598), NOT the 0x180 one (0xb8 apart).");
-    out.str("\n    -> RESOLVED: +0x150 is set at Framework+0x5d454f1, four");
-    out.str("\n       instructions AFTER the +0x218 store at 0x5d454d7, in the");
-    out.str("\n       same function. So +0x150 == 1 PROVES the bind ran to");
-    out.str("\n       completion - the field WAS written.");
-    out.str("\n    -> and something cleared it: the destructor at 0x5d45030");
-    out.str("\n       frees the cell and then does");
+    out.str("\n    -> +0x218 has exactly one writer, the bind at 0x5d45440");
+    out.str("\n       (store at 0x5d454d7, unconditional), and exactly one");
+    out.str("\n       clearer, the teardown at 0x5d4514e:");
     out.str("\n         5d4514e  mov QWORD PTR [rbx+0x218], 0x0");
-    out.str("\n       So the object was torn down and then pumped again.");
+    out.str("\n    -> +0x150 is written by the bind at 0x5d454f1, four");
+    out.str("\n       instructions LATER, and the teardown never touches it.");
+    out.str("\n       So +0x150 == 1 together with +0x218 == 0 is the signature");
+    out.str("\n       of BOUND, THEN DESTROYED: a use-after-free. The bind is");
+    out.str("\n       proven to have run; the object is simply no longer alive.");
+    out.str("\n    -> the two vtables above deslide to 0xe268490/0xe268598, so");
+    out.str("\n       r14 is a correctly aligned 0x270 controller base. No");
+    out.str("\n       misalignment, no offset shift, and both vtables share");
+    out.str("\n       one slide, which is what makes that check meaningful.");
+    out.str("\n    -> the question is who invokes DoWork after the teardown. It");
+    out.str("\n       arrives through a closure: new(0x38), vtable 0xe1e7f48,");
+    out.str("\n       DoWork at slot +0x10, built in Blink's");
+    out.str("\n       non_main_thread_impl.cc and gpu_child_thread.cc, bound");
+    out.str("\n       at Framework+0x4b47edf.");
+    // Separate output buffer: the report above is already long, and truncation
+    // is silent. Additive, and off unless its own variable is set.
+    out.flush();
+    say_dowork_who(out, context);
+    // Also separate and also off by default: the controller's own words, so
+    // the layout claims above are checkable rather than asserted.
+    out.flush();
+    say_tc_layout(out, r14);
+    // Its own switch, and deliberately *not* nested inside `say_tc_layout`: the
+    // two answer different questions and must be settable independently.
+    out.flush();
+    say_tls_cell(out);
+}
+
+/// Dump the stack around the fault so the *caller* can be identified from what is
+/// actually there, rather than from an assumed frame layout. Additive, and off
+/// unless `ROSETTA3_DOWORK_WHO` is set.
+///
+/// Added for the live blocker, and only for it. `Framework+0x5d46240` is reached
+/// from `Framework+0x5cd7329`, which is the instruction after `call 0x5d46020`
+/// at `0x5cd7324` inside the function at `0x5cd72b0`. That function builds the
+/// receiver as its **second argument** minus `0xf0` - `add r14,
+/// 0xffffffffffffff10` at `0x5cd72da`, then `mov rsi, r14` at `0x5cd7321` - so
+/// the question is who supplies that argument. `0x5cd72b0` has no direct caller
+/// at all: it is reached only through the vtable at `0xe1e7f48`, whose address
+/// point is installed in exactly two places, `0x5cd70d5` and `0xc8bf471`.
+///
+/// A frame-pointer walk cannot answer it, and the reason is worth recording:
+/// `0x5cd72b0` establishes its own frame, so the slot holding the return address
+/// into *it* is the first thing above the faulting `rbp` and everything older is
+/// above that. That is exactly why [`say_caller`] reports `0x5cd7329` and stops,
+/// correctly - the frames that matter are past its reach.
+///
+/// So this measures instead of computing. Counting a prologue to place saved
+/// registers is a guess, and a measured guess is still a guess: an earlier
+/// version of this function derived the offsets, got two of the five saved
+/// registers wrong while its control word was right, and would have published
+/// two confident wrong addresses. It therefore prints the raw window, and then
+/// probes *every* word in it that could be a frame pointer, so the chain is read
+/// off the output rather than asserted.
+///
+/// The control is the annotation on `rbp+8`: it must say `+0x5cd7329`, the
+/// address the main report has already named by a different route. If it does
+/// not, `rbp` is not the frame this claims and nothing below it means anything.
+fn say_dowork_who(out: &mut Buffer, context: *mut libc::c_void) {
+    /// What to look for, so the variable is a switch and not a tuning knob.
+    const ENV: &str = "ROSETTA3_DOWORK_WHO";
+    /// Window around the faulting frame pointer. `0x5cd72b0`'s frame is 0x60
+    /// bytes below its own `rbp` and the frames above it start immediately after,
+    /// so this is generous rather than tight.
+    const BELOW: i64 = 0x60;
+    const ABOVE: i64 = 0x200;
+    /// How far above `rbp` a word may be and still be worth probing as a frame
+    /// pointer. The main thread's stack is 8 MB; a guest frame is not 2 KB.
+    const PROBE: u64 = 0x100000;
+
+    if !std::env::var_os(ENV).is_some_and(|v| v != "0") {
+        return;
+    }
+    let Some((rbp, sp, _)) = host_frame(context) else {
+        out.str("\n  DOWORK_WHO: no frame pointer for this thread");
+        return;
+    };
+    // A word from the window. `at` is a whole number of eight bytes from an
+    // eight-aligned `rbp` and no more than `ABOVE`/`BELOW` away, and the faulting
+    // thread's stack is mapped at least `sp` bytes upwards, so it is read only
+    // when it is at or above `sp`.
+    let word = |at: u64| -> Option<u64> {
+        (at % 8 == 0 && at >= sp).then(|| {
+            // SAFETY: as above - a word inside this thread's own stack, above the
+            // kernel's `rsp` for it.
+            unsafe { std::ptr::read_volatile(at as *const u64) }
+        })
+    };
+    let say_offset = |out: &mut Buffer, label: &str, at: u64, v: u64| {
+        out.str("\n      ");
+        out.str(label);
+        out.str(" = ");
+        out.hex(v);
+        if in_image(v) {
+            out.str("  ");
+            let _ = say_image(out, v);
+        }
+        let _ = at;
+    };
+
+    out.str("\n  DOWORK_WHO - the stack around the call into DoWork, raw:");
+    out.str("\n    rbp ");
+    out.hex(rbp);
+    out.str("  rsp ");
+    out.hex(sp);
+    out.str("  rbp-rsp ");
+    out.hex(rbp.wrapping_sub(sp));
+    out.flush();
+
+    let mut control_ok = false;
+    let mut candidates: Vec<u64> = Vec::new();
+    for step in -BELOW..=ABOVE {
+        let at = rbp.wrapping_add(step as u64);
+        let Some(v) = word(at) else { continue };
+        let label = if step < 0 {
+            let mut s = String::from("[rbp-");
+            s.push_str(&format!("{:x}", step.unsigned_abs()));
+            s.push(']');
+            s
+        } else {
+            format!("[rbp+{step:x}]")
+        };
+        say_offset(out, &label, at, v);
+        out.flush();
+        if step == 8 && image_offset(v) == Some(0x5cd7329) {
+            control_ok = true;
+        }
+        // Anything that could be a frame pointer of an outer frame: on the stack,
+        // eight-aligned, and above `rbp`.
+        if v >= rbp && v % 8 == 0 && v <= rbp.saturating_add(PROBE) {
+            candidates.push(v);
+        }
+    }
+
+    out.str("\n    control: [rbp+8] is ");
+    if control_ok {
+        out.str("Framework+0x5cd7329, as it must be");
+    } else {
+        out.str("NOT Framework+0x5cd7329");
+    }
+    out.str(" - ");
+    out.str(if control_ok {
+        "so the window above is the real frame."
+    } else {
+        "so this window is not the frame it claims and NONE of it is evidence."
+    });
+    out.str("\n    probing every word above rbp that could be a frame pointer:");
+    out.flush();
+    let mut probed: Vec<u64> = Vec::new();
+    for fp in candidates {
+        if probed.contains(&fp) {
+            continue;
+        }
+        probed.push(fp);
+        let Some((next, ret)) = frame(fp) else {
+            continue;
+        };
+        out.str("\n      frame ");
+        out.hex(fp);
+        out.str(" -> next ");
+        out.hex(next);
+        out.str(", returns to ");
+        out.hex(ret);
+        if in_image(ret) {
+            out.str("  ");
+            let _ = say_image(out, ret);
+        }
+        out.flush();
+    }
+    out.flush();
+}
+
+/// `ROSETTA3_ABORT_WHO` - the switch for the guest-stack dump.
+///
+/// It is also the switch for *catching* the signal that reaches it, because
+/// SIGTRAP is not handled at all otherwise; see [`install`].
+const STACK_WHO_ENV: &str = "ROSETTA3_ABORT_WHO";
+
+/// Whether [`STACK_WHO_ENV`] asks for the guest stack.
+///
+/// Read from [`install`] before any guest code runs, and from a signal handler
+/// afterwards, so it is the plain `var_os` test rather than a cached copy: a
+/// cached `OnceLock` would be fine in the handler but would have to be a
+/// different function for the start-up read, and one switch read twice is
+/// simpler to reason about than two.
+fn stack_who() -> bool {
+    std::env::var_os(STACK_WHO_ENV).is_some_and(|v| v != "0")
+}
+
+/// The `/proc/self/maps` entry that contains `at`, as `(start, end)`.
+///
+/// A signal handler that faults taking its own report with it loses everything
+/// after the faulting word, so a walk over a thread's stack needs a bound it can
+/// *establish* rather than one it assumes. This is the same file and the same
+/// field layout [`say_host_mapping`] already parses, read a second time for the
+/// one number a walk needs, and it is the only reason [`say_guest_stack`] can
+/// say where it stopped.
+///
+/// `None` off Linux, on a host without `/proc`, or when nothing contains the
+/// address - in which case the caller falls back to its own declared window and
+/// says so.
+#[cfg(target_os = "linux")]
+fn stack_bounds(at: u64) -> Option<(u64, u64)> {
+    // SAFETY: a constant path and constant flags.
+    let fd = unsafe {
+        libc::open(
+            c"/proc/self/maps".as_ptr(),
+            libc::O_RDONLY | libc::O_CLOEXEC,
+        )
+    };
+    if fd < 0 {
+        return None;
+    }
+    // The same small buffer and the same reason as `say_host_mapping`: this runs
+    // on a signal stack.
+    let mut buf = [0u8; 512];
+    let mut held = 0usize;
+    let mut found = None;
+    'reading: loop {
+        // SAFETY: writing into the unused tail of a live local array.
+        let read = unsafe { libc::read(fd, buf[held..].as_mut_ptr().cast(), buf.len() - held) };
+        if read <= 0 {
+            break;
+        }
+        let filled = held + read as usize;
+        let mut start = 0;
+        while let Some(end) = buf[start..filled].iter().position(|b| *b == b'\n') {
+            let line = &buf[start..start + end];
+            if let Some(range) = maps_range(line) {
+                if (range.0..range.1).contains(&at) {
+                    found = Some(range);
+                    break 'reading;
+                }
+            }
+            start += end + 1;
+        }
+        held = filled - start;
+        if held == buf.len() {
+            held = 0;
+        } else {
+            buf.copy_within(start..filled, 0);
+        }
+    }
+    // SAFETY: the descriptor opened above, which nothing else holds.
+    unsafe { libc::close(fd) };
+    found
+}
+
+/// The `lo-hi` a `/proc/self/maps` line starts with, if it starts with one.
+#[cfg(target_os = "linux")]
+fn maps_range(line: &[u8]) -> Option<(u64, u64)> {
+    let (low, rest) = hex_prefix(line);
+    let rest = rest.strip_prefix(b"-")?;
+    let (high, _) = hex_prefix(rest);
+    (high > low).then_some((low, high))
+}
+
+#[cfg(not(target_os = "linux"))]
+fn stack_bounds(_at: u64) -> Option<(u64, u64)> {
+    None
+}
+
+/// Dump every guest return address on the faulting thread's stack, with the call
+/// edge each one implies decoded out of the image.
+///
+/// Additive, and off unless `ROSETTA3_ABORT_WHO` is set. `ROSETTA3_DOWORK_WHO`
+/// prints the raw words around one frame because a frame-pointer walk could not
+/// reach the frames that mattered; this is the same raw window, filtered - and
+/// the filter is the part that is new.
+///
+/// **Why this exists.** `check.cc(361)` is a *constant*, not a location.
+/// `base/check.cc:358-363` is `NotReachedError::TriggerNotReached()`, which
+/// calls `NotReached() << "..."` **with no location argument**, so the
+/// `Location()` carries `check.cc`'s own `__FILE__:__LINE__`. Every migrated
+/// `NOTREACHED_IN_MIGRATION()` in this build prints that identical line, there
+/// are thousands of them, and the log cannot tell them apart. The only thing
+/// that can is the stack: the caller of `TriggerNotReached` is the site.
+///
+/// **The filter, and why it is not a guess.** A word on the stack is reported
+/// when it is inside a guest image *and* the byte five before it in that image
+/// is `0xe8` (a `call rel32` that ends exactly there) or `0xe9` (a `jmp rel32`,
+/// i.e. a tail call). The return address of a real call is by construction the
+/// address just past the call, and on x86-64 a direct call *is* `e8` with its
+/// displacement last, so `target = v - 5 + disp32` is the call's own operand
+/// rather than a reconstruction - it is decoded from the same bytes the guest
+/// executed. A word of data that happens to hold an image address is preceded
+/// by whatever that data is, and is dropped. An indirect call (`ff 15` / `ff
+/// 25`, six bytes) is recognised and reported without a target, because its
+/// target is in memory rather than in the instruction.
+///
+/// The negative is bounded and stated: a `call` through a *register* or a
+/// *trampoline* leaves a return address this filter drops, so a caller reached
+/// only that way is missing from the list. That is a reason to re-read the
+/// disassembly at whatever the list names, not a reason to trust the list
+/// alone.
+///
+/// **The control is in the same run.** The frame-pointer chain is walked first,
+/// with [`frame`] - which the rest of this file has used for every report, and
+/// which is not a reconstruction of anything. Every address that walk produces
+/// is *also* an eight-aligned word at or above `rsp`, so the scan must find
+/// every one of them. The report says how many it found and names any it
+/// missed. If the two routes disagree, the list is not evidence and the report
+/// says so.
+fn say_guest_stack(out: &mut Buffer, context: *mut libc::c_void) {
+    /// `ROSETTA3_ABORT_WHO=1` - off by default, and the only thing this reads.
+    const ENV: &str = STACK_WHO_ENV;
+    /// How far above the kernel's `rsp` to look, and *also* a bound on the read:
+    /// the scan stops at the top of the mapping that holds `rsp` (see
+    /// [`stack_bounds`]), because a signal handler that faults taking its own
+    /// report with it loses everything after the faulting word. The frames that
+    /// matter are the innermost, which sit in the first three kilobytes, so this
+    /// is slack rather than a choice: on the run that produced the first report
+    /// the sixteenth frame was 0xda8 bytes in and the chain already reached the
+    /// launcher's `main`.
+    const WINDOW: u64 = 64 * 1024;
+    /// Cap on reported candidates, so a stack full of stale frames cannot
+    /// produce an unbounded log. The innermost ones come first, so the cap
+    /// costs the shallowest and not the answer.
+    const MAX_LINES: usize = 400;
+    /// How far the frame-pointer chain is followed. A guest calling a host
+    /// library is a handful of frames; a few hundred is start-up.
+    const CHAIN_FRAMES: usize = 256;
+    /// Guest addresses the frame chain contributed, kept for the cross-check.
+    /// A fixed array rather than a `Vec`: nothing in a signal handler should
+    /// allocate, and the existing `Vec`s in this file are the one thing here
+    /// that is worth *not* copying.
+    const CHAIN_MAX: usize = 64;
+
+    if !std::env::var_os(ENV).is_some_and(|v| v != "0") {
+        return;
+    }
+    let Some((rbp, sp, _)) = host_frame(context) else {
+        out.str("\n  ABORT_WHO: no frame pointer for this thread");
+        return;
+    };
+    // The image ranges, taken once. `in_image` and the module's `image_offset`
+    // each take the lock, and this walks half a megabyte of stack; one snapshot
+    // is both cheaper and simpler to reason about. Refused outright if another
+    // thread holds the lock, because there would then be nothing to attribute
+    // to and a list of bare numbers is not worth printing.
+    let mut ranges: Vec<(u64, u64)> = Vec::new();
+    let mut names: Vec<[u8; NAME]> = Vec::new();
+    let mut used: Vec<usize> = Vec::new();
+    {
+        let Ok(images) = IMAGES.try_lock() else {
+            out.str("\n  ABORT_WHO: another thread holds the image table");
+            return;
+        };
+        for image in images.iter().filter(|i| i.range.1 > i.range.0).take(16) {
+            ranges.push(image.range);
+            let mut name = [0u8; NAME];
+            name[..image.used].copy_from_slice(&image.name[..image.used]);
+            names.push(name);
+            used.push(image.used);
+        }
+    }
+    let which = |addr: u64| ranges.iter().position(|r| (r.0..r.1).contains(&addr));
+    // `(image index, offset in it)`, or `None` for no recorded image.
+    let offset_of = |addr: u64| which(addr).map(|i| (i, addr - ranges[i].0));
+    // `Chromium Framework+0x5cb87d0`, rather than a bare offset: two images are
+    // live and a bare offset names neither.
+    let say_where = |out: &mut Buffer, at: u64| -> bool {
+        let Some((i, off)) = offset_of(at) else {
+            return false;
+        };
+        out.bytes(&names[i][..used[i]]);
+        out.str("+");
+        out.hex(off);
+        true
+    };
+
+    // One guest byte, by absolute address. The `which` check is what makes the
+    // read safe: it is inside an image the loader mapped.
+    let byte = |addr: u64| -> Option<u8> {
+        which(addr)?;
+        // SAFETY: `which` established that `addr` is inside a mapped guest
+        // image. A wild address simply failed that test and nothing is read.
+        Some(unsafe { std::ptr::read_volatile(addr as *const u8) })
+    };
+    let rel32 = |addr: u64| -> Option<i32> {
+        let bytes = [
+            byte(addr)?,
+            byte(addr.wrapping_add(1))?,
+            byte(addr.wrapping_add(2))?,
+            byte(addr.wrapping_add(3))?,
+        ];
+        Some(i32::from_le_bytes(bytes))
+    };
+    // The top of the mapping that holds this thread's stack, so the scan below
+    // has a bound it established rather than one it assumed. `None` leaves the
+    // declared window, and the report says where it stopped either way.
+    let top = stack_bounds(sp).map_or(sp.saturating_add(WINDOW), |(_, hi)| {
+        sp.saturating_add(WINDOW).min(hi)
+    });
+    // A stack word. The guard is the *stack*, not the image table: an earlier
+    // version of this read tested `which(addr)` - the address being read - and
+    // so rejected every word, because a stack address is in no guest image.
+    // Section B came out empty and section C said so; the control earned its
+    // keep on its first run.
+    let word = |addr: u64| -> Option<u64> {
+        (addr % 8 == 0 && addr >= sp && addr < top).then(|| {
+            // SAFETY: a word inside this thread's own stack, above the kernel's
+            // `rsp` for it and below the top of the mapping holding it.
+            unsafe { std::ptr::read_volatile(addr as *const u64) }
+        })
+    };
+    // The call a return address came from, if the instruction before it says
+    // so. `(kind byte, target)`, or `None` when the filter rejects the word.
+    //
+    // `e8` sits at `v - 5`, so the instruction it starts is `v - 5`, the
+    // displacement is the four bytes at `v - 4`, and the target is
+    // **`v + disp`** - `(v-5) + 5 + disp`. Adding the five a second time is an
+    // error this function made and the report now catches on its own: every
+    // printed target was five bytes past its real entry, so none of them matched
+    // `NOT_REACHED_CHAIN` and the one line that had to light up stayed dark.
+    let edge = |v: u64| -> Option<(u8, u64)> {
+        let opcode = byte(v.wrapping_sub(5))?;
+        match opcode {
+            // `call rel32` / `jmp rel32`: displacement is the last four bytes.
+            0xe8 | 0xe9 => {
+                let disp = rel32(v.wrapping_sub(4))?;
+                Some((opcode, v.wrapping_add(disp as i64 as u64)))
+            }
+            // `ff 15` / `ff 25`: six bytes, and the target is in memory.
+            0xff => {
+                let m = byte(v.wrapping_sub(5))?;
+                (m == 0x15 || m == 0x25).then_some((m, 0))
+            }
+            _ => None,
+        }
+    };
+    let named_target = |off: u64| {
+        NOT_REACHED_CHAIN
+            .iter()
+            .find(|(at, _)| *at == off)
+            .map(|(_, name)| *name)
+    };
+    // Offsets from `NOT_REACHED_CHAIN` that some return address on this stack
+    // was returned from. Recorded rather than printed-and-forgotten, so the
+    // summary after section B can state an absence as well as a presence.
+    let mut seen_targets: Vec<u64> = Vec::new();
+    let note_target = |seen: &mut Vec<u64>, at: u64| {
+        if NOT_REACHED_CHAIN.iter().any(|(want, _)| *want == at) && !seen.contains(&at) {
+            seen.push(at);
+        }
+    };
+
+    out.str("\n  ABORT_WHO - the guest stack at this fault, shallowest first.");
+    out.str("\n    rbp ");
+    out.hex(rbp);
+    out.str("  rsp ");
+    out.hex(sp);
+    out.str("  thread ");
+    out.hex(u64::from(thread_id().max(0) as u32));
+    out.str("  images in the table: ");
+    out.hex(ranges.len() as u64);
+    for (i, range) in ranges.iter().enumerate() {
+        out.str("\n      [");
+        out.hex(i as u64);
+        out.str("] ");
+        out.bytes(&names[i][..used[i]]);
+        out.str("  ");
+        out.hex(range.0);
+        out.str("..");
+        out.hex(range.1);
+    }
+    out.str("\n    the faulting pc is ");
+    match host_pc(context) {
+        Some(pc) if offset_of(pc).is_some() => {
+            out.str("IN a guest image at ");
+            say_where(out, pc);
+            out.str(" - it is frame 0");
+        }
+        Some(pc) => {
+            out.str("host code, so it is not a guest frame; it is in ");
+            say_host_mapping(out, pc);
+        }
+        None => out.str("unreadable"),
+    }
+    out.flush();
+
+    // ------------------------------------------------------------------ the
+    // frame-pointer chain, with the addresses it contributes kept for the
+    // cross-check at the end.
+    let mut chain: [(usize, u64); CHAIN_MAX] = [(0, 0); CHAIN_MAX];
+    let mut chain_len = 0usize;
+    out.str("\n    A. the frame-pointer chain, the route the main report used:");
+    out.flush();
+    let mut fp = rbp;
+    let mut printed = 0usize;
+    for n in 0..CHAIN_FRAMES {
+        let Some(here) = readable(fp, sp) else {
+            out.str("\n      (chain ends: rbp is not on this stack)");
+            break;
+        };
+        let Some((next, ret)) = frame(here) else {
+            out.str("\n      (chain ends: this frame holds no usable pair)");
+            break;
+        };
+        if printed < MAX_LINES {
+            out.str("\n      #");
+            out.hex(n as u64);
+            out.str(" fp ");
+            out.hex(here);
+            out.str(" -> fp ");
+            out.hex(next);
+            out.str(", returns to ");
+            out.hex(ret);
+            if offset_of(ret).is_some() {
+                out.str(" = ");
+                say_where(out, ret);
+            } else {
+                // Not a guest address, so the *caller* is not guest code. That is
+                // worth saying out loud rather than leaving as "not in a guest
+                // image": a reader otherwise assumes the walk stopped, when what
+                // it means is that the chain left the guest here.
+                out.str(" which is in no guest image; it is ");
+                say_host_mapping(out, ret);
+            }
+            if let Some(e) = edge(ret) {
+                out.str(if e.0 == 0xe8 {
+                    "  called "
+                } else {
+                    "  jumped to "
+                });
+                if e.1 != 0 {
+                    out.hex(e.1);
+                    if offset_of(e.1).is_some() {
+                        out.str(" = ");
+                        say_where(out, e.1);
+                        let (_, t) = offset_of(e.1).unwrap();
+                        note_target(&mut seen_targets, t);
+                        if let Some(name) = named_target(t) {
+                            out.str("  <<< ");
+                            out.str(name);
+                        }
+                    } else {
+                        out.str(" (not in a guest image)");
+                    }
+                } else {
+                    out.str("indirect");
+                }
+            } else if offset_of(ret).is_some() {
+                out.str("  (the byte before it is not a call or jmp)");
+            }
+            out.flush();
+            printed += 1;
+        }
+        if let Some((i, off)) = offset_of(ret) {
+            if chain_len < CHAIN_MAX {
+                chain[chain_len] = (i, off);
+                chain_len += 1;
+            }
+        }
+        fp = next;
+    }
+    out.str("\n      ");
+    out.hex(printed as u64);
+    out.str(" frame(s) printed");
+    out.flush();
+
+    // ------------------------------------------------------------------ the
+    // raw scan. Every eight-aligned word at or above the kernel's `rsp`, in
+    // increasing address order, so shallower frames come first.
+    out.str("\n    B. every eight-aligned word at or above rsp that a call left behind:");
+    out.str("\n       (shallowest first; `called` is the operand of the");
+    out.str("\n        instruction the guest actually executed)");
+    out.flush();
+    let mut found = 0usize;
+    let mut at = sp;
+    let stop = top;
+    while at < stop && found < MAX_LINES {
+        let Some(v) = word(at) else {
+            at += 8;
+            continue;
+        };
+        if offset_of(v).is_none() {
+            at += 8;
+            continue;
+        }
+        let Some((kind, target)) = edge(v) else {
+            at += 8;
+            continue;
+        };
+        out.str("\n       [rsp+");
+        out.hex(at.wrapping_sub(sp));
+        out.str("] ");
+        say_where(out, v);
+        out.str(if kind == 0xe8 {
+            "  called "
+        } else {
+            "  jumped to "
+        });
+        if target != 0 {
+            out.hex(target);
+            if offset_of(target).is_some() {
+                out.str(" = ");
+                say_where(out, target);
+                let (_, t) = offset_of(target).unwrap();
+                note_target(&mut seen_targets, t);
+                if let Some(name) = named_target(t) {
+                    out.str("  <<< ");
+                    out.str(name);
+                }
+            } else {
+                out.str(" (not in a guest image)");
+            }
+        } else {
+            out.str("indirect (ff 15/25: the target is in memory, not the instruction)");
+        }
+        out.flush();
+        found += 1;
+        at += 8;
+    }
+    out.str("\n       ");
+    out.hex(found as u64);
+    out.str(" candidate(s) between rsp and ");
+    out.hex(stop);
+    out.str(" (rsp+");
+    out.hex(stop.wrapping_sub(sp));
+    out.str(")");
+    out.flush();
+    // The one line that has to light up when the `check.cc` chain is on this
+    // stack. Stated as an absence too, because a decoder quietly five bytes out
+    // prints a list that looks complete and names nothing - which is exactly
+    // what an earlier version of [`edge`] did.
+    out.str("\n       the four `check.cc` entries, each with whether some return");
+    out.str("\n       address on this stack was returned FROM it:");
+    let mut lit = 0usize;
+    for (at, what) in NOT_REACHED_CHAIN {
+        let seen = seen_targets.contains(at);
+        out.str("\n         ");
+        out.hex(*at);
+        out.str(" ");
+        out.str(what);
+        out.str(if seen { "   SEEN" } else { "   not seen" });
+        if seen {
+            lit += 1;
+        }
+    }
+    out.str("\n       ");
+    out.hex(lit as u64);
+    out.str(" of the ");
+    out.hex(NOT_REACHED_CHAIN.len() as u64);
+    out.str(" were on this stack");
+    out.flush();
+
+    // ------------------------------------------------------------------ the
+    // control, in the same run and by a different route.
+    out.str("\n    C. control: section A found ");
+    out.hex(chain_len as u64);
+    out.str(" guest address(es) by walking frames; section B found ");
+    out.hex(found as u64);
+    out.str(" by scanning memory. Every one of A's must also be in B, because a");
+    out.str("\n       saved return address IS an eight-aligned word at or above rsp:");
+    out.flush();
+    // The comparison, without a second buffer: for each address A contributed,
+    // ask whether the scan's own test would have accepted it. Deliberately the
+    // same test B used, so a disagreement means B dropped a real frame rather
+    // than that the two are testing different things.
+    //
+    // Two different reasons an address can be in A and not in B, and conflating
+    // them is a false alarm: a saved "return address" that is really a *branch
+    // target* - which a tail `jmp` leaves behind - is not preceded by a call,
+    // so B's filter drops it by design and section A says so on the same line.
+    // Only an address that *passes* the filter and is still missing means the
+    // scan lost a real frame.
+    let mut lost = 0usize;
+    let mut rejected = 0usize;
+    for slot in &chain[..chain_len] {
+        let (image, off) = *slot;
+        // A's own address, recovered from the range, so `edge` can be asked.
+        let abs = ranges[image].0 + off;
+        let mut seen = false;
+        let mut cursor = sp;
+        while cursor < stop && !seen {
+            if let Some(v) = word(cursor)
+                && offset_of(v) == Some((image, off))
+                && edge(v).is_some()
+            {
+                seen = true;
+            }
+            cursor += 8;
+        }
+        if seen {
+            continue;
+        }
+        let filterable = edge(abs).is_some();
+        if filterable {
+            lost += 1;
+        } else {
+            rejected += 1;
+        }
+        out.str("\n       ");
+        out.bytes(&names[image][..used[image]]);
+        out.str("+");
+        out.hex(off);
+        out.str(if filterable {
+            "  <- from A, passes B's filter, and B still lost it"
+        } else {
+            "  <- from A, and B's filter rejects it: not a call return, which is what A said too"
+        });
+        out.flush();
+    }
+    out.str("\n       of those, ");
+    out.hex(rejected as u64);
+    out.str(" are branch targets rather than call returns (A says so on each), and ");
+    out.hex(lost as u64);
+    out.str(" pass B's filter and were still missed.");
+    out.flush();
+    if lost == 0 {
+        out.str("\n       B lost nothing, so it is a superset of A and the list is");
+        out.str("\n       complete as far as this window reaches. Read B, and");
+        out.str("\n       re-disassemble anything it names: `callers.py` scans raw");
+        out.str("\n       bytes and has reported ModRM bytes as calls, and macho.py has");
+        out.str("\n       39 mid-instruction starts in 258.");
+    } else {
+        out.str("\n       ");
+        out.hex(lost as u64);
+        out.str(" real frame(s) were lost, so the list above is NOT complete evidence.");
+    }
+    out.flush();
+}
+
+/// The `base/check.cc` frames a migrated `NOTREACHED_IN_MIGRATION()` unwinds
+/// through, by image offset.
+///
+/// This build has **no symbol table** - `macho.py`'s `symbols` is empty and
+/// there is no `LC_FUNCTION_STARTS` - so the offsets are derived from the image
+/// and written down here in full, because a reader must be able to check them:
+///
+/// ```text
+/// 5cb87d0:  push rbp; mov rbp,rsp; push r14; push rbx; sub rsp,0x30
+/// 5cb87db:  lea  rsi,[rip+…]  # 0xd8eba55 "TriggerNotReached"      (its __func__)
+/// 5cb87e2:  lea  rdx,[rip+…]  # 0xd8eba67 "../../base/check.cc"    (its __FILE__)
+/// 5cb87ed:  mov  ecx,0x169                                       (its __LINE__ = 361)
+/// 5cb87f2:  call 0x5ccd790                                       (Location ctor)
+/// ```
+///
+/// That is `NotReachedError::TriggerNotReached()`: the two `__cstring` loads
+/// are the only ones in the whole image that reach those strings, and
+/// `0x169 == 361` is the number the guest printed. A site that *streams a real
+/// location* would print its own file and line instead, so a report carrying
+/// `check.cc(361)` is a report that came through here - which is what makes
+/// this list the answer rather than one candidate among thousands.
+///
+/// The three below it are what `TriggerNotReached` itself unwinds through, all
+/// in the same file and read off the same disassembly: it ends with
+/// `call 0x5cb8890`, which calls `0x5cb87c0`, which calls `0x5cb8770`
+/// (`CheckError::~CheckError`: virtual-dispatch the `LogMessage`, then
+/// `int3; ud2`). The abort happens inside the virtual's callee, in
+/// `LogMessage::Flush`, which is why the frames stop there.
+const NOT_REACHED_CHAIN: &[(u64, &str)] = &[
+    (
+        0x5cb87d0,
+        "NotReachedError::TriggerNotReached()  <- the site that fired",
+    ),
+    (0x5cb8890, "NotReachedError::~NotReachedError()"),
+    (0x5cb87c0, "the out-of-line ~CheckError wrapper"),
+    (0x5cb8770, "CheckError::~CheckError()"),
+];
+
+///
+/// Additive and off by default. `ROSETTA3_TC_LAYOUT=1`.
+///
+/// Why this exists, and why it is not decoration. Three separate claims about
+/// the object at `Framework+0x5d46240` have been made from single fields, and
+/// two of them are wrong in ways this prints directly:
+///
+/// - `0x5cd72b0` builds the receiver as its second argument **minus `0x10`**
+///   (`add r14,0xffffffffffffff10` at `0x5cd72da`), while its only live caller
+///   passes `&this + 0xf0` (`lea rsi,[rbx+0xf0]` at `0x5d46f77`). The two are
+///   *not* inverses: the receiver is `caller_this + 0xe0`. So the object `r14`
+///   points at and the object `0x5d46e60` is running on are 0xe0 apart, and
+///   every field name in the main report is being read at one of two bases.
+/// - The constructor writes **three** more vtable pointers than the report
+///   prints, at `+0xf8` and `+0x158` (and the destructor writes the same two
+///   values again), so the four of them together are a positive fingerprint of
+///   "this address was a `ThreadControllerImpl`, constructed".
+/// - The destructor clears `+0x268` (`0x5d45078`) as well as `+0x218`
+///   (`0x5d4514e`). Those two clears were both executed or neither, so `+0x268`
+///   is a *second, independent* test of the same hypothesis that `+0x218` is
+///   being used for, and it is not being used for it.
+///
+/// The last point is the reason to run this: `+0x218` alone cannot distinguish
+/// "destructor ran" from "block was reused", and `+0x268` is a free second
+/// witness.
+fn say_tc_layout(out: &mut Buffer, r14: u64) {
+    /// `ROSETTA3_TC_LAYOUT=1` - off by default, and the only thing this reads.
+    const ENV: &str = "ROSETTA3_TC_LAYOUT";
+    /// How far below the controller to print. The caller of the DoWork closure
+    /// computes its own `this` as `r14 - 0xe0` and then reads a member at
+    /// `+0x268` from *that*, i.e. `r14 + 0x188`, so the region below is not
+    /// slack - it is where the object that holds the controller lives.
+    const BELOW: u64 = 0x100;
+    /// The controller is a `new(0x270)`, and `DoWork` reads `+0x260`, so this
+    /// is the whole allocation plus a little.
+    const ABOVE: u64 = 0x280;
+
+    if !std::env::var_os(ENV).is_some_and(|v| v != "0") {
+        return;
+    }
+    let word = |at: u64| -> Option<u64> {
+        if at == 0 || at % 8 != 0 {
+            return None;
+        }
+        // SAFETY: a guest word, read only after the null and alignment check. A
+        // wild address means this one line does not print, which is the same
+        // failure mode as every other probe here.
+        Some(unsafe { std::ptr::read_volatile(at as *const u64) })
+    };
+    let line = |out: &mut Buffer, label: &str, v: Option<u64>| {
+        out.str("\n      ");
+        out.str(label);
+        out.str(" = ");
+        match v {
+            Some(v) => {
+                out.hex(v);
+                // Deslide so a vtable pointer can be compared with the
+                // addresses the disassembly prints.
+                if let Some(off) = image_offset(v) {
+                    out.str("  guest+");
+                    out.hex(off);
+                }
+            }
+            None => out.str("unreadable"),
+        }
+    };
+
+    out.str("\n  TC_LAYOUT - the four vptrs the ctor and dtor both write:");
+    for (name, at) in [
+        ("r14+0x000 vptr   (0x5d44ebe / 0x5d45044)", 0x000u64),
+        ("r14+0x0f0 vptr   (0x5d44ec8 / 0x5d4504e)", 0x0f0),
+        ("r14+0x0f8 vptr   (0x5d44ed6 / 0x5d45055)", 0x0f8),
+        ("r14+0x158 vptr   (0x5d44ee4 / 0x5d4506a)", 0x158),
+    ] {
+        line(out, name, word(r14.wrapping_add(at)));
+    }
+    out.str("\n    expected guest offsets 0xe268490 / 0xe268598 / 0xe2685f0 / 0xe268628");
+    out.flush();
+
+    out.str("\n  TC_LAYOUT - the destructor's clears, and what it released:");
+    out.flush();
+    for (name, at) in [
+        ("r14+0x218  cleared at 0x5d4514e", 0x218u64),
+        ("r14+0x268  cleared at 0x5d45078", 0x268),
+        ("r14+0x1a0  pthread_mutex_destroy at 0x5d4519a", 0x1a0),
+        ("r14+0x1e0  released at 0x5d4517b", 0x1e0),
+        ("r14+0x1f0  released at 0x5d45165", 0x1f0),
+        ("r14+0x200  destroyed at 0x5d45160", 0x200),
+        ("r14+0x220  vector begin (ctor 0x5d44fcb)", 0x220),
+        ("r14+0x228  vector end", 0x228),
+        ("r14+0x238  list head (bind 0x5d45529)", 0x238),
+        ("r14+0x150  bound flag  (bind 0x5d454f1)", 0x150),
+    ] {
+        line(out, name, word(r14.wrapping_add(at)));
+        out.flush();
+    }
+    out.str("\n    -> +0x218 and +0x268 are cleared by the same destructor,");
+    out.str("\n       0x4f2 bytes apart with no branch between them, so they");
+    out.str("\n       were both written or neither was. Two witnesses, not one.");
+    out.flush();
+
+    out.str("\n  TC_LAYOUT - the object 0xe0 below the controller, word by word:");
+    out.str("\n    (0x5d46e60 runs on r14-0xe0 and reads its +0x268, +0xf0, +0x218)");
+    out.flush();
+    let mut below = BELOW;
+    while below >= 8 {
+        below -= 8;
+        line(out, &format!("r14-{below:#05x}"), word(r14.wrapping_sub(below)));
+    }
+    out.flush();
+    out.str("\n  TC_LAYOUT - past the end of the 0x270 allocation:");
+    out.flush();
+    for step in (0x270u64..=ABOVE).step_by(8) {
+        line(out, &format!("r14+{step:#05x}"), word(r14.wrapping_add(step)));
+    }
+    out.flush();
+}
+
+/// Why is the `+0x218` cell null?  It is produced by `0x5cd7420`, and that
+/// function is a **thread-local cell accessor**: it reads `gs:[...]`, checks a
+/// generation word, and has a `xor eax,eax` exit that returns null when either
+/// check fails. The bind at `0x5d45440` stores that return value unguarded and
+/// four instructions later sets `+0x150 = 1`.
+///
+/// So this is the whole question, and it is a *measurement* of the faulting
+/// thread's `%gs` rather than an argument about it. `rdfsgs` is a single
+/// instruction, and the handler runs on the faulting thread, so the base read
+/// here is that thread's.
+///
+/// Additive, and off unless `ROSETTA3_TLS_CELL=1`.
+fn say_tls_cell(out: &mut Buffer) {
+    /// `ROSETTA3_TLS_CELL=1` - off by default, and the only thing this reads.
+    const ENV: &str = "ROSETTA3_TLS_CELL";
+    /// The three guest globals `0x5cd7420` reads. The offset of the thread_local
+    /// block, the slot index, and the generation word - all at image offsets
+    /// taken from the disassembly, not guessed.
+    const TLS_OFFSET_PTR: u64 = 0xe6a9db0;
+    const SLOT_INDEX: u64 = 0xe8729c0;
+    const GENERATION: u64 = 0xe8729c8;
+    /// The once-flag `0x5cd7420` tests before any of this.
+    const ONCE_FLAG: u64 = 0xe8729d0;
+
+    if !std::env::var_os(ENV).is_some_and(|v| v != "0") {
+        return;
+    }
+    // A guest *file* offset, as the disassembly prints it, turned into the host
+    // address it was loaded at. The three globals below are named by their
+    // unrelocated offsets because that is what the disassembly says, and
+    // reading them unrelocated faults - which is what the first run of this
+    // probe did, and reported as "unreadable" rather than as "wrong address".
+    let host_of = |guest_off: u64| -> Option<u64> {
+        IMAGES.try_lock().ok().and_then(|images| {
+            images
+                .iter()
+                .find(|i| guest_off < i.range.1 - i.range.0)
+                .map(|i| i.range.0 + guest_off)
+        })
+    };
+    // SAFETY: a null/alignment-checked word, as everywhere else here.
+    let word = |at: u64| -> Option<u64> {
+        (at != 0 && at % 8 == 0)
+            .then(|| unsafe { std::ptr::read_volatile(at as *const u64) })
+    };
+    // The guest global, named by its file offset and read where it was loaded.
+    let global = |guest_off: u64| -> Option<u64> { word(host_of(guest_off)?) };
+    // The faulting thread's `%gs` base, as the runtime installed it. This is a
+    // plain memory read of a box the thread already owns, not a `gs:` load:
+    // the handler must not itself fault, and it must not assume `%gs` is
+    // installed at all on the thread that faulted.
+    let gs: u64 = crate::thread::tsd_base();
+    out.str("\n  TLS_CELL - the faulting thread's %gs and the three globals");
+    out.str("\n    0x5cd7420 reads gs:[%rip+0xe6a9db0], so:");
+    out.str("\n    %gs base = ");
+    out.hex(gs);
+    out.str("  (0 = unset, which is the whole answer if true)");
+    out.flush();
+    for (name, at) in [
+        ("[0xe6a9db0] tls block offset", TLS_OFFSET_PTR),
+        ("[0xe8729c0] slot index", SLOT_INDEX),
+        ("[0xe8729c8] generation", GENERATION),
+        ("[0xe8729d0] once flag (byte)", ONCE_FLAG),
+    ] {
+        out.str("\n    ");
+        out.str(name);
+        out.str(" = ");
+        match global(at) {
+            Some(v) => {
+                out.hex(v);
+                if let Some(off) = image_offset(v) {
+                    out.str("  guest+");
+                    out.hex(off);
+                }
+            }
+            None => out.str("unreadable"),
+        }
+    }
+    out.flush();
+    // Reproduce the guest's own three steps, in its own order, reading only
+    // memory this thread already owns. The guest does:
+    //
+    //   mov rax,[rip+0xe6a9db0]      ; a word index
+    //   mov rax,gs:[rax*8]           ; THE THREAD POINTER
+    //   and rax,~3 ; je -> allocate
+    //
+    // so `%gs` is indexed by that word, and what comes back is the pointer the
+    // rest of the function treats as the per-thread block. `tsd_base()` is that
+    // same `%gs` value.
+    match global(TLS_OFFSET_PTR) {
+        Some(idx) => {
+            out.str("\n    the word index at 0xe6a9db0 = ");
+            out.hex(idx);
+            out.str("\n    so the guest loads gs:[index*8] = tsd_base + index*8");
+            out.str("\n    = ");
+            let at = gs.wrapping_add(idx.wrapping_mul(8));
+            out.hex(at);
+            out.flush();
+            match word(at) {
+                Some(tp) => {
+                    out.str("\n    the THREAD POINTER it reads there = ");
+                    out.hex(tp);
+                    out.str("  (0 = the `and rax,~3; je` fires and it allocates)");
+                    out.flush();
+                    // Now the generation check, exactly as at 0x5cd7518-0x5cd752d.
+                    let index = global(SLOT_INDEX).unwrap_or(0);
+                    let gen_at = tp.wrapping_add(index.wrapping_mul(16)).wrapping_add(8);
+                    let gen_here = word(gen_at);
+                    let gen_want = global(GENERATION);
+                    out.str("\n    slot index [0xe8729c0] = ");
+                    out.hex(index);
+                    out.str(", shifted <<4 = ");
+                    out.hex(index.wrapping_mul(16));
+                    out.str("\n    generation at [tp+rcx+8] = ");
+                    match gen_here {
+                        Some(v) => out.hex(v),
+                        None => out.str("unreadable"),
+                    }
+                    out.str("\n    generation wanted [0xe8729c8] = ");
+                    match gen_want {
+                        Some(v) => out.hex(v),
+                        None => out.str("unreadable"),
+                    }
+                    match (gen_here, gen_want) {
+                        (Some(a), Some(b)) if a == b => out.str(
+                            "\n    -> they MATCH, so 0x5cd7420 returned the cell, not null",
+                        ),
+                        _ => out.str(
+                            "\n    -> they DIFFER, so 0x5cd752d took `jne 0x5cd7537`,",
+                        ),
+                    }
+                    out.flush();
+                    out.str("\n    and the cell it would return is [tp+rcx] = ");
+                    let cell = word(tp.wrapping_add(index.wrapping_mul(16)));
+                    match cell {
+                        Some(v) => out.hex(v),
+                        None => out.str("unreadable"),
+                    }
+                    out.flush();
+                }
+                None => out.str(
+                    "\n    UNREADABLE, so the thread-pointer load itself is the fault",
+                ),
+            }
+        }
+        None => out.str("\n    the index word is unreadable, so this says nothing"),
+    }
+    out.str("\n    a healthy thread has a non-zero thread pointer, a generation");
+    out.str("\n    that matches, and a non-null cell. Any one of those three");
+    out.str("\n    failing is enough to make the bind store a null into +0x218.");
+    out.flush();
 }
 
 /// Name the unbound import a jump to zero went through.
@@ -1245,7 +2424,8 @@ fn image_offset(addr: u64) -> Option<u64> {
     })
 }
 
-fn say_image(out: &mut Buffer, addr: u64) -> bool {    let Ok(images) = IMAGES.try_lock() else {
+fn say_image(out: &mut Buffer, addr: u64) -> bool {
+    let Ok(images) = IMAGES.try_lock() else {
         return false;
     };
     let Some(image) = images
@@ -1263,13 +2443,44 @@ fn say_image(out: &mut Buffer, addr: u64) -> bool {    let Ok(images) = IMAGES.t
 }
 
 /// What this runtime knows about the faulting thread.
+///
+/// **The "not a guest thread" line below is a statement about
+/// [`crate::thread::current`] and nothing else**, and on the **native** backend it
+/// is `None` for *every* thread including the main one, because nothing there ever
+/// calls [`crate::thread::install`] - `exec::native::Native::load` binds every
+/// import straight to a host address and disarms the trampolines, so
+/// `crate::shims::dispatch` is never reached and a guest `pthread_create` lands in
+/// `darwin::pthread::create`, whose `run` gives the thread a Darwin thread pointer
+/// and no guest thread state. It is printed for every fault in every native run, so
+/// on that backend it distinguishes nothing. `ROSETTA3_THREAD_WHO=1` adds the two
+/// facts that make it checkable - see [`note_thread_who`].
 fn say_thread(out: &mut Buffer) {
     out.str("\n  thread ");
     out.hex(u64::from(crate::thread::key()));
     let Some(state) = crate::thread::current() else {
-        out.str(" - not a guest thread; the fault is in this runtime or in a host library");
+        note_thread_who(false);
+        // **This clause used to claim the fault was in this runtime or a host
+        // library, and on the native backend that is false every time.** The
+        // thread registry is populated by `install`, whose only live caller is
+        // `abi::call_import_inner` — reached from the `Vm` run loop, which the
+        // native backend never enters because it disarms the trampolines and
+        // calls guest code directly. So on native `current()` is `None` for
+        // *every* thread, guest or not, and 66 of 66 recorded reports said
+        // "not a guest thread" and none ever printed `guest rsp`.
+        //
+        // It cost four sessions of chasing a ghost thread. The read itself is
+        // honest — one writer of that slot, `install` — it simply says nothing
+        // on this backend, so the report must not imply it does.
+        if crate::exec::active().is_some_and(|e| e.engine() == crate::exec::Engine::Native) {
+            out.str(" - the native backend keeps no guest thread registry, so this says");
+            out.str(" nothing about the thread; the fault is in guest code if the");
+            out.str(" pc above is in a guest image");
+        } else {
+            out.str(" - not a guest thread; the fault is in this runtime or in a host library");
+        }
         return;
     };
+    note_thread_who(true);
     out.str(", guest rsp ");
     out.hex(state.live_rsp());
     out.str(", entry ");

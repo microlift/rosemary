@@ -31,6 +31,10 @@ impl Work {
         // pointer, and its allocator reads a thread identity the same way. Free
         // on a thread that is inside Darwin code already - the main queue's.
         let _darwin = crate::tls::DarwinThread::enter();
+        // This thread is not a guest thread - nothing registered it - and what
+        // runs below is guest code. See `block::adopt_thread` for why that
+        // matters and who installs the hook.
+        super::block::adopt_thread();
         match self {
             // SAFETY: the caller's guarantee. The release pairs with the copy that
             // put it on the queue.

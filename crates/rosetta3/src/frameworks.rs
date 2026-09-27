@@ -145,6 +145,43 @@ static FRAMEWORKS: &[Framework] = &[
         data: Some(avfoundation::data_symbols),
         symbol: None,
     },
+    // `provide: None` because the census says **zero** OpenDirectory *function*
+    // imports - the guest reaches OpenDirectory only through `objc_msgSend`, so
+    // classes and their selectors are the whole of the surface here.
+    Framework {
+        leaf: "OpenDirectory",
+        version: 'A',
+        umbrellas: &[],
+        provide: None,
+        data: Some(opendirectory::data_symbols),
+        symbol: Some(opendirectory::symbol),
+    },
+    // `provide: None` because the census says **zero** CoreLocation *function*
+    // imports: the guest links the framework (LC_LOAD_DYLIB at 0x20fb) and
+    // imports one class and two `double` constants, and the two constants are
+    // already `darwin`'s named zeroed refusals. So the class and its selectors
+    // are the whole of the surface here.
+    Framework {
+        leaf: "CoreLocation",
+        version: 'A',
+        umbrellas: &[],
+        provide: None,
+        data: Some(corelocation::data_symbols),
+        symbol: Some(corelocation::symbol),
+    },
+    // `provide: None` for the reason the OpenDirectory row above gives: zero
+    // CoreWLAN *function* imports - one data import, one class. That is
+    // provable rather than sampled, which matters here: this host has no real
+    // CoreWLAN, so every CoreWLAN import would be unbound and would appear in
+    // the census, and the log carries exactly one line for it.
+    Framework {
+        leaf: "CoreWLAN",
+        version: 'A',
+        umbrellas: &[],
+        provide: None,
+        data: Some(corewlan::data_symbols),
+        symbol: Some(corewlan::symbol),
+    },
     Framework {
         leaf: "Security",
         version: 'A',
@@ -218,6 +255,16 @@ fn register_system_libraries() {
         &["/usr/lib/libobjc.A.dylib", "/usr/lib/libobjc.dylib"],
         objc_symbol,
     );
+    // `/usr/lib/libsandbox.1.dylib` is the install name every helper image
+    // declares (`LC_LOAD_DYLIB`, first entry, ahead of `libSystem.B.dylib`),
+    // and it is not in `darwin::LIBRARY_NAMES`. A bind does not need this - the
+    // loader's chain is global, which is how `_sandbox_free_error` resolves from
+    // this library today - but a `dlopen` of the path does, and the leaf spelling
+    // is registered too because `synthetic::find` matches on either.
+    crate::dyld::register_synthetic(
+        &["/usr/lib/libsandbox.1.dylib", "libsandbox.1.dylib"],
+        symbol,
+    );
 }
 
 fn objc_symbol(name: &str) -> Option<u64> {
@@ -289,6 +336,15 @@ pub fn provider() -> SyntheticDylib {
     for (name, addr) in media_constants() {
         out.data(&name, addr);
     }
+    // Not a framework, so it has no row in `FRAMEWORKS` and no
+    // `/System/Library/Frameworks/...` path to be registered under: the five
+    // helper images declare `LC_LOAD_DYLIB /usr/lib/libsandbox.1.dylib`, and the
+    // two names it carries (`_sandbox_apply`, `_sandbox_init_with_parameters`)
+    // were unbound - a zero in the slot and a jump through it, in five
+    // processes. See `crates/sandbox/src/lib.rs` for the census that says which
+    // of the fourteen `_sandbox_*` names the guest tolerates a refusal from and
+    // which it traps on, and `register_system_libraries` for the install name.
+    sandbox::provide(out);
     for (name, addr) in shimmed() {
         out.function(&format!("_{name}"), addr as usize as u64);
     }
@@ -329,6 +385,7 @@ fn media_constants() -> Vec<(String, u64)> {
 fn shimmed() -> Vec<(&'static str, *const ())> {
     vec![
         ("NSLog", crate::shims::nslog::native::nslog() as *const ()),
+        ("NSLogv", crate::shims::nslog::native::nslogv() as *const ()),
         (
             "NSRunAlertPanel",
             crate::shims::nslog::native::run_alert_panel() as *const (),
@@ -355,6 +412,12 @@ pub fn symbol(name: &str) -> Option<u64> {
         // `crate::opengl`, which publishes it through its own lazy provider.
         .or_else(|| crate::opengl::symbol(name))
         .or_else(|| crate::openal::symbol(name))
+        // `libsandbox.1.dylib` is not a framework, so it has no row above; its
+        // two names are registered for the loader in `provider` and have to be
+        // registered for `dlsym` here, or the two would disagree about what
+        // `_sandbox_apply` is - which is the bug the thread-local bootstrap in
+        // PLAN.md §4 was.
+        .or_else(|| sandbox::symbol(name))
 }
 
 pub fn set_main_bundle(executable: &std::path::Path) {
@@ -454,5 +517,53 @@ mod tests {
                 assert_eq!(answer(bare), Some(*address), "{}: {mach_o}", framework.leaf);
             }
         }
+    }
+
+    /// The whole of the split-brain, as one claim: for **every** function any
+    /// framework publishes, [`symbol`] - the `dlsym` path - answers at the
+    /// address the flat provider publishes, the bind path.
+    ///
+    /// The two tests above do not have teeth together.
+    /// [`Self::no_framework_defines_a_symbol_another_one_does`] only counts
+    /// *names*, so two publishers that agree on the name and disagree on the
+    /// address - or the same function reached through two different rows, which
+    /// is a different bug with the same shape - pass it. And
+    /// [`Self::a_published_function_is_the_one_dlsym_answers`] asks each
+    /// framework about its *own* names, so a name published twice, by two
+    /// frameworks, is never asked about from both sides at once. The
+    /// duplicates this project has had - `_copyfile` and
+    /// `_CGCursorIsVisible` - are both invisible to it, and the second was
+    /// sitting in a passing suite.
+    ///
+    /// Functions only. A data slot is bound by address when the image loads and
+    /// no code path here `dlsym`s one, and `corefoundation::symbol` answers
+    /// almost no data name, so including them would assert a property nothing
+    /// depends on. And this is the *default* configuration: `provider()` wraps
+    /// the same publications in `exports::Denying`, and `ROSETTA3_WITHHOLD`
+    /// deliberately makes the bind path publish strictly less than the `dlsym`
+    /// path - an asymmetry that is the point of the knob and would otherwise be
+    /// reported as a disagreement here.
+    #[test]
+    fn the_bind_path_and_the_dlsym_path_reach_the_same_function() {
+        if !using_builtin() {
+            return;
+        }
+        let out = published();
+        let mut checked = 0;
+        for (mach_o, address) in &out.functions {
+            let bare = mach_o.strip_prefix('_').expect("the Mach-O underscore");
+            // `symbol` stops at the first framework that answers, so this is
+            // exactly the question "did the bind path and the dlsym path pick
+            // the same winner", asked per name.
+            let answered = symbol(bare).map(|a| format!("{a:#x}"));
+            assert_eq!(
+                symbol(bare),
+                Some(*address),
+                "{mach_o}: the flat provider binds {address:#x} and `dlsym` says {}",
+                answered.as_deref().unwrap_or("nothing")
+            );
+            checked += 1;
+        }
+        assert!(checked > 100, "only {checked} functions checked");
     }
 }

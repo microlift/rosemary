@@ -57,7 +57,11 @@ impl Flavor {
 
     /// Parse one of this flavor's images under its own spec. A slice of the wrong
     /// architecture parses to nothing rather than to wrong addresses.
-    fn exports(self, bytes: &[u8]) -> Result<ExportTable> {
+    ///
+    /// `pub(crate)` rather than private because `crate::objcexc`'s test needs the
+    /// same table [`bind_objc_exceptions_to_the_vendored_cxxabi`] builds, and a
+    /// second way to build it is a second thing to keep right.
+    pub(crate) fn exports(self, bytes: &[u8]) -> Result<ExportTable> {
         match self {
             Flavor::Intel => ExportTable::parse(&MachObject::parse_any(bytes, X86_64)?),
             Flavor::Arm => ExportTable::parse(&MachObject::parse_any(bytes, Arm64)?),

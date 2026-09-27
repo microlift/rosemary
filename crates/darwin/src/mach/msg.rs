@@ -7,6 +7,30 @@ use super::space::{self, MACH_PORT_DEAD, MACH_PORT_NULL, Name};
 use super::wire::{self, Datagram, MAX_RIGHTS, Receiver};
 
 /// `MACH_MSG_TYPE_*`, the dispositions a header field or descriptor can carry.
+///
+/// **These are the SDK's numbers, not the kernel's, and they are the ones the
+/// guest's own machine code carries.** `MACH_MSG_TYPE_MOVE_SEND` is `0x11` and
+/// `MACH_MSG_TYPE_MOVE_RECEIVE` is `0x10` in the SDK this binary was built
+/// against, which is the reverse of the order a reader remembers from the
+/// kernel's `osfmk/mach/message.h`. All six are folded into immediates in
+/// `mojo::core::ChannelMac::SendMessageLocked`,
+/// `MachPortRendezvousServerBase::CreateReplyMessage` and
+/// `mojo::core::ChannelMac::SendHandshake`, and each was read out of the bytes
+/// rather than out of anyone's memory:
+///
+/// | value | constant | measured at |
+/// |---|---|---|
+/// | `0x10` | `MACH_MSG_TYPE_MOVE_RECEIVE` | `+0x632269`, the `kMachReceive` arm of `SendMessageLocked` |
+/// | `0x11` | `MACH_MSG_TYPE_MOVE_SEND` | `+0x632120` and `+0x63224d`, the `kMachSend` and `kFd` arms |
+/// | `0x12` | `MACH_MSG_TYPE_MOVE_SEND_ONCE` | `+0x5da3cac`, `mov DWORD PTR [rcx],0x80000012` |
+/// | `0x13` | `MACH_MSG_TYPE_COPY_SEND` | `+0x631f9a` in `SendMessageLocked`, and `+0x5d9a48b` in `waitable_event_apple.cc`'s `SignalImpl` |
+/// | `0x14` | `MACH_MSG_TYPE_MAKE_SEND` | `+0x631369`, `mojo`'s `SendHandshake` |
+/// | `0x15` | `MACH_MSG_TYPE_MAKE_SEND_ONCE` | `+0x5da457c`, `MachPortRendezvousClient::SendRequest` |
+///
+/// The three `SendMessageLocked` entries are written as one 32-bit store at
+/// descriptor offset +8, `mov DWORD PTR [r15+0x8],0x00110000` and
+/// `0x00100000`, which is what puts `disposition` at offset 10 and `type` at 11
+/// - see `DESCRIPTOR_DISPOSITION_AT` and `DESCRIPTOR_TYPE_AT` below.
 pub const MOVE_RECEIVE: u32 = 16;
 pub const MOVE_SEND: u32 = 17;
 pub const MOVE_SEND_ONCE: u32 = 18;
@@ -15,6 +39,19 @@ pub const MAKE_SEND: u32 = 20;
 pub const MAKE_SEND_ONCE: u32 = 21;
 
 /// `MACH_MSGH_BITS_*`.
+///
+/// **The remote disposition is in bits 0-4 and the local one in bits 8-12** -
+/// `MACH_MSGH_BITS_REMOTE(x)` is `x` and `MACH_MSGH_BITS_LOCAL(x)` is `x << 8`.
+/// This is the other thing the kernel's copy of the header gets remembered
+/// backwards, and getting it wrong makes a send apply the destination's
+/// disposition to the reply port.
+///
+/// `+0x631369` settles it in one folded constant: `mojo`'s `SendHandshake` builds
+/// `MACH_MSGH_BITS(MACH_MSG_TYPE_COPY_SEND, MACH_MSG_TYPE_MAKE_SEND)`, and the
+/// immediate is `0x1413` - `0x13` low, `0x14` at shift 8, so the first argument
+/// lands low. `+0x5d9a495` agrees: `SignalImpl` stores
+/// `MACH_MSGH_BITS_REMOTE(MACH_MSG_TYPE_COPY_SEND)` as the word `0x13` on its own,
+/// with nothing shifted.
 const BITS_COMPLEX: u32 = 0x8000_0000;
 const BITS_PORTS_MASK: u32 = 0x1f;
 const BITS_LOCAL_SHIFT: u32 = 8;
@@ -40,8 +77,75 @@ const DESCRIPTOR_PORT: u8 = 0;
 
 /// `mach_msg_header_t`, `mach_msg_body_t` and `mach_msg_port_descriptor_t`, in
 /// bytes. All three are the same size on x86-64 and arm64.
+///
+/// # `HEADER` is 24, and it is not padding
+///
+/// **Six words, not five.** The header this has to match carries `msgh_name`
+/// between `msgh_local_port` and `msgh_id`:
+///
+/// ```c
+/// mach_msg_bits_t   msgh_bits;          // +0
+/// mach_msg_size_t   msgh_size;          // +4
+/// mach_port_t       msgh_remote_port;   // +8
+/// mach_port_t       msgh_local_port;    // +12
+/// mach_port_t       msgh_name;          // +16
+/// mach_msg_id_t     msgh_id;            // +20
+/// ```
+///
+/// A five-word header - the shape pre-`msgh_name` - is 20, and 20 is the number
+/// that has to be argued against here, because a 20-byte header is the one thing
+/// that would be silently, invisibly wrong: a send would write the body four
+/// bytes late and a receive would refuse a genuine 20-byte message as too short.
+/// **It is not what the guest uses, and this is measured rather than argued.**
+/// Every figure below is read out of the shipped `Chromium Framework` at tag
+/// `130.0.6723.91`; `_mach_msg` is called from eleven places and six of them
+/// size a message with a constant that fixes the header's extent.
+///
+/// | where | what it is | the number |
+/// |---|---|---|
+/// | `+0x5d9a4af` | `base::WaitableEvent::SignalImpl` - `mov edx,0x18` is the `send_size` argument, `sizeof(mach_msg_empty_send_t)`, which is one header and nothing else | **24** |
+/// | `+0x5d9a323` | `base::WaitableEvent::PeekPort(port, /*dequeue=*/true)` - `mov ecx,0x20` is `rcv_size`, `sizeof(mach_msg_empty_rcv_t)`: a header *and* a `mach_msg_trailer_t` | **32** |
+/// | `+0x5d9a652` | `base::WaitableEvent::TimedWaitImpl` - `r15d` is the same `rcv_size`, materialised as `1 << 5` | **32** |
+/// | `+0x5da3acb` | `base::mac::MachPortRendezvousServerBase::HandleRequest` - `rcv_size` for `struct : mach_msg_header_t { mach_msg_audit_trailer_t trailer; }` | **76** = 24 + 52 |
+/// | `+0x5da45b1` | `MachPortRendezvousClient::SendRequest` - `rcv_size` for `CalculateResponseSize(5) + sizeof(mach_msg_trailer_t)`, i.e. a header, a body, five 12-byte descriptors, five 4-byte identifiers and a trailer | **116** |
+/// | `+0x630683` | `mojo::core::ChannelMac::OnMachMessageReceived` - `cmp r15,0x1b; jbe` rejects anything under `sizeof(mach_msg_base_t)` | **28** = 24 + 4 |
+///
+/// Four of those are self-checking: 32, 76, 116 and 28 each name a struct that
+/// *contains* the header plus other things of independently known size, so each
+/// one is an equation with the header as the only unknown, and all four solve to
+/// 24. 24 and 32 are what `waitable_event_apple.cc` passes for a message with no
+/// body and for one with a trailer and no body, which is the pair that would
+/// disagree with 20.
+///
+/// The field offsets say the same thing, from three independent routines, and
+/// they are what a wrong `HEADER` would actually break:
+///
+/// * `+0x5da3cee` - `MachPortRendezvousServerBase::CreateReplyMessage` stores
+///   `msgh_id` (`'MRZV'`) with `mov DWORD PTR [rax+0x14],0x4d525a56`, so
+///   `msgh_id` is at **+20**. Under a five-word header it would be at +16.
+/// * `+0x5da3d02` - the same function stores
+///   `body.msgh_descriptor_count` at `[rax+0x18]`, so the **first body byte is
+///   +24**. This is the offset a 20-byte `HEADER` would put four bytes early.
+/// * `+0x6313ad` - `mojo::core::ChannelMac::SendHandshake` stores `'mjhs'` at
+///   `[rbp-0x34]` with its buffer at `[rbp-0x48]` (the store is at `+0x631389`) -
+///   again **+20** - and passes `sizeof(message)` as `send_size` at `+0x6313a0`,
+///   again **24**.
+///
+/// And `msgh_name` is not a phantom: `+0x6303e9` is `*header =
+/// mach_msg_header_t{}` compiled to `movdqu [r14],xmm0` plus `mov QWORD
+/// [r14+0x10],0` - sixteen bytes then eight, zeroing exactly 24. A 20-byte struct
+/// would have needed a four-byte second store.
+///
+/// The authority here is not this project's reading of a header: the compiler
+/// that built the guest folded `sizeof(mach_msg_header_t)` to 24 in three
+/// separate translation units. Whatever that SDK was, it had six words, and a
+/// 20-byte `HEADER` would be a mismatch with the binary that has to be satisfied.
 const HEADER: usize = 24;
+/// `mach_msg_body_t` - the descriptor count, and nothing else. Confirmed as one
+/// word by the store at `+0x5da3d02` and by `sizeof(mach_msg_base_t)` being 28.
 const BODY: usize = 4;
+/// `mach_msg_port_descriptor_t`. The guest's own span arithmetic is twelve bytes
+/// a descriptor: `+0x5da3d06`, `lea r8,[r13*4]` then `lea r12,[r8+r8*2]`.
 const DESCRIPTOR: usize = 12;
 
 /// `mach_msg_trailer_t`: the eight bytes the kernel appends to a received

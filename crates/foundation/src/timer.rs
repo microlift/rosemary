@@ -445,6 +445,33 @@ unsafe extern "C" fn fire_date(receiver: Id, _sel: Sel) -> Id {
 /// a program comparing them would be told they were different.
 static RUN_LOOP: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
 
+/// `-[NSRunLoop currentMode]`, the loop's current mode as an object.
+///
+/// The answer has to be the **same object** the guest holds in its imported
+/// constant, because that is what it compares against: the guest's check is
+/// `[[NSRunLoop currentRunLoop] currentMode] == NSEventTrackingRunLoopMode`,
+/// an identity comparison (`Framework+0x815e991`). `corefoundation::base::interned_name`
+/// is what makes that hold - it returns one object per text for the whole
+/// process, and it is the same function that publishes the imported constant
+/// (`string_globals` → `global_cell(symbol, interned_name(text))`). So both
+/// sides of the comparison come from one interning table and agree by
+/// construction.
+///
+/// **This is why it is not `crate::string::from_bytes`.** Building a fresh
+/// string with the right text would satisfy every byte comparison and still
+/// fail the one comparison the guest actually makes - and it would turn an
+/// honest `nil` into a plausible-looking wrong answer, which is the outcome
+/// PLAN.md §1 is about. Equal text is not the same string.
+///
+/// `nil` when the loop is not running in a mode, which is also what
+/// `CFRunLoopCopyCurrentMode` answers in that state.
+unsafe extern "C" fn current_mode(_receiver: Id, _sel: Sel) -> Id {
+    match corefoundation::runloop::current().current_mode() {
+        Some(name) => corefoundation::base::interned_name(&name) as Id,
+        None => std::ptr::null_mut(),
+    }
+}
+
 unsafe extern "C" fn current_run_loop(class: Id, _sel: Sel) -> Id {
     *RUN_LOOP.get_or_init(|| {
         // SAFETY: `class` is `NSRunLoop`, which this module registered.
@@ -471,7 +498,16 @@ unsafe extern "C" fn run_mode_before_date(_receiver: Id, _sel: Sel, _mode: Id, l
         true => 0.0,
         false => (date_of(limit) - now()).max(0.0),
     };
-    let result = corefoundation::runloop::main().run_in_mode(
+    // `current()`, and this line is load-bearing: Chromium's
+    // `MessagePumpCFRunLoop` adds its sources to the **thread's own** loop
+    // (`CFRunLoopGetCurrent`, `Framework+0x5d95afb`) and then turns the loop
+    // through `-runMode:beforeDate:` (`Framework+0x5d96ca3`). Turning `main()`
+    // here put the sources on one loop and the turning on another - a global,
+    // with two threads sharing one loop's current mode, stop request and
+    // sources. `current()` is thread-local, so each thread now turns the loop it
+    // added its sources to. On the main thread the two are the same object, so
+    // nothing there changes.
+    let result = corefoundation::runloop::current().run_in_mode(
         corefoundation::runloop::DEFAULT_MODE,
         seconds,
         true,
@@ -542,6 +578,18 @@ pub(crate) fn install() {
         "addTimer:forMode:" => add_timer_for_mode, c"v32@0:8@16@24";
         "runMode:beforeDate:" => run_mode_before_date, c"B32@0:8@16@24";
         "runUntilDate:" => run_until_date, c"v24@0:8@16";
+        // The guest sends this: `Framework+0x815e97a` loads
+        // `@selector(currentMode)` and calls `objc_msgSend` on the result of
+        // `+[NSRunLoop currentRunLoop]`.
+        //
+        // It is the left half of an **identity** comparison - see the
+        // `_NSEventTrackingRunLoopMode` binding in `crates/appkit/src/lib.rs`,
+        // which is the right half. Answering `nil` made that comparison
+        // `nil == <mode>`, which is false for every mode including the one the
+        // guest is asking about, so "am I inside a tracking loop?" could never be
+        // true. The answer has to be the *same object* the mode was registered
+        // under, which is why this reads `current()` and not `main()`.
+        "currentMode" => current_mode, c"@16@0:8";
     });
 }
 

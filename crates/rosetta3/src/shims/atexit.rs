@@ -49,6 +49,42 @@ pub fn cxa_atexit(
 /// The handler is registered through the three-argument form with a null
 /// argument. A function compiled to take none ignores the register it arrives
 /// in, under both ABIs in play here.
+///
+/// # Which of those two reasons is true depends on the backend, and this module
+/// is only reached on one of them
+///
+/// The first reason - that the handler must become a trampoline - is an
+/// **emulated**-backend fact. Under emulation the guest's function pointers are
+/// not the host's, so [`crate::abi::Callbacks::substitute`] has to compile one;
+/// under **native** execution the guest *is* host code, a guest function pointer
+/// is already a callable host address, and the substitution would be the
+/// identity.
+///
+/// The second reason is true on both, and is the one that cannot be fixed by
+/// publication either way: `atexit` is in `libc_nonshared.a`, so a
+/// `SyntheticDylib` that defined the name would be shadowed by nothing but
+/// would also be the *only* thing serving it, and `dlsym` will never find it
+/// however the runtime is wired. `__cxa_atexit` is the opposite case and *is*
+/// exported, so it is publishable.
+///
+/// ## The whole module is unreachable on native
+///
+/// [`crate::shims::dispatch`] is called from exactly one place,
+/// `abi::call_import_inner`, which is reached only from the `Vm` run loop. On
+/// the native backend `exec::native::Native::load` binds every import straight to
+/// a host address and calls `crate::trampoline::disarm()`, so no guest call ever
+/// arrives at `dispatch` - `crates/rosetta3/src/fault.rs`'s `say_thread` says so
+/// at the same site and for the same reason. So on native the guest's
+/// `___cxa_atexit` reaches glibc's own copy with the guest's `dso_handle`.
+///
+/// Measured, and the measurement is *not* a misbehaviour report: the guest
+/// imports `___cxa_atexit` from 14 of 14 Mach-Os in the bundle (251 call sites
+/// in the Framework) and `__cxa_finalize` from **none**, so nothing on this
+/// guest ever compares a DSO handle against the one glibc stored. That is why
+/// the asymmetry is worth recording rather than fixing blind: the substitution
+/// this module performs is inert for this program, and a native publication that
+/// "fixed" it would be changing code that was not wrong. What it would *not* do
+/// is make anything more correct, which is the honest summary.
 pub fn atexit(
     symbol: &str,
     ctx: &mut RegisterContext,
@@ -72,6 +108,12 @@ pub fn atexit(
 pub type Shim = crate::signal::Shim;
 
 /// Whether `name` (underscore already stripped) is one of this module's.
+///
+/// Mach-O spellings, because that is what [`crate::shims`] reduces to: the
+/// guest's import is `___cxa_atexit` and `_atexit`, and one underscore comes off
+/// before this is asked. A row written `__cxa_atexit` here would match nothing,
+/// and nothing would say so - see the note on [`atexit`] about which backend
+/// reaches this at all.
 pub fn shim_for(name: &str) -> Option<Shim> {
     match name {
         "__cxa_atexit" => Some(cxa_atexit),

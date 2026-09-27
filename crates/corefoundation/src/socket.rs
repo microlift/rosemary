@@ -109,12 +109,16 @@ unsafe extern "C" fn perform(info: *mut c_void) {
 pub unsafe extern "C" fn create_run_loop_source(
     _allocator: CFTypeRef,
     socket: CFTypeRef,
-    _order: CFIndex,
+    order: CFIndex,
 ) -> CFTypeRef {
     let Some(socket) = (unsafe { borrow(socket) }) else {
         return std::ptr::null();
     };
-    let source = crate::runloop::new_source(Some(perform), Arc::as_ptr(&socket) as usize);
+    let source = crate::runloop::new_source_ordered(
+        Some(perform),
+        Arc::as_ptr(&socket) as usize,
+        order,
+    );
     *socket.source.lock().unwrap_or_else(|e| e.into_inner()) = Some(Arc::downgrade(&source));
     Arc::into_raw(source).cast::<c_void>()
 }

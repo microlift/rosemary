@@ -859,6 +859,40 @@ unsafe fn send_if_implemented(target: Id, selector: &str, argument: Id) {
     unsafe { f(target, sel, argument) };
 }
 
+/// `void NSBeep(void)` - refused, and no sound made.
+///
+/// The function rings the system alert. There is no system alert to ring on this
+/// host: no audio device is claimed by this runtime, and Chromium's own audio path
+/// is SDL-backed rather than AppKit's. A beep that produced no sound would be a
+/// lie told to an accessibility feature that asked for one.
+///
+/// It is `void` with no out-parameter, so the guest reads nothing back, and both
+/// of its call sites are conditional on a flag of the guest's own. At
+/// `0x68f9b83` - a tail jump, so nothing is in any register - the flag is
+/// `getenv("CHROME_HEADLESS")`, read once into a byte at `0xe73da70` from the
+/// string at `0xd94ee29`:
+///
+/// ```text
+/// 68f9b74  cmp  BYTE PTR [0xe73da70], 1
+/// 68f9b7b  jne  0x68f9b88              ; not set: the other path
+/// 68f9b7d  add  rsp, 8
+/// 68f9b81  pop  rbx
+/// 68f9b82  pop  rbp
+/// 68f9b83  jmp  _NSBeep                ; set: this is the headless beep
+/// 68f9b88  mov  rsi, [0xe6e8740]        ; the other path
+/// 68f9b92  call objc_msgSend
+/// ```
+///
+/// And at `0x8835d88`, also a tail jump, a byte at `[rdi+0x344]` decides:
+/// `cmp BYTE PTR [rdi+0x344], 1; jne 0x8835d8d`, so the beep is the `== 1` case
+/// and the work continues otherwise.
+///
+/// So it is bound rather than left unbound because a null slot is a segfault and a
+/// named no-op is not, and because the reason it makes no sound belongs in the
+/// source rather than only in a report.
+#[expect(non_snake_case, reason = "the C spelling is the interface")]
+pub extern "C" fn NSBeep() {}
+
 /// `int NSApplicationMain(int argc, const char *argv[])`.
 ///
 /// The arguments are ignored, as Apple's are: everything it needs is in the
@@ -1283,5 +1317,29 @@ mod tests {
             "the source was not serviced from inside -run"
         );
         loop_.remove_source(&source, corefoundation::runloop::DEFAULT_MODE);
+    }
+
+    /// `NSBeep` is bound, takes no arguments and returns nothing.
+    ///
+    /// The assertion is only that the shape is callable: a `void(void)` that
+    /// returns no value cannot be asserted on, and the reason it is silent is in
+    /// its own doc comment. What is checked is that calling it does not fault and
+    /// does not need an application - which is the shape, since one of the
+    /// guest's two call sites is a tail jump reached before any application
+    /// exists.
+    ///
+    /// Nothing here touches `+[NSApplication sharedApplication]`. That singleton
+    /// is process-global and a sibling test in this module installs a subclass
+    /// against it, so merely *asking* for it from a second thread is what makes
+    /// `the_shared_application_is_the_class_it_was_asked_for_and_is_what_ns_app_holds`
+    /// fail intermittently. This test has no reason to ask.
+    #[test]
+    fn a_beep_is_bound_and_needs_nothing_to_happen_first() {
+        crate::bootstrap();
+        // SAFETY: `void (void)`, which is what both of the guest's two call sites
+        // reach - one of them a tail jump with nothing in any register.
+        let beep: extern "C" fn() = NSBeep;
+        beep();
+        beep();
     }
 }

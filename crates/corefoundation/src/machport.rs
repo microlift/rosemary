@@ -126,10 +126,11 @@ pub unsafe extern "C" fn create_with_port(
 /// `CFRunLoopSourceRef CFMachPortCreateRunLoopSource(CFAllocatorRef, CFMachPortRef,
 /// CFIndex order)`
 ///
-/// The `order` is Apple's own sort key between the version-0 sources a loop
-/// holds, and it is not consulted for the same reason it is not in
-/// [`crate::socket::create_run_loop_source`]: this implementation has one kind of
-/// source and the loop runs them in the order it was given them.
+/// The `order` is Apple's own sort key between the sources a mode holds, and it
+/// is passed to [`crate::runloop::new_source_ready_ordered`] for the same reason
+/// a version-0 source's is: a loop that services its sources in the order it was
+/// given them is servicing a different set of things per turn than one that
+/// services them in the order the guest asked for.
 ///
 /// Null rather than a source that never fires when the port cannot be listened
 /// to. A name that is not a receive right - a send right, a port set - has no
@@ -138,7 +139,7 @@ pub unsafe extern "C" fn create_with_port(
 pub unsafe extern "C" fn create_run_loop_source(
     _allocator: CFTypeRef,
     port: CFTypeRef,
-    _order: CFIndex,
+    order: CFIndex,
 ) -> CFTypeRef {
     let Some(port) = (unsafe { borrow(port) }) else {
         return std::ptr::null();
@@ -146,11 +147,15 @@ pub unsafe extern "C" fn create_run_loop_source(
     if !port.valid.load(Ordering::Acquire) || space::receiver(port.name).is_none() {
         return std::ptr::null();
     }
-    let source =
-        crate::runloop::new_source_ready(Some(perform), Arc::as_ptr(&port) as usize, Some(ready));
+    let source = crate::runloop::new_source_ready_ordered(
+        Some(perform),
+        Arc::as_ptr(&port) as usize,
+        order,
+        Some(ready),
+    );
     *port.source.lock().unwrap_or_else(|e| e.into_inner()) = Some(Arc::downgrade(&source));
-    // `runloop::new_source_ready` has already recorded the handle, so the loop's
-    // own `CFRunLoopSource*` entry points can find it again.
+    // `runloop::new_source_ready_ordered` has already recorded the handle, so the
+    // loop's own `CFRunLoopSource*` entry points can find it again.
     Arc::into_raw(source).cast::<c_void>()
 }
 

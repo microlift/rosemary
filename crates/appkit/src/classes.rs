@@ -104,6 +104,48 @@ static HIERARCHY: &[(&str, Option<&str>, usize)] = &[
     // The unbound-import report agrees about the framework:
     // "_OBJC_CLASS_$_NSAssertionHandler from .../Foundation.framework".
     ("NSAssertionHandler", None, 0),
+    // Declared for the subclasses the guest cannot register without, which is
+    // the whole of the difference between having a class and not having one: a
+    // missing superclass refuses the *subclass*, so every method it defines
+    // and every message sent to it goes with it, where a declared one
+    // registers and only the inherited messages actually sent are refused.
+    //
+    // The evidence is the Framework's own bind stream, not a header. The guest
+    // binds `_OBJC_CLASS_$_X` into `__objc_data` at `class + 8`, which is
+    // `objc_class::superclass` - `isa` is at +0 - so the class at `slot - 8`
+    // is the one that cannot be realised. Reading the stream that way names
+    // exactly one subclass per row, and there are no others: of the 171 classes
+    // in `__objc_classlist`, eight have a superclass in a system framework,
+    // and five of those superclasses were unbound.
+    //
+    //   NSAnimation                     <- ConstrainedWindowAnimationBase
+    //                                   <- FadeAllWindowsAnimation
+    //   NSAccessibilityElement          <- AXPlatformNodeCocoa
+    //   NSTableView                     <- TaskManagerMacTableView
+    //   NSTitlebarAccessoryViewController <- ImmersiveModeTitlebarViewController
+    //   NSATSTypesetter                 <- GTMBreakRecordingTypeSetter
+    //
+    // The eighth is `ASAuthorizationController`, which has no crate here.
+    //
+    // No methods of their own: what these subclasses send is not knowable from
+    // the image, and an invented one is worse than a refusal that names it. The
+    // superclasses below are AppKit's documented ones, so a subclass also
+    // inherits whatever `NSView`/`NSViewController` already answers here.
+    //
+    // `NSATSTypesetter` is declared straight off `NSObject` rather than off
+    // `NSTypesetter`, which is what Apple's header says it derives from:
+    // `NSTypesetter` has no crate and no call site in the guest, so naming it
+    // would add a class nothing can use and refuse `-setString:` for a subclass
+    // that only wants its own methods.
+    ("NSAnimation", None, 0),
+    ("NSAccessibilityElement", None, 0),
+    ("NSATSTypesetter", None, 0),
+    ("NSTableView", Some("NSControl"), 0),
+    (
+        "NSTitlebarAccessoryViewController",
+        Some("NSViewController"),
+        0,
+    ),
 ];
 
 pub fn install() {
@@ -206,5 +248,72 @@ mod tests {
         let view = objc::class::lookup(c"NSView").expect("NSView");
         assert!(panel.chain().any(|c| std::ptr::eq(c, window)));
         assert!(!view.chain().any(|c| std::ptr::eq(c, window)));
+    }
+
+    /// The five superclasses the guest's own classes are declared against, by
+    /// the exact Mach-O spelling it imports them under.
+    ///
+    /// The spelling is the point of the test, not a detail of it. A guest binds
+    /// `_OBJC_CLASS_$_X` **verbatim, with no normalisation**, and a class
+    /// registered and published under any other spelling leaves the import
+    /// unbound - which a clean build and a green suite both pass straight over,
+    /// because nothing in either can see a name that is never looked up. These
+    /// five strings are the names in the Framework's bind stream, copied.
+    const GUEST_SUBCLASSES: &[&str] = &[
+        // ConstrainedWindowAnimationBase, FadeAllWindowsAnimation
+        "NSAnimation",
+        // AXPlatformNodeCocoa
+        "NSAccessibilityElement",
+        // GTMBreakRecordingTypeSetter
+        "NSATSTypesetter",
+        // TaskManagerMacTableView
+        "NSTableView",
+        // ImmersiveModeTitlebarViewController
+        "NSTitlebarAccessoryViewController",
+    ];
+
+    #[test]
+    fn a_class_the_guest_subclasses_is_published_under_the_name_it_imports() {
+        crate::bootstrap();
+        let published: Vec<String> = class_data().into_iter().map(|(name, _)| name).collect();
+        for name in GUEST_SUBCLASSES {
+            let c = std::ffi::CString::new(*name).expect("a name");
+            let class = objc::class::lookup(&c)
+                .unwrap_or_else(|| panic!("{name} is registered, or its subclass cannot be"));
+            assert_eq!(
+                objc::class::ptr(class) as usize as u64,
+                class_data()
+                    .into_iter()
+                    .find(|(n, _)| n == &format!("_OBJC_CLASS_$_{name}"))
+                    .unwrap_or_else(|| panic!("{name} is published as data"))
+                    .1,
+                "{name} is published as something other than itself"
+            );
+            assert!(
+                published.contains(&format!("_OBJC_METACLASS_$_{name}")),
+                "{name} publishes no metaclass, so a guest's +message on a subclass has nowhere \
+                 to go"
+            );
+        }
+    }
+
+    /// A declared superclass has to be *reachable* from the subclass, not merely
+    /// present: `ConstrainedWindowAnimationBase` sends `[super ...]`, and a
+    /// parent that is not in the chain turns that into a refusal.
+    #[test]
+    fn a_declared_superclass_is_in_the_subclasss_chain() {
+        crate::bootstrap();
+        for (name, superclass, _) in HIERARCHY {
+            let c = std::ffi::CString::new(*name).expect("a name");
+            let Some(class) = objc::class::lookup(&c) else {
+                continue;
+            };
+            let parent = std::ffi::CString::new(superclass.unwrap_or("NSObject")).expect("a name");
+            let parent = objc::class::lookup(&parent).expect("the declared parent");
+            assert!(
+                class.chain().any(|c| std::ptr::eq(c, parent)),
+                "{name} does not reach {superclass:?}"
+            );
+        }
     }
 }

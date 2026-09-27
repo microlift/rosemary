@@ -243,11 +243,87 @@ unsafe extern "C" fn malloc_as_darwin(size: usize) -> *mut std::ffi::c_void {
 
 /// As [`malloc_as_darwin`], for `free`.
 unsafe extern "C" fn free_as_darwin(block: *mut std::ffi::c_void) {
+    if quarantine_free() {
+        quarantine::defer(block);
+        return;
+    }
     // SAFETY: `GUEST_FREE` holds the address of the guest's own `free`.
     let free: unsafe extern "C" fn(*mut std::ffi::c_void) =
         unsafe { std::mem::transmute(GUEST_FREE.load(Ordering::Acquire)) };
     // SAFETY: the caller states the block came from the guest's allocator.
     unsafe { darwin::call_as_darwin!(free(block)) };
+}
+
+/// Whether freed blocks are held back instead of returned to the allocator.
+///
+/// `ROSETTA3_QUARANTINE_FREE=1`. **Off by default, and a diagnostic, not a
+/// fix.** The reasoning is in [`quarantine`]; the short version is that the
+/// guest has a use-after-free at
+/// `blink/renderer/platform/scheduler/worker/non_main_thread_impl.cc`
+/// `+0x4b4814b` - a `lock dec` whose result is never tested, immediately
+/// followed by `call [rax+0x10]` on the same pointer. Whether that is *fatal*
+/// depends entirely on whether the allocator hands the same block straight back,
+/// and it does: the thread that was just destroyed is the one running the code.
+///
+/// Withholding freed blocks makes the use visible without changing it - the
+/// stale memory keeps whatever it last held, so the fault moves somewhere real
+/// instead of into recycled space, and the guest gets far enough to show what it
+/// was trying to do. It costs memory, so it is not something to leave on.
+fn quarantine_free() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = std::env::var("ROSETTA3_QUARANTINE_FREE")
+            .is_ok_and(|v| !v.is_empty() && v != "0");
+        if on {
+            eprintln!(
+                "rosetta3: interpose: ROSETTA3_QUARANTINE_FREE is set - freed blocks are held \
+                 back, not returned to the allocator"
+            );
+        }
+        on
+    })
+}
+
+/// Freed blocks this run is holding back.
+mod quarantine {
+    use std::sync::Mutex;
+
+    /// `ROSETTA3_QUARANTINE_FREE=N` caps it. The default is generous: the point
+    /// is to survive a start-up, not to be a leak.
+    const DEFAULT_LIMIT: usize = 1 << 20;
+    const ENV_LIMIT: &str = "ROSETTA3_QUARANTINE_FREE";
+
+    /// Held, and never freed. A `Vec` rather than a set: addresses repeat, and
+    /// holding the same block twice is harmless here in a way that deduplicating
+    /// would not be - the count is the budget, not the contents.
+    static HELD: Mutex<Vec<usize>> = Mutex::new(Vec::new());
+
+    fn limit() -> usize {
+        static LIMIT: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+        *LIMIT.get_or_init(|| {
+            std::env::var(ENV_LIMIT)
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .filter(|n| *n > 0)
+                .unwrap_or(DEFAULT_LIMIT)
+        })
+    }
+
+    /// Withhold `block`. The pointer is only stored, never dereferenced, so this
+    /// is safe whatever the guest thinks it is doing.
+    pub(super) fn defer(block: *mut std::ffi::c_void) {
+        if block.is_null() {
+            return;
+        }
+        let Ok(mut held) = HELD.lock() else {
+            return;
+        };
+        if held.len() >= limit() {
+            return;
+        }
+        held.push(block as usize);
+    }
 }
 
 /// Bindings that name a symbol some *other* binding had interposed, and were left

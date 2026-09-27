@@ -26,6 +26,25 @@ pub fn run(exec: &dyn Execution) -> Result<i32, VmError> {
     // image map goes with it.
     crate::fault::install();
     crate::fault::note_images(exec.report());
+    // So that a block entered on a thread *this runtime* started - a dispatch
+    // pool worker, which `darwin` spawns and which `DarwinThread::enter` gives
+    // a Darwin thread pointer but does not register - has guest thread state
+    // before its guest code runs. Without it `thread::current()` is `None` there,
+    // and guest code reached that way runs unadopted: no indirect-call cache,
+    // and nothing keyed on the current thread to answer from. Set before any
+    // framework can post a block. See `darwin::dispatch::block`.
+    darwin::dispatch::block::set_thread_adopt_hook(Some(|| {
+        // Read *before* adopting, because after it the answer is always "yes" and
+        // the diagnostic would report the opposite of what it claims to measure.
+        let was_untracked = crate::thread::current().is_none();
+        // Idempotent, and it allocates a guest stack on first use, which is
+        // what any thread entering guest code needs.
+        let _ = crate::thread::ensure();
+        // One line, so a run that shows the fault unmoved can be distinguished
+        // from a run where the hook never fired. Validating the instrument
+        // before reading its negative is the whole lesson of this investigation.
+        crate::fault::note_block_adopted(was_untracked);
+    }));
     // Before any framework can ask a question about the main executable and get
     // an answer about this binary rather than the program's. See [`crate::compat`].
     #[cfg(target_os = "macos")]

@@ -83,7 +83,14 @@ const FRAMELESS_PERMUTATION: u32 = 0x0000_03ff;
 
 /// Anything that stops a stack walk. Every variant is a sentence a user can act
 /// on, because an unwinder that fails silently unwinds into nothing.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+///
+/// `Copy` is gone and that is [`PersonalityFailed`](Self::PersonalityFailed)'s
+/// doing: it is the one variant whose sentence comes from the host rather than
+/// from this file, and a `&'static str` could not carry it. Every other variant
+/// is still a constant, so the loss is confined to call sites that copied an
+/// error before reporting it - and there is one, deliberately: a walk that
+/// wants to say *which* frame failed reports the error it has.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum UnwindError {
     /// The function's encoding says "see `__eh_frame`", which is not parsed.
     NeedsDwarf,
@@ -102,6 +109,12 @@ pub enum UnwindError {
     /// A handler exists, but deciding it needs type relationships (a base class,
     /// a pointer conversion) that are not implemented.
     NeedsTypeGraph,
+    /// A personality routine was reached and the call into it failed.
+    ///
+    /// The one variant that carries its own sentence, because the failure is not
+    /// about a frame: it is about the call, and the reason is whatever the host
+    /// said. See [`crate::unwind_native`], which is the only constructor.
+    PersonalityFailed(String),
 }
 
 impl UnwindError {
@@ -123,13 +136,27 @@ impl UnwindError {
                 "a catch clause needs base-class or pointer-conversion matching, which needs \
                  the guest's type_info graph (M5)"
             }
+            // Named here only so the match is total; `as_error` sends this one
+            // down the `Nested` arm, which can carry the host's own sentence.
+            UnwindError::PersonalityFailed(_) => "a personality routine could not be called",
         }
     }
 
-    fn as_error(self, symbol: &str) -> AbiError {
-        AbiError::Refused {
-            symbol: symbol.to_string(),
-            reason: self.reason(),
+    /// This failure, said about `symbol`.
+    ///
+    /// `pub(crate)` because [`crate::unwind_native`] unwinds through the same
+    /// walk and has to report a refusal the same way, rather than in a shape of
+    /// its own that nothing renders.
+    pub(crate) fn as_error(self, symbol: &str) -> AbiError {
+        match self {
+            UnwindError::PersonalityFailed(reason) => AbiError::Nested {
+                symbol: symbol.to_string(),
+                reason,
+            },
+            other => AbiError::Refused {
+                symbol: symbol.to_string(),
+                reason: other.reason(),
+            },
         }
     }
 }
@@ -445,6 +472,15 @@ pub enum Outcome {
     Undecidable,
 }
 
+/// The one [`UnwindError`] this file raises by the dozen.
+///
+/// A function rather than a `let`, because `UnwindError` is no longer `Copy` -
+/// see its declaration - and thirteen `ok_or(bad)` sites in this file each move
+/// it. Naming it keeps every one of those a single word.
+const fn bad_lsda() -> UnwindError {
+    UnwindError::BadLsda
+}
+
 impl Lsda {
     /// Parse the header of the table at `lsda`.
     pub fn parse(
@@ -453,22 +489,21 @@ impl Lsda {
         mem: &dyn GuestMemory,
     ) -> core::result::Result<Self, UnwindError> {
         let mut r = Reader::new(mem, lsda);
-        let bad = UnwindError::BadLsda;
-        let lp_encoding = r.u8().ok_or(bad)?;
+        let lp_encoding = r.u8().ok_or_else(bad_lsda)?;
         let lp_start = if lp_encoding == DW_EH_PE_OMIT {
             function
         } else {
-            r.encoded(lp_encoding).ok_or(bad)?
+            r.encoded(lp_encoding).ok_or_else(bad_lsda)?
         };
-        let ttype_encoding = r.u8().ok_or(bad)?;
+        let ttype_encoding = r.u8().ok_or_else(bad_lsda)?;
         let class_info = if ttype_encoding == DW_EH_PE_OMIT {
             0
         } else {
-            let offset = r.uleb128().ok_or(bad)?;
+            let offset = r.uleb128().ok_or_else(bad_lsda)?;
             r.at.wrapping_add(offset)
         };
-        let call_site_encoding = r.u8().ok_or(bad)?;
-        let length = r.uleb128().ok_or(bad)?;
+        let call_site_encoding = r.u8().ok_or_else(bad_lsda)?;
+        let length = r.uleb128().ok_or_else(bad_lsda)?;
         let start = r.at;
         let end = start.wrapping_add(length);
         Ok(Lsda {
@@ -487,14 +522,13 @@ impl Lsda {
         ip: u64,
         mem: &dyn GuestMemory,
     ) -> core::result::Result<Option<Site>, UnwindError> {
-        let bad = UnwindError::BadLsda;
         let offset = ip.wrapping_sub(1).wrapping_sub(self.lp_start);
         let mut r = Reader::new(mem, self.call_sites.0);
         while r.at < self.call_sites.1 {
-            let start = r.encoded(self.call_site_encoding).ok_or(bad)?;
-            let length = r.encoded(self.call_site_encoding).ok_or(bad)?;
-            let pad = r.encoded(self.call_site_encoding).ok_or(bad)?;
-            let action = r.uleb128().ok_or(bad)?;
+            let start = r.encoded(self.call_site_encoding).ok_or_else(bad_lsda)?;
+            let length = r.encoded(self.call_site_encoding).ok_or_else(bad_lsda)?;
+            let pad = r.encoded(self.call_site_encoding).ok_or_else(bad_lsda)?;
+            let action = r.uleb128().ok_or_else(bad_lsda)?;
             if offset >= start && offset < start.wrapping_add(length) {
                 return Ok(Some(Site {
                     landing_pad: if pad == 0 {
@@ -517,7 +551,6 @@ impl Lsda {
         thrown_type: u64,
         mem: &dyn GuestMemory,
     ) -> core::result::Result<Outcome, UnwindError> {
-        let bad = UnwindError::BadLsda;
         if site.landing_pad == 0 {
             return Ok(Outcome::Nothing);
         }
@@ -532,9 +565,9 @@ impl Lsda {
         let mut cleanup = false;
         loop {
             let mut r = Reader::new(mem, at);
-            let filter = r.sleb128().ok_or(bad)?;
+            let filter = r.sleb128().ok_or_else(bad_lsda)?;
             let next_at = r.at;
-            let next = r.sleb128().ok_or(bad)?;
+            let next = r.sleb128().ok_or_else(bad_lsda)?;
 
             match filter {
                 0 => cleanup = true,
@@ -581,18 +614,17 @@ impl Lsda {
         index: i64,
         mem: &dyn GuestMemory,
     ) -> core::result::Result<u64, UnwindError> {
-        let bad = UnwindError::BadLsda;
         if self.class_info == 0 {
-            return Err(bad);
+            return Err(bad_lsda());
         }
         let size = match self.ttype_encoding & 0x0f {
             0x02 | 0x0a => 2,
             0x03 | 0x0b => 4,
             0x00 | 0x04 | 0x0c => 8,
-            _ => return Err(bad),
+            _ => return Err(bad_lsda()),
         };
         let at = self.class_info.wrapping_sub(index as u64 * size);
-        Reader::new(mem, at).encoded(self.ttype_encoding).ok_or(bad)
+        Reader::new(mem, at).encoded(self.ttype_encoding).ok_or_else(bad_lsda)
     }
 }
 

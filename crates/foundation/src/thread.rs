@@ -118,9 +118,23 @@ fn current(class: &'static objc::class::Class) -> Id {
 /// one. Captured at first use rather than at load time: under `dlopen` the
 /// runtime's own start-up may already have run on the main thread, and the
 /// first guest call is guaranteed to be a real guest thread.
+/// The tid the process started on, which is the only thread that is the main one.
+///
+/// This was first-caller-wins, and that is a real defect rather than a harmless
+/// shortcut: it makes the answer depend on **who asked first**, so a program
+/// that touches `+[NSThread isMainThread]` from a helper thread before `main`
+/// runs is told the helper is the main thread, and everything keyed off that -
+/// which run loop is "current", which queue is the main queue - is wrong from
+/// then on. Chromium starts threads early.
+///
+/// `std::process::id()` is the kernel's own answer rather than a guess about
+/// arrival order: on Linux a process's initial thread has a tid equal to its
+/// pid, so this is the main thread by definition and not by observation. It also
+/// agrees with `corefoundation::runloop`'s main loop, which is keyed the same
+/// way - the two used to be able to disagree, which is the same bug one level
+/// up.
 fn main_tid() -> u32 {
-    static MAIN: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
-    *MAIN.get_or_init(darwin::pthread::id)
+    std::process::id()
 }
 
 unsafe extern "C" fn is_main_thread(_class: Id, _sel: Sel) -> bool {

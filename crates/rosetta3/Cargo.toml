@@ -22,6 +22,14 @@ sdl3.workspace = true
 corevideo.workspace = true
 coreaudio.workspace = true
 contacts.workspace = true
+corelocation.workspace = true
+corewlan.workspace = true
+opendirectory.workspace = true
+# Not a workspace dependency: a relative path keeps the root `Cargo.toml` - which
+# this change has no business touching, and which other agents are also adding
+# lines to - out of it. `crates/*` is already a workspace member, so the crate
+# itself needs no registration there.
+sandbox = { path = "../sandbox" }
 avfoundation.workspace = true
 security.workspace = true
 gamecontroller.workspace = true

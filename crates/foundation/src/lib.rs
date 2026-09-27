@@ -246,6 +246,7 @@ pub const CLASSES: &[&str] = &[
     "NSNull",
     "NSNotification",
     "NSNotificationCenter",
+    "NSDistributedNotificationCenter",
     "NSAutoreleasePool",
     "NSBundle",
     "NSDate",
@@ -268,6 +269,28 @@ pub const CLASSES: &[&str] = &[
     "NSAppleEventManager",
     "NSAppleEventDescriptor",
     "NSMethodSignature",
+    // Registered by modules that were written before anything published them,
+    // so a guest binding `_OBJC_CLASS_$_X` got a zero and every message to the
+    // class answered nil. Each of these is the *same* class the module already
+    // allocates from, which is the only reason publishing it is safe: a set
+    // built through `CFSetCreateMutable` and one built through
+    // `[[NSMutableSet alloc] init]` are the same object, and a formatter built
+    // through `CFDateFormatterCreate` and one built through
+    // `[[NSDateFormatter alloc] init]` answer the same questions.
+    //
+    // `formatter::install`'s own comment states the intent - "Register the three
+    // classes, so that a guest binding `_OBJC_CLASS_$_NSCalendar` gets the same
+    // class this module allocates from" - and the registration alone did not
+    // achieve it, because registration is not publication.
+    "NSSet",
+    "NSMutableSet",
+    "NSCalendar",
+    "NSDateFormatter",
+    "NSNumberFormatter",
+    // The main menu's own titles: `-[MenuControllerCocoaDelegateImpl
+    // controllerWillAddItem:fromModel:atIndex:]` allocates one of these per item
+    // while the browser starts. See `attributed_string::install`.
+    "NSMutableAttributedString",
 ];
 
 // The image-resident number classes are `constant::CLASSES`, published the same
@@ -377,6 +400,53 @@ mod tests {
             missing.is_empty(),
             "claimed but not registered: {missing:?}"
         );
+    }
+
+    /// The five classes this crate *registers* but did not publish, by the exact
+    /// Mach-O spelling the guest imports them under.
+    ///
+    /// A class that is registered and not published leaves
+    /// `_OBJC_CLASS_$_X` unbound, and an unbound class symbol is a zero: every
+    /// message to it answers nil, silently, for the rest of the run. Neither a
+    /// clean build nor a green suite can see that, because nothing in either
+    /// looks a name up - which is why the names are pinned here rather than
+    /// left to `class_data`'s formatting to get right.
+    const UNPUBLISHED_UNTIL_NOW: &[&str] = &[
+        // `-[AppShimTerminationObserver allObservers]`:
+        //   "static NSMutableSet<AppShimTerminationObserver*>* set = [NSMutableSet set];"
+        // in chrome/browser/web_applications/os_integration/mac/
+        // app_shim_termination_observer.mm, and the same shape in
+        // `+[ViewsNSWindowCloseAnimator allAnimators]`.
+        "NSSet",
+        "NSMutableSet",
+        // `[[NSCalendar alloc] initWithCalendarIdentifier:_NSCalendarIdentifierGregorian]`
+        "NSCalendar",
+        // `[[NSDateFormatter alloc] init]`, `-setLocale:`, and
+        // `+dateFormatFromTemplate:options:locale:`
+        "NSDateFormatter",
+        // `[[NSNumberFormatter alloc] init]`, `-setNumberStyle:`, `-stringFromNumber:`
+        "NSNumberFormatter",
+    ];
+
+    #[test]
+    fn a_registered_class_is_published_under_the_name_the_guest_imports() {
+        bootstrap();
+        let data: std::collections::HashMap<String, u64> =
+            class_data().into_iter().collect();
+        for name in UNPUBLISHED_UNTIL_NOW {
+            let c = std::ffi::CString::new(*name).expect("a name");
+            let class = objc::class::lookup(&c).unwrap_or_else(|| panic!("{name} is registered"));
+            let symbol = format!("_OBJC_CLASS_$_{name}");
+            assert_eq!(
+                data.get(&symbol).copied(),
+                Some(objc::class::ptr(class) as usize as u64),
+                "{name} is published as something other than itself, or not at all"
+            );
+            assert!(
+                data.contains_key(&format!("_OBJC_METACLASS_$_{name}")),
+                "{name} publishes no metaclass"
+            );
+        }
     }
 
     /// The whole of toll-free bridging, in one assertion each way: a string

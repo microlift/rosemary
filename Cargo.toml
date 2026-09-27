@@ -24,7 +24,10 @@ coreservices = { path = "crates/coreservices" }
 audiotoolbox = { path = "crates/audiotoolbox" }
 corevideo = { path = "crates/corevideo" }
 coreaudio = { path = "crates/coreaudio" }
+corelocation = { path = "crates/corelocation" }
 contacts = { path = "crates/contacts" }
+opendirectory = { path = "crates/opendirectory" }
+corewlan = { path = "crates/corewlan" }
 avfoundation = { path = "crates/avfoundation" }
 security = { path = "crates/security" }
 gamecontroller = { path = "crates/gamecontroller" }

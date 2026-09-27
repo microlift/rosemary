@@ -1,0 +1,41 @@
+/* `<exception>`, and the one header here that **defines** rather than
+ * declares.
+ *
+ * The natural version - declare `std::exception` with a key function and let the
+ * real `libc++abi.dylib` supply the vtable - is the wrong answer, and here is
+ * the measurement that says so:
+ *
+ *     $ strings intel/libc++abi.dylib | grep -c ZTVNSt9exception  -> 0
+ *     $ strings intel/libc++abi.dylib | grep -c ZTINSt9exception  -> 0
+ *     $ strings intel/libc++abi.dylib | grep -c exception4whatEv  -> 2   (exported)
+ *
+ * The vendored `libc++abi` exports `what()` and both destructors and exports
+ * **neither** `_ZTVSt9exception` nor `_ZTISt9exception`.  A key-function fixture
+ * imports both, both land on `crates/rosetta3/src/abi/table.rs:3941`
+ * (`("_ZTVSt9exception", DATA)`), which is a `darwin::data_unavailable` *zeroed
+ * refusal* - and the test would have called through address zero and reported on
+ * the unwinder.
+ *
+ * So the class is **defined**, with every virtual inline and therefore no key
+ * function: the vtable and the typeinfo are emitted in the fixture, weakly, and
+ * are defined.  The cost is real and is recorded in the test that pays it -
+ * `a_base_class_clause_catches_a_derived_type` matches a **guest-defined** base,
+ * not libc++abi's.
+ */
+#ifndef ROSETTA3_TEST_EXCEPTION
+#define ROSETTA3_TEST_EXCEPTION
+
+#include "stddef.h"
+
+namespace std {
+
+class exception {
+public:
+    exception() noexcept = default;
+    virtual ~exception() {}
+    virtual const char *what() const noexcept { return "std::exception"; }
+};
+
+} // namespace std
+
+#endif /* ROSETTA3_TEST_EXCEPTION */

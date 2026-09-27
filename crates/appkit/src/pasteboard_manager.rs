@@ -410,6 +410,47 @@ pub unsafe extern "C" fn PasteboardResolvePromises(handle: *const c_void) -> i32
     }
 }
 
+/// `void NSPerformService(NSPasteboardName pboardName, NSArray *objects)`
+///
+/// Refused, and no drag is started.
+///
+/// The function begins a drag-and-drop session carrying `objects` on the named
+/// pasteboard. A drag session needs a window server to track the mouse against, a
+/// pasteboard server to promise the data on, and a run loop to pump the session's
+/// events; none of those exists here, and a "drag" that started and immediately
+/// ended would tell the guest a drag happened when none did.
+///
+/// The guest's one call site shows that this is the tail of a decision it has
+/// already made and that it reads nothing back (`0x3aaab06`):
+///
+/// ```text
+/// 3aaaacd  call objc_msgSend             ; -[delegate writeObjects:items]
+/// 3aaaad3  mov  BYTE PTR [rbp-0x39], al
+/// 3aaaae9  cmp  BYTE PTR [rbp-0x39], 0
+/// 3aaaeed  je   0x3aaab14                ; not written: no drag at all
+/// 3aaaafc  lea  rdi, [0xe672b10]         ; the NSPasteboardName
+/// 3aaab03  mov  rsi, rax                 ; the items
+/// 3aaab06  call _NSPerformService
+/// 3aaab0b  call _objc_release            ; and the return is discarded
+/// ```
+///
+/// So refusing here leaves the guest exactly where a board that could not start a
+/// drag would leave it: the delegate already said it wrote the objects, and the
+/// drag does not follow. The function is `void` with no out-parameter, so there is
+/// nothing to write on a refusal - which is the rule this project keeps, and the
+/// reason it is worth stating that none was needed.
+#[allow(non_snake_case)]
+pub extern "C" fn NSPerformService(_pboard_name: *const c_void, _objects: *const c_void) {
+    static ONCE: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+    if ONCE.set(()).is_ok() {
+        eprintln!(
+            "rosetta3: NSPerformService: refused - a drag session needs a window server, a \
+             pasteboard server and a run loop to pump it, and this runtime has none of the \
+             three; no drag was started, and the guest reads no result (0x3aaab0b)"
+        );
+    }
+}
+
 exports::exports! {
     functions {
         "PasteboardCreate" => PasteboardCreate,
@@ -424,6 +465,7 @@ exports::exports! {
         "PasteboardCopyName" => PasteboardCopyName,
         "PasteboardSetPromiseKeeper" => PasteboardSetPromiseKeeper,
         "PasteboardResolvePromises" => PasteboardResolvePromises,
+        "NSPerformService" => NSPerformService,
     }
 }
 
@@ -557,5 +599,49 @@ mod tests {
         unsafe { PasteboardCreate(std::ptr::null(), &raw mut handle) };
         let board = board_of(handle).expect("the handle just created");
         assert_eq!(board.board, crate::pasteboard::CLIPBOARD);
+    }
+
+    /// `NSPerformService` is bound and starts no drag.
+    ///
+    /// The assertion is that the shape is callable and that the board it was
+    /// handed is unchanged: a test that only checked the symbol was published
+    /// would pass on an implementation that started a session, and there is no
+    /// session to start here.
+    ///
+    /// A **private** board, named by its own name. The system clipboard is
+    /// process-global and two other tests in this suite write to it, so an
+    /// assertion about it is a race - which is exactly what the first version of
+    /// this test did, and it failed for that reason and no other.
+    #[test]
+    fn a_drag_is_refused_rather_than_started() {
+        crate::bootstrap();
+        let pb = private_board("drag-refused");
+        let board = board_of(pb).expect("the handle just created");
+        let name = string(&board.name);
+        let items = corefoundation::collections::new_array(
+            &[string("public.utf8-plain-text")],
+            corefoundation::callbacks::Policy::from_type_callbacks(),
+            false,
+        );
+        let mut before = 99usize;
+        // SAFETY: a live handle and out-parameter.
+        unsafe {
+            assert_eq!(PasteboardGetItemCount(pb, &raw mut before), status::NO_ERR);
+        }
+        // SAFETY: both are objects this test made; the function is `void` and
+        // reads neither.
+        unsafe { NSPerformService(name, items) };
+        // Nothing was taken off the board the guest named, which is what "no drag"
+        // means for it.
+        let mut after = 99usize;
+        // SAFETY: a live handle and out-parameter.
+        unsafe {
+            assert_eq!(PasteboardGetItemCount(pb, &raw mut after), status::NO_ERR);
+            assert_eq!(
+                after, before,
+                "a refused drag took nothing off {}",
+                board.name
+            );
+        }
     }
 }

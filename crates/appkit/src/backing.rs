@@ -1176,6 +1176,36 @@ unsafe extern "C" fn cg_color_space(_receiver: Id, _sel: Sel) -> *const c_void {
         as *const c_void
 }
 
+/// `void NSRectFill(NSRect rect)` - refused, and drawing nothing.
+///
+/// The function fills `rect` with the current fill colour **into the current
+/// graphics context**. There is no such context to fill here, and the reason is
+/// in this file rather than in AppKit: `-[NSGraphicsContext CGContext]` answers
+/// nil (see [`nil`]) and `+[NSGraphicsContext currentContext]` answers nil unless
+/// a view holds focus (see [`current_context`]). The fill colour is tracked per
+/// `CGContext` in `crate::cgcontext`, and no `NSGraphicsContext` is connected to
+/// one, so there is nothing to blend into and no colour to blend.
+///
+/// Drawing nothing is the truthful outcome - a rectangle that was not filled *is*
+/// what a program sees when there is no display to fill it on - and the function
+/// is `void` with no out-parameter, so the guest reads nothing back. Leaving the
+/// import unbound instead would be a jump through a zero slot, which is worse.
+///
+/// The rectangle is a 32-byte aggregate, so it goes on the stack; verified at all
+/// three call sites (`0x3ab5add`, `0x6948465`, `0xbc83874`), each of which writes
+/// it at `[rsp]` and `[rsp+0x10]` immediately before the call.
+#[allow(non_snake_case)]
+pub extern "C" fn NSRectFill(_rect: NSRect) {
+    static ONCE: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+    if ONCE.set(()).is_ok() {
+        eprintln!(
+            "rosetta3: NSRectFill: refused - there is no current NSGraphicsContext to fill \
+             into (-[NSGraphicsContext CGContext] answers nil here), so the rectangle was \
+             not drawn; the guest reads no result"
+        );
+    }
+}
+
 pub(crate) fn install() {
     let view = objc::class::lookup(c"NSView").expect("declared before its methods");
     methods!(view, {
@@ -1513,5 +1543,34 @@ mod tests {
         );
         assert_eq!(store.pixels, [99, 99, 227, 255]);
         FOCUS.with(|stack| stack.borrow_mut().clear());
+    }
+
+    /// `NSRectFill` is bound and fills nothing, and the reason it fills nothing is
+    /// the same reason `-[NSGraphicsContext CGContext]` answers nil.
+    ///
+    /// The assertion is that the call is *callable* and leaves the store alone: a
+    /// test that only checked the symbol was published would pass on an
+    /// implementation that invented a destination, and inventing one would paint
+    /// into a store nothing is reading.
+    #[test]
+    fn nsrectfill_is_bound_and_fills_nothing() {
+        crate::bootstrap();
+        let mut store = store_of(4, 4);
+        store.pixels = vec![7u8, 7, 7, 255].repeat(16);
+        let before = store.pixels.clone();
+        let rect = NSRect {
+            origin: NSPoint { x: 1.0, y: 1.0 },
+            size: NSSize {
+                width: 2.0,
+                height: 2.0,
+            },
+        };
+        // SAFETY: a `CGRect` by value and no return, which is the shape all three
+        // of the guest's call sites use.
+        unsafe { NSRectFill(rect) };
+        assert_eq!(
+            store.pixels, before,
+            "there is no current graphics context, so nothing was filled"
+        );
     }
 }

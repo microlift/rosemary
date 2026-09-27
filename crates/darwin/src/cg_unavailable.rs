@@ -2122,7 +2122,7 @@ mod imp {
                 cg_context_begin_page(std::ptr::null(), std::ptr::null());
                 cg_context_end_page(std::ptr::null());
                 cg_context_draw_pdf_page(std::ptr::null(), std::ptr::null());
-                cg_context_rotate_ctm(std::ptr::null(), 0.7853981633974483);
+                cg_context_rotate_ctm(std::ptr::null(), std::f64::consts::FRAC_PI_4);
                 cg_context_set_should_subpixel_position_fonts(std::ptr::null(), true);
                 cg_context_set_should_subpixel_quantize_fonts(std::ptr::null(), true);
                 cg_context_set_allows_font_subpixel_positioning(std::ptr::null(), true);

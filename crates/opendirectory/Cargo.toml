@@ -1,0 +1,11 @@
+[package]
+name = "opendirectory"
+description = "The parts of Apple's OpenDirectory framework that Chromium Framework imports, and the one answer this host can give"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+objc.workspace = true
+corefoundation.workspace = true
+foundation.workspace = true

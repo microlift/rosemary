@@ -110,6 +110,10 @@ pub extern "C" fn IODeregisterForSystemPower(_notifier: *mut u32) -> i32 {
 /// source to be posted to. `kIOReturnNoDevice` is the true answer for the
 /// argument the guest would pass - the `io_connect_t` it stored, which is
 /// `IO_OBJECT_NULL`.
+///
+/// `IOCancelPowerChange` is this function's other spelling, with the same two
+/// arguments and the same answer: there is no notification to cancel either,
+/// because there was never one to allow.
 pub extern "C" fn IOAllowPowerChange(_kernel_port: u32, _notification_id: isize) -> i32 {
     crate::registry::NO_DEVICE
 }
@@ -192,7 +196,7 @@ exports::exports! {
         "IOPSNotificationCreateRunLoopSource" => IOPSNotificationCreateRunLoopSource,
         "IORegisterForSystemPower" => IORegisterForSystemPower,
         "IODeregisterForSystemPower" => IODeregisterForSystemPower,
-        "IOAllowPowerChange" => IOAllowPowerChange,
+        "IOAllowPowerChange" | "IOCancelPowerChange" => IOAllowPowerChange,
         "IOPMAssertionCreateWithName" => IOPMAssertionCreateWithName,
         "IOPMAssertionRelease" => IOPMAssertionRelease,
         "IOPMCopyCPUPowerStatus" => IOPMCopyCPUPowerStatus,

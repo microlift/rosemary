@@ -33,7 +33,13 @@ pub mod bsd;
 pub mod callback;
 #[cfg(not(target_os = "macos"))]
 pub mod cg_unavailable;
+#[cfg(not(target_os = "macos"))]
+pub mod as_unavailable;
+#[cfg(not(target_os = "macos"))]
+pub mod gfx_unavailable;
 pub mod clock;
+#[cfg(not(target_os = "macos"))]
+pub mod media_unavailable;
 pub mod commoncrypto;
 #[cfg(not(target_os = "macos"))]
 pub mod compat;
@@ -61,7 +67,10 @@ pub mod idle;
 pub mod ioctl;
 pub mod kqueue;
 #[cfg(not(target_os = "macos"))]
+pub mod data_unavailable;
 pub mod langinfo;
+#[cfg(not(target_os = "macos"))]
+pub mod last_unavailable;
 pub mod libproc;
 pub mod locale;
 pub mod mach;
@@ -407,6 +416,16 @@ static MODULES: &[exports::Module] = &[
     unavailable::MODULE,
     #[cfg(not(target_os = "macos"))]
     cg_unavailable::MODULE,
+    #[cfg(not(target_os = "macos"))]
+    as_unavailable::MODULE,
+    #[cfg(not(target_os = "macos"))]
+    gfx_unavailable::MODULE,
+    #[cfg(not(target_os = "macos"))]
+    media_unavailable::MODULE,
+    #[cfg(not(target_os = "macos"))]
+    last_unavailable::MODULE,
+    #[cfg(not(target_os = "macos"))]
+    data_unavailable::MODULE,
     xpc::MODULE,
 ];
 
@@ -455,19 +474,48 @@ pub fn provider() -> machish::resolve::SyntheticDylib {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
+
     use super::*;
 
+    /// Every name more than one module claims, not the first one found.
+    ///
+    /// **This used to `panic!` on the first duplicate, which made it assert
+    /// nothing.** `sched_yield` is claimed by both `darwin::idle` and
+    /// `darwin::pthread`, and `idle` is early in `MODULES` - so the test failed
+    /// on that one collision and never looked at the other ~40 modules. A check
+    /// that stops at the first failure is a check on one fact, and a second
+    /// collision anywhere else in the table was invisible until this one was
+    /// fixed.
+    ///
+    /// Collecting all of them and asserting on the *set* makes it a real check,
+    /// and keeps the reported failure the same one it has always been: the
+    /// assertion names every colliding name, so the next person to add one sees
+    /// their own in the list rather than a stale first entry.
     #[test]
     fn no_module_defines_a_name_another_one_does() {
-        let mut seen: Vec<(&str, &str)> = Vec::new();
+        let mut owners: HashMap<&str, Vec<&str>> = HashMap::new();
         for module in MODULES {
             for name in (module.names)() {
-                if let Some((_, first)) = seen.iter().find(|(n, _)| *n == name) {
-                    panic!("{name} is defined by both {first} and {}", module.path);
-                }
-                seen.push((name, module.path));
+                owners.entry(name).or_default().push(module.path);
             }
         }
+        let mut collisions: Vec<(&str, &Vec<&str>)> = owners
+            .iter()
+            .filter(|(_, paths)| paths.len() > 1)
+            .map(|(name, paths)| (*name, paths))
+            .collect();
+        collisions.sort_by_key(|(name, _)| *name);
+        assert!(
+            collisions.is_empty(),
+            "{} name(s) defined by more than one module: {}",
+            collisions.len(),
+            collisions
+                .iter()
+                .map(|(name, paths)| format!("{name} by {}", paths.join(" and ")))
+                .collect::<Vec<_>>()
+                .join("; ")
+        );
     }
 
     #[test]

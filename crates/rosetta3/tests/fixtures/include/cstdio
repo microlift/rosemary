@@ -1,0 +1,9 @@
+/* `<cstdio>`.  Declares in the global namespace, which is what a real `<cstdio>`
+ * does as well as putting them in `std::`, and what the fixtures call
+ * unqualified. */
+#ifndef ROSETTA3_TEST_CSTDIO
+#define ROSETTA3_TEST_CSTDIO
+
+#include "stdio.h"
+
+#endif /* ROSETTA3_TEST_CSTDIO */

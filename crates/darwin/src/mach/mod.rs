@@ -12,6 +12,10 @@ pub mod kern;
 // its own file, because a `MODULE` nobody includes is how a name ends up
 // implemented and unbound - which is what its first attempt at this did.
 pub mod kevent64;
+// `memory_object` is `mach_make_memory_entry_64` and the `vm_map` of its
+// result, declared here for the reason `kevent64` and `policy` are: a `MODULE`
+// nobody includes is how a name ends up implemented and unbound.
+pub mod memory_object;
 pub mod msg;
 // `policy` is declared here rather than in an `exports!` block inside its own
 // file for the reason `kevent64` is: a `MODULE` nobody includes is how a name

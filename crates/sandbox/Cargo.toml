@@ -1,0 +1,15 @@
+[package]
+name = "sandbox"
+description = "The two libsandbox entry points Chromium's helper processes import and nothing in the tree published, and the truthful refusals the guest's own code shows it can survive"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+libc = "0.2"
+# `darwin` is here for one thing only, and it is the load-bearing one: the census
+# test below asks *its* table whether these two names are already published
+# somewhere else, so "one provider per name" is proved against the real table
+# rather than asserted in a comment. See `no_other_module_publishes_these_names`.
+darwin = { path = "../darwin" }
+exports = { path = "../exports" }

@@ -127,6 +127,18 @@ pub fn by_key(key: u32) -> Option<&'static GuestThread> {
     None
 }
 
+/// How many guest threads the table holds right now.
+///
+/// A count, not a `bool`, so a report can say "0" rather than leaving the reader to
+/// wonder whether the question was asked. Diagnostic only: nothing in the run loop
+/// reads it. See [`crate::fault::say_thread`] for why a fault report needs it.
+pub fn registered() -> usize {
+    TABLE
+        .iter()
+        .filter(|slot| slot.key.load(Ordering::Acquire) != 0)
+        .count()
+}
+
 /// Call `f` with the [`key`] of every registered guest thread.
 ///
 /// A thread that ends mid-walk is reported and then fails to suspend, which is the

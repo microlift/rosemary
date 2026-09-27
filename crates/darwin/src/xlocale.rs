@@ -87,6 +87,14 @@ pub unsafe extern "C" fn setlocale(category: c_int, locale: *const c_char) -> *m
 /// Darwin's `int __mb_cur_max`, the global `MB_CUR_MAX` read before it became
 /// a function. Old headers still inline a load of it, so it has to follow the
 /// global locale the way libSystem's does; 1 is the C locale's answer.
+///
+/// An `AtomicI32` and not a plain `i32` because [`setlocale`] rewrites it while
+/// a guest may be reading it. `AtomicI32` is four bytes at four-byte alignment,
+/// so the cell Darwin's `int` would have occupied has the same layout and a
+/// guest's `movl` off it is correct. The `constants` row at the foot of this
+/// module says why the row publishes **this** address rather than the number
+/// inside it; `the_row_publishes_the_address_and_the_number_is_read_through_it`
+/// is the test.
 static MB_CUR_MAX: AtomicI32 = AtomicI32::new(1);
 
 /// `locale_t newlocale(int mask, const char *name, locale_t base)`.
@@ -840,6 +848,38 @@ exports::exports! {
         "__DefaultRuneLocale" => default_rune_locale(),
     }
     constants {
+        // **The address of the int, not the int.** A `constants` entry is data
+        // at a fixed address, and the number in the row is that address, because
+        // `Binder::bind` writes it straight into the guest's slot
+        // (`mem.write(slot_va, &(r.addr + addend))`) and the guest's next
+        // instruction loads *through* the slot. There is no relocation in the
+        // format that substitutes a value for a data import, so a row here that
+        // published `1` would leave the guest dereferencing address 1.
+        //
+        // The name denoting a number is therefore not the discriminator it looks
+        // like. `__mb_cur_max` names an `int` *variable*, and the loader binds a
+        // variable's address; the number lives at that address, which is the
+        // only place a guest can read it from. The same shape is published five
+        // more times in this tree - `_vm_page_size`, `_vm_page_mask` and
+        // `_vm_page_shift` in `mach/mod.rs`, whose own note says "the loader
+        // binds the address and the guest reads the word through it", and
+        // `_mach_task_self_` and `_bootstrap_port`, whose `mach_port_t` is an
+        // `unsigned int`. All six take the address of a global, and
+        // `_vm_page_size` is imported by the image this project runs.
+        // `crates/darwin/tests/data_publication.rs` is the guard.
+        //
+        // The distinction that *is* real is against the **function** of the
+        // same name, which is a different Mach-O symbol and is answered above: a
+        // function hands the number back in `eax`, a variable is read through
+        // the slot. `crates/rosetta3/src/abi/table.rs` types the two differently
+        // for exactly this reason - `sig!("___mb_cur_max", I32)` against
+        // `("__mb_cur_max", DATA)`, where `DATA` reads "a data import, read
+        // through its slot and never called".
+        //
+        // `MB_CUR_MAX` is an `AtomicI32` because `setlocale` rewrites it, and
+        // an `AtomicI32` is four bytes at four-byte alignment - the layout
+        // Darwin's `int` has, which is what makes a guest's `movl (%rax), %eax`
+        // off the bound slot read the right thing.
         "__mb_cur_max" => MB_CUR_MAX.as_ptr() as usize as u64,
     }
 }
@@ -847,6 +887,90 @@ exports::exports! {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The reported defect, stated as the property the row actually has.
+    ///
+    /// A census read `"__mb_cur_max" => MB_CUR_MAX.as_ptr() as usize as u64` as
+    /// publishing "the address of a 4-byte int under a name that denotes a 4-byte
+    /// int", so a guest "gets a pointer where it expected a number". The number
+    /// in the row **is** an address and has to be: `Binder::bind` writes it into
+    /// the guest's slot and the guest loads through the slot, so the address is
+    /// the only thing the format can carry, and the number the guest wants is
+    /// what is stored there.
+    ///
+    /// So this asserts both halves, in the order they matter. The address is
+    /// storage, and a four-byte load through it is the number - not the address,
+    /// and not a page of zeros. It derives the expected value from the row
+    /// *through the loader* (`symbol`, which is what `exports!` generates for
+    /// `constants` rows) and compares, so a change to the row's expression
+    /// changes this test rather than passing unnoticed.
+    ///
+    /// The same test exists in two places deliberately. This one is at the
+    /// instance and names it; `crates/darwin/tests/data_publication.rs` is the
+    /// one that can see all 500-odd published data names, which is the only
+    /// place the *class* can be caught.
+    #[test]
+    fn the_row_publishes_the_address_and_the_number_is_read_through_it() {
+        let at = symbol("__mb_cur_max").expect("the constants row is in symbol()");
+
+        // The address is this static, not merely *a* number: a row that
+        // published `MB_CUR_MAX.load(…)` would answer 1, and every assertion
+        // below would fail rather than quietly pass.
+        assert_eq!(
+            at,
+            (&raw const MB_CUR_MAX) as *const AtomicI32 as usize as u64,
+            "the row no longer publishes the address of the global"
+        );
+
+        // A Darwin `int` is four bytes at four-byte alignment, and an
+        // `AtomicI32` is too, so a guest's `movl (%rax), %eax` off the bound
+        // slot reads the int rather than the int and the padding after it.
+        assert_eq!(at % 4, 0, "`int` storage is 4-byte aligned");
+
+        // SAFETY: the address is `&raw const MB_CUR_MAX`, a `static` that lives
+        // for the whole program, read four bytes at four-byte alignment.
+        let as_guest_reads_it = unsafe { (at as usize as *const i32).read() };
+        assert_eq!(
+            as_guest_reads_it,
+            MB_CUR_MAX.load(Ordering::Relaxed),
+            "a four-byte load at the published address is not the number the \
+             global holds"
+        );
+        assert!(
+            (1..=16).contains(&as_guest_reads_it),
+            "a four-byte load at the published address is {as_guest_reads_it}, \
+             which is not an `MB_CUR_MAX`: the C locale's is 1 and UTF-8's is 4 \
+             to 6, so this is a pointer or a length rather than the constant"
+        );
+        assert_ne!(
+            as_guest_reads_it, at as i32,
+            "the published address equals the number behind it, which is what \
+             publishing the value in place of the address would look like"
+        );
+
+        // The two are **different Mach-O symbols** and both have to resolve, or
+        // one of them is a name the loader cannot look up. `___mb_cur_max` is a
+        // function: the guest calls it and reads the number out of `eax`.
+        // `__mb_cur_max` is the variable: the guest loads through the slot. Only
+        // the second is a number behind an address, and publishing the value for
+        // it - which the assertions above reject - is the confusion this whole
+        // test is about. The spellings differ by one underscore, which is the
+        // trap the brief calls out, so both are named rather than derived.
+        let function = symbol("___mb_cur_max").expect("the function row answers");
+        assert_ne!(
+            function, at,
+            "`___mb_cur_max` is a call target and `__mb_cur_max` is a data cell; \
+             a single address for both would mean one of them is answered wrongly"
+        );
+        let names = names();
+        for name in ["__mb_cur_max", "___mb_cur_max", "__mb_cur_max_l"] {
+            assert!(
+                names.contains(&name),
+                "{name} is not in names(), so a `dlsym` of it cannot reach this \
+                 module even though the loader can bind it"
+            );
+        }
+    }
 
     /// The switch is undone even when the wrapped call fails, which is the whole
     /// reason it is a guard: a thread left in the guest's locale formats every

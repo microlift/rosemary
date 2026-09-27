@@ -597,10 +597,31 @@ pub unsafe fn number_type(object: CFTypeRef) -> Option<i32> {
     unsafe { number_value(object) }.map(|(_, kind)| kind)
 }
 
+/// The bytes of a data object, and whether *this* one may be changed.
+///
+/// As [`ArrayContents::mutable`], and for Apple's own reason rather than this
+/// crate's convenience.  `CFData.h` declares one C type and two constnesses:
+///
+/// ```c
+/// typedef const struct CF_BRIDGED_TYPE(NSData)       __CFData * CFDataRef;
+/// typedef       struct CF_BRIDGED_MUTABLE_TYPE(NSMutableData) __CFData * CFMutableDataRef;
+/// ```
+///
+/// so `NSData` and `NSMutableData` are the same object with a different
+/// *reference*, and the mutability is not a property the object can be asked
+/// about.  A runtime that has one class for both - and it must, because
+/// `__NSCFData` has to descend from `NSMutableData` for a guest's
+/// `isKindOfClass:` to work either way - can therefore only keep the
+/// distinction on the body, which is what this is.
+pub struct DataContents {
+    pub bytes: Vec<u8>,
+    pub mutable: bool,
+}
+
 pub fn data_class() -> &'static Class {
     static CLASS: OnceLock<usize> = OnceLock::new();
     let p = *CLASS.get_or_init(|| {
-        objc::class::ptr(register::<Vec<u8>>(
+        objc::class::ptr(register::<DataContents>(
             c"__NSCFData",
             crate::base::mutable_pair(c"NSData", c"NSMutableData"),
         )) as usize
@@ -609,14 +630,55 @@ pub fn data_class() -> &'static Class {
     unsafe { &*(p as *const Class) }
 }
 
+/// An **immutable** data object holding `bytes`.
+///
+/// The default, and the right one for every caller that is not a `Mutable`
+/// constructor: a `CFDataCreate`, a `+[NSData …]`, a property list document, a
+/// pasteboard flavour.  None of those is a spelling a guest can change, and a
+/// data that says it may be changed is a claim nothing here can honour.
 pub fn new_data(bytes: Vec<u8>) -> CFTypeRef {
-    make(data_class(), bytes)
+    make(
+        data_class(),
+        DataContents {
+            bytes,
+            mutable: false,
+        },
+    )
 }
 
+/// A data object that may be changed, as `CFDataCreateMutable` and
+/// `CFDataCreateMutableCopy` make one.
+///
+/// The counterpart of [`new_data`], and the same pair the set has: one class,
+/// two constructors, and the difference is a field on the body.
+pub fn new_mutable_data(bytes: Vec<u8>) -> CFTypeRef {
+    make(
+        data_class(),
+        DataContents {
+            bytes,
+            mutable: true,
+        },
+    )
+}
+
+/// The bytes of a data object.
+///
+/// The projection of [`data_contents`], and it stays the projection so that the
+/// forty-odd readers of a data's bytes in this tree - a pasteboard flavour, a
+/// TIFF encoder, a plist writer - keep saying exactly what they said.  A reader
+/// of bytes has no use for the mutability bit; a reader that *writes* is
+/// [`data_contents`].
+pub unsafe fn data<'a>(object: CFTypeRef) -> Option<&'a mut Vec<u8>> {
+    // SAFETY: the caller's obligation, as [`contents`].
+    unsafe { data_contents(object) }.map(|d| &mut d.bytes)
+}
+
+/// The body of a data object: its bytes and whether it may be changed.
+///
 /// # Safety
 ///
 /// As [`contents`].
-pub unsafe fn data<'a>(object: CFTypeRef) -> Option<&'a mut Vec<u8>> {
+pub unsafe fn data_contents<'a>(object: CFTypeRef) -> Option<&'a mut DataContents> {
     unsafe { contents(object, data_class()) }
 }
 

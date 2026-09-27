@@ -1,0 +1,11 @@
+[package]
+name = "corewlan"
+description = "The three selectors of CoreWLAN that a geolocation provider reads a Wi-Fi radio state through, answered from this host's own radio"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+objc.workspace = true
+corefoundation.workspace = true
+foundation.workspace = true

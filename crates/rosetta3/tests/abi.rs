@@ -958,12 +958,30 @@ fn a_callback_taker_is_refused_without_a_vm_rather_than_passed_through() {
 
 #[test]
 fn a_variadic_with_no_shim_is_refused_rather_than_forwarded() {
-    // `err(3, "...", ...)` cannot be forwarded: its variadic tail is in
-    // registers on the guest's side and on the stack on the host's.
+    // `syslog(LOG_NOTICE, "...", ...)` cannot be forwarded: its variadic tail
+    // is in registers on the guest's side and on the stack on the host's.
+    //
+    // **`syslog`, and not `err` as this used to name.** `err` *is* shimmed -
+    // `src/shims/err.rs` prints and then calls `exit(ctx.rdi)`, which is what
+    // BSD `err(3)` is specified to do and is therefore correct - so
+    // `call_import` never reached the `NoShim` arm the test was written to
+    // check. It reached `shims::err`, which called `libc::exit(0)` **in the
+    // test process**: the harness died mid-suite, cargo saw exit status 0, and
+    // this file reported neither a failure nor a result. `running 20 tests`,
+    // six lines of output, no `test result:` line at all. Fourteen tests of
+    // this file - a quarter of the directory - had never run, and nothing
+    // said so. That is the same class of thing as the skip macro: a run that
+    // reports success and executed less than it appears to.
+    //
+    // Nine of the 31 variadics in `abi/table.rs` have no shim, and this is one
+    // of them. The claim is about the *mechanism* - a variadic tail that would
+    // be read from the wrong place - so any unshimmed variadic carries it, and
+    // none of them can do anything at all, because `NoShim` is decided before
+    // the callee is reached.
     let mut mem = guest_stack();
     let mut ctx = RegisterContext::new();
     let err = rosetta3::call_import(
-        "_err",
+        "_syslog",
         0,
         0x1000,
         &mut ctx,

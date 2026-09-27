@@ -2840,72 +2840,35 @@ mod imp {
         None
     }
 
-    /// `int copyfile(const char *src, const char *dst, copyfile_state *state, copyfile_flags flags)`.
-    ///
-    /// Four arguments and the binary supplies the fourth: `Framework+0x5d94843`
-    /// sets `ecx = 8`, which is `COPYFILE_STAT` from `<sys/copyfile.h>` - copy the
-    /// *stat* attributes only, not the data. So the honest implementation of that
-    /// request is to apply the source's mode and times to the destination, which
-    /// is exactly what `COPYFILE_STAT` means.
-    ///
-    /// The return is real: 0 on success, -1 with `errno` on failure, and the
-    /// guest folds it into a boolean (`sete bl` at `+0x5d9484f`).
-    unsafe extern "C" fn copyfile(
-        src: *const c_char,
-        dst: *const c_char,
-        _state: *mut c_void,
-        flags: u32,
-    ) -> c_int {
-        /// `COPYFILE_DATA`.
-        const DATA: u32 = 0x4;
-        /// `COPYFILE_STAT`.
-        const STAT: u32 = 0x8;
-        /// `COPYFILE_ALL` - everything this host can do.
-        const ALL: u32 = 0x1f;
-        if src.is_null() || dst.is_null() {
-            return failed(libc::EINVAL);
-        }
-        // SAFETY: the caller's two C strings, which the declaration declares
-        // non-null and which were checked above.
-        let (src, dst) = (
-            unsafe { CStr::from_ptr(src) }.to_owned(),
-            unsafe { CStr::from_ptr(dst) }.to_owned(),
-        );
-        if flags & !(DATA | STAT | ALL) != 0 {
-            // `COPYFILE_ACL`, `COPYFILE_SECURITY` and `COPYFILE_XATTR` ask for
-            // things a guest's own sandbox here has no equivalent of, and
-            // silently doing less than was asked is the failure to avoid.
-            return failed(libc::EINVAL);
-        }
-        if flags & DATA != 0 || flags & ALL == ALL {
-            if let Err(e) = std::fs::copy(path_of(&src), path_of(&dst)) {
-                return failed(e.raw_os_error().unwrap_or(libc::EIO));
-            }
-        }
-        if flags & STAT != 0 || flags & ALL == ALL {
-            let Ok(meta) = std::fs::metadata(path_of(&src)) else {
-                return 0;
-            };
-            let _ = std::fs::set_permissions(path_of(&dst), meta.permissions());
-            let seconds = |at: std::io::Result<std::time::SystemTime>| -> libc::time_t {
-                at.ok()
-                    .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                    .map(|d| d.as_secs() as libc::time_t)
-                    .unwrap_or(0)
-            };
-            let times = [
-                libc::timespec { tv_sec: seconds(meta.accessed()), tv_nsec: 0 },
-                libc::timespec { tv_sec: seconds(meta.modified()), tv_nsec: 0 },
-            ];
-            // SAFETY: `dst` is this frame's `CString` and `times` is this frame's
-            // array, both of which outlive the call; `utimensat` writes only the
-            // two `timespec`s.
-            unsafe {
-                libc::utimensat(libc::AT_FDCWD, dst.as_ptr(), times.as_ptr(), 0);
-            }
-        }
-        0
-    }
+    // `copyfile` is NOT here, and must not be added back.
+    //
+    // A second `copyfile` lived in this file until the duplicate census found
+    // it.  It was not merely a copy of `crate::copyfile`'s: it disagreed with
+    // it, and it was the winner, because `provide_all` publishes modules in
+    // list order into a `BTreeMap` and this module is *after* `copyfile` in
+    // `MODULES`.  A guest's `_copyfile` import therefore bound here.
+    //
+    // What it did with the guest's one call: `base::CopyFile`
+    // (`base/files/file_util_apple.mm`, fetched from tag 130.0.6723.91) is
+    //
+    //     return (copyfile(from, to, /*state=*/nullptr, COPYFILE_DATA) == 0);
+    //
+    // and the binary agrees - `Framework+0x5d94843` is `mov ecx,0x8` and
+    // `+0x5d94848` is `call _copyfile` (re-disassembled; it is the only
+    // `_copyfile` call site in the guest, per `test/tools/callers.py`).
+    // `COPYFILE_DATA` is `(1<<3)`, i.e. 8, per Apple's own
+    // `apple-oss-distributions/copyfile` `copyfile.h`.
+    //
+    // This file's constants said `DATA = 0x4` and `STAT = 0x8`.  So for the
+    // guest's `flags == 8` it took the *stat* arm and not the *data* arm: it
+    // copied no bytes at all, silently rewrote the destination's mode and
+    // timestamps, and returned 0.  `sete bl` at `+0x5d9484f` turned that into
+    // `true`, so `base::CopyFile` reported a file copied that had not been -
+    // a fabricated success, on the one copy primitive the guest has.
+    //
+    // `crate::copyfile` has every one of Apple's flag values, and translates
+    // the guest's path through the prefix, which this one did not.  It is the
+    // single definition; the census in `crate::copyfile` holds it to that.
 
     /// `int clonefile(const char *src, const char *dst, int flags)`.
     ///
@@ -2963,7 +2926,12 @@ mod imp {
     /// this cancels is a notification token, and no token can have been issued -
     /// [`notify_register_dispatch`] and [`notify_register_file_descriptor`] both
     /// refuse - so there is nothing registered and nothing to unregister. The
-    /// guest's four call sites are destructors that ignore the answer.
+    /// guest's four call sites are `+0xada7d5`, `+0xada9dc`, `+0x5daa09f` and
+    /// the one the stub census puts in the same function as
+    /// [`notify_register_file_descriptor`], and all four discard the answer
+    /// without testing it: `+0xada9dc` is followed by
+    /// `+0xada9e1  mov DWORD PTR [rbx+0x8],0xffffffff`, which overwrites `eax`
+    /// before anything can read it.
     unsafe extern "C" fn notify_cancel(_name: u32) -> i32 {
         crate::mach::kern::KERN_SUCCESS
     }
@@ -2972,9 +2940,51 @@ mod imp {
     ///
     /// Refused with `KERN_FAILURE`. A dispatch source is a thing a guest can wait
     /// on, and the only source this host can honour is a Mach receive right -
-    /// which is the whole of what `crate::dispatch::source` implements and is
-    /// another owner's work. The guest stores the status
-    /// (`Framework+0x5da9c13`, `mov ebx, eax`) and takes its own error path.
+    /// which is the whole of what `crate::dispatch::source` implements.
+    ///
+    /// **There is exactly one call site**, and the refusal is survivable by
+    /// measurement rather than by inheritance - the sentence this note used to
+    /// carry, "the guest stores the status and takes its own error path", was
+    /// wrong about the second half and had to be replaced. `notify_register_dispatch`
+    /// appears twice in the image (once in each of the two symbol-name tables,
+    /// `0xe758fd2` and `0xe772f90`) and the `call rel32` scan of all 214 MB of
+    /// `__TEXT,__text` finds one target, `+0x5da9c0e`. Its enclosing function's
+    /// `__FILE__` is `../../base/power_monitor/thermal_state_observer_mac.mm` and
+    /// its function-name string is `ThermalStateObserverMac` - both loaded by
+    /// `lea` at `+0x5da9c39` and `+0x5da9c5d`, inside the failure arm itself.
+    ///
+    /// ```text
+    ///  5da9c0e  call   0xcca17fa              ; _notify_register_dispatch
+    ///  5da9c13  mov    ebx,eax               ; the status, kept in a callee-saved register
+    ///  5da9c15  ...                          ; objc_release(__dispatch_main_q)
+    ///  5da9c22  cmp    DWORD PTR [rip+…],0x3 ; 0xe872920, the logging verbosity
+    ///  5da9c29  setge  al
+    ///  5da9c2c  test   ebx,ebx               ; KERN_SUCCESS?
+    ///  5da9c2e  sete   cl
+    ///  5da9c31  or     cl,al
+    ///  5da9c33  jne    0x5da9d17             ; success, or verbose: skip the report
+    ///  5da9c39  lea    rsi,[rip+…]            # 0xd8f1160  "../../base/power_monitor/…"
+    ///  5da9c5d  lea    rsi,[rip+…]            # 0xd8f1197  "ThermalStateObserverMac"
+    ///  5da9c71  lea    rsi,[rip+…]            # 0xd8f11af  " unable to register to power
+    ///                                              notifications. Result: "
+    ///  5da9c88  mov    esi,ebx               ; the status, as the formatted value
+    ///  5da9c8a  call   0x440060              ; int -> string
+    /// ```
+    ///
+    /// So the status is stored and then **logged**, and the function returns
+    /// `void` at `+0x5da9da3` with the observer simply never receiving a power
+    /// notification. There is no `CHECK`, no `MACH_CHECK`, no `NOTREACHED` and no
+    /// `DCHECK`: the `je` at `+0x5da9c33` is the *skip-the-report* arm, and
+    /// the log call at `+0x5cce550` is the report. What is lost is thermal-state
+    /// throttling, which `--dump-dom` does not consult.
+    ///
+    /// The reason to write all of that down is that an inherited justification is
+    /// exactly what this project has been bitten by: `notify_register_dispatch`
+    /// was on file as "KERN_FAILURE is the answer Darwin gives a port that cannot
+    /// be registered", which is a claim about *Darwin's* behaviour that nothing
+    /// here checked, resting on a claim about *the guest's* behaviour that turned
+    /// out to be the wrong shape. Both halves are now read off the instruction
+    /// stream.
     unsafe extern "C" fn notify_register_dispatch(
         _name: *const c_char,
         _reg: u64,
@@ -2989,9 +2999,9 @@ mod imp {
             "notify-dispatch",
             "notify_register_dispatch",
             "answering KERN_FAILURE: a dispatch source is a condition this host can wait on, \
-             and the only one implemented here is a Mach receive right. KERN_FAILURE is the \
-             answer Darwin gives a port that cannot be registered, and the guest stores the \
-             status and takes its own error path",
+             and the only one implemented here is a Mach receive right. There is one call site, \
+             ThermalStateObserverMac, which stores the status, logs it and returns - no CHECK, \
+             no wait - so what is lost is power-notification throttling and nothing else",
         );
         crate::mach::kern::KERN_FAILURE
     }
@@ -3017,35 +3027,73 @@ mod imp {
         crate::mach::kern::KERN_FAILURE
     }
 
-    /// `kern_return_t mach_msg_send(mach_msg_t msg, unsigned int msm_bits, mach_msg_size_t msg_size, mach_msg_size_t rcv_size, boolean_t want_reply)`.
+    /// `kern_return_t mach_msg_send(mach_msg_header_t *msg)` - **one argument**.
     ///
-    /// Forwarded to this crate's own [`crate::mach::msg::mach_msg`] with
-    /// `MACH_SEND_MSG` added, which is all the wrapper does: the header's own
-    /// description of `mach_msg_send` is "`mach_msg` with the `MACH_SEND_MSG` bit
-    /// set", and the guest passes `msm_bits = 0` (`Framework+0x50ff720`), i.e. it
-    /// is relying on this function to add it.
+    /// This used to be declared with the five-argument *kernel trap* signature
+    /// from `<mach/mach_trap_support.h>` - `mach_msg_send(mach_msg_t, unsigned,
+    /// mach_msg_size_t, mach_msg_size_t, boolean_t)` - which is a different
+    /// function that takes a port as its first argument. The userspace
+    /// `mach_msg_send` in `<mach/mach.h>` takes a message pointer and nothing
+    /// else, and its entire body is `mach_msg(msg, MACH_SEND_MSG,
+    /// msg->msgh_size, 0, MACH_PORT_NULL, MACH_PORT_NULL, 0)`.
     ///
-    /// The guest does not read the return value; it pre-fills the message with
-    /// `0xaa` and inspects the buffer afterwards
-    /// (`Framework+0x50ff725` is the `movabs` of that pattern), so a send that
-    /// does not happen is visible to it rather than silent.
-    unsafe extern "C" fn mach_msg_send(
-        msg: *mut c_void,
-        msm_bits: u32,
-        msg_size: u32,
-        rcv_size: u32,
-        _want_reply: bool,
-    ) -> i32 {
+    /// **Every call site in the image passes exactly one argument**, so the old
+    /// declaration read `msm_bits` out of whatever the caller happened to leave
+    /// in `esi` and `msg_size` out of `edx`:
+    ///
+    /// ```text
+    /// ; MessagePumpKqueue::ScheduleWork, Framework+0x5da6d30
+    ///  5da6d4e  movabs rax,0x1800000015   ; msgh_bits = 0x15, msgh_size = 0x18 (24)
+    ///  5da6d58  mov    QWORD PTR [rbp-0x18],rax
+    ///  5da6d5c  mov    eax,DWORD PTR [rdi+0x10]
+    ///  5da6d5f  mov    DWORD PTR [rbp-0x10],eax
+    ///  5da6d62  lea    rdi,[rbp-0x18]      ; one argument
+    ///  5da6d66  call   0xcca11f4           ; _mach_msg_send
+    ///  5da6d6b  test   eax,eax             ; MACH_CHECK on the result
+    /// ```
+    ///
+    /// The second site (`Framework+0x50ff720`) is `lea rdi,[rbp-0xb0]; call`
+    /// with nothing in `esi`/`edx`/`ecx`/`r8` either, and it too `MACH_CHECK`s
+    /// the result. So `edx` at the call was whatever `ScheduleWork`'s own caller
+    /// left there - which is how a 24-byte message went out claiming to be
+    /// larger, and the receiver correctly answered `MACH_RCV_TOO_LARGE`.
+    ///
+    /// The guest does not read the message afterwards at the second site; it
+    /// pre-fills the buffer with `0xaa` and inspects it
+    /// (`Framework+0x50ff725` is that `movabs`), so a send that does not happen
+    /// is visible to it rather than silent. The **return value is read at both**
+    /// sites, so it is the real `kern_return_t` and not a constant.
+    unsafe extern "C" fn mach_msg_send(msg: *mut c_void) -> i32 {
         /// `MACH_SEND_MSG`, from `<mach/message.h>`.
         const SEND_MSG: i32 = 0x1;
+        /// `offsetof(mach_msg_header_t, msgh_size)`.
+        ///
+        /// `msgh_bits` is 4 bytes and `msgh_size` follows it. The guest packs
+        /// both into a single 8-byte store (`movabs rax,0x1800000015` above), so
+        /// the size is the high half of that store - and it is corroborated from
+        /// the other end, since the guest writes `msgh_local_port` at **offset
+        /// 12** of a receive buffer (`waitable_event_apple.cc:73`), which puts
+        /// `msgh_remote_port` at 8 and so the header in use is the 64-bit
+        /// Darwin one.
+        const MSGH_SIZE: usize = 4;
+        if msg.is_null() {
+            return crate::mach::kern::KERN_INVALID_ARGUMENT;
+        }
+        // SAFETY: `msg` is the caller's own message, and the caller of
+        // `mach_msg_send` has just built a header there - the guest packs
+        // `msgh_bits` and `msgh_size` in the instruction immediately before the
+        // call. Reading the four bytes at `MSGH_SIZE` is inside that header.
+        let msg_size = unsafe {
+            core::ptr::read_unaligned(msg.cast::<u8>().add(MSGH_SIZE) as *const u32)
+        };
         // SAFETY: the caller's message buffer; `mach_msg`'s own contract is
         // stated on its definition and this call adds only the send bit.
         unsafe {
             crate::mach::msg::mach_msg(
                 msg,
-                msm_bits as i32 | SEND_MSG,
+                SEND_MSG,
                 msg_size,
-                rcv_size,
+                0,
                 crate::mach::space::MACH_PORT_NULL,
                 0,
                 crate::mach::space::MACH_PORT_NULL,
@@ -3053,41 +3101,75 @@ mod imp {
         }
     }
 
-    /// `kern_return_t mach_make_memory_entry_64(vm_task_t target_task, vm_entry_t *entry, vm_address_t address, vm_size_t size, int protections, int max_protections, vm_entry_t parent_entry)`.
+    /// `mach_make_memory_entry_64` used to be refused here, with
+    /// `KERN_NOT_SUPPORTED` and a long note saying why no memory entry could be
+    /// minted: a named memory entry is a kernel IPC object, and the port space
+    /// in this tree is a table inside the process. **That reason was half right
+    /// and the half that was right was not the obstacle.**
     ///
-    /// `KERN_FAILURE`. A memory entry is a *named reference* to a region of
-    /// another task's address space, and making one needs a real Mach virtual
-    /// memory object on the other side; the two call sites
-    /// (`Framework+0x5d94ff8` region) are Chromium's shared-memory setup, which
-    /// falls back to a plain mapping when this fails.
-    unsafe extern "C" fn mach_make_memory_entry_64(
-        _target_task: u32,
-        _entry: *mut u32,
-        _address: u32,
-        _size: u32,
-        _protections: c_int,
-        _max_protections: c_int,
-        _parent_entry: u32,
-    ) -> i32 {
-        crate::mach::kern::KERN_FAILURE
-    }
-
+    /// It was right that the *name* is process-local - `mach::space` is a
+    /// `OnceLock<RwLock<HashMap<Name, Right>>>` and a name from it means nothing
+    /// in another task. It was wrong that this makes a real memory object
+    /// impossible, because a port's cross-process identity in this tree is not
+    /// its name: `mach::msg` puts a port's 64-bit `Address` in the message and
+    /// the receiver draws a **fresh name in its own space for that same
+    /// `Address`**. A memory object can therefore be named by its `Address`
+    /// and resolve in a process that never saw it minted - which is the second
+    /// half of XNU's "two-stage `vm_remap`" the refusal said was missing.
+    ///
+    /// So it is answered now, in `mach::memory_object`, and the whole of the
+    /// reasoning - the two call sites read off the binary, the `MAP_MEM_NAMED_
+    /// CREATE` bit, the `CHECK` at `platform_shared_memory_region_apple.cc(150)`,
+    /// and the one real difference from XNU, which is who can reach the object
+    /// and not what a holder of the port gets - is written down there. The arm
+    /// in this file's dispatch below points at it, so the name is still bound
+    /// here and not through `mach::dispatch`.
+    ///
+    /// Nothing about the `CHECK` changed: `mach_make_memory_entry_64` answers
+    /// `KERN_SUCCESS` because the object it mints is a real one, and a named
+    /// refusal for the three shapes it does not implement, not because the
+    /// refusal was removed.
+    ///
     /// `int sandbox_check(pid_t pid, const char *profile, uint64_t flags)`.
     ///
-    /// **-1, and that is the truth**: this process is not in a macOS sandbox,
-    /// because there is no sandbox here. The three call sites all *degrade* on a
-    /// non-zero answer rather than aborting, and the shape of the degradation is
-    /// the answer's justification:
+    /// **`-1`, and that is the right answer, not a wrong one wearing the right
+    /// shape.** It is worth setting out why, because a first reading of these
+    /// five sites gets the polarity backwards.
     ///
-    /// * `Framework+0xc8f7708` - `je 0xc8f7733` skips the whole block on zero, so
-    ///   non-zero goes to `CGSSetDenyWindowServerConnections(1)` and then
-    ///   `TransformProcessType` to a background process. That is Chromium's
-    ///   "we are not sandboxed, so do not hold the window server" path, running
-    ///   as designed.
-    /// * `Framework+0x4950cc6` and `+0x4f1812d` branch on the same way.
+    /// **All five sites ask the same question about this process**, and none of
+    /// them passes a profile: each is
+    /// `call _getpid; mov edi, eax; xor esi, esi; xor edx, edx; xor eax, eax; call
+    /// _sandbox_check`, i.e. `sandbox_check(getpid(), NULL, 0)`. The function's
+    /// own return convention is **0 = confined, non-zero = not confined**, and
+    /// that is what the binary shows at each site:
     ///
-    /// So the truthful answer is also the one the guest was written to receive on
-    /// a machine that is not sandboxed, and the run continues.
+    /// | site | what it does with the answer | reads it as |
+    /// |---|---|---|
+    /// | `+0x4f1812d` | `test eax,eax; je 0x4f1827f` and `+0x4f1827f` is `int3` | **0 = sandboxed** |
+    /// | `+0xc8f7701` | `test eax,eax; je 0xc8f7733` and `+0xc8f7733` is `int3` | **0 = sandboxed** |
+    /// | `+0xc8f7701` (non-zero) | `CGSSetDenyWindowServerConnections(1)`, then `DisableLaunchServices` | not confined |
+    /// | `+0x4950cc6` | non-zero falls into `call 0x80f03f0` | not confined |
+    /// | `+0x82a07e4` | `setne BYTE PTR [rbx+0x240]` — cached, then passed as a `bool` to a virtual call, beside the literal `"GPU.Sandboxed"` | not confined |
+    /// | `+0xc6c1f91` | `test eax,eax; setne al; ret` — the whole function | not confined |
+    ///
+    /// The two `int3` sites fix the convention beyond argument: **zero is
+    /// fatal**, so the only answers available are zero and non-zero, and "0 =
+    /// confined" is not something this runtime may ever return. The
+    /// not-confined reading is confirmed by what the two shedding paths
+    /// *are*: `0x80f03f0` is `sandbox::DisableLaunchServices()`, which is
+    /// `SetApplicationIsDaemon(true)` plus a LaunchServices connection denial,
+    /// and its own `__FILE__` string in the image is
+    /// `../../sandbox/mac/system_services.cc` (at `+0x80f041f`, the `lea` whose
+    /// target is `0xda391e2`). Chromium sheds LaunchServices from an
+    /// **unsandboxed** process. So `!= 0` means "not confined", and `-1` says
+    /// exactly that, which is **true**: there is no Seatbelt on this host.
+    ///
+    /// The honest caveat, which is a caveat about the *interface* and not about
+    /// this value: `-1` is a failure code — "the check could not be performed" —
+    /// and Chromium's idiom cannot tell that apart from "not confined", because
+    /// it only ever tests zero against non-zero. That conflation is harmless
+    /// here, where the two happen to agree. It is also not avoidable: refusing to
+    /// answer, or answering 0, is `int3` at two sites.
     unsafe extern "C" fn sandbox_check(_pid: c_int, _profile: *const c_char, _flags: u64) -> c_int {
         -1
     }
@@ -3138,25 +3220,54 @@ mod imp {
         0
     }
 
-    /// `void sandbox_free_error(int err, char *buf, size_t buflen)`.
+    /// `void sandbox_free_error(char *errbuf)`.
     ///
-    /// A real message, and the point of the function: it turns an error a sandbox
-    /// call returned into text a human can read. `strerror` is the true answer
-    /// for the `errno` the refusals above actually set, so that is what goes in
-    /// the buffer - which is what makes those refusals legible at the point of
-    /// failure rather than only in this file's notes.
-    unsafe extern "C" fn sandbox_free_error(err: c_int, buf: *mut c_char, buflen: usize) {
-        if buf.is_null() || buflen == 0 {
+    /// **One argument, and the binary is why.** Both call sites pass `rdi` and
+    /// nothing else:
+    ///
+    /// ```text
+    /// 7fe660c  mov  r14, rdi ; 7fe660f  call _sandbox_free_error   (Framework)
+    /// 10002704d mov r15, rdi ; 100027050 call _sandbox_free_error   (Helper)
+    /// ```
+    ///
+    /// So `rsi` and `rdx` are whatever the preceding call left behind. This
+    /// function used to be spelled with the three arguments of a *different*
+    /// reading of the name — `(int err, char *buf, size_t buflen)` — and that
+    /// made it, on two reachable sites, a **bounded-length write into the guest's
+    /// own message buffer driven by two registers of garbage**: entered with
+    /// `err` = a pointer, `buf` = the same pointer (the guest hands the message
+    /// back as both), and `buflen` = a register this runtime never chose. The
+    /// copy was `min(strerror_len, buflen - 1)`, and `strerror` of an
+    /// unrecognised value is `"Unknown error N"` — so it was bounded only by the
+    /// accident that the buffer happened to be longer than about twenty-one
+    /// bytes. `crates/sandbox` had to size its message at 256 bytes for that to
+    /// stay inside the allocation; that workaround is **gone** now that the
+    /// arity is right.
+    ///
+    /// **What it does instead is the real thing: release the string.** The
+    /// header's job is to free what the library allocated on the way out of a
+    /// failed call, and both measured producers in this tree allocate it here:
+    /// `darwin::last_unavailable::sandbox_compile_string` and
+    /// `crates::sandbox`'s `sandbox_init_with_parameters`. So this frees, and it
+    /// frees only what this runtime handed out — the table in
+    /// [`crate::last_unavailable`] is what makes "ours" answerable, which is
+    /// what stops this from being a "free any pointer the guest names" primitive
+    /// and what makes a second release a no-op rather than a double free.
+    unsafe extern "C" fn sandbox_free_error(errbuf: *mut c_char) {
+        if errbuf.is_null() {
             return;
         }
-        // SAFETY: `strerror` returns a pointer to a static string, which is read
-        // here and copied; `buf` is the caller's, of `buflen` bytes, and the copy
-        // is truncated to fit with its terminator.
-        unsafe {
-            let message = std::ffi::CStr::from_ptr(libc::strerror(err)).to_bytes();
-            let take = message.len().min(buflen - 1);
-            std::ptr::copy_nonoverlapping(message.as_ptr() as *const c_char, buf, take);
-            *buf.add(take) = 0;
+        if !crate::last_unavailable::release_guest_error_string(errbuf) {
+            said_once(
+                "sandbox_free_error/foreign",
+                "sandbox_free_error",
+                &format!(
+                    "refused to release {:#x}: it is not an error string this runtime \
+                     handed the guest, so freeing it would be a free of a pointer the guest \
+                     chose. Nothing is released and the run continues",
+                    errbuf as usize
+                ),
+            );
         }
     }
 
@@ -3483,7 +3594,9 @@ mod imp {
             "change_fdguard_np" => change_fdguard_np,
             "devname" => devname,
             "getsectiondata" => getsectiondata,
-            "copyfile" => copyfile,
+            // `copyfile` is answered by `crate::copyfile`, once. See the note
+            // above `clonefile` for why a second one here was a defect and not
+            // a redundancy.
             "clonefile" => clonefile,
             "notify_cancel" => notify_cancel,
             "mach_msg_send" => mach_msg_send,
@@ -3496,7 +3609,11 @@ mod imp {
             "fileport_makefd" => fileport_makefd,
             "notify_register_dispatch" => notify_register_dispatch,
             "notify_register_file_descriptor" => notify_register_file_descriptor,
-            "mach_make_memory_entry_64" => mach_make_memory_entry_64,
+            // A real memory object, not the refusal this used to be: one file
+            // both processes map `MAP_SHARED`, named by a send right this
+            // process can put in a message. See `mach::memory_object`'s module
+            // note for the whole of it, and `mach::vm::vm_map` for the map.
+            "mach_make_memory_entry_64" => crate::mach::memory_object::mach_make_memory_entry_64,
             "sandbox_check" => sandbox_check,
             "sandbox_ms" => sandbox_ms,
             "sandbox_extension_issue_file" => sandbox_extension_issue_file,
@@ -4116,6 +4233,73 @@ mod imp {
             drop(unsafe { Box::from_raw(pool as *mut PixelBufferPool) });
         }
 
+        /// The name is still bound, and now to an answer rather than a refusal -
+        /// so the arm in this file's dispatch has to resolve. The behaviour is
+        /// `mach::memory_object`'s and is tested there; what is worth pinning
+        /// *here* is that the two call sites' exact arguments reach a real
+        /// memory object, because that is the `CHECK` at
+        /// `platform_shared_memory_region_apple.cc(150)`.
+        #[test]
+        fn mach_make_memory_entry_64_is_bound_and_answers_the_create_shape() {
+            let mut size: u64 = 0x1_0000;
+            let mut handle: u32 = 0xaaaa_aaaa;
+            // The two call sites' arguments, verbatim: `mach_task_self()`'s
+            // port, the in/out size, the offset, `MAP_MEM_NAMED_CREATE |
+            // VM_PROT_READ | VM_PROT_WRITE`, the out-port and
+            // `MACH_PORT_NULL`. Only the first is a real port here and it does
+            // not change the answer, which is the point.
+            //
+            // SAFETY: both out-parameters are live locals, and nothing is
+            // dereferenced on the way out.
+            let kr = unsafe {
+                crate::mach::memory_object::mach_make_memory_entry_64(
+                    crate::mach::space::TASK_SELF,
+                    &mut size,
+                    0,
+                    0x2_0003,
+                    &mut handle,
+                    crate::mach::space::MACH_PORT_NULL,
+                )
+            };
+            assert_eq!(kr, crate::mach::kern::KERN_SUCCESS);
+            assert_ne!(handle, 0xaaaa_aaaa, "a real answer writes a real port");
+            assert_eq!(
+                size % 0x1000,
+                0,
+                "a Mach VM object is a whole number of pages, and the image's \
+                 DCHECK_GE(vm_size, size) is satisfied by rounding up"
+            );
+            // And the port it wrote is a send right this process holds, which is
+            // what makes it transferable: `mach::msg` puts a port's `Address` in
+            // a message and the receiver draws its own name for the same one.
+            assert!(crate::mach::space::address_of(handle).is_some());
+            // The answer is not kept alive by the test: the entry's pages are a
+            // file and its name is a port, and dropping the port is what the
+            // guest does with it.
+            assert_eq!(
+                crate::mach::space::mach_port_deallocate(
+                    crate::mach::space::TASK_SELF,
+                    handle
+                ),
+                crate::mach::kern::KERN_SUCCESS
+            );
+        }
+
+        /// The arm in this file's dispatch still publishes this name, so the
+        /// guest's import is bound to the implementation rather than to nothing
+        /// - a `MODULE` nobody includes is how a name ends up implemented and
+        /// unbound, and the count in `the_module_publishes_exactly_the_names_it_
+        /// documents` is what notices the next one.
+        #[test]
+        fn mach_make_memory_entry_64_is_still_published_here() {
+            let names = exports::Module::all_names(std::slice::from_ref(&MODULE));
+            assert!(
+                names.iter().any(|n| *n == "mach_make_memory_entry_64"),
+                "the name is in the table, and the arm points at \
+                 crate::mach::memory_object::mach_make_memory_entry_64"
+            );
+        }
+
         /// A pixel buffer built here reports its own geometry, and locks
         /// symmetrically.
         #[test]
@@ -4239,12 +4423,58 @@ mod imp {
             let _ = std::fs::remove_file(&path);
         }
 
-        /// `sandbox_check` says "not sandboxed", and the guest's three sites
-        /// branch on exactly that.
+        /// `sandbox_check` answers **non-zero**, and both halves of that are
+        /// forced by the guest rather than chosen.
+        ///
+        /// Non-zero is the *only* survivable answer: `Framework+0x4f18134` and
+        /// `+0xc8f7708` both `je` an `int3` on **zero**
+        /// (`+0x4f1827f`, `+0xc8f7733`), so `0 = confined` is not a value this
+        /// runtime may ever return here.
+        ///
+        /// And non-zero is what the guest reads as *not confined*: the two
+        /// shedding paths it takes on non-zero are `CGSSetDenyWindowServerConnections(1)`
+        /// and `sandbox::DisableLaunchServices()` — `SetApplicationIsDaemon(true)`
+        /// plus a LaunchServices denial, whose own `__FILE__` string in the image
+        /// is `../../sandbox/mac/system_services.cc`. Chromium sheds
+        /// LaunchServices from an unsandboxed process, so `-1` — non-zero, and
+        /// true, because there is no Seatbelt on this host — is the answer the
+        /// guest was written to receive. See the note on the function itself for
+        /// the per-site table.
         #[test]
         fn sandbox_check_says_this_process_is_not_sandboxed() {
-            // SAFETY: no pointer arguments, and nothing is read.
-            assert_eq!(unsafe { sandbox_check(0, std::ptr::null(), 0) }, -1);
+            // SAFETY: no pointer arguments, and nothing is read. The profile
+            // argument is the `NULL` all five real call sites pass.
+            let answer = unsafe { sandbox_check(0, std::ptr::null(), 0) };
+            assert_ne!(answer, 0, "zero is an int3 at Framework+0x4f1827f and +0xc8f7733");
+        }
+
+        /// `sandbox_free_error` takes **one** argument and releases a string this
+        /// runtime produced — and refuses a pointer it did not.
+        ///
+        /// The arity is the whole point: the guest calls it with `rdi` only
+        /// (`Framework+0x7fe660c`, `Helper+0x10002704d`, both `mov <reg>, %rdi;
+        /// call`), so a three-argument spelling was entered with `rsi` and `rdx`
+        /// full of whatever the previous call left and wrote
+        /// `strerror(garbage)` into the guest's own buffer at a length this
+        /// runtime never chose. One argument cannot do that.
+        #[test]
+        fn sandbox_free_error_releases_only_our_own_strings() {
+            // A string one of the two real producers would have written.
+            let ours = crate::last_unavailable::guest_error_string("a refusal that says why");
+            // SAFETY: one pointer, the only argument the guest passes. It is an
+            // allocation this runtime made and registered, so it is freed here.
+            unsafe { sandbox_free_error(ours) };
+            // A second release of the same pointer must not free again — that is
+            // a double free, and the address is gone from the table.
+            // SAFETY: as above; the pointer is stale, and refusing it is the point.
+            unsafe { sandbox_free_error(ours) };
+            // A null is the arm the guest's own `test r15,r15; je` skips.
+            // SAFETY: null, and nothing is dereferenced.
+            unsafe { sandbox_free_error(std::ptr::null_mut()) };
+            // And a pointer this runtime never produced is refused, not freed.
+            // SAFETY: a value that is not a heap pointer at all, and is refused
+            // by a table lookup before anything could dereference it.
+            unsafe { sandbox_free_error(0x1000 as *mut c_char) };
         }
 
         /// `responsibility` is this process for every pid, which is the truth
@@ -4284,20 +4514,37 @@ mod imp {
         #[test]
         fn the_module_publishes_exactly_the_names_it_documents() {
             let names = exports::Module::all_names(std::slice::from_ref(&MODULE));
-            // 110 names, of which one is not published: `mach_vm_purgable_control`
-            // is in the guest's unbound list and is a `mach_` name, and
-            // `crate::divergent` names it in two of its own tests as *the* witness
-            // for "a Mach memory call this crate declines" - quoting the same
-            // call site (`+0x81c4106`). Publishing it would answer a question the
-            // tree has already decided, so it is left to `divergent` to deny.
+            assert!(
+                !names.iter().any(|n| *n == "copyfile"),
+                "`copyfile` is `crate::copyfile`'s, once. A second one here won \
+                 every guest import - see the note above `clonefile` - and the \
+                 count below is what notices the next one"
+            );
+            // 110 names, of which one is not published here:
+            // `mach_vm_purgable_control` is a `mach_` name in the guest's
+            // unbound list, and it used to be left to `crate::divergent` to deny,
+            // which `divergent` named in two of its own tests as *the* witness
+            // for "a Mach memory call this crate declines".
+            //
+            // That stopped being true, and the reason is mechanical rather than
+            // editorial. `divergent` denies a name; it cannot publish one. The
+            // Framework calls `mach_vm_purgable_control` at `+0x81c4106` and the
+            // instruction after the call, `+0x81c410b`, reads its out-parameter
+            // with no status test - so leaving it denied left the import
+            // **unbound**, a zero in its slot and a jump through it on every Mach
+            // VM walk. It is now published by `crate::last_unavailable`, and
+            // `divergent`'s witnesses moved to the `task_` prefix, which is
+            // still declined. This module still does not publish it, which is
+            // what the assertion below checks and still means.
             assert_eq!(
                 names.len(),
-                109,
-                "libSystem.B 34 + CoreMedia 31 + CoreVideo 26 + Accelerate 17"
+                108,
+                "libSystem.B 33 + CoreMedia 31 + CoreVideo 26 + Accelerate 17, \
+                 plus one of the two names this module does not publish"
             );
             assert!(
                 !names.iter().any(|n| n.ends_with("mach_vm_purgable_control")),
-                "crate::divergent keeps that one denied on purpose; see its tests"
+                "it belongs to crate::last_unavailable, not to the media families"
             );
             for family in [
                 "vDSP_",       // 17
