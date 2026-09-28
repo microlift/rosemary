@@ -71,10 +71,17 @@ fn run(
         // `exit` and re-enter the JIT. Compiling a region needs live
         // thread-locals (Cranelift's among them), so a handler whose code had
         // not yet been translated would panic instead of running.
-        Ok(status) => std::process::exit(status),
+        Ok(status) => {
+            // Recorded for the `atexit` footer of a per-process log, which is
+            // the only place a child's exit status is ever written down: the
+            // harness sees the status of the browser process and nothing else.
+            LOG_STATUS.store(status, std::sync::atomic::Ordering::Relaxed);
+            std::process::exit(status)
+        }
         // A stop is a diagnostic, not a crash.
         Err(e) => {
             eprintln!("rosetta3: {path}: {e}");
+            LOG_STATUS.store(1, std::sync::atomic::Ordering::Relaxed);
             ExitCode::FAILURE
         }
     }
@@ -147,7 +154,200 @@ fn guest_spelling(path: &str) -> String {
         .into_owned()
 }
 
+/// `ROSETTA3_LOG_DIR`: where this process's log file goes, if it gets one.
+const LOG_DIR_ENV: &str = "ROSETTA3_LOG_DIR";
+
+/// Whether [`process_log`] took this process's stderr over, for [`log_footer`].
+static LOG_ON: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// This process's pid, for [`log_footer`].
+static LOG_PID: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+/// The status this process is about to exit with, or `-1` for a path that
+/// never said - for [`log_footer`].
+static LOG_STATUS: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(-1);
+
+/// Point this process's whole stderr at a file of its own, named for this
+/// process, when `ROSETTA3_LOG_DIR` names a directory.
+///
+/// **Off by default.** Unset, this returns before it does anything, and the
+/// runtime's output is what it has always been: the argument parser below
+/// prints the same usage text, and no line anywhere gains a prefix. Every
+/// other way of telling two processes apart has to be threaded through
+/// something; this needs no cooperation from any single line, which is the
+/// point, because there is no choke point to thread it through. `rosetta3: ` is
+/// several hundred `eprintln!`s across twenty-odd crates, and the guest writes
+/// to the same descriptor with its own `write(2)`.
+///
+/// **A file, not a tag per line,** because the two problems are different. A
+/// tag needs a per-line edit at every site; a file needs one `dup2`. And the
+/// file also removes the *interleaving*, which a tag cannot: two processes
+/// writing one descriptor produce a log in which
+/// `Failed to initialize sandbox.rosetta3: fault:` is a single line, and in
+/// the last eight milestone logs each of them has a `rosetta3: fault:` that
+/// begins mid-line. Everything a single-threaded process wrote around one of
+/// those is unattributable, which is most of the log.
+///
+/// **Every guest child is a fresh `rosetta3 run`,** so each of them re-enters
+/// here and takes a file of its own. The descriptor is deliberately *not*
+/// close-on-exec: the child inherits this process's file as its stderr and
+/// replaces it as the first thing it does, which is why there is nothing left
+/// to share. Closing it instead would leave the child with no stderr at all,
+/// and Rust's `eprintln!` panics when it cannot write - a run that worked would
+/// be lost to a logging detail.
+fn process_log() {
+    use std::os::fd::AsRawFd;
+
+    let Ok(dir) = std::env::var(LOG_DIR_ENV) else {
+        return;
+    };
+    let dir = std::path::PathBuf::from(dir);
+    // Milliseconds since the epoch in the name, so a lexical sort of the files
+    // is a sort by process *start* time - the only ordering a set of
+    // independent processes has.
+    let started = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    let pid = std::process::id();
+    let path = dir.join(format!("{started:013}-{pid}"));
+    let file = match std::fs::File::options().write(true).create(true).truncate(true).open(&path)
+    {
+        Ok(file) => file,
+        Err(e) => {
+            // Said on the *real* stderr, which is still the real stderr here.
+            eprintln!("rosetta3: log: cannot open {LOG_DIR_ENV} file {}: {e}", path.display());
+            eprintln!("rosetta3: log:   stderr is unchanged, so this run's log will interleave again");
+            return;
+        }
+    };
+    // SAFETY: `file` is a descriptor this process owns and has just opened, and
+    // 2 is this process's own stderr. `dup2` returns 2's previous value or -1,
+    // and does not close anything it did not create.
+    if unsafe { libc::dup2(file.as_raw_fd(), 2) } < 0 {
+        eprintln!("rosetta3: log: cannot make {} this process's stderr", path.display());
+        eprintln!("rosetta3: log:   stderr is unchanged, so this run's log will interleave again");
+        return;
+    }
+    // `file` is dropped here, which closes the descriptor it owns. The one
+    // `dup2` made is a separate descriptor onto the same open file, and it is
+    // the one everything below - and the whole process - writes to.
+    drop(file);
+
+    LOG_PID.store(pid, std::sync::atomic::Ordering::Relaxed);
+    LOG_ON.store(true, std::sync::atomic::Ordering::Relaxed);
+    // Runs at the end of `exit`, after the guest's own handlers and this
+    // runtime's statics. Fails silently, which is all a footer may do: a
+    // logging failure must never be the reason a run dies.
+    unsafe { libc::atexit(log_footer) };
+
+    eprintln!("rosetta3: log: pid {pid}, and this process's whole stderr, because {LOG_DIR_ENV} is set");
+    // The two measurements that make any line in a *shared* log attributable
+    // even if this header is lost: a Linux tid is this pid, and the load
+    // address of libc is a per-process identity, because ASLR moves it and the
+    // fault report prints both a host pc and the file offset it maps to.
+    eprintln!("rosetta3: log: pid {pid}, tid {}, on the main thread", std::process::id());
+    match libc_base() {
+        Some(base) => eprintln!(
+            "rosetta3: log: pid {pid}, libc base {base:#x} - a fault report's `host pc` minus its \
+             `file offset` is this number, and no other process in the run has it"
+        ),
+        None => eprintln!(
+            "rosetta3: log: pid {pid}, libc base not readable (/proc/self/maps); a fault report's \
+             `host pc` is still this process's alone"
+        ),
+    }
+    // The guest image, which is what tells two helpers apart.
+    let argv: Vec<String> = std::env::args_os()
+        .map(|a| a.to_string_lossy().into_owned())
+        .collect();
+    eprintln!("rosetta3: log: pid {pid}, argv {}", argv.join(" "));
+    eprintln!("rosetta3: log: pid {pid}, file {}", path.display());
+}
+
+/// The load address of this process's libc, or `None` where `/proc` says nothing.
+///
+/// A shared object is mapped at an address ASLR chose, so this is an identity
+/// no two processes in a run share, and the fault report already prints both
+/// halves of the subtraction: a `host pc` and the `file offset` that pc maps
+/// to. The lowest mapping of the object is the ELF load bias.
+fn libc_base() -> Option<u64> {
+    let maps = std::fs::read_to_string("/proc/self/maps").ok()?;
+    for line in maps.lines() {
+        // `address perms offset dev inode path`, and the path is absent when
+        // the mapping is anonymous.
+        if !line.split_whitespace().nth(5).is_some_and(|p| p.contains("libc.so")) {
+            continue;
+        }
+        let start = line.split_whitespace().next()?.split('-').next()?;
+        return u64::from_str_radix(start, 16).ok();
+    }
+    None
+}
+
+/// Say, from a normal exit, that the process got to the end.
+///
+/// `abort()` does not run `atexit` handlers and neither does a core dump, which
+/// is the whole value of this: a per-process log with the footer is a process
+/// that finished, and one without it is a process that was killed - including
+/// by the harness's own sweep, which is otherwise indistinguishable from a
+/// guest that hung. The harness's sweep, incidentally, is the reason this is
+/// worth having: it kills processes on purpose.
+extern "C" fn log_footer() {
+    use std::sync::atomic::Ordering::Relaxed;
+    if !LOG_ON.load(Relaxed) {
+        return;
+    }
+    // No allocation, no formatting, nothing that can panic: this runs inside
+    // `exit` while the runtime is being torn down, and a panic in an `atexit`
+    // handler aborts a run that had otherwise worked.
+    let mut buf = [0u8; 96];
+    let mut at = 0;
+    at += write_bytes(&mut buf, at, b"rosetta3: log: pid ");
+    at += write_number(&mut buf, at, u64::from(LOG_PID.load(Relaxed)));
+    at += write_bytes(&mut buf, at, b" exiting normally, status ");
+    let status = LOG_STATUS.load(Relaxed);
+    if status < 0 {
+        at += write_bytes(&mut buf, at, b"?");
+    } else {
+        at += write_number(&mut buf, at, status as u64);
+    }
+    at += write_bytes(
+        &mut buf,
+        at,
+        b"; an abort or a core dump prints no footer\n",
+    );
+    // SAFETY: `write` on descriptor 2, which [`process_log`] made this
+    // process's own log file. One call, no state, async-signal-safe.
+    unsafe { libc::write(2, buf.as_ptr().cast(), at as libc::size_t) };
+}
+
+/// `bytes` into `buf` at `at`, stopping at the end of the buffer.
+fn write_bytes(buf: &mut [u8], at: usize, bytes: &[u8]) -> usize {
+    let end = (at + bytes.len()).min(buf.len());
+    buf[at..end].copy_from_slice(&bytes[..end - at]);
+    end - at
+}
+
+/// `value` in decimal into `buf` at `at`, stopping at the end of the buffer.
+fn write_number(buf: &mut [u8], at: usize, mut value: u64) -> usize {
+    let mut digits = [0u8; 20];
+    let mut i = digits.len();
+    loop {
+        i -= 1;
+        digits[i] = b'0' + u8::try_from(value % 10).unwrap_or(0);
+        value /= 10;
+        if value == 0 {
+            break;
+        }
+    }
+    write_bytes(buf, at, &digits[i..])
+}
+
 fn main() -> ExitCode {
+    // Before anything can print, and before the guest has been started, because
+    // this is the only point at which this process's output is still knowable:
+    // afterwards a dozen guest children share one descriptor with it.
+    process_log();
+
     // `args_os`, not `args`: a process argument is a byte string, and
     // `std::env::args` *panics* on one that is not UTF-8. Some apps spawn
     // with annotations copied out of `sysctl`, so the argument

@@ -16,6 +16,8 @@ mod constant;
 pub mod cookies;
 pub mod defaults;
 mod define;
+#[cfg(test)]
+mod encoding_check;
 pub mod error;
 pub mod exception;
 pub mod filemanager;
@@ -26,10 +28,12 @@ pub mod kvc;
 pub mod kvo;
 pub mod locale;
 pub mod notification;
+pub mod ns_invocation;
 pub mod objectify;
 pub mod operation;
 pub mod paths;
 pub mod plist;
+mod plist_serialization;
 pub mod pool;
 pub mod processinfo;
 pub mod runtime;
@@ -40,10 +44,12 @@ pub mod thread;
 pub mod timer;
 mod timezone;
 pub mod unarchiver;
+pub mod uniform_type_identifiers;
 pub mod url;
 mod urlcomponents;
 pub mod urlsession;
 pub mod value;
+mod vision;
 
 mod collections;
 
@@ -85,6 +91,10 @@ pub fn bootstrap() {
         defaults::install();
         processinfo::install();
         appleevent::install();
+        plist_serialization::install();
+        ns_invocation::install();
+        uniform_type_identifiers::install();
+        vision::install();
     });
 }
 
@@ -187,6 +197,10 @@ pub fn class_data() -> Vec<(String, u64)> {
     for name in CLASSES
         .iter()
         .chain(constant::CLASSES)
+        .chain(plist_serialization::CLASSES)
+        .chain(ns_invocation::CLASSES)
+        .chain(uniform_type_identifiers::CLASSES)
+        .chain(vision::CLASSES)
         .chain(urlsession::CLASSES)
         .copied()
     {

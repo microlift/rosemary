@@ -555,9 +555,9 @@ pub(crate) fn install() {
     let timer_class = corefoundation::base::register(c"NSTimer", None, TIMER_INSTANCE_SIZE, false);
     class_methods!(timer_class, {
         "scheduledTimerWithTimeInterval:target:selector:userInfo:repeats:"
-            => scheduled_timer, c"@48@0:8d16@24:32@40c48";
+            => scheduled_timer, c"@52@0:8d16@24:32@40c48";
         "timerWithTimeInterval:target:selector:userInfo:repeats:"
-            => unscheduled_timer, c"@48@0:8d16@24:32@40c48";
+            => unscheduled_timer, c"@52@0:8d16@24:32@40c48";
     });
     methods!(timer_class, {
         "invalidate" => invalidate, c"v16@0:8";

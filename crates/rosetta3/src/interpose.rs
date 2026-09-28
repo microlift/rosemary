@@ -212,10 +212,118 @@ pub fn adopt_guest_allocator(report: &LinkReport) {
     let malloc_entry = malloc_as_darwin as *const () as usize;
     let free_entry = free_as_darwin as *const () as usize;
     objc::allocator::register(malloc_entry, free_entry);
-    darwin::heap::register(malloc_entry, free_entry);
+    let owns = if heap_region_describes_the_host_allocator() {
+        owns_block as *const () as usize
+    } else {
+        // Named rather than installed. A predicate that answers about a
+        // different allocator would turn every live block into a zero, which
+        // is the failure this whole mechanism exists to prevent, and it would
+        // do it silently. With none installed, `darwin::heap::owns` answers
+        // `None` and `darwin::malloc::malloc_size` behaves as it did before.
+        eprintln!(
+            "rosetta3: interpose: mimalloc does not own a block this host's own malloc just \
+             returned, so no ownership predicate is registered - `darwin::malloc::malloc_size` \
+             will have no way to tell a live block from a foreign pointer, and a foreign pointer \
+             will reach the host's malloc_usable_size undefined, which is what it did before this \
+             was added"
+        );
+        0
+    };
+    darwin::heap::register(malloc_entry, free_entry, owns);
     if tracing() {
         eprintln!("rosetta3: interpose: guest allocator malloc {malloc:#x}, free {free:#x}");
+        // The fact the ownership predicate above rests on, printed when asked
+        // for rather than assumed. `guest_allocator` reads whatever the guest's
+        // images resolved to, and that is a second allocator if it is not the
+        // host's own.
+        let host_malloc = libc::malloc as *const () as usize;
+        eprintln!(
+            "rosetta3: interpose: the guest's malloc {} the host's malloc {host_malloc:#x}, and \
+             the ownership predicate is {}",
+            if malloc as usize == host_malloc {
+                "is the same function as"
+            } else {
+                "is NOT the same function as"
+            },
+            if owns == 0 { "NOT installed" } else { "installed" },
+        );
     }
+}
+
+unsafe extern "C" {
+    /// mimalloc v3's `bool mi_is_in_heap_region(const void *p)`.
+    ///
+    /// **Not exported by the `mimalloc` crate.** It is declared in
+    /// `libmimalloc_sys::extended`, which that crate gates behind a feature
+    /// this one does not enable (`crates/rosetta3/Cargo.toml:47`), so there is
+    /// no `mimalloc::mi_is_in_heap_region` to call. `dlsym` cannot find it
+    /// either, and not because the archive is statically linked: `MI_OVERRIDE`
+    /// makes this executable *define* the libc names, so `malloc`, `free`,
+    /// `realloc`, `calloc` and `malloc_usable_size` are all in its `.dynsym`
+    /// (measured, entries 400-419), and the `mi_`-prefixed spellings are not
+    /// exported at all - so `dlsym` has nowhere to look for this one. It is in
+    /// `libmimalloc.a` as its own section `.text.mi_is_in_heap_region` (0x14
+    /// bytes), compiled with `-ffunction-sections` and dropped by
+    /// `--gc-sections` precisely because nothing referenced it; naming it here
+    /// is what keeps it, and it is in no symbol table of the built binary until
+    /// this line exists.
+    ///
+    /// Defined for **every** pointer, foreign included: it is
+    /// `_mi_safe_ptr_page(p) != NULL` (mimalloc v3 `page-map.c:443`), the
+    /// checked lookup whose submap test `_mi_ptr_page` skips when `MI_DEBUG`
+    /// is 0 and the target is not Apple. That is the predicate the fix needs and
+    /// the one the unchecked build cannot do for itself.
+    fn mi_is_in_heap_region(p: *const std::ffi::c_void) -> bool;
+}
+
+/// `mi_is_in_heap_region`, as `darwin::heap`'s ownership predicate.
+///
+/// The same answer for a pointer inside a live segment but not at a block start
+/// - `true`, and then `malloc_usable_size` sizes the segment's block, which is
+/// what the host's own allocator says for freed memory and what Darwin says
+/// through its zone's `size` slot. The predicate answers "is this pointer in
+/// this allocator at all", which is the question that has a false answer, not
+/// "is this a live block", which is one only a heap can enumerate.
+unsafe extern "C" fn owns_block(p: *const std::ffi::c_void) -> bool {
+    // SAFETY: `mi_is_in_heap_region` reads only mimalloc's own page map and is
+    // defined for any pointer; see the declaration above.
+    unsafe { mi_is_in_heap_region(p) }
+}
+
+/// Whether the host's `malloc_usable_size` is mimalloc's, asked as a question
+/// with an answer rather than assumed from the dependency list.
+///
+/// The control that has to pass before the predicate is installed: allocate one
+/// block from **the host's own `malloc`** - the function `malloc_size` will go
+/// on to call `malloc_usable_size` about - and ask mimalloc whether it owns it.
+/// If it does not, then asking mimalloc about a pointer is asking a different
+/// allocator than the one being sized, every live block would come back "not
+/// owned", and the zero would be a wrong answer wearing a correct-looking
+/// name.
+///
+/// A block is also asked about, so this fails in the other direction too: a
+/// predicate that says `false` to the host's own block would answer `malloc_size`
+/// 0 for it, which is as wrong as the other case and is caught here.
+fn heap_region_describes_the_host_allocator() -> bool {
+    // SAFETY: a size this function asks for itself and frees before returning.
+    let block = unsafe { libc::malloc(64) };
+    if block.is_null() {
+        eprintln!(
+            "rosetta3: interpose: the host's own malloc returned null for a 64-byte probe, so no \
+             ownership predicate is registered - there is no block to check the predicate against"
+        );
+        return false;
+    }
+    // SAFETY: `block` is a live block of this host's allocator.
+    let says_yes = unsafe { mi_is_in_heap_region(block) };
+    // SAFETY: `block` came from `malloc` and is not used again.
+    unsafe { libc::free(block) };
+    if !says_yes {
+        return false;
+    }
+    // The other direction, on an address that is certainly not a block.
+    let stack = &0u8 as *const u8 as *const std::ffi::c_void;
+    !unsafe { mi_is_in_heap_region(stack) }
 }
 
 /// The guest's own `malloc` and `free`, behind [`malloc_as_darwin`].

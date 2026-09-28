@@ -155,8 +155,17 @@ pub unsafe extern "C" fn create_run_loop_source(
     );
     *port.source.lock().unwrap_or_else(|e| e.into_inner()) = Some(Arc::downgrade(&source));
     // `runloop::new_source_ready_ordered` has already recorded the handle, so the
-    // loop's own `CFRunLoopSource*` entry points can find it again.
-    Arc::into_raw(source).cast::<c_void>()
+    // loop's own `CFRunLoopSource*` entry points can find it again - but that
+    // records *that* the address is one of ours, not who holds a reference to
+    // it, and the C world's half is this function's to register. `leak` is the
+    // same `Arc::into_raw` plus the release, so a guest that follows Apple and
+    // `CFRelease`s the source it was handed ends the reference it was handed.
+    //
+    // A bare `Arc::into_raw` here cannot: `note` leaves `refs` at `None`, so
+    // `release_opaque` finds no counted reference, answers `CRef::Unknown`, and
+    // the source is never freed. That is a leak and not a wrong answer, but it
+    // is unbounded and it is the guest doing exactly what Apple documents.
+    crate::runloop::leak(source)
 }
 
 /// Whether the `CFMachPort` at `info` has a message waiting.
@@ -308,8 +317,18 @@ mod tests {
         // SAFETY: a port this module made.
         let handle = unsafe { create_run_loop_source(std::ptr::null(), port, 0) };
         assert!(!handle.is_null(), "a receive right can be listened to");
-        // SAFETY: `create_run_loop_source` returned a leaked `Arc<Source>`, and it
-        // is not dropped: the loop holds the only reference that matters.
+        // SAFETY: `create_run_loop_source` handed the C world exactly one strong
+        // reference to this `Arc<Source>` and this consumes it, so the test owns
+        // that reference rather than aliasing it.
+        //
+        // **It is the same single reference either way, and that is the point.**
+        // `runloop::leak` does not make a second one: it does the same
+        // `Arc::into_raw` and then *records* where the one it gave away is given
+        // back. Nothing in this module `CFRelease`s a source, so the release it
+        // registered never fires and this is not a double free. And when this
+        // `Arc` drops, `Source::drop` calls `forget`, which takes the whole
+        // `OPAQUE` entry - the registered release included - so a later
+        // allocation at the same address is not claimed by it.
         let source = unsafe { Arc::from_raw(handle.cast::<Source>()) };
         loop_.add_source(&source, crate::runloop::DEFAULT_MODE);
         (loop_, source)

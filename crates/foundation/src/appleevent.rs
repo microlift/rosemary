@@ -1159,7 +1159,7 @@ pub(crate) fn install() {
         "descriptorWithDescriptorType:bytes:length:" => descriptor_with_bytes, c"@36@0:8I16^v20I28";
         "descriptorWithDescriptorType:data:" => descriptor_with_data, c"@32@0:8I16@24";
         "appleEventWithEventClass:eventID:targetDescriptor:returnID:transactionID:"
-            => apple_event_with, c"@42@0:8I16I20@24s32i34";
+            => apple_event_with, c"@42@0:8I16I20@24s32i36";
     });
     methods!(descriptor, {
         "descriptorType" => descriptor_type, c"I16@0:8";

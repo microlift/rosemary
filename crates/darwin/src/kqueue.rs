@@ -57,6 +57,147 @@
 //! [`super::mach::kevent64::Proc::exited`], from the XNU source; see
 //! `PROC_DELIVERED_FLAGS` there for the `kn_flags` chain that puts the kernel's
 //! bits - and the caller's `EV_ADD` - in the delivered word.
+//!
+//! ## A correction this file used to carry, and one it used to get wrong
+//!
+//! [`refused_filter`] used to close with: *"of every filter this file refuses,
+//! `EVFILT_PROC` was the only one that any of the framework's `kevent` callers
+//! actually waited on ... The rest are refused by name and cost nothing, because
+//! no caller blocks on them."*
+//!
+//! **That is false, and the disassembly says so.** `EVFILT_VNODE` is registered
+//! **and waited on** at four of this file's call sites - `+0x5d9e968` and
+//! `+0x5d9f56e` in `base::FilePathWatcherKQueue`, `+0x3a9ab38` and `+0x3a9b73e`
+//! in `content::file_system_access::FilePathWatcherKQueue` - each of them
+//! `kevent(kq, changes, n, out, n, NULL)`: a null timeout and room for events,
+//! which is a wait. The registration word is `movabs rax,0x6f0061fffc` at
+//! `+0x5d9e7e8`, `+0x5d9ecfe`, `+0x5d9edbb`, `+0x3a9a9ba`, `+0x3a9aed0` and
+//! `+0x3a9af8d`.
+//!
+//! So the refused set was **not** free of waits, and the sentence was wrong about
+//! that. `EVFILT_VNODE` was the one refusal in the whole kqueue surface that was
+//! **both reached and blocking**: runs 219, 220, 221, 222 and 223 each refused it
+//! four times, in two shapes, both of which had room for events. (Runs 215, 216
+//! and 218 refused it **zero** times, with the same binary and no code change -
+//! the run's own start-up order decides, which is the nondeterministic wall the
+//! project brief describes.) The guest's handling of the `EINVAL` was to fall
+//! through rather than retry, so it was not a hang; the cost was a file watcher
+//! that never fired, and `FilePathWatcherKQueue::Watch` returning **false**.
+//!
+//! **It is answered now**, on a real `inotify` watch - see
+//! [`super::mach::kevent64`]'s module note for the note-to-event mapping, the
+//! measured `inotify` rows behind it, and which three notes are refused by name.
+//!
+//! ## `EV_RECEIPT`: a synthetic receipt satisfies the guest, and that is settled
+//!
+//! Every `EVFILT_VNODE` registration the framework makes carries `EV_RECEIPT`, and
+//! `FilePathWatcherKQueue::AreKeventValuesValid` is the function that judges it.
+//! **The question was whether a receipt this runtime synthesizes would be
+//! accepted. It is, and the answer is two instructions, measured rather than
+//! inferred** - `AreKeventValuesValid` is not inlined, it is a real function at
+//! `Chromium Framework+0x5d9e4c0`, called from `OnKQueueReadable` at `+0x5d9f097`:
+//!
+//! ```text
+//!  5d9e4c0  test  edx,edx                      ; count < 0  -> false
+//!  5d9e505  test  BYTE PTR [rbx+r15*1+0xb],0x40 ; flags & EV_ERROR
+//!  5d9e50b  je   0x5d9e4f2
+//!  5d9e510  cmp  QWORD PTR [r15+0x10],0x0      ; data != 0 ?
+//!  5d9e515  je   0x5d9e4f2                    ; data == 0 -> STILL VALID
+//! ```
+//!
+//! The whole of its validity test is **bit 14 of `flags` and whether `data` is
+//! zero**. There is no check on `fflags`, no check on `udata`, and no check on
+//! where the event came from - so a receipt whose `data` is `0` is accepted and a
+//! receipt whose `data` is an `errno` is rejected, whatever produced it. The
+//! compiler folded `flags & EV_ERROR` into the *high byte* of `flags` (`+0x0b`),
+//! which is why a 16-bit `test ...,0x4000` scan of `__TEXT,__text` finds nothing
+//! and reports a false zero.
+//!
+//! Two independent facts settle it, and both are measurements:
+//!
+//! * **The positive control.** A byte scan for that 8-bit form, at every byte
+//!   offset within `__TEXT,__text`'s declared size, finds **exactly two** hits in
+//!   214 MB: `0x5d9e506` and its `__FILE__`-bracketed twin at `0x3a9a6d6`, with
+//!   the same instruction sequence and the same relative branch displacements.
+//!   So the scan is not blind, and there is no third copy of this check.
+//! * **The behaviour is already live.** Before any of this, a refused
+//!   `EVFILT_VNODE` produced a receipt with `data == EINVAL`, the guest rejected
+//!   it at `+0x5d9f09c`, `Watch()` returned `false`, and the run carried on. So
+//!   the receipt path was reached, read and acted on on every one of those four
+//!   refusals per run. The only thing that changes is the one bit: `data` becomes
+//!   `0`, and `Watch()` returns `true`.
+//!
+//! A receipt is not fabricated: it is the caller's own change echoed back with
+//! `flags = EV_ERROR` and `data` set to the outcome of a change that was
+//! actually carried out. `data == 0` means "this change succeeded", and that is
+//! a true statement.
+//!
+//! ## Which filters the guest passes, and which of them it waits on
+//!
+//! The whole-bundle census is in [`super::mach::kevent64`]'s module note, because
+//! that is where it was measured. What belongs here is the part about *this*
+//! file's twelve `_kevent` call sites:
+//!
+//! | call site | change list | wait? | function |
+//! |---|---|:--:|---|
+//! | `+0x3a9ab38` | `EVFILT_VNODE\|EV_ADD\|EV_CLEAR\|EV_RECEIPT`, `fflags 0x6f` | **yes** | `content::...::FilePathWatcherKQueue` |
+//! | `+0x3a9b73e` | the same | **yes** | the same, a second path |
+//! | `+0x3a9b22d` | none | collect, zero timeout | the same, `OnKQueueReadable` |
+//! | `+0x5d9e968` | the same `EVFILT_VNODE` word | **yes** | `base::FilePathWatcherKQueue` |
+//! | `+0x5d9f56e` | the same | **yes** | the same, a second path |
+//! | `+0x5d9f05d` | none | collect, zero timeout | the same, `OnKQueueReadable` |
+//! | `+0x5afcf72` | `EVFILT_PROC\|EV_ADD`, `NOTE_EXIT` | no | `RelauncherSynchronizeWithParent` |
+//! | `+0x5afd036` | none | **yes** | the relauncher waiting on its own queue |
+//! | `+0x5d8cb53` | `EVFILT_PROC\|EV_ADD`, `NOTE_EXIT` | no | `base::WaitForSingleNonChildProcess` |
+//! | `+0x5d8ce63` | none | **yes**, with a deadline | `Process::WaitForExitWithTimeout` |
+//! | `+0x5daa1e2` | `EVFILT_PROC\|EV_ADD`, `NOTE_EXIT` | no | `base::WaitForChildToDie` |
+//! | `+0x5daa304` | none | **yes**, with a deadline | the same function's wait |
+//!
+//! ## `EVFILT_READ` on a descriptor, and `EVFILT_READ` on a Mach port
+//!
+//! These are different questions and the difference is worth stating, because
+//! conflating them is what made the `kevent64` refusals look alarming.
+//!
+//! **This file answers the descriptor form**, on a real descriptor, with
+//! `poll`/`epoll` underneath: readiness, a byte count from `FIONREAD`, `EV_EOF`
+//! on a hangup, and `EV_ONESHOT`/`EV_DISPATCH` honoured. Nothing in the shipped
+//! guest reaches it - there is **no `EVFILT_READ|EV_ADD` anywhere in the bundle
+//! that reaches a `kevent` call** - and that is worth knowing precisely, because
+//! it means the readiness machinery here is currently unexercised rather than
+//! wrong.
+//!
+//! **The other form is a different call and a different refusal.** It arrives
+//! through `_kevent64`, at `+0x5da4eec` for a deregistration and at `+0x5da7c0d`
+//! for a one-shot registration, and it is refused there. **The "26 `EVFILT_READ`
+//! refusals" were 26 *runs*, not 26 occurrences**: the site is `+0x5da7c0d` and
+//! `nevents == 0` there (`xor %ecx,%ecx; xor %r8d,%r8d` at `+0x5da7c05`), so it
+//! **cannot block**. And the `ident` at that site is `0x23` - an **open
+//! descriptor**, not a Mach port - which is what
+//! [`super::mach::kevent64::describe_ident`] is for; a message that says "a Mach
+//! port is not a descriptor" about an open descriptor asserts the opposite of
+//! the truth.
+//!
+//! ## The runtime census, and what it says
+//!
+//! `ROSETTA3_TRACE_KEVENT=1` (off by default) prints one line per distinct
+//! **shape** of `kevent` call a run reaches, with a running count, and says on
+//! every line whether the call had room for an event - which is what decides
+//! whether anything refused in it could have hung a thread. Over runs 215, 216
+//! and 218:
+//!
+//! | shape | count | verdict |
+//! |---|--:|---|
+//! | `EVFILT_VNODE\|EV_ADD\|EV_CLEAR\|EV_RECEIPT`, `fflags 0x6f`, 1 change, 1 event slot | 1 | **can block**, and was refused |
+//! | the same, 3 changes, 3 event slots | 2 | **can block**, and was refused |
+//! | no change list, 0 event slots | 32 | collection, cannot block |
+//! | no change list, 4 event slots, `KEVENT_FLAG_IMMEDIATE` | 16 | a **wait**, on registrations that *were* accepted |
+//!
+//! **No `EVFILT_READ`, `EVFILT_WRITE` or `EVFILT_USER` shape appears at all.** So
+//! the readiness path in this file - the `poll`/`epoll` reconstruction, the
+//! `FIONREAD` byte count, `EV_ONESHOT` and `EV_DISPATCH` - is correct but
+//! unexercised by the shipped guest's `kevent` path. That is worth knowing
+//! precisely: it means the code here is not what is failing, and it also means
+//! its correctness rests on this crate's tests rather than on the milestone.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::ffi::{c_int, c_void};
@@ -90,12 +231,19 @@ const EVFILT_USER: i16 = -10;
 /// here: the number is `-5` in `<sys/event.h>` and it exists exactly once in
 /// this crate, next to the XNU citations for what the filter means.
 const EVFILT_PROC: i16 = super::mach::kevent64::EVFILT_PROC;
+/// `EVFILT_VNODE`, taken from [`super::mach::kevent64`] rather than written
+/// here, for the same reason `EVFILT_PROC` is: the number is `-4` in
+/// `<sys/event.h>` and it exists exactly once in this crate, next to the XNU
+/// citations for what the filter means and the `inotify` measurement for what
+/// this host can say about each of its notes.
+const EVFILT_VNODE: i16 = super::mach::kevent64::EVFILT_VNODE;
 
 const EV_ADD: u16 = 0x0001;
 const EV_DELETE: u16 = 0x0002;
 const EV_ENABLE: u16 = 0x0004;
 const EV_DISABLE: u16 = 0x0008;
 const EV_ONESHOT: u16 = 0x0010;
+const EV_CLEAR: u16 = 0x0020;
 const EV_RECEIPT: u16 = 0x0040;
 const EV_DISPATCH: u16 = 0x0080;
 const EV_ERROR: u16 = 0x4000;
@@ -128,6 +276,15 @@ struct Registration {
     /// **pid**. Nothing here may treat the two as one number space - see
     /// [`Registration::watches`].
     proc: Option<Arc<super::mach::kevent64::Proc>>,
+    /// `Some` for an `EVFILT_VNODE` registration: the `inotify` watch on the
+    /// object `ident` names, and the notes it has accumulated.
+    ///
+    /// **As with `proc` above, the thing that becomes readable is not `ident`.**
+    /// An `EVFILT_VNODE`'s `ident` *is* a descriptor, but the descriptor cannot
+    /// be waited on; what becomes readable is the kqueue's own `inotify`
+    /// instance, and that is what [`Vnode::inotify_fd`] reports. See
+    /// [`Registration::watches`].
+    vnode: Option<Arc<super::mach::kevent64::Vnode>>,
 }
 
 impl Registration {
@@ -164,6 +321,50 @@ impl Registration {
         }
     }
 
+    /// The event to hand back for an `EVFILT_VNODE` registration, if one is
+    /// waiting.
+    ///
+    /// **`None` when nothing has fired, and that is not the same as an event with
+    /// an empty `fflags`.** A `kevent` that reported an event with no note in it
+    /// would be a readiness the caller cannot act on and cannot distinguish from
+    /// a real one, and `FilePathWatcherKQueue::OnKQueueReadable` is a loop over
+    /// whatever `count` says it got - so the count is the only thing keeping a
+    /// spurious entry out of it.
+    ///
+    /// **`fflags` is the note word that was actually observed**, not the caller's
+    /// interest: the `&self.fflags` in [`Registration::fired`] is right for a
+    /// readiness filter, whose `fflags` is a low-water mark rather than a set of
+    /// results, and it would be wrong here, where a delivered `fflags` is the set
+    /// of notes that fired. XNU's shape is the same - `knote_fill_kevent` copies
+    /// `kn_fflags` while `kn_sfflags` is what stays behind - and
+    /// `filt_vnode_common` only ORs a hint in under `if (kn->kn_sfflags & hint)`,
+    /// so a delivered bit is always one the caller asked for.
+    ///
+    /// **`data` is 0**, because that is what `filt_vnprocess` passes:
+    /// `knote_fill_kevent(kn, kev, data)` with the `int64_t data = 0` that
+    /// `filt_vnode_common` declares, and that only its `EVFILT_READ` and
+    /// `EVFILT_WRITE` arms ever change. And `ident` and `udata` are the caller's
+    /// own, which the framework matches on - both `AreKeventValuesValid` and
+    /// `OnKQueueReadable` compare the delivered `ident` against the one it
+    /// registered.
+    fn vnode_fired(&self) -> Option<Kevent> {
+        let watch = self.vnode.as_ref()?;
+        let clear = self.flags & EV_CLEAR != 0;
+        let fflags = watch.take_pending(clear);
+        if fflags == 0 {
+            return None;
+        }
+        super::mach::kevent64::announce_vnode_delivered(watch, fflags);
+        Some(Kevent {
+            ident: watch.ident(),
+            filter: EVFILT_VNODE,
+            flags: watch.delivered_flags(fflags),
+            fflags,
+            data: 0,
+            udata: watch.udata(),
+        })
+    }
+
     /// Is this registration waiting on the descriptor `fd`?
     ///
     /// **A pid is not a descriptor, and this is where that is enforced.** Every
@@ -178,6 +379,18 @@ impl Registration {
     fn watches(&self, fd: c_int) -> bool {
         match self.filter {
             EVFILT_PROC => self.proc.as_ref().is_some_and(|proc| proc.raw_fd() == fd),
+            // **The `inotify` instance, never the `ident`.** An `EVFILT_VNODE`'s
+            // `ident` *is* a descriptor - the one the caller opened with
+            // `O_EVTONLY` - but it cannot be waited on: `inotify_add_watch` takes
+            // a pathname rather than a descriptor (measured: it answers `EFAULT`
+            // for an `O_PATH` descriptor, because the second argument is a
+            // `const char *`), so the watch is on a path reached from
+            // `/proc/self/fd`. What becomes readable is the queue's own `inotify`.
+            //
+            // Matching on `ident` instead would put an `O_PATH` descriptor into
+            // an `epoll` set, which this host answers `EPERM`, and would report
+            // the readiness of a descriptor nobody is waiting on.
+            EVFILT_VNODE => self.vnode.as_ref().is_some_and(|watch| watch.inotify_fd() == fd),
             _ => self.ident == fd as usize,
         }
     }
@@ -190,6 +403,16 @@ struct Queue<B> {
     /// delivered is one event, not two.
     triggered: VecDeque<usize>,
     triggered_set: HashSet<usize>,
+    /// This queue's own `inotify` instance, created by the first
+    /// `EVFILT_VNODE` registration on it and released with the last one. It is
+    /// never shared with another queue, and that is a decision with a reason:
+    /// see [`apply_vnode`].
+    ///
+    /// **It is the single authority for which instance this queue uses.** Every
+    /// registration reaches the same `Arc` through its own [`Vnode`], so there is
+    /// one place that can be wrong about it, and [`kevent`] drains this one - the
+    /// instance whose events the registrations on this queue are waiting for.
+    inotify: Option<Arc<super::mach::kevent64::Inotify>>,
     backend: Arc<B>,
 }
 
@@ -199,6 +422,7 @@ impl<B> Queue<B> {
             registrations: HashMap::new(),
             triggered: VecDeque::new(),
             triggered_set: HashSet::new(),
+            inotify: None,
             backend: Arc::new(backend),
         }
     }
@@ -533,15 +757,26 @@ fn drain_fd(queue: c_int) {
 /// The number is **Darwin's**: it reaches the guest as an `EV_ERROR` event's
 /// `data`, which is a value rather than the `errno` slot, so nothing later
 /// translates it.
-fn apply<B: ReadinessBackend>(state: &mut Queue<B>, change: &Kevent) -> Result<(), c_int> {
-    // `EVFILT_PROC` goes out to `apply_proc` before the filter match below, and
-    // it is the only filter that is not a descriptor: its `ident` is a pid and
-    // the thing to wait on is a `pidfd` opened for it. See the module note.
+fn apply<B: ReadinessBackend>(
+    state: &mut Queue<B>,
+    queue: c_int,
+    change: &Kevent,
+) -> Result<(), c_int> {
+    // Two filters go out to their own `apply_*` before the `matches!` below, and
+    // for the same reason each time: what becomes *readable* for them is not
+    // their `ident`. `EVFILT_PROC`'s `ident` is a pid and the thing waited on is
+    // a `pidfd`; `EVFILT_VNODE`'s `ident` is a descriptor and the thing waited on
+    // is the queue's own `inotify` instance, because `inotify_add_watch` takes a
+    // pathname rather than a descriptor. Both are `pub` in
+    // [`super::mach::kevent64`], where the XNU citations are.
     if change.filter == EVFILT_PROC {
         return apply_proc(state, change);
     }
+    if change.filter == EVFILT_VNODE {
+        return apply_vnode(state, queue, change);
+    }
     if !matches!(change.filter, EVFILT_READ | EVFILT_WRITE | EVFILT_USER) {
-        return Err(refused_filter(change.filter, change.ident));
+        return Err(refused_filter(change));
     }
     let key = (change.ident, change.filter);
 
@@ -583,6 +818,7 @@ fn apply<B: ReadinessBackend>(state: &mut Queue<B>, change: &Kevent) -> Result<(
                 udata: change.udata,
                 enabled: change.flags & EV_DISABLE == 0,
                 proc: None,
+                vnode: None,
             },
         );
     } else {
@@ -717,11 +953,152 @@ fn apply_proc<B: ReadinessBackend>(state: &mut Queue<B>, change: &Kevent) -> Res
                     udata: change.udata,
                     enabled,
                     proc: Some(Arc::new(proc)),
+                    vnode: None,
                 },
             );
         }
     }
     sync_interest(state, &registrations, EVFILT_PROC, ident)?;
+    state.registrations = registrations;
+    Ok(())
+}
+
+/// Apply one `EVFILT_VNODE` change.
+///
+/// **The decision is [`super::mach::kevent64::vnode_change`]'s**, which is where
+/// the XNU citations for the filter, the `NOTE_` values and the reasons three of
+/// them cannot be reported on this host live; this carries the decision out
+/// against this queue's own table and opens the `inotify` watch the registration
+/// then holds. The transaction is the one [`apply`] and [`apply_proc`] use, and
+/// for the same stated reason: a refused change leaves the queue exactly as it
+/// was, because `registrations` is a clone that is only committed at the end.
+///
+/// **One `inotify` instance per kqueue, created here and released here.** That is
+/// what makes a change to this queue's watched file wake *this* queue and no
+/// other. A process-wide instance would put this queue's descriptor into a
+/// readiness set because of somebody else's watch, which is a readiness report
+/// about a queue that had no event - the shape of thing this module refuses.
+/// `state.inotify` is the only place that knows which instance this queue uses;
+/// each registration reaches the same `Arc` through its own [`Vnode`], so
+/// [`kevent`] drains the one instance whose events this queue is waiting for and
+/// an `inotify` cannot outlive its last registration.
+fn apply_vnode<B: ReadinessBackend>(
+    state: &mut Queue<B>,
+    queue: c_int,
+    change: &Kevent,
+) -> Result<(), c_int> {
+    use super::mach::kevent64::{
+        Inotify, Vnode, VnodeChange, announce_missing_vnode, announce_vnode_note_dropped,
+        vnode_change,
+    };
+
+    let ident = change.ident;
+    let key = (ident, EVFILT_VNODE);
+    let mut registrations = state.registrations.clone();
+    // The queue's own question, asked the same way `apply` and `apply_proc` ask
+    // it: a change with no `EV_ADD` for a registration that is not there is
+    // `ENOENT`, which is what `kevent_register` answers when
+    // `kq_find_knote_and_kq_lock` finds nothing. Without this a change carrying
+    // only `EV_RECEIPT` would be read as a request to watch a path, and the
+    // caller would get a *success* receipt for a watch that was never made -
+    // which is how `EV_RECEIPT` becomes a lie.
+    if change.flags & EV_ADD == 0 && !registrations.contains_key(&key) {
+        announce_missing_vnode(ident as u64);
+        return Err(crate::errno::from_host(libc::ENOENT));
+    }
+    match vnode_change(ident as u64, change.flags, change.fflags, change.udata as u64) {
+        VnodeChange::Refused(errno) => return Err(errno),
+        VnodeChange::Delete => {
+            // Dropping the queue's `Arc<Vnode>` *is* the `inotify_rm_watch`, and
+            // it is the only one: a `drain` in flight on another thread holds its
+            // own `Arc`, so the watch cannot be removed from under it.
+            if registrations.remove(&key).is_none() {
+                announce_missing_vnode(ident as u64);
+                return Err(crate::errno::from_host(libc::ENOENT));
+            }
+        }
+        VnodeChange::Armed { enabled } => {
+            // Enabling and disabling take the registration out of the wait and
+            // put it back, and the watch is untouched by either: the object did
+            // not stop being watched while the knote was disabled, and the watch
+            // is what the knote *is*. Notes that arrived while it was disabled
+            // are kept, because XNU keeps `kn_fflags` across a disable too -
+            // `filt_vnodetouch` only reassigns `kn_sfflags`.
+            let Some(existing) = registrations.get(&key) else {
+                announce_missing_vnode(ident as u64);
+                return Err(crate::errno::from_host(libc::ENOENT));
+            };
+            let vnode = existing
+                .vnode
+                .clone()
+                .expect("an EVFILT_VNODE registration holds its inotify watch");
+            registrations.insert(
+                key,
+                Registration {
+                    enabled,
+                    vnode: Some(vnode),
+                    ..existing.clone()
+                },
+            );
+        }
+        VnodeChange::Watch {
+            mask,
+            dropped,
+            enabled,
+            udata,
+        } => {
+            // **Every note dropped from the mask is named before the registration
+            // is made**, so the log says what the watcher is *not* being told
+            // about even if the run never gets as far as a delivery.
+            if dropped != 0 {
+                announce_vnode_note_dropped(ident as u64, change.fflags, dropped);
+            }
+            // A re-`EV_ADD` on the same key replaces the registration, which means
+            // the old watch goes: "there may be only be one unique kevent per
+            // kqueue". Removing it *before* opening the new one is what stops a
+            // re-`EV_ADD` of a narrowed mask from leaving the old, wider interest
+            // behind it.
+            registrations.remove(&key);
+            let inotify = match state.inotify.clone() {
+                Some(inotify) => inotify,
+                None => {
+                    let created = Arc::new(Inotify::new()?);
+                    state.inotify = Some(Arc::clone(&created));
+                    created
+                }
+            };
+            let vnode = Vnode::watch(queue, inotify, ident as u64, mask, udata)?;
+            super::mach::kevent64::announce_vnode_registered(&vnode);
+            registrations.insert(
+                key,
+                Registration {
+                    ident,
+                    filter: EVFILT_VNODE,
+                    flags: change.flags,
+                    // The *narrowed* interest, not the caller's word: this is the
+                    // `kn_sfflags` the knote is given, and it is what
+                    // `filt_vnode_common` intersects an arriving hint with. So a
+                    // re-read of the registration reports what is actually
+                    // watched rather than what was asked for.
+                    fflags: mask,
+                    udata: change.udata,
+                    enabled,
+                    proc: None,
+                    vnode: Some(vnode),
+                },
+            );
+        }
+    }
+    // The instance is released with the last vnode registration on this queue, so
+    // a kqueue that watched something and then stopped does not hold a descriptor
+    // for the rest of the process.
+    if !registrations
+        .values()
+        .any(|registration| registration.filter == EVFILT_VNODE)
+    {
+        state.inotify = None;
+    }
+    sync_interest(state, &registrations, EVFILT_VNODE, ident)?;
     state.registrations = registrations;
     Ok(())
 }
@@ -733,7 +1110,10 @@ fn interest_for(registrations: &HashMap<(usize, i16), Registration>, fd: c_int) 
         .fold(0, |interest, registration| {
             interest
                 | match registration.filter {
-                    EVFILT_READ | EVFILT_PROC => libc::POLLIN,
+                    // A vnode change is a thing that *happened*, so the `inotify`
+                    // instance is read, not written - and `EPOLLOUT` on it would
+                    // be a wait for a queue that can never be written to.
+                    EVFILT_READ | EVFILT_PROC | EVFILT_VNODE => libc::POLLIN,
                     EVFILT_WRITE => libc::POLLOUT,
                     _ => 0,
                 }
@@ -833,45 +1213,111 @@ fn filter_name(filter: i16) -> &'static str {
     }
 }
 
-/// A filter this module will not answer, **named**.
+/// A filter this module will not answer, **named, per filter, and counted**.
 ///
 /// This used to be a bare `EINVAL` out of a `matches!`, and that is the worst
 /// shape a refusal can take in this tree: the number reached the guest as an
 /// `EV_ERROR` event's `data` with nothing anywhere saying *which capability* was
 /// missing, so the log could not distinguish "the guest asked for something we
-/// do not have" from "the guest is wrong". So the capability is said here, once
-/// per distinct filter, with what is answered in its place and which of the
-/// framework's callers would have needed it.
+/// do not have" from "the guest is wrong".
 ///
-/// The census at the end is the point of the function: **of every filter this
-/// file refuses, `EVFILT_PROC` was the only one that any of the framework's
-/// `kevent` callers actually waited on** - two of them, at
-/// `Chromium Framework+0x5afcf35` (`RelauncherSynchronizeWithParent`) and
-/// `+0x5d8cb10` (`base::WaitForSingleNonChildProcess`) - and it is now answered
-/// instead, on a real `pidfd`. The rest are refused by name and cost nothing,
-/// because no caller blocks on them.
-fn refused_filter(filter: i16, ident: usize) -> c_int {
-    use std::sync::Once;
-    static SAID: Once = Once::new();
-    SAID.call_once(|| {
+/// Two defects in the version that replaced it are fixed here.
+///
+/// **It had one `Once` for the whole refused set**, so a run that refused
+/// `EVFILT_VNODE` four times and then `EVFILT_AIO` once named only the first of
+/// them - and it carried no count, so "this happened" could never become "this
+/// happened four times". The count is per filter, and the first eight of each
+/// print one at a time (a small exact number is worth having) and after that
+/// every thousandth, so a run that refuses in a loop cannot turn the log into the
+/// wall.
+///
+/// **It also asserted the opposite of the truth about the `ident`.** It read
+/// `EVFILT_VNODE` refusals as refusing a *Mach port*, when the `ident` those
+/// registrations carry is `0x23` - an **open descriptor**, the one
+/// `FilePathWatcherKQueue` opened with `O_EVTONLY`. A Mach port and an open
+/// descriptor are different facts about the same number, and the difference is
+/// the difference between a refusal that costs nothing and a missing capability,
+/// so the message now says which one this is, by looking rather than assuming -
+/// see [`super::mach::kevent64::describe_ident`], which is the one derivation of
+/// that classification in the crate.
+///
+/// And the census that used to close this function is **corrected**: it is *not*
+/// true that `EVFILT_PROC` was the only refused filter anything waited on.
+/// `EVFILT_VNODE` is registered *and* waited on; see this file's module note for
+/// the four call sites and the counts.
+fn refused_filter(change: &Kevent) -> c_int {
+    use std::sync::OnceLock;
+    static COUNTS: OnceLock<Mutex<HashMap<i16, u32>>> = OnceLock::new();
+    let nth = {
+        let mut counts = COUNTS
+            .get_or_init(Default::default)
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let slot = counts.entry(change.filter).or_insert(0);
+        *slot += 1;
+        *slot
+    };
+    if nth <= 8 || nth % 1000 == 0 {
         eprintln!(
-            "rosetta3: kevent refused {} ({filter}) on ident {ident:#x}: this kqueue answers \
-             EVFILT_READ (-1) and EVFILT_WRITE (-2) as poll readiness on a real descriptor, \
-             EVFILT_USER (-10) as a self-triggered event, and EVFILT_PROC (-5) as \"has this process \
-             exited\" on a real pidfd, which is the one the framework's own kevent callers wait on \
-             (RelauncherSynchronizeWithParent and base::WaitForSingleNonChildProcess). It cannot \
-             answer EVFILT_VNODE (-4) or EVFILT_FS (-9), which name a vnode and a mount rather than \
-             a descriptor; EVFILT_AIO (-3), which names an I/O completion this runtime has no queue \
-             for; EVFILT_SIGNAL (-6), which names a signal delivery; EVFILT_VM (-12), which names a \
-             vmspace; EVFILT_EXCEPT (-15), which names an exception port; EVFILT_TIMER (-7) and \
-             EVFILT_MACHPORT (-8), which kevent64 does answer for its own caller; or \
-             EVFILT_DEVICE (-11), EVFILT_WORKLOOP (-13) and EVFILT_USER_EVENT (-14), which name \
-             subsystems this runtime does not model. A filter refused here is refused by name, \
-             because a bare EINVAL says nothing about which capability is missing",
-            filter_name(filter)
+            "rosetta3: kevent refused {} ({}) with {} on ident {:#x}, which is {} \
+             [refusal {nth} of this filter in this process]. This kevent answers EVFILT_READ (-1) \
+             and EVFILT_WRITE (-2) as poll readiness on a real descriptor, EVFILT_USER (-10) as a \
+             self-triggered event, EVFILT_PROC (-5) as \"has this process exited\" on a real \
+             pidfd, and EVFILT_VNODE (-4) as a note set on a real inotify watch; every other \
+             filter is refused here by name. EVFILT_FS (-9) names a mount, EVFILT_AIO (-3) an I/O \
+             completion, EVFILT_SIGNAL (-6) a signal delivery, EVFILT_VM (-12) a vmspace and \
+             EVFILT_EXCEPT (-15) an exception port - none of which this runtime has anything to \
+             attach to; EVFILT_TIMER (-7) and EVFILT_MACHPORT (-8) are answered by kevent64 for \
+             their own callers; EVFILT_DEVICE (-11), EVFILT_WORKLOOP (-13) and EVFILT_USER_EVENT \
+             (-14) name subsystems it does not model. EVFILT_VNODE was in this list and is not: \
+             the notes it cannot produce are refused there by name rather than mapped to the \
+             nearest event. The full census of what the guest passes, and which of it is actually \
+             waited on, is in this file's module note",
+            filter_name(change.filter),
+            change.filter,
+            flags_meaning(change.flags),
+            change.ident,
+            super::mach::kevent64::describe_ident(change.ident as u64),
         );
-    });
+    }
     crate::errno::from_host(libc::EINVAL)
+}
+
+/// The filter's `flags` word, spelled out.
+///
+/// **Only the action bits, because only they say what the change asks for:**
+/// `EV_ADD` starts a registration and `EV_DELETE` ends one, and that difference
+/// is most of whether a refusal can cost a hang. A hex number the reader has to
+/// decode is much the same silence as no name at all, and the two words this
+/// module actually sees from the framework - `0xfffc` and `0xfffb` - differ only
+/// in the bits named here.
+fn flags_meaning(flags: u16) -> String {
+    const NAMES: [(u16, &str); 10] = [
+        (EV_ADD, "EV_ADD"),
+        (EV_DELETE, "EV_DELETE"),
+        (EV_ENABLE, "EV_ENABLE"),
+        (EV_DISABLE, "EV_DISABLE"),
+        (EV_ONESHOT, "EV_ONESHOT"),
+        (EV_CLEAR, "EV_CLEAR"),
+        (EV_RECEIPT, "EV_RECEIPT"),
+        (EV_DISPATCH, "EV_DISPATCH"),
+        (EV_ERROR, "EV_ERROR"),
+        (EV_EOF, "EV_EOF"),
+    ];
+    let mut out = String::new();
+    for (bit, name) in NAMES {
+        if flags & bit != 0 {
+            if !out.is_empty() {
+                out.push('|');
+            }
+            out.push_str(name);
+        }
+    }
+    if out.is_empty() {
+        out.push_str("no action bit");
+    }
+    out.push_str(&format!(" ({flags:#06x})"));
+    out
 }
 
 /// The `poll` timeout in milliseconds, or -1 for "wait forever".
@@ -904,6 +1350,12 @@ fn timeout_ms(timeout: *const libc::timespec) -> Result<c_int, c_int> {
 fn descriptor_of(registration: &Registration) -> Option<c_int> {
     match registration.filter {
         EVFILT_PROC => registration.proc.as_ref().map(|proc| proc.raw_fd()),
+        // The queue's `inotify` instance. Every vnode registration on a queue
+        // folds onto this one descriptor, so the first one registered puts it in
+        // the readiness set and the last one deleted takes it out again - which
+        // is what `sync_interest` and `interest_for` already do for a shared
+        // descriptor, and why no new machinery was needed for it.
+        EVFILT_VNODE => registration.vnode.as_ref().map(|watch| watch.inotify_fd()),
         _ => c_int::try_from(registration.ident).ok(),
     }
 }
@@ -987,10 +1439,15 @@ pub unsafe extern "C" fn kevent(
         // SAFETY: the caller states there are `nchanges` of them.
         n => unsafe { std::slice::from_raw_parts(changes, n as usize) },
     };
+    // The runtime half of the census in this file's module note: one line per
+    // distinct call *shape* a run reaches, with whether the call had room for an
+    // event - which is what decides whether anything refused in it could have
+    // hung a thread. Off unless `ROSETTA3_TRACE_KEVENT` is set.
+    announce_call_shape(changes, nchanges, nevents, timeout);
     {
         let mut state = state.lock().unwrap_or_else(|e| e.into_inner());
         for change in changes {
-            let failure = apply(&mut state, change).err();
+            let failure = apply(&mut state, queue, change).err();
             // `EV_RECEIPT` asks for the *outcome of every change* rather than
             // for readiness, and it asks for it whether or not the change
             // failed - which is how a caller applies a batch and finds out
@@ -1055,6 +1512,34 @@ pub unsafe extern "C" fn kevent(
         state.backend.drain_wake();
     }
 
+    // The `inotify` events are folded into each watch's pending note word
+    // **before** any registration is asked whether it has something to report,
+    // because `poll` reported that this queue's `inotify` is readable and the
+    // only question left is which notes that stands for.
+    //
+    // **This is not behind the trace variable, and it must not be.** A drain
+    // gated on a diagnostic switch is a filter that never fires while the
+    // variable is unset, which is the one outcome that looks like success and is
+    // not: the registration would be accepted, the queue would be armed, the
+    // descriptor would become readable, and no event would ever arrive. The
+    // switch goes on the *reporting*, below, and nowhere else.
+    //
+    // The queue lock is held across it, and that is safe because the order is the
+    // same everywhere: `queue -> inotify -> watch` in `apply_vnode` and
+    // `inotify -> watch` in [`Inotify::drain`], and nothing takes a watch lock
+    // before an `inotify` one, so there is no cycle. The `Arc`s are taken under
+    // the `inotify` lock and used after it has been dropped.
+    let vnode_fired = match state.inotify.clone() {
+        Some(inotify) => inotify.drain(),
+        None => 0,
+    };
+    if vnode_fired != 0 && vnode_trace_wanted() {
+        eprintln!(
+            "rosetta3: kqueue: {vnode_fired} EVFILT_VNODE watch(es) gained a note on kqueue \
+             {queue} - this is the proof that the filter fires, and it is the only one"
+        );
+    }
+
     // The user events first: a program triggers one to be told to stop, and a
     // busy descriptor must not keep that behind it.
     while out.len() < capacity {
@@ -1086,6 +1571,45 @@ pub unsafe extern "C" fn kevent(
         for (key, registration) in firing {
             if out.len() == capacity {
                 break;
+            }
+            // **An `EVFILT_VNODE` is not a `poll` revent and is not derived from
+            // one.** What `entry.revents` reports is that this queue's `inotify`
+            // instance is readable; what the event says is the note word the
+            // matching watch has accumulated, which is a fact about a *different*
+            // object than the descriptor that became readable. So it is asked for
+            // rather than computed, and it is handled before `wanted` because
+            // there is no `wanted` for it: a note is not a readiness condition.
+            //
+            // Note that `entry.revents == 0` is filtered out above, and a
+            // vnode `inotify` is armed `POLLIN`, so an `EPOLLIN` here is the
+            // only reason to get this far.
+            if registration.filter == EVFILT_VNODE {
+                let Some(event) = registration.vnode_fired() else {
+                    // The instance was readable for another watch on this queue,
+                    // or for an event whose note is not in this registration's
+                    // interest. Either way there is no event to report, and
+                    // reporting one with an empty `fflags` would be a readiness
+                    // the caller cannot act on.
+                    continue;
+                };
+                out.push(event);
+                // **`NOTE_REVOKE` is one-shot whether or not the caller asked.**
+                // `filt_vnode_common` sets `EV_EOF | EV_ONESHOT` on it, because
+                // the vnode XNU would have attached the knote to is gone:
+                // `if (NOTE_REVOKE == hint) kn->kn_flags |= (EV_EOF | EV_ONESHOT);`
+                // The delivery is therefore the last one this knote gives, and
+                // leaving it armed would re-report a revoke that has already
+                // happened - which is a busy watcher, and a wrong one.
+                if registration.flags & EV_ONESHOT == 0
+                    && event.fflags & super::mach::kevent64::VNODE_REVOKE == 0
+                {
+                    continue;
+                }
+                let before = interest_for(&state.registrations, entry.fd);
+                state.registrations.remove(&key);
+                let after = interest_for(&state.registrations, entry.fd);
+                let _ = state.backend.update(entry.fd, before, after);
+                continue;
             }
             let wanted = match registration.filter {
                 EVFILT_READ | EVFILT_PROC => libc::POLLIN,
@@ -1156,6 +1680,126 @@ pub unsafe extern "C" fn kevent(
 
 /// `kevent64` and the filters `poll` cannot answer; see the module note.
 pub const REFUSED: &[&str] = &["kevent64", "kevent_qos"];
+
+/// Whether the run asked for the `kevent` census.
+///
+/// Read **once** through a `OnceLock`, because the answer cannot change and this
+/// is on the path of every call. With the variable unset - the default - the
+/// census costs one atomic load and a `return`, and the default output is
+/// unchanged byte for byte.
+fn census_wanted() -> bool {
+    use std::sync::OnceLock;
+    static WANTED: OnceLock<bool> = OnceLock::new();
+    *WANTED.get_or_init(|| std::env::var_os("ROSETTA3_TRACE_KEVENT").is_some())
+}
+
+/// Whether the run asked for the `EVFILT_VNODE` delivery trace.
+///
+/// **Off by default; env-gated on `ROSETTA3_TRACE_EVFILT_VNODE=1`.** Read once
+/// through a [`OnceLock`] for the same reason as [`census_wanted`]: the answer
+/// cannot change, and with the variable unset - the default - the line below
+/// costs one atomic load and the default output is unchanged.
+///
+/// **It gates a line, never the drain.** The gate is on the *reporting*; the
+/// `Inotify::drain` above runs whether or not this is set, because a drain
+/// behind a diagnostic switch is a filter that is accepted, armed, and never
+/// fires - which is the one outcome that looks like success and is not.
+fn vnode_trace_wanted() -> bool {
+    use std::sync::OnceLock;
+    static WANTED: OnceLock<bool> = OnceLock::new();
+    *WANTED.get_or_init(|| std::env::var_os("ROSETTA3_TRACE_EVFILT_VNODE").is_some())
+}
+
+/// The census, keyed by call shape. See [`announce_call_shape`].
+static CENSUS: std::sync::OnceLock<Mutex<HashMap<(i16, u16, u32, bool, bool, bool), u32>>> =
+    std::sync::OnceLock::new();
+
+/// One line per distinct **shape** of `kevent` call, with a running count.
+///
+/// **Off by default; env-gated on `ROSETTA3_TRACE_KEVENT=1`.** It is the runtime
+/// half of the census in this file's module note, and it exists because the
+/// static half cannot answer the one question that decides whether a refusal is
+/// a wall: *did this run reach it at all?* `EVFILT_VNODE` is registered **and**
+/// waited on by two `FilePathWatcherKQueue` classes, and a run that constructs
+/// neither looks identical to one that constructs both - in a disassembly and in
+/// a refusal message alike. The measurement that it is reached *sometimes* and
+/// not others, with the same binary and no code change, is in the module note.
+///
+/// "Shape" is everything that changes what the call asks for: the first change's
+/// filter, flags and `fflags`, whether a change list was submitted at all, and
+/// **whether there was room for an event** - which is what makes the call a
+/// *wait* rather than a registration, and therefore what decides whether
+/// anything refused in it could have hung a thread. **A `nevents == 0` call
+/// cannot block**, and that single fact is the difference between a diagnostic and
+/// a hang, so it is stated on every line.
+///
+/// The count is printed on the first sighting of a shape and at every power of
+/// two after that, so the number converges without a line per call.
+fn announce_call_shape(
+    changes: &[Kevent],
+    nchanges: c_int,
+    nevents: c_int,
+    timeout: *const libc::timespec,
+) {
+    if !census_wanted() {
+        return;
+    }
+    type Key = (i16, u16, u32, bool, bool, bool);
+    let first = changes.first();
+    let key: Key = (
+        first.map_or(0, |change| change.filter),
+        first.map_or(0, |change| change.flags),
+        first.map_or(0, |change| change.fflags),
+        nchanges > 0,
+        nevents > 0,
+        !timeout.is_null(),
+    );
+    let nth = {
+        let mut seen = CENSUS
+            .get_or_init(Default::default)
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let slot = seen.entry(key).or_insert(0);
+        *slot += 1;
+        *slot
+    };
+    // First sighting, then every doubling: 1, 2, 4, 8, ... 16, 32, 64, ...
+    if !nth.is_power_of_two() {
+        return;
+    }
+    let filter = match first {
+        Some(change) => format!(
+            "{} ({}) with {}",
+            filter_name(change.filter),
+            change.filter,
+            flags_meaning(change.flags)
+        ),
+        None => "no change list at all".to_string(),
+    };
+    let verb = if nchanges > 0 && first.is_some_and(|change| change.flags & EV_ADD == 0) {
+        "The change list carries no EV_ADD, so this is a deregistration of something this call \
+         did not register."
+    } else if nchanges > 0 {
+        "The change list carries EV_ADD, so this call does register something."
+    } else {
+        "No change list, so this call can only collect or wait."
+    };
+    eprintln!(
+        "rosetta3: kevent: {nth} call(s) of this shape - {filter}, fflags {:#x}, {nchanges} \
+         change(s), {nevents} event slot(s) so {}, timeout {}. {verb}",
+        first.map_or(0, |change| change.fflags),
+        if nevents > 0 {
+            "this call can block, so anything refused in it is a possible hang"
+        } else {
+            "this call cannot block, so nothing refused in it can hang a thread"
+        },
+        if timeout.is_null() {
+            "NULL, which means wait forever"
+        } else {
+            "given, so it is a bounded wait"
+        },
+    );
+}
 
 exports::exports! {
     functions {
@@ -1927,13 +2571,23 @@ mod tests {
 
     /// A filter this module cannot answer is refused, and `EV_RECEIPT` is how
     /// the caller finds out which change it was.
+    ///
+    /// **This test used to name `EVFILT_VNODE` as its example, and that was a
+    /// false pin.** It asserted, in the name of a passing test, that the one
+    /// refused filter the framework *registers and waits on* could not be
+    /// answered - which was the reason the file watcher was dead, stated as if it
+    /// were a property of the platform. `EVFILT_VNODE` is answered now, on a real
+    /// `inotify` watch, and the tests below are what say so. `EVFILT_FS` is used
+    /// here instead because it is still refused, and it is refused for the reason
+    /// given: it names a *mount*, and a mount is not an object with a pathname
+    /// this host can watch.
     #[test]
     fn an_unsupported_filter_is_refused_by_number() {
         let queue = kqueue();
-        const EVFILT_VNODE: i16 = -4;
+        const EVFILT_FS: i16 = -9;
         let add = Kevent {
             ident: 1,
-            filter: EVFILT_VNODE,
+            filter: EVFILT_FS,
             flags: EV_ADD | EV_RECEIPT,
             ..Kevent::default()
         };
@@ -1992,5 +2646,652 @@ mod tests {
         };
         assert_eq!(n, -1);
         assert_eq!(crate::errno::get(), libc::EBADF);
+    }
+
+    // -----------------------------------------------------------------------
+    // `EVFILT_VNODE`
+    //
+    // Everything below is arranged so that it **fails if the filter is not
+    // implemented**: each one creates a real file or directory, registers it the
+    // way the framework's two `FilePathWatcherKQueue` classes do, changes
+    // something, and asserts the delivered `fflags` and `ident`. With the filter
+    // refused, the registration's receipt carries `EINVAL` and every subsequent
+    // collection returns nothing.
+    // -----------------------------------------------------------------------
+
+    /// The seven public `EVFILT_VNODE` notes, quoted from XNU's `bsd/sys/event.h`
+    /// rather than imported, because the *set* `0x6f` is the thing the framework
+    /// submits and what the narrowing is measured against.
+    const VNOTE_DELETE: u32 = 0x0000_0001;
+    const VNOTE_WRITE: u32 = 0x0000_0002;
+    const VNOTE_EXTEND: u32 = 0x0000_0004;
+    const VNOTE_ATTRIB: u32 = 0x0000_0008;
+    const VNOTE_LINK: u32 = 0x0000_0010;
+    const VNOTE_RENAME: u32 = 0x0000_0020;
+    const VNOTE_REVOKE: u32 = 0x0000_0040;
+
+    /// `movabs rax,0x6f0061fffc` - the top eight bytes, which is what the
+    /// framework's six registrations in the image actually submit.
+    const ALL_SEVEN: u32 =
+        VNOTE_DELETE | VNOTE_WRITE | VNOTE_EXTEND | VNOTE_ATTRIB | VNOTE_LINK | VNOTE_RENAME
+            | VNOTE_REVOKE;
+
+    /// A real directory to run a file-system test in.
+    ///
+    /// `std::env::temp_dir()` and the pid, which is the convention every other
+    /// test in this crate uses, and the pid is there because two suites can be
+    /// running at once on this host. `temp_dir` reads `TMPDIR`, and the run script
+    /// points that at `/home/frolleks/tmp` - which matters, because `/tmp` here
+    /// is a tmpfs backed by RAM.
+    fn scratch(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("r3-kq-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("a scratch directory");
+        dir
+    }
+
+    /// The descriptor the framework's `FilePathWatcherKQueue` registers: what its
+    /// `FileDescriptorForPath` gets from `open(path, O_EVTONLY)`.
+    ///
+    /// **`O_PATH` and not `O_RDONLY`, because `O_PATH` is what this runtime
+    /// answers `O_EVTONLY` with** ([`crate::fcntl`], and the reason it is the
+    /// same capability rather than a stand-in: `read` is `EBADF`, `fstat` and
+    /// `close` work, a missing path is `ENOENT`). A test that opened the file for
+    /// reading instead would be testing a capability the guest never has, and
+    /// would pass on a path that could not have been reached from the guest.
+    fn open_evtonly(path: &std::path::Path) -> c_int {
+        let mut name = path.as_os_str().as_encoded_bytes().to_vec();
+        name.push(0);
+        // `O_PATH | O_NOFOLLOW | O_CLOEXEC` = 0x200000 | 0x20000 | 0x80000.
+        // SAFETY: `name` is NUL-terminated and the pointer is valid for the call.
+        let fd = unsafe {
+            libc::open(
+                name.as_ptr().cast::<libc::c_char>(),
+                0x200000 | 0x20000 | 0x80000,
+            )
+        };
+        assert!(fd >= 0, "open {}: {}", path.display(), crate::errno::get());
+        fd
+    }
+
+    /// Chromium's `EV_SET(&event, fd, EVFILT_VNODE, EV_ADD|EV_CLEAR|EV_RECEIPT,
+    /// <all seven notes>, 0, data)`, word for word. The `udata` is distinctive so
+    /// a delivered event can be traced back to the registration that asked for
+    /// it rather than to a number that happens to match.
+    fn watch_vnode(fd: c_int, fflags: u32, udata: usize) -> Kevent {
+        Kevent {
+            ident: fd as usize,
+            filter: EVFILT_VNODE,
+            flags: EV_ADD | EV_CLEAR | EV_RECEIPT,
+            fflags,
+            data: 0,
+            udata,
+        }
+    }
+
+    /// Register `fd` and answer the receipt.
+    ///
+    /// **The receipt is the whole question**, and it is asserted rather than
+    /// assumed: `FilePathWatcherKQueue::AreKeventValuesValid` is a two-instruction
+    /// test in the guest - `test BYTE PTR [rbx+r15*1+0xb],0x40` then
+    /// `cmp QWORD PTR [r15+0x10],0x0` at `0x5d9e505` and `0x5d9e510`, and its
+    /// `__FILE__`-bracketed twin at `0x3a9a6d5`/`0x3a9a6e0` - so it accepts a
+    /// receipt whose `data` is zero and rejects every other, whatever produced it.
+    /// `data == 0` here is a true statement about a change that was carried out,
+    /// and it is the single bit that makes `Watch()` return true instead of
+    /// false.
+    fn register_vnode(queue: c_int, fd: c_int, fflags: u32, udata: usize) {
+        let add = watch_vnode(fd, fflags, udata);
+        let mut got = [Kevent::default(); 1];
+        // SAFETY: one change and room for the one receipt.
+        let n = unsafe {
+            kevent(
+                queue,
+                &raw const add,
+                1,
+                got.as_mut_ptr(),
+                1,
+                &raw const NO_WAIT,
+            )
+        };
+        assert_eq!(n, 1, "a receipt answers with an event, not a return value");
+        assert_eq!(got[0].flags & EV_ERROR, EV_ERROR, "a receipt is an EV_ERROR");
+        assert_eq!(
+            got[0].data, 0,
+            "the registration was refused with {:?}; the watcher would never fire",
+            crate::errno::from_host(got[0].data as i32)
+        );
+        // The caller's own words are echoed, which is how it tells *which* change
+        // this receipt is about.
+        assert_eq!(got[0].ident, fd as usize);
+        assert_eq!(got[0].filter, EVFILT_VNODE);
+        assert_eq!(got[0].udata, udata);
+    }
+
+    /// Collect with a short timeout, for the assertions whose point is that
+    /// *nothing* arrives.
+    fn collect_briefly(queue: c_int, room: usize) -> Vec<Kevent> {
+        let brief = libc::timespec {
+            tv_sec: 0,
+            tv_nsec: 50_000_000,
+        };
+        let mut got = vec![Kevent::default(); room];
+        // SAFETY: no changes, `room` slots, and a 50ms timeout.
+        let n = unsafe {
+            kevent(
+                queue,
+                std::ptr::null(),
+                0,
+                got.as_mut_ptr(),
+                room as c_int,
+                &raw const brief,
+            )
+        };
+        assert!(n >= 0, "the wait failed: {}", crate::errno::get());
+        got.truncate(n as usize);
+        got
+    }
+
+    /// Every event a watcher collected, with the `fflags` words ORed together -
+    /// and the assertion that no *unreportable* note ever appears in one.
+    ///
+    /// **The subset assertion is the one that makes this filter honest.** A
+    /// change list is a filter, not a demand: `0x6f` asks for seven notes and
+    /// this host can report five, so a delivered `fflags` carrying `NOTE_EXTEND`
+    /// or `NOTE_LINK` would be a claim that something was observed when it was
+    /// not. The measurement that dropping them costs this guest nothing is in
+    /// [`super::mach::kevent64::VNODE_DROPPED_BY_THE_GUEST`]; the measurement
+    /// that they are never *asked for* is these tests.
+    fn notes_of(events: &[Kevent], room: usize) -> u32 {
+        assert!(
+            events.len() <= room,
+            "a zero-timeout collection cannot report more than its room"
+        );
+        let mut word = 0;
+        for event in events {
+            assert_eq!(event.filter, EVFILT_VNODE);
+            assert_eq!(
+                event.fflags & (VNOTE_EXTEND | VNOTE_LINK),
+                0,
+                "NOTE_EXTEND and NOTE_LINK are refused by name, so they must never appear in a \
+                 delivered fflags - a note this host cannot observe must never be reported"
+            );
+            word |= event.fflags;
+        }
+        word
+    }
+
+    /// The case the client needs: a watched file is written, and the write is
+    /// reported as `NOTE_WRITE` on the caller's own `ident`.
+    ///
+    /// **This is the test that fails if the filter is refused.** With `EVFILT_VNODE`
+    /// refused, `register_vnode`'s receipt carries `EINVAL` and this panics there;
+    /// even if that were papered over, the collection below would find nothing.
+    #[test]
+    fn a_watched_file_that_is_written_reports_note_write_on_its_own_ident() {
+        let dir = scratch("kq-vnode-write");
+        let file = dir.join("watched");
+        std::fs::write(&file, b"before").unwrap();
+        let fd = open_evtonly(&file);
+        let queue = kqueue();
+        register_vnode(queue, fd, ALL_SEVEN, 0x5150);
+
+        // Append, so the change is a `write(2)` and nothing else: a truncation
+        // would also be a `VNOP_SETATTR`, and the two are not being told apart
+        // here.
+        {
+            use std::io::Write;
+            let mut handle = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&file)
+                .unwrap();
+            handle.write_all(b"after").unwrap();
+        }
+
+        let got = collect(queue, 4);
+        let notes = notes_of(&got, 4);
+        assert!(
+            notes & VNOTE_WRITE != 0,
+            "a write to a watched file is NOTE_WRITE ({notes:#x}), and nothing else was reported"
+        );
+        // The delivered `ident` is the descriptor the caller registered, which is
+        // what `OnKQueueReadable` matches against: an event carrying anything
+        // else is an event about an object nobody named.
+        assert_eq!(got[0].ident, fd as usize);
+        assert_eq!(got[0].udata, 0x5150);
+        assert_eq!(
+            got[0].data, 0,
+            "filt_vnprocess delivers data = 0 for every note it can raise"
+        );
+
+        // SAFETY: this test's own two descriptors.
+        unsafe { libc::close(fd) };
+        unsafe { libc::close(queue) };
+    }
+
+    /// A rename is `NOTE_RENAME` and a delete is `NOTE_DELETE` - **not each
+    /// other's opposite number**, which is the wrong answer a file watcher cannot
+    /// detect.
+    #[test]
+    fn a_rename_is_note_rename_and_a_delete_is_note_delete_and_not_the_reverse() {
+        let dir = scratch("kq-vnode-rename-delete");
+        let file = dir.join("watched");
+        let moved = dir.join("moved");
+        std::fs::write(&file, b"x").unwrap();
+        let fd = open_evtonly(&file);
+        let queue = kqueue();
+        register_vnode(queue, fd, ALL_SEVEN, 0xDE1E);
+
+        std::fs::rename(&file, &moved).unwrap();
+        let renamed = collect(queue, 4);
+        let notes = notes_of(&renamed, 4);
+        assert!(
+            notes & VNOTE_RENAME != 0,
+            "a rename of a watched file is NOTE_RENAME ({notes:#x})"
+        );
+        assert_eq!(
+            notes & VNOTE_DELETE,
+            0,
+            "a rename is not a delete: reporting NOTE_DELETE for a rename would close the \
+             descriptor the framework is still using, and the guest cannot tell the two apart"
+        );
+
+        std::fs::remove_file(&moved).unwrap();
+        let deleted = collect(queue, 4);
+        let notes = notes_of(&deleted, 4);
+        assert!(
+            notes & VNOTE_DELETE != 0,
+            "an unlink of a watched file is NOTE_DELETE ({notes:#x})"
+        );
+        assert_eq!(
+            notes & VNOTE_RENAME,
+            0,
+            "a delete is not a rename"
+        );
+
+        // SAFETY: this test's own two descriptors.
+        unsafe { libc::close(fd) };
+        unsafe { libc::close(queue) };
+    }
+
+    /// A delete is reported **once**.
+    ///
+    /// Measured, and this is why it has to be once: an `unlink` of a watched file
+    /// with its descriptor still open delivers `IN_ATTRIB` immediately and
+    /// `IN_DELETE_SELF` when the last reference goes - and
+    /// `HandleDeleteOrMoveChange` closes the descriptor as soon as it has seen the
+    /// first, so on this guest the second event is *guaranteed* to arrive.
+    /// XNU posts `NOTE_DELETE` once, from `VNOP_REMOVE`.
+    #[test]
+    fn a_delete_is_reported_once_and_not_again() {
+        let dir = scratch("kq-vnode-delete-once");
+        let file = dir.join("watched");
+        std::fs::write(&file, b"x").unwrap();
+        let fd = open_evtonly(&file);
+        let queue = kqueue();
+        register_vnode(queue, fd, ALL_SEVEN, 0x0D0E);
+
+        std::fs::remove_file(&file).unwrap();
+        let first = collect(queue, 4);
+        assert!(
+            notes_of(&first, 4) & VNOTE_DELETE != 0,
+            "the unlink itself is NOTE_DELETE"
+        );
+        assert!(
+            collect_briefly(queue, 4).is_empty(),
+            "the fact was already reported; saying it again is a busy watcher"
+        );
+
+        // SAFETY: this test's own two descriptors.
+        unsafe { libc::close(fd) };
+        unsafe { libc::close(queue) };
+    }
+
+    /// A `chmod` is `NOTE_ATTRIB` - the one of `IN_ATTRIB`'s three causes that
+    /// does have a note of its own.
+    #[test]
+    fn a_chmod_is_note_attrib() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = scratch("kq-vnode-attrib");
+        let file = dir.join("watched");
+        std::fs::write(&file, b"x").unwrap();
+        let fd = open_evtonly(&file);
+        let queue = kqueue();
+        register_vnode(queue, fd, ALL_SEVEN, 0xA7B7);
+
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let got = collect(queue, 4);
+        assert!(
+            notes_of(&got, 4) & VNOTE_ATTRIB != 0,
+            "a mode change is a VNOP_SETATTR and XNU posts NOTE_ATTRIB for it"
+        );
+
+        // SAFETY: this test's own two descriptors.
+        unsafe { libc::close(fd) };
+        unsafe { libc::close(queue) };
+    }
+
+    /// **A link count going *up* reports nothing at all**, and this is the test
+    /// that keeps a refusal from turning into a plausible lie.
+    ///
+    /// `inotify` reports a hard link as `IN_ATTRIB` - the *same bit* as a mode,
+    /// ownership or timestamp change - and nothing in the event says which. XNU
+    /// posts `NOTE_LINK` and **nothing else** for `VNOP_LINK`, so mapping this to
+    /// `NOTE_ATTRIB` would be a claim macOS does not make: it would tell the
+    /// framework that the file's *attributes* changed when only its *link count*
+    /// did. So the count is read and compared, and a change in it is reported as
+    /// no note at all, because the note that says so (`NOTE_LINK`) is refused by
+    /// name.
+    ///
+    /// **The positive control is inside the test**, and it is what makes the
+    /// negative assertion mean anything: the same watch is still armed afterwards
+    /// and still reports a write. Without it, "nothing arrived" would be
+    /// indistinguishable from "the watch is dead", and the test would pass for
+    /// entirely the wrong reason.
+    #[test]
+    fn a_hard_link_reports_no_note_because_note_link_is_refused() {
+        let dir = scratch("kq-vnode-link");
+        let file = dir.join("watched");
+        let alias = dir.join("alias");
+        std::fs::write(&file, b"x").unwrap();
+        let fd = open_evtonly(&file);
+        let queue = kqueue();
+        register_vnode(queue, fd, ALL_SEVEN, 0x11AD);
+
+        std::fs::hard_link(&file, &alias).unwrap();
+        let got = collect_briefly(queue, 4);
+        assert!(
+            got.is_empty(),
+            "a hard link raises IN_ATTRIB, which is the bit a metadata change uses, but XNU \
+             posts NOTE_LINK and nothing else for VNOP_LINK. Reporting NOTE_ATTRIB here would \
+             claim the file's attributes changed; got {:?}",
+            got.iter().map(|event| event.fflags).collect::<Vec<_>>()
+        );
+
+        // The positive control: the watch is alive and still armed, so the
+        // emptiness above was about the note and not about a dead registration.
+        {
+            use std::io::Write;
+            let mut handle = std::fs::OpenOptions::new().append(true).open(&file).unwrap();
+            handle.write_all(b"y").unwrap();
+        }
+        let alive = collect(queue, 4);
+        assert!(
+            notes_of(&alive, 4) & VNOTE_WRITE != 0,
+            "the same watch still reports a write, so it was never dead"
+        );
+
+        // SAFETY: this test's own two descriptors.
+        unsafe { libc::close(fd) };
+        unsafe { libc::close(queue) };
+    }
+
+    /// A watched **directory** whose contents change is `NOTE_WRITE` - and a
+    /// child's *metadata* change is **not** reported on the parent.
+    ///
+    /// This is the other of the two wrong answers a file watcher cannot detect: a
+    /// `NOTE_ATTRIB` on the parent would be a claim about a *different file* than
+    /// the one that changed, and `HandleAttributesChange` acts on it by closing
+    /// descriptors and re-opening the next path component. XNU raises a child's
+    /// `NOTE_ATTRIB` on the child's own vnode, where the parent's registration has
+    /// no knote at all.
+    #[test]
+    fn a_directory_watch_reports_a_create_as_note_write_and_a_childs_chmod_as_nothing() {
+        let dir = scratch("kq-vnode-dir");
+        let child = dir.join("child");
+        std::fs::write(&child, b"x").unwrap();
+        let fd = open_evtonly(&dir);
+        let queue = kqueue();
+        register_vnode(queue, fd, ALL_SEVEN, 0x8175);
+
+        // A new entry inside the watched directory. `inotify` says `IN_CREATE`
+        // *with a name*, and XNU raises `NOTE_WRITE` on the directory for it from
+        // `VNOP_MKNOD`.
+        std::fs::write(dir.join("created"), b"new").unwrap();
+        let created = collect(queue, 8);
+        let notes = notes_of(&created, 8);
+        assert!(
+            notes & VNOTE_WRITE != 0,
+            "an entry appearing in a watched directory is a NOTE_WRITE on the directory ({notes:#x})"
+        );
+        assert_eq!(
+            notes & VNOTE_ATTRIB,
+            0,
+            "creating an entry is not a metadata change to the directory itself"
+        );
+
+        // A *child's* mode change. `inotify` reports this on the parent as an
+        // `IN_ATTRIB` **with a name**, and it must be dropped: XNU posts
+        // NOTE_ATTRIB on the child's own vnode, and the parent's registration has
+        // no knote there.
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&child, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let attrib = collect_briefly(queue, 8);
+        assert!(
+            notes_of(&attrib, 8) & VNOTE_ATTRIB == 0,
+            "a child's metadata change is NOT the parent's NOTE_ATTRIB; claiming it would make \
+             HandleAttributesChange close descriptors because of another file, and the guest \
+             cannot tell that apart from a real one"
+        );
+
+        // The positive control again: the directory watch still fires.
+        std::fs::write(dir.join("created-2"), b"new").unwrap();
+        assert!(
+            notes_of(&collect(queue, 8), 8) & VNOTE_WRITE != 0,
+            "the directory watch is still armed"
+        );
+
+        // SAFETY: this test's own two descriptors.
+        unsafe { libc::close(fd) };
+        unsafe { libc::close(queue) };
+    }
+
+    /// A registration that asks for **only** notes this host cannot observe is
+    /// **refused**, not accepted.
+    ///
+    /// `EINVAL`, and by name, because the alternative - a registration that
+    /// succeeds, a queue that reports its descriptor readable, and no event that
+    /// can ever arrive - is the one outcome this module is written to avoid.
+    ///
+    /// **Both answers are asserted, because they differ and the difference is
+    /// XNU's.** Without `EV_RECEIPT` the refusal is `errno` and the call is `-1`;
+    /// *with* `EV_RECEIPT` and **no room for events** the error has nowhere to go
+    /// and the call answers `0` - the receipt is simply not delivered, which is
+    /// what `kevent_register` does with a receipt it cannot write. That is why the
+    /// first case here carries no `EV_RECEIPT`: with it, this test would be
+    /// asserting the receipt path rather than the refusal.
+    #[test]
+    fn a_change_asking_only_for_unreportable_notes_is_refused() {
+        let dir = scratch("kq-vnode-all-unreportable");
+        let file = dir.join("watched");
+        std::fs::write(&file, b"x").unwrap();
+        let fd = open_evtonly(&file);
+        let queue = kqueue();
+        let add = Kevent {
+            flags: EV_ADD,
+            ..watch_vnode(fd, VNOTE_EXTEND | VNOTE_LINK, 0)
+        };
+        assert_eq!(
+            apply_one(queue, &add),
+            Err(crate::errno::from_host(libc::EINVAL)),
+            "there is no filter left to register, so this is refused rather than accepted"
+        );
+        // And nothing is left armed behind it.
+        assert!(
+            collect_briefly(queue, 4).is_empty(),
+            "a refused registration has armed nothing"
+        );
+        // The same change with room for its receipt says so in the receipt rather
+        // than in `errno`, and still says *something*.
+        let mut got = [Kevent::default(); 1];
+        let receipt = watch_vnode(fd, VNOTE_EXTEND | VNOTE_LINK, 0);
+        // SAFETY: one change and room for the one receipt.
+        let n = unsafe {
+            kevent(
+                queue,
+                &raw const receipt,
+                1,
+                got.as_mut_ptr(),
+                1,
+                &raw const NO_WAIT,
+            )
+        };
+        assert_eq!(n, 1);
+        assert_eq!(got[0].flags & EV_ERROR, EV_ERROR);
+        assert_eq!(got[0].data as i32, crate::errno::from_host(libc::EINVAL));
+        // SAFETY: this test's own two descriptors.
+        unsafe { libc::close(fd) };
+        unsafe { libc::close(queue) };
+    }
+
+    /// A registration that asks for `NOTE_EXTEND` *and* something reportable is
+    /// **accepted, and narrowed** - and this is the test that separates the two
+    /// outcomes above: the same `NOTE_EXTEND` bit that is fatal on its own is
+    /// dropped rather than fatal alongside `NOTE_WRITE`.
+    ///
+    /// This is the "a change list is a filter, not a demand" question answered in
+    /// code: `NOTE_EXTEND` is *narrowing* of `NOTE_WRITE`, so the wider note
+    /// carries the same fact with XNU's own scope, and refusing the registration
+    /// outright would refuse a watch the guest can use.
+    #[test]
+    fn an_unreportable_note_alongside_a_reportable_one_is_dropped_not_fatal() {
+        let dir = scratch("kq-vnode-narrowed");
+        let file = dir.join("watched");
+        std::fs::write(&file, b"before").unwrap();
+        let fd = open_evtonly(&file);
+        let queue = kqueue();
+        // `NOTE_EXTEND | NOTE_WRITE`: the two notes a caller might use to mean
+        // "the file got bigger".
+        register_vnode(queue, fd, VNOTE_EXTEND | VNOTE_WRITE, 0x0A0A);
+
+        {
+            use std::io::Write;
+            let mut handle = std::fs::OpenOptions::new().append(true).open(&file).unwrap();
+            handle.write_all(b"more").unwrap();
+        }
+        let got = collect(queue, 4);
+        let notes = notes_of(&got, 4);
+        assert_eq!(
+            notes, VNOTE_WRITE,
+            "the append is reported as NOTE_WRITE alone: NOT NOTE_EXTEND, which would claim the \
+             size grew when the event that arrived does not say so"
+        );
+
+        // SAFETY: this test's own two descriptors.
+        unsafe { libc::close(fd) };
+        unsafe { libc::close(queue) };
+    }
+
+    /// A `NOTE_RENAME` in a registration's own `fflags` is what the framework
+    /// reads back, and the guest's two `OnKQueueReadable` bodies test exactly
+    /// three immediates against a delivered `fflags`: `and edx,0x8`,
+    /// `test al,0x61` and `test al,0x2` (`Chromium Framework+0x5d9f1dd`,
+    /// `+0x5d9f2ba` and `+0x5d9f337`, and the `__FILE__`-bracketed twin at
+    /// `+0x3a9b3ad`, `+0x3a9b48a` and `+0x3a9b507`). So the five notes this
+    /// implementation reports are exactly the ones the guest acts on, and the two
+    /// it refuses are two the guest never tests.
+    #[test]
+    fn the_notes_reported_are_exactly_the_ones_the_guest_reads_back() {
+        // What the two `OnKQueueReadable` bodies test against a delivered
+        // `fflags`: `and edx,0x8`, `test al,0x61`, `test al,0x2`.
+        const GUEST_READS: u32 = VNOTE_ATTRIB | VNOTE_WRITE | 0x61;
+        // What this host can report on a measured `inotify` event.
+        const REPORTED: u32 =
+            VNOTE_WRITE | VNOTE_ATTRIB | VNOTE_DELETE | VNOTE_RENAME | VNOTE_REVOKE;
+        // `0x61` is `NOTE_DELETE | NOTE_RENAME | NOTE_REVOKE`, so the guest reads
+        // every note the implementation reports...
+        assert_eq!(GUEST_READS, REPORTED);
+        // ...and nothing it reports escapes what the guest reads.
+        assert_eq!(REPORTED & !GUEST_READS, 0);
+        // What the guest asked for and does *not* read is exactly the refused
+        // pair, so narrowing `0x6f` costs this guest nothing.
+        assert_eq!(ALL_SEVEN & !GUEST_READS, VNOTE_EXTEND | VNOTE_LINK);
+    }
+
+    /// A receipt for a `NOTE_RENAME` change that was **never made** is `ENOENT`,
+    /// not a success.
+    ///
+    /// Without this, a change carrying only `EV_RECEIPT` would be read as a
+    /// request to watch a path, and the caller would get a *success* receipt for a
+    /// watch that was never made - which is how `EV_RECEIPT` becomes a lie.
+    #[test]
+    fn a_receipt_for_a_vnode_registration_that_was_never_made_is_enoent() {
+        let queue = kqueue();
+        let receipt = Kevent {
+            filter: EVFILT_VNODE,
+            flags: EV_RECEIPT,
+            ..Kevent::default()
+        };
+        let mut got = [Kevent::default(); 1];
+        // SAFETY: one change and room for the one receipt.
+        let n = unsafe {
+            kevent(
+                queue,
+                &raw const receipt,
+                1,
+                got.as_mut_ptr(),
+                1,
+                &raw const NO_WAIT,
+            )
+        };
+        assert_eq!(n, 1, "a receipt answers with an event, not a return value");
+        assert_eq!(got[0].flags & EV_ERROR, EV_ERROR);
+        assert_eq!(
+            got[0].data as i32,
+            crate::errno::from_host(libc::ENOENT),
+            "a success receipt here would be a subscription the caller does not have"
+        );
+        // SAFETY: this test's own queue descriptor.
+        unsafe { libc::close(queue) };
+    }
+
+    /// A vnode registration's `ident` is an **open descriptor**, and the delivered
+    /// event is about that descriptor - not about the queue's `inotify`, which is
+    /// a different object and the only thing that ever becomes readable.
+    #[test]
+    fn a_vnode_ident_is_an_open_descriptor_and_the_event_is_about_it() {
+        let dir = scratch("kq-vnode-ident");
+        let file = dir.join("watched");
+        std::fs::write(&file, b"x").unwrap();
+        let fd = open_evtonly(&file);
+        let queue = kqueue();
+        // The premise, asserted rather than assumed: this is an `O_PATH`
+        // descriptor, so `read` is `EBADF` and it could never be waited on.
+        assert!(unsafe { libc::fcntl(fd, libc::F_GETFD) } >= 0, "it is open");
+        assert_eq!(unsafe { libc::read(fd, std::ptr::null_mut(), 1) }, -1);
+        assert_eq!(crate::errno::get(), libc::EBADF);
+        register_vnode(queue, fd, ALL_SEVEN, 0xF00D);
+
+        let watched = {
+            let state = queue_of(queue).expect("this test's own queue");
+            let state = state.lock().unwrap_or_else(|e| e.into_inner());
+            let registration = &state.registrations[&(fd as usize, EVFILT_VNODE)];
+            // The thing `poll` waits on is the queue's `inotify`, which is not
+            // the ident - which is why `EPOLLIN` on the `O_PATH` descriptor
+            // would have been `EPERM`.
+            let inotify_fd = registration.vnode.as_ref().unwrap().inotify_fd();
+            assert_ne!(inotify_fd, fd, "the descriptor waited on is not the ident");
+            // And the narrowed interest is what the knote holds, not `0x6f`.
+            assert_eq!(registration.fflags, ALL_SEVEN & !(VNOTE_EXTEND | VNOTE_LINK));
+            inotify_fd
+        };
+        // And the `inotify` is genuinely armed on the caller's descriptor: a
+        // write is reported, and the `ident` in the event is the caller's.
+        {
+            use std::io::Write;
+            let mut handle = std::fs::OpenOptions::new().append(true).open(&file).unwrap();
+            handle.write_all(b"y").unwrap();
+        }
+        let got = collect(queue, 4);
+        assert!(notes_of(&got, 4) & VNOTE_WRITE != 0);
+        assert_eq!(got[0].ident, fd as usize);
+        assert_ne!(
+            got[0].ident,
+            watched as usize,
+            "the event is about the ident, not the inotify"
+        );
+        // SAFETY: this test's own two descriptors.
+        unsafe { libc::close(fd) };
+        unsafe { libc::close(queue) };
     }
 }

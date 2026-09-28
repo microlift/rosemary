@@ -30,6 +30,7 @@ pub mod identity;
 pub mod key;
 pub mod keychain;
 pub mod keychain_legacy;
+pub mod local_authentication;
 pub mod status;
 pub mod task;
 pub mod trust;
@@ -68,5 +69,27 @@ pub fn data_symbols() -> Vec<(String, u64)> {
         random.to_string(),
         corefoundation::base::global_cell(random, 0),
     ));
+    // The `LAContext` classref, published as data. A class that is only
+    // *registered* leaves the guest binding `_OBJC_CLASS_$_LAContext` to
+    // whatever `ROSETTA3_NAME_MISSING_CLASSES` made of it, and the difference
+    // between that and this class is the difference between an abort that names
+    // "unrecognized selector sent to instance of LAContext" and a `BOOL` that is
+    // the truth about this host. See `local_authentication`.
+    local_authentication::install();
+    for name in local_authentication::CLASSES {
+        let Some(class) =
+            std::ffi::CString::new(*name).ok().and_then(|n| objc::class::lookup(&n))
+        else {
+            continue;
+        };
+        symbols.push((
+            format!("_OBJC_CLASS_$_{name}"),
+            objc::class::ptr(class) as usize as u64,
+        ));
+        symbols.push((
+            format!("_OBJC_METACLASS_$_{name}"),
+            objc::class::ptr(class.metaclass()) as usize as u64,
+        ));
+    }
     symbols
 }

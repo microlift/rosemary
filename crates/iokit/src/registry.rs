@@ -753,8 +753,13 @@ pub unsafe extern "C" fn IONotificationPortDestroy(port: *mut c_void) {
 /// (`Framework+0x3cef600`, `+0x3d029a3`, `+0x5cfe150`, `+0x5da9684`,
 /// `+0x83c1832`, `+0x83ff1f8`) pass the result straight to
 /// `CFRunLoopAddSource` or `CFRunLoopRemoveSource` with no test, and
-/// `corefoundation`'s implementations of both return early for a null source
-/// (`crates/corefoundation/src/api.rs:3207` and `:3216`). A guest that gets a
+/// `corefoundation`'s implementations of both return early for a null source:
+/// `CFRunLoopAddSource` at `crates/corefoundation/src/api.rs:3440` - the
+/// `let (Some(l), Some(s)) = … else { return }` at `:3442-3446` - and
+/// `CFRunLoopRemoveSource` at `:3450`, the same shape at `:3455-3459`. On the
+/// default path that return is silent; `refuse_null_handle` (`:3419`), which
+/// would *name* the null rather than ignore it, is off unless
+/// `ROSETTA3_CHECK_RUNLOOP_SOURCE=1`. A guest that gets a
 /// source it can never signal from is worse off than one that knows it is not
 /// listening - and a source built here would have had to be a
 /// `CFRunLoopSourceContext` with a null `perform`, which is the shape that

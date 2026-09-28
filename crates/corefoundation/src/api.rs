@@ -3317,6 +3317,7 @@ pub unsafe extern "C" fn CFRunLoopAddObserver(
     observer: CFTypeRef,
     mode: CFTypeRef,
 ) {
+    refuse_null_handle("CFRunLoopAddObserver", observer);
     let (Some(l), Some(o)) = (unsafe { borrow::<RunLoop>(loop_) }, unsafe {
         borrow::<runloop::Observer>(observer)
     }) else {
@@ -3380,7 +3381,64 @@ pub unsafe extern "C" fn CFRunLoopSourceIsValid(source: CFTypeRef) -> Boolean {
     unsafe { borrow::<Source>(source) }.is_some_and(|s| s.is_valid()) as Boolean
 }
 
+/// A null handle handed to one of the `CFRunLoop*` entry points that take a
+/// handle the caller *made*.
+///
+/// ## Why this is not on by default, and what the default is
+///
+/// A null source is not hypothetical here: it is what
+/// `IONotificationPortGetRunLoopSource` answers when there is no port behind
+/// it, and what [`CFRunLoopSourceCreate`] answers for a source version it does
+/// not implement. Both are refusals by name rather than a source that never
+/// fires, which is the point of both. So the guest can and does hold a null
+/// where a `CFRunLoopSourceRef` belongs.
+///
+/// The default answer is that adding it does nothing, and that is a decision
+/// rather than an omission, for two reasons that are both about this loop
+/// rather than about the null:
+///
+/// - **The loop cannot service any handle it did not make.** [`borrow`] gates
+///   on [`runloop::is_noted`], so a source from Apple's own CoreFoundation - the
+///   ordinary case on macOS, where a program's notification port is Apple's -
+///   is *also* silently not added. Refusing null while ignoring a real foreign
+///   source would make the null the only handle in the file that kills the
+///   process, which is a distinction with no meaning behind it.
+/// - **There is no answer to give.** The call returns void. There is no value
+///   to be wrong about; the only alternative to "nothing was added" is a
+///   process kill, and a kill is not information.
+///
+/// What the default *does* owe the reader is that it is a decision, and this is
+/// the flag that turns it into a refusal that names itself, for whoever is
+/// chasing a run where a null is standing in for something real. It is off
+/// unless `ROSETTA3_CHECK_RUNLOOP_SOURCE=1` is set, and the default output of
+/// the suite and of a run is byte-identical with it present.
+///
+/// A handle that is *not* null and not one of this tree's is not this
+/// function's business: see the first bullet, and [`runloop::is_noted`] for why
+/// rebuilding an `Arc` over it would be corruption rather than an answer.
+fn refuse_null_handle(call: &str, handle: CFTypeRef) {
+    if !handle.is_null() || !check_runloop_handles() {
+        return;
+    }
+    objc::fail!(
+        "corefoundation: {call} was handed a null handle.  A null is what this runtime answers \
+         for a run loop source it cannot make - IONotificationPortGetRunLoopSource with no port \
+         behind it, CFRunLoopSourceCreate for a source version it does not implement - so a null \
+         here is a caller's own earlier answer coming back.  The handle is not added to anything; \
+         the loop cannot service a handle it did not make, so there is nothing it could be added \
+         to.  Refusing so that a program relying on this source being scheduled says so."
+    );
+}
+
+/// Whether a null handle in a `CFRunLoop*` call should be refused rather than
+/// ignored. Off unless `ROSETTA3_CHECK_RUNLOOP_SOURCE=1` is set.
+fn check_runloop_handles() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("ROSETTA3_CHECK_RUNLOOP_SOURCE").is_some())
+}
+
 pub unsafe extern "C" fn CFRunLoopAddSource(loop_: CFTypeRef, source: CFTypeRef, mode: CFTypeRef) {
+    refuse_null_handle("CFRunLoopAddSource", source);
     let (Some(l), Some(s)) = (unsafe { borrow::<RunLoop>(loop_) }, unsafe {
         borrow::<Source>(source)
     }) else {
@@ -3460,6 +3518,7 @@ pub unsafe extern "C" fn CFRunLoopTimerCreate(
 }
 
 pub unsafe extern "C" fn CFRunLoopAddTimer(loop_: CFTypeRef, timer: CFTypeRef, mode: CFTypeRef) {
+    refuse_null_handle("CFRunLoopAddTimer", timer);
     let (Some(l), Some(t)) = (unsafe { borrow::<RunLoop>(loop_) }, unsafe {
         borrow::<Timer>(timer)
     }) else {
@@ -4283,6 +4342,111 @@ mod path_style_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A null run-loop source added to a live loop is ignored, and nothing about
+    /// it faults.
+    ///
+    /// This is the question the milestone path turns on. `iokit`'s
+    /// `IONotificationPortGetRunLoopSource` answers **null** when there is no
+    /// port behind it - a merge decision, against an alternative that built a
+    /// `CFRunLoopSourceContext` with a null `perform`, which is a source that
+    /// *faults* when it is signalled rather than one that never fires - and
+    /// `CFRunLoopSourceCreate` answers null for a source version it does not
+    /// implement. So a null is a value this tree hands the guest on purpose, and
+    /// the question is what the guest's next call does with it.
+    ///
+    /// Answered by measurement rather than by reading: a null is added, signalled,
+    /// queried, removed, retained, released and type-queried, and a loop with a
+    /// real source in it is turned afterwards. The loop still runs the real
+    /// source, which is the half that matters - a null that took the loop down
+    /// with it, or that turned a *later* source into a no-op, would be a fault
+    /// wearing the costume of a refusal.
+    ///
+    /// What the default does *not* do is say anything, which is
+    /// [`refuse_null_handle`]'s subject: `ROSETTA3_CHECK_RUNLOOP_SOURCE=1` turns
+    /// the add into a refusal that names itself. This test is the other half -
+    /// that the null is inert, which is what makes answering null upstream safe.
+    #[test]
+    fn a_null_run_loop_source_is_inert_and_never_a_fault() {
+        crate::bootstrap();
+        use crate::runloop::{self, result};
+        static FIRED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        unsafe extern "C" fn perform(_info: *mut std::ffi::c_void) {
+            FIRED.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        }
+        // SAFETY: null handles and a loop this thread owns.
+        unsafe {
+            let loop_ = CFRunLoopGetCurrent();
+            // Every entry point that takes a source, with a null.
+            CFRunLoopAddSource(loop_, std::ptr::null(), std::ptr::null());
+            CFRunLoopSourceSignal(std::ptr::null());
+            CFRunLoopSourceInvalidate(std::ptr::null());
+            assert_eq!(
+                CFRunLoopSourceIsValid(std::ptr::null()),
+                0,
+                "a null source is not a valid source"
+            );
+            assert_eq!(
+                CFRunLoopContainsSource(loop_, std::ptr::null(), std::ptr::null()),
+                0,
+                "and it is in no loop"
+            );
+            CFRunLoopRemoveSource(loop_, std::ptr::null(), std::ptr::null());
+            // The two siblings, because a null timer or observer is the same
+            // caller's earlier null arriving somewhere else.
+            CFRunLoopAddTimer(loop_, std::ptr::null(), std::ptr::null());
+            CFRunLoopRemoveTimer(loop_, std::ptr::null(), std::ptr::null());
+            CFRunLoopAddObserver(loop_, std::ptr::null(), std::ptr::null());
+            CFRunLoopRemoveObserver(loop_, std::ptr::null(), std::ptr::null());
+            // And the reference operations, which is where a null could reach an
+            // `objc_retain` on address zero.
+            assert!(CFRetain(std::ptr::null()).is_null());
+            CFRelease(std::ptr::null());
+            assert_eq!(CFGetRetainCount(std::ptr::null()), 0);
+            assert_eq!(CFGetTypeID(std::ptr::null()), 0);
+
+            // The loop still works, and still services a real source: the half of
+            // the question that decides whether the upstream null is safe. The
+            // `perform` is not optional here, and that is the other half of the
+            // upstream decision - a source whose `perform` is null is one that is
+            // signalled and delivers nothing, which `Source::fire` refuses rather
+            // than treating as "handled".
+            let context = CFRunLoopSourceContext {
+                version: 0,
+                info: std::ptr::null_mut(),
+                retain: std::ptr::null(),
+                release: std::ptr::null(),
+                copy_description: std::ptr::null(),
+                equal: std::ptr::null(),
+                hash: std::ptr::null(),
+                schedule: std::ptr::null(),
+                cancel: std::ptr::null(),
+                perform: Some(perform),
+            };
+            let source = CFRunLoopSourceCreate(std::ptr::null(), 0, &context);
+            assert!(!source.is_null(), "a version-0 source is one this runtime can make");
+            CFRunLoopAddSource(loop_, source, std::ptr::null());
+            CFRunLoopSourceSignal(source);
+            assert_eq!(
+                CFRunLoopRunInMode(std::ptr::null(), 0.0, 1),
+                result::HANDLED_SOURCE,
+                "a real source added after a null one is still serviced, so the null did not \
+                 take the loop's source list with it"
+            );
+            assert_eq!(FIRED.load(std::sync::atomic::Ordering::Acquire), 1);
+            CFRunLoopSourceInvalidate(source);
+            CFRelease(source);
+            // And the loop is back to having nothing in it: a mode with nothing
+            // left to service is *finished*, not timed out and not "handled", so
+            // this is also the assertion that the null did not leave a source
+            // behind - a null that were recorded as one would show up here as a
+            // turn that reports a source it did not deliver.
+            assert_eq!(CFRunLoopRunInMode(std::ptr::null(), 0.0, 1), result::FINISHED);
+            // The address the null was asked about is still the allocator's, and
+            // nothing is recorded for it: see `runloop`'s null test.
+            assert!(!runloop::probe_any_noted(0));
+        }
+    }
 
     #[test]
     fn a_windows_code_page_or_charset_name_names_its_encoding() {

@@ -169,6 +169,7 @@ mod imp {
         pub static IMAGE_DATA: AtomicBool = AtomicBool::new(false);
         pub static IMAGE_GEOMETRY: AtomicBool = AtomicBool::new(false);
         pub static CTM: AtomicBool = AtomicBool::new(false);
+        pub static NO_COLOR: AtomicBool = AtomicBool::new(false);
     }
 
     /// The class pointer `corefoundation` reports as a `CFTypeID`.
@@ -277,28 +278,80 @@ mod imp {
     /// `CGColorSpaceCreateWithName` builds, a `ColorSpace` object - is the
     /// identity on the component vector. Returning the colour is that identity.
     ///
-    /// **The guest dereferences the answer without checking it**, which is why
-    /// this is not a refusal: `Framework+0x61ac9a7` calls it and at `+0x61ac9b2`
-    /// passes the result straight to `CGColorGetComponents`, whose pointer is
-    /// read at `+0x61ac9b7` with no test in between. A null here is a fault at
-    /// address zero.
+    /// **A null `color` is refused by name, and the refusal is the whole of the
+    /// answer.** The caller hands this a `CGColorRef` it got from somewhere that
+    /// could not produce one, and the only truthful answer to "convert this
+    /// colour" when there is no colour is "there is no colour". Returning
+    /// something non-null here would not be a conversion, it would be a
+    /// fabricated `CGColor` whose four components nothing in this tree measured,
+    /// and the caller converts it to a byte-quantised `SkColor` and paints with
+    /// it. That is the one outcome worse than not answering, so this stays null
+    /// and says why.
     ///
-    /// The reachability of that is worth recording, because it is not this
-    /// function's doing: the caller is behind `test r14,r14; je 0x61ac7b7` on
-    /// the result of `-colorUsingColorSpace:`, which in this runtime returns the
-    /// receiver and so never falls into the `CGColor` arm. So the answer is
-    /// correct for every call that can be made and unreachable for the rest.
+    /// **The guest's own `CHECK` is the right way for that to surface.** The
+    /// caller dereferences the answer with no test - `Framework+0x61ac9a7` calls
+    /// this, `+0x61ac9b2` passes the answer straight to `CGColorGetComponents`,
+    /// and `+0x61ac9b7` reads `[rax]` with nothing in between - so a null answer
+    /// is a fault at address zero on the first component. That is the guest
+    /// reporting our incompleteness, which is the outcome this project wants; it
+    /// is *not* a reason to invent a colour. See `test/logs/REPORT-cgcolor-components.md`.
     ///
-    /// Ownership: CoreGraphics returns a new reference. The one call site holds
-    /// its own reference to `color` (`objc_retainAutorelease` at `+0x61ac7ba`)
-    /// and releases the answer exactly once at `+0x61ac9fd`, so handing back
-    /// the colour it already owns balances; nothing is over-released.
+    /// # The reachability claim that was here, and why it was wrong
+    ///
+    /// This note used to say: *"the caller is behind `test r14,r14; je 0x61ac7b7`
+    /// on the result of `-colorUsingColorSpace:`, which in this runtime returns
+    /// the receiver and so never falls into the `CGColor` arm. So the answer is
+    /// correct for every call that can be made and unreachable for the rest."*
+    /// Three separate things are wrong with it, and the first two are wrong on
+    /// the instructions alone, before any run:
+    ///
+    /// * `je 0x61ac7b7` is the **nil** arm, not the non-nil one - `test r14,r14`
+    ///   sets ZF when the message returned null, and `je` takes that. So
+    ///   `+0x61ac7b7` is precisely the arm taken when
+    ///   `-colorUsingColorSpace:` returns nil. The old note read the branch the
+    ///   other way round.
+    /// * "returns the receiver" therefore *reaches* that arm whenever the
+    ///   receiver is nil, which is the case that matters. Returning the receiver
+    ///   is what makes the arm reachable, not what keeps it out.
+    /// * The function that would have to be unreachable is not the one at
+    ///   `+0x61ac660` anyway. `+0x61ac660` calls `+0x61ac980` on its `n == 4`
+    ///   sub-arm only, and `+0x61ac980` is the function with the
+    ///   `CGColorCreateCopyByMatchingToColorSpace` call in it.
+    ///
+    /// Measured, from the whole 0x430-byte region `+0x61ac660 .. +0x61aca90`
+    /// enumerated instruction by instruction (271 instructions, every
+    /// `call`/`jmp`/`ret`/`ud2`/`int3` classified from its own bytes):
+    /// `+0x61ac9a7` is the **only** call to this function in the region, and
+    /// `+0x61ac980` has four call sites - `+0x61ac7e3`, which `cmp rax,4` and
+    /// `jne +0x61ac7ea` exclude unless the component count is exactly four, and
+    /// `+0x810a3f1`, `+0x810a521` and `+0x810ac02`, none of which test their
+    /// argument. So the two exposure shapes are distinct and both real.
+    ///
+    /// Ownership: CoreGraphics returns a new reference. The caller releases the
+    /// answer exactly once (`_CFRelease` at `+0x61aca02`, behind
+    /// `test rbx,rbx`), and it holds its own reference to `color`, so handing
+    /// back the colour it already owns balances; nothing is over-released.
     unsafe extern "C" fn cg_color_create_copy_by_matching_to_color_space(
         _space: *const c_void,
         _options: u32,
         color: *const c_void,
         _intent: c_int,
     ) -> *const c_void {
+        if color.is_null() {
+            note(
+                &said::NO_COLOR,
+                "CGColorCreateCopyByMatchingToColorSpace",
+                "null: the colour to convert does not exist. The guest handed this the \
+                 answer of a lookup that had nothing to give - measured call sites are \
+                 MACaptionAppearanceCopyForegroundColor (refused by name: there are no \
+                 caption preferences on this host) at Framework+0x810a3f1, +0x810a521 \
+                 and +0x810ac02, and -[NSColor CGColor] at +0x61ac9a7's caller, which \
+                 no class in this tree registers. Converting nothing to nothing is the \
+                 identity, and the four components an answer would carry would be four \
+                 numbers nothing here measured; the caller's own CHECK \
+                 (Framework+0x61ac864) is the honest way for this to surface",
+            );
+        }
         color
     }
 
@@ -1946,6 +1999,42 @@ mod imp {
             // (`Framework+0x61ac9b7`).
             assert!(!same.is_null());
             assert_eq!(same, colour, "the conversion is the identity on this host");
+        }
+
+        /// A null colour converts to null, and says so by name. The second half
+        /// is the half that matters: the alternative - a non-null answer for a
+        /// null input - would be four components nothing measured, and
+        /// `+0x61ac9f2` turns four floats into a byte-quantised `SkColor` that
+        /// the guest paints with. The first half is a mutation control: make the
+        /// function answer non-null for a null colour and the equality below
+        /// fails, so this test cannot pass while the function invents one.
+        #[test]
+        fn converting_nothing_is_nothing_and_not_a_made_up_colour() {
+            // SAFETY: the function passes the null through and reads nothing.
+            let nothing =
+                unsafe { cg_color_create_copy_by_matching_to_color_space(std::ptr::null(), 0, std::ptr::null(), 0) };
+            assert!(nothing.is_null(), "a null input must not become a colour");
+        }
+
+        /// The identity still holds when the refusal flag has already been taken,
+        /// which is what makes the two assertions above independent of which test
+        /// runs first: `note` is one-shot per process, so a test that asserted
+        /// the flag's *value* would be an order-dependent test. This asserts the
+        /// flag's only load-bearing effect - that it cannot change an answer.
+        #[test]
+        fn the_refusal_does_not_change_the_answer_whatever_the_flag_is() {
+            // SAFETY: the function passes the null through and reads nothing.
+            unsafe { cg_color_create_copy_by_matching_to_color_space(std::ptr::null(), 0, std::ptr::null(), 0) };
+            // Now the flag is consumed, whatever order the suite ran in.
+            // SAFETY: the arguments are only passed through.
+            let colour = unsafe {
+                cg_color_create_copy_by_matching_to_color_space(std::ptr::null(), 0, 0x1000 as *const c_void, 0)
+            };
+            assert_eq!(colour, 0x1000 as *const c_void, "a real colour is still the identity");
+            // SAFETY: the function passes the null through and reads nothing.
+            let nothing =
+                unsafe { cg_color_create_copy_by_matching_to_color_space(std::ptr::null(), 0, std::ptr::null(), 0) };
+            assert!(nothing.is_null(), "and a null one is still null after the flag is spent");
         }
 
         /// A `CGPath` from `CTFontCreatePathForGlyph` has a rectangle in it.

@@ -73,7 +73,23 @@ static HIERARCHY: &[(&str, Option<&str>, usize)] = &[
         Some("NSImageRep"),
         crate::image::bitmap::INSTANCE_SIZE,
     ),
-    ("NSFont", None, 0),
+    // `CTFont` is toll-free bridged to `NSFont`, and the guest relies on it: one
+    // `rbx` is passed to `CTFontGetSize` and then sent `familyName`,
+    // `fontDescriptor`, `ascender`, `capHeight`, `descender` and `leading`
+    // (`Framework+0x6949218` through `+0x6949a2d`). The instance size is the one
+    // ivar holding the CoreText attributes, so these are real objects and not
+    // names a send can be refused against.
+    //
+    // `NSFontDescriptor` is here for the same reason and is not optional: the
+    // guest *imports* it - `objc-classrefs.py` puts `NSFontDescriptor` at
+    // `#e6e7780`, and `Framework+0x6949787` sends
+    // `+fontDescriptorWithFontAttributes:` to that classref while
+    // `+0x6949278` sends `fontDescriptor` to the font and reads
+    // `symbolicTraits` off the answer at `+0x6949289`. A class that is missing
+    // refuses its superclass, and here it would refuse the descriptor that the
+    // bold path in `+0x6949520` builds its request from.
+    ("NSFont", None, crate::font::INSTANCE_SIZE),
+    ("NSFontDescriptor", None, crate::font::INSTANCE_SIZE),
     ("NSFontManager", None, 0),
     (
         "NSOpenGLContext",

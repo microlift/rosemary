@@ -120,7 +120,18 @@ pub unsafe extern "C" fn create_run_loop_source(
         order,
     );
     *socket.source.lock().unwrap_or_else(|e| e.into_inner()) = Some(Arc::downgrade(&source));
-    Arc::into_raw(source).cast::<c_void>()
+    // `new_source_ordered` has already recorded the handle as one of ours, which
+    // says nothing about who holds a reference to it. `leak` is the same
+    // `Arc::into_raw` plus the release, so a guest that `CFRelease`s the source
+    // it was handed ends the reference it was handed.
+    //
+    // A bare `Arc::into_raw` here cannot, and this one leaks unconditionally:
+    // `note` leaves `refs` at `None`, so `release_opaque` answers
+    // `CRef::Unknown`, and nothing in this crate ever rebuilds an `Arc<Source>`
+    // from this address - the `Weak` above is the only other reference and it
+    // never keeps the allocation alive. Every source this function hands out
+    // was a `Source` that could never be dropped.
+    crate::runloop::leak(source)
 }
 
 pub unsafe extern "C" fn get_native(socket: CFTypeRef) -> i32 {
@@ -219,5 +230,95 @@ pub(crate) fn poll() {
                 source.signal();
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A real descriptor, because `create_with_native` takes one and
+    /// `invalidate` closes it.
+    fn descriptor() -> libc::c_int {
+        // SAFETY: a `NUL`-terminated path this module supplies, and a read-only
+        // nonblocking open of a character device that always exists.
+        let fd = unsafe { libc::open(c"/dev/null".as_ptr(), libc::O_RDONLY | libc::O_NONBLOCK) };
+        assert!(fd >= 0, "/dev/null is openable");
+        fd
+    }
+
+    /// A source this module hands out is the C world's to give back.
+    ///
+    /// `CFSocketCreateRunLoopSource` returns a +1 reference the caller owns and is
+    /// expected to `CFRelease`, and this module had no way for that to happen:
+    /// `Arc::into_raw` gives the reference away without recording where it is
+    /// given back, and `note` - which `new_source_ordered` does call - records
+    /// only *that* the address is one of ours, leaving the entry's `refs` at
+    /// `None`. So a guest's `CFRelease` found no counted reference to give back.
+    ///
+    /// **That is worse than the leak it looks like, and the difference is worth
+    /// being exact about.** `CFRelease` does not stop on `CRef::Unknown`; it
+    /// goes on to `forwarded("CFRelease", …)` and then to
+    /// `objc::arc::release`, whose last resort is `deallocate` - a Rust
+    /// `Arc<Source>` allocation handed to the Objective-C deallocation path
+    /// (`clear_weak_references`, then `dispose_instance`).
+    ///
+    /// **What this test measured, and what it read.** Measured, by reverting the
+    /// one line above to `Arc::into_raw` and running this: the guest's
+    /// `CFRelease` did **not** end the reference - the `Weak` still upgraded
+    /// afterwards, where with `leak` it does not. Read, not measured, because the
+    /// test does not assert it: that the fall-through reaches `deallocate` at
+    /// all, and what `dispose_instance` does to a struct this crate laid out.
+    /// Nothing here rebuilds an `Arc` from the handle, so the C world's half was
+    /// the only strong reference - which is why "the reference was not ended" is
+    /// the whole of what the assertion claims and not more.
+    ///
+    /// The assertion is on that observable consequence rather than on a table
+    /// entry, because a table entry is an implementation detail and a reference
+    /// the guest gave back that is still outstanding is the thing that matters:
+    /// the `Weak` is the only other handle on this allocation, so it upgrades
+    /// while the guest holds the source and stops upgrading once the guest has
+    /// given it back.
+    #[test]
+    fn a_source_the_guest_gives_back_is_freed_and_one_it_keeps_is_not() {
+        // SAFETY: a null allocator, a real descriptor, no callback and no context.
+        let socket = unsafe {
+            create_with_native(
+                std::ptr::null(),
+                descriptor(),
+                0,
+                None,
+                std::ptr::null(),
+            )
+        };
+        assert!(!socket.is_null(), "a non-negative descriptor makes a socket");
+        // SAFETY: a socket this module made.
+        let handle = unsafe { create_run_loop_source(std::ptr::null(), socket, 0) };
+        assert!(!handle.is_null(), "a live socket is listenable");
+
+        // SAFETY: a socket this module made, and the returned `Arc` is
+        // `ManuallyDrop` because the C world still owns the reference.
+        let weak = unsafe { borrow(socket) }
+            .expect("the socket is in the table")
+            .source
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+            .expect("create_run_loop_source recorded the source");
+        assert!(
+            weak.upgrade().is_some(),
+            "the source is alive while the guest holds it"
+        );
+
+        // SAFETY: a `CFRunLoopSourceRef` this module handed out.
+        unsafe { crate::api::CFRelease(handle) };
+
+        assert!(
+            weak.upgrade().is_none(),
+            "the guest gave the reference back and the Source is still allocated. \
+             The C world's half was never recorded, so `release_opaque` answered \
+             `CRef::Unknown` and the release fell through to the forwarding path \
+             instead of ending the reference it was handed"
+        );
     }
 }

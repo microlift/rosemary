@@ -59,6 +59,26 @@ const INDEX_KEY: &str = "R3FontFileIndex";
 /// A size CoreText uses for a font created with none.
 const DEFAULT_SIZE: f64 = 12.0;
 
+/// A size a UI font is made at when the caller asked for none.
+///
+/// **This is a number nobody chose**, and it is here rather than nowhere because
+/// the alternative is worse: `+[NSFont systemFontSize]` is refused
+/// (`crate::font::system_font_size`) and answers `0.0` under
+/// `ROSETTA3_LOG_UNRECOGNIZED`, and two of the seven sites that call it pass
+/// that `0.0` straight into a point size - `Framework+0x8b6d9fd` and
+/// `+0xc0ac741` (the whole-`__text` selref census is in
+/// `crate::font::system_font_size`). So a refused size arrives here as "no
+/// size", and this is what "no size" becomes: 13 points, which is a plausible
+/// looking font size that reports nothing.
+///
+/// CoreText's own contract for a UI font created with no size is that it gets
+/// the default one, and 13 is this tree's statement of what that is. It is not
+/// derived from anything on this host - fontconfig's `Sans` carries no default
+/// point size, and neither does any font file. **If a run is ever to be trusted
+/// with a system font size, this constant is the thing to replace**, deliberately
+/// and in the open, which is why it is named here rather than inlined.
+const UI_DEFAULT_SIZE: f64 = 13.0;
+
 /// `kCTFontItalicTrait`, `kCTFontBoldTrait` and `kCTFontMonoSpaceTrait`.
 const ITALIC_TRAIT: u32 = 1 << 0;
 const BOLD_TRAIT: u32 = 1 << 1;
@@ -83,7 +103,20 @@ fn release(object: CFTypeRef) {
     }
 }
 
+/// The attributes a font or descriptor object stands for.
+///
+/// A guest that received a font from `CTFontCreateWithName` received an
+/// `NSFont`, so the reader of that object's attributes has to look through it.
+/// Everything above this function works on the plain dictionary; everything
+/// below, at the ABI, is the class macOS gives these objects and this runtime
+/// has to give them too, or a message sent to a font - and the guest sends
+/// seven - is refused with `__NSCFDictionary` in the message.
+fn unwrap(object: CFTypeRef) -> CFTypeRef {
+    crate::font::attributes_of(object)
+}
+
 fn get(dictionary: CFTypeRef, name: &'static str) -> CFTypeRef {
+    let dictionary = unwrap(dictionary);
     // SAFETY: null, or a dictionary a guest received from this runtime.
     match unsafe { collections::dictionary(dictionary) } {
         Some(_) => unsafe { corefoundation::api::CFDictionaryGetValue(dictionary, key(name)) },
@@ -324,7 +357,10 @@ fn make_font(descriptor: CFTypeRef, size: f64) -> CFTypeRef {
 /// Copy `base`'s attributes with `overrides` layered on top.
 fn merged_attributes(base: CFTypeRef, overrides: CFTypeRef) -> CFTypeRef {
     let mut pairs = Vec::new();
-    for object in [base, overrides] {
+    // `base` may arrive as an `NSFont` or `NSFontDescriptor` - `CTFontCreateCopy
+    // WithAttributes` and `-[NSFont fontDescriptor]` both hand one here - so
+    // the class has to come off before the entries are read.
+    for object in [unwrap(base), overrides] {
         // SAFETY: null, or a dictionary a guest received from this runtime.
         if let Some(contents) = unsafe { collections::dictionary(object) } {
             pairs.extend(contents.entries.iter().copied());
@@ -334,6 +370,7 @@ fn merged_attributes(base: CFTypeRef, overrides: CFTypeRef) -> CFTypeRef {
 }
 
 fn loaded(font: CFTypeRef) -> Option<Arc<LoadedFace>> {
+    let font = unwrap(font);
     let path = get_string(font, PATH_KEY)?;
     let index = get_number(font, INDEX_KEY).unwrap_or(0.0) as u32;
     fonts::load(&path, index)
@@ -348,19 +385,44 @@ fn scale(font: CFTypeRef, face: &LoadedFace) -> f64 {
     font_size(font) / f64::from(face.face().units_per_em().max(1))
 }
 
+/// A font for the system UI family at `size` and `weight`.
+///
+/// `weight` is CoreText's own weight trait, the -1 to 1 scale
+/// `NSFontWeight` is spelled in, and `None` is the regular face. The face is the
+/// family member nearest that weight, which is how `resolve` picks one anyway.
+pub unsafe fn ui_font(kind: u32, size: f64, weight: Option<f64>) -> CFTypeRef {
+    // `kCTFontUIFontUserFixedPitch` is 1; every other kind is proportional.
+    let family = fonts::default_family(kind == 1).unwrap_or_else(|| "Sans".to_string());
+    let name = string(&family);
+    let descriptor = match weight {
+        None => new_dictionary(&[(key("CTFontFamilyNameAttribute"), name)]),
+        Some(weight) => {
+            let traits = new_dictionary(&[(
+                key("CTFontWeightTrait"),
+                collections::new_number(Number::Float(weight.clamp(-1.0, 1.0))),
+            )]);
+            let descriptor = new_dictionary(&[
+                (key("CTFontFamilyNameAttribute"), name),
+                (key("CTFontTraitsAttribute"), traits),
+            ]);
+            release(traits);
+            descriptor
+        }
+    };
+    let font = make_font(descriptor, if size > 0.0 { size } else { UI_DEFAULT_SIZE });
+    release(descriptor);
+    release(name);
+    crate::font::font_object(font)
+}
+
 pub unsafe extern "C" fn CTFontCreateUIFontForLanguage(
     kind: u32,
     size: f64,
     _language: CFTypeRef,
 ) -> CFTypeRef {
-    // `kCTFontUIFontUserFixedPitch` is 1; every other kind is proportional.
-    let family = fonts::default_family(kind == 1).unwrap_or_else(|| "Sans".to_string());
-    let name = string(&family);
-    let descriptor = new_dictionary(&[(key("CTFontFamilyNameAttribute"), name)]);
-    let font = make_font(descriptor, if size > 0.0 { size } else { 13.0 });
-    release(descriptor);
-    release(name);
-    font
+    // SAFETY: the attributes are a live dictionary, and the returned reference
+    // is the +1 an `NSFont` object holds.
+    unsafe { ui_font(kind, size, None) }
 }
 
 pub unsafe extern "C" fn CTFontCreateWithName(
@@ -377,14 +439,18 @@ pub unsafe extern "C" fn CTFontCreateWithName(
     ]);
     let font = make_font(descriptor, size);
     release(descriptor);
-    font
+    crate::font::font_object(font)
 }
 
 pub unsafe extern "C" fn CTFontCopyFontDescriptor(font: CFTypeRef) -> CFTypeRef {
     if font.is_null() {
         return std::ptr::null();
     }
-    unsafe { corefoundation::api::CFRetain(font) }
+    // A `Copy` returns +1, and a descriptor is a different class from a font
+    // even when the attributes behind them are one dictionary.
+    // SAFETY: the +1 the copy owes.
+    let attributes = unsafe { corefoundation::api::CFRetain(unwrap(font)) };
+    crate::font::descriptor_object(attributes)
 }
 
 /// A font serves as its own graphics font.
@@ -397,9 +463,11 @@ pub unsafe extern "C" fn CTFontCopyGraphicsFont(
     }
     if !attributes.is_null() {
         // SAFETY: the caller supplied the documented optional output pointer.
-        unsafe { *attributes = corefoundation::api::CFRetain(font) };
+        unsafe { *attributes = corefoundation::api::CFRetain(unwrap(font)) };
     }
-    unsafe { corefoundation::api::CFRetain(font) }
+    // SAFETY: the +1 the copy owes.
+    let copy = unsafe { corefoundation::api::CFRetain(unwrap(font)) };
+    crate::font::font_object(copy)
 }
 
 fn copy_string_attribute(font: CFTypeRef, name: &'static str) -> CFTypeRef {
@@ -735,6 +803,10 @@ pub unsafe extern "C" fn CTFontDescriptorCopyAttribute(
     if descriptor.is_null() || attribute.is_null() {
         return std::ptr::null();
     }
+    // A descriptor is an `NSFontDescriptor` object as often as it is a bare
+    // dictionary, and the attribute has to come off the same dictionary either
+    // way.
+    let descriptor = unwrap(descriptor);
     // SAFETY: null, or a dictionary a guest received from this runtime.
     if unsafe { collections::dictionary(descriptor) }.is_none() {
         return std::ptr::null();
@@ -765,7 +837,9 @@ pub unsafe extern "C" fn CTFontDescriptorCreateWithAttributes(attributes: CFType
     if attributes.is_null() {
         return std::ptr::null();
     }
-    unsafe { corefoundation::api::CFRetain(attributes) }
+    // SAFETY: the +1 the create owes, which the descriptor object now holds.
+    let attributes = unsafe { corefoundation::api::CFRetain(unwrap(attributes)) };
+    crate::font::descriptor_object(attributes)
 }
 
 pub unsafe extern "C" fn CTFontDescriptorCreateMatchingFontDescriptor(
@@ -775,8 +849,9 @@ pub unsafe extern "C" fn CTFontDescriptorCreateMatchingFontDescriptor(
     if descriptor.is_null() {
         return std::ptr::null();
     }
+    let descriptor = unwrap(descriptor);
     let info = resolve(descriptor);
-    match info {
+    let attributes = match info {
         Some(info) => {
             let size = get_number(descriptor, "CTFontSizeAttribute").unwrap_or(0.0);
             let resolved = face_attributes(&info, size);
@@ -784,8 +859,10 @@ pub unsafe extern "C" fn CTFontDescriptorCreateMatchingFontDescriptor(
             release(resolved);
             merged
         }
+        // SAFETY: the +1 the copy owes.
         None => unsafe { corefoundation::api::CFRetain(descriptor) },
-    }
+    };
+    crate::font::descriptor_object(attributes)
 }
 
 /// Every face of the descriptor's family, which is how Qt populates a family;
@@ -813,15 +890,27 @@ pub unsafe extern "C" fn CTFontDescriptorCreateMatchingFontDescriptors(
             if faces.is_empty() {
                 return std::ptr::null();
             }
-            let array = collections::new_array(&faces, type_policy(), false);
-            faces.into_iter().for_each(release);
-            return array;
+            return descriptor_array(faces);
         }
     }
     let matching =
         unsafe { CTFontDescriptorCreateMatchingFontDescriptor(descriptor, std::ptr::null()) };
     let array = collections::new_array(&[matching], type_policy(), false);
     release(matching);
+    array
+}
+
+/// Every face of the descriptor's family as descriptor **objects**, which is what
+/// `CTFontDescriptorCreateMatchingFontDescriptors` promises: an array of
+/// `CTFontDescriptorRef`, and a guest that walks it sends each element a
+/// descriptor message.
+fn descriptor_array(faces: Vec<CFTypeRef>) -> CFTypeRef {
+    let descriptors: Vec<CFTypeRef> = faces
+        .into_iter()
+        .map(|attributes| crate::font::descriptor_object(attributes))
+        .collect();
+    let array = collections::new_array(&descriptors, type_policy(), false);
+    descriptors.into_iter().for_each(release);
     array
 }
 
@@ -832,7 +921,8 @@ pub unsafe extern "C" fn CTFontDescriptorCreateCopyWithAttributes(
     if original.is_null() {
         return std::ptr::null();
     }
-    merged_attributes(original, attributes)
+    let merged = merged_attributes(original, attributes);
+    crate::font::descriptor_object(merged)
 }
 
 pub unsafe extern "C" fn CTFontDescriptorCreateWithNameAndSize(
@@ -848,7 +938,7 @@ pub unsafe extern "C" fn CTFontDescriptorCreateWithNameAndSize(
         (key("CTFontSizeAttribute"), size),
     ]);
     release(size);
-    descriptor
+    crate::font::descriptor_object(descriptor)
 }
 
 pub unsafe extern "C" fn CTFontCreateWithFontDescriptor(
@@ -859,7 +949,8 @@ pub unsafe extern "C" fn CTFontCreateWithFontDescriptor(
     if descriptor.is_null() {
         return std::ptr::null();
     }
-    make_font(descriptor, size)
+    let font = make_font(unwrap(descriptor), size);
+    crate::font::font_object(font)
 }
 
 pub unsafe extern "C" fn CTFontCreateCopyWithAttributes(
@@ -878,7 +969,7 @@ pub unsafe extern "C" fn CTFontCreateCopyWithAttributes(
     };
     let result = make_font(merged, size);
     release(merged);
-    result
+    crate::font::font_object(result)
 }
 
 /// A graphics font is the same attributes dictionary as its CTFont.
@@ -935,9 +1026,7 @@ pub unsafe extern "C" fn CTFontCopyDefaultCascadeListForLanguages(
             descriptor
         })
         .collect();
-    let array = collections::new_array(&descriptors, type_policy(), false);
-    descriptors.into_iter().for_each(release);
-    array
+    descriptor_array(descriptors)
 }
 
 pub unsafe extern "C" fn CTFontManagerCopyAvailableFontFamilyNames() -> CFTypeRef {
@@ -961,9 +1050,7 @@ fn descriptors_for(faces: &[FaceInfo]) -> CFTypeRef {
         .iter()
         .map(|face| face_attributes(face, 0.0))
         .collect();
-    let array = collections::new_array(&descriptors, type_policy(), false);
-    descriptors.into_iter().for_each(release);
-    array
+    descriptor_array(descriptors)
 }
 
 /// Register the faces in a font file and describe them.
@@ -998,7 +1085,8 @@ pub unsafe extern "C" fn CTFontManagerCreateFontDescriptorFromData(data: CFTypeR
     let Some(first) = faces.first() else {
         return std::ptr::null();
     };
-    face_attributes(first, 0.0)
+    let attributes = face_attributes(first, 0.0);
+    crate::font::descriptor_object(attributes)
 }
 
 exports::exports! {

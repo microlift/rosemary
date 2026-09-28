@@ -468,8 +468,7 @@ mod parser {
     /// The parser is the load-bearing part of this file, so it is checked
     /// against text that has every shape the tree actually uses.
     #[test]
-    fn the_parser_reads_the_shapes_this_tree_uses() {
-        let src = r#"
+    fn the_parser_reads_the_shapes_this_tree_uses() {        let src = r#"
             /// A doc comment mentioning "exports!" and `groups { }` by name.
             exports::exports! {
                 functions {
@@ -540,6 +539,137 @@ mod parser {
         assert!(
             !exclusive(&[Some("target_os = \"macos\")".into()), Some("target_os = \"macos\")".into())]),
             "two identical cfgs are exclusive on no build"
+        );
+    }
+
+    /// **The positive control**, and the reason the census above can be read as
+    /// a verdict rather than as an absence of complaints.
+    ///
+    /// Every other test in this file runs against a tree that currently has
+    /// exactly one duplicate, and it is allowlisted. So a parser that found
+    /// *nothing* — that read zero rows, that mis-parsed every `|`, that
+    /// normalised the underscore wrongly — would produce a green run
+    /// indistinguishable from a clean tree. That is the same shape as the bug
+    /// this project cares about most: **a wrong answer that looks like success.**
+    ///
+    /// So the duplicate *detector* is run against a fixture that contains a
+    /// duplicate, and required to find it. The fixture is a real file on disk
+    /// because the `cfg` check reads the attribute lines above each row from the
+    /// source: a hand-built `Vec<Row>` has no attributes above it, so the
+    /// `cfg`-exclusive control could not be exercised at all.
+    ///
+    /// `$TMPDIR` and not `/tmp`, which on this host is a **tmpfs backed by RAM** —
+    /// every byte written there is a byte of the machine's memory, and that is
+    /// the direct cause of the OOM kills that have ended agent sessions
+    /// mid-task.
+    #[test]
+    fn the_duplicate_detector_finds_a_duplicate_that_was_planted() {
+        let base = std::env::var_os("TMPDIR")
+            .map(std::path::PathBuf::from)
+            .filter(|p| p.is_dir())
+            .unwrap_or_else(|| std::path::PathBuf::from("/home/frolleks/tmp"));
+        let path = base.join(format!(
+            "darwin-census-control-{}.rs",
+            std::process::id()
+        ));
+        std::fs::write(
+            &path,
+            r#"exports::exports! {
+    functions {
+        "copyfile" => a,
+        // Two rows, one published name: the control. Without the underscore
+        // rule this is two different names and there is no duplicate at all.
+        "syntheticDuplicate" => b,
+        // A name this tree really had duplicated, planted so the *classification*
+        // path is exercised on something a reader recognises.
+        "copyfile" => c,
+        // The two-underscore case. `functions` publishes `"_" + row`, so this
+        // is `__twiceUnderscored`; the `data` row below publishes verbatim, so
+        // the two are one published name and only a section-aware rule sees it.
+        "_twiceUnderscored" => c,
+        // A `cfg`-exclusive pair, which is NOT a duplicate: exactly one of the
+        // two rows is compiled, and a detector that reports this one is
+        // inventing findings.
+        #[cfg(not(target_os = "macos"))]
+        "exclusive" => d,
+        #[cfg(target_os = "macos")]
+        "exclusive" => libc::exclusive,
+    }
+    data {
+        "_syntheticDuplicate" => cell_a(),
+        "__twiceUnderscored" => cell_b(),
+        "_copyfile" => cell_c(),
+    }
+}
+"#,
+        )
+        .expect("write the fixture");
+
+        let rows = rows_of(&path);
+        let _ = std::fs::remove_file(&path);
+        assert!(
+            rows.len() >= 7,
+            "the fixture parsed to only {} row(s), so everything below is vacuous: \
+             {:?}",
+            rows.len(),
+            rows.iter().map(|r| r.name.as_str()).collect::<Vec<_>>()
+        );
+
+        let mut counts: BTreeMap<&str, usize> = BTreeMap::new();
+        for row in &rows {
+            *counts.entry(row.name.as_str()).or_default() += 1;
+        }
+        let mut seen_twice: Vec<&str> = counts
+            .iter()
+            .filter(|(_, n)| **n > 1)
+            .map(|(name, _)| *name)
+            .collect();
+        seen_twice.sort_unstable();
+        // The `cfg`-exclusive pair **is** two rows for one name, so it appears
+        // here.  What must not happen is it appearing in the verdict - and the
+        // classifier is what decides that, so it is asked, separately, below.
+        assert_eq!(
+            seen_twice,
+            vec![
+                "__twiceUnderscored",
+                "_copyfile",
+                "_exclusive",
+                "_syntheticDuplicate"
+            ],
+            "four planted same-name pairs, found. `__twiceUnderscored` is the one \
+             a uniform underscore rule misses: `exports!` publishes `\"_\" + row` \
+             for `functions` and the row verbatim for `data`, so a `functions` row \
+             `\"_foo\"` and a `data` row `\"__foo\"` are the same published name. A \
+             run that reports fewer than four is reading nothing"
+        );
+
+        // The classifier, asked of every one of the four.  `_exclusive` must be
+        // let through and the other three must not: a detector that reports the
+        // exclusive pair is inventing findings, and one that lets a real
+        // duplicate through is a suppression.
+        let mut verdicts: Vec<(&str, bool)> = seen_twice
+            .iter()
+            .map(|name| {
+                let cfgs: Vec<Option<String>> = rows
+                    .iter()
+                    .filter(|r| r.name == *name)
+                    .map(|r| r.cfg.clone())
+                    .collect();
+                (*name, exclusive(&cfgs))
+            })
+            .collect();
+        verdicts.sort_unstable();
+        assert_eq!(
+            verdicts,
+            vec![
+                ("__twiceUnderscored", false),
+                ("_copyfile", false),
+                ("_exclusive", true),
+                ("_syntheticDuplicate", false),
+            ],
+            "the `cfg`-exclusive pair must be classified exclusive and nothing \
+             else may be. Every genuinely exclusive pair in the workspace depends \
+             on this, and so does every real duplicate"
         );
     }
 }

@@ -1356,22 +1356,127 @@ pub unsafe extern "C" fn malloc_zone_statistics(_zone: *mut c_void, stats: *mut 
 
 /// `size_t malloc_size(const void *ptr)`
 ///
-/// Darwin answers the usable size of a block, and zero for a pointer its
-/// allocator does not own. glibc and musl answer the first question as
-/// `malloc_usable_size` and do not answer the second at all, so a pointer that
-/// is not a live block is undefined here where Darwin would have said zero. A
-/// guest asks this about its own blocks, which one allocator owns - see
-/// [`crate::heap`].
+/// Darwin answers the usable size of a block, and **zero for a pointer its
+/// allocator does not own**. The second half is not a detail of the signature,
+/// it is the question the function exists to answer safely: `malloc_zone_from_ptr`
+/// returns NULL for a pointer in no registered malloc zone, and Apple's own
+/// test for this function
+/// (`compiler-rt/test/tsan/Darwin/malloc_size.mm`) asserts `size = 0x0` with
+/// `zone = no zone` for a pointer that is a global and for one that came from
+/// `mmap`. An mmap'd region and a guest arena are in that same class.
+///
+/// glibc and musl answer the first question as `malloc_usable_size` and do not
+/// answer the second at all, so a pointer that is not a live block is undefined
+/// here - and undefined is a **fault**, not a zero, on a host whose
+/// `malloc_usable_size` is mimalloc's: with `MI_DEBUG=0` and not
+/// `defined(__APPLE__)`, mimalloc's `internal.h:668` compiles
+/// `_mi_unchecked_ptr_page`, so `_mi_page_map[p >> 29]` is dereferenced
+/// without being tested. For a pointer in no heap that index is null and the
+/// load faults at `0x00 + ((p >> 16) & 0x1fff) * 8`. Measured: `0x348` and
+/// `0x350` on two runs, from `Framework+0x680e10`'s `_malloc_size`.
+///
+/// So the ownership question is asked first, through [`crate::heap`], and a
+/// pointer that is not a block is answered 0 - **and named**, because a zero
+/// nobody printed is the failure this project exists to prevent. Which is not
+/// a substitute: it is the number Darwin returns for this pointer, and the
+/// pointer in the measurement above was inside a 64 GiB `PROT_NONE` cage this
+/// runtime mapped for the guest, not inside a heap.
 ///
 /// # Safety
 ///
-/// `ptr` is null or a live block from this host's allocator.
+/// `ptr` is null, a live block of this host's allocator, or a pointer the
+/// registered predicate answers `Some(false)` for. A pointer that is neither,
+/// and that the predicate answers `Some(true)` for, is a freed block in a live
+/// segment - which `malloc_usable_size` answers for, as the host's allocator
+/// does, and which Darwin would answer for through its zone's `size` slot.
 pub unsafe extern "C" fn malloc_size(ptr: *const c_void) -> usize {
     if ptr.is_null() {
         return 0;
     }
-    // SAFETY: the caller states `ptr` is a live block of this allocator.
+    if let Some(false) = crate::heap::owns(ptr) {
+        // Not a block, so there is no size. Named and counted, then answered
+        // with the zero Darwin gives.
+        report_not_owned(ptr);
+        return 0;
+    }
+    // SAFETY: the caller states `ptr` is a live block of this allocator, or
+    // that no predicate is registered - in which case there is one allocator
+    // and it is this host's, which is the case `malloc_usable_size` is for.
     unsafe { libc::malloc_usable_size(ptr.cast_mut()) }
+}
+
+/// Distinct foreign pointers [`report_not_owned`] has written down.
+static NOT_OWNED: std::sync::Mutex<Vec<usize>> = std::sync::Mutex::new(Vec::new());
+
+/// Every foreign pointer this run has been asked about, named or not.
+static NOT_OWNED_TOTAL: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Whether the count above has been reported without the pointers it counts.
+static NOT_OWNED_OVERFLOW_SAID: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// How many distinct foreign pointers are written down before the rest are only
+/// counted. A bounded list and an unbounded count, because the count is what a
+/// reader needs to trust and a list of ten thousand addresses is not a log
+/// anyone reads.
+const NOT_OWNED_NAMED: usize = 8;
+
+/// Write `ptr` down, once, as a pointer this host's allocator does not own.
+///
+/// The alternative - handing it to `malloc_usable_size` and letting the
+/// allocator decide what a null first-level page-map entry means - produces a
+/// `SIGSEGV` with no name in it, which is the one outcome worse than a wrong
+/// answer, because it says nothing at all.
+///
+/// Two guards, and each is for a real reason rather than tidiness:
+///
+/// - **One line per distinct address.** A guest asking about the same arena
+///   block in a loop must not produce a log to end all logs.
+/// - **The lock is dropped before the line is printed.** Printing allocates, and
+///   holding a `Mutex` across an allocation in a function a guest can reach is
+///   how a lock ends up held by a thread that then blocks on it. Two guest
+///   threads asking at once serialise on the set and both get counted; neither
+///   holds the lock while the other's event is in flight.
+fn report_not_owned(ptr: *const c_void) {
+    use std::sync::atomic::Ordering;
+
+    NOT_OWNED_TOTAL.fetch_add(1, Ordering::Relaxed);
+    let Ok(mut named) = NOT_OWNED.lock() else {
+        // A poisoned lock means another thread panicked holding it, which means
+        // this process is already in a state the guest will hear about. The
+        // count above still went up, so the zero is accounted for.
+        return;
+    };
+    let at = ptr as usize;
+    if named.contains(&at) {
+        return;
+    }
+    if named.len() < NOT_OWNED_NAMED {
+        named.push(at);
+        drop(named);
+        eprintln!(
+            "rosetta3: malloc_size: {at:#x} is not a block of this host's allocator, so it has \
+             no size and Darwin's answer is 0 - malloc_zone_from_ptr answers NULL for a pointer \
+             in no malloc zone on macOS, and a region this runtime mapped for the guest (a \
+             vm_allocate arena, a guest-side pool) is in that class, not in a heap. Answered 0 \
+             and named, because the same pointer handed to the host's malloc_usable_size faults \
+             at {:#x} instead: with MI_DEBUG=0 and not __APPLE__, mimalloc tests no first-level \
+             page-map entry and this load is from a null submap.",
+            (at >> 16 & 0x1fff) * 8
+        );
+        return;
+    }
+    if !NOT_OWNED_OVERFLOW_SAID.swap(true, Ordering::Relaxed) {
+        drop(named);
+        eprintln!(
+            "rosetta3: malloc_size: {NOT_OWNED_NAMED} distinct foreign pointers have been \
+             answered 0 and written down individually, and {total} have now been answered 0 in \
+             total - the addresses past those {named_at} are counted and not listed, and this \
+             count is a running one, not a final total",
+            total = NOT_OWNED_TOTAL.load(Ordering::Relaxed),
+            named_at = NOT_OWNED_NAMED,
+        );
+    }
 }
 
 exports::exports! {
@@ -1427,6 +1532,113 @@ mod tests {
         unsafe { libc::free(block) };
         // SAFETY: null is the documented no-block case.
         assert_eq!(unsafe { malloc_size(std::ptr::null()) }, 0);
+    }
+
+    /// A registered ownership predicate, and the previous registration restored
+    /// when the guard drops.
+    ///
+    /// The registration is process-global - `crate::heap::register` writes three
+    /// statics - so these tests take the same lock `heap`'s own do, and a test
+    /// running beside one of them is not decided by it either way. The predicate
+    /// answers about **one** address for the same reason.
+    struct OneRefused(
+        Option<(
+            (usize, usize, usize),
+            std::sync::MutexGuard<'static, ()>,
+        )>,
+    );
+
+    impl OneRefused {
+        /// A real, mapped, non-null address that is certainly not a block of
+        /// anything: a leaked byte, so it is still mapped when the test has
+        /// finished and is never dereferenced.
+        ///
+        /// **One address for the whole binary, not one per call.** Leaking a
+        /// fresh byte each time would hand back a different address every call,
+        /// and a predicate comparing against it would answer `true` to
+        /// everything - which is a test that passes while checking nothing,
+        /// which is the failure this exists to catch.
+        fn foreign() -> *const c_void {
+            static FOREIGN: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+            *FOREIGN.get_or_init(|| Box::leak(Box::new(0u8)) as *const u8 as usize) as *const c_void
+        }
+
+        /// `bool(const void *)`: owned, except for [`OneRefused::foreign`].
+        // SAFETY: the signature `crate::heap::register` documents.
+        unsafe extern "C" fn owns(p: *const c_void) -> bool {
+            p != OneRefused::foreign()
+        }
+
+        /// Install that predicate. `0` for `owns` installs none at all.
+        fn install(owns: usize) -> Self {
+            let one_at_a_time = crate::heap::ONE_REGISTRATION_AT_A_TIME
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            let was = crate::heap::registration();
+            crate::heap::register(
+                libc::malloc as *const () as usize,
+                libc::free as *const () as usize,
+                owns,
+            );
+            Self(Some((was, one_at_a_time)))
+        }
+    }
+
+    impl Drop for OneRefused {
+        fn drop(&mut self) {
+            if let Some((was, _lock)) = self.0.take() {
+                crate::heap::register(was.0, was.1, was.2);
+            }
+        }
+    }
+
+    /// A pointer this host's allocator does not own is answered 0 - and a real
+    /// block is still answered its real size, in the same process and under the
+    /// same predicate.
+    ///
+    /// The second half is what stops the first from being a blanket zero, and
+    /// the first is what a reader of a log can check: without it the address
+    /// goes to `malloc_usable_size`, which on a host whose `malloc_usable_size`
+    /// is mimalloc's faults inside the allocator rather than answering.
+    #[test]
+    fn a_pointer_the_allocator_does_not_own_has_no_size_and_a_real_block_still_does() {
+        let _guard = OneRefused::install(OneRefused::owns as *const () as usize);
+        // SAFETY: the predicate installed above says this is not a block, which
+        // is the case the function now handles.
+        assert_eq!(unsafe { malloc_size(OneRefused::foreign()) }, 0);
+        // SAFETY: a block from this host's allocator, freed below.
+        let block = unsafe { libc::malloc(4096) };
+        assert!(!block.is_null());
+        // SAFETY: `block` is live and the predicate says it is one.
+        assert!(unsafe { malloc_size(block) } >= 4096);
+        // SAFETY: `block` came from `malloc` and is not used again.
+        unsafe { libc::free(block) };
+    }
+
+    /// Every zero [`malloc_size`] returns for a pointer nobody owns is counted,
+    /// so a reader can tell "there was no such pointer" from "there were many".
+    #[test]
+    fn a_foreign_pointer_is_counted_as_well_as_answered() {
+        use std::sync::atomic::Ordering;
+        let _guard = OneRefused::install(OneRefused::owns as *const () as usize);
+        let before = NOT_OWNED_TOTAL.load(Ordering::Relaxed);
+        // SAFETY: the installed predicate says it is not a block.
+        unsafe { malloc_size(OneRefused::foreign()) };
+        assert_eq!(NOT_OWNED_TOTAL.load(Ordering::Relaxed), before + 1);
+    }
+
+    /// With no predicate registered the answer is still the host's own, which is
+    /// the case [`crate::heap::owns`] calls `None` and must not be read as "no".
+    #[test]
+    fn with_no_ownership_predicate_the_hosts_own_answer_is_unchanged() {
+        let _guard = OneRefused::install(0);
+        // SAFETY: a block from this host's allocator, freed below.
+        let block = unsafe { libc::malloc(2048) };
+        // SAFETY: `block` is live, and no predicate was installed to say
+        // otherwise.
+        assert!(unsafe { malloc_size(block) } >= 2048);
+        // SAFETY: `block` came from `malloc` and is not used again.
+        unsafe { libc::free(block) };
     }
 
     /// The total is a real number and the fields nothing can answer are zero,

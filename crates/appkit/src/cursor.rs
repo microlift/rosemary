@@ -964,7 +964,7 @@ pub(crate) fn install() {
     let area = objc::class::lookup(c"NSTrackingArea").expect("declared before its methods");
     methods!(area, {
         "initWithRect:options:owner:userInfo:" => init_tracking_area,
-            c"@64@0:8{CGRect={CGPoint=dd}{CGSize=dd}}16Q48@56@64";
+            c"@72@0:8{CGRect={CGPoint=dd}{CGSize=dd}}16Q48@56@64";
         "rect" => tracking_rect, c"{CGRect={CGPoint=dd}{CGSize=dd}}16@0:8";
         "options" => tracking_options, c"Q16@0:8";
         "owner" => tracking_owner, c"@16@0:8";

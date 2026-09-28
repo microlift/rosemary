@@ -231,24 +231,275 @@
 //!
 //! ### What is refused, and why that is an answer
 //!
-//! Every other filter. `EVFILT_READ` and `EVFILT_WRITE` on a *Mach* port name
-//! are not a thing - a Mach port is not a descriptor, and the filters that name
-//! one are about a `vnode` or a filesystem, neither of which exists for a Mach
-//! port. `EVFILT_SIGNAL`, `EVFILT_AIO`, `EVFILT_FS`, `EVFILT_VM` and
-//! `EVFILT_EXCEPT` name a `struct proc`, an I/O request, a mount, a vmspace and
-//! an exception port respectively, and this runtime has none of those to
-//! attach to. The framework's other `kevent64` call sites want
-//! `EVFILT_VNODE`, `EVFILT_TIMER`, `EVFILT_MACHPORT` or a descriptor
-//! `EVFILT_READ`/`EVFILT_WRITE`; of those, `EVFILT_MACHPORT` and
-//! `EVFILT_TIMER` are answered below and the other two are not.
+//! Every other filter, and **every refusal names the filter, the flags, the
+//! `ident`, and how many times that filter has been refused in this process.**
+//! That last part is not decoration. The single `Once` this replaced printed one
+//! paragraph the first time *any* filter was refused and was then silent about
+//! every other one, so a run that refused `EVFILT_VNODE` twenty times and
+//! `EVFILT_AIO` once named only the first - which is the worst shape a refusal
+//! can take here, because the guest gets `EINVAL` as an `EV_ERROR` event's
+//! `data` and gets nothing else either way.
 //!
-//! **Of that refused set, `EVFILT_PROC` was the only one any of these three
-//! callers actually waited on** - and it was not refused by a decision, it was
-//! refused by never being asked: the filter was `EINVAL`ed in
-//! [`crate::kqueue`] before this file was consulted, and silently. Every other
-//! entry above is a filter no caller in the framework blocks on, so their
-//! refusals cost nothing; that is the whole content of the sentence, and it is
-//! why the fix that mattered was making this filter reachable at all.
+//! `EVFILT_READ` and `EVFILT_WRITE` are the case that needs the most care,
+//! because **`EVFILT_READ` on a Mach port and `EVFILT_READ` on a descriptor are
+//! different questions** and the message this file used to print answered the
+//! wrong one. It said, of every `ident` it was handed, "a Mach port is not a
+//! descriptor" - a claim about the *filter*, asserted about the *number*, and
+//! the number is what decides whether the refusal is right. So
+//! [`describe_ident`] looks: a live receive right in this task's port space, a
+//! port set, an open descriptor on this host (`kqueue()` hands back the
+//! readiness descriptor itself, so a guest `ident` can be a real fd), or none of
+//! those, and the refusal says which test it used.
+//!
+//! ### The whole-bundle census: which filters the guest passes, and which it waits on
+//!
+//! The immediate is in the instruction stream, so the census is read out of it
+//! rather than out of a header. Method: every executable section of all
+//! fourteen Mach-O images in the bundle was scanned, **at every byte offset**,
+//! for `e8 <rel32>` landing on `_kevent` (`0xcca0e16`), `_kevent64` (`0xcca1728`)
+//! or `_kqueue` (`0xcca0e1c`) - resolved through the **indirect symbol table
+//! within `__TEXT,__stubs`'s declared size only**, because past that size lies
+//! `__TEXT,__stub_helper`, which is not a 6-byte-stride table and is where a
+//! name comes to have two addresses. Positive control: 12 `_kevent` call sites
+//! in the Framework, the number this file's own note above already claimed.
+//!
+//! | image | `_kevent` | `_kevent64` | `_kqueue` |
+//! |---|--:|--:|--:|
+//! | Chromium Framework | 12 | 9 | 7 |
+//! | chrome_crashpad_handler | 2 | 0 | 1 |
+//! | the other twelve images | 0 | 0 | 0 |
+//!
+//! Every one of those 21 `kevent`/`kevent64` call sites was then disassembled and
+//! its change list read instruction by instruction. The result, with **"wait"**
+//! meaning the call passed a non-zero `nevents` and so could block:
+//!
+//! | call site | change list | wait? | what it is |
+//! |---|---|:--:|---|
+//! | `+0x5d9a9db` | `EVFILT_MACHPORT\|EV_ADD` | **yes** | `WaitableEvent::WaitManyImpl` |
+//! | `+0x5da59fe` | `EVFILT_MACHPORT\|EV_ADD\|MACH_RCV_MSG` + buffer | no | `MessagePumpKqueue`'s wakeup port |
+//! | `+0x5da6e3e` | `EVFILT_MACHPORT\|EV_ADD` | no | the pump's second receive right |
+//! | `+0x5da6427` | none | **yes** | `DoInternalWork`, the wait every pump turn ends in |
+//! | `+0x5da62d7` | `EVFILT_TIMER\|EV_ADD\|EV_ONESHOT`, `fflags 0x2` | no | the pump's deadline timer |
+//! | `+0x5da61cf` | `EVFILT_TIMER\|EV_DELETE` | no | deregistering that timer |
+//! | `+0x5da571e` | `EVFILT_MACHPORT\|EV_DELETE` | no | deregistering a receive right |
+//! | `+0x5da4eec` | `EVFILT_READ\|EV_DELETE` + `EVFILT_WRITE\|EV_DELETE` | no | `MessagePumpKqueue`'s deregistration |
+//! | **`+0x5da7c0d`** | **`EVFILT_READ\|EV_ADD\|EV_ONESHOT`** + `EVFILT_WRITE\|EV_ADD\|EV_ONESHOT` | **no** | **the real refusals - see below** |
+//! | `+0x5afcf72` | `EVFILT_PROC\|EV_ADD`, `NOTE_EXIT` | no | `RelauncherSynchronizeWithParent` |
+//! | `+0x5afd036` | none | **yes** | the relauncher waiting on its own kqueue |
+//! | `+0x5d8cb53` | `EVFILT_PROC\|EV_ADD`, `NOTE_EXIT` | no | `base::WaitForSingleNonChildProcess` |
+//! | `+0x5d8ce63` | none | **yes** | `Process::WaitForExitWithTimeout` |
+//! | `+0x5daa1e2` | `EVFILT_PROC\|EV_ADD`, `NOTE_EXIT` | no | `base::WaitForChildToDie` |
+//! | `+0x5daa304` | none | **yes** | that function's wait, with a deadline |
+//! | `+0x100076801` | `EVFILT_MACHPORT\|EV_ADD\|EV_CLEAR` + `EVFILT_WRITE\|EV_ADD\|EV_CLEAR` | no | crashpad `child_port_handshake.cc:173` |
+//! | `+0x100076a28` | none | **yes** | crashpad's wait on the same queue |
+//!
+//! ### The `EVFILT_READ` refusals are a diagnostic, and here is the whole argument
+//!
+//! **The immediate is not at the call site, and finding it is the whole
+//! difficulty.** `+0x5da7c0d` is the only one of the nine `kevent64` sites whose
+//! change list carries no filter immediate anywhere near it: the list is a
+//! `std::vector` of 48-byte records, built by a loop, and the call only walks
+//! it. The record is filled field by field, and the filter and the flags are
+//! two *separate* stores - which is why a scan for the 8-byte word
+//! `0x00000000_0011ffff` finds **nothing** in the whole 214 MB image, and why
+//! the first pass of this census, which looked for that word, named the wrong
+//! site. The stores are:
+//!
+//! ```text
+//!  5da7a4a  movw  $0xffff,0x8(%r14)   ; filter = EVFILT_READ
+//!  5da7a51  mov   %bx,0xa(%r14)        ; flags  = EV_ADD|EV_ONESHOT, built at +0x5da79c4
+//!  5da7a56  movq  $0x0,0xc(%r14)       ; fflags = 0
+//!  5da7b58  movw  $0xfffe,0x8(%r14)   ; filter = EVFILT_WRITE
+//!  5da7b5f  mov   %bx,0xa(%r14)        ; the same flags
+//!  5da7c0d  call  0xcca1728            ; _kevent64, eventlist NULL, nevents 0
+//! ```
+//!
+//! The flags word is `(%r14b ^ 1) << 4 | 1`, i.e. `EV_ONESHOT` when a bit is
+//! clear and `EV_ONESHOT|EV_DISPATCH` when it is set, always with `EV_ADD`.
+//! **So the guest registers a one-shot read and a one-shot write on a
+//! descriptor, on a kqueue of its own, and then waits on the queue descriptor
+//! some other way.** Three facts follow, and together they settle it.
+//!
+//! **1. `nevents == 0` at `+0x5da7c0d`, so this call cannot block.** Look at
+//! the argument setup at `+0x5da7c05`: `xor %ecx,%ecx` for `eventlist` and
+//! `xor %r8d,%r8d` for `nevents`. There is nowhere for an event to go. Nothing
+//! here can hang a thread, so "the refusals are a hang" is not available, and
+//! the census line says so on every shape for exactly that reason.
+//!
+//! **2. The wait, if there is one, is on the queue *descriptor*, and it is a
+//! `kevent` on the same queue - not on these filters.** The site's own
+//! `MOVUPS`-cleared record and the `leaq 0x38(%r13)` at `+0x5da7a99` are the
+//! pump's own bookkeeping. What the runtime census settles is that a `--headless
+//! --dump-dom about:blank` run reaches this shape **exactly once**
+//! (`ROSETTA3_TRACE_KEVENT=1`, run 218), submits it, and moves on.
+//!
+//! **3. The caller tolerates the failure.** `+0x5da4ef4`, in the sibling
+//! deregistration path, retries only on `EINTR` and otherwise carries on; and
+//! for the registration at `+0x5da7c0d` the shape is submitted by
+//! `MessagePumpKqueue`'s watchable-object bookkeeping, which has already stored
+//! the descriptor it is about to wait on.
+//!
+//! The cost, then, is what the brief describes for a *held* filter: **none**,
+//! because the queue is the thing being waited on and the queue is real. A
+//! refused one-shot registration means the guest is not told *which* readiness
+//! fired - and on this host the `EV_ONESHOT` read was going to be a readiness
+//! this runtime could not have produced truthfully anyway, since a Mach port
+//! that `kevent64` was asked about here is a descriptor, and a descriptor's
+//! readiness is a `poll` on it, which [`crate::kqueue`] does.
+//!
+//! ### How many, and where the "26" came from
+//!
+//! **The 26 in the brief is not what a run does.** With the count in the refusal
+//! message, every run measured here refuses `EVFILT_READ` **once**: runs 215,
+//! 218, 221, 222, 223, 224, 225 and 226 all reach `refusal 1 of this filter`
+//! and no more. The census agrees - the `EVFILT_READ|EV_ADD|EV_ONESHOT` shape
+//! is a single shape, and its count line reads 1 in each.
+//!
+//! So 26 was most likely the number of *runs* that had shown the line, or the
+//! number of images a tool scanned, rather than a count within one run. The
+//! honest statement is the one above: **one registration per run, refused once,
+//! on a call that cannot block.** If 26 ever does appear it will now be
+//! *stated* in the message rather than inferred, which is the only reason to
+//! prefer the counted refusal over a `Once`.
+//!
+//! **What it does cost is the log**, which is why the refusal now says what the
+//! `ident` is and how many times it has happened. The `ident` in a real run is
+//! `0x23`, and the refusal says of it: *not a Mach port in this task's space,
+//! but an open descriptor on this host* - which is the finding, because the
+//! message this replaced asserted the opposite of that about every `ident` it
+//! was handed.
+//!
+//! ### The census is not complete, and the way it is not is worth recording
+//!
+//! The static half found the filter **at the wrong site on the first pass**,
+//! and the reason is general enough to be worth writing down: **a change list
+//! built field-by-field has no filter immediate to find.** `+0x5da7c0d` writes
+//! `filter` and `flags` as two `movw`/`mov` stores eight bytes apart, so the
+//! 8-byte pattern `0x00000000_0011ffff` that encodes all three fields at once -
+//! the shape the three `EVFILT_PROC` sites use - **occurs zero times in the
+//! image**. A scan that looks for the combined word reports "no `EVFILT_READ`
+//! registration anywhere", and the first pass of this census did exactly that
+//! and named `+0x5da4eec` instead.
+//!
+//! What caught it was the *runtime* half: the refusal now prints the flags it
+//! was actually handed, and they were `EV_ADD|EV_ONESHOT` where the static
+//! census said `EV_DELETE`. A number that contradicts the census is the whole
+//! point of printing it.
+//!
+//! The rule that follows: **a static census of change lists is a lower bound,
+//! and only a lower bound.** What makes this one exhaustive is not the
+//! immediates - it is that all 21 call sites were disassembled and every one of
+//! their argument setups read, including the sites whose list is built
+//! elsewhere. Positive control for the call-site scan: 12 `_kevent` sites,
+//! 9 `_kevent64`, 7 `_kqueue` in the Framework, 2 and 1 in
+//! `chrome_crashpad_handler`, and the three `EVFILT_PROC` 8-byte words at
+//! exactly `0x5afcf4b`, `0x5d8cb12`, `0x5daa1b4` - the last of which is the
+//! positive control for the immediate scan too, and the reason the trap below
+//! was caught rather than believed.
+//!
+//! ### The trap: `macho.py`'s `stub_at` gives one name two addresses
+//!
+//! Walking `__TEXT,__stubs` past its **declared size** lands in
+//! `__TEXT,__stub_helper`, which is not a 6-byte-stride table, and an index
+//! computed there resolves to a plausible-looking wrong name. Resolving
+//! `_kevent` that way yields **two** addresses, `0xcca0e16` and `0xcca3318`,
+//! and the second is in `__stub_helper`. Within the declared size there is
+//! **one**: `0xcca0e16`, whose bytes are `ff 25 5c a1 9d 01`, a real
+//! `jmp qword ptr [rip+…]` thunk. Every address in the table above is resolved
+//! within the declared size, and every call site found is a `call rel32` landing
+//! on one of them.
+//!
+//! (The separate claim about `ff 25 <disp32>` thunks - 1580 thunks, 1580
+//! distinct names, none with more than one - is about a different thing and is
+//! not re-litigated here.)
+//!
+//! ### `EVFILT_VNODE` is waited on, and is the one refusal that could be a wall
+//!
+//! Two `FilePathWatcherKQueue` classes register `EVFILT_VNODE` and then block on
+//! it - `base::FilePathWatcherKQueue` and
+//! `content::file_system_access::FilePathWatcherKQueue`, at `+0x5d9e968`,
+//! `+0x5d9f56e`, `+0x3a9ab38` and `+0x3a9b73e`, every one of them
+//! `kevent(kq, changes, n, out, n, NULL)`: a **null timeout and room for
+//! events**, which is a wait. The registration word is identical in all four and
+//! decodes as the tag's source spells it,
+//! `EV_SET(&event, fd, EVFILT_VNODE, EV_ADD|EV_CLEAR|EV_RECEIPT, <all seven notes>, 0, data)`:
+//!
+//! ```text
+//!  3a9a9b8  movabs rax,0x6f0061fffc
+//!  3a9a9c2  mov    rax,0x8(%r12)         ; filter 0xfffc, flags 0x0061, fflags 0x0000006f
+//! ```
+//!
+//! with `0x6f` being `NOTE_DELETE|NOTE_WRITE|NOTE_EXTEND|NOTE_ATTRIB|NOTE_LINK|
+//! NOTE_RENAME|NOTE_REVOKE`. (The `__FILE__` strings that attribute those two
+//! functions are in the image: `0xd809888` is
+//! `content/browser/file_system_access/file_path_watcher/file_path_watcher_kqueue.cc`
+//! and `0xd8f03b8` is `base/files/file_path_watcher_kqueue.cc`, with
+//! `0xd8097f0` naming the `fsevents` sibling as a control.)
+//!
+//! **So the sentence this file used to close with - that `EVFILT_PROC` was the
+//! only filter any of these callers waited on - was true only of the three
+//! `EVFILT_PROC` callers, and false of the framework.** It is corrected. What
+//! ### It is reached: `EVFILT_VNODE` costs this run four refused registrations
+//!
+//! **A first measurement said otherwise and was wrong, and the way it was wrong
+//! is the useful part.** `ROSETTA3_TRACE_KEVENT=1` over runs 215, 216 and 218
+//! showed **no `EVFILT_VNODE` shape at all**, and I wrote that the watcher is
+//! not constructed in a `--headless` run. Runs 219 and 220, same command, same
+//! binary, no code change in between: **four `EVFILT_VNODE` refusals each.** The
+//! census is not lying in either direction - it prints every shape a run reaches
+//! - so the difference is in **the run**, not the tool.
+//!
+//! What differs is the browser's own start-up order, which is what the
+//! nondeterministic wall in the brief is about: a run that gets further reaches
+//! the watcher, a run that aborts earlier does not. `EVFILT_VNODE` is therefore
+//! reached *sometimes*, and which sometimes is not something this file can say.
+//!
+//! The census lines for it, from run 223, are the two shapes there are:
+//!
+//! | shape | count | verdict |
+//! |---|--:|---|
+//! | `EVFILT_VNODE\|EV_ADD\|EV_CLEAR\|EV_RECEIPT`, `fflags 0x6f`, 1 change, 1 event slot | 1 | **can block** |
+//! | the same, 3 changes, 3 event slots | 2 | **can block** |
+//!
+//! **So the honest verdict on `EVFILT_VNODE` is: refused, reached, blocking, and
+//! not yet the wall.** The three `fflags 0x6f` registrations are refused with
+//! `EINVAL`; `kevent` then answers `-1`; and at every one of the four call sites
+//! the guest retries only on `EINTR` and otherwise falls through to a path that
+//! proceeds - so a refused `EVFILT_VNODE` is **not** a hang, and the run carries
+//! on. What it costs is a file watcher that never fires, which in a
+//! `--dump-dom about:blank` run means nothing observable, and which in a
+//! browsing run would be a silently dead `FileSystemAccess` watch.
+//!
+//! **It is implemented now, and the paragraph that used to say otherwise is
+//! this one's error record.** It read: *"Implementing it is the honest next step
+//! and is not attempted here. The truthful answer is `inotify` on the watched
+//! path's parent directory plus a self-write on the file, and this host's
+//! `inotify` cannot distinguish `NOTE_WRITE` on a directory from `IN_ATTRIB`,
+//! nor report `NOTE_RENAME` against a name."* Both halves of that are wrong, and
+//! wrongly in the direction of refusing more than the evidence requires:
+//!
+//! * **A watch does not need the parent directory.** `inotify_add_watch` on the
+//!   object itself is enough, and this filter's `ident` is a descriptor the
+//!   caller holds, so the path comes from `/proc/self/fd/<ident>` - the object's
+//!   own path, not its parent's. The parent-plus-self-write scheme is what you
+//!   would do for a *name*; the `ident` here is a descriptor, which is the thing
+//!   XNU attaches the knote to.
+//! * **`inotify` separates both of those, and it was measured rather than
+//!   assumed.** A watched directory's child create arrives as `IN_CREATE` **with
+//!   a name**, and a watched directory's *own* metadata change arrives as
+//!   `IN_ATTRIB` **without one**; and a rename of the watched object arrives as
+//!   `IN_MOVE_SELF`, which is a statement about the object rather than a name, so
+//!   `NOTE_RENAME` needs no name to be reported against. What `inotify` genuinely
+//!   cannot do is fold `NOTE_EXTEND` out of `IN_MODIFY`, or `NOTE_LINK` out of
+//!   `IN_ATTRIB` - and the answer to that is not a refusal, it is a narrowing:
+//!   see [`VNODE_UNREPORTABLE`], and [`VNODE_DROPPED_BY_THE_GUEST`] for the
+//!   measurement that this guest never reads those two bits back.
+//!
+//! So the filter is answered on a real `inotify` watch, in [`crate::kqueue`], for
+//! the five notes a measured `inotify` event can carry, and the remaining notes
+//! are **dropped from the interest and named** rather than mapped to the nearest
+//! event. A note this implementation cannot observe never appears in a delivered
+//! `fflags`.
 //!
 //! Also refused, by name and with a message: a `fflags` receive option beyond
 //! [`MACH_RCV_MSG`] ([`refused_receive_option`]), a `MACH_RCV_MSG` registration
@@ -300,9 +551,9 @@
 //! the failure this file is written to avoid: Chromium would spin on a
 //! `mach_msg` that can never return a message.
 
-use std::collections::HashMap;
-use std::ffi::c_int;
-use std::sync::{Arc, Mutex, OnceLock};
+use std::collections::{HashMap, HashSet};
+use std::ffi::{c_int, c_void};
+use std::sync::{Arc, Mutex, OnceLock, Weak};
 
 use super::space::{self, Name};
 
@@ -344,7 +595,16 @@ const _: () = {
 const EVFILT_READ: i16 = -1;
 const EVFILT_WRITE: i16 = -2;
 const EVFILT_AIO: i16 = -3;
-const EVFILT_VNODE: i16 = -4;
+/// `EVFILT_VNODE`, from the same `<sys/event.h>` as the rest of this block:
+/// `EVFILT_VNODE = -4`.
+///
+/// **`pub` because [`crate::kqueue`] serves it**, for the same reason
+/// [`EVFILT_PROC`] is: the framework's two `FilePathWatcherKQueue` classes reach
+/// this filter through `_kevent` - the 32-bit `struct kevent` at the stub
+/// `0xcca0e16` - and never through this file's `kevent64`, so the constant is what
+/// `crate::kqueue::kevent` switches on to find its way here. The spelling is
+/// this module's so that the number exists exactly once in the crate.
+pub const EVFILT_VNODE: i16 = -4;
 /// `EVFILT_PROC`, from the same `<sys/event.h>` as the rest of this block:
 /// `EVFILT_PROC = -5`.
 ///
@@ -1226,7 +1486,7 @@ fn apply(state: &mut Queue, change: &Kevent64) -> Result<(), i32> {
         return apply_proc(state, change);
     }
     if change.filter != EVFILT_MACHPORT {
-        return Err(refused_filter(change.filter, change.ident));
+        return Err(refused_filter(change));
     }
     if change.flags & !SERVED != 0 {
         return Err(refused_action(change.flags, change.ident));
@@ -1640,20 +1900,274 @@ fn filter_name(filter: i16) -> &'static str {
     }
 }
 
-/// A filter this file will not answer, named.
-fn refused_filter(filter: i16, ident: u64) -> i32 {
-    static SAID: std::sync::Once = std::sync::Once::new();
-    SAID.call_once(|| {
-        eprintln!(
-            "rosetta3: kevent64 refused {} ({filter}) on ident {ident:#x}: a Mach port is not a \
-             descriptor, and the filters that name one are about a vnode or a filesystem, neither \
-             of which a Mach port has. EVFILT_MACHPORT (-8) answers \"is there a message on this \
-             port\", EVFILT_TIMER (-7) answers \"has this deadline passed\" on a real timerfd, and \
-             EVFILT_PROC (-5) answers \"has this process exited\" on a real pidfd - all three are \
-             answered",
-            filter_name(filter)
+/// The filter's `flags` word, spelled out.
+///
+/// Only the action bits, because only they say what the change *asks for*:
+/// `EV_ADD` is "start watching", `EV_DELETE` is "stop watching", and the
+/// difference is the whole of whether a refusal costs anything. A word with no
+/// action bit in it is not a change at all, and saying so is better than
+/// printing a hex number the reader has to decode.
+fn flags_meaning(flags: u16) -> String {
+    const NAMES: [(u16, &str); 10] = [
+        (EV_ADD, "EV_ADD"),
+        (EV_DELETE, "EV_DELETE"),
+        (EV_ENABLE, "EV_ENABLE"),
+        (EV_DISABLE, "EV_DISABLE"),
+        (EV_ONESHOT, "EV_ONESHOT"),
+        (EV_CLEAR, "EV_CLEAR"),
+        (EV_RECEIPT, "EV_RECEIPT"),
+        (EV_DISPATCH, "EV_DISPATCH"),
+        (EV_ERROR, "EV_ERROR"),
+        (EV_EOF, "EV_EOF"),
+    ];
+    let mut out = String::new();
+    for (bit, name) in NAMES {
+        if flags & bit != 0 {
+            if !out.is_empty() {
+                out.push('|');
+            }
+            out.push_str(name);
+        }
+    }
+    if out.is_empty() {
+        out.push_str("no action bit");
+    }
+    out.push_str(&format!(" ({flags:#06x})"));
+    out
+}
+
+/// What the `ident` of a refused change actually is in this runtime.
+///
+/// **This is the question the old message answered by assertion.** It said "a
+/// Mach port is not a descriptor" about every `ident` it was handed, and that
+/// is a claim about the *filter*, not about the *number* - and the number is
+/// the thing that decides whether the refusal is right. The guest's own
+/// `EVFILT_READ` changes carry whatever its caller had in a register, which on
+/// this host can be a real descriptor number (`kqueue()` hands back the
+/// readiness descriptor itself), so "it is a Mach port" is not something this
+/// function is entitled to say without looking.
+///
+/// **`pub` so that [`crate::kqueue`] uses this one derivation rather than a
+/// second copy of it**, for the same reason it takes `EVFILT_PROC` and `Proc`
+/// from here: two classifiers that could drift would be two places for a
+/// diagnostic to start lying.
+///
+/// So it looks, in this order, and says which test it used:
+///
+/// * a live receive right in this task's port space - a Mach port;
+/// * a port set in this task's space - a Mach port set;
+/// * not a name in this task's space, but an open descriptor on this host -
+///   a real descriptor, which is the case where the truthful answer exists and
+///   is `EVFILT_READ` as poll readiness, in [`crate::kqueue`];
+/// * neither, so the number names nothing here at all.
+pub fn describe_ident(ident: u64) -> String {
+    let name = name_of(ident);
+    if space::receiver(name).is_some() {
+        return format!("a live receive right in this task's Mach port space (port {name:#x})");
+    }
+    if let Some(members) = space::members(name) {
+        return format!(
+            "a Mach port set in this task's space (set {name:#x}, {} member(s))",
+            members.len()
         );
-    });
+    }
+    match c_int::try_from(ident) {
+        Ok(fd) if unsafe { libc::fcntl(fd, libc::F_GETFD) } >= 0 => format!(
+            "NOT a Mach port in this task's space, but an open descriptor ({fd}) on this host - so \
+             this filter could be answered, as poll readiness, by _kevent rather than by kevent64"
+        ),
+        Ok(fd) => format!(
+            "neither a Mach port in this task's space nor an open descriptor here ({fd} is closed \
+             or was never open)"
+        ),
+        Err(_) => format!(
+            "not a Mach port in this task's space, and not a descriptor number this host could \
+             have issued either ({ident:#x} is larger than any fd)"
+        ),
+    }
+}
+
+/// The frames above a census line's own, for tying a call shape to a call site.
+///
+/// **A deliberate exception to "never walk the frame", and gated twice.** The
+/// alternatives are all fragile - "assume no prologue was emitted" is not a
+/// property Rust promises, and this project has been bitten by assuming things
+/// about codegen before - whereas `std`'s walker is the one implementation that
+/// knows about omitted frame pointers. It is reached only from a census line,
+/// and only on the first sighting of a shape, so the cost is never paid on a
+/// path that matters.
+///
+/// **What it prints is the host's frames, and under the native backend the host's
+/// *is* the guest's** - that identity is the basis of this crate's reasoning
+/// about `thread_get_state` too. So a frame that resolves to no host symbol is
+/// guest code, and its address is the guest's own, to be looked up in the image.
+///
+/// It is printed through `Display`, which is the stable interface; `frames()` and
+/// `ip()` are still unstable, and this file is not going to be the reason a build
+/// needs a nightly. A symbolicated frame reads
+/// `   3: 0x5da4eec - <unknown>`, and the `3:` is the count of frames above
+/// this runtime's own - which is what makes the call site findable.
+fn announce_call_site() {
+    eprintln!(
+        "rosetta3: kevent64: frames above this line, innermost first. A frame with no symbol is \
+         guest code; its address is the guest's own and is one of the 21 call sites named in \
+         crate::mach::kevent64's module note.\n{frames}",
+        frames = std::backtrace::Backtrace::force_capture(),
+    );
+}
+
+/// Whether the run asked for the kevent census.
+///
+/// Read **once** through a `OnceLock`, because the answer cannot change and this
+/// is on the path of every change. With the variable unset - the default - the
+/// census is one atomic load and a `return`.
+fn census_wanted() -> bool {
+    use std::sync::OnceLock;
+    static WANTED: OnceLock<bool> = OnceLock::new();
+    *WANTED.get_or_init(|| std::env::var_os("ROSETTA3_TRACE_KEVENT").is_some())
+}
+
+/// One line per distinct **shape** of `kevent64` call, with a running count.
+///
+/// **Off by default; env-gated on `ROSETTA3_TRACE_KEVENT`.** It is the runtime
+/// half of the census in this module's note, and it exists because the static
+/// half cannot answer the one question that decides whether a refusal is a
+/// wall: *did this run reach it at all?* A filter the guest registers nowhere
+/// in the image and a filter the guest registers on the first line of start-up
+/// look identical in a disassembly.
+///
+/// "Shape" is everything about the call that changes what it asks for: the
+/// filter and flags of the first change, whether a change list was submitted at
+/// all, whether there was room for an event (which is what makes the call a
+/// **wait** rather than a registration), and whether a timeout was given. A
+/// `nevents == 0` call cannot block, and that is the single fact this file's
+/// refusals turn on.
+///
+/// The count is printed on the first sighting of a shape and then at every
+/// power of two, so the number converges without a log line per call.
+fn announce_call_shape(
+    changes: &[Kevent64],
+    nchanges: i32,
+    nevents: i32,
+    flags: u32,
+    immediate: bool,
+    timeout: *const libc::timespec,
+) {
+    if !census_wanted() {
+        return;
+    }
+    type Key = (i16, u16, u32, bool, bool, bool, bool);
+    let first = changes.first();
+    let key: Key = (
+        first.map_or(0, |c| c.filter),
+        first.map_or(0, |c| c.flags),
+        first.map_or(0, |c| c.fflags),
+        nchanges > 0,
+        nevents > 0,
+        !timeout.is_null(),
+        immediate,
+    );
+    use std::sync::OnceLock;
+    static SEEN: OnceLock<Mutex<HashMap<Key, u32>>> = OnceLock::new();
+    let nth = {
+        let mut seen = SEEN
+            .get_or_init(Default::default)
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let slot = seen.entry(key).or_insert(0);
+        *slot += 1;
+        *slot
+    };
+    // First sighting, then every doubling: 1, 2, 4, 8, ... 16, 32, 64, ...
+    // The frames are printed only on the *first* sighting: a backtrace costs
+    // real time, and one per shape is enough to tie a shape to a call site.
+    let first_time = nth == 1;
+    if !nth.is_power_of_two() {
+        return;
+    }
+    if first_time {
+        announce_call_site();
+    }
+    let filter = match first {
+        Some(c) => format!(
+            "{} ({}) with {}",
+            filter_name(c.filter),
+            c.filter,
+            flags_meaning(c.flags)
+        ),
+        None => "no change list at all".to_string(),
+    };
+    eprintln!(
+        "rosetta3: kevent64: {nth} call(s) of this shape - {filter}, fflags {:#x}, \
+         {nchanges} change(s), {nevents} event slot(s) so {}, timeout {}, \
+         the flags word {flags:#x} so KEVENT_FLAG_IMMEDIATE is {}. {}",
+        first.map_or(0, |c| c.fflags),
+        if nevents > 0 {
+            "this call can block, so anything refused in it is a possible hang"
+        } else {
+            "this call cannot block, so nothing refused in it can hang a thread"
+        },
+        if timeout.is_null() {
+            "NULL, which means wait forever"
+        } else if is_zero(unsafe { &*timeout }) {
+            "a zero timespec, which means do not wait"
+        } else {
+            "a deadline"
+        },
+        if immediate { "set" } else { "clear" },
+        if nchanges > 0 && first.is_some_and(|c| c.flags & EV_ADD == 0) {
+            "The change list carries no EV_ADD, so this is a deregistration: the registration it \
+             names was never made by this call."
+        } else {
+            "The change list carries EV_ADD, so this call does register something."
+        },
+    );
+}
+
+/// How many times each filter has been refused by this file.
+///
+/// **Per filter, and not one `Once` for the whole set.** A single `Once` is the
+/// worst shape this refusal can take: the guest gets `EINVAL` as an `EV_ERROR`
+/// event's `data` and *we* get one line, so a run that refuses `EVFILT_READ`
+/// twenty-six times says so once, and a run that goes on to refuse
+/// `EVFILT_VNODE` says nothing about that at all. The count is what turns "this
+/// happened" into "this happened twenty-six times, and here is the number".
+fn refusal_count(filter: i16) -> u32 {
+    use std::sync::OnceLock;
+    static COUNTS: OnceLock<Mutex<HashMap<i16, u32>>> = OnceLock::new();
+    let counts = COUNTS.get_or_init(Default::default);
+    let mut counts = counts.lock().unwrap_or_else(|e| e.into_inner());
+    let slot = counts.entry(filter).or_insert(0);
+    *slot += 1;
+    *slot
+}
+
+/// A filter this file will not answer, **named, per filter, and counted**.
+///
+/// The `Once` this replaces printed one paragraph the first time any filter was
+/// refused and was silent about every other one. Two things were wrong with
+/// that. It could not say *how often*, which is the difference between a
+/// diagnostic and a wall. And it asserted what the `ident` was; see
+/// [`describe_ident`].
+fn refused_filter(change: &Kevent64) -> i32 {
+    let (filter, ident) = (change.filter, change.ident);
+    let nth = refusal_count(filter);
+    // The first few one at a time, because twenty-six is a fact worth having
+    // exactly; after that every thousandth, so a run that refuses in a loop
+    // cannot turn the log into the wall.
+    if nth <= 8 || nth % 1000 == 0 {
+        eprintln!(
+            "rosetta3: kevent64 refused {} ({filter}) with {} on ident {ident:#x}, which is {} \
+             [refusal {nth} of this filter in this process]. This kevent64 answers EVFILT_MACHPORT \
+             (-8) - \"is there a message on this port\", including receiving one into the caller's \
+             buffer - EVFILT_TIMER (-7) on a real timerfd, and EVFILT_PROC (-5) on a real pidfd; \
+             every other filter is refused here by name. The whole-crate census of what the guest \
+             passes, and which of it is waited on, is in crate::mach::kevent64's module note",
+            filter_name(filter),
+            flags_meaning(change.flags),
+            describe_ident(ident),
+        );
+    }
     crate::errno::from_host(libc::EINVAL)
 }
 
@@ -2138,6 +2652,11 @@ pub unsafe extern "C" fn kevent64(
         0 => &[][..],
         n => unsafe { std::slice::from_raw_parts(changelist, n as usize) },
     };
+    // The runtime census reports the *shape* of each call, and the frames above
+    // it, so that a shape can be tied to the call site that produced it. All 21
+    // call sites are named with their addresses in this module's note, so a
+    // frame list is enough to say which of them a run reached.
+    announce_call_shape(changes, nchanges, nevents, flags, immediate, timeout);
     {
         let mut state = state.lock().unwrap_or_else(|e| e.into_inner());
         for change in changes {
@@ -2498,6 +3017,1255 @@ fn announce_empty_wait() {
              and no message can arrive to wake it. Darwin blocks here forever; EINVAL is refused \
              instead, because a caller that is told can say what it asked for and a caller that \
              is not told gets a hang with nothing in the log to explain it"
+        );
+    });
+}
+
+// ---------------------------------------------------------------------------
+// `EVFILT_VNODE`
+// ---------------------------------------------------------------------------
+
+/// The seven public `EVFILT_VNODE` notes, quoted from XNU's `bsd/sys/event.h`:
+///
+/// ```c
+/// #define NOTE_DELETE     0x00000001   /* vnode was removed */
+/// #define NOTE_WRITE      0x00000002   /* data contents changed */
+/// #define NOTE_EXTEND     0x00000004   /* size increased */
+/// #define NOTE_ATTRIB     0x00000008   /* attributes changed */
+/// #define NOTE_LINK       0x00000010   /* link count changed */
+/// #define NOTE_RENAME     0x00000020   /* vnode was renamed */
+/// #define NOTE_REVOKE     0x00000040   /* vnode access was revoked */
+/// #define NOTE_NONE       0x00000080   /* No specific vnode event ... */
+/// #define NOTE_FUNLOCK    0x00000100   /* vnode was unlocked by flock(2) */
+/// #define NOTE_LEASE_DOWNGRADE 0x00000200
+/// #define NOTE_LEASE_RELEASE   0x00000400
+/// ```
+///
+/// `0x6f` - and the note that `0x6f` is **six** of the seven, not all seven.
+///
+/// This file used to call it "the seven from `NOTE_DELETE` to `NOTE_REVOKE`",
+/// and that is false in a way that mattered, because the whole narrowing argument
+/// was written on the difference. `NOTE_DELETE | NOTE_WRITE | NOTE_EXTEND |
+/// NOTE_ATTRIB | NOTE_LINK | NOTE_RENAME | NOTE_REVOKE` is **`0x7f`**; `0x6f` has
+/// **`NOTE_LINK` (`0x10`) missing**. So the framework asks for six notes, and the
+/// one it leaves out is precisely the one `inotify` cannot carry.
+///
+/// Verified against the running guest rather than by arithmetic alone: run 245's
+/// registration line reads `fflags 0x6f`, the interest it was narrowed to is
+/// **`0x6b`**, and exactly **one** note is named as dropped - `NOTE_EXTEND`. The
+/// arithmetic says the same thing: `0x6f & VNODE_UNREPORTABLE == 0x4`, not `0x14`.
+///
+/// The immediates are at `Chromium Framework+0x3a9a9ba`, `+0x3a9aed0`,
+/// `+0x3a9af8d`, `+0x5d9e7ea`, `+0x5d9ed00` and `+0x5d9edbd`, and nowhere else -
+/// **six sites, one constant**, with the `0xfffc` being `EVFILT_VNODE` and the
+/// `0x0061` being `EV_ADD|EV_CLEAR|EV_RECEIPT`. The census behind those six is in
+/// this module's note; the positive control for the scan is the `EVFILT_PROC` word
+/// `0x8000_0000_0001_fffb`, which the same byte scan finds at exactly the three
+/// addresses already claimed for it.
+const NOTE_DELETE: u32 = 0x0000_0001;
+const NOTE_WRITE: u32 = 0x0000_0002;
+const NOTE_EXTEND: u32 = 0x0000_0004;
+const NOTE_ATTRIB: u32 = 0x0000_0008;
+const NOTE_LINK: u32 = 0x0000_0010;
+const NOTE_RENAME: u32 = 0x0000_0020;
+const NOTE_REVOKE: u32 = 0x0000_0040;
+
+/// `NOTE_REVOKE`, `pub` for the one decision that is [`crate::kqueue`]'s rather
+/// than this file's: `filt_vnode_common` sets `EV_EOF | EV_ONESHOT` on a
+/// `NOTE_REVOKE`, so the delivery of that note is the delivery that removes the
+/// knote, and only the code doing the delivering can act on that.
+pub const VNODE_REVOKE: u32 = NOTE_REVOKE;
+const NOTE_NONE: u32 = 0x0000_0080;
+const NOTE_FUNLOCK: u32 = 0x0000_0100;
+const NOTE_LEASE_DOWNGRADE: u32 = 0x0000_0200;
+const NOTE_LEASE_RELEASE: u32 = 0x0000_0400;
+
+/// Every `EVFILT_VNODE` note `<sys/event.h>` gives a name to.
+const VNODE_NOTES: u32 = NOTE_DELETE
+    | NOTE_WRITE
+    | NOTE_EXTEND
+    | NOTE_ATTRIB
+    | NOTE_LINK
+    | NOTE_RENAME
+    | NOTE_REVOKE
+    | NOTE_NONE
+    | NOTE_FUNLOCK
+    | NOTE_LEASE_DOWNGRADE
+    | NOTE_LEASE_RELEASE;
+
+/// The notes this implementation can report, each with a **measured** `inotify`
+/// event behind it.
+///
+/// This set is not a judgement about what a file watcher needs; it is the set
+/// for which this host produces an event that says *the same thing*, and each row
+/// of the table in the module note carries the XNU call site that raises the note
+/// and the `inotify` row measured on this host that carries the same fact. The
+/// complement - [`VNODE_UNREPORTABLE`] - is the set with no such row, and it is
+/// **dropped from the registration's interest rather than mapped to the nearest
+/// event**, because a note this implementation cannot observe must never appear
+/// in a delivered `fflags`.
+///
+/// The narrowing is safe *for this guest* because of a measurement, not an
+/// assumption: see [`VNODE_DROPPED_BY_THE_GUEST`].
+const VNODE_REPORTABLE: u32 =
+    NOTE_WRITE | NOTE_ATTRIB | NOTE_DELETE | NOTE_RENAME | NOTE_REVOKE;
+
+/// The notes with no `inotify` event that says the same thing.
+///
+/// **`NOTE_EXTEND` and `NOTE_LINK` are the two this host will not report**, and
+/// the reasons are different in kind:
+///
+/// * `NOTE_EXTEND` ("size increased") is a *narrowing* of `NOTE_WRITE` ("data
+///   contents changed"). `inotify` reports one bit, `IN_MODIFY`, for both, and
+///   does not say which happened. Reporting `NOTE_EXTEND` on the strength of an
+///   `IN_MODIFY` would claim a size change that may not have happened; refusing
+///   it claims only what was measured. `NOTE_WRITE` carries the same fact with
+///   the wider scope XNU gives it. **The framework does ask for this one**, so it
+///   is the one that is actually dropped - see [`VNODE_DROPPED_BY_THE_GUEST`].
+/// * `NOTE_LINK` ("link count changed") is folded by `inotify` into the *same*
+///   bit as a metadata change, `IN_ATTRIB`, and there is nothing in the event
+///   that says which. This one is not even a narrowing, so it cannot be papered
+///   over: see [`Vnode::attrib_note`], which resolves it with a `stat` of the
+///   link count rather than by picking a bit. **The framework does not ask for
+///   it** - `0x6f` leaves `NOTE_LINK` out - so on this guest that ambiguity is
+///   never posed, and a link count going up is reported as no note at all.
+///
+/// The rest are not vnode notes a caller can usefully ask for: `NOTE_NONE` is
+/// `<sys/event.h>`'s own "No specific vnode event" bit, and the lease and
+/// `flock` notes are advisory requests XNU answers by waking a lease holder or
+/// nothing at all, with no filesystem event anywhere near them.
+const VNODE_UNREPORTABLE: u32 =
+    NOTE_EXTEND | NOTE_LINK | NOTE_NONE | NOTE_FUNLOCK | NOTE_LEASE_DOWNGRADE
+    | NOTE_LEASE_RELEASE;
+
+/// The one of [`VNODE_UNREPORTABLE`] the framework's own registration asks for,
+/// and a measurement that it costs nothing.
+///
+/// **`0x6f & VNODE_UNREPORTABLE == 0x4` - one note, not two.** This constant used
+/// to be `NOTE_EXTEND | NOTE_LINK` on the strength of "`0x6f` is the seven notes",
+/// which is false: `NOTE_LINK` is not in `0x6f` at all. The corrected reading is
+/// *better* for the implementation, not worse, and it is worth being exact about
+/// why:
+///
+/// * the guest asks for `NOTE_EXTEND` and does **not** get it, because `IN_MODIFY`
+///   does not say the file grew - so this is the one place where the delivered
+///   `fflags` is narrower than what the caller asked for, and it is narrower
+///   *because of a measurement*;
+/// * the guest never asks for `NOTE_LINK`, so the `IN_ATTRIB`-is-ambiguous
+///   question it raises in [`Vnode::attrib_note`] is a question **this guest does
+///   not pose**. A link count going up produces no note, and nothing in the
+///   framework would have looked for one.
+///
+/// The narrowing is safe *for this guest* because of a measurement of its own
+/// delivered-event handling, not an inference from the change list:
+/// in `Chromium Framework+[0x5d9efb0, 0x5d9f900)` and its line-for-line twin
+/// `+[0x3a9b180, 0x3a9ba20)`, the *only* immediates used with `test`, `and` or
+/// `cmp` are
+///
+/// ```text
+///  5d9f1dd  and  edx,0x8      ; NOTE_ATTRIB
+///  5d9f2ba  test al,0x61     ; NOTE_DELETE | NOTE_RENAME | NOTE_REVOKE
+///  5d9f337  test al,0x2      ; NOTE_WRITE
+/// ```
+///
+/// plus `-1`, `EINTR` (4), `0x7fffffff` and two boolean `test`s on `0x1`. **No
+/// `0x4` and no `0x10` anywhere in either body**, and the two bodies produce
+/// byte-identical greps at the same line numbers, which is the positive control
+/// that the scan covers both.
+///
+/// A change list is a *filter*: it says what a caller would like, not what it
+/// checks on the way out. Dropping the one bit it never checks therefore costs the
+/// watcher nothing, and keeps the five it does check honest.
+///
+/// **`pub` so that [`crate::kqueue`]'s test checks this arithmetic against a
+/// constant rather than restating it**, which is the difference between a claim
+/// and a claim that can rot.
+pub const VNODE_DROPPED_BY_THE_GUEST: u32 = NOTE_EXTEND;
+
+/// `inotify` event bits, from `&lt;sys/inotify.h&gt;`. Named rather than written
+/// inline because the whole argument of [`Vnode::translate`] is that each note
+/// has a *specific* event behind it, and a hex number cannot be checked against
+/// a header.
+const IN_ACCESS: u32 = 0x0000_0001;
+const IN_MODIFY: u32 = 0x0000_0002;
+const IN_ATTRIB: u32 = 0x0000_0004;
+const IN_CLOSE_WRITE: u32 = 0x0000_0008;
+const IN_CLOSE_NOWRITE: u32 = 0x0000_0010;
+const IN_OPEN: u32 = 0x0000_0020;
+const IN_MOVED_FROM: u32 = 0x0000_0040;
+const IN_MOVED_TO: u32 = 0x0000_0080;
+const IN_CREATE: u32 = 0x0000_0100;
+const IN_DELETE: u32 = 0x0000_0200;
+const IN_DELETE_SELF: u32 = 0x0000_0400;
+const IN_MOVE_SELF: u32 = 0x0000_0800;
+const IN_UNMOUNT: u32 = 0x0000_2000;
+const IN_Q_OVERFLOW: u32 = 0x0000_4000;
+const IN_IGNORED: u32 = 0x0000_8000;
+
+/// The `inotify` mask that corresponds to [`VNODE_REPORTABLE`].
+///
+/// Narrowed the way the note mask is, and for the same reason: `inotify` takes a
+/// filter too, and asking for events whose note is not in the caller's interest
+/// would be work whose result is then thrown away. `IN_IGNORED` has no mask bit
+/// - the kernel sends it whenever it drops a watch - and `IN_UNMOUNT` and
+/// `IN_Q_OVERFLOW` are not asked for because neither has a vnode note; both are
+/// refused by name in [`Vnode::translate`].
+///
+/// **Measured, because the accepted set is not the obvious one:** on this host
+/// `inotify_add_watch` accepts `0x6fff` and `0xfff` and rejects `0x1fff` and
+/// `0xffff` with `EINVAL`, so the "all reportable bits" set is not a mask.
+const VNODE_INOTIFY_MASK: u32 = IN_MODIFY
+    | IN_ATTRIB
+    | IN_MOVED_FROM
+    | IN_MOVED_TO
+    | IN_CREATE
+    | IN_DELETE
+    | IN_DELETE_SELF
+    | IN_MOVE_SELF;
+
+/// The action bits an `EVFILT_VNODE` is served for.
+///
+/// The same [`SERVED`] set, and each bit means what it means for the other
+/// filters: `EV_CLEAR` is honoured by clearing the accumulated note word after
+/// a delivery (XNU's `knote_fill_kevent_with_sdata` does `if (kn->kn_flags &
+/// EV_CLEAR) kn->kn_fflags = 0;`), `EV_ONESHOT` and `EV_DISPATCH` by dropping
+/// and disabling the registration after one delivery.
+const VNODE_SERVED: u16 = SERVED;
+
+/// What one `EVFILT_VNODE` change asks for, decided with no reference to any
+/// queue's tables.
+///
+/// The `EVFILT_VNODE` half of [`VnodeChange`]'s contract, and shaped exactly like
+/// [`ProcChange`] because it is the same question: what does this change mean,
+/// and is this implementation allowed to answer it.
+pub enum VnodeChange {
+    /// `EV_ADD`: watch the object behind `ident` for the notes in `mask`.
+    Watch {
+        /// The `fflags` after the unreportable notes have been dropped, and
+        /// never zero - a change that asks only for notes this host cannot
+        /// report is [`VnodeChange::Refused`], not a watch that never fires.
+        mask: u32,
+        /// The bits dropped out of `mask`, so the caller of this function can
+        /// name them rather than silently keep a narrower filter.
+        dropped: u32,
+        /// `EV_ADD` "implies enable", so this is false only when `EV_DISABLE`
+        /// was in the same word.
+        enabled: bool,
+        udata: u64,
+    },
+    /// `EV_DELETE`: forget the registration, which removes the `inotify` watch.
+    Delete,
+    /// `EV_ENABLE` or `EV_DISABLE` on a registration that is already there.
+    Armed { enabled: bool },
+    /// The change was rejected. The number is **Darwin's**, for the same reason
+    /// [`ProcChange::Refused`]'s is.
+    Refused(i32),
+}
+
+/// Decide what an `EVFILT_VNODE` change means, and whether it is allowed.
+///
+/// **This is the whole of the narrowing decision, and it happens before any
+/// `inotify` is touched.** The order matters and is the reference's order:
+///
+/// 1. An action bit outside [`VNODE_SERVED`] is refused, because a caller that
+///    asked for a filter-specific `EV_FLAG0` and got a vnode watch would be
+///    holding a subscription it did not ask for.
+/// 2. A `NOTE_` bit outside [`VNODE_NOTES`] is refused with `ENOTSUP`, which is
+///    what `filt_procattach` gives for a `NOTE_` it does not implement and what
+///    a caller can tell apart from a note that is merely narrower than it asked.
+/// 3. The unreportable notes are then **dropped** and named, and only a change
+///    that asked for *nothing else* is refused - with `EINVAL`, and by name,
+///    because a registration that succeeds and can never fire is the one
+///    outcome this file is written to avoid.
+pub fn vnode_change(ident: u64, flags: u16, fflags: u32, udata: u64) -> VnodeChange {
+    if flags & !VNODE_SERVED != 0 {
+        return VnodeChange::Refused(refused_vnode_action(flags, ident));
+    }
+    if fflags & !VNODE_NOTES != 0 {
+        return VnodeChange::Refused(refused_vnode_note(ident, fflags));
+    }
+    let dropped = fflags & VNODE_UNREPORTABLE;
+    let mask = fflags & !VNODE_UNREPORTABLE;
+    if mask == 0 {
+        return VnodeChange::Refused(refused_vnode_mask(ident, fflags));
+    }
+    if flags & EV_DELETE != 0 {
+        return VnodeChange::Delete;
+    }
+    if flags & (EV_ENABLE | EV_DISABLE) != 0 && flags & EV_ADD == 0 {
+        return VnodeChange::Armed {
+            enabled: flags & EV_ENABLE != 0,
+        };
+    }
+    VnodeChange::Watch {
+        mask,
+        dropped,
+        enabled: flags & EV_DISABLE == 0,
+        udata,
+    }
+}
+
+/// The `inotify` instance a kqueue's `EVFILT_VNODE` watches live in.
+///
+/// **One per kqueue, and that is a decision with a reason.** The alternative -
+/// one process-wide instance - has to be added to every kqueue that has *any*
+/// vnode registration, so an event on queue A's file makes queue B's descriptor
+/// readable, and queue B then wakes, finds nothing, and goes back to sleep. That
+/// is harmless to this guest and it is still a readiness report about a queue
+/// that had no event, which is the shape of thing this project refuses. One
+/// instance per queue makes the descriptor that `epoll` reports readable *this
+/// queue's own* pending vnode events, and nothing else can put anything on it.
+///
+/// The map is `wd -> watch`, and the watch is a [`Weak`]: the queue's table owns
+/// the [`Vnode`], and this map must not keep one alive after an `EV_DELETE` or
+/// after the queue itself has gone. [`Inotify::drain`] upgrades, and drops the
+/// entry when the upgrade fails.
+pub struct Inotify {
+    /// The `inotify` descriptor, `IN_NONBLOCK | IN_CLOEXEC`.
+    ///
+    /// **Non-blocking because the reader is not the only reader.** Two threads
+    /// can be inside `kevent` on the same queue - the wait and a
+    /// zero-timeout collection from another task - and a blocking `read` on the
+    /// second one would wait for an event that the first is about to consume.
+    fd: c_int,
+    watches: Mutex<HashMap<c_int, Weak<Vnode>>>,
+}
+
+impl Drop for Inotify {
+    fn drop(&mut self) {
+        // The watches went with the `Vnode`s that own them; this closes the
+        // descriptor, which is the only other thing this owns.
+        unsafe { libc::close(self.fd) };
+    }
+}
+
+impl Inotify {
+    /// A fresh instance, or the host's `errno`.
+    pub fn new() -> Result<Self, i32> {
+        // `IN_NONBLOCK | IN_CLOEXEC` = 0o4000 | 0o2000000.
+        let fd = unsafe { libc::syscall(libc::SYS_inotify_init1, 0o2004000) } as c_int;
+        if fd < 0 {
+            return Err(crate::errno::to_host(crate::errno::get()));
+        }
+        Ok(Self {
+            fd,
+            watches: Mutex::new(HashMap::new()),
+        })
+    }
+
+    /// The descriptor to put in a `poll`/`epoll` set.
+    pub fn raw_fd(&self) -> c_int {
+        self.fd
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<c_int, Weak<Vnode>>> {
+        self.watches.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Add `watch` and return its `inotify` watch descriptor.
+    fn insert(&self, watch: &Arc<Vnode>) -> c_int {
+        let mut watches = self.lock();
+        watches.insert(watch.wd, Arc::downgrade(watch));
+        watch.wd
+    }
+
+    /// Forget `wd`, and stop the kernel sending anything more for it.
+    ///
+    /// **The order is load-bearing.** Removing the watch from this module's own
+    /// map is what makes the `IN_IGNORED` the kernel sends in reply to
+    /// `inotify_rm_watch` *not* become a `NOTE_REVOKE`: an `IN_IGNORED` whose
+    /// `wd` is no longer in the map is dropped, which is right, because the
+    /// object it was about is one the caller has just stopped watching. The
+    /// kernel's `IN_IGNORED` means "the watch is gone", and the two reasons a
+    /// watch goes - the object went, or the caller said so - are not the same
+    /// fact, and only the first is a `NOTE_REVOKE`.
+    fn remove(&self, wd: c_int) {
+        self.lock().remove(&wd);
+        // SAFETY: `wd` came from `inotify_add_watch` on this instance. A
+        // failure here means the watch is already gone, which is the state the
+        // caller asked for either way, so the number is not worth reporting.
+        unsafe { libc::syscall(libc::SYS_inotify_rm_watch, self.fd, wd) };
+    }
+
+    /// Read every queued event, and fold each into the pending note word of the
+    /// watch it belongs to. Returns how many watches gained a note.
+    ///
+    /// **An event whose `wd` is not in the map is dropped**, which is the case
+    /// described on [`Inotify::remove`] plus the case of a watch whose queue has
+    /// gone. It is also the case `IN_Q_OVERFLOW` arrives in, and that one is
+    /// named rather than dropped: see [`refused_vnode_overflow`].
+    pub fn drain(&self) -> usize {
+        let mut buffer = [0u8; 16 * 1024];
+        let mut fired = 0usize;
+        let mut woken: Vec<Arc<Vnode>> = Vec::new();
+        loop {
+            let n = unsafe {
+                libc::read(
+                    self.fd,
+                    buffer.as_mut_ptr().cast::<c_void>(),
+                    buffer.len(),
+                )
+            };
+            if n <= 0 {
+                // `EAGAIN` is the normal end: the descriptor is non-blocking and
+                // there is nothing left. Anything else is this host failing to
+                // hand over its own events, and it is named below.
+                if n < 0 {
+                    // The host's own number, and it is compared with the host's
+                    // own `EAGAIN` - not translated, because the translation is
+                    // in the other direction and a `from_host` here would make
+                    // the normal end of every drain look like a failure.
+                    let errno = crate::errno::get();
+                    if errno != libc::EAGAIN {
+                        refused_vnode_read(errno);
+                    }
+                }
+                break;
+            }
+            let mut offset = 0usize;
+            while offset + 16 <= n as usize {
+                let (wd, mask, _cookie, len) = {
+                    let b = &buffer[offset..offset + 16];
+                    (
+                        i32::from_ne_bytes([b[0], b[1], b[2], b[3]]),
+                        u32::from_ne_bytes([b[4], b[5], b[6], b[7]]),
+                        u32::from_ne_bytes([b[8], b[9], b[10], b[11]]),
+                        u32::from_ne_bytes([b[12], b[13], b[14], b[15]]) as usize,
+                    )
+                };
+                let name_len = len.min(buffer.len() - offset - 16);
+                let named = name_len != 0
+                    && buffer[offset + 16..offset + 16 + name_len]
+                        .split(|byte| *byte == 0)
+                        .next()
+                        .is_some_and(|name| !name.is_empty());
+                offset += 16 + len;
+                if mask & IN_Q_OVERFLOW != 0 {
+                    refused_vnode_overflow();
+                    continue;
+                }
+                if mask & IN_UNMOUNT != 0 {
+                    refused_vnode_unmount();
+                    continue;
+                }
+                let Some(watch) = self
+                    .lock()
+                    .get(&wd)
+                    .and_then(Weak::upgrade)
+                    .filter(|watch| !woken.iter().any(|seen| Arc::ptr_eq(seen, watch)))
+                else {
+                    continue;
+                };
+                if watch.note(mask, named) {
+                    if !woken.iter().any(|seen| Arc::ptr_eq(seen, &watch)) {
+                        woken.push(watch);
+                    }
+                    fired += 1;
+                }
+            }
+        }
+        fired
+    }
+}
+
+/// One `EVFILT_VNODE` registration: an `inotify` watch, and the note word it has
+/// accumulated.
+///
+/// **`ident` is a descriptor, and the descriptor is not what is watched.** The
+/// guest's `open(path, O_EVTONLY)` is answered on this host with `O_PATH`
+/// ([`crate::fcntl`], and the reason it is the same capability), and
+/// `inotify_add_watch` takes a *pathname*, not a descriptor - measured: it
+/// answers `EFAULT` for an `O_PATH` descriptor, because the second argument is a
+/// `const char *`. So the path is recovered from `/proc/self/fd/<ident>` and the
+/// object it names is checked against the object the descriptor holds, twice.
+/// That check is the whole of the difference between watching what the caller
+/// opened and watching whatever is at that name later, and XNU has no such
+/// window because it attaches the knote to the `vnode` the descriptor holds.
+pub struct Vnode {
+    /// The kqueue's descriptor, remembered only so the wait can name it.
+    queue: c_int,
+    /// `ident` as the descriptor it is.
+    ///
+    /// **This is what [`Vnode::attrib_note`] asks about, and not `path`.** A knote
+    /// in XNU is attached to the *vnode*, and the descriptor holds that vnode;
+    /// the path is only a name for it, and the name can be given to a different
+    /// object. It is also the only one of the two that still answers after an
+    /// `unlink` - measured, an `unlink` of a watched file leaves `fstat` on the
+    /// still-open `O_PATH` descriptor reporting `nlink = 0` while `stat` on the
+    /// path is already `ENOENT`, so a link-count drop on a file with no names
+    /// left is invisible to anything that stats the path.
+    fd: c_int,
+    /// The `inotify` instance this registration's watch lives in.
+    inotify: Arc<Inotify>,
+    /// The `inotify` watch descriptor, from `inotify_add_watch`.
+    wd: c_int,
+    /// The path recovered from `/proc/self/fd/<ident>`, and the only thing a
+    /// later `stat` can be asked about.
+    path: Vec<u8>,
+    /// `(st_dev, st_ino)` of the object the descriptor held at registration,
+    /// checked before and after `inotify_add_watch`.
+    identity: (u64, u64),
+    /// The link count at registration and after the last `IN_ATTRIB`. Zero means
+    /// "unknown", and it is only ever reached by a `stat` that failed.
+    nlink: Mutex<u64>,
+    /// Whether a `NOTE_DELETE` has already been reported for this watch.
+    ///
+    /// **It exists because the two events that mean "this vnode lost a name" are
+    /// both real, in that order, and reporting the fact twice is a busy watcher.**
+    /// Measured: an `unlink` of a watched file delivers `IN_ATTRIB` while the
+    /// descriptor is open, and `IN_DELETE_SELF` when it is closed - and
+    /// `FilePathWatcherKQueue::HandleDeleteOrMoveChange` closes the descriptor as
+    /// soon as it has seen the first one, so on this guest the second event is
+    /// guaranteed to arrive. XNU posts `NOTE_DELETE` once, from `VNOP_REMOVE`.
+    delete_reported: std::sync::atomic::AtomicBool,
+    /// The notes that have fired since the last delivery. `EV_CLEAR` empties it;
+    /// XNU's `knote_fill_kevent_with_sdata` empties `kn_fflags` on exactly the
+    /// same condition, and this is that.
+    pending: Mutex<u32>,
+    /// The `fflags` after the narrowing, i.e. the `kn_sfflags` this knote has.
+    mask: u32,
+    /// The caller's own `ident`, `udata` and narrowed `fflags`, echoed in a
+    /// delivered event exactly as XNU echoes them.
+    ident: u64,
+    udata: u64,
+}
+
+impl Drop for Vnode {
+    fn drop(&mut self) {
+        self.inotify.remove(self.wd);
+    }
+}
+
+impl Vnode {
+    /// Watch the object the descriptor `ident` holds, for the notes in `mask`.
+    ///
+    /// `inotify` is this kqueue's instance; the watch is added to it, so it is
+    /// the descriptor that has to be waited on, and it is
+    /// [`Inotify::raw_fd`] rather than `ident` that goes into the readiness set.
+    pub fn watch(
+        queue: c_int,
+        inotify: Arc<Inotify>,
+        ident: u64,
+        mask: u32,
+        udata: u64,
+    ) -> Result<Arc<Self>, i32> {
+        let Some(fd) = c_int::try_from(ident).ok() else {
+            refused_vnode_ident(ident);
+            return Err(crate::errno::from_host(libc::EBADF));
+        };
+        // `EV_ADD` names a descriptor, and one that is not open is `EBADF` at
+        // registration rather than at the first wait - which is where BSD reports
+        // it, and the only place a caller looks.
+        let before = match stat_of(fd) {
+            Some(stat) => stat,
+            None => {
+                let errno = crate::errno::get();
+                refused_vnode_ident(ident);
+                return Err(crate::errno::to_host(errno));
+            }
+        };
+        let path = path_of(fd)?;
+        if inotify
+            .lock()
+            .values()
+            .filter_map(Weak::upgrade)
+            .any(|watch| watch.identity == (before.dev, before.ino) && watch.ident == ident)
+        {
+            refused_vnode_twice(ident, &path);
+            return Err(crate::errno::from_host(libc::EEXIST));
+        }
+        if stat_path(&path).map(|now| (now.dev, now.ino)) != Some((before.dev, before.ino)) {
+            refused_vnode_identity(ident, &path);
+            return Err(crate::errno::from_host(libc::EINVAL));
+        }
+        let wd = {
+            let Ok(name) = std::ffi::CString::new(path.clone()) else {
+                return Err(crate::errno::from_host(libc::EINVAL));
+            };
+            // SAFETY: `name` is a NUL-terminated path with no interior NUL, and
+            // the pointer is valid for the length of the call.
+            let wd = unsafe {
+                libc::syscall(
+                    libc::SYS_inotify_add_watch,
+                    inotify.raw_fd(),
+                    name.as_ptr(),
+                    VNODE_INOTIFY_MASK,
+                )
+            } as c_int;
+            if wd < 0 {
+                let errno = crate::errno::get();
+                refused_vnode_watch(ident, &path, errno);
+                return Err(crate::errno::to_host(errno));
+            }
+            wd
+        };
+        // The second half of the identity check, and the reason it is done twice:
+        // a path can be replaced between the `stat` and the `inotify_add_watch`,
+        // and a watch on the wrong inode reports changes for a file the caller
+        // never opened.
+        if stat_of(fd).map(|now| (now.dev, now.ino)) != Some((before.dev, before.ino)) {
+            inotify.remove(wd);
+            refused_vnode_identity(ident, &path);
+            return Err(crate::errno::from_host(libc::EINVAL));
+        }
+        let watch = Arc::new(Self {
+            queue,
+            fd,
+            wd,
+            path,
+            identity: (before.dev, before.ino),
+            nlink: Mutex::new(before.nlink),
+            delete_reported: std::sync::atomic::AtomicBool::new(false),
+            pending: Mutex::new(0),
+            mask,
+            ident,
+            udata,
+            inotify: Arc::clone(&inotify),
+        });
+        inotify.insert(&watch);
+        Ok(watch)
+    }
+
+    /// The `inotify` instance this registration is watched through, which is
+    /// what the kqueue waits on and is **not** `ident`.
+    pub fn inotify_fd(&self) -> c_int {
+        self.inotify.raw_fd()
+    }
+
+    /// A second registration on the same queue must join the *same* instance, or
+    /// the queue would have two `inotify` descriptors and a `drain` on one would
+    /// never see the other's events.
+    pub fn shared_inotify(&self) -> Arc<Inotify> {
+        Arc::clone(&self.inotify)
+    }
+
+    /// The kqueue this registration belongs to, for a trace line.
+    pub fn queue(&self) -> c_int {
+        self.queue
+    }
+
+    /// The caller's `ident`, echoed in a delivered event.
+    pub fn ident(&self) -> usize {
+        self.ident as usize
+    }
+
+    /// The caller's `udata`, echoed in a delivered event.
+    pub fn udata(&self) -> usize {
+        self.udata as usize
+    }
+
+    /// The `fflags` this knote is interested in, after the narrowing.
+    pub fn mask(&self) -> u32 {
+        self.mask
+    }
+
+    /// Fold one `inotify` event into the pending note word. Returns whether
+    /// anything was added.
+    fn note(&self, mask: u32, named: bool) -> bool {
+        let translated = self.translate(mask, named);
+        if translated == 0 {
+            return false;
+        }
+        let mut pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
+        // A delivered word never carries a bit outside the caller's interest:
+        // this is the `kn_sfflags` intersection `filt_vnode_common` performs
+        // with `if (kn->kn_sfflags & hint)`.
+        let gained = translated & self.mask & !*pending;
+        *pending |= translated & self.mask;
+        gained != 0
+    }
+
+    /// The whole of the note-to-event mapping, one row at a time.
+    ///
+    /// **`named` is the distinction that carries the argument.** A name is
+    /// present exactly when the event is about an entry *inside* a watched
+    /// directory, and absent when it is about the watched object itself, and
+    /// those two cases are two different translations rather than one.
+    fn translate(&self, mask: u32, named: bool) -> u32 {
+        if named {
+            // The directory's contents changed. XNU raises `NOTE_WRITE` on the
+            // *directory* for every one of these, and each row below is the XNU
+            // call site that says so:
+            //
+            //   inotify      XNU (`bsd/vfs/kpi_vfs.c`)                        note
+            //   IN_CREATE    VNOP_MKNOD:  `post_event_if_success(dvp, NOTE_WRITE)`  NOTE_WRITE
+            //   IN_DELETE    VNOP_REMOVE: `post_event_if_success(dvp, NOTE_WRITE)`  NOTE_WRITE
+            //   IN_MOVED_*   VNOP_RENAME: `int events = NOTE_WRITE; ... dvp`       NOTE_WRITE
+            //
+            // `IN_ATTRIB` with a name is **not** in that table and must not be
+            // added to it: it is a *child's* metadata change, and XNU raises it
+            // on the child's own vnode (`VNOP_SETXATTR`:
+            // `post_event_if_success(vp, error, NOTE_ATTRIB)`), where this
+            // registration has no knote. Putting `NOTE_ATTRIB` on the parent
+            // would claim the parent's metadata changed, which is a claim about
+            // a different file - so nothing is reported for it, and the fact is
+            // reported by the child's own watch, which is where XNU puts it.
+            if mask & (IN_CREATE | IN_DELETE | IN_MOVED_FROM | IN_MOVED_TO) != 0 {
+                return NOTE_WRITE;
+            }
+            return 0;
+        }
+        let mut note = 0;
+        if mask & IN_MODIFY != 0 {
+            // `write(2)` and `truncate(2)` on the object. XNU:
+            // `lock_vnode_and_post(pvp, NOTE_WRITE)` in `vfs_syscalls.c`, and
+            // `VNOP_SETATTR` with `va_flags` set. `NOTE_EXTEND` is *not* set
+            // here even though XNU may set it too, because `IN_MODIFY` does not
+            // say the size grew - see `VNODE_UNREPORTABLE`.
+            note |= NOTE_WRITE;
+        }
+        if mask & IN_DELETE_SELF != 0
+            && !self
+                .delete_reported
+                .swap(true, std::sync::atomic::Ordering::Relaxed)
+        {
+            // The object has no names left. XNU `VNOP_REMOVE`:
+            // `post_event_if_success(vp, _err, NOTE_DELETE | NOTE_LINK)` - of which
+            // only the `NOTE_DELETE` half is reportable here, and which XNU posts
+            // **once** even though the vnode goes on to be recycled. So the
+            // `IN_ATTRIB` that already said so is not said again here; see
+            // `delete_reported`.
+            note |= NOTE_DELETE;
+        }
+        if mask & IN_MOVE_SELF != 0 {
+            // The object was renamed. XNU `VNOP_RENAME`:
+            // `lock_vnode_and_post(fvp, NOTE_RENAME)`, on the renamed-from
+            // vnode, with `NOTE_DELETE` on the renamed-to one.
+            note |= NOTE_RENAME;
+        }
+        if mask & IN_IGNORED != 0 {
+            // The kernel dropped the watch because the object is gone, which is
+            // XNU's `vnode_recycle`: `KNOTE(&vp->v_knotes, NOTE_REVOKE)`. The
+            // two reasons a watch goes - the object went, or the caller removed
+            // it - are told apart by whether the `wd` is still in the map; see
+            // `Inotify::remove`.
+            note |= NOTE_REVOKE;
+        }
+        if mask & IN_ATTRIB != 0 {
+            note |= self.attrib_note();
+        }
+        note
+    }
+
+    /// `IN_ATTRIB` is one bit for three facts, so this decides which it is.
+    ///
+    /// **XNU has three notes here and `inotify` has one event**, and only two of
+    /// them are a narrowing of the others:
+    ///
+    /// | fact | XNU | `inotify` |
+    /// |---|---|---|
+    /// | a name for this vnode was removed | `VNOP_REMOVE`: `NOTE_DELETE \| NOTE_LINK` | `IN_ATTRIB` |
+    /// | a name was added (a hard link) | `VNOP_LINK`: `NOTE_LINK` | `IN_ATTRIB` |
+    /// | mode, ownership, xattrs, timestamps | `VNOP_SETATTR`: `NOTE_ATTRIB` | `IN_ATTRIB` |
+    ///
+    /// The link count is therefore read and compared with the value from the last
+    /// time it was read, which is what separates all three:
+    ///
+    /// * **down** - a name for this vnode was removed, and `NOTE_DELETE` is
+    ///   reported. This is XNU's own `NOTE_DELETE`, raised by `VNOP_REMOVE` on the
+    ///   *vnode*, whichever of its names was unlinked - and it is the case that
+    ///   matters here, because it is the **only** one of the three that
+    ///   `IN_DELETE_SELF` does not also carry: measured, an `unlink` of a watched
+    ///   file with its `O_PATH` descriptor still open delivers **`IN_ATTRIB` and
+    ///   nothing else**, and `IN_DELETE_SELF` and `IN_IGNORED` arrive only when
+    ///   the last reference to the inode goes, which for `FilePathWatcherKQueue`
+    ///   is after `HandleDeleteOrMoveChange` has closed the descriptor. So without
+    ///   this the framework would learn about a deleted file on the *second*
+    ///   collection rather than the first.
+    /// * **up** - a hard link, and **nothing** is reported, because the note is
+    ///   `NOTE_LINK` and `NOTE_LINK` is refused by name. Reporting `NOTE_ATTRIB`
+    ///   would be a claim macOS does not make: `VNOP_LINK` posts
+    ///   `post_event_if_success(vp, _err, NOTE_LINK)` and nothing else.
+    /// * **unchanged** - `NOTE_ATTRIB`, which is what XNU posts for a mode,
+    ///   ownership or xattr change.
+    /// * **the count cannot be read** - nothing is reported, and the remembered
+    ///   count is set to zero, which is a value no live object can have and
+    ///   therefore makes every later `IN_ATTRIB` on this registration silent
+    ///   rather than wrong.
+    ///
+    /// **The count is read with `fstat` on the descriptor, and not with `stat` on
+    /// the path.** Two reasons, and the second is the one that was a bug:
+    ///
+    /// * A knote in XNU is attached to the vnode and the descriptor holds that
+    ///   vnode, while the path is a *name* that can be handed to a different
+    ///   object - which is the window [`Vnode::watch`] checks twice for and would
+    ///   then quietly walk into here.
+    /// * After an `unlink` the path does not exist, so `stat` is `ENOENT` and the
+    ///   link count is unreadable at exactly the moment it is the only thing that
+    ///   distinguishes a delete from a metadata change. Measured: `fstat` on the
+    ///   open `O_PATH` descriptor reports `nlink = 0` where `stat` on the path
+    ///   reports `ENOENT`.
+    ///
+    /// The path is still the fallback, for a registration whose descriptor is no
+    /// longer open - which is silent rather than wrong, per the last bullet above.
+    ///
+    /// **The one imprecision, stated rather than hidden.** A `write` updates the
+    /// modification time and a `truncate` is a `VNOP_SETATTR`, and either can come
+    /// with an `IN_ATTRIB` that is a real metadata change, which *is* reported. If
+    /// this host raised `IN_ATTRIB` for a timestamp alone, where XNU posts only
+    /// `NOTE_WRITE` from `write(2)`'s `lock_vnode_and_post(pvp, NOTE_WRITE)`, that
+    /// would be a *superset* by one bit on an event that already carries
+    /// `NOTE_WRITE`. **Measured on this host, it does not**: a plain append
+    /// delivers `IN_MODIFY` alone, and a `truncate` delivers `IN_MODIFY` alone.
+    /// So there is no superset here to bound, and the imprecision is recorded as
+    /// absent rather than argued about. It would still be named in
+    /// [`announce_vnode_delivered`] if it ever appeared.
+    fn attrib_note(&self) -> u32 {
+        let mut remembered = self.nlink.lock().unwrap_or_else(|e| e.into_inner());
+        let note = match stat_of(self.fd).or_else(|| stat_path(&self.path)) {
+            Some(now) if now.nlink < *remembered => {
+                *remembered = now.nlink;
+                NOTE_DELETE
+            }
+            Some(now) if now.nlink > *remembered => {
+                *remembered = now.nlink;
+                0
+            }
+            Some(_) => NOTE_ATTRIB,
+            None => {
+                *remembered = 0;
+                0
+            }
+        };
+        if note & NOTE_DELETE != 0 {
+            self.delete_reported.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+        note
+    }
+
+    /// The notes waiting to be delivered, and whether to leave them waiting.
+    ///
+    /// `clear` is `EV_CLEAR`, and it empties the word after the caller has read
+    /// it - `knote_fill_kevent_with_sdata` clears `kn_fflags` at the same point
+    /// in the same order, after the copy-out has been prepared.
+    pub fn take_pending(&self, clear: bool) -> u32 {
+        let mut pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
+        let word = *pending;
+        if clear {
+            *pending = 0;
+        }
+        word
+    }
+
+    /// The `flags` a delivered event carries.
+    ///
+    /// **The caller's own word, plus the kernel's additions, and the additions
+    /// are the reference's.** `<sys/event.h>`'s `EV_RECEIPT` line and XNU's
+    /// `kevent_register` together make the caller's `EV_ADD` part of the word
+    /// already - the same argument as `PROC_DELIVERED_FLAGS`, for the same
+    /// reason. And `filt_vnode_common` adds two bits of its own on a
+    /// `NOTE_REVOKE`:
+    ///
+    /// ```c
+    /// if (NOTE_REVOKE == hint) {
+    ///         kn->kn_flags |= (EV_EOF | EV_ONESHOT);
+    /// ```
+    ///
+    /// so a `NOTE_REVOKE` event is the last one this knote gives: the framework
+    /// reads neither `flags` nor `data` off a vnode event, but a caller that did
+    /// is owed the truth, and the truth is that the object is at end of file and
+    /// the knote is one-shot.
+    pub fn delivered_flags(&self, note: u32) -> u16 {
+        let mut flags = EV_ADD;
+        if note & NOTE_REVOKE != 0 {
+            flags |= EV_EOF | EV_ONESHOT;
+        }
+        flags
+    }
+}
+
+/// What one `stat` was asked for.
+struct Stat {
+    dev: u64,
+    ino: u64,
+    nlink: u64,
+}
+
+fn stat_of(fd: c_int) -> Option<Stat> {
+    // SAFETY: `fd` is a descriptor the caller holds, and `stat` fills a
+    // `struct stat` this module owns.
+    let mut out: libc::stat = unsafe { std::mem::zeroed() };
+    if unsafe { libc::fstat(fd, &raw mut out) } < 0 {
+        return None;
+    }
+    Some(Stat {
+        dev: out.st_dev as u64,
+        ino: out.st_ino as u64,
+        nlink: out.st_nlink as u64,
+    })
+}
+
+fn stat_path(path: &[u8]) -> Option<Stat> {
+    let mut name = path.to_vec();
+    name.push(0);
+    let mut out: libc::stat = unsafe { std::mem::zeroed() };
+    // SAFETY: `name` is a NUL-terminated path, and the pointer is valid for the
+    // length of the call. `AT_SYMLINK_NOFOLLOW` so the answer is about the name
+    // that was recovered from the descriptor and not about a symlink's target,
+    // matching the `fstat` it is compared against.
+    let rc = unsafe {
+        libc::fstatat(
+            libc::AT_FDCWD,
+            name.as_ptr().cast::<libc::c_char>(),
+            &raw mut out,
+            libc::AT_SYMLINK_NOFOLLOW,
+        )
+    };
+    if rc < 0 {
+        return None;
+    }
+    Some(Stat {
+        dev: out.st_dev as u64,
+        ino: out.st_ino as u64,
+        nlink: out.st_nlink as u64,
+    })
+}
+
+/// The path the descriptor `fd` was opened with, from `/proc/self/fd/<fd>`.
+fn path_of(fd: c_int) -> Result<Vec<u8>, i32> {
+    let mut link = format!("/proc/self/fd/{fd}").into_bytes();
+    link.push(0);
+    let mut buf = vec![0u8; 4096];
+    // SAFETY: `link` is NUL-terminated, `buf` is 4096 writable bytes, and the
+    // return value is clamped to the buffer's length, which is what `readlink`
+    // does with a short path.
+    let n = unsafe {
+        libc::readlink(
+            link.as_ptr().cast::<libc::c_char>(),
+            buf.as_mut_ptr().cast::<libc::c_char>(),
+            buf.len() - 1,
+        )
+    };
+    if n < 0 {
+        let errno = crate::errno::get();
+        refused_vnode_path(fd, errno);
+        return Err(crate::errno::to_host(errno));
+    }
+    buf.truncate(n as usize);
+    Ok(buf)
+}
+
+/// The names of the `EVFILT_VNODE` notes, for a message that has to name one.
+fn note_names(notes: u32) -> String {
+    const NAMES: [(u32, &str); 11] = [
+        (NOTE_DELETE, "NOTE_DELETE"),
+        (NOTE_WRITE, "NOTE_WRITE"),
+        (NOTE_EXTEND, "NOTE_EXTEND"),
+        (NOTE_ATTRIB, "NOTE_ATTRIB"),
+        (NOTE_LINK, "NOTE_LINK"),
+        (NOTE_RENAME, "NOTE_RENAME"),
+        (NOTE_REVOKE, "NOTE_REVOKE"),
+        (NOTE_NONE, "NOTE_NONE"),
+        (NOTE_FUNLOCK, "NOTE_FUNLOCK"),
+        (NOTE_LEASE_DOWNGRADE, "NOTE_LEASE_DOWNGRADE"),
+        (NOTE_LEASE_RELEASE, "NOTE_LEASE_RELEASE"),
+    ];
+    let named: Vec<&str> = NAMES
+        .iter()
+        .filter(|(bit, _)| notes & bit != 0)
+        .map(|(_, name)| *name)
+        .collect();
+    if named.is_empty() {
+        return format!("{notes:#x}, which is not a NOTE_ this filter has");
+    }
+    format!("{notes:#x} ({})", named.join(" | "))
+}
+
+/// **The message this filter is about.** A registration asked for notes that this
+/// host's `inotify` cannot distinguish, and the registration is carrying on
+/// without them - which is only acceptable because each dropped note is named
+/// here and because the caller was told *which* notes it is no longer being told
+/// about.
+///
+/// **It is a refusal of each dropped note individually, and the first occurrence
+/// of each note is what prints.** The interesting failure is a run in which the
+/// watcher works and nobody can tell which notes it is blind to; a browser that
+/// watches a hundred paths says it once per note and then stops.
+pub fn announce_vnode_note_dropped(ident: u64, asked: u32, dropped: u32) {
+    use std::sync::OnceLock;
+    static SEEN: OnceLock<Mutex<HashSet<u32>>> = OnceLock::new();
+    let mut seen = SEEN
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let first: Vec<u32> = (0..32)
+        .map(|bit| 1u32 << bit)
+        .filter(|bit| dropped & bit != 0 && seen.insert(*bit))
+        .collect();
+    if first.is_empty() {
+        return;
+    }
+    for bit in first {
+        let reason = match bit {
+            NOTE_EXTEND => "NOTE_EXTEND is \"size increased\", which is a narrowing of \
+                NOTE_WRITE rather than a different fact, and inotify's IN_MODIFY is one bit for \
+                both: it does not say the file grew. Reporting it would claim a size change that \
+                may not have happened. NOTE_WRITE is reported instead, with the scope XNU gives \
+                it",
+            NOTE_LINK => "NOTE_LINK is \"link count changed\", and inotify folds a link-count \
+                change into the same IN_ATTRIB it uses for a mode, ownership, timestamp or xattr \
+                change. That is not a narrowing - the two notes are different facts - so the link \
+                count is read with a stat and compared, and a change in it produces no note at \
+                all rather than the wrong one",
+            NOTE_NONE => "NOTE_NONE is <sys/event.h>'s own \"No specific vnode event\" bit, \
+                which asks a filter to activate without saying what happened, and there is \
+                nothing to report under it",
+            NOTE_FUNLOCK => "NOTE_FUNLOCK is \"vnode was unlocked by flock(2)\", and flock is \
+                advisory: an unlock is not a filesystem change and raises no filesystem event",
+            NOTE_LEASE_DOWNGRADE | NOTE_LEASE_RELEASE => "the lease notes are requests XNU \
+                answers by waking a lease holder, and there is no filesystem event behind one \
+                on this host",
+            _ => "this host has no inotify event that says the same thing",
+        };
+        eprintln!(
+            "rosetta3: kevent: refused {} of the EVFILT_VNODE fflags {} on ident {ident:#x} - \
+             {reason}. The registration is carried on for the {} it can report, and a refused \
+             note is never set in a delivered fflags, so nothing is reported that was not observed",
+            note_names(bit),
+            note_names(asked),
+            note_names(asked & VNODE_REPORTABLE),
+        );
+    }
+}
+
+/// A registration that asked for **nothing this implementation can report**.
+///
+/// **Refused rather than accepted**, because a registration that succeeds and can
+/// never fire is the one shape of answer this project calls a lie: the caller
+/// holds a subscription, the queue reports the descriptor readable, and no event
+/// ever arrives. `EINVAL`, named, and the caller is told exactly which notes it
+/// asked for and which of them are the problem.
+pub fn refused_vnode_mask(ident: u64, fflags: u32) -> i32 {
+    static SAID: std::sync::Once = std::sync::Once::new();
+    SAID.call_once(|| {
+        eprintln!(
+            "rosetta3: kevent refused an EVFILT_VNODE on ident {ident:#x} with fflags {}: every \
+             one of them is a note this host cannot observe, so there is no filter left to \
+             register. The reportable notes are {} - answered on a real inotify watch, and \
+             refused for a change is refused by name rather than mapped to the nearest event. \
+             Accepting this would answer a subscription that could never fire",
+            note_names(fflags),
+            note_names(VNODE_REPORTABLE),
+        );
+    });
+    crate::errno::from_host(libc::EINVAL)
+}
+
+/// A `NOTE_` that is not an `EVFILT_VNODE` note at all.
+///
+/// `ENOTSUP`, which is the number XNU's own `filt_procattach` gives for a `NOTE_`
+/// it does not implement, so a caller can tell "this filter has no such note"
+/// apart from "this note is narrower than you asked for".
+fn refused_vnode_note(ident: u64, fflags: u32) -> i32 {
+    static SAID: std::sync::Once = std::sync::Once::new();
+    SAID.call_once(|| {
+        eprintln!(
+            "rosetta3: kevent refused fflags {fflags:#x} on an EVFILT_VNODE with ident {ident:#x}: \
+             the bits outside {VNODE_NOTES:#x} are not EVFILT_VNODE notes. The vnode notes are {} \
+             and the two among them this host cannot observe are {} - refused by name, never \
+             answered with the nearest event",
+            note_names(VNODE_NOTES),
+            note_names(VNODE_UNREPORTABLE),
+        );
+    });
+    crate::errno::from_host(libc::ENOTSUP)
+}
+
+/// An action bit an `EVFILT_VNODE` has no meaning for.
+fn refused_vnode_action(flags: u16, ident: u64) -> i32 {
+    static SAID: std::sync::Once = std::sync::Once::new();
+    SAID.call_once(|| {
+        eprintln!(
+            "rosetta3: kevent refused flags {flags:#x} on an EVFILT_VNODE with ident {ident:#x}: \
+             the bits outside {VNODE_SERVED:#x} are EV_EOF ({EV_EOF:#x}) and EV_ERROR \
+             ({EV_ERROR:#x}), which the kernel returns rather than accepts, and EV_SYSFLAGS, which \
+             it reserves. The registration the framework makes - EV_ADD|EV_CLEAR|EV_RECEIPT with \
+             all seven vnode notes - is answered"
+        );
+    });
+    crate::errno::from_host(libc::EINVAL)
+}
+
+/// An `ident` that is not a descriptor this host has open.
+fn refused_vnode_ident(ident: u64) {
+    static SAID: std::sync::Once = std::sync::Once::new();
+    SAID.call_once(|| {
+        eprintln!(
+            "rosetta3: kevent refused an EVFILT_VNODE on ident {ident:#x}: it is not a descriptor \
+             this host has open, so there is no object to watch. Darwin reports EBADF for the same \
+             change, at registration rather than at the first wait, and a knote attached to nothing \
+             could never fire"
+        );
+    });
+}
+
+/// A descriptor whose path `/proc/self/fd` will not give back.
+fn refused_vnode_path(fd: c_int, errno: i32) {
+    static SAID: std::sync::Once = std::sync::Once::new();
+    SAID.call_once(|| {
+        eprintln!(
+            "rosetta3: kevent refused an EVFILT_VNODE on descriptor {fd}: readlink of \
+             /proc/self/fd/{fd} failed with {errno:#x}, and inotify_add_watch takes a pathname \
+             rather than a descriptor - measured, it answers EFAULT for an O_PATH descriptor \
+             because the second argument is a const char *. Without the path there is nothing to \
+             watch, and the alternative - watching the descriptor number - is a different filter"
+        );
+    });
+}
+
+/// Two registrations on one queue for the same object.
+///
+/// **Refused rather than shared**, and the reason is specific: one `inotify`
+/// watch descriptor per object per instance, so a second registration would either
+/// clobber the first or need its own instance, and a clobbered first registration
+/// would stop reporting changes for a path its caller is still watching. `EEXIST`,
+/// named. No registration in the framework does this - `EventsForPath` opens each
+/// component once - so the refusal costs nothing here and is a capability named
+/// rather than a silent loss of one of the two.
+fn refused_vnode_twice(ident: u64, path: &[u8]) {
+    eprintln!(
+        "rosetta3: kevent refused a second EVFILT_VNODE on ident {ident:#x} for {}: this \
+         kqueue already watches that object, and one inotify watch descriptor per object per \
+         instance means a second registration would either replace the first - leaving a caller \
+         with a subscription that has stopped reporting - or need a second instance. The \
+         framework registers each path component once per watcher, so nothing in it does this",
+        String::from_utf8_lossy(path),
+    );
+}
+
+/// A path that no longer names the object the descriptor holds.
+///
+/// **This is the race XNU does not have**, and it is the reason the check is made
+/// twice. `inotify_add_watch` takes a path, so the object is named twice - once by
+/// the `open` the caller did, and once by the `readlink` of `/proc/self/fd` - and
+/// between them the name can be pointed at a different inode. A watch on the
+/// wrong inode reports changes for a file nobody opened, which is the wrong
+/// answer this project exists to refuse, so the name is `stat`ed and compared with
+/// the descriptor's own `fstat` before the watch is added and again after.
+fn refused_vnode_identity(ident: u64, path: &[u8]) {
+    eprintln!(
+        "rosetta3: kevent refused an EVFILT_VNODE on ident {ident:#x}: {} does not name the \
+         object that descriptor holds. inotify_add_watch takes a pathname, so the object was named \
+         twice - by the caller's open and by the readlink of /proc/self/fd - and the name moved \
+         between them. A watch on the other inode would report changes for a file the caller never \
+         opened, so this is refused rather than watched",
+        String::from_utf8_lossy(path),
+    );
+}
+
+/// `inotify_add_watch` refused the path itself.
+fn refused_vnode_watch(ident: u64, path: &[u8], errno: i32) {
+    eprintln!(
+        "rosetta3: kevent refused an EVFILT_VNODE on ident {ident:#x} for {}: inotify_add_watch \
+         answered {errno:#x} with mask {VNODE_INOTIFY_MASK:#x}. Darwin's own reason for refusing \
+         a vnode knote is ENOTSUP (filt_vnode_common: \"if (kn->kn_vnode_use != VIL_FSTATS) \
+         knote_set_error(kn, ENOTSUP)\"), and the host's number is passed through rather than \
+         replaced, so the guest sees the failure this host actually had",
+        String::from_utf8_lossy(path),
+    );
+}
+
+/// The `inotify` queue overflowed, so events were lost.
+fn refused_vnode_overflow() {
+    static SAID: std::sync::Once = std::sync::Once::new();
+    SAID.call_once(|| {
+        eprintln!(
+            "rosetta3: kevent: inotify reported IN_Q_OVERFLOW, so file system events were lost \
+             before they could be read. The notes that did arrive are still reported, because \
+             they were observed, and the overflow itself is not reported as a note because there \
+             is no vnode note for it - the alternative would be to attach a NOTE_WRITE or a \
+             NOTE_ATTRIB to a file about something that happened to no file in particular. \
+             XNU's kqueue has no equivalent loss: it never drops a knote's pending fflags"
+        );
+    });
+}
+
+/// The filesystem a watch was on went away.
+fn refused_vnode_unmount() {
+    static SAID: std::sync::Once = std::sync::Once::new();
+    SAID.call_once(|| {
+        eprintln!(
+            "rosetta3: kevent: inotify reported IN_UNMOUNT, so the filesystem a watch was on is \
+             gone. No vnode note says so - NOTE_REVOKE is a property of one vnode's access being \
+             revoked, and every watch on the filesystem is affected at once - so nothing is reported \
+             and this line says why the watcher has gone quiet"
+        );
+    });
+}
+
+/// `read` on the `inotify` descriptor failed in a way `EAGAIN` does not explain.
+fn refused_vnode_read(errno: i32) {
+    static SAID: std::sync::Once = std::sync::Once::new();
+    SAID.call_once(|| {
+        eprintln!(
+            "rosetta3: kevent: read on the inotify descriptor answered {errno:#x}, so this host \
+             stopped handing over its own file system events. The notes already read are still \
+             reported, because they were observed; nothing further will be, and a queue that is \
+             waiting on this will have to be woken by something else"
+        );
+    });
+}
+
+/// Say that an `EVFILT_VNODE` registration was made, and exactly what it is.
+///
+/// **Off by default, and env-gated on `ROSETTA3_TRACE_EVFILT_VNODE`**, for the
+/// reason `announce_proc_registered` is: the question this filter raises is
+/// whether the *narrowed* mask is what the caller wanted, and the way to answer
+/// it is a line per registration rather than an inference.
+pub fn announce_vnode_registered(watch: &Vnode) {
+    if std::env::var_os("ROSETTA3_TRACE_EVFILT_VNODE").is_none() {
+        return;
+    }
+    eprintln!(
+        "rosetta3: kqueue: EVFILT_VNODE registration for ident {:#x} (fd {}) on {}, udata {:#x}, \
+         interest {} - an inotify watch on inode {} of the queue's own inotify instance {}. \
+         XNU would attach a knote to the vnode the descriptor holds and set kn_sfflags to what \
+         was asked for; this narrows it, and the dropped notes are named by \
+         announce_vnode_note_dropped",
+        watch.ident,
+        watch.ident,
+        String::from_utf8_lossy(&watch.path),
+        watch.udata,
+        note_names(watch.mask()),
+        watch.identity.1,
+        watch.inotify_fd(),
+    );
+}
+
+/// Say what a delivered `EVFILT_VNODE` event says, in the reference's terms.
+///
+/// Off by default, env-gated on `ROSETTA3_TRACE_EVFILT_VNODE`, and **one line per
+/// delivery**: this is the measurement that decides whether the filter is honest,
+/// because a delivered `fflags` is the one value in it that can be wrong without
+/// anything failing.
+pub fn announce_vnode_delivered(watch: &Vnode, fflags: u32) {
+    if std::env::var_os("ROSETTA3_TRACE_EVFILT_VNODE").is_none() {
+        return;
+    }
+    eprintln!(
+        "rosetta3: kqueue: delivered EVFILT_VNODE on ident {:#x} ({}) with fflags {} - {} - \
+         flags {:#x}, data 0, udata {:#x}",
+        watch.ident,
+        String::from_utf8_lossy(&watch.path),
+        fflags,
+        note_names(fflags),
+        watch.delivered_flags(fflags),
+        watch.udata,
+    );
+}
+
+/// An `EV_DELETE` of an `EVFILT_VNODE` that was never registered.
+///
+/// `pub` because [`crate::kqueue`] refuses the same `ENOENT` from its own table,
+/// and the missing registration is the same thing in both.
+pub fn announce_missing_vnode(ident: u64) {
+    static SAID: std::sync::Once = std::sync::Once::new();
+    SAID.call_once(|| {
+        eprintln!(
+            "rosetta3: kevent: ENOENT for an EVFILT_VNODE with ident {ident:#x} - no such \
+             registration on this queue, and so no inotify watch to remove. Darwin answers the \
+             same way, and it is the check that catches a delete of a registration that was never \
+             made"
         );
     });
 }
@@ -3591,7 +5359,16 @@ mod tests {
     }
 
     /// The `fflags` this filter will not report, and the two it must refuse
-    /// with the *reference's* numbers rather than its own.    #[test]
+    /// with the *reference's* numbers rather than its own.
+    ///
+    /// **`#[test]` was on the end of this doc comment rather than on its own
+    /// line**, so the attribute was part of the documentation, this function was
+    /// not a test, and the compiler said so - `warning: function
+    /// proc_notes_a_pidfd_cannot_report_are_refused_by_name is never used`. A
+    /// fully written test that never runs is the same shape of lie as one that
+    /// asserts nothing, and the brief records this tree lying three ways already.
+    /// It runs now, and it passes.
+    #[test]
     fn proc_notes_a_pidfd_cannot_report_are_refused_by_name() {
         let queue = queue();
 

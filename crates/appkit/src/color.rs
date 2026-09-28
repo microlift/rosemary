@@ -82,6 +82,27 @@ fn singleton(name: &str, red: f64, green: f64, blue: f64, alpha: f64) -> Id {
     color
 }
 
+/// The value of `+alternatingContentBackgroundColor`: a light grey.
+///
+/// **An invented constant, named here rather than inlined, and it is standing in
+/// for a shade this host cannot measure.** It is not derived from an appearance,
+/// a `.colorset`, a preference store or a theme file: there is no such thing on
+/// this host, and [`refuse_no_catalog`] gives the census. Every other number in
+/// [`NAMED`] that is not a device colour is in the same position, and this one is
+/// singled out because the **plural** selector
+/// (`+[NSColor alternatingContentBackgroundColors]`, see
+/// [`alternating_content_background_colors`]) returns a *pair* whose second
+/// member this constant is, and because
+/// [`alternating_row_colors`](alternating_row_colors()) builds its pair out of it
+/// as well. A constant nobody chose is a wrong answer wearing the shape of a
+/// right one, so it has a name and a reason attached rather than a bare `0.96`.
+///
+/// The same objection is on record against `UI_DEFAULT_SIZE = 13.0` in
+/// `coretext` and against the other entries in `MEMORY.md`'s list. **Ruling
+/// whether each stays is a decision this file does not make for itself**; what
+/// it does do is stop any of them from being inherited silently.
+const ALTERNATING_CONTENT_BACKGROUND_GREY: f64 = 0.96;
+
 /// The named colours, as `(selector, r, g, b, a)`.
 ///
 /// The first group is the device colours, whose values are their names. The
@@ -91,6 +112,25 @@ fn singleton(name: &str, red: f64, green: f64, blue: f64, alpha: f64) -> Id {
 /// draws with `+textColor` on a dark background gets black text, which is what
 /// it would get from AppKit in light mode; a program that switched appearance
 /// would not be followed, and there is no appearance here to switch.
+///
+/// **Two of these are off every path this guest can take, measured, and one of
+/// them is a spelling miss that matters.** Of the 56 selectors below, 13 have an
+/// `__objc_selrefs` entry and 43 do not - four because the name is in
+/// `__TEXT,__objc_methname` with no selref pointing at it, and 39 because the
+/// name does not occur in the guest image at all (positive controls on the same
+/// two-sided scan: `controlTextColor`, `selectedTextBackgroundColor`,
+/// `keyboardFocusIndicatorColor`, `disabledControlTextColor`,
+/// `unemphasizedSelectedContentBackgroundColor`, `deviceRGBColorSpace` and
+/// `colorUsingColorSpace:` are each exactly 1 occurrence, and
+/// `underPageBackgroundColor` and `selectedContentBackgroundColor` are each 0).
+/// Among the 39 are **`alternatingContentBackgroundColor`** - a selector this
+/// tree answers, which **the guest does not contain**: the byte scan for it
+/// NUL-terminated returns 0, and the 1 hit for the unterminated spelling is the
+/// plural's own prefix. The guest sends the **plural**, which is why
+/// [`alternating_content_background_colors`] exists and why the singular's
+/// [`ALTERNATING_CONTENT_BACKGROUND_GREY`] is inherited by nothing. Also among
+/// the 39 is `controlBackgroundColor`, the other half of the fabricated pair in
+/// [`alternating_row_colors`](alternating_row_colors()).
 static NAMED: &[(&str, f64, f64, f64, f64)] = &[
     ("textColor", 0.0, 0.0, 0.0, 1.0),
     ("labelColor", 0.0, 0.0, 0.0, 1.0),
@@ -149,7 +189,13 @@ static NAMED: &[(&str, f64, f64, f64, f64)] = &[
     ("placeholderTextColor", 0.0, 0.0, 0.0, 0.25),
     ("separatorColor", 0.0, 0.0, 0.0, 0.1),
     ("underPageBackgroundColor", 0.60, 0.60, 0.60, 1.0),
-    ("alternatingContentBackgroundColor", 0.96, 0.96, 0.96, 1.0),
+    (
+        "alternatingContentBackgroundColor",
+        ALTERNATING_CONTENT_BACKGROUND_GREY,
+        ALTERNATING_CONTENT_BACKGROUND_GREY,
+        ALTERNATING_CONTENT_BACKGROUND_GREY,
+        1.0,
+    ),
     // The `systemX` palette, whose values are Apple's published sRGB ones. A
     // program picks one to draw with rather than asking the appearance about it.
     ("systemRedColor", 1.0, 0.23, 0.19, 1.0),
@@ -340,13 +386,246 @@ fn refuse_no_catalog(catalog: Id, name: Id) {
     );
 }
 
+/// `+[NSColor alternatingContentBackgroundColors]` — a **plural** selector
+/// returning an `NSArray` of **two** colours — answered `nil`, and said out loud.
+///
+/// # The decision, on both halves
+///
+/// **Half one — is there a truthful pair on this host? No, and the reason is
+/// categorical rather than a matter of not having looked.** This is *not* one of
+/// the `-[NSWorkspace accessibilityDisplayShould…]` family that
+/// `workspace.rs` answers NO to. Those four report *whether the user asked for a
+/// display option*, and the answer is a fact about a user account: nobody here has
+/// asked, so `false` is true, and that is why refusing-by-answering works for
+/// them. This selector has no such boolean. It reports *what colour the current
+/// appearance uses for alternating content* — a system colour, in the same family
+/// as the other 56 entries in [`NAMED`], every one of which is a shade this host
+/// cannot measure. There is no true value to return and no true value to refuse
+/// *with*; the only way to answer it at all is to invent two colours.
+///
+/// The census behind that, which is a measurement rather than an argument:
+///
+/// * **No appearance and no system colours.** No asset catalog of any kind: over
+///   all 214 files of `test/Chromium/`, 0 `*.colorset`, 0 `*.xcassets`, 0
+///   `Contents.json`, 0 `*.car`, and the only thing under
+///   `Chromium.app/Contents/Resources` is a set of `.lproj` localisations. No
+///   ColorSync among the Framework's 60 dependent libraries, and no symbol
+///   containing `ColorSync` or `NamedColor` among the 8828 dyld bind records of
+///   the 11 images whose bind stream decodes. That is
+///   [`refuse_no_catalog`]'s census, and it is the same census, because it is
+///   the same missing thing: an AppKit system colour.
+/// * **Nothing on this host that could stand in for it, and a substitution from
+///   elsewhere would be a *different* wrong answer.** This is a desktop Linux
+///   with an XDG freedesktop theme; answering a macOS platform colour from a
+///   Linux theme would hand the guest a colour from a platform it is not on,
+///   which is less honest than `nil`, not more.
+///
+/// **Half two — if it must answer something, what? `nil`, and the reason `nil`
+/// beats an empty array is a fact about the guest rather than a preference.**
+///
+/// An empty `NSArray` is *not* a value this method can have on macOS, so it is a
+/// fabrication like any other — and it is a fabrication with a worse consequence
+/// than the other one, which is measurable. See the call-site section below: the
+/// one caller subscripts the answer at index **1** with no bounds check and no
+/// nil test, so an empty array raises `NSRangeException` *inside AppKit emulation*
+/// while `nil` is a message to nil, which yields nil, which is what reaches the
+/// guest's own `CHECK`. **`nil` is the only one of the three answers that is
+/// both truthful about the absence and survivable by the one caller in the image.**
+/// The two-element pair is the third option and is rejected: it is the pair
+/// [`alternating_row_colors`](alternating_row_colors()) already fabricates, and
+/// handing it out again here is precisely the quiet inheritance the invented
+/// [`ALTERNATING_CONTENT_BACKGROUND_GREY`] is not allowed to have.
+///
+/// # The one call site, enumerated rather than sampled
+///
+/// The whole enclosing function, `Framework+0x8142aa0 .. 0x814375a` — 3258 bytes,
+/// 790 instructions, **163 control transfers enumerated and classified from their
+/// own bytes** (70 `call`, 56 `je`, 34 `jne`, 2 `jle`, 1 `ret`, no `ud2` or
+/// `int3` inside the function) — loads exactly **six** selectors:
+///
+/// | address | selector | then |
+/// |---|---|---|
+/// | `+0x8142bea` | `disabledControlTextColor` | straight to `+0x61ac660` |
+/// | `+0x8142d1f` | `controlTextColor` | straight to `+0x61ac660` |
+/// | **`+0x8142e4f`** | **`alternatingContentBackgroundColors`** | **`objectAtIndexedSubscript: 1`, then `+0x61ac660`** |
+/// | `+0x8142e6b` | `objectAtIndexedSubscript:` | belongs to the row above |
+/// | `+0x8142fbd` | `keyboardFocusIndicatorColor` | straight to `+0x61ac660` |
+/// | `+0x81431ee` | `selectedTextBackgroundColor` | straight to `+0x61ac660` |
+///
+/// Four of the five colour selectors loaded here are the *singular* named
+/// colours, handed to the Skia colour accessor `+0x61ac660` unchanged; the fifth
+/// load is `objectAtIndexedSubscript:`, and it belongs to this one selector and
+/// no other. **The plural is the only one of the six that is subscripted:**
+///
+/// ```text
+///  8142e48  mov  rdi,[rip+…]        # 0xe6e72d0 = NSColor, a classref
+///  8142e4f  mov  rsi,[rip+…]        # 0xe6eba38 = the selector
+///  8142e5d  call r14                # objc_msgSend(NSColor, sel)   -> nil here
+///  8142e60  mov  rdi,rax
+///  8142e63  call _objc_retainAutoreleasedReturnValue
+///  8142e68  mov  r15,rax                                 # r15 = the answer
+///  8142e6b  mov  rsi,[rip+…]        # 'objectAtIndexedSubscript:'
+///  8142e72  mov  edx,0x1                                  # <-- index 1
+///  8142e77  mov  rdi,rax                                 # the answer, untested
+///  8142e7a  call r14                # message to nil -> nil
+///  8142e8b  call 0x61ac660          # a nil NSColor
+/// ```
+///
+/// **There is no `respondsToSelector:` in that function** — the six-selector
+/// enumeration is the control, and a gate would be a seventh load — and **no test
+/// of the answer between `+0x8142e5d` and `+0x8142e7a`**: the retain, the
+/// register shuffle and `edx = 1` are all that is between them. So the guest has
+/// no designed path for this selector being absent, which is why a wrong pair here
+/// is painted rather than survived.
+///
+/// It is the only reference in the image. A whole-`__TEXT,__text` rip-relative
+/// sweep for the selref word `0xe6eba38` returns **1** site, `+0x8142e4f`;
+/// positive controls on the same pass: `objectAtIndexedSubscript:`'s
+/// `0xe6e7dc0` returns 34, `appearanceNamed:`'s `0xe6e9460` returns 6.
+///
+/// # What the `nil` reaches, and why that is the guest's own `CHECK`
+///
+/// `+0x61ac660` retains its argument, sends `-colorUsingColorSpace:`, and
+/// branches on the result: `je 0x61ac7b7` at `+0x61ac6cb` is the **nil** arm, and
+/// that arm does `objc_retainAutorelease` → `-[NSColor CGColor]` →
+/// `_CGColorGetNumberOfComponents`. Two things make that the honest outcome rather
+/// than a second defect to repair:
+///
+/// * **`-colorUsingColorSpace:` is not what puts us there.** It returns the
+///   receiver whatever the space is (`color_using_color_space`, this file), and
+///   the space the guest asks for is a *real* object here: the classref
+///   `0xe6e7370` is paired with the `sRGBColorSpace` selref at `+0x3ab58e2` and
+///   the `deviceRGBColorSpace` selref at `+0x61ac681`, and
+///   `+[NSColorSpace deviceRGBColorSpace]` is installed at `backing.rs:1241`.
+///   The `CGColor` arm is entered **iff the colour itself is nil**, which is this
+///   answer and nothing else.
+/// * **`-[NSColor CGColor]` is registered by no class in this tree**, so that arm
+///   yields nil, `_CGColorGetNumberOfComponents(nil)` is 0 (`cgcontext.rs:687`),
+///   and `add rax,-3; cmp rax,-3; jbe 0x61ac864` fires. That `int3` is
+///   `test/logs/REPORT-cgcolor-components.md`'s `CHECK`, and it is the guest
+///   reporting our incompleteness. It is **not** a reason to invent a component
+///   count: `+0x6bb010` is `SkColor4f::toColor()` (`255.0f` at `0xd637fe0`,
+///   `0.5f` at `0xd637f40`, read out of the image), so a made-up count becomes
+///   painted pixels.
+///
+/// # What the answer costs, said rather than hidden
+///
+/// Installing this method moves a `Refusal` abort into that `CHECK` on a default
+/// run: with `ROSETTA3_LOG_UNRECOGNIZED` unset the selector used to abort here by
+/// name, and it will now answer `nil` and let the guest trap. The line below is
+/// **unconditional** and printed **immediately before** the trap, so the cause is
+/// still named at the moment of the fault — the guest's own assertion, with this
+/// refusal as the line above it. That is the `_NSServiceEntry` trade and the
+/// `CGColor` trade already made in this project, and it is the right one: the
+/// alternative is a plausible component count nobody here measured.
+///
+/// `-[NSColor CGColor]` is a genuinely missing public method and it is the reason
+/// a nil colour becomes a `CHECK` rather than a colour. It is **not** implemented
+/// here, and implementing it would not move this wall: the only path to it is a
+/// nil receiver, where a method on nil answers nil by definition.
+unsafe extern "C" fn alternating_content_background_colors(_class: Id, _sel: Sel) -> Id {
+    refuse_alternating_content_background_colors();
+    std::ptr::null_mut()
+}
+
+/// Say, once per process, that there is no system colour to make the pair from.
+///
+/// Once per process rather than once per call, for the reason
+/// [`refuse_no_catalog`] and `refuse_display_option` give: the point of the line
+/// is that a named capability is absent, not that one event happened. Unconditional
+/// and not env-gated, because the whole deliverable is that the absence is named;
+/// an env-gated refusal is not a refusal.
+fn refuse_alternating_content_background_colors() {
+    static SAID: std::sync::Mutex<bool> = std::sync::Mutex::new(false);
+    let mut said = SAID.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    if *said {
+        return;
+    }
+    *said = true;
+    eprintln!(
+        "rosetta3: appkit: +[NSColor alternatingContentBackgroundColors]: answered nil. This is \
+         a public, documented AppKit class property (macOS 10.14+, typed NSColor[], \"the colors \
+         to use for alternating content, typically found in table views and collection views\"), so \
+         the missing capability is a real platform one and it is named here: **an AppKit system \
+         colour for the current appearance, of which this host has none**. Measured: 0 *.colorset, \
+         0 *.xcassets, 0 Contents.json and 0 *.car across all 214 files of the Chromium bundle, no \
+         ColorSync among the Framework's 60 dependent libraries, and no ColorSync or NamedColor \
+         symbol among the 8828 dyld bind records of the 11 images whose bind stream decodes. This \
+         is deliberately NOT answered like the four -[NSWorkspace accessibilityDisplayShould...] \
+         flags in workspace.rs: those report whether the user asked for a display option, and \
+         \"nobody has asked\" is a true answer with a real boolean behind it. This one has no such \
+         boolean - it reports a shade, and the only way to answer it is to invent two colours that \
+         the guest paints and cannot tell from real ones. NOT answered as an empty array either: \
+         that is not a value this method can have on macOS, and it is worse than nil, because the \
+         one caller in the image subscripts the answer at index 1 with no bounds check and no nil \
+         test (Framework+0x8142e72 `mov edx,0x1`; 0x8142e5d the send, 0x8142e7a the subscript, \
+         nothing in between), so an empty NSArray raises inside AppKit emulation while nil is a \
+         message to nil. The caller is the native-theme colour table at Framework+0x8142aa0 \
+         (3258 bytes, 790 instructions, 163 control transfers enumerated and classified from their \
+         own bytes); it loads exactly six selectors - four are the singular named colours \
+         disabledControlTextColor, controlTextColor, keyboardFocusIndicatorColor and \
+         selectedTextBackgroundColor, each handed straight to the Skia accessor at +0x61ac660, and \
+         the fifth is objectAtIndexedSubscript:, which belongs to this selector alone - and there is \
+         no respondsToSelector: in that function, so \
+         there is no designed path for the selector being absent. This selref (0xe6eba38) has \
+         exactly 1 reference in the whole 214 MB of __text, at +0x8142e4f; positive controls on the \
+         same pass: objectAtIndexedSubscript: 34, appearanceNamed: 6. It uses element 1 - the \
+         *alternate* of the pair - for the theme's alternating-content band, and \
+         +[NSColor alternatingContentBackgroundColor] (singular) is answered in this tree at 56/56 \
+         of the NAMED table but is NOT a selector the guest contains at all: the NUL-terminated \
+         byte scan returns 0 for it, 39 of the 56 NAMED selectors return 0 that way, and the four \
+         positive controls on the same two-sided scan (controlTextColor, \
+         selectedTextBackgroundColor, keyboardFocusIndicatorColor, disabledControlTextColor) each \
+         return 1. INHERITANCE REFUSED: the pair a two-element answer would have to be is exactly \
+         the one +[NSColor controlAlternatingRowBackgroundColors] already fabricates in this file \
+         (the function alternating_row_colors) - [+controlBackgroundColor white, \
+         +alternatingContentBackgroundColor 0.96 grey] - and 0.96 is an invented constant standing \
+         in for a shade nothing here measures, now named ALTERNATING_CONTENT_BACKGROUND_GREY in \
+         this file for that reason. A two-element answer would hand the guest precisely that \
+         unmeasured grey as element 1. Neither half of the fabricated pair is on a path this \
+         guest can take anyway: controlAlternatingRowBackgroundColors occurs 0 times in the image \
+         and controlBackgroundColor is among the 39 NAMED names the image does not contain. \
+         CONSEQUENCE, stated rather than hidden: with a real colour the CHECK at +0x61ac864 is not \
+         reached; with nil the guest indexes nil, -colorUsingColorSpace: returns the receiver \
+         (nil), -[NSColor CGColor] - registered by no class in this tree - answers nil, \
+         _CGColorGetNumberOfComponents(nil) is 0 (cgcontext.rs:687), and add rax,-3; cmp rax,-3; \
+         jbe 0x61ac864 traps. That is the guest correctly reporting our incompleteness, the same \
+         trade as _NSServiceEntry and the same trade as the CGColor component count, and the line \
+         above it is unconditional so the cause is named at the moment of the fault. Full report: \
+         test/logs/REPORT-alternating-colors.md"
+    );
+}
+
 /// `+controlAlternatingRowBackgroundColors`, an `NSArray` of **two** colours.
 ///
-/// Not in [`NAMED`] because it is not a colour: a table view alternates its row
-/// background between the two, so the answer is the pair and a caller indexes it
-/// with the row number. The members are the even and odd row backgrounds, which
-/// match `+controlBackgroundColor` and `+alternatingContentBackgroundColor` - a
-/// caller that uses one table and the other constant has to get the same shade.
+/// **This is a fabricated pair, and it is kept and documented rather than removed
+/// or inherited.** It is not in [`NAMED`] because it is not a colour: a table view
+/// alternates its row background between the two, so the answer is the pair and a
+/// caller indexes it with the row number. The members are the even and odd row
+/// backgrounds, which match `+controlBackgroundColor` and
+/// `+alternatingContentBackgroundColor` — a caller that uses one table and the
+/// other constant has to get the same shade.
+///
+/// Two things are on record about it, both measured:
+///
+/// * **Both halves are invented.** `+controlBackgroundColor` is white here and
+///   `+alternatingContentBackgroundColor` is
+///   [`ALTERNATING_CONTENT_BACKGROUND_GREY`], and neither is derived from
+///   anything on this host. This is the same objection as the three constants
+///   `MEMORY.md` lists, and it is **not** resolved here: removing the method would
+///   turn a fabricated pair into an unrecognized-selector abort on the default
+///   run, which is a worse milestone outcome and not this file's call to make. It
+///   is named so that a ruling can be made about it deliberately.
+/// * **No path in this guest can reach it.** The selector occurs **0** times in
+///   the Framework (positive controls on the same scan: `controlTextColor`,
+///   `selectedTextBackgroundColor`, `keyboardFocusIndicatorColor`,
+///   `disabledControlTextColor`, `unemphasizedSelectedContentBackgroundColor`,
+///   `deviceRGBColorSpace`, `colorUsingColorSpace:` each exactly 1), and
+///   `+controlBackgroundColor`, the even member, is one of the 39 [`NAMED`]
+///   selectors whose name the image does not contain at all. So this fabrication
+///   is off the milestone's path entirely — which is also why the plural
+///   selector's answer does **not** reuse it. See
+///   [`alternating_content_background_colors`].
 ///
 /// Kept rather than autoreleased, for [`singleton`]'s reason: this is a named
 /// constant a caller may put straight into a `static`.
@@ -357,7 +636,13 @@ unsafe extern "C" fn alternating_row_colors(_class: Id, _sel: Sel) -> Id {
         return *kept as Id;
     }
     let even = singleton("controlBackgroundColor", 1.0, 1.0, 1.0, 1.0);
-    let odd = singleton("alternatingContentBackgroundColor", 0.96, 0.96, 0.96, 1.0);
+    let odd = singleton(
+        "alternatingContentBackgroundColor",
+        ALTERNATING_CONTENT_BACKGROUND_GREY,
+        ALTERNATING_CONTENT_BACKGROUND_GREY,
+        ALTERNATING_CONTENT_BACKGROUND_GREY,
+        1.0,
+    );
     let array = corefoundation::collections::new_array(
         &[
             even as corefoundation::base::CFTypeRef,
@@ -534,6 +819,7 @@ pub(crate) fn install() {
         meta.replace_method(objc::sel::get(name), named as *const c_void, c"@16@0:8");
     }
     class_methods!(class, {
+        "alternatingContentBackgroundColors" => alternating_content_background_colors, c"@16@0:8";
         "controlAlternatingRowBackgroundColors" => alternating_row_colors, c"@16@0:8";
         "colorWithCatalogName:colorName:" => color_with_catalog_name, c"@32@0:8@16@24";
         "colorWithCalibratedRed:green:blue:alpha:" => color_with_rgba, c"@48@0:8d16d24d32d40";
@@ -731,5 +1017,143 @@ mod tests {
         // Rule 3: two objects, because the call site puts two `__cfstring`
         // pointers in `rdx` and `rcx` and reads them as strings.
         assert_eq!(kinds, vec!["@", "@"], "{types}: both arguments are objects");
+    }
+
+    /// The plural selector, sent the way the guest sends it: through
+    /// `objc_msgSend` with the class in `rdi` and the selector in `rsi`.
+    fn send_alternating_content_background_colors() -> Id {
+        // SAFETY: `+alternatingContentBackgroundColors` takes no arguments and
+        // returns an object, which is the claim the test below checks against
+        // the *installed* encoding rather than taken from this signature.
+        let f: unsafe extern "C" fn(Id, Sel) -> Id =
+            unsafe { std::mem::transmute(objc::msg::entry()) };
+        let class = objc::class::ptr(objc::class::lookup(c"NSColor").expect("NSColor"));
+        // SAFETY: a class and a zero-argument selector, as the selector declares.
+        unsafe { f(class as Id, objc::sel::get("alternatingContentBackgroundColors")) }
+    }
+
+    /// **The answer is `nil`, and it is `nil` rather than a pair or an empty
+    /// array** — the claim this method has to earn on every run, because the
+    /// three candidate answers differ only in what the guest paints.
+    ///
+    /// The test pins the *answer*, not the printing, which is the point: a
+    /// function that returned the fabricated pair would still print the refusal
+    /// and would still pass a test that only checked the refusal appeared. So
+    /// this asserts the value the guest will read at `Framework+0x8142e77`.
+    #[test]
+    fn the_plural_is_nil_and_not_a_pair() {
+        crate::bootstrap();
+        let answer = send_alternating_content_background_colors();
+        assert!(
+            answer.is_null(),
+            "+[NSColor alternatingContentBackgroundColors] answered {:?}, not nil: the \
+             guest indexes this at 1 with no bounds check and no nil test and paints it, so a \
+             pair here is a fabricated pair it cannot tell from a real one",
+            answer
+        );
+        // Asked twice: still nil, and still no pair invented on the second ask.
+        assert!(send_alternating_content_background_colors().is_null());
+    }
+
+    /// **The once-per-process latch on the refusal does not change the answer.**
+    ///
+    /// The refusal prints once per process, so the second ask is the interesting
+    /// one: an implementation that let the latch return something other than
+    /// `nil` — the singleton the latch caches, say — would answer differently
+    /// the second time, and the guest's one call site is a `std::call_once`-style
+    /// initialiser that runs at most once anyway, so the difference would be
+    /// invisible at run level and visible only here.
+    ///
+    /// **This test deliberately does not assert on the printed line**, because
+    /// `libtest` discards a passing test's stderr — which is how "9 passing" was
+    /// once 9 quiet skips. A mutation that *deletes* the refusal call leaves all
+    /// nine tests in this module passing, and that is the intended result: the
+    /// tests pin the answer, so no test of them can pass while the function
+    /// invents a colour.
+    #[test]
+    fn the_answer_is_null_on_every_ask_and_not_only_the_first() {
+        crate::bootstrap();
+        assert!(send_alternating_content_background_colors().is_null());
+        assert!(send_alternating_content_background_colors().is_null());
+    }
+
+    /// **The installed encoding agrees with the selector's own colon count, for
+    /// the plural.** Re-derived here the way the two-argument case above is,
+    /// because a method encoding is never read at dispatch: a wrong string would
+    /// be invisible to every other test in this file.
+    ///
+    /// `alternatingContentBackgroundColors` has **zero** colons, so it declares
+    /// **zero** arguments, and a frame of 16 is the one a zero-argument
+    /// object-returning method has. The `last_arg_offset + 8` rule of the
+    /// two-argument case does not apply here and is not applied: there is no
+    /// last argument. A two-argument shape installed here would be the exact
+    /// `v32@0:8@?24` class of error this file already hit once, in a method whose
+    /// unit test passed throughout because it agreed with the misreading.
+    #[test]
+    fn the_plurals_declared_encoding_agrees_with_its_zero_colon_selector() {
+        crate::bootstrap();
+        const SEL: &str = "alternatingContentBackgroundColors";
+        let class = objc::class::lookup(c"NSColor").expect("NSColor");
+        let method = class
+            .metaclass()
+            .own_method(objc::sel::get(SEL))
+            .expect("+alternatingContentBackgroundColors is installed");
+        // SAFETY: `Method::types` is a `CString` the class leaked and still owns.
+        let types = unsafe { std::ffi::CStr::from_ptr(method.types()) };
+        let types = types.to_str().expect("an encoding is ASCII");
+
+        let wanted = SEL.bytes().filter(|b| *b == b':').count();
+        assert_eq!(wanted, 0, "{SEL} takes no arguments by its own name");
+        // `@<frame>@0:8` and nothing after it: anything more is a declared
+        // argument for a selector that declares none.
+        let (head, rest) = types
+            .strip_prefix('@')
+            .and_then(|rest| rest.split_once("@0:8"))
+            .unwrap_or_else(|| panic!("{types} is not `@<frame>@0:8...`"));
+        let frame: usize = head.parse().unwrap_or_else(|_| panic!("{head} is not a frame size"));
+        assert_eq!(rest, "", "{types} declares arguments; {SEL} has {wanted} colons");
+        assert_eq!(frame, 16, "{types}: a zero-argument method returning an object");
+    }
+
+    /// **`+[NSColor alternatingContentBackgroundColors]` is not the selector
+    /// the guest sends, and the plural is not derived from the singular.**
+    ///
+    /// The singular *is* answered, from [`NAMED`], with
+    /// [`ALTERNATING_CONTENT_BACKGROUND_GREY`]; the plural is the one the guest
+    /// actually sends and it is answered `nil`. This test exists so the two
+    /// cannot be confused by a later reader, and so the invented constant is
+    /// pinned to the selector that is off every path this guest can take —
+    /// which is the whole reason the plural is not answered with it.
+    ///
+    /// **What this does *not* do is assert that the constant is `0.96`, and the
+    /// omission is deliberate.** The constant is a fabrication, so there is no
+    /// true value to check it against; a test asserting `0.96` would be a witness
+    /// assertion about an invented number, and it would make the number look
+    /// chosen. Measured consequence: a mutation that changes
+    /// `ALTERNATING_CONTENT_BACKGROUND_GREY` to `0.5` leaves **all nine** tests in
+    /// this module passing, because both sides of every comparison here are the
+    /// same constant. The claim this test does earn is narrower and is the one
+    /// that matters: the constant is the *single source* for the singular's
+    /// value, and the plural's answer is `nil` whatever the constant says — the
+    /// `pair` mutation, which wires the plural to the fabricated two-element
+    /// answer, fails this test.
+    #[test]
+    fn the_singular_is_answered_from_the_named_constant_and_the_plural_is_nil() {
+        crate::bootstrap();
+        let class = objc::class::ptr(objc::class::lookup(c"NSColor").expect("NSColor")) as Id;
+        let grey = ALTERNATING_CONTENT_BACKGROUND_GREY;
+        // SAFETY: `+namedColor` is `id (Class, SEL)`.
+        let singular = unsafe { named(class, objc::sel::get("alternatingContentBackgroundColor")) };
+        assert!(!singular.is_null(), "the singular is answered");
+        // SAFETY: a colour this crate just made.
+        assert_eq!(
+            unsafe { components(singular) },
+            (grey, grey, grey, 1.0),
+            "the singular's value is exactly the named constant and nothing else, so a reader \
+             who changes the constant knows this is what moves"
+        );
+        // And the plural is a *different* answer to a *different* selector, not
+        // the singular's answer handed back in an array.
+        assert!(send_alternating_content_background_colors().is_null());
     }
 }

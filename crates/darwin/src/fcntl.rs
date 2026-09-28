@@ -143,6 +143,12 @@ pub mod oflag {
     pub const O_TRUNC: i32 = 0x0400;
     pub const O_EXCL: i32 = 0x0800;
     pub const O_NOCTTY: i32 = 0x0002_0000;
+    /// `0x00008000` — "descriptor requested for event notifications only".
+    ///
+    /// From xnu `bsd/sys/fcntl.h:141`. It is **not** a lock and **not**
+    /// `FNDRINFO`; the name matters because a refusal line that cannot be
+    /// resolved to a flag is a line nobody can act on.
+    pub const O_EVTONLY: i32 = 0x0000_8000;
     pub const O_DIRECTORY: i32 = 0x0010_0000;
     pub const O_DSYNC: i32 = 0x0040_0000;
     pub const O_CLOEXEC: i32 = 0x0100_0000;
@@ -154,10 +160,76 @@ pub fn creates(flags: i32) -> bool {
 
 /// The guest's `open` flags as the host's.
 ///
-/// Bit for bit on macOS. Elsewhere a translation, and one that drops nothing silently:
-/// a Darwin-only flag with no host equivalent - `O_SHLOCK`, `O_EVTONLY`, `O_SYMLINK` -
-/// is reported rather than ignored, because a guest that asked for a shared lock and
-/// did not get one has been told it succeeded.
+/// Bit for bit on macOS. Elsewhere a translation, and one that drops nothing
+/// silently: a Darwin-only flag with no host equivalent - `O_SHLOCK`,
+/// `O_SYMLINK` - is reported rather than ignored, because a guest that asked
+/// for a shared lock and did not get one has been told it succeeded.
+///
+/// # `O_EVTONLY`, and why it is answered rather than refused
+///
+/// `O_EVTONLY` (`0x8000`, xnu `bsd/sys/fcntl.h:141`) asks for "a descriptor
+/// requested for event notifications only": the descriptor resolves the path
+/// and is then used *only* to register a filesystem event on. Linux has the
+/// same thing under a different name - **`O_PATH`**, `open(2)`: "obtain a file
+/// descriptor that can be used for two purposes: to indicate a location in the
+/// filesystem tree and to perform operations that act purely at the file
+/// descriptor level.  The file itself is not opened, and other file operations
+/// (e.g. `read`, `write`) fail with `EBADF`."  That is `O_EVTONLY`'s semantics
+/// and not a weakening of them: a descriptor that cannot be read is the whole
+/// of what Darwin hands back.
+///
+/// **The two are not interchangeable, and the difference is what the guest
+/// does.** The measured caller in this tree is
+/// `base::FilePathWatcherKQueue::FileDescriptorForPath`
+/// (`file_path_watcher_kqueue.cc:113`),
+/// `int fd = HANDLE_EINTR(open(path.value().c_str(), O_EVTONLY));`, in **two**
+/// copies of that file (`Framework+0x5d9e423` and `+0x3a9a5f3`, ten call
+/// sites between them, all inside those two files) plus the same function in
+/// `content/browser/file_system_access/`.  It uses the descriptor for exactly
+/// one thing: `EV_SET(&event, fd, EVFILT_VNODE, ...)`.
+///
+/// Translating it to `O_RDONLY` - the obvious "close enough" - would hand the
+/// guest a *readable* descriptor where Darwin gives an unreadable one, and
+/// that is the shape of wrong answer this project exists to refuse: a
+/// plausible value that is silently more capable than the truth.  `O_PATH` is
+/// not more capable; it is the same.
+///
+/// **What this does buy, and what it still does not - both stated so the log is
+/// not over-read in either direction.** This paragraph used to say that the
+/// guest's `EVFILT_VNODE` registration was refused by name by this host's
+/// kqueue (`darwin::kqueue::refused_filter`), so the descriptor was real while
+/// the *watch* still did not arm, and `FilePathWatcher::Watch` failed. **That
+/// was true and is no longer.** `kqueue::apply` routes `EVFILT_VNODE` to
+/// `apply_vnode` *before* the `refused_filter` arm, so the filter is answered
+/// rather than refused, on a real `inotify` watch, and the two halves of this
+/// note are what it is armed on: the registration's `ident` is the descriptor,
+/// `inotify_add_watch` takes a pathname rather than a descriptor (measured - it
+/// answers `EFAULT` for an `O_PATH` descriptor), and so the path comes from
+/// `/proc/self/fd/<ident>` and the object that path resolves to is checked
+/// against the object the descriptor holds. The `EV_RECEIPT` the registration
+/// carries comes back with `data == 0`, which the guest's
+/// `AreKeventValuesValid` accepts, so `Watch()` returns **true**. The `EINVAL`
+/// receipt this paragraph described, and the `false` that followed it, are both
+/// gone - see `mach::kevent64`'s module note for the correction that replaced
+/// them and the call sites it was measured at.
+///
+/// **What is still missing, so the correction is not read as "no gap".** The
+/// registration asks for `fflags 0x6f` - six of the seven `NOTE_` values, every
+/// one except `NOTE_LINK` - and this host can report five of those six.
+/// `NOTE_EXTEND` is a narrowing of `NOTE_WRITE` that `inotify` folds into the
+/// same `IN_MODIFY`, and `NOTE_LINK` is folded into the same `IN_ATTRIB` as a
+/// metadata change, and neither can be told apart from what it is folded into.
+/// So the one the guest asks for and this host cannot see - `0x4` - is **dropped
+/// from the registration's interest and named**, not mapped to the nearest event:
+/// a note this implementation cannot observe must never appear in a delivered
+/// `fflags`. That is a narrowing rather than a wrong answer, and it costs this
+/// guest nothing by a measurement rather than an assumption - the
+/// delivered-event handling tests only `NOTE_ATTRIB`, `NOTE_WRITE` and
+/// `NOTE_DELETE|NOTE_RENAME|NOTE_REVOKE`, and no `0x4` and no `0x10` anywhere in
+/// either copy of it, so the five that are reportable are exactly the five it
+/// checks. See `mach::kevent64`'s `VNODE_UNREPORTABLE` for the two it will not
+/// report and `VNODE_DROPPED_BY_THE_GUEST` for the one of them the framework
+/// actually requests.
 #[cfg(not(target_os = "macos"))]
 pub fn flags_to_host(flags: i32) -> Result<libc::c_int, i32> {
     let flags = FcntlFlags(flags);
@@ -178,6 +250,13 @@ const PAIRS: &[(i32, libc::c_int)] = &[
     (oflag::O_TRUNC, libc::O_TRUNC),
     (oflag::O_EXCL, libc::O_EXCL),
     (oflag::O_NOCTTY, libc::O_NOCTTY),
+    // `O_EVTONLY` -> `O_PATH`: the same capability under this host's name, and
+    // the *narrower* of the two plausible answers.  See the note on
+    // [`flags_to_host`] for the caller that made this worth doing and for what
+    // it does not fix.  It is in `PAIRS` rather than special-cased because
+    // `unknown()` reads this table, and a bit that is in neither table is a
+    // bit this module refuses.
+    (oflag::O_EVTONLY, libc::O_PATH),
     (oflag::O_DIRECTORY, libc::O_DIRECTORY),
     (oflag::O_DSYNC, libc::O_DSYNC),
     (oflag::O_CLOEXEC, libc::O_CLOEXEC),
@@ -489,6 +568,83 @@ mod tests {
     fn a_flag_with_no_equivalent_is_reported() {
         const O_SHLOCK: i32 = 0x0010;
         assert_eq!(flags_to_host(oflag::O_RDONLY | O_SHLOCK), Err(O_SHLOCK));
+    }
+
+    /// **`O_EVTONLY` is answered, and it is answered with `O_PATH`.**
+    ///
+    /// This is the positive half of the test above, and it is here because the
+    /// refusal it replaced was a *class-2* instance rather than a class-3 one:
+    /// the refused `open` was `FilePathWatcherKQueue::FileDescriptorForPath`
+    /// (`file_path_watcher_kqueue.cc:113`), and its failure propagated into
+    /// `DnsConfigService::watch_failed_`, which makes the resolver report an
+    /// **empty** `DnsConfig` (dns_config_service.cc:237-240).  A guest told "no
+    /// name servers" because a watch could not be armed is the same shape as
+    /// the `SCDynamicStoreCopyProxies` instance: learning a fact from an
+    /// absence this runtime created.
+    #[test]
+    #[cfg(not(target_os = "macos"))]
+    fn o_evtonly_is_answered_as_o_path_and_nothing_else() {
+        // The guest's word is exactly `0x8000` at both of its call sites
+        // (`Framework+0x5d9e423`, `+0x3a9a5f3`, measured with
+        // `test/tools/flag-sites.py _open --reg esi`), and this is the
+        // translation of that word and nothing more.
+        assert_eq!(flags_to_host(oflag::O_EVTONLY), Ok(libc::O_PATH));
+        // Not `O_RDONLY`: that would be a *readable* descriptor where Darwin
+        // hands back an unreadable one, and the difference is exactly the
+        // "plausible value, silently wrong" this project exists to refuse.
+        assert_ne!(libc::O_PATH, libc::O_RDONLY);
+        assert_eq!(
+            FcntlFlags(oflag::O_EVTONLY).unknown(),
+            0,
+            "O_EVTONLY is in PAIRS, so it is answered rather than reported"
+        );
+    }
+
+    /// The narrower claim, checked against the host rather than against this
+    /// file: an `O_PATH` descriptor behaves the way Darwin's `O_EVTONLY` one
+    /// does, so the translation is the same capability and not a stand-in.
+    ///
+    /// `read` on it is `EBADF`, `fstat`/`fcntl`/`close` work, and a path that
+    /// does not exist still fails to open - the three properties
+    /// `FilePathWatcherKQueue` depends on.
+    #[test]
+    #[cfg(not(target_os = "macos"))]
+    fn the_o_path_descriptor_behaves_the_way_darwins_o_evtonly_one_does() {
+        use std::ffi::CString;
+        let dir = std::env::temp_dir().join(format!("evtonly-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = CString::new(dir.to_str().unwrap()).unwrap();
+        // SAFETY: a NUL-terminated path, and a flags word with no mode bit, so
+        // no third argument is read.
+        let fd = unsafe { libc::open(path.as_ptr(), flags_to_host(oflag::O_EVTONLY).unwrap()) };
+        assert!(fd >= 0, "O_PATH must open an existing directory: {}", std::io::Error::last_os_error());
+        // SAFETY: a live descriptor, and a two-byte buffer.
+        let (rc, buf) = unsafe {
+            let mut buf = [0u8; 2];
+            (libc::read(fd, buf.as_mut_ptr().cast(), buf.len()), buf)
+        };
+        assert_eq!(rc, -1, "an O_PATH descriptor must not be readable");
+        assert_eq!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::EBADF),
+            "and the refusal must be EBADF, the way Darwin's is"
+        );
+        assert_eq!(buf, [0, 0], "nothing may have been read into the buffer");
+        // SAFETY: a live descriptor and a live `struct stat`.
+        assert_eq!(unsafe { libc::fstat(fd, std::ptr::null_mut()) }, -1, "fstat needs a real struct");
+        // SAFETY: closing a descriptor this test opened.
+        assert_eq!(unsafe { libc::close(fd) }, 0);
+        // A path that does not exist must still fail: `O_EVTONLY` is not a
+        // licence to succeed on nothing.
+        let missing = CString::new(dir.join("nope").to_str().unwrap()).unwrap();
+        // SAFETY: as above.
+        let fd = unsafe { libc::open(missing.as_ptr(), flags_to_host(oflag::O_EVTONLY).unwrap()) };
+        assert_eq!(fd, -1, "a missing path must still fail to open");
+        assert_eq!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::ENOENT)
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     /// The commands that agree do so by accident and stop at five; anything past

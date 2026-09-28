@@ -584,7 +584,7 @@ pub(crate) fn install() {
         "fileExistsAtPath:" => file_exists, c"B24@0:8@16";
         "fileExistsAtPath:isDirectory:" => file_exists_is_directory, c"B32@0:8@16^c24";
         "createDirectoryAtPath:withIntermediateDirectories:attributes:error:"
-            => create_directory, c"B44@0:8@16c24@32^@40";
+            => create_directory, c"B48@0:8@16c24@32^@40";
         "removeItemAtPath:error:" => remove_item, c"B32@0:8@16^@24";
         "copyItemAtPath:toPath:error:" => copy_item, c"B40@0:8@16@24^@32";
         "moveItemAtPath:toPath:error:" => move_item, c"B40@0:8@16@24^@32";
@@ -597,7 +597,7 @@ pub(crate) fn install() {
         "stringWithFileSystemRepresentation:length:"
             => string_with_file_system_representation, c"@32@0:8*16Q24";
         "createDirectoryAtURL:withIntermediateDirectories:attributes:error:"
-            => create_directory_at_url, c"B44@0:8@16c24@32^@40";
+            => create_directory_at_url, c"B48@0:8@16c24@32^@40";
         "removeItemAtURL:error:" => remove_item_at_url, c"B32@0:8@16^@24";
         "moveItemAtURL:toURL:error:" => move_item_at_url, c"B40@0:8@16@24^@32";
         "copyItemAtURL:toURL:error:" => copy_item_at_url, c"B40@0:8@16@24^@32";

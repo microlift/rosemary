@@ -761,6 +761,288 @@ pub unsafe extern "C" fn fstatfs(fd: c_int, out: *mut Statfs) -> c_int {
     result
 }
 
+/// macOS's `struct statvfs` — **64 bytes**, and nothing like the 2 KB shape
+/// `struct statfs` has.
+///
+/// # There are no name buffers here, and that is the whole point
+///
+/// `f_mntonname`, `f_mntfromname` and `f_mountfromname` are fields of
+/// **`struct statfs`**, not of `struct statvfs`. Apple's own `statvfs(3)` man
+/// page enumerates the members — `f_bsize`, `f_frsize`, `f_blocks`, `f_bfree`,
+/// `f_bavail`, `f_files`, `f_ffree`, `f_favail`, `f_fsid`, `f_flag`,
+/// `f_namemax` — and no name, and closes with "IMPLEMENTATION NOTES: The
+/// statvfs() and fstatvfs() functions are implemented as wrappers around the
+/// statfs() and fstatfs() functions, respectively. **Not all the information
+/// provided by those functions is made available through this interface.**"
+/// A caller that wants a mount point on macOS asks `getmntinfo` or `statfs`;
+/// there is no mount point in this structure to derive one into, and inventing
+/// 3 KB of them would be worse than the absence.
+///
+/// # The size is measured, not remembered — and it is load-bearing
+///
+/// A previous account of this entry had this structure at "~2 KB" and
+/// `f_mntonname` as one of its fields. Writing 2 KB into this guest's buffer
+/// would **smash its frame by about 3 KB**, which is the fault this entry
+/// exists to fix. Three independent measurements, all from the guest's own
+/// `__text`, agree on 64:
+///
+/// * `base::SysInfo::AmountOfFreeDiskSpace` at `Framework+0x5d83b90` (and
+///   `AmountOfTotalDiskSpace` at `+0x5d83ce0`) each declare
+///   `struct statvfs stats;` at `[rbp-0x70]` and pattern-initialise it with
+///   **exactly four** `movaps` of the `0xaa` literal at `0xd637790` — 64 bytes
+///   at `+0x5d83c0e`, `+0x5d83c12`, `+0x5d83c16`, `+0x5d83c1a`, and nothing
+///   after. The two bytes that follow are a `xchg ax,ax` NOP, not a store.
+/// * The same idiom, for `struct statfs`, emits
+///   `mov edx,0x878; mov esi,0xaa; call _memset` at `+0x7424afe` — **2168**
+///   bytes, which is Darwin's `sizeof(struct statfs)`, and the store that
+///   follows reads `f_fstypename` at base `+0x48` and compares it against
+///   `"hfs"` and `"ufs"`. That is the positive control: the pattern fill is
+///   this compiler's `-ftrivial-auto-var-init=pattern` and it covers whole
+///   objects, so its extent is the object's `sizeof`. (80 599 `movaps`
+///   references to that one literal in `__TEXT,__literals` are the second
+///   control.)
+/// * The frame arithmetic closes: `sub rsp,0xa0` after `push rbp/r14/rbx`
+///   leaves 160 bytes at `[rbp-0xb0, rbp-0x10)`, and that is 64 (the
+///   `ScopedBlockingCall`) + 64 (`stats`) + 24 (`base::Location`) + 8 of slack.
+///   The buffer at `rbp-0x70` therefore has 96 bytes to the saved `rbx` and
+///   could not have held 2 KB whatever the header says.
+///
+/// ## Which offsets are measured and which are derived
+///
+/// Measured, by the reads the two functions perform:
+///
+/// | offset | width | what it is | evidence |
+/// |---:|---:|---|---|
+/// | `0x08` | 64 | the block size | `imul rbx, QWORD PTR [rbp-0x68]`, **the same operand in both functions** |
+/// | `0x10` | 32 | total blocks | `mov ebx, DWORD PTR [rbp-0x60]` in `AmountOfTotalDiskSpace` |
+/// | `0x18` | 32 | blocks available to others | `mov ebx, DWORD PTR [rbp-0x58]` in `AmountOfFreeDiskSpace` |
+///
+/// The two functions are `base/system/sys_info_posix.cc:184` and `:195`
+/// (`FROM_HERE` on lines 185 and 196, and the function names are at
+/// `0xd8eef0e` and `0xd8eef48`) and each returns
+/// `saturated_cast<int64_t>(stats.f_bavail * stats.f_frsize)` or
+/// `… f_blocks * stats.f_frsize` after `HANDLE_EINTR`. So `0x08` is the one
+/// factor both share and `0x10`/`0x18` are the counters that differ — and the
+/// counters are read **32 bits at a time**, which is why they are `u32` here
+/// even though this host reports them as `unsigned long`.
+///
+/// The rest follow from the POSIX declaration order, from `0x08` being
+/// eight bytes (so `f_bsize` is eight bytes at `0x00` — there is no room for a
+/// four-byte `f_bsize` with a hole at `0x04`), and from the total being 64.
+/// That derivation is recorded rather than hidden, and the two offsets the
+/// guest's disk-space code depends on are the two that are measured.
+///
+/// # The 32-bit counters are macOS's, not a shortcut
+///
+/// A count this host reports above `2^32` does not fit, and is truncated
+/// rather than refused: the field is thirty-two bits wide in the guest's own
+/// layout, so macOS truncates it too. Refusing would invent a capability gap
+/// that does not exist, and inventing a 64-bit field at those offsets would
+/// put `f_bfree` where the guest reads `f_bavail`.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct Statvfs {
+    pub f_bsize: u64,
+    pub f_frsize: u64,
+    pub f_blocks: u32,
+    pub f_bfree: u32,
+    pub f_bavail: u32,
+    pub f_files: u32,
+    pub f_ffree: u32,
+    pub f_favail: u32,
+    pub f_fsid: u64,
+    pub f_flag: u32,
+    pub f_namemax: u32,
+    pub f_type: u32,
+    _pad: u32,
+}
+
+const _: () = {
+    assert!(size_of::<Statvfs>() == 64);
+    // The three the guest reads, and the two that fix the width of `f_bsize`.
+    assert!(std::mem::offset_of!(Statvfs, f_bsize) == 0);
+    assert!(std::mem::offset_of!(Statvfs, f_frsize) == 8);
+    assert!(std::mem::offset_of!(Statvfs, f_blocks) == 16);
+    assert!(std::mem::offset_of!(Statvfs, f_bavail) == 24);
+    assert!(std::mem::offset_of!(Statvfs, f_fsid) == 40);
+    assert!(std::mem::offset_of!(Statvfs, f_flag) == 48);
+    // This host's own `struct statvfs` is 112 bytes with every one of these
+    // fields at a *different* offset and a different width, so a copy that
+    // skipped the conversion would pass every size check this block makes and
+    // hand the guest `f_frsize` where it reads `f_bavail`.
+    assert!(size_of::<libc::statvfs>() == 112);
+    assert!(std::mem::offset_of!(libc::statvfs, f_blocks) != 16
+        || std::mem::offset_of!(libc::statvfs, f_bavail) != 24);
+    assert!(size_of::<libc::statvfs>() != size_of::<Statvfs>());
+};
+
+/// Darwin's `f_flag` bits, which are `ST_RDONLY` and `ST_NOSUID` and nothing
+/// else (`statvfs(3)`: "There are two flags defined for the `f_flag` member").
+/// This host defines the same two at the same values and then a dozen more,
+/// none of which names a mount option Darwin has.
+const DARWIN_ST_RDONLY: u32 = 0x1;
+const DARWIN_ST_NOSUID: u32 = 0x2;
+
+/// A count this host reports wider than Darwin's field.
+fn count(count: libc::c_ulong) -> u32 {
+    count as u32
+}
+
+/// Fill a Darwin `struct statvfs` from this host's.
+///
+/// Every field is the same fact under the name the two platforms give it,
+/// except `f_type` and `f_flag`, and both of those are refusals rather than
+/// guesses — see [`say_unmapped_fstype`] and `f_flag`.
+///
+/// # Safety
+///
+/// `out` is null or a writable Darwin `struct statvfs`; `magic` reports this
+/// host's filesystem magic for the same target, and is only called if the
+/// `f_type` refusal has not been said yet.
+unsafe fn fill_statvfs(
+    host: &libc::statvfs,
+    magic: impl FnOnce() -> libc::c_long,
+    out: *mut Statvfs,
+) {
+    if out.is_null() {
+        return;
+    }
+    let value = Statvfs {
+        f_bsize: host.f_bsize as u64,
+        // This host's `f_frsize` is the *fragment* size and is 0 for a
+        // filesystem that has no separate one, where macOS's `f_frsize` is the
+        // fundamental allocation unit — `statvfs(3)`: "This corresponds to the
+        // f_bsize member of struct statfs." Both platforms therefore answer
+        // `f_bsize` for a filesystem with one block size, and taking that
+        // member when the fragment size is absent is the same fact rather than
+        // a substitute for it. This host reports 4096 for both on ext4 and
+        // tmpfs, so the fallback is not what the answer is today.
+        f_frsize: match host.f_frsize {
+            0 => host.f_bsize as u64,
+            fragment => fragment as u64,
+        },
+        f_blocks: count(host.f_blocks),
+        f_bfree: count(host.f_bfree),
+        f_bavail: count(host.f_bavail),
+        f_files: count(host.f_files),
+        f_ffree: count(host.f_ffree),
+        f_favail: count(host.f_favail),
+        // One `unsigned long` of opaque identifier on both sides; the 0x38 on
+        // this host and the two `int`s Darwin's `fsid_t` is made of are the
+        // same eight bytes, and nothing in either platform interprets them.
+        f_fsid: host.f_fsid as u64,
+        // Only the two bits Darwin names. This host's word also carries
+        // `ST_NODEV`, `ST_NOEXEC`, `ST_SYNCHRONOUS`, `ST_RELATIME` and more,
+        // and none of those has a Darwin name, so none is claimed — a caller
+        // that tested a bit Darwin does not define would be reading a bit this
+        // runtime invented.
+        f_flag: host.f_flag as u32 & (DARWIN_ST_RDONLY | DARWIN_ST_NOSUID),
+        f_namemax: host.f_namemax as u32,
+        // Refused. See [`say_unmapped_fstype`].
+        f_type: 0,
+        _pad: 0,
+    };
+    if value.f_type == 0 {
+        say_unmapped_fstype(magic);
+    }
+    // SAFETY: the caller's obligation; `out` is non-null and the guest sized it
+    // at exactly 64 bytes, which is what `assert!` above pins.
+    unsafe { out.write(value) };
+}
+
+/// This host's filesystem magic for `path`, or 0 if it cannot be read.
+///
+/// `libc::statvfs` has no `f_type` — glibc added it to `statvfs` in 2.36 and
+/// the Rust binding still mirrors the older header — and `statfs` carries the
+/// same number under the same name, so this is the same fact asked a second
+/// way. Only the refusal message needs it, and that asks at most once per
+/// distinct magic, so the extra call is not on any path a caller pays for.
+fn fstype_of(path: *const c_char) -> libc::c_long {
+    with_fallback(path, |path| {
+        // SAFETY: a zeroed `struct statfs` is what the host is asked to fill.
+        let mut host: libc::statfs = unsafe { std::mem::zeroed() };
+        // SAFETY: the caller's obligation, and `host` is this host's own layout.
+        let rc = unsafe { libc::statfs(path, &mut host) };
+        (host.f_type, rc == 0)
+    })
+}
+
+/// [`fstype_of`] for a descriptor, so the refusal names the filesystem the
+/// caller actually asked about.
+fn fstype_of_fd(fd: c_int) -> libc::c_long {
+    // SAFETY: a zeroed `struct statfs` is what the host is asked to fill.
+    let mut host: libc::statfs = unsafe { std::mem::zeroed() };
+    // SAFETY: `host` is this host's own layout and `fd` is the caller's.
+    let rc = unsafe { libc::fstatfs(fd, &mut host) };
+    let _ = rc;
+    host.f_type
+}
+
+/// Name a filesystem whose magic has no Darwin `OSTYPE` once.
+///
+/// Darwin's `f_type` is an `OSTYPE` and this host's is a filesystem magic; the
+/// two agree for no filesystem this host actually has — ext4 is `0xef53` here
+/// and tmpfs is `0x01021994`, and neither is a four-character `OSTYPE`. The
+/// field is therefore left zero and this says so, once, by name: a caller that
+/// switches on `f_type` sees "not a filesystem I can name" instead of a magic
+/// that means nothing on macOS and would match nothing there either.
+fn say_unmapped_fstype(magic: impl FnOnce() -> libc::c_long) {
+    use std::sync::Mutex;
+
+    static SAID: Mutex<Vec<libc::c_long>> = Mutex::new(Vec::new());
+    let mut said = SAID.lock().unwrap_or_else(|e| e.into_inner());
+    let magic = magic();
+    if said.contains(&magic) {
+        return;
+    }
+    said.push(magic);
+    eprintln!(
+        "rosetta3: statvfs: no Darwin f_type for this host's filesystem magic {magic:#x}; \
+         the field is left zero rather than given a number that would name nothing on macOS"
+    );
+}
+
+/// `int statvfs(const char *, struct statvfs *)`
+///
+/// # Safety
+///
+/// `path` is NUL-terminated and `out` is null or a writable Darwin
+/// `struct statvfs`.
+pub unsafe extern "C" fn statvfs(path: *const c_char, out: *mut Statvfs) -> c_int {
+    with_fallback(path, |path| {
+        // SAFETY: a zeroed `struct statvfs` is what the host is asked to fill.
+        let mut host: libc::statvfs = unsafe { std::mem::zeroed() };
+        // SAFETY: the caller's obligation, and `host` is this host's own layout.
+        let result = unsafe { libc::statvfs(path, &mut host) };
+        if result == 0 {
+            unsafe { fill_statvfs(&host, || fstype_of(path), out) };
+        }
+        (result, result == 0)
+    })
+}
+
+/// `int fstatvfs(int, struct statvfs *)`
+///
+/// Asked about a **descriptor**, so the host is asked about the descriptor:
+/// `fstatvfs` on this host takes an `int` too, and resolving the descriptor to
+/// a path to reopen would answer about whatever now occupies that name, which
+/// for an unlinked file is nothing. The test
+/// `fstatvfs_asks_about_the_descriptor_and_not_the_name` holds that apart.
+///
+/// # Safety
+///
+/// As [`statvfs`].
+pub unsafe extern "C" fn fstatvfs(fd: c_int, out: *mut Statvfs) -> c_int {
+    // SAFETY: a zeroed `struct statvfs` is what the host is asked to fill.
+    let mut host: libc::statvfs = unsafe { std::mem::zeroed() };
+    // SAFETY: `host` is this host's own layout and `fd` is the caller's.
+    let result = unsafe { libc::fstatvfs(fd, &mut host) };
+    if result == 0 {
+        unsafe { fill_statvfs(&host, || fstype_of_fd(fd), out) };
+    }
+    result
+}
+
 // Every name this module answers, in both spellings a Mach-O may import them
 // by - see `crate::base_name` for why `$INODE64` is not a name of its own, and
 // `crate::divergent` for the list that stops the host's own being bound
@@ -773,6 +1055,8 @@ exports::exports! {
         "fstatat" | "fstatat$INODE64" => fstatat,
         "statfs" | "statfs$INODE64" => statfs,
         "fstatfs" | "fstatfs$INODE64" => fstatfs,
+        "statvfs" | "statvfs$INODE64" => statvfs,
+        "fstatvfs" | "fstatvfs$INODE64" => fstatvfs,
         "access" => access,
         "faccessat" => faccessat,
         "realpath" => realpath,
@@ -1262,5 +1546,260 @@ mod tests {
             libc::umask(previous);
             previous as u32
         }
+    }
+
+    /// What the host says about `path`, for the tests below to compare against.
+    fn host_statvfs(path: &[u8]) -> libc::statvfs {
+        // SAFETY: a zeroed `struct statvfs` is what the host is asked to fill.
+        let mut host: libc::statvfs = unsafe { std::mem::zeroed() };
+        // SAFETY: `path` is a NUL-terminated string the caller built.
+        let rc = unsafe { libc::statvfs(cstr(path).as_ptr(), &mut host) };
+        assert_eq!(rc, 0, "host statvfs: {}", std::io::Error::last_os_error());
+        host
+    }
+
+    /// A NUL-terminated copy of a byte string, for a `*const c_char`.
+    fn cstr(bytes: &[u8]) -> CString {
+        CString::new(bytes).expect("no NUL")
+    }
+
+    /// The structure is 64 bytes and lands its fields where the guest reads
+    /// them. This is the assertion that would fail if the 2 KB `statfs`-shaped
+    /// structure were used here, and it fails *loudly and early* rather than by
+    /// smashing a frame three kilobytes up: 64 is the size the guest's own
+    /// compiler reserved, measured in the doc comment on [`Statvfs`].
+    #[test]
+    fn a_statvfs_is_sixty_four_bytes_with_its_fields_where_the_guest_reads_them() {
+        assert_eq!(size_of::<Statvfs>(), 64);
+        assert_eq!(std::mem::offset_of!(Statvfs, f_bsize), 0);
+        assert_eq!(std::mem::offset_of!(Statvfs, f_frsize), 8);
+        assert_eq!(std::mem::offset_of!(Statvfs, f_blocks), 16);
+        assert_eq!(std::mem::offset_of!(Statvfs, f_bavail), 24);
+        // And the host's is neither the size nor the layout, which is the whole
+        // reason this function exists.
+        assert_ne!(size_of::<libc::statvfs>(), size_of::<Statvfs>());
+        assert_ne!(std::mem::offset_of!(libc::statvfs, f_bavail), 24);
+    }
+
+    /// A real path reports a block size and a non-zero block count — the two
+    /// facts `base::SysInfo::AmountOfFreeDiskSpace` is asking for, and a
+    /// refusal that returned zero for either would satisfy a caller that never
+    /// looked.
+    #[test]
+    fn statvfs_on_a_real_path_reports_a_block_size_and_a_block_count() {
+        let path = cstr(b"/");
+        let mut out = Statvfs {
+            f_bsize: 0,
+            f_frsize: 0,
+            f_blocks: 0,
+            f_bfree: 0,
+            f_bavail: 0,
+            f_files: 0,
+            f_ffree: 0,
+            f_favail: 0,
+            f_fsid: 0,
+            f_flag: 0,
+            f_namemax: 0,
+            f_type: 0,
+            _pad: 0,
+        };
+        // SAFETY: a NUL-terminated path and a writable Darwin `statvfs`.
+        let rc = unsafe { statvfs(path.as_ptr(), &mut out) };
+        assert_eq!(rc, 0, "statvfs failed: {}", std::io::Error::last_os_error());
+        assert!(out.f_bsize > 0, "no block size");
+        assert!(out.f_blocks > 0, "a filesystem with no blocks at all");
+        assert!(out.f_bavail > 0, "no block available to this user");
+        assert!(out.f_frsize > 0, "no fundamental block size");
+        assert!(out.f_files > 0, "no file nodes at all");
+    }
+
+    /// Every field this entry claims to fill, asserted against the host's own
+    /// answer for the same path — and asserted as **bytes at Darwin's offsets**,
+    /// not through the field names, so a call that filled the guest's buffer
+    /// with this host's layout could not satisfy them.
+    #[test]
+    fn every_field_matches_the_host_and_sits_at_its_offset() {
+        let raw = b"/";
+        let path = cstr(raw);
+        let host = host_statvfs(raw);
+
+        let mut out = Statvfs {
+            f_bsize: 0,
+            f_frsize: 0,
+            f_blocks: 0,
+            f_bfree: 0,
+            f_bavail: 0,
+            f_files: 0,
+            f_ffree: 0,
+            f_favail: 0,
+            f_fsid: 0,
+            f_flag: 0,
+            f_namemax: 0,
+            f_type: 0,
+            _pad: 0,
+        };
+        // SAFETY: a NUL-terminated path and a writable Darwin `statvfs`.
+        let rc = unsafe { statvfs(path.as_ptr(), &mut out) };
+        assert_eq!(rc, 0, "{}", std::io::Error::last_os_error());
+
+        // The counts, the two block sizes, the identifier, the name limit.
+        assert_eq!(out.f_bsize, host.f_bsize as u64, "f_bsize");
+        assert_eq!(
+            out.f_frsize,
+            match host.f_frsize {
+                0 => host.f_bsize as u64,
+                fragment => fragment as u64,
+            },
+            "f_frsize"
+        );
+        assert_eq!(out.f_blocks, host.f_blocks as u32, "f_blocks");
+        assert_eq!(out.f_bfree, host.f_bfree as u32, "f_bfree");
+        assert_eq!(out.f_bavail, host.f_bavail as u32, "f_bavail");
+        assert_eq!(out.f_files, host.f_files as u32, "f_files");
+        assert_eq!(out.f_ffree, host.f_ffree as u32, "f_ffree");
+        assert_eq!(out.f_favail, host.f_favail as u32, "f_favail");
+        assert_eq!(out.f_fsid, host.f_fsid as u64, "f_fsid");
+        assert_eq!(out.f_namemax, host.f_namemax as u32, "f_namemax");
+        // The two flag bits Darwin defines, and no other.
+        assert_eq!(
+            out.f_flag,
+            host.f_flag as u32 & (DARWIN_ST_RDONLY | DARWIN_ST_NOSUID),
+            "f_flag carries only the two bits Darwin names"
+        );
+        // `f_type` is the one field this entry refuses, and the refusal is
+        // visible: zero, and said once by name on stderr.
+        assert_eq!(out.f_type, 0, "f_type is a refusal, not an answer");
+
+        // And as the bytes a guest reading its own buffer would see. Every
+        // field in `Statvfs` is an integer, so all 64 bytes are defined.
+        let bytes = unsafe {
+            std::slice::from_raw_parts((&out as *const Statvfs).cast::<u8>(), size_of::<Statvfs>())
+        };
+        // `f_bavail` is four bytes wide, so it is read as four - which is the
+        // point: the guest reads it with `mov ebx, DWORD PTR [rbp-0x58]`.
+        let word = |offset: usize| {
+            u32::from_le_bytes(bytes[offset..offset + 4].try_into().expect("four bytes"))
+        };
+        assert_eq!(
+            word(std::mem::offset_of!(Statvfs, f_bavail)),
+            host.f_bavail as u32,
+            "f_bavail is not four bytes wide where the guest reads it"
+        );
+        assert_eq!(
+            word(std::mem::offset_of!(Statvfs, f_blocks)),
+            host.f_blocks as u32,
+            "f_blocks is not four bytes wide where the guest reads it"
+        );
+        assert_eq!(
+            u64::from_le_bytes(
+                bytes[std::mem::offset_of!(Statvfs, f_frsize)
+                    ..std::mem::offset_of!(Statvfs, f_frsize) + 8]
+                    .try_into()
+                    .expect("eight bytes")
+            ),
+            match host.f_frsize {
+                0 => host.f_bsize as u64,
+                fragment => fragment as u64,
+            },
+            "f_frsize is not eight bytes wide at +8, where the guest's shared operand is"
+        );
+        // Which the host's own layout contradicts: on this host `f_bavail` is at
+        // 32 and eight bytes wide, so a straight copy would have satisfied
+        // every name-based assertion above and put nothing where the guest
+        // looks.
+        assert_ne!(std::mem::offset_of!(libc::statvfs, f_bavail), 24);
+    }
+
+    /// `fstatvfs` asks about the descriptor. The file is unlinked before the
+    /// second call, so an implementation that resolved the descriptor to a path
+    /// and reopened it would answer `ENOENT` — and a reopen of *that name*
+    /// would answer about a different file entirely.
+    #[test]
+    fn fstatvfs_asks_about_the_descriptor_and_not_the_name() {
+        let at = std::env::temp_dir().join(format!("r3-fstatvfs-{}", std::process::id()));
+        let _ = std::fs::remove_file(&at);
+        std::fs::write(&at, b"descriptor").expect("a file");
+        let path = cstr(at.to_str().expect("utf-8").as_bytes());
+        // SAFETY: a NUL-terminated path and Darwin scalar arguments.
+        let fd = unsafe { open(path.as_ptr(), crate::fcntl::oflag::O_RDONLY, 0) };
+        assert!(fd >= 0, "open failed: {}", std::io::Error::last_os_error());
+
+        let mut by_name = Statvfs {
+            f_bsize: 0,
+            f_frsize: 0,
+            f_blocks: 0,
+            f_bfree: 0,
+            f_bavail: 0,
+            f_files: 0,
+            f_ffree: 0,
+            f_favail: 0,
+            f_fsid: 0,
+            f_flag: 0,
+            f_namemax: 0,
+            f_type: 0,
+            _pad: 0,
+        };
+        // SAFETY: a NUL-terminated path and a writable Darwin `statvfs`.
+        let before = unsafe { statvfs(path.as_ptr(), &mut by_name) };
+        assert_eq!(before, 0, "{}", std::io::Error::last_os_error());
+
+        // The name goes away; the descriptor does not.
+        let _ = std::fs::remove_file(&at);
+
+        let mut by_descriptor = by_name;
+        // SAFETY: a live descriptor and a writable Darwin `statvfs`.
+        let rc = unsafe { fstatvfs(fd, &mut by_descriptor) };
+        // SAFETY: a descriptor this test just opened.
+        unsafe { libc::close(fd) };
+        crate::errno::set(0);
+        assert_eq!(
+            rc,
+            0,
+            "fstatvfs on an unlinked file failed: {}",
+            std::io::Error::last_os_error()
+        );
+        assert!(by_descriptor.f_bsize > 0);
+        assert!(by_descriptor.f_blocks > 0);
+        // The same filesystem, so the same answer.
+        assert_eq!(by_descriptor.f_bsize, by_name.f_bsize);
+        assert_eq!(by_descriptor.f_blocks, by_name.f_blocks);
+        assert_eq!(by_descriptor.f_bavail, by_name.f_bavail);
+    }
+
+    /// The claim of the whole entry, end to end: the name a Mach-O imports
+    /// binds, with the underscore `exports!` publishes, and the refusal list
+    /// that used to name it does not get to deny what is answered here.
+    #[test]
+    fn a_published_statvfs_binds_and_is_not_refused() {
+        assert!(
+            crate::symbol("_statvfs").is_some(),
+            "_statvfs is published and unanswered"
+        );
+        assert!(crate::symbol("_fstatvfs").is_some());
+        assert_eq!(crate::divergent::reason("statvfs"), None);
+        assert_eq!(crate::divergent::reason("fstatvfs"), None);
+    }
+
+    /// And the answer is 64 bytes into a buffer the caller sized at 64 — the
+    /// test that fails without the whole entry, and the one that would have
+    /// caught the frame it is here to prevent. A canary immediately after the
+    /// structure is what a 2 KB fill would step on.
+    #[test]
+    fn the_fill_does_not_step_outside_the_sixty_four_bytes() {
+        const GUARD: u8 = 0xa5;
+        let mut buffer = [GUARD; 96];
+        // SAFETY: `buffer` is 96 bytes and the first 64 of it are handed over
+        // as a Darwin `struct statvfs`, which is 64 bytes.
+        let rc = unsafe { statvfs(c"/".as_ptr(), buffer.as_mut_ptr().cast::<Statvfs>()) };
+        assert_eq!(rc, 0, "{}", std::io::Error::last_os_error());
+        assert!(
+            buffer[64..].iter().all(|b| *b == GUARD),
+            "the fill wrote past the structure: {:?}",
+            &buffer[64..]
+        );
+        assert!(
+            buffer[..64].iter().any(|b| *b != 0),
+            "nothing at all was written"
+        );
     }
 }

@@ -12,6 +12,7 @@
 
 mod about;
 pub mod accessibility;
+mod accessibility_remote_ui;
 pub mod alert;
 mod animation;
 pub mod appearance;
@@ -31,6 +32,8 @@ pub mod decor;
 mod define;
 pub mod dialog;
 pub mod dock;
+#[cfg(test)]
+mod encoding_check;
 pub mod event;
 mod font;
 pub use chrome::fonts;
@@ -53,11 +56,17 @@ pub mod panel;
 mod paragraph;
 pub mod pasteboard;
 mod pasteboard_manager;
+mod print_panel;
 pub mod quartzcore;
 pub mod raster;
 mod responder;
-pub mod screen;
+mod pop_up_button;
+mod screen;
 pub mod script;
+mod sharing_service_picker;
+mod spell_checker;
+mod speech_synthesizer;
+mod status_bar;
 pub mod text;
 pub mod textinput;
 mod transform;
@@ -105,6 +114,13 @@ pub fn bootstrap() {
         pasteboard::install();
         nsevent::install();
         monitor::install();
+        print_panel::install();
+        spell_checker::install();
+        status_bar::install();
+        accessibility_remote_ui::install();
+        speech_synthesizer::install();
+        pop_up_button::install();
+        sharing_service_picker::install();
     });
 }
 
@@ -285,6 +301,32 @@ static CG_RECT_INFINITE: [f64; 4] = [f64::MAX / -2.0, f64::MAX / -2.0, f64::MAX,
 pub fn data_symbols() -> Vec<(String, u64)> {
     bootstrap();
     let mut out = classes::class_data();
+    // A class in `classes::HIERARCHY` is *registered*; publication is a
+    // separate list, and the distinction is `test/logs/class-gap.md`'s finding
+    // about `formatter::install`. These are AppKit's and are published here.
+    for name in print_panel::CLASSES
+        .iter()
+        .chain(spell_checker::CLASSES)
+        .chain(status_bar::CLASSES)
+        .chain(accessibility_remote_ui::CLASSES)
+        .chain(speech_synthesizer::CLASSES)
+        .chain(pop_up_button::CLASSES)
+        .chain(sharing_service_picker::CLASSES)
+    {
+        let Some(class) =
+            std::ffi::CString::new(*name).ok().and_then(|n| objc::class::lookup(&n))
+        else {
+            continue;
+        };
+        out.push((
+            format!("_OBJC_CLASS_$_{name}"),
+            objc::class::ptr(class) as usize as u64,
+        ));
+        out.push((
+            format!("_OBJC_METACLASS_$_{name}"),
+            objc::class::ptr(class.metaclass()) as usize as u64,
+        ));
+    }
     out.extend(coretext::data_symbols());
     out.extend(cgcontext::data_symbols());
     out.extend(appearance::name_cells());

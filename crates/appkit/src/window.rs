@@ -2081,10 +2081,18 @@ pub(crate) fn install() {
         // `NSWindow` selectors installed in this crate.
         //
         // The 32-byte `CGRect` is 4 words but 1 argument, which is why the
-        // offsets are 16/48/56/64 and not 16/48/64/72. The frame size is *not*
-        // derivable from the string — the guest itself emits both `v20@0:8c16`
-        // and `v24@0:8c16` for the same shape — so a `char` argument is one of
-        // the cases where only the guest's own declaration settles it.
+        // offsets are 16/48/56/64 and not 16/48/64/72. The frame size *is*
+        // derivable from the string: the guest writes `+4` for a narrow argument
+        // in 102 of its own 102 such declarations and `+8` in none, so a `char`
+        // argument occupies a four-byte slot. The earlier note here said the
+        // guest "emits both `v20@0:8c16` and `v24@0:8c16` for the same shape";
+        // it does not — there is no `v24@0:8c16` in the Framework at all. The one
+        // declaration containing `24@0:8c16` is `v24@0:8c16i20`
+        // (`-setVisibility:ofColumnWithId:`), where the 24 comes from the `i` at
+        // 20. So `v20@0:8c16` is the shape and a 24 is the deviation, and this
+        // tree's own `v24@0:8c16` rows are the deviation.
+        // (`test/tools/objcenc.py frameselftest` asserts the guest emits
+        // `v20@0:8c16`, in 50 declarations.)
         //
         // Inert for every send, because `objc_msgSend` never reads a declared
         // frame size; it matters to a frame-size consumer such as
@@ -2106,7 +2114,7 @@ pub(crate) fn install() {
             c"{CGRect={CGPoint=dd}{CGSize=dd}}56@0:8{CGRect={CGPoint=dd}{CGSize=dd}}16Q48";
         "setFrame:" => set_frame, c"v48@0:8{CGRect={CGPoint=dd}{CGSize=dd}}16";
         "setFrame:display:" => set_frame_display, c"v52@0:8{CGRect={CGPoint=dd}{CGSize=dd}}16c48";
-        "setFrame:display:animate:" => set_frame_display_animate, c"v52@0:8{CGRect={CGPoint=dd}{CGSize=dd}}16c48c49";
+        "setFrame:display:animate:" => set_frame_display_animate, c"v56@0:8{CGRect={CGPoint=dd}{CGSize=dd}}16c48c52";
         "setFrameOrigin:" => set_frame_origin, c"v32@0:8{CGPoint=dd}16";
         "convertBaseToScreen:" => convert_base_to_screen, c"{CGPoint=dd}32@0:8{CGPoint=dd}16";
         "convertScreenToBase:" => convert_screen_to_base, c"{CGPoint=dd}32@0:8{CGPoint=dd}16";

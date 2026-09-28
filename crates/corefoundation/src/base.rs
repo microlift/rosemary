@@ -303,10 +303,11 @@ pub unsafe fn allocate<T>(class: &'static Class) -> *mut T {
 /// **witness**: a function the handle's *owner* supplies, which can tell from
 /// the allocation itself whether it is still the thing that was noted there.
 /// [`crate::runloop`] supplies one for all four of its kinds, and it is exact -
-/// the word it reads is one the owner wrote and nothing else ever writes. Where
-/// an owner has not supplied one the answer is still the table's, and that is a
-/// stated limitation rather than a silent one: the only owners that have not are
-/// the ones whose allocation cannot die, which is precisely the case in which
+/// the word it reads is one the owner wrote and nothing else ever writes, and
+/// what that word must hold is a value nothing else in the process can carry.
+/// Where an owner has not supplied one the answer is still the table's, and that
+/// is a stated limitation rather than a silent one: the only owners that have not
+/// are the ones whose allocation cannot die, which is precisely the case in which
 /// the bare key was sound to begin with.
 static OPAQUE: std::sync::Mutex<std::collections::BTreeMap<usize, Entry>> =
     std::sync::Mutex::new(std::collections::BTreeMap::new());
@@ -409,7 +410,12 @@ pub fn note_typed_opaque(handle: *const c_void, type_id: CFTypeID) {
 /// `witness` is asked by [`is_opaque`] and by [`witnessed`], and nothing else.
 /// It must be cheap, side-effect free, and it must answer `false` for any
 /// address that is not the allocation it was registered for - which means it has
-/// to read a word the owner itself wrote, not one it inferred.
+/// to read a word the owner itself wrote, not one it inferred, **and** the
+/// value that word must hold has to be one nothing else in the process can
+/// hold. The second half is not a restatement of the first: a witness that reads
+/// a word it wrote and compares it to a value other allocations also carry - zero
+/// is the obvious one - is a check that answers by luck, which is the defect
+/// [`is_opaque`] exists to refuse. See [`crate::runloop::HANDLE_TAG`].
 ///
 /// # Safety
 ///
@@ -747,15 +753,18 @@ pub fn opaque_collision(handle: CFTypeRef) -> bool {
 /// ## Why the class check does not decide this
 ///
 /// The obvious alternative is to ask `first_word_is_a_class_of_ours` here
-/// instead of asking the owner, and it is the wrong instrument for two measured
-/// reasons.
+/// instead of asking the owner, and it is the wrong instrument. Both reasons
+/// below were measured in this suite, and the second one is the reason a check
+/// is not an instrument at all.
 ///
 /// 1. **It covers only the one collision that is easy to recognise.** A recycled
 ///    address can be handed to something that is not an object either - a
 ///    `CFMachPort`, an `IOHIDElementRef`, a `CGDisplayModeRef` - and then neither
 ///    first word is a class, so the check reports everything is fine while
-///    `CFRetain` no-ops and `CFGetTypeID` answers the wrong type. The kind
-///    registry behind this one ([`crate::runloop::is_noted`]) is the sharper
+///    `CFRetain` no-ops and `CFGetTypeID` answers the wrong type. Measured on a
+///    receive right allocated by a test: the first word of a `CFMachPort` is
+///    `0x7f0000000000`, a Mach port name, and the check is silent for it. The
+///    kind registry behind this one ([`crate::runloop::is_noted`]) is the sharper
 ///    case, because it is keyed on the same address and only ever written by
 ///    [`crate::runloop::note`]: a `CFMachPort` landing on a dead
 ///    `CFRunLoopSource`'s address leaves the `Source` entry intact,
@@ -766,17 +775,29 @@ pub fn opaque_collision(handle: CFTypeRef) -> bool {
 ///    overwrites the entry with its own kind - which is exactly why a test that
 ///    only checked "is it some other kind" would have been asserting a bug that
 ///    is not there.
-/// 2. **It reads a word the owner did not write.** For `Source` the first word is
-///    a one-byte `AtomicBool` and seven bytes of padding; for `Observer` it is a
-///    `u32` of activities and four bytes of padding; for `RunLoop` a thread id
-///    and five. None of those is initialised, and a check whose correctness
-///    depends on uninitialised padding is a check that will pass or fail by
-///    luck - and its failure mode is the bad direction, because a false "this is
-///    an object" sends `CFRetain` to Apple's `objc_retain` on a structure this
-///    crate laid out.
+/// 2. **It can only say "definitely not one of ours", and what it cannot say is
+///    the whole question.** A detection is not a decision: for every collision
+///    the class does not recognise - a zeroed word, a port name, a descriptor, a
+///    device index - the check is silent, and a silent check has to be answered
+///    *from the table*, which is the bare address this module exists to refuse.
+///    So the class check can only ever be a witness that is allowed to say no;
+///    it can never be the thing that says yes. That is why it is wired to
+///    `ROSETTA3_CHECK_OPAQUE=1` and [`opaque_collision`] rather than to the
+///    answer, and it is a better canary than nothing - it is the only instrument
+///    here that can catch an owner that never registered a witness at all.
 ///
 /// A witness has neither defect: it is the owner's own word, written once and
-/// never again, so it answers exactly rather than by luck.
+/// never again, and - this is the part that is easy to get wrong - its *value*
+/// has to be one nothing else in the process can hold. The first version of
+/// [`crate::runloop::witness`] required the word to be zero, which excluded the
+/// handles this crate hands out and excluded nothing else: a zeroed word is
+/// what an unlocked futex, a `bool` and seven bytes of padding, a zeroed
+/// `malloc` chunk and a fresh `mmap` page all begin with, so it answered "still
+/// mine" for exactly the allocations that land on a freed handle's address -
+/// measured, and pinned by
+/// `runloop::tests::a_zeroed_word_is_not_a_handle_of_this_modules`. It has the
+/// same defect as the class check, one level down, and it is fixed by
+/// [`crate::runloop::HANDLE_TAG`] rather than by argument.
 ///
 /// So the class check stays a *named observation* - `ROSETTA3_CHECK_OPAQUE=1`
 /// turns it into a refusal that names itself, `ROSETTA3_PROBE_OPAQUE=1` prints

@@ -15,6 +15,53 @@ use crate::base::{CFIndex, CFTypeRef};
 pub type Perform = unsafe extern "C" fn(*mut c_void);
 pub type TimerCallback = unsafe extern "C" fn(CFTypeRef, *mut c_void);
 
+/// The value [`witness`] requires in the first word of a handle this module made.
+///
+/// ## Why a tag and not zero, which is what it was
+///
+/// The check was `first word == 0`, on the argument that a real object has its
+/// `isa` in that word, a `CFMachPort` a port name in it and a `CFSocket` a
+/// descriptor in it - so a word that is still zero cannot be one of ours. That
+/// argument is about the handles *this crate* hands out, and the thing that lands
+/// on a freed handle's address is not one of them: it is whatever the allocator
+/// built next, or whatever the guest owns that the number equals. Measured, in
+/// this suite, by asking the old check about a zeroed word: it answered `true`,
+/// and [`a_zeroed_word_is_not_a_handle_of_this_modules`] fails without this
+/// change.
+/// A zeroed word is not a rare shape. It is the first word of an unlocked
+/// futex, of a `bool` and seven bytes of padding, of a zeroed `malloc` chunk the
+/// guest wrote into, of `Box::leak(Box::new(0u64))` - which
+/// `darwin::oslog::_os_activity_create` does on purpose, handing one out per
+/// activity so that two are never the same handle - and of every page a fresh
+/// `mmap` hands out. So the check was answering "this is still my handle" for a
+/// class of allocations where it is not, which is the same defect the class
+/// check has, one level down: a value that other things in the process can hold
+/// is a value the check passes by luck.
+///
+/// The tag is chosen so that nothing else in this process can hold it, and each
+/// part of the choice is measured rather than assumed:
+///
+/// - **Above every mapping.** This process maps nothing at or above `2^47`
+///   (x86-64's user-space half), so no `isa`, no `Arc`/`Weak` pointer, no
+///   `ElementRef::device` and no function pointer can be the tag. Those are
+///   the words an allocation of ours can start with, and the tag is above all
+///   of them.
+/// - **Above a Mach port name.** `darwin::mach::space` encodes a name in the
+///   top bits: measured, a receive right this suite allocated is
+///   `0x7f0000000000`, so names live in `[2^46, 2^53)`. The tag is at `2^62`.
+///
+/// - **Odd.** Nothing word-aligned in this process is odd, so the tag is not
+///   even a value an 8-aligned allocation's first word could take, and the
+///   alignment test in [`witness`] is a second, independent reason to answer
+///   false.
+/// - **Below `2^63`**, so it is not a sign-extended small integer either.
+///
+/// A number invented here is a *tag*, not an answer: nothing the guest can
+/// observe depends on its value, and the field it lives in is read by nothing
+/// except [`witness`]. It is a name for "an allocation of this module's", which
+/// is the one fact a bare address cannot supply.
+pub const HANDLE_TAG: usize = 0x524c_5f00_0000_0001;
+
 /// A version-0 source: a flag, and what to do when it is set.
 ///
 /// `repr(C)` and not the default, and that is load-bearing rather than
@@ -26,7 +73,7 @@ pub type TimerCallback = unsafe extern "C" fn(CFTypeRef, *mut c_void);
 /// pins the offsets.
 #[repr(C)]
 pub struct Source {
-    /// Always zero, and the whole of what [`witness`] reads.
+    /// Always [`HANDLE_TAG`], and the whole of what [`witness`] reads.
     ///
     /// The first word of this struct is the only word the run-loop handle
     /// registry knows how to check, and it is checked because a bare address
@@ -34,15 +81,15 @@ pub struct Source {
     /// allocator builds there next, and `CFRetain` on a live object that lands
     /// there is a **silent no-op** whose only symptom is a retain count that
     /// never moves. A word this struct writes once and nothing else ever writes
-    /// answers that exactly - a real object has its `isa` there, and a
-    /// `CFMachPort` has a port name - where reading a `bool` next to seven
-    /// bytes of padding would answer by luck.
+    /// answers that exactly - and the value it writes is one nothing else in
+    /// this process can hold, which is what makes it exact rather than lucky.
+    /// See [`HANDLE_TAG`].
     ///
     /// Cost: eight bytes per handle, and one invariant to keep. Cheaper than the
     /// alternative, which is a wrong answer.
     /// Read only through the address, by [`witness`], which is the whole point.
     #[allow(dead_code)]
-    witness: usize,
+    tag: usize,
     signalled: AtomicBool,
     perform: Option<Perform>,
     info: usize,
@@ -165,10 +212,10 @@ impl Source {
 
 #[repr(C)]
 pub struct Timer {
-    /// Always zero; see [`Source::witness`].
+    /// Always [`HANDLE_TAG`]; see [`Source::tag`].
     /// Read only through the address, by [`witness`], which is the whole point.
     #[allow(dead_code)]
-    witness: usize,
+    tag: usize,
     next: Mutex<Instant>,
     interval: Option<Duration>,
     callback: Option<TimerCallback>,
@@ -347,10 +394,10 @@ pub mod activity {
 /// events are never delivered.
 #[repr(C)]
 pub struct Observer {
-    /// Always zero; see [`Source::witness`].
+    /// Always [`HANDLE_TAG`]; see [`Source::tag`].
     /// Read only through the address, by [`witness`], which is the whole point.
     #[allow(dead_code)]
-    witness: usize,
+    tag: usize,
     activities: u32,
     repeats: bool,
     /// Lower runs first among observers of the same activity, which is the whole
@@ -478,10 +525,10 @@ struct Run {
 
 #[repr(C)]
 pub struct RunLoop {
-    /// Always zero; see [`Source::witness`].
+    /// Always [`HANDLE_TAG`]; see [`Source::tag`].
     /// Read only through the address, by [`witness`], which is the whole point.
     #[allow(dead_code)]
-    witness: usize,
+    tag: usize,
     /// The thread this loop belongs to, which is the one that may turn it.
     ///
     /// A run loop belongs to one thread - that is what makes it a run loop and
@@ -522,7 +569,7 @@ pub mod result {
 impl RunLoop {
     fn new() -> RunLoop {
         RunLoop {
-            witness: 0,
+            tag: HANDLE_TAG,
             owner: darwin::pthread::id(),
             modes: Mutex::new(BTreeMap::new()),
             common: Mutex::new(Common {
@@ -1201,7 +1248,7 @@ pub fn new_observer(
     info: usize,
 ) -> Arc<Observer> {
     let observer = Arc::new(Observer {
-        witness: 0,
+        tag: HANDLE_TAG,
         activities,
         repeats,
         order,
@@ -1245,7 +1292,7 @@ pub fn new_source_ready_ordered(
     ready: Option<fn(usize) -> bool>,
 ) -> Arc<Source> {
     let source = Arc::new(Source {
-        witness: 0,
+        tag: HANDLE_TAG,
         signalled: AtomicBool::new(false),
         perform,
         info,
@@ -1278,12 +1325,14 @@ static HANDLES: Mutex<BTreeMap<usize, TypeId>> = Mutex::new(BTreeMap::new());
 /// The proof [`note`] registers for a `T`.
 ///
 /// Every handle in this module begins with a `usize` that is written once, at
-/// construction, and never again - see [`Source::witness`]. Zero is the right
-/// value for it for a reason that is not taste: a real Objective-C object has its
-/// `isa` in that word, and `objc::class::is_known(null)` is false, so a word that
-/// is still zero cannot be an object. Neither can it be any of the other
-/// non-object handles this tree hands out, because their leading words are a port
-/// name, a socket descriptor and a device index.
+/// construction, and never again - see [`Source::tag`]. The word is
+/// [`HANDLE_TAG`], and *that* is what makes the answer exact rather than lucky:
+/// the check used to be "still zero", which excluded the handles this crate
+/// hands out (a real object has its `isa` in that word, a `CFMachPort` a port
+/// name, a `CFSocket` a descriptor) and excluded nothing else. A zeroed word is
+/// what an unlocked futex, a `bool` and seven bytes of padding, a zeroed
+/// `malloc` chunk and a fresh `mmap` page all start with, and those are exactly
+/// what lands on a freed handle's address. See [`HANDLE_TAG`].
 ///
 /// The two questions this answers are the two that a bare address cannot, and
 /// they are asked in different places: [`crate::base::is_opaque`] asks it before
@@ -1299,11 +1348,22 @@ unsafe fn witness<T: 'static>(handle: crate::base::CFTypeRef) -> bool {
     }
     // SAFETY: the caller's obligation, as above. The word is one this module
     // wrote at construction, so reading it is reading an initialised `usize`.
-    unsafe { *(handle as *const usize) == 0 }
+    unsafe { *(handle as *const usize) == HANDLE_TAG }
 }
 
 /// Record a handle before it is handed to the C world.
+///
+/// Null is refused rather than recorded, and the reason is a caller rather than
+/// a tidiness: key `0` would make `CFRunLoopAddSource(loop, NULL, mode)` - a
+/// null source, which is what an `IONotificationPortGetRunLoopSource` that has
+/// no port behind it answers here - pass [`is_noted`], and `crate::api::borrow`
+/// would then rebuild an `Arc<T>` over address zero and the loop would read
+/// through it. [`crate::base::note_witnessed`] has always refused null; this is
+/// the same rule for the kind registry beside it.
 pub fn note<T: 'static>(handle: *const T) {
+    if handle.is_null() {
+        return;
+    }
     HANDLES
         .lock()
         .unwrap_or_else(|e| e.into_inner())
@@ -1460,7 +1520,7 @@ pub fn new_timer_ordered(
     order: CFIndex,
 ) -> Arc<Timer> {
     let timer = Arc::new(Timer {
-        witness: 0,
+        tag: HANDLE_TAG,
         next: Mutex::new(Instant::now() + after),
         interval,
         callback,
@@ -2768,8 +2828,7 @@ mod tests {
         }
     }
 
-
-    /// The word the witness reads is the first word of all four, and it is zero.
+    /// The tag the witness reads is the first word of all four, and it is the tag.
     ///
     /// The whole of [`witness`] is this field, so if a constructor ever stopped
     /// writing it - or wrote something else - every live handle in the process
@@ -2777,32 +2836,32 @@ mod tests {
     /// Apple's `objc_retain` on a structure this crate laid out. It is a cheap
     /// invariant to pin and an expensive one to discover.
     #[test]
-    fn the_witness_word_is_the_first_word_of_every_handle_and_is_zero() {
+    fn the_tag_is_the_first_word_of_every_handle_and_is_the_tag() {
         crate::bootstrap();
         // The offsets are the load-bearing half, and they are only true because
         // of the `repr(C)` on the four structs. Measured with the default layout:
-        // `Source::witness` at 32, `RunLoop::witness` at 96 - so the word the
+        // `Source::tag` at 32, `RunLoop::tag` at 96 - so the word the
         // witness read was a `Mutex`'s, and the check said "not a handle" about
         // every live one.
-        assert_eq!(std::mem::offset_of!(Source, witness), 0, "a source's");
-        assert_eq!(std::mem::offset_of!(Timer, witness), 0, "a timer's");
-        assert_eq!(std::mem::offset_of!(Observer, witness), 0, "an observer's");
-        assert_eq!(std::mem::offset_of!(RunLoop, witness), 0, "a run loop's");
+        assert_eq!(std::mem::offset_of!(Source, tag), 0, "a source's");
+        assert_eq!(std::mem::offset_of!(Timer, tag), 0, "a timer's");
+        assert_eq!(std::mem::offset_of!(Observer, tag), 0, "an observer's");
+        assert_eq!(std::mem::offset_of!(RunLoop, tag), 0, "a run loop's");
         let (_, perform, timer) = counter!();
         let source = new_source(Some(perform), 0);
-        assert_eq!(source.witness, 0, "a source's first word");
+        assert_eq!(source.tag, HANDLE_TAG, "a source's first word");
         assert_eq!(
-            std::ptr::addr_of!(source.witness) as usize,
+            std::ptr::addr_of!(source.tag) as usize,
             handle_address(&source),
             "and it is the first word of the allocation, not a field the witness has to go \
              looking for"
         );
         let made = new_timer(Duration::from_millis(1), None, Some(timer), 0);
-        assert_eq!(made.witness, 0, "a timer's first word");
+        assert_eq!(made.tag, HANDLE_TAG, "a timer's first word");
         let observer = new_observer(activity::ENTRY, true, 0, None, 0);
-        assert_eq!(observer.witness, 0, "an observer's first word");
+        assert_eq!(observer.tag, HANDLE_TAG, "an observer's first word");
         let loop_ = Arc::new(RunLoop::new());
-        assert_eq!(loop_.witness, 0, "a run loop's first word");
+        assert_eq!(loop_.tag, HANDLE_TAG, "a run loop's first word");
         // And the witness agrees, for every kind, through the address rather than
         // through the field - which is the only way `is_opaque` can reach it.
         for (kind, address) in [
@@ -2815,6 +2874,133 @@ mod tests {
             // aligned word is there.
             assert!(unsafe { witness::<Source>(address as *const c_void) }, "{kind}");
         }
+    }
+
+    /// A zeroed word is not a handle of this module's, which is the whole reason
+    /// the witness reads a tag rather than zero.
+    ///
+    /// This is the one test that fails without the tag, and the condition is
+    /// *arranged* rather than waited for: a static zeroed word is a zeroed word,
+    /// and it is a shape this process has plenty of - an unlocked futex word, a
+    /// `bool` and seven bytes of padding, a zeroed `malloc` chunk the guest
+    /// wrote into, a fresh `mmap` page, and the `Box::leak(Box::new(0u64))` that
+    /// `darwin::oslog` hands out as an activity handle. What lands on a freed
+    /// handle's address is not one of this crate's handles, so excluding this
+    /// crate's handles is not enough - and with the check as "still zero" it
+    /// answered *true* here.
+    ///
+    /// What that costs, on the state the table cannot otherwise tell from a
+    /// handle: `CFRetain` on it returns having done nothing, `CFGetTypeID`
+    /// answers the type id the dead handle reported, and `CFGetRetainCount`
+    /// answers 1 - a plausible number for a wrong object, which is the answer
+    /// this project treats as the worst kind.
+    #[test]
+    fn a_zeroed_word_is_not_a_handle_of_this_modules() {
+        crate::bootstrap();
+        static ZEROED: u64 = 0;
+        let zeroed = std::ptr::addr_of!(ZEROED).cast::<c_void>();
+        // The state, stated first: this is exactly the state a note left behind
+        // for a handle that has been freed, over an allocation that is not one.
+        crate::base::note_witnessed(zeroed, 0, Some(witness::<Source>));        // SAFETY: a readable aligned word, which `static ZEROED` is.
+        assert!(
+            !unsafe { witness::<Source>(zeroed) },
+            "a zeroed word is being answered as one of this module's handles, so every \
+             zeroed allocation that lands on a freed handle's address is retained as a source \
+             that is not there"
+        );
+        assert!(
+            !crate::base::witnessed(zeroed),
+            "and the same question asked the way `is_noted` asks it"
+        );
+        assert!(
+            !crate::base::is_opaque(zeroed),
+            "so CFRetain on it is not a no-op and CFGetTypeID does not answer a dead handle's type"
+        );
+        assert_eq!(crate::base::opaque_type_id(zeroed), None, "and no type either");
+        forget(zeroed);
+    }
+
+    /// A `CFMachPort` is not a handle of this module's either, and this is the
+    /// collision the class check cannot see.
+    ///
+    /// `crate::base::first_word_is_a_class_of_ours` - the instrument the tag
+    /// replaced - is silent for both of these: a port's first word is a Mach port
+    /// name, not an `isa`, and a zeroed word is not an `isa`. Measured in this
+    /// suite, on a receive right allocated by the test itself, and pinned here so
+    /// the measurement cannot rot into an assumption.
+    #[test]
+    fn a_mach_port_is_not_a_handle_of_this_modules() {
+        crate::bootstrap();
+        let mut name = darwin::mach::space::MACH_PORT_NULL;
+        // SAFETY: a live local for the out-parameter.
+        assert_eq!(
+            unsafe {
+                darwin::mach::space::mach_port_allocate(
+                    darwin::mach::space::TASK_SELF,
+                    darwin::mach::space::RIGHT_RECEIVE,
+                    &mut name
+                )
+            },
+            0,
+            "KERN_SUCCESS"
+        );
+        // SAFETY: a null allocator and a receive right this test allocated.
+        let port = unsafe { crate::machport::create_with_port(std::ptr::null(), name, 1) };
+        assert!(!port.is_null(), "a receive right can be wrapped");
+        // SAFETY: a handle this tree made, so its first word is readable.
+        let first = unsafe { *(port as *const usize) };
+        assert_ne!(first, 0, "measured: a port name is not zero");
+        assert_ne!(
+            first, HANDLE_TAG,
+            "and it is not the tag, which is above every mapping in this process"
+        );
+        assert!(
+            !unsafe { crate::base::first_word_is_a_class_of_ours(port) },
+            "which is the point: the class check cannot see this collision, and the tag can"
+        );
+        // SAFETY: the same word, read the way the witness reads it.
+        assert!(!unsafe { witness::<Source>(port) }, "so it is not one of ours");
+        // The port is still a port, though: the class check being silent must not
+        // cost the port its own answers.
+        assert!(
+            crate::base::is_opaque(port),
+            "a CFMachPort is an opaque handle of this tree's, which is a different question"
+        );
+        assert_eq!(crate::base::opaque_type_id(port), Some(crate::machport::type_id()));
+        // The port set was never this test's to keep, and the port is a leak by
+        // design - see `crate::machport`'s module note on ownership.
+        darwin::mach::space::mach_port_destroy(darwin::mach::space::TASK_SELF, name);
+    }
+
+    /// A null is not a handle, and the kind registry says so.
+    ///
+    /// The guest's own path to a null is `CFRunLoopAddSource(loop, NULL, mode)`,
+    /// which is what an `IONotificationPortGetRunLoopSource` with no port behind
+    /// it answers here. Key `0` in the kind registry would make `is_noted` pass
+    /// for it, and `crate::api::borrow` would rebuild an `Arc<Source>` over
+    /// address zero. So this is pinned for the case where a constructor ever
+    /// passes a null, not for a case reachable today: every constructor is handed
+    /// an `Arc`, which is never null.
+    #[test]
+    fn a_null_is_not_noted_as_any_kind_of_handle() {
+        crate::bootstrap();
+        for kind in ["Source", "Timer", "Observer", "RunLoop"] {
+            assert!(
+                !is_noted_as(kind, 0),
+                "address 0 is recorded as a {kind}, so a null source would be handed to the loop \
+                 as one"
+            );
+        }
+        // And the note itself is the pair that keeps it that way.
+        note(std::ptr::null::<Source>());
+        assert!(
+            !crate::runloop::probe_any_noted(0),
+            "a null was recorded in the kind registry"
+        );
+        assert!(
+            !crate::base::is_opaque(std::ptr::null()),
+            "or in the shared table, which refuses null and always did"
+        );
     }
 
     /// A handle the **guest** owns stops claiming its address when the guest

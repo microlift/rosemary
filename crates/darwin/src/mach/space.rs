@@ -910,12 +910,112 @@ pub extern "C" fn mach_port_set_attributes(
 /// mach_msg_id_t, mach_port_mscount_t, mach_port_name_t notify,
 /// mach_msg_type_name_t, mach_port_name_t *previous)`
 ///
-/// Recorded and never delivered. There is no kernel here watching a port to
-/// notice that its last send right went away, and inventing the notification
-/// would be worse than withholding it: a dead-name notification tells a client
-/// its server has died, so a spurious one makes a working server look dead. The
-/// withheld direction says "still alive", which is the failure a caller can
-/// survive.
+/// **Refused. It used to answer `KERN_SUCCESS`, and that was the worst bug in
+/// this file: a wrong answer that looks like success, on a `bool` both callers
+/// branch on.**
+///
+/// ## The request, and who makes it
+///
+/// Two call sites in the guest, found by scanning `__TEXT,__text` for `e8
+/// rel32` onto the one `__TEXT,__stubs` slot for the name **inside that
+/// section's declared size** - slot 182, `0xcca06c0`, stride 6, bound
+/// `0xcca027c + 0x2502`. Walking past `size / 6` reaches
+/// `__TEXT,__stub_helper`, which is not a 6-byte table, and invents a *second*
+/// address for this same name at `0xcca2bc2`; no `e8` targets it, but a tool
+/// that reports it will be believed over the real one.
+///
+/// * `Framework+0x6317da` - `ChannelMac::RequestSendDeadNameNotification`,
+///   `mojo/core/channel_mac.cc:266`. Returns a `bool`.
+/// * `Framework+0x3a7a9e1` - a function of `base/process/port_provider_mac.cc`
+///   that also references `NotifyObservers`. Returns void; branches on the
+///   status as `test <kr>,<kr> / jne`.
+///
+/// Both load `edx = 0x48` (`MACH_NOTIFY_DEAD_NAME`, xnu's
+/// `MACH_NOTIFY_FIRST + 010`) and `r9d = 0x15` (`MACH_MSG_TYPE_MAKE_SEND_ONCE`,
+/// xnu's `21`) immediately before the call, and both branch on the returned
+/// status. **The severity rests entirely on that, so it was read out of the
+/// disassembly and then confirmed against the source** (tag `130.0.6723.91`).
+///
+/// ## Why the answer has to be a failure
+///
+/// The withheld direction says "still alive", and for a caller that waits on
+/// the answer that is the fatal one. `RequestSendDeadNameNotification` is
+/// followed by a Mojo channel that will only ever learn its peer is gone from
+/// this notification, and the send path is built to *defer* to it:
+///
+/// ```c
+/// } else {
+///   send_buffer_contains_message_ = false;
+///   mach_msg_destroy(header);
+///   if (kr != MACH_SEND_INVALID_DEST) {
+///     ... report an error and shut down ...
+///   }
+///   // else: wait for the Channel to process the dead-name notification
+/// }
+/// ```
+///
+/// This namespace answers `MACH_SEND_INVALID_DEST` for a destination nobody
+/// holds (`kern::send_failure` maps `ECONNREFUSED` onto it), so the guest takes
+/// the branch that waits. `Right::Dead` is constructed in exactly one place -
+/// `mach_port_allocate(RIGHT_DEAD_NAME)` - and **nothing ever transitions a send
+/// or receive right into one**, so the notification is not merely undelivered, it
+/// is undeliverable. A `KERN_SUCCESS` here does not delay the report; it removes
+/// it, and what is left is a process that runs and looks slow.
+///
+/// ## Why it is `KERN_INVALID_ARGUMENT` and not some other failure
+///
+/// Because that is the one code the caller wrote a path for. Its own source:
+///
+/// ```c
+/// if (kr != KERN_SUCCESS) {
+///   // If port is already a dead name (i.e. the receiver is already gone),
+///   // then the channel should be shut down by the caller.
+///   MACH_LOG_IF(ERROR, kr != KERN_INVALID_ARGUMENT, kr)
+///       << "mach_port_request_notification";
+///   return false;
+/// }
+/// ```
+///
+/// and both of its callers act on the `false`:
+/// `StartOnIOThread` does `OnError(Error::kConnectionFailed); return;` and
+/// `ReceiveHandshake` does `send_port_.reset(); OnError(kConnectionFailed);`.
+/// `MACH_LOG_IF` is the disassembly's `test <kr>,0xfffffffb / je` at
+/// `Framework+0x6318c4`: `KERN_SUCCESS` and `KERN_INVALID_ARGUMENT` are excused
+/// from the log and **every other non-zero status is an `ERROR` log on every
+/// channel**, so the choice of code is not cosmetic. `KERN_FAILURE` would be a
+/// truthful refusal too, and a noisier one than the situation warrants.
+///
+/// The consequence is not free and is stated rather than discovered: **every Mojo
+/// channel now fails to establish**, with `kConnectionFailed`, on the first
+/// `ChannelMac` that starts. That is a total, loud, named failure in place of a
+/// silent hang, which is the trade this project makes on purpose - but it does
+/// mean the milestone cannot get past the first Mojo channel until the
+/// notification is really implemented.
+///
+/// ## What implementing it properly would take
+///
+/// Noted so the refusal reads as a measurement rather than a shrug, because one
+/// piece of the substrate already exists: [`super::wire::is_bound`] *can* tell
+/// that a port's holder is gone, because an unbound `SOCK_DGRAM` address refuses
+/// a `connect`. What is missing is everything around it.
+///
+/// * A watcher. There is no blocking way to wait on a port this process does not
+///   hold the socket for, so the only mechanism available is polling - a thread
+///   per registration, for a browser that has thousands of channels.
+/// * A message, in the exact shape `OnMachMessageReceived` insists on: a
+///   `mach_dead_name_notification_t` whose `not_port` is a real
+///   `MACH_PORT_DEAD` right, and a trailer.
+/// * An audit token equal to `KERNEL_AUDIT_TOKEN_VALUE` - xnu's
+///   `{ {0, 0, 0, 0, 0, 0, 0, 0} }`. **That one is a forged kernel identity**,
+///   and there is no way round it rather than only past it: the receive path
+///   writes an eight-byte `mach_msg_trailer_t` and nothing else
+///   (`mach::msg::write_trailer`, which stores `msgh_trailer_type` and
+///   `msgh_trailer_size` at offsets 0 and 4 and stops), so this transport has
+///   nowhere to *put* an audit token and has never written one.
+///   `OnMachMessageReceived` `memcmp`s `trailer->msgh_audit` against the kernel
+///   token, so it would be comparing the guest's own uninitialised buffer.
+/// * The second notification, `MACH_NOTIFY_SEND_ONCE` (`0x47`), for the
+///   send-once right made for this request, which also has no watcher.
 ///
 /// # Safety
 ///
@@ -923,7 +1023,7 @@ pub extern "C" fn mach_port_set_attributes(
 pub unsafe extern "C" fn mach_port_request_notification(
     task: Name,
     name: Name,
-    _id: i32,
+    id: i32,
     _sync: u32,
     notify: Name,
     _disposition: u32,
@@ -938,8 +1038,18 @@ pub unsafe extern "C" fn mach_port_request_notification(
             return KERN_INVALID_NAME;
         }
     }
-    // The send-once right the caller handed over is consumed by the request,
-    // whether or not the notification ever fires.
+    // Mach consumes the notification right with the request whatever the answer
+    // is, and so does this. **For the two call sites in the guest that is a
+    // no-op, and the reason is the disposition rather than the port kind:**
+    // both pass a *receive* right as `notify` with `MACH_MSG_TYPE_MAKE_SEND_ONCE`
+    // (xnu: `21 /* Must hold receive right */`), and `MAKE` derives a send-once
+    // right from a receive right instead of consuming its name -
+    // `MACH_MSG_TYPE_MOVE_SEND_ONCE` (18) is the disposition that consumes.
+    // So [`release`] answers `KERN_INVALID_RIGHT` here and the port is left
+    // alone, which is the right outcome: `ChannelMac` keeps `receive_port_` and
+    // waits on it immediately afterwards. The return value is discarded because
+    // a caller that asked for a right derived from a port it still holds has
+    // lost nothing either way.
     if notify != MACH_PORT_NULL {
         with(|space| release(space, notify));
     }
@@ -947,19 +1057,49 @@ pub unsafe extern "C" fn mach_port_request_notification(
         // SAFETY: the caller's `mach_port_name_t`.
         unsafe { previous.write(MACH_PORT_NULL) };
     }
-    announce_undelivered_notifications();
-    KERN_SUCCESS
+    refused_notification(id, name, notify)
 }
 
-fn announce_undelivered_notifications() {
-    static SAID: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-    if !SAID.swap(true, std::sync::atomic::Ordering::Relaxed) {
+/// Name the id that cannot be delivered, once.
+///
+/// A `kern_return_t` is a number and Chromium's report of one names only its
+/// file and line, so the words are the whole of what a caller learns. Naming
+/// the *id* is what makes the number actionable: `MACH_NOTIFY_DEAD_NAME` can
+/// be looked up in `<mach/notify.h>` and reasoned about, `0x48` cannot.
+///
+/// The id is printed in hex because it arrives as a signed `mach_msg_id_t`, and
+/// `0x48` is `72` in decimal - the two numbers are both what `<mach/notify.h>`
+/// and `msgh_id` respectively would suggest, and picking the wrong one is a
+/// lookup in the wrong table.
+fn refused_notification(id: i32, name: Name, notify: Name) -> i32 {
+    static SAID: std::sync::Once = std::sync::Once::new();
+    SAID.call_once(|| {
+        let asked = match id as u32 {
+            0x48 => "MACH_NOTIFY_DEAD_NAME",
+            0x47 => "MACH_NOTIFY_SEND_ONCE",
+            0x45 => "MACH_NOTIFY_PORT_DESTROYED",
+            0x46 => "MACH_NOTIFY_NO_SENDERS",
+            _ => "a notification id this namespace does not define",
+        };
         eprintln!(
-            "rosetta3: mach_port_request_notification accepted but never delivered - nothing here \
-             watches a port's reference counts, so a caller waiting for a dead-name notification \
-             waits forever rather than being told a live port died"
+            "rosetta3: mach_port_request_notification refused, not accepted: port {name:#x} \
+             cannot be watched for {asked} (msgh_id {id:#x}), so no notification will ever be \
+             delivered to notify port {notify:#x}. Nothing in this namespace moves a right into \
+             Right::Dead - the only dead-name right is the one \
+             mach_port_allocate(RIGHT_DEAD_NAME) hands out - so the request is undeliverable \
+             rather than merely undelivered, and the caller that waits on it would wait forever. \
+             A dead port IS observable here (mach::wire::is_bound: an unbound address refuses a \
+             connect), but arming that would need a watcher per registration, a \
+             mach_dead_name_notification_t, and a trailer whose audit token is \
+             KERNEL_AUDIT_TOKEN_VALUE, which is a forged kernel identity. The two call sites in \
+             the guest are mojo/core/channel_mac.cc:266 \
+             (ChannelMac::RequestSendDeadNameNotification, whose bool decides whether the \
+             channel calls OnError(kConnectionFailed)) and one in \
+             base/process/port_provider_mac.cc; both branch on this status"
         );
-    }
+    });
+    // The one code the guest's own `MACH_LOG_IF` excuses. See the note above.
+    KERN_INVALID_ARGUMENT
 }
 
 #[cfg(test)]
@@ -1244,6 +1384,255 @@ mod tests {
 
         mach_port_destroy(TASK_SELF, set);
         mach_port_destroy(TASK_SELF, member);
+    }
+
+    /// The two notification ids, from xnu's `osfmk/mach/notify.h`, which
+    /// spells them as octal offsets from `MACH_NOTIFY_FIRST`:
+    ///
+    /// ```c
+    /// #define MACH_NOTIFY_FIRST               0100
+    /// #define MACH_NOTIFY_SEND_ONCE           (MACH_NOTIFY_FIRST + 007)
+    /// #define MACH_NOTIFY_DEAD_NAME           (MACH_NOTIFY_FIRST + 010)
+    /// ```
+    ///
+    /// **`0x48` and `0x47`, not the `0x40` and `0x10` in the old SDK
+    /// `<mach/notify.h>`.** Those are the legacy numbering, and the immediate
+    /// `mov edx,0x48` at `Framework+0x6317ca` is xnu's, so the two constants
+    /// are read out of xnu rather than out of a header that still carries both.
+    ///
+    /// The octal is written `0o`-prefixed rather than as xnu's bare `0100`,
+    /// which clippy correctly calls a decimal constant: the value is the same
+    /// and the derivation is the point, but `0100` read as one hundred is the
+    /// kind of quiet misreading this file exists to prevent.
+    const MACH_NOTIFY_FIRST: i32 = 0x40;
+    const MACH_NOTIFY_SEND_ONCE: i32 = MACH_NOTIFY_FIRST + 0o7;
+    const MACH_NOTIFY_DEAD_NAME: i32 = MACH_NOTIFY_FIRST + 0o10;
+    /// `MACH_MSG_TYPE_MAKE_SEND_ONCE`, the disposition both call sites pass, and
+    /// `21` in xnu's `osfmk/mach/message.h`, so `0x15`.
+    ///
+    /// Its comment there is `/* Must hold receive right */`, and the `MAKE`
+    /// spelling is what says why the caller's `receive_port_` survives a request
+    /// that names it: this disposition *derives* a send-once right from a receive
+    /// right, where `MACH_MSG_TYPE_MOVE_SEND_ONCE` (18, `0x12`) would consume the
+    /// name. That is why the test below can send on the notify port afterwards.
+    const MACH_MSG_TYPE_MAKE_SEND_ONCE: u32 = 21;
+
+    /// The operand of the `test` that gates Chromium's own `MACH_LOG_IF`
+    /// (tag `130.0.6723.91`):
+    ///
+    /// ```c
+    /// MACH_LOG_IF(ERROR, kr != KERN_INVALID_ARGUMENT, kr)
+    /// ```
+    ///
+    /// which the `channel_mac.cc` call site compiles to at `Framework+0x6318c4`:
+    ///
+    /// ```text
+    ///  6318c4  test   ebx,0xfffffffb
+    ///  6318ca  je     0x63192c        ; skip the ERROR log
+    /// ```
+    ///
+    /// Read the predicate exactly: `test` sets ZF when `kr & 0xfffffffb == 0`,
+    /// and `je` *skips the log*, so this mask selects the statuses that **do**
+    /// get an `ERROR` line, and `0` is excused from it. Since bit 2 is the only
+    /// bit cleared, `kr & CALLER_LOGS == 0` holds for exactly two values:
+    /// `KERN_SUCCESS` and `KERN_INVALID_ARGUMENT`. The code is not cosmetic -
+    /// any other failure puts an `ERROR` line in the log on every channel that
+    /// ever starts.
+    const CALLER_LOGS: u32 = 0xffff_fffb;
+
+    /// The octal derivation above, asserted rather than trusted: the immediates
+    /// in the guest are `0x48` and the id this file names them by has to be the
+    /// same number, and `MACH_NOTIFY_FIRST` is the one thing a reader is most
+    /// likely to read as a decimal `100`.
+    #[test]
+    fn the_notification_ids_are_xnus_octal_and_the_guests_immediates() {
+        assert_eq!(MACH_NOTIFY_FIRST, 0x40, "xnu spells it 0100");
+        assert_eq!(MACH_NOTIFY_DEAD_NAME, 0x48, "MACH_NOTIFY_FIRST + 010");
+        assert_eq!(MACH_NOTIFY_SEND_ONCE, 0x47, "MACH_NOTIFY_FIRST + 007");
+        // The `mov edx` immediate at `Framework+0x6317ca` and `+0x3a7a9d1`.
+        assert_eq!(MACH_NOTIFY_DEAD_NAME, 0x48u32 as i32);
+        // `MACH_MSG_TYPE_MAKE_SEND_ONCE` is `r9d = 0x15` at `+0x6317d4`.
+        assert_eq!(MACH_MSG_TYPE_MAKE_SEND_ONCE, 0x15);
+    }
+
+    /// A notification this namespace can never deliver is refused, and the
+    /// refusal is the one code both call sites name.
+    ///
+    /// The bug this test exists for is a **wrong success**, so the assertion has
+    /// to be the positive one. `assert_ne!(kr, KERN_SUCCESS)` alone would be too
+    /// weak to be worth much - it would pass on any refusal at all, including a
+    /// fabricated one - so this asserts the specific code, and separately
+    /// asserts that the code is one the guest's own branch excuses, which is
+    /// what makes the refusal survivable rather than merely loud.
+    ///
+    /// The call is exactly the one at `Framework+0x6317da`, from
+    /// `ChannelMac::RequestSendDeadNameNotification`:
+    ///
+    /// ```c
+    /// mach_port_request_notification(mach_task_self(), send_port_,
+    ///                               MACH_NOTIFY_DEAD_NAME, 0, receive_port_,
+    ///                               MACH_MSG_TYPE_MAKE_SEND_ONCE, &previous);
+    /// ```
+    ///
+    /// Both call sites were found by scanning `__text` for `e8 rel32` onto the
+    /// one `__stubs` slot for the name **inside the section's declared size**
+    /// (slot 182, `0xcca06c0`); walking past `size / 6` invents a second address
+    /// for the same name in `__TEXT,__stub_helper`, which is not a 6-byte table.
+    /// There are exactly two, and both branch on the status:
+    ///
+    /// * `+0x6317da`, in `ChannelMac::RequestSendDeadNameNotification`
+    ///   (`channel_mac.cc:266` - the `edx = 0x10a` of the `LogMessage` ctor at
+    ///   `+0x6318dd`, with the strings `mojo/core/channel_mac.cc` and
+    ///   `mach_port_request_notification` in `__cstring`). Status lands in `ebx`;
+    ///   `test ebx,0xfffffffb / je` at `+0x6318c4` gates the `ERROR` log, and
+    ///   `test ebx,ebx / sete al` at `+0x6319d2` **is the function's own return
+    ///   value** - the `bool` the brief is about. Source, tag `130.0.6723.91`:
+    ///
+    ///   ```c
+    ///   if (kr != KERN_SUCCESS) {
+    ///     MACH_LOG_IF(ERROR, kr != KERN_INVALID_ARGUMENT, kr)
+    ///         << "mach_port_request_notification";
+    ///     return false;
+    ///   }
+    ///   return true;
+    ///   ```
+    ///
+    /// * `+0x3a7a9e1`, in a function of `base/process/port_provider_mac.cc`
+    ///   that also references the string `NotifyObservers`. Status lands in
+    ///   `r12d`; `test r12d,r12d / jne` at `+0x3a7aad6` sends **any** non-zero
+    ///   status down an error path that skips the tree insert at
+    ///   `+0x3a7aadf..+0x3a7abe0`. This one logs nothing about the status, so
+    ///   which of `NotifyObservers`' callers it is was not determined; the
+    ///   status is branched on either way, which is what the severity rests on.
+    ///
+    /// **Both sites load `edx = 0x48` and `r9d = 0x15` immediately before the
+    /// call** (`+0x6317ca`/`+0x6317d4` and `+0x3a7a9d1`/`+0x3a7a9db`).
+    #[test]
+    fn a_dead_name_notification_that_can_never_be_delivered_is_refused() {
+        // The shape `RequestSendDeadNameNotification` sets up: a send right to
+        // the peer (`send_port_`) and a receive right it keeps (`receive_port_`).
+        let mut receive = MACH_PORT_NULL;
+        // SAFETY: a live local for the out-parameter.
+        assert_eq!(
+            unsafe { mach_port_allocate(TASK_SELF, RIGHT_RECEIVE, &mut receive) },
+            KERN_SUCCESS,
+            "the receive right the caller keeps"
+        );
+        let send = insert_send(address_of(receive).expect("a real port"));
+
+        // **Positive control, before the assertion that matters.** With a name
+        // the space does not hold, the same call answers `KERN_INVALID_NAME`.
+        // That is what makes the result below a measurement rather than a
+        // constant: the function is reached, it is given two live ports, and it
+        // reads and answers on its status channel.
+        let mut previous = MACH_PORT_NULL;
+        // SAFETY: two live locals for the out-parameters.
+        let bogus = unsafe {
+            mach_port_request_notification(
+                TASK_SELF,
+                0xdead_beef,
+                MACH_NOTIFY_DEAD_NAME,
+                0,
+                receive,
+                MACH_MSG_TYPE_MAKE_SEND_ONCE,
+                &mut previous,
+            )
+        };
+        assert_eq!(
+            bogus, KERN_INVALID_NAME,
+            "the control: an unknown port is refused before the notification is \
+             considered, so the status below is a decision and not a constant"
+        );
+
+        // The call under test, with the guest's own seven arguments.
+        let mut previous = MACH_PORT_NULL;
+        // SAFETY: `previous` is a live `mach_port_name_t` and the ports are live.
+        let kr = unsafe {
+            mach_port_request_notification(
+                TASK_SELF,
+                send,
+                MACH_NOTIFY_DEAD_NAME,
+                0,
+                receive,
+                MACH_MSG_TYPE_MAKE_SEND_ONCE,
+                &mut previous,
+            )
+        };
+
+        assert_eq!(
+            kr, KERN_INVALID_ARGUMENT,
+            "a registration whose notification can never fire must not answer \
+             KERN_SUCCESS: both call sites read this status, and a success means \
+             a Mojo channel waits forever for a peer that died"
+        );
+        assert_eq!(
+            (kr as u32) & CALLER_LOGS,
+            0,
+            "`MACH_LOG_IF(ERROR, kr != KERN_INVALID_ARGUMENT, kr)` excuses exactly \
+             two statuses from the ERROR log, and this has to be one of them or \
+             every Mojo channel logs before it fails"
+        );
+        assert_eq!(previous, MACH_PORT_NULL, "`previous` is written, as on Mach");
+
+        // The refusal changed nothing else: `MACH_MSG_TYPE_MAKE_SEND_ONCE`
+        // derives a right from the notify port rather than consuming its name,
+        // so the receive right the caller keeps is still a working port.
+        // Without this the test could pass by destroying the ports.
+        let mut bits = 0;
+        // SAFETY: `bits` is a live `mach_port_type_t`.
+        assert_eq!(
+            unsafe { mach_port_type(TASK_SELF, receive, &mut bits) },
+            KERN_SUCCESS
+        );
+        assert_eq!(bits, type_of(RIGHT_RECEIVE), "the receive right survived");
+        assert!(
+            destination(send).is_ok(),
+            "and the send right still names the same port, so a message can still go out"
+        );
+
+        mach_port_destroy(TASK_SELF, receive);
+        mach_port_deallocate(TASK_SELF, send);
+    }
+
+    /// The second notification Chromium's handler has to be able to see, and
+    /// the one whose absence is a *leak* rather than a hang: the send-once
+    /// right made for the notification is destroyed and
+    /// `MachMessageSendLocked` then refuses to report a dead peer, waiting for a
+    /// notification that will not come.
+    ///
+    /// `MACH_NOTIFY_SEND_ONCE` has no more of a watcher behind it than
+    /// `MACH_NOTIFY_DEAD_NAME` does, so it is refused the same way, and the test
+    /// says so explicitly because "the two ids behave alike" is a claim about
+    /// this namespace's structure rather than about a header.
+    #[test]
+    fn no_notification_id_in_this_namespace_is_honoured() {
+        let mut receive = MACH_PORT_NULL;
+        // SAFETY: a live local for the out-parameter.
+        unsafe { mach_port_allocate(TASK_SELF, RIGHT_RECEIVE, &mut receive) };
+        let send = insert_send(address_of(receive).expect("a real port"));
+
+        for id in [MACH_NOTIFY_DEAD_NAME, MACH_NOTIFY_SEND_ONCE] {
+            let mut previous = MACH_PORT_NULL;
+            // SAFETY: `previous` is live and the ports are live.
+            let kr = unsafe {
+                mach_port_request_notification(
+                    TASK_SELF,
+                    send,
+                    id,
+                    0,
+                    receive,
+                    MACH_MSG_TYPE_MAKE_SEND_ONCE,
+                    &mut previous,
+                )
+            };
+            assert_eq!(
+                kr, KERN_INVALID_ARGUMENT,
+                "id {id:#x}: nothing here ever sends a notification"
+            );
+        }
+
+        mach_port_destroy(TASK_SELF, receive);
+        mach_port_deallocate(TASK_SELF, send);
     }
 
     /// A receive right somebody else still holds cannot be moved out from under

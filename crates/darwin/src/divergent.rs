@@ -42,6 +42,38 @@ pub const NAMES: &[(&str, &str)] = &[
     ("fstatat", STAT),
     ("statfs", STAT),
     ("fstatfs", STAT),
+    // `statvfs` and `fstatvfs` are here for the same reason `statfs` and
+    // `fstatfs` are, and the history is worth recording because it is not the
+    // reason any other entry above is listed.
+    //
+    // They were **missing from this list**, and their absence cost a Chromium
+    // run a smashed frame. The guest's `_statvfs` import was therefore not
+    // claimed by a Darwin implementation *and* not denied to the host, so the
+    // last provider — `NativeDylibProvider` — handed it **glibc's own
+    // `statvfs`**, and glibc wrote a 112-byte `struct statvfs` into a buffer
+    // the caller had sized for the guest's own **64-byte** one. Measured from a
+    // core dump: `base::SysInfo::AmountOfFreeDiskSpace` at
+    // `Framework+0x5d83b90` puts that buffer at `[rbp-0x70]`, and 112 bytes
+    // from there ends at `[rbp+0x0]` — the two words it covers below `rbp` are
+    // **exactly** that frame's saved `rbx` and `r14`, and the byte it does *not*
+    // reach is the saved `rbp`. The function returned to exactly the right
+    // place having replaced both callee-saved registers with zeros, and the
+    // guest then stored through the null `rbx` and died at `Framework+0x65d1bac`
+    // in `SimpleBackendImpl::InitCacheStructureOnDisk`.
+    //
+    // The control that pins the mechanism rather than merely suggesting it: of
+    // the five callee-saved registers, **only `rbx` and `r14` were destroyed** —
+    // `r12`, `r13` and `r15` all survived. 112 bytes of overrun predicts that
+    // selection exactly, including the one register it stops short of; "a callee
+    // was rude" does not predict anything.
+    //
+    // `crate::stat` now answers both, so like `fstatat` and `statfs` above the
+    // entries stay: they are what stops the **host's** `statvfs` being bound
+    // instead, and `reason` carves an implemented name back out. The size that
+    // makes this a hazard is 64 and not the ~2 KB `struct statfs` is — see
+    // `darwin::stat::Statvfs`, where all three measurements are recorded.
+    ("statvfs", STAT),
+    ("fstatvfs", STAT),
     // `struct dirent`: Darwin has a `d_namlen` glibc has not, so `d_type` and
     // the name are two bytes later. `crate::dirent` answers all but the last;
     // the entries are what stop the host's own being bound instead. `opendir`

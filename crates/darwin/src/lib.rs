@@ -478,34 +478,48 @@ mod tests {
 
     use super::*;
 
-    /// Every name more than one module claims, not the first one found.
+    /// Every name more than one module claims, and the modules that claim it.
     ///
-    /// **This used to `panic!` on the first duplicate, which made it assert
-    /// nothing.** `sched_yield` is claimed by both `darwin::idle` and
-    /// `darwin::pthread`, and `idle` is early in `MODULES` - so the test failed
-    /// on that one collision and never looked at the other ~40 modules. A check
-    /// that stops at the first failure is a check on one fact, and a second
-    /// collision anywhere else in the table was invisible until this one was
-    /// fixed.
+    /// **This used to `assert!` inside the loop, which made it assert nothing.**
+    /// `sched_yield` is claimed by both `darwin::idle` and `darwin::pthread`,
+    /// and `idle` is early in `MODULES` - so the test failed on that one
+    /// collision and never looked at the other ~40 modules. A check that stops at
+    /// the first failure is a check on one fact, and a second collision anywhere
+    /// else in the table was invisible until this one was fixed.
     ///
-    /// Collecting all of them and asserting on the *set* makes it a real check,
-    /// and keeps the reported failure the same one it has always been: the
-    /// assertion names every colliding name, so the next person to add one sees
-    /// their own in the list rather than a stale first entry.
-    #[test]
-    fn no_module_defines_a_name_another_one_does() {
+    /// **Returned rather than asserted, so a caller can ask the question without
+    /// the answer deciding for it** - which is what lets
+    /// `the_census_reports_every_duplicate_and_not_the_first` below test the
+    /// *collection* against a table built to have several duplicates, instead of
+    /// against the real table where the first one and the only one are the same
+    /// name and a check that stopped early would look identical.
+    ///
+    /// Owners are sorted so the answer is a fact about *which* modules claim a
+    /// name rather than about the order the table happens to be in; the names are
+    /// sorted so the message is stable and the next person to add a duplicate
+    /// sees their own in the list rather than a stale first entry.
+    fn collisions(modules: &[exports::Module]) -> Vec<(String, Vec<&'static str>)> {
         let mut owners: HashMap<&str, Vec<&str>> = HashMap::new();
-        for module in MODULES {
+        for module in modules {
             for name in (module.names)() {
                 owners.entry(name).or_default().push(module.path);
             }
         }
-        let mut collisions: Vec<(&str, &Vec<&str>)> = owners
-            .iter()
+        let mut found: Vec<(String, Vec<&'static str>)> = owners
+            .into_iter()
             .filter(|(_, paths)| paths.len() > 1)
-            .map(|(name, paths)| (*name, paths))
+            .map(|(name, mut paths)| {
+                paths.sort_unstable();
+                (name.to_string(), paths)
+            })
             .collect();
-        collisions.sort_by_key(|(name, _)| *name);
+        found.sort();
+        found
+    }
+
+    #[test]
+    fn no_module_defines_a_name_another_one_does() {
+        let collisions = collisions(MODULES);
         assert!(
             collisions.is_empty(),
             "{} name(s) defined by more than one module: {}",
@@ -515,6 +529,98 @@ mod tests {
                 .map(|(name, paths)| format!("{name} by {}", paths.join(" and ")))
                 .collect::<Vec<_>>()
                 .join("; ")
+        );
+    }
+
+    /// The control for the test above, and the only thing that can tell it apart
+    /// from a vacuous one.
+    ///
+    /// **On the real table the two implementations are indistinguishable.** The
+    /// real table's first duplicate and its only duplicate are both `sched_yield`,
+    /// so a census that stops at the first and a census that collects every one
+    /// produce the same answer on this tree today. The census above therefore
+    /// cannot, by itself, tell a real check from the thing it replaced - which is
+    /// precisely the failure mode `sched_yield` at index 0 was hiding, and why
+    /// this file needed the second test rather than only the first.
+    ///
+    /// So this asks the same question against a table built to have **three**
+    /// independent duplicates, none of them at index 0, and asserts an answer
+    /// written out literally. A census that stopped at the first would have no
+    /// value to return at all, so it cannot pass this; one that returned only the
+    /// alphabetically-first would fail it too, which is the second way to be
+    /// incomplete.
+    #[test]
+    fn the_census_reports_every_duplicate_and_not_the_first() {
+        // Named `fn`s rather than closures: `Module::names` is a `fn()` pointer
+        // and a closure cannot capture the list it was handed.
+        fn first() -> exports::Names {
+            vec!["shared", "solo"]
+        }
+        fn second() -> exports::Names {
+            vec!["shared"]
+        }
+        fn third() -> exports::Names {
+            vec!["twin", "also_shared"]
+        }
+        fn fourth() -> exports::Names {
+            vec!["twin", "also_shared"]
+        }
+        fn module(path: &'static str, names: fn() -> exports::Names) -> exports::Module {
+            exports::Module {
+                path,
+                names,
+                symbol: |_| None,
+                provide: |_: &mut dyn exports::Exports| {},
+            }
+        }
+        // `shared` is the first collision in *table* order and `also_shared` is
+        // the first in *name* order, so the two cannot be confused for each other
+        // either. `twin` is a third, and neither first.
+        let table = [
+            module("test::first", first),
+            module("test::second", second),
+            module("test::third", third),
+            module("test::fourth", fourth),
+        ];
+        assert_eq!(
+            collisions(&table),
+            vec![
+                (
+                    "also_shared".to_string(),
+                    vec!["test::fourth", "test::third"]
+                ),
+                ("shared".to_string(), vec!["test::first", "test::second"]),
+                ("twin".to_string(), vec!["test::fourth", "test::third"]),
+            ],
+            "the census must name every duplicate, in name order, with every owner"
+        );
+    }
+
+    /// What the census says about the real table, pinned in a test that passes.
+    ///
+    /// The test above is **red on purpose** until the `sched_yield` duplicate is
+    /// decided one way or the other, and a red test is a bad place to keep a
+    /// census: a second duplicate arriving changes that failure's *message*, and
+    /// a reader who has already learned to expect `sched_yield` reads straight
+    /// past the rest of the line. So the count is asserted where it can fail by
+    /// itself - a **new** duplicate is a separate failure here, in a suite that
+    /// was otherwise green, and the one duplicate that is known is named by a
+    /// test that passes.
+    ///
+    /// This does not soften the red one and it does not remove the duplicate: it
+    /// is the same fact, in a place where adding a collision cannot hide behind
+    /// a failure that is already expected.
+    #[test]
+    fn exactly_one_duplicate_is_known_and_it_is_sched_yield() {
+        assert_eq!(
+            collisions(MODULES),
+            vec![(
+                "sched_yield".to_string(),
+                vec!["darwin::idle", "darwin::pthread"],
+            )],
+            "the duplicate set changed: a name is now defined by more than one \
+             module that was not before, or `sched_yield` has been decided. The \
+             full set is above, with every module that claims each name"
         );
     }
 

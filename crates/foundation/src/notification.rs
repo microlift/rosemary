@@ -849,12 +849,42 @@ pub(crate) fn install() {
 //   selref  0xe6e9d28  `defaultUserNotificationCenter`     2 loads
 //           0x510305b, 0x5106945
 //   classref 0xe6e75d0 `UNUserNotificationCenter`          3 refs
-//           0x50fcbf3, 0x5102eb4, 0x5106891
+//           0x50fcbf3, 0x5102fcc, 0x5106891
 //   classref 0xe6e75f0 `NSUserNotificationCenter`          2 refs
 //           0x5103054, 0x510693e
 //   classref 0xe6e7618 `NSUserNotification`                1 ref
 //           0x5107217
 //
+// One of those three was wrong here and is corrected above: the middle
+// `UNUserNotificationCenter` classref is **0x5102fcc**, not 0x5102eb4. 0x5102eb4
+// loads `0xe6e7408`, which is the `NSBundle` classref - the `mainBundle` line
+// three paragraphs below - and the pair at 0x5102fcc/0x5102fd3 is the
+// `currentNotificationCenter` send that 0x5102fd3 was already correct about. The
+// selref site 0x5102fd3 and the classref site 0x5102fcc are seven bytes apart,
+// which is the shape of `mov rdi,[classref]` / `mov rsi,[selref]` / `call`; the
+// wrong address was a different classref seven bytes from a *different* selref,
+// and nothing but the disassembly distinguishes the two.
+//
+// The other classrefs the guest imports are at 0xe6e7628, 0xe6e7630 and 0xe6e7638
+// (one load each: 0x510bce8, 0x510caf6, 0x510ccca), derived from the slid slot
+// addresses in `test/logs/206.log` by the slide that
+// `NSUserNotificationCenter` fixes - slid 0x7f076d36b5f0 against unslid
+// 0xe6e75f0 gives 0x7f075af4f400, and the same slide turns the log's
+// `UNUserNotificationCenter` and `NSUserNotification` slots into 0xe6e75d0 and
+// 0xe6e7618, the two addresses `selcensus.py` independently finds. Two
+// confirmations from sources that do not share a failure mode.
+//
+// The class *symbols* the image imports are ten, found by scanning the file for
+// the `_OBJC_CLASS_$_` prefix and reading each NUL-terminated name that follows -
+// which is the bind stream's own spelling, so it cannot miss a name the way a
+// truncated run log can: `test/logs/206.log` shows 43 of the 122 missing classes
+// and **does not list `UNNotificationAction`, `UNNotificationCategory`,
+// `UNTextInputNotificationAction` or `UNTextInputNotificationResponse`**, which
+// are all four in the image. Ten names, and the table below carries all ten -
+// `UNTextInputNotificationAction` was **missing** from this file until that scan,
+// and `every_class_the_guest_imports_has_an_arm_and_vice_versa` is the test that
+// now holds the two lists against each other.
+
 // Each `classref` load is immediately followed by the matching `selref` load and
 // then `call QWORD PTR [rip+..] # 0xdd50038`, which is the send. So there are
 // **two** `+[NSUserNotificationCenter defaultUserNotificationCenter]` sends in
@@ -1009,7 +1039,7 @@ pub(crate) fn install() {
 // `respondsToSelector:` on `NSUserNotification`, which the census does find
 // there.
 //
-// # What could not be settled
+// # Which file function 2 is in: not settled, and now bounded
 //
 // `whichfile.py` brackets both function 1 and function 2 to
 // `chrome/app_shim/app_shim_controller.mm`, and the marker census agrees there
@@ -1018,42 +1048,120 @@ pub(crate) fn install() {
 // census of `0x5104400..0x5106d60`, which lies inside it, returns
 // `removeHistoryOverlay`, `processTouchEventForHistorySwiping`,
 // `updateProgressBar` and `navigateBrowserInDirection` - `content/browser`
-// history-overlay and translate-bubble code, not the app shim. So function 2 is
-// named here by its **shape** - it is the only code in the image that
-// constructs a `MacNotificationServiceNS` under a `NewMacNotificationAPI` test -
-// and not by a file. Which Chromium method it is, in which `.cc`, is not
-// established.
+// history-overlay and translate-bubble code, not the app shim. Re-run here and
+// confirmed, and widened: the same census over `0x5106600..0x5106d60` returns
+// only `scrollingDeltaY` at 0x510661f and then **nothing but function 2's two
+// centre sends** at 0x510689b and 0x5106948.
+//
+// A marker census over `0x50f0000..0x5120000` (every byte offset scanned for a
+// `disp32` landing on a source-path cstring) shows the last
+// `app_shim_controller.mm` marker at **0x5103edb**, no source-path marker at all
+// between it and `0x5106ab3`, and the first
+// `mac_notification_service_un.mm` marker at **0x510a5b9** - seven of them, the
+// last at 0x5111bf5. There is **no `mac_notification_service_ns.mm` string
+// anywhere in the image**, so the NS file emits no marker and cannot be located
+// by one.
+//
+// So what is established is the boundary, not the name: function 2 and the
+// service class are the only code in the image that talks to a notification
+// centre, they sit in a run from 0x5106860 to 0x510a230 that is otherwise
+// silent of selectors, and that run begins immediately after the
+// `content/browser` gesture code and ends at the UN service's constructor. Which
+// Chromium method function 2 is, and in which `.mm`, is **not** established, and
+// this file names it by its shape - the only code in the image that constructs
+// the NS notification service under a `NewMacNotificationAPI` test.
+//
+// # THE QUESTION THIS REOPENING WAS FOR: what does the service do with a nil centre?
+//
+// The answer decides whether `nil` is the truthful answer or a lie, so it is
+// worth the whole constructor.
+//
+// `MacNotificationServiceNS` is the class whose vtable is at `0xe2dbab0`; its
+// `isa` is written by the constructor at `0x5106d92`, by the destructor at
+// `0x510702d` and by the destructor at `0x510711d`, and nothing else. Its eight
+// virtual methods are the vtable's other seven entries plus the constructor, so
+// **every method the class has is inside `0x5106d60..0x510a143`** and there is no
+// code outside that range that can reach the field. Two names make it concrete
+// without any source: the constructor allocates the classref at `0xe6e7610`,
+// whose `ro_data` name at `0xe6f8540` is `AlertNSNotificationCenterDelegate` and
+// which it messages `initWithActionHandler:` (selref `0xe6e9eb8`); and it builds
+// a mojo remote, passing the cstring at `0xcf22cc0`, which is
+// `mac_notifications.mojom.MacNotificationService`.
+//
+// The constructor, `%rcx` is the centre as its fourth argument:
+//
+//   0x5106d7e  `mov rdi,rcx` ; 0x5106d81 `call [0xdd50040]` = `_objc_retain`
+//   0x5106d87  `mov [rbp-0x40],rax`        - retained, held on the frame
+//   ...        the mojo remote, an `operator new(8)` refcount block, the vtable
+//   0x5106eda  `_objc_alloc` of the delegate class, `initWithActionHandler:`
+//   0x5106f12  `mov [r14+0x38],rax`        - the delegate, at this+0x38
+//   0x5106f36  `mov rdi,[rbp-0x40]` ; 0x5106f3a `_objc_retain` again
+//   0x5106f43  `mov [r14+0x40],rax`        - **the centre, at this+0x40**
+//   0x5106f55  `[centre setDelegate: delegate]` through `objc_msgSend`
+//   0x5106f5b  `_objc_release(centre)` ; `ret`
+//
+// It is retained twice, stored once, and messaged once, and there is no branch
+// on it anywhere in the constructor. **And there is no branch on it anywhere in
+// the class.** `test/tools/field-nilcheck.py 0x5106d60:0x510a143 0x40` walks
+// every read of `+0x40` and what the value is used for:
+//
+//   SENT     0x5107037  0x5107127   the two destructors, `-setDelegate:nil`
+//   RETAINED 0x510704a  0x510713a   the two destructors, releasing it
+//   SENT     0x51076c1  **`-deliverNotification:` in the same function**
+//   SENT     0x51077f5  0x5108195  0x5108526   `-deliveredNotifications` x3
+//   SENT     0x5108427  0x5108762   `-removeDeliveredNotification:` x2
+//   SENT     0x51087c4  0x51087d0   `-removeAllDeliveredNotifications`,
+//                                     a tail jump straight into `objc_msgSend`
+//   STORE    0x5106f43                the constructor's own write
+//   TESTED   0x5109b03                **the positive control**, below
+//
+// Eleven reads of the field, **nine sends, zero tests**. The control is in the
+// same output: `0x5109b03` reads a `+0x40` in a *different* object in the same
+// translation unit and **is** nil-tested three instructions later, so a walk
+// that could not see a `test` would report zero and read like a fact. Widening
+// the range to `0x5106000..0x510c000` adds two more `+0x40` reads (0x510ad56,
+// 0x510bdaf), both into `%rsi`/`%r15` and both past the first
+// `mac_notification_service_un.mm` marker at `0x510a5b9`, so the class's own
+// eleven are the whole of it.
+//
+// **So the class never asks whether it has a centre, and the only reason a null
+// centre would not crash is Objective-C's own rule that a message to `nil` is a
+// no-op.** That rule is real and this runtime implements it - `msg_send` on
+// x86-64 begins `test rdi,rdi; je` at `crates/objc/src/msg.rs:301` and returns
+// with `%rax` and `%rdx` zeroed, `msg_send_stret` begins `test rsi,rsi` at
+// `crates/objc/src/msg.rs:362` and returns the buffer address, and the aarch64
+// body says why in a comment at `crates/objc/src/msg.rs:281`: "Messaging nil is
+// the language, not an error". The guest relies on it elsewhere in the very same
+// function: at `0x510782f` it sends `countByEnumeratingWithState:objects:count:`
+// to whatever `deliveredNotifications` returned, and `0x5107838: test rax,rax; je`
+// skips the whole loop when the answer is zero, which is the protocol's own "stop
+// enumerating" convention and is exactly what a nil receiver returns.
+//
+// **Which makes `nil` survivable - and survivable is the problem.** The
+// constructor's own `setDelegate:` would be a no-op; nothing would be shown; and
+// `-deliverNotification:` is `void` and reports nothing, so at `0x51076c1..0x51076e1`
+// the guest sends the toast, releases it, releases the delegate and returns. It
+// has no way to know. A null centre is not "notifications unavailable": it is
+// **delivery that looks like delivery**, which is the one outcome worse than a
+// fault, and the reason the earlier reading here - "nil is not survivable",
+// argued from the centre never being nil on macOS - reached the right verdict
+// for the wrong reason. It is an argument about macOS, not about this
+// constructor; the constructor answers it, and the answer is that it would carry
+// on.
+//
+// Therefore: **`nil` is refused, and the refusal is unconditional.** The missing
+// capability is named per class by the two constants below, and the caller is
+// named in the message: `+[NSUserNotificationCenter defaultUserNotificationCenter]`
+// at `0x5106945`, whose result goes through `_objc_retainAutoreleasedReturnValue`
+// into `%rcx` at `0x51069b1` and straight into this constructor at `0x51069b4`.
 //
 // # What is installed, and what it does
 //
-// `ROSETTA3_NAME_SYSTEM_NOTIFICATIONS=1` registers each class the guest imports
-// from `UserNotifications.framework`, plus the two `NSUserNotification*` classes
-// it imports from `Foundation.framework`, and installs on each the selectors the
-// census measured as sent to **that** class. Every one prints the missing
-// service and then aborts. Nothing is answered, and no guest path is taught to
-// tolerate anything: with the variable unset these classrefs stay unbound,
-// `ROSETTA3_NAME_MISSING_CLASSES` binds them to named empty classes, and the
-// first message aborts by name - the same refusal, shorter message, which is why
-// this is off by default and additive.
-//
-// **Why off by default, given that the run now reaches it.** The default is not
-// "quiet": `ROSETTA3_NAME_MISSING_CLASSES` is on in the milestone script, so the
-// run already stops here, at the same instruction, by the same `abort()`. What
-// this file adds is the reason. Installing it unconditionally would change two
-// things the project relies on, and both are losses:
-//
-//  * `ROSETTA3_LOG_UNRECOGNIZED=1` is documented as answering nil for an
-//    **unrecognised** selector. Installing these methods makes them recognised,
-//    so that lever would stop working at this wall - and it is the lever that
-//    walks past a wall to reveal the queue behind it.
-//  * `--raw` (both unbound-data defences off) leaves the classref unbound, so the
-//    guest sends to `nil` and the run continues into a `MacNotificationServiceNS`
-//    holding a null centre. That is the "delivery that looks like success" this
-//    file exists to prevent, and turning the refusal on is what would stop it -
-//    but it stops the `--raw` run at a different place than today.
-//
-// Both are the orchestrator's call, not this file's, and both are one constant:
-// [`SYSTEM_NOTIFICATION_ENV`] read as `!= Some("0")`.
+// Each class the guest imports from `UserNotifications.framework`, plus the two
+// `NSUserNotification*` classes it imports from `Foundation.framework`, with on
+// each the selectors the census measured as sent to **that** class. Every one
+// prints the missing service and the caller, and then aborts. Nothing is
+// answered, and no guest path is taught to tolerate anything.
 //
 // Registering under the guest's own spelling is what makes the message reach the
 // right object whatever the order of the two registrations is:
@@ -1061,12 +1169,42 @@ pub(crate) fn install() {
 // name is taken, and `replace_method` installs onto whatever it returned. So
 // whether this runs before or after `rosetta3::program::name_missing_classes`,
 // there is one class object per name and the guest's slot ends up pointing at it.
+//
+// **The one thing that changes on the milestone's default output is one line,
+// and it is the line at the fault.** Before: `rosetta3: objc: unrecognized
+// selector sent to instance of NSUserNotificationCenter:
+// defaultUserNotificationCenter`, from `objc::msg::unrecognised`, because
+// `NAME_MISSING_CLASSES` gave the classref an empty class. After: the line
+// above, from this file. Same instruction, same `abort()`, same exit 134, the
+// same line number in the log, and the line now says what is missing and who
+// asked. Measured on runs 206 and 217 of `test/logs/`.
+//
+// # What is behind this wall, and why the default run cannot show it
+//
+// With `ROSETTA3_LOG_UNRECOGNIZED=1` - and only with it, or with `--raw`, which
+// leaves the classref unbound so the guest messages nil - the run walks past this
+// refusal and the **same wall** appears in both: `Chromium Framework+0x65d1bac`,
+// a store at `+8` through `%rbx = 0`, in a function bracketed by
+// `net/disk_cache/simple/simple_backend_impl.cc` markers at 0x65d0f52, 0x65d1999
+// and 0x65d1bc5. Runs 216 and 219.
+//
+// Two controls make that a finding rather than a coincidence. In 219 (`--raw`)
+// the guest never messages the notification centre at all - zero refusal lines,
+// zero `objc` refusal lines, only the unbound-import listing - and the fault is
+// still at 0x65d1bac. And the one `-[TKTokenWatcher tokenIDs]` line in 216, which
+// looks like the trigger, is **not**: 219 has no such line and faults identically,
+// so it is another thread's output interleaved. The disk-cache fault is
+// independent of the notification surface, and this wall is the only thing
+// between the default run and it.
+//
+// Which is the operational consequence worth writing down: **this refusal is now
+// a hard stop for the milestone**, by design. The capability is genuinely absent,
+// the alternative answer is delivery that looks like delivery, and the other arm
+// of the gate is the same missing daemon. Whoever picks the milestone up next
+// needs to know that the run cannot get past this line without answering nil
+// somewhere it should not, and that the next *fixable* item is not visible from
+// the default run at all.
 
-/// Opt in to naming `usernotificationsd` rather than only naming the class.
-///
-/// Off by default because the default is already a refusal by name, and this
-/// changes that message - not the behaviour, which is to stop either way.
-pub const SYSTEM_NOTIFICATION_ENV: &str = "ROSETTA3_NAME_SYSTEM_NOTIFICATIONS";
 
 /// `CStr` from a string literal, because `macro_rules!` bodies cannot name
 /// `c"..."` and this file's other tables are written with it.
@@ -1223,11 +1361,18 @@ const SYSTEM_NOTIFICATIONS: &[Measured] = &[
         &[],
         &[("userText", c"@16@0:8")],
     ),
-    // No selector of either kind was measured on these two. They are registered
-    // so the refusal names the class rather than leaving the classref bound to
-    // an anonymous empty one.
+    // No selector of either kind was measured on these four: the image imports
+    // their class symbols and the census found no send to them. They are
+    // registered so that a send the census has not seen names the class and the
+    // missing daemon rather than leaving the classref bound to an anonymous
+    // empty one. Note what is **not** claimed: that the image never loads a
+    // classref for them. Their classref slot addresses are not in any log here -
+    // `test/logs/206.log` prints 43 of the 122 missing classes - and a census
+    // that cannot name a slot cannot count its loads.
+    ("UNTextInputNotificationAction", &[], &[]),
     ("UNNotificationAction", &[], &[]),
     ("UNNotificationCategory", &[], &[]),
+    ("UNTextInputNotificationResponse", &[], &[]),
 ];
 
 /// Say once that nothing here can deliver a notification, then stop.
@@ -1239,29 +1384,56 @@ const SYSTEM_NOTIFICATIONS: &[Measured] = &[
 /// `nil`, `0`, an empty settings object - is one this guest's own code has no way
 /// to tell from a real answer, so the only honest result is to stop.
 ///
+/// **The one exception is the runtime's own diagnostic switch, and it is the
+/// runtime's, not this file's.** `ROSETTA3_LOG_UNRECOGNIZED=1` is documented, in
+/// `objc::msg::logging_unrecognised`, as *answer nil instead of aborting on a
+/// message no class answers*. These selectors are a message no class can answer,
+/// so leaving them out of that switch would make this wall the one place the
+/// lever stops working, and the lever is how the queue behind a wall is read in
+/// one run. Under it the line is still printed - naming the class, the selector
+/// and the missing service, which is more than the switch's own line says - and
+/// then `nil` is returned, which is what "answer nil" means. The default run,
+/// with the variable unset, still aborts here.
+///
+/// This is not "the guest tolerates a failure". The guest is untouched and has
+/// no path that could: `deliverNotification:` is one-way `void` and there is no
+/// "notifications unavailable" branch anywhere in the class, which is the
+/// measurement in the comment above.
+///
 /// Once **per (class, selector)**, not once per process: the two classes are
 /// refused for two different missing capabilities, and a message that named only
 /// the first would be wrong about the second.
-fn refuse_system_notification(class: &str, missing: &str, sel: Sel) -> ! {
+fn refuse_system_notification(class: &str, missing: &str, sel: Sel) -> usize {
     // SAFETY: `objc::sel::name` is the selector itself, which `sel_registerName`
     // made a NUL-terminated string, and this is the only read of it.
     let name = unsafe { std::ffi::CStr::from_ptr(objc::sel::name(sel)) };
     let mut said = SAID.lock().unwrap_or_else(|e| e.into_inner());
     if said.insert((class.to_string(), name.to_string_lossy().into_owned())) {
         eprintln!(
-            "rosetta3: foundation: {class} {}: refused by name. {missing} Nothing on this \
+            "rosetta3: foundation: {class} {selector}: refused by name. {missing} Nothing on this \
              host can put a notification in front of a user, so a request made through this class \
              could never be delivered and no permission or settings answer read back from it would \
              be true. The in-process NSNotificationCenter in this file is a different object and \
              not a substitute: a post to it reaches the guest's own observer and nothing else, \
-             which would look like delivery. The guest reached this class because the feature that \
-             selects the other implementation is disabled in this build, so the class is on the \
-             only path it has here; the gates and the two send sites are measured in the comment \
-             above.",
-            name.to_string_lossy()
+             which would look like delivery. {caller}{switch}",
+            selector = name.to_string_lossy(),
+            caller = caller_of(class),
+            switch = if objc::msg::logging_unrecognised() {
+                " ROSETTA3_LOG_UNRECOGNIZED is set, so this refusal is answering nil instead of \
+                 aborting; a run this way cannot be trusted."
+            } else {
+                ""
+            },
         );
     }
-    std::process::abort()
+    // `0` is not a stand-in for an answer - it is what "answer nil" means, and
+    // the only way out of this function. The guest cannot reach it in the
+    // default configuration, because `logging_unrecognised()` is false there and
+    // the process stops instead.
+    match objc::msg::logging_unrecognised() {
+        true => 0,
+        false => std::process::abort(),
+    }
 }
 
 /// `(class, selector)` pairs already named, so the refusal speaks once each.
@@ -1301,6 +1473,119 @@ const MISSING_NOTIFICATION_UI: &str = "The deprecated NSUserNotification centre 
     and no client either: it hands the toast to the system's notification UI, which draws it \
     under the app's registered bundle identity and the user's login session.";
 
+/// Which guest code asks each class for a notification centre, and why it asks.
+///
+/// A refusal that names the class but not the caller is half a refusal: the class is
+/// a third-party name, and the caller is the line in Chromium that has to change.
+/// Every address here is measured, and the two gates are derived rather than
+/// assumed (`FeatureList::IsEnabled` returns through `cmp DWORD PTR [rbx+0x8],0x1;
+/// sete al` on both its return paths, so `+8` is the status and `1` is enabled).
+///
+/// Per class rather than one shared sentence, because the two centres are reached
+/// from opposite arms of the **same** test - and a message that named one arm while
+/// refusing a message on the other would send whoever reads it to the wrong gate.
+/// `NewMacNotificationAPI` (0xe6da980) is one of the 928 disabled records of the
+/// 1642-entry feature array, which is why the `else` arm is the one this build walks.
+///
+/// The two classes that the census found with no measured selector are in here with
+/// the same shape, saying that nothing in the image messages them, rather than
+/// left to the `unreachable!` that guards an unpaired table row.
+const CALLERS: &[(&str, &str)] = &[
+    (
+        "UNUserNotificationCenter",
+        "The caller is +[UNUserNotificationCenter currentNotificationCenter], measured at three \
+         sites - 0x50fcbf3, 0x5102eb4 and 0x5106891 - of which 0x5106898 is the one whose \
+         constructor this file's comment traces; the feature that would select the other \
+         implementation, NewMacNotificationAPI, is disabled in this build, so the UN arm is \
+         unreachable from here and this is the arm the run takes.",
+    ),
+    (
+        "NSUserNotificationCenter",
+        "The caller is +[NSUserNotificationCenter defaultUserNotificationCenter] at 0x5106945, \
+         the else arm of a test on the feature NewMacNotificationAPI, which is disabled in this \
+         build, so this is the only path the guest has to a notification here. Its result goes \
+         through _objc_retainAutoreleasedReturnValue into %rcx at 0x51069b1 and straight into \
+         the service's constructor at 0x51069b4, which retains it, stores it at +0x40 and \
+         messages it nine times with no nil test at all - measured in the comment above. That is \
+         why the answer cannot be nil: a message to nil is a no-op in Objective-C, so a nil \
+         centre would let the guest record a delivered notification that no user could ever have \
+         seen, from a -deliverNotification: that returns void and reports nothing.",
+    ),
+    (
+        "NSUserNotification",
+        "The caller is _objc_alloc_init at 0x510721e, called directly on this classref - the \
+         guest does not send +alloc - and the first message the class ever receives is \
+         -setTitle: at 0x5107259, in the same function that then sends \
+         -deliverNotification: at 0x51076cf.",
+    ),
+    (
+        "UNMutableNotificationContent",
+        "Nothing in this image messages this class in a way the run reaches: its classref is \
+         0xe6e7628, loaded once, at 0x510bce8, which is inside the UN service's code - past \
+         0x510a5b9, the first mac_notification_service_un.mm marker - and the UN arm is the one \
+         NewMacNotificationAPI selects, so this build does not take it. The class is registered \
+         anyway, so that a send the census has not seen names the class and the missing daemon \
+         rather than an anonymous empty class.",
+    ),
+    (
+        "UNNotificationRequest",
+        "Its classref is 0xe6e7638, loaded once, at 0x510ccca - also inside the UN arm - and the \
+         only selector the census finds for it is \
+         +requestWithIdentifier:content:trigger:. Registered so the refusal names the class.",
+    ),
+    (
+        "UNNotificationAttachment",
+        "Its classref is 0xe6e7630, loaded once, at 0x510caf6 - also inside the UN arm - and the \
+         only selector the census finds for it is \
+         +attachmentWithIdentifier:URL:options:error:. Registered so the refusal names the class.",
+    ),
+    (
+        "UNTextInputNotificationResponse",
+        "The image imports the class symbol - the bind stream's own spelling has it, and the \
+         selector census in the comment above is how that was found - but no send to it was \
+         measured, so there is nothing to name. It is a response type the UN arm's delegate \
+         callback would receive, and that callback cannot run without the daemon. Registered so \
+         a send that the census has not seen names the class rather than an anonymous empty one.",
+    ),
+    (
+        "UNTextInputNotificationAction",
+        "Like UNTextInputNotificationResponse, the image imports the class symbol and the census \
+         found no send to it. It belongs to a `UNTextInputNotificationAction` category, which is \
+         built on the daemon's side of the service. Registered so a send names the class and the \
+         missing daemon.",
+    ),
+    (
+        "UNNotificationAction",
+        "The image imports the class symbol and the census found no send to it. Registered anyway, \
+         so that a send the census has not seen yet names the class and the missing daemon rather \
+         than an anonymous empty class.",
+    ),
+    (
+        "UNNotificationCategory",
+        "The image imports the class symbol and the census found no send to it. Registered anyway, \
+         so that a send the census has not seen yet names the class and the missing daemon rather \
+         than an anonymous empty class.",
+    ),
+];
+
+/// The [`CALLERS`] row for one class, or a sentence that says the table has drifted.
+///
+/// Not an `unwrap` and not an `expect` on a lookup that can be wrong: a class in
+/// [`SYSTEM_NOTIFICATIONS`] with no row here is a table that has grown a class
+/// without saying who wants it, and the message would then be silent about the
+/// caller of a refusal - which is the half that tells whoever reads it what to do.
+fn caller_of(class: &str) -> &'static str {
+    CALLERS
+        .iter()
+        .find(|(name, _)| *name == class)
+        .map(|(_, text)| *text)
+        .unwrap_or(
+            "The caller is not recorded: this class is in the refusal table with no row in \
+             CALLERS, so the census behind that table has to be re-run before this line can be \
+             trusted.",
+        )
+}
+
 /// The implementation for a selector, chosen by its declared return type.
 ///
 /// `!` coerces to every return type, so one body would serve both. What this
@@ -1335,11 +1620,15 @@ fn refuse_pick(
 /// on the names.
 macro_rules! refuse_system_class {
     ($name:literal, $missing:expr, $class_methods:expr, $instance_methods:expr) => {{
+        // Two bodies, and the split is by **declared return type** rather than by
+        // convenience: a selector that returns an object leaves nothing undefined
+        // in `%rax` on the way out even when the switch above answers nil, and
+        // `refuse_pick` is what decides which of the two a row gets.
         unsafe extern "C" fn returning(_receiver: Id, sel: Sel) -> usize {
             refuse_system_notification($name, $missing, sel)
         }
         unsafe extern "C" fn returning_void(_receiver: Id, sel: Sel) {
-            refuse_system_notification($name, $missing, sel)
+            refuse_system_notification($name, $missing, sel);
         }
         let class = system_notification_class(name_cstr!($name));
         for (selector, types) in $class_methods.iter() {
@@ -1386,20 +1675,42 @@ fn class_name_cstr(name: &str) -> &std::ffi::CStr {
     )
 }
 
-/// Whether the opt-in is set. Named separately so a test can ask the question
-/// without having to make the process-wide change first.
+/// Whether the refusal installs unconditionally.
+///
+/// It does, and there is nothing to set; the name survives only so the test
+/// above reads as a claim about behaviour rather than about a variable.
+#[cfg(test)]
 fn system_notification_refusals_enabled() -> bool {
-    std::env::var_os(SYSTEM_NOTIFICATION_ENV).is_some()
+    true
 }
 
 /// Register the notification classes whose only honest answer is a refusal.
 ///
-/// Does nothing unless [`SYSTEM_NOTIFICATION_ENV`] is set, so the default output
-/// is byte-identical.
+/// **Unconditional, and that is the decision this file was reopened to make.**
+/// A refusal behind a variable is not a refusal the run can hit: the milestone
+/// sets `ROSETTA3_NAME_MISSING_CLASSES` and no other variable, so the default
+/// already stops at this wall by the shorter route, and every line the census
+/// here took to produce - the two send sites, the two gates, the nine sends with
+/// no nil test, the reason a nil centre is a lie rather than an absence - would
+/// be documentation about a code path nothing takes.
+///
+/// The two things the opt-in was said to cost are both answered, and neither
+/// needed a variable:
+///
+///  * `ROSETTA3_LOG_UNRECOGNIZED=1` keeps working across this wall, because
+///    [`refuse_system_notification`] asks `objc::msg::logging_unrecognised`
+///    - the runtime's own switch - rather than keeping a private one. The line is
+///    still printed, and it names more than the switch's own line does.
+///  * `--raw` was never going to be stopped by this file, and saying so is the
+///    measurement. `--raw` turns off `ROSETTA3_NAME_MISSING_CLASSES`, and *that*
+///    is what writes the guest's `__objc_classrefs` slot
+///    (`crates/rosetta3/src/program.rs:327`); `corefoundation::base::register`
+///    makes a class in this runtime's own table and touches no guest memory. So
+///    under `--raw` the classref still reads zero, the guest still messages nil,
+///    and the run still walks into a null centre with these methods installed.
+///    Installing them changes which refusal is printed, not whether the class is
+///    reachable - and the fix for that belongs to the loader, not here.
 fn system_notification_refusals() {
-    if !system_notification_refusals_enabled() {
-        return;
-    }
     // One arm per class, each passing its **own literal**, because the macro
     // needs a `literal` to put in the message and a `macro_rules!` cannot turn
     // a variable into one. The `other` arm is what keeps a class added to
@@ -1446,6 +1757,12 @@ fn system_notification_refusals() {
             ),
             "UNTextInputNotificationResponse" => refuse_system_class!(
                 "UNTextInputNotificationResponse",
+                MISSING_USER_NOTIFICATIONS_DAEMON,
+                class_methods,
+                instance_methods
+            ),
+            "UNTextInputNotificationAction" => refuse_system_class!(
+                "UNTextInputNotificationAction",
                 MISSING_USER_NOTIFICATIONS_DAEMON,
                 class_methods,
                 instance_methods
@@ -1864,6 +2181,7 @@ const GUEST_IMPORTS: &[&str] = &[
     "UNNotificationRequest",
     "UNNotificationAction",
     "UNNotificationCategory",
+    "UNTextInputNotificationAction",
     "UNTextInputNotificationResponse",
     "NSUserNotification",
     "NSUserNotificationCenter",
@@ -2043,21 +2361,16 @@ fn every_encoding_names_offsets_that_are_multiples_of_eight_in_range() {
     }
 }
 
-/// With the opt-in set, every class is a real class carrying the selectors the
-/// census measured, and not the empty placeholder `NAME_MISSING_CLASSES` builds.
+/// Every class is a real class carrying the selectors the census measured, and
+/// not the empty placeholder `NAME_MISSING_CLASSES` builds.
 ///
-/// The point is that the *message* changes and the *behaviour* does not, so
-/// there is a way to see which of the two is which: a class with no own methods
-/// is the empty placeholder, and this asserts every one has its own.
+/// The point is that the *message* now names the missing service, and the
+/// behaviour is still to stop, so there is a way to see which of the two is
+/// which: a class with no own methods is the empty placeholder, and this asserts
+/// every one has its own.
 #[test]
-fn the_opt_in_installs_a_method_for_every_measured_selector() {
-    // Set for the duration of the test rather than for the process, because
-    // every other test in this file runs with the default - which is the state
-    // the default output has to keep.
-    // SAFETY: single-threaded within this test, and restored before it returns.
-    unsafe { std::env::set_var(SYSTEM_NOTIFICATION_ENV, "1") };
+fn the_refusal_installs_a_method_for_every_measured_selector() {
     system_notification_refusals();
-    unsafe { std::env::remove_var(SYSTEM_NOTIFICATION_ENV) };
 
     for (class_name, class_methods, instance_methods) in SYSTEM_NOTIFICATIONS {
         let class = system_notification_class(class_name_cstr(class_name));
@@ -2155,44 +2468,46 @@ fn the_two_reasons_name_two_different_missing_capabilities() {
     }
 }
 
-/// The default installs nothing, which is what keeps the default output
-/// byte-identical: with the variable unset these classrefs stay unbound,
-/// `NAME_MISSING_CLASSES` gives them named empty classes, and the first message
-/// aborts by name.
+/// There is no gate, and that is the point: a refusal the default run cannot
+/// reach is documentation.
 ///
-/// Asserted on the gate rather than on the absence of classes, because the
-/// classes may legitimately be in the table already - another test in this binary
-/// runs the opt-in - and "the class is not registered" would be a claim about
-/// test order rather than about the default.
+/// What replaced the gate is the runtime's **own** switch. Under
+/// `ROSETTA3_LOG_UNRECOGNIZED=1` the diagnostic lever must keep working across
+/// this wall, and it does, because [`refuse_system_notification`] asks
+/// `objc::msg::logging_unrecognised()` - the same function the rest of the
+/// runtime asks - rather than keeping a private variable. So there is nothing
+/// here for an operator to set, and nothing that can make this wall quieter than
+/// the rest of the runtime.
 #[test]
-fn the_default_is_off() {
+fn the_refusal_has_no_gate_of_its_own() {
     assert!(
-        !system_notification_refusals_enabled(),
-        "the gate reads as on with {} unset",
-        SYSTEM_NOTIFICATION_ENV
+        system_notification_refusals_enabled(),
+        "the refusal is behind a variable again, so the default run does not hit it"
     );
-    // And with the variable set it reads as on, so the gate is the variable and
-    // not something that is simply always false.
-    // SAFETY: single-threaded within this test, and restored before it returns.
-    unsafe { std::env::set_var(SYSTEM_NOTIFICATION_ENV, "1") };
-    let on = system_notification_refusals_enabled();
-    unsafe { std::env::remove_var(SYSTEM_NOTIFICATION_ENV) };
-    assert!(on, "the gate ignores the variable entirely");
-    assert!(
-        !system_notification_refusals_enabled(),
-        "the gate is still on after the variable was removed"
+    // And the function that decides whether to abort is the runtime's, so a run
+    // that sets the diagnostic lever walks past this wall exactly as it walks
+    // past every other unrecognised selector - which is the whole of what the
+    // opt-in used to cost.
+    assert_eq!(
+        objc::msg::logging_unrecognised(),
+        std::env::var_os("ROSETTA3_LOG_UNRECOGNIZED").is_some(),
+        "the refusal and objc::msg disagree about whether the diagnostic switch is set"
     );
 }
 
-/// The two classes the census found with **no** measured selector are named in
-/// the table comment, and are the only two.
+/// The four classes the census found with **no** measured selector are named in
+/// the table comment, and are the only four.
 ///
-/// This is a freeze on a census result. If a later census finds a send to
-/// `UNNotificationAction` or `UNNotificationCategory`, this fails and the
+/// This is a freeze on a census result. It was two classes until
+/// `UNTextInputNotificationAction` and `UNTextInputNotificationResponse` were
+/// found by scanning the bind stream's own spelling for the `_OBJC_CLASS_$_`
+/// prefix: the run log that the earlier list came from prints 43 of the 122
+/// missing classes, so its silence about a name was never evidence of anything.
+/// If a later census finds a send to any of these four, this fails and the
 /// comment above has to be corrected - which is the point: a note that can go
 /// stale without anything noticing is not a note.
 #[test]
-fn the_two_classes_with_no_measured_selector_are_the_two_named() {
+fn the_four_classes_with_no_measured_selector_are_the_four_named() {
     let silent: Vec<&str> = SYSTEM_NOTIFICATIONS
         .iter()
         .filter(|(_, c, i)| c.is_empty() && i.is_empty())
@@ -2200,9 +2515,133 @@ fn the_two_classes_with_no_measured_selector_are_the_two_named() {
         .collect();
     assert_eq!(
         silent,
-        vec!["UNNotificationAction", "UNNotificationCategory"],
+        vec![
+            "UNTextInputNotificationAction",
+            "UNNotificationAction",
+            "UNNotificationCategory",
+            "UNTextInputNotificationResponse",
+        ],
         "the set of classes with no measured selector has changed; update the comment too"
     );
+}
+
+/// Every class in the refusal table has a row in [`CALLERS`], and every row names
+/// a class in the table.
+///
+/// The message a reader gets at the fault is the only account of the caller that
+/// will exist, and it is assembled from two independent lists. A class added to
+/// one and not the other is the failure that matters: `caller_of` would answer
+/// with the "not recorded" sentence, which is true and useless, and nothing
+/// downstream would notice.
+#[test]
+fn every_refused_class_has_a_caller_and_vice_versa() {
+    let tabled: std::collections::BTreeSet<&str> =
+        SYSTEM_NOTIFICATIONS.iter().map(|(n, _, _)| *n).collect();
+    let called: std::collections::BTreeSet<&str> = CALLERS.iter().map(|(n, _)| *n).collect();
+    assert_eq!(
+        tabled, called,
+        "the refusal table and the caller table have drifted, so a refusal would name a caller \
+         that does not exist or say nothing at all"
+    );
+    for (class, text) in CALLERS {
+        assert!(
+            text.len() > 80,
+            "{class}: the caller text is too short to be a measurement"
+        );
+        // Either it names an address, which is checkable against the binary, or
+        // it reports the census's own negative - "no send to it" -
+        // which is the measurement for the four classes the image imports and
+        // never messages. What is not allowed is a sentence that could have
+        // been written without looking. The negative is deliberately *not* a
+        // stronger claim: this file has no census of classref loads for those
+        // four, because the run log that would give their slot addresses prints
+        // 43 of the 122 missing classes.
+        assert!(
+            text.contains("0x") || text.contains("no send to it"),
+            "{class}: the caller text names no address and does not report the census's negative, \
+             so it cannot be checked against the binary"
+        );
+    }
+    // And the two classes the run actually walks must name an address each. A
+    // census of a class nothing loads cannot be a sentence, and these two are
+    // the ones the wall's message is read for.
+    for class in ["NSUserNotificationCenter", "NSUserNotification"] {
+        let text = CALLERS
+            .iter()
+            .find(|(n, _)| *n == class)
+            .map(|(_, t)| *t)
+            .unwrap();
+        assert!(
+            text.contains("0x"),
+            "{class}: the caller text for a class the run walks names no address"
+        );
+    }
+}
+
+/// Every selector in the refusal table is one the census measured, and the census
+/// for the two classes this run walks is frozen here.
+///
+/// `objcenc.py` **cannot** be the certifier for these rows: it finds install
+/// sites by reading a `methods!` table, and these selectors arrive through a
+/// `for ... in` over a `const` slice, so it reports 0 of them
+/// (`objcenc.py ours | grep -c NSUserNotification` is 0). The two encoding tests
+/// above are therefore the only arity check these rows get, and this is the check
+/// that they are *real*.
+///
+/// The arm the run walks is `NSUserNotificationCenter` and `NSUserNotification`,
+/// and these are their measured sends, from the census in the comment above:
+/// three `deliveredNotifications` sites, two `removeDeliveredNotification:` sites,
+/// and one each of the rest. `shouldPreventNotificationDismissalAfterDefaultAction`
+/// is deliberately **absent**: it is a `respondsToSelector:` probe whose answer the
+/// guest reads, so absence is tolerated and installing it would refuse a message
+/// the guest is asking whether it can send.
+#[test]
+fn the_walked_arms_selectors_are_exactly_the_measured_ones() {
+    let measured: &[(&str, &[(&str, &str)])] = &[
+        (
+            "NSUserNotificationCenter",
+            &[
+                ("+", "defaultUserNotificationCenter"),
+                ("-", "deliverNotification:"),
+                ("-", "deliveredNotifications"),
+                ("-", "removeAllDeliveredNotifications"),
+                ("-", "removeDeliveredNotification:"),
+                ("-", "setDelegate:"),
+                ("-", "delegate"),
+            ],
+        ),
+        (
+            "NSUserNotification",
+            &[
+                ("-", "setActionButtonTitle:"),
+                ("-", "setContentImage:"),
+                ("-", "setHasActionButton:"),
+                ("-", "setIdentifier:"),
+                ("-", "setInformativeText:"),
+                ("-", "setSubtitle:"),
+                ("-", "setTitle:"),
+                ("-", "setUserInfo:"),
+                ("-", "userInfo"),
+            ],
+        ),
+    ];
+    for (class, expected) in measured {
+        let tabled = SYSTEM_NOTIFICATIONS
+            .iter()
+            .find(|(n, _, _)| n == class)
+            .map(|(_, c, i)| {
+                c.iter()
+                    .map(|(s, _)| ("+", *s))
+                    .chain(i.iter().map(|(s, _)| ("-", *s)))
+                    .collect::<std::collections::BTreeSet<(&str, &str)>>()
+            })
+            .unwrap_or_else(|| panic!("{class} is not in the refusal table"));
+        let want: std::collections::BTreeSet<(&str, &str)> = expected.iter().copied().collect();
+        assert_eq!(
+            tabled, want,
+            "{class}: the table and the measured selector census have drifted"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -2216,7 +2655,7 @@ fn sel_name_of(m: &objc::class::Method) -> &[u8] {
 /// The two registrations cannot fight, whichever order they run in.
 ///
 /// `rosetta3::program::name_missing_classes` registers an empty class under the
-/// guest's spelling and writes it into the classref slot, and this file's opt-in
+/// guest's spelling and writes it into the classref slot, and this file's refusal
 /// registers the same spelling with methods on it. The comment above claims
 /// either order ends with one class object carrying the methods, and that claim
 /// rests on two facts about `corefoundation::base::register` and
@@ -2240,7 +2679,7 @@ fn an_empty_class_registered_first_still_ends_up_carrying_the_methods() {
         first.own_methods().is_empty(),
         "the probe class should start empty, or this is not testing the empty case"
     );
-    // What this file's opt-in then does.
+    // What this file's refusal then does.
     let sel = objc::sel::get("aSelectorNobodySends");
     first.replace_method(
         sel,
