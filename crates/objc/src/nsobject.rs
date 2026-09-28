@@ -50,6 +50,12 @@ pub(crate) fn install() {
     add(meta, "load", initialize as Imp, c"v16@0:8");
 
     add(class, "init", init as Imp, c"@16@0:8");
+    add(
+        class,
+        "validateMenuItem:",
+        validate_menu_item as Imp,
+        c"c24@0:8@16",
+    );
     add(class, "dealloc", dealloc as Imp, c"v16@0:8");
     add(class, "retain", retain as Imp, c"@16@0:8");
     add(class, "release", release as Imp, c"v16@0:8");
@@ -380,6 +386,11 @@ unsafe extern "C" fn class_copy_with_zone(receiver: Id, _sel: Sel, _zone: *mut c
 
 /// `+initialize` and `+load`, which `NSObject` answers by doing nothing.
 unsafe extern "C" fn initialize(_receiver: Id, _sel: Sel) {}
+
+/// `NSObject`'s default menu-item validation leaves an item enabled.
+unsafe extern "C" fn validate_menu_item(_receiver: Id, _sel: Sel, _item: Id) -> u8 {
+    1
+}
 
 #[cfg(test)]
 mod tests {

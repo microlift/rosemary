@@ -115,6 +115,14 @@ mod tests {
             // decision table is still checked by the test above.
             return;
         }
+        // Some sandboxes allow creating a set but refuse every semctl operation.
+        if unsafe { libc::semctl(id, 0, sem::SETVAL, 7) } < 0 {
+            let error = std::io::Error::last_os_error().raw_os_error();
+            if matches!(error, Some(libc::EPERM | libc::EACCES)) {
+                return;
+            }
+            panic!("semctl SETVAL failed: {error:?}");
+        }
 
         let mut ctx = RegisterContext::new();
         let mut mem = NoMemory;

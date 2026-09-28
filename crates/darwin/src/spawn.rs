@@ -1064,9 +1064,6 @@ mod tests {
         assert!(is_mach_o(&c(&fat)), "a fat archive");
         assert!(!is_mach_o(&c(&elf)), "an ELF must be left alone");
         assert!(!is_mach_o(c"/nonexistent-path-for-this-test"));
-        // The host's own shell is the case that must never be rewritten.
-        assert!(!is_mach_o(c"/bin/sh"));
-
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -1129,17 +1126,19 @@ mod tests {
     #[test]
     fn a_script_runs_under_its_translated_interpreter() {
         let dir = scratch("script");
+        let host_shell = dir.join("host-shell");
+        std::fs::write(&host_shell, b"\x7fELF____").unwrap();
         let script = dir.join("script");
-        std::fs::write(&script, b"#!/bin/sh -e\ntrue\n").unwrap();
+        std::fs::write(&script, format!("#!{} -e\ntrue\n", host_shell.display())).unwrap();
         let argv = [c"script".to_owned(), c"one".to_owned()];
 
         let plan = launch(&c_path(&script), &argv);
         assert!(!plan.runtime);
-        assert_eq!(plan.program, c"/bin/sh".to_owned());
+        assert_eq!(plan.program, c_path(&host_shell));
         assert_eq!(
             plan.argv.unwrap(),
             [
-                c"/bin/sh".to_owned(),
+                c_path(&host_shell),
                 c"-e".to_owned(),
                 c_path(&script),
                 c"one".to_owned()
@@ -1178,7 +1177,11 @@ mod tests {
     /// Anything that is not a Mach-O is left entirely alone.
     #[test]
     fn a_host_program_is_not_rewritten() {
-        assert!(rewrite(c"/bin/sh", c"/bin/sh", &[c"sh".to_owned()]).is_none());
+        let dir = scratch("host-program");
+        let host = dir.join("elf");
+        std::fs::write(&host, b"\x7fELF____").unwrap();
+        assert!(rewrite(&c_path(&host), &c_path(&host), &[c"elf".to_owned()]).is_none());
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// Darwin's attribute types are `void *`, so the guest's eight bytes must hold

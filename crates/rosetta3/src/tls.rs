@@ -16,9 +16,7 @@ struct Template {
     initial_size: usize,
     total_size: usize,
     align: usize,
-    /// This image's `__thread_bss_init_func` entries, in section order. Run
-    /// once per thread, back to front, the first time that thread gets a block
-    /// for this image - see [`run_init_funcs`].
+    /// Constructor addresses in section order.
     init_funcs: Vec<u64>,
 }
 
@@ -165,6 +163,14 @@ unsafe extern "C" fn discard(block: *mut core::ffi::c_void) {
 struct Block {
     ptr: *mut u8,
     layout: Layout,
+    state: InitState,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum InitState {
+    Initializing,
+    Ready,
+    Failed,
 }
 
 impl Drop for Block {
@@ -191,9 +197,6 @@ pub fn register(report: &LinkReport) -> usize {
             initial_size: (t.initial_size.min(t.total_size)) as usize,
             total_size: t.total_size as usize,
             align: 1usize << t.align.min(16),
-            // A section whose whole content is this list, so there is nothing
-            // here worth refusing: `machish` has already dropped null padding
-            // entries, and the addresses are the image's own functions.
             init_funcs: image.tlv_init_funcs.clone(),
         };
 
@@ -241,30 +244,58 @@ pub fn register(report: &LinkReport) -> usize {
 /// what publishing the plain SysV function instead of the thunk looks like.
 pub extern "C" fn bootstrap(descriptor: *const u8) -> *mut u8 {
     let at = descriptor as usize as u64;
+    match bootstrap_with(at, call_guest_init) {
+        Ok(address) => address,
+        Err(error) => {
+            eprintln!("rosetta3: __tlv_bootstrap({at:#x}): {error}");
+            std::ptr::null_mut()
+        }
+    }
+}
+
+enum Resolution {
+    Address(*mut u8),
+    Initialize {
+        image: usize,
+        address: *mut u8,
+        funcs: Vec<u64>,
+    },
+}
+
+fn bootstrap_with(
+    at: u64,
+    mut call: impl FnMut(u64) -> Result<(), String>,
+) -> Result<*mut u8, String> {
     let tls = storage();
     if tls.is_null() {
         say_without_storage(at);
-        return std::ptr::null_mut();
+        return Ok(std::ptr::null_mut());
     }
-    // SAFETY: `storage` returns this thread's own allocation, and `resolve` reaches
-    // nothing that could call back in and borrow it a second time.
-    let answer = unsafe { resolve(&mut *tls, at) };
-    // Deliberately outside the borrow above. An initialiser is free to read
-    // another thread-local of the same image - that is the case dyld registers
-    // the block *before* running them for - and doing so re-enters `bootstrap`
-    // and takes `&mut ThreadTls` again.
-    run_init_funcs(&answer.init_funcs);
-    answer.address
-}
+    // The mutable borrow ends before guest constructors run; they may re-enter here.
+    let (image, address, funcs) = match unsafe { resolve(&mut *tls, at) } {
+        Resolution::Address(address) => return Ok(address),
+        Resolution::Initialize {
+            image,
+            address,
+            funcs,
+        } => (image, address, funcs),
+    };
 
-/// What one [`resolve`] found: the address, and what the caller still owes the
-/// image it came from.
-struct Answer {
-    address: *mut u8,
-    /// The image's `__thread_bss_init_func` entries, if this call was the one
-    /// that gave *this thread* a block for it. Empty on every other path, so a
-    /// constructor cannot run twice for one block.
-    init_funcs: Vec<u64>,
+    let result = funcs.iter().rev().try_for_each(|&func| call(func));
+    let thread = unsafe { &mut *tls };
+    let block = thread
+        .blocks
+        .get_mut(&image)
+        .expect("new TLV block remains registered");
+    block.state = if result.is_ok() {
+        InitState::Ready
+    } else {
+        InitState::Failed
+    };
+    if result.is_ok() {
+        thread.cache[line(at)] = (at, address);
+    }
+    result.map(|()| address)
 }
 
 /// [`bootstrap`] behind the register discipline a `tlv_descriptor` thunk owes its
@@ -363,8 +394,8 @@ pub unsafe extern "C" fn bootstrap_thunk(_descriptor: *const u8) -> *mut u8 {
     )
 }
 
-/// The body of [`bootstrap`], with this thread's storage already in hand.
-fn resolve(tls: &mut ThreadTls, at: u64) -> Answer {
+/// Find the address and identify a block that still needs construction.
+fn resolve(tls: &mut ThreadTls, at: u64) -> Resolution {
     // Acquire pairs with the release in `register`: observing the new epoch
     // means observing the slots that came with it.
     let epoch = EPOCH.load(Ordering::Acquire);
@@ -376,10 +407,7 @@ fn resolve(tls: &mut ThreadTls, at: u64) -> Answer {
 
     let line = line(at);
     if at != 0 && tls.cache[line].0 == at {
-        return Answer {
-            address: tls.cache[line].1,
-            init_funcs: Vec::new(),
-        };
+        return Resolution::Address(tls.cache[line].1);
     }
 
     let (image, offset) = {
@@ -388,85 +416,59 @@ fn resolve(tls: &mut ThreadTls, at: u64) -> Answer {
             Some(slot) => (slot.image, slot.offset),
             None => {
                 say_unregistered(at);
-                return Answer {
-                    address: std::ptr::null_mut(),
-                    init_funcs: Vec::new(),
-                };
+                return Resolution::Address(std::ptr::null_mut());
             }
         }
     };
 
-    let mut init_funcs = Vec::new();
+    let mut init_funcs = None;
     if let std::collections::btree_map::Entry::Vacant(slot) = tls.blocks.entry(image) {
-        // The block goes in *before* the initialisers run, for the reason in
-        // `run_init_funcs`: one of them may read another thread-local of this
-        // image, and that read has to find the block rather than start the
-        // whole allocation again.
-        let Some(fresh) = allocate(image) else {
-            return Answer {
-                address: std::ptr::null_mut(),
-                init_funcs: Vec::new(),
-            };
+        let Some(mut fresh) = allocate(image) else {
+            return Resolution::Address(std::ptr::null_mut());
         };
-        init_funcs = init_funcs_of(image);
+        let funcs = init_funcs_of(image);
+        if !funcs.is_empty() {
+            fresh.state = InitState::Initializing;
+            init_funcs = Some(funcs);
+        }
+        // A constructor may re-enter bootstrap for another variable in this block.
         slot.insert(fresh);
+    }
+    let block = &tls.blocks[&image];
+    if block.state == InitState::Failed {
+        return Resolution::Address(std::ptr::null_mut());
     }
     // SAFETY: `offset` was checked against `total_size` at registration and the
     // block was allocated with exactly that many bytes.
-    let address = unsafe { tls.blocks[&image].ptr.add(offset as usize) };
+    let address = unsafe { block.ptr.add(offset as usize) };
 
-    // Cached only now, and only for an answer that came from a block.
-    tls.cache[line] = (at, address);
-    Answer {
-        address,
-        init_funcs,
+    if let Some(funcs) = init_funcs {
+        return Resolution::Initialize {
+            image,
+            address,
+            funcs,
+        };
     }
+    if block.state == InitState::Ready {
+        tls.cache[line] = (at, address);
+    }
+    Resolution::Address(address)
 }
 
 /// One image's `__thread_bss_init_func` list, copied out from under the lock.
 fn init_funcs_of(image: usize) -> Vec<u64> {
     let images = IMAGES.read().unwrap_or_else(|e| e.into_inner());
-    images.get(image).map_or_else(Vec::new, |t| t.init_funcs.clone())
+    images
+        .get(image)
+        .map_or_else(Vec::new, |t| t.init_funcs.clone())
 }
 
-/// Call the functions that construct a thread's zero-initialised
-/// thread-locals, once per thread per image.
-///
-/// The contract, from `tlv_allocate_and_initialize_for_key` in dyld-852.2
-/// (`src/threadLocalVariables.c`) - the last Apple code that ran this section:
-///
-/// * `void (*)(void)`, called with **no arguments**. Not the block: the block is
-///   not a parameter of these functions, and `tlv_get_addr` has already turned
-///   it into an address before anything else happens.
-/// * **Back to front** - dyld's loop is `for (size_t j=count; j > 0; --j)`, so
-///   the last-registered constructor is also the first destroyed. Running them
-///   in section order would construct a program that its own `__cxa_thread_atexit`
-///   registrations tear down in the other order.
-/// * After the block is in this thread's storage, which is what
-///   [`resolve`] arranges before handing them over.
-///
-/// Expect this to be empty for anything built with a current toolchain, and it
-/// is empty for every image in the Chromium run: clang stopped emitting
-/// `__thread_bss_init_func` years ago and constructs a `thread_local` with a
-/// dynamic initialiser inline at the access instead. What this buys is an older
-/// image - or a hand-written one - whose constructors would otherwise never
-/// run, which fails silently rather than loudly.
-///
-/// # Safety-irrelevant
-///
-/// Every entry came from a mapped image's own section through
-/// [`crate::tls::register`], so it is a live address in the identity mapping
-/// this module already relies on for copying `__thread_data` out of the image.
-/// The function is the guest's, called with the C ABI and no arguments, which is
-/// what it was compiled to be called with.
-fn run_init_funcs(funcs: &[u64]) {
-    for &at in funcs.iter().rev() {
-        // SAFETY: a `void (*)(void)` in the guest's own text, which the mapping
-        // this module copies `__thread_data` from keeps alive. Nothing here is
-        // borrowed across the call - `bootstrap` deliberately runs these with
-        // no `&mut ThreadTls` held, because one of them can re-enter it.
-        unsafe { std::mem::transmute::<u64, unsafe extern "C" fn()>(at)() };
-    }
+/// The active backend executes guest constructors with no arguments.
+fn call_guest_init(at: u64) -> Result<(), String> {
+    let exec = crate::exec::active().ok_or("no execution backend is active")?;
+    exec.call(at, &[])
+        .map(|_| ())
+        .map_err(|error| format!("thread-local constructor at {at:#x}: {error}"))
 }
 
 /// Name a descriptor this runtime has no block for, once each.
@@ -525,7 +527,11 @@ fn allocate(image: usize) -> Option<Block> {
             std::ptr::copy_nonoverlapping(t.initial_va as usize as *const u8, ptr, t.initial_size);
         }
     }
-    Some(Block { ptr, layout })
+    Some(Block {
+        ptr,
+        layout,
+        state: InitState::Ready,
+    })
 }
 
 #[cfg(test)]
@@ -563,15 +569,8 @@ mod tests {
         let sentinel = 0x5eed_usize as *mut u8;
         tls.cache[line(a)] = (a, sentinel);
 
-        assert_eq!(
-            resolve(&mut tls, a).address,
-            sentinel,
-            "the cached entry is a hit"
-        );
-        assert!(
-            resolve(&mut tls, b).address.is_null(),
-            "a collision must consult the registry, not the line"
-        );
+        assert!(matches!(resolve(&mut tls, a), Resolution::Address(p) if p == sentinel));
+        assert!(matches!(resolve(&mut tls, b), Resolution::Address(p) if p.is_null()));
     }
 
     /// Two threads must not share a block, and a second access on one thread
@@ -635,10 +634,7 @@ mod tests {
         tls.cache[line(at)] = (at, 0x5eed_usize as *mut u8);
 
         EPOCH.fetch_add(1, Ordering::Release);
-        assert!(
-            resolve(&mut tls, at).address.is_null(),
-            "the stale entry must not survive the epoch it was filled in"
-        );
+        assert!(matches!(resolve(&mut tls, at), Resolution::Address(p) if p.is_null()));
     }
 
     /// A thread-local read from a `pthread_key_create` destructor must still answer.
@@ -731,10 +727,6 @@ mod tests {
         at
     }
 
-    /// `__thread_data` is the image's own bytes and `__thread_bss` is nothing at
-    /// all, so a thread's block has to be *copied* from the first and *zeroed*
-    /// over the second - and copied per thread, or two threads share one
-    /// mutable object and the bug is invisible until something writes.
     #[test]
     fn initial_values_are_copied_per_thread_and_never_aliased() {
         static IMAGE: [u8; 8] = [1, 2, 3, 4, 5, 6, 7, 8];
@@ -745,8 +737,6 @@ mod tests {
             align: 16,
             init_funcs: Vec::new(),
         };
-        // Two variables in one image: the `__thread_data` half, which has
-        // initial values, and the `__thread_bss` half, which has none.
         let data = register_one(template, 0);
         let bss = {
             let image = SLOTS
@@ -761,10 +751,7 @@ mod tests {
         let mine = bootstrap(data as *const u8);
         assert!(!mine.is_null(), "a registered descriptor has a block");
         let tail = bootstrap(bss as *const u8);
-        // SAFETY: both are inside a thirty-two byte block this thread owns -
-        // `mine` at its start, `tail` twenty-four bytes in - so these reads and
-        // the write below are in bounds and touch nothing but this thread's
-        // copy.
+        // SAFETY: both pointers address this thread's 32-byte block.
         unsafe {
             assert_eq!(
                 std::slice::from_raw_parts(mine, IMAGE.len()),
@@ -772,11 +759,9 @@ mod tests {
                 "the initialised prefix must arrive as the image's bytes"
             );
             assert_eq!(
-                *tail,
-                0,
+                *tail, 0,
                 "past __thread_data a fresh block is zero, whatever the image holds"
             );
-            // Write through this thread's copy...
             mine.write(0xff);
         }
         assert_eq!(
@@ -790,8 +775,7 @@ mod tests {
             // SAFETY: as above, on the spawned thread's own block.
             unsafe {
                 assert_eq!(
-                    *theirs,
-                    1,
+                    *theirs, 1,
                     "a second thread must get the image's bytes, not this one's write"
                 );
                 assert_eq!(*their_tail, 0, "and a zero-filled tail");
@@ -806,25 +790,9 @@ mod tests {
         );
     }
 
-    /// What a C++ `thread_local` with a dynamic initialiser needs, and what a
-    /// runtime that skipped it fails at silently: the constructors run, they run
-    /// once per thread, and they run in the order that makes the program tear
-    /// itself down in the reverse of the order it was built up in.
-    ///
-    /// A hand-built `init_funcs` list stands in for a `__thread_bss_init_func`
-    /// section, because that is what the list *is* - see
-    /// [`machish::report::ImageReport::tlv_init_funcs`], and note the section is
-    /// absent from every image this project currently runs, so the only honest
-    /// test of the calling discipline is one that does not need a toolchain.
     #[test]
-    fn a_dynamic_initialiser_runs_once_per_thread_and_back_to_front() {
+    fn constructors_run_once_per_thread_in_reverse_order_and_allow_reentry() {
         static ORDER: Mutex<Vec<u8>> = Mutex::new(Vec::new());
-        extern "C" fn first() {
-            ORDER.lock().unwrap().push(1);
-        }
-        extern "C" fn second() {
-            ORDER.lock().unwrap().push(2);
-        }
 
         let at = register_one(
             Template {
@@ -832,74 +800,77 @@ mod tests {
                 initial_size: 0,
                 total_size: 64,
                 align: 16,
-                init_funcs: vec![
-                    first as *const () as usize as u64,
-                    second as *const () as usize as u64,
-                ],
+                init_funcs: vec![1, 2],
             },
             0,
         );
+        let image = SLOTS.read().unwrap()[&at].image;
+        let other = register_slot(image, 8);
+        let run = |func| {
+            if func == 2 {
+                let nested = bootstrap_with(other, |_| panic!("constructor ran twice"))?;
+                assert!(!nested.is_null());
+            }
+            ORDER.lock().unwrap().push(func as u8);
+            Ok(())
+        };
 
-        assert!(!bootstrap(at as *const u8).is_null());
+        let first = bootstrap_with(at, run).unwrap();
+        assert!(!first.is_null());
+        assert_eq!(*ORDER.lock().unwrap(), [2, 1]);
+        assert_eq!(bootstrap_with(at, run).unwrap(), first);
         assert_eq!(
-            *ORDER.lock().unwrap(),
-            [2, 1],
-            "dyld runs them back to front, so destruction is the reverse"
+            bootstrap_with(other, run).unwrap() as usize,
+            first as usize + 8
         );
-        // The second read of the same descriptor is a cache hit and must not
-        // construct anything again.
-        assert!(!bootstrap(at as *const u8).is_null());
-        assert_eq!(*ORDER.lock().unwrap(), [2, 1], "once per thread, not per read");
+        assert_eq!(*ORDER.lock().unwrap(), [2, 1]);
 
-        // A descriptor of the same image at a different offset is a different
-        // variable, and by then the thread already has the block.
-        let other = register_one(
+        std::thread::spawn(move || {
+            let answer = bootstrap_with(at, |func| {
+                ORDER.lock().unwrap().push(func as u8);
+                Ok(())
+            })
+            .unwrap();
+            assert!(!answer.is_null());
+        })
+        .join()
+        .unwrap();
+        assert_eq!(*ORDER.lock().unwrap(), [2, 1, 2, 1]);
+    }
+
+    #[test]
+    fn failed_constructor_is_not_retried_or_exposed() {
+        let at = register_one(
             Template {
                 initial_va: 0,
                 initial_size: 0,
                 total_size: 64,
                 align: 16,
-                init_funcs: Vec::new(),
+                init_funcs: vec![1, 2, 3],
             },
             0,
         );
-        assert!(!bootstrap(other as *const u8).is_null());
-        assert_eq!(*ORDER.lock().unwrap(), [2, 1], "still once");
-
-        std::thread::spawn(move || {
-            assert!(!bootstrap(at as *const u8).is_null());
-        })
-        .join()
-        .expect("the thread constructs its own");
-        assert_eq!(
-            *ORDER.lock().unwrap(),
-            [2, 1, 2, 1],
-            "a second thread gets its own construction of every thread-local"
+        let image = SLOTS.read().unwrap()[&at].image;
+        let other = register_slot(image, 8);
+        let mut called = Vec::new();
+        let result = bootstrap_with(at, |func| {
+            called.push(func);
+            if func == 2 {
+                Err("failed".to_string())
+            } else {
+                Ok(())
+            }
+        });
+        assert_eq!(result.unwrap_err(), "failed");
+        assert_eq!(called, [3, 2]);
+        assert!(bootstrap_with(at, |_| panic!("retried")).unwrap().is_null());
+        assert!(
+            bootstrap_with(other, |_| panic!("retried"))
+                .unwrap()
+                .is_null()
         );
     }
 
-    /// Which function the runtime publishes as the bootstrap, which is the
-    /// whole of the difference between a working thread-local and a fault one
-    /// instruction later.
-    ///
-    /// The body and the thunk are one call apart and behave identically from
-    /// inside; the difference is what the guest may assume across the call. clang
-    /// emits a thread-local access without spilling anything first, so dyld's
-    /// `_tlv_get_addr` preserves *every* register except the result - `rdi`-`r11`
-    /// and `xmm0`-`xmm7` included, none of which the System V ABI makes
-    /// callee-saved - and a guest counts on that. `bootstrap` is an ordinary C
-    /// function and loses all of them, so Chromium Framework's
-    /// `lea desc; call *desc.thunk` loses the `rsi` holding a moved-from object
-    /// and faults on the load through it on the next line, with the thread-local
-    /// read itself having worked perfectly.
-    ///
-    /// It is checked here rather than in the thunk's own code because the two
-    /// functions are the same logic: what went wrong was never which one the
-    /// *thunk* was, it was which one the *provider* published. And that is
-    /// per-provider, and the providers differ between link paths - a `dlopen`ed
-    /// image is bound through [`crate::program::HostProviders`] and the program's
-    /// own through the list in [`crate::exec::native`], so a name two of them
-    /// answer differently is right on one and wrong on the other.
     #[test]
     fn the_bootstrap_is_published_as_the_register_preserving_thunk() {
         use machish::fixups::SymbolRef;
@@ -915,13 +886,11 @@ mod tests {
                 .resolve(&symbol)
                 .unwrap_or_else(|| panic!("{name} is not published at all"));
             assert_eq!(
-                resolved.addr,
-                bootstrap_thunk as *const () as usize as u64,
+                resolved.addr, bootstrap_thunk as *const () as usize as u64,
                 "{name} must be bound to the thunk, not to the plain function"
             );
             assert_ne!(
-                resolved.addr,
-                bootstrap as *const () as usize as u64,
+                resolved.addr, bootstrap as *const () as usize as u64,
                 "{name} is bound to a C function that clobbers the guest's registers"
             );
         }

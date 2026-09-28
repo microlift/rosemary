@@ -1,6 +1,8 @@
 #![cfg(not(target_os = "macos"))]
 
 use std::ffi::{CStr, CString, c_char, c_int};
+use std::os::unix::ffi::OsStrExt;
+use std::path::Path;
 
 use crate::stat::{DARWIN_PATH_MAX, guest_path, may_write, stdio_writes, with_fallback};
 
@@ -11,6 +13,22 @@ fn host(path: *const c_char) -> Option<CString> {
     }
     // SAFETY: non-null, and a `const char *` is NUL-terminated by contract.
     Some(prefix::ns::to_host(unsafe { CStr::from_ptr(path) }).into_owned())
+}
+
+/// Resolve an at-style path to one the Rust filesystem APIs can use.
+fn host_at(dirfd: c_int, path: *const c_char) -> Option<CString> {
+    if path.is_null() {
+        return None;
+    }
+    // SAFETY: non-null, and an at-style path is NUL-terminated by contract.
+    let guest = unsafe { CStr::from_ptr(path) };
+    let path = prefix::ns::to_host_at(dirfd, guest).into_owned();
+    if dirfd == libc::AT_FDCWD || path.as_bytes().first() == Some(&b'/') {
+        return Some(path);
+    }
+    // Relative paths under a real descriptor need an absolute spelling for
+    // `std::fs`; the procfs fd link keeps lookup anchored to that descriptor.
+    CString::new(format!("/proc/self/fd/{dirfd}/{}", path.to_str().ok()?)).ok()
 }
 
 /// Run `ask` on the host spelling of both paths, folding `from` on `ENOENT`.
@@ -204,6 +222,48 @@ pub unsafe extern "C" fn lchown(path: *const c_char, uid: libc::uid_t, gid: libc
     })
 }
 
+/// `int lchflags(const char *, uint32_t)`
+///
+/// The host has no equivalent operation for symlink flags. Still resolve the
+/// guest path and report ordinary lookup errors before returning unsupported.
+///
+/// # Safety
+///
+/// `path` is a NUL-terminated string.
+pub unsafe extern "C" fn lchflags(path: *const c_char, _flags: u32) -> c_int {
+    with_fallback(path, |path| {
+        let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+        // SAFETY: `path` is a NUL-terminated path and `stat` is writable.
+        let rc = unsafe { libc::lstat(path, stat.as_mut_ptr()) };
+        if rc != 0 {
+            return (rc, false);
+        }
+        crate::errno::set(libc::ENOTSUP);
+        (-1, false)
+    })
+}
+
+/// `int undelete(const char *)`
+///
+/// Recovery is not supported, but validate the path as an existing object so
+/// missing paths retain the usual filesystem error. This never changes files.
+///
+/// # Safety
+///
+/// `path` is a NUL-terminated string.
+pub unsafe extern "C" fn undelete(path: *const c_char) -> c_int {
+    with_fallback(path, |path| {
+        let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+        // SAFETY: `path` is a NUL-terminated path and `stat` is writable.
+        let rc = unsafe { libc::lstat(path, stat.as_mut_ptr()) };
+        if rc != 0 {
+            return (rc, false);
+        }
+        crate::errno::set(libc::ENOTSUP);
+        (-1, false)
+    })
+}
+
 /// `int truncate(const char *, off_t)`
 ///
 /// # Safety
@@ -230,6 +290,88 @@ pub unsafe extern "C" fn link(from: *const c_char, to: *const c_char) -> c_int {
             return -1;
         }
         unsafe { libc::link(from, to) }
+    })
+}
+
+/// `int clonefileat(int, const char *, int, const char *, int)`
+///
+/// This host does not expose Darwin's copy-on-write operation, so files and
+/// directories are copied independently. `CLONE_NOFOLLOW` preserves a source
+/// link.
+///
+/// # Safety
+///
+/// Both paths are NUL-terminated and both descriptors are valid or Darwin's
+/// `AT_FDCWD`.
+pub unsafe extern "C" fn clonefileat(
+    from_dirfd: c_int,
+    from: *const c_char,
+    to_dirfd: c_int,
+    to: *const c_char,
+    flags: c_int,
+) -> c_int {
+    const CLONE_NOFOLLOW: c_int = 1;
+    const CLONE_NOOWNERCOPY: c_int = 2;
+    const CLONE_ACL: c_int = 4;
+    if flags & !(CLONE_NOFOLLOW | CLONE_NOOWNERCOPY | CLONE_ACL) != 0 {
+        crate::errno::set(libc::EINVAL);
+        return -1;
+    }
+    if flags & CLONE_ACL != 0 {
+        crate::errno::set(libc::ENOTSUP);
+        return -1;
+    }
+    if from.is_null() || to.is_null() {
+        crate::errno::set(libc::EFAULT);
+        return -1;
+    }
+    let from_dirfd = match from_dirfd {
+        crate::stat::DARWIN_AT_FDCWD => libc::AT_FDCWD,
+        fd => fd,
+    };
+    let to_dirfd = match to_dirfd {
+        crate::stat::DARWIN_AT_FDCWD => libc::AT_FDCWD,
+        fd => fd,
+    };
+    let (Some(from), Some(to)) = (host_at(from_dirfd, from), host_at(to_dirfd, to)) else {
+        crate::errno::set(libc::EINVAL);
+        return -1;
+    };
+    let mut from_resolved = from.clone();
+    let from_path = crate::stat::with_fallback_at(libc::AT_FDCWD, from.as_ptr(), |path| {
+        from_resolved = unsafe { CStr::from_ptr(path) }.to_owned();
+        let source = unsafe { CStr::from_ptr(path) };
+        let source = Path::new(std::ffi::OsStr::from_bytes(source.to_bytes()));
+        let result = match flags & CLONE_NOFOLLOW != 0 {
+            true => std::fs::symlink_metadata(source),
+            false => std::fs::metadata(source),
+        };
+        match result {
+            Ok(_) => (true, true),
+            Err(error) => {
+                crate::errno::set(error.raw_os_error().unwrap_or(libc::EIO));
+                (false, false)
+            }
+        }
+    });
+    if !from_path {
+        return -1;
+    }
+    let from_path = Path::new(std::ffi::OsStr::from_bytes(from_resolved.to_bytes()));
+    crate::stat::with_fallback_at(libc::AT_FDCWD, to.as_ptr(), |destination| {
+        if !crate::stat::may_write_at(libc::AT_FDCWD, destination) {
+            return (-1, true);
+        }
+        let destination = Path::new(std::ffi::OsStr::from_bytes(
+            unsafe { CStr::from_ptr(destination) }.to_bytes(),
+        ));
+        match crate::copyfile::clonefile(from_path, destination, flags & CLONE_NOFOLLOW != 0) {
+            Ok(()) => (0, true),
+            Err(error) => {
+                crate::errno::set(error.raw_os_error().unwrap_or(libc::EIO));
+                (-1, true)
+            }
+        }
     })
 }
 
@@ -408,8 +550,11 @@ exports::exports! {
         "chmod" => chmod,
         "chown" => chown,
         "lchown" => lchown,
+        "lchflags" => lchflags,
+        "undelete" => undelete,
         "truncate" => truncate,
         "link" => link,
+        "clonefileat" => clonefileat,
         "rename" => rename,
         "symlink" => symlink,
         "freopen" => freopen,

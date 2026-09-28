@@ -23,8 +23,8 @@ const LIBRARIES: &[&str] = &[
     "libncurses.5.4.dylib",
     "libcurses.dylib",
     "libtermcap.dylib",
-    "libssl.0.9.8.dylib",
-    "libcrypto.0.9.8.dylib",
+    "libssl.60.dylib",
+    "libcrypto.57.dylib",
 ];
 
 /// Whether `install_name` is one of the libraries this module takes from the base.

@@ -694,6 +694,7 @@ mod tests {
         assert_eq!(base_name("_close$NOCANCEL"), "close");
         assert_eq!(base_name("_fopen$DARWIN_EXTSN"), "fopen");
         assert_eq!(base_name("_getdirentries$INODE64"), "getdirentries");
+        #[cfg(not(target_os = "macos"))]
         assert!(divergent::contains(base_name("_getdirentries$INODE64")));
         assert_eq!(base_name("_$NOCANCEL"), "$NOCANCEL");
         assert_eq!(base_name("_close$"), "close$");

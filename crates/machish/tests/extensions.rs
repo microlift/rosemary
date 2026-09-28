@@ -3,13 +3,16 @@
 mod common;
 
 use machish::extensions::Extension;
-use machish::extensions::tlv::TlvExtension;
+use machish::extensions::tlv::{TlvExtension, collect_tlv_init_funcs};
 use machish::fixups::{Fixup, LibraryRef, decode_image};
-use machish::image::MachObject;
+use machish::image::{MachObject, Section};
 use machish::loader::Loader;
-use machish::memory::BufferSpace;
+use machish::memory::{AddressSpace, BufferSpace, Placement};
 use machish::resolve::{NativeDylibProvider, SymbolProvider, SyntheticDylib, eager_binding_shims};
 use machish::spec::arch::X86_64;
+use machish::spec::constants::{
+    CPU_TYPE_X86_64, MH_EXECUTE, MH_MAGIC_64, S_THREAD_LOCAL_INIT_FUNCTION_POINTERS,
+};
 
 /// Three constructors with explicit priorities, a destructor, and two
 /// thread-locals - enough that ordering and count are both checkable.
@@ -343,12 +346,47 @@ fn a_bare_loader_reports_nothing_optional() {
     assert!(!img.bindings.is_empty());
 }
 
+#[test]
+fn tlv_constructors_are_read_after_rebase_in_section_order() {
+    let mut header = [0u8; 32];
+    header[0..4].copy_from_slice(&MH_MAGIC_64.to_le_bytes());
+    header[4..8].copy_from_slice(&CPU_TYPE_X86_64.to_le_bytes());
+    header[12..16].copy_from_slice(&MH_EXECUTE.to_le_bytes());
+    let mut image = MachObject::parse(&header, X86_64).unwrap();
+    image.sections.push(Section {
+        seg_name: "__DATA",
+        sect_name: "__thread_bss_init_func",
+        addr: 0x100,
+        size: 32,
+        offset: 0,
+        align: 3,
+        reloff: 0,
+        nreloc: 0,
+        flags: S_THREAD_LOCAL_INIT_FUNCTION_POINTERS as u32,
+        reserved1: 0,
+        reserved2: 0,
+    });
+    let mut mem = BufferSpace::new(0x1000);
+    mem.reserve(0x1000, 0x1000, Placement::Fixed(0x1000))
+        .unwrap();
+    for (i, pointer) in [0x2100_u64, 0, 0x2300, 0x2400].iter().enumerate() {
+        mem.write(0x1100 + i as u64 * 8, &pointer.to_le_bytes())
+            .unwrap();
+    }
+    assert_eq!(
+        collect_tlv_init_funcs(&image, &mem, 0x1000).unwrap(),
+        [0x2100, 0x2300, 0x2400]
+    );
+}
+
+/// Load the optional Chromium Framework fixture.
 /// The guest this project exists to run, if it is on this checkout.
 ///
 /// Everything below is skipped without it, deliberately: the invariants worth
 /// testing here are the ones a synthetic fixture cannot check, because a
 /// fixture's `__thread_vars` is however many variables its source declares
 /// while a real image has whatever its toolchain emitted.
+
 fn chromium_framework() -> Option<Vec<u8>> {
     let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../../test/Chromium/Chromium.app/Contents/Frameworks")
@@ -374,6 +412,7 @@ fn chromium_framework() -> Option<Vec<u8>> {
 /// variable ends exactly on the end of the block, which is the shape that
 /// proves the padding between the two sections is inside the arithmetic and not
 /// dropped from it.
+
 #[test]
 fn every_descriptor_of_the_real_framework_lands_inside_its_block() {
     let Some(bytes) = chromium_framework() else {
@@ -396,6 +435,7 @@ fn every_descriptor_of_the_real_framework_lands_inside_its_block() {
             &mut mem,
             &providers,
         )
+
         .expect("the Framework links");
     let img = report.root().unwrap();
     let template = img
@@ -415,6 +455,7 @@ fn every_descriptor_of_the_real_framework_lands_inside_its_block() {
     // The section type counts `__thread_bss_init_func`, which this image does not
     // have: a current toolchain constructs a `thread_local` with a dynamic
     // initialiser inline at the access instead.
+
     assert!(
         img.tlv_init_funcs.is_empty(),
         "this image has no __thread_bss_init_func to report"
@@ -426,6 +467,7 @@ fn every_descriptor_of_the_real_framework_lands_inside_its_block() {
         assert_eq!(
             d.thunk,
             0x7f00_0000,
+
             "descriptor {:#x} has no bootstrap bound into it",
             d.at
         );
@@ -438,6 +480,7 @@ fn every_descriptor_of_the_real_framework_lands_inside_its_block() {
         );
         // What a bootstrap will return, and the arithmetic has to stay inside
         // the allocation it will be indexing.
+
         let answer = template.initial_va.wrapping_add(d.offset);
         assert!(answer >= template.initial_va);
         assert!(

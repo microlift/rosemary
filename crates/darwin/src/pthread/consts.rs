@@ -169,11 +169,17 @@ mod tests {
     #[test]
     fn scheduling_priorities_translate_in_both_directions() {
         let other = sched_policy_to_host(SCHED_OTHER).unwrap();
+        let other_default = sched_priority_to_host(DARWIN_PRIORITY_DEFAULT, other).unwrap();
+        let other_min = unsafe { libc::sched_get_priority_min(other) };
+        let other_max = unsafe { libc::sched_get_priority_max(other) };
+        assert!((other_min..=other_max).contains(&other_default));
+        if other_min == other_max {
+            assert_eq!(other_default, other_min);
+        }
         assert_eq!(
-            sched_priority_to_host(DARWIN_PRIORITY_DEFAULT, other),
-            Some(0)
+            sched_priority_from_host(other_default, other),
+            DARWIN_PRIORITY_DEFAULT
         );
-        assert_eq!(sched_priority_from_host(0, other), DARWIN_PRIORITY_DEFAULT);
         assert_eq!(sched_priority_to_host(DARWIN_PRIORITY_MIN - 1, other), None);
 
         let fifo = sched_policy_to_host(SCHED_FIFO).unwrap();

@@ -122,6 +122,9 @@ pub(crate) unsafe fn wait_u32(
     timeout_ns: Option<u64>,
     scope: Scope,
 ) -> Result<(), WaitError> {
+    if word.load(std::sync::atomic::Ordering::Relaxed) != expected {
+        return Err(WaitError::Changed);
+    }
     // Zero is "forever", so a sub-microsecond timeout has to round *up* to one
     // microsecond rather than down to no timeout at all.
     let timeout_us = match timeout_ns {

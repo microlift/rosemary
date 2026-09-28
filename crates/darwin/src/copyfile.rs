@@ -166,6 +166,12 @@ fn copy(from: &Path, to: &Path, flags: u32, from_text: &[u8]) -> std::io::Result
     Ok(())
 }
 
+/// Make the independent copy used when the host cannot create an APFS clone.
+pub(crate) fn clonefile(from: &Path, to: &Path, nofollow: bool) -> std::io::Result<()> {
+    let flags = ALL | RECURSIVE | EXCL | if nofollow { NOFOLLOW_SRC } else { 0 };
+    copy(from, to, flags, from.as_os_str().as_bytes())
+}
+
 /// `int copyfile(const char *from, const char *to, copyfile_state_t, copyfile_flags_t)`
 ///
 /// ACLs and extended attributes are **refused**, with `EINVAL`, rather than

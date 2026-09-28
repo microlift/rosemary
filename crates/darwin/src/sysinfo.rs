@@ -559,15 +559,54 @@ static LOCAL_ARCH: ArchInfo = ArchInfo {
     description: c"Intel x86-64".as_ptr(),
 };
 
+static X86_64_ARCH: ArchInfo = ArchInfo {
+    name: c"x86_64".as_ptr(),
+    cputype: 0x0100_0007,
+    cpusubtype: 3,
+    // `NX_LittleEndian`.
+    byteorder: 1,
+    description: c"Intel x86-64".as_ptr(),
+};
+
+static ARM64_ARCH: ArchInfo = ArchInfo {
+    name: c"arm64".as_ptr(),
+    cputype: 0x0100_000c,
+    cpusubtype: 0,
+    // `NX_LittleEndian`.
+    byteorder: 1,
+    description: c"ARM64".as_ptr(),
+};
+
 /// `const NXArchInfo *NXGetLocalArchInfo(void)`
 pub extern "C" fn nx_get_local_arch_info() -> *const ArchInfo {
     &LOCAL_ARCH
+}
+
+/// `const NXArchInfo *NXGetArchInfoFromCpuType(cpu_type_t, cpu_subtype_t)`.
+///
+/// The runtime supports the x86-64 and arm64 guest architectures. A subtype of
+/// `CPU_SUBTYPE_MULTIPLE` requests the most general entry for a CPU type; subtype
+/// capability bits do not change the underlying architecture.
+pub extern "C" fn nx_get_arch_info_from_cpu_type(cputype: i32, cpusubtype: i32) -> *const ArchInfo {
+    let arch = match cputype {
+        0x0100_0007 => &X86_64_ARCH,
+        0x0100_000c => &ARM64_ARCH,
+        _ => return std::ptr::null(),
+    };
+    const CPU_SUBTYPE_MULTIPLE: i32 = -1;
+    const CPU_SUBTYPE_MASK: i32 = 0xff00_0000u32 as i32;
+    if cpusubtype == CPU_SUBTYPE_MULTIPLE || cpusubtype & !CPU_SUBTYPE_MASK == arch.cpusubtype {
+        arch
+    } else {
+        std::ptr::null()
+    }
 }
 
 exports::exports! {
     functions {
         "uname" => uname,
         "NXGetLocalArchInfo" => nx_get_local_arch_info,
+        "NXGetArchInfoFromCpuType" => nx_get_arch_info_from_cpu_type,
         "compat_mode" => compat_mode,
         #[cfg(not(target_os = "macos"))]
         "Gestalt" => gestalt,

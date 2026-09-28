@@ -2,6 +2,22 @@
 
 use std::ffi::{c_char, c_void};
 
+/// Compare `len` bytes without stopping at the first difference.
+///
+/// # Safety
+///
+/// Both pointers must be readable for `len` bytes, unless `len` is zero.
+pub unsafe extern "C" fn timingsafe_bcmp(a: *const c_void, b: *const c_void, len: usize) -> i32 {
+    let a = a.cast::<u8>();
+    let b = b.cast::<u8>();
+    let mut difference = 0u8;
+    for offset in 0..len {
+        // Volatile reads keep the full comparison observable to the optimizer.
+        difference |= unsafe { a.add(offset).read_volatile() ^ b.add(offset).read_volatile() };
+    }
+    ((difference as u32).wrapping_neg() >> 31) as i32
+}
+
 /// Fill `len` bytes at `b` by repeating the `n`-byte pattern at `pattern`.
 ///
 /// A trailing partial copy is written, which is what Apple's does: the length is
@@ -131,6 +147,7 @@ pub unsafe extern "C" fn perror(s: *const c_char) {
 
 exports::exports! {
     functions {
+        "timingsafe_bcmp" => timingsafe_bcmp,
         "memset_pattern4" => memset_pattern4,
         "memset_pattern8" => memset_pattern8,
         "memset_pattern16" => memset_pattern16,
@@ -143,6 +160,29 @@ exports::exports! {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn timingsafe_bcmp_reports_equality_and_difference() {
+        let left = b"abcdef";
+        let same = b"abcdef";
+        let first = b"zbcdef";
+        let last = b"abcdez";
+        for (right, expected) in [(same, 0), (first, 1), (last, 1)] {
+            // SAFETY: both arrays contain six readable bytes.
+            let result =
+                unsafe { timingsafe_bcmp(left.as_ptr().cast(), right.as_ptr().cast(), left.len()) };
+            assert_eq!(result, expected);
+        }
+        // SAFETY: a zero-length comparison reads neither pointer.
+        assert_eq!(
+            unsafe { timingsafe_bcmp(std::ptr::null(), std::ptr::null(), 0) },
+            0
+        );
+        assert_eq!(
+            crate::symbol("_timingsafe_bcmp"),
+            Some(timingsafe_bcmp as *const () as usize as u64)
+        );
+    }
 
     fn filled(n: usize, pattern: &[u8], len: usize) -> Vec<u8> {
         let mut buf = vec![0xAAu8; len + 8];

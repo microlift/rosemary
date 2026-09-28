@@ -455,7 +455,7 @@ fn source_msl_translation_errors_include_nearby_source() {
     let source = "// Prelude\n\
                   // More prelude\n\
                   kernel void f(\n\
-                      texture2d<float, access::write> output [[texture(0)]]\n\
+                      texturecube<float, access::write> output [[texture(0)]]\n\
                   ) { return; }\n\
                   // Epilogue";
     let error = translate_msl(source, &TargetProfile::vulkan_1_3()).unwrap_err();
@@ -468,7 +468,7 @@ fn source_msl_translation_errors_include_nearby_source() {
             "MSL source context:\n",
             "  2 | // More prelude\n",
             "  3 | kernel void f(\n",
-            "> 4 | texture2d<float, access::write> output [[texture(0)]]\n",
+            "> 4 | texturecube<float, access::write> output [[texture(0)]]\n",
             "  5 | ) { return; }\n",
             "  6 | // Epilogue",
         )
@@ -478,7 +478,7 @@ fn source_msl_translation_errors_include_nearby_source() {
 #[test]
 fn source_msl_rejects_texture_shapes_without_an_ir_type() {
     let error = parse_msl(
-        "kernel void f(texture2d<float, access::write> output [[texture(0)]]) { return; }",
+        "kernel void f(texturecube<float, access::write> output [[texture(0)]]) { return; }",
     )
     .unwrap_err();
     assert_eq!(error.diagnostics[0].message, "unsupported MSL texture type");

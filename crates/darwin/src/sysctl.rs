@@ -1,4 +1,4 @@
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 
 /// Top-level MIB identifiers.
 pub const CTL_KERN: i32 = 1;
@@ -86,6 +86,12 @@ pub fn set_guest_arch(arch: GuestArch) {
         },
         Ordering::Release,
     );
+}
+
+static IS_TRANSLATED: AtomicBool = AtomicBool::new(false);
+
+pub fn set_is_translated(translated: bool) {
+    IS_TRANSLATED.store(translated, Ordering::SeqCst);
 }
 
 /// The guest's architecture, defaulting to this host's when no program said.
@@ -417,42 +423,22 @@ fn named(name: &str) -> Option<Value> {
     match name {
         "kern.osproductversion" => Some(Value::Str(env_or("ROSETTA3_MACOS_VERSION", "15.0"))),
         "kern.osproductversioncompat" => Some(Value::Str(env_or("ROSETTA3_MACOS_VERSION", "15.0"))),
-        // Whether *this* process is running under translation. A guest asking is
-        // asking about itself, and under this runtime the answer is yes for an Intel
-        // image on an arm64 host and no otherwise.
         "sysctl.proc_translated" => Some(Value::U32(u32::from(
-            guest_arch() == GuestArch::X86_64 && cfg!(target_arch = "aarch64"),
+            IS_TRANSLATED.load(Ordering::SeqCst),
         ))),
         "hw.optional.arm64" => Some(Value::U32(u32::from(guest_arch() == GuestArch::Arm64))),
         "machdep.cpu.brand_string" => Some(Value::Str(brand_string())),
         "hw.cputype" => Some(Value::U32(guest_arch().cpu_type() as u32)),
         "hw.cpusubtype" => Some(Value::U32(guest_arch().cpu_subtype() as u32)),
-        // `CPUFAMILY_UNKNOWN`. The real values are opaque hashes of a specific
-        // Apple or Intel part, and a caller that recognises one acts on what it
-        // knows about that part - so naming a family this is not is worse than
-        // the answer Darwin itself gives for a CPU it does not recognise.
         "hw.cpufamily" | "hw.cpusubfamily" => Some(Value::U32(0)),
         _ => optional_feature(name),
     }
 }
 
-/// `hw.optional.*`: which instructions the guest may actually execute.
-///
-/// The question is not "what can this CPU do". Under emulation the guest's
-/// instructions are recompiled, and a guest told the machine has AVX-512 emits
-/// AVX-512 that the lifter has to be able to translate - so the honest answer
-/// there is the *baseline* of the guest's architecture and nothing more.
-///
-/// The native backend is the case where the two coincide: the program's
-/// instructions are this CPU's, so it may ask this CPU. [`set_runs_host_
-/// instructions`] is how that is said, and it is the only thing that turns the
-/// wider answers on.
-///
-/// A name this does not know is left to the caller's `None`, which is
-/// `ENOENT` - what a Mac without the feature answers, because Darwin publishes
-/// an `hw.optional` key only when the feature is present.
 #[cfg(not(target_os = "macos"))]
 fn optional_feature(name: &str) -> Option<Value> {
+    // FIXME (ACCURACY): make this match what `cpuid` reports
+
     let x86 = guest_arch() == GuestArch::X86_64;
     let arm = !x86;
     let present = match name {
@@ -854,6 +840,7 @@ mod tests {
     /// Every name in the table must map to a MIB this module actually answers, or
     /// the two halves have drifted.
     #[test]
+    #[cfg(not(target_os = "macos"))]
     fn every_named_key_has_an_answer() {
         let _held = lock_guest_arch(GuestArch::X86_64);
         for (name, mib) in BY_NAME {

@@ -954,6 +954,7 @@ pub static SIGNATURES: &[FunctionAbi] = &[
     sig!("CGColorCreateCopy", P, P),
     sig!("CGColorRelease", V, P),
     sig!("CGColorRetain", P, P),
+    sig!("NXGetArchInfoFromCpuType", P, I32, I32),
     sig!("SCDynamicStoreCopyMultiple", P, P, P, P),
     sig!("SCDynamicStoreCopyKeyList", P, P, P),
     sig!("SCDynamicStoreGetTypeID", U64),
@@ -1725,6 +1726,7 @@ pub static SIGNATURES: &[FunctionAbi] = &[
     sig!("cfsetospeed", I32, P, U64),
     sig!("cfsetspeed", I32, P, U64),
     sig!("chflags", I32, P, U32),
+    sig!("lchflags", I32, P, U32),
     sig!("closelog", V),
     sig!("confstr", U64, I32, P, U64),
     sig!("crc32", U64, U64, P, U32),
@@ -1844,6 +1846,7 @@ pub static SIGNATURES: &[FunctionAbi] = &[
     sig!("fabsf", F32, F32),
     sig!("fchmod", I32, I32, U32),
     sig!("fclose", I32, P),
+    sig!("clonefileat", I32, I32, P, I32, P, I32),
     vsig!("fcntl", I32, I32, I32),
     // `copyfile(const char *, const char *, copyfile_state_t,
     // copyfile_flags_t)`: the state is an opaque pointer and Darwin's flag
@@ -3146,6 +3149,7 @@ pub static SIGNATURES: &[FunctionAbi] = &[
     sig!("strptime", P, P, P, P),
     sig!("strrchr", P, P, I32),
     sig!("strspn", U64, P, P),
+    sig!("strsep", P, P, P),
     // `char *strsignal(int)`. A **pointer** return, and the reason to say so.
     sig!("strsignal", P, I32),
     //
@@ -3237,6 +3241,7 @@ pub static SIGNATURES: &[FunctionAbi] = &[
     sig!("thread_set_state", I32, U32, I32, P, U32),
     sig!("thread_suspend", I32, U32),
     sig!("time", I64, P),
+    sig!("timingsafe_bcmp", I32, P, P, U64),
     sig!("timegm", I64, P),
     // The other spellings; see `_tlv_bootstrap` and `_tlv_atexit` above.
     cbsig!([0], "tlv_atexit", V, P, P),
@@ -3256,6 +3261,7 @@ pub static SIGNATURES: &[FunctionAbi] = &[
     sig!("ungetc", I32, I32, P),
     sig!("ungetwc", I32, I32, P),
     sig!("unlink", I32, P),
+    sig!("undelete", I32, P),
     sig!("unsetenv", I32, P),
     sig!("unvis", I32, P, I32, P, I32),
     sig!("vis", P, P, I32, I32, I32),
@@ -4134,12 +4140,24 @@ mod tests {
         // these declare more arguments than the prototype has, deliberately.
         const SPLIT_AGGREGATES: &[&str] = &[
             "CFArrayApplyFunction",
+            "CFDataDeleteBytes",
+            "CFDataReplaceBytes",
             "CFStringGetBytes",
+            "CFStringCompareWithOptions",
+            "CFStringFindWithOptions",
+            "CFStringCreateWithSubstring",
+            "CFStringGetCharacters",
+            "CFStringDelete",
+            "CFStringReplace",
+            "CFStringFindAndReplace",
             "cabs",
             // A `CGPoint` written out as its two `double`s.
             "CGDisplayMoveCursorToPoint",
             "CGWarpMouseCursorPosition",
         ];
+        // Clang treats these names as its three-argument builtins. The runtime
+        // table describes compiler-rt's four-argument generic functions.
+        const COMPILER_RT_GENERIC: &[&str] = &["__atomic_load", "__atomic_store"];
 
         let mut source = String::from(HEADERS);
         source.push_str("void probe(void) {\n");
@@ -4148,7 +4166,11 @@ mod tests {
         for abi in SIGNATURES {
             // A `$`-suffixed spelling is not a C identifier, and a variadic's
             // last "parameter" is the ellipsis its shim consumes.
-            if abi.name.contains('$') || abi.variadic || SPLIT_AGGREGATES.contains(&abi.name) {
+            if abi.name.contains('$')
+                || abi.variadic
+                || SPLIT_AGGREGATES.contains(&abi.name)
+                || COMPILER_RT_GENERIC.contains(&abi.name)
+            {
                 continue;
             }
             let args = vec!["0"; abi.types.len() - 1].join(",");

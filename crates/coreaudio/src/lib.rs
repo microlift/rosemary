@@ -1,6 +1,7 @@
 #![allow(clippy::missing_safety_doc)]
 #![allow(non_snake_case)]
 
+use std::collections::BTreeSet;
 use std::ffi::c_void;
 use std::sync::{Arc, Mutex};
 
@@ -195,12 +196,22 @@ unsafe impl Send for Unit {}
 
 /// Every instance handed out, by the handle the guest holds - the address of
 /// the `Mutex`, which is stable and unique for as long as the `Arc` lives.
-static UNITS: Mutex<Vec<(usize, Arc<Mutex<Unit>>)>> = Mutex::new(Vec::new());
+#[derive(Default)]
+struct Units {
+    active: Vec<(usize, Arc<Mutex<Unit>>)>,
+    disposed: BTreeSet<usize>,
+}
+
+static UNITS: Mutex<Units> = Mutex::new(Units {
+    active: Vec::new(),
+    disposed: BTreeSet::new(),
+});
 
 fn unit_for(handle: *mut c_void) -> Option<Arc<Mutex<Unit>>> {
     UNITS
         .lock()
         .unwrap_or_else(|e| e.into_inner())
+        .active
         .iter()
         .find(|(h, _)| *h == handle as usize)
         .map(|(_, u)| Arc::clone(u))
@@ -281,26 +292,33 @@ pub unsafe extern "C" fn AudioComponentInstanceNew(
         rendered: 0,
     }));
     let handle = Arc::as_ptr(&unit) as *mut c_void;
-    UNITS
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .push((handle as usize, unit));
+    let mut units = UNITS.lock().unwrap_or_else(|e| e.into_inner());
+    units.disposed.remove(&(handle as usize));
+    units.active.push((handle as usize, unit));
     unsafe { *out = handle };
     SUCCESS
 }
 
 /// `OSStatus AudioComponentInstanceDispose(AudioComponentInstance)`
 pub unsafe extern "C" fn AudioComponentInstanceDispose(handle: *mut c_void) -> i32 {
-    let Some(unit) = unit_for(handle) else {
+    let unit = {
+        let mut units = UNITS.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(index) = units.active.iter().position(|(h, _)| *h == handle as usize) {
+            let (_, unit) = units.active.remove(index);
+            units.disposed.insert(handle as usize);
+            Some(unit)
+        } else if units.disposed.contains(&(handle as usize)) {
+            return INVALID_COMPONENT;
+        } else {
+            None
+        }
+    };
+    let Some(unit) = unit else {
         return foreign::status(c"AudioComponentInstanceDispose", handle)
             .unwrap_or(INVALID_COMPONENT);
     };
     // SAFETY: `close` owns the stream and leaves none behind.
     unsafe { stream::close(&mut unit.lock().unwrap_or_else(|e| e.into_inner())) };
-    UNITS
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .retain(|(h, _)| *h != handle as usize);
     SUCCESS
 }
 

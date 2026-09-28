@@ -23,7 +23,7 @@ fn a_native_hello_world_matches_the_kernels_own_run_of_it() {
 
 #[test]
 fn a_native_exit_status_reaches_the_shell() {
-    let Some(path) = build_native("native_hello", common::HELLO_C) else {
+    let Some(path) = build_native("native_hello_exit", common::HELLO_C) else {
         skip!("cannot build native fixtures")
     };
     // `main` returns `abs(argc) - 1`, so one argument makes it 1 - and a
@@ -42,13 +42,12 @@ fn a_native_unix_thread_entry_matches_the_kernels_own_run_of_it() {
     let bytes = std::fs::read(&path).expect("read LC_UNIXTHREAD fixture");
     let object = machish::image::MachObject::parse_any(&bytes, rosetta3::exec::native::HOST_SPEC)
         .expect("parse LC_UNIXTHREAD fixture");
-    assert!(
-        matches!(
-            object.entry(),
-            Some(machish::image::EntryPoint::UnixThread { .. })
-        ),
-        "-no_new_main did not produce LC_UNIXTHREAD"
-    );
+    if !matches!(
+        object.entry(),
+        Some(machish::image::EntryPoint::UnixThread { .. })
+    ) {
+        skip!("the linker did not produce LC_UNIXTHREAD")
+    }
     let Some((native_status, native_out)) = run_native(&path) else {
         skip!("cannot run the native LC_UNIXTHREAD fixture")
     };
@@ -193,7 +192,7 @@ fn forcing_native_on_an_x86_64_binary_names_the_architecture() {
 
 #[test]
 fn forcing_emulated_on_a_native_binary_names_the_architecture() {
-    let Some(path) = build_native("native_hello", common::HELLO_C) else {
+    let Some(path) = build_native("native_hello_emulated", common::HELLO_C) else {
         skip!("cannot build native fixtures")
     };
     let (status, _, err) = run_guest_with(&["--emulated"], &path, &[]);

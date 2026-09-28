@@ -538,7 +538,7 @@ pub unsafe extern "C" fn openat(
 /// The fold stays relative to `dirfd`: a relative path under a real directory
 /// descriptor is already a host path, and mapping it again would apply the
 /// prefix twice.
-fn with_fallback_at<T>(
+pub(crate) fn with_fallback_at<T>(
     dirfd: c_int,
     path: *const c_char,
     mut ask: impl FnMut(*const c_char) -> (T, bool),
@@ -559,7 +559,7 @@ fn with_fallback_at<T>(
 }
 
 /// Darwin spells `AT_FDCWD` as `-2`; Linux spells it as `-100`.
-const DARWIN_AT_FDCWD: c_int = -2;
+pub(crate) const DARWIN_AT_FDCWD: c_int = -2;
 
 /// Darwin's `AT_EACCESS` and `AT_SYMLINK_NOFOLLOW`, which are Linux's `0x200`
 /// and `0x100`.
