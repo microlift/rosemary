@@ -69,11 +69,11 @@ impl ComputePipeline {
             self.name.to_string_lossy()
         ));
         // SAFETY: every borrowed structure lives across the call.
-        let pipeline = unsafe {
+        let pipeline = crate::stats::pipeline(|| unsafe {
             self.gpu
                 .device
                 .create_compute_pipelines(vk::PipelineCache::null(), &[info], None)
-        }
+        })
         .map_err(|(_, error)| format!("vkCreateComputePipelines failed with {error:?}"))?[0];
         cache.insert(size, pipeline);
         Ok(pipeline)
