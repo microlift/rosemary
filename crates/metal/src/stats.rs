@@ -50,6 +50,8 @@ counters!(
     BufferBlockMicros = "buffer_block_micros",
     BindMicros = "bind_micros",
     PipelineMicros = "pipeline_micros",
+    PipelinePeakMicros = "pipeline_micros_peak",
+    FrameGapPeakMicros = "frame_gap_micros_peak",
     QueueMicros = "queue_micros",
     GpuMicros = "gpu_micros",
     ImmediateCalls = "immediate_calls",
@@ -95,6 +97,36 @@ pub fn timed<T>(counter: Counter, body: impl FnOnce() -> T) -> T {
     let value = body();
     add(counter, start.elapsed().as_micros() as u64);
     value
+}
+
+/// Time the driver building one pipeline: the total, the count, and the
+/// slowest single one of the interval, which is what a hitch is.
+pub fn pipeline<T>(body: impl FnOnce() -> T) -> T {
+    if !enabled() {
+        return body();
+    }
+    let start = Instant::now();
+    let value = body();
+    let micros = start.elapsed().as_micros() as u64;
+    add(Counter::PipelinesCreated, 1);
+    add(Counter::PipelineMicros, micros);
+    peak(Counter::PipelinePeakMicros, micros);
+    value
+}
+
+/// Count a presented frame, and keep the longest wait between two of them:
+/// a rate hides a single late frame, and that frame is the stutter.
+pub fn frame() {
+    if !enabled() {
+        return;
+    }
+    static LAST: std::sync::Mutex<Option<Instant>> = std::sync::Mutex::new(None);
+    let now = Instant::now();
+    let last = LAST.lock().expect("frame time").replace(now);
+    if let Some(last) = last {
+        peak(Counter::FrameGapPeakMicros, (now - last).as_micros() as u64);
+    }
+    add(Counter::Frames, 1);
 }
 
 pub fn timer() -> Option<Instant> {
