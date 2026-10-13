@@ -77,6 +77,24 @@ fn refresh_rate_of(link: &DisplayLink) -> f64 {
         .unwrap_or(60.0)
 }
 
+/// The refresh a call at `when` is for and the one after it, as `-timestamp`
+/// and `-targetTimestamp`.
+///
+/// Refreshes are `interval` apart on a fixed grid, and the two stamps are
+/// points on it however late the call itself is: Apple's are the display's own
+/// times, and a program pacing its frames by them - Roblox keeps a history of
+/// them to match against what it presented - reads the jitter of a stamp taken
+/// from the clock as the display stuttering. `last` keeps them advancing when a
+/// call arrives a little before its refresh.
+fn refresh_around(when: f64, interval: f64, last: f64) -> (f64, f64) {
+    // A call woken a hair early belongs to the refresh it was set for.
+    let mut shown = (when / interval + 0.05).floor() * interval;
+    if shown <= last {
+        shown = last + interval;
+    }
+    (shown, shown + interval)
+}
+
 /// One turn of a link: stamp it and send the selector to the target.
 unsafe extern "C" fn fire(_timer: *const c_void, info: *mut c_void) {
     let object = info as Id;
@@ -87,11 +105,21 @@ unsafe extern "C" fn fire(_timer: *const c_void, info: *mut c_void) {
         }
         (link.target, link.selector, interval_of(link))
     };
-    let when = now();
     {
         let link = link_of(object);
-        link.timestamp = when;
-        link.target_timestamp = when + interval;
+        let when = now();
+        let (shown, next) = refresh_around(when, interval, link.timestamp);
+        link.timestamp = shown;
+        link.target_timestamp = next;
+        // Due again at that refresh, not an interval after whenever the loop
+        // got round to this one: the lateness would otherwise add up, and the
+        // link would run slower than the display it stands for.
+        if !link.timer.is_null() {
+            // SAFETY: the `Arc` `schedule` leaked into the object, still held.
+            let timer = unsafe { &*(link.timer as *const corefoundation::runloop::Timer) };
+            let wait = std::time::Duration::from_secs_f64((next - when).max(0.0));
+            timer.set_next(std::time::Instant::now() + wait);
+        }
     }
     // SAFETY: a live object this runtime allocated.
     let method = unsafe { objc::object::class_of(target) }.and_then(|c| c.method(selector));
@@ -355,6 +383,17 @@ mod tests {
         let f: unsafe extern "C" fn(Id, Sel) -> Id =
             unsafe { std::mem::transmute(method.implementation()) };
         unsafe { f(object, sel) }
+    }
+
+    #[test]
+    fn stamps_are_refreshes_however_late_the_call_is() {
+        let interval = 0.25;
+        // On time, late, and a hair early: all the refresh at 10.0.
+        assert_eq!(refresh_around(10.0, interval, 9.75), (10.0, 10.25));
+        assert_eq!(refresh_around(10.2, interval, 9.75), (10.0, 10.25));
+        assert_eq!(refresh_around(9.995, interval, 9.75), (10.0, 10.25));
+        // A second call inside one refresh still moves on.
+        assert_eq!(refresh_around(10.1, interval, 10.0), (10.25, 10.5));
     }
 
     #[test]
