@@ -461,7 +461,7 @@ fn enqueue_swapchain(drawable: Id) -> bool {
     ) {
         Ok(true) => {
             gpu::milestone("presented frame");
-            crate::stats::count(crate::stats::Counter::Frames);
+            crate::stats::frame();
             // The readback path reports from `present_readback`; without this
             // a swapchain run never prints its statistics at all.
             crate::stats::tick();
@@ -587,7 +587,7 @@ fn present_inner(drawable: Id) {
         // the whole allocation.
         let pixels = unsafe { std::slice::from_raw_parts(staging.contents, bytes as usize) };
         gpu::milestone("presented frame");
-        crate::stats::count(crate::stats::Counter::Frames);
+        crate::stats::frame();
         dump_frame(pixels, width, height, texture.image.format);
         crate::stats::timed(crate::stats::Counter::BlitMicros, || {
             blit_to_window(pixels, width, height, texture.image.format, window)
