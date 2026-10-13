@@ -394,11 +394,11 @@ impl RenderPipeline {
             .render_pass(pass)
             .subpass(0);
         // SAFETY: every borrowed structure lives across the call.
-        let pipeline = unsafe {
+        let pipeline = crate::stats::pipeline(|| unsafe {
             self.gpu
                 .device
                 .create_graphics_pipelines(vk::PipelineCache::null(), &[info], None)
-        }
+        })
         .map_err(|(_, error)| format!("vkCreateGraphicsPipelines failed with {error:?}"))?[0];
         cache.insert(*key, pipeline);
         Ok(pipeline)
