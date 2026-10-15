@@ -136,11 +136,13 @@ unsafe extern "C" fn fire(_timer: *const c_void, info: *mut c_void) {
         // a frame loop that does not run.
         objc::fail!("-[CADisplayLink]: the target does not respond to its selector");
     };
+    objc::arc::retain(object);
     // SAFETY: a display link action is `void (id, SEL, CADisplayLink *)`.
     unsafe {
         let f: unsafe extern "C" fn(Id, Sel, Id) = std::mem::transmute(method.implementation());
         f(target, selector, object);
     }
+    objc::arc::release(object);
 }
 
 /// Put the link on the main loop at its current interval.
