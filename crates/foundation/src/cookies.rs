@@ -676,7 +676,7 @@ unsafe extern "C" fn shared_storage(class: Id, _sel: Sel) -> Id {
                 0,
             )
         };
-        objc::arc::retain(storage);
+        objc::arc::make_immortal(storage);
         storage as usize
     }) as Id
 }
