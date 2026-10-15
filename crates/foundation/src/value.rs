@@ -54,7 +54,7 @@ unsafe extern "C" fn null(class: Id, _sel: Sel) -> Id {
         };
         // Retained forever: a singleton that could be deallocated is one a guest
         // can make dangle by releasing what it never owned.
-        objc::arc::retain(object);
+        objc::arc::make_immortal(object);
         object as usize
     }) as Id
 }
