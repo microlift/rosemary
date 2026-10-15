@@ -794,7 +794,7 @@ unsafe extern "C" fn shared_session(_class: Id, _sel: Sel) -> Id {
         let session = make(session_class(), Session { delegate: 0 });
         // Retained forever: a singleton a guest can release is one it can make
         // dangle by releasing what it never owned.
-        objc::arc::retain(session);
+        objc::arc::make_immortal(session);
         session as usize
     }) as Id
 }
