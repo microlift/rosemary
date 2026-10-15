@@ -78,7 +78,7 @@ fn singleton(name: &str, red: f64, green: f64, blue: f64, alpha: f64) -> Id {
     let color = allocate(red, green, blue, alpha);
     // Retained forever: a named colour a guest can release is one it can make
     // dangle, and these are handed out unowned.
-    objc::arc::retain(color);
+    objc::arc::make_immortal(color);
     colors.push((name.to_string(), color as usize));
     color
 }
