@@ -43,6 +43,12 @@ pub unsafe extern "C" fn cxa_atexit(func: *const (), arg: *mut c_void, dso: *con
     crate::exit::register(handler, arg, dso as u64, func as u64)
 }
 
+pub extern "C" fn exit(status: c_int) -> ! {
+    crate::exit::finalize(0);
+    // SAFETY: ends the process; the remaining host handlers run as usual.
+    unsafe { libc::exit(status) }
+}
+
 /// `void __cxa_finalize(void *dso)`
 pub extern "C" fn cxa_finalize(dso: *const ()) {
     crate::exit::finalize(dso as u64);
@@ -456,6 +462,7 @@ exports::exports! {
         "atexit_b" => atexit_b,
         "__cxa_atexit" => cxa_atexit,
         "__cxa_finalize" => cxa_finalize,
+        "exit" => exit,
         "pthread_atfork" => pthread_atfork,
         "__assert_rtn" => assert_rtn,
         "srandomdev" => srandomdev,
