@@ -1,5 +1,6 @@
 #![allow(clippy::missing_safety_doc, clippy::not_unsafe_ptr_arg_deref)]
 
+mod address;
 pub mod allocator;
 pub mod api;
 pub mod arc;
@@ -220,6 +221,36 @@ mod tests {
     use super::*;
 
     #[test]
+    fn only_a_class_itself_is_known() {
+        bootstrap();
+        let nsobject = class::lookup(c"NSObject").expect("NSObject");
+        let as_ptr = |c: &'static class::Class| std::ptr::from_ref(c);
+        assert!(class::is_known(as_ptr(nsobject)));
+        assert!(class::is_known(as_ptr(nsobject.metaclass())));
+        let instance = object::create_instance(nsobject, 0);
+        assert!(!class::is_known(instance as *const class::Class));
+        let inside = (as_ptr(nsobject) as usize + 8) as *const class::Class;
+        assert!(!class::is_known(inside));
+        assert!(!class::is_known(std::ptr::null()));
+    }
+
+    #[test]
+    fn an_immortal_object_survives_being_over_released() {
+        bootstrap();
+        let nsobject = class::lookup(c"NSObject").expect("NSObject");
+        let object = object::create_instance(nsobject, 0);
+        arc::make_immortal(object);
+        for _ in 0..1000 {
+            arc::release(object);
+        }
+        assert!(arc::retain_count(object) > 1000);
+        assert!(std::ptr::eq(
+            unsafe { object::class_of(object) }.unwrap(),
+            nsobject
+        ));
+    }
+
+    #[test]
     fn nsobject_is_installed_and_its_metaclass_chain_terminates() {
         bootstrap();
         let nsobject = class::lookup(c"NSObject").expect("NSObject is this runtime's own");
@@ -303,6 +334,24 @@ mod invariants {
             "the probe did not move, so a cached dispatch plan would stay stale"
         );
         assert_eq!(after, second as *const c_void);
+    }
+
+    #[test]
+    fn a_method_added_to_a_superclass_later_is_found_from_the_subclass() {
+        let base = class_named(c"RosemaryMethodCacheBase");
+        let derived = class::allocate_pair(Some(base), c"RosemaryMethodCacheSub", 0).unwrap();
+        class::register_pair(derived);
+        let sel = sel::get("lateAnswer");
+        assert!(derived.method(sel).is_none());
+        assert!(base.add_method(sel, first as *const c_void, c"Q16@0:8"));
+        assert_eq!(
+            derived.method(sel).map(|m| m.implementation()),
+            Some(first as *const c_void)
+        );
+        assert_eq!(
+            derived.method(sel).map(|m| m.implementation()),
+            Some(first as *const c_void)
+        );
     }
 
     /// A subclass overriding a superclass's method moves the probe too, which is
