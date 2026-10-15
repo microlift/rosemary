@@ -237,15 +237,18 @@ fn release() -> String {
 /// question and must not get two answers. Darwin 20 is macOS 11 and each is one
 /// apart after that; before it, every Darwin was some 10.x.
 pub fn macos_version() -> (i32, i32, i32) {
-    let release = release();
-    let mut parts = release.split('.').map(|p| p.parse::<i32>().unwrap_or(0));
-    let darwin = parts.next().unwrap_or(24);
-    let minor = parts.next().unwrap_or(0);
-    let patch = parts.next().unwrap_or(0);
-    match darwin >= 20 {
-        true => (darwin - 9, minor, patch),
-        false => (10, darwin - 4, minor),
-    }
+    static VERSION: std::sync::OnceLock<(i32, i32, i32)> = std::sync::OnceLock::new();
+    *VERSION.get_or_init(|| {
+        let release = release();
+        let mut parts = release.split('.').map(|p| p.parse::<i32>().unwrap_or(0));
+        let darwin = parts.next().unwrap_or(24);
+        let minor = parts.next().unwrap_or(0);
+        let patch = parts.next().unwrap_or(0);
+        match darwin >= 20 {
+            true => (darwin - 9, minor, patch),
+            false => (10, darwin - 4, minor),
+        }
+    })
 }
 
 /// `kern.osproductversion`, spelled as macOS does: no patch component when it is 0.
