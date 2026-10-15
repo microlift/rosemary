@@ -240,6 +240,7 @@ struct Api {
         Option<unsafe extern "C" fn(u32, *mut c_int) -> *mut *mut DisplayMode>,
 
     SDL_PollEvent: Option<unsafe extern "C" fn(*mut Event) -> bool>,
+    SDL_PeepEvents: Option<unsafe extern "C" fn(*mut Event, c_int, c_int, u32, u32) -> c_int>,
     SDL_WaitEventTimeout: Option<unsafe extern "C" fn(*mut Event, i32) -> bool>,
     SDL_StartTextInput: Option<unsafe extern "C" fn(Window) -> bool>,
     SDL_StopTextInput: Option<unsafe extern "C" fn(Window) -> bool>,
@@ -469,6 +470,7 @@ fn api() -> Option<&'static Api> {
             SDL_GetDisplayName,
             SDL_GetFullscreenDisplayModes,
             SDL_PollEvent,
+            SDL_PeepEvents,
             SDL_WaitEventTimeout,
             SDL_StartTextInput,
             SDL_StopTextInput,
@@ -1167,6 +1169,134 @@ pub mod clipboard {
     }
 }
 
+pub mod dialog {
+    use super::*;
+    use std::sync::{Arc, Mutex};
+
+    pub enum Kind {
+        Open { many: bool },
+        Save,
+        Folder { many: bool },
+    }
+
+    pub type Answer = Arc<Mutex<Option<Vec<Vec<u8>>>>>;
+
+    #[repr(C)]
+    struct Filter {
+        name: *const c_char,
+        pattern: *const c_char,
+    }
+
+    struct Request {
+        answer: Answer,
+        _names: Vec<CString>,
+        _patterns: Vec<CString>,
+        filters: Vec<Filter>,
+        default: Option<CString>,
+    }
+
+    unsafe extern "C" fn answered(
+        userdata: *mut c_void,
+        files: *const *const c_char,
+        _filter: c_int,
+    ) {
+        // SAFETY: the box `show` leaked; SDL answers each request once.
+        let request = unsafe { Box::from_raw(userdata as *mut Request) };
+        let mut paths = Vec::new();
+        let mut at = files;
+        // SAFETY: null on failure, else a null-terminated list of C strings.
+        unsafe {
+            while !at.is_null() && !(*at).is_null() {
+                paths.push(CStr::from_ptr(*at).to_bytes().to_vec());
+                at = at.add(1);
+            }
+        }
+        *request.answer.lock().unwrap_or_else(|e| e.into_inner()) = Some(paths);
+    }
+
+    pub fn show(
+        kind: Kind,
+        window: Window,
+        filters: &[(String, String)],
+        default: Option<&[u8]>,
+    ) -> Option<Answer> {
+        type Show = unsafe extern "C" fn(
+            unsafe extern "C" fn(*mut c_void, *const *const c_char, c_int),
+            *mut c_void,
+            Window,
+            *const Filter,
+            c_int,
+            *const c_char,
+            bool,
+        );
+        type Save = unsafe extern "C" fn(
+            unsafe extern "C" fn(*mut c_void, *const *const c_char, c_int),
+            *mut c_void,
+            Window,
+            *const Filter,
+            c_int,
+            *const c_char,
+        );
+        type Folder = unsafe extern "C" fn(
+            unsafe extern "C" fn(*mut c_void, *const *const c_char, c_int),
+            *mut c_void,
+            Window,
+            *const c_char,
+            bool,
+        );
+        let handle = library()?;
+        let names: Vec<CString> = filters
+            .iter()
+            .filter_map(|(name, _)| CString::new(name.as_str()).ok())
+            .collect();
+        let patterns: Vec<CString> = filters
+            .iter()
+            .filter_map(|(_, pattern)| CString::new(pattern.as_str()).ok())
+            .collect();
+        let filters = names
+            .iter()
+            .zip(&patterns)
+            .map(|(name, pattern)| Filter {
+                name: name.as_ptr(),
+                pattern: pattern.as_ptr(),
+            })
+            .collect();
+        let answer = Answer::default();
+        let request = Box::new(Request {
+            answer: answer.clone(),
+            _names: names,
+            _patterns: patterns,
+            filters,
+            default: default.and_then(|path| CString::new(path).ok()),
+        });
+        let location = request.default.as_ref().map_or(std::ptr::null(), |p| p.as_ptr());
+        let (list, count) = (request.filters.as_ptr(), request.filters.len() as c_int);
+        let list = if count == 0 { std::ptr::null() } else { list };
+        // SAFETY: SDL3 declares these prototypes; the request stays alive until
+        // `answered` takes it back.
+        unsafe {
+            match kind {
+                Kind::Open { many } => {
+                    let show = entry::<Show>(handle, "SDL_ShowOpenFileDialog")?;
+                    let userdata = Box::into_raw(request).cast();
+                    show(answered, userdata, window, list, count, location, many);
+                }
+                Kind::Save => {
+                    let show = entry::<Save>(handle, "SDL_ShowSaveFileDialog")?;
+                    let userdata = Box::into_raw(request).cast();
+                    show(answered, userdata, window, list, count, location);
+                }
+                Kind::Folder { many } => {
+                    let show = entry::<Folder>(handle, "SDL_ShowOpenFolderDialog")?;
+                    let userdata = Box::into_raw(request).cast();
+                    show(answered, userdata, window, location, many);
+                }
+            }
+        }
+        Some(answer)
+    }
+}
+
 pub mod virtual_joystick {
     use super::*;
 
@@ -1737,6 +1867,25 @@ pub mod video {
             return None;
         }
         Some(translate(&raw))
+    }
+
+    pub fn take_next_text() -> Option<String> {
+        let peep = api()?.SDL_PeepEvents?;
+        let mut raw = super::Event::default();
+        // SAFETY: room for one event; `SDL_PEEKEVENT` over every type.
+        if unsafe { peep(&mut raw, 1, 1, 0, u32::MAX) } != 1
+            || kind(&raw) != event_type::TEXT_INPUT
+        {
+            return None;
+        }
+        // SAFETY: as above, `SDL_GETEVENT`, now that it is known to be text.
+        if unsafe { peep(&mut raw, 1, 2, event_type::TEXT_INPUT, event_type::TEXT_INPUT) } != 1 {
+            return None;
+        }
+        match translate(&raw) {
+            Event::Text { text, .. } => Some(text),
+            _ => None,
+        }
     }
 
     /// The next event, waiting up to `milliseconds` for one: for a loop with
