@@ -1,4 +1,4 @@
-use std::ffi::{c_char, c_int, c_uint, c_void};
+use std::ffi::{CStr, c_char, c_int, c_uint, c_void};
 use std::sync::atomic::{AtomicI32, Ordering};
 
 /// POSIX's distinguished `(locale_t)-1`, omitted by the Rust libc bindings on
@@ -73,13 +73,49 @@ pub unsafe extern "C" fn setlocale(category: c_int, locale: *const c_char) -> *m
         crate::errno::set(libc::EINVAL);
         return core::ptr::null_mut();
     };
-    // SAFETY: the caller's string and the translated host category.
-    let name = unsafe { libc::setlocale(category, locale) };
+    // SAFETY: the caller's string, which is null or NUL-terminated.
+    let name = if !locale.is_null() && unsafe { *locale } == 0 {
+        unsafe { set_from_guest_environment(category) }
+    } else {
+        // SAFETY: the caller's string and the translated host category.
+        unsafe { libc::setlocale(category, locale) }
+    };
     if !name.is_null() && (category == libc::LC_ALL || category == libc::LC_CTYPE) {
         let max = unsafe { plain::__ctype_get_mb_cur_max() };
         MB_CUR_MAX.store(max as c_int, Ordering::Relaxed);
     }
     name
+}
+
+unsafe fn set_from_guest_environment(category: c_int) -> *mut c_char {
+    const CATEGORIES: [(c_int, &CStr); 6] = [
+        (libc::LC_COLLATE, c"LC_COLLATE"),
+        (libc::LC_CTYPE, c"LC_CTYPE"),
+        (libc::LC_MONETARY, c"LC_MONETARY"),
+        (libc::LC_NUMERIC, c"LC_NUMERIC"),
+        (libc::LC_TIME, c"LC_TIME"),
+        (libc::LC_MESSAGES, c"LC_MESSAGES"),
+    ];
+    let guest = |name: &CStr| {
+        // SAFETY: a NUL-terminated name; the answer is null or a guest string.
+        let value = unsafe { crate::env::getenv(name.as_ptr()) };
+        (!value.is_null() && unsafe { *value } != 0).then_some(value as *const c_char)
+    };
+    for (host, variable) in CATEGORIES {
+        if category != libc::LC_ALL && category != host {
+            continue;
+        }
+        let name = guest(c"LC_ALL")
+            .or_else(|| guest(variable))
+            .or_else(|| guest(c"LANG"))
+            .unwrap_or(c"C".as_ptr());
+        // SAFETY: a NUL-terminated name and a host category.
+        if unsafe { libc::setlocale(host, name) }.is_null() {
+            return core::ptr::null_mut();
+        }
+    }
+    // SAFETY: a query, which changes nothing.
+    unsafe { libc::setlocale(category, core::ptr::null()) }
 }
 
 /// Darwin's `int __mb_cur_max`, the global `MB_CUR_MAX` read before it became
@@ -845,6 +881,23 @@ exports::exports! {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_empty_name_reads_the_guests_environment() {
+        // SAFETY: NUL-terminated names; the locale is put back below.
+        unsafe {
+            for name in [c"LC_ALL", c"LC_NUMERIC", c"LANG"] {
+                crate::env::unsetenv(name.as_ptr());
+            }
+            let set = setlocale(category::NUMERIC, c"".as_ptr());
+            assert_eq!(CStr::from_ptr(set), c"C");
+            crate::env::setenv(c"LC_NUMERIC".as_ptr(), c"C.UTF-8".as_ptr(), 1);
+            let set = setlocale(category::NUMERIC, c"".as_ptr());
+            assert_eq!(CStr::from_ptr(set), c"C.UTF-8");
+            crate::env::unsetenv(c"LC_NUMERIC".as_ptr());
+            libc::setlocale(libc::LC_NUMERIC, c"C".as_ptr());
+        }
+    }
 
     /// The switch is undone even when the wrapped call fails, which is the whole
     /// reason it is a guard: a thread left in the guest's locale formats every
