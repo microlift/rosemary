@@ -268,7 +268,7 @@ fn make_drawable(
         Drawable {
             gpu,
             texture,
-            layer,
+            layer: objc::arc::retain(layer),
             readback: None,
         },
     );
@@ -294,8 +294,10 @@ fn retire_stale(cache: &mut Vec<Cached>) {
     reclaim_dropped(cache);
     let mut index = 0;
     while index < cache.len() {
-        if cache[index].stale
-            && cache[index]
+        let entry = &cache[index];
+        let abandoned = objc::arc::retain_count(entry.layer as Id) <= entry.slots.len();
+        if (entry.stale || abandoned)
+            && entry
                 .slots
                 .iter()
                 .all(|slot| slot.state == SlotState::Available)
@@ -371,6 +373,7 @@ unsafe extern "C" fn drawable_dealloc(receiver: Id, _sel: Sel) {
         &mut drawable.texture,
         std::ptr::null_mut(),
     ));
+    objc::arc::release(std::mem::replace(&mut drawable.layer, std::ptr::null_mut()));
     // SAFETY: the body was established by `object::make` and is not read again.
     unsafe { std::ptr::drop_in_place(drawable as *mut Drawable) };
     objc::arc::finalize(receiver);
