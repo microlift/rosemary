@@ -68,7 +68,7 @@ pub(crate) fn screen_object(class_name: &std::ffi::CStr, display: u32) -> Id {
     unsafe { (*screen).display = display as usize };
     // Retained forever: a screen a guest can release is one it can make dangle,
     // and these are handed out unowned by `+mainScreen`.
-    objc::arc::retain(screen as Id);
+    objc::arc::make_immortal(screen as Id);
     screens.push((class_name.to_owned(), display, screen as usize));
     screen as Id
 }
@@ -1381,6 +1381,12 @@ pub unsafe extern "C" fn CGWarpMouseCursorPosition(point: foundation::geometry::
     };
     crate::event::note_warp_delta(moved.0, moved.1);
     crate::event::warp_pointer(local.0, local.1);
+    if mouse_is_associated()
+        && let Some(window) = target
+        && recentre(window, point)
+    {
+        return 0;
+    }
 
     let relative: Vec<_> = windows
         .iter()
@@ -1471,6 +1477,87 @@ fn remember_relative_warp(point: (f32, f32)) {
 
 fn forget_relative_warp() {
     *RELATIVE_WARP.lock().unwrap_or_else(|e| e.into_inner()) = None;
+}
+
+#[derive(Clone, Copy)]
+struct Recentring {
+    window: usize,
+    target: (f32, f32),
+    at: std::time::Instant,
+    active: bool,
+}
+
+static RECENTRING: std::sync::Mutex<Option<Recentring>> = std::sync::Mutex::new(None);
+
+const RECENTRE_WITHIN: std::time::Duration = std::time::Duration::from_millis(250);
+const RECENTRE_IDLE: std::time::Duration = std::time::Duration::from_millis(300);
+
+fn recentre(window: sdl3::Window, point: (f32, f32)) -> bool {
+    let now = std::time::Instant::now();
+    let mut state = RECENTRING.lock().unwrap_or_else(|e| e.into_inner());
+    let same = state.filter(|r| r.window == window as usize);
+    match same {
+        Some(r) if r.active => {
+            *state = Some(Recentring {
+                target: point,
+                at: now,
+                ..r
+            });
+            return true;
+        }
+        Some(r)
+            if now - r.at < RECENTRE_WITHIN
+                && (r.target.0 - point.0).abs() < 0.5
+                && (r.target.1 - point.1).abs() < 0.5 =>
+        {
+            sdl3::video::set_hint(sdl3::video::HINT_RELATIVE_CURSOR_VISIBLE, c"1");
+            if sdl3::video::set_relative_mouse_mode(window, true) {
+                forget_relative_warp();
+                *state = Some(Recentring {
+                    at: now,
+                    active: true,
+                    ..r
+                });
+                return true;
+            }
+        }
+        _ => {}
+    }
+    *state = Some(Recentring {
+        window: window as usize,
+        target: point,
+        at: now,
+        active: false,
+    });
+    false
+}
+
+pub(crate) fn recentring() -> bool {
+    RECENTRING
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .is_some_and(|r| r.active)
+}
+
+pub(crate) fn end_recentring_if_idle() -> bool {
+    let ended = {
+        let mut state = RECENTRING.lock().unwrap_or_else(|e| e.into_inner());
+        match *state {
+            Some(r) if r.active && r.at.elapsed() > RECENTRE_IDLE => state.take(),
+            _ => None,
+        }
+    };
+    let Some(r) = ended else {
+        return false;
+    };
+    let window = r.window as sdl3::Window;
+    let local = crate::event::pointer_position();
+    sdl3::video::warp_mouse_in_window(window, local.0, local.1);
+    sdl3::video::set_relative_mouse_mode(window, false);
+    let origin = crate::window::global_position(window).unwrap_or((0, 0));
+    let global = (local.0 + origin.0 as f32, local.1 + origin.1 as f32);
+    warp_physical(Some(window), global, local);
+    true
 }
 
 /// `CGError CGAssociateMouseAndMouseCursorPosition(boolean_t connected)`.
@@ -1672,8 +1759,8 @@ fn end_edge_hold() {
 /// Called again when a window takes focus, because SDL leaves the mode when
 /// focus goes and a window made after the guest disassociated never had it.
 pub fn apply_mouse_association() {
-    // From here the association decides relative mode, an edge hold included.
     *EDGE_HOLD.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    *RECENTRING.lock().unwrap_or_else(|e| e.into_inner()) = None;
     let relative = !mouse_is_associated();
     // Disassociating is not hiding: on macOS the cursor stays on screen where
     // it was, and only `+[NSCursor hide]` takes it away - which this tree
