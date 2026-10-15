@@ -578,6 +578,18 @@ fn fit_content_view_to(object: Id, width: i32, height: i32) {
     }
 }
 
+pub(crate) fn forget_responder(responder: Id) {
+    for window in all() {
+        let window = window_of(window);
+        if window.first_responder == responder {
+            window.first_responder = std::ptr::null_mut();
+        }
+        if window.initial_first_responder == responder {
+            window.initial_first_responder = std::ptr::null_mut();
+        }
+    }
+}
+
 /// A window's own first responder, nil when it has none - not the window
 /// itself, which is what `-firstResponder` answers then.
 pub fn first_responder_of(object: Id) -> Id {
@@ -2269,6 +2281,14 @@ unsafe extern "C" fn yes_with_object(_receiver: Id, _sel: Sel, _object: Id) -> u
     1
 }
 
+unsafe extern "C" fn visible_occlusion(_receiver: Id, _sel: Sel) -> u64 {
+    1 << 1
+}
+
+unsafe extern "C" fn zero_border(_receiver: Id, _sel: Sel, _edge: usize) -> f64 {
+    0.0
+}
+
 unsafe extern "C" fn nil(_receiver: Id, _sel: Sel) -> Id {
     std::ptr::null_mut()
 }
@@ -2420,6 +2440,7 @@ pub(crate) fn install() {
         "orderFront:" => make_key_and_order_front, c"v24@0:8@16";
         "orderFrontRegardless" => order_front_regardless, c"v16@0:8";
         "orderOut:" => order_out, c"v24@0:8@16";
+        "endSheet:" => ignored_object, c"v24@0:8@16";
         "close" => close, c"v16@0:8";
         "dealloc" => dealloc, c"v16@0:8";
         "performClose:" => perform_close, c"v24@0:8@16";
@@ -2447,6 +2468,12 @@ pub(crate) fn install() {
         "isOpaque" => yes, c"c16@0:8";
         "setOpaque:" => ignored_flag, c"v20@0:8c16";
         "setHidesOnDeactivate:" => ignored_flag, c"v20@0:8c16";
+        "hidesOnDeactivate" => no, c"c16@0:8";
+        "orderBack:" => ignored_object, c"v24@0:8@16";
+        "occlusionState" => visible_occlusion, c"Q16@0:8";
+        "setToolbar:" => ignored_object, c"v24@0:8@16";
+        "contentBorderThicknessForEdge:" => zero_border, c"d24@0:8Q16";
+        "setDefaultButtonCell:" => ignored_object, c"v24@0:8@16";
         "setRestorable:" => ignored_flag, c"v20@0:8c16";
         // No state restoration, so nothing ever asks the class to restore.
         "setRestorationClass:" => ignored_integer, c"v24@0:8#16";
@@ -3029,5 +3056,19 @@ mod tests {
         let answered = unsafe { make_first_responder(window, objc::sel::get("x"), engine) };
         assert_eq!(answered, 1);
         assert_eq!(window_of(window).first_responder, handler);
+    }
+
+    #[test]
+    fn a_freed_first_responder_is_forgotten() {
+        crate::bootstrap();
+        let window =
+            objc::object::create_instance(objc::class::lookup(c"NSWindow").expect("NSWindow"), 0);
+        let view =
+            objc::object::create_instance(objc::class::lookup(c"NSView").expect("NSView"), 0);
+        WINDOWS.lock().unwrap().push((0, window as usize));
+        window_of(window).first_responder = view;
+        objc::arc::release(view);
+        WINDOWS.lock().unwrap().retain(|(_, w)| *w != window as usize);
+        assert!(window_of(window).first_responder.is_null());
     }
 }
