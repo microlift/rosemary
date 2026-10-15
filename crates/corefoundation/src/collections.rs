@@ -420,7 +420,7 @@ pub fn boolean(value: bool) -> CFTypeRef {
             kind: number_type::CHAR,
         };
         let object = make(boolean_class(), body);
-        objc::arc::retain(object as objc::object::Id);
+        objc::arc::make_immortal(object as objc::object::Id);
         object as usize
     }) as CFTypeRef
 }
