@@ -22,7 +22,10 @@ fn block() -> std::sync::MutexGuard<'static, bool> {
         return initialized;
     }
     let entries = handed_off().unwrap_or_else(|| {
-        let host: Vec<_> = std::env::vars_os().collect();
+        let app = APP_LAUNCH.load(std::sync::atomic::Ordering::Relaxed);
+        let host: Vec<_> = std::env::vars_os()
+            .filter(|(name, _)| !(app && is_locale_var(name.as_encoded_bytes())))
+            .collect();
         initial(&host, &guest_value)
     });
     let entries: Vec<_> = entries
@@ -54,7 +57,17 @@ const BASELINE: &[&str] = &["HOME", "USER", "LOGNAME", "SHELL", "PATH", "TMPDIR"
 /// which describe the user rather than the host's software, and which a
 /// command-line guest is lost without.
 fn passes_through(name: &[u8]) -> bool {
-    matches!(name, b"TERM" | b"COLORTERM" | b"LANG") || name.starts_with(b"LC_")
+    matches!(name, b"TERM" | b"COLORTERM") || is_locale_var(name)
+}
+
+fn is_locale_var(name: &[u8]) -> bool {
+    name == b"LANG" || name.starts_with(b"LC_")
+}
+
+static APP_LAUNCH: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+pub fn launch_as_app() {
+    APP_LAUNCH.store(true, std::sync::atomic::Ordering::Relaxed);
 }
 
 /// The starting block of a guest no other guest launched, as `NAME=VALUE`.
