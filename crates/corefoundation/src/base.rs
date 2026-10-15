@@ -272,7 +272,7 @@ pub fn interned_name(text: &str) -> u64 {
     }
     let object = crate::string::from_bytes(text.as_bytes(), false);
     // Retained forever: a global a guest may release is one it can make dangle.
-    objc::arc::retain(object as objc::object::Id);
+    objc::arc::make_immortal(object as objc::object::Id);
     let address = object as usize as u64;
     strings.push((text.to_string(), address));
     address
