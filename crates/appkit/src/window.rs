@@ -24,9 +24,10 @@ pub struct Window {
     /// `NSWindowCollectionBehavior`, which a program reads back to decide
     /// whether it may go full screen.
     collection_behavior: usize,
+    /// Weak: a responder freed while it has focus must not leave this dangling.
     first_responder: Id,
-    /// `-initialFirstResponder`, a nib outlet and so not retained: made the
-    /// first responder when the window is first ordered front without one.
+    /// `-initialFirstResponder`, a nib outlet and so weak, not retained: made
+    /// the first responder when the window is first ordered front without one.
     initial_first_responder: Id,
     /// `-setNextResponder:`, unretained; a window has none until given one.
     next_responder: Id,
@@ -77,6 +78,11 @@ pub struct Window {
     title_visibility: isize,
     /// `-windowController`, not retained: the controller owns the window.
     window_controller: Id,
+    /// `-setHidesOnDeactivate:`, kept so a program reads back what it set.
+    hides_on_deactivate: usize,
+    /// When this window was last ordered front, from [`ORDERED`]: the stacking
+    /// order, which creation order is not.
+    ordered: u64,
 }
 
 pub const INSTANCE_SIZE: usize = size_of::<Window>();
@@ -417,6 +423,16 @@ pub fn sdl_windows() -> Vec<sdl3::Window> {
         .collect()
 }
 
+/// The last value handed to [`Window::ordered`].
+static ORDERED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Every shown window, frontmost first.
+pub(crate) fn front_to_back() -> Vec<Id> {
+    let mut windows: Vec<Id> = all().into_iter().filter(|w| is_shown(*w)).collect();
+    windows.sort_by_key(|w| std::cmp::Reverse(window_of(*w).ordered));
+    windows
+}
+
 /// Every window this crate has made, most recent last.
 pub fn all() -> Vec<Id> {
     WINDOWS
@@ -575,18 +591,6 @@ fn fit_content_view_to(object: Id, width: i32, height: i32) {
     unsafe {
         let f: unsafe extern "C" fn(Id, Sel, NSRect) = std::mem::transmute(objc::msg::entry());
         f(window.content_view, objc::sel::get("setFrame:"), frame);
-    }
-}
-
-pub(crate) fn forget_responder(responder: Id) {
-    for window in all() {
-        let window = window_of(window);
-        if window.first_responder == responder {
-            window.first_responder = std::ptr::null_mut();
-        }
-        if window.initial_first_responder == responder {
-            window.initial_first_responder = std::ptr::null_mut();
-        }
     }
 }
 
@@ -1414,6 +1418,7 @@ fn order_front(receiver: Id, make_key: bool) {
         sdl3::video::raise_window(sdl);
     }
     window_of(receiver).shown = 1;
+    window_of(receiver).ordered = ORDERED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
     trace!(
         "{receiver:p} shown at sdl {:?} size {:?}",
         sdl3::video::window_position(sdl),
@@ -1479,6 +1484,8 @@ unsafe extern "C" fn dealloc(receiver: Id, sel: Sel) {
     ));
     // SAFETY: `-orderOut:` is `void (id, SEL, id)`; it also gives up key status.
     unsafe { order_out(receiver, sel, std::ptr::null_mut()) };
+    objc::arc::destroy_weak(&mut window.first_responder);
+    objc::arc::destroy_weak(&mut window.initial_first_responder);
     WINDOWS
         .lock()
         .unwrap_or_else(|e| e.into_inner())
@@ -1694,6 +1701,14 @@ unsafe extern "C" fn becomes_key_only_if_needed(receiver: Id, _sel: Sel) -> u8 {
 
 unsafe extern "C" fn set_becomes_key_only_if_needed(receiver: Id, _sel: Sel, value: u8) {
     window_of(receiver).becomes_key_only_if_needed = value as usize;
+}
+
+unsafe extern "C" fn hides_on_deactivate(receiver: Id, _sel: Sel) -> u8 {
+    (window_of(receiver).hides_on_deactivate != 0) as u8
+}
+
+unsafe extern "C" fn set_hides_on_deactivate(receiver: Id, _sel: Sel, value: u8) {
+    window_of(receiver).hides_on_deactivate = value as usize;
 }
 
 unsafe extern "C" fn is_key_window(receiver: Id, _sel: Sel) -> u8 {
@@ -1922,7 +1937,7 @@ unsafe extern "C" fn set_next_responder(receiver: Id, _sel: Sel, responder: Id) 
 }
 
 unsafe extern "C" fn set_initial_first_responder(receiver: Id, _sel: Sel, responder: Id) {
-    window_of(receiver).initial_first_responder = responder;
+    objc::arc::store_weak(&mut window_of(receiver).initial_first_responder, responder);
 }
 
 unsafe extern "C" fn initial_first_responder(receiver: Id, _sel: Sel) -> Id {
@@ -1948,7 +1963,7 @@ unsafe extern "C" fn make_first_responder(receiver: Id, _sel: Sel, responder: Id
     if !unsafe { responder_agrees(current, "resignFirstResponder") } {
         return 0;
     }
-    window_of(receiver).first_responder = responder;
+    objc::arc::store_weak(&mut window_of(receiver).first_responder, responder);
     if unsafe { responder_agrees(responder, "becomeFirstResponder") } {
         update_text_input(receiver);
         return 1;
@@ -1956,7 +1971,10 @@ unsafe extern "C" fn make_first_responder(receiver: Id, _sel: Sel, responder: Id
     // A refusal leaves the window itself as the responder, which is the null
     // this file spells it with - unless the refusal already moved it on.
     if window_of(receiver).first_responder == responder {
-        window_of(receiver).first_responder = std::ptr::null_mut();
+        objc::arc::store_weak(
+            &mut window_of(receiver).first_responder,
+            std::ptr::null_mut(),
+        );
     }
     update_text_input(receiver);
     0
@@ -2281,7 +2299,8 @@ unsafe extern "C" fn yes_with_object(_receiver: Id, _sel: Sel, _object: Id) -> u
     1
 }
 
-unsafe extern "C" fn visible_occlusion(_receiver: Id, _sel: Sel) -> u64 {
+/// `NSWindowOcclusionStateVisible`: no compositor here reports occlusion.
+pub(crate) unsafe extern "C" fn visible_occlusion(_receiver: Id, _sel: Sel) -> u64 {
     1 << 1
 }
 
@@ -2467,8 +2486,8 @@ pub(crate) fn install() {
         "setReleasedWhenClosed:" => ignored_flag, c"v20@0:8c16";
         "isOpaque" => yes, c"c16@0:8";
         "setOpaque:" => ignored_flag, c"v20@0:8c16";
-        "setHidesOnDeactivate:" => ignored_flag, c"v20@0:8c16";
-        "hidesOnDeactivate" => no, c"c16@0:8";
+        "setHidesOnDeactivate:" => set_hides_on_deactivate, c"v20@0:8c16";
+        "hidesOnDeactivate" => hides_on_deactivate, c"c16@0:8";
         "orderBack:" => ignored_object, c"v24@0:8@16";
         "occlusionState" => visible_occlusion, c"Q16@0:8";
         "setToolbar:" => ignored_object, c"v24@0:8@16";
@@ -3065,10 +3084,9 @@ mod tests {
             objc::object::create_instance(objc::class::lookup(c"NSWindow").expect("NSWindow"), 0);
         let view =
             objc::object::create_instance(objc::class::lookup(c"NSView").expect("NSView"), 0);
-        WINDOWS.lock().unwrap().push((0, window as usize));
-        window_of(window).first_responder = view;
+        objc::arc::store_weak(&mut window_of(window).first_responder, view);
         objc::arc::release(view);
-        WINDOWS.lock().unwrap().retain(|(_, w)| *w != window as usize);
         assert!(window_of(window).first_responder.is_null());
+        objc::arc::destroy_weak(&mut window_of(window).first_responder);
     }
 }

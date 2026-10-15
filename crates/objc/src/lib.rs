@@ -235,6 +235,22 @@ mod tests {
     }
 
     #[test]
+    fn an_immortal_object_survives_being_over_released() {
+        bootstrap();
+        let nsobject = class::lookup(c"NSObject").expect("NSObject");
+        let object = object::create_instance(nsobject, 0);
+        arc::make_immortal(object);
+        for _ in 0..1000 {
+            arc::release(object);
+        }
+        assert!(arc::retain_count(object) > 1000);
+        assert!(std::ptr::eq(
+            unsafe { object::class_of(object) }.unwrap(),
+            nsobject
+        ));
+    }
+
+    #[test]
     fn nsobject_is_installed_and_its_metaclass_chain_terminates() {
         bootstrap();
         let nsobject = class::lookup(c"NSObject").expect("NSObject is this runtime's own");

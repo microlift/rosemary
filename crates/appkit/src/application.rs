@@ -32,6 +32,8 @@ pub struct Application {
     /// How deep the modal nesting is, so `-stopModal` ends one session rather
     /// than all of them.
     modal_depth: usize,
+    /// What the innermost stopped session answers: `-stopModalWithCode:`'s code.
+    modal_code: isize,
 }
 
 pub const INSTANCE_SIZE: usize = size_of::<Application>();
@@ -341,7 +343,7 @@ fn register_common_modes() {
     });
 }
 
-pub(crate) const MODAL_PANEL_MODE: &str = "NSModalPanelRunLoopMode";
+const MODAL_PANEL_MODE: &str = "NSModalPanelRunLoopMode";
 
 /// One turn of the main thread's loop in `mode`: what `-run` does each time
 /// round, and what `-runModalSession:` does once.
@@ -349,10 +351,17 @@ pub(crate) const MODAL_PANEL_MODE: &str = "NSModalPanelRunLoopMode";
 /// # Safety
 ///
 /// `receiver` must be an application.
-pub(crate) unsafe fn turn(receiver: Id, mode: &str) {
-    let pool = objc::arc::pool_push();
+unsafe fn turn(receiver: Id, mode: &str) {
+    // Popped on unwind too: a skipped pop would leave the next one draining
+    // the wrong pool.
+    struct Pool(*mut c_void);
+    impl Drop for Pool {
+        fn drop(&mut self) {
+            objc::arc::pool_pop(self.0);
+        }
+    }
+    let _pool = Pool(objc::arc::pool_push());
     unsafe { turn_in_pool(receiver, mode) };
-    objc::arc::pool_pop(pool);
 }
 
 unsafe fn turn_in_pool(receiver: Id, mode: &str) {
@@ -611,16 +620,11 @@ unsafe extern "C" fn enumerate_windows(_receiver: Id, _sel: Sel, options: u64, b
     let Some(invoke) = (unsafe { crate::animation::invoke(block) }) else {
         return;
     };
-    let mut windows = crate::window::all();
-    if options & 1 != 0 {
-        windows.retain(|window| crate::window::is_shown(*window));
-        windows.reverse();
-        let key = crate::window::key_window();
-        if let Some(at) = windows.iter().position(|w| *w == key) {
-            let key = windows.remove(at);
-            windows.insert(0, key);
-        }
-    }
+    // `NSWindowListOrderedFrontToBack`.
+    let windows = match options & 1 != 0 {
+        true => crate::window::front_to_back(),
+        false => crate::window::all(),
+    };
     for window in &windows {
         objc::arc::retain(*window);
     }
@@ -830,18 +834,16 @@ unsafe extern "C" fn end_modal_session(receiver: Id, _sel: Sel, _session: Id) {
 }
 
 /// `-stopModal` and `-abortModal`, which end the innermost session.
-unsafe extern "C" fn stop_modal(receiver: Id, _sel: Sel) {
+unsafe extern "C" fn stop_modal(receiver: Id, sel: Sel) {
+    // SAFETY: an application.
+    unsafe { stop_modal_with_code(receiver, sel, modal_response::STOP) };
+}
+
+unsafe extern "C" fn stop_modal_with_code(receiver: Id, _sel: Sel, code: isize) {
     // SAFETY: an application.
     let app = unsafe { &mut *(receiver as *mut Application) };
     app.modal_depth = app.modal_depth.saturating_sub(1);
-}
-
-unsafe extern "C" fn stop_modal_with_code(receiver: Id, sel: Sel, _code: isize) {
-    unsafe { stop_modal(receiver, sel) };
-}
-
-unsafe extern "C" fn visible_occlusion(_receiver: Id, _sel: Sel) -> u64 {
-    1 << 1
+    app.modal_code = code;
 }
 
 /// `-runModalForWindow:`, the blocking form.
@@ -862,7 +864,8 @@ unsafe extern "C" fn run_modal_for_window(receiver: Id, sel: Sel, window: Id) ->
         }
     }
     unsafe { end_modal_session(receiver, sel, window) };
-    modal_response::STOP
+    // SAFETY: an application.
+    unsafe { (*(receiver as *const Application)).modal_code }
 }
 
 /// Send `selector` to `target` if it has one, and do nothing if it does not.
@@ -1039,7 +1042,7 @@ pub(crate) fn install() {
         "runModalForWindow:" => run_modal_for_window, c"q24@0:8@16";
         "stopModal" => stop_modal, c"v16@0:8";
         "stopModalWithCode:" => stop_modal_with_code, c"v24@0:8q16";
-        "occlusionState" => visible_occlusion, c"Q16@0:8";
+        "occlusionState" => crate::window::visible_occlusion, c"Q16@0:8";
         "endSheet:" => ignored_sender, c"v24@0:8@16";
         "abortModal" => stop_modal, c"v16@0:8";
     });
@@ -1330,10 +1333,8 @@ mod tests {
             objc::class::lookup(c"NSApplication").expect("NSApplication"),
             0,
         );
-        let object = objc::object::create_instance(
-            objc::class::lookup(c"NSObject").expect("NSObject"),
-            0,
-        );
+        let object =
+            objc::object::create_instance(objc::class::lookup(c"NSObject").expect("NSObject"), 0);
         OBJECT.store(object as usize, std::sync::atomic::Ordering::SeqCst);
         let source = corefoundation::runloop::new_source(Some(perform), 0);
         let loop_ = corefoundation::runloop::main();

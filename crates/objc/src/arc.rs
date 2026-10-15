@@ -74,6 +74,21 @@ pub fn retain(object: Id) -> Id {
     object
 }
 
+/// Pin `object` for the life of the process: no number of releases frees it.
+///
+/// For singletons a guest is handed unowned and may over-release. Blocks and
+/// `OS_object`s keep their counts elsewhere, where a pin here would not reach.
+pub fn make_immortal(object: Id) {
+    if object.is_null() || crate::class::is_known(object as *const crate::class::Class) {
+        return;
+    }
+    // SAFETY: a live object; see [`retain`].
+    if unsafe { crate::block::is_block(object) } || os_object_refcount(object).is_some() {
+        crate::fail!("make_immortal: {object:p} does not use this runtime's refcount");
+    }
+    counts(object).insert(object as usize, usize::MAX / 2);
+}
+
 /// Drop a reference, deallocating at zero.
 ///
 /// Deallocation is `-dealloc` if the class implements it, and a plain `free`

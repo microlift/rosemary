@@ -131,8 +131,9 @@ unsafe extern "C" fn next_drawable(receiver: Id, _sel: Sel) -> Id {
     }
     // Before the cache is locked, which finishing a copied source needs.
     crate::swapchain::retire_copied();
+    let mut retired = retire_stale(&mut CACHE.0.lock().expect("drawable cache"));
+    release_slots(&mut retired);
     let mut cache = CACHE.0.lock().expect("drawable cache");
-    retire_stale(&mut cache);
     for entry in cache
         .iter_mut()
         .filter(|entry| entry.layer == receiver as usize)
@@ -290,24 +291,35 @@ fn release_slots(slots: &mut Vec<CachedSlot>) {
     }
 }
 
-fn retire_stale(cache: &mut Vec<Cached>) {
+/// Take out the rings nothing can use again, for the caller to release once the
+/// cache is unlocked: the last drawable of an abandoned layer frees the layer,
+/// and its teardown must not run under the lock.
+#[must_use]
+fn retire_stale(cache: &mut Vec<Cached>) -> Vec<CachedSlot> {
     reclaim_dropped(cache);
+    // Every ring's drawables hold their layer, stale rings' included, so a
+    // layer only its own drawables hold is one the guest has let go of.
+    let mut held = std::collections::HashMap::<usize, usize>::new();
+    for entry in cache.iter() {
+        *held.entry(entry.layer).or_default() += entry.slots.len();
+    }
+    let mut retired = Vec::new();
     let mut index = 0;
     while index < cache.len() {
         let entry = &cache[index];
-        let abandoned = objc::arc::retain_count(entry.layer as Id) <= entry.slots.len();
+        let abandoned = objc::arc::retain_count(entry.layer as Id) <= held[&entry.layer];
         if (entry.stale || abandoned)
             && entry
                 .slots
                 .iter()
                 .all(|slot| slot.state == SlotState::Available)
         {
-            let mut stale = cache.remove(index);
-            release_slots(&mut stale.slots);
+            retired.append(&mut cache.remove(index).slots);
         } else {
             index += 1;
         }
     }
+    retired
 }
 
 /// Transfer a vended slot to a command buffer. A duplicate presentation of
@@ -335,7 +347,9 @@ pub(crate) fn complete(drawable: Id) {
         slot.complete();
         CACHE.1.notify_all();
     }
-    retire_stale(&mut cache);
+    let mut retired = retire_stale(&mut cache);
+    drop(cache);
+    release_slots(&mut retired);
 }
 
 unsafe extern "C" fn drawable_texture(receiver: Id, _sel: Sel) -> Id {
