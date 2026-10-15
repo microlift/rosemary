@@ -228,7 +228,28 @@ static VIRTUAL_KEYS: &[(u32, u16)] = &[
 /// know it would be a bug with nothing to say so.
 pub const UNKNOWN: u16 = 0xFFFF;
 
+fn swapping() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("ROSEMARY_SWAP_CTRL_CMD").is_some_and(|v| v != "0"))
+}
+
+fn swap_ctrl_cmd(sdl_modifiers: u16) -> u16 {
+    if !swapping() {
+        return sdl_modifiers;
+    }
+    let ctrl = sdl_modifiers & (keymod::LCTRL | keymod::RCTRL);
+    let gui = sdl_modifiers & (keymod::LGUI | keymod::RGUI);
+    (sdl_modifiers & !(ctrl | gui)) | (ctrl << 4) | (gui >> 4)
+}
+
 pub fn virtual_key(scancode: u32) -> u16 {
+    let scancode = match (swapping(), scancode) {
+        (true, scancode::LCTRL) => scancode::LGUI,
+        (true, scancode::RCTRL) => scancode::RGUI,
+        (true, scancode::LGUI) => scancode::LCTRL,
+        (true, scancode::RGUI) => scancode::RCTRL,
+        _ => scancode,
+    };
     VIRTUAL_KEYS
         .iter()
         .find(|(sdl, _)| *sdl == scancode)
@@ -258,6 +279,7 @@ pub mod flags {
 }
 
 pub fn modifiers(sdl_modifiers: u16) -> u64 {
+    let sdl_modifiers = swap_ctrl_cmd(sdl_modifiers);
     let mut out = 0;
     for (from, to) in [
         (keymod::SHIFT, flags::SHIFT),
@@ -324,7 +346,7 @@ mod carbon {
 /// Carbon's bits. Qt's key mapper asks this rather than `+[NSEvent modifierFlags]`.]
 #[allow(non_snake_case)]
 pub unsafe extern "C" fn GetCurrentKeyModifiers() -> u32 {
-    let held = sdl3::video::keyboard_modifiers();
+    let held = swap_ctrl_cmd(sdl3::video::keyboard_modifiers());
     [
         (keymod::GUI, carbon::CMD_KEY),
         (keymod::SHIFT, carbon::SHIFT_KEY),
