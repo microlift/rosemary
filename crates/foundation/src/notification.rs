@@ -303,7 +303,7 @@ fn center_of(class: &'static Class) -> Id {
         let center = objc::object::create_instance(class, 0);
         // Retained forever: a singleton a guest can release is one it can make
         // dangle by releasing what it never owned.
-        objc::arc::retain(center);
+        objc::arc::make_immortal(center);
         center as usize
     }) as Id
 }
@@ -524,7 +524,7 @@ pub mod cf {
             let class = corefoundation::base::abstract_class(c"CFNotificationCenter", None);
             let center = objc::object::create_instance(class, 0);
             // Retained forever, as every singleton here is.
-            objc::arc::retain(center);
+            objc::arc::make_immortal(center);
             center as usize
         }) as Id
     }
