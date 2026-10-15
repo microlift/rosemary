@@ -808,7 +808,7 @@ fn cursor_for(shape: usize) -> Id {
     // SAFETY: freshly allocated.
     unsafe { (*cursor).shape = shape };
     // Retained forever: `+arrowCursor` hands one out unowned.
-    objc::arc::retain(cursor as Id);
+    objc::arc::make_immortal(cursor as Id);
     cursors.push((shape, cursor as usize));
     cursor as Id
 }
