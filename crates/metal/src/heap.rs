@@ -104,10 +104,9 @@ impl Heap {
         let block = crate::stats::timed(crate::stats::Counter::BufferBlockMicros, || {
             self.block(device, capacity)
         })?;
-        state.blocks.push(block);
+        let index = state.place(block);
         if size > BLOCK || dedicate_everything() {
             // Its own block, freed when it is: nothing else is cut from it.
-            let index = state.blocks.len() - 1;
             state.dedicated.push(index);
             let block = &mut state.blocks[index];
             block.free.clear();
@@ -231,6 +230,19 @@ impl Heap {
 }
 
 impl State {
+    fn place(&mut self, block: Block) -> usize {
+        match self.blocks.iter().position(|spent| spent.size == 0) {
+            Some(index) => {
+                self.blocks[index] = block;
+                index
+            }
+            None => {
+                self.blocks.push(block);
+                self.blocks.len() - 1
+            }
+        }
+    }
+
     /// A wholly-free block to give back, once a second one is also free.
     fn spare_block(&self) -> Option<usize> {
         let mut empty = self
@@ -388,6 +400,19 @@ mod tests {
         let again = state.carve(128, 1).expect("room");
         assert_eq!(again.offset, first.offset);
         assert!(!again.pristine);
+    }
+
+    #[test]
+    fn a_fresh_block_takes_the_slot_of_one_given_back() {
+        let mut state = State {
+            blocks: vec![block(1024), block(1024)],
+            dedicated: Vec::new(),
+        };
+        state.blocks[0].size = 0;
+        state.blocks[0].free.clear();
+        assert_eq!(state.place(block(2048)), 0);
+        assert_eq!(state.place(block(2048)), 2);
+        assert_eq!(state.blocks.len(), 3);
     }
 
     #[test]
