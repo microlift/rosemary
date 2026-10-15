@@ -164,8 +164,8 @@ fn unbound(binding: &metal_translate::ResourceBinding, what: &str, represented: 
     } else {
         "its descriptor keeps whatever the set last held"
     };
-    gpu::trace_once(format!("a shader resource {what}; {result}"));
-    gpu::trace(format!(
+    gpu::trace_once(format_args!("a shader resource {what}; {result}"));
+    gpu::trace(format_args!(
         "{:?} at Metal index {} of set {} {what}",
         binding.kind, binding.metal_index, binding.descriptor_set
     ));
