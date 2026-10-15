@@ -1,7 +1,7 @@
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::ffi::c_void;
-use std::sync::Mutex;
+use std::sync::{LazyLock, Mutex};
 
 use foundation::geometry::{NSPoint, NSRect, NSSize};
 use objc::object::Id;
@@ -1801,12 +1801,86 @@ fn shared_instance(name: &'static std::ffi::CStr) -> Id {
     object
 }
 
-unsafe extern "C" fn context_is_flipped(_receiver: Id, _sel: Sel) -> u8 {
-    current_focus().is_some_and(|focus| focus.flipped) as u8
+#[derive(Clone, Copy)]
+struct WrappedCGContext {
+    context: usize,
+    flipped: bool,
 }
 
-unsafe extern "C" fn nil(_receiver: Id, _sel: Sel) -> Id {
-    std::ptr::null_mut()
+static WRAPPED_CG_CONTEXTS: LazyLock<Mutex<HashMap<usize, WrappedCGContext>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+unsafe extern "C" fn context_with_cg_context(
+    _class: Id,
+    _sel: Sel,
+    cg_context: *const c_void,
+    flipped: u8,
+) -> Id {
+    if cg_context.is_null() {
+        return std::ptr::null_mut();
+    }
+    let class = objc::class::lookup(c"NSGraphicsContext").expect("declared");
+    let object = objc::object::create_instance(class, 0);
+    if object.is_null() {
+        return object;
+    }
+
+    // AppKit's factory owns the supplied Core Graphics context for as long as
+    // the wrapper lives; the `CGContext` and `graphicsPort` getters borrow it.
+    unsafe { corefoundation::api::CFRetain(cg_context) };
+    let previous = WRAPPED_CG_CONTEXTS
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .insert(
+            object as usize,
+            WrappedCGContext {
+                context: cg_context as usize,
+                flipped: flipped != 0,
+            },
+        );
+    debug_assert!(previous.is_none(), "new graphics context reused a live key");
+    objc::arc::autorelease(object)
+}
+
+unsafe extern "C" fn graphics_context_dealloc(receiver: Id, _sel: Sel) {
+    let wrapped = WRAPPED_CG_CONTEXTS
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .remove(&(receiver as usize));
+    if let Some(wrapped) = wrapped {
+        // SAFETY: the factory retained this live CGContext for this wrapper.
+        unsafe { corefoundation::api::CFRelease(wrapped.context as *const c_void) };
+    }
+    // SAFETY: no instance fields are stored in the Objective-C allocation.
+    objc::arc::finalize(receiver);
+}
+
+fn wrapped_cg_context(receiver: Id) -> Option<WrappedCGContext> {
+    WRAPPED_CG_CONTEXTS
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .get(&(receiver as usize))
+        .copied()
+}
+
+fn context_cg_context(receiver: Id) -> *const c_void {
+    wrapped_cg_context(receiver)
+        .map_or(std::ptr::null(), |wrapped| wrapped.context as *const c_void)
+}
+
+unsafe extern "C" fn graphics_context_cg_context(receiver: Id, _sel: Sel) -> *const c_void {
+    context_cg_context(receiver)
+}
+
+unsafe extern "C" fn graphics_context_graphics_port(receiver: Id, _sel: Sel) -> *const c_void {
+    context_cg_context(receiver)
+}
+
+unsafe extern "C" fn context_is_flipped(receiver: Id, _sel: Sel) -> u8 {
+    current_focus()
+        .map(|focus| focus.flipped)
+        .or_else(|| wrapped_cg_context(receiver).map(|wrapped| wrapped.flipped))
+        .unwrap_or(false) as u8
 }
 
 unsafe extern "C" fn ignored(_receiver: Id, _sel: Sel) {}
@@ -1845,11 +1919,13 @@ pub(crate) fn install() {
     // Saving and restoring the graphics state is `crate::bezier`'s.
     class_methods!(context, {
         "currentContext" => current_context, c"@16@0:8";
+        "graphicsContextWithCGContext:flipped:" => context_with_cg_context, c"@32@0:8^v16c24";
     });
     methods!(context, {
         "isFlipped" => context_is_flipped, c"c16@0:8";
-        "CGContext" => nil, c"^v16@0:8";
-        "graphicsPort" => nil, c"^v16@0:8";
+        "CGContext" => graphics_context_cg_context, c"^v16@0:8";
+        "graphicsPort" => graphics_context_graphics_port, c"^v16@0:8";
+        "dealloc" => graphics_context_dealloc, c"v16@0:8";
         "flushGraphics" => ignored, c"v16@0:8";
         "compositingOperation" => zero, c"q16@0:8";
         "setCompositingOperation:" => ignored_integer, c"v24@0:8q16";
@@ -1873,6 +1949,123 @@ pub(crate) fn install() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn make_graphics_context(cg_context: *const c_void, flipped: u8) -> Id {
+        let class = objc::class::lookup(c"NSGraphicsContext").expect("declared");
+        // SAFETY: `msg::entry` has the registered class-method ABI below.
+        let send: unsafe extern "C" fn(Id, Sel, *const c_void, u8) -> Id =
+            unsafe { std::mem::transmute(objc::msg::entry()) };
+        // SAFETY: the class and selector identify the registered class method.
+        unsafe {
+            send(
+                objc::class::ptr(class).cast(),
+                objc::sel::get("graphicsContextWithCGContext:flipped:"),
+                cg_context,
+                flipped,
+            )
+        }
+    }
+
+    #[test]
+    fn graphics_context_factory_preserves_context_and_flipped_state() {
+        crate::bootstrap();
+        let pool = unsafe { objc::api::objc_autoreleasePoolPush() };
+        let context = unsafe {
+            crate::cgcontext::CGBitmapContextCreate(
+                std::ptr::null_mut(),
+                2,
+                3,
+                8,
+                0,
+                std::ptr::null(),
+                0,
+            )
+        };
+        assert!(!context.is_null());
+
+        let flipped = make_graphics_context(context, 1);
+        let unflipped = make_graphics_context(context, 0);
+        assert!(!flipped.is_null());
+        assert!(!unflipped.is_null());
+
+        let get_context: unsafe extern "C" fn(Id, Sel) -> *const c_void =
+            unsafe { std::mem::transmute(objc::msg::entry()) };
+        let get_flipped: unsafe extern "C" fn(Id, Sel) -> u8 =
+            unsafe { std::mem::transmute(objc::msg::entry()) };
+        assert_eq!(
+            unsafe { get_context(flipped, objc::sel::get("CGContext")) },
+            context
+        );
+        assert_eq!(
+            unsafe { get_context(flipped, objc::sel::get("graphicsPort")) },
+            context
+        );
+        assert_eq!(
+            unsafe { get_flipped(flipped, objc::sel::get("isFlipped")) },
+            1
+        );
+        assert_eq!(
+            unsafe { get_flipped(unflipped, objc::sel::get("isFlipped")) },
+            0
+        );
+        assert_eq!(unsafe { corefoundation::api::CFGetRetainCount(context) }, 3);
+
+        // Keep one reference so the count remains readable after both wrappers
+        // leave the autorelease pool and release the references they own.
+        unsafe { crate::cgcontext::CGContextRetain(context) };
+        unsafe { crate::cgcontext::CGContextRelease(context) };
+        assert_eq!(unsafe { corefoundation::api::CFGetRetainCount(context) }, 3);
+        unsafe { objc::api::objc_autoreleasePoolPop(pool) };
+        assert_eq!(unsafe { corefoundation::api::CFGetRetainCount(context) }, 1);
+        unsafe { crate::cgcontext::CGContextRelease(context) };
+    }
+
+    #[test]
+    fn graphics_context_flipped_state_follows_the_focused_view() {
+        crate::bootstrap();
+        let pool = unsafe { objc::api::objc_autoreleasePoolPush() };
+        let context = unsafe {
+            crate::cgcontext::CGBitmapContextCreate(
+                std::ptr::null_mut(),
+                1,
+                1,
+                8,
+                0,
+                std::ptr::null(),
+                0,
+            )
+        };
+        let wrapper = make_graphics_context(context, 0);
+        let get_flipped: unsafe extern "C" fn(Id, Sel) -> u8 =
+            unsafe { std::mem::transmute(objc::msg::entry()) };
+        let selector = objc::sel::get("isFlipped");
+        assert_eq!(unsafe { get_flipped(wrapper, selector) }, 0);
+
+        FOCUS.with(|stack| {
+            stack.borrow_mut().push(Focus {
+                view: std::ptr::null_mut(),
+                window: std::ptr::null_mut(),
+                x: 0.0,
+                y: 0.0,
+                width: 1.0,
+                height: 1.0,
+                density: 1.0,
+                flipped: true,
+                offscreen: false,
+            });
+        });
+        assert_eq!(unsafe { get_flipped(wrapper, selector) }, 1);
+        FOCUS.with(|stack| stack.borrow_mut().clear());
+
+        unsafe { objc::api::objc_autoreleasePoolPop(pool) };
+        unsafe { crate::cgcontext::CGContextRelease(context) };
+    }
+
+    #[test]
+    fn graphics_context_factory_returns_nil_for_a_null_context() {
+        crate::bootstrap();
+        assert!(make_graphics_context(std::ptr::null(), 0).is_null());
+    }
 
     /// A view of `NSView`'s, and one of a flipped subclass, so a tree can be
     /// placed without a window.
