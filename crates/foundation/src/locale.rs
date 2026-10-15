@@ -77,7 +77,7 @@ fn shared() -> Id {
         let locale = objc::object::create_instance(class, 0);
         // Retained forever: a singleton a guest can release is one it can make
         // dangle by releasing what it never owned.
-        objc::arc::retain(locale);
+        objc::arc::make_immortal(locale);
         locale as usize
     }) as Id
 }
@@ -285,7 +285,7 @@ pub mod cf {
             return *object as Id;
         }
         let object = crate::string::from_str(text);
-        objc::arc::retain(object);
+        objc::arc::make_immortal(object);
         pool.push((text.to_string(), object as usize));
         object
     }
