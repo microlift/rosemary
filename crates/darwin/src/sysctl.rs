@@ -226,8 +226,14 @@ fn host_value(mib: &[i32]) -> Option<Value> {
 /// The defaults describe macOS 15.0. A program that branches on the OS version needs
 /// a *specific* answer far more than it needs a true one, and the environment is where
 /// that belongs rather than a rebuild.
+///
+/// Read once: [`macos_version`] is derived from it and cached, and the two must
+/// keep agreeing if the variable changes later.
 fn release() -> String {
-    env_or("ROSEMARY_DARWIN_RELEASE", "24.0.0")
+    static RELEASE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    RELEASE
+        .get_or_init(|| env_or("ROSEMARY_DARWIN_RELEASE", "24.0.0"))
+        .clone()
 }
 
 /// The macOS version the [`release`] above implies, as `(major, minor, patch)`.
@@ -914,6 +920,17 @@ pub(crate) fn lock_guest_arch(arch: GuestArch) -> std::sync::MutexGuard<'static,
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_release_and_the_macos_version_keep_agreeing() {
+        let version = macos_version();
+        let first = release();
+        // SAFETY: no other test reads or writes this variable.
+        unsafe { std::env::set_var("ROSEMARY_DARWIN_RELEASE", "99.0.0") };
+        assert_eq!(release(), first);
+        assert_eq!(macos_version(), version);
+        unsafe { std::env::remove_var("ROSEMARY_DARWIN_RELEASE") };
+    }
 
     /// Ask a key the way a guest does, and get the bytes back.
     fn ask(mib: &[i32]) -> Option<Vec<u8>> {
