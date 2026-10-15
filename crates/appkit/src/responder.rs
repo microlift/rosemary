@@ -258,11 +258,8 @@ unsafe extern "C" fn interpret_key_events(receiver: Id, _sel: Sel, events: Id) {
     };
     let command_sel = objc::sel::get("doCommandBySelector:");
     // SAFETY: a live responder this method was sent to.
-    let Some(method) =
-        (unsafe { objc::object::class_of(receiver) }).and_then(|class| class.method(command_sel))
-    else {
-        return;
-    };
+    let method =
+        (unsafe { objc::object::class_of(receiver) }).and_then(|class| class.method(command_sel));
     for event in array.values.iter().copied() {
         let event = event as Id;
         if event.is_null() {
@@ -288,6 +285,15 @@ unsafe extern "C" fn interpret_key_events(receiver: Id, _sel: Sel, events: Id) {
             continue;
         }
         let Some(command) = command_for(key_code, modifiers) else {
+            let chord = crate::keymap::flags::COMMAND | crate::keymap::flags::CONTROL;
+            if modifiers & chord == 0
+                && let Some(text) = sdl3::video::take_next_text()
+            {
+                crate::text::commit(receiver, &text);
+            }
+            continue;
+        };
+        let Some(method) = method else {
             continue;
         };
         // SAFETY: `-doCommandBySelector:` is `void (id, SEL, SEL)`, and the
