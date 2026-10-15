@@ -172,6 +172,11 @@ struct Pool {
 ///
 /// The depth of the pool that was pushed, plus one so it is never null. Apple
 /// returns an interior pointer; nothing may read it either way.
+/// The token of a pool pushed after this thread's pools were destroyed: a
+/// destructor running at thread exit gets one, and popping it does nothing.
+/// No real token is this value.
+const DEAD_POOL: *mut c_void = usize::MAX as *mut c_void;
+
 pub fn pool_push() -> *mut c_void {
     POOLS
         .try_with(|pools| {
@@ -187,7 +192,7 @@ pub fn pool_push() -> *mut c_void {
             });
             token
         })
-        .unwrap_or(std::ptr::dangling_mut())
+        .unwrap_or(DEAD_POOL)
 }
 
 /// Release everything added since the matching [`pool_push`].
@@ -195,9 +200,16 @@ pub fn pool_push() -> *mut c_void {
 /// Pools nest, so a token naming an outer pool pops the inner ones too - which
 /// is what happens when a `@autoreleasepool` unwinds past one.
 pub fn pool_pop(token: *mut c_void) {
+    if token == DEAD_POOL {
+        return;
+    }
     if crate::debug::enabled() {
+        let Ok(found) =
+            POOLS.try_with(|pools| pools.borrow().iter().any(|pool| pool.token == token))
+        else {
+            return;
+        };
         crate::debug::validate_pool(token, thread_id());
-        let found = POOLS.with(|pools| pools.borrow().iter().any(|pool| pool.token == token));
         if !found {
             crate::fail!(
                 "objc debug: autorelease pool token {token:p} is not on this thread's stack"
@@ -205,11 +217,10 @@ pub fn pool_pop(token: *mut c_void) {
         }
     }
     loop {
-        let Some(pool) = POOLS
-            .try_with(|pools| pools.borrow_mut().pop())
-            .ok()
-            .flatten()
-        else {
+        let Ok(top) = POOLS.try_with(|pools| pools.borrow_mut().pop()) else {
+            return;
+        };
+        let Some(pool) = top else {
             if crate::debug::enabled() {
                 crate::fail!("objc debug: autorelease pool pop with an empty pool stack");
             }
