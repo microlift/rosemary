@@ -43,14 +43,25 @@ pub fn tsd_base() -> u64 {
 }
 
 #[cfg(not(target_os = "macos"))]
+thread_local! {
+    static BASE: core::cell::Cell<u64> = const { core::cell::Cell::new(0) };
+}
+
+#[cfg(not(target_os = "macos"))]
 pub fn tsd_base() -> u64 {
+    let cached = BASE.with(|base| base.get());
+    if cached != 0 {
+        return cached;
+    }
     let key = synthetic_key();
     // SAFETY: `key` was created by `pthread_key_create` below and is never deleted.
     let existing = unsafe { libc::pthread_getspecific(key) };
     if !existing.is_null() {
+        BASE.with(|base| base.set(existing as usize as u64));
         return existing as usize as u64;
     }
     let base = allocate();
+    BASE.with(|cell| cell.set(base));
     // SAFETY: as above; `base` is a leaked allocation this thread now owns, and
     // `release` frees it when the thread ends.
     unsafe { libc::pthread_setspecific(key, base as usize as *const core::ffi::c_void) };
@@ -119,6 +130,11 @@ unsafe extern "C" fn release(block: *mut core::ffi::c_void) {
     }
     // SAFETY: as above; the last pass takes the array away before freeing it.
     unsafe { libc::pthread_setspecific(synthetic_key(), core::ptr::null()) };
+    BASE.with(|base| {
+        if base.get() == block as usize as u64 {
+            base.set(0);
+        }
+    });
     // SAFETY: as above. Reconstituting the same `Box<[u64]>` `allocate` leaked, with
     // the same length.
     drop(unsafe { Box::from_raw(core::ptr::slice_from_raw_parts_mut(words, WORDS)) });
