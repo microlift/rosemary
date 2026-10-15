@@ -1623,6 +1623,7 @@ unsafe extern "C" fn dealloc(receiver: Id, _sel: Sel) {
     unsafe { crate::layer::set_view(layer, std::ptr::null_mut()) };
     objc::arc::release(layer);
     crate::cursor::discard_rects(receiver);
+    crate::window::forget_responder(receiver);
     objc::arc::finalize(receiver);
 }
 
@@ -1743,6 +1744,10 @@ unsafe extern "C" fn yes(_receiver: Id, _sel: Sel) -> u8 {
     1
 }
 
+pub(crate) fn is_default_accepts_first_responder(imp: *const std::ffi::c_void) -> bool {
+    std::ptr::eq(imp, yes as *const std::ffi::c_void)
+}
+
 unsafe extern "C" fn no(_receiver: Id, _sel: Sel) -> u8 {
     0
 }
@@ -1793,6 +1798,7 @@ unsafe extern "C" fn set_hidden(receiver: Id, _sel: Sel, hidden: u8) {
 unsafe extern "C" fn is_hidden(receiver: Id, _sel: Sel) -> u8 {
     u8::from(view_of(receiver).hidden != 0)
 }
+
 
 unsafe extern "C" fn is_hidden_or_has_hidden_ancestor_method(receiver: Id, _sel: Sel) -> u8 {
     u8::from(is_hidden_or_has_hidden_ancestor(receiver))
