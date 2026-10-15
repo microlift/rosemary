@@ -447,6 +447,15 @@ pub(crate) fn deliver_past_modal(event: sdl3::video::Event) {
             }
             // The first real motion after a warp is the one that reports it.
             let warped = take_warp_delta();
+            let ended = crate::screen::end_recentring_if_idle();
+            let (x, y) = match ended || crate::screen::recentring() {
+                true => {
+                    let (px, py) = pointer_position();
+                    warp_pointer(px + dx, py + dy);
+                    (px + dx, py + dy)
+                }
+                false => (x, y),
+            };
             crate::cgevent::note_mouse_delta(dx, dy);
             crate::screen::hold_at_edge(id, x, y, dx, dy);
             // SDL's position keeps integrating the deltas of a disassociated
@@ -828,6 +837,9 @@ pub fn route(window: Id, event: Id) {
         },
         false => responder_of(window),
     };
+    if kind == kind::LEFT_MOUSE_DOWN {
+        focus_clicked(window, start);
+    }
     let Some((responder, method)) = chain(start, sel) else {
         if tracing() {
             eprintln!("rosemary: appkit: -{selector}: nothing from {start:p} up implements it");
@@ -847,6 +859,32 @@ pub fn route(window: Id, event: Id) {
         let f: unsafe extern "C" fn(Id, objc::sel::Sel, Id) =
             std::mem::transmute(method.implementation());
         f(responder, sel, event);
+    }
+}
+
+fn focus_clicked(window: Id, view: Id) {
+    let sel = objc::sel::get("acceptsFirstResponder");
+    // SAFETY: null or a live object this runtime allocated.
+    let Some(method) = unsafe { objc::object::class_of(view) }.and_then(|c| c.method(sel)) else {
+        return;
+    };
+    if crate::view::is_default_accepts_first_responder(method.implementation()) {
+        return;
+    }
+    // SAFETY: `BOOL (id, SEL)`, the class's own implementation.
+    let accepts = unsafe {
+        let f: unsafe extern "C" fn(Id, objc::sel::Sel) -> u8 =
+            std::mem::transmute(method.implementation());
+        f(view, sel) != 0
+    };
+    if !accepts || responder_of(window) == view {
+        return;
+    }
+    // SAFETY: `-makeFirstResponder:` is `BOOL (id, SEL, NSResponder *)`.
+    unsafe {
+        let f: unsafe extern "C" fn(Id, objc::sel::Sel, Id) -> u8 =
+            std::mem::transmute(objc::msg::entry());
+        f(window, objc::sel::get("makeFirstResponder:"), view);
     }
 }
 
@@ -926,6 +964,7 @@ pub(crate) fn warp_pointer(x: f32, y: f32) {
     *POINTER.lock().unwrap_or_else(|e| e.into_inner()) = (x, y);
 }
 
+
 /// Where a physical warp is expected to be echoed back as a motion event.
 ///
 /// CoreGraphics posts no event for a warp, but SDL does (Cocoa sends one
@@ -996,7 +1035,7 @@ pub(crate) fn pointer_position() -> (f32, f32) {
 fn track_pointer(window: u32, x: f32, y: f32) -> (f32, f32) {
     POINTER_WINDOW.store(window, std::sync::atomic::Ordering::Relaxed);
     let mut pointer = POINTER.lock().unwrap_or_else(|e| e.into_inner());
-    if crate::screen::mouse_is_associated() {
+    if crate::screen::mouse_is_associated() && !crate::screen::recentring() {
         *pointer = (x, y);
     }
     *pointer
@@ -1027,7 +1066,7 @@ pub(crate) fn settle_pointer() {
 /// Where the guest is to be told the pointer is on the desktop, for the calls
 /// that ask the window system rather than reading an event.
 pub(crate) fn frozen_pointer() -> Option<(f32, f32)> {
-    if crate::screen::mouse_is_associated() {
+    if crate::screen::mouse_is_associated() && !crate::screen::recentring() {
         return None;
     }
     let (x, y) = *POINTER.lock().unwrap_or_else(|e| e.into_inner());
