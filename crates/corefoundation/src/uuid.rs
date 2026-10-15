@@ -85,7 +85,7 @@ pub fn constant(bytes: Bytes) -> CFTypeRef {
     }
     let object = new(bytes);
     // Retained forever: a constant a guest may release is one it can make dangle.
-    objc::arc::retain(object as Id);
+    objc::arc::make_immortal(object as Id);
     constants.push((bytes, object as usize));
     object
 }
