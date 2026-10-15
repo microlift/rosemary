@@ -26,6 +26,9 @@ pub struct Allocation {
     pub contents: *mut u8,
     /// The block this came out of, or `None` for a block of its own.
     block: Option<usize>,
+    /// Which block held that index when this was carved: a spent block's
+    /// index is given to the next one, and a stale free must not reach it.
+    generation: u64,
     offset: u64,
     size: u64,
     /// Whether this range has never been handed out before. A driver zeroes
@@ -51,6 +54,7 @@ struct Block {
     /// One past the highest offset ever carved out. Everything above it is
     /// memory as the driver handed it over, which is zeroed.
     reached: u64,
+    generation: u64,
 }
 
 // SAFETY: as for `Allocation`.
@@ -61,6 +65,7 @@ struct State {
     blocks: Vec<Block>,
     /// Blocks a large allocation owns outright, by the index it was given.
     dedicated: Vec<usize>,
+    generations: u64,
 }
 
 /// One memory type's blocks.
@@ -115,6 +120,7 @@ impl Heap {
                 memory: block.memory,
                 contents: block.contents,
                 block: Some(index),
+                generation: block.generation,
                 offset: 0,
                 size: capacity,
                 pristine: true,
@@ -131,6 +137,10 @@ impl Heap {
             return;
         };
         let mut state = self.state.lock().expect("buffer heap");
+        if !state.owns(index, allocation.generation) {
+            debug_assert!(false, "a Metal heap range was freed after its block was");
+            return;
+        }
         if let Some(at) = state.dedicated.iter().position(|owned| *owned == index) {
             state.dedicated.swap_remove(at);
             let block = &mut state.blocks[index];
@@ -209,6 +219,7 @@ impl Heap {
                 size,
                 free: vec![(0, size)],
                 reached: 0,
+                generation: 0,
             });
         }
         // SAFETY: host-visible memory nothing else has mapped.
@@ -225,12 +236,15 @@ impl Heap {
             size,
             free: vec![(0, size)],
             reached: 0,
+            generation: 0,
         })
     }
 }
 
 impl State {
-    fn place(&mut self, block: Block) -> usize {
+    fn place(&mut self, mut block: Block) -> usize {
+        self.generations += 1;
+        block.generation = self.generations;
         match self.blocks.iter().position(|spent| spent.size == 0) {
             Some(index) => {
                 self.blocks[index] = block;
@@ -241,6 +255,13 @@ impl State {
                 self.blocks.len() - 1
             }
         }
+    }
+
+    /// Whether the block at `index` is still the one `generation` was cut from.
+    fn owns(&self, index: usize, generation: u64) -> bool {
+        self.blocks
+            .get(index)
+            .is_some_and(|block| block.size > 0 && block.generation == generation)
     }
 
     /// A wholly-free block to give back, once a second one is also free.
@@ -291,6 +312,7 @@ impl State {
                         false => unsafe { block.contents.add(aligned as usize) },
                     },
                     block: Some(index),
+                    generation: block.generation,
                     offset: aligned,
                     size,
                     pristine,
@@ -305,6 +327,11 @@ impl Block {
     /// Return a range, merging it with whichever neighbours are also free.
     fn release(&mut self, offset: u64, size: u64) {
         let at = self.free.partition_point(|(start, _)| *start < offset);
+        debug_assert!(
+            (at == 0 || self.free[at - 1].0 + self.free[at - 1].1 <= offset)
+                && self.free.get(at).is_none_or(|(next, _)| offset + size <= *next),
+            "a Metal heap range was freed twice"
+        );
         self.free.insert(at, (offset, size));
         // Merge forward first, so the backward merge sees the whole run.
         if at + 1 < self.free.len() {
@@ -336,6 +363,7 @@ impl Allocation {
             memory: vk::DeviceMemory::null(),
             contents: std::ptr::null_mut(),
             block: None,
+            generation: 0,
             offset: 0,
             size: 0,
             pristine: false,
@@ -354,6 +382,7 @@ mod tests {
             size,
             free: vec![(0, size)],
             reached: 0,
+            generation: 0,
         }
     }
 
@@ -373,6 +402,7 @@ mod tests {
         let mut state = State {
             blocks: vec![block(1024)],
             dedicated: Vec::new(),
+            generations: 0,
         };
         let first = state.carve(8, 1).expect("room");
         assert_eq!(first.offset, 0);
@@ -391,6 +421,7 @@ mod tests {
         let mut state = State {
             blocks: vec![block(1024)],
             dedicated: Vec::new(),
+            generations: 0,
         };
         let first = state.carve(128, 1).expect("room");
         assert!(first.pristine);
@@ -407,6 +438,7 @@ mod tests {
         let mut state = State {
             blocks: vec![block(1024), block(1024)],
             dedicated: Vec::new(),
+            generations: 0,
         };
         state.blocks[0].size = 0;
         state.blocks[0].free.clear();
@@ -416,10 +448,36 @@ mod tests {
     }
 
     #[test]
+    fn a_free_from_before_its_slot_was_reused_does_not_reach_the_new_block() {
+        let mut state = State::default();
+        let index = state.place(block(1024));
+        let stale = state.carve(128, 1).expect("room");
+        state.blocks[index].size = 0;
+        state.blocks[index].free.clear();
+        assert_eq!(state.place(block(1024)), index);
+        assert!(!state.owns(index, stale.generation));
+        let live = state.carve(128, 1).expect("room");
+        assert!(state.owns(index, live.generation));
+    }
+
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "freed twice")]
+    fn a_double_free_is_caught() {
+        let mut state = State::default();
+        state.place(block(1024));
+        let taken = state.carve(128, 1).expect("room");
+        state.carve(128, 1).expect("room");
+        state.blocks[0].release(taken.offset, taken.size);
+        state.blocks[0].release(taken.offset, taken.size);
+    }
+
+    #[test]
     fn a_block_which_fills_and_empties_is_whole_again() {
         let mut state = State {
             blocks: vec![block(1024)],
             dedicated: Vec::new(),
+            generations: 0,
         };
         let mut taken = Vec::new();
         while let Some(allocation) = state.carve(128, 1) {
