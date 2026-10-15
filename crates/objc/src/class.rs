@@ -68,7 +68,7 @@ impl Ivar {
 /// The mutable half of a class.
 #[derive(Default)]
 struct Contents {
-    methods: HashMap<usize, &'static Method>,
+    methods: crate::address::AddressMap<&'static Method>,
     ivars: Vec<&'static Ivar>,
     protocols: Vec<&'static crate::protocol::Protocol>,
     properties: Vec<&'static crate::property::Property>,
@@ -113,6 +113,34 @@ pub fn generation() -> usize {
     GENERATION.load(Ordering::Acquire)
 }
 
+#[derive(Clone, Copy)]
+struct CachedMethod {
+    class: usize,
+    sel: usize,
+    generation: usize,
+    method: Option<&'static Method>,
+}
+
+const METHOD_SLOTS: usize = 512;
+
+thread_local! {
+    static METHOD_CACHE: [std::cell::Cell<CachedMethod>; METHOD_SLOTS] = const {
+        [const {
+            std::cell::Cell::new(CachedMethod {
+                class: 0,
+                sel: 0,
+                generation: 0,
+                method: None,
+            })
+        }; METHOD_SLOTS]
+    };
+}
+
+fn method_slot(class: usize, sel: usize) -> usize {
+    let key = (class as u64) ^ (sel as u64).rotate_left(32);
+    (crate::address::mix(key) >> 55) as usize % METHOD_SLOTS
+}
+
 /// Every class this runtime has built, so a pointer can be told from a foreign
 /// one.
 ///
@@ -120,16 +148,57 @@ pub fn generation() -> usize {
 /// and reading it as one walks a structure that is not there. Off the send path:
 /// a send already knows its receiver is the guest's, and [`is_known`] is for the
 /// entry points a *host* object can reach - `CFRelease` on a `CGEventRef`, say.
-static KNOWN: LazyLock<RwLock<std::collections::HashSet<usize>>> =
-    LazyLock::new(|| RwLock::new(std::collections::HashSet::new()));
+const CLASS_CAPACITY: usize = 1 << 16;
+const CLASS_STRIDE: usize = size_of::<Class>();
+const NO_ARENA: usize = usize::MAX;
+
+static ARENA: AtomicUsize = AtomicUsize::new(0);
+static BUILT: AtomicUsize = AtomicUsize::new(0);
+static BUILDING: Mutex<()> = Mutex::new(());
+static OVERFLOWED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static OVERFLOW: RwLock<crate::address::AddressMap<()>> =
+    RwLock::new(HashMap::with_hasher(std::hash::BuildHasherDefault::new()));
 
 /// Whether `p` is a class this runtime built.
 pub fn is_known(p: *const Class) -> bool {
-    !p.is_null()
-        && KNOWN
+    if p.is_null() {
+        return false;
+    }
+    let built = BUILT.load(Ordering::Acquire);
+    let offset = (p as usize).wrapping_sub(ARENA.load(Ordering::Relaxed));
+    if offset < built * CLASS_STRIDE && offset.is_multiple_of(CLASS_STRIDE) {
+        return true;
+    }
+    OVERFLOWED.load(Ordering::Acquire)
+        && OVERFLOW
             .read()
             .unwrap_or_else(|e| e.into_inner())
-            .contains(&(p as usize))
+            .contains_key(&(p as usize))
+}
+
+fn arena_slot() -> Option<*mut Class> {
+    if ARENA.load(Ordering::Relaxed) == 0 {
+        // SAFETY: a fresh private anonymous reservation.
+        let mapped = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                CLASS_CAPACITY * CLASS_STRIDE,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_NORESERVE,
+                -1,
+                0,
+            )
+        };
+        let base = match mapped == libc::MAP_FAILED {
+            true => NO_ARENA,
+            false => mapped as usize,
+        };
+        ARENA.store(base, Ordering::Relaxed);
+    }
+    let base = ARENA.load(Ordering::Relaxed);
+    let index = BUILT.load(Ordering::Relaxed);
+    (base != NO_ARENA && index < CLASS_CAPACITY)
+        .then(|| (base + index * CLASS_STRIDE) as *mut Class)
 }
 
 impl Class {
@@ -139,7 +208,7 @@ impl Class {
         is_meta: bool,
         instance_size: usize,
     ) -> &'static Class {
-        let class = Box::leak(Box::new(Class {
+        let class = Class {
             isa: AtomicPtr::new(std::ptr::null_mut()),
             superclass: AtomicPtr::new(superclass),
             name,
@@ -147,12 +216,27 @@ impl Class {
             is_meta,
             registered: AtomicUsize::new(0),
             contents: RwLock::new(Contents::default()),
-        }));
-        KNOWN
-            .write()
-            .unwrap_or_else(|e| e.into_inner())
-            .insert(std::ptr::from_ref(class) as usize);
-        class
+        };
+        let _building = BUILDING.lock().unwrap_or_else(|e| e.into_inner());
+        match arena_slot() {
+            Some(slot) => {
+                // SAFETY: an unused, aligned slot of a reservation that is never
+                // unmapped, published only once written.
+                unsafe { slot.write(class) };
+                BUILT.fetch_add(1, Ordering::Release);
+                // SAFETY: as above.
+                unsafe { &*slot }
+            }
+            None => {
+                let class: &'static Class = Box::leak(Box::new(class));
+                OVERFLOW
+                    .write()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .insert(std::ptr::from_ref(class) as usize, ());
+                OVERFLOWED.store(true, Ordering::Release);
+                class
+            }
+        }
     }
 
     pub fn name(&self) -> *const c_char {
@@ -226,7 +310,23 @@ impl Class {
 
     /// The method `sel` resolves to, searching superclasses.
     pub fn method(&'static self, sel: Sel) -> Option<&'static Method> {
-        self.chain().find_map(|c| c.own_method(sel))
+        let class = std::ptr::from_ref(self) as usize;
+        let generation = generation();
+        let slot = method_slot(class, sel as usize);
+        let cached = METHOD_CACHE.with(|cache| cache[slot].get());
+        if cached.class == class && cached.sel == sel as usize && cached.generation == generation {
+            return cached.method;
+        }
+        let method = self.chain().find_map(|c| c.own_method(sel))?;
+        METHOD_CACHE.with(|cache| {
+            cache[slot].set(CachedMethod {
+                class,
+                sel: sel as usize,
+                generation,
+                method: Some(method),
+            })
+        });
+        Some(method)
     }
 
     /// Install `imp` for `sel`, failing if this class already declares it.
@@ -396,12 +496,33 @@ impl Class {
 /// `NSObject`, and a `Once` re-entered from inside its own initializer does not
 /// return.
 pub fn lookup(name: &CStr) -> Option<&'static Class> {
-    let name = name.to_str().ok()?;
-    CLASSES
+    let address = name.as_ptr() as usize;
+    let generation = NAMED.load(Ordering::Acquire);
+    let slot = (crate::address::mix(address as u64) >> 56) as usize % LOOKUP_SLOTS;
+    let (at, cached_generation, cached) = RECENT_LOOKUPS.with(|recent| recent[slot].get());
+    if at == address
+        && cached_generation == generation
+        && let Some(class) = cached
+        && class.name.as_c_str() == name
+    {
+        return Some(class);
+    }
+    let class = CLASSES
         .read()
         .unwrap_or_else(|e| e.into_inner())
-        .get(name)
-        .copied()
+        .get(name.to_str().ok()?)
+        .copied()?;
+    RECENT_LOOKUPS.with(|recent| recent[slot].set((address, generation, Some(class))));
+    Some(class)
+}
+
+static NAMED: AtomicUsize = AtomicUsize::new(1);
+
+const LOOKUP_SLOTS: usize = 128;
+
+thread_local! {
+    static RECENT_LOOKUPS: [std::cell::Cell<(usize, usize, Option<&'static Class>)>; LOOKUP_SLOTS] =
+        const { [const { std::cell::Cell::new((0, 0, None)) }; LOOKUP_SLOTS] };
 }
 
 /// Every registered class, by name.
@@ -499,7 +620,10 @@ pub fn dispose_pair(class: &'static Class) {
 }
 
 fn with_classes<R>(body: impl FnOnce(&mut HashMap<String, &'static Class>) -> R) -> R {
-    body(&mut CLASSES.write().unwrap_or_else(|e| e.into_inner()))
+    let mut classes = CLASSES.write().unwrap_or_else(|e| e.into_inner());
+    let result = body(&mut classes);
+    NAMED.fetch_add(1, Ordering::Release);
+    result
 }
 
 /// A `&'static Class` as the raw pointer the C API passes around.
