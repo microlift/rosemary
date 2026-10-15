@@ -2,14 +2,17 @@ use std::collections::HashMap;
 use std::ffi::c_void;
 use std::sync::{LazyLock, Mutex, MutexGuard, OnceLock, RwLock};
 
+use crate::address::AddressMap;
 use crate::object::Id;
 
-/// Extra references beyond the one an object is born with.
-static COUNTS: LazyLock<Mutex<HashMap<usize, usize>>> =
-    LazyLock::new(|| Mutex::new(HashMap::new()));
+const SHARDS: usize = 64;
 
-fn counts() -> MutexGuard<'static, HashMap<usize, usize>> {
-    COUNTS.lock().unwrap_or_else(|e| e.into_inner())
+static COUNTS: [Mutex<AddressMap<usize>>; SHARDS] =
+    [const { Mutex::new(HashMap::with_hasher(std::hash::BuildHasherDefault::new())) }; SHARDS];
+
+fn counts(object: Id) -> MutexGuard<'static, AddressMap<usize>> {
+    let shard = (crate::address::mix(object as u64) >> 58) as usize % SHARDS;
+    COUNTS[shard].lock().unwrap_or_else(|e| e.into_inner())
 }
 
 /// How an `OS_object` counts references: `(retain, release, count)`.
@@ -59,7 +62,7 @@ pub fn retain(object: Id) -> Id {
         (refcount.retain)(object);
         return object;
     }
-    let mut map = counts();
+    let mut map = counts(object);
     let extra = map.entry(object as usize).or_insert(0);
     if crate::debug::enabled() {
         *extra = extra
@@ -69,6 +72,13 @@ pub fn retain(object: Id) -> Id {
         *extra += 1;
     }
     object
+}
+
+pub fn make_immortal(object: Id) {
+    if object.is_null() {
+        return;
+    }
+    counts(object).insert(object as usize, usize::MAX / 2);
 }
 
 /// Drop a reference, deallocating at zero.
@@ -92,7 +102,7 @@ pub fn release(object: Id) {
         return (refcount.release)(object);
     }
     {
-        let mut map = counts();
+        let mut map = counts(object);
         if let Some(extra) = map.get_mut(&(object as usize)) {
             *extra -= 1;
             if *extra == 0 {
@@ -116,7 +126,7 @@ pub fn retain_count(object: Id) -> usize {
     if let Some(refcount) = os_object_refcount(object) {
         return (refcount.count)(object);
     }
-    1 + counts().get(&(object as usize)).copied().unwrap_or(0)
+    1 + counts(object).get(&(object as usize)).copied().unwrap_or(0)
 }
 
 /// Send `-dealloc` if there is one, then give the memory back.
@@ -163,19 +173,21 @@ struct Pool {
 /// The depth of the pool that was pushed, plus one so it is never null. Apple
 /// returns an interior pointer; nothing may read it either way.
 pub fn pool_push() -> *mut c_void {
-    POOLS.with(|pools| {
-        let mut pools = pools.borrow_mut();
-        let token = if crate::debug::enabled() {
-            crate::debug::new_pool(thread_id())
-        } else {
-            (pools.len() + 1) as *mut c_void
-        };
-        pools.push(Pool {
-            token,
-            objects: Vec::new(),
-        });
-        token
-    })
+    POOLS
+        .try_with(|pools| {
+            let mut pools = pools.borrow_mut();
+            let token = if crate::debug::enabled() {
+                crate::debug::new_pool(thread_id())
+            } else {
+                (pools.len() + 1) as *mut c_void
+            };
+            pools.push(Pool {
+                token,
+                objects: Vec::new(),
+            });
+            token
+        })
+        .unwrap_or(std::ptr::dangling_mut())
 }
 
 /// Release everything added since the matching [`pool_push`].
@@ -193,7 +205,11 @@ pub fn pool_pop(token: *mut c_void) {
         }
     }
     loop {
-        let Some(pool) = POOLS.with(|pools| pools.borrow_mut().pop()) else {
+        let Some(pool) = POOLS
+            .try_with(|pools| pools.borrow_mut().pop())
+            .ok()
+            .flatten()
+        else {
             if crate::debug::enabled() {
                 crate::fail!("objc debug: autorelease pool pop with an empty pool stack");
             }
@@ -221,10 +237,13 @@ pub fn autorelease(object: Id) -> Id {
         return object;
     }
     crate::debug::validate(object, "autorelease");
-    POOLS.with(|pools| match pools.borrow_mut().last_mut() {
+    let pushed = POOLS.try_with(|pools| match pools.borrow_mut().last_mut() {
         Some(pool) => pool.objects.push(object),
         None => no_pool(),
     });
+    if pushed.is_err() {
+        no_pool();
+    }
     object
 }
 
