@@ -734,7 +734,7 @@ unsafe extern "C" fn shared_manager(class: Id, _sel: Sel) -> Id {
         };
         // Retained forever, as every singleton in this tree is: one a guest can
         // release is one it can make dangle by releasing what it never owned.
-        objc::arc::retain(object);
+        objc::arc::make_immortal(object);
         object as usize
     }) as Id
 }
