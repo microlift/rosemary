@@ -30,7 +30,9 @@ fn current() -> Id {
     static CURRENT: OnceLock<usize> = OnceLock::new();
     *CURRENT.get_or_init(|| {
         let class = objc::class::lookup(c"NSAnimationContext").expect("declared");
-        objc::object::create_instance(class, 0) as usize
+        let context = objc::object::create_instance(class, 0);
+        objc::arc::make_immortal(context);
+        context as usize
     }) as Id
 }
 
