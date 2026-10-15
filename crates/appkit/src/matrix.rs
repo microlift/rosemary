@@ -38,6 +38,8 @@ struct Matrix {
     cells: Vec<usize>,
     /// The button new cells are copied from, retained and in no view tree.
     prototype: usize,
+    /// Factory class for newly created cells.
+    cell_class: usize,
     /// The cell chosen outside radio mode, where no state records it.
     selected: Option<usize>,
 }
@@ -59,6 +61,7 @@ impl Default for Matrix {
             allows_empty_selection: false,
             cells: Vec::new(),
             prototype: 0,
+            cell_class: 0,
             selected: None,
         }
     }
@@ -323,6 +326,94 @@ unsafe extern "C" fn cell_at(receiver: Id, _sel: Sel, row: isize, column: isize)
     cell_at_index(&matrix, index_of(&matrix, row, column))
 }
 
+unsafe extern "C" fn cell_frame_at(
+    receiver: Id,
+    _sel: Sel,
+    row: isize,
+    column: isize,
+) -> NSRect {
+    let matrix = read(receiver);
+    let Ok(r) = usize::try_from(row) else {
+        return NSRect::default();
+    };
+    let Ok(c) = usize::try_from(column) else {
+        return NSRect::default();
+    };
+    if r >= matrix.rows || c >= matrix.columns {
+        return NSRect::default();
+    }
+    NSRect {
+        origin: NSPoint {
+            x: c as f64 * (matrix.cell_size.width + matrix.spacing.width),
+            y: r as f64 * (matrix.cell_size.height + matrix.spacing.height),
+        },
+        size: matrix.cell_size,
+    }
+}
+
+unsafe extern "C" fn get_row_column_of_cell(
+    receiver: Id,
+    _sel: Sel,
+    row: *mut isize,
+    column: *mut isize,
+    cell: Id,
+) -> u8 {
+    let button = button_of(cell) as usize;
+    let matrix = read(receiver);
+    let Some(at) = matrix.cells.iter().position(|c| *c == button) else {
+        return 0;
+    };
+    let cols = matrix.columns.max(1);
+    // SAFETY: the caller's out-pointers, either of which may be null.
+    unsafe {
+        if !row.is_null() {
+            *row = (at / cols) as isize;
+        }
+        if !column.is_null() {
+            *column = (at % cols) as isize;
+        }
+    }
+    1
+}
+
+unsafe extern "C" fn get_row_column_for_point(
+    receiver: Id,
+    _sel: Sel,
+    row: *mut isize,
+    column: *mut isize,
+    point: NSPoint,
+) -> u8 {
+    let matrix = read(receiver);
+    if matrix.rows == 0 || matrix.columns == 0 {
+        return 0;
+    }
+    let step_x = matrix.cell_size.width + matrix.spacing.width;
+    let step_y = matrix.cell_size.height + matrix.spacing.height;
+    if step_x <= 0.0 || step_y <= 0.0 || point.x < 0.0 || point.y < 0.0 {
+        return 0;
+    }
+    let c = (point.x / step_x) as usize;
+    let r = (point.y / step_y) as usize;
+    if r >= matrix.rows || c >= matrix.columns {
+        return 0;
+    }
+    let offset_x = point.x - c as f64 * step_x;
+    let offset_y = point.y - r as f64 * step_y;
+    if offset_x > matrix.cell_size.width || offset_y > matrix.cell_size.height {
+        return 0;
+    }
+    // SAFETY: the caller's out-pointers, either of which may be null.
+    unsafe {
+        if !row.is_null() {
+            *row = r as isize;
+        }
+        if !column.is_null() {
+            *column = c as isize;
+        }
+    }
+    1
+}
+
 unsafe extern "C" fn cells(receiver: Id, _sel: Sel) -> Id {
     let values: Vec<*const std::ffi::c_void> = read(receiver)
         .cells
@@ -351,6 +442,23 @@ unsafe extern "C" fn cell_with_tag(receiver: Id, _sel: Sel, tag: isize) -> Id {
 unsafe extern "C" fn selected_cell(receiver: Id, _sel: Sel) -> Id {
     let matrix = read(receiver);
     cell_at_index(&matrix, selected_index(&matrix))
+}
+
+unsafe extern "C" fn selected_cells(receiver: Id, sel: Sel) -> Id {
+    // SAFETY: caller passes live receiver.
+    let cell = unsafe { selected_cell(receiver, sel) };
+    let values: Vec<*const std::ffi::c_void> = if cell.is_null() {
+        Vec::new()
+    } else {
+        vec![cell as *const _]
+    };
+    let array = corefoundation::collections::new_array(
+        &values,
+        corefoundation::callbacks::Policy::from_type_callbacks(),
+        false,
+    );
+    // SAFETY: a fresh array.
+    unsafe { corefoundation::api::CFAutorelease(array) as Id }
 }
 
 unsafe extern "C" fn selected_row(receiver: Id, _sel: Sel) -> isize {
@@ -400,11 +508,27 @@ unsafe extern "C" fn select_cell_with_tag(receiver: Id, sel: Sel, tag: isize) ->
 }
 
 unsafe extern "C" fn select_cell(receiver: Id, _sel: Sel, cell: Id) {
+    if cell.is_null() {
+        let matrix = read(receiver);
+        if matrix.mode == mode::RADIO && !matrix.allows_empty_selection {
+            return;
+        }
+        select_index(receiver, None);
+        return;
+    }
     let button = button_of(cell) as usize;
     let at = read(receiver).cells.iter().position(|c| *c == button);
     if at.is_some() {
         select_index(receiver, at);
     }
+}
+
+unsafe extern "C" fn deselect_selected_cell(receiver: Id, _sel: Sel) {
+    let matrix = read(receiver);
+    if matrix.mode == mode::RADIO && !matrix.allows_empty_selection {
+        return;
+    }
+    select_index(receiver, None);
 }
 
 unsafe extern "C" fn deselect_all_cells(receiver: Id, _sel: Sel) {
@@ -422,6 +546,10 @@ unsafe extern "C" fn set_state_at(receiver: Id, _sel: Sel, state: isize, row: is
     };
     match matrix.mode {
         mode::RADIO if state != 0 => select_index(receiver, Some(at)),
+        mode::RADIO if matrix.allows_empty_selection && matrix.selected == Some(at) => {
+            select_index(receiver, None);
+        }
+        mode::RADIO => {}
         _ => set_state(matrix.cells[at] as Id, state),
     }
 }
@@ -477,6 +605,116 @@ unsafe extern "C" fn remove_row(receiver: Id, _sel: Sel, row: isize) {
             other => other,
         };
         m.cells.drain(start..end).collect()
+    });
+    for button in removed {
+        discard(button as Id);
+    }
+    lay_out(receiver);
+}
+
+/// `-insertColumn:`: a column of new cells, copied from the prototype.
+unsafe extern "C" fn insert_column(receiver: Id, _sel: Sel, column: isize) {
+    let matrix = read(receiver);
+    let column = usize::try_from(column).unwrap_or(0).min(matrix.columns);
+    // A matrix with no rows gains one, as AppKit's does.
+    let rows = matrix.rows.max(1);
+    let old_cols = matrix.columns;
+    let new_cols = old_cols + 1;
+
+    let mut new_cells = Vec::with_capacity(rows * new_cols);
+    let mut old_iter = matrix.cells.into_iter();
+    for _ in 0..rows {
+        for _ in 0..column {
+            if let Some(c) = old_iter.next() {
+                new_cells.push(c);
+            }
+        }
+        let button = new_cell(receiver);
+        adopt(receiver, button);
+        new_cells.push(button as usize);
+        for _ in column..old_cols {
+            if let Some(c) = old_iter.next() {
+                new_cells.push(c);
+            }
+        }
+    }
+
+    update(receiver, |m| {
+        m.rows = rows;
+        m.columns = new_cols;
+        m.cells = new_cells;
+        if let Some(s) = m.selected {
+            let (r, c) = (s / old_cols.max(1), s % old_cols.max(1));
+            let new_c = if c >= column { c + 1 } else { c };
+            m.selected = Some(r * new_cols + new_c);
+        }
+    });
+    lay_out(receiver);
+}
+
+unsafe extern "C" fn add_column(receiver: Id, sel: Sel) {
+    let columns = read(receiver).columns as isize;
+    // SAFETY: the same matrix.
+    unsafe { insert_column(receiver, sel, columns) };
+}
+
+unsafe extern "C" fn remove_column(receiver: Id, _sel: Sel, column: isize) {
+    let Ok(column) = usize::try_from(column) else {
+        return;
+    };
+    let matrix = read(receiver);
+    if column >= matrix.columns {
+        return;
+    }
+    let old_cols = matrix.columns;
+    let new_cols = old_cols - 1;
+    let rows = if new_cols == 0 { 0 } else { matrix.rows };
+
+    let mut removed = Vec::new();
+    let mut new_cells = Vec::with_capacity(rows * new_cols);
+    let mut old_iter = matrix.cells.into_iter();
+    for _ in 0..matrix.rows {
+        for _ in 0..column {
+            if let Some(c) = old_iter.next() {
+                if new_cols > 0 {
+                    new_cells.push(c);
+                } else {
+                    removed.push(c);
+                }
+            }
+        }
+        if let Some(discard_cell) = old_iter.next() {
+            removed.push(discard_cell);
+        }
+        for _ in (column + 1)..old_cols {
+            if let Some(c) = old_iter.next() {
+                if new_cols > 0 {
+                    new_cells.push(c);
+                } else {
+                    removed.push(c);
+                }
+            }
+        }
+    }
+
+    update(receiver, |m| {
+        m.rows = rows;
+        m.columns = new_cols;
+        m.cells = new_cells;
+        m.selected = match m.selected {
+            Some(_) if new_cols == 0 => None,
+            Some(s) => {
+                let (r, c) = (s / old_cols.max(1), s % old_cols.max(1));
+                if c == column {
+                    None
+                } else if c > column {
+                    Some(r * new_cols + (c - 1))
+                } else {
+                    Some(r * new_cols + c)
+                }
+            }
+            None => None,
+        };
     });
     for button in removed {
         discard(button as Id);
@@ -589,6 +827,85 @@ unsafe extern "C" fn set_prototype(receiver: Id, _sel: Sel, cell: Id) {
     objc::arc::release(old as Id);
 }
 
+unsafe extern "C" fn cell_class(receiver: Id, _sel: Sel) -> Id {
+    let m = read(receiver);
+    if m.cell_class != 0 {
+        return m.cell_class as Id;
+    }
+    if m.prototype != 0 {
+        let cell = crate::cell::cell_of(m.prototype as Id);
+        if !cell.is_null() {
+            // SAFETY: cell is an NSCell proxy.
+            unsafe {
+                let f: unsafe extern "C" fn(Id, Sel) -> Id =
+                    std::mem::transmute(objc::msg::entry());
+                return f(cell, objc::sel::get("class"));
+            }
+        }
+    }
+    objc::class::lookup(c"NSButtonCell")
+        .or_else(|| objc::class::lookup(c"NSActionCell"))
+        .map_or(std::ptr::null_mut(), |c| c as *const _ as *mut _)
+}
+
+unsafe extern "C" fn set_cell_class(receiver: Id, _sel: Sel, class: Id) {
+    update(receiver, |m| m.cell_class = class as usize);
+}
+
+unsafe extern "C" fn init_with_frame_mode_prototype_rows_cols(
+    receiver: Id,
+    sel: Sel,
+    frame: NSRect,
+    mode: usize,
+    prototype: Id,
+    rows: isize,
+    columns: isize,
+) -> Id {
+    // SAFETY: `-initWithFrame:` is `id (id, SEL, NSRect)` on every view.
+    let matrix = unsafe {
+        let f: unsafe extern "C" fn(Id, Sel, NSRect) -> Id =
+            std::mem::transmute(objc::msg::entry());
+        f(receiver, objc::sel::get("initWithFrame:"), frame)
+    };
+    if matrix.is_null() {
+        return matrix;
+    }
+    update(matrix, |m| {
+        m.mode = mode;
+    });
+    if !prototype.is_null() {
+        unsafe { set_prototype(matrix, sel, prototype) };
+    }
+    unsafe { renew_rows(matrix, sel, rows, columns) };
+    matrix
+}
+
+unsafe extern "C" fn init_with_frame_mode_cell_class_rows_cols(
+    receiver: Id,
+    sel: Sel,
+    frame: NSRect,
+    mode: usize,
+    cell_class: Id,
+    rows: isize,
+    columns: isize,
+) -> Id {
+    // SAFETY: `-initWithFrame:` is `id (id, SEL, NSRect)` on every view.
+    let matrix = unsafe {
+        let f: unsafe extern "C" fn(Id, Sel, NSRect) -> Id =
+            std::mem::transmute(objc::msg::entry());
+        f(receiver, objc::sel::get("initWithFrame:"), frame)
+    };
+    if matrix.is_null() {
+        return matrix;
+    }
+    update(matrix, |m| {
+        m.mode = mode;
+        m.cell_class = cell_class as usize;
+    });
+    unsafe { renew_rows(matrix, sel, rows, columns) };
+    matrix
+}
+
 /// What a nib's `NSMatrix` holds, for [`crate::decode`].
 pub(crate) struct Archived {
     pub rows: usize,
@@ -608,6 +925,9 @@ pub(crate) fn set_archived(receiver: Id, archived: Archived) {
     for cell in &archived.cells {
         adopt(receiver, *cell);
     }
+    let selected_index_opt = archived
+        .selected
+        .map(|(row, column)| row * archived.columns.max(1) + column);
     update(receiver, |m| {
         m.rows = archived.rows;
         m.columns = archived.columns;
@@ -621,10 +941,11 @@ pub(crate) fn set_archived(receiver: Id, archived: Archived) {
         m.allows_empty_selection = archived.allows_empty_selection;
         m.cells = archived.cells.iter().map(|c| *c as usize).collect();
         m.prototype = archived.prototype as usize;
-        m.selected = archived
-            .selected
-            .map(|(row, column)| row * archived.columns.max(1) + column);
+        m.selected = selected_index_opt;
     });
+    if selected_index_opt.is_some() {
+        select_index(receiver, selected_index_opt);
+    }
     lay_out(receiver);
 }
 
@@ -637,19 +958,27 @@ pub(crate) fn install() {
         "numberOfColumns" => number_of_columns, c"q16@0:8";
         "getNumberOfRows:columns:" => get_number_of_rows, c"v32@0:8^q16^q24";
         "cellAtRow:column:" => cell_at, c"@32@0:8q16q24";
+        "cellFrameAtRow:column:" => cell_frame_at, c"{CGRect={CGPoint=dd}{CGSize=dd}}32@0:8q16q24";
+        "getRow:column:ofCell:" => get_row_column_of_cell, c"c40@0:8^q16^q24@32";
+        "getRow:column:forPoint:" => get_row_column_for_point, c"c48@0:8^q16^q24{CGPoint=dd}32";
         "cells" => cells, c"@16@0:8";
         "cellWithTag:" => cell_with_tag, c"@24@0:8q16";
         "selectedCell" => selected_cell, c"@16@0:8";
+        "selectedCells" => selected_cells, c"@16@0:8";
         "selectedRow" => selected_row, c"q16@0:8";
         "selectedColumn" => selected_column, c"q16@0:8";
         "selectCellAtRow:column:" => select_cell_at, c"v32@0:8q16q24";
         "selectCellWithTag:" => select_cell_with_tag, c"c24@0:8q16";
         "selectCell:" => select_cell, c"v24@0:8@16";
+        "deselectSelectedCell" => deselect_selected_cell, c"v16@0:8";
         "deselectAllCells" => deselect_all_cells, c"v16@0:8";
         "setState:atRow:column:" => set_state_at, c"v40@0:8q16q24q32";
         "insertRow:" => insert_row, c"v24@0:8q16";
         "addRow" => add_row, c"v16@0:8";
         "removeRow:" => remove_row, c"v24@0:8q16";
+        "insertColumn:" => insert_column, c"v24@0:8q16";
+        "addColumn" => add_column, c"v16@0:8";
+        "removeColumn:" => remove_column, c"v24@0:8q16";
         "renewRows:columns:" => renew_rows, c"v32@0:8q16q24";
         "sizeToCells" => size_to_cells, c"v16@0:8";
         "setMode:" => set_mode, c"v24@0:8Q16";
@@ -662,5 +991,336 @@ pub(crate) fn install() {
         "intercellSpacing" => intercell_spacing, c"{CGSize=dd}16@0:8";
         "prototype" => prototype, c"@16@0:8";
         "setPrototype:" => set_prototype, c"v24@0:8@16";
+        "cellClass" => cell_class, c"#16@0:8";
+        "setCellClass:" => set_cell_class, c"v24@0:8#16";
+        "initWithFrame:mode:prototype:numberOfRows:numberOfColumns:" =>
+            init_with_frame_mode_prototype_rows_cols,
+            c"@80@0:8{CGRect={CGPoint=dd}{CGSize=dd}}16Q48@56q64q72";
+        "initWithFrame:mode:cellClass:numberOfRows:numberOfColumns:" =>
+            init_with_frame_mode_cell_class_rows_cols,
+            c"@80@0:8{CGRect={CGPoint=dd}{CGSize=dd}}16Q48#56q64q72";
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn matrix_init_with_frame_mode_cell_class_rows_cols() {
+        crate::bootstrap();
+        let class = objc::class::lookup(c"NSMatrix").expect("NSMatrix");
+        let matrix = objc::object::create_instance(class, 0);
+        let init_sel = objc::sel::get("initWithFrame:mode:cellClass:numberOfRows:numberOfColumns:");
+        // SAFETY: calling designated initializer on fresh instance.
+        let matrix = unsafe {
+            let f: unsafe extern "C" fn(Id, Sel, NSRect, usize, Id, isize, isize) -> Id =
+                std::mem::transmute(objc::msg::entry());
+            f(
+                matrix,
+                init_sel,
+                NSRect::default(),
+                mode::RADIO,
+                std::ptr::null_mut(),
+                3,
+                2,
+            )
+        };
+        assert!(!matrix.is_null());
+
+        let m = read(matrix);
+        assert_eq!(m.rows, 3);
+        assert_eq!(m.columns, 2);
+        assert_eq!(m.cells.len(), 6);
+        assert_eq!(m.mode, mode::RADIO);
+
+        // SAFETY: getter calls.
+        unsafe {
+            let get_rows: unsafe extern "C" fn(Id, Sel) -> isize =
+                std::mem::transmute(objc::msg::entry());
+            let get_cols: unsafe extern "C" fn(Id, Sel) -> isize =
+                std::mem::transmute(objc::msg::entry());
+            assert_eq!(get_rows(matrix, objc::sel::get("numberOfRows")), 3);
+            assert_eq!(get_cols(matrix, objc::sel::get("numberOfColumns")), 2);
+        }
+
+        objc::arc::release(matrix);
+    }
+
+    #[test]
+    fn matrix_cell_frame_at_and_get_row_column_for_point() {
+        crate::bootstrap();
+        let class = objc::class::lookup(c"NSMatrix").expect("NSMatrix");
+        let matrix = objc::object::create_instance(class, 0);
+        // SAFETY: designated initializer.
+        let matrix = unsafe {
+            let f: unsafe extern "C" fn(Id, Sel, NSRect, usize, Id, isize, isize) -> Id =
+                std::mem::transmute(objc::msg::entry());
+            f(
+                matrix,
+                objc::sel::get("initWithFrame:mode:cellClass:numberOfRows:numberOfColumns:"),
+                NSRect::default(),
+                mode::RADIO,
+                std::ptr::null_mut(),
+                2,
+                3,
+            )
+        };
+
+        // SAFETY: set cell size to 50x20 and spacing to 5x5.
+        unsafe {
+            let set_size: unsafe extern "C" fn(Id, Sel, NSSize) =
+                std::mem::transmute(objc::msg::entry());
+            set_size(
+                matrix,
+                objc::sel::get("setCellSize:"),
+                NSSize {
+                    width: 50.0,
+                    height: 20.0,
+                },
+            );
+            set_size(
+                matrix,
+                objc::sel::get("setIntercellSpacing:"),
+                NSSize {
+                    width: 5.0,
+                    height: 5.0,
+                },
+            );
+        }
+
+        // Cell frame at row 1, col 2 -> x = 2 * (50 + 5) = 110, y = 1 * (20 + 5) = 25
+        unsafe {
+            let cell_frame: unsafe extern "C" fn(Id, Sel, isize, isize) -> NSRect =
+                std::mem::transmute(objc::msg::entry_stret());
+            let frame = cell_frame(matrix, objc::sel::get("cellFrameAtRow:column:"), 1, 2);
+            assert_eq!(frame.origin.x, 110.0);
+            assert_eq!(frame.origin.y, 25.0);
+            assert_eq!(frame.size.width, 50.0);
+            assert_eq!(frame.size.height, 20.0);
+
+            // Out-of-bounds row/col
+            let oob = cell_frame(matrix, objc::sel::get("cellFrameAtRow:column:"), 5, 5);
+            assert_eq!(oob, NSRect::default());
+        }
+
+        // Hit testing via getRow:column:forPoint:
+        unsafe {
+            let get_point: unsafe extern "C" fn(Id, Sel, *mut isize, *mut isize, NSPoint) -> u8 =
+                std::mem::transmute(objc::msg::entry());
+            let mut r: isize = -1;
+            let mut c: isize = -1;
+
+            // Point inside cell (1, 2)
+            let hit = get_point(
+                matrix,
+                objc::sel::get("getRow:column:forPoint:"),
+                &mut r,
+                &mut c,
+                NSPoint { x: 120.0, y: 30.0 },
+            );
+            assert_eq!(hit, 1);
+            assert_eq!(r, 1);
+            assert_eq!(c, 2);
+
+            // Point in gap between col 0 and 1 (x: 52 is in gap between 50 and 55)
+            let hit_gap = get_point(
+                matrix,
+                objc::sel::get("getRow:column:forPoint:"),
+                &mut r,
+                &mut c,
+                NSPoint { x: 52.0, y: 10.0 },
+            );
+            assert_eq!(hit_gap, 0);
+
+            // Point outside bounds
+            let hit_oob = get_point(
+                matrix,
+                objc::sel::get("getRow:column:forPoint:"),
+                &mut r,
+                &mut c,
+                NSPoint {
+                    x: 1000.0,
+                    y: 1000.0,
+                },
+            );
+            assert_eq!(hit_oob, 0);
+        }
+
+        objc::arc::release(matrix);
+    }
+
+    #[test]
+    fn matrix_column_insertion_and_removal() {
+        crate::bootstrap();
+        let class = objc::class::lookup(c"NSMatrix").expect("NSMatrix");
+        let matrix = objc::object::create_instance(class, 0);
+        // SAFETY: designated initializer 2 rows x 2 cols.
+        let matrix = unsafe {
+            let f: unsafe extern "C" fn(Id, Sel, NSRect, usize, Id, isize, isize) -> Id =
+                std::mem::transmute(objc::msg::entry());
+            f(
+                matrix,
+                objc::sel::get("initWithFrame:mode:cellClass:numberOfRows:numberOfColumns:"),
+                NSRect::default(),
+                mode::RADIO,
+                std::ptr::null_mut(),
+                2,
+                2,
+            )
+        };
+
+        // Select cell at (0, 1) -> index 1
+        unsafe {
+            let select_at: unsafe extern "C" fn(Id, Sel, isize, isize) =
+                std::mem::transmute(objc::msg::entry());
+            select_at(matrix, objc::sel::get("selectCellAtRow:column:"), 0, 1);
+        }
+        assert_eq!(read(matrix).selected, Some(1));
+
+        // Insert column at index 1 -> old col 1 shifts to col 2, so selection becomes (0, 2) -> index 2
+        unsafe {
+            let insert_col: unsafe extern "C" fn(Id, Sel, isize) =
+                std::mem::transmute(objc::msg::entry());
+            insert_col(matrix, objc::sel::get("insertColumn:"), 1);
+        }
+        let m = read(matrix);
+        assert_eq!(m.rows, 2);
+        assert_eq!(m.columns, 3);
+        assert_eq!(m.cells.len(), 6);
+        assert_eq!(m.selected, Some(2));
+
+        // Add column at end
+        unsafe {
+            let add_col: unsafe extern "C" fn(Id, Sel) = std::mem::transmute(objc::msg::entry());
+            add_col(matrix, objc::sel::get("addColumn"));
+        }
+        let m = read(matrix);
+        assert_eq!(m.rows, 2);
+        assert_eq!(m.columns, 4);
+        assert_eq!(m.cells.len(), 8);
+
+        // Remove column at index 2 (the selected column) -> selection clears
+        unsafe {
+            let remove_col: unsafe extern "C" fn(Id, Sel, isize) =
+                std::mem::transmute(objc::msg::entry());
+            remove_col(matrix, objc::sel::get("removeColumn:"), 2);
+        }
+        let m = read(matrix);
+        assert_eq!(m.rows, 2);
+        assert_eq!(m.columns, 3);
+        assert_eq!(m.cells.len(), 6);
+        assert_eq!(m.selected, None);
+
+        objc::arc::release(matrix);
+    }
+
+    #[test]
+    fn matrix_selection_and_desync_fix() {
+        crate::bootstrap();
+        let class = objc::class::lookup(c"NSMatrix").expect("NSMatrix");
+        let matrix = objc::object::create_instance(class, 0);
+        // SAFETY: designated initializer.
+        let matrix = unsafe {
+            let f: unsafe extern "C" fn(Id, Sel, NSRect, usize, Id, isize, isize) -> Id =
+                std::mem::transmute(objc::msg::entry());
+            f(
+                matrix,
+                objc::sel::get("initWithFrame:mode:cellClass:numberOfRows:numberOfColumns:"),
+                NSRect::default(),
+                mode::RADIO,
+                std::ptr::null_mut(),
+                2,
+                2,
+            )
+        };
+
+        // Select cell at (1, 1)
+        unsafe {
+            let select_at: unsafe extern "C" fn(Id, Sel, isize, isize) =
+                std::mem::transmute(objc::msg::entry());
+            let selected_row: unsafe extern "C" fn(Id, Sel) -> isize =
+                std::mem::transmute(objc::msg::entry());
+            let selected_col: unsafe extern "C" fn(Id, Sel) -> isize =
+                std::mem::transmute(objc::msg::entry());
+            let selected_cells_fn: unsafe extern "C" fn(Id, Sel) -> Id =
+                std::mem::transmute(objc::msg::entry());
+
+            select_at(matrix, objc::sel::get("selectCellAtRow:column:"), 1, 1);
+            assert_eq!(selected_row(matrix, objc::sel::get("selectedRow")), 1);
+            assert_eq!(selected_col(matrix, objc::sel::get("selectedColumn")), 1);
+
+            let cells_array = selected_cells_fn(matrix, objc::sel::get("selectedCells"));
+            assert!(!cells_array.is_null());
+            assert_eq!(
+                corefoundation::api::CFArrayGetCount(cells_array as *const _),
+                1
+            );
+
+            // In radio mode without allows_empty_selection, deselecting is a no-op
+            let deselect: unsafe extern "C" fn(Id, Sel) = std::mem::transmute(objc::msg::entry());
+            deselect(matrix, objc::sel::get("deselectSelectedCell"));
+            assert_eq!(selected_row(matrix, objc::sel::get("selectedRow")), 1);
+
+            // Allow empty selection, then deselectSelectedCell succeeds
+            let set_allows_empty: unsafe extern "C" fn(Id, Sel, u8) =
+                std::mem::transmute(objc::msg::entry());
+            set_allows_empty(matrix, objc::sel::get("setAllowsEmptySelection:"), 1);
+            deselect(matrix, objc::sel::get("deselectSelectedCell"));
+            assert_eq!(selected_row(matrix, objc::sel::get("selectedRow")), -1);
+            assert_eq!(selected_col(matrix, objc::sel::get("selectedColumn")), -1);
+
+            let empty_cells_array = selected_cells_fn(matrix, objc::sel::get("selectedCells"));
+            assert_eq!(
+                corefoundation::api::CFArrayGetCount(empty_cells_array as *const _),
+                0
+            );
+
+            // selectCell:nil with allows_empty_selection
+            select_at(matrix, objc::sel::get("selectCellAtRow:column:"), 0, 0);
+            assert_eq!(selected_row(matrix, objc::sel::get("selectedRow")), 0);
+            let select_cell_fn: unsafe extern "C" fn(Id, Sel, Id) =
+                std::mem::transmute(objc::msg::entry());
+            select_cell_fn(matrix, objc::sel::get("selectCell:"), std::ptr::null_mut());
+            assert_eq!(selected_row(matrix, objc::sel::get("selectedRow")), -1);
+        }
+
+        // Test NIB decoded selection sync
+        let cell0 = new_cell(std::ptr::null_mut());
+        let cell1 = new_cell(std::ptr::null_mut());
+        let matrix2 = objc::object::create_instance(class, 0);
+        // SAFETY: -init on view.
+        let matrix2 = unsafe {
+            let f: unsafe extern "C" fn(Id, Sel, NSRect) -> Id =
+                std::mem::transmute(objc::msg::entry());
+            f(matrix2, objc::sel::get("initWithFrame:"), NSRect::default())
+        };
+        set_archived(
+            matrix2,
+            Archived {
+                rows: 2,
+                columns: 1,
+                cell_size: None,
+                spacing: None,
+                mode: mode::RADIO,
+                allows_empty_selection: false,
+                cells: vec![cell0, cell1],
+                prototype: std::ptr::null_mut(),
+                selected: Some((1, 0)),
+            },
+        );
+
+        // Check that button state was synchronized and returns row 1 immediately
+        unsafe {
+            let selected_row: unsafe extern "C" fn(Id, Sel) -> isize =
+                std::mem::transmute(objc::msg::entry());
+            let selected_col: unsafe extern "C" fn(Id, Sel) -> isize =
+                std::mem::transmute(objc::msg::entry());
+            assert_eq!(selected_row(matrix2, objc::sel::get("selectedRow")), 1);
+            assert_eq!(selected_col(matrix2, objc::sel::get("selectedColumn")), 0);
+        }
+
+        objc::arc::release(matrix);
+        objc::arc::release(matrix2);
+    }
 }

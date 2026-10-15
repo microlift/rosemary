@@ -41,6 +41,9 @@ pub unsafe fn once<F: FnOnce()>(at: u64, body: F) -> i32 {
     }
 
     let state = record.u32(STATE);
+    if state.load(Ordering::Acquire) == DONE {
+        return 0;
+    }
     let mut body = Some(body);
     loop {
         match state.compare_exchange(NEVER, RUNNING, Ordering::Acquire, Ordering::Acquire) {

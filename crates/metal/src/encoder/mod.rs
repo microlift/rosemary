@@ -20,6 +20,8 @@ use render::*;
 use retire::*;
 use state::*;
 
+use objc::address::AddressSet;
+
 pub(crate) use pass::RenderPassDescriptor;
 pub(crate) use queue::new_command_queue;
 pub(crate) use retire::Submission;
@@ -72,30 +74,6 @@ impl Default for BufferBinding {
         }
     }
 }
-
-/// A hasher for object addresses, which are already unique: the command
-/// buffer's retained set is probed on every bind.
-#[derive(Default)]
-struct AddressHasher(u64);
-
-impl std::hash::Hasher for AddressHasher {
-    fn finish(&self) -> u64 {
-        self.0
-    }
-
-    fn write(&mut self, bytes: &[u8]) {
-        for byte in bytes {
-            self.0 = (self.0 ^ u64::from(*byte)).wrapping_mul(0x100_0000_01b3);
-        }
-    }
-
-    fn write_usize(&mut self, address: usize) {
-        let mixed = (address as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15);
-        self.0 = mixed ^ (mixed >> 32);
-    }
-}
-
-type AddressSet = std::collections::HashSet<usize, std::hash::BuildHasherDefault<AddressHasher>>;
 
 /// One descriptor write, as the encoder last recorded it for a set.
 #[derive(Clone, Copy)]

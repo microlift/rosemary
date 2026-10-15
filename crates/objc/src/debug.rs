@@ -601,6 +601,26 @@ mod tests {
                 crate::arc::release(object);
                 crate::arc::release(object);
             }
+            "exit-pool" => {
+                struct Teardown;
+                impl Drop for Teardown {
+                    fn drop(&mut self) {
+                        let pool = crate::arc::pool_push();
+                        crate::arc::pool_pop(pool);
+                    }
+                }
+                thread_local! {
+                    static TEARDOWN: Teardown = const { Teardown };
+                }
+                std::thread::spawn(|| {
+                    // Registered before the pools, so destroyed after them.
+                    TEARDOWN.with(|_| {});
+                    let pool = crate::arc::pool_push();
+                    crate::arc::pool_pop(pool);
+                })
+                .join()
+                .expect("a pool pushed and popped at thread exit is a no-op");
+            }
             "dealloc" => {
                 let object = object(c"RosemaryDebugDealloc", Some(incomplete_dealloc as Imp));
                 crate::arc::release(object);
@@ -677,6 +697,7 @@ mod tests {
             ("overrelease", Some("use of finalized")),
             ("dealloc", Some("without calling super")),
             ("pool", Some("already popped")),
+            ("exit-pool", None),
             ("weak", Some("weak slot was never initialized")),
             ("property", Some("past the")),
             ("class", Some("invalid class handle")),
