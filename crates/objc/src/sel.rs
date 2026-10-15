@@ -23,12 +23,32 @@ pub fn register(name: &CStr) -> Sel {
     leaked.as_ptr()
 }
 
+const RECENT_SLOTS: usize = 256;
+
+thread_local! {
+    static RECENT: [std::cell::Cell<(usize, usize, Sel)>; RECENT_SLOTS] =
+        const { [const { std::cell::Cell::new((0, 0, std::ptr::null())) }; RECENT_SLOTS] };
+}
+
 /// The selector for a Rust string, for this crate's own classes.
 ///
 /// Panics on an interior NUL, which only a bug here could produce.
 pub fn get(name: &str) -> Sel {
+    let address = name.as_ptr() as usize;
+    let slot = (crate::address::mix((address ^ name.len()) as u64) >> 56) as usize % RECENT_SLOTS;
+    let (at, length, sel) = RECENT.with(|recent| recent[slot].get());
+    // SAFETY: a non-null cached selector is an interned, NUL-terminated name.
+    if at == address
+        && length == name.len()
+        && !sel.is_null()
+        && unsafe { CStr::from_ptr(sel) }.to_bytes() == name.as_bytes()
+    {
+        return sel;
+    }
     let c = CString::new(name).expect("a selector name has no interior NUL");
-    register(&c)
+    let sel = register(&c);
+    RECENT.with(|recent| recent[slot].set((address, name.len(), sel)));
+    sel
 }
 
 /// A selector's name, which is the selector.
@@ -63,6 +83,19 @@ pub fn is_equal(a: Sel, b: Sel) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_reused_name_buffer_gets_its_new_selector() {
+        let mut name = String::with_capacity(32);
+        name.push_str("cacheProbeAlpha");
+        let alpha = get(&name);
+        name.clear();
+        name.push_str("cacheProbeBravo");
+        let bravo = get(&name);
+        assert_ne!(alpha, bravo);
+        assert_eq!(bravo, register(c"cacheProbeBravo"));
+        assert_eq!(alpha, register(c"cacheProbeAlpha"));
+    }
 
     #[test]
     fn the_same_name_registers_to_the_same_pointer() {
