@@ -94,7 +94,7 @@ unsafe extern "C" fn shared_application(class: Id, _sel: Sel) -> Id {
     let app = objc::object::create_instance(class, 0);
     // Retained forever: `NSApp` is a process-lifetime global, and an application
     // a guest can release is one it can make dangle.
-    objc::arc::retain(app);
+    objc::arc::make_immortal(app);
     SHARED.store(app as usize, std::sync::atomic::Ordering::Release);
     // SAFETY: the cell is this crate's own, and the guest reads it as `NSApp`.
     unsafe { *(crate::ns_app_cell() as *mut u64) = app as usize as u64 };
@@ -341,7 +341,7 @@ fn register_common_modes() {
     });
 }
 
-const MODAL_PANEL_MODE: &str = "NSModalPanelRunLoopMode";
+pub(crate) const MODAL_PANEL_MODE: &str = "NSModalPanelRunLoopMode";
 
 /// One turn of the main thread's loop in `mode`: what `-run` does each time
 /// round, and what `-runModalSession:` does once.
@@ -349,7 +349,13 @@ const MODAL_PANEL_MODE: &str = "NSModalPanelRunLoopMode";
 /// # Safety
 ///
 /// `receiver` must be an application.
-unsafe fn turn(receiver: Id, mode: &str) {
+pub(crate) unsafe fn turn(receiver: Id, mode: &str) {
+    let pool = objc::arc::pool_push();
+    unsafe { turn_in_pool(receiver, mode) };
+    objc::arc::pool_pop(pool);
+}
+
+unsafe fn turn_in_pool(receiver: Id, mode: &str) {
     register_common_modes();
     // The window system first, and every turn. A window that is never pumped is
     // one the platform has not been told to show: on macOS SDL's Cocoa backend
@@ -483,6 +489,7 @@ unsafe extern "C" fn terminate(receiver: Id, _sel: Sel, _sender: Id) {
     // SAFETY: a delegate method is `void (id, SEL, NSNotification *)`.
     unsafe { send_if_implemented(delegate, "applicationWillTerminate:", notification) };
     foundation::notification::post(WILL_TERMINATE, receiver, std::ptr::null_mut());
+    darwin::exit::finalize(0);
     std::process::exit(0);
 }
 
@@ -597,6 +604,38 @@ unsafe extern "C" fn windows(_receiver: Id, _sel: Sel) -> Id {
     );
     // SAFETY: a fresh array.
     unsafe { corefoundation::api::CFAutorelease(array) as Id }
+}
+
+unsafe extern "C" fn enumerate_windows(_receiver: Id, _sel: Sel, options: u64, block: Id) {
+    // SAFETY: `void (^)(NSWindow *, BOOL *)`, as the selector declares.
+    let Some(invoke) = (unsafe { crate::animation::invoke(block) }) else {
+        return;
+    };
+    let mut windows = crate::window::all();
+    if options & 1 != 0 {
+        windows.retain(|window| crate::window::is_shown(*window));
+        windows.reverse();
+        let key = crate::window::key_window();
+        if let Some(at) = windows.iter().position(|w| *w == key) {
+            let key = windows.remove(at);
+            windows.insert(0, key);
+        }
+    }
+    for window in &windows {
+        objc::arc::retain(*window);
+    }
+    let mut stop = 0u8;
+    for window in &windows {
+        // SAFETY: the block's own prototype.
+        unsafe {
+            let f: unsafe extern "C" fn(Id, Id, *mut u8) = std::mem::transmute(invoke);
+            f(block, *window, &mut stop);
+        }
+        if stop != 0 {
+            break;
+        }
+    }
+    windows.into_iter().for_each(objc::arc::release);
 }
 
 unsafe extern "C" fn key_window(_receiver: Id, _sel: Sel) -> Id {
@@ -797,6 +836,14 @@ unsafe extern "C" fn stop_modal(receiver: Id, _sel: Sel) {
     app.modal_depth = app.modal_depth.saturating_sub(1);
 }
 
+unsafe extern "C" fn stop_modal_with_code(receiver: Id, sel: Sel, _code: isize) {
+    unsafe { stop_modal(receiver, sel) };
+}
+
+unsafe extern "C" fn visible_occlusion(_receiver: Id, _sel: Sel) -> u64 {
+    1 << 1
+}
+
 /// `-runModalForWindow:`, the blocking form.
 ///
 /// Runs the loop `-runModalSession:` leaves to the caller: pump until something
@@ -957,6 +1004,7 @@ pub(crate) fn install() {
         "setPresentationOptions:" => set_presentation_options, c"v24@0:8Q16";
         "nextEventMatchingMask:untilDate:inMode:dequeue:" => next_event, c"@48@0:8Q16@24@32B40";
         "windows" => windows, c"@16@0:8";
+        "enumerateWindowsWithOptions:usingBlock:" => enumerate_windows, c"v32@0:8Q16@?24";
         "windowWithWindowNumber:" => window_with_window_number, c"@24@0:8q16";
         "keyWindow" => key_window, c"@16@0:8";
         "mainWindow" => key_window, c"@16@0:8";
@@ -990,6 +1038,9 @@ pub(crate) fn install() {
         "endModalSession:" => end_modal_session, c"v24@0:8^v16";
         "runModalForWindow:" => run_modal_for_window, c"q24@0:8@16";
         "stopModal" => stop_modal, c"v16@0:8";
+        "stopModalWithCode:" => stop_modal_with_code, c"v24@0:8q16";
+        "occlusionState" => visible_occlusion, c"Q16@0:8";
+        "endSheet:" => ignored_sender, c"v24@0:8@16";
         "abortModal" => stop_modal, c"v16@0:8";
     });
 }
@@ -1263,5 +1314,38 @@ mod tests {
             "the source was not serviced from inside -run"
         );
         loop_.remove_source(&source, corefoundation::runloop::DEFAULT_MODE);
+    }
+
+    #[test]
+    fn what_a_turn_autoreleases_is_released_when_it_ends() {
+        crate::bootstrap();
+        static OBJECT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+        unsafe extern "C" fn perform(_info: *mut std::ffi::c_void) {
+            let object = OBJECT.load(std::sync::atomic::Ordering::SeqCst) as Id;
+            objc::arc::autorelease(objc::arc::retain(object));
+        }
+
+        let app = objc::object::create_instance(
+            objc::class::lookup(c"NSApplication").expect("NSApplication"),
+            0,
+        );
+        let object = objc::object::create_instance(
+            objc::class::lookup(c"NSObject").expect("NSObject"),
+            0,
+        );
+        OBJECT.store(object as usize, std::sync::atomic::Ordering::SeqCst);
+        let source = corefoundation::runloop::new_source(Some(perform), 0);
+        let loop_ = corefoundation::runloop::main();
+        loop_.add_source(&source, corefoundation::runloop::DEFAULT_MODE);
+        source.signal();
+
+        let outer = objc::arc::pool_push();
+        // SAFETY: `app` is an application.
+        unsafe { turn(app, corefoundation::runloop::DEFAULT_MODE) };
+        assert_eq!(objc::arc::retain_count(object), 1);
+        objc::arc::pool_pop(outer);
+        loop_.remove_source(&source, corefoundation::runloop::DEFAULT_MODE);
+        objc::arc::release(object);
     }
 }
