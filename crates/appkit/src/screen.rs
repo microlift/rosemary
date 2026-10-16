@@ -68,7 +68,7 @@ pub(crate) fn screen_object(class_name: &std::ffi::CStr, display: u32) -> Id {
     unsafe { (*screen).display = display as usize };
     // Retained forever: a screen a guest can release is one it can make dangle,
     // and these are handed out unowned by `+mainScreen`.
-    objc::arc::make_immortal(screen as Id);
+    objc::arc::retain(screen as Id);
     screens.push((class_name.to_owned(), display, screen as usize));
     screen as Id
 }
