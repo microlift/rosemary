@@ -441,7 +441,7 @@ fn dump(id: u32, surface: &sdl3::video::Presentation, pixels: &[u8]) {
 }
 
 /// The window a dialog is modal for: the key window, or any of the program's.
-fn parent() -> sdl3::Window {
+pub(crate) fn parent() -> sdl3::Window {
     // SDL leaves a child of a hidden window unmapped, so a program that
     // ordered its only window out before alerting would get no dialog at all.
     let shown = |window: sdl3::Window| {
@@ -480,6 +480,41 @@ pub(crate) fn deliver_modal(event: &sdl3::video::Event) -> bool {
         }
         None => false,
     })
+}
+
+pub(crate) fn run_modal_window<T: Clone>(
+    window: sdl3::Window,
+    dismissed: T,
+    mut handle: impl FnMut(&sdl3::video::Event) -> Option<T>,
+) -> (T, bool) {
+    use sdl3::video::Event;
+
+    let outer = MODAL.replace(Some((window, Default::default())));
+    let result = loop {
+        crate::opengl::release_for_other_threads();
+        crate::script::run();
+        let scripted = MODAL.with_borrow_mut(|modal| modal.as_mut()?.1.pop_front());
+        let Some(event) = scripted.or_else(|| sdl3::video::wait(50)) else {
+            continue;
+        };
+        if let Some(answer) = handle(&event) {
+            break (answer, false);
+        }
+        match event {
+            Event::Quit => break (dismissed.clone(), true),
+            Event::Key { .. }
+            | Event::Text { .. }
+            | Event::TextEditing { .. }
+            | Event::MouseMotion { .. }
+            | Event::MouseButton { .. }
+            | Event::MouseWheel { .. }
+            | Event::WindowClosed { .. }
+            | Event::WindowHitTest { .. } => {}
+            other => crate::event::deliver_past_modal(other),
+        }
+    };
+    MODAL.set(outer);
+    result
 }
 
 /// Show `request` and wait for a button: its index, or `None` when no dialog
@@ -582,7 +617,7 @@ pub(crate) fn deliver(event: &sdl3::video::Event) -> bool {
 
 /// Over the parent's middle, or the primary display's. Wayland places a
 /// window itself and ignores this.
-fn center(window: sdl3::Window, parent: sdl3::Window, width: f32, height: f32) {
+pub(crate) fn center(window: sdl3::Window, parent: sdl3::Window, width: f32, height: f32) {
     let area = match parent.is_null() {
         false => sdl3::video::window_position(parent).zip(sdl3::video::window_size(parent)),
         true => None,

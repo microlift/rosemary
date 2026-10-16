@@ -140,6 +140,20 @@ unsafe extern "C" fn icon_for_file_type(_receiver: Id, _sel: Sel, _type: Id) -> 
     objc::arc::autorelease(image)
 }
 
+/// `-[NSWorkspace isFilePackageAtPath:]`.
+///
+/// AppKit's file panels use this query when deciding whether a directory is a
+/// package that should be selectable as a file. Package classification is
+/// shared with the panels so both APIs agree about the same filesystem entry.
+unsafe extern "C" fn is_file_package_at_path(_receiver: Id, _sel: Sel, path: Id) -> u8 {
+    if path.is_null() {
+        return 0;
+    }
+    let path = unsafe { text(path) };
+    let host_path = prefix::ns::existing_host_path(&path);
+    u8::from(host_path.is_dir() && crate::panel::is_file_package(&host_path))
+}
+
 /// The `NSRunningApplication` for this process, a process-lifetime singleton.
 fn current() -> Id {
     *CURRENT.get_or_init(|| {
@@ -355,6 +369,7 @@ pub(crate) fn install() {
             c"@48@0:8@16Q24@32^@40";
         "iconForFileType:" => icon_for_file_type, c"@24@0:8@16";
         "iconForFile:" => icon_for_file_type, c"@24@0:8@16";
+        "isFilePackageAtPath:" => is_file_package_at_path, c"c24@0:8@16";
     });
 
     let running =
@@ -447,6 +462,44 @@ mod tests {
         };
         assert!(!icon.is_null());
         assert_eq!(crate::image::declared_size(icon).width, 32.0);
+    }
+
+    #[test]
+    fn workspace_reports_existing_file_packages_and_rejects_other_paths() {
+        crate::bootstrap();
+        let class = objc::class::lookup(c"NSWorkspace").unwrap();
+        let selector = objc::sel::get("isFilePackageAtPath:");
+        assert!(class.method(selector).is_some());
+
+        let root = std::env::temp_dir().join(format!(
+            "rosemary-workspace-file-package-{}",
+            std::process::id()
+        ));
+        let package = root.join("Example.app");
+        let folder = root.join("Assets");
+        let missing = root.join("Missing.app");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&package).unwrap();
+        std::fs::create_dir_all(&folder).unwrap();
+
+        let query = |path: &std::path::Path| {
+            let path = foundation::string::from_str(&path.to_string_lossy());
+            let result = unsafe { is_file_package_at_path(std::ptr::null_mut(), selector, path) };
+            unsafe { corefoundation::api::CFRelease(path as _) };
+            result
+        };
+
+        assert_eq!(query(&package), 1);
+        assert_eq!(query(&folder), 0);
+        assert_eq!(query(&missing), 0);
+        assert_eq!(
+            unsafe {
+                is_file_package_at_path(std::ptr::null_mut(), selector, std::ptr::null_mut())
+            },
+            0
+        );
+
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

@@ -350,6 +350,13 @@ pub const STRING_GLOBALS: &[(&str, &str)] = &[
     ("_NSFileSystemFreeSize", "NSFileSystemFreeSize"),
     ("_NSFileSystemSize", "NSFileSystemSize"),
     ("_NSFileSystemNumber", "NSFileSystemNumber"),
+    ("_NSFileTypeDirectory", "NSFileTypeDirectory"),
+    ("_NSFileTypeRegular", "NSFileTypeRegular"),
+    ("_NSFileTypeSymbolicLink", "NSFileTypeSymbolicLink"),
+    ("_NSFileTypeSocket", "NSFileTypeSocket"),
+    ("_NSFileTypeCharacterSpecial", "NSFileTypeCharacterSpecial"),
+    ("_NSFileTypeBlockSpecial", "NSFileTypeBlockSpecial"),
+    ("_NSFileTypeUnknown", "NSFileTypeUnknown"),
     ("_NSPOSIXErrorDomain", "NSPOSIXErrorDomain"),
     ("_NSCocoaErrorDomain", "NSCocoaErrorDomain"),
     ("_NSFilePathErrorKey", "NSFilePath"),
@@ -398,6 +405,29 @@ mod tests {
     fn class(name: &std::ffi::CStr) -> Id {
         bootstrap();
         objc::class::ptr(objc::class::lookup(name).expect("registered")) as Id
+    }
+
+    #[test]
+    fn file_type_constants_are_exported_as_string_globals() {
+        let symbols = data_symbols();
+        for (symbol, expected) in [
+            ("_NSFileTypeDirectory", "NSFileTypeDirectory"),
+            ("_NSFileTypeRegular", "NSFileTypeRegular"),
+            ("_NSFileTypeSymbolicLink", "NSFileTypeSymbolicLink"),
+            ("_NSFileTypeSocket", "NSFileTypeSocket"),
+            ("_NSFileTypeCharacterSpecial", "NSFileTypeCharacterSpecial"),
+            ("_NSFileTypeBlockSpecial", "NSFileTypeBlockSpecial"),
+            ("_NSFileTypeUnknown", "NSFileTypeUnknown"),
+        ] {
+            let (_, cell) = symbols
+                .iter()
+                .find(|(name, _)| name == symbol)
+                .unwrap_or_else(|| panic!("missing Foundation data symbol {symbol}"));
+            let object = unsafe { *(*cell as *const u64) } as corefoundation::base::CFTypeRef;
+            let value = unsafe { corefoundation::string::as_string(object) }
+                .unwrap_or_else(|| panic!("{symbol} does not point to a CFString"));
+            assert_eq!(value.utf8(), expected.as_bytes(), "{symbol}");
+        }
     }
 
     #[test]

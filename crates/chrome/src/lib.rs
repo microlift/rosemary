@@ -6,6 +6,7 @@
 pub mod alert;
 pub mod checkbox;
 pub mod corners;
+pub mod file_picker;
 pub mod fonts;
 pub mod geometry;
 pub mod menu;

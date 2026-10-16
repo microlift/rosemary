@@ -1791,12 +1791,30 @@ const SCROLLER_WIDTH: f64 = 15.0;
 /// The small control size's scroller, which is the one size that differs.
 const SMALL_SCROLLER_WIDTH: f64 = 11.0;
 
+const LEGACY_SCROLLER_STYLE: isize = 0;
+
+unsafe extern "C" fn scroller_preferred_style(_class: Id, _sel: Sel) -> isize {
+    LEGACY_SCROLLER_STYLE
+}
+
 unsafe extern "C" fn scroller_width(_class: Id, _sel: Sel) -> f64 {
     SCROLLER_WIDTH
 }
 
 /// `NSControlSize`: regular is 0, small 1, mini 2.
 unsafe extern "C" fn scroller_width_for_control_size(_class: Id, _sel: Sel, size: usize) -> f64 {
+    match size {
+        0 => SCROLLER_WIDTH,
+        _ => SMALL_SCROLLER_WIDTH,
+    }
+}
+
+unsafe extern "C" fn scroller_width_for_control_size_and_style(
+    _receiver: Id,
+    _sel: Sel,
+    size: usize,
+    _style: isize,
+) -> f64 {
     match size {
         0 => SCROLLER_WIDTH,
         _ => SMALL_SCROLLER_WIDTH,
@@ -2082,18 +2100,23 @@ pub(crate) fn install() {
 
     let class = objc::class::lookup(c"NSButtonCell").expect("declared before its methods");
     methods!(class, {
+        "setButtonType:" => button_set_type, c"v24@0:8Q16";
+        "buttonType" => button_type, c"Q16@0:8";
         "setBackgroundStyle:" => button_set_background_style, c"v24@0:8q16";
         "backgroundStyle" => button_background_style, c"q16@0:8";
     });
 
     let class = objc::class::lookup(c"NSScroller").expect("declared before its methods");
     class_methods!(class, {
+        "preferredScrollerStyle" => scroller_preferred_style, c"q16@0:8";
         "scrollerWidth" => scroller_width, c"d16@0:8";
         "scrollerWidthForControlSize:" => scroller_width_for_control_size, c"d24@0:8Q16";
+        "scrollerWidthForControlSize:scrollerStyle:" => scroller_width_for_control_size_and_style, c"d32@0:8Q16q24";
     });
     methods!(class, {
         "initWithFrame:" => scroller_init_with_frame,
             c"@48@0:8{CGRect={CGPoint=dd}{CGSize=dd}}16";
+        "scrollerWidthForControlSize:scrollerStyle:" => scroller_width_for_control_size_and_style, c"d32@0:8Q16q24";
         "setDoubleValue:" => scroller_set_double_value, c"v24@0:8d16";
         "doubleValue" => scroller_double_value, c"d16@0:8";
         "setFloatValue:" => scroller_set_float_value, c"v20@0:8f16";
@@ -2296,7 +2319,41 @@ mod tests {
                 scroller_width_for_control_size(std::ptr::null_mut(), sel, 1),
                 SMALL_SCROLLER_WIDTH
             );
+            let sel = objc::sel::get("scrollerWidthForControlSize:scrollerStyle:");
+            let instance = scroller(NSRect {
+                origin: NSPoint::default(),
+                size: NSSize {
+                    width: 100.0,
+                    height: 200.0,
+                },
+            });
+            assert_eq!(
+                scroller_width_for_control_size_and_style(instance, sel, 0, LEGACY_SCROLLER_STYLE),
+                SCROLLER_WIDTH
+            );
+            assert_eq!(
+                scroller_width_for_control_size_and_style(instance, sel, 1, LEGACY_SCROLLER_STYLE),
+                SMALL_SCROLLER_WIDTH
+            );
+            objc::arc::release(instance);
         }
+    }
+
+    #[test]
+    fn button_cells_keep_their_button_type() {
+        crate::bootstrap();
+        let class = objc::class::lookup(c"NSButtonCell").expect("NSButtonCell");
+        let cell = objc::object::create_instance(class, 0);
+        let setter = objc::sel::get("setButtonType:");
+        let getter = objc::sel::get("buttonType");
+        assert!(class.method(setter).is_some());
+        assert!(class.method(getter).is_some());
+        // SAFETY: the selectors are the NSButtonCell accessors registered above.
+        unsafe {
+            button_set_type(cell, setter, 3);
+            assert_eq!(button_type(cell, getter), 3);
+        }
+        objc::arc::release(cell);
     }
 
     /// The knob takes its proportion of the slot and slides along the rest;

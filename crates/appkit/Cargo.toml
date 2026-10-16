@@ -18,3 +18,8 @@ gamecontroller.workspace = true
 iosurface.workspace = true
 static_init.workspace = true
 owned_ttf_parser.workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+ashpd = { version = "0.13.13", default-features = false, features = ["async-io", "file_chooser"] }
+async-io = "2"
+url = "2"

@@ -214,3 +214,34 @@ pub(crate) fn install() {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn text_field_cells_forward_font_accessors() {
+        crate::bootstrap();
+        let field_class = objc::class::lookup(c"NSTextField").expect("NSTextField");
+        let field = objc::object::create_instance(field_class, 0);
+        let cell = cell_of(field);
+        let cell_class = unsafe { objc::object::class_of(cell) }.expect("NSTextFieldCell");
+        let setter = objc::sel::get("setFont:");
+        let getter = objc::sel::get("font");
+        assert!(cell_class.method(setter).is_some());
+        assert!(cell_class.method(getter).is_some());
+
+        let send: unsafe extern "C" fn(Id, Sel, Id) =
+            unsafe { std::mem::transmute(objc::msg::entry()) };
+        let read: unsafe extern "C" fn(Id, Sel) -> Id =
+            unsafe { std::mem::transmute(objc::msg::entry()) };
+        unsafe {
+            send(cell, setter, std::ptr::null_mut());
+            assert!(read(cell, getter).is_null());
+        }
+
+        forget(field);
+        crate::label::forget(field);
+        objc::arc::release(field);
+    }
+}

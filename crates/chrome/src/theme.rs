@@ -38,6 +38,7 @@ pub struct Theme {
     pub menu_title_padding: f32,
 
     pub panel_background: Color,
+    pub panel_input_background: Color,
     pub panel_border: Color,
     pub panel_text: Color,
     pub panel_text_disabled: Color,
@@ -114,6 +115,7 @@ impl Theme {
             menu_title_size: 13.0,
             menu_title_padding: 9.0,
             panel_background: Color::rgb(0xF2, 0xF2, 0xF2),
+            panel_input_background: Color::rgb(0xFF, 0xFF, 0xFF),
             panel_border: Color::rgb(0xC4, 0xC4, 0xC4),
             panel_text: Color::rgba(0, 0, 0, 0.85),
             panel_text_disabled: Color::rgba(0, 0, 0, 0.3),
@@ -172,6 +174,7 @@ impl Theme {
             menu_title_disabled: Color::rgba(255, 255, 255, 0.3),
             menu_title_highlight: Color::rgba(255, 255, 255, 0.14),
             panel_background: Color::rgb(0x2A, 0x2A, 0x2B),
+            panel_input_background: Color::rgb(0x3A, 0x3A, 0x3A),
             panel_border: Color::rgb(0x55, 0x55, 0x55),
             panel_text: Color::rgba(255, 255, 255, 0.88),
             panel_text_disabled: Color::rgba(255, 255, 255, 0.28),
