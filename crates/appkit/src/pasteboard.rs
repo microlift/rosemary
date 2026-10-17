@@ -10,13 +10,17 @@ use objc::sel::Sel;
 use crate::define::{class_methods, methods};
 
 const GENERAL: &str = "NSGeneralPboard";
+const CARBON_GENERAL: &[u8] = b"com.apple.pasteboard.clipboard";
 const STRING: &str = "public.utf8-plain-text";
+const QT_PLAIN_TEXT: &str = "com.trolltech.anymime.text--plain";
+const LEGACY_STRING: &[u8] = b"NSStringPboardType";
 
 #[derive(Default)]
 struct Entry {
     ty: Vec<u8>,
     data: Option<Vec<u8>>,
     property_list: usize,
+    promised: bool,
 }
 
 impl Drop for Entry {
@@ -30,6 +34,7 @@ struct Board {
     change_count: isize,
     entries: Vec<Entry>,
     object_strings: Vec<Vec<u8>>,
+    last_system_text: Option<Vec<u8>>,
 }
 
 #[derive(Default)]
@@ -41,6 +46,16 @@ struct Boards {
 fn boards() -> &'static Mutex<Boards> {
     static BOARDS: OnceLock<Mutex<Boards>> = OnceLock::new();
     BOARDS.get_or_init(Default::default)
+}
+
+#[cfg(test)]
+static GENERAL_PASTEBOARD_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+#[cfg(test)]
+pub(crate) fn general_pasteboard_test_lock() -> std::sync::MutexGuard<'static, ()> {
+    GENERAL_PASTEBOARD_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 fn class() -> &'static objc::class::Class {
@@ -57,6 +72,7 @@ fn make_board() -> Board {
         change_count: 0,
         entries: Vec::new(),
         object_strings: Vec::new(),
+        last_system_text: None,
     }
 }
 
@@ -76,26 +92,63 @@ fn is_general(all: &Boards, receiver: Id) -> bool {
 /// board before answering a read. SDL is the authority for that one board;
 /// named boards remain process-local AppKit objects.
 fn sync_system_text(board: &mut Board) {
-    if sdl3::clipboard::has_text() != Some(true) {
-        return;
-    }
-    let Some(text) = sdl3::clipboard::text() else {
-        return;
+    let available = sdl3::clipboard::has_text();
+    let text = sdl3::clipboard::text();
+    sync_system_text_value(board, available, text);
+}
+
+fn sync_system_text_value(board: &mut Board, available: Option<bool>, text: Option<Vec<u8>>) {
+    let text = match text {
+        Some(text) if !text.is_empty() => Some(text),
+        _ if available == Some(false) && board.last_system_text.is_some() => None,
+        _ => return,
     };
-    let existing = board
-        .entries
-        .iter()
-        .find(|entry| entry.ty == STRING.as_bytes())
-        .and_then(|entry| entry.data.as_ref());
-    if existing == Some(&text) {
-        return;
+    match text {
+        Some(text) => {
+            let system_changed = board.last_system_text.as_deref() != Some(text.as_slice());
+            let text_changed = system_changed
+                || board
+                    .entries
+                    .iter()
+                    .find(|entry| entry.ty == STRING.as_bytes())
+                    .and_then(|entry| entry.data.as_deref())
+                    != Some(text.as_slice());
+
+            if system_changed {
+                board.entries.clear();
+                let entry = entry_mut(board, STRING.as_bytes());
+                entry.data = Some(text.clone());
+            } else if text_changed {
+                let entry = entry_mut(board, STRING.as_bytes());
+                objc::arc::release(entry.property_list as Id);
+                entry.property_list = 0;
+                entry.data = Some(text.clone());
+                entry.promised = false;
+            }
+            if system_changed {
+                board.object_strings.clear();
+            }
+            if text_changed {
+                board.change_count += 1;
+            }
+            board.last_system_text = Some(text);
+        }
+        None => {
+            let entries_removed = !board.entries.is_empty();
+            board.entries.clear();
+            let objects_removed = !board.object_strings.is_empty();
+            board.object_strings.clear();
+            if entries_removed || objects_removed {
+                board.change_count += 1;
+            }
+            board.last_system_text = Some(Vec::new());
+        }
     }
-    let entry = entry_mut(board, STRING.as_bytes());
-    objc::arc::release(entry.property_list as Id);
-    entry.property_list = 0;
-    entry.data = Some(text);
-    board.object_strings.clear();
-    board.change_count += 1;
+}
+
+fn write_system_text(board: &mut Board, text: &[u8]) {
+    let exported = sdl3::clipboard::set_text(text);
+    board.last_system_text = exported.then(|| text.to_vec());
 }
 
 /// The current plain text from the desktop-backed general pasteboard.
@@ -108,11 +161,12 @@ pub(crate) fn general_text() -> Option<Vec<u8>> {
     let mut all = boards().lock().unwrap_or_else(|e| e.into_inner());
     let board = board_mut(&mut all, receiver)?;
     sync_system_text(board);
-    board
+    let text = board
         .entries
         .iter()
         .find(|entry| entry.ty == STRING.as_bytes())
-        .and_then(|entry| entry.data.clone())
+        .and_then(|entry| entry.data.clone());
+    text
 }
 
 const HTML: &str = "public.html";
@@ -120,12 +174,23 @@ const HTML: &str = "public.html";
 /// The general pasteboard's plain text and HTML, with its change count: for a
 /// toolkit that keeps a clipboard of its own and has to be handed ours.
 pub fn general_text_and_html() -> (isize, Option<Vec<u8>>, Option<Vec<u8>>) {
-    let count = change_count_of(CLIPBOARD);
-    (
-        count,
-        flavor_data(CLIPBOARD, STRING.as_bytes()),
-        flavor_data(CLIPBOARD, HTML.as_bytes()),
-    )
+    let receiver = named(GENERAL.as_bytes());
+    let mut all = boards().lock().unwrap_or_else(|e| e.into_inner());
+    let Some(board) = board_mut(&mut all, receiver) else {
+        return (0, None, None);
+    };
+    sync_system_text(board);
+    let text = board
+        .entries
+        .iter()
+        .find(|entry| entry.ty == STRING.as_bytes())
+        .and_then(|entry| entry.data.clone());
+    let html = board
+        .entries
+        .iter()
+        .find(|entry| entry.ty == HTML.as_bytes())
+        .and_then(|entry| entry.data.clone());
+    (board.change_count, text, html)
 }
 
 /// Make the general pasteboard hold this text and HTML and nothing else, as
@@ -195,13 +260,52 @@ pub(crate) fn put_flavor(name: &[u8], ty: &[u8], bytes: Vec<u8>) {
     objc::arc::release(entry.property_list as Id);
     entry.property_list = 0;
     entry.data = Some(bytes.clone());
+    entry.promised = false;
     board.object_strings.clear();
     board.change_count += 1;
     // Out to the desktop as well, so another application can paste it - the same
     // thing `-setData:forType:` does for the same board and the same flavour.
-    if general && ty == STRING.as_bytes() {
-        let _ = sdl3::clipboard::set_text(&bytes);
+    if general && (ty == STRING.as_bytes() || ty == QT_PLAIN_TEXT.as_bytes()) {
+        write_system_text(board, &bytes);
     }
+}
+
+pub(crate) fn put_promised_flavor(name: &[u8], ty: &[u8]) {
+    let receiver = named(name);
+    let mut all = boards().lock().unwrap_or_else(|e| e.into_inner());
+    let Some(board) = board_mut(&mut all, receiver) else {
+        return;
+    };
+    let entry = entry_mut(board, ty);
+    objc::arc::release(entry.property_list as Id);
+    entry.property_list = 0;
+    entry.data = None;
+    entry.promised = true;
+    board.object_strings.clear();
+    board.change_count += 1;
+}
+
+pub(crate) fn promised_flavors(name: &[u8]) -> Vec<Vec<u8>> {
+    let receiver = named(name);
+    let mut all = boards().lock().unwrap_or_else(|e| e.into_inner());
+    board_mut(&mut all, receiver)
+        .map(|board| {
+            board
+                .entries
+                .iter()
+                .filter(|entry| entry.promised && entry.data.is_none())
+                .map(|entry| entry.ty.clone())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+pub(crate) fn flavor_is_promised(name: &[u8], ty: &[u8]) -> bool {
+    let receiver = named(name);
+    let mut all = boards().lock().unwrap_or_else(|e| e.into_inner());
+    board_mut(&mut all, receiver)
+        .and_then(|board| board.entries.iter().find(|entry| entry.ty == ty))
+        .is_some_and(|entry| entry.promised && entry.data.is_none())
 }
 
 /// Empty a named board, and return its new change count.
@@ -210,8 +314,8 @@ pub(crate) fn clear_named(name: &[u8]) -> isize {
     let receiver = named(name);
     let mut all = boards().lock().unwrap_or_else(|e| e.into_inner());
     let count = board_mut(&mut all, receiver).map_or(0, clear);
-    if general {
-        let _ = sdl3::clipboard::set_text(b"");
+    if general && let Some(board) = board_mut(&mut all, receiver) {
+        write_system_text(board, b"");
     }
     count
 }
@@ -230,6 +334,12 @@ pub(crate) fn change_count_of(name: &[u8]) -> isize {
     board.change_count
 }
 
+pub(crate) fn local_change_count_of(name: &[u8]) -> isize {
+    let receiver = named(name);
+    let mut all = boards().lock().unwrap_or_else(|e| e.into_inner());
+    board_mut(&mut all, receiver).map_or(0, |board| board.change_count)
+}
+
 fn named(name: &[u8]) -> Id {
     let mut all = boards().lock().unwrap_or_else(|e| e.into_inner());
     if let Some((_, board)) = all.boards.iter().find(|(n, _)| n == name) {
@@ -239,6 +349,31 @@ fn named(name: &[u8]) -> Id {
     let object = board.object as Id;
     all.boards.push((name.to_vec(), board));
     object
+}
+
+fn canonical_name(name: &[u8]) -> &[u8] {
+    if name == CARBON_GENERAL {
+        GENERAL.as_bytes()
+    } else {
+        name
+    }
+}
+
+fn entry_for_type<'a>(board: &'a Board, ty: &[u8]) -> Option<&'a Entry> {
+    board
+        .entries
+        .iter()
+        .find(|entry| entry.ty == ty)
+        .or_else(|| {
+            (ty == LEGACY_STRING)
+                .then(|| {
+                    board
+                        .entries
+                        .iter()
+                        .find(|entry| entry.ty == STRING.as_bytes())
+                })
+                .flatten()
+        })
 }
 
 fn type_bytes(object: Id) -> Vec<u8> {
@@ -254,6 +389,7 @@ fn entry_mut<'a>(board: &'a mut Board, ty: &[u8]) -> &'a mut Entry {
         ty: ty.to_vec(),
         data: None,
         property_list: 0,
+        promised: false,
     });
     board.entries.last_mut().expect("entry just pushed")
 }
@@ -277,7 +413,7 @@ unsafe extern "C" fn general_pasteboard(_class: Id, _sel: Sel) -> Id {
 }
 
 unsafe extern "C" fn pasteboard_with_name(_class: Id, _sel: Sel, name: Id) -> Id {
-    named(&type_bytes(name))
+    named(canonical_name(&type_bytes(name)))
 }
 
 unsafe extern "C" fn pasteboard_with_unique_name(_class: Id, _sel: Sel) -> Id {
@@ -291,7 +427,7 @@ unsafe extern "C" fn pasteboard_with_unique_name(_class: Id, _sel: Sel) -> Id {
 
 /// `-initWithName:` joins the same named-board registry as the factory.
 unsafe extern "C" fn init_with_name(receiver: Id, _sel: Sel, name: Id) -> Id {
-    let board = named(&type_bytes(name));
+    let board = named(canonical_name(&type_bytes(name)));
     // The object `alloc` made is only a shell; the registered board is the
     // object's identity.  Give the initializer's caller its owning reference.
     objc::arc::release(receiver);
@@ -299,7 +435,7 @@ unsafe extern "C" fn init_with_name(receiver: Id, _sel: Sel, name: Id) -> Id {
 }
 
 unsafe extern "C" fn remove_pasteboard_with_name(_class: Id, _sel: Sel, name: Id) {
-    let name = type_bytes(name);
+    let name = canonical_name(&type_bytes(name)).to_vec();
     if name == GENERAL.as_bytes() {
         return;
     }
@@ -338,12 +474,20 @@ unsafe extern "C" fn types(receiver: Id, _sel: Sel) -> Id {
 
 unsafe extern "C" fn change_count(receiver: Id, _sel: Sel) -> isize {
     let mut all = boards().lock().unwrap_or_else(|e| e.into_inner());
-    board_mut(&mut all, receiver).map_or(0, |board| board.change_count)
+    let general = is_general(&all, receiver);
+    let count = board_mut(&mut all, receiver).map_or(0, |board| {
+        if general {
+            sync_system_text(board);
+        }
+        board.change_count
+    });
+    count
 }
 
 fn clear(board: &mut Board) -> isize {
     board.entries.clear();
     board.object_strings.clear();
+    board.last_system_text = None;
     board.change_count += 1;
     board.change_count
 }
@@ -352,8 +496,8 @@ unsafe extern "C" fn clear_contents(receiver: Id, _sel: Sel) -> isize {
     let mut all = boards().lock().unwrap_or_else(|e| e.into_inner());
     let general = is_general(&all, receiver);
     let count = board_mut(&mut all, receiver).map_or(0, clear);
-    if general {
-        let _ = sdl3::clipboard::set_text(b"");
+    if general && let Some(board) = board_mut(&mut all, receiver) {
+        write_system_text(board, b"");
     }
     count
 }
@@ -414,10 +558,11 @@ unsafe extern "C" fn set_data(receiver: Id, _sel: Sel, data: Id, ty: Id) -> u8 {
     objc::arc::release(entry.property_list as Id);
     entry.property_list = 0;
     entry.data = Some(data);
+    entry.promised = false;
     board.object_strings.clear();
     board.change_count += 1;
     if let Some(text) = system_text {
-        let _ = sdl3::clipboard::set_text(&text);
+        write_system_text(board, &text);
     }
     1
 }
@@ -431,7 +576,7 @@ unsafe extern "C" fn data_for_type(receiver: Id, _sel: Sel, ty: Id) -> Id {
         sync_system_text(board);
     }
     let Some(data) = board_mut(&mut all, receiver)
-        .and_then(|board| board.entries.iter().find(|entry| entry.ty == ty))
+        .and_then(|board| entry_for_type(board, &ty))
         .and_then(|entry| entry.data.clone())
     else {
         return std::ptr::null_mut();
@@ -453,10 +598,11 @@ unsafe extern "C" fn set_string(receiver: Id, _sel: Sel, string: Id, ty: Id) -> 
     objc::arc::release(entry.property_list as Id);
     entry.property_list = 0;
     entry.data = Some(value);
+    entry.promised = false;
     board.object_strings.clear();
     board.change_count += 1;
     if let Some(text) = system_text {
-        let _ = sdl3::clipboard::set_text(&text);
+        write_system_text(board, &text);
     }
     1
 }
@@ -470,7 +616,7 @@ unsafe extern "C" fn string_for_type(receiver: Id, _sel: Sel, ty: Id) -> Id {
         sync_system_text(board);
     }
     let Some(value) = board_mut(&mut all, receiver)
-        .and_then(|board| board.entries.iter().find(|entry| entry.ty == ty))
+        .and_then(|board| entry_for_type(board, &ty))
         .and_then(|entry| entry.data.clone())
     else {
         return std::ptr::null_mut();
@@ -493,6 +639,7 @@ unsafe extern "C" fn set_property_list(receiver: Id, _sel: Sel, value: Id, ty: I
     objc::arc::release(entry.property_list as Id);
     entry.property_list = objc::arc::retain(value) as usize;
     entry.data = None;
+    entry.promised = false;
     board.object_strings.clear();
     board.change_count += 1;
     1
@@ -521,12 +668,16 @@ unsafe extern "C" fn available_type_from_array(receiver: Id, _sel: Sel, types: I
         })
         .unwrap_or_default();
     let mut all = boards().lock().unwrap_or_else(|e| e.into_inner());
+    let general = is_general(&all, receiver);
+    if general && let Some(board) = board_mut(&mut all, receiver) {
+        sync_system_text(board);
+    }
     let Some(board) = board_mut(&mut all, receiver) else {
         return std::ptr::null_mut();
     };
     let Some(ty) = requested
         .into_iter()
-        .find(|ty| board.entries.iter().any(|entry| entry.ty == *ty))
+        .find(|ty| entry_for_type(board, ty).is_some())
     else {
         return std::ptr::null_mut();
     };
@@ -588,9 +739,10 @@ unsafe extern "C" fn write_objects(receiver: Id, _sel: Sel, objects: Id) -> u8 {
     clear(board);
     let entry = entry_mut(board, STRING.as_bytes());
     entry.data = values.first().cloned();
+    entry.promised = false;
     board.object_strings = values;
     if let Some(text) = system_text {
-        let _ = sdl3::clipboard::set_text(&text);
+        write_system_text(board, &text);
     }
     1
 }
@@ -681,6 +833,7 @@ mod tests {
 
     #[test]
     fn general_pasteboard_keeps_string_data_and_type_order() {
+        let _clipboard_guard = general_pasteboard_test_lock();
         crate::bootstrap();
         let board = unsafe {
             general_pasteboard(std::ptr::null_mut(), objc::sel::get("generalPasteboard"))
@@ -700,6 +853,172 @@ mod tests {
             unsafe { foundation::string::bytes(array.values[0] as Id) },
             STRING.as_bytes()
         );
+    }
+
+    #[test]
+    fn carbon_clipboard_name_resolves_to_the_general_pasteboard() {
+        crate::bootstrap();
+        let general = unsafe {
+            general_pasteboard(std::ptr::null_mut(), objc::sel::get("generalPasteboard"))
+        };
+        let carbon_name = corefoundation::string::from_bytes(CARBON_GENERAL, false) as Id;
+        let named_general = unsafe {
+            pasteboard_with_name(
+                std::ptr::null_mut(),
+                objc::sel::get("pasteboardWithName:"),
+                carbon_name,
+            )
+        };
+        assert_eq!(general, named_general);
+    }
+
+    #[test]
+    fn legacy_string_type_reads_the_canonical_plain_text() {
+        crate::bootstrap();
+        let name = corefoundation::string::from_bytes(b"legacy-string-test", false) as Id;
+        let board = unsafe {
+            pasteboard_with_name(
+                std::ptr::null_mut(),
+                objc::sel::get("pasteboardWithName:"),
+                name,
+            )
+        };
+        let string_type = corefoundation::string::from_bytes(STRING.as_bytes(), false) as Id;
+        let text = corefoundation::string::from_bytes(b"external text", false) as Id;
+        assert_eq!(
+            unsafe {
+                set_string(
+                    board,
+                    objc::sel::get("setString:forType:"),
+                    text,
+                    string_type,
+                )
+            },
+            1
+        );
+        let legacy_type = corefoundation::string::from_bytes(LEGACY_STRING, false) as Id;
+        let read = unsafe { string_for_type(board, objc::sel::get("stringForType:"), legacy_type) };
+        assert_eq!(unsafe { foundation::string::bytes(read) }, b"external text");
+        let requested = collections::new_array(
+            &[legacy_type as CFTypeRef],
+            Policy::from_type_callbacks(),
+            false,
+        ) as Id;
+        let available = unsafe {
+            available_type_from_array(board, objc::sel::get("availableTypeFromArray:"), requested)
+        };
+        assert_eq!(
+            unsafe { foundation::string::bytes(available) },
+            LEGACY_STRING
+        );
+    }
+
+    fn board_with_system_text(text: &[u8]) -> Board {
+        Board {
+            object: 0,
+            change_count: 0,
+            entries: vec![
+                Entry {
+                    ty: STRING.as_bytes().to_vec(),
+                    data: Some(text.to_vec()),
+                    property_list: 0,
+                    promised: false,
+                },
+                Entry {
+                    ty: HTML.as_bytes().to_vec(),
+                    data: Some(b"<b>old</b>".to_vec()),
+                    property_list: 0,
+                    promised: false,
+                },
+            ],
+            object_strings: vec![text.to_vec()],
+            last_system_text: None,
+        }
+    }
+
+    #[test]
+    fn external_text_is_accepted_even_when_the_availability_probe_is_false() {
+        let mut board = board_with_system_text(b"studio");
+        board.last_system_text = Some(b"studio".to_vec());
+        board.entries.push(Entry {
+            ty: b"com.trolltech.anymime.text--plain".to_vec(),
+            data: None,
+            property_list: 0,
+            promised: true,
+        });
+        sync_system_text_value(&mut board, Some(false), Some(b"external".to_vec()));
+        assert_eq!(
+            board
+                .entries
+                .iter()
+                .find(|entry| entry.ty == STRING.as_bytes())
+                .and_then(|entry| entry.data.as_deref()),
+            Some(b"external".as_slice())
+        );
+        assert_eq!(board.change_count, 1);
+        assert!(board.object_strings.is_empty());
+        assert!(
+            !board
+                .entries
+                .iter()
+                .any(|entry| entry.ty == HTML.as_bytes())
+        );
+        assert_eq!(board.entries.len(), 1);
+        assert!(!board.entries[0].promised);
+    }
+
+    #[test]
+    fn syncing_identical_text_preserves_html_without_bumping_the_change_count() {
+        let mut board = board_with_system_text(b"copied");
+        board.last_system_text = Some(b"copied".to_vec());
+        sync_system_text_value(&mut board, Some(true), Some(b"copied".to_vec()));
+        assert!(
+            board
+                .entries
+                .iter()
+                .any(|entry| entry.ty == HTML.as_bytes())
+        );
+        assert_eq!(board.change_count, 0);
+    }
+
+    #[test]
+    fn confirmed_empty_system_clipboard_clears_stale_text_and_html() {
+        let mut board = board_with_system_text(b"old");
+        board.last_system_text = Some(b"old".to_vec());
+        sync_system_text_value(&mut board, Some(false), Some(Vec::new()));
+        assert!(board.entries.is_empty());
+        assert_eq!(board.change_count, 1);
+    }
+
+    #[test]
+    fn an_unexported_local_copy_survives_an_empty_clipboard_probe() {
+        let mut board = board_with_system_text(b"cached");
+        sync_system_text_value(&mut board, Some(false), Some(Vec::new()));
+        assert_eq!(
+            board
+                .entries
+                .iter()
+                .find(|entry| entry.ty == STRING.as_bytes())
+                .and_then(|entry| entry.data.as_deref()),
+            Some(b"cached".as_slice())
+        );
+        assert_eq!(board.change_count, 0);
+    }
+
+    #[test]
+    fn unavailable_clipboard_backend_preserves_cached_contents() {
+        let mut board = board_with_system_text(b"cached");
+        sync_system_text_value(&mut board, None, None);
+        assert_eq!(
+            board
+                .entries
+                .iter()
+                .find(|entry| entry.ty == STRING.as_bytes())
+                .and_then(|entry| entry.data.as_deref()),
+            Some(b"cached".as_slice())
+        );
+        assert_eq!(board.change_count, 0);
+        assert_eq!(board.object_strings, vec![b"cached".to_vec()]);
     }
 
     #[test]

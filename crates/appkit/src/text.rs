@@ -1698,6 +1698,7 @@ mod tests {
 
     #[test]
     fn paste_inserts_general_pasteboard_text_at_the_selection() {
+        let _clipboard_guard = crate::pasteboard::general_pasteboard_test_lock();
         let view = text_view();
         let board_class =
             objc::class::ptr(objc::class::lookup(c"NSPasteboard").expect("NSPasteboard")) as Id;
