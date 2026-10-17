@@ -1046,6 +1046,20 @@ unsafe extern "C" fn control_tag(receiver: Id, _sel: Sel) -> isize {
     read(buttons(), receiver, slot::TAG) as isize
 }
 
+/// `-[NSButtonCell drawBezelWithFrame:inView:]` draws only the border. The
+/// supplied view is the button whose state controls the bezel appearance.
+unsafe extern "C" fn button_cell_draw_bezel_with_frame(
+    _receiver: Id,
+    _sel: Sel,
+    frame: NSRect,
+    control_view: Id,
+) {
+    if control_view.is_null() {
+        return;
+    }
+    draw_button(control_view, frame, false);
+}
+
 /// The bezel of a bordered button and its title, which is how a text button
 /// built in Interface Builder looks. An image button that is not bordered
 /// draws neither.
@@ -1053,21 +1067,53 @@ unsafe extern "C" fn control_tag(receiver: Id, _sel: Sel) -> isize {
 /// FIXME (ACCURACY): one rounded, lightly shaded bezel stands in for every
 /// `NSBezelStyle`; Apple's artwork differs per style.
 fn draw_bezel_and_title(receiver: Id) {
+    draw_button(receiver, view::bounds_of(receiver), true);
+}
+
+fn draw_button(receiver: Id, frame: NSRect, draw_title: bool) {
+    let Some((pixels, width, height)) = button_surface(receiver, frame, draw_title) else {
+        return;
+    };
+    crate::backing::draw_image(
+        &pixels,
+        width,
+        height,
+        frame.size,
+        frame,
+        NSRect {
+            origin: NSPoint::default(),
+            size: frame.size,
+        },
+        // Source-over.
+        2,
+        1.0,
+        true,
+    );
+}
+
+fn button_surface(
+    receiver: Id,
+    frame: NSRect,
+    draw_title: bool,
+) -> Option<(Vec<u8>, usize, usize)> {
     let bordered = read(buttons(), receiver, slot::NOT_BORDERED) == 0;
-    let title = button_text(receiver);
+    let title = if draw_title {
+        button_text(receiver)
+    } else {
+        String::new()
+    };
     if !bordered && title.is_empty() {
-        return;
+        return None;
     }
-    let bounds = view::bounds_of(receiver);
     let density = crate::backing::focus_density();
-    let width = (bounds.size.width * density).ceil() as usize;
-    let height = (bounds.size.height * density).ceil() as usize;
+    let width = (frame.size.width * density).ceil() as usize;
+    let height = (frame.size.height * density).ceil() as usize;
     if width == 0 || height == 0 {
-        return;
+        return None;
     }
     let mut pixels = vec![0u8; width * height * 4];
     let mut canvas = chrome::Canvas::new(&mut pixels, width, height, width * 4, density as f32);
-    let (w, h) = (bounds.size.width as f32, bounds.size.height as f32);
+    let (w, h) = (frame.size.width as f32, frame.size.height as f32);
     let pressed = read(buttons(), receiver, slot::HIGHLIGHTED) != 0;
     let enabled = read(buttons(), receiver, slot::DISABLED) == 0;
     if bordered {
@@ -1106,21 +1152,7 @@ fn draw_bezel_and_title(receiver: Id) {
             chrome::Color::rgba(0, 0, 0, alpha),
         );
     }
-    crate::backing::draw_image(
-        &pixels,
-        width,
-        height,
-        bounds.size,
-        bounds,
-        NSRect {
-            origin: NSPoint::default(),
-            size: bounds.size,
-        },
-        // Source-over.
-        2,
-        1.0,
-        true,
-    );
+    Some((pixels, width, height))
 }
 
 /// A check box or radio button: its box, its mark and its title beside it.
@@ -2105,6 +2137,12 @@ pub(crate) fn install() {
         "mouseUp:" => button_mouse_up, c"v24@0:8@16";
     });
 
+    let class = objc::class::lookup(c"NSButtonCell").expect("declared before its methods");
+    methods!(class, {
+        "drawBezelWithFrame:inView:" => button_cell_draw_bezel_with_frame,
+            c"v56@0:8{CGRect={CGPoint=dd}{CGSize=dd}}16@48";
+    });
+
     let class = objc::class::lookup(c"NSImageView").expect("declared before its methods");
     methods!(class, {
         "setImage:" => image_view_set_image, c"v24@0:8@16";
@@ -2152,6 +2190,45 @@ pub(crate) fn install() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn button_cell_draw_bezel_uses_its_frame_and_control_view() {
+        crate::bootstrap();
+        let button_class = objc::class::lookup(c"NSButton").expect("NSButton");
+        let button = objc::object::create_instance(button_class, 0);
+        write(buttons(), button, slot::NOT_BORDERED, 0);
+
+        let cell = crate::cell::cell_of(button);
+        let cell_class = objc::class::lookup(c"NSButtonCell").expect("NSButtonCell");
+        let selector = objc::sel::get("drawBezelWithFrame:inView:");
+        let method = cell_class
+            .method(selector)
+            .expect("button-cell bezel method");
+        // SAFETY: the registered IMP and type encoding match this Objective-C signature.
+        assert_eq!(
+            unsafe { std::ffi::CStr::from_ptr(method.types()) },
+            c"v56@0:8{CGRect={CGPoint=dd}{CGSize=dd}}16@48"
+        );
+
+        let frame = NSRect {
+            origin: NSPoint { x: 3.0, y: 5.0 },
+            size: NSSize {
+                width: 24.0,
+                height: 16.0,
+            },
+        };
+        let (pixels, width, height) =
+            button_surface(button, frame, false).expect("bordered buttons have a bezel");
+        assert_eq!((width, height), (24, 16));
+        assert!(pixels.chunks_exact(4).any(|pixel| pixel[3] != 0));
+
+        // SAFETY: the selector is registered above and receives a live button cell,
+        // a CGRect, and the NSButton that owns that cell.
+        let draw: unsafe extern "C" fn(Id, Sel, NSRect, Id) =
+            unsafe { std::mem::transmute(objc::msg::entry()) };
+        unsafe { draw(cell, selector, frame, button) };
+        objc::arc::release(button);
+    }
 
     #[test]
     fn button_title_is_retained_and_read_back() {
