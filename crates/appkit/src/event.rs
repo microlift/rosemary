@@ -343,6 +343,9 @@ pub(crate) fn deliver_past_modal(event: sdl3::video::Event) {
         Event::WindowFocus { window, gained } => {
             crate::decor::focus_changed(window, gained);
             let object = object_for(window);
+            if !gained {
+                crate::screen::forget_recentring();
+            }
             if !object.is_null() && gained {
                 window::set_key_window(object);
                 // SDL drops relative mouse mode when focus goes, and a window
@@ -451,14 +454,18 @@ pub(crate) fn deliver_past_modal(event: sdl3::video::Event) {
             }
             // The first real motion after a warp is the one that reports it.
             let warped = take_warp_delta();
-            let ended = crate::screen::end_recentring_if_idle();
-            let (x, y) = match ended || crate::screen::recentring() {
-                true => {
-                    let (px, py) = pointer_position();
-                    warp_pointer(px + dx, py + dy);
-                    (px + dx, py + dy)
-                }
-                false => (x, y),
+            crate::screen::note_recentring_motion();
+            // Ending puts the physical cursor where the guest's pointer is,
+            // so that is where this motion is reported; while it lasts, SDL's
+            // position is a relative-mode one and only the deltas are real.
+            let (x, y) = if crate::screen::end_recentring_if_idle((x, y)) {
+                pointer_position()
+            } else if crate::screen::recentring() {
+                let (px, py) = pointer_position();
+                warp_pointer(px + dx, py + dy);
+                (px + dx, py + dy)
+            } else {
+                (x, y)
             };
             crate::cgevent::note_mouse_delta(dx, dy);
             crate::screen::hold_at_edge(id, x, y, dx, dy);
