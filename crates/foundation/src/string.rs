@@ -481,6 +481,24 @@ unsafe extern "C" fn init_with_bytes(
     }
 }
 
+unsafe extern "C" fn init_with_bytes_no_copy(
+    receiver: Id,
+    sel: Sel,
+    bytes: *mut u8,
+    length: usize,
+    ns: usize,
+    free_when_done: u8,
+) -> Id {
+    // The bytes are copied, so the buffer is done with now. Apple leaves it to
+    // the caller when the init fails.
+    let string = unsafe { init_with_bytes(receiver, sel, bytes, length, ns) };
+    if free_when_done != 0 && !bytes.is_null() && !string.is_null() {
+        // SAFETY: the caller gave this buffer, from `malloc`, to the string.
+        unsafe { objc::allocator::guest_free(bytes.cast()) };
+    }
+    string
+}
+
 unsafe extern "C" fn init_with_utf8(receiver: Id, _sel: Sel, cstr: *const c_char) -> Id {
     // SAFETY: a NUL-terminated string or null.
     unsafe {
@@ -1683,6 +1701,8 @@ pub(crate) fn install() {
         "fileSystemRepresentation" => file_system_representation, c"*16@0:8";
         "mutableCopyWithZone:" => mutable_copy, c"@24@0:8^v16";
         "initWithBytes:length:encoding:" => init_with_bytes, c"@40@0:8^v16Q24Q32";
+        "initWithBytesNoCopy:length:encoding:freeWhenDone:" => init_with_bytes_no_copy,
+            c"@44@0:8^v16Q24Q32c40";
         "initWithData:encoding:" => init_with_data, c"@32@0:8@16Q24";
         "initWithUTF8String:" => init_with_utf8, c"@24@0:8*16";
         "initWithCString:encoding:" => init_with_cstring_encoding, c"@32@0:8*16Q24";

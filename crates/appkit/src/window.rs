@@ -1478,7 +1478,7 @@ unsafe extern "C" fn order_out(receiver: Id, _sel: Sel, _sender: Id) {
 ///
 /// The SDL window is hidden rather than destroyed: a Metal swapchain may still
 /// be keyed by it, and that table is not this crate's to clear.
-unsafe extern "C" fn dealloc(receiver: Id, sel: Sel) {
+pub(crate) unsafe extern "C" fn dealloc(receiver: Id, sel: Sel) {
     let window = window_of(receiver);
     objc::arc::release(std::mem::replace(
         &mut window.appearance,

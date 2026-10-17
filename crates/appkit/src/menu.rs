@@ -588,6 +588,12 @@ unsafe extern "C" fn add_item_with_title(
     unsafe { insert_item_with_title(receiver, sel, title, action, key, count) }
 }
 
+unsafe extern "C" fn ignored_width(_receiver: Id, _sel: Sel, _width: f64) {}
+
+unsafe extern "C" fn zero_width(_receiver: Id, _sel: Sel) -> f64 {
+    0.0
+}
+
 pub(crate) fn install() {
     let menu = objc::class::lookup(c"NSMenu").expect("declared before its methods");
     class_methods!(menu, {
@@ -618,6 +624,8 @@ pub(crate) fn install() {
         "supermenu" => supermenu, c"@16@0:8";
         "autoenablesItems" => autoenables_items, c"c16@0:8";
         "setAutoenablesItems:" => set_autoenables_items, c"v20@0:8c16";
+        "setMinimumWidth:" => ignored_width, c"v24@0:8d16";
+        "minimumWidth" => zero_width, c"d16@0:8";
         "update" => update, c"v16@0:8";
         "performKeyEquivalent:" => perform_key_equivalent, c"c24@0:8@16";
         "performActionForItemAtIndex:" => perform_action_for_item_at_index, c"v24@0:8q16";

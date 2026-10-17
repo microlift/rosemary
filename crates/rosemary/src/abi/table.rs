@@ -609,6 +609,8 @@ pub static SIGNATURES: &[FunctionAbi] = &[
     // `CFComparisonResult` is a `CFIndex`, so a signed doubleword, and
     // `CFStringCompareFlags` is a `CFOptionFlags` - both 64-bit on LP64.
     sig!("CFStringCompare", I64, P, P, U64),
+    sig!("CFCopyDescription", P, P),
+    sig!("CFCopyTypeIDDescription", P, U64),
     sig!("CFStringCompareWithOptions", I64, P, P, I64, I64, U64),
     // `Boolean CFStringFindWithOptions(CFStringRef, CFStringRef, CFRange,
     // CFStringCompareFlags, CFRange *)`, with the range flattened.
@@ -1262,6 +1264,14 @@ pub static SIGNATURES: &[FunctionAbi] = &[
     sig!("SetSystemUIMode", I32, U32, U32),
     // `OSErr FSFindFolder(FSVolumeRefNum, OSType, Boolean, FSRef *)`.
     sig!("FSFindFolder", I16, I16, U32, U8, P),
+    sig!("GetIconRef", I16, I16, U32, U32, P),
+    sig!("ReleaseIconRef", I16, P),
+    sig!("LocaleRefFromLocaleString", I32, P, P),
+    sig!("UCCreateCollator", I32, P, U32, U32, P),
+    sig!("UCDisposeCollator", I32, P),
+    sig!("UCCompareText", I32, P, P, U64, P, U64, P, P),
+    sig!("UCGetCollationKey", I32, P, P, U64, U64, P, P),
+    sig!("UCCompareCollationKeys", I32, P, U64, P, U64, P, P),
     // The handler is a guest function the Apple Event Manager calls when an
     // event arrives, so it crosses as a thunk; removal names the same one.
     cbsig!([2], "AEInstallEventHandler", I16, U32, U32, P, P, U8),

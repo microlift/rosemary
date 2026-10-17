@@ -3381,6 +3381,54 @@ pub unsafe extern "C" fn CFUUIDGetUUIDBytes(uuid: CFTypeRef) -> CFUUIDBytes {
     CFUUIDBytes(unsafe { crate::uuid::bytes_of(uuid) }.unwrap_or([0; 16]))
 }
 
+/// `CFTypeID CFNullGetTypeID(void)`: `NSNull`'s, which Foundation registers
+/// as a CoreFoundation type.
+pub unsafe extern "C" fn CFNullGetTypeID() -> CFTypeID {
+    objc::class::lookup(c"NSNull").map_or(0, crate::base::type_id_of)
+}
+
+/// `CFTypeID CFBagGetTypeID(void)`. No bag is ever made here, so the answer
+/// only has to be an ID no object reports: not zero, and not a class address.
+pub unsafe extern "C" fn CFBagGetTypeID() -> CFTypeID {
+    1
+}
+
+/// `CFStringRef CFCopyDescription(CFTypeRef)`: the object's `-description`,
+/// retained as a Copy function's result is.
+pub unsafe extern "C" fn CFCopyDescription(object: CFTypeRef) -> CFTypeRef {
+    if object.is_null() {
+        return std::ptr::null();
+    }
+    // SAFETY: `-description` is `id (id, SEL)` on every object.
+    let text = unsafe {
+        let f: unsafe extern "C" fn(Id, objc::sel::Sel) -> Id =
+            std::mem::transmute(objc::msg::entry());
+        f(object as Id, objc::sel::get("description"))
+    };
+    objc::arc::retain(text) as CFTypeRef
+}
+
+/// `CFStringRef CFCopyTypeIDDescription(CFTypeID)`: the type's name, spelled
+/// as Apple's (`CFString`, not `__NSCFString`).
+pub unsafe extern "C" fn CFCopyTypeIDDescription(id: CFTypeID) -> CFTypeRef {
+    let Some(name) = crate::base::type_name(id) else {
+        return std::ptr::null();
+    };
+    let name = match name.strip_prefix("__NSCF") {
+        Some(rest) => format!("CF{rest}"),
+        None => name.to_string(),
+    };
+    string::from_bytes(name.as_bytes(), false)
+}
+
+/// `CFUUIDRef CFUUIDCreateFromUUIDBytes(CFAllocatorRef, CFUUIDBytes)`
+pub unsafe extern "C" fn CFUUIDCreateFromUUIDBytes(
+    _allocator: CFAllocatorRef,
+    bytes: CFUUIDBytes,
+) -> CFTypeRef {
+    crate::uuid::new(bytes.0)
+}
+
 #[cfg(test)]
 mod path_style_tests {
     use super::*;

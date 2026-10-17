@@ -18,7 +18,7 @@ unsafe extern "C" fn default_manager(class: Id, _sel: Sel) -> Id {
         };
         // Retained forever: a singleton a guest can release is one it can make
         // dangle by releasing what it never owned.
-        objc::arc::retain(manager);
+        objc::arc::make_immortal(manager);
         manager as usize
     }) as Id
 }

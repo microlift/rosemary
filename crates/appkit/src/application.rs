@@ -343,7 +343,7 @@ fn register_common_modes() {
     });
 }
 
-const MODAL_PANEL_MODE: &str = "NSModalPanelRunLoopMode";
+pub(crate) const MODAL_PANEL_MODE: &str = "NSModalPanelRunLoopMode";
 
 /// One turn of the main thread's loop in `mode`: what `-run` does each time
 /// round, and what `-runModalSession:` does once.
@@ -351,7 +351,7 @@ const MODAL_PANEL_MODE: &str = "NSModalPanelRunLoopMode";
 /// # Safety
 ///
 /// `receiver` must be an application.
-unsafe fn turn(receiver: Id, mode: &str) {
+pub(crate) unsafe fn turn(receiver: Id, mode: &str) {
     // Popped on unwind too: a skipped pop would leave the next one draining
     // the wrong pool.
     struct Pool(*mut c_void);

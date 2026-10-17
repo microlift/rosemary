@@ -716,6 +716,34 @@ pub unsafe extern "C" fn CGColorGetConstantColor(name: CFTypeRef) -> CFTypeRef {
     std::ptr::null()
 }
 
+pub unsafe extern "C" fn CGColorGetTypeID() -> corefoundation::base::CFTypeID {
+    corefoundation::base::type_id_of(
+        objc::class::lookup(c"__CGColor").expect("installed during bootstrap"),
+    )
+}
+
+/// Every colour here is kept as RGBA, so its space is device RGB.
+pub unsafe extern "C" fn CGColorGetColorSpace(color: CFTypeRef) -> CFTypeRef {
+    static SPACE: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    if color_of(color).is_none() {
+        return std::ptr::null();
+    }
+    // SAFETY: a fresh space, kept for the process as Apple's shared ones are.
+    *SPACE.get_or_init(|| unsafe { crate::graphics::CGColorSpaceCreateDeviceRGB() } as usize)
+        as CFTypeRef
+}
+
+/// `kCGColorSpaceModelRGB` for any space, since only RGB ones are made here.
+pub unsafe extern "C" fn CGColorSpaceGetModel(space: CFTypeRef) -> i32 {
+    match space.is_null() {
+        true => -1,
+        false => 1,
+    }
+}
+
+// Paths are not kept on a context (see `CGContextAddPath`), so neither is a rect.
+unsafe extern "C" fn ignored_context_rect(_context: CFTypeRef, _rect: NSRect) {}
+
 pub unsafe extern "C" fn CGPathCreateMutable() -> CFTypeRef {
     let class = objc::class::lookup(c"__CGPath").expect("installed during bootstrap");
     // SAFETY: `Path` is the registered class layout.
@@ -957,6 +985,10 @@ exports::exports! {
         "CGColorGetNumberOfComponents" => CGColorGetNumberOfComponents,
         "CGColorGetAlpha" => CGColorGetAlpha,
         "CGColorGetConstantColor" => CGColorGetConstantColor,
+        "CGColorGetTypeID" => CGColorGetTypeID,
+        "CGColorGetColorSpace" => CGColorGetColorSpace,
+        "CGColorSpaceGetModel" => CGColorSpaceGetModel,
+        "CGContextAddRect" | "CGContextAddEllipseInRect" => ignored_context_rect,
         "CGColorSpaceCreatePattern" | "CGPatternCreate" => null_object,
         "CGPatternRelease" | "CGShadingRelease" => release_object,
         "CGPathCreateMutable" => CGPathCreateMutable,

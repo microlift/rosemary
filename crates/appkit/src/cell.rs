@@ -214,3 +214,21 @@ pub(crate) fn install() {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn a_text_field_cell_answers_what_its_field_does() {
+        crate::bootstrap();
+        let cell = objc::class::lookup(c"NSTextFieldCell").expect("NSTextFieldCell");
+        for name in [
+            "setFont:",
+            "font",
+            "setAlignment:",
+            "setDrawsBackground:",
+            "setEditable:",
+        ] {
+            assert!(cell.method(objc::sel::get(name)).is_some(), "{name}");
+        }
+    }
+}

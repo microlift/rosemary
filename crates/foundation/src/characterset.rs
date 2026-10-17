@@ -22,6 +22,11 @@ const ALPHANUMERICS: usize = 7;
 const PUNCTUATION: usize = 8;
 /// A set made from characters or a range, whose members are in [`custom`].
 const CUSTOM: usize = 9;
+const CONTROL: usize = 10;
+const LOWERCASE: usize = 11;
+const UPPERCASE: usize = 12;
+const SYMBOLS: usize = 13;
+const KINDS: usize = 14;
 
 /// The members of each `CUSTOM` set: inclusive code point ranges, and whether
 /// the set is everything *but* them.
@@ -38,7 +43,7 @@ fn custom() -> &'static Mutex<HashMap<usize, Members>> {
 
 /// One of Foundation's standard sets, made once for the process as Apple's are.
 fn standard(kind: usize) -> Id {
-    static SETS: std::sync::Mutex<[usize; 9]> = std::sync::Mutex::new([0; 9]);
+    static SETS: std::sync::Mutex<[usize; KINDS]> = std::sync::Mutex::new([0; KINDS]);
     let mut sets = SETS.lock().unwrap_or_else(|e| e.into_inner());
     if sets[kind] == 0 {
         let class = objc::class::lookup(c"NSCharacterSet").expect("installed NSCharacterSet");
@@ -115,6 +120,12 @@ pub(crate) unsafe fn contains_char(set: Id, c: char) -> bool {
         // FIXME (ACCURACY): ASCII's members of the Unicode `P*` categories
         // only; no table of the rest is kept.
         PUNCTUATION => ascii.is_some_and(|b| b"!\"#%&'()*,-./:;?@[\\]_{}".contains(&b)),
+        CONTROL => c.is_control(),
+        LOWERCASE => c.is_lowercase(),
+        UPPERCASE => c.is_uppercase(),
+        // FIXME (ACCURACY): ASCII's members of the Unicode `S*` categories
+        // only, as for punctuation.
+        SYMBOLS => ascii.is_some_and(|b| b"$+<=>^`|~".contains(&b)),
         CUSTOM => {
             let custom = custom().lock().unwrap_or_else(|e| e.into_inner());
             let Some(members) = custom.get(&(set as usize)) else {
@@ -253,6 +264,35 @@ pub(crate) fn install() {
         "invertedSet" => inverted_set, c"@16@0:8";
         "characterIsMember:" => character_is_member, c"c20@0:8S16";
     });
+}
+
+/// `CFCharacterSetRef CFCharacterSetGetPredefined(CFCharacterSetPredefinedSet)`.
+/// A set with no counterpart here is an empty one.
+#[allow(non_snake_case)]
+pub unsafe extern "C" fn CFCharacterSetGetPredefined(set: isize) -> Id {
+    let kind = match set {
+        1 => CONTROL,
+        2 => WHITESPACE,
+        3 => WHITESPACE_AND_NEWLINE,
+        4 => DECIMAL_DIGITS,
+        5 => LETTERS,
+        6 => LOWERCASE,
+        7 => UPPERCASE,
+        10 => ALPHANUMERICS,
+        11 => PUNCTUATION,
+        14 => SYMBOLS,
+        15 => NEWLINE,
+        _ => CUSTOM,
+    };
+    standard(kind)
+}
+
+/// `Boolean CFCharacterSetIsCharacterMember(CFCharacterSetRef, UniChar)`.
+#[allow(non_snake_case)]
+pub unsafe extern "C" fn CFCharacterSetIsCharacterMember(set: Id, unit: u16) -> u8 {
+    char::from_u32(u32::from(unit))
+        .is_some_and(|c| unsafe { contains_char(set, c) })
+        .into()
 }
 
 #[cfg(test)]
