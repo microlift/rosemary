@@ -33,6 +33,7 @@ security = { path = "crates/security" }
 gamecontroller = { path = "crates/gamecontroller" }
 webkit = { path = "crates/webkit" }
 forcefeedback = { path = "crates/forcefeedback" }
+network = { path = "crates/network" }
 opencl = { path = "crates/opencl" }
 metal_translate = { path = "crates/metal_translate" }
 metal = { path = "crates/metal" }
