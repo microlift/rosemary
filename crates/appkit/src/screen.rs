@@ -1562,7 +1562,11 @@ pub(crate) fn recentring() -> bool {
 /// Record real pointer motion, for [`recentre`] to tell a warp that undoes
 /// the user's movement from one that repeats a snap.
 pub(crate) fn note_recentring_motion() {
-    if let Some(r) = RECENTRING.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
+    if let Some(r) = RECENTRING
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_mut()
+    {
         r.moved = true;
     }
 }

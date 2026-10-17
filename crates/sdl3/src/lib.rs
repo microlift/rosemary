@@ -1745,13 +1745,21 @@ pub mod video {
         let peep = api()?.SDL_PeepEvents?;
         let mut raw = super::Event::default();
         // SAFETY: room for one event; `SDL_PEEKEVENT` over every type.
-        if unsafe { peep(&mut raw, 1, 1, 0, u32::MAX) } != 1
-            || kind(&raw) != event_type::TEXT_INPUT
+        if unsafe { peep(&mut raw, 1, 1, 0, u32::MAX) } != 1 || kind(&raw) != event_type::TEXT_INPUT
         {
             return None;
         }
         // SAFETY: as above, `SDL_GETEVENT`, now that it is known to be text.
-        if unsafe { peep(&mut raw, 1, 2, event_type::TEXT_INPUT, event_type::TEXT_INPUT) } != 1 {
+        if unsafe {
+            peep(
+                &mut raw,
+                1,
+                2,
+                event_type::TEXT_INPUT,
+                event_type::TEXT_INPUT,
+            )
+        } != 1
+        {
             return None;
         }
         match translate(&raw) {

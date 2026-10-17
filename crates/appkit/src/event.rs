@@ -1012,7 +1012,6 @@ pub(crate) fn warp_pointer(x: f32, y: f32) {
     *POINTER.lock().unwrap_or_else(|e| e.into_inner()) = (x, y);
 }
 
-
 /// Where a physical warp is expected to be echoed back as a motion event.
 ///
 /// CoreGraphics posts no event for a warp, but SDL does (Cocoa sends one

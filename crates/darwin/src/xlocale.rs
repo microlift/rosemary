@@ -920,7 +920,13 @@ mod tests {
 
     impl GuestLocale {
         fn new(vars: &[(&'static CStr, Option<&CStr>)]) -> Self {
-            let names = [c"LC_ALL", c"LANG", c"LC_COLLATE", c"LC_CTYPE", c"LC_NUMERIC"];
+            let names = [
+                c"LC_ALL",
+                c"LANG",
+                c"LC_COLLATE",
+                c"LC_CTYPE",
+                c"LC_NUMERIC",
+            ];
             // SAFETY: NUL-terminated names and values.
             let saved = names
                 .iter()
