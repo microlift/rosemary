@@ -180,8 +180,9 @@ mod tests {
     /// A handed-over buffer is freed by the destructor named, not copied.
     #[test]
     fn a_free_destructor_takes_the_buffer() {
-        // SAFETY: `malloc` is what `DISPATCH_DATA_DESTRUCTOR_FREE` promises.
-        let buffer = unsafe { libc::malloc(8) };
+        // SAFETY: the guest's `malloc` is what `DISPATCH_DATA_DESTRUCTOR_FREE`
+        // promises; the host's is another allocator in a test.
+        let buffer = unsafe { crate::malloc::malloc(8) };
         // SAFETY: a live malloc'd buffer handed over with the free destructor.
         let handle = unsafe { create(buffer, 8, 0, destructor_free()) };
         // SAFETY: the release frees the buffer through the destructor.

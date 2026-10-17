@@ -1,0 +1,244 @@
+diff --git a/build.rs b/build.rs
+index 0f3fcda..571f537 100644
+--- a/build.rs
++++ b/build.rs
+@@ -27,6 +27,11 @@ fn main() {
+     // environment variable.
+     println!("cargo:INCLUDE_DIR={include_dir}");
+ 
++    // rosemary: `cc` prints `rerun-if-env-changed`, after which cargo watches
++    // only what is named. The published crate never changes; this copy does.
++    println!("cargo:rerun-if-changed=build.rs");
++    println!("cargo:rerun-if-changed=c_src/mimalloc/{version}");
++
+     build.include(format!("c_src/mimalloc/{version}/include"));
+     build.include(format!("c_src/mimalloc/{version}/src"));
+ 
+diff --git a/c_src/mimalloc/v3/include/mimalloc/atomic.h b/c_src/mimalloc/v3/include/mimalloc/atomic.h
+index e4abde6..5a0c40e 100644
+--- a/c_src/mimalloc/v3/include/mimalloc/atomic.h
++++ b/c_src/mimalloc/v3/include/mimalloc/atomic.h
+@@ -452,10 +452,21 @@ typedef struct mi_lock_s {
+ 
+ #define MI_LOCK_INITIALIZER { PTHREAD_MUTEX_INITIALIZER }
+ 
++// rosemary: every lock is taken through the fork gate (`src/rosemary.c`), so
++// that `fork` waits until no thread holds one and the child finds them all free.
++void _mi_fork_gate_init(void);
++void _mi_fork_gate_enter(void);
++bool _mi_fork_gate_try_enter(void);
++void _mi_fork_gate_leave(void);
++
+ static inline bool mi_lock_try_acquire(mi_lock_t* lock) {
+-  return (pthread_mutex_trylock(&lock->mutex) == 0);
++  if (!_mi_fork_gate_try_enter()) return false;
++  if (pthread_mutex_trylock(&lock->mutex) == 0) return true;
++  _mi_fork_gate_leave();
++  return false;
+ }
+ static inline void mi_lock_acquire(mi_lock_t* lock) {
++  _mi_fork_gate_enter();
+   const int err = pthread_mutex_lock(&lock->mutex);
+   if (err != 0) {
+     _mi_error_message(err, "internal error: lock cannot be acquired (err %i)\n", err);
+@@ -463,6 +474,7 @@ static inline void mi_lock_acquire(mi_lock_t* lock) {
+ }
+ static inline void mi_lock_release(mi_lock_t* lock) {
+   pthread_mutex_unlock(&lock->mutex);
++  _mi_fork_gate_leave();
+ }
+ static inline void mi_lock_init(mi_lock_t* lock) {
+   if(lock==NULL) return;
+diff --git a/c_src/mimalloc/v3/src/init.c b/c_src/mimalloc/v3/src/init.c
+index 1fabd89..e9399c3 100644
+--- a/c_src/mimalloc/v3/src/init.c
++++ b/c_src/mimalloc/v3/src/init.c
+@@ -1108,6 +1108,9 @@ static void mi_process_init_once(void) mi_attr_noexcept {
+   _mi_page_map_init(); // todo: this could fail.. should we abort in that case?
+   mi_thread_init();
+   _mi_process_is_initialized = true;
++  #if defined(MI_USE_PTHREADS)
++  _mi_fork_gate_init();  // rosemary: see rosemary.c
++  #endif
+ 
+   #if defined(_WIN32) && defined(MI_WIN_USE_FLS)
+   // On windows, when building as a static lib the FLS cleanup happens to early for the main thread.
+diff --git a/c_src/mimalloc/v3/src/rosemary.c b/c_src/mimalloc/v3/src/rosemary.c
+new file mode 100644
+index 0000000..0084393
+--- /dev/null
++++ b/c_src/mimalloc/v3/src/rosemary.c
+@@ -0,0 +1,161 @@
++/* ----------------------------------------------------------------------------
++Rosemary's additions to mimalloc, for the guarantees libmalloc makes that
++crates/darwin/src/malloc.rs builds on mimalloc. See ROSEMARY.md at the root of
++this crate. Included from static.c, so that it sees mimalloc's internals.
++
++1. The fork gate. libmalloc takes every zone's lock before `fork`, so that the
++   child of a threaded process can still allocate. mimalloc has no fork
++   handlers: a lock another thread holds when `fork` happens stays held in the
++   child, where no thread will release it, and the child hangs on its next
++   use. Every `mi_lock_t` is taken through this gate (see `atomic.h`). `fork`
++   closes it, waits until no thread holds a lock, and opens it again in both
++   processes, so the child finds every lock free. A thread that already holds
++   a lock is let through for another, as is the forking thread, so that
++   neither can be left waiting on the fork.
++
++2. `mi_rosemary_block_state`: what an address is to mimalloc, so that `free`
++   can refuse what libmalloc refuses - an address inside a block, and a block
++   the page's own bookkeeping shows is already free.
++-----------------------------------------------------------------------------*/
++#include "mimalloc.h"
++#include "mimalloc/internal.h"
++#include "mimalloc/prim.h"
++
++#if defined(MI_USE_PTHREADS)
++
++#include <string.h>  // memcpy
++
++static _Atomic(size_t)        mi_fork_inside;   // threads that hold at least one lock
++static _Atomic(size_t)        mi_fork_closed;   // nonzero from the prepare handler on
++static pthread_mutex_t        mi_fork_mutex = PTHREAD_MUTEX_INITIALIZER;  // one fork at a time
++static mi_decl_thread size_t  mi_fork_depth;    // locks this thread holds
++static mi_decl_thread bool    mi_fork_counted;  // this thread is in `mi_fork_inside`
++static mi_decl_thread bool    mi_fork_forking;  // this thread is forking
++
++// Whether this thread must go through the gate for its next lock.
++static inline bool mi_fork_gate_applies(void) {
++  return (mi_fork_depth == 0 && !mi_fork_forking);
++}
++
++void _mi_fork_gate_enter(void) {
++  if (mi_fork_gate_applies()) {
++    for (;;) {
++      // seq_cst on both sides: either the prepare handler sees this thread
++      // inside, or this thread sees the gate closed.
++      atomic_fetch_add_explicit(&mi_fork_inside, 1, memory_order_seq_cst);
++      if (atomic_load_explicit(&mi_fork_closed, memory_order_seq_cst) == 0) break;
++      atomic_fetch_sub_explicit(&mi_fork_inside, 1, memory_order_seq_cst);
++      while (atomic_load_explicit(&mi_fork_closed, memory_order_acquire) != 0) {
++        _mi_prim_thread_yield();
++      }
++    }
++    mi_fork_counted = true;
++  }
++  mi_fork_depth++;
++}
++
++bool _mi_fork_gate_try_enter(void) {
++  if (mi_fork_gate_applies()) {
++    atomic_fetch_add_explicit(&mi_fork_inside, 1, memory_order_seq_cst);
++    if (atomic_load_explicit(&mi_fork_closed, memory_order_seq_cst) != 0) {
++      atomic_fetch_sub_explicit(&mi_fork_inside, 1, memory_order_seq_cst);
++      return false;
++    }
++    mi_fork_counted = true;
++  }
++  mi_fork_depth++;
++  return true;
++}
++
++void _mi_fork_gate_leave(void) {
++  mi_assert_internal(mi_fork_depth > 0);
++  if (--mi_fork_depth == 0 && mi_fork_counted) {
++    mi_fork_counted = false;
++    atomic_fetch_sub_explicit(&mi_fork_inside, 1, memory_order_seq_cst);
++  }
++}
++
++static void mi_fork_prepare(void) {
++  pthread_mutex_lock(&mi_fork_mutex);
++  mi_fork_forking = true;
++  atomic_store_explicit(&mi_fork_closed, 1, memory_order_seq_cst);
++  // A thread forking from inside mimalloc (a visitor that forks) holds a lock
++  // of its own, which it cannot wait for.
++  const size_t own = (mi_fork_counted ? 1 : 0);
++  while (atomic_load_explicit(&mi_fork_inside, memory_order_seq_cst) > own) {
++    _mi_prim_thread_yield();
++  }
++}
++
++static void mi_fork_parent(void) {
++  mi_fork_forking = false;
++  atomic_store_explicit(&mi_fork_closed, 0, memory_order_seq_cst);
++  pthread_mutex_unlock(&mi_fork_mutex);
++}
++
++static void mi_fork_child(void) {
++  // This thread is the only one left, and no other held a lock at the fork.
++  // One that had just counted itself in, to find the gate closed, never
++  // reached its lock.
++  atomic_store_explicit(&mi_fork_inside, (mi_fork_counted ? 1 : 0), memory_order_relaxed);
++  atomic_store_explicit(&mi_fork_closed, 0, memory_order_relaxed);
++  mi_fork_forking = false;
++  const pthread_mutex_t fresh = PTHREAD_MUTEX_INITIALIZER;
++  memcpy(&mi_fork_mutex, &fresh, sizeof(fresh));
++}
++
++// Called once, from `mi_process_init`. Registered this early, the handlers run
++// after every other prepare handler and before every other child handler, so
++// those may still allocate.
++void _mi_fork_gate_init(void) {
++  pthread_atfork(&mi_fork_prepare, &mi_fork_parent, &mi_fork_child);
++}
++
++#endif  // MI_USE_PTHREADS
++
++
++// What `p` is to mimalloc. `free` hands mimalloc only `MI_ROSEMARY_LIVE`.
++typedef enum mi_rosemary_block_state_e {
++  MI_ROSEMARY_FOREIGN  = 0,  // in no mimalloc page
++  MI_ROSEMARY_LIVE     = 1,  // the start of a block that may be live; in a page of aligned
++                             // blocks, any address in one, as the aligned address is not kept
++  MI_ROSEMARY_INTERIOR = 2,  // in a page, but not where a block starts
++  MI_ROSEMARY_FREED    = 3,  // a block freed last on its page, on this thread or another
++  MI_ROSEMARY_UNUSED   = 4,  // a block the owning thread's page shows is not in use
++} mi_rosemary_block_state_t;
++
++// What `mi_rosemary_block_state` finds beside the state, from the same page
++// lookup, so that `free` need not look the page up again.
++typedef struct mi_rosemary_block_info_s {
++  mi_heap_t* heap;    // the heap whose page `p` is in; NULL when it is in none
++  size_t     usable;  // `mi_usable_size(p)` for `MI_ROSEMARY_LIVE`; 0 otherwise
++} mi_rosemary_block_info_t;
++
++// Only what is cheap: a block deeper in a free list is `MI_ROSEMARY_LIVE`. A
++// page's bookkeeping beyond its constant fields and its atomic thread-free
++// list is read only by the thread that owns the page.
++mi_decl_export int mi_rosemary_block_state(const void* p, mi_rosemary_block_info_t* info) mi_attr_noexcept {
++  info->heap = NULL;
++  info->usable = 0;
++  mi_page_t* const page = _mi_safe_ptr_page(p);
++  if (page == NULL) return MI_ROSEMARY_FOREIGN;
++  info->heap = mi_page_heap(page);
++  const uint8_t* const start = mi_page_start(page);
++  const size_t bsize = mi_page_block_size(page);
++  if ((const uint8_t*)p < start) return MI_ROSEMARY_INTERIOR;   // the page's own header
++  const size_t diff = (size_t)((const uint8_t*)p - start);
++  if (diff >= bsize * page->reserved) return MI_ROSEMARY_INTERIOR;  // past the last block
++  const mi_block_t* const block = _mi_page_ptr_unalign(page, p);
++  if ((const void*)block != p && !mi_page_has_interior_pointers(page)) {
++    return MI_ROSEMARY_INTERIOR;
++  }
++  if (mi_page_thread_free(page) == block) return MI_ROSEMARY_FREED;
++  if (mi_page_thread_id(page) == _mi_prim_thread_id()) {
++    if (page->local_free == block) return MI_ROSEMARY_FREED;
++    if (page->free == block || page->used == 0 || diff >= bsize * page->capacity) {
++      return MI_ROSEMARY_UNUSED;
++    }
++  }
++  info->usable = _mi_usable_size(p, page);
++  return MI_ROSEMARY_LIVE;
++}
+diff --git a/c_src/mimalloc/v3/src/static.c b/c_src/mimalloc/v3/src/static.c
+index 2383f65..6038716 100644
+--- a/c_src/mimalloc/v3/src/static.c
++++ b/c_src/mimalloc/v3/src/static.c
+@@ -38,6 +38,7 @@ terms of the MIT license. A copy of the license can be found in the file
+ #include "theap.c"
+ #include "threadlocal.c"
+ #include "prim/prim.c"
++#include "rosemary.c"      // rosemary: the fork gate and the block check
+ #if MI_OSX_ZONE
+ #include "prim/osx/alloc-override-zone.c"
+ #endif

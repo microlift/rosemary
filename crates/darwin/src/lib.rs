@@ -457,6 +457,9 @@ pub const LIBRARY_NAMES: &[&str] = &[
 pub fn provider() -> machish::resolve::SyntheticDylib {
     // Before the guest's initializers can register an exit handler of their own.
     stdio::register_cleanup();
+    // The zone registry, and its fork handlers ahead of any the guest installs.
+    #[cfg(not(target_os = "macos"))]
+    malloc::init();
     let mut lib = machish::resolve::SyntheticDylib::new("<darwin>");
     lib.flat(true);
     for name in LIBRARY_NAMES {

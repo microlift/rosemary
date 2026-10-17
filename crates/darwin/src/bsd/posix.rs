@@ -258,26 +258,6 @@ pub unsafe extern "C" fn atomic_store(
     atomic_after(_model);
 }
 
-/// `void *reallocf(void *ptr, size_t size)`
-///
-/// `realloc` that frees the block when it fails, so a caller writing
-/// `p = reallocf(p, n)` does not leak it. Through the host's allocator, which
-/// is the one the guest's own `realloc` import reaches - see
-/// `crate::passthrough`.
-///
-/// # Safety
-///
-/// As `realloc`.
-pub unsafe extern "C" fn reallocf(ptr: *mut c_void, size: usize) -> *mut c_void {
-    unsafe {
-        let grown = libc::realloc(ptr, size);
-        if grown.is_null() && !ptr.is_null() && size != 0 {
-            libc::free(ptr);
-        }
-        grown
-    }
-}
-
 /// # Safety
 ///
 /// `numstr` is NUL-terminated and `errstrp` is null or writable.
@@ -430,7 +410,6 @@ exports::exports! {
         "__assert_rtn" => assert_rtn,
         "srandomdev" => srandomdev,
         "memset_s" => memset_s,
-        "reallocf" => reallocf,
         "strtonum" => strtonum,
         "sys_icache_invalidate" => sys_icache_invalidate,
     }
@@ -567,15 +546,7 @@ mod tests {
     }
 
     #[test]
-    fn reallocf_grows_and_a_test_process_is_not_setuid() {
-        // SAFETY: a fresh block, grown and then freed once.
-        unsafe {
-            let p = reallocf(std::ptr::null_mut(), 8);
-            assert!(!p.is_null());
-            let p = reallocf(p, 4096);
-            assert!(!p.is_null());
-            libc::free(p);
-        }
+    fn a_test_process_is_not_setuid() {
         assert_eq!(crate::credentials::issetugid(), 0);
     }
 

@@ -3775,6 +3775,46 @@ pub static SIGNATURES: &[FunctionAbi] = &[
     sig!("malloc_zone_print_ptr_info", V, P),
     sig!("malloc_zone_unregister", V, P),
     sig!("malloc_good_size", U64, U64),
+    sig!("malloc_zone_malloc_with_options", P, P, U64, U64, U64),
+    sig!("malloc_zone_malloc_with_options_np", P, P, U64, U64, U64),
+    sig!("malloc_zone_pressure_relief", U64, P, U64),
+    sig!("malloc_zone_claimed_address", I32, P, P),
+    sig!("malloc_claimed_address", I32, P),
+    sig!("malloc_make_purgeable", V, P),
+    sig!("malloc_make_nonpurgeable", I32, P),
+    sig!("malloc_zone_enable_discharge_checking", I32, P),
+    sig!("malloc_zone_disable_discharge_checking", V, P),
+    sig!("malloc_zone_discharge", V, P, P),
+    sig!("malloc_error_break", V),
+    sig!("malloc_engaged_nano", I32),
+    sig!("malloc_enter_process_memory_limit_warn_mode", V),
+    sig!("malloc_memory_event_handler", V, U64),
+    sig!("reallocarray", P, P, U64, U64),
+    sig!("reallocarrayf", P, P, U64, U64),
+    // The typed-allocation entry points of macOS 14: the untyped call and a
+    // `malloc_type_id_t`, which is a `uint64_t`.
+    sig!("malloc_type_malloc", P, U64, U64),
+    sig!("malloc_type_calloc", P, U64, U64, U64),
+    sig!("malloc_type_free", V, P, U64),
+    sig!("malloc_type_realloc", P, P, U64, U64),
+    sig!("malloc_type_valloc", P, U64, U64),
+    sig!("malloc_type_aligned_alloc", P, U64, U64, U64),
+    sig!("malloc_type_posix_memalign", I32, P, U64, U64, U64),
+    sig!("malloc_type_zone_malloc", P, P, U64, U64),
+    sig!("malloc_type_zone_calloc", P, P, U64, U64, U64),
+    sig!("malloc_type_zone_free", V, P, P, U64),
+    sig!("malloc_type_zone_realloc", P, P, P, U64, U64),
+    sig!("malloc_type_zone_valloc", P, P, U64, U64),
+    sig!("malloc_type_zone_memalign", P, P, U64, U64, U64),
+    sig!(
+        "malloc_type_zone_malloc_with_options",
+        P,
+        P,
+        U64,
+        U64,
+        U64,
+        U64
+    ),
     // `void *valloc(size_t)` and its private counterpart `vfree`, which
     // libsystem_malloc exports without a header.
     sig!("valloc", P, U64),
@@ -4114,6 +4154,14 @@ pub static REFUSED: &[(&str, &str)] = &[
     (
         "malloc_get_all_zones",
         "walks another task's zones through a guest reader callback",
+    ),
+    // `struct mstats mstats(void)` - forty bytes returned in memory.
+    ("mstats", AGGREGATE),
+    // `void malloc_zone_enumerate_discharged_pointers(malloc_zone_t *,
+    // void (^)(void *, void *))` - hands a zone a guest block to call.
+    (
+        "malloc_zone_enumerate_discharged_pointers",
+        "passes a guest block to a zone, which would call it as host code",
     ),
 ];
 

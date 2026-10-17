@@ -34,3 +34,8 @@ rc4.workspace = true
 rustix.workspace = true
 posix-regex = { path = "../posix-regex" }
 fancy-regex = { version = "0.19.2", features = ["leftmost_longest"] }
+
+# The allocator `malloc`'s zones are made of. The runtime links mimalloc with
+# `override`, so its main heap is also the host's own `malloc`.
+[target.'cfg(not(target_os = "macos"))'.dependencies]
+libmimalloc-sys = { version = "0.1.49", default-features = false, features = ["extended"] }
