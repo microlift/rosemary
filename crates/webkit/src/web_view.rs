@@ -1830,11 +1830,11 @@ fn key(receiver: Id, event: Id, pressed: bool) {
     };
     // Command-V: GTK is about to read the clipboard, which has to be the
     // host's by then.
+    let modifiers = with_object(receiver, |v| v.modifier_flags).unwrap_or_default();
     if pressed
         && key == 47
-        && with_object(receiver, |v| v.modifier_flags).unwrap_or_default()
-            & appkit::keymap::flags::COMMAND
-            != 0
+        && modifiers & (appkit::keymap::flags::COMMAND | appkit::keymap::flags::CONTROL) != 0
+        && modifiers & appkit::keymap::flags::OPTION == 0
     {
         clipboard::offer(engine);
     }
@@ -1863,7 +1863,22 @@ unsafe extern "C" fn perform_key_equivalent(receiver: Id, _sel: Sel, event: Id) 
     // SAFETY: a live view and an event; each accessor is AppKit's prototype.
     let (first, code, flags) = unsafe {
         let window = send!(receiver, "window"; Id);
-        let first = !window.is_null() && send!(window, "firstResponder"; Id) == receiver;
+        let mut responder = if window.is_null() {
+            std::ptr::null_mut()
+        } else {
+            send!(window, "firstResponder"; Id)
+        };
+        let mut first = false;
+        for _ in 0..64 {
+            if responder.is_null() {
+                break;
+            }
+            if responder == receiver {
+                first = true;
+                break;
+            }
+            responder = appkit::view::superview_of(responder);
+        }
         (
             first,
             send!(event, "keyCode"; u16),
@@ -1874,7 +1889,7 @@ unsafe extern "C" fn perform_key_equivalent(receiver: Id, _sel: Sel, event: Id) 
     // C, X, V, A and Z, by position.
     const EDITING: [u16; 5] = [0x08, 0x07, 0x09, 0x00, 0x06];
     let editing =
-        flags & COMMAND != 0 && flags & (CONTROL | OPTION) == 0 && EDITING.contains(&code);
+        flags & (COMMAND | CONTROL) != 0 && flags & OPTION == 0 && EDITING.contains(&code);
     if !first || !editing || surface_of(receiver).is_none() {
         return 0;
     }

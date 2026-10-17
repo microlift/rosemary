@@ -229,10 +229,14 @@ fn sync_field(editor: Id) {
 /// slot. Keeping that distinction means custom text clients and ordinary text
 /// views continue to receive their own input directly.
 pub(crate) fn editing_responder(window: Id, responder: Id) -> Id {
-    if !is_text_field(responder) || !field(responder).editable {
+    if !is_text_field(responder) {
         return responder;
     }
-    let existing = field(responder).editor as Id;
+    let field_state = field(responder);
+    if !field_state.selectable {
+        return responder;
+    }
+    let existing = field_state.editor as Id;
     let editor = if existing.is_null() {
         let Some(class) = objc::class::lookup(c"NSTextView") else {
             return responder;
@@ -253,8 +257,8 @@ pub(crate) fn editing_responder(window: Id, responder: Id) -> Id {
         }
         set(editor, |flags| {
             flags.field_editor = true;
-            flags.editable = true;
-            flags.selectable = true;
+            flags.editable = field_state.editable;
+            flags.selectable = field_state.selectable;
             flags.delegate = responder as usize;
         });
         fields()
@@ -268,6 +272,10 @@ pub(crate) fn editing_responder(window: Id, responder: Id) -> Id {
         // A field can move between windows without changing identity.
         // SAFETY: the cached object is the text view made above.
         unsafe { crate::view::set_window(existing, window) };
+        set(existing, |flags| {
+            flags.editable = field_state.editable;
+            flags.selectable = field_state.selectable;
+        });
         existing
     };
     let text = field(responder).text;
@@ -760,9 +768,50 @@ unsafe extern "C" fn delete_forward(receiver: Id, _sel: Sel, _sender: Id) {
     });
 }
 
-/// `-paste:`, the standard responder action for inserting plain text from the
-/// general pasteboard at the current selection.
+fn selected_text(receiver: Id) -> Option<String> {
+    let state = read(receiver);
+    if state.selected.length == 0 {
+        return None;
+    }
+    let bytes = byte_range(&state.text, state.selected);
+    Some(state.text[bytes].to_owned())
+}
+
+/// The standard responder action for copying selected plain text.
+unsafe extern "C" fn copy(receiver: Id, _sel: Sel, _sender: Id) {
+    if let Some(text) = selected_text(receiver) {
+        crate::pasteboard::set_general_text_and_html(Some(text.into_bytes()), None);
+    }
+}
+
+/// Copy the selection before removing it from an editable view.
+fn cut_selection(receiver: Id, publish: impl FnOnce(Vec<u8>)) {
+    if !get(receiver).editable {
+        return;
+    }
+    let Some(text) = selected_text(receiver) else {
+        return;
+    };
+    publish(text.into_bytes());
+    edit(receiver, |state| {
+        replace(state, state.selected, "");
+        state.marked = None;
+    });
+}
+
+unsafe extern "C" fn cut(receiver: Id, _sel: Sel, _sender: Id) {
+    cut_selection(receiver, |text| {
+        crate::pasteboard::set_general_text_and_html(Some(text), None);
+    });
+}
+
+/// The standard responder action for inserting plain text from the general
+/// pasteboard at the current selection.
 unsafe extern "C" fn paste(receiver: Id, _sel: Sel, _sender: Id) {
+    let flags = get(receiver);
+    if flags.field_editor && !flags.editable {
+        return;
+    }
     let Some(text) = crate::pasteboard::general_text() else {
         return;
     };
@@ -790,7 +839,6 @@ unsafe extern "C" fn should_change_text(
 /// editing commands only; inserting its `-characters` here as well would type
 /// every printable key twice.
 unsafe extern "C" fn key_down(receiver: Id, _sel: Sel, event: Id) {
-    accept_key_interpretation(receiver);
     let modifiers = unsafe {
         let f: unsafe extern "C" fn(Id, Sel) -> u64 = std::mem::transmute(objc::msg::entry());
         f(event, objc::sel::get("modifierFlags"))
@@ -799,15 +847,28 @@ unsafe extern "C" fn key_down(receiver: Id, _sel: Sel, event: Id) {
         let f: unsafe extern "C" fn(Id, Sel) -> u16 = std::mem::transmute(objc::msg::entry());
         f(event, objc::sel::get("keyCode"))
     };
-    // Command-V is the AppKit shortcut. Control-V is accepted too because on
-    // the Linux hosts this runtime targets it is the desktop paste gesture.
-    if key_code == crate::keymap::vk::ANSI_V
-        && modifiers & (crate::keymap::flags::COMMAND | crate::keymap::flags::CONTROL) != 0
-    {
-        // SAFETY: this is the same standard text action as a Paste menu item.
-        unsafe { paste(receiver, objc::sel::get("paste:"), receiver) };
-        return;
+    let shortcut = modifiers & (crate::keymap::flags::COMMAND | crate::keymap::flags::CONTROL) != 0
+        && modifiers & crate::keymap::flags::OPTION == 0;
+    if shortcut {
+        let (action, selector) = match key_code {
+            crate::keymap::vk::ANSI_C => (Some(copy as unsafe extern "C" fn(Id, Sel, Id)), "copy:"),
+            crate::keymap::vk::ANSI_X => (Some(cut as unsafe extern "C" fn(Id, Sel, Id)), "cut:"),
+            crate::keymap::vk::ANSI_V => {
+                (Some(paste as unsafe extern "C" fn(Id, Sel, Id)), "paste:")
+            }
+            crate::keymap::vk::ANSI_A => (
+                Some(select_all as unsafe extern "C" fn(Id, Sel, Id)),
+                "selectAll:",
+            ),
+            _ => (None, ""),
+        };
+        if let Some(action) = action {
+            // SAFETY: each editing action takes this responder and sender.
+            unsafe { action(receiver, objc::sel::get(selector), receiver) };
+            return;
+        }
     }
+    accept_key_interpretation(receiver);
     let sel = objc::sel::get("characters");
     // SAFETY: `-characters` is `id (id, SEL)` on an event this crate made.
     let characters = unsafe {
@@ -949,7 +1010,13 @@ unsafe extern "C" fn do_command_by_selector(receiver: Id, _sel: Sel, command: Se
     // otherwise invisible field. Unknown commands are intentionally ignored.
     // SAFETY: each target has the uniform text-command shape `(id, SEL, id)`.
     unsafe {
-        if command == objc::sel::get("deleteBackward:") {
+        if command == objc::sel::get("copy:") {
+            copy(receiver, command, receiver);
+        } else if command == objc::sel::get("cut:") {
+            cut(receiver, command, receiver);
+        } else if command == objc::sel::get("paste:") {
+            paste(receiver, command, receiver);
+        } else if command == objc::sel::get("deleteBackward:") {
             delete_backward(receiver, command, receiver);
         } else if command == objc::sel::get("deleteForward:") {
             delete_forward(receiver, command, receiver);
@@ -977,7 +1044,8 @@ pub(crate) fn is_input_client(receiver: Id) -> bool {
 
 /// Deliver one text-input commit to the focused input client.
 pub(crate) fn commit(receiver: Id, text: &str) {
-    if text.is_empty() {
+    let flags = get(receiver);
+    if text.is_empty() || (flags.field_editor && !flags.editable) {
         return;
     }
     let value = objc::arc::autorelease(foundation::string::from_str(text));
@@ -1009,6 +1077,10 @@ pub(crate) fn commit(receiver: Id, text: &str) {
 
 /// Deliver an in-progress host IME composition to the focused input client.
 pub(crate) fn compose(receiver: Id, text: &str, start: i32, length: i32) {
+    let flags = get(receiver);
+    if flags.field_editor && !flags.editable {
+        return;
+    }
     let value = objc::arc::autorelease(foundation::string::from_str(text));
     let character_range = NSRange {
         location: usize::try_from(start).unwrap_or(0),
@@ -1170,7 +1242,7 @@ unsafe extern "C" fn current_editor(receiver: Id, _sel: Sel) -> Id {
 }
 
 unsafe extern "C" fn field_mouse_down(receiver: Id, _sel: Sel, _event: Id) {
-    if !field(receiver).editable {
+    if !field(receiver).selectable {
         return;
     }
     // SAFETY: the receiver is a text-field view from this runtime.
@@ -1479,6 +1551,8 @@ pub(crate) fn install() {
             c"v56@0:8@16{_NSRange=QQ}24{_NSRange=QQ}40";
         "deleteBackward:" => delete_backward, c"v24@0:8@16";
         "deleteForward:" => delete_forward, c"v24@0:8@16";
+        "copy:" => copy, c"v24@0:8@16";
+        "cut:" => cut, c"v24@0:8@16";
         "paste:" => paste, c"v24@0:8@16";
         "selectAll:" => select_all, c"v24@0:8@16";
         "moveLeft:" => move_left, c"v24@0:8@16";
@@ -1694,6 +1768,63 @@ mod tests {
             b"typed"
         );
         assert_eq!(read(view).selected.location, 5);
+    }
+
+    #[test]
+    fn cut_uses_the_selected_utf16_range() {
+        let view = text_view();
+        unsafe {
+            set_string(
+                view,
+                objc::sel::get("setString:"),
+                foundation::string::from_str("a\u{1f600}b"),
+            );
+            set_selected_range(
+                view,
+                objc::sel::get("setSelectedRange:"),
+                NSRange {
+                    location: 1,
+                    length: 2,
+                },
+            );
+            set_editable(view, objc::sel::get("setEditable:"), 1);
+        }
+        assert_eq!(selected_text(view).as_deref(), Some("😀"));
+        let mut copied = None;
+        cut_selection(view, |text| copied = Some(text));
+        assert_eq!(copied.as_deref(), Some("😀".as_bytes()));
+        assert_eq!(read(view).text, "ab");
+        assert_eq!(read(view).selected.location, 1);
+    }
+
+    #[test]
+    fn a_read_only_text_view_cannot_cut_its_selection() {
+        let view = text_view();
+        unsafe {
+            set_string(
+                view,
+                objc::sel::get("setString:"),
+                foundation::string::from_str("keep"),
+            );
+            set_selected_range(
+                view,
+                objc::sel::get("setSelectedRange:"),
+                NSRange {
+                    location: 1,
+                    length: 2,
+                },
+            );
+            set_editable(view, objc::sel::get("setEditable:"), 0);
+            cut(view, objc::sel::get("cut:"), view);
+        }
+        assert_eq!(read(view).text, "keep");
+        assert_eq!(
+            read(view).selected,
+            NSRange {
+                location: 1,
+                length: 2,
+            }
+        );
     }
 
     #[test]
