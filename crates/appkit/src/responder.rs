@@ -243,11 +243,12 @@ fn command_for(key_code: u16, modifiers: u64) -> Option<&'static str> {
 /// - see [`crate::text::accepts_host_text`]. A view that never calls it keeps its
 /// keys.
 ///
-/// The second is the editing commands, sent on as `-doCommandBySelector:`. What
-/// is deliberately *not* sent is the printable text of the event: this host's
-/// text arrives separately and layout-resolved from SDL, and inserting
-/// `-characters` here as well would type every printable key twice - the same
-/// reason [`crate::text`]'s own `-keyDown:` does not.
+/// The second is the editing commands, sent on as `-doCommandBySelector:`, and
+/// for any other key the text it typed, sent as `-insertText:` while the call
+/// is still on the stack, as AppKit does; Qt reads text arriving then as
+/// the key's. That text is SDL's layout-resolved commit, not `-characters`, and
+/// only the live host key down may take it: see
+/// [`crate::event::take_live_key_text`]. Otherwise the pump commits it later.
 unsafe extern "C" fn interpret_key_events(receiver: Id, _sel: Sel, events: Id) {
     crate::text::accept_key_interpretation(receiver);
     // SAFETY: null or an `NSArray`, which is what the method takes.
@@ -287,7 +288,7 @@ unsafe extern "C" fn interpret_key_events(receiver: Id, _sel: Sel, events: Id) {
         let Some(command) = command_for(key_code, modifiers) else {
             let chord = crate::keymap::flags::COMMAND | crate::keymap::flags::CONTROL;
             if modifiers & chord == 0
-                && let Some(text) = sdl3::video::take_next_text()
+                && let Some(text) = crate::event::take_live_key_text(key_code)
             {
                 crate::text::commit(receiver, &text);
             }

@@ -408,7 +408,11 @@ pub(crate) fn deliver_past_modal(event: sdl3::video::Event) {
                     kind: kind::FLAGS_CHANGED,
                     ..fields(w)
                 }),
-                false => send(id, None, |w, _| fields(w)),
+                false => {
+                    let live = down.then(|| LiveKey::begin(code));
+                    send(id, None, |w, _| fields(w));
+                    drop(live);
+                }
             }
         }
         // A key event describes a physical key. Text input is the separate,
@@ -886,6 +890,43 @@ fn focus_clicked(window: Id, view: Id) {
             std::mem::transmute(objc::msg::entry());
         f(window, objc::sel::get("makeFirstResponder:"), view);
     }
+}
+
+thread_local! {
+    static LIVE_KEY: std::cell::Cell<Option<u16>> = const { std::cell::Cell::new(None) };
+}
+
+/// The host key down being dispatched right now, whose text SDL queues
+/// directly behind it. Only that key may take the text: a synthesized or
+/// replayed event would otherwise take the text of a later keystroke.
+struct LiveKey;
+
+impl LiveKey {
+    fn begin(key_code: u16) -> Self {
+        LIVE_KEY.with(|live| live.set(Some(key_code)));
+        LiveKey
+    }
+}
+
+impl Drop for LiveKey {
+    fn drop(&mut self) {
+        LIVE_KEY.with(|live| live.set(None));
+    }
+}
+
+/// The text SDL resolved for the key down being dispatched, if `key_code` is
+/// that key and its text has not been taken yet. Taking it removes it from the
+/// queue, so the pump does not commit it a second time.
+pub(crate) fn take_live_key_text(key_code: u16) -> Option<String> {
+    LIVE_KEY.with(|live| {
+        if live.get() != Some(key_code) {
+            return None;
+        }
+        // Once per key down, even when there is no text: anything queued
+        // after a textless key belongs to a later one.
+        live.set(None);
+        sdl3::video::take_next_text()
+    })
 }
 
 /// The responder method an event type is delivered through.
