@@ -1169,6 +1169,206 @@ pub mod clipboard {
     }
 }
 
+/// The desktop's file chooser (`SDL_ShowOpenFileDialog` and friends), which
+/// answers asynchronously: [`show`] returns at once and the [`Answer`] fills
+/// in when SDL calls back, possibly on another thread.
+pub mod dialog {
+    use super::*;
+    use std::sync::{Arc, Mutex};
+
+    pub enum Kind {
+        Open { many: bool },
+        Save,
+        Folder { many: bool },
+    }
+
+    /// How a request ended.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub enum Outcome {
+        /// The paths chosen; never empty.
+        Chosen(Vec<Vec<u8>>),
+        Cancelled,
+        /// SDL could not show a chooser, with its error.
+        Failed(String),
+    }
+
+    pub type Answer = Arc<Mutex<Option<Outcome>>>;
+
+    /// `SDL_DialogFileFilter`.
+    #[repr(C)]
+    struct Filter {
+        name: *const c_char,
+        pattern: *const c_char,
+    }
+
+    type Callback = unsafe extern "C" fn(*mut c_void, *const *const c_char, c_int);
+
+    /// What SDL borrows until it calls back: the filter strings must outlive
+    /// the call, since a portal backend reads them later.
+    struct Request {
+        answer: Answer,
+        _strings: Vec<(CString, CString)>,
+        filters: Vec<Filter>,
+        default: Option<CString>,
+    }
+
+    unsafe extern "C" fn answered(
+        userdata: *mut c_void,
+        files: *const *const c_char,
+        _filter: c_int,
+    ) {
+        // SAFETY: the box `show` leaked; SDL answers each request once.
+        let request = unsafe { Box::from_raw(userdata as *mut Request) };
+        // Null means an error; an empty list means the user cancelled.
+        let outcome = if files.is_null() {
+            Outcome::Failed(error())
+        } else {
+            let mut paths = Vec::new();
+            let mut at = files;
+            // SAFETY: a null-terminated list of C strings SDL owns for the call.
+            unsafe {
+                while !(*at).is_null() {
+                    paths.push(CStr::from_ptr(*at).to_bytes().to_vec());
+                    at = at.add(1);
+                }
+            }
+            match paths.is_empty() {
+                true => Outcome::Cancelled,
+                false => Outcome::Chosen(paths),
+            }
+        };
+        *request.answer.lock().unwrap_or_else(|e| e.into_inner()) = Some(outcome);
+    }
+
+    /// The filters as C strings. A pair is kept or dropped whole, so a name
+    /// with a NUL in it cannot shift every later name onto the wrong pattern.
+    fn pairs(filters: &[(String, String)]) -> Vec<(CString, CString)> {
+        filters
+            .iter()
+            .filter_map(|(name, pattern)| {
+                Some((
+                    CString::new(name.as_str()).ok()?,
+                    CString::new(pattern.as_str()).ok()?,
+                ))
+            })
+            .collect()
+    }
+
+    /// Ask for a chooser. `filters` are `(name, pattern)` pairs, a pattern being
+    /// `;`-separated extensions without dots (`"png;jpg"`, or `"*"`). `default`
+    /// is a starting folder, or for a save a folder and file name.
+    ///
+    /// `None` only when SDL itself is missing; any later failure arrives as
+    /// [`Outcome::Failed`].
+    pub fn show(
+        kind: Kind,
+        window: Window,
+        filters: &[(String, String)],
+        default: Option<&[u8]>,
+    ) -> Option<Answer> {
+        type Open = unsafe extern "C" fn(
+            Callback,
+            *mut c_void,
+            Window,
+            *const Filter,
+            c_int,
+            *const c_char,
+            bool,
+        );
+        type Save = unsafe extern "C" fn(
+            Callback,
+            *mut c_void,
+            Window,
+            *const Filter,
+            c_int,
+            *const c_char,
+        );
+        type Folder = unsafe extern "C" fn(Callback, *mut c_void, Window, *const c_char, bool);
+        let handle = library()?;
+        let strings = pairs(filters);
+        let filters = strings
+            .iter()
+            .map(|(name, pattern)| Filter {
+                name: name.as_ptr(),
+                pattern: pattern.as_ptr(),
+            })
+            .collect();
+        let answer = Answer::default();
+        let request = Box::new(Request {
+            answer: answer.clone(),
+            _strings: strings,
+            filters,
+            default: default.and_then(|path| CString::new(path).ok()),
+        });
+        let location = request
+            .default
+            .as_ref()
+            .map_or(std::ptr::null(), |p| p.as_ptr());
+        let count = request.filters.len() as c_int;
+        let list = match count {
+            0 => std::ptr::null(),
+            _ => request.filters.as_ptr(),
+        };
+        // SAFETY: SDL3 declares these prototypes. Each entry is resolved before
+        // the request is leaked, and `answered` takes it back exactly once.
+        unsafe {
+            match kind {
+                Kind::Open { many } => {
+                    let show = entry::<Open>(handle, "SDL_ShowOpenFileDialog")?;
+                    show(
+                        answered,
+                        Box::into_raw(request).cast(),
+                        window,
+                        list,
+                        count,
+                        location,
+                        many,
+                    );
+                }
+                Kind::Save => {
+                    let show = entry::<Save>(handle, "SDL_ShowSaveFileDialog")?;
+                    show(
+                        answered,
+                        Box::into_raw(request).cast(),
+                        window,
+                        list,
+                        count,
+                        location,
+                    );
+                }
+                Kind::Folder { many } => {
+                    let show = entry::<Folder>(handle, "SDL_ShowOpenFolderDialog")?;
+                    show(
+                        answered,
+                        Box::into_raw(request).cast(),
+                        window,
+                        location,
+                        many,
+                    );
+                }
+            }
+        }
+        Some(answer)
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn a_bad_filter_drops_its_whole_pair() {
+            let filters = [
+                ("Bad\0".to_string(), "txt".to_string()),
+                ("Images".to_string(), "png;jpg".to_string()),
+            ];
+            let pairs = pairs(&filters);
+            assert_eq!(pairs.len(), 1);
+            assert_eq!(pairs[0].0.to_bytes(), b"Images");
+            assert_eq!(pairs[0].1.to_bytes(), b"png;jpg");
+        }
+    }
+}
+
 pub mod virtual_joystick {
     use super::*;
 
