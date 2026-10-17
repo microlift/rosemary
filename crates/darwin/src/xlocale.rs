@@ -87,6 +87,14 @@ pub unsafe extern "C" fn setlocale(category: c_int, locale: *const c_char) -> *m
     name
 }
 
+/// `setlocale(category, "")`: each category from the guest's `LC_ALL`, then
+/// its own variable, then `LANG`, never the host's environment. All or
+/// nothing, as POSIX asks: when one category's name is refused, the ones
+/// already changed are put back.
+///
+/// # Safety
+///
+/// `category` is a host category.
 unsafe fn set_from_guest_environment(category: c_int) -> *mut c_char {
     const CATEGORIES: [(c_int, &CStr); 6] = [
         (libc::LC_COLLATE, c"LC_COLLATE"),
@@ -99,8 +107,12 @@ unsafe fn set_from_guest_environment(category: c_int) -> *mut c_char {
     let guest = |name: &CStr| {
         // SAFETY: a NUL-terminated name; the answer is null or a guest string.
         let value = unsafe { crate::env::getenv(name.as_ptr()) };
-        (!value.is_null() && unsafe { *value } != 0).then_some(value as *const c_char)
+        // SAFETY: a non-null answer is a NUL-terminated guest string, copied
+        // before anything can change it.
+        (!value.is_null() && unsafe { *value } != 0)
+            .then(|| unsafe { CStr::from_ptr(value) }.to_owned())
     };
+    let mut changed: Vec<(c_int, std::ffi::CString)> = Vec::new();
     for (host, variable) in CATEGORIES {
         if category != libc::LC_ALL && category != host {
             continue;
@@ -108,10 +120,20 @@ unsafe fn set_from_guest_environment(category: c_int) -> *mut c_char {
         let name = guest(c"LC_ALL")
             .or_else(|| guest(variable))
             .or_else(|| guest(c"LANG"))
-            .unwrap_or(c"C".as_ptr());
+            .unwrap_or_else(|| c"C".to_owned());
+        // SAFETY: a query, whose answer is copied before the next call.
+        let before = unsafe { libc::setlocale(host, core::ptr::null()) };
+        let before = (!before.is_null()).then(|| unsafe { CStr::from_ptr(before) }.to_owned());
         // SAFETY: a NUL-terminated name and a host category.
-        if unsafe { libc::setlocale(host, name) }.is_null() {
+        if unsafe { libc::setlocale(host, name.as_ptr()) }.is_null() {
+            for (host, before) in changed.iter().rev() {
+                // SAFETY: a name the host itself reported for this category.
+                unsafe { libc::setlocale(*host, before.as_ptr()) };
+            }
             return core::ptr::null_mut();
+        }
+        if let Some(before) = before {
+            changed.push((host, before));
         }
     }
     // SAFETY: a query, which changes nothing.
@@ -882,21 +904,120 @@ exports::exports! {
 mod tests {
     use super::*;
 
+    /// The global locale and the guest's environment are process-wide, so the
+    /// tests that change them take turns.
+    static GLOBAL_LOCALE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn turn() -> std::sync::MutexGuard<'static, ()> {
+        GLOBAL_LOCALE.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Sets guest variables for one test and puts the old values back, along
+    /// with the host's global locale. Made while holding [`turn`].
+    struct GuestLocale {
+        saved: Vec<(&'static CStr, Option<std::ffi::CString>)>,
+    }
+
+    impl GuestLocale {
+        fn new(vars: &[(&'static CStr, Option<&CStr>)]) -> Self {
+            let names = [c"LC_ALL", c"LANG", c"LC_COLLATE", c"LC_CTYPE", c"LC_NUMERIC"];
+            // SAFETY: NUL-terminated names and values.
+            let saved = names
+                .iter()
+                .map(|&name| unsafe {
+                    let value = crate::env::getenv(name.as_ptr());
+                    let value = (!value.is_null()).then(|| CStr::from_ptr(value).to_owned());
+                    crate::env::unsetenv(name.as_ptr());
+                    (name, value)
+                })
+                .collect();
+            for (name, value) in vars {
+                if let Some(value) = value {
+                    // SAFETY: as above.
+                    unsafe { crate::env::setenv(name.as_ptr(), value.as_ptr(), 1) };
+                }
+            }
+            GuestLocale { saved }
+        }
+    }
+
+    impl Drop for GuestLocale {
+        fn drop(&mut self) {
+            // SAFETY: NUL-terminated names and values.
+            unsafe {
+                for (name, value) in &self.saved {
+                    match value {
+                        Some(value) => crate::env::setenv(name.as_ptr(), value.as_ptr(), 1),
+                        None => crate::env::unsetenv(name.as_ptr()),
+                    };
+                }
+                libc::setlocale(libc::LC_ALL, c"C".as_ptr());
+            }
+            MB_CUR_MAX.store(1, Ordering::Relaxed);
+        }
+    }
+
+    /// A UTF-8 locale this host has, if any: hosts differ in which they ship.
+    fn utf8_locale() -> Option<&'static CStr> {
+        [c"C.UTF-8", c"en_US.UTF-8"].into_iter().find(|name| {
+            // SAFETY: NUL-terminated names; the global locale is the test's.
+            unsafe {
+                let found = !libc::setlocale(libc::LC_CTYPE, name.as_ptr()).is_null();
+                libc::setlocale(libc::LC_CTYPE, c"C".as_ptr());
+                found
+            }
+        })
+    }
+
+    #[test]
+    fn an_empty_name_without_guest_variables_is_c() {
+        let _turn = turn();
+        let _guest = GuestLocale::new(&[]);
+        // SAFETY: NUL-terminated names.
+        unsafe {
+            let set = setlocale(category::NUMERIC, c"".as_ptr());
+            assert!(!set.is_null());
+            assert_eq!(CStr::from_ptr(set), c"C");
+        }
+    }
+
     #[test]
     fn an_empty_name_reads_the_guests_environment() {
-        // SAFETY: NUL-terminated names; the locale is put back below.
+        let _turn = turn();
+        let Some(utf8) = utf8_locale() else {
+            eprintln!("skipping: this host has no UTF-8 locale");
+            return;
+        };
+        let _guest = GuestLocale::new(&[(c"LC_NUMERIC", Some(utf8))]);
+        // SAFETY: NUL-terminated names.
         unsafe {
-            for name in [c"LC_ALL", c"LC_NUMERIC", c"LANG"] {
-                crate::env::unsetenv(name.as_ptr());
-            }
             let set = setlocale(category::NUMERIC, c"".as_ptr());
-            assert_eq!(CStr::from_ptr(set), c"C");
-            crate::env::setenv(c"LC_NUMERIC".as_ptr(), c"C.UTF-8".as_ptr(), 1);
-            let set = setlocale(category::NUMERIC, c"".as_ptr());
-            assert_eq!(CStr::from_ptr(set), c"C.UTF-8");
-            crate::env::unsetenv(c"LC_NUMERIC".as_ptr());
-            libc::setlocale(libc::LC_NUMERIC, c"C".as_ptr());
+            assert!(!set.is_null());
+            assert_eq!(CStr::from_ptr(set), utf8);
         }
+    }
+
+    /// One refused category leaves every other one, and `MB_CUR_MAX`, as it
+    /// was.
+    #[test]
+    fn a_refused_category_changes_nothing() {
+        let _turn = turn();
+        let Some(utf8) = utf8_locale() else {
+            eprintln!("skipping: this host has no UTF-8 locale");
+            return;
+        };
+        let _guest = GuestLocale::new(&[
+            (c"LC_CTYPE", Some(utf8)),
+            (c"LC_NUMERIC", Some(c"xx_NOWHERE.none")),
+        ]);
+        // SAFETY: NUL-terminated names.
+        unsafe {
+            libc::setlocale(libc::LC_ALL, c"C".as_ptr());
+            assert!(setlocale(category::ALL, c"".as_ptr()).is_null());
+            let ctype = libc::setlocale(libc::LC_CTYPE, core::ptr::null());
+            assert_eq!(CStr::from_ptr(ctype), c"C");
+        }
+        assert_eq!(MB_CUR_MAX.load(Ordering::Relaxed), 1);
     }
 
     /// The switch is undone even when the wrapped call fails, which is the whole
