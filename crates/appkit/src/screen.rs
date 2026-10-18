@@ -539,6 +539,20 @@ pub unsafe extern "C" fn CGDisplayPixelsHigh(display: u32) -> u64 {
     unsafe { CGDisplayBounds(display) }.size.height as u64
 }
 
+/// `size_t CGDisplayBitsPerPixel(CGDirectDisplayID)`
+///
+/// 32, matching the `IO32BitDirectPixels` encoding every mode reports; zero
+/// for a display id that is not online, as CoreGraphics answers.
+#[allow(non_snake_case)]
+pub unsafe extern "C" fn CGDisplayBitsPerPixel(display: u32) -> u64 {
+    // SAFETY: a plain call.
+    if unsafe { CGDisplayIsOnline(display) } != 0 {
+        32
+    } else {
+        0
+    }
+}
+
 /// `CGError CGDisplayMoveCursorToPoint(CGDirectDisplayID, CGPoint)`.
 ///
 /// The point is relative to the display's origin; the warp wants global space.

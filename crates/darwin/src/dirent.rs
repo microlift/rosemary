@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::ffi::{CStr, c_char, c_int};
+use std::ffi::{CStr, c_char, c_int, c_void};
 use std::sync::{Arc, Mutex};
 
 /// Darwin's `struct dirent`, the `_DARWIN_FEATURE_64_BIT_INODE` layout.
@@ -37,6 +37,43 @@ impl Default for Dirent {
     }
 }
 
+/// x86-64 Darwin's `struct dirent` without `_DARWIN_FEATURE_64_BIT_INODE`,
+/// which the unsuffixed `readdir` returns there; see `crate::stat::LegacyStat`.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct LegacyDirent {
+    pub ino: u32,
+    pub reclen: u16,
+    pub kind: u8,
+    pub namlen: u8,
+    pub name: [c_char; 256],
+}
+
+const _: () = {
+    assert!(size_of::<LegacyDirent>() == 264);
+    assert!(std::mem::offset_of!(LegacyDirent, name) == 8);
+};
+
+impl LegacyDirent {
+    /// `None` for a name longer than the 255 bytes this layout holds, which
+    /// no Darwin file system of its time could have.
+    fn from(entry: &Dirent) -> Option<Self> {
+        let namlen = entry.namlen as usize;
+        if namlen > 255 {
+            return None;
+        }
+        let mut name = [0; 256];
+        name[..namlen].copy_from_slice(&entry.name[..namlen]);
+        Some(LegacyDirent {
+            ino: entry.ino as u32,
+            reclen: size_of::<LegacyDirent>() as u16,
+            kind: entry.kind,
+            namlen: namlen as u8,
+            name,
+        })
+    }
+}
+
 /// The supported hosts share the `DT_*` numbers, so the type byte
 /// is copied rather than translated. Asserted rather than assumed.
 const _: () = {
@@ -52,6 +89,8 @@ const _: () = {
 struct Open {
     /// The entry [`readdir`] published last.
     entry: Option<Box<Dirent>>,
+    /// The same, as [`readdir_unsuffixed`] published it to a legacy caller.
+    legacy: Option<Box<LegacyDirent>>,
     /// The mount table's changes to this directory, read on first use so a
     /// handle from anywhere - `fdopendir` included - gets them.
     listing: Option<Option<Arc<prefix::ns::Listing>>>,
@@ -222,6 +261,32 @@ pub unsafe extern "C" fn readdir(dir: *mut libc::DIR) -> *mut Dirent {
             .entry
             .get_or_insert_with(|| Box::new(Dirent::default()));
         **slot = entry;
+        (&raw mut **slot).cast()
+    })
+}
+
+/// The unsuffixed `readdir`, whose entry is a [`LegacyDirent`] for an x86-64
+/// guest and a [`Dirent`] otherwise.
+///
+/// # Safety
+///
+/// As [`readdir`].
+pub unsafe extern "C" fn readdir_unsuffixed(dir: *mut libc::DIR) -> *mut c_void {
+    let entry = unsafe { readdir(dir) };
+    if entry.is_null() || !crate::stat::unsuffixed_is_legacy() {
+        return entry.cast();
+    }
+    // SAFETY: the slot `readdir` just filled, live until the next call on `dir`.
+    let Some(legacy) = LegacyDirent::from(unsafe { &*entry }) else {
+        crate::errno::set(libc::EOVERFLOW);
+        return std::ptr::null_mut();
+    };
+    entries(|open| {
+        let slot = open
+            .entry(dir as usize)
+            .or_default()
+            .legacy
+            .insert(Box::new(legacy));
         (&raw mut **slot).cast()
     })
 }
@@ -441,7 +506,8 @@ pub const REFUSED: &[&str] = &["getdirentries"];
 exports::exports! {
     functions {
         "opendir" => opendir,
-        "readdir" => readdir,
+        "readdir" => readdir_unsuffixed,
+        "readdir$INODE64" => readdir,
         "readdir_r" => readdir_r,
         "closedir" => closedir,
         "scandir" => scandir,
@@ -458,6 +524,32 @@ mod tests {
     fn c_path(path: &std::path::Path) -> std::ffi::CString {
         use std::os::unix::ffi::OsStrExt;
         std::ffi::CString::new(path.as_os_str().as_bytes()).expect("a path with no NUL")
+    }
+
+    /// A legacy entry carries the name and type at its own offsets.
+    #[test]
+    fn a_legacy_entry_keeps_the_name() {
+        let mut entry = Dirent {
+            ino: 0x1_0000_0002,
+            kind: libc::DT_REG,
+            namlen: 5,
+            ..Dirent::default()
+        };
+        for (to, from) in entry.name.iter_mut().zip(b"fonts") {
+            *to = *from as c_char;
+        }
+        let legacy = LegacyDirent::from(&entry).expect("a short name");
+        assert_eq!(legacy.ino, 2);
+        assert_eq!(
+            (legacy.kind, legacy.namlen, legacy.reclen),
+            (libc::DT_REG, 5, 264)
+        );
+        // SAFETY: the copied name is NUL-terminated by the zeroed tail.
+        let name = unsafe { CStr::from_ptr(legacy.name.as_ptr()) };
+        assert_eq!(name.to_bytes(), b"fonts");
+
+        entry.namlen = 300;
+        assert!(LegacyDirent::from(&entry).is_none());
     }
 
     /// Guest offsets are fixed even when the host uses another layout.

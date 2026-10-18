@@ -252,6 +252,13 @@ unsafe extern "C" fn string_with_cstring_encoding(
     }
 }
 
+/// `+stringWithCString:`, the deprecated spelling that reads the bytes in
+/// [`default_cstring_encoding`].
+unsafe extern "C" fn string_with_cstring(class: Id, sel: Sel, cstr: *const c_char) -> Id {
+    // SAFETY: a NUL-terminated string or null.
+    unsafe { string_with_cstring_encoding(class, sel, cstr, default_cstring_encoding(class, sel)) }
+}
+
 /// `+defaultCStringEncoding`. Apple's answers Mac Roman; this one answers the
 /// encoding [`cf_encoding`] actually reads an unnamed one as, so a program that
 /// asks and then passes the answer back gets the decoding it was told about.
@@ -504,6 +511,15 @@ unsafe extern "C" fn init_with_utf8(receiver: Id, _sel: Sel, cstr: *const c_char
     unsafe {
         objc::arc::release(receiver);
         api::CFStringCreateWithCString(std::ptr::null(), cstr, encoding::UTF8) as Id
+    }
+}
+
+/// `-initWithCString:`, as [`string_with_cstring`].
+unsafe extern "C" fn init_with_cstring(receiver: Id, sel: Sel, cstr: *const c_char) -> Id {
+    // SAFETY: a NUL-terminated string or null.
+    unsafe {
+        let ns = default_cstring_encoding(receiver, sel);
+        init_with_cstring_encoding(receiver, sel, cstr, ns)
     }
 }
 
@@ -1706,6 +1722,7 @@ pub(crate) fn install() {
         "initWithData:encoding:" => init_with_data, c"@32@0:8@16Q24";
         "initWithUTF8String:" => init_with_utf8, c"@24@0:8*16";
         "initWithCString:encoding:" => init_with_cstring_encoding, c"@32@0:8*16Q24";
+        "initWithCString:" => init_with_cstring, c"@24@0:8*16";
         "initWithFormat:" => init_with_format, c"@24@0:8@16";
         "stringByAppendingFormat:" => appending_format, c"@24@0:8@16";
         "stringByRemovingPercentEncoding" => removing_percent_encoding, c"@16@0:8";
@@ -1739,6 +1756,7 @@ pub(crate) fn install() {
     class_methods!(class, {
         "stringWithUTF8String:" => string_with_utf8, c"@24@0:8*16";
         "stringWithCString:encoding:" => string_with_cstring_encoding, c"@32@0:8*16Q24";
+        "stringWithCString:" => string_with_cstring, c"@24@0:8*16";
         "defaultCStringEncoding" => default_cstring_encoding, c"Q16@0:8";
         "stringWithContentsOfFile:encoding:error:" => string_with_contents_of_file,
             c"@40@0:8@16Q24^@32";

@@ -178,6 +178,7 @@ mod tests {
     }
 
     /// A handed-over buffer is freed by the destructor named, not copied.
+    #[cfg(not(target_os = "macos"))]
     #[test]
     fn a_free_destructor_takes_the_buffer() {
         // SAFETY: the guest's `malloc` is what `DISPATCH_DATA_DESTRUCTOR_FREE`

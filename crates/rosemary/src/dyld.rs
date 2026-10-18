@@ -1611,6 +1611,12 @@ static NATIVE_SYMBOL_COUNT: AtomicUsize = AtomicUsize::new(0);
 /// `RTLD_GLOBAL` and never closed, for the reason the native provider's own fallback
 /// is: closing it would dangle every pointer already written into a guest slot.
 fn open_native(path: &str) -> Option<u64> {
+    // Every symbol behind such a handle is the host's own, which is exactly what
+    // `darwin::strict` withdraws; a guest `dlopen("libstdc++.so.6")` must not
+    // undo it at run time.
+    if darwin::strict::enabled() {
+        return None;
+    }
     if crate::frameworks::no_host_frameworks() && crate::frameworks::is_host_framework_path(path) {
         return None;
     }
@@ -2359,7 +2365,11 @@ pub(crate) mod entry {
             }
             // No Mach-O for this backend on disk under that name.
             Err(reason) => super::open_native(&path).or_else(|| {
-                super::set_error(format!("dlopen({path}): {reason}"));
+                let strict = match darwin::strict::enabled() {
+                    true => format!(" (and {} refuses the host's loader)", darwin::strict::VAR),
+                    false => String::new(),
+                };
+                super::set_error(format!("dlopen({path}): {reason}{strict}"));
                 None
             }),
         };

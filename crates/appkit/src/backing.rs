@@ -1883,8 +1883,8 @@ unsafe extern "C" fn context_is_flipped(_receiver: Id, _sel: Sel) -> u8 {
     current_focus().is_some_and(|focus| focus.flipped) as u8
 }
 
-unsafe extern "C" fn nil(_receiver: Id, _sel: Sel) -> Id {
-    std::ptr::null_mut()
+unsafe extern "C" fn cg_context(_receiver: Id, _sel: Sel) -> *const c_void {
+    crate::cgcontext::focus_context()
 }
 
 unsafe extern "C" fn ignored(_receiver: Id, _sel: Sel) {}
@@ -1927,8 +1927,8 @@ pub(crate) fn install() {
     });
     methods!(context, {
         "isFlipped" => context_is_flipped, c"c16@0:8";
-        "CGContext" => nil, c"^v16@0:8";
-        "graphicsPort" => nil, c"^v16@0:8";
+        "CGContext" => cg_context, c"^v16@0:8";
+        "graphicsPort" => cg_context, c"^v16@0:8";
         "flushGraphics" => ignored, c"v16@0:8";
         "compositingOperation" => zero, c"q16@0:8";
         "setCompositingOperation:" => ignored_integer, c"v24@0:8q16";

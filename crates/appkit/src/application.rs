@@ -448,9 +448,9 @@ fn queued_event(mask: u64, dequeue: bool) -> Id {
 ///
 /// A program that drives its own loop - UE3 does - calls this instead of
 /// `-run`, so the pump has to happen here too or its window is never serviced.
-/// Keyboard events and events posted to the application are the objects this
-/// method returns; the rest of window-system input is delivered by
-/// `event::pump` directly.
+/// Keyboard, mouse button, mouse motion and scroll events, and events posted to
+/// the application, are the objects this method returns; the rest of
+/// window-system input is delivered by `event::pump` directly.
 ///
 /// FIXME (ACCURACY): AppKit has one event queue. Every window-server event -
 /// mouse, keyboard, scroll, tracking, app-defined - is dequeued here, run
@@ -459,14 +459,15 @@ fn queued_event(mask: u64, dequeue: bool) -> Id {
 /// until the caller hands it to `-[NSApplication sendEvent:]`, which `-run` does
 /// for itself. A mask leaves non-matching events queued, in order, for a later
 /// call - that is how a mouse-tracking loop keeps keystrokes for afterwards.
-/// Here only key and flags-changed events take that path; everything else is
-/// sent from inside `event::pump`, before this returns, and never comes back
-/// from it. The difference shows when a guest reads its input from what this
-/// returns rather than from its responders: SDL 2.0.4 handles the keyboard only
-/// in its `Cocoa_PumpEvents` loop, which is why keys were moved first. Mouse
-/// events still bypass a guest loop that filters or drops them, a tracking loop
-/// asking for mouse events alone gets none, and keys can now arrive after mouse
-/// events that happened later.
+/// Here key, flags-changed, mouse button, motion and scroll events take that
+/// path; the rest - entered/exited, cursor updates, and the moves a tracking
+/// area's owner is sent - are sent from inside `event::pump`, before this
+/// returns, and never come back from it. The difference shows when a guest
+/// reads its input from what this returns rather than from its responders: SDL
+/// 2.0.4 handles the keyboard only in its `Cocoa_PumpEvents` loop, and
+/// ClassiCube the mouse only in its own loop, which is why those moved first.
+/// Tracking events still bypass a guest loop that filters or drops them, and
+/// can arrive ahead of input that happened earlier.
 ///
 /// Done properly, `event::pump` only translates: each SDL event becomes an
 /// `NSEvent` (or a window notification, which is not an event) appended to

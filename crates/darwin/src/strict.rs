@@ -1,3 +1,13 @@
+//! Refusing the host's own libraries as an answer to a guest.
+//!
+//! On a host that is not a Mac, a host symbol with a Darwin name is a guess at
+//! the Darwin ABI: a guest linked against `libc++` can end up calling the host's
+//! `libstdc++`. Under this mode only what this tree implements answers - the
+//! link-time chains drop `NativeDylibProvider`, [`crate::symbol`] stops falling
+//! back to `dlsym`, and a guest `dlopen` never reaches the host's loader. Shims
+//! that forward to a named host function keep it (see [`crate::shim_symbol`]).
+//! Off on macOS, whose host libraries are the Darwin ones.
+
 /// The variable that turns the refusal on. Any value but `0`.
 pub const VAR: &str = "ROSEMARY_NO_PASSTHROUGH";
 

@@ -496,12 +496,18 @@ mod slot {
     pub const BEZEL: usize = 16;
     pub const TEXT_ALIGNMENT: usize = 17;
     pub const ATTRIBUTED_TITLE: usize = 18;
-    /// Whether the state shows by swapping in the alternate title and image
-    /// (`showsStateBy` includes `NSContentsCellMask`).
-    pub const SHOWS_ALTERNATE: usize = 19;
+    /// `-showsStateBy`, an `NSCellStyleMask`.
+    pub const SHOWS_STATE_BY: usize = 19;
     /// `-contentTintColor`, retained.
     pub const TINT_COLOR: usize = 20;
     pub const BACKGROUND_STYLE: usize = 21;
+    /// `-highlightsBy`, plus one so that zero is "never set".
+    pub const HIGHLIGHTS_BY: usize = 22;
+    /// `NSCellImagePosition`.
+    pub const IMAGE_POSITION: usize = 23;
+    pub const ALLOWS_MIXED_STATE: usize = 24;
+    /// `NSImageScaling`; zero is proportionally down, a button's default.
+    pub const BUTTON_IMAGE_SCALING: usize = 25;
     pub const BUTTON_OBJECTS: [usize; 8] = [
         TINT_COLOR,
         IMAGE,
@@ -523,7 +529,7 @@ mod slot {
     pub const KNOB_PROPORTION: usize = 1;
 }
 
-const ROW: usize = 22;
+const ROW: usize = 26;
 
 fn read(table: &Mutex<HashMap<usize, Vec<usize>>>, receiver: Id, at: usize) -> usize {
     table
@@ -1016,8 +1022,9 @@ unsafe extern "C" fn button_draw_rect(receiver: Id, _sel: Sel, _dirty: NSRect) {
         if natural.width <= 0.0 || natural.height <= 0.0 {
             return;
         }
-        // Proportionally down and centred, `NSButton`'s defaults.
-        let destination = image_placement(view::bounds_of(receiver), natural, 0, 0);
+        // Centred, as `NSButton` places an image by default.
+        let scaling = read(buttons(), receiver, slot::BUTTON_IMAGE_SCALING);
+        let destination = image_placement(view::bounds_of(receiver), natural, scaling, 0);
         // A tint colours template images only; any other draws as it is.
         let tint = read(buttons(), receiver, slot::TINT_COLOR) as Id;
         if !tint.is_null() && crate::image::is_template_image(image) {
@@ -1175,13 +1182,61 @@ fn draw_check(receiver: Id, radio: bool) {
     );
 }
 
-/// `NSButtonType`, for the kinds whose clicks change their state.
+/// `NSButtonType`.
 pub(crate) mod button_type {
+    pub const MOMENTARY_LIGHT: usize = 0;
     pub const PUSH_ON_PUSH_OFF: usize = 1;
     pub const TOGGLE: usize = 2;
     pub const SWITCH: usize = 3;
     pub const RADIO: usize = 4;
+    pub const MOMENTARY_CHANGE: usize = 5;
     pub const ON_OFF: usize = 6;
+    pub const MOMENTARY_PUSH_IN: usize = 7;
+    pub const ACCELERATOR: usize = 8;
+    pub const MULTI_LEVEL_ACCELERATOR: usize = 9;
+}
+
+/// `NSCellStyleMask`, what `-highlightsBy` and `-showsStateBy` hold.
+mod cell_mask {
+    pub const CONTENTS: usize = 1;
+    pub const PUSH_IN: usize = 2;
+    pub const CHANGE_GRAY: usize = 4;
+    pub const CHANGE_BACKGROUND: usize = 8;
+}
+
+/// What a button of a type highlights by while pressed and shows its state
+/// by, as `-setButtonType:` sets them.
+fn type_masks(kind: usize) -> Option<(usize, usize)> {
+    use cell_mask::*;
+    Some(match kind {
+        button_type::MOMENTARY_LIGHT => (CHANGE_BACKGROUND, 0),
+        button_type::PUSH_ON_PUSH_OFF => (PUSH_IN | CHANGE_GRAY, CHANGE_BACKGROUND),
+        button_type::TOGGLE => (PUSH_IN | CONTENTS, CONTENTS),
+        button_type::SWITCH | button_type::RADIO => (CONTENTS, CONTENTS),
+        button_type::MOMENTARY_CHANGE => (CONTENTS, 0),
+        button_type::ON_OFF => (CHANGE_BACKGROUND, CHANGE_BACKGROUND),
+        button_type::MOMENTARY_PUSH_IN
+        | button_type::ACCELERATOR
+        | button_type::MULTI_LEVEL_ACCELERATOR => (PUSH_IN | CHANGE_GRAY, 0),
+        _ => return None,
+    })
+}
+
+/// `NSControlStateValue`s.
+mod state {
+    pub const MIXED: isize = -1;
+    pub const OFF: isize = 0;
+    pub const ON: isize = 1;
+}
+
+/// The state a click moves a button to: on and off alternate, and a button
+/// that allows the mixed state passes through it on the way from off to on.
+fn next_state(receiver: Id) -> isize {
+    match read(buttons(), receiver, slot::BUTTON_STATE) as isize {
+        state::ON => state::OFF,
+        state::OFF if read(buttons(), receiver, slot::ALLOWS_MIXED_STATE) != 0 => state::MIXED,
+        _ => state::ON,
+    }
 }
 
 /// What a click does to a button's state before its action is sent: a radio
@@ -1211,8 +1266,12 @@ fn advance_state(receiver: Id) {
         | button_type::TOGGLE
         | button_type::SWITCH
         | button_type::ON_OFF => {
-            let on = read(buttons(), receiver, slot::BUTTON_STATE) != 0;
-            write(buttons(), receiver, slot::BUTTON_STATE, usize::from(!on));
+            write(
+                buttons(),
+                receiver,
+                slot::BUTTON_STATE,
+                next_state(receiver) as usize,
+            );
         }
         _ => return,
     }
@@ -1266,7 +1325,7 @@ fn button_text(receiver: Id) -> String {
         true => match read(buttons(), receiver, slot::ALTERNATE_TITLE) as Id {
             alternate
                 if read(buttons(), receiver, slot::BUTTON_STATE) != 0
-                    && read(buttons(), receiver, slot::SHOWS_ALTERNATE) != 0
+                    && read(buttons(), receiver, slot::SHOWS_STATE_BY) & cell_mask::CONTENTS != 0
                     // SAFETY: a string this button retained.
                     && !unsafe { foundation::string::bytes(alternate) }.is_empty() =>
             {
@@ -1370,12 +1429,16 @@ button_word! {
     button_set_key_modifiers, button_key_modifiers => KEY_MODIFIERS;
     button_set_bezel_style, button_bezel_style => BEZEL;
     button_set_alignment, button_alignment => TEXT_ALIGNMENT;
+    button_set_image_position, button_image_position => IMAGE_POSITION;
+    button_set_image_scaling, button_image_scaling => BUTTON_IMAGE_SCALING;
 }
 
 /// Whether the state shows as the alternate contents, for a button built in
 /// Interface Builder, whose cell flags say so rather than its type.
 pub(crate) fn set_shows_alternate(receiver: Id, on: bool) {
-    write(buttons(), receiver, slot::SHOWS_ALTERNATE, usize::from(on));
+    let shows = read(buttons(), receiver, slot::SHOWS_STATE_BY) & !cell_mask::CONTENTS;
+    let contents = if on { cell_mask::CONTENTS } else { 0 };
+    write(buttons(), receiver, slot::SHOWS_STATE_BY, shows | contents);
 }
 
 /// `-performKeyEquivalent:`: a click, when the event's characters and
@@ -1492,15 +1555,79 @@ unsafe extern "C" fn button_title(receiver: Id, _sel: Sel) -> Id {
     read(buttons(), receiver, slot::TITLE) as Id
 }
 
+/// `-setButtonType:`: the type, and the highlight and state display, image
+/// position and border AppKit gives a button of that type.
 unsafe extern "C" fn button_set_type(receiver: Id, _sel: Sel, value: usize) {
     write(buttons(), receiver, slot::BUTTON_TYPE, value);
-    // `NSToggleButton` shows its state by its contents; the rest do not.
+    if let Some((highlights, shows)) = type_masks(value) {
+        write(buttons(), receiver, slot::HIGHLIGHTS_BY, highlights + 1);
+        write(buttons(), receiver, slot::SHOWS_STATE_BY, shows);
+    }
+    if matches!(value, button_type::SWITCH | button_type::RADIO) {
+        // A check box or radio button draws its artwork left of the title,
+        // without a bezel.
+        write(
+            buttons(),
+            receiver,
+            slot::IMAGE_POSITION,
+            image_position::LEFT,
+        );
+        write(buttons(), receiver, slot::NOT_BORDERED, 1);
+    }
+    crate::backing::needs_display(receiver);
+}
+
+/// `NSCellImagePosition`.
+mod image_position {
+    pub const LEFT: usize = 2;
+}
+
+unsafe extern "C" fn button_set_highlights_by(receiver: Id, _sel: Sel, value: usize) {
+    write(buttons(), receiver, slot::HIGHLIGHTS_BY, value + 1);
+}
+
+/// `-highlightsBy`: a fresh button is `NSMomentaryPushInButton`'s.
+unsafe extern "C" fn button_highlights_by(receiver: Id, _sel: Sel) -> usize {
+    match read(buttons(), receiver, slot::HIGHLIGHTS_BY) {
+        0 => cell_mask::PUSH_IN | cell_mask::CHANGE_GRAY,
+        stored => stored - 1,
+    }
+}
+
+unsafe extern "C" fn button_set_shows_state_by(receiver: Id, _sel: Sel, value: usize) {
+    write(buttons(), receiver, slot::SHOWS_STATE_BY, value);
+    crate::backing::needs_display(receiver);
+}
+
+unsafe extern "C" fn button_shows_state_by(receiver: Id, _sel: Sel) -> usize {
+    read(buttons(), receiver, slot::SHOWS_STATE_BY)
+}
+
+unsafe extern "C" fn button_set_allows_mixed_state(receiver: Id, _sel: Sel, value: u8) {
     write(
         buttons(),
         receiver,
-        slot::SHOWS_ALTERNATE,
-        usize::from(value == 2),
+        slot::ALLOWS_MIXED_STATE,
+        usize::from(value != 0),
     );
+}
+
+unsafe extern "C" fn button_allows_mixed_state(receiver: Id, _sel: Sel) -> u8 {
+    read(buttons(), receiver, slot::ALLOWS_MIXED_STATE) as u8
+}
+
+unsafe extern "C" fn button_next_state(receiver: Id, _sel: Sel) -> isize {
+    next_state(receiver)
+}
+
+unsafe extern "C" fn button_set_next_state(receiver: Id, _sel: Sel) {
+    write(
+        buttons(),
+        receiver,
+        slot::BUTTON_STATE,
+        next_state(receiver) as usize,
+    );
+    crate::backing::needs_display(receiver);
 }
 
 unsafe extern "C" fn button_type(receiver: Id, _sel: Sel) -> usize {
@@ -2067,6 +2194,18 @@ pub(crate) fn install() {
         "title" => button_title, c"@16@0:8";
         "setButtonType:" => button_set_type, c"v24@0:8Q16";
         "buttonType" => button_type, c"Q16@0:8";
+        "setHighlightsBy:" => button_set_highlights_by, c"v24@0:8Q16";
+        "highlightsBy" => button_highlights_by, c"Q16@0:8";
+        "setShowsStateBy:" => button_set_shows_state_by, c"v24@0:8Q16";
+        "showsStateBy" => button_shows_state_by, c"Q16@0:8";
+        "setImagePosition:" => button_set_image_position, c"v24@0:8Q16";
+        "imagePosition" => button_image_position, c"Q16@0:8";
+        "setImageScaling:" => button_set_image_scaling, c"v24@0:8Q16";
+        "imageScaling" => button_image_scaling, c"Q16@0:8";
+        "setAllowsMixedState:" => button_set_allows_mixed_state, c"v20@0:8c16";
+        "allowsMixedState" => button_allows_mixed_state, c"c16@0:8";
+        "nextState" => button_next_state, c"q16@0:8";
+        "setNextState" => button_set_next_state, c"v16@0:8";
         "setState:" => button_set_state, c"v24@0:8q16";
         "state" => button_state, c"q16@0:8";
         "setTarget:" => button_set_target, c"v24@0:8@16";

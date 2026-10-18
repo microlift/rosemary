@@ -757,6 +757,7 @@ pub static SIGNATURES: &[FunctionAbi] = &[
     sig!("CGContextSetTextDrawingMode", V, P, I32),
     sig!("CGContextSetGrayFillColor", V, P, F64, F64),
     sig!("CGContextSetShouldSmoothFonts", V, P, BOOL),
+    sig!("CGDisplayBitsPerPixel", U64, U32),
     sig!("CGDisplayCopyAllDisplayModes", P, U32, P),
     sig!("CGDisplayCopyDisplayMode", P, U32),
     // Seven floats and a flag, and the `boolean_t` at the end is the argument

@@ -1,5 +1,5 @@
 use std::{
-    ffi::{CStr, c_char, c_int},
+    ffi::{CStr, c_char, c_int, c_void},
     mem::MaybeUninit,
 };
 
@@ -99,6 +99,124 @@ const _: () = {
     assert!(std::mem::offset_of!(Stat, size) == 96);
     assert!(std::mem::offset_of!(Stat, blksize) == 112);
 };
+
+/// x86-64 Darwin's `struct stat` without `_DARWIN_FEATURE_64_BIT_INODE`: what
+/// the unsuffixed `stat`, `lstat` and `fstat` fill there, `$INODE64` naming the
+/// [`Stat`] ones. A program built for 10.5 and earlier imports these, and its
+/// buffer is 24 bytes short of a [`Stat`] - writing one smashes its stack.
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub struct LegacyStat {
+    pub dev: i32,
+    pub ino: u32,
+    pub mode: u16,
+    pub nlink: u16,
+    pub uid: u32,
+    pub gid: u32,
+    pub rdev: i32,
+    pub atime: Timespec,
+    pub mtime: Timespec,
+    pub ctime: Timespec,
+    pub size: i64,
+    pub blocks: i64,
+    pub blksize: i32,
+    pub flags: u32,
+    pub generation: u32,
+    pub lspare: i32,
+    pub qspare: [i64; 2],
+}
+
+const _: () = {
+    assert!(size_of::<LegacyStat>() == 120);
+    assert!(std::mem::offset_of!(LegacyStat, atime) == 24);
+    assert!(std::mem::offset_of!(LegacyStat, size) == 72);
+    assert!(std::mem::offset_of!(LegacyStat, blksize) == 88);
+};
+
+impl From<&Stat> for LegacyStat {
+    fn from(stat: &Stat) -> Self {
+        LegacyStat {
+            dev: stat.dev,
+            // Truncated, as the 32-bit `ino_t` of these callers always was.
+            ino: stat.ino as u32,
+            mode: stat.mode,
+            nlink: stat.nlink,
+            uid: stat.uid,
+            gid: stat.gid,
+            rdev: stat.rdev,
+            atime: stat.atime,
+            mtime: stat.mtime,
+            ctime: stat.ctime,
+            size: stat.size,
+            blocks: stat.blocks,
+            blksize: stat.blksize,
+            flags: stat.flags,
+            generation: stat.generation,
+            lspare: stat.lspare,
+            qspare: stat.qspare,
+        }
+    }
+}
+
+/// Whether an unsuffixed `stat` family name means [`LegacyStat`]: only an
+/// x86-64 guest ever had the 32-bit-inode layout; arm64's plain names are the
+/// 64-bit one.
+pub(crate) fn unsuffixed_is_legacy() -> bool {
+    crate::sysctl::guest_arch() == crate::sysctl::GuestArch::X86_64
+}
+
+/// Fill `out` through `fill`, as [`LegacyStat`] when `legacy` and as [`Stat`]
+/// otherwise.
+///
+/// # Safety
+///
+/// `out` is null or a writable `struct stat` of that layout.
+unsafe fn unsuffixed(
+    out: *mut c_void,
+    legacy: bool,
+    fill: impl FnOnce(*mut Stat) -> c_int,
+) -> c_int {
+    if out.is_null() || !legacy {
+        return fill(out.cast());
+    }
+    let mut full = Stat::default();
+    let rc = fill(&mut full);
+    if rc == 0 {
+        // SAFETY: the caller states `out` is a writable legacy `struct stat`.
+        unsafe {
+            out.cast::<LegacyStat>()
+                .write_unaligned(LegacyStat::from(&full))
+        };
+    }
+    rc
+}
+
+/// The unsuffixed `int stat(const char *, struct stat *)`.
+///
+/// # Safety
+///
+/// As [`stat`], with `out` laid out as [`unsuffixed_is_legacy`] says.
+pub unsafe extern "C" fn stat_unsuffixed(path: *const c_char, out: *mut c_void) -> c_int {
+    unsafe { unsuffixed(out, unsuffixed_is_legacy(), |out| stat(path, out)) }
+}
+
+/// The unsuffixed `lstat`, as [`stat_unsuffixed`].
+///
+/// # Safety
+///
+/// As [`stat_unsuffixed`].
+pub unsafe extern "C" fn lstat_unsuffixed(path: *const c_char, out: *mut c_void) -> c_int {
+    unsafe { unsuffixed(out, unsuffixed_is_legacy(), |out| lstat(path, out)) }
+}
+
+/// The unsuffixed `fstat`, as [`stat_unsuffixed`].
+///
+/// # Safety
+///
+/// As [`fstat`], with `out` laid out as [`unsuffixed_is_legacy`] says.
+pub unsafe extern "C" fn fstat_unsuffixed(fd: c_int, out: *mut c_void) -> c_int {
+    unsafe { unsuffixed(out, unsuffixed_is_legacy(), |out| fstat(fd, out)) }
+}
 
 /// Convert what the host filled in.
 ///
@@ -794,7 +912,7 @@ fn say_unknown_open_flags(unknown: c_int) {
 }
 
 /// Every name this module answers, in both spellings a Mach-O may import them
-/// by - see the module note on why `$INODE64` is not the same name.
+/// by - see [`LegacyStat`] on why `$INODE64` is not the same name.
 /// Darwin's `struct statfs`, which is 2168 bytes to this host's 120.
 ///
 /// The two do not merely differ in layout, they differ in *kind*: Darwin
@@ -1003,9 +1121,12 @@ pub extern "C" fn devname(_device: i32, _mode: i32) -> *const c_char {
 
 exports::exports! {
     functions {
-        "stat" | "stat$INODE64" => stat,
-        "lstat" | "lstat$INODE64" => lstat,
-        "fstat" | "fstat$INODE64" => fstat,
+        "stat" => stat_unsuffixed,
+        "stat$INODE64" => stat,
+        "lstat" => lstat_unsuffixed,
+        "lstat$INODE64" => lstat,
+        "fstat" => fstat_unsuffixed,
+        "fstat$INODE64" => fstat,
         "fstatat" | "fstatat$INODE64" => fstatat,
         "statfs" | "statfs$INODE64" => statfs,
         "fstatfs" | "fstatfs$INODE64" => fstatfs,
@@ -1036,12 +1157,36 @@ mod tests {
     use std::ffi::CString;
     use std::os::unix::fs::PermissionsExt;
 
+    /// Except the three whose plain names are the legacy layout on x86-64.
     #[test]
     fn every_listed_name_resolves_and_a_variant_is_its_base() {
         for name in names() {
             assert!(symbol(name).is_some(), "{name}");
-            assert_eq!(symbol(name), symbol(base(name)), "{name}");
+            match base(name) {
+                "stat" | "lstat" | "fstat" => {}
+                base => assert_eq!(symbol(name), symbol(base), "{name}"),
+            }
         }
+    }
+
+    /// A legacy caller's buffer is 120 bytes, and what follows it is its own.
+    #[test]
+    fn a_legacy_stat_stays_inside_its_buffer() {
+        let at = std::env::temp_dir().join(format!("rosemary-ostat-{}", std::process::id()));
+        std::fs::write(&at, vec![0u8; 4321]).expect("a file");
+        let file = std::fs::File::open(&at).expect("open");
+        let _ = std::fs::remove_file(&at);
+        let mut buffer = [0xa5u8; 144];
+        let fd = std::os::fd::AsRawFd::as_raw_fd(&file);
+        // SAFETY: an open descriptor and a buffer larger than a `LegacyStat`.
+        let rc = unsafe { unsuffixed(buffer.as_mut_ptr().cast(), true, |out| fstat(fd, out)) };
+        assert_eq!(rc, 0);
+        assert!(
+            buffer[120..].iter().all(|b| *b == 0xa5),
+            "wrote past 120 bytes"
+        );
+        let size = i64::from_le_bytes(buffer[72..80].try_into().expect("eight bytes"));
+        assert_eq!(size, 4321);
     }
 
     /// The layout is the guest's, and the size a guest reads is the file's.

@@ -167,15 +167,24 @@ pub(crate) fn new_cell(matrix: Id) -> Id {
         // two buttons.
         unsafe {
             for (getter, setter) in [
+                // The type first: it sets the rest's defaults.
                 ("buttonType", "setButtonType:"),
+                ("highlightsBy", "setHighlightsBy:"),
+                ("showsStateBy", "setShowsStateBy:"),
+                ("imagePosition", "setImagePosition:"),
+                ("bezelStyle", "setBezelStyle:"),
                 ("title", "setTitle:"),
+                ("alternateTitle", "setAlternateTitle:"),
+                ("image", "setImage:"),
+                ("alternateImage", "setAlternateImage:"),
                 ("font", "setFont:"),
                 ("isBordered", "setBordered:"),
+                ("allowsMixedState", "setAllowsMixedState:"),
                 ("alignment", "setAlignment:"),
             ] {
                 let value = get(prototype, getter);
                 match getter {
-                    "isBordered" => {
+                    "isBordered" | "allowsMixedState" => {
                         let f: unsafe extern "C" fn(Id, Sel, u8) =
                             std::mem::transmute(objc::msg::entry());
                         f(button, objc::sel::get(setter), value as u8);
@@ -811,9 +820,10 @@ unsafe extern "C" fn prototype(receiver: Id, _sel: Sel) -> Id {
     }
 }
 
-/// `-setPrototype:`: a cell this crate made stands for its button. A cell
-/// with no button - one a program allocated itself - names nothing new cells
-/// could be copied from, and leaves the prototype as it was.
+/// `-setPrototype:`: a cell stands for its button, which a cell a program
+/// allocated itself was given when it was initialized. A cell with no button
+/// names nothing new cells could be copied from, and leaves the prototype as
+/// it was.
 unsafe extern "C" fn set_prototype(receiver: Id, _sel: Sel, cell: Id) {
     let button = button_of(cell);
     if button.is_null() {

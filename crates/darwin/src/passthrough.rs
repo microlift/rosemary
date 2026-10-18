@@ -110,8 +110,6 @@ pub const CLAIMED: &[&str] = &[
     "difftime",
     "mktime",
     "time",
-    "munmap",
-    "mprotect",
     "mlock",
     "munlock",
     "mincore",

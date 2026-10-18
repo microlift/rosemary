@@ -148,6 +148,7 @@ exports::exports! {
         "CGDisplayIsMain" => screen::CGDisplayIsMain,
         "CGDisplayPixelsWide" => screen::CGDisplayPixelsWide,
         "CGDisplayPixelsHigh" => screen::CGDisplayPixelsHigh,
+        "CGDisplayBitsPerPixel" => screen::CGDisplayBitsPerPixel,
         "CGDisplayMoveCursorToPoint" => screen::CGDisplayMoveCursorToPoint,
         "CGDisplayCapture" => screen::CGDisplayCapture,
         "CGCaptureAllDisplays" => screen::CGCaptureAllDisplays,

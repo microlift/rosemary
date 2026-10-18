@@ -91,6 +91,9 @@ struct BitmapContext {
     bits_per_component: usize,
     bitmap_info: u32,
     state: *mut State,
+    /// Drawing goes to the view `-drawRect:` focused rather than to `data`,
+    /// which is null: the context `-[NSGraphicsContext graphicsPort]` answers.
+    focus: bool,
 }
 
 #[repr(C)]
@@ -204,6 +207,48 @@ pub unsafe extern "C" fn CGBitmapContextCreate(
             _storage: owned,
         }));
     }
+    context as CFTypeRef
+}
+
+thread_local! {
+    /// The focus context, and the focus it was last answered for.
+    static FOCUS_CONTEXT: std::cell::Cell<(usize, Option<(usize, usize)>)> =
+        const { std::cell::Cell::new((0, None)) };
+}
+
+/// The `CGContextRef` of the view being drawn, or null with nothing focused.
+///
+/// One per thread, its graphics state reset whenever the focus changes, since
+/// AppKit hands each `-drawRect:` a fresh state. Its user space is the view's
+/// own, in points, so drawing lands where the same rectangle would through
+/// `NSImage`.
+pub(crate) fn focus_context() -> CFTypeRef {
+    let Some(device) = crate::backing::focused_device() else {
+        return std::ptr::null();
+    };
+    let focus = Some((device.key, device.depth));
+    let (mut context, last) = FOCUS_CONTEXT.with(|cell| cell.get());
+    if context == 0 {
+        let class = objc::class::lookup(c"__CGContext").expect("installed during bootstrap");
+        // SAFETY: `BitmapContext` is the registered class layout; the object
+        // lives for the thread, so it is never released.
+        let fresh = unsafe { corefoundation::base::allocate::<BitmapContext>(class) };
+        unsafe {
+            (*fresh).focus = true;
+            (*fresh).state = Box::into_raw(Box::new(State {
+                current: GState::default(),
+                saved: Vec::new(),
+                _storage: None,
+            }));
+        }
+        context = fresh as usize;
+    } else if last != focus {
+        // SAFETY: the context made above, whose state is never freed.
+        let state = unsafe { &mut *(*(context as *mut BitmapContext)).state };
+        state.current = GState::default();
+        state.saved.clear();
+    }
+    FOCUS_CONTEXT.with(|cell| cell.set((context, focus)));
     context as CFTypeRef
 }
 
@@ -406,6 +451,31 @@ pub unsafe extern "C" fn CGContextDrawImage(context: CFTypeRef, rect: NSRect, im
     }
     // SAFETY: every context is created with a state.
     let state = unsafe { (*ctx.state).current };
+    if ctx.focus {
+        let [left, bottom, right, top] = device_bounds(state.ctm, rect);
+        const SOURCE_OVER: usize = 2;
+        crate::backing::draw_image(
+            &source,
+            source_width,
+            source_height,
+            NSSize {
+                width: source_width as f64,
+                height: source_height as f64,
+            },
+            NSRect {
+                origin: NSPoint { x: left, y: bottom },
+                size: NSSize {
+                    width: right - left,
+                    height: top - bottom,
+                },
+            },
+            NSRect::default(),
+            SOURCE_OVER,
+            state.alpha,
+            false,
+        );
+        return;
+    }
     let transform = state.ctm;
     let determinant = transform.a * transform.d - transform.b * transform.c;
     if determinant == 0.0 {
