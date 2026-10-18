@@ -234,16 +234,75 @@ fn swapping() -> bool {
 }
 
 fn swap_ctrl_cmd(sdl_modifiers: u16) -> u16 {
+    let ctrl = sdl_modifiers & (keymod::LCTRL | keymod::RCTRL);
+    if in_edit_chord() {
+        return (sdl_modifiers & !ctrl) | (ctrl << 4);
+    }
     if !swapping() {
         return sdl_modifiers;
     }
-    let ctrl = sdl_modifiers & (keymod::LCTRL | keymod::RCTRL);
     let gui = sdl_modifiers & (keymod::LGUI | keymod::RGUI);
     (sdl_modifiers & !(ctrl | gui)) | (ctrl << 4) | (gui >> 4)
 }
 
+/// `ROSEMARY_CONTROL_EDIT_KEYS=1`: Control with A, C, V, X, Y or Z acts as
+/// Command, and Control stays Control everywhere else.
+///
+/// The narrow form of `ROSEMARY_SWAP_CTRL_CMD`, for a program that edits text
+/// with Command and also reads Control as a key of its own - a game that
+/// crouches on it, say. On a desktop that keeps Super's letter chords for
+/// itself, Command-V is otherwise unreachable.
+pub const CONTROL_EDIT_KEYS_ENV: &str = "ROSEMARY_CONTROL_EDIT_KEYS";
+
+fn control_edit_keys() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os(CONTROL_EDIT_KEYS_ENV).is_some_and(|v| v != "0"))
+}
+
+/// The letters whose Command chords are editing: select all, copy, paste, cut,
+/// redo and undo.
+const EDIT_KEYS: [u32; 6] = [
+    scancode::A,
+    scancode::C,
+    scancode::V,
+    scancode::X,
+    scancode::Y,
+    scancode::Z,
+];
+
+/// Whether Control is being reported as Command, from the editing key that
+/// started it until Control is let go. Held across the whole chord rather than
+/// the one key, so that Control-A then Control-C is one selection and copy and
+/// not two Command presses with a Control press between them.
+static EDIT_CHORD: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+fn in_edit_chord() -> bool {
+    EDIT_CHORD.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Whether this key press starts an editing chord: an editing letter with
+/// Control and no other modifier but Shift, outside a chord already running.
+pub fn starts_edit_chord(scancode: u32, sdl_modifiers: u16, down: bool) -> bool {
+    control_edit_keys()
+        && !swapping()
+        && down
+        && !in_edit_chord()
+        && EDIT_KEYS.contains(&scancode)
+        && sdl_modifiers & keymod::CTRL != 0
+        && sdl_modifiers & (keymod::ALT | keymod::GUI) == 0
+}
+
+/// Whether this key release ends the editing chord: Control let go.
+pub fn ends_edit_chord(scancode: u32, down: bool) -> bool {
+    in_edit_chord() && !down && matches!(scancode, scancode::LCTRL | scancode::RCTRL)
+}
+
+pub fn set_edit_chord(on: bool) {
+    EDIT_CHORD.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
 pub fn virtual_key(scancode: u32) -> u16 {
-    let scancode = match (swapping(), scancode) {
+    let scancode = match (swapping() || in_edit_chord(), scancode) {
         (true, scancode::LCTRL) => scancode::LGUI,
         (true, scancode::RCTRL) => scancode::RGUI,
         (true, scancode::LGUI) => scancode::LCTRL,

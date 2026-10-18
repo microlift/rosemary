@@ -381,6 +381,10 @@ pub(crate) fn deliver_past_modal(event: sdl3::video::Event) {
                 return;
             }
             let modifier = crate::keymap::is_modifier(scancode);
+            if crate::keymap::starts_edit_chord(scancode, modifiers, down) {
+                begin_edit_chord(window, modifiers);
+            }
+            let ends_chord = crate::keymap::ends_edit_chord(scancode, down);
             let event = nsevent::make(Fields {
                 // A modifier is `-flagsChanged:`, not a key down: AppKit has no
                 // key-up for one, and a guest that treated it as a key would
@@ -410,6 +414,11 @@ pub(crate) fn deliver_past_modal(event: sdl3::video::Event) {
                 }
             }
             queue_key(window, event);
+            // The release of Control went out above as the release of
+            // Command, which is what the guest saw pressed.
+            if ends_chord {
+                crate::keymap::set_edit_chord(false);
+            }
         }
         // A key event describes a physical key. Text input is the separate,
         // layout- and IME-resolved commit, and must go to the focused
@@ -620,6 +629,44 @@ pub fn window_geometry_changed(object: Id) {
         });
     }
     post(id, window::DID_MOVE);
+}
+
+/// Turn the held Control into Command before an editing key, as the guest
+/// would see a Mac user let go of one and press the other: `-flagsChanged:`
+/// for each, so a program that tracks its modifier keys from those events,
+/// rather than reading the key's own flags, agrees about which is down.
+fn begin_edit_chord(window: Id, sdl_modifiers: u16) {
+    use sdl3::keycodes::keymod;
+    let right = sdl_modifiers & keymod::RCTRL != 0 && sdl_modifiers & keymod::LCTRL == 0;
+    let (control, command) = match right {
+        true => (
+            crate::keymap::vk::RIGHT_CONTROL,
+            crate::keymap::vk::RIGHT_COMMAND,
+        ),
+        false => (crate::keymap::vk::CONTROL, crate::keymap::vk::COMMAND),
+    };
+    let released = crate::keymap::modifiers(sdl_modifiers & !keymod::CTRL);
+    queue_key(
+        window,
+        nsevent::make(Fields {
+            kind: kind::FLAGS_CHANGED,
+            modifiers: released,
+            key_code: control,
+            window,
+            ..Fields::default()
+        }),
+    );
+    crate::keymap::set_edit_chord(true);
+    queue_key(
+        window,
+        nsevent::make(Fields {
+            kind: kind::FLAGS_CHANGED,
+            modifiers: crate::keymap::modifiers(sdl_modifiers),
+            key_code: command,
+            window,
+            ..Fields::default()
+        }),
+    );
 }
 
 fn current_modifiers() -> u64 {
