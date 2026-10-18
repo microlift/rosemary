@@ -614,6 +614,9 @@ fn modal_loop(dialog: &mut Dialog) -> (usize, bool) {
         let Some(event) = scripted.or_else(|| sdl3::video::wait(50)) else {
             continue;
         };
+        // No key reaches the program while the dialog is up, so a Control
+        // let go meanwhile must end an editing chord here.
+        crate::event::key_withheld(&event);
         match dialog.handle(&event) {
             Outcome::Answered(answer) => return (answer, false),
             Outcome::Handled => continue,

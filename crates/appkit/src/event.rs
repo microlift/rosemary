@@ -1,5 +1,6 @@
 use foundation::geometry::NSPoint;
 use objc::object::Id;
+use sdl3::keycodes::{keymod, scancode};
 
 use crate::nsevent::{self, Fields, kind};
 use crate::window;
@@ -228,6 +229,7 @@ pub(crate) fn deliver(event: sdl3::video::Event) {
 pub(crate) fn deliver_past_modal(event: sdl3::video::Event) {
     use sdl3::video::Event;
     if crate::dialog::deliver(&event) {
+        key_withheld(&event);
         return;
     }
     match event {
@@ -342,6 +344,10 @@ pub(crate) fn deliver_past_modal(event: sdl3::video::Event) {
         }
         Event::WindowFocus { window, gained } => {
             crate::decor::focus_changed(window, gained);
+            // Control may be let go where this pump never hears of it.
+            if !gained {
+                leave_edit_chord(0);
+            }
             let object = object_for(window);
             if !gained {
                 crate::screen::forget_recentring();
@@ -369,7 +375,13 @@ pub(crate) fn deliver_past_modal(event: sdl3::video::Event) {
             down,
             repeat,
         } => {
+            use crate::keymap::ChordStep;
+            let step = crate::keymap::edit_chord_step(scancode, modifiers, down);
+            if step == ChordStep::Leave {
+                leave_edit_chord(modifiers);
+            }
             if crate::decor::key(scancode, down) {
+                key_withheld(&event);
                 return;
             }
             let text = crate::keymap::characters(
@@ -378,13 +390,13 @@ pub(crate) fn deliver_past_modal(event: sdl3::video::Event) {
             );
             let window = object_for(id);
             if window.is_null() {
+                key_withheld(&event);
                 return;
             }
             let modifier = crate::keymap::is_modifier(scancode);
-            if crate::keymap::starts_edit_chord(scancode, modifiers, down) {
-                begin_edit_chord(window, modifiers);
+            if step == ChordStep::Begin {
+                begin_edit_chord(id, window, modifiers);
             }
-            let ends_chord = crate::keymap::ends_edit_chord(scancode, down);
             let event = nsevent::make(Fields {
                 // A modifier is `-flagsChanged:`, not a key down: AppKit has no
                 // key-up for one, and a guest that treated it as a key would
@@ -414,10 +426,13 @@ pub(crate) fn deliver_past_modal(event: sdl3::video::Event) {
                 }
             }
             queue_input(window, event);
-            // The release of Control went out above as the release of
-            // Command, which is what the guest saw pressed.
-            if ends_chord {
-                crate::keymap::set_edit_chord(false);
+            // A Control pressed or let go during the chord went out above as
+            // Command, and the chord now covers the sides still held; the last
+            // one let go ends it.
+            if crate::keymap::edit_chord() != 0
+                && matches!(scancode, scancode::LCTRL | scancode::RCTRL)
+            {
+                crate::keymap::set_edit_chord(modifiers & keymod::CTRL);
             }
         }
         // A key event describes a physical key. Text input is the separate,
@@ -563,6 +578,10 @@ pub(crate) fn deliver_past_modal(event: sdl3::video::Event) {
                 crate::window::end_drag();
             }
             let (x, y) = track_pointer(id, x, y);
+            // A Control-click during an editing chord is a Control-click.
+            if down {
+                leave_edit_chord(sdl3::video::keyboard_modifiers());
+            }
             let modifiers = match button == sdl3::mouse::LEFT && plain_control_click() {
                 true => without_control(current_modifiers()),
                 false => current_modifiers(),
@@ -631,38 +650,104 @@ pub fn window_geometry_changed(object: Id) {
     post(id, window::DID_MOVE);
 }
 
+/// The SDL window an editing chord's Command went to, which is told when the
+/// chord ends however the release of Control was lost.
+static CHORD_WINDOW: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
 /// Turn the held Control into Command before an editing key, as the guest
 /// would see a Mac user let go of one and press the other: `-flagsChanged:`
 /// for each, so a program that tracks its modifier keys from those events,
 /// rather than reading the key's own flags, agrees about which is down.
-fn begin_edit_chord(window: Id, sdl_modifiers: u16) {
-    use sdl3::keycodes::keymod;
-    let right = sdl_modifiers & keymod::RCTRL != 0 && sdl_modifiers & keymod::LCTRL == 0;
-    let (control, command) = match right {
-        true => (
-            crate::keymap::vk::RIGHT_CONTROL,
-            crate::keymap::vk::RIGHT_COMMAND,
-        ),
-        false => (crate::keymap::vk::CONTROL, crate::keymap::vk::COMMAND),
+fn begin_edit_chord(id: u32, window: Id, sdl_modifiers: u16) {
+    let sides = sdl_modifiers & keymod::CTRL;
+    let rest = sdl_modifiers & !keymod::CTRL;
+    let mut control = sides;
+    for side in [keymod::LCTRL, keymod::RCTRL]
+        .into_iter()
+        .filter(|s| sides & s != 0)
+    {
+        control &= !side;
+        let flags = crate::keymap::modifiers(rest | control);
+        flags_changed(window, crate::keymap::chord_control(side), flags);
+    }
+    let mut command = 0;
+    for side in [keymod::LCTRL, keymod::RCTRL]
+        .into_iter()
+        .filter(|s| sides & s != 0)
+    {
+        command |= side;
+        let flags = crate::keymap::modifiers(rest | (command << 4));
+        flags_changed(window, crate::keymap::chord_command(side), flags);
+    }
+    CHORD_WINDOW.store(id, std::sync::atomic::Ordering::Relaxed);
+    crate::keymap::set_edit_chord(sides);
+}
+
+/// End an editing chord before an event it must not touch: the guest sees
+/// Command let go, then Control pressed again for each side `sdl_modifiers`
+/// still holds. Nothing when no chord is running.
+pub(crate) fn leave_edit_chord(sdl_modifiers: u16) {
+    let sides = crate::keymap::edit_chord();
+    if sides == 0 {
+        return;
+    }
+    crate::keymap::set_edit_chord(0);
+    let window = object_for(CHORD_WINDOW.load(std::sync::atomic::Ordering::Relaxed));
+    if window.is_null() {
+        return;
+    }
+    let rest = sdl_modifiers & !keymod::CTRL;
+    let mut command = sides;
+    for side in [keymod::LCTRL, keymod::RCTRL]
+        .into_iter()
+        .filter(|s| sides & s != 0)
+    {
+        command &= !side;
+        let flags = crate::keymap::modifiers(rest | (command << 4));
+        flags_changed(window, crate::keymap::chord_command(side), flags);
+    }
+    let held = sdl_modifiers & keymod::CTRL;
+    let mut control = 0;
+    for side in [keymod::LCTRL, keymod::RCTRL]
+        .into_iter()
+        .filter(|s| held & s != 0)
+    {
+        control |= side;
+        let flags = crate::keymap::modifiers(rest | control);
+        flags_changed(window, crate::keymap::chord_control(side), flags);
+    }
+}
+
+/// A key event the guest will not see, because a dialog, a menu or a missing
+/// window took it: if it was the release that ends the editing chord, or shows
+/// the chord is stale, end the chord anyway rather than leave Control reported
+/// as Command.
+pub(crate) fn key_withheld(event: &sdl3::video::Event) {
+    use crate::keymap::ChordStep;
+    let sdl3::video::Event::Key {
+        scancode,
+        modifiers,
+        down,
+        ..
+    } = *event
+    else {
+        return;
     };
-    let released = crate::keymap::modifiers(sdl_modifiers & !keymod::CTRL);
+    if matches!(
+        crate::keymap::edit_chord_step(scancode, modifiers, down),
+        ChordStep::Leave | ChordStep::EndAfter
+    ) {
+        leave_edit_chord(modifiers);
+    }
+}
+
+fn flags_changed(window: Id, key_code: u16, modifiers: u64) {
     queue_input(
         window,
         nsevent::make(Fields {
             kind: kind::FLAGS_CHANGED,
-            modifiers: released,
-            key_code: control,
-            window,
-            ..Fields::default()
-        }),
-    );
-    crate::keymap::set_edit_chord(true);
-    queue_input(
-        window,
-        nsevent::make(Fields {
-            kind: kind::FLAGS_CHANGED,
-            modifiers: crate::keymap::modifiers(sdl_modifiers),
-            key_code: command,
+            modifiers,
+            key_code,
             window,
             ..Fields::default()
         }),

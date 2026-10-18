@@ -410,6 +410,36 @@ fn key(window: u32, scancode: u32, character: u32, modifiers: u16) {
         down,
         repeat: false,
     };
+    // A real Control chord has Control's own press and release around it,
+    // and the guest (and an editing chord) follow Control from those.
+    let control = |down: bool| {
+        use sdl3::keycodes::{keymod, scancode};
+        let mut held = match down {
+            true => modifiers & !keymod::CTRL,
+            false => modifiers,
+        };
+        for (side, code) in [
+            (keymod::LCTRL, scancode::LCTRL),
+            (keymod::RCTRL, scancode::RCTRL),
+        ] {
+            if modifiers & side == 0 {
+                continue;
+            }
+            held = match down {
+                true => held | side,
+                false => held & !side,
+            };
+            crate::event::deliver(Event::Key {
+                window,
+                scancode: code,
+                // `SDLK_SCANCODE_MASK | scancode`, SDL's keycode for it.
+                key: 0x4000_0000 | code,
+                modifiers: held,
+                down,
+                repeat: false,
+            });
+        }
+    };
     // SDL places a committed text event between the physical press and
     // release, and the pump carries it on the key down. Keep scripted typing
     // on the same path as a real keyboard, which commits no text for a
@@ -418,12 +448,14 @@ fn key(window: u32, scancode: u32, character: u32, modifiers: u16) {
     let text = char::from_u32(character)
         .filter(|c| !c.is_control() && !chord)
         .map(String::from);
+    control(true);
     // A key a dialog took never became an event, and the dialog reads text
     // from its own events.
     if let Some(text) = crate::event::deliver_typed_key(event(true), text) {
         crate::event::deliver(Event::Text { window, text });
     }
     crate::event::deliver(event(false));
+    control(false);
 }
 
 /// The US-layout key that types a character, and whether it needs shift.
