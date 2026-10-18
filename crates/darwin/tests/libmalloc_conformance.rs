@@ -1,17 +1,16 @@
-//! libmalloc conformance: the assertions of Apple's own libmalloc test suite
-//! (apple-oss-distributions/libmalloc at libmalloc-812.100.31, `tests/*.c`),
-//! and behaviour its sources define that no test there pins down, run against
-//! this crate's zones through the entry points a guest calls.
+//! libmalloc conformance: the assertions of Apple's libmalloc test suite
+//! (`tests/*.c` at libmalloc-812.100.31), plus behaviour its sources define
+//! that no test pins down, run against this crate's zones through the entry
+//! points a guest calls.
 //!
-//! Every check runs alone in a child process. Some exercise what libmalloc
-//! aborts on - a double free, an interior free - and a heap that does not
-//! abort may be left corrupt by them; others change which zone is the default.
-//! The parent prints one line per check and a score per category.
+//! Every check runs alone in a child process: some exercise what libmalloc
+//! aborts on (double free, interior free) and may corrupt the heap, others
+//! change the default zone.
 //!
-//! A check failing that is not in [`KNOWN_DEVIATIONS`] fails the test. Set
-//! `LIBMALLOC_STRICT=1` to fail it on those too, `LIBMALLOC_ONLY=a,b` to run some checks, `LIBMALLOC_JOBS=n`
-//! for how many run at once, and `LIBMALLOC_REPORT=path` for a JSON-lines
-//! copy of the results.
+//! A failure not in [`KNOWN_DEVIATIONS`] fails the test. Environment:
+//! `LIBMALLOC_STRICT=1` fails on those too, `LIBMALLOC_ONLY=a,b` selects checks,
+//! `LIBMALLOC_JOBS=n` sets parallelism, `LIBMALLOC_REPORT=path` writes
+//! JSON-lines results.
 //!
 //! ```text
 //! cargo test -p darwin --test libmalloc_conformance -- --nocapture
@@ -53,9 +52,7 @@ const KIB: usize = 1024;
 const MIB: usize = 1024 * KIB;
 const GIB: usize = 1024 * MIB;
 
-// ---------------------------------------------------------------------------
 // The harness.
-// ---------------------------------------------------------------------------
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Kind {
@@ -422,9 +419,7 @@ fn child(name: &str) -> ! {
     unsafe { libc::_exit(0) }
 }
 
-// ---------------------------------------------------------------------------
 // Helpers.
-// ---------------------------------------------------------------------------
 
 /// xorshift64*, seeded per check so that a failure reproduces.
 struct Rng(u64);
@@ -511,9 +506,7 @@ unsafe fn mmap_anonymous(len: usize) -> *mut c_void {
     p
 }
 
-// ---------------------------------------------------------------------------
 // tests/malloc_free_test.c
-// ---------------------------------------------------------------------------
 
 unsafe fn t_malloc(t: &mut T, s: usize) -> *mut c_void {
     let p = m::malloc(s);
@@ -597,9 +590,7 @@ fn malloc_free_null(_: &mut T) {
     }
 }
 
-// ---------------------------------------------------------------------------
 // tests/malloc_empty.c
-// ---------------------------------------------------------------------------
 
 fn empty_malloc_valid(t: &mut T) {
     unsafe {
@@ -628,9 +619,7 @@ fn empty_malloc_valid(t: &mut T) {
     }
 }
 
-// ---------------------------------------------------------------------------
 // tests/malloc_size_test.c
-// ---------------------------------------------------------------------------
 
 fn malloc_size_valid(t: &mut T) {
     unsafe {
@@ -742,9 +731,7 @@ fn malloc_size_max_good_size(t: &mut T) {
     );
 }
 
-// ---------------------------------------------------------------------------
 // tests/calloc_test.c
-// ---------------------------------------------------------------------------
 
 fn calloc_overflow(t: &mut T) {
     let long_max = i64::MAX as usize;
@@ -841,9 +828,7 @@ fn calloc_sizes(t: &mut T) {
     }
 }
 
-// ---------------------------------------------------------------------------
 // tests/aligned_alloc_test.c and tests/posix_memalign_test.c
-// ---------------------------------------------------------------------------
 
 unsafe fn t_aligned_alloc(t: &mut T, alignment: usize, size: usize) -> *mut c_void {
     let p = m::aligned_alloc(alignment, size);
@@ -1060,9 +1045,7 @@ fn posix_memalign_enumerated(t: &mut T) {
     }
 }
 
-// ---------------------------------------------------------------------------
 // tests/realloc.c, tests/reallocarray.c, tests/malloc_realloc_large.c
-// ---------------------------------------------------------------------------
 
 fn realloc_failure(t: &mut T) {
     unsafe {
@@ -1190,9 +1173,7 @@ fn realloc_large_huge(t: &mut T) {
     }
 }
 
-// ---------------------------------------------------------------------------
 // tests/zone_names.c
-// ---------------------------------------------------------------------------
 
 fn zone_names_default(t: &mut T) {
     unsafe {
@@ -1309,9 +1290,7 @@ fn set_zone_name_heap(t: &mut T) {
     }
 }
 
-// ---------------------------------------------------------------------------
 // tests/introspect_tests.c
-// ---------------------------------------------------------------------------
 
 fn szone_statistics(t: &mut T) {
     unsafe {
@@ -1423,9 +1402,7 @@ fn get_all_zones(t: &mut T) {
     }
 }
 
-// ---------------------------------------------------------------------------
 // tests/malloc_create_zone_tests.c
-// ---------------------------------------------------------------------------
 
 fn create_many_zones(t: &mut T) {
     unsafe {
@@ -1693,9 +1670,7 @@ unsafe fn wait_with_timeout_then(
     }
 }
 
-// ---------------------------------------------------------------------------
 // tests/malloc_zone_unregister_test.c
-// ---------------------------------------------------------------------------
 
 fn custom_default_zone(t: &mut T) {
     unsafe {
@@ -1770,9 +1745,7 @@ fn custom_default_zone(t: &mut T) {
     }
 }
 
-// ---------------------------------------------------------------------------
 // tests/malloc_claimed_address_tests.c
-// ---------------------------------------------------------------------------
 
 const CLAIM_CASES: [(&str, usize, usize); 3] = [
     ("tiny", 16, 8),
@@ -1877,9 +1850,7 @@ fn claimed_address_other_zone(t: &mut T) {
     }
 }
 
-// ---------------------------------------------------------------------------
 // tests/malloc_with_options_test.c
-// ---------------------------------------------------------------------------
 
 fn malloc_options_random(t: &mut T) {
     unsafe {
@@ -1965,9 +1936,7 @@ fn malloc_options_alignment(t: &mut T) {
     }
 }
 
-// ---------------------------------------------------------------------------
 // tests/malloc_create_purgeable_zone.c
-// ---------------------------------------------------------------------------
 
 fn purgeable_aligned_alloc(t: &mut T) {
     unsafe {
@@ -2020,9 +1989,7 @@ fn purgeable_realloc(t: &mut T) {
     }
 }
 
-// ---------------------------------------------------------------------------
 // tests/memory_pressure.c
-// ---------------------------------------------------------------------------
 
 /// `tiny_mem_pressure`: pressure relief on another thread while blocks come
 /// and go.
@@ -2054,9 +2021,7 @@ fn pressure_relief_concurrent(_: &mut T) {
     }
 }
 
-// ---------------------------------------------------------------------------
 // Behaviour of upstream's sources that no test there asserts.
-// ---------------------------------------------------------------------------
 
 /// `TINY_QUANTUM`: tiny, nano and xzone blocks are all sized and aligned in
 /// sixteens, and `szone_good_size` rounds the same way.
@@ -2433,11 +2398,9 @@ fn typed_entry_points(t: &mut T) {
     }
 }
 
-/// libmalloc's zones are safe to use from any thread, and a block may be
-/// freed on another thread than the one that made it. Every block is filled
-/// with a tag of its own and checked before it goes, so that two live blocks
-/// that overlap, or a block changed under its owner, show up; the default
-/// zone's figures come back to where they began.
+/// Blocks are freed on other threads than the ones that made them. Each is
+/// tagged and checked before it goes, so overlapping or clobbered blocks show
+/// up, and the default zone's figures must return to where they began.
 fn threaded_stress(t: &mut T) {
     unsafe {
         let default = zones()[0];
@@ -2542,13 +2505,10 @@ fn threaded_stress(t: &mut T) {
     }
 }
 
-/// `_malloc_fork_prepare` takes the registry lock and every zone's lock
-/// before `fork`, so that a child can always allocate, create a zone or start
-/// a thread, whatever the parent's other threads were doing. Four threads
-/// create and destroy zones and two start threads that touch the default
-/// zone while the main thread forks; each child does the same once, and
-/// leaves a mark in shared memory before each step, so that a child that
-/// hangs says where.
+/// The prepare handler holds every lock across `fork`, so a child can always
+/// allocate, create a zone or start a thread. Other threads churn zones while
+/// the main thread forks; each child marks shared memory before each step so
+/// a hang says where.
 fn fork_while_allocating(t: &mut T) {
     const STEPS: [&str; 5] = [
         "malloc_create_zone",
@@ -2672,11 +2632,9 @@ fn fork_while_allocating(t: &mut T) {
     }
 }
 
-// ---------------------------------------------------------------------------
 // What upstream does with a program's memory errors. On LP64 libmalloc always
 // sets MALLOC_ABORT_ON_CORRUPTION (`set_flags_from_environment`), so each of
 // these reports the error and aborts.
-// ---------------------------------------------------------------------------
 
 /// `find_zone_and_free` with no owner: MALLOC_REPORT_CRASH.
 fn bad_free_aborts(_: &mut T) {
@@ -2791,9 +2749,7 @@ fn unknown_options_trap(t: &mut T) {
     t.note(format!("returned {p:p}"));
 }
 
-// ---------------------------------------------------------------------------
 // The checks.
-// ---------------------------------------------------------------------------
 
 macro_rules! check {
     ($kind:ident, $source:expr, $name:ident) => {

@@ -1,75 +1,63 @@
-//! libsystem_malloc's zones: the `malloc_zone_t` interface, the registry of
-//! zones, and the C allocation entry points that dispatch through it.
+//! libsystem_malloc's zones: the `malloc_zone_t` interface, the zone registry,
+//! and the C allocation entry points that dispatch through it.
 //!
-//! On Darwin every block belongs to a zone, and `malloc` is not an allocator so
-//! much as a call through the first zone in `malloc_zones`. `free` asks each
-//! registered zone in turn whether it owns the pointer (`zone->size`) and hands
-//! it to the one that says yes. Programs depend on that structure, not just on
-//! `malloc` working: Chromium's PartitionAlloc registers a zone of its own and
-//! shuffles the zone array until it is first, relying on
-//! `malloc_zone_unregister` moving the *last* zone into the hole it leaves. So
-//! the registry here follows libmalloc's `malloc.c` closely, down to that
-//! detail, and the zones it starts with are this host's allocator dressed as
-//! Darwin zones.
+//! Darwin's `malloc` calls the first registered zone, and `free` asks each zone
+//! in turn which one owns the pointer. Programs depend on that: Chromium's
+//! PartitionAlloc registers its own zone and reorders the array until it is
+//! first, relying on `malloc_zone_unregister` moving the *last* zone into the
+//! hole. The registry therefore follows libmalloc's `malloc.c` closely.
 //!
-//! ## Where the memory comes from
+//! ## Backing memory
 //!
-//! This process's `malloc` is mimalloc (the runtime links it with `override`),
-//! and the zones this module creates are mimalloc heaps:
+//! The runtime links mimalloc with `override`, and every zone here is a
+//! mimalloc heap:
 //!
-//! * the default zone, `DefaultMallocZone`, allocates from a heap of its own,
-//!   and also answers for mimalloc's main heap - the one the host's own `malloc`
-//!   allocates from. A block this runtime's frameworks allocate with the host's
-//!   `malloc` and hand to the guest is therefore one the default zone owns, and
-//!   the guest's `free` finds it. Its own heap is what lets its statistics count
-//!   the guest's blocks and not the host's.
-//! * `malloc_default_purgeable_zone` and every `malloc_create_zone` get a heap of
-//!   their own, so that `malloc_zone_from_ptr` can tell their blocks apart and
-//!   `malloc_destroy_zone` can release everything a zone holds at once.
+//! * The default zone has a heap of its own and also claims mimalloc's main
+//!   heap, so blocks the host's frameworks `malloc` and hand to the guest are
+//!   still found by the guest's `free`. The separate heap keeps its statistics
+//!   from counting the host's blocks.
+//! * The purgeable zone and every `malloc_create_zone` zone get a heap each, so
+//!   `malloc_zone_from_ptr` can tell them apart and `malloc_destroy_zone` can
+//!   release a zone at once.
 //!
 //! Ownership is `mi_heap_of(p)`, a page-map lookup that is defined for any
-//! address. That is what makes `zone->size` safe to call on a pointer from
-//! another allocator, which `free` does to every zone before the right one.
-//! Whether `p` is where a block starts, and not one its page shows is free, is
-//! `mi_rosemary_block_state`, which the workspace's copy of mimalloc adds
-//! (`third_party/libmimalloc-sys`), along with the fork handling that keeps a
-//! threaded program's child able to allocate, as libmalloc's does.
+//! address, which is what makes `zone->size` safe on another allocator's
+//! pointers. `mi_rosemary_block_state` (added by `third_party/libmimalloc-sys`)
+//! says whether `p` starts a live block. That crate also carries the fork
+//! handling that keeps a threaded program's child able to allocate.
 //!
-//! A pointer no zone owns, an address inside a block, and a block freed twice
-//! are reported and abort the process, as libmalloc does on 64-bit Darwin.
+//! A pointer no zone owns, an interior pointer and a double free are reported
+//! and abort the process, as on 64-bit Darwin.
 //!
 //! ## Differences from libmalloc
 //!
-//! * A freed block is told from a live one only when mimalloc's page shows it
-//!   cheaply: it is the block freed last on its page, or its page has none in
-//!   use. Any other freed block still answers its size, and a second `free` of
-//!   one reaches mimalloc. In a page that holds aligned blocks, whose aligned
-//!   addresses mimalloc does not keep, any address inside one is taken for it.
+//! * A freed block is recognised only when mimalloc's page shows it cheaply:
+//!   it was the last block freed on its page, or the page has none in use.
+//!   Other freed blocks still report a size, and freeing one again reaches
+//!   mimalloc. In a page of aligned blocks, any address inside a block counts
+//!   as the block.
 //! * A block handed to a zone that did not make it is freed, or moved into the
 //!   zone asked to resize it, where libmalloc's scalable zone aborts.
-//! * `malloc_set_zone_name` always copies the name. libmalloc keeps one that is
-//!   in an image's read-only memory by reference (`_dyld_is_memory_immutable`),
-//!   which needs the loader this crate does not see.
-//! * The purgeable zone never discards memory. `malloc_make_purgeable` changes
-//!   nothing, and `malloc_make_nonpurgeable` reports the contents intact, which
-//!   is always true.
-//! * The zones report version 13 (`try_free_default`, no typed callbacks). The
-//!   typed entry points (`malloc_type_*`) ignore the type and take the untyped
-//!   path, which is what libmalloc does for a zone older than 16.
-//! * `enumerator` reports `KERN_FAILURE`: mimalloc cannot be walked from outside
-//!   while other threads allocate.
-//! * Statistics count live blocks and their usable sizes, as libmalloc's do,
-//!   but `size_allocated` repeats `size_in_use`, since mimalloc does not say how
-//!   much memory each heap holds. The default zone keeps no high-water mark, and
-//!   reports `max_size_in_use` as zero, as libmalloc's nano and xzone allocators
-//!   do.
+//! * `malloc_set_zone_name` always copies the name. libmalloc keeps names in
+//!   read-only image memory by reference, which needs dyld state this crate
+//!   does not see.
+//! * The purgeable zone never discards memory: `malloc_make_purgeable` is a
+//!   no-op and `malloc_make_nonpurgeable` reports the contents intact.
+//! * Zones report version 13 (`try_free_default`, no typed callbacks), and the
+//!   `malloc_type_*` entry points ignore the type, as libmalloc does for zones
+//!   older than 16.
+//! * `enumerator` returns `KERN_FAILURE`: mimalloc cannot be walked from
+//!   outside while other threads allocate.
+//! * `size_allocated` repeats `size_in_use`, since mimalloc does not report
+//!   per-heap footprint. The default zone has no high-water mark and reports
+//!   `max_size_in_use` as zero, like libmalloc's nano and xzone allocators.
 //!
 //! ## Guest zones
 //!
-//! A zone the guest registers is a structure of guest function pointers. In the
-//! native backend those are host-callable machine code, entered with the
-//! Darwin thread pointer (see [`crate::call_as_darwin`]). The emulated backend
-//! cannot call them, and refuses `malloc_zone_register` before it reaches here.
+//! A guest-registered zone is a table of guest function pointers. Under the
+//! native backend they are host-callable and entered with the Darwin thread
+//! pointer (see [`crate::call_as_darwin`]). The emulated backend cannot call
+//! them and refuses `malloc_zone_register` before it gets here.
 #![cfg(not(target_os = "macos"))]
 
 use core::ffi::{c_char, c_int, c_uint, c_void};
@@ -79,10 +67,6 @@ use std::sync::atomic::{
 use std::sync::{Once, OnceLock};
 
 use libmimalloc_sys as mi;
-
-// ---------------------------------------------------------------------------
-// The ABI: `malloc_zone_t`, `malloc_introspection_t` and friends.
-// ---------------------------------------------------------------------------
 
 /// `boolean_t`: a 32-bit integer on both Darwin architectures.
 pub type Boolean = c_int;
@@ -343,10 +327,6 @@ macro_rules! zone_call {
     }};
 }
 
-// ---------------------------------------------------------------------------
-// Constants.
-// ---------------------------------------------------------------------------
-
 /// `MALLOC_ZONE_MALLOC_DEFAULT_ALIGN`: `sizeof(void *)`.
 const DEFAULT_ALIGN: usize = size_of::<usize>();
 
@@ -396,10 +376,6 @@ fn set_errno_if(mzo: Mzo, error: c_int) {
         crate::errno::set(error);
     }
 }
-
-// ---------------------------------------------------------------------------
-// mimalloc heaps.
-// ---------------------------------------------------------------------------
 
 unsafe extern "C" {
     // Present in the mimalloc this links (v3) but not in `libmimalloc-sys`'s
@@ -465,10 +441,8 @@ fn main_heap() -> *mut mi::mi_heap_t {
     MAIN_HEAP.load(Ordering::Relaxed)
 }
 
-/// The default zone's heap and the purgeable zone's, once each has one: the
-/// two zones that live for the rest of the process, which any zone may be
-/// handed a block of. Kept apart from the zones' own `heap` fields, which are
-/// written once while nothing else can reach the zone and read freely after.
+/// The default and purgeable zones' heaps, published atomically because any
+/// zone may be handed their blocks; the zones' own `heap` fields are plain.
 static DEFAULT_HEAP: AtomicPtr<mi::mi_heap_t> = AtomicPtr::new(std::ptr::null_mut());
 static PURGEABLE_HEAP: AtomicPtr<mi::mi_heap_t> = AtomicPtr::new(std::ptr::null_mut());
 
@@ -495,17 +469,13 @@ fn live_block(ptr: *const c_void) -> Option<BlockInfo> {
     }
 }
 
-// ---------------------------------------------------------------------------
-// The zones this module provides.
-// ---------------------------------------------------------------------------
-
 /// A zone backed by a mimalloc heap. `zone` is first, so a `*mut MallocZone`
 /// this module handed out is a `*mut HostZone`.
 #[repr(C)]
 struct HostZone {
     zone: MallocZone,
-    /// The heap; set before the zone is reachable. mimalloc's main heap when
-    /// no heap of its own could be made, and then the zone counts nothing.
+    /// Set before the zone is reachable. The main heap if a private one could
+    /// not be made, in which case the zone counts nothing.
     heap: *mut mi::mi_heap_t,
     count: Count,
     /// The live totals, for [`Count::Shared`].
@@ -520,9 +490,8 @@ enum Count {
     /// In the zone's own atomics, with a high-water mark: a created zone, or
     /// the purgeable one.
     Shared,
-    /// In per-thread [`Tally`]s, of which there is one set: the default zone,
-    /// which every thread's `malloc` and `free` reach, and where one shared
-    /// counter would be a cache line every thread writes on every call.
+    /// In per-thread [`Tally`]s, for the default zone: one shared counter
+    /// would be a cache line every thread writes on every call.
     PerThread,
 }
 
@@ -586,11 +555,9 @@ impl HostZone {
         heap == self.heap || (std::ptr::eq(self, &raw const DEFAULT_ZONE) && heap == main_heap())
     }
 
-    /// The zone whose totals hold `block`: the one whose heap made it. A block
-    /// of the main heap is the host's and is counted nowhere. One of another
-    /// created zone, handed to the wrong zone, is looked for among the
-    /// registered zones, a walk only that mistake pays for; libmalloc's
-    /// scalable zone would not survive the call at all.
+    /// The zone whose totals hold a block of `heap`. Main-heap blocks are the
+    /// host's and counted nowhere. A created zone's block handed to the wrong
+    /// zone is found by walking the registry; only that mistake pays for it.
     fn counter_of(&self, heap: *mut mi::mi_heap_t) -> Option<&HostZone> {
         if heap.is_null() || heap == main_heap() {
             return None;
@@ -679,13 +646,11 @@ impl HostZone {
 
 /// One thread's share of the default zone's live totals.
 ///
-/// Only the thread holding a tally writes it, with a plain load and store
-/// rather than a locked add. A block freed on another thread than the one that
-/// made it comes off the freeing thread's tally, so one tally alone may be
-/// negative, and only their sum means anything. A thread that exits leaves its
-/// tally, numbers and all, to the next thread that needs one: the blocks it
-/// counted are still live. So there are only ever as many tallies as there
-/// were threads running at once.
+/// Only the owning thread writes it, with a plain load and store. A block freed
+/// on another thread comes off that thread's tally, so one tally may be
+/// negative and only the sum means anything. An exiting thread hands its tally,
+/// numbers included, to the next thread, since the blocks it counted are still
+/// live.
 #[repr(align(64))]
 struct Tally {
     blocks: AtomicIsize,
@@ -879,11 +844,10 @@ unsafe extern "C" fn host_memalign(
     host.allocated(unsafe { heap_memalign(host.heap, alignment, size) })
 }
 
-/// `free`. A block of another mimalloc heap is freed all the same, and comes
-/// off its own zone's totals, which is what a program that passes the wrong
-/// zone meant. Anything else - an address that is no mimalloc block's start,
-/// or a block already free - goes to the registry, which finds the zone that
-/// owns it or reports the error, rather than into mimalloc's free lists.
+/// A block of another mimalloc heap is freed anyway and comes off its own
+/// zone's totals. Anything else (not a block start, or already free) goes to
+/// the registry, which finds the owner or reports the error, so it never
+/// reaches mimalloc's free lists.
 unsafe extern "C" fn host_free(zone: *mut MallocZone, ptr: *mut c_void) {
     if ptr.is_null() {
         return;
@@ -902,8 +866,8 @@ unsafe extern "C" fn host_free_definite_size(zone: *mut MallocZone, ptr: *mut c_
     unsafe { host_free(zone, ptr) }
 }
 
-/// `try_free_default`: free `ptr` if it is the default zone's, and otherwise
-/// look for its owner among the rest - the promise the field makes.
+/// `try_free_default`: free `ptr` if it is the default zone's, else find its
+/// owner among the rest.
 unsafe extern "C" fn host_try_free_default(zone: *mut MallocZone, ptr: *mut c_void) {
     if ptr.is_null() {
         return;
@@ -1068,13 +1032,8 @@ unsafe extern "C" fn host_enable_discharge_checking(_zone: *mut MallocZone) -> B
     0
 }
 
-/// `statistics`: the blocks this zone's callers hold and their usable sizes,
-/// which is what libmalloc's zones count too. Blocks of the main heap that the
-/// default zone answers for are the host's, and are in no zone's figures, so
-/// the sum over every zone counts each block once.
-///
-/// `size_allocated` is the in-use figure again: mimalloc does not say how much
-/// of its memory each heap holds.
+/// Counts live blocks and their usable sizes. Main-heap blocks are in no zone's
+/// figures, so the sum over all zones counts each block once.
 unsafe extern "C" fn host_statistics(zone: *mut MallocZone, stats: *mut Statistics) {
     if stats.is_null() {
         return;
@@ -1112,13 +1071,8 @@ unsafe extern "C" fn host_task_statistics(
     unsafe { host_statistics(zone as *mut MallocZone, stats) }
 }
 
-// ---------------------------------------------------------------------------
-// The virtual default zone: what `malloc_default_zone` returns.
-// ---------------------------------------------------------------------------
-
-/// libmalloc's `virtual_default_zone`. Every call goes to whichever zone is
-/// first in the array *now*, so a program that holds the default zone keeps
-/// allocating from the default after another zone is put in front.
+/// libmalloc's `virtual_default_zone`: every call goes to whichever zone is
+/// first now, so a held default zone follows reordering.
 static mut VIRTUAL_ZONE: MallocZone = MallocZone {
     reserved1: std::ptr::null_mut(),
     reserved2: std::ptr::null_mut(),
@@ -1334,10 +1288,6 @@ unsafe extern "C" fn virtual_reinit_lock(_: *mut MallocZone) {
     unsafe { zone_reinit_lock(zone0()) }
 }
 
-// ---------------------------------------------------------------------------
-// Calls into any zone, with libmalloc's version guards.
-// ---------------------------------------------------------------------------
-
 unsafe fn zone_size(zone: *mut MallocZone, ptr: *const c_void) -> usize {
     match unsafe { (*zone).size } {
         Some(f) => unsafe { zone_call!(f, host_size, (zone, ptr)) },
@@ -1423,10 +1373,6 @@ unsafe fn zone_name_lossy(zone: *mut MallocZone) -> String {
         .into_owned()
 }
 
-// ---------------------------------------------------------------------------
-// The registry.
-// ---------------------------------------------------------------------------
-
 /// libmalloc's `MALLOC_LOCK`. A flag rather than a `Mutex` so that the fork
 /// handlers can hold it across `fork` and the child can simply clear it.
 struct RegistryLock(AtomicBool);
@@ -1470,21 +1416,19 @@ static NUM_ZONES: AtomicU32 = AtomicU32::new(0);
 static ALLOCATED: AtomicU32 = AtomicU32::new(0);
 /// `initial_num_zones`: the zones a lookup checks without the drain counters.
 static INITIAL_NUM_ZONES: AtomicU32 = AtomicU32::new(0);
-/// libmalloc's two FRZ counters and which one is live. A lookup past the
-/// initial zones counts itself in on the live one; `malloc_zone_unregister`
-/// swaps them and waits for the old one to drain, so that a zone it removed is
-/// not in use by anyone when it returns.
+/// libmalloc's two FRZ counters. Lookups past the initial zones count in on the
+/// live one; `malloc_zone_unregister` swaps and drains the old one so the
+/// removed zone is idle when it returns.
 static FRZ: [AtomicI32; 2] = [AtomicI32::new(0), AtomicI32::new(0)];
 static FRZ_LIVE: AtomicUsize = AtomicUsize::new(0);
 
 static INIT: Once = Once::new();
 
-/// Register the default zone, as libmalloc does while libSystem initialises.
+/// Register the default zone and the fork handlers.
 ///
-/// Also installs the fork handlers. libSystem's `fork` runs malloc's prepare
-/// handler after every other one and its child handler before them, so that a
-/// `pthread_atfork` handler may still allocate; registering ours ahead of the
-/// guest's gives the same order, since prepare handlers run in reverse.
+/// libSystem runs malloc's prepare handler after every other one and its child
+/// handler before them, so that `pthread_atfork` handlers can still allocate.
+/// Registering ahead of the guest's gives that order, as prepare runs in reverse.
 pub fn init() {
     INIT.call_once(|| {
         // SAFETY: mimalloc's own heap, which exists from its first use.
@@ -1525,8 +1469,8 @@ fn zones() -> (*const *mut MallocZone, u32) {
     load_zones()
 }
 
-/// The count before the array: a grown array is published before the count
-/// that needs it, so whichever array is seen holds at least `count` entries.
+/// The count is loaded first: a grown array is published before the count that
+/// needs it, so the array seen holds at least `count` entries.
 fn load_zones() -> (*const *mut MallocZone, u32) {
     let count = NUM_ZONES.load(Ordering::Acquire);
     (ZONES.load(Ordering::Acquire), count)
@@ -1630,9 +1574,8 @@ unsafe fn register_while_locked(zone: *mut MallocZone, make_default: bool) {
     protect(array, protect_size, libc::PROT_READ);
 }
 
-/// libmalloc's two-phase walk of the registry: the initial zones without the
-/// drain counters, then the rest counted in on the live one. `visit` gets each
-/// zone's index from `first` on, and the first answer it gives ends the walk.
+/// libmalloc's two-phase registry walk: initial zones without the drain
+/// counters, then the rest counted in. The first answer from `visit` ends it.
 ///
 /// # Safety
 ///
@@ -1673,8 +1616,8 @@ unsafe fn walk_registered<T>(
 
 /// `find_registered_zone`: the zone that owns `ptr`, and the size it reports.
 ///
-/// A hit on the first zone answers the virtual default zone, as libmalloc does
-/// when nothing was injected in front of it - which nothing here can do.
+/// A hit on the first zone answers the virtual default zone, as in libmalloc
+/// when nothing is injected in front of it.
 ///
 /// # Safety
 ///
@@ -1692,8 +1635,7 @@ unsafe fn find_registered_zone(
     found.unwrap_or((std::ptr::null_mut(), 0))
 }
 
-/// The registered zone of this module's whose heap is `heap`, or null: the
-/// owner of a created zone's block that another zone was handed.
+/// The registered `HostZone` whose heap is `heap`, or null.
 ///
 /// # Safety
 ///
@@ -1723,10 +1665,6 @@ unsafe fn find_zone_and_free(ptr: *mut c_void, known_non_default: bool) {
         unsafe { zone_free_definite_size(zone, ptr, size) };
     }
 }
-
-// ---------------------------------------------------------------------------
-// Reporting.
-// ---------------------------------------------------------------------------
 
 fn write_fd(fd: c_int, text: &str) {
     let mut rest = text.as_bytes();
@@ -1761,9 +1699,7 @@ pub extern "C" fn malloc_error_break() {
     std::hint::black_box(());
 }
 
-/// A memory error in the program, reported and fatal: on 64-bit Darwin
-/// libmalloc always sets `MALLOC_ABORT_ON_CORRUPTION`
-/// (`set_flags_from_environment`), so `MallocErrorAbort` changes nothing here.
+/// Report and abort: 64-bit libmalloc always sets `MALLOC_ABORT_ON_CORRUPTION`.
 fn corruption(message: &str) -> ! {
     report(&format!(
         "{message}\n*** set a breakpoint in malloc_error_break to debug\n"
@@ -1773,8 +1709,7 @@ fn corruption(message: &str) -> ! {
     unsafe { libc::abort() }
 }
 
-/// `free` of a pointer no zone owns, in the words libmalloc's allocators use
-/// for what mimalloc's page shows it to be.
+/// `free` of a pointer no zone owns, worded as libmalloc's allocators do.
 fn bad_free(ptr: *const c_void) -> ! {
     match block_state(ptr) {
         Block::Freed => corruption(&format!("Double free of object {ptr:p}")),
@@ -1786,10 +1721,6 @@ fn bad_free(ptr: *const c_void) -> ! {
         )),
     }
 }
-
-// ---------------------------------------------------------------------------
-// Allocation through a zone, with libmalloc's checks.
-// ---------------------------------------------------------------------------
 
 unsafe fn zone_malloc(zone: *mut MallocZone, size: usize, mzo: Mzo) -> *mut c_void {
     let zone = resolve(zone);
@@ -1880,10 +1811,6 @@ unsafe fn zone_memalign(
     block
 }
 
-// ---------------------------------------------------------------------------
-// The C entry points.
-// ---------------------------------------------------------------------------
-
 /// `void *malloc(size_t size)`
 pub unsafe extern "C" fn malloc(size: usize) -> *mut c_void {
     unsafe { zone_malloc(zone0(), size, Mzo::POSIX) }
@@ -1906,8 +1833,8 @@ pub unsafe extern "C" fn aligned_alloc(alignment: usize, size: usize) -> *mut c_
 
 /// `int posix_memalign(void **memptr, size_t alignment, size_t size)`
 ///
-/// The error is returned rather than put in `errno`. `EINVAL` and `ENOMEM`
-/// have the same numbers on Darwin and on every host this runs on.
+/// The error is returned, not put in `errno`. `EINVAL` and `ENOMEM` match
+/// Darwin's numbers on every host.
 pub unsafe extern "C" fn posix_memalign(
     memptr: *mut *mut c_void,
     alignment: usize,
@@ -1927,9 +1854,8 @@ pub unsafe extern "C" fn posix_memalign(
 
 /// `void free(void *ptr)`
 ///
-/// The first zone's `try_free_default` when it has one - which is how the
-/// default zone, or PartitionAlloc's in Chromium, frees its own blocks without
-/// a walk - and the walk otherwise.
+/// Uses the first zone's `try_free_default` when it has one, which spares the
+/// default zone and PartitionAlloc's a registry walk.
 pub unsafe extern "C" fn free(ptr: *mut c_void) {
     if ptr.is_null() {
         return;
@@ -1948,9 +1874,8 @@ pub unsafe extern "C" fn vfree(ptr: *mut c_void) {
 
 /// `void *realloc(void *ptr, size_t size)`
 ///
-/// libmalloc's rules: a null pointer is `malloc`; a zero size allocates a
-/// minimal block from the default zone and frees the old one only if that
-/// worked; anything else is resized by the zone that owns it.
+/// A null pointer is `malloc`; a zero size allocates a minimal block and frees
+/// the old one only if that worked; otherwise the owning zone resizes.
 pub unsafe extern "C" fn realloc(ptr: *mut c_void, size: usize) -> *mut c_void {
     if ptr.is_null() {
         return unsafe { zone_malloc(zone0(), size, Mzo::POSIX) };
@@ -1976,8 +1901,7 @@ pub unsafe extern "C" fn realloc(ptr: *mut c_void, size: usize) -> *mut c_void {
 
 /// `void *reallocf(void *ptr, size_t size)`
 ///
-/// `realloc`, but the old block is freed when it fails, so that
-/// `p = reallocf(p, n)` does not leak it. `errno` is kept across that `free`.
+/// Frees the old block on failure, preserving `errno`.
 pub unsafe extern "C" fn reallocf(ptr: *mut c_void, size: usize) -> *mut c_void {
     let resized = unsafe { realloc(ptr, size) };
     if resized.is_null() && !ptr.is_null() && size != 0 {
@@ -2022,10 +1946,6 @@ pub unsafe extern "C" fn malloc_size(ptr: *const c_void) -> usize {
 pub unsafe extern "C" fn malloc_good_size(size: usize) -> usize {
     unsafe { zone_good_size(virtual_zone(), size) }
 }
-
-// ---------------------------------------------------------------------------
-// The zone API.
-// ---------------------------------------------------------------------------
 
 /// `malloc_zone_t *malloc_default_zone(void)`: the virtual default zone.
 pub extern "C" fn malloc_default_zone() -> *mut MallocZone {
@@ -2220,8 +2140,8 @@ pub unsafe extern "C" fn malloc_zone_register(zone: *mut MallocZone) {
 
 /// `void malloc_zone_unregister(malloc_zone_t *zone)`
 ///
-/// The last zone moves into the removed one's place - which is the property
-/// programs use to choose which zone is first.
+/// The last zone moves into the removed one's slot; programs rely on that to
+/// pick the first zone.
 pub unsafe extern "C" fn malloc_zone_unregister(zone: *mut MallocZone) {
     init();
     if NUM_ZONES.load(Ordering::Acquire) == 0 {
@@ -2265,8 +2185,7 @@ pub unsafe extern "C" fn malloc_zone_unregister(zone: *mut MallocZone) {
 
 /// `void malloc_set_zone_name(malloc_zone_t *zone, const char *name)`
 ///
-/// The old name is freed if a zone owns it, and the new one is copied into the
-/// zone itself, as libmalloc does with a name that is not in an image.
+/// Frees the old name if a zone owns it and copies the new one into the zone.
 pub unsafe extern "C" fn malloc_set_zone_name(zone: *mut MallocZone, name: *const c_char) {
     if zone.is_null() {
         return;
@@ -2303,9 +2222,8 @@ pub unsafe extern "C" fn malloc_get_zone_name(zone: *mut MallocZone) -> *const c
 /// `kern_return_t malloc_get_all_zones(task_t task, memory_reader_t reader,
 /// vm_address_t **addresses, unsigned *count)`
 ///
-/// Without a reader, the zone array itself: Chromium reads the first entry to
-/// learn which zone `malloc` uses. With one, the three reads libmalloc makes,
-/// through it, of this process's own variables.
+/// Without a reader, returns the array itself (Chromium reads the first entry
+/// to learn which zone `malloc` uses). With one, makes libmalloc's three reads.
 pub unsafe extern "C" fn malloc_get_all_zones(
     task: Task,
     reader: Option<MemoryReaderFn>,
@@ -2453,9 +2371,8 @@ pub unsafe extern "C" fn malloc_zone_log(zone: *mut MallocZone, address: *mut c_
 
 /// `size_t malloc_zone_pressure_relief(malloc_zone_t *zone, size_t goal)`
 ///
-/// For null, every zone until `goal` is met (zero is greedy). The zones are
-/// called outside the registry lock, which libmalloc holds: a zone that
-/// registers another while relieving pressure would otherwise deadlock.
+/// For null, every zone until `goal` is met (zero is greedy). Unlike libmalloc
+/// this runs outside the registry lock, so a zone may register another.
 pub unsafe extern "C" fn malloc_zone_pressure_relief(zone: *mut MallocZone, goal: usize) -> usize {
     let relieve = |zone: *mut MallocZone, goal: usize| match unsafe {
         MallocZone::pressure_relief_fn(zone)
@@ -2481,8 +2398,8 @@ pub unsafe extern "C" fn malloc_zone_pressure_relief(zone: *mut MallocZone, goal
 
 /// `boolean_t malloc_zone_claimed_address(malloc_zone_t *zone, void *ptr)`
 ///
-/// A zone that cannot say has to be assumed to claim it: a false negative is
-/// the one wrong answer this function may not give.
+/// A zone that cannot say is assumed to claim it; a false negative is the one
+/// wrong answer this may not give.
 pub unsafe extern "C" fn malloc_zone_claimed_address(
     zone: *mut MallocZone,
     ptr: *mut c_void,
@@ -2633,10 +2550,6 @@ pub extern "C" fn _malloc_fork_child() {
     }
     LOCK.release();
 }
-
-// ---------------------------------------------------------------------------
-// Typed allocation (macOS 14): the type is advice no zone here takes.
-// ---------------------------------------------------------------------------
 
 pub unsafe extern "C" fn malloc_type_malloc(size: usize, _: TypeId) -> *mut c_void {
     unsafe { malloc(size) }
@@ -3505,10 +3418,6 @@ mod tests {
         assert!(count >= 1);
         assert!(registered().contains(&unsafe { *zones as *mut MallocZone }));
     }
-
-    // -----------------------------------------------------------------------
-    // Chromium's zone shuffle, with stand-ins for its two zones.
-    // -----------------------------------------------------------------------
 
     static mut REAL_DEFAULT: *mut MallocZone = std::ptr::null_mut();
 
