@@ -73,10 +73,10 @@
 #![cfg(not(target_os = "macos"))]
 
 use core::ffi::{c_char, c_int, c_uint, c_void};
-use std::sync::Once;
 use std::sync::atomic::{
     AtomicBool, AtomicI32, AtomicIsize, AtomicPtr, AtomicU32, AtomicUsize, Ordering,
 };
+use std::sync::{Once, OnceLock};
 
 use libmimalloc_sys as mi;
 
@@ -380,8 +380,10 @@ const PURGEABLE_ZONE_NAME: &std::ffi::CStr = c"DefaultPurgeableMallocZone";
 
 /// The page size a guest is told (`vm_page_size`), which `valloc` aligns to.
 fn page_size() -> usize {
+    // Cached: `malloc` checks every request against a bound derived from it.
+    static PAGE_SIZE: OnceLock<usize> = OnceLock::new();
     // SAFETY: a plain query.
-    (unsafe { libc::sysconf(libc::_SC_PAGESIZE) }).max(4096) as usize
+    *PAGE_SIZE.get_or_init(|| (unsafe { libc::sysconf(libc::_SC_PAGESIZE) }).max(4096) as usize)
 }
 
 /// `malloc_absolute_max_size`: the largest request worth passing on.
@@ -502,8 +504,8 @@ fn live_block(ptr: *const c_void) -> Option<BlockInfo> {
 #[repr(C)]
 struct HostZone {
     zone: MallocZone,
-    /// The heap, or null for mimalloc's main heap - which only the default
-    /// zone allocates from, and only until [`init`] gives it its own.
+    /// The heap; set before the zone is reachable. mimalloc's main heap when
+    /// no heap of its own could be made, and then the zone counts nothing.
     heap: *mut mi::mi_heap_t,
     count: Count,
     /// The live totals, for [`Count::Shared`].
@@ -581,12 +583,7 @@ impl HostZone {
         if heap.is_null() {
             return false;
         }
-        let own = if self.heap.is_null() {
-            main_heap()
-        } else {
-            self.heap
-        };
-        heap == own || (std::ptr::eq(self, &raw const DEFAULT_ZONE) && heap == main_heap())
+        heap == self.heap || (std::ptr::eq(self, &raw const DEFAULT_ZONE) && heap == main_heap())
     }
 
     /// The zone whose totals hold `block`: the one whose heap made it. A block
@@ -595,7 +592,7 @@ impl HostZone {
     /// registered zones, a walk only that mistake pays for; libmalloc's
     /// scalable zone would not survive the call at all.
     fn counter_of(&self, heap: *mut mi::mi_heap_t) -> Option<&HostZone> {
-        if heap.is_null() {
+        if heap.is_null() || heap == main_heap() {
             return None;
         }
         if heap == self.heap {
@@ -610,16 +607,22 @@ impl HostZone {
                 return Some(HostZone::of((&raw mut PURGEABLE_ZONE).cast()));
             }
         }
-        if heap == main_heap() {
-            return None;
-        }
         // SAFETY: the zone that made a live block is live while it is.
         unsafe { registered_host_zone(heap).as_ref() }
     }
 
-    /// Count `block`, which mimalloc just returned, in the zone whose heap it
-    /// is in.
+    /// Count `block`, which mimalloc just made in this zone's heap.
     fn allocated(&self, block: *mut c_void) -> *mut c_void {
+        if !block.is_null() && self.heap != main_heap() {
+            // SAFETY: a live block mimalloc just returned.
+            self.count_in(unsafe { mi::mi_usable_size(block) });
+        }
+        block
+    }
+
+    /// Count `block`, which `realloc` returned, in the zone whose heap it is
+    /// in: a block resized in place stays in the heap that made it.
+    fn reallocated(&self, block: *mut c_void) -> *mut c_void {
         if let Some(zone) = self.counter_of(heap_of(block)) {
             // SAFETY: a live block mimalloc just returned.
             zone.count_in(unsafe { mi::mi_usable_size(block) });
@@ -834,25 +837,13 @@ unsafe extern "C" fn host_size(zone: *mut MallocZone, ptr: *const c_void) -> usi
 }
 
 unsafe fn heap_malloc(heap: *mut mi::mi_heap_t, size: usize) -> *mut c_void {
-    // SAFETY: mimalloc's allocation calls, with a heap this module made.
-    unsafe {
-        if heap.is_null() {
-            mi::mi_malloc(quantum(size))
-        } else {
-            mi::mi_heap_malloc(heap, quantum(size))
-        }
-    }
+    // SAFETY: mimalloc's allocation call, with a zone's heap.
+    unsafe { mi::mi_heap_malloc(heap, quantum(size)) }
 }
 
 unsafe fn heap_memalign(heap: *mut mi::mi_heap_t, alignment: usize, size: usize) -> *mut c_void {
     // SAFETY: as [`heap_malloc`].
-    unsafe {
-        if heap.is_null() {
-            mi::mi_malloc_aligned(quantum(size), alignment)
-        } else {
-            mi::mi_heap_malloc_aligned(heap, quantum(size), alignment)
-        }
-    }
+    unsafe { mi::mi_heap_malloc_aligned(heap, quantum(size), alignment) }
 }
 
 unsafe extern "C" fn host_malloc(zone: *mut MallocZone, size: usize) -> *mut c_void {
@@ -866,14 +857,8 @@ unsafe extern "C" fn host_calloc(zone: *mut MallocZone, count: usize, size: usiz
         crate::errno::set(libc::ENOMEM);
         return std::ptr::null_mut();
     };
-    // SAFETY: mimalloc's zeroing allocations.
-    let block = unsafe {
-        if host.heap.is_null() {
-            mi::mi_zalloc(quantum(total))
-        } else {
-            mi::mi_heap_zalloc(host.heap, quantum(total))
-        }
-    };
+    // SAFETY: mimalloc's zeroing allocation.
+    let block = unsafe { mi::mi_heap_zalloc(host.heap, quantum(total)) };
     host.allocated(block)
 }
 
@@ -948,19 +933,13 @@ unsafe extern "C" fn host_realloc(
     if let Some(block) = live_block(ptr) {
         host.releasing(block);
         // SAFETY: a live mimalloc block, resized by mimalloc.
-        let grown = unsafe {
-            if host.heap.is_null() {
-                mi::mi_realloc(ptr, quantum(size))
-            } else {
-                mi::mi_heap_realloc(host.heap, ptr, quantum(size))
-            }
-        };
+        let grown = unsafe { mi::mi_heap_realloc(host.heap, ptr, quantum(size)) };
         if grown.is_null() {
             // The old block is still live, and counted back where it was.
-            host.allocated(ptr);
+            host.reallocated(ptr);
             return grown;
         }
-        return host.allocated(grown);
+        return host.reallocated(grown);
     }
     // Another zone's block: move it into this one. libmalloc's scalable zone
     // would refuse; the caller asked for this zone, and the data survives.
@@ -1028,11 +1007,8 @@ unsafe extern "C" fn host_pressure_relief(zone: *mut MallocZone, _goal: usize) -
     // SAFETY: our zone's heap, collected; mimalloc does not say how much. The
     // default zone answers for the main heap too, so collects that as well.
     unsafe {
-        let heap = host_heap(zone);
-        if !heap.is_null() {
-            mi::mi_heap_collect(heap, true);
-        }
-        if heap.is_null() || zone == default_host_zone() {
+        mi::mi_heap_collect(host_heap(zone), true);
+        if zone == default_host_zone() {
             mi::mi_collect(true);
         }
     }
@@ -1514,12 +1490,14 @@ pub fn init() {
         // SAFETY: mimalloc's own heap, which exists from its first use.
         MAIN_HEAP.store(unsafe { mi_heap_main() }, Ordering::Relaxed);
         // The default zone's own heap, so that its blocks can be told from the
-        // host's. Without one it stays on the main heap and counts nothing.
+        // host's. Without one it uses the main heap and counts nothing.
         // SAFETY: a heap that lives for the rest of the process, written into
         // the zone before the zone is registered.
         unsafe {
             let heap = mi::mi_heap_new();
-            if !heap.is_null() {
+            if heap.is_null() {
+                (*default_host_zone().cast::<HostZone>()).heap = main_heap();
+            } else {
                 (*default_host_zone().cast::<HostZone>()).heap = heap;
                 DEFAULT_HEAP.store(heap, Ordering::Release);
             }
@@ -1544,10 +1522,14 @@ pub fn init() {
 /// The array and how many of its entries are live.
 fn zones() -> (*const *mut MallocZone, u32) {
     init();
-    (
-        ZONES.load(Ordering::Acquire),
-        NUM_ZONES.load(Ordering::Acquire),
-    )
+    load_zones()
+}
+
+/// The count before the array: a grown array is published before the count
+/// that needs it, so whichever array is seen holds at least `count` entries.
+fn load_zones() -> (*const *mut MallocZone, u32) {
+    let count = NUM_ZONES.load(Ordering::Acquire);
+    (ZONES.load(Ordering::Acquire), count)
 }
 
 /// `malloc_zones[0]`, the zone `malloc` allocates from.
@@ -1648,30 +1630,27 @@ unsafe fn register_while_locked(zone: *mut MallocZone, make_default: bool) {
     protect(array, protect_size, libc::PROT_READ);
 }
 
-/// `find_registered_zone`: the zone that owns `ptr`, and the size it reports.
-///
-/// A hit on the first zone answers the virtual default zone, as libmalloc does
-/// when nothing was injected in front of it.
+/// libmalloc's two-phase walk of the registry: the initial zones without the
+/// drain counters, then the rest counted in on the live one. `visit` gets each
+/// zone's index from `first` on, and the first answer it gives ends the walk.
 ///
 /// # Safety
 ///
 /// Every registered zone is callable, which registering one promises.
-unsafe fn find_registered_zone(
-    ptr: *const c_void,
-    known_non_default: bool,
-) -> (*mut MallocZone, usize) {
+unsafe fn walk_registered<T>(
+    first: u32,
+    mut visit: impl FnMut(u32, *mut MallocZone) -> Option<T>,
+) -> Option<T> {
     let (zones, count) = zones();
     if count == 0 {
-        return (std::ptr::null_mut(), 0);
+        return None;
     }
-    let initial = INITIAL_NUM_ZONES.load(Ordering::Acquire);
-    for i in u32::from(known_non_default)..initial {
+    let initial = INITIAL_NUM_ZONES.load(Ordering::Acquire).min(count);
+    for i in first..initial {
         // SAFETY: the initial zones are never removed while others run, which
         // is the bargain libmalloc's fast path makes as well.
-        let zone = unsafe { *zones.add(i as usize) };
-        let size = unsafe { zone_size(zone, ptr) };
-        if size != 0 {
-            return (if i == 0 { virtual_zone() } else { zone }, size);
+        if let Some(found) = visit(i, unsafe { *zones.add(i as usize) }) {
+            return Some(found);
         }
     }
 
@@ -1679,15 +1658,12 @@ unsafe fn find_registered_zone(
     FRZ[live].fetch_add(1, Ordering::SeqCst);
     // Reloaded inside the counted region, so that an unregister either waits
     // for this walk or happened before it.
-    let zones = ZONES.load(Ordering::Acquire);
-    let limit = NUM_ZONES.load(Ordering::Acquire);
-    let mut found = (std::ptr::null_mut(), 0);
-    for i in initial..limit {
+    let (zones, limit) = load_zones();
+    let mut found = None;
+    for i in initial.max(first)..limit {
         // SAFETY: entries below the count are live until this walk drains.
-        let zone = unsafe { *zones.add(i as usize) };
-        let size = unsafe { zone_size(zone, ptr) };
-        if size != 0 {
-            found = (zone, size);
+        found = visit(i, unsafe { *zones.add(i as usize) });
+        if found.is_some() {
             break;
         }
     }
@@ -1695,46 +1671,44 @@ unsafe fn find_registered_zone(
     found
 }
 
+/// `find_registered_zone`: the zone that owns `ptr`, and the size it reports.
+///
+/// A hit on the first zone answers the virtual default zone, as libmalloc does
+/// when nothing was injected in front of it - which nothing here can do.
+///
+/// # Safety
+///
+/// As [`walk_registered`].
+unsafe fn find_registered_zone(
+    ptr: *const c_void,
+    known_non_default: bool,
+) -> (*mut MallocZone, usize) {
+    let found = unsafe {
+        walk_registered(u32::from(known_non_default), |i, zone| {
+            let size = zone_size(zone, ptr);
+            (size != 0).then(|| (if i == 0 { virtual_zone() } else { zone }, size))
+        })
+    };
+    found.unwrap_or((std::ptr::null_mut(), 0))
+}
+
 /// The registered zone of this module's whose heap is `heap`, or null: the
 /// owner of a created zone's block that another zone was handed.
 ///
 /// # Safety
 ///
-/// As [`find_registered_zone`].
+/// As [`walk_registered`].
 unsafe fn registered_host_zone(heap: *mut mi::mi_heap_t) -> *const HostZone {
-    let has_heap = |zone: *mut MallocZone| {
-        // SAFETY: a registered zone; only one whose introspection is ours is
-        // a `HostZone`.
-        unsafe {
-            std::ptr::eq((*zone).introspect, &raw const HOST_INTROSPECT)
-                && HostZone::of(zone).heap == heap
-        }
+    let found = unsafe {
+        walk_registered(0, |_, zone| {
+            // SAFETY: a registered zone; only one whose introspection is ours
+            // is a `HostZone`.
+            (std::ptr::eq((*zone).introspect, &raw const HOST_INTROSPECT)
+                && HostZone::of(zone).heap == heap)
+                .then(|| zone.cast_const().cast())
+        })
     };
-    let (zones, count) = zones();
-    let initial = INITIAL_NUM_ZONES.load(Ordering::Acquire).min(count);
-    for i in 0..initial {
-        // SAFETY: as in [`find_registered_zone`].
-        let zone = unsafe { *zones.add(i as usize) };
-        if has_heap(zone) {
-            return zone.cast();
-        }
-    }
-
-    let live = FRZ_LIVE.load(Ordering::SeqCst);
-    FRZ[live].fetch_add(1, Ordering::SeqCst);
-    let zones = ZONES.load(Ordering::Acquire);
-    let limit = NUM_ZONES.load(Ordering::Acquire);
-    let mut found = std::ptr::null();
-    for i in initial..limit {
-        // SAFETY: as in [`find_registered_zone`].
-        let zone = unsafe { *zones.add(i as usize) };
-        if has_heap(zone) {
-            found = zone.cast_const().cast();
-            break;
-        }
-    }
-    FRZ[live].fetch_sub(1, Ordering::SeqCst);
-    found
+    found.unwrap_or(std::ptr::null())
 }
 
 /// `find_zone_and_free`.
@@ -2068,8 +2042,12 @@ pub extern "C" fn malloc_default_purgeable_zone() -> *mut MallocZone {
         // SAFETY: written once, before the zone is published.
         unsafe {
             let heap = mi::mi_heap_new();
-            (*zone.cast::<HostZone>()).heap = heap;
-            PURGEABLE_HEAP.store(heap, Ordering::Release);
+            if heap.is_null() {
+                (*zone.cast::<HostZone>()).heap = main_heap();
+            } else {
+                (*zone.cast::<HostZone>()).heap = heap;
+                PURGEABLE_HEAP.store(heap, Ordering::Release);
+            }
         }
         // SAFETY: a zone that lives for the rest of the process.
         unsafe { malloc_zone_register(zone) };
