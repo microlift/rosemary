@@ -16,6 +16,8 @@ exports::exports! {
         "NSFullUserName" => NSFullUserName,
         "NSSetUncaughtExceptionHandler" => NSSetUncaughtExceptionHandler,
         "NSGetUncaughtExceptionHandler" => NSGetUncaughtExceptionHandler,
+        "CFCharacterSetGetPredefined" => crate::characterset::CFCharacterSetGetPredefined,
+        "CFCharacterSetIsCharacterMember" => crate::characterset::CFCharacterSetIsCharacterMember,
     }
 }
 

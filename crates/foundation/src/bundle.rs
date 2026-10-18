@@ -77,6 +77,50 @@ fn plugins_of(contents: &Path) -> PathBuf {
     found.unwrap_or(exact)
 }
 
+/// `CFBundleIdentifier` of the Apple framework named `leaf`, as its
+/// `Info.plist` on a Mac spells it.
+///
+/// Only frameworks whose identifier is known go here: the spellings are not
+/// regular (`com.apple.opengl`, `com.apple.framework.IOKit`), and a guessed one
+/// would be found by nobody.
+const APPLE_IDENTIFIERS: &[(&str, &str)] = &[
+    ("AGL", "com.apple.AGL"),
+    ("AppKit", "com.apple.AppKit"),
+    ("ApplicationServices", "com.apple.ApplicationServices"),
+    ("AudioToolbox", "com.apple.audio.toolbox.AudioToolbox"),
+    ("Carbon", "com.apple.Carbon"),
+    ("Cocoa", "com.apple.Cocoa"),
+    ("CoreAudio", "com.apple.audio.CoreAudio"),
+    ("CoreFoundation", "com.apple.CoreFoundation"),
+    ("CoreGraphics", "com.apple.CoreGraphics"),
+    ("CoreServices", "com.apple.CoreServices"),
+    ("CoreVideo", "com.apple.CoreVideo"),
+    ("Foundation", "com.apple.Foundation"),
+    ("GameController", "com.apple.GameController"),
+    ("IOKit", "com.apple.framework.IOKit"),
+    ("Metal", "com.apple.Metal"),
+    ("OpenGL", "com.apple.opengl"),
+    ("QuartzCore", "com.apple.QuartzCore"),
+    ("Security", "com.apple.security"),
+    ("WebKit", "com.apple.WebKit"),
+];
+
+fn apple_identifier(leaf: &str) -> Option<&'static str> {
+    APPLE_IDENTIFIERS
+        .iter()
+        .find(|(name, _)| *name == leaf)
+        .map(|(_, identifier)| *identifier)
+}
+
+/// The guest path of the Apple framework `identifier` names. CFBundle compares
+/// identifiers without regard to case.
+fn apple_framework(identifier: &str) -> Option<String> {
+    APPLE_IDENTIFIERS
+        .iter()
+        .find(|(_, known)| known.eq_ignore_ascii_case(identifier))
+        .map(|(name, _)| format!("/System/Library/Frameworks/{name}.framework"))
+}
+
 impl Layout {
     /// The bundle `executable` is inside, or `None` for a loose binary.
     pub fn enclosing(executable: &Path) -> Option<Layout> {
@@ -158,9 +202,10 @@ impl Layout {
     ///
     /// Nothing of it is on disk, so there is no `Info.plist` to read: the
     /// dictionary holds only what the shape of a framework already says - its
-    /// executable is `X`, beside the bundle's top level, and it is a framework.
-    /// An identifier or a version would be invented, and a caller comparing
-    /// one would be told something no Mac says.
+    /// executable is `X`, beside the bundle's top level, and it is a framework -
+    /// plus the identifier a Mac gives it, for the frameworks
+    /// [`apple_identifier`] knows. Any other identifier, or a version, would be
+    /// invented, and a caller comparing one would be told something no Mac says.
     pub fn provided_framework(guest: &str) -> Option<Layout> {
         let guest = guest.trim_end_matches('/');
         if !darwin::images::virtual_directory(guest) {
@@ -172,19 +217,23 @@ impl Layout {
             .strip_suffix(".framework")?
             .to_string();
         let root = opened(Path::new(guest));
-        let info = Value::Dictionary(
-            [
-                (
-                    "CFBundleExecutable".to_string(),
-                    Value::String(leaf.clone()),
-                ),
-                (
-                    "CFBundlePackageType".to_string(),
-                    Value::String("FMWK".into()),
-                ),
-            ]
-            .into(),
-        );
+        let mut info = std::collections::BTreeMap::from([
+            (
+                "CFBundleExecutable".to_string(),
+                Value::String(leaf.clone()),
+            ),
+            (
+                "CFBundlePackageType".to_string(),
+                Value::String("FMWK".into()),
+            ),
+        ]);
+        if let Some(identifier) = apple_identifier(&leaf) {
+            info.insert(
+                "CFBundleIdentifier".to_string(),
+                Value::String(identifier.into()),
+            );
+        }
+        let info = Value::Dictionary(info);
         Some(Layout {
             resources: root.join("Resources"),
             frameworks: root.join("Frameworks"),
@@ -702,6 +751,50 @@ pub mod cf {
         })
     }
 
+    /// `CFBundleRef CFBundleGetBundleWithIdentifier(CFStringRef)`
+    ///
+    /// Searches the bundles this process already has - the main one and every
+    /// one created since - and then the Apple framework of that identifier, if
+    /// this runtime provides it. That last is how a program finds OpenGL to
+    /// look up an extension in: `com.apple.opengl`, then
+    /// `CFBundleGetFunctionPointerForName`.
+    ///
+    /// A `Get`, so not retained: every bundle here lives for the process.
+    unsafe extern "C" fn CFBundleGetBundleWithIdentifier(identifier: Id) -> Id {
+        if identifier.is_null() {
+            return std::ptr::null_mut();
+        }
+        // SAFETY: a CFString, as the caller passed it.
+        let identifier = unsafe { crate::string::bytes(identifier) };
+        let Ok(identifier) = std::str::from_utf8(&identifier) else {
+            return std::ptr::null_mut();
+        };
+        if super::main().is_some_and(|main| main.identifier() == Some(identifier)) {
+            return super::class::main_object();
+        }
+        let made = super::class::made_with_identifier(identifier);
+        if !made.is_null() {
+            return made;
+        }
+        match super::apple_framework(identifier) {
+            Some(guest) => super::class::provided(&guest),
+            None => std::ptr::null_mut(),
+        }
+    }
+
+    /// `void *CFBundleGetDataPointerForName(CFBundleRef, CFStringRef)`
+    ///
+    /// The address of an exported variable - a constant string, a table - in
+    /// the bundle's executable alone, loading it first. `dlsym` answers data
+    /// and functions alike, so this is the function lookup under another name.
+    unsafe extern "C" fn CFBundleGetDataPointerForName(
+        bundle: Id,
+        name: Id,
+    ) -> *mut std::ffi::c_void {
+        // SAFETY: as the caller passed them.
+        unsafe { CFBundleGetFunctionPointerForName(bundle, name) }
+    }
+
     /// The layout a `CFBundleRef` answers for. A null bundle has always been
     /// answered as the main one here, and still is.
     fn layout(bundle: Id) -> Option<&'static super::Layout> {
@@ -755,6 +848,8 @@ pub mod cf {
             "CFBundleCreate" => CFBundleCreate,
             "CFBundleLoadExecutable" => CFBundleLoadExecutable,
             "CFBundleGetFunctionPointerForName" => CFBundleGetFunctionPointerForName,
+            "CFBundleGetDataPointerForName" => CFBundleGetDataPointerForName,
+            "CFBundleGetBundleWithIdentifier" => CFBundleGetBundleWithIdentifier,
         }
     }
 }
@@ -851,6 +946,19 @@ mod tests {
             Layout::provided_framework("/System/Library/Frameworks/RosemaryAbsent.framework")
                 .is_none()
         );
+    }
+
+    /// An Apple framework is found by the identifier a Mac gives it, in any
+    /// case, and only one in the table has one.
+    #[test]
+    fn an_apple_identifier_names_its_framework() {
+        assert_eq!(apple_identifier("OpenGL"), Some("com.apple.opengl"));
+        assert_eq!(
+            apple_framework("com.apple.OpenGL").as_deref(),
+            Some("/System/Library/Frameworks/OpenGL.framework")
+        );
+        assert_eq!(apple_identifier("RosemaryProbe"), None);
+        assert_eq!(apple_framework("com.example.thing"), None);
     }
 
     /// Build a bundle-shaped directory, since the claim is about shape.
@@ -1017,18 +1125,40 @@ pub(crate) mod class {
         }
     }
 
+    /// Every on-disk bundle object made, by resolved directory.
+    static INTERNED: std::sync::Mutex<Vec<(std::path::PathBuf, usize)>> =
+        std::sync::Mutex::new(Vec::new());
+
+    /// Every provided-framework bundle object made, by guest path.
+    static PROVIDED: std::sync::Mutex<Vec<(String, usize)>> = std::sync::Mutex::new(Vec::new());
+
+    /// A bundle object already made whose identifier is `identifier`, in the
+    /// order they were made, or nil.
+    pub(crate) fn made_with_identifier(identifier: &str) -> Id {
+        let interned = INTERNED.lock().unwrap_or_else(|e| e.into_inner());
+        let provided = PROVIDED.lock().unwrap_or_else(|e| e.into_inner());
+        interned
+            .iter()
+            .map(|(_, object)| *object)
+            .chain(provided.iter().map(|(_, object)| *object))
+            .find(|&object| {
+                // SAFETY: both tables hold only `NSBundle`s this module made.
+                unsafe { layout_of(object as Id) }
+                    .is_some_and(|layout| layout.identifier() == Some(identifier))
+            })
+            .map_or(std::ptr::null_mut(), |object| object as Id)
+    }
+
     /// One `NSBundle` per bundle directory for the life of the process, as
     /// Apple's: a program compares bundles by identity.
     fn interned(class: Id, layout: super::Layout) -> Id {
-        static MADE: std::sync::Mutex<Vec<(std::path::PathBuf, usize)>> =
-            std::sync::Mutex::new(Vec::new());
         // Keyed by the resolved directory: the loader and a guest's path may
         // spell one bundle two ways.
         let key = layout
             .root
             .canonicalize()
             .unwrap_or_else(|_| layout.root.clone());
-        let mut made = MADE.lock().unwrap_or_else(|e| e.into_inner());
+        let mut made = INTERNED.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(&(_, object)) = made.iter().find(|(root, _)| *root == key) {
             return object as Id;
         }
@@ -1088,9 +1218,8 @@ pub(crate) mod class {
     /// `CFBundleCreate` also answers a URL it has seen with the same bundle, so
     /// the result is not the caller's to release.
     pub(crate) fn provided(guest: &str) -> Id {
-        static MADE: std::sync::Mutex<Vec<(String, usize)>> = std::sync::Mutex::new(Vec::new());
         let guest = guest.trim_end_matches('/');
-        let mut made = MADE.lock().unwrap_or_else(|e| e.into_inner());
+        let mut made = PROVIDED.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(&(_, object)) = made.iter().find(|(path, _)| path == guest) {
             return object as Id;
         }

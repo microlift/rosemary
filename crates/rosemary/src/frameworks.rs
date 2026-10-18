@@ -84,6 +84,14 @@ static FRAMEWORKS: &[Framework] = &[
         symbol: Some(forcefeedback::symbol),
     },
     Framework {
+        leaf: "Network",
+        version: 'A',
+        umbrellas: &[],
+        provide: Some(network::provide),
+        data: None,
+        symbol: Some(network::symbol),
+    },
+    Framework {
         leaf: "OpenCL",
         version: 'A',
         umbrellas: &[],
@@ -223,7 +231,7 @@ fn register_dlopen_names() {
     for framework in FRAMEWORKS {
         let paths = paths_of(framework);
         let borrowed: Vec<&str> = paths.iter().map(String::as_str).collect();
-        crate::dyld::register_synthetic(&borrowed, symbol);
+        crate::dyld::register_synthetic(&borrowed, dlsym_symbol);
     }
     register_opengl_framework();
     register_openal_framework();
@@ -378,6 +386,38 @@ pub fn symbol(name: &str) -> Option<u64> {
         // `crate::opengl`, which publishes it through its own lazy provider.
         .or_else(|| crate::opengl::symbol(name))
         .or_else(|| crate::openal::symbol(name))
+}
+
+/// What `dlsym` on a provided framework answers: its functions, and then its
+/// variables - `CFBundleGetDataPointerForName` asks for `kCFTypeArrayCallBacks`
+/// this way, and has to be handed the address the guest's own bind got.
+fn dlsym_symbol(name: &str) -> Option<u64> {
+    symbol(name).or_else(|| data_symbol(name))
+}
+
+/// A variable the flat provider publishes, by its C name.
+fn data_symbol(name: &str) -> Option<u64> {
+    if !using_builtin() {
+        return None;
+    }
+    // Built once: the tables allocate their objects on first use and answer
+    // the same addresses after, which is what makes a cache of them correct.
+    static DATA: std::sync::OnceLock<std::collections::HashMap<String, u64>> =
+        std::sync::OnceLock::new();
+    let data = DATA.get_or_init(|| {
+        foundation::bootstrap();
+        FRAMEWORKS
+            .iter()
+            .filter_map(|f| f.data)
+            .flat_map(|data| data())
+            .chain(media_constants())
+            .collect()
+    });
+    let mangled = format!("_{name}");
+    if withheld(&mangled) {
+        return None;
+    }
+    data.get(&mangled).copied()
 }
 
 pub fn set_main_bundle(executable: &std::path::Path) {

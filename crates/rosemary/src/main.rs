@@ -416,6 +416,9 @@ fn launch(path: OsString, options: &RunOptions, args: Vec<OsString>) -> ExitCode
     let path = path.as_str();
     rosemary::shims::runtime::set_executable_path(std::path::Path::new(path));
     rosemary::frameworks::set_main_bundle(std::path::Path::new(path));
+    if rosemary::bundle::enclosing(std::path::Path::new(path)).is_some() {
+        darwin::env::launch_as_app();
+    }
     // The same path as the guest spells it, for `argv[0]`.
     let guest = guest_spelling(path);
     // A Mac's `~/Library` subtree, which this host has not got and a guest

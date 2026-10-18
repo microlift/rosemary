@@ -57,15 +57,10 @@ pub(crate) fn allows(event: Id) -> bool {
 ///
 /// `block` must be null or a block literal of that prototype.
 unsafe fn call(block: Id, argument: Id) -> Id {
-    if block.is_null() {
+    // SAFETY: the caller's obligation.
+    let Some(invoke) = (unsafe { objc::block::invoke(block) }) else {
         return argument;
-    }
-    // SAFETY: `invoke` is the third word of a block
-    // literal, after `isa`, `flags` and `reserved`.
-    let invoke = unsafe { *((block as *const u8).add(16) as *const usize) };
-    if invoke == 0 {
-        return argument;
-    }
+    };
     unsafe {
         let f: unsafe extern "C" fn(Id, Id) -> Id = std::mem::transmute(invoke);
         f(block, argument)

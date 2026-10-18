@@ -874,6 +874,17 @@ pub(crate) fn rewrite_refs(
     let mut view = r.memory();
     let mut rewritten = 0;
     for image in report.images.iter().filter_map(|i| i.objc.as_ref()) {
+        // A pre-10.6 compiler names its own classes in code, where no slot can
+        // be rewritten; see `host::alias_class`.
+        let declared = image
+            .classes
+            .iter()
+            .flat_map(|c| core::iter::once(c.va).chain(c.meta.as_ref().map(|m| m.va)));
+        for va in declared {
+            if let Some(host) = rt.host_class(va) {
+                host::alias_class(va, host);
+            }
+        }
         // A superref names the class a `[super ...]` send starts its search
         // from, and is a class reference in every other respect.
         let classes = image.class_refs.iter().chain(image.super_refs.iter());

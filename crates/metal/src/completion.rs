@@ -82,10 +82,8 @@ unsafe fn run(entry: Pending) {
         // Metal runs handlers on a dispatch queue, which drains a pool around
         // each one; without it whatever the handler autoreleases leaks.
         let pool = objc::arc::pool_push();
-        // A block's invoke pointer is its third word.
         // SAFETY: `block` was copied by `objc_retainBlock` and is still live.
-        let invoke = unsafe { *((block as *const u8).add(16) as *const usize) };
-        if invoke != 0 {
+        if let Some(invoke) = unsafe { objc::block::invoke(block) } {
             // SAFETY: a completion handler is `void (^)(id<MTLCommandBuffer>)`.
             let call: unsafe extern "C" fn(Id, Id) = unsafe { std::mem::transmute(invoke) };
             // SAFETY: the guest's handler, given the buffer it was registered on.

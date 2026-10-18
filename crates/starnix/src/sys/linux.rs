@@ -9,7 +9,8 @@ use std::path::PathBuf;
 use std::sync::OnceLock;
 
 use crate::process::{
-    Audit, Descriptor, DescriptorKind, Identity, Process, Region, State, Thread, Usage,
+    Audit, Descriptor, DescriptorKind, FileId, Identity, InUse, Process, Region, State, Thread,
+    Usage,
 };
 use crate::socket::Peer;
 use crate::system::{CpuTicks, Memory, page_size};
@@ -234,21 +235,96 @@ pub fn command_line(pid: i32) -> Option<Vec<u8>> {
 }
 
 pub fn descriptors() -> io::Result<Vec<Descriptor>> {
-    Ok(std::fs::read_dir("/proc/self/fd")?
-        .flatten()
-        .filter_map(|entry| {
-            let fd = entry.file_name().to_str()?.parse::<i32>().ok()?;
-            let target = std::fs::read_link(entry.path()).unwrap_or_default();
-            let target = target.to_string_lossy();
-            let kind = match () {
-                _ if target.starts_with("socket:") => DescriptorKind::Socket,
-                _ if target.starts_with("pipe:") => DescriptorKind::Pipe,
-                _ if target.contains("[eventpoll]") => DescriptorKind::Queue,
-                _ => DescriptorKind::File,
-            };
-            Some(Descriptor { fd, kind })
-        })
+    Ok(descriptors_in("/proc/self/fd")?
+        .map(|(descriptor, _)| descriptor)
         .collect())
+}
+
+/// The descriptors a `/proc/<pid>/fd` directory lists, each with its entry
+/// when it leads to a file that can be stat'ed through `/proc`.
+fn descriptors_in(
+    dir: &str,
+) -> io::Result<impl Iterator<Item = (Descriptor, Option<std::fs::DirEntry>)> + use<>> {
+    Ok(std::fs::read_dir(dir)?.flatten().filter_map(|entry| {
+        let fd = entry.file_name().to_str()?.parse::<i32>().ok()?;
+        let target = std::fs::read_link(entry.path()).unwrap_or_default();
+        let target = target.to_string_lossy();
+        let kind = match () {
+            _ if target.starts_with("socket:") => DescriptorKind::Socket,
+            _ if target.starts_with("pipe:") => DescriptorKind::Pipe,
+            _ if target.contains("[eventpoll]") => DescriptorKind::Queue,
+            _ => DescriptorKind::File,
+        };
+        // An `anon_inode:` link is an eventfd, a timerfd and the like: an
+        // object of the kernel's, not a file anyone else can name.
+        let file =
+            (kind == DescriptorKind::File && !target.starts_with("anon_inode:")).then_some(entry);
+        Some((Descriptor { fd, kind }, file))
+    }))
+}
+
+/// The device and inode of what `path` leads to.
+fn file_id(path: &std::path::Path) -> Option<FileId> {
+    std::fs::metadata(path)
+        .ok()
+        .map(|meta| (meta.dev(), meta.ino()))
+}
+
+pub fn in_use(pid: i32) -> Option<InUse> {
+    let base = format!("/proc/{pid}");
+    let mut directories: Vec<FileId> = ["cwd", "root"]
+        .iter()
+        .filter_map(|link| file_id(std::path::Path::new(&format!("{base}/{link}"))))
+        .collect();
+    let mut open: Vec<FileId> = descriptors_in(&format!("{base}/fd"))
+        .ok()?
+        .filter_map(|(_, file)| file_id(&file?.path()))
+        .collect();
+    for files in [&mut directories, &mut open] {
+        files.sort_unstable();
+        files.dedup();
+    }
+    Some(InUse {
+        directories,
+        open,
+        mapped: mapped_files(&base),
+    })
+}
+
+/// What `/proc/<pid>` shows mapped from files. `map_files` leads to each
+/// file itself; without leave to read it, `maps` names them, and each path is
+/// stat'ed for the device `stat` reports, which on a filesystem with
+/// subvolumes is not the one `maps` gives.
+fn mapped_files(base: &str) -> Vec<FileId> {
+    let mut files: Vec<FileId> = match std::fs::read_dir(format!("{base}/map_files")) {
+        Ok(entries) => entries
+            .flatten()
+            .filter_map(|entry| file_id(&entry.path()))
+            .collect(),
+        Err(_) => Vec::new(),
+    };
+    if files.is_empty() {
+        let backing = super::procmap::backing_files(&format!("{base}/maps")).unwrap_or_default();
+        files = backing
+            .into_iter()
+            .map(|file| {
+                // The path is the process's own, so it is read through its root.
+                let found = file.path.as_ref().and_then(|path| {
+                    file_id(
+                        &PathBuf::from(format!("{base}/root"))
+                            .join(path.strip_prefix("/").unwrap_or(path)),
+                    )
+                });
+                // A different file at the path is not the one mapped.
+                found
+                    .filter(|&(_, inode)| inode == file.inode)
+                    .unwrap_or((file.dev, file.inode))
+            })
+            .collect();
+    }
+    files.sort_unstable();
+    files.dedup();
+    files
 }
 
 pub fn regions() -> io::Result<Vec<Region>> {
@@ -448,4 +524,21 @@ pub fn xattr_remove_path(
 
 pub fn xattr_is_missing(error: &io::Error) -> bool {
     error.raw_os_error() == Some(libc::ENODATA)
+}
+
+/// What `/sys/class/net/<name>` says carries the interface.
+pub fn link_medium(name: &std::ffi::CStr) -> Option<crate::net::Link> {
+    use crate::net::Link;
+    let dir = std::path::Path::new("/sys/class/net").join(name.to_str().ok()?);
+    if dir.join("wireless").exists() || dir.join("phy80211").exists() {
+        return Some(Link::Wifi);
+    }
+    let uevent = std::fs::read_to_string(dir.join("uevent")).unwrap_or_default();
+    if uevent.lines().any(|line| line == "DEVTYPE=wwan") {
+        return Some(Link::Cellular);
+    }
+    // Bridges, veths and the like frame as Ethernet too, but only hardware
+    // has a `device`; tunnels and PPP are other ARPHRD kinds.
+    let kind = std::fs::read_to_string(dir.join("type")).ok()?;
+    (kind.trim() == "1" && dir.join("device").exists()).then_some(Link::Wired)
 }

@@ -343,7 +343,7 @@ fn register_common_modes() {
     });
 }
 
-const MODAL_PANEL_MODE: &str = "NSModalPanelRunLoopMode";
+pub(crate) const MODAL_PANEL_MODE: &str = "NSModalPanelRunLoopMode";
 
 /// One turn of the main thread's loop in `mode`: what `-run` does each time
 /// round, and what `-runModalSession:` does once.
@@ -351,7 +351,7 @@ const MODAL_PANEL_MODE: &str = "NSModalPanelRunLoopMode";
 /// # Safety
 ///
 /// `receiver` must be an application.
-unsafe fn turn(receiver: Id, mode: &str) {
+pub(crate) unsafe fn turn(receiver: Id, mode: &str) {
     // Popped on unwind too: a skipped pop would leave the next one draining
     // the wrong pool.
     struct Pool(*mut c_void);
@@ -435,6 +435,10 @@ fn queued_event(mask: u64, dequeue: bool) -> Id {
             .expect("the matching event is still queued") as Id,
         false => objc::arc::retain(queue[index] as Id),
     };
+    drop(queue);
+    if dequeue {
+        crate::event::handing_out(event);
+    }
     // A dequeued event transfers the queue's reference to the current
     // autorelease pool. A peek acquired its own reference above.
     objc::arc::autorelease(event)
@@ -444,8 +448,38 @@ fn queued_event(mask: u64, dequeue: bool) -> Id {
 ///
 /// A program that drives its own loop - UE3 does - calls this instead of
 /// `-run`, so the pump has to happen here too or its window is never serviced.
-/// Window-system input is still delivered directly by `event::pump`; events
-/// explicitly posted to the application are the objects this method returns.
+/// Keyboard events and events posted to the application are the objects this
+/// method returns; the rest of window-system input is delivered by
+/// `event::pump` directly.
+///
+/// FIXME (ACCURACY): AppKit has one event queue. Every window-server event -
+/// mouse, keyboard, scroll, tracking, app-defined - is dequeued here, run
+/// through the local monitors (`+addLocalMonitorForEventsMatchingMask:`, whose
+/// handler can replace or swallow it), and returned; nothing reaches a window
+/// until the caller hands it to `-[NSApplication sendEvent:]`, which `-run` does
+/// for itself. A mask leaves non-matching events queued, in order, for a later
+/// call - that is how a mouse-tracking loop keeps keystrokes for afterwards.
+/// Here only key and flags-changed events take that path; everything else is
+/// sent from inside `event::pump`, before this returns, and never comes back
+/// from it. The difference shows when a guest reads its input from what this
+/// returns rather than from its responders: SDL 2.0.4 handles the keyboard only
+/// in its `Cocoa_PumpEvents` loop, which is why keys were moved first. Mouse
+/// events still bypass a guest loop that filters or drops them, a tracking loop
+/// asking for mouse events alone gets none, and keys can now arrive after mouse
+/// events that happened later.
+///
+/// Done properly, `event::pump` only translates: each SDL event becomes an
+/// `NSEvent` (or a window notification, which is not an event) appended to
+/// `POSTED_EVENTS`, keeping SDL's order. This method returns the first match
+/// after the monitors have run, waiting on the run loop until `until` for one
+/// to arrive; `turn` dequeues and sends exactly as `-run` does; and
+/// `-discardEventsMatchingMask:beforeEvent:` becomes real. Two things move with it. Text resolved by the host travels on
+/// its key down - `nsevent::attach_text` - since a separate text event would be
+/// committed before the guest saw the key; the IME's own commits and
+/// compositions (`Event::Text` and `Event::TextEditing` not paired with a key)
+/// need an event of their own in the same queue so they stay behind the key
+/// that started them. And `-currentEvent` and `+pressedMouseButtons` describe
+/// the event being sent, not the host's state when the pump ran.
 unsafe extern "C" fn next_event(
     receiver: Id,
     _sel: Sel,
@@ -697,6 +731,15 @@ unsafe extern "C" fn post_event(_receiver: Id, _sel: Sel, event: Id, at_start: u
     }
 }
 
+/// Queue an input event for `-nextEventMatchingMask:`, behind what is already
+/// there. The queue takes its own reference.
+pub(crate) fn enqueue_input(event: Id) {
+    if event.is_null() {
+        return;
+    }
+    posted_events().push_back(objc::arc::retain(event) as usize);
+}
+
 /// Send every queued event through the application's dynamic `-sendEvent:`.
 ///
 /// # Safety
@@ -709,6 +752,7 @@ unsafe fn dispatch_posted_events(receiver: Id) {
     let batch = std::mem::take(&mut *posted_events());
     for event in batch {
         let event = event as Id;
+        crate::event::handing_out(event);
         // SAFETY: the caller's obligation.
         unsafe { send_event_through(receiver, event) };
         objc::arc::release(event);

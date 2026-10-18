@@ -76,6 +76,8 @@ pub(crate) fn install() {
         c"B24@0:8#16",
     );
     add(class, "respondsToSelector:", responds as Imp, c"B24@0:8:16");
+    add(class, "isProxy", is_proxy as Imp, c"B16@0:8");
+    add(class, "zone", zone as Imp, c"^{_NSZone=}16@0:8");
     add(
         class,
         "methodForSelector:",
@@ -239,6 +241,14 @@ unsafe extern "C" fn is_equal(receiver: Id, _sel: Sel, other: Id) -> bool {
 
 unsafe extern "C" fn hash(receiver: Id, _sel: Sel) -> usize {
     receiver as usize
+}
+
+unsafe extern "C" fn is_proxy(_receiver: Id, _sel: Sel) -> bool {
+    false
+}
+
+unsafe extern "C" fn zone(_receiver: Id, _sel: Sel) -> *mut c_void {
+    std::ptr::null_mut()
 }
 
 unsafe extern "C" fn is_kind_of(receiver: Id, _sel: Sel, class: Id) -> bool {

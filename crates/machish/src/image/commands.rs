@@ -50,7 +50,8 @@ pub struct Symtab {
 }
 
 /// `LC_DYSYMTAB`, reduced to the parts a loader needs: the indirect symbol
-/// table, which is what maps a stub or pointer slot back to a symbol.
+/// table, which is what maps a stub or pointer slot back to a symbol, and the
+/// external/local relocation tables a pre-`LC_DYLD_INFO` image binds through.
 #[derive(Copy, Clone, Debug, Default)]
 pub struct Dysymtab {
     pub ilocalsym: u32,
@@ -61,6 +62,10 @@ pub struct Dysymtab {
     pub nundefsym: u32,
     pub indirectsymoff: u32,
     pub nindirectsyms: u32,
+    pub extreloff: u32,
+    pub nextrel: u32,
+    pub locreloff: u32,
+    pub nlocrel: u32,
 }
 
 /// `LC_DYLD_INFO(_ONLY)`: the four fixup opcode streams plus the export trie.
@@ -187,6 +192,10 @@ impl<'a> LoadCommand<'a> {
                 nundefsym: view.u32(off + 28)?,
                 indirectsymoff: view.u32(off + 56)?,
                 nindirectsyms: view.u32(off + 60)?,
+                extreloff: view.u32(off + 64)?,
+                nextrel: view.u32(off + 68)?,
+                locreloff: view.u32(off + 72)?,
+                nlocrel: view.u32(off + 76)?,
             }),
 
             c::LC_LOAD_DYLIB

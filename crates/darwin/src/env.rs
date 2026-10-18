@@ -23,7 +23,8 @@ fn block() -> std::sync::MutexGuard<'static, bool> {
     }
     let entries = handed_off().unwrap_or_else(|| {
         let host: Vec<_> = std::env::vars_os().collect();
-        initial(&host, &guest_value)
+        let app = APP_LAUNCH.load(std::sync::atomic::Ordering::Relaxed);
+        initial(&host, &guest_value, app)
     });
     let entries: Vec<_> = entries
         .into_iter()
@@ -52,18 +53,32 @@ const BASELINE: &[&str] = &["HOME", "USER", "LOGNAME", "SHELL", "PATH", "TMPDIR"
 
 /// Host variables copied without being asked for: the terminal and the locale,
 /// which describe the user rather than the host's software, and which a
-/// command-line guest is lost without.
-fn passes_through(name: &[u8]) -> bool {
-    matches!(name, b"TERM" | b"COLORTERM" | b"LANG") || name.starts_with(b"LC_")
+/// command-line guest is lost without. An app gets no locale variables, as one
+/// launched from the Finder has none: it reads its language from preferences.
+fn passes_through(name: &[u8], app: bool) -> bool {
+    matches!(name, b"TERM" | b"COLORTERM") || (!app && is_locale_var(name))
+}
+
+fn is_locale_var(name: &[u8]) -> bool {
+    name == b"LANG" || name.starts_with(b"LC_")
+}
+
+static APP_LAUNCH: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+pub fn launch_as_app() {
+    APP_LAUNCH.store(true, std::sync::atomic::Ordering::Relaxed);
 }
 
 /// The starting block of a guest no other guest launched, as `NAME=VALUE`.
 ///
 /// `host` is this process's environment and `baseline` the guest's value for a
 /// [`BASELINE`] name; both are parameters so tests need not touch either.
+/// `app` is whether the guest is an application bundle (see [`passes_through`]);
+/// `ROSEMARY_ENVIRON` can still copy anything by name.
 fn initial(
     host: &[(std::ffi::OsString, std::ffi::OsString)],
     baseline: &dyn Fn(&str) -> Option<std::ffi::OsString>,
+    app: bool,
 ) -> Vec<Vec<u8>> {
     use std::os::unix::ffi::OsStrExt;
     let host_value = |name: &[u8]| {
@@ -88,7 +103,7 @@ fn initial(
         }
     }
     for (name, value) in host {
-        if passes_through(name.as_bytes()) {
+        if passes_through(name.as_bytes(), app) {
             set(name.as_bytes(), value.as_bytes());
         }
     }
@@ -656,7 +671,7 @@ mod tests {
             ("LC_CTYPE", "en_US.UTF-8"),
         ]);
         let baseline = |name: &str| (name == "HOME").then(|| "/Users/user".into());
-        let got = texts(initial(&host, &baseline));
+        let got = texts(initial(&host, &baseline, false));
         assert_eq!(
             got,
             [
@@ -679,8 +694,22 @@ mod tests {
             ),
         ]);
         let baseline = |name: &str| (name == "PATH").then(|| DEFAULT_PATH.into());
-        let got = texts(initial(&host, &baseline));
+        let got = texts(initial(&host, &baseline, false));
         assert_eq!(got, ["PATH=/opt/bin", "FOO=bar=baz", "DISPLAY=:0"]);
+    }
+
+    /// An app gets none of the host's locale variables by default, but one
+    /// named in `ROSEMARY_ENVIRON` is still copied.
+    #[test]
+    fn an_app_gets_only_the_locale_it_asks_for() {
+        let host = host(&[
+            ("TERM", "xterm-256color"),
+            ("LANG", "de_DE.UTF-8"),
+            ("LC_CTYPE", "en_US.UTF-8"),
+            (ENVIRON_VAR, "LANG"),
+        ]);
+        let got = texts(initial(&host, &|_| None, true));
+        assert_eq!(got, ["TERM=xterm-256color", "LANG=de_DE.UTF-8"]);
     }
 
     /// Nothing crosses by default, a `*` pattern is a prefix, and a hand-off

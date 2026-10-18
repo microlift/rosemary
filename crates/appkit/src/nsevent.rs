@@ -38,7 +38,8 @@ struct Event {
     /// and the window that made it outlives that.
     window: Id,
     /// `-characters`, kept as an object so `-length` and `-characterAtIndex:`
-    /// answer without this module knowing what a string is.
+    /// answer without this module knowing what a string is. Owned: a key event
+    /// can sit in the application's queue past the pool it was made in.
     characters: Id,
     key_code: u16,
     button: i64,
@@ -50,6 +51,10 @@ struct Event {
     /// `-trackingArea`, unretained like `window`: the view that holds the area
     /// outlives the dispatch the event is made for.
     tracking_area: Id,
+    /// For a host key down, the text the host resolved for it, owned and
+    /// taken once by whichever responder interprets the key. See
+    /// [`take_text`].
+    text: Id,
 }
 
 pub const INSTANCE_SIZE: usize = size_of::<Event>();
@@ -227,7 +232,7 @@ pub fn make(fields: Fields) -> Id {
         (*event).location = fields.location;
         (*event).delta = fields.delta;
         (*event).window = fields.window;
-        (*event).characters = fields.characters;
+        (*event).characters = objc::arc::retain(fields.characters);
         (*event).key_code = fields.key_code;
         (*event).button = fields.button;
         (*event).clicks = fields.clicks;
@@ -236,8 +241,54 @@ pub fn make(fields: Fields) -> Id {
         (*event).data1 = fields.data1;
         (*event).data2 = fields.data2;
         (*event).tracking_area = fields.tracking_area;
+        (*event).text = std::ptr::null_mut();
     }
     objc::arc::autorelease(event as Id)
+}
+
+/// `-dealloc`: the strings are the event's own.
+unsafe extern "C" fn dealloc(receiver: Id, _sel: Sel) {
+    let event = receiver as *mut Event;
+    // SAFETY: `-dealloc` is sent once, to an event of this module's layout,
+    // with the last reference gone.
+    unsafe {
+        objc::arc::release((*event).characters);
+        objc::arc::release((*event).text);
+    }
+    objc::arc::finalize(receiver);
+}
+
+/// Attach the text the host resolved for a key down to its event.
+pub(crate) fn attach_text(event: Id, text: &str) {
+    // SAFETY: null or a live object this runtime allocated.
+    if unsafe { event_of(event) }.is_none() || text.is_empty() {
+        return;
+    }
+    let event = event as *mut Event;
+    // SAFETY: an event of this module's layout, checked above.
+    unsafe {
+        objc::arc::release((*event).text);
+        (*event).text = foundation::string::from_str(text);
+    }
+}
+
+/// Take the text attached to a key down, once.
+///
+/// Once because AppKit commits a keystroke's text to one input client: a
+/// second `-interpretKeyEvents:` with the same event must not type it again.
+pub(crate) fn take_text(event: Id) -> Option<String> {
+    // SAFETY: null or a live object this runtime allocated.
+    unsafe { event_of(event) }?;
+    let event = event as *mut Event;
+    // SAFETY: an event of this module's layout, checked above.
+    let text = unsafe { std::mem::replace(&mut (*event).text, std::ptr::null_mut()) };
+    if text.is_null() {
+        return None;
+    }
+    // SAFETY: an `NSString` `attach_text` made.
+    let value = String::from_utf8_lossy(&unsafe { foundation::string::bytes(text) }).into_owned();
+    objc::arc::release(text);
+    Some(value)
 }
 
 /// An event's type, for the window's own routing.
@@ -457,6 +508,7 @@ pub(crate) fn install() {
         "deltaZ" => zero_double, c"d16@0:8";
         "timestamp" => timestamp, c"d16@0:8";
         "copyWithZone:" => copy_with_zone, c"@24@0:8^v16";
+        "dealloc" => dealloc, c"v16@0:8";
     });
 }
 
@@ -483,6 +535,20 @@ mod tests {
                 NSPoint { x: 3.0, y: 4.0 }
             );
         }
+    }
+
+    /// A key down's host text is typed once, by whichever responder takes it
+    /// first, however many times the event is interpreted.
+    #[test]
+    fn a_key_downs_text_is_taken_once() {
+        crate::bootstrap();
+        let event = make(Fields {
+            kind: kind::KEY_DOWN,
+            ..Fields::default()
+        });
+        attach_text(event, "a");
+        assert_eq!(take_text(event).as_deref(), Some("a"));
+        assert_eq!(take_text(event), None);
     }
 
     /// An event is immutable, so its copy is itself with one more owner.

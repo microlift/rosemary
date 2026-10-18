@@ -1759,6 +1759,47 @@ unsafe extern "C" fn clear_current_context(_class: Id, _sel: Sel) {
     }
 }
 
+/// Whether `format` asked for a back buffer. A format this crate did not make,
+/// or one with no list, is the single-buffered default.
+fn double_buffered(format: Id) -> bool {
+    // SAFETY: a pixel format this crate made; the pointer is its own.
+    let Some(list) = (!format.is_null())
+        .then(|| unsafe { format_of(format).attributes.as_ref() })
+        .flatten()
+    else {
+        return false;
+    };
+    let mut i = 0;
+    while let Some(&name) = list.get(i) {
+        if name == 0 {
+            break;
+        }
+        if matches!(name, attribute::DOUBLE_BUFFER | attribute::TRIPLE_BUFFER) {
+            return true;
+        }
+        i += 1 + attribute::takes_value(name).unwrap_or(false) as usize;
+    }
+    false
+}
+
+/// `glFlush` and `glFinish` on a single-buffered context: present.
+///
+/// On a Mac a single-buffered context draws to the window itself, so a flush
+/// is what puts a frame on the screen and such a program never sends
+/// `-flushBuffer`. Here every window surface has a back buffer, and on Wayland
+/// one that is never swapped is never even mapped.
+///
+/// FIXME (ACCURACY): the back buffer is undefined after the swap, so a program
+/// that adds to its previous frame rather than redrawing it loses that frame.
+pub fn present_single_buffered() {
+    let receiver = CURRENT.get();
+    if receiver.is_null() || double_buffered(context_of(receiver).format) {
+        return;
+    }
+    // SAFETY: the current context, a context of this crate's.
+    unsafe { flush_buffer(receiver, objc::sel::register(c"flushBuffer")) };
+}
+
 /// `-flushBuffer`: the swap that puts a frame on the screen.
 unsafe extern "C" fn flush_buffer(receiver: Id, _sel: Sel) {
     let window = drawable(context_of(receiver));
@@ -2435,6 +2476,22 @@ mod tests {
                 attributes.as_ptr(),
             )
         }
+    }
+
+    #[test]
+    fn only_a_format_with_a_back_buffer_is_double_buffered() {
+        crate::bootstrap();
+        assert!(!double_buffered(std::ptr::null_mut()));
+        assert!(!double_buffered(new_format(&[0])));
+        // A depth of 5 is a value, not `NSOpenGLPFADoubleBuffer`.
+        assert!(!double_buffered(new_format(&[attribute::DEPTH_SIZE, 5, 0])));
+        assert!(double_buffered(new_format(&[
+            attribute::DEPTH_SIZE,
+            16,
+            attribute::DOUBLE_BUFFER,
+            0
+        ])));
+        assert!(double_buffered(new_format(&[attribute::TRIPLE_BUFFER, 0])));
     }
 
     fn new_view(format: Id) -> Id {

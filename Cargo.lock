@@ -602,6 +602,7 @@ dependencies = [
  "objc",
  "prefix",
  "sdl3",
+ "starnix",
  "static_init",
 ]
 
@@ -1759,6 +1760,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "743fb55ba31b18fb1ecef6bdc9aa2743314978ac084044301a7eee33fb99a20d"
 
 [[package]]
+name = "network"
+version = "0.3.0"
+dependencies = [
+ "corefoundation",
+ "darwin",
+ "exports",
+ "objc",
+ "starnix",
+]
+
+[[package]]
 name = "num-conv"
 version = "0.2.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2244,6 +2256,7 @@ dependencies = [
  "metal",
  "microlift",
  "mimalloc",
+ "network",
  "objc",
  "opencl",
  "prefix",

@@ -20,6 +20,11 @@ pub use macos::*;
 #[cfg(any(target_os = "freebsd", target_os = "macos"))]
 mod sysctl;
 
+#[cfg(any(target_os = "freebsd", target_os = "macos"))]
+mod ifmedia;
+#[cfg(any(target_os = "freebsd", target_os = "macos"))]
+pub use ifmedia::link_medium;
+
 #[cfg(target_os = "linux")]
 mod procmap;
 

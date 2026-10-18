@@ -21,6 +21,8 @@ const DIRECTORIES: &[&str] = &[
     "/private",
     "/private/tmp",
     "/private/var",
+    // Darwin's `P_tmpdir`, which `mkstemp` templates are commonly built from.
+    "/private/var/tmp",
     // Root's home, which `su -` and `sudo -i` change into.
     "/private/var/root",
     "/Volumes",
@@ -136,11 +138,15 @@ pub fn create(directory: &Path) -> std::io::Result<bool> {
     if created(directory) {
         return Ok(false);
     }
+    // Two processes started together on a fresh prefix would otherwise both
+    // make its symlinks, and the second fails with EEXIST.
+    let _lock = crate::repair::lock(&Prefix::at(directory))?;
+    if created(directory) {
+        return Ok(false);
+    }
     let drive = directory.join(DRIVE);
     let user = user_name();
-    for path in DIRECTORIES {
-        std::fs::create_dir_all(drive.join(path.trim_start_matches('/')))?;
-    }
+    fill_in(directory)?;
     for (path, target) in SYMLINKS {
         // `original` should not be absolute because that would make the prefix unmovable from folder to folder
         std::os::unix::fs::symlink(target, drive.join(path.trim_start_matches('/')))?;
@@ -156,6 +162,18 @@ pub fn create(directory: &Path) -> std::io::Result<bool> {
     // half-made is not one this will later mistake for finished.
     std::fs::write(state_path(directory), state_file())?;
     Ok(true)
+}
+
+/// Make any prefix-owned directory a prefix created by an older runtime lacks.
+///
+/// Only directories: they are cheap to check on every start, and a guest that
+/// finds one missing fails in ways nothing traces back to the layout.
+pub fn fill_in(directory: &Path) -> std::io::Result<()> {
+    let drive = directory.join(DRIVE);
+    for path in DIRECTORIES {
+        std::fs::create_dir_all(drive.join(path.trim_start_matches('/')))?;
+    }
+    Ok(())
 }
 
 /// The contents of a new `state.yaml`.
@@ -287,7 +305,13 @@ mod tests {
         assert!(create(&at).expect("a prefix is made"));
         assert!(created(&at), "the state file says so");
         let drive = at.join(DRIVE);
-        for relative in ["Applications", "System/Library", "usr/lib", "private/tmp"] {
+        for relative in [
+            "Applications",
+            "System/Library",
+            "usr/lib",
+            "private/tmp",
+            "private/var/tmp",
+        ] {
             assert!(drive.join(relative).is_dir(), "{relative} is missing");
         }
         assert!(
@@ -301,6 +325,20 @@ mod tests {
         assert!(!create(&at).expect("the second call is a no-op"));
 
         let _ = std::fs::remove_dir_all(&at);
+    }
+
+    /// A prefix made before `/private/var/tmp` was part of the layout gains it
+    /// on the next start, through the `/var` symlink a guest names it by.
+    #[test]
+    fn an_older_prefix_gains_missing_layout_directories() {
+        let at = crate::verify::tests::scratch("layout-fill-in");
+        create(&at).unwrap();
+        let var_tmp = at.join(DRIVE).join("private/var/tmp");
+        std::fs::remove_dir(&var_tmp).unwrap();
+
+        fill_in(&at).unwrap();
+        assert!(var_tmp.is_dir());
+        assert!(at.join(DRIVE).join("var/tmp").is_dir());
     }
 
     #[test]

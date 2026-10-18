@@ -80,6 +80,10 @@ pub fn peer(fd: RawFd) -> Option<Peer> {
     (rc == 0).then_some(Peer { pid: None, uid })
 }
 
+pub fn in_use(_pid: i32) -> Option<crate::process::InUse> {
+    None
+}
+
 pub fn fd_path(_fd: RawFd) -> Option<PathBuf> {
     None
 }
@@ -124,4 +128,8 @@ pub fn xattr_remove_path(_: &std::ffi::CStr, _: &std::ffi::CStr, _: bool) -> io:
 
 pub fn xattr_is_missing(_: &io::Error) -> bool {
     false
+}
+
+pub fn link_medium(_name: &std::ffi::CStr) -> Option<crate::net::Link> {
+    None
 }

@@ -93,6 +93,33 @@ pub unsafe extern "C" fn CGRectEqualToRect(a: NSRect, b: NSRect) -> u8 {
     u8::from(standardized(a) == standardized(b))
 }
 
+#[allow(non_snake_case)]
+pub unsafe extern "C" fn NSIsEmptyRect(rect: NSRect) -> u8 {
+    u8::from(rect.size.width <= 0.0 || rect.size.height <= 0.0)
+}
+
+#[allow(non_snake_case)]
+pub unsafe extern "C" fn NSUnionRect(a: NSRect, b: NSRect) -> NSRect {
+    match unsafe { (NSIsEmptyRect(a) != 0, NSIsEmptyRect(b) != 0) } {
+        (true, true) => NSRect::default(),
+        (true, false) => b,
+        (false, true) => a,
+        (false, false) => {
+            let x = a.origin.x.min(b.origin.x);
+            let y = a.origin.y.min(b.origin.y);
+            let right = (a.origin.x + a.size.width).max(b.origin.x + b.size.width);
+            let top = (a.origin.y + a.size.height).max(b.origin.y + b.size.height);
+            NSRect {
+                origin: NSPoint { x, y },
+                size: NSSize {
+                    width: right - x,
+                    height: top - y,
+                },
+            }
+        }
+    }
+}
+
 /// `BOOL NSPointInRect(NSPoint, NSRect)`.
 #[allow(non_snake_case)]
 pub unsafe extern "C" fn NSPointInRect(point: NSPoint, rect: NSRect) -> u8 {

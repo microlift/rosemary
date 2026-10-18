@@ -29,6 +29,7 @@ security.workspace = true
 gamecontroller.workspace = true
 webkit.workspace = true
 forcefeedback.workspace = true
+network.workspace = true
 opencl.workspace = true
 metal.workspace = true
 gimli.workspace = true

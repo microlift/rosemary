@@ -106,6 +106,17 @@ pub fn block_data() -> Vec<(String, u64)> {
     }
 }
 
+/// Let a send through a `_fixup` entry point name the guest `objc_class` at
+/// `guest` and reach the registered class `class` instead.
+///
+/// Nothing to do under `native`, whose libobjc realizes the guest's own
+/// structure in place.
+pub fn alias_class(guest: u64, class: u64) {
+    if backend() == Backend::Builtin {
+        builtin::msg::alias_class(guest as usize, class as usize as *const std::ffi::c_void);
+    }
+}
+
 /// Stop the *host's* class objects reaching a runtime that is not the host's.
 ///
 /// A guest's `Cat : NSString` binds `_OBJC_CLASS_$_NSString` as data and hands

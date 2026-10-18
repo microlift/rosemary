@@ -156,6 +156,11 @@ unsafe extern "C" fn later_date(receiver: Id, _sel: Sel, other: Id) -> Id {
     }
 }
 
+/// `+[NSDate timeIntervalSinceReferenceDate]`: the current time, no object.
+unsafe extern "C" fn class_time_interval_since_reference(_class: Id, _sel: Sel) -> f64 {
+    now()
+}
+
 unsafe extern "C" fn time_interval_since_reference(receiver: Id, _sel: Sel) -> f64 {
     date_of(receiver)
 }
@@ -503,6 +508,7 @@ pub(crate) fn install() {
         "dateWithTimeIntervalSince1970:" => date_with_interval_since_1970, c"@24@0:8d16";
         "dateWithTimeIntervalSinceReferenceDate:" => date_with_interval_since_reference,
             c"@24@0:8d16";
+        "timeIntervalSinceReferenceDate" => class_time_interval_since_reference, c"d16@0:8";
     });
     methods!(date_class, {
         "timeIntervalSinceReferenceDate" => time_interval_since_reference, c"d16@0:8";

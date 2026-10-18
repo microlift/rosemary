@@ -115,13 +115,14 @@ pub fn bootstrap() {
         tab::install();
         table::install();
         view_animation::install();
-        // Last of the controls: a cell forwards what its control implements.
-        cell::install();
         bezier::install();
         layer::install();
         coreanimation::install();
         text::install();
         label::install();
+        // Last of the controls (text fields and labels included): a cell
+        // forwards what its control implements.
+        cell::install();
         input_context::install();
         opengl::install();
         darwin::idle::on_idle(opengl::going_idle);
@@ -234,6 +235,8 @@ exports::exports! {
         "CGRectGetMidY" => geometry::CGRectGetMidY,
         "CGRectGetMaxY" => geometry::CGRectGetMaxY,
         "NSPointInRect" => geometry::NSPointInRect,
+        "NSIsEmptyRect" => geometry::NSIsEmptyRect,
+        "NSUnionRect" => geometry::NSUnionRect,
         "NSMouseInRect" => geometry::NSMouseInRect,
         "NSInsetRect" => geometry::NSInsetRect,
         "NSRectFill" => color::NSRectFill,

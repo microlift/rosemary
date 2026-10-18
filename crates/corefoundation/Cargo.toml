@@ -8,6 +8,7 @@ license.workspace = true
 [dependencies]
 exports.workspace = true
 darwin.workspace = true
+starnix.workspace = true
 objc.workspace = true
 prefix.workspace = true
 libc.workspace = true

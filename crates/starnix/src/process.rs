@@ -211,9 +211,96 @@ pub fn audit() -> Audit {
     sys::audit()
 }
 
+/// A file by the host's device and inode for it, as `stat` gives them.
+pub type FileId = (u64, u64);
+
+/// The files a process is using, as `proc_listpidspath` looks for them.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct InUse {
+    /// Its working directory and its root directory, sorted and deduplicated.
+    pub directories: Vec<FileId>,
+    /// What its descriptors have open, other than sockets, pipes and the
+    /// host's event objects. Sorted and deduplicated.
+    pub open: Vec<FileId>,
+    /// What it has mapped from files, sorted and deduplicated.
+    pub mapped: Vec<FileId>,
+}
+
+/// The files `pid` is using, or `None` for a process the host does not show
+/// this one. Where the host shows only this process's own, its mappings are
+/// left out.
+pub fn in_use(pid: i32) -> Option<InUse> {
+    sys::in_use(pid).or_else(|| (pid == me()).then(own_in_use))
+}
+
+/// What a host that does not show other processes' files can still tell about
+/// this one's.
+fn own_in_use() -> InUse {
+    use std::os::unix::fs::MetadataExt;
+    let id = |meta: std::fs::Metadata| (meta.dev(), meta.ino());
+    let directories = [".", "/"]
+        .iter()
+        .filter_map(|path| std::fs::metadata(path).ok().map(id))
+        .collect();
+    let open = descriptors()
+        .unwrap_or_default()
+        .iter()
+        .filter(|entry| entry.kind == DescriptorKind::File)
+        .filter_map(|entry| {
+            // SAFETY: a zeroed `struct stat` is what the host is asked to fill.
+            let mut st: libc::stat = unsafe { std::mem::zeroed() };
+            // SAFETY: `st` is a live local; a closed descriptor is refused.
+            (unsafe { libc::fstat(entry.fd, &mut st) } == 0)
+                .then_some((st.st_dev as u64, st.st_ino as u64))
+        })
+        .collect();
+    let mut used = InUse {
+        directories,
+        open,
+        mapped: Vec::new(),
+    };
+    for files in [&mut used.directories, &mut used.open] {
+        files.sort_unstable();
+        files.dedup();
+    }
+    used
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// What `proc_listpidspath` looks for: the working directory, an open
+    /// file, and on Linux the executable this test runs from.
+    #[test]
+    fn a_process_shows_the_files_it_is_using() {
+        use std::os::unix::fs::MetadataExt;
+        let id = |path: &std::path::Path| {
+            let meta = std::fs::metadata(path).unwrap();
+            (meta.dev(), meta.ino())
+        };
+        let path = std::env::temp_dir().join(format!("starnix-in-use-{}", std::process::id()));
+        let file = std::fs::File::create(&path).unwrap();
+        let _cleanup = Cleanup(path.clone());
+        let used = in_use(me()).unwrap();
+        assert!(
+            used.directories
+                .contains(&id(&std::env::current_dir().unwrap()))
+        );
+        assert!(used.open.contains(&id(&path)));
+        #[cfg(target_os = "linux")]
+        assert!(used.mapped.contains(&id(&std::env::current_exe().unwrap())));
+        drop(file);
+    }
+
+    /// Removes the file even when an assertion fails first.
+    struct Cleanup(std::path::PathBuf);
+
+    impl Drop for Cleanup {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+        }
+    }
 
     #[test]
     fn this_process_is_alive_under_its_own_identity() {

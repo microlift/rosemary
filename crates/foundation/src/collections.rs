@@ -13,15 +13,6 @@ struct Predicate {
     block: usize,
 }
 
-unsafe fn block_invoke(block: Id) -> Option<usize> {
-    if block.is_null() {
-        return None;
-    }
-    // SAFETY: `invoke` is the third word of every Objective-C block literal.
-    let invoke = unsafe { *((block as *const u8).add(16) as *const usize) };
-    (invoke != 0).then_some(invoke)
-}
-
 /// Report a mutation of a collection that was not created mutable.
 ///
 /// A named abort rather than a wrong answer: an `NSArray` that silently accepted
@@ -130,7 +121,7 @@ unsafe extern "C" fn index_of_object_with_options_passing_test(
         return NOT_FOUND;
     };
     // SAFETY: null or a block.
-    let Some(invoke) = (unsafe { block_invoke(block) }) else {
+    let Some(invoke) = (unsafe { objc::block::invoke(block) }) else {
         return NOT_FOUND;
     };
     // SAFETY: the block is `BOOL (^)(id, NSUInteger, BOOL *)`.
@@ -166,7 +157,7 @@ unsafe extern "C" fn filtered_array_using_predicate(receiver: Id, _sel: Sel, pre
     // SAFETY: `predicateWithBlock:` creates this layout.
     let block = unsafe { (*(predicate as *const Predicate)).block as Id };
     let mut values = Vec::new();
-    if let Some(invoke) = unsafe { block_invoke(block) } {
+    if let Some(invoke) = unsafe { objc::block::invoke(block) } {
         // `NSPredicate` block predicates receive the object and a bindings
         // dictionary. There are no substitution variables in this operation.
         let call: unsafe extern "C" fn(Id, Id, Id) -> bool = unsafe { std::mem::transmute(invoke) };
@@ -517,7 +508,7 @@ unsafe extern "C" fn sorted_array_using_comparator(receiver: Id, _sel: Sel, bloc
         return std::ptr::null_mut();
     };
     // SAFETY: null or a block.
-    let Some(invoke) = (unsafe { block_invoke(block) }) else {
+    let Some(invoke) = (unsafe { objc::block::invoke(block) }) else {
         return std::ptr::null_mut();
     };
     // SAFETY: the block is `NSComparisonResult (^)(id, id)`.

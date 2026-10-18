@@ -410,16 +410,18 @@ fn key(window: u32, scancode: u32, character: u32, modifiers: u16) {
         down,
         repeat: false,
     };
-    crate::event::deliver(event(true));
     // SDL places a committed text event between the physical press and
-    // release. Keep scripted typing on the same path as a real keyboard,
-    // which commits no text for a Control or Command chord.
+    // release, and the pump carries it on the key down. Keep scripted typing
+    // on the same path as a real keyboard, which commits no text for a
+    // Control or Command chord.
     let chord = modifiers & (0x0040 | 0x0080 | 0x0400 | 0x0800) != 0;
-    if let Some(text) = char::from_u32(character).filter(|c| !c.is_control() && !chord) {
-        crate::event::deliver(Event::Text {
-            window,
-            text: text.to_string(),
-        });
+    let text = char::from_u32(character)
+        .filter(|c| !c.is_control() && !chord)
+        .map(String::from);
+    // A key a dialog took never became an event, and the dialog reads text
+    // from its own events.
+    if let Some(text) = crate::event::deliver_typed_key(event(true), text) {
+        crate::event::deliver(Event::Text { window, text });
     }
     crate::event::deliver(event(false));
 }

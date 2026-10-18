@@ -12,11 +12,10 @@ const SET_RENDER_CALLBACK: u32 = 23;
 const SET_INPUT_CALLBACK: u32 = 22;
 /// `kAudioOutputUnitProperty_SetInputCallback`, which despite the similar name
 /// is the *record* callback: the unit calls it when it has captured audio, and
-/// it answers by calling `AudioUnitRender` on the input bus. Refused, because
-/// this HAL has no capture device - installing it as the render callback would
-/// have the playback stream pulling a function that expects to be handed
-/// recorded frames.
+/// it answers by calling `AudioUnitRender` on the input bus.
 const OUTPUT_SET_INPUT_CALLBACK: u32 = 2005;
+/// `kAudioOutputUnitProperty_HasIO`.
+const HAS_IO: u32 = 2006;
 /// `kAudioUnitProperty_ElementCount`: how many input buses a mixer has.
 const ELEMENT_COUNT: u32 = 11;
 /// The 3D mixer's own properties, which pick a spatialisation algorithm and
@@ -197,6 +196,13 @@ fn format_of(unit: &crate::Unit, scope: u32, element: u32) -> Format {
             .get(element as usize)
             .map_or_else(Format::default, |input| input.format),
         (crate::Kind::Converter, scope::INPUT) => unit.input_format,
+        // Element 1 records: its input scope is the device's side.
+        (crate::Kind::Output, scope::INPUT) if element == crate::capture::ELEMENT => {
+            crate::hal::input_format().unwrap_or_default()
+        }
+        (crate::Kind::Output, scope::OUTPUT) if element == crate::capture::ELEMENT => {
+            crate::capture::format(unit)
+        }
         _ => unit.format,
     }
 }
@@ -277,6 +283,36 @@ unsafe fn set(
             SUCCESS,
         );
         return SUCCESS;
+    }
+    if unit.kind == crate::Kind::Output && element == crate::capture::ELEMENT {
+        match id {
+            STREAM_FORMAT => {
+                if (size as usize) < size_of::<Format>() {
+                    return INVALID_PROPERTY_VALUE;
+                }
+                let format = unsafe { *(data as *const Format) };
+                return match scope {
+                    scope::OUTPUT => {
+                        if crate::stream::sdl_spec(&format).is_none() {
+                            return FORMAT_NOT_SUPPORTED;
+                        }
+                        if !unit.capture.is_null() {
+                            return CANNOT_DO_IN_CURRENT_CONTEXT;
+                        }
+                        unit.capture_format = Some(format);
+                        SUCCESS
+                    }
+                    // The device's own format can be set back, not changed.
+                    scope::INPUT => match crate::hal::input_format() == Some(format) {
+                        true => SUCCESS,
+                        false => FORMAT_NOT_SUPPORTED,
+                    },
+                    _ => INVALID_SCOPE,
+                };
+            }
+            MAXIMUM_FRAMES_PER_SLICE => return SUCCESS,
+            _ => {}
+        }
     }
     match id {
         ELEMENT_COUNT if unit.kind == crate::Kind::Mixer => {
@@ -361,32 +397,51 @@ unsafe fn set(
                 return INVALID_PROPERTY_VALUE;
             }
             let enabled = unsafe { *(data as *const u32) } != 0;
+            if !unit.stream.is_null() || !unit.capture.is_null() {
+                return CANNOT_DO_IN_CURRENT_CONTEXT;
+            }
             match scope {
-                // This unit is an output, and disabling that leaves a program
-                // rendering into a unit that will never pull it.
-                scope::OUTPUT => match enabled {
-                    true => SUCCESS,
-                    false => INVALID_PROPERTY_VALUE,
-                },
-                // There is no capture device behind this HAL, so enabling
-                // input is refused here rather than at the first empty buffer.
-                scope::INPUT => match enabled {
+                scope::OUTPUT => {
+                    unit.playback = enabled;
+                    SUCCESS
+                }
+                // Refused here when there is nothing to record from, where the
+                // program still checks.
+                scope::INPUT => match enabled && !crate::hal::has_input() {
                     true => INVALID_PROPERTY_VALUE,
-                    false => SUCCESS,
+                    false => {
+                        unit.recording = enabled;
+                        SUCCESS
+                    }
                 },
                 _ => INVALID_SCOPE,
             }
         }
-        // As `ENABLE_IO` on the input scope: there is nothing to record from,
-        // and this is where a program still checks.
-        OUTPUT_SET_INPUT_CALLBACK => INVALID_PROPERTY,
+        OUTPUT_SET_INPUT_CALLBACK => {
+            if (size as usize) < size_of::<[usize; 2]>() {
+                return INVALID_PROPERTY_VALUE;
+            }
+            // SAFETY: as for the render callback.
+            let raw = unsafe { *(data as *const [*mut c_void; 2]) };
+            unit.input_callback = (!raw[0].is_null()).then(|| Callback {
+                // SAFETY: as for the render callback.
+                proc: unsafe { std::mem::transmute::<*mut c_void, Proc>(raw[0]) },
+                ref_con: raw[1],
+            });
+            SUCCESS
+        }
         CURRENT_DEVICE => {
             if size < 4 {
                 return INVALID_PROPERTY_VALUE;
             }
             let device = unsafe { *(data as *const u32) };
-            match device == crate::hal::OUTPUT_DEVICE {
-                true => SUCCESS,
+            let known = device == crate::hal::OUTPUT_DEVICE
+                || (device == crate::hal::INPUT_DEVICE && crate::hal::has_input());
+            match known {
+                true => {
+                    unit.device = device;
+                    SUCCESS
+                }
                 false => INVALID_PROPERTY_VALUE,
             }
         }
@@ -474,12 +529,14 @@ pub unsafe extern "C" fn AudioUnitGetProperty(
             unsafe { *(out as *mut u32) = MAXIMUM_FRAMES };
             SUCCESS
         }
-        // Read back so that a program can confirm what it set: this unit is an
-        // output on the one device below it, whatever scope is asked about.
-        ENABLE_IO | CURRENT_DEVICE => {
-            let value = match id {
-                CURRENT_DEVICE => crate::hal::OUTPUT_DEVICE,
-                _ => u32::from(scope == scope::OUTPUT),
+        // Read back so that a program can confirm what it set.
+        ENABLE_IO | CURRENT_DEVICE | HAS_IO => {
+            let value = match (id, scope) {
+                (CURRENT_DEVICE, _) => unit.device,
+                (ENABLE_IO, scope::INPUT) => u32::from(unit.recording),
+                (ENABLE_IO, _) => u32::from(unit.playback),
+                (_, scope::INPUT) => u32::from(crate::hal::has_input()),
+                _ => 1,
             };
             unsafe { *size = 4 };
             if out.is_null() {
@@ -606,11 +663,18 @@ mod tests {
         };
         assert_eq!(word(1, ENABLE_IO, scope::OUTPUT), SUCCESS);
         assert_eq!(word(0, ENABLE_IO, scope::INPUT), SUCCESS);
-        assert_eq!(word(1, ENABLE_IO, scope::INPUT), INVALID_PROPERTY_VALUE);
-        assert_eq!(word(0, ENABLE_IO, scope::OUTPUT), INVALID_PROPERTY_VALUE);
+        let input = match crate::hal::has_input() {
+            true => SUCCESS,
+            false => INVALID_PROPERTY_VALUE,
+        };
+        assert_eq!(word(1, ENABLE_IO, scope::INPUT), input);
+        assert_eq!(word(0, ENABLE_IO, scope::INPUT), SUCCESS);
+        assert_eq!(word(0, ENABLE_IO, scope::OUTPUT), SUCCESS);
+        assert_eq!(word(1, ENABLE_IO, scope::OUTPUT), SUCCESS);
         assert_eq!(word(0, ENABLE_IO, 0), INVALID_SCOPE);
 
         assert_eq!(word(crate::hal::OUTPUT_DEVICE, CURRENT_DEVICE, 0), SUCCESS);
+        assert_eq!(word(crate::hal::INPUT_DEVICE, CURRENT_DEVICE, 0), input);
         assert_eq!(word(99, CURRENT_DEVICE, 0), INVALID_PROPERTY_VALUE);
 
         // `kAudioChannelLayoutTag_Stereo`, against the default format's two

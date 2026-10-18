@@ -560,38 +560,25 @@ unsafe fn store_int(at: *mut c_void, length: Length, value: i64) {
     }
 }
 
-/// Store a `long double`, which is the host's: the guest runs natively, so
-/// it shares this architecture's.
+/// Parse and store a `long double`, which is the host's: the guest runs
+/// natively, so it shares this architecture's.
 ///
 /// # Safety
 ///
-/// `at` is writable for a `long double`.
-unsafe fn store_long_double(at: *mut u8, value: f64) {
+/// `text` is NUL-terminated and `at` is writable for a `long double`.
+unsafe fn store_long_double(at: *mut u8, text: *const c_char) {
     if cfg!(target_arch = "x86_64") {
-        // FIXME (ACCURACY): parsed at double precision and widened to the x87
-        // format exactly, so digits past a double's are lost.
-        let bits = value.to_bits();
-        let sign = (bits >> 63) as u16;
-        let exponent = ((bits >> 52) & 0x7ff) as u16;
-        let fraction = bits & ((1 << 52) - 1);
-        let (exp80, mantissa) = match exponent {
-            0 if fraction == 0 => (0, 0),
-            0 => {
-                // Subnormal: normalize into the wider exponent range.
-                let shift = fraction.leading_zeros() - 11;
-                (15361 - shift as u16, (fraction << (shift + 11)) | (1 << 63))
-            }
-            0x7ff => (0x7fff, (1 << 63) | (fraction << 11)),
-            e => (e - 1023 + 16383, (1 << 63) | (fraction << 11)),
-        };
-        let mut out = [0u8; 10];
-        out[..8].copy_from_slice(&mantissa.to_le_bytes());
-        out[8..].copy_from_slice(&(exp80 | (sign << 15)).to_le_bytes());
-        // SAFETY: the caller's obligation; an x87 value is ten bytes.
-        unsafe { std::ptr::copy_nonoverlapping(out.as_ptr(), at, 10) };
+        // SAFETY: the caller's string; an x87 value is ten bytes.
+        unsafe {
+            let value = crate::strtofp::strtold_x87(text, std::ptr::null_mut());
+            std::ptr::copy_nonoverlapping(value.as_ptr(), at, value.len());
+        }
     } else {
         // SAFETY: the caller's obligation; `long double` is `double` here.
-        unsafe { at.cast::<f64>().write_unaligned(value) };
+        unsafe {
+            at.cast::<f64>()
+                .write_unaligned(crate::strtofp::strtod(text, std::ptr::null_mut()))
+        };
     }
 }
 
@@ -718,15 +705,16 @@ unsafe fn scan(fp: *mut File, format: *const c_char, next: Destinations) -> c_in
                 if !suppress {
                     let text = field.as_ptr().cast::<c_char>();
                     let at = next();
-                    // SAFETY: a NUL-terminated number, stored at the width
-                    // `length` names unless the destination is null.
+                    // SAFETY: a NUL-terminated number, parsed at the width
+                    // `length` names and stored unless the destination is null.
                     unsafe {
-                        let value = libc::strtod(text, std::ptr::null_mut());
+                        use crate::strtofp::{strtod, strtof};
+                        let end = std::ptr::null_mut();
                         match length {
-                            _ if at.is_null() => {}
-                            Length::LongDouble => store_long_double(at.cast(), value),
-                            Length::Long => *at.cast::<f64>() = value,
-                            _ => *at.cast::<f32>() = libc::strtof(text, std::ptr::null_mut()),
+                            _ if at.is_null() => _ = strtod(text, end),
+                            Length::LongDouble => store_long_double(at.cast(), text),
+                            Length::Long => *at.cast::<f64>() = strtod(text, end),
+                            _ => *at.cast::<f32>() = strtof(text, end),
                         }
                     }
                     assigned += 1;

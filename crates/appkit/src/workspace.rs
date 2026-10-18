@@ -79,6 +79,26 @@ unsafe extern "C" fn open_url(_receiver: Id, _sel: Sel, url: Id) -> u8 {
     u8::from(sdl3::open_url(&target))
 }
 
+unsafe extern "C" fn open_file(_receiver: Id, _sel: Sel, path: Id) -> u8 {
+    if path.is_null() {
+        return 0;
+    }
+    // SAFETY: an `NSString`.
+    let bytes = unsafe { foundation::string::bytes(path) };
+    let Ok(guest) = std::str::from_utf8(&bytes) else {
+        return 0;
+    };
+    let host = prefix::ns::host_path(guest);
+    let url = corefoundation::url::new_file_url(&host.to_string_lossy(), host.is_dir());
+    let text = unsafe { corefoundation::url::as_url(url) }.map(|u| u.text.clone());
+    unsafe { corefoundation::api::CFRelease(url) };
+    text.is_some_and(|text| sdl3::open_url(&text)).into()
+}
+
+unsafe extern "C" fn open_file_with(receiver: Id, sel: Sel, path: Id, _application: Id) -> u8 {
+    unsafe { open_file(receiver, sel, path) }
+}
+
 fn open_target(url: &corefoundation::url::Contents) -> Option<String> {
     if url.scheme().is_empty() {
         return None;
@@ -340,6 +360,32 @@ unsafe extern "C" fn running_applications(_class: Id, _sel: Sel, _identifier: Id
     unsafe { corefoundation::api::CFAutorelease(array) as Id }
 }
 
+unsafe extern "C" fn is_file_package(_receiver: Id, _sel: Sel, path: Id) -> u8 {
+    const PACKAGES: &[&str] = &[
+        "app",
+        "bundle",
+        "framework",
+        "plugin",
+        "kext",
+        "pkg",
+        "rtfd",
+    ];
+    if path.is_null() {
+        return 0;
+    }
+    // SAFETY: an `NSString`.
+    let bytes = unsafe { foundation::string::bytes(path) };
+    let Ok(guest) = std::str::from_utf8(&bytes) else {
+        return 0;
+    };
+    let host = prefix::ns::host_path(guest);
+    let package = host
+        .extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|e| PACKAGES.iter().any(|p| p.eq_ignore_ascii_case(e)));
+    u8::from(package && host.is_dir())
+}
+
 pub(crate) fn install() {
     let class = objc::class::lookup(c"NSWorkspace").expect("declared before its methods");
     class_methods!(class, {
@@ -348,6 +394,8 @@ pub(crate) fn install() {
     methods!(class, {
         "URLForApplicationToOpenURL:" => application_url_for_url, c"@24@0:8@16";
         "openURL:" => open_url, c"c24@0:8@16";
+        "openFile:" => open_file, c"c24@0:8@16";
+        "openFile:withApplication:" => open_file_with, c"c32@0:8@16@24";
         "notificationCenter" => notification_center, c"@16@0:8";
         "frontmostApplication" => frontmost_application, c"@16@0:8";
         "runningApplications" => workspace_running_applications, c"@16@0:8";
@@ -355,6 +403,7 @@ pub(crate) fn install() {
             c"@48@0:8@16Q24@32^@40";
         "iconForFileType:" => icon_for_file_type, c"@24@0:8@16";
         "iconForFile:" => icon_for_file_type, c"@24@0:8@16";
+        "isFilePackageAtPath:" => is_file_package, c"c24@0:8@16";
     });
 
     let running =

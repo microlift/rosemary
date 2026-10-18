@@ -1803,6 +1803,19 @@ unsafe extern "C" fn scroller_width_for_control_size(_class: Id, _sel: Sel, size
     }
 }
 
+unsafe extern "C" fn scroller_width_for_control_size_and_style(
+    class: Id,
+    sel: Sel,
+    size: usize,
+    _style: isize,
+) -> f64 {
+    unsafe { scroller_width_for_control_size(class, sel, size) }
+}
+
+unsafe extern "C" fn preferred_scroller_style(_class: Id, _sel: Sel) -> isize {
+    0
+}
+
 /// `-[NSScroller initWithFrame:]`, which is not the inherited one: a scroller
 /// constrains the frame it is given.
 ///
@@ -1942,6 +1955,30 @@ fn scroller_part(size: NSSize, value: f64, proportion: f64, which: usize) -> NSR
     }
 }
 
+unsafe extern "C" fn control_size_to_fit(receiver: Id, _sel: Sel) {
+    // SAFETY: `-intrinsicContentSize` is `NSSize (id, SEL)` and `-setFrameSize:`
+    // `void (id, SEL, NSSize)`, both on every view.
+    unsafe {
+        let size: unsafe extern "C" fn(Id, Sel) -> NSSize = std::mem::transmute(objc::msg::entry());
+        let size = size(receiver, objc::sel::get("intrinsicContentSize"));
+        if size.width <= 0.0 || size.height <= 0.0 {
+            return;
+        }
+        let set: unsafe extern "C" fn(Id, Sel, NSSize) = std::mem::transmute(objc::msg::entry());
+        set(receiver, objc::sel::get("setFrameSize:"), size);
+    }
+}
+
+unsafe extern "C" fn control_ignored_flag(_receiver: Id, _sel: Sel, _flag: u8) {}
+
+unsafe extern "C" fn control_no(_receiver: Id, _sel: Sel) -> u8 {
+    0
+}
+
+unsafe extern "C" fn control_send_action_on(_receiver: Id, _sel: Sel, _mask: u64) -> i64 {
+    1 << 2
+}
+
 pub(crate) fn install() {
     let class = objc::class::lookup(c"NSStackView").expect("declared before its methods");
     methods!(class, {
@@ -2013,6 +2050,10 @@ pub(crate) fn install() {
         "sendAction:to:" => control_send_action, c"c32@0:8:16@24";
         "setTag:" => control_set_tag, c"v24@0:8q16";
         "tag" => control_tag, c"q16@0:8";
+        "sizeToFit" => control_size_to_fit, c"v16@0:8";
+        "setContinuous:" => control_ignored_flag, c"v20@0:8c16";
+        "isContinuous" => control_no, c"c16@0:8";
+        "sendActionOn:" => control_send_action_on, c"q24@0:8Q16";
     });
 
     let class = objc::class::lookup(c"NSButton").expect("declared before its methods");
@@ -2090,6 +2131,9 @@ pub(crate) fn install() {
     class_methods!(class, {
         "scrollerWidth" => scroller_width, c"d16@0:8";
         "scrollerWidthForControlSize:" => scroller_width_for_control_size, c"d24@0:8Q16";
+        "scrollerWidthForControlSize:scrollerStyle:" => scroller_width_for_control_size_and_style,
+            c"d32@0:8Q16q24";
+        "preferredScrollerStyle" => preferred_scroller_style, c"q16@0:8";
     });
     methods!(class, {
         "initWithFrame:" => scroller_init_with_frame,

@@ -82,8 +82,9 @@ pub(crate) fn install() {
         "dealloc" => pointer_dealloc, c"v16@0:8";
     });
 
+    // A CoreFoundation type, so `CFGetTypeID(kCFNull)` is `CFNullGetTypeID()`.
     let null_class =
-        corefoundation::base::register(c"NSNull", None, std::mem::size_of::<usize>(), false);
+        corefoundation::base::register(c"NSNull", None, std::mem::size_of::<usize>(), true);
     class_methods!(null_class, {
         "null" => null, c"@16@0:8";
     });

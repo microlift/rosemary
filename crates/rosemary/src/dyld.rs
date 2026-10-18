@@ -5,7 +5,8 @@ use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU64, AtomicUsize, Ordering}
 use std::sync::{Mutex, OnceLock};
 
 use crate::cxxlib::Flavor;
-use machish::exports::ExportTable;
+use machish::exports::{ExportTable, ExportValue};
+use machish::image::DependencyKind;
 use machish::image::MachObject;
 use machish::install_name::PathContext;
 use machish::loader::Loader;
@@ -118,8 +119,41 @@ struct LinkedImage {
     /// Parsed from the file on first use, and `None` if it cannot be: the image
     /// is already mapped, so re-reading it is pure cost and only a `dlopen` ever
     /// pays it.
-    exports: OnceLock<Option<ExportTable>>,
+    parsed: OnceLock<Option<LinkedExports>>,
 }
+
+/// What a [`LinkedImage`] offers a binder: its own trie and the edges it
+/// forwards through.
+struct LinkedExports {
+    exports: ExportTable,
+    /// Install names in ordinal order, which a trie re-export's ordinal indexes.
+    dependencies: Vec<String>,
+    /// The `LC_REEXPORT_DYLIB` subset of `dependencies`, whose tries this image
+    /// publishes without copying a single entry into its own.
+    reexports: Vec<String>,
+}
+
+impl LinkedExports {
+    fn parse<S: MachSpec>(bytes: &[u8], spec: S) -> Option<Self> {
+        let obj = MachObject::parse_any(bytes, spec).ok()?;
+        let names = |reexport_only: bool| {
+            obj.dependencies()
+                .iter()
+                .filter(|d| !reexport_only || d.kind == DependencyKind::Reexport)
+                .map(|d| d.install_name.to_string())
+                .collect()
+        };
+        Some(LinkedExports {
+            exports: ExportTable::parse(&obj).ok()?,
+            dependencies: names(false),
+            reexports: names(true),
+        })
+    }
+}
+
+/// Deepest chain of re-exports followed before giving up, which only a cycle
+/// reaches; machish's own namespace uses the same bound.
+const MAX_REEXPORT_DEPTH: usize = 16;
 
 impl LinkedImage {
     /// Every image of `report` but its root.
@@ -133,7 +167,7 @@ impl LinkedImage {
                 name: i.name.clone(),
                 path: i.path.clone(),
                 slide: i.slide,
-                exports: OnceLock::new(),
+                parsed: OnceLock::new(),
             })
             .collect()
     }
@@ -145,28 +179,63 @@ impl LinkedImage {
         leaf(&self.name) == wanted || leaf(&self.path) == wanted
     }
 
-    fn exports(&self) -> Option<&ExportTable> {
-        self.exports
+    fn parsed(&self) -> Option<&LinkedExports> {
+        self.parsed
             .get_or_init(|| {
                 let bytes = std::fs::read(&self.path)
                     .ok()
                     .or_else(|| std::fs::read(resolve_path(&self.name)?).ok())?;
                 match crate::exec::active()?.engine() {
-                    crate::exec::Engine::Native => ExportTable::parse(
-                        &MachObject::parse_any(&bytes, crate::exec::native::HOST_SPEC).ok()?,
-                    )
-                    .ok(),
-                    crate::exec::Engine::Emulated => {
-                        ExportTable::parse(&MachObject::parse_any(&bytes, X86_64).ok()?).ok()
+                    crate::exec::Engine::Native => {
+                        LinkedExports::parse(&bytes, crate::exec::native::HOST_SPEC)
                     }
+                    crate::exec::Engine::Emulated => LinkedExports::parse(&bytes, X86_64),
                 }
             })
             .as_ref()
     }
 
-    fn resolve(&self, name: &str) -> Option<machish::resolve::Resolved> {
-        let export = self.exports()?.get(name)?;
-        // A re-export has no address of its own; see [`MainExports`].
+    fn exports(&self) -> Option<&ExportTable> {
+        self.parsed().map(|p| &p.exports)
+    }
+
+    /// Look `name` up here, following re-exports into the images of `peers`,
+    /// the set this image was linked with.
+    ///
+    /// Following them is what keeps a plugin's C++ ABI imports in the guest:
+    /// `libc++` re-exports all of `libc++abi` by load command, so `___dynamic_cast`
+    /// is in no trie a plugin's two-level reference names, and an unfollowed
+    /// edge falls through to the host's `libstdc++` - whose `type_info` vtable
+    /// layout is not `libc++abi`'s.
+    fn resolve(
+        &self,
+        peers: &[LinkedImage],
+        name: &str,
+        depth: usize,
+    ) -> Option<machish::resolve::Resolved> {
+        if depth > MAX_REEXPORT_DEPTH {
+            return None;
+        }
+        let parsed = self.parsed()?;
+        let peer = |target: &str| peers.iter().find(|p| p.answers_to(leaf(target)));
+        let Some(export) = parsed.exports.get(name) else {
+            return parsed
+                .reexports
+                .iter()
+                .filter_map(|target| peer(target))
+                .find_map(|next| next.resolve(peers, name, depth + 1));
+        };
+        if let ExportValue::Reexport {
+            ordinal,
+            imported_name,
+        } = &export.value
+        {
+            let target = parsed
+                .dependencies
+                .get(usize::from(*ordinal).checked_sub(1)?)?;
+            let name = imported_name.as_deref().unwrap_or(name);
+            return peer(target)?.resolve(peers, name, depth + 1);
+        }
         let addr = export.address(self.slide)?;
         Some(machish::resolve::Resolved {
             addr,
@@ -225,7 +294,11 @@ impl machish::resolve::SymbolProvider for ProgramImages {
 
     fn resolve(&self, sym: &machish::fixups::SymbolRef<'_>) -> Option<machish::resolve::Resolved> {
         let named = sym.library.install_name().map(leaf);
-        Self::matching(named).find_map(|image| image.resolve(sym.name))
+        let all = PROGRAM_IMAGES
+            .get()
+            .map(|v| v.as_slice())
+            .unwrap_or_default();
+        Self::matching(named).find_map(|image| image.resolve(all, sym.name, 0))
     }
 }
 
@@ -372,7 +445,7 @@ impl machish::resolve::SymbolProvider for LoadedImages {
                     .linked
                     .iter()
                     .filter(|l| named.is_none_or(|n| l.answers_to(n)))
-                    .find_map(|l| l.resolve(sym.name))
+                    .find_map(|l| l.resolve(&image.linked, sym.name, 0))
             })?;
             let mut bound = self.bound.lock().unwrap_or_else(|e| e.into_inner());
             if !bound.iter().any(|b| std::ptr::eq(*b, image)) {
@@ -2416,11 +2489,11 @@ mod tests {
         let host = unsafe {
             libc::dlsym(
                 handle as *mut libc::c_void,
-                c"CGLChoosePixelFormat".as_ptr(),
+                c"CGLDescribePixelFormat".as_ptr(),
             )
         };
         assert!(!host.is_null());
-        assert!(lookup(handle, "CGLChoosePixelFormat").is_none());
+        assert!(lookup(handle, "CGLDescribePixelFormat").is_none());
         assert!(lookup(handle, "gluPerspective").is_none());
         let expected = appkit::symbol("CGLGetCurrentContext").unwrap();
         assert_eq!(
@@ -2553,5 +2626,82 @@ mod tests {
                 "{err}"
             );
         }
+    }
+
+    fn linked(name: &str, slide: u64, exports: Vec<machish::exports::Export>) -> LinkedImage {
+        let deps = |reexport: bool| match (name, reexport) {
+            ("/usr/lib/libc++.1.dylib", _) => vec!["/usr/lib/libc++abi.dylib".to_string()],
+            ("/usr/lib/libfwd.dylib", false) => vec!["/usr/lib/libc++abi.dylib".to_string()],
+            _ => Vec::new(),
+        };
+        LinkedImage {
+            name: name.to_string(),
+            // Unreadable on purpose: the exports below are the whole image.
+            path: format!("/nonexistent{name}"),
+            slide,
+            parsed: OnceLock::from(Some(LinkedExports {
+                exports: ExportTable::from_entries(exports),
+                dependencies: deps(false),
+                reexports: deps(true),
+            })),
+        }
+    }
+
+    fn export(name: &str, vmaddr: u64, value: ExportValue) -> machish::exports::Export {
+        machish::exports::Export {
+            name: name.to_string(),
+            flags: 0,
+            kind: machish::exports::ExportKind::Regular,
+            vmaddr,
+            value,
+        }
+    }
+
+    /// `libc++` re-exports `libc++abi` by load command, so `___dynamic_cast` is
+    /// in no trie a plugin's reference to `libc++` names. Unfollowed, the import
+    /// fell through to the host's `libstdc++` and crashed Roblox Studio.
+    #[test]
+    fn follows_whole_dylib_reexport_to_the_defining_image() {
+        let peers = [
+            linked("/usr/lib/libc++.1.dylib", 0x1000, Vec::new()),
+            linked(
+                "/usr/lib/libc++abi.dylib",
+                0x2000,
+                vec![export("___dynamic_cast", 0x40, ExportValue::Direct)],
+            ),
+        ];
+        let found = peers[0].resolve(&peers, "___dynamic_cast", 0);
+        assert_eq!(found.map(|r| r.addr), Some(0x2040));
+    }
+
+    #[test]
+    fn follows_renaming_trie_reexport_by_ordinal() {
+        let peers = [
+            linked(
+                "/usr/lib/libfwd.dylib",
+                0x1000,
+                vec![export(
+                    "_outer",
+                    0,
+                    ExportValue::Reexport {
+                        ordinal: 1,
+                        imported_name: Some("_inner".to_string()),
+                    },
+                )],
+            ),
+            linked(
+                "/usr/lib/libc++abi.dylib",
+                0x2000,
+                vec![export("_inner", 0x10, ExportValue::Direct)],
+            ),
+        ];
+        let found = peers[0].resolve(&peers, "_outer", 0);
+        assert_eq!(found.map(|r| r.addr), Some(0x2010));
+    }
+
+    #[test]
+    fn reexport_with_no_mapped_target_is_unresolved() {
+        let peers = [linked("/usr/lib/libc++.1.dylib", 0x1000, Vec::new())];
+        assert!(peers[0].resolve(&peers, "___dynamic_cast", 0).is_none());
     }
 }

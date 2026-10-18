@@ -71,3 +71,65 @@ fn the_system_framework_lookup_agrees_with_the_host() {
     };
     assert_eq!(guest_out, native_out, "stderr: {err}");
 }
+
+/// The OpenGL-extension pattern, against a framework every guest links: find
+/// an Apple framework by identifier, then a variable in it by name.
+const BY_IDENTIFIER_C: &str = r#"
+#include <CoreFoundation/CoreFoundation.h>
+#include <stdio.h>
+
+int main(void) {
+    CFStringRef name = CFSTR("com.apple.CoreFoundation");
+    CFBundleRef bundle = CFBundleGetBundleWithIdentifier(name);
+    printf("bundle %d\n", bundle != NULL);
+    if (!bundle) return 1;
+    printf("same %d\n", bundle == CFBundleGetBundleWithIdentifier(name));
+    printf("identifier %d\n",
+        CFStringCompare(CFBundleGetIdentifier(bundle), name, 0) == kCFCompareEqualTo);
+    const void *data = CFBundleGetDataPointerForName(bundle, CFSTR("kCFTypeArrayCallBacks"));
+    printf("data %d\n", data == &kCFTypeArrayCallBacks);
+    printf("missing data %d\n",
+        CFBundleGetDataPointerForName(bundle, CFSTR("no_such_variable_here")) != NULL);
+    printf("missing bundle %d\n",
+        CFBundleGetBundleWithIdentifier(CFSTR("com.example.no-such-bundle")) != NULL);
+    return 0;
+}
+"#;
+
+const BY_IDENTIFIER_FLAGS: &[&str] = &["-framework", "CoreFoundation"];
+
+#[test]
+fn a_variable_is_found_in_a_framework_named_by_identifier() {
+    let Some(guest) =
+        common::build_x86_64("bundle_by_identifier", BY_IDENTIFIER_C, BY_IDENTIFIER_FLAGS)
+    else {
+        skip!("cannot build x86_64 fixtures")
+    };
+    let (status, out, err) = common::run_guest(&guest, &[]);
+    assert_eq!(status, Some(0), "stdout: {out}\nstderr: {err}");
+    assert_eq!(
+        out, "bundle 1\nsame 1\nidentifier 1\ndata 1\nmissing data 0\nmissing bundle 0\n",
+        "stderr: {err}"
+    );
+}
+
+#[test]
+fn the_identifier_lookup_agrees_with_the_host() {
+    let Some(guest) =
+        common::build_x86_64("bundle_by_identifier", BY_IDENTIFIER_C, BY_IDENTIFIER_FLAGS)
+    else {
+        skip!("cannot build x86_64 fixtures")
+    };
+    let Some(native) = common::build_native_with(
+        "bundle_by_identifier_native",
+        BY_IDENTIFIER_C,
+        BY_IDENTIFIER_FLAGS,
+    ) else {
+        skip!("cannot build native fixtures")
+    };
+    let (_, guest_out, err) = common::run_guest(&guest, &[]);
+    let Some((_, native_out)) = common::run_native(&native) else {
+        skip!("the native fixture would not run")
+    };
+    assert_eq!(guest_out, native_out, "stderr: {err}");
+}

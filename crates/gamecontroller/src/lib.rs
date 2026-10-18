@@ -494,15 +494,6 @@ fn read_direction(controller: *mut Controller, kind: DirectionKind) -> (f32, f32
     }
 }
 
-unsafe fn block_invoke(block: Id) -> Option<usize> {
-    if block.is_null() {
-        return None;
-    }
-    // SAFETY: `invoke` is the third word of every block literal.
-    let invoke = unsafe { *((block as *const u8).add(16) as *const usize) };
-    (invoke != 0).then_some(invoke)
-}
-
 fn replace_block(slot: &mut usize, block: Id) {
     let copied = objc::block::copy(block) as usize;
     if *slot != 0 {
@@ -749,7 +740,7 @@ fn call_input(input: Id) -> bool {
     }
     let block = objc::block::copy(unsafe { (*(input as *const Input)).handler as Id });
     unsafe {
-        if let Some(invoke) = block_invoke(block) {
+        if let Some(invoke) = objc::block::invoke(block) {
             if matches!(source, Source::Axis(..) | Source::DpadX | Source::DpadY) {
                 let f: unsafe extern "C" fn(Id, Id, f32) = std::mem::transmute(invoke);
                 f(block, input, value);
@@ -763,7 +754,7 @@ fn call_input(input: Id) -> bool {
     if pressed(value) != pressed(old) {
         let block = objc::block::copy(unsafe { (*(input as *const Input)).pressed_handler as Id });
         unsafe {
-            if let Some(invoke) = block_invoke(block) {
+            if let Some(invoke) = objc::block::invoke(block) {
                 let f: unsafe extern "C" fn(Id, Id, f32, u8) = std::mem::transmute(invoke);
                 f(block, input, value, pressed(value) as u8);
             }
@@ -791,7 +782,7 @@ fn call_direction(direction: Id) -> bool {
     }
     let block = objc::block::copy(unsafe { (*(direction as *const Direction)).handler as Id });
     unsafe {
-        if let Some(invoke) = block_invoke(block) {
+        if let Some(invoke) = objc::block::invoke(block) {
             let f: unsafe extern "C" fn(Id, Id, f32, f32) = std::mem::transmute(invoke);
             f(block, direction, x, y);
         }
@@ -803,7 +794,7 @@ fn call_direction(direction: Id) -> bool {
 fn call_profile(profile: Id, element: Id) {
     let block = objc::block::copy(unsafe { (*(profile as *const ExtendedGamepad)).handler as Id });
     unsafe {
-        if let Some(invoke) = block_invoke(block) {
+        if let Some(invoke) = objc::block::invoke(block) {
             let f: unsafe extern "C" fn(Id, Id, Id) = std::mem::transmute(invoke);
             f(block, profile, element);
         }
@@ -854,7 +845,7 @@ fn poll_controller(controller: Id) {
         let block =
             objc::block::copy(unsafe { (*(controller as *const Controller)).paused_handler as Id });
         unsafe {
-            if let Some(invoke) = block_invoke(block) {
+            if let Some(invoke) = objc::block::invoke(block) {
                 let f: unsafe extern "C" fn(Id, Id) = std::mem::transmute(invoke);
                 f(block, controller);
             }

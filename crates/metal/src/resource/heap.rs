@@ -473,8 +473,10 @@ mod tests {
         assert_eq!(quote.size, 768);
         assert_eq!(fit(0, 1024, &quote), Some(768));
         assert_eq!(fit(768, 1024, &quote), None);
-        // Alignment pads the start, and the padding counts against the heap.
-        assert_eq!(fit(10, 1024, &quote), None);
+        // Alignment pads the start, and the padding counts against the heap:
+        // 10 + 768 would fit in 1000, but 256 + 768 does not.
+        assert_eq!(fit(10, 1000, &quote), None);
+        assert_eq!(fit(10, 1024, &quote), Some(1024));
         assert_eq!(fit(10, 1024, &buffer_quote(1)), Some(512));
     }
 }

@@ -493,6 +493,84 @@ pub unsafe extern "C" fn clonefileat(
     })
 }
 
+/// `int clonefile(const char *, const char *, uint32_t)`
+///
+/// # Safety
+///
+/// Both paths are NUL-terminated strings.
+pub unsafe extern "C" fn clonefile(from: *const c_char, to: *const c_char, flags: c_int) -> c_int {
+    let here = crate::stat::DARWIN_AT_FDCWD;
+    unsafe { clonefileat(here, from, here, to, flags) }
+}
+
+/// `int renameatx_np(int, const char *, int, const char *, unsigned int)`
+///
+/// `RENAME_SWAP` and `RENAME_EXCL` are Linux's `RENAME_EXCHANGE` and
+/// `RENAME_NOREPLACE`; a host without `renameat2` refuses them rather than
+/// rename without the guarantee asked for.
+///
+/// # Safety
+///
+/// Both paths are NUL-terminated strings.
+pub unsafe extern "C" fn renameatx_np(
+    from_dirfd: c_int,
+    from: *const c_char,
+    to_dirfd: c_int,
+    to: *const c_char,
+    flags: u32,
+) -> c_int {
+    const RENAME_SWAP: u32 = 2;
+    const RENAME_EXCL: u32 = 4;
+    if flags & !(RENAME_SWAP | RENAME_EXCL) != 0 || flags == RENAME_SWAP | RENAME_EXCL {
+        crate::errno::set(libc::EINVAL);
+        return -1;
+    }
+    let dirfd = |fd| match fd {
+        crate::stat::DARWIN_AT_FDCWD => libc::AT_FDCWD,
+        fd => fd,
+    };
+    let (Some(from), Some(to)) = (
+        host_at(dirfd(from_dirfd), from),
+        host_at(dirfd(to_dirfd), to),
+    ) else {
+        crate::errno::set(libc::EFAULT);
+        return -1;
+    };
+    // Both ends, as `rename`: a system file renamed away is as gone as one deleted.
+    if !may_write(from.as_ptr()) || !may_write(to.as_ptr()) {
+        return -1;
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let mut linux = 0;
+        if flags & RENAME_SWAP != 0 {
+            linux |= libc::RENAME_EXCHANGE;
+        }
+        if flags & RENAME_EXCL != 0 {
+            linux |= libc::RENAME_NOREPLACE;
+        }
+        // SAFETY: two NUL-terminated host paths.
+        unsafe {
+            libc::renameat2(
+                libc::AT_FDCWD,
+                from.as_ptr(),
+                libc::AT_FDCWD,
+                to.as_ptr(),
+                linux,
+            )
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        if flags != 0 {
+            crate::errno::set(libc::ENOTSUP);
+            return -1;
+        }
+        // SAFETY: two NUL-terminated host paths.
+        unsafe { libc::rename(from.as_ptr(), to.as_ptr()) }
+    }
+}
+
 /// `int rename(const char *, const char *)`
 ///
 /// # Safety
@@ -719,6 +797,8 @@ exports::exports! {
         "truncate" => truncate,
         "link" => link,
         "clonefileat" => clonefileat,
+        "clonefile" => clonefile,
+        "renameatx_np" => renameatx_np,
         "rename" => rename,
         "symlink" => symlink,
         "mkstemp" => mkstemp,

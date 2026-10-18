@@ -786,9 +786,9 @@ unsafe extern "C" fn should_change_text(
 /// `-keyDown:`, which is the whole reason the rest of this exists.
 ///
 /// AppKit's `NSTextView` runs printable input through the input manager, which
-/// is represented by SDL's separate text-input event. The key event handles
-/// editing commands only; inserting its `-characters` here as well would type
-/// every printable key twice.
+/// is represented by the host text carried on the event. The key's
+/// `-characters` are for editing commands only; inserting them as well would
+/// type every printable key twice.
 unsafe extern "C" fn key_down(receiver: Id, _sel: Sel, event: Id) {
     accept_key_interpretation(receiver);
     let modifiers = unsafe {
@@ -807,6 +807,12 @@ unsafe extern "C" fn key_down(receiver: Id, _sel: Sel, event: Id) {
         // SAFETY: this is the same standard text action as a Paste menu item.
         unsafe { paste(receiver, objc::sel::get("paste:"), receiver) };
         return;
+    }
+    let chord = crate::keymap::flags::COMMAND | crate::keymap::flags::CONTROL;
+    if modifiers & chord == 0
+        && let Some(typed) = crate::nsevent::take_text(event)
+    {
+        commit(receiver, &typed);
     }
     let sel = objc::sel::get("characters");
     // SAFETY: `-characters` is `id (id, SEL)` on an event this crate made.

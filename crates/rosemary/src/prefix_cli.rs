@@ -189,6 +189,9 @@ pub fn settle_prefix() {
             }
         }
         Ok(false) => {
+            if let Err(e) = prefix::layout::fill_in(&directory) {
+                eprintln!("rosemary: {}: {e}", directory.display());
+            }
             let prefix = Prefix::at(&directory);
             if named.is_none() {
                 offer_update(&prefix);

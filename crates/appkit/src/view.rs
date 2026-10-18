@@ -1747,6 +1747,12 @@ unsafe extern "C" fn no(_receiver: Id, _sel: Sel) -> u8 {
     0
 }
 
+/// Whether `imp` is NSView's own `-acceptsFirstResponder`. It answers yes for
+/// every view, so it says nothing about whether a click should focus one.
+pub(crate) fn is_default_accepts_first_responder(imp: objc::class::Imp) -> bool {
+    imp == yes as objc::class::Imp
+}
+
 /// `-display`: draw the view now.
 ///
 /// **This is what calls `-drawRect:`,** and a no-op here is a program that

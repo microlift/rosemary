@@ -1,0 +1,13 @@
+[package]
+name = "network"
+description = "Network.framework's path monitor, over the host's network interfaces"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+exports.workspace = true
+objc.workspace = true
+corefoundation.workspace = true
+darwin.workspace = true
+starnix.workspace = true

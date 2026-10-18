@@ -153,6 +153,14 @@ unsafe extern "C" fn perform_current(receiver: Id, sel: Sel, block: Id) {
     }
 }
 
+/// Draw this thread in Aqua, so a test's colours do not follow the host theme.
+#[cfg(test)]
+pub(crate) fn use_aqua_on_this_thread() {
+    let sel = objc::sel::get("setCurrentAppearance:");
+    // SAFETY: the class side ignores its receiver.
+    unsafe { set_current(std::ptr::null_mut(), sel, aqua()) };
+}
+
 pub fn is_dark() -> bool {
     let appearance = unsafe {
         current(

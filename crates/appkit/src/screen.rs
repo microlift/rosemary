@@ -1381,6 +1381,12 @@ pub unsafe extern "C" fn CGWarpMouseCursorPosition(point: foundation::geometry::
     };
     crate::event::note_warp_delta(moved.0, moved.1);
     crate::event::warp_pointer(local.0, local.1);
+    if mouse_is_associated()
+        && let Some(window) = target
+        && recentre(window, point)
+    {
+        return 0;
+    }
 
     let relative: Vec<_> = windows
         .iter()
@@ -1471,6 +1477,137 @@ fn remember_relative_warp(point: (f32, f32)) {
 
 fn forget_relative_warp() {
     *RELATIVE_WARP.lock().unwrap_or_else(|e| e.into_inner()) = None;
+}
+
+/// A guest that keeps warping the cursor back to one point while a button is
+/// held - Studio's right-drag camera - is doing mouse look without
+/// disassociating. Following each warp physically would fight the user's hand,
+/// so after the second such warp the window goes into relative mode and the
+/// warps only move the pointer the guest is told about.
+#[derive(Clone, Copy)]
+struct Recentring {
+    window: usize,
+    target: (f32, f32),
+    at: std::time::Instant,
+    /// Real motion arrived since the warp to `target`: the next warp there
+    /// takes back the user's movement rather than repeating a snap.
+    moved: bool,
+    active: bool,
+}
+
+static RECENTRING: std::sync::Mutex<Option<Recentring>> = std::sync::Mutex::new(None);
+
+const RECENTRE_WITHIN: std::time::Duration = std::time::Duration::from_millis(250);
+const RECENTRE_IDLE: std::time::Duration = std::time::Duration::from_millis(300);
+
+fn same_point(a: (f32, f32), b: (f32, f32)) -> bool {
+    (a.0 - b.0).abs() < 0.5 && (a.1 - b.1).abs() < 0.5
+}
+
+fn button_held() -> bool {
+    sdl3::video::mouse_state().is_some_and(|(_, _, buttons)| buttons != 0)
+}
+
+/// Note a guest warp to `point`. True when it was taken as a recentring one,
+/// which moves only the pointer the guest sees.
+fn recentre(window: sdl3::Window, point: (f32, f32)) -> bool {
+    let now = std::time::Instant::now();
+    let mut state = RECENTRING.lock().unwrap_or_else(|e| e.into_inner());
+    let same = state.filter(|r| r.window == window as usize);
+    match same {
+        Some(r) if r.active && same_point(r.target, point) => {
+            *state = Some(Recentring { at: now, ..r });
+            return true;
+        }
+        // A warp anywhere else is a real one: the user has to see it.
+        Some(r) if r.active => {
+            sdl3::video::set_relative_mouse_mode(r.window as sdl3::Window, false);
+        }
+        Some(r)
+            if r.moved
+                && now - r.at < RECENTRE_WITHIN
+                && same_point(r.target, point)
+                && button_held() =>
+        {
+            sdl3::video::set_hint(sdl3::video::HINT_RELATIVE_CURSOR_VISIBLE, c"1");
+            if sdl3::video::set_relative_mouse_mode(window, true) {
+                forget_relative_warp();
+                *state = Some(Recentring {
+                    at: now,
+                    active: true,
+                    ..r
+                });
+                return true;
+            }
+        }
+        _ => {}
+    }
+    *state = Some(Recentring {
+        window: window as usize,
+        target: point,
+        at: now,
+        moved: false,
+        active: false,
+    });
+    false
+}
+
+pub(crate) fn recentring() -> bool {
+    RECENTRING
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .is_some_and(|r| r.active)
+}
+
+/// Record real pointer motion, for [`recentre`] to tell a warp that undoes
+/// the user's movement from one that repeats a snap.
+pub(crate) fn note_recentring_motion() {
+    if let Some(r) = RECENTRING
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_mut()
+    {
+        r.moved = true;
+    }
+}
+
+/// Leave recentring once the guest has stopped warping, putting the physical
+/// cursor where the guest believes it is. `from` is where SDL last reported
+/// the cursor, in the window's coordinates, for the warp's echo to be dropped.
+/// True when it ended, with the pointer now at [`crate::event::pointer_position`].
+pub(crate) fn end_recentring_if_idle(from: (f32, f32)) -> bool {
+    let ended = {
+        let mut state = RECENTRING.lock().unwrap_or_else(|e| e.into_inner());
+        match *state {
+            Some(r) if r.active && r.at.elapsed() > RECENTRE_IDLE => state.take(),
+            _ => None,
+        }
+    };
+    let Some(r) = ended else {
+        return false;
+    };
+    let window = r.window as sdl3::Window;
+    let local = crate::event::pointer_position();
+    // Before relative mode ends, or SDL exposes the position it integrated.
+    sdl3::video::warp_mouse_in_window(window, local.0, local.1);
+    sdl3::video::set_relative_mouse_mode(window, false);
+    crate::event::expect_warp_echo(from, local);
+    let origin = crate::window::global_position(window).unwrap_or((0, 0));
+    let global = (local.0 + origin.0 as f32, local.1 + origin.1 as f32);
+    warp_physical(Some(window), global, local);
+    true
+}
+
+/// Drop recentring without moving anything, for a window losing focus: SDL
+/// has already left relative mode, and a cursor now over another program must
+/// not be pulled back to where the guest last had it.
+pub(crate) fn forget_recentring() {
+    let Some(r) = RECENTRING.lock().unwrap_or_else(|e| e.into_inner()).take() else {
+        return;
+    };
+    if r.active {
+        sdl3::video::set_relative_mouse_mode(r.window as sdl3::Window, false);
+    }
 }
 
 /// `CGError CGAssociateMouseAndMouseCursorPosition(boolean_t connected)`.
@@ -1672,8 +1809,8 @@ fn end_edge_hold() {
 /// Called again when a window takes focus, because SDL leaves the mode when
 /// focus goes and a window made after the guest disassociated never had it.
 pub fn apply_mouse_association() {
-    // From here the association decides relative mode, an edge hold included.
     *EDGE_HOLD.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    *RECENTRING.lock().unwrap_or_else(|e| e.into_inner()) = None;
     let relative = !mouse_is_associated();
     // Disassociating is not hiding: on macOS the cursor stays on screen where
     // it was, and only `+[NSCursor hide]` takes it away - which this tree

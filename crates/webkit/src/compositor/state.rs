@@ -137,7 +137,9 @@ pub struct State {
     _fractional: FractionalScaleManagerState,
     _cursor_shape: CursorShapeManagerState,
     seat: Seat<State>,
-    keyboard: KeyboardHandle<State>,
+    /// Absent when xkbcommon cannot find its keymap data; the seat then has
+    /// no keyboard capability and pages get pointer input only.
+    keyboard: Option<KeyboardHandle<State>>,
     pointer: PointerHandle<State>,
     /// Where a window is until its view says which display it is on.
     output: Output,
@@ -310,7 +312,13 @@ impl State {
                     25,
                 )
             })
-            .expect("the US keymap always compiles");
+            .map_err(|err| {
+                eprintln!(
+                    "rosemary: webkit: compositor: no keyboard, web views cannot be typed into: \
+                     {err} (point XKB_CONFIG_ROOT at xkeyboard-config's xkb directory)"
+                );
+            })
+            .ok();
         let pointer = seat.add_pointer();
         let output = Output::new(
             "rosemary".to_string(),
@@ -505,19 +513,16 @@ impl State {
             Command::Key { key, pressed } => {
                 // A release of a key the page never saw pressed: a shortcut
                 // the menus took, whose key-up still reaches the view.
-                if !pressed
-                    && !self
-                        .keyboard
-                        .pressed_keys()
-                        .contains(&Keycode::new(key + 8))
-                {
+                let Some(keyboard) = self.keyboard.clone() else {
+                    return;
+                };
+                if !pressed && !keyboard.pressed_keys().contains(&Keycode::new(key + 8)) {
                     return;
                 }
                 let state = match pressed {
                     true => KeyState::Pressed,
                     false => KeyState::Released,
                 };
-                let keyboard = self.keyboard.clone();
                 let time = self.time();
                 // Evdev codes are X keycodes less 8.
                 keyboard.input::<(), _>(
@@ -561,10 +566,12 @@ impl State {
                     .map(|w| w.toplevel.wl_surface().clone())
             })
         });
-        if self.keyboard.current_focus() == target {
+        let Some(keyboard) = self.keyboard.clone() else {
+            return;
+        };
+        if keyboard.current_focus() == target {
             return;
         }
-        let keyboard = self.keyboard.clone();
         keyboard.set_focus(self, target, SERIAL_COUNTER.next_serial());
     }
 

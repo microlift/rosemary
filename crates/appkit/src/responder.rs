@@ -243,11 +243,11 @@ fn command_for(key_code: u16, modifiers: u64) -> Option<&'static str> {
 /// - see [`crate::text::accepts_host_text`]. A view that never calls it keeps its
 /// keys.
 ///
-/// The second is the editing commands, sent on as `-doCommandBySelector:`. What
-/// is deliberately *not* sent is the printable text of the event: this host's
-/// text arrives separately and layout-resolved from SDL, and inserting
-/// `-characters` here as well would type every printable key twice - the same
-/// reason [`crate::text`]'s own `-keyDown:` does not.
+/// The second is the editing commands, sent on as `-doCommandBySelector:`, and
+/// for any other key the text it typed, sent as `-insertText:` while the call
+/// is still on the stack, as AppKit does; Qt reads text arriving then as
+/// the key's. That text is SDL's layout-resolved commit, not `-characters`,
+/// carried on the event: see [`crate::nsevent::take_text`].
 unsafe extern "C" fn interpret_key_events(receiver: Id, _sel: Sel, events: Id) {
     crate::text::accept_key_interpretation(receiver);
     // SAFETY: null or an `NSArray`, which is what the method takes.
@@ -258,11 +258,8 @@ unsafe extern "C" fn interpret_key_events(receiver: Id, _sel: Sel, events: Id) {
     };
     let command_sel = objc::sel::get("doCommandBySelector:");
     // SAFETY: a live responder this method was sent to.
-    let Some(method) =
-        (unsafe { objc::object::class_of(receiver) }).and_then(|class| class.method(command_sel))
-    else {
-        return;
-    };
+    let method =
+        (unsafe { objc::object::class_of(receiver) }).and_then(|class| class.method(command_sel));
     for event in array.values.iter().copied() {
         let event = event as Id;
         if event.is_null() {
@@ -288,6 +285,15 @@ unsafe extern "C" fn interpret_key_events(receiver: Id, _sel: Sel, events: Id) {
             continue;
         }
         let Some(command) = command_for(key_code, modifiers) else {
+            let chord = crate::keymap::flags::COMMAND | crate::keymap::flags::CONTROL;
+            if modifiers & chord == 0
+                && let Some(text) = crate::nsevent::take_text(event)
+            {
+                crate::text::commit(receiver, &text);
+            }
+            continue;
+        };
+        let Some(method) = method else {
             continue;
         };
         // SAFETY: `-doCommandBySelector:` is `void (id, SEL, SEL)`, and the

@@ -47,6 +47,17 @@ pub fn type_id_of(class: &'static Class) -> CFTypeID {
         .unwrap_or(0)
 }
 
+/// The name of the class a `CFTypeID` stands for, or `None` for an ID no
+/// registered type has.
+pub fn type_name(id: CFTypeID) -> Option<&'static str> {
+    let types = TYPES.lock().unwrap_or_else(|e| e.into_inner());
+    if id == 0 || !types.contains(&id) {
+        return None;
+    }
+    // SAFETY: a class this crate noted as a type, which lives for the process.
+    unsafe { objc::class::from_ptr(id as *const Class) }.map(Class::name_str)
+}
+
 /// The class of `object`, or `None` for null.
 ///
 /// # Safety

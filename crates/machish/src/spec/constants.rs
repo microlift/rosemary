@@ -261,6 +261,16 @@ pub const N_WEAK_REF: u16 = 0x0040;
 pub const INDIRECT_SYMBOL_LOCAL: u32 = 0x8000_0000;
 pub const INDIRECT_SYMBOL_ABS: u32 = 0x4000_0000;
 
+/// `sizeof(struct relocation_info)`.
+pub const RELOCATION_INFO_SIZE: usize = 8;
+/// `r_address` bit marking a `scattered_relocation_info`, which only 32-bit
+/// images use.
+pub const R_SCATTERED: u32 = 0x8000_0000;
+/// `X86_64_RELOC_UNSIGNED` and `ARM64_RELOC_UNSIGNED`: an absolute pointer.
+pub const RELOC_UNSIGNED: u8 = 0;
+/// `r_length` of a 64-bit pointer (log2 of its size).
+pub const RELOC_LENGTH_POINTER: u8 = 3;
+
 pub const MACH_HEADER_64_SIZE: usize = 32;
 pub const LOAD_COMMAND_SIZE: usize = 8;
 pub const SEGMENT_COMMAND_64_SIZE: usize = 72;

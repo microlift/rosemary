@@ -468,6 +468,10 @@ pub fn peer(fd: RawFd) -> Option<Peer> {
     })
 }
 
+pub fn in_use(_pid: i32) -> Option<crate::process::InUse> {
+    None
+}
+
 pub fn fd_path(fd: RawFd) -> Option<PathBuf> {
     let mut path = [0u8; libc::MAXPATHLEN as usize];
     // SAFETY: `F_GETPATH` writes at most `MAXPATHLEN` bytes.

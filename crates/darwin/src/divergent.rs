@@ -359,9 +359,9 @@ mod tests {
         // itself was here until `crate::dirent` answered it, and is asserted
         // the other way round below.
         assert_eq!(reason("getdirentries"), Some(DIRENT));
-        // A Mach call that reaches the kernel about *memory*, which is the half
-        // of the family `crate::mach` does not answer.
-        assert_eq!(reason("mach_vm_allocate"), Some(MACH));
+        // A Mach call that reads another task's memory, which is the half of
+        // the family `crate::mach` does not answer.
+        assert_eq!(reason("mach_vm_read"), Some(MACH));
         assert_eq!(
             reason("strlen"),
             None,

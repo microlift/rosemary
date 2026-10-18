@@ -723,3 +723,155 @@ fn a_synthetic_dylib_satisfies_a_built_fixtures_imports() {
         assert_eq!(u64::from_le_bytes(buf), 0xdead_0000);
     }
 }
+
+/// A pre-10.6 executable: no `LC_DYLD_INFO`, one indirect pointer slot, and
+/// data bound and slid only through `LC_DYSYMTAB`'s relocation tables.
+fn classic_image_with_relocations() -> Vec<u8> {
+    use machish::spec::constants::{
+        CPU_TYPE_X86_64, LC_DYSYMTAB, LC_LOAD_DYLIB, LC_SEGMENT_64, LC_SYMTAB, MH_EXECUTE,
+        MH_MAGIC_64, MH_TWOLEVEL,
+    };
+    const TEXT: u64 = 0x1_0000_0000;
+    const DATA: u64 = 0x1_0000_1000;
+
+    fn segment(name: &str, vmaddr: u64, fileoff: u64, prot: i32, sections: &[[u8; 80]]) -> Vec<u8> {
+        let mut v = Vec::new();
+        v.extend_from_slice(&LC_SEGMENT_64.to_le_bytes());
+        v.extend_from_slice(&(72 + 80 * sections.len() as u32).to_le_bytes());
+        let mut n = [0u8; 16];
+        n[..name.len()].copy_from_slice(name.as_bytes());
+        v.extend_from_slice(&n);
+        for x in [vmaddr, 0x1000, fileoff, 0x1000] {
+            v.extend_from_slice(&x.to_le_bytes());
+        }
+        v.extend_from_slice(&prot.to_le_bytes());
+        v.extend_from_slice(&prot.to_le_bytes());
+        v.extend_from_slice(&(sections.len() as u32).to_le_bytes());
+        v.extend_from_slice(&0u32.to_le_bytes());
+        for s in sections {
+            v.extend_from_slice(s);
+        }
+        v
+    }
+
+    // `__DATA,__nl_symbol_ptr`: one slot, indirect entry 0.
+    let mut nl = [0u8; 80];
+    nl[..15].copy_from_slice(b"__nl_symbol_ptr");
+    nl[16..22].copy_from_slice(b"__DATA");
+    nl[32..40].copy_from_slice(&DATA.to_le_bytes());
+    nl[40..48].copy_from_slice(&8u64.to_le_bytes());
+    nl[48..52].copy_from_slice(&0x1000u32.to_le_bytes());
+    nl[64..68].copy_from_slice(&6u32.to_le_bytes()); // S_NON_LAZY_SYMBOL_POINTERS
+
+    let mut cmds = Vec::new();
+    cmds.extend(segment("__TEXT", TEXT, 0, 5, &[]));
+    cmds.extend(segment("__DATA", DATA, 0x1000, 3, &[nl]));
+    let dylib = b"/usr/lib/libobjc.A.dylib\0\0\0\0\0\0\0\0";
+    cmds.extend_from_slice(&LC_LOAD_DYLIB.to_le_bytes());
+    cmds.extend_from_slice(&(24 + dylib.len() as u32).to_le_bytes());
+    for x in [24u32, 0, 0, 0] {
+        cmds.extend_from_slice(&x.to_le_bytes());
+    }
+    cmds.extend_from_slice(dylib);
+
+    // __LINKEDIT-ish tail at 0x2000: symbols, strings, relocations, indirects.
+    let symoff = 0x2000u32;
+    let stroff = symoff + 2 * 16;
+    let strings = b"\0_objc_msgSend_fixup\0_kCFAllocatorDefault\0";
+    let reloff = stroff + strings.len() as u32;
+    let locreloff = reloff + 8;
+    let indirectoff = locreloff + 8;
+
+    cmds.extend_from_slice(&LC_SYMTAB.to_le_bytes());
+    cmds.extend_from_slice(&24u32.to_le_bytes());
+    for x in [symoff, 2, stroff, strings.len() as u32] {
+        cmds.extend_from_slice(&x.to_le_bytes());
+    }
+    cmds.extend_from_slice(&LC_DYSYMTAB.to_le_bytes());
+    cmds.extend_from_slice(&80u32.to_le_bytes());
+    let dysym = [
+        0u32,
+        0,
+        0,
+        0,
+        0,
+        2,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        indirectoff,
+        1,
+        reloff,
+        1,
+        locreloff,
+        1,
+    ];
+    for x in dysym {
+        cmds.extend_from_slice(&x.to_le_bytes());
+    }
+
+    let mut v = Vec::new();
+    v.extend_from_slice(&MH_MAGIC_64.to_le_bytes());
+    v.extend_from_slice(&CPU_TYPE_X86_64.to_le_bytes());
+    v.extend_from_slice(&3i32.to_le_bytes());
+    v.extend_from_slice(&MH_EXECUTE.to_le_bytes());
+    v.extend_from_slice(&5u32.to_le_bytes());
+    v.extend_from_slice(&(cmds.len() as u32).to_le_bytes());
+    v.extend_from_slice(&MH_TWOLEVEL.to_le_bytes());
+    v.extend_from_slice(&0u32.to_le_bytes());
+    v.extend(cmds);
+    v.resize(0x2000, 0);
+    // An addend already in the bound slot, and a local pointer to slide.
+    v[0x1010..0x1018].copy_from_slice(&4u64.to_le_bytes());
+    v[0x1020..0x1028].copy_from_slice(&(TEXT + 0x80).to_le_bytes());
+
+    for (strx, ordinal) in [(1u32, 1u16), (21, 1)] {
+        v.extend_from_slice(&strx.to_le_bytes());
+        v.push(0x01); // N_UNDF | N_EXT
+        v.push(0);
+        v.extend_from_slice(&(ordinal << 8).to_le_bytes());
+        v.extend_from_slice(&0u64.to_le_bytes());
+    }
+    v.extend_from_slice(strings);
+    // r_address is from the first writable segment; extern UNSIGNED quad.
+    v.extend_from_slice(&0x10u32.to_le_bytes());
+    v.extend_from_slice(&((3u32 << 25) | (1 << 27)).to_le_bytes());
+    v.extend_from_slice(&0x20u32.to_le_bytes());
+    v.extend_from_slice(&(1u32 | (3 << 25)).to_le_bytes());
+    v.extend_from_slice(&1u32.to_le_bytes()); // indirect: symbol 1
+    v
+}
+
+#[test]
+fn classic_external_relocations_bind_and_local_ones_rebase() {
+    let bytes = classic_image_with_relocations();
+    let obj = MachObject::parse(&bytes, X86_64).unwrap();
+    let (encoding, fixups) = decode_image(&obj).unwrap();
+    assert_eq!(encoding, "classic");
+
+    let binds: Vec<_> = fixups
+        .iter()
+        .filter_map(|f| match f {
+            Fixup::Bind {
+                at, symbol, addend, ..
+            } => Some((*at, symbol.name, *addend, symbol.library)),
+            _ => None,
+        })
+        .collect();
+    assert!(binds.contains(&(
+        0x1_0000_1000,
+        "_kCFAllocatorDefault",
+        0,
+        LibraryRef::InstallName("/usr/lib/libobjc.A.dylib")
+    )));
+    assert!(binds.contains(&(
+        0x1_0000_1010,
+        "_objc_msgSend_fixup",
+        4,
+        LibraryRef::InstallName("/usr/lib/libobjc.A.dylib")
+    )));
+    assert!(fixups.contains(&Fixup::Rebase { at: 0x1_0000_1020 }));
+}

@@ -560,6 +560,7 @@ mod tests {
     #[test]
     fn each_named_colour_is_its_own() {
         crate::bootstrap();
+        crate::appearance::use_aqua_on_this_thread();
         let class = objc::class::ptr(objc::class::lookup(c"NSColor").expect("NSColor")) as Id;
         for (name, r, g, b, a) in NAMED {
             // SAFETY: `+namedColor` is `id (Class, SEL)`.
@@ -578,6 +579,7 @@ mod tests {
     #[test]
     fn a_named_colour_is_one_kept_object() {
         crate::bootstrap();
+        crate::appearance::use_aqua_on_this_thread();
         let class = objc::class::ptr(objc::class::lookup(c"NSColor").expect("NSColor")) as Id;
         let sel = objc::sel::get("controlTextColor");
         // SAFETY: `+namedColor` is `id (Class, SEL)`.

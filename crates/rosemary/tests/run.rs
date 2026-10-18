@@ -109,7 +109,13 @@ fn objc_debug_is_accepted_with_the_default_builtin_runtime() {
     let err = String::from_utf8_lossy(&output.stderr);
     assert!(!err.contains("usage:"), "{err}");
     assert!(!err.contains("--objc-debug requires"), "{err}");
-    assert!(err.starts_with("rosemary: /etc/hosts:"), "{err}");
+    // The first driver to run makes the shared test prefix and says so first.
+    assert!(
+        err.lines()
+            .last()
+            .is_some_and(|l| l.starts_with("rosemary: /etc/hosts:")),
+        "{err}"
+    );
 }
 
 #[test]
@@ -270,7 +276,13 @@ fn an_untranslatable_stop_names_itself_instead_of_crashing() {
     let (status, out, err) = run_guest("/etc/hosts", &[]);
     assert_eq!(status, Some(1));
     assert!(out.is_empty());
-    assert!(err.starts_with("rosemary: /etc/hosts:"), "{err:?}");
+    // The first driver to run makes the shared test prefix and says so first.
+    assert!(
+        err.lines()
+            .last()
+            .is_some_and(|l| l.starts_with("rosemary: /etc/hosts:")),
+        "{err:?}"
+    );
 }
 
 #[test]

@@ -116,12 +116,12 @@ fn read_u32(symbol: &str, mem: &mut dyn GuestMemory, at: u64) -> Result<u32> {
     Ok(u32::from_le_bytes(buf))
 }
 
-/// Call a host libdispatch entry point after rewriting the guest block.
+/// Call a host block-taking entry point after rewriting the guest block.
 ///
-/// This deliberately does not hold any rosemary lock while libdispatch is running the
+/// This deliberately does not hold any rosemary lock while the host is running the
 /// block.
 fn call_block(symbol: &str, host: u64, args: &[u64]) {
-    // SAFETY: all block-taking dispatch functions handled here return void
+    // SAFETY: all block-taking functions handled here return void
     // and receive only integer/pointer arguments. The host ABI ignores the
     // unused argument registers, and the caller supplies the exact prefix for
     // the selected function.
@@ -320,6 +320,24 @@ fn dispatch_data_create(
     Ok(())
 }
 
+/// `void nw_path_monitor_set_update_handler(nw_path_monitor_t, block)`, its
+/// cancel-handler twin, and `void nw_path_enumerate_interfaces(nw_path_t,
+/// block)`: an object, then a block that is copied for later or run before
+/// the call returns. A nil block is legal for the two setters.
+fn object_and_block(
+    symbol: &str,
+    ctx: &mut RegisterContext,
+    mem: &mut dyn GuestMemory,
+    callbacks: &dyn Callbacks,
+) -> Result<()> {
+    let (object, block) = (ctx.rdi, ctx.rsi);
+    if block != 0 {
+        substitute_block(symbol, block, mem, callbacks)?;
+    }
+    call_block(symbol, host_or_refuse(symbol)?, &[object, block]);
+    Ok(())
+}
+
 /// One of this module's implementations, in the shape [`crate::shims`] wants -
 /// the wider one, carrying [`Callbacks`].
 pub type Shim = crate::signal::Shim;
@@ -338,6 +356,9 @@ pub fn shim_for(name: &str) -> Option<Shim> {
         "dispatch_group_notify" => Some(dispatch_group_notify),
         "dispatch_group_async" => Some(dispatch_group_async),
         "CFRunLoopObserverCreateWithHandler" => Some(run_loop_observer_create_with_handler),
+        "nw_path_monitor_set_update_handler"
+        | "nw_path_monitor_set_cancel_handler"
+        | "nw_path_enumerate_interfaces" => Some(object_and_block),
         // Both spellings.
         "_Block_copy" | "Block_copy" => Some(block_copy),
         _ => None,

@@ -287,6 +287,10 @@ pub fn peer(fd: RawFd) -> Option<Peer> {
     })
 }
 
+pub fn in_use(_pid: i32) -> Option<crate::process::InUse> {
+    None
+}
+
 pub fn fd_path(fd: RawFd) -> Option<PathBuf> {
     // SAFETY: `kinfo_file` is plain data, valid when zeroed.
     let mut info: libc::kinfo_file = unsafe { std::mem::zeroed() };

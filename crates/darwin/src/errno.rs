@@ -6,9 +6,9 @@
 ///
 /// Darwin's `EPROCLIM`, `EBADRPC`, `ERPCMISMATCH`, `EPROGUNAVAIL`,
 /// `EPROGMISMATCH`, `EPROCUNAVAIL`, `EFTYPE`, `EAUTH`, `ENEEDAUTH`, `EPWROFF`,
-/// `EDEVERR`, `EBADEXEC`, `EBADARCH`, `ESHLIBVERS`, `EBADMACHO`, `ENOATTR`,
-/// `ENOPOLICY` and `EQFULL` are absent because this host has no counterpart to
-/// pair them with.
+/// `EDEVERR`, `EBADEXEC`, `EBADARCH`, `ESHLIBVERS`, `EBADMACHO`, `ENOPOLICY`
+/// and `EQFULL` are absent because this host has no counterpart to pair them
+/// with. So is `ENOATTR` on Linux, which a shim reports with [`set_guest`].
 #[cfg(not(target_os = "macos"))]
 const NUMBERS: &[(i32, i32)] = &[
     (1, libc::EPERM),
@@ -93,6 +93,8 @@ const NUMBERS: &[(i32, i32)] = &[
     (90, libc::EIDRM),
     (91, libc::ENOMSG),
     (92, libc::EILSEQ),
+    #[cfg(target_os = "freebsd")]
+    (93, libc::ENOATTR),
     (94, libc::EBADMSG),
     (95, libc::EMULTIHOP),
     #[cfg(not(target_os = "freebsd"))]
@@ -138,13 +140,28 @@ pub fn from_host(host: i32) -> i32 {
     host
 }
 
+/// Darwin numbers this host can stand for one way only: [`to_host`] gives the
+/// nearest host number, and [`from_host`] keeps answering that number's own
+/// Darwin name.
+#[cfg(target_os = "linux")]
+const TO_HOST_ONLY: &[(i32, i32)] = &[
+    // `ENOATTR`: Linux reports a missing attribute as `ENODATA`.
+    (93, libc::ENODATA),
+];
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+const TO_HOST_ONLY: &[(i32, i32)] = &[];
+
 /// A guest's `errno` as this host's.
 #[cfg(not(target_os = "macos"))]
 pub fn to_host(darwin: i32) -> i32 {
     if darwin == 0 {
         return 0;
     }
-    match NUMBERS.iter().find(|(theirs, _)| *theirs == darwin) {
+    match NUMBERS
+        .iter()
+        .chain(TO_HOST_ONLY)
+        .find(|(theirs, _)| *theirs == darwin)
+    {
         Some((_, ours)) => *ours,
         None => libc::EINVAL,
     }
@@ -232,6 +249,23 @@ pub fn guest_location() -> *mut libc::c_int {
                 value.as_ptr()
             })
         })
+    }
+}
+
+/// Set the guest's `errno` to Darwin's `darwin`, for an error this host's own
+/// number would name differently or not at all.
+///
+/// Both slots are written, and the host one is remembered as pushed, so the
+/// next reconciliation keeps `darwin` rather than renaming it from the host's.
+pub fn set_guest(darwin: i32) {
+    #[cfg(target_os = "macos")]
+    set(darwin);
+    #[cfg(not(target_os = "macos"))]
+    {
+        let host = to_host(darwin);
+        guest_slot::VALUE.with(|value| value.set(darwin));
+        guest_slot::PUSHED.with(|pushed| pushed.set(host));
+        set(host);
     }
 }
 
@@ -372,6 +406,18 @@ mod tests {
         // A host call that succeeds and leaves `errno` alone.
         // SAFETY: the accessor is re-entered exactly as a guest would.
         assert_eq!(unsafe { *error() }, 0, "the guest's own write was lost");
+        set(0);
+    }
+
+    /// A number this host cannot name survives to the guest, and is not
+    /// renamed by the next reconciliation.
+    #[test]
+    #[cfg(not(target_os = "macos"))]
+    fn a_darwin_only_number_reaches_the_guest() {
+        set(libc::ENOENT);
+        set_guest(93);
+        assert_eq!(guest_errno(), 93);
+        assert_eq!(guest_errno(), 93, "and stays after a second read");
         set(0);
     }
 

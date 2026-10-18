@@ -400,6 +400,8 @@ pub static SIGNATURES: &[FunctionAbi] = &[
     sig!("CFBundleGetMainBundle", P),
     sig!("CFBundleLoadExecutable", U8, P),
     sig!("CFBundleGetFunctionPointerForName", P, P, P),
+    sig!("CFBundleGetDataPointerForName", P, P, P),
+    sig!("CFBundleGetBundleWithIdentifier", P, P),
     sig!("CFBundleGetVersionNumber", U32, P),
     sig!("CFBundleGetValueForInfoDictionaryKey", P, P, P),
     sig!("CFStringGetCharactersPtr", P, P),
@@ -609,6 +611,8 @@ pub static SIGNATURES: &[FunctionAbi] = &[
     // `CFComparisonResult` is a `CFIndex`, so a signed doubleword, and
     // `CFStringCompareFlags` is a `CFOptionFlags` - both 64-bit on LP64.
     sig!("CFStringCompare", I64, P, P, U64),
+    sig!("CFCopyDescription", P, P),
+    sig!("CFCopyTypeIDDescription", P, U64),
     sig!("CFStringCompareWithOptions", I64, P, P, I64, I64, U64),
     // `Boolean CFStringFindWithOptions(CFStringRef, CFStringRef, CFRange,
     // CFStringCompareFlags, CFRange *)`, with the range flattened.
@@ -768,11 +772,7 @@ pub static SIGNATURES: &[FunctionAbi] = &[
     sig!("CGDisplayIsOnline", I32, U32),
     sig!("CGDisplayIsAsleep", I32, U32),
     sig!("CGDisplaySerialNumber", U32, U32),
-    sig!("CGDisplayRegisterReconfigurationCallback", I32, P, P),
-    sig!("CGDisplayRemoveReconfigurationCallback", I32, P, P),
     sig!("CGDisplayPrimaryDisplay", U32, U32),
-    sig!("CGDisplayRelease", I32, U32),
-    sig!("CGDisplayRotation", F64, U32),
     sig!("CGDisplayMirrorsDisplay", U32, U32),
     sig!("CGDisplayModeCopyPixelEncoding", P, P),
     sig!("CGDisplayModeGetHeight", U64, P),
@@ -951,6 +951,25 @@ pub static SIGNATURES: &[FunctionAbi] = &[
     sig!("FFEffectDownload", I32, P),
     sig!("FFEffectUnload", I32, P),
     sig!("FFDeviceGetForceFeedbackState", I32, P, P),
+    //
+    // Network.framework's path monitor. The three block-taking calls are
+    // shimmed in `crate::shims::block`, which thunks the block first.
+    sig!("nw_path_monitor_create", P),
+    sig!("nw_path_monitor_create_with_type", P, I32),
+    sig!("nw_path_monitor_set_queue", V, P, P),
+    sig!("nw_path_monitor_prohibit_interface_type", V, P, I32),
+    sig!("nw_path_monitor_start", V, P),
+    sig!("nw_path_monitor_cancel", V, P),
+    sig!("nw_path_get_status", I32, P),
+    sig!("nw_path_is_equal", BOOL, P, P),
+    sig!("nw_path_uses_interface_type", BOOL, P, I32),
+    sig!("nw_path_is_expensive", BOOL, P),
+    sig!("nw_path_is_constrained", BOOL, P),
+    sig!("nw_interface_get_type", I32, P),
+    sig!("nw_interface_get_name", P, P),
+    sig!("nw_interface_get_index", U32, P),
+    sig!("nw_retain", P, P),
+    sig!("nw_release", V, P),
     sig!("CVDisplayLinkCreateWithActiveCGDisplays", I32, P),
     sig!("CVDisplayLinkCreateWithCGDisplay", I32, U32, P),
     sig!("CVDisplayLinkGetActualOutputVideoRefreshPeriod", F64, P),
@@ -1262,6 +1281,14 @@ pub static SIGNATURES: &[FunctionAbi] = &[
     sig!("SetSystemUIMode", I32, U32, U32),
     // `OSErr FSFindFolder(FSVolumeRefNum, OSType, Boolean, FSRef *)`.
     sig!("FSFindFolder", I16, I16, U32, U8, P),
+    sig!("GetIconRef", I16, I16, U32, U32, P),
+    sig!("ReleaseIconRef", I16, P),
+    sig!("LocaleRefFromLocaleString", I32, P, P),
+    sig!("UCCreateCollator", I32, P, U32, U32, P),
+    sig!("UCDisposeCollator", I32, P),
+    sig!("UCCompareText", I32, P, P, U64, P, U64, P, P),
+    sig!("UCGetCollationKey", I32, P, P, U64, U64, P, P),
+    sig!("UCCompareCollationKeys", I32, P, U64, P, U64, P, P),
     // The handler is a guest function the Apple Event Manager calls when an
     // event arrives, so it crosses as a thunk; removal names the same one.
     cbsig!([2], "AEInstallEventHandler", I16, U32, U32, P, P, U8),

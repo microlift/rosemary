@@ -1,4 +1,5 @@
 use std::ffi::c_void;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::object::Id;
 use crate::sel::Sel;
@@ -606,29 +607,129 @@ super_stret_trampoline!(msg_send_super_stret, lookup_super);
 #[cfg(target_arch = "x86_64")]
 super_stret_trampoline!(msg_send_super2_stret, lookup_super2);
 
+/// Guest `objc_class` structures standing for classes of this runtime, keyed by
+/// address, with the range they span so the common case is two compares.
+///
+/// A pre-10.6 compiler names a class from its own image by the address of its
+/// `objc_class` in code (`lea`), not through a `__objc_classrefs` slot a loader
+/// could rewrite, so the receiver of `[MyClass alloc]` or the class of a
+/// `[super ...]` is a structure this runtime never made. That toolchain only
+/// ever sends through the `_fixup` entry points, so they are the one place the
+/// translation is needed - and the only place it costs anything.
+static ALIASES: std::sync::RwLock<Option<std::collections::HashMap<usize, usize>>> =
+    std::sync::RwLock::new(None);
+static ALIAS_LO: AtomicUsize = AtomicUsize::new(usize::MAX);
+static ALIAS_HI: AtomicUsize = AtomicUsize::new(0);
+
+/// Record that the guest `objc_class` at `guest` stands for `class`.
+pub fn alias_class(guest: usize, class: *const c_void) {
+    ALIASES
+        .write()
+        .unwrap_or_else(|e| e.into_inner())
+        .get_or_insert_with(Default::default)
+        .insert(guest, class as usize);
+    ALIAS_LO.fetch_min(guest, Ordering::AcqRel);
+    ALIAS_HI.fetch_max(guest + 1, Ordering::AcqRel);
+}
+
+/// The class `addr` stands for, or `addr` itself.
+pub fn unalias_class(addr: usize) -> usize {
+    ALIASES
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_ref()
+        .and_then(|m| m.get(&addr).copied())
+        .unwrap_or(addr)
+}
+
+extern "C" fn unalias_class_c(addr: usize) -> usize {
+    unalias_class(addr)
+}
+
 /// The `_fixup` spellings a pre-10.9 x86-64 toolchain calls through a
 /// `message_ref_t` (`{IMP, SEL}`): the selector register holds the ref, not the
 /// `SEL`. Apple's runtime rewrites each ref's `IMP` to a trampoline that loads
 /// the `SEL` and carries on; binding the import to that trampoline directly is
 /// the same thing without the rewrite. The `SEL` half is uniqued at load.
+///
+/// `$class` is the operand holding the receiver (or `objc_super.class`), which
+/// is translated through [`ALIASES`] when it falls in their range.
 macro_rules! fixup_trampoline {
-    ($name:ident, $reg:literal, $target:ident) => {
+    ($name:ident, $sel:literal, $class:literal, $target:ident) => {
         #[cfg(target_arch = "x86_64")]
         #[unsafe(naked)]
         pub(crate) unsafe extern "C" fn $name() {
             core::arch::naked_asm!(
-                concat!("mov ", $reg, ", [", $reg, " + 8]"),
+                concat!("mov ", $sel, ", [", $sel, " + 8]"),
+                concat!("mov r11, ", $class),
+                "cmp r11, [rip + {lo}]",
+                "jb {target}",
+                "cmp r11, [rip + {hi}]",
+                "jae {target}",
+                "push rbp",
+                "mov rbp, rsp",
+                "sub rsp, 192",
+                "movaps [rsp + 0], xmm0",
+                "movaps [rsp + 16], xmm1",
+                "movaps [rsp + 32], xmm2",
+                "movaps [rsp + 48], xmm3",
+                "movaps [rsp + 64], xmm4",
+                "movaps [rsp + 80], xmm5",
+                "movaps [rsp + 96], xmm6",
+                "movaps [rsp + 112], xmm7",
+                "mov [rsp + 128], rdi",
+                "mov [rsp + 136], rsi",
+                "mov [rsp + 144], rdx",
+                "mov [rsp + 152], rcx",
+                "mov [rsp + 160], r8",
+                "mov [rsp + 168], r9",
+                "mov [rsp + 176], rax",
+                "mov rdi, r11",
+                "call {unalias}",
+                "mov r11, rax",
+                "movaps xmm0, [rsp + 0]",
+                "movaps xmm1, [rsp + 16]",
+                "movaps xmm2, [rsp + 32]",
+                "movaps xmm3, [rsp + 48]",
+                "movaps xmm4, [rsp + 64]",
+                "movaps xmm5, [rsp + 80]",
+                "movaps xmm6, [rsp + 96]",
+                "movaps xmm7, [rsp + 112]",
+                "mov rdi, [rsp + 128]",
+                "mov rsi, [rsp + 136]",
+                "mov rdx, [rsp + 144]",
+                "mov rcx, [rsp + 152]",
+                "mov r8,  [rsp + 160]",
+                "mov r9,  [rsp + 168]",
+                "mov rax, [rsp + 176]",
+                "add rsp, 192",
+                "pop rbp",
+                concat!("mov ", $class, ", r11"),
                 "jmp {target}",
                 target = sym $target,
+                lo = sym ALIAS_LO,
+                hi = sym ALIAS_HI,
+                unalias = sym unalias_class_c,
             )
         }
     };
 }
 
-fixup_trampoline!(msg_send_fixup, "rsi", msg_send);
-fixup_trampoline!(msg_send_stret_fixup, "rdx", msg_send_stret);
-fixup_trampoline!(msg_send_super2_fixup, "rsi", msg_send_super2);
-fixup_trampoline!(msg_send_super2_stret_fixup, "rdx", msg_send_super2_stret);
+// `objc_super` is `{receiver, class}`; a super send's class is its second word.
+fixup_trampoline!(msg_send_fixup, "rsi", "rdi", msg_send);
+fixup_trampoline!(msg_send_stret_fixup, "rdx", "rsi", msg_send_stret);
+fixup_trampoline!(
+    msg_send_super2_fixup,
+    "rsi",
+    "qword ptr [rdi + 8]",
+    msg_send_super2
+);
+fixup_trampoline!(
+    msg_send_super2_stret_fixup,
+    "rdx",
+    "qword ptr [rsi + 8]",
+    msg_send_super2_stret
+);
 
 /// An `IMP` that sends the same message, every argument untouched, to the
 /// object in the receiver's first instance word (the one after `isa`).

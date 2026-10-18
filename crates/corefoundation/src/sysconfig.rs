@@ -146,7 +146,7 @@ fn new_target(local: bool) -> CFTypeRef {
 fn reachable_flags(local: bool) -> u32 {
     match local {
         true => flag::REACHABLE | flag::IS_LOCAL_ADDRESS,
-        false => match routed_source_address().is_some() {
+        false => match routed() {
             true => flag::REACHABLE,
             // Zero is what Apple's reports for a host with no route, and it is
             // the answer a client turns into "offline" rather than into a wait.
@@ -629,68 +629,22 @@ unsafe fn text_of(string: CFTypeRef) -> Option<Vec<u8>> {
     unsafe { crate::string::as_string(string) }.map(|s| s.utf8())
 }
 
-/// The interface packets to the outside world leave by.
-///
-/// Asked of the routing table rather than guessed at, and asked without sending
-/// anything: `connect` on a datagram socket picks the route and binds a local
-/// address, which `getifaddrs` then names. `None` when nothing is routable,
-/// which is the honest answer for a machine that is offline.
+/// The interface packets to the outside world leave by, as the routing table
+/// says. `None` when nothing is routable, which is the honest answer for a
+/// machine that is offline.
 fn primary_interface() -> Option<String> {
-    let local = routed_source_address()?;
-    // SAFETY: `getifaddrs` fills in the pointer or returns non-zero.
-    unsafe {
-        let mut list: *mut libc::ifaddrs = std::ptr::null_mut();
-        if libc::getifaddrs(&mut list) != 0 {
-            return None;
-        }
-        let mut found = None;
-        let mut entry = list;
-        while !entry.is_null() {
-            let address = (*entry).ifa_addr;
-            if !address.is_null() && (*address).sa_family as i32 == libc::AF_INET {
-                let address = &*(address as *const libc::sockaddr_in);
-                if address.sin_addr.s_addr == local {
-                    found = std::ffi::CStr::from_ptr((*entry).ifa_name)
-                        .to_str()
-                        .ok()
-                        .map(str::to_string);
-                    break;
-                }
-            }
-            entry = (*entry).ifa_next;
-        }
-        libc::freeifaddrs(list);
-        found
-    }
+    let local = starnix::net::route_v4()?;
+    starnix::net::interfaces()
+        .into_iter()
+        .find(|interface| interface.v4.contains(&local))
+        .map(|interface| interface.name)
 }
 
-/// The local IPv4 address a packet to the public internet would go out from, in
-/// network order.
-fn routed_source_address() -> Option<u32> {
-    // SAFETY: every call below is checked, and the socket is closed on every
-    // path out.
-    unsafe {
-        let socket = libc::socket(libc::AF_INET, libc::SOCK_DGRAM, 0);
-        if socket < 0 {
-            return None;
-        }
-        // A public address that is not contacted: `connect` on a datagram
-        // socket only consults the routing table.
-        let mut to: libc::sockaddr_in = std::mem::zeroed();
-        to.sin_family = libc::AF_INET as libc::sa_family_t;
-        to.sin_port = 53u16.to_be();
-        to.sin_addr.s_addr = u32::from_be_bytes([1, 1, 1, 1]).to_be();
-        let mut local: libc::sockaddr_in = std::mem::zeroed();
-        let mut len = size_of::<libc::sockaddr_in>() as libc::socklen_t;
-        let routed = libc::connect(
-            socket,
-            std::ptr::from_ref(&to).cast(),
-            size_of::<libc::sockaddr_in>() as libc::socklen_t,
-        ) == 0
-            && libc::getsockname(socket, std::ptr::from_mut(&mut local).cast(), &mut len) == 0;
-        libc::close(socket);
-        routed.then_some(local.sin_addr.s_addr)
-    }
+/// Whether the routing table has a way out to the public internet, by either
+/// family. `network`'s path monitor asks the same question.
+#[cfg(not(target_os = "macos"))]
+fn routed() -> bool {
+    starnix::net::route_v4().is_some() || starnix::net::route_v6().is_some()
 }
 
 /// `kSCDynamicStorePropNetPrimaryInterface`, which is also the dictionary key

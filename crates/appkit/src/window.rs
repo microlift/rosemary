@@ -1478,7 +1478,7 @@ unsafe extern "C" fn order_out(receiver: Id, _sel: Sel, _sender: Id) {
 ///
 /// The SDL window is hidden rather than destroyed: a Metal swapchain may still
 /// be keyed by it, and that table is not this crate's to clear.
-unsafe extern "C" fn dealloc(receiver: Id, sel: Sel) {
+pub(crate) unsafe extern "C" fn dealloc(receiver: Id, sel: Sel) {
     let window = window_of(receiver);
     objc::arc::release(std::mem::replace(
         &mut window.appearance,
@@ -1727,6 +1727,40 @@ unsafe extern "C" fn set_hides_on_deactivate(receiver: Id, _sel: Sel, value: u8)
 
 unsafe extern "C" fn is_key_window(receiver: Id, _sel: Sel) -> u8 {
     (key_window() == receiver) as u8
+}
+
+/// AppKit's rule: a window with a title bar or a resize bar can be key (and
+/// main); a borderless one cannot unless a subclass says so.
+unsafe extern "C" fn can_become_key(receiver: Id, _sel: Sel) -> u8 {
+    (window_of(receiver).style_mask & (style::TITLED | style::RESIZABLE) != 0) as u8
+}
+
+/// Keep a titled window's top edge on `screen`'s visible frame, shrinking a
+/// resizable one that is taller than it. A nil screen leaves `rect` alone.
+unsafe extern "C" fn constrain_frame_rect(
+    receiver: Id,
+    _sel: Sel,
+    mut rect: NSRect,
+    screen: Id,
+) -> NSRect {
+    let mask = window_of(receiver).style_mask;
+    if screen.is_null() || mask & style::TITLED == 0 {
+        return rect;
+    }
+    // SAFETY: `-visibleFrame` is `NSRect (id, SEL)`, returned through a buffer.
+    let visible = unsafe {
+        let f: unsafe extern "C" fn(Id, Sel) -> NSRect =
+            std::mem::transmute(objc::msg::entry_stret());
+        f(screen, objc::sel::get("visibleFrame"))
+    };
+    let top = visible.origin.y + visible.size.height;
+    if mask & style::RESIZABLE != 0 && rect.size.height > visible.size.height {
+        rect.size.height = visible.size.height;
+    }
+    if rect.origin.y + rect.size.height > top {
+        rect.origin.y = top - rect.size.height;
+    }
+    rect
 }
 
 unsafe extern "C" fn is_visible(receiver: Id, _sel: Sel) -> u8 {
@@ -2478,6 +2512,10 @@ pub(crate) fn install() {
         "dealloc" => dealloc, c"v16@0:8";
         "performClose:" => perform_close, c"v24@0:8@16";
         "isKeyWindow" => is_key_window, c"c16@0:8";
+        "canBecomeKeyWindow" => can_become_key, c"c16@0:8";
+        "canBecomeMainWindow" => can_become_key, c"c16@0:8";
+        "constrainFrameRect:toScreen:" => constrain_frame_rect,
+            c"{CGRect={CGPoint=dd}{CGSize=dd}}56@0:8{CGRect={CGPoint=dd}{CGSize=dd}}16@48";
         "isMainWindow" => is_key_window, c"c16@0:8";
         "isVisible" => is_visible, c"c16@0:8";
         "setIsVisible:" => set_is_visible, c"v20@0:8c16";

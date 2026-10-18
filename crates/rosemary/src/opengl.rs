@@ -254,7 +254,7 @@ mod tests {
             }
         }
         if builtin {
-            for name in ["CGLChoosePixelFormat", "gluPerspective"] {
+            for name in ["CGLDescribePixelFormat", "gluPerspective"] {
                 assert!(symbol(name).is_none());
                 assert!(darwin::symbol(name).is_none());
                 assert!(darwin::shim_symbol(name).is_none());

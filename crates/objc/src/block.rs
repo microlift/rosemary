@@ -155,6 +155,23 @@ unsafe fn helpers(block: *const Block) -> Option<&'static DescriptorHelpers> {
     Some(unsafe { &*(descriptor as *const DescriptorHelpers) })
 }
 
+/// A block's invoke function, or `None` for nil or a block without one.
+///
+/// The caller transmutes it to the block's prototype, with the block itself
+/// as the hidden first argument.
+///
+/// # Safety
+///
+/// `block` must be null or a live block literal.
+pub unsafe fn invoke(block: Id) -> Option<usize> {
+    if block.is_null() {
+        return None;
+    }
+    // SAFETY: the caller's obligation; `invoke` is in the fixed header.
+    let invoke = unsafe { (*(block as *const Block)).invoke } as usize;
+    (invoke != 0).then_some(invoke)
+}
+
 /// `void *_Block_copy(const void *block)`.
 ///
 /// A heap block gains a reference, a global block is itself, and a stack block

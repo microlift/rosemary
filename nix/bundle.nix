@@ -6,6 +6,7 @@
 , closureInfo
 , writeText
 , glib-networking
+, xkeyboard-config
 , bubblewrap
 , xdg-dbus-proxy
 , rosemary
@@ -127,6 +128,8 @@ let
     conf = [
       "default_env.GIO_EXTRA_MODULES=@ROOT@/lib/gio/modules"
       "default_env.WEBKIT_INJECTED_BUNDLE_PATH=@ROOT@/lib/webkitgtk-6.0/injected-bundle"
+      # libxkbcommon's built-in data directory is a store path.
+      "default_env.XKB_CONFIG_ROOT=@ROOT@/share/X11/xkb"
       # The bundled fontconfig and GnuTLS look for their configuration in the
       # store; the host's is wanted, wherever its distribution keeps it.
       "default_path.FONTCONFIG_FILE=/etc/fonts/fonts.conf"
@@ -149,4 +152,10 @@ runCommand "rosemary-bundle-${rosemary.version}"
     cp -r ${fhs} $out
     chmod -R u+w $out
     python3 ${../tools/bundle/bundle.py} --config ${config} --out $out
+    # Keymap data for the bundled libxkbcommon; the compositor behind web views
+    # cannot build a keyboard without it.
+    mkdir -p $out/share/X11
+    cp -rL ${xkeyboard-config}/share/X11/xkb $out/share/X11/xkb
+    chmod -R u+w $out/share/X11
+    test -e $out/share/X11/xkb/rules/evdev
   ''

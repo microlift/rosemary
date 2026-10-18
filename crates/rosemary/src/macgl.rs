@@ -252,9 +252,43 @@ unsafe extern "C" fn get_integerv(name: u32, out: *mut i32) {
     unsafe { out.write(value) };
 }
 
+type Flush = unsafe extern "C" fn();
+
+fn real_flush() -> Option<Flush> {
+    static SLOT: OnceLock<usize> = OnceLock::new();
+    // SAFETY: `void glFlush(void)`.
+    driver(c"glFlush", &SLOT).map(|a| unsafe { std::mem::transmute::<usize, Flush>(a) })
+}
+
+fn real_finish() -> Option<Flush> {
+    static SLOT: OnceLock<usize> = OnceLock::new();
+    // SAFETY: `void glFinish(void)`.
+    driver(c"glFinish", &SLOT).map(|a| unsafe { std::mem::transmute::<usize, Flush>(a) })
+}
+
+/// A single-buffered Mac context presents on a flush; see
+/// `appkit::opengl::present_single_buffered`.
+unsafe extern "C" fn flush() {
+    if let Some(real) = real_flush() {
+        // SAFETY: the guest's call, passed on.
+        unsafe { real() };
+    }
+    appkit::opengl::present_single_buffered();
+}
+
+unsafe extern "C" fn finish() {
+    if let Some(real) = real_finish() {
+        // SAFETY: the guest's call, passed on.
+        unsafe { real() };
+    }
+    appkit::opengl::present_single_buffered();
+}
+
 /// This module's replacement for `name`, if it has one.
 pub fn address(name: &str) -> Option<u64> {
     let f = match name {
+        "glFlush" if crate::frameworks::using_builtin() => flush as *const (),
+        "glFinish" if crate::frameworks::using_builtin() => finish as *const (),
         "glGetString" => get_string as *const (),
         "glGetStringi" => get_stringi as *const (),
         "glGetIntegerv" => get_integerv as *const (),

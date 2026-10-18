@@ -254,6 +254,22 @@ mod tests {
         ));
     }
 
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn a_fixup_send_to_an_aliased_guest_class_reaches_the_real_one() {
+        bootstrap();
+        let nsobject = class::lookup(c"NSObject").expect("NSObject");
+        let real = std::ptr::from_ref(nsobject) as *const std::ffi::c_void;
+        // Stands in for a guest `objc_class` that code names by address.
+        static GUEST: [usize; 5] = [0; 5];
+        msg::alias_class(GUEST.as_ptr() as usize, real);
+        let message_ref: [usize; 2] = [0, sel::get("class") as usize];
+        // SAFETY: `objc_msgSend_fixup` is `id (id, message_ref_t *)` here.
+        let send: unsafe extern "C" fn(*const usize, *const [usize; 2]) -> *const std::ffi::c_void =
+            unsafe { std::mem::transmute(msg::msg_send_fixup as *const ()) };
+        assert_eq!(unsafe { send(GUEST.as_ptr(), &message_ref) }, real);
+    }
+
     #[test]
     fn nsobject_is_installed_and_its_metaclass_chain_terminates() {
         bootstrap();
