@@ -8,8 +8,8 @@
 //! abort may be left corrupt by them; others change which zone is the default.
 //! The parent prints one line per check and a score per category.
 //!
-//! Deviations are reported, not failed: set `LIBMALLOC_STRICT=1` to fail the
-//! test on any, `LIBMALLOC_ONLY=a,b` to run some checks, `LIBMALLOC_JOBS=n`
+//! A check failing that is not in [`KNOWN_DEVIATIONS`] fails the test. Set
+//! `LIBMALLOC_STRICT=1` to fail it on those too, `LIBMALLOC_ONLY=a,b` to run some checks, `LIBMALLOC_JOBS=n`
 //! for how many run at once, and `LIBMALLOC_REPORT=path` for a JSON-lines
 //! copy of the results.
 //!
@@ -31,6 +31,18 @@ use darwin::malloc::{self as m, KernReturn, MallocZone, Statistics, Task, VmRang
 
 const UPSTREAM: &str = "libmalloc-812.100.31";
 const CHILD: &str = "LIBMALLOC_CONFORMANCE_CHECK";
+
+/// Checks that fail by design: the differences from libmalloc that
+/// `darwin::malloc`'s module documentation lists.
+const KNOWN_DEVIATIONS: &[&str] = &[
+    // `enumerator` reports KERN_FAILURE.
+    "posix_memalign_enumerated",
+    // `malloc_set_zone_name` always copies the name.
+    "set_zone_name_literal",
+    // A block handed to the wrong zone is freed or moved, not aborted on.
+    "wrong_zone_free_aborts",
+    "wrong_zone_realloc_aborts",
+];
 
 const KERN_SUCCESS: KernReturn = 0;
 const MALLOC_PTR_IN_USE_RANGE_TYPE: c_uint = 1;
@@ -243,6 +255,16 @@ fn libmalloc_conformance() {
     if std::env::var("LIBMALLOC_STRICT").is_ok() {
         assert_eq!(failed, 0, "{failed} checks deviate from libmalloc");
     }
+    let unexpected: Vec<_> = checks
+        .iter()
+        .zip(&results)
+        .filter(|(c, o)| o.status == Status::Fail && !KNOWN_DEVIATIONS.contains(&c.name))
+        .map(|(c, _)| c.name)
+        .collect();
+    assert!(
+        unexpected.is_empty(),
+        "checks deviate from libmalloc: {unexpected:?}"
+    );
 }
 
 fn json(text: &str) -> String {

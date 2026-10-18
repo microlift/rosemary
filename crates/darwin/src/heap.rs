@@ -87,13 +87,15 @@ mod tests {
 
         unsafe extern "C" fn counting_free(block: *mut c_void) {
             FREED.fetch_add(1, Ordering::Relaxed);
-            // SAFETY: a block the host's own `malloc` returned.
-            unsafe { libc::free(block) };
+            // SAFETY: a block Darwin's `malloc` returned.
+            unsafe { darwin_free(block) };
         }
 
+        // Darwin's own pair, so that a block another test allocates on one
+        // side of the switch is still freed by the allocator that made it.
         let (was_malloc, was_free) = (MALLOC.load(Ordering::Acquire), FREE.load(Ordering::Acquire));
         register(
-            libc::malloc as *const () as usize,
+            darwin_malloc as *const () as usize,
             counting_free as *const () as usize,
         );
         assert!(is_registered());
