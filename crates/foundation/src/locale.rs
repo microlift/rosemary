@@ -86,23 +86,95 @@ unsafe extern "C" fn current_locale(_class: Id, _sel: Sel) -> Id {
     shared()
 }
 
-/// `+preferredLanguages`, which is the one language this process has.
+/// The languages the user prefers, most preferred first.
 ///
-/// One element rather than a guessed-at fallback chain: a program walks the
-/// list looking for a localisation it has, and an invented second entry would
-/// send it to a language the user never asked for.
-unsafe extern "C" fn preferred_languages(_class: Id, _sel: Sel) -> Id {
-    let tag = crate::string::from_str(&tag());
-    let array = corefoundation::collections::new_array(
-        &[tag as corefoundation::base::CFTypeRef],
-        corefoundation::callbacks::Policy::from_type_callbacks(),
-        false,
-    );
-    // SAFETY: both are fresh objects this call owns.
-    unsafe {
-        corefoundation::api::CFRelease(tag as corefoundation::base::CFTypeRef);
-        corefoundation::api::CFAutorelease(array) as Id
+/// What Apple's `CFLocaleCopyPreferredLanguages` (`CFLocale.c`) reads: the
+/// `AppleLanguages` preference, from the current application's domain and then
+/// the global one, as `CFPreferencesCopyAppValue` looks, each string made a
+/// canonical language identifier and anything else in the array skipped. A
+/// value that is not an array is no languages at all, as it is there.
+///
+/// A Mac's global domain always has the key, where this host's starts empty,
+/// so a store without one is answered with the environment's locale - the one
+/// language this process has, and one element rather than a guessed-at
+/// fallback chain: a program walks the list looking for a localisation it
+/// has, and an invented second entry would send it to a language the user
+/// never asked for.
+fn preferred() -> Vec<String> {
+    use corefoundation::plist::Value;
+    use corefoundation::preferences as defaults;
+    const KEY: &str = "AppleLanguages";
+    let stored = defaults::value(&defaults::current_application(), KEY)
+        .or_else(|| defaults::value(defaults::GLOBAL, KEY));
+    match stored {
+        None => vec![tag()],
+        Some(Value::Array(items)) => items
+            .iter()
+            .filter_map(|item| match item {
+                Value::String(text) => Some(canonical_language(text)),
+                _ => None,
+            })
+            .collect(),
+        Some(_) => Vec::new(),
     }
+}
+
+/// `CFLocaleCreateCanonicalLanguageIdentifierFromString`'s case and separator
+/// normalisation (Apple's `CFLocaleIdentifier.c`, `_UpdateFullLocaleString`):
+/// the language lowercased, a four-letter script with its first letter
+/// uppercased, a two-letter or three-digit region uppercased, `-` between
+/// subtags, and keywords and an encoding suffix dropped. Apple's tables of
+/// pre-10.4 names (`English`) and obsolete codes are not carried here.
+fn canonical_language(text: &str) -> String {
+    let base = text.split(['@', '.']).next().unwrap_or_default();
+    base.split(['-', '_'])
+        .enumerate()
+        .map(|(i, part)| {
+            let alpha = part.bytes().all(|b| b.is_ascii_alphabetic());
+            let digits = part.bytes().all(|b| b.is_ascii_digit());
+            match (i, part.len()) {
+                (0, _) => part.to_ascii_lowercase(),
+                (_, 4) if alpha => {
+                    let (first, rest) = part.split_at(1);
+                    first.to_ascii_uppercase() + &rest.to_ascii_lowercase()
+                }
+                (_, 2) if alpha => part.to_ascii_uppercase(),
+                (_, 3) if digits => part.to_string(),
+                _ => part.to_ascii_lowercase(),
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("-")
+}
+
+/// A new array of [`preferred`], which the caller owns.
+fn copy_preferred() -> corefoundation::base::CFTypeRef {
+    let tags: Vec<Id> = preferred()
+        .iter()
+        .map(|t| crate::string::from_str(t))
+        .collect();
+    let values: Vec<corefoundation::base::CFTypeRef> = tags
+        .iter()
+        .map(|&t| t as corefoundation::base::CFTypeRef)
+        .collect();
+    // `CFArrayCreateMutable` with `kCFTypeArrayCallBacks`, as Apple's is.
+    let array = corefoundation::collections::new_array(
+        &values,
+        corefoundation::callbacks::Policy::from_type_callbacks(),
+        true,
+    );
+    for value in values {
+        // SAFETY: a fresh string this call owns, which the array retained.
+        unsafe { corefoundation::api::CFRelease(value) };
+    }
+    array
+}
+
+/// `+preferredLanguages`, which Apple's Foundation answers with
+/// `CFLocaleCopyPreferredLanguages`, autoreleased.
+unsafe extern "C" fn preferred_languages(_class: Id, _sel: Sel) -> Id {
+    // SAFETY: a fresh array this call owns.
+    unsafe { corefoundation::api::CFAutorelease(copy_preferred()) as Id }
 }
 
 /// Whether this locale measures in metres.
@@ -290,6 +362,13 @@ pub mod cf {
         object
     }
 
+    /// `CFArrayRef CFLocaleCopyPreferredLanguages(void)`: the languages the
+    /// user prefers, most preferred first, as [`super::preferred`] reads
+    /// them. A `Copy`, so a new array the caller releases.
+    unsafe extern "C" fn CFLocaleCopyPreferredLanguages() -> Id {
+        super::copy_preferred() as Id
+    }
+
     /// `CFLocaleRef CFLocaleGetSystem(void)`.
     ///
     /// A `Get`, so the caller does not own it and will not release it - which
@@ -306,6 +385,7 @@ pub mod cf {
             "CFLocaleCopyCurrent" => CFLocaleCopyCurrent,
             "CFLocaleGetIdentifier" => CFLocaleGetIdentifier,
             "CFLocaleGetValue" => CFLocaleGetValue,
+            "CFLocaleCopyPreferredLanguages" => CFLocaleCopyPreferredLanguages,
         }
     }
 }
@@ -401,5 +481,16 @@ mod tests {
         assert_eq!(split("en_GB@euro"), ("en".into(), "GB".into()));
         assert_eq!(split("de"), ("de".into(), "US".into()));
         assert_eq!(split(""), ("en".into(), "US".into()));
+    }
+
+    /// The normalisation `CFLocaleCreateCanonicalLanguageIdentifierFromString`
+    /// gives an `AppleLanguages` entry.
+    #[test]
+    fn a_stored_language_is_made_canonical() {
+        assert_eq!(canonical_language("en-US"), "en-US");
+        assert_eq!(canonical_language("EN_us"), "en-US");
+        assert_eq!(canonical_language("zh-hans-cn"), "zh-Hans-CN");
+        assert_eq!(canonical_language("es_419"), "es-419");
+        assert_eq!(canonical_language("fr_CA.UTF-8@euro"), "fr-CA");
     }
 }

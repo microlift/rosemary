@@ -158,23 +158,47 @@ impl Layout {
 
     /// The bundle *at* `root`, which is how `+bundleWithPath:` asks.
     ///
-    /// The same shape [`Layout::enclosing`] recognises, entered from the other
-    /// end: a directory whose `Contents/Info.plist` is a file. The executable is
+    /// The shapes CFBundle's `_CFBundleGetBundleVersionForURL` tells apart:
+    /// a modern bundle keeps everything under `Contents/` (version 2), and a
+    /// framework keeps `Resources/` - with `Resources/Info.plist` in it - and
+    /// its executable at the top level (version 0), usually as symlinks into
+    /// `Versions/Current`. A `.framework` that has both is read as version 0,
+    /// anything else as version 2, which is Apple's order. The executable is
     /// named by `CFBundleExecutable` rather than found by looking, because a
     /// `.bundle` with a resource beside its binary in `MacOS` has no other way
     /// to say which one it is.
     pub fn at(root: &Path) -> Option<Layout> {
         let absolute = root.canonicalize().ok();
         let root = absolute.as_deref().unwrap_or(root);
-        let contents = root.join("Contents");
-        let info_path = contents.join("Info.plist");
+        let modern = root.join("Contents");
+        let flat = root.join("Resources");
+        let framework = root
+            .extension()
+            .is_some_and(|extension| extension == "framework");
+        let version_0 = match (modern.is_dir(), flat.is_dir()) {
+            (_, true) if framework => true,
+            (true, _) => false,
+            (false, true) => true,
+            (false, false) => return None,
+        };
+        let (contents, resources, executables) = match version_0 {
+            true => (root.to_path_buf(), flat, root.to_path_buf()),
+            false => (
+                modern.clone(),
+                modern.join("Resources"),
+                modern.join("MacOS"),
+            ),
+        };
+        let info_path = match version_0 {
+            true => resources.join("Info.plist"),
+            false => contents.join("Info.plist"),
+        };
         // CFBundle takes a bundle with no `Info.plist` at all, as an empty
         // dictionary: plug-in `.bundle`s built outside Xcode are often only
         // `Contents/MacOS/<name>`, and Unity loads every native plug-in that way.
         let info = match info_path.is_file() {
             true => plist::parse(&std::fs::read(&info_path).ok()?).ok()?,
-            false if contents.is_dir() => Value::Dictionary(Default::default()),
-            false => return None,
+            false => Value::Dictionary(Default::default()),
         };
         // CFBundle's rule: an empty or missing name falls back to the bundle's
         // own, extension stripped. Roblox Studio's protocol handler ships
@@ -184,11 +208,11 @@ impl Layout {
             .find_map(|key| info.get(key)?.as_str().filter(|name| !name.is_empty()))
             .map(std::ffi::OsStr::new)
             .or_else(|| root.file_stem())
-            .map(|name| contents.join("MacOS").join(name))
+            .map(|name| executables.join(name))
             .unwrap_or_default();
         Some(Layout {
             root: root.to_path_buf(),
-            resources: contents.join("Resources"),
+            resources,
             frameworks: contents.join("Frameworks"),
             plugins: plugins_of(&contents),
             executable,
@@ -316,13 +340,33 @@ impl Layout {
     }
 
     /// `-preferredLocalizations`: the `.lproj` names strings are read from,
-    /// most preferred first, restricted to the ones that exist.
+    /// most preferred first, restricted to the bundle's own localizations -
+    /// the directories it has and the names its `CFBundleLocalizations` lists.
+    ///
+    /// Never empty, which is Apple's rule rather than this module's
+    /// (`_CFBundleCopyLocalizationsForPreferences` in CF's `CFBundle_Locale.c`):
+    /// a bundle whose localizations match nothing preferred answers its first
+    /// one, and a bundle with none at all - an app whose `Resources` holds no
+    /// `.lproj` - answers `en`. Callers index the result without checking it.
     pub fn preferred_localizations(&self) -> Vec<String> {
-        self.string_localizations()
+        let available = self.localization_names();
+        let mut preferred: Vec<String> = self
+            .string_localizations()
             .into_iter()
-            .filter(|path| path.is_dir())
-            .filter_map(|path| Some(path.file_stem()?.to_str()?.to_owned()))
-            .collect()
+            .filter_map(|path| {
+                let name = path.file_stem()?.to_str()?.to_owned();
+                (path.is_dir() || available.contains(&name)).then_some(name)
+            })
+            .collect();
+        if preferred.is_empty() {
+            preferred.push(
+                available
+                    .first()
+                    .cloned()
+                    .unwrap_or_else(|| "en".to_owned()),
+            );
+        }
+        preferred
     }
 
     /// `-pathsForResourcesOfType:inDirectory:`: every entry with that extension
@@ -415,6 +459,39 @@ impl Layout {
             .find(|p| p.exists())
     }
 
+    /// `CFBundleCopyResourceURLForLocalization` and
+    /// `-pathForResource:ofType:inDirectory:forLocalization:`, by CF's rule
+    /// (`_copyResourceURLsFromBundle` in `CFBundle_Resources.c`): a
+    /// non-localized resource in `Resources/<directory>` is the answer whatever
+    /// localization is asked for, and otherwise only
+    /// `Resources/<localization>.lproj/<directory>` is searched - not the
+    /// other localizations, and with none named, no `.lproj` at all.
+    pub fn resource_for_localization(
+        &self,
+        name: &str,
+        extension: &str,
+        directory: &str,
+        localization: &str,
+    ) -> Option<PathBuf> {
+        let leaf = match extension.is_empty() {
+            true => name.to_string(),
+            false => format!("{name}.{extension}"),
+        };
+        let plain = self.resources.join(directory).join(&leaf);
+        if plain.exists() {
+            return Some(plain);
+        }
+        if localization.is_empty() {
+            return None;
+        }
+        let localized = self
+            .resources
+            .join(format!("{localization}.lproj"))
+            .join(directory)
+            .join(&leaf);
+        localized.exists().then_some(localized)
+    }
+
     /// The main nib, if the `Info.plist` names one and it is there.
     ///
     /// `.nib` and `.storyboardc` are both directories in a modern bundle and a
@@ -500,6 +577,29 @@ pub mod cf {
         file_url(&path, false)
     }
 
+    /// `CFURLRef CFBundleCopyResourceURLForLocalization(CFBundleRef,
+    /// CFStringRef name, CFStringRef type, CFStringRef subDir, CFStringRef
+    /// localizationName)`
+    unsafe extern "C" fn CFBundleCopyResourceURLForLocalization(
+        bundle: Id,
+        name: Id,
+        kind: Id,
+        subdirectory: Id,
+        localization: Id,
+    ) -> Id {
+        // SAFETY: each is an `NSString` or nil.
+        let strings = unsafe { super::strings([name, kind, subdirectory, localization]) };
+        let Some([name, kind, subdirectory, localization]) = strings else {
+            return std::ptr::null_mut();
+        };
+        match layout(bundle)
+            .and_then(|b| b.resource_for_localization(&name, &kind, &subdirectory, &localization))
+        {
+            Some(path) => file_url(&path, false),
+            None => std::ptr::null_mut(),
+        }
+    }
+
     /// `CFURLRef CFBundleCopyExecutableURL(CFBundleRef)`
     unsafe extern "C" fn CFBundleCopyExecutableURL(bundle: Id) -> Id {
         match layout(bundle) {
@@ -581,13 +681,28 @@ pub mod cf {
     }
 
     /// `CFArrayRef CFBundleCopyPreferredLocalizationsFromArray(CFArrayRef)`.
+    ///
+    /// The localization of `localizations` matching this process's language,
+    /// else the first - and, for a NULL or empty array, `en`: CF never answers
+    /// an empty array here (`_CFBundleCopyLocalizationsForPreferences`).
     unsafe extern "C" fn CFBundleCopyPreferredLocalizationsFromArray(localizations: Id) -> Id {
+        let backstop = || {
+            let en = crate::notification::name_object("en") as CFTypeRef;
+            corefoundation::collections::new_array(
+                &[en],
+                corefoundation::callbacks::Policy::from_type_callbacks(),
+                false,
+            ) as Id
+        };
         // SAFETY: a CFArray or null.
         let Some(array) =
             (unsafe { corefoundation::collections::array(localizations as CFTypeRef) })
         else {
-            return std::ptr::null_mut();
+            return backstop();
         };
+        if array.values.is_empty() {
+            return backstop();
+        }
         let language = crate::locale::language();
         let preferred = array.values.iter().copied().find(|value| {
             // SAFETY: localization arrays contain CFStrings.
@@ -834,6 +949,7 @@ pub mod cf {
             "CFBundleCopyLocalizedString" => CFBundleCopyLocalizedString,
             "CFBundleGetMainBundle" => CFBundleGetMainBundle,
             "CFBundleCopyResourceURL" => CFBundleCopyResourceURL,
+            "CFBundleCopyResourceURLForLocalization" => CFBundleCopyResourceURLForLocalization,
             "CFBundleCopyExecutableURL" => CFBundleCopyExecutableURL,
             "CFBundleCopyBundleURL" => CFBundleCopyBundleURL,
             "CFBundleCopyResourcesDirectoryURL" => CFBundleCopyResourcesDirectoryURL,
@@ -895,6 +1011,22 @@ fn entries_of_type(directory: &Path, extension: &str) -> Vec<PathBuf> {
 /// The main bundle, or `None` for a program that is not in one.
 pub fn main() -> Option<&'static Layout> {
     *MAIN.read().unwrap_or_else(|e| e.into_inner())
+}
+
+/// The UTF-8 of each `NSString` (nil reads as empty), or `None` if one is not
+/// UTF-8.
+///
+/// # Safety
+///
+/// Each is an `NSString` or nil.
+unsafe fn strings<const N: usize>(objects: [objc::object::Id; N]) -> Option<[String; N]> {
+    let mut out: [String; N] = std::array::from_fn(|_| String::new());
+    for (slot, object) in out.iter_mut().zip(objects) {
+        // SAFETY: the caller's `NSString` or nil.
+        let bytes = unsafe { crate::string::bytes(object) };
+        *slot = String::from_utf8(bytes).ok()?;
+    }
+    Some(out)
 }
 
 /// Resolve a resource in the bundle object the guest supplied.
@@ -1004,6 +1136,68 @@ mod tests {
         assert_eq!(layout.localization_names(), ["English"]);
     }
 
+    /// `-preferredLocalizations` is never empty, as CF's is not: a bundle
+    /// whose localizations match nothing preferred answers its first one, and
+    /// a bundle with none answers `en`.
+    #[test]
+    fn preferred_localizations_fall_back_as_cf_does() {
+        let exe = scratch("preferred", INFO);
+        let layout = Layout::enclosing(&exe).expect("a bundle");
+        assert_eq!(layout.preferred_localizations(), ["English"]);
+
+        let resources = layout.resources.clone();
+        std::fs::remove_dir_all(resources.join("English.lproj")).unwrap();
+        std::fs::create_dir_all(resources.join("xx.lproj")).unwrap();
+        assert_eq!(layout.preferred_localizations(), ["xx"]);
+
+        std::fs::remove_dir_all(resources.join("xx.lproj")).unwrap();
+        assert_eq!(layout.preferred_localizations(), ["en"]);
+    }
+
+    /// `CFBundleCopyResourceURLForLocalization`'s order: the non-localized
+    /// copy whatever is asked for, then only the named `.lproj`.
+    #[test]
+    fn a_localized_resource_is_found_only_in_its_own_lproj() {
+        let exe = scratch("for-localization", INFO);
+        let layout = Layout::enclosing(&exe).expect("a bundle");
+        let resources = layout.resources.clone();
+        std::fs::create_dir_all(resources.join("fr.lproj/sub")).unwrap();
+        std::fs::write(resources.join("fr.lproj/sub/menu.json"), "fr").unwrap();
+        std::fs::write(resources.join("English.lproj/menu.json"), "en").unwrap();
+
+        let found = |name, kind, dir, loc| layout.resource_for_localization(name, kind, dir, loc);
+        assert_eq!(
+            found("menu", "json", "sub", "fr"),
+            Some(resources.join("fr.lproj/sub/menu.json"))
+        );
+        assert_eq!(
+            found("menu", "json", "sub", "de"),
+            None,
+            "not another lproj"
+        );
+        assert_eq!(
+            found("menu", "json", "", "fr"),
+            None,
+            "fr has it only in sub"
+        );
+        assert_eq!(
+            found("menu", "json", "", ""),
+            None,
+            "no lproj without a name"
+        );
+        assert_eq!(
+            found("menu", "json", "", "English"),
+            Some(resources.join("English.lproj/menu.json"))
+        );
+
+        std::fs::write(resources.join("menu.json"), "plain").unwrap();
+        assert_eq!(
+            found("menu", "json", "", "English"),
+            Some(resources.join("menu.json")),
+            "the non-localized copy first"
+        );
+    }
+
     #[test]
     fn an_empty_executable_name_falls_back_to_the_bundle_name() {
         let exe = scratch(
@@ -1059,6 +1253,51 @@ mod tests {
         std::fs::write(&loose, b"").unwrap();
         assert!(Layout::enclosing(&loose).is_none(), "Contents/Thing");
         assert!(Layout::enclosing(Path::new("/bin/ls")).is_none());
+    }
+
+    /// A framework is read the way CFBundle reads a version 0 bundle: its
+    /// `Info.plist` and resources under a top-level `Resources`, its executable
+    /// beside them, both reached through the `Versions/Current` symlinks.
+    #[test]
+    fn a_framework_is_read_through_its_top_level_resources() {
+        let root = std::env::temp_dir().join("rosemary-bundle-framework");
+        let _ = std::fs::remove_dir_all(&root);
+        let framework = root.join("Thing.framework");
+        let version = framework.join("Versions/A");
+        std::fs::create_dir_all(version.join("Resources")).unwrap();
+        std::fs::write(version.join("Resources/Info.plist"), INFO).unwrap();
+        std::fs::write(version.join("Resources/data.dat"), b"").unwrap();
+        std::fs::write(version.join("Thing"), b"").unwrap();
+        std::os::unix::fs::symlink("A", framework.join("Versions/Current")).unwrap();
+        for name in ["Resources", "Thing"] {
+            std::os::unix::fs::symlink(format!("Versions/Current/{name}"), framework.join(name))
+                .unwrap();
+        }
+
+        let layout = Layout::at(&framework).expect("a framework");
+        assert_eq!(layout.identifier(), Some("com.example.thing"));
+        assert_eq!(
+            layout.executable,
+            framework.canonicalize().unwrap().join("Thing")
+        );
+        assert!(layout.resource("data", "dat").is_some());
+    }
+
+    /// A `.framework` with both shapes is read as a framework, and anything else
+    /// with both as a modern bundle - Apple's order of precedence.
+    #[test]
+    fn contents_wins_except_in_a_framework() {
+        let root = std::env::temp_dir().join("rosemary-bundle-both");
+        let _ = std::fs::remove_dir_all(&root);
+        for name in ["Both.framework", "Both.bundle"] {
+            let bundle = root.join(name);
+            std::fs::create_dir_all(bundle.join("Contents/MacOS")).unwrap();
+            std::fs::create_dir_all(bundle.join("Resources")).unwrap();
+            let layout = Layout::at(&bundle).expect("a bundle");
+            let flat = name.ends_with(".framework");
+            assert_eq!(layout.contents.ends_with("Contents"), !flat, "{name}");
+        }
+        assert!(Layout::at(&root).is_none(), "neither shape");
     }
 
     /// An `Info.plist` that cannot be read is a bundle this runtime declines to
@@ -1629,6 +1868,52 @@ pub(crate) mod class {
         path(unsafe { layout_of(receiver) }.and_then(|b| b.resource_in(name, kind, directory)))
     }
 
+    /// `-pathForResource:ofType:inDirectory:forLocalization:`, which
+    /// Foundation answers with `CFBundleCopyResourceURLForLocalization`.
+    unsafe extern "C" fn path_for_resource_for_localization(
+        receiver: Id,
+        _sel: Sel,
+        name: Id,
+        kind: Id,
+        directory: Id,
+        localization: Id,
+    ) -> Id {
+        // SAFETY: each argument is an `NSString` or nil.
+        let Some([name, kind, directory, localization]) =
+            (unsafe { super::strings([name, kind, directory, localization]) })
+        else {
+            return std::ptr::null_mut();
+        };
+        // SAFETY: the receiver is an `NSBundle`.
+        path(
+            unsafe { layout_of(receiver) }
+                .and_then(|b| b.resource_for_localization(&name, &kind, &directory, &localization)),
+        )
+    }
+
+    /// `-URLForResource:withExtension:subdirectory:localization:`, the URL
+    /// form of the above.
+    unsafe extern "C" fn url_for_resource_for_localization(
+        receiver: Id,
+        _sel: Sel,
+        name: Id,
+        kind: Id,
+        directory: Id,
+        localization: Id,
+    ) -> Id {
+        // SAFETY: each argument is an `NSString` or nil.
+        let Some([name, kind, directory, localization]) =
+            (unsafe { super::strings([name, kind, directory, localization]) })
+        else {
+            return std::ptr::null_mut();
+        };
+        // SAFETY: the receiver is an `NSBundle`.
+        resource_file_url(
+            unsafe { layout_of(receiver) }
+                .and_then(|b| b.resource_for_localization(&name, &kind, &directory, &localization)),
+        )
+    }
+
     /// `-infoDictionary`: the whole `Info.plist` as objects.
     ///
     /// This was refused until `crate::objectify` existed, and the reason is
@@ -1665,6 +1950,8 @@ pub(crate) mod class {
             "pathForResource:ofType:" => path_for_resource, c"@32@0:8@16@24";
             "URLForResource:withExtension:" => url_for_resource, c"@32@0:8@16@24";
             "pathForResource:ofType:inDirectory:" => path_for_resource_in_directory, c"@40@0:8@16@24@32";
+            "pathForResource:ofType:inDirectory:forLocalization:" => path_for_resource_for_localization, c"@48@0:8@16@24@32@40";
+            "URLForResource:withExtension:subdirectory:localization:" => url_for_resource_for_localization, c"@48@0:8@16@24@32@40";
             "infoDictionary" => info_dictionary, c"@16@0:8";
             "executableName" => executable_name, c"*16@0:8";
             "localizedStringForKey:value:table:" => localized_string_for_key, c"@40@0:8@16@24@32";

@@ -2517,6 +2517,8 @@ pub static SIGNATURES: &[FunctionAbi] = &[
     sig!("glValidateProgram", V, U32),
     sig!("glVertexAttribDivisor", V, U32, U32),
     sig!("glVertexAttribIPointer", V, U32, I32, U32, I32, P),
+    sig!("CFBundleCopyResourceURLForLocalization", P, P, P, P, P, P),
+    sig!("CFLocaleCopyPreferredLanguages", P),
     sig!("glWaitSync", V, P, U32, U64),
     sig!("glTexParameterf", V, U32, U32, F32),
     sig!("glTexParameteri", V, U32, U32, I32),
