@@ -244,3 +244,11 @@ the driver's own version, extensions and functions instead.
 
 The built-in GLU surface provides `gluOrtho2D` through the driver's `glOrtho`;
 other GLU functions are unbound. No host GLU library is required.
+
+## Bounded Metal frame captures
+
+`ROSEMARY_FRAME_OUT` selects a directory for diagnostic PPM frame captures.
+`ROSEMARY_FRAME_INTERVAL` selects the sampling interval in frames (default 30).
+`ROSEMARY_FRAME_LIMIT` caps scheduled captures per process (default 8; 0 disables
+capture). Failed writes also consume the limit. Filenames include the process ID
+to avoid collisions between concurrent guests.
