@@ -1950,21 +1950,17 @@ unsafe extern "C" fn data_init_with_bytes(
 }
 
 /// `-initWithBytesNoCopy:length:freeWhenDone:`. Copied, as
-/// [`data_with_bytes_no_copy`] explains, and the caller's buffer released
-/// now when it handed it over.
+/// [`data_with_bytes_no_copy_free`] explains: the buffer a guest asked to be
+/// freed is left to it rather than freed synchronously before `-dealloc`.
 unsafe extern "C" fn data_init_no_copy_free(
     receiver: Id,
     _sel: Sel,
     bytes: *mut u8,
     length: usize,
-    free: bool,
+    _free: bool,
 ) -> Id {
     // SAFETY: the caller says `bytes` covers `length` bytes.
     let copy = unsafe { raw(bytes, length) }.to_vec();
-    if free && !bytes.is_null() {
-        // SAFETY: a `malloc` block the caller gave away.
-        unsafe { darwin::heap::free(bytes.cast()) };
-    }
     replace_receiver(receiver, copy)
 }
 

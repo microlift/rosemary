@@ -765,4 +765,30 @@ mod tests {
             );
         }
     }
+
+    #[test]
+    fn data_init_with_bytes_no_copy_does_not_free_caller_buffer_immediately() {
+        bootstrap();
+        let class = class(c"NSData");
+        unsafe {
+            let alloc: unsafe extern "C" fn(Id, Sel) -> Id =
+                std::mem::transmute(objc::msg::entry());
+            let init: unsafe extern "C" fn(Id, Sel, *mut u8, usize, bool) -> Id =
+                std::mem::transmute(objc::msg::entry());
+            let mut stack_buf = [1u8, 2, 3, 4];
+            let instance = alloc(class, objc::sel::get("alloc"));
+            let data = init(
+                instance,
+                objc::sel::get("initWithBytesNoCopy:length:freeWhenDone:"),
+                stack_buf.as_mut_ptr(),
+                stack_buf.len(),
+                true,
+            );
+            assert!(!data.is_null());
+            let length: unsafe extern "C" fn(Id, Sel) -> usize =
+                std::mem::transmute(objc::msg::entry());
+            assert_eq!(length(data, objc::sel::get("length")), 4);
+            objc::arc::release(data);
+        }
+    }
 }
