@@ -1244,6 +1244,49 @@ pub unsafe extern "C" fn CFArrayGetValueAtIndex(array: CFTypeRef, index: CFIndex
     }
 }
 
+/// `void CFArrayGetValues(CFArrayRef, CFRange, const void **)`.
+///
+/// Under SysV AMD64 and AAPCS64, `CFRange` (two `CFIndex` fields) is passed
+/// flattened in two consecutive integer registers.
+///
+/// A range that is not inside the array copies nothing, for
+/// [`CFStringGetCharacters`]' reason: the caller sized its buffer from the range it
+/// asked for.
+pub unsafe extern "C" fn CFArrayGetValues(
+    array: CFTypeRef,
+    range_location: CFIndex,
+    range_length: CFIndex,
+    values: *mut CFTypeRef,
+) {
+    if values.is_null() {
+        return;
+    }
+    let (Ok(start), Ok(count)) = (
+        usize::try_from(range_location),
+        usize::try_from(range_length),
+    ) else {
+        return;
+    };
+    let Some(a) = (unsafe { collections::array(array) }) else {
+        return;
+    };
+    let Some(slice) = start
+        .checked_add(count)
+        .filter(|&end| end <= a.values.len())
+        .and_then(|end| a.values.get(start..end))
+    else {
+        return;
+    };
+    if count == 0 {
+        return;
+    }
+    // SAFETY: caller guaranteed `values` points to at least `range_length` pointers,
+    // and `slice` has exact length `count`.
+    unsafe {
+        std::ptr::copy_nonoverlapping(slice.as_ptr(), values, count);
+    }
+}
+
 //
 
 pub unsafe extern "C" fn CFSetGetTypeID() -> CFTypeID {
