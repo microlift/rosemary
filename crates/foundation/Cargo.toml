@@ -13,3 +13,6 @@ darwin.workspace = true
 prefix.workspace = true
 libc.workspace = true
 ureq.workspace = true
+
+[dev-dependencies]
+machish.workspace = true

@@ -1197,6 +1197,7 @@ dependencies = [
  "darwin",
  "exports",
  "libc",
+ "machish",
  "objc",
  "prefix",
  "ureq",

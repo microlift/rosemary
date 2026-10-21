@@ -40,6 +40,7 @@ pub mod processinfo;
 pub mod proxy;
 pub mod runtime;
 mod signature;
+pub mod stream;
 pub mod string;
 pub mod strings;
 pub mod task;
@@ -51,6 +52,7 @@ pub mod url;
 mod urlcomponents;
 pub mod urlsession;
 pub mod value;
+mod valuetransformer;
 
 mod collections;
 
@@ -90,6 +92,7 @@ pub fn bootstrap() {
         url::install();
         urlcomponents::install();
         json::install();
+        stream::install();
         urlsession::install();
         cookies::install();
         defaults::install();
@@ -97,6 +100,7 @@ pub fn bootstrap() {
         filehandle::install();
         task::install();
         appleevent::install();
+        valuetransformer::install();
     });
 }
 
@@ -246,6 +250,7 @@ pub const CLASSES: &[&str] = &[
     "NSMutableAttributedString",
     "NSCharacterSet",
     "NSIndexSet",
+    "NSValueTransformer",
     "NSMutableIndexSet",
     "NSURLComponents",
     "NSHTTPCookie",
@@ -297,6 +302,8 @@ pub const CLASSES: &[&str] = &[
     "NSAppleEventManager",
     "NSAppleEventDescriptor",
     "NSMethodSignature",
+    "NSStream",
+    "NSInputStream",
 ];
 
 // The image-resident number classes are `constant::CLASSES`, published the same
@@ -315,6 +322,8 @@ pub fn data_symbols() -> Vec<(String, u64)> {
         kvo::KEYS,
         decimal::KEYS,
         proxy::KEYS,
+        stream::KEYS,
+        valuetransformer::KEYS,
         STRING_GLOBALS,
     ] {
         out.extend(corefoundation::base::string_globals(table));
