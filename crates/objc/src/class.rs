@@ -526,6 +526,21 @@ pub fn lookup(name: &CStr) -> Option<&'static Class> {
     Some(class)
 }
 
+/// Returns the number of registered classes.
+pub fn class_count() -> usize {
+    CLASSES.read().unwrap_or_else(|e| e.into_inner()).len()
+}
+
+/// Returns all currently registered classes.
+pub fn all_classes() -> Vec<&'static Class> {
+    CLASSES
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .values()
+        .copied()
+        .collect()
+}
+
 static NAMED: AtomicUsize = AtomicUsize::new(1);
 
 const LOOKUP_SLOTS: usize = 128;

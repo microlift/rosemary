@@ -2824,6 +2824,8 @@ pub static SIGNATURES: &[FunctionAbi] = &[
     sig!("nextafter", F64, F64, F64),
     sig!("nl_langinfo", P, I32),
     sig!("nl_langinfo_l", P, I32, P),
+    sig!("objc_copyClassList", P, P),
+    sig!("objc_getClassList", I32, P, I32),
     // Fixed-arity adapters for x86-64 imports. Native Apple arm64 retains
     // the host's variadic ABI, whose optional arguments are on the stack.
     sig!("open", I32, P, I32, U32),
@@ -4451,6 +4453,8 @@ mod tests {
         // Not a blanket "anything starting with OBJC": the entry points are
         // functions with signatures, and swallowing one here would hide it.
         assert!(matches!(lookup(0, "_objc_msgSend"), Lookup::Unknown));
+        assert!(matches!(lookup(0, "_objc_getClassList"), Lookup::Known(_)));
+        assert!(matches!(lookup(0, "_objc_copyClassList"), Lookup::Known(_)));
     }
 
     #[test]

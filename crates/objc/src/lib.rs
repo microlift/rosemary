@@ -46,6 +46,8 @@ exports::exports! {
         "sel_getName" => api::sel_getName,
         "sel_isEqual" => api::sel_isEqual,
         "objc_getClass" => api::objc_getClass,
+        "objc_getClassList" => api::objc_getClassList,
+        "objc_copyClassList" => api::objc_copyClassList,
         "objc_lookUpClass" => api::objc_lookUpClass,
         "objc_getRequiredClass" => api::objc_getRequiredClass,
         "objc_getMetaClass" => api::objc_getMetaClass,
