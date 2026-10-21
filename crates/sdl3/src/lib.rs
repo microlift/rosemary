@@ -253,6 +253,7 @@ struct Api {
     SDL_SetCursor: Option<unsafe extern "C" fn(Cursor) -> bool>,
     SDL_GetDefaultCursor: Option<unsafe extern "C" fn() -> Cursor>,
     SDL_DestroyCursor: Option<unsafe extern "C" fn(Cursor)>,
+    SDL_GetMouseFocus: Option<unsafe extern "C" fn() -> Window>,
     SDL_GetMouseState: Option<unsafe extern "C" fn(*mut f32, *mut f32) -> u32>,
     SDL_GetGlobalMouseState: Option<unsafe extern "C" fn(*mut f32, *mut f32) -> u32>,
     SDL_WarpMouseInWindow: Option<unsafe extern "C" fn(Window, f32, f32)>,
@@ -484,6 +485,7 @@ fn api() -> Option<&'static Api> {
             SDL_SetCursor,
             SDL_GetDefaultCursor,
             SDL_DestroyCursor,
+            SDL_GetMouseFocus,
             SDL_GetMouseState,
             SDL_GetGlobalMouseState,
             SDL_WarpMouseInWindow,
@@ -3309,6 +3311,14 @@ pub mod video {
         // SAFETY: two writable floats.
         let buttons = unsafe { f(&mut x, &mut y) };
         Some((x, y, buttons))
+    }
+
+    /// The window whose coordinate system `mouse_state` uses. Main thread only.
+    pub fn mouse_focus() -> Option<Window> {
+        let f = api()?.SDL_GetMouseFocus?;
+        // SAFETY: SDL owns the returned window; this does not transfer ownership.
+        let window = unsafe { f() };
+        (!window.is_null()).then_some(window)
     }
 
     /// The pointer in the focused window's coordinates, and held buttons.

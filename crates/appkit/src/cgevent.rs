@@ -192,6 +192,11 @@ pub fn note_mouse_delta(dx: f32, dy: f32) {
     delta.1 += dy;
 }
 
+/// Forget unconsumed motion when the application loses input focus.
+pub(crate) fn reset_mouse_delta() {
+    *DELTA.lock().unwrap_or_else(|e| e.into_inner()) = (0.0, 0.0);
+}
+
 /// `void CGGetLastMouseDelta(int32_t *deltaX, int32_t *deltaY)`
 ///
 /// CoreGraphics answers with the last event's movement. A game reads it once
