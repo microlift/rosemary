@@ -93,10 +93,13 @@ const NUMBERS: &[(i32, i32)] = &[
     (90, libc::EIDRM),
     (91, libc::ENOMSG),
     (92, libc::EILSEQ),
-    #[cfg(target_os = "freebsd")]
-    (93, libc::ENOATTR),
     (94, libc::EBADMSG),
     (95, libc::EMULTIHOP),
+    // FreeBSD has a number of its own for a missing attribute; Linux reports
+    // one as `ENODATA`, which only the attribute calls can tell apart - see
+    // `crate::xattr`.
+    #[cfg(target_os = "freebsd")]
+    (93, libc::ENOATTR),
     #[cfg(not(target_os = "freebsd"))]
     (96, libc::ENODATA),
     (97, libc::ENOLINK),
@@ -192,11 +195,24 @@ mod guest_slot {
     thread_local! {
         /// What the guest sees, in Darwin's numbering.
         pub static VALUE: Cell<libc::c_int> = const { Cell::new(0) };
-        /// The host number [`super::error`] last wrote into the host's slot, so
-        /// a later call can tell "the host changed it" from "the guest did".
-        pub static PUSHED: Cell<libc::c_int> = const { Cell::new(0) };
+        /// The host number [`super::set_guest`] left in the host's slot, and
+        /// the Darwin number it stands for there.
+        pub static PENDING: Cell<(libc::c_int, libc::c_int)> =
+            const { Cell::new((super::UNTOUCHED, 0)) };
     }
 }
+
+/// What [`error`] leaves in the host's slot: a number no host call writes, as
+/// every `errno` is a small positive one.
+///
+/// Comparing the host's slot with the number last put there is not enough. A
+/// host call that fails twice with the same error writes the same number twice,
+/// and the second failure would read as no change at all - so a guest that
+/// cleared `errno` in between, as OpenSSL does before every socket read, would
+/// find its own 0 where the host had just reported `EAGAIN`. With a number no
+/// host call writes, any write at all is seen.
+#[cfg(not(target_os = "macos"))]
+const UNTOUCHED: libc::c_int = i32::MIN + 0x6572;
 
 /// `int *__error(void)`, as the guest imports it.
 ///
@@ -208,14 +224,18 @@ mod guest_slot {
 ///
 /// `errno` is a macro for `(*__error())`, so a C guest calls this immediately
 /// before every read *and* every write. That is the whole hook available: the
-/// write itself cannot be seen. Each call therefore does three things.
+/// write itself cannot be seen. Each call therefore does two things.
 ///
-/// 1. If the host's slot differs from what this function last put there, a host
-///    call changed it; the guest's slot is refreshed from it.
+/// 1. If the host's slot holds the number [`set_guest`] left pending there,
+///    the guest's slot keeps the Darwin number it was set to. Otherwise, if
+///    the host's slot holds anything but [`UNTOUCHED`], a host call wrote it
+///    since the last call; the guest's slot is refreshed from it.
 /// 2. Otherwise the guest's slot is left alone, which is what makes `errno = 0`
 ///    stick across an intervening host call that succeeded quietly.
-/// 3. The guest's value is pushed back to the host's slot and remembered, so
-///    that a shim in this crate reading [`get`] sees what the guest set.
+///
+/// Either way the host's slot is then set back to [`UNTOUCHED`]. A shim in this
+/// crate that wants what the guest last stored reads [`guest_errno`], not
+/// [`get`].
 ///
 /// The one case it cannot get right is a guest write and a host write between
 /// the same pair of calls, where the host's wins. There is no `errno` read
@@ -238,25 +258,30 @@ pub fn guest_location() -> *mut libc::c_int {
     #[cfg(not(target_os = "macos"))]
     {
         let host = get();
-        guest_slot::PUSHED.with(|pushed| {
-            guest_slot::VALUE.with(|value| {
-                if host != pushed.get() {
-                    value.set(from_host(host));
-                }
-                let now = to_host(value.get());
-                pushed.set(now);
-                set(now);
-                value.as_ptr()
-            })
+        let (pending, darwin) = guest_slot::PENDING.with(|p| p.replace((UNTOUCHED, 0)));
+        guest_slot::VALUE.with(|value| {
+            if host == pending && pending != UNTOUCHED {
+                value.set(darwin);
+            } else if host != UNTOUCHED {
+                value.set(from_host(host));
+            }
+            set(UNTOUCHED);
+            value.as_ptr()
         })
     }
 }
 
-/// Set the guest's `errno` to Darwin's `darwin`, for an error this host's own
-/// number would name differently or not at all.
+/// Report `darwin` - a number in Darwin's numbering - as the guest's `errno`.
 ///
-/// Both slots are written, and the host one is remembered as pushed, so the
-/// next reconciliation keeps `darwin` rather than renaming it from the host's.
+/// For an error a shim decides on that has no host number to [`set`], or whose
+/// host number means more than one Darwin error: Linux's `ENODATA` is Darwin's
+/// `ENODATA` from most calls but its `ENOATTR` from the attribute ones.
+///
+/// The host's slot gets the host's nearest number, as callers in this crate
+/// read it back with [`get`], and is remembered as pending: the next
+/// [`guest_location`] that still finds it there gives the guest `darwin`
+/// rather than renaming it. Only that one reconciliation is affected, so a
+/// repeated host error is still seen after it.
 pub fn set_guest(darwin: i32) {
     #[cfg(target_os = "macos")]
     set(darwin);
@@ -264,7 +289,7 @@ pub fn set_guest(darwin: i32) {
     {
         let host = to_host(darwin);
         guest_slot::VALUE.with(|value| value.set(darwin));
-        guest_slot::PUSHED.with(|pushed| pushed.set(host));
+        guest_slot::PENDING.with(|p| p.set((host, darwin)));
         set(host);
     }
 }
@@ -406,6 +431,31 @@ mod tests {
         // A host call that succeeds and leaves `errno` alone.
         // SAFETY: the accessor is re-entered exactly as a guest would.
         assert_eq!(unsafe { *error() }, 0, "the guest's own write was lost");
+        set(0);
+    }
+
+    /// The same host error twice, with the guest clearing `errno` between the
+    /// two, must read as the second error and not as the guest's 0 - a socket
+    /// read that would block twice running reports `EAGAIN` both times.
+    #[test]
+    #[cfg(not(target_os = "macos"))]
+    fn a_repeated_host_error_is_seen_after_a_guest_clear() {
+        set(libc::EAGAIN);
+        // SAFETY: as above; the guest reads, then clears.
+        unsafe {
+            let slot = error();
+            assert_eq!(*slot, 35);
+            *slot = 0;
+            assert_eq!(*error(), 0);
+        }
+        // The same host call failing the same way.
+        set(libc::EAGAIN);
+        // SAFETY: as above.
+        assert_eq!(
+            unsafe { *error() },
+            35,
+            "the second EAGAIN was taken for no change"
+        );
         set(0);
     }
 
