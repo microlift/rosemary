@@ -148,6 +148,8 @@ pub mod oflag {
     pub const O_CLOEXEC: i32 = 0x0100_0000;
     /// Execute-only open; Linux has no separate execute access mode.
     pub const O_EXEC: i32 = 0x4000_0000;
+    /// A descriptor wanted for event notifications.
+    pub const O_EVTONLY: i32 = 0x0000_8000;
 }
 
 pub fn creates(flags: i32) -> bool {
@@ -157,7 +159,7 @@ pub fn creates(flags: i32) -> bool {
 /// The guest's `open` flags as the host's.
 ///
 /// Bit for bit on macOS. Elsewhere a translation, and one that drops nothing silently:
-/// a Darwin-only flag with no host equivalent - `O_SHLOCK`, `O_EVTONLY`, `O_SYMLINK` -
+/// a Darwin-only flag with no host equivalent - `O_SHLOCK`, `O_SYMLINK` -
 /// is reported rather than ignored, because a guest that asked for a shared lock and
 /// did not get one has been told it succeeded.
 #[cfg(not(target_os = "macos"))]
@@ -185,6 +187,12 @@ const PAIRS: &[(i32, libc::c_int)] = &[
     (oflag::O_CLOEXEC, libc::O_CLOEXEC),
     // Linux represents an execute-only open as a normal read-only descriptor.
     (oflag::O_EXEC, 0),
+    // XNU's `open1` keeps the access mode an `O_EVTONLY` open asked for - it is
+    // taken away only for a process that opted into that - and the flag
+    // otherwise means the descriptor does not hold its volume busy, and an I/O
+    // hint. Neither is a promise a host descriptor breaks, so the open is the
+    // plain one.
+    (oflag::O_EVTONLY, 0),
 ];
 
 #[cfg(not(target_os = "macos"))]

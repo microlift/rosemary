@@ -1,4 +1,4 @@
-use std::ffi::{c_int, c_void};
+use std::ffi::{c_char, c_int, c_void};
 
 const PROC_PIDLISTFDS: c_int = 1;
 const PROC_PIDTBSDINFO: c_int = 3;
@@ -505,6 +505,354 @@ pub unsafe extern "C" fn proc_listallpids(buffer: *mut c_void, size: c_int) -> c
     bytes / size_of::<i32>() as c_int
 }
 
+/// `proc_pidfdinfo` flavours.
+const PROC_PIDFDVNODEINFO: c_int = 1;
+const PROC_PIDFDVNODEPATHINFO: c_int = 2;
+const PROC_PIDFDCHANNELINFO: c_int = 10;
+
+/// `DTYPE_VNODE`, in `fi_type`.
+const DTYPE_VNODE: i32 = 1;
+/// `fi_status`: the descriptor closes on exec.
+const PROC_FP_CLEXEC: u32 = 2;
+const MAXPATHLEN: usize = 1024;
+
+/// `struct proc_fileinfo`
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct ProcFileInfo {
+    openflags: u32,
+    status: u32,
+    offset: i64,
+    kind: i32,
+    guardflags: u32,
+}
+
+/// `struct vinfo_stat`: `stat64` with fixed-width fields.
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct VinfoStat {
+    dev: u32,
+    mode: u16,
+    nlink: u16,
+    ino: u64,
+    uid: u32,
+    gid: u32,
+    atime: i64,
+    atimensec: i64,
+    mtime: i64,
+    mtimensec: i64,
+    ctime: i64,
+    ctimensec: i64,
+    birthtime: i64,
+    birthtimensec: i64,
+    size: i64,
+    blocks: i64,
+    blksize: i32,
+    flags: u32,
+    generation: u32,
+    rdev: u32,
+    qspare: [i64; 2],
+}
+
+/// `struct vnode_info`
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct VnodeInfo {
+    stat: VinfoStat,
+    kind: i32,
+    pad: i32,
+    fsid: [i32; 2],
+}
+
+/// `struct vnode_fdinfo`
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct VnodeFdInfo {
+    file: ProcFileInfo,
+    vnode: VnodeInfo,
+}
+
+/// `struct vnode_fdinfowithpath`
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct VnodeFdInfoWithPath {
+    file: ProcFileInfo,
+    vnode: VnodeInfo,
+    path: [u8; MAXPATHLEN],
+}
+
+const _: () = {
+    assert!(size_of::<ProcFileInfo>() == 24);
+    assert!(size_of::<VinfoStat>() == 136);
+    assert!(size_of::<VnodeInfo>() == 152);
+    assert!(size_of::<VnodeFdInfo>() == 176);
+    assert!(size_of::<VnodeFdInfoWithPath>() == 1200);
+};
+
+/// `munge_vinfo_stat`, from what `fstat` tells the guest.
+fn vinfo_stat(st: &crate::stat::Stat) -> VinfoStat {
+    VinfoStat {
+        dev: st.dev as u32,
+        mode: st.mode,
+        nlink: st.nlink,
+        ino: st.ino,
+        uid: st.uid,
+        gid: st.gid,
+        atime: st.atime.sec,
+        atimensec: st.atime.nsec,
+        mtime: st.mtime.sec,
+        mtimensec: st.mtime.nsec,
+        ctime: st.ctime.sec,
+        ctimensec: st.ctime.nsec,
+        birthtime: st.birthtime.sec,
+        birthtimensec: st.birthtime.nsec,
+        size: st.size,
+        blocks: st.blocks,
+        blksize: st.blksize,
+        flags: st.flags,
+        generation: st.generation,
+        rdev: st.rdev as u32,
+        qspare: st.qspare,
+    }
+}
+
+/// `enum vtype` for a file of mode `mode`.
+fn vnode_type(mode: u32) -> i32 {
+    match mode & libc::S_IFMT {
+        libc::S_IFREG => 1,
+        libc::S_IFDIR => 2,
+        libc::S_IFBLK => 3,
+        libc::S_IFCHR => 4,
+        libc::S_IFLNK => 5,
+        libc::S_IFSOCK => 6,
+        libc::S_IFIFO => 7,
+        _ => 0,
+    }
+}
+
+/// This process's descriptor `fd`, as `fill_fileinfo` and `fill_vnodeinfo`
+/// describe it, and the guest's spelling of its path. `Err` is the errno: a
+/// descriptor that is not a vnode - a socket, a pipe, an event queue or any
+/// other object of the kernel's - is `EBADF`, as `fp_get_ftype` has it.
+fn vnode_record(fd: c_int) -> Result<(ProcFileInfo, VnodeInfo, Vec<u8>), c_int> {
+    use std::os::unix::ffi::OsStrExt;
+    // SAFETY: a zeroed `struct stat` is what the host is asked to fill.
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    // SAFETY: `st` is a live local; a closed descriptor is the host's EBADF.
+    if unsafe { libc::fstat(fd, &mut st) } != 0 {
+        return Err(libc::EBADF);
+    }
+    let link = starnix::fd::resolved(fd).unwrap_or_default();
+    let link_bytes = link.as_os_str().as_bytes();
+    let kernel_object = ["socket:", "pipe:", "anon_inode:"]
+        .iter()
+        .any(|prefix| link_bytes.starts_with(prefix.as_bytes()));
+    if st.st_mode & libc::S_IFMT == libc::S_IFSOCK || kernel_object {
+        return Err(libc::EBADF);
+    }
+    // SAFETY: plain descriptor queries; failures read as zero below.
+    let (flags, fd_flags, offset) = unsafe {
+        (
+            libc::fcntl(fd, libc::F_GETFL),
+            libc::fcntl(fd, libc::F_GETFD),
+            libc::lseek(fd, 0, libc::SEEK_CUR),
+        )
+    };
+    let file = ProcFileInfo {
+        // `fg_flag` is `FFLAGS` of the open flags: the access mode plus one,
+        // so that `FREAD` and `FWRITE` are bits.
+        openflags: (crate::fcntl::flags_to_guest(flags.max(0)) + 1) as u32,
+        status: if fd_flags > 0 && fd_flags & libc::FD_CLOEXEC != 0 {
+            PROC_FP_CLEXEC
+        } else {
+            0
+        },
+        offset: offset.max(0) as i64,
+        kind: DTYPE_VNODE,
+        guardflags: 0,
+    };
+    // SAFETY: a zeroed `struct statfs` is what the host is asked to fill.
+    let mut fs: libc::statfs = unsafe { std::mem::zeroed() };
+    // SAFETY: `fs` is a live local.
+    let fsid = match unsafe { libc::fstatfs(fd, &mut fs) } {
+        // SAFETY: `fsid_t` is two `int`s on every host, as `Statfs` reads it.
+        0 => unsafe { std::mem::transmute::<libc::fsid_t, [i32; 2]>(fs.f_fsid) },
+        _ => [0; 2],
+    };
+    let vnode = VnodeInfo {
+        stat: vinfo_stat(&crate::stat::as_seen(&st, crate::stat::Found::Fd(fd))),
+        kind: vnode_type(st.st_mode as u32),
+        pad: 0,
+        fsid,
+    };
+    let path = match link_bytes.is_empty() {
+        true => Vec::new(),
+        false => prefix::ns::to_guest(&link)
+            .unwrap_or(link)
+            .into_os_string()
+            .into_encoded_bytes(),
+    };
+    Ok((file, vnode, path))
+}
+
+/// `int proc_pidfdinfo(int pid, int fd, int flavor, void *buffer, int
+/// buffersize)`: the bytes written, or 0 with `errno` set.
+///
+/// The vnode flavours, for this process's descriptors. Another process's
+/// descriptors live in that process and are not answered for, as with
+/// `PROC_PIDLISTFDS`; nor are the socket, pipe, semaphore, shared memory and
+/// queue flavours, whose records describe kernel state this host does not
+/// keep in Darwin's terms.
+///
+/// # Safety
+///
+/// `buffer` is null or writable for `size` bytes.
+pub unsafe extern "C" fn proc_pidfdinfo(
+    pid: c_int,
+    fd: c_int,
+    flavor: c_int,
+    buffer: *mut c_void,
+    size: c_int,
+) -> c_int {
+    let fail = |errno| {
+        crate::errno::set(errno);
+        0
+    };
+    let wanted = match flavor {
+        PROC_PIDFDVNODEINFO => size_of::<VnodeFdInfo>(),
+        PROC_PIDFDVNODEPATHINFO => size_of::<VnodeFdInfoWithPath>(),
+        f if (PROC_PIDFDVNODEINFO..=PROC_PIDFDCHANNELINFO).contains(&f) => {
+            return fail(libc::ENOTSUP);
+        }
+        _ => return fail(libc::EINVAL),
+    };
+    if (size.max(0) as usize) < wanted {
+        return fail(libc::ENOMEM);
+    }
+    if crate::process::describe(pid).is_none() {
+        return fail(libc::ESRCH);
+    }
+    if crate::process::host_pid(pid) != starnix::process::me() {
+        return fail(libc::ESRCH);
+    }
+    let (file, vnode, path) = match vnode_record(fd) {
+        Ok(record) => record,
+        Err(errno) => return fail(errno),
+    };
+    if buffer.is_null() {
+        return fail(libc::EFAULT);
+    }
+    if flavor == PROC_PIDFDVNODEINFO {
+        // SAFETY: the caller's buffer has room for the record.
+        unsafe {
+            buffer
+                .cast::<VnodeFdInfo>()
+                .write_unaligned(VnodeFdInfo { file, vnode })
+        };
+        return wanted as c_int;
+    }
+    let mut record = VnodeFdInfoWithPath {
+        file,
+        vnode,
+        path: [0; MAXPATHLEN],
+    };
+    // `vn_getpath` into `MAXPATHLEN` bytes, the last of them always NUL.
+    let length = path.len().min(MAXPATHLEN - 1);
+    record.path[..length].copy_from_slice(&path[..length]);
+    // SAFETY: the caller's buffer has room for the record.
+    unsafe { buffer.cast::<VnodeFdInfoWithPath>().write_unaligned(record) };
+    wanted as c_int
+}
+
+/// `proc_listpidspath` flags.
+const PROC_LISTPIDSPATH_PATH_IS_VOLUME: u32 = 1;
+
+/// `int proc_listpidspath(uint32_t type, uint32_t typeinfo, const char *path,
+/// uint32_t pathflags, void *buffer, int buffersize)`: the bytes of pids
+/// written, or -1 with `errno` set.
+///
+/// libproc's search: of the processes `type` selects, latest first, those
+/// whose working or root directory, or one of whose open files, is the file
+/// `path` names - or with `PROC_LISTPIDSPATH_PATH_IS_VOLUME` is on its volume
+/// - and then, while there is room, those that have it mapped, which as in
+/// libproc can name a process the first pass named already. A process this
+/// one is not shown the files of is not a match, as one libproc cannot
+/// inspect is not. Which descriptors were opened `O_EVTONLY` is not kept, so
+/// `PROC_LISTPIDSPATH_EXCLUDE_EVTONLY` excludes none.
+///
+/// # Safety
+///
+/// `path` is null or NUL-terminated, and `buffer` null or writable for `size`
+/// bytes.
+pub unsafe extern "C" fn proc_listpidspath(
+    kind: u32,
+    info: u32,
+    path: *const c_char,
+    flags: u32,
+    buffer: *mut c_void,
+    size: c_int,
+) -> c_int {
+    if buffer.is_null() {
+        // SAFETY: a null buffer asks for the size.
+        return unsafe { proc_listpids(kind, info, std::ptr::null_mut(), 0) };
+    }
+    let size = size - size % size_of::<i32>() as c_int;
+    if size < size_of::<i32>() as c_int {
+        crate::errno::set(libc::ENOMEM);
+        return -1;
+    }
+    if path.is_null() {
+        crate::errno::set(libc::EFAULT);
+        return -1;
+    }
+    let target = crate::stat::with_fallback(path, |host| {
+        // SAFETY: a zeroed `struct stat` is what the host is asked to fill.
+        let mut st: libc::stat = unsafe { std::mem::zeroed() };
+        // SAFETY: `host` is a NUL-terminated host path and `st` a live local.
+        let found = unsafe { libc::stat(host, &mut st) } == 0;
+        (found.then_some((st.st_dev as u64, st.st_ino as u64)), found)
+    });
+    let Some(target) = target else {
+        return -1;
+    };
+    let Some(pids) = select_pids(kind, info) else {
+        crate::errno::set(libc::EINVAL);
+        return -1;
+    };
+    let volume = flags & PROC_LISTPIDSPATH_PATH_IS_VOLUME != 0;
+    // `check_file`
+    let matches = |file: &starnix::process::FileId| {
+        file.0 != 0 && file.0 == target.0 && (volume || file.1 == target.1)
+    };
+    let room = size as usize / size_of::<i32>();
+    let used: Vec<_> = pids
+        .iter()
+        .rev()
+        .filter(|&&pid| pid != 0)
+        .filter_map(|&pid| {
+            starnix::process::in_use(crate::process::host_pid(pid)).map(|files| (pid, files))
+        })
+        .collect();
+    let mut found: Vec<i32> = used
+        .iter()
+        .filter(|(_, files)| files.directories.iter().chain(&files.open).any(matches))
+        .map(|&(pid, _)| pid)
+        .take(room)
+        .collect();
+    if found.len() < room {
+        let mapped = used
+            .iter()
+            .filter(|(_, files)| files.mapped.iter().any(matches))
+            .map(|&(pid, _)| pid)
+            .take(room - found.len())
+            .collect::<Vec<_>>();
+        found.extend(mapped);
+    }
+    // SAFETY: at most `room` pids, which fit in the caller's buffer.
+    unsafe { std::ptr::copy_nonoverlapping(found.as_ptr(), buffer.cast::<i32>(), found.len()) };
+    (found.len() * size_of::<i32>()) as c_int
+}
+
 /// `int memorystatus_control(uint32_t command, int32_t pid, uint32_t flags,
 /// void *buffer, size_t buffersize)`.
 ///
@@ -574,6 +922,8 @@ exports::exports! {
         "proc_pid_rusage" => proc_pid_rusage,
         "proc_listpids" => proc_listpids,
         "proc_listallpids" => proc_listallpids,
+        "proc_listpidspath" => proc_listpidspath,
+        "proc_pidfdinfo" => proc_pidfdinfo,
         "memorystatus_control" => memorystatus_control,
     }
 }
@@ -632,6 +982,150 @@ mod tests {
         assert!(info.resident_size > 0);
         assert!(info.virtual_size >= info.resident_size);
         assert!(info.threadnum >= 1);
+    }
+
+    /// What `F_GETPATH` and `fstat` say about a descriptor, in libproc's
+    /// record of it.
+    #[test]
+    fn a_descriptor_is_described_with_its_path() {
+        use std::os::fd::AsRawFd;
+        let dir = std::env::temp_dir().join(format!("darwin-pidfdinfo-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("record");
+        std::fs::write(&path, b"twelve bytes").unwrap();
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .unwrap();
+        let fd = file.as_raw_fd();
+        // SAFETY: a descriptor this test opened.
+        assert_eq!(unsafe { libc::lseek(fd, 5, libc::SEEK_SET) }, 5);
+        let mut record = std::mem::MaybeUninit::<VnodeFdInfoWithPath>::zeroed();
+        let size = size_of::<VnodeFdInfoWithPath>() as c_int;
+        let me = crate::process::guest_pid(starnix::process::me());
+        // SAFETY: a buffer of the flavour's size.
+        let bytes = unsafe {
+            proc_pidfdinfo(
+                me,
+                fd,
+                PROC_PIDFDVNODEPATHINFO,
+                record.as_mut_ptr().cast(),
+                size,
+            )
+        };
+        assert_eq!(bytes, 1200);
+        // SAFETY: filled above.
+        let record = unsafe { record.assume_init() };
+        let guest = prefix::ns::to_guest(&path).unwrap_or(path.clone());
+        let named = std::ffi::CStr::from_bytes_until_nul(&record.path).unwrap();
+        assert_eq!(named.to_str().unwrap(), guest.to_str().unwrap());
+        let mut st = crate::stat::Stat::default();
+        // SAFETY: a live `Stat`.
+        assert_eq!(unsafe { crate::stat::fstat(fd, &mut st) }, 0);
+        assert_eq!(
+            (record.vnode.stat.ino, record.vnode.stat.dev),
+            (st.ino, st.dev as u32)
+        );
+        assert_eq!(record.vnode.stat.size, 12);
+        assert_eq!(record.vnode.kind, 1, "VREG");
+        assert_eq!(record.file.kind, DTYPE_VNODE);
+        assert_eq!(record.file.offset, 5);
+        assert_eq!(record.file.openflags & 3, 3, "FREAD | FWRITE");
+        assert_eq!(record.file.status & PROC_FP_CLEXEC, PROC_FP_CLEXEC);
+
+        let mut short = [0u8; 176];
+        // SAFETY: a buffer of the vnode flavour's size.
+        let ask = |flavor, buffer: *mut c_void, size, fd| unsafe {
+            proc_pidfdinfo(me, fd, flavor, buffer, size)
+        };
+        assert_eq!(
+            ask(PROC_PIDFDVNODEINFO, short.as_mut_ptr().cast(), 176, fd),
+            176
+        );
+        assert_eq!(
+            ask(PROC_PIDFDVNODEPATHINFO, short.as_mut_ptr().cast(), 176, fd),
+            0
+        );
+        assert_eq!(crate::errno::get(), libc::ENOMEM);
+        assert_eq!(ask(99, short.as_mut_ptr().cast(), 176, fd), 0);
+        assert_eq!(crate::errno::get(), libc::EINVAL);
+        let mut ends = [0; 2];
+        // SAFETY: room for both ends.
+        assert_eq!(unsafe { libc::pipe(ends.as_mut_ptr()) }, 0);
+        assert_eq!(
+            ask(PROC_PIDFDVNODEINFO, short.as_mut_ptr().cast(), 176, ends[0]),
+            0
+        );
+        assert_eq!(crate::errno::get(), libc::EBADF, "a pipe is not a vnode");
+        // SAFETY: both ends were opened above.
+        unsafe {
+            libc::close(ends[0]);
+            libc::close(ends[1]);
+        }
+        drop(file);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// This process has the file open, and so holds a reference to it and
+    /// to its volume; a file nobody has open is held by nobody.
+    #[test]
+    fn the_processes_using_a_path_include_one_that_has_it_open() {
+        let dir = std::env::temp_dir().join(format!("darwin-listpidspath-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (open, closed) = (dir.join("open"), dir.join("closed"));
+        std::fs::write(&open, b"x").unwrap();
+        std::fs::write(&closed, b"x").unwrap();
+        let file = std::fs::File::open(&open).unwrap();
+        let me = crate::process::guest_pid(starnix::process::me());
+        let ask = |path: &std::path::Path, flags| {
+            let path = std::ffi::CString::new(path.to_str().unwrap()).unwrap();
+            let mut pids = [0i32; 4096];
+            // SAFETY: a path and a buffer this test owns.
+            let bytes = unsafe {
+                proc_listpidspath(
+                    PROC_ALL_PIDS,
+                    0,
+                    path.as_ptr(),
+                    flags,
+                    pids.as_mut_ptr().cast(),
+                    size_of_val(&pids) as c_int,
+                )
+            };
+            assert!(bytes >= 0 && bytes % 4 == 0);
+            pids[..bytes as usize / 4].to_vec()
+        };
+        assert!(ask(&open, 0).contains(&me));
+        assert!(!ask(&closed, 0).contains(&me));
+        assert!(ask(&closed, PROC_LISTPIDSPATH_PATH_IS_VOLUME).contains(&me));
+        let missing = c"/nonexistent/darwin-listpidspath";
+        let mut pid = 0i32;
+        // SAFETY: a path and a one-pid buffer.
+        let rc = unsafe {
+            proc_listpidspath(
+                PROC_ALL_PIDS,
+                0,
+                missing.as_ptr(),
+                0,
+                (&raw mut pid).cast(),
+                4,
+            )
+        };
+        assert_eq!((rc, crate::errno::get()), (-1, libc::ENOENT));
+        // SAFETY: as above, with no room for a pid.
+        let rc = unsafe {
+            proc_listpidspath(
+                PROC_ALL_PIDS,
+                0,
+                missing.as_ptr(),
+                0,
+                (&raw mut pid).cast(),
+                3,
+            )
+        };
+        assert_eq!((rc, crate::errno::get()), (-1, libc::ENOMEM));
+        drop(file);
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
