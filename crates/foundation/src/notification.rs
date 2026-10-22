@@ -101,6 +101,11 @@ fn notification_class() -> &'static Class {
 /// `name` is text rather than an `NSString` because every caller here has text:
 /// the constants are `&'static str` in this crate and in AppKit.
 pub fn make(name: &str, object: Id, user_info: Id) -> Id {
+    objc::arc::autorelease(make_owned(name, object, user_info))
+}
+
+/// [`make`], retained rather than autoreleased: the caller's to release.
+fn make_owned(name: &str, object: Id, user_info: Id) -> Id {
     crate::bootstrap();
     // SAFETY: `Notification` is the layout `notification_class` was registered
     // with, and its first field is the `isa`.
@@ -111,7 +116,7 @@ pub fn make(name: &str, object: Id, user_info: Id) -> Id {
         (*n).object = objc::arc::retain(object);
         (*n).user_info = objc::arc::retain(user_info);
     }
-    objc::arc::autorelease(n as Id)
+    n as Id
 }
 
 /// Post `name` to every observer that asked for it.
@@ -143,7 +148,11 @@ pub fn post(name: &str, object: Id, user_info: Id) {
             .count();
         eprintln!("rosemary: foundation: post {name} object {object:p} to {takers} observer(s)");
     }
-    let notification = make(name, object, user_info);
+    // Owned for the post and released after it, as Apple's temporary
+    // notification is: the posted object is not kept alive past the post by a
+    // notification sitting in an autorelease pool. An observer that wants it
+    // longer retains it.
+    let notification = make_owned(name, object, user_info);
     // Copied out before sending: an observer is entitled to add or remove one
     // from inside its own handler, and holding the lock across the send would
     // deadlock on the first that did.
@@ -162,6 +171,7 @@ pub fn post(name: &str, object: Id, user_info: Id) {
     }
     post_to_blocks(name, object, notification);
     post_to_callbacks(cf::local_center(), name, object as *const c_void, user_info);
+    objc::arc::release(notification);
 }
 
 /// Hand the notification to every block observer of `name`.
@@ -299,6 +309,17 @@ unsafe extern "C" fn object(receiver: Id, _sel: Sel) -> Id {
     unsafe { (*(receiver as *const Notification)).object }
 }
 
+/// `-dealloc`: the name, object and user info a notification retained when it
+/// was made, released with it.
+unsafe extern "C" fn notification_dealloc(receiver: Id, _sel: Sel) {
+    // SAFETY: a notification, whose fields are its own references.
+    let n = unsafe { &mut *(receiver as *mut Notification) };
+    for field in [&mut n.name, &mut n.object, &mut n.user_info] {
+        objc::arc::release(std::mem::replace(field, std::ptr::null_mut()));
+    }
+    objc::arc::finalize(receiver);
+}
+
 unsafe extern "C" fn user_info(receiver: Id, _sel: Sel) -> Id {
     // SAFETY: a notification.
     unsafe { (*(receiver as *const Notification)).user_info }
@@ -424,6 +445,30 @@ fn drop_block_observers(keep: impl Fn(&BlockObserver) -> bool) {
         objc::arc::release(queue);
         objc::arc::release(token);
     }
+}
+
+/// `-addObserver:selector:name:object:` on the default center, for this crate's
+/// own objects.
+pub(crate) fn observe(observer: Id, selector: Sel, name: &str, object: Id) {
+    OBSERVERS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .push(Observer {
+            observer,
+            selector,
+            name: Some(name.to_string()),
+            object,
+        });
+}
+
+/// `-removeObserver:name:object:` for a registration [`observe`] made.
+pub(crate) fn unobserve(observer: Id, name: &str, object: Id) {
+    OBSERVERS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .retain(|o| {
+            o.observer != observer || o.name.as_deref() != Some(name) || o.object != object
+        });
 }
 
 unsafe extern "C" fn remove_observer(_receiver: Id, _sel: Sel, observer: Id) {
@@ -637,6 +682,7 @@ pub(crate) fn install() {
         "name" => name, c"@16@0:8";
         "object" => object, c"@16@0:8";
         "userInfo" => user_info, c"@16@0:8";
+        "dealloc" => notification_dealloc, c"v16@0:8";
     });
     class_methods!(notification, {
         "notificationWithName:object:" => notification_with_name, c"@32@0:8@16@24";
