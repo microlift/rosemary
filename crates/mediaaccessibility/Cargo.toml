@@ -1,0 +1,12 @@
+[package]
+name = "mediaaccessibility"
+description = "Reimplementation of MediaAccessibility.framework's caption appearance"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+exports.workspace = true
+corefoundation.workspace = true
+foundation.workspace = true
+appkit.workspace = true

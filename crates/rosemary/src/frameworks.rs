@@ -116,6 +116,14 @@ static FRAMEWORKS: &[Framework] = &[
         symbol: Some(applicationservices::symbol),
     },
     Framework {
+        leaf: "MediaAccessibility",
+        version: 'A',
+        umbrellas: &[],
+        provide: Some(mediaaccessibility::provide),
+        data: Some(mediaaccessibility::data_symbols),
+        symbol: Some(mediaaccessibility::symbol),
+    },
+    Framework {
         leaf: "CoreServices",
         version: 'A',
         umbrellas: &["Carbon"],

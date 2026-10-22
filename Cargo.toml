@@ -38,6 +38,7 @@ network = { path = "crates/network" }
 opencl = { path = "crates/opencl" }
 metal_translate = { path = "crates/metal_translate" }
 metal = { path = "crates/metal" }
+mediaaccessibility = { path = "crates/mediaaccessibility" }
 ash = "0.38"
 libc = "0.2"
 half = "2.7.1"

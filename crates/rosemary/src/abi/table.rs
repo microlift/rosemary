@@ -3178,6 +3178,27 @@ pub static SIGNATURES: &[FunctionAbi] = &[
     sig!("sinf", F32, F32),
     sig!("sinh", F64, F64),
     sig!("sinhf", F32, F32),
+    sig!("MACaptionAppearanceCopyForegroundColor", P, I64, P),
+    sig!("MACaptionAppearanceCopyBackgroundColor", P, I64, P),
+    sig!("MACaptionAppearanceCopyWindowColor", P, I64, P),
+    sig!("MACaptionAppearanceGetForegroundOpacity", F64, I64, P),
+    sig!("MACaptionAppearanceGetBackgroundOpacity", F64, I64, P),
+    sig!("MACaptionAppearanceGetWindowOpacity", F64, I64, P),
+    sig!(
+        "MACaptionAppearanceGetWindowRoundedCornerRadius",
+        F64,
+        I64,
+        P
+    ),
+    sig!("MACaptionAppearanceGetRelativeCharacterSize", F64, I64, P),
+    sig!("MACaptionAppearanceGetTextEdgeStyle", I64, I64, P),
+    sig!(
+        "MACaptionAppearanceCopyFontDescriptorForStyle",
+        P,
+        I64,
+        P,
+        I64
+    ),
     sig!("sleep", U32, U32),
     vsig!("snprintf", I32, P, U64, P),
     sig!("socket", I32, I32, I32, I32),
