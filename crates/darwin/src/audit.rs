@@ -153,12 +153,126 @@ pub extern "C" fn audit_submit(_event: i16, _auid: u32, _status: i8, _error: c_i
     0
 }
 
+// libbsm's readers of an `audit_token_t`, from OpenBSM's `bsm_wrappers.c`
+// (`audit_token_to_au32`) and the SDK's `<bsm/libbsm.h>`: the token is taken by
+// value, and each field is the word `set_security_token_task_internal` put
+// there - see [`crate::mach::info::audit_token`].
+
+use crate::mach::info::AuditToken;
+
+/// `au_tid_t`: the terminal's port and machine.
+#[repr(C)]
+#[derive(Clone, Copy, Default, Debug, PartialEq, Eq)]
+pub struct AuTid {
+    port: i32,
+    machine: u32,
+}
+
+/// `uid_t audit_token_to_auid(audit_token_t)`
+pub extern "C" fn audit_token_to_auid(token: AuditToken) -> u32 {
+    token.val[0]
+}
+
+/// `uid_t audit_token_to_euid(audit_token_t)`
+pub extern "C" fn audit_token_to_euid(token: AuditToken) -> u32 {
+    token.val[1]
+}
+
+/// `gid_t audit_token_to_egid(audit_token_t)`
+pub extern "C" fn audit_token_to_egid(token: AuditToken) -> u32 {
+    token.val[2]
+}
+
+/// `uid_t audit_token_to_ruid(audit_token_t)`
+pub extern "C" fn audit_token_to_ruid(token: AuditToken) -> u32 {
+    token.val[3]
+}
+
+/// `gid_t audit_token_to_rgid(audit_token_t)`
+pub extern "C" fn audit_token_to_rgid(token: AuditToken) -> u32 {
+    token.val[4]
+}
+
+/// `pid_t audit_token_to_pid(audit_token_t)`
+pub extern "C" fn audit_token_to_pid(token: AuditToken) -> i32 {
+    token.val[5] as i32
+}
+
+/// `au_asid_t audit_token_to_asid(audit_token_t)`
+pub extern "C" fn audit_token_to_asid(token: AuditToken) -> i32 {
+    token.val[6] as i32
+}
+
+/// `int audit_token_to_pidversion(audit_token_t)`
+pub extern "C" fn audit_token_to_pidversion(token: AuditToken) -> c_int {
+    token.val[7] as c_int
+}
+
+/// `void audit_token_to_au32(audit_token_t, uid_t *auid, uid_t *euid,
+/// gid_t *egid, uid_t *ruid, gid_t *rgid, pid_t *pid, au_asid_t *asid,
+/// au_tid_t *tid)`: every field, each to a pointer that is not null. The
+/// terminal's machine is `kern.hostid`, which nothing here sets, so it is 0 as
+/// on a Mac that never called `sethostid`.
+///
+/// # Safety
+///
+/// Each pointer is null or writable.
+#[allow(clippy::too_many_arguments, reason = "the C prototype")]
+pub unsafe extern "C" fn audit_token_to_au32(
+    token: AuditToken,
+    auid: *mut u32,
+    euid: *mut u32,
+    egid: *mut u32,
+    ruid: *mut u32,
+    rgid: *mut u32,
+    pid: *mut i32,
+    asid: *mut i32,
+    tid: *mut AuTid,
+) {
+    let v = token.val;
+    // SAFETY: the caller's pointers, each null or writable.
+    unsafe {
+        for (out, value) in [
+            (auid, v[0]),
+            (euid, v[1]),
+            (egid, v[2]),
+            (ruid, v[3]),
+            (rgid, v[4]),
+        ] {
+            if let Some(out) = out.as_mut() {
+                *out = value;
+            }
+        }
+        if let Some(out) = pid.as_mut() {
+            *out = v[5] as i32;
+        }
+        if let Some(out) = asid.as_mut() {
+            *out = v[6] as i32;
+        }
+        if let Some(out) = tid.as_mut() {
+            *out = AuTid {
+                port: v[7] as i32,
+                machine: 0,
+            };
+        }
+    }
+}
+
 exports::exports! {
     functions {
         "getaudit_addr" => getaudit_addr,
         "getauid" => getauid,
         "setaudit_addr" => setaudit_addr,
         "audit_submit" => audit_submit,
+        "audit_token_to_auid" => audit_token_to_auid,
+        "audit_token_to_euid" => audit_token_to_euid,
+        "audit_token_to_egid" => audit_token_to_egid,
+        "audit_token_to_ruid" => audit_token_to_ruid,
+        "audit_token_to_rgid" => audit_token_to_rgid,
+        "audit_token_to_pid" => audit_token_to_pid,
+        "audit_token_to_asid" => audit_token_to_asid,
+        "audit_token_to_pidversion" => audit_token_to_pidversion,
+        "audit_token_to_au32" => audit_token_to_au32,
     }
 }
 
@@ -179,6 +293,60 @@ mod tests {
         assert_ne!(info.asid, 0);
         assert_eq!(info.kind, AU_IPV4);
         assert_ne!(info.flags & AU_SESSION_FLAG_HAS_AUTHENTICATED, 0);
+    }
+
+    /// Each reader names its own word of the token, in the order
+    /// `audit_token_to_au32` gives them, and this process's token reads back
+    /// as this process.
+    #[test]
+    fn a_token_reads_back_field_by_field() {
+        let token = AuditToken {
+            val: [10, 11, 12, 13, 14, 15, 16, 17],
+        };
+        assert_eq!(
+            (
+                audit_token_to_auid(token),
+                audit_token_to_euid(token),
+                audit_token_to_egid(token),
+                audit_token_to_ruid(token),
+                audit_token_to_rgid(token),
+                audit_token_to_pid(token),
+                audit_token_to_asid(token),
+                audit_token_to_pidversion(token),
+            ),
+            (10, 11, 12, 13, 14, 15, 16, 17)
+        );
+        let (mut auid, mut euid, mut egid, mut ruid, rgid) = (0, 0, 0, 0, 0);
+        let (mut pid, mut asid, mut tid) = (0, 0, AuTid::default());
+        // SAFETY: locals of this test's, and one pointer left null.
+        unsafe {
+            audit_token_to_au32(
+                token,
+                &mut auid,
+                &mut euid,
+                &mut egid,
+                &mut ruid,
+                std::ptr::null_mut(),
+                &mut pid,
+                &mut asid,
+                &mut tid,
+            );
+        }
+        assert_eq!((auid, euid, egid, ruid, rgid), (10, 11, 12, 13, 0));
+        assert_eq!((pid, asid), (15, 16));
+        assert_eq!(
+            tid,
+            AuTid {
+                port: 17,
+                machine: 0
+            }
+        );
+
+        let me = std::process::id() as i32;
+        let own = crate::mach::info::audit_token(me);
+        assert_eq!(audit_token_to_pid(own), me);
+        // SAFETY: no arguments.
+        assert_eq!(audit_token_to_euid(own), unsafe { libc::geteuid() });
     }
 
     #[test]

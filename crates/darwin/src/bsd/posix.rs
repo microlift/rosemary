@@ -330,15 +330,66 @@ pub unsafe extern "C" fn sigsetjmp(_env: *mut c_void, _savemask: c_int) -> c_int
     core::arch::naked_asm!("b {}", sym __sigsetjmp);
 }
 
-const CS_OPS_STATUS: u32 = 0;
+/// `csops` operations, from XNU's `bsd/sys/codesign.h`.
+pub mod cs_ops {
+    pub const STATUS: u32 = 0;
+    pub const ENTITLEMENTS_BLOB: u32 = 7;
+    pub const BLOB: u32 = 10;
+    pub const IDENTITY: u32 = 11;
+    pub const TEAMID: u32 = 14;
+    pub const DER_ENTITLEMENTS_BLOB: u32 = 16;
+}
+
+/// The code-signing flags this process runs with. None: no signature is
+/// checked when a guest is loaded, so nothing is `CS_VALID`, and a Mac reports
+/// a process it never validated the same way. Every read below follows from
+/// that, as XNU's `csops_internal` decides it.
+const CS_FLAGS: u32 = 0;
+const CS_VALID: u32 = 0x1;
+const CS_DEBUGGED: u32 = 0x1000_0000;
+
+/// The answer to one of the reads, as an errno, or zero.
+///
+/// # Safety
+///
+/// `useraddr` is writable for `usersize` bytes.
+unsafe fn cs_read(ops: u32, useraddr: *mut c_void, usersize: usize) -> c_int {
+    let validated = CS_FLAGS & (CS_VALID | CS_DEBUGGED) != 0;
+    match ops {
+        cs_ops::STATUS => {
+            // The kernel copies the flags word out and checks nothing else, so
+            // a buffer of any other size is the caller's mistake to make.
+            if useraddr.is_null() || usersize != size_of::<u32>() {
+                return libc::EINVAL;
+            }
+            // SAFETY: the caller's obligation, checked to be four bytes.
+            unsafe { useraddr.cast::<u32>().write_unaligned(CS_FLAGS) };
+            0
+        }
+        // The identity and team ID first ask for room for the blob header.
+        cs_ops::IDENTITY | cs_ops::TEAMID if usersize < 8 => libc::ERANGE,
+        cs_ops::IDENTITY
+        | cs_ops::TEAMID
+        | cs_ops::ENTITLEMENTS_BLOB
+        | cs_ops::DER_ENTITLEMENTS_BLOB
+        | cs_ops::BLOB
+            if !validated =>
+        {
+            libc::EINVAL
+        }
+        // The operations that change a process's signing state, and those
+        // with nothing to report on a host with no signing - the code
+        // directory hash among them, whose "no signature" is `EBADEXEC`, an
+        // errno this host has no number to carry.
+        _ => libc::ENOTSUP,
+    }
+}
 
 /// `int csops(pid_t, unsigned int ops, void *useraddr, size_t usersize)`
 ///
-/// Only `CS_OPS_STATUS` of this process, answered with no flags: nothing here
-/// is code-signed, and a Mac reports an unsigned process the same way. Apple's
-/// bash asks to learn whether it runs under the installer's restrictions.
-///
-/// FIXME (ACCURACY): No real code signing, this always reports success!
+/// Asks about this process only: another's signing state is the kernel's of
+/// another machine. Apple's bash asks for the status to learn whether it runs
+/// under the installer's restrictions; `SecTask` asks for entitlements.
 ///
 /// # Safety
 ///
@@ -353,18 +404,46 @@ pub unsafe extern "C" fn csops(
         crate::errno::set(libc::ESRCH);
         return -1;
     }
-    if ops != CS_OPS_STATUS {
-        crate::errno::set(libc::ENOTSUP);
-        return -1;
+    // SAFETY: the caller's obligation.
+    match unsafe { cs_read(ops, useraddr, usersize) } {
+        0 => 0,
+        errno => {
+            crate::errno::set(errno);
+            -1
+        }
     }
-    // The kernel's own check: the flags word and nothing else.
-    if useraddr.is_null() || usersize != size_of::<u32>() {
+}
+
+/// `int csops_audittoken(pid_t, unsigned int ops, void *useraddr, size_t
+/// usersize, audit_token_t *token)`: `csops`, for the process the token names,
+/// which has to be the pid asked about.
+///
+/// # Safety
+///
+/// As [`csops`]; `token` is null or a readable `audit_token_t`.
+pub unsafe extern "C" fn csops_audittoken(
+    pid: libc::pid_t,
+    ops: u32,
+    useraddr: *mut c_void,
+    usersize: usize,
+    token: *const crate::mach::info::AuditToken,
+) -> c_int {
+    if token.is_null() {
         crate::errno::set(libc::EINVAL);
         return -1;
     }
-    // SAFETY: the caller's obligation, checked to be four bytes.
-    unsafe { useraddr.cast::<u32>().write_unaligned(0) };
-    0
+    let pid = match pid {
+        0 => starnix::process::me(),
+        pid => pid,
+    };
+    // SAFETY: the caller's token.
+    let named = unsafe { token.read_unaligned() };
+    if named.val[5] != pid as u32 || named != crate::mach::info::audit_token(pid) {
+        crate::errno::set(libc::ESRCH);
+        return -1;
+    }
+    // SAFETY: the caller's obligation.
+    unsafe { csops(pid, ops, useraddr, usersize) }
 }
 
 /// `void _cthread_init(void)`
@@ -401,6 +480,7 @@ exports::exports! {
         #[cfg(target_os = "linux")]
         "sigsetjmp" => sigsetjmp,
         "csops" => csops,
+        "csops_audittoken" => csops_audittoken,
         "_cthread_init" => cthread_init,
         "__keymgr_dwarf2_register_sections" => keymgr_dwarf2_register_sections,
         "__atomic_load" => atomic_load,
@@ -473,10 +553,28 @@ mod tests {
     fn csops_reports_an_unsigned_process() {
         let mut flags = u32::MAX;
         // SAFETY: a live four-byte local.
-        let rc = unsafe { csops(0, CS_OPS_STATUS, (&raw mut flags).cast(), 4) };
+        let rc = unsafe { csops(0, cs_ops::STATUS, (&raw mut flags).cast(), 4) };
         assert_eq!((rc, flags), (0, 0));
         let rc = unsafe { csops(0, 99, (&raw mut flags).cast(), 4) };
         assert_eq!(rc, -1);
+        // An unsigned process has no entitlements to hand out, which XNU
+        // reports as EINVAL - and which `SecTask` reads as "none".
+        let mut header = [0u8; 8];
+        let rc = unsafe { csops(0, cs_ops::ENTITLEMENTS_BLOB, header.as_mut_ptr().cast(), 8) };
+        assert_eq!((rc, crate::errno::get()), (-1, libc::EINVAL));
+        let rc = unsafe { csops(0, cs_ops::IDENTITY, header.as_mut_ptr().cast(), 4) };
+        assert_eq!((rc, crate::errno::get()), (-1, libc::ERANGE));
+        // The token has to be this process's own.
+        let me = starnix::process::me();
+        let token = crate::mach::info::audit_token(me);
+        let rc =
+            unsafe { csops_audittoken(me, cs_ops::STATUS, (&raw mut flags).cast(), 4, &token) };
+        assert_eq!(rc, 0);
+        let mut other = token;
+        other.val[5] += 1;
+        let rc =
+            unsafe { csops_audittoken(me, cs_ops::STATUS, (&raw mut flags).cast(), 4, &other) };
+        assert_eq!((rc, crate::errno::get()), (-1, libc::ESRCH));
     }
 
     #[test]

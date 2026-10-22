@@ -9,6 +9,7 @@ const TASK_ABSOLUTETIME_INFO: i32 = 1;
 const TASK_EVENTS_INFO: i32 = 2;
 const TASK_THREAD_TIMES_INFO: i32 = 3;
 const TASK_BASIC_INFO_64: i32 = 5;
+const TASK_AUDIT_TOKEN: i32 = 15;
 const MACH_TASK_BASIC_INFO: i32 = 20;
 const TASK_POWER_INFO: i32 = 21;
 const TASK_VM_INFO: i32 = 22;
@@ -258,6 +259,37 @@ pub(super) unsafe fn publish<T: Copy>(value: T, out: *mut c_void, count: *mut u3
     KERN_SUCCESS
 }
 
+/// `audit_token_t`, eight words a task's messages and `csops_audittoken`
+/// carry to say whose they are.
+#[repr(C)]
+#[derive(Clone, Copy, Default, Debug, PartialEq, Eq)]
+pub struct AuditToken {
+    pub val: [u32; 8],
+}
+
+/// A process's audit token, filled as XNU's `set_security_token_task_internal`
+/// fills it: audit user, effective user and group, real user and group, pid,
+/// audit session and pid version. The audit user is the login's, which is the
+/// real user; the session is the process's; a pid here is never reused within
+/// a run, so its version is zero.
+pub fn audit_token(pid: i32) -> AuditToken {
+    let credentials = crate::credentials::current();
+    // SAFETY: asks about the calling process.
+    let session = unsafe { libc::getsid(0) }.max(0) as u32;
+    AuditToken {
+        val: [
+            credentials.ruid,
+            credentials.euid,
+            credentials.egid,
+            credentials.ruid,
+            credentials.rgid,
+            pid as u32,
+            session,
+            0,
+        ],
+    }
+}
+
 /// `kern_return_t task_info(task_name_t, task_flavor_t, task_info_t,
 /// mach_msg_type_number_t *)`
 ///
@@ -282,6 +314,13 @@ pub unsafe extern "C" fn task_info(
     let Some(usage) = measure(task, flavor) else {
         return KERN_INVALID_ARGUMENT;
     };
+    if flavor == TASK_AUDIT_TOKEN {
+        let Some(pid) = space::task_pid(task) else {
+            return KERN_INVALID_ARGUMENT;
+        };
+        // SAFETY: the caller's obligation, checked against the flavour's size.
+        return unsafe { publish(audit_token(pid), out, count) };
+    }
     let user_time = TimeValue::from_ns(usage.user_ns);
     let system_time = TimeValue::from_ns(usage.system_ns);
     let (virtual_size, resident_size) = (usage.virtual_size, usage.resident_size);
