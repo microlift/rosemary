@@ -147,6 +147,124 @@ unsafe extern "C" fn index_of_object_with_options_passing_test(
     NOT_FOUND
 }
 
+/// `-indexOfObjectPassingTest:`, the forward walk of the one above.
+unsafe extern "C" fn index_of_object_passing_test(receiver: Id, sel: Sel, block: Id) -> usize {
+    // SAFETY: the caller's array and block.
+    unsafe { index_of_object_with_options_passing_test(receiver, sel, 0, block) }
+}
+
+/// `-enumerateObjectsWithOptions:usingBlock:`: each object with its index, in
+/// order or under `NSEnumerationReverse` backwards, until the block sets its
+/// `stop`. The walk is over the objects the array held when it began.
+unsafe extern "C" fn enumerate_objects_with_options(
+    receiver: Id,
+    _sel: Sel,
+    options: usize,
+    block: Id,
+) {
+    // SAFETY: an array.
+    let Some(array) = (unsafe { collections::array(receiver as CFTypeRef) }) else {
+        return;
+    };
+    // SAFETY: null or a block.
+    let Some(invoke) = (unsafe { objc::block::invoke(block) }) else {
+        return;
+    };
+    // SAFETY: the block is `void (^)(id, NSUInteger, BOOL *)`.
+    let call: unsafe extern "C" fn(Id, Id, usize, *mut bool) =
+        unsafe { std::mem::transmute(invoke) };
+    let values = array.values.clone();
+    let order: Box<dyn Iterator<Item = usize>> = match options & ENUMERATION_REVERSE {
+        0 => Box::new(0..values.len()),
+        _ => Box::new((0..values.len()).rev()),
+    };
+    let mut stop = false;
+    for at in order {
+        // SAFETY: as above; `stop` outlives the call.
+        unsafe { call(block, values[at] as Id, at, &mut stop) };
+        if stop {
+            break;
+        }
+    }
+}
+
+/// `-enumerateObjectsUsingBlock:`.
+unsafe extern "C" fn enumerate_objects(receiver: Id, sel: Sel, block: Id) {
+    // SAFETY: the caller's array and block.
+    unsafe { enumerate_objects_with_options(receiver, sel, 0, block) }
+}
+
+/// `-makeObjectsPerformSelector:withObject:`: the message to each object in
+/// order, with one argument.
+unsafe extern "C" fn make_objects_perform_selector_with_object(
+    receiver: Id,
+    _sel: Sel,
+    selector: Sel,
+    argument: Id,
+) {
+    // SAFETY: an array.
+    let Some(array) = (unsafe { collections::array(receiver as CFTypeRef) }) else {
+        return;
+    };
+    if selector.is_null() {
+        objc::fail!("-[NSArray makeObjectsPerformSelector:]: selector cannot be NULL");
+    }
+    let values = array.values.clone();
+    // SAFETY: an `id (id, SEL, id)` send; a selector of none ignores the extra
+    // register, as on Darwin.
+    let send: unsafe extern "C" fn(Id, Sel, Id) -> Id =
+        unsafe { std::mem::transmute(objc::msg::entry()) };
+    for value in values {
+        // SAFETY: as above, to each object the array held.
+        unsafe { send(value as Id, selector, argument) };
+    }
+}
+
+/// `-makeObjectsPerformSelector:`.
+unsafe extern "C" fn make_objects_perform_selector(receiver: Id, sel: Sel, selector: Sel) {
+    // SAFETY: the caller's array and selector.
+    unsafe {
+        make_objects_perform_selector_with_object(receiver, sel, selector, std::ptr::null_mut())
+    }
+}
+
+/// `-enumerateKeysAndObjectsWithOptions:usingBlock:`: each key and its object
+/// until the block sets its `stop`. A dictionary has no order to reverse, so
+/// the options change nothing, as `NSEnumerationConcurrent` is only a
+/// permission.
+unsafe extern "C" fn enumerate_keys_and_objects_with_options(
+    receiver: Id,
+    _sel: Sel,
+    _options: usize,
+    block: Id,
+) {
+    // SAFETY: a dictionary.
+    let Some(dictionary) = (unsafe { collections::dictionary(receiver as CFTypeRef) }) else {
+        return;
+    };
+    // SAFETY: null or a block.
+    let Some(invoke) = (unsafe { objc::block::invoke(block) }) else {
+        return;
+    };
+    // SAFETY: the block is `void (^)(id key, id obj, BOOL *stop)`.
+    let call: unsafe extern "C" fn(Id, Id, Id, *mut bool) = unsafe { std::mem::transmute(invoke) };
+    let entries = dictionary.entries.clone();
+    let mut stop = false;
+    for (key, value) in entries {
+        // SAFETY: as above; `stop` outlives the call.
+        unsafe { call(block, key as Id, value as Id, &mut stop) };
+        if stop {
+            break;
+        }
+    }
+}
+
+/// `-enumerateKeysAndObjectsUsingBlock:`.
+unsafe extern "C" fn enumerate_keys_and_objects(receiver: Id, sel: Sel, block: Id) {
+    // SAFETY: the caller's dictionary and block.
+    unsafe { enumerate_keys_and_objects_with_options(receiver, sel, 0, block) }
+}
+
 unsafe extern "C" fn filtered_array_using_predicate(receiver: Id, _sel: Sel, predicate: Id) -> Id {
     let Some(array) = (unsafe { collections::array(receiver as CFTypeRef) }) else {
         return std::ptr::null_mut();
@@ -868,6 +986,56 @@ unsafe extern "C" fn write_to_file(receiver: Id, _sel: Sel, path: Id, atomically
     write_bytes_to_file(&path, bytes, atomically != 0).is_ok() as u8
 }
 
+/// `-[NSArray writeToFile:atomically:]` and `-[NSDictionary
+/// writeToFile:atomically:]`: the receiver as an XML property list.
+///
+/// `NO`, and nothing written, for a collection holding anything a property
+/// list cannot - which is checked all the way down before a byte is written,
+/// as Apple's documents.
+unsafe extern "C" fn write_property_list_to_file(
+    receiver: Id,
+    _sel: Sel,
+    path: Id,
+    atomically: u8,
+) -> u8 {
+    // SAFETY: an `NSString`, or nil.
+    let path = unsafe { crate::string::bytes(path) };
+    match String::from_utf8(path) {
+        // SAFETY: the receiver is a collection.
+        Ok(path) if !path.is_empty() => unsafe { write_property_list(receiver, &path, atomically) },
+        _ => 0,
+    }
+}
+
+/// `-writeToURL:atomically:`, the same for a file URL. Any other URL is `NO`.
+unsafe extern "C" fn write_property_list_to_url(
+    receiver: Id,
+    _sel: Sel,
+    url: Id,
+    atomically: u8,
+) -> u8 {
+    // SAFETY: an `NSURL`, or nil.
+    let path = unsafe { corefoundation::url::as_url(url as CFTypeRef) }.and_then(|u| u.file_path());
+    match path {
+        // SAFETY: the receiver is a collection.
+        Some(path) => unsafe { write_property_list(receiver, &path, atomically) },
+        None => 0,
+    }
+}
+
+/// # Safety
+///
+/// `receiver` is an array or a dictionary.
+unsafe fn write_property_list(receiver: Id, path: &str, atomically: u8) -> u8 {
+    // SAFETY: the caller's.
+    let Some(value) = (unsafe { corefoundation::propertylist::value_of(receiver as CFTypeRef) })
+    else {
+        return 0;
+    };
+    let xml = corefoundation::plist::write_xml(&value);
+    write_bytes_to_file(path, &xml, atomically != 0).is_ok() as u8
+}
+
 pub(crate) fn write_bytes_to_file(
     guest_path: &str,
     bytes: &[u8],
@@ -1563,6 +1731,73 @@ unsafe extern "C" fn objects_for_keys_not_found_marker(
             false,
         )) as Id
     }
+}
+
+/// `-isEqual:` of an array: an array with equal elements in the same order.
+unsafe extern "C" fn array_is_equal(receiver: Id, sel: Sel, other: Id) -> bool {
+    receiver == other || unsafe { is_equal_to_array(receiver, sel, other) }
+}
+
+/// `-isEqualToArray:`: the same count, each element equal to its peer as the
+/// receiver's callbacks compare them.
+unsafe extern "C" fn is_equal_to_array(receiver: Id, _sel: Sel, other: Id) -> bool {
+    // SAFETY: arrays if they are ours.
+    let (Some(a), Some(b)) = (
+        unsafe { collections::array(receiver as CFTypeRef) },
+        unsafe { collections::array(other as CFTypeRef) },
+    ) else {
+        return false;
+    };
+    a.values.len() == b.values.len()
+        && a.values
+            .iter()
+            .zip(&b.values)
+            .all(|(x, y)| a.policy.equal(*x, *y))
+}
+
+/// `-hash` of an array: its count, as `CFArray`'s is, so that equal arrays
+/// hash alike whatever they hold.
+unsafe extern "C" fn array_hash(receiver: Id, _sel: Sel) -> usize {
+    // SAFETY: an array if it is ours.
+    unsafe { collections::array(receiver as CFTypeRef) }
+        .map_or(receiver as usize, |a| a.values.len())
+}
+
+/// `-isEqual:` of a dictionary: a dictionary with the same entries.
+unsafe extern "C" fn dictionary_is_equal(receiver: Id, sel: Sel, other: Id) -> bool {
+    receiver == other || unsafe { is_equal_to_dictionary(receiver, sel, other) }
+}
+
+/// `-hash` of a dictionary: its count, as `CFDictionary`'s is.
+unsafe extern "C" fn dictionary_hash(receiver: Id, _sel: Sel) -> usize {
+    // SAFETY: a dictionary if it is ours.
+    unsafe { collections::dictionary(receiver as CFTypeRef) }
+        .map_or(receiver as usize, |d| d.entries.len())
+}
+
+/// `-isEqual:` of a set: a set with the same members.
+unsafe extern "C" fn set_is_equal(receiver: Id, sel: Sel, other: Id) -> bool {
+    receiver == other || unsafe { is_equal_to_set(receiver, sel, other) }
+}
+
+/// `-isEqualToSet:`: the same count, and every member of one in the other.
+unsafe extern "C" fn is_equal_to_set(receiver: Id, _sel: Sel, other: Id) -> bool {
+    // SAFETY: sets if they are ours.
+    let (Some(a), Some(b)) = (unsafe { collections::set(receiver as CFTypeRef) }, unsafe {
+        collections::set(other as CFTypeRef)
+    }) else {
+        return false;
+    };
+    a.values.len() == b.values.len()
+        && a.values
+            .iter()
+            .all(|x| b.values.iter().any(|y| b.policy.equal(*x, *y)))
+}
+
+/// `-hash` of a set: its count, as `CFSet`'s is.
+unsafe extern "C" fn set_hash(receiver: Id, _sel: Sel) -> usize {
+    // SAFETY: a set if it is ours.
+    unsafe { collections::set(receiver as CFTypeRef) }.map_or(receiver as usize, |s| s.values.len())
 }
 
 /// `-isEqualToDictionary:`: the same keys, each with an equal value.
@@ -2493,6 +2728,9 @@ pub(crate) fn install() {
     });
     methods!(set, {
         "count" => set_count, c"Q16@0:8";
+        "isEqual:" => set_is_equal, c"B24@0:8@16";
+        "isEqualToSet:" => is_equal_to_set, c"B24@0:8@16";
+        "hash" => set_hash, c"Q16@0:8";
         "containsObject:" => set_contains_object, c"B24@0:8@16";
         "anyObject" => set_any_object, c"@16@0:8";
         "countByEnumeratingWithState:objects:count:" => set_enumerate, c"Q40@0:8^{?=Q^@^QQ5}16^@24Q32";
@@ -2519,7 +2757,12 @@ pub(crate) fn install() {
     let array = objc::class::lookup(c"NSArray").expect("CoreFoundation registered NSArray");
     let mutable_array = objc::class::lookup(c"NSMutableArray").expect("NSMutableArray");
     methods!(array, {
+        "writeToFile:atomically:" => write_property_list_to_file, c"B28@0:8@16B24";
+        "writeToURL:atomically:" => write_property_list_to_url, c"B28@0:8@16B24";
         "count" => count, c"Q16@0:8";
+        "isEqual:" => array_is_equal, c"B24@0:8@16";
+        "isEqualToArray:" => is_equal_to_array, c"B24@0:8@16";
+        "hash" => array_hash, c"Q16@0:8";
         "objectAtIndex:" => object_at_index, c"@24@0:8Q16";
         "subarrayWithRange:" => subarray_with_range, c"@32@0:8{_NSRange=QQ}16";
         "objectAtIndexedSubscript:" => object_at_index, c"@24@0:8Q16";
@@ -2535,6 +2778,11 @@ pub(crate) fn install() {
         "sortedArrayUsingFunction:context:" => sorted_array_using_function, c"@32@0:8^?16^v24";
         "filteredArrayUsingPredicate:" => filtered_array_using_predicate, c"@24@0:8@16";
         "indexOfObjectWithOptions:passingTest:" => index_of_object_with_options_passing_test, c"Q32@0:8Q16@?24";
+        "indexOfObjectPassingTest:" => index_of_object_passing_test, c"Q24@0:8@?16";
+        "enumerateObjectsUsingBlock:" => enumerate_objects, c"v24@0:8@?16";
+        "enumerateObjectsWithOptions:usingBlock:" => enumerate_objects_with_options, c"v32@0:8Q16@?24";
+        "makeObjectsPerformSelector:" => make_objects_perform_selector, c"v24@0:8:16";
+        "makeObjectsPerformSelector:withObject:" => make_objects_perform_selector_with_object, c"v32@0:8:16@24";
         "countByEnumeratingWithState:objects:count:" => array_enumerate, c"Q40@0:8^{?=Q^@^QQ5}16^@24Q32";
         "description" => array_description, c"@16@0:8";
         "objectEnumerator" => object_enumerator, c"@16@0:8";
@@ -2585,6 +2833,8 @@ pub(crate) fn install() {
     let mutable_dictionary =
         objc::class::lookup(c"NSMutableDictionary").expect("NSMutableDictionary");
     methods!(dictionary_class, {
+        "writeToFile:atomically:" => write_property_list_to_file, c"B28@0:8@16B24";
+        "writeToURL:atomically:" => write_property_list_to_url, c"B28@0:8@16B24";
         "count" => dictionary_count, c"Q16@0:8";
         "objectForKey:" => object_for_key, c"@24@0:8@16";
         "objectForKeyedSubscript:" => object_for_key, c"@24@0:8@16";
@@ -2599,9 +2849,13 @@ pub(crate) fn install() {
         "allKeysForObject:" => all_keys_for_object, c"@24@0:8@16";
         "objectsForKeys:notFoundMarker:" => objects_for_keys_not_found_marker, c"@32@0:8@16@24";
         "isEqualToDictionary:" => is_equal_to_dictionary, c"B24@0:8@16";
+        "isEqual:" => dictionary_is_equal, c"B24@0:8@16";
+        "hash" => dictionary_hash, c"Q16@0:8";
         "keyEnumerator" => key_enumerator, c"@16@0:8";
         "objectEnumerator" => dictionary_object_enumerator, c"@16@0:8";
         "countByEnumeratingWithState:objects:count:" => dictionary_enumerate, c"Q40@0:8^{?=Q^@^QQ5}16^@24Q32";
+        "enumerateKeysAndObjectsUsingBlock:" => enumerate_keys_and_objects, c"v24@0:8@?16";
+        "enumerateKeysAndObjectsWithOptions:usingBlock:" => enumerate_keys_and_objects_with_options, c"v32@0:8Q16@?24";
     });
     class_methods!(dictionary_class, {
         "dictionary" => empty_dictionary, c"@16@0:8";
@@ -2765,4 +3019,291 @@ pub(crate) fn install() {
         "numberWithUnsignedChar:" => number_with_unsigned_char, c"@24@0:8C16";
         "numberWithFloat:" => number_with_float, c"@24@0:8f16";
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A block literal as the compiler lays one out, carrying a pointer to
+    /// what the test's invoke function records.
+    #[repr(C)]
+    struct Seen {
+        isa: *const std::ffi::c_void,
+        flags: i32,
+        reserved: i32,
+        invoke: *const std::ffi::c_void,
+        descriptor: *const std::ffi::c_void,
+        /// Indexes seen, and the indexes past which the block stops.
+        seen: *mut Vec<(usize, Id)>,
+        keep: *const dyn Fn(usize) -> bool,
+    }
+
+    unsafe extern "C" fn record(block: *const Seen, object: Id, at: usize, stop: *mut bool) {
+        // SAFETY: a `Seen` of the test's, live for the enumeration.
+        unsafe {
+            let block = &*block;
+            if (*block.keep)(at) {
+                (*block.seen).push((at, object));
+            } else {
+                *stop = true;
+            }
+        }
+    }
+
+    fn enumerate(array: Id, options: usize, keep: &dyn Fn(usize) -> bool) -> Vec<(usize, Id)> {
+        let mut seen = Vec::new();
+        let block = Seen {
+            isa: std::ptr::null(),
+            flags: 0,
+            reserved: 0,
+            invoke: record as *const std::ffi::c_void,
+            descriptor: std::ptr::null(),
+            seen: &mut seen,
+            // SAFETY: only read during the call below, while `keep` lives.
+            keep: unsafe {
+                std::mem::transmute::<&dyn Fn(usize) -> bool, *const dyn Fn(usize) -> bool>(keep)
+            },
+        };
+        let sel = objc::sel::get("enumerateObjectsWithOptions:usingBlock:");
+        // SAFETY: an array and a block of the selector's type.
+        unsafe { enumerate_objects_with_options(array, sel, options, (&raw const block) as Id) };
+        seen
+    }
+
+    /// Equal contents make equal collections with equal hashes, as
+    /// swift-corelibs-foundation's `TestNSArray.test_equality` and
+    /// `TestNSDictionary.test_equality` check.
+    #[test]
+    fn collections_with_equal_contents_are_equal_and_hash_alike() {
+        crate::bootstrap();
+        use corefoundation::collections::{Number, new_array, new_dictionary, new_number};
+        let policy = corefoundation::callbacks::Policy::from_type_callbacks;
+        let number = |n| new_number(Number::Integer(n));
+        let (one, two, other_one) = (number(1), number(2), number(1));
+        let a = new_array(&[one, two], policy(), false) as Id;
+        let b = new_array(&[other_one, two], policy(), true) as Id;
+        let reversed = new_array(&[two, one], policy(), false) as Id;
+        let d = new_dictionary(&[(one, two)], policy(), policy(), false) as Id;
+        let e = new_dictionary(&[(other_one, two)], policy(), policy(), true) as Id;
+        let f = new_dictionary(&[(one, one)], policy(), policy(), false) as Id;
+        let equal = |x: Id, y: Id| unsafe {
+            corefoundation::api::CFEqual(x as CFTypeRef, y as CFTypeRef) != 0
+        };
+        let hash = |x: Id| unsafe { corefoundation::api::CFHash(x as CFTypeRef) };
+        assert!(equal(a, b), "mutability does not matter");
+        assert_eq!(hash(a), hash(b));
+        assert!(!equal(a, reversed), "order does");
+        assert!(equal(d, e));
+        assert_eq!(hash(d), hash(e));
+        assert!(!equal(d, f), "values do");
+        assert!(!equal(a, d), "an array is not a dictionary");
+    }
+
+    /// Ported from swift-corelibs-foundation's `TestNSArray.test_enumerationUsingBlock`:
+    /// run to completion, and stop half way, under each combination of the
+    /// concurrent and reverse options. Its `at:` half needs `NSIndexSet`.
+    #[test]
+    fn an_array_enumerates_its_objects_with_a_block() {
+        crate::bootstrap();
+        let numbers: Vec<CFTypeRef> = (0..100i64)
+            .map(|n| {
+                corefoundation::collections::new_number(
+                    corefoundation::collections::Number::Integer(n),
+                )
+            })
+            .collect();
+        let array = corefoundation::collections::new_array(
+            &numbers,
+            corefoundation::callbacks::Policy::from_type_callbacks(),
+            false,
+        ) as Id;
+        const CONCURRENT: usize = 1 << 0;
+        for options in [
+            0,
+            CONCURRENT,
+            ENUMERATION_REVERSE,
+            CONCURRENT | ENUMERATION_REVERSE,
+        ] {
+            let reverse = options & ENUMERATION_REVERSE != 0;
+            let all = enumerate(array, options, &|_| true);
+            assert_eq!(all.len(), 100, "options {options}");
+            for (at, object) in &all {
+                // SAFETY: an array of this test's.
+                assert_eq!(*object, unsafe {
+                    object_at_index(array, std::ptr::null(), *at)
+                });
+            }
+            let order: Vec<usize> = all.iter().map(|(at, _)| *at).collect();
+            let expected: Vec<usize> = match reverse {
+                false => (0..100).collect(),
+                true => (0..100).rev().collect(),
+            };
+            assert_eq!(order, expected, "options {options}");
+
+            let half = |at: usize| if reverse { at >= 50 } else { at < 50 };
+            let mut stopped: Vec<usize> = enumerate(array, options, &half)
+                .iter()
+                .map(|(at, _)| *at)
+                .collect();
+            stopped.sort_unstable();
+            let expected: Vec<usize> = (0..100).filter(|at| half(*at)).collect();
+            assert_eq!(stopped, expected, "options {options}");
+        }
+        // The plain spelling is the forward walk.
+        let mut seen = Vec::new();
+        let keep: &dyn Fn(usize) -> bool = &|_| true;
+        let block = Seen {
+            isa: std::ptr::null(),
+            flags: 0,
+            reserved: 0,
+            invoke: record as *const std::ffi::c_void,
+            descriptor: std::ptr::null(),
+            seen: &mut seen,
+            // SAFETY: as in `enumerate`.
+            keep: unsafe {
+                std::mem::transmute::<&dyn Fn(usize) -> bool, *const dyn Fn(usize) -> bool>(keep)
+            },
+        };
+        // SAFETY: as above.
+        unsafe {
+            enumerate_objects(
+                array,
+                objc::sel::get("enumerateObjectsUsingBlock:"),
+                (&raw const block) as Id,
+            )
+        };
+        assert_eq!(seen.first().map(|(at, _)| *at), Some(0));
+        assert_eq!(seen.len(), 100);
+        for number in numbers {
+            // SAFETY: the references made above; the array holds its own.
+            unsafe { api::CFRelease(number) };
+        }
+    }
+
+    #[repr(C)]
+    struct Pairs {
+        isa: *const std::ffi::c_void,
+        flags: i32,
+        reserved: i32,
+        invoke: *const std::ffi::c_void,
+        descriptor: *const std::ffi::c_void,
+        seen: *mut Vec<(Id, Id)>,
+        stop_after: usize,
+    }
+
+    unsafe extern "C" fn record_pair(block: *const Pairs, key: Id, value: Id, stop: *mut bool) {
+        // SAFETY: a `Pairs` of the test's, live for the enumeration.
+        unsafe {
+            let block = &*block;
+            (*block.seen).push((key, value));
+            if (*block.seen).len() >= block.stop_after {
+                *stop = true;
+            }
+        }
+    }
+
+    /// Every key arrives with its own object, once, and `stop` ends the walk.
+    #[test]
+    fn a_dictionary_enumerates_its_keys_and_objects_with_a_block() {
+        crate::bootstrap();
+        let policy = corefoundation::callbacks::Policy::from_type_callbacks();
+        let texts = [("foo", "bar"), ("whiz", "bang"), ("toil", "trouble")];
+        let pairs: Vec<(CFTypeRef, CFTypeRef)> = texts
+            .iter()
+            .map(|(k, v)| {
+                (
+                    crate::string::from_str(k) as CFTypeRef,
+                    crate::string::from_str(v) as CFTypeRef,
+                )
+            })
+            .collect();
+        let dictionary =
+            corefoundation::collections::new_dictionary(&pairs, policy, policy, false) as Id;
+        for stop_after in [usize::MAX, 1] {
+            let mut seen = Vec::new();
+            let block = Pairs {
+                isa: std::ptr::null(),
+                flags: 0,
+                reserved: 0,
+                invoke: record_pair as *const std::ffi::c_void,
+                descriptor: std::ptr::null(),
+                seen: &mut seen,
+                stop_after,
+            };
+            let sel = objc::sel::get("enumerateKeysAndObjectsUsingBlock:");
+            // SAFETY: a dictionary and a block of the selector's type.
+            unsafe { enumerate_keys_and_objects(dictionary, sel, (&raw const block) as Id) };
+            let mut got: Vec<(String, String)> = seen
+                .iter()
+                .map(|(k, v)| {
+                    // SAFETY: strings this test made.
+                    let text = |s: Id| {
+                        String::from_utf8_lossy(&unsafe { crate::string::bytes(s) }).into_owned()
+                    };
+                    (text(*k), text(*v))
+                })
+                .collect();
+            got.sort();
+            match stop_after {
+                1 => assert_eq!(got.len(), 1),
+                _ => {
+                    let mut want: Vec<(String, String)> = texts
+                        .iter()
+                        .map(|(k, v)| (k.to_string(), v.to_string()))
+                        .collect();
+                    want.sort();
+                    assert_eq!(got, want);
+                }
+            }
+        }
+    }
+
+    /// A dictionary written as a property list reads back as the same values,
+    /// and one holding something a property list cannot is refused with
+    /// nothing written.
+    #[test]
+    fn a_dictionary_is_written_as_a_property_list() {
+        crate::bootstrap();
+        let directory = std::env::temp_dir().join(format!("rosemary-plist-{}", std::process::id()));
+        std::fs::create_dir_all(&directory).expect("a scratch directory");
+        let path = directory.join("written.plist");
+        let policy = corefoundation::callbacks::Policy::from_type_callbacks();
+        let key = crate::string::from_str("Name");
+        let value = crate::string::from_str("League");
+        let dictionary = corefoundation::collections::new_dictionary(
+            &[(key as CFTypeRef, value as CFTypeRef)],
+            policy,
+            policy,
+            false,
+        ) as Id;
+        let sel = objc::sel::get("writeToFile:atomically:");
+        let target = crate::string::from_str(path.to_str().expect("a UTF-8 path"));
+        // SAFETY: `BOOL (id, SEL, id, BOOL)`, with a dictionary and a string.
+        assert_eq!(
+            unsafe { write_property_list_to_file(dictionary, sel, target, 1) },
+            1
+        );
+        let written = std::fs::read(&path).expect("the file was written");
+        let parsed = corefoundation::plist::parse(&written).expect("a property list");
+        assert_eq!(parsed.get("Name").and_then(|v| v.as_str()), Some("League"));
+
+        let not_a_plist =
+            objc::object::create_instance(objc::class::lookup(c"NSObject").expect("NSObject"), 0);
+        let refused_path = directory.join("refused.plist");
+        let refused = corefoundation::collections::new_dictionary(
+            &[(key as CFTypeRef, not_a_plist as CFTypeRef)],
+            policy,
+            policy,
+            false,
+        ) as Id;
+        let refused_target = crate::string::from_str(refused_path.to_str().expect("UTF-8"));
+        // SAFETY: as above.
+        assert_eq!(
+            unsafe { write_property_list_to_file(refused, sel, refused_target, 0) },
+            0
+        );
+        assert!(!refused_path.exists());
+        let _ = std::fs::remove_dir_all(&directory);
+    }
 }
