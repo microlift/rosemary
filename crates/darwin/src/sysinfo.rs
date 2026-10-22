@@ -93,13 +93,163 @@ unsafe extern "C" fn fpathconf(fd: i32, name: i32) -> i64 {
     }
 }
 
-unsafe extern "C" fn confstr(name: i32, out: *mut libc::c_char, len: usize) -> usize {
-    if name == 1 {
-        unsafe { libc::confstr(libc::_CS_PATH, out, len) }
-    } else {
-        crate::errno::set(libc::EINVAL);
-        0
+/// Darwin's `_CS_*` names, from `<unistd.h>`.
+mod cs {
+    pub const PATH: i32 = 1;
+    pub const POSIX_V6_ILP32_OFF32_CFLAGS: i32 = 2;
+    pub const POSIX_V6_ILP32_OFF32_LDFLAGS: i32 = 3;
+    pub const POSIX_V6_ILP32_OFF32_LIBS: i32 = 4;
+    pub const POSIX_V6_ILP32_OFFBIG_CFLAGS: i32 = 5;
+    pub const POSIX_V6_ILP32_OFFBIG_LDFLAGS: i32 = 6;
+    pub const POSIX_V6_ILP32_OFFBIG_LIBS: i32 = 7;
+    pub const POSIX_V6_LP64_OFF64_CFLAGS: i32 = 8;
+    pub const POSIX_V6_LP64_OFF64_LDFLAGS: i32 = 9;
+    pub const POSIX_V6_LP64_OFF64_LIBS: i32 = 10;
+    pub const POSIX_V6_LPBIG_OFFBIG_CFLAGS: i32 = 11;
+    pub const POSIX_V6_LPBIG_OFFBIG_LDFLAGS: i32 = 12;
+    pub const POSIX_V6_LPBIG_OFFBIG_LIBS: i32 = 13;
+    pub const POSIX_V6_WIDTH_RESTRICTED_ENVS: i32 = 14;
+    pub const XBS5_ILP32_OFF32_CFLAGS: i32 = 20;
+    pub const XBS5_ILP32_OFF32_LDFLAGS: i32 = 21;
+    pub const XBS5_ILP32_OFF32_LIBS: i32 = 22;
+    pub const XBS5_ILP32_OFF32_LINTFLAGS: i32 = 23;
+    pub const XBS5_ILP32_OFFBIG_CFLAGS: i32 = 24;
+    pub const XBS5_ILP32_OFFBIG_LDFLAGS: i32 = 25;
+    pub const XBS5_ILP32_OFFBIG_LIBS: i32 = 26;
+    pub const XBS5_ILP32_OFFBIG_LINTFLAGS: i32 = 27;
+    pub const XBS5_LP64_OFF64_CFLAGS: i32 = 28;
+    pub const XBS5_LP64_OFF64_LDFLAGS: i32 = 29;
+    pub const XBS5_LP64_OFF64_LIBS: i32 = 30;
+    pub const XBS5_LP64_OFF64_LINTFLAGS: i32 = 31;
+    pub const XBS5_LPBIG_OFFBIG_CFLAGS: i32 = 32;
+    pub const XBS5_LPBIG_OFFBIG_LDFLAGS: i32 = 33;
+    pub const XBS5_LPBIG_OFFBIG_LIBS: i32 = 34;
+    pub const XBS5_LPBIG_OFFBIG_LINTFLAGS: i32 = 35;
+    pub const DARWIN_USER_DIR: i32 = 65536;
+    pub const DARWIN_USER_TEMP_DIR: i32 = 65537;
+    pub const DARWIN_USER_CACHE_DIR: i32 = 65538;
+}
+
+/// `P_tmpdir`, from Darwin's `<stdio.h>`.
+const P_TMPDIR: &str = "/var/tmp/";
+
+/// What Libc's `gen/confstr.c` answers for `name`, or the errno it fails
+/// with.
+fn confstr_value(name: i32) -> Result<String, i32> {
+    use crate::dirhelper::{Which, dirhelper};
+    use cs::*;
+    let directory = |which| {
+        dirhelper(which).map_err(|error| match error.raw_os_error() {
+            Some(libc::ENOMEM) => libc::ENOMEM,
+            _ => libc::EIO,
+        })
+    };
+    Ok(match name {
+        // No special flags.
+        POSIX_V6_ILP32_OFF32_CFLAGS
+        | XBS5_ILP32_OFF32_CFLAGS
+        | POSIX_V6_ILP32_OFF32_LDFLAGS
+        | XBS5_ILP32_OFF32_LDFLAGS
+        | POSIX_V6_ILP32_OFF32_LIBS
+        | XBS5_ILP32_OFF32_LIBS
+        | XBS5_ILP32_OFF32_LINTFLAGS
+        | POSIX_V6_ILP32_OFFBIG_LIBS
+        | XBS5_ILP32_OFFBIG_LIBS
+        | XBS5_ILP32_OFFBIG_LINTFLAGS
+        | POSIX_V6_LP64_OFF64_LIBS
+        | XBS5_LP64_OFF64_LIBS
+        | XBS5_LP64_OFF64_LINTFLAGS
+        | POSIX_V6_LPBIG_OFFBIG_LIBS
+        | XBS5_LPBIG_OFFBIG_LIBS
+        | XBS5_LPBIG_OFFBIG_LINTFLAGS => String::new(),
+        POSIX_V6_ILP32_OFFBIG_CFLAGS
+        | XBS5_ILP32_OFFBIG_CFLAGS
+        | POSIX_V6_ILP32_OFFBIG_LDFLAGS
+        | XBS5_ILP32_OFFBIG_LDFLAGS => "-W 32".into(),
+        POSIX_V6_LP64_OFF64_CFLAGS
+        | XBS5_LP64_OFF64_CFLAGS
+        | POSIX_V6_LP64_OFF64_LDFLAGS
+        | XBS5_LP64_OFF64_LDFLAGS
+        | POSIX_V6_LPBIG_OFFBIG_CFLAGS
+        | XBS5_LPBIG_OFFBIG_CFLAGS
+        | POSIX_V6_LPBIG_OFFBIG_LDFLAGS
+        | XBS5_LPBIG_OFFBIG_LDFLAGS => "-W 64".into(),
+        POSIX_V6_WIDTH_RESTRICTED_ENVS => "_POSIX_V6_LP64_OFF64".into(),
+        DARWIN_USER_DIR => directory(Which::User)?,
+        DARWIN_USER_CACHE_DIR => directory(Which::Cache)?,
+        // "If __dirhelper() fails, try TMPDIR and P_tmpdir, finally failing
+        // otherwise."
+        DARWIN_USER_TEMP_DIR => match directory(Which::Temp) {
+            Ok(path) => path,
+            Err(errno) => {
+                // SAFETY: a NUL-terminated name.
+                let tmpdir = unsafe { crate::env::getenv(c"TMPDIR".as_ptr()) };
+                // SAFETY: a value `getenv` returned is NUL-terminated.
+                let tmpdir = (!tmpdir.is_null()).then(|| {
+                    unsafe { std::ffi::CStr::from_ptr(tmpdir) }
+                        .to_string_lossy()
+                        .into_owned()
+                });
+                match tmpdir
+                    .into_iter()
+                    .chain([P_TMPDIR.to_string()])
+                    .find(|path| writable(path))
+                {
+                    Some(path) => path,
+                    None => return Err(errno),
+                }
+            }
+        },
+        _ => return Err(libc::EINVAL),
+    })
+}
+
+/// `access(path, W_OK) == 0` on the guest's `path`.
+fn writable(path: &str) -> bool {
+    let Ok(guest) = std::ffi::CString::new(path) else {
+        return false;
+    };
+    let host = prefix::ns::to_host(&guest);
+    // SAFETY: a NUL-terminated path.
+    unsafe { libc::access(host.as_ptr(), libc::W_OK) == 0 }
+}
+
+/// `size_t confstr(int name, char *buf, size_t len)`
+///
+/// Libc's `gen/confstr.c`: the value's length with its NUL, and as much of it
+/// as fits `buf`, or 0 with `errno` - `EINVAL` for a name it does not know.
+/// `_CS_PATH` is `user.cs_path`, and the `_CS_DARWIN_USER_*` directories are
+/// [`crate::dirhelper`]'s.
+///
+/// # Safety
+///
+/// `buf` is writable for `len` bytes, or `len` is 0.
+unsafe extern "C" fn confstr(name: i32, buf: *mut libc::c_char, len: usize) -> usize {
+    let value = match name {
+        cs::PATH => ask(&[crate::sysctl::CTL_USER, crate::sysctl::USER_CS_PATH]),
+        _ => match confstr_value(name) {
+            Ok(value) => value,
+            Err(errno) => {
+                crate::errno::set(errno);
+                return 0;
+            }
+        },
+    };
+    if len != 0 && !buf.is_null() {
+        // `strlcpy`, and `_CS_PATH`'s `strncpy` of `len - 1` with a NUL after:
+        // the same bytes, and zeros past the value, which `strncpy` writes
+        // and `strlcpy` leaves.
+        let copied = value.len().min(len - 1);
+        // SAFETY: `buf` is writable for `len` bytes, and `copied < len`.
+        unsafe {
+            std::ptr::copy_nonoverlapping(value.as_ptr(), buf.cast::<u8>(), copied);
+            *buf.add(copied) = 0;
+            if name == cs::PATH {
+                std::ptr::write_bytes(buf.add(copied), 0, len - copied);
+            }
+        }
     }
+    value.len() + 1
 }
 
 /// `_SYS_NAMELEN`, the width of every field in Darwin's `struct utsname`.
@@ -576,6 +726,61 @@ exports::exports! {
 mod tests {
     use super::*;
     use crate::sysctl::{GuestArch, lock_guest_arch};
+
+    /// `confstr.c`'s answers: the length with the NUL whatever fits, a
+    /// truncated copy that is still terminated, and `EINVAL` for a name it
+    /// does not know.
+    #[test]
+    fn confstr_answers_as_libc_does() {
+        let mut buf = [0x55 as libc::c_char; 64];
+        // SAFETY: a 64-byte buffer.
+        let n = unsafe { confstr(cs::PATH, buf.as_mut_ptr(), buf.len()) };
+        assert_eq!(n, "/usr/bin:/bin:/usr/sbin:/sbin".len() + 1);
+        // SAFETY: terminated by `confstr`.
+        assert_eq!(
+            unsafe { std::ffi::CStr::from_ptr(buf.as_ptr()) },
+            c"/usr/bin:/bin:/usr/sbin:/sbin"
+        );
+        assert!(buf[n..].iter().all(|&b| b == 0), "strncpy pads the rest");
+
+        let mut short = [0x55 as libc::c_char; 5];
+        // SAFETY: a 5-byte buffer.
+        assert_eq!(
+            unsafe { confstr(cs::PATH, short.as_mut_ptr(), short.len()) },
+            n
+        );
+        // SAFETY: as above.
+        assert_eq!(unsafe { std::ffi::CStr::from_ptr(short.as_ptr()) }, c"/usr");
+
+        // SAFETY: no buffer, as the length alone is asked for.
+        assert_eq!(
+            unsafe { confstr(cs::POSIX_V6_LP64_OFF64_CFLAGS, std::ptr::null_mut(), 0) },
+            6
+        );
+        // SAFETY: as above.
+        assert_eq!(
+            unsafe { confstr(cs::XBS5_ILP32_OFF32_LIBS, std::ptr::null_mut(), 0) },
+            1
+        );
+        // SAFETY: a 64-byte buffer.
+        unsafe {
+            confstr(
+                cs::POSIX_V6_WIDTH_RESTRICTED_ENVS,
+                buf.as_mut_ptr(),
+                buf.len(),
+            )
+        };
+        // SAFETY: as above.
+        assert_eq!(
+            unsafe { std::ffi::CStr::from_ptr(buf.as_ptr()) },
+            c"_POSIX_V6_LP64_OFF64"
+        );
+
+        crate::errno::set(0);
+        // SAFETY: as above.
+        assert_eq!(unsafe { confstr(15, buf.as_mut_ptr(), buf.len()) }, 0);
+        assert_eq!(crate::errno::get(), libc::EINVAL);
+    }
 
     fn field(u: &Utsname, index: usize) -> String {
         // SAFETY: the five fields are contiguous `SYS_NAMELEN` arrays and `index` is
