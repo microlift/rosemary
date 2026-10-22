@@ -412,7 +412,36 @@ pub const STRING_GLOBALS: &[(&str, &str)] = &[
     ),
 ];
 
+/// `NSExceptionName`s, whose values are their names.
+pub const EXCEPTION_NAMES: &[&str] = &[
+    "NSGenericException",
+    "NSRangeException",
+    "NSInvalidArgumentException",
+    "NSInternalInconsistencyException",
+    "NSMallocException",
+    "NSObjectInaccessibleException",
+    "NSObjectNotAvailableException",
+    "NSDestinationInvalidException",
+    "NSPortTimeoutException",
+    "NSInvalidSendPortException",
+    "NSInvalidReceivePortException",
+    "NSPortSendException",
+    "NSPortReceiveException",
+    "NSCharacterConversionException",
+    "NSFileHandleOperationException",
+    "NSParseErrorException",
+    "NSInconsistentArchiveException",
+    "NSUndefinedKeyException",
+];
+
 pub const NOTIFICATION_NAMES: &[&str] = &[
+    // Observed, and posted by nothing here: no time zone change, defaults
+    // write from another process, or background read is followed.
+    "NSSystemTimeZoneDidChangeNotification",
+    "NSUserDefaultsDidChangeNotification",
+    "NSFileHandleReadCompletionNotification",
+    "NSFileHandleReadToEndOfFileCompletionNotification",
+    "NSFileHandleDataAvailableNotification",
     "NSProcessInfoThermalStateDidChangeNotification",
     "NSProcessInfoPowerStateDidChangeNotification",
     "NSCurrentLocaleDidChangeNotification",

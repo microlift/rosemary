@@ -11,10 +11,31 @@
 use corefoundation::base::CFTypeRef;
 use corefoundation::callbacks::Policy;
 
-/// The proxy dictionary keys and the one proxy type this module names.
+/// The proxy dictionary keys and proxy types. CFNetwork's values are their
+/// own names: a proxy entry reads `kCFProxyTypeKey = kCFProxyTypeHTTP`.
 pub const KEYS: &[(&str, &str)] = &[
     ("_kCFProxyTypeKey", "kCFProxyTypeKey"),
     ("_kCFProxyTypeNone", "kCFProxyTypeNone"),
+    ("_kCFProxyTypeHTTP", "kCFProxyTypeHTTP"),
+    ("_kCFProxyTypeHTTPS", "kCFProxyTypeHTTPS"),
+    ("_kCFProxyTypeSOCKS", "kCFProxyTypeSOCKS"),
+    ("_kCFProxyTypeFTP", "kCFProxyTypeFTP"),
+    (
+        "_kCFProxyTypeAutoConfigurationURL",
+        "kCFProxyTypeAutoConfigurationURL",
+    ),
+    (
+        "_kCFProxyTypeAutoConfigurationJavaScript",
+        "kCFProxyTypeAutoConfigurationJavaScript",
+    ),
+    (
+        "_kCFProxyAutoConfigurationURLKey",
+        "kCFProxyAutoConfigurationURLKey",
+    ),
+    (
+        "_kCFProxyAutoConfigurationJavaScriptKey",
+        "kCFProxyAutoConfigurationJavaScriptKey",
+    ),
     ("_kCFProxyHostNameKey", "kCFProxyHostNameKey"),
     ("_kCFProxyPortNumberKey", "kCFProxyPortNumberKey"),
     ("_kCFProxyUsernameKey", "kCFProxyUsernameKey"),
