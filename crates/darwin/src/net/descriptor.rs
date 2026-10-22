@@ -1,16 +1,23 @@
 /// `int close(int fd)`
 pub(crate) unsafe extern "C" fn close(fd: i32) -> i32 {
+    crate::guarded::enforce(
+        fd,
+        crate::guarded::GUARD_CLOSE,
+        crate::guarded::Flavor::Close,
+    );
     // SAFETY: an integer descriptor; the call touches no caller memory.
     let rc = unsafe { libc::close(fd) };
     if rc == 0 || crate::errno::get() == libc::EBADF {
         super::sockopt::forget(fd);
         crate::attrlist::forget(fd);
+        crate::guarded::forget(fd);
     }
     rc
 }
 
 /// `int dup(int fd)`
 unsafe extern "C" fn dup(fd: i32) -> i32 {
+    crate::guarded::enforce(fd, crate::guarded::GUARD_DUP, crate::guarded::Flavor::Dup);
     // SAFETY: an integer descriptor; the call touches no caller memory.
     let copied = unsafe { libc::dup(fd) };
     if copied >= 0 {
@@ -21,11 +28,21 @@ unsafe extern "C" fn dup(fd: i32) -> i32 {
 
 /// `int dup2(int from, int to)`
 pub(crate) unsafe extern "C" fn dup2(from: i32, to: i32) -> i32 {
+    crate::guarded::enforce(from, crate::guarded::GUARD_DUP, crate::guarded::Flavor::Dup);
+    if from != to {
+        // Replacing `to` closes what it named.
+        crate::guarded::enforce(
+            to,
+            crate::guarded::GUARD_CLOSE,
+            crate::guarded::Flavor::Close,
+        );
+    }
     // SAFETY: two integer descriptors; the call touches no caller memory.
     let copied = unsafe { libc::dup2(from, to) };
     if copied >= 0 && from != to {
         // `to` now names another file, so a listing of the old one is stale.
         crate::attrlist::forget(to);
+        crate::guarded::forget(to);
     }
     if copied >= 0 {
         super::sockopt::inherit_sigpipe_suppression(from, copied);

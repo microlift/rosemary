@@ -1381,6 +1381,8 @@ pub static SIGNATURES: &[FunctionAbi] = &[
     sig!("OSAtomicAdd64", I64, I64, P),
     sig!("OSAtomicAdd64Barrier", I64, I64, P),
     sig!("OSAtomicCompareAndSwap32", BOOL, I32, I32, P),
+    sig!("change_fdguard_np", I32, I32, P, U32, P, U32, P),
+    sig!("guarded_close_np", I32, I32, P),
     sig!("OSAtomicCompareAndSwap32Barrier", BOOL, I32, I32, P),
     sig!("OSAtomicCompareAndSwap64", BOOL, I64, I64, P),
     sig!("OSAtomicCompareAndSwap64Barrier", BOOL, I64, I64, P),

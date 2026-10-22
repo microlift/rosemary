@@ -296,6 +296,17 @@ unsafe fn getpath(fd: libc::c_int, out: *mut libc::c_char) -> libc::c_int {
     0
 }
 
+/// The guard checks `fcntl` makes before acting: a copy of a descriptor whose
+/// guard forbids copies, or clearing close-on-exec on a guarded one.
+fn enforce_guard(fd: libc::c_int, command: libc::c_int, arg: usize) {
+    use crate::guarded::{Flavor, GUARD_DUP, enforce, enforce_cloexec};
+    match command {
+        cmd::F_DUPFD | cmd::F_DUPFD_CLOEXEC => enforce(fd, GUARD_DUP, Flavor::Dup),
+        cmd::F_SETFD => enforce_cloexec(fd, arg as i32),
+        _ => {}
+    }
+}
+
 #[cfg(target_os = "macos")]
 pub mod entry {
     pub unsafe extern "C" fn fcntl(
@@ -306,6 +317,7 @@ pub mod entry {
         if command == super::cmd::F_GETPATH {
             return unsafe { super::getpath(fd, arg as *mut libc::c_char) };
         }
+        super::enforce_guard(fd, command, arg);
         unsafe { libc::fcntl(fd, command, arg) }
     }
 
@@ -339,6 +351,7 @@ pub mod entry {
         if command == cmd::F_GETPATH {
             return unsafe { super::getpath(fd, arg as *mut libc::c_char) };
         }
+        super::enforce_guard(fd, command, arg);
         if command == cmd::F_PREALLOCATE {
             // SAFETY: `F_PREALLOCATE` defines its third argument as `fstore_t *`.
             return unsafe { preallocate(fd, arg as *mut Fstore) };

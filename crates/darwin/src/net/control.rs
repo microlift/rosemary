@@ -114,7 +114,19 @@ pub unsafe fn to_host(control: *const c_void, len: u32) -> Result<Vec<u8>, Untra
             core::slice::from_raw_parts(control.cast::<u8>().add(at + DARWIN_HDR), payload_len)
         };
         let host_kind = match (level, kind, payload.len()) {
-            (DARWIN_SOL_SOCKET, SCM_RIGHTS, _) => SCM_RIGHTS,
+            (DARWIN_SOL_SOCKET, SCM_RIGHTS, _) => {
+                // Sending a descriptor whose guard forbids it is the
+                // exception `unp_internalize` raises.
+                for fd in payload.chunks_exact(4) {
+                    let fd = i32::from_ne_bytes([fd[0], fd[1], fd[2], fd[3]]);
+                    crate::guarded::enforce(
+                        fd,
+                        crate::guarded::GUARD_SOCKET_IPC,
+                        crate::guarded::Flavor::SocketIpc,
+                    );
+                }
+                SCM_RIGHTS
+            }
             (libc::IPPROTO_IP, DARWIN_IP_TOS, 1 | 4) => libc::IP_TOS,
             // A host with no `IP_PKTINFO` carries nothing in Darwin's `struct
             // in_pktinfo`, so the message is refused rather than rewritten
