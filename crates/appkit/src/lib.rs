@@ -11,6 +11,7 @@
 )]
 
 mod about;
+mod accessibility;
 pub mod alert;
 mod animation;
 pub mod appearance;
@@ -96,6 +97,7 @@ pub fn bootstrap() {
         event::install_quartz_event_provider();
         decor::install();
         classes::install();
+        accessibility::install();
         alert::install();
         panel::install();
         appearance::install();
