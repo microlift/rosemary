@@ -380,6 +380,12 @@ pub(crate) fn install() {
         "drawsBackground" => draws_background, c"c16@0:8";
         "setBordered:" => set_bordered, c"v20@0:8c16";
         "isBordered" => is_bordered, c"c16@0:8";
+        // FIXME (ACCURACY): kept, and not drawn: a field here draws its border
+        // the same way bezeled or not.
+        "isBezeled" => crate::props::get_bool, c"c16@0:8";
+        "setBezeled:" => crate::props::set_bool, c"v20@0:8c16";
+        "bezelStyle" => crate::props::get_integer, c"q16@0:8";
+        "setBezelStyle:" => crate::props::set_integer, c"v24@0:8q16";
         "setAlignment:" => set_alignment, c"v24@0:8q16";
         "alignment" => alignment, c"q16@0:8";
         "setLineBreakMode:" => set_line_break_mode, c"v24@0:8q16";

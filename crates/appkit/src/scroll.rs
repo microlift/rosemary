@@ -174,6 +174,11 @@ pub(crate) fn install() {
         "borderType" => zero, c"Q16@0:8";
         "reflectScrolledClipView:" => ignored_object, c"v24@0:8@16";
     });
+    // Rubber-banding, which nothing here does; kept for reading back.
+    crate::props::properties!(scroll, {
+        integer "verticalScrollElasticity", "setVerticalScrollElasticity:";
+        integer "horizontalScrollElasticity", "setHorizontalScrollElasticity:";
+    });
     let clip = objc::class::lookup(c"NSClipView").expect("declared in crate::classes");
     methods!(clip, {
         "documentView" => clip_document_view, c"@16@0:8";

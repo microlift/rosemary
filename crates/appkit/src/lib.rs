@@ -52,6 +52,8 @@ pub mod launchservices;
 pub use coregraphics::cggeometry;
 pub use coregraphics::fonts;
 pub(crate) use coregraphics::quartz;
+mod props;
+pub use chrome::fonts;
 pub mod icon;
 pub mod image;
 mod input_context;
