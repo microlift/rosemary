@@ -106,6 +106,8 @@ static HIERARCHY: &[(&str, Option<&str>, usize)] = &[
     ),
     ("NSFont", None, 0),
     ("NSFontManager", None, 0),
+    // Its instances are the font dictionaries CoreText's descriptors are.
+    ("NSFontDescriptor", None, 0),
     (
         "NSOpenGLContext",
         None,
