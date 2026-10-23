@@ -886,6 +886,101 @@ unsafe fn recase(target: CFTypeRef, map: fn(&str) -> String) {
     unsafe { string::set_bytes(target, mapped.as_bytes()) };
 }
 
+fn nfd(text: &str) -> String {
+    icu_normalizer::DecomposingNormalizerBorrowed::new_nfd()
+        .normalize(text)
+        .into_owned()
+}
+
+fn nfkd(text: &str) -> String {
+    icu_normalizer::DecomposingNormalizerBorrowed::new_nfkd()
+        .normalize(text)
+        .into_owned()
+}
+
+fn nfc(text: &str) -> String {
+    icu_normalizer::ComposingNormalizerBorrowed::new_nfc()
+        .normalize(text)
+        .into_owned()
+}
+
+fn nfkc(text: &str) -> String {
+    icu_normalizer::ComposingNormalizerBorrowed::new_nfkc()
+        .normalize(text)
+        .into_owned()
+}
+
+/// Decomposed, the nonspacing marks dropped, and composed again: what
+/// "strip combining marks" and "strip diacritics" both do to text.
+fn strip_marks(text: &str) -> String {
+    use icu_properties::props::GeneralCategory;
+    let categories = icu_properties::CodePointMapData::<GeneralCategory>::new();
+    let bare: String = nfd(text)
+        .chars()
+        .filter(|c| categories.get(*c) != GeneralCategory::NonspacingMark)
+        .collect();
+    nfc(&bare)
+}
+
+/// `void CFStringNormalize(CFMutableStringRef, CFStringNormalizationForm)`.
+pub unsafe extern "C" fn CFStringNormalize(target: CFTypeRef, form: CFIndex) {
+    let map: fn(&str) -> String = match form {
+        0 => nfd,
+        1 => nfkd,
+        2 => nfc,
+        3 => nfkc,
+        _ => return,
+    };
+    unsafe { recase(target, map) }
+}
+
+pub const TRANSFORM_STRIP_COMBINING_MARKS: &str = "kCFStringTransformStripCombiningMarks";
+pub const TRANSFORM_STRIP_DIACRITICS: &str = "kCFStringTransformStripDiacritics";
+
+/// `Boolean CFStringTransform(CFMutableStringRef, CFRange *range, CFStringRef
+/// transform, Boolean reverse)`.
+///
+/// The transforms that drop marks are done; any other, and any reverse
+/// transform, answers false and leaves the string as it was, which is what
+/// Apple's does with a transform it cannot apply.
+pub unsafe extern "C" fn CFStringTransform(
+    target: CFTypeRef,
+    range: *mut CFRange,
+    transform: CFTypeRef,
+    reverse: u8,
+) -> u8 {
+    let Some(name) = (unsafe { string::as_string(transform) }) else {
+        return 0;
+    };
+    let name = String::from_utf8_lossy(&name.utf8()).into_owned();
+    if reverse != 0
+        || (name != TRANSFORM_STRIP_COMBINING_MARKS && name != TRANSFORM_STRIP_DIACRITICS)
+    {
+        return 0;
+    }
+    let Some(s) = (unsafe { string::as_string(target) }) else {
+        return 0;
+    };
+    let units = s.utf16();
+    let (start, length) = match unsafe { range.as_ref() } {
+        Some(r) => (r.location.max(0) as usize, r.length.max(0) as usize),
+        None => (0, units.len()),
+    };
+    let end = (start + length).min(units.len());
+    let start = start.min(end);
+    let middle = strip_marks(&String::from_utf16_lossy(&units[start..end]));
+    let middle: Vec<u16> = middle.encode_utf16().collect();
+    let mut out = units[..start].to_vec();
+    out.extend_from_slice(&middle);
+    out.extend_from_slice(&units[end..]);
+    unsafe { string::set_utf16(target, &out) };
+    // SAFETY: the caller's range, which says where the result now is.
+    if let Some(r) = unsafe { range.as_mut() } {
+        r.length = middle.len() as CFIndex;
+    }
+    1
+}
+
 /// `UniChar CFStringGetCharacterAtIndex(CFStringRef, CFIndex)`.
 ///
 /// Zero for an index outside the string, which Apple's would fault on: there is
