@@ -12,6 +12,7 @@ mod block;
 pub mod boxed;
 pub mod bundle;
 pub mod calculate;
+mod cf_attributed_string;
 mod characterset;
 mod constant;
 pub mod cookies;
@@ -106,6 +107,7 @@ pub fn bootstrap() {
 
 exports::group! {
     paths,
+    cf_attributed_string,
     /// Bundle and search-path calls are CoreFoundation and Foundation spellings
     /// of questions only this crate can answer - `corefoundation` is underneath
     /// it and has neither an `NSBundle` nor a `$HOME`.
