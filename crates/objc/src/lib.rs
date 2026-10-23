@@ -123,6 +123,7 @@ exports::exports! {
         "objc_sync_exit" => api::objc_sync_exit,
         "objc_setAssociatedObject" => api::objc_setAssociatedObject,
         "objc_getAssociatedObject" => api::objc_getAssociatedObject,
+        "objc_removeAssociatedObjects" => api::objc_removeAssociatedObjects,
         "objc_alloc" => shorthand::objc_alloc,
         "objc_allocWithZone" => shorthand::objc_allocWithZone,
         "objc_alloc_init" => shorthand::objc_alloc_init,

@@ -439,21 +439,106 @@ pub fn sync_exit(object: Id) {
     }
 }
 
-/// `objc_setAssociatedObject`'s table, keyed by object and key pointer.
+/// `objc_setAssociatedObject`'s table: per object, its values by key, and
+/// whether this table holds a reference to each.
 ///
 /// Addresses rather than pointers, so the table is `Send` without an assertion
 /// this crate would then have to justify.
-static ASSOCIATIONS: LazyLock<RwLock<HashMap<(usize, usize), usize>>> =
+static ASSOCIATIONS: LazyLock<RwLock<HashMap<usize, HashMap<usize, (usize, bool)>>>> =
     LazyLock::new(|| RwLock::new(HashMap::new()));
 
+/// Set once anything is associated, so the many objects freed in a program
+/// that never associates anything skip the table.
+static ANY_ASSOCIATED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// `OBJC_ASSOCIATION_*`: the low byte's bit 0 retains, and `3` copies.
+const POLICY_RETAIN: usize = 1;
+const POLICY_COPY: usize = 3;
+
+/// [`set_associated_with_policy`] with `OBJC_ASSOCIATION_ASSIGN`.
 pub fn set_associated(object: Id, key: *const c_void, value: Id) {
+    set_associated_with_policy(object, key, value, 0);
+}
+
+/// `objc_setAssociatedObject`: the table retains or copies `value` as
+/// `policy` says, and lets go of what the key held before.
+pub fn set_associated_with_policy(object: Id, key: *const c_void, value: Id, policy: usize) {
     crate::debug::validate(object, "objc_setAssociatedObject");
     crate::debug::validate(value, "objc_setAssociatedObject value");
-    let mut map = ASSOCIATIONS.write().unwrap_or_else(|e| e.into_inner());
-    match value.is_null() {
-        true => map.remove(&(object as usize, key as usize)),
-        false => map.insert((object as usize, key as usize), value as usize),
+    if object.is_null() {
+        return;
+    }
+    let (value, owned) = match policy & 0xff {
+        _ if value.is_null() => (value, false),
+        POLICY_COPY => {
+            // SAFETY: an object, sent `-copy`, which answers one it owns.
+            let copy = unsafe {
+                let f: unsafe extern "C" fn(Id, crate::sel::Sel) -> Id =
+                    std::mem::transmute(crate::msg::entry());
+                f(value, crate::sel::get("copy"))
+            };
+            (copy, true)
+        }
+        p if p & POLICY_RETAIN != 0 => (retain(value), true),
+        _ => (value, false),
     };
+    ANY_ASSOCIATED.store(true, std::sync::atomic::Ordering::Release);
+    let previous = {
+        let mut map = ASSOCIATIONS.write().unwrap_or_else(|e| e.into_inner());
+        let entries = map.entry(object as usize).or_default();
+        let previous = match value.is_null() {
+            true => entries.remove(&(key as usize)),
+            false => entries.insert(key as usize, (value as usize, owned)),
+        };
+        if entries.is_empty() {
+            map.remove(&(object as usize));
+        }
+        previous
+    };
+    // Released with the table unlocked: a release can run a `-dealloc` that
+    // associates or removes associations itself.
+    if let Some((old, true)) = previous {
+        release(old as Id);
+    }
+}
+
+/// A plain word kept against `object` under `key`, dropped with the object's
+/// associations. Not an object, so nothing is retained or validated; zero
+/// removes it.
+pub fn set_associated_word(object: Id, key: *const c_void, word: usize) {
+    crate::debug::validate(object, "objc_setAssociatedObject");
+    if object.is_null() {
+        return;
+    }
+    ANY_ASSOCIATED.store(true, std::sync::atomic::Ordering::Release);
+    let mut map = ASSOCIATIONS.write().unwrap_or_else(|e| e.into_inner());
+    let entries = map.entry(object as usize).or_default();
+    match word {
+        0 => entries.remove(&(key as usize)),
+        word => entries.insert(key as usize, (word, false)),
+    };
+    if entries.is_empty() {
+        map.remove(&(object as usize));
+    }
+}
+
+/// `objc_removeAssociatedObjects`, which an object's destruction also runs.
+pub fn remove_associated(object: Id) {
+    if !ANY_ASSOCIATED.load(std::sync::atomic::Ordering::Acquire) || object.is_null() {
+        return;
+    }
+    let removed = ASSOCIATIONS
+        .write()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(&(object as usize));
+    for (value, owned) in removed
+        .into_iter()
+        .flat_map(|entries| entries.into_values())
+    {
+        if owned {
+            release(value as Id);
+        }
+    }
 }
 
 pub fn associated(object: Id, key: *const c_void) -> Id {
@@ -461,6 +546,7 @@ pub fn associated(object: Id, key: *const c_void) -> Id {
     ASSOCIATIONS
         .read()
         .unwrap_or_else(|e| e.into_inner())
-        .get(&(object as usize, key as usize))
-        .map_or(std::ptr::null_mut(), |v| *v as Id)
+        .get(&(object as usize))
+        .and_then(|entries| entries.get(&(key as usize)))
+        .map_or(std::ptr::null_mut(), |(v, _)| *v as Id)
 }

@@ -848,9 +848,13 @@ pub unsafe extern "C" fn objc_setAssociatedObject(
     object: Id,
     key: *const c_void,
     value: Id,
-    _policy: usize,
+    policy: usize,
 ) {
-    crate::arc::set_associated(object, key, value);
+    crate::arc::set_associated_with_policy(object, key, value, policy);
+}
+
+pub unsafe extern "C" fn objc_removeAssociatedObjects(object: Id) {
+    crate::arc::remove_associated(object);
 }
 
 pub unsafe extern "C" fn objc_getAssociatedObject(object: Id, key: *const c_void) -> Id {
@@ -946,5 +950,24 @@ mod tests {
         assert_eq!(crate::arc::retain_count(object), 2);
         crate::arc::release(object);
         crate::arc::release(object);
+    }
+
+    /// A retaining association keeps its value alive, and the value is let
+    /// go of when the owner is destroyed - so a later object at the owner's
+    /// address does not inherit it.
+    #[test]
+    fn a_retained_association_lives_and_dies_with_its_owner() {
+        static KEY: u8 = 0;
+        let key = &KEY as *const u8 as *const c_void;
+        let (owner, value) = (object(), object());
+        // SAFETY: two live objects; 0x301 is OBJC_ASSOCIATION_RETAIN.
+        unsafe { objc_setAssociatedObject(owner, key, value, 0x301) };
+        assert_eq!(crate::arc::retain_count(value), 2);
+        assert_eq!(unsafe { objc_getAssociatedObject(owner, key) }, value);
+        // SAFETY: the owner is intact and about to be freed.
+        unsafe { crate::object::destruct_instance(owner) };
+        assert_eq!(crate::arc::retain_count(value), 1);
+        assert!(unsafe { objc_getAssociatedObject(owner, key) }.is_null());
+        crate::arc::release(value);
     }
 }
