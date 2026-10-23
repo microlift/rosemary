@@ -1145,6 +1145,21 @@ fn scale(receiver: Id) -> f64 {
     }
 }
 
+/// `-init`, which is `-initWithFrame:` with an empty frame: sent, so a
+/// subclass's designated initializer runs, as it does under AppKit.
+unsafe extern "C" fn init(receiver: Id, _sel: Sel) -> Id {
+    // SAFETY: `-initWithFrame:` is `id (id, SEL, NSRect)`.
+    unsafe {
+        let f: unsafe extern "C" fn(Id, Sel, NSRect) -> Id =
+            std::mem::transmute(objc::msg::entry());
+        f(
+            receiver,
+            objc::sel::get("initWithFrame:"),
+            NSRect::default(),
+        )
+    }
+}
+
 pub(crate) unsafe extern "C" fn init_with_frame(receiver: Id, _sel: Sel, frame: NSRect) -> Id {
     view_of(receiver).frame = frame;
     receiver
@@ -1876,6 +1891,7 @@ pub(crate) fn install() {
         "appearance" => appearance, c"@16@0:8";
         "setAppearance:" => set_appearance, c"v24@0:8@16";
         "effectiveAppearance" => effective_appearance, c"@16@0:8";
+        "init" => init, c"@16@0:8";
         "initWithFrame:" => init_with_frame, c"@48@0:8{CGRect={CGPoint=dd}{CGSize=dd}}16";
         "frame" => frame, c"{CGRect={CGPoint=dd}{CGSize=dd}}16@0:8";
         "setFrame:" => set_frame, c"v48@0:8{CGRect={CGPoint=dd}{CGSize=dd}}16";

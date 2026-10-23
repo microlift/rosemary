@@ -1871,6 +1871,24 @@ unsafe extern "C" fn set_content_view(receiver: Id, _sel: Sel, view: Id) {
     unsafe { crate::view::update_tracking_areas(view) };
 }
 
+/// `-init`: a titled window with an empty content rectangle, through the
+/// designated initializer so a subclass's runs.
+unsafe extern "C" fn init_plain(receiver: Id, _sel: Sel) -> Id {
+    // SAFETY: `id (id, SEL, NSRect, NSUInteger, NSUInteger, BOOL)`.
+    unsafe {
+        let f: unsafe extern "C" fn(Id, Sel, NSRect, usize, usize, u8) -> Id =
+            std::mem::transmute(objc::msg::entry());
+        f(
+            receiver,
+            objc::sel::get("initWithContentRect:styleMask:backing:defer:"),
+            NSRect::default(),
+            style::TITLED,
+            2,
+            0,
+        )
+    }
+}
+
 unsafe extern "C" fn window_controller(receiver: Id, _sel: Sel) -> Id {
     window_of(receiver).window_controller
 }
@@ -3330,6 +3348,7 @@ pub(crate) fn install() {
         "appearance" => appearance, c"@16@0:8";
         "setAppearance:" => set_appearance, c"v24@0:8@16";
         "effectiveAppearance" => effective_appearance, c"@16@0:8";
+        "init" => init_plain, c"@16@0:8";
         "initWithContentRect:styleMask:backing:defer:" => init_with_content_rect,
             c"@56@0:8{CGRect={CGPoint=dd}{CGSize=dd}}16Q48Q56c64";
         "initWithContentRect:styleMask:backing:defer:screen:" => init_with_content_rect_screen,
