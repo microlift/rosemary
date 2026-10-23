@@ -29,7 +29,8 @@ mod sync_flags {
 }
 
 /// The one item identifier a board here has. See the module note.
-const ITEM: usize = 1;
+const ITEM: u32 = 1;
+const PROMISED: u32 = 512;
 
 /// `kPasteboardClipboard`, the name a caller passes for the system clipboard.
 const CLIPBOARD_NAME: &str = "com.apple.pasteboard.clipboard";
@@ -46,10 +47,11 @@ struct Pasteboard {
     /// Whether this handle wrote the current contents, for
     /// `kPasteboardClientIsOwner`.
     owner: Mutex<bool>,
-    /// What `PasteboardSetPromiseKeeper` was given, recorded and never called -
-    /// see [`PasteboardResolvePromises`].
+    /// The callback and context used to produce promised flavors.
     keeper: Mutex<(usize, usize)>,
 }
+
+type PromiseKeeperProc = unsafe extern "C" fn(*const c_void, u32, CFTypeRef, *mut c_void) -> i32;
 
 /// The handles handed out, by address. Leaked: a `PasteboardRef` is released with
 /// `CFRelease`, and a clipboard lives as long as the program that opened it.
@@ -134,6 +136,64 @@ pub unsafe extern "C" fn PasteboardClear(handle: *const c_void) -> i32 {
     status::NO_ERR
 }
 
+fn is_text_flavor(flavor: &[u8]) -> bool {
+    matches!(
+        flavor,
+        b"public.utf8-plain-text"
+            | b"public.utf16-plain-text"
+            | b"public.text"
+            | b"com.apple.traditional-mac-plain-text"
+            | b"com.trolltech.anymime.text--plain"
+    )
+}
+
+fn invoke_promise_keeper(
+    handle: *const c_void,
+    board: &'static Pasteboard,
+    item: u32,
+    flavor: &[u8],
+) -> Result<(), i32> {
+    if !crate::pasteboard::flavor_is_promised(&board.board, flavor) {
+        return Ok(());
+    }
+    let (keeper, context) = *board.keeper.lock().unwrap_or_else(|e| e.into_inner());
+    if keeper == 0 {
+        return Err(status::BAD_FLAVOR);
+    }
+    let flavor_ref = corefoundation::string::from_bytes(flavor, false);
+    // SAFETY: PasteboardSetPromiseKeeper receives this callback with the
+    // platform-defined PasteboardPromiseKeeperProcPtr signature.
+    let callback: PromiseKeeperProc = unsafe { std::mem::transmute(keeper) };
+    let result = unsafe { callback(handle, item, flavor_ref, context as *mut c_void) };
+    unsafe { corefoundation::api::CFRelease(flavor_ref) };
+    let materialized = crate::pasteboard::flavor_data(&board.board, flavor).is_some();
+    if result != status::NO_ERR {
+        return Err(result);
+    }
+    if materialized {
+        Ok(())
+    } else {
+        Err(status::BAD_FLAVOR)
+    }
+}
+
+fn resolve_exportable_text_promises(handle: *const c_void, board: &'static Pasteboard) {
+    for flavor in crate::pasteboard::promised_flavors(&board.board) {
+        if is_text_flavor(&flavor) {
+            let _ = invoke_promise_keeper(handle, board, ITEM, &flavor);
+        }
+    }
+}
+
+fn resolve_all_promises(handle: *const c_void, board: &'static Pasteboard) -> i32 {
+    for flavor in crate::pasteboard::promised_flavors(&board.board) {
+        if let Err(result) = invoke_promise_keeper(handle, board, ITEM, &flavor) {
+            return result;
+        }
+    }
+    status::NO_ERR
+}
+
 /// `PasteboardSyncFlags PasteboardSynchronize(PasteboardRef)`
 ///
 /// `kPasteboardModified` means "changed since you last asked", which is what a
@@ -146,7 +206,8 @@ pub unsafe extern "C" fn PasteboardSynchronize(handle: *const c_void) -> u32 {
     };
     let count = crate::pasteboard::change_count_of(&board.board);
     let mut seen = board.seen.lock().unwrap_or_else(|e| e.into_inner());
-    let modified = count != *seen;
+    let previous = *seen;
+    let modified = count != previous;
     *seen = count;
     if modified {
         // A change this handle did not make means somebody else owns what is
@@ -157,7 +218,8 @@ pub unsafe extern "C" fn PasteboardSynchronize(handle: *const c_void) -> u32 {
     if modified {
         flags |= sync_flags::MODIFIED;
     }
-    if *board.owner.lock().unwrap_or_else(|e| e.into_inner()) {
+    let owner = *board.owner.lock().unwrap_or_else(|e| e.into_inner());
+    if owner {
         flags |= sync_flags::CLIENT_IS_OWNER;
     }
     flags
@@ -171,14 +233,14 @@ pub unsafe extern "C" fn PasteboardSynchronize(handle: *const c_void) -> u32 {
 /// # Safety
 ///
 /// `out` is null or writable for one `ItemCount`.
-pub unsafe extern "C" fn PasteboardGetItemCount(handle: *const c_void, out: *mut usize) -> i32 {
+pub unsafe extern "C" fn PasteboardGetItemCount(handle: *const c_void, out: *mut u32) -> i32 {
     let Some(board) = board_of(handle) else {
         return status::PARAM_ERR;
     };
     if out.is_null() {
         return status::PARAM_ERR;
     }
-    let count = !crate::pasteboard::flavors(&board.board).is_empty() as usize;
+    let count = !crate::pasteboard::flavors(&board.board).is_empty() as u32;
     // SAFETY: the caller states `out` is writable.
     unsafe { *out = count };
     status::NO_ERR
@@ -192,11 +254,11 @@ pub unsafe extern "C" fn PasteboardGetItemCount(handle: *const c_void, out: *mut
 ///
 /// # Safety
 ///
-/// `out` is null or writable for one pointer.
+/// `out` is null or writable for one `PasteboardItemID`.
 pub unsafe extern "C" fn PasteboardGetItemIdentifier(
     handle: *const c_void,
     index: CFIndex,
-    out: *mut usize,
+    out: *mut u32,
 ) -> i32 {
     let Some(board) = board_of(handle) else {
         return status::PARAM_ERR;
@@ -220,7 +282,7 @@ pub unsafe extern "C" fn PasteboardGetItemIdentifier(
 /// `out` is null or writable for one pointer.
 pub unsafe extern "C" fn PasteboardCopyItemFlavors(
     handle: *const c_void,
-    item: usize,
+    item: u32,
     out: *mut CFTypeRef,
 ) -> i32 {
     let Some(board) = board_of(handle) else {
@@ -262,7 +324,7 @@ pub unsafe extern "C" fn PasteboardCopyItemFlavors(
 /// pointer.
 pub unsafe extern "C" fn PasteboardCopyItemFlavorData(
     handle: *const c_void,
-    item: usize,
+    item: u32,
     flavor: CFTypeRef,
     out: *mut CFTypeRef,
 ) -> i32 {
@@ -278,7 +340,12 @@ pub unsafe extern "C" fn PasteboardCopyItemFlavorData(
     let Some(flavor) = (unsafe { text(flavor) }) else {
         return status::PARAM_ERR;
     };
-    let Some(bytes) = crate::pasteboard::flavor_data(&board.board, &flavor) else {
+    let mut bytes = crate::pasteboard::flavor_data(&board.board, &flavor);
+    if bytes.is_none() && crate::pasteboard::flavor_is_promised(&board.board, &flavor) {
+        let _ = invoke_promise_keeper(handle, board, item, &flavor);
+        bytes = crate::pasteboard::flavor_data(&board.board, &flavor);
+    }
+    let Some(bytes) = bytes else {
         return status::BAD_FLAVOR;
     };
     // SAFETY: the caller states `out` is writable.
@@ -297,7 +364,7 @@ pub unsafe extern "C" fn PasteboardCopyItemFlavorData(
 /// `flavor` and `data` are null or objects this runtime allocated.
 pub unsafe extern "C" fn PasteboardPutItemFlavor(
     handle: *const c_void,
-    _item: usize,
+    item: u32,
     flavor: CFTypeRef,
     data: CFTypeRef,
     _flags: u32,
@@ -305,38 +372,44 @@ pub unsafe extern "C" fn PasteboardPutItemFlavor(
     let Some(board) = board_of(handle) else {
         return status::PARAM_ERR;
     };
+    if item != ITEM {
+        return status::BAD_ITEM;
+    }
     let Some(flavor) = (unsafe { text(flavor) }) else {
         return status::PARAM_ERR;
     };
-    // SAFETY: as above - a `CFData` or null.
-    let bytes = match unsafe { corefoundation::collections::data(data) } {
-        Some(bytes) => bytes.clone(),
-        // A null `CFData` is how a caller *promises* the flavour: the data is to
-        // be asked for later, through the promise keeper. Recorded as empty, and
-        // see [`PasteboardResolvePromises`].
-        None => Vec::new(),
-    };
-    crate::pasteboard::put_flavor(&board.board, &flavor, bytes);
+    let promised = data.is_null();
+    if promised {
+        crate::pasteboard::put_promised_flavor(&board.board, &flavor);
+    } else {
+        let Some(bytes) = (unsafe { corefoundation::collections::data(data) }) else {
+            return status::PARAM_ERR;
+        };
+        let bytes = bytes.clone();
+        crate::pasteboard::put_flavor(&board.board, &flavor, bytes);
+    }
     *board.owner.lock().unwrap_or_else(|e| e.into_inner()) = true;
     *board.seen.lock().unwrap_or_else(|e| e.into_inner()) =
-        crate::pasteboard::change_count_of(&board.board);
+        crate::pasteboard::local_change_count_of(&board.board);
+    if promised && is_text_flavor(&flavor) {
+        let handle = handle;
+        resolve_exportable_text_promises(handle, board);
+    }
     status::NO_ERR
 }
 
 /// `OSStatus PasteboardGetItemFlavorFlags(PasteboardRef, PasteboardItemID,
 /// CFStringRef, PasteboardFlavorFlags *outFlags)`
 ///
-/// Zero flags - no promise, not sender-only, not translated - for a flavour the
-/// board holds, and `badPasteboardFlavorErr` for one it does not. The flags are
-/// what a caller checks to decide whether reading the data is free; here it
-/// always is, because the data is already in memory.
+/// Returns `kPasteboardFlavorPromised` until the promise keeper materializes the
+/// flavor, and zero afterward.
 ///
 /// # Safety
 ///
 /// `out` is null or writable for one `PasteboardFlavorFlags`.
 pub unsafe extern "C" fn PasteboardGetItemFlavorFlags(
     handle: *const c_void,
-    item: usize,
+    item: u32,
     flavor: CFTypeRef,
     out: *mut u32,
 ) -> i32 {
@@ -352,10 +425,15 @@ pub unsafe extern "C" fn PasteboardGetItemFlavorFlags(
     if !crate::pasteboard::flavors(&board.board).contains(&flavor) {
         return status::BAD_FLAVOR;
     }
-    if !out.is_null() {
-        // SAFETY: the caller states `out` is writable.
-        unsafe { *out = 0 };
+    if out.is_null() {
+        return status::PARAM_ERR;
     }
+    let flags = if crate::pasteboard::flavor_is_promised(&board.board, &flavor) {
+        PROMISED
+    } else {
+        0
+    };
+    unsafe { *out = flags };
     status::NO_ERR
 }
 
@@ -380,12 +458,7 @@ pub unsafe extern "C" fn PasteboardCopyName(handle: *const c_void, out: *mut CFT
 /// `OSStatus PasteboardSetPromiseKeeper(PasteboardRef,
 /// PasteboardPromiseKeeperProcPtr, void *inContext)`
 ///
-/// Recorded and not called. A promise keeper exists so a large flavour - a
-/// rendered image, a file's contents - is produced only if somebody pastes it,
-/// and [`PasteboardPutItemFlavor`] here always stores the bytes it was given, so
-/// nothing is ever outstanding. Accepting the registration is still right: a
-/// caller that could not set one would take the "promises unsupported" branch of
-/// its own code, which is a drag that offers nothing at all.
+/// Registers the callback used to materialize flavors passed with null data.
 pub unsafe extern "C" fn PasteboardSetPromiseKeeper(
     handle: *const c_void,
     keeper: *const c_void,
@@ -395,19 +468,18 @@ pub unsafe extern "C" fn PasteboardSetPromiseKeeper(
         return status::PARAM_ERR;
     };
     *board.keeper.lock().unwrap_or_else(|e| e.into_inner()) = (keeper as usize, context as usize);
+    resolve_exportable_text_promises(handle, board);
     status::NO_ERR
 }
 
 /// `OSStatus PasteboardResolvePromises(PasteboardRef)`
 ///
-/// Nothing to resolve - see [`PasteboardSetPromiseKeeper`] - so this succeeds.
-/// Failing would be the wrong answer: a caller reads it as "the drag could not be
-/// completed" and abandons the contents it had just put there.
+/// Materializes every outstanding flavor by calling its promise keeper.
 pub unsafe extern "C" fn PasteboardResolvePromises(handle: *const c_void) -> i32 {
-    match board_of(handle).is_some() {
-        true => status::NO_ERR,
-        false => status::PARAM_ERR,
-    }
+    let Some(board) = board_of(handle) else {
+        return status::PARAM_ERR;
+    };
+    resolve_all_promises(handle, board)
 }
 
 exports::exports! {
@@ -451,6 +523,20 @@ mod tests {
         handle
     }
 
+    unsafe extern "C" fn materialize_text(
+        handle: *const c_void,
+        item: u32,
+        flavor: CFTypeRef,
+        context: *mut c_void,
+    ) -> i32 {
+        let calls = unsafe { &mut *(context as *mut usize) };
+        *calls += 1;
+        let data = corefoundation::collections::new_data(b"promised text".to_vec());
+        let result = unsafe { PasteboardPutItemFlavor(handle, item, flavor, data, 0) };
+        unsafe { corefoundation::api::CFRelease(data) };
+        result
+    }
+
     /// The round trip Qt's clipboard is made of: clear, put a flavour, then
     /// enumerate and read it back.
     #[test]
@@ -461,7 +547,7 @@ mod tests {
         // out-parameters throughout.
         unsafe {
             assert_eq!(PasteboardClear(pb), status::NO_ERR);
-            let mut count = 99usize;
+            let mut count = 99u32;
             assert_eq!(PasteboardGetItemCount(pb, &raw mut count), status::NO_ERR);
             assert_eq!(count, 0, "a cleared board has no items");
 
@@ -474,7 +560,7 @@ mod tests {
 
             assert_eq!(PasteboardGetItemCount(pb, &raw mut count), status::NO_ERR);
             assert_eq!(count, 1);
-            let mut item = 0usize;
+            let mut item = 0u32;
             assert_eq!(
                 PasteboardGetItemIdentifier(pb, 1, &raw mut item),
                 status::NO_ERR
@@ -558,5 +644,111 @@ mod tests {
         unsafe { PasteboardCreate(std::ptr::null(), &raw mut handle) };
         let board = board_of(handle).expect("the handle just created");
         assert_eq!(board.board, crate::pasteboard::CLIPBOARD);
+    }
+
+    #[test]
+    fn promised_text_is_materialized_by_its_keeper() {
+        let pb = private_board("promised-text");
+        let flavor = string("public.utf8-plain-text");
+        let mut calls = 0usize;
+        unsafe {
+            assert_eq!(PasteboardClear(pb), status::NO_ERR);
+            assert_eq!(
+                PasteboardPutItemFlavor(pb, ITEM, flavor, std::ptr::null(), 0),
+                status::NO_ERR
+            );
+
+            let mut flags = 0;
+            assert_eq!(
+                PasteboardGetItemFlavorFlags(pb, ITEM, flavor, &raw mut flags),
+                status::NO_ERR
+            );
+            assert_eq!(flags, PROMISED);
+
+            assert_eq!(
+                PasteboardSetPromiseKeeper(
+                    pb,
+                    materialize_text as *const () as usize as *const c_void,
+                    &raw mut calls as *mut c_void,
+                ),
+                status::NO_ERR
+            );
+            assert_eq!(calls, 1);
+
+            let mut data: CFTypeRef = std::ptr::null();
+            assert_eq!(
+                PasteboardCopyItemFlavorData(pb, ITEM, flavor, &raw mut data),
+                status::NO_ERR
+            );
+            assert_eq!(
+                corefoundation::collections::data(data).unwrap(),
+                b"promised text"
+            );
+            corefoundation::api::CFRelease(data);
+
+            assert_eq!(
+                PasteboardGetItemFlavorFlags(pb, ITEM, flavor, &raw mut flags),
+                status::NO_ERR
+            );
+            assert_eq!(flags, 0);
+            assert_eq!(PasteboardResolvePromises(pb), status::NO_ERR);
+            assert_eq!(calls, 1);
+        }
+    }
+
+    #[test]
+    fn resolve_promises_materializes_non_text_flavors_on_demand() {
+        let pb = private_board("resolve-promise");
+        let flavor = string("public.tiff");
+        let mut calls = 0usize;
+        unsafe {
+            assert_eq!(PasteboardClear(pb), status::NO_ERR);
+            assert_eq!(
+                PasteboardPutItemFlavor(pb, ITEM, flavor, std::ptr::null(), 0),
+                status::NO_ERR
+            );
+            assert_eq!(
+                PasteboardSetPromiseKeeper(
+                    pb,
+                    materialize_text as *const () as usize as *const c_void,
+                    &raw mut calls as *mut c_void,
+                ),
+                status::NO_ERR
+            );
+            assert_eq!(calls, 0);
+            assert_eq!(PasteboardResolvePromises(pb), status::NO_ERR);
+            assert_eq!(calls, 1);
+
+            let mut data: CFTypeRef = std::ptr::null();
+            assert_eq!(
+                PasteboardCopyItemFlavorData(pb, ITEM, flavor, &raw mut data),
+                status::NO_ERR
+            );
+            assert_eq!(
+                corefoundation::collections::data(data).unwrap(),
+                b"promised text"
+            );
+            corefoundation::api::CFRelease(data);
+        }
+    }
+
+    #[test]
+    fn pasteboard_item_count_uses_the_32_bit_carbon_abi() {
+        let pb = private_board("item-count-abi");
+        let mut storage = 0xAABB_CCDD_1122_3344u64;
+        unsafe {
+            assert_eq!(PasteboardClear(pb), status::NO_ERR);
+            let data = corefoundation::collections::new_data(b"x".to_vec());
+            assert_eq!(
+                PasteboardPutItemFlavor(pb, ITEM, string("public.utf8-plain-text"), data, 0,),
+                status::NO_ERR
+            );
+            corefoundation::api::CFRelease(data);
+            assert_eq!(
+                PasteboardGetItemCount(pb, (&raw mut storage).cast::<u32>()),
+                status::NO_ERR
+            );
+        }
+        assert_eq!(storage, 0xAABB_CCDD_0000_0001);
     }
 }
