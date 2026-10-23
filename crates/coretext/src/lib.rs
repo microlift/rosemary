@@ -22,7 +22,9 @@ use coregraphics::{CGPoint, CGRect, CGSize};
 
 const ATTRIBUTE_GLOBALS: &[(&str, &str)] = &[
     ("_kCTFontCopyrightNameKey", "CTFontCopyrightNameKey"),
-    ("_kCTFontAttributeName", "CTFontAttributeName"),
+    // The attributed-string keys are shared with AppKit's where both
+    // exist, which is how one attributed string serves both frameworks.
+    ("_kCTFontAttributeName", "NSFont"),
     ("_kCTFontCascadeListAttribute", "CTFontCascadeListAttribute"),
     ("_kCTFontFamilyNameAttribute", "CTFontFamilyNameAttribute"),
     (
@@ -48,12 +50,21 @@ const ATTRIBUTE_GLOBALS: &[(&str, &str)] = &[
     ("_kCTFontURLAttribute", "CTFontURLAttribute"),
     ("_kCTFontUniqueNameKey", "CTFontUniqueNameKey"),
     ("_kCTFontWeightTrait", "CTFontWeightTrait"),
+    ("_kCTForegroundColorAttributeName", "CTForegroundColor"),
     (
-        "_kCTForegroundColorAttributeName",
-        "CTForegroundColorAttributeName",
+        "_kCTForegroundColorFromContextAttributeName",
+        "CTForegroundColorFromContext",
     ),
-    ("_kCTKernAttributeName", "CTKernAttributeName"),
-    ("_kCTLanguageAttributeName", "CTLanguageAttributeName"),
+    ("_kCTKernAttributeName", "NSKern"),
+    ("_kCTLigatureAttributeName", "NSLigature"),
+    ("_kCTParagraphStyleAttributeName", "NSParagraphStyle"),
+    ("_kCTUnderlineStyleAttributeName", "NSUnderline"),
+    ("_kCTUnderlineColorAttributeName", "CTUnderlineColor"),
+    ("_kCTStrokeWidthAttributeName", "NSStrokeWidth"),
+    ("_kCTStrokeColorAttributeName", "CTStrokeColor"),
+    ("_kCTSuperscriptAttributeName", "NSSuperScript"),
+    ("_kCTGlyphInfoAttributeName", "NSGlyphInfo"),
+    ("_kCTLanguageAttributeName", "NSLanguage"),
     (
         "_kCTTypesetterOptionForcedEmbeddingLevel",
         "CTTypesetterOptionForcedEmbeddingLevel",
