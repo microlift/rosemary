@@ -198,6 +198,7 @@ exports::exports! {
         "CFRunLoopStop" => api::CFRunLoopStop,
         "CFRunLoopCopyCurrentMode" => api::CFRunLoopCopyCurrentMode,
         "CFRunLoopWakeUp" => api::CFRunLoopWakeUp,
+        "CFRunLoopPerformBlock" => api::CFRunLoopPerformBlock,
         "CFRunLoopSourceCreate" => api::CFRunLoopSourceCreate,
         "CFRunLoopSourceSignal" => api::CFRunLoopSourceSignal,
         "CFRunLoopSourceInvalidate" => api::CFRunLoopSourceInvalidate,

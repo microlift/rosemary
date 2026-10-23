@@ -2669,6 +2669,31 @@ pub unsafe extern "C" fn CFRunLoopStop(loop_: CFTypeRef) {
     }
 }
 
+/// `void CFRunLoopPerformBlock(CFRunLoopRef, CFTypeRef mode, void (^)(void))`.
+/// The mode is one mode's name or an array of them.
+pub unsafe extern "C" fn CFRunLoopPerformBlock(
+    loop_: CFTypeRef,
+    mode: CFTypeRef,
+    block: CFTypeRef,
+) {
+    let Some(l) = (unsafe { borrow::<RunLoop>(loop_) }) else {
+        return;
+    };
+    let modes = match unsafe { collections::array(mode) } {
+        // SAFETY: the array's elements are mode names.
+        Some(array) => array
+            .values
+            .iter()
+            .map(|m| unsafe { mode_name(*m) })
+            .collect(),
+        None => vec![unsafe { mode_name(mode) }],
+    };
+    let block = objc::block::copy(block as objc::object::Id);
+    if !block.is_null() {
+        l.perform_block(&modes, block as usize);
+    }
+}
+
 pub unsafe extern "C" fn CFRunLoopWakeUp(loop_: CFTypeRef) {
     if let Some(l) = unsafe { borrow::<RunLoop>(loop_) } {
         l.wake();

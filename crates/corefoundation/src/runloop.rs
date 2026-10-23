@@ -235,6 +235,9 @@ pub struct RunLoop {
     /// loop runs inside the default one, and `CFRunLoopCopyCurrentMode` names
     /// the inner.
     running: Mutex<Vec<String>>,
+    /// `CFRunLoopPerformBlock`'s blocks: each a copy this loop owns, and the
+    /// modes it may run in.
+    blocks: Mutex<Vec<(Vec<String>, usize)>>,
 }
 
 pub const DEFAULT_MODE: &str = "kCFRunLoopDefaultMode";
@@ -259,7 +262,45 @@ impl RunLoop {
             waker: (Mutex::new(false), Condvar::new()),
             waiting: AtomicBool::new(false),
             running: Mutex::new(Vec::new()),
+            blocks: Mutex::new(Vec::new()),
         }
+    }
+
+    /// Queue `block`, a copy this loop takes over, to run the next time the
+    /// loop turns in one of `modes`.
+    pub fn perform_block(&self, modes: &[String], block: usize) {
+        let mut names = Vec::new();
+        for mode in modes {
+            names.extend(self.names(mode));
+        }
+        self.blocks
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push((names, block));
+    }
+
+    /// Run the queued blocks that may run in `mode`; true if any ran.
+    fn run_blocks(&self, mode: &str) -> bool {
+        let due: Vec<usize> = {
+            let mut blocks = self.blocks.lock().unwrap_or_else(|e| e.into_inner());
+            let (due, kept) = blocks
+                .drain(..)
+                .partition::<Vec<_>, _>(|(modes, _)| modes.iter().any(|m| m == mode));
+            *blocks = kept;
+            due.into_iter().map(|(_, block)| block).collect()
+        };
+        for block in &due {
+            // SAFETY: a `void (^)(void)` copied by `CFRunLoopPerformBlock`,
+            // whose `invoke` takes the block alone.
+            unsafe {
+                if let Some(invoke) = objc::block::invoke(*block as objc::object::Id) {
+                    let f: unsafe extern "C" fn(usize) = std::mem::transmute(invoke);
+                    f(*block);
+                }
+            }
+            objc::block::release(*block as objc::object::Id);
+        }
+        !due.is_empty()
     }
 
     /// The mode the innermost run in progress is in, or `None` when the loop
@@ -567,6 +608,7 @@ impl RunLoop {
             for source in &sources {
                 handled |= source.fire();
             }
+            handled |= self.run_blocks(mode);
             if handled && return_after_source {
                 self.observe(mode, activity::EXIT);
                 return result::HANDLED_SOURCE;
