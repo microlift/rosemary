@@ -701,3 +701,53 @@ mod tests {
         );
     }
 }
+
+/// `void NSFrameRect(NSRect)`: a one-point border inside `rect`, in the fill
+/// colour.
+#[allow(non_snake_case)]
+pub extern "C" fn NSFrameRect(rect: NSRect) {
+    NSFrameRectWithWidth(rect, 1.0);
+}
+
+/// `void NSFrameRectWithWidth(NSRect, CGFloat)`.
+#[allow(non_snake_case)]
+pub extern "C" fn NSFrameRectWithWidth(rect: NSRect, width: f64) {
+    let (x, y) = (rect.origin.x, rect.origin.y);
+    let (w, h) = (rect.size.width, rect.size.height);
+    if w <= 0.0 || h <= 0.0 {
+        return;
+    }
+    let edge = |x, y, width, height| NSRect {
+        origin: NSPoint { x, y },
+        size: NSSize { width, height },
+    };
+    let inner = (h - 2.0 * width).max(0.0);
+    NSRectFill(edge(x, y, w, width.min(h)));
+    NSRectFill(edge(x, y + h - width.min(h), w, width.min(h)));
+    NSRectFill(edge(x, y + width, width.min(w), inner));
+    NSRectFill(edge(x + w - width.min(w), y + width, width.min(w), inner));
+}
+
+/// `void NSEraseRect(NSRect)`: white, whatever the fill colour is.
+#[allow(non_snake_case)]
+pub extern "C" fn NSEraseRect(rect: NSRect) {
+    let saved = FILL.with(Cell::get);
+    FILL.with(|fill| fill.set([1.0, 1.0, 1.0, 1.0]));
+    NSRectFill(rect);
+    FILL.with(|fill| fill.set(saved));
+}
+
+/// `void NSRectClip(NSRect)`.
+#[allow(non_snake_case)]
+pub extern "C" fn NSRectClip(rect: NSRect) {
+    crate::bezier::clip_rect(rect);
+}
+
+/// `void NSRectFillUsingOperation(NSRect, NSCompositingOperation)`.
+///
+/// FIXME (ACCURACY): every operation draws source-over, which is right for
+/// `NSCompositingOperationSourceOver`, and for `Copy` with an opaque colour.
+#[allow(non_snake_case)]
+pub extern "C" fn NSRectFillUsingOperation(rect: NSRect, _operation: usize) {
+    NSRectFill(rect);
+}

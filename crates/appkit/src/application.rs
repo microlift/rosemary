@@ -1496,3 +1496,7 @@ mod tests {
         objc::arc::release(object);
     }
 }
+
+/// `void NSBeep(void)`: the alert sound. There is no system sound to play.
+#[allow(non_snake_case)]
+pub extern "C" fn NSBeep() {}

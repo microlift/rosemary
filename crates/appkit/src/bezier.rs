@@ -291,6 +291,11 @@ pub(crate) fn fill_rect_through_state(rect: NSRect, color: [f64; 4]) -> bool {
     true
 }
 
+/// `NSRectClip`: intersect the clip with `rect`.
+pub(crate) fn clip_rect(rect: NSRect) {
+    clip_to(vec![rect_points(rect)], false);
+}
+
 /// Where `rect` lands in the view under the current transform, for drawing
 /// that can only place axis-aligned images.
 ///
