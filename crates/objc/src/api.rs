@@ -970,4 +970,53 @@ mod tests {
         assert!(unsafe { objc_getAssociatedObject(owner, key) }.is_null());
         crate::arc::release(value);
     }
+
+    static FORWARD_TARGET: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+    unsafe extern "C" fn answer(_receiver: Id, _sel: crate::sel::Sel) -> usize {
+        42
+    }
+
+    unsafe extern "C" fn target_for(
+        _receiver: Id,
+        _sel: crate::sel::Sel,
+        _wanted: crate::sel::Sel,
+    ) -> Id {
+        FORWARD_TARGET.load(std::sync::atomic::Ordering::Acquire) as Id
+    }
+
+    /// A message the receiver does not answer goes to the object its
+    /// `-forwardingTargetForSelector:` names, and arrives with that object as
+    /// its receiver.
+    #[test]
+    fn a_forwarding_target_receives_the_message() {
+        crate::bootstrap();
+        let root = crate::class::lookup(c"NSObject").unwrap();
+        let answering = crate::class::allocate_pair(Some(root), c"ForwardTestTarget", 0).unwrap();
+        answering.add_method(
+            crate::sel::get("forwardTestAnswer"),
+            answer as crate::class::Imp,
+            c"Q16@0:8",
+        );
+        crate::class::register_pair(answering);
+        let proxy = crate::class::allocate_pair(Some(root), c"ForwardTestProxy", 0).unwrap();
+        proxy.add_method(
+            crate::sel::get("forwardingTargetForSelector:"),
+            target_for as crate::class::Imp,
+            c"@24@0:8:16",
+        );
+        crate::class::register_pair(proxy);
+        let target = crate::object::create_instance(answering, 0);
+        FORWARD_TARGET.store(target as usize, std::sync::atomic::Ordering::Release);
+        let sender = crate::object::create_instance(proxy, 0);
+        // SAFETY: `NSUInteger (id, SEL)`, sent through the trampoline.
+        let got = unsafe {
+            let f: unsafe extern "C" fn(Id, crate::sel::Sel) -> usize =
+                std::mem::transmute(crate::msg::entry());
+            f(sender, crate::sel::get("forwardTestAnswer"))
+        };
+        assert_eq!(got, 42);
+        crate::arc::release(sender);
+        crate::arc::release(target);
+    }
 }

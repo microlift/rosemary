@@ -109,7 +109,126 @@ pub(crate) fn install() {
         does_not_recognize as Imp,
         c"v24@0:8:16",
     );
+    add(
+        meta,
+        "resolveInstanceMethod:",
+        resolve_nothing as Imp,
+        c"B24@0:8:16",
+    );
+    add(
+        meta,
+        "resolveClassMethod:",
+        resolve_nothing as Imp,
+        c"B24@0:8:16",
+    );
+    add(
+        class,
+        "forwardingTargetForSelector:",
+        no_forwarding_target as Imp,
+        c"@24@0:8:16",
+    );
 
+    crate::class::register_pair(class);
+    install_proxy();
+}
+
+/// `+resolveInstanceMethod:` and `+resolveClassMethod:` as `NSObject` has
+/// them: nothing added. The lookup skips a class whose resolver is this.
+unsafe extern "C" fn resolve_nothing(_receiver: Id, _sel: Sel, _selector: Sel) -> bool {
+    false
+}
+
+pub(crate) fn default_resolver() -> *const c_void {
+    resolve_nothing as *const c_void
+}
+
+/// `-forwardingTargetForSelector:` as `NSObject` has it: none.
+unsafe extern "C" fn no_forwarding_target(_receiver: Id, _sel: Sel, _selector: Sel) -> Id {
+    std::ptr::null_mut()
+}
+
+pub(crate) fn default_forwarding_target() -> *const c_void {
+    no_forwarding_target as *const c_void
+}
+
+unsafe extern "C" fn yes(_receiver: Id, _sel: Sel) -> bool {
+    true
+}
+
+/// `NSProxy`, Foundation's other root class: an object that stands in for
+/// another and forwards what it does not answer itself. Declared here rather
+/// than in Foundation because a root class's memory management is the
+/// runtime's.
+///
+/// FIXME (ACCURACY): forwarding reaches a target through
+/// `-forwardingTargetForSelector:` only; `-forwardInvocation:` needs
+/// `NSInvocation`, which this runtime does not have.
+fn install_proxy() {
+    let Some(class) = crate::class::allocate_pair(None, c"NSProxy", 0) else {
+        return;
+    };
+    let meta = class.metaclass();
+    add(meta, "alloc", alloc as Imp, c"@16@0:8");
+    add(
+        meta,
+        "allocWithZone:",
+        alloc_with_zone as Imp,
+        c"@24@0:8^v16",
+    );
+    add(meta, "class", class_of_class as Imp, c"#16@0:8");
+    add(meta, "initialize", initialize as Imp, c"v16@0:8");
+    add(meta, "load", initialize as Imp, c"v16@0:8");
+    add(meta, "respondsToSelector:", responds as Imp, c"B24@0:8:16");
+    add(
+        meta,
+        "resolveInstanceMethod:",
+        resolve_nothing as Imp,
+        c"B24@0:8:16",
+    );
+    add(
+        meta,
+        "resolveClassMethod:",
+        resolve_nothing as Imp,
+        c"B24@0:8:16",
+    );
+    add(class, "dealloc", dealloc as Imp, c"v16@0:8");
+    add(class, "retain", retain as Imp, c"@16@0:8");
+    add(class, "release", release as Imp, c"v16@0:8");
+    add(class, "autorelease", autorelease as Imp, c"@16@0:8");
+    add(class, "retainCount", retain_count as Imp, c"Q16@0:8");
+    add(class, "self", itself as Imp, c"@16@0:8");
+    add(class, "class", class_of as Imp, c"#16@0:8");
+    add(class, "superclass", instance_superclass as Imp, c"#16@0:8");
+    add(class, "isEqual:", is_equal as Imp, c"B24@0:8@16");
+    add(class, "hash", hash as Imp, c"Q16@0:8");
+    add(class, "isKindOfClass:", is_kind_of as Imp, c"B24@0:8#16");
+    add(
+        class,
+        "isMemberOfClass:",
+        is_member_of as Imp,
+        c"B24@0:8#16",
+    );
+    add(class, "respondsToSelector:", responds as Imp, c"B24@0:8:16");
+    add(class, "isProxy", yes as Imp, c"B16@0:8");
+    add(class, "zone", zone as Imp, c"^{_NSZone=}16@0:8");
+    add(
+        class,
+        "conformsToProtocol:",
+        instance_conforms as Imp,
+        c"B24@0:8@16",
+    );
+    add(
+        class,
+        "forwardingTargetForSelector:",
+        no_forwarding_target as Imp,
+        c"@24@0:8:16",
+    );
+    add(
+        class,
+        "doesNotRecognizeSelector:",
+        does_not_recognize as Imp,
+        c"v24@0:8:16",
+    );
     crate::class::register_pair(class);
 }
 
