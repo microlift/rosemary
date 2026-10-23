@@ -560,8 +560,12 @@ impl RunLoop {
             let mut handled = false;
             crate::socket::poll();
             self.observe(mode, activity::BEFORE_TIMERS);
+            // A fired timer is not a handled *source*: `returnAfterSourceHandled`
+            // concerns sources alone, and a loop whose timer is always due (tao's
+            // `ControlFlow::Poll`) must still reach `BeforeWaiting`, where toolkits
+            // drain the work other threads queued for them.
             for timer in &timers {
-                handled |= timer.fire(now);
+                timer.fire(now);
             }
             self.observe(mode, activity::BEFORE_SOURCES);
             for source in &sources {
@@ -1075,5 +1079,37 @@ mod tests {
         loop_.remove_source(&source, COMMON_MODES);
         assert_eq!(loop_.run_in_mode("Modal", 0.0, true), result::FINISHED);
         assert_eq!(loop_.run_in_mode(DEFAULT_MODE, 0.0, true), result::FINISHED);
+    }
+
+    /// tao runs `ControlFlow::Poll` with a timer that is always due and drains
+    /// work other threads queued for it from `BeforeWaiting`. A fired timer is not
+    /// a handled source, so a run that returns after one must still get there.
+    #[test]
+    fn a_due_timer_does_not_end_a_return_after_source_run_early() {
+        thread_local! {
+            static SEEN: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+        }
+        unsafe extern "C" fn observer(_: CFTypeRef, what: u32, _: *mut c_void) {
+            if what == activity::BEFORE_WAITING {
+                SEEN.with(|s| s.set(s.get() + 1));
+            }
+        }
+        unsafe extern "C" fn timer_cb(_: CFTypeRef, _: *mut c_void) {}
+        let loop_ = Arc::new(RunLoop::new());
+        loop_.add_observer(
+            &new_observer(activity::BEFORE_WAITING, true, 0, Some(observer), 0),
+            DEFAULT_MODE,
+        );
+        loop_.add_timer(
+            &new_timer(
+                Duration::ZERO,
+                Some(Duration::from_millis(1)),
+                Some(timer_cb),
+                0,
+            ),
+            DEFAULT_MODE,
+        );
+        loop_.run_in_mode(DEFAULT_MODE, 0.01, true);
+        assert!(SEEN.with(|s| s.get()) > 0);
     }
 }
