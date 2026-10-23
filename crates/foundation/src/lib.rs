@@ -35,6 +35,7 @@ pub mod notification;
 pub mod objectify;
 pub mod operation;
 pub mod paths;
+mod transformer;
 pub use corefoundation::plist;
 pub mod pool;
 pub mod processinfo;
@@ -68,6 +69,7 @@ pub fn bootstrap() {
         attributed_string::install();
         collections::install();
         enumeration::install();
+        transformer::install();
         decimal::install();
         pool::install();
         geometry::install();
@@ -266,6 +268,10 @@ pub const CLASSES: &[&str] = &[
     "NSDecimalNumber",
     "NSDecimalNumberHandler",
     "NSPredicate",
+    "NSProxy",
+    "NSValueTransformer",
+    "NSURLProtocol",
+    "NSScriptCommand",
     "NSEnumerator",
     "NSValue",
     "NSNull",
