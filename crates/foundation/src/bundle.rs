@@ -1262,8 +1262,16 @@ pub(crate) mod class {
     /// class, so every class answers with the main bundle - Apple's answer for
     /// the guest's own classes, which are the ones a program asks about.
     unsafe extern "C" fn bundle_for_class(class: Id, sel: Sel, of: Id) -> Id {
-        // SAFETY: a class object, or nil.
-        let image = unsafe { objc::class::from_ptr(of as *const objc::class::Class) }
+        // A class object, or nil - or an instance, which Apple answers for by
+        // its class, and which a program passing `self` relies on.
+        let class_ptr = of as *const objc::class::Class;
+        let of = match objc::class::is_known(class_ptr) {
+            // SAFETY: a class this runtime registered.
+            true => unsafe { objc::class::from_ptr(class_ptr) },
+            // SAFETY: nil or a live object.
+            false => unsafe { objc::object::class_of(of) },
+        };
+        let image = of
             .and_then(|of| of.own_methods().first().map(|m| m.implementation() as u64))
             .and_then(darwin::images::image_path);
         let main = super::main();
