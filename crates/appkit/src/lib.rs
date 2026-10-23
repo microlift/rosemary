@@ -20,6 +20,7 @@ mod aqua;
 pub mod backing;
 mod bezier;
 pub mod button;
+mod cassowary;
 mod catalog;
 mod cell;
 pub use coregraphics::cgbitmap;

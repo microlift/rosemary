@@ -2204,6 +2204,8 @@ unsafe extern "C" fn order_front_regardless(receiver: Id, _sel: Sel) {
 }
 
 fn order_front(receiver: Id, make_key: bool) {
+    // Its views are owed their first `-updateConstraints` before it draws.
+    crate::layout::note_tree_changed();
     let window = window_of(receiver);
     if window.sdl.is_null() {
         return;
