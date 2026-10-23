@@ -19,6 +19,7 @@ pub mod decimal;
 pub mod defaults;
 mod define;
 mod distributed;
+mod enumeration;
 pub mod error;
 pub mod exception;
 pub mod filehandle;
@@ -66,6 +67,7 @@ pub fn bootstrap() {
         indexset::install();
         attributed_string::install();
         collections::install();
+        enumeration::install();
         decimal::install();
         pool::install();
         geometry::install();
