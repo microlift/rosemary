@@ -2057,6 +2057,13 @@ unsafe extern "C" fn content_view(receiver: Id, _sel: Sel) -> Id {
 /// draws into a fraction of the window and reports a backing store that does not
 /// match it.
 unsafe extern "C" fn set_content_view(receiver: Id, _sel: Sel, view: Id) {
+    let previous = window_of(receiver).content_view;
+    if previous != view {
+        crate::view::will_move_to_window(previous, receiver, std::ptr::null_mut());
+        // SAFETY: null or a view of this crate's.
+        let from = unsafe { crate::view::window_of(view) };
+        crate::view::will_move_to_window(view, from, receiver);
+    }
     let window = window_of(receiver);
     let old = std::mem::replace(&mut window.content_view, objc::arc::retain(view));
     // The view being replaced may outlive this window: Qt keeps its own reference
@@ -2078,9 +2085,16 @@ unsafe extern "C" fn set_content_view(receiver: Id, _sel: Sel, view: Id) {
             send_view(window.frame_view, "addSubview:", view);
         }
     }
+    let moved = old != view;
+    if moved {
+        crate::view::did_move_to_window(old, receiver, std::ptr::null_mut());
+    }
     objc::arc::release(old);
     // SAFETY: `view` is null or an object this runtime allocated.
     unsafe { crate::view::set_window(view, receiver) };
+    if moved {
+        crate::view::did_move_to_window(view, std::ptr::null_mut(), receiver);
+    }
     if view.is_null() || window.sdl.is_null() {
         return;
     }

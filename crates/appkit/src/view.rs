@@ -1484,6 +1484,69 @@ unsafe extern "C" fn subviews(receiver: Id, _sel: Sel) -> Id {
     view.subviews
 }
 
+/// Send `selector`, taking one object, to `view` and every view under it.
+fn tell_tree(view: Id, selector: &str, argument: Id) {
+    if !is_view(view) {
+        return;
+    }
+    let sel = objc::sel::get(selector);
+    // SAFETY: `void (id, SEL, id)`, which the hierarchy hooks are.
+    unsafe {
+        let f: unsafe extern "C" fn(Id, Sel, Id) = std::mem::transmute(objc::msg::entry());
+        f(view, sel, argument);
+    }
+    for child in subviews_of(view) {
+        tell_tree(child, selector, argument);
+    }
+}
+
+/// [`tell_tree`] for a hook that takes nothing.
+fn tell_tree_bare(view: Id, selector: &str) {
+    if !is_view(view) {
+        return;
+    }
+    let sel = objc::sel::get(selector);
+    // SAFETY: `void (id, SEL)`.
+    unsafe {
+        let f: unsafe extern "C" fn(Id, Sel) = std::mem::transmute(objc::msg::entry());
+        f(view, sel);
+    }
+    for child in subviews_of(view) {
+        tell_tree_bare(child, selector);
+    }
+}
+
+fn tell(view: Id, selector: &str, argument: Id) {
+    // SAFETY: `void (id, SEL, id)`.
+    unsafe {
+        let f: unsafe extern "C" fn(Id, Sel, Id) = std::mem::transmute(objc::msg::entry());
+        f(view, objc::sel::get(selector), argument);
+    }
+}
+
+fn tell_bare(view: Id, selector: &str) {
+    // SAFETY: `void (id, SEL)`.
+    unsafe {
+        let f: unsafe extern "C" fn(Id, Sel) = std::mem::transmute(objc::msg::entry());
+        f(view, objc::sel::get(selector));
+    }
+}
+
+/// `view` and its subtree are leaving `old` for `new`: the will-move hooks.
+pub(crate) fn will_move_to_window(view: Id, old: Id, new: Id) {
+    if old != new {
+        tell_tree(view, "viewWillMoveToWindow:", new);
+    }
+}
+
+/// ...and the did-move ones, once the move is made.
+pub(crate) fn did_move_to_window(view: Id, old: Id, new: Id) {
+    if old != new {
+        crate::layout::note_tree_changed();
+        tell_tree_bare(view, "viewDidMoveToWindow");
+    }
+}
+
 /// `-enclosingScrollView`: the nearest scroll view above this one.
 unsafe extern "C" fn enclosing_scroll_view(receiver: Id, _sel: Sel) -> Id {
     let Some(scroll) = objc::class::lookup(c"NSScrollView") else {
@@ -1527,9 +1590,12 @@ unsafe extern "C" fn add_subview(receiver: Id, sel: Sel, subview: Id) {
     // old parent keeps a reference and, when it goes, frees what it no longer owns.
     // Held across the move because the old list may own the only reference.
     objc::arc::retain(subview);
+    // SAFETY: both are views of this crate's.
+    let (old_window, new_window) = unsafe { (window_of(subview), window_of(receiver)) };
+    will_move_to_window(subview, old_window, new_window);
+    tell(subview, "viewWillMoveToSuperview:", receiver);
     if !view_of(subview).superview.is_null() {
-        // SAFETY: `-removeFromSuperview` is `void (id, SEL)`.
-        unsafe { remove_from_superview(subview, objc::sel::get("removeFromSuperview")) };
+        detach_from_superview(subview);
     }
     view_of(subview).superview = receiver;
     // A window's content view that becomes a subview is in its new parent's
@@ -1542,6 +1608,9 @@ unsafe extern "C" fn add_subview(receiver: Id, sel: Sel, subview: Id) {
             .values
             .push(array.policy.retain(subview as *const c_void));
     }
+    tell_bare(subview, "viewDidMoveToSuperview");
+    tell(receiver, "didAddSubview:", subview);
+    did_move_to_window(subview, old_window, new_window);
     objc::arc::release(subview);
     // SAFETY: a view this crate made, now in a window.
     unsafe { update_tracking_areas(subview) };
@@ -1620,7 +1689,28 @@ pub(crate) fn convert_rect(rect: NSRect, from: Id, to: Id) -> NSRect {
     rect_between(rect, |point| convert_point(point, from, to))
 }
 
+/// `-removeFromSuperview`, with the hooks a view is told of around it.
 unsafe extern "C" fn remove_from_superview(receiver: Id, _sel: Sel) {
+    let parent = view_of(receiver).superview;
+    if !is_view(parent) {
+        view_of(receiver).superview = std::ptr::null_mut();
+        return;
+    }
+    // Held: the superview's list may own the only reference.
+    objc::arc::retain(receiver);
+    // SAFETY: a view of this crate's.
+    let old_window = unsafe { window_of(receiver) };
+    tell(parent, "willRemoveSubview:", receiver);
+    will_move_to_window(receiver, old_window, std::ptr::null_mut());
+    tell(receiver, "viewWillMoveToSuperview:", std::ptr::null_mut());
+    detach_from_superview(receiver);
+    tell_bare(receiver, "viewDidMoveToSuperview");
+    did_move_to_window(receiver, old_window, std::ptr::null_mut());
+    objc::arc::release(receiver);
+}
+
+/// Take `receiver` out of its superview's list, telling no one.
+fn detach_from_superview(receiver: Id) {
     let view = view_of(receiver);
     let parent = view.superview;
     view.superview = std::ptr::null_mut();
@@ -1971,6 +2061,12 @@ pub(crate) fn install() {
         "translatesAutoresizingMaskIntoConstraints" => translates_autoresizing_mask, c"c16@0:8";
         "enclosingScrollView" => enclosing_scroll_view, c"@16@0:8";
         "isDescendantOf:" => is_descendant_of, c"c24@0:8@16";
+        "viewWillMoveToWindow:" => hook_with_object, c"v24@0:8@16";
+        "viewDidMoveToWindow" => hook, c"v16@0:8";
+        "viewWillMoveToSuperview:" => hook_with_object, c"v24@0:8@16";
+        "viewDidMoveToSuperview" => hook, c"v16@0:8";
+        "didAddSubview:" => hook_with_object, c"v24@0:8@16";
+        "willRemoveSubview:" => hook_with_object, c"v24@0:8@16";
         "removeFromSuperview" => remove_from_superview, c"v16@0:8";
         "dealloc" => dealloc, c"v16@0:8";
         "setWantsBestResolutionOpenGLSurface:" => set_wants_best_resolution, c"v20@0:8c16";
