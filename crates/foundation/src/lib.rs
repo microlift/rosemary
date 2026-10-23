@@ -326,6 +326,11 @@ pub fn data_symbols() -> Vec<(String, u64)> {
     // not pointers to them: the guest loads the symbol's address and reads two
     // or four doubles out of it. A one-word cell would leave the rest of the
     // read off the end of the allocation.
+    // `const int64_t`, read as a number.
+    out.push((
+        "_NSURLSessionTransferSizeUnknown".to_string(),
+        corefoundation::base::global_cell("_NSURLSessionTransferSizeUnknown", (-1i64) as u64),
+    ));
     out.push(("_NSZeroPoint".to_string(), zeroed::<geometry::NSPoint>()));
     out.push(("_NSZeroSize".to_string(), zeroed::<geometry::NSSize>()));
     out.push(("_NSZeroRect".to_string(), zeroed::<geometry::NSRect>()));
@@ -410,12 +415,34 @@ pub const STRING_GLOBALS: &[(&str, &str)] = &[
         "_NSURLVolumeAvailableCapacityForImportantUsageKey",
         "NSURLVolumeAvailableCapacityForImportantUsageKey",
     ),
+    // Apple moved the exception names to CoreFoundation; a guest built
+    // against a newer SDK binds them there.
+    ("_NSGenericException", "NSGenericException"),
+    ("_NSInvalidArgumentException", "NSInvalidArgumentException"),
+    ("_NSNegateBooleanTransformerName", "NSNegateBoolean"),
+    ("_NSIsNilTransformerName", "NSIsNil"),
+    ("_NSIsNotNilTransformerName", "NSIsNotNil"),
+    ("_NSRecoveryAttempterErrorKey", "NSRecoveryAttempter"),
+    (
+        "_NSProgressEstimatedTimeRemainingKey",
+        "NSProgressEstimatedTimeRemainingKey",
+    ),
+    (
+        "_NSProgressFileOperationKindDownloading",
+        "NSProgressFileOperationKindDownloading",
+    ),
+    (
+        "_NSProgressFileOperationKindKey",
+        "NSProgressFileOperationKindKey",
+    ),
+    ("_NSProgressKindFile", "NSProgressKindFile"),
 ];
 
 pub const NOTIFICATION_NAMES: &[&str] = &[
     "NSProcessInfoThermalStateDidChangeNotification",
     "NSProcessInfoPowerStateDidChangeNotification",
     "NSCurrentLocaleDidChangeNotification",
+    "NSUserDefaultsDidChangeNotification",
 ];
 
 #[cfg(test)]
