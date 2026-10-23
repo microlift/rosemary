@@ -1,0 +1,15 @@
+[package]
+name = "mediabackend"
+description = "Host-neutral media decoding interface for Rosemary"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[features]
+default = []
+gstreamer = ["dep:gst", "dep:gst_app", "dep:gst_video"]
+
+[dependencies]
+gst = { package = "gstreamer", version = "0.25", optional = true }
+gst_app = { package = "gstreamer-app", version = "0.25", features = ["v1_28"], optional = true }
+gst_video = { package = "gstreamer-video", version = "0.25", optional = true }
