@@ -740,6 +740,23 @@ unsafe extern "C" fn constraint_with_item(
     objc::arc::autorelease(object)
 }
 
+/// A new constraint, autoreleased, for another module of this crate.
+pub(crate) fn new_constraint(
+    first: (Id, isize),
+    relation: isize,
+    second: (Id, isize),
+    multiplier: f64,
+    constant: f64,
+) -> Id {
+    make(first, relation, second, multiplier, constant)
+}
+
+pub(crate) fn set_priority_of(constraint: Id, priority: f32) {
+    if !constraint.is_null() {
+        constraint_of(constraint).priority = priority;
+    }
+}
+
 /// `-[NSView addConstraint:]`: active, and listed by the view's
 /// `-constraints`.
 unsafe extern "C" fn add_constraint(receiver: Id, _sel: Sel, constraint: Id) {
@@ -1207,6 +1224,8 @@ pub(crate) fn install() {
         "constraintWithItem:attribute:relatedBy:toItem:attribute:multiplier:constant:" =>
             constraint_with_item, c"@72@0:8@16q24q32@40q48d56d64";
         "activateConstraints:" => activate_constraints, c"v24@0:8@16";
+        "constraintsWithVisualFormat:options:metrics:views:" =>
+            crate::visual_format::constraints_with_visual_format, c"@48@0:8@16Q24@32@40";
         "deactivateConstraints:" => deactivate_constraints, c"v24@0:8@16";
     });
     methods!(class, {
