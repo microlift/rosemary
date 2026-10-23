@@ -1852,10 +1852,15 @@ pub static SIGNATURES: &[FunctionAbi] = &[
     sig!("dispatch_set_context", V, P, P),
     sig!("dispatch_source_cancel", V, P),
     sig!("dispatch_source_create", P, P, U64, U64, P),
+    sig!("dispatch_source_get_data", U64, P),
+    sig!("dispatch_source_get_handle", U64, P),
+    sig!("dispatch_source_get_mask", U64, P),
+    sig!("dispatch_source_merge_data", V, P, U64),
     cbsig!([1], "dispatch_source_set_cancel_handler_f", V, P, P),
     cbsig!([1], "dispatch_source_set_event_handler_f", V, P, P),
     sig!("dispatch_source_set_timer", V, P, U64, U64, U64),
     sig!("dispatch_suspend", V, P),
+    sig!("dispatch_source_testcancel", I64, P),
     // `dispatch_time(dispatch_time_t base, int64_t delta)` - the base is an
     // opaque absolute time and the delta is signed nanoseconds, which is why
     // the two arguments are not the same type despite both being doublewords.

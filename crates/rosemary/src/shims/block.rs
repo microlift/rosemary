@@ -371,6 +371,12 @@ pub fn shim_for(name: &str) -> Option<Shim> {
         "nw_path_monitor_set_cancel_handler" => {
             Some(bind!(callback "nw_path_monitor_set_cancel_handler" => object_and_block))
         }
+        "dispatch_source_set_event_handler" => {
+            Some(bind!(callback "dispatch_source_set_event_handler" => object_and_block))
+        }
+        "dispatch_source_set_cancel_handler" => {
+            Some(bind!(callback "dispatch_source_set_cancel_handler" => object_and_block))
+        }
         "nw_path_enumerate_interfaces" => {
             Some(bind!(callback "nw_path_enumerate_interfaces" => object_and_block))
         }
