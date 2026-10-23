@@ -332,6 +332,23 @@ pub trait Callbacks {
     /// while servicing `symbol`.
     fn substitute(&self, symbol: &str, va: u64) -> Result<u64>;
 
+    /// Substitute a callback with an exact host/guest ABI signature.
+    ///
+    /// A generic thunk cannot carry by-value aggregates that live on the
+    /// guest stack. Implementations without a typed trampoline must refuse
+    /// this operation instead of losing callback arguments.
+    fn substitute_typed(
+        &self,
+        symbol: &str,
+        _va: u64,
+        _signature: crate::thunk::ThunkSignature,
+    ) -> Result<u64> {
+        Err(AbiError::Refused {
+            symbol: symbol.to_string(),
+            reason: "takes a typed guest callback, and this caller has no typed thunk",
+        })
+    }
+
     /// The guest address behind `va`, if `va` is a thunk this runtime handed out; `va`
     /// otherwise.
     ///

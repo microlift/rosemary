@@ -1,6 +1,8 @@
 use microlift::arch::x86_64::context::RegisterContext;
 
-use crate::abi::{Callbacks, GuestMemory, Result};
+use crate::abi::aggregate::{Aggregate, Leaf, Shape};
+use crate::abi::{ArgType as T, Callbacks, GuestMemory, Result};
+use crate::thunk::ThunkSignature;
 
 use super::coregraphics::CgPoint;
 use super::host::builtin_or_host;
@@ -198,6 +200,46 @@ fn frame_rate_range_make(
     Ok(())
 }
 
+/// The callback's two 24-byte times are passed on the guest SysV stack,
+/// but by pointer to a caller-owned copy on AAPCS64 hosts.
+pub(crate) fn decompression_output_signature() -> ThunkSignature {
+    let time = Shape::Struct(Aggregate {
+        size: size_of::<CmTime>(),
+        align: align_of::<CmTime>(),
+        leaves: vec![
+            Leaf {
+                ty: T::SignedDoubleword,
+                offset: 0,
+            },
+            Leaf {
+                ty: T::SignedWord,
+                offset: 8,
+            },
+            Leaf {
+                ty: T::UnsignedWord,
+                offset: 12,
+            },
+            Leaf {
+                ty: T::SignedDoubleword,
+                offset: 16,
+            },
+        ],
+    });
+    ThunkSignature::new(
+        vec![
+            Shape::Scalar(T::Pointer),
+            Shape::Scalar(T::Pointer),
+            Shape::Scalar(T::SignedWord),
+            Shape::Scalar(T::UnsignedWord),
+            Shape::Scalar(T::Pointer),
+            time.clone(),
+            time,
+        ],
+        None,
+    )
+    .expect("the VideoToolbox output callback uses a supported ABI")
+}
+
 /// `VTDecompressionOutputCallbackRecord` - a function pointer and its refcon.
 #[repr(C)]
 struct OutputCallbackRecord {
@@ -227,7 +269,9 @@ fn decompression_session_create(
         va => Some(OutputCallbackRecord {
             callback: match mem.read_u64(va, symbol)? {
                 0 => 0,
-                guest => callbacks.substitute(symbol, guest)?,
+                guest => {
+                    callbacks.substitute_typed(symbol, guest, decompression_output_signature())?
+                }
             },
             refcon: mem.read_u64(va + 8, symbol)?,
         }),

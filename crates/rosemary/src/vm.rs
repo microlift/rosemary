@@ -1323,11 +1323,16 @@ impl Vm {
         guest_va: u64,
         signature: crate::thunk::ThunkSignature,
     ) -> Result<u64, VmError> {
-        if let Some(existing) = self.host_thunk_for(guest_va) {
+        // A generic thunk is not ABI-compatible, and a guest address may be
+        // used with more than one callback prototype.
+        let mut table = self.thunks.write().unwrap_or_else(|e| e.into_inner());
+        if let Some(existing) = table.typed_host_for(guest_va, &signature) {
             return Ok(existing);
         }
-        let thunk = crate::thunk::build_typed(guest_va, signature)?;
-        let host = self.insert_thunk(thunk);
+        let thunk = crate::thunk::build_typed(guest_va, signature.clone())?;
+        let host = table.insert_typed(signature, thunk);
+        self.publish_thunk_view(&table);
+        drop(table);
         // As in `thunk_for`: handing the pointer out is the demand signal.
         let _ = self.cache.get_or_lift(&self.program, guest_va);
         Ok(host)
@@ -1345,7 +1350,7 @@ impl Vm {
         Ok(host)
     }
 
-    /// How many guest function pointers have been handed to host code.
+    /// How many host thunks exist, including typed variants of one guest address.
     pub fn thunks(&self) -> usize {
         self.thunks.read().unwrap_or_else(|e| e.into_inner()).len()
     }
@@ -1396,6 +1401,11 @@ impl Vm {
     fn insert_thunk(&self, thunk: crate::thunk::Thunk) -> u64 {
         let mut table = self.thunks.write().unwrap_or_else(|e| e.into_inner());
         let host = table.insert(thunk);
+        self.publish_thunk_view(&table);
+        host
+    }
+
+    fn publish_thunk_view(&self, table: &ThunkTable) {
         let view = Box::leak(Box::new(table.view()));
         let count = view.count;
         self.thunk_view.store(view, Ordering::Release);
@@ -1405,7 +1415,6 @@ impl Vm {
         // An address that meant nothing a moment ago is now a thunk. See
         // [`crate::dispatch::invalidate`].
         crate::dispatch::invalidate();
-        host
     }
 
     /// Record an error raised inside a host->guest callback, on the thread it happened
@@ -1687,6 +1696,28 @@ impl crate::abi::Callbacks for Vm {
                 _ => "the guest function pointer could not be made callable",
             },
         })
+    }
+
+    fn substitute_typed(
+        &self,
+        symbol: &str,
+        va: u64,
+        signature: crate::thunk::ThunkSignature,
+    ) -> Result<u64, AbiError> {
+        if va == 0 {
+            return Ok(0);
+        }
+        if let Some(host) = crate::trampoline::host_behind(va) {
+            return Ok(host);
+        }
+        if !self.program.is_guest_address(va) {
+            return Ok(va);
+        }
+        self.typed_thunk_for(va, signature)
+            .map_err(|_| AbiError::Refused {
+                symbol: symbol.to_string(),
+                reason: "a typed host->guest thunk could not be built",
+            })
     }
 
     /// A thunk handed back by host code becomes the guest pointer it stands for.

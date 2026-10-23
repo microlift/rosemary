@@ -50,6 +50,9 @@ unsafe impl Sync for Thunk {}
 /// Every thunk handed out, both ways round.
 pub struct ThunkTable {
     by_guest: BTreeMap<u64, Thunk>,
+    // One guest entry can be registered with different callback prototypes.
+    // Neither a generic thunk nor a differently typed one may be reused.
+    typed_by_guest: BTreeMap<u64, Vec<(ThunkSignature, Thunk)>>,
     by_host: BTreeMap<u64, u64>,
 }
 
@@ -57,6 +60,7 @@ impl ThunkTable {
     pub fn new() -> Self {
         ThunkTable {
             by_guest: BTreeMap::new(),
+            typed_by_guest: BTreeMap::new(),
             by_host: BTreeMap::new(),
         }
     }
@@ -66,18 +70,37 @@ impl ThunkTable {
         self.by_guest.get(&guest).map(|t| t.host)
     }
 
+    /// A typed thunk for the exact guest address and callback signature.
+    pub fn typed_host_for(&self, guest: u64, signature: &ThunkSignature) -> Option<u64> {
+        self.typed_by_guest
+            .get(&guest)?
+            .iter()
+            .find(|(s, _)| s == signature)
+            .map(|(_, t)| t.host)
+    }
+
     /// The guest address behind a thunk, if this is one.
     pub fn guest_for(&self, host: u64) -> Option<u64> {
         self.by_host.get(&host).copied()
     }
 
-    /// How many distinct guest pointers have crossed outward.
+    /// How many native thunks this table owns, including typed variants.
     pub fn len(&self) -> usize {
-        self.by_guest.len()
+        self.by_host.len()
     }
 
     pub fn is_empty(&self) -> bool {
-        self.by_guest.is_empty()
+        self.by_host.is_empty()
+    }
+
+    pub fn insert_typed(&mut self, signature: ThunkSignature, thunk: Thunk) -> u64 {
+        let (guest, host) = (thunk.guest, thunk.host);
+        self.by_host.insert(host, guest);
+        self.typed_by_guest
+            .entry(guest)
+            .or_default()
+            .push((signature, thunk));
+        host
     }
 
     pub fn insert(&mut self, thunk: Thunk) -> u64 {
@@ -92,7 +115,7 @@ impl ThunkTable {
         ThunkView {
             by_guest: self.by_guest.iter().map(|(g, t)| (*g, t.host)).collect(),
             by_host: self.by_host.iter().map(|(h, g)| (*h, *g)).collect(),
-            count: self.by_guest.len(),
+            count: self.by_host.len(),
         }
     }
 }
@@ -179,6 +202,7 @@ pub(crate) fn current() -> Option<&'static Vm> {
 
 /// A callback whose argument and return types are known, as the emitted trampoline and
 /// the Rust entry both need them.
+#[derive(Clone, PartialEq, Eq)]
 pub struct ThunkSignature {
     /// `self` and `_cmd` included: these are the arguments the guest really
     /// takes, in order.
@@ -196,11 +220,10 @@ type Unsupported = &'static str;
 impl ThunkSignature {
     /// Decide the host-side shape of every argument, or say what stopped it.
     ///
-    /// An aggregate's host placement is indistinguishable from its leaves' - an HFA of
-    /// *n* occupies the same registers as *n* floating-point arguments, and a composite
-    /// of at most sixteen bytes the same as one or two integer ones - which is what
-    /// lets the trampoline declare a signature of plain scalars and still be called
-    /// correctly by AAPCS64.
+    /// An HFA occupies the same registers as its floating-point members and a
+    /// composite of at most sixteen bytes as one or two integers. Larger AAPCS64
+    /// composites arrive as pointers to a caller-owned copy; SysV composites
+    /// instead occupy the incoming stack argument area.
     pub fn new(params: Vec<Shape>, returns: Option<Shape>) -> Result<Self, Unsupported> {
         let mut host_leaves = Vec::with_capacity(params.len());
         for shape in &params {
@@ -222,19 +245,11 @@ impl ThunkSignature {
                             Eightbyte::Integer => T::UnsignedDoubleword,
                         })
                         .collect(),
-                    // AAPCS64 copies an argument this large to the *caller's*
-                    // stack, and the trampoline would have to find it there.
-                    // SysV puts it in the callee's own incoming stack area,
-                    // which Cranelift declares as a `StructArgument` - so the
-                    // trampoline is handed its address and this shape is
-                    // carried. The leaves here are the spill slot's words and
-                    // not declared parameters; see [`build_typed`].
-                    HostClass::Indirect => {
-                        if cfg!(target_arch = "aarch64") {
-                            return Err("takes an aggregate too large for AAPCS64's registers");
-                        }
-                        vec![T::UnsignedDoubleword; agg.size.div_ceil(8)]
-                    }
+                    // Both hosts deliver an address for a large composite.
+                    // AAPCS64 passes a pointer in the next integer argument
+                    // slot; SysV uses the incoming stack argument area.
+                    // These leaves describe the spill words, not ABI parameters.
+                    HostClass::Indirect => vec![T::UnsignedDoubleword; agg.size.div_ceil(8)],
                 },
             });
         }
@@ -401,6 +416,18 @@ fn copy_out(
 /// The generic thunk takes six integer and eight floating-point registers because it
 /// has no types to work from.
 pub(crate) fn build_typed(guest_va: u64, signature: ThunkSignature) -> Result<Thunk, VmError> {
+    build_typed_with_entry(
+        guest_va,
+        signature,
+        typed_entry as *const () as usize as u64,
+    )
+}
+
+fn build_typed_with_entry(
+    guest_va: u64,
+    signature: ThunkSignature,
+    host_entry: u64,
+) -> Result<Thunk, VmError> {
     let conv = get_host_calling_conv();
     let fail = |reason: String| VmError::Thunk {
         guest: guest_va,
@@ -428,10 +455,18 @@ pub(crate) fn build_typed(guest_va: u64, signature: ThunkSignature) -> Result<Th
             Incoming::Leaf { ty, .. } => AbiParam::new(ThunkSignature::cl_type(*ty)),
             // Rounded up because the backend requires whole eightbytes, which is
             // also what the caller reserved: SysV pads a stack argument out.
-            Incoming::Aggregate { size, .. } => AbiParam::special(
-                ptr,
-                ArgumentPurpose::StructArgument(size.next_multiple_of(8) as u32),
-            ),
+            Incoming::Aggregate { size, .. } => {
+                if cfg!(target_arch = "aarch64") {
+                    // AAPCS64 passes composites larger than 16 bytes by
+                    // pointer. Cranelift does not support StructArgument there.
+                    AbiParam::new(ptr)
+                } else {
+                    AbiParam::special(
+                        ptr,
+                        ArgumentPurpose::StructArgument(size.next_multiple_of(8) as u32),
+                    )
+                }
+            }
         });
     }
     let ret_leaves = signature.return_leaves().map_err(|e| fail(e.to_string()))?;
@@ -479,9 +514,28 @@ pub(crate) fn build_typed(guest_va: u64, signature: ThunkSignature) -> Result<Th
             // through it into the words the entry expects to find them in.
             Incoming::Aggregate { word, size } => {
                 for i in 0..size.div_ceil(8) {
-                    let w = b
-                        .ins()
-                        .load(types::I64, MemFlagsData::trusted(), v, (i * 8) as i32);
+                    let offset = i * 8;
+                    let bytes = (size - offset).min(8);
+                    let w = if bytes == 8 {
+                        b.ins()
+                            .load(types::I64, MemFlagsData::trusted(), v, offset as i32)
+                    } else {
+                        // The AAPCS64 caller only promises the exact object
+                        // size. Never read through its last partial eightbyte.
+                        let mut w = b.ins().iconst(types::I64, 0);
+                        for j in 0..bytes {
+                            let byte = b.ins().load(
+                                types::I8,
+                                MemFlagsData::trusted(),
+                                v,
+                                (offset + j) as i32,
+                            );
+                            let byte = b.ins().uextend(types::I64, byte);
+                            let byte = b.ins().ishl_imm_u(byte, (j * 8) as i64);
+                            w = b.ins().bor(w, byte);
+                        }
+                        w
+                    };
                     b.ins().stack_store(ptr, w, spill, ((word + i) * 8) as i32);
                 }
             }
@@ -499,9 +553,7 @@ pub(crate) fn build_typed(guest_va: u64, signature: ThunkSignature) -> Result<Th
         callee_sig.params.push(AbiParam::new(types::I64));
     }
     let callee_sig = b.import_signature(callee_sig);
-    let callee = b
-        .ins()
-        .iconst(types::I64, typed_entry as *const () as usize as i64);
+    let callee = b.ins().iconst(types::I64, host_entry as i64);
     b.ins()
         .call_indirect(callee_sig, callee, &[guest, desc, spill_ptr, out_ptr]);
 
@@ -727,6 +779,41 @@ fn reassemble(agg: &Aggregate, host: HostClass, words: &[u64]) -> Vec<u8> {
     raw
 }
 
+/// Rebuild the guest's ABI argument registers and stack from the exact
+/// host-side words spilled by the typed trampoline.
+fn guest_arguments(
+    signature: &ThunkSignature,
+    spill: &[u64],
+    result_buffer: &mut [u8; RESULT_BYTES],
+) -> Option<GuestArgs> {
+    let mut args = GuestArgs::default();
+    if let Some(Shape::Struct(agg)) = signature.returns.as_ref()
+        && agg.guest_class() == GuestClass::Memory
+    {
+        if agg.size > RESULT_BYTES {
+            return None;
+        }
+        // The shared guest/host address space lets a guest return into this
+        // local as though the caller had passed a hidden sret pointer.
+        args.push_int(result_buffer.as_mut_ptr() as usize as u64);
+    }
+    let mut at = 0usize;
+    for (shape, leaves) in signature.params.iter().zip(&signature.host_leaves) {
+        let words = spill.get(at..at + leaves.len())?;
+        at += leaves.len();
+        match shape {
+            Shape::Scalar(t) if crate::abi::aggregate::is_fp(*t) => args.push_sse(words[0]),
+            Shape::Scalar(_) => args.push_int(words[0]),
+            Shape::Struct(agg) => {
+                let host = agg.host_class().ok()?;
+                let raw = reassemble(agg, host, words);
+                args.push_aggregate(agg, &raw);
+            }
+        }
+    }
+    Some(args)
+}
+
 /// The aggregate a returning guest call left behind, as its own bytes.
 ///
 /// `buffer` is what a MEMORY-class return was given to fill; for the register
@@ -788,42 +875,10 @@ unsafe extern "C" fn typed_entry(
         (signature, std::slice::from_raw_parts(spill, n))
     };
 
-    // An aggregate SysV classifies MEMORY comes back through a buffer whose
-    // address the *caller* passes in the first integer register, ahead of
-    // `self` - so this is pushed before any argument is read.
-    let sret = match signature.returns.as_ref() {
-        Some(Shape::Struct(agg)) if agg.guest_class() == GuestClass::Memory => {
-            // Not reachable through `ThunkSignature::new`, which takes only the
-            // classes AAPCS64 returns in registers, none of them wider.
-            if agg.size > RESULT_BYTES {
-                return;
-            }
-            true
-        }
-        _ => false,
-    };
     let mut buffer = [0u8; RESULT_BYTES];
-
-    let mut args = GuestArgs::default();
-    if sret {
-        // Guest and host share one address space, so a host local is an address
-        // the guest can store through. See `GuestView`.
-        args.push_int(buffer.as_mut_ptr() as usize as u64);
-    }
-    let mut at = 0usize;
-    for (shape, leaves) in signature.params.iter().zip(&signature.host_leaves) {
-        let words = &spill[at..at + leaves.len()];
-        at += leaves.len();
-        match shape {
-            Shape::Scalar(t) if crate::abi::aggregate::is_fp(*t) => args.push_sse(words[0]),
-            Shape::Scalar(_) => args.push_int(words[0]),
-            Shape::Struct(agg) => {
-                let Ok(host) = agg.host_class() else { return };
-                let raw = reassemble(agg, host, words);
-                args.push_aggregate(agg, &raw);
-            }
-        }
-    }
+    let Some(args) = guest_arguments(signature, spill, &mut buffer) else {
+        return;
+    };
 
     let mut ctx = RegisterContext::new();
     for (slot, &v) in [
@@ -985,5 +1040,187 @@ unsafe extern "C" fn thunk_entry(guest_va: u64, ints: *const u64, floats: *const
             );
             0
         }
+    }
+}
+
+#[cfg(test)]
+mod callback_abi_tests {
+    use super::*;
+
+    #[test]
+    fn video_toolbox_signature_has_two_indirect_times() {
+        let signature = crate::shims::coremedia::decompression_output_signature();
+        assert_eq!(signature.params.len(), 7);
+        assert!(signature.returns.is_none());
+        assert_eq!(
+            signature
+                .host_leaves
+                .iter()
+                .map(Vec::len)
+                .collect::<Vec<_>>(),
+            [1, 1, 1, 1, 1, 3, 3]
+        );
+        let incoming = signature.incoming();
+        assert_eq!(incoming.len(), 7);
+        assert!(matches!(
+            incoming[5],
+            Incoming::Aggregate { word: 5, size: 24 }
+        ));
+        assert!(matches!(
+            incoming[6],
+            Incoming::Aggregate { word: 8, size: 24 }
+        ));
+        for shape in &signature.params[5..] {
+            let Shape::Struct(agg) = shape else {
+                panic!("CMTime must be an aggregate")
+            };
+            assert_eq!(agg.size, 24);
+            assert_eq!(agg.align, 8);
+            assert_eq!(agg.guest_class(), GuestClass::Memory);
+            assert_eq!(agg.host_class(), Ok(HostClass::Indirect));
+        }
+    }
+
+    #[test]
+    fn video_toolbox_two_times_reach_guest_stack_untruncated() {
+        let signature = crate::shims::coremedia::decompression_output_signature();
+        let first = [
+            0x0123_4567_89ab_cdef,
+            0x1234_5678_9abc_def0,
+            0xfedc_ba98_7654_3210,
+        ];
+        let second = [
+            0x7fff_ffff_ffff_fffe,
+            0xabcd_1234_0000_0001,
+            0x8000_0000_0000_0001,
+        ];
+        let spill = [
+            0x1001,
+            0x2002,
+            (-129i64) as u64,
+            0x8000_0012,
+            0x5005,
+            first[0],
+            first[1],
+            first[2],
+            second[0],
+            second[1],
+            second[2],
+        ];
+        let mut buffer = [0; RESULT_BYTES];
+        let guest = guest_arguments(&signature, &spill, &mut buffer).expect("supported ABI");
+        assert_eq!(guest.ints, spill[..5]);
+        assert!(guest.sse.is_empty());
+        let expected: Vec<u8> = first
+            .into_iter()
+            .chain(second)
+            .flat_map(u64::to_le_bytes)
+            .collect();
+        assert_eq!(guest.stack.len(), 48);
+        assert_eq!(guest.stack, expected);
+    }
+
+    #[test]
+    fn a_register_after_two_stack_times_keeps_its_guest_slot() {
+        let mut sig = crate::shims::coremedia::decompression_output_signature();
+        sig.params.push(Shape::Scalar(T::UnsignedDoubleword));
+        sig.host_leaves.push(vec![T::UnsignedDoubleword]);
+        let spill = [10, 20, 30, 40, 50, 1, 2, 3, 4, 5, 6, 70];
+        let mut buffer = [0; RESULT_BYTES];
+        let guest = guest_arguments(&sig, &spill, &mut buffer).unwrap();
+        assert_eq!(guest.ints, [10, 20, 30, 40, 50, 70]);
+        assert_eq!(guest.stack.len(), 48);
+    }
+
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    struct NativeTime {
+        value: i64,
+        timescale: i32,
+        flags: u32,
+        epoch: i64,
+    }
+
+    thread_local! {
+        static CAPTURED: std::cell::RefCell<Vec<u64>> = const { std::cell::RefCell::new(Vec::new()) };
+    }
+
+    unsafe extern "C" fn capture_spill(
+        _guest: u64,
+        _desc: *const ThunkSignature,
+        spill: *const u64,
+        _out: *mut u8,
+    ) {
+        // SAFETY: this test constructs the trampoline with exactly eleven
+        // spill words, and the callback runs synchronously before it returns.
+        let words = unsafe { std::slice::from_raw_parts(spill, 11) };
+        CAPTURED.with(|slot| *slot.borrow_mut() = words.to_vec());
+    }
+
+    #[test]
+    fn native_c_callback_thunk_carries_both_times_in_full() {
+        let signature = crate::shims::coremedia::decompression_output_signature();
+        let thunk = build_typed_with_entry(
+            0x1234,
+            signature.clone(),
+            capture_spill as *const () as usize as u64,
+        )
+        .expect("native ABI supports the callback");
+        let first = NativeTime {
+            value: 0x0123_4567_89ab_cdef,
+            timescale: 600,
+            flags: 0x1234_5678,
+            epoch: -8,
+        };
+        let second = NativeTime {
+            value: -0x1234_5678_90ab_cde,
+            timescale: -300,
+            flags: 0x9876_5432,
+            epoch: 0x1122_3344_5566_7788,
+        };
+        assert_eq!(size_of::<NativeTime>(), 24);
+        // SAFETY: the generated trampoline declares precisely this host
+        // callback signature, with two native CMTime-layout arguments.
+        let call: extern "C" fn(u64, u64, i32, u32, u64, NativeTime, NativeTime) =
+            unsafe { std::mem::transmute(thunk.host as usize) };
+        call(11, 22, -33, 44, 55, first, second);
+        let captured = CAPTURED.with(|slot| slot.borrow().clone());
+        assert_eq!(captured[0], 11);
+        assert_eq!(captured[1], 22);
+        assert_eq!(captured[3] as u32, 44);
+        assert_eq!(captured[4], 55);
+        // Signed 32-bit callback parameters only promise their low 32 bits.
+        assert_eq!(captured[2] as u32 as i32, -33);
+        let mut expected = Vec::new();
+        for time in [first, second] {
+            expected.extend_from_slice(&[
+                time.value as u64,
+                u64::from(time.timescale as u32) | (u64::from(time.flags) << 32),
+                time.epoch as u64,
+            ]);
+        }
+        assert_eq!(&captured[5..], expected.as_slice());
+        let mut buffer = [0; RESULT_BYTES];
+        let guest = guest_arguments(&signature, &captured, &mut buffer).unwrap();
+        assert_eq!(guest.ints.len(), 5);
+        let expected_bytes: Vec<u8> = expected.into_iter().flat_map(u64::to_le_bytes).collect();
+        assert_eq!(guest.stack, expected_bytes);
+    }
+
+    #[test]
+    fn typed_and_generic_thunks_cannot_be_confused_in_the_table() {
+        let signature = crate::shims::coremedia::decompression_output_signature();
+        let typed = build_typed(0x1234, signature.clone()).unwrap();
+        let generic = build(0x1234).unwrap();
+        let mut table = ThunkTable::new();
+        let typed_host = table.insert_typed(signature.clone(), typed);
+        let generic_host = table.insert(generic);
+        assert_ne!(typed_host, generic_host);
+        assert_eq!(table.typed_host_for(0x1234, &signature), Some(typed_host));
+        assert_eq!(table.host_for(0x1234), Some(generic_host));
+        assert_eq!(table.guest_for(typed_host), Some(0x1234));
+        assert_eq!(table.guest_for(generic_host), Some(0x1234));
+        assert_eq!(table.len(), 2);
+        assert_eq!(table.view().count, 2);
     }
 }
