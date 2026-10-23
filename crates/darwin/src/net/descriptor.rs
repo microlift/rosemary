@@ -5,16 +5,18 @@ pub unsafe extern "C" fn close(fd: i32) -> i32 {
     if rc == 0 || crate::errno::get() == libc::EBADF {
         super::sockopt::forget(fd);
         crate::attrlist::forget(fd);
+        crate::kqueue::forget(fd);
     }
     rc
 }
 
 /// `int dup(int fd)`
-unsafe extern "C" fn dup(fd: i32) -> i32 {
+pub(crate) unsafe extern "C" fn dup(fd: i32) -> i32 {
     // SAFETY: an integer descriptor; the call touches no caller memory.
     let copied = unsafe { libc::dup(fd) };
     if copied >= 0 {
         super::sockopt::inherit_sigpipe_suppression(fd, copied);
+        crate::kqueue::duplicate(fd, copied);
     }
     copied
 }
@@ -26,9 +28,11 @@ pub(crate) unsafe extern "C" fn dup2(from: i32, to: i32) -> i32 {
     if copied >= 0 && from != to {
         // `to` now names another file, so a listing of the old one is stale.
         crate::attrlist::forget(to);
+        crate::kqueue::forget(to);
     }
     if copied >= 0 {
         super::sockopt::inherit_sigpipe_suppression(from, copied);
+        crate::kqueue::duplicate(from, copied);
     }
     copied
 }

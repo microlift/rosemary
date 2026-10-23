@@ -367,6 +367,7 @@ pub mod entry {
         let rc = unsafe { libc::fcntl(fd, host_command, arg) };
         if rc >= 0 && matches!(command, cmd::F_DUPFD | cmd::F_DUPFD_CLOEXEC) {
             crate::net::sockopt::inherit_sigpipe_suppression(fd, rc);
+            crate::kqueue::duplicate(fd, rc);
         }
         match command == cmd::F_GETFL && rc >= 0 {
             true => flags_to_guest(rc),

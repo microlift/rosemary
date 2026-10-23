@@ -186,6 +186,13 @@ struct PollBackend {
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+impl Drop for PollBackend {
+    fn drop(&mut self) {
+        forget_waker(self.wake);
+    }
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 impl ReadinessBackend for PollBackend {
     fn new() -> Result<(Self, c_int), c_int> {
         let wake = unsafe { libc::eventfd(0, libc::EFD_CLOEXEC | libc::EFD_NONBLOCK) };
@@ -892,6 +899,45 @@ pub extern "C" fn kqueue() -> c_int {
     fd
 }
 
+fn forget_queue_if_unreferenced(
+    map: &HashMap<c_int, Arc<Mutex<Queue<SelectedBackend>>>>,
+    queue: Arc<Mutex<Queue<SelectedBackend>>>,
+) {
+    let still_referenced = map.values().any(|other| Arc::ptr_eq(other, &queue));
+    if !still_referenced {
+        let state = queue.lock().unwrap_or_else(|e| e.into_inner());
+        forget_waker(state.backend.wake_descriptor());
+    }
+}
+
+/// Note that a kqueue descriptor was duplicated.
+pub fn duplicate(from: c_int, to: c_int) {
+    if from == to || from < 0 || to < 0 {
+        return;
+    }
+    let mut map = queues().lock().unwrap_or_else(|e| e.into_inner());
+    let old_queue = match map.get(&from).cloned() {
+        Some(queue) => map.insert(to, queue),
+        None => map.remove(&to),
+    };
+    if let Some(old) = old_queue {
+        forget_queue_if_unreferenced(&map, old);
+    }
+}
+
+/// Note that a descriptor was closed, so any kqueue registered under this
+/// descriptor number is removed.
+pub fn forget(fd: c_int) {
+    if fd < 0 {
+        return;
+    }
+    forget_waker(fd);
+    let mut map = queues().lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(queue) = map.remove(&fd) {
+        forget_queue_if_unreferenced(&map, queue);
+    }
+}
+
 /// Wake a `kevent` blocked on `queue`.
 fn wake_fd(queue: c_int) {
     let one: u64 = 1;
@@ -981,6 +1027,13 @@ fn apply<B: ReadinessBackend>(state: &mut Queue<B>, change: &Kevent) -> Result<(
         state.triggered_set = triggered_set;
         if change.filter == EVFILT_SIGNAL {
             let _ = crate::signal::observe(change.ident as i32, false);
+            if !state
+                .registrations
+                .values()
+                .any(|r| r.filter == EVFILT_SIGNAL)
+            {
+                forget_waker(state.backend.wake_descriptor());
+            }
         }
         return Ok(());
     }
@@ -1377,6 +1430,13 @@ pub unsafe extern "C" fn kevent(
         if flags & EV_ONESHOT != 0 {
             state.registrations.remove(&key);
             let _ = crate::signal::observe(ident as i32, false);
+            if !state
+                .registrations
+                .values()
+                .any(|r| r.filter == EVFILT_SIGNAL)
+            {
+                forget_waker(state.backend.wake_descriptor());
+            }
         } else if flags & EV_DISPATCH != 0 {
             registration.enabled = false;
         }
@@ -2306,5 +2366,257 @@ mod tests {
         space::destroy(port);
         // SAFETY: this test's own descriptor.
         unsafe { libc::close(queue) };
+    }
+
+    struct AutoClose(c_int);
+    impl Drop for AutoClose {
+        fn drop(&mut self) {
+            if self.0 >= 0 {
+                // SAFETY: descriptor owned by this test.
+                unsafe { crate::net::descriptor::close(self.0) };
+            }
+        }
+    }
+
+    #[test]
+    fn duplicated_kqueue_shares_state_and_wakes() {
+        let queue = AutoClose(kqueue());
+        assert!(queue.0 >= 0);
+
+        let dup_fd = AutoClose(unsafe { crate::net::descriptor::dup(queue.0) });
+        assert!(dup_fd.0 >= 0);
+        assert_ne!(queue.0, dup_fd.0);
+
+        let fcntl_fd = AutoClose(unsafe {
+            crate::fcntl::entry::fcntl(queue.0, crate::fcntl::cmd::F_DUPFD_CLOEXEC, 0)
+        });
+        assert!(fcntl_fd.0 >= 0);
+        assert_ne!(queue.0, fcntl_fd.0);
+
+        // Register EVFILT_USER on dup_fd
+        let change = Kevent {
+            ident: 0,
+            filter: EVFILT_USER,
+            flags: EV_ADD | EV_CLEAR | EV_RECEIPT,
+            fflags: 0,
+            data: 0,
+            udata: 0x42,
+        };
+        let mut receipt = Kevent::default();
+        let ret = unsafe { kevent(dup_fd.0, &change, 1, &mut receipt, 1, std::ptr::null()) };
+        assert_eq!(ret, 1);
+        assert_eq!(receipt.data, 0);
+
+        // Trigger on fcntl_fd
+        let trigger = Kevent {
+            ident: 0,
+            filter: EVFILT_USER,
+            flags: 0,
+            fflags: NOTE_TRIGGER,
+            data: 0,
+            udata: 0,
+        };
+        let ret = unsafe {
+            kevent(
+                fcntl_fd.0,
+                &trigger,
+                1,
+                std::ptr::null_mut(),
+                0,
+                std::ptr::null(),
+            )
+        };
+        assert_eq!(ret, 0);
+
+        // Collect from original queue
+        let mut event = Kevent::default();
+        let timeout = libc::timespec {
+            tv_sec: 0,
+            tv_nsec: 0,
+        };
+        let ret = unsafe { kevent(queue.0, std::ptr::null(), 0, &mut event, 1, &timeout) };
+        assert_eq!(ret, 1);
+        assert_eq!(event.filter, EVFILT_USER);
+        assert_eq!(event.udata, 0x42);
+    }
+
+    #[test]
+    fn duplicate_negative_and_boundary_cases() {
+        let q = AutoClose(kqueue());
+        assert!(q.0 >= 0);
+
+        // Negative or equal descriptors are safe no-ops.
+        duplicate(-1, -1);
+        duplicate(-1, q.0);
+        duplicate(q.0, -1);
+        duplicate(q.0, q.0);
+
+        // Duplicate with unknown descriptors is a safe no-op.
+        duplicate(999999, 999998);
+
+        // Verify q is still operational.
+        assert!(queue_of(q.0).is_some());
+    }
+
+    #[test]
+    fn forget_negative_and_boundary_cases() {
+        // Negative fd or unknown descriptor is a safe no-op.
+        forget(-1);
+        forget(999999);
+    }
+
+    #[test]
+    fn dup2_overwrites_existing_kqueue_and_preserves_state() {
+        let q1 = AutoClose(kqueue());
+        let q2 = AutoClose(kqueue());
+        assert!(q1.0 >= 0);
+        assert!(q2.0 >= 0);
+        assert_ne!(q1.0, q2.0);
+
+        // Register distinguishable user events on q1 and q2.
+        let add_q1 = Kevent {
+            ident: 1,
+            filter: EVFILT_USER,
+            flags: EV_ADD | EV_CLEAR | EV_RECEIPT,
+            udata: 0x1111,
+            ..Kevent::default()
+        };
+        let add_q2 = Kevent {
+            ident: 2,
+            filter: EVFILT_USER,
+            flags: EV_ADD | EV_CLEAR | EV_RECEIPT,
+            udata: 0x2222,
+            ..Kevent::default()
+        };
+        let mut receipt = Kevent::default();
+        assert_eq!(
+            unsafe { kevent(q1.0, &add_q1, 1, &mut receipt, 1, std::ptr::null()) },
+            1
+        );
+        assert_eq!(
+            unsafe { kevent(q2.0, &add_q2, 1, &mut receipt, 1, std::ptr::null()) },
+            1
+        );
+
+        // Overwrite q2 with dup2(q1, q2).
+        let ret = unsafe { crate::net::descriptor::dup2(q1.0, q2.0) };
+        assert_eq!(ret, q2.0);
+
+        // Trigger on q2; collect on q1.
+        let trigger = Kevent {
+            ident: 1,
+            filter: EVFILT_USER,
+            flags: 0,
+            fflags: NOTE_TRIGGER,
+            data: 0,
+            udata: 0,
+        };
+        assert_eq!(
+            unsafe { kevent(q2.0, &trigger, 1, std::ptr::null_mut(), 0, std::ptr::null(),) },
+            0
+        );
+
+        let mut event = Kevent::default();
+        let timeout = libc::timespec {
+            tv_sec: 0,
+            tv_nsec: 0,
+        };
+        let ret = unsafe { kevent(q1.0, std::ptr::null(), 0, &mut event, 1, &timeout) };
+        assert_eq!(ret, 1);
+        assert_eq!(event.ident, 1);
+        assert_eq!(event.udata, 0x1111);
+
+        // Old q2 state (ident 2) must not be present.
+        let ret = unsafe { kevent(q2.0, std::ptr::null(), 0, &mut event, 1, &timeout) };
+        assert_eq!(ret, 0);
+
+        // dup2 with from == to is a no-op and preserves state.
+        assert_eq!(unsafe { crate::net::descriptor::dup2(q1.0, q1.0) }, q1.0);
+        assert!(queue_of(q1.0).is_some());
+    }
+
+    #[test]
+    fn waker_slot_lifecycle_on_signal_delete_and_close() {
+        use crate::signal::signum::SIGWINCH;
+        let q = AutoClose(kqueue());
+        assert!(q.0 >= 0);
+
+        let wake_fd = {
+            let map = queues().lock().unwrap_or_else(|e| e.into_inner());
+            map.get(&q.0)
+                .expect("queue registered")
+                .lock()
+                .unwrap()
+                .backend
+                .wake_descriptor()
+        };
+
+        // Before adding signal, wake_fd is not in WAKER_FDS.
+        assert!(
+            !WAKER_FDS
+                .iter()
+                .any(|slot| slot.load(Ordering::Acquire) == wake_fd)
+        );
+
+        // Register EVFILT_SIGNAL.
+        let add = Kevent {
+            ident: SIGWINCH as usize,
+            filter: EVFILT_SIGNAL,
+            flags: EV_ADD | EV_ENABLE,
+            ..Kevent::default()
+        };
+        assert_eq!(collect(q.0, Some(&add)).0, 0);
+
+        // Now wake_fd is registered in WAKER_FDS.
+        assert!(
+            WAKER_FDS
+                .iter()
+                .any(|slot| slot.load(Ordering::Acquire) == wake_fd)
+        );
+
+        // Delete EVFILT_SIGNAL.
+        let del = Kevent {
+            ident: SIGWINCH as usize,
+            filter: EVFILT_SIGNAL,
+            flags: EV_DELETE,
+            ..Kevent::default()
+        };
+        assert_eq!(collect(q.0, Some(&del)).0, 0);
+
+        // Slot is freed once no signal filters remain on the queue.
+        assert!(
+            !WAKER_FDS
+                .iter()
+                .any(|slot| slot.load(Ordering::Acquire) == wake_fd)
+        );
+
+        // Re-add signal.
+        assert_eq!(collect(q.0, Some(&add)).0, 0);
+        assert!(
+            WAKER_FDS
+                .iter()
+                .any(|slot| slot.load(Ordering::Acquire) == wake_fd)
+        );
+
+        // Duplicate the queue: closing the first descriptor leaves wake_fd active.
+        let dup_q = AutoClose(unsafe { crate::net::descriptor::dup(q.0) });
+        assert!(dup_q.0 >= 0);
+        drop(q);
+
+        assert!(
+            WAKER_FDS
+                .iter()
+                .any(|slot| slot.load(Ordering::Acquire) == wake_fd),
+            "waker must stay active while duplicate is still open"
+        );
+
+        // Dropping the last duplicate frees the slot in WAKER_FDS.
+        drop(dup_q);
+        assert!(
+            !WAKER_FDS
+                .iter()
+                .any(|slot| slot.load(Ordering::Acquire) == wake_fd),
+            "waker must be freed when all duplicates are closed"
+        );
     }
 }
