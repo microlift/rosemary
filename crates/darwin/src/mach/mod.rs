@@ -40,6 +40,12 @@ fn nanoseconds(clock: libc::clockid_t) -> u64 {
 }
 
 unsafe extern "C" fn absolute_time() -> u64 {
+    absolute()
+}
+
+/// `mach_absolute_time`, for a framework that stamps its own times on the
+/// guest's timeline. Ticks are nanoseconds: the timebase is one to one.
+pub fn absolute() -> u64 {
     nanoseconds(libc::CLOCK_MONOTONIC)
 }
 
@@ -48,6 +54,11 @@ unsafe extern "C" fn absolute_time() -> u64 {
 /// `CLOCK_BOOTTIME` where there is one; `CLOCK_MONOTONIC` otherwise, which
 /// differs only across a suspend and is the closer of the two answers available.
 unsafe extern "C" fn continuous_time() -> u64 {
+    continuous()
+}
+
+/// `mach_continuous_time`, for a timer that runs on it.
+pub fn continuous() -> u64 {
     #[cfg(target_os = "linux")]
     let clock = libc::CLOCK_BOOTTIME;
     #[cfg(not(target_os = "linux"))]

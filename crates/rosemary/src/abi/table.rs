@@ -463,6 +463,7 @@ pub static SIGNATURES: &[FunctionAbi] = &[
     sig!("CFDataGetTypeID", U64),
     sig!("CFDictionaryAddValue", V, P, P, P),
     cbsig!([1], "CFDictionaryApplyFunction", V, P, P, P),
+    sig!("kevent64", I32, I32, P, I32, P, I32, U32, P),
     sig!("CFDictionaryContainsKey", BOOL, P, P),
     sig!("CFDictionaryGetCount", I64, P),
     sig!("CFDictionaryCreate", P, P, P, P, I64, P, P),
