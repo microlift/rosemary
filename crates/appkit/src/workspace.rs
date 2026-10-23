@@ -519,6 +519,11 @@ unsafe extern "C" fn is_file_package(_receiver: Id, _sel: Sel, path: Id) -> u8 {
     u8::from(package && host.is_dir())
 }
 
+/// `-isVoiceOverEnabled`: no screen reader is attached to a guest.
+unsafe extern "C" fn voice_over_enabled(_receiver: Id, _sel: Sel) -> u8 {
+    0
+}
+
 pub(crate) fn install() {
     let class = objc::class::lookup(c"NSWorkspace").expect("declared before its methods");
     class_methods!(class, {
@@ -527,6 +532,7 @@ pub(crate) fn install() {
     methods!(class, {
         "URLForApplicationToOpenURL:" => application_url_for_url, c"@24@0:8@16";
         "openURL:" => open_url, c"c24@0:8@16";
+        "isVoiceOverEnabled" => voice_over_enabled, c"c16@0:8";
         "openFile:" => open_file, c"c24@0:8@16";
         "openFile:withApplication:" => open_file_with, c"c32@0:8@16@24";
         "notificationCenter" => notification_center, c"@16@0:8";

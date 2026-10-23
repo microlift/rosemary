@@ -499,6 +499,22 @@ unsafe extern "C" fn url_for_image_resource(bundle: Id, _sel: Sel, name: Id) -> 
     image_resource(bundle, "URLForResource:withExtension:", name)
 }
 
+/// `-[NSBundle imageForResource:]`: the image file `-pathForImageResource:`
+/// finds, loaded.
+unsafe extern "C" fn image_for_resource(bundle: Id, _sel: Sel, name: Id) -> Id {
+    let path = image_resource(bundle, "pathForResource:ofType:", name);
+    if path.is_null() {
+        return std::ptr::null_mut();
+    }
+    let class = objc::class::lookup(c"NSImage").expect("declared before its methods");
+    let image = objc::object::create_instance(class, 0);
+    // SAFETY: a fresh image and an NSString path.
+    let image = unsafe {
+        init_with_contents_of_file(image, objc::sel::get("initWithContentsOfFile:"), path)
+    };
+    objc::arc::autorelease(image)
+}
+
 /// `-addRepresentation:`, and the list it appends to.
 ///
 /// An image built this way carries its pixels in the representation rather than
@@ -943,6 +959,7 @@ pub(crate) fn install() {
     methods!(bundle, {
         "pathForImageResource:" => path_for_image_resource, c"@24@0:8@16";
         "URLForImageResource:" => url_for_image_resource, c"@24@0:8@16";
+        "imageForResource:" => image_for_resource, c"@24@0:8@16";
     });
     let class = objc::class::lookup(c"NSImage").expect("declared before its methods");
     class_methods!(class, {

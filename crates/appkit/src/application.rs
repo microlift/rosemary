@@ -697,6 +697,27 @@ unsafe extern "C" fn windows(_receiver: Id, _sel: Sel) -> Id {
     unsafe { corefoundation::api::CFAutorelease(array) as Id }
 }
 
+/// `-orderedWindows`: front to back, and without panels, which Apple leaves
+/// out as not scriptable.
+unsafe extern "C" fn ordered_windows(_receiver: Id, _sel: Sel) -> Id {
+    let panel = objc::class::lookup(c"NSPanel");
+    let objects: Vec<corefoundation::base::CFTypeRef> = crate::window::front_to_back()
+        .into_iter()
+        .filter(|w| {
+            // SAFETY: a live window of this crate's.
+            !panel.is_some_and(|p| unsafe { corefoundation::base::is_kind_of(w.cast(), p) })
+        })
+        .map(|w| w as corefoundation::base::CFTypeRef)
+        .collect();
+    let array = corefoundation::collections::new_array(
+        &objects,
+        corefoundation::callbacks::Policy::from_type_callbacks(),
+        false,
+    );
+    // SAFETY: a fresh array.
+    unsafe { corefoundation::api::CFAutorelease(array) as Id }
+}
+
 unsafe extern "C" fn enumerate_windows(_receiver: Id, _sel: Sel, options: u64, block: Id) {
     // SAFETY: `void (^)(NSWindow *, BOOL *)`, as the selector declares.
     let Some(invoke) = (unsafe { crate::animation::invoke(block) }) else {
@@ -1119,6 +1140,7 @@ pub(crate) fn install() {
         "setPresentationOptions:" => set_presentation_options, c"v24@0:8Q16";
         "nextEventMatchingMask:untilDate:inMode:dequeue:" => next_event, c"@48@0:8Q16@24@32B40";
         "windows" => windows, c"@16@0:8";
+        "orderedWindows" => ordered_windows, c"@16@0:8";
         "enumerateWindowsWithOptions:usingBlock:" => enumerate_windows, c"v32@0:8Q16@?24";
         "windowWithWindowNumber:" => window_with_window_number, c"@24@0:8q16";
         "keyWindow" => key_window, c"@16@0:8";

@@ -21,6 +21,22 @@ unsafe extern "C" fn shared_font_manager(class: Id, _sel: Sel) -> Id {
     }) as Id
 }
 
+/// `-[NSFontManager fontMenu:]`'s menu, retained.
+static FONT_MENU: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// `-[NSFontManager setFontMenu:]`. Kept for `-fontMenu:`; the items in it
+/// are the application's, and send their own actions.
+unsafe extern "C" fn set_font_menu(_receiver: Id, _sel: Sel, menu: Id) {
+    objc::arc::retain(menu);
+    let old = FONT_MENU.swap(menu as usize, std::sync::atomic::Ordering::AcqRel);
+    objc::arc::release(old as Id);
+}
+
+/// `-[NSFontManager fontMenu:]`. The flag asks for one to be made; none is.
+unsafe extern "C" fn font_menu(_receiver: Id, _sel: Sel, _create: u8) -> Id {
+    FONT_MENU.load(std::sync::atomic::Ordering::Acquire) as Id
+}
+
 /// `-[NSFontManager localizedNameForFamily:face:]`.
 ///
 /// The fallback family exposed by CoreText has no separate localized names.
@@ -333,6 +349,8 @@ pub(crate) fn install() {
     });
     methods!(class, {
         "localizedNameForFamily:face:" => localized_name, c"@32@0:8@16@24";
+        "setFontMenu:" => set_font_menu, c"v24@0:8@16";
+        "fontMenu:" => font_menu, c"@20@0:8c16";
         "fontWithFamily:traits:weight:size:" => font_with_family, c"@48@0:8@16Q24q32d40";
         "availableFontFamilies" => available_font_families, c"@16@0:8";
         "availableMembersOfFontFamily:" => available_members_of_font_family, c"@24@0:8@16";

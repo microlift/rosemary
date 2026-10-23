@@ -54,6 +54,8 @@ pub struct MenuItem {
     indentation: isize,
     /// `-representedObject`, retained.
     represented: Id,
+    /// `-allowsKeyEquivalentWhenHidden`.
+    key_equivalent_when_hidden: usize,
 }
 
 pub const MENU_INSTANCE_SIZE: usize = size_of::<Menu>();
@@ -382,6 +384,14 @@ unsafe extern "C" fn set_hidden(receiver: Id, _sel: Sel, hidden: u8) {
     item_of(receiver).hidden = hidden as usize;
 }
 
+unsafe extern "C" fn allows_key_equivalent_when_hidden(receiver: Id, _sel: Sel) -> u8 {
+    (item_of(receiver).key_equivalent_when_hidden != 0) as u8
+}
+
+unsafe extern "C" fn set_allows_key_equivalent_when_hidden(receiver: Id, _sel: Sel, allows: u8) {
+    item_of(receiver).key_equivalent_when_hidden = allows as usize;
+}
+
 /// The requests that describe how a menu *looks*, which nothing here draws.
 /// `+[NSMenuItem separatorItem]`, the divider in a menu.
 ///
@@ -677,6 +687,8 @@ pub(crate) fn install() {
         "setEnabled:" => set_enabled, c"v20@0:8c16";
         "isHidden" => is_hidden, c"c16@0:8";
         "setHidden:" => set_hidden, c"v20@0:8c16";
+        "allowsKeyEquivalentWhenHidden" => allows_key_equivalent_when_hidden, c"c16@0:8";
+        "setAllowsKeyEquivalentWhenHidden:" => set_allows_key_equivalent_when_hidden, c"v20@0:8c16";
         "setKeyEquivalentModifierMask:" => set_key_equivalent_modifier_mask, c"v24@0:8Q16";
         "keyEquivalentModifierMask" => key_equivalent_modifier_mask, c"Q16@0:8";
         "isSeparatorItem" => is_separator_item, c"c16@0:8";
