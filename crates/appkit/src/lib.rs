@@ -158,7 +158,6 @@ exports::exports! {
         "NSPlanarFromDepth" => screen::NSPlanarFromDepth,
         "NSColorSpaceFromDepth" => screen::NSColorSpaceFromDepth,
         "NSBestDepth" => screen::NSBestDepth,
-
         "GetCurrentKeyModifiers" | "GetCurrentEventKeyModifiers" => keymap::GetCurrentKeyModifiers,
         "TISCopyCurrentKeyboardInputSource" => textinput::TISCopyCurrentKeyboardInputSource,
         "TISCopyInputMethodKeyboardLayoutOverride" => textinput::TISCopyInputMethodKeyboardLayoutOverride,
