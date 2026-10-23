@@ -53,7 +53,9 @@ pub use coregraphics::cggeometry;
 pub use coregraphics::fonts;
 pub(crate) use coregraphics::quartz;
 mod props;
+mod table_views;
 mod view_controller;
+mod visual_effect;
 pub use chrome::fonts;
 pub mod icon;
 pub mod image;
@@ -104,6 +106,8 @@ pub fn bootstrap() {
         accessibility::install();
         ctline::install();
         view_controller::install();
+        table_views::install();
+        visual_effect::install();
         alert::install();
         panel::install();
         appearance::install();
