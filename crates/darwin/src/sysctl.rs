@@ -258,7 +258,7 @@ pub fn macos_version() -> (i32, i32, i32) {
 }
 
 /// `kern.osproductversion`, spelled as macOS does: no patch component when it is 0.
-fn product_version() -> String {
+pub fn product_version() -> String {
     let (major, minor, patch) = macos_version();
     match patch {
         0 => format!("{major}.{minor}"),
@@ -266,7 +266,8 @@ fn product_version() -> String {
     }
 }
 
-fn build() -> String {
+/// `kern.osversion`, the build: `24A335` unless `ROSEMARY_DARWIN_BUILD` says otherwise.
+pub fn build() -> String {
     env_or("ROSEMARY_DARWIN_BUILD", "24A335")
 }
 

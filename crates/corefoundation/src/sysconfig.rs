@@ -55,7 +55,7 @@ mod flag {
 /// freed object, which is the crossing this tree spends its time chasing.
 #[repr(C)]
 #[derive(Clone, Copy)]
-struct Context {
+pub struct Context {
     version: i64,
     info: *mut c_void,
     retain: Option<unsafe extern "C" fn(*const c_void) -> *const c_void>,
@@ -462,42 +462,310 @@ pub unsafe extern "C" fn SCDynamicStoreCopyProxies(_store: CFTypeRef) -> CFTypeR
     std::ptr::null()
 }
 
+/// `kSCStatus*`, from `<SystemConfiguration/SystemConfiguration.h>`, each
+/// with the text configd's `SCErrorString` gives it.
+mod status {
+    pub const OK: i32 = 0;
+    pub const FAILED: i32 = 1001;
+    pub const INVALID_ARGUMENT: i32 = 1002;
+    pub const NO_KEY: i32 = 1004;
+    pub const NO_STORE_SESSION: i32 = 2001;
+    pub const NOTIFIER_ACTIVE: i32 = 2003;
+
+    pub const MESSAGES: &[(i32, &std::ffi::CStr)] = &[
+        (1003, c"Permission denied"),
+        (
+            5002,
+            c"Network connection information not available at this time",
+        ),
+        (5001, c"Network service for connection not available"),
+        (FAILED, c"Failed!"),
+        (INVALID_ARGUMENT, c"Invalid argument"),
+        (1005, c"Key already defined"),
+        (1006, c"Lock already held"),
+        (3006, c"Maximum link count exceeded"),
+        (1007, c"Lock required for this operation"),
+        (2002, c"Configuration daemon not (no longer) available"),
+        (NO_STORE_SESSION, c"Configuration daemon session not active"),
+        (3003, c"Configuration file not found"),
+        (NO_KEY, c"No such key"),
+        (3004, c"No such link"),
+        (3001, c"Preference session not active"),
+        (NOTIFIER_ACTIVE, c"Notifier is currently active"),
+        (OK, c"Success!"),
+        (3002, c"Preferences update currently in progress"),
+        (4001, c"Network reachability cannot be determined"),
+        (3005, c"Write attempted on stale version of object"),
+    ];
+}
+
+thread_local! {
+    /// The status `SCError` answers: the last failure on this thread, as
+    /// configd keeps it in thread-specific data.
+    static LAST_ERROR: std::cell::Cell<i32> = const { std::cell::Cell::new(status::OK) };
+}
+
+/// configd's `_SCErrorSet`.
+fn set_error(code: i32) {
+    LAST_ERROR.with(|e| e.set(code));
+}
+
+/// `int SCError(void)`.
+pub unsafe extern "C" fn SCError() -> i32 {
+    LAST_ERROR.with(|e| e.get())
+}
+
+/// `const char *SCErrorString(int status)`: configd's message for its own
+/// codes, `strerror` for an errno, and otherwise the Mach error text, which
+/// for a code that is none of these is `strerror`'s "Unknown error".
+pub unsafe extern "C" fn SCErrorString(code: i32) -> *const std::ffi::c_char {
+    if let Some((_, message)) = status::MESSAGES.iter().find(|(c, _)| *c == code) {
+        return message.as_ptr();
+    }
+    // `ELAST` on Darwin; a Darwin errno is the guest's, and the host's
+    // `strerror` has the same text for the POSIX ones.
+    const ELAST: i32 = 106;
+    if (1..=ELAST).contains(&code) {
+        let host = darwin::errno::to_host(code);
+        // SAFETY: `strerror` answers a string that lives until the next call.
+        return unsafe { libc::strerror(host) };
+    }
+    // FIXME (ACCURACY): `bootstrap_strerror` and `mach_error_string` are not
+    // consulted for the codes they own; their unknown-code answer is this.
+    // SAFETY: as above.
+    unsafe { libc::strerror(code) }
+}
+
+/// `SCDynamicStoreCallBack`: `(store, changedKeys, info)`.
+type StoreCallBack = unsafe extern "C" fn(CFTypeRef, CFTypeRef, *mut c_void);
+
 /// An `SCDynamicStoreRef`.
 ///
-/// A handle and nothing else: the store below answers from the host's own
-/// interfaces rather than from a session, and the name and callback a guest
-/// passes name a notification channel this tree does not deliver on. It is a
-/// real object of this runtime's because the caller releases it with
-/// `CFRelease`, which walks the isa.
+/// The store below answers from the host's own interfaces rather than from a
+/// configd session, so nothing changes in it and nothing is ever notified - but
+/// a caller registers for notifications all the same, and gets back what
+/// Apple's gives it: its keys kept and a run loop source it can schedule.
+/// FIXME: the host's network changes (netlink, on Linux) are not watched, so
+/// the source is never signalled and the callout never runs.
 #[repr(C)]
 struct Store {
     isa: *const Class,
+    /// Boxed and freed with the object: `crate::base::allocate` gives fixed
+    /// storage, and the state has a lock in it.
+    state: *mut std::sync::Mutex<StoreState>,
 }
+
+#[derive(Default)]
+struct StoreState {
+    /// Kept for the change delivery the FIXME on [`Store`] names.
+    #[allow(dead_code)]
+    callout: Option<StoreCallBack>,
+    /// The context's `info`, retained by its own `retain` when it has one.
+    info: usize,
+    release: Option<unsafe extern "C" fn(*const c_void)>,
+    /// `SCDynamicStoreSetNotificationKeys`' keys and patterns, as text.
+    keys: Option<Vec<Vec<u8>>>,
+    patterns: Option<Vec<Vec<u8>>>,
+    /// The one run loop source `SCDynamicStoreCreateRunLoopSource` hands out,
+    /// whose reference the store holds.
+    source: usize,
+}
+
+// SAFETY: `info` is the caller's opaque pointer, handed back and never read;
+// the callbacks are code addresses.
+unsafe impl Send for StoreState {}
 
 fn store_class() -> &'static Class {
     static CLASS: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     let ptr = *CLASS.get_or_init(|| {
         let class = crate::base::register(c"SCDynamicStore", None, size_of::<Store>(), true);
+        class.replace_method(
+            objc::sel::get("dealloc"),
+            store_dealloc as *const c_void,
+            c"v16@0:8",
+        );
         objc::class::ptr(class) as usize
     });
     // SAFETY: the cell holds a pointer to a class this function registered.
     unsafe { objc::class::from_ptr(ptr as *const Class).expect("a class") }
 }
 
+/// configd's `__SCDynamicStoreDeallocate`: the run loop source invalidated
+/// and released, and the context's `info` released.
+unsafe extern "C" fn store_dealloc(receiver: objc::object::Id, _sel: objc::sel::Sel) {
+    // SAFETY: an object of `store_class`, whose state `SCDynamicStoreCreate`
+    // boxed, taken back once here.
+    let state = unsafe {
+        let store = receiver as *mut Store;
+        let state = std::mem::replace(&mut (*store).state, std::ptr::null_mut());
+        (!state.is_null()).then(|| {
+            Box::from_raw(state)
+                .into_inner()
+                .unwrap_or_else(|e| e.into_inner())
+        })
+    };
+    if let Some(state) = state {
+        if state.source != 0 {
+            // SAFETY: the source this store made and holds a reference to.
+            unsafe {
+                crate::api::CFRunLoopSourceInvalidate(state.source as CFTypeRef);
+                crate::api::CFRelease(state.source as CFTypeRef);
+            }
+        }
+        if let Some(release) = state.release {
+            // SAFETY: the caller's own release for its own `info`.
+            unsafe { release(state.info as *const c_void) };
+        }
+    }
+    objc::arc::finalize(receiver);
+}
+
+/// The state of a store of this runtime's, or `None` for anything else -
+/// configd's `isA_SCDynamicStore`.
+///
+/// # Safety
+///
+/// `store` is null or a live object.
+unsafe fn store_state<'a>(store: CFTypeRef) -> Option<&'a std::sync::Mutex<StoreState>> {
+    if store.is_null() {
+        return None;
+    }
+    // SAFETY: a live object, whose class is read to check it.
+    let class = unsafe { objc::object::class_of(store as objc::object::Id) }?;
+    if !std::ptr::eq(class, store_class()) {
+        return None;
+    }
+    // SAFETY: a store, whose state lives as long as it does.
+    let state = unsafe { (*(store as *const Store)).state };
+    // SAFETY: as above.
+    (!state.is_null()).then(|| unsafe { &*state })
+}
+
 /// `SCDynamicStoreRef SCDynamicStoreCreate(CFAllocatorRef, CFStringRef, SCDynamicStoreCallBack, SCDynamicStoreContext *)`
 ///
 /// The store is created rather than declined, because a caller that gets NULL
-/// here asks nothing further - and the keys below can be answered.
+/// here asks nothing further - and the keys below can be answered. The
+/// context is copied and its `info` retained, as configd's is.
 pub unsafe extern "C" fn SCDynamicStoreCreate(
     _allocator: CFTypeRef,
     _name: CFTypeRef,
-    _callout: *const c_void,
-    _context: *mut c_void,
+    callout: Option<StoreCallBack>,
+    context: *const Context,
 ) -> CFTypeRef {
+    let mut state = StoreState {
+        callout,
+        ..StoreState::default()
+    };
+    if !context.is_null() {
+        // SAFETY: the caller's live context.
+        let context = unsafe { *context };
+        state.info = match context.retain {
+            // SAFETY: the caller's own retain for its own `info`.
+            Some(retain) => (unsafe { retain(context.info) }) as usize,
+            None => context.info as usize,
+        };
+        state.release = context.release;
+    }
     // SAFETY: `Store` begins with `isa` and is the layout `store_class` was
     // registered with.
     let store: *mut Store = unsafe { crate::base::allocate(store_class()) };
+    // SAFETY: freshly allocated.
+    unsafe { (*store).state = Box::into_raw(Box::new(std::sync::Mutex::new(state))) };
     store as CFTypeRef
+}
+
+/// The text of each string in an array, or `None` for an array holding
+/// anything else - what configd's `_SCSerialize` would fail on.
+///
+/// # Safety
+///
+/// `array` is a live object.
+unsafe fn texts(array: CFTypeRef) -> Option<Vec<Vec<u8>>> {
+    // SAFETY: a live object; anything but an array is refused.
+    let contents = unsafe { crate::collections::array(array) }?;
+    contents
+        .values
+        .iter()
+        // SAFETY: each element is a live object.
+        .map(|&value| unsafe { text_of(value) })
+        .collect()
+}
+
+/// `Boolean SCDynamicStoreSetNotificationKeys(SCDynamicStoreRef, CFArrayRef
+/// keys, CFArrayRef patterns)`: the keys and patterns to be told about,
+/// replacing the last ones; a null array clears its half.
+pub unsafe extern "C" fn SCDynamicStoreSetNotificationKeys(
+    store: CFTypeRef,
+    keys: CFTypeRef,
+    patterns: CFTypeRef,
+) -> u8 {
+    // SAFETY: the caller's object or null.
+    let Some(state) = (unsafe { store_state(store) }) else {
+        set_error(status::NO_STORE_SESSION);
+        return 0;
+    };
+    let read = |array: CFTypeRef| match array.is_null() {
+        true => Some(None),
+        // SAFETY: a live object.
+        false => unsafe { texts(array) }.map(Some),
+    };
+    let (Some(keys), Some(patterns)) = (read(keys), read(patterns)) else {
+        set_error(status::FAILED);
+        return 0;
+    };
+    let mut state = state.lock().unwrap_or_else(|e| e.into_inner());
+    state.keys = keys;
+    state.patterns = patterns;
+    1
+}
+
+/// `CFRunLoopSourceRef SCDynamicStoreCreateRunLoopSource(CFAllocatorRef,
+/// SCDynamicStoreRef, CFIndex order)`: the store's one source, made the first
+/// time and the same one after, with a reference for the caller each time.
+pub unsafe extern "C" fn SCDynamicStoreCreateRunLoopSource(
+    _allocator: CFTypeRef,
+    store: CFTypeRef,
+    _order: isize,
+) -> CFTypeRef {
+    // SAFETY: the caller's object or null.
+    let Some(state) = (unsafe { store_state(store) }) else {
+        set_error(status::NO_STORE_SESSION);
+        return std::ptr::null();
+    };
+    let mut state = state.lock().unwrap_or_else(|e| e.into_inner());
+    if state.source == 0 {
+        // Never signalled: see `Store`.
+        let context = crate::api::CFRunLoopSourceContext {
+            version: 0,
+            info: store as *mut c_void,
+            retain: std::ptr::null(),
+            release: std::ptr::null(),
+            copy_description: std::ptr::null(),
+            equal: std::ptr::null(),
+            hash: std::ptr::null(),
+            schedule: std::ptr::null(),
+            cancel: std::ptr::null(),
+            perform: None,
+        };
+        // SAFETY: a version-0 context that lives for the call.
+        state.source =
+            unsafe { crate::api::CFRunLoopSourceCreate(std::ptr::null(), 0, &context) } as usize;
+        if state.source == 0 {
+            set_error(status::FAILED);
+            return std::ptr::null();
+        }
+    }
+    // SAFETY: the source made above, which the store holds.
+    unsafe { crate::api::CFRetain(state.source as CFTypeRef) }
+}
+
+/// `CFStringRef SCDynamicStoreKeyCreateProxies(CFAllocatorRef)`: configd's
+/// `State:/Network/Global/Proxies`.
+pub unsafe extern "C" fn SCDynamicStoreKeyCreateProxies(allocator: CFTypeRef) -> CFTypeRef {
+    let domain = crate::base::interned_name("State:") as CFTypeRef;
+    let entity = crate::base::interned_name("Proxies") as CFTypeRef;
+    // SAFETY: two strings.
+    unsafe { SCDynamicStoreKeyCreateNetworkGlobalEntity(allocator, domain, entity) }
 }
 
 /// `CFStringRef SCDynamicStoreCopyComputerName(SCDynamicStoreRef, CFStringEncoding *)`
@@ -745,8 +1013,13 @@ const KEY_STRINGS: &[(&str, &str)] = &[
 /// The `kSC*` globals, as `(Mach-O name, address)`.
 pub fn data_symbols() -> Vec<(String, u64)> {
     crate::bootstrap();
+    // The schema's keys, less any this module already lists.
+    let schema = crate::sysconfig_schema::SCHEMA
+        .iter()
+        .filter(|(symbol, _)| !KEY_STRINGS.iter().any(|(s, _)| s == symbol));
     KEY_STRINGS
         .iter()
+        .chain(schema)
         .map(|(symbol, text)| {
             (
                 (*symbol).to_string(),
@@ -769,6 +1042,11 @@ exports::exports! {
         "SCNetworkReachabilityUnscheduleFromRunLoop" => SCNetworkReachabilityUnscheduleFromRunLoop,
         "SCDynamicStoreCopyProxies" => SCDynamicStoreCopyProxies,
         "SCDynamicStoreCreate" => SCDynamicStoreCreate,
+        "SCDynamicStoreSetNotificationKeys" => SCDynamicStoreSetNotificationKeys,
+        "SCDynamicStoreCreateRunLoopSource" => SCDynamicStoreCreateRunLoopSource,
+        "SCDynamicStoreKeyCreateProxies" => SCDynamicStoreKeyCreateProxies,
+        "SCError" => SCError,
+        "SCErrorString" => SCErrorString,
         "SCDynamicStoreCopyComputerName" => SCDynamicStoreCopyComputerName,
         "SCDynamicStoreKeyCreateNetworkGlobalEntity" => SCDynamicStoreKeyCreateNetworkGlobalEntity,
         "SCDynamicStoreCopyValue" => SCDynamicStoreCopyValue,
@@ -995,6 +1273,122 @@ mod tests {
                 "a target the host made answers its own flags"
             );
             crate::api::CFRelease(target);
+        }
+    }
+
+    unsafe extern "C" fn retain_info(info: *const c_void) -> *const c_void {
+        // SAFETY: the counter this test passes as `info`.
+        unsafe {
+            (*(info as *const std::sync::atomic::AtomicIsize))
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+        };
+        info
+    }
+
+    unsafe extern "C" fn release_info(info: *const c_void) {
+        // SAFETY: as above.
+        unsafe {
+            (*(info as *const std::sync::atomic::AtomicIsize))
+                .fetch_sub(1, std::sync::atomic::Ordering::SeqCst)
+        };
+    }
+
+    /// configd's `SCDynamicStoreCreateRunLoopSource`: one source per store, a
+    /// reference to it for each call; and its context's `info` retained for
+    /// the store's life.
+    #[test]
+    fn a_store_has_one_run_loop_source_and_keeps_its_info() {
+        use std::sync::atomic::{AtomicIsize, Ordering};
+        crate::bootstrap();
+        let held = AtomicIsize::new(0);
+        let context = Context {
+            version: 0,
+            info: &held as *const AtomicIsize as *mut c_void,
+            retain: Some(retain_info),
+            release: Some(release_info),
+            copy_description: std::ptr::null(),
+        };
+        let name = crate::string::from_bytes(b"test", false);
+        // SAFETY: a live context and name; the objects are released below.
+        unsafe {
+            let store = SCDynamicStoreCreate(std::ptr::null(), name, None, &context);
+            assert!(!store.is_null());
+            assert_eq!(held.load(Ordering::SeqCst), 1, "the store retains its info");
+            let first = SCDynamicStoreCreateRunLoopSource(std::ptr::null(), store, 0);
+            let second = SCDynamicStoreCreateRunLoopSource(std::ptr::null(), store, 0);
+            assert!(!first.is_null());
+            assert_eq!(first, second, "the same source each time");
+            crate::api::CFRelease(first);
+            crate::api::CFRelease(second);
+            crate::api::CFRelease(store);
+            assert_eq!(
+                held.load(Ordering::SeqCst),
+                0,
+                "and releases it with itself"
+            );
+            crate::api::CFRelease(name);
+        }
+    }
+
+    /// `SCDynamicStoreSetNotificationKeys` keeps keys and patterns, and a
+    /// call that is not about a store is `kSCStatusNoStoreSession`, which
+    /// `SCError` then reports and `SCErrorString` describes as configd does.
+    #[test]
+    fn notification_keys_are_kept_and_a_missing_store_is_an_error() {
+        crate::bootstrap();
+        // SAFETY: the objects are made here and released below.
+        unsafe {
+            let store =
+                SCDynamicStoreCreate(std::ptr::null(), std::ptr::null(), None, std::ptr::null());
+            let proxies = SCDynamicStoreKeyCreateProxies(std::ptr::null());
+            assert_eq!(
+                text_of(proxies).as_deref(),
+                Some(&b"State:/Network/Global/Proxies"[..])
+            );
+            let pattern = crate::string::from_bytes(b"State:/Network/Interface/[^/]+/IPv4", false);
+            let keys =
+                crate::collections::new_array(&[proxies], Policy::from_type_callbacks(), false);
+            let patterns =
+                crate::collections::new_array(&[pattern], Policy::from_type_callbacks(), false);
+            assert_eq!(SCDynamicStoreSetNotificationKeys(store, keys, patterns), 1);
+            {
+                let state = store_state(store).unwrap().lock().unwrap();
+                assert_eq!(
+                    state.keys.as_deref(),
+                    Some(&[b"State:/Network/Global/Proxies".to_vec()][..])
+                );
+                assert_eq!(state.patterns.as_ref().map(Vec::len), Some(1));
+            }
+            assert_eq!(
+                SCDynamicStoreSetNotificationKeys(store, std::ptr::null(), std::ptr::null()),
+                1
+            );
+            assert!(
+                store_state(store).unwrap().lock().unwrap().keys.is_none(),
+                "null clears"
+            );
+
+            assert_eq!(
+                SCDynamicStoreSetNotificationKeys(std::ptr::null(), keys, patterns),
+                0
+            );
+            assert_eq!(SCError(), status::NO_STORE_SESSION);
+            assert!(SCDynamicStoreCreateRunLoopSource(std::ptr::null(), proxies, 0).is_null());
+            assert_eq!(SCError(), status::NO_STORE_SESSION);
+            let text = std::ffi::CStr::from_ptr(SCErrorString(SCError()));
+            assert_eq!(text, c"Configuration daemon session not active");
+            assert_eq!(std::ffi::CStr::from_ptr(SCErrorString(0)), c"Success!");
+            let not_found = std::ffi::CStr::from_ptr(SCErrorString(2))
+                .to_string_lossy()
+                .into_owned();
+            assert_eq!(
+                not_found, "No such file or directory",
+                "an errno is strerror's"
+            );
+
+            for object in [keys, patterns, pattern, proxies, store] {
+                crate::api::CFRelease(object);
+            }
         }
     }
 }

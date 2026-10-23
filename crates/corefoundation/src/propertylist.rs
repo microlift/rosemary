@@ -126,6 +126,12 @@ pub fn object_from_value(value: &Value) -> Option<CFTypeRef> {
     build(value, 0, 0).ok()
 }
 
+/// [`object_from_value`] with mutable containers, as
+/// `kCFPropertyListMutableContainers` reads a document.
+pub(crate) fn mutable_object_from_value(value: &Value) -> Option<CFTypeRef> {
+    build(value, mutability::MUTABLE_CONTAINERS, 0).ok()
+}
+
 /// The property list value of `object`, or `None` when it holds anything a
 /// property list cannot: a dictionary with a non-string key, or an object of
 /// some other class. Booleans, numbers, strings, data, dates, arrays and

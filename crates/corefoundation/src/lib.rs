@@ -26,6 +26,8 @@ mod send;
 mod socket;
 pub mod string;
 pub mod sysconfig;
+mod sysconfig_schema;
+mod systemversion;
 pub mod timezone;
 pub mod tzif;
 pub mod url;
@@ -249,6 +251,7 @@ exports::exports! {
         fsevents,
         urlresource,
         sysconfig,
+        systemversion,
     }
 }
 
@@ -360,7 +363,7 @@ pub fn data_symbols() -> Vec<(String, u64)> {
     // The string-valued globals, each of which is exactly its own name without
     // the `k` and the `Key`. Interned so that a guest comparing one against a
     // key it read back gets identity as well as equality.
-    for (symbol, text) in KEY_STRINGS {
+    for (symbol, text) in KEY_STRINGS.iter().chain(systemversion::KEYS) {
         out.push((
             symbol.to_string(),
             base::global_cell(symbol, base::interned_name(text)),
