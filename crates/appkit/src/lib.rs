@@ -242,6 +242,11 @@ pub fn data_symbols() -> Vec<(String, u64)> {
         .map(|(symbol, name, _)| (*symbol, *name))
         .collect();
     out.extend(corefoundation::base::string_globals(&gravities));
+    // `const CGFloat`, read as a double.
+    out.push((
+        "_NSViewNoIntrinsicMetric".to_string(),
+        corefoundation::base::global_cell("_NSViewNoIntrinsicMetric", (-1.0f64).to_bits()),
+    ));
     // Doubles rather than pointers - see [`FONT_WEIGHTS`].
     for (symbol, weight) in FONT_WEIGHTS {
         out.push((
@@ -315,6 +320,17 @@ pub const NOTIFICATION_NAMES: &[&str] = &[
     "NSControlTintDidChangeNotification",
     "NSMenuWillSendActionNotification",
     "NSViewGlobalFrameDidChangeNotification",
+    "NSApplicationDidResignActiveNotification",
+    "NSWorkspaceDidMountNotification",
+    "NSWorkspaceDidUnmountNotification",
+    "NSWorkspaceDidRenameVolumeNotification",
+    "NSOutlineViewItemDidCollapseNotification",
+    "NSOutlineViewItemDidExpandNotification",
+    "NSPopUpButtonWillPopUpNotification",
+    // Keys and option names whose text is their own name.
+    "NSApplicationLaunchUserNotificationKey",
+    "NSAccessibilityException",
+    "NSPrintHeaderAndFooter",
 ];
 
 /// The other AppKit string globals a program reads.
@@ -374,6 +390,14 @@ pub const STRING_GLOBALS: &[(&str, &str)] = &[
         "kCGImageSourceTypeIdentifierHint",
     ),
     ("_kUTTypePNG", "public.png"),
+    ("_kUTTypeURL", "public.url"),
+    ("_kUTTypePlainText", "public.plain-text"),
+    ("_kUTTypeText", "public.text"),
+    ("_kUTTypeData", "public.data"),
+    ("_kUTTypeItem", "public.item"),
+    ("_kUTTypeDirectory", "public.directory"),
+    ("_kUTTypeFolder", "public.folder"),
+    ("_kUTTypeApplicationBundle", "com.apple.application-bundle"),
     ("_kLSItemDisplayName", "LSItemDisplayName"),
     // Dragged files arrive as this type; the guest compares pasteboard types to it.
     ("_kUTTypeFileURL", "public.file-url"),
@@ -516,8 +540,181 @@ pub const STRING_GLOBALS: &[(&str, &str)] = &[
     ("_NSAccessibilityHelpAttribute", "AXHelp"),
     ("_NSAccessibilityTitleAttribute", "AXTitle"),
     ("_NSAccessibilityDescriptionAttribute", "AXDescription"),
+    ("_NSAccessibilityRoleAttribute", "AXRole"),
+    (
+        "_NSAccessibilityRoleDescriptionAttribute",
+        "AXRoleDescription",
+    ),
+    ("_NSAccessibilitySubroleAttribute", "AXSubrole"),
+    ("_NSAccessibilityChildrenAttribute", "AXChildren"),
+    ("_NSAccessibilityParentAttribute", "AXParent"),
+    ("_NSAccessibilityWindowAttribute", "AXWindow"),
+    (
+        "_NSAccessibilityTopLevelUIElementAttribute",
+        "AXTopLevelUIElement",
+    ),
+    ("_NSAccessibilityPositionAttribute", "AXPosition"),
+    ("_NSAccessibilitySizeAttribute", "AXSize"),
+    ("_NSAccessibilityValueAttribute", "AXValue"),
+    ("_NSAccessibilityURLAttribute", "AXURL"),
+    ("_NSAccessibilitySelectedTextAttribute", "AXSelectedText"),
+    (
+        "_NSAccessibilitySelectedTextRangeAttribute",
+        "AXSelectedTextRange",
+    ),
+    (
+        "_NSAccessibilityNumberOfCharactersAttribute",
+        "AXNumberOfCharacters",
+    ),
+    (
+        "_NSAccessibilityVisibleCharacterRangeAttribute",
+        "AXVisibleCharacterRange",
+    ),
+    (
+        "_NSAccessibilityLineForIndexParameterizedAttribute",
+        "AXLineForIndex",
+    ),
+    (
+        "_NSAccessibilityRangeForLineParameterizedAttribute",
+        "AXRangeForLine",
+    ),
+    (
+        "_NSAccessibilityStringForRangeParameterizedAttribute",
+        "AXStringForRange",
+    ),
+    (
+        "_NSAccessibilityRangeForPositionParameterizedAttribute",
+        "AXRangeForPosition",
+    ),
+    (
+        "_NSAccessibilityRangeForIndexParameterizedAttribute",
+        "AXRangeForIndex",
+    ),
+    (
+        "_NSAccessibilityBoundsForRangeParameterizedAttribute",
+        "AXBoundsForRange",
+    ),
+    (
+        "_NSAccessibilityRTFForRangeParameterizedAttribute",
+        "AXRTFForRange",
+    ),
+    (
+        "_NSAccessibilityStyleRangeForIndexParameterizedAttribute",
+        "AXStyleRangeForIndex",
+    ),
+    (
+        "_NSAccessibilityAttributedStringForRangeParameterizedAttribute",
+        "AXAttributedStringForRange",
+    ),
+    ("_NSAccessibilityFontTextAttribute", "AXFont"),
+    (
+        "_NSAccessibilityForegroundColorTextAttribute",
+        "AXForegroundColor",
+    ),
+    (
+        "_NSAccessibilityBackgroundColorTextAttribute",
+        "AXBackgroundColor",
+    ),
+    ("_NSAccessibilityLinkTextAttribute", "AXLink"),
+    ("_NSAccessibilityMisspelledTextAttribute", "AXMisspelled"),
+    (
+        "_NSAccessibilityStrikethroughTextAttribute",
+        "AXStrikethrough",
+    ),
+    ("_NSAccessibilityUnderlineTextAttribute", "AXUnderline"),
+    ("_NSAccessibilityFontFamilyKey", "AXFontFamily"),
+    ("_NSAccessibilityFontNameKey", "AXFontName"),
+    ("_NSAccessibilityFontSizeKey", "AXFontSize"),
+    ("_NSAccessibilityVisibleNameKey", "AXVisibleName"),
+    ("_NSAccessibilityGroupRole", "AXGroup"),
+    ("_NSAccessibilityLinkRole", "AXLink"),
+    ("_NSAccessibilityStaticTextRole", "AXStaticText"),
+    ("_NSAccessibilityRadioButtonRole", "AXRadioButton"),
+    ("_NSAccessibilityRadioGroupRole", "AXRadioGroup"),
+    ("_NSAccessibilityTabGroupRole", "AXTabGroup"),
+    ("_NSAccessibilityTextAreaRole", "AXTextArea"),
+    ("_NSAccessibilityTextFieldRole", "AXTextField"),
+    ("_NSAccessibilityTextLinkSubrole", "AXTextLink"),
+    ("_NSAccessibilityPressAction", "AXPress"),
+    (
+        "_NSAccessibilitySelectedRowsChangedNotification",
+        "AXSelectedRowsChanged",
+    ),
+    (
+        "_NSAccessibilitySelectedTextChangedNotification",
+        "AXSelectedTextChanged",
+    ),
+    ("_NSAccessibilityValueChangedNotification", "AXValueChanged"),
+    (
+        "_NSAccessibilityAnnouncementRequestedNotification",
+        "AXAnnouncementRequested",
+    ),
+    ("_NSAccessibilityAnnouncementKey", "AXAnnouncementKey"),
     // The only named system image a program asks for here.
     ("_NSImageNameApplicationIcon", "NSApplicationIcon"),
+    ("_NSImageNameActionTemplate", "NSActionTemplate"),
+    ("_NSImageNameAddTemplate", "NSAddTemplate"),
+    ("_NSImageNameRemoveTemplate", "NSRemoveTemplate"),
+    ("_NSImageNameRefreshTemplate", "NSRefreshTemplate"),
+    ("_NSImageNameGoLeftTemplate", "NSGoLeftTemplate"),
+    ("_NSImageNameGoRightTemplate", "NSGoRightTemplate"),
+    (
+        "_NSImageNameStopProgressFreestandingTemplate",
+        "NSStopProgressFreestandingTemplate",
+    ),
+    ("_NSImageNameComputer", "NSComputer"),
+    ("_NSImageNameMultipleDocuments", "NSMultipleDocuments"),
+    ("_NSImageNameStatusAvailable", "NSStatusAvailable"),
+    ("_NSImageNameStatusUnavailable", "NSStatusUnavailable"),
+    ("_NSBackgroundColorAttributeName", "NSBackgroundColor"),
+    ("_NSShadowAttributeName", "NSShadow"),
+    ("_NSStrikethroughStyleAttributeName", "NSStrikethrough"),
+    ("_NSExpansionAttributeName", "NSExpansion"),
+    ("_NSGlyphInfoAttributeName", "NSGlyphInfo"),
+    (
+        "_NSFontFeatureSettingsAttribute",
+        "NSCTFontFeatureSettingsAttribute",
+    ),
+    ("_NSFontFeatureTypeIdentifierKey", "CTFeatureTypeIdentifier"),
+    (
+        "_NSFontFeatureSelectorIdentifierKey",
+        "CTFeatureSelectorIdentifier",
+    ),
+    ("_NSGeneralPboard", "Apple CFPasteboard general"),
+    ("_NSFindPboard", "Apple CFPasteboard find"),
+    (
+        "_NSToolbarFlexibleSpaceItemIdentifier",
+        "NSToolbarFlexibleSpaceItem",
+    ),
+    // Cocoa bindings' names and options.
+    ("_NSValueBinding", "value"),
+    ("_NSContentBinding", "content"),
+    ("_NSContentValuesBinding", "contentValues"),
+    ("_NSSelectedValueBinding", "selectedValue"),
+    ("_NSSelectedIndexBinding", "selectedIndex"),
+    ("_NSSelectedTagBinding", "selectedTag"),
+    ("_NSSelectionIndexesBinding", "selectionIndexes"),
+    ("_NSTitleBinding", "title"),
+    ("_NSToolTipBinding", "toolTip"),
+    ("_NSHiddenBinding", "hidden"),
+    ("_NSImageBinding", "image"),
+    ("_NSEnabledBinding", "enabled"),
+    ("_NSEditableBinding", "editable"),
+    ("_NSAnimateBinding", "animate"),
+    ("_NSDocumentEditedBinding", "documentEdited"),
+    (
+        "_NSValueTransformerNameBindingOption",
+        "NSValueTransformerName",
+    ),
+    ("_NSValueTransformerBindingOption", "NSValueTransformer"),
+    ("_NSNullPlaceholderBindingOption", "NSNullPlaceholder"),
+    (
+        "_NSContinuouslyUpdatesValueBindingOption",
+        "NSContinuouslyUpdatesValue",
+    ),
+    ("_NSObservedObjectKey", "NSObservedObject"),
+    ("_NSObservedKeyPathKey", "NSObservedKeyPath"),
+    ("_NSOptionsKey", "NSOptions"),
 ];
 
 /// `NSFontWeight` globals, which are **`CGFloat` variables** and not pointers.
@@ -527,6 +724,11 @@ pub const STRING_GLOBALS: &[(&str, &str)] = &[
 /// pattern of a pointer as a font weight. The values are Apple's own, on the
 /// -1.0 to 1.0 scale `+systemFontOfSize:weight:` takes.
 const FONT_WEIGHTS: &[(&str, f64)] = &[
+    // Not weights, but the same kind of `CGFloat` variable: the gray levels.
+    ("_NSBlack", 0.0),
+    ("_NSDarkGray", 1.0 / 3.0),
+    ("_NSLightGray", 2.0 / 3.0),
+    ("_NSWhite", 1.0),
     ("_NSFontWeightUltraLight", -0.8),
     ("_NSFontWeightThin", -0.6),
     ("_NSFontWeightLight", -0.4),
