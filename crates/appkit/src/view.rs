@@ -1484,6 +1484,41 @@ unsafe extern "C" fn subviews(receiver: Id, _sel: Sel) -> Id {
     view.subviews
 }
 
+/// `-enclosingScrollView`: the nearest scroll view above this one.
+unsafe extern "C" fn enclosing_scroll_view(receiver: Id, _sel: Sel) -> Id {
+    let Some(scroll) = objc::class::lookup(c"NSScrollView") else {
+        return std::ptr::null_mut();
+    };
+    // SAFETY: a view of this crate's.
+    let mut at = unsafe { superview_of(receiver) };
+    while is_view(at) {
+        // SAFETY: a live view.
+        if unsafe { corefoundation::base::is_kind_of(at.cast(), scroll) } {
+            return at;
+        }
+        // SAFETY: as above.
+        at = unsafe { superview_of(at) };
+    }
+    std::ptr::null_mut()
+}
+
+/// `-isDescendantOf:`, counting the view itself.
+unsafe extern "C" fn is_descendant_of(receiver: Id, _sel: Sel, other: Id) -> u8 {
+    let mut at = receiver;
+    while is_view(at) {
+        if at == other {
+            return 1;
+        }
+        // SAFETY: a view of this crate's.
+        at = unsafe { superview_of(at) };
+    }
+    0
+}
+
+unsafe extern "C" fn hook_with_object(_receiver: Id, _sel: Sel, _argument: Id) {}
+
+unsafe extern "C" fn hook(_receiver: Id, _sel: Sel) {}
+
 unsafe extern "C" fn add_subview(receiver: Id, sel: Sel, subview: Id) {
     if !is_view(subview) {
         return;
@@ -1934,6 +1969,8 @@ pub(crate) fn install() {
         "setTranslatesAutoresizingMaskIntoConstraints:" => set_translates_autoresizing_mask,
             c"v20@0:8c16";
         "translatesAutoresizingMaskIntoConstraints" => translates_autoresizing_mask, c"c16@0:8";
+        "enclosingScrollView" => enclosing_scroll_view, c"@16@0:8";
+        "isDescendantOf:" => is_descendant_of, c"c24@0:8@16";
         "removeFromSuperview" => remove_from_superview, c"v16@0:8";
         "dealloc" => dealloc, c"v16@0:8";
         "setWantsBestResolutionOpenGLSurface:" => set_wants_best_resolution, c"v20@0:8c16";
