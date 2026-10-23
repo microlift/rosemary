@@ -236,6 +236,9 @@ pub fn bind<M: machish::memory::Regions>(
         for (i, missing) in image.missing.iter().enumerate() {
             let record = if missing.symbol == "_OBJC_EHTYPE_id" {
                 id_record()
+            } else if missing.symbol == "___objc_personality_v0" {
+                // Nothing else exports it, so it is only ever missing.
+                Some(personality)
             } else if let Some(class) = missing.symbol.strip_prefix("_OBJC_EHTYPE_$_") {
                 std::ffi::CString::new(class)
                     .ok()
