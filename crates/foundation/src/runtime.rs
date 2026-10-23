@@ -18,6 +18,9 @@ exports::exports! {
         "NSGetUncaughtExceptionHandler" => NSGetUncaughtExceptionHandler,
         "CFCharacterSetGetPredefined" => crate::characterset::CFCharacterSetGetPredefined,
         "CFCharacterSetIsCharacterMember" => crate::characterset::CFCharacterSetIsCharacterMember,
+        "CFCharacterSetIsLongCharacterMember" => crate::characterset::CFCharacterSetIsLongCharacterMember,
+        "CFCharacterSetCreateMutable" => crate::characterset::CFCharacterSetCreateMutable,
+        "CFCharacterSetAddCharactersInRange" => crate::characterset::CFCharacterSetAddCharactersInRange,
     }
 }
 
