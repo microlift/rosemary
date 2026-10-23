@@ -241,7 +241,7 @@ impl Decoder {
         let pipeline = gst::parse::launch(&format!(
             "appsrc name=rosemary_input format=time is-live=false block=false max-bytes=8388608 \
              caps=\"{input_caps}\" \
-             ! h264parse ! avdec_h264 max-threads={threads} \
+             ! h264parse ! avdec_h264 max-threads={threads} output-corrupt=false discard-corrupted-frames=true \
              ! videoconvert ! video/x-raw,format=(string){output_caps} \
              ! appsink name=rosemary_output sync=false max-buffers=32 drop=false"
         ))
@@ -585,6 +585,67 @@ mod tests {
                 "incorrect decoded picture at presentation frame {i}"
             );
         }
+    }
+
+    #[test]
+    fn missing_initial_idr_does_not_emit_pre_recovery_pictures() {
+        // The first IDR slice was removed from the same pinned multi-GOP
+        // fixture. A decoder must recover at the later IDR, not present
+        // pre-recovery pictures as valid output.
+        let stream = include_bytes!("../tests/fixtures/multi_gop_missing_first_idr_64x64.h264");
+        let golden = include_str!("../tests/fixtures/multi_gop_bframes_64x64.luma_fnv64");
+        let mut offsets = Vec::new();
+        for (i, bytes) in stream.windows(5).enumerate() {
+            if bytes[..4] == [0, 0, 0, 1] && bytes[4] & 31 == 9 {
+                offsets.push(i);
+            }
+        }
+        assert_eq!(offsets.len(), 60);
+        let mut decoder = Decoder::h264_nv12(1).unwrap();
+        for (index, &start) in offsets.iter().enumerate() {
+            let end = offsets.get(index + 1).copied().unwrap_or(stream.len());
+            let unit = &stream[start..end];
+            decoder
+                .submit(AccessUnit {
+                    id: index as u64,
+                    bytes: unit,
+                    pts_ns: Some(index as u64 * 33_333_333),
+                    dts_ns: None,
+                    duration_ns: Some(33_333_333),
+                })
+                .unwrap();
+        }
+        decoder.end_stream().unwrap();
+        let mut ids = Vec::new();
+        let mut pixels = Vec::new();
+        for _ in 0..60 {
+            let Some(frame) = decoder.pull(Duration::from_secs(2)).unwrap() else {
+                break;
+            };
+            ids.push(frame.id());
+            let hash = frame
+                .with_bytes(|mapped, info| {
+                    let mut hash = 0xcbf29ce484222325_u64;
+                    for row in 0..64 {
+                        let begin = info.offsets[0] + row * info.strides[0];
+                        for &pixel in &mapped[begin..begin + 64] {
+                            hash = (hash ^ u64::from(pixel)).wrapping_mul(0x100000001b3);
+                        }
+                    }
+                    format!("{hash:016x}")
+                })
+                .unwrap();
+            pixels.push(hash);
+        }
+        // FFmpeg's normal public output emits only the 40 pictures after the
+        // second IDR in this fixture. The public draw_horiz_band hook, by
+        // contrast, fires for invalid pre-roll and cannot establish eligibility.
+        assert_eq!(ids.len(), 40);
+        assert!(
+            ids.iter().all(|&id| id >= 20),
+            "pre-recovery picture escaped"
+        );
+        assert_eq!(pixels, golden.lines().skip(20).collect::<Vec<_>>());
     }
 
     #[test]
@@ -1001,10 +1062,14 @@ mod tests {
         ids.sort_unstable();
         assert_eq!(ids, (1..=8).collect::<Vec<_>>());
         assert!(decoder.pull(Duration::ZERO).unwrap().is_none());
-        assert!(
-            decoder.is_drained(),
-            "EOS should be visible after all outputs are delivered"
-        );
+        // GStreamer marks its appsink EOS asynchronously even after the last
+        // sample has been returned. Poll for terminal EOS; an empty output
+        // queue alone never establishes decoder completion.
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while !decoder.is_drained() && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert!(decoder.is_drained(), "terminal EOS never arrived");
         assert!(matches!(
             decoder.submit(AccessUnit {
                 id: 9,

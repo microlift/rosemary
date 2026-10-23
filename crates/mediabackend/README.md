@@ -36,7 +36,11 @@ The regression fixtures are stored under this crate, so no other feature PR is
 required to test decoding. Tests cover B-frame reference identity with repeated
 PTS, a pinned 60-picture three-GOP pixel reference, colorimetry, range,
 NV12/I420/BGRA lifetime, same-SPS PPS reconfiguration, 256-frame bounded queue
-backpressure, and terminal EOS. The multi-GOP luma checksum fixture is
+backpressure, terminal EOS, and missing-IDR recovery. The libav element is
+configured with `output-corrupt=false` and `discard-corrupted-frames=true`:
+its unmodified default emitted invalid pre-recovery pictures. The pinned
+60-picture truncated fixture confirms it drops all 19 invalid pictures and
+outputs the remaining 40 with the same pixel hashes as FFmpeg's normal output. The multi-GOP luma checksum fixture is
 `tests/fixtures/multi_gop_bframes_64x64.luma_fnv64`.
 
 ## Known limits
