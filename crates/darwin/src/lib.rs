@@ -51,6 +51,7 @@ pub mod fcntl;
 pub mod fmtcheck;
 pub mod fortify;
 pub mod fs;
+pub mod fsctl;
 pub mod fts;
 #[cfg(target_os = "linux")]
 pub mod getopt;
@@ -72,6 +73,7 @@ pub mod malloc;
 pub mod math;
 pub mod modes;
 pub mod net;
+pub mod notify;
 mod oslog;
 pub mod pam;
 pub mod passthrough;
@@ -377,6 +379,7 @@ static NONPORTABLE_MODULES: &[exports::Module] = &[
     sched::MODULE,
     random::MODULE,
     ioctl::MODULE,
+    fsctl::MODULE,
     ulock::MODULE,
     data::MODULE,
     xlocale::MODULE,
@@ -392,6 +395,7 @@ static NONPORTABLE_MODULES: &[exports::Module] = &[
     backtrace::MODULE,
     #[cfg(target_arch = "x86_64")]
     printf_l::MODULE,
+    notify::MODULE,
     acl::MODULE,
     fmtcheck::MODULE,
     langinfo::MODULE,
