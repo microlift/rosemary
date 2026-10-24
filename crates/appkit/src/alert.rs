@@ -88,6 +88,46 @@ unsafe extern "C" fn alert(class: Id, _sel: Sel) -> Id {
     objc::arc::autorelease(objc::object::create_instance(class, 0))
 }
 
+/// `+alertWithError:`: the error's description as the message and its
+/// recovery suggestion as the informative text.
+unsafe extern "C" fn alert_with_error(class: Id, sel: Sel, error: Id) -> Id {
+    // SAFETY: the same class.
+    let receiver = unsafe { alert(class, sel) };
+    if receiver.is_null() || error.is_null() {
+        return receiver;
+    }
+    // SAFETY: both getters are `id (id, SEL)` on an `NSError`.
+    let text = |getter: &str| unsafe {
+        let f: unsafe extern "C" fn(Id, Sel) -> Id = std::mem::transmute(objc::msg::entry());
+        f(error, objc::sel::get(getter))
+    };
+    let alert = alert_of(receiver);
+    set(&mut alert.message, text("localizedDescription"));
+    set(&mut alert.informative, text("localizedRecoverySuggestion"));
+    receiver
+}
+
+/// `-[NSResponder presentError:]`, which AppKit passes up the responder chain
+/// to the application to show as an alert. No error here offers a recovery,
+/// so the answer is NO.
+unsafe extern "C" fn present_error(_receiver: Id, _sel: Sel, error: Id) -> u8 {
+    let Some(class) = objc::class::lookup(c"NSAlert") else {
+        return 0;
+    };
+    // SAFETY: the alert class and an `NSError`.
+    unsafe {
+        let alert = alert_with_error(
+            class as *const _ as Id,
+            objc::sel::get("alertWithError:"),
+            error,
+        );
+        if !alert.is_null() {
+            run_modal(alert, objc::sel::get("runModal"));
+        }
+    }
+    0
+}
+
 unsafe extern "C" fn set_message_text(receiver: Id, _sel: Sel, text: Id) {
     set(&mut alert_of(receiver).message, text);
 }
@@ -242,6 +282,11 @@ pub(crate) fn install() {
     let class = objc::class::lookup(c"NSAlert").expect("declared in `classes`");
     class_methods!(class, {
         "alert" => alert, c"@16@0:8";
+        "alertWithError:" => alert_with_error, c"@24@0:8@16";
+    });
+    let responder = objc::class::lookup(c"NSResponder").expect("declared in `classes`");
+    methods!(responder, {
+        "presentError:" => present_error, c"c24@0:8@16";
     });
     methods!(class, {
         "setMessageText:" => set_message_text, c"v24@0:8@16";
