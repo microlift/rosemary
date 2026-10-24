@@ -1,3 +1,5 @@
+use std::sync::LazyLock;
+
 use microlift::arch::x86_64::context::RegisterContext;
 
 use crate::abi::aggregate::{Aggregate, Leaf, Shape};
@@ -203,6 +205,11 @@ fn frame_rate_range_make(
 /// The callback's two 24-byte times are passed on the guest SysV stack,
 /// but by pointer to a caller-owned copy on AAPCS64 hosts.
 pub(crate) fn decompression_output_signature() -> ThunkSignature {
+    static SIGNATURE: LazyLock<ThunkSignature> = LazyLock::new(decompression_output_shape);
+    SIGNATURE.clone()
+}
+
+fn decompression_output_shape() -> ThunkSignature {
     let time = Shape::Struct(Aggregate {
         size: size_of::<CmTime>(),
         align: align_of::<CmTime>(),
@@ -267,12 +274,11 @@ fn decompression_session_create(
     let record = match ctx.r8 {
         0 => None,
         va => Some(OutputCallbackRecord {
-            callback: match mem.read_u64(va, symbol)? {
-                0 => 0,
-                guest => {
-                    callbacks.substitute_typed(symbol, guest, decompression_output_signature())?
-                }
-            },
+            callback: callbacks.substitute_typed(
+                symbol,
+                mem.read_u64(va, symbol)?,
+                decompression_output_signature(),
+            )?,
             refcon: mem.read_u64(va + 8, symbol)?,
         }),
     };
