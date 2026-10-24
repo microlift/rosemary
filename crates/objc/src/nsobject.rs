@@ -382,10 +382,16 @@ unsafe extern "C" fn is_kind_of(receiver: Id, _sel: Sel, class: Id) -> bool {
     mine.chain().any(|c| std::ptr::eq(c, theirs))
 }
 
+/// `[self class] == class`, as Apple has it: sent, so an object that answers
+/// `-class` with a class other than its `isa` (a KVO-notifying object, a
+/// proxy) is a member of the class it answers.
 unsafe extern "C" fn is_member_of(receiver: Id, _sel: Sel, class: Id) -> bool {
-    // SAFETY: an instance.
-    unsafe { crate::object::class_of(receiver) }
-        .is_some_and(|c| std::ptr::eq(c, class as *const Class))
+    // SAFETY: `Class (id, SEL)`.
+    let mine = unsafe {
+        let f: unsafe extern "C" fn(Id, Sel) -> Id = std::mem::transmute(crate::msg::entry());
+        f(receiver, crate::sel::get("class"))
+    };
+    !mine.is_null() && mine == class
 }
 
 unsafe extern "C" fn responds(receiver: Id, _sel: Sel, selector: Sel) -> bool {
