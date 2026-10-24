@@ -484,6 +484,12 @@ fn each_avcc_nal(
                 "invalid AVC NAL unit length or header".into(),
             ));
         }
+        // H.264 reserves these types and assigns no defined payload format.
+        // Other defined NALs (including extension types) remain the decoder's
+        // responsibility; structural validation is not full bitstream parsing.
+        if matches!(packet[cursor] & 31, 0 | 16..=18 | 22..=31) {
+            return Err(Error::InvalidInput("undefined AVC NAL unit type".into()));
+        }
         visit(&packet[cursor..cursor + size])?;
         cursor += size;
     }
@@ -871,64 +877,46 @@ impl VideoDecoder for Decoder {
                 "compressed access unit exceeds queue limit".into(),
             ));
         }
-        if !self.avcc_annexb_fallback
-            && let Some(config) = &self.avcc
-        {
-            each_avcc_nal(packet.bytes, config.nal_length, |_| Ok(()))?;
-        }
-        let annexb = if self.avcc_annexb_fallback {
-            let config = self
-                .avcc
-                .as_ref()
-                .expect("AVCC fallback without configuration");
-            let mut injection = Vec::new();
-            if self.initial_annexb_sets_pending {
-                for nal in config.sps.iter().chain(&config.pps) {
-                    if injection
-                        .len()
+        // Preflight the complete input and its expanded byte count before
+        // allocating a converted AU or copying (possibly large) parameter
+        // sets. Even with a full output queue, malformed input must fail as
+        // InvalidInput rather than Backpressure.
+        let total_len = if let Some(config) = &self.avcc {
+            if self.avcc_annexb_fallback {
+                let mut expanded = 0usize;
+                each_avcc_nal(packet.bytes, config.nal_length, |nal| {
+                    expanded = expanded
                         .checked_add(4)
                         .and_then(|n| n.checked_add(nal.len()))
-                        .is_none_or(|n| n as u64 > INPUT_QUEUE_LIMIT)
-                    {
-                        return Err(Error::InvalidInput(
-                            "parameter sets exceed queue limit".into(),
-                        ));
-                    }
-                    injection.extend_from_slice(&[0, 0, 0, 1]);
-                    injection.extend_from_slice(nal);
-                }
-            } else if let Some(pps) = &self.pending_pps {
-                injection.extend_from_slice(pps);
-            }
-            let aud_len = leading_avcc_aud(packet.bytes, config.nal_length)?;
-            let mut converted = Vec::new();
-            avcc_to_annexb(packet.bytes, config.nal_length, &mut converted)?;
-            if !injection.is_empty() {
-                let split = aud_len.map_or(0, |n| n + 4);
-                if converted
+                        .filter(|&n| n as u64 <= INPUT_QUEUE_LIMIT)
+                        .ok_or_else(|| {
+                            Error::InvalidInput("expanded AVC packet exceeds queue limit".into())
+                        })?;
+                    Ok(())
+                })?;
+                let injected = if self.initial_annexb_sets_pending {
+                    config
+                        .sps
+                        .iter()
+                        .chain(&config.pps)
+                        .try_fold(0usize, |sum, nal| {
+                            sum.checked_add(4).and_then(|n| n.checked_add(nal.len()))
+                        })
+                } else {
+                    Some(self.pending_pps.as_ref().map_or(0, Vec::len))
+                };
+                expanded.checked_add(injected.ok_or_else(|| {
+                    Error::InvalidInput("AVC parameter sets exceed queue limit".into())
+                })?)
+            } else {
+                each_avcc_nal(packet.bytes, config.nal_length, |_| Ok(()))?;
+                packet
+                    .bytes
                     .len()
-                    .checked_add(injection.len())
-                    .is_none_or(|n| n as u64 > INPUT_QUEUE_LIMIT)
-                {
-                    return Err(Error::InvalidInput(
-                        "expanded AVC access unit exceeds queue limit".into(),
-                    ));
-                }
-                converted.splice(split..split, injection);
+                    .checked_add(self.pending_pps.as_ref().map_or(0, Vec::len))
             }
-            Some(converted)
         } else {
-            None
-        };
-        let extra = if annexb.is_some() {
-            0
-        } else {
-            self.pending_pps.as_ref().map_or(0, Vec::len)
-        };
-        let total_len = if let Some(bytes) = &annexb {
-            Some(bytes.len())
-        } else {
-            packet.bytes.len().checked_add(extra)
+            Some(packet.bytes.len())
         };
         if packet.id == u64::MAX
             || packet.duration_ns == Some(u64::MAX)
@@ -953,10 +941,30 @@ impl VideoDecoder for Decoder {
         {
             return Err(Error::Backpressure);
         }
-        // The caller owns input access units. GStreamer gets its own buffer;
-        // decoded GstSample allocations remain owned until callback completion.
-        let compressed = if let Some(bytes) = annexb {
-            bytes
+        // The caller owns input access units. GStreamer receives its own
+        // buffer only after structural, size, time and backpressure checks.
+        let compressed = if self.avcc_annexb_fallback {
+            let config = self
+                .avcc
+                .as_ref()
+                .expect("AVCC fallback without configuration");
+            let mut injection = Vec::new();
+            if self.initial_annexb_sets_pending {
+                for nal in config.sps.iter().chain(&config.pps) {
+                    injection.extend_from_slice(&[0, 0, 0, 1]);
+                    injection.extend_from_slice(nal);
+                }
+            } else if let Some(pps) = &self.pending_pps {
+                injection.extend_from_slice(pps);
+            }
+            let aud_len = leading_avcc_aud(packet.bytes, config.nal_length)?;
+            let mut converted = Vec::with_capacity(total_len.unwrap());
+            avcc_to_annexb(packet.bytes, config.nal_length, &mut converted)?;
+            if !injection.is_empty() {
+                let split = aud_len.map_or(0, |n| n + 4);
+                converted.splice(split..split, injection);
+            }
+            converted
         } else {
             let mut bytes = Vec::with_capacity(total_len.unwrap());
             if let Some(pps) = &self.pending_pps {
@@ -1144,9 +1152,16 @@ mod tests {
                 .unwrap();
             checksums.push(format!("{hash:016x}"));
         }
-        let mut sorted = identities;
-        sorted.sort_unstable();
-        assert_eq!(sorted, (100..160).collect::<Vec<_>>());
+        // Match source AU identities to independently pinned presentation-
+        // order luma hashes, not merely to an unordered set of frame IDs.
+        const EXPECTED_PRESENTATION_IDS: [u64; 60] = [
+            100, 102, 103, 101, 105, 106, 104, 108, 109, 107, 111, 112, 110, 114, 115, 113, 117,
+            118, 116, 119, 120, 122, 123, 121, 124, 126, 125, 128, 127, 129, 131, 130, 132, 134,
+            133, 136, 135, 138, 139, 137, 140, 142, 143, 141, 145, 144, 147, 146, 149, 148, 150,
+            152, 151, 153, 154, 155, 157, 156, 158, 159,
+        ];
+        assert_eq!(identities, EXPECTED_PRESENTATION_IDS);
+
         let golden = expected.lines().collect::<Vec<_>>();
         assert_eq!(checksums.len(), golden.len());
         for (i, hash) in checksums.iter().enumerate() {
@@ -2159,6 +2174,45 @@ mod tests {
     }
 
     #[test]
+    fn undefined_avcc_nal_types_are_rejected_before_submission() {
+        for width in [1_u8, 2, 4] {
+            for nal_type in [0_u8, 16, 17, 18, 22, 23, 24, 31] {
+                let mut packet = vec![0; usize::from(width)];
+                packet[usize::from(width) - 1] = 1;
+                packet.push(nal_type);
+                assert!(matches!(
+                    each_avcc_nal(&packet, width, |_| Ok(())),
+                    Err(Error::InvalidInput(_))
+                ));
+                let mut annexb = Vec::new();
+                assert!(matches!(
+                    avcc_to_annexb(&packet, width, &mut annexb),
+                    Err(Error::InvalidInput(_))
+                ));
+                assert!(annexb.is_empty());
+                // A structurally valid first NAL does not exempt a later
+                // undefined NAL header from validation.
+                let mut second = vec![0; usize::from(width)];
+                second[usize::from(width) - 1] = 1;
+                second.push(0x65);
+                second.extend_from_slice(&packet);
+                assert!(matches!(
+                    each_avcc_nal(&second, width, |_| Ok(())),
+                    Err(Error::InvalidInput(_))
+                ));
+            }
+            // Defined extension NAL types must not be mistaken for reserved
+            // values; the decoder is responsible for semantic support.
+            for nal_type in [1_u8, 6, 9, 13, 15, 19, 20, 21] {
+                let mut packet = vec![0; usize::from(width)];
+                packet[usize::from(width) - 1] = 1;
+                packet.push(nal_type);
+                each_avcc_nal(&packet, width, |_| Ok(())).unwrap();
+            }
+        }
+    }
+
+    #[test]
     fn malformed_avcc_nal_chain_does_not_poison_decoder() {
         let (sets, valid) =
             avcc_idr_fixture(include_bytes!("../tests/fixtures/pps_qp18_64x64.h264"));
@@ -2170,6 +2224,8 @@ mod tests {
             vec![0, 0, 0, 1, 0x65, 0, 0, 0, 10, 0x61],
             vec![0, 0, 0, 1, 0x65, 0, 0],
             vec![0, 0, 0, 1, 0xe5], // forbidden_zero_bit
+            vec![0, 0, 0, 1, 0x00], // unspecified type 0
+            vec![0, 0, 0, 1, 0x1f], // unspecified type 31
         ];
         for (i, bytes) in bad.iter().enumerate() {
             assert!(
@@ -2695,8 +2751,9 @@ mod tests {
                 })
                 .unwrap();
         }
-        ids.sort_unstable();
-        assert_eq!(ids, (1..=8).collect::<Vec<_>>());
+        // Display-order B-frame identity must not be reassigned by repeated
+        // PTS values or the GStreamer parser/converter chain.
+        assert_eq!(ids, [1, 3, 4, 2, 6, 7, 5, 8]);
         assert!(decoder.pull(Duration::ZERO).unwrap().is_none());
         // GStreamer marks its appsink EOS asynchronously even after the last
         // sample has been returned. Poll for terminal EOS; an empty output

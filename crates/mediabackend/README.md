@@ -40,8 +40,10 @@ NV12, I420 and BGRA outputs.
   Unsupported AVC profiles and SPS extension NALs fail explicitly. The
   sample NAL-prefix width is validated separately (1, 2, or 4 bytes). The
   ordinary AVCC path validates every length-prefixed NAL without conversion
-  or an extra allocation; malformed prefixes/headers fail recoverably as
-  `InvalidInput` before reaching the asynchronous decoder. Unusually large
+  or an extra allocation; truncated prefixes/payloads, forbidden header bits,
+  and undefined/reserved NAL types fail recoverably as `InvalidInput` before
+  reaching the asynchronous decoder. This is structural validation, not a
+  full H.264 bitstream syntax or decoder-capability check. Unusually large
   initial parameter sets use a bounds-checked Annex-B fallback to avoid a
   GStreamer codec-data parsing limitation while preserving sample identities
   and backpressure.
@@ -58,7 +60,10 @@ NV12, I420 and BGRA outputs.
   Annex-B fallback reserves at least five bytes for a minimal first NAL
   after its initial parameter-set injection. Access units larger than 8 MiB
   are rejected; within that bound, queue backpressure is recoverable: drain output
-  and retry the **same** unconsumed input, rather than dropping frames.
+  and retry the **same** unconsumed input, rather than dropping frames. AVCC
+  fallback submissions validate the whole NAL chain and calculate the expanded
+  byte count before testing queue saturation; no parameter-set injection or
+  Annex-B conversion allocation occurs on a backpressured submission.
 - End-of-stream is terminal and distinct from a temporarily empty output
   queue. `is_drained()` returns `Result<bool, Error>` and observes pending
   fatal bus errors before declaring successful completion. No Apple framework
@@ -78,12 +83,13 @@ cargo run --release -p mediabackend --features gstreamer --example h264_stream -
 
 The regression fixtures are stored under this crate, so no other feature PR is
 required to test decoding. Tests cover B-frame reference identity with repeated
-PTS, a pinned 60-picture three-GOP pixel reference, colorimetry, range,
+PTS, pinned exact presentation-order frame IDs alongside a 60-picture
+three-GOP pixel reference, colorimetry, range,
 NV12/I420/BGRA lifetime, same-SPS PPS reconfiguration, 256-frame bounded queue
 backpressure, terminal EOS, missing-IDR recovery, immediate single-IDR output
 without EOS, retained fatal bus errors including after EOS, decoded timing,
-BT.2020/PQ and BT.2020/HLG stream metadata, malformed direct AVCC NAL-chain
-recovery, below/above 8 MiB aggregate SPS/PPS boundaries with atomic rejected
+BT.2020/PQ and BT.2020/HLG stream metadata, malformed or undefined
+AVCC NAL headers and direct NAL-chain recovery, below/above 8 MiB aggregate SPS/PPS boundaries with atomic rejected
 reconfiguration, anamorphic/interlaced metadata, per-buffer field flags with explicit unsupported
 interlace-mode rejection, MPEG-2 versus JPEG chroma siting, negative source DTS
 and decoded signed PTS through B-frame reordering, one-byte AVCC prefixes with
