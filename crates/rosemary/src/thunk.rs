@@ -38,6 +38,8 @@ pub struct Thunk {
     pub host: u64,
     /// Keeps the JIT module, and therefore `host`'s pages, mapped.
     _backend: CraneliftBackend,
+    /// Typed callbacks keep their signature at a stable address until this thunk dies.
+    _signature: Option<Box<ThunkSignature>>,
 }
 
 // SAFETY: as for `Translation` in `crate::cache`, and for the same reason. A
@@ -542,8 +544,11 @@ fn build_typed_with_entry(
         }
     }
 
-    let desc = Box::leak(Box::new(signature)) as *const ThunkSignature;
-    let desc = b.ins().iconst(types::I64, desc as usize as i64);
+    let descriptor = Box::new(signature);
+    let desc = b.ins().iconst(
+        types::I64,
+        (&*descriptor as *const ThunkSignature) as usize as i64,
+    );
     let spill_ptr = b.ins().stack_addr(types::I64, spill, 0);
     let out_ptr = b.ins().stack_addr(types::I64, out, 0);
     let guest = b.ins().iconst(types::I64, guest_va as i64);
@@ -578,6 +583,7 @@ fn build_typed_with_entry(
         guest: guest_va,
         host: code as usize as u64,
         _backend: backend,
+        _signature: Some(descriptor),
     })
 }
 
@@ -656,6 +662,7 @@ pub(crate) fn build(guest_va: u64) -> Result<Thunk, VmError> {
         guest: guest_va,
         host: code as usize as u64,
         _backend: backend,
+        _signature: None,
     })
 }
 
@@ -866,8 +873,8 @@ unsafe extern "C" fn typed_entry(
     if !vm.program.is_guest_address(guest_va) {
         return;
     }
-    // SAFETY: `desc` was leaked at build time and is never freed; `spill` points
-    // at a slot the calling trampoline just filled with exactly as many words as
+    // SAFETY: `desc` is owned by the VM's thunk and remains valid while the
+    // host can call this trampoline; `spill` points at exactly as many words as
     // `desc.host_leaves` flattens to.
     let (signature, spill) = unsafe {
         let signature = &*desc;
@@ -1166,6 +1173,15 @@ mod callback_abi_tests {
             capture_spill as *const () as usize as u64,
         )
         .expect("native ABI supports the callback");
+        let owned_descriptor = std::ptr::from_ref(thunk._signature.as_deref().unwrap());
+        let mut table = ThunkTable::new();
+        let host = table.insert_typed(signature.clone(), thunk);
+        let stored = &table.typed_by_guest[&0x1234][0].1;
+        assert_eq!(
+            owned_descriptor,
+            std::ptr::from_ref(stored._signature.as_deref().unwrap())
+        );
+        assert_eq!(table.typed_host_for(0x1234, &signature), Some(host));
         let first = NativeTime {
             value: 0x0123_4567_89ab_cdef,
             timescale: 600,
@@ -1182,7 +1198,7 @@ mod callback_abi_tests {
         // SAFETY: the generated trampoline declares precisely this host
         // callback signature, with two native CMTime-layout arguments.
         let call: extern "C" fn(u64, u64, i32, u32, u64, NativeTime, NativeTime) =
-            unsafe { std::mem::transmute(thunk.host as usize) };
+            unsafe { std::mem::transmute(host as usize) };
         call(11, 22, -33, 44, 55, first, second);
         let captured = CAPTURED.with(|slot| slot.borrow().clone());
         assert_eq!(captured[0], 11);
@@ -1222,5 +1238,157 @@ mod callback_abi_tests {
         assert_eq!(table.guest_for(generic_host), Some(0x1234));
         assert_eq!(table.len(), 2);
         assert_eq!(table.view().count, 2);
+    }
+
+    #[test]
+    fn typed_cache_distinguishes_exact_signatures_for_one_guest_address() {
+        let original = crate::shims::coremedia::decompression_output_signature();
+        let mut changed_params = original.params.clone();
+        // A different signedness is still a different callback prototype even
+        // if the two machine register layouts happen to be identical.
+        changed_params[3] = Shape::Scalar(T::SignedWord);
+        let changed = ThunkSignature::new(changed_params, None).unwrap();
+        let mut table = ThunkTable::new();
+        let first = table.insert_typed(
+            original.clone(),
+            build_typed(0x1234, original.clone()).unwrap(),
+        );
+        assert_eq!(table.typed_host_for(0x1234, &original), Some(first));
+        assert_eq!(table.typed_host_for(0x1234, &original.clone()), Some(first));
+        assert_eq!(table.typed_host_for(0x1234, &changed), None);
+        let second = table.insert_typed(
+            changed.clone(),
+            build_typed(0x1234, changed.clone()).unwrap(),
+        );
+        assert_ne!(first, second);
+        assert_eq!(table.typed_host_for(0x1234, &changed), Some(second));
+        assert_eq!(table.guest_for(first), Some(0x1234));
+        assert_eq!(table.guest_for(second), Some(0x1234));
+        assert_eq!(table.len(), 2);
+    }
+
+    thread_local! {
+        static REENTER_THUNK: Cell<u64> = const { Cell::new(0) };
+        static REENTER_DEPTH: Cell<usize> = const { Cell::new(0) };
+        static REENTER_SPILLS: std::cell::RefCell<Vec<(usize, Vec<u64>)>> = const {
+            std::cell::RefCell::new(Vec::new())
+        };
+    }
+
+    unsafe extern "C" fn capture_reentrant(
+        _guest: u64,
+        _desc: *const ThunkSignature,
+        spill: *const u64,
+        _out: *mut u8,
+    ) {
+        // SAFETY: the seven-argument callback always has eleven spill words.
+        let words = unsafe { std::slice::from_raw_parts(spill, 11) }.to_vec();
+        let depth = REENTER_DEPTH.with(|slot| slot.replace(slot.get() + 1));
+        if depth == 0 {
+            let host = REENTER_THUNK.with(Cell::get);
+            // SAFETY: this is the same typed trampoline currently executing.
+            let call: extern "C" fn(u64, u64, i32, u32, u64, NativeTime, NativeTime) =
+                unsafe { std::mem::transmute(host as usize) };
+            let time = NativeTime {
+                value: 111,
+                timescale: 222,
+                flags: 333,
+                epoch: 444,
+            };
+            call(10, 20, 30, 40, 50, time, time);
+        }
+        REENTER_SPILLS.with(|slot| slot.borrow_mut().push((depth, words)));
+        REENTER_DEPTH.with(|slot| slot.set(depth));
+    }
+
+    #[test]
+    fn typed_callback_trampoline_can_reenter_itself_without_clobbering_spills() {
+        let signature = crate::shims::coremedia::decompression_output_signature();
+        let thunk = build_typed_with_entry(
+            0x1234,
+            signature,
+            capture_reentrant as *const () as usize as u64,
+        )
+        .unwrap();
+        REENTER_THUNK.with(|slot| slot.set(thunk.host));
+        REENTER_SPILLS.with(|slot| slot.borrow_mut().clear());
+        // SAFETY: the generated thunk declares this exact native callback ABI.
+        let call: extern "C" fn(u64, u64, i32, u32, u64, NativeTime, NativeTime) =
+            unsafe { std::mem::transmute(thunk.host as usize) };
+        let outer = NativeTime {
+            value: 555,
+            timescale: 666,
+            flags: 777,
+            epoch: 888,
+        };
+        call(1, 2, 3, 4, 5, outer, outer);
+        let samples = REENTER_SPILLS.with(|slot| slot.borrow().clone());
+        assert_eq!(samples.len(), 2);
+        assert_eq!(samples[0].0, 1);
+        assert_eq!(samples[1].0, 0);
+        assert_eq!(&samples[0].1[..5], &[10, 20, 30, 40, 50]);
+        assert_eq!(&samples[1].1[..5], &[1, 2, 3, 4, 5]);
+        assert_eq!(samples[0].1[5], 111);
+        assert_eq!(samples[0].1[7], 444);
+        assert_eq!(samples[1].1[5], 555);
+        assert_eq!(samples[1].1[7], 888);
+        REENTER_THUNK.with(|slot| slot.set(0));
+    }
+
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    struct NativeTwentyFive([u8; 25]);
+
+    unsafe extern "C" fn capture_partial(
+        _guest: u64,
+        desc: *const ThunkSignature,
+        spill: *const u64,
+        _out: *mut u8,
+    ) {
+        // SAFETY: the trampoline owns the descriptor and the synchronous
+        // spill slot it passes here has exactly the declared word count.
+        let words = unsafe {
+            let count: usize = (*desc).host_leaves.iter().map(Vec::len).sum();
+            std::slice::from_raw_parts(spill, count)
+        };
+        CAPTURED.with(|slot| *slot.borrow_mut() = words.to_vec());
+    }
+
+    #[test]
+    fn partial_final_aggregate_word_does_not_copy_padding() {
+        let signature = ThunkSignature::new(
+            vec![Shape::Struct(Aggregate {
+                size: 25,
+                align: 1,
+                leaves: vec![crate::abi::aggregate::Leaf {
+                    ty: T::UnsignedByte,
+                    offset: 0,
+                }],
+            })],
+            None,
+        )
+        .unwrap();
+        let thunk = build_typed_with_entry(
+            0x5678,
+            signature.clone(),
+            capture_partial as *const () as usize as u64,
+        )
+        .unwrap();
+        let mut bytes = [0u8; 25];
+        for (i, byte) in bytes.iter_mut().enumerate() {
+            *byte = i as u8 + 1;
+        }
+        // SAFETY: the generated function declares one 25-byte by-value C
+        // aggregate, which the host ABI passes in memory.
+        let call: extern "C" fn(NativeTwentyFive) =
+            unsafe { std::mem::transmute(thunk.host as usize) };
+        call(NativeTwentyFive(bytes));
+        let captured = CAPTURED.with(|slot| slot.borrow().clone());
+        assert_eq!(captured.len(), 4);
+        assert_eq!(captured[3], 25);
+        let mut buffer = [0u8; RESULT_BYTES];
+        let guest = guest_arguments(&signature, &captured, &mut buffer).unwrap();
+        assert_eq!(&guest.stack[..25], &bytes);
+        assert_eq!(&guest.stack[25..], &[0; 7]);
     }
 }
