@@ -1,4 +1,5 @@
 //! Performance/continuity exerciser for software GStreamer H.264 decoding.
+//! Raw Annex-B inputs are split into access units by h264parse, including streams without AUDs.
 //! Usage: cargo run -p mediabackend --features gstreamer --release --example h264_stream -- FILE [THREADS]
 use mediabackend::{AccessUnit, Error, VideoDecoder, VideoFrame, gstreamer::Decoder};
 use std::{
@@ -7,42 +8,93 @@ use std::{
 };
 
 fn access_units(bytes: &[u8]) -> Result<Vec<Vec<u8>>, Error> {
-    let mut starts = Vec::new();
-    let mut index = 0;
-    while index + 3 <= bytes.len() {
-        let width = if bytes[index..].starts_with(&[0, 0, 0, 1]) {
-            4
-        } else if bytes[index..].starts_with(&[0, 0, 1]) {
-            3
-        } else {
-            index += 1;
-            continue;
-        };
-        starts.push((index, width));
-        index += width;
+    use gst::prelude::*;
+    use gst_app::{AppSink, AppSrc};
+
+    if bytes.is_empty() {
+        return Err(Error::InvalidInput("empty H.264 stream".into()));
     }
-    let mut units = Vec::new();
-    for (i, &(pos, width)) in starts.iter().enumerate() {
-        let end = starts.get(i + 1).map_or(bytes.len(), |(p, _)| *p);
-        let nal = &bytes[pos + width..end];
-        if nal.is_empty() {
-            continue;
+    gst::init().map_err(|e| Error::BackendUnavailable(e.to_string()))?;
+    // An AUD is optional in H.264. Delegate picture-boundary recognition to
+    // h264parse instead of treating the whole AUD-less file as one access unit.
+    let pipeline = gst::parse::launch(
+        "appsrc name=compressed format=time is-live=false block=false \
+         caps=video/x-h264,stream-format=byte-stream \
+         ! h264parse ! video/x-h264,alignment=au,stream-format=byte-stream \
+         ! appsink name=parsed sync=false max-buffers=32 drop=false",
+    )
+    .map_err(|e| Error::BackendUnavailable(format!("H.264 parser: {e}")))?
+    .downcast::<gst::Pipeline>()
+    .map_err(|_| Error::BackendUnavailable("invalid parser pipeline".into()))?;
+    let input = pipeline
+        .by_name("compressed")
+        .and_then(|e| e.downcast::<AppSrc>().ok())
+        .ok_or_else(|| Error::BackendUnavailable("missing parser appsrc".into()))?;
+    let output = pipeline
+        .by_name("parsed")
+        .and_then(|e| e.downcast::<AppSink>().ok())
+        .ok_or_else(|| Error::BackendUnavailable("missing parser appsink".into()))?;
+    let result = (|| {
+        pipeline
+            .set_state(gst::State::Playing)
+            .map_err(|e| Error::BackendUnavailable(format!("cannot start parser: {e:?}")))?;
+        input
+            .push_buffer(gst::Buffer::from_mut_slice(bytes.to_vec()))
+            .map_err(|e| Error::Decode(format!("cannot submit H.264 stream: {e:?}")))?;
+        input
+            .end_of_stream()
+            .map_err(|e| Error::Decode(format!("cannot end parsed stream: {e:?}")))?;
+        let bus = pipeline
+            .bus()
+            .ok_or_else(|| Error::Decode("missing parser bus".into()))?;
+        let mut units = Vec::new();
+        let mut deadline = Instant::now() + Duration::from_secs(15);
+        loop {
+            if let Some(msg) = bus.pop_filtered(&[gst::MessageType::Error])
+                && let gst::MessageView::Error(e) = msg.view()
+            {
+                return Err(Error::Decode(format!(
+                    "H.264 parser: {}: {:?}",
+                    e.error(),
+                    e.debug()
+                )));
+            }
+            if let Some(sample) = output.try_pull_sample(gst::ClockTime::from_mseconds(100)) {
+                let buffer = sample
+                    .buffer()
+                    .ok_or_else(|| Error::Decode("parser emitted sample without buffer".into()))?;
+                let mapped = buffer
+                    .map_readable()
+                    .map_err(|_| Error::Decode("cannot map parsed access unit".into()))?;
+                if mapped.as_slice().is_empty() {
+                    return Err(Error::Decode("parser emitted empty access unit".into()));
+                }
+                units.push(mapped.as_slice().to_vec());
+                deadline = Instant::now() + Duration::from_secs(15);
+            } else if output.is_eos() {
+                break;
+            } else if Instant::now() > deadline {
+                return Err(Error::Decode("H.264 parser timed out".into()));
+            }
         }
-        if nal[0] & 31 == 9 {
-            units.push(Vec::new());
+        if let Some(msg) = bus.pop_filtered(&[gst::MessageType::Error])
+            && let gst::MessageView::Error(e) = msg.view()
+        {
+            return Err(Error::Decode(format!(
+                "H.264 parser: {}: {:?}",
+                e.error(),
+                e.debug()
+            )));
         }
         if units.is_empty() {
-            units.push(Vec::new());
+            return Err(Error::InvalidInput(
+                "H.264 stream contains no decodable access units".into(),
+            ));
         }
-        units
-            .last_mut()
-            .unwrap()
-            .extend_from_slice(&bytes[pos..end]);
-    }
-    if units.iter().any(Vec::is_empty) {
-        return Err(Error::InvalidInput("AUD with no access unit".into()));
-    }
-    Ok(units)
+        Ok(units)
+    })();
+    let _ = pipeline.set_state(gst::State::Null);
+    result
 }
 
 fn receive(
@@ -124,4 +176,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         decoded.len() as f64 / elapsed.as_secs_f64()
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_audless_h264_into_individual_pictures() {
+        let data = include_bytes!("../tests/fixtures/audless_10_64x64.h264");
+        assert_eq!(access_units(data).unwrap().len(), 10);
+    }
+
+    #[test]
+    fn parses_aud_delimited_h264_without_losing_pictures() {
+        let data = include_bytes!("../tests/fixtures/anamorphic_4_64x64.h264");
+        assert_eq!(access_units(data).unwrap().len(), 4);
+    }
 }

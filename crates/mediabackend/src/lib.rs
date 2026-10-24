@@ -62,6 +62,23 @@ pub struct FrameCrop {
     pub height: usize,
 }
 
+/// Physical field organization of the decoded video buffer.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum FrameInterlaceMode {
+    Progressive,
+    Interleaved,
+    Mixed,
+    Fields,
+}
+
+/// Display order for interlaced fields. Unknown is distinct from progressive.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum FrameFieldOrder {
+    Unknown,
+    TopFirst,
+    BottomFirst,
+}
+
 #[derive(Clone, Debug)]
 pub struct FrameLayout {
     pub width: usize,
@@ -71,6 +88,10 @@ pub struct FrameLayout {
     pub offsets: Vec<usize>,
     /// None means the full decoded dimensions are visible.
     pub crop: Option<FrameCrop>,
+    /// Pixel (sample) aspect ratio, reduced to a positive numerator/denominator.
+    pub pixel_aspect_ratio: (u32, u32),
+    pub interlace_mode: FrameInterlaceMode,
+    pub field_order: FrameFieldOrder,
     pub matrix: ColorMatrix,
     pub primaries: ColorPrimaries,
     pub transfer: ColorTransfer,
@@ -145,7 +166,9 @@ pub trait VideoDecoder {
     fn end_stream(&mut self) -> Result<(), Error>;
     /// True only after a terminal end-of-stream has passed through all
     /// buffered output. A temporary empty poll is not equivalent to EOS.
-    fn is_drained(&self) -> bool;
+    /// Returns an error if decoding failed, including a previously unobserved
+    /// fatal bus error. True means successful terminal EOS.
+    fn is_drained(&mut self) -> Result<bool, Error>;
 }
 
 #[cfg(feature = "gstreamer")]

@@ -13,15 +13,20 @@ NV12, I420 and BGRA outputs.
   identity across H.264 B-frame reordering. `VideoFrame::with_bytes` maps the
   original GStreamer sample without an intermediate per-plane owned `Vec`.
 - Frame layout carries validated strides/offsets, per-plane mapped spans,
-  pixel format, optional crop, and color information. Unknown color range is
-  distinct from limited range. Frame timing comes from decoded buffers; output
-  DTS may be absent even when the compressed input provided it.
-- AVCC input accepts SPS/PPS configuration and compatible live PPS changes;
-  Annex-B access-unit input is supported. Access units larger than 8 MiB are
+  pixel format, optional crop, sample aspect ratio, negotiated interlace mode
+  and field order, and color information. Unknown color range is distinct from
+  limited range. Frame timing comes from decoded buffers; output DTS may be
+  absent even when the compressed input provided it.
+- AVCC input accepts SPS/PPS configuration and compatible live PPS changes.
+  A changed PPS is carried in-band with the next accepted access unit rather
+  than resetting the H.264 reference state through a caps update. Annex-B
+  access-unit input is supported. Access units larger than 8 MiB are
   rejected; within that bound, queue backpressure is recoverable: drain output
   and retry the **same** unconsumed input, rather than dropping frames.
 - End-of-stream is terminal and distinct from a temporarily empty output
-  queue. No Apple framework API is implemented in this crate.
+  queue. `is_drained()` returns `Result<bool, Error>` and observes pending
+  fatal bus errors before declaring successful completion. No Apple framework
+  API is implemented in this crate.
 
 ## Build and test
 
@@ -40,7 +45,12 @@ required to test decoding. Tests cover B-frame reference identity with repeated
 PTS, a pinned 60-picture three-GOP pixel reference, colorimetry, range,
 NV12/I420/BGRA lifetime, same-SPS PPS reconfiguration, 256-frame bounded queue
 backpressure, terminal EOS, missing-IDR recovery, immediate single-IDR output
-without EOS, retained fatal bus errors, decoded timing, and truncated input. The libav element is
+without EOS, retained fatal bus errors including after EOS, decoded timing,
+anamorphic/interlaced metadata, an AUD-less 10-picture stream, and truncated
+input. A 20-picture changed-PPS mid-GOP regression matches independent FFmpeg
+luma hashes, including reference-dependent P frames after reconfiguration.
+The example uses GStreamer's H.264 parser to find access-unit boundaries,
+rather than assuming Access Unit Delimiters are mandatory. The libav element is
 configured with `output-corrupt=false` and `discard-corrupted-frames=true`:
 its unmodified default emitted invalid pre-recovery pictures. The pinned
 60-picture truncated fixture confirms it drops all 19 invalid pictures and
@@ -55,6 +65,8 @@ frame callback requirements, nonterminal delayed-frame waits, and GPU-backed
 CoreVideo/Metal presentation require separate integration. A public GStreamer
 still-frame/segment-done drain emits delayed pictures, but on the tested libav
 backend damages subsequent H.264 predicted-picture content until next IDR.
-Never expose that drain as VideoToolbox-compatible. Auto/frame threading can
+Never expose that drain as VideoToolbox-compatible. Interlace and field-order
+values reflect GStreamer's negotiated output caps; they do not independently
+validate the source stream's intended field presentation. Auto/frame threading can
 improve throughput but increases delayed output and RSS. See later scoped
 integration work for CPU CoreVideo handoff and bundle packaging.

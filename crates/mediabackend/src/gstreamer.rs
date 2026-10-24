@@ -12,8 +12,8 @@ use gst_app::{AppSink, AppSrc};
 const INPUT_QUEUE_LIMIT: u64 = 8 * 1024 * 1024;
 
 use crate::{
-    AccessUnit, ColorMatrix, ColorPrimaries, ColorTransfer, Error, FrameCrop, FrameLayout,
-    PixelFormat, VideoCodec, VideoDecoder, VideoFrame,
+    AccessUnit, ColorMatrix, ColorPrimaries, ColorTransfer, Error, FrameCrop, FrameFieldOrder,
+    FrameInterlaceMode, FrameLayout, PixelFormat, VideoCodec, VideoDecoder, VideoFrame,
 };
 
 pub struct Decoder {
@@ -25,6 +25,7 @@ pub struct Decoder {
     fatal_error: Option<String>,
     output_format: PixelFormat,
     avcc: Option<AvccConfiguration>,
+    pending_pps: Option<Vec<u8>>,
 }
 
 struct AvccConfiguration {
@@ -41,7 +42,12 @@ impl AvccConfiguration {
         let mut sps = Vec::new();
         let mut pps = Vec::new();
         for &set in sets {
-            if set.first().is_none_or(|b| b & 0x80 != 0) || set.len() > u16::MAX as usize {
+            let max_len = if nal_length == 1 {
+                u8::MAX as usize
+            } else {
+                u16::MAX as usize
+            };
+            if set.first().is_none_or(|b| b & 0x80 != 0) || set.len() > max_len {
                 return Err(Error::InvalidInput("malformed AVCC parameter set".into()));
             }
             match set[0] & 31 {
@@ -225,11 +231,18 @@ impl Decoder {
                 "incompatible H.264 SPS or NAL-length update".into(),
             ));
         }
-        let caps = incoming
-            .caps()
-            .parse::<gst::Caps>()
-            .map_err(|e| Error::InvalidInput(format!("invalid AVCC caps: {e}")))?;
-        self.input.set_caps(Some(&caps));
+        // Changing appsrc codec_data caps inside a reference-dependent GOP
+        // flushes gst-libav's H.264 reference pictures. Carry changed PPS NALs
+        // in-band with the next submitted AU, preserving pipeline continuity.
+        if incoming.pps != original.pps {
+            let mut pending = Vec::new();
+            for pps in &incoming.pps {
+                let len = (pps.len() as u32).to_be_bytes();
+                pending.extend_from_slice(&len[4 - nal_length as usize..]);
+                pending.extend_from_slice(pps);
+            }
+            self.pending_pps = Some(pending);
+        }
         self.avcc = Some(incoming);
         self.check_error()
     }
@@ -291,6 +304,7 @@ impl Decoder {
             fatal_error: None,
             output_format,
             avcc: None,
+            pending_pps: None,
         })
     }
 
@@ -351,6 +365,30 @@ impl Decoder {
                 "decoder negotiated an unrequested pixel format".into(),
             ));
         }
+        let par = info.par();
+        let pixel_aspect_ratio = match (par.numer(), par.denom()) {
+            (n, d) if n > 0 && d > 0 => (n as u32, d as u32),
+            _ => return Err(Error::Decode("invalid pixel aspect ratio".into())),
+        };
+        let interlace_mode = match info.interlace_mode() {
+            gst_video::VideoInterlaceMode::Progressive => FrameInterlaceMode::Progressive,
+            gst_video::VideoInterlaceMode::Interleaved => FrameInterlaceMode::Interleaved,
+            gst_video::VideoInterlaceMode::Mixed => FrameInterlaceMode::Mixed,
+            gst_video::VideoInterlaceMode::Fields => FrameInterlaceMode::Fields,
+            other => {
+                return Err(Error::Decode(format!(
+                    "unsupported interlace mode {other:?}"
+                )));
+            }
+        };
+        let field_order = match info.field_order() {
+            gst_video::VideoFieldOrder::Unknown => FrameFieldOrder::Unknown,
+            gst_video::VideoFieldOrder::TopFieldFirst => FrameFieldOrder::TopFirst,
+            gst_video::VideoFieldOrder::BottomFieldFirst => FrameFieldOrder::BottomFirst,
+            other => {
+                return Err(Error::Decode(format!("unsupported field order {other:?}")));
+            }
+        };
         let color = info.colorimetry();
         let matrix = match color.matrix() {
             gst_video::VideoColorMatrix::Bt601 => ColorMatrix::Bt601,
@@ -376,6 +414,9 @@ impl Decoder {
                     height: height as usize,
                 }
             }),
+            pixel_aspect_ratio,
+            interlace_mode,
+            field_order,
             matrix,
             primaries: match color.primaries() {
                 gst_video::VideoColorPrimaries::Bt709 => ColorPrimaries::Bt709,
@@ -449,13 +490,15 @@ impl VideoDecoder for Decoder {
         if self.completed {
             return Err(Error::EndOfStream);
         }
+        let extra = self.pending_pps.as_ref().map_or(0, Vec::len);
+        let total_len = packet.bytes.len().checked_add(extra);
         if packet.id == u64::MAX
             || [packet.pts_ns, packet.dts_ns, packet.duration_ns]
                 .into_iter()
                 .flatten()
                 .any(|v| v == u64::MAX)
             || packet.bytes.is_empty()
-            || packet.bytes.len() as u64 > INPUT_QUEUE_LIMIT
+            || total_len.is_none_or(|len| len as u64 > INPUT_QUEUE_LIMIT)
         {
             return Err(Error::InvalidInput(
                 "invalid packet identifier or length".into(),
@@ -468,14 +511,19 @@ impl VideoDecoder for Decoder {
             || self
                 .input
                 .current_level_bytes()
-                .saturating_add(packet.bytes.len() as u64)
+                .saturating_add(total_len.unwrap() as u64)
                 > INPUT_QUEUE_LIMIT
         {
             return Err(Error::Backpressure);
         }
         // The caller owns input access units. GStreamer gets its own buffer;
         // decoded GstSample allocations remain owned until callback completion.
-        let mut buffer = gst::Buffer::from_mut_slice(packet.bytes.to_vec());
+        let mut compressed = Vec::with_capacity(total_len.unwrap());
+        if let Some(pps) = &self.pending_pps {
+            compressed.extend_from_slice(pps);
+        }
+        compressed.extend_from_slice(packet.bytes);
+        let mut buffer = gst::Buffer::from_mut_slice(compressed);
         let writable = buffer
             .get_mut()
             .ok_or_else(|| Error::Decode("GstBuffer is not writable".into()))?;
@@ -491,6 +539,7 @@ impl VideoDecoder for Decoder {
         if let Err(e) = self.input.push_buffer(buffer) {
             return Err(self.latch_error(format!("cannot submit H.264 access unit: {e:?}")));
         }
+        self.pending_pps = None;
         self.check_error()
     }
 
@@ -521,8 +570,9 @@ impl VideoDecoder for Decoder {
         self.check_error()
     }
 
-    fn is_drained(&self) -> bool {
-        self.fatal_error.is_none() && self.completed && self.output.is_eos()
+    fn is_drained(&mut self) -> Result<bool, Error> {
+        self.check_error()?;
+        Ok(self.completed && self.output.is_eos())
     }
 }
 
@@ -775,7 +825,7 @@ mod tests {
                 _ => panic!("decoder operation did not retain first fatal error"),
             }
         }
-        assert!(!decoder.is_drained());
+        assert!(matches!(decoder.is_drained(), Err(Error::Decode(_))));
     }
 
     #[test]
@@ -974,10 +1024,90 @@ mod tests {
         assert_eq!(received, (0..total).collect::<Vec<_>>());
     }
 
+    fn aud_delimited_units(stream: &[u8]) -> Vec<&[u8]> {
+        let starts: Vec<_> = stream
+            .windows(5)
+            .enumerate()
+            .filter_map(|(offset, bytes)| {
+                (bytes[..4] == [0, 0, 0, 1] && bytes[4] & 31 == 9).then_some(offset)
+            })
+            .collect();
+        assert_eq!(starts.first(), Some(&0));
+        starts
+            .iter()
+            .enumerate()
+            .map(|(i, &start)| {
+                let end = starts.get(i + 1).copied().unwrap_or(stream.len());
+                &stream[start..end]
+            })
+            .collect()
+    }
+
+    #[test]
+    fn anamorphic_h264_preserves_pixel_aspect_ratio() {
+        let data = include_bytes!("../tests/fixtures/anamorphic_4_64x64.h264");
+        let units = aud_delimited_units(data);
+        assert_eq!(units.len(), 4);
+        let mut decoder = Decoder::h264_nv12(1).unwrap();
+        for (index, bytes) in units.iter().enumerate() {
+            decoder
+                .submit(AccessUnit {
+                    id: index as u64,
+                    bytes,
+                    pts_ns: Some(index as u64 * 100_000_000),
+                    dts_ns: None,
+                    duration_ns: Some(100_000_000),
+                })
+                .unwrap();
+        }
+        decoder.end_stream().unwrap();
+        for index in 0..4 {
+            let frame = decoder.pull(Duration::from_secs(2)).unwrap().unwrap();
+            assert_eq!(frame.id(), index);
+            assert_eq!(frame.layout().pixel_aspect_ratio, (4, 3));
+            assert_eq!(
+                frame.layout().interlace_mode,
+                FrameInterlaceMode::Progressive
+            );
+        }
+    }
+
+    #[test]
+    fn interlaced_h264_preserves_field_order_and_mode() {
+        let data = include_bytes!("../tests/fixtures/interlaced_tff_4_64x64.h264");
+        let units = aud_delimited_units(data);
+        assert_eq!(units.len(), 4);
+        let mut decoder = Decoder::h264_nv12(1).unwrap();
+        for (index, bytes) in units.iter().enumerate() {
+            decoder
+                .submit(AccessUnit {
+                    id: index as u64,
+                    bytes,
+                    pts_ns: Some(index as u64 * 100_000_000),
+                    dts_ns: None,
+                    duration_ns: Some(100_000_000),
+                })
+                .unwrap();
+        }
+        decoder.end_stream().unwrap();
+        for index in 0..4 {
+            let frame = decoder.pull(Duration::from_secs(2)).unwrap().unwrap();
+            assert_eq!(frame.id(), index);
+            assert_eq!(frame.layout().pixel_aspect_ratio, (1, 1));
+            assert_eq!(
+                frame.layout().interlace_mode,
+                FrameInterlaceMode::Interleaved
+            );
+            // Match the negotiated output caps, which are BFF on this
+            // GStreamer/FFmpeg pipeline even though FFprobe reports TFF input.
+            assert_eq!(frame.layout().field_order, FrameFieldOrder::BottomFirst);
+        }
+    }
+
     #[test]
     fn terminal_eos_and_clock_sentinels_are_not_silent() {
         let mut decoder = Decoder::h264_nv12(1).unwrap();
-        assert!(!decoder.is_drained());
+        assert!(!decoder.is_drained().unwrap());
         let data = include_bytes!("../tests/fixtures/red_32x32.h264");
         for (id, pts, dts, duration) in [
             (u64::MAX, None, None, None),
@@ -996,7 +1126,7 @@ mod tests {
                 Err(Error::InvalidInput(_))
             ));
         }
-        assert!(!decoder.is_drained());
+        assert!(!decoder.is_drained().unwrap());
         decoder
             .submit(AccessUnit {
                 id: 7,
@@ -1010,7 +1140,45 @@ mod tests {
         let frame = decoder.pull(Duration::from_secs(3)).unwrap().unwrap();
         assert_eq!(frame.id(), 7);
         assert!(decoder.pull(Duration::from_secs(1)).unwrap().is_none());
-        assert!(decoder.is_drained());
+        assert!(decoder.is_drained().unwrap());
+    }
+
+    #[test]
+    fn fatal_bus_error_after_eos_prevents_successful_drain() {
+        let mut decoder = Decoder::h264_nv12(1).unwrap();
+        let bytes = include_bytes!("../tests/fixtures/red_32x32.h264");
+        decoder
+            .submit(AccessUnit {
+                id: 7,
+                bytes,
+                pts_ns: Some(0),
+                dts_ns: None,
+                duration_ns: None,
+            })
+            .unwrap();
+        decoder.end_stream().unwrap();
+        let frame = decoder.pull(Duration::from_secs(2)).unwrap().unwrap();
+        assert_eq!(frame.id(), 7);
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while !decoder.is_drained().unwrap() && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert!(decoder.is_drained().unwrap());
+        decoder
+            .pipeline
+            .bus()
+            .unwrap()
+            .post(
+                gst::message::Error::builder(gst::CoreError::Failed, "post-eos injected fatal")
+                    .src(&decoder.pipeline)
+                    .build(),
+            )
+            .unwrap();
+        match decoder.is_drained() {
+            Err(Error::Decode(message)) => assert!(message.contains("post-eos injected fatal")),
+            _ => panic!("drain status ignored a pending fatal bus error"),
+        }
+        assert!(matches!(decoder.is_drained(), Err(Error::Decode(_))));
     }
 
     #[test]
@@ -1022,6 +1190,9 @@ mod tests {
             strides: vec![17, 18],
             offsets: vec![0, 17 * 17],
             crop: None,
+            pixel_aspect_ratio: (1, 1),
+            interlace_mode: FrameInterlaceMode::Progressive,
+            field_order: FrameFieldOrder::Unknown,
             matrix: ColorMatrix::Bt601,
             primaries: ColorPrimaries::Bt709,
             transfer: ColorTransfer::Bt709,
@@ -1148,6 +1319,116 @@ mod tests {
         assert_eq!(headers.len(), 2);
         assert!(!idr.is_empty());
         (headers, idr)
+    }
+
+    #[test]
+    fn changed_midgop_pps_preserves_reference_dependent_output() {
+        // The source has one IDR and nineteen dependent P pictures. At picture
+        // ten its PPS ID 0 is redefined with pic_init_qp_minus26 -3 -> -2.
+        // FFmpeg's independent raw-video decode hashes are pinned below.
+        let stream = include_bytes!("../tests/fixtures/pps_midgop_changed_20_64x64.h264");
+        let golden = include_str!("../tests/fixtures/pps_midgop_changed_20_64x64.luma_fnv64");
+        let units = aud_delimited_units(stream);
+        assert_eq!(units.len(), 20);
+        let mut sps = None;
+        let mut old_pps = None;
+        let mut new_pps = None;
+        let mut avcc = Vec::new();
+
+        for (index, au) in units.iter().enumerate() {
+            let mut starts = Vec::new();
+            let mut cursor = 0;
+            while cursor + 3 <= au.len() {
+                let prefix = if au[cursor..].starts_with(&[0, 0, 0, 1]) {
+                    4
+                } else if au[cursor..].starts_with(&[0, 0, 1]) {
+                    3
+                } else {
+                    cursor += 1;
+                    continue;
+                };
+                starts.push((cursor, prefix));
+                cursor += prefix;
+            }
+            let mut packet = Vec::new();
+            for (nal_index, &(position, prefix)) in starts.iter().enumerate() {
+                let end = starts
+                    .get(nal_index + 1)
+                    .map(|&(next, _)| next)
+                    .unwrap_or(au.len());
+                let nal = &au[position + prefix..end];
+                if nal.is_empty() {
+                    continue;
+                }
+                match nal[0] & 31 {
+                    7 => {
+                        assert_eq!(index, 0);
+                        sps = Some(nal.to_vec());
+                    }
+                    8 => {
+                        if index == 0 {
+                            old_pps = Some(nal.to_vec());
+                        } else {
+                            assert_eq!(index, 10);
+                            new_pps = Some(nal.to_vec());
+                        }
+                    }
+                    1 | 5 => {
+                        packet.extend_from_slice(&(nal.len() as u32).to_be_bytes());
+                        packet.extend_from_slice(nal);
+                    }
+                    _ => {}
+                }
+            }
+            assert!(!packet.is_empty(), "missing slice in picture {index}");
+            avcc.push(packet);
+        }
+        let sps = sps.unwrap();
+        let old_pps = old_pps.unwrap();
+        let new_pps = new_pps.unwrap();
+        assert_eq!(old_pps, [0x68, 0xce, 0x0f, 0xc8]);
+        assert_eq!(new_pps, [0x68, 0xce, 0x0b, 0xc8]);
+        let mut decoder = Decoder::h264_avcc(&[&sps, &old_pps], 4, 1).unwrap();
+
+        for (index, packet) in avcc.iter().enumerate() {
+            if index == 10 {
+                decoder.reconfigure_avcc(&[&sps, &new_pps], 4).unwrap();
+            }
+            decoder
+                .submit(AccessUnit {
+                    id: index as u64 + 200,
+                    bytes: packet,
+                    pts_ns: Some(index as u64 * 100_000_000),
+                    dts_ns: None,
+                    duration_ns: Some(100_000_000),
+                })
+                .unwrap();
+        }
+        decoder.end_stream().unwrap();
+        let mut hashes = Vec::new();
+        for index in 0..20 {
+            let frame = decoder
+                .pull(Duration::from_secs(3))
+                .unwrap()
+                .unwrap_or_else(|| {
+                    panic!("decoder dropped PPS-change picture after {index} outputs")
+                });
+            assert_eq!(frame.id(), index + 200);
+            let hash = frame
+                .with_bytes(|mapped, info| {
+                    let mut hash = 0xcbf29ce484222325_u64;
+                    for row in 0..64 {
+                        let begin = info.offsets[0] + row * info.strides[0];
+                        for &pixel in &mapped[begin..begin + 64] {
+                            hash = (hash ^ u64::from(pixel)).wrapping_mul(0x100000001b3);
+                        }
+                    }
+                    format!("{hash:016x}")
+                })
+                .unwrap();
+            hashes.push(hash);
+        }
+        assert_eq!(hashes, golden.lines().collect::<Vec<_>>());
     }
 
     #[test]
@@ -1315,10 +1596,10 @@ mod tests {
         // sample has been returned. Poll for terminal EOS; an empty output
         // queue alone never establishes decoder completion.
         let deadline = std::time::Instant::now() + Duration::from_secs(2);
-        while !decoder.is_drained() && std::time::Instant::now() < deadline {
+        while !decoder.is_drained().unwrap() && std::time::Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(1));
         }
-        assert!(decoder.is_drained(), "terminal EOS never arrived");
+        assert!(decoder.is_drained().unwrap(), "terminal EOS never arrived");
         assert!(matches!(
             decoder.submit(AccessUnit {
                 id: 9,
