@@ -379,7 +379,29 @@ fn store(receiver: Id, key: Id, value: Option<Value>) {
         return;
     };
     let domain = unsafe { domain(receiver) };
+    // Observers of the receiver, and of the standard defaults' mirror when the
+    // write is to the application's own domain, hear of the change.
+    let mut announced = vec![receiver];
+    let mirror = MIRROR.load(std::sync::atomic::Ordering::Acquire);
+    if mirror != 0 && domain == preferences::current_application() {
+        announced.push(mirror as Id);
+    }
+    for object in &announced {
+        crate::kvo::will_change(*object, key.as_bytes());
+    }
     preferences::set_value(&domain, &key, value);
+    for object in announced.iter().rev() {
+        crate::kvo::did_change(*object, key.as_bytes());
+    }
+}
+
+/// An object that is told of every write to the standard defaults as a change
+/// of the key written - `NSUserDefaultsController`'s `values`, which AppKit makes.
+static MIRROR: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Make `object` hear the standard defaults' writes, as [`MIRROR`] describes.
+pub fn mirror_changes_to(object: Id) {
+    MIRROR.store(object as usize, std::sync::atomic::Ordering::Release);
 }
 
 unsafe extern "C" fn set_object_for_key(receiver: Id, _sel: Sel, value: Id, key: Id) {

@@ -812,6 +812,15 @@ fn clip_by(gs: &mut GState, coverage: sk::Mask) {
     gs.clip = Some(Arc::new(mask));
 }
 
+/// Run `body` with a context's clip as coverage bytes, row by row, and the
+/// row width; `None` when the context is not clipped.
+pub(crate) fn with_clip<R>(context: CFTypeRef, body: impl FnOnce(&[u8], u32) -> R) -> Option<R> {
+    let frame = frame_of(context)?;
+    let state = state_of(context)?;
+    let mask = clip_for(&state.current, frame.width, frame.height)?;
+    Some(body(mask.data(), mask.width()))
+}
+
 /// The device rectangle the clip leaves drawable, as left, top, right,
 /// bottom.
 pub(crate) fn clip_device_bounds(context: CFTypeRef) -> Option<[f64; 4]> {

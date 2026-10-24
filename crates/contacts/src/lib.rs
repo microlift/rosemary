@@ -33,7 +33,14 @@ unsafe extern "C" fn authorization_status_for_entity_type(
 pub fn data_symbols() -> Vec<(String, u64)> {
     bootstrap();
     let class = objc::class::lookup(c"CNContactStore").expect("CNContactStore is registered");
-    vec![
+    let mut symbols = corefoundation::base::string_globals(&[
+        // AddressBook's property names, which a program reads the card of
+        // the current user with.
+        ("_kABEmailProperty", "Email"),
+        ("_kABFirstNameProperty", "First"),
+        ("_kABLastNameProperty", "Last"),
+    ]);
+    symbols.extend(vec![
         (
             "_OBJC_CLASS_$_CNContactStore".to_string(),
             objc::class::ptr(class) as usize as u64,
@@ -42,7 +49,8 @@ pub fn data_symbols() -> Vec<(String, u64)> {
             "_OBJC_METACLASS_$_CNContactStore".to_string(),
             objc::class::ptr(class.metaclass()) as usize as u64,
         ),
-    ]
+    ]);
+    symbols
 }
 
 #[cfg(test)]

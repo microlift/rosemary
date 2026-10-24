@@ -21,6 +21,22 @@ unsafe extern "C" fn shared_font_manager(class: Id, _sel: Sel) -> Id {
     }) as Id
 }
 
+/// `-[NSFontManager fontMenu:]`'s menu, retained.
+static FONT_MENU: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// `-[NSFontManager setFontMenu:]`. Kept for `-fontMenu:`; the items in it
+/// are the application's, and send their own actions.
+unsafe extern "C" fn set_font_menu(_receiver: Id, _sel: Sel, menu: Id) {
+    objc::arc::retain(menu);
+    let old = FONT_MENU.swap(menu as usize, std::sync::atomic::Ordering::AcqRel);
+    objc::arc::release(old as Id);
+}
+
+/// `-[NSFontManager fontMenu:]`. The flag asks for one to be made; none is.
+unsafe extern "C" fn font_menu(_receiver: Id, _sel: Sel, _create: u8) -> Id {
+    FONT_MENU.load(std::sync::atomic::Ordering::Acquire) as Id
+}
+
 /// `-[NSFontManager localizedNameForFamily:face:]`.
 ///
 /// The fallback family exposed by CoreText has no separate localized names.
@@ -296,6 +312,81 @@ unsafe extern "C" fn font_point_size(receiver: Id, _sel: Sel) -> f64 {
     unsafe { crate::coretext::CTFontGetSize(receiver as *const _) }
 }
 
+/// `NSFont`'s metrics, which are CoreText's with AppKit's sign for the
+/// descender: below the baseline is negative.
+unsafe extern "C" fn ascender(receiver: Id, _sel: Sel) -> f64 {
+    // SAFETY: a font dictionary this runtime made.
+    unsafe { crate::coretext::CTFontGetAscent(receiver as *const _) }
+}
+
+unsafe extern "C" fn descender(receiver: Id, _sel: Sel) -> f64 {
+    // SAFETY: as above.
+    -unsafe { crate::coretext::CTFontGetDescent(receiver as *const _) }
+}
+
+unsafe extern "C" fn leading(receiver: Id, _sel: Sel) -> f64 {
+    // SAFETY: as above.
+    unsafe { crate::coretext::CTFontGetLeading(receiver as *const _) }
+}
+
+unsafe extern "C" fn cap_height(receiver: Id, _sel: Sel) -> f64 {
+    // SAFETY: as above.
+    unsafe { crate::coretext::CTFontGetCapHeight(receiver as *const _) }
+}
+
+unsafe extern "C" fn x_height(receiver: Id, _sel: Sel) -> f64 {
+    // SAFETY: as above.
+    unsafe { crate::coretext::CTFontGetXHeight(receiver as *const _) }
+}
+
+unsafe extern "C" fn underline_position(receiver: Id, _sel: Sel) -> f64 {
+    // SAFETY: as above.
+    unsafe { crate::coretext::CTFontGetUnderlinePosition(receiver as *const _) }
+}
+
+unsafe extern "C" fn underline_thickness(receiver: Id, _sel: Sel) -> f64 {
+    // SAFETY: as above.
+    unsafe { crate::coretext::CTFontGetUnderlineThickness(receiver as *const _) }
+}
+
+unsafe extern "C" fn italic_angle(receiver: Id, _sel: Sel) -> f64 {
+    // SAFETY: as above.
+    unsafe { crate::coretext::CTFontGetSlantAngle(receiver as *const _) }
+}
+
+/// `-[NSFontDescriptor fontDescriptorByAddingAttributes:]`.
+unsafe extern "C" fn descriptor_adding(receiver: Id, _sel: Sel, attributes: Id) -> Id {
+    // SAFETY: a descriptor and an attribute dictionary.
+    let made = unsafe {
+        crate::coretext::CTFontDescriptorCreateCopyWithAttributes(
+            receiver as *const _,
+            attributes as *const _,
+        )
+    };
+    objc::arc::autorelease(made as Id)
+}
+
+/// `+[NSFont fontWithDescriptor:size:]`.
+unsafe extern "C" fn font_with_descriptor(_class: Id, _sel: Sel, descriptor: Id, size: f64) -> Id {
+    // SAFETY: a descriptor dictionary; no matrix.
+    let made = unsafe {
+        crate::coretext::CTFontCreateWithFontDescriptor(
+            descriptor as *const _,
+            size,
+            std::ptr::null(),
+        )
+    };
+    objc::arc::autorelease(made as Id)
+}
+
+/// `+[NSFontDescriptor fontDescriptorWithFontAttributes:]`.
+unsafe extern "C" fn descriptor_with_attributes(_class: Id, _sel: Sel, attributes: Id) -> Id {
+    // SAFETY: an attribute dictionary.
+    let made =
+        unsafe { crate::coretext::CTFontDescriptorCreateWithAttributes(attributes as *const _) };
+    objc::arc::autorelease(made as Id)
+}
+
 pub(crate) fn install() {
     let dictionary = objc::class::lookup(c"NSDictionary").expect("declared before its methods");
     methods!(dictionary, {
@@ -303,6 +394,15 @@ pub(crate) fn install() {
         "fontName" => font_name, c"@16@0:8";
         "displayName" => font_family_name, c"@16@0:8";
         "pointSize" => font_point_size, c"d16@0:8";
+        "ascender" => ascender, c"d16@0:8";
+        "descender" => descender, c"d16@0:8";
+        "leading" => leading, c"d16@0:8";
+        "capHeight" => cap_height, c"d16@0:8";
+        "xHeight" => x_height, c"d16@0:8";
+        "underlinePosition" => underline_position, c"d16@0:8";
+        "underlineThickness" => underline_thickness, c"d16@0:8";
+        "italicAngle" => italic_angle, c"d16@0:8";
+        "fontDescriptorByAddingAttributes:" => descriptor_adding, c"@24@0:8@16";
         "fontDescriptor" => font_descriptor, c"@16@0:8";
         "symbolicTraits" => symbolic_traits, c"I16@0:8";
     });
@@ -310,6 +410,7 @@ pub(crate) fn install() {
     let class = objc::class::lookup(c"NSFont").expect("declared before its methods");
     class_methods!(class, {
         "fontWithName:size:" => font_with_name, c"@32@0:8@16d24";
+        "fontWithDescriptor:size:" => font_with_descriptor, c"@32@0:8@16d24";
         "systemFontOfSize:" => system_font_of_size, c"@24@0:8d16";
         "boldSystemFontOfSize:" => system_font_of_size, c"@24@0:8d16";
         "userFontOfSize:" => system_font_of_size, c"@24@0:8d16";
@@ -327,16 +428,36 @@ pub(crate) fn install() {
         "toolTipsFontOfSize:" => tool_tips_font_of_size, c"@24@0:8d16";
     });
 
+    let descriptor = objc::class::lookup(c"NSFontDescriptor").expect("declared before its methods");
+    class_methods!(descriptor, {
+        "fontDescriptorWithFontAttributes:" => descriptor_with_attributes, c"@24@0:8@16";
+    });
+
     let class = objc::class::lookup(c"NSFontManager").expect("declared before its methods");
     class_methods!(class, {
         "sharedFontManager" => shared_font_manager, c"@16@0:8";
     });
     methods!(class, {
         "localizedNameForFamily:face:" => localized_name, c"@32@0:8@16@24";
+        "setFontMenu:" => set_font_menu, c"v24@0:8@16";
+        "fontMenu:" => font_menu, c"@20@0:8c16";
         "fontWithFamily:traits:weight:size:" => font_with_family, c"@48@0:8@16Q24q32d40";
         "availableFontFamilies" => available_font_families, c"@16@0:8";
         "availableMembersOfFontFamily:" => available_members_of_font_family, c"@24@0:8@16";
+        "setSelectedFont:isMultiple:" => set_selected_font, c"v28@0:8@16c24";
+        "selectedFont" => crate::props::get_object, c"@16@0:8";
+        "isMultiple" => crate::props::get_bool, c"c16@0:8";
     });
+}
+
+/// `-setSelectedFont:isMultiple:`, kept for `-selectedFont` and `-isMultiple`.
+/// There is no font panel to show it in.
+unsafe extern "C" fn set_selected_font(receiver: Id, _sel: Sel, font: Id, multiple: u8) {
+    // SAFETY: the property setters, under the getters' keys.
+    unsafe {
+        crate::props::set_retained(receiver, objc::sel::get("setSelectedFont:"), font);
+        crate::props::set_bool(receiver, objc::sel::get("setMultiple:"), multiple);
+    }
 }
 
 #[cfg(test)]

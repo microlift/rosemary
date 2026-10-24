@@ -181,7 +181,9 @@ static VIEW_STORES: Mutex<Option<HashMap<usize, Store>>> = Mutex::new(None);
 #[derive(Default)]
 struct WindowState {
     damage: Rect,
-    placed: Vec<(usize, Rect)>,
+    /// Each view's `(view, clip, rect)`: the rectangle too, since a scrolled
+    /// document moves under a clip that stays where it is.
+    placed: Vec<(usize, Rect, Rect)>,
     holes: Vec<Hole>,
     /// For each layer with an overlay stacked above it, the overlays'
     /// rectangles, which its own presents must leave to the store.
@@ -949,6 +951,7 @@ fn send(receiver: Id, name: &str) {
 /// Draw everything marked for display and present every window that changed.
 pub fn pump() {
     crate::decor::pump();
+    crate::layout::prepare();
     for window in crate::window::all() {
         if !crate::window::is_shown(window) {
             continue;
@@ -1183,9 +1186,22 @@ fn place_view(
         alpha,
     });
     let flipped = crate::view::is_flipped(view);
+    // Subviews' frames are measured from the bounds origin, so a scrolled
+    // clip view moves its document the other way.
+    let shift = crate::view::bounds_origin_of(view);
+    let inner = NSRect {
+        origin: NSPoint {
+            x: in_window.origin.x - shift.x,
+            y: match flipped {
+                true => in_window.origin.y + shift.y,
+                false => in_window.origin.y - shift.y,
+            },
+        },
+        size: in_window.size,
+    };
     // SAFETY: a view this crate made.
     for child in unsafe { crate::view::children(view) } {
-        place_view(child, in_window, flipped, clip, geometry, depth + 1, out);
+        place_view(child, inner, flipped, clip, geometry, depth + 1, out);
     }
 }
 
@@ -1232,7 +1248,10 @@ fn compose_window(window: Id) {
         .iter()
         .flat_map(|p| crate::coreanimation::surface_contents_damage(p.view, p.rect, p.clip))
         .collect();
-    let now: Vec<(usize, Rect)> = placed.iter().map(|p| (p.view as usize, p.clip)).collect();
+    let now: Vec<(usize, Rect, Rect)> = placed
+        .iter()
+        .map(|p| (p.view as usize, p.clip, p.rect))
+        .collect();
     let overlaid: Vec<usize> = OVERLAYS
         .lock()
         .unwrap_or_else(|e| e.into_inner())
@@ -1326,10 +1345,10 @@ fn compose_window(window: Id) {
     }
     if state.placed != now {
         // Where each view was and is, for every one that changed.
-        for (_, rect) in state.placed.iter().filter(|entry| !now.contains(entry)) {
+        for (_, rect, _) in state.placed.iter().filter(|entry| !now.contains(entry)) {
             region = region.union(rect);
         }
-        for (_, rect) in now.iter().filter(|entry| !state.placed.contains(entry)) {
+        for (_, rect, _) in now.iter().filter(|entry| !state.placed.contains(entry)) {
             region = region.union(rect);
         }
         state.placed = now;

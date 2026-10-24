@@ -311,6 +311,21 @@ unsafe extern "C" fn highlight_with_level(receiver: Id, _sel: Sel, level: CGFloa
     make(mix(r), mix(g), mix(b), a)
 }
 
+/// `+colorWithCGColor:`: the same components, as RGBA.
+unsafe extern "C" fn color_with_cg_color(_class: Id, _sel: Sel, color: *const c_void) -> Id {
+    if color.is_null() {
+        return std::ptr::null_mut();
+    }
+    // SAFETY: a `CGColorRef`; this runtime's colours are RGBA, four components.
+    let components = unsafe { crate::cgcontext::CGColorGetComponents(color as _) };
+    if components.is_null() {
+        return std::ptr::null_mut();
+    }
+    // SAFETY: four components, as above.
+    let [red, green, blue, alpha] = unsafe { *(components as *const [f64; 4]) };
+    make(red, green, blue, alpha)
+}
+
 unsafe extern "C" fn color_with_rgba(
     _class: Id,
     _sel: Sel,
@@ -565,6 +580,7 @@ pub(crate) fn install() {
         "colorWithDeviceRed:green:blue:alpha:" => color_with_rgba, c"@48@0:8d16d24d32d40";
         "colorWithSRGBRed:green:blue:alpha:" => color_with_rgba, c"@48@0:8d16d24d32d40";
         "colorWithRed:green:blue:alpha:" => color_with_rgba, c"@48@0:8d16d24d32d40";
+        "colorWithCGColor:" => color_with_cg_color, c"@24@0:8^{CGColor=}16";
         "colorWithCalibratedWhite:alpha:" => color_with_white, c"@32@0:8d16d24";
         "colorWithDeviceWhite:alpha:" => color_with_white, c"@32@0:8d16d24";
         "colorWithWhite:alpha:" => color_with_white, c"@32@0:8d16d24";
@@ -700,4 +716,54 @@ mod tests {
             (0.0, 0.0, 0.0, 1.0)
         );
     }
+}
+
+/// `void NSFrameRect(NSRect)`: a one-point border inside `rect`, in the fill
+/// colour.
+#[allow(non_snake_case)]
+pub extern "C" fn NSFrameRect(rect: NSRect) {
+    NSFrameRectWithWidth(rect, 1.0);
+}
+
+/// `void NSFrameRectWithWidth(NSRect, CGFloat)`.
+#[allow(non_snake_case)]
+pub extern "C" fn NSFrameRectWithWidth(rect: NSRect, width: f64) {
+    let (x, y) = (rect.origin.x, rect.origin.y);
+    let (w, h) = (rect.size.width, rect.size.height);
+    if w <= 0.0 || h <= 0.0 {
+        return;
+    }
+    let edge = |x, y, width, height| NSRect {
+        origin: NSPoint { x, y },
+        size: NSSize { width, height },
+    };
+    let inner = (h - 2.0 * width).max(0.0);
+    NSRectFill(edge(x, y, w, width.min(h)));
+    NSRectFill(edge(x, y + h - width.min(h), w, width.min(h)));
+    NSRectFill(edge(x, y + width, width.min(w), inner));
+    NSRectFill(edge(x + w - width.min(w), y + width, width.min(w), inner));
+}
+
+/// `void NSEraseRect(NSRect)`: white, whatever the fill colour is.
+#[allow(non_snake_case)]
+pub extern "C" fn NSEraseRect(rect: NSRect) {
+    let saved = FILL.with(Cell::get);
+    FILL.with(|fill| fill.set([1.0, 1.0, 1.0, 1.0]));
+    NSRectFill(rect);
+    FILL.with(|fill| fill.set(saved));
+}
+
+/// `void NSRectClip(NSRect)`.
+#[allow(non_snake_case)]
+pub extern "C" fn NSRectClip(rect: NSRect) {
+    crate::bezier::clip_rect(rect);
+}
+
+/// `void NSRectFillUsingOperation(NSRect, NSCompositingOperation)`.
+///
+/// FIXME (ACCURACY): every operation draws source-over, which is right for
+/// `NSCompositingOperationSourceOver`, and for `Copy` with an opaque colour.
+#[allow(non_snake_case)]
+pub extern "C" fn NSRectFillUsingOperation(rect: NSRect, _operation: usize) {
+    NSRectFill(rect);
 }

@@ -206,8 +206,11 @@ pub unsafe extern "C" fn class_getClassMethod(cls: *const c_void, name: Sel) -> 
 ///
 /// `rosemary`'s dispatch caches this value and re-probes it to notice a swizzle,
 /// so it must change exactly when the resolution does. See the crate doc.
+/// Like Apple's, this sends `+initialize` first: a caller that looks up an
+/// `IMP` to call it is about to message the class.
 pub unsafe extern "C" fn class_getMethodImplementation(cls: *const c_void, name: Sel) -> Imp {
     unsafe { class(cls) }.map_or(std::ptr::null(), |c| {
+        crate::class::ensure_initialized(c);
         crate::class::method_implementation(c, name)
     })
 }
@@ -848,9 +851,13 @@ pub unsafe extern "C" fn objc_setAssociatedObject(
     object: Id,
     key: *const c_void,
     value: Id,
-    _policy: usize,
+    policy: usize,
 ) {
-    crate::arc::set_associated(object, key, value);
+    crate::arc::set_associated_with_policy(object, key, value, policy);
+}
+
+pub unsafe extern "C" fn objc_removeAssociatedObjects(object: Id) {
+    crate::arc::remove_associated(object);
 }
 
 pub unsafe extern "C" fn objc_getAssociatedObject(object: Id, key: *const c_void) -> Id {
@@ -946,5 +953,73 @@ mod tests {
         assert_eq!(crate::arc::retain_count(object), 2);
         crate::arc::release(object);
         crate::arc::release(object);
+    }
+
+    /// A retaining association keeps its value alive, and the value is let
+    /// go of when the owner is destroyed - so a later object at the owner's
+    /// address does not inherit it.
+    #[test]
+    fn a_retained_association_lives_and_dies_with_its_owner() {
+        static KEY: u8 = 0;
+        let key = &KEY as *const u8 as *const c_void;
+        let (owner, value) = (object(), object());
+        // SAFETY: two live objects; 0x301 is OBJC_ASSOCIATION_RETAIN.
+        unsafe { objc_setAssociatedObject(owner, key, value, 0x301) };
+        assert_eq!(crate::arc::retain_count(value), 2);
+        assert_eq!(unsafe { objc_getAssociatedObject(owner, key) }, value);
+        // SAFETY: the owner is intact and about to be freed.
+        unsafe { crate::object::destruct_instance(owner) };
+        assert_eq!(crate::arc::retain_count(value), 1);
+        assert!(unsafe { objc_getAssociatedObject(owner, key) }.is_null());
+        crate::arc::release(value);
+    }
+
+    static FORWARD_TARGET: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+    unsafe extern "C" fn answer(_receiver: Id, _sel: crate::sel::Sel) -> usize {
+        42
+    }
+
+    unsafe extern "C" fn target_for(
+        _receiver: Id,
+        _sel: crate::sel::Sel,
+        _wanted: crate::sel::Sel,
+    ) -> Id {
+        FORWARD_TARGET.load(std::sync::atomic::Ordering::Acquire) as Id
+    }
+
+    /// A message the receiver does not answer goes to the object its
+    /// `-forwardingTargetForSelector:` names, and arrives with that object as
+    /// its receiver.
+    #[test]
+    fn a_forwarding_target_receives_the_message() {
+        crate::bootstrap();
+        let root = crate::class::lookup(c"NSObject").unwrap();
+        let answering = crate::class::allocate_pair(Some(root), c"ForwardTestTarget", 0).unwrap();
+        answering.add_method(
+            crate::sel::get("forwardTestAnswer"),
+            answer as crate::class::Imp,
+            c"Q16@0:8",
+        );
+        crate::class::register_pair(answering);
+        let proxy = crate::class::allocate_pair(Some(root), c"ForwardTestProxy", 0).unwrap();
+        proxy.add_method(
+            crate::sel::get("forwardingTargetForSelector:"),
+            target_for as crate::class::Imp,
+            c"@24@0:8:16",
+        );
+        crate::class::register_pair(proxy);
+        let target = crate::object::create_instance(answering, 0);
+        FORWARD_TARGET.store(target as usize, std::sync::atomic::Ordering::Release);
+        let sender = crate::object::create_instance(proxy, 0);
+        // SAFETY: `NSUInteger (id, SEL)`, sent through the trampoline.
+        let got = unsafe {
+            let f: unsafe extern "C" fn(Id, crate::sel::Sel) -> usize =
+                std::mem::transmute(crate::msg::entry());
+            f(sender, crate::sel::get("forwardTestAnswer"))
+        };
+        assert_eq!(got, 42);
+        crate::arc::release(sender);
+        crate::arc::release(target);
     }
 }

@@ -90,6 +90,8 @@ exports::exports! {
         "CFStringCreateMutableCopy" => api::CFStringCreateMutableCopy,
         "CFStringUppercase" => api::CFStringUppercase,
         "CFStringLowercase" => api::CFStringLowercase,
+        "CFStringNormalize" => api::CFStringNormalize,
+        "CFStringTransform" => api::CFStringTransform,
         "CFStringGetCharacterAtIndex" => api::CFStringGetCharacterAtIndex,
         "CFStringGetCharacters" => api::CFStringGetCharacters,
         "CFStringGetCharactersPtr" => api::CFStringGetCharactersPtr,
@@ -198,6 +200,7 @@ exports::exports! {
         "CFRunLoopStop" => api::CFRunLoopStop,
         "CFRunLoopCopyCurrentMode" => api::CFRunLoopCopyCurrentMode,
         "CFRunLoopWakeUp" => api::CFRunLoopWakeUp,
+        "CFRunLoopPerformBlock" => api::CFRunLoopPerformBlock,
         "CFRunLoopSourceCreate" => api::CFRunLoopSourceCreate,
         "CFRunLoopSourceSignal" => api::CFRunLoopSourceSignal,
         "CFRunLoopSourceInvalidate" => api::CFRunLoopSourceInvalidate,
@@ -355,6 +358,21 @@ pub fn data_symbols() -> Vec<(String, u64)> {
         out.push((
             name.to_string(),
             base::global_cell(name, base::interned_name(mode)),
+        ));
+    }
+    for (symbol, text) in [
+        (
+            "_kCFStringTransformStripCombiningMarks",
+            api::TRANSFORM_STRIP_COMBINING_MARKS,
+        ),
+        (
+            "_kCFStringTransformStripDiacritics",
+            api::TRANSFORM_STRIP_DIACRITICS,
+        ),
+    ] {
+        out.push((
+            symbol.to_string(),
+            base::global_cell(symbol, base::interned_name(text)),
         ));
     }
     // The string-valued globals, each of which is exactly its own name without

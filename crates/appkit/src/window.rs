@@ -98,6 +98,12 @@ pub struct Window {
     /// When this window was last ordered front, from [`ORDERED`]: the stacking
     /// order, which creation order is not.
     ordered: u64,
+    /// The view the content view and the titlebar accessories share, retained,
+    /// made when the first accessory is added; null until then. It is what
+    /// AppKit's `NSThemeFrame` is to the content view: its superview.
+    frame_view: Id,
+    /// `-titlebarAccessoryViewControllers`, an owned mutable array or null.
+    accessories: Id,
 }
 
 pub const INSTANCE_SIZE: usize = size_of::<Window>();
@@ -588,12 +594,215 @@ pub fn is_shown(object: Id) -> bool {
     !unsafe { sdl_window(object) }.is_null() && window_of(object).shown != 0
 }
 
-/// A window's content view, for the event pump.
+/// The root of a window's views, for the event pump and drawing: the content
+/// view, or the view it shares with the titlebar accessories.
 pub fn content_view_of(object: Id) -> Id {
-    match object.is_null() {
-        true => std::ptr::null_mut(),
-        false => window_of(object).content_view,
+    if object.is_null() {
+        return std::ptr::null_mut();
     }
+    let window = window_of(object);
+    match window.frame_view.is_null() {
+        true => window.content_view,
+        false => window.frame_view,
+    }
+}
+
+fn send_view(receiver: Id, sel: &str, argument: Id) {
+    // SAFETY: `void (id, SEL, id)`, which every selector this is used with is.
+    unsafe {
+        let f: unsafe extern "C" fn(Id, Sel, Id) = std::mem::transmute(objc::msg::entry());
+        f(receiver, objc::sel::get(sel), argument);
+    }
+}
+
+fn send_frame(receiver: Id, frame: NSRect) {
+    // SAFETY: `-setFrame:` is `void (id, SEL, NSRect)`.
+    unsafe {
+        let f: unsafe extern "C" fn(Id, Sel, NSRect) = std::mem::transmute(objc::msg::entry());
+        f(receiver, objc::sel::get("setFrame:"), frame);
+    }
+}
+
+/// The accessory controllers of a window, in order.
+fn accessories_of(object: Id) -> Vec<Id> {
+    let accessories = window_of(object).accessories;
+    // SAFETY: null or the array `add_titlebar_accessory` made.
+    unsafe { corefoundation::collections::array(accessories as corefoundation::base::CFTypeRef) }
+        .map(|a| a.values.iter().map(|v| *v as Id).collect())
+        .unwrap_or_default()
+}
+
+/// The controller's view, loading it if need be.
+fn accessory_view(controller: Id) -> Id {
+    // SAFETY: an `NSViewController`, sent `-view`.
+    unsafe {
+        let f: unsafe extern "C" fn(Id, Sel) -> Id = std::mem::transmute(objc::msg::entry());
+        f(controller, objc::sel::get("view"))
+    }
+}
+
+/// Place the accessories along the top of the frame view, each its own
+/// height, and the content view in what is left.
+///
+/// FIXME (ACCURACY): an accessory placed at the titlebar's leading or
+/// trailing edge goes under it with the rest, since the titlebar here is not
+/// made of views it could join.
+fn layout_titlebar(object: Id, size: NSSize) {
+    let window = window_of(object);
+    if window.frame_view.is_null() {
+        return;
+    }
+    send_frame(
+        window.frame_view,
+        NSRect {
+            origin: NSPoint::default(),
+            size,
+        },
+    );
+    let mut top = size.height;
+    for controller in accessories_of(object) {
+        let view = accessory_view(controller);
+        if view.is_null() || crate::props::integer(controller, "hidden") != 0 {
+            continue;
+        }
+        let height = match crate::layout::own_size(view)[1] {
+            (Some(exact), _) => exact,
+            (None, Some(least)) => least.max(crate::view::frame_of(view).size.height),
+            (None, None) => crate::view::frame_of(view).size.height,
+        };
+        top -= height;
+        send_frame(
+            view,
+            NSRect {
+                origin: NSPoint { x: 0.0, y: top },
+                size: NSSize {
+                    width: size.width,
+                    height,
+                },
+            },
+        );
+    }
+    if !window.content_view.is_null() {
+        send_frame(
+            window.content_view,
+            NSRect {
+                origin: NSPoint::default(),
+                size: NSSize {
+                    width: size.width,
+                    height: top.max(0.0),
+                },
+            },
+        );
+    }
+}
+
+/// `-addTitlebarAccessoryViewController:`.
+unsafe extern "C" fn add_titlebar_accessory(receiver: Id, sel: Sel, controller: Id) {
+    let count = accessories_of(receiver).len();
+    unsafe { insert_titlebar_accessory(receiver, sel, controller, count) };
+}
+
+/// `-insertTitlebarAccessoryViewController:atIndex:`.
+unsafe extern "C" fn insert_titlebar_accessory(
+    receiver: Id,
+    _sel: Sel,
+    controller: Id,
+    index: usize,
+) {
+    if controller.is_null() {
+        return;
+    }
+    let window = window_of(receiver);
+    if window.accessories.is_null() {
+        window.accessories = corefoundation::collections::new_array(
+            &[],
+            corefoundation::callbacks::Policy::from_type_callbacks(),
+            true,
+        ) as Id;
+    }
+    if window.frame_view.is_null() {
+        let class = objc::class::lookup(c"NSView").expect("NSView");
+        let frame_view = objc::object::create_instance(class, 0);
+        // SAFETY: `-initWithFrame:` is `id (id, SEL, NSRect)`.
+        let frame_view = unsafe {
+            let f: unsafe extern "C" fn(Id, Sel, NSRect) -> Id =
+                std::mem::transmute(objc::msg::entry());
+            f(
+                frame_view,
+                objc::sel::get("initWithFrame:"),
+                NSRect::default(),
+            )
+        };
+        window.frame_view = frame_view;
+        if !window.content_view.is_null() {
+            send_view(frame_view, "addSubview:", window.content_view);
+        }
+        // SAFETY: a view of this crate's, now this window's root.
+        unsafe { crate::view::set_window(frame_view, receiver) };
+    }
+    // SAFETY: the array made above, and an object to put in it.
+    if let Some(array) = unsafe {
+        corefoundation::collections::array(window.accessories as corefoundation::base::CFTypeRef)
+    } {
+        let at = index.min(array.values.len());
+        array.values.insert(
+            at,
+            objc::arc::retain(controller) as corefoundation::base::CFTypeRef,
+        );
+    }
+    crate::view_controller::set_accessory_window(controller, receiver);
+    let view = accessory_view(controller);
+    if !view.is_null() {
+        send_view(window.frame_view, "addSubview:", view);
+        if crate::props::integer(controller, "hidden") != 0 {
+            // SAFETY: `-setHidden:` is `void (id, SEL, BOOL)`.
+            unsafe {
+                let f: unsafe extern "C" fn(Id, Sel, u8) = std::mem::transmute(objc::msg::entry());
+                f(view, objc::sel::get("setHidden:"), 1);
+            }
+        }
+    }
+    fit_content_view(receiver);
+}
+
+/// `-removeTitlebarAccessoryViewControllerAtIndex:`.
+unsafe extern "C" fn remove_titlebar_accessory(receiver: Id, _sel: Sel, index: usize) {
+    let window = window_of(receiver);
+    // SAFETY: null or the array `insert_titlebar_accessory` made.
+    let Some(array) = (unsafe {
+        corefoundation::collections::array(window.accessories as corefoundation::base::CFTypeRef)
+    }) else {
+        return;
+    };
+    if index >= array.values.len() {
+        return;
+    }
+    let controller = array.values.remove(index) as Id;
+    let view = accessory_view(controller);
+    if !view.is_null() {
+        // SAFETY: `-removeFromSuperview` is `void (id, SEL)`.
+        unsafe {
+            let f: unsafe extern "C" fn(Id, Sel) = std::mem::transmute(objc::msg::entry());
+            f(view, objc::sel::get("removeFromSuperview"));
+        }
+    }
+    crate::view_controller::set_accessory_window(controller, std::ptr::null_mut());
+    objc::arc::release(controller);
+    fit_content_view(receiver);
+}
+
+/// `-titlebarAccessoryViewControllers`.
+unsafe extern "C" fn titlebar_accessories(receiver: Id, _sel: Sel) -> Id {
+    let values: Vec<corefoundation::base::CFTypeRef> = accessories_of(receiver)
+        .into_iter()
+        .map(|c| c as corefoundation::base::CFTypeRef)
+        .collect();
+    let array = corefoundation::collections::new_array(
+        &values,
+        corefoundation::callbacks::Policy::from_type_callbacks(),
+        false,
+    );
+    objc::arc::autorelease(array as Id)
 }
 
 /// Whether `object` is an `NSPanel`, which gets a titlebar and no menu bar.
@@ -1072,6 +1281,10 @@ fn fit_content_view_to(object: Id, size: NSSize) {
             height: (size.height - content_inset(object)).max(0.0),
         },
     };
+    if !window.frame_view.is_null() {
+        layout_titlebar(object, frame.size);
+        return;
+    }
     // Sent rather than written, so a view that tracks its own size hears
     // about it.
     // SAFETY: `-setFrame:` is `void (id, SEL, NSRect)`.
@@ -1841,6 +2054,13 @@ unsafe extern "C" fn content_view(receiver: Id, _sel: Sel) -> Id {
 /// draws into a fraction of the window and reports a backing store that does not
 /// match it.
 unsafe extern "C" fn set_content_view(receiver: Id, _sel: Sel, view: Id) {
+    let previous = window_of(receiver).content_view;
+    if previous != view {
+        crate::view::will_move_to_window(previous, receiver, std::ptr::null_mut());
+        // SAFETY: null or a view of this crate's.
+        let from = unsafe { crate::view::window_of(view) };
+        crate::view::will_move_to_window(view, from, receiver);
+    }
     let window = window_of(receiver);
     let old = std::mem::replace(&mut window.content_view, objc::arc::retain(view));
     // The view being replaced may outlive this window: Qt keeps its own reference
@@ -1850,15 +2070,52 @@ unsafe extern "C" fn set_content_view(receiver: Id, _sel: Sel, view: Id) {
         // SAFETY: null or an object this runtime allocated.
         unsafe { crate::view::detach_window(old, receiver) };
     }
+    if !window.frame_view.is_null() && old != view {
+        if !old.is_null() {
+            // SAFETY: `-removeFromSuperview` is `void (id, SEL)`.
+            unsafe {
+                let f: unsafe extern "C" fn(Id, Sel) = std::mem::transmute(objc::msg::entry());
+                f(old, objc::sel::get("removeFromSuperview"));
+            }
+        }
+        if !view.is_null() {
+            send_view(window.frame_view, "addSubview:", view);
+        }
+    }
+    let moved = old != view;
+    if moved {
+        crate::view::did_move_to_window(old, receiver, std::ptr::null_mut());
+    }
     objc::arc::release(old);
     // SAFETY: `view` is null or an object this runtime allocated.
     unsafe { crate::view::set_window(view, receiver) };
+    if moved {
+        crate::view::did_move_to_window(view, std::ptr::null_mut(), receiver);
+    }
     if view.is_null() || window.sdl.is_null() {
         return;
     }
     fit_content_view(receiver);
     // SAFETY: a view this crate made, now this window's.
     unsafe { crate::view::update_tracking_areas(view) };
+}
+
+/// `-init`: a titled window with an empty content rectangle, through the
+/// designated initializer so a subclass's runs.
+unsafe extern "C" fn init_plain(receiver: Id, _sel: Sel) -> Id {
+    // SAFETY: `id (id, SEL, NSRect, NSUInteger, NSUInteger, BOOL)`.
+    unsafe {
+        let f: unsafe extern "C" fn(Id, Sel, NSRect, usize, usize, u8) -> Id =
+            std::mem::transmute(objc::msg::entry());
+        f(
+            receiver,
+            objc::sel::get("initWithContentRect:styleMask:backing:defer:"),
+            NSRect::default(),
+            style::TITLED,
+            2,
+            0,
+        )
+    }
 }
 
 unsafe extern "C" fn window_controller(receiver: Id, _sel: Sel) -> Id {
@@ -1943,7 +2200,7 @@ unsafe extern "C" fn set_title_with_represented_filename(receiver: Id, sel: Sel,
 
 /// `-display`: redraw the whole content view at the next pump.
 unsafe extern "C" fn display_window(receiver: Id, _sel: Sel) {
-    let content = window_of(receiver).content_view;
+    let content = content_view_of(receiver);
     if !content.is_null() {
         crate::backing::needs_display(content);
     }
@@ -1958,6 +2215,8 @@ unsafe extern "C" fn order_front_regardless(receiver: Id, _sel: Sel) {
 }
 
 fn order_front(receiver: Id, make_key: bool) {
+    // Its views are owed their first `-updateConstraints` before it draws.
+    crate::layout::note_tree_changed();
     let window = window_of(receiver);
     if window.sdl.is_null() {
         return;
@@ -2082,6 +2341,14 @@ pub(crate) unsafe extern "C" fn dealloc(receiver: Id, sel: Sel) {
     ));
     objc::arc::release(std::mem::replace(
         &mut window.represented_filename,
+        std::ptr::null_mut(),
+    ));
+    let frame_view = std::mem::replace(&mut window.frame_view, std::ptr::null_mut());
+    // SAFETY: null or an object this runtime allocated.
+    unsafe { crate::view::detach_window(frame_view, receiver) };
+    objc::arc::release(frame_view);
+    objc::arc::release(std::mem::replace(
+        &mut window.accessories,
         std::ptr::null_mut(),
     ));
     // SAFETY: `-orderOut:` is `void (id, SEL, id)`; it also gives up key status.
@@ -3292,6 +3559,62 @@ unsafe extern "C" fn effective_appearance(receiver: Id, sel: Sel) -> Id {
     crate::appearance::effective_of(crate::application::shared())
 }
 
+/// Send a getter answering an `NSRect`, which returns through `_stret`.
+fn send_rect(receiver: Id, selector: &str) -> NSRect {
+    if receiver.is_null() {
+        return NSRect::default();
+    }
+    // SAFETY: `NSRect (id, SEL)`.
+    unsafe {
+        let f: unsafe extern "C" fn(Id, Sel) -> NSRect =
+            std::mem::transmute(objc::msg::entry_stret());
+        f(receiver, objc::sel::get(selector))
+    }
+}
+
+/// `-stringWithSavedFrame`: the frame and its screen's visible frame, as
+/// AppKit spells them: eight numbers, each followed by a space.
+unsafe extern "C" fn string_with_saved_frame(receiver: Id, _sel: Sel) -> Id {
+    let frame = send_rect(receiver, "frame");
+    // SAFETY: `NSScreen * (id, SEL)`.
+    let screen = unsafe {
+        let f: unsafe extern "C" fn(Id, Sel) -> Id = std::mem::transmute(objc::msg::entry());
+        f(receiver, objc::sel::get("screen"))
+    };
+    let visible = send_rect(screen, "visibleFrame");
+    let text: String = [frame, visible]
+        .iter()
+        .flat_map(|r| [r.origin.x, r.origin.y, r.size.width, r.size.height])
+        .map(|n| format!("{} ", n.round() as i64))
+        .collect();
+    objc::arc::autorelease(foundation::string::from_str(&text))
+}
+
+/// `-setFrameFromString:`: the first four numbers of a saved frame.
+unsafe extern "C" fn set_frame_from_string(receiver: Id, _sel: Sel, string: Id) {
+    // SAFETY: an `NSString` or nil.
+    let text = String::from_utf8_lossy(&unsafe { foundation::string::bytes(string) }).into_owned();
+    let numbers: Vec<f64> = text
+        .split_whitespace()
+        .filter_map(|n| n.parse().ok())
+        .collect();
+    let [x, y, width, height, ..] = numbers[..] else {
+        return;
+    };
+    if width <= 0.0 || height <= 0.0 {
+        return;
+    }
+    let frame = NSRect {
+        origin: NSPoint { x, y },
+        size: NSSize { width, height },
+    };
+    // SAFETY: `void (id, SEL, NSRect, BOOL)`.
+    unsafe {
+        let f: unsafe extern "C" fn(Id, Sel, NSRect, u8) = std::mem::transmute(objc::msg::entry());
+        f(receiver, objc::sel::get("setFrame:display:"), frame, 1);
+    }
+}
+
 pub(crate) fn install() {
     let responder = objc::class::lookup(c"NSResponder").expect("declared before its methods");
     methods!(responder, {
@@ -3318,6 +3641,7 @@ pub(crate) fn install() {
         "appearance" => appearance, c"@16@0:8";
         "setAppearance:" => set_appearance, c"v24@0:8@16";
         "effectiveAppearance" => effective_appearance, c"@16@0:8";
+        "init" => init_plain, c"@16@0:8";
         "initWithContentRect:styleMask:backing:defer:" => init_with_content_rect,
             c"@56@0:8{CGRect={CGPoint=dd}{CGSize=dd}}16Q48Q56c64";
         "initWithContentRect:styleMask:backing:defer:screen:" => init_with_content_rect_screen,
@@ -3358,6 +3682,10 @@ pub(crate) fn install() {
             c"{CGRect={CGPoint=dd}{CGSize=dd}}48@0:8{CGRect={CGPoint=dd}{CGSize=dd}}16";
         "setContentSize:" => set_content_size, c"v32@0:8{CGSize=dd}16";
         "contentView" => content_view, c"@16@0:8";
+        "addTitlebarAccessoryViewController:" => add_titlebar_accessory, c"v24@0:8@16";
+        "insertTitlebarAccessoryViewController:atIndex:" => insert_titlebar_accessory, c"v32@0:8@16q24";
+        "removeTitlebarAccessoryViewControllerAtIndex:" => remove_titlebar_accessory, c"v24@0:8q16";
+        "titlebarAccessoryViewControllers" => titlebar_accessories, c"@16@0:8";
         "setContentView:" => set_content_view, c"v24@0:8@16";
         "delegate" => delegate, c"@16@0:8";
         "windowController" => window_controller, c"@16@0:8";
@@ -3380,6 +3708,8 @@ pub(crate) fn install() {
         "dealloc" => dealloc, c"v16@0:8";
         "performClose:" => perform_close, c"v24@0:8@16";
         "isKeyWindow" => is_key_window, c"c16@0:8";
+        // The application's: a window has no event of its own.
+        "currentEvent" => crate::application::current_event, c"@16@0:8";
         "canBecomeKeyWindow" => can_become_key, c"c16@0:8";
         "canBecomeMainWindow" => can_become_key, c"c16@0:8";
         "constrainFrameRect:toScreen:" => constrain_frame_rect,
@@ -3389,6 +3719,8 @@ pub(crate) fn install() {
         "setIsVisible:" => set_is_visible, c"v20@0:8c16";
         // No window is ever attached as a sheet: nothing implements -beginSheet:.
         "isSheet" => no, c"c16@0:8";
+        // One space: ordering any window in puts it on the active one.
+        "isOnActiveSpace" => yes, c"c16@0:8";
         "attachedSheet" => nil, c"@16@0:8";
         "screen" => screen, c"@16@0:8";
         "backingScaleFactor" => backing_scale_factor, c"d16@0:8";
@@ -3424,6 +3756,8 @@ pub(crate) fn install() {
         "saveFrameUsingName:" => ignored_integer, c"v24@0:8@16";
         "setFrameUsingName:" => no_with_object, c"c24@0:8@16";
         "setFrameAutosaveName:" => yes_with_object, c"c24@0:8@16";
+        "stringWithSavedFrame" => string_with_saved_frame, c"@16@0:8";
+        "setFrameFromString:" => set_frame_from_string, c"v24@0:8@16";
         // The textured bottom bar: no such chrome is drawn here.
         "setContentBorderThickness:forEdge:" => ignored_border, c"v32@0:8d16Q24";
         "setAutorecalculatesContentBorderThickness:forEdge:" => ignored_border_flag, c"v28@0:8c16Q20";

@@ -468,12 +468,82 @@ unsafe extern "C" fn other_event(
     event
 }
 
+/// `-CGEvent`: a CoreGraphics event with this one's type, flags and key.
+unsafe extern "C" fn cg_event(receiver: Id, _sel: Sel) -> *const c_void {
+    // SAFETY: null or a live object this runtime allocated.
+    let Some(event) = (unsafe { event_of(receiver) }) else {
+        return std::ptr::null();
+    };
+    crate::cgevent::describing(event.kind, event.modifiers, event.key_code, event.location)
+}
+
+/// The text a key types with `flags` held, from the keyboard layout: Shift,
+/// Option and Caps Lock change it, Command and Control do not.
+fn typed_characters(key_code: u16, flags: u64) -> String {
+    use crate::keymap::flags as f;
+    use crate::uchr::modifier as m;
+    let mut modifiers = 0u32;
+    for (flag, bit) in [
+        (f::SHIFT, m::SHIFT),
+        (f::OPTION, m::OPTION),
+        (f::CAPS_LOCK, m::ALPHA_LOCK),
+    ] {
+        if flags & flag != 0 {
+            modifiers |= u32::from(bit);
+        }
+    }
+    let mut state = 0;
+    // SAFETY: this crate's own layout resource; kind 40 is the ANSI keyboard.
+    let typed = unsafe {
+        crate::uchr::translate(
+            crate::uchr::layout().as_ptr(),
+            key_code,
+            0,
+            modifiers,
+            40,
+            crate::uchr::NO_DEAD_KEYS,
+            &mut state,
+        )
+    }
+    .map(|chars| String::from_utf16_lossy(&chars))
+    .unwrap_or_default();
+    // A function key has no layout entry; it types AppKit's private-use scalar.
+    if typed.is_empty()
+        && let Some(scancode) = crate::keymap::scancode_of(key_code)
+    {
+        return crate::keymap::characters(scancode, 0);
+    }
+    typed
+}
+
+/// `+eventWithCGEvent:`.
+unsafe extern "C" fn event_with_cg_event(_class: Id, _sel: Sel, cg: *const c_void) -> Id {
+    let Some((kind, flags, key_code, location)) = crate::cgevent::parts(cg as _) else {
+        return std::ptr::null_mut();
+    };
+    let characters = match kind {
+        10 | 11 => objc::arc::autorelease(foundation::string::from_str(&typed_characters(
+            key_code, flags,
+        ))),
+        _ => std::ptr::null_mut(),
+    };
+    make(Fields {
+        kind,
+        modifiers: flags,
+        location,
+        characters,
+        key_code,
+        ..Fields::default()
+    })
+}
+
 pub(crate) fn install() {
     let class = objc::class::lookup(c"NSEvent").expect("declared before its methods");
     crate::define::class_methods!(class, {
         "modifierFlags" => current_modifier_flags, c"Q16@0:8";
         "mouseLocation" => mouse_location, c"{CGPoint=dd}16@0:8";
         "pressedMouseButtons" => pressed_mouse_buttons, c"Q16@0:8";
+        "eventWithCGEvent:" => event_with_cg_event, c"@24@0:8^{__CGEvent=}16";
         "doubleClickInterval" => double_click_interval, c"d16@0:8";
         "enterExitEventWithType:location:modifierFlags:timestamp:windowNumber:context:eventNumber:trackingNumber:userData:"
             => enter_exit_event, c"@96@0:8Q16{CGPoint=dd}24Q40d48q56@64q72q80^v88";
@@ -482,6 +552,7 @@ pub(crate) fn install() {
     });
     methods!(class, {
         "type" => kind, c"Q16@0:8";
+        "CGEvent" => cg_event, c"^{__CGEvent=}16@0:8";
         "modifierFlags" => modifier_flags, c"Q16@0:8";
         "locationInWindow" => location_in_window, c"{CGPoint=dd}16@0:8";
         "keyCode" => key_code, c"S16@0:8";

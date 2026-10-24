@@ -339,6 +339,23 @@ fn object_and_block(
     Ok(())
 }
 
+/// `void CFRunLoopPerformBlock(CFRunLoopRef, CFTypeRef mode, block)`: two
+/// objects, then a block the run loop copies.
+fn run_loop_perform_block(
+    symbol: &str,
+    ctx: &mut RegisterContext,
+    mem: &mut dyn GuestMemory,
+    callbacks: &dyn Callbacks,
+) -> Result<()> {
+    let (run_loop, mode, block) = (ctx.rdi, ctx.rsi, ctx.rdx);
+    if block == 0 {
+        return Err(bad_pointer(symbol, 0));
+    }
+    substitute_block(symbol, block, mem, callbacks)?;
+    call_block(symbol, host_or_refuse(symbol)?, &[run_loop, mode, block]);
+    Ok(())
+}
+
 /// One of this module's implementations, in the shape [`crate::shims`] wants -
 /// the wider one, carrying [`Callbacks`].
 pub type Shim = crate::signal::Shim;
@@ -362,6 +379,9 @@ pub fn shim_for(name: &str) -> Option<Shim> {
         "dispatch_group_async" => {
             Some(bind!(callback "dispatch_group_async" => dispatch_group_async))
         }
+        "CFRunLoopPerformBlock" => {
+            Some(bind!(callback "CFRunLoopPerformBlock" => run_loop_perform_block))
+        }
         "CFRunLoopObserverCreateWithHandler" => Some(
             bind!(callback "CFRunLoopObserverCreateWithHandler" => run_loop_observer_create_with_handler),
         ),
@@ -370,6 +390,12 @@ pub fn shim_for(name: &str) -> Option<Shim> {
         }
         "nw_path_monitor_set_cancel_handler" => {
             Some(bind!(callback "nw_path_monitor_set_cancel_handler" => object_and_block))
+        }
+        "dispatch_source_set_event_handler" => {
+            Some(bind!(callback "dispatch_source_set_event_handler" => object_and_block))
+        }
+        "dispatch_source_set_cancel_handler" => {
+            Some(bind!(callback "dispatch_source_set_cancel_handler" => object_and_block))
         }
         "nw_path_enumerate_interfaces" => {
             Some(bind!(callback "nw_path_enumerate_interfaces" => object_and_block))

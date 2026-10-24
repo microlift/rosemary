@@ -1624,6 +1624,7 @@ fn send_button_action(receiver: Id) {
     if read(buttons(), receiver, slot::DISABLED) != 0 {
         return;
     }
+    crate::bindings::control_changed(receiver);
     let action = read(buttons(), receiver, slot::ACTION) as Sel;
     let app = crate::application::shared();
     if action.is_null() || app.is_null() {

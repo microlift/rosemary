@@ -358,8 +358,50 @@ pub unsafe extern "C" fn CFPropertyListCreateWithData(
     }
 }
 
+/// `CFDataRef CFPropertyListCreateData(CFAllocatorRef, CFPropertyListRef,
+/// CFPropertyListFormat, CFOptionFlags, CFErrorRef *error)`
+///
+/// XML and binary are written; the OpenStep format, which Apple can no
+/// longer write either, and anything that is not a property list type are
+/// errors.
+///
+/// # Safety
+///
+/// `list` is null or an object this runtime allocated; `error` is null or
+/// writable for one value.
+pub unsafe extern "C" fn CFPropertyListCreateData(
+    _allocator: CFAllocatorRef,
+    list: CFTypeRef,
+    format: CFIndex,
+    _options: u64,
+    error: *mut CFTypeRef,
+) -> CFTypeRef {
+    if !error.is_null() {
+        // SAFETY: the caller states it is writable.
+        unsafe { *error = std::ptr::null() };
+    }
+    let fail = |why: &str| {
+        if !error.is_null() {
+            // SAFETY: as above.
+            unsafe { *error = error_object(why) };
+        }
+        std::ptr::null()
+    };
+    // SAFETY: null or an object this runtime allocated.
+    let Some(value) = (unsafe { value_of(list) }) else {
+        return fail("the object is not a property list");
+    };
+    let bytes = match format as i64 {
+        format::XML_V1_0 => crate::plist::write_xml(&value),
+        format::BINARY_V1_0 => crate::plist::write_binary(&value),
+        _ => return fail("this property list format cannot be written"),
+    };
+    collections::new_data(bytes)
+}
+
 exports::exports! {
     functions {
+        "CFPropertyListCreateData" => CFPropertyListCreateData,
         "CFPropertyListCreateWithData" => CFPropertyListCreateWithData,
         "CFPropertyListCreateFromXMLData" => CFPropertyListCreateFromXMLData,
     }

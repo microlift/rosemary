@@ -2,6 +2,7 @@ pub mod block;
 pub mod data;
 pub mod object;
 pub mod queue;
+pub mod source;
 pub mod sync;
 pub mod time;
 
@@ -126,11 +127,31 @@ exports::exports! {
         "dispatch_set_context" => object::set_context,
         "dispatch_get_context" => object::get_context,
         "dispatch_set_finalizer_f" => object::set_finalizer_f,
+        "dispatch_suspend" => queue::suspend,
+        "dispatch_resume" => queue::resume,
+        "dispatch_source_create" => source::create,
+        "dispatch_source_set_event_handler" => source::set_event_handler,
+        "dispatch_source_set_event_handler_f" => source::set_event_handler_f,
+        "dispatch_source_set_cancel_handler" => source::set_cancel_handler,
+        "dispatch_source_set_cancel_handler_f" => source::set_cancel_handler_f,
+        "dispatch_source_cancel" => source::cancel,
+        "dispatch_source_testcancel" => source::testcancel,
+        "dispatch_source_get_data" => source::get_data,
+        "dispatch_source_get_handle" => source::get_handle,
+        "dispatch_source_get_mask" => source::get_mask,
+        "dispatch_source_merge_data" => source::merge_data,
     }
     data {
         "__dispatch_main_q" => main_queue(),
         "__dispatch_queue_attr_concurrent" => queue::concurrent_attr(),
         "__dispatch_data_destructor_free" => data::destructor_free(),
+        "__dispatch_source_type_data_add" => source::type_data_add(),
+        "__dispatch_source_type_data_or" => source::type_data_or(),
+        "__dispatch_source_type_data_replace" => source::type_data_replace(),
+        "__dispatch_source_type_read" => source::type_read(),
+        "__dispatch_source_type_write" => source::type_write(),
+        "__dispatch_source_type_signal" => source::type_signal(),
+        "__dispatch_source_type_vnode" => source::type_vnode(),
     }
 }
 

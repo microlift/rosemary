@@ -39,6 +39,12 @@ pub const KEYS: &[(&str, &str)] = &[
     ("_kSecReturnAttributes", "r_Attributes"),
     ("_kSecMatchLimit", "m_Limit"),
     ("_kSecMatchLimitOne", "m_LimitOne"),
+    ("_kSecMatchLimitAll", "m_LimitAll"),
+    ("_kSecReturnRef", "r_Ref"),
+    ("_kSecAttrComment", "icmt"),
+    ("_kSecAttrDescription", "desc"),
+    ("_kSecKeyAlgorithmRSAEncryptionRaw", "algid:encrypt:RSA:raw"),
+    ("_kSecTransformInputAttributeName", "INPUT"),
 ];
 
 /// What identifies an item: its class, its service and its account.

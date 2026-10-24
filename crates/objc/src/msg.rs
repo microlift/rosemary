@@ -6,23 +6,117 @@ use crate::sel::Sel;
 
 /// The `IMP` to jump to for `(receiver, sel)`, or the "unrecognised" trampoline.
 ///
-/// Called from [`msg_send`]'s prologue with the receiver and selector only; the
-/// rest of the arguments are still spilled on its frame.
+/// Called from [`msg_send`]'s prologue with the receiver, the selector, and
+/// where on its frame the receiver is spilled; the rest of the arguments are
+/// still spilled there too. A forwarded message is sent on by rewriting that
+/// slot, which is what the trampoline restores the receiver from.
 ///
 /// # Safety
 ///
-/// `receiver` must be a non-null object pointer.
-unsafe extern "C" fn lookup(receiver: Id, sel: Sel) -> *const c_void {
+/// `receiver` must be a non-null object pointer, and `slot` null or the
+/// trampoline's saved receiver.
+unsafe extern "C" fn lookup(receiver: Id, sel: Sel, slot: *mut Id) -> *const c_void {
     let refused = match logging_unrecognised() {
         true => unrecognised_logged as *const c_void,
         false => unrecognised as *const c_void,
     };
-    let Some(class) = (unsafe { crate::object::class_of(receiver) }) else {
-        return refused;
+    // SAFETY: the caller's obligations.
+    unsafe { resolve(receiver, sel, slot) }.unwrap_or(refused)
+}
+
+/// The method `sel` resolves to for `receiver`, after the class has had its
+/// `+resolveInstanceMethod:` (or `+resolveClassMethod:`) chance to add one,
+/// and after `-forwardingTargetForSelector:` has had its chance to name
+/// another receiver - which is then written to `slot`.
+///
+/// # Safety
+///
+/// As [`lookup`].
+unsafe fn resolve(receiver: Id, sel: Sel, slot: *mut Id) -> Option<*const c_void> {
+    let mut receiver = receiver;
+    // Bounded: two proxies naming each other must not hang the send.
+    for _ in 0..8 {
+        // SAFETY: a live object, by the caller and by each forwarding target.
+        let class = unsafe { crate::object::class_of(receiver) }?;
+        crate::class::ensure_initialized(class);
+        let found = class
+            .method(sel)
+            .or_else(|| unsafe { resolve_dynamically(class, receiver, sel) });
+        if let Some(method) = found {
+            if !slot.is_null() {
+                // SAFETY: the trampoline's spill slot, by the caller.
+                unsafe { *slot = receiver };
+            }
+            return Some(method.implementation());
+        }
+        let target = unsafe { forwarding_target(class, receiver, sel) };
+        if target.is_null() || target == receiver || slot.is_null() {
+            return None;
+        }
+        receiver = target;
+    }
+    None
+}
+
+/// `+resolveInstanceMethod:`, or `+resolveClassMethod:` for a class
+/// receiver: the class may add the method now, and the lookup is tried again.
+///
+/// # Safety
+///
+/// `receiver` is a live object of `class`.
+unsafe fn resolve_dynamically(
+    class: &'static crate::class::Class,
+    receiver: Id,
+    sel: Sel,
+) -> Option<&'static crate::class::Method> {
+    let (resolver, asked) = match class.is_meta() {
+        true => (crate::sel::get("resolveClassMethod:"), receiver),
+        false => (
+            crate::sel::get("resolveInstanceMethod:"),
+            crate::class::ptr(class) as Id,
+        ),
     };
-    match class.method(sel) {
-        Some(method) => method.implementation(),
-        None => refused,
+    // Only a class that implements the resolver is asked: the default
+    // answers no, and asking through a send would recurse here for a class
+    // that has none.
+    let meta = match class.is_meta() {
+        true => class,
+        false => class.metaclass(),
+    };
+    let method = meta.method(resolver)?;
+    if method.implementation() == crate::nsobject::default_resolver() {
+        return None;
+    }
+    // SAFETY: `BOOL (id, SEL, SEL)`, the resolver's prototype.
+    let added = unsafe {
+        let f: unsafe extern "C" fn(Id, Sel, Sel) -> u8 =
+            std::mem::transmute(method.implementation());
+        f(asked, resolver, sel)
+    };
+    match added {
+        0 => None,
+        _ => class.method(sel),
+    }
+}
+
+/// What `-forwardingTargetForSelector:` names for `sel`, or nil.
+///
+/// # Safety
+///
+/// As [`resolve_dynamically`].
+unsafe fn forwarding_target(class: &'static crate::class::Class, receiver: Id, sel: Sel) -> Id {
+    let forward = crate::sel::get("forwardingTargetForSelector:");
+    let Some(method) = class.method(forward) else {
+        return std::ptr::null_mut();
+    };
+    if method.implementation() == crate::nsobject::default_forwarding_target() {
+        return std::ptr::null_mut();
+    }
+    // SAFETY: `id (id, SEL, SEL)`, the method's prototype.
+    unsafe {
+        let f: unsafe extern "C" fn(Id, Sel, Sel) -> Id =
+            std::mem::transmute(method.implementation());
+        f(receiver, forward, sel)
     }
 }
 
@@ -117,18 +211,13 @@ unsafe extern "C" fn unrecognised_stret_logged(_buffer: *mut c_void, receiver: I
 ///
 /// As [`lookup`].
 #[cfg(target_arch = "x86_64")]
-unsafe extern "C" fn lookup_stret(receiver: Id, sel: Sel) -> *const c_void {
+unsafe extern "C" fn lookup_stret(receiver: Id, sel: Sel, slot: *mut Id) -> *const c_void {
     let refused = match logging_unrecognised() {
         true => unrecognised_stret_logged as *const c_void,
         false => unrecognised_stret as *const c_void,
     };
-    let Some(class) = (unsafe { crate::object::class_of(receiver) }) else {
-        return refused;
-    };
-    match class.method(sel) {
-        Some(method) => method.implementation(),
-        None => refused,
-    }
+    // SAFETY: the caller's obligations.
+    unsafe { resolve(receiver, sel, slot) }.unwrap_or(refused)
 }
 
 /// `objc_msgSend`'s address.
@@ -185,6 +274,7 @@ unsafe extern "C" fn msg_send() {
         "stp     x4, x5, [sp, #160]",
         "stp     x6, x7, [sp, #176]",
         "str     x8,      [sp, #192]",
+        "add     x2, sp, #128",
         "bl      {lookup}",
         "mov     x9, x0",
         "ldp     q0, q1, [sp, #0]",
@@ -239,6 +329,7 @@ unsafe extern "C" fn msg_send() {
         "mov     [rsp + 160], r8",
         "mov     [rsp + 168], r9",
         "mov     [rsp + 176], rax",
+        "lea     rdx, [rsp + 128]",
         "call    {lookup}",
         "mov     r11, rax",
         "movaps  xmm0, [rsp + 0]",
@@ -304,6 +395,7 @@ unsafe extern "C" fn msg_send_stret() {
         // takes them.
         "mov     rdi, rsi",
         "mov     rsi, rdx",
+        "lea     rdx, [rsp + 136]",
         "call    {lookup}",
         "mov     r11, rax",
         "movaps  xmm0, [rsp + 0]",

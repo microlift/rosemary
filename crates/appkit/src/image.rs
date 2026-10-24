@@ -94,6 +94,14 @@ fn recognise(bytes: &[u8]) -> Option<Recognised> {
     // offset. Recognised so the diagnostic can name them, with no size - which
     // `-size` reports as zero, the same as Apple does for an image it has not
     // measured yet.
+    // PDF: the first page's media box, in points, like every size here.
+    if bytes.starts_with(b"%PDF-") {
+        let (width, height) = crate::pdf::page_size(bytes)?;
+        return Some(Recognised {
+            format: "PDF",
+            size: NSSize { width, height },
+        });
+    }
     if bytes.starts_with(b"icns") {
         return Some(Recognised {
             format: "ICNS",
@@ -256,7 +264,13 @@ pub fn bitmap(object: Id) -> Option<crate::raster::Bitmap> {
     if !is_image(object) {
         return None;
     }
-    crate::raster::decode(bytes_of(object)).or_else(|| {
+    let bytes = bytes_of(object);
+    if bytes.starts_with(b"%PDF-") {
+        // Twice the page's size, so the artwork stays sharp on a
+        // high-density display; drawing scales it to the image's size.
+        return crate::pdf::render(bytes, 2.0);
+    }
+    crate::raster::decode(bytes).or_else(|| {
         // Built by `-initWithSize:` plus `-addRepresentation:`, which is how a
         // program that generated its pixels rather than loading a file makes
         // one. The first representation is the image, as it is in Apple's for
@@ -396,7 +410,9 @@ pub fn empty(size: NSSize) -> Id {
 
 /// The extensions `+imageNamed:` tries after the name as given, in the order
 /// Apple's lookup prefers them.
-const NAMED_EXTENSIONS: &[&str] = &["png", "tiff", "tif", "icns", "jpg", "jpeg", "gif", "bmp"];
+const NAMED_EXTENSIONS: &[&str] = &[
+    "png", "tiff", "tif", "pdf", "icns", "jpg", "jpeg", "gif", "bmp",
+];
 
 /// `+[NSImage imageNamed:]`.
 ///
@@ -458,8 +474,19 @@ unsafe extern "C" fn image_named(_class: Id, _sel: Sel, name: Id) -> Id {
         objc::arc::release(image);
         return std::ptr::null_mut();
     }
+    mark_template_by_name(image, &name);
     named.insert(name, image as usize);
     image
+}
+
+/// AppKit's convention for `+imageNamed:` and `-[NSBundle imageForResource:]`:
+/// a resource whose name ends in "Template" is a template image, which a
+/// program tints itself when it sees one.
+fn mark_template_by_name(image: Id, name: &str) {
+    let stem = name.rsplit_once('.').map_or(name, |(stem, _)| stem);
+    if stem.ends_with("Template") {
+        image_of(image).template = 1;
+    }
 }
 
 /// `-[NSBundle pathForImageResource:]` and `-URLForImageResource:`, AppKit
@@ -497,6 +524,27 @@ unsafe extern "C" fn path_for_image_resource(bundle: Id, _sel: Sel, name: Id) ->
 
 unsafe extern "C" fn url_for_image_resource(bundle: Id, _sel: Sel, name: Id) -> Id {
     image_resource(bundle, "URLForResource:withExtension:", name)
+}
+
+/// `-[NSBundle imageForResource:]`: the image file `-pathForImageResource:`
+/// finds, loaded.
+unsafe extern "C" fn image_for_resource(bundle: Id, _sel: Sel, name: Id) -> Id {
+    let path = image_resource(bundle, "pathForResource:ofType:", name);
+    if path.is_null() {
+        return std::ptr::null_mut();
+    }
+    let class = objc::class::lookup(c"NSImage").expect("declared before its methods");
+    let image = objc::object::create_instance(class, 0);
+    // SAFETY: a fresh image and an NSString path.
+    let image = unsafe {
+        init_with_contents_of_file(image, objc::sel::get("initWithContentsOfFile:"), path)
+    };
+    if !image.is_null()
+        && let Ok(name) = String::from_utf8(unsafe { foundation::string::bytes(name) })
+    {
+        mark_template_by_name(image, &name);
+    }
+    objc::arc::autorelease(image)
 }
 
 /// `-addRepresentation:`, and the list it appends to.
@@ -645,6 +693,11 @@ unsafe extern "C" fn copy_with_zone(receiver: Id, _sel: Sel, _zone: *mut c_void)
     to.reps = objc::arc::retain(from.reps);
     to.size = from.size;
     to.template = from.template;
+    let description = crate::props::object(receiver, "accessibilityDescription");
+    if !description.is_null() {
+        let key = objc::sel::get("accessibilityDescription") as *const c_void;
+        objc::arc::set_associated_with_policy(copy, key, description, 3);
+    }
     if !from.cg_image.is_null() {
         // SAFETY: a `CGImage` the original holds.
         to.cg_image = unsafe { corefoundation::api::CFRetain(from.cg_image) };
@@ -893,6 +946,12 @@ unsafe extern "C" fn draw_in_rect_respect_flipped(
     );
 }
 
+/// `-drawInRect:`: the whole image, source-over, respecting flipped
+/// contexts, as Apple documents it.
+unsafe extern "C" fn draw_in_rect_plain(receiver: Id, sel: Sel, destination: NSRect) {
+    draw(receiver, sel, destination, NSRect::default(), 2, 1.0, true);
+}
+
 unsafe extern "C" fn draw_in_rect(
     receiver: Id,
     sel: Sel,
@@ -943,6 +1002,7 @@ pub(crate) fn install() {
     methods!(bundle, {
         "pathForImageResource:" => path_for_image_resource, c"@24@0:8@16";
         "URLForImageResource:" => url_for_image_resource, c"@24@0:8@16";
+        "imageForResource:" => image_for_resource, c"@24@0:8@16";
     });
     let class = objc::class::lookup(c"NSImage").expect("declared before its methods");
     class_methods!(class, {
@@ -968,6 +1028,10 @@ pub(crate) fn install() {
         "isTemplate" => is_template, c"c16@0:8";
         "copyWithZone:" => copy_with_zone, c"@24@0:8^v16";
     });
+    // Read back only: nothing here speaks to assistive technology.
+    crate::props::properties!(class, {
+        copied "accessibilityDescription", "setAccessibilityDescription:";
+    });
     // The pixel family, each reached by the same implementation so that the one
     // that is wanted first names itself.
     methods!(class, {
@@ -992,6 +1056,7 @@ pub(crate) fn install() {
     methods!(class, {
         "lockFocus" => lock_focus, c"v16@0:8";
         "unlockFocus" => unlock_focus, c"v16@0:8";
+        "drawInRect:" => draw_in_rect_plain, c"v48@0:8{CGRect={CGPoint=dd}{CGSize=dd}}16";
         "drawInRect:fromRect:operation:fraction:" => draw_in_rect,
             c"v96@0:8{CGRect={CGPoint=dd}{CGSize=dd}}16{CGRect={CGPoint=dd}{CGSize=dd}}48Q80d88";
         "drawInRect:fromRect:operation:fraction:respectFlipped:hints:" =>

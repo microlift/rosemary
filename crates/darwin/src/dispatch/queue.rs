@@ -108,6 +108,8 @@ struct State {
     /// Held by the one worker allowed to run this serial queue's work. Unused for a
     /// concurrent queue, which has no such restriction.
     draining: bool,
+    /// `dispatch_suspend`s not yet balanced by a resume. Work stays queued.
+    suspended: u32,
 }
 
 /// The queue a handle names, if it names a live one.
@@ -133,6 +135,7 @@ fn new(label: &str, concurrent: bool, main: bool) -> u64 {
         state: Mutex::new(State {
             pending: VecDeque::new(),
             draining: false,
+            suspended: 0,
         }),
     });
     Box::into_raw(queue) as u64
@@ -214,12 +217,14 @@ pub fn drain_main() {
     let Some(main) = (unsafe { queue(handle) }) else {
         return;
     };
-    let mut budget = main
-        .state
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .pending
-        .len();
+    let mut budget = {
+        let state = main.state.lock().unwrap_or_else(|e| e.into_inner());
+        if state.suspended > 0 {
+            0
+        } else {
+            state.pending.len()
+        }
+    };
     while budget > 0 {
         let Some(item) = main
             .state
@@ -387,7 +392,7 @@ fn run_one(handle: u64) {
         let mut state = q.state.lock().unwrap_or_else(|e| e.into_inner());
         // Another worker already owns this serial queue. It re-enqueues when it is
         // done, so the work is not lost by returning here.
-        if !q.concurrent && state.draining {
+        if (!q.concurrent && state.draining) || state.suspended > 0 {
             return;
         }
         match state.pending.pop_front() {
@@ -452,6 +457,43 @@ pub unsafe extern "C" fn queue_create(label: *const c_char, attr: u64) -> u64 {
     // SAFETY: a null or NUL-terminated C string from the guest.
     let label = unsafe { label_of(label) };
     new(&label, attr == concurrent_attr(), false)
+}
+
+/// `void dispatch_suspend(dispatch_object_t)`.
+pub unsafe extern "C" fn suspend(handle: u64) {
+    if super::source::suspend(handle) {
+        return;
+    }
+    // SAFETY: the guest holds a reference for the duration of the call.
+    if let Some(q) = unsafe { queue(handle) } {
+        q.state.lock().unwrap_or_else(|e| e.into_inner()).suspended += 1;
+    }
+}
+
+/// `void dispatch_resume(dispatch_object_t)`.
+pub unsafe extern "C" fn resume(handle: u64) {
+    if super::source::resume(handle) {
+        return;
+    }
+    // SAFETY: the guest holds a reference for the duration of the call.
+    let Some(q) = (unsafe { queue(handle) }) else {
+        return;
+    };
+    let runnable = {
+        let mut state = q.state.lock().unwrap_or_else(|e| e.into_inner());
+        if state.suspended == 0 {
+            return;
+        }
+        state.suspended -= 1;
+        state.suspended == 0 && !state.pending.is_empty()
+    };
+    if runnable {
+        if q.main {
+            wake_main();
+        } else {
+            schedule(handle);
+        }
+    }
 }
 
 /// `dispatch_queue_t dispatch_queue_create_with_target(const char *,

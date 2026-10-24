@@ -67,6 +67,46 @@ pub const KEYS: &[(&str, &str)] = &[
     ),
     ("_kCFURLAddedToDirectoryDateKey", ADDED_TO_DIRECTORY_DATE),
     ("_NSURLAddedToDirectoryDateKey", ADDED_TO_DIRECTORY_DATE),
+    ("_kCFURLFileResourceTypeKey", FILE_RESOURCE_TYPE),
+    ("_NSURLFileResourceTypeKey", FILE_RESOURCE_TYPE),
+    ("_kCFURLHasHiddenExtensionKey", HAS_HIDDEN_EXTENSION),
+    ("_NSURLHasHiddenExtensionKey", HAS_HIDDEN_EXTENSION),
+    ("_kCFURLIsApplicationKey", IS_APPLICATION),
+    ("_NSURLIsApplicationKey", IS_APPLICATION),
+    ("_kCFURLParentDirectoryURLKey", PARENT_DIRECTORY_URL),
+    ("_NSURLParentDirectoryURLKey", PARENT_DIRECTORY_URL),
+    ("_kCFURLTagNamesKey", TAG_NAMES),
+    ("_NSURLTagNamesKey", TAG_NAMES),
+    ("_kCFURLVolumeIsInternalKey", VOLUME_IS_INTERNAL),
+    ("_NSURLVolumeIsInternalKey", VOLUME_IS_INTERNAL),
+    ("_kCFURLVolumeIsLocalKey", VOLUME_IS_LOCAL),
+    ("_NSURLVolumeIsLocalKey", VOLUME_IS_LOCAL),
+    // An icon is an `NSImage`, which AppKit answers if it is loaded.
+    ("_kCFURLEffectiveIconKey", EFFECTIVE_ICON),
+    ("_NSURLEffectiveIconKey", EFFECTIVE_ICON),
+    // The values `NSURLFileResourceTypeKey` answers with.
+    ("_kCFURLFileResourceTypeNamedPipe", TYPE_NAMED_PIPE),
+    ("_NSURLFileResourceTypeNamedPipe", TYPE_NAMED_PIPE),
+    (
+        "_kCFURLFileResourceTypeCharacterSpecial",
+        TYPE_CHARACTER_SPECIAL,
+    ),
+    (
+        "_NSURLFileResourceTypeCharacterSpecial",
+        TYPE_CHARACTER_SPECIAL,
+    ),
+    ("_kCFURLFileResourceTypeDirectory", TYPE_DIRECTORY),
+    ("_NSURLFileResourceTypeDirectory", TYPE_DIRECTORY),
+    ("_kCFURLFileResourceTypeBlockSpecial", TYPE_BLOCK_SPECIAL),
+    ("_NSURLFileResourceTypeBlockSpecial", TYPE_BLOCK_SPECIAL),
+    ("_kCFURLFileResourceTypeRegular", TYPE_REGULAR),
+    ("_NSURLFileResourceTypeRegular", TYPE_REGULAR),
+    ("_kCFURLFileResourceTypeSymbolicLink", TYPE_SYMBOLIC_LINK),
+    ("_NSURLFileResourceTypeSymbolicLink", TYPE_SYMBOLIC_LINK),
+    ("_kCFURLFileResourceTypeSocket", TYPE_SOCKET),
+    ("_NSURLFileResourceTypeSocket", TYPE_SOCKET),
+    ("_kCFURLFileResourceTypeUnknown", TYPE_UNKNOWN),
+    ("_NSURLFileResourceTypeUnknown", TYPE_UNKNOWN),
 ];
 
 const NAME: &str = "NSURLNameKey";
@@ -87,6 +127,22 @@ const IS_VOLUME: &str = "NSURLIsVolumeKey";
 const VOLUME_NAME: &str = "NSURLVolumeNameKey";
 pub const CONTENT_MODIFICATION_DATE: &str = "NSURLContentModificationDateKey";
 pub const ADDED_TO_DIRECTORY_DATE: &str = "NSURLAddedToDirectoryDateKey";
+const FILE_RESOURCE_TYPE: &str = "NSURLFileResourceTypeKey";
+const HAS_HIDDEN_EXTENSION: &str = "NSURLHasHiddenExtensionKey";
+const IS_APPLICATION: &str = "NSURLIsApplicationKey";
+const PARENT_DIRECTORY_URL: &str = "NSURLParentDirectoryURLKey";
+const TAG_NAMES: &str = "NSURLTagNamesKey";
+const VOLUME_IS_INTERNAL: &str = "NSURLVolumeIsInternalKey";
+const VOLUME_IS_LOCAL: &str = "NSURLVolumeIsLocalKey";
+pub const EFFECTIVE_ICON: &str = "NSURLEffectiveIconKey";
+const TYPE_NAMED_PIPE: &str = "NSFileTypeNamedPipe";
+const TYPE_CHARACTER_SPECIAL: &str = "NSFileTypeCharacterSpecial";
+const TYPE_DIRECTORY: &str = "NSFileTypeDirectory";
+const TYPE_BLOCK_SPECIAL: &str = "NSFileTypeBlockSpecial";
+const TYPE_REGULAR: &str = "NSFileTypeRegular";
+const TYPE_SYMBOLIC_LINK: &str = "NSFileTypeSymbolicLink";
+const TYPE_SOCKET: &str = "NSFileTypeSocket";
+const TYPE_UNKNOWN: &str = "NSFileTypeUnknown";
 
 /// What a Mac calls its boot volume, and so what the guest's `/` is called.
 const ROOT_VOLUME_NAME: &str = "Macintosh HD";
@@ -250,6 +306,55 @@ pub fn property(guest: &str, key: &str) -> Option<CFTypeRef> {
             };
             crate::string::from_bytes(name.as_bytes(), false)
         }
+        FILE_RESOURCE_TYPE => {
+            use std::os::unix::fs::FileTypeExt;
+            let kind = metadata()?.file_type();
+            let name = if kind.is_dir() {
+                TYPE_DIRECTORY
+            } else if kind.is_file() {
+                TYPE_REGULAR
+            } else if kind.is_symlink() {
+                TYPE_SYMBOLIC_LINK
+            } else if kind.is_fifo() {
+                TYPE_NAMED_PIPE
+            } else if kind.is_char_device() {
+                TYPE_CHARACTER_SPECIAL
+            } else if kind.is_block_device() {
+                TYPE_BLOCK_SPECIAL
+            } else if kind.is_socket() {
+                TYPE_SOCKET
+            } else {
+                TYPE_UNKNOWN
+            };
+            crate::base::interned_name(name) as CFTypeRef
+        }
+        // The Finder flag that hides an extension has nowhere to live here.
+        HAS_HIDDEN_EXTENSION => crate::collections::boolean(false),
+        IS_APPLICATION => crate::collections::boolean(
+            is_package(path)
+                && path
+                    .extension()
+                    .is_some_and(|e| e.eq_ignore_ascii_case("app")),
+        ),
+        PARENT_DIRECTORY_URL => {
+            let trimmed = guest.trim_end_matches('/');
+            let parent = match trimmed.rfind('/') {
+                None => return None,
+                Some(0) => "/",
+                Some(at) => &trimmed[..at],
+            };
+            if trimmed.is_empty() {
+                return None;
+            }
+            crate::url::new_file_url(parent, true)
+        }
+        // Finder tags are an extended attribute nothing on this host writes.
+        TAG_NAMES => crate::collections::new_array(
+            &[],
+            crate::callbacks::Policy::from_type_callbacks(),
+            false,
+        ),
+        VOLUME_IS_INTERNAL | VOLUME_IS_LOCAL => crate::collections::boolean(true),
         _ => return None,
     })
 }

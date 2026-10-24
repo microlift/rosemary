@@ -138,6 +138,12 @@ pub fn data_symbols() -> Vec<(String, u64)> {
             objc::class::ptr(class.metaclass()) as usize as u64,
         ));
     }
+    // Legacy `WebView`'s progress notifications, which nothing here posts.
+    symbols.extend(corefoundation::base::named_string_globals(&[
+        "WebViewProgressStartedNotification",
+        "WebViewProgressEstimateChangedNotification",
+        "WebViewProgressFinishedNotification",
+    ]));
     let cookies = foundation::notification::name_object("WKWebsiteDataTypeCookies");
     symbols.push((
         "_WKWebsiteDataTypeCookies".to_string(),

@@ -53,6 +53,44 @@ pub unsafe extern "C" fn create(
     }))
 }
 
+/// `FSEventStreamCreateRelativeToDevice`: as [`create`], with paths relative
+/// to a device's root.
+#[allow(clippy::too_many_arguments)]
+pub unsafe extern "C" fn create_relative_to_device(
+    allocator: CFTypeRef,
+    callback: Option<Callback>,
+    context: *const Context,
+    _device: i32,
+    paths: CFTypeRef,
+    since_when: u64,
+    latency: f64,
+    flags: u32,
+) -> *const Stream {
+    // SAFETY: the caller's obligations are `create`'s.
+    unsafe {
+        create(
+            allocator, callback, context, paths, since_when, latency, flags,
+        )
+    }
+}
+
+/// `FSEventStreamScheduleWithRunLoop`: where the callback would be called.
+pub unsafe extern "C" fn schedule_with_run_loop(
+    _stream: *const Stream,
+    _run_loop: CFTypeRef,
+    _mode: CFTypeRef,
+) {
+}
+
+/// `FSEventStreamEventId FSEventsGetCurrentEventId(void)`.
+///
+/// FIXME (ACCURACY): no stream here ever reports an event, so the id is a
+/// counter that only has to move forward between calls.
+pub extern "C" fn get_current_event_id() -> u64 {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    NEXT.fetch_add(1, Ordering::Relaxed)
+}
+
 pub unsafe extern "C" fn set_dispatch_queue(_stream: *const Stream, _queue: *mut c_void) {}
 
 pub unsafe extern "C" fn start(stream: *const Stream) -> u8 {
@@ -99,6 +137,10 @@ pub unsafe extern "C" fn release(stream: *const Stream) {
 exports::exports! {
     functions {
         "FSEventStreamCreate" => create,
+        "FSEventStreamCreateRelativeToDevice" => create_relative_to_device,
+        "FSEventStreamScheduleWithRunLoop" => schedule_with_run_loop,
+        "FSEventStreamUnscheduleFromRunLoop" => schedule_with_run_loop,
+        "FSEventsGetCurrentEventId" => get_current_event_id,
         "FSEventStreamSetDispatchQueue" => set_dispatch_queue,
         "FSEventStreamStart" => start,
         "FSEventStreamStop" => stop,

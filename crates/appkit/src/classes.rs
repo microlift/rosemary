@@ -17,6 +17,17 @@ static HIERARCHY: &[(&str, Option<&str>, usize)] = &[
     ("NSOpenPanel", Some("NSSavePanel"), 0),
     ("NSWindowController", Some("NSResponder"), 0),
     ("NSViewController", Some("NSResponder"), 0),
+    ("NSController", None, 0),
+    (
+        "NSUserDefaultsController",
+        Some("NSController"),
+        crate::bindings::DEFAULTS_CONTROLLER_INSTANCE_SIZE,
+    ),
+    (
+        "NSTitlebarAccessoryViewController",
+        Some("NSViewController"),
+        0,
+    ),
     ("NSView", Some("NSResponder"), crate::view::INSTANCE_SIZE),
     // Core Animation, and here for `-contentsScale`; see `crate::layer`.
     ("CALayer", None, crate::layer::INSTANCE_SIZE),
@@ -40,6 +51,10 @@ static HIERARCHY: &[(&str, Option<&str>, usize)] = &[
     ("NSSegmentedControl", Some("NSControl"), 0),
     ("NSMatrix", Some("NSControl"), 0),
     ("NSTableView", Some("NSControl"), 0),
+    ("NSOutlineView", Some("NSTableView"), 0),
+    ("NSTableCellView", Some("NSView"), 0),
+    ("NSTableRowView", Some("NSView"), 0),
+    ("NSVisualEffectView", Some("NSView"), 0),
     ("NSTableColumn", None, 0),
     ("NSTableHeaderView", Some("NSView"), 0),
     ("NSImageView", Some("NSControl"), 0),
@@ -106,6 +121,8 @@ static HIERARCHY: &[(&str, Option<&str>, usize)] = &[
     ),
     ("NSFont", None, 0),
     ("NSFontManager", None, 0),
+    // Its instances are the font dictionaries CoreText's descriptors are.
+    ("NSFontDescriptor", None, 0),
     (
         "NSOpenGLContext",
         None,

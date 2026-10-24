@@ -18,6 +18,8 @@ mod kind {
     pub const OTHER_MOUSE_DOWN: u32 = 25;
     pub const OTHER_MOUSE_UP: u32 = 26;
     pub const OTHER_MOUSE_DRAGGED: u32 = 27;
+    pub const KEY_DOWN: u32 = 10;
+    pub const KEY_UP: u32 = 11;
 
     /// Whether posting this event means "put the pointer here".
     pub fn moves_the_pointer(kind: u32) -> bool {
@@ -48,6 +50,10 @@ struct Body {
     location: NSPoint,
     /// `CGEventType`.
     kind: u32,
+    /// `CGEventFlags`, which share their bits with `NSEventModifierFlags`.
+    flags: u64,
+    /// `kCGKeyboardEventKeycode`: the virtual key, for a keyboard event.
+    key_code: u16,
 }
 
 fn class() -> &'static Class {
@@ -63,6 +69,10 @@ fn class() -> &'static Class {
 
 /// An event object the caller owns and releases with `CFRelease`.
 fn new(location: NSPoint, kind: u32) -> CFTypeRef {
+    new_with(location, kind, 0, 0)
+}
+
+fn new_with(location: NSPoint, kind: u32, flags: u64, key_code: u16) -> CFTypeRef {
     // SAFETY: `Body` begins with `isa` and is the layout `class` was registered
     // with.
     let body: *mut Body = unsafe { corefoundation::base::allocate(class()) };
@@ -73,8 +83,88 @@ fn new(location: NSPoint, kind: u32) -> CFTypeRef {
     unsafe {
         (*body).location = location;
         (*body).kind = kind;
+        (*body).flags = flags;
+        (*body).key_code = key_code;
     }
     body as CFTypeRef
+}
+
+/// The event's body, for anything this module made.
+fn body_of<'a>(event: CFTypeRef) -> Option<&'a mut Body> {
+    // SAFETY: null or an object this runtime allocated.
+    if !unsafe { corefoundation::base::is_kind_of(event, class()) } {
+        return None;
+    }
+    // SAFETY: an instance of `class()` is a `Body`.
+    Some(unsafe { &mut *(event as *mut Body) })
+}
+
+/// A CoreGraphics event describing an `NSEvent`, autoreleased: what
+/// `-[NSEvent CGEvent]` hands back, which lives as long as the event does.
+pub(crate) fn describing(kind: u64, flags: u64, key_code: u16, location: NSPoint) -> CFTypeRef {
+    let event = new_with(location, kind as u32, flags, key_code);
+    // SAFETY: a fresh object.
+    unsafe { corefoundation::api::CFAutorelease(event) }
+}
+
+/// What `+[NSEvent eventWithCGEvent:]` reads: the type, flags, key and place.
+pub(crate) fn parts(event: CFTypeRef) -> Option<(u64, u64, u16, NSPoint)> {
+    body_of(event).map(|b| (u64::from(b.kind), b.flags, b.key_code, b.location))
+}
+
+/// `CGEventRef CGEventCreateKeyboardEvent(CGEventSourceRef, CGKeyCode, bool)`.
+#[allow(non_snake_case)]
+pub unsafe extern "C" fn CGEventCreateKeyboardEvent(
+    _source: *const c_void,
+    key: u16,
+    down: bool,
+) -> CFTypeRef {
+    let kind = match down {
+        true => kind::KEY_DOWN,
+        false => kind::KEY_UP,
+    };
+    new_with(global_pointer(), kind, 0, key)
+}
+
+/// `CGEventFlags CGEventGetFlags(CGEventRef)`.
+#[allow(non_snake_case)]
+pub unsafe extern "C" fn CGEventGetFlags(event: CFTypeRef) -> u64 {
+    body_of(event).map_or(0, |b| b.flags)
+}
+
+/// `void CGEventSetFlags(CGEventRef, CGEventFlags)`.
+#[allow(non_snake_case)]
+pub unsafe extern "C" fn CGEventSetFlags(event: CFTypeRef, flags: u64) {
+    if let Some(body) = body_of(event) {
+        body.flags = flags;
+    }
+}
+
+/// `CGEventGetType`.
+#[allow(non_snake_case)]
+pub unsafe extern "C" fn CGEventGetType(event: CFTypeRef) -> u32 {
+    body_of(event).map_or(kind::NULL, |b| b.kind)
+}
+
+/// `int64_t CGEventGetIntegerValueField(CGEventRef, CGEventField)`: the key
+/// code; every other field this runtime does not track reads as zero, which
+/// is what a fresh event of that type holds.
+#[allow(non_snake_case)]
+pub unsafe extern "C" fn CGEventGetIntegerValueField(event: CFTypeRef, field: u32) -> i64 {
+    // `kCGKeyboardEventKeycode`.
+    const KEYCODE: u32 = 9;
+    match (body_of(event), field) {
+        (Some(body), KEYCODE) => i64::from(body.key_code),
+        _ => 0,
+    }
+}
+
+/// `void CGEventSetIntegerValueField(CGEventRef, CGEventField, int64_t)`.
+#[allow(non_snake_case)]
+pub unsafe extern "C" fn CGEventSetIntegerValueField(event: CFTypeRef, field: u32, value: i64) {
+    if let (Some(body), 9) = (body_of(event), field) {
+        body.key_code = value as u16;
+    }
 }
 
 /// Where the pointer is, in Quartz's global coordinates.

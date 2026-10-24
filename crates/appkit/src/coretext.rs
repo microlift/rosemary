@@ -12,7 +12,9 @@ use crate::fonts::{self, FaceInfo, LoadedFace};
 
 const ATTRIBUTE_GLOBALS: &[(&str, &str)] = &[
     ("_kCTFontCopyrightNameKey", "CTFontCopyrightNameKey"),
-    ("_kCTFontAttributeName", "CTFontAttributeName"),
+    // The attributed-string keys are shared with AppKit's where both
+    // exist, which is how one attributed string serves both frameworks.
+    ("_kCTFontAttributeName", "NSFont"),
     ("_kCTFontCascadeListAttribute", "CTFontCascadeListAttribute"),
     ("_kCTFontFamilyNameAttribute", "CTFontFamilyNameAttribute"),
     (
@@ -38,12 +40,21 @@ const ATTRIBUTE_GLOBALS: &[(&str, &str)] = &[
     ("_kCTFontURLAttribute", "CTFontURLAttribute"),
     ("_kCTFontUniqueNameKey", "CTFontUniqueNameKey"),
     ("_kCTFontWeightTrait", "CTFontWeightTrait"),
+    ("_kCTForegroundColorAttributeName", "CTForegroundColor"),
     (
-        "_kCTForegroundColorAttributeName",
-        "CTForegroundColorAttributeName",
+        "_kCTForegroundColorFromContextAttributeName",
+        "CTForegroundColorFromContext",
     ),
-    ("_kCTKernAttributeName", "CTKernAttributeName"),
-    ("_kCTLanguageAttributeName", "CTLanguageAttributeName"),
+    ("_kCTKernAttributeName", "NSKern"),
+    ("_kCTLigatureAttributeName", "NSLigature"),
+    ("_kCTParagraphStyleAttributeName", "NSParagraphStyle"),
+    ("_kCTUnderlineStyleAttributeName", "NSUnderline"),
+    ("_kCTUnderlineColorAttributeName", "CTUnderlineColor"),
+    ("_kCTStrokeWidthAttributeName", "NSStrokeWidth"),
+    ("_kCTStrokeColorAttributeName", "CTStrokeColor"),
+    ("_kCTSuperscriptAttributeName", "NSSuperScript"),
+    ("_kCTGlyphInfoAttributeName", "NSGlyphInfo"),
+    ("_kCTLanguageAttributeName", "NSLanguage"),
     (
         "_kCTTypesetterOptionForcedEmbeddingLevel",
         "CTTypesetterOptionForcedEmbeddingLevel",
@@ -868,6 +879,49 @@ pub unsafe extern "C" fn CTFontCreateWithFontDescriptor(
     make_font(descriptor, size)
 }
 
+/// `CTFontCreateCopyWithSymbolicTraits(CTFontRef, CGFloat size, const
+/// CGAffineTransform *, CTFontSymbolicTraits value, CTFontSymbolicTraits
+/// mask)`: the face of the same family with the masked traits changed, or
+/// null when the family has none, as CoreText answers.
+pub unsafe extern "C" fn CTFontCreateCopyWithSymbolicTraits(
+    font: CFTypeRef,
+    size: f64,
+    _matrix: *const c_void,
+    value: u32,
+    mask: u32,
+) -> CFTypeRef {
+    if font.is_null() {
+        return std::ptr::null();
+    }
+    let traits = get(font, "CTFontTraitsAttribute");
+    let old = get_number(traits, "CTFontSymbolicTrait").unwrap_or(0.0) as u32;
+    let wanted = (old & !mask) | (value & mask);
+    let family = get_string(font, "CTFontFamilyNameAttribute").unwrap_or_default();
+    let family = string(&family);
+    let symbolic = collections::new_number(Number::Integer(i64::from(wanted)));
+    let traits = new_dictionary(&[(key("CTFontSymbolicTrait"), symbolic)]);
+    let descriptor = new_dictionary(&[
+        (key("CTFontFamilyNameAttribute"), family),
+        (key("CTFontTraitsAttribute"), traits),
+    ]);
+    let size = match size > 0.0 {
+        true => size,
+        false => font_size(font),
+    };
+    let found = resolve(descriptor).filter(|face| {
+        (wanted & BOLD_TRAIT == 0 || face.weight >= 600)
+            && (wanted & ITALIC_TRAIT == 0 || face.italic)
+    });
+    let made = match found {
+        Some(_) => make_font(descriptor, size),
+        None => std::ptr::null(),
+    };
+    for object in [descriptor, traits, symbolic, family] {
+        release(object);
+    }
+    made
+}
+
 pub unsafe extern "C" fn CTFontCreateCopyWithAttributes(
     font: CFTypeRef,
     size: f64,
@@ -1065,6 +1119,7 @@ exports::exports! {
         "CTFontDescriptorCreateWithNameAndSize" => CTFontDescriptorCreateWithNameAndSize,
         "CTFontDescriptorCreateMatchingFontDescriptors" => CTFontDescriptorCreateMatchingFontDescriptors,
         "CTFontCreateCopyWithAttributes" => CTFontCreateCopyWithAttributes,
+        "CTFontCreateCopyWithSymbolicTraits" => CTFontCreateCopyWithSymbolicTraits,
         "CTFontCreateWithGraphicsFont" => CTFontCreateWithGraphicsFont,
         "CTGetCoreTextVersion" => CTGetCoreTextVersion,
     }

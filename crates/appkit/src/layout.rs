@@ -23,6 +23,9 @@ pub struct Constraint {
     constant: f64,
     priority: f32,
     active: usize,
+    /// The view `-addConstraint:` installed it on, unretained; nil for one
+    /// activated directly.
+    owner: Id,
 }
 
 pub const INSTANCE_SIZE: usize = size_of::<Constraint>();
@@ -74,71 +77,6 @@ fn constraint_of<'a>(receiver: Id) -> &'a mut Constraint {
     unsafe { &mut *(receiver as *mut Constraint) }
 }
 
-#[derive(Clone, Copy, PartialEq)]
-enum Axis {
-    X,
-    Y,
-}
-
-/// Which quantity along an axis an attribute names; the index into
-/// [`Known::values`].
-const MIN: usize = 0;
-const MAX: usize = 1;
-const CENTER: usize = 2;
-const SIZE: usize = 3;
-
-/// `NSLayoutAttribute`, along an axis of a view whose superview is `flipped`.
-///
-/// Margins and baselines are the edges they sit nearest: an AppKit view has no
-/// layout margins of its own, and a view here has no text to measure a
-/// baseline from.
-fn classify(attribute: isize, flipped: bool) -> Option<(Axis, usize)> {
-    let (top, bottom) = if flipped { (MIN, MAX) } else { (MAX, MIN) };
-    Some(match attribute {
-        1 | 5 | 13 | 17 => (Axis::X, MIN),
-        2 | 6 | 14 | 18 => (Axis::X, MAX),
-        9 | 19 => (Axis::X, CENTER),
-        7 => (Axis::X, SIZE),
-        3 | 12 | 15 => (Axis::Y, top),
-        4 | 11 | 16 => (Axis::Y, bottom),
-        10 | 20 => (Axis::Y, CENTER),
-        8 => (Axis::Y, SIZE),
-        _ => return None,
-    })
-}
-
-fn along(rect: NSRect, axis: Axis) -> (f64, f64) {
-    match axis {
-        Axis::X => (rect.origin.x, rect.size.width),
-        Axis::Y => (rect.origin.y, rect.size.height),
-    }
-}
-
-fn measure(rect: NSRect, axis: Axis, what: usize) -> f64 {
-    let (origin, size) = along(rect, axis);
-    match what {
-        MIN => origin,
-        MAX => origin + size,
-        CENTER => origin + size / 2.0,
-        _ => size,
-    }
-}
-
-/// `item`'s rectangle in the coordinates of `space`, a view's superview.
-fn rect_in(item: Id, space: Id) -> Option<NSRect> {
-    if !view::is_view(item) {
-        return None;
-    }
-    let bounds = NSRect {
-        origin: NSPoint { x: 0.0, y: 0.0 },
-        size: view::frame_of(item).size,
-    };
-    if item == space {
-        return Some(bounds);
-    }
-    Some(view::convert_rect(bounds, item, space))
-}
-
 pub(crate) fn is_flipped(view: Id) -> bool {
     let sel = objc::sel::get("isFlipped");
     // SAFETY: `-isFlipped` is `BOOL (id, SEL)`, sent so a guest override answers.
@@ -148,209 +86,449 @@ pub(crate) fn is_flipped(view: Id) -> bool {
     }
 }
 
-/// What the constraints say about one axis of one view.
-#[derive(Default)]
-struct Known {
-    values: [Option<f64>; 4],
-    smallest: Option<f64>,
-    largest: Option<f64>,
+use crate::cassowary::{Expression, REQUIRED as SOLVER_REQUIRED, Relation, Solver};
+
+/// A constraint priority as a solver strength. Each hundred points of
+/// priority is a factor of ten, so that many constraints of one priority do
+/// not outweigh a single one of a higher priority, which is how Auto Layout
+/// treats them.
+fn strength(priority: f32) -> f64 {
+    match priority >= REQUIRED {
+        true => SOLVER_REQUIRED,
+        false => 10f64.powf(f64::from(priority.max(0.0)) / 100.0),
+    }
 }
 
-impl Known {
-    /// How many of the edges and centre along this axis are known.
-    fn positions(&self) -> usize {
-        let [min, max, center, _] = self.values;
-        [min, max, center].iter().filter(|v| v.is_some()).count()
+/// What keeps a view the constraints leave free where it already is.
+const STAY: f64 = 1e-3;
+
+/// The views of one solve and their variables: each view's left, top, width
+/// and height, in the top-down coordinates of the tree's root.
+struct System {
+    views: Vec<Id>,
+    index: std::collections::HashMap<usize, usize>,
+    /// The view whose fitting size is being found, which is then the top of
+    /// the system; none for a whole window's solve.
+    root: Option<Id>,
+}
+
+impl System {
+    fn left(i: usize) -> usize {
+        4 * i
+    }
+    fn top(i: usize) -> usize {
+        4 * i + 1
+    }
+    fn width(i: usize) -> usize {
+        4 * i + 2
+    }
+    fn height(i: usize) -> usize {
+        4 * i + 3
     }
 
-    /// Whether both the position and the size along this axis are known.
-    fn determined(&self) -> bool {
-        let positions = self.positions();
-        positions >= 2 || (positions == 1 && self.values[SIZE].is_some())
-    }
-
-    /// Take what `other` knows where this does not, unless this axis is
-    /// already fixed.
-    fn fill_from(&mut self, other: &Known) {
-        if self.determined() {
-            return;
-        }
-        for (value, fallback) in self.values.iter_mut().zip(other.values) {
-            if value.is_none() {
-                *value = fallback;
+    /// Add `view` and every view above it, up to the root.
+    fn add(&mut self, view: Id) {
+        let mut at = view;
+        while view::is_view(at) && !self.index.contains_key(&(at as usize)) {
+            self.index.insert(at as usize, self.views.len());
+            self.views.push(at);
+            if Some(at) == self.root {
+                break;
             }
+            // SAFETY: a view of this crate's.
+            at = unsafe { view::superview_of(at) };
         }
     }
 
-    /// The view's new origin and size along this axis, from `current`; a
-    /// size the constraints leave open is the view's `intrinsic` one, as
-    /// AppKit's content-size constraints make it, else what it already has.
-    fn place(&self, current: (f64, f64), intrinsic: Option<f64>) -> (f64, f64) {
-        let [min, max, center, size] = self.values;
-        let mut size = size
-            .or(min.zip(max).map(|(a, b)| b - a))
-            .or(min.zip(center).map(|(a, c)| 2.0 * (c - a)))
-            .or(max.zip(center).map(|(b, c)| 2.0 * (b - c)))
-            .or(intrinsic)
-            .unwrap_or(current.1);
-        if let Some(largest) = self.largest {
-            size = size.min(largest);
-        }
-        if let Some(smallest) = self.smallest {
-            size = size.max(smallest);
-        }
-        let size = size.max(0.0);
-        let origin = min
-            .or(max.map(|b| b - size))
-            .or(center.map(|c| c - size / 2.0))
-            .unwrap_or(current.0);
-        (origin, size)
-    }
-}
-
-/// The width and height `target` has from a label pinned inside it to both
-/// edges of an axis: the label's own size and the two insets, which is what
-/// AppKit's fitting size makes of a badge around its text.
-fn enclosed_size(target: Id, constraints: &[&Constraint]) -> [Option<f64>; 2] {
-    let flipped = is_flipped(target);
-    let mut out = [None, None];
-    // Per child and axis: the leading inset and the trailing one.
-    let mut edges: Vec<(Id, Axis, Option<f64>, Option<f64>)> = Vec::new();
-    for c in constraints {
-        if c.second != target || c.first == target || c.relation != EQUAL || c.multiplier != 1.0 {
-            continue;
-        }
-        let (Some((axis, what)), Some((other_axis, other))) = (
-            classify(c.first_attribute, flipped),
-            classify(c.second_attribute, flipped),
-        ) else {
-            continue;
+    /// Whether `view` is the root or under it; every view is, with no root.
+    fn within(&self, view: Id) -> bool {
+        let Some(root) = self.root else {
+            return true;
         };
-        if axis != other_axis || what != other || !(what == MIN || what == MAX) {
-            continue;
-        }
-        let at = match edges
-            .iter()
-            .position(|(v, a, ..)| *v == c.first && *a == axis)
-        {
-            Some(at) => at,
-            None => {
-                edges.push((c.first, axis, None, None));
-                edges.len() - 1
+        let mut at = view;
+        while view::is_view(at) {
+            if at == root {
+                return true;
             }
-        };
-        match what {
-            MIN => edges[at].2 = Some(c.constant),
-            _ => edges[at].3 = Some(-c.constant),
+            // SAFETY: as above.
+            at = unsafe { view::superview_of(at) };
         }
+        false
     }
-    for (child, axis, lead, trail) in edges {
-        let (Some(lead), Some(trail)) = (lead, trail) else {
-            continue;
-        };
-        let Some(size) = crate::label::intrinsic_size(child) else {
-            continue;
-        };
-        let (slot, length) = match axis {
-            Axis::X => (0, size.width),
-            Axis::Y => (1, size.height),
-        };
-        let total = lead + length + trail;
-        out[slot] = Some(out[slot].map_or(total, |t: f64| t.max(total)));
+
+    fn superview(&self, view: Id) -> Option<usize> {
+        if Some(view) == self.root {
+            return None;
+        }
+        // SAFETY: a view of this crate's.
+        let parent = unsafe { view::superview_of(view) };
+        self.index.get(&(parent as usize)).copied()
     }
-    out
+
+    /// The nearest view both are in, each counting as in itself.
+    fn common_ancestor(&self, a: Id, b: Id) -> Option<usize> {
+        let mut chain = Vec::new();
+        let mut at = a;
+        while view::is_view(at) {
+            chain.push(at);
+            // SAFETY: as above.
+            at = unsafe { view::superview_of(at) };
+        }
+        let mut at = b;
+        while view::is_view(at) {
+            if chain.contains(&at) {
+                return self.index.get(&(at as usize)).copied();
+            }
+            // SAFETY: as above.
+            at = unsafe { view::superview_of(at) };
+        }
+        None
+    }
+
+    /// `view`'s `attribute` as an expression, a position measured from the
+    /// origin of `space`, the view the constraint is expressed in.
+    ///
+    /// FIXME (ACCURACY): baselines are the bottom and top edges, and the
+    /// margin attributes are the edges, as a view here has no text metrics
+    /// to place a baseline by and no layout margins.
+    fn attribute(&self, view: usize, attribute: isize, space: usize) -> Option<Expression> {
+        let var = |v| Expression::var(v);
+        let left = var(Self::left(view)).plus(&var(Self::left(space)), -1.0);
+        let top = var(Self::top(view)).plus(&var(Self::top(space)), -1.0);
+        let width = var(Self::width(view));
+        let height = var(Self::height(view));
+        Some(match attribute {
+            1 | 5 | 13 | 17 => left,
+            2 | 6 | 14 | 18 => left.plus(&width, 1.0),
+            3 | 12 | 15 => top,
+            4 | 11 | 16 => top.plus(&height, 1.0),
+            7 => width,
+            8 => height,
+            9 | 19 => left.plus(&width, 0.5),
+            10 | 20 => top.plus(&height, 0.5),
+            _ => return None,
+        })
+    }
 }
 
-/// Where `target`'s constraints put it, in its superview's coordinates.
-fn place(target: Id, constraints: &[&Constraint]) -> Option<NSRect> {
-    // SAFETY: a view of this crate's, as every constrained item is.
-    let space = unsafe { view::superview_of(target) };
-    if !view::is_view(space) {
-        return None;
-    }
-    let flipped = is_flipped(space);
-    let current = view::frame_of(target);
-    let mut x = Known::default();
-    let mut y = Known::default();
-    // What constraints naming `target` second say about it, which only fills
-    // what none naming it first does: a box pinned to the edges of a stack
-    // inside it would otherwise size the stack from the box's own unsolved
-    // size, and each would keep the other at zero.
-    let mut inverse_x = Known::default();
-    let mut inverse_y = Known::default();
-    for c in constraints {
-        let inverse = c.first != target;
-        // The side `target` is on, and the value the other side gives it.
-        let (attribute, relation, value) = if c.first == target {
-            let value = if c.second.is_null() || c.second_attribute == 0 {
-                c.constant
-            } else {
-                let Some((axis, what)) = classify(c.second_attribute, flipped) else {
-                    continue;
-                };
-                let rect = if c.second == target {
-                    Some(current)
-                } else {
-                    rect_in(c.second, space)
-                };
-                let Some(rect) = rect else {
-                    continue;
-                };
-                c.multiplier * measure(rect, axis, what) + c.constant
-            };
-            (c.first_attribute, c.relation, value)
-        } else if c.second == target && c.relation == EQUAL && c.multiplier != 0.0 {
-            let Some((axis, what)) = classify(c.first_attribute, flipped) else {
-                continue;
-            };
-            let Some(rect) = rect_in(c.first, space) else {
-                continue;
-            };
-            let value = (measure(rect, axis, what) - c.constant) / c.multiplier;
-            (c.second_attribute, EQUAL, value)
-        } else {
-            continue;
-        };
-        let Some((axis, what)) = classify(attribute, flipped) else {
-            continue;
-        };
-        let known = match (axis, inverse) {
-            (Axis::X, false) => &mut x,
-            (Axis::Y, false) => &mut y,
-            (Axis::X, true) => &mut inverse_x,
-            (Axis::Y, true) => &mut inverse_y,
-        };
-        match (relation, what) {
-            (EQUAL, _) => known.values[what] = Some(value),
-            (LESS_OR_EQUAL, SIZE) => known.largest = Some(value),
-            (_, SIZE) => known.smallest = Some(value),
-            _ => {}
-        }
-    }
-    // A view held by one edge of its own and nothing else along an axis is as
-    // big as its content, before what other views' constraints say about it
-    // fills the rest: that is what its content hugging does in AppKit, and it
-    // is what lets a label beside a stretching one keep its own width.
-    let intrinsic = match crate::label::intrinsic_size(target) {
-        Some(size) => [Some(size.width), Some(size.height)],
-        None => enclosed_size(target, constraints),
-    };
-    for (known, length) in [(&mut x, intrinsic[0]), (&mut y, intrinsic[1])] {
-        if let Some(length) = length
-            && known.values[SIZE].is_none()
-            && known.positions() == 1
-        {
-            known.values[SIZE] = Some(length.max(known.smallest.unwrap_or(0.0)));
-        }
-    }
-    x.fill_from(&inverse_x);
-    y.fill_from(&inverse_y);
-    let (ox, width) = x.place(along(current, Axis::X), intrinsic[0]);
-    let (oy, height) = y.place(along(current, Axis::Y), intrinsic[1]);
-    Some(NSRect {
-        origin: NSPoint { x: ox, y: oy },
-        size: NSSize { width, height },
+/// `-intrinsicContentSize`, sent so a guest's override answers; `None` when
+/// the class has no such method.
+fn intrinsic_content_size(view: Id) -> Option<NSSize> {
+    let sel = objc::sel::get("intrinsicContentSize");
+    // SAFETY: a live object.
+    let class = unsafe { objc::object::class_of(view) }?;
+    class.method(sel)?;
+    // SAFETY: `NSSize (id, SEL)`, two doubles returned in registers.
+    Some(unsafe {
+        let f: unsafe extern "C" fn(Id, Sel) -> NSSize = std::mem::transmute(objc::msg::entry());
+        f(view, sel)
     })
+}
+
+/// Whether the solver leaves `view` alone: its frame is set by its program,
+/// by autoresizing, or by the stack that arranges it.
+fn pinned(view: Id) -> bool {
+    !view::is_constrained(view) || crate::controls::is_arranged(view)
+}
+
+/// What pulls a view towards its smallest size when its fitting size is
+/// asked for: above the stays, below every real priority.
+const FIT: f64 = 1e-2;
+
+/// Solve `constraints` and the frames they leave fixed. Answers each view of
+/// the system with where the solution puts it, in its superview, and the
+/// root's size when `root` asks for a fitting size.
+fn solve_system(constraints: &[&Constraint], root: Option<Id>) -> (Vec<(Id, NSRect)>, NSSize) {
+    let mut system = System {
+        views: Vec::new(),
+        index: std::collections::HashMap::new(),
+        root,
+    };
+    if let Some(root) = root {
+        system.add(root);
+    }
+    let constraints: Vec<&Constraint> = constraints
+        .iter()
+        .copied()
+        .filter(|c| system.within(c.first) && (!view::is_view(c.second) || system.within(c.second)))
+        .collect();
+    for c in &constraints {
+        for item in [c.first, c.second] {
+            if view::is_view(item) {
+                system.add(item);
+            }
+        }
+    }
+    let mut solver = Solver::new();
+    let add = |solver: &mut Solver, e: Expression, relation: Relation, strength: f64| {
+        if solver.add(&e, relation, strength).is_err() {
+            // AppKit breaks one of the conflicting constraints and carries
+            // on; this keeps it, at the highest strength that can lose.
+            let _ = solver.add(&e, relation, self::strength(999.0));
+        }
+    };
+    let flipped: Vec<bool> = system.views.iter().map(|v| is_flipped(*v)).collect();
+    for (i, &view) in system.views.iter().enumerate() {
+        let frame = view::frame_of(view);
+        let (l, t, w, h) = (
+            System::left(i),
+            System::top(i),
+            System::width(i),
+            System::height(i),
+        );
+        let var = Expression::var;
+        let pin = |solver: &mut Solver, v, value: f64, strength| {
+            add(
+                solver,
+                var(v).add_constant(-value),
+                Relation::Equal,
+                strength,
+            );
+        };
+        let parent = system.superview(view);
+        let fitting = Some(view) == system.root;
+        let fixed = (pinned(view) || parent.is_none()) && !fitting;
+        let strength = if fixed { SOLVER_REQUIRED } else { STAY };
+        // A view its mask places moves with its superview, as the
+        // constraints AppKit makes of the mask say, rather than staying put.
+        let rates = match parent {
+            Some(p) if fixed && !crate::controls::is_arranged(view) => {
+                view::autoresizing_rates(view).map(|rates| (p, rates))
+            }
+            _ => None,
+        };
+        if let Some((p, [(kx, kw), (ky, kh)])) = rates {
+            let old = view::frame_of(system.views[p]).size;
+            let follow =
+                |solver: &mut Solver, own: Expression, rate: f64, along: usize, was: f64| {
+                    let e = own.plus(&var(along), -rate).add_constant(rate * was);
+                    add(solver, e, Relation::Equal, SOLVER_REQUIRED);
+                };
+            let width = var(w).add_constant(-frame.size.width);
+            follow(&mut solver, width, kw, System::width(p), old.width);
+            let height = var(h).add_constant(-frame.size.height);
+            follow(&mut solver, height, kh, System::height(p), old.height);
+            let left = var(l)
+                .plus(&var(System::left(p)), -1.0)
+                .add_constant(-frame.origin.x);
+            follow(&mut solver, left, kx, System::width(p), old.width);
+            // The mask's y is the frame's, so from the top in a flipped
+            // superview and from the bottom otherwise.
+            let (top, rate) = match flipped[p] {
+                true => (
+                    var(t)
+                        .plus(&var(System::top(p)), -1.0)
+                        .add_constant(-frame.origin.y),
+                    ky,
+                ),
+                false => (
+                    var(t)
+                        .plus(&var(System::top(p)), -1.0)
+                        .plus(&var(System::height(p)), -1.0)
+                        .plus(&var(h), 1.0)
+                        .add_constant(frame.origin.y),
+                    -ky,
+                ),
+            };
+            follow(&mut solver, top, rate, System::height(p), old.height);
+            continue;
+        }
+        match fitting {
+            true => {
+                pin(&mut solver, w, 0.0, FIT);
+                pin(&mut solver, h, 0.0, FIT);
+            }
+            false => {
+                pin(&mut solver, w, frame.size.width, strength);
+                pin(&mut solver, h, frame.size.height, strength);
+            }
+        }
+        match parent {
+            // The top of the tree is the origin of the system.
+            None => {
+                pin(&mut solver, l, 0.0, SOLVER_REQUIRED);
+                pin(&mut solver, t, 0.0, SOLVER_REQUIRED);
+            }
+            Some(p) => {
+                // left = parent.left + x, and top from the parent's top, or
+                // from its bottom when the parent counts y upwards.
+                let left = var(l)
+                    .plus(&var(System::left(p)), -1.0)
+                    .add_constant(-frame.origin.x);
+                add(&mut solver, left, Relation::Equal, strength);
+                let top = match flipped[p] {
+                    true => var(t)
+                        .plus(&var(System::top(p)), -1.0)
+                        .add_constant(-frame.origin.y),
+                    false => var(t)
+                        .plus(&var(System::top(p)), -1.0)
+                        .plus(&var(System::height(p)), -1.0)
+                        .add_constant(frame.origin.y + frame.size.height),
+                };
+                // A free view's top follows its height when the parent counts
+                // upwards: what stays put on screen is its bottom edge.
+                let top = match (fixed, flipped[p]) {
+                    (false, false) => top.plus(&var(h), 1.0).add_constant(-frame.size.height),
+                    _ => top,
+                };
+                add(&mut solver, top, Relation::Equal, strength);
+            }
+        }
+        if fixed {
+            continue;
+        }
+        // Content hugging and compression resistance, at their priorities.
+        if let Some(size) = intrinsic_content_size(view) {
+            for (v, length, orientation) in [(w, size.width, 0), (h, size.height, 1)] {
+                if length < 0.0 {
+                    continue;
+                }
+                let hugging = content_priority(view, priority_slot(false, orientation));
+                let resistance = content_priority(view, priority_slot(true, orientation));
+                let e = var(v).add_constant(-length);
+                add(
+                    &mut solver,
+                    e.clone(),
+                    Relation::LessOrEqual,
+                    self::strength(hugging),
+                );
+                add(
+                    &mut solver,
+                    e,
+                    Relation::GreaterOrEqual,
+                    self::strength(resistance),
+                );
+            }
+        }
+        // No negative sizes.
+        add(
+            &mut solver,
+            var(w),
+            Relation::GreaterOrEqual,
+            SOLVER_REQUIRED,
+        );
+        add(
+            &mut solver,
+            var(h),
+            Relation::GreaterOrEqual,
+            SOLVER_REQUIRED,
+        );
+    }
+    for c in &constraints {
+        let Some(&first) = system.index.get(&(c.first as usize)) else {
+            continue;
+        };
+        let has_second = view::is_view(c.second) && c.second_attribute != 0;
+        let space = match has_second {
+            true => system.common_ancestor(c.first, c.second),
+            false => system.superview(c.first).or(Some(first)),
+        };
+        let Some(space) = space else {
+            continue;
+        };
+        let Some(lhs) = system.attribute(first, c.first_attribute, space) else {
+            continue;
+        };
+        let rhs = match has_second {
+            true => {
+                let Some(&second) = system.index.get(&(c.second as usize)) else {
+                    continue;
+                };
+                let Some(e) = system.attribute(second, c.second_attribute, space) else {
+                    continue;
+                };
+                Expression::constant(0.0).plus(&e, c.multiplier)
+            }
+            false => Expression::constant(0.0),
+        }
+        .add_constant(c.constant);
+        let relation = match c.relation {
+            LESS_OR_EQUAL => Relation::LessOrEqual,
+            GREATER_OR_EQUAL => Relation::GreaterOrEqual,
+            _ => Relation::Equal,
+        };
+        add(
+            &mut solver,
+            lhs.plus(&rhs, -1.0),
+            relation,
+            strength(c.priority),
+        );
+    }
+    // Each free view's frame, in its superview, with its edges on whole
+    // points as AppKit puts them.
+    let mut out = Vec::new();
+    for (i, &view) in system.views.iter().enumerate() {
+        let Some(p) = system.superview(view) else {
+            continue;
+        };
+        if pinned(view) {
+            continue;
+        }
+        let value = |v| solver.value(v);
+        let (pl, pt, ph) = (
+            value(System::left(p)),
+            value(System::top(p)),
+            value(System::height(p)),
+        );
+        let left = (value(System::left(i)) - pl).round();
+        let right = (value(System::left(i)) + value(System::width(i)) - pl).round();
+        let top = (value(System::top(i)) - pt).round();
+        let bottom = (value(System::top(i)) + value(System::height(i)) - pt).round();
+        let height = (bottom - top).max(0.0);
+        let y = match flipped[p] {
+            true => top,
+            false => ph.round() - bottom,
+        };
+        out.push((
+            view,
+            NSRect {
+                origin: NSPoint { x: left, y },
+                size: NSSize {
+                    width: (right - left).max(0.0),
+                    height,
+                },
+            },
+        ));
+    }
+    let size = match root.and_then(|r| system.index.get(&(r as usize)).copied()) {
+        Some(i) => NSSize {
+            width: solver.value(System::width(i)).max(0.0).ceil(),
+            height: solver.value(System::height(i)).max(0.0).ceil(),
+        },
+        None => NSSize::default(),
+    };
+    (out, size)
+}
+
+/// `-[NSView fittingSize]`: the smallest size the view's own constraints and
+/// its subviews' allow.
+unsafe extern "C" fn fitting_size(receiver: Id, _sel: Sel) -> NSSize {
+    if !SOLVING.get() {
+        update_constraints();
+    }
+    let snapshot: Vec<usize> = ACTIVE.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    for c in &snapshot {
+        objc::arc::retain(*c as Id);
+    }
+    let constraints: Vec<&Constraint> =
+        snapshot.iter().map(|c| &*constraint_of(*c as Id)).collect();
+    let (_, size) = solve_system(&constraints, Some(receiver));
+    for c in snapshot {
+        objc::arc::release(c as Id);
+    }
+    size
+}
+
+/// `-[NSView intrinsicContentSize]`: a plain view has none of its own.
+unsafe extern "C" fn no_intrinsic_size(_receiver: Id, _sel: Sel) -> NSSize {
+    NSSize {
+        width: -1.0,
+        height: -1.0,
+    }
+}
+
+unsafe extern "C" fn invalidate_intrinsic_size(_receiver: Id, _sel: Sel) {
+    solve();
 }
 
 fn differs(a: NSRect, b: NSRect) -> bool {
@@ -378,39 +556,23 @@ pub(crate) fn set_frame(target: Id, frame: NSRect) -> bool {
     true
 }
 
-/// One pass over every constrained view; whether any of them moved.
+/// One solve of every active constraint; whether any view moved.
 fn pass() -> bool {
     let snapshot: Vec<usize> = ACTIVE.lock().unwrap_or_else(|e| e.into_inner()).clone();
     // Held for the pass: a guest's `-setFrame:` may deactivate one.
     for c in &snapshot {
         objc::arc::retain(*c as Id);
     }
-    let mut constraints: Vec<&Constraint> =
+    let constraints: Vec<&Constraint> =
         snapshot.iter().map(|c| &*constraint_of(*c as Id)).collect();
-    // Stable, so that among equal priorities the later constraint wins.
-    constraints.sort_by(|a, b| a.priority.total_cmp(&b.priority));
-    let mut targets: Vec<Id> = Vec::new();
-    for c in &constraints {
-        for item in [c.first, c.second] {
-            if view::is_constrained(item) && !targets.contains(&item) {
-                targets.push(item);
-            }
-        }
-    }
+    let (mut placed, _) = solve_system(&constraints, None);
+    // Parents first: a parent's new size resizes its autoresizing children,
+    // which the next pass then holds where that left them.
+    // SAFETY: views of this crate's.
+    placed.sort_by_key(|(view, _)| depth(*view));
     let mut moved = false;
-    for target in targets {
-        // A stack places what it arranges; its constraints only size it.
-        if crate::controls::is_arranged(target) {
-            continue;
-        }
-        let related: Vec<&Constraint> = constraints
-            .iter()
-            .copied()
-            .filter(|c| c.first == target || c.second == target)
-            .collect();
-        if let Some(frame) = place(target, &related) {
-            moved |= set_frame(target, frame);
-        }
+    for (view, frame) in placed {
+        moved |= set_frame(view, frame);
     }
     moved |= crate::controls::arrange_stacks();
     moved |= fit_windows();
@@ -418,6 +580,18 @@ fn pass() -> bool {
         objc::arc::release(c as Id);
     }
     moved
+}
+
+/// How many superviews `view` has.
+fn depth(view: Id) -> usize {
+    let mut depth = 0;
+    // SAFETY: views of this crate's.
+    let mut at = unsafe { view::superview_of(view) };
+    while view::is_view(at) {
+        depth += 1;
+        at = unsafe { view::superview_of(at) };
+    }
+    depth
 }
 
 /// What `view`'s own constraints say its width and height are, each as
@@ -475,11 +649,30 @@ fn fit_windows() -> bool {
     moved
 }
 
-/// Bring every constrained view to where its constraints put it.
+/// Set by every change a layout pass would act on.
+static LAYOUT_NEEDED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Note that the constraints or the geometry they depend on changed.
 ///
-/// Called on every geometry change. Placing one view changes others', which
-/// calls back in; that re-entry only marks the running solve dirty.
+/// The solve itself waits for the next layout pass, before the windows draw,
+/// or for a program that asks for one: AppKit defers layout the same way,
+/// and a view is routinely given its constraints in its own initializer,
+/// which a solve run from inside it would reach half made.
 pub(crate) fn solve() {
+    LAYOUT_NEEDED.store(true, std::sync::atomic::Ordering::Release);
+}
+
+/// The layout pass: views owed `-updateConstraints` get it, then every
+/// constrained view goes where its constraints put it, if anything changed.
+pub(crate) fn layout_now() {
+    if SOLVING.get() {
+        DIRTY.set(true);
+        return;
+    }
+    update_constraints();
+    if !LAYOUT_NEEDED.swap(false, std::sync::atomic::Ordering::AcqRel) {
+        return;
+    }
     if ACTIVE.lock().unwrap_or_else(|e| e.into_inner()).is_empty() && !crate::controls::has_stacks()
     {
         return;
@@ -497,10 +690,19 @@ pub(crate) fn solve() {
         }
     }
     SOLVING.set(false);
+    // What placing views changed is settled by the passes above.
+    LAYOUT_NEEDED.store(false, std::sync::atomic::Ordering::Release);
 }
 
 /// Drop every active constraint on a view that is going away.
 pub(crate) fn forget(view: Id) {
+    if let Some(introduced) = INTRODUCED
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_mut()
+    {
+        introduced.remove(&(view as usize));
+    }
     let gone: Vec<usize> = {
         let mut active = ACTIVE.lock().unwrap_or_else(|e| e.into_inner());
         let (gone, kept) = active.drain(..).partition(|c| {
@@ -570,6 +772,187 @@ unsafe extern "C" fn constraint_with_item(
     c.constant = constant;
     c.priority = REQUIRED;
     objc::arc::autorelease(object)
+}
+
+/// A new constraint, autoreleased, for another module of this crate.
+pub(crate) fn new_constraint(
+    first: (Id, isize),
+    relation: isize,
+    second: (Id, isize),
+    multiplier: f64,
+    constant: f64,
+) -> Id {
+    make(first, relation, second, multiplier, constant)
+}
+
+pub(crate) fn set_priority_of(constraint: Id, priority: f32) {
+    if !constraint.is_null() {
+        constraint_of(constraint).priority = priority;
+    }
+}
+
+/// `-[NSView addConstraint:]`: active, and listed by the view's
+/// `-constraints`.
+unsafe extern "C" fn add_constraint(receiver: Id, _sel: Sel, constraint: Id) {
+    if constraint.is_null() {
+        return;
+    }
+    constraint_of(constraint).owner = receiver;
+    if set_active(constraint, true) {
+        solve();
+    }
+}
+
+unsafe extern "C" fn add_constraints(receiver: Id, _sel: Sel, constraints: Id) {
+    each_in(constraints, |c| {
+        constraint_of(c).owner = receiver;
+        set_active(c, true);
+    });
+    solve();
+}
+
+unsafe extern "C" fn remove_constraint(_receiver: Id, _sel: Sel, constraint: Id) {
+    if constraint.is_null() {
+        return;
+    }
+    constraint_of(constraint).owner = std::ptr::null_mut();
+    if set_active(constraint, false) {
+        solve();
+    }
+}
+
+unsafe extern "C" fn remove_constraints(_receiver: Id, _sel: Sel, constraints: Id) {
+    each_in(constraints, |c| {
+        constraint_of(c).owner = std::ptr::null_mut();
+        set_active(c, false);
+    });
+    solve();
+}
+
+/// `-[NSView constraints]`: the active ones installed on this view.
+unsafe extern "C" fn view_constraints(receiver: Id, _sel: Sel) -> Id {
+    let owned: Vec<corefoundation::base::CFTypeRef> = ACTIVE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+        .filter(|c| constraint_of(**c as Id).owner == receiver)
+        .map(|c| *c as corefoundation::base::CFTypeRef)
+        .collect();
+    let array = corefoundation::collections::new_array(
+        &owned,
+        corefoundation::callbacks::Policy::from_type_callbacks(),
+        false,
+    );
+    objc::arc::autorelease(array as Id)
+}
+
+/// Views owed an `-updateConstraints`, each retained.
+static NEEDS_UPDATE: Mutex<Vec<usize>> = Mutex::new(Vec::new());
+
+/// `-setNeedsUpdateConstraints:`: the view's `-updateConstraints`, which a
+/// subclass overrides to make its constraints, is sent before the next solve.
+unsafe extern "C" fn set_needs_update_constraints(receiver: Id, _sel: Sel, needed: u8) {
+    if needed == 0 {
+        return;
+    }
+    let mut pending = NEEDS_UPDATE.lock().unwrap_or_else(|e| e.into_inner());
+    if !pending.contains(&(receiver as usize)) {
+        pending.push(objc::arc::retain(receiver) as usize);
+    }
+}
+
+unsafe extern "C" fn needs_update_constraints(receiver: Id, _sel: Sel) -> u8 {
+    NEEDS_UPDATE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .contains(&(receiver as usize)) as u8
+}
+
+/// Send `-updateConstraints` to every view owed one. A view may ask again
+/// from inside it, which is honoured on the next round, as AppKit's own
+/// loop does.
+pub(crate) fn update_constraints() {
+    for _ in 0..8 {
+        let pending: Vec<usize> =
+            std::mem::take(&mut *NEEDS_UPDATE.lock().unwrap_or_else(|e| e.into_inner()));
+        if pending.is_empty() {
+            return;
+        }
+        for view in pending {
+            // SAFETY: a view, sent its `void (id, SEL)` hook.
+            unsafe {
+                let f: unsafe extern "C" fn(Id, Sel) = std::mem::transmute(objc::msg::entry());
+                f(view as Id, objc::sel::get("updateConstraints"));
+            }
+            objc::arc::release(view as Id);
+        }
+    }
+}
+
+/// Views that have had the `-updateConstraints` every new view is owed when
+/// it first appears in a window, as AppKit's first layout pass sends it.
+static INTRODUCED: Mutex<Option<std::collections::HashSet<usize>>> = Mutex::new(None);
+
+/// Set when a view joins a window, so the next [`prepare`] looks for views
+/// that have not been introduced.
+static TREE_CHANGED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+
+pub(crate) fn note_tree_changed() {
+    TREE_CHANGED.store(true, std::sync::atomic::Ordering::Release);
+}
+
+/// Before the windows draw: every view in a shown one not yet sent
+/// `-updateConstraints` is owed one, and then the constraints are solved.
+pub(crate) fn prepare() {
+    if !TREE_CHANGED.swap(false, std::sync::atomic::Ordering::AcqRel) {
+        layout_now();
+        return;
+    }
+    let mut stack: Vec<Id> = crate::window::all()
+        .into_iter()
+        .filter(|w| crate::window::is_shown(*w))
+        .map(crate::window::content_view_of)
+        .collect();
+    let mut owed = Vec::new();
+    {
+        let mut introduced = INTRODUCED.lock().unwrap_or_else(|e| e.into_inner());
+        let introduced = introduced.get_or_insert_default();
+        while let Some(view) = stack.pop() {
+            if !view::is_view(view) {
+                continue;
+            }
+            if introduced.insert(view as usize) {
+                owed.push(view);
+            }
+            stack.extend(view::subviews_of(view));
+        }
+    }
+    {
+        let mut pending = NEEDS_UPDATE.lock().unwrap_or_else(|e| e.into_inner());
+        // Deepest first, as AppKit updates a subtree from its leaves up.
+        for view in owed.into_iter().rev() {
+            if !pending.contains(&(view as usize)) {
+                pending.push(objc::arc::retain(view) as usize);
+            }
+        }
+    }
+    solve();
+    layout_now();
+}
+
+/// `-[NSView updateConstraints]`: the base class has none of its own.
+unsafe extern "C" fn base_update_constraints(_receiver: Id, _sel: Sel) {}
+
+/// `-setNeedsLayout:`: solving is done on every change here, so it runs now.
+unsafe extern "C" fn set_needs_layout(_receiver: Id, _sel: Sel, needed: u8) {
+    if needed != 0 {
+        solve();
+    }
+}
+
+/// `-layoutSubtreeIfNeeded` and the like: the layout pass, now.
+unsafe extern "C" fn solve_now(_receiver: Id, _sel: Sel) {
+    layout_now();
 }
 
 /// A new constraint, autoreleased, as the anchor methods hand one back.
@@ -875,6 +1258,8 @@ pub(crate) fn install() {
         "constraintWithItem:attribute:relatedBy:toItem:attribute:multiplier:constant:" =>
             constraint_with_item, c"@72@0:8@16q24q32@40q48d56d64";
         "activateConstraints:" => activate_constraints, c"v24@0:8@16";
+        "constraintsWithVisualFormat:options:metrics:views:" =>
+            crate::visual_format::constraints_with_visual_format, c"@48@0:8@16Q24@32@40";
         "deactivateConstraints:" => deactivate_constraints, c"v24@0:8@16";
     });
     methods!(class, {
@@ -918,6 +1303,20 @@ pub(crate) fn install() {
     });
     let view = objc::class::lookup(c"NSView").expect("declared before its methods");
     methods!(view, {
+        "fittingSize" => fitting_size, c"{CGSize=dd}16@0:8";
+        "intrinsicContentSize" => no_intrinsic_size, c"{CGSize=dd}16@0:8";
+        "invalidateIntrinsicContentSize" => invalidate_intrinsic_size, c"v16@0:8";
+        "addConstraint:" => add_constraint, c"v24@0:8@16";
+        "addConstraints:" => add_constraints, c"v24@0:8@16";
+        "removeConstraint:" => remove_constraint, c"v24@0:8@16";
+        "removeConstraints:" => remove_constraints, c"v24@0:8@16";
+        "constraints" => view_constraints, c"@16@0:8";
+        "setNeedsUpdateConstraints:" => set_needs_update_constraints, c"v20@0:8c16";
+        "needsUpdateConstraints" => needs_update_constraints, c"c16@0:8";
+        "updateConstraintsForSubtreeIfNeeded" => solve_now, c"v16@0:8";
+        "updateConstraints" => base_update_constraints, c"v16@0:8";
+        "setNeedsLayout:" => set_needs_layout, c"v20@0:8c16";
+        "layoutSubtreeIfNeeded" => solve_now, c"v16@0:8";
         "leftAnchor" => view_anchor, c"@16@0:8";
         "rightAnchor" => view_anchor, c"@16@0:8";
         "topAnchor" => view_anchor, c"@16@0:8";
@@ -1050,9 +1449,51 @@ mod tests {
             pin(container, 4, root, 0.0),
         ]);
         let array = activate(&constraints);
+        layout_now();
         assert_eq!(view::frame_of(background), rect(0.0, 252.0, 400.0, 48.0));
         assert_eq!(view::frame_of(stack), rect(0.0, 0.0, 400.0, 48.0));
         assert_eq!(view::frame_of(container), rect(0.0, 0.0, 400.0, 252.0));
+        let class = objc::class::lookup(c"NSLayoutConstraint").expect("NSLayoutConstraint");
+        send(
+            objc::class::ptr(class) as Id,
+            "deactivateConstraints:",
+            array,
+        );
+    }
+
+    #[test]
+    fn a_constraint_through_an_autoresizing_view_sizes_its_superview() {
+        let _serial = SOLVING_TESTS.lock().unwrap_or_else(|e| e.into_inner());
+        // TextMate's gutter: a scroll view as wide as the document view in
+        // its clip view, which its mask sizes to the scroll view.
+        let root = view(rect(0.0, 0.0, 400.0, 300.0));
+        let scroll = view(rect(0.0, 0.0, 0.0, 300.0));
+        let clip = view(rect(0.0, 0.0, 0.0, 300.0));
+        let document = view(rect(0.0, 0.0, 0.0, 300.0));
+        send(root, "addSubview:", scroll);
+        send(scroll, "addSubview:", clip);
+        send(clip, "addSubview:", document);
+        constrain(scroll);
+        constrain(document);
+        // SAFETY: `-setAutoresizingMask:` is `void (id, SEL, NSUInteger)`.
+        unsafe {
+            let f: unsafe extern "C" fn(Id, Sel, usize) = std::mem::transmute(objc::msg::entry());
+            f(clip, objc::sel::get("setAutoresizingMask:"), 0x12);
+        }
+        let constraints = [
+            pin(scroll, 1, root, 0.0),
+            pin(scroll, 3, root, 0.0),
+            pin(scroll, 4, root, 0.0),
+            pin(document, 1, clip, 0.0),
+            pin(document, 2, clip, 0.0),
+            pin(document, 3, clip, 0.0),
+            relate(document, 7, std::ptr::null_mut(), 0, 41.0),
+        ];
+        let array = activate(&constraints);
+        layout_now();
+        assert_eq!(view::frame_of(scroll), rect(0.0, 0.0, 41.0, 300.0));
+        assert_eq!(view::frame_of(clip), rect(0.0, 0.0, 41.0, 300.0));
+        assert_eq!(view::frame_of(document).size.width, 41.0);
         let class = objc::class::lookup(c"NSLayoutConstraint").expect("NSLayoutConstraint");
         send(
             objc::class::ptr(class) as Id,
@@ -1076,10 +1517,12 @@ mod tests {
                 0,
             );
         }
+        // Vertical attributes grow downwards whichever way the superview
+        // counts, as `V:|-20-[child]` makes `child.top = parent.top + 20`.
         let constraints = [
             pin(child, 1, parent, 10.0),
             pin(child, 2, parent, -10.0),
-            pin(child, 3, parent, -20.0),
+            pin(child, 3, parent, 20.0),
             pin(child, 4, parent, 0.0),
         ];
         let values: Vec<*const c_void> = constraints.iter().map(|c| *c as *const c_void).collect();
@@ -1090,6 +1533,7 @@ mod tests {
         ) as Id;
         let class = objc::class::lookup(c"NSLayoutConstraint").expect("NSLayoutConstraint");
         send(objc::class::ptr(class) as Id, "activateConstraints:", array);
+        layout_now();
         assert_eq!(view::frame_of(child), rect(10.0, 0.0, 380.0, 280.0));
 
         // SAFETY: `-setFrame:` is `void (id, SEL, NSRect)`.
@@ -1101,6 +1545,7 @@ mod tests {
                 rect(0.0, 0.0, 200.0, 100.0),
             );
         }
+        layout_now();
         assert_eq!(view::frame_of(child), rect(10.0, 0.0, 180.0, 80.0));
 
         send(
@@ -1153,6 +1598,7 @@ mod tests {
             anchored(child, "bottomAnchor", parent, "bottomAnchor", 0.0),
             fixed,
         ]);
+        layout_now();
         assert_eq!(view::frame_of(child), rect(10.0, 0.0, 380.0, 40.0));
         let class = objc::class::lookup(c"NSLayoutConstraint").expect("NSLayoutConstraint");
         send(
@@ -1191,6 +1637,7 @@ mod tests {
             send(stack, "addArrangedSubview:", row);
         }
         solve();
+        layout_now();
         for row in rows {
             assert_eq!(view::frame_of(row).size.width, 200.0);
         }

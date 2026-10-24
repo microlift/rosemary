@@ -12,6 +12,7 @@ mod block;
 pub mod boxed;
 pub mod bundle;
 pub mod calculate;
+mod cf_attributed_string;
 mod characterset;
 mod constant;
 pub mod cookies;
@@ -19,6 +20,7 @@ pub mod decimal;
 pub mod defaults;
 mod define;
 mod distributed;
+mod enumeration;
 pub mod error;
 pub mod exception;
 pub mod filehandle;
@@ -34,6 +36,11 @@ pub mod notification;
 pub mod objectify;
 pub mod operation;
 pub mod paths;
+pub mod predicate;
+mod serialization;
+mod sort;
+mod transformer;
+mod uuid;
 pub use corefoundation::plist;
 pub mod pool;
 pub mod processinfo;
@@ -66,12 +73,18 @@ pub fn bootstrap() {
         indexset::install();
         attributed_string::install();
         collections::install();
+        enumeration::install();
+        transformer::install();
         decimal::install();
         pool::install();
         geometry::install();
         value::install();
         kvc::install();
         kvo::install();
+        predicate::install();
+        sort::install();
+        serialization::install();
+        uuid::install();
         runtime::install();
         signature::install();
         notification::install();
@@ -102,6 +115,7 @@ pub fn bootstrap() {
 
 exports::group! {
     paths,
+    cf_attributed_string,
     /// Bundle and search-path calls are CoreFoundation and Foundation spellings
     /// of questions only this crate can answer - `corefoundation` is underneath
     /// it and has neither an `NSBundle` nor a `$HOME`.
@@ -264,6 +278,14 @@ pub const CLASSES: &[&str] = &[
     "NSDecimalNumber",
     "NSDecimalNumberHandler",
     "NSPredicate",
+    "NSCompoundPredicate",
+    "NSSortDescriptor",
+    "NSPropertyListSerialization",
+    "NSUUID",
+    "NSProxy",
+    "NSValueTransformer",
+    "NSURLProtocol",
+    "NSScriptCommand",
     "NSEnumerator",
     "NSValue",
     "NSNull",
@@ -326,6 +348,11 @@ pub fn data_symbols() -> Vec<(String, u64)> {
     // not pointers to them: the guest loads the symbol's address and reads two
     // or four doubles out of it. A one-word cell would leave the rest of the
     // read off the end of the allocation.
+    // `const int64_t`, read as a number.
+    out.push((
+        "_NSURLSessionTransferSizeUnknown".to_string(),
+        corefoundation::base::global_cell("_NSURLSessionTransferSizeUnknown", (-1i64) as u64),
+    ));
     out.push(("_NSZeroPoint".to_string(), zeroed::<geometry::NSPoint>()));
     out.push(("_NSZeroSize".to_string(), zeroed::<geometry::NSSize>()));
     out.push(("_NSZeroRect".to_string(), zeroed::<geometry::NSRect>()));
@@ -410,12 +437,34 @@ pub const STRING_GLOBALS: &[(&str, &str)] = &[
         "_NSURLVolumeAvailableCapacityForImportantUsageKey",
         "NSURLVolumeAvailableCapacityForImportantUsageKey",
     ),
+    // Apple moved the exception names to CoreFoundation; a guest built
+    // against a newer SDK binds them there.
+    ("_NSGenericException", "NSGenericException"),
+    ("_NSInvalidArgumentException", "NSInvalidArgumentException"),
+    ("_NSNegateBooleanTransformerName", "NSNegateBoolean"),
+    ("_NSIsNilTransformerName", "NSIsNil"),
+    ("_NSIsNotNilTransformerName", "NSIsNotNil"),
+    ("_NSRecoveryAttempterErrorKey", "NSRecoveryAttempter"),
+    (
+        "_NSProgressEstimatedTimeRemainingKey",
+        "NSProgressEstimatedTimeRemainingKey",
+    ),
+    (
+        "_NSProgressFileOperationKindDownloading",
+        "NSProgressFileOperationKindDownloading",
+    ),
+    (
+        "_NSProgressFileOperationKindKey",
+        "NSProgressFileOperationKindKey",
+    ),
+    ("_NSProgressKindFile", "NSProgressKindFile"),
 ];
 
 pub const NOTIFICATION_NAMES: &[&str] = &[
     "NSProcessInfoThermalStateDidChangeNotification",
     "NSProcessInfoPowerStateDidChangeNotification",
     "NSCurrentLocaleDidChangeNotification",
+    "NSUserDefaultsDidChangeNotification",
 ];
 
 #[cfg(test)]
