@@ -17,6 +17,12 @@ static HIERARCHY: &[(&str, Option<&str>, usize)] = &[
     ("NSOpenPanel", Some("NSSavePanel"), 0),
     ("NSWindowController", Some("NSResponder"), 0),
     ("NSViewController", Some("NSResponder"), 0),
+    ("NSController", None, 0),
+    (
+        "NSUserDefaultsController",
+        Some("NSController"),
+        crate::bindings::DEFAULTS_CONTROLLER_INSTANCE_SIZE,
+    ),
     (
         "NSTitlebarAccessoryViewController",
         Some("NSViewController"),

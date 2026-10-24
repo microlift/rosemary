@@ -19,6 +19,7 @@ pub mod application;
 mod aqua;
 pub mod backing;
 mod bezier;
+mod bindings;
 pub mod button;
 mod cassowary;
 mod catalog;
@@ -108,6 +109,7 @@ pub fn bootstrap() {
         accessibility::install();
         ctline::install();
         view_controller::install();
+        bindings::install();
         table_views::install();
         visual_effect::install();
         alert::install();
