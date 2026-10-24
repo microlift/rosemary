@@ -9,7 +9,7 @@ use crate::geometry::{NSPoint, NSRange, NSRect, NSSize};
 
 /// The argument or return shapes an accessor may have here.
 #[derive(Clone, Copy, PartialEq, Debug)]
-enum Shape {
+pub(crate) enum Shape {
     Object,
     Bool,
     /// A signed or unsigned integer, with its width in bytes.
@@ -24,7 +24,7 @@ enum Shape {
 
 impl Shape {
     /// The shape a type encoding names, or `None` for one not handled here.
-    fn of(encoding: &[u8]) -> Option<Shape> {
+    pub(crate) fn of(encoding: &[u8]) -> Option<Shape> {
         Some(match encoding.first()? {
             b'@' | b'#' => Shape::Object,
             b'B' => Shape::Bool,
@@ -81,7 +81,7 @@ fn type_length(encoding: &[u8]) -> usize {
 /// frame offsets that follow each.
 ///
 /// `v48@0:8{CGRect=...}16` becomes `["v", "@", ":", "{CGRect=...}"]`.
-fn parts(encoding: &CStr) -> Vec<Vec<u8>> {
+pub(crate) fn parts(encoding: &CStr) -> Vec<Vec<u8>> {
     let mut out = Vec::new();
     let mut rest = encoding.to_bytes();
     while !rest.is_empty() {
@@ -101,7 +101,7 @@ fn parts(encoding: &CStr) -> Vec<Vec<u8>> {
 }
 
 /// `bounds` as `setBounds:`.
-fn setter_name(key: &str) -> String {
+pub(crate) fn setter_name(key: &str) -> String {
     let mut chars = key.chars();
     match chars.next() {
         Some(first) => format!("set{}{}:", first.to_uppercase(), chars.as_str()),
@@ -273,6 +273,9 @@ unsafe extern "C" fn set_value_for_key(receiver: Id, _sel: Sel, value: Id, key: 
                     .map_or(String::new(), |p| String::from_utf8_lossy(p).into_owned())
             );
         };
+        if value.is_null() && shape != Shape::Object {
+            return send_key(receiver, "setNilValueForKey:", key);
+        }
         // SAFETY: the value is an object this runtime allocated, or nil.
         let Some(bytes) = (unsafe { unbox_value(shape, value) }) else {
             objc::fail!(
@@ -301,6 +304,9 @@ unsafe extern "C" fn set_value_for_key(receiver: Id, _sel: Sel, value: Id, key: 
             ivar.types().to_string_lossy()
         );
     };
+    if value.is_null() && shape != Shape::Object {
+        return send_key(receiver, "setNilValueForKey:", key);
+    }
     // SAFETY: a live object and a value of the ivar's own type.
     let Some(bytes) = (unsafe { unbox_value(shape, value) }) else {
         objc::fail!(
@@ -308,6 +314,12 @@ unsafe extern "C" fn set_value_for_key(receiver: Id, _sel: Sel, value: Id, key: 
             class.name_str()
         );
     };
+    // A setter announces its own change once KVO has wrapped it; a store
+    // straight into the ivar has to be announced here.
+    let announce = crate::kvo::is_watched(receiver) && automatically_notifies(class, key);
+    if announce {
+        send_key(receiver, "willChangeValueForKey:", key);
+    }
     // SAFETY: the ivar is inside the allocation and is `bytes.len()` wide.
     unsafe {
         std::ptr::copy_nonoverlapping(
@@ -316,6 +328,87 @@ unsafe extern "C" fn set_value_for_key(receiver: Id, _sel: Sel, value: Id, key: 
             bytes.len().min(ivar.size()),
         )
     };
+    if announce {
+        send_key(receiver, "didChangeValueForKey:", key);
+    }
+}
+
+/// Send a `void (id, SEL, NSString *)` message naming `key`.
+fn send_key(receiver: Id, selector: &str, key: &str) {
+    let key = crate::string::from_str(key);
+    // SAFETY: the selectors this is used with are `void (id, SEL, NSString *)`.
+    unsafe {
+        let f: unsafe extern "C" fn(Id, Sel, Id) = std::mem::transmute(objc::msg::entry());
+        f(receiver, objc::sel::get(selector), key);
+        corefoundation::api::CFRelease(key as corefoundation::base::CFTypeRef);
+    }
+}
+
+fn automatically_notifies(class: &'static Class, key: &str) -> bool {
+    let key = crate::string::from_str(key);
+    // SAFETY: `BOOL (Class, SEL, NSString *)`.
+    unsafe {
+        let f: unsafe extern "C" fn(Id, Sel, Id) -> u8 = std::mem::transmute(objc::msg::entry());
+        let answer = f(
+            objc::class::ptr(class) as Id,
+            objc::sel::get("automaticallyNotifiesObserversForKey:"),
+            key,
+        );
+        corefoundation::api::CFRelease(key as corefoundation::base::CFTypeRef);
+        answer != 0
+    }
+}
+
+/// Send `-valueForKey:` with `key`, so an override answers.
+fn send_value_for_key(receiver: Id, key: &[u8]) -> Id {
+    let key = crate::string::from_str(&String::from_utf8_lossy(key));
+    // SAFETY: `id (id, SEL, NSString *)`.
+    unsafe {
+        let f: unsafe extern "C" fn(Id, Sel, Id) -> Id = std::mem::transmute(objc::msg::entry());
+        let value = f(receiver, objc::sel::get("valueForKey:"), key);
+        corefoundation::api::CFRelease(key as corefoundation::base::CFTypeRef);
+        value
+    }
+}
+
+/// `-valueForKeyPath:`: `-valueForKey:` for each component in turn.
+unsafe extern "C" fn value_for_key_path(receiver: Id, _sel: Sel, path: Id) -> Id {
+    // SAFETY: the path is an `NSString`.
+    let path = unsafe { crate::string::bytes(path) };
+    path.split(|b| *b == b'.')
+        .fold(receiver, |object, key| match object.is_null() {
+            true => object,
+            false => send_value_for_key(object, key),
+        })
+}
+
+/// `-setValue:forKeyPath:`: `-setValue:forKey:` on what the path's head leads to.
+unsafe extern "C" fn set_value_for_key_path(receiver: Id, _sel: Sel, value: Id, path: Id) {
+    // SAFETY: the path is an `NSString`.
+    let path = unsafe { crate::string::bytes(path) };
+    let (head, last) = match path.iter().rposition(|b| *b == b'.') {
+        Some(dot) => (&path[..dot], &path[dot + 1..]),
+        None => (&path[..0], &path[..]),
+    };
+    let target = match head.is_empty() {
+        true => receiver,
+        false => head
+            .split(|b| *b == b'.')
+            .fold(receiver, |object, key| match object.is_null() {
+                true => object,
+                false => send_value_for_key(object, key),
+            }),
+    };
+    if target.is_null() {
+        return;
+    }
+    let key = crate::string::from_str(&String::from_utf8_lossy(last));
+    // SAFETY: `void (id, SEL, id, NSString *)`.
+    unsafe {
+        let f: unsafe extern "C" fn(Id, Sel, Id, Id) = std::mem::transmute(objc::msg::entry());
+        f(target, objc::sel::get("setValue:forKey:"), value, key);
+        corefoundation::api::CFRelease(key as corefoundation::base::CFTypeRef);
+    }
 }
 
 unsafe extern "C" fn value_for_key(receiver: Id, _sel: Sel, key: Id) -> Id {
@@ -382,6 +475,38 @@ unsafe extern "C" fn value_for_key(receiver: Id, _sel: Sel, key: Id) -> Id {
     }
 }
 
+/// `-setNilValueForKey:`, which Apple makes an exception: nil is no scalar.
+unsafe extern "C" fn set_nil_value_for_key(receiver: Id, _sel: Sel, key: Id) {
+    // SAFETY: a live object, and the key is an `NSString`.
+    let (class, key) = unsafe { (objc::object::class_of(receiver), crate::string::bytes(key)) };
+    objc::fail!(
+        "-[{} setNilValueForKey:]: could not set nil as the value for the key {}",
+        class.map_or("nil", |c| c.name_str()),
+        String::from_utf8_lossy(&key)
+    );
+}
+
+/// Whether setting nil for `key` on an object of `class` would reach
+/// `-setNilValueForKey:` - a scalar key - and the class has not overridden
+/// that to make it mean something.
+pub fn rejects_nil(class: &'static Class, key: &str) -> bool {
+    let shape = match class.method(objc::sel::get(&setter_name(key))) {
+        // SAFETY: a method's type encoding is a NUL-terminated string the
+        // runtime owns.
+        Some(method) => parts(unsafe { CStr::from_ptr(method.types()) })
+            .get(3)
+            .and_then(|p| Shape::of(p)),
+        None => ivar_for(class, key).and_then(|i| Shape::of(i.types().to_bytes())),
+    };
+    if shape.is_none_or(|s| s == Shape::Object) {
+        return false;
+    }
+    let nsobject = objc::class::lookup(c"NSObject").expect("NSObject");
+    let handler = objc::sel::get("setNilValueForKey:");
+    class.method(handler).map(|m| m.implementation())
+        == nsobject.method(handler).map(|m| m.implementation())
+}
+
 /// Whether `-setValue:forKey:` on an object of `class` would reach anything.
 pub fn accepts(class: &'static Class, key: &str) -> bool {
     if let Some(method) = class.method(objc::sel::get(&setter_name(key))) {
@@ -399,9 +524,10 @@ pub(crate) fn install() {
     let nsobject = objc::class::lookup(c"NSObject").expect("the runtime's own NSObject");
     methods!(nsobject, {
         "setValue:forKey:" => set_value_for_key, c"v32@0:8@16@24";
+        "setNilValueForKey:" => set_nil_value_for_key, c"v24@0:8@16";
         "valueForKey:" => value_for_key, c"@24@0:8@16";
-        "setValue:forKeyPath:" => set_value_for_key, c"v32@0:8@16@24";
-        "valueForKeyPath:" => value_for_key, c"@24@0:8@16"
+        "setValue:forKeyPath:" => set_value_for_key_path, c"v32@0:8@16@24";
+        "valueForKeyPath:" => value_for_key_path, c"@24@0:8@16"
     });
 }
 
