@@ -693,6 +693,11 @@ unsafe extern "C" fn copy_with_zone(receiver: Id, _sel: Sel, _zone: *mut c_void)
     to.reps = objc::arc::retain(from.reps);
     to.size = from.size;
     to.template = from.template;
+    let description = crate::props::object(receiver, "accessibilityDescription");
+    if !description.is_null() {
+        let key = objc::sel::get("accessibilityDescription") as *const c_void;
+        objc::arc::set_associated_with_policy(copy, key, description, 3);
+    }
     if !from.cg_image.is_null() {
         // SAFETY: a `CGImage` the original holds.
         to.cg_image = unsafe { corefoundation::api::CFRetain(from.cg_image) };
@@ -1022,6 +1027,10 @@ pub(crate) fn install() {
         "setTemplate:" => set_template, c"v20@0:8c16";
         "isTemplate" => is_template, c"c16@0:8";
         "copyWithZone:" => copy_with_zone, c"@24@0:8^v16";
+    });
+    // Read back only: nothing here speaks to assistive technology.
+    crate::props::properties!(class, {
+        copied "accessibilityDescription", "setAccessibilityDescription:";
     });
     // The pixel family, each reached by the same implementation so that the one
     // that is wanted first names itself.
