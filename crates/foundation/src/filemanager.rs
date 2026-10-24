@@ -47,6 +47,56 @@ unsafe fn no_error(slot: *mut Id) {
     }
 }
 
+/// YES for `Ok`; otherwise NO, with an `NSCocoaErrorDomain` error naming
+/// `path` and the POSIX cause written through `slot`, as Foundation reports a
+/// failed write. A caller that presents the error has something to show.
+///
+/// # Safety
+///
+/// `slot` must be null or writable.
+unsafe fn report(slot: *mut Id, path: &std::path::Path, result: std::io::Result<()>) -> u8 {
+    let Err(cause) = result else {
+        return 1;
+    };
+    if slot.is_null() {
+        return 0;
+    }
+    // `NSFileNoSuchFileError`, `NSFileWriteNoPermissionError`,
+    // `NSFileWriteFileExistsError`, `NSFileWriteUnknownError`.
+    let code = match cause.kind() {
+        std::io::ErrorKind::NotFound => 4,
+        std::io::ErrorKind::PermissionDenied => 513,
+        std::io::ErrorKind::AlreadyExists => 516,
+        _ => 512,
+    };
+    // A host path is never shown to the guest; see `prefix::ns::to_guest`.
+    let shown = prefix::ns::to_guest(path).map_or_else(
+        || {
+            path.file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .into_owned()
+        },
+        |p| p.to_string_lossy().into_owned(),
+    );
+    let description = format!("\u{201c}{shown}\u{201d} could not be written: {cause}");
+    let path_value = crate::string::from_str(&shown);
+    let underlying = cause.raw_os_error().map(|errno| {
+        crate::error::make(
+            "NSPOSIXErrorDomain",
+            i64::from(darwin::errno::from_host(errno)),
+            &cause.to_string(),
+        )
+    });
+    let mut entries = vec![("NSFilePath", path_value)];
+    entries.extend(underlying.map(|e| ("NSUnderlyingError", e)));
+    let made = crate::error::create("NSCocoaErrorDomain", code, &description, &entries);
+    objc::arc::release(path_value);
+    // SAFETY: writable, the caller's obligation.
+    unsafe { *slot = objc::arc::autorelease(made) };
+    0
+}
+
 unsafe extern "C" fn file_exists(_receiver: Id, _sel: Sel, path: Id) -> u8 {
     // SAFETY: an `NSString`, or nil.
     unsafe { path_of(path) }.is_some_and(|p| std::fs::metadata(p).is_ok()) as u8
@@ -116,7 +166,8 @@ unsafe extern "C" fn create_directory(
     // Apple's succeeds when the directory is already there and intermediates
     // were asked for, which `create_dir_all` also does - so the two agree
     // without a check here.
-    made.is_ok() as u8
+    // SAFETY: null or writable.
+    unsafe { report(error, &path, made) }
 }
 
 unsafe extern "C" fn remove_item(_receiver: Id, _sel: Sel, path: Id, error: *mut Id) -> u8 {
@@ -133,7 +184,8 @@ unsafe extern "C" fn remove_item(_receiver: Id, _sel: Sel, path: Id, error: *mut
         true => std::fs::remove_dir_all(&path),
         false => std::fs::remove_file(&path),
     };
-    removed.is_ok() as u8
+    // SAFETY: null or writable.
+    unsafe { report(error, &path, removed) }
 }
 
 unsafe extern "C" fn copy_item(_receiver: Id, _sel: Sel, from: Id, to: Id, error: *mut Id) -> u8 {
@@ -151,8 +203,9 @@ unsafe extern "C" fn copy_item(_receiver: Id, _sel: Sel, from: Id, to: Id, error
             "-[NSFileManager copyItemAtPath:toPath:error:]: this runtime copies files, not \
              directory trees"
         ),
-        Ok(_) => std::fs::copy(&from, &to).is_ok() as u8,
-        Err(_) => 0,
+        // SAFETY: null or writable.
+        Ok(_) => unsafe { report(error, &to, std::fs::copy(&from, &to).map(drop)) },
+        Err(cause) => unsafe { report(error, &from, Err(cause)) },
     }
 }
 
@@ -163,7 +216,8 @@ unsafe extern "C" fn move_item(_receiver: Id, _sel: Sel, from: Id, to: Id, error
     let (Some(from), Some(to)) = (unsafe { path_of(from) }, unsafe { path_of(to) }) else {
         return 0;
     };
-    std::fs::rename(&from, &to).is_ok() as u8
+    // SAFETY: null or writable.
+    unsafe { report(error, &to, std::fs::rename(&from, &to)) }
 }
 
 /// Run `with` on the path a file URL names, spelled as the `NSString` the
@@ -358,7 +412,8 @@ unsafe extern "C" fn url_for_directory(
     else {
         return std::ptr::null_mut();
     };
-    if create != 0 && std::fs::create_dir_all(&path).is_err() {
+    // The path is the guest's; it is created at the host's spelling.
+    if create != 0 && std::fs::create_dir_all(prefix::ns::existing_host_path(&path)).is_err() {
         return std::ptr::null_mut();
     }
     directory_url(&path)
