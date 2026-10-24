@@ -906,6 +906,34 @@ unsafe extern "C" fn write_to_file(receiver: Id, _sel: Sel, path: Id, atomically
     write_bytes_to_file(&path, bytes, atomically != 0).is_ok() as u8
 }
 
+/// `-[NSArray writeToFile:atomically:]` and `-[NSDictionary ...]`: an XML
+/// property list, or NO for contents that are not property list types.
+unsafe extern "C" fn write_plist_to_file(receiver: Id, _sel: Sel, path: Id, atomically: u8) -> u8 {
+    // SAFETY: an `NSString`, or nil.
+    let path = unsafe { crate::string::bytes(path) };
+    let Ok(path) = String::from_utf8(path) else {
+        return 0;
+    };
+    // SAFETY: a collection of this runtime's.
+    let Some(value) = (unsafe { corefoundation::propertylist::value_of(receiver as CFTypeRef) })
+    else {
+        return 0;
+    };
+    let bytes = corefoundation::plist::write_xml(&value);
+    write_bytes_to_file(&path, &bytes, atomically != 0).is_ok() as u8
+}
+
+/// `-writeToURL:atomically:`, for a file URL.
+unsafe extern "C" fn write_plist_to_url(receiver: Id, sel: Sel, url: Id, atomically: u8) -> u8 {
+    // SAFETY: `NSString * (id, SEL)` on an `NSURL`.
+    let path = unsafe {
+        let f: unsafe extern "C" fn(Id, Sel) -> Id = std::mem::transmute(objc::msg::entry());
+        f(url, objc::sel::get("path"))
+    };
+    // SAFETY: as above.
+    unsafe { write_plist_to_file(receiver, sel, path, atomically) }
+}
+
 pub(crate) fn write_bytes_to_file(
     guest_path: &str,
     bytes: &[u8],
@@ -2825,7 +2853,11 @@ pub(crate) fn install() {
     let array = objc::class::lookup(c"NSArray").expect("CoreFoundation registered NSArray");
     let mutable_array = objc::class::lookup(c"NSMutableArray").expect("NSMutableArray");
     methods!(array, {
+        "writeToFile:atomically:" => write_plist_to_file, c"B28@0:8@16c24";
+        "writeToURL:atomically:" => write_plist_to_url, c"B28@0:8@16c24";
         "count" => count, c"Q16@0:8";
+        "arrayByAddingObject:" => array_by_adding_object, c"@24@0:8@16";
+        "arrayByAddingObjectsFromArray:" => array_by_adding_objects, c"@24@0:8@16";
         "objectAtIndex:" => object_at_index, c"@24@0:8Q16";
         "subarrayWithRange:" => subarray_with_range, c"@32@0:8{_NSRange=QQ}16";
         "objectAtIndexedSubscript:" => object_at_index, c"@24@0:8Q16";
@@ -2891,6 +2923,8 @@ pub(crate) fn install() {
     let mutable_dictionary =
         objc::class::lookup(c"NSMutableDictionary").expect("NSMutableDictionary");
     methods!(dictionary_class, {
+        "writeToFile:atomically:" => write_plist_to_file, c"B28@0:8@16c24";
+        "writeToURL:atomically:" => write_plist_to_url, c"B28@0:8@16c24";
         "count" => dictionary_count, c"Q16@0:8";
         "objectForKey:" => object_for_key, c"@24@0:8@16";
         "objectForKeyedSubscript:" => object_for_key, c"@24@0:8@16";
