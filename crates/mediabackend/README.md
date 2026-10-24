@@ -13,7 +13,9 @@ NV12, I420 and BGRA outputs.
   identity across H.264 B-frame reordering. A sample that will never produce a
   frame of its own (discarded as corrupt or pre-recovery, or folded into
   another picture) is reported once by `VideoDecoder::take_dropped`, so every
-  accepted id is eventually accounted for. `VideoFrame::with_bytes` maps the
+  accepted id is eventually accounted for. A decoded frame whose metadata is
+  unusable is reported the same way with its error, without ending the
+  session; only losing a frame's identity is fatal. `VideoFrame::with_bytes` maps the
   original GStreamer sample without an intermediate per-plane owned `Vec`.
 - Frame layout carries validated strides/offsets, per-plane mapped spans,
   pixel format, optional crop, sample aspect ratio, negotiated chroma siting

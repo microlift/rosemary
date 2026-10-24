@@ -240,6 +240,9 @@ pub trait VideoDecoder {
 
     fn codec(&self) -> VideoCodec;
     fn submit(&mut self, packet: AccessUnit<'_>) -> Result<(), Error>;
+    /// An error is fatal to the session. A decoded frame that cannot be
+    /// returned is reported through `take_dropped` with its error instead,
+    /// and this returns None.
     fn pull(&mut self, timeout: Duration) -> Result<Option<Self::Frame>, Error>;
     /// The next sample known never to produce a frame. A drop becomes known
     /// once the decoder outputs a later frame or reaches end of stream, so

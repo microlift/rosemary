@@ -850,15 +850,10 @@ impl Decoder {
         Ok(())
     }
 
-    fn decode_sample(&mut self, sample: gst::Sample) -> Result<DecodedFrame, Error> {
+    fn decode_sample(&self, id: u64, sample: gst::Sample) -> Result<DecodedFrame, Error> {
         let buffer = sample
             .buffer()
             .ok_or_else(|| Error::Decode("no output buffer".into()))?;
-        // Do NOT key callbacks on output PTS: h264parse/avdec_h264 can
-        // legitimately output multiple frames with the same timestamp.
-        let id = sample_id(buffer, &self.reference).ok_or_else(|| {
-            Error::Decode("H.264 output lost its sample identity metadata".into())
-        })?;
         let info = gst_video::VideoInfo::from_caps(
             sample
                 .caps()
@@ -985,11 +980,29 @@ impl Decoder {
         })
     }
 
-    fn decode_checked_sample(&mut self, sample: gst::Sample) -> Result<DecodedFrame, Error> {
-        match self.decode_sample(sample) {
-            Ok(frame) => Ok(frame),
-            Err(Error::Decode(message)) => Err(self.latch_error(message)),
-            Err(error) => Err(error),
+    // A frame without an id cannot be matched to its submission, so the
+    // one-result-per-sample contract is broken for good. Anything else wrong
+    // with an identified frame fails only that frame.
+    fn decode_checked_sample(
+        &mut self,
+        sample: gst::Sample,
+    ) -> Result<Option<DecodedFrame>, Error> {
+        // Do NOT key callbacks on output PTS: h264parse/avdec_h264 can
+        // legitimately output multiple frames with the same timestamp.
+        let Some(id) = sample.buffer().and_then(|b| sample_id(b, &self.reference)) else {
+            return Err(self.latch_error("H.264 output lost its sample identity metadata".into()));
+        };
+        match self.decode_sample(id, sample) {
+            Ok(frame) => Ok(Some(frame)),
+            Err(error) => {
+                lock_tracker(&self.tracker)
+                    .dropped
+                    .push_back(DroppedSample {
+                        id,
+                        error: Some(error),
+                    });
+                Ok(None)
+            }
         }
     }
 }
@@ -1153,7 +1166,7 @@ impl VideoDecoder for Decoder {
             .try_pull_sample(gst::ClockTime::from_nseconds(nanos))
         {
             self.check_error()?;
-            return self.decode_checked_sample(sample).map(Some);
+            return self.decode_checked_sample(sample);
         }
         self.check_error()?;
         Ok(None)
@@ -1503,6 +1516,38 @@ mod tests {
             Err(Error::Decode(message)) => assert_eq!(message, first),
             _ => panic!("decoder accepted input after losing frame identity"),
         }
+    }
+
+    #[test]
+    fn unusable_identified_frame_is_dropped_without_poisoning_the_stream() {
+        let mut decoder = Decoder::h264_nv12(1).unwrap();
+        // An identified frame whose caps are missing cannot be described.
+        let mut buffer = gst::Buffer::from_mut_slice(vec![0]);
+        gst::ReferenceTimestampMeta::add(
+            buffer.get_mut().unwrap(),
+            &decoder.reference,
+            gst::ClockTime::from_nseconds(41),
+            None,
+        );
+        let sample = gst::Sample::builder().buffer(&buffer).build();
+        assert!(decoder.decode_checked_sample(sample).unwrap().is_none());
+        let dropped = decoder.take_dropped().unwrap();
+        assert_eq!(dropped.id, 41);
+        assert!(matches!(dropped.error, Some(Error::Decode(_))));
+        assert!(decoder.fatal_error.is_none());
+        decoder
+            .submit(AccessUnit {
+                id: 42,
+                bytes: include_bytes!("../tests/fixtures/red_32x32.h264"),
+                pts_ns: Some(0),
+                dts_ns: None,
+                duration_ns: None,
+            })
+            .unwrap();
+        assert_eq!(
+            decoder.pull(Duration::from_secs(2)).unwrap().unwrap().id(),
+            42
+        );
     }
 
     #[test]
