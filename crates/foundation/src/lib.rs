@@ -37,6 +37,7 @@ pub mod objectify;
 pub mod operation;
 pub mod paths;
 pub mod predicate;
+mod serialization;
 mod sort;
 mod transformer;
 pub use corefoundation::plist;
@@ -81,6 +82,7 @@ pub fn bootstrap() {
         kvo::install();
         predicate::install();
         sort::install();
+        serialization::install();
         runtime::install();
         signature::install();
         notification::install();
@@ -276,6 +278,7 @@ pub const CLASSES: &[&str] = &[
     "NSPredicate",
     "NSCompoundPredicate",
     "NSSortDescriptor",
+    "NSPropertyListSerialization",
     "NSProxy",
     "NSValueTransformer",
     "NSURLProtocol",
