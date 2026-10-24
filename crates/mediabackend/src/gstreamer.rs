@@ -4,11 +4,14 @@
 //! This implements the backend contract only; it does not claim to implement
 //! synchronous VideoToolbox decode, FinishDelayedFrames, or GPU CVPixelBuffers.
 
+use std::collections::VecDeque;
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
 use gst::glib::translate::IntoGlib;
 use gst::prelude::*;
 use gst_app::{AppSink, AppSrc};
+use gst_video::prelude::*;
 use gst_video::video_frame::VideoBufferExt;
 
 const INPUT_QUEUE_LIMIT: u64 = 8 * 1024 * 1024;
@@ -117,16 +120,120 @@ fn chroma_siting(site: gst_video::VideoChromaSite) -> ChromaSiting {
 }
 
 use crate::{
-    AccessUnit, ChromaSiting, ColorMatrix, ColorPrimaries, ColorTransfer, Error, FrameCrop,
-    FrameFieldOrder, FrameInterlaceMode, FrameLayout, PixelFormat, VideoCodec, VideoDecoder,
-    VideoFrame,
+    AccessUnit, ChromaSiting, ColorMatrix, ColorPrimaries, ColorTransfer, DroppedSample, Error,
+    FrameCrop, FrameFieldOrder, FrameInterlaceMode, FrameLayout, PixelFormat, VideoCodec,
+    VideoDecoder, VideoFrame,
 };
+
+fn sample_id(buffer: &gst::BufferRef, reference: &gst::Caps) -> Option<u64> {
+    buffer
+        .iter_meta::<gst::ReferenceTimestampMeta>()
+        .find(|meta| meta.reference() == reference.as_ref())
+        .map(|meta| meta.timestamp().nseconds())
+}
+
+// Neither h264parse nor avdec_h264 reports which input it discarded or
+// folded into another picture, so infer it at the decoder's pads. The whole
+// pipeline runs on appsrc's one streaming thread with no queues, so a sample
+// reaching the decoder means every earlier one has entered it or been
+// dropped upstream, and one leaving it means every sample that is no longer
+// among the decoder's pending frames was discarded.
+#[derive(Default)]
+struct SampleTracker {
+    // Submitted but not yet seen by the decoder, in submission order.
+    upstream: VecDeque<u64>,
+    // Seen by the decoder but neither output nor known to be dropped.
+    decoding: Vec<u64>,
+    dropped: VecDeque<DroppedSample>,
+}
+
+impl SampleTracker {
+    fn entered_decoder(&mut self, id: u64) {
+        if let Some(position) = self.upstream.iter().position(|&queued| queued == id) {
+            for id in self.upstream.drain(..position) {
+                self.dropped.push_back(DroppedSample { id, error: None });
+            }
+            self.upstream.pop_front();
+        }
+        self.decoding.push(id);
+    }
+
+    fn left_decoder(&mut self, id: u64, pending: &[u64]) {
+        for decoding in std::mem::take(&mut self.decoding) {
+            if pending.contains(&decoding) {
+                self.decoding.push(decoding);
+            } else if decoding != id {
+                self.dropped.push_back(DroppedSample {
+                    id: decoding,
+                    error: None,
+                });
+            }
+        }
+    }
+
+    fn end_of_stream(&mut self) {
+        for id in self.upstream.drain(..).chain(self.decoding.drain(..)) {
+            self.dropped.push_back(DroppedSample { id, error: None });
+        }
+    }
+}
+
+fn lock_tracker(tracker: &Mutex<SampleTracker>) -> MutexGuard<'_, SampleTracker> {
+    tracker.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+fn track_decoder(
+    decoder: &gst_video::VideoDecoder,
+    reference: &gst::Caps,
+    tracker: &Arc<Mutex<SampleTracker>>,
+) -> Result<(), Error> {
+    let pad = |name| {
+        decoder
+            .static_pad(name)
+            .ok_or_else(|| Error::BackendUnavailable(format!("decoder has no {name} pad")))
+    };
+    let (sink, src) = (pad("sink")?, pad("src")?);
+    let (entering, reference_in) = (tracker.clone(), reference.clone());
+    sink.add_probe(gst::PadProbeType::BUFFER, move |_, info| {
+        if let Some(id) = info.buffer().and_then(|b| sample_id(b, &reference_in)) {
+            lock_tracker(&entering).entered_decoder(id);
+        }
+        gst::PadProbeReturn::Ok
+    });
+    // A strong reference here would keep the element alive through its pad.
+    let weak_decoder = decoder.downgrade();
+    let (leaving, reference_out) = (tracker.clone(), reference.clone());
+    src.add_probe(
+        gst::PadProbeType::BUFFER | gst::PadProbeType::EVENT_DOWNSTREAM,
+        move |_, info| {
+            if let Some(gst::EventView::Eos(_)) = info.event().map(|e| e.view()) {
+                lock_tracker(&leaving).end_of_stream();
+            } else if let Some(id) = info.buffer().and_then(|b| sample_id(b, &reference_out))
+                && let Some(decoder) = weak_decoder.upgrade()
+            {
+                let pending = decoder
+                    .frames()
+                    .iter()
+                    .filter_map(|frame| {
+                        frame
+                            .input_buffer()
+                            .and_then(|b| sample_id(b, &reference_out))
+                    })
+                    .collect::<Vec<_>>();
+                lock_tracker(&leaving).left_decoder(id, &pending);
+            }
+            gst::PadProbeReturn::Ok
+        },
+    );
+    Ok(())
+}
 
 pub struct Decoder {
     pipeline: gst::Pipeline,
     input: AppSrc,
     output: AppSink,
     reference: gst::Caps,
+    tracker: Arc<Mutex<SampleTracker>>,
     completed: bool,
     fatal_error: Option<String>,
     output_format: PixelFormat,
@@ -678,7 +785,7 @@ impl Decoder {
         let pipeline = gst::parse::launch(&format!(
             "appsrc name=rosemary_input format=time is-live=false block=false max-bytes=8388608 \
              caps=\"{input_caps}\" \
-             ! h264parse ! avdec_h264 max-threads={threads} output-corrupt=false discard-corrupted-frames=true \
+             ! h264parse ! avdec_h264 name=rosemary_decoder max-threads={threads} output-corrupt=false discard-corrupted-frames=true \
              ! videoconvert ! video/x-raw,format=(string){output_caps} \
              ! appsink name=rosemary_output sync=false max-buffers=32 drop=false"
         ))
@@ -693,6 +800,13 @@ impl Decoder {
             .by_name("rosemary_output")
             .and_then(|e| e.downcast::<AppSink>().ok())
             .ok_or_else(|| Error::BackendUnavailable("GStreamer appsink missing".into()))?;
+        let decoder = pipeline
+            .by_name("rosemary_decoder")
+            .and_then(|e| e.downcast::<gst_video::VideoDecoder>().ok())
+            .ok_or_else(|| Error::BackendUnavailable("GStreamer video decoder missing".into()))?;
+        let reference = gst::Caps::builder("application/x-rosemary-frame-id").build();
+        let tracker = Arc::default();
+        track_decoder(&decoder, &reference, &tracker)?;
         pipeline
             .set_state(gst::State::Playing)
             .map_err(|e| Error::BackendUnavailable(format!("GStreamer failed to start: {e:?}")))?;
@@ -700,7 +814,8 @@ impl Decoder {
             pipeline,
             input,
             output,
-            reference: gst::Caps::builder("application/x-rosemary-frame-id").build(),
+            reference,
+            tracker,
             completed: false,
             fatal_error: None,
             output_format,
@@ -741,13 +856,9 @@ impl Decoder {
             .ok_or_else(|| Error::Decode("no output buffer".into()))?;
         // Do NOT key callbacks on output PTS: h264parse/avdec_h264 can
         // legitimately output multiple frames with the same timestamp.
-        let identity = buffer
-            .iter_meta::<gst::ReferenceTimestampMeta>()
-            .find(|meta| meta.reference() == self.reference.as_ref())
-            .ok_or_else(|| {
-                Error::Decode("H.264 output lost its sample identity metadata".into())
-            })?;
-        let id = identity.timestamp().nseconds();
+        let id = sample_id(buffer, &self.reference).ok_or_else(|| {
+            Error::Decode("H.264 output lost its sample identity metadata".into())
+        })?;
         let info = gst_video::VideoInfo::from_caps(
             sample
                 .caps()
@@ -1020,7 +1131,11 @@ impl VideoDecoder for Decoder {
         if let Some(dts) = dts {
             gst::ReferenceTimestampMeta::add(writable, &self.source_dts_reference, dts, None);
         }
+        // Record the id first: the streaming thread may reach the decoder
+        // before push_buffer returns.
+        lock_tracker(&self.tracker).upstream.push_back(packet.id);
         if let Err(e) = self.input.push_buffer(buffer) {
+            lock_tracker(&self.tracker).upstream.pop_back();
             return Err(self.latch_error(format!("cannot submit H.264 access unit: {e:?}")));
         }
         self.pending_pps = None;
@@ -1042,6 +1157,10 @@ impl VideoDecoder for Decoder {
         }
         self.check_error()?;
         Ok(None)
+    }
+
+    fn take_dropped(&mut self) -> Option<DroppedSample> {
+        lock_tracker(&self.tracker).dropped.pop_front()
     }
 
     fn end_stream(&mut self) -> Result<(), Error> {
@@ -1254,6 +1373,50 @@ mod tests {
             "pre-recovery picture escaped"
         );
         assert_eq!(pixels, golden.lines().skip(20).collect::<Vec<_>>());
+        // Every discarded pre-recovery sample is reported, so a caller
+        // waiting for one result per submission is not left hanging.
+        wait_drained(&mut decoder);
+        let mut dropped = Vec::new();
+        while let Some(sample) = decoder.take_dropped() {
+            assert!(sample.error.is_none(), "{:?}", sample.error);
+            dropped.push(sample.id);
+        }
+        dropped.sort_unstable();
+        assert_eq!(dropped, (0..20).collect::<Vec<_>>());
+    }
+
+    fn wait_drained(decoder: &mut Decoder) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while !decoder.is_drained().unwrap() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "terminal EOS never arrived"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    #[test]
+    fn decoded_samples_are_never_reported_dropped() {
+        let frames = fixture_access_units();
+        let mut decoder = Decoder::h264_nv12(1).unwrap();
+        for (id, bytes) in frames.iter().enumerate() {
+            decoder
+                .submit(AccessUnit {
+                    id: id as u64,
+                    bytes,
+                    pts_ns: Some(id as i64 * 33_333_333),
+                    dts_ns: None,
+                    duration_ns: Some(33_333_333),
+                })
+                .unwrap();
+        }
+        decoder.end_stream().unwrap();
+        for _ in 0..frames.len() {
+            decoder.pull(Duration::from_secs(3)).unwrap().unwrap();
+        }
+        wait_drained(&mut decoder);
+        assert!(decoder.take_dropped().is_none());
     }
 
     #[test]

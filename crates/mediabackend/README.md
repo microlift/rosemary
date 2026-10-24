@@ -10,7 +10,10 @@ NV12, I420 and BGRA outputs.
 - `VideoDecoder::submit` accepts a compressed access unit with a unique `id`.
   The identifier is not a presentation timestamp; repeated PTS is valid.
 - `VideoDecoder::pull` returns a host-owned decoded frame preserving input
-  identity across H.264 B-frame reordering. `VideoFrame::with_bytes` maps the
+  identity across H.264 B-frame reordering. A sample that will never produce a
+  frame of its own (discarded as corrupt or pre-recovery, or folded into
+  another picture) is reported once by `VideoDecoder::take_dropped`, so every
+  accepted id is eventually accounted for. `VideoFrame::with_bytes` maps the
   original GStreamer sample without an intermediate per-plane owned `Vec`.
 - Frame layout carries validated strides/offsets, per-plane mapped spans,
   pixel format, optional crop, sample aspect ratio, negotiated chroma siting

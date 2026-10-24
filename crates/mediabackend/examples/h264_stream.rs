@@ -103,6 +103,12 @@ fn receive(
     ids: &mut Vec<u64>,
     bytes: &mut u64,
 ) -> Result<bool, Error> {
+    if let Some(dropped) = decoder.take_dropped() {
+        return Err(Error::Decode(format!(
+            "decoder dropped access unit {}: {:?}",
+            dropped.id, dropped.error
+        )));
+    }
     let Some(frame) = decoder.pull(timeout)? else {
         return Ok(false);
     };

@@ -221,15 +221,30 @@ pub trait VideoFrame {
     fn with_bytes<R>(&self, read: impl FnOnce(&[u8], &FrameLayout) -> R) -> Result<R, Error>;
 }
 
+/// A submitted sample that will never be returned as a frame.
+#[derive(Debug)]
+pub struct DroppedSample {
+    pub id: u64,
+    /// None when the decoder discarded the sample (for example a corrupt or
+    /// pre-recovery picture) or folded it into another picture.
+    pub error: Option<Error>,
+}
+
 /// An incremental decode producer/consumer. Submission need not produce an
 /// immediately available picture when the compressed stream uses reordering.
-/// The caller must not interpret an empty poll as a dropped input sample.
+/// The caller must not interpret an empty poll as a dropped input sample;
+/// every accepted sample id is eventually returned exactly once, either as a
+/// frame by `pull` or by `take_dropped`.
 pub trait VideoDecoder {
     type Frame: VideoFrame;
 
     fn codec(&self) -> VideoCodec;
     fn submit(&mut self, packet: AccessUnit<'_>) -> Result<(), Error>;
     fn pull(&mut self, timeout: Duration) -> Result<Option<Self::Frame>, Error>;
+    /// The next sample known never to produce a frame. A drop becomes known
+    /// once the decoder outputs a later frame or reaches end of stream, so
+    /// poll this alongside `pull`.
+    fn take_dropped(&mut self) -> Option<DroppedSample>;
     /// Terminal stream completion, not a VideoToolbox-compatible mid-GOP wait.
     fn end_stream(&mut self) -> Result<(), Error>;
     /// True only after a terminal end-of-stream has passed through all
