@@ -506,10 +506,12 @@ fn install() -> Option<()> {
             // after a resume as it does after a Mach one; and everything
             // blocked, so nothing runs on the thread while it is parked.
             // The server's work is the exception: a suspended task still
-            // answers for its memory.
+            // answers for its memory. Do not use SA_ONSTACK: a full saved
+            // register/FPU context can overflow 8 KiB alternate stacks used
+            // by host runtimes. Suspension is not a stack-overflow handler.
             let mut action: libc::sigaction = std::mem::zeroed();
             action.sa_sigaction = park as *const () as usize;
-            action.sa_flags = libc::SA_SIGINFO | libc::SA_RESTART | libc::SA_ONSTACK;
+            action.sa_flags = libc::SA_SIGINFO | libc::SA_RESTART;
             libc::sigfillset(&mut action.sa_mask);
             if let Some(service) = server::task::signal() {
                 libc::sigdelset(&mut action.sa_mask, service);
@@ -1059,6 +1061,22 @@ mod state {
 mod tests {
     use super::*;
     use std::sync::atomic::AtomicU64;
+
+    /// The suspension handler must not consume a host runtime's small
+    /// alternate signal stack while saving the full register/FPU context.
+    #[test]
+    fn suspension_handler_does_not_use_the_alternate_signal_stack() {
+        assert!(install().is_some());
+        let signal = suspend_signal().expect("private suspension signal");
+        // SAFETY: querying an existing disposition without installing one.
+        let mut action: libc::sigaction = unsafe { std::mem::zeroed() };
+        assert_eq!(
+            unsafe { libc::sigaction(signal, std::ptr::null(), &mut action) },
+            0
+        );
+        assert_eq!(action.sa_flags & libc::SA_ONSTACK, 0);
+        assert_ne!(action.sa_flags & libc::SA_SIGINFO, 0);
+    }
 
     /// Whatever `thread_policy_set` was given, a thread reads back as a
     /// timeshare thread with the default time constraint.
