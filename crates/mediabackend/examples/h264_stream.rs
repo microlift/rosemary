@@ -126,7 +126,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             match decoder.submit(AccessUnit {
                 id: index as u64,
                 bytes: unit,
-                pts_ns: Some((index as u64 + 1) * 1_000_000),
+                pts_ns: Some((index as i64 + 1) * 1_000_000),
                 dts_ns: None,
                 duration_ns: Some(1_000_000),
             }) {

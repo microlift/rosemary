@@ -11,10 +11,49 @@ use gst_app::{AppSink, AppSrc};
 use gst_video::video_frame::VideoBufferExt;
 
 const INPUT_QUEUE_LIMIT: u64 = 8 * 1024 * 1024;
+// GStreamer uses unsigned nanoseconds with u64::MAX reserved for NONE.
+// Bias signed media times into a positive range (146 years of negative
+// preroll, all positive i64 nanoseconds). Reject values outside this range.
+const MEDIA_TIME_EPOCH_NS: i128 = 1_i128 << 62;
+
+fn gst_media_time(ns: i64) -> Result<gst::ClockTime, Error> {
+    let unsigned = i128::from(ns) + MEDIA_TIME_EPOCH_NS;
+    if unsigned < 0 || unsigned >= i128::from(u64::MAX) {
+        return Err(Error::InvalidInput(
+            "timestamp outside GStreamer timeline range".into(),
+        ));
+    }
+    Ok(gst::ClockTime::from_nseconds(unsigned as u64))
+}
+
+fn original_media_time(time: gst::ClockTime) -> Result<i64, Error> {
+    i64::try_from(i128::from(time.nseconds()) - MEDIA_TIME_EPOCH_NS)
+        .map_err(|_| Error::Decode("decoded timestamp outside signed timeline".into()))
+}
+
+fn chroma_siting(site: gst_video::VideoChromaSite) -> ChromaSiting {
+    use gst_video::VideoChromaSite as S;
+    if site.is_empty() {
+        ChromaSiting::Unknown
+    } else if site == S::JPEG {
+        ChromaSiting::Jpeg
+    } else if site == S::MPEG2 {
+        ChromaSiting::Mpeg2
+    } else if site == S::DV {
+        ChromaSiting::Dv
+    } else if site == S::COSITED {
+        ChromaSiting::Cosited
+    } else if site == S::ALT_LINE {
+        ChromaSiting::AlternateLine
+    } else {
+        ChromaSiting::Other(site.bits())
+    }
+}
 
 use crate::{
-    AccessUnit, ColorMatrix, ColorPrimaries, ColorTransfer, Error, FrameCrop, FrameFieldOrder,
-    FrameInterlaceMode, FrameLayout, PixelFormat, VideoCodec, VideoDecoder, VideoFrame,
+    AccessUnit, ChromaSiting, ColorMatrix, ColorPrimaries, ColorTransfer, Error, FrameCrop,
+    FrameFieldOrder, FrameInterlaceMode, FrameLayout, PixelFormat, VideoCodec, VideoDecoder,
+    VideoFrame,
 };
 
 pub struct Decoder {
@@ -29,6 +68,8 @@ pub struct Decoder {
     pending_pps: Option<Vec<u8>>,
     avcc_annexb_fallback: bool,
     initial_annexb_sets_pending: bool,
+    source_pts_reference: gst::Caps,
+    source_dts_reference: gst::Caps,
 }
 
 struct AvccConfiguration {
@@ -196,9 +237,11 @@ pub struct DecodedFrame {
     id: u64,
     sample: gst::Sample,
     layout: FrameLayout,
-    pts_ns: Option<u64>,
-    dts_ns: Option<u64>,
+    pts_ns: Option<i64>,
+    dts_ns: Option<i64>,
     duration_ns: Option<u64>,
+    source_pts_ns: Option<i64>,
+    source_dts_ns: Option<i64>,
 }
 
 impl VideoFrame for DecodedFrame {
@@ -210,16 +253,24 @@ impl VideoFrame for DecodedFrame {
         &self.layout
     }
 
-    fn pts_ns(&self) -> Option<u64> {
+    fn pts_ns(&self) -> Option<i64> {
         self.pts_ns
     }
 
-    fn dts_ns(&self) -> Option<u64> {
+    fn dts_ns(&self) -> Option<i64> {
         self.dts_ns
     }
 
     fn duration_ns(&self) -> Option<u64> {
         self.duration_ns
+    }
+
+    fn source_pts_ns(&self) -> Option<i64> {
+        self.source_pts_ns
+    }
+
+    fn source_dts_ns(&self) -> Option<i64> {
+        self.source_dts_ns
     }
 
     fn with_bytes<R>(&self, read: impl FnOnce(&[u8], &FrameLayout) -> R) -> Result<R, Error> {
@@ -306,6 +357,24 @@ fn frame_fields(
             "unsupported decoded interlace mode {other:?}"
         ))),
     }
+}
+
+// AUD (NAL type 9) must remain first in an H.264 access unit. Return the
+// first NAL's payload length when it is an AUD; malformed first length
+// prefixes fail before either PPS injection or queued state is consumed.
+fn leading_avcc_aud(packet: &[u8], width: u8) -> Result<Option<usize>, Error> {
+    let width = usize::from(width);
+    if packet.len() < width {
+        return Err(Error::InvalidInput("truncated AVC length prefix".into()));
+    }
+    let mut n = 0usize;
+    for &b in &packet[..width] {
+        n = (n << 8) | usize::from(b);
+    }
+    if n == 0 || n > packet.len() - width {
+        return Err(Error::InvalidInput("invalid leading AVC NAL length".into()));
+    }
+    Ok((packet[width] & 31 == 9).then_some(n))
 }
 
 // Some GStreamer avcC parsers reject parameter sets exceeding 255 bytes even
@@ -505,6 +574,8 @@ impl Decoder {
             pending_pps: None,
             avcc_annexb_fallback: false,
             initial_annexb_sets_pending: false,
+            source_pts_reference: gst::Caps::builder("application/x-rosemary-source-pts").build(),
+            source_dts_reference: gst::Caps::builder("application/x-rosemary-source-dts").build(),
         })
     }
 
@@ -530,7 +601,7 @@ impl Decoder {
         Ok(())
     }
 
-    fn decode_sample(&self, sample: gst::Sample) -> Result<DecodedFrame, Error> {
+    fn decode_sample(&mut self, sample: gst::Sample) -> Result<DecodedFrame, Error> {
         let buffer = sample
             .buffer()
             .ok_or_else(|| Error::Decode("no output buffer".into()))?;
@@ -598,6 +669,7 @@ impl Decoder {
                 }
             }),
             pixel_aspect_ratio,
+            chroma_siting: chroma_siting(info.chroma_site()),
             interlace_mode,
             field_order,
             repeat_first_field,
@@ -641,9 +713,19 @@ impl Decoder {
                 .collect();
         }
         validate_planes(&layout, buffer.size())?;
-        let pts_ns = buffer.pts().map(|time| time.nseconds());
-        let dts_ns = buffer.dts().map(|time| time.nseconds());
+        let pts_ns = buffer.pts().map(original_media_time).transpose()?;
+        let dts_ns = buffer.dts().map(original_media_time).transpose()?;
         let duration_ns = buffer.duration().map(|time| time.nseconds());
+        let source_pts_ns = buffer
+            .iter_meta::<gst::ReferenceTimestampMeta>()
+            .find(|meta| meta.reference() == self.source_pts_reference.as_ref())
+            .map(|meta| original_media_time(meta.timestamp()))
+            .transpose()?;
+        let source_dts_ns = buffer
+            .iter_meta::<gst::ReferenceTimestampMeta>()
+            .find(|meta| meta.reference() == self.source_dts_reference.as_ref())
+            .map(|meta| original_media_time(meta.timestamp()))
+            .transpose()?;
         Ok(DecodedFrame {
             id,
             sample,
@@ -651,6 +733,8 @@ impl Decoder {
             pts_ns,
             dts_ns,
             duration_ns,
+            source_pts_ns,
+            source_dts_ns,
         })
     }
 
@@ -685,10 +769,10 @@ impl VideoDecoder for Decoder {
                 .avcc
                 .as_ref()
                 .expect("AVCC fallback without configuration");
-            let mut converted = Vec::new();
+            let mut injection = Vec::new();
             if self.initial_annexb_sets_pending {
                 for nal in config.sps.iter().chain(&config.pps) {
-                    if converted
+                    if injection
                         .len()
                         .checked_add(4)
                         .and_then(|n| n.checked_add(nal.len()))
@@ -698,13 +782,28 @@ impl VideoDecoder for Decoder {
                             "parameter sets exceed queue limit".into(),
                         ));
                     }
-                    converted.extend_from_slice(&[0, 0, 0, 1]);
-                    converted.extend_from_slice(nal);
+                    injection.extend_from_slice(&[0, 0, 0, 1]);
+                    injection.extend_from_slice(nal);
                 }
             } else if let Some(pps) = &self.pending_pps {
-                converted.extend_from_slice(pps);
+                injection.extend_from_slice(pps);
             }
+            let aud_len = leading_avcc_aud(packet.bytes, config.nal_length)?;
+            let mut converted = Vec::new();
             avcc_to_annexb(packet.bytes, config.nal_length, &mut converted)?;
+            if !injection.is_empty() {
+                let split = aud_len.map_or(0, |n| n + 4);
+                if converted
+                    .len()
+                    .checked_add(injection.len())
+                    .is_none_or(|n| n as u64 > INPUT_QUEUE_LIMIT)
+                {
+                    return Err(Error::InvalidInput(
+                        "expanded AVC access unit exceeds queue limit".into(),
+                    ));
+                }
+                converted.splice(split..split, injection);
+            }
             Some(converted)
         } else {
             None
@@ -720,10 +819,7 @@ impl VideoDecoder for Decoder {
             packet.bytes.len().checked_add(extra)
         };
         if packet.id == u64::MAX
-            || [packet.pts_ns, packet.dts_ns, packet.duration_ns]
-                .into_iter()
-                .flatten()
-                .any(|v| v == u64::MAX)
+            || packet.duration_ns == Some(u64::MAX)
             || packet.bytes.is_empty()
             || total_len.is_none_or(|len| len as u64 > INPUT_QUEUE_LIMIT)
         {
@@ -731,6 +827,8 @@ impl VideoDecoder for Decoder {
                 "invalid packet identifier or length".into(),
             ));
         }
+        let pts = packet.pts_ns.map(gst_media_time).transpose()?;
+        let dts = packet.dts_ns.map(gst_media_time).transpose()?;
         // GStreamer is asynchronous. Never block the guest's decode thread
         // while an appsink queue could itself be awaiting that same thread.
         // Return a recoverable signal without consuming the input instead.
@@ -750,17 +848,22 @@ impl VideoDecoder for Decoder {
         } else {
             let mut bytes = Vec::with_capacity(total_len.unwrap());
             if let Some(pps) = &self.pending_pps {
+                let split = leading_avcc_aud(packet.bytes, self.avcc.as_ref().unwrap().nal_length)?
+                    .map_or(0, |n| n + self.avcc.as_ref().unwrap().nal_length as usize);
+                bytes.extend_from_slice(&packet.bytes[..split]);
                 bytes.extend_from_slice(pps);
+                bytes.extend_from_slice(&packet.bytes[split..]);
+            } else {
+                bytes.extend_from_slice(packet.bytes);
             }
-            bytes.extend_from_slice(packet.bytes);
             bytes
         };
         let mut buffer = gst::Buffer::from_mut_slice(compressed);
         let writable = buffer
             .get_mut()
             .ok_or_else(|| Error::Decode("GstBuffer is not writable".into()))?;
-        writable.set_pts(packet.pts_ns.map(gst::ClockTime::from_nseconds));
-        writable.set_dts(packet.dts_ns.map(gst::ClockTime::from_nseconds));
+        writable.set_pts(pts);
+        writable.set_dts(dts);
         writable.set_duration(packet.duration_ns.map(gst::ClockTime::from_nseconds));
         gst::ReferenceTimestampMeta::add(
             writable,
@@ -768,6 +871,12 @@ impl VideoDecoder for Decoder {
             gst::ClockTime::from_nseconds(packet.id),
             None,
         );
+        if let Some(pts) = pts {
+            gst::ReferenceTimestampMeta::add(writable, &self.source_pts_reference, pts, None);
+        }
+        if let Some(dts) = dts {
+            gst::ReferenceTimestampMeta::add(writable, &self.source_dts_reference, dts, None);
+        }
         if let Err(e) = self.input.push_buffer(buffer) {
             return Err(self.latch_error(format!("cannot submit H.264 access unit: {e:?}")));
         }
@@ -891,7 +1000,7 @@ mod tests {
                 .submit(AccessUnit {
                     id: (i + 100) as u64,
                     bytes,
-                    pts_ns: Some(i as u64 * 33_333_333),
+                    pts_ns: Some(i as i64 * 33_333_333),
                     dts_ns: None,
                     duration_ns: Some(33_333_333),
                 })
@@ -958,7 +1067,7 @@ mod tests {
                 .submit(AccessUnit {
                     id: index as u64,
                     bytes: unit,
-                    pts_ns: Some(index as u64 * 33_333_333),
+                    pts_ns: Some(index as i64 * 33_333_333),
                     dts_ns: None,
                     duration_ns: Some(33_333_333),
                 })
@@ -1219,7 +1328,7 @@ mod tests {
             match decoder.submit(AccessUnit {
                 id: produced,
                 bytes,
-                pts_ns: Some(produced * 33_333_333),
+                pts_ns: Some(produced as i64 * 33_333_333),
                 dts_ns: None,
                 duration_ns: Some(33_333_333),
             }) {
@@ -1287,7 +1396,7 @@ mod tests {
                 .submit(AccessUnit {
                     id: index as u64,
                     bytes,
-                    pts_ns: Some(index as u64 * 100_000_000),
+                    pts_ns: Some(index as i64 * 100_000_000),
                     dts_ns: None,
                     duration_ns: Some(100_000_000),
                 })
@@ -1316,7 +1425,7 @@ mod tests {
                 .submit(AccessUnit {
                     id: index as u64,
                     bytes,
-                    pts_ns: Some(index as u64 * 100_000_000),
+                    pts_ns: Some(index as i64 * 100_000_000),
                     dts_ns: None,
                     duration_ns: Some(100_000_000),
                 })
@@ -1541,7 +1650,7 @@ mod tests {
                 .submit(AccessUnit {
                     id: i as u64 + 300,
                     bytes,
-                    pts_ns: Some(i as u64 * 200_000_000),
+                    pts_ns: Some(i as i64 * 200_000_000),
                     dts_ns: None,
                     duration_ns: Some(200_000_000),
                 })
@@ -1565,7 +1674,7 @@ mod tests {
                 .submit(AccessUnit {
                     id: i as u64 + 400,
                     bytes,
-                    pts_ns: Some(i as u64 * 200_000_000),
+                    pts_ns: Some(i as i64 * 200_000_000),
                     dts_ns: None,
                     duration_ns: Some(200_000_000),
                 })
@@ -1595,8 +1704,8 @@ mod tests {
         let data = include_bytes!("../tests/fixtures/red_32x32.h264");
         for (id, pts, dts, duration) in [
             (u64::MAX, None, None, None),
-            (1, Some(u64::MAX), None, None),
-            (1, None, Some(u64::MAX), None),
+            (1, Some(i64::MIN), None, None),
+            (1, None, Some(i64::MIN), None),
             (1, None, None, Some(u64::MAX)),
         ] {
             assert!(matches!(
@@ -1675,6 +1784,7 @@ mod tests {
             offsets: vec![0, 17 * 17],
             crop: None,
             pixel_aspect_ratio: (1, 1),
+            chroma_siting: ChromaSiting::Unknown,
             interlace_mode: FrameInterlaceMode::Progressive,
             field_order: FrameFieldOrder::Unknown,
             repeat_first_field: false,
@@ -1808,6 +1918,128 @@ mod tests {
     }
 
     #[test]
+    fn chroma_siting_preserves_distinct_negotiated_positions() {
+        let sources: [(&[u8], ChromaSiting); 2] = [
+            (
+                include_bytes!("../tests/fixtures/chroma_mpeg2_2_64x64.h264"),
+                ChromaSiting::Mpeg2,
+            ),
+            (
+                include_bytes!("../tests/fixtures/chroma_jpeg_2_64x64.h264"),
+                ChromaSiting::Jpeg,
+            ),
+        ];
+        for (source, expected) in sources {
+            let units = aud_delimited_units(source);
+            assert_eq!(units.len(), 2);
+            let mut decoder = Decoder::h264_nv12(1).unwrap();
+            for (id, bytes) in units.iter().enumerate() {
+                decoder
+                    .submit(AccessUnit {
+                        id: id as u64 + 1000,
+                        bytes,
+                        pts_ns: Some(id as i64 * 200_000_000),
+                        dts_ns: None,
+                        duration_ns: Some(200_000_000),
+                    })
+                    .unwrap();
+            }
+            decoder.end_stream().unwrap();
+            for index in 0..2 {
+                let frame = decoder.pull(Duration::from_secs(3)).unwrap().unwrap();
+                assert_eq!(frame.id(), index + 1000);
+                assert_eq!(frame.layout().chroma_siting, expected);
+                assert_eq!(frame.layout().format, PixelFormat::Nv12);
+            }
+        }
+        assert_eq!(
+            chroma_siting(gst_video::VideoChromaSite::empty()),
+            ChromaSiting::Unknown
+        );
+        assert_eq!(
+            chroma_siting(gst_video::VideoChromaSite::DV),
+            ChromaSiting::Dv
+        );
+    }
+
+    #[test]
+    fn negative_media_times_roundtrip_through_bframe_reordering() {
+        assert!(matches!(
+            gst_media_time(i64::MIN),
+            Err(Error::InvalidInput(_))
+        ));
+        for ts in [
+            -1_000_000_000,
+            -99_999_999,
+            -1,
+            0,
+            1,
+            1_000_000_000,
+            i64::MAX,
+        ] {
+            assert_eq!(
+                original_media_time(gst_media_time(ts).unwrap()).unwrap(),
+                ts
+            );
+        }
+        let frames = fixture_access_units();
+        assert_eq!(frames.len(), 8);
+        // Decode order differs from display order; the initial decode time is
+        // negative. Per-ID source timing is retained even when avdec_h264
+        // discards its output DTS.
+        let presentation_order = [0_i64, 3, 1, 2, 6, 4, 5, 7];
+        let mut decoder = Decoder::h264_nv12(1).unwrap();
+        for (index, packet) in frames.iter().enumerate() {
+            decoder
+                .submit(AccessUnit {
+                    id: index as u64 + 1100,
+                    bytes: packet,
+                    pts_ns: Some((presentation_order[index] - 4) * 33_333_333),
+                    dts_ns: Some((index as i64 - 4) * 33_333_333),
+                    duration_ns: Some(33_333_333),
+                })
+                .unwrap();
+        }
+        decoder.end_stream().unwrap();
+        let mut found = Vec::new();
+        let mut negative_decoded = false;
+        for _ in 0..8 {
+            let frame = decoder.pull(Duration::from_secs(3)).unwrap().unwrap();
+            let i = (frame.id() - 1100) as usize;
+            assert_eq!(
+                frame.source_pts_ns(),
+                Some((presentation_order[i] - 4) * 33_333_333)
+            );
+            assert_eq!(frame.source_dts_ns(), Some((i as i64 - 4) * 33_333_333));
+            // avdec_h264 may reassign decoded PTS while preserving source
+            // timing metadata attached to the exact source frame identity.
+            negative_decoded |= frame.pts_ns().is_some_and(|pts| pts < 0);
+            found.push(i);
+        }
+        found.sort_unstable();
+        assert_eq!(found, (0..8).collect::<Vec<_>>());
+        assert!(negative_decoded, "negative decoded output PTS was lost");
+    }
+
+    #[test]
+    fn leading_avcc_aud_is_recognized_and_malformed_lengths_rejected() {
+        for width in [1, 2, 4] {
+            let mut packet = vec![0; width];
+            packet[width - 1] = 2;
+            packet.extend_from_slice(&[9, 0xf0]);
+            packet[width - 1] = 2;
+            assert_eq!(leading_avcc_aud(&packet, width as u8).unwrap(), Some(2));
+            packet[width] = 0x65;
+            assert_eq!(leading_avcc_aud(&packet, width as u8).unwrap(), None);
+            packet[width - 1] = 3;
+            assert!(matches!(
+                leading_avcc_aud(&packet, width as u8),
+                Err(Error::InvalidInput(_))
+            ));
+        }
+    }
+
+    #[test]
     fn changed_midgop_pps_preserves_reference_dependent_output() {
         // The source has one IDR and nineteen dependent P pictures. At picture
         // ten its PPS ID 0 is redefined with pic_init_qp_minus26 -3 -> -2.
@@ -1859,7 +2091,7 @@ mod tests {
                             new_pps = Some(nal.to_vec());
                         }
                     }
-                    1 | 5 => {
+                    1 | 5 | 9 => {
                         packet.extend_from_slice(&(nal.len() as u32).to_be_bytes());
                         packet.extend_from_slice(nal);
                     }
@@ -1867,6 +2099,7 @@ mod tests {
                 }
             }
             assert!(!packet.is_empty(), "missing slice in picture {index}");
+            assert_eq!(packet[4] & 31, 9, "each PPS regression AU retains its AUD");
             avcc.push(packet);
         }
         let sps = sps.unwrap();
@@ -1884,7 +2117,7 @@ mod tests {
                 .submit(AccessUnit {
                     id: index as u64 + 200,
                     bytes: packet,
-                    pts_ns: Some(index as u64 * 100_000_000),
+                    pts_ns: Some(index as i64 * 100_000_000),
                     dts_ns: None,
                     duration_ns: Some(100_000_000),
                 })
@@ -2023,7 +2256,7 @@ mod tests {
                 .submit(AccessUnit {
                     id: (i + 17) as u64,
                     bytes,
-                    pts_ns: Some(i as u64 * 33_333_333),
+                    pts_ns: Some(i as i64 * 33_333_333),
                     dts_ns: None,
                     duration_ns: Some(33_333_333),
                 })
@@ -2053,7 +2286,7 @@ mod tests {
                     id: id as u64 + 1,
                     bytes,
                     // Deliberately repeated PTS: mapping by timestamp is wrong.
-                    pts_ns: Some((id as u64 / 2) * 33_333_333),
+                    pts_ns: Some((id as i64 / 2) * 33_333_333),
                     dts_ns: None,
                     duration_ns: Some(33_333_333),
                 })

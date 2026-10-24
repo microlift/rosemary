@@ -13,12 +13,20 @@ NV12, I420 and BGRA outputs.
   identity across H.264 B-frame reordering. `VideoFrame::with_bytes` maps the
   original GStreamer sample without an intermediate per-plane owned `Vec`.
 - Frame layout carries validated strides/offsets, per-plane mapped spans,
-  pixel format, optional crop, sample aspect ratio, per-buffer field order,
-  repeat-first/one-field flags, and color information. Progressive and
+  pixel format, optional crop, sample aspect ratio, negotiated chroma siting
+  (JPEG/MPEG-2/DV/other/unknown), per-buffer field order, repeat-first/
+  one-field flags, and color information. Progressive and
   interleaved frames are supported; Mixed, Fields and alternate-field formats
   fail explicitly until their additional reconstruction/plane contracts exist.
-  Unknown color range is distinct from limited range. Frame timing comes from decoded buffers; output DTS may be
-  absent even when the compressed input provided it.
+  Unknown color range is distinct from limited range. Signed PTS/DTS are
+  expressed as nanoseconds, independently of sample IDs; durations remain
+  unsigned. The GStreamer backend applies a reversible +2^62 ns epoch bias
+  because GstClockTime is unsigned; values earlier than -2^62 ns are
+  explicitly rejected rather than clamped. Decoded PTS/DTS describe actual
+  output, which may be reordered or omitted by libav. Original compressed
+  source PTS/DTS remain available separately through VideoFrame source timing
+  methods and are preserved using per-buffer timestamp metadata, without
+  retaining an unbounded per-ID lookup table.
 - AVCC configuration records use independent 16-bit SPS/PPS lengths and
   validated High/High10/High422 profile-specific chroma/bit-depth fields.
   Unsupported AVC profiles and SPS extension NALs fail explicitly. The
@@ -33,7 +41,8 @@ NV12, I420 and BGRA outputs.
   the update is rejected without altering the existing session. The Annex-B
   fallback accepts longer in-band PPS updates. Neither path restricts the
   initial avcC record's 16-bit parameter-set lengths. Annex-B access-unit
-  input is supported. Access units larger than 8 MiB are
+  input is supported. PPS injection preserves a leading AUD in either input
+  format. Access units larger than 8 MiB are
   rejected; within that bound, queue backpressure is recoverable: drain output
   and retry the **same** unconsumed input, rather than dropping frames.
 - End-of-stream is terminal and distinct from a temporarily empty output
@@ -60,10 +69,12 @@ NV12/I420/BGRA lifetime, same-SPS PPS reconfiguration, 256-frame bounded queue
 backpressure, terminal EOS, missing-IDR recovery, immediate single-IDR output
 without EOS, retained fatal bus errors including after EOS, decoded timing,
 anamorphic/interlaced metadata, per-buffer field flags with explicit unsupported
-interlace-mode rejection, one-byte AVCC prefixes with a 425-byte legal High10
-PPS and profile-specific avcC extensions, an AUD-less 10-picture stream,
-and truncated input. A 20-picture changed-PPS mid-GOP regression matches independent FFmpeg
-luma hashes, including reference-dependent P frames after reconfiguration.
+interlace-mode rejection, MPEG-2 versus JPEG chroma siting, negative source DTS
+and decoded signed PTS through B-frame reordering, one-byte AVCC prefixes with
+a 425-byte legal High10 PPS and profile-specific avcC extensions, an AUD-less
+10-picture stream, and truncated input. A 20-picture changed-PPS mid-GOP regression matches independent FFmpeg
+luma hashes, including reference-dependent P frames after reconfiguration,
+with the original AUD NAL units retained.
 The example uses GStreamer's H.264 parser to find access-unit boundaries,
 rather than assuming Access Unit Delimiters are mandatory. The libav element is
 configured with `output-corrupt=false` and `discard-corrupted-frames=true`:
@@ -85,5 +96,8 @@ GStreamer decoded buffer flags rather than only negotiated caps; FFprobe's
 independent per-frame top_field_first=0 agrees with the BFF flags for the pinned
 interlaced fixture, even though its stream summary reports field_order=tt.
 Complex telecine reconstruction and multi-meta field buffers remain unsupported.
+Signed media times are represented to nanosecond precision; fractional
+CoreMedia time scales requiring subnanosecond precision must be converted by
+an integrating adapter rather than silently rounded by this decoder.
 Auto/frame threading can improve throughput but increases delayed output and RSS. See later scoped
 integration work for CPU CoreVideo handoff and bundle packaging.

@@ -19,6 +19,19 @@ pub enum PixelFormat {
     Bgra,
 }
 
+/// Chroma sample alignment relative to luma samples. Unknown means no
+/// location was negotiated; Other preserves unusual GStreamer flag sets.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ChromaSiting {
+    Unknown,
+    Jpeg,
+    Mpeg2,
+    Dv,
+    Cosited,
+    AlternateLine,
+    Other(u32),
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ColorMatrix {
     Bt601,
@@ -48,8 +61,11 @@ pub enum ColorTransfer {
 pub struct AccessUnit<'a> {
     pub id: u64,
     pub bytes: &'a [u8],
-    pub pts_ns: Option<u64>,
-    pub dts_ns: Option<u64>,
+    /// Signed nanoseconds on the caller's media timeline. No implicit clamp
+    /// or wrap to GStreamer's unsigned clock is allowed.
+    pub pts_ns: Option<i64>,
+    pub dts_ns: Option<i64>,
+    /// A duration cannot be negative.
     pub duration_ns: Option<u64>,
 }
 
@@ -88,6 +104,8 @@ pub struct FrameLayout {
     pub crop: Option<FrameCrop>,
     /// Pixel (sample) aspect ratio, reduced to a positive numerator/denominator.
     pub pixel_aspect_ratio: (u32, u32),
+    /// Chroma cositing from decoded output caps, distinct from colorimetry.
+    pub chroma_siting: ChromaSiting,
     /// Modes requiring field-specific planes or telecine reconstruction fail
     /// at decode instead of being represented as incomplete frame layouts.
     pub interlace_mode: FrameInterlaceMode,
@@ -152,9 +170,15 @@ pub trait VideoFrame {
     fn layout(&self) -> &FrameLayout;
     /// Presentation, decoding and duration times as reported on decoded output.
     /// These are not sample identifiers and may be absent or repeated.
-    fn pts_ns(&self) -> Option<u64>;
-    fn dts_ns(&self) -> Option<u64>;
+    /// Decoded output timeline (may differ from the source by reordering).
+    fn pts_ns(&self) -> Option<i64>;
+    fn dts_ns(&self) -> Option<i64>;
     fn duration_ns(&self) -> Option<u64>;
+    /// Exact original compressed sample timeline, keyed by sample identity.
+    /// Decoders may legitimately omit their output DTS; source DTS remains
+    /// independently recoverable and is not fabricated as output DTS.
+    fn source_pts_ns(&self) -> Option<i64>;
+    fn source_dts_ns(&self) -> Option<i64>;
     fn with_bytes<R>(&self, read: impl FnOnce(&[u8], &FrameLayout) -> R) -> Result<R, Error>;
 }
 
