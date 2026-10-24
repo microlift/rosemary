@@ -606,17 +606,30 @@ unsafe extern "C" fn draw_rect(receiver: Id, _sel: Sel, _dirty: NSRect) {
     let mut pixels = vec![0u8; width * height * 4];
     let mut canvas = chrome::Canvas::new(&mut pixels, width, height, width * 4, density as f32);
     let (w, h) = (bounds.size.width as f32, bounds.size.height as f32);
-    canvas.fill_rounded_rect(
-        chrome::Rect::new(1.0, 1.0, w - 2.0, h - 3.0),
-        4.0,
-        chrome::Color::rgba(255, 255, 255, 1.0),
-    );
-    canvas.stroke_rounded_rect(
-        chrome::Rect::new(1.5, 1.5, w - 3.0, h - 4.0),
-        4.0,
-        1.0,
-        chrome::Color::rgba(0, 0, 0, 0.3),
-    );
+    // A borderless pop-up is its title and arrows on whatever is behind it,
+    // in the appearance's label colour.
+    // SAFETY: `-isBordered` is `BOOL (id, SEL)`.
+    let bordered = unsafe {
+        let f: unsafe extern "C" fn(Id, Sel) -> u8 = std::mem::transmute(objc::msg::entry());
+        f(receiver, objc::sel::get("isBordered")) != 0
+    };
+    if bordered {
+        canvas.fill_rounded_rect(
+            chrome::Rect::new(1.0, 1.0, w - 2.0, h - 3.0),
+            4.0,
+            chrome::Color::rgba(255, 255, 255, 1.0),
+        );
+        canvas.stroke_rounded_rect(
+            chrome::Rect::new(1.5, 1.5, w - 3.0, h - 4.0),
+            4.0,
+            1.0,
+            chrome::Color::rgba(0, 0, 0, 0.3),
+        );
+    }
+    let ink = match !bordered && crate::appearance::is_dark() {
+        true => 255,
+        false => 0,
+    };
     let enabled = crate::controls::is_enabled(receiver);
     let alpha = if enabled { 0.85 } else { 0.35 };
     let font: Option<(Arc<chrome::Font>, f64)> =
@@ -633,7 +646,7 @@ unsafe extern "C" fn draw_rect(receiver: Id, _sel: Sel, _dirty: NSRect) {
         });
         let line = font.truncate(&title, size, (w - 12.0 - arrows).max(0.0));
         let baseline = font.centered_baseline(size, 0.0, h - 1.0);
-        let color = chrome::Color::rgba(0, 0, 0, alpha);
+        let color = chrome::Color::rgba(ink, ink, ink, alpha);
         canvas.draw_text(&line, &font, size, chrome::Point::new(8.0, baseline), color);
         let glyph = if state(receiver).pulls_down {
             "\u{25BE}"
