@@ -1960,6 +1960,101 @@ fn new_view(class: Id) -> Option<Id> {
     (!object.is_null()).then(|| objc::arc::autorelease(object))
 }
 
+fn send_word(receiver: Id, selector: &str, value: usize) {
+    // SAFETY: every selector this is used with is `void (id, SEL, NSUInteger)`
+    // or takes a BOOL, which the ABI passes in the same register.
+    unsafe {
+        let f: unsafe extern "C" fn(Id, Sel, usize) = std::mem::transmute(objc::msg::entry());
+        f(receiver, objc::sel::get(selector), value);
+    }
+}
+
+/// A button of `kind` titled `title`, sized to fit, for the `+...WithTitle:`
+/// constructors.
+fn titled_button(class: Id, title: Id, target: Id, action: Sel, kind: usize) -> Id {
+    let Some(button) = new_view(class) else {
+        return std::ptr::null_mut();
+    };
+    send_word(button, "setButtonType:", kind);
+    if kind == button_type::MOMENTARY_PUSH_IN {
+        // `NSBezelStyleRounded`.
+        send_word(button, "setBezelStyle:", 1);
+    }
+    send_object(button, "setTitle:", title);
+    send_object(button, "setTarget:", target);
+    // SAFETY: `-setAction:` is `void (id, SEL, SEL)`, and `-sizeToFit`
+    // `void (id, SEL)`.
+    unsafe {
+        let f: unsafe extern "C" fn(Id, Sel, Sel) = std::mem::transmute(objc::msg::entry());
+        f(button, objc::sel::get("setAction:"), action);
+        let f: unsafe extern "C" fn(Id, Sel) = std::mem::transmute(objc::msg::entry());
+        f(button, objc::sel::get("sizeToFit"));
+    }
+    button
+}
+
+/// `+buttonWithTitle:target:action:`: a rounded push button.
+unsafe extern "C" fn button_with_title(
+    class: Id,
+    _sel: Sel,
+    title: Id,
+    target: Id,
+    action: Sel,
+) -> Id {
+    titled_button(class, title, target, action, button_type::MOMENTARY_PUSH_IN)
+}
+
+unsafe extern "C" fn checkbox_with_title(
+    class: Id,
+    _sel: Sel,
+    title: Id,
+    target: Id,
+    action: Sel,
+) -> Id {
+    titled_button(class, title, target, action, button_type::SWITCH)
+}
+
+/// `-setAttributedAlternateTitle:`. Kept, and shown as its characters: a
+/// button here draws its alternate title as plain text.
+unsafe extern "C" fn button_set_attributed_alternate_title(receiver: Id, sel: Sel, value: Id) {
+    // SAFETY: the property's own setter and getter selectors.
+    unsafe { crate::props::set_copied(receiver, sel, value) };
+    let string = match value.is_null() {
+        true => std::ptr::null_mut(),
+        // SAFETY: `-string` is `id (id, SEL)` on an attributed string.
+        false => unsafe {
+            let f: unsafe extern "C" fn(Id, Sel) -> Id = std::mem::transmute(objc::msg::entry());
+            f(value, objc::sel::get("string"))
+        },
+    };
+    // SAFETY: the receiver is a button and the argument an NSString or nil.
+    unsafe { button_set_alternate_title(receiver, objc::sel::get("setAlternateTitle:"), string) };
+}
+
+/// `+stackViewWithViews:`: a horizontal stack arranging `views` in order.
+unsafe extern "C" fn stack_with_views(class: Id, _sel: Sel, views: Id) -> Id {
+    let Some(stack) = new_view(class) else {
+        return std::ptr::null_mut();
+    };
+    // SAFETY: an array, or nil.
+    if let Some(array) = unsafe { corefoundation::collections::array(views as _) } {
+        for view in array.values.clone() {
+            arrange_view(stack, view as Id, 1);
+        }
+    }
+    stack
+}
+
+/// `-isDisplayedWhenStopped`, stored inverted: AppKit's default is YES.
+/// FIXME (ACCURACY): kept only; an indicator here draws nothing either way.
+unsafe extern "C" fn indicator_set_displayed_when_stopped(receiver: Id, _sel: Sel, value: u8) {
+    crate::props::set_integer_of(receiver, "hiddenWhenStopped", usize::from(value == 0));
+}
+
+unsafe extern "C" fn indicator_is_displayed_when_stopped(receiver: Id, _sel: Sel) -> u8 {
+    u8::from(crate::props::integer(receiver, "hiddenWhenStopped") == 0)
+}
+
 /// `+buttonWithImage:target:action:`, sized to the image as AppKit sizes it to
 /// fit.
 unsafe extern "C" fn button_with_image(
@@ -2249,6 +2344,9 @@ pub(crate) fn install() {
         "removeArrangedSubview:" => stack_remove_arranged_subview, c"v24@0:8@16";
         "arrangedSubviews" => stack_arranged_subviews, c"@16@0:8";
     });
+    class_methods!(class, {
+        "stackViewWithViews:" => stack_with_views, c"@24@0:8@16";
+    });
 
     let class = objc::class::lookup(c"NSBox").expect("declared before its methods");
     methods!(class, {
@@ -2285,6 +2383,11 @@ pub(crate) fn install() {
         "stopAnimation:" => indicator_stop_animation, c"v24@0:8@16";
         "setDoubleValue:" => indicator_set_double_value, c"v24@0:8d16";
         "doubleValue" => indicator_double_value, c"d16@0:8";
+        "setDisplayedWhenStopped:" => indicator_set_displayed_when_stopped, c"v20@0:8c16";
+        "isDisplayedWhenStopped" => indicator_is_displayed_when_stopped, c"c16@0:8";
+        // FIXME (ACCURACY): kept, and not drawn: an indicator draws nothing.
+        "controlSize" => crate::props::get_integer, c"Q16@0:8";
+        "setControlSize:" => crate::props::set_integer, c"v24@0:8Q16";
     });
 
     // Every control has a target and an action; a subclass a program writes
@@ -2304,11 +2407,21 @@ pub(crate) fn install() {
         "setContinuous:" => control_ignored_flag, c"v20@0:8c16";
         "isContinuous" => control_no, c"c16@0:8";
         "sendActionOn:" => control_send_action_on, c"q24@0:8Q16";
+        // FIXME (ACCURACY): kept, and not drawn: controls here draw at the
+        // regular size.
+        "controlSize" => crate::props::get_integer, c"Q16@0:8";
+        "setControlSize:" => crate::props::set_integer, c"v24@0:8Q16";
+        // FIXME (ACCURACY): kept, not applied: a field shows its string value
+        // as set, unformatted.
+        "formatter" => crate::props::get_object, c"@16@0:8";
+        "setFormatter:" => crate::props::set_retained, c"v24@0:8@16";
     });
 
     let class = objc::class::lookup(c"NSButton").expect("declared before its methods");
     class_methods!(class, {
         "buttonWithImage:target:action:" => button_with_image, c"@40@0:8@16@24:32";
+        "buttonWithTitle:target:action:" => button_with_title, c"@40@0:8@16@24:32";
+        "checkboxWithTitle:target:action:" => checkbox_with_title, c"@40@0:8@16@24:32";
     });
     methods!(class, {
         "setImage:" => button_set_image, c"v24@0:8@16";
@@ -2351,6 +2464,8 @@ pub(crate) fn install() {
         "font" => button_font, c"@16@0:8";
         "setAlternateTitle:" => button_set_alternate_title, c"v24@0:8@16";
         "alternateTitle" => button_alternate_title, c"@16@0:8";
+        "setAttributedAlternateTitle:" => button_set_attributed_alternate_title, c"v24@0:8@16";
+        "attributedAlternateTitle" => crate::props::get_object, c"@16@0:8";
         "setAttributedTitle:" => button_set_attributed_title, c"v24@0:8@16";
         "attributedTitle" => button_attributed_title, c"@16@0:8";
         "setKeyEquivalent:" => button_set_key_equivalent, c"v24@0:8@16";

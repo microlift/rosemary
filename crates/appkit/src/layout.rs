@@ -1311,6 +1311,11 @@ pub(crate) fn install() {
         "constraintLessThanOrEqualToAnchor:multiplier:constant:"
             => at_most_times_plus, c"@40@0:8@16d24d32";
     });
+    let window = objc::class::lookup(c"NSWindow").expect("declared before its methods");
+    methods!(window, {
+        "layoutIfNeeded" => solve_now, c"v16@0:8";
+        "updateConstraintsIfNeeded" => solve_now, c"v16@0:8";
+    });
     let view = objc::class::lookup(c"NSView").expect("declared before its methods");
     methods!(view, {
         "fittingSize" => fitting_size, c"{CGSize=dd}16@0:8";
