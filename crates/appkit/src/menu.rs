@@ -299,6 +299,42 @@ unsafe extern "C" fn set_item_title(receiver: Id, _sel: Sel, title: Id) {
     item.title = objc::arc::retain(title);
 }
 
+/// `-setAttributedTitle:`: kept for reading back, and its characters become
+/// the title the chrome draws.
+/// FIXME (ACCURACY): the attributes are not drawn.
+unsafe extern "C" fn set_attributed_title(receiver: Id, sel: Sel, title: Id) {
+    // SAFETY: the property setter for `attributedTitle`.
+    unsafe { crate::props::set_copied(receiver, sel, title) };
+    let string = match title.is_null() {
+        true => title,
+        // SAFETY: `NSString * (id, SEL)` on an attributed string.
+        false => unsafe {
+            let f: unsafe extern "C" fn(Id, Sel) -> Id = std::mem::transmute(objc::msg::entry());
+            f(title, objc::sel::get("string"))
+        },
+    };
+    // SAFETY: as `-setTitle:`.
+    unsafe { set_item_title(receiver, objc::sel::get("setTitle:"), string) };
+}
+
+/// `-[NSMenu font]`: what was set, or the menu font.
+unsafe extern "C" fn menu_font(receiver: Id, _sel: Sel) -> Id {
+    let set = crate::props::object(receiver, "font");
+    if !set.is_null() {
+        return set;
+    }
+    let class = objc::class::lookup(c"NSFont").expect("declared");
+    // SAFETY: `id (Class, SEL, CGFloat)`.
+    unsafe {
+        let f: unsafe extern "C" fn(Id, Sel, f64) -> Id = std::mem::transmute(objc::msg::entry());
+        f(
+            objc::class::ptr(class) as Id,
+            objc::sel::get("menuFontOfSize:"),
+            0.0,
+        )
+    }
+}
+
 unsafe extern "C" fn item_action(receiver: Id, _sel: Sel) -> Sel {
     item_of(receiver).action
 }
@@ -654,6 +690,8 @@ pub(crate) fn install() {
         "performActionForItemAtIndex:" => perform_action_for_item_at_index, c"v24@0:8q16";
         "setSubmenu:forItem:" => ignored_object, c"v32@0:8@16@24";
         "indexOfItemWithSubmenu:" => index_of_item_with_submenu, c"q24@0:8@16";
+        "font" => menu_font, c"@16@0:8";
+        "setFont:" => crate::props::set_retained, c"v24@0:8@16";
     });
 
     let item = objc::class::lookup(c"NSMenuItem").expect("declared before its methods");
@@ -703,6 +741,8 @@ pub(crate) fn install() {
         "setMixedStateImage:" => ignored_object, c"v24@0:8@16";
         "setRepresentedObject:" => set_represented_object, c"v24@0:8@16";
         "representedObject" => represented_object, c"@16@0:8";
+        "attributedTitle" => crate::props::get_object, c"@16@0:8";
+        "setAttributedTitle:" => set_attributed_title, c"v24@0:8@16";
     });
 }
 

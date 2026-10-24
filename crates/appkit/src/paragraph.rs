@@ -68,6 +68,38 @@ unsafe extern "C" fn set_paragraph_style(receiver: Id, _sel: Sel, other: Id) {
     let to = style_of(receiver);
     to.alignment = from.alignment;
     to.line_break = from.line_break;
+    copy_properties(other, receiver);
+}
+
+/// The properties kept as associations, see [`crate::props`]: the objects,
+/// then the numbers.
+const OBJECTS: &[&str] = &["tabStops", "textBlocks", "textLists"];
+const NUMBERS: &[&str] = &[
+    "headIndent",
+    "firstLineHeadIndent",
+    "tailIndent",
+    "lineSpacing",
+    "paragraphSpacing",
+    "paragraphSpacingBefore",
+    "minimumLineHeight",
+    "maximumLineHeight",
+    "lineHeightMultiple",
+    "defaultTabInterval",
+    "baseWritingDirection",
+    "hyphenationFactor",
+    "tighteningFactorForTruncation",
+];
+
+/// Copy `from`'s association-backed properties onto `to`.
+fn copy_properties(from: Id, to: Id) {
+    for name in OBJECTS {
+        let key = objc::sel::get(name) as *const c_void;
+        objc::arc::set_associated_with_policy(to, key, objc::arc::associated(from, key), 1);
+    }
+    for name in NUMBERS {
+        let key = objc::sel::get(name) as *const c_void;
+        objc::arc::set_associated_word(to, key, objc::arc::associated(from, key) as usize);
+    }
 }
 
 fn copy_into(receiver: Id, class: &'static std::ffi::CStr) -> Id {
@@ -96,6 +128,26 @@ pub(crate) fn install() {
         "lineBreakMode" => line_break_mode, c"Q16@0:8";
         "copyWithZone:" => copy_with_zone, c"@24@0:8^v16";
         "mutableCopyWithZone:" => mutable_copy_with_zone, c"@24@0:8^v16";
+    });
+    // FIXME (ACCURACY): kept for reading back; text drawing honours only the
+    // alignment and the line break mode.
+    crate::props::properties!(paragraph, {
+        retained "tabStops", "setTabStops:";
+        retained "textBlocks", "setTextBlocks:";
+        retained "textLists", "setTextLists:";
+        double "headIndent", "setHeadIndent:";
+        double "firstLineHeadIndent", "setFirstLineHeadIndent:";
+        double "tailIndent", "setTailIndent:";
+        double "lineSpacing", "setLineSpacing:";
+        double "paragraphSpacing", "setParagraphSpacing:";
+        double "paragraphSpacingBefore", "setParagraphSpacingBefore:";
+        double "minimumLineHeight", "setMinimumLineHeight:";
+        double "maximumLineHeight", "setMaximumLineHeight:";
+        double "lineHeightMultiple", "setLineHeightMultiple:";
+        double "defaultTabInterval", "setDefaultTabInterval:";
+        integer "baseWritingDirection", "setBaseWritingDirection:";
+        double "hyphenationFactor", "setHyphenationFactor:";
+        double "tighteningFactorForTruncation", "setTighteningFactorForTruncation:";
     });
 
     let mutable = objc::class::lookup(c"NSMutableParagraphStyle").expect("declared");

@@ -444,7 +444,20 @@ pub(crate) fn install() {
         "fontWithFamily:traits:weight:size:" => font_with_family, c"@48@0:8@16Q24q32d40";
         "availableFontFamilies" => available_font_families, c"@16@0:8";
         "availableMembersOfFontFamily:" => available_members_of_font_family, c"@24@0:8@16";
+        "setSelectedFont:isMultiple:" => set_selected_font, c"v28@0:8@16c24";
+        "selectedFont" => crate::props::get_object, c"@16@0:8";
+        "isMultiple" => crate::props::get_bool, c"c16@0:8";
     });
+}
+
+/// `-setSelectedFont:isMultiple:`, kept for `-selectedFont` and `-isMultiple`.
+/// There is no font panel to show it in.
+unsafe extern "C" fn set_selected_font(receiver: Id, _sel: Sel, font: Id, multiple: u8) {
+    // SAFETY: the property setters, under the getters' keys.
+    unsafe {
+        crate::props::set_retained(receiver, objc::sel::get("setSelectedFont:"), font);
+        crate::props::set_bool(receiver, objc::sel::get("setMultiple:"), multiple);
+    }
 }
 
 #[cfg(test)]
