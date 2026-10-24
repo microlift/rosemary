@@ -203,9 +203,11 @@ impl std::error::Error for Error {}
 pub trait VideoFrame {
     fn id(&self) -> u64;
     fn layout(&self) -> &FrameLayout;
-    /// Presentation, decoding and duration times as reported on decoded output.
-    /// These are not sample identifiers and may be absent or repeated.
-    /// Decoded output timeline (may differ from the source by reordering).
+    /// Decoded presentation and decode times on the source media timeline,
+    /// not sample identifiers. These may be absent, repeated or reordered.
+    /// When a compressed sample has neither source PTS nor DTS, the GStreamer
+    /// backend suppresses generated output clock values rather than treating
+    /// them as if they were provided on the caller's signed timeline.
     fn pts_ns(&self) -> Option<i64>;
     fn dts_ns(&self) -> Option<i64>;
     fn duration_ns(&self) -> Option<u64>;

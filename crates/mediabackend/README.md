@@ -26,10 +26,15 @@ NV12, I420 and BGRA outputs.
   unsigned. The GStreamer backend applies a reversible +2^62 ns epoch bias
   because GstClockTime is unsigned; values earlier than -2^62 ns are
   explicitly rejected rather than clamped. Decoded PTS/DTS describe actual
-  output, which may be reordered or omitted by libav. Original compressed
-  source PTS/DTS remain available separately through VideoFrame source timing
-  methods and are preserved using per-buffer timestamp metadata, without
-  retaining an unbounded per-ID lookup table.
+  output on the caller's signed media timeline, which may be reordered or
+  omitted by libav. If a compressed sample has neither source PTS nor DTS,
+  GStreamer's inferred unsigned output timestamps are not misinterpreted as
+  epoch-biased media times: the frame exposes absent PTS/DTS instead. This
+  decision is made per frame, including streams mixing timestamped and
+  untimestamped access units, and preserves valid input timestamps at -2^62 ns.
+  Original compressed source PTS/DTS remain available separately through
+  VideoFrame source timing methods and are preserved using per-buffer
+  timestamp metadata, without retaining an unbounded per-ID lookup table.
 - AVCC configuration records use independent 16-bit SPS/PPS lengths and
   validated High/High10/High422 profile-specific chroma/bit-depth fields.
   Unsupported AVC profiles and SPS extension NALs fail explicitly. The

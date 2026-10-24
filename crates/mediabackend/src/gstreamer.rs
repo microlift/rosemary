@@ -808,8 +808,6 @@ impl Decoder {
                 .collect();
         }
         validate_planes(&layout, buffer.size())?;
-        let pts_ns = buffer.pts().map(original_media_time).transpose()?;
-        let dts_ns = buffer.dts().map(original_media_time).transpose()?;
         let duration_ns = buffer.duration().map(|time| time.nseconds());
         let source_pts_ns = buffer
             .iter_meta::<gst::ReferenceTimestampMeta>()
@@ -821,6 +819,20 @@ impl Decoder {
             .find(|meta| meta.reference() == self.source_dts_reference.as_ref())
             .map(|meta| original_media_time(meta.timestamp()))
             .transpose()?;
+        // A decoder may synthesize PTS/DTS starting at GstClockTime zero
+        // for entirely untimestamped input. Such values were never shifted
+        // onto our signed media timeline; undoing the epoch would fabricate
+        // timestamps far in the past. Preserve absence instead. A genuine
+        // input timestamp of -2^62 maps to zero, so numeric threshold checks
+        // on the GStreamer clock would be incorrect.
+        let (pts_ns, dts_ns) = if source_pts_ns.is_some() || source_dts_ns.is_some() {
+            (
+                buffer.pts().map(original_media_time).transpose()?,
+                buffer.dts().map(original_media_time).transpose()?,
+            )
+        } else {
+            (None, None)
+        };
         Ok(DecodedFrame {
             id,
             sample,
@@ -1312,6 +1324,107 @@ mod tests {
             decoder.pull(Duration::from_millis(500)),
             Ok(Some(_))
         ));
+    }
+
+    #[test]
+    fn untimestamped_input_never_exposes_unanchored_generated_time() {
+        let bytes = include_bytes!("../tests/fixtures/red_32x32.h264");
+        for duration_ns in [Some(33_333_333), None] {
+            let mut decoder = Decoder::h264_nv12(1).unwrap();
+            for index in 0..3_u64 {
+                decoder
+                    .submit(AccessUnit {
+                        id: 310 + index,
+                        bytes,
+                        pts_ns: None,
+                        dts_ns: None,
+                        duration_ns,
+                    })
+                    .unwrap();
+            }
+            decoder.end_stream().unwrap();
+            for index in 0..3_u64 {
+                let frame = decoder
+                    .pull(Duration::from_secs(3))
+                    .unwrap()
+                    .expect("missing untimestamped decoded picture");
+                assert_eq!(frame.id(), 310 + index);
+                assert_eq!(frame.source_pts_ns(), None);
+                assert_eq!(frame.source_dts_ns(), None);
+                assert_eq!(
+                    frame.pts_ns(),
+                    None,
+                    "unanchored output PTS was epoch-decoded"
+                );
+                assert_eq!(
+                    frame.dts_ns(),
+                    None,
+                    "unanchored output DTS was epoch-decoded"
+                );
+            }
+            assert!(decoder.pull(Duration::from_millis(100)).unwrap().is_none());
+        }
+    }
+
+    #[test]
+    fn timestamp_provenance_is_per_frame_in_mixed_input() {
+        let bytes = include_bytes!("../tests/fixtures/red_32x32.h264");
+        let input_pts = [Some(-33_333_333), None, Some(33_333_333)];
+        let mut decoder = Decoder::h264_nv12(1).unwrap();
+        for (index, &pts_ns) in input_pts.iter().enumerate() {
+            decoder
+                .submit(AccessUnit {
+                    id: 350 + index as u64,
+                    bytes,
+                    pts_ns,
+                    dts_ns: None,
+                    duration_ns: Some(33_333_333),
+                })
+                .unwrap();
+        }
+        decoder.end_stream().unwrap();
+        for (index, expected_pts) in input_pts.into_iter().enumerate() {
+            let frame = decoder.pull(Duration::from_secs(3)).unwrap().unwrap();
+            assert_eq!(frame.id(), 350 + index as u64);
+            assert_eq!(frame.source_pts_ns(), expected_pts);
+            assert_eq!(frame.source_dts_ns(), None);
+            if expected_pts.is_none() {
+                assert_eq!(frame.pts_ns(), None);
+                assert_eq!(frame.dts_ns(), None);
+            } else {
+                assert!(frame.pts_ns().is_some(), "known signed PTS was lost");
+            }
+        }
+    }
+
+    #[test]
+    fn signed_timestamp_epoch_boundary_roundtrips_through_decode() {
+        const EARLIEST: i64 = -(1_i64 << 62);
+        assert_eq!(gst_media_time(EARLIEST).unwrap().nseconds(), 0);
+        assert_eq!(
+            original_media_time(gst_media_time(EARLIEST).unwrap()).unwrap(),
+            EARLIEST
+        );
+        assert!(matches!(
+            gst_media_time(EARLIEST - 1),
+            Err(Error::InvalidInput(_))
+        ));
+        let mut decoder = Decoder::h264_nv12(1).unwrap();
+        decoder
+            .submit(AccessUnit {
+                id: 400,
+                bytes: include_bytes!("../tests/fixtures/red_32x32.h264"),
+                pts_ns: Some(EARLIEST),
+                dts_ns: Some(EARLIEST),
+                duration_ns: Some(33_333_333),
+            })
+            .unwrap();
+        decoder.end_stream().unwrap();
+        let frame = decoder.pull(Duration::from_secs(3)).unwrap().unwrap();
+        assert_eq!(frame.id(), 400);
+        assert_eq!(frame.source_pts_ns(), Some(EARLIEST));
+        assert_eq!(frame.source_dts_ns(), Some(EARLIEST));
+        assert_eq!(frame.pts_ns(), Some(EARLIEST));
     }
 
     #[test]
