@@ -1568,6 +1568,11 @@ mod callback_abi_tests {
             other_host
         );
         assert_eq!(vm.guest_behind_thunk(other_host), Some(entry));
+        // And back: a typed thunk handed to a generic callback slot becomes
+        // the generic thunk, never a typed one called with generic registers.
+        assert_eq!(vm.substitute("roundtrip", host).unwrap(), generic);
+        assert_eq!(vm.substitute("roundtrip", other_host).unwrap(), generic);
+        assert_eq!(vm.substitute("roundtrip", generic).unwrap(), generic);
         assert_eq!(vm.thunks(), 3);
         assert_eq!(
             vm.substitute_typed("roundtrip", 0, alternate.clone())

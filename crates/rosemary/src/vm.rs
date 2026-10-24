@@ -1688,28 +1688,57 @@ impl crate::objc::Realizer for Vm {
     }
 }
 
-impl crate::abi::Callbacks for Vm {
-    fn substitute(&self, symbol: &str, va: u64) -> Result<u64, AbiError> {
+/// What a guest-held function pointer is on its way out to host code.
+enum Outbound {
+    /// Already callable by the host, and passed as it is.
+    Host(u64),
+    /// Guest code, which needs a thunk of the callee's chosen kind.
+    Guest(u64),
+}
+
+impl Vm {
+    /// Classify a pointer for [`crate::abi::Callbacks::substitute`] and its typed twin,
+    /// so both apply the same rules.
+    fn outbound(&self, va: u64) -> Outbound {
         if va == 0 {
-            return Ok(0);
+            return Outbound::Host(0);
+        }
+        // A thunk the guest read back out of host-visible state. Its guest
+        // target is what gets a thunk again: the one it came from may have a
+        // different ABI from the one this callee calls through.
+        if let Some(guest) = self.guest_behind_thunk(va) {
+            return Outbound::Guest(guest);
         }
         // One of this runtime's own import stubs, which the guest is holding
         // because a slot it loaded was substituted for one.
         if let Some(host) = crate::trampoline::host_behind(va) {
-            return Ok(host);
+            return Outbound::Host(host);
         }
         // Not guest code: a host pointer the guest is handing back, which the
         // host may compare against one it gave out.
         if !self.program.is_guest_address(va) {
-            return Ok(va);
+            return Outbound::Host(va);
         }
-        self.thunk_for(va).map_err(|e: VmError| AbiError::Refused {
-            symbol: symbol.to_string(),
-            reason: match e {
-                VmError::Thunk { .. } => "a host->guest thunk could not be built",
-                _ => "the guest function pointer could not be made callable",
-            },
-        })
+        Outbound::Guest(va)
+    }
+}
+
+fn thunk_refusal(symbol: &str, e: VmError) -> AbiError {
+    AbiError::Refused {
+        symbol: symbol.to_string(),
+        reason: match e {
+            VmError::Thunk { .. } => "a host->guest thunk could not be built",
+            _ => "the guest function pointer could not be made callable",
+        },
+    }
+}
+
+impl crate::abi::Callbacks for Vm {
+    fn substitute(&self, symbol: &str, va: u64) -> Result<u64, AbiError> {
+        match self.outbound(va) {
+            Outbound::Host(host) => Ok(host),
+            Outbound::Guest(guest) => self.thunk_for(guest).map_err(|e| thunk_refusal(symbol, e)),
+        }
     }
 
     fn substitute_typed(
@@ -1718,25 +1747,12 @@ impl crate::abi::Callbacks for Vm {
         va: u64,
         signature: crate::thunk::ThunkSignature,
     ) -> Result<u64, AbiError> {
-        if va == 0 {
-            return Ok(0);
+        match self.outbound(va) {
+            Outbound::Host(host) => Ok(host),
+            Outbound::Guest(guest) => self
+                .typed_thunk_for(guest, signature)
+                .map_err(|e| thunk_refusal(symbol, e)),
         }
-        // A callback returned through guest-visible state may already be a
-        // Rosemary thunk for another signature. Recover its guest target
-        // before choosing the exact native ABI; otherwise a host caller may
-        // invoke that old thunk with the wrong argument layout.
-        let va = self.guest_behind_thunk(va).unwrap_or(va);
-        if let Some(host) = crate::trampoline::host_behind(va) {
-            return Ok(host);
-        }
-        if !self.program.is_guest_address(va) {
-            return Ok(va);
-        }
-        self.typed_thunk_for(va, signature)
-            .map_err(|_| AbiError::Refused {
-                symbol: symbol.to_string(),
-                reason: "a typed host->guest thunk could not be built",
-            })
     }
 
     /// A thunk handed back by host code becomes the guest pointer it stands for.
