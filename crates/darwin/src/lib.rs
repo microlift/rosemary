@@ -450,6 +450,7 @@ pub const LIBRARY_NAMES: &[&str] = &[
     "/usr/lib/libpoll.dylib",
     "/usr/lib/libproc.dylib",
     "/usr/lib/libdbm.dylib",
+    "/usr/lib/libcopyfile.dylib",
     "/usr/lib/librpcsvc.dylib",
     "/usr/lib/libgcc_s.1.dylib",
     // OpenPAM, which `crate::pam` is on hosts without a Darwin one.
