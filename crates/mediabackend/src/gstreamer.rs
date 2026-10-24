@@ -9,9 +9,11 @@ use std::time::Duration;
 use gst::prelude::*;
 use gst_app::{AppSink, AppSrc};
 
+const INPUT_QUEUE_LIMIT: u64 = 8 * 1024 * 1024;
+
 use crate::{
-    AccessUnit, ColorMatrix, ColorPrimaries, ColorTransfer, Error, FrameLayout, PixelFormat,
-    VideoCodec, VideoDecoder, VideoFrame,
+    AccessUnit, ColorMatrix, ColorPrimaries, ColorTransfer, Error, FrameCrop, FrameLayout,
+    PixelFormat, VideoCodec, VideoDecoder, VideoFrame,
 };
 
 pub struct Decoder {
@@ -20,6 +22,7 @@ pub struct Decoder {
     output: AppSink,
     reference: gst::Caps,
     completed: bool,
+    fatal_error: Option<String>,
     output_format: PixelFormat,
     avcc: Option<AvccConfiguration>,
 }
@@ -89,6 +92,9 @@ pub struct DecodedFrame {
     id: u64,
     sample: gst::Sample,
     layout: FrameLayout,
+    pts_ns: Option<u64>,
+    dts_ns: Option<u64>,
+    duration_ns: Option<u64>,
 }
 
 impl VideoFrame for DecodedFrame {
@@ -98,6 +104,18 @@ impl VideoFrame for DecodedFrame {
 
     fn layout(&self) -> &FrameLayout {
         &self.layout
+    }
+
+    fn pts_ns(&self) -> Option<u64> {
+        self.pts_ns
+    }
+
+    fn dts_ns(&self) -> Option<u64> {
+        self.dts_ns
+    }
+
+    fn duration_ns(&self) -> Option<u64> {
+        self.duration_ns
     }
 
     fn with_bytes<R>(&self, read: impl FnOnce(&[u8], &FrameLayout) -> R) -> Result<R, Error> {
@@ -118,31 +136,35 @@ fn validate_planes(layout: &FrameLayout, size: usize) -> Result<(), Error> {
     if layout.width == 0 || layout.height == 0 || layout.width > 32768 || layout.height > 32768 {
         return Err(Error::Decode("invalid decoded plane dimensions".into()));
     }
-    let chroma_width = layout.width.div_ceil(2);
-    let chroma_height = layout.height.div_ceil(2);
-    let required: Vec<(usize, usize)> = match layout.format {
-        PixelFormat::Nv12 => vec![
-            (layout.width, layout.height),
-            (chroma_width * 2, chroma_height),
-        ],
-        PixelFormat::I420 => vec![
-            (layout.width, layout.height),
-            (chroma_width, chroma_height),
-            (chroma_width, chroma_height),
-        ],
-        PixelFormat::Bgra => vec![(layout.width * 4, layout.height)],
+    if let Some(crop) = layout.crop
+        && (crop.width == 0
+            || crop.height == 0
+            || crop
+                .x
+                .checked_add(crop.width)
+                .is_none_or(|x| x > layout.width)
+            || crop
+                .y
+                .checked_add(crop.height)
+                .is_none_or(|y| y > layout.height))
+    {
+        return Err(Error::Decode(
+            "decoded crop exceeds frame dimensions".into(),
+        ));
+    }
+    let plane_count = match layout.format {
+        PixelFormat::Nv12 => 2,
+        PixelFormat::I420 => 3,
+        PixelFormat::Bgra => 1,
     };
-    if required.len() != layout.strides.len() || required.len() != layout.offsets.len() {
+    if plane_count != layout.strides.len() || plane_count != layout.offsets.len() {
         return Err(Error::Decode("invalid decoded plane count".into()));
     }
-    for (plane, (row_bytes, rows)) in required.into_iter().enumerate() {
-        let stride = layout.strides[plane];
-        let offset = layout.offsets[plane];
-        let end = (rows - 1)
-            .checked_mul(stride)
-            .and_then(|v| v.checked_add(row_bytes))
-            .and_then(|v| v.checked_add(offset));
-        if stride < row_bytes || end.is_none_or(|n| n > size) {
+    for plane in 0..plane_count {
+        let end = layout
+            .plane_byte_span(plane)
+            .and_then(|span| layout.offsets[plane].checked_add(span));
+        if end.is_none_or(|n| n > size) {
             return Err(Error::Decode(format!(
                 "decoded plane {plane} exceeds mapped buffer"
             )));
@@ -189,6 +211,7 @@ impl Decoder {
     /// losing decoder reference pictures. Changed SPS and NAL length are
     /// intentionally rejected until stream-compatibility is proven.
     pub fn reconfigure_avcc(&mut self, sets: &[&[u8]], nal_length: u8) -> Result<(), Error> {
+        self.check_error()?;
         if self.completed {
             return Err(Error::EndOfStream);
         }
@@ -265,20 +288,30 @@ impl Decoder {
             output,
             reference: gst::Caps::builder("application/x-rosemary-frame-id").build(),
             completed: false,
+            fatal_error: None,
             output_format,
             avcc: None,
         })
     }
 
-    fn check_error(&self) -> Result<(), Error> {
-        let bus = self
+    fn latch_error(&mut self, message: String) -> Error {
+        let first = self.fatal_error.get_or_insert(message);
+        Error::Decode(first.clone())
+    }
+
+    fn check_error(&mut self) -> Result<(), Error> {
+        if let Some(message) = &self.fatal_error {
+            return Err(Error::Decode(message.clone()));
+        }
+        let message = self
             .pipeline
             .bus()
-            .ok_or_else(|| Error::Decode("missing GStreamer bus".into()))?;
-        if let Some(msg) = bus.pop_filtered(&[gst::MessageType::Error])
+            .ok_or_else(|| Error::Decode("missing GStreamer bus".into()))?
+            .pop_filtered(&[gst::MessageType::Error]);
+        if let Some(msg) = message
             && let gst::MessageView::Error(e) = msg.view()
         {
-            return Err(Error::Decode(format!("{}: {:?}", e.error(), e.debug())));
+            return Err(self.latch_error(format!("{}: {:?}", e.error(), e.debug())));
         }
         Ok(())
     }
@@ -334,6 +367,15 @@ impl Decoder {
                 .map(|n| usize::try_from(*n).unwrap_or(0))
                 .collect(),
             offsets: info.offset().to_vec(),
+            crop: buffer.meta::<gst_video::VideoCropMeta>().map(|meta| {
+                let (x, y, width, height) = meta.rect();
+                FrameCrop {
+                    x: x as usize,
+                    y: y as usize,
+                    width: width as usize,
+                    height: height as usize,
+                }
+            }),
             matrix,
             primaries: match color.primaries() {
                 gst_video::VideoColorPrimaries::Bt709 => ColorPrimaries::Bt709,
@@ -346,7 +388,11 @@ impl Decoder {
                 gst_video::VideoTransferFunction::Srgb => ColorTransfer::Srgb,
                 _ => ColorTransfer::Unknown,
             },
-            full_range: color.range() == gst_video::VideoColorRange::Range0_255,
+            full_range: match color.range() {
+                gst_video::VideoColorRange::Range0_255 => Some(true),
+                gst_video::VideoColorRange::Range16_235 => Some(false),
+                _ => None,
+            },
         };
         // GstVideoMeta, when supplied by a decoder pool, describes physical
         // buffer plane offsets/strides rather than the negotiated default.
@@ -369,7 +415,25 @@ impl Decoder {
                 .collect();
         }
         validate_planes(&layout, buffer.size())?;
-        Ok(DecodedFrame { id, sample, layout })
+        let pts_ns = buffer.pts().map(|time| time.nseconds());
+        let dts_ns = buffer.dts().map(|time| time.nseconds());
+        let duration_ns = buffer.duration().map(|time| time.nseconds());
+        Ok(DecodedFrame {
+            id,
+            sample,
+            layout,
+            pts_ns,
+            dts_ns,
+            duration_ns,
+        })
+    }
+
+    fn decode_checked_sample(&mut self, sample: gst::Sample) -> Result<DecodedFrame, Error> {
+        match self.decode_sample(sample) {
+            Ok(frame) => Ok(frame),
+            Err(Error::Decode(message)) => Err(self.latch_error(message)),
+            Err(error) => Err(error),
+        }
     }
 }
 
@@ -381,6 +445,7 @@ impl VideoDecoder for Decoder {
     }
 
     fn submit(&mut self, packet: AccessUnit<'_>) -> Result<(), Error> {
+        self.check_error()?;
         if self.completed {
             return Err(Error::EndOfStream);
         }
@@ -390,7 +455,7 @@ impl VideoDecoder for Decoder {
                 .flatten()
                 .any(|v| v == u64::MAX)
             || packet.bytes.is_empty()
-            || packet.bytes.len() > 64 * 1024 * 1024
+            || packet.bytes.len() as u64 > INPUT_QUEUE_LIMIT
         {
             return Err(Error::InvalidInput(
                 "invalid packet identifier or length".into(),
@@ -399,14 +464,12 @@ impl VideoDecoder for Decoder {
         // GStreamer is asynchronous. Never block the guest's decode thread
         // while an appsink queue could itself be awaiting that same thread.
         // Return a recoverable signal without consuming the input instead.
-        const INPUT_QUEUE_LIMIT: u64 = 8 * 1024 * 1024;
         if self.output.current_level_buffers() >= 32
-            || (self.input.current_level_bytes() != 0
-                && self
-                    .input
-                    .current_level_bytes()
-                    .saturating_add(packet.bytes.len() as u64)
-                    > INPUT_QUEUE_LIMIT)
+            || self
+                .input
+                .current_level_bytes()
+                .saturating_add(packet.bytes.len() as u64)
+                > INPUT_QUEUE_LIMIT
         {
             return Err(Error::Backpressure);
         }
@@ -425,13 +488,14 @@ impl VideoDecoder for Decoder {
             gst::ClockTime::from_nseconds(packet.id),
             None,
         );
-        self.input
-            .push_buffer(buffer)
-            .map_err(|e| Error::Decode(format!("cannot submit H.264 access unit: {e:?}")))?;
+        if let Err(e) = self.input.push_buffer(buffer) {
+            return Err(self.latch_error(format!("cannot submit H.264 access unit: {e:?}")));
+        }
         self.check_error()
     }
 
     fn pull(&mut self, timeout: Duration) -> Result<Option<Self::Frame>, Error> {
+        self.check_error()?;
         // Zero-duration polling is valid: a decoder may still be holding
         // reference pictures and the caller must supply future access units.
         let nanos = u64::try_from(timeout.as_nanos().min((u64::MAX - 1) as u128)).unwrap();
@@ -439,24 +503,26 @@ impl VideoDecoder for Decoder {
             .output
             .try_pull_sample(gst::ClockTime::from_nseconds(nanos))
         {
-            return self.decode_sample(sample).map(Some);
+            self.check_error()?;
+            return self.decode_checked_sample(sample).map(Some);
         }
         self.check_error()?;
         Ok(None)
     }
 
     fn end_stream(&mut self) -> Result<(), Error> {
+        self.check_error()?;
         if !self.completed {
-            self.input
-                .end_of_stream()
-                .map_err(|e| Error::Decode(format!("GStreamer EOS: {e:?}")))?;
+            if let Err(e) = self.input.end_of_stream() {
+                return Err(self.latch_error(format!("GStreamer EOS: {e:?}")));
+            }
             self.completed = true;
         }
-        Ok(())
+        self.check_error()
     }
 
     fn is_drained(&self) -> bool {
-        self.completed && self.output.is_eos()
+        self.fatal_error.is_none() && self.completed && self.output.is_eos()
     }
 }
 
@@ -649,6 +715,165 @@ mod tests {
     }
 
     #[test]
+    fn single_idr_can_complete_without_terminal_eos() {
+        let bytes = include_bytes!("../tests/fixtures/red_32x32.h264");
+        let mut decoder = Decoder::h264_nv12(1).unwrap();
+        decoder
+            .submit(AccessUnit {
+                id: 123,
+                bytes,
+                pts_ns: Some(0),
+                dts_ns: None,
+                duration_ns: Some(33_333_333),
+            })
+            .unwrap();
+        let immediate = decoder.pull(Duration::from_millis(300)).unwrap();
+        assert!(
+            immediate.is_some(),
+            "Even all-IDR decoder requires a later frame or terminal EOS before emitting"
+        );
+        assert_eq!(immediate.unwrap().id(), 123);
+    }
+
+    #[test]
+    fn first_fatal_bus_error_is_latched_across_decoder_operations() {
+        let mut decoder = Decoder::h264_nv12(1).unwrap();
+        let bus = decoder.pipeline.bus().unwrap();
+        bus.post(
+            gst::message::Error::builder(gst::CoreError::Failed, "injected first fatal")
+                .src(&decoder.pipeline)
+                .build(),
+        )
+        .unwrap();
+        let first = match decoder.pull(Duration::ZERO) {
+            Err(Error::Decode(message)) => message,
+            _ => panic!("fatal bus error was not reported"),
+        };
+        assert!(first.contains("injected first fatal"), "{first}");
+
+        bus.post(
+            gst::message::Error::builder(gst::CoreError::Failed, "second fatal")
+                .src(&decoder.pipeline)
+                .build(),
+        )
+        .unwrap();
+        let sample = include_bytes!("../tests/fixtures/red_32x32.h264");
+        let packet = AccessUnit {
+            id: 1,
+            bytes: sample,
+            pts_ns: None,
+            dts_ns: None,
+            duration_ns: None,
+        };
+        for result in [
+            decoder.submit(packet),
+            decoder.end_stream(),
+            decoder.pull(Duration::ZERO).map(|_| ()),
+        ] {
+            match result {
+                Err(Error::Decode(message)) => assert_eq!(message, first),
+                _ => panic!("decoder operation did not retain first fatal error"),
+            }
+        }
+        assert!(!decoder.is_drained());
+    }
+
+    #[test]
+    fn missing_decoded_sample_identity_is_a_sticky_fatal_error() {
+        let mut decoder = Decoder::h264_nv12(1).unwrap();
+        let buffer = gst::Buffer::from_mut_slice(vec![0]);
+        let sample = gst::Sample::builder().buffer(&buffer).build();
+        let first = match decoder.decode_checked_sample(sample) {
+            Err(Error::Decode(message)) => message,
+            _ => panic!("missing identity was not rejected"),
+        };
+        assert!(first.contains("lost its sample identity"));
+        match decoder.submit(AccessUnit {
+            id: 9,
+            bytes: include_bytes!("../tests/fixtures/red_32x32.h264"),
+            pts_ns: None,
+            dts_ns: None,
+            duration_ns: None,
+        }) {
+            Err(Error::Decode(message)) => assert_eq!(message, first),
+            _ => panic!("decoder accepted input after losing frame identity"),
+        }
+    }
+
+    #[test]
+    fn truncated_h264_access_unit_never_fabricates_a_decoded_frame() {
+        let mut decoder = Decoder::h264_nv12(1).unwrap();
+        // One incomplete IDR NAL header without a decodable slice body.
+        let invalid = [0, 0, 0, 1, 0x65, 0xff];
+        let submission = decoder.submit(AccessUnit {
+            id: 33,
+            bytes: &invalid,
+            pts_ns: Some(0),
+            dts_ns: None,
+            duration_ns: None,
+        });
+        assert!(submission.is_ok() || matches!(submission, Err(Error::Decode(_))));
+        // A parser may reject the sample asynchronously, or discard it.
+        // Neither path may present an invented frame as decoded output.
+        let _ = decoder.end_stream();
+        assert!(!matches!(
+            decoder.pull(Duration::from_millis(500)),
+            Ok(Some(_))
+        ));
+    }
+
+    #[test]
+    fn decoded_frame_exposes_output_timing() {
+        let bytes = include_bytes!("../tests/fixtures/red_32x32.h264");
+        let mut decoder = Decoder::h264_nv12(1).unwrap();
+        decoder
+            .submit(AccessUnit {
+                id: 71,
+                bytes,
+                pts_ns: Some(500_000_000),
+                dts_ns: Some(500_000_000),
+                duration_ns: Some(33_333_333),
+            })
+            .unwrap();
+        let frame = decoder.pull(Duration::from_secs(2)).unwrap().unwrap();
+        assert_eq!(frame.id(), 71);
+        assert_eq!(frame.pts_ns(), Some(500_000_000));
+        assert_eq!(frame.duration_ns(), Some(33_333_333));
+        // The H.264 parser/decoder may discard DTS on reordered output.
+        // Expose the actual decoded-buffer value rather than copying input DTS.
+        assert_eq!(frame.dts_ns(), None);
+    }
+
+    #[test]
+    fn overlarge_access_unit_is_rejected_without_poisoning_the_stream() {
+        let mut decoder = Decoder::h264_nv12(1).unwrap();
+        let too_large = vec![0x7f; INPUT_QUEUE_LIMIT as usize + 1];
+        assert!(matches!(
+            decoder.submit(AccessUnit {
+                id: 1,
+                bytes: &too_large,
+                pts_ns: None,
+                dts_ns: None,
+                duration_ns: None,
+            }),
+            Err(Error::InvalidInput(_))
+        ));
+        decoder
+            .submit(AccessUnit {
+                id: 2,
+                bytes: include_bytes!("../tests/fixtures/red_32x32.h264"),
+                pts_ns: Some(0),
+                dts_ns: None,
+                duration_ns: None,
+            })
+            .unwrap();
+        assert_eq!(
+            decoder.pull(Duration::from_secs(2)).unwrap().unwrap().id(),
+            2
+        );
+    }
+
+    #[test]
     fn requested_nv12_i420_and_bgra_outputs_are_mappable() {
         let data = include_bytes!("../tests/fixtures/red_32x32.h264");
         for format in [PixelFormat::Nv12, PixelFormat::I420, PixelFormat::Bgra] {
@@ -670,6 +895,11 @@ mod tests {
             frame
                 .with_bytes(|bytes, info| {
                     validate_planes(info, bytes.len()).unwrap();
+                    for plane in 0..info.offsets.len() {
+                        let span = info.plane_byte_span(plane).unwrap();
+                        assert!(span > 0);
+                        assert!(info.offsets[plane] + span <= bytes.len());
+                    }
                     assert_eq!(
                         info.offsets.len(),
                         match format {
@@ -791,17 +1021,36 @@ mod tests {
             format: PixelFormat::Nv12,
             strides: vec![17, 18],
             offsets: vec![0, 17 * 17],
+            crop: None,
             matrix: ColorMatrix::Bt601,
             primaries: ColorPrimaries::Bt709,
             transfer: ColorTransfer::Bt709,
-            full_range: false,
+            full_range: Some(false),
         };
         assert!(validate_planes(&baseline, 17 * 17 + 18 * 9).is_ok());
+        assert_eq!(baseline.plane_byte_span(0), Some(17 * 17));
+        assert_eq!(baseline.plane_byte_span(1), Some(18 * 9));
+        assert_eq!(baseline.plane_byte_span(2), None);
         let mut invalid = baseline.clone();
         invalid.strides[1] = 17;
         assert!(validate_planes(&invalid, usize::MAX).is_err());
         invalid = baseline.clone();
         invalid.offsets[1] = usize::MAX;
+        assert!(validate_planes(&invalid, usize::MAX).is_err());
+        invalid = baseline.clone();
+        invalid.crop = Some(FrameCrop {
+            x: 16,
+            y: 0,
+            width: 2,
+            height: 1,
+        });
+        assert!(validate_planes(&invalid, usize::MAX).is_err());
+        invalid.crop = Some(FrameCrop {
+            x: 0,
+            y: 16,
+            width: 1,
+            height: 2,
+        });
         assert!(validate_planes(&invalid, usize::MAX).is_err());
         invalid = baseline;
         invalid.width = usize::MAX;
@@ -826,7 +1075,7 @@ mod tests {
         assert_eq!(frame.layout().matrix, ColorMatrix::Bt709);
         assert_eq!(frame.layout().primaries, ColorPrimaries::Bt709);
         assert_eq!(frame.layout().transfer, ColorTransfer::Bt709);
-        assert!(frame.layout().full_range);
+        assert_eq!(frame.layout().full_range, Some(true));
     }
 
     #[test]
@@ -855,7 +1104,7 @@ mod tests {
                 .unwrap();
             decoder.end_stream().unwrap();
             let frame = decoder.pull(Duration::from_secs(2)).unwrap().unwrap();
-            assert_eq!(frame.layout().full_range, full, "range");
+            assert_eq!(frame.layout().full_range, Some(full), "range");
             assert_eq!(frame.layout().matrix, matrix, "matrix");
             // No VUI primaries/transfer in these older fixtures; unlike matrix
             // and range they must remain unknown rather than guessed.

@@ -53,6 +53,15 @@ pub struct AccessUnit<'a> {
     pub duration_ns: Option<u64>,
 }
 
+/// A decoder-provided visible subrectangle of a physically larger frame.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct FrameCrop {
+    pub x: usize,
+    pub y: usize,
+    pub width: usize,
+    pub height: usize,
+}
+
 #[derive(Clone, Debug)]
 pub struct FrameLayout {
     pub width: usize,
@@ -60,10 +69,34 @@ pub struct FrameLayout {
     pub format: PixelFormat,
     pub strides: Vec<usize>,
     pub offsets: Vec<usize>,
+    /// None means the full decoded dimensions are visible.
+    pub crop: Option<FrameCrop>,
     pub matrix: ColorMatrix,
     pub primaries: ColorPrimaries,
     pub transfer: ColorTransfer,
-    pub full_range: bool,
+    /// None means GStreamer did not establish a usable color range.
+    pub full_range: Option<bool>,
+}
+
+impl FrameLayout {
+    /// Minimum contiguous mapped span starting at a plane's offset, including
+    /// padding between rows but not padding after the last active row.
+    pub fn plane_byte_span(&self, plane: usize) -> Option<usize> {
+        let chroma_width = self.width.div_ceil(2);
+        let chroma_height = self.height.div_ceil(2);
+        let (row_bytes, rows) = match (self.format, plane) {
+            (PixelFormat::Nv12, 0) | (PixelFormat::I420, 0) => (self.width, self.height),
+            (PixelFormat::Nv12, 1) => (chroma_width.checked_mul(2)?, chroma_height),
+            (PixelFormat::I420, 1 | 2) => (chroma_width, chroma_height),
+            (PixelFormat::Bgra, 0) => (self.width.checked_mul(4)?, self.height),
+            _ => return None,
+        };
+        let stride = *self.strides.get(plane)?;
+        if rows == 0 || row_bytes == 0 || stride < row_bytes {
+            return None;
+        }
+        (rows - 1).checked_mul(stride)?.checked_add(row_bytes)
+    }
 }
 
 #[derive(Debug)]
@@ -91,6 +124,11 @@ impl std::error::Error for Error {}
 pub trait VideoFrame {
     fn id(&self) -> u64;
     fn layout(&self) -> &FrameLayout;
+    /// Presentation, decoding and duration times as reported on decoded output.
+    /// These are not sample identifiers and may be absent or repeated.
+    fn pts_ns(&self) -> Option<u64>;
+    fn dts_ns(&self) -> Option<u64>;
+    fn duration_ns(&self) -> Option<u64>;
     fn with_bytes<R>(&self, read: impl FnOnce(&[u8], &FrameLayout) -> R) -> Result<R, Error>;
 }
 

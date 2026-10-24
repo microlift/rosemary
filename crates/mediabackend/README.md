@@ -12,11 +12,14 @@ NV12, I420 and BGRA outputs.
 - `VideoDecoder::pull` returns a host-owned decoded frame preserving input
   identity across H.264 B-frame reordering. `VideoFrame::with_bytes` maps the
   original GStreamer sample without an intermediate per-plane owned `Vec`.
-- Frame layout carries validated strides/offsets, pixel format, color matrix,
-  range, primaries and transfer information when known.
+- Frame layout carries validated strides/offsets, per-plane mapped spans,
+  pixel format, optional crop, and color information. Unknown color range is
+  distinct from limited range. Frame timing comes from decoded buffers; output
+  DTS may be absent even when the compressed input provided it.
 - AVCC input accepts SPS/PPS configuration and compatible live PPS changes;
-  Annex-B access-unit input is supported. Backpressure is recoverable: drain
-  output and retry the **same** unconsumed input, rather than dropping frames.
+  Annex-B access-unit input is supported. Access units larger than 8 MiB are
+  rejected; within that bound, queue backpressure is recoverable: drain output
+  and retry the **same** unconsumed input, rather than dropping frames.
 - End-of-stream is terminal and distinct from a temporarily empty output
   queue. No Apple framework API is implemented in this crate.
 
@@ -36,11 +39,13 @@ The regression fixtures are stored under this crate, so no other feature PR is
 required to test decoding. Tests cover B-frame reference identity with repeated
 PTS, a pinned 60-picture three-GOP pixel reference, colorimetry, range,
 NV12/I420/BGRA lifetime, same-SPS PPS reconfiguration, 256-frame bounded queue
-backpressure, terminal EOS, and missing-IDR recovery. The libav element is
+backpressure, terminal EOS, missing-IDR recovery, immediate single-IDR output
+without EOS, retained fatal bus errors, decoded timing, and truncated input. The libav element is
 configured with `output-corrupt=false` and `discard-corrupted-frames=true`:
 its unmodified default emitted invalid pre-recovery pictures. The pinned
 60-picture truncated fixture confirms it drops all 19 invalid pictures and
-outputs the remaining 40 with the same pixel hashes as FFmpeg's normal output. The multi-GOP luma checksum fixture is
+outputs the remaining 40 with the same pixel hashes as FFmpeg's normal output.
+The multi-GOP luma checksum fixture is
 `tests/fixtures/multi_gop_bframes_64x64.luma_fnv64`.
 
 ## Known limits
