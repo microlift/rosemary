@@ -311,6 +311,21 @@ unsafe extern "C" fn highlight_with_level(receiver: Id, _sel: Sel, level: CGFloa
     make(mix(r), mix(g), mix(b), a)
 }
 
+/// `+colorWithCGColor:`: the same components, as RGBA.
+unsafe extern "C" fn color_with_cg_color(_class: Id, _sel: Sel, color: *const c_void) -> Id {
+    if color.is_null() {
+        return std::ptr::null_mut();
+    }
+    // SAFETY: a `CGColorRef`; this runtime's colours are RGBA, four components.
+    let components = unsafe { crate::cgcontext::CGColorGetComponents(color as _) };
+    if components.is_null() {
+        return std::ptr::null_mut();
+    }
+    // SAFETY: four components, as above.
+    let [red, green, blue, alpha] = unsafe { *(components as *const [f64; 4]) };
+    make(red, green, blue, alpha)
+}
+
 unsafe extern "C" fn color_with_rgba(
     _class: Id,
     _sel: Sel,
@@ -565,6 +580,7 @@ pub(crate) fn install() {
         "colorWithDeviceRed:green:blue:alpha:" => color_with_rgba, c"@48@0:8d16d24d32d40";
         "colorWithSRGBRed:green:blue:alpha:" => color_with_rgba, c"@48@0:8d16d24d32d40";
         "colorWithRed:green:blue:alpha:" => color_with_rgba, c"@48@0:8d16d24d32d40";
+        "colorWithCGColor:" => color_with_cg_color, c"@24@0:8^{CGColor=}16";
         "colorWithCalibratedWhite:alpha:" => color_with_white, c"@32@0:8d16d24";
         "colorWithDeviceWhite:alpha:" => color_with_white, c"@32@0:8d16d24";
         "colorWithWhite:alpha:" => color_with_white, c"@32@0:8d16d24";
