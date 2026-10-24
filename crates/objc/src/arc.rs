@@ -444,8 +444,11 @@ pub fn sync_exit(object: Id) {
 ///
 /// Addresses rather than pointers, so the table is `Send` without an assertion
 /// this crate would then have to justify.
-static ASSOCIATIONS: LazyLock<RwLock<HashMap<usize, HashMap<usize, (usize, bool)>>>> =
+static ASSOCIATIONS: LazyLock<RwLock<HashMap<usize, Associations>>> =
     LazyLock::new(|| RwLock::new(HashMap::new()));
+
+/// One object's associations: by key, the value and whether it is owned.
+type Associations = HashMap<usize, (usize, bool)>;
 
 /// Set once anything is associated, so the many objects freed in a program
 /// that never associates anything skip the table.
