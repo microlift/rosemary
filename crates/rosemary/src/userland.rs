@@ -3,53 +3,6 @@ use machish::namespace::{DylibRequest, DylibSource, FetchedDylib};
 
 use crate::cxxlib::Flavor;
 
-/// Install names answered from the base, as leaf names under `/usr/lib/`.
-///
-/// Each is a whole library family on a Mac - `libcurses` and `libtermcap` are
-/// `libncurses` under older names, and `libreadline` is `libedit`'s
-/// compatibility name - so all of a family is listed or none of it.
-const LIBRARIES: &[&str] = &[
-    "libutil.dylib",
-    "libutil1.0.dylib",
-    "libedit.dylib",
-    "libedit.2.dylib",
-    "libedit.3.dylib",
-    "libedit.3.0.dylib",
-    "libreadline.dylib",
-    "libncurses.dylib",
-    "libncurses.5.dylib",
-    "libncurses.5.4.dylib",
-    "libcurses.dylib",
-    "libtermcap.dylib",
-    "libpanel.dylib",
-    "libpanel.5.dylib",
-    "libpanel.5.4.dylib",
-    "libssl.60.dylib",
-    "libtls.dylib",
-    "libtls.33.dylib",
-    "libcrypto.57.dylib",
-    "libxo.0.dylib",
-    "libremovefile.dylib",
-    "libxml2.dylib",
-    "libxml2.2.dylib",
-    "libxml2.2.9.13.dylib",
-    "libbz2.dylib",
-    "libbz2.1.0.dylib",
-    "libsbuf.dylib",
-    "libsbuf.60.dylib",
-    "libicuuc.dylib",
-    "libicuuc.76.dylib",
-    "libicudata.dylib",
-    "libicudata.76.dylib",
-];
-
-/// Whether `install_name` is one of the libraries this module takes from the base.
-pub fn from_base(install_name: &str) -> bool {
-    install_name
-        .strip_prefix("/usr/lib/")
-        .is_some_and(|leaf| LIBRARIES.contains(&leaf))
-}
-
 /// A [`DylibSource`] that answers [`LIBRARIES`] out of the current prefix, and
 /// delegates everything else.
 pub struct BaseLibraries<S> {
@@ -65,8 +18,10 @@ impl<S> BaseLibraries<S> {
 
 impl<S: DylibSource> DylibSource for BaseLibraries<S> {
     fn fetch(&mut self, request: &DylibRequest<'_>) -> Result<Option<FetchedDylib>> {
-        if !from_base(request.install_name) || prefix::ns::current().is_none() {
-            return self.inner.fetch(request);
+        if let Ok(lib) = self.inner.fetch(request)
+            && lib.is_some()
+        {
+            return Ok(lib);
         }
         let path = prefix::ns::host_path(request.install_name);
         let Ok(bytes) = std::fs::read(&path) else {
@@ -84,24 +39,5 @@ impl<S: DylibSource> DylibSource for BaseLibraries<S> {
             bytes,
             implied: Vec::new(),
         }))
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use machish::resolve::SymbolProvider;
-
-    #[test]
-    fn answers_for_userland_libraries_and_nothing_else() {
-        assert!(from_base("/usr/lib/libutil.dylib"));
-        assert!(from_base("/usr/lib/libutil1.0.dylib"));
-        assert!(from_base("/usr/lib/libedit.3.dylib"));
-        assert!(from_base("/usr/lib/libncurses.5.4.dylib"));
-        assert!(from_base("/usr/lib/libreadline.dylib"));
-        assert!(!from_base("/usr/lib/libSystem.B.dylib"));
-        assert!(!from_base("@rpath/libedit.3.dylib"));
-        assert!(!from_base("/usr/local/lib/libedit.3.dylib"));
-        assert!(!darwin::provider().stands_for("/usr/lib/libutil.dylib"));
     }
 }
