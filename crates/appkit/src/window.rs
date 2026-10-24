@@ -3564,6 +3564,62 @@ unsafe extern "C" fn effective_appearance(receiver: Id, sel: Sel) -> Id {
     crate::appearance::effective_of(crate::application::shared())
 }
 
+/// Send a getter answering an `NSRect`, which returns through `_stret`.
+fn send_rect(receiver: Id, selector: &str) -> NSRect {
+    if receiver.is_null() {
+        return NSRect::default();
+    }
+    // SAFETY: `NSRect (id, SEL)`.
+    unsafe {
+        let f: unsafe extern "C" fn(Id, Sel) -> NSRect =
+            std::mem::transmute(objc::msg::entry_stret());
+        f(receiver, objc::sel::get(selector))
+    }
+}
+
+/// `-stringWithSavedFrame`: the frame and its screen's visible frame, as
+/// AppKit spells them: eight numbers, each followed by a space.
+unsafe extern "C" fn string_with_saved_frame(receiver: Id, _sel: Sel) -> Id {
+    let frame = send_rect(receiver, "frame");
+    // SAFETY: `NSScreen * (id, SEL)`.
+    let screen = unsafe {
+        let f: unsafe extern "C" fn(Id, Sel) -> Id = std::mem::transmute(objc::msg::entry());
+        f(receiver, objc::sel::get("screen"))
+    };
+    let visible = send_rect(screen, "visibleFrame");
+    let text: String = [frame, visible]
+        .iter()
+        .flat_map(|r| [r.origin.x, r.origin.y, r.size.width, r.size.height])
+        .map(|n| format!("{} ", n.round() as i64))
+        .collect();
+    objc::arc::autorelease(foundation::string::from_str(&text))
+}
+
+/// `-setFrameFromString:`: the first four numbers of a saved frame.
+unsafe extern "C" fn set_frame_from_string(receiver: Id, _sel: Sel, string: Id) {
+    // SAFETY: an `NSString` or nil.
+    let text = String::from_utf8_lossy(&unsafe { foundation::string::bytes(string) }).into_owned();
+    let numbers: Vec<f64> = text
+        .split_whitespace()
+        .filter_map(|n| n.parse().ok())
+        .collect();
+    let [x, y, width, height, ..] = numbers[..] else {
+        return;
+    };
+    if width <= 0.0 || height <= 0.0 {
+        return;
+    }
+    let frame = NSRect {
+        origin: NSPoint { x, y },
+        size: NSSize { width, height },
+    };
+    // SAFETY: `void (id, SEL, NSRect, BOOL)`.
+    unsafe {
+        let f: unsafe extern "C" fn(Id, Sel, NSRect, u8) = std::mem::transmute(objc::msg::entry());
+        f(receiver, objc::sel::get("setFrame:display:"), frame, 1);
+    }
+}
+
 pub(crate) fn install() {
     let responder = objc::class::lookup(c"NSResponder").expect("declared before its methods");
     methods!(responder, {
@@ -3657,6 +3713,8 @@ pub(crate) fn install() {
         "dealloc" => dealloc, c"v16@0:8";
         "performClose:" => perform_close, c"v24@0:8@16";
         "isKeyWindow" => is_key_window, c"c16@0:8";
+        // The application's: a window has no event of its own.
+        "currentEvent" => crate::application::current_event, c"@16@0:8";
         "canBecomeKeyWindow" => can_become_key, c"c16@0:8";
         "canBecomeMainWindow" => can_become_key, c"c16@0:8";
         "constrainFrameRect:toScreen:" => constrain_frame_rect,
@@ -3701,6 +3759,8 @@ pub(crate) fn install() {
         "saveFrameUsingName:" => ignored_integer, c"v24@0:8@16";
         "setFrameUsingName:" => no_with_object, c"c24@0:8@16";
         "setFrameAutosaveName:" => yes_with_object, c"c24@0:8@16";
+        "stringWithSavedFrame" => string_with_saved_frame, c"@16@0:8";
+        "setFrameFromString:" => set_frame_from_string, c"v24@0:8@16";
         // The textured bottom bar: no such chrome is drawn here.
         "setContentBorderThickness:forEdge:" => ignored_border, c"v32@0:8d16Q24";
         "setAutorecalculatesContentBorderThickness:forEdge:" => ignored_border_flag, c"v28@0:8c16Q20";

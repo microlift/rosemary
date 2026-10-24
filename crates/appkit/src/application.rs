@@ -984,7 +984,11 @@ pub(crate) unsafe fn send_event_through(receiver: Id, event: Id) {
 }
 
 /// `-currentEvent`, the event inside `-sendEvent:`, and nil outside it.
-unsafe extern "C" fn current_event(_receiver: Id, _sel: Sel) -> Id {
+unsafe extern "C" fn register_services(_receiver: Id, _sel: Sel, _send: Id, _return: Id) {}
+
+unsafe extern "C" fn reply_to_open_or_print(_receiver: Id, _sel: Sel, _reply: usize) {}
+
+pub(crate) unsafe extern "C" fn current_event(_receiver: Id, _sel: Sel) -> Id {
     CURRENT_EVENT.load(Ordering::Acquire) as Id
 }
 
@@ -1292,6 +1296,11 @@ pub(crate) fn install() {
         "setDockMenu:" => set_menu_for, c"v24@0:8@16";
         "postEvent:atStart:" => post_event, c"v28@0:8@16B24";
         "currentEvent" => current_event, c"@16@0:8";
+        // Documents opened by command-line arguments, not an Apple Event, so
+        // there is no reply to send.
+        "replyToOpenOrPrint:" => reply_to_open_or_print, c"v24@0:8Q16";
+        // There is no Services menu to offer types to.
+        "registerServicesMenuSendTypes:returnTypes:" => register_services, c"v32@0:8@16@24";
         "sendEvent:" => send_event, c"v24@0:8@16";
         // Private: the window server's hit-testing cache, which this runtime
         // has none of. Gecko drops a hidden popup from it.
