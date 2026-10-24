@@ -1406,6 +1406,10 @@ unsafe extern "C" fn listener_download(receiver: Id, _sel: Sel) {
     });
 }
 
+/// `+registerURLSchemeAsLocal:`. Local-file access is not restricted by scheme
+/// in this runtime's legacy web view, so there is nothing to record.
+unsafe extern "C" fn register_scheme_as_local(_class: Id, _sel: Sel, _scheme: Id) {}
+
 pub fn install() {
     let wk = objc::class::lookup(c"WKWebView").expect("installed before this");
     let web_view = corefoundation::base::abstract_class(c"WebView", Some(wk));
@@ -1484,6 +1488,9 @@ pub fn install() {
     });
     crate::class_methods!(script, {
         "throwException:" => throw_exception, c"c24@0:8@16";
+    });
+    crate::class_methods!(web_view, {
+        "registerURLSchemeAsLocal:" => register_scheme_as_local, c"v24@0:8@16";
     });
     let undefined = corefoundation::base::abstract_class(c"WebUndefined", None);
     crate::class_methods!(undefined, {
