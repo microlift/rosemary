@@ -173,7 +173,7 @@ impl Painter {
         // SAFETY: the painter's live context.
         unsafe {
             cg::CGContextSetRGBFillColor(self.context, color[0], color[1], color[2], color[3]);
-            cg::CGContextFillRect(self.context, r);
+            cg::CGContextFillRect(self.context, crate::cgpath::cg_rect(r));
         }
     }
 
@@ -196,7 +196,7 @@ impl Painter {
 
     fn ellipse(&self, r: NSRect) {
         // SAFETY: the painter's live context.
-        unsafe { cg::CGContextAddEllipseInRect(self.context, r) };
+        unsafe { cg::CGContextAddEllipseInRect(self.context, crate::cgpath::cg_rect(r)) };
     }
 
     /// A button face: the gradient and its border, or the accent colour.

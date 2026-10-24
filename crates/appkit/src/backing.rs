@@ -615,10 +615,13 @@ pub(crate) fn draw_image(
     );
 }
 
+/// A draw into a focused view's pixels.
+pub(crate) type FocusedDraw<'a> = dyn FnMut(&mut [u8], u32, u32) -> Option<Rect> + 'a;
+
 /// The focused view's store as a canvas: `draw` gets its premultiplied B, G,
 /// R, A pixels, top row first, with their width and height, and answers the
 /// rectangle of them it changed. False with nothing focused.
-pub(crate) fn draw_focused(draw: impl FnOnce(&mut [u8], u32, u32) -> Option<Rect>) -> bool {
+pub(crate) fn draw_focused(draw: &mut FocusedDraw<'_>) -> bool {
     let Some(focus) = current_focus() else {
         return false;
     };
@@ -653,6 +656,33 @@ pub(crate) fn draw_focused(draw: impl FnOnce(&mut [u8], u32, u32) -> Option<Rect
         );
     }
     true
+}
+
+/// The focus provider CoreGraphics asks for the view being drawn.
+struct FocusProvider;
+
+impl coregraphics::focus::Provider for FocusProvider {
+    fn device(&self) -> Option<coregraphics::focus::Device> {
+        focused_device().map(|device| coregraphics::focus::Device {
+            key: device.key,
+            depth: device.depth,
+            width: device.width,
+            height: device.height,
+            density: device.density,
+            flipped: device.flipped,
+        })
+    }
+
+    fn draw(&self, draw: &mut coregraphics::focus::Draw<'_>) -> bool {
+        draw_focused(&mut |pixels, width, height| {
+            draw(pixels, width, height).map(|damage| Rect {
+                x: damage.x,
+                y: damage.y,
+                width: damage.width,
+                height: damage.height,
+            })
+        })
+    }
 }
 
 /// [`draw_image`], into the focused view's store; answers the rectangle of
@@ -2266,11 +2296,12 @@ unsafe extern "C" fn shared_color_space(_receiver: Id, _sel: Sel) -> Id {
 unsafe extern "C" fn cg_color_space(_receiver: Id, _sel: Sel) -> *const c_void {
     static SPACE: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     // SAFETY: creates an object this runtime keeps for the process.
-    *SPACE.get_or_init(|| unsafe { crate::graphics::CGColorSpaceCreateDeviceRGB() } as usize)
+    *SPACE.get_or_init(|| unsafe { crate::cgcolor::CGColorSpaceCreateDeviceRGB() } as usize)
         as *const c_void
 }
 
 pub(crate) fn install() {
+    coregraphics::focus::set_provider(Box::new(FocusProvider));
     let view = objc::class::lookup(c"NSView").expect("declared before its methods");
     methods!(view, {
         "lockFocusIfCanDraw" => lock_focus_if_can_draw, c"c16@0:8";

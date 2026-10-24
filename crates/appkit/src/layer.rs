@@ -298,7 +298,7 @@ unsafe extern "C" fn display(receiver: Id, _sel: Sel) {
     }
     // SAFETY: an owned buffer of the given size; 1 is premultiplied RGBA.
     let context = unsafe {
-        crate::cgcontext::CGBitmapContextCreate(
+        crate::cgbitmap::CGBitmapContextCreate(
             std::ptr::null_mut(),
             width as usize,
             height as usize,

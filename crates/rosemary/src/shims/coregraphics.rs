@@ -1,6 +1,6 @@
 use microlift::arch::x86_64::context::RegisterContext;
 
-use crate::abi::{AbiError, GuestMemory, Result};
+use crate::abi::{AbiError, Callbacks, GuestMemory, Result};
 
 use super::host::host_or_refuse;
 use crate::shims::bind;
@@ -241,6 +241,437 @@ fn inset_rect(symbol: &str, ctx: &mut RegisterContext, mem: &mut dyn GuestMemory
     Ok(())
 }
 
+/// `CGAffineTransform`, as both ABIs pass one: forty-eight bytes, which is
+/// MEMORY class to a guest and indirect to a host.
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub(crate) struct CgTransform {
+    pub(crate) a: f64,
+    pub(crate) b: f64,
+    pub(crate) c: f64,
+    pub(crate) d: f64,
+    pub(crate) tx: f64,
+    pub(crate) ty: f64,
+}
+
+impl CgTransform {
+    /// The forty-eight bytes the guest expects in its hidden buffer, in order.
+    fn to_le_bytes(self) -> [u8; 48] {
+        let mut out = [0u8; 48];
+        for (i, v) in [self.a, self.b, self.c, self.d, self.tx, self.ty]
+            .iter()
+            .enumerate()
+        {
+            out[i * 8..(i + 1) * 8].copy_from_slice(&v.to_le_bytes());
+        }
+        out
+    }
+}
+
+/// Read the `CGAffineTransform` a guest passed by value, out of its own stack.
+///
+/// A MEMORY-class argument is on the stack under SysV AMD64, and microlift
+/// exits before the `CALL`, so `rsp` is still the pre-call value and the
+/// argument area starts at `rsp + 0` - the arrangement [`rect_argument`] rests
+/// on too.
+fn transform_argument(
+    symbol: &str,
+    ctx: &RegisterContext,
+    mem: &mut dyn GuestMemory,
+    offset: u64,
+) -> Result<CgTransform> {
+    let at = ctx.rsp.wrapping_add(offset);
+    let mut bytes = [0u8; 48];
+    for (i, word) in bytes.chunks_exact_mut(8).enumerate() {
+        let value = mem.read_u64(at.wrapping_add(i as u64 * 8), symbol)?;
+        word.copy_from_slice(&value.to_le_bytes());
+    }
+    let field = |i: usize| {
+        let mut w = [0u8; 8];
+        w.copy_from_slice(&bytes[i * 8..(i + 1) * 8]);
+        f64::from_le_bytes(w)
+    };
+    Ok(CgTransform {
+        a: field(0),
+        b: field(1),
+        c: field(2),
+        d: field(3),
+        tx: field(4),
+        ty: field(5),
+    })
+}
+
+/// Place a `CGAffineTransform` return the guest's way: through the hidden
+/// buffer `rdi` names, with `rax` answering it.
+fn return_transform(
+    symbol: &str,
+    ctx: &mut RegisterContext,
+    mem: &mut dyn GuestMemory,
+    buffer: u64,
+    value: CgTransform,
+) -> Result<()> {
+    if buffer == 0 {
+        return Err(AbiError::Memory {
+            symbol: symbol.to_string(),
+            addr: 0,
+        });
+    }
+    mem.write_bytes(buffer, &value.to_le_bytes(), symbol)?;
+    ctx.rax = buffer;
+    Ok(())
+}
+
+/// The host prototypes these shims call, one alias per shape.
+type Transform6 = extern "C" fn(f64, f64, f64, f64, f64, f64) -> CgTransform;
+type Transform2 = extern "C" fn(f64, f64) -> CgTransform;
+type Transform1 = extern "C" fn(CgTransform) -> CgTransform;
+type TransformPair = extern "C" fn(CgTransform, CgTransform) -> CgTransform;
+type TransformScaled = extern "C" fn(CgTransform, f64, f64) -> CgTransform;
+type TransformIdentity = extern "C" fn(CgTransform) -> u8;
+type RectApply = extern "C" fn(CgRect, CgTransform) -> CgRect;
+
+/// `CGAffineTransform CGAffineTransformMake(CGFloat a, CGFloat b, CGFloat c,
+/// CGFloat d, CGFloat tx, CGFloat ty)`
+///
+/// Six `double`s in `xmm0`-`xmm5`; the hidden return buffer is `rdi`, which
+/// the SSE bank does not shift.
+fn transform_make(
+    symbol: &str,
+    ctx: &mut RegisterContext,
+    mem: &mut dyn GuestMemory,
+) -> Result<()> {
+    let host = host_or_refuse(symbol)?;
+    let buffer = ctx.rdi;
+    let arg = |i: usize| f64::from_bits(ctx.xmm[i][0]);
+    // SAFETY: the symbol [`shim_for`] matched, which is
+    // `CGAffineTransform (*)(CGFloat, CGFloat, CGFloat, CGFloat, CGFloat, CGFloat)`.
+    let f: Transform6 = unsafe { core::mem::transmute::<u64, Transform6>(host) };
+    let out = f(arg(0), arg(1), arg(2), arg(3), arg(4), arg(5));
+    return_transform(symbol, ctx, mem, buffer, out)
+}
+
+/// `CGAffineTransform CGAffineTransformMakeScale(CGFloat sx, CGFloat sy)`
+fn transform_make_scale(
+    symbol: &str,
+    ctx: &mut RegisterContext,
+    mem: &mut dyn GuestMemory,
+) -> Result<()> {
+    let host = host_or_refuse(symbol)?;
+    let buffer = ctx.rdi;
+    let (sx, sy) = (f64::from_bits(ctx.xmm[0][0]), f64::from_bits(ctx.xmm[1][0]));
+    // SAFETY: the symbol [`shim_for`] matched, which is
+    // `CGAffineTransform (*)(CGFloat, CGFloat)`.
+    let f: Transform2 = unsafe { core::mem::transmute::<u64, Transform2>(host) };
+    let out = f(sx, sy);
+    return_transform(symbol, ctx, mem, buffer, out)
+}
+
+/// `CGAffineTransform CGAffineTransformMakeTranslation(CGFloat tx, CGFloat ty)`
+fn transform_make_translation(
+    symbol: &str,
+    ctx: &mut RegisterContext,
+    mem: &mut dyn GuestMemory,
+) -> Result<()> {
+    let host = host_or_refuse(symbol)?;
+    let buffer = ctx.rdi;
+    let (tx, ty) = (f64::from_bits(ctx.xmm[0][0]), f64::from_bits(ctx.xmm[1][0]));
+    // SAFETY: the symbol [`shim_for`] matched, which is
+    // `CGAffineTransform (*)(CGFloat, CGFloat)`.
+    let f: Transform2 = unsafe { core::mem::transmute::<u64, Transform2>(host) };
+    let out = f(tx, ty);
+    return_transform(symbol, ctx, mem, buffer, out)
+}
+
+/// `CGAffineTransform CGAffineTransformConcat(CGAffineTransform t1,
+/// CGAffineTransform t2)`
+///
+/// Both arguments are MEMORY class, so they are on the guest's stack one after
+/// the other, forty-eight bytes each.
+fn transform_concat(
+    symbol: &str,
+    ctx: &mut RegisterContext,
+    mem: &mut dyn GuestMemory,
+) -> Result<()> {
+    let host = host_or_refuse(symbol)?;
+    let buffer = ctx.rdi;
+    let first = transform_argument(symbol, ctx, mem, 0)?;
+    let second = transform_argument(symbol, ctx, mem, 48)?;
+    // SAFETY: the symbol [`shim_for`] matched, which is
+    // `CGAffineTransform (*)(CGAffineTransform, CGAffineTransform)`.
+    let f: TransformPair = unsafe { core::mem::transmute::<u64, TransformPair>(host) };
+    let out = f(first, second);
+    return_transform(symbol, ctx, mem, buffer, out)
+}
+
+/// `CGAffineTransform CGAffineTransformScale(CGAffineTransform t, CGFloat sx,
+/// CGFloat sy)`
+fn transform_scale(
+    symbol: &str,
+    ctx: &mut RegisterContext,
+    mem: &mut dyn GuestMemory,
+) -> Result<()> {
+    let host = host_or_refuse(symbol)?;
+    let buffer = ctx.rdi;
+    let transform = transform_argument(symbol, ctx, mem, 0)?;
+    let (sx, sy) = (f64::from_bits(ctx.xmm[0][0]), f64::from_bits(ctx.xmm[1][0]));
+    // SAFETY: the symbol [`shim_for`] matched, which is
+    // `CGAffineTransform (*)(CGAffineTransform, CGFloat, CGFloat)`.
+    let f: TransformScaled = unsafe { core::mem::transmute::<u64, TransformScaled>(host) };
+    let out = f(transform, sx, sy);
+    return_transform(symbol, ctx, mem, buffer, out)
+}
+
+/// `CGAffineTransform CGAffineTransformTranslate(CGAffineTransform t,
+/// CGFloat tx, CGFloat ty)`
+fn transform_translate(
+    symbol: &str,
+    ctx: &mut RegisterContext,
+    mem: &mut dyn GuestMemory,
+) -> Result<()> {
+    let host = host_or_refuse(symbol)?;
+    let buffer = ctx.rdi;
+    let transform = transform_argument(symbol, ctx, mem, 0)?;
+    let (tx, ty) = (f64::from_bits(ctx.xmm[0][0]), f64::from_bits(ctx.xmm[1][0]));
+    // SAFETY: the symbol [`shim_for`] matched, which is
+    // `CGAffineTransform (*)(CGAffineTransform, CGFloat, CGFloat)`.
+    let f: TransformScaled = unsafe { core::mem::transmute::<u64, TransformScaled>(host) };
+    let out = f(transform, tx, ty);
+    return_transform(symbol, ctx, mem, buffer, out)
+}
+
+/// `CGAffineTransform CGAffineTransformInvert(CGAffineTransform t)`
+fn transform_invert(
+    symbol: &str,
+    ctx: &mut RegisterContext,
+    mem: &mut dyn GuestMemory,
+) -> Result<()> {
+    let host = host_or_refuse(symbol)?;
+    let buffer = ctx.rdi;
+    let transform = transform_argument(symbol, ctx, mem, 0)?;
+    // SAFETY: the symbol [`shim_for`] matched, which is
+    // `CGAffineTransform (*)(CGAffineTransform)`.
+    let f: Transform1 = unsafe { core::mem::transmute::<u64, Transform1>(host) };
+    let out = f(transform);
+    return_transform(symbol, ctx, mem, buffer, out)
+}
+
+/// `bool CGAffineTransformIsIdentity(CGAffineTransform t)`
+fn transform_is_identity(
+    symbol: &str,
+    ctx: &mut RegisterContext,
+    mem: &mut dyn GuestMemory,
+) -> Result<()> {
+    let host = host_or_refuse(symbol)?;
+    let transform = transform_argument(symbol, ctx, mem, 0)?;
+    // SAFETY: the symbol [`shim_for`] matched, which is
+    // `bool (*)(CGAffineTransform)`.
+    let f: TransformIdentity = unsafe { core::mem::transmute::<u64, TransformIdentity>(host) };
+    // A `bool` is a byte, so only the low byte of `rax` carries it.
+    ctx.rax = u64::from(f(transform));
+    Ok(())
+}
+
+/// `CGRect CGRectApplyAffineTransform(CGRect rect, CGAffineTransform t)`
+///
+/// Both arguments are MEMORY class: the rectangle at `rsp + 0`, the transform
+/// at `rsp + 32`.
+fn rect_apply_transform(
+    symbol: &str,
+    ctx: &mut RegisterContext,
+    mem: &mut dyn GuestMemory,
+) -> Result<()> {
+    let host = host_or_refuse(symbol)?;
+    let buffer = ctx.rdi;
+    let rect = rect_argument(symbol, ctx, mem, 0)?;
+    let transform = transform_argument(symbol, ctx, mem, 32)?;
+    // SAFETY: the symbol [`shim_for`] matched, which is
+    // `CGRect (*)(CGRect, CGAffineTransform)`.
+    let f: RectApply = unsafe { core::mem::transmute::<u64, RectApply>(host) };
+    let out = f(rect, transform);
+    if buffer == 0 {
+        return Err(AbiError::Memory {
+            symbol: symbol.to_string(),
+            addr: 0,
+        });
+    }
+    mem.write_bytes(buffer, &out.to_le_bytes(), symbol)?;
+    ctx.rax = buffer;
+    Ok(())
+}
+
+/// `CGPathRef CGPathCreateWithRect(CGRect rect, const CGAffineTransform *m)`
+///
+/// The rectangle is MEMORY class to a guest, so it is on the guest's stack and
+/// the transform is the first integer register. The path is a pointer, so it
+/// comes back in `rax` with no hidden buffer.
+fn path_create_with_rect(
+    symbol: &str,
+    ctx: &mut RegisterContext,
+    mem: &mut dyn GuestMemory,
+) -> Result<()> {
+    let host = host_or_refuse(symbol)?;
+    let rect = rect_argument(symbol, ctx, mem, 0)?;
+    // SAFETY: the symbol [`shim_for`] matched, which is
+    // `CGPathRef (*)(CGRect, const CGAffineTransform *)`.
+    let f: extern "C" fn(CgRect, u64) -> u64 =
+        unsafe { core::mem::transmute::<u64, extern "C" fn(CgRect, u64) -> u64>(host) };
+    ctx.rax = f(rect, ctx.rdi);
+    Ok(())
+}
+
+/// `CGPathRef CGPathCreateWithRoundedRect(CGRect rect, CGFloat cornerWidth,
+/// CGFloat cornerHeight, const CGAffineTransform *m)`
+fn path_create_with_rounded_rect(
+    symbol: &str,
+    ctx: &mut RegisterContext,
+    mem: &mut dyn GuestMemory,
+) -> Result<()> {
+    let host = host_or_refuse(symbol)?;
+    let rect = rect_argument(symbol, ctx, mem, 0)?;
+    let (width, height) = (f64::from_bits(ctx.xmm[0][0]), f64::from_bits(ctx.xmm[1][0]));
+    // SAFETY: the symbol [`shim_for`] matched, which is
+    // `CGPathRef (*)(CGRect, CGFloat, CGFloat, const CGAffineTransform *)`.
+    let f: extern "C" fn(CgRect, f64, f64, u64) -> u64 =
+        unsafe { core::mem::transmute::<u64, extern "C" fn(CgRect, f64, f64, u64) -> u64>(host) };
+    ctx.rax = f(rect, width, height, ctx.rdi);
+    Ok(())
+}
+
+/// `void CGPathAddRect(CGMutablePathRef path, const CGAffineTransform *m,
+/// CGRect rect)`
+fn path_add_rect(symbol: &str, ctx: &mut RegisterContext, mem: &mut dyn GuestMemory) -> Result<()> {
+    let host = host_or_refuse(symbol)?;
+    let rect = rect_argument(symbol, ctx, mem, 0)?;
+    // SAFETY: the symbol [`shim_for`] matched, which is
+    // `void (*)(CGMutablePathRef, const CGAffineTransform *, CGRect)`.
+    let f: extern "C" fn(u64, u64, CgRect) =
+        unsafe { core::mem::transmute::<u64, extern "C" fn(u64, u64, CgRect)>(host) };
+    f(ctx.rdi, ctx.rsi, rect);
+    Ok(())
+}
+
+/// `void CGPathAddRoundedRect(CGMutablePathRef path, const CGAffineTransform
+/// *m, CGRect rect, CGFloat cornerWidth, CGFloat cornerHeight)`
+fn path_add_rounded_rect(
+    symbol: &str,
+    ctx: &mut RegisterContext,
+    mem: &mut dyn GuestMemory,
+) -> Result<()> {
+    let host = host_or_refuse(symbol)?;
+    let rect = rect_argument(symbol, ctx, mem, 0)?;
+    let (width, height) = (f64::from_bits(ctx.xmm[0][0]), f64::from_bits(ctx.xmm[1][0]));
+    // SAFETY: the symbol [`shim_for`] matched, which is
+    // `void (*)(CGMutablePathRef, const CGAffineTransform *, CGRect, CGFloat, CGFloat)`.
+    let f: extern "C" fn(u64, u64, CgRect, f64, f64) =
+        unsafe { core::mem::transmute::<u64, extern "C" fn(u64, u64, CgRect, f64, f64)>(host) };
+    f(ctx.rdi, ctx.rsi, rect, width, height);
+    Ok(())
+}
+
+/// `CGRect CGPathGetBoundingBox(CGPathRef path)`
+///
+/// A MEMORY-class return: the guest passes the buffer in `rdi` and the path
+/// moves to `rsi`.
+fn path_bounding_box(
+    symbol: &str,
+    ctx: &mut RegisterContext,
+    mem: &mut dyn GuestMemory,
+) -> Result<()> {
+    let host = host_or_refuse(symbol)?;
+    let (buffer, path) = (ctx.rdi, ctx.rsi);
+    if buffer == 0 {
+        return Err(AbiError::Memory {
+            symbol: symbol.to_string(),
+            addr: 0,
+        });
+    }
+    // SAFETY: the symbol [`shim_for`] matched, which is `CGRect (*)(CGPathRef)`.
+    let f: extern "C" fn(u64) -> CgRect =
+        unsafe { core::mem::transmute::<u64, extern "C" fn(u64) -> CgRect>(host) };
+    let rect = f(path);
+    mem.write_bytes(buffer, &rect.to_le_bytes(), symbol)?;
+    ctx.rax = buffer;
+    Ok(())
+}
+
+/// `CGPoint CGPathGetCurrentPoint(CGPathRef path)`
+///
+/// Sixteen bytes of two `double`s, which the two ABIs agree about: `xmm0` and
+/// `xmm1` to a guest, `v0` and `v1` to a host.
+fn path_current_point(
+    symbol: &str,
+    ctx: &mut RegisterContext,
+    _mem: &mut dyn GuestMemory,
+) -> Result<()> {
+    let host = host_or_refuse(symbol)?;
+    // SAFETY: the symbol [`shim_for`] matched, which is `CGPoint (*)(CGPathRef)`.
+    let f: extern "C" fn(u64) -> CgPoint =
+        unsafe { core::mem::transmute::<u64, extern "C" fn(u64) -> CgPoint>(host) };
+    let point = f(ctx.rdi);
+    ctx.xmm[0] = [point.x.to_bits(), 0];
+    ctx.xmm[1] = [point.y.to_bits(), 0];
+    Ok(())
+}
+
+/// `bool CGPathContainsPoint(CGPathRef path, const CGAffineTransform *m,
+/// CGPoint point, bool eoFill)`
+///
+/// The point takes the two SSE registers, so the flag takes the next *integer*
+/// register - `rdx`, after the path and the transform.
+fn path_contains_point(
+    symbol: &str,
+    ctx: &mut RegisterContext,
+    _mem: &mut dyn GuestMemory,
+) -> Result<()> {
+    let host = host_or_refuse(symbol)?;
+    let point = CgPoint {
+        x: f64::from_bits(ctx.xmm[0][0]),
+        y: f64::from_bits(ctx.xmm[1][0]),
+    };
+    // SAFETY: the symbol [`shim_for`] matched, which is
+    // `bool (*)(CGPathRef, const CGAffineTransform *, CGPoint, bool)`.
+    let f: extern "C" fn(u64, u64, CgPoint, u8) -> u8 =
+        unsafe { core::mem::transmute::<u64, extern "C" fn(u64, u64, CgPoint, u8) -> u8>(host) };
+    ctx.rax = u64::from(f(ctx.rdi, ctx.rsi, point, ctx.rdx as u8));
+    Ok(())
+}
+
+/// `void CGPathApplyWithBlock(CGPathRef path, CGPathApplierBlock block)`
+///
+/// The block's invoke pointer is a guest address until it is substituted, and
+/// the host would call it as host code. `substitute_block` writes the thunk
+/// into the block first, which is what every other block-taking shim does.
+fn path_apply_with_block(
+    symbol: &str,
+    ctx: &mut RegisterContext,
+    mem: &mut dyn GuestMemory,
+    callbacks: &dyn Callbacks,
+) -> Result<()> {
+    let host = host_or_refuse(symbol)?;
+    let (path, block) = (ctx.rdi, ctx.rsi);
+    crate::shims::block::substitute_block(symbol, block, mem, callbacks)?;
+    // SAFETY: the symbol [`callback_shim_for`] matched, which is
+    // `void (*)(CGPathRef, CGPathApplierBlock)`.
+    let f: extern "C" fn(u64, u64) =
+        unsafe { core::mem::transmute::<u64, extern "C" fn(u64, u64)>(host) };
+    f(path, block);
+    Ok(())
+}
+
+/// One of this module's implementations that needs [`Callbacks`].
+pub type CallbackShim = crate::signal::Shim;
+
+/// Whether `name` (underscore already stripped) is one of this module's
+/// callback-taking shims.
+pub fn callback_shim_for(name: &str) -> Option<CallbackShim> {
+    match name {
+        "CGPathApplyWithBlock" => {
+            Some(bind!(callback "CGPathApplyWithBlock" => path_apply_with_block))
+        },
+        _ => None,
+    }
+}
+
 /// `CGPoint`, as both ABIs return one: two floating-point registers.
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
@@ -317,6 +748,45 @@ pub fn shim_for(name: &str) -> Option<Shim> {
         "CGRectGetMinY" => Some(bind!("CGRectGetMinY" => rect_accessor)),
         "CGRectGetMidY" => Some(bind!("CGRectGetMidY" => rect_accessor)),
         "CGRectGetMaxY" => Some(bind!("CGRectGetMaxY" => rect_accessor)),
+        // `CGAffineTransform` is forty-eight bytes, so every one of these is
+        // MEMORY class on both sides and cannot be a table entry.
+        "CGAffineTransformMake" => Some(bind!("CGAffineTransformMake" => transform_make)),
+        "CGAffineTransformMakeScale" => {
+            Some(bind!("CGAffineTransformMakeScale" => transform_make_scale))
+        }
+        "CGAffineTransformMakeTranslation" => {
+            Some(bind!("CGAffineTransformMakeTranslation" => transform_make_translation))
+        }
+        "CGAffineTransformConcat" => Some(bind!("CGAffineTransformConcat" => transform_concat)),
+        "CGAffineTransformScale" => Some(bind!("CGAffineTransformScale" => transform_scale)),
+        "CGAffineTransformTranslate" => {
+            Some(bind!("CGAffineTransformTranslate" => transform_translate))
+        }
+        "CGAffineTransformInvert" => Some(bind!("CGAffineTransformInvert" => transform_invert)),
+        "CGAffineTransformIsIdentity" => {
+            Some(bind!("CGAffineTransformIsIdentity" => transform_is_identity))
+        }
+        "CGRectApplyAffineTransform" => {
+            Some(bind!("CGRectApplyAffineTransform" => rect_apply_transform))
+        }
+        // `CGPath`'s aggregate forms. The rectangle is MEMORY class to a guest
+        // and the point is two SSE eightbytes; neither can be a table entry.
+        "CGPathCreateWithRect" => Some(bind!("CGPathCreateWithRect" => path_create_with_rect)),
+        "CGPathCreateWithEllipseInRect" => {
+            Some(bind!("CGPathCreateWithEllipseInRect" => path_create_with_rect))
+        }
+        "CGPathCreateWithRoundedRect" => {
+            Some(bind!("CGPathCreateWithRoundedRect" => path_create_with_rounded_rect))
+        }
+        "CGPathAddRect" => Some(bind!("CGPathAddRect" => path_add_rect)),
+        "CGPathAddEllipseInRect" => Some(bind!("CGPathAddEllipseInRect" => path_add_rect)),
+        "CGPathAddRoundedRect" => Some(bind!("CGPathAddRoundedRect" => path_add_rounded_rect)),
+        "CGPathGetBoundingBox" => Some(bind!("CGPathGetBoundingBox" => path_bounding_box)),
+        "CGPathGetPathBoundingBox" => {
+            Some(bind!("CGPathGetPathBoundingBox" => path_bounding_box))
+        }
+        "CGPathGetCurrentPoint" => Some(bind!("CGPathGetCurrentPoint" => path_current_point)),
+        "CGPathContainsPoint" => Some(bind!("CGPathContainsPoint" => path_contains_point)),
         _ => None,
     }
 }
@@ -342,6 +812,54 @@ mod tests {
             word.copy_from_slice(&bytes[i * 8..(i + 1) * 8]);
             assert_eq!(f64::from_le_bytes(word), *expected);
         }
+    }
+
+    /// The layout claim, which is the only thing this module asserts about
+    /// `CGAffineTransform` and the thing a wrong answer would silently violate.
+    #[test]
+    fn a_transform_is_six_doubles_in_order() {
+        assert_eq!(core::mem::size_of::<CgTransform>(), 48);
+        let bytes = CgTransform {
+            a: 1.5,
+            b: 2.5,
+            c: 3.5,
+            d: 4.5,
+            tx: 5.5,
+            ty: 6.5,
+        }
+        .to_le_bytes();
+        for (i, expected) in [1.5f64, 2.5, 3.5, 4.5, 5.5, 6.5].iter().enumerate() {
+            let mut word = [0u8; 8];
+            word.copy_from_slice(&bytes[i * 8..(i + 1) * 8]);
+            assert_eq!(f64::from_le_bytes(word), *expected);
+        }
+    }
+
+    #[test]
+    fn the_path_aggregates_are_shimmed() {
+        for name in [
+            "CGPathCreateWithRect",
+            "CGPathCreateWithEllipseInRect",
+            "CGPathCreateWithRoundedRect",
+            "CGPathAddRect",
+            "CGPathAddEllipseInRect",
+            "CGPathAddRoundedRect",
+            "CGPathGetBoundingBox",
+            "CGPathGetPathBoundingBox",
+            "CGPathGetCurrentPoint",
+            "CGPathContainsPoint",
+        ] {
+            assert!(shim_for(name).is_some(), "{name} has no shim");
+        }
+    }
+
+    #[test]
+    fn the_applier_forms_are_reachable() {
+        match crate::abi::table::lookup(0, "CGPathApply") {
+            crate::abi::Lookup::Known(abi) => assert!(abi.callbacks.contains(&2)),
+            other => panic!("CGPathApply is not described: {other:?}"),
+        }
+        assert!(callback_shim_for("CGPathApplyWithBlock").is_some());
     }
 
     /// Against the host, so the claim is about CoreGraphics rather than about this

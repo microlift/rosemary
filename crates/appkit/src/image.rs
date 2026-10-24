@@ -300,8 +300,8 @@ unsafe extern "C" fn init_with_data(receiver: Id, _sel: Sel, data: Id) -> Id {
             // SAFETY: a `CGImage` this image holds.
             image.size = unsafe {
                 NSSize {
-                    width: crate::graphics::CGImageGetWidth(cg_image) as f64,
-                    height: crate::graphics::CGImageGetHeight(cg_image) as f64,
+                    width: crate::cgimage::CGImageGetWidth(cg_image) as f64,
+                    height: crate::cgimage::CGImageGetHeight(cg_image) as f64,
                 }
             };
         }
@@ -319,7 +319,7 @@ fn cg_image_of(receiver: Id) -> Option<*const c_void> {
             true => bitmap(receiver)?,
             false => render_handler(receiver)?,
         };
-        image.cg_image = crate::graphics::image_from_bitmap(pixels);
+        image.cg_image = crate::cgimage::image_from_bitmap(pixels);
     }
     (!image.cg_image.is_null()).then_some(image.cg_image)
 }
@@ -681,8 +681,8 @@ unsafe extern "C" fn init_with_cg_image(
         true => size,
         false => unsafe {
             NSSize {
-                width: crate::graphics::CGImageGetWidth(cg_image) as f64,
-                height: crate::graphics::CGImageGetHeight(cg_image) as f64,
+                width: crate::cgimage::CGImageGetWidth(cg_image) as f64,
+                height: crate::cgimage::CGImageGetHeight(cg_image) as f64,
             }
         },
     };
@@ -729,7 +729,7 @@ fn draw(
         // SAFETY: `needs_pixels` reads only the receiver and selector.
         unsafe { needs_pixels(receiver, sel) };
     };
-    let Some((width, height, pixels)) = crate::graphics::image_bgra(cg_image) else {
+    let Some((width, height, pixels)) = crate::cgimage::image_bgra(cg_image) else {
         return;
     };
     crate::backing::draw_image(
@@ -760,7 +760,7 @@ pub(crate) fn draw_tinted(receiver: Id, destination: NSRect, tint: [f64; 4]) {
     let Some(cg_image) = cg_image_of(receiver) else {
         return;
     };
-    let Some((width, height, mut pixels)) = crate::graphics::image_bgra(cg_image) else {
+    let Some((width, height, mut pixels)) = crate::cgimage::image_bgra(cg_image) else {
         return;
     };
     let channel = |value: f64| value.clamp(0.0, 1.0);
@@ -1133,7 +1133,7 @@ pub mod bitmap {
     /// The pixels are *copied* rather than shared with the `CGImage`: a rep
     /// hands out `-bitmapData` for the guest to write through, and writing
     /// through it must not edit an image someone else still holds. Nil for a
-    /// pixel layout [`crate::graphics::image_bgra`] does not decode, which is
+    /// pixel layout [`crate::cgimage::image_bgra`] does not decode, which is
     /// `NSBitmapImageRep`'s own answer for an image it cannot represent.
     unsafe extern "C" fn init_with_cg_image(
         receiver: Id,
@@ -1143,7 +1143,7 @@ pub mod bitmap {
         if cg_image.is_null() {
             return std::ptr::null_mut();
         }
-        let Some((width, height, mut pixels)) = crate::graphics::image_bgra(cg_image) else {
+        let Some((width, height, mut pixels)) = crate::cgimage::image_bgra(cg_image) else {
             return std::ptr::null_mut();
         };
         // `image_bgra` composites, and a rep's samples are R, G, B, A.
@@ -1509,7 +1509,7 @@ pub mod bitmap {
                 cg_image
             );
             let (width, height, bgra) =
-                crate::graphics::image_bgra(cg_image).expect("a layout image_bgra reads");
+                crate::cgimage::image_bgra(cg_image).expect("a layout image_bgra reads");
             assert_eq!((width, height), (1, 1));
             assert_eq!(bgra, [0x10, 0x20, 0x30, 0xff]);
             // SAFETY: both are `NSInteger (id, SEL)`.
@@ -1524,7 +1524,7 @@ pub mod bitmap {
         #[test]
         fn a_cg_image_reads_back_as_rgba_samples() {
             crate::bootstrap();
-            let cg_image = crate::graphics::image_from_bitmap(crate::raster::Bitmap {
+            let cg_image = crate::cgimage::image_from_bitmap(crate::raster::Bitmap {
                 width: 2,
                 height: 1,
                 pixels: vec![0x10, 0x20, 0x30, 0xff, 0x40, 0x50, 0x60, 0xff],

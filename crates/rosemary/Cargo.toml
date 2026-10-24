@@ -23,6 +23,8 @@ sdl3.workspace = true
 corevideo.workspace = true
 iosurface.workspace = true
 coreaudio.workspace = true
+coregraphics.workspace = true
+coretext.workspace = true
 contacts.workspace = true
 avfoundation.workspace = true
 security.workspace = true
@@ -37,7 +39,10 @@ libc.workspace = true
 static_init.workspace = true
 clap = { version = "4", features = ["derive"] }
 iced-x86 = "1"
-microlift = { git = "https://github.com/microlift/microlift", features = ["disasm", "runtime"] }
+microlift = { git = "https://github.com/microlift/microlift", features = [
+    "disasm",
+    "runtime",
+] }
 # `override` feature disabled on macOS for now because it has a bug where it improperly sets `_malloc_fork` info,
 # causing child processes to get their memory allocator corrupted.
 [target.'cfg(target_os = "macos")'.dependencies]

@@ -71,17 +71,6 @@ pub unsafe extern "C" fn MTLCopyAllDevices() -> Id {
     ) as Id
 }
 
-/// Return a retained device for the requested display.
-///
-/// # Safety
-///
-/// Called through the CoreGraphics framework ABI.
-pub unsafe extern "C" fn CGDirectDisplayCopyCurrentMetalDevice(_display: u32) -> Id {
-    // SAFETY: called through the framework ABI.
-    let device = unsafe { MTLCreateSystemDefaultDevice() };
-    objc::arc::retain(device)
-}
-
 pub fn data_symbols() -> Vec<(String, u64)> {
     bootstrap();
     [
@@ -111,15 +100,12 @@ pub fn data_symbols() -> Vec<(String, u64)> {
 ///
 /// The crate has a module of this name too, so the macro is spelled absolutely.
 mod entries {
-    use super::{
-        CGDirectDisplayCopyCurrentMetalDevice, MTLCopyAllDevices, MTLCreateSystemDefaultDevice,
-    };
+    use super::{MTLCopyAllDevices, MTLCreateSystemDefaultDevice};
 
     ::exports::exports! {
         functions {
             "MTLCreateSystemDefaultDevice" => MTLCreateSystemDefaultDevice,
             "MTLCopyAllDevices" => MTLCopyAllDevices,
-            "CGDirectDisplayCopyCurrentMetalDevice" => CGDirectDisplayCopyCurrentMetalDevice,
         }
     }
 }

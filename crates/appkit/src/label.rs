@@ -131,7 +131,7 @@ fn font_of(look: &Look) -> Option<(Arc<chrome::Font>, f64)> {
 /// An `NSFont` as the face and point size chrome draws with; the system font
 /// for nil or a font with no face here.
 pub(crate) fn chrome_font(font: Id) -> Option<(Arc<chrome::Font>, f64)> {
-    if let Some((face, size)) = crate::coretext::face_of(font as *const _)
+    if let Some((face, size)) = coregraphics::font_attributes::face_of(font as *const _)
         && let Some(font) = chrome::Font::from_faces_with_fallback(vec![face])
     {
         return Some((Arc::new(font), if size > 0.0 { size } else { SYSTEM_SIZE }));

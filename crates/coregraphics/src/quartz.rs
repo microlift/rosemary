@@ -16,18 +16,18 @@
 use std::ffi::c_void;
 use std::sync::Arc;
 
+use crate::{CGAffineTransformIdentity, CGPoint, CGRect, CGSize};
 use corefoundation::base::CFTypeRef;
-use foundation::geometry::{NSPoint, NSRect, NSSize};
 use tiny_skia as sk;
 
-use crate::cgcontext::{CGAffineTransform, IDENTITY};
+use crate::cgcontext::CGAffineTransform;
 use crate::cgpath::Elements;
 
 /// A Core Foundation object a graphics state holds a reference to.
-pub(crate) struct Retained(pub CFTypeRef);
+pub struct Retained(pub CFTypeRef);
 
 impl Retained {
-    pub(crate) fn new(object: CFTypeRef) -> Option<Retained> {
+    pub fn new(object: CFTypeRef) -> Option<Retained> {
         // SAFETY: a live object the caller holds.
         (!object.is_null()).then(|| Retained(unsafe { corefoundation::api::CFRetain(object) }))
     }
@@ -49,7 +49,7 @@ impl Drop for Retained {
 
 /// What a fill or stroke paints with.
 #[derive(Clone)]
-pub(crate) enum Ink {
+pub enum Ink {
     /// Straight R, G, B, A.
     Color([f64; 4]),
     /// A `CGPattern`, and the colour an uncoloured one is painted in.
@@ -57,7 +57,7 @@ pub(crate) enum Ink {
 }
 
 #[derive(Clone)]
-pub(crate) struct Line {
+pub struct Line {
     pub width: f64,
     pub cap: sk::LineCap,
     pub join: sk::LineJoin,
@@ -67,7 +67,7 @@ pub(crate) struct Line {
 }
 
 #[derive(Clone)]
-pub(crate) struct GState {
+pub struct GState {
     pub ctm: CGAffineTransform,
     pub fill: Ink,
     pub stroke: Ink,
@@ -92,7 +92,7 @@ pub(crate) struct GState {
 impl Default for GState {
     fn default() -> Self {
         GState {
-            ctm: IDENTITY,
+            ctm: CGAffineTransformIdentity,
             fill: Ink::Color([0.0, 0.0, 0.0, 1.0]),
             stroke: Ink::Color([0.0, 0.0, 0.0, 1.0]),
             fill_components: 3,
@@ -109,7 +109,7 @@ impl Default for GState {
                 dash: None,
             },
             clip: None,
-            text_matrix: IDENTITY,
+            text_matrix: CGAffineTransformIdentity,
             font: None,
             font_size: 0.0,
             text_mode: 0,
@@ -118,7 +118,7 @@ impl Default for GState {
     }
 }
 
-pub(crate) struct State {
+pub struct State {
     pub current: GState,
     pub saved: Vec<GState>,
     /// The current path, in base space.
@@ -129,7 +129,7 @@ pub(crate) struct State {
 }
 
 impl State {
-    pub(crate) fn new(storage: Option<Vec<u8>>) -> State {
+    pub fn new(storage: Option<Vec<u8>>) -> State {
         State {
             current: GState::default(),
             saved: Vec::new(),
@@ -140,7 +140,7 @@ impl State {
 }
 
 #[repr(C)]
-pub(crate) struct BitmapContext {
+pub struct BitmapContext {
     pub isa: *const c_void,
     pub data: *mut u8,
     pub width: usize,
@@ -158,7 +158,7 @@ pub(crate) struct BitmapContext {
     pub alpha_only: bool,
 }
 
-pub(crate) fn context_of<'a>(context: CFTypeRef) -> Option<&'a mut BitmapContext> {
+pub fn context_of<'a>(context: CFTypeRef) -> Option<&'a mut BitmapContext> {
     let class = objc::class::lookup(c"__CGContext")?;
     // SAFETY: null or an object a guest received from this runtime.
     if context.is_null() || !unsafe { corefoundation::base::is_kind_of(context, class) } {
@@ -168,19 +168,19 @@ pub(crate) fn context_of<'a>(context: CFTypeRef) -> Option<&'a mut BitmapContext
     Some(unsafe { &mut *(context as *mut BitmapContext) })
 }
 
-pub(crate) fn state_of<'a>(context: CFTypeRef) -> Option<&'a mut State> {
+pub fn state_of<'a>(context: CFTypeRef) -> Option<&'a mut State> {
     let context = context_of(context)?;
     // SAFETY: every context is created with a state.
     unsafe { context.state.as_mut() }
 }
 
-pub(crate) const ALPHA_INFO_MASK: u32 = 0x1f;
-pub(crate) const BYTE_ORDER_MASK: u32 = 0x7000;
-pub(crate) const BYTE_ORDER_32_LITTLE: u32 = 0x2000;
+pub const ALPHA_INFO_MASK: u32 = 0x1f;
+pub const BYTE_ORDER_MASK: u32 = 0x7000;
+pub const BYTE_ORDER_32_LITTLE: u32 = 0x2000;
 
 /// Where a context's base space lands in its target, and how big that is.
 #[derive(Clone, Copy)]
-pub(crate) struct Frame {
+pub struct Frame {
     /// Base space to device pixels.
     pub base: CGAffineTransform,
     pub width: u32,
@@ -193,22 +193,22 @@ pub(crate) struct Frame {
 }
 
 /// The frame a context draws in, without touching its pixels.
-pub(crate) fn frame_of(context: CFTypeRef) -> Option<Frame> {
+pub fn frame_of(context: CFTypeRef) -> Option<Frame> {
     let ctx = context_of(context)?;
     if ctx.focus {
-        let device = crate::backing::focused_device()?;
+        let device = crate::focus::device()?;
         let d = device.density;
         let base = match device.flipped {
             true => CGAffineTransform {
                 a: d,
                 d,
-                ..IDENTITY
+                ..CGAffineTransformIdentity
             },
             false => CGAffineTransform {
                 a: d,
                 d: -d,
                 ty: f64::from(device.height),
-                ..IDENTITY
+                ..CGAffineTransformIdentity
             },
         };
         return Some(Frame {
@@ -226,7 +226,7 @@ pub(crate) fn frame_of(context: CFTypeRef) -> Option<Frame> {
         base: CGAffineTransform {
             d: -1.0,
             ty: ctx.height as f64,
-            ..IDENTITY
+            ..CGAffineTransformIdentity
         },
         width: ctx.width as u32,
         height: ctx.height as u32,
@@ -282,7 +282,7 @@ fn skips_alpha(ctx: &BitmapContext) -> bool {
 /// when the frame says to swap), and write back what it changed.
 ///
 /// `op` answers the device rectangle it touched, or `None` for nothing.
-pub(crate) fn render(
+pub fn render(
     context: CFTypeRef,
     op: impl FnOnce(&mut sk::PixmapMut, &Frame) -> Option<sk::IntRect>,
 ) {
@@ -293,10 +293,12 @@ pub(crate) fn render(
         return;
     };
     if ctx.focus {
-        crate::backing::draw_focused(|pixels, width, height| {
+        let mut op = Some(op);
+        crate::focus::draw(&mut |pixels, width, height| {
+            let op = op.take()?;
             let mut pixmap = sk::PixmapMut::from_bytes(pixels, width, height)?;
             let touched = op(&mut pixmap, &frame)?;
-            Some(crate::backing::Rect {
+            Some(crate::focus::Damage {
                 x: i64::from(touched.x()),
                 y: i64::from(touched.y()),
                 width: i64::from(touched.width()),
@@ -401,8 +403,20 @@ fn write_out(
     }
 }
 
-impl CGAffineTransform {
-    pub(crate) fn sk(self) -> sk::Transform {
+/// `CGAffineTransform` as tiny-skia wants it.
+///
+/// A trait rather than an inherent method because the type lives in
+/// `coregraphics`, and an inherent impl on a foreign type is not allowed.
+trait SkTransform {
+    fn sk(self) -> sk::Transform;
+
+    /// The factor lengths grow by, for sizing a raster that will be drawn
+    /// through this transform.
+    fn scale_factor(self) -> f64;
+}
+
+impl SkTransform for CGAffineTransform {
+    fn sk(self) -> sk::Transform {
         sk::Transform::from_row(
             self.a as f32,
             self.b as f32,
@@ -413,31 +427,13 @@ impl CGAffineTransform {
         )
     }
 
-    pub(crate) fn inverse(self) -> Option<CGAffineTransform> {
-        let det = self.a * self.d - self.b * self.c;
-        if det == 0.0 || !det.is_finite() {
-            return None;
-        }
-        let (a, b, c, d) = (self.d / det, -self.b / det, -self.c / det, self.a / det);
-        Some(CGAffineTransform {
-            a,
-            b,
-            c,
-            d,
-            tx: -(self.tx * a + self.ty * c),
-            ty: -(self.tx * b + self.ty * d),
-        })
-    }
-
-    /// The factor lengths grow by, for sizing a raster that will be drawn
-    /// through this transform.
-    pub(crate) fn scale_factor(self) -> f64 {
+    fn scale_factor(self) -> f64 {
         (self.a * self.d - self.b * self.c).abs().sqrt()
     }
 }
 
 /// A paint source, made before the geometry it will fill is known.
-pub(crate) enum Source {
+pub enum Source {
     /// Straight R, G, B, A, the global alpha already applied.
     Solid([f64; 4]),
     /// A raster, already in the target's channel order, and the transform from
@@ -470,7 +466,7 @@ fn color(rgba: [f64; 4], swap: bool) -> sk::Color {
 impl Source {
     /// The paint for this source when the geometry is drawn through
     /// `geometry`, which tiny-skia also applies to the shader.
-    pub(crate) fn paint<'a>(
+    pub fn paint<'a>(
         &'a self,
         geometry: CGAffineTransform,
         state: &GState,
@@ -536,7 +532,7 @@ impl Source {
 }
 
 /// The source an ink paints with in a context whose frame is `frame`.
-pub(crate) fn source_for(ink: &Ink, state: &GState, frame: &Frame) -> Option<Source> {
+pub fn source_for(ink: &Ink, state: &GState, frame: &Frame) -> Option<Source> {
     match ink {
         Ink::Color([r, g, b, a]) => Some(Source::Solid([*r, *g, *b, a * state.alpha])),
         Ink::Pattern(pattern, rgba) => {
@@ -544,7 +540,7 @@ pub(crate) fn source_for(ink: &Ink, state: &GState, frame: &Frame) -> Option<Sou
             let placed = crate::cgpaint::pattern_matrix(pattern.0)?.then(CGAffineTransform {
                 tx: phase_x,
                 ty: phase_y,
-                ..IDENTITY
+                ..CGAffineTransformIdentity
             });
             let pattern_to_device = placed.then(frame.base);
             let tile = crate::cgpaint::render_tile(
@@ -653,7 +649,7 @@ fn fill_clipped(
 }
 
 /// Fill `path`, given in base space, with `ink`.
-pub(crate) fn fill(context: CFTypeRef, path: &Elements, rule: sk::FillRule, stroke_ink: bool) {
+pub fn fill(context: CFTypeRef, path: &Elements, rule: sk::FillRule, stroke_ink: bool) {
     let Some(state) = state_of(context) else {
         return;
     };
@@ -706,7 +702,7 @@ fn in_user_space(path: &Elements, ctm: CGAffineTransform) -> Option<Elements> {
 ///
 /// The stroke is made in user space and the whole drawn through the CTM, so a
 /// line width scales as Quartz's does.
-pub(crate) fn stroke(context: CFTypeRef, path: &Elements) {
+pub fn stroke(context: CFTypeRef, path: &Elements) {
     let Some(state) = state_of(context) else {
         return;
     };
@@ -758,7 +754,7 @@ pub(crate) fn stroke(context: CFTypeRef, path: &Elements) {
 }
 
 /// The outline a stroke of `path` (base space) would fill, in base space.
-pub(crate) fn stroked_outline(context: CFTypeRef, path: &Elements) -> Option<Elements> {
+pub fn stroked_outline(context: CFTypeRef, path: &Elements) -> Option<Elements> {
     let state = &state_of(context)?.current;
     let user = in_user_space(path, state.ctm)?;
     let outline = user.to_skia()?.stroke(&stroke_style(&state.line), 1.0)?;
@@ -766,7 +762,7 @@ pub(crate) fn stroked_outline(context: CFTypeRef, path: &Elements) -> Option<Ele
 }
 
 /// Intersect the clip with `path`, given in base space.
-pub(crate) fn clip(context: CFTypeRef, path: &Elements, rule: sk::FillRule) {
+pub fn clip(context: CFTypeRef, path: &Elements, rule: sk::FillRule) {
     let Some(frame) = frame_of(context) else {
         return;
     };
@@ -814,7 +810,7 @@ fn clip_by(gs: &mut GState, coverage: sk::Mask) {
 
 /// The device rectangle the clip leaves drawable, as left, top, right,
 /// bottom.
-pub(crate) fn clip_device_bounds(context: CFTypeRef) -> Option<[f64; 4]> {
+pub fn clip_device_bounds(context: CFTypeRef) -> Option<[f64; 4]> {
     let frame = frame_of(context)?;
     let state = state_of(context)?;
     let Some(mask) = clip_for(&state.current, frame.width, frame.height) else {
@@ -842,13 +838,13 @@ pub(crate) fn clip_device_bounds(context: CFTypeRef) -> Option<[f64; 4]> {
 fn coverage_mask(
     state: &GState,
     frame: &Frame,
-    rect: NSRect,
+    rect: CGRect,
     width: usize,
     height: usize,
     coverage: &[u8],
 ) -> Option<sk::Mask> {
     let mut alpha = sk::Pixmap::new(width as u32, height as u32)?;
-    for (pixel, value) in alpha.data_mut().chunks_exact_mut(4).zip(coverage) {
+    for (pixel, value) in alpha.data_mut().as_chunks_mut::<4>().0.iter_mut().zip(coverage) {
         pixel.copy_from_slice(&[0, 0, 0, *value]);
     }
     let mut device = sk::Pixmap::new(frame.width, frame.height)?;
@@ -866,11 +862,11 @@ fn coverage_mask(
 
 /// `CGContextClipToMask`: the clip multiplied by an image's coverage over
 /// `rect`.
-pub(crate) fn clip_to_mask(context: CFTypeRef, rect: NSRect, image: CFTypeRef) {
+pub fn clip_to_mask(context: CFTypeRef, rect: CGRect, image: CFTypeRef) {
     let Some(frame) = frame_of(context) else {
         return;
     };
-    let Some((width, height, coverage)) = crate::graphics::image_coverage(image) else {
+    let Some((width, height, coverage)) = crate::cgimage::image_coverage(image) else {
         return;
     };
     let Some(state) = state_of(context) else {
@@ -883,7 +879,7 @@ pub(crate) fn clip_to_mask(context: CFTypeRef, rect: NSRect, image: CFTypeRef) {
 }
 
 /// Image pixels (top row first) to the user-space rectangle they fill.
-fn image_to_user(rect: NSRect, width: usize, height: usize) -> CGAffineTransform {
+fn image_to_user(rect: CGRect, width: usize, height: usize) -> CGAffineTransform {
     CGAffineTransform {
         a: rect.size.width / width as f64,
         b: 0.0,
@@ -898,14 +894,14 @@ fn image_to_user(rect: NSRect, width: usize, height: usize) -> CGAffineTransform
 fn raster(bgra: Vec<u8>, width: usize, height: usize, swap: bool) -> Option<sk::Pixmap> {
     let mut pixels = bgra;
     if !swap {
-        for pixel in pixels.chunks_exact_mut(4) {
+        for pixel in pixels.as_chunks_mut::<4>().0 {
             pixel.swap(0, 2);
         }
     }
     sk::Pixmap::from_vec(pixels, sk::IntSize::from_wh(width as u32, height as u32)?)
 }
 
-fn rect_path(rect: NSRect) -> Option<sk::Path> {
+fn rect_path(rect: CGRect) -> Option<sk::Path> {
     let r = sk::Rect::from_xywh(
         rect.origin.x as f32,
         rect.origin.y as f32,
@@ -917,13 +913,7 @@ fn rect_path(rect: NSRect) -> Option<sk::Path> {
 
 /// Draw premultiplied B, G, R, A pixels, top row first, into `rect` in user
 /// space - the whole of `CGContextDrawImage` once the image is decoded.
-pub(crate) fn draw_pixels(
-    context: CFTypeRef,
-    rect: NSRect,
-    width: usize,
-    height: usize,
-    bgra: Vec<u8>,
-) {
+pub fn draw_pixels(context: CFTypeRef, rect: CGRect, width: usize, height: usize, bgra: Vec<u8>) {
     if width == 0 || height == 0 || rect.size.width == 0.0 || rect.size.height == 0.0 {
         return;
     }
@@ -962,9 +952,9 @@ pub(crate) fn draw_pixels(
 }
 
 /// Paint the fill through an image mask's coverage over `rect`.
-pub(crate) fn draw_through_mask(
+pub fn draw_through_mask(
     context: CFTypeRef,
-    rect: NSRect,
+    rect: CGRect,
     width: usize,
     height: usize,
     coverage: Vec<u8>,
@@ -998,7 +988,7 @@ pub(crate) fn draw_through_mask(
 }
 
 /// A rectangle with a non-negative size.
-fn standard(rect: NSRect) -> NSRect {
+fn standard(rect: CGRect) -> CGRect {
     let (x, w) = match rect.size.width < 0.0 {
         true => (rect.origin.x + rect.size.width, -rect.size.width),
         false => (rect.origin.x, rect.size.width),
@@ -1007,9 +997,9 @@ fn standard(rect: NSRect) -> NSRect {
         true => (rect.origin.y + rect.size.height, -rect.size.height),
         false => (rect.origin.y, rect.size.height),
     };
-    NSRect {
-        origin: NSPoint { x, y },
-        size: NSSize {
+    CGRect {
+        origin: CGPoint { x, y },
+        size: CGSize {
             width: w,
             height: h,
         },
@@ -1017,7 +1007,7 @@ fn standard(rect: NSRect) -> NSRect {
 }
 
 /// `CGContextClearRect`: the rectangle made transparent, within the clip.
-pub(crate) fn clear(context: CFTypeRef, rect: NSRect) {
+pub fn clear(context: CFTypeRef, rect: CGRect) {
     let Some(state) = state_of(context) else {
         return;
     };
@@ -1047,7 +1037,7 @@ pub(crate) fn clear(context: CFTypeRef, rect: NSRect) {
 }
 
 /// A gradient to paint, from `cgpaint`'s shading.
-pub(crate) struct Shading {
+pub struct Shading {
     /// The two circles' radii, for a radial shading.
     pub radial: Option<(f64, f64)>,
     pub start: (f64, f64),
@@ -1057,7 +1047,7 @@ pub(crate) struct Shading {
 }
 
 /// `CGContextDrawShading`: the shading over the clip, in user space.
-pub(crate) fn draw_shading(context: CFTypeRef, shading: Shading) {
+pub fn draw_shading(context: CFTypeRef, shading: Shading) {
     let Some(state) = state_of(context) else {
         return;
     };
@@ -1075,7 +1065,7 @@ pub(crate) fn draw_shading(context: CFTypeRef, shading: Shading) {
         .map(|(x, y)| device_to_user.apply(x, y));
         let reach = corners
             .iter()
-            .flat_map(|(x, y)| [x.abs(), y.abs()])
+            .flat_map(|p| [p.x.abs(), p.y.abs()])
             .fold(0.0f64, f64::max)
             * 4.0
             + 1.0;
@@ -1102,10 +1092,10 @@ pub(crate) fn draw_shading(context: CFTypeRef, shading: Shading) {
                 };
                 let at = |s: f64| (shading.start.0 + ux * s, shading.start.1 + uy * s);
                 let (a, b) = (at(s0), at(s1));
-                region.move_to(IDENTITY, a.0 + px, a.1 + py);
-                region.line_to(IDENTITY, b.0 + px, b.1 + py);
-                region.line_to(IDENTITY, b.0 - px, b.1 - py);
-                region.line_to(IDENTITY, a.0 - px, a.1 - py);
+                region.move_to(CGAffineTransformIdentity, a.0 + px, a.1 + py);
+                region.line_to(CGAffineTransformIdentity, b.0 + px, b.1 + py);
+                region.line_to(CGAffineTransformIdentity, b.0 - px, b.1 - py);
+                region.line_to(CGAffineTransformIdentity, a.0 - px, a.1 - py);
                 region.close();
                 (shading.stops.clone(), shading.start, shading.end, None)
             }
@@ -1113,26 +1103,26 @@ pub(crate) fn draw_shading(context: CFTypeRef, shading: Shading) {
                 let concentric = shading.start == shading.end;
                 match shading.extend.1 {
                     true => region.rect(
-                        IDENTITY,
-                        NSRect {
-                            origin: NSPoint {
+                        CGAffineTransformIdentity,
+                        CGRect {
+                            origin: CGPoint {
                                 x: -reach,
                                 y: -reach,
                             },
-                            size: NSSize {
+                            size: CGSize {
                                 width: reach * 2.0,
                                 height: reach * 2.0,
                             },
                         },
                     ),
                     false => region.ellipse(
-                        IDENTITY,
-                        NSRect {
-                            origin: NSPoint {
+                        CGAffineTransformIdentity,
+                        CGRect {
+                            origin: CGPoint {
                                 x: shading.end.0 - r1,
                                 y: shading.end.1 - r1,
                             },
-                            size: NSSize {
+                            size: CGSize {
                                 width: r1 * 2.0,
                                 height: r1 * 2.0,
                             },
@@ -1183,7 +1173,7 @@ pub(crate) fn draw_shading(context: CFTypeRef, shading: Shading) {
 
 /// Glyph outlines, at positions in text space, drawn as the text drawing mode
 /// says: filled, stroked, added to the clip, or not at all.
-pub(crate) fn draw_glyphs(
+pub fn draw_glyphs(
     context: CFTypeRef,
     face: &crate::fonts::LoadedFace,
     size: f64,
@@ -1203,7 +1193,7 @@ pub(crate) fn draw_glyphs(
             d: s,
             tx: *x,
             ty: *y,
-            ..IDENTITY
+            ..CGAffineTransformIdentity
         };
         crate::cgpath::glyph_outline(face.face(), *glyph, at, &mut text);
     }
@@ -1229,7 +1219,7 @@ pub(crate) fn draw_glyphs(
 
 /// Write a pixel buffer's B, G, R, A copy for `CGBitmapContextCreateImage` -
 /// the context's own bytes in whatever layout - as premultiplied B, G, R, A.
-pub(crate) fn snapshot_bgra(ctx: &BitmapContext) -> Option<Vec<u8>> {
+pub fn snapshot_bgra(ctx: &BitmapContext) -> Option<Vec<u8>> {
     if ctx.data.is_null() {
         return None;
     }
@@ -1237,7 +1227,7 @@ pub(crate) fn snapshot_bgra(ctx: &BitmapContext) -> Option<Vec<u8>> {
     let bytes = unsafe { std::slice::from_raw_parts(ctx.data, ctx.bytes_per_row * ctx.height) };
     let mut rgba = vec![0u8; ctx.width * ctx.height * 4];
     read_in(bytes, ctx, layout(ctx), &mut rgba);
-    for pixel in rgba.chunks_exact_mut(4) {
+    for pixel in rgba.as_chunks_mut::<4>().0 {
         pixel.swap(0, 2);
     }
     Some(rgba)
@@ -1258,7 +1248,7 @@ mod tests {
             ty: -7.0,
         };
         let back = t.then(t.inverse().expect("invertible"));
-        let (x, y) = back.apply(1.25, -3.5);
-        assert!((x - 1.25).abs() < 1e-9 && (y + 3.5).abs() < 1e-9);
+        let p = back.apply(1.25, -3.5);
+        assert!((p.x - 1.25).abs() < 1e-9 && (p.y + 3.5).abs() < 1e-9);
     }
 }

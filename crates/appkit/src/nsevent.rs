@@ -360,16 +360,18 @@ unsafe extern "C" fn mouse_location(_class: Id, _sel: Sel) -> NSPoint {
     // cursor, so the window system would answer where a person left it and
     // disagree with the events the guest has just been given.
     if let Some((x, y)) = crate::script::pointer() {
-        return crate::geometry::point_from_sdl(x as f64, y as f64);
+        return crate::cgpath::ns_point(crate::cggeometry::point_from_sdl(x as f64, y as f64));
     }
     // A disassociated pointer is the other exception, and for the same reason
     // in reverse: the window system's cursor is still moving and the guest's is
     // not - see `event::frozen_pointer`.
     if let Some((x, y)) = crate::event::frozen_pointer() {
-        return crate::geometry::point_from_sdl(x as f64, y as f64);
+        return crate::cgpath::ns_point(crate::cggeometry::point_from_sdl(x as f64, y as f64));
     }
     match crate::window::desktop_mouse_state() {
-        Some((x, y, _)) => crate::geometry::point_from_sdl(x as f64, y as f64),
+        Some((x, y, _)) => {
+            crate::cgpath::ns_point(crate::cggeometry::point_from_sdl(x as f64, y as f64))
+        }
         None => NSPoint::default(),
     }
 }

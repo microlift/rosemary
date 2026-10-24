@@ -36,9 +36,18 @@ use library::*;
 use object::methods;
 
 pub use exports::{
-    CGDirectDisplayCopyCurrentMetalDevice, MTLCopyAllDevices, MTLCreateSystemDefaultDevice,
-    data_symbols, names, provide, symbol,
+    MTLCopyAllDevices, MTLCreateSystemDefaultDevice, data_symbols, names, provide, symbol,
 };
+
+/// The CoreGraphics display-to-device call's view of Metal.
+struct CoreGraphicsProvider;
+
+impl coregraphics::metal::Provider for CoreGraphicsProvider {
+    fn current_device(&self) -> Id {
+        // SAFETY: called through the framework ABI.
+        unsafe { MTLCreateSystemDefaultDevice() }
+    }
+}
 
 struct Device {
     ordinal: u64,
@@ -157,6 +166,7 @@ pub fn bootstrap() {
     static ONCE: std::sync::Once = std::sync::Once::new();
     ONCE.call_once(|| {
         foundation::bootstrap();
+        coregraphics::metal::set_provider(Box::new(CoreGraphicsProvider));
         let class = object::register::<Device>(c"RosemaryMTLDevice");
         let library_class = object::register::<Library>(c"RosemaryMTLLibrary");
         let function_class = object::register::<Function>(c"RosemaryMTLFunction");

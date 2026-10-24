@@ -729,7 +729,70 @@ pub static SIGNATURES: &[FunctionAbi] = &[
     sig!("CFURLGetFileSystemRepresentation", U8, P, U8, P, I64),
     sig!("CFUUIDCreate", P, P),
     sig!("CFUUIDCreateString", P, P, P),
+    // CoreGraphics
     //
+    // `CGAffineTransform` is forty-eight bytes, so every function that takes
+    // or returns one is MEMORY class: the argument is on the guest's stack and
+    // the return goes through the hidden pointer in `rdi`. The table's types
+    // are scalars, so none of them can be an entry - they are shims, in
+    // `crate::shims::coregraphics`. Declaring one here as `F64` calls a
+    // struct-returning function through a scalar prototype and writes the
+    // result through whatever `rdi` held.
+    //
+    // `CGPath` is the family that does belong here: its only aggregates are
+    // `CGRect` and `CGPoint`, and the functions that take those are shims.
+    sig!("CGPathCreateMutable", P),
+    sig!("CGPathCreateCopy", P, P),
+    sig!("CGPathCreateMutableCopy", P, P),
+    sig!("CGPathCreateCopyByTransformingPath", P, P, P),
+    sig!("CGPathCreateMutableCopyByTransformingPath", P, P, P),
+    sig!("CGPathRetain", P, P),
+    sig!("CGPathRelease", V, P),
+    sig!("CGPathMoveToPoint", V, P, P, F64, F64),
+    sig!("CGPathAddLineToPoint", V, P, P, F64, F64),
+    sig!("CGPathAddQuadCurveToPoint", V, P, P, F64, F64, F64, F64),
+    sig!(
+        "CGPathAddCurveToPoint",
+        V,
+        P,
+        P,
+        F64,
+        F64,
+        F64,
+        F64,
+        F64,
+        F64
+    ),
+    sig!("CGPathCloseSubpath", V, P),
+    sig!("CGPathAddRects", V, P, P, P, U64),
+    sig!("CGPathAddArc", V, P, P, F64, F64, F64, F64, F64, BOOL),
+    sig!("CGPathAddArcToPoint", V, P, P, F64, F64, F64, F64, F64),
+    sig!("CGPathAddLines", V, P, P, P, U64),
+    sig!("CGPathAddPath", V, P, P, P),
+    sig!("CGPathIsEmpty", U8, P),
+    sig!("CGPathIsRect", U8, P, P),
+    sig!("CGPathEqualToPath", U8, P, P),
+    sig!("CGPathGetTypeID", U64),
+    sig!("CGPathAddRelativeArc", V, P, P, F64, F64, F64, F64, F64),
+    sig!("CGPathCreateCopyByDashingPath", P, P, P, F64, P, U64),
+    sig!(
+        "CGPathCreateCopyByStrokingPath",
+        P,
+        P,
+        P,
+        F64,
+        I32,
+        I32,
+        F64
+    ),
+    sig!("CGPathCreateCopyByFlattening", P, P, F64),
+    sig!("CGPathCreateCopyByNormalizing", P, P, BOOL),
+    sig!("CGPathCreateCopyByUnioningPath", P, P, P, BOOL),
+    sig!("CGPathCreateCopyByIntersectingPath", P, P, P, BOOL),
+    sig!("CGPathCreateCopyBySubtractingPath", P, P, P, BOOL),
+    sig!("CGPathCreateCopyBySymmetricDifferenceOfPath", P, P, P, BOOL),
+    // The applier is argument two, and the host calls it once per element.
+    cbsig!([2], "CGPathApply", V, P, P, P),
     // Everything SDL3's Cocoa backend asks about a screen: which displays
     // exist, what modes each has, and which one is in use.
     sig!("CGAcquireDisplayFadeReservation", I32, F32, P),

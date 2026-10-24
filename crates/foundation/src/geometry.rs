@@ -6,8 +6,7 @@ use objc::sel::Sel;
 
 use crate::define::{class_methods, methods};
 
-/// `CGFloat`, which is a `double` on every host this runs on.
-pub type CGFloat = f64;
+pub use coregraphics::CGFloat;
 
 #[repr(C)]
 #[derive(Clone, Copy, Default, PartialEq, Debug)]

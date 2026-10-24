@@ -9,6 +9,7 @@ license.workspace = true
 exports.workspace = true
 objc.workspace = true
 corefoundation.workspace = true
+coregraphics.workspace = true
 darwin.workspace = true
 prefix.workspace = true
 libc.workspace = true

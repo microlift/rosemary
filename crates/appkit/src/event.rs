@@ -5,6 +5,35 @@ use sdl3::keycodes::{keymod, scancode};
 use crate::nsevent::{self, Fields, kind};
 use crate::window;
 
+/// The Quartz event services' view of AppKit's pointer and modifiers.
+struct QuartzEventProvider;
+
+impl coregraphics::quartz_event::Provider for QuartzEventProvider {
+    fn pointer(&self) -> Option<(f32, f32)> {
+        crate::script::pointer()
+            .or_else(frozen_pointer)
+            .or_else(|| crate::window::desktop_mouse_state().map(|(x, y, _)| (x, y)))
+    }
+
+    fn warp_pointer(&self, point: coregraphics::CGPoint) {
+        let point = NSPoint {
+            x: point.x,
+            y: point.y,
+        };
+        // SAFETY: a point, which is all it takes.
+        unsafe { crate::screen::warp_pointer_impl(point) };
+    }
+
+    fn modifiers(&self) -> u64 {
+        crate::keymap::modifiers(sdl3::video::keyboard_modifiers())
+    }
+}
+
+/// Install the provider the Quartz event services ask for pointer state.
+pub(crate) fn install_quartz_event_provider() {
+    coregraphics::quartz_event::set_provider(Box::new(QuartzEventProvider));
+}
+
 /// Drain SDL's queue once, delivering what this tree can deliver.
 ///
 /// `app` is the application, which is the object a window notification is posted
@@ -594,7 +623,7 @@ pub(crate) fn deliver_past_modal(event: sdl3::video::Event) {
             } else {
                 (x, y)
             };
-            crate::cgevent::note_mouse_delta(dx, dy);
+            crate::quartz_event::note_mouse_delta(dx, dy);
             crate::screen::hold_at_edge(id, x, y, dx, dy);
             // SDL's position keeps integrating the deltas of a disassociated
             // pointer, so it wanders over the chrome while the cursor the
@@ -998,7 +1027,9 @@ fn location(window: Id, x: f32, y: f32) -> NSPoint {
         },
     };
     let height = height + window::content_inset(window);
-    crate::geometry::point_in_window(x as f64, y as f64, height)
+    crate::cgpath::ns_point(crate::cggeometry::point_in_window(
+        x as f64, y as f64, height,
+    ))
 }
 
 /// Queue one mouse event for its window, which `-[NSApplication sendEvent:]`
@@ -1014,7 +1045,7 @@ fn send(id: u32, at: Option<(f32, f32)>, fields: impl FnOnce(Id, NSPoint) -> Fie
 
 /// Hand a built event to its window's `-sendEvent:`, after the local monitors.
 pub(crate) fn dispatch(window: Id, event: Id) {
-    crate::cgevent::count(nsevent::kind_of(event));
+    crate::quartz_event::count(nsevent::kind_of(event));
     // Before the window sees it, which is where AppKit runs a local monitor: a
     // monitor exists to swallow an event, and one that ran afterwards could
     // only take it back.

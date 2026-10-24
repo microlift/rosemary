@@ -475,7 +475,7 @@ unsafe extern "C" fn cg_color(receiver: Id, _sel: Sel) -> *const c_void {
     let (red, green, blue, alpha) = unsafe { components(receiver) };
     // SAFETY: a fresh colour this call owns.
     unsafe {
-        let color = crate::cgcontext::CGColorCreateGenericRGB(red, green, blue, alpha);
+        let color = crate::cgcolor::CGColorCreateGenericRGB(red, green, blue, alpha);
         corefoundation::api::CFAutorelease(color)
     }
 }

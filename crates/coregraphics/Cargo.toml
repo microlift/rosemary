@@ -1,0 +1,16 @@
+[package]
+name = "coregraphics"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+corefoundation.workspace = true
+exports.workspace = true
+objc.workspace = true
+sdl3.workspace = true
+tiny-skia.workspace = true
+i_overlay.workspace = true
+owned_ttf_parser.workspace = true
+ab_glyph_rasterizer.workspace = true
+rust-fontconfig.workspace = true

@@ -252,7 +252,9 @@ impl Dialog {
     /// Show the pointer while `shown`, if the program has it hidden.
     fn show_cursor(&mut self, shown: bool) {
         // SAFETY: reads a counter.
-        if unsafe { crate::cursor::CGCursorIsVisible() } != 0 || self.showed_cursor == shown {
+        if unsafe { coregraphics::quartz_display::CGCursorIsVisible() } != 0
+            || self.showed_cursor == shown
+        {
             return;
         }
         crate::cursor::force_visible(shown);

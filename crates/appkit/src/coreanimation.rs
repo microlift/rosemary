@@ -298,7 +298,7 @@ unsafe extern "C" fn background_color(receiver: Id, _sel: Sel) -> CFTypeRef {
 /// `-setBackgroundColor:`, a `CGColorRef`.
 unsafe extern "C" fn set_background_color(receiver: Id, _sel: Sel, color: CFTypeRef) {
     // SAFETY: null or a `CGColor`.
-    let components = unsafe { crate::cgcontext::CGColorGetComponents(color) };
+    let components = unsafe { crate::cgcolor::CGColorGetComponents(color) };
     let background = (!components.is_null()).then(|| {
         // SAFETY: a colour here always has four components.
         let c = unsafe { std::slice::from_raw_parts(components, 4) };
@@ -1737,7 +1737,7 @@ fn say_undrawn_format(format: u32) {
 
 /// Premultiplied BGRA pixels of a `CGImage` or an `NSImage`, top row first.
 fn decode_contents(contents: usize) -> Option<(usize, usize, Vec<u8>)> {
-    if let Some(decoded) = crate::graphics::image_bgra(contents as CFTypeRef) {
+    if let Some(decoded) = crate::cgimage::image_bgra(contents as CFTypeRef) {
         return Some(decoded);
     }
     let bitmap = crate::image::bitmap(contents as Id)?;
@@ -2452,7 +2452,7 @@ mod tests {
         let child: Id = send(class, "layer", ());
         send::<NSRect, ()>(child, "setFrame:", rect(0.0, 0.0, 2.0, 4.0));
         // SAFETY: a fresh colour, retained by the layer below.
-        let red = unsafe { crate::cgcontext::CGColorCreateGenericRGB(1.0, 0.0, 0.0, 1.0) };
+        let red = unsafe { crate::cgcolor::CGColorCreateGenericRGB(1.0, 0.0, 0.0, 1.0) };
         send::<CFTypeRef, ()>(child, "setBackgroundColor:", red);
         send::<Id, ()>(root, "addSublayer:", child);
         let whole = Rect {

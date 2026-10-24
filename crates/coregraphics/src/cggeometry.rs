@@ -1,4 +1,9 @@
-use foundation::geometry::{CGFloat, NSPoint, NSRect, NSSize};
+//! Rectangle and point geometry: the `CGRect` accessors and the conversions
+//! between CoreGraphics' bottom-left space and SDL's top-left one.
+
+#![allow(non_snake_case)]
+
+use crate::{CGFloat, CGPoint, CGRect, CGSize};
 
 /// The height of the primary display, which is the origin AppKit measures from.
 ///
@@ -9,26 +14,26 @@ pub fn primary_height() -> f64 {
     sdl3::video::display_bounds(sdl3::video::primary_display()).map_or(0.0, |b| b.h as f64)
 }
 
-/// An SDL rectangle, top-left and y down, as an AppKit one.
-pub fn rect_from_sdl(x: i32, y: i32, width: i32, height: i32) -> NSRect {
-    NSRect {
-        origin: NSPoint {
+/// An SDL rectangle, top-left and y down, as a CoreGraphics one.
+pub fn rect_from_sdl(x: i32, y: i32, width: i32, height: i32) -> CGRect {
+    CGRect {
+        origin: CGPoint {
             x: x as f64,
             y: primary_height() - (y as f64) - (height as f64),
         },
-        size: NSSize {
+        size: CGSize {
             width: width as f64,
             height: height as f64,
         },
     }
 }
 
-/// The reverse: an AppKit rectangle as SDL's `(x, y, width, height)`.
+/// The reverse: a CoreGraphics rectangle as SDL's `(x, y, width, height)`.
 ///
 /// The same expression as [`rect_from_sdl`], which is not a coincidence - the
 /// transform is its own inverse - and is written out rather than shared so that
 /// each direction reads as what it does.
-pub fn rect_to_sdl(rect: NSRect) -> (i32, i32, i32, i32) {
+pub fn rect_to_sdl(rect: CGRect) -> (i32, i32, i32, i32) {
     let y = primary_height() - rect.origin.y - rect.size.height;
     (
         rect.origin.x as i32,
@@ -38,20 +43,22 @@ pub fn rect_to_sdl(rect: NSRect) -> (i32, i32, i32, i32) {
     )
 }
 
-/// A desktop point as an AppKit screen point.
-pub fn point_from_sdl(x: f64, y: f64) -> NSPoint {
-    NSPoint {
+/// A desktop point as a CoreGraphics screen point.
+pub fn point_from_sdl(x: f64, y: f64) -> CGPoint {
+    CGPoint {
         x,
         y: primary_height() - y,
     }
 }
 
-/// A point inside a window, from SDL's top-left frame to AppKit's bottom-left.
+/// A point inside a window, from SDL's top-left frame to CoreGraphics'
+/// bottom-left.
 ///
-/// `height` is the window's, in points: this is the conversion `-locationInWindow`
-/// needs, and it is relative to the window rather than to the screen.
-pub fn point_in_window(x: f64, y: f64, height: f64) -> NSPoint {
-    NSPoint { x, y: height - y }
+/// `height` is the window's, in points: this is the conversion
+/// `-locationInWindow` needs, and it is relative to the window rather than to
+/// the screen.
+pub fn point_in_window(x: f64, y: f64, height: f64) -> CGPoint {
+    CGPoint { x, y: height - y }
 }
 
 /// A rectangle with a non-negative width and height, which is what every
@@ -59,7 +66,7 @@ pub fn point_in_window(x: f64, y: f64, height: f64) -> NSPoint {
 ///
 /// CoreGraphics allows a negative extent and standardizes before measuring, so
 /// `CGRectGetMinX` of a rectangle that runs leftwards is its *right* edge.
-fn standardized(rect: NSRect) -> (f64, f64, f64, f64) {
+fn standardized(rect: CGRect) -> (f64, f64, f64, f64) {
     let (x, width) = match rect.size.width < 0.0 {
         true => (rect.origin.x + rect.size.width, -rect.size.width),
         false => (rect.origin.x, rect.size.width),
@@ -73,7 +80,7 @@ fn standardized(rect: NSRect) -> (f64, f64, f64, f64) {
 
 /// Whether `point` is inside `rect`, half-open on the far edges as
 /// `CGRectContainsPoint` is.
-pub fn contains(rect: NSRect, point: NSPoint) -> bool {
+pub fn contains(rect: CGRect, point: CGPoint) -> bool {
     let (x, y, width, height) = standardized(rect);
     point.x >= x && point.x < x + width && point.y >= y && point.y < y + height
 }
@@ -81,27 +88,22 @@ pub fn contains(rect: NSRect, point: NSPoint) -> bool {
 /// `void NSDisableScreenUpdates(void)` and `NSEnableScreenUpdates`: they hold
 /// back the window server's flushes so several windows change at once. Each
 /// window here presents on its own, so there is nothing to hold back.
-#[allow(non_snake_case)]
 pub extern "C" fn NSDisableScreenUpdates() {}
 
-#[allow(non_snake_case)]
 pub extern "C" fn NSEnableScreenUpdates() {}
 
 /// `bool CGRectEqualToRect(CGRect, CGRect)`, compared standardized.
-#[allow(non_snake_case)]
-pub unsafe extern "C" fn CGRectEqualToRect(a: NSRect, b: NSRect) -> u8 {
+pub unsafe extern "C" fn CGRectEqualToRect(a: CGRect, b: CGRect) -> u8 {
     u8::from(standardized(a) == standardized(b))
 }
 
-#[allow(non_snake_case)]
-pub unsafe extern "C" fn NSIsEmptyRect(rect: NSRect) -> u8 {
+pub unsafe extern "C" fn NSIsEmptyRect(rect: CGRect) -> u8 {
     u8::from(rect.size.width <= 0.0 || rect.size.height <= 0.0)
 }
 
-#[allow(non_snake_case)]
-pub unsafe extern "C" fn NSUnionRect(a: NSRect, b: NSRect) -> NSRect {
+pub unsafe extern "C" fn NSUnionRect(a: CGRect, b: CGRect) -> CGRect {
     match unsafe { (NSIsEmptyRect(a) != 0, NSIsEmptyRect(b) != 0) } {
-        (true, true) => NSRect::default(),
+        (true, true) => CGRect::default(),
         (true, false) => b,
         (false, true) => a,
         (false, false) => {
@@ -109,9 +111,9 @@ pub unsafe extern "C" fn NSUnionRect(a: NSRect, b: NSRect) -> NSRect {
             let y = a.origin.y.min(b.origin.y);
             let right = (a.origin.x + a.size.width).max(b.origin.x + b.size.width);
             let top = (a.origin.y + a.size.height).max(b.origin.y + b.size.height);
-            NSRect {
-                origin: NSPoint { x, y },
-                size: NSSize {
+            CGRect {
+                origin: CGPoint { x, y },
+                size: CGSize {
                     width: right - x,
                     height: top - y,
                 },
@@ -121,8 +123,7 @@ pub unsafe extern "C" fn NSUnionRect(a: NSRect, b: NSRect) -> NSRect {
 }
 
 /// `BOOL NSPointInRect(NSPoint, NSRect)`.
-#[allow(non_snake_case)]
-pub unsafe extern "C" fn NSPointInRect(point: NSPoint, rect: NSRect) -> u8 {
+pub unsafe extern "C" fn NSPointInRect(point: CGPoint, rect: CGRect) -> u8 {
     contains(rect, point) as u8
 }
 
@@ -132,8 +133,7 @@ pub unsafe extern "C" fn NSPointInRect(point: NSPoint, rect: NSRect) -> u8 {
 /// horizontal interval is always half-open. The vertical interval follows the
 /// view orientation: a flipped view owns its minimum-y edge, while an
 /// unflipped view owns its maximum-y edge.
-#[allow(non_snake_case)]
-pub unsafe extern "C" fn NSMouseInRect(point: NSPoint, rect: NSRect, flipped: u8) -> u8 {
+pub unsafe extern "C" fn NSMouseInRect(point: CGPoint, rect: CGRect, flipped: u8) -> u8 {
     let (x, y, width, height) = standardized(rect);
     let horizontal = point.x >= x && point.x < x + width;
     let vertical = if flipped != 0 {
@@ -147,14 +147,13 @@ pub unsafe extern "C" fn NSMouseInRect(point: NSPoint, rect: NSRect, flipped: u8
 /// `NSRect NSInsetRect(NSRect, CGFloat, CGFloat)`: the rectangle shrunk by `dx`
 /// on each side and `dy` on each end. A negative amount grows it, which is how
 /// callers use it to make a margin.
-#[allow(non_snake_case)]
-pub unsafe extern "C" fn NSInsetRect(rect: NSRect, dx: CGFloat, dy: CGFloat) -> NSRect {
-    NSRect {
-        origin: NSPoint {
+pub unsafe extern "C" fn NSInsetRect(rect: CGRect, dx: CGFloat, dy: CGFloat) -> CGRect {
+    CGRect {
+        origin: CGPoint {
             x: rect.origin.x + dx,
             y: rect.origin.y + dy,
         },
-        size: NSSize {
+        size: CGSize {
             width: rect.size.width - 2.0 * dx,
             height: rect.size.height - 2.0 * dy,
         },
@@ -164,18 +163,17 @@ pub unsafe extern "C" fn NSInsetRect(rect: NSRect, dx: CGFloat, dy: CGFloat) -> 
 /// `NSRect NSIntersectionRect(NSRect, NSRect)`, which is also
 /// `CGRectIntersection` for the empty case's purposes: no overlap is the zero
 /// rectangle.
-#[allow(non_snake_case)]
-pub unsafe extern "C" fn NSIntersectionRect(a: NSRect, b: NSRect) -> NSRect {
+pub unsafe extern "C" fn NSIntersectionRect(a: CGRect, b: CGRect) -> CGRect {
     let x = a.origin.x.max(b.origin.x);
     let y = a.origin.y.max(b.origin.y);
     let right = (a.origin.x + a.size.width).min(b.origin.x + b.size.width);
     let top = (a.origin.y + a.size.height).min(b.origin.y + b.size.height);
     if right <= x || top <= y {
-        return NSRect::default();
+        return CGRect::default();
     }
-    NSRect {
-        origin: NSPoint { x, y },
-        size: NSSize {
+    CGRect {
+        origin: CGPoint { x, y },
+        size: CGSize {
             width: right - x,
             height: top - y,
         },
@@ -184,10 +182,9 @@ pub unsafe extern "C" fn NSIntersectionRect(a: NSRect, b: NSRect) -> NSRect {
 
 /// `NSRect NSOffsetRect(NSRect, CGFloat, CGFloat)`, the same as
 /// `CGRectOffset`.
-#[allow(non_snake_case)]
-pub unsafe extern "C" fn NSOffsetRect(rect: NSRect, dx: CGFloat, dy: CGFloat) -> NSRect {
-    NSRect {
-        origin: NSPoint {
+pub unsafe extern "C" fn NSOffsetRect(rect: CGRect, dx: CGFloat, dy: CGFloat) -> CGRect {
+    CGRect {
+        origin: CGPoint {
             x: rect.origin.x + dx,
             y: rect.origin.y + dy,
         },
@@ -196,18 +193,17 @@ pub unsafe extern "C" fn NSOffsetRect(rect: NSRect, dx: CGFloat, dy: CGFloat) ->
 }
 
 /// [`standardized`] as a rectangle again.
-fn standard_rect(rect: NSRect) -> NSRect {
+fn standard_rect(rect: CGRect) -> CGRect {
     let (x, y, width, height) = standardized(rect);
-    NSRect {
-        origin: NSPoint { x, y },
-        size: NSSize { width, height },
+    CGRect {
+        origin: CGPoint { x, y },
+        size: CGSize { width, height },
     }
 }
 
 /// `CGRect CGRectInset(CGRect, CGFloat, CGFloat)`: standardized first, and
 /// the null rectangle when the inset swallows it.
-#[allow(non_snake_case)]
-pub unsafe extern "C" fn CGRectInset(rect: NSRect, dx: CGFloat, dy: CGFloat) -> NSRect {
+pub unsafe extern "C" fn CGRectInset(rect: CGRect, dx: CGFloat, dy: CGFloat) -> CGRect {
     let rect = standard_rect(rect);
     let out = unsafe { NSInsetRect(rect, dx, dy) };
     if out.size.width < 0.0 || out.size.height < 0.0 {
@@ -217,15 +213,13 @@ pub unsafe extern "C" fn CGRectInset(rect: NSRect, dx: CGFloat, dy: CGFloat) -> 
 }
 
 /// `CGRect CGRectOffset(CGRect, CGFloat, CGFloat)`
-#[allow(non_snake_case)]
-pub unsafe extern "C" fn CGRectOffset(rect: NSRect, dx: CGFloat, dy: CGFloat) -> NSRect {
+pub unsafe extern "C" fn CGRectOffset(rect: CGRect, dx: CGFloat, dy: CGFloat) -> CGRect {
     unsafe { NSOffsetRect(standard_rect(rect), dx, dy) }
 }
 
 /// `CGRect CGRectIntegral(CGRect)`: the smallest integral rectangle that
 /// contains it.
-#[allow(non_snake_case)]
-pub unsafe extern "C" fn CGRectIntegral(rect: NSRect) -> NSRect {
+pub unsafe extern "C" fn CGRectIntegral(rect: CGRect) -> CGRect {
     if rect.origin.x.is_infinite() || rect.origin.y.is_infinite() {
         return rect;
     }
@@ -233,9 +227,9 @@ pub unsafe extern "C" fn CGRectIntegral(rect: NSRect) -> NSRect {
     let (x, y) = (rect.origin.x.floor(), rect.origin.y.floor());
     let right = (rect.origin.x + rect.size.width).ceil();
     let top = (rect.origin.y + rect.size.height).ceil();
-    NSRect {
-        origin: NSPoint { x, y },
-        size: NSSize {
+    CGRect {
+        origin: CGPoint { x, y },
+        size: CGSize {
             width: right - x,
             height: top - y,
         },
@@ -243,8 +237,7 @@ pub unsafe extern "C" fn CGRectIntegral(rect: NSRect) -> NSRect {
 }
 
 /// `bool CGRectIsEmpty(CGRect)`: zero area, or the null rectangle.
-#[allow(non_snake_case)]
-pub unsafe extern "C" fn CGRectIsEmpty(rect: NSRect) -> u8 {
+pub unsafe extern "C" fn CGRectIsEmpty(rect: CGRect) -> u8 {
     u8::from(
         rect.size.width == 0.0
             || rect.size.height == 0.0
@@ -254,12 +247,12 @@ pub unsafe extern "C" fn CGRectIsEmpty(rect: NSRect) -> u8 {
 }
 
 /// `CGRectNull`: an infinite origin and a zero size.
-const CG_RECT_NULL: NSRect = NSRect {
-    origin: NSPoint {
+const CG_RECT_NULL: CGRect = CGRect {
+    origin: CGPoint {
         x: f64::INFINITY,
         y: f64::INFINITY,
     },
-    size: NSSize {
+    size: CGSize {
         width: 0.0,
         height: 0.0,
     },
@@ -274,8 +267,7 @@ const CG_RECT_NULL: NSRect = NSRect {
 macro_rules! accessors {
     ($($name:ident => $measure:expr;)*) => {
         $(
-            #[allow(non_snake_case)]
-            pub unsafe extern "C" fn $name(rect: NSRect) -> f64 {
+            pub unsafe extern "C" fn $name(rect: CGRect) -> f64 {
                 let measure: fn(f64, f64, f64, f64) -> f64 = $measure;
                 let (x, y, width, height) = standardized(rect);
                 measure(x, y, width, height)
@@ -295,6 +287,33 @@ accessors! {
     CGRectGetMaxY => |_x, y, _width, height| y + height;
 }
 
+exports::exports! {
+    functions {
+        "NSDisableScreenUpdates" => NSDisableScreenUpdates,
+        "NSEnableScreenUpdates" => NSEnableScreenUpdates,
+        "CGRectEqualToRect" | "NSEqualRects" => CGRectEqualToRect,
+        "NSIsEmptyRect" => NSIsEmptyRect,
+        "NSUnionRect" => NSUnionRect,
+        "NSPointInRect" => NSPointInRect,
+        "NSMouseInRect" => NSMouseInRect,
+        "NSInsetRect" => NSInsetRect,
+        "NSIntersectionRect" => NSIntersectionRect,
+        "NSOffsetRect" => NSOffsetRect,
+        "CGRectInset" => CGRectInset,
+        "CGRectOffset" => CGRectOffset,
+        "CGRectIntegral" => CGRectIntegral,
+        "CGRectIsEmpty" => CGRectIsEmpty,
+        "CGRectGetWidth" => CGRectGetWidth,
+        "CGRectGetHeight" => CGRectGetHeight,
+        "CGRectGetMinX" => CGRectGetMinX,
+        "CGRectGetMidX" => CGRectGetMidX,
+        "CGRectGetMaxX" => CGRectGetMaxX,
+        "CGRectGetMinY" => CGRectGetMinY,
+        "CGRectGetMidY" => CGRectGetMidY,
+        "CGRectGetMaxY" => CGRectGetMaxY,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -303,9 +322,9 @@ mod tests {
     /// negative extent measure the same as the one it describes.
     #[test]
     fn a_rectangle_that_runs_backwards_measures_as_the_one_it_describes() {
-        let backwards = NSRect {
-            origin: NSPoint { x: 30.0, y: 40.0 },
-            size: NSSize {
+        let backwards = CGRect {
+            origin: CGPoint { x: 30.0, y: 40.0 },
+            size: CGSize {
                 width: -10.0,
                 height: -20.0,
             },
@@ -326,9 +345,9 @@ mod tests {
     /// a window where it started.
     #[test]
     fn a_rectangle_survives_the_round_trip() {
-        let rect = NSRect {
-            origin: NSPoint { x: 100.0, y: 200.0 },
-            size: NSSize {
+        let rect = CGRect {
+            origin: CGPoint { x: 100.0, y: 200.0 },
+            size: CGSize {
                 width: 640.0,
                 height: 480.0,
             },
@@ -341,14 +360,14 @@ mod tests {
     #[test]
     fn the_origin_is_the_other_corner() {
         let height = primary_height();
-        assert_eq!(point_from_sdl(0.0, height), NSPoint { x: 0.0, y: 0.0 });
+        assert_eq!(point_from_sdl(0.0, height), CGPoint { x: 0.0, y: 0.0 });
     }
 
     #[test]
     fn mouse_rect_vertical_edge_tracks_view_orientation() {
-        let rect = NSRect {
-            origin: NSPoint { x: 10.0, y: 20.0 },
-            size: NSSize {
+        let rect = CGRect {
+            origin: CGPoint { x: 10.0, y: 20.0 },
+            size: CGSize {
                 width: 30.0,
                 height: 40.0,
             },
@@ -356,11 +375,11 @@ mod tests {
 
         // SAFETY: these calls pass the function's plain value arguments.
         unsafe {
-            assert_eq!(NSMouseInRect(NSPoint { x: 10.0, y: 20.0 }, rect, 1), 1);
-            assert_eq!(NSMouseInRect(NSPoint { x: 10.0, y: 60.0 }, rect, 1), 0);
-            assert_eq!(NSMouseInRect(NSPoint { x: 10.0, y: 20.0 }, rect, 0), 0);
-            assert_eq!(NSMouseInRect(NSPoint { x: 10.0, y: 60.0 }, rect, 0), 1);
-            assert_eq!(NSMouseInRect(NSPoint { x: 40.0, y: 30.0 }, rect, 0), 0);
+            assert_eq!(NSMouseInRect(CGPoint { x: 10.0, y: 20.0 }, rect, 1), 1);
+            assert_eq!(NSMouseInRect(CGPoint { x: 10.0, y: 60.0 }, rect, 1), 0);
+            assert_eq!(NSMouseInRect(CGPoint { x: 10.0, y: 20.0 }, rect, 0), 0);
+            assert_eq!(NSMouseInRect(CGPoint { x: 10.0, y: 60.0 }, rect, 0), 1);
+            assert_eq!(NSMouseInRect(CGPoint { x: 40.0, y: 30.0 }, rect, 0), 0);
         }
     }
 }

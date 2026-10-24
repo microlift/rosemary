@@ -1,0 +1,12 @@
+[package]
+name = "coretext"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+corefoundation.workspace = true
+coregraphics.workspace = true
+exports.workspace = true
+prefix.workspace = true
+owned_ttf_parser.workspace = true

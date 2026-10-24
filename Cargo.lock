@@ -161,13 +161,14 @@ version = "0.4.1"
 dependencies = [
  "chrome",
  "corefoundation",
+ "coregraphics",
+ "coretext",
  "darwin",
  "exports",
  "foundation",
  "gamecontroller",
  "iosurface",
  "objc",
- "owned_ttf_parser",
  "prefix",
  "sdl3",
  "server",
@@ -179,8 +180,11 @@ dependencies = [
 name = "applicationservices"
 version = "0.4.1"
 dependencies = [
- "appkit",
+ "corefoundation",
+ "coregraphics",
  "exports",
+ "foundation",
+ "owned_ttf_parser",
 ]
 
 [[package]]
@@ -475,8 +479,8 @@ name = "chrome"
 version = "0.4.1"
 dependencies = [
  "ab_glyph_rasterizer",
+ "coregraphics",
  "owned_ttf_parser",
- "rust-fontconfig",
 ]
 
 [[package]]
@@ -621,6 +625,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "coregraphics"
+version = "0.4.1"
+dependencies = [
+ "ab_glyph_rasterizer",
+ "corefoundation",
+ "exports",
+ "i_overlay",
+ "objc",
+ "owned_ttf_parser",
+ "rust-fontconfig",
+ "sdl3",
+ "tiny-skia",
+]
+
+[[package]]
 name = "coreservices"
 version = "0.4.1"
 dependencies = [
@@ -629,6 +648,17 @@ dependencies = [
  "exports",
  "foundation",
  "libc",
+ "prefix",
+]
+
+[[package]]
+name = "coretext"
+version = "0.4.1"
+dependencies = [
+ "corefoundation",
+ "coregraphics",
+ "exports",
+ "owned_ttf_parser",
  "prefix",
 ]
 
@@ -1194,6 +1224,7 @@ name = "foundation"
 version = "0.4.1"
 dependencies = [
  "corefoundation",
+ "coregraphics",
  "darwin",
  "exports",
  "libc",
@@ -1373,6 +1404,48 @@ checksum = "27f864f10dfb56725ce5ce5472bc52252c8f93a4ab86327122cebf62c5f59a17"
 dependencies = [
  "typenum",
 ]
+
+[[package]]
+name = "i_float"
+version = "5.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9ecaff1ce29bcacd72cdf581ba6fce636ef4c4e0b2da7e7846dd0137d98141e2"
+dependencies = [
+ "libm",
+]
+
+[[package]]
+name = "i_key_sort"
+version = "0.12.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "14269ee362009550495e20650ff3c2bca14a8147fe251e216760381ffed90b6f"
+
+[[package]]
+name = "i_overlay"
+version = "9.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "913fd692c02408adc76cead636f8e7e07c705f8b995a8b54b454b995e8e197d5"
+dependencies = [
+ "i_float",
+ "i_key_sort",
+ "i_shape",
+ "i_tree",
+]
+
+[[package]]
+name = "i_shape"
+version = "5.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fa1878f91ef7921feaf1b2346253ebc5e661878b22d5715195c1d5dcf0f20ae5"
+dependencies = [
+ "i_float",
+]
+
+[[package]]
+name = "i_tree"
+version = "0.20.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "048af31de955890c62a8506fec511335a5089e91e1c516537add16f96c507d84"
 
 [[package]]
 name = "iced-x86"
@@ -1693,6 +1766,7 @@ dependencies = [
  "appkit",
  "ash",
  "corefoundation",
+ "coregraphics",
  "darwin",
  "exports",
  "foundation",
@@ -2254,7 +2328,9 @@ dependencies = [
  "contacts",
  "coreaudio",
  "corefoundation",
+ "coregraphics",
  "coreservices",
+ "coretext",
  "corevideo",
  "darwin",
  "exports",

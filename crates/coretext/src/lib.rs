@@ -1,14 +1,24 @@
-#![allow(non_snake_case)]
+//! CoreText: fonts and descriptors.
+
+#![allow(
+    clippy::missing_safety_doc,
+    clippy::not_unsafe_ptr_arg_deref,
+    non_camel_case_types,
+    non_snake_case,
+    non_upper_case_globals
+)]
 
 use std::ffi::c_void;
-use std::sync::Arc;
 
 use corefoundation::base::CFTypeRef;
-use corefoundation::callbacks::Policy;
 use corefoundation::collections::{self, Number};
-use foundation::geometry::{NSPoint, NSRect, NSSize};
-
-use crate::fonts::{self, FaceInfo, LoadedFace};
+use coregraphics::cgfont::{face_for, reference_of};
+use coregraphics::font_attributes::{
+    PATH_KEY, face_attributes, font_size, get, get_number, get_string, key, loaded, make_font,
+    merged_attributes, new_dictionary, release, resolve, scale, spill_font, string, type_policy,
+};
+use coregraphics::fonts::{self, FaceInfo};
+use coregraphics::{CGPoint, CGRect, CGSize};
 
 const ATTRIBUTE_GLOBALS: &[(&str, &str)] = &[
     ("_kCTFontCopyrightNameKey", "CTFontCopyrightNameKey"),
@@ -51,312 +61,6 @@ const ATTRIBUTE_GLOBALS: &[(&str, &str)] = &[
     ("_kCTVerticalFormsAttributeName", "CTVerticalForms"),
 ];
 
-/// Where a resolved font's face lives. Private to this runtime, so a guest
-/// copying attributes between descriptors carries them along unexamined.
-const PATH_KEY: &str = "RosemaryFontFilePath";
-const INDEX_KEY: &str = "RosemaryFontFileIndex";
-
-/// A size CoreText uses for a font created with none.
-const DEFAULT_SIZE: f64 = 12.0;
-
-/// `kCTFontItalicTrait`, `kCTFontBoldTrait` and `kCTFontMonoSpaceTrait`.
-const ITALIC_TRAIT: u32 = 1 << 0;
-const BOLD_TRAIT: u32 = 1 << 1;
-const MONOSPACE_TRAIT: u32 = 1 << 10;
-
-fn key(text: &'static str) -> CFTypeRef {
-    foundation::notification::name_object(text) as CFTypeRef
-}
-
-fn type_policy() -> Policy {
-    Policy::from_type_callbacks()
-}
-
-fn new_dictionary(pairs: &[(CFTypeRef, CFTypeRef)]) -> CFTypeRef {
-    collections::new_dictionary(pairs, Policy::from_key_callbacks(), type_policy(), false)
-}
-
-fn release(object: CFTypeRef) {
-    if !object.is_null() {
-        // SAFETY: a reference the caller owns.
-        unsafe { corefoundation::api::CFRelease(object) };
-    }
-}
-
-pub(crate) fn get(dictionary: CFTypeRef, name: &'static str) -> CFTypeRef {
-    // SAFETY: null, or a dictionary a guest received from this runtime.
-    match unsafe { collections::dictionary(dictionary) } {
-        Some(_) => unsafe { corefoundation::api::CFDictionaryGetValue(dictionary, key(name)) },
-        None => std::ptr::null(),
-    }
-}
-
-fn get_string(dictionary: CFTypeRef, name: &'static str) -> Option<String> {
-    let value = get(dictionary, name);
-    if value.is_null() {
-        return None;
-    }
-    // SAFETY: font attributes named as strings hold strings.
-    let bytes = unsafe { foundation::string::bytes(value as _) };
-    String::from_utf8(bytes).ok()
-}
-
-fn get_number(dictionary: CFTypeRef, name: &'static str) -> Option<f64> {
-    let value = get(dictionary, name);
-    // SAFETY: null or an object this runtime allocated.
-    unsafe { collections::number(value) }.map(|number| number.as_f64())
-}
-
-fn string(text: &str) -> CFTypeRef {
-    foundation::string::from_str(text) as CFTypeRef
-}
-
-/// CoreText's weight trait, from -1 to 1, as an OpenType weight class.
-fn weight_class(weight: f64) -> u16 {
-    const STOPS: [(f64, u16); 9] = [
-        (-0.8, 100),
-        (-0.6, 200),
-        (-0.4, 300),
-        (0.0, 400),
-        (0.23, 500),
-        (0.3, 600),
-        (0.4, 700),
-        (0.56, 800),
-        (0.62, 900),
-    ];
-    STOPS
-        .iter()
-        .min_by(|a, b| (a.0 - weight).abs().total_cmp(&(b.0 - weight).abs()))
-        .map_or(400, |stop| stop.1)
-}
-
-/// The inverse of [`weight_class`].
-fn weight_trait(class: u16) -> f64 {
-    match class {
-        0..=150 => -0.8,
-        151..=250 => -0.6,
-        251..=350 => -0.4,
-        351..=450 => 0.0,
-        451..=550 => 0.23,
-        551..=650 => 0.3,
-        651..=750 => 0.4,
-        751..=850 => 0.56,
-        _ => 0.62,
-    }
-}
-
-fn symbolic_traits(info: &FaceInfo) -> u32 {
-    let mut traits = 0;
-    if info.italic {
-        traits |= ITALIC_TRAIT;
-    }
-    if info.weight >= 600 {
-        traits |= BOLD_TRAIT;
-    }
-    if info.monospace {
-        traits |= MONOSPACE_TRAIT;
-    }
-    traits
-}
-
-/// Language codes for the scripts a face has glyphs for, which is what Qt
-/// decides a family's writing systems from.
-fn languages(face: &LoadedFace) -> Vec<&'static str> {
-    const SAMPLES: [(char, &str); 12] = [
-        ('a', "en"),
-        ('\u{0431}', "ru"),
-        ('\u{03b1}', "el"),
-        ('\u{05d0}', "he"),
-        ('\u{0639}', "ar"),
-        ('\u{0e01}', "th"),
-        ('\u{0915}', "hi"),
-        ('\u{4e2d}', "zh-Hans"),
-        ('\u{7e41}', "zh-Hant"),
-        ('\u{3042}', "ja"),
-        ('\u{d55c}', "ko"),
-        ('\u{1ea1}', "vi"),
-    ];
-    SAMPLES
-        .iter()
-        .filter(|(sample, _)| face.face().glyph_index(*sample).is_some())
-        .map(|(_, language)| *language)
-        .collect()
-}
-
-/// The attributes of `info` at `size`, as a font or descriptor.
-pub(crate) fn face_attributes(info: &FaceInfo, size: f64) -> CFTypeRef {
-    let mut owned = Vec::new();
-    let mut own = |object: CFTypeRef| {
-        owned.push(object);
-        object
-    };
-    let weight = own(collections::new_number(Number::Float(weight_trait(
-        info.weight,
-    ))));
-    let slant = own(collections::new_number(Number::Float(match info.italic {
-        true => 0.07,
-        false => 0.0,
-    })));
-    let symbolic = own(collections::new_number(Number::Integer(i64::from(
-        symbolic_traits(info),
-    ))));
-    let traits = own(new_dictionary(&[
-        (key("CTFontWeightTrait"), weight),
-        (key("CTFontSlantTrait"), slant),
-        (key("CTFontSymbolicTrait"), symbolic),
-    ]));
-    let postscript = match info.postscript.is_empty() {
-        true => format!(
-            "{}-{}",
-            info.family.replace(' ', ""),
-            info.style.replace(' ', "")
-        ),
-        false => info.postscript.clone(),
-    };
-    let language_list: Vec<CFTypeRef> = fonts::load(&info.path, info.index)
-        .map(|face| languages(&face).into_iter().map(string).collect())
-        .unwrap_or_default();
-    let languages = own(collections::new_array(&language_list, type_policy(), false));
-    for language in language_list {
-        release(language);
-    }
-    let pairs = [
-        (key("CTFontFamilyNameAttribute"), own(string(&info.family))),
-        (key("CTFontStyleNameAttribute"), own(string(&info.style))),
-        (key("CTFontNameAttribute"), own(string(&postscript))),
-        (
-            key("CTFontSizeAttribute"),
-            own(collections::new_number(Number::Float(size))),
-        ),
-        (key("CTFontTraitsAttribute"), traits),
-        (key("CTFontLanguagesAttribute"), languages),
-        (
-            key("CTFontURLAttribute"),
-            own(corefoundation::url::new_file_url(&info.path, false)),
-        ),
-        (key(PATH_KEY), own(string(&info.path))),
-        (
-            key(INDEX_KEY),
-            own(collections::new_number(Number::Integer(i64::from(
-                info.index,
-            )))),
-        ),
-    ];
-    let font = new_dictionary(&pairs);
-    for object in owned {
-        release(object);
-    }
-    font
-}
-
-/// The face a descriptor names: its own file where it has been resolved, and
-/// otherwise the best match for its family, weight and slant.
-fn resolve(descriptor: CFTypeRef) -> Option<FaceInfo> {
-    if let Some(path) = get_string(descriptor, PATH_KEY) {
-        let index = get_number(descriptor, INDEX_KEY).unwrap_or(0.0) as u32;
-        let family = get_string(descriptor, "CTFontFamilyNameAttribute").unwrap_or_default();
-        let style = get_string(descriptor, "CTFontStyleNameAttribute").unwrap_or_default();
-        if let Some(found) = fonts::all_faces()
-            .into_iter()
-            .find(|face| face.path == path && face.index == index)
-        {
-            return Some(found);
-        }
-        return Some(FaceInfo {
-            family,
-            style,
-            postscript: String::new(),
-            path,
-            index,
-            weight: 400,
-            italic: false,
-            monospace: false,
-        });
-    }
-    let traits = get(descriptor, "CTFontTraitsAttribute");
-    let weight = get_number(traits, "CTFontWeightTrait").map_or(400, weight_class);
-    let symbolic = get_number(traits, "CTFontSymbolicTrait").unwrap_or(0.0) as u32;
-    let slant = get_number(traits, "CTFontSlantTrait").unwrap_or(0.0);
-    let weight = match symbolic & BOLD_TRAIT != 0 {
-        true => weight.max(700),
-        false => weight,
-    };
-    let italic = symbolic & ITALIC_TRAIT != 0 || slant > 0.0;
-    let family = get_string(descriptor, "CTFontFamilyNameAttribute")
-        .or_else(|| get_string(descriptor, "CTFontNameAttribute"))
-        .unwrap_or_default();
-    let style = get_string(descriptor, "CTFontStyleNameAttribute");
-    if let Some(style) = style {
-        if let Some(face) = fonts::all_faces().into_iter().find(|face| {
-            face.family.eq_ignore_ascii_case(&family) && face.style.eq_ignore_ascii_case(&style)
-        }) {
-            return Some(face);
-        }
-    }
-    fonts::resolve(&family, weight, italic)
-}
-
-/// A font for `descriptor` at `size`, keeping every attribute the descriptor
-/// had that the face does not replace.
-fn make_font(descriptor: CFTypeRef, size: f64) -> CFTypeRef {
-    let size = match size > 0.0 {
-        true => size,
-        false => get_number(descriptor, "CTFontSizeAttribute")
-            .filter(|size| *size > 0.0)
-            .unwrap_or(DEFAULT_SIZE),
-    };
-    let Some(info) = resolve(descriptor) else {
-        // No face at all: the descriptor with its size, so that the font
-        // still answers its names.
-        let size = collections::new_number(Number::Float(size));
-        let overrides = new_dictionary(&[(key("CTFontSizeAttribute"), size)]);
-        let font = merged_attributes(descriptor, overrides);
-        release(overrides);
-        release(size);
-        return font;
-    };
-    let resolved = face_attributes(&info, size);
-    let font = merged_attributes(descriptor, resolved);
-    release(resolved);
-    font
-}
-
-/// Copy `base`'s attributes with `overrides` layered on top.
-fn merged_attributes(base: CFTypeRef, overrides: CFTypeRef) -> CFTypeRef {
-    let mut pairs = Vec::new();
-    for object in [base, overrides] {
-        // SAFETY: null, or a dictionary a guest received from this runtime.
-        if let Some(contents) = unsafe { collections::dictionary(object) } {
-            pairs.extend(contents.entries.iter().copied());
-        }
-    }
-    new_dictionary(&pairs)
-}
-
-pub(crate) fn loaded(font: CFTypeRef) -> Option<Arc<LoadedFace>> {
-    let path = get_string(font, PATH_KEY)?;
-    let index = get_number(font, INDEX_KEY).unwrap_or(0.0) as u32;
-    fonts::load(&path, index)
-}
-
-fn font_size(font: CFTypeRef) -> f64 {
-    get_number(font, "CTFontSizeAttribute").unwrap_or(0.0)
-}
-
-/// The face a font draws with and its size in points, for text AppKit draws
-/// itself.
-pub(crate) fn face_of(font: CFTypeRef) -> Option<(Arc<LoadedFace>, f64)> {
-    if font.is_null() {
-        return None;
-    }
-    Some((loaded(font)?, font_size(font)))
-}
-
-/// Points per font unit.
-fn scale(font: CFTypeRef, face: &LoadedFace) -> f64 {
-    font_size(font) / f64::from(face.face().units_per_em().max(1))
-}
-
 pub unsafe extern "C" fn CTFontCreateUIFontForLanguage(
     kind: u32,
     size: f64,
@@ -387,6 +91,34 @@ pub unsafe extern "C" fn CTFontCreateWithName(
     let font = make_font(descriptor, size);
     release(descriptor);
     font
+}
+
+/// `CTFontRef CTFontCreateWithPlatformFont(ATSFontRef, CGFloat, const
+/// CGAffineTransform *, CTFontDescriptorRef)`
+pub unsafe extern "C" fn CTFontCreateWithPlatformFont(
+    font: u32,
+    size: f64,
+    _matrix: *const c_void,
+    _attributes: CFTypeRef,
+) -> CFTypeRef {
+    let Some(face) = face_for(font) else {
+        return std::ptr::null();
+    };
+    face_attributes(&face, size)
+}
+
+/// `ATSFontRef CTFontGetPlatformFont(CTFontRef, CTFontDescriptorRef *)`
+pub unsafe extern "C" fn CTFontGetPlatformFont(font: CFTypeRef, attributes: *mut CFTypeRef) -> u32 {
+    if !attributes.is_null() {
+        // SAFETY: writable, per the caller. The descriptor is optional.
+        unsafe { attributes.write(std::ptr::null()) };
+    }
+    reference_of(font)
+}
+
+/// `CFIndex CTFontGetGlyphCount(CTFontRef)`
+pub unsafe extern "C" fn CTFontGetGlyphCount(font: CFTypeRef) -> isize {
+    loaded(font).map_or(0, |face| face.face().number_of_glyphs() as isize)
 }
 
 pub unsafe extern "C" fn CTFontCopyFontDescriptor(font: CFTypeRef) -> CFTypeRef {
@@ -519,17 +251,17 @@ pub unsafe extern "C" fn CTFontGetUnderlineThickness(font: CFTypeRef) -> f64 {
     )
 }
 
-fn rect(left: f64, bottom: f64, right: f64, top: f64) -> NSRect {
-    NSRect {
-        origin: NSPoint { x: left, y: bottom },
-        size: NSSize {
+fn rect(left: f64, bottom: f64, right: f64, top: f64) -> CGRect {
+    CGRect {
+        origin: CGPoint { x: left, y: bottom },
+        size: CGSize {
             width: right - left,
             height: top - bottom,
         },
     }
 }
 
-pub unsafe extern "C" fn CTFontGetBoundingBox(font: CFTypeRef) -> NSRect {
+pub unsafe extern "C" fn CTFontGetBoundingBox(font: CFTypeRef) -> CGRect {
     match loaded(font) {
         Some(face) => {
             let s = scale(font, &face);
@@ -552,12 +284,12 @@ pub unsafe extern "C" fn CTFontGetBoundingRectsForGlyphs(
     font: CFTypeRef,
     _orientation: u32,
     glyphs: *const u16,
-    bounds: *mut NSRect,
+    bounds: *mut CGRect,
     count: isize,
-) -> NSRect {
+) -> CGRect {
     let count = count.max(0) as usize;
     let face = loaded(font);
-    let mut union: Option<NSRect> = None;
+    let mut union: Option<CGRect> = None;
     for at in 0..count {
         let glyph_rect = match (&face, glyphs.is_null()) {
             (Some(face), false) => {
@@ -566,7 +298,7 @@ pub unsafe extern "C" fn CTFontGetBoundingRectsForGlyphs(
                 let glyph = unsafe { *glyphs.add(at) };
                 face.face()
                     .glyph_bounding_box(owned_ttf_parser::GlyphId(glyph))
-                    .map_or(NSRect::default(), |b| {
+                    .map_or(CGRect::default(), |b| {
                         rect(
                             f64::from(b.x_min) * s,
                             f64::from(b.y_min) * s,
@@ -598,7 +330,7 @@ pub unsafe extern "C" fn CTFontGetAdvancesForGlyphs(
     font: CFTypeRef,
     _orientation: u32,
     glyphs: *const u16,
-    advances: *mut NSSize,
+    advances: *mut CGSize,
     count: isize,
 ) -> f64 {
     let count = count.max(0) as usize;
@@ -619,7 +351,7 @@ pub unsafe extern "C" fn CTFontGetAdvancesForGlyphs(
         };
         if !advances.is_null() {
             // SAFETY: the caller supplies `count` writable advances.
-            unsafe { advances.add(at).write(NSSize { width, height: 0.0 }) };
+            unsafe { advances.add(at).write(CGSize { width, height: 0.0 }) };
         }
         total += width;
     }
@@ -689,7 +421,7 @@ pub unsafe extern "C" fn CTFontGetGlyphsForCharacters(
 pub unsafe extern "C" fn CTFontDrawGlyphs(
     font: CFTypeRef,
     glyphs: *const u16,
-    positions: *const NSPoint,
+    positions: *const CGPoint,
     count: usize,
     context: CFTypeRef,
 ) {
@@ -707,31 +439,31 @@ pub unsafe extern "C" fn CTFontDrawGlyphs(
         )
     };
     let positions: Vec<(f64, f64)> = positions.iter().map(|p| (p.x, p.y)).collect();
-    crate::quartz::draw_glyphs(context, &face, font_size(font), glyphs, &positions);
+    coregraphics::quartz::draw_glyphs(context, &face, font_size(font), glyphs, &positions);
 }
 
 pub unsafe extern "C" fn CTFontCreatePathForGlyph(
     font: CFTypeRef,
     glyph: u16,
-    transform: *const crate::cgcontext::CGAffineTransform,
+    transform: *const coregraphics::cgcontext::CGAffineTransform,
 ) -> CFTypeRef {
     let Some(face) = loaded(font) else {
         return std::ptr::null();
     };
     let s = scale(font, &face);
-    let to_font = crate::cgcontext::CGAffineTransform {
+    let to_font = coregraphics::cgcontext::CGAffineTransform {
         a: s,
         d: s,
-        ..crate::cgcontext::IDENTITY
+        ..coregraphics::CGAffineTransformIdentity
     };
     let m = match transform.is_null() {
         true => to_font,
         // SAFETY: the caller's transform.
         false => to_font.then(unsafe { *transform }),
     };
-    let mut outline = crate::cgpath::Elements::default();
-    crate::cgpath::glyph_outline(face.face(), glyph, m, &mut outline);
-    crate::cgpath::path_from(outline)
+    let mut outline = coregraphics::cgpath::Elements::default();
+    coregraphics::cgpath::glyph_outline(face.face(), glyph, m, &mut outline);
+    coregraphics::cgpath::path_from(outline).cast()
 }
 
 pub unsafe extern "C" fn CTFontDescriptorCopyAttribute(
@@ -803,8 +535,8 @@ pub unsafe extern "C" fn CTFontDescriptorCreateMatchingFontDescriptors(
     if descriptor.is_null() {
         return std::ptr::null();
     }
-    if get(descriptor, PATH_KEY).is_null() {
-        if let Some(family) = get_string(descriptor, "CTFontFamilyNameAttribute") {
+    if get(descriptor, PATH_KEY).is_null()
+        && let Some(family) = get_string(descriptor, "CTFontFamilyNameAttribute") {
             let style = get_string(descriptor, "CTFontStyleNameAttribute");
             let faces: Vec<CFTypeRef> = fonts::all_faces()
                 .iter()
@@ -823,7 +555,6 @@ pub unsafe extern "C" fn CTFontDescriptorCreateMatchingFontDescriptors(
             faces.into_iter().for_each(release);
             return array;
         }
-    }
     let matching =
         unsafe { CTFontDescriptorCreateMatchingFontDescriptor(descriptor, std::ptr::null()) };
     let array = collections::new_array(&[matching], type_policy(), false);
@@ -984,29 +715,6 @@ pub unsafe extern "C" fn CTFontManagerCreateFontDescriptorsFromURL(url: CFTypeRe
     descriptors_for(&fonts::register_file(&path.to_string_lossy()))
 }
 
-/// Write a font held in memory where the face database can read it, named by
-/// its contents so the same font is written once. The path, or `None` when it
-/// cannot be written.
-pub(crate) fn spill_font(bytes: &[u8]) -> Option<String> {
-    use std::hash::{Hash, Hasher};
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    bytes.hash(&mut hasher);
-    let directory = std::env::temp_dir().join("rosemary-fonts");
-    let _ = std::fs::create_dir_all(&directory);
-    let path = directory.join(format!("{:016x}.ttf", hasher.finish()));
-    if !path.exists() && std::fs::write(&path, bytes).is_err() {
-        return None;
-    }
-    Some(path.to_string_lossy().into_owned())
-}
-
-/// The file and face index a font draws with.
-pub(crate) fn face_location(font: CFTypeRef) -> Option<(String, u32)> {
-    let path = get_string(font, PATH_KEY)?;
-    let index = get_number(font, INDEX_KEY).unwrap_or(0.0) as u32;
-    Some((path, index))
-}
-
 /// As [`CTFontManagerCreateFontDescriptorsFromURL`], for font bytes in memory,
 /// which are written to a file so that they load like every other face.
 pub unsafe extern "C" fn CTFontManagerCreateFontDescriptorFromData(data: CFTypeRef) -> CFTypeRef {
@@ -1028,6 +736,9 @@ exports::exports! {
     functions {
         "CTFontCreateUIFontForLanguage" => CTFontCreateUIFontForLanguage,
         "CTFontCreateWithName" => CTFontCreateWithName,
+        "CTFontCreateWithPlatformFont" => CTFontCreateWithPlatformFont,
+        "CTFontGetPlatformFont" => CTFontGetPlatformFont,
+        "CTFontGetGlyphCount" => CTFontGetGlyphCount,
         "CTFontCopyFontDescriptor" => CTFontCopyFontDescriptor,
         "CTFontCopyGraphicsFont" => CTFontCopyGraphicsFont,
         "CTFontCopyName" => CTFontCopyName,
@@ -1077,15 +788,28 @@ pub fn data_symbols() -> Vec<(String, u64)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use coregraphics::font_attributes::{weight_class, weight_trait};
 
     /// The host's default sans-serif font, or `None` on a host with no
     /// fontconfig, where these tests have nothing to read.
     fn default_font(size: f64) -> Option<CFTypeRef> {
-        crate::bootstrap();
+        coregraphics::bootstrap();
         fonts::default_family(false)?;
         // SAFETY: a null language is documented.
         let font = unsafe { CTFontCreateUIFontForLanguage(0, size, std::ptr::null()) };
         loaded(font).is_some().then_some(font)
+    }
+
+    #[test]
+    fn the_framework_publishes_its_font_calls() {
+        let names = names();
+        for name in [
+            "CTFontCreateWithName",
+            "CTFontDrawGlyphs",
+            "CTFontCreatePathForGlyph",
+        ] {
+            assert!(names.contains(&name), "{name}");
+        }
     }
 
     #[test]
@@ -1129,10 +853,10 @@ mod tests {
                 1
             );
             assert_ne!(glyph[0], u16::from(b'H'));
-            let mut advance = NSSize::default();
+            let mut advance = CGSize::default();
             CTFontGetAdvancesForGlyphs(font, 0, glyph.as_ptr(), &mut advance, 1);
             assert!(advance.width > 5.0);
-            let context = crate::cgcontext::CGBitmapContextCreate(
+            let context = coregraphics::cgbitmap::CGBitmapContextCreate(
                 pixels.as_mut_ptr().cast(),
                 32,
                 32,
@@ -1141,8 +865,8 @@ mod tests {
                 std::ptr::null(),
                 7,
             );
-            crate::cgcontext::CGContextSetGrayFillColor(context, 1.0, 1.0);
-            let origin = NSPoint { x: 4.0, y: 6.0 };
+            coregraphics::cgcontext::CGContextSetGrayFillColor(context, 1.0, 1.0);
+            let origin = CGPoint { x: 4.0, y: 6.0 };
             CTFontDrawGlyphs(font, glyph.as_ptr(), &origin, 1, context);
             release(context);
             release(font);
@@ -1153,7 +877,7 @@ mod tests {
 
     #[test]
     fn descriptor_copy_overrides_original_attributes() {
-        crate::bootstrap();
+        coregraphics::bootstrap();
         let name = string("Fira Mono");
         // SAFETY: all arguments are live Core Foundation objects.
         unsafe {

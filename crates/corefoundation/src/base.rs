@@ -1,5 +1,7 @@
 use std::ffi::c_void;
 
+use core::sync::atomic::AtomicU64;
+
 use objc::class::Class;
 use objc::object::Id;
 
@@ -13,6 +15,15 @@ pub type CFIndex = isize;
 /// is the same thing said more directly - `CFGetTypeID(x) == CFStringGetTypeID()`
 /// asks whether `x` is a string, and the class answers that exactly.
 pub type CFTypeID = usize;
+
+#[repr(C)]
+pub struct CFRuntimeBase {
+    /// Must point at the `__NSCFType` class from your objc crate so that
+    /// `objc_retain`/`objc_release` and `-isEqual:` work on CG objects.
+    pub isa: CFTypeRef,
+    /// Shim encoding: low 32 bits = type ID, high 32 bits = retain count.
+    pub info: AtomicU64,
+}
 
 /// The type ID of `class`.
 pub fn type_id(class: &'static Class) -> CFTypeID {

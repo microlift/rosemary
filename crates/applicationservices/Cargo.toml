@@ -7,4 +7,7 @@ license.workspace = true
 
 [dependencies]
 exports.workspace = true
-appkit.workspace = true
+corefoundation.workspace = true
+coregraphics.workspace = true
+foundation.workspace = true
+owned_ttf_parser.workspace = true

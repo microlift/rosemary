@@ -28,6 +28,8 @@ audiotoolbox = { path = "crates/audiotoolbox" }
 corevideo = { path = "crates/corevideo" }
 iosurface = { path = "crates/iosurface" }
 coreaudio = { path = "crates/coreaudio" }
+coregraphics = { path = "crates/coregraphics" }
+coretext = { path = "crates/coretext" }
 contacts = { path = "crates/contacts" }
 avfoundation = { path = "crates/avfoundation" }
 security = { path = "crates/security" }
@@ -46,14 +48,28 @@ backtrace = "0.3"
 gimli = "0.34"
 getrandom = "0.3"
 rustls-pki-types = "1"
-webpki = { package = "rustls-webpki", version = "0.103", default-features = false, features = ["ring", "std"] }
+webpki = { package = "rustls-webpki", version = "0.103", default-features = false, features = [
+    "ring",
+    "std",
+] }
 webpki-roots = "1"
-ureq = { version = "3", default-features = false, features = ["rustls", "gzip", "cookies"] }
+ureq = { version = "3", default-features = false, features = [
+    "rustls",
+    "gzip",
+    "cookies",
+] }
 static_init = "1.0.4"
 owned_ttf_parser = "0.25"
-tiny-skia = { version = "0.11.4", default-features = false, features = ["std", "simd"] }
+tiny-skia = { version = "0.11.4", default-features = false, features = [
+    "std",
+    "simd",
+] }
 ab_glyph_rasterizer = "0.1.9"
-rust-fontconfig = { version = "5.0.1", default-features = false, features = ["std", "parsing", "multithreading"] }
+rust-fontconfig = { version = "5.0.1", default-features = false, features = [
+    "std",
+    "parsing",
+    "multithreading",
+] }
 llvm-bitcode = "0.4.0"
 rspirv = "0.13.0"
 sha2 = "0.11.0"
@@ -67,6 +83,7 @@ des = "0.9.0"
 rc2 = "0.9.0"
 rc4 = "0.2.0"
 rustix = { version = "1.1.5", features = ["time", "thread", "process", "net"] }
+i_overlay = "9.1"
 
 # mimalloc with a fork gate and a block check, which darwin's malloc needs for
 # libmalloc's guarantees. See third_party/libmimalloc-sys/ROSEMARY.md.

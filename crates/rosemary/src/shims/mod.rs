@@ -121,6 +121,7 @@ fn macos_shim_for(_name: &str) -> Option<Shim> {
 fn callback_shim_for(name: &str) -> Option<CallbackShim> {
     corefoundation::shim_for(name)
         .or_else(|| audiounit::shim_for(name))
+        .or_else(|| coregraphics::callback_shim_for(name))
         .or_else(|| macos_callback_shim_for(name))
 }
 
