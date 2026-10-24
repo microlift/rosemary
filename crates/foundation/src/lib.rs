@@ -40,6 +40,7 @@ pub mod predicate;
 mod serialization;
 mod sort;
 mod transformer;
+mod uuid;
 pub use corefoundation::plist;
 pub mod pool;
 pub mod processinfo;
@@ -83,6 +84,7 @@ pub fn bootstrap() {
         predicate::install();
         sort::install();
         serialization::install();
+        uuid::install();
         runtime::install();
         signature::install();
         notification::install();
@@ -279,6 +281,7 @@ pub const CLASSES: &[&str] = &[
     "NSCompoundPredicate",
     "NSSortDescriptor",
     "NSPropertyListSerialization",
+    "NSUUID",
     "NSProxy",
     "NSValueTransformer",
     "NSURLProtocol",
