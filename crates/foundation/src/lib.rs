@@ -37,6 +37,7 @@ pub mod objectify;
 pub mod operation;
 pub mod paths;
 pub mod predicate;
+mod sort;
 mod transformer;
 pub use corefoundation::plist;
 pub mod pool;
@@ -79,6 +80,7 @@ pub fn bootstrap() {
         kvc::install();
         kvo::install();
         predicate::install();
+        sort::install();
         runtime::install();
         signature::install();
         notification::install();
@@ -273,6 +275,7 @@ pub const CLASSES: &[&str] = &[
     "NSDecimalNumberHandler",
     "NSPredicate",
     "NSCompoundPredicate",
+    "NSSortDescriptor",
     "NSProxy",
     "NSValueTransformer",
     "NSURLProtocol",
