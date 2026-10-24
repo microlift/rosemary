@@ -756,15 +756,29 @@ static MAIN: Mutex<Option<Arc<RunLoop>>> = Mutex::new(None);
 /// "First caller" is not the main thread: Unity's joystick thread asks for its
 /// own loop before the main thread does, and main-loop timers then fired there.
 pub fn current() -> Arc<RunLoop> {
-    CURRENT.with(|cell| {
-        Arc::clone(cell.get_or_init(|| {
-            // SAFETY: no arguments; answers from thread ids.
-            match unsafe { darwin::pthread::main_np() } != 0 {
+    // SAFETY: no arguments; answers from thread ids.
+    let on_main = || unsafe { darwin::pthread::main_np() } != 0;
+    CURRENT
+        .try_with(|cell| {
+            Arc::clone(cell.get_or_init(|| match on_main() {
                 true => main(),
                 false => fresh(),
+            }))
+        })
+        .unwrap_or_else(|_| {
+            // Asked from a destructor as the thread exits - a guest's `atexit`
+            // handler, say - when this thread's slot is already gone. The
+            // pointer the caller gets must stay valid, so a loop made now is
+            // kept for the rest of the process.
+            match on_main() {
+                true => main(),
+                false => {
+                    let loop_ = fresh();
+                    std::mem::forget(Arc::clone(&loop_));
+                    loop_
+                }
             }
-        }))
-    })
+        })
 }
 
 /// The main thread's run loop, made if nothing has asked for it yet.
