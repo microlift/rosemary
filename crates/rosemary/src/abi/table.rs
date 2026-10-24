@@ -873,6 +873,15 @@ pub static SIGNATURES: &[FunctionAbi] = &[
     sig!("CGEventCreate", P, P),
     sig!("CGEventPost", V, U32, P),
     sig!("CGEventSetType", V, P, U32),
+    sig!("CGEventGetType", U32, P),
+    // `CGEventCreateKeyboardEvent(CGEventSourceRef, CGKeyCode, bool keyDown)`.
+    sig!("CGEventCreateKeyboardEvent", P, P, U16, BOOL),
+    // `CGEventFlags` is a `uint64_t` of modifier bits.
+    sig!("CGEventGetFlags", U64, P),
+    sig!("CGEventSetFlags", V, P, U64),
+    // `CGEventField` is a `uint32_t` enum; the value an `int64_t`.
+    sig!("CGEventGetIntegerValueField", I64, P, U32),
+    sig!("CGEventSetIntegerValueField", V, P, U32, I64),
     // The gamma ramp, read and written.
     sig!("CGGetDisplayTransferByTable", I32, U32, U32, P, P, P, P),
     sig!("CGSetDisplayTransferByTable", I32, U32, U32, P, P, P),

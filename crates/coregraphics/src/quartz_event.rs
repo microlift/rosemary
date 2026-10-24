@@ -23,6 +23,8 @@ mod kind {
     pub const OTHER_MOUSE_DOWN: u32 = 25;
     pub const OTHER_MOUSE_UP: u32 = 26;
     pub const OTHER_MOUSE_DRAGGED: u32 = 27;
+    pub const KEY_DOWN: u32 = 10;
+    pub const KEY_UP: u32 = 11;
 
     /// Whether posting this event means "put the pointer here".
     pub fn moves_the_pointer(kind: u32) -> bool {
@@ -74,6 +76,10 @@ struct Body {
     location: CGPoint,
     /// `CGEventType`.
     kind: u32,
+    /// `CGEventFlags`, which share their bits with `NSEventModifierFlags`.
+    flags: u64,
+    /// `kCGKeyboardEventKeycode`: the virtual key, for a keyboard event.
+    key_code: u16,
 }
 
 fn class() -> &'static Class {
@@ -99,6 +105,8 @@ fn new(location: CGPoint, kind: u32) -> CFTypeRef {
     unsafe {
         (*body).location = location;
         (*body).kind = kind;
+        (*body).flags = flags;
+        (*body).key_code = key_code;
     }
     body as CFTypeRef
 }
