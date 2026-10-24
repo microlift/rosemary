@@ -95,21 +95,34 @@ impl ThunkTable {
         self.by_host.is_empty()
     }
 
-    pub fn insert_typed(&mut self, signature: ThunkSignature, thunk: Thunk) -> u64 {
+    /// Add a typed thunk, unless one for the same guest and signature already exists.
+    ///
+    /// Returns the host address to hand out and whether `thunk` was the one kept. The
+    /// first thunk wins: its address may already be in host hands, so it must stay
+    /// mapped, and a racing duplicate that never left this table is the one dropped.
+    pub fn insert_typed(&mut self, signature: ThunkSignature, thunk: Thunk) -> (u64, bool) {
+        if let Some(existing) = self.typed_host_for(thunk.guest, &signature) {
+            return (existing, false);
+        }
         let (guest, host) = (thunk.guest, thunk.host);
         self.by_host.insert(host, guest);
         self.typed_by_guest
             .entry(guest)
             .or_default()
             .push((signature, thunk));
-        host
+        (host, true)
     }
 
-    pub fn insert(&mut self, thunk: Thunk) -> u64 {
+    /// Add a generic thunk, unless the guest address already has one. As for
+    /// [`ThunkTable::insert_typed`], the first thunk wins.
+    pub fn insert(&mut self, thunk: Thunk) -> (u64, bool) {
+        if let Some(existing) = self.host_for(thunk.guest) {
+            return (existing, false);
+        }
         let (guest, host) = (thunk.guest, thunk.host);
         self.by_host.insert(host, guest);
         self.by_guest.insert(guest, thunk);
-        host
+        (host, true)
     }
 
     /// A snapshot of both directions, for [`ThunkView`].
@@ -1175,7 +1188,7 @@ mod callback_abi_tests {
         .expect("native ABI supports the callback");
         let owned_descriptor = std::ptr::from_ref(thunk._signature.as_deref().unwrap());
         let mut table = ThunkTable::new();
-        let host = table.insert_typed(signature.clone(), thunk);
+        let (host, _) = table.insert_typed(signature.clone(), thunk);
         let stored = &table.typed_by_guest[&0x1234][0].1;
         assert_eq!(
             owned_descriptor,
@@ -1229,8 +1242,8 @@ mod callback_abi_tests {
         let typed = build_typed(0x1234, signature.clone()).unwrap();
         let generic = build(0x1234).unwrap();
         let mut table = ThunkTable::new();
-        let typed_host = table.insert_typed(signature.clone(), typed);
-        let generic_host = table.insert(generic);
+        let (typed_host, _) = table.insert_typed(signature.clone(), typed);
+        let (generic_host, _) = table.insert(generic);
         assert_ne!(typed_host, generic_host);
         assert_eq!(table.typed_host_for(0x1234, &signature), Some(typed_host));
         assert_eq!(table.host_for(0x1234), Some(generic_host));
@@ -1249,14 +1262,14 @@ mod callback_abi_tests {
         changed_params[3] = Shape::Scalar(T::SignedWord);
         let changed = ThunkSignature::new(changed_params, None).unwrap();
         let mut table = ThunkTable::new();
-        let first = table.insert_typed(
+        let (first, _) = table.insert_typed(
             original.clone(),
             build_typed(0x1234, original.clone()).unwrap(),
         );
         assert_eq!(table.typed_host_for(0x1234, &original), Some(first));
         assert_eq!(table.typed_host_for(0x1234, &original.clone()), Some(first));
         assert_eq!(table.typed_host_for(0x1234, &changed), None);
-        let second = table.insert_typed(
+        let (second, _) = table.insert_typed(
             changed.clone(),
             build_typed(0x1234, changed.clone()).unwrap(),
         );
@@ -1265,6 +1278,29 @@ mod callback_abi_tests {
         assert_eq!(table.guest_for(first), Some(0x1234));
         assert_eq!(table.guest_for(second), Some(0x1234));
         assert_eq!(table.len(), 2);
+    }
+
+    #[test]
+    fn a_racing_duplicate_thunk_does_not_replace_the_first() {
+        let signature = crate::shims::coremedia::decompression_output_signature();
+        let mut table = ThunkTable::new();
+        let (generic, kept) = table.insert(build(0x1234).unwrap());
+        assert!(kept);
+        let (again, kept) = table.insert(build(0x1234).unwrap());
+        assert!(!kept);
+        assert_eq!(again, generic);
+        let (typed, kept) = table.insert_typed(
+            signature.clone(),
+            build_typed(0x1234, signature.clone()).unwrap(),
+        );
+        assert!(kept);
+        let (again, kept) =
+            table.insert_typed(signature.clone(), build_typed(0x1234, signature).unwrap());
+        assert!(!kept);
+        assert_eq!(again, typed);
+        // Only the kept thunks are reachable from their host addresses.
+        assert_eq!(table.len(), 2);
+        assert_eq!(table.view().count, 2);
     }
 
     thread_local! {

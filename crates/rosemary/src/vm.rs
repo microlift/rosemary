@@ -1324,14 +1324,24 @@ impl Vm {
         signature: crate::thunk::ThunkSignature,
     ) -> Result<u64, VmError> {
         // A generic thunk is not ABI-compatible, and a guest address may be
-        // used with more than one callback prototype.
-        let mut table = self.thunks.write().unwrap_or_else(|e| e.into_inner());
-        if let Some(existing) = table.typed_host_for(guest_va, &signature) {
+        // used with more than one callback prototype. Typed thunks are not in
+        // the published view, but a read lock does not stall other readers.
+        let cached = self
+            .thunks
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .typed_host_for(guest_va, &signature);
+        if let Some(existing) = cached {
             return Ok(existing);
         }
+        // Compiled outside the lock; a thread that lost the race to insert
+        // drops its copy, which nothing has seen yet.
         let thunk = crate::thunk::build_typed(guest_va, signature.clone())?;
-        let host = table.insert_typed(signature, thunk);
-        self.publish_thunk_view(&table);
+        let mut table = self.thunks.write().unwrap_or_else(|e| e.into_inner());
+        let (host, kept) = table.insert_typed(signature, thunk);
+        if kept {
+            self.publish_thunk_view(&table);
+        }
         drop(table);
         // As in `thunk_for`: handing the pointer out is the demand signal.
         let _ = self.cache.get_or_lift(&self.program, guest_va);
@@ -1342,6 +1352,8 @@ impl Vm {
         if let Some(existing) = self.host_thunk_for(guest_va) {
             return Ok(existing);
         }
+        // As for typed thunks: built outside the lock, and the first one
+        // inserted is the one every caller gets.
         let thunk = crate::thunk::build(guest_va)?;
         let host = self.insert_thunk(thunk);
 
@@ -1400,8 +1412,10 @@ impl Vm {
     /// Add a thunk and republish the snapshot, both under the one lock.
     fn insert_thunk(&self, thunk: crate::thunk::Thunk) -> u64 {
         let mut table = self.thunks.write().unwrap_or_else(|e| e.into_inner());
-        let host = table.insert(thunk);
-        self.publish_thunk_view(&table);
+        let (host, kept) = table.insert(thunk);
+        if kept {
+            self.publish_thunk_view(&table);
+        }
         host
     }
 
