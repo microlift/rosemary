@@ -34,6 +34,44 @@ unsafe extern "C" fn object_at_index(receiver: Id, _sel: Sel, index: usize) -> I
 }
 
 /// `-subarrayWithRange:`, or `NSRangeException` by name for a range past the end.
+/// A fresh array of the receiver's elements followed by `extra`, autoreleased.
+///
+/// # Safety
+///
+/// `receiver` is an array.
+unsafe fn array_adding(receiver: Id, extra: &[CFTypeRef]) -> Id {
+    // SAFETY: an array, by the caller.
+    let mut values = unsafe { collections::array(receiver as CFTypeRef) }
+        .map(|a| a.values.clone())
+        .unwrap_or_default();
+    values.extend_from_slice(extra);
+    // SAFETY: a fresh array holding live objects.
+    unsafe {
+        api::CFAutorelease(collections::new_array(
+            &values,
+            Policy::from_type_callbacks(),
+            false,
+        )) as Id
+    }
+}
+
+unsafe extern "C" fn array_by_adding_object(receiver: Id, _sel: Sel, object: Id) -> Id {
+    if object.is_null() {
+        objc::fail!("-[NSArray arrayByAddingObject:]: object cannot be nil");
+    }
+    // SAFETY: an array and a live object.
+    unsafe { array_adding(receiver, &[object as CFTypeRef]) }
+}
+
+unsafe extern "C" fn array_by_adding_objects(receiver: Id, _sel: Sel, other: Id) -> Id {
+    // SAFETY: an array, and an array or nil.
+    let extra = unsafe { collections::array(other as CFTypeRef) }
+        .map(|a| a.values.clone())
+        .unwrap_or_default();
+    // SAFETY: an array.
+    unsafe { array_adding(receiver, &extra) }
+}
+
 unsafe extern "C" fn subarray_with_range(
     receiver: Id,
     _sel: Sel,
@@ -2904,19 +2942,6 @@ pub(crate) fn install() {
         "new" => new_dictionary, c"@16@0:8";
         "dictionary" => dictionary, c"@16@0:8";
         "dictionaryWithCapacity:" => dictionary_with_capacity, c"@24@0:8Q16";
-    });
-
-    let predicate = corefoundation::base::register(
-        c"NSPredicate",
-        None,
-        std::mem::size_of::<Predicate>(),
-        false,
-    );
-    methods!(predicate, {
-        "dealloc" => predicate_dealloc, c"v16@0:8";
-    });
-    class_methods!(predicate, {
-        "predicateWithBlock:" => predicate_with_block, c"@24@0:8@?16";
     });
 
     let data = objc::class::lookup(c"NSData").expect("CoreFoundation registered NSData");
