@@ -474,8 +474,19 @@ unsafe extern "C" fn image_named(_class: Id, _sel: Sel, name: Id) -> Id {
         objc::arc::release(image);
         return std::ptr::null_mut();
     }
+    mark_template_by_name(image, &name);
     named.insert(name, image as usize);
     image
+}
+
+/// AppKit's convention for `+imageNamed:` and `-[NSBundle imageForResource:]`:
+/// a resource whose name ends in "Template" is a template image, which a
+/// program tints itself when it sees one.
+fn mark_template_by_name(image: Id, name: &str) {
+    let stem = name.rsplit_once('.').map_or(name, |(stem, _)| stem);
+    if stem.ends_with("Template") {
+        image_of(image).template = 1;
+    }
 }
 
 /// `-[NSBundle pathForImageResource:]` and `-URLForImageResource:`, AppKit
@@ -528,6 +539,11 @@ unsafe extern "C" fn image_for_resource(bundle: Id, _sel: Sel, name: Id) -> Id {
     let image = unsafe {
         init_with_contents_of_file(image, objc::sel::get("initWithContentsOfFile:"), path)
     };
+    if !image.is_null()
+        && let Ok(name) = String::from_utf8(unsafe { foundation::string::bytes(name) })
+    {
+        mark_template_by_name(image, &name);
+    }
     objc::arc::autorelease(image)
 }
 
