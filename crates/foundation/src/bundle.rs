@@ -1729,6 +1729,24 @@ pub(crate) mod class {
         path(unsafe { layout_of(receiver) }.map(|b| b.executable.clone()))
     }
 
+    /// `-pathForAuxiliaryExecutable:`: a file of that name beside the main
+    /// executable, or nil.
+    unsafe extern "C" fn path_for_auxiliary_executable(receiver: Id, _sel: Sel, name: Id) -> Id {
+        // SAFETY: an `NSString` or nil.
+        let name = unsafe { crate::string::bytes(name) };
+        let Ok(name) = std::str::from_utf8(&name) else {
+            return std::ptr::null_mut();
+        };
+        if name.is_empty() {
+            return std::ptr::null_mut();
+        }
+        // SAFETY: the receiver is an `NSBundle`.
+        path(unsafe { layout_of(receiver) }.and_then(|b| {
+            let candidate = b.executable.parent()?.join(name);
+            candidate.exists().then_some(candidate)
+        }))
+    }
+
     unsafe extern "C" fn private_frameworks_path(receiver: Id, _sel: Sel) -> Id {
         path(unsafe { layout_of(receiver) }.map(|b| b.frameworks.clone()))
     }
@@ -1830,6 +1848,7 @@ pub(crate) mod class {
             "executableURL" => executable_url, c"@16@0:8";
             "resourcePath" => resource_path, c"@16@0:8";
             "executablePath" => executable_path, c"@16@0:8";
+            "pathForAuxiliaryExecutable:" => path_for_auxiliary_executable, c"@24@0:8@16";
             "privateFrameworksPath" => private_frameworks_path, c"@16@0:8";
             "builtInPlugInsPath" => built_in_plug_ins_path, c"@16@0:8";
             "bundleIdentifier" => bundle_identifier, c"@16@0:8";
