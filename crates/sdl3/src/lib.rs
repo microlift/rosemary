@@ -4416,6 +4416,10 @@ pub mod video {
         let Some(window) = create_window(c"SDL cached Vulkan window", 160, 120, 0) else {
             return;
         };
+        // Another test thread may have claimed video since `may_pump`.
+        if !is_video_thread() {
+            return;
+        }
         let first = presentation_window(window).expect("video owner sampled window");
         assert_eq!(first.flags & flags::OPENGL, 0);
         let key = window as usize;
@@ -4455,6 +4459,10 @@ pub mod video {
         let Some(window) = create_window(c"SDL token lifetime", 64, 64, 0) else {
             return;
         };
+        // Another test thread may have claimed video since `may_pump`.
+        if !is_video_thread() {
+            return;
+        }
         let key = (window as usize, 0xfeedu64);
         vulkan::test_insert_ready_surface(window, key.1);
         let token = match vulkan::acquire_prepared_surface(window, key.1, None) {
@@ -4512,6 +4520,10 @@ pub mod video {
         let Some(window) = create_window(c"SDL threading metadata", 140, 90, 0) else {
             return;
         };
+        // Another test thread may have claimed video since `may_pump`.
+        if !is_video_thread() {
+            return;
+        }
         let original = presentation_window(window).expect("SDL owner snapshot");
         let key = window as usize;
         let count = WINDOW_SNAPSHOT_QUERIES.load(std::sync::atomic::Ordering::Relaxed);

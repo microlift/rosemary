@@ -2939,6 +2939,11 @@ fn a_fractional_metal_layer_samples_exactly_its_rounded_destination_edges() {
     {
         return;
     }
+    // Only the SDL video thread can build the presentation cache.
+    if !sdl3::video::is_video_thread() {
+        objc::arc::pool_pop(pool);
+        return;
+    }
     let sdl = unsafe { appkit::window::sdl_window(window) };
     let points = sdl3::video::window_size(sdl).unwrap();
     let physical = sdl3::video::window_size_in_pixels(sdl).unwrap();

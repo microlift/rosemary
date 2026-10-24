@@ -356,8 +356,15 @@ mod listing {
             wait.recv().unwrap();
         });
         let other_tid = rx.recv().unwrap();
+        // A pass may skip a live thread while others exit (the kernel resumes
+        // the listing by position), so list again as `suspend_task` does.
         let mut seen = Vec::new();
-        assert!(super::for_each_thread(&mut |tid| seen.push(tid)));
+        for _ in 0..8 {
+            assert!(super::for_each_thread(&mut |tid| seen.push(tid)));
+            if seen.contains(&other_tid) {
+                break;
+            }
+        }
         done.send(()).unwrap();
         other.join().unwrap();
         assert!(seen.contains(&rustix::thread::gettid().as_raw_nonzero().get()));

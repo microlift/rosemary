@@ -1637,10 +1637,19 @@ mod tests {
     fn what_a_turn_autoreleases_is_released_when_it_ends() {
         crate::bootstrap();
         static OBJECT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        thread_local! {
+            static PERFORMED: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+        }
 
+        // The main loop is shared with every other test in the process, so
+        // another test's turn may service the source; only this one counts.
         unsafe extern "C" fn perform(_info: *mut std::ffi::c_void) {
+            if PERFORMED.get().is_none() {
+                return;
+            }
             let object = OBJECT.load(std::sync::atomic::Ordering::SeqCst) as Id;
             objc::arc::autorelease(objc::arc::retain(object));
+            PERFORMED.set(Some(true));
         }
 
         let app = objc::object::create_instance(
@@ -1653,11 +1662,16 @@ mod tests {
         let source = corefoundation::runloop::new_source(Some(perform), 0);
         let loop_ = corefoundation::runloop::main();
         loop_.add_source(&source, corefoundation::runloop::DEFAULT_MODE);
-        source.signal();
+        PERFORMED.set(Some(false));
 
         let outer = objc::arc::pool_push();
-        // SAFETY: `app` is an application.
-        unsafe { turn(app, corefoundation::runloop::DEFAULT_MODE) };
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while PERFORMED.get() != Some(true) && std::time::Instant::now() < deadline {
+            source.signal();
+            // SAFETY: `app` is an application.
+            unsafe { turn(app, corefoundation::runloop::DEFAULT_MODE) };
+        }
+        assert_eq!(PERFORMED.get(), Some(true), "the source never fired here");
         assert_eq!(objc::arc::retain_count(object), 1);
         objc::arc::pool_pop(outer);
         loop_.remove_source(&source, corefoundation::runloop::DEFAULT_MODE);

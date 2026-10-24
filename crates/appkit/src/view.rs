@@ -2764,6 +2764,10 @@ mod tests {
         if !made {
             return;
         }
+        // Only the SDL video thread can build the presentation cache.
+        if !sdl3::video::is_video_thread() {
+            return;
+        }
         let child = view(rect(0.0, 0.0, 0.0, 0.0));
         unsafe { set_window(child, window) };
         let sdl = unsafe { crate::window::sdl_window(window) };
