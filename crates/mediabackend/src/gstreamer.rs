@@ -15,6 +15,8 @@ use gst_video::prelude::*;
 use gst_video::video_frame::VideoBufferExt;
 
 const INPUT_QUEUE_LIMIT: u64 = 8 * 1024 * 1024;
+// appsink depth; submit reports Backpressure before the sink would block.
+const OUTPUT_QUEUE_LIMIT: u64 = 32;
 // Each initial SPS/PPS contributes a four-byte start code. Leave at least
 // one start code and one NAL header for the first submitted access unit.
 const MAX_INITIAL_PARAMETER_BYTES: usize = INPUT_QUEUE_LIMIT as usize - 5;
@@ -783,11 +785,11 @@ impl Decoder {
         // GstReferenceTimestampMeta survives this tested software pipeline;
         // replacing any element requires re-running the identity regressions.
         let pipeline = gst::parse::launch(&format!(
-            "appsrc name=rosemary_input format=time is-live=false block=false max-bytes=8388608 \
+            "appsrc name=rosemary_input format=time is-live=false block=false max-bytes={INPUT_QUEUE_LIMIT} \
              caps=\"{input_caps}\" \
              ! h264parse ! avdec_h264 name=rosemary_decoder max-threads={threads} output-corrupt=false discard-corrupted-frames=true \
              ! videoconvert ! video/x-raw,format=(string){output_caps} \
-             ! appsink name=rosemary_output sync=false max-buffers=32 drop=false"
+             ! appsink name=rosemary_output sync=false max-buffers={OUTPUT_QUEUE_LIMIT} drop=false"
         ))
         .map_err(|e| Error::BackendUnavailable(e.to_string()))?
         .downcast::<gst::Pipeline>()
@@ -1079,7 +1081,7 @@ impl VideoDecoder for Decoder {
         // GStreamer is asynchronous. Never block the guest's decode thread
         // while an appsink queue could itself be awaiting that same thread.
         // Return a recoverable signal without consuming the input instead.
-        if self.output.current_level_buffers() >= 32
+        if self.output.current_level_buffers() >= OUTPUT_QUEUE_LIMIT
             || self
                 .input
                 .current_level_bytes()
