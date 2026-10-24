@@ -281,9 +281,15 @@ impl Registry {
             .collect()
     }
 
+    /// Drop the applications that have quit. A zombie counts as quit here:
+    /// it is the same process until collected, but it can never be handed a
+    /// launch, and its parent may take a while to collect it.
     fn prune_applications(&mut self) {
-        self.applications
-            .retain(|app| host::alive(app.application.pid, &app.identity));
+        self.applications.retain(|app| {
+            let pid = app.application.pid;
+            host::alive(pid, &app.identity)
+                && host::process(pid).is_none_or(|p| p.state != host::State::Zombie)
+        });
     }
 
     pub fn is_guest(&mut self, pid: i32) -> bool {
@@ -529,6 +535,23 @@ mod tests {
         assert_eq!(launch(&mut registry, a(first), Launch::Open), None);
         assert_eq!(launch(&mut registry, a(second), Launch::Open), Some(first));
         assert_eq!(registry.applications(None).len(), 1);
+    }
+
+    #[test]
+    fn a_launch_is_not_handed_to_an_instance_that_has_quit() {
+        let mut child = std::process::Command::new("true").spawn().unwrap();
+        let quit = child.id() as i32;
+        let identity = host::identity(quit).unwrap();
+        let mut registry = Registry::new();
+        let a = |pid| app(pid, "/Applications/A.app", "com.example.a", false);
+        assert_eq!(registry.launch(a(quit), Launch::Open, identity), None);
+        // Not collected yet: a zombie until the wait below.
+        while host::process(quit).is_some_and(|p| p.state != host::State::Zombie) {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert_eq!(launch(&mut registry, a(me()), Launch::Open), None);
+        assert_eq!(registry.applications(None).len(), 1);
+        child.wait().unwrap();
     }
 
     #[test]
