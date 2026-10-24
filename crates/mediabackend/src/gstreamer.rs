@@ -8,6 +8,7 @@ use std::time::Duration;
 
 use gst::prelude::*;
 use gst_app::{AppSink, AppSrc};
+use gst_video::video_frame::VideoBufferExt;
 
 const INPUT_QUEUE_LIMIT: u64 = 8 * 1024 * 1024;
 
@@ -26,12 +27,95 @@ pub struct Decoder {
     output_format: PixelFormat,
     avcc: Option<AvccConfiguration>,
     pending_pps: Option<Vec<u8>>,
+    avcc_annexb_fallback: bool,
+    initial_annexb_sets_pending: bool,
 }
 
 struct AvccConfiguration {
     sps: Vec<Vec<u8>>,
     pps: Vec<Vec<u8>>,
     nal_length: u8,
+    high_profile: Option<AvccHighProfile>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct AvccHighProfile {
+    chroma_format: u8,
+    bit_depth_luma_minus8: u8,
+    bit_depth_chroma_minus8: u8,
+}
+
+// Read only the fields needed by ISO/IEC 14496-15's high-profile avcC
+// extension. Do not guess chroma format or bit depth from profile_idc.
+fn avcc_sps_profile(sps: &[u8]) -> Result<Option<AvccHighProfile>, Error> {
+    if sps.len() < 5 || sps[0] & 31 != 7 {
+        return Err(Error::InvalidInput(
+            "invalid AVC sequence parameter set".into(),
+        ));
+    }
+    let mut rbsp = Vec::with_capacity(sps.len());
+    let mut zero_count = 0;
+    for &byte in &sps[1..] {
+        if zero_count == 2 && byte == 3 {
+            zero_count = 0;
+            continue;
+        }
+        rbsp.push(byte);
+        zero_count = if byte == 0 { zero_count + 1 } else { 0 };
+    }
+    fn bits(data: &[u8], pos: &mut usize, width: usize) -> Option<u32> {
+        if width > 32 || pos.checked_add(width)? > data.len() * 8 {
+            return None;
+        }
+        let mut value = 0;
+        for _ in 0..width {
+            value = (value << 1) | u32::from(data[*pos / 8] >> (7 - *pos % 8) & 1);
+            *pos += 1;
+        }
+        Some(value)
+    }
+    fn ue(data: &[u8], pos: &mut usize) -> Option<u32> {
+        let mut zeroes = 0;
+        while bits(data, pos, 1)? == 0 {
+            zeroes += 1;
+            if zeroes > 31 {
+                return None;
+            }
+        }
+        Some(((1_u64 << zeroes) - 1 + u64::from(bits(data, pos, zeroes)?)) as u32)
+    }
+    let mut pos = 24; // profile_idc, constraint flags, level_idc
+    let sps_id =
+        ue(&rbsp, &mut pos).ok_or_else(|| Error::InvalidInput("truncated AVC SPS ID".into()))?;
+    if sps_id > 31 {
+        return Err(Error::InvalidInput("invalid AVC SPS ID".into()));
+    }
+    if !matches!(sps[1], 100 | 110 | 122 | 144) {
+        if matches!(sps[1], 66 | 77 | 88) {
+            return Ok(None);
+        }
+        return Err(Error::InvalidInput("unsupported AVC profile".into()));
+    }
+    let read = || Error::InvalidInput("truncated AVC high-profile SPS".into());
+    let chroma_format = ue(&rbsp, &mut pos).ok_or_else(read)?;
+    if chroma_format > 3 {
+        return Err(Error::InvalidInput("invalid AVC chroma format".into()));
+    }
+    if chroma_format == 3 && bits(&rbsp, &mut pos, 1).ok_or_else(read)? != 0 {
+        return Err(Error::InvalidInput(
+            "separate-colour-plane AVC SPS not supported".into(),
+        ));
+    }
+    let luma_depth = ue(&rbsp, &mut pos).ok_or_else(read)?;
+    let chroma_depth = ue(&rbsp, &mut pos).ok_or_else(read)?;
+    if luma_depth > 6 || chroma_depth > 6 {
+        return Err(Error::InvalidInput("invalid AVC bit depth".into()));
+    }
+    Ok(Some(AvccHighProfile {
+        chroma_format: chroma_format as u8,
+        bit_depth_luma_minus8: luma_depth as u8,
+        bit_depth_chroma_minus8: chroma_depth as u8,
+    }))
 }
 
 impl AvccConfiguration {
@@ -42,12 +126,9 @@ impl AvccConfiguration {
         let mut sps = Vec::new();
         let mut pps = Vec::new();
         for &set in sets {
-            let max_len = if nal_length == 1 {
-                u8::MAX as usize
-            } else {
-                u16::MAX as usize
-            };
-            if set.first().is_none_or(|b| b & 0x80 != 0) || set.len() > max_len {
+            // avcC parameter-set lengths are always u16; sample NAL prefixes
+            // use the independently negotiated nal_length width.
+            if set.first().is_none_or(|b| b & 0x80 != 0) || set.len() > u16::MAX as usize {
                 return Err(Error::InvalidInput("malformed AVCC parameter set".into()));
             }
             match set[0] & 31 {
@@ -59,10 +140,19 @@ impl AvccConfiguration {
         if sps.is_empty() || sps.len() > 31 || pps.is_empty() || pps.len() > 255 {
             return Err(Error::InvalidInput("AVCC requires SPS/PPS".into()));
         }
+        let high_profile = avcc_sps_profile(&sps[0])?;
+        for other in sps.iter().skip(1) {
+            if other[1] != sps[0][1] || avcc_sps_profile(other)? != high_profile {
+                return Err(Error::InvalidInput(
+                    "conflicting AVC SPS profiles or format parameters".into(),
+                ));
+            }
+        }
         Ok(Self {
             sps,
             pps,
             nal_length,
+            high_profile,
         })
     }
 
@@ -83,6 +173,14 @@ impl AvccConfiguration {
         for set in &self.pps {
             avcc.extend_from_slice(&(set.len() as u16).to_be_bytes());
             avcc.extend_from_slice(set);
+        }
+        if let Some(high) = self.high_profile {
+            avcc.extend_from_slice(&[
+                0xfc | high.chroma_format,
+                0xf8 | high.bit_depth_luma_minus8,
+                0xf8 | high.bit_depth_chroma_minus8,
+                0, // no sequence parameter set extensions were supplied
+            ]);
         }
         let hex = avcc
             .iter()
@@ -179,6 +277,79 @@ fn validate_planes(layout: &FrameLayout, size: usize) -> Result<(), Error> {
     Ok(())
 }
 
+// Frame presentation is determined by each decoded buffer, not only caps.
+// MIXED requires per-picture telecine reconstruction; FIELDS requires
+// multiple field-specific GstVideoMeta entries, neither exposed by this API.
+fn frame_fields(
+    mode: gst_video::VideoInterlaceMode,
+    flags: gst_video::VideoBufferFlags,
+) -> Result<(FrameInterlaceMode, FrameFieldOrder, bool, bool), Error> {
+    use gst_video::{VideoBufferFlags as F, VideoInterlaceMode as M};
+    match mode {
+        M::Progressive => Ok((
+            FrameInterlaceMode::Progressive,
+            FrameFieldOrder::Unknown,
+            false,
+            false,
+        )),
+        M::Interleaved => Ok((
+            FrameInterlaceMode::Interleaved,
+            if flags.contains(F::TFF) {
+                FrameFieldOrder::TopFirst
+            } else {
+                FrameFieldOrder::BottomFirst
+            },
+            flags.contains(F::RFF),
+            flags.contains(F::ONEFIELD),
+        )),
+        other => Err(Error::Decode(format!(
+            "unsupported decoded interlace mode {other:?}"
+        ))),
+    }
+}
+
+// Some GStreamer avcC parsers reject parameter sets exceeding 255 bytes even
+// though the record encodes them with u16 lengths. Feed only those sessions
+// through byte-stream caps; ordinary AVCC input remains zero-conversion.
+fn avcc_to_annexb(packet: &[u8], nal_length: u8, out: &mut Vec<u8>) -> Result<(), Error> {
+    let width = nal_length as usize;
+    let mut cursor = 0;
+    while cursor < packet.len() {
+        if packet.len() - cursor < width {
+            return Err(Error::InvalidInput(
+                "truncated AVC NAL-length prefix".into(),
+            ));
+        }
+        let mut size = 0usize;
+        for &byte in &packet[cursor..cursor + width] {
+            size = (size << 8) | usize::from(byte);
+        }
+        cursor += width;
+        if size == 0 || packet.len() - cursor < size || packet[cursor] & 0x80 != 0 {
+            return Err(Error::InvalidInput(
+                "invalid AVC NAL unit length or header".into(),
+            ));
+        }
+        if out
+            .len()
+            .checked_add(4)
+            .and_then(|n| n.checked_add(size))
+            .is_none_or(|n| n as u64 > INPUT_QUEUE_LIMIT)
+        {
+            return Err(Error::InvalidInput(
+                "expanded AVC packet exceeds queue limit".into(),
+            ));
+        }
+        out.extend_from_slice(&[0, 0, 0, 1]);
+        out.extend_from_slice(&packet[cursor..cursor + size]);
+        cursor += size;
+    }
+    if cursor == 0 {
+        return Err(Error::InvalidInput("empty AVC access unit".into()));
+    }
+    Ok(())
+}
+
 impl Decoder {
     /// Requires GStreamer's appsrc, h264parse, avdec_h264, videoconvert and
     /// appsink plugins at runtime. Never silently select another decoder or
@@ -208,8 +379,20 @@ impl Decoder {
         output_format: PixelFormat,
     ) -> Result<Self, Error> {
         let config = AvccConfiguration::new(sets, nal_length)?;
-        let mut decoder = Self::with_h264_caps(threads, &config.caps(), output_format)?;
+        let annexb_fallback = config
+            .sps
+            .iter()
+            .chain(&config.pps)
+            .any(|nal| nal.len() > 255);
+        let caps = if annexb_fallback {
+            "video/x-h264,stream-format=(string)byte-stream,alignment=(string)au".to_owned()
+        } else {
+            config.caps()
+        };
+        let mut decoder = Self::with_h264_caps(threads, &caps, output_format)?;
         decoder.avcc = Some(config);
+        decoder.avcc_annexb_fallback = annexb_fallback;
+        decoder.initial_annexb_sets_pending = annexb_fallback;
         Ok(decoder)
     }
 
@@ -235,10 +418,25 @@ impl Decoder {
         // flushes gst-libav's H.264 reference pictures. Carry changed PPS NALs
         // in-band with the next submitted AU, preserving pipeline continuity.
         if incoming.pps != original.pps {
+            let max_nal_len = (1_u64 << (u32::from(nal_length) * 8)) - 1;
+            if !self.avcc_annexb_fallback
+                && incoming
+                    .pps
+                    .iter()
+                    .any(|pps| pps.len() as u64 > max_nal_len)
+            {
+                return Err(Error::InvalidInput(
+                    "updated PPS exceeds sample NAL-length prefix capacity".into(),
+                ));
+            }
             let mut pending = Vec::new();
             for pps in &incoming.pps {
-                let len = (pps.len() as u32).to_be_bytes();
-                pending.extend_from_slice(&len[4 - nal_length as usize..]);
+                if self.avcc_annexb_fallback {
+                    pending.extend_from_slice(&[0, 0, 0, 1]);
+                } else {
+                    let len = (pps.len() as u32).to_be_bytes();
+                    pending.extend_from_slice(&len[4 - nal_length as usize..]);
+                }
                 pending.extend_from_slice(pps);
             }
             self.pending_pps = Some(pending);
@@ -305,6 +503,8 @@ impl Decoder {
             output_format,
             avcc: None,
             pending_pps: None,
+            avcc_annexb_fallback: false,
+            initial_annexb_sets_pending: false,
         })
     }
 
@@ -370,25 +570,8 @@ impl Decoder {
             (n, d) if n > 0 && d > 0 => (n as u32, d as u32),
             _ => return Err(Error::Decode("invalid pixel aspect ratio".into())),
         };
-        let interlace_mode = match info.interlace_mode() {
-            gst_video::VideoInterlaceMode::Progressive => FrameInterlaceMode::Progressive,
-            gst_video::VideoInterlaceMode::Interleaved => FrameInterlaceMode::Interleaved,
-            gst_video::VideoInterlaceMode::Mixed => FrameInterlaceMode::Mixed,
-            gst_video::VideoInterlaceMode::Fields => FrameInterlaceMode::Fields,
-            other => {
-                return Err(Error::Decode(format!(
-                    "unsupported interlace mode {other:?}"
-                )));
-            }
-        };
-        let field_order = match info.field_order() {
-            gst_video::VideoFieldOrder::Unknown => FrameFieldOrder::Unknown,
-            gst_video::VideoFieldOrder::TopFieldFirst => FrameFieldOrder::TopFirst,
-            gst_video::VideoFieldOrder::BottomFieldFirst => FrameFieldOrder::BottomFirst,
-            other => {
-                return Err(Error::Decode(format!("unsupported field order {other:?}")));
-            }
-        };
+        let (interlace_mode, field_order, repeat_first_field, one_field) =
+            frame_fields(info.interlace_mode(), buffer.video_flags())?;
         let color = info.colorimetry();
         let matrix = match color.matrix() {
             gst_video::VideoColorMatrix::Bt601 => ColorMatrix::Bt601,
@@ -417,6 +600,8 @@ impl Decoder {
             pixel_aspect_ratio,
             interlace_mode,
             field_order,
+            repeat_first_field,
+            one_field,
             matrix,
             primaries: match color.primaries() {
                 gst_video::VideoColorPrimaries::Bt709 => ColorPrimaries::Bt709,
@@ -490,8 +675,50 @@ impl VideoDecoder for Decoder {
         if self.completed {
             return Err(Error::EndOfStream);
         }
-        let extra = self.pending_pps.as_ref().map_or(0, Vec::len);
-        let total_len = packet.bytes.len().checked_add(extra);
+        if packet.bytes.len() as u64 > INPUT_QUEUE_LIMIT {
+            return Err(Error::InvalidInput(
+                "compressed access unit exceeds queue limit".into(),
+            ));
+        }
+        let annexb = if self.avcc_annexb_fallback {
+            let config = self
+                .avcc
+                .as_ref()
+                .expect("AVCC fallback without configuration");
+            let mut converted = Vec::new();
+            if self.initial_annexb_sets_pending {
+                for nal in config.sps.iter().chain(&config.pps) {
+                    if converted
+                        .len()
+                        .checked_add(4)
+                        .and_then(|n| n.checked_add(nal.len()))
+                        .is_none_or(|n| n as u64 > INPUT_QUEUE_LIMIT)
+                    {
+                        return Err(Error::InvalidInput(
+                            "parameter sets exceed queue limit".into(),
+                        ));
+                    }
+                    converted.extend_from_slice(&[0, 0, 0, 1]);
+                    converted.extend_from_slice(nal);
+                }
+            } else if let Some(pps) = &self.pending_pps {
+                converted.extend_from_slice(pps);
+            }
+            avcc_to_annexb(packet.bytes, config.nal_length, &mut converted)?;
+            Some(converted)
+        } else {
+            None
+        };
+        let extra = if annexb.is_some() {
+            0
+        } else {
+            self.pending_pps.as_ref().map_or(0, Vec::len)
+        };
+        let total_len = if let Some(bytes) = &annexb {
+            Some(bytes.len())
+        } else {
+            packet.bytes.len().checked_add(extra)
+        };
         if packet.id == u64::MAX
             || [packet.pts_ns, packet.dts_ns, packet.duration_ns]
                 .into_iter()
@@ -518,11 +745,16 @@ impl VideoDecoder for Decoder {
         }
         // The caller owns input access units. GStreamer gets its own buffer;
         // decoded GstSample allocations remain owned until callback completion.
-        let mut compressed = Vec::with_capacity(total_len.unwrap());
-        if let Some(pps) = &self.pending_pps {
-            compressed.extend_from_slice(pps);
-        }
-        compressed.extend_from_slice(packet.bytes);
+        let compressed = if let Some(bytes) = annexb {
+            bytes
+        } else {
+            let mut bytes = Vec::with_capacity(total_len.unwrap());
+            if let Some(pps) = &self.pending_pps {
+                bytes.extend_from_slice(pps);
+            }
+            bytes.extend_from_slice(packet.bytes);
+            bytes
+        };
         let mut buffer = gst::Buffer::from_mut_slice(compressed);
         let writable = buffer
             .get_mut()
@@ -540,6 +772,7 @@ impl VideoDecoder for Decoder {
             return Err(self.latch_error(format!("cannot submit H.264 access unit: {e:?}")));
         }
         self.pending_pps = None;
+        self.initial_annexb_sets_pending = false;
         self.check_error()
     }
 
@@ -1093,15 +1326,266 @@ mod tests {
         for index in 0..4 {
             let frame = decoder.pull(Duration::from_secs(2)).unwrap().unwrap();
             assert_eq!(frame.id(), index);
+            assert!(
+                frame
+                    .sample
+                    .buffer()
+                    .unwrap()
+                    .video_flags()
+                    .contains(gst_video::VideoBufferFlags::INTERLACED)
+            );
+            assert!(
+                !frame
+                    .sample
+                    .buffer()
+                    .unwrap()
+                    .video_flags()
+                    .contains(gst_video::VideoBufferFlags::TFF)
+            );
             assert_eq!(frame.layout().pixel_aspect_ratio, (1, 1));
             assert_eq!(
                 frame.layout().interlace_mode,
                 FrameInterlaceMode::Interleaved
             );
-            // Match the negotiated output caps, which are BFF on this
-            // GStreamer/FFmpeg pipeline even though FFprobe reports TFF input.
+            // FFprobe's per-FRAME top_field_first=0 agrees with GstVideoBuffer
+            // TFF=0. FFprobe's separate stream-level field_order=tt does not.
             assert_eq!(frame.layout().field_order, FrameFieldOrder::BottomFirst);
+            assert!(!frame.layout().one_field);
+            assert!(!frame.layout().repeat_first_field);
         }
+    }
+
+    #[test]
+    fn interlace_flags_are_per_buffer_and_unsupported_modes_are_rejected() {
+        use gst_video::{VideoBufferFlags as F, VideoInterlaceMode as M};
+        assert_eq!(
+            frame_fields(M::Progressive, F::empty()).unwrap(),
+            (
+                FrameInterlaceMode::Progressive,
+                FrameFieldOrder::Unknown,
+                false,
+                false
+            )
+        );
+        assert_eq!(
+            frame_fields(M::Interleaved, F::INTERLACED | F::TFF | F::RFF).unwrap(),
+            (
+                FrameInterlaceMode::Interleaved,
+                FrameFieldOrder::TopFirst,
+                true,
+                false
+            )
+        );
+        assert_eq!(
+            frame_fields(M::Interleaved, F::INTERLACED | F::ONEFIELD).unwrap(),
+            (
+                FrameInterlaceMode::Interleaved,
+                FrameFieldOrder::BottomFirst,
+                false,
+                true
+            )
+        );
+        assert_eq!(
+            frame_fields(M::Interleaved, F::INTERLACED | F::TFF | F::ONEFIELD).unwrap(),
+            (
+                FrameInterlaceMode::Interleaved,
+                FrameFieldOrder::TopFirst,
+                false,
+                true
+            )
+        );
+        assert!(matches!(
+            frame_fields(M::Mixed, F::INTERLACED),
+            Err(Error::Decode(_))
+        ));
+        assert!(matches!(
+            frame_fields(M::Fields, F::INTERLACED),
+            Err(Error::Decode(_))
+        ));
+    }
+
+    #[test]
+    fn avcc_high_profile_extension_and_unsupported_sps_are_explicit() {
+        let stream = include_bytes!("../tests/fixtures/bframes_8_64x64.h264");
+        let start = stream
+            .windows(5)
+            .position(|w| w[..4] == [0, 0, 0, 1] && w[4] & 31 == 7)
+            .unwrap();
+        let next = stream[start + 4..]
+            .windows(4)
+            .position(|w| w == [0, 0, 0, 1])
+            .unwrap()
+            + start
+            + 4;
+        let sps = &stream[start + 4..next];
+        assert_eq!(sps[1], 100); // High profile, ordinary 8-bit 4:2:0
+        let pps = [0x68, 0xce, 0x0f, 0xc8];
+        let config = AvccConfiguration::new(&[sps, &pps], 4).unwrap();
+        assert_eq!(
+            config.high_profile,
+            Some(AvccHighProfile {
+                chroma_format: 1,
+                bit_depth_luma_minus8: 0,
+                bit_depth_chroma_minus8: 0,
+            })
+        );
+        assert!(config.caps().ends_with("fdf8f800"));
+        let unknown_profile = [0x67, 244, 0, 10, 0x80];
+        assert!(matches!(
+            AvccConfiguration::new(&[&unknown_profile, &pps], 4),
+            Err(Error::InvalidInput(_))
+        ));
+        let truncated_high = [0x67, 100, 0, 10, 0x80];
+        assert!(matches!(
+            AvccConfiguration::new(&[&truncated_high, &pps], 4),
+            Err(Error::InvalidInput(_))
+        ));
+        let oversized_pps = vec![0x68; u16::MAX as usize + 1];
+        assert!(matches!(
+            AvccConfiguration::new(&[sps, &oversized_pps], 1),
+            Err(Error::InvalidInput(_))
+        ));
+    }
+
+    #[test]
+    fn high10_avcc_uses_16_bit_parameter_set_lengths_with_1_byte_nal_prefixes() {
+        // Real High10 Annex-B, independently accepted by ffmpeg/ffprobe as
+        // two valid frames. Its PPS contains 8 legal scaling lists (425 bytes).
+        let source = include_bytes!("../tests/fixtures/high10_large_pps_2_32x32.h264");
+        let mut starts = Vec::new();
+        let mut cursor = 0;
+        while cursor + 3 <= source.len() {
+            let prefix = if source[cursor..].starts_with(&[0, 0, 0, 1]) {
+                4
+            } else if source[cursor..].starts_with(&[0, 0, 1]) {
+                3
+            } else {
+                cursor += 1;
+                continue;
+            };
+            starts.push((cursor, prefix));
+            cursor += prefix;
+        }
+        let mut sps = None;
+        let mut pps = None;
+        let mut vcl = Vec::new();
+        for (index, &(pos, prefix)) in starts.iter().enumerate() {
+            let end = starts
+                .get(index + 1)
+                .map_or(source.len(), |(next, _)| *next);
+            let nal = &source[pos + prefix..end];
+            match nal[0] & 31 {
+                7 => sps = Some(nal),
+                8 => pps = Some(nal),
+                1 | 5 => {
+                    assert!(nal.len() <= 255);
+                    let mut packet = vec![nal.len() as u8];
+                    packet.extend_from_slice(nal);
+                    vcl.push(packet);
+                }
+                _ => {}
+            }
+        }
+        let sps = sps.unwrap();
+        let pps = pps.unwrap();
+        assert_eq!(pps.len(), 425);
+        assert_eq!(sps[1], 110); // High 10 profile
+        let config = AvccConfiguration::new(&[sps, pps], 1).unwrap();
+        assert_eq!(
+            config.high_profile,
+            Some(AvccHighProfile {
+                chroma_format: 1,
+                bit_depth_luma_minus8: 2,
+                bit_depth_chroma_minus8: 2,
+            })
+        );
+        let caps = config.caps();
+        let hex = caps
+            .strip_prefix(
+                "video/x-h264,stream-format=(string)avc,alignment=(string)au,codec_data=(buffer)",
+            )
+            .unwrap();
+        let record = (0..hex.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(record[4], 0xfc); // 1-byte NAL prefixes
+        assert_eq!(record[5], 0xe1);
+        let pps_offset = 8 + sps.len();
+        assert_eq!(record[pps_offset], 1);
+        assert_eq!(
+            &record[pps_offset + 1..pps_offset + 3],
+            &(pps.len() as u16).to_be_bytes()
+        );
+        assert_eq!(&record[pps_offset + 3..pps_offset + 3 + pps.len()], pps);
+        assert_eq!(&record[record.len() - 4..], &[0xfd, 0xfa, 0xfa, 0]);
+        assert_eq!(vcl.len(), 2);
+        // The large-PPS source also decodes through the bounded Annex-B
+        // fallback when GStreamer's AVC codec-data parser rejects long PPS.
+        let smaller_pps = [0x68, 0xce, 0x0f, 0xc8];
+        let mut decoder = Decoder::h264_avcc(&[sps, pps], 1, 1).unwrap();
+        assert!(decoder.avcc_annexb_fallback);
+        assert!(matches!(
+            decoder.submit(AccessUnit {
+                id: 299,
+                bytes: &[3, 0x65],
+                pts_ns: None,
+                dts_ns: None,
+                duration_ns: None,
+            }),
+            Err(Error::InvalidInput(_))
+        ));
+        assert!(decoder.initial_annexb_sets_pending);
+        for (i, bytes) in vcl.iter().enumerate() {
+            decoder
+                .submit(AccessUnit {
+                    id: i as u64 + 300,
+                    bytes,
+                    pts_ns: Some(i as u64 * 200_000_000),
+                    dts_ns: None,
+                    duration_ns: Some(200_000_000),
+                })
+                .unwrap();
+        }
+        decoder.end_stream().unwrap();
+        for i in 0..2 {
+            let frame = decoder
+                .pull(Duration::from_secs(3))
+                .unwrap()
+                .expect("High10 picture dropped");
+            assert_eq!(frame.id(), i + 300);
+            assert_eq!((frame.layout().width, frame.layout().height), (32, 32));
+        }
+        // The ordinary AVCC path continues decoding High10 without copying
+        // and rewriting NAL prefixes when no parameter set exceeds 255 bytes.
+        let mut normal = Decoder::h264_avcc(&[sps, &smaller_pps], 1, 1).unwrap();
+        assert!(!normal.avcc_annexb_fallback);
+        for (i, bytes) in vcl.iter().enumerate() {
+            normal
+                .submit(AccessUnit {
+                    id: i as u64 + 400,
+                    bytes,
+                    pts_ns: Some(i as u64 * 200_000_000),
+                    dts_ns: None,
+                    duration_ns: Some(200_000_000),
+                })
+                .unwrap();
+        }
+        normal.end_stream().unwrap();
+        for i in 0..2 {
+            let frame = normal.pull(Duration::from_secs(3)).unwrap().unwrap();
+            assert_eq!(frame.id(), i + 400);
+        }
+        // A large initial avcC PPS is valid; sending such a PPS in-band
+        // is impossible with a one-byte prefix and must be rejected without
+        // modifying an existing session's configuration.
+        let mut short = Decoder::h264_avcc(&[sps, &smaller_pps], 1, 1).unwrap();
+        assert!(matches!(
+            short.reconfigure_avcc(&[sps, pps], 1),
+            Err(Error::InvalidInput(_))
+        ));
+        assert_eq!(short.avcc.as_ref().unwrap().pps[0], smaller_pps);
+        assert!(short.pending_pps.is_none());
     }
 
     #[test]
@@ -1193,6 +1677,8 @@ mod tests {
             pixel_aspect_ratio: (1, 1),
             interlace_mode: FrameInterlaceMode::Progressive,
             field_order: FrameFieldOrder::Unknown,
+            repeat_first_field: false,
+            one_field: false,
             matrix: ColorMatrix::Bt601,
             primaries: ColorPrimaries::Bt709,
             transfer: ColorTransfer::Bt709,

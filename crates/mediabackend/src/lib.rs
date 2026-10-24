@@ -67,8 +67,6 @@ pub struct FrameCrop {
 pub enum FrameInterlaceMode {
     Progressive,
     Interleaved,
-    Mixed,
-    Fields,
 }
 
 /// Display order for interlaced fields. Unknown is distinct from progressive.
@@ -90,8 +88,15 @@ pub struct FrameLayout {
     pub crop: Option<FrameCrop>,
     /// Pixel (sample) aspect ratio, reduced to a positive numerator/denominator.
     pub pixel_aspect_ratio: (u32, u32),
+    /// Modes requiring field-specific planes or telecine reconstruction fail
+    /// at decode instead of being represented as incomplete frame layouts.
     pub interlace_mode: FrameInterlaceMode,
+    /// Per-buffer first field (unknown for progressive buffers).
     pub field_order: FrameFieldOrder,
+    /// Repeat the first field in presentation, as specified by the buffer.
+    pub repeat_first_field: bool,
+    /// Only the first field is valid; the other field must be ignored.
+    pub one_field: bool,
     pub matrix: ColorMatrix,
     pub primaries: ColorPrimaries,
     pub transfer: ColorTransfer,

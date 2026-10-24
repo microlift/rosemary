@@ -13,14 +13,27 @@ NV12, I420 and BGRA outputs.
   identity across H.264 B-frame reordering. `VideoFrame::with_bytes` maps the
   original GStreamer sample without an intermediate per-plane owned `Vec`.
 - Frame layout carries validated strides/offsets, per-plane mapped spans,
-  pixel format, optional crop, sample aspect ratio, negotiated interlace mode
-  and field order, and color information. Unknown color range is distinct from
-  limited range. Frame timing comes from decoded buffers; output DTS may be
+  pixel format, optional crop, sample aspect ratio, per-buffer field order,
+  repeat-first/one-field flags, and color information. Progressive and
+  interleaved frames are supported; Mixed, Fields and alternate-field formats
+  fail explicitly until their additional reconstruction/plane contracts exist.
+  Unknown color range is distinct from limited range. Frame timing comes from decoded buffers; output DTS may be
   absent even when the compressed input provided it.
+- AVCC configuration records use independent 16-bit SPS/PPS lengths and
+  validated High/High10/High422 profile-specific chroma/bit-depth fields.
+  Unsupported AVC profiles and SPS extension NALs fail explicitly. The
+  sample NAL-prefix width is validated separately (1, 2, or 4 bytes). The
+  ordinary AVCC path has no NAL conversion; unusually large initial parameter
+  sets use a bounds-checked Annex-B fallback to avoid a GStreamer codec-data
+  parsing limitation while preserving sample identities and backpressure.
 - AVCC input accepts SPS/PPS configuration and compatible live PPS changes.
   A changed PPS is carried in-band with the next accepted access unit rather
-  than resetting the H.264 reference state through a caps update. Annex-B
-  access-unit input is supported. Access units larger than 8 MiB are
+  than resetting the H.264 reference state through a caps update. If a changed
+  PPS will not fit the sample NAL-prefix width in an ordinary AVCC session,
+  the update is rejected without altering the existing session. The Annex-B
+  fallback accepts longer in-band PPS updates. Neither path restricts the
+  initial avcC record's 16-bit parameter-set lengths. Annex-B access-unit
+  input is supported. Access units larger than 8 MiB are
   rejected; within that bound, queue backpressure is recoverable: drain output
   and retry the **same** unconsumed input, rather than dropping frames.
 - End-of-stream is terminal and distinct from a temporarily empty output
@@ -46,8 +59,10 @@ PTS, a pinned 60-picture three-GOP pixel reference, colorimetry, range,
 NV12/I420/BGRA lifetime, same-SPS PPS reconfiguration, 256-frame bounded queue
 backpressure, terminal EOS, missing-IDR recovery, immediate single-IDR output
 without EOS, retained fatal bus errors including after EOS, decoded timing,
-anamorphic/interlaced metadata, an AUD-less 10-picture stream, and truncated
-input. A 20-picture changed-PPS mid-GOP regression matches independent FFmpeg
+anamorphic/interlaced metadata, per-buffer field flags with explicit unsupported
+interlace-mode rejection, one-byte AVCC prefixes with a 425-byte legal High10
+PPS and profile-specific avcC extensions, an AUD-less 10-picture stream,
+and truncated input. A 20-picture changed-PPS mid-GOP regression matches independent FFmpeg
 luma hashes, including reference-dependent P frames after reconfiguration.
 The example uses GStreamer's H.264 parser to find access-unit boundaries,
 rather than assuming Access Unit Delimiters are mandatory. The libav element is
@@ -65,8 +80,10 @@ frame callback requirements, nonterminal delayed-frame waits, and GPU-backed
 CoreVideo/Metal presentation require separate integration. A public GStreamer
 still-frame/segment-done drain emits delayed pictures, but on the tested libav
 backend damages subsequent H.264 predicted-picture content until next IDR.
-Never expose that drain as VideoToolbox-compatible. Interlace and field-order
-values reflect GStreamer's negotiated output caps; they do not independently
-validate the source stream's intended field presentation. Auto/frame threading can
-improve throughput but increases delayed output and RSS. See later scoped
+Never expose that drain as VideoToolbox-compatible. Frame field order comes from
+GStreamer decoded buffer flags rather than only negotiated caps; FFprobe's
+independent per-frame top_field_first=0 agrees with the BFF flags for the pinned
+interlaced fixture, even though its stream summary reports field_order=tt.
+Complex telecine reconstruction and multi-meta field buffers remain unsupported.
+Auto/frame threading can improve throughput but increases delayed output and RSS. See later scoped
 integration work for CPU CoreVideo handoff and bundle packaging.
