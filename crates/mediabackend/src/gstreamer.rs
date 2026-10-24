@@ -628,8 +628,21 @@ fn each_avcc_nal(
 // Some GStreamer avcC parsers reject parameter sets exceeding 255 bytes even
 // though the record encodes them with u16 lengths. Feed only those sessions
 // through byte-stream caps; ordinary AVCC input remains zero-conversion.
-fn avcc_to_annexb(packet: &[u8], nal_length: u8, out: &mut Vec<u8>) -> Result<(), Error> {
+// `inject` writes in-band parameter sets before the first NAL that is not
+// an AUD, which must stay first in the access unit.
+fn avcc_to_annexb(
+    packet: &[u8],
+    nal_length: u8,
+    out: &mut Vec<u8>,
+    inject: impl FnOnce(&mut Vec<u8>),
+) -> Result<(), Error> {
+    let mut inject = Some(inject);
     each_avcc_nal(packet, nal_length, |nal| {
+        if nal[0] & 31 != 9
+            && let Some(inject) = inject.take()
+        {
+            inject(out);
+        }
         if out
             .len()
             .checked_add(4)
@@ -643,7 +656,11 @@ fn avcc_to_annexb(packet: &[u8], nal_length: u8, out: &mut Vec<u8>) -> Result<()
         out.extend_from_slice(&[0, 0, 0, 1]);
         out.extend_from_slice(nal);
         Ok(())
-    })
+    })?;
+    if let Some(inject) = inject {
+        inject(out);
+    }
+    Ok(())
 }
 
 impl Decoder {
@@ -1097,22 +1114,18 @@ impl VideoDecoder for Decoder {
                 .avcc
                 .as_ref()
                 .expect("AVCC fallback without configuration");
-            let mut injection = Vec::new();
-            if self.initial_annexb_sets_pending {
-                for nal in config.sps.iter().chain(&config.pps) {
-                    injection.extend_from_slice(&[0, 0, 0, 1]);
-                    injection.extend_from_slice(nal);
-                }
-            } else if let Some(pps) = &self.pending_pps {
-                injection.extend_from_slice(pps);
-            }
-            let aud_len = leading_avcc_aud(packet.bytes, config.nal_length)?;
+            let (initial_sets, pending_pps) = (self.initial_annexb_sets_pending, &self.pending_pps);
             let mut converted = Vec::with_capacity(total_len.unwrap());
-            avcc_to_annexb(packet.bytes, config.nal_length, &mut converted)?;
-            if !injection.is_empty() {
-                let split = aud_len.map_or(0, |n| n + 4);
-                converted.splice(split..split, injection);
-            }
+            avcc_to_annexb(packet.bytes, config.nal_length, &mut converted, |out| {
+                if initial_sets {
+                    for nal in config.sps.iter().chain(&config.pps) {
+                        out.extend_from_slice(&[0, 0, 0, 1]);
+                        out.extend_from_slice(nal);
+                    }
+                } else if let Some(pps) = pending_pps {
+                    out.extend_from_slice(pps);
+                }
+            })?;
             converted
         } else {
             let mut bytes = Vec::with_capacity(total_len.unwrap());
@@ -2496,7 +2509,7 @@ mod tests {
                 ));
                 let mut annexb = Vec::new();
                 assert!(matches!(
-                    avcc_to_annexb(&packet, width, &mut annexb),
+                    avcc_to_annexb(&packet, width, &mut annexb, |_| {}),
                     Err(Error::InvalidInput(_))
                 ));
                 assert!(annexb.is_empty());
@@ -2772,6 +2785,25 @@ mod tests {
         found.sort_unstable();
         assert_eq!(found, (0..8).collect::<Vec<_>>());
         assert!(negative_decoded, "negative decoded output PTS was lost");
+    }
+
+    #[test]
+    fn annexb_fallback_injects_parameter_sets_after_a_leading_aud() {
+        let inject = |out: &mut Vec<u8>| out.extend_from_slice(&[0, 0, 0, 1, 0x68, 0xce]);
+        let mut out = Vec::new();
+        avcc_to_annexb(&[2, 9, 0xf0, 2, 0x65, 0x88], 1, &mut out, inject).unwrap();
+        assert_eq!(
+            out,
+            [
+                0, 0, 0, 1, 9, 0xf0, 0, 0, 0, 1, 0x68, 0xce, 0, 0, 0, 1, 0x65, 0x88
+            ]
+        );
+        out.clear();
+        avcc_to_annexb(&[2, 0x65, 0x88], 1, &mut out, inject).unwrap();
+        assert_eq!(out, [0, 0, 0, 1, 0x68, 0xce, 0, 0, 0, 1, 0x65, 0x88]);
+        out.clear();
+        avcc_to_annexb(&[2, 9, 0xf0], 1, &mut out, inject).unwrap();
+        assert_eq!(out, [0, 0, 0, 1, 9, 0xf0, 0, 0, 0, 1, 0x68, 0xce]);
     }
 
     #[test]
