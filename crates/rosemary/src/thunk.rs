@@ -1425,7 +1425,7 @@ mod callback_abi_tests {
     }
 
     // A Clang-compiled caller, rather than Rust's extern "C" lowering,
-    // validates the Apple ARM64 ABI at the generated callee boundary.
+    // validates the host macOS ABI at the generated callee boundary.
     #[cfg(target_os = "macos")]
     fn native_c_caller_fixture(dir: &std::path::Path) -> (*mut libc::c_void, usize) {
         use std::ffi::CString;
@@ -1448,47 +1448,102 @@ mod callback_abi_tests {
         let source = dir.join("native-c-caller.c");
         let library = dir.join("native-c-caller.dylib");
         std::fs::write(&source, SOURCE).expect("write C callback caller");
+        let arch = match std::env::consts::ARCH {
+            "aarch64" => "arm64",
+            "x86_64" => "x86_64",
+            other => panic!("unsupported macOS callback test host architecture: {other}"),
+        };
         let status = Command::new("cc")
-            .args(["-arch", "arm64", "-dynamiclib", "-o"])
+            .args(["-arch", arch, "-dynamiclib", "-o"])
             .arg(&library)
             .arg(&source)
             .status()
             .expect("invoke Apple's C compiler");
         assert!(
             status.success(),
-            "native ARM64 callback C caller must compile"
+            "native macOS callback C caller must compile"
         );
         let dylib_path = CString::new(library.to_str().unwrap()).unwrap();
         // SAFETY: path and symbol are valid NUL-terminated strings.
         let handle = unsafe { libc::dlopen(dylib_path.as_ptr(), libc::RTLD_NOW) };
-        assert!(!handle.is_null(), "load native ARM64 C callback caller");
+        assert!(!handle.is_null(), "load native macOS C callback caller");
         let symbol = CString::new("invoke_guest_callback").unwrap();
         // SAFETY: the library owns this exported function until dlclose below.
         let entry = unsafe { libc::dlsym(handle, symbol.as_ptr()) };
-        assert!(!entry.is_null(), "find native ARM64 callback caller entry");
+        assert!(!entry.is_null(), "find native macOS callback caller entry");
         (handle, entry as usize)
     }
 
     #[test]
+    #[cfg_attr(
+        not(target_os = "macos"),
+        ignore = "requires Clang and ld64.lld: run explicitly with --ignored and ROSEMARY_TEST_LD64_LLD"
+    )]
     fn native_callback_enters_a_real_emulated_macho_guest_with_full_times() {
-        let Some(path) = macho_callback_fixture() else {
-            assert!(
-                !cfg!(target_os = "macos") && std::env::var_os("ROSEMARY_TEST_LD64_LLD").is_none(),
-                "a Mach-O fixture is required on macOS or with an explicit Mach-O linker"
-            );
-            eprintln!("skipping callback ABI guest fixture: no Mach-O compiler/linker");
-            return;
-        };
+        let path = macho_callback_fixture().expect(
+            "Mach-O fixture compilation failed: on Linux provide Clang and ROSEMARY_TEST_LD64_LLD",
+        );
         let path = path.to_str().unwrap();
         let program = crate::Program::load_executable(path, &[]).expect("load guest Mach-O");
         let entry = program.report.root().unwrap().entry.expect("Mach-O entry");
         let vm = crate::Vm::new(program, path, &[]).expect("guest VM");
+        let signature = crate::shims::coremedia::decompression_output_signature();
         let host = vm
-            .typed_thunk_for(
-                entry,
-                crate::shims::coremedia::decompression_output_signature(),
-            )
+            .typed_thunk_for(entry, signature.clone())
             .expect("typed guest callback");
+
+        // Guest-visible callback values may contain a native thunk created
+        // earlier for a generic or incompatible signature. Re-substituting
+        // them must recover the same guest entry and use the requested ABI.
+        use crate::abi::Callbacks as _;
+        let generic = vm.thunk_for(entry).expect("generic guest callback");
+        assert_ne!(generic, host);
+        assert_eq!(
+            vm.substitute_typed("roundtrip", generic, signature.clone())
+                .unwrap(),
+            host
+        );
+        assert_eq!(
+            vm.substitute_typed("roundtrip", host, signature.clone())
+                .unwrap(),
+            host
+        );
+        let mut alternate_params = signature.params.clone();
+        alternate_params[3] = Shape::Scalar(T::SignedWord);
+        let alternate = ThunkSignature::new(alternate_params, None).unwrap();
+        let other_host = vm
+            .substitute_typed("roundtrip", host, alternate.clone())
+            .expect("alternate typed guest callback");
+        assert_ne!(other_host, host);
+        assert_ne!(other_host, generic);
+        assert_eq!(
+            vm.substitute_typed("roundtrip", generic, alternate.clone())
+                .unwrap(),
+            other_host
+        );
+        assert_eq!(
+            vm.substitute_typed("roundtrip", other_host, signature.clone())
+                .unwrap(),
+            host
+        );
+        assert_eq!(
+            vm.substitute_typed("roundtrip", other_host, alternate.clone())
+                .unwrap(),
+            other_host
+        );
+        assert_eq!(vm.guest_behind_thunk(other_host), Some(entry));
+        assert_eq!(vm.thunks(), 3);
+        assert_eq!(
+            vm.substitute_typed("roundtrip", 0, alternate.clone())
+                .unwrap(),
+            0
+        );
+        let native = std::ptr::from_ref(&vm) as u64;
+        assert_eq!(
+            vm.substitute_typed("roundtrip", native, alternate).unwrap(),
+            native
+        );
+
         // SAFETY: the C caller has exactly the trampoline's native signature.
         #[cfg(not(target_os = "macos"))]
         let callback: extern "C" fn(u64, u64, i32, u32, u64, NativeTime, NativeTime) =

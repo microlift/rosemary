@@ -1707,6 +1707,11 @@ impl crate::abi::Callbacks for Vm {
         if va == 0 {
             return Ok(0);
         }
+        // A callback returned through guest-visible state may already be a
+        // Rosemary thunk for another signature. Recover its guest target
+        // before choosing the exact native ABI; otherwise a host caller may
+        // invoke that old thunk with the wrong argument layout.
+        let va = self.guest_behind_thunk(va).unwrap_or(va);
         if let Some(host) = crate::trampoline::host_behind(va) {
             return Ok(host);
         }
