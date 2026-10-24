@@ -1785,4 +1785,57 @@ mod callback_abi_tests {
         assert_eq!(&guest.stack[..25], &bytes);
         assert_eq!(&guest.stack[25..], &[0; 7]);
     }
+
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    struct NativeMixed {
+        a: i64,
+        b: f64,
+        c: i32,
+        d: i64,
+    }
+
+    // ObjC methods reach `build_typed` through their decoded type encoding, and
+    // one taking a large non-HFA struct is passed by pointer on AAPCS64 and on
+    // the stack on SysV. The argument after it must keep its own slot either way.
+    #[test]
+    fn an_objc_method_with_a_large_struct_argument_reaches_the_guest_intact() {
+        let method = machish::extensions::objc::ObjcMethod {
+            name: "takeMixed:after:".into(),
+            types: "v48@0:8{Mixed=qdiq}16q48".into(),
+            imp: 0x9abc,
+        };
+        let signature = crate::objc::thunk_signature(&method).expect("supported encoding");
+        let thunk = build_typed_with_entry(
+            0x9abc,
+            signature.clone(),
+            capture_partial as *const () as usize as u64,
+        )
+        .unwrap();
+        let mixed = NativeMixed {
+            a: -0x0102_0304_0506_0708,
+            b: 1.5,
+            c: -9,
+            d: 0x1122_3344_5566_7788,
+        };
+        // SAFETY: the trampoline was built from exactly this method's encoding.
+        let call: extern "C" fn(u64, u64, NativeMixed, i64) =
+            unsafe { std::mem::transmute(thunk.host as usize) };
+        call(0x5e1f, 0xc0de, mixed, -77);
+        let captured = CAPTURED.with(|slot| slot.borrow().clone());
+        let mut buffer = [0u8; RESULT_BYTES];
+        let guest = guest_arguments(&signature, &captured, &mut buffer).unwrap();
+        assert_eq!(guest.ints, [0x5e1f, 0xc0de, (-77i64) as u64]);
+        assert!(guest.sse.is_empty());
+        let mut expected = Vec::new();
+        expected.extend_from_slice(&mixed.a.to_le_bytes());
+        expected.extend_from_slice(&mixed.b.to_le_bytes());
+        expected.extend_from_slice(&mixed.c.to_le_bytes());
+        expected.extend_from_slice(&[0; 4]);
+        expected.extend_from_slice(&mixed.d.to_le_bytes());
+        assert_eq!(guest.stack.len(), 32);
+        // The padding after `c` is the caller's; only the members must match.
+        assert_eq!(&guest.stack[..20], &expected[..20]);
+        assert_eq!(&guest.stack[24..], &expected[24..]);
+    }
 }
