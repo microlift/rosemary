@@ -202,6 +202,45 @@ fn sample_counts_follow_the_vulkan_device() {
 }
 
 #[test]
+fn the_read_write_tier_follows_storage_image_support() {
+    for format in READ_WRITE_TIER_1.iter().chain(&READ_WRITE_TIER_2) {
+        assert_ne!(
+            gpu::pixel_format(*format),
+            ash::vk::Format::UNDEFINED,
+            "pixel format {format}"
+        );
+    }
+    let offline = device_for_tests();
+    // SAFETY: the guest's query on a device with no Vulkan adapter.
+    let tier = unsafe { read_write_texture_tier(offline, std::ptr::null()) };
+    assert_eq!(tier, MTL_READ_WRITE_TEXTURE_TIER_NONE);
+
+    let Some(device) = gpu_device() else {
+        return;
+    };
+    let gpu = gpu_of(device).expect("a Vulkan device");
+    let instance = vulkan::instance().expect("the instance behind the device");
+    let storage = |format: u64| {
+        // SAFETY: the physical device belongs to this instance.
+        let properties = unsafe {
+            instance.get_physical_device_format_properties(gpu.physical, gpu::pixel_format(format))
+        };
+        properties
+            .optimal_tiling_features
+            .contains(ash::vk::FormatFeatureFlags::STORAGE_IMAGE)
+    };
+    // SAFETY: the same query on the live device.
+    let tier = unsafe { read_write_texture_tier(device, std::ptr::null()) };
+    if tier >= MTL_READ_WRITE_TEXTURE_TIER_1 {
+        assert!(READ_WRITE_TIER_1.iter().all(|&format| storage(format)));
+    }
+    if tier == MTL_READ_WRITE_TEXTURE_TIER_2 {
+        assert!(READ_WRITE_TIER_2.iter().all(|&format| storage(format)));
+    }
+    assert!(tier <= MTL_READ_WRITE_TEXTURE_TIER_2);
+}
+
+#[test]
 fn source_library_creation_reports_invalid_source() {
     isolate_metal_fixture!();
     let device = device_for_tests();
@@ -1749,4 +1788,60 @@ fn recording_cost() {
         compute.as_secs_f64() * 1e6 / DISPATCHES as f64,
         render.as_secs_f64() * 1e6 / DRAWS as f64,
     );
+}
+
+/// The observer form answers the same devices, and the observer it hands out
+/// is released once removed; removing it again, or nil, is harmless.
+#[test]
+fn a_device_observer_comes_with_the_device_list_until_removed() {
+    #[repr(C)]
+    struct Descriptor {
+        reserved: u64,
+        size: u64,
+    }
+    #[repr(C)]
+    struct Literal {
+        isa: u64,
+        flags: i32,
+        reserved: i32,
+        invoke: unsafe extern "C" fn(*mut Literal, Id, Id),
+        descriptor: &'static Descriptor,
+    }
+    unsafe extern "C" fn invoke(_block: *mut Literal, _device: Id, _name: Id) {
+        panic!("no device is added or removed");
+    }
+    static DESCRIPTOR: Descriptor = Descriptor {
+        reserved: 0,
+        size: size_of::<Literal>() as u64,
+    };
+    bootstrap();
+    let isa = objc::block::data_symbols()
+        .into_iter()
+        .find(|(name, _)| name == "__NSConcreteGlobalBlock")
+        .map_or(0, |(_, address)| address);
+    // A global block, as a literal capturing nothing is.
+    let handler = Box::leak(Box::new(Literal {
+        isa,
+        flags: 1 << 28,
+        reserved: 0,
+        invoke,
+        descriptor: &DESCRIPTOR,
+    })) as *mut Literal as Id;
+    let mut observer: Id = std::ptr::null_mut();
+    // SAFETY: the framework ABI, with a writable out-parameter.
+    unsafe {
+        let devices = MTLCopyAllDevicesWithObserver(&mut observer, handler);
+        let plain = MTLCopyAllDevices();
+        assert_eq!(
+            corefoundation::api::CFArrayGetCount(devices),
+            corefoundation::api::CFArrayGetCount(plain)
+        );
+        assert!(!observer.is_null());
+        assert!(object::is_kind(observer, c"RosemaryMTLDeviceObserver"));
+        MTLRemoveDeviceObserver(observer);
+        MTLRemoveDeviceObserver(observer);
+        MTLRemoveDeviceObserver(std::ptr::null_mut());
+        corefoundation::api::CFRelease(devices);
+        corefoundation::api::CFRelease(plain);
+    }
 }

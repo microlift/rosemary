@@ -288,6 +288,54 @@ pub(super) unsafe extern "C" fn argument_buffers_tier(_receiver: Id, _sel: Sel) 
     MTL_ARGUMENT_BUFFERS_TIER_1
 }
 
+/// Formats `MTLReadWriteTextureTier1` lets a kernel read and write in one
+/// texture: R32Float, R32Uint and R32Sint.
+pub(super) const READ_WRITE_TIER_1: [u64; 3] = [55, 53, 54];
+
+/// What `MTLReadWriteTextureTier2` adds: RGBA32, RGBA16 and R16 as Float,
+/// Uint and Sint, and RGBA8 and R8 as Unorm, Uint and Sint.
+pub(super) const READ_WRITE_TIER_2: [u64; 15] = [
+    125, 123, 124, 115, 113, 114, 70, 73, 74, 25, 23, 24, 10, 13, 14,
+];
+
+/// `-readWriteTextureSupport`.
+///
+/// A read-write texture is lowered to a storage image with no declared
+/// format, so the tier needs Vulkan's format-less storage reads and writes,
+/// and every format of the tier usable as an optimally tiled storage image.
+pub(super) unsafe extern "C" fn read_write_texture_tier(receiver: Id, _sel: Sel) -> u64 {
+    let (Some(gpu), Some(instance)) = (gpu_of(receiver), crate::vulkan::instance()) else {
+        return MTL_READ_WRITE_TEXTURE_TIER_NONE;
+    };
+    // SAFETY: an `RosemaryMTLDevice`, whose profile belongs to the
+    // process-wide adapter list.
+    let target = unsafe { object::body::<Device>(receiver).target.as_ref() };
+    let Some(target) = target else {
+        return MTL_READ_WRITE_TEXTURE_TIER_NONE;
+    };
+    if !(target.shader_storage_image_read_without_format
+        && target.shader_storage_image_write_without_format)
+    {
+        return MTL_READ_WRITE_TEXTURE_TIER_NONE;
+    }
+    let storage = |formats: &[u64]| {
+        formats.iter().all(|&format| {
+            let format = gpu::pixel_format(format);
+            // SAFETY: the physical device belongs to this instance.
+            let properties =
+                unsafe { instance.get_physical_device_format_properties(gpu.physical, format) };
+            properties
+                .optimal_tiling_features
+                .contains(ash::vk::FormatFeatureFlags::STORAGE_IMAGE)
+        })
+    };
+    match (storage(&READ_WRITE_TIER_1), storage(&READ_WRITE_TIER_2)) {
+        (true, true) => MTL_READ_WRITE_TEXTURE_TIER_2,
+        (true, false) => MTL_READ_WRITE_TEXTURE_TIER_1,
+        _ => MTL_READ_WRITE_TEXTURE_TIER_NONE,
+    }
+}
+
 pub(super) unsafe extern "C" fn supports_sample_count(receiver: Id, _sel: Sel, count: u64) -> bool {
     let Some(gpu) = gpu_of(receiver) else {
         return false;

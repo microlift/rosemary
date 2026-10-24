@@ -36,8 +36,8 @@ use library::*;
 use object::methods;
 
 pub use exports::{
-    CGDirectDisplayCopyCurrentMetalDevice, MTLCopyAllDevices, MTLCreateSystemDefaultDevice,
-    data_symbols, names, provide, symbol,
+    CGDirectDisplayCopyCurrentMetalDevice, MTLCopyAllDevices, MTLCopyAllDevicesWithObserver,
+    MTLCreateSystemDefaultDevice, MTLRemoveDeviceObserver, data_symbols, names, provide, symbol,
 };
 
 struct Device {
@@ -180,6 +180,7 @@ pub fn bootstrap() {
             "supportsFamily:" => supports_family, c"B24@0:8Q16";
             "argumentBuffersSupport" => argument_buffers_tier, c"Q16@0:8";
             "argumentBuffersTier" => argument_buffers_tier, c"Q16@0:8";
+            "readWriteTextureSupport" => read_write_texture_tier, c"Q16@0:8";
             "supportsShaderBarycentricCoordinates" => no, c"B16@0:8";
             "areBarycentricCoordsSupported" => no, c"B16@0:8";
             "supportsRaytracing" => no, c"B16@0:8";
@@ -218,6 +219,10 @@ pub fn bootstrap() {
         });
         // Encoders on one device run in order behind full barriers, so a fence
         // has nothing to carry: it is an object to pass back and nothing more.
+        let observer = object::register::<Id>(c"RosemaryMTLDeviceObserver");
+        methods!(observer, {
+            "dealloc" => exports::observer_dealloc, c"v16@0:8";
+        });
         let fence = object::register::<Id>(c"RosemaryMTLFence");
         methods!(fence, {
             "device" => fence_device, c"@16@0:8";

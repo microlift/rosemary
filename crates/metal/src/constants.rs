@@ -19,6 +19,10 @@ pub(crate) const MTL_FEATURE_SET_MACOS_GPU_FAMILY_2_V1: u64 = 10005;
 
 pub(crate) const MTL_ARGUMENT_BUFFERS_TIER_1: u64 = 0;
 
+pub(crate) const MTL_READ_WRITE_TEXTURE_TIER_NONE: u64 = 0;
+pub(crate) const MTL_READ_WRITE_TEXTURE_TIER_1: u64 = 1;
+pub(crate) const MTL_READ_WRITE_TEXTURE_TIER_2: u64 = 2;
+
 pub(crate) const MTL_COLOR_WRITE_MASK_ALL: u64 = 0xf;
 pub(crate) const MTL_DEPTH_CLIP_MODE_CLAMP: u64 = 1;
 
