@@ -1218,43 +1218,13 @@ impl Drop for Decoder {
 mod tests {
     use super::*;
 
-    fn fixture_access_units() -> Vec<Vec<u8>> {
-        let stream = include_bytes!("../tests/fixtures/bframes_8_64x64.h264");
-        let mut starts = Vec::new();
-        for (i, window) in stream.windows(4).enumerate() {
-            if window == [0, 0, 0, 1] {
-                starts.push(i);
-            }
-        }
-        let mut packets = Vec::new();
-        for (index, &pos) in starts.iter().enumerate() {
-            let end = starts.get(index + 1).copied().unwrap_or(stream.len());
-            let nal = &stream[pos + 4..end];
-            if nal.is_empty() {
-                continue;
-            }
-            if nal[0] & 31 == 9 {
-                packets.push(Vec::new());
-            }
-            if packets.is_empty() {
-                packets.push(Vec::new());
-            }
-            packets
-                .last_mut()
-                .unwrap()
-                .extend_from_slice(&stream[pos..end]);
-        }
-        packets
-    }
-
-    #[test]
-    fn multi_gop_reordering_matches_ffmpeg_presentation_pixels() {
-        let stream = include_bytes!("../tests/fixtures/multi_gop_bframes_64x64.h264");
-        let expected = include_str!("../tests/fixtures/multi_gop_bframes_64x64.luma_fnv64");
+    /// Each Annex-B NAL as its start-code offset and payload, recognizing
+    /// both 3- and 4-byte start codes.
+    fn annexb_nals(stream: &[u8]) -> Vec<(usize, &[u8])> {
         let mut starts = Vec::new();
         let mut cursor = 0;
         while cursor + 3 <= stream.len() {
-            let size = if stream[cursor..].starts_with(&[0, 0, 0, 1]) {
+            let prefix = if stream[cursor..].starts_with(&[0, 0, 0, 1]) {
                 4
             } else if stream[cursor..].starts_with(&[0, 0, 1]) {
                 3
@@ -1262,27 +1232,45 @@ mod tests {
                 cursor += 1;
                 continue;
             };
-            starts.push((cursor, size));
-            cursor += size;
+            starts.push((cursor, prefix));
+            cursor += prefix;
         }
-        let mut units = Vec::<Vec<u8>>::new();
-        for (i, &(pos, size)) in starts.iter().enumerate() {
-            let end = starts.get(i + 1).map(|(p, _)| *p).unwrap_or(stream.len());
-            let nal = &stream[pos + size..end];
-            if nal.is_empty() {
-                continue;
-            }
-            if nal[0] & 31 == 9 {
-                units.push(Vec::new());
-            }
-            if units.is_empty() {
-                units.push(Vec::new());
-            }
-            units
-                .last_mut()
-                .unwrap()
-                .extend_from_slice(&stream[pos..end]);
-        }
+        starts
+            .iter()
+            .enumerate()
+            .map(|(i, &(start, prefix))| {
+                let end = starts.get(i + 1).map_or(stream.len(), |&(next, _)| next);
+                (start, &stream[start + prefix..end])
+            })
+            .filter(|(_, nal)| !nal.is_empty())
+            .collect()
+    }
+
+    /// Access units of an Annex-B stream, each starting at an AUD (or at the
+    /// first NAL when the stream does not open with one).
+    fn access_units(stream: &[u8]) -> Vec<&[u8]> {
+        let starts = annexb_nals(stream)
+            .into_iter()
+            .enumerate()
+            .filter(|(i, (_, nal))| *i == 0 || nal[0] & 31 == 9)
+            .map(|(_, (start, _))| start)
+            .collect::<Vec<_>>();
+        starts
+            .iter()
+            .enumerate()
+            .map(|(i, &start)| &stream[start..starts.get(i + 1).copied().unwrap_or(stream.len())])
+            .collect()
+    }
+
+    fn fixture_access_units() -> Vec<&'static [u8]> {
+        access_units(include_bytes!("../tests/fixtures/bframes_8_64x64.h264"))
+    }
+
+    #[test]
+    fn multi_gop_reordering_matches_ffmpeg_presentation_pixels() {
+        let stream = include_bytes!("../tests/fixtures/multi_gop_bframes_64x64.h264");
+        let expected = include_str!("../tests/fixtures/multi_gop_bframes_64x64.luma_fnv64");
+        let units = access_units(stream);
         assert_eq!(units.len(), 60);
         let mut decoder = Decoder::h264_nv12(1).unwrap();
         for (i, bytes) in units.iter().enumerate() {
@@ -1349,17 +1337,10 @@ mod tests {
         // pre-recovery pictures as valid output.
         let stream = include_bytes!("../tests/fixtures/multi_gop_missing_first_idr_64x64.h264");
         let golden = include_str!("../tests/fixtures/multi_gop_bframes_64x64.luma_fnv64");
-        let mut offsets = Vec::new();
-        for (i, bytes) in stream.windows(5).enumerate() {
-            if bytes[..4] == [0, 0, 0, 1] && bytes[4] & 31 == 9 {
-                offsets.push(i);
-            }
-        }
-        assert_eq!(offsets.len(), 60);
+        let units = access_units(stream);
+        assert_eq!(units.len(), 60);
         let mut decoder = Decoder::h264_nv12(1).unwrap();
-        for (index, &start) in offsets.iter().enumerate() {
-            let end = offsets.get(index + 1).copied().unwrap_or(stream.len());
-            let unit = &stream[start..end];
+        for (index, unit) in units.iter().enumerate() {
             decoder
                 .submit(AccessUnit {
                     id: index as u64,
@@ -1840,29 +1821,10 @@ mod tests {
         assert_eq!(received, (0..total).collect::<Vec<_>>());
     }
 
-    fn aud_delimited_units(stream: &[u8]) -> Vec<&[u8]> {
-        let starts: Vec<_> = stream
-            .windows(5)
-            .enumerate()
-            .filter_map(|(offset, bytes)| {
-                (bytes[..4] == [0, 0, 0, 1] && bytes[4] & 31 == 9).then_some(offset)
-            })
-            .collect();
-        assert_eq!(starts.first(), Some(&0));
-        starts
-            .iter()
-            .enumerate()
-            .map(|(i, &start)| {
-                let end = starts.get(i + 1).copied().unwrap_or(stream.len());
-                &stream[start..end]
-            })
-            .collect()
-    }
-
     #[test]
     fn anamorphic_h264_preserves_pixel_aspect_ratio() {
         let data = include_bytes!("../tests/fixtures/anamorphic_4_64x64.h264");
-        let units = aud_delimited_units(data);
+        let units = access_units(data);
         assert_eq!(units.len(), 4);
         let mut decoder = Decoder::h264_nv12(1).unwrap();
         for (index, bytes) in units.iter().enumerate() {
@@ -1891,7 +1853,7 @@ mod tests {
     #[test]
     fn interlaced_h264_preserves_field_order_and_mode() {
         let data = include_bytes!("../tests/fixtures/interlaced_tff_4_64x64.h264");
-        let units = aud_delimited_units(data);
+        let units = access_units(data);
         assert_eq!(units.len(), 4);
         let mut decoder = Decoder::h264_nv12(1).unwrap();
         for (index, bytes) in units.iter().enumerate() {
@@ -2030,17 +1992,11 @@ mod tests {
     #[test]
     fn avcc_high_profile_extension_and_unsupported_sps_are_explicit() {
         let stream = include_bytes!("../tests/fixtures/bframes_8_64x64.h264");
-        let start = stream
-            .windows(5)
-            .position(|w| w[..4] == [0, 0, 0, 1] && w[4] & 31 == 7)
+        let sps = annexb_nals(stream)
+            .into_iter()
+            .map(|(_, nal)| nal)
+            .find(|nal| nal[0] & 31 == 7)
             .unwrap();
-        let next = stream[start + 4..]
-            .windows(4)
-            .position(|w| w == [0, 0, 0, 1])
-            .unwrap()
-            + start
-            + 4;
-        let sps = &stream[start + 4..next];
         assert_eq!(sps[1], 100); // High profile, ordinary 8-bit 4:2:0
         let pps = [0x68, 0xce, 0x0f, 0xc8];
         let config = AvccConfiguration::new(&[sps, &pps], 4).unwrap();
@@ -2112,28 +2068,10 @@ mod tests {
         // Real High10 Annex-B, independently accepted by ffmpeg/ffprobe as
         // two valid frames. Its PPS contains 8 legal scaling lists (425 bytes).
         let source = include_bytes!("../tests/fixtures/high10_large_pps_2_32x32.h264");
-        let mut starts = Vec::new();
-        let mut cursor = 0;
-        while cursor + 3 <= source.len() {
-            let prefix = if source[cursor..].starts_with(&[0, 0, 0, 1]) {
-                4
-            } else if source[cursor..].starts_with(&[0, 0, 1]) {
-                3
-            } else {
-                cursor += 1;
-                continue;
-            };
-            starts.push((cursor, prefix));
-            cursor += prefix;
-        }
         let mut sps = None;
         let mut pps = None;
         let mut vcl = Vec::new();
-        for (index, &(pos, prefix)) in starts.iter().enumerate() {
-            let end = starts
-                .get(index + 1)
-                .map_or(source.len(), |(next, _)| *next);
-            let nal = &source[pos + prefix..end];
+        for (_, nal) in annexb_nals(source) {
             match nal[0] & 31 {
                 7 => sps = Some(nal),
                 8 => pps = Some(nal),
@@ -2471,7 +2409,7 @@ mod tests {
                 ColorTransfer::AribStdB67,
             ),
         ] {
-            let units = aud_delimited_units(stream);
+            let units = access_units(stream);
             assert_eq!(units.len(), 2);
             let mut decoder = Decoder::h264_nv12(1).unwrap();
             for (i, bytes) in units.iter().enumerate() {
@@ -2647,28 +2585,9 @@ mod tests {
     }
 
     fn avcc_idr_fixture(stream: &[u8]) -> (Vec<Vec<u8>>, Vec<u8>) {
-        let mut positions = Vec::new();
-        let mut pos = 0;
-        while pos + 3 <= stream.len() {
-            let prefix = if stream[pos..].starts_with(&[0, 0, 0, 1]) {
-                4
-            } else if stream[pos..].starts_with(&[0, 0, 1]) {
-                3
-            } else {
-                pos += 1;
-                continue;
-            };
-            positions.push((pos, prefix));
-            pos += prefix;
-        }
         let mut headers = Vec::new();
         let mut idr = Vec::new();
-        for (i, &(start, prefix)) in positions.iter().enumerate() {
-            let end = positions.get(i + 1).map_or(stream.len(), |(n, _)| *n);
-            let bytes = &stream[start + prefix..end];
-            if bytes.is_empty() {
-                continue;
-            }
+        for (_, bytes) in annexb_nals(stream) {
             match bytes[0] & 31 {
                 7 | 8 => headers.push(bytes.to_vec()),
                 5 => {
@@ -2696,7 +2615,7 @@ mod tests {
             ),
         ];
         for (source, expected) in sources {
-            let units = aud_delimited_units(source);
+            let units = access_units(source);
             assert_eq!(units.len(), 2);
             let mut decoder = Decoder::h264_nv12(1).unwrap();
             for (id, bytes) in units.iter().enumerate() {
@@ -2831,7 +2750,7 @@ mod tests {
         // FFmpeg's independent raw-video decode hashes are pinned below.
         let stream = include_bytes!("../tests/fixtures/pps_midgop_changed_20_64x64.h264");
         let golden = include_str!("../tests/fixtures/pps_midgop_changed_20_64x64.luma_fnv64");
-        let units = aud_delimited_units(stream);
+        let units = access_units(stream);
         assert_eq!(units.len(), 20);
         let mut sps = None;
         let mut old_pps = None;
@@ -2839,30 +2758,8 @@ mod tests {
         let mut avcc = Vec::new();
 
         for (index, au) in units.iter().enumerate() {
-            let mut starts = Vec::new();
-            let mut cursor = 0;
-            while cursor + 3 <= au.len() {
-                let prefix = if au[cursor..].starts_with(&[0, 0, 0, 1]) {
-                    4
-                } else if au[cursor..].starts_with(&[0, 0, 1]) {
-                    3
-                } else {
-                    cursor += 1;
-                    continue;
-                };
-                starts.push((cursor, prefix));
-                cursor += prefix;
-            }
             let mut packet = Vec::new();
-            for (nal_index, &(position, prefix)) in starts.iter().enumerate() {
-                let end = starts
-                    .get(nal_index + 1)
-                    .map(|&(next, _)| next)
-                    .unwrap_or(au.len());
-                let nal = &au[position + prefix..end];
-                if nal.is_empty() {
-                    continue;
-                }
+            for (_, nal) in annexb_nals(au) {
                 match nal[0] & 31 {
                     7 => {
                         assert_eq!(index, 0);
@@ -2999,30 +2896,8 @@ mod tests {
         let mut sets = Vec::new();
         let mut packets = Vec::new();
         for bytes in &frames {
-            let mut starts = Vec::new();
-            let mut i = 0;
-            while i + 3 <= bytes.len() {
-                let separator = if bytes[i..].starts_with(&[0, 0, 0, 1]) {
-                    4
-                } else if bytes[i..].starts_with(&[0, 0, 1]) {
-                    3
-                } else {
-                    i += 1;
-                    continue;
-                };
-                starts.push((i, separator));
-                i += separator;
-            }
             let mut packet = Vec::new();
-            for (n, &(start, separator)) in starts.iter().enumerate() {
-                let end = starts
-                    .get(n + 1)
-                    .map(|(pos, _)| *pos)
-                    .unwrap_or(bytes.len());
-                let nal = &bytes[start + separator..end];
-                if nal.is_empty() {
-                    continue;
-                }
+            for (_, nal) in annexb_nals(bytes) {
                 match nal[0] & 31 {
                     7 | 8 => sets.push(nal),
                     1 | 5 | 6 => {
@@ -3108,7 +2983,7 @@ mod tests {
         assert!(matches!(
             decoder.submit(AccessUnit {
                 id: 9,
-                bytes: &frames[0],
+                bytes: frames[0],
                 pts_ns: None,
                 dts_ns: None,
                 duration_ns: None,
