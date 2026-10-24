@@ -1335,6 +1335,215 @@ mod callback_abi_tests {
         REENTER_THUNK.with(|slot| slot.set(0));
     }
 
+    // This fixture needs no Apple SDK or imported libraries. On macOS, the
+    // system compiler can link it; on Linux, Clang and ld64.lld can do so.
+    fn macho_callback_fixture() -> Option<std::path::PathBuf> {
+        use std::process::Command;
+
+        const SOURCE: &str = r#"
+            typedef unsigned long long U64;
+            typedef struct { long long value; int timescale; unsigned flags; long long epoch; } Time;
+            typedef void (*Callback)(void*, void*, int, unsigned, void*, Time, Time);
+            static volatile U64 observed[2][13];
+            __attribute__((used,noinline)) U64 guest_callback(void* refcon, void* frame, int status,
+                                                unsigned flags, void* image, Time pts, Time duration) {
+                if ((U64)refcon == 0xfeedfaceULL)
+                    return observed[(U64)frame / 13][(U64)frame % 13];
+                volatile U64* row = observed[(U64)refcon == 101 ? 1 : 0];
+                row[0] = (U64)refcon;
+                row[1] = (U64)frame;
+                row[2] = (U64)(unsigned)status;
+                row[3] = flags;
+                row[4] = (U64)image;
+                row[5] = (U64)pts.value;
+                row[6] = (U64)(unsigned)pts.timescale;
+                row[7] = pts.flags;
+                row[8] = (U64)pts.epoch;
+                row[9] = (U64)duration.value;
+                row[10] = (U64)(unsigned)duration.timescale;
+                row[11] = duration.flags;
+                row[12] = (U64)duration.epoch;
+                if ((U64)refcon == 11) {
+                    Time a = {-999, 123, 0xff000011U, 4444};
+                    Time b = {4321, -432, 0x12345678U, -123};
+                    ((Callback)frame)((void*)101, (void*)202, -303, 404, (void*)505, a, b);
+                }
+                return 0;
+            }
+        "#;
+        let dir =
+            std::env::temp_dir().join(format!("rosemary-callback-abi-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).ok()?;
+        let src = dir.join("callback.c");
+        let obj = dir.join("callback.o");
+        let exe = dir.join("callback");
+        std::fs::write(&src, SOURCE).ok()?;
+        if cfg!(target_os = "macos") {
+            let status = Command::new("cc")
+                .args(["-arch", "x86_64", "-O1", "-Wl,-e,_guest_callback", "-o"])
+                .arg(&exe)
+                .arg(&src)
+                .status()
+                .ok()?;
+            return status.success().then_some(exe);
+        }
+        let compiled = Command::new("clang")
+            .args([
+                "-target",
+                "x86_64-apple-macos10.15",
+                "-O1",
+                "-fno-stack-protector",
+                "-c",
+                "-o",
+            ])
+            .arg(&obj)
+            .arg(&src)
+            .status()
+            .ok()?;
+        if !compiled.success() {
+            return None;
+        }
+        let linker =
+            std::env::var_os("ROSEMARY_TEST_LD64_LLD").unwrap_or_else(|| "ld64.lld".into());
+        let linked = Command::new(linker)
+            .args([
+                "-arch",
+                "x86_64",
+                "-platform_version",
+                "macos",
+                "10.15",
+                "10.15",
+                "-e",
+                "_guest_callback",
+                "-o",
+            ])
+            .arg(&exe)
+            .arg(&obj)
+            .status()
+            .ok()?;
+        linked.success().then_some(exe)
+    }
+
+    #[test]
+    fn native_callback_enters_a_real_emulated_macho_guest_with_full_times() {
+        let Some(path) = macho_callback_fixture() else {
+            assert!(
+                !cfg!(target_os = "macos") && std::env::var_os("ROSEMARY_TEST_LD64_LLD").is_none(),
+                "a Mach-O fixture is required on macOS or with an explicit Mach-O linker"
+            );
+            eprintln!("skipping callback ABI guest fixture: no Mach-O compiler/linker");
+            return;
+        };
+        let path = path.to_str().unwrap();
+        let program = crate::Program::load_executable(path, &[]).expect("load guest Mach-O");
+        let entry = program.report.root().unwrap().entry.expect("Mach-O entry");
+        let vm = crate::Vm::new(program, path, &[]).expect("guest VM");
+        let host = vm
+            .typed_thunk_for(
+                entry,
+                crate::shims::coremedia::decompression_output_signature(),
+            )
+            .expect("typed guest callback");
+        // SAFETY: the C caller has exactly the trampoline's native signature.
+        let callback: extern "C" fn(u64, u64, i32, u32, u64, NativeTime, NativeTime) =
+            unsafe { std::mem::transmute(host as usize) };
+        let first = NativeTime {
+            value: 0x0123_4567_89ab_cdef,
+            timescale: -360,
+            flags: 0xabcd_1234,
+            epoch: -555,
+        };
+        let second = NativeTime {
+            value: -0x1234_5678_90ab_cde,
+            timescale: 777,
+            flags: 0x8000_0001,
+            epoch: 0x1122_3344_5566_7788,
+        };
+        with_current(&vm, || {
+            callback(11, host, -33, 0x8765_4321, 55, first, second)
+        });
+        let expected = [
+            11,
+            host,
+            (-33i32 as u32) as u64,
+            0x8765_4321,
+            55,
+            first.value as u64,
+            (first.timescale as u32) as u64,
+            first.flags as u64,
+            first.epoch as u64,
+            second.value as u64,
+            (second.timescale as u32) as u64,
+            second.flags as u64,
+            second.epoch as u64,
+        ];
+        for (index, want) in expected.iter().enumerate() {
+            let got = vm
+                .call(entry, &[0xfeedface, index as u64])
+                .expect("read guest capture");
+            assert_eq!(got, *want, "outer guest CMTime word {index}");
+        }
+        let nested = [
+            101,
+            202,
+            (-303i32 as u32) as u64,
+            404,
+            505,
+            (-999i64) as u64,
+            123,
+            0xff00_0011,
+            4444,
+            4321,
+            (-432i32 as u32) as u64,
+            0x1234_5678,
+            (-123i64) as u64,
+        ];
+        for (index, want) in nested.iter().enumerate() {
+            let got = vm
+                .call(entry, &[0xfeedface, (13 + index) as u64])
+                .expect("read nested guest capture");
+            assert_eq!(got, *want, "nested guest CMTime word {index}");
+        }
+
+        // A host callback thread has no preexisting guest stack or VM TLS.
+        // Enter the same trampoline from a second native thread and check
+        // every field again after that thread has exited.
+        std::thread::scope(|scope| {
+            scope
+                .spawn(|| {
+                    with_current(&vm, || {
+                        callback(12, 23, -34, 0x1357_2468, 56, second, first)
+                    });
+                })
+                .join()
+                .expect("native callback worker");
+        });
+        let threaded = [
+            12,
+            23,
+            (-34i32 as u32) as u64,
+            0x1357_2468,
+            56,
+            second.value as u64,
+            (second.timescale as u32) as u64,
+            second.flags as u64,
+            second.epoch as u64,
+            first.value as u64,
+            (first.timescale as u32) as u64,
+            first.flags as u64,
+            first.epoch as u64,
+        ];
+        for (index, want) in threaded.iter().enumerate() {
+            let got = vm
+                .call(entry, &[0xfeedface, index as u64])
+                .expect("read threaded guest capture");
+            assert_eq!(got, *want, "threaded guest CMTime word {index}");
+        }
+        let dir = std::path::Path::new(path).parent().unwrap();
+        drop(vm);
+        std::fs::remove_dir_all(dir).expect("remove callback fixture");
+    }
+
     #[repr(C)]
     #[derive(Clone, Copy)]
     struct NativeTwentyFive([u8; 25]);
