@@ -404,35 +404,54 @@ fn validate_planes(layout: &FrameLayout, size: usize) -> Result<(), Error> {
     Ok(())
 }
 
-// Frame presentation is determined by each decoded buffer, not only caps.
-// MIXED requires per-picture telecine reconstruction; FIELDS requires
-// multiple field-specific GstVideoMeta entries, neither exposed by this API.
+// GStreamer only allows caps field-order for INTERLEAVED; when it is unknown,
+// and always for MIXED, the buffer's TFF flag decides and its absence means
+// bottom field first. A MIXED buffer is interlaced only if flagged so.
+// FIELDS and ALTERNATE need field-specific planes this API cannot express.
 fn frame_fields(
     mode: gst_video::VideoInterlaceMode,
+    caps_order: gst_video::VideoFieldOrder,
     flags: gst_video::VideoBufferFlags,
 ) -> Result<(FrameInterlaceMode, FrameFieldOrder, bool, bool), Error> {
-    use gst_video::{VideoBufferFlags as F, VideoInterlaceMode as M};
-    match mode {
-        M::Progressive => Ok((
+    use gst_video::{VideoBufferFlags as F, VideoFieldOrder as O, VideoInterlaceMode as M};
+    let flagged_order = if flags.contains(F::TFF) {
+        FrameFieldOrder::TopFirst
+    } else {
+        FrameFieldOrder::BottomFirst
+    };
+    let interlaced = match mode {
+        M::Progressive => false,
+        M::Interleaved => true,
+        M::Mixed => flags.contains(F::INTERLACED),
+        other => {
+            return Err(Error::Decode(format!(
+                "unsupported decoded interlace mode {other:?}"
+            )));
+        }
+    };
+    let rff = flags.contains(F::RFF);
+    let field_order = match (mode, caps_order) {
+        (M::Progressive, _) => FrameFieldOrder::Unknown,
+        (M::Interleaved, O::TopFieldFirst) => FrameFieldOrder::TopFirst,
+        (M::Interleaved, O::BottomFieldFirst) => FrameFieldOrder::BottomFirst,
+        // A repeated field of a progressive MIXED frame still needs its parity.
+        _ if interlaced || rff => flagged_order,
+        _ => FrameFieldOrder::Unknown,
+    };
+    if !interlaced {
+        return Ok((
             FrameInterlaceMode::Progressive,
-            FrameFieldOrder::Unknown,
+            field_order,
+            rff && mode == M::Mixed,
             false,
-            false,
-        )),
-        M::Interleaved => Ok((
-            FrameInterlaceMode::Interleaved,
-            if flags.contains(F::TFF) {
-                FrameFieldOrder::TopFirst
-            } else {
-                FrameFieldOrder::BottomFirst
-            },
-            flags.contains(F::RFF),
-            flags.contains(F::ONEFIELD),
-        )),
-        other => Err(Error::Decode(format!(
-            "unsupported decoded interlace mode {other:?}"
-        ))),
+        ));
     }
+    Ok((
+        FrameInterlaceMode::Interleaved,
+        field_order,
+        rff,
+        flags.contains(F::ONEFIELD),
+    ))
 }
 
 // AUD (NAL type 9) must remain first in an H.264 access unit. Return the
@@ -755,8 +774,11 @@ impl Decoder {
             (n, d) if n > 0 && d > 0 => (n as u32, d as u32),
             _ => return Err(Error::Decode("invalid pixel aspect ratio".into())),
         };
-        let (interlace_mode, field_order, repeat_first_field, one_field) =
-            frame_fields(info.interlace_mode(), buffer.video_flags())?;
+        let (interlace_mode, field_order, repeat_first_field, one_field) = frame_fields(
+            info.interlace_mode(),
+            info.field_order(),
+            buffer.video_flags(),
+        )?;
         let color = info.colorimetry();
         let matrix = color_matrix(color.matrix());
         let layout = FrameLayout {
@@ -1684,8 +1706,9 @@ mod tests {
                 frame.layout().interlace_mode,
                 FrameInterlaceMode::Interleaved
             );
-            // FFprobe's per-FRAME top_field_first=0 agrees with GstVideoBuffer
-            // TFF=0. FFprobe's separate stream-level field_order=tt does not.
+            // Despite the file name, the caps say bottom-field-first and
+            // FFprobe's per-frame top_field_first=0 agrees; only FFprobe's
+            // stream-level field_order=tt says otherwise.
             assert_eq!(frame.layout().field_order, FrameFieldOrder::BottomFirst);
             assert!(!frame.layout().one_field);
             assert!(!frame.layout().repeat_first_field);
@@ -1694,51 +1717,90 @@ mod tests {
 
     #[test]
     fn interlace_flags_are_per_buffer_and_unsupported_modes_are_rejected() {
-        use gst_video::{VideoBufferFlags as F, VideoInterlaceMode as M};
-        assert_eq!(
-            frame_fields(M::Progressive, F::empty()).unwrap(),
+        use gst_video::{VideoBufferFlags as F, VideoFieldOrder as O, VideoInterlaceMode as M};
+        use {FrameFieldOrder as Order, FrameInterlaceMode as Mode};
+        for (mode, caps_order, flags, expected) in [
             (
-                FrameInterlaceMode::Progressive,
-                FrameFieldOrder::Unknown,
-                false,
-                false
-            )
-        );
-        assert_eq!(
-            frame_fields(M::Interleaved, F::INTERLACED | F::TFF | F::RFF).unwrap(),
+                M::Progressive,
+                O::Unknown,
+                F::empty(),
+                (Mode::Progressive, Order::Unknown, false, false),
+            ),
             (
-                FrameInterlaceMode::Interleaved,
-                FrameFieldOrder::TopFirst,
-                true,
-                false
-            )
-        );
-        assert_eq!(
-            frame_fields(M::Interleaved, F::INTERLACED | F::ONEFIELD).unwrap(),
+                M::Progressive,
+                O::Unknown,
+                F::RFF,
+                (Mode::Progressive, Order::Unknown, false, false),
+            ),
             (
-                FrameInterlaceMode::Interleaved,
-                FrameFieldOrder::BottomFirst,
-                false,
-                true
-            )
-        );
-        assert_eq!(
-            frame_fields(M::Interleaved, F::INTERLACED | F::TFF | F::ONEFIELD).unwrap(),
+                M::Interleaved,
+                O::Unknown,
+                F::INTERLACED | F::TFF | F::RFF,
+                (Mode::Interleaved, Order::TopFirst, true, false),
+            ),
             (
-                FrameInterlaceMode::Interleaved,
-                FrameFieldOrder::TopFirst,
-                false,
-                true
-            )
-        );
-        assert!(matches!(
-            frame_fields(M::Mixed, F::INTERLACED),
-            Err(Error::Decode(_))
-        ));
-        assert!(matches!(
-            frame_fields(M::Fields, F::INTERLACED),
-            Err(Error::Decode(_))
-        ));
+                M::Interleaved,
+                O::Unknown,
+                F::INTERLACED | F::ONEFIELD,
+                (Mode::Interleaved, Order::BottomFirst, false, true),
+            ),
+            (
+                M::Interleaved,
+                O::Unknown,
+                F::INTERLACED | F::TFF | F::ONEFIELD,
+                (Mode::Interleaved, Order::TopFirst, false, true),
+            ),
+            // A stream-wide caps field order applies even without buffer flags.
+            (
+                M::Interleaved,
+                O::TopFieldFirst,
+                F::empty(),
+                (Mode::Interleaved, Order::TopFirst, false, false),
+            ),
+            (
+                M::Interleaved,
+                O::BottomFieldFirst,
+                F::TFF,
+                (Mode::Interleaved, Order::BottomFirst, false, false),
+            ),
+            // Mixed streams carry interlacing and field order per buffer.
+            (
+                M::Mixed,
+                O::Unknown,
+                F::INTERLACED | F::TFF,
+                (Mode::Interleaved, Order::TopFirst, false, false),
+            ),
+            (
+                M::Mixed,
+                O::Unknown,
+                F::INTERLACED,
+                (Mode::Interleaved, Order::BottomFirst, false, false),
+            ),
+            (
+                M::Mixed,
+                O::Unknown,
+                F::empty(),
+                (Mode::Progressive, Order::Unknown, false, false),
+            ),
+            (
+                M::Mixed,
+                O::Unknown,
+                F::TFF | F::RFF,
+                (Mode::Progressive, Order::TopFirst, true, false),
+            ),
+        ] {
+            assert_eq!(
+                frame_fields(mode, caps_order, flags).unwrap(),
+                expected,
+                "{mode:?} {caps_order:?} {flags:?}"
+            );
+        }
+        for mode in [M::Fields, M::Alternate] {
+            assert!(matches!(
+                frame_fields(mode, O::Unknown, F::INTERLACED),
+                Err(Error::Decode(_))
+            ));
+        }
     }
 
     #[test]

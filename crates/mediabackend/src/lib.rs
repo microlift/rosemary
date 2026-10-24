@@ -141,10 +141,12 @@ pub struct FrameLayout {
     pub pixel_aspect_ratio: (u32, u32),
     /// Chroma cositing from decoded output caps, distinct from colorimetry.
     pub chroma_siting: ChromaSiting,
-    /// Modes requiring field-specific planes or telecine reconstruction fail
-    /// at decode instead of being represented as incomplete frame layouts.
+    /// Per-frame: a stream mixing interlaced and progressive pictures reports
+    /// each one as it is. Modes requiring field-specific planes fail at
+    /// decode instead of being represented as incomplete frame layouts.
     pub interlace_mode: FrameInterlaceMode,
-    /// Per-buffer first field (unknown for progressive buffers).
+    /// First field in display order. Unknown for progressive frames unless
+    /// repeat_first_field is set, since the repeated field has a parity.
     pub field_order: FrameFieldOrder,
     /// Repeat the first field in presentation, as specified by the buffer.
     pub repeat_first_field: bool,

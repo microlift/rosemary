@@ -18,9 +18,9 @@ NV12, I420 and BGRA outputs.
   one-field flags, and color information. The public colorimetry enums preserve
   the decoded BT.2020 matrix/primaries, SMPTE ST 2084 (PQ) and ARIB STD-B67
   (HLG) characteristics; unrecognized numeric values remain distinguishable
-  from genuinely unspecified metadata. Progressive and
-  interleaved frames are supported; Mixed, Fields and alternate-field formats
-  fail explicitly until their additional reconstruction/plane contracts exist.
+  from genuinely unspecified metadata. Progressive, interleaved and mixed
+  streams are supported, with mixed streams reported per frame; Fields and
+  alternate-field formats fail explicitly until a plane contract exists.
   Unknown color range is distinct from limited range. Signed PTS/DTS are
   expressed as nanoseconds, independently of sample IDs; durations remain
   unsigned. The GStreamer backend applies a reversible +2^62 ns epoch bias
@@ -90,8 +90,8 @@ backpressure, terminal EOS, missing-IDR recovery, immediate single-IDR output
 without EOS, retained fatal bus errors including after EOS, decoded timing,
 BT.2020/PQ and BT.2020/HLG stream metadata, malformed or undefined
 AVCC NAL headers and direct NAL-chain recovery, below/above 8 MiB aggregate SPS/PPS boundaries with atomic rejected
-reconfiguration, anamorphic/interlaced metadata, per-buffer field flags with explicit unsupported
-interlace-mode rejection, MPEG-2 versus JPEG chroma siting, negative source DTS
+reconfiguration, anamorphic/interlaced metadata, per-buffer field flags, mixed interlace, explicit
+field-separated interlace-mode rejection, MPEG-2 versus JPEG chroma siting, negative source DTS
 and decoded signed PTS through B-frame reordering, one-byte AVCC prefixes with
 a 425-byte legal High10 PPS and profile-specific avcC extensions, an AUD-less
 10-picture stream, and truncated input. A 20-picture changed-PPS mid-GOP regression matches independent FFmpeg
@@ -114,10 +114,11 @@ CoreVideo/Metal presentation require separate integration. A public GStreamer
 still-frame/segment-done drain emits delayed pictures, but on the tested libav
 backend damages subsequent H.264 predicted-picture content until next IDR.
 Never expose that drain as VideoToolbox-compatible. Frame field order comes from
-GStreamer decoded buffer flags rather than only negotiated caps; FFprobe's
-independent per-frame top_field_first=0 agrees with the BFF flags for the pinned
-interlaced fixture, even though its stream summary reports field_order=tt.
-Complex telecine reconstruction and multi-meta field buffers remain unsupported.
+negotiated caps when they fix it for the stream, otherwise from each decoded
+buffer's flags. For the pinned interlaced fixture both GStreamer's caps and
+FFprobe's per-frame top_field_first=0 say bottom field first, even though the
+file name and FFprobe's stream summary (field_order=tt) suggest otherwise.
+Multi-meta field buffers remain unsupported.
 Signed media times are represented to nanosecond precision; fractional
 CoreMedia time scales requiring subnanosecond precision must be converted by
 an integrating adapter rather than silently rounded by this decoder.
