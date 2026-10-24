@@ -94,6 +94,14 @@ fn recognise(bytes: &[u8]) -> Option<Recognised> {
     // offset. Recognised so the diagnostic can name them, with no size - which
     // `-size` reports as zero, the same as Apple does for an image it has not
     // measured yet.
+    // PDF: the first page's media box, in points, like every size here.
+    if bytes.starts_with(b"%PDF-") {
+        let (width, height) = crate::pdf::page_size(bytes)?;
+        return Some(Recognised {
+            format: "PDF",
+            size: NSSize { width, height },
+        });
+    }
     if bytes.starts_with(b"icns") {
         return Some(Recognised {
             format: "ICNS",
@@ -256,7 +264,13 @@ pub fn bitmap(object: Id) -> Option<crate::raster::Bitmap> {
     if !is_image(object) {
         return None;
     }
-    crate::raster::decode(bytes_of(object)).or_else(|| {
+    let bytes = bytes_of(object);
+    if bytes.starts_with(b"%PDF-") {
+        // Twice the page's size, so the artwork stays sharp on a
+        // high-density display; drawing scales it to the image's size.
+        return crate::pdf::render(bytes, 2.0);
+    }
+    crate::raster::decode(bytes).or_else(|| {
         // Built by `-initWithSize:` plus `-addRepresentation:`, which is how a
         // program that generated its pixels rather than loading a file makes
         // one. The first representation is the image, as it is in Apple's for
@@ -396,7 +410,9 @@ pub fn empty(size: NSSize) -> Id {
 
 /// The extensions `+imageNamed:` tries after the name as given, in the order
 /// Apple's lookup prefers them.
-const NAMED_EXTENSIONS: &[&str] = &["png", "tiff", "tif", "icns", "jpg", "jpeg", "gif", "bmp"];
+const NAMED_EXTENSIONS: &[&str] = &[
+    "png", "tiff", "tif", "pdf", "icns", "jpg", "jpeg", "gif", "bmp",
+];
 
 /// `+[NSImage imageNamed:]`.
 ///

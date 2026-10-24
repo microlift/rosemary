@@ -78,6 +78,7 @@ pub mod panel;
 mod paragraph;
 pub mod pasteboard;
 mod pasteboard_manager;
+mod pdf;
 mod popup;
 pub use coregraphics::raster;
 mod responder;
