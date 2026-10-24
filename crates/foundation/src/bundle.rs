@@ -1106,6 +1106,43 @@ mod tests {
         </dict></plist>"#;
 
     #[test]
+    fn a_bundle_is_found_by_its_file_url_as_by_its_path() {
+        crate::bootstrap();
+        let exe = scratch("url", INFO);
+        let app = exe.parent().unwrap().parent().unwrap().parent().unwrap();
+        let guest = spelled(app).unwrap().to_string_lossy().into_owned();
+        let ns_bundle =
+            objc::class::ptr(objc::class::lookup(c"NSBundle").unwrap()) as objc::object::Id;
+        let by_path = class::at_path(ns_bundle, &guest);
+        assert!(!by_path.is_null());
+
+        let url = corefoundation::url::new_file_url(&guest, true);
+        // SAFETY: `+bundleWithURL:` takes one object.
+        let by_url = unsafe {
+            class::bundle_with_url(
+                ns_bundle,
+                objc::sel::get("bundleWithURL:"),
+                url as objc::object::Id,
+            )
+        };
+        assert_eq!(by_url, by_path);
+
+        let web = corefoundation::url::new("https://example.com/Thing.app");
+        let none = unsafe {
+            class::bundle_with_url(
+                ns_bundle,
+                objc::sel::get("bundleWithURL:"),
+                web as objc::object::Id,
+            )
+        };
+        assert!(none.is_null());
+        unsafe {
+            corefoundation::api::CFRelease(url);
+            corefoundation::api::CFRelease(web);
+        }
+    }
+
+    #[test]
     fn a_bundle_is_recognised_by_shape_and_read_through() {
         let exe = scratch("shape", INFO);
         let layout = Layout::enclosing(&exe).expect("a bundle");
@@ -1307,6 +1344,18 @@ pub(crate) mod class {
             return std::ptr::null_mut();
         };
         at_path(class, guest)
+    }
+
+    /// `+bundleWithURL:`: `+bundleWithPath:` for a `file:` URL, nil for any
+    /// other.
+    pub(crate) unsafe extern "C" fn bundle_with_url(class: Id, _sel: Sel, url: Id) -> Id {
+        // SAFETY: an `NSURL`, or nil, which is no URL.
+        let Some(path) = unsafe { corefoundation::url::as_url(url as _) }
+            .and_then(|contents| contents.file_path())
+        else {
+            return std::ptr::null_mut();
+        };
+        at_path(class, &path)
     }
 
     /// The bundle at the guest path `guest`, unretained: the main one, one on
@@ -1796,7 +1845,8 @@ pub(crate) mod class {
             "mainBundle" => main_bundle, c"@16@0:8";
             "bundleForClass:" => bundle_for_class, c"@24@0:8#16";
             "pathsForResourcesOfType:inDirectory:" => class_paths_for_resources_of_type, c"@32@0:8@16@24";
-            "bundleWithPath:" => bundle_with_path, c"@24@0:8@16"
+            "bundleWithPath:" => bundle_with_path, c"@24@0:8@16";
+            "bundleWithURL:" => bundle_with_url, c"@24@0:8@16"
         });
     }
 }
