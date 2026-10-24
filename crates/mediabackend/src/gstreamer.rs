@@ -197,11 +197,12 @@ fn avcc_sps_profile(sps: &[u8]) -> Result<Option<AvccHighProfile>, Error> {
     if sps_id > 31 {
         return Err(Error::InvalidInput("invalid AVC SPS ID".into()));
     }
-    if !matches!(sps[1], 100 | 110 | 122 | 144) {
-        if matches!(sps[1], 66 | 77 | 88) {
-            return Ok(None);
-        }
-        return Err(Error::InvalidInput("unsupported AVC profile".into()));
+    // H.264 7.3.2.1.1 lists the profiles carrying chroma_format_idc and bit
+    // depths; 144 is the withdrawn High 4:4:4, which encoders still emit.
+    match sps[1] {
+        66 | 77 | 88 => return Ok(None),
+        100 | 110 | 122 | 244 | 44 | 83 | 86 | 118 | 128 | 138 | 139 | 134 | 135 | 144 => {}
+        _ => return Err(Error::InvalidInput("unsupported AVC profile".into())),
     }
     let read = || Error::InvalidInput("truncated AVC high-profile SPS".into());
     let chroma_format = ue(&rbsp, &mut pos).ok_or_else(read)?;
@@ -1829,11 +1830,24 @@ mod tests {
             })
         );
         assert!(config.caps().ends_with("fdf8f800"));
-        let unknown_profile = [0x67, 244, 0, 10, 0x80];
+        let unknown_profile = [0x67, 99, 0, 10, 0x80];
         assert!(matches!(
             AvccConfiguration::new(&[&unknown_profile, &pps], 4),
             Err(Error::InvalidInput(_))
         ));
+        // CAVLC 4:4:4 Intra: sps_id 0, chroma_format_idc 3, separate planes
+        // off, 8-bit luma and chroma.
+        let cavlc444 = [0x67, 44, 0, 10, 0b1001_0001, 0b1100_0000];
+        assert_eq!(
+            AvccConfiguration::new(&[&cavlc444, &pps], 4)
+                .unwrap()
+                .high_profile,
+            Some(AvccHighProfile {
+                chroma_format: 3,
+                bit_depth_luma_minus8: 0,
+                bit_depth_chroma_minus8: 0,
+            })
+        );
         let truncated_high = [0x67, 100, 0, 10, 0x80];
         assert!(matches!(
             AvccConfiguration::new(&[&truncated_high, &pps], 4),
@@ -1844,6 +1858,30 @@ mod tests {
             AvccConfiguration::new(&[sps, &oversized_pps], 1),
             Err(Error::InvalidInput(_))
         ));
+    }
+
+    #[test]
+    fn high444_predictive_avcc_decodes() {
+        let (sets, idr) =
+            avcc_idr_fixture(include_bytes!("../tests/fixtures/high444_2_32x32.h264"));
+        assert_eq!(sets[0][1], 244);
+        let refs = sets.iter().map(Vec::as_slice).collect::<Vec<_>>();
+        let config = AvccConfiguration::new(&refs, 4).unwrap();
+        assert_eq!(config.high_profile.unwrap().chroma_format, 3);
+        let mut decoder = Decoder::h264_avcc(&refs, 4, 1).unwrap();
+        decoder
+            .submit(AccessUnit {
+                id: 244,
+                bytes: &idr,
+                pts_ns: Some(0),
+                dts_ns: None,
+                duration_ns: None,
+            })
+            .unwrap();
+        decoder.end_stream().unwrap();
+        let frame = decoder.pull(Duration::from_secs(3)).unwrap().unwrap();
+        assert_eq!(frame.id(), 244);
+        assert_eq!((frame.layout().width, frame.layout().height), (32, 32));
     }
 
     #[test]

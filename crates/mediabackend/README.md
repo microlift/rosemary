@@ -36,7 +36,8 @@ NV12, I420 and BGRA outputs.
   VideoFrame source timing methods and are preserved using per-buffer
   timestamp metadata, without retaining an unbounded per-ID lookup table.
 - AVCC configuration records use independent 16-bit SPS/PPS lengths and
-  validated High/High10/High422 profile-specific chroma/bit-depth fields.
+  validated chroma/bit-depth fields for every profile whose SPS carries them
+  (High, High 10, High 4:2:2, High 4:4:4 and the scalable/multiview profiles).
   Unsupported AVC profiles and SPS extension NALs fail explicitly. The
   sample NAL-prefix width is validated separately (1, 2, or 4 bytes). The
   ordinary AVCC path validates every length-prefixed NAL without conversion
