@@ -75,13 +75,21 @@ fn retained(value: &Value, what: &str) -> CFTypeRef {
             }
             dictionary
         }
-        // An `NSDate` is Foundation's and this tree has none. Refused rather
-        // than turned into the number of seconds it holds, which a guest sending
-        // `-timeIntervalSinceReferenceDate` would read correctly and a guest
-        // sending anything else would not.
-        Value::Date(_) => objc::fail!(
-            "{what}: this property list holds a date, and this runtime has no NSDate to make of it"
-        ),
+        Value::Date(interval) => {
+            let class = objc::class::lookup(c"NSDate").expect("Foundation registered NSDate");
+            // SAFETY: `+dateWithTimeIntervalSinceReferenceDate:` is
+            // `id (Class, SEL, NSTimeInterval)`, installed by `crate::timer`.
+            let date = unsafe {
+                let f: unsafe extern "C" fn(Id, objc::sel::Sel, f64) -> Id =
+                    std::mem::transmute(objc::msg::entry());
+                f(
+                    objc::class::ptr(class) as Id,
+                    objc::sel::get("dateWithTimeIntervalSinceReferenceDate:"),
+                    *interval,
+                )
+            };
+            objc::arc::retain(date) as CFTypeRef
+        }
         Value::Uid(_) => objc::fail!(
             "{what}: this property list holds a CF$UID, which is an archive's reference and not a \
              value - see foundation::unarchiver"
