@@ -36,7 +36,14 @@ pub enum ChromaSiting {
 pub enum ColorMatrix {
     Bt601,
     Bt709,
+    Bt2020,
+    Rgb,
+    Fcc,
+    Smpte240m,
+    /// No matrix was specified by the decoded stream.
     Unknown,
+    /// Unrecognized GStreamer numeric value, distinct from unspecified.
+    Other(i32),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -44,14 +51,42 @@ pub enum ColorPrimaries {
     Bt709,
     Ebu3213,
     SmpteC,
+    Bt470m,
+    Bt470bg,
+    Smpte170m,
+    Smpte240m,
+    Film,
+    Bt2020,
+    AdobeRgb,
+    Smptest428,
+    Smpterp431,
+    Smpteeg432,
     Unknown,
+    Other(i32),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ColorTransfer {
     Bt709,
     Srgb,
+    Bt601,
+    Smpte240m,
+    Gamma10,
+    Gamma18,
+    Gamma20,
+    Gamma22,
+    Gamma28,
+    Log100,
+    Log316,
+    Bt202010,
+    Bt202012,
+    AdobeRgb,
+    /// SMPTE ST 2084 perceptual quantizer (PQ).
+    Smpte2084,
+    /// ARIB STD-B67 hybrid log-gamma (HLG).
+    AribStdB67,
     Unknown,
+    Other(i32),
 }
 
 /// A decode-order sample identifier is not a timestamp. Never recover it from

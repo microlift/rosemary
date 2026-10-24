@@ -6,11 +6,16 @@
 
 use std::time::Duration;
 
+use gst::glib::translate::IntoGlib;
 use gst::prelude::*;
 use gst_app::{AppSink, AppSrc};
 use gst_video::video_frame::VideoBufferExt;
 
 const INPUT_QUEUE_LIMIT: u64 = 8 * 1024 * 1024;
+// Each initial SPS/PPS contributes a four-byte start code. Leave at least
+// one start code and one NAL header for the first submitted access unit.
+const MAX_INITIAL_PARAMETER_BYTES: usize = INPUT_QUEUE_LIMIT as usize - 5;
+
 // GStreamer uses unsigned nanoseconds with u64::MAX reserved for NONE.
 // Bias signed media times into a positive range (146 years of negative
 // preroll, all positive i64 nanoseconds). Reject values outside this range.
@@ -29,6 +34,67 @@ fn gst_media_time(ns: i64) -> Result<gst::ClockTime, Error> {
 fn original_media_time(time: gst::ClockTime) -> Result<i64, Error> {
     i64::try_from(i128::from(time.nseconds()) - MEDIA_TIME_EPOCH_NS)
         .map_err(|_| Error::Decode("decoded timestamp outside signed timeline".into()))
+}
+
+// Distinguish genuinely unspecified metadata from both known and new
+// host-supported colorimetry values. In particular, unknown GStreamer enum
+// numbers must not silently look like unspecified color data.
+fn color_matrix(matrix: gst_video::VideoColorMatrix) -> ColorMatrix {
+    use gst_video::VideoColorMatrix as M;
+    match matrix {
+        M::Unknown => ColorMatrix::Unknown,
+        M::Rgb => ColorMatrix::Rgb,
+        M::Fcc => ColorMatrix::Fcc,
+        M::Bt601 => ColorMatrix::Bt601,
+        M::Bt709 => ColorMatrix::Bt709,
+        M::Smpte240m => ColorMatrix::Smpte240m,
+        M::Bt2020 => ColorMatrix::Bt2020,
+        other => ColorMatrix::Other(other.into_glib()),
+    }
+}
+
+fn color_primaries(primaries: gst_video::VideoColorPrimaries) -> ColorPrimaries {
+    use gst_video::VideoColorPrimaries as P;
+    match primaries {
+        P::Unknown => ColorPrimaries::Unknown,
+        P::Bt709 => ColorPrimaries::Bt709,
+        P::Bt470m => ColorPrimaries::Bt470m,
+        P::Bt470bg => ColorPrimaries::Bt470bg,
+        P::Smpte170m => ColorPrimaries::Smpte170m,
+        P::Smpte240m => ColorPrimaries::Smpte240m,
+        P::Film => ColorPrimaries::Film,
+        P::Bt2020 => ColorPrimaries::Bt2020,
+        P::Adobergb => ColorPrimaries::AdobeRgb,
+        P::Smptest428 => ColorPrimaries::Smptest428,
+        P::Smpterp431 => ColorPrimaries::Smpterp431,
+        P::Smpteeg432 => ColorPrimaries::Smpteeg432,
+        P::Ebu3213 => ColorPrimaries::Ebu3213,
+        other => ColorPrimaries::Other(other.into_glib()),
+    }
+}
+
+fn color_transfer(transfer: gst_video::VideoTransferFunction) -> ColorTransfer {
+    use gst_video::VideoTransferFunction as T;
+    match transfer {
+        T::Unknown => ColorTransfer::Unknown,
+        T::Gamma10 => ColorTransfer::Gamma10,
+        T::Gamma18 => ColorTransfer::Gamma18,
+        T::Gamma20 => ColorTransfer::Gamma20,
+        T::Gamma22 => ColorTransfer::Gamma22,
+        T::Gamma28 => ColorTransfer::Gamma28,
+        T::Bt709 => ColorTransfer::Bt709,
+        T::Smpte240m => ColorTransfer::Smpte240m,
+        T::Srgb => ColorTransfer::Srgb,
+        T::Log100 => ColorTransfer::Log100,
+        T::Log316 => ColorTransfer::Log316,
+        T::Bt202010 => ColorTransfer::Bt202010,
+        T::Bt202012 => ColorTransfer::Bt202012,
+        T::Adobergb => ColorTransfer::AdobeRgb,
+        T::Smpte2084 => ColorTransfer::Smpte2084,
+        T::AribStdB67 => ColorTransfer::AribStdB67,
+        T::Bt601 => ColorTransfer::Bt601,
+        other => ColorTransfer::Other(other.into_glib()),
+    }
 }
 
 fn chroma_siting(site: gst_video::VideoChromaSite) -> ChromaSiting {
@@ -166,12 +232,22 @@ impl AvccConfiguration {
         }
         let mut sps = Vec::new();
         let mut pps = Vec::new();
+        let mut initial_injection_bytes = 0usize;
         for &set in sets {
             // avcC parameter-set lengths are always u16; sample NAL prefixes
             // use the independently negotiated nal_length width.
             if set.first().is_none_or(|b| b & 0x80 != 0) || set.len() > u16::MAX as usize {
                 return Err(Error::InvalidInput("malformed AVCC parameter set".into()));
             }
+            initial_injection_bytes = initial_injection_bytes
+                .checked_add(4)
+                .and_then(|count| count.checked_add(set.len()))
+                .filter(|count| *count <= MAX_INITIAL_PARAMETER_BYTES)
+                .ok_or_else(|| {
+                    Error::InvalidInput(
+                        "aggregate AVC parameter sets exceed input queue limit".into(),
+                    )
+                })?;
             match set[0] & 31 {
                 7 if set.len() >= 4 => sps.push(set.to_vec()),
                 8 if set.len() >= 2 => pps.push(set.to_vec()),
@@ -377,12 +453,21 @@ fn leading_avcc_aud(packet: &[u8], width: u8) -> Result<Option<usize>, Error> {
     Ok((packet[width] & 31 == 9).then_some(n))
 }
 
-// Some GStreamer avcC parsers reject parameter sets exceeding 255 bytes even
-// though the record encodes them with u16 lengths. Feed only those sessions
-// through byte-stream caps; ordinary AVCC input remains zero-conversion.
-fn avcc_to_annexb(packet: &[u8], nal_length: u8, out: &mut Vec<u8>) -> Result<(), Error> {
-    let width = nal_length as usize;
-    let mut cursor = 0;
+// Validate every NAL prefix and payload before anything reaches the
+// asynchronous parser. The callback keeps ordinary AVCC zero-conversion and
+// allocation-free; the Annex-B fallback reuses these exact checks.
+fn each_avcc_nal(
+    packet: &[u8],
+    nal_length: u8,
+    mut visit: impl FnMut(&[u8]) -> Result<(), Error>,
+) -> Result<(), Error> {
+    if !matches!(nal_length, 1 | 2 | 4) || packet.is_empty() {
+        return Err(Error::InvalidInput(
+            "invalid AVCC NAL prefix or empty sample".into(),
+        ));
+    }
+    let width = usize::from(nal_length);
+    let mut cursor = 0usize;
     while cursor < packet.len() {
         if packet.len() - cursor < width {
             return Err(Error::InvalidInput(
@@ -399,24 +484,31 @@ fn avcc_to_annexb(packet: &[u8], nal_length: u8, out: &mut Vec<u8>) -> Result<()
                 "invalid AVC NAL unit length or header".into(),
             ));
         }
+        visit(&packet[cursor..cursor + size])?;
+        cursor += size;
+    }
+    Ok(())
+}
+
+// Some GStreamer avcC parsers reject parameter sets exceeding 255 bytes even
+// though the record encodes them with u16 lengths. Feed only those sessions
+// through byte-stream caps; ordinary AVCC input remains zero-conversion.
+fn avcc_to_annexb(packet: &[u8], nal_length: u8, out: &mut Vec<u8>) -> Result<(), Error> {
+    each_avcc_nal(packet, nal_length, |nal| {
         if out
             .len()
             .checked_add(4)
-            .and_then(|n| n.checked_add(size))
-            .is_none_or(|n| n as u64 > INPUT_QUEUE_LIMIT)
+            .and_then(|len| len.checked_add(nal.len()))
+            .is_none_or(|len| len as u64 > INPUT_QUEUE_LIMIT)
         {
             return Err(Error::InvalidInput(
                 "expanded AVC packet exceeds queue limit".into(),
             ));
         }
         out.extend_from_slice(&[0, 0, 0, 1]);
-        out.extend_from_slice(&packet[cursor..cursor + size]);
-        cursor += size;
-    }
-    if cursor == 0 {
-        return Err(Error::InvalidInput("empty AVC access unit".into()));
-    }
-    Ok(())
+        out.extend_from_slice(nal);
+        Ok(())
+    })
 }
 
 impl Decoder {
@@ -498,7 +590,23 @@ impl Decoder {
                     "updated PPS exceeds sample NAL-length prefix capacity".into(),
                 ));
             }
-            let mut pending = Vec::new();
+            let prefix_width = if self.avcc_annexb_fallback {
+                4
+            } else {
+                nal_length as usize
+            };
+            let minimum_packet_bytes = prefix_width + 1;
+            let pending_size = incoming
+                .pps
+                .iter()
+                .try_fold(0usize, |sum, pps| {
+                    sum.checked_add(prefix_width)?.checked_add(pps.len())
+                })
+                .filter(|count| *count <= INPUT_QUEUE_LIMIT as usize - minimum_packet_bytes)
+                .ok_or_else(|| {
+                    Error::InvalidInput("updated PPS aggregate exceeds input queue limit".into())
+                })?;
+            let mut pending = Vec::with_capacity(pending_size);
             for pps in &incoming.pps {
                 if self.avcc_annexb_fallback {
                     pending.extend_from_slice(&[0, 0, 0, 1]);
@@ -644,11 +752,7 @@ impl Decoder {
         let (interlace_mode, field_order, repeat_first_field, one_field) =
             frame_fields(info.interlace_mode(), buffer.video_flags())?;
         let color = info.colorimetry();
-        let matrix = match color.matrix() {
-            gst_video::VideoColorMatrix::Bt601 => ColorMatrix::Bt601,
-            gst_video::VideoColorMatrix::Bt709 => ColorMatrix::Bt709,
-            _ => ColorMatrix::Unknown,
-        };
+        let matrix = color_matrix(color.matrix());
         let layout = FrameLayout {
             width: info.width() as usize,
             height: info.height() as usize,
@@ -675,17 +779,8 @@ impl Decoder {
             repeat_first_field,
             one_field,
             matrix,
-            primaries: match color.primaries() {
-                gst_video::VideoColorPrimaries::Bt709 => ColorPrimaries::Bt709,
-                gst_video::VideoColorPrimaries::Bt470bg => ColorPrimaries::Ebu3213,
-                gst_video::VideoColorPrimaries::Smpte170m => ColorPrimaries::SmpteC,
-                _ => ColorPrimaries::Unknown,
-            },
-            transfer: match color.transfer() {
-                gst_video::VideoTransferFunction::Bt709 => ColorTransfer::Bt709,
-                gst_video::VideoTransferFunction::Srgb => ColorTransfer::Srgb,
-                _ => ColorTransfer::Unknown,
-            },
+            primaries: color_primaries(color.primaries()),
+            transfer: color_transfer(color.transfer()),
             full_range: match color.range() {
                 gst_video::VideoColorRange::Range0_255 => Some(true),
                 gst_video::VideoColorRange::Range16_235 => Some(false),
@@ -763,6 +858,11 @@ impl VideoDecoder for Decoder {
             return Err(Error::InvalidInput(
                 "compressed access unit exceeds queue limit".into(),
             ));
+        }
+        if !self.avcc_annexb_fallback
+            && let Some(config) = &self.avcc
+        {
+            each_avcc_nal(packet.bytes, config.nal_length, |_| Ok(()))?;
         }
         let annexb = if self.avcc_annexb_fallback {
             let config = self
@@ -1878,6 +1978,180 @@ mod tests {
             assert_eq!(frame.layout().primaries, ColorPrimaries::Unknown);
             assert_eq!(frame.layout().transfer, ColorTransfer::Unknown);
         }
+    }
+
+    #[test]
+    fn unrecognized_numeric_color_values_are_not_treated_as_unspecified() {
+        assert_eq!(
+            color_matrix(gst_video::VideoColorMatrix::Unknown),
+            ColorMatrix::Unknown
+        );
+        assert_eq!(
+            color_matrix(gst_video::VideoColorMatrix::__Unknown(413)),
+            ColorMatrix::Other(413)
+        );
+        assert_eq!(
+            color_primaries(gst_video::VideoColorPrimaries::Unknown),
+            ColorPrimaries::Unknown
+        );
+        assert_eq!(
+            color_primaries(gst_video::VideoColorPrimaries::__Unknown(414)),
+            ColorPrimaries::Other(414)
+        );
+        assert_eq!(
+            color_transfer(gst_video::VideoTransferFunction::Unknown),
+            ColorTransfer::Unknown
+        );
+        assert_eq!(
+            color_transfer(gst_video::VideoTransferFunction::__Unknown(415)),
+            ColorTransfer::Other(415)
+        );
+    }
+
+    #[test]
+    fn bt2020_pq_and_hlg_metadata_survive_decode() {
+        for (stream, transfer) in [
+            (
+                include_bytes!("../tests/fixtures/bt2020_pq_2_64x64.h264").as_slice(),
+                ColorTransfer::Smpte2084,
+            ),
+            (
+                include_bytes!("../tests/fixtures/bt2020_hlg_2_64x64.h264").as_slice(),
+                ColorTransfer::AribStdB67,
+            ),
+        ] {
+            let units = aud_delimited_units(stream);
+            assert_eq!(units.len(), 2);
+            let mut decoder = Decoder::h264_nv12(1).unwrap();
+            for (i, bytes) in units.iter().enumerate() {
+                decoder
+                    .submit(AccessUnit {
+                        id: i as u64 + 9000,
+                        bytes,
+                        pts_ns: Some(i as i64 * 200_000_000),
+                        dts_ns: None,
+                        duration_ns: Some(200_000_000),
+                    })
+                    .unwrap();
+            }
+            decoder.end_stream().unwrap();
+            for i in 0..2 {
+                let frame = decoder.pull(Duration::from_secs(3)).unwrap().unwrap();
+                assert_eq!(frame.id(), i + 9000);
+                assert_eq!(frame.layout().matrix, ColorMatrix::Bt2020);
+                assert_eq!(frame.layout().primaries, ColorPrimaries::Bt2020);
+                assert_eq!(frame.layout().transfer, transfer);
+            }
+        }
+    }
+
+    #[test]
+    fn malformed_avcc_nal_chain_does_not_poison_decoder() {
+        let (sets, valid) =
+            avcc_idr_fixture(include_bytes!("../tests/fixtures/pps_qp18_64x64.h264"));
+        let refs = sets.iter().map(Vec::as_slice).collect::<Vec<_>>();
+        let mut decoder = Decoder::h264_avcc(&refs, 4, 1).unwrap();
+        let bad = [
+            vec![0, 0, 0, 10, 0x65],
+            vec![0, 0, 0, 0],
+            vec![0, 0, 0, 1, 0x65, 0, 0, 0, 10, 0x61],
+            vec![0, 0, 0, 1, 0x65, 0, 0],
+            vec![0, 0, 0, 1, 0xe5], // forbidden_zero_bit
+        ];
+        for (i, bytes) in bad.iter().enumerate() {
+            assert!(
+                matches!(
+                    decoder.submit(AccessUnit {
+                        id: i as u64 + 700,
+                        bytes,
+                        pts_ns: Some(0),
+                        dts_ns: None,
+                        duration_ns: Some(33_333_333),
+                    }),
+                    Err(Error::InvalidInput(_))
+                ),
+                "malformed AVCC sequence {i} accepted"
+            );
+            assert!(decoder.fatal_error.is_none());
+            assert_eq!(decoder.input.current_level_bytes(), 0);
+        }
+        decoder
+            .submit(AccessUnit {
+                id: 999,
+                bytes: &valid,
+                pts_ns: Some(0),
+                dts_ns: None,
+                duration_ns: Some(33_333_333),
+            })
+            .unwrap();
+        decoder.end_stream().unwrap();
+        let frame = decoder.pull(Duration::from_secs(3)).unwrap().unwrap();
+        assert_eq!(frame.id(), 999);
+    }
+
+    #[test]
+    fn aggregate_parameter_set_boundary_and_failed_update_are_atomic() {
+        let (sets, valid) =
+            avcc_idr_fixture(include_bytes!("../tests/fixtures/pps_qp18_64x64.h264"));
+        let sps = sets[0].as_slice();
+        // For byte-stream fallback the decoder prepends four start-code bytes
+        // to every SPS/PPS, and a valid first 1-byte slice needs five bytes.
+        let allowance = INPUT_QUEUE_LIMIT as usize - 5;
+        let oversized_pps = vec![0x68; u16::MAX as usize];
+        let mut near = Vec::with_capacity(130);
+        near.push(sps);
+        for _ in 0..127 {
+            near.push(oversized_pps.as_slice());
+        }
+        let used = (sps.len() + 4) + 127 * (oversized_pps.len() + 4);
+        let remainder = allowance - used - 4;
+        assert!((2..=u16::MAX as usize).contains(&remainder));
+        let last_pps = vec![0x68; remainder];
+        near.push(&last_pps);
+        let near_config = AvccConfiguration::new(&near, 4).unwrap();
+        assert_eq!(
+            near_config
+                .sps
+                .iter()
+                .chain(&near_config.pps)
+                .map(|s| s.len() + 4)
+                .sum::<usize>(),
+            allowance
+        );
+        // One more byte leaves no space for the smallest valid converted AU.
+        let mut over_pps = last_pps.clone();
+        over_pps.push(0x68);
+        near.pop();
+        near.push(&over_pps);
+        assert!(matches!(
+            AvccConfiguration::new(&near, 4),
+            Err(Error::InvalidInput(_))
+        ));
+        assert!(matches!(
+            Decoder::h264_avcc(&near, 4, 1),
+            Err(Error::InvalidInput(_))
+        ));
+        let mut decoder = Decoder::h264_avcc(&[sps, &sets[1]], 4, 1).unwrap();
+        assert!(matches!(
+            decoder.reconfigure_avcc(&near, 4),
+            Err(Error::InvalidInput(_))
+        ));
+        assert_eq!(decoder.avcc.as_ref().unwrap().pps.len(), 1);
+        assert!(decoder.pending_pps.is_none());
+        decoder
+            .submit(AccessUnit {
+                id: 800,
+                bytes: &valid,
+                pts_ns: Some(0),
+                dts_ns: None,
+                duration_ns: None,
+            })
+            .unwrap();
+        decoder.end_stream().unwrap();
+        assert_eq!(
+            decoder.pull(Duration::from_secs(3)).unwrap().unwrap().id(),
+            800
+        );
     }
 
     fn avcc_idr_fixture(stream: &[u8]) -> (Vec<Vec<u8>>, Vec<u8>) {

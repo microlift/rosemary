@@ -15,7 +15,10 @@ NV12, I420 and BGRA outputs.
 - Frame layout carries validated strides/offsets, per-plane mapped spans,
   pixel format, optional crop, sample aspect ratio, negotiated chroma siting
   (JPEG/MPEG-2/DV/other/unknown), per-buffer field order, repeat-first/
-  one-field flags, and color information. Progressive and
+  one-field flags, and color information. The public colorimetry enums preserve
+  the decoded BT.2020 matrix/primaries, SMPTE ST 2084 (PQ) and ARIB STD-B67
+  (HLG) characteristics; unrecognized numeric values remain distinguishable
+  from genuinely unspecified metadata. Progressive and
   interleaved frames are supported; Mixed, Fields and alternate-field formats
   fail explicitly until their additional reconstruction/plane contracts exist.
   Unknown color range is distinct from limited range. Signed PTS/DTS are
@@ -31,9 +34,12 @@ NV12, I420 and BGRA outputs.
   validated High/High10/High422 profile-specific chroma/bit-depth fields.
   Unsupported AVC profiles and SPS extension NALs fail explicitly. The
   sample NAL-prefix width is validated separately (1, 2, or 4 bytes). The
-  ordinary AVCC path has no NAL conversion; unusually large initial parameter
-  sets use a bounds-checked Annex-B fallback to avoid a GStreamer codec-data
-  parsing limitation while preserving sample identities and backpressure.
+  ordinary AVCC path validates every length-prefixed NAL without conversion
+  or an extra allocation; malformed prefixes/headers fail recoverably as
+  `InvalidInput` before reaching the asynchronous decoder. Unusually large
+  initial parameter sets use a bounds-checked Annex-B fallback to avoid a
+  GStreamer codec-data parsing limitation while preserving sample identities
+  and backpressure.
 - AVCC input accepts SPS/PPS configuration and compatible live PPS changes.
   A changed PPS is carried in-band with the next accepted access unit rather
   than resetting the H.264 reference state through a caps update. If a changed
@@ -42,8 +48,11 @@ NV12, I420 and BGRA outputs.
   fallback accepts longer in-band PPS updates. Neither path restricts the
   initial avcC record's 16-bit parameter-set lengths. Annex-B access-unit
   input is supported. PPS injection preserves a leading AUD in either input
-  format. Access units larger than 8 MiB are
-  rejected; within that bound, queue backpressure is recoverable: drain output
+  format. Aggregate SPS/PPS initialization and reconfiguration injection
+  sizes are checked before decoder configuration state is committed. The
+  Annex-B fallback reserves at least five bytes for a minimal first NAL
+  after its initial parameter-set injection. Access units larger than 8 MiB
+  are rejected; within that bound, queue backpressure is recoverable: drain output
   and retry the **same** unconsumed input, rather than dropping frames.
 - End-of-stream is terminal and distinct from a temporarily empty output
   queue. `is_drained()` returns `Result<bool, Error>` and observes pending
@@ -68,7 +77,9 @@ PTS, a pinned 60-picture three-GOP pixel reference, colorimetry, range,
 NV12/I420/BGRA lifetime, same-SPS PPS reconfiguration, 256-frame bounded queue
 backpressure, terminal EOS, missing-IDR recovery, immediate single-IDR output
 without EOS, retained fatal bus errors including after EOS, decoded timing,
-anamorphic/interlaced metadata, per-buffer field flags with explicit unsupported
+BT.2020/PQ and BT.2020/HLG stream metadata, malformed direct AVCC NAL-chain
+recovery, below/above 8 MiB aggregate SPS/PPS boundaries with atomic rejected
+reconfiguration, anamorphic/interlaced metadata, per-buffer field flags with explicit unsupported
 interlace-mode rejection, MPEG-2 versus JPEG chroma siting, negative source DTS
 and decoded signed PTS through B-frame reordering, one-byte AVCC prefixes with
 a 425-byte legal High10 PPS and profile-specific avcC extensions, an AUD-less
