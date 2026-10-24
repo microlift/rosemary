@@ -22,6 +22,8 @@ pub const LAUNCH_ARCHITECTURE: &str = "NSWorkspaceLaunchConfigurationArchitectur
 /// it, by object address. Anything not listed here is this process.
 struct Launched {
     pid: i32,
+    /// The bundle as the guest spells it, when the process server knows it.
+    bundle: Option<String>,
     identifier: Option<String>,
     name: Option<String>,
 }
@@ -182,6 +184,7 @@ fn object_for(application: &server::protocol::Application) -> Id {
         object as usize,
         Launched {
             pid: application.pid,
+            bundle: Some(application.bundle.clone()),
             identifier: application.identifier.clone(),
             name: application.name.clone(),
         },
@@ -239,6 +242,63 @@ unsafe extern "C" fn bundle_identifier(receiver: Id, _sel: Sel) -> Id {
         Some(identifier) => autoreleased(identifier),
         None => std::ptr::null_mut(),
     }
+}
+
+/// `-bundleURL`: the bundle's `file:` URL, nil for an executable outside one.
+///
+/// A program that keeps itself to one instance compares it with its own before
+/// handing over to the instance it found.
+unsafe extern "C" fn running_bundle_url(receiver: Id, _sel: Sel) -> Id {
+    let path = match launched(receiver, |app| app.bundle.clone()) {
+        Some(bundle) => bundle,
+        None => foundation::bundle::main()
+            .and_then(|b| prefix::ns::to_guest(&b.root))
+            .map(|p| p.to_string_lossy().into_owned()),
+    };
+    match path {
+        Some(path) if !path.is_empty() => {
+            // SAFETY: a URL this call just made.
+            unsafe {
+                corefoundation::api::CFAutorelease(corefoundation::url::new_file_url(&path, true))
+                    as Id
+            }
+        }
+        _ => std::ptr::null_mut(),
+    }
+}
+
+/// `-isHidden`: nothing here hides an application.
+unsafe extern "C" fn running_is_hidden(_receiver: Id, _sel: Sel) -> u8 {
+    0
+}
+
+/// `-unhide`: there is nothing hidden to show, which Apple reports as success.
+unsafe extern "C" fn running_unhide(_receiver: Id, _sel: Sel) -> u8 {
+    1
+}
+
+/// `-isTerminated`: the process has gone.
+unsafe extern "C" fn running_is_terminated(receiver: Id, _sel: Sel) -> u8 {
+    u8::from(launched(receiver, |app| !darwin::process::visible(app.pid)).unwrap_or(false))
+}
+
+/// Signal the process an `NSRunningApplication` names, in Darwin's numbering.
+/// This process's own object is never signalled: Apple refuses that too.
+fn signal_application(receiver: Id, signal: i32) -> u8 {
+    let Some(pid) = launched(receiver, |app| app.pid) else {
+        return 0;
+    };
+    u8::from(darwin::signal::entry::kill_(pid, signal) == 0)
+}
+
+/// `-terminate`: asks the application to quit.
+unsafe extern "C" fn running_terminate(receiver: Id, _sel: Sel) -> u8 {
+    signal_application(receiver, 15)
+}
+
+/// `-forceTerminate`.
+unsafe extern "C" fn running_force_terminate(receiver: Id, _sel: Sel) -> u8 {
+    signal_application(receiver, 9)
 }
 
 /// `-localizedName`: the bundle's display name, else the executable's name.
@@ -491,6 +551,12 @@ pub(crate) fn install() {
         "localizedName" => localized_name, c"@16@0:8";
         "isActive" => running_is_active, c"c16@0:8";
         "activateWithOptions:" => activate_with_options, c"c24@0:8Q16";
+        "bundleURL" => running_bundle_url, c"@16@0:8";
+        "isHidden" => running_is_hidden, c"c16@0:8";
+        "unhide" => running_unhide, c"c16@0:8";
+        "isTerminated" => running_is_terminated, c"c16@0:8";
+        "terminate" => running_terminate, c"c16@0:8";
+        "forceTerminate" => running_force_terminate, c"c16@0:8";
     });
 }
 
@@ -537,6 +603,28 @@ mod tests {
             Some("file:///tmp/a%20file.txt".to_string())
         );
         unsafe { corefoundation::api::CFRelease(file) };
+    }
+
+    #[test]
+    fn another_instance_answers_its_bundle_url() {
+        crate::bootstrap();
+        let object = object_for(&server::protocol::Application {
+            pid: i32::MAX,
+            bundle: "/Applications/Some App.app".into(),
+            identifier: Some("com.example.app".into()),
+            ..Default::default()
+        });
+        // SAFETY: `-bundleURL` takes no explicit arguments.
+        let url = unsafe { running_bundle_url(object, objc::sel::get("bundleURL")) };
+        assert!(!url.is_null());
+        let contents = unsafe { corefoundation::url::as_url(url as _) }.unwrap();
+        assert_eq!(
+            open_target(contents),
+            Some("file:///Applications/Some%20App.app/".to_string())
+        );
+        // SAFETY: as above.
+        let hidden = unsafe { running_is_hidden(object, objc::sel::get("isHidden")) };
+        assert_eq!(hidden, 0);
     }
 
     #[test]
