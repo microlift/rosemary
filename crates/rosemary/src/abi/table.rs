@@ -530,6 +530,9 @@ pub static SIGNATURES: &[FunctionAbi] = &[
     // through directly.
     sig!("CFPreferencesCopyAppValue", P, P, P),
     sig!("CFPropertyListCreateWithData", P, P, P, U64, P, P),
+    // `CFPropertyListCreateData(allocator, list, CFPropertyListFormat,
+    // CFOptionFlags, CFErrorRef *)`.
+    sig!("CFPropertyListCreateData", P, P, P, I64, U64, P),
     sig!("CFPreferencesCopyValue", P, P, P, P, P),
     sig!("CFPreferencesCopyKeyList", P, P, P, P),
     sig!("CFPreferencesCopyMultiple", P, P, P, P, P),
