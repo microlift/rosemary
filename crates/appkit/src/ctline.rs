@@ -184,6 +184,9 @@ fn next_tab(paragraph: &Paragraph, x: f64) -> f64 {
 }
 
 /// Lay out an attributed string.
+/// `kCGFontIndexInvalid`: the glyph of a character with nothing to draw.
+const INVISIBLE: u16 = 0xFFFF;
+
 fn layout(string: Id) -> Line {
     let length = send_length(string);
     let text = send_id(string, "string");
@@ -239,7 +242,12 @@ fn layout(string: Id) -> Line {
                     width as isize,
                 );
             }
-            let glyph = out[0];
+            // A control character - a tab, a line end - is laid out but has
+            // nothing to draw: `kCGFontIndexInvalid`, which drawing skips.
+            let glyph = match units[i] {
+                0x00..=0x1F | 0x7F => INVISIBLE,
+                _ => out[0],
+            };
             let advance = match units[i] {
                 0x09 => next_tab(&paragraph, x) - x,
                 // Line ends take no room.
@@ -454,12 +462,9 @@ pub unsafe extern "C" fn CTLineDraw(line: CFTypeRef, context: CFTypeRef) {
                 crate::cgcontext::CGContextSetFillColorWithColor(context, run.color);
             }
         }
-        let glyphs: Vec<u16> = run.glyphs.iter().map(|g| g.glyph).collect();
-        let positions: Vec<NSPoint> = run
-            .glyphs
-            .iter()
-            .map(|g| NSPoint { x: g.x, y: 0.0 })
-            .collect();
+        let shown = || run.glyphs.iter().filter(|g| g.glyph != INVISIBLE);
+        let glyphs: Vec<u16> = shown().map(|g| g.glyph).collect();
+        let positions: Vec<NSPoint> = shown().map(|g| NSPoint { x: g.x, y: 0.0 }).collect();
         // SAFETY: as many glyphs as positions.
         unsafe {
             coretext::CTFontDrawGlyphs(
