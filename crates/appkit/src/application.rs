@@ -243,10 +243,15 @@ unsafe extern "C" fn finish_launching(receiver: Id, _sel: Sel) {
         if name == DID_FINISH_LAUNCHING {
             // SAFETY: an application, and a delegate the program set.
             unsafe { open_launch_urls(receiver, delegate) };
-            foundation::appleevent::raise(
-                foundation::appleevent::CORE_EVENT_CLASS,
-                foundation::appleevent::OPEN_APPLICATION,
-            );
+            // A launch with documents opens them instead of announcing a bare
+            // launch, which is what would make an untitled document.
+            // SAFETY: as above.
+            if !unsafe { open_launch_files(receiver, delegate) } {
+                foundation::appleevent::raise(
+                    foundation::appleevent::CORE_EVENT_CLASS,
+                    foundation::appleevent::OPEN_APPLICATION,
+                );
+            }
         }
         let notification = foundation::notification::make(name, receiver, std::ptr::null_mut());
         // SAFETY: a delegate method is `void (id, SEL, NSNotification *)`.
@@ -290,6 +295,138 @@ unsafe fn open_launch_urls(receiver: Id, delegate: Id) {
     }
     // SAFETY: the caller's.
     unsafe { send_open_urls(receiver, delegate, &urls) };
+}
+
+/// The files named on the command line, as AppKit opens them: every
+/// argument that is not an option (`-Key value` pairs are the argument domain's)
+/// or a URL and names a file that exists, made absolute against the working
+/// directory.
+fn launch_files() -> Vec<String> {
+    let arguments: Vec<String> = foundation::processinfo::guest_arguments()
+        .iter()
+        .skip(1)
+        .filter_map(|argument| argument.to_str().map(str::to_owned))
+        .collect();
+    let manager = {
+        let class = objc::class::lookup(c"NSFileManager").expect("Foundation registered it");
+        // SAFETY: `id (Class, SEL)`.
+        unsafe {
+            let f: unsafe extern "C" fn(Id, Sel) -> Id = std::mem::transmute(objc::msg::entry());
+            f(
+                objc::class::ptr(class) as Id,
+                objc::sel::get("defaultManager"),
+            )
+        }
+    };
+    let directory = {
+        // SAFETY: `NSString * (id, SEL)`.
+        let path = unsafe {
+            let f: unsafe extern "C" fn(Id, Sel) -> Id = std::mem::transmute(objc::msg::entry());
+            f(manager, objc::sel::get("currentDirectoryPath"))
+        };
+        // SAFETY: a string or nil.
+        String::from_utf8_lossy(&unsafe { foundation::string::bytes(path) }).into_owned()
+    };
+    let exists = |path: &str| {
+        let string = foundation::string::from_str(path);
+        // SAFETY: `BOOL (id, SEL, NSString *)`.
+        let found = unsafe {
+            let f: unsafe extern "C" fn(Id, Sel, Id) -> u8 =
+                std::mem::transmute(objc::msg::entry());
+            f(manager, objc::sel::get("fileExistsAtPath:"), string)
+        } != 0;
+        objc::arc::release(string);
+        found
+    };
+    let mut files = Vec::new();
+    let mut arguments = arguments.into_iter();
+    while let Some(argument) = arguments.next() {
+        if argument.starts_with("-psn_") {
+            continue;
+        }
+        if argument.starts_with('-') {
+            arguments.next();
+            continue;
+        }
+        if crate::launch::is_launch_url(&argument) {
+            continue;
+        }
+        let path = match argument.starts_with('/') {
+            true => argument,
+            false => format!("{}/{argument}", directory.trim_end_matches('/')),
+        };
+        if exists(&path) {
+            files.push(path);
+        }
+    }
+    files
+}
+
+/// `-[delegate application:openFiles:]`, or `-application:openFile:` for
+/// each, for the files named on the command line. False when there are none
+/// or the delegate takes neither.
+///
+/// # Safety
+///
+/// `receiver` is an application and `delegate` is null or live.
+unsafe fn open_launch_files(receiver: Id, delegate: Id) -> bool {
+    if delegate.is_null() {
+        return false;
+    }
+    let files = launch_files();
+    if files.is_empty() {
+        return false;
+    }
+    // SAFETY: a live delegate.
+    let class = unsafe { objc::object::class_of(delegate) };
+    let responds = |sel: &str| class.is_some_and(|c| c.method(objc::sel::get(sel)).is_some());
+    let strings: Vec<Id> = files
+        .iter()
+        .map(|f| foundation::string::from_str(f))
+        .collect();
+    let opened = if responds("application:openFiles:") {
+        let array = corefoundation::collections::new_array(
+            &strings
+                .iter()
+                .map(|s| *s as corefoundation::base::CFTypeRef)
+                .collect::<Vec<_>>(),
+            corefoundation::callbacks::Policy::from_type_callbacks(),
+            false,
+        );
+        // SAFETY: `void (id, SEL, NSApplication *, NSArray<NSString *> *)`.
+        unsafe {
+            let f: unsafe extern "C" fn(Id, Sel, Id, Id) = std::mem::transmute(objc::msg::entry());
+            f(
+                delegate,
+                objc::sel::get("application:openFiles:"),
+                receiver,
+                array as Id,
+            );
+            corefoundation::api::CFRelease(array);
+        }
+        true
+    } else if responds("application:openFile:") {
+        for string in &strings {
+            // SAFETY: `BOOL (id, SEL, NSApplication *, NSString *)`.
+            unsafe {
+                let f: unsafe extern "C" fn(Id, Sel, Id, Id) -> u8 =
+                    std::mem::transmute(objc::msg::entry());
+                f(
+                    delegate,
+                    objc::sel::get("application:openFile:"),
+                    receiver,
+                    *string,
+                );
+            }
+        }
+        true
+    } else {
+        false
+    };
+    for string in strings {
+        objc::arc::release(string);
+    }
+    opened
 }
 
 /// The delegate of the shared application, or nil.
