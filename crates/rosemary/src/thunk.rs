@@ -531,12 +531,14 @@ fn build_typed_with_entry(
                 for i in 0..size.div_ceil(8) {
                     let offset = i * 8;
                     let bytes = (size - offset).min(8);
-                    let w = if bytes == 8 {
+                    // A SysV caller reserved whole eightbytes (see the
+                    // `StructArgument` above); an AAPCS64 caller's copy is only
+                    // the object's own size, so its last partial eightbyte is
+                    // read a byte at a time.
+                    let w = if bytes == 8 || !cfg!(target_arch = "aarch64") {
                         b.ins()
                             .load(types::I64, MemFlagsData::trusted(), v, offset as i32)
                     } else {
-                        // The AAPCS64 caller only promises the exact object
-                        // size. Never read through its last partial eightbyte.
                         let mut w = b.ins().iconst(types::I64, 0);
                         for j in 0..bytes {
                             let byte = b.ins().load(
@@ -1772,7 +1774,12 @@ mod callback_abi_tests {
         call(NativeTwentyFive(bytes));
         let captured = CAPTURED.with(|slot| slot.borrow().clone());
         assert_eq!(captured.len(), 4);
-        assert_eq!(captured[3], 25);
+        // A SysV host loads the whole padded eightbyte, so only the object's
+        // own byte is meaningful there.
+        assert_eq!(captured[3] & 0xff, 25);
+        if cfg!(target_arch = "aarch64") {
+            assert_eq!(captured[3], 25);
+        }
         let mut buffer = [0u8; RESULT_BYTES];
         let guest = guest_arguments(&signature, &captured, &mut buffer).unwrap();
         assert_eq!(&guest.stack[..25], &bytes);
