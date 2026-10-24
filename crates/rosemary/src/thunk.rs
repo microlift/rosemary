@@ -1424,6 +1424,51 @@ mod callback_abi_tests {
         linked.success().then_some(exe)
     }
 
+    // A Clang-compiled caller, rather than Rust's extern "C" lowering,
+    // validates the Apple ARM64 ABI at the generated callee boundary.
+    #[cfg(target_os = "macos")]
+    fn native_c_caller_fixture(dir: &std::path::Path) -> (*mut libc::c_void, usize) {
+        use std::ffi::CString;
+        use std::process::Command;
+
+        const SOURCE: &str = r#"
+            typedef struct { long long value; int timescale; unsigned flags; long long epoch; } Time;
+            typedef void (*Callback)(void*, void*, int, unsigned, void*, Time, Time);
+            __attribute__((visibility("default"))) void invoke_guest_callback(void *thunk, int which) {
+                Time first = { 0x0123456789abcdefLL, -360, 0xabcd1234U, -555 };
+                Time second = { -0x1234567890abcdeLL, 777, 0x80000001U, 0x1122334455667788LL };
+                Callback cb = (Callback)thunk;
+                if (!which) {
+                    cb((void*)11, thunk, -33, 0x87654321U, (void*)55, first, second);
+                } else {
+                    cb((void*)12, (void*)23, -34, 0x13572468U, (void*)56, second, first);
+                }
+            }
+        "#;
+        let source = dir.join("native-c-caller.c");
+        let library = dir.join("native-c-caller.dylib");
+        std::fs::write(&source, SOURCE).expect("write C callback caller");
+        let status = Command::new("cc")
+            .args(["-arch", "arm64", "-dynamiclib", "-o"])
+            .arg(&library)
+            .arg(&source)
+            .status()
+            .expect("invoke Apple's C compiler");
+        assert!(
+            status.success(),
+            "native ARM64 callback C caller must compile"
+        );
+        let dylib_path = CString::new(library.to_str().unwrap()).unwrap();
+        // SAFETY: path and symbol are valid NUL-terminated strings.
+        let handle = unsafe { libc::dlopen(dylib_path.as_ptr(), libc::RTLD_NOW) };
+        assert!(!handle.is_null(), "load native ARM64 C callback caller");
+        let symbol = CString::new("invoke_guest_callback").unwrap();
+        // SAFETY: the library owns this exported function until dlclose below.
+        let entry = unsafe { libc::dlsym(handle, symbol.as_ptr()) };
+        assert!(!entry.is_null(), "find native ARM64 callback caller entry");
+        (handle, entry as usize)
+    }
+
     #[test]
     fn native_callback_enters_a_real_emulated_macho_guest_with_full_times() {
         let Some(path) = macho_callback_fixture() else {
@@ -1445,8 +1490,15 @@ mod callback_abi_tests {
             )
             .expect("typed guest callback");
         // SAFETY: the C caller has exactly the trampoline's native signature.
+        #[cfg(not(target_os = "macos"))]
         let callback: extern "C" fn(u64, u64, i32, u32, u64, NativeTime, NativeTime) =
             unsafe { std::mem::transmute(host as usize) };
+        #[cfg(target_os = "macos")]
+        let (native_c_handle, native_c_addr) =
+            native_c_caller_fixture(std::path::Path::new(path).parent().unwrap());
+        #[cfg(target_os = "macos")]
+        let native_c_call: unsafe extern "C" fn(u64, i32) =
+            unsafe { std::mem::transmute(native_c_addr) };
         let first = NativeTime {
             value: 0x0123_4567_89ab_cdef,
             timescale: -360,
@@ -1459,6 +1511,9 @@ mod callback_abi_tests {
             flags: 0x8000_0001,
             epoch: 0x1122_3344_5566_7788,
         };
+        #[cfg(target_os = "macos")]
+        with_current(&vm, || unsafe { native_c_call(host, 0) });
+        #[cfg(not(target_os = "macos"))]
         with_current(&vm, || {
             callback(11, host, -33, 0x8765_4321, 55, first, second)
         });
@@ -1511,6 +1566,9 @@ mod callback_abi_tests {
         std::thread::scope(|scope| {
             scope
                 .spawn(|| {
+                    #[cfg(target_os = "macos")]
+                    with_current(&vm, || unsafe { native_c_call(host, 1) });
+                    #[cfg(not(target_os = "macos"))]
                     with_current(&vm, || {
                         callback(12, 23, -34, 0x1357_2468, 56, second, first)
                     });
@@ -1539,6 +1597,8 @@ mod callback_abi_tests {
                 .expect("read threaded guest capture");
             assert_eq!(got, *want, "threaded guest CMTime word {index}");
         }
+        #[cfg(target_os = "macos")]
+        assert_eq!(unsafe { libc::dlclose(native_c_handle) }, 0);
         let dir = std::path::Path::new(path).parent().unwrap();
         drop(vm);
         std::fs::remove_dir_all(dir).expect("remove callback fixture");
