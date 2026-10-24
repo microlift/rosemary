@@ -82,6 +82,8 @@ const FORWARDED: &[&str] = &[
     "setSelectable:",
     "lineBreakMode",
     "setLineBreakMode:",
+    "wraps",
+    "setWraps:",
     "state",
     "setState:",
     "image",
@@ -343,6 +345,150 @@ unsafe extern "C" fn dealloc(receiver: Id, _sel: Sel) {
         objc::arc::release(control);
     }
     objc::arc::finalize(receiver);
+}
+
+/// `-copyWithZone:`: a cell of the same class with a control of its own,
+/// given the original's configuration, so that a program can measure a
+/// different string with it without touching the original's control.
+unsafe extern "C" fn copy_with_zone(receiver: Id, _sel: Sel, _zone: *mut std::ffi::c_void) -> Id {
+    // SAFETY: an object this runtime allocated.
+    let Some(class) = (unsafe { objc::object::class_of(receiver) }) else {
+        return std::ptr::null_mut();
+    };
+    let copy = back_with_control(objc::object::create_instance(class, 0));
+    // SAFETY: an instance of a class laid out as `Cell`.
+    let (from, to) = unsafe {
+        (
+            (*(receiver as *const Cell)).control,
+            (*(copy as *const Cell)).control,
+        )
+    };
+    if !from.is_null() && !to.is_null() && from != to {
+        copy_configuration(from, to);
+    }
+    let own: Vec<(Slot, usize)> = state()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+        .filter(|((owner, slot), _)| *owner == receiver as usize && *slot != Slot::MenuItem)
+        .map(|((_, slot), value)| (*slot, *value))
+        .collect();
+    for (slot, value) in own {
+        set(copy, slot, value);
+    }
+    copy
+}
+
+/// Copy what a cell shows from one control to another of the same kind:
+/// each getter and setter pair both controls answer.
+fn copy_configuration(from: Id, to: Id) {
+    // The button type first: it sets the defaults the rest override.
+    const WORDS: &[(&str, &str)] = &[
+        ("buttonType", "setButtonType:"),
+        ("highlightsBy", "setHighlightsBy:"),
+        ("showsStateBy", "setShowsStateBy:"),
+        ("imagePosition", "setImagePosition:"),
+        ("bezelStyle", "setBezelStyle:"),
+        ("alignment", "setAlignment:"),
+        ("lineBreakMode", "setLineBreakMode:"),
+        ("maximumNumberOfLines", "setMaximumNumberOfLines:"),
+        ("controlSize", "setControlSize:"),
+        ("state", "setState:"),
+        ("tag", "setTag:"),
+        ("action", "setAction:"),
+    ];
+    const OBJECTS: &[(&str, &str)] = &[
+        ("font", "setFont:"),
+        ("textColor", "setTextColor:"),
+        ("backgroundColor", "setBackgroundColor:"),
+        ("title", "setTitle:"),
+        ("alternateTitle", "setAlternateTitle:"),
+        ("image", "setImage:"),
+        ("alternateImage", "setAlternateImage:"),
+        ("formatter", "setFormatter:"),
+        ("target", "setTarget:"),
+        ("stringValue", "setStringValue:"),
+    ];
+    const FLAGS: &[(&str, &str)] = &[
+        ("drawsBackground", "setDrawsBackground:"),
+        ("isBordered", "setBordered:"),
+        ("isBezeled", "setBezeled:"),
+        ("usesSingleLineMode", "setUsesSingleLineMode:"),
+        ("isEditable", "setEditable:"),
+        ("isSelectable", "setSelectable:"),
+        ("isEnabled", "setEnabled:"),
+        ("allowsMixedState", "setAllowsMixedState:"),
+    ];
+    let both = |getter: &str, setter: &str| responds(from, getter) && responds(to, setter);
+    // SAFETY: each pair is a getter and setter of the same word-sized or
+    // object type, sent to two controls of the same kind.
+    unsafe {
+        for (getter, setter) in WORDS.iter().chain(OBJECTS) {
+            if both(getter, setter) {
+                let get: unsafe extern "C" fn(Id, Sel) -> usize =
+                    std::mem::transmute(objc::msg::entry());
+                let set: unsafe extern "C" fn(Id, Sel, usize) =
+                    std::mem::transmute(objc::msg::entry());
+                set(
+                    to,
+                    objc::sel::get(setter),
+                    get(from, objc::sel::get(getter)),
+                );
+            }
+        }
+        for (getter, setter) in FLAGS {
+            if both(getter, setter) {
+                let get: unsafe extern "C" fn(Id, Sel) -> u8 =
+                    std::mem::transmute(objc::msg::entry());
+                let set: unsafe extern "C" fn(Id, Sel, u8) =
+                    std::mem::transmute(objc::msg::entry());
+                set(
+                    to,
+                    objc::sel::get(setter),
+                    get(from, objc::sel::get(getter)),
+                );
+            }
+        }
+    }
+}
+
+/// `-cellSizeForBounds:`: what the control needs, a wrapping text field's
+/// text broken to the width of `bounds`.
+unsafe extern "C" fn cell_size_for_bounds(
+    receiver: Id,
+    _sel: Sel,
+    bounds: foundation::geometry::NSRect,
+) -> foundation::geometry::NSSize {
+    // SAFETY: an instance of a class laid out as `Cell`.
+    let control = unsafe { (*(receiver as *const Cell)).control };
+    if control.is_null() {
+        return foundation::geometry::NSSize::default();
+    }
+    if let Some(size) = crate::label::cell_size(control, bounds) {
+        return size;
+    }
+    // SAFETY: `-intrinsicContentSize` is `NSSize (id, SEL)` on every view.
+    let size = unsafe {
+        let f: unsafe extern "C" fn(Id, Sel) -> foundation::geometry::NSSize =
+            std::mem::transmute(objc::msg::entry());
+        f(control, objc::sel::get("intrinsicContentSize"))
+    };
+    foundation::geometry::NSSize {
+        width: size.width.max(0.0),
+        height: size.height.max(0.0),
+    }
+}
+
+unsafe extern "C" fn cell_size(receiver: Id, sel: Sel) -> foundation::geometry::NSSize {
+    let unbounded = foundation::geometry::NSRect {
+        origin: Default::default(),
+        size: foundation::geometry::NSSize {
+            width: f64::MAX,
+            height: f64::MAX,
+        },
+    };
+    // SAFETY: the same receiver.
+    unsafe { cell_size_for_bounds(receiver, sel, unbounded) }
 }
 
 unsafe extern "C" fn cell(receiver: Id, _sel: Sel) -> Id {
@@ -685,6 +831,10 @@ pub(crate) fn install() {
         "initTextCell:" => init_text_cell, c"@24@0:8@16";
         "initImageCell:" => init_image_cell, c"@24@0:8@16";
         "dealloc" => dealloc, c"v16@0:8";
+        "copyWithZone:" => copy_with_zone, c"@24@0:8^v16";
+        "cellSizeForBounds:" => cell_size_for_bounds,
+            c"{CGSize=dd}48@0:8{CGRect={CGPoint=dd}{CGSize=dd}}16";
+        "cellSize" => cell_size, c"{CGSize=dd}16@0:8";
         "controlSize" => control_size, c"Q16@0:8";
         "setControlSize:" => set_control_size, c"v24@0:8Q16";
         "bezelStyle" => bezel_style, c"Q16@0:8";
@@ -777,6 +927,35 @@ mod tests {
         let cell = unsafe { send_word(cell, "initTextCell:", title as usize) } as Id;
         objc::arc::release(title);
         cell
+    }
+
+    #[test]
+    fn a_copied_text_field_cell_measures_without_changing_the_original() {
+        crate::bootstrap();
+        let class = objc::class::lookup(c"NSTextField").expect("NSTextField");
+        let field = objc::object::create_instance(class, 0);
+        let short = foundation::string::from_str("ab");
+        let long = foundation::string::from_str("a much longer string than that");
+        // SAFETY: each selector is one a text field or its cell answers, with
+        // the argument and return types used here.
+        unsafe {
+            send_word(field, "setStringValue:", short as usize);
+            let cell = send(field, "cell") as Id;
+            let copy = send(cell, "copy") as Id;
+            assert!(!copy.is_null() && copy != cell);
+            send_word(copy, "setStringValue:", long as usize);
+            let measure = |cell: Id| {
+                let f: unsafe extern "C" fn(Id, Sel) -> foundation::geometry::NSSize =
+                    std::mem::transmute(objc::msg::entry());
+                f(cell, objc::sel::get("cellSize"))
+            };
+            assert!(measure(copy).width > measure(cell).width);
+            let kept = send(field, "stringValue") as Id;
+            assert_eq!(foundation::string::bytes(kept), b"ab");
+            objc::arc::release(copy);
+        }
+        objc::arc::release(short);
+        objc::arc::release(long);
     }
 
     #[test]
