@@ -800,18 +800,18 @@ fn reassemble(agg: &Aggregate, host: HostClass, words: &[u64]) -> Vec<u8> {
 }
 
 /// Rebuild the guest's ABI argument registers and stack from the exact
-/// host-side words spilled by the typed trampoline.
+/// host-side words spilled by the typed trampoline, or say why they cannot be.
 fn guest_arguments(
     signature: &ThunkSignature,
     spill: &[u64],
     result_buffer: &mut [u8; RESULT_BYTES],
-) -> Option<GuestArgs> {
+) -> Result<GuestArgs, Unsupported> {
     let mut args = GuestArgs::default();
     if let Some(Shape::Struct(agg)) = signature.returns.as_ref()
         && agg.guest_class() == GuestClass::Memory
     {
         if agg.size > RESULT_BYTES {
-            return None;
+            return Err("an aggregate return larger than this runtime buffers");
         }
         // The shared guest/host address space lets a guest return into this
         // local as though the caller had passed a hidden sret pointer.
@@ -819,19 +819,21 @@ fn guest_arguments(
     }
     let mut at = 0usize;
     for (shape, leaves) in signature.params.iter().zip(&signature.host_leaves) {
-        let words = spill.get(at..at + leaves.len())?;
+        let words = spill
+            .get(at..at + leaves.len())
+            .ok_or("fewer spilled words than the signature describes")?;
         at += leaves.len();
         match shape {
             Shape::Scalar(t) if crate::abi::aggregate::is_fp(*t) => args.push_sse(words[0]),
             Shape::Scalar(_) => args.push_int(words[0]),
             Shape::Struct(agg) => {
-                let host = agg.host_class().ok()?;
+                let host = agg.host_class()?;
                 let raw = reassemble(agg, host, words);
                 args.push_aggregate(agg, &raw);
             }
         }
     }
-    Some(args)
+    Ok(args)
 }
 
 /// The aggregate a returning guest call left behind, as its own bytes.
@@ -896,8 +898,20 @@ unsafe extern "C" fn typed_entry(
     };
 
     let mut buffer = [0u8; RESULT_BYTES];
-    let Some(args) = guest_arguments(signature, spill, &mut buffer) else {
-        return;
+    // A refusal, not a zeroed return the host would read as the callback
+    // having run.
+    let args = match guest_arguments(signature, spill, &mut buffer) {
+        Ok(args) => args,
+        Err(reason) => {
+            park_or_die(
+                vm,
+                VmError::Thunk {
+                    guest: guest_va,
+                    reason: format!("the callback's arguments cannot be placed: {reason}"),
+                },
+            );
+            return;
+        }
     };
 
     let mut ctx = RegisterContext::new();
@@ -1150,6 +1164,14 @@ mod callback_abi_tests {
         let guest = guest_arguments(&sig, &spill, &mut buffer).unwrap();
         assert_eq!(guest.ints, [10, 20, 30, 40, 50, 70]);
         assert_eq!(guest.stack.len(), 48);
+    }
+
+    #[test]
+    fn a_short_spill_is_refused_rather_than_zeroed() {
+        let signature = crate::shims::coremedia::decompression_output_signature();
+        let mut buffer = [0; RESULT_BYTES];
+        let refused = guest_arguments(&signature, &[1, 2, 3], &mut buffer);
+        assert!(refused.is_err());
     }
 
     #[repr(C)]
