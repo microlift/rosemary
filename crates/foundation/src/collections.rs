@@ -7,12 +7,6 @@ use objc::sel::Sel;
 
 use crate::define::{class_methods, methods};
 
-#[repr(C)]
-struct Predicate {
-    isa: *const objc::class::Class,
-    block: usize,
-}
-
 /// Report a mutation of a collection that was not created mutable.
 ///
 /// A named abort rather than a wrong answer: an `NSArray` that silently accepted
@@ -183,56 +177,6 @@ unsafe extern "C" fn index_of_object_with_options_passing_test(
         }
     }
     NOT_FOUND
-}
-
-unsafe extern "C" fn filtered_array_using_predicate(receiver: Id, _sel: Sel, predicate: Id) -> Id {
-    let Some(array) = (unsafe { collections::array(receiver as CFTypeRef) }) else {
-        return std::ptr::null_mut();
-    };
-    if predicate.is_null() {
-        return std::ptr::null_mut();
-    }
-    // SAFETY: `predicateWithBlock:` creates this layout.
-    let block = unsafe { (*(predicate as *const Predicate)).block as Id };
-    let mut values = Vec::new();
-    if let Some(invoke) = unsafe { objc::block::invoke(block) } {
-        // `NSPredicate` block predicates receive the object and a bindings
-        // dictionary. There are no substitution variables in this operation.
-        let call: unsafe extern "C" fn(Id, Id, Id) -> bool = unsafe { std::mem::transmute(invoke) };
-        for value in &array.values {
-            if unsafe { call(block, *value as Id, std::ptr::null_mut()) } {
-                values.push(*value);
-            }
-        }
-    }
-    // SAFETY: a fresh array follows the convenience-constructor rule.
-    unsafe {
-        api::CFAutorelease(collections::new_array(
-            &values,
-            Policy::from_type_callbacks(),
-            false,
-        )) as Id
-    }
-}
-
-unsafe extern "C" fn predicate_with_block(_class: Id, _sel: Sel, block: Id) -> Id {
-    let class = objc::class::lookup(c"NSPredicate").expect("NSPredicate is installed");
-    // SAFETY: `Predicate` is the registered layout for this class.
-    let predicate = unsafe { corefoundation::base::allocate::<Predicate>(class) };
-    if predicate.is_null() {
-        return std::ptr::null_mut();
-    }
-    // SAFETY: a fresh instance.
-    unsafe { (*predicate).block = objc::block::copy(block) as usize };
-    // SAFETY: a fresh object follows the convenience-constructor rule.
-    unsafe { api::CFAutorelease(predicate as CFTypeRef) as Id }
-}
-
-unsafe extern "C" fn predicate_dealloc(receiver: Id, _sel: Sel) {
-    // SAFETY: a Predicate instance at the end of its lifetime.
-    let block = unsafe { (*(receiver as *mut Predicate)).block as Id };
-    objc::block::release(block);
-    objc::arc::finalize(receiver);
 }
 
 /// An array enumerator: a snapshot of the array's elements and a cursor.
@@ -2871,7 +2815,6 @@ pub(crate) fn install() {
         "sortedArrayUsingSelector:" => sorted_array_using_selector, c"@24@0:8:16";
         "sortedArrayUsingComparator:" => sorted_array_using_comparator, c"@24@0:8@?16";
         "sortedArrayUsingFunction:context:" => sorted_array_using_function, c"@32@0:8^?16^v24";
-        "filteredArrayUsingPredicate:" => filtered_array_using_predicate, c"@24@0:8@16";
         "indexOfObjectWithOptions:passingTest:" => index_of_object_with_options_passing_test, c"Q32@0:8Q16@?24";
         "countByEnumeratingWithState:objects:count:" => array_enumerate, c"Q40@0:8^{?=Q^@^QQ5}16^@24Q32";
         "description" => array_description, c"@16@0:8";

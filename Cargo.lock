@@ -1229,6 +1229,7 @@ dependencies = [
  "coregraphics",
  "darwin",
  "exports",
+ "fancy-regex",
  "libc",
  "objc",
  "prefix",

@@ -481,6 +481,31 @@ pub mod native {
         render(&bytes, &mut args).ok()
     }
 
+    /// The arguments of a captured tail, one per conversion in `kinds`: `d`
+    /// for an integer, `f` for a double, anything else for an object pointer.
+    pub fn tail_arguments(
+        symbol: &str,
+        tail: u64,
+        kinds: &[char],
+    ) -> Option<Vec<foundation::predicate::Argument>> {
+        use foundation::predicate::Argument;
+        let mem = ProcessMemory;
+        #[cfg(target_arch = "aarch64")]
+        let mut args = VarArgs::from_stack(symbol, &mem, tail);
+        #[cfg(not(target_arch = "aarch64"))]
+        let mut args = VarArgs::from_va_list(symbol, &mem, tail).ok()?;
+        kinds
+            .iter()
+            .map(|kind| {
+                Some(match kind {
+                    'd' => Argument::Integer(args.next_int().ok()? as i64),
+                    'f' => Argument::Real(args.next_fp().ok()?),
+                    _ => Argument::Object(args.next_int().ok()? as usize as objc::object::Id),
+                })
+            })
+            .collect()
+    }
+
     /// [`render_tail`] as an autoreleased `NSString` with every `%` doubled,
     /// which is the form the frameworks' own format methods expect.
     pub fn render_escaped(symbol: &str, format: u64, tail: u64) -> Option<u64> {

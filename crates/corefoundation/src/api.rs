@@ -912,7 +912,7 @@ fn nfkc(text: &str) -> String {
 
 /// Decomposed, the nonspacing marks dropped, and composed again: what
 /// "strip combining marks" and "strip diacritics" both do to text.
-fn strip_marks(text: &str) -> String {
+pub fn strip_marks(text: &str) -> String {
     use icu_properties::props::GeneralCategory;
     let categories = icu_properties::CodePointMapData::<GeneralCategory>::new();
     let bare: String = nfd(text)
