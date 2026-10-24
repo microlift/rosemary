@@ -124,6 +124,16 @@ unsafe extern "C" fn accessory_plain_init(receiver: Id, sel: Sel) -> Id {
 /// `-setHidden:` on an accessory: its window lays its titlebar out again.
 unsafe extern "C" fn accessory_set_hidden(receiver: Id, sel: Sel, hidden: u8) {
     unsafe { props::set_bool(receiver, sel, hidden) };
+    // AppKit collapses the accessory's container, so its view is not drawn
+    // either; here the view sits in the frame view directly.
+    let view = props::object(receiver, "view");
+    if !view.is_null() {
+        // SAFETY: `-setHidden:` is `void (id, SEL, BOOL)`.
+        unsafe {
+            let f: unsafe extern "C" fn(Id, Sel, u8) = std::mem::transmute(objc::msg::entry());
+            f(view, objc::sel::get("setHidden:"), hidden);
+        }
+    }
     let window = accessory_window(receiver);
     if !window.is_null() {
         crate::window::fit_content_view(window);

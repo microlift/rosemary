@@ -754,6 +754,13 @@ unsafe extern "C" fn insert_titlebar_accessory(
     let view = accessory_view(controller);
     if !view.is_null() {
         send_view(window.frame_view, "addSubview:", view);
+        if crate::props::integer(controller, "hidden") != 0 {
+            // SAFETY: `-setHidden:` is `void (id, SEL, BOOL)`.
+            unsafe {
+                let f: unsafe extern "C" fn(Id, Sel, u8) = std::mem::transmute(objc::msg::entry());
+                f(view, objc::sel::get("setHidden:"), 1);
+            }
+        }
     }
     fit_content_view(receiver);
 }
