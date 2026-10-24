@@ -193,6 +193,20 @@ const OBJECT_LISTS: &[(&str, &str, &str, bool, bool)] = &[
         true,
         true,
     ),
+    (
+        "NSSet",
+        "setWithObjects:",
+        "setWithObjects:count:",
+        false,
+        false,
+    ),
+    (
+        "NSSet",
+        "initWithObjects:",
+        "initWithObjects:count:",
+        false,
+        true,
+    ),
 ];
 
 /// `(variadic selector, counted selector, pairs)` for each installed list.
