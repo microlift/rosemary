@@ -50,6 +50,9 @@ pub struct View {
     /// [`WANTS_LAYER`] and [`BACKING_LAYER`], and `-setLayerContentsPlacement:`
     /// from [`PLACEMENT_SHIFT`] up.
     layer_backing: usize,
+    /// `-setBoundsOrigin:`: where the view's own coordinates start, which is
+    /// how a clip view scrolls its document. The bounds' size is the frame's.
+    bounds_origin: NSPoint,
 }
 
 /// The bits of [`View::layer_backing`]: the view asked for a layer, and the
@@ -713,9 +716,13 @@ fn y_from_superview(frame: NSRect, flipped: bool, outer_flipped: bool, y: f64) -
 /// A point in `view`'s coordinates, in its superview's.
 fn to_superview(view: Id, point: NSPoint) -> NSPoint {
     let v = view_of(view);
+    let local = NSPoint {
+        x: point.x - v.bounds_origin.x,
+        y: point.y - v.bounds_origin.y,
+    };
     NSPoint {
-        x: point.x + v.frame.origin.x,
-        y: y_to_superview(v.frame, is_flipped(view), is_flipped(v.superview), point.y),
+        x: local.x + v.frame.origin.x,
+        y: y_to_superview(v.frame, is_flipped(view), is_flipped(v.superview), local.y),
     }
 }
 
@@ -723,8 +730,9 @@ fn to_superview(view: Id, point: NSPoint) -> NSPoint {
 fn from_superview(view: Id, point: NSPoint) -> NSPoint {
     let v = view_of(view);
     NSPoint {
-        x: point.x - v.frame.origin.x,
-        y: y_from_superview(v.frame, is_flipped(view), is_flipped(v.superview), point.y),
+        x: point.x - v.frame.origin.x + v.bounds_origin.x,
+        y: y_from_superview(v.frame, is_flipped(view), is_flipped(v.superview), point.y)
+            + v.bounds_origin.y,
     }
 }
 
@@ -785,17 +793,23 @@ fn rect_between(rect: NSRect, map: impl Fn(NSPoint) -> NSPoint) -> NSRect {
 
 /// A view's bounds in its window's base coordinates.
 pub fn rect_in_window(view: Id) -> NSRect {
-    let size = match is_view(view) {
-        true => view_of(view).frame.size,
-        false => NSSize::default(),
-    };
-    rect_between(
-        NSRect {
-            origin: NSPoint::default(),
-            size,
+    let bounds = match is_view(view) {
+        true => NSRect {
+            origin: view_of(view).bounds_origin,
+            size: view_of(view).frame.size,
         },
-        |point| point_to_window(view, point),
-    )
+        false => NSRect::default(),
+    };
+    rect_between(bounds, |point| point_to_window(view, point))
+}
+
+/// Where a view's subviews' frames are measured from: its bounds origin, which
+/// a clip view moves to scroll.
+pub(crate) fn bounds_origin_of(view: Id) -> NSPoint {
+    match is_view(view) {
+        true => view_of(view).bounds_origin,
+        false => NSPoint::default(),
+    }
 }
 
 /// Whether a rectangle of a view's holds a point, for [`crate::cursor`].
@@ -1191,26 +1205,95 @@ unsafe extern "C" fn set_frame_origin(receiver: Id, _sel: Sel, origin: NSPoint) 
 /// transform of its own has.
 unsafe extern "C" fn bounds(receiver: Id, _sel: Sel) -> NSRect {
     NSRect {
-        origin: NSPoint::default(),
+        origin: view_of(receiver).bounds_origin,
         size: view_of(receiver).frame.size,
     }
 }
 
-unsafe extern "C" fn set_bounds(receiver: Id, _sel: Sel, bounds: NSRect) {
+/// FIXME (ACCURACY): a bounds size other than the frame's would scale the
+/// view's coordinates; here it resizes the frame instead.
+unsafe extern "C" fn set_bounds(receiver: Id, sel: Sel, bounds: NSRect) {
     let before = view_of(receiver).frame;
     view_of(receiver).frame.size = bounds.size;
     note_geometry_change(receiver, before);
+    // SAFETY: as `-setBoundsOrigin:`.
+    unsafe { set_bounds_origin(receiver, sel, bounds.origin) };
 }
 
-/// `-visibleRect`: the part of the view not clipped away by an ancestor.
-///
-/// The bounds, because nothing in this tree clips: there is no scroll view and
-/// no clip view with a smaller frame, so every view is wholly visible. A guest
-/// sizing a viewport from this gets the same answer it would from `-bounds`,
-/// which is what it would get from AppKit for a view that fills its window.
-unsafe extern "C" fn visible_rect(receiver: Id, sel: Sel) -> NSRect {
-    // SAFETY: `-bounds` is `NSRect (id, SEL)`.
-    unsafe { bounds(receiver, sel) }
+/// `-setBoundsOrigin:`: the subviews move the other way, and the whole view
+/// is to be drawn again.
+pub(crate) unsafe extern "C" fn set_bounds_origin(receiver: Id, _sel: Sel, origin: NSPoint) {
+    let view = view_of(receiver);
+    if view.bounds_origin == origin {
+        return;
+    }
+    view.bounds_origin = origin;
+    let layer = view.layer;
+    if !layer.is_null() {
+        crate::layer::set_bounds_of(layer, bounds_of(receiver));
+    }
+    crate::backing::needs_display(receiver);
+    if view_of(receiver).posts & POSTS_BOUNDS != 0 {
+        foundation::notification::post(BOUNDS_DID_CHANGE, receiver, std::ptr::null_mut());
+    }
+}
+
+/// `-translateOriginToPoint:`.
+unsafe extern "C" fn translate_origin(receiver: Id, sel: Sel, by: NSPoint) {
+    let origin = view_of(receiver).bounds_origin;
+    // SAFETY: as `-setBoundsOrigin:`.
+    unsafe {
+        set_bounds_origin(
+            receiver,
+            sel,
+            NSPoint {
+                x: origin.x - by.x,
+                y: origin.y - by.y,
+            },
+        )
+    };
+}
+
+/// `-visibleRect`: the part of the view's bounds no ancestor clips away, in
+/// the view's own coordinates. Every view clips its subviews to its frame.
+unsafe extern "C" fn visible_rect(receiver: Id, _sel: Sel) -> NSRect {
+    visible_rect_of(receiver)
+}
+
+pub(crate) fn visible_rect_of(view: Id) -> NSRect {
+    if !is_view(view) {
+        return NSRect::default();
+    }
+    let mut visible = rect_in_window(view);
+    let mut node = view_of(view).superview;
+    for _ in 0..64 {
+        if !is_view(node) {
+            break;
+        }
+        visible = intersection(visible, rect_in_window(node));
+        node = view_of(node).superview;
+    }
+    if visible.size.width <= 0.0 || visible.size.height <= 0.0 {
+        return NSRect {
+            origin: view_of(view).bounds_origin,
+            size: NSSize::default(),
+        };
+    }
+    rect_between(visible, |point| point_from_window(view, point))
+}
+
+fn intersection(a: NSRect, b: NSRect) -> NSRect {
+    let left = a.origin.x.max(b.origin.x);
+    let bottom = a.origin.y.max(b.origin.y);
+    let right = (a.origin.x + a.size.width).min(b.origin.x + b.size.width);
+    let top = (a.origin.y + a.size.height).min(b.origin.y + b.size.height);
+    NSRect {
+        origin: NSPoint { x: left, y: bottom },
+        size: NSSize {
+            width: (right - left).max(0.0),
+            height: (top - bottom).max(0.0),
+        },
+    }
 }
 
 /// `-convertRectToBacking:`, which is the whole reason a Retina program asks a
@@ -2025,6 +2108,8 @@ pub(crate) fn install() {
         "bounds" => bounds, c"{CGRect={CGPoint=dd}{CGSize=dd}}16@0:8";
         "visibleRect" => visible_rect, c"{CGRect={CGPoint=dd}{CGSize=dd}}16@0:8";
         "setBounds:" => set_bounds, c"v48@0:8{CGRect={CGPoint=dd}{CGSize=dd}}16";
+        "setBoundsOrigin:" => set_bounds_origin, c"v32@0:8{CGPoint=dd}16";
+        "translateOriginToPoint:" => translate_origin, c"v32@0:8{CGPoint=dd}16";
         "convertRectToBacking:" => convert_rect_to_backing,
             c"{CGRect={CGPoint=dd}{CGSize=dd}}48@0:8{CGRect={CGPoint=dd}{CGSize=dd}}16";
         "convertRectFromBacking:" => convert_rect_from_backing,
