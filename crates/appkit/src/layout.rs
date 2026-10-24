@@ -294,6 +294,50 @@ fn solve_system(constraints: &[&Constraint], root: Option<Id>) -> (Vec<(Id, NSRe
         let fitting = Some(view) == system.root;
         let fixed = (pinned(view) || parent.is_none()) && !fitting;
         let strength = if fixed { SOLVER_REQUIRED } else { STAY };
+        // A view its mask places moves with its superview, as the
+        // constraints AppKit makes of the mask say, rather than staying put.
+        let rates = match parent {
+            Some(p) if fixed && !crate::controls::is_arranged(view) => {
+                view::autoresizing_rates(view).map(|rates| (p, rates))
+            }
+            _ => None,
+        };
+        if let Some((p, [(kx, kw), (ky, kh)])) = rates {
+            let old = view::frame_of(system.views[p]).size;
+            let follow =
+                |solver: &mut Solver, own: Expression, rate: f64, along: usize, was: f64| {
+                    let e = own.plus(&var(along), -rate).add_constant(rate * was);
+                    add(solver, e, Relation::Equal, SOLVER_REQUIRED);
+                };
+            let width = var(w).add_constant(-frame.size.width);
+            follow(&mut solver, width, kw, System::width(p), old.width);
+            let height = var(h).add_constant(-frame.size.height);
+            follow(&mut solver, height, kh, System::height(p), old.height);
+            let left = var(l)
+                .plus(&var(System::left(p)), -1.0)
+                .add_constant(-frame.origin.x);
+            follow(&mut solver, left, kx, System::width(p), old.width);
+            // The mask's y is the frame's, so from the top in a flipped
+            // superview and from the bottom otherwise.
+            let (top, rate) = match flipped[p] {
+                true => (
+                    var(t)
+                        .plus(&var(System::top(p)), -1.0)
+                        .add_constant(-frame.origin.y),
+                    ky,
+                ),
+                false => (
+                    var(t)
+                        .plus(&var(System::top(p)), -1.0)
+                        .plus(&var(System::height(p)), -1.0)
+                        .plus(&var(h), 1.0)
+                        .add_constant(frame.origin.y),
+                    -ky,
+                ),
+            };
+            follow(&mut solver, top, rate, System::height(p), old.height);
+            continue;
+        }
         match fitting {
             true => {
                 pin(&mut solver, w, 0.0, FIT);
@@ -1419,6 +1463,47 @@ mod tests {
         assert_eq!(view::frame_of(background), rect(0.0, 252.0, 400.0, 48.0));
         assert_eq!(view::frame_of(stack), rect(0.0, 0.0, 400.0, 48.0));
         assert_eq!(view::frame_of(container), rect(0.0, 0.0, 400.0, 252.0));
+        let class = objc::class::lookup(c"NSLayoutConstraint").expect("NSLayoutConstraint");
+        send(
+            objc::class::ptr(class) as Id,
+            "deactivateConstraints:",
+            array,
+        );
+    }
+
+    #[test]
+    fn a_constraint_through_an_autoresizing_view_sizes_its_superview() {
+        let _serial = SOLVING_TESTS.lock().unwrap_or_else(|e| e.into_inner());
+        // TextMate's gutter: a scroll view as wide as the document view in
+        // its clip view, which its mask sizes to the scroll view.
+        let root = view(rect(0.0, 0.0, 400.0, 300.0));
+        let scroll = view(rect(0.0, 0.0, 0.0, 300.0));
+        let clip = view(rect(0.0, 0.0, 0.0, 300.0));
+        let document = view(rect(0.0, 0.0, 0.0, 300.0));
+        send(root, "addSubview:", scroll);
+        send(scroll, "addSubview:", clip);
+        send(clip, "addSubview:", document);
+        constrain(scroll);
+        constrain(document);
+        // SAFETY: `-setAutoresizingMask:` is `void (id, SEL, NSUInteger)`.
+        unsafe {
+            let f: unsafe extern "C" fn(Id, Sel, usize) = std::mem::transmute(objc::msg::entry());
+            f(clip, objc::sel::get("setAutoresizingMask:"), 0x12);
+        }
+        let constraints = [
+            pin(scroll, 1, root, 0.0),
+            pin(scroll, 3, root, 0.0),
+            pin(scroll, 4, root, 0.0),
+            pin(document, 1, clip, 0.0),
+            pin(document, 2, clip, 0.0),
+            pin(document, 3, clip, 0.0),
+            relate(document, 7, std::ptr::null_mut(), 0, 41.0),
+        ];
+        let array = activate(&constraints);
+        layout_now();
+        assert_eq!(view::frame_of(scroll), rect(0.0, 0.0, 41.0, 300.0));
+        assert_eq!(view::frame_of(clip), rect(0.0, 0.0, 41.0, 300.0));
+        assert_eq!(view::frame_of(document).size.width, 41.0);
         let class = objc::class::lookup(c"NSLayoutConstraint").expect("NSLayoutConstraint");
         send(
             objc::class::ptr(class) as Id,

@@ -205,6 +205,42 @@ unsafe extern "C" fn resize_with_old_superview_size(receiver: Id, _sel: Sel, old
     }
 }
 
+/// How a view its autoresizing mask places follows its superview: what its
+/// origin and its size gain per point the superview grows, along x then y.
+/// The solver reads this as AppKit reads a mask into constraints, so a
+/// constraint on such a view can size its superview. `None` when the
+/// superview does not resize its subviews.
+pub(crate) fn autoresizing_rates(view: Id) -> Option<[(CGFloat, CGFloat); 2]> {
+    let v = view_of(view);
+    if !is_view(v.superview) || view_of(v.superview).does_not_autoresize_subviews != 0 {
+        return None;
+    }
+    let old = view_of(v.superview).frame.size;
+    let mask = v.autoresizing_mask;
+    let rate = |leading, sizable, trailing, origin: CGFloat, size: CGFloat, old: CGFloat| {
+        let (o, s) = distribute(leading, sizable, trailing, origin, size, old, old + 1.0);
+        (o - origin, s - size)
+    };
+    Some([
+        rate(
+            mask & autoresizing::MIN_X_MARGIN != 0,
+            mask & autoresizing::WIDTH_SIZABLE != 0,
+            mask & autoresizing::MAX_X_MARGIN != 0,
+            v.frame.origin.x,
+            v.frame.size.width,
+            old.width,
+        ),
+        rate(
+            mask & autoresizing::MIN_Y_MARGIN != 0,
+            mask & autoresizing::HEIGHT_SIZABLE != 0,
+            mask & autoresizing::MAX_Y_MARGIN != 0,
+            v.frame.origin.y,
+            v.frame.size.height,
+            old.height,
+        ),
+    ])
+}
+
 /// Spread a superview's change along one axis over the three lengths that make
 /// it up: the leading margin, the subview itself, and the trailing margin.
 ///
