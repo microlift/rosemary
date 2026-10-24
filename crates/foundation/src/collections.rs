@@ -1111,6 +1111,31 @@ unsafe extern "C" fn remove_all_objects(receiver: Id, _sel: Sel) {
     }
 }
 
+/// `-setArray:`. The new contents are retained before the old are released,
+/// so an array may be set to (a copy of) itself.
+unsafe extern "C" fn set_array(receiver: Id, _sel: Sel, other: Id) {
+    // SAFETY: an array.
+    let Some(a) = (unsafe { collections::array(receiver as CFTypeRef) }) else {
+        return;
+    };
+    if !a.mutable {
+        immutable("NSArray", "setArray:");
+    }
+    let values = match other.is_null() {
+        true => Vec::new(),
+        // SAFETY: the argument is an array if it is one of ours.
+        false => match unsafe { collections::array(other as CFTypeRef) } {
+            Some(o) => o.values.clone(),
+            None => objc::fail!("-[NSMutableArray setArray:]: the argument is not an array"),
+        },
+    };
+    let retained = values.into_iter().map(|v| a.policy.retain(v)).collect();
+    let old = std::mem::replace(&mut a.values, retained);
+    for value in old {
+        a.policy.release(value);
+    }
+}
+
 /// `-removeObject:` and `-removeObjectIdenticalTo:`: every element `matches`
 /// takes out, not just the first.
 ///
@@ -2853,6 +2878,7 @@ pub(crate) fn install() {
         "setObject:atIndexedSubscript:" => set_object_at_indexed_subscript, c"v32@0:8@16Q24";
         "sortUsingFunction:context:" => sort_using_function, c"v32@0:8^?16^v24";
         "removeAllObjects" => remove_all_objects, c"v16@0:8";
+        "setArray:" => set_array, c"v24@0:8@16";
     });
     class_methods!(mutable_array, {
         "new" => new_array, c"@16@0:8";
