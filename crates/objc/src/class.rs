@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::ffi::{CStr, CString, c_char, c_void};
-use std::sync::atomic::{AtomicPtr, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicUsize, Ordering};
 use std::sync::{LazyLock, Mutex, OnceLock, RwLock};
 
 use crate::sel::Sel;
@@ -91,6 +91,10 @@ pub struct Class {
     /// Whether `objc_registerClassPair` has run. An unregistered class is not
     /// findable by name and must not be instantiated.
     registered: AtomicUsize,
+    /// Whether `+initialize` has been sent; see [`ensure_initialized`].
+    initialized: AtomicBool,
+    /// For a metaclass, the class it is the metaclass of.
+    instances: AtomicPtr<Class>,
     contents: RwLock<Contents>,
 }
 
@@ -223,6 +227,8 @@ impl Class {
             instance_size: AtomicUsize::new(instance_size),
             is_meta,
             registered: AtomicUsize::new(0),
+            initialized: AtomicBool::new(false),
+            instances: AtomicPtr::new(std::ptr::null_mut()),
             contents: RwLock::new(Contents::default()),
         };
         let _building = BUILDING.lock().unwrap_or_else(|e| e.into_inner());
@@ -500,6 +506,77 @@ impl Class {
     }
 }
 
+/// Classes whose `+initialize` is running, and the thread running each.
+static INITIALIZING: Mutex<Vec<(usize, std::thread::ThreadId)>> = Mutex::new(Vec::new());
+static INITIALIZED: std::sync::Condvar = std::sync::Condvar::new();
+
+/// Send `+initialize` to `class` - its superclasses' first - unless it has
+/// been already, as Apple's runtime does before the first message to a class
+/// or to an instance of it.
+///
+/// Sent, so a class with no `+initialize` of its own runs its superclass's
+/// with itself as the receiver, which is what a guard of
+/// `if (self == [Foo class])` is written against. A message the class's own
+/// `+initialize` sends to the class goes straight through; a message from
+/// another thread waits until it has returned.
+pub fn ensure_initialized(class: &'static Class) {
+    if class.initialized.load(Ordering::Acquire) {
+        return;
+    }
+    let class = match class.is_meta() {
+        true => {
+            let instances = class.instances.load(Ordering::Acquire);
+            match instances.is_null() {
+                true => return,
+                // SAFETY: a leaked class, set when the pair was allocated.
+                false => unsafe { &*(instances as *const Class) },
+            }
+        }
+        false => class,
+    };
+    if class.initialized.load(Ordering::Acquire) || !class.is_registered() {
+        return;
+    }
+    if let Some(superclass) = class.superclass() {
+        ensure_initialized(superclass);
+    }
+    let address = ptr(class) as usize;
+    let me = std::thread::current().id();
+    {
+        let mut running = INITIALIZING.lock().unwrap_or_else(|e| e.into_inner());
+        loop {
+            if class.initialized.load(Ordering::Acquire) {
+                return;
+            }
+            match running.iter().find(|(c, _)| *c == address) {
+                Some((_, thread)) if *thread == me => return,
+                Some(_) => {
+                    running = INITIALIZED.wait(running).unwrap_or_else(|e| e.into_inner());
+                }
+                None => {
+                    running.push((address, me));
+                    break;
+                }
+            }
+        }
+    }
+    let sel = crate::sel::get("initialize");
+    if let Some(method) = class.metaclass().method(sel) {
+        // SAFETY: `+initialize` is `void (Class, SEL)`.
+        unsafe {
+            let f: unsafe extern "C" fn(*mut Class, Sel) =
+                std::mem::transmute(method.implementation());
+            f(ptr(class), sel);
+        }
+    }
+    class.initialized.store(true, Ordering::Release);
+    INITIALIZING
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .retain(|(c, _)| *c != address);
+    INITIALIZED.notify_all();
+}
+
 /// A class by name, or `None` if none is registered.
 ///
 /// Does not bootstrap: [`crate::bootstrap`] itself reaches this while installing
@@ -582,6 +659,7 @@ pub fn allocate_pair(
         None => meta,
     };
     meta.isa.store(ptr(root_meta), Ordering::Release);
+    meta.instances.store(ptr(class), Ordering::Release);
     class.isa.store(ptr(meta), Ordering::Release);
     Some(class)
 }

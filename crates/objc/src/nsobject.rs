@@ -688,4 +688,42 @@ mod tests {
         let f: unsafe extern "C" fn(Id, Sel) -> Id = unsafe { std::mem::transmute(imp) };
         unsafe { f(class, sel::get("copy")) }
     }
+
+    thread_local! {
+        static INITIALIZED: std::cell::RefCell<Vec<String>> =
+            const { std::cell::RefCell::new(Vec::new()) };
+    }
+
+    unsafe extern "C" fn record_initialize(receiver: Id, _sel: Sel) {
+        // SAFETY: the receiver is a class.
+        let name = unsafe { crate::class::from_ptr(receiver as *const Class) }
+            .expect("a class")
+            .name_str()
+            .to_string();
+        INITIALIZED.with(|i| i.borrow_mut().push(name));
+    }
+
+    /// `+initialize` runs once per class before its first message, superclass
+    /// first; a subclass without its own runs the inherited one as itself.
+    #[test]
+    fn initialize_is_sent_once_per_class_superclass_first() {
+        crate::bootstrap();
+        let nsobject = crate::class::lookup(c"NSObject").expect("NSObject");
+        let base = crate::class::allocate_pair(Some(nsobject), c"RosemaryInitBase", 0)
+            .expect("a fresh name");
+        base.metaclass()
+            .add_method(sel::get("initialize"), record_initialize as Imp, c"v16@0:8");
+        crate::class::register_pair(base);
+        let derived = crate::class::allocate_pair(Some(base), c"RosemaryInitDerived", 0)
+            .expect("a fresh name");
+        crate::class::register_pair(derived);
+
+        crate::class::ensure_initialized(derived);
+        crate::class::ensure_initialized(derived.metaclass());
+        crate::class::ensure_initialized(base);
+        assert_eq!(
+            INITIALIZED.with(|i| i.borrow().clone()),
+            ["RosemaryInitBase", "RosemaryInitDerived"]
+        );
+    }
 }

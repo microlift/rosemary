@@ -38,6 +38,7 @@ unsafe fn resolve(receiver: Id, sel: Sel, slot: *mut Id) -> Option<*const c_void
     for _ in 0..8 {
         // SAFETY: a live object, by the caller and by each forwarding target.
         let class = unsafe { crate::object::class_of(receiver) }?;
+        crate::class::ensure_initialized(class);
         let found = class
             .method(sel)
             .or_else(|| unsafe { resolve_dynamically(class, receiver, sel) });

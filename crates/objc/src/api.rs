@@ -206,8 +206,11 @@ pub unsafe extern "C" fn class_getClassMethod(cls: *const c_void, name: Sel) -> 
 ///
 /// `rosemary`'s dispatch caches this value and re-probes it to notice a swizzle,
 /// so it must change exactly when the resolution does. See the crate doc.
+/// Like Apple's, this sends `+initialize` first: a caller that looks up an
+/// `IMP` to call it is about to message the class.
 pub unsafe extern "C" fn class_getMethodImplementation(cls: *const c_void, name: Sel) -> Imp {
     unsafe { class(cls) }.map_or(std::ptr::null(), |c| {
+        crate::class::ensure_initialized(c);
         crate::class::method_implementation(c, name)
     })
 }
