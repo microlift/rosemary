@@ -11,8 +11,10 @@ gstreamer = ["dep:gst", "dep:gst_app", "dep:gst_video"]
 
 [dependencies]
 gst = { package = "gstreamer", version = "0.25", optional = true }
+# AppSink::current_level_buffers, the output backpressure check, is 1.28 API.
 gst_app = { package = "gstreamer-app", version = "0.25", features = ["v1_28"], optional = true }
-gst_video = { package = "gstreamer-video", version = "0.25", features = ["v1_28"], optional = true }
+# PQ/HLG transfer and SMPTE 428/431/432 and EBU 3213 primaries are 1.18 API.
+gst_video = { package = "gstreamer-video", version = "0.25", features = ["v1_18"], optional = true }
 
 [[example]]
 name = "h264_stream"
