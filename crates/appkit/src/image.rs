@@ -941,6 +941,12 @@ unsafe extern "C" fn draw_in_rect_respect_flipped(
     );
 }
 
+/// `-drawInRect:`: the whole image, source-over, respecting flipped
+/// contexts, as Apple documents it.
+unsafe extern "C" fn draw_in_rect_plain(receiver: Id, sel: Sel, destination: NSRect) {
+    draw(receiver, sel, destination, NSRect::default(), 2, 1.0, true);
+}
+
 unsafe extern "C" fn draw_in_rect(
     receiver: Id,
     sel: Sel,
@@ -1041,6 +1047,7 @@ pub(crate) fn install() {
     methods!(class, {
         "lockFocus" => lock_focus, c"v16@0:8";
         "unlockFocus" => unlock_focus, c"v16@0:8";
+        "drawInRect:" => draw_in_rect_plain, c"v48@0:8{CGRect={CGPoint=dd}{CGSize=dd}}16";
         "drawInRect:fromRect:operation:fraction:" => draw_in_rect,
             c"v96@0:8{CGRect={CGPoint=dd}{CGSize=dd}}16{CGRect={CGPoint=dd}{CGSize=dd}}48Q80d88";
         "drawInRect:fromRect:operation:fraction:respectFlipped:hints:" =>
