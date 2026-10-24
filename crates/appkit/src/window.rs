@@ -3724,6 +3724,8 @@ pub(crate) fn install() {
         "setIsVisible:" => set_is_visible, c"v20@0:8c16";
         // No window is ever attached as a sheet: nothing implements -beginSheet:.
         "isSheet" => no, c"c16@0:8";
+        // One space: ordering any window in puts it on the active one.
+        "isOnActiveSpace" => yes, c"c16@0:8";
         "attachedSheet" => nil, c"@16@0:8";
         "screen" => screen, c"@16@0:8";
         "backingScaleFactor" => backing_scale_factor, c"d16@0:8";
