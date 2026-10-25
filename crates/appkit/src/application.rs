@@ -776,8 +776,15 @@ pub(crate) fn check_last_window_closed() {
 /// window to bring forward.
 unsafe extern "C" fn activate(_receiver: Id, _sel: Sel, _flag: u8) {}
 
+static ACTIVATION_POLICY: std::sync::atomic::AtomicIsize = std::sync::atomic::AtomicIsize::new(0);
+
+unsafe extern "C" fn activation_policy(_receiver: Id, _sel: Sel) -> isize {
+    ACTIVATION_POLICY.load(std::sync::atomic::Ordering::Acquire)
+}
+
 /// `-setActivationPolicy:`, which answers that it succeeded.
-unsafe extern "C" fn set_activation_policy(_receiver: Id, _sel: Sel, _policy: isize) -> u8 {
+unsafe extern "C" fn set_activation_policy(_receiver: Id, _sel: Sel, policy: isize) -> u8 {
+    ACTIVATION_POLICY.store(policy, std::sync::atomic::Ordering::Release);
     1
 }
 
@@ -1275,6 +1282,7 @@ pub(crate) fn install() {
         "stop:" => stop, c"v24@0:8@16";
         "terminate:" => terminate, c"v24@0:8@16";
         "activateIgnoringOtherApps:" => activate, c"v20@0:8c16";
+        "activationPolicy" => activation_policy, c"q16@0:8";
         "setActivationPolicy:" => set_activation_policy, c"c24@0:8q16";
         "currentSystemPresentationOptions" => presentation_options, c"Q16@0:8";
         "presentationOptions" => presentation_options, c"Q16@0:8";
@@ -1676,6 +1684,25 @@ mod tests {
         objc::arc::pool_pop(outer);
         loop_.remove_source(&source, corefoundation::runloop::DEFAULT_MODE);
         objc::arc::release(object);
+    }
+
+    #[test]
+    fn activation_policy_round_trips() {
+        crate::bootstrap();
+        let app = objc::object::create_instance(
+            objc::class::lookup(c"NSApplication").expect("NSApplication"),
+            0,
+        );
+        unsafe {
+            let get: unsafe extern "C" fn(Id, Sel) -> isize =
+                std::mem::transmute(objc::msg::entry());
+            let set: unsafe extern "C" fn(Id, Sel, isize) -> u8 =
+                std::mem::transmute(objc::msg::entry());
+            assert_eq!(set(app, objc::sel::get("setActivationPolicy:"), 1), 1);
+            assert_eq!(get(app, objc::sel::get("activationPolicy")), 1);
+            assert_eq!(set(app, objc::sel::get("setActivationPolicy:"), 0), 1);
+            assert_eq!(get(app, objc::sel::get("activationPolicy")), 0);
+        }
     }
 }
 
