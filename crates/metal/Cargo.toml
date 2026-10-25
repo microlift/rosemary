@@ -10,6 +10,7 @@ exports.workspace = true
 ash.workspace = true
 libc.workspace = true
 corefoundation.workspace = true
+coregraphics.workspace = true
 darwin.workspace = true
 foundation.workspace = true
 objc.workspace = true

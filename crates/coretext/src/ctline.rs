@@ -16,7 +16,8 @@ use foundation::geometry::{NSPoint, NSRect, NSSize};
 use objc::object::Id;
 use objc::sel::Sel;
 
-use crate::coretext;
+use crate as coretext;
+use coregraphics::font_attributes::face_of;
 
 /// One glyph of a run: the glyph, its pen position from the line's start,
 /// its advance, and the UTF-16 index of the character it draws.
@@ -353,7 +354,7 @@ pub unsafe extern "C" fn CTLineGetTrailingWhitespaceWidth(line: CFTypeRef) -> f6
             if glyph.advance <= 0.0 {
                 continue;
             }
-            let Some((face, _)) = coretext::face_of(run.font) else {
+            let Some((face, _)) = face_of(run.font) else {
                 return width;
             };
             let blank = face
@@ -430,7 +431,7 @@ pub unsafe extern "C" fn CTLineGetImageBounds(line: CFTypeRef, context: CFTypeRe
         return NSRect::default();
     };
     // SAFETY: a context or null.
-    let at = unsafe { crate::cgcontext::CGContextGetTextPosition(context) };
+    let at = unsafe { coregraphics::cgcontext::CGContextGetTextPosition(context) };
     NSRect {
         origin: NSPoint {
             x: at.x,
@@ -450,16 +451,16 @@ pub unsafe extern "C" fn CTLineDraw(line: CFTypeRef, context: CFTypeRef) {
         return;
     };
     // SAFETY: a context.
-    let origin = unsafe { crate::cgcontext::CGContextGetTextPosition(context) };
+    let origin = unsafe { coregraphics::cgcontext::CGContextGetTextPosition(context) };
     for run in &line.runs {
         if run.glyphs.is_empty() {
             continue;
         }
         // SAFETY: a context, saved and restored around the run's colour.
         unsafe {
-            crate::cgcontext::CGContextSaveGState(context);
+            coregraphics::cgcontext::CGContextSaveGState(context);
             if !run.color.is_null() {
-                crate::cgcontext::CGContextSetFillColorWithColor(context, run.color);
+                coregraphics::cgcontext::CGContextSetFillColorWithColor(context, run.color);
             }
         }
         let shown = || run.glyphs.iter().filter(|g| g.glyph != INVISIBLE);
@@ -482,7 +483,7 @@ pub unsafe extern "C" fn CTLineDraw(line: CFTypeRef, context: CFTypeRef) {
             unsafe {
                 let position = coretext::CTFontGetUnderlinePosition(run.font);
                 let thickness = coretext::CTFontGetUnderlineThickness(run.font).max(1.0);
-                crate::cgcontext::CGContextFillRect(
+                coregraphics::cgcontext::CGContextFillRect(
                     context,
                     NSRect {
                         origin: NSPoint {
@@ -498,16 +499,16 @@ pub unsafe extern "C" fn CTLineDraw(line: CFTypeRef, context: CFTypeRef) {
             }
         }
         // SAFETY: as above.
-        unsafe { crate::cgcontext::CGContextRestoreGState(context) };
+        unsafe { coregraphics::cgcontext::CGContextRestoreGState(context) };
     }
 }
 
 /// `CTParagraphStyleSetting`.
 #[repr(C)]
 pub struct Setting {
-    spec: u32,
-    size: usize,
-    value: *const c_void,
+    pub spec: u32,
+    pub size: usize,
+    pub value: *const c_void,
 }
 
 /// `kCTParagraphStyleSpecifierTabStops` and `...DefaultTabInterval`.

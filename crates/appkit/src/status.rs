@@ -449,7 +449,7 @@ fn menu_signature(menu: Id, hash: &mut impl std::hash::Hasher, depth: usize) {
 }
 
 /// An image's pixels, no larger than the tray needs.
-fn icon_pixels(image: Id) -> Option<crate::raster::Bitmap> {
+fn icon_pixels(image: Id) -> Option<coregraphics::raster::Bitmap> {
     let bitmap = match image.is_null() {
         false => crate::image::bitmap(image),
         // An extra with no image shows its title on a Mac; a tray has no
@@ -461,7 +461,7 @@ fn icon_pixels(image: Id) -> Option<crate::raster::Bitmap> {
 }
 
 /// Box-filter `bitmap` down until it fits in `limit` pixels.
-fn shrink(bitmap: crate::raster::Bitmap, limit: u32) -> crate::raster::Bitmap {
+fn shrink(bitmap: coregraphics::raster::Bitmap, limit: u32) -> coregraphics::raster::Bitmap {
     let mut b = bitmap;
     while b.width > limit && b.height > limit && b.width % 2 == 0 && b.height % 2 == 0 {
         let (w, h) = (b.width / 2, b.height / 2);
@@ -477,7 +477,7 @@ fn shrink(bitmap: crate::raster::Bitmap, limit: u32) -> crate::raster::Bitmap {
                 }
             }
         }
-        b = crate::raster::Bitmap {
+        b = coregraphics::raster::Bitmap {
             width: w,
             height: h,
             pixels: out,

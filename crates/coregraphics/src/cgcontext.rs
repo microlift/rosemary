@@ -5,59 +5,19 @@
 
 use std::ffi::{c_char, c_void};
 
+use crate::font_attributes::{key, loaded, make_font, new_dictionary, release};
+use crate::fonts::LoadedFace;
+use crate::{CGAffineTransformIdentity, CGPoint, CGRect, CGRectApplyAffineTransform, CGSize};
 use corefoundation::base::CFTypeRef;
-use foundation::geometry::{NSPoint, NSRect, NSSize};
 use tiny_skia as sk;
 
 use crate::cgpath::Elements;
-use crate::quartz::{self, BitmapContext, Ink, Retained, State, context_of, state_of};
+use crate::quartz::{self, BitmapContext, Ink, Retained, State, state_of};
+use crate::{CGAffineTransformMakeScale, CGAffineTransformMakeTranslation};
 
-#[repr(C)]
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub struct CGAffineTransform {
-    pub a: f64,
-    pub b: f64,
-    pub c: f64,
-    pub d: f64,
-    pub tx: f64,
-    pub ty: f64,
-}
+pub use crate::CGAffineTransform;
 
-pub const IDENTITY: CGAffineTransform = CGAffineTransform {
-    a: 1.0,
-    b: 0.0,
-    c: 0.0,
-    d: 1.0,
-    tx: 0.0,
-    ty: 0.0,
-};
-
-impl CGAffineTransform {
-    /// `self` then `then`, as `CGAffineTransformConcat(self, then)`.
-    pub fn then(self, then: CGAffineTransform) -> CGAffineTransform {
-        CGAffineTransform {
-            a: self.a * then.a + self.b * then.c,
-            b: self.a * then.b + self.b * then.d,
-            c: self.c * then.a + self.d * then.c,
-            d: self.c * then.b + self.d * then.d,
-            tx: self.tx * then.a + self.ty * then.c + then.tx,
-            ty: self.tx * then.b + self.ty * then.d + then.ty,
-        }
-    }
-
-    pub fn apply(self, x: f64, y: f64) -> (f64, f64) {
-        (
-            self.a * x + self.c * y + self.tx,
-            self.b * x + self.d * y + self.ty,
-        )
-    }
-}
-
-#[repr(C)]
-struct Color {
-    isa: *const c_void,
-    components: [f64; 4],
-}
+pub type CGContextRef = CFTypeRef;
 
 pub fn install() {
     let context =
@@ -67,8 +27,6 @@ pub fn install() {
         context_dealloc as *const c_void,
         c"v16@0:8",
     );
-    corefoundation::base::register(c"__CGColor", None, size_of::<Color>(), true);
-    crate::cgpath::install();
     crate::cgpaint::install();
 }
 
@@ -84,63 +42,6 @@ unsafe extern "C" fn context_dealloc(receiver: objc::object::Id, _sel: objc::sel
     }
 }
 
-/// `kCGImageAlphaOnly`.
-const ALPHA_ONLY: u32 = 7;
-
-pub unsafe extern "C" fn CGBitmapContextCreate(
-    data: *mut c_void,
-    width: usize,
-    height: usize,
-    bits_per_component: usize,
-    bytes_per_row: usize,
-    space: CFTypeRef,
-    bitmap_info: u32,
-) -> CFTypeRef {
-    if width == 0 || height == 0 || bits_per_component != 8 {
-        return std::ptr::null();
-    }
-    let alpha = bitmap_info & quartz::ALPHA_INFO_MASK;
-    let alpha_only = alpha == ALPHA_ONLY;
-    // No space is RGB here unless the alpha is all there is.
-    let components = crate::graphics::space_components(space).unwrap_or(3);
-    let channels = match (alpha_only, components, alpha) {
-        (true, _, _) => 1,
-        (false, 1, 0) => 1,
-        (false, 3, _) => 4,
-        // Gray with alpha, CMYK and the like: refused, as Quartz refuses an
-        // unsupported combination, rather than drawn in the wrong layout.
-        _ => return std::ptr::null(),
-    };
-    let bytes_per_row = match bytes_per_row {
-        0 => width * channels,
-        n => n,
-    };
-    if bytes_per_row < width * channels {
-        return std::ptr::null();
-    }
-    let mut owned = data.is_null().then(|| vec![0u8; bytes_per_row * height]);
-    let data = owned
-        .as_mut()
-        .map_or(data.cast::<u8>(), |buffer| buffer.as_mut_ptr());
-    let class = objc::class::lookup(c"__CGContext").expect("installed during bootstrap");
-    // SAFETY: `BitmapContext` is the registered class layout.
-    let context = unsafe { corefoundation::base::allocate::<BitmapContext>(class) };
-    // SAFETY: a fresh allocation; the pixel storage is the caller's or owned
-    // by the state, which lives as long as the context.
-    unsafe {
-        (*context).data = data;
-        (*context).width = width;
-        (*context).height = height;
-        (*context).bytes_per_row = bytes_per_row;
-        (*context).bits_per_component = bits_per_component;
-        (*context).bitmap_info = bitmap_info;
-        (*context).channels = channels;
-        (*context).alpha_only = alpha_only;
-        (*context).state = Box::into_raw(Box::new(State::new(owned)));
-    }
-    context as CFTypeRef
-}
-
 thread_local! {
     /// The focus context, and the focus it was last answered for.
     static FOCUS_CONTEXT: std::cell::Cell<(usize, Option<(usize, usize)>)> =
@@ -153,8 +54,8 @@ thread_local! {
 /// AppKit hands each `-drawRect:` a fresh state. Its user space is the view's
 /// own, in points, so drawing lands where the same rectangle would through
 /// `NSImage`.
-pub(crate) fn focus_context() -> CFTypeRef {
-    let Some(device) = crate::backing::focused_device() else {
+pub fn focus_context() -> CFTypeRef {
+    let Some(device) = crate::focus::device() else {
         return std::ptr::null();
     };
     let focus = Some((device.key, device.depth));
@@ -179,26 +80,22 @@ pub(crate) fn focus_context() -> CFTypeRef {
     context as CFTypeRef
 }
 
-// On a Mac `NSGraphicsContext` and its `CGContext` share one graphics state;
-// here AppKit's drawing keeps its own (`crate::bezier`), and these carry the
-// parts of it a program mixes with Quartz calls across to the focus context.
-
-/// `-[NSGraphicsContext saveGraphicsState]`, on the Quartz side.
-pub(crate) fn focus_save() {
+/// Save the focus context's state alongside AppKit's graphics state.
+pub fn focus_save() {
     let context = focus_context();
     // SAFETY: null or the focus context.
     unsafe { CGContextSaveGState(context) };
 }
 
-/// `-[NSGraphicsContext restoreGraphicsState]`, on the Quartz side.
-pub(crate) fn focus_restore() {
+/// Restore the focus context's state alongside AppKit's graphics state.
+pub fn focus_restore() {
     let context = focus_context();
     // SAFETY: null or the focus context.
     unsafe { CGContextRestoreGState(context) };
 }
 
-/// A change AppKit made to its transform, made to the focus context's too.
-pub(crate) fn focus_update_ctm(update: impl FnOnce(CGAffineTransform) -> CGAffineTransform) {
+/// Apply an AppKit transform change to the focus context too.
+pub fn focus_update_ctm(update: impl FnOnce(CGAffineTransform) -> CGAffineTransform) {
     if let Some(state) = gstate(focus_context()) {
         state.ctm = update(state.ctm);
     }
@@ -206,74 +103,8 @@ pub(crate) fn focus_update_ctm(update: impl FnOnce(CGAffineTransform) -> CGAffin
 
 /// Run `body` with the focus context's clip, one coverage byte per device
 /// pixel, when Quartz calls have clipped it.
-pub(crate) fn with_focus_clip<R>(body: impl FnOnce(&[u8], u32) -> R) -> Option<R> {
+pub fn with_focus_clip<R>(body: impl FnOnce(&[u8], u32) -> R) -> Option<R> {
     quartz::with_clip(focus_context(), body)
-}
-
-pub unsafe extern "C" fn CGBitmapContextGetData(context: CFTypeRef) -> *mut c_void {
-    context_of(context).map_or(std::ptr::null_mut(), |context| context.data.cast())
-}
-
-pub unsafe extern "C" fn CGBitmapContextGetWidth(context: CFTypeRef) -> usize {
-    context_of(context).map_or(0, |context| context.width)
-}
-
-pub unsafe extern "C" fn CGBitmapContextGetHeight(context: CFTypeRef) -> usize {
-    context_of(context).map_or(0, |context| context.height)
-}
-
-/// `CGImageRef CGBitmapContextCreateImage(CGContextRef)`: a copy of the
-/// pixels as they are now, so later drawing does not show through.
-pub unsafe extern "C" fn CGBitmapContextCreateImage(context: CFTypeRef) -> CFTypeRef {
-    let Some(ctx) = context_of(context) else {
-        return std::ptr::null();
-    };
-    let Some(pixels) = quartz::snapshot_bgra(ctx) else {
-        return std::ptr::null();
-    };
-    // A gray context's image has no alpha to read as coverage; every other
-    // layout's does, an alpha-only one's being all it has.
-    let info = match ctx.channels == 1 && !ctx.alpha_only {
-        true => 6 | quartz::BYTE_ORDER_32_LITTLE,
-        false => crate::graphics::PREMULTIPLIED_BGRA,
-    };
-    crate::graphics::image_from_pixels(pixels, ctx.width, ctx.height, ctx.width * 4, info)
-}
-
-pub unsafe extern "C" fn CGBitmapContextGetBitmapInfo(context: CFTypeRef) -> u32 {
-    context_of(context).map_or(0, |context| context.bitmap_info)
-}
-
-pub unsafe extern "C" fn CGBitmapContextGetBitsPerComponent(context: CFTypeRef) -> usize {
-    context_of(context).map_or(0, |context| context.bits_per_component)
-}
-
-pub unsafe extern "C" fn CGBitmapContextGetBitsPerPixel(context: CFTypeRef) -> usize {
-    context_of(context).map_or(0, |context| context.channels * 8)
-}
-
-pub unsafe extern "C" fn CGBitmapContextGetBytesPerRow(context: CFTypeRef) -> usize {
-    context_of(context).map_or(0, |context| context.bytes_per_row)
-}
-
-/// The context's space, which the caller does not own: device gray for a
-/// gray context, none for an alpha-only one, and device RGB otherwise.
-pub unsafe extern "C" fn CGBitmapContextGetColorSpace(context: CFTypeRef) -> CFTypeRef {
-    static RGB: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    static GRAY: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    let Some(ctx) = context_of(context) else {
-        return std::ptr::null();
-    };
-    // SAFETY: fresh spaces, kept for the process.
-    let space = match (ctx.channels, ctx.alpha_only) {
-        (1, true) => return std::ptr::null(),
-        (1, false) => *GRAY
-            .get_or_init(|| unsafe { crate::graphics::CGColorSpaceCreateDeviceGray() as usize }),
-        _ => {
-            *RGB.get_or_init(|| unsafe { crate::graphics::CGColorSpaceCreateDeviceRGB() as usize })
-        }
-    };
-    space as CFTypeRef
 }
 
 pub unsafe extern "C" fn CGContextRetain(context: CFTypeRef) -> CFTypeRef {
@@ -314,7 +145,7 @@ pub unsafe extern "C" fn CGContextConcatCTM(context: CFTypeRef, transform: CGAff
 }
 
 pub unsafe extern "C" fn CGContextGetCTM(context: CFTypeRef) -> CGAffineTransform {
-    gstate(context).map_or(IDENTITY, |state| state.ctm)
+    gstate(context).map_or(CGAffineTransformIdentity, |state| state.ctm)
 }
 
 /// `CGContextSetCTM`, private but exported, and used by Cairo to put back a
@@ -340,7 +171,7 @@ pub unsafe extern "C" fn CGContextRotateCTM(context: CFTypeRef, angle: f64) {
         b: sin,
         c: -sin,
         d: cos,
-        ..IDENTITY
+        ..CGAffineTransformIdentity
     };
     unsafe { CGContextConcatCTM(context, rotation) };
 }
@@ -381,31 +212,21 @@ pub unsafe extern "C" fn CGContextSetGrayStrokeColor(context: CFTypeRef, gray: f
     unsafe { CGContextSetRGBStrokeColor(context, gray, gray, gray, alpha) };
 }
 
-fn color_of<'a>(color: CFTypeRef) -> Option<&'a Color> {
-    let class = objc::class::lookup(c"__CGColor").expect("installed during bootstrap");
-    // SAFETY: null or an object a guest received from this runtime.
-    if color.is_null() || !unsafe { corefoundation::base::is_kind_of(color, class) } {
-        return None;
-    }
-    // SAFETY: a `__CGColor`, whose body is `Color`.
-    Some(unsafe { &*(color as *const Color) })
-}
-
 pub unsafe extern "C" fn CGContextSetFillColorWithColor(context: CFTypeRef, color: CFTypeRef) {
-    if let (Some(state), Some(color)) = (gstate(context), color_of(color)) {
+    if let (Some(state), Some(color)) = (gstate(context), crate::cgcolor::color_of(color)) {
         state.fill = Ink::Color(color.components);
     }
 }
 
 pub unsafe extern "C" fn CGContextSetStrokeColorWithColor(context: CFTypeRef, color: CFTypeRef) {
-    if let (Some(state), Some(color)) = (gstate(context), color_of(color)) {
+    if let (Some(state), Some(color)) = (gstate(context), crate::cgcolor::color_of(color)) {
         state.stroke = Ink::Color(color.components);
     }
 }
 
 pub unsafe extern "C" fn CGContextSetFillColorSpace(context: CFTypeRef, space: CFTypeRef) {
     if let Some(state) = gstate(context) {
-        state.fill_components = crate::graphics::space_components(space).unwrap_or(3);
+        state.fill_components = crate::cgcolor::space_components(space).unwrap_or(3);
         // A new space resets the colour to its initial one, opaque black.
         state.fill = Ink::Color([0.0, 0.0, 0.0, 1.0]);
     }
@@ -413,32 +234,15 @@ pub unsafe extern "C" fn CGContextSetFillColorSpace(context: CFTypeRef, space: C
 
 pub unsafe extern "C" fn CGContextSetStrokeColorSpace(context: CFTypeRef, space: CFTypeRef) {
     if let Some(state) = gstate(context) {
-        state.stroke_components = crate::graphics::space_components(space).unwrap_or(3);
+        state.stroke_components = crate::cgcolor::space_components(space).unwrap_or(3);
         state.stroke = Ink::Color([0.0, 0.0, 0.0, 1.0]);
     }
-}
-
-/// R, G, B, A from `components` read as the space's colour and an alpha.
-///
-/// # Safety
-///
-/// `components` holds `space_components + 1` values, or is null.
-unsafe fn rgba_from(components: *const f64, space_components: usize) -> Option<[f64; 4]> {
-    if components.is_null() {
-        return None;
-    }
-    // SAFETY: the caller's count.
-    let c = unsafe { std::slice::from_raw_parts(components, space_components + 1) };
-    Some(match space_components {
-        1 => [c[0], c[0], c[0], c[1]],
-        _ => [c[0], c[1], c[2], c[3]],
-    })
 }
 
 pub unsafe extern "C" fn CGContextSetFillColor(context: CFTypeRef, components: *const f64) {
     if let Some(state) = gstate(context)
         && state.fill_components != 0
-        && let Some(rgba) = unsafe { rgba_from(components, state.fill_components) }
+        && let Some(rgba) = unsafe { crate::cgcolor::rgba_from(components, state.fill_components) }
     {
         state.fill = Ink::Color(rgba);
     }
@@ -447,7 +251,8 @@ pub unsafe extern "C" fn CGContextSetFillColor(context: CFTypeRef, components: *
 pub unsafe extern "C" fn CGContextSetStrokeColor(context: CFTypeRef, components: *const f64) {
     if let Some(state) = gstate(context)
         && state.stroke_components != 0
-        && let Some(rgba) = unsafe { rgba_from(components, state.stroke_components) }
+        && let Some(rgba) =
+            unsafe { crate::cgcolor::rgba_from(components, state.stroke_components) }
     {
         state.stroke = Ink::Color(rgba);
     }
@@ -464,7 +269,9 @@ unsafe fn pattern_ink(pattern: CFTypeRef, components: *const f64) -> Option<Ink>
     let color = match components.is_null() {
         true => [0.0, 0.0, 0.0, 1.0],
         // SAFETY: the caller's obligation.
-        false => unsafe { rgba_from(components, 3) }.unwrap_or([0.0, 0.0, 0.0, 1.0]),
+        false => {
+            unsafe { crate::cgcolor::rgba_from(components, 3) }.unwrap_or([0.0, 0.0, 0.0, 1.0])
+        }
     };
     Some(Ink::Pattern(pattern, color))
 }
@@ -493,7 +300,7 @@ pub unsafe extern "C" fn CGContextSetStrokePattern(
     }
 }
 
-pub unsafe extern "C" fn CGContextSetPatternPhase(context: CFTypeRef, phase: NSSize) {
+pub unsafe extern "C" fn CGContextSetPatternPhase(context: CFTypeRef, phase: CGSize) {
     if let Some(state) = gstate(context) {
         state.pattern_phase = (phase.width, phase.height);
     }
@@ -712,13 +519,13 @@ pub unsafe extern "C" fn CGContextClosePath(context: CFTypeRef) {
     }
 }
 
-pub unsafe extern "C" fn CGContextAddRect(context: CFTypeRef, rect: NSRect) {
+pub unsafe extern "C" fn CGContextAddRect(context: CFTypeRef, rect: CGRect) {
     if let Some((path, ctm)) = path(context) {
         path.rect(ctm, rect);
     }
 }
 
-pub unsafe extern "C" fn CGContextAddRects(context: CFTypeRef, rects: *const NSRect, count: usize) {
+pub unsafe extern "C" fn CGContextAddRects(context: CFTypeRef, rects: *const CGRect, count: usize) {
     let Some((path, ctm)) = path(context) else {
         return;
     };
@@ -731,7 +538,7 @@ pub unsafe extern "C" fn CGContextAddRects(context: CFTypeRef, rects: *const NSR
     }
 }
 
-pub unsafe extern "C" fn CGContextAddEllipseInRect(context: CFTypeRef, rect: NSRect) {
+pub unsafe extern "C" fn CGContextAddEllipseInRect(context: CFTypeRef, rect: CGRect) {
     if let Some((path, ctm)) = path(context) {
         path.ellipse(ctm, rect);
     }
@@ -767,7 +574,7 @@ pub unsafe extern "C" fn CGContextAddArcToPoint(
 
 pub unsafe extern "C" fn CGContextAddLines(
     context: CFTypeRef,
-    points: *const NSPoint,
+    points: *const CGPoint,
     count: usize,
 ) {
     let Some((path, ctm)) = path(context) else {
@@ -785,7 +592,7 @@ pub unsafe extern "C" fn CGContextAddLines(
 }
 
 pub unsafe extern "C" fn CGContextAddPath(context: CFTypeRef, other: CFTypeRef) {
-    let Some(source) = crate::cgpath::elements_of(other).map(|e| e.clone()) else {
+    let Some(source) = crate::cgpath::elements_of(other.cast()).map(|e| e.clone()) else {
         return;
     };
     if let Some((path, ctm)) = path(context) {
@@ -797,21 +604,21 @@ pub unsafe extern "C" fn CGContextIsPathEmpty(context: CFTypeRef) -> bool {
     path(context).is_none_or(|(path, _)| path.is_empty())
 }
 
-pub unsafe extern "C" fn CGContextGetPathCurrentPoint(context: CFTypeRef) -> NSPoint {
+pub unsafe extern "C" fn CGContextGetPathCurrentPoint(context: CFTypeRef) -> CGPoint {
     let Some((path, ctm)) = path(context) else {
-        return NSPoint::default();
+        return CGPoint::default();
     };
     match (path.current, ctm.inverse()) {
-        (Some((x, y)), Some(inverse)) => {
-            let (x, y) = inverse.apply(x, y);
-            NSPoint { x, y }
+        (Some(p), Some(inverse)) => {
+            let p = inverse.apply(p.x, p.y);
+            CGPoint { x: p.x, y: p.y }
         }
-        _ => NSPoint::default(),
+        _ => CGPoint::default(),
     }
 }
 
 /// `CGContextGetPathBoundingBox`, in user space.
-pub unsafe extern "C" fn CGContextGetPathBoundingBox(context: CFTypeRef) -> NSRect {
+pub unsafe extern "C" fn CGContextGetPathBoundingBox(context: CFTypeRef) -> CGRect {
     let Some((path, ctm)) = path(context) else {
         return NULL_RECT;
     };
@@ -888,7 +695,7 @@ fn shape(
     Some(shape)
 }
 
-pub unsafe extern "C" fn CGContextFillRect(context: CFTypeRef, rect: NSRect) {
+pub unsafe extern "C" fn CGContextFillRect(context: CFTypeRef, rect: CGRect) {
     if let Some(shape) = shape(context, |e, m| e.rect(m, rect)) {
         quartz::fill(context, &shape, sk::FillRule::Winding, false);
     }
@@ -896,7 +703,7 @@ pub unsafe extern "C" fn CGContextFillRect(context: CFTypeRef, rect: NSRect) {
 
 pub unsafe extern "C" fn CGContextFillRects(
     context: CFTypeRef,
-    rects: *const NSRect,
+    rects: *const CGRect,
     count: usize,
 ) {
     if rects.is_null() {
@@ -909,7 +716,7 @@ pub unsafe extern "C" fn CGContextFillRects(
     }
 }
 
-pub unsafe extern "C" fn CGContextStrokeRect(context: CFTypeRef, rect: NSRect) {
+pub unsafe extern "C" fn CGContextStrokeRect(context: CFTypeRef, rect: CGRect) {
     if let Some(shape) = shape(context, |e, m| e.rect(m, rect)) {
         quartz::stroke(context, &shape);
     }
@@ -917,7 +724,7 @@ pub unsafe extern "C" fn CGContextStrokeRect(context: CFTypeRef, rect: NSRect) {
 
 pub unsafe extern "C" fn CGContextStrokeRectWithWidth(
     context: CFTypeRef,
-    rect: NSRect,
+    rect: CGRect,
     width: f64,
 ) {
     let Some(state) = gstate(context) else {
@@ -931,13 +738,13 @@ pub unsafe extern "C" fn CGContextStrokeRectWithWidth(
     }
 }
 
-pub unsafe extern "C" fn CGContextFillEllipseInRect(context: CFTypeRef, rect: NSRect) {
+pub unsafe extern "C" fn CGContextFillEllipseInRect(context: CFTypeRef, rect: CGRect) {
     if let Some(shape) = shape(context, |e, m| e.ellipse(m, rect)) {
         quartz::fill(context, &shape, sk::FillRule::Winding, false);
     }
 }
 
-pub unsafe extern "C" fn CGContextStrokeEllipseInRect(context: CFTypeRef, rect: NSRect) {
+pub unsafe extern "C" fn CGContextStrokeEllipseInRect(context: CFTypeRef, rect: CGRect) {
     if let Some(shape) = shape(context, |e, m| e.ellipse(m, rect)) {
         quartz::stroke(context, &shape);
     }
@@ -947,7 +754,7 @@ pub unsafe extern "C" fn CGContextStrokeEllipseInRect(context: CFTypeRef, rect: 
 /// pair of points is a line of its own.
 pub unsafe extern "C" fn CGContextStrokeLineSegments(
     context: CFTypeRef,
-    points: *const NSPoint,
+    points: *const CGPoint,
     count: usize,
 ) {
     if points.is_null() {
@@ -956,7 +763,7 @@ pub unsafe extern "C" fn CGContextStrokeLineSegments(
     // SAFETY: the caller supplies `count` points.
     let points = unsafe { std::slice::from_raw_parts(points, count) };
     if let Some(shape) = shape(context, |e, m| {
-        for pair in points.chunks_exact(2) {
+        for pair in points.as_chunks::<2>().0 {
             e.move_to(m, pair[0].x, pair[0].y);
             e.line_to(m, pair[1].x, pair[1].y);
         }
@@ -965,7 +772,7 @@ pub unsafe extern "C" fn CGContextStrokeLineSegments(
     }
 }
 
-pub unsafe extern "C" fn CGContextClearRect(context: CFTypeRef, rect: NSRect) {
+pub unsafe extern "C" fn CGContextClearRect(context: CFTypeRef, rect: CGRect) {
     quartz::clear(context, rect);
 }
 
@@ -985,7 +792,7 @@ pub unsafe extern "C" fn CGContextEOClip(context: CFTypeRef) {
     }
 }
 
-pub unsafe extern "C" fn CGContextClipToRect(context: CFTypeRef, rect: NSRect) {
+pub unsafe extern "C" fn CGContextClipToRect(context: CFTypeRef, rect: CGRect) {
     if let Some(shape) = shape(context, |e, m| e.rect(m, rect)) {
         quartz::clip(context, &shape, sk::FillRule::Winding);
     }
@@ -993,7 +800,7 @@ pub unsafe extern "C" fn CGContextClipToRect(context: CFTypeRef, rect: NSRect) {
 
 pub unsafe extern "C" fn CGContextClipToRects(
     context: CFTypeRef,
-    rects: *const NSRect,
+    rects: *const CGRect,
     count: usize,
 ) {
     if rects.is_null() {
@@ -1006,13 +813,13 @@ pub unsafe extern "C" fn CGContextClipToRects(
     }
 }
 
-pub unsafe extern "C" fn CGContextClipToMask(context: CFTypeRef, rect: NSRect, mask: CFTypeRef) {
+pub unsafe extern "C" fn CGContextClipToMask(context: CFTypeRef, rect: CGRect, mask: CFTypeRef) {
     quartz::clip_to_mask(context, rect, mask);
 }
 
 /// `CGContextGetClipBoundingBox`, in user space: the device rectangle the clip
 /// leaves, carried back through the CTM.
-pub unsafe extern "C" fn CGContextGetClipBoundingBox(context: CFTypeRef) -> NSRect {
+pub unsafe extern "C" fn CGContextGetClipBoundingBox(context: CFTypeRef) -> CGRect {
     let (Some([left, top, right, bottom]), Some(frame), Some(state)) = (
         quartz::clip_device_bounds(context),
         quartz::frame_of(context),
@@ -1026,9 +833,9 @@ pub unsafe extern "C" fn CGContextGetClipBoundingBox(context: CFTypeRef) -> NSRe
     let Some(device_to_user) = state.ctm.then(frame.base).inverse() else {
         return NULL_RECT;
     };
-    let rect = NSRect {
-        origin: NSPoint { x: left, y: top },
-        size: NSSize {
+    let rect = CGRect {
+        origin: CGPoint { x: left, y: top },
+        size: CGSize {
             width: right - left,
             height: bottom - top,
         },
@@ -1040,14 +847,14 @@ pub unsafe extern "C" fn CGContextGetClipBoundingBox(context: CFTypeRef) -> NSRe
 // Images and shadings
 //
 
-pub unsafe extern "C" fn CGContextDrawImage(context: CFTypeRef, rect: NSRect, image: CFTypeRef) {
-    if crate::graphics::is_image_mask(image) {
-        if let Some((width, height, coverage)) = crate::graphics::image_coverage(image) {
+pub unsafe extern "C" fn CGContextDrawImage(context: CFTypeRef, rect: CGRect, image: CFTypeRef) {
+    if crate::cgimage::is_image_mask(image) {
+        if let Some((width, height, coverage)) = crate::cgimage::image_coverage(image) {
             quartz::draw_through_mask(context, rect, width, height, coverage);
         }
         return;
     }
-    if let Some((width, height, pixels)) = crate::graphics::image_bgra(image) {
+    if let Some((width, height, pixels)) = crate::cgimage::image_bgra(image) {
         quartz::draw_pixels(context, rect, width, height, pixels);
     }
 }
@@ -1087,11 +894,15 @@ pub unsafe extern "C" fn CGContextSelectFont(
     }
     // SAFETY: a NUL-terminated name.
     let name = unsafe { std::ffi::CStr::from_ptr(name) }.to_string_lossy();
-    let name = foundation::string::from_str(&name);
-    // SAFETY: a string this call made.
-    let font =
-        unsafe { crate::coretext::CTFontCreateWithName(name as CFTypeRef, size, std::ptr::null()) };
-    objc::arc::release(name);
+    let name = corefoundation::string::from_bytes(name.as_bytes(), false);
+    let descriptor = new_dictionary(&[
+        (key("CTFontNameAttribute"), name),
+        (key("CTFontFamilyNameAttribute"), name),
+    ]);
+    let font = make_font(descriptor, size);
+    release(descriptor);
+    // SAFETY: the reference this call made.
+    unsafe { corefoundation::api::CFRelease(name) };
     if let Some(state) = gstate(context) {
         state.font = Retained::new(font);
         state.font_size = size;
@@ -1109,7 +920,7 @@ pub unsafe extern "C" fn CGContextSetTextMatrix(context: CFTypeRef, matrix: CGAf
 }
 
 pub unsafe extern "C" fn CGContextGetTextMatrix(context: CFTypeRef) -> CGAffineTransform {
-    gstate(context).map_or(IDENTITY, |state| state.text_matrix)
+    gstate(context).map_or(CGAffineTransformIdentity, |state| state.text_matrix)
 }
 
 pub unsafe extern "C" fn CGContextSetTextPosition(context: CFTypeRef, x: f64, y: f64) {
@@ -1119,8 +930,8 @@ pub unsafe extern "C" fn CGContextSetTextPosition(context: CFTypeRef, x: f64, y:
     }
 }
 
-pub unsafe extern "C" fn CGContextGetTextPosition(context: CFTypeRef) -> NSPoint {
-    gstate(context).map_or(NSPoint::default(), |state| NSPoint {
+pub unsafe extern "C" fn CGContextGetTextPosition(context: CFTypeRef) -> CGPoint {
+    gstate(context).map_or(CGPoint::default(), |state| CGPoint {
         x: state.text_matrix.tx,
         y: state.text_matrix.ty,
     })
@@ -1133,9 +944,9 @@ pub unsafe extern "C" fn CGContextSetTextDrawingMode(context: CFTypeRef, mode: i
 }
 
 /// The face the state's font draws with.
-fn state_face(context: CFTypeRef) -> Option<(std::sync::Arc<crate::fonts::LoadedFace>, f64)> {
+fn state_face(context: CFTypeRef) -> Option<(std::sync::Arc<LoadedFace>, f64)> {
     let state = gstate(context)?;
-    let face = crate::coretext::loaded(state.font.as_ref()?.0)?;
+    let face = loaded(state.font.as_ref()?.0)?;
     Some((face, state.font_size))
 }
 
@@ -1153,9 +964,9 @@ fn show_glyphs(context: CFTypeRef, glyphs: &[u16], advances: &[(f64, f64)]) {
     }
     quartz::draw_glyphs(context, &face, size, glyphs, &positions);
     if let Some(state) = gstate(context) {
-        let (tx, ty) = state.text_matrix.apply(pen.0, pen.1);
-        state.text_matrix.tx = tx;
-        state.text_matrix.ty = ty;
+        let p = state.text_matrix.apply(pen.0, pen.1);
+        state.text_matrix.tx = p.x;
+        state.text_matrix.ty = p.y;
     }
 }
 
@@ -1180,7 +991,7 @@ fn font_advances(context: CFTypeRef, glyphs: &[u16]) -> Vec<(f64, f64)> {
 pub unsafe extern "C" fn CGContextShowGlyphsWithAdvances(
     context: CFTypeRef,
     glyphs: *const u16,
-    advances: *const NSSize,
+    advances: *const CGSize,
     count: usize,
 ) {
     if glyphs.is_null() || advances.is_null() || count == 0 {
@@ -1264,231 +1075,15 @@ unsafe extern "C" fn ignored_context(_context: CFTypeRef) {}
 
 /// `CGContextBeginPage(CGContextRef, const CGRect *)`: a bitmap context has
 /// one page and nothing here makes a PDF context.
-unsafe extern "C" fn CGContextBeginPage(_context: CFTypeRef, _media: *const NSRect) {}
-
-/// `CGContextRef CGPDFContextCreateWithURL(CFURLRef, const CGRect *,
-/// CFDictionaryRef)`: NULL - there is no PDF writer, and a program printing to
-/// a file gets the failure it already handles.
-unsafe extern "C" fn CGPDFContextCreateWithURL(
-    _url: CFTypeRef,
-    _media: *const NSRect,
-    _info: CFTypeRef,
-) -> CFTypeRef {
-    std::ptr::null()
-}
-
-//
-// Affine transforms
-//
-
-pub unsafe extern "C" fn CGAffineTransformMake(
-    a: f64,
-    b: f64,
-    c: f64,
-    d: f64,
-    tx: f64,
-    ty: f64,
-) -> CGAffineTransform {
-    CGAffineTransform { a, b, c, d, tx, ty }
-}
-
-pub unsafe extern "C" fn CGAffineTransformMakeScale(x: f64, y: f64) -> CGAffineTransform {
-    CGAffineTransform {
-        a: x,
-        d: y,
-        ..IDENTITY
-    }
-}
-
-pub unsafe extern "C" fn CGAffineTransformMakeTranslation(x: f64, y: f64) -> CGAffineTransform {
-    CGAffineTransform {
-        tx: x,
-        ty: y,
-        ..IDENTITY
-    }
-}
-
-pub unsafe extern "C" fn CGAffineTransformConcat(
-    first: CGAffineTransform,
-    second: CGAffineTransform,
-) -> CGAffineTransform {
-    first.then(second)
-}
-
-pub unsafe extern "C" fn CGAffineTransformScale(
-    transform: CGAffineTransform,
-    x: f64,
-    y: f64,
-) -> CGAffineTransform {
-    unsafe { CGAffineTransformMakeScale(x, y) }.then(transform)
-}
-
-pub unsafe extern "C" fn CGAffineTransformTranslate(
-    transform: CGAffineTransform,
-    x: f64,
-    y: f64,
-) -> CGAffineTransform {
-    unsafe { CGAffineTransformMakeTranslation(x, y) }.then(transform)
-}
-
-pub unsafe extern "C" fn CGAffineTransformInvert(t: CGAffineTransform) -> CGAffineTransform {
-    // A singular transform is returned unchanged, as Quartz documents.
-    t.inverse().unwrap_or(t)
-}
-
-pub unsafe extern "C" fn CGAffineTransformIsIdentity(t: CGAffineTransform) -> u8 {
-    u8::from(t == IDENTITY)
-}
-
-pub unsafe extern "C" fn CGRectApplyAffineTransform(rect: NSRect, t: CGAffineTransform) -> NSRect {
-    let (x0, y0) = (rect.origin.x, rect.origin.y);
-    let (x1, y1) = (x0 + rect.size.width, y0 + rect.size.height);
-    let corners = [
-        t.apply(x0, y0),
-        t.apply(x1, y0),
-        t.apply(x0, y1),
-        t.apply(x1, y1),
-    ];
-    let [left, bottom, right, top] = corners.iter().fold(
-        [f64::MAX, f64::MAX, f64::MIN, f64::MIN],
-        |[l, b, r, t], &(x, y)| [l.min(x), b.min(y), r.max(x), t.max(y)],
-    );
-    NSRect {
-        origin: NSPoint { x: left, y: bottom },
-        size: NSSize {
-            width: right - left,
-            height: top - bottom,
-        },
-    }
-}
-
-//
-// Colours
-//
-
-fn new_color(components: [f64; 4]) -> CFTypeRef {
-    let class = objc::class::lookup(c"__CGColor").expect("installed during bootstrap");
-    // SAFETY: `Color` is the registered class layout.
-    let color = unsafe { corefoundation::base::allocate::<Color>(class) };
-    // SAFETY: a fresh allocation.
-    unsafe { (*color).components = components };
-    color as CFTypeRef
-}
-
-/// `CGColorCreate`, reading the components as gray and alpha or as R, G, B
-/// and alpha by how many the color space has. A space this runtime did not
-/// make is taken as RGB.
-pub unsafe extern "C" fn CGColorCreate(space: CFTypeRef, components: *const f64) -> CFTypeRef {
-    let count = crate::graphics::space_components(space).unwrap_or(3).max(1);
-    // SAFETY: the space's components and an alpha.
-    match unsafe { rgba_from(components, count) } {
-        Some(rgba) => new_color(rgba),
-        None => std::ptr::null(),
-    }
-}
-
-pub unsafe extern "C" fn CGColorCreateGenericRGB(r: f64, g: f64, b: f64, a: f64) -> CFTypeRef {
-    new_color([r, g, b, a])
-}
-
-pub unsafe extern "C" fn CGColorCreateGenericGray(gray: f64, alpha: f64) -> CFTypeRef {
-    new_color([gray, gray, gray, alpha])
-}
-
-pub unsafe extern "C" fn CGColorRelease(color: CFTypeRef) {
-    if !color.is_null() {
-        unsafe { corefoundation::api::CFRelease(color) };
-    }
-}
-
-pub unsafe extern "C" fn CGColorRetain(color: CFTypeRef) -> CFTypeRef {
-    if !color.is_null() {
-        unsafe { corefoundation::api::CFRetain(color) };
-    }
-    color
-}
-
-/// `CGColorCreateCopyWithAlpha`: the same colour at another alpha.
-pub unsafe extern "C" fn CGColorCreateCopyWithAlpha(color: CFTypeRef, alpha: f64) -> CFTypeRef {
-    match color_of(color) {
-        Some(color) => {
-            let [r, g, b, _] = color.components;
-            new_color([r, g, b, alpha])
-        }
-        None => std::ptr::null(),
-    }
-}
-
-pub unsafe extern "C" fn CGColorGetComponents(color: CFTypeRef) -> *const f64 {
-    color_of(color).map_or(std::ptr::null(), |color| color.components.as_ptr())
-}
-
-pub unsafe extern "C" fn CGColorGetNumberOfComponents(color: CFTypeRef) -> usize {
-    color_of(color).map_or(0, |_| 4)
-}
-
-pub unsafe extern "C" fn CGColorGetAlpha(color: CFTypeRef) -> f64 {
-    color_of(color).map_or(0.0, |color| color.components[3])
-}
-
-/// `kCGColorBlack`, `kCGColorWhite` and `kCGColorClear` by name, for the
-/// `CFStringRef` constants [`data_symbols`] publishes.
-pub unsafe extern "C" fn CGColorGetConstantColor(name: CFTypeRef) -> CFTypeRef {
-    static COLORS: std::sync::OnceLock<[usize; 3]> = std::sync::OnceLock::new();
-    let colors = COLORS.get_or_init(|| {
-        [
-            new_color([0.0, 0.0, 0.0, 1.0]) as usize,
-            new_color([1.0, 1.0, 1.0, 1.0]) as usize,
-            new_color([0.0, 0.0, 0.0, 0.0]) as usize,
-        ]
-    });
-    for (at, key) in ["kCGColorBlack", "kCGColorWhite", "kCGColorClear"]
-        .into_iter()
-        .enumerate()
-    {
-        let key = foundation::notification::name_object(key) as CFTypeRef;
-        // SAFETY: both are strings.
-        if !name.is_null() && unsafe { corefoundation::api::CFEqual(name, key) } != 0 {
-            return colors[at] as CFTypeRef;
-        }
-    }
-    std::ptr::null()
-}
-
-pub unsafe extern "C" fn CGColorGetTypeID() -> corefoundation::base::CFTypeID {
-    corefoundation::base::type_id_of(
-        objc::class::lookup(c"__CGColor").expect("installed during bootstrap"),
-    )
-}
-
-/// Every colour here is kept as RGBA, so its space is device RGB.
-pub unsafe extern "C" fn CGColorGetColorSpace(color: CFTypeRef) -> CFTypeRef {
-    static SPACE: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    if color_of(color).is_none() {
-        return std::ptr::null();
-    }
-    // SAFETY: a fresh space, kept for the process as Apple's shared ones are.
-    *SPACE.get_or_init(|| unsafe { crate::graphics::CGColorSpaceCreateDeviceRGB() } as usize)
-        as CFTypeRef
-}
-
-/// The model of a space: `kCGColorSpaceModelMonochrome`, `RGB` or `Pattern`.
-pub unsafe extern "C" fn CGColorSpaceGetModel(space: CFTypeRef) -> i32 {
-    match crate::graphics::space_components(space) {
-        Some(1) => 0,
-        Some(0) => 6,
-        Some(_) => 1,
-        None => -1,
-    }
-}
+unsafe extern "C" fn CGContextBeginPage(_context: CFTypeRef, _media: *const CGRect) {}
 
 /// `CGRectNull`.
-const NULL_RECT: NSRect = NSRect {
-    origin: NSPoint {
+const NULL_RECT: CGRect = CGRect {
+    origin: CGPoint {
         x: f64::INFINITY,
         y: f64::INFINITY,
     },
-    size: NSSize {
+    size: CGSize {
         width: 0.0,
         height: 0.0,
     },
@@ -1496,16 +1091,6 @@ const NULL_RECT: NSRect = NSRect {
 
 exports::exports! {
     functions {
-        "CGBitmapContextCreate" => CGBitmapContextCreate,
-        "CGBitmapContextGetData" => CGBitmapContextGetData,
-        "CGBitmapContextGetWidth" => CGBitmapContextGetWidth,
-        "CGBitmapContextGetHeight" => CGBitmapContextGetHeight,
-        "CGBitmapContextCreateImage" => CGBitmapContextCreateImage,
-        "CGBitmapContextGetBitmapInfo" => CGBitmapContextGetBitmapInfo,
-        "CGBitmapContextGetBitsPerComponent" => CGBitmapContextGetBitsPerComponent,
-        "CGBitmapContextGetBitsPerPixel" => CGBitmapContextGetBitsPerPixel,
-        "CGBitmapContextGetBytesPerRow" => CGBitmapContextGetBytesPerRow,
-        "CGBitmapContextGetColorSpace" => CGBitmapContextGetColorSpace,
         "CGContextRetain" => CGContextRetain,
         "CGContextRelease" => CGContextRelease,
         "CGContextSaveGState" => CGContextSaveGState,
@@ -1593,60 +1178,25 @@ exports::exports! {
         "CGContextShowTextAtPoint" => CGContextShowTextAtPoint,
         "CGContextFlush" | "CGContextSynchronize" | "CGContextEndPage" => ignored_context,
         "CGContextBeginPage" => CGContextBeginPage,
-        "CGPDFContextCreateWithURL" => CGPDFContextCreateWithURL,
-        "CGAffineTransformMake" => CGAffineTransformMake,
-        "CGAffineTransformMakeScale" => CGAffineTransformMakeScale,
-        "CGAffineTransformMakeTranslation" => CGAffineTransformMakeTranslation,
-        "CGAffineTransformConcat" => CGAffineTransformConcat,
-        "CGAffineTransformScale" => CGAffineTransformScale,
-        "CGAffineTransformTranslate" => CGAffineTransformTranslate,
-        "CGAffineTransformInvert" => CGAffineTransformInvert,
-        "CGAffineTransformIsIdentity" => CGAffineTransformIsIdentity,
-        "CGRectApplyAffineTransform" => CGRectApplyAffineTransform,
-        "CGColorCreate" => CGColorCreate,
-        "CGColorCreateGenericRGB" => CGColorCreateGenericRGB,
-        "CGColorCreateGenericGray" => CGColorCreateGenericGray,
-        "CGColorRelease" => CGColorRelease,
-        "CGColorRetain" => CGColorRetain,
-        "CGColorCreateCopyWithAlpha" => CGColorCreateCopyWithAlpha,
-        "CGColorGetComponents" => CGColorGetComponents,
-        "CGColorGetNumberOfComponents" => CGColorGetNumberOfComponents,
-        "CGColorGetAlpha" => CGColorGetAlpha,
-        "CGColorGetConstantColor" => CGColorGetConstantColor,
-        "CGColorGetTypeID" => CGColorGetTypeID,
-        "CGColorGetColorSpace" => CGColorGetColorSpace,
-        "CGColorSpaceGetModel" => CGColorSpaceGetModel,
     }
-}
-
-/// The `CFStringRef` color names `CGColorGetConstantColor` takes.
-pub fn data_symbols() -> Vec<(String, u64)> {
-    ["kCGColorBlack", "kCGColorWhite", "kCGColorClear"]
-        .into_iter()
-        .map(|name| {
-            let symbol = format!("_{name}");
-            let value = foundation::notification::name_object(name) as usize as u64;
-            let cell = corefoundation::base::global_cell(&symbol, value);
-            (symbol, cell)
-        })
-        .collect()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cgbitmap::CGBitmapContextCreate;
 
-    fn rect(x: f64, y: f64, width: f64, height: f64) -> NSRect {
-        NSRect {
-            origin: NSPoint { x, y },
-            size: NSSize { width, height },
+    fn rect(x: f64, y: f64, width: f64, height: f64) -> CGRect {
+        CGRect {
+            origin: CGPoint { x, y },
+            size: CGSize { width, height },
         }
     }
 
     #[test]
     fn draws_an_image_through_a_vertical_context_flip() {
         crate::bootstrap();
-        let image = crate::graphics::image_from_bitmap(crate::raster::Bitmap {
+        let image = crate::cgimage::image_from_bitmap(crate::raster::Bitmap {
             width: 1,
             height: 2,
             pixels: vec![255, 0, 0, 255, 0, 255, 0, 255],
@@ -1660,7 +1210,7 @@ mod tests {
             CGContextScaleCTM(context, 1.0, -1.0);
             CGContextDrawImage(context, rect(0.0, 0.0, 1.0, 2.0), image);
             CGContextRelease(context);
-            crate::graphics::CGImageRelease(image);
+            crate::cgimage::CGImageRelease(image);
         }
         assert_eq!(pixels, [0, 255, 0, 255, 255, 0, 0, 255]);
     }
@@ -1726,8 +1276,8 @@ mod tests {
             CGContextScaleCTM(context, 2.0, 3.0);
             assert_eq!(CGContextGetCTM(context).d, 3.0);
             CGContextRestoreGState(context);
-            assert_eq!(CGContextGetCTM(context), IDENTITY);
-            let inverse = CGAffineTransformInvert(CGAffineTransformMakeScale(2.0, 4.0));
+            assert_eq!(CGContextGetCTM(context), CGAffineTransformIdentity);
+            let inverse = crate::CGAffineTransformInvert(CGAffineTransformMakeScale(2.0, 4.0));
             assert_eq!(inverse.a, 0.5);
             assert_eq!(inverse.d, 0.25);
             CGContextRelease(context);
@@ -1834,7 +1384,7 @@ mod tests {
         let pixels = pixels_after(|context| unsafe {
             let layer = crate::cgpaint::CGLayerCreateWithContext(
                 context,
-                NSSize {
+                CGSize {
                     width: 2.0,
                     height: 2.0,
                 },
@@ -1843,7 +1393,7 @@ mod tests {
             let inner = crate::cgpaint::CGLayerGetContext(layer);
             CGContextSetRGBFillColor(inner, 0.0, 0.0, 1.0, 1.0);
             CGContextFillRect(inner, rect(0.0, 1.0, 2.0, 1.0));
-            crate::cgpaint::CGContextDrawLayerAtPoint(context, NSPoint::default(), layer);
+            crate::cgpaint::CGContextDrawLayerAtPoint(context, CGPoint::default(), layer);
             crate::cgpaint::CGLayerRelease(layer);
         });
         assert_eq!(pixels, [[0, 0, 255, 255], [0, 0, 255, 255], [0; 4], [0; 4]]);

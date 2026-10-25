@@ -317,7 +317,7 @@ unsafe extern "C" fn color_with_cg_color(_class: Id, _sel: Sel, color: *const c_
         return std::ptr::null_mut();
     }
     // SAFETY: a `CGColorRef`; this runtime's colours are RGBA, four components.
-    let components = unsafe { crate::cgcontext::CGColorGetComponents(color as _) };
+    let components = unsafe { coregraphics::cgcolor::CGColorGetComponents(color as _) };
     if components.is_null() {
         return std::ptr::null_mut();
     }
@@ -490,7 +490,7 @@ unsafe extern "C" fn cg_color(receiver: Id, _sel: Sel) -> *const c_void {
     let (red, green, blue, alpha) = unsafe { components(receiver) };
     // SAFETY: a fresh colour this call owns.
     unsafe {
-        let color = crate::cgcontext::CGColorCreateGenericRGB(red, green, blue, alpha);
+        let color = coregraphics::cgcolor::CGColorCreateGenericRGB(red, green, blue, alpha);
         corefoundation::api::CFAutorelease(color)
     }
 }

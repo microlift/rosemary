@@ -24,18 +24,21 @@ pub mod button;
 mod cassowary;
 mod catalog;
 mod cell;
-pub mod cgcontext;
-pub mod cgevent;
-pub mod cgfont;
+pub use coregraphics::cgbitmap;
+pub use coregraphics::cgcolor;
+pub use coregraphics::cgcontext;
+pub use coregraphics::cgdataprovider;
+pub use coregraphics::cgimage;
+pub use coregraphics::quartz_event;
 pub mod cgl;
-pub mod cgpaint;
+pub use coregraphics::cgpaint;
 pub mod cgpath;
 pub mod classes;
 pub mod color;
 mod controls;
 mod coreanimation;
-pub mod coretext;
-mod ctline;
+pub use coretext;
+use coretext::ctline;
 pub mod cursor;
 pub(crate) mod decode;
 pub mod decor;
@@ -49,14 +52,12 @@ pub mod hitheme;
 pub mod launch;
 pub mod launchservices;
 mod props;
-pub(crate) mod quartz;
+pub use coregraphics::cggeometry;
 mod table_views;
 mod view_controller;
 mod visual_effect;
 mod visual_format;
-pub use chrome::fonts;
-pub mod geometry;
-pub mod graphics;
+pub use coregraphics::fonts;
 pub mod icon;
 pub mod image;
 mod input_context;
@@ -77,7 +78,7 @@ pub mod pasteboard;
 mod pasteboard_manager;
 mod pdf;
 mod popup;
-pub mod raster;
+pub use coregraphics::raster;
 mod responder;
 pub mod screen;
 pub mod script;
@@ -100,10 +101,12 @@ pub fn bootstrap() {
     static ONCE: std::sync::Once = std::sync::Once::new();
     ONCE.call_once(|| {
         foundation::bootstrap();
+        coregraphics::bootstrap();
+        event::install_quartz_event_provider();
         decor::install();
         classes::install();
         accessibility::install();
-        ctline::install();
+        coretext::bootstrap();
         view_controller::install();
         bindings::install();
         table_views::install();
@@ -116,9 +119,8 @@ pub fn bootstrap() {
         dock::install();
         workspace::install();
         color::install();
-        graphics::install();
-        cgcontext::install();
         cursor::install();
+        screen::install_quartz_display_provider();
         font::install();
         image::install();
         image::bitmap::install();
@@ -165,152 +167,18 @@ exports::exports! {
     functions {
         "NSApplicationMain" => application::NSApplicationMain,
         "CAFrameRateRangeMake" => displaylink::CAFrameRateRangeMake,
-        "CGMainDisplayID" => screen::CGMainDisplayID,
-        "CGSessionCopyCurrentDictionary" => screen::CGSessionCopyCurrentDictionary,
-        "CGWindowServerCreateServerPort" => screen::CGWindowServerCreateServerPort,
-        "CGDisplayBounds" => screen::CGDisplayBounds,
-        "CGGetDisplayTransferByTable" => screen::CGGetDisplayTransferByTable,
-        "CGSetDisplayTransferByTable" => screen::CGSetDisplayTransferByTable,
-        "CGDisplayRestoreColorSyncSettings" => screen::CGDisplayRestoreColorSyncSettings,
-        "CGDisplayScreenSize" => screen::CGDisplayScreenSize,
-        "CGDisplayIsMain" => screen::CGDisplayIsMain,
-        "CGDisplayPixelsWide" => screen::CGDisplayPixelsWide,
-        "CGDisplayPixelsHigh" => screen::CGDisplayPixelsHigh,
-        "CGDisplayBitsPerPixel" => screen::CGDisplayBitsPerPixel,
-        "CGDisplayMoveCursorToPoint" => screen::CGDisplayMoveCursorToPoint,
-        "CGDisplayCapture" => screen::CGDisplayCapture,
-        "CGCaptureAllDisplays" => screen::CGCaptureAllDisplays,
-        "CGReleaseAllDisplays" => screen::CGReleaseAllDisplays,
-        "CGDisplaySetDisplayMode" => screen::CGDisplaySetDisplayMode,
-        "CGAcquireDisplayFadeReservation" => screen::CGAcquireDisplayFadeReservation,
-        "CGReleaseDisplayFadeReservation" => screen::CGReleaseDisplayFadeReservation,
-        "CGDisplayFade" => screen::CGDisplayFade,
-        "CGShieldingWindowLevel" => screen::CGShieldingWindowLevel,
-        "CGDisplayIsBuiltin" => screen::CGDisplayIsBuiltin,
-        "CGDisplayPrimaryDisplay" => screen::CGDisplayPrimaryDisplay,
-        "CGDisplayRelease" => screen::CGDisplayRelease,
-        "CGDisplayRotation" => screen::CGDisplayRotation,
-        "CGDisplayIsOnline" => screen::CGDisplayIsOnline,
-        "CGDisplayIsAsleep" => screen::CGDisplayIsAsleep,
-        "CGDisplayMirrorsDisplay" => screen::CGDisplayMirrorsDisplay,
-        "CGDisplayModelNumber" => screen::CGDisplayModelNumber,
-        "CGDisplayVendorNumber" => screen::CGDisplayVendorNumber,
-        "CGDisplaySerialNumber" => screen::CGDisplaySerialNumber,
-        "CGDisplayCopyDisplayMode" => screen::CGDisplayCopyDisplayMode,
-        "CGDisplayModeGetRefreshRate" => screen::CGDisplayModeGetRefreshRate,
-        "CGDisplayModeRelease" => screen::CGDisplayModeRelease,
-        "CGDisplayModeRetain" => screen::CGDisplayModeRetain,
-        "CGDisplayCopyAllDisplayModes" => screen::CGDisplayCopyAllDisplayModes,
-        "CGDisplayModeGetWidth" => screen::CGDisplayModeGetWidth,
-        "CGDisplayModeGetHeight" => screen::CGDisplayModeGetHeight,
-        "CGDisplayModeGetPixelWidth" => screen::CGDisplayModeGetPixelWidth,
-        "CGDisplayModeGetPixelHeight" => screen::CGDisplayModeGetPixelHeight,
-        "CGDisplayModeGetIOFlags" => screen::CGDisplayModeGetIOFlags,
-        "CGDisplayModeIsUsableForDesktopGUI" => screen::CGDisplayModeIsUsableForDesktopGUI,
-        "CGDisplayRegisterReconfigurationCallback" => screen::CGDisplayRegisterReconfigurationCallback,
-        "CGDisplayRemoveReconfigurationCallback" => screen::CGDisplayRemoveReconfigurationCallback,
-        "CGGetDisplaysWithRect" => screen::CGGetDisplaysWithRect,
-        "CGDisplayCreateUUIDFromDisplayID" => screen::CGDisplayCreateUUIDFromDisplayID,
-        "CGDisplayGetDisplayIDFromUUID" => screen::CGDisplayGetDisplayIDFromUUID,
         "NSBitsPerSampleFromDepth" => screen::NSBitsPerSampleFromDepth,
         "NSBitsPerPixelFromDepth" => screen::NSBitsPerPixelFromDepth,
         "NSNumberOfColorComponents" => screen::NSNumberOfColorComponents,
         "NSPlanarFromDepth" => screen::NSPlanarFromDepth,
         "NSColorSpaceFromDepth" => screen::NSColorSpaceFromDepth,
         "NSBestDepth" => screen::NSBestDepth,
-        "CGGetOnlineDisplayList" | "CGGetActiveDisplayList" => screen::CGGetOnlineDisplayList,
-        "CGDisplayIDToOpenGLDisplayMask" => screen::CGDisplayIDToOpenGLDisplayMask,
-        "CGDisplayIOServicePort" => screen::CGDisplayIOServicePort,
-        "CGDisplayHideCursor" => cursor::CGDisplayHideCursor,
-        "CGDisplayShowCursor" => cursor::CGDisplayShowCursor,
-        "CGCursorIsVisible" => cursor::CGCursorIsVisible,
-        "CGWarpMouseCursorPosition" => screen::CGWarpMouseCursorPosition,
-        "CGSetLocalEventsSuppressionInterval" => screen::CGSetLocalEventsSuppressionInterval,
-        "CGAssociateMouseAndMouseCursorPosition" => screen::CGAssociateMouseAndMouseCursorPosition,
-        "CGEventSourceKeyState" => screen::CGEventSourceKeyState,
-        "CGEventCreate" => cgevent::CGEventCreate,
-        "CGEventGetLocation" => cgevent::CGEventGetLocation,
-        "CGEventCreateMouseEvent" => cgevent::CGEventCreateMouseEvent,
-        "CGEventSetType" => cgevent::CGEventSetType,
-        "CGEventGetType" => cgevent::CGEventGetType,
-        "CGEventCreateKeyboardEvent" => cgevent::CGEventCreateKeyboardEvent,
-        "CGEventGetFlags" => cgevent::CGEventGetFlags,
-        "CGEventSetFlags" => cgevent::CGEventSetFlags,
-        "CGEventGetIntegerValueField" => cgevent::CGEventGetIntegerValueField,
-        "CGEventSetIntegerValueField" => cgevent::CGEventSetIntegerValueField,
-        "CGEventPost" => cgevent::CGEventPost,
-        "CGGetLastMouseDelta" => cgevent::CGGetLastMouseDelta,
-        "CGEventSourceFlagsState" => cgevent::CGEventSourceFlagsState,
-        "CGEventSourceCounterForEventType" => cgevent::CGEventSourceCounterForEventType,
-        "CGEventTapCreate" => cgevent::CGEventTapCreate,
-        "CGDisplayModeCopyPixelEncoding" => screen::CGDisplayModeCopyPixelEncoding,
-        "CGColorSpaceCreateWithName" => graphics::CGColorSpaceCreateWithName,
-        "CGColorSpaceCreateDeviceRGB" => graphics::CGColorSpaceCreateDeviceRGB,
-        "CGColorSpaceCreateDeviceGray" => graphics::CGColorSpaceCreateDeviceGray,
-        "CGColorSpaceCreateWithPlatformColorSpace" => graphics::CGColorSpaceCreateWithPlatformColorSpace,
-        "CGColorSpaceCreatePattern" => graphics::CGColorSpaceCreatePattern,
-        "CGColorSpaceGetNumberOfComponents" => graphics::CGColorSpaceGetNumberOfComponents,
-        "CGColorSpaceRelease" => graphics::CGColorSpaceRelease,
-        "CGColorSpaceGetName" => graphics::CGColorSpaceGetName,
-        "CGColorSpaceCopyName" => graphics::CGColorSpaceCopyName,
-        "CGColorSpaceCopyPropertyList" => graphics::CGColorSpaceCopyPropertyList,
-        "CGDataProviderCreateWithData" => graphics::CGDataProviderCreateWithData,
-        "CGDataProviderRelease" => graphics::CGDataProviderRelease,
-        "CGImageCreate" => graphics::CGImageCreate,
-        "CGImageMaskCreate" => graphics::CGImageMaskCreate,
-        "CGImageCreateWithImageInRect" => graphics::CGImageCreateWithImageInRect,
-        "CGImageCreateWithPNGDataProvider" => graphics::CGImageCreateWithPNGDataProvider,
-        "CGImageCreateCopyWithColorSpace" => graphics::CGImageCreateCopyWithColorSpace,
-        "CGImageRetain" => graphics::CGImageRetain,
-        "CGImageRelease" => graphics::CGImageRelease,
-        "CGImageGetWidth" => graphics::CGImageGetWidth,
-        "CGImageGetHeight" => graphics::CGImageGetHeight,
-        "CGImageGetBitsPerComponent" => graphics::CGImageGetBitsPerComponent,
-        "CGImageGetAlphaInfo" => graphics::CGImageGetAlphaInfo,
-        "CGImageGetColorSpace" => graphics::CGImageGetColorSpace,
-        "CGImageSourceCreateWithData" => graphics::CGImageSourceCreateWithData,
-        "CGImageSourceCreateImageAtIndex" => graphics::CGImageSourceCreateImageAtIndex,
-        "CGRectGetWidth" => geometry::CGRectGetWidth,
-        "CGRectGetHeight" => geometry::CGRectGetHeight,
-        "CGRectGetMinX" => geometry::CGRectGetMinX,
-        "CGRectGetMidX" => geometry::CGRectGetMidX,
-        "CGRectGetMaxX" => geometry::CGRectGetMaxX,
-        "CGRectGetMinY" => geometry::CGRectGetMinY,
-        "CGRectGetMidY" => geometry::CGRectGetMidY,
-        "CGRectGetMaxY" => geometry::CGRectGetMaxY,
-        "NSPointInRect" => geometry::NSPointInRect,
-        "NSIsEmptyRect" => geometry::NSIsEmptyRect,
-        "NSUnionRect" => geometry::NSUnionRect,
-        "NSMouseInRect" => geometry::NSMouseInRect,
-        "NSInsetRect" => geometry::NSInsetRect,
-        "NSIntersectionRect" => geometry::NSIntersectionRect,
-        "NSOffsetRect" => geometry::NSOffsetRect,
-        "CGRectInset" => geometry::CGRectInset,
-        "CGRectOffset" => geometry::CGRectOffset,
-        "CGRectIntegral" => geometry::CGRectIntegral,
-        "CGRectIsEmpty" => geometry::CGRectIsEmpty,
-        "CGRectIntersection" => geometry::CGRectIntersection,
-        "CGRectContainsPoint" => geometry::CGRectContainsPoint,
-        "CGRectContainsRect" => geometry::CGRectContainsRect,
-        "NSContainsRect" => geometry::NSContainsRect,
-        "NSIntersectsRect" => geometry::NSIntersectsRect,
-        "NSIntegralRect" => geometry::NSIntegralRect,
-        "NSEqualPoints" => geometry::NSEqualPoints,
-        "NSEqualSizes" => geometry::NSEqualSizes,
-        "NSIntersectionRange" => geometry::NSIntersectionRange,
-        "NSStringFromPoint" => geometry::NSStringFromPoint,
-        "NSStringFromSize" => geometry::NSStringFromSize,
-        "NSStringFromRect" => geometry::NSStringFromRect,
-        "NSStringFromRange" => geometry::NSStringFromRange,
-        "NSPointFromString" => geometry::NSPointFromString,
-        "NSSizeFromString" => geometry::NSSizeFromString,
-        "NSRectFromString" => geometry::NSRectFromString,
+        "NSBeep" => application::NSBeep,
         "NSFrameRect" => color::NSFrameRect,
         "NSFrameRectWithWidth" => color::NSFrameRectWithWidth,
         "NSEraseRect" => color::NSEraseRect,
         "NSRectClip" => color::NSRectClip,
         "NSRectFillUsingOperation" => color::NSRectFillUsingOperation,
-        "NSBeep" => application::NSBeep,
         "NSAccessibilityPostNotification" => accessibility::NSAccessibilityPostNotification,
         "NSAccessibilityPostNotificationWithUserInfo" => accessibility::NSAccessibilityPostNotificationWithUserInfo,
         "NSAccessibilityActionDescription" => accessibility::NSAccessibilityActionDescription,
@@ -318,14 +186,6 @@ exports::exports! {
         "NSAccessibilityRoleDescriptionForUIElement" => accessibility::NSAccessibilityRoleDescriptionForUIElement,
         "NSAccessibilityUnignoredAncestor" => accessibility::NSAccessibilityUnignoredAncestor,
         "NSAccessibilityFrameInView" => accessibility::NSAccessibilityFrameInView,
-        // FIXME (PORTABILITY): this needs to be ported to macOS
-        #[cfg(not(target_os = "macos"))]
-        "NSDefaultMallocZone" => darwin::malloc::malloc_default_zone,
-        "NSRectFill" => color::NSRectFill,
-        "NSDrawNinePartImage" => image::NSDrawNinePartImage,
-        "NSDisableScreenUpdates" => geometry::NSDisableScreenUpdates,
-        "NSEnableScreenUpdates" => geometry::NSEnableScreenUpdates,
-        "CGRectEqualToRect" | "NSEqualRects" => geometry::CGRectEqualToRect,
         "GetCurrentKeyModifiers" | "GetCurrentEventKeyModifiers" => keymap::GetCurrentKeyModifiers,
         "TISCopyCurrentKeyboardInputSource" => textinput::TISCopyCurrentKeyboardInputSource,
         "TISCopyInputMethodKeyboardLayoutOverride" => textinput::TISCopyInputMethodKeyboardLayoutOverride,
@@ -368,13 +228,8 @@ exports::exports! {
     groups {
         ctline,
         pasteboard_manager,
-        coretext,
-        cgfont,
         hitheme,
         launchservices,
-        cgcontext,
-        cgpath,
-        cgpaint,
         cgl,
     }
 }
@@ -383,22 +238,13 @@ pub fn ns_app_cell() -> u64 {
     corefoundation::base::global_cell("_NSApp", 0)
 }
 
-// CoreGraphics exports these structures themselves, rather than pointers to
-// them. A guest loads their addresses from its GOT and copies the fields.
-static CG_AFFINE_TRANSFORM_IDENTITY: [f64; 6] = [1.0, 0.0, 0.0, 1.0, 0.0, 0.0];
 /// `{{-CGFLOAT_MAX / 2, -CGFLOAT_MAX / 2}, {CGFLOAT_MAX, CGFLOAT_MAX}}`.
 static CG_RECT_INFINITE: [f64; 4] = [f64::MAX / -2.0, f64::MAX / -2.0, f64::MAX, f64::MAX];
 
 pub fn data_symbols() -> Vec<(String, u64)> {
     bootstrap();
     let mut out = classes::class_data();
-    out.extend(coretext::data_symbols());
-    out.extend(cgcontext::data_symbols());
     out.push(("_NSApp".to_string(), ns_app_cell()));
-    out.push((
-        "_CGAffineTransformIdentity".to_string(),
-        CG_AFFINE_TRANSFORM_IDENTITY.as_ptr() as usize as u64,
-    ));
     out.push((
         "_CGRectInfinite".to_string(),
         CG_RECT_INFINITE.as_ptr() as usize as u64,
@@ -971,17 +817,5 @@ mod tests {
             unsafe { foundation::string::bytes(object) },
             window::DID_CHANGE_SCREEN.as_bytes()
         );
-    }
-
-    #[test]
-    fn core_graphics_structure_globals_point_at_their_fields() {
-        let symbols = data_symbols();
-        let (_, identity) = symbols
-            .iter()
-            .find(|(name, _)| name == "_CGAffineTransformIdentity")
-            .expect("published");
-        // SAFETY: the symbol points at the six-double static above.
-        let fields = unsafe { std::slice::from_raw_parts(*identity as *const f64, 6) };
-        assert_eq!(fields, &[1.0, 0.0, 0.0, 1.0, 0.0, 0.0]);
     }
 }

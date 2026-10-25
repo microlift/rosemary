@@ -1,9 +1,14 @@
-use std::ffi::c_void;
+//! The Quartz event services: `CGEvent`, its posting, and the input counters.
 
-use foundation::geometry::NSPoint;
-use objc::class::Class;
+#![allow(non_snake_case)]
+
+use std::ffi::c_void;
+use std::sync::OnceLock;
 
 use corefoundation::base::CFTypeRef;
+use objc::class::Class;
+
+use crate::CGPoint;
 
 /// `CGEventType`, the ones this module acts on.
 mod kind {
@@ -43,11 +48,32 @@ mod kind {
     }
 }
 
+/// What AppKit provides to the Quartz event services: where the pointer is,
+/// how to move it, and the keyboard's modifiers.
+pub trait Provider: Send + Sync {
+    /// The pointer in Quartz's global coordinates, or `None` when the host has
+    /// no answer.
+    fn pointer(&self) -> Option<(f32, f32)>;
+
+    /// Put the pointer at `point`, in Quartz's global coordinates.
+    fn warp_pointer(&self, point: CGPoint);
+
+    /// The keyboard's modifiers, as `NSEvent`'s modifier bits.
+    fn modifiers(&self) -> u64;
+}
+
+static PROVIDER: OnceLock<Box<dyn Provider>> = OnceLock::new();
+
+/// Install the provider AppKit answers pointer and modifier queries with.
+pub fn set_provider(provider: Box<dyn Provider>) {
+    let _ = PROVIDER.set(provider);
+}
+
 #[repr(C)]
 struct Body {
     isa: *const Class,
     /// Where the event says the pointer is, in Quartz's global coordinates.
-    location: NSPoint,
+    location: CGPoint,
     /// `CGEventType`.
     kind: u32,
     /// `CGEventFlags`, which share their bits with `NSEventModifierFlags`.
@@ -68,11 +94,11 @@ fn class() -> &'static Class {
 }
 
 /// An event object the caller owns and releases with `CFRelease`.
-fn new(location: NSPoint, kind: u32) -> CFTypeRef {
+fn new(location: CGPoint, kind: u32) -> CFTypeRef {
     new_with(location, kind, 0, 0)
 }
 
-fn new_with(location: NSPoint, kind: u32, flags: u64, key_code: u16) -> CFTypeRef {
+fn new_with(location: CGPoint, kind: u32, flags: u64, key_code: u16) -> CFTypeRef {
     // SAFETY: `Body` begins with `isa` and is the layout `class` was registered
     // with.
     let body: *mut Body = unsafe { corefoundation::base::allocate(class()) };
@@ -101,14 +127,14 @@ fn body_of<'a>(event: CFTypeRef) -> Option<&'a mut Body> {
 
 /// A CoreGraphics event describing an `NSEvent`, autoreleased: what
 /// `-[NSEvent CGEvent]` hands back, which lives as long as the event does.
-pub(crate) fn describing(kind: u64, flags: u64, key_code: u16, location: NSPoint) -> CFTypeRef {
+pub fn describing(kind: u64, flags: u64, key_code: u16, location: CGPoint) -> CFTypeRef {
     let event = new_with(location, kind as u32, flags, key_code);
     // SAFETY: a fresh object.
     unsafe { corefoundation::api::CFAutorelease(event) }
 }
 
 /// What `+[NSEvent eventWithCGEvent:]` reads: the type, flags, key and place.
-pub(crate) fn parts(event: CFTypeRef) -> Option<(u64, u64, u16, NSPoint)> {
+pub fn parts(event: CFTypeRef) -> Option<(u64, u64, u16, CGPoint)> {
     body_of(event).map(|b| (u64::from(b.kind), b.flags, b.key_code, b.location))
 }
 
@@ -167,17 +193,24 @@ pub unsafe extern "C" fn CGEventSetIntegerValueField(event: CFTypeRef, field: u3
     }
 }
 
+/// Put the pointer at `point`, in Quartz's global coordinates.
+pub fn warp_pointer(point: CGPoint) {
+    if let Some(provider) = PROVIDER.get() {
+        provider.warp_pointer(point);
+    }
+}
+
 /// Where the pointer is, in Quartz's global coordinates.
 ///
 /// The same two exceptions `+[NSEvent mouseLocation]` makes, and for the same
 /// reason: a scripted pointer and a disassociated one are both places the
 /// window system's own cursor is not, and the two answers must not disagree.
-pub fn global_pointer() -> NSPoint {
-    let (x, y) = crate::script::pointer()
-        .or_else(crate::event::frozen_pointer)
-        .or_else(|| crate::window::desktop_mouse_state().map(|(x, y, _)| (x, y)))
+pub fn global_pointer() -> CGPoint {
+    let (x, y) = PROVIDER
+        .get()
+        .and_then(|provider| provider.pointer())
         .unwrap_or((0.0, 0.0));
-    NSPoint {
+    CGPoint {
         x: x as f64,
         y: y as f64,
     }
@@ -189,7 +222,6 @@ pub fn global_pointer() -> NSPoint {
 /// way this is used: the event it hands back carries where the pointer is now.
 /// A non-null source names a tap to take the state from, and this runtime has
 /// one input state - so the answer is the same either way.
-#[allow(non_snake_case)]
 pub unsafe extern "C" fn CGEventCreate(_source: *const c_void) -> CFTypeRef {
     new(global_pointer(), kind::NULL)
 }
@@ -198,11 +230,10 @@ pub unsafe extern "C" fn CGEventCreate(_source: *const c_void) -> CFTypeRef {
 ///
 /// Zero for anything that is not an event this module made, which is what
 /// CoreGraphics answers for a null event.
-#[allow(non_snake_case)]
-pub unsafe extern "C" fn CGEventGetLocation(event: CFTypeRef) -> NSPoint {
+pub unsafe extern "C" fn CGEventGetLocation(event: CFTypeRef) -> CGPoint {
     // SAFETY: null or an object this runtime allocated.
     if !unsafe { corefoundation::base::is_kind_of(event, class()) } {
-        return NSPoint::default();
+        return CGPoint::default();
     }
     // SAFETY: an instance of `class()` is a `Body`.
     unsafe { (*(event as *const Body)).location }
@@ -214,18 +245,16 @@ pub unsafe extern "C" fn CGEventGetLocation(event: CFTypeRef) -> NSPoint {
 /// The button is recorded nowhere: the only kind of event this runtime can act
 /// on when it is posted is one that moves the pointer, and which button is held
 /// while it moves changes nothing about where it lands.
-#[allow(non_snake_case)]
 pub unsafe extern "C" fn CGEventCreateMouseEvent(
     _source: *const c_void,
     kind: u32,
-    location: NSPoint,
+    location: CGPoint,
     _button: u32,
 ) -> CFTypeRef {
     new(location, kind)
 }
 
 /// `void CGEventSetType(CGEventRef, CGEventType)`.
-#[allow(non_snake_case)]
 pub unsafe extern "C" fn CGEventSetType(event: CFTypeRef, kind: u32) {
     // SAFETY: null or an object this runtime allocated.
     if !unsafe { corefoundation::base::is_kind_of(event, class()) } {
@@ -247,7 +276,6 @@ pub unsafe extern "C" fn CGEventSetType(event: CFTypeRef, kind: u32) {
 /// what this runtime has instead is SDL's queue, which is fed by the window
 /// system and is not writable. Said once rather than ignored, because a program
 /// that synthesises a click and never sees one has no other way to find out.
-#[allow(non_snake_case)]
 pub unsafe extern "C" fn CGEventPost(_tap: u32, event: CFTypeRef) {
     // SAFETY: null or an object this runtime allocated.
     if !unsafe { corefoundation::base::is_kind_of(event, class()) } {
@@ -256,17 +284,18 @@ pub unsafe extern "C" fn CGEventPost(_tap: u32, event: CFTypeRef) {
     // SAFETY: an instance of `class()` is a `Body`.
     let body = unsafe { &*(event as *const Body) };
     if kind::moves_the_pointer(body.kind) {
-        // SAFETY: a point, which is all it takes.
-        unsafe { crate::screen::CGWarpMouseCursorPosition(body.location) };
+        if let Some(provider) = PROVIDER.get() {
+            provider.warp_pointer(body.location);
+        }
         return;
     }
     if kind::presses_a_button(body.kind) {
         static ONCE: std::sync::Once = std::sync::Once::new();
         ONCE.call_once(|| {
             eprintln!(
-                "rosemary: appkit: CGEventPost: this program synthesises mouse button events, \
-                 which this runtime cannot deliver - its event queue is the window system's and \
-                 is not writable"
+                "rosemary: coregraphics: CGEventPost: this program synthesises mouse button \
+                 events, which this runtime cannot deliver - its event queue is the window \
+                 system's and is not writable"
             );
         });
     }
@@ -293,7 +322,6 @@ pub fn note_mouse_delta(dx: f32, dy: f32) {
 /// # Safety
 ///
 /// Both pointers are null or writable.
-#[allow(non_snake_case)]
 pub unsafe extern "C" fn CGGetLastMouseDelta(dx: *mut i32, dy: *mut i32) {
     let mut delta = DELTA.lock().unwrap_or_else(|e| e.into_inner());
     let (x, y) = (delta.0.trunc(), delta.1.trunc());
@@ -310,15 +338,13 @@ pub unsafe extern "C" fn CGGetLastMouseDelta(dx: *mut i32, dy: *mut i32) {
     }
 }
 
-/// `CGEventFlags CGEventSourceFlagsState(CGEventSourceStateID)`
-///
 /// Input events delivered so far, by `CGEventType` - which for every input
 /// event is the same number as its `NSEventType`.
 static COUNTS: [std::sync::atomic::AtomicU32; 32] =
     [const { std::sync::atomic::AtomicU32::new(0) }; 32];
 
 /// Note one delivered event of `kind`, for [`CGEventSourceCounterForEventType`].
-pub(crate) fn count(kind: u64) {
+pub fn count(kind: u64) {
     if let Some(counter) = COUNTS.get(kind as usize) {
         counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
@@ -329,7 +355,6 @@ pub(crate) fn count(kind: u64) {
 /// How many events of a type have arrived, which a program samples twice to
 /// learn whether the user did anything in between. `kCGAnyInputEventType` is
 /// the sum of every type.
-#[allow(non_snake_case)]
 pub extern "C" fn CGEventSourceCounterForEventType(_state: u32, kind: u32) -> u32 {
     /// `kCGAnyInputEventType`.
     const ANY_INPUT: u32 = u32::MAX;
@@ -340,12 +365,38 @@ pub extern "C" fn CGEventSourceCounterForEventType(_state: u32, kind: u32) -> u3
     }
 }
 
+/// `CGError CGSetLocalEventsSuppressionInterval(CFTimeInterval)`.
+///
+/// How long real mouse input is ignored after a warp. `CGWarpMouseCursorPosition`
+/// never suppresses anything, which is the interval games set - zero, so mouse
+/// look keeps its deltas. Any other interval is reported once rather than kept.
+pub unsafe extern "C" fn CGSetLocalEventsSuppressionInterval(seconds: f64) -> i32 {
+    static TOLD: std::sync::Once = std::sync::Once::new();
+    if seconds != 0.0 {
+        TOLD.call_once(|| {
+            eprintln!(
+                "rosemary: coregraphics: CGSetLocalEventsSuppressionInterval({seconds}) is not \
+                 honoured; input is never suppressed after a warp"
+            )
+        });
+    }
+    0
+}
+
+/// `bool CGEventSourceKeyState(CGEventSourceStateID, CGKeyCode)`.
+///
+/// False: the key state a caller asks about here is the window server's, and
+/// there is no window server to ask. SDL's keyboard state is this process's own
+/// view and answers a different question.
+pub unsafe extern "C" fn CGEventSourceKeyState(_source: i32, _key: u16) -> u8 {
+    0
+}
+
 /// `CFMachPortRef CGEventTapCreate(CGEventTapLocation, CGEventTapPlacement,
 /// CGEventTapOptions, CGEventMask, CGEventTapCallBack, void *)`
 ///
 /// NULL, which is what Apple's answers to a process not trusted for
 /// accessibility: no other process's input passes through this one.
-#[allow(non_snake_case)]
 pub extern "C" fn CGEventTapCreate(
     _tap: u32,
     _place: u32,
@@ -359,7 +410,136 @@ pub extern "C" fn CGEventTapCreate(
 
 /// The keyboard's modifiers now. The flags are NSEvent's modifier bits, which
 /// is how AppKit defines them, so the same translation answers both.
-#[allow(non_snake_case)]
 pub extern "C" fn CGEventSourceFlagsState(_state: u32) -> u64 {
-    crate::keymap::modifiers(sdl3::video::keyboard_modifiers())
+    PROVIDER.get().map_or(0, |provider| provider.modifiers())
+}
+
+exports::exports! {
+    functions {
+        "CGEventCreate" => CGEventCreate,
+        "CGEventGetLocation" => CGEventGetLocation,
+        "CGEventCreateMouseEvent" => CGEventCreateMouseEvent,
+        "CGEventSetType" => CGEventSetType,
+        "CGEventGetType" => CGEventGetType,
+        "CGEventCreateKeyboardEvent" => CGEventCreateKeyboardEvent,
+        "CGEventGetFlags" => CGEventGetFlags,
+        "CGEventSetFlags" => CGEventSetFlags,
+        "CGEventGetIntegerValueField" => CGEventGetIntegerValueField,
+        "CGEventSetIntegerValueField" => CGEventSetIntegerValueField,
+        "CGEventPost" => CGEventPost,
+        "CGGetLastMouseDelta" => CGGetLastMouseDelta,
+        "CGEventSourceFlagsState" => CGEventSourceFlagsState,
+        "CGEventSourceCounterForEventType" => CGEventSourceCounterForEventType,
+        "CGSetLocalEventsSuppressionInterval" => CGSetLocalEventsSuppressionInterval,
+        "CGEventSourceKeyState" => CGEventSourceKeyState,
+        "CGEventTapCreate" => CGEventTapCreate,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn keyboard_constructors_record_the_key_and_direction_without_modifiers() {
+        // SAFETY: a null source is supported; each owned event is released once.
+        unsafe {
+            for (down, kind) in [(true, kind::KEY_DOWN), (false, kind::KEY_UP)] {
+                let event = CGEventCreateKeyboardEvent(std::ptr::null(), 42, down);
+                assert!(!event.is_null());
+                assert_eq!(CGEventGetType(event), kind);
+                assert_eq!(CGEventGetFlags(event), 0);
+                assert_eq!(CGEventGetIntegerValueField(event, 9), 42);
+                corefoundation::api::CFRelease(event);
+            }
+        }
+    }
+
+    #[test]
+    fn keyboard_fields_can_be_changed_without_affecting_the_location() {
+        let location = CGPoint { x: 12.5, y: -7.0 };
+        let event = new_with(location, kind::KEY_DOWN, 0, 42);
+        let flags = (1u64 << 63) | (1 << 20) | (1 << 17);
+        // SAFETY: a live event owned by this test.
+        unsafe {
+            CGEventSetFlags(event, flags);
+            CGEventSetIntegerValueField(event, 9, 123);
+            CGEventSetType(event, kind::KEY_UP);
+            assert_eq!(CGEventGetFlags(event), flags);
+            assert_eq!(CGEventGetIntegerValueField(event, 9), 123);
+            assert_eq!(CGEventGetType(event), kind::KEY_UP);
+            assert_eq!(CGEventGetLocation(event), location);
+            assert_eq!(parts(event), Some((11, flags, 123, location)));
+            CGEventSetIntegerValueField(event, 8, 99);
+            assert_eq!(CGEventGetIntegerValueField(event, 8), 0);
+            assert_eq!(CGEventGetIntegerValueField(event, 9), 123);
+            corefoundation::api::CFRelease(event);
+        }
+    }
+
+    #[test]
+    fn integer_key_fields_use_the_virtual_keys_sixteen_bits() {
+        let event = new_with(CGPoint::default(), kind::KEY_DOWN, 0, 0);
+        // SAFETY: a live event owned by this test.
+        unsafe {
+            for (value, expected) in [(-1, 65535), (65536, 0), (65537, 1)] {
+                CGEventSetIntegerValueField(event, 9, value);
+                assert_eq!(CGEventGetIntegerValueField(event, 9), expected);
+            }
+            corefoundation::api::CFRelease(event);
+        }
+    }
+
+    #[test]
+    fn describing_round_trips_appkit_fields_and_autoreleases_the_event() {
+        let pool = objc::arc::pool_push();
+        let location = CGPoint { x: -10.0, y: 25.5 };
+        let event = describing(10, 1 << 20, 12, location);
+        assert!(!event.is_null());
+        assert_eq!(parts(event), Some((10, 1 << 20, 12, location)));
+        // SAFETY: retain the event across draining the pool that owns its release.
+        unsafe { corefoundation::api::CFRetain(event) };
+        objc::arc::pool_pop(pool);
+        // SAFETY: the retained reference is still live and is released once.
+        unsafe {
+            assert_eq!(corefoundation::api::CFGetRetainCount(event), 1);
+            assert_eq!(CGEventGetIntegerValueField(event, 9), 12);
+            corefoundation::api::CFRelease(event);
+        }
+    }
+
+    #[test]
+    fn keyboard_accessors_reject_null_and_non_events() {
+        crate::bootstrap();
+        // SAFETY: null or a live color space, neither of which is an event.
+        unsafe {
+            let space = crate::cgcolor::CGColorSpaceCreateDeviceRGB();
+            for event in [std::ptr::null(), space] {
+                assert_eq!(parts(event), None);
+                assert_eq!(CGEventGetType(event), kind::NULL);
+                assert_eq!(CGEventGetFlags(event), 0);
+                assert_eq!(CGEventGetIntegerValueField(event, 9), 0);
+                CGEventSetFlags(event, u64::MAX);
+                CGEventSetIntegerValueField(event, 9, 42);
+                CGEventSetType(event, kind::KEY_DOWN);
+                assert_eq!(parts(event), None);
+            }
+            crate::cgcolor::CGColorSpaceRelease(space);
+        }
+    }
+
+    #[test]
+    fn the_keyboard_event_calls_are_exported() {
+        let names = crate::names();
+        for name in [
+            "CGEventCreateKeyboardEvent",
+            "CGEventGetType",
+            "CGEventGetFlags",
+            "CGEventSetFlags",
+            "CGEventGetIntegerValueField",
+            "CGEventSetIntegerValueField",
+        ] {
+            assert!(names.contains(&name), "{name}");
+        }
+    }
 }

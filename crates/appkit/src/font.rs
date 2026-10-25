@@ -182,7 +182,7 @@ unsafe extern "C" fn symbolic_traits(receiver: Id, _sel: Sel) -> u32 {
 /// `-[NSFontManager availableFontFamilies]`: every family the face database
 /// holds, each once, sorted as AppKit's is.
 unsafe extern "C" fn available_font_families(_receiver: Id, _sel: Sel) -> Id {
-    let mut families: Vec<String> = crate::fonts::all_faces()
+    let mut families: Vec<String> = coregraphics::fonts::all_faces()
         .into_iter()
         .map(|face| face.family)
         .collect();
@@ -211,7 +211,7 @@ unsafe extern "C" fn available_members_of_font_family(_receiver: Id, _sel: Sel, 
     // SAFETY: an NSString, as the selector requires.
     let wanted =
         String::from_utf8_lossy(&unsafe { foundation::string::bytes(family) }).into_owned();
-    let mut faces: Vec<_> = crate::fonts::all_faces()
+    let mut faces: Vec<_> = coregraphics::fonts::all_faces()
         .into_iter()
         .filter(|face| face.family.eq_ignore_ascii_case(&wanted))
         .collect();

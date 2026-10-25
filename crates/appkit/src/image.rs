@@ -170,7 +170,7 @@ unsafe extern "C" fn unlock_focus(receiver: Id, _sel: Sel) {
 }
 
 /// Copy a rectangle from the currently focused image into an RGBA bitmap.
-fn focused_bitmap(rect: NSRect) -> Option<crate::raster::Bitmap> {
+fn focused_bitmap(rect: NSRect) -> Option<coregraphics::raster::Bitmap> {
     let receiver = IMAGE_FOCUS.with(|stack| stack.borrow().last().copied())? as Id;
     let image = image_of(receiver);
     let (image_width, image_height) = pixel_extent(image.size)?;
@@ -195,7 +195,7 @@ fn focused_bitmap(rect: NSRect) -> Option<crate::raster::Bitmap> {
         let to = row * width * 4;
         pixels[to..to + width * 4].copy_from_slice(&source[from..from + width * 4]);
     }
-    Some(crate::raster::Bitmap {
+    Some(coregraphics::raster::Bitmap {
         width: width as u32,
         height: height as u32,
         pixels,
@@ -260,7 +260,7 @@ pub fn is_blank(object: Id) -> bool {
 
 /// An image's pixels, for a caller outside AppKit that needs them - the
 /// application icon is the one that does.
-pub fn bitmap(object: Id) -> Option<crate::raster::Bitmap> {
+pub fn bitmap(object: Id) -> Option<coregraphics::raster::Bitmap> {
     if !is_image(object) {
         return None;
     }
@@ -270,7 +270,7 @@ pub fn bitmap(object: Id) -> Option<crate::raster::Bitmap> {
         // high-density display; drawing scales it to the image's size.
         return crate::pdf::render(bytes, 2.0);
     }
-    crate::raster::decode(bytes).or_else(|| {
+    coregraphics::raster::decode(bytes).or_else(|| {
         // Built by `-initWithSize:` plus `-addRepresentation:`, which is how a
         // program that generated its pixels rather than loading a file makes
         // one. The first representation is the image, as it is in Apple's for
@@ -314,8 +314,8 @@ unsafe extern "C" fn init_with_data(receiver: Id, _sel: Sel, data: Id) -> Id {
             // SAFETY: a `CGImage` this image holds.
             image.size = unsafe {
                 NSSize {
-                    width: crate::graphics::CGImageGetWidth(cg_image) as f64,
-                    height: crate::graphics::CGImageGetHeight(cg_image) as f64,
+                    width: coregraphics::cgimage::CGImageGetWidth(cg_image) as f64,
+                    height: coregraphics::cgimage::CGImageGetHeight(cg_image) as f64,
                 }
             };
         }
@@ -325,7 +325,7 @@ unsafe extern "C" fn init_with_data(receiver: Id, _sel: Sel, data: Id) -> Id {
 
 /// The image's pixels as a `CGImage` it holds, decoding them on first use.
 ///
-/// `None` only for a container [`crate::raster`] has no decoder for.
+/// `None` only for a container [`coregraphics::raster`] has no decoder for.
 fn cg_image_of(receiver: Id) -> Option<*const c_void> {
     let image = image_of(receiver);
     if image.cg_image.is_null() {
@@ -333,7 +333,7 @@ fn cg_image_of(receiver: Id) -> Option<*const c_void> {
             true => bitmap(receiver)?,
             false => render_handler(receiver)?,
         };
-        image.cg_image = crate::graphics::image_from_bitmap(pixels);
+        image.cg_image = coregraphics::cgimage::image_from_bitmap(pixels);
     }
     (!image.cg_image.is_null()).then_some(image.cg_image)
 }
@@ -629,7 +629,7 @@ unsafe extern "C" fn image_with_size(
 }
 
 /// Run an image's drawing handler into a fresh bitmap.
-fn render_handler(receiver: Id) -> Option<crate::raster::Bitmap> {
+fn render_handler(receiver: Id) -> Option<coregraphics::raster::Bitmap> {
     let image = image_of(receiver);
     // SAFETY: a block this image copied, whose `invoke` the `@?` in
     // `+imageWithSize:flipped:drawingHandler:`'s encoding made callable.
@@ -663,7 +663,7 @@ fn render_handler(receiver: Id) -> Option<crate::raster::Bitmap> {
         };
         *texel = [straight(r), straight(g), straight(b), a];
     }
-    Some(crate::raster::Bitmap {
+    Some(coregraphics::raster::Bitmap {
         width: store.width,
         height: store.height,
         pixels,
@@ -734,8 +734,8 @@ unsafe extern "C" fn init_with_cg_image(
         true => size,
         false => unsafe {
             NSSize {
-                width: crate::graphics::CGImageGetWidth(cg_image) as f64,
-                height: crate::graphics::CGImageGetHeight(cg_image) as f64,
+                width: coregraphics::cgimage::CGImageGetWidth(cg_image) as f64,
+                height: coregraphics::cgimage::CGImageGetHeight(cg_image) as f64,
             }
         },
     };
@@ -782,7 +782,7 @@ fn draw(
         // SAFETY: `needs_pixels` reads only the receiver and selector.
         unsafe { needs_pixels(receiver, sel) };
     };
-    let Some((width, height, pixels)) = crate::graphics::image_bgra(cg_image) else {
+    let Some((width, height, pixels)) = coregraphics::cgimage::image_bgra(cg_image) else {
         return;
     };
     crate::backing::draw_image(
@@ -813,7 +813,7 @@ pub(crate) fn draw_tinted(receiver: Id, destination: NSRect, tint: [f64; 4]) {
     let Some(cg_image) = cg_image_of(receiver) else {
         return;
     };
-    let Some((width, height, mut pixels)) = crate::graphics::image_bgra(cg_image) else {
+    let Some((width, height, mut pixels)) = coregraphics::cgimage::image_bgra(cg_image) else {
         return;
     };
     let channel = |value: f64| value.clamp(0.0, 1.0);
@@ -973,7 +973,7 @@ unsafe extern "C" fn needs_pixels(receiver: Id, sel: Sel) -> ! {
     let name = unsafe { std::ffi::CStr::from_ptr(sel) }.to_string_lossy();
     let format = recognise(bytes_of(receiver)).map_or("unrecognised data", |r| r.format);
     objc::fail!(
-        "-[NSImage {name}]: this runtime has no decoder for {format} - see appkit::raster for the \
+        "-[NSImage {name}]: this runtime has no decoder for {format} - see coregraphics::raster for the \
          ones it does have"
     );
 }
@@ -983,16 +983,16 @@ unsafe extern "C" fn needs_pixels(receiver: Id, sel: Sel) -> ! {
 /// The round trip is the guest's design rather than this runtime's. A program
 /// that wants an image's pixels asks `NSImage` for a TIFF and hands that to
 /// `NSBitmapImageRep`, so both ends of the conversion are here and
-/// `appkit::raster` keeps them agreeing.
+/// `coregraphics::raster` keeps them agreeing.
 ///
 /// Nil when the container has no decoder, which is what Apple answers for an
 /// image it could not read - and the guest checks, because it has just come
 /// down this path from its own reader failing.
 unsafe extern "C" fn tiff_representation(receiver: Id, _sel: Sel) -> Id {
-    let Some(bitmap) = crate::raster::decode(bytes_of(receiver)) else {
+    let Some(bitmap) = coregraphics::raster::decode(bytes_of(receiver)) else {
         return std::ptr::null_mut();
     };
-    let tiff = corefoundation::collections::new_data(crate::raster::encode_tiff(&bitmap));
+    let tiff = corefoundation::collections::new_data(coregraphics::raster::encode_tiff(&bitmap));
     // SAFETY: a fresh object.
     unsafe { corefoundation::api::CFAutorelease(tiff) as Id }
 }
@@ -1164,7 +1164,7 @@ pub mod bitmap {
     }
 
     /// Fill in the fields a decoded bitmap determines.
-    fn adopt(receiver: Id, bitmap: crate::raster::Bitmap) -> Id {
+    fn adopt(receiver: Id, bitmap: coregraphics::raster::Bitmap) -> Id {
         let rep = rep_of(receiver);
         rep.width = bitmap.width as usize;
         rep.height = bitmap.height as usize;
@@ -1186,7 +1186,7 @@ pub mod bitmap {
         else {
             return std::ptr::null_mut();
         };
-        match crate::raster::decode(bytes) {
+        match coregraphics::raster::decode(bytes) {
             Some(bitmap) => adopt(receiver, bitmap),
             None => std::ptr::null_mut(),
         }
@@ -1198,7 +1198,7 @@ pub mod bitmap {
     /// The pixels are *copied* rather than shared with the `CGImage`: a rep
     /// hands out `-bitmapData` for the guest to write through, and writing
     /// through it must not edit an image someone else still holds. Nil for a
-    /// pixel layout [`crate::graphics::image_bgra`] does not decode, which is
+    /// pixel layout [`coregraphics::cgimage::image_bgra`] does not decode, which is
     /// `NSBitmapImageRep`'s own answer for an image it cannot represent.
     unsafe extern "C" fn init_with_cg_image(
         receiver: Id,
@@ -1208,7 +1208,7 @@ pub mod bitmap {
         if cg_image.is_null() {
             return std::ptr::null_mut();
         }
-        let Some((width, height, mut pixels)) = crate::graphics::image_bgra(cg_image) else {
+        let Some((width, height, mut pixels)) = coregraphics::cgimage::image_bgra(cg_image) else {
             return std::ptr::null_mut();
         };
         // `image_bgra` composites, and a rep's samples are R, G, B, A.
@@ -1217,7 +1217,7 @@ pub mod bitmap {
         }
         adopt(
             receiver,
-            crate::raster::Bitmap {
+            coregraphics::raster::Bitmap {
                 width: width as u32,
                 height: height as u32,
                 pixels,
@@ -1338,7 +1338,7 @@ pub mod bitmap {
     /// four samples, no padding between rows. A rep of any other shape is
     /// `None` rather than reinterpreted, because the bytes would be read as a
     /// format they are not.
-    pub fn pixels_of(object: Id) -> Option<crate::raster::Bitmap> {
+    pub fn pixels_of(object: Id) -> Option<coregraphics::raster::Bitmap> {
         if object.is_null() {
             return None;
         }
@@ -1366,7 +1366,7 @@ pub mod bitmap {
         if pixels.len() < wanted {
             return None;
         }
-        Some(crate::raster::Bitmap {
+        Some(coregraphics::raster::Bitmap {
             width: rep.width as u32,
             height: rep.height as u32,
             pixels,
@@ -1453,12 +1453,13 @@ pub mod bitmap {
         // both initialisers established.
         let pixels =
             unsafe { std::slice::from_raw_parts(data, rep.bytes_per_row * rep.height) }.to_vec();
-        let bitmap = crate::raster::Bitmap {
+        let bitmap = coregraphics::raster::Bitmap {
             width: rep.width as u32,
             height: rep.height as u32,
             pixels,
         };
-        let tiff = corefoundation::collections::new_data(crate::raster::encode_tiff(&bitmap));
+        let tiff =
+            corefoundation::collections::new_data(coregraphics::raster::encode_tiff(&bitmap));
         // SAFETY: a fresh object.
         unsafe { corefoundation::api::CFAutorelease(tiff) as Id }
     }
@@ -1574,7 +1575,7 @@ pub mod bitmap {
                 cg_image
             );
             let (width, height, bgra) =
-                crate::graphics::image_bgra(cg_image).expect("a layout image_bgra reads");
+                coregraphics::cgimage::image_bgra(cg_image).expect("a layout image_bgra reads");
             assert_eq!((width, height), (1, 1));
             assert_eq!(bgra, [0x10, 0x20, 0x30, 0xff]);
             // SAFETY: both are `NSInteger (id, SEL)`.
@@ -1589,7 +1590,7 @@ pub mod bitmap {
         #[test]
         fn a_cg_image_reads_back_as_rgba_samples() {
             crate::bootstrap();
-            let cg_image = crate::graphics::image_from_bitmap(crate::raster::Bitmap {
+            let cg_image = coregraphics::cgimage::image_from_bitmap(coregraphics::raster::Bitmap {
                 width: 2,
                 height: 1,
                 pixels: vec![0x10, 0x20, 0x30, 0xff, 0x40, 0x50, 0x60, 0xff],
@@ -1629,7 +1630,7 @@ pub mod bitmap {
                 objc::class::lookup(c"NSBitmapImageRep").expect("NSBitmapImageRep"),
                 0,
             );
-            let rep = adopt(rep, crate::raster::Bitmap::new(64, 32));
+            let rep = adopt(rep, coregraphics::raster::Bitmap::new(64, 32));
             let get = objc::sel::get("size");
             let set = objc::sel::get("setSize:");
             // SAFETY: `-size` is `NSSize (id, SEL)` and `-setSize:` its setter.

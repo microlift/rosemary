@@ -909,7 +909,7 @@ fn disassociated_pointer_input_ignores_the_logical_frame_edge() {
     SENT_EVENTS.with_borrow_mut(Vec::clear);
 
     let id = sdl3::video::window_id(window_of(object).sdl);
-    unsafe { crate::screen::CGAssociateMouseAndMouseCursorPosition(0) };
+    unsafe { coregraphics::quartz_display::CGAssociateMouseAndMouseCursorPosition(0) };
     // Frozen in the 31-point band above the logical frame.
     crate::event::warp_pointer(40.0, 10.0);
     let click = |down| sdl3::video::Event::MouseButton {
@@ -930,7 +930,7 @@ fn disassociated_pointer_input_ignores_the_logical_frame_edge() {
     });
     crate::event::deliver(click(true));
     crate::event::deliver(click(false));
-    unsafe { crate::screen::CGAssociateMouseAndMouseCursorPosition(1) };
+    unsafe { coregraphics::quartz_display::CGAssociateMouseAndMouseCursorPosition(1) };
     let sent = SENT_EVENTS.take();
     let kinds: Vec<u64> = sent.iter().map(|(kind, _, _)| *kind).collect();
     // NSEventTypeMouseMoved, LeftMouseDown, LeftMouseUp.
@@ -2013,8 +2013,12 @@ fn fullscreen_screen_visible_frame_ignores_desktop_panel() {
     let display = sdl3::video::display_for_window(sdl).unwrap();
     let bounds = sdl3::video::display_bounds(display).unwrap();
     let usable = sdl3::video::display_usable_bounds(display).unwrap();
-    let desktop = crate::geometry::rect_from_sdl(usable.x, usable.y, usable.w, usable.h);
-    let whole = crate::geometry::rect_from_sdl(bounds.x, bounds.y, bounds.w, bounds.h);
+    let desktop = crate::cgpath::ns_rect(coregraphics::cggeometry::rect_from_sdl(
+        usable.x, usable.y, usable.w, usable.h,
+    ));
+    let whole = crate::cgpath::ns_rect(coregraphics::cggeometry::rect_from_sdl(
+        bounds.x, bounds.y, bounds.w, bounds.h,
+    ));
     assert_ne!(desktop, whole, "run with a reserved panel work area");
     let screen = crate::screen::screen_object(c"NSScreen", display);
     let visible = |screen| {
@@ -2138,7 +2142,9 @@ fn fullscreen_screen_visible_frame_ignores_desktop_panel() {
         let usable = sdl3::video::display_usable_bounds(other).unwrap();
         assert_eq!(
             visible(crate::screen::screen_object(c"NSScreen", other)),
-            crate::geometry::rect_from_sdl(usable.x, usable.y, usable.w, usable.h)
+            crate::cgpath::ns_rect(coregraphics::cggeometry::rect_from_sdl(
+                usable.x, usable.y, usable.w, usable.h,
+            ))
         );
     }
     assert!(sdl3::video::minimize_window(sdl));

@@ -6,7 +6,7 @@
 pub mod alert;
 pub mod checkbox;
 pub mod corners;
-pub mod fonts;
+pub use coregraphics::fonts;
 pub mod geometry;
 pub mod menu;
 pub mod paint;

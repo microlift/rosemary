@@ -212,18 +212,18 @@ unsafe extern "C" fn transform_size(receiver: Id, _sel: Sel, size: NSSize) -> NS
 unsafe extern "C" fn concat(receiver: Id, _sel: Sel) {
     let m = matrix(receiver);
     crate::bezier::update_ctm(|ctm| m.then(ctm));
-    crate::cgcontext::focus_update_ctm(|ctm| cg(m).then(ctm));
+    coregraphics::cgcontext::focus_update_ctm(|ctm| cg(m).then(ctm));
 }
 
 /// `-set`: draw through this transform instead of the current one.
 unsafe extern "C" fn set(receiver: Id, _sel: Sel) {
     let m = matrix(receiver);
     crate::bezier::update_ctm(|_| m);
-    crate::cgcontext::focus_update_ctm(|_| cg(m));
+    coregraphics::cgcontext::focus_update_ctm(|_| cg(m));
 }
 
-fn cg(m: Matrix) -> crate::cgcontext::CGAffineTransform {
-    crate::cgcontext::CGAffineTransform {
+fn cg(m: Matrix) -> coregraphics::cgcontext::CGAffineTransform {
+    coregraphics::cgcontext::CGAffineTransform {
         a: m.m11,
         b: m.m12,
         c: m.m21,

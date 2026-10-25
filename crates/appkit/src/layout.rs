@@ -66,6 +66,11 @@ const EQUAL: isize = 0;
 /// retain them in AppKit.
 static ACTIVE: Mutex<Vec<usize>> = Mutex::new(Vec::new());
 
+/// The active set and the views it moves are process-wide, so only one thread
+/// may run a solve at a time. A re-entrant solve on the solving thread is
+/// caught by [`SOLVING`] before it reaches this lock.
+static SOLVE_LOCK: Mutex<()> = Mutex::new(());
+
 thread_local! {
     static SOLVING: Cell<bool> = const { Cell::new(false) };
     static DIRTY: Cell<bool> = const { Cell::new(false) };
@@ -679,6 +684,11 @@ pub(crate) fn layout_now() {
     }
     if SOLVING.get() {
         DIRTY.set(true);
+        return;
+    }
+    let _solving = SOLVE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    if ACTIVE.lock().unwrap_or_else(|e| e.into_inner()).is_empty() && !crate::controls::has_stacks()
+    {
         return;
     }
     SOLVING.set(true);

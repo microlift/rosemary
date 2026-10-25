@@ -13,7 +13,7 @@ use tiny_skia::{
     StrokeDash, Transform,
 };
 
-use crate::raster::Bitmap;
+use coregraphics::raster::Bitmap;
 
 #[derive(Clone, Debug, PartialEq)]
 enum Object {
@@ -391,7 +391,7 @@ impl Document {
         for filter in filters {
             data = match filter.as_slice() {
                 b"FlateDecode" | b"Fl" => {
-                    crate::raster::inflate(&data).ok_or("a stream that does not inflate")?
+                    coregraphics::raster::inflate(&data).ok_or("a stream that does not inflate")?
                 }
                 other => {
                     return Err(format!("the {} filter", String::from_utf8_lossy(other)));

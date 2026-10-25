@@ -360,16 +360,22 @@ unsafe extern "C" fn mouse_location(_class: Id, _sel: Sel) -> NSPoint {
     // cursor, so the window system would answer where a person left it and
     // disagree with the events the guest has just been given.
     if let Some((x, y)) = crate::script::pointer() {
-        return crate::geometry::point_from_sdl(x as f64, y as f64);
+        return crate::cgpath::ns_point(coregraphics::cggeometry::point_from_sdl(
+            x as f64, y as f64,
+        ));
     }
     // A disassociated pointer is the other exception, and for the same reason
     // in reverse: the window system's cursor is still moving and the guest's is
     // not - see `event::frozen_pointer`.
     if let Some((x, y)) = crate::event::frozen_pointer() {
-        return crate::geometry::point_from_sdl(x as f64, y as f64);
+        return crate::cgpath::ns_point(coregraphics::cggeometry::point_from_sdl(
+            x as f64, y as f64,
+        ));
     }
     match crate::window::desktop_mouse_state() {
-        Some((x, y, _)) => crate::geometry::point_from_sdl(x as f64, y as f64),
+        Some((x, y, _)) => {
+            crate::cgpath::ns_point(coregraphics::cggeometry::point_from_sdl(x as f64, y as f64))
+        }
         None => NSPoint::default(),
     }
 }
@@ -474,7 +480,12 @@ unsafe extern "C" fn cg_event(receiver: Id, _sel: Sel) -> *const c_void {
     let Some(event) = (unsafe { event_of(receiver) }) else {
         return std::ptr::null();
     };
-    crate::cgevent::describing(event.kind, event.modifiers, event.key_code, event.location)
+    coregraphics::quartz_event::describing(
+        event.kind,
+        event.modifiers,
+        event.key_code,
+        event.location,
+    )
 }
 
 /// The text a key types with `flags` held, from the keyboard layout: Shift,
@@ -518,7 +529,7 @@ fn typed_characters(key_code: u16, flags: u64) -> String {
 
 /// `+eventWithCGEvent:`.
 unsafe extern "C" fn event_with_cg_event(_class: Id, _sel: Sel, cg: *const c_void) -> Id {
-    let Some((kind, flags, key_code, location)) = crate::cgevent::parts(cg as _) else {
+    let Some((kind, flags, key_code, location)) = coregraphics::quartz_event::parts(cg as _) else {
         return std::ptr::null_mut();
     };
     let characters = match kind {

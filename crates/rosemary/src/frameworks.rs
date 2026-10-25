@@ -68,6 +68,22 @@ static FRAMEWORKS: &[Framework] = &[
         symbol: Some(foundation::symbol),
     },
     Framework {
+        leaf: "CoreGraphics",
+        version: 'A',
+        umbrellas: &[],
+        provide: Some(coregraphics::provide),
+        data: Some(coregraphics::data_symbols),
+        symbol: Some(coregraphics::symbol),
+    },
+    Framework {
+        leaf: "CoreText",
+        version: 'A',
+        umbrellas: &[],
+        provide: Some(coretext::provide),
+        data: Some(coretext::data_symbols),
+        symbol: Some(coretext::symbol),
+    },
+    Framework {
         leaf: "IOKit",
         version: 'A',
         umbrellas: &[],

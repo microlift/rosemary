@@ -279,7 +279,7 @@ unsafe extern "C" {
 
 /// A whole zlib stream inflated, for data whose inflated size is not known
 /// up front: the one-shot call is retried with a larger buffer until it fits.
-pub(crate) fn inflate(source: &[u8]) -> Option<Vec<u8>> {
+pub fn inflate(source: &[u8]) -> Option<Vec<u8>> {
     const Z_OK: std::ffi::c_int = 0;
     const Z_BUF_ERROR: std::ffi::c_int = -5;
     let mut capacity = source.len().saturating_mul(4).max(1024);
@@ -734,6 +734,36 @@ mod tests {
         }
         out.extend_from_slice(&((b << 16) | a).to_be_bytes());
         out
+    }
+
+    #[test]
+    fn inflate_reads_stored_and_empty_streams() {
+        let data = b"a PDF content stream";
+        assert_eq!(inflate(&stored(data)).as_deref(), Some(data.as_slice()));
+        assert_eq!(inflate(&stored(&[])), Some(Vec::new()));
+    }
+
+    #[test]
+    fn inflate_grows_until_a_compressed_stream_fits() {
+        // A zlib stream of 16384 'A' bytes needs two buffer growth retries.
+        let compressed = [
+            120, 156, 237, 193, 49, 1, 0, 0, 0, 194, 160, 108, 235, 95, 202, 24, 62, 64, 1, 0, 0,
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 111, 3, 218, 58, 64, 241,
+        ];
+        assert_eq!(inflate(&compressed), Some(vec![b'A'; 16384]));
+    }
+
+    #[test]
+    fn inflate_declines_invalid_truncated_and_corrupt_streams() {
+        assert_eq!(inflate(&[]), None);
+        assert_eq!(inflate(b"not a zlib stream"), None);
+
+        let mut compressed = stored(b"a PDF content stream");
+        for length in 0..compressed.len() {
+            assert_eq!(inflate(&compressed[..length]), None, "prefix {length}");
+        }
+        *compressed.last_mut().unwrap() ^= 1;
+        assert_eq!(inflate(&compressed), None);
     }
 
     fn chunk(kind: &[u8; 4], data: &[u8]) -> Vec<u8> {

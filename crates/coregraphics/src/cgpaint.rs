@@ -6,8 +6,8 @@
 
 use std::ffi::c_void;
 
+use crate::{CGPoint, CGRect, CGSize};
 use corefoundation::base::CFTypeRef;
-use foundation::geometry::{NSPoint, NSRect, NSSize};
 
 use crate::cgcontext::CGAffineTransform;
 
@@ -33,7 +33,7 @@ struct Tile {
 struct Pattern {
     isa: *const c_void,
     info: *mut c_void,
-    bounds: NSRect,
+    bounds: CGRect,
     matrix: CGAffineTransform,
     x_step: f64,
     y_step: f64,
@@ -65,8 +65,8 @@ struct Shading {
     isa: *const c_void,
     radial: bool,
     components: usize,
-    start: NSPoint,
-    end: NSPoint,
+    start: CGPoint,
+    end: CGPoint,
     radii: (f64, f64),
     function: CFTypeRef,
     extend: (bool, bool),
@@ -76,7 +76,7 @@ struct Shading {
 struct Layer {
     isa: *const c_void,
     context: CFTypeRef,
-    size: NSSize,
+    size: CGSize,
 }
 
 pub fn install() {
@@ -176,7 +176,7 @@ unsafe extern "C" fn layer_dealloc(receiver: objc::object::Id, _sel: objc::sel::
 #[allow(clippy::too_many_arguments)]
 pub unsafe extern "C" fn CGPatternCreate(
     info: *mut c_void,
-    bounds: NSRect,
+    bounds: CGRect,
     matrix: CGAffineTransform,
     x_step: f64,
     y_step: f64,
@@ -227,11 +227,11 @@ pub unsafe extern "C" fn CGPatternRetain(pattern: CFTypeRef) -> CFTypeRef {
 }
 
 /// The pattern's matrix: pattern space to the context's base space.
-pub(crate) fn pattern_matrix(pattern: CFTypeRef) -> Option<CGAffineTransform> {
+pub fn pattern_matrix(pattern: CFTypeRef) -> Option<CGAffineTransform> {
     object_of::<Pattern>(pattern, c"__CGPattern").map(|p| p.matrix)
 }
 
-pub(crate) struct RenderedTile {
+pub struct RenderedTile {
     /// In the target's channel order.
     pub pixmap: tiny_skia::Pixmap,
     /// Tile pixels to pattern space.
@@ -240,7 +240,7 @@ pub(crate) struct RenderedTile {
 
 /// One cell of the pattern, drawn by the program's callback at `scale` device
 /// pixels per pattern unit. An uncoloured pattern is painted `color`.
-pub(crate) fn render_tile(
+pub fn render_tile(
     pattern: CFTypeRef,
     scale: f64,
     color: [f64; 4],
@@ -267,7 +267,7 @@ pub(crate) fn render_tile(
         // program's own, called as Quartz calls it, with the context then
         // released.
         let rgba = unsafe {
-            let context = crate::cgcontext::CGBitmapContextCreate(
+            let context = crate::cgbitmap::CGBitmapContextCreate(
                 std::ptr::null_mut(),
                 width as usize,
                 height as usize,
@@ -285,7 +285,7 @@ pub(crate) fn render_tile(
                 f64::from(height) / y_step,
             );
             draw(p.info, context);
-            let data = crate::cgcontext::CGBitmapContextGetData(context) as *const u8;
+            let data = crate::cgbitmap::CGBitmapContextGetData(context) as *const u8;
             let rgba = std::slice::from_raw_parts(data, (width * height * 4) as usize).to_vec();
             crate::cgcontext::CGContextRelease(context);
             rgba
@@ -300,7 +300,7 @@ pub(crate) fn render_tile(
     let mut pixels = tile.rgba.clone();
     if !p.colored {
         // An uncoloured pattern is a stencil: its coverage in the colour given.
-        for pixel in pixels.chunks_exact_mut(4) {
+        for pixel in pixels.as_chunks_mut::<4>().0 {
             let a = f64::from(pixel[3]) / 255.0 * color[3].clamp(0.0, 1.0);
             let c = |v: f64| (v.clamp(0.0, 1.0) * a * 255.0).round() as u8;
             pixel.copy_from_slice(&[
@@ -312,7 +312,7 @@ pub(crate) fn render_tile(
         }
     }
     if swap {
-        for pixel in pixels.chunks_exact_mut(4) {
+        for pixel in pixels.as_chunks_mut::<4>().0 {
             pixel.swap(0, 2);
         }
     }
@@ -384,8 +384,8 @@ fn retain(object: CFTypeRef) -> CFTypeRef {
 /// end, CGFunctionRef, bool extendStart, bool extendEnd)`
 pub unsafe extern "C" fn CGShadingCreateAxial(
     space: CFTypeRef,
-    start: NSPoint,
-    end: NSPoint,
+    start: CGPoint,
+    end: CGPoint,
     function: CFTypeRef,
     extend_start: bool,
     extend_end: bool,
@@ -406,9 +406,9 @@ pub unsafe extern "C" fn CGShadingCreateAxial(
 #[allow(clippy::too_many_arguments)]
 pub unsafe extern "C" fn CGShadingCreateRadial(
     space: CFTypeRef,
-    start: NSPoint,
+    start: CGPoint,
     start_radius: f64,
-    end: NSPoint,
+    end: CGPoint,
     end_radius: f64,
     function: CFTypeRef,
     extend_start: bool,
@@ -428,8 +428,8 @@ pub unsafe extern "C" fn CGShadingCreateRadial(
 fn make_shading(
     space: CFTypeRef,
     radial: bool,
-    start: NSPoint,
-    end: NSPoint,
+    start: CGPoint,
+    end: CGPoint,
     radii: (f64, f64),
     function: CFTypeRef,
     extend: (bool, bool),
@@ -441,7 +441,7 @@ fn make_shading(
     // SAFETY: a fresh allocation; the function is retained for its life.
     unsafe {
         (*shading).radial = radial;
-        (*shading).components = crate::graphics::space_components(space).unwrap_or(3).max(1);
+        (*shading).components = crate::cgcolor::space_components(space).unwrap_or(3).max(1);
         (*shading).start = start;
         (*shading).end = end;
         (*shading).radii = radii;
@@ -464,7 +464,7 @@ pub unsafe extern "C" fn CGShadingRetain(shading: CFTypeRef) -> CFTypeRef {
 
 /// A shading as the engine paints it: its geometry and its function sampled
 /// into straight R, G, B, A stops.
-pub(crate) fn shading_paint(shading: CFTypeRef) -> Option<crate::quartz::Shading> {
+pub fn shading_paint(shading: CFTypeRef) -> Option<crate::quartz::Shading> {
     /// Enough stops that the eye cannot find the joins in a smooth function.
     const SAMPLES: usize = 64;
     let s = object_of::<Shading>(shading, c"__CGShading")?;
@@ -506,7 +506,7 @@ pub(crate) fn shading_paint(shading: CFTypeRef) -> Option<crate::quartz::Shading
 /// its own size is as sharp as drawing directly.
 pub unsafe extern "C" fn CGLayerCreateWithContext(
     context: CFTypeRef,
-    size: NSSize,
+    size: CGSize,
     _auxiliary: CFTypeRef,
 ) -> CFTypeRef {
     if size.width <= 0.0 || size.height <= 0.0 {
@@ -517,14 +517,14 @@ pub unsafe extern "C" fn CGLayerCreateWithContext(
     let height = (size.height * scale).ceil().max(1.0) as usize;
     // SAFETY: a context over its own storage.
     let backing = unsafe {
-        crate::cgcontext::CGBitmapContextCreate(
+        crate::cgbitmap::CGBitmapContextCreate(
             std::ptr::null_mut(),
             width,
             height,
             8,
             width * 4,
             std::ptr::null(),
-            crate::graphics::PREMULTIPLIED_BGRA,
+            crate::cgimage::PREMULTIPLIED_BGRA,
         )
     };
     if backing.is_null() {
@@ -551,8 +551,8 @@ pub unsafe extern "C" fn CGLayerGetContext(layer: CFTypeRef) -> CFTypeRef {
     object_of::<Layer>(layer, c"__CGLayer").map_or(std::ptr::null(), |l| l.context)
 }
 
-pub unsafe extern "C" fn CGLayerGetSize(layer: CFTypeRef) -> NSSize {
-    object_of::<Layer>(layer, c"__CGLayer").map_or(NSSize::default(), |l| l.size)
+pub unsafe extern "C" fn CGLayerGetSize(layer: CFTypeRef) -> CGSize {
+    object_of::<Layer>(layer, c"__CGLayer").map_or(CGSize::default(), |l| l.size)
 }
 
 pub unsafe extern "C" fn CGLayerRelease(layer: CFTypeRef) {
@@ -568,7 +568,7 @@ pub unsafe extern "C" fn CGLayerRetain(layer: CFTypeRef) -> CFTypeRef {
 
 /// A layer's pixels as premultiplied B, G, R, A, top row first, with its size
 /// in pixels.
-pub(crate) fn layer_pixels(layer: CFTypeRef) -> Option<(usize, usize, Vec<u8>)> {
+pub fn layer_pixels(layer: CFTypeRef) -> Option<(usize, usize, Vec<u8>)> {
     let l = object_of::<Layer>(layer, c"__CGLayer")?;
     let ctx = crate::quartz::context_of(l.context)?;
     Some((ctx.width, ctx.height, crate::quartz::snapshot_bgra(ctx)?))
@@ -577,7 +577,7 @@ pub(crate) fn layer_pixels(layer: CFTypeRef) -> Option<(usize, usize, Vec<u8>)> 
 /// `CGContextDrawLayerInRect(CGContextRef, CGRect, CGLayerRef)`
 pub unsafe extern "C" fn CGContextDrawLayerInRect(
     context: CFTypeRef,
-    rect: NSRect,
+    rect: CGRect,
     layer: CFTypeRef,
 ) {
     if let Some((width, height, bgra)) = layer_pixels(layer) {
@@ -589,7 +589,7 @@ pub unsafe extern "C" fn CGContextDrawLayerInRect(
 /// layer's own size.
 pub unsafe extern "C" fn CGContextDrawLayerAtPoint(
     context: CFTypeRef,
-    point: NSPoint,
+    point: CGPoint,
     layer: CFTypeRef,
 ) {
     // SAFETY: the same arguments, with the rectangle the point and size make.
@@ -597,7 +597,7 @@ pub unsafe extern "C" fn CGContextDrawLayerAtPoint(
         let size = CGLayerGetSize(layer);
         CGContextDrawLayerInRect(
             context,
-            NSRect {
+            CGRect {
                 origin: point,
                 size,
             },

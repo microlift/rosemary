@@ -489,7 +489,7 @@ pub unsafe extern "C" fn HIThemeSetFill(
     _orientation: u32,
 ) -> OSStatus {
     // SAFETY: the caller's context, or null, which the call ignores.
-    unsafe { crate::cgcontext::CGContextSetRGBFillColor(context, 0.93, 0.93, 0.93, 1.0) };
+    unsafe { coregraphics::cgcontext::CGContextSetRGBFillColor(context, 0.93, 0.93, 0.93, 1.0) };
     NO_ERR
 }
 

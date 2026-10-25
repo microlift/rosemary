@@ -132,7 +132,7 @@ fn register_application_fonts() {
         Err(_) => vec![path],
     };
     for file in files.iter().filter(|f| f.is_file()) {
-        crate::fonts::register_file(&file.to_string_lossy());
+        coregraphics::fonts::register_file(&file.to_string_lossy());
     }
 }
 

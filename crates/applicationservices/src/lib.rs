@@ -1,15 +1,4 @@
-#[repr(i32)]
-enum CGWindowLevelKey {
-    _BaseWindow = 0,
-}
-
-type CGWindowLevel = i32;
-
-// FIXME: Window levels are not implemented; every key returns zero.
-#[allow(non_snake_case)]
-extern "C" fn CGWindowLevelForKey(_key: CGWindowLevelKey) -> CGWindowLevel {
-    0
-}
+pub mod ats;
 
 /// `Boolean UAZoomEnabled(void)`: whether the screen zoom is on, which it
 /// never is for a guest.
@@ -29,6 +18,8 @@ exports::exports! {
     functions {
         "UAZoomEnabled" => UAZoomEnabled,
         "UAZoomChangeFocus" => UAZoomChangeFocus,
-        "CGWindowLevelForKey" => CGWindowLevelForKey,
+    }
+    groups {
+        ats,
     }
 }

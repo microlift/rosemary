@@ -6,6 +6,6 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+coregraphics.workspace = true
 owned_ttf_parser.workspace = true
 ab_glyph_rasterizer.workspace = true
-rust-fontconfig.workspace = true

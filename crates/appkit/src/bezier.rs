@@ -84,7 +84,7 @@ unsafe extern "C" fn save_graphics_state(_receiver: Id, _sel: Sel) {
         let copy = top.clone();
         states.push(copy);
     });
-    crate::cgcontext::focus_save();
+    coregraphics::cgcontext::focus_save();
 }
 
 unsafe extern "C" fn restore_graphics_state(_receiver: Id, _sel: Sel) {
@@ -101,7 +101,7 @@ unsafe extern "C" fn restore_graphics_state(_receiver: Id, _sel: Sel) {
         states.pop();
         let (fill, stroke) = states[n - 2].colors;
         crate::color::restore(fill, stroke);
-        crate::cgcontext::focus_restore();
+        coregraphics::cgcontext::focus_restore();
     });
 }
 
@@ -233,7 +233,7 @@ fn paint(polygons: Vec<Vec<[f64; 2]>>, even_odd: bool, color: [f64; 4]) {
     if let Some(clip) = clip {
         apply_clip(&mut mask, &clip, device.width as usize);
     }
-    crate::cgcontext::with_focus_clip(|clip, width| {
+    coregraphics::cgcontext::with_focus_clip(|clip, width| {
         for (at, value) in mask.coverage.iter_mut().enumerate() {
             let x = mask.left as usize + at % mask.width;
             let y = mask.top as usize + at / mask.width;
@@ -294,7 +294,7 @@ fn clip_to(polygons: Vec<Vec<[f64; 2]>>, even_odd: bool) {
 /// otherwise cannot honour. False when there is neither, for the blit.
 pub(crate) fn fill_rect_through_state(rect: NSRect, color: [f64; 4]) -> bool {
     let (ctm, clip, device) = current();
-    let quartz_clip = crate::cgcontext::with_focus_clip(|_, _| ()).is_some();
+    let quartz_clip = coregraphics::cgcontext::with_focus_clip(|_, _| ()).is_some();
     if device.is_none() || (ctm == Matrix::IDENTITY && clip.is_none() && !quartz_clip) {
         return false;
     }

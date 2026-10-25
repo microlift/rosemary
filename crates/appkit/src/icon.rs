@@ -1,6 +1,6 @@
 use std::sync::{Mutex, OnceLock};
 
-use crate::raster::Bitmap;
+use coregraphics::raster::Bitmap;
 
 /// What `-setApplicationIconImage:` last set, which wins over the bundle's.
 static REPLACEMENT: Mutex<Option<Bitmap>> = Mutex::new(None);
@@ -15,10 +15,10 @@ fn bundled() -> Option<&'static Bitmap> {
     ICON.get_or_init(|| {
         let path = foundation::bundle::main()?.icon()?;
         let bytes = std::fs::read(&path).ok()?;
-        let bitmap = crate::raster::decode(&bytes);
+        let bitmap = coregraphics::raster::decode(&bytes);
         if bitmap.is_none() {
             eprintln!(
-                "rosemary: appkit: {}: no decoder for this icon - see appkit::raster",
+                "rosemary: appkit: {}: no decoder for this icon - see coregraphics::raster",
                 path.display()
             );
         }

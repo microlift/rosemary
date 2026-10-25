@@ -1253,8 +1253,8 @@ impl TextStyle {
     /// Helvetica 12 - here the system face - in black, left aligned.
     fn of(attributes: Id) -> Option<TextStyle> {
         let attributes = attributes as corefoundation::base::CFTypeRef;
-        let font = crate::coretext::get(attributes, "NSFont");
-        let (font, size) = crate::coretext::face_of(font)
+        let font = coregraphics::font_attributes::get(attributes, "NSFont");
+        let (font, size) = coregraphics::font_attributes::face_of(font)
             .and_then(|(face, size)| {
                 let size = if size > 0.0 { size } else { 12.0 };
                 Some((
@@ -1263,7 +1263,7 @@ impl TextStyle {
                 ))
             })
             .or_else(|| Some((chrome::Font::system(400)?, 12.0)))?;
-        let color = crate::coretext::get(attributes, "NSColor");
+        let color = coregraphics::font_attributes::get(attributes, "NSColor");
         let color = match color.is_null() {
             true => chrome::Color::rgba(0, 0, 0, 1.0),
             false => {
@@ -1277,7 +1277,7 @@ impl TextStyle {
                 }
             }
         };
-        let paragraph = crate::coretext::get(attributes, "NSParagraphStyle");
+        let paragraph = coregraphics::font_attributes::get(attributes, "NSParagraphStyle");
         let alignment = crate::paragraph::alignment(paragraph as Id).unwrap_or(0);
         Some(TextStyle {
             font,

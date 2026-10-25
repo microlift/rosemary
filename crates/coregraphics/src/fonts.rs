@@ -1,3 +1,6 @@
+//! Font discovery and loading, and the glyph outlines text drawing builds
+//! paths from.
+
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex, OnceLock};
 

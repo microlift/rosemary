@@ -1,10 +1,9 @@
-//! `CGFont` and the ATS font calls that predate Core Text.
+//! The ATS font calls that predate Core Text.
 //!
-//! A `CGFont` here is the same attribute dictionary a `CTFont` is, as
-//! `CTFontCopyGraphicsFont` already answers: the face it names is what both
-//! draw with. An `ATSFontRef` is a small number this module hands out for a
-//! face, stable for the life of the process, so a program that converts a font
-//! to one and back gets the same face.
+//! An `ATSFontRef` is a small number this module hands out for a face, stable
+//! for the life of the process, so a program that converts a font to one and
+//! back gets the same face. The reference table itself lives in
+//! [`coregraphics::cgfont`], because `CGFontCreateWithPlatformFont` takes one.
 
 #![allow(non_snake_case)]
 
@@ -12,9 +11,9 @@ use std::ffi::c_void;
 use std::sync::Mutex;
 
 use corefoundation::base::CFTypeRef;
-use foundation::geometry::{NSPoint, NSRect, NSSize};
-
-use crate::fonts::{self, FaceInfo};
+use coregraphics::cgfont::{bump_generation, face_for, generation, reference};
+use coregraphics::font_attributes::spill_font;
+use coregraphics::fonts::{self, FaceInfo};
 
 type OSStatus = i32;
 
@@ -26,42 +25,8 @@ const INVALID_FONT_ACCESS: OSStatus = -985;
 /// `kATSInvalidFontTableAccess`, for a table the face does not have.
 const INVALID_FONT_TABLE_ACCESS: OSStatus = -986;
 
-/// `kInvalidFont`.
-const INVALID_FONT: u32 = 0;
-
-/// The faces references have been handed out for, by `ATSFontRef - 1`.
-static REFERENCES: Mutex<Vec<(String, u32)>> = Mutex::new(Vec::new());
-
 /// Memory fonts activated through `ATSFontActivateFromMemory`, by container.
 static CONTAINERS: Mutex<Vec<Vec<u32>>> = Mutex::new(Vec::new());
-
-/// Bumped whenever the set of faces changes, for `ATSGetGeneration`.
-static GENERATION: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(1);
-
-/// The reference for the face at `path` and `index`, made on first use.
-fn reference(path: &str, index: u32) -> u32 {
-    let mut table = REFERENCES.lock().unwrap_or_else(|e| e.into_inner());
-    let at = match table.iter().position(|(p, i)| p == path && *i == index) {
-        Some(at) => at,
-        None => {
-            table.push((path.to_string(), index));
-            table.len() - 1
-        }
-    };
-    at as u32 + 1
-}
-
-/// The face a reference names.
-fn face_for(reference: u32) -> Option<FaceInfo> {
-    let (path, index) = REFERENCES
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .get(reference.checked_sub(1)? as usize)
-        .cloned()?;
-    fonts::all_faces()
-        .into_iter()
-        .find(|face| face.path == path && face.index == index)
-}
 
 /// The text of a `CFString`, or `None` for null.
 fn text(string: CFTypeRef) -> Option<String> {
@@ -94,18 +59,20 @@ pub unsafe extern "C" fn ATSFontNotificationSubscribe(
 
 /// `ATSGeneration ATSGetGeneration(void)`
 pub unsafe extern "C" fn ATSGetGeneration() -> u32 {
-    GENERATION.load(std::sync::atomic::Ordering::Relaxed)
+    generation()
 }
 
 /// `ATSFontRef ATSFontFindFromPostScriptName(CFStringRef, ATSOptionFlags)`
 pub unsafe extern "C" fn ATSFontFindFromPostScriptName(name: CFTypeRef, _options: u32) -> u32 {
     let Some(name) = text(name) else {
-        return INVALID_FONT;
+        return coregraphics::cgfont::INVALID_FONT;
     };
     fonts::all_faces()
         .into_iter()
         .find(|face| face.postscript == name)
-        .map_or(INVALID_FONT, |face| reference(&face.path, face.index))
+        .map_or(coregraphics::cgfont::INVALID_FONT, |face| {
+            reference(&face.path, face.index)
+        })
 }
 
 /// `ATSFontRef ATSFontFindFromName(CFStringRef, ATSOptionFlags)`: a full name,
@@ -113,7 +80,7 @@ pub unsafe extern "C" fn ATSFontFindFromPostScriptName(name: CFTypeRef, _options
 /// PostScript name is accepted too, as Apple's does.
 pub unsafe extern "C" fn ATSFontFindFromName(name: CFTypeRef, _options: u32) -> u32 {
     let Some(name) = text(name) else {
-        return INVALID_FONT;
+        return coregraphics::cgfont::INVALID_FONT;
     };
     let faces = fonts::all_faces();
     let full = |face: &FaceInfo| match face.style.eq_ignore_ascii_case("regular") {
@@ -123,7 +90,9 @@ pub unsafe extern "C" fn ATSFontFindFromName(name: CFTypeRef, _options: u32) -> 
     faces
         .iter()
         .find(|face| face.postscript == name || full(face).eq_ignore_ascii_case(&name))
-        .map_or(INVALID_FONT, |face| reference(&face.path, face.index))
+        .map_or(coregraphics::cgfont::INVALID_FONT, |face| {
+            reference(&face.path, face.index)
+        })
 }
 
 /// `OSStatus ATSFontGetPostScriptName(ATSFontRef, ATSOptionFlags, CFStringRef *)`
@@ -275,7 +244,7 @@ pub unsafe extern "C" fn ATSFontActivateFromMemory(
     }
     // SAFETY: the caller supplies `length` readable bytes.
     let bytes = unsafe { std::slice::from_raw_parts(data, length) };
-    let Some(path) = crate::coretext::spill_font(bytes) else {
+    let Some(path) = spill_font(bytes) else {
         return PARAM_ERR;
     };
     let faces = fonts::register_file(&path);
@@ -288,7 +257,7 @@ pub unsafe extern "C" fn ATSFontActivateFromMemory(
         .collect();
     let mut containers = CONTAINERS.lock().unwrap_or_else(|e| e.into_inner());
     containers.push(refs);
-    GENERATION.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    bump_generation();
     // SAFETY: writable, per the caller.
     unsafe { out.write(containers.len() as u32) };
     NO_ERR
@@ -360,257 +329,6 @@ pub unsafe extern "C" fn ATSFontFamilyGetName(
     INVALID_FONT_ACCESS
 }
 
-/// The face a `CGFont` or `CTFont` draws with, as a reference.
-fn reference_of(font: CFTypeRef) -> u32 {
-    crate::coretext::face_location(font)
-        .map_or(INVALID_FONT, |(path, index)| reference(&path, index))
-}
-
-/// `CGFontRef CGFontCreateWithPlatformFont(void *platformFontReference)`: the
-/// reference is an `ATSFontRef *`.
-pub unsafe extern "C" fn CGFontCreateWithPlatformFont(platform: *const u32) -> CFTypeRef {
-    if platform.is_null() {
-        return std::ptr::null();
-    }
-    // SAFETY: an `ATSFontRef *`, as the documentation defines it.
-    let Some(face) = face_for(unsafe { *platform }) else {
-        return std::ptr::null();
-    };
-    crate::coretext::face_attributes(&face, 0.0)
-}
-
-/// `CTFontRef CTFontCreateWithPlatformFont(ATSFontRef, CGFloat, const
-/// CGAffineTransform *, CTFontDescriptorRef)`
-pub unsafe extern "C" fn CTFontCreateWithPlatformFont(
-    font: u32,
-    size: f64,
-    _matrix: *const c_void,
-    _attributes: CFTypeRef,
-) -> CFTypeRef {
-    let Some(face) = face_for(font) else {
-        return std::ptr::null();
-    };
-    crate::coretext::face_attributes(&face, size)
-}
-
-/// `ATSFontRef CTFontGetPlatformFont(CTFontRef, CTFontDescriptorRef *)`
-pub unsafe extern "C" fn CTFontGetPlatformFont(font: CFTypeRef, attributes: *mut CFTypeRef) -> u32 {
-    if !attributes.is_null() {
-        // SAFETY: writable, per the caller. The descriptor is optional.
-        unsafe { attributes.write(std::ptr::null()) };
-    }
-    reference_of(font)
-}
-
-/// `CGFontRef CGFontCreateWithFontName(CFStringRef)`: by PostScript or full
-/// name, as `CTFontCreateWithName` resolves one.
-pub unsafe extern "C" fn CGFontCreateWithFontName(name: CFTypeRef) -> CFTypeRef {
-    // SAFETY: a string or null.
-    unsafe { crate::coretext::CTFontCreateWithName(name, 0.0, std::ptr::null()) }
-}
-
-/// `CGFontRef CGFontCreateWithDataProvider(CGDataProviderRef)`: a font file's
-/// bytes.
-pub unsafe extern "C" fn CGFontCreateWithDataProvider(provider: CFTypeRef) -> CFTypeRef {
-    let Some(bytes) = crate::graphics::provider_bytes(provider) else {
-        return std::ptr::null();
-    };
-    let Some(path) = crate::coretext::spill_font(bytes) else {
-        return std::ptr::null();
-    };
-    match fonts::register_file(&path).first() {
-        Some(face) => {
-            GENERATION.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            crate::coretext::face_attributes(face, 0.0)
-        }
-        None => std::ptr::null(),
-    }
-}
-
-pub unsafe extern "C" fn CGFontRetain(font: CFTypeRef) -> CFTypeRef {
-    if !font.is_null() {
-        // SAFETY: a font this runtime made.
-        unsafe { corefoundation::api::CFRetain(font) };
-    }
-    font
-}
-
-pub unsafe extern "C" fn CGFontRelease(font: CFTypeRef) {
-    if !font.is_null() {
-        // SAFETY: a reference the caller owns.
-        unsafe { corefoundation::api::CFRelease(font) };
-    }
-}
-
-/// `int CGFontGetUnitsPerEm(CGFontRef)`
-pub unsafe extern "C" fn CGFontGetUnitsPerEm(font: CFTypeRef) -> i32 {
-    // SAFETY: a font this runtime made, or null.
-    unsafe { crate::coretext::CTFontGetUnitsPerEm(font) as i32 }
-}
-
-/// `int CGFontGetXHeight(CGFontRef)`, in font units.
-pub unsafe extern "C" fn CGFontGetXHeight(font: CFTypeRef) -> i32 {
-    crate::coretext::loaded(font).map_or(0, |face| {
-        let face = face.face();
-        i32::from(face.x_height().unwrap_or(face.ascender() / 2))
-    })
-}
-
-/// `bool CGFontGetGlyphAdvances(CGFontRef, const CGGlyph *, size_t, int *)`,
-/// in font units.
-pub unsafe extern "C" fn CGFontGetGlyphAdvances(
-    font: CFTypeRef,
-    glyphs: *const u16,
-    count: usize,
-    advances: *mut i32,
-) -> bool {
-    let Some(face) = crate::coretext::loaded(font) else {
-        return false;
-    };
-    if count > 0 && (glyphs.is_null() || advances.is_null()) {
-        return false;
-    }
-    for at in 0..count {
-        // SAFETY: the caller supplies `count` glyphs and advances.
-        unsafe {
-            let glyph = owned_ttf_parser::GlyphId(*glyphs.add(at));
-            let width = face.face().glyph_hor_advance(glyph).unwrap_or(0);
-            advances.add(at).write(i32::from(width));
-        }
-    }
-    true
-}
-
-/// `CFDataRef CGFontCopyTableForTag(CGFontRef, uint32_t)`
-pub unsafe extern "C" fn CGFontCopyTableForTag(font: CFTypeRef, tag: u32) -> CFTypeRef {
-    // SAFETY: a font this runtime made, or null.
-    unsafe { crate::coretext::CTFontCopyTable(font, tag, 0) }
-}
-
-/// `CFIndex CTFontGetGlyphCount(CTFontRef)`
-pub unsafe extern "C" fn CTFontGetGlyphCount(font: CFTypeRef) -> isize {
-    crate::coretext::loaded(font).map_or(0, |face| face.face().number_of_glyphs() as isize)
-}
-
-/// A face's design-unit rectangle as a `CGRect`.
-fn unit_rect(r: owned_ttf_parser::Rect) -> NSRect {
-    NSRect {
-        origin: NSPoint {
-            x: f64::from(r.x_min),
-            y: f64::from(r.y_min),
-        },
-        size: NSSize {
-            width: f64::from(r.x_max) - f64::from(r.x_min),
-            height: f64::from(r.y_max) - f64::from(r.y_min),
-        },
-    }
-}
-
-/// `bool CGFontGetGlyphBBoxes(CGFontRef, const CGGlyph *, size_t, CGRect *)`,
-/// in font units. A glyph with no outline - a space - has the empty box.
-pub unsafe extern "C" fn CGFontGetGlyphBBoxes(
-    font: CFTypeRef,
-    glyphs: *const u16,
-    count: usize,
-    boxes: *mut NSRect,
-) -> bool {
-    let Some(face) = crate::coretext::loaded(font) else {
-        return false;
-    };
-    if count > 0 && (glyphs.is_null() || boxes.is_null()) {
-        return false;
-    }
-    for at in 0..count {
-        // SAFETY: the caller supplies `count` glyphs and boxes.
-        unsafe {
-            let glyph = owned_ttf_parser::GlyphId(*glyphs.add(at));
-            let rect = face
-                .face()
-                .glyph_bounding_box(glyph)
-                .map_or(NSRect::default(), unit_rect);
-            boxes.add(at).write(rect);
-        }
-    }
-    true
-}
-
-/// `void CGFontGetGlyphsForUnichars(CGFontRef, const UniChar *, CGGlyph *,
-/// size_t)`, private but looked up by name by Cairo's Quartz backend.
-///
-/// One glyph per UTF-16 unit; a surrogate pair maps to its character's glyph
-/// in the first slot and zero in the second, as Apple's does.
-pub unsafe extern "C" fn CGFontGetGlyphsForUnichars(
-    font: CFTypeRef,
-    characters: *const u16,
-    glyphs: *mut u16,
-    count: usize,
-) {
-    if count == 0 || characters.is_null() || glyphs.is_null() {
-        return;
-    }
-    // SAFETY: the caller supplies `count` characters and glyph slots.
-    let (units, out) = unsafe {
-        (
-            std::slice::from_raw_parts(characters, count),
-            std::slice::from_raw_parts_mut(glyphs, count),
-        )
-    };
-    out.fill(0);
-    let Some(face) = crate::coretext::loaded(font) else {
-        return;
-    };
-    let mut at = 0;
-    for decoded in char::decode_utf16(units.iter().copied()) {
-        let width = decoded.as_ref().map_or(1, |c| c.len_utf16());
-        if let Ok(c) = decoded {
-            out[at] = face.face().glyph_index(c).map_or(0, |g| g.0);
-        }
-        at += width;
-    }
-}
-
-/// `CGPathRef CGFontGetGlyphPath(CGFontRef, const CGAffineTransform *, int,
-/// CGGlyph)`, private and looked up by Cairo: the outline in font units under
-/// `transform`, which the caller releases.
-pub unsafe extern "C" fn CGFontGetGlyphPath(
-    font: CFTypeRef,
-    transform: *const crate::cgcontext::CGAffineTransform,
-    _unknown: i32,
-    glyph: u16,
-) -> CFTypeRef {
-    let Some(face) = crate::coretext::loaded(font) else {
-        return std::ptr::null();
-    };
-    let m = match transform.is_null() {
-        true => crate::cgcontext::IDENTITY,
-        // SAFETY: the caller's transform.
-        false => unsafe { *transform },
-    };
-    let mut outline = crate::cgpath::Elements::default();
-    crate::cgpath::glyph_outline(face.face(), glyph, m, &mut outline);
-    crate::cgpath::path_from(outline)
-}
-
-/// `CGRect CGFontGetFontBBox(CGFontRef)`, the `head` table's, in font units.
-pub unsafe extern "C" fn CGFontGetFontBBox(font: CFTypeRef) -> NSRect {
-    crate::coretext::loaded(font).map_or(NSRect::default(), |face| {
-        unit_rect(face.face().global_bounding_box())
-    })
-}
-
-/// `int CGFontGetAscent(CGFontRef)` and its two neighbours, in font units.
-pub unsafe extern "C" fn CGFontGetAscent(font: CFTypeRef) -> i32 {
-    crate::coretext::loaded(font).map_or(0, |face| i32::from(face.face().ascender()))
-}
-
-pub unsafe extern "C" fn CGFontGetDescent(font: CFTypeRef) -> i32 {
-    crate::coretext::loaded(font).map_or(0, |face| i32::from(face.face().descender()))
-}
-
-pub unsafe extern "C" fn CGFontGetLeading(font: CFTypeRef) -> i32 {
-    crate::coretext::loaded(font).map_or(0, |face| i32::from(face.face().line_gap()))
-}
-
 exports::exports! {
     functions {
         "ATSFontNotificationSubscribe" => ATSFontNotificationSubscribe,
@@ -625,25 +343,6 @@ exports::exports! {
         "ATSFontDeactivate" => ATSFontDeactivate,
         "ATSFontFamilyFindFromQuickDrawName" => ATSFontFamilyFindFromQuickDrawName,
         "ATSFontFamilyGetName" => ATSFontFamilyGetName,
-        "CGFontCreateWithPlatformFont" => CGFontCreateWithPlatformFont,
-        "CGFontCreateWithFontName" => CGFontCreateWithFontName,
-        "CGFontCreateWithDataProvider" => CGFontCreateWithDataProvider,
-        "CGFontRetain" => CGFontRetain,
-        "CGFontRelease" => CGFontRelease,
-        "CGFontGetUnitsPerEm" => CGFontGetUnitsPerEm,
-        "CGFontGetXHeight" => CGFontGetXHeight,
-        "CGFontGetGlyphAdvances" => CGFontGetGlyphAdvances,
-        "CGFontCopyTableForTag" => CGFontCopyTableForTag,
-        "CTFontCreateWithPlatformFont" => CTFontCreateWithPlatformFont,
-        "CTFontGetPlatformFont" => CTFontGetPlatformFont,
-        "CTFontGetGlyphCount" => CTFontGetGlyphCount,
-        "CGFontGetGlyphBBoxes" => CGFontGetGlyphBBoxes,
-        "CGFontGetGlyphsForUnichars" => CGFontGetGlyphsForUnichars,
-        "CGFontGetGlyphPath" => CGFontGetGlyphPath,
-        "CGFontGetFontBBox" => CGFontGetFontBBox,
-        "CGFontGetAscent" => CGFontGetAscent,
-        "CGFontGetDescent" => CGFontGetDescent,
-        "CGFontGetLeading" => CGFontGetLeading,
     }
 }
 
@@ -660,7 +359,7 @@ mod tests {
             return;
         };
         let first = reference(&face.path, face.index);
-        assert_ne!(first, INVALID_FONT);
+        assert_ne!(first, coregraphics::cgfont::INVALID_FONT);
         assert_eq!(reference(&face.path, face.index), first);
         let back = face_for(first).expect("the face");
         assert_eq!((back.path, back.index), (face.path, face.index));

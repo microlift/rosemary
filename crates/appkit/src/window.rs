@@ -310,7 +310,7 @@ fn placed_origin(sdl: sdl3::Window) -> Option<(i32, i32)> {
     if requested.size.width <= 0.0 || requested.size.height <= 0.0 {
         return None;
     }
-    let (x, y, _, _) = crate::geometry::rect_to_sdl(requested);
+    let (x, y, _, _) = coregraphics::cggeometry::rect_to_sdl(crate::cgpath::cg_rect(requested));
     Some((x, y))
 }
 
@@ -879,7 +879,9 @@ fn host_frame(object: Id) -> Option<NSRect> {
         let snapshot = sdl3::video::presentation_window(sdl)?;
         (snapshot.logical_size, snapshot.position)
     };
-    Some(crate::geometry::rect_from_sdl(x, y, width, height))
+    Some(crate::cgpath::ns_rect(
+        coregraphics::cggeometry::rect_from_sdl(x, y, width, height),
+    ))
 }
 
 pub(crate) fn fullscreen_frame(object: Id) -> Option<NSRect> {
@@ -1347,7 +1349,7 @@ unsafe extern "C" fn init_with_content_rect(
     window.requested = rect;
 
     let flags = creation_flags(style_mask, Api::Undecided);
-    let (x, y, width, height) = crate::geometry::rect_to_sdl(rect);
+    let (x, y, width, height) = coregraphics::cggeometry::rect_to_sdl(crate::cgpath::cg_rect(rect));
     let (width, height) = match forced_size() {
         // A guest which sizes its first window to a fraction of the screen is
         // unusable in a headless or scripted session, where nothing can drag
@@ -1588,7 +1590,8 @@ fn remake(receiver: Id, api: Api, want: Presentation) -> bool {
     let (width, height) = sdl3::video::window_size(old).unwrap_or((1, 1));
     let title = sdl3::video::window_title(old);
     let shown = window.shown != 0;
-    let (x, y, _, _) = crate::geometry::rect_to_sdl(window.requested);
+    let (x, y, _, _) =
+        coregraphics::cggeometry::rect_to_sdl(crate::cgpath::cg_rect(window.requested));
 
     let flags = creation_flags(window.style_mask, api);
     let new = match want.popup_flags() {
@@ -1675,7 +1678,8 @@ unsafe extern "C" fn frame(receiver: Id, _sel: Sel) -> NSRect {
     }
     let (w, h) = match window.size_pending != 0 {
         true => {
-            let (_, _, w, h) = crate::geometry::rect_to_sdl(window.requested);
+            let (_, _, w, h) =
+                coregraphics::cggeometry::rect_to_sdl(crate::cgpath::cg_rect(window.requested));
             (w, h)
         }
         false => sdl3::video::window_size(window.sdl).unwrap_or((0, 0)),
@@ -1684,7 +1688,7 @@ unsafe extern "C" fn frame(receiver: Id, _sel: Sel) -> NSRect {
         Some(position) => position,
         None => return window.requested,
     };
-    crate::geometry::rect_from_sdl(x, y, w, h)
+    crate::cgpath::ns_rect(coregraphics::cggeometry::rect_from_sdl(x, y, w, h))
 }
 
 /// `+windowNumberAtPoint:belowWindowWithWindowNumber:`, over this runtime's own
@@ -1724,7 +1728,10 @@ unsafe extern "C" fn window_number_at_point(
                 continue;
             }
             let rect = frame(*window, objc::sel::get("frame"));
-            if crate::geometry::contains(rect, point) {
+            if coregraphics::cggeometry::contains(
+                crate::cgpath::cg_rect(rect),
+                crate::cgpath::cg_point(point),
+            ) {
                 return window_number(*window, objc::sel::get("windowNumber"));
             }
         }
@@ -1764,9 +1771,13 @@ pub fn pointer_location(window: Id) -> NSPoint {
         return point;
     }
     let point = match crate::script::pointer().or_else(crate::event::frozen_pointer) {
-        Some((x, y)) => crate::geometry::point_from_sdl(x as f64, y as f64),
+        Some((x, y)) => {
+            crate::cgpath::ns_point(coregraphics::cggeometry::point_from_sdl(x as f64, y as f64))
+        }
         None => match desktop_mouse_state() {
-            Some((x, y, _)) => crate::geometry::point_from_sdl(x as f64, y as f64),
+            Some((x, y, _)) => crate::cgpath::ns_point(coregraphics::cggeometry::point_from_sdl(
+                x as f64, y as f64,
+            )),
             None => return NSPoint::default(),
         },
     };
@@ -1933,7 +1944,7 @@ unsafe extern "C" fn set_frame(receiver: Id, _sel: Sel, rect: NSRect) {
     if sdl.is_null() {
         return;
     }
-    let (x, y, width, height) = crate::geometry::rect_to_sdl(rect);
+    let (x, y, width, height) = coregraphics::cggeometry::rect_to_sdl(crate::cgpath::cg_rect(rect));
     let (local_x, local_y) = local_position(sdl, x, y);
     trace!(
         "{receiver:p} frame ({:.0},{:.0} {:.0}x{:.0}) -> sdl ({local_x},{local_y} \
@@ -2002,7 +2013,7 @@ unsafe extern "C" fn set_frame_origin(
         },
     };
     window.requested = rect;
-    let (x, y, _, _) = crate::geometry::rect_to_sdl(rect);
+    let (x, y, _, _) = coregraphics::cggeometry::rect_to_sdl(crate::cgpath::cg_rect(rect));
     let (local_x, local_y) = local_position(sdl, x, y);
     trace!(
         "{receiver:p} origin ({:.0},{:.0}) -> sdl ({local_x},{local_y})",
@@ -2245,7 +2256,8 @@ fn order_front(receiver: Id, make_key: bool) {
     // The frame again, now that the window is the kind it is going to be: a
     // popup made a moment ago was placed against whatever its parent's position
     // was then, and a toplevel remade as a popup was never placed at all.
-    let (x, y, width, height) = crate::geometry::rect_to_sdl(window.requested);
+    let (x, y, width, height) =
+        coregraphics::cggeometry::rect_to_sdl(crate::cgpath::cg_rect(window.requested));
     if width > 0 && height > 0 {
         let (local_x, local_y) = local_position(sdl, x, y);
         sdl3::video::set_window_size(sdl, width.max(1), height.max(1));
@@ -2768,7 +2780,9 @@ unsafe extern "C" fn set_style_mask(receiver: Id, _sel: Sel, mask: usize) {
 /// asked has nothing to report, and reporting it anyway is not free - see
 /// [`crate::event::window_geometry_changed`].
 pub(crate) fn requested_size(receiver: Id) -> Option<(i32, i32)> {
-    let (_, _, width, height) = crate::geometry::rect_to_sdl(window_of(receiver).requested);
+    let (_, _, width, height) = coregraphics::cggeometry::rect_to_sdl(crate::cgpath::cg_rect(
+        window_of(receiver).requested,
+    ));
     (width > 0 && height > 0).then_some((width, height))
 }
 
@@ -3290,7 +3304,7 @@ unsafe extern "C" fn zoom(receiver: Id, _sel: Sel, _sender: Id) {
 unsafe extern "C" fn is_zoomed(receiver: Id, sel: Sel) -> u8 {
     // SAFETY: `-frame` is `NSRect (id, SEL)`.
     let frame = unsafe { frame(receiver, sel) };
-    let screen = crate::geometry::primary_height();
+    let screen = coregraphics::cggeometry::primary_height();
     (frame.size.height >= screen) as u8
 }
 

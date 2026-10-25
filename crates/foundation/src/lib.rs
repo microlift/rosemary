@@ -114,6 +114,7 @@ pub fn bootstrap() {
 }
 
 exports::group! {
+    geometry,
     paths,
     cf_attributed_string,
     /// Bundle and search-path calls are CoreFoundation and Foundation spellings
