@@ -783,7 +783,7 @@ pub enum InstructionKind {
         /// Metal's `sample_compare`: the reference a depth texture's texels
         /// are compared with through the sampler's compare function. The
         /// result is then one `float`, the filtered comparison.
-        compare: Option<Operand>,
+        compare: Option<Box<Operand>>,
     },
     /// Read one texel by integer coordinate, without a sampler.
     TextureRead {

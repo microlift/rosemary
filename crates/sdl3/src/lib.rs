@@ -301,6 +301,8 @@ struct Api {
     SDL_GetSystemTheme: Option<unsafe extern "C" fn() -> c_int>,
     SDL_GetCurrentVideoDriver: Option<unsafe extern "C" fn() -> *const c_char>,
     SDL_GetWindowProperties: Option<unsafe extern "C" fn(Window) -> PropertiesId>,
+    // Only the Linux X11 window path reads this imported symbol.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     SDL_GetNumberProperty: Option<unsafe extern "C" fn(PropertiesId, *const c_char, i64) -> i64>,
     SDL_GetPointerProperty:
         Option<unsafe extern "C" fn(PropertiesId, *const c_char, *mut c_void) -> *mut c_void>,

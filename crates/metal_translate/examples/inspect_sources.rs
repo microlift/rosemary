@@ -38,7 +38,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     for path in paths {
         total += 1;
         let source = std::fs::read_to_string(&path)?;
-        let translated = translate_msl_with(&source, &target, &passes);
+        let translated = translate_msl_with(&source, &target, passes);
         if let (Ok(library), Some(output)) = (&translated, &output) {
             let stem = path.file_stem().unwrap_or_default().to_string_lossy();
             for entry in &library.entries {

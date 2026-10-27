@@ -174,7 +174,12 @@ mod tests {
             let addr = crate::symbol("_timingsafe_bcmp").expect("timingsafe_bcmp is exported");
             // SAFETY: the exported function has this prototype. Function addresses
             // can differ across codegen units, so check its behavior instead.
-            implementations.push(unsafe { std::mem::transmute(addr as usize as *const ()) });
+            implementations.push(unsafe {
+                std::mem::transmute::<
+                    *const (),
+                    unsafe extern "C" fn(*const c_void, *const c_void, usize) -> i32,
+                >(addr as usize as *const ())
+            });
         }
         let left = b"abcdef";
         let same = b"abcdef";

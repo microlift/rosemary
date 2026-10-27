@@ -3000,7 +3000,7 @@ fn two_large_native_views_capture_cache_pressure_benchmark() {
     }
     let repeat_ms = refresh.elapsed().as_secs_f64() * 1000.0 / loops as f64;
     let again = native_render_count_for_tests();
-    let misses = (again - after_warm) as usize;
+    let misses = again - after_warm;
     let total = loops * views.len() * tiles.len();
     let hits = total.saturating_sub(misses);
     let cache_bytes: usize = NATIVE_CAPTURES
@@ -3923,7 +3923,7 @@ mod tests {
         const WIDTH: u32 = 6;
         const HEIGHT: u32 = 4;
         let mut pixels = [12u8, 34, 56, 255].repeat((WIDTH * HEIGHT) as usize);
-        pixels[(1 * WIDTH as usize + 4) * 4..(1 * WIDTH as usize + 5) * 4]
+        pixels[((WIDTH as usize) + 4) * 4..((WIDTH as usize) + 5) * 4]
             .copy_from_slice(&[90, 80, 70, 255]);
         set_native_view_pixels_for_tests(view, WIDTH, HEIGHT, pixels);
         let crop = Rect {
@@ -3939,7 +3939,7 @@ mod tests {
         assert_eq!(&opaque[4..8], &[90, 80, 70, 255]);
         set_native_view_pixels_for_tests(view, WIDTH, HEIGHT, {
             let mut pixels = [12u8, 34, 56, 255].repeat((WIDTH * HEIGHT) as usize);
-            pixels[(1 * WIDTH as usize + 4) * 4..(1 * WIDTH as usize + 5) * 4]
+            pixels[((WIDTH as usize) + 4) * 4..((WIDTH as usize) + 5) * 4]
                 .copy_from_slice(&[90, 80, 70, 0]);
             pixels
         });
@@ -4061,7 +4061,7 @@ mod tests {
         {
             let mut stores = VIEW_STORES.lock().unwrap();
             let src = stores.as_mut().unwrap().get_mut(&(view as usize)).unwrap();
-            src.pixels[(1 * 8 + 6) * 4..(1 * 8 + 6) * 4 + 4].copy_from_slice(&[255, 0, 0, 255]);
+            src.pixels[(8 + 6) * 4..(8 + 6) * 4 + 4].copy_from_slice(&[255, 0, 0, 255]);
             src.touch_region(Rect {
                 x: 6,
                 y: 1,
@@ -4131,10 +4131,7 @@ mod tests {
                 },
             })
         );
-        assert_eq!(
-            &second.0[(1 * 4 + 2) * 4..(1 * 4 + 2) * 4 + 4],
-            &[0, 255, 0, 255]
-        );
+        assert_eq!(&second.0[(4 + 2) * 4..(4 + 2) * 4 + 4], &[0, 255, 0, 255]);
         {
             let mut stores = VIEW_STORES.lock().unwrap();
             let store = stores.as_mut().unwrap().get_mut(&(view as usize)).unwrap();
@@ -4238,14 +4235,11 @@ mod tests {
         uploading.dirty = true;
         let before_stores = {
             let mut stores = STORES.lock().expect("stores");
-            std::mem::replace(
-                &mut *stores,
-                Some(HashMap::from([
-                    (0x71a1usize, deferred),
-                    (0x71b2usize, independent),
-                    (0x71c3usize, uploading),
-                ])),
-            )
+            (*stores).replace(HashMap::from([
+                (0x71a1usize, deferred),
+                (0x71b2usize, independent),
+                (0x71c3usize, uploading),
+            ]))
         };
         present_dirty();
         {
@@ -4569,7 +4563,9 @@ mod tests {
         assert_eq!(opaque_alpha_scan_count_for_tests(), scanned + 1);
         store
             .pixels
-            .chunks_exact_mut(4)
+            .as_chunks_mut::<4>()
+            .0
+            .iter_mut()
             .for_each(|pixel| pixel[3] = 255);
         store.touch();
         for _ in 0..100 {

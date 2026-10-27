@@ -1043,10 +1043,11 @@ pub(crate) fn install() {
     // that is wanted first names itself. The encodings are still each method's
     // own: the runtime marshals a guest's send by decoding exactly this string,
     // and the shared implementation does not make the arguments go away.
-    for (selector, types) in [(
-        "bestRepresentationForRect:context:hints:",
-        c"@64@0:8{CGRect={CGPoint=dd}{CGSize=dd}}16@48@56",
-    )] {
+    {
+        let (selector, types) = (
+            "bestRepresentationForRect:context:hints:",
+            c"@64@0:8{CGRect={CGPoint=dd}{CGSize=dd}}16@48@56",
+        );
         class.replace_method(
             objc::sel::get(selector),
             needs_pixels as *const c_void,

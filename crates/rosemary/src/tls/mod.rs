@@ -267,7 +267,7 @@ mod tests {
         std::thread::spawn(|| {
             // SAFETY: as above.
             unsafe {
-                tlv_atexit(Some(record), 1 as *mut _);
+                tlv_atexit(Some(record), std::ptr::dangling_mut());
                 tlv_atexit(Some(record), 2 as *mut _);
                 tlv_atexit(Some(record), 3 as *mut _);
             }
@@ -329,7 +329,7 @@ mod tests {
         let late_key = darwin::tls::key::Key::create(Some(late)).unwrap();
         std::thread::spawn(move || {
             assert!(!tlv_allocate(D.load(Ordering::SeqCst) as usize as *const u8).is_null());
-            late_key.set(1 as *mut _);
+            late_key.set(std::ptr::dangling_mut());
         })
         .join()
         .unwrap();

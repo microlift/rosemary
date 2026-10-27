@@ -2469,7 +2469,14 @@ mod chrome_blit {
             let get = sdl3::video::gl_proc_address(c"glGetIntegerv")?;
             let set = sdl3::video::gl_proc_address(c"glViewport")?;
             // SAFETY: both GL entrypoints have stable C signatures.
-            Some(unsafe { (std::mem::transmute(get), std::mem::transmute(set)) })
+            Some(unsafe {
+                (
+                    std::mem::transmute::<*mut c_void, unsafe extern "C" fn(u32, *mut i32)>(get),
+                    std::mem::transmute::<*mut c_void, unsafe extern "C" fn(i32, i32, i32, i32)>(
+                        set,
+                    ),
+                )
+            })
         }) else {
             return;
         };

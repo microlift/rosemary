@@ -1114,11 +1114,13 @@ fn constrain_fullscreen_frame(mut rect: NSRect, host: NSRect) -> NSRect {
 /// here. On X11 an input-transparent shaped black child above the host window
 /// obscures out-of-bounds pixels immediately, including old front buffers.
 pub(crate) fn refresh_idle_opengl_clip(sdl: sdl3::Window) {
-    if sdl.is_null() || !draws_with_opengl(sdl) {
-        return;
-    }
+    #[cfg(not(target_os = "linux"))]
+    let _ = sdl;
     #[cfg(target_os = "linux")]
     {
+        if sdl.is_null() || !draws_with_opengl(sdl) {
+            return;
+        }
         if !sdl3::video::is_x11() && !sdl3::video::is_wayland() {
             return;
         }

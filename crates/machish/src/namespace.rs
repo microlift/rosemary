@@ -1,4 +1,6 @@
-use alloc::string::{String, ToString};
+use alloc::string::String;
+#[cfg(any(feature = "std", test))]
+use alloc::string::ToString;
 use alloc::vec::Vec;
 
 use crate::error::Result;

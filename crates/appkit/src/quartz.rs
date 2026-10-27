@@ -857,7 +857,13 @@ fn coverage_mask(
     coverage: &[u8],
 ) -> Option<sk::Mask> {
     let mut alpha = sk::Pixmap::new(width as u32, height as u32)?;
-    for (pixel, value) in alpha.data_mut().chunks_exact_mut(4).zip(coverage) {
+    for (pixel, value) in alpha
+        .data_mut()
+        .as_chunks_mut::<4>()
+        .0
+        .iter_mut()
+        .zip(coverage)
+    {
         pixel.copy_from_slice(&[0, 0, 0, *value]);
     }
     let mut device = sk::Pixmap::new(frame.width, frame.height)?;
@@ -907,7 +913,7 @@ fn image_to_user(rect: NSRect, width: usize, height: usize) -> CGAffineTransform
 fn raster(bgra: Vec<u8>, width: usize, height: usize, swap: bool) -> Option<sk::Pixmap> {
     let mut pixels = bgra;
     if !swap {
-        for pixel in pixels.chunks_exact_mut(4) {
+        for pixel in pixels.as_chunks_mut::<4>().0.iter_mut() {
             pixel.swap(0, 2);
         }
     }
@@ -1246,7 +1252,7 @@ pub(crate) fn snapshot_bgra(ctx: &BitmapContext) -> Option<Vec<u8>> {
     let bytes = unsafe { std::slice::from_raw_parts(ctx.data, ctx.bytes_per_row * ctx.height) };
     let mut rgba = vec![0u8; ctx.width * ctx.height * 4];
     read_in(bytes, ctx, layout(ctx), &mut rgba);
-    for pixel in rgba.chunks_exact_mut(4) {
+    for pixel in rgba.as_chunks_mut::<4>().0.iter_mut() {
         pixel.swap(0, 2);
     }
     Some(rgba)

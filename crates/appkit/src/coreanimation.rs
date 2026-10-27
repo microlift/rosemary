@@ -1965,7 +1965,7 @@ fn progress(spec: &Spec, start: f64, now: f64) -> (Option<f64>, bool) {
     }
     let cycle = duration * if spec.autoreverses { 2.0 } else { 1.0 };
     let total = match (spec.repeat_count > 0.0, spec.repeat_duration > 0.0) {
-        (true, _) => spec.repeat_count as f64 * cycle,
+        (true, _) => spec.repeat_count * cycle,
         (false, true) => spec.repeat_duration,
         (false, false) => cycle,
     };
@@ -2932,8 +2932,10 @@ fn paint_rounded_contribution(
         let start = (y as usize * store.width as usize + area.x as usize) * 4;
         let after = &mut store.pixels[start..start + row_bytes];
         for (column, (prior, current)) in source
-            .chunks_exact(4)
-            .zip(after.chunks_exact_mut(4))
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .zip(after.as_chunks_mut::<4>().0.iter_mut())
             .enumerate()
         {
             let coverage = rounded_coverage(shape, radius, area.x + column as i64, y);
@@ -3227,6 +3229,10 @@ pub(crate) fn metal_sublayers_extent(view: Id, rect: Rect) -> Option<Rect> {
     metal_sublayers_extent_selected(view, rect, &[])
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Layer traversal passes accumulated scene state without allocating intermediate nodes"
+)]
 fn layer_paint_extent(
     layer: Id,
     mapping: &Mapping,
@@ -4381,7 +4387,10 @@ mod tests {
                         duration: 10.0,
                         ..Spec::default()
                     },
-                    start: darwin::mach::media_time() - 5.0,
+                    // Avoid the halfway pixel-rounding boundary (width 1.0,
+                    // centered at an anchor of 0.5), which makes damage
+                    // detection timing-dependent on native ARM64 macOS.
+                    start: darwin::mach::media_time() - 6.0,
                 },
             ));
         });
@@ -4701,7 +4710,7 @@ mod tests {
         // The group's independent premultiplied source is [128,0,0,128].
         assert_eq!(actual, &[128, 0, 0, 128]);
         let mut green = Store::for_tests(8, 8);
-        for pixel in green.pixels.chunks_exact_mut(4) {
+        for pixel in green.pixels.as_chunks_mut::<4>().0.iter_mut() {
             pixel.copy_from_slice(&[0, 255, 0, 255]);
         }
         render_metal_sublayers_selected(view, &mut green, whole, whole, &[], &[]);
@@ -4723,7 +4732,7 @@ mod tests {
             "fully invisible ordinary CA subtrees should not request retained sources"
         );
         let mut invisible = Store::for_tests(8, 8);
-        for pixel in invisible.pixels.chunks_exact_mut(4) {
+        for pixel in invisible.pixels.as_chunks_mut::<4>().0.iter_mut() {
             pixel.copy_from_slice(&[0, 255, 0, 255]);
         }
         render_metal_sublayers_selected(view, &mut invisible, whole, whole, &[], &[]);
@@ -4768,7 +4777,7 @@ mod tests {
         };
         let render = || {
             let mut image = Store::for_tests(12, 12);
-            for pixel in image.pixels.chunks_exact_mut(4) {
+            for pixel in image.pixels.as_chunks_mut::<4>().0.iter_mut() {
                 pixel.copy_from_slice(&[0, 255, 0, 255]);
             }
             render_metal_sublayers_selected(view, &mut image, whole, whole, &[], &[]);
@@ -4894,7 +4903,7 @@ mod tests {
         };
         let render = || {
             let mut pixels = Store::for_tests(12, 12);
-            for pixel in pixels.pixels.chunks_exact_mut(4) {
+            for pixel in pixels.pixels.as_chunks_mut::<4>().0.iter_mut() {
                 pixel.copy_from_slice(&[0, 255, 0, 255]);
             }
             render_metal_sublayers_selected(view, &mut pixels, frame, frame, &[], &[]);
@@ -4969,7 +4978,7 @@ mod tests {
             height: 50,
         };
         let mut pixels = Store::for_tests(10, 50);
-        for pixel in pixels.pixels.chunks_exact_mut(4) {
+        for pixel in pixels.pixels.as_chunks_mut::<4>().0.iter_mut() {
             pixel.copy_from_slice(&[0, 255, 0, 255]);
         }
         render_metal_sublayers_selected(view, &mut pixels, frame, frame, &[], &[]);
@@ -5148,7 +5157,7 @@ mod tests {
             };
             let make_store = || {
                 let mut store = Store::for_tests(width as u32, height as u32);
-                for pixel in store.pixels.chunks_exact_mut(4) {
+                for pixel in store.pixels.as_chunks_mut::<4>().0.iter_mut() {
                     pixel.copy_from_slice(&green);
                 }
                 store
@@ -5248,7 +5257,7 @@ mod tests {
             height: 20,
         };
         let mut store = Store::for_tests(20, 20);
-        for pixel in store.pixels.chunks_exact_mut(4) {
+        for pixel in store.pixels.as_chunks_mut::<4>().0.iter_mut() {
             pixel.copy_from_slice(&[0, 255, 0, 255]);
         }
         render_metal_sublayers_selected(view, &mut store, whole, whole, &[], &[]);

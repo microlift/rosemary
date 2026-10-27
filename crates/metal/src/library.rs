@@ -62,17 +62,16 @@ pub(super) unsafe extern "C" fn new_library_with_data(
     retain_library(receiver, translated, Some(air), entry_modules, Some(target))
 }
 
+type MetallibTranslation<'a> = (
+    metal_translate::TranslatedLibrary,
+    Vec<&'a [u8]>,
+    Vec<usize>,
+);
+
 fn translate_metallib<'a>(
     bytes: &'a [u8],
     target: &metal_translate::TargetProfile,
-) -> Result<
-    (
-        metal_translate::TranslatedLibrary,
-        Vec<&'a [u8]>,
-        Vec<usize>,
-    ),
-    metal_translate::TranslateError,
-> {
+) -> Result<MetallibTranslation<'a>, metal_translate::TranslateError> {
     let modules = metal_translate::metallib_airs(bytes)?;
     let mut entries = Vec::new();
     let mut function_constants = Vec::new();

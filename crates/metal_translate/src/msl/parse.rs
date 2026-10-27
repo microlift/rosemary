@@ -488,7 +488,7 @@ impl Parser<'_> {
                 format!("packed type {word} is not supported"),
             ));
         }
-        if word.contains('x') && word.starts_with(|c: char| c == 'f' || c == 'h') {
+        if word.contains('x') && word.starts_with(['f', 'h']) {
             return Err(syntax_error(
                 line,
                 format!("matrix type {word} is not supported"),
@@ -1186,10 +1186,8 @@ fn vector_named(word: &str) -> Option<(Scalar, u8)> {
 fn texture_dimension(word: &str) -> Option<(TextureDimension, bool, bool, bool)> {
     let (depth, body) = if let Some(body) = word.strip_prefix("texture") {
         (false, body)
-    } else if let Some(body) = word.strip_prefix("depth") {
-        (true, body)
     } else {
-        return None;
+        (true, word.strip_prefix("depth")?)
     };
     let (body, array) = match body.strip_suffix("_array") {
         Some(body) => (body, true),

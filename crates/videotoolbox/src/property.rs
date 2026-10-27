@@ -9,6 +9,9 @@ use corefoundation::{
     api::CFAllocatorRef, base::CFTypeRef, collections::CFDictionaryRef, string::CFStringRef,
 };
 
+/// # Safety
+///
+/// The session, key and value must be valid Core Foundation objects when non-null.
 pub unsafe extern "C" fn VTSessionSetProperty(
     _session: VTSessionRef,
     _propertyKey: CFStringRef,
@@ -17,6 +20,9 @@ pub unsafe extern "C" fn VTSessionSetProperty(
     kVTPropertyNotSupportedErr
 }
 
+/// # Safety
+///
+/// The session and key must be valid; the optional output pointer must be writable.
 pub unsafe extern "C" fn VTSessionCopyProperty(
     _session: VTSessionRef,
     _propertyKey: CFStringRef,
@@ -26,6 +32,9 @@ pub unsafe extern "C" fn VTSessionCopyProperty(
     kVTPropertyNotSupportedErr
 }
 
+/// # Safety
+///
+/// The session and property dictionary must be valid objects when non-null.
 pub unsafe extern "C" fn VTSessionSetProperties(
     _session: VTSessionRef,
     _propertyDictionary: CFDictionaryRef,
@@ -33,6 +42,9 @@ pub unsafe extern "C" fn VTSessionSetProperties(
     kVTPropertyNotSupportedErr
 }
 
+/// # Safety
+///
+/// The session must be live and the optional output pointer must be writable.
 pub unsafe extern "C" fn VTSessionCopySupportedPropertyDictionary(
     _session: VTSessionRef,
     _supportedPropertyDictionaryOut: *mut CFDictionaryRef,

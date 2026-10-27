@@ -448,7 +448,9 @@ pub(crate) fn image_coverage(image: CFTypeRef) -> Option<(usize, usize, Vec<u8>)
     );
     let (width, height, bgra) = image_bgra(image)?;
     let coverage = bgra
-        .chunks_exact(4)
+        .as_chunks::<4>()
+        .0
+        .iter()
         .map(|p| match (is_mask, has_alpha) {
             (true, _) => {
                 let decoded = low + f64::from(p[2]) / 255.0 * (high - low);
@@ -612,7 +614,10 @@ pub(crate) fn image_bgra(image: CFTypeRef) -> Option<(usize, usize, Vec<u8>)> {
     for row in 0..image.height {
         let from = &bytes[row * stride..row * stride + image.width * channels];
         let to = &mut out[row * image.width * 4..(row + 1) * image.width * 4];
-        for (source, target) in from.chunks_exact(channels).zip(to.chunks_exact_mut(4)) {
+        for (source, target) in from
+            .chunks_exact(channels)
+            .zip(to.as_chunks_mut::<4>().0.iter_mut())
+        {
             let mut ordered = [0u8; 4];
             ordered[..channels].copy_from_slice(source);
             if little && channels == 4 {
@@ -745,7 +750,7 @@ mod tests {
         crate::bootstrap();
         // A one-pixel, 24-bit BMP. Its stored BGR pixel is red and the row is
         // padded to four bytes.
-        let mut bmp = vec![0u8; 58];
+        let mut bmp = [0u8; 58];
         bmp[0..2].copy_from_slice(b"BM");
         bmp[2..6].copy_from_slice(&58u32.to_le_bytes());
         bmp[10..14].copy_from_slice(&54u32.to_le_bytes());

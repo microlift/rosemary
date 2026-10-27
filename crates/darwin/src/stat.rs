@@ -36,8 +36,8 @@ impl DarwinTranslation<libc::stat> for Stat {
     fn to_host(&self) -> libc::stat {
         let mut stat: libc::stat = unsafe { std::mem::zeroed() };
         stat.st_dev = self.dev as _;
-        stat.st_mode = self.mode.into();
-        stat.st_nlink = self.nlink.into();
+        stat.st_mode = self.mode as _;
+        stat.st_nlink = self.nlink as _;
         stat.st_ino = self.ino;
         stat.st_uid = self.uid;
         stat.st_gid = self.gid;
@@ -50,7 +50,7 @@ impl DarwinTranslation<libc::stat> for Stat {
         stat.st_ctime_nsec = self.ctime.nsec;
         stat.st_size = self.size;
         stat.st_blocks = self.blocks;
-        stat.st_blksize = self.blksize.into();
+        stat.st_blksize = self.blksize as _;
         #[cfg(target_os = "macos")]
         {
             stat.st_birthtime = self.birthtime.sec;
@@ -583,6 +583,7 @@ pub(crate) fn guest_path(host: &CStr) -> Option<std::ffi::CString> {
 ///
 /// `path` is a NUL-terminated string.
 pub unsafe extern "C" fn open(path: *const c_char, flags: c_int, mode: u32) -> c_int {
+    #[cfg(target_os = "linux")]
     if flags & beneath::O_SUPPORTED != 0 {
         // SAFETY: the caller's obligations, unchanged.
         return unsafe { openat(DARWIN_AT_FDCWD, path, flags, mode) };
@@ -622,7 +623,10 @@ pub unsafe extern "C" fn openat(
     flags: c_int,
     mode: u32,
 ) -> c_int {
+    #[cfg(target_os = "linux")]
     let resolve_beneath = flags & beneath::O_SUPPORTED != 0;
+    #[cfg(not(target_os = "linux"))]
+    let resolve_beneath = false;
     let Some(host_flags) = open_flags(flags & !beneath::O_SUPPORTED) else {
         return -1;
     };
@@ -753,6 +757,7 @@ pub unsafe extern "C" fn fstatat(
         DARWIN_AT_FDCWD => libc::AT_FDCWD,
         fd => fd,
     };
+    #[cfg(target_os = "linux")]
     if flag & beneath::SUPPORTED != 0 {
         return with_fallback_at(dirfd, path, |path| {
             // SAFETY: the caller's path and descriptor; `out` as for this function.
@@ -780,6 +785,7 @@ pub unsafe extern "C" fn fstatat(
 /// directory it starts from, by `..`, an absolute path or a symlink. Safe
 /// archive extraction (`unzip`) relies on it, so it is kept rather than dropped.
 pub(crate) mod beneath {
+    #[cfg(target_os = "linux")]
     use super::Stat;
     #[cfg(target_os = "linux")]
     use super::{Found, as_seen};
@@ -870,11 +876,6 @@ pub(crate) mod beneath {
         unsafe { libc::close(fd) };
         crate::errno::set(saved);
         rc
-    }
-
-    #[cfg(not(target_os = "linux"))]
-    pub unsafe fn fstatat(_: c_int, _: *const c_char, _: *mut Stat, _: bool) -> c_int {
-        unreachable!("SUPPORTED is zero here, so nothing asks for it")
     }
 
     /// `unlinkat` beneath `dirfd`: the parent opened with `RESOLVE_BENEATH`,
@@ -1449,11 +1450,11 @@ mod tests {
         };
         let (rc, followed) = stat_at(c"link", 0);
         assert_eq!(rc, 0);
-        assert_eq!(followed.mode as u32 & 0o170000, libc::S_IFREG.into());
+        assert_eq!(followed.mode as libc::mode_t & libc::S_IFMT, libc::S_IFREG);
         assert_eq!(followed.size, 3);
         let (rc, link) = stat_at(c"link", DARWIN_AT_SYMLINK_NOFOLLOW);
         assert_eq!(rc, 0);
-        assert_eq!(link.mode as u32 & 0o170000, libc::S_IFLNK.into());
+        assert_eq!(link.mode as libc::mode_t & libc::S_IFMT, libc::S_IFLNK);
         let (rc, folded) = stat_at(c"contents/game.ios", 0);
         assert_eq!(rc, 0, "the case fold stays relative to the descriptor");
         assert_eq!(folded.size, 3);

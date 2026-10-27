@@ -1,5 +1,6 @@
 use super::*;
 
+#[cfg_attr(target_os = "macos", allow(dead_code))]
 fn test_opaque_metal_placement(id: usize, frame: DirectFrame) -> ScenePlacement {
     ScenePlacement {
         opacity_groups: Vec::new(),
@@ -1523,9 +1524,7 @@ fn v10_fifo_fixture() -> Option<(
     GpuImage,
     appkit::view::Frame,
 )> {
-    if std::env::var_os("ROSEMARY_TEST_VULKAN").is_none() {
-        return None;
-    }
+    std::env::var_os("ROSEMARY_TEST_VULKAN")?;
     let gpu = crate::vulkan::adapters().ok()?.first()?.gpu().ok()?;
     let window = sdl3::video::create_window(c"FIFO persistent layers", 160, 120, 0)?;
     sdl3::video::show_window(window);
@@ -2097,7 +2096,7 @@ fn failed_dma_blend_defers_or_requests_cpu_without_accepting_raw_store() {
     sdl3::video::show_window(window);
     sdl3::video::presentation_window(window).expect("SDL snapshot");
     let mut store = appkit::backing::Store::new(80, 64);
-    for pixel in store.pixels.chunks_exact_mut(4) {
+    for pixel in store.pixels.as_chunks_mut::<4>().0 {
         pixel.copy_from_slice(&[0, 255, 0, 255]);
     }
     let picture = real_gbm_picture_with_pixels(80, 64, |_, _| [0, 0, 255, 255]);
@@ -3201,6 +3200,10 @@ fn opacity_group_composites_metal_drawable_before_applying_root_alpha() {
 /// A large grouped window must not allocate a full-window scratch image for
 /// all eight frame slots. Every image is a real Vulkan/WSI-backed allocation.
 #[cfg(not(target_os = "macos"))]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Test matrix cases select independent window, scene and opacity parameters"
+)]
 fn long_lived_large_group_reuses_completed_scratch(
     width: u32,
     height: u32,
@@ -3390,9 +3393,8 @@ fn long_lived_large_group_reuses_completed_scratch(
             overlapping_slots = overlapping_slots.max(busy);
         }
         samples.push(started.elapsed().as_secs_f64() * 1000.0);
-        assert_eq!(
+        assert!(
             state.scene_gpu_bytes() <= 512 * 1024 * 1024,
-            true,
             "scene images exceeded committed 512 MiB budget"
         );
     }
@@ -3910,13 +3912,12 @@ fn omitted_invisible_sibling_preserves_shared_opacity_group_pixels() {
             let normalized = state.normalized_opacity_paths();
             assert!(!normalized.iter().any(|(id, _, _)| *id == hidden.id));
             assert!(
-                normalized
+                !normalized
                     .iter()
                     .find(|(id, _, _)| *id == front.id)
                     .unwrap()
                     .1
-                    .len()
-                    > 0
+                    .is_empty()
             );
             assert_eq!(state.redisplay_scene(window as usize), Ok(true));
             state.idle();
@@ -5494,7 +5495,7 @@ fn fifo_flattened_static_drawable_recomposes_after_ca_mask_change() {
         native: None,
     };
     state.layers.push(id);
-    state.synchronize_scene(window as usize, &[base.clone()]);
+    state.synchronize_scene(window as usize, std::slice::from_ref(&base));
     assert_eq!(
         state.stage_composite_layer(id, &frame, &source, None, &mut SourceOwner(None), false),
         Ok(Some(true))
@@ -6015,7 +6016,7 @@ fn animated_geometry_mask_recomposes_static_metal_gpu_pixels() {
     assert!(initial.iter().any(|s| s.layer == metal_id));
     let (initial_p, initial_clip) = scene_from_ca();
     state.layers.push(metal_id);
-    state.synchronize_scene(sdl as usize, &[initial_p.clone()]);
+    state.synchronize_scene(sdl as usize, std::slice::from_ref(&initial_p));
     assert_eq!(
         state.stage_composite_source(
             metal_id,
@@ -6190,7 +6191,7 @@ fn fully_visible_six_k_cpu_native_tiles_overlay_static_opaque_metal() {
     let metal_id = 301usize;
     let base = test_opaque_metal_placement(metal_id, DirectFrame::from_frame(&whole));
     state.layers.push(metal_id);
-    state.synchronize_scene(window as usize, &[base.clone()]);
+    state.synchronize_scene(window as usize, std::slice::from_ref(&base));
     assert_eq!(
         state.stage_composite_source(
             metal_id,
@@ -6307,7 +6308,7 @@ fn twelve_retained_native_replacements_commit_with_old_generations_pinned() {
     let metal_id = 905usize;
     let background = test_opaque_metal_placement(metal_id, DirectFrame::from_frame(&whole));
     state.layers.push(metal_id);
-    state.synchronize_scene(window as usize, &[background.clone()]);
+    state.synchronize_scene(window as usize, std::slice::from_ref(&background));
     assert_eq!(
         state.stage_composite_source(
             metal_id,
@@ -6528,7 +6529,7 @@ fn native_overlay_joins_last_direct_wsi_image_without_new_metal_drawable() {
     let metal_id = 991usize;
     let metal_placement = test_opaque_metal_placement(metal_id, DirectFrame::from_frame(&whole));
     state.layers.push(metal_id);
-    state.synchronize_scene(window as usize, &[metal_placement.clone()]);
+    state.synchronize_scene(window as usize, std::slice::from_ref(&metal_placement));
     state.queue_direct(
         metal_id,
         &whole,
@@ -6760,7 +6761,13 @@ fn real_gbm_picture_with_pixels(
         );
         let bytes = std::slice::from_raw_parts_mut(pixels, stride as usize * height as usize);
         for (y, row) in bytes.chunks_exact_mut(stride as usize).enumerate() {
-            for (x, pixel) in row.chunks_exact_mut(4).take(width as usize).enumerate() {
+            for (x, pixel) in row
+                .as_chunks_mut::<4>()
+                .0
+                .iter_mut()
+                .take(width as usize)
+                .enumerate()
+            {
                 pixel.copy_from_slice(&color(x as u32, y as u32));
             }
         }
@@ -6772,7 +6779,8 @@ fn real_gbm_picture_with_pixels(
         destroy_device(device);
         libc::close(fd);
         libc::dlclose(handle);
-        let picture = Arc::new(appkit::backing::Dmabuf {
+
+        Arc::new(appkit::backing::Dmabuf {
             width,
             height,
             fourcc: u32::from_le_bytes(*b"AR24"),
@@ -6782,8 +6790,7 @@ fn real_gbm_picture_with_pixels(
                 offset: 0,
                 stride,
             }],
-        });
-        picture
+        })
     }
 }
 
@@ -6844,7 +6851,7 @@ fn six_k_mixed_cpu_and_translucent_gbm_dma_preserves_native_background() {
     let whole = test_full_frame(window, WIDTH, HEIGHT);
     let bottom = test_opaque_metal_placement(0x2458, DirectFrame::from_frame(&whole));
     state.layers.push(bottom.id);
-    state.synchronize_scene(window as usize, &[bottom.clone()]);
+    state.synchronize_scene(window as usize, std::slice::from_ref(&bottom));
     assert_eq!(
         state.stage_composite_source(
             bottom.id,
@@ -7079,7 +7086,7 @@ fn six_k_mixed_cpu_and_translucent_gbm_dma_preserves_native_background() {
         let pixel = read_scene_pixel(gpu, image, WIDTH, HEIGHT, x, y);
         for channel in 0..4 {
             assert!(
-                (i32::from(pixel[channel]) - i32::from(expected[channel])).abs() <= 2,
+                (i32::from(pixel[channel]) - expected[channel]).abs() <= 2,
                 "mixed DMA/native/Metal sampling at ({x},{y}) pixel={pixel:?} expected={expected:?}"
             );
         }
@@ -7516,7 +7523,7 @@ fn rejected_linear_dma_without_prior_native_image_stays_in_final_pixels() {
     let stride = width * 4 + 16;
     let mut image = vec![0u8; (stride * height) as usize];
     for row in image.chunks_exact_mut(stride as usize) {
-        for texel in row.chunks_exact_mut(4).take(width as usize) {
+        for texel in row.as_chunks_mut::<4>().0.iter_mut().take(width as usize) {
             texel.copy_from_slice(&[0, 0, 255, 255]);
         }
     }
@@ -7660,7 +7667,7 @@ fn refused_native_dma_buff_does_not_block_later_cpu_scene() {
     let native_id = (1usize << (usize::BITS - 1)) | 7078;
     let bottom = test_opaque_metal_placement(id, DirectFrame::from_frame(&whole));
     state.layers.push(id);
-    state.synchronize_scene(window as usize, &[bottom.clone()]);
+    state.synchronize_scene(window as usize, std::slice::from_ref(&bottom));
     assert_eq!(
         state.stage_composite_layer(id, &whole, &metal, None, &mut SourceOwner(None), false),
         Ok(Some(true))
@@ -9636,7 +9643,7 @@ fn live_native_occlusion_updates_without_new_drawable_or_initial_backing() {
         native: None,
     };
     state.layers.push(id);
-    state.synchronize_scene(window as usize, &[placement.clone()]);
+    state.synchronize_scene(window as usize, std::slice::from_ref(&placement));
     assert!(state.live_scene_regions(id, &whole).is_some());
     if matches!(
         state.present_mode,
@@ -9693,7 +9700,7 @@ fn live_native_occlusion_updates_without_new_drawable_or_initial_backing() {
         }]),
         ..placement.clone()
     };
-    assert!(state.synchronize_scene(window as usize, &[moved.clone()]));
+    assert!(state.synchronize_scene(window as usize, std::slice::from_ref(&moved)));
     assert_eq!(state.redisplay_scene(window as usize), Ok(true));
     state.idle();
     assert_eq!(
@@ -9743,7 +9750,7 @@ fn oversized_cpu_native_view_keeps_foreground_in_final_vulkan_framebuffer() {
     let native_view = objc::object::create_instance(cls, 0);
     // Source width 6016 x height 3384 exceeds the 64 MiB AppKit capture cap.
     let mut pixels = [0u8, 0, 255, 255].repeat(6016);
-    for (index, texel) in pixels.chunks_exact_mut(4).enumerate() {
+    for (index, texel) in pixels.as_chunks_mut::<4>().0.iter_mut().enumerate() {
         if index >= 3000 {
             texel.copy_from_slice(&[255, 0, 0, 255]); // blue in BGRA
         }
@@ -10028,7 +10035,7 @@ fn direct_wsi_static_drawable_recomposes_after_ca_mask_changes() {
         native: None,
     };
     state.layers.push(id);
-    state.synchronize_scene(window as usize, &[base.clone()]);
+    state.synchronize_scene(window as usize, std::slice::from_ref(&base));
     assert!(fast_direct_scene(&state, id, &whole, None, true));
     state.queue_direct(
         id,
@@ -10075,7 +10082,7 @@ fn direct_wsi_static_drawable_recomposes_after_ca_mask_changes() {
             .all(|(a, b)| a.abs_diff(b) <= 1),
         "a direct WSI image escaped newly added Core Animation opacity: {grouped_pixel:?}"
     );
-    assert!(state.synchronize_scene(window as usize, &[base.clone()]));
+    assert!(state.synchronize_scene(window as usize, std::slice::from_ref(&base)));
     assert_eq!(state.redisplay_scene(window as usize), Ok(true));
     state.idle();
     assert!(
@@ -10092,7 +10099,7 @@ fn direct_wsi_static_drawable_recomposes_after_ca_mask_changes() {
         rounded: vec![rounded],
         ..base.clone()
     };
-    assert!(state.synchronize_scene(window as usize, &[new.clone()]));
+    assert!(state.synchronize_scene(window as usize, std::slice::from_ref(&new)));
     assert!(state.scene_repaint_needed);
     assert_eq!(state.redisplay_scene(window as usize), Ok(true));
     state.idle();
@@ -10123,7 +10130,7 @@ fn direct_wsi_static_drawable_recomposes_after_ca_mask_changes() {
         rounded: vec![],
         ..new
     };
-    assert!(state.synchronize_scene(window as usize, &[unrounded.clone()]));
+    assert!(state.synchronize_scene(window as usize, std::slice::from_ref(&unrounded)));
     assert_eq!(state.redisplay_scene(window as usize), Ok(true));
     state.idle();
     assert!(
@@ -12944,7 +12951,7 @@ fn benchmark_live_immediate_acquisition_policy() {
         if Instant::now() < due {
             std::thread::sleep(due - Instant::now());
         }
-        if present(gpu, window as usize, &frame, &images[n % 2], &[]).unwrap() != true {
+        if !present(gpu, window as usize, &frame, &images[n % 2], &[]).unwrap() {
             deferred += 1;
         }
         if n == 0 {
@@ -13245,9 +13252,7 @@ fn v17_async_window_fixture() -> Option<(
         return None;
     }
 
-    if std::env::var_os("ROSEMARY_TEST_VULKAN").is_none() {
-        return None;
-    }
+    std::env::var_os("ROSEMARY_TEST_VULKAN")?;
     let gpu = crate::vulkan::adapters().ok()?.first()?.gpu().ok()?;
     let window = sdl3::video::create_window(c"WSI asynchronous ownership", 240, 180, 0)?;
     sdl3::video::show_window(window);
@@ -13477,7 +13482,7 @@ fn appkit_parent_remake_retires_gpu_backed_popup_without_dangling_nswindow() {
         "recursive native teardown left the child backing-store worker parked"
     );
     let deadline = Instant::now() + Duration::from_secs(5);
-    while sdl3::video::window_from_id(old_child_id) != std::ptr::null_mut() {
+    while !sdl3::video::window_from_id(old_child_id).is_null() {
         sdl3::video::vulkan::service_surface_requests();
         assert!(Instant::now() < deadline, "GPU-backed popup never retired");
         std::thread::sleep(Duration::from_millis(2));
@@ -14136,7 +14141,7 @@ fn rejected_linear_dma_worker_commits_original_publication() {
     let (width, height, stride) = (30u32, 25u32, 30u32 * 4 + 16);
     let mut image = vec![0u8; (stride * height) as usize];
     for row in image.chunks_exact_mut(stride as usize) {
-        for pixel in row.chunks_exact_mut(4).take(width as usize) {
+        for pixel in row.as_chunks_mut::<4>().0.iter_mut().take(width as usize) {
             pixel.copy_from_slice(&[0, 0, 255, 255]);
         }
     }
@@ -15744,7 +15749,12 @@ fn metal_root_ca_only_child_recomposes_actual_vulkan_pixels_without_new_drawable
         .find(|part| part.native_pixels.is_some())
         .expect("Metal root CA child must be separately composited");
     let old_pixels = overlay_before.native_pixels.as_ref().unwrap();
-    let first_red = old_pixels.chunks_exact(4).position(|p| p[3] != 0).unwrap();
+    let first_red = old_pixels
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .position(|p| p[3] != 0)
+        .unwrap();
     let old_point = (
         overlay_before.frame.x as u32 + (first_red % overlay_before.frame.width as usize) as u32,
         overlay_before.frame.y as u32 + (first_red / overlay_before.frame.width as usize) as u32,
@@ -15952,7 +15962,12 @@ fn metal_root_ca_only_child_recomposes_actual_vulkan_pixels_without_new_drawable
         .find(|part| part.native_pixels.is_some())
         .unwrap();
     let new_pixels = updated.native_pixels.as_ref().unwrap();
-    let new_red = new_pixels.chunks_exact(4).position(|p| p[3] != 0).unwrap();
+    let new_red = new_pixels
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .position(|p| p[3] != 0)
+        .unwrap();
     let new_point = (
         updated.frame.x as u32 + (new_red % updated.frame.width as usize) as u32,
         updated.frame.y as u32 + (new_red / updated.frame.width as usize) as u32,
@@ -16482,7 +16497,7 @@ fn metadata_only_animation_over_static_metal_recomposition_benchmark() {
         state.idle();
         let mut samples = Vec::with_capacity(24);
         for iteration in 0..24 {
-            placements[count].frame.x = (16 + iteration * 5) as i32;
+            placements[count].frame.x = 16 + iteration * 5;
             placements[count].opacity = if iteration % 2 == 0 { 1.0 } else { 0.5 };
             let now = Instant::now();
             state.synchronize_scene(window as usize, &placements);

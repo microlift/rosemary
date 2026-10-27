@@ -872,7 +872,7 @@ impl Lowerer<'_, '_> {
                 } else {
                     None
                 },
-                compare: reference,
+                compare: reference.map(Box::new),
             },
         );
         let value = Value { op, ty: result_ty };

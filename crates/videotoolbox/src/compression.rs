@@ -46,6 +46,9 @@ pub struct VTDecompressionOutputCallbackRecord {
     pub decompression_output_ref_con: *mut std::ffi::c_void,
 }
 
+/// # Safety
+///
+/// The format description, dictionaries, callback record and output pointer must refer to valid storage for their declared types when provided.
 pub unsafe extern "C" fn VTDecompressionSessionCreate(
     _allocator: CFAllocatorRef,
     _videoFormatDescription: CMVideoFormatDescriptionRef,
@@ -57,6 +60,9 @@ pub unsafe extern "C" fn VTDecompressionSessionCreate(
     kVTCouldNotFindVideoDecoderErr
 }
 
+/// # Safety
+///
+/// The session and sample buffer must be live objects; the optional info output pointer must be writable.
 pub unsafe extern "C" fn VTDecompressionSessionDecodeFrame(
     _session: VTDecompressionSessionRef,
     _sampleBuffer: CMSampleBufferRef,
@@ -67,14 +73,23 @@ pub unsafe extern "C" fn VTDecompressionSessionDecodeFrame(
     kVTVideoDecoderMalfunctionErr
 }
 
+/// # Safety
+///
+/// `_session` must be a live decompression session when non-null.
 pub unsafe extern "C" fn VTDecompressionSessionInvalidate(_session: VTDecompressionSessionRef) {}
 
+/// # Safety
+///
+/// `_session` must be a live decompression session when non-null.
 pub unsafe extern "C" fn VTDecompressionSessionWaitForAsynchronousFrames(
     _session: VTDecompressionSessionRef,
 ) -> OSStatus {
     kVTVideoDecoderMalfunctionErr
 }
 
+/// # Safety
+///
+/// `_session` and `_newFormatDescription` must refer to live objects when non-null.
 pub unsafe extern "C" fn VTDecompressionSessionCanAcceptFormatDescription(
     _session: VTDecompressionSessionRef,
     _newFormatDescription: CMVideoFormatDescriptionRef,

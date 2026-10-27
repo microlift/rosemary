@@ -220,8 +220,7 @@ fn own_sizes(regions: bool) -> Option<Usage> {
 
 /// How many mappings this process has
 fn region_count() -> u32 {
-    let count = starnix::process::regions().map_or(0, |regions| regions.len() as u32);
-    count
+    starnix::process::regions().map_or(0, |regions| regions.len() as u32)
 }
 
 /// Resident memory the task does not share with another, which is the

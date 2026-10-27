@@ -1170,9 +1170,11 @@ unsafe extern "C" fn current_editor(receiver: Id, _sel: Sel) -> Id {
         let f: unsafe extern "C" fn(Id, Sel) -> Id = std::mem::transmute(objc::msg::entry());
         f(window, objc::sel::get("firstResponder"))
     };
-    (first == editor)
-        .then_some(editor)
-        .unwrap_or(std::ptr::null_mut())
+    if first == editor {
+        editor
+    } else {
+        std::ptr::null_mut()
+    }
 }
 
 unsafe extern "C" fn field_mouse_down(receiver: Id, _sel: Sel, _event: Id) {

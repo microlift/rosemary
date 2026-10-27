@@ -92,6 +92,8 @@ fn copy_one(from: &Path, to: &Path, flags: u32) -> std::io::Result<()> {
         let mut destination = std::fs::OpenOptions::new()
             .write(true)
             .create(true)
+            // Check for source/destination identity before truncating the destination.
+            .truncate(false)
             .create_new(flags & EXCL != 0)
             .open(to)?;
         let dst = destination.metadata()?;

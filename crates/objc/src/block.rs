@@ -20,6 +20,7 @@ mod flag {
     /// The block is in `__DATA` and copying it is a no-op.
     pub const IS_GLOBAL: i32 = 1 << 28;
     /// The block returns a struct through a hidden first argument.
+    #[cfg(any(test, target_arch = "x86_64"))]
     pub const USE_STRET: i32 = 1 << 29;
 }
 
@@ -246,6 +247,7 @@ pub(crate) const USE_STRET_FLAG: i32 = flag::USE_STRET;
 /// # Safety
 ///
 /// `block` must be a block literal.
+#[cfg(target_arch = "x86_64")]
 pub(crate) unsafe fn uses_stret(block: Id) -> bool {
     // SAFETY: the header is the first three words of every block.
     unsafe { (*(block as *const Block)).flags.load(Ordering::Relaxed) & flag::USE_STRET != 0 }

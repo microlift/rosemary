@@ -170,6 +170,7 @@ static IMPORTED: Mutex<Vec<Imported>> = Mutex::new(Vec::new());
 static TEST_IMPORT_ATTEMPTS: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
 #[cfg(test)]
+#[cfg_attr(target_os = "macos", allow(dead_code))]
 pub(crate) fn import_attempts_for_test() -> usize {
     TEST_IMPORT_ATTEMPTS.load(std::sync::atomic::Ordering::Relaxed)
 }
@@ -182,10 +183,12 @@ static INJECT_UNSUPPORTED_IMPORT_ONCE: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
 #[cfg(test)]
+#[cfg_attr(target_os = "macos", allow(dead_code))]
 pub(crate) fn fail_next_dma_import_for_test() {
     INJECT_IMPORT_FAILURE_ONCE.store(true, std::sync::atomic::Ordering::Release);
 }
 #[cfg(test)]
+#[cfg_attr(target_os = "macos", allow(dead_code))]
 pub(crate) fn fail_next_unsupported_dma_import_for_test() {
     INJECT_UNSUPPORTED_IMPORT_ONCE.store(true, std::sync::atomic::Ordering::Release);
 }
@@ -322,22 +325,21 @@ fn make(gpu: &'static Gpu, picture: &Arc<Dmabuf>) -> Result<Imported, ImportMake
     // The advertised modifier list already verifies sampled-image features
     // AND external DMA_BUF importability for the selected physical device.
     // An unsupported tuple cannot become valid through retrying allocations.
-    if let Some(instance) = crate::vulkan::instance() {
-        if !modifiers(instance, gpu.physical, format).contains(&picture.modifier) {
-            return Err(ImportMakeError::unsupported(
-                "the device cannot sample this DRM format/modifier as an external DMA-BUF",
-            ));
-        }
+    if let Some(instance) = crate::vulkan::instance()
+        && !modifiers(instance, gpu.physical, format).contains(&picture.modifier)
+    {
+        return Err(ImportMakeError::unsupported(
+            "the device cannot sample this DRM format/modifier as an external DMA-BUF",
+        ));
     }
-    if let Some(instance) = crate::vulkan::instance() {
-        if let Some(planes) = modifier_plane_count(instance, gpu.physical, format, picture.modifier)
-            && picture.planes.len() != planes as usize
-        {
-            return Err(ImportMakeError::unsupported(format!(
-                "DRM modifier requires {planes} planes, producer supplied {}",
-                picture.planes.len()
-            )));
-        }
+    if let Some(instance) = crate::vulkan::instance()
+        && let Some(planes) = modifier_plane_count(instance, gpu.physical, format, picture.modifier)
+        && picture.planes.len() != planes as usize
+    {
+        return Err(ImportMakeError::unsupported(format!(
+            "DRM modifier requires {planes} planes, producer supplied {}",
+            picture.planes.len()
+        )));
     }
     if picture.planes.iter().any(|plane| plane.stride == 0) {
         return Err(ImportMakeError::unsupported("zero DMA-BUF plane stride"));
@@ -346,7 +348,7 @@ fn make(gpu: &'static Gpu, picture: &Arc<Dmabuf>) -> Result<Imported, ImportMake
         && picture
             .planes
             .iter()
-            .any(|plane| plane.stride < picture.width.checked_mul(4).unwrap_or(u32::MAX))
+            .any(|plane| plane.stride < picture.width.saturating_mul(4))
     {
         return Err(ImportMakeError::unsupported(
             "linear DMA-BUF stride shorter than one row",
@@ -596,6 +598,7 @@ impl Drop for PassLease {
 }
 
 #[cfg(test)]
+#[cfg_attr(target_os = "macos", allow(dead_code))]
 pub(crate) fn available_passes_for_test(gpu: &'static Gpu) -> usize {
     PASSES
         .lock()

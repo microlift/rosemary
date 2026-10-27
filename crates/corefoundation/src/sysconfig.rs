@@ -42,6 +42,7 @@ fn host(name: &std::ffi::CStr) -> Option<*mut c_void> {
 /// `kSCNetworkReachabilityFlagsReachable` is the bit every caller tests;
 /// `IsLocalAddress` distinguishes a target on this machine, which is reachable
 /// whatever the routing table says.
+#[cfg(not(target_os = "macos"))]
 mod flag {
     pub const REACHABLE: u32 = 1 << 1;
     pub const IS_LOCAL_ADDRESS: u32 = 1 << 16;
@@ -53,6 +54,7 @@ mod flag {
 /// passes alongside are how it stays alive for as long as this holds it. A
 /// runtime that kept the pointer and skipped the retain hands the callback a
 /// freed object, which is the crossing this tree spends its time chasing.
+#[cfg(not(target_os = "macos"))]
 #[repr(C)]
 #[derive(Clone, Copy)]
 struct Context {
@@ -63,6 +65,7 @@ struct Context {
     copy_description: *const c_void,
 }
 
+#[cfg(not(target_os = "macos"))]
 type Callback = unsafe extern "C" fn(CFTypeRef, u32, *mut c_void);
 
 /// An `SCNetworkReachabilityRef` of this runtime's.

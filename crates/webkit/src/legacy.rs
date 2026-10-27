@@ -441,22 +441,26 @@ unsafe fn send_words(receiver: Id, sel: Sel, args: &[usize]) -> Option<usize> {
     unsafe {
         Some(match *args {
             [] => {
-                std::mem::transmute::<_, unsafe extern "C" fn(Id, Sel) -> W>(entry)(receiver, sel)
+                std::mem::transmute::<*const std::ffi::c_void, unsafe extern "C" fn(Id, Sel) -> W>(
+                    entry,
+                )(receiver, sel)
             }
-            [a] => std::mem::transmute::<_, unsafe extern "C" fn(Id, Sel, W) -> W>(entry)(
-                receiver, sel, a,
-            ),
-            [a, b] => std::mem::transmute::<_, unsafe extern "C" fn(Id, Sel, W, W) -> W>(entry)(
-                receiver, sel, a, b,
-            ),
-            [a, b, c] => std::mem::transmute::<_, unsafe extern "C" fn(Id, Sel, W, W, W) -> W>(
-                entry,
-            )(receiver, sel, a, b, c),
-            [a, b, c, d] => {
-                std::mem::transmute::<_, unsafe extern "C" fn(Id, Sel, W, W, W, W) -> W>(entry)(
-                    receiver, sel, a, b, c, d,
-                )
-            }
+            [a] => std::mem::transmute::<
+                *const std::ffi::c_void,
+                unsafe extern "C" fn(Id, Sel, W) -> W,
+            >(entry)(receiver, sel, a),
+            [a, b] => std::mem::transmute::<
+                *const std::ffi::c_void,
+                unsafe extern "C" fn(Id, Sel, W, W) -> W,
+            >(entry)(receiver, sel, a, b),
+            [a, b, c] => std::mem::transmute::<
+                *const std::ffi::c_void,
+                unsafe extern "C" fn(Id, Sel, W, W, W) -> W,
+            >(entry)(receiver, sel, a, b, c),
+            [a, b, c, d] => std::mem::transmute::<
+                *const std::ffi::c_void,
+                unsafe extern "C" fn(Id, Sel, W, W, W, W) -> W,
+            >(entry)(receiver, sel, a, b, c, d),
             _ => return None,
         })
     }

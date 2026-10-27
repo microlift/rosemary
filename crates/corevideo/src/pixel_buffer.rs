@@ -1036,8 +1036,13 @@ pub unsafe extern "C" fn CVPixelBufferGetIOSurface(buffer: CFTypeRef) -> CFTypeR
 /// Mac with the builtin frameworks. Retained; `None` when `buffer` is not
 /// this runtime's or the host cannot make one. Attachments stay behind, as
 /// their values are this runtime's objects.
+///
+/// # Safety
+///
+/// `buffer` must be null or a live Core Foundation object. A local
+/// CVPixelBuffer must remain valid throughout the copy.
 #[cfg(target_os = "macos")]
-pub fn host_copy(buffer: CFTypeRef) -> Option<CFTypeRef> {
+pub unsafe fn host_copy(buffer: CFTypeRef) -> Option<CFTypeRef> {
     type Create =
         unsafe extern "C" fn(CFTypeRef, usize, usize, u32, CFTypeRef, *mut CFTypeRef) -> i32;
     type Lock = unsafe extern "C" fn(CFTypeRef, u64) -> i32;
@@ -1109,7 +1114,11 @@ pub fn host_copy(buffer: CFTypeRef) -> Option<CFTypeRef> {
 
 /// Off Darwin there is no host CoreVideo.
 #[cfg(not(target_os = "macos"))]
-pub fn host_copy(_buffer: CFTypeRef) -> Option<CFTypeRef> {
+///
+/// # Safety
+///
+/// The pointer is not inspected on non-macOS hosts.
+pub unsafe fn host_copy(_buffer: CFTypeRef) -> Option<CFTypeRef> {
     None
 }
 

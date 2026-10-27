@@ -120,6 +120,7 @@ const NUMBERS: &[(i32, i32)] = &[
 /// this host's `EL2NSYNC` (45) through would name Darwin's `ENOTSUP`. An
 /// unfamiliar number is no use to a guest either way; a familiar wrong one sends
 /// it down a handling path it should not be on.
+#[cfg(not(target_os = "macos"))]
 const DARWIN_EINVAL: i32 = 22;
 
 /// This host's `errno` as Darwin's.

@@ -317,14 +317,14 @@ unsafe extern "C" fn list_service(
     else {
         objc::fail!("an object list was serviced before its counted method was recorded");
     };
-    let mut at = 0;
+    let mut at: usize = 0;
     let mut next = || {
         // SAFETY: the caller passed a nil-terminated list, and this stops
         // reading at the nil.
         let value = unsafe {
-            match at < TAIL_REGISTERS {
-                true => *registers.add(at),
-                false => *stack.add(at - TAIL_REGISTERS),
+            match at.checked_sub(TAIL_REGISTERS) {
+                None => *registers.add(at),
+                Some(index) => *stack.add(index),
             }
         };
         at += 1;
@@ -398,7 +398,7 @@ unsafe extern "C" fn list_trampoline() {
     )
 }
 
-#[cfg(test)]
+#[cfg(all(test, target_arch = "x86_64"))]
 mod tests {
     use super::*;
 

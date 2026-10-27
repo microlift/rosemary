@@ -734,6 +734,7 @@ pub fn unalias_class(addr: usize) -> usize {
         .unwrap_or(addr)
 }
 
+#[cfg(target_arch = "x86_64")]
 extern "C" fn unalias_class_c(addr: usize) -> usize {
     unalias_class(addr)
 }

@@ -463,6 +463,10 @@ mod tests {
     }
 
     #[test]
+    #[expect(
+        clippy::single_range_in_vec_init,
+        reason = "guard accepts a slice of address ranges, not a collected list of addresses"
+    )]
     fn a_fault_on_a_guarded_page_unprotects_and_queues_it() {
         let _ = init();
         let size = page_size() as usize;
@@ -472,7 +476,9 @@ mod tests {
             (size * 2) as u64,
             libc::PROT_READ | libc::PROT_WRITE,
         );
-        guard(&[p as u64..p as u64 + 8]);
+        // One guarded range, not a vector of addresses within the range.
+        let ranges: [std::ops::Range<u64>; 1] = [p as u64..p as u64 + 8];
+        guard(&ranges);
         // Not the second page: it holds nothing.
         assert!(on_fault(p as u64 + 3));
         // SAFETY: writable again after `on_fault`.

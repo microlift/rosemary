@@ -1,7 +1,12 @@
+#[cfg(target_arch = "x86_64")]
 use std::collections::BTreeSet;
+#[cfg(target_arch = "x86_64")]
 use std::ffi::c_void;
+#[cfg(target_arch = "x86_64")]
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+#[cfg(target_arch = "x86_64")]
+use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use machish::memory::Regions;
 use machish::report::LinkReport;
@@ -15,21 +20,27 @@ pub fn requested() -> bool {
 
 /// The guest's real `free`, and the predicate that says whether it owns a
 /// pointer. Written once, before any guest code runs.
+#[cfg(target_arch = "x86_64")]
 static REAL_FREE: AtomicUsize = AtomicUsize::new(0);
+#[cfg(target_arch = "x86_64")]
 static OWNS: AtomicUsize = AtomicUsize::new(0);
+#[cfg(target_arch = "x86_64")]
 static REAL_REALLOC: AtomicUsize = AtomicUsize::new(0);
 static FOREIGN: AtomicU64 = AtomicU64::new(0);
 /// Proof the trampoline is on the path at all: a check that is never called
 /// reports the same "no crossings" a clean run does.
+#[cfg(target_arch = "x86_64")]
 static ANNOUNCED: std::sync::Once = std::sync::Once::new();
 
 /// Return addresses already reported, so a crossing on a hot path says its
 /// piece once rather than once per call.
+#[cfg(target_arch = "x86_64")]
 static SEEN: Mutex<BTreeSet<u64>> = Mutex::new(BTreeSet::new());
 
 /// `free(p)`, with `ra` appended by the trampoline.
 /// Whether the guest's allocator made the block at `p`, reporting `ra` when it
 /// did not. `false` means the caller must not hand it over.
+#[cfg(target_arch = "x86_64")]
 fn owned(p: *mut c_void, ra: u64, what: &str) -> bool {
     ANNOUNCED.call_once(|| {
         eprintln!("rosemary: heapcheck: the check is live - first {what} from {ra:#x}");
@@ -56,6 +67,7 @@ fn owned(p: *mut c_void, ra: u64, what: &str) -> bool {
 }
 
 /// `free(p)`, with `ra` appended by the trampoline.
+#[cfg(target_arch = "x86_64")]
 unsafe extern "C" fn checked_free(p: *mut c_void, ra: u64) {
     if p.is_null() || !owned(p, ra, "free") {
         return;
@@ -70,6 +82,7 @@ unsafe extern "C" fn checked_free(p: *mut c_void, ra: u64) {
 /// `realloc(p, size)`. It frees too, and a foreign pointer reaching it is the
 /// same crossing one step removed - so the block is copied out rather than
 /// handed over, which is the only answer that keeps the caller's data.
+#[cfg(target_arch = "x86_64")]
 unsafe extern "C" fn checked_realloc(p: *mut c_void, size: usize, ra: u64) -> *mut c_void {
     let real: unsafe extern "C" fn(*mut c_void, usize) -> *mut c_void =
         // SAFETY: `REAL_REALLOC` holds the guest's own `realloc`.
@@ -119,8 +132,10 @@ unsafe extern "C" {
 
 /// Where each guest image landed, so a return address can be named without
 /// taking the loader's lock from inside a free.
+#[cfg(target_arch = "x86_64")]
 static IMAGES: Mutex<Vec<(String, u64, u64)>> = Mutex::new(Vec::new());
 
+#[cfg(target_arch = "x86_64")]
 fn where_is(addr: u64) -> String {
     let images = IMAGES.lock().unwrap_or_else(|e| e.into_inner());
     for (name, lo, hi) in images.iter() {
@@ -133,7 +148,9 @@ fn where_is(addr: u64) -> String {
 }
 
 /// Every name that hands a block back to the allocator.
+#[cfg(target_arch = "x86_64")]
 const FREES: &[&str] = &["free", "mi_free"];
+#[cfg(target_arch = "x86_64")]
 const REALLOCS: &[&str] = &["realloc", "mi_realloc"];
 
 /// How many foreign frees were caught, for the line printed at exit.

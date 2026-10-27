@@ -956,7 +956,7 @@ pub unsafe extern "C" fn CGContextStrokeLineSegments(
     // SAFETY: the caller supplies `count` points.
     let points = unsafe { std::slice::from_raw_parts(points, count) };
     if let Some(shape) = shape(context, |e, m| {
-        for pair in points.chunks_exact(2) {
+        for pair in points.as_chunks::<2>().0.iter() {
             e.move_to(m, pair[0].x, pair[0].y);
             e.line_to(m, pair[1].x, pair[1].y);
         }

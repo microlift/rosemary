@@ -1240,19 +1240,19 @@ fn present_inner(drawable: Id) {
             gpu::milestone("presented frame");
             crate::stats::frame();
             dump_frame(pixels, width, height, texture.image.format);
-            if let Some(window) = window {
-                if let Some(properties) = sdl3::video::presentation_window(window) {
-                    enqueue_completed_readback(ReadbackFrame {
-                        window: window as usize,
-                        window_id: properties.id,
-                        layer: described.layer as usize,
-                        pixels: pixels.to_vec(),
-                        width,
-                        height,
-                        format: texture.image.format,
-                        placement,
-                    });
-                }
+            if let Some(window) = window
+                && let Some(properties) = sdl3::video::presentation_window(window)
+            {
+                enqueue_completed_readback(ReadbackFrame {
+                    window: window as usize,
+                    window_id: properties.id,
+                    layer: described.layer as usize,
+                    pixels: pixels.to_vec(),
+                    width,
+                    height,
+                    format: texture.image.format,
+                    placement,
+                });
             }
         }
     }
@@ -1345,7 +1345,7 @@ fn mask_readback_surface(
         let (x, w) = (band.x as usize, band.w as usize);
         for y in band.y as usize..(band.y + band.h) as usize {
             let row = &mut pixels[y * pitch + x * 4..y * pitch + (x + w) * 4];
-            for pixel in row.chunks_exact_mut(4) {
+            for pixel in row.as_chunks_mut::<4>().0 {
                 pixel.copy_from_slice(&[0, 0, 0, 255]);
             }
         }
@@ -1940,11 +1940,13 @@ static TEST_STORE_UPLOAD_SUBMISSIONS: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
 
 #[cfg(test)]
+#[cfg_attr(target_os = "macos", allow(dead_code))]
 pub(crate) fn backing_upload_submissions_for_test() -> usize {
     TEST_STORE_UPLOAD_SUBMISSIONS.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 #[cfg(test)]
+#[cfg_attr(target_os = "macos", allow(dead_code))]
 pub(crate) fn hold_every_blended_source_for_test(
     window: sdl3::Window,
 ) -> Vec<std::sync::Arc<crate::swapchain::BackingImageLease>> {
@@ -1968,6 +1970,7 @@ pub(crate) fn hold_every_blended_source_for_test(
 }
 
 #[cfg(test)]
+#[cfg_attr(target_os = "macos", allow(dead_code))]
 pub(crate) fn backing_store_blended_for_test(
     window: sdl3::Window,
 ) -> Option<std::sync::Arc<crate::swapchain::BackingImageLease>> {
@@ -1980,6 +1983,7 @@ pub(crate) fn backing_store_blended_for_test(
 }
 
 #[cfg(test)]
+#[cfg_attr(target_os = "macos", allow(dead_code))]
 pub(crate) fn backing_store_image_for_test(
     window: sdl3::Window,
 ) -> Option<(std::sync::Arc<crate::swapchain::BackingImageLease>, usize)> {
@@ -1992,6 +1996,7 @@ pub(crate) fn backing_store_image_for_test(
 }
 
 #[cfg(test)]
+#[cfg_attr(target_os = "macos", allow(dead_code))]
 pub(crate) fn forget_backing_store_for_test(window: sdl3::Window) {
     forget_window(window);
 }
@@ -2258,6 +2263,7 @@ fn forget_window(window: sdl3::Window) {
 }
 
 #[cfg(test)]
+#[cfg_attr(target_os = "macos", allow(dead_code))]
 pub(crate) fn store_upload_completed_outcome_for_test(
     window: sdl3::Window,
 ) -> Option<appkit::backing::PresentOutcome> {
@@ -2770,6 +2776,7 @@ static TEST_ACCEPTED_DMA_BLENDS: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
 
 #[cfg(test)]
+#[cfg_attr(target_os = "macos", allow(dead_code))]
 pub(crate) fn accepted_dma_blends_for_test() -> usize {
     TEST_ACCEPTED_DMA_BLENDS.load(std::sync::atomic::Ordering::SeqCst)
 }
@@ -2778,11 +2785,13 @@ pub(crate) fn accepted_dma_blends_for_test() -> usize {
 static TEST_BLEND_FAILURE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
 #[cfg(test)]
+#[cfg_attr(target_os = "macos", allow(dead_code))]
 pub(crate) fn inject_blend_failure_for_test(mode: usize) {
     TEST_BLEND_FAILURE.store(mode, std::sync::atomic::Ordering::SeqCst);
 }
 
 #[cfg(test)]
+#[cfg_attr(target_os = "macos", allow(dead_code))]
 pub(crate) fn blend_failure_pending_for_test() -> usize {
     TEST_BLEND_FAILURE.load(std::sync::atomic::Ordering::SeqCst)
 }

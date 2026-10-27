@@ -160,6 +160,10 @@ pub(super) struct SceneWork {
     tile_edge_before: u32,
 }
 
+#[expect(
+    clippy::large_enum_variant,
+    reason = "Compositor preparation runs per frame; keep the hot path free of heap allocations"
+)]
 pub(super) enum ScenePrepared {
     SingleLayer,
     Deferred,
@@ -905,6 +909,7 @@ impl Swapchain {
     }
 
     #[cfg(test)]
+    #[cfg_attr(target_os = "macos", allow(dead_code))]
     pub(super) fn seed_accepted_native_for_budget_test(
         &mut self,
         id: usize,
@@ -1083,21 +1088,19 @@ impl Swapchain {
                 .direct
                 .as_mut()
                 .filter(|direct| direct.layer == placement.id)
+                && direct.frame != placement.frame
             {
-                if direct.frame != placement.frame {
-                    direct.frame = placement.frame;
-                    direct.queued_at = Instant::now();
-                    self.composite_dirty = true;
-                    self.composite_dirty_since = Some(Instant::now());
-                    changed = true;
-                }
+                direct.frame = placement.frame;
+                direct.queued_at = Instant::now();
+                self.composite_dirty = true;
+                self.composite_dirty_since = Some(Instant::now());
+                changed = true;
             }
             if let Some(scene) = self
                 .scene_layers
                 .iter_mut()
                 .find(|scene| scene.id == placement.id)
-            {
-                if scene.frame != placement.frame
+                && (scene.frame != placement.frame
                     || scene.opacity != placement.opacity
                     || scene.opaque != placement.opaque
                     || scene.clip != placement.clip
@@ -1115,28 +1118,27 @@ impl Swapchain {
                             )
                         });
                         scene.regions != updated
-                    })
-                {
-                    scene.frame = placement.frame;
-                    scene.opacity = placement.opacity;
-                    scene.opaque = placement.opaque;
-                    scene.clip = placement.clip;
-                    scene.rounded.clone_from(&placement.rounded);
-                    if let Some(coverage) = &placement.occluded {
-                        scene.regions = (!coverage.is_empty()).then(|| {
-                            super::subtract(
-                                Region {
-                                    x: placement.frame.x,
-                                    y: placement.frame.y,
-                                    width: placement.frame.width.min(i32::MAX as u32) as i32,
-                                    height: placement.frame.height.min(i32::MAX as u32) as i32,
-                                },
-                                coverage,
-                            )
-                        });
-                    }
-                    changed = true;
+                    }))
+            {
+                scene.frame = placement.frame;
+                scene.opacity = placement.opacity;
+                scene.opaque = placement.opaque;
+                scene.clip = placement.clip;
+                scene.rounded.clone_from(&placement.rounded);
+                if let Some(coverage) = &placement.occluded {
+                    scene.regions = (!coverage.is_empty()).then(|| {
+                        super::subtract(
+                            Region {
+                                x: placement.frame.x,
+                                y: placement.frame.y,
+                                width: placement.frame.width.min(i32::MAX as u32) as i32,
+                                height: placement.frame.height.min(i32::MAX as u32) as i32,
+                            },
+                            coverage,
+                        )
+                    });
                 }
+                changed = true;
             }
             if let Some((_, frame)) = self
                 .scene_frames
@@ -1246,10 +1248,10 @@ impl Swapchain {
                 count(lease);
             }
         }
-        if let Some(direct) = &self.direct {
-            if let Some(lease) = &direct.backing {
-                count(lease);
-            }
+        if let Some(direct) = &self.direct
+            && let Some(lease) = &direct.backing
+        {
+            count(lease);
         }
         if let Some(composite) = &self.composite {
             bytes = bytes.saturating_add(scene_image_bytes(PresentSource::from(composite)));
@@ -1295,10 +1297,10 @@ impl Swapchain {
         for prior in &self.transaction_pinned {
             count(prior);
         }
-        if let Some(direct) = &self.direct {
-            if let Some(backing) = &direct.backing {
-                count(backing);
-            }
+        if let Some(direct) = &self.direct
+            && let Some(backing) = &direct.backing
+        {
+            count(backing);
         }
         total.saturating_add(
             self.composite
@@ -1843,16 +1845,14 @@ impl Swapchain {
         // If the current layer's pool is saturated, leave the previous image
         // intact and ask the presenter to retry when a GPU source is free.
         let previous_image_source = previous
-            .and_then(|_| self.composite.as_ref())
+            .and(self.composite.as_ref())
             .map(PresentSource::from);
-        if let Some(source) = previous_image_source {
+        if let Some(source) = previous_image_source
+            && !fits_scene_budget(self.budgeted_scene_bytes(), scene_image_bytes(source))
+        {
+            self.shed_scene_spares();
             if !fits_scene_budget(self.budgeted_scene_bytes(), scene_image_bytes(source)) {
-                self.shed_scene_spares();
-                if !fits_scene_budget(self.budgeted_scene_bytes(), scene_image_bytes(source)) {
-                    return Err(
-                        "retained scene GPU budget exhausted capturing previous layer".into(),
-                    );
-                }
+                return Err("retained scene GPU budget exhausted capturing previous layer".into());
             }
         }
         let previous_image = previous_image_source
@@ -2051,20 +2051,20 @@ impl Swapchain {
         };
         // A previously single-layer FIFO window only retained the flattened
         // accumulator. Capture it once when a second layer first joins.
-        if let Some(old) = work.previous {
-            if let Some(old) = self.scene_layers.iter().find(|scene| scene.id == old) {
-                let dest = old.snapshot.image.image;
-                unsafe {
-                    blit(
-                        device,
-                        command_buffer,
-                        composite,
-                        frame_extents(self.extent.width, self.extent.height),
-                        dest,
-                        vk::ImageLayout::GENERAL,
-                        frame_extents(self.extent.width, self.extent.height),
-                    );
-                }
+        if let Some(old) = work.previous
+            && let Some(old) = self.scene_layers.iter().find(|scene| scene.id == old)
+        {
+            let dest = old.snapshot.image.image;
+            unsafe {
+                blit(
+                    device,
+                    command_buffer,
+                    composite,
+                    frame_extents(self.extent.width, self.extent.height),
+                    dest,
+                    vk::ImageLayout::GENERAL,
+                    frame_extents(self.extent.width, self.extent.height),
+                );
             }
         }
         if let Some(current) = self

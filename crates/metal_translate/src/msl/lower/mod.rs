@@ -973,12 +973,11 @@ impl<'c, 'p> Lowerer<'c, 'p> {
 
     /// Each field of a structure-typed expression, in order.
     pub fn struct_fields(&mut self, expr: &Expr, index: usize, line: usize) -> Result<Vec<Value>> {
-        if let Some(lvalue) = self.lvalue(expr)? {
-            if let LValue::Fields(found, fields) = &lvalue
-                && *found == index
-            {
-                return fields.iter().map(|field| self.load(field, line)).collect();
-            }
+        if let Some(lvalue) = self.lvalue(expr)?
+            && let LValue::Fields(found, fields) = &lvalue
+            && *found == index
+        {
+            return fields.iter().map(|field| self.load(field, line)).collect();
         }
         let value = self.rvalue(expr)?;
         if value.ty != Ty::Struct(index) {

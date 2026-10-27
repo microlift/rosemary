@@ -235,7 +235,7 @@ fn monotonic_nanoseconds() -> u64 {
         .saturating_add(now.tv_nsec as u64)
 }
 
-/// Empty on macOS, where the host's own kernel answers these.
+// Empty on macOS, where the host's own kernel answers these.
 #[cfg(target_os = "macos")]
 exports::exports! {}
 

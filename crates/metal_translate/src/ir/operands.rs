@@ -147,7 +147,7 @@ pub(crate) fn instruction_operands(kind: &InstructionKind) -> Vec<&Operand> {
             .chain(offset)
             .chain(lod)
             .chain(bias)
-            .chain(compare)
+            .chain(compare.as_deref())
             .chain(gradient.as_deref().map(|(dx, _)| dx))
             .chain(gradient.as_deref().map(|(_, dy)| dy))
             .collect(),
@@ -255,7 +255,7 @@ pub(crate) fn instruction_operands_mut(kind: &mut InstructionKind) -> Vec<&mut O
             operands.extend(offset);
             operands.extend(lod);
             operands.extend(bias);
-            operands.extend(compare);
+            operands.extend(compare.as_deref_mut());
             if let Some(gradient) = gradient {
                 operands.push(&mut gradient.0);
                 operands.push(&mut gradient.1);

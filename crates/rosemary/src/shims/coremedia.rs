@@ -163,7 +163,9 @@ fn encode_frame(symbol: &str, ctx: &mut RegisterContext, mem: &mut dyn GuestMemo
     // The encoder is the host's even with the builtin frameworks, and cannot
     // read this runtime's pixel buffers; it is handed a copy the host made.
     let copy = match crate::frameworks::using_builtin() {
-        true => corevideo::pixel_buffer::host_copy(ctx.rsi as usize as *const c_void),
+        // SAFETY: guest input for this frame is a live CVPixelBuffer object for
+        // the duration of the encoder call.
+        true => unsafe { corevideo::pixel_buffer::host_copy(ctx.rsi as usize as *const c_void) },
         false => None,
     };
     let image = copy.map_or(ctx.rsi, |copy| copy as usize as u64);

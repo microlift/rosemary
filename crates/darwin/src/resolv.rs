@@ -9,7 +9,7 @@ unsafe extern "C" fn res_9_init() -> c_int {
         }
         unsafe {
             let sym = libc::dlsym(libc::RTLD_DEFAULT, c"res_init".as_ptr());
-            std::mem::transmute(sym)
+            sym as usize
         }
     });
     if *RES_INIT_SYM != 0 {

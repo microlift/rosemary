@@ -283,17 +283,20 @@ impl Gpu {
     }
 
     #[cfg(test)]
+    #[cfg_attr(target_os = "macos", allow(dead_code))]
     pub(crate) fn inject_immediate_wait_failure_for_test(&self) {
         self.fail_immediate_wait_after_submit
             .store(true, Ordering::Release);
     }
 
     #[cfg(test)]
+    #[cfg_attr(target_os = "macos", allow(dead_code))]
     pub(crate) fn immediate_quarantine_count_for_test(&self) -> usize {
         self.immediate.lock().unwrap().quarantined.len()
     }
 
     #[cfg(test)]
+    #[cfg_attr(target_os = "macos", allow(dead_code))]
     pub(crate) fn wait_first_quarantined_for_test(&self) -> Result<(), String> {
         let fence = self
             .immediate
@@ -346,6 +349,7 @@ impl Gpu {
     /// Metal performs some work outside any command buffer the guest holds:
     /// putting a fresh texture into a usable layout, and copying bytes a guest
     /// handed to `-replaceRegion:`. Those go through here.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn one_shot(&self, body: impl FnOnce(&Device, vk::CommandBuffer)) -> Result<(), String> {
         self.one_shot_owned((), |device, cb, _| body(device, cb))
     }

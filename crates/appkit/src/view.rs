@@ -904,6 +904,10 @@ fn capture_metal_subtree_segment(
     }
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Scene traversal forwards inherited clipping and opacity state without copying layers"
+)]
 fn visit_metal_scene(
     view: Id,
     window: sdl3::Window,
@@ -1016,43 +1020,43 @@ fn visit_metal_scene(
     }
     if has_ca_mask {
         let radius = crate::coreanimation::scene_corner_radius(layer);
-        if radius > 0.0 {
-            if let Some(frame) = own_frame {
-                let bounds = bounds_of(view).size;
-                let scale_x = f64::from(frame.width) / bounds.width.abs().max(f64::MIN_POSITIVE);
-                let scale_y = f64::from(frame.height) / bounds.height.abs().max(f64::MIN_POSITIVE);
-                let physical = radius * scale_x.min(scale_y);
-                if physical.is_finite() && physical > 0.0 {
-                    rounded.push(RoundedSceneClip {
-                        frame,
-                        radius: physical as f32,
-                    });
-                }
+        if radius > 0.0
+            && let Some(frame) = own_frame
+        {
+            let bounds = bounds_of(view).size;
+            let scale_x = f64::from(frame.width) / bounds.width.abs().max(f64::MIN_POSITIVE);
+            let scale_y = f64::from(frame.height) / bounds.height.abs().max(f64::MIN_POSITIVE);
+            let physical = radius * scale_x.min(scale_y);
+            if physical.is_finite() && physical > 0.0 {
+                rounded.push(RoundedSceneClip {
+                    frame,
+                    radius: physical as f32,
+                });
             }
         }
     }
-    if !layer.is_null() && crate::layer::is_metal(layer) {
-        if let Some(frame) = unsafe { presentation_frame(view) } {
-            if frame.window == window {
-                scene.push(MetalSceneLayer {
-                    opacity_groups: opacity_groups.clone(),
-                    layer: layer as usize,
-                    frame,
-                    opacity: source_view_alpha * layer_opacity,
-                    opaque: crate::layer::opaque_of(layer),
-                    clip: ca_clip,
-                    rounded: rounded.clone(),
-                    occluded: Vec::new(),
-                    native_pixels: None,
-                    native_cpu_capture: None,
-                    native_dmabuf: None,
-                    native_revision: 0,
-                    native_dma_sample: None,
-                    native_owner: 0,
-                });
-                *seen_metal = true;
-            }
-        }
+    if !layer.is_null()
+        && crate::layer::is_metal(layer)
+        && let Some(frame) = unsafe { presentation_frame(view) }
+        && frame.window == window
+    {
+        scene.push(MetalSceneLayer {
+            opacity_groups: opacity_groups.clone(),
+            layer: layer as usize,
+            frame,
+            opacity: source_view_alpha * layer_opacity,
+            opaque: crate::layer::opaque_of(layer),
+            clip: ca_clip,
+            rounded: rounded.clone(),
+            occluded: Vec::new(),
+            native_pixels: None,
+            native_cpu_capture: None,
+            native_dmabuf: None,
+            native_revision: 0,
+            native_dma_sample: None,
+            native_owner: 0,
+        });
+        *seen_metal = true;
     }
     let child_clip = if current_masks {
         own_frame.map(|frame| ca_clip.map_or(frame, |clip| intersect_scene_clips(frame, clip)))
@@ -1131,123 +1135,106 @@ fn visit_metal_scene(
     // Per-view native content needs its own source above the preceding
     // drawable. The high bit reserves an identity namespace distinct from
     // user-space Objective-C layer pointers and SDL window identities.
-    if *seen_metal && (layer.is_null() || !crate::layer::is_metal(layer)) {
-        if let Some(frame) = unsafe { presentation_frame(view) } {
-            if frame.window == window {
-                // A 6K NSView clipped into a small Metal window only needs
-                // that visible rectangle in GPU memory. Preserve source-local
-                // coordinates while publishing the cropped frame in window
-                // pixels; Metal never gets the flattened-underlay version.
-                let viewport = Frame {
-                    x: 0,
-                    y: 0,
-                    width: frame.window_width,
-                    height: frame.window_height,
-                    ..frame
+    if *seen_metal
+        && (layer.is_null() || !crate::layer::is_metal(layer))
+        && let Some(frame) = unsafe { presentation_frame(view) }
+        && frame.window == window
+    {
+        // A 6K NSView clipped into a small Metal window only needs
+        // that visible rectangle in GPU memory. Preserve source-local
+        // coordinates while publishing the cropped frame in window
+        // pixels; Metal never gets the flattened-underlay version.
+        let viewport = Frame {
+            x: 0,
+            y: 0,
+            width: frame.window_width,
+            height: frame.window_height,
+            ..frame
+        };
+        let visible = ca_clip.map_or(intersect_scene_clips(frame, viewport), |clip| {
+            intersect_scene_clips(intersect_scene_clips(frame, viewport), clip)
+        });
+        let dma = crate::backing::native_scene_dma_extent_supported(frame.width, frame.height)
+            .then(|| crate::backing::native_dma_overlay(view))
+            .flatten();
+        // The 64 MiB capture bound applies to one allocation, not an
+        // entire visible NSView. Publish 2048x2048 pixel tiles in the
+        // same paint order, each with an independent GPU lease.
+        let large_visible =
+            !crate::backing::native_scene_extent_supported(visible.width, visible.height);
+        let tile_edge = if large_visible { 2048 } else { u32::MAX };
+        let mut index = 0u32;
+        let mut y = 0u32;
+        while y < visible.height {
+            let height = (visible.height - y).min(tile_edge);
+            let mut x = 0u32;
+            while x < visible.width {
+                let width = (visible.width - x).min(tile_edge);
+                let part = Frame {
+                    x: visible.x.saturating_add(x as i32),
+                    y: visible.y.saturating_add(y as i32),
+                    width,
+                    height,
+                    ..visible
                 };
-                let visible = ca_clip.map_or(intersect_scene_clips(frame, viewport), |clip| {
-                    intersect_scene_clips(intersect_scene_clips(frame, viewport), clip)
-                });
-                let bounded =
-                    crate::backing::native_scene_extent_supported(frame.width, frame.height);
-                let dma =
-                    crate::backing::native_scene_dma_extent_supported(frame.width, frame.height)
-                        .then(|| crate::backing::native_dma_overlay(view))
-                        .flatten();
-                // The 64 MiB capture bound applies to one allocation, not an
-                // entire visible NSView. Publish 2048x2048 pixel tiles in the
-                // same paint order, each with an independent GPU lease.
-                let large_visible =
-                    !crate::backing::native_scene_extent_supported(visible.width, visible.height);
-                let tile_edge = if large_visible { 2048 } else { u32::MAX };
-                let mut index = 0u32;
-                let mut y = 0u32;
-                while y < visible.height {
-                    let height = (visible.height - y).min(tile_edge);
-                    let mut x = 0u32;
-                    while x < visible.width {
-                        let width = (visible.width - x).min(tile_edge);
-                        let part = Frame {
-                            x: visible.x.saturating_add(x as i32),
-                            y: visible.y.saturating_add(y as i32),
-                            width,
-                            height,
-                            ..visible
-                        };
-                        let cropped = crate::backing::Rect {
-                            x: i64::from(part.x) - i64::from(frame.x),
-                            y: i64::from(part.y) - i64::from(frame.y),
-                            width: i64::from(width),
-                            height: i64::from(height),
-                        };
-                        let cpu = if bounded
-                            && part.x == frame.x
-                            && part.y == frame.y
-                            && part.width == frame.width
-                            && part.height == frame.height
-                        {
-                            crate::backing::native_scene_pixels_cropped_with_damage(
-                                view,
-                                frame.width,
-                                frame.height,
-                                cropped,
-                            )
-                        } else {
-                            crate::backing::native_scene_pixels_cropped_with_damage(
-                                view,
-                                frame.width,
-                                frame.height,
-                                cropped,
-                            )
-                        };
-                        // A DMA source remains one coherent GPU image. A CPU
-                        // tile never borrows a DMA producer's unrelated frame.
-                        if cpu.is_some() || dma.is_some() {
-                            let sample = dma.as_ref().map(|_| {
-                                (
-                                    frame.width,
-                                    frame.height,
-                                    cropped.x as u32,
-                                    cropped.y as u32,
-                                )
-                            });
-                            // Moving a large static DMA view can keep the
-                            // visible output frame unchanged while changing
-                            // which producer texels are sampled.
-                            let revision = cpu.as_ref().map_or(0, |(_, rev, _)| *rev)
-                                ^ dma.as_ref().map_or(0, |(_, rev)| rev.rotate_left(19))
-                                ^ sample.map_or(0, |(w, h, x, y)| {
-                                    (u64::from(w) << 32 | u64::from(h)).rotate_left(11)
-                                        ^ (u64::from(x) << 32 | u64::from(y)).rotate_left(37)
-                                });
-                            scene.push(MetalSceneLayer {
-                                opacity_groups: opacity_groups.clone(),
-                                layer: native_tile_id(view, index),
-                                native_owner: view as usize,
-                                frame: part,
-                                opacity: source_view_alpha * layer_opacity,
-                                opaque: false,
-                                clip: ca_clip,
-                                rounded: rounded.clone(),
-                                occluded: Vec::new(),
-                                native_cpu_capture: cpu.as_ref().map(|(_, rev, damage)| {
-                                    crate::backing::NativeCpuCapture {
-                                        revision: *rev,
-                                        damage: *damage,
-                                    }
-                                }),
-                                native_pixels: cpu.map(|(pixels, _, _)| pixels),
-                                native_dmabuf: dma.as_ref().map(|(p, _)| std::sync::Arc::clone(p)),
-                                native_dma_sample: sample,
-                                native_revision: revision,
-                            });
-                        }
-                        index += 1;
-                        x += width;
-                    }
-                    y += height;
+                let cropped = crate::backing::Rect {
+                    x: i64::from(part.x) - i64::from(frame.x),
+                    y: i64::from(part.y) - i64::from(frame.y),
+                    width: i64::from(width),
+                    height: i64::from(height),
+                };
+                let cpu = crate::backing::native_scene_pixels_cropped_with_damage(
+                    view,
+                    frame.width,
+                    frame.height,
+                    cropped,
+                );
+                // A DMA source remains one coherent GPU image. A CPU
+                // tile never borrows a DMA producer's unrelated frame.
+                if cpu.is_some() || dma.is_some() {
+                    let sample = dma.as_ref().map(|_| {
+                        (
+                            frame.width,
+                            frame.height,
+                            cropped.x as u32,
+                            cropped.y as u32,
+                        )
+                    });
+                    // Moving a large static DMA view can keep the
+                    // visible output frame unchanged while changing
+                    // which producer texels are sampled.
+                    let revision = cpu.as_ref().map_or(0, |(_, rev, _)| *rev)
+                        ^ dma.as_ref().map_or(0, |(_, rev)| rev.rotate_left(19))
+                        ^ sample.map_or(0, |(w, h, x, y)| {
+                            (u64::from(w) << 32 | u64::from(h)).rotate_left(11)
+                                ^ (u64::from(x) << 32 | u64::from(y)).rotate_left(37)
+                        });
+                    scene.push(MetalSceneLayer {
+                        opacity_groups: opacity_groups.clone(),
+                        layer: native_tile_id(view, index),
+                        native_owner: view as usize,
+                        frame: part,
+                        opacity: source_view_alpha * layer_opacity,
+                        opaque: false,
+                        clip: ca_clip,
+                        rounded: rounded.clone(),
+                        occluded: Vec::new(),
+                        native_cpu_capture: cpu.as_ref().map(|(_, rev, damage)| {
+                            crate::backing::NativeCpuCapture {
+                                revision: *rev,
+                                damage: *damage,
+                            }
+                        }),
+                        native_pixels: cpu.map(|(pixels, _, _)| pixels),
+                        native_dmabuf: dma.as_ref().map(|(p, _)| std::sync::Arc::clone(p)),
+                        native_dma_sample: sample,
+                        native_revision: revision,
+                    });
                 }
+                index += 1;
+                x += width;
             }
+            y += height;
         }
     }
     for child in child_views {
@@ -1306,10 +1293,10 @@ fn publish_metal_scene_at(sdl: sdl3::Window, now: f64, force: bool) {
     let differs = changed
         .as_ref()
         .is_none_or(|old| !same_metal_scene(old, &scene));
-    if differs || force {
-        if let Some(hook) = METAL_SCENE_CHANGED.get() {
-            hook(sdl, scene);
-        }
+    if (differs || force)
+        && let Some(hook) = METAL_SCENE_CHANGED.get()
+    {
+        hook(sdl, scene);
     }
 }
 
@@ -4367,7 +4354,7 @@ mod tests {
             .expect("non-view CALayer child missing above Metal drawable");
         assert_eq!(native.native_owner, metal_view as usize);
         let before = native.native_pixels.as_ref().unwrap();
-        assert!(before.chunks_exact(4).any(|pixel| pixel[3] != 0));
+        assert!(before.as_chunks::<4>().0.iter().any(|pixel| pixel[3] != 0));
         let full = crate::backing::metal_sublayers_pixels_cropped(
             metal_view,
             100,
@@ -4382,7 +4369,7 @@ mod tests {
         .expect("full retained CA raster")
         .0;
         assert!(
-            full.chunks_exact(4).any(|pixel| pixel[3] == 0),
+            full.as_chunks::<4>().0.iter().any(|pixel| pixel[3] == 0),
             "root Metal background must not be rasterized over its drawable"
         );
         let original_revision = native.native_revision;
@@ -4436,7 +4423,9 @@ mod tests {
             .native_pixels
             .as_ref()
             .unwrap()
-            .chunks_exact(4)
+            .as_chunks::<4>()
+            .0
+            .iter()
             .map(|pixel| pixel[3])
             .max()
             .unwrap();
@@ -4515,7 +4504,9 @@ mod tests {
                 .native_pixels
                 .as_ref()
                 .unwrap()
-                .chunks_exact(4)
+                .as_chunks::<4>()
+                .0
+                .iter()
                 .any(|px| px[3] > 0)
         );
         unsafe {
@@ -4618,18 +4609,20 @@ mod tests {
                 .map(|item| item.native_owner)
                 .collect::<Vec<_>>();
             assert_eq!(owners, expected);
-            let colors = scene
+
+            scene
                 .iter()
                 .skip(1)
                 .filter_map(|item| item.native_pixels.as_ref())
                 .map(|data| {
-                    data.chunks_exact(4)
+                    data.as_chunks::<4>()
+                        .0
+                        .iter()
                         .find(|p| p[3] == 255)
                         .map(|pixel| pixel.to_vec())
                         .unwrap()
                 })
-                .collect::<Vec<_>>();
-            colors
+                .collect::<Vec<_>>()
         };
         assert_eq!(
             verify(&[metal_view as usize, blue_view as usize, metal_view as usize]),
@@ -4749,7 +4742,9 @@ mod tests {
                 .native_pixels
                 .as_ref()
                 .unwrap()
-                .chunks_exact(4)
+                .as_chunks::<4>()
+                .0
+                .iter()
                 .find(|px| px[3] != 0)
                 .unwrap();
             assert_eq!(pixel[3], 255, "CPU capture premultiplied GPU group alpha");
@@ -4997,7 +4992,7 @@ mod tests {
         unsafe { set(ca, objc::sel::get("setBackgroundColor:"), opaque as Id) };
         let image = crate::backing::native_scene_pixels(large, 3840, 2160)
             .expect("a changed opaque CA layer must invalidate empty cache");
-        assert!(image.0.chunks_exact(4).any(|pixel| pixel[3] != 0));
+        assert!(image.0.as_chunks::<4>().0.iter().any(|pixel| pixel[3] != 0));
         assert_eq!(crate::backing::native_render_count_for_tests() - before, 2);
         unsafe { set(ca, objc::sel::get("setBackgroundColor:"), transparent as Id) };
         assert!(crate::backing::native_scene_pixels(large, 3840, 2160).is_none());
@@ -7051,7 +7046,7 @@ mod native_partial_draw_regression {
         match DRAW_PHASE.load(Ordering::Relaxed) {
             0 => {
                 assert!(crate::backing::draw_focused(|pixels, width, height| {
-                    for pixel in pixels.chunks_exact_mut(4) {
+                    for pixel in pixels.as_chunks_mut::<4>().0.iter_mut() {
                         pixel.copy_from_slice(&[255, 0, 0, 255]);
                     }
                     Some(crate::backing::Rect {

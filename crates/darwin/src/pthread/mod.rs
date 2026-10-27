@@ -130,6 +130,7 @@ mod thread_ids {
         None
     }
 
+    #[cfg_attr(target_os = "macos", allow(dead_code))]
     pub fn get(thread: u64) -> Option<u32> {
         let start = thread as usize % CAPACITY;
         for offset in 0..CAPACITY {
@@ -603,16 +604,26 @@ pub extern "C" fn jit_write_protect_np(enabled: i32) {
     let _ = enabled;
 }
 
-/// Non-zero on the thread that ran `main`. Answered by comparing thread ids rather
-/// than by asking libpthread, which has no such call here.
+/// Non-zero on the thread that ran `main`. On macOS the host libpthread knows
+/// that thread; other hosts compare against a process-start constructor ID.
 pub unsafe extern "C" fn main_np() -> i32 {
-    use static_init::dynamic;
+    #[cfg(target_os = "macos")]
+    {
+        // A constructor in a shared library or a libtest harness may first
+        // evaluate a lazy static on a worker, not on the process main thread.
+        // SAFETY: querying the current thread takes no arguments or pointers.
+        unsafe { libc::pthread_main_np() }
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        use static_init::dynamic;
 
-    // static_init::dynamic is a necessity here because it runs on the main thread always as a constructor
-    #[dynamic]
-    static MAIN: u32 = id();
+        // Capture the process main thread before arbitrary workers start.
+        #[dynamic]
+        static MAIN: u32 = id();
 
-    i32::from(*MAIN == id())
+        i32::from(*MAIN == id())
+    }
 }
 
 pub unsafe extern "C" fn cpu_number_np(out: u64) -> i32 {

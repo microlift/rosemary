@@ -300,7 +300,7 @@ pub(crate) fn render_tile(
     let mut pixels = tile.rgba.clone();
     if !p.colored {
         // An uncoloured pattern is a stencil: its coverage in the colour given.
-        for pixel in pixels.chunks_exact_mut(4) {
+        for pixel in pixels.as_chunks_mut::<4>().0.iter_mut() {
             let a = f64::from(pixel[3]) / 255.0 * color[3].clamp(0.0, 1.0);
             let c = |v: f64| (v.clamp(0.0, 1.0) * a * 255.0).round() as u8;
             pixel.copy_from_slice(&[
@@ -312,7 +312,7 @@ pub(crate) fn render_tile(
         }
     }
     if swap {
-        for pixel in pixels.chunks_exact_mut(4) {
+        for pixel in pixels.as_chunks_mut::<4>().0.iter_mut() {
             pixel.swap(0, 2);
         }
     }

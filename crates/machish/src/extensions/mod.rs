@@ -134,6 +134,11 @@ impl<S: MachSpec> ExtensionSet<S> {
     }
 }
 
+#[cfg(any(
+    feature = "ext-initializers",
+    feature = "ext-tlv",
+    feature = "ext-interpose"
+))]
 pub(crate) fn read_words(mem: &dyn AddressSpace, at: Word, count: usize) -> Result<Vec<Word>> {
     let mut out = Vec::with_capacity(count.min(1024));
     for i in 0..count {

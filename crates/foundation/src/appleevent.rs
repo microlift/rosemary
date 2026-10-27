@@ -995,6 +995,9 @@ unsafe fn dispatch_to_c(event: Id, reply: Id, event_class: u32, event_id: u32) {
 /// `OSErr AEInstallEventHandler(AEEventClass, AEEventID, AEEventHandlerUPP,
 /// SRefCon, Boolean isSysHandler)`
 #[allow(non_snake_case)]
+/// # Safety
+///
+/// `handler` must be a callable Apple Event callback with the expected ABI when invoked.
 pub unsafe extern "C" fn AEInstallEventHandler(
     event_class: u32,
     event_id: u32,
@@ -1019,6 +1022,9 @@ pub unsafe extern "C" fn AEInstallEventHandler(
 /// `OSErr AERemoveEventHandler(AEEventClass, AEEventID, AEEventHandlerUPP,
 /// Boolean isSysHandler)`
 #[allow(non_snake_case)]
+/// # Safety
+///
+/// A nonzero `handler` must identify the callback previously registered for this event.
 pub unsafe extern "C" fn AERemoveEventHandler(
     event_class: u32,
     event_id: u32,
@@ -1039,6 +1045,9 @@ pub unsafe extern "C" fn AERemoveEventHandler(
 
 /// `OSErr AECreateDesc(DescType, const void *, Size, AEDesc *)`
 #[allow(non_snake_case)]
+/// # Safety
+///
+/// `bytes` must cover `size` readable bytes when `size` is positive; `out` must be writable for an `AeDesc`.
 pub unsafe extern "C" fn AECreateDesc(
     kind: u32,
     bytes: *const u8,
@@ -1065,6 +1074,9 @@ pub unsafe extern "C" fn AECreateDesc(
 
 /// `OSErr AEDisposeDesc(AEDesc *)`, which leaves the null descriptor behind.
 #[allow(non_snake_case)]
+/// # Safety
+///
+/// `desc` must reference a writable initialized `AeDesc` with a valid owned descriptor handle.
 pub unsafe extern "C" fn AEDisposeDesc(desc: *mut AeDesc) -> i16 {
     if desc.is_null() {
         return PARAM_ERR;
@@ -1082,6 +1094,9 @@ pub unsafe extern "C" fn AEDisposeDesc(desc: *mut AeDesc) -> i16 {
 
 /// `Size AEGetDescDataSize(const AEDesc *)`
 #[allow(non_snake_case)]
+/// # Safety
+///
+/// `desc` must refer to a readable initialized `AeDesc` when non-null.
 pub unsafe extern "C" fn AEGetDescDataSize(desc: *const AeDesc) -> isize {
     // SAFETY: the caller's `AEDesc`.
     let handle = match desc.is_null() {
@@ -1093,6 +1108,9 @@ pub unsafe extern "C" fn AEGetDescDataSize(desc: *const AeDesc) -> isize {
 
 /// `OSErr AEGetDescData(const AEDesc *, void *, Size)`: as much as fits.
 #[allow(non_snake_case)]
+/// # Safety
+///
+/// `desc` must refer to an initialized `AeDesc`, and `out` must have room for `max` bytes when non-null.
 pub unsafe extern "C" fn AEGetDescData(desc: *const AeDesc, out: *mut u8, max: isize) -> i16 {
     if desc.is_null() || (out.is_null() && max > 0) {
         return PARAM_ERR;

@@ -2568,7 +2568,7 @@ mod tests {
         let (pixels, width, height) =
             button_surface(button, frame, false).expect("bordered buttons have a bezel");
         assert_eq!((width, height), (24, 16));
-        assert!(pixels.chunks_exact(4).any(|pixel| pixel[3] != 0));
+        assert!(pixels.as_chunks::<4>().0.iter().any(|pixel| pixel[3] != 0));
 
         // SAFETY: the selector is registered above and receives a live button cell,
         // a CGRect, and the NSButton that owns that cell.

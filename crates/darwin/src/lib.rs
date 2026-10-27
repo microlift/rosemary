@@ -26,6 +26,7 @@ pub mod accounts;
 #[cfg(not(target_os = "macos"))]
 pub mod acl;
 pub mod appmailbox;
+#[cfg(not(target_os = "macos"))]
 mod asl;
 mod atomics;
 pub mod attrlist;
@@ -201,12 +202,10 @@ fn load_host_libraries() {
     {
         static ONCE: std::sync::Once = std::sync::Once::new();
         ONCE.call_once(|| {
-            for soname in [c"libm.so.6"] {
-                // SAFETY: a soname the dynamic loader resolves, opened globally
-                // so its exports join the default search, and never closed.
-                unsafe {
-                    libc::dlopen(soname.as_ptr(), libc::RTLD_LAZY | libc::RTLD_GLOBAL);
-                }
+            // SAFETY: a soname the dynamic loader resolves, opened globally
+            // so its exports join the default search, and never closed.
+            unsafe {
+                libc::dlopen(c"libm.so.6".as_ptr(), libc::RTLD_LAZY | libc::RTLD_GLOBAL);
             }
         });
     }

@@ -404,13 +404,12 @@ mod tests {
 
     #[test]
     fn a_nested_boundary_leaves_the_array_installed() {
-        let outer = DarwinThread::enter();
+        let _outer = DarwinThread::enter();
         assert!(entered());
         {
             let _inner = DarwinThread::enter();
         }
         assert!(entered(), "the inner boundary took the array away");
-        drop(outer);
     }
 
     #[test]
@@ -436,9 +435,10 @@ mod tests {
     #[test]
     fn entering_darwin_code_leaves_the_host_s_own_thread_pointer_alone() {
         let before = host_thread_pointer();
-        let guard = DarwinThread::enter();
-        assert_eq!(host_thread_pointer(), before);
-        drop(guard);
+        {
+            let _guard = DarwinThread::enter();
+            assert_eq!(host_thread_pointer(), before);
+        }
         assert_eq!(host_thread_pointer(), before);
     }
 
