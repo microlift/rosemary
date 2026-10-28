@@ -1504,6 +1504,13 @@ pub static SIGNATURES: &[FunctionAbi] = &[
     sig!("SecItemUpdate", I32, P, P),
     sig!("SecCertificateCreateWithData", P, P, P),
     sig!("SecPolicyCreateBasicX509", P),
+    sig!("SecPolicyCreateSSL", P, U8, P),
+    sig!("SecTrustSetVerifyDate", I32, P, P),
+    sig!("SecTrustSetOCSPResponse", I32, P, P),
+    sig!("SecCopyErrorMessageString", P, I32, P),
+    sig!("SecTrustEvaluateWithError", U8, P, P),
+    sig!("SecTrustSetAnchorCertificates", I32, P, P),
+    sig!("SecTrustSetAnchorCertificatesOnly", I32, P, U8),
     sig!("SecTrustCreateWithCertificates", I32, P, P, P),
     sig!("SecTrustSetOptions", I32, P, U32),
     sig!("SecTrustEvaluate", I32, P, P),
@@ -1533,6 +1540,7 @@ pub static SIGNATURES: &[FunctionAbi] = &[
     // validates anything, and copies each certificate's DER out to hand to
     // whichever TLS implementation it was built against.
     sig!("SecCertificateCopyData", P, P),
+    sig!("SecCertificateCopySubjectSummary", P, P),
     sig!("SecCertificateGetData", I32, P, P),
     sig!("SecKeychainItemCopyContent", I32, P, P, P, P, P),
     sig!("SecKeychainItemFreeContent", I32, P, P),
