@@ -2,6 +2,8 @@ use std::ffi::c_void;
 
 pub mod bootstrap;
 pub mod clock;
+#[cfg(target_os = "linux")]
+mod credits;
 pub mod entry;
 pub mod info;
 pub mod kern;

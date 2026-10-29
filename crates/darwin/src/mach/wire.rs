@@ -1,4 +1,6 @@
 use std::ffi::c_int;
+#[cfg(target_os = "linux")]
+use std::os::fd::AsRawFd;
 use std::sync::Mutex;
 
 /// A port's address: the socket name is derived from it and nothing
@@ -493,7 +495,7 @@ pub const MAX_FDS: usize = 252;
 
 fn control_len() -> usize {
     // SAFETY: `CMSG_SPACE` is arithmetic on its argument.
-    unsafe { libc::CMSG_SPACE((MAX_FDS * core::mem::size_of::<c_int>()) as u32) as usize }
+    unsafe { libc::CMSG_SPACE(((MAX_FDS + 1) * core::mem::size_of::<c_int>()) as u32) as usize }
 }
 
 /// Send `bytes` to `destination`, moving `fds` with it.
@@ -515,6 +517,28 @@ pub fn send(destination: Address, bytes: &[u8], fds: &[c_int]) -> std::io::Resul
     if fds.len() > MAX_FDS {
         return Err(std::io::Error::from_raw_os_error(libc::EMSGSIZE));
     }
+
+    #[cfg(target_os = "linux")]
+    let credit = if fds.is_empty() {
+        None
+    } else {
+        Some(super::credits::reserve(fds.len() + 1)?)
+    };
+    #[cfg(target_os = "linux")]
+    let envelope = credit
+        .as_ref()
+        .map(|_| [super::credits::HEADER.as_slice(), bytes].concat());
+    #[cfg(target_os = "linux")]
+    let bytes = envelope.as_deref().unwrap_or(bytes);
+    #[cfg(target_os = "linux")]
+    let credited_fds = credit.as_ref().map(|token| {
+        let mut carried = Vec::with_capacity(fds.len() + 1);
+        carried.push(token.as_raw_fd());
+        carried.extend_from_slice(fds);
+        carried
+    });
+    #[cfg(target_os = "linux")]
+    let fds = credited_fds.as_deref().unwrap_or(fds);
 
     let (addr, addr_len) = sockaddr(destination)?;
     let mut iov = libc::iovec {
@@ -566,7 +590,7 @@ pub fn send(destination: Address, bytes: &[u8], fds: &[c_int]) -> std::io::Resul
 
 /// Take one datagram from `fd`, with any descriptors that came with it.
 fn receive_from(fd: c_int) -> std::io::Result<Option<Datagram>> {
-    let mut bytes = vec![0u8; MAX_MESSAGE];
+    let mut bytes = vec![0u8; MAX_MESSAGE + 8];
     let mut control = vec![0u8; control_len()];
     let mut iov = libc::iovec {
         iov_base: bytes.as_mut_ptr().cast(),
@@ -627,12 +651,60 @@ fn receive_from(fd: c_int) -> std::io::Result<Option<Datagram>> {
         }
     }
     bytes.truncate(received);
+    #[cfg(target_os = "linux")]
+    if bytes.starts_with(super::credits::HEADER) {
+        if fds.is_empty() || msg.msg_flags & (libc::MSG_CTRUNC | libc::MSG_TRUNC) != 0 {
+            for fd in fds {
+                unsafe { libc::close(fd) };
+            }
+            return Err(std::io::Error::from_raw_os_error(libc::EBADMSG));
+        }
+        // recvmsg has removed these rights from the kernel's in-flight count.
+        unsafe { libc::close(fds.remove(0)) };
+        bytes.drain(..super::credits::HEADER.len());
+    }
     Ok(Some(Datagram { bytes, fds }))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn descriptor_budget_is_shared_across_ports_and_recovers_after_drain() {
+        let file = std::fs::File::open("/dev/null").unwrap();
+        let mut ports = Vec::new();
+        loop {
+            let port = Receiver::bind().unwrap();
+            match send(port.address(), b"rights", &[file.as_raw_fd()]) {
+                Ok(()) => ports.push(port),
+                Err(error) => {
+                    assert_eq!(error.raw_os_error(), Some(libc::EAGAIN));
+                    assert_eq!(
+                        super::super::kern::send_failure(libc::EAGAIN),
+                        super::super::kern::MACH_SEND_NO_BUFFER
+                    );
+                    send(port.address(), b"no rights", &[]).unwrap();
+                    assert_eq!(port.receive(100).unwrap().unwrap().bytes, b"no rights");
+                    break;
+                }
+            }
+            assert!(ports.len() <= 128, "descriptor budget was bypassed");
+        }
+        assert!(!ports.is_empty());
+        for port in &ports {
+            let message = port.receive(100).unwrap().unwrap();
+            assert_eq!(message.bytes, b"rights");
+            assert_eq!(
+                message.fds.len(),
+                1,
+                "transport credit escaped to the guest"
+            );
+        }
+        send(ports[0].address(), b"again", &[file.as_raw_fd()]).unwrap();
+        assert_eq!(ports[0].receive(100).unwrap().unwrap().bytes, b"again");
+    }
 
     #[test]
     fn a_message_sent_to_a_bound_port_arrives_whole() {
