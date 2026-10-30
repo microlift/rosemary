@@ -133,6 +133,106 @@ unsafe extern "C" fn thread_dictionary(receiver: Id, _sel: Sel) -> Id {
     dictionary as Id
 }
 
+/// What an `NSThread` holds besides its dictionary, beside the object for the
+/// same reason [`thread_dictionary`] is.
+struct Attributes {
+    /// `threadPriority`, 0.0 to 1.0. This host's default scheduler has no
+    /// static priorities for an unprivileged process to map the range onto, so
+    /// the value is the thread's to read back rather than a scheduling change.
+    priority: f64,
+    /// `name`, a retained copy, or null.
+    name: usize,
+    /// `qualityOfService`, an `NSQualityOfService`.
+    quality: i64,
+}
+
+impl Default for Attributes {
+    fn default() -> Attributes {
+        Attributes {
+            // The documented default.
+            priority: 0.5,
+            name: 0,
+            // `NSQualityOfServiceDefault`.
+            quality: -1,
+        }
+    }
+}
+
+fn with_attributes<R>(thread: Id, f: impl FnOnce(&mut Attributes) -> R) -> R {
+    static ATTRIBUTES: std::sync::Mutex<Vec<(usize, Attributes)>> =
+        std::sync::Mutex::new(Vec::new());
+    let mut all = ATTRIBUTES.lock().unwrap_or_else(|e| e.into_inner());
+    let index = match all.iter().position(|(t, _)| *t == thread as usize) {
+        Some(index) => index,
+        None => {
+            all.push((thread as usize, Attributes::default()));
+            all.len() - 1
+        }
+    };
+    f(&mut all[index].1)
+}
+
+unsafe extern "C" fn thread_priority(receiver: Id, _sel: Sel) -> f64 {
+    with_attributes(receiver, |a| a.priority)
+}
+
+unsafe extern "C" fn set_thread_priority(receiver: Id, _sel: Sel, priority: f64) {
+    with_attributes(receiver, |a| a.priority = priority.clamp(0.0, 1.0));
+}
+
+/// `+threadPriority`: the calling thread's.
+unsafe extern "C" fn current_priority(_class: Id, _sel: Sel) -> f64 {
+    with_attributes(current(), |a| a.priority)
+}
+
+/// `+setThreadPriority:`, which answers whether the assignment took.
+unsafe extern "C" fn set_current_priority(_class: Id, _sel: Sel, priority: f64) -> bool {
+    with_attributes(current(), |a| a.priority = priority.clamp(0.0, 1.0));
+    true
+}
+
+unsafe extern "C" fn name(receiver: Id, _sel: Sel) -> Id {
+    with_attributes(receiver, |a| a.name as Id)
+}
+
+/// `-setName:`, a copy. Naming the calling thread names it to the system too,
+/// as Foundation does with `pthread_setname_np`, so a debugger or crash report
+/// shows it.
+unsafe extern "C" fn set_name(receiver: Id, _sel: Sel, name: Id) {
+    // SAFETY: the caller's string, or nil.
+    let text =
+        unsafe { corefoundation::string::as_string(name as corefoundation::base::CFTypeRef) }
+            .map(|s| String::from_utf16_lossy(&s.utf16()));
+    let copy = match &text {
+        Some(text) => crate::string::from_str(text),
+        None => objc::arc::retain(name),
+    };
+    let old = with_attributes(receiver, |a| std::mem::replace(&mut a.name, copy as usize));
+    objc::arc::release(old as Id);
+    if receiver != current() {
+        return;
+    }
+    if let Some(text) = text {
+        // The host keeps fifteen bytes and a NUL; cut on a character boundary.
+        let mut end = text.len().min(15);
+        while !text.is_char_boundary(end) {
+            end -= 1;
+        }
+        if let Ok(c) = std::ffi::CString::new(&text[..end]) {
+            // SAFETY: the calling thread and a NUL-terminated name.
+            unsafe { libc::pthread_setname_np(libc::pthread_self(), c.as_ptr()) };
+        }
+    }
+}
+
+unsafe extern "C" fn quality_of_service(receiver: Id, _sel: Sel) -> i64 {
+    with_attributes(receiver, |a| a.quality)
+}
+
+unsafe extern "C" fn set_quality_of_service(receiver: Id, _sel: Sel, quality: i64) {
+    with_attributes(receiver, |a| a.quality = quality);
+}
+
 pub(crate) fn install() {
     let class = objc::class::lookup(c"NSThread").expect("declared abstract by this crate");
     class_methods!(class, {
@@ -142,9 +242,17 @@ pub(crate) fn install() {
         "isMainThread" => is_main_thread, c"B16@0:8";
         "currentThread" => current_thread, c"@16@0:8";
         "mainThread" => main_thread, c"@16@0:8";
+        "threadPriority" => current_priority, c"d16@0:8";
+        "setThreadPriority:" => set_current_priority, c"B24@0:8d16";
     });
     methods!(class, {
         "isMainThread" => is_main_thread, c"B16@0:8";
         "threadDictionary" => thread_dictionary, c"@16@0:8";
+        "threadPriority" => thread_priority, c"d16@0:8";
+        "setThreadPriority:" => set_thread_priority, c"v24@0:8d16";
+        "name" => name, c"@16@0:8";
+        "setName:" => set_name, c"v24@0:8@16";
+        "qualityOfService" => quality_of_service, c"q16@0:8";
+        "setQualityOfService:" => set_quality_of_service, c"v24@0:8q16";
     });
 }
