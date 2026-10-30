@@ -1365,7 +1365,11 @@ fn dump_frame(pixels: &[u8], width: u32, height: u32, format: vk::Format) {
         .and_then(|value| value.trim().parse::<u64>().ok())
         .filter(|interval| *interval > 0)
         .unwrap_or(30);
-    if !frame.is_multiple_of(interval) {
+    let limit = std::env::var("ROSEMARY_FRAME_LIMIT")
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .unwrap_or(8);
+    if !capture_due(frame, interval, limit) {
         return;
     }
     let directory = std::path::PathBuf::from(directory);
@@ -1382,7 +1386,36 @@ fn dump_frame(pixels: &[u8], width: u32, height: u32, format: vk::Format) {
             false => out.extend_from_slice(&[texel[0], texel[1], texel[2]]),
         }
     }
-    let _ = std::fs::write(directory.join(format!("frame-{frame:06}.ppm")), out);
+    let _ = std::fs::write(
+        directory.join(format!("frame-{}-{frame:06}.ppm", std::process::id())),
+        out,
+    );
+}
+
+// Count scheduled captures, not bytes or successful writes, to bound work too.
+fn capture_due(frame: u64, interval: u64, limit: u64) -> bool {
+    interval != 0 && frame.is_multiple_of(interval) && frame / interval < limit
+}
+
+#[cfg(test)]
+mod capture_tests {
+    use super::capture_due;
+
+    #[test]
+    fn capture_limit_includes_first_frame_and_excludes_boundary() {
+        assert!(capture_due(0, 30, 2));
+        assert!(!capture_due(1, 30, 2));
+        assert!(capture_due(30, 30, 2));
+        assert!(!capture_due(60, 30, 2));
+    }
+
+    #[test]
+    fn disabled_and_extreme_capture_settings_are_bounded() {
+        assert!(!capture_due(0, 30, 0));
+        assert!(!capture_due(0, 0, 8));
+        assert!(capture_due(u64::MAX, u64::MAX, 2));
+        assert!(!capture_due(u64::MAX, 1, u64::MAX));
+    }
 }
 
 /// Source interval surviving both physical SDL bounds and the smaller logical
