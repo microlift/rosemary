@@ -426,6 +426,7 @@ fn launch(path: OsString, options: &RunOptions, args: Vec<OsString>) -> ExitCode
     };
     let path = path.as_str();
     rosemary::shims::runtime::set_executable_path(std::path::Path::new(path));
+    rosemary::fault::set_program(std::path::Path::new(path));
     rosemary::frameworks::set_main_bundle(std::path::Path::new(path));
     if rosemary::bundle::enclosing(std::path::Path::new(path)).is_some() {
         darwin::env::launch_as_app();

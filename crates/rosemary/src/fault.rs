@@ -220,6 +220,35 @@ pub fn for_each_placed(mut f: impl FnMut(&PlacedRegion, &[GuestCodeRange])) {
 /// Whether [`install`] has run. Handlers are process-wide.
 static INSTALLED: AtomicBool = AtomicBool::new(false);
 
+/// The program's file name, for the report's first line: a program of
+/// several processes - a browser and its helpers - writes every helper's
+/// report to the one terminal, and a report that does not say whose it is
+/// cannot be acted on. Set once before guest code runs, so the handler only
+/// ever reads it.
+static PROGRAM: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+/// Name the program this process runs, for [`PROGRAM`].
+pub fn set_program(executable: &std::path::Path) {
+    let name = executable
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| executable.display().to_string());
+    let _ = PROGRAM.set(name);
+}
+
+/// ` in <program> (pid N)`. Async-signal-safe: an already-set `OnceLock` is
+/// an atomic load, and `getpid` is on the list.
+fn say_process(out: &mut Buffer) {
+    if let Some(program) = PROGRAM.get() {
+        out.str(" in ");
+        out.str(program);
+    }
+    out.str(" (pid ");
+    // SAFETY: no arguments.
+    out.dec(unsafe { libc::getpid() } as u64);
+    out.str(")");
+}
+
 /// Longest image name the report keeps. `libmonobdwgc-2.0.dylib` is 23.
 const NAME: usize = 48;
 
@@ -332,13 +361,27 @@ pub fn install() {
     // Rust runtime gave it.
     install_alternate_stack();
     keep_the_fault_signals();
+    BACKTRACE.store(
+        std::env::var_os(FAULT_BACKTRACE_ENV).is_some_and(|v| v != "0"),
+        Ordering::Relaxed,
+    );
     // `SIGABRT` beside the two faults, because the allocator is the third way a
     // program of this size dies and the only one that used to leave no report at
     // all: glibc's `free(): invalid size` goes to stderr and then straight to
     // `abort`, with no pc, no image and no registers. The handler restores the
     // previous disposition and returns, so the abort still happens - this only
     // adds the sentence in front of it.
-    for signal in [libc::SIGSEGV, libc::SIGBUS, libc::SIGABRT] {
+    // `SIGILL` and `SIGTRAP` for the trap a compiler plants: `IMMEDIATE_CRASH`,
+    // `__builtin_trap` and a failed `CHECK` are an `int3` and a `ud2`, and a
+    // translation runs them as the host instructions they are - so without
+    // these a program's own assertion ended the process with no guest pc.
+    for signal in [
+        libc::SIGSEGV,
+        libc::SIGBUS,
+        libc::SIGABRT,
+        libc::SIGILL,
+        libc::SIGTRAP,
+    ] {
         // SAFETY: `action` and `old` are live locals of the right type;
         // `sa_sigaction` holds a handler with the `SA_SIGINFO` signature, which
         // is what `SA_SIGINFO` in the flags declares it to be. Installing a
@@ -382,11 +425,29 @@ pub fn install() {
 /// recovers from a fault by design does not survive having its handler ignored.
 pub const KEEP_FAULT_HANDLER_ENV: &str = "ROSEMARY_KEEP_FAULT_HANDLER";
 
+/// Set to add the whole frame-pointer chain to a report: every return
+/// address, and the image or translation each is in.
+///
+/// For a fault whose cause is some frames above the guest frame
+/// [`say_caller`] names - a fatal error raised from a callback, say, which
+/// is reached through code that is not the program's.
+pub const FAULT_BACKTRACE_ENV: &str = "ROSEMARY_FAULT_BACKTRACE";
+
+/// [`FAULT_BACKTRACE_ENV`], read once at [`install`], since a handler should
+/// not be reading the environment.
+static BACKTRACE: AtomicBool = AtomicBool::new(false);
+
 fn keep_the_fault_signals() {
     if !std::env::var_os(KEEP_FAULT_HANDLER_ENV).is_some_and(|v| v != "0") {
         return;
     }
-    for signal in [libc::SIGSEGV, libc::SIGBUS, libc::SIGABRT, libc::SIGILL] {
+    for signal in [
+        libc::SIGSEGV,
+        libc::SIGBUS,
+        libc::SIGABRT,
+        libc::SIGILL,
+        libc::SIGTRAP,
+    ] {
         // The registry is keyed by Darwin's numbering, which is what the guest's
         // `sigaction` is given. `SIGBUS` is 10 there and 7 here.
         if let Some(darwin) = darwin::signal::signal_from_host(signal) {
@@ -395,8 +456,8 @@ fn keep_the_fault_signals() {
     }
     darwin::signal::retain_altstack();
     eprintln!(
-        "rosemary: the guest's own handlers for SIGSEGV, SIGBUS, SIGABRT and SIGILL will be \
-         accepted and ignored ({KEEP_FAULT_HANDLER_ENV} is set)"
+        "rosemary: the guest's own handlers for SIGSEGV, SIGBUS, SIGABRT, SIGILL and SIGTRAP \
+         will be accepted and ignored ({KEEP_FAULT_HANDLER_ENV} is set)"
     );
 }
 
@@ -463,11 +524,15 @@ const fn saved() -> Saved {
 static SEGV: Saved = saved();
 static BUS: Saved = saved();
 static ABRT: Saved = saved();
+static ILL: Saved = saved();
+static TRAP: Saved = saved();
 
 fn saved_for(signal: i32) -> &'static Saved {
     match signal {
         libc::SIGBUS => &BUS,
         libc::SIGABRT => &ABRT,
+        libc::SIGILL => &ILL,
+        libc::SIGTRAP => &TRAP,
         _ => &SEGV,
     }
 }
@@ -616,19 +681,64 @@ extern "C" fn report(signal: i32, info: *mut libc::siginfo_t, context: *mut libc
             libc::SIGBUS => "SIGBUS",
             libc::SIGSEGV => "SIGSEGV",
             libc::SIGABRT => "SIGABRT",
+            libc::SIGILL => "SIGILL",
+            libc::SIGTRAP => "SIGTRAP",
             _ => "signal",
         });
+        say_process(&mut line);
         line.str(" on thread ");
         line.hex(me as u32 as u64);
         line.str(" at host pc ");
         line.hex(host_pc(context).unwrap_or(0));
         line.str(" - another thread is reporting its own fault first\n");
         line.flush();
+        // Restoring the default disposition and returning re-raises this
+        // fault with nothing to catch it, which takes the process down while
+        // the first thread is still writing - so its report never arrived.
+        // Wait for it, a bounded time: a reporter that hung must not keep the
+        // process alive. `nanosleep` is async-signal-safe.
+        let pause = libc::timespec {
+            tv_sec: 0,
+            tv_nsec: 1_000_000,
+        };
+        for _ in 0..5_000 {
+            if !REPORTING.load(Ordering::SeqCst) {
+                break;
+            }
+            // SAFETY: a live `timespec`, and no remainder is asked for.
+            unsafe { libc::nanosleep(&pause, std::ptr::null_mut()) };
+        }
         restore(signal);
         return;
     }
     REPORTER.store(me, Ordering::SeqCst);
 
+    // On a stack of the handler's own: the one the kernel picked is whatever
+    // alternate stack this thread has, and a thread std started has eight
+    // kilobytes, which an unoptimized report overflows - taking the report
+    // with it. `REPORTING` makes this thread the stack's only user.
+    let mut args = (signal, info, context);
+    // SAFETY: a live tuple of `compose`'s arguments, read before it returns.
+    unsafe { on_report_stack(compose_from, (&raw mut args).cast()) };
+
+    // Handed back, so that a later fault - a different one, on any thread -
+    // gets a report of its own rather than the line above.
+    REPORTER.store(0, Ordering::SeqCst);
+    REPORTING.store(false, Ordering::SeqCst);
+    restore(signal);
+}
+
+/// [`compose`], for [`on_report_stack`], with its arguments behind `raw`.
+unsafe extern "C" fn compose_from(raw: *mut libc::c_void) {
+    // SAFETY: the caller's `(signal, info, context)`, live for this call.
+    let (signal, info, context) =
+        unsafe { *raw.cast::<(i32, *mut libc::siginfo_t, *mut libc::c_void)>() };
+    compose(signal, info, context);
+}
+
+/// Build the report into [`REPORT`] and print it. Only the thread that holds
+/// `report`'s `REPORTING` calls this.
+fn compose(signal: i32, info: *mut libc::siginfo_t, context: *mut libc::c_void) {
     // SAFETY: the swap above is what makes this the only writer - every other
     // entry to the handler takes the branch that only reads it, and does so on
     // its way out of the process.
@@ -640,8 +750,11 @@ extern "C" fn report(signal: i32, info: *mut libc::siginfo_t, context: *mut libc
         libc::SIGBUS => "SIGBUS",
         libc::SIGSEGV => "SIGSEGV",
         libc::SIGABRT => "SIGABRT",
+        libc::SIGILL => "SIGILL",
+        libc::SIGTRAP => "SIGTRAP",
         _ => "signal",
     });
+    say_process(out);
 
     // SAFETY: the kernel passes a live `siginfo_t` for the duration of the
     // handler; `si_addr` is the faulting address for both signals handled here.
@@ -698,17 +811,101 @@ extern "C" fn report(signal: i32, info: *mut libc::siginfo_t, context: *mut libc
     else if signal == libc::SIGABRT {
         say_caller(out, context);
     }
+    if BACKTRACE.load(Ordering::Relaxed) {
+        say_backtrace(out, context);
+    }
 
     stage(6);
     out.str("\n");
     BUILDING.store(false, Ordering::SeqCst);
     out.flush();
+}
 
-    // Handed back, so that a later fault - a different one, on any thread -
-    // gets a report of its own rather than the line above.
-    REPORTER.store(0, Ordering::SeqCst);
-    REPORTING.store(false, Ordering::SeqCst);
-    restore(signal);
+/// The stack [`compose`] runs on. A megabyte, which no report comes near, in
+/// `.bss` so that nothing has to be mapped from inside a handler.
+const REPORT_STACK_BYTES: usize = 1 << 20;
+
+#[repr(C, align(16))]
+struct ReportStack(std::cell::UnsafeCell<[u8; REPORT_STACK_BYTES]>);
+
+/// SAFETY: used only by the thread holding `report`'s `REPORTING`.
+unsafe impl Sync for ReportStack {}
+
+static REPORT_STACK: ReportStack = ReportStack(std::cell::UnsafeCell::new([0; REPORT_STACK_BYTES]));
+
+/// Call `f(arg)` with the stack pointer at the top of [`REPORT_STACK`], and
+/// return on the stack this was called on.
+///
+/// # Safety
+///
+/// Only one thread at a time, and `f` must not unwind.
+#[cfg(target_arch = "x86_64")]
+unsafe fn on_report_stack(f: unsafe extern "C" fn(*mut libc::c_void), arg: *mut libc::c_void) {
+    let top = REPORT_STACK
+        .0
+        .get()
+        .cast::<u8>()
+        .wrapping_add(REPORT_STACK_BYTES);
+    // SAFETY: `top` is 16-byte aligned and the stack is this thread's alone;
+    // the old stack pointer is kept on the new stack and put back after.
+    unsafe {
+        core::arch::asm!(
+            "mov rax, rsp",
+            "mov rsp, {top}",
+            "push rax",
+            "sub rsp, 8",
+            "call {f}",
+            "add rsp, 8",
+            "pop rsp",
+            top = in(reg) top,
+            f = in(reg) f,
+            out("rax") _,
+            in("rdi") arg,
+            clobber_abi("C"),
+        );
+    }
+}
+
+/// As the x86-64 one.
+///
+/// # Safety
+///
+/// As the x86-64 one.
+#[cfg(target_arch = "aarch64")]
+unsafe fn on_report_stack(f: unsafe extern "C" fn(*mut libc::c_void), arg: *mut libc::c_void) {
+    let top = REPORT_STACK
+        .0
+        .get()
+        .cast::<u8>()
+        .wrapping_add(REPORT_STACK_BYTES);
+    // SAFETY: as the x86-64 one; x9 and x10 are scratch registers the call
+    // clobbers anyway.
+    unsafe {
+        core::arch::asm!(
+            "mov x10, sp",
+            "mov sp, {top}",
+            "str x10, [sp, #-16]!",
+            "blr {f}",
+            "ldr x9, [sp], #16",
+            "mov sp, x9",
+            top = in(reg) top,
+            f = in(reg) f,
+            out("x10") _,
+            in("x0") arg,
+            clobber_abi("C"),
+        );
+    }
+}
+
+/// Elsewhere, on the stack the handler was given.
+///
+/// # Safety
+///
+/// As the x86-64 one.
+#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+unsafe fn on_report_stack(f: unsafe extern "C" fn(*mut libc::c_void), arg: *mut libc::c_void) {
+    // SAFETY: the caller's guarantee.
+    unsafe { f(arg) }
 }
 
 /// Byte offset of `uc_mcontext` within Darwin's `ucontext_t`, where it is a
@@ -762,6 +959,30 @@ fn say_caller(out: &mut Buffer, context: *mut libc::c_void) {
     } else {
         out.str(" in");
         let _ = say_image(out, ret);
+    }
+}
+
+/// Every return address in the faulting thread's frame chain, with what each
+/// is in. See [`FAULT_BACKTRACE_ENV`].
+fn say_backtrace(out: &mut Buffer, context: *mut libc::c_void) {
+    const FRAMES: usize = 64;
+    let Some((mut fp, sp, lr)) = host_frame(context) else {
+        return;
+    };
+    out.str("\n  backtrace:");
+    let returns = lr.into_iter().chain(std::iter::from_fn(|| {
+        let (next, ret) = readable(fp, sp).and_then(|f| frame(f))?;
+        fp = next;
+        Some(ret)
+    }));
+    for ret in returns.take(FRAMES) {
+        out.str("\n    ");
+        out.hex(ret);
+        if in_translation(ret) {
+            say_region(out, ret);
+        } else if !say_image(out, ret) {
+            say_host_mapping(out, ret);
+        }
     }
 }
 
@@ -1113,6 +1334,13 @@ fn restore(signal: i32) {
         saved.mask.get().apply(&mut action);
         action.sa_flags = saved.flags.load(Ordering::SeqCst);
         libc::sigaction(signal, &action, std::ptr::null_mut());
+        // A breakpoint is a trap, not a fault: the pc is already past the
+        // `int3`, so returning would carry on as if it had not been there.
+        // Raised again instead, for whatever disposition was there before.
+        #[cfg(not(target_os = "macos"))]
+        if signal == libc::SIGTRAP {
+            libc::raise(signal);
+        }
         // Returning to a synchronous fault raises another Mach exception on
         // macOS, which a guest crash server may leave unanswered. Deliver the
         // default disposition as a signal instead of retrying the instruction.
@@ -1434,6 +1662,24 @@ impl Buffer {
             }
         }
         self.str("0x");
+        for i in (0..n).rev() {
+            self.bytes(&[digits[i]]);
+        }
+    }
+
+    /// The value, as `PRIu64` prints it - the pid's spelling in a fault report.
+    /// Hand-rolled for the reason the type exists.
+    fn dec(&mut self, mut value: u64) {
+        let mut digits = [0u8; 20];
+        let mut n = 0;
+        loop {
+            digits[n] = b'0' + (value % 10) as u8;
+            value /= 10;
+            n += 1;
+            if value == 0 {
+                break;
+            }
+        }
         for i in (0..n).rev() {
             self.bytes(&[digits[i]]);
         }
