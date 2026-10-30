@@ -47,6 +47,8 @@ const EV_EOF: u16 = 0x8000;
 
 /// `NOTE_TRIGGER`, the one `fflags` bit `EVFILT_USER` acts on.
 const NOTE_TRIGGER: u32 = 0x0100_0000;
+const NOTE_FFCTRLMASK: u32 = 0xc000_0000;
+const NOTE_FFLAGSMASK: u32 = 0x00ff_ffff;
 
 /// The `EVFILT_SOCK` conditions, from `<sys/event.h>`. Only a host whose
 /// backend observes them reads the ones `kevent` itself does not.
@@ -78,24 +80,47 @@ struct Registration {
     /// reported, or happened before the registration. `EVFILT_SOCK`: the
     /// conditions already reported, which Darwin reports once each.
     seen: u64,
+    /// EVFILT_USER is level-active after NOTE_TRIGGER until EV_CLEAR,
+    /// EV_ONESHOT, or EV_DELETE resets its state.
+    user_active: bool,
+    user_data: isize,
 }
 
 impl Registration {
     /// The event to hand back when this registration fires.
     ///
-    /// `NOTE_TRIGGER` is cleared: it is the caller's *request*, and a caller
-    /// that read it back in a delivered event would see its own trigger as a
-    /// property of the event.
+    /// USER reports its stored flags (even raw control bits on initial
+    /// registration), as XNU does. Other filters do not report NOTE_TRIGGER.
     fn fired(&self) -> Kevent {
         Kevent {
             ident: self.ident,
             filter: self.filter,
-            flags: 0,
-            fflags: self.fflags & !NOTE_TRIGGER,
-            data: 0,
+            flags: if self.filter == EVFILT_USER {
+                self.flags
+            } else {
+                0
+            },
+            fflags: if self.filter == EVFILT_USER {
+                self.fflags
+            } else {
+                self.fflags & !NOTE_TRIGGER
+            },
+            data: if self.filter == EVFILT_USER {
+                self.user_data
+            } else {
+                0
+            },
             udata: self.udata,
         }
     }
+}
+
+// An EV_CLEAR host port edge can fan out to several guest registrations.
+// Keep notifications that cannot fit after reserving unrelated host I/O.
+struct PendingPort {
+    key: (usize, i16),
+    member: Name,
+    receiver: Arc<Receiver>,
 }
 
 struct Queue<B> {
@@ -110,6 +135,15 @@ struct Queue<B> {
     /// delivered is one event, not two.
     triggered: VecDeque<usize>,
     triggered_set: HashSet<usize>,
+    pending_ports: VecDeque<PendingPort>,
+    // With nevents=1 a persistent user event must not starve a kernel edge.
+    // Alternate priority without consuming edges on user-only iterations.
+    prefer_user_first: bool,
+    // Among non-USER turns, prevent an always-ready Mach port from hiding I/O.
+    prefer_synthetic_first: bool,
+    // True while USER or deferred Mach-port readiness holds a wake.
+    // Avoid an extra nonblocking read on ordinary I/O-only kevent calls.
+    synthetic_wake_pending: bool,
     backend: Arc<B>,
 }
 
@@ -130,6 +164,10 @@ impl<B> Queue<B> {
             port_watch: HashMap::new(),
             triggered: VecDeque::new(),
             triggered_set: HashSet::new(),
+            pending_ports: VecDeque::new(),
+            prefer_user_first: true,
+            prefer_synthetic_first: true,
+            synthetic_wake_pending: false,
             backend: Arc::new(backend),
         }
     }
@@ -176,6 +214,9 @@ trait ReadinessBackend: Sized {
     /// The descriptor `wake` writes, for a signal handler to write.
     fn wake_descriptor(&self) -> c_int;
     fn drain_wake(&self);
+    /// macOS may cache a READ event in its host kqueue after the pipe drains.
+    /// Reset the host wake registration without consuming unrelated I/O edges.
+    fn reset_stale_wake(&self) {}
     /// Whether the host can report edges, which `EV_CLEAR` needs.
     const EDGE: bool;
     fn update(&self, fd: c_int, before: Interest, after: Interest) -> Result<(), c_int>;
@@ -792,6 +833,44 @@ impl ReadinessBackend for KqueueBackend {
         drain_fd(self.wake_read)
     }
 
+    fn reset_stale_wake(&self) {
+        // Polling a native kqueue may retain a cached READ notification even
+        // after the pipe becomes empty. Two control changes in one kevent
+        // retire that cached wake and re-arm the source atomically with respect
+        // to other host event collection; no host READ/WRITE edges are read.
+        let change = |flags, udata| libc::kevent {
+            ident: self.wake_read as usize,
+            filter: libc::EVFILT_READ,
+            flags,
+            fflags: 0,
+            data: 0,
+            udata: udata as *mut c_void,
+        };
+        let changes = [
+            change(libc::EV_DELETE, 0),
+            change(libc::EV_ADD, Self::WAKE_TOKEN),
+        ];
+        let rc = unsafe {
+            libc::kevent(
+                self.kqueue,
+                changes.as_ptr(),
+                2,
+                std::ptr::null_mut(),
+                0,
+                std::ptr::null(),
+            )
+        };
+        if rc < 0 {
+            // A failed delete must not leave the wake channel unregistered.
+            let _ = self.change(
+                self.wake_read,
+                libc::EVFILT_READ,
+                libc::EV_ADD,
+                Self::WAKE_TOKEN,
+            );
+        }
+    }
+
     const EDGE: bool = true;
 
     fn update(&self, fd: c_int, before: Interest, after: Interest) -> Result<(), c_int> {
@@ -1085,6 +1164,27 @@ fn drain_fd(queue: c_int) {
     while unsafe { libc::read(queue, (&raw mut value).cast::<c_void>(), size_of::<u64>()) } > 0 {}
 }
 
+/// Keep the host queue poll-readable for as long as a persistent USER
+/// registration is level-active, not just until its first kevent delivery.
+/// Called under the queue lock so a concurrent USER change cannot race the
+/// wake state. Signals can write without this lock, so preserve their pending
+/// counter after retiring the USER token.
+fn reconcile_synthetic_wake<B: ReadinessBackend>(state: &mut Queue<B>) {
+    if !state.triggered.is_empty() || !state.pending_ports.is_empty() {
+        if !state.synthetic_wake_pending {
+            state.backend.wake();
+            state.synthetic_wake_pending = true;
+        }
+    } else if state.synthetic_wake_pending {
+        state.backend.drain_wake();
+        state.backend.reset_stale_wake();
+        state.synthetic_wake_pending = false;
+        if signals_pending(&state.registrations) {
+            state.backend.wake();
+        }
+    }
+}
+
 /// Apply one change, answering with the `errno` it failed with.
 ///
 /// The number is **Darwin's**: it reaches the guest as an `EV_ERROR` event's
@@ -1103,17 +1203,26 @@ fn apply<B: ReadinessBackend>(state: &mut Queue<B>, change: &Kevent) -> Result<(
     let mut registrations = state.registrations.clone();
     let mut triggered = state.triggered.clone();
     let mut triggered_set = state.triggered_set.clone();
+    let user_existing = change.filter == EVFILT_USER && registrations.contains_key(&key);
 
     if change.flags & EV_DELETE != 0 {
         if registrations.remove(&key).is_none() {
             return Err(crate::errno::from_host(libc::ENOENT));
         }
-        triggered.retain(|ident| *ident != change.ident);
-        triggered_set.remove(&change.ident);
+        if change.filter == EVFILT_USER {
+            triggered.retain(|ident| *ident != change.ident);
+            triggered_set.remove(&change.ident);
+        }
         sync_interest(state, &registrations, change.filter, change.ident)?;
         state.registrations = registrations;
         state.triggered = triggered;
         state.triggered_set = triggered_set;
+        if change.filter == EVFILT_MACHPORT {
+            state.pending_ports.retain(|entry| entry.key != key);
+        }
+        if matches!(change.filter, EVFILT_USER | EVFILT_MACHPORT) {
+            reconcile_synthetic_wake(state);
+        }
         if change.filter == EVFILT_SIGNAL {
             let _ = crate::signal::observe(change.ident as i32, false);
             release_signal_waker(state);
@@ -1179,45 +1288,109 @@ fn apply<B: ReadinessBackend>(state: &mut Queue<B>, change: &Kevent) -> Result<(
             Registration {
                 ident: change.ident,
                 filter: change.filter,
-                flags: change.flags,
-                fflags: change.fflags,
+                // XNU retains the delivery mode of an existing USER knote.
+                // Repeated EV_ADD updates metadata, not its original flags.
+                flags: if user_existing {
+                    state.registrations[&key].flags
+                } else {
+                    change.flags
+                },
+                fflags: if user_existing {
+                    state.registrations[&key].fflags
+                } else {
+                    change.fflags
+                },
                 udata: change.udata,
-                enabled: change.flags & EV_DISABLE == 0,
+                enabled: if user_existing {
+                    state.registrations[&key].enabled
+                } else {
+                    change.flags & EV_DISABLE == 0
+                },
                 seen,
+                user_active: change.filter == EVFILT_USER
+                    && (change.fflags & NOTE_TRIGGER != 0
+                        || state
+                            .registrations
+                            .get(&key)
+                            .is_some_and(|old| old.user_active)),
+                user_data: if change.filter == EVFILT_USER {
+                    change.data
+                } else {
+                    0
+                },
             },
         );
-    } else {
-        let Some(registration) = registrations.get_mut(&key) else {
-            return Err(crate::errno::from_host(libc::ENOENT));
-        };
-        if change.flags & EV_ENABLE != 0 {
-            registration.enabled = true;
-        }
-        if change.flags & EV_DISABLE != 0 {
-            registration.enabled = false;
-        }
+    } else if !registrations.contains_key(&key) {
+        return Err(crate::errno::from_host(libc::ENOENT));
     }
 
-    if change.filter == EVFILT_USER && change.fflags & NOTE_TRIGGER != 0 {
-        let enabled = registrations
-            .get(&key)
-            .is_some_and(|registration| registration.enabled);
-        if enabled && triggered_set.insert(change.ident) {
-            triggered.push_back(change.ident);
+    // Re-registering a USER knote must not silently re-enable one that was
+    // explicitly disabled or disabled by EV_DISPATCH. Only these control bits
+    // change effective enablement; EV_DISABLE wins if both are present.
+    let registration = registrations.get_mut(&key).expect("registered knote");
+    if change.flags & EV_ENABLE != 0 {
+        registration.enabled = true;
+    }
+    if change.flags & EV_DISABLE != 0 {
+        registration.enabled = false;
+    }
+
+    if change.filter == EVFILT_USER {
+        let registration = registrations
+            .get_mut(&key)
+            .expect("user registration exists after successful add/update");
+        let operand = change.fflags & NOTE_FFLAGSMASK;
+        // XNU copies the raw initial fflags on EV_ADD; the control operation
+        // applies only to later updates (including EV_ADD to an existing knote).
+        if user_existing || change.flags & EV_ADD == 0 {
+            registration.fflags = match change.fflags & NOTE_FFCTRLMASK {
+                0x4000_0000 => registration.fflags & operand, // NOTE_FFAND
+                0x8000_0000 => registration.fflags | operand, // NOTE_FFOR
+                0xc000_0000 => operand,                       // NOTE_FFCOPY
+                _ => registration.fflags,                     // NOTE_FFNOP
+            };
+        }
+        registration.user_data = change.data;
+        registration.udata = change.udata;
+        if change.fflags & NOTE_TRIGGER != 0 {
+            registration.user_active = true;
+        }
+        if registration.enabled && registration.user_active {
+            if triggered_set.insert(change.ident) {
+                triggered.push_back(change.ident);
+            }
+        } else if triggered_set.remove(&change.ident) {
+            triggered.retain(|ident| *ident != change.ident);
         }
     }
     sync_interest(state, &registrations, change.filter, change.ident)?;
     if change.filter == EVFILT_MACHPORT {
         sync_ports(&mut state.port_watch, &*state.backend, &registrations)?;
     }
-    let woke = change.filter == EVFILT_USER
-        && change.fflags & NOTE_TRIGGER != 0
-        && triggered != state.triggered;
     state.registrations = registrations;
     state.triggered = triggered;
     state.triggered_set = triggered_set;
-    if woke {
-        state.backend.wake();
+    if change.filter == EVFILT_MACHPORT {
+        // An ordinary EV_ADD updates registration metadata, not the host
+        // edge that was already consumed for this knote. Keep deferred
+        // notifications while the registration remains enabled, edge-based,
+        // and attached to the *same* receive right and port-set membership.
+        // A disabled, mode-replaced or identity-replaced knote is invalidated.
+        let registration = state.registrations.get(&key).expect("updated knote");
+        let still_watched = if registration.enabled && registration.flags & EV_CLEAR != 0 {
+            receivers(registration.ident as Name)
+        } else {
+            Vec::new()
+        };
+        state.pending_ports.retain(|entry| {
+            entry.key != key
+                || still_watched.iter().any(|(member, receiver)| {
+                    *member == entry.member && Arc::ptr_eq(receiver, &entry.receiver)
+                })
+        });
+    }
+    if matches!(change.filter, EVFILT_USER | EVFILT_MACHPORT) {
+        reconcile_synthetic_wake(state);
     }
     Ok(())
 }
@@ -1374,6 +1547,90 @@ fn readable_bytes(fd: c_int) -> isize {
     }
 }
 
+/// Deliver each level-active user filter once in this batch. Persistent
+/// triggers remain queued for the next call, not a second slot in this one.
+fn take_user_batch<B: ReadinessBackend>(
+    state: &mut Queue<B>,
+    out: &mut Vec<Kevent>,
+    capacity: usize,
+) {
+    // Deliver each pending EVFILT_USER at most once per batch. An ordinary
+    // user knote stays level-active until explicitly cleared or disabled,
+    // but returning it twice in one kevent() call would violate batching.
+    let mut remaining = state.triggered.len();
+    while out.len() < capacity && remaining != 0 {
+        remaining -= 1;
+        let Some(ident) = state.triggered.pop_front() else {
+            break;
+        };
+        let Some(registration) = state.registrations.get_mut(&(ident, EVFILT_USER)) else {
+            state.triggered_set.remove(&ident);
+            continue;
+        };
+        if !registration.enabled || !registration.user_active {
+            state.triggered_set.remove(&ident);
+            continue;
+        }
+        let flags = registration.flags;
+        out.push(registration.fired());
+        if flags & EV_ONESHOT != 0 {
+            state.registrations.remove(&(ident, EVFILT_USER));
+            state.triggered_set.remove(&ident);
+        } else {
+            // The delivery modes are independent: a combined EV_CLEAR and
+            // EV_DISPATCH must both forget this trigger and disable the knote.
+            if flags & EV_CLEAR != 0 {
+                registration.user_active = false;
+            }
+            if flags & EV_DISPATCH != 0 {
+                registration.enabled = false;
+            }
+            if registration.enabled && registration.user_active {
+                state.triggered.push_back(ident);
+            } else {
+                state.triggered_set.remove(&ident);
+            }
+        }
+    }
+}
+
+/// Deliver a consumed Mach-port edge to an existing guest registration.
+/// Identity and membership validation prevent deferred events from surviving
+/// a port-right replacement or port-set membership change.
+fn deliver_port<B: ReadinessBackend>(
+    state: &mut Queue<B>,
+    notification: &PendingPort,
+    out: &mut Vec<Kevent>,
+    ports_changed: &mut bool,
+) {
+    let Some(registration) = state.registrations.get(&notification.key).copied() else {
+        return;
+    };
+    if !registration.enabled
+        || registration.filter != EVFILT_MACHPORT
+        || registration.flags & EV_CLEAR == 0
+        || !receivers(registration.ident as Name)
+            .iter()
+            .any(|(name, receiver)| {
+                *name == notification.member && Arc::ptr_eq(receiver, &notification.receiver)
+            })
+    {
+        return;
+    }
+    let mut event = registration.fired();
+    event.data = notification.member as isize;
+    out.push(event);
+    if registration.flags & EV_ONESHOT != 0 {
+        state.registrations.remove(&notification.key);
+        *ports_changed = true;
+    } else if registration.flags & EV_DISPATCH != 0 {
+        if let Some(registration) = state.registrations.get_mut(&notification.key) {
+            registration.enabled = false;
+        }
+        *ports_changed = true;
+    }
+}
+
 /// `int kevent(int kq, const struct kevent *changelist, int nchanges,
 /// struct kevent *eventlist, int nevents, const struct timespec *timeout)`
 ///
@@ -1456,11 +1713,56 @@ pub unsafe extern "C" fn kevent(
         }
         watched_ports(&state.registrations)
     };
-    let triggered = {
-        let state = state.lock().unwrap_or_else(|e| e.into_inner());
-        !state.triggered.is_empty()
-            || signals_pending(&state.registrations)
-            || ports.iter().any(|port| port.ready())
+    // Persistent USER triggers must not starve other filters, at ANY event
+    // capacity. On a user-priority scan collect only USER notifications and
+    // return without polling: a kernel EV_CLEAR edge consumed by an early host
+    // wait would otherwise vanish if USER events fill the result buffer.
+    let other_scan = {
+        let mut locked = state.lock().unwrap_or_else(|e| e.into_inner());
+        if locked.triggered.is_empty() {
+            false
+        } else {
+            let has_other_filters = locked
+                .registrations
+                .values()
+                .any(|r| r.enabled && r.filter != EVFILT_USER);
+            let user_first = !has_other_filters || locked.prefer_user_first;
+            if has_other_filters {
+                locked.prefer_user_first = !user_first;
+            }
+            if user_first {
+                take_user_batch(&mut locked, &mut out, capacity);
+                if !out.is_empty() {
+                    // Preserve the host wake while any persistent USER
+                    // remains active; otherwise retire it before a timed wait.
+                    reconcile_synthetic_wake(&mut locked);
+                    // Returning fewer than capacity is allowed; do not consume
+                    // an edge just to populate the remaining slots.
+                    unsafe { std::ptr::copy_nonoverlapping(out.as_ptr(), events, out.len()) };
+                    return out.len() as c_int;
+                }
+            }
+            !user_first
+        }
+    };
+    let (triggered, synthetic_other_ready, has_deferred_ports) = {
+        let mut state = state.lock().unwrap_or_else(|e| e.into_inner());
+        reconcile_synthetic_wake(&mut state);
+        let signal_ready = signals_pending(&state.registrations);
+        let port_ready = ports.iter().any(|port| port.ready());
+        let competing = other_scan && (signal_ready || port_ready);
+        let synthetic_first = competing && state.prefer_synthetic_first;
+        if competing {
+            state.prefer_synthetic_first = !state.prefer_synthetic_first;
+        }
+        (
+            !state.triggered.is_empty()
+                || signal_ready
+                || port_ready
+                || !state.pending_ports.is_empty(),
+            synthetic_first,
+            !state.pending_ports.is_empty(),
+        )
     };
     // Something is already waiting, so this is a collection rather than a wait.
     let wait = match triggered {
@@ -1473,7 +1775,12 @@ pub unsafe extern "C" fn kevent(
             }
         },
     };
-    let ready = {
+    let ready = if synthetic_other_ready || has_deferred_ports {
+        // Synthetic signal/port readiness is already known. Collect it
+        // without consuming an EPOLLET/kqueue event we cannot return if the
+        // caller supplied a smaller event buffer.
+        Vec::new()
+    } else {
         let state = state.lock().unwrap_or_else(|e| e.into_inner());
         let backend = Arc::clone(&state.backend);
         let registrations = state.registrations.clone();
@@ -1488,23 +1795,60 @@ pub unsafe extern "C" fn kevent(
         }
     };
 
+    // An I/O-ready scan must deliver those edges BEFORE synthetic filters or
+    // risk losing them. Otherwise an already-ready signal or Mach port can
+    // preempt USER, so a persistent USER never starves other sources.
+    let host_io_ready = ready.iter().any(|event| {
+        event.revents != 0 && matches!(event.source, Source::Level | Source::Edge | Source::Port)
+    });
     let mut state = state.lock().unwrap_or_else(|e| e.into_inner());
+    // A USER may have triggered concurrently *during* the host poll. Do not
+    // let it occupy the sole result slot after the kernel has consumed an
+    // EV_CLEAR edge, even when no USER was active before entering the poll.
+    let kernel_first = host_io_ready && (other_scan || !state.triggered.is_empty());
+    // Reserve slots for readiness already consumed from the host. In
+    // particular, a ready EV_CLEAR Mach port must not be dropped merely
+    // because a USER notification also exists in this batch.
+    let host_io_slots = ready
+        .iter()
+        .filter(|entry| entry.revents != 0 && matches!(entry.source, Source::Level | Source::Edge))
+        .count();
+    let host_slots = ready
+        .iter()
+        .filter(|entry| {
+            entry.revents != 0
+                && matches!(entry.source, Source::Level | Source::Edge | Source::Port)
+        })
+        .count();
+    let synthetic_limit = if kernel_first {
+        capacity.saturating_sub(host_slots)
+    } else {
+        capacity
+    };
+    let port_limit = if kernel_first {
+        capacity.saturating_sub(host_io_slots)
+    } else {
+        capacity
+    };
+    let other_first = kernel_first
+        || !state.pending_ports.is_empty()
+        || (other_scan
+            && (signals_pending(&state.registrations) || ports.iter().any(|port| port.ready())));
     if ready.iter().any(|entry| entry.source == Source::Wake) {
         state.backend.drain_wake();
+        state.synthetic_wake_pending = false;
     }
 
-    // The user events first: a program triggers one to be told to stop, and a
-    // busy descriptor must not keep that behind it.
-    while out.len() < capacity {
-        let Some(ident) = state.triggered.pop_front() else {
+    if !other_first {
+        take_user_batch(&mut state, &mut out, capacity);
+    }
+
+    let mut ports_changed = false;
+    while out.len() < synthetic_limit {
+        let Some(notification) = state.pending_ports.pop_front() else {
             break;
         };
-        state.triggered_set.remove(&ident);
-        if let Some(registration) = state.registrations.get(&(ident, EVFILT_USER))
-            && registration.enabled
-        {
-            out.push(registration.fired());
-        }
+        deliver_port(&mut state, &notification, &mut out, &mut ports_changed);
     }
 
     let mut signals: Vec<(usize, i16)> = state
@@ -1515,7 +1859,7 @@ pub unsafe extern "C" fn kevent(
         .collect();
     signals.sort_unstable();
     for key in signals {
-        if out.len() == capacity {
+        if out.len() >= synthetic_limit {
             break;
         }
         let Some(registration) = state.registrations.get_mut(&key) else {
@@ -1547,7 +1891,7 @@ pub unsafe extern "C" fn kevent(
         .collect();
     machports.sort_unstable();
     for key in machports {
-        if out.len() == capacity {
+        if out.len() >= synthetic_limit {
             break;
         }
         let Some(registration) = state.registrations.get_mut(&key) else {
@@ -1576,9 +1920,8 @@ pub unsafe extern "C" fn kevent(
         }
     }
 
-    let mut ports_changed = false;
     for entry in &ready {
-        if out.len() == capacity || entry.source != Source::Port {
+        if entry.source != Source::Port {
             continue;
         }
         let Some(port) = state.port_watch.get(&entry.fd).cloned() else {
@@ -1592,9 +1935,6 @@ pub unsafe extern "C" fn kevent(
             .collect();
         firing.sort_unstable_by_key(|(key, _)| *key);
         for (key, registration) in firing {
-            if out.len() == capacity {
-                break;
-            }
             let Some(member) = receivers(registration.ident as Name)
                 .into_iter()
                 .find(|(_, member)| Arc::ptr_eq(member, &port))
@@ -1602,17 +1942,21 @@ pub unsafe extern "C" fn kevent(
             else {
                 continue;
             };
-            let mut event = registration.fired();
-            event.data = member as isize;
-            out.push(event);
-            if registration.flags & EV_ONESHOT != 0 {
-                state.registrations.remove(&key);
-                ports_changed = true;
-            } else if registration.flags & EV_DISPATCH != 0 {
-                if let Some(registration) = state.registrations.get_mut(&key) {
-                    registration.enabled = false;
-                }
-                ports_changed = true;
+            let notification = PendingPort {
+                key,
+                member,
+                receiver: Arc::clone(&port),
+            };
+            if out.len() < port_limit {
+                deliver_port(&mut state, &notification, &mut out, &mut ports_changed);
+            } else if !state.pending_ports.iter().any(|pending| {
+                pending.key == key
+                    && pending.member == member
+                    && Arc::ptr_eq(&pending.receiver, &port)
+            }) {
+                // The host already consumed this edge. The guest notification
+                // must survive without consuming a slot reserved for READ.
+                state.pending_ports.push_back(notification);
             }
         }
     }
@@ -1702,6 +2046,12 @@ pub unsafe extern "C" fn kevent(
             }
         }
     }
+    if other_first && out.len() < capacity {
+        take_user_batch(&mut state, &mut out, capacity);
+    }
+    // The backend may have consumed the wake token on this turn, while USER
+    // is still pending after delivery or became active during the host poll.
+    reconcile_synthetic_wake(&mut state);
     // SAFETY: the caller states there is room for `nevents`, and `out` never
     // grew past that.
     unsafe { std::ptr::copy_nonoverlapping(out.as_ptr(), events, out.len()) };
@@ -1973,6 +2323,7 @@ mod tests {
                 ident: 42,
                 filter: EVFILT_USER,
                 fflags: NOTE_TRIGGER,
+                udata: 7,
                 ..Kevent::default()
             };
             // SAFETY: one change and no room for events, which applies it and
@@ -2553,6 +2904,452 @@ mod tests {
         space::destroy(port);
         // SAFETY: this test's own descriptor.
         unsafe { crate::net::descriptor::close(queue) };
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn persistent_user_must_not_consume_ev_clear_port_in_one_slot() {
+        let queue = kqueue();
+        let (set, port) = port_in_set();
+        assert_eq!(watch(queue, 55445, EVFILT_USER, EV_ADD), 0);
+        assert_eq!(watch_machport(queue, set), 0);
+        let trigger = Kevent {
+            ident: 55445,
+            filter: EVFILT_USER,
+            fflags: NOTE_TRIGGER,
+            ..Kevent::default()
+        };
+        unsafe {
+            assert_eq!(
+                kevent(
+                    queue,
+                    &trigger,
+                    1,
+                    std::ptr::null_mut(),
+                    0,
+                    std::ptr::null()
+                ),
+                0
+            );
+        }
+        assert_eq!(collect(queue, None).1.filter, EVFILT_USER);
+        post(port, 88);
+        let (n, event) = collect(queue, None);
+        assert_eq!(
+            (n, event.filter, event.data),
+            (1, EVFILT_MACHPORT, port as isize)
+        );
+        assert_eq!(collect(queue, None).1.filter, EVFILT_USER);
+        space::destroy(set);
+        space::destroy(port);
+        unsafe {
+            libc::close(queue);
+        }
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn persistent_user_does_not_drop_ev_clear_port_when_io_has_spare_slots() {
+        let queue = kqueue();
+        let (set, port) = port_in_set();
+        let (reader, writer) = pipe();
+        assert_eq!(watch(queue, 55444, EVFILT_USER, EV_ADD), 0);
+        assert_eq!(watch(queue, reader as usize, EVFILT_READ, EV_ADD), 0);
+        assert_eq!(watch_machport(queue, set), 0);
+        let trigger = Kevent {
+            ident: 55444,
+            filter: EVFILT_USER,
+            fflags: NOTE_TRIGGER,
+            ..Kevent::default()
+        };
+        unsafe {
+            assert_eq!(
+                kevent(
+                    queue,
+                    &trigger,
+                    1,
+                    std::ptr::null_mut(),
+                    0,
+                    std::ptr::null()
+                ),
+                0
+            );
+        }
+        // Return the USER-only batch without consuming an unrelated host edge.
+        assert_eq!(collect(queue, None).1.filter, EVFILT_USER);
+        unsafe {
+            assert_eq!(libc::write(writer, c"x".as_ptr().cast(), 1), 1);
+        }
+        post(port, 88);
+        let mut events = [Kevent::default(); 4];
+        let n = unsafe {
+            kevent(
+                queue,
+                std::ptr::null(),
+                0,
+                events.as_mut_ptr(),
+                4,
+                &raw const NO_WAIT,
+            )
+        };
+        let filters: Vec<i16> = events[..n.max(0) as usize]
+            .iter()
+            .map(|e| e.filter)
+            .collect();
+        assert!(filters.contains(&EVFILT_READ), "{filters:?}");
+        assert!(
+            filters.contains(&EVFILT_MACHPORT),
+            "EV_CLEAR port edge lost: {filters:?}"
+        );
+        space::destroy(set);
+        space::destroy(port);
+        unsafe {
+            libc::close(reader);
+            libc::close(writer);
+            libc::close(queue);
+        }
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn duplicate_port_watchers_preserve_consumed_read_edge_and_second_port_notice() {
+        let queue = kqueue();
+        let (set, port) = port_in_set();
+        let (reader, writer) = pipe();
+        assert_eq!(watch(queue, 55446, EVFILT_USER, EV_ADD), 0);
+        assert_eq!(
+            watch(queue, reader as usize, EVFILT_READ, EV_ADD | EV_CLEAR),
+            0
+        );
+        assert_eq!(watch_machport(queue, set), 0);
+        assert_eq!(watch_machport(queue, port), 0);
+        let trigger = Kevent {
+            ident: 55446,
+            filter: EVFILT_USER,
+            fflags: NOTE_TRIGGER,
+            ..Kevent::default()
+        };
+        unsafe {
+            assert_eq!(
+                kevent(
+                    queue,
+                    &trigger,
+                    1,
+                    std::ptr::null_mut(),
+                    0,
+                    std::ptr::null()
+                ),
+                0
+            );
+        }
+        assert_eq!(collect(queue, None).1.filter, EVFILT_USER);
+        post(port, 55);
+        unsafe {
+            assert_eq!(libc::write(writer, c"x".as_ptr().cast(), 1), 1);
+        }
+        let mut got = [Kevent::default(); 2];
+        let mut notices = Vec::new();
+        for _ in 0..12 {
+            let n = unsafe {
+                kevent(
+                    queue,
+                    std::ptr::null(),
+                    0,
+                    got.as_mut_ptr(),
+                    2,
+                    &raw const NO_WAIT,
+                )
+            };
+            assert!(n >= 0);
+            notices.extend_from_slice(&got[..n as usize]);
+        }
+        let reads = notices.iter().filter(|e| e.filter == EVFILT_READ).count();
+        let ports: Vec<usize> = notices
+            .iter()
+            .filter(|e| e.filter == EVFILT_MACHPORT)
+            .map(|e| e.ident)
+            .collect();
+        assert_eq!(
+            reads,
+            1,
+            "READ edge disappeared: {:?}",
+            notices
+                .iter()
+                .map(|e| (e.ident, e.filter))
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            ports.contains(&(set as usize)) && ports.contains(&(port as usize)),
+            "port edge must notify both registrations: {:?}",
+            notices
+                .iter()
+                .map(|e| (e.ident, e.filter))
+                .collect::<Vec<_>>()
+        );
+        space::destroy(set);
+        space::destroy(port);
+        unsafe {
+            libc::close(reader);
+            libc::close(writer);
+            libc::close(queue);
+        }
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn metadata_readd_preserves_deferred_mach_edge_and_updates_udata() {
+        let queue = kqueue();
+        let (set, port) = port_in_set();
+        let (reader, writer) = pipe();
+        assert_eq!(watch(queue, 55448, EVFILT_USER, EV_ADD), 0);
+        assert_eq!(
+            watch(queue, reader as usize, EVFILT_READ, EV_ADD | EV_CLEAR),
+            0
+        );
+        assert_eq!(watch_machport(queue, set), 0);
+        assert_eq!(watch_machport(queue, port), 0);
+        let trigger = Kevent {
+            ident: 55448,
+            filter: EVFILT_USER,
+            fflags: NOTE_TRIGGER,
+            ..Kevent::default()
+        };
+        unsafe {
+            assert_eq!(
+                kevent(
+                    queue,
+                    &trigger,
+                    1,
+                    std::ptr::null_mut(),
+                    0,
+                    std::ptr::null()
+                ),
+                0
+            );
+        }
+        assert_eq!(collect(queue, None).1.filter, EVFILT_USER);
+        post(port, 88);
+        unsafe {
+            assert_eq!(libc::write(writer, c"x".as_ptr().cast(), 1), 1);
+        }
+        let mut out = [Kevent::default(); 2];
+        let n = unsafe {
+            kevent(
+                queue,
+                std::ptr::null(),
+                0,
+                out.as_mut_ptr(),
+                2,
+                &raw const NO_WAIT,
+            )
+        };
+        assert_eq!(n, 2, "expected READ and first Mach-port notification");
+        assert_eq!(out.iter().filter(|e| e.filter == EVFILT_READ).count(), 1);
+        let emitted = out
+            .iter()
+            .find(|e| e.filter == EVFILT_MACHPORT)
+            .expect("first port notification")
+            .ident;
+        let deferred = if emitted == set as usize {
+            port as usize
+        } else {
+            set as usize
+        };
+        let update = Kevent {
+            ident: deferred,
+            filter: EVFILT_MACHPORT,
+            flags: EV_ADD | EV_CLEAR,
+            udata: 0xfeed,
+            ..Kevent::default()
+        };
+        unsafe {
+            assert_eq!(
+                kevent(queue, &update, 1, std::ptr::null_mut(), 0, std::ptr::null()),
+                0
+            );
+        }
+        let mut deferred_events = Vec::new();
+        for _ in 0..8 {
+            let n = unsafe {
+                kevent(
+                    queue,
+                    std::ptr::null(),
+                    0,
+                    out.as_mut_ptr(),
+                    2,
+                    &raw const NO_WAIT,
+                )
+            };
+            assert!(n >= 0);
+            deferred_events.extend(
+                out[..n as usize]
+                    .iter()
+                    .copied()
+                    .filter(|e| e.filter == EVFILT_MACHPORT && e.ident == deferred),
+            );
+        }
+        assert_eq!(
+            deferred_events.len(),
+            1,
+            "re-registration must not lose or duplicate consumed Mach-port edge"
+        );
+        assert_eq!(
+            (deferred_events[0].data, deferred_events[0].udata),
+            (port as isize, 0xfeed)
+        );
+        space::destroy(set);
+        space::destroy(port);
+        unsafe {
+            libc::close(reader);
+            libc::close(writer);
+            libc::close(queue);
+        }
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn deleting_a_deferred_port_knote_cancels_its_consumed_notification() {
+        let queue = kqueue();
+        let (set, port) = port_in_set();
+        let (reader, writer) = pipe();
+        assert_eq!(watch(queue, 55447, EVFILT_USER, EV_ADD), 0);
+        assert_eq!(
+            watch(queue, reader as usize, EVFILT_READ, EV_ADD | EV_CLEAR),
+            0
+        );
+        assert_eq!(watch_machport(queue, set), 0);
+        assert_eq!(watch_machport(queue, port), 0);
+        let trigger = Kevent {
+            ident: 55447,
+            filter: EVFILT_USER,
+            fflags: NOTE_TRIGGER,
+            ..Kevent::default()
+        };
+        unsafe {
+            assert_eq!(
+                kevent(
+                    queue,
+                    &trigger,
+                    1,
+                    std::ptr::null_mut(),
+                    0,
+                    std::ptr::null()
+                ),
+                0
+            );
+        }
+        assert_eq!(collect(queue, None).1.filter, EVFILT_USER);
+        post(port, 77);
+        unsafe {
+            assert_eq!(libc::write(writer, c"x".as_ptr().cast(), 1), 1);
+        }
+        let mut out = [Kevent::default(); 2];
+        let n = unsafe {
+            kevent(
+                queue,
+                std::ptr::null(),
+                0,
+                out.as_mut_ptr(),
+                2,
+                &raw const NO_WAIT,
+            )
+        };
+        assert_eq!(n, 2);
+        assert!(out.iter().any(|e| e.filter == EVFILT_READ));
+        let emitted = out
+            .iter()
+            .find(|e| e.filter == EVFILT_MACHPORT)
+            .expect("first port event")
+            .ident;
+        let deferred = if emitted == set as usize {
+            port as usize
+        } else {
+            set as usize
+        };
+        // The deferred port notification alone must hold poll-readability
+        // even after the persistent USER source has been disabled.
+        assert_eq!(watch(queue, 55447, EVFILT_USER, EV_DISABLE), 0);
+        let mut pfd = libc::pollfd {
+            fd: queue,
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        assert_eq!(unsafe { libc::poll(&raw mut pfd, 1, 0) }, 1);
+        assert_ne!(pfd.revents & libc::POLLIN, 0);
+        assert_eq!(watch(queue, deferred, EVFILT_MACHPORT, EV_DELETE), 0);
+        for _ in 0..8 {
+            let n = unsafe {
+                kevent(
+                    queue,
+                    std::ptr::null(),
+                    0,
+                    out.as_mut_ptr(),
+                    2,
+                    &raw const NO_WAIT,
+                )
+            };
+            assert!(n >= 0);
+            assert!(
+                !out[..n as usize]
+                    .iter()
+                    .any(|e| e.filter == EVFILT_MACHPORT && e.ident == deferred),
+                "deleted port knote delivered stale edge"
+            );
+        }
+        space::destroy(set);
+        space::destroy(port);
+        unsafe {
+            libc::close(reader);
+            libc::close(writer);
+            libc::close(queue);
+        }
+    }
+
+    #[test]
+    fn persistent_user_and_read_do_not_starve_a_ready_machport() {
+        let queue = kqueue();
+        let (set, port) = port_in_set();
+        let (reader, writer) = pipe();
+        assert_eq!(watch(queue, 55443, EVFILT_USER, EV_ADD), 0);
+        assert_eq!(watch(queue, reader as usize, EVFILT_READ, EV_ADD), 0);
+        assert_eq!(watch(queue, set as usize, EVFILT_MACHPORT, EV_ADD), 0);
+        let trigger = Kevent {
+            ident: 55443,
+            filter: EVFILT_USER,
+            fflags: NOTE_TRIGGER,
+            ..Kevent::default()
+        };
+        unsafe {
+            assert_eq!(
+                kevent(
+                    queue,
+                    &trigger,
+                    1,
+                    std::ptr::null_mut(),
+                    0,
+                    std::ptr::null()
+                ),
+                0
+            );
+            assert_eq!(libc::write(writer, c"x".as_ptr().cast(), 1), 1);
+        }
+        post(port, 88);
+        let mut filters = Vec::new();
+        for _ in 0..12 {
+            let (n, event) = collect(queue, None);
+            assert_eq!(n, 1);
+            filters.push(event.filter);
+        }
+        assert!(filters.contains(&EVFILT_USER), "{filters:?}");
+        assert!(filters.contains(&EVFILT_READ), "{filters:?}");
+        assert!(filters.contains(&EVFILT_MACHPORT), "{filters:?}");
+        space::destroy(set);
+        space::destroy(port);
+        unsafe {
+            libc::close(reader);
+            libc::close(writer);
+            libc::close(queue);
+        }
     }
 
     #[test]
