@@ -1351,6 +1351,14 @@ mod tests {
     }
 
     #[test]
+    fn losing_focus_invalidates_a_relative_warp_without_recentering() {
+        let _guard = crate::event::POINTER_TEST_LOCK.lock().unwrap();
+        remember_relative_warp((400.0, 300.0));
+        forget_recentring();
+        assert_eq!(known_relative_warp(), None);
+    }
+
+    #[test]
     fn a_global_warp_is_translated_to_window_coordinates() {
         assert_eq!(local_warp_point((420.0, 310.0), (100, 50)), (320.0, 260.0));
     }
@@ -1441,24 +1449,21 @@ pub unsafe extern "C" fn CGWarpMouseCursorPosition(point: foundation::geometry::
     // An edge hold is not the guest's relative mode: the warp is a plain one.
     end_edge_hold();
     let windows = crate::window::sdl_windows();
-    let target = crate::event::pointer_window();
+    let target = sdl3::video::mouse_focus().or_else(crate::event::pointer_window);
     let origin = target
         .and_then(crate::window::global_position)
         .unwrap_or((0, 0));
     let local = local_warp_point(point, origin);
-    let from = crate::event::pointer_position();
-    // Measured from the cursor the guest is told about: the frozen point when
-    // it is disassociated, which a repeated warp to one target leaves exactly
-    // where it was, and otherwise the answer the window system gives.
-    let moved = match mouse_is_associated() {
-        true => {
-            let at = crate::cgevent::global_pointer();
-            (asked.x - at.x, asked.y - at.y)
-        }
-        false => (f64::from(local.0 - from.0), f64::from(local.1 - from.1)),
-    };
+    // Both positions must use the same desktop coordinate system. The last
+    // delivered event can belong to a different window than SDL's mouse focus.
+    let at = crate::cgevent::global_pointer();
+    let from = local_warp_point((at.x as f32, at.y as f32), origin);
+    let moved = (asked.x - at.x, asked.y - at.y);
     crate::event::note_warp_delta(moved.0, moved.1);
-    crate::event::warp_pointer(local.0, local.1);
+    match target {
+        Some(window) => crate::event::warp_pointer_in_window(window, local.0, local.1),
+        None => crate::event::warp_pointer(local.0, local.1),
+    }
     if mouse_is_associated()
         && let Some(window) = target
         && recentre(window, point)
@@ -1692,6 +1697,8 @@ pub(crate) fn end_recentring_if_idle(from: (f32, f32)) -> bool {
 /// has already left relative mode, and a cursor now over another program must
 /// not be pulled back to where the guest last had it.
 pub(crate) fn forget_recentring() {
+    // A cached physical warp cannot describe a cursor moved in another app.
+    forget_relative_warp();
     let Some(r) = RECENTRING.lock().unwrap_or_else(|e| e.into_inner()).take() else {
         return;
     };
