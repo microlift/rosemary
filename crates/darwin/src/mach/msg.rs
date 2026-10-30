@@ -183,7 +183,11 @@ enum Pending {
     Moved(Name),
     /// A receive right already out of the space, with the descriptors to send:
     /// the port, and its listener or `-1`.
-    Receive { moved: wire::Moved, address: u64 },
+    Receive {
+        name: Name,
+        moved: wire::Moved,
+        address: u64,
+    },
 }
 
 impl Pending {
@@ -191,10 +195,14 @@ impl Pending {
     fn restore(self) {
         match self {
             Pending::Copied | Pending::Moved(_) => {}
-            Pending::Receive { moved, address } => {
+            Pending::Receive {
+                name,
+                moved,
+                address,
+            } => {
                 // SAFETY: the descriptors taken out of the space above, never
                 // handed to anything else.
-                space::insert_receive(unsafe {
+                space::restore_receive(name, unsafe {
                     Receiver::adopt(
                         moved.fd,
                         moved.senders,
@@ -261,7 +269,11 @@ fn export(name: Name, disposition: u32) -> Result<(Reference, Option<Pending>), 
                     complete: moved.complete,
                     address,
                 },
-                Some(Pending::Receive { moved, address }),
+                Some(Pending::Receive {
+                    name,
+                    moved,
+                    address,
+                }),
             ))
         }
         MAKE_SEND | COPY_SEND | MOVE_SEND => {
@@ -917,6 +929,37 @@ mod tests {
             )
         };
         name
+    }
+
+    #[test]
+    fn failed_send_preserves_moved_receive_right_names() {
+        for option in [SEND_MSG, SEND_MSG | SEND_TIMEOUT] {
+            let service = space::insert_send(wire::fresh_address());
+            let carried = allocate_receive();
+            let address = space::address_of(carried).unwrap();
+            let mut descriptor = Vec::new();
+            descriptor.extend_from_slice(&1u32.to_le_bytes());
+            descriptor.extend_from_slice(&carried.to_le_bytes());
+            descriptor.extend_from_slice(&0u32.to_le_bytes());
+            descriptor.extend_from_slice(&[0, 0, MOVE_RECEIVE as u8, DESCRIPTOR_PORT]);
+            let mut sent = message(BITS_COMPLEX, service, MACH_PORT_NULL, 7, &descriptor);
+            let result = unsafe {
+                mach_msg(
+                    sent.as_mut_ptr().cast(),
+                    option,
+                    sent.len() as u32,
+                    0,
+                    MACH_PORT_NULL,
+                    0,
+                    MACH_PORT_NULL,
+                )
+            };
+            assert_eq!(result, MACH_SEND_INVALID_DEST);
+            assert_eq!(space::address_of(carried), Some(address));
+            assert!(space::receiver(carried).is_some());
+            space::mach_port_destroy(space::TASK_SELF, service);
+            space::mach_port_destroy(space::TASK_SELF, carried);
+        }
     }
 
     #[test]
