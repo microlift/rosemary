@@ -436,6 +436,13 @@ pub fn insert_receive(port: Receiver) -> Name {
     insert(Right::Receive(Arc::new(port)))
 }
 
+/// A failed send restores the receive right under its original name.
+pub fn restore_receive(name: Name, port: Receiver) {
+    with(|space| {
+        space.names.insert(name, Right::Receive(Arc::new(port)));
+    });
+}
+
 /// Drop one user reference to `name`, removing it when the last one goes.
 ///
 /// This is `mach_port_deallocate`'s whole behaviour and the tail of several
