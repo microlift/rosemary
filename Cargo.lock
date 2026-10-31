@@ -2017,6 +2017,7 @@ dependencies = [
 name = "mediabackend"
 version = "0.5.0"
 dependencies = [
+ "ffmpeg",
  "gstreamer",
  "gstreamer-app",
  "gstreamer-video",
