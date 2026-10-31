@@ -741,6 +741,8 @@ fn run(start: Id) {
         let event = unsafe {
             crate::application::next_event_in_mode(app, TRACKED, 0.002, TRACKING_MODE, true)
         };
+        // SAFETY: as above.
+        let event = unsafe { newest_motion(app, event) };
         let Some(fields) = crate::nsevent::fields_of(event) else {
             if last_update.elapsed() >= PERIODIC_UPDATE && tracker.wants_periodic_updates() {
                 tracker.track(info, target(reporting), true);
@@ -785,6 +787,46 @@ fn run(start: Id) {
     };
     crate::application::with_current_event(start, || finish(result));
     crate::application::requeue_front(keys);
+}
+
+/// The newest of the motions queued right behind `event`, which a Mac hands
+/// over in place of the ones it skipped: a destination can take longer to
+/// answer an update than the pointer takes to move (a 3D editor that hit-tests
+/// its scene on each), and following every queued motion leaves the drag
+/// further behind with each one. Anything other than a motion ends the run, so
+/// buttons and keys keep their order.
+///
+/// # Safety
+///
+/// On the main thread with `app` the application, inside an autorelease pool.
+unsafe fn newest_motion(app: Id, mut event: Id) -> Id {
+    let is_motion = |event: Id| {
+        crate::nsevent::fields_of(event).is_some_and(|f| {
+            matches!(
+                f.kind,
+                kind::MOUSE_MOVED
+                    | kind::LEFT_MOUSE_DRAGGED
+                    | kind::RIGHT_MOUSE_DRAGGED
+                    | kind::OTHER_MOUSE_DRAGGED
+            )
+        })
+    };
+    if !is_motion(event) {
+        return event;
+    }
+    loop {
+        // SAFETY: the caller's thread and application; a zero wait only looks.
+        let next = unsafe {
+            crate::application::next_event_in_mode(app, TRACKED, 0.0, TRACKING_MODE, false)
+        };
+        if next.is_null() || !is_motion(next) {
+            return event;
+        }
+        // SAFETY: as above; this takes the event just looked at.
+        event = unsafe {
+            crate::application::next_event_in_mode(app, TRACKED, 0.0, TRACKING_MODE, true)
+        };
+    }
 }
 
 /// The button a drag is following was let go over the decorations, where no
