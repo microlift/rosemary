@@ -50,18 +50,24 @@ pub mod frame {
     pub const EXTENDED_DATA: usize = 96;
     pub const WIDTH: usize = 104;
     pub const HEIGHT: usize = 108;
+    /// Video only, an `AVRational`: numerator, then denominator.
+    pub const SAMPLE_ASPECT_RATIO: usize = 124;
     /// Both `enum AVPixelFormat` (video) and `enum AVSampleFormat` (audio):
     /// the same field, read as whichever the stream is.
     pub const FORMAT: usize = 116;
     /// Audio only: samples per channel in this frame.
     pub const NB_SAMPLES: usize = 112;
     pub const PTS: usize = 136;
+    pub const REPEAT_PICT: usize = 176;
     /// Audio only.
     pub const SAMPLE_RATE: usize = 180;
+    /// `AV_FRAME_FLAG_*`.
+    pub const FLAGS: usize = 276;
     pub const COLOR_RANGE: usize = 280;
     pub const COLOR_PRIMARIES: usize = 284;
     pub const COLOR_TRC: usize = 288;
     pub const COLORSPACE: usize = 292;
+    pub const CHROMA_LOCATION: usize = 296;
     pub const CROP_TOP: usize = 344;
     pub const CROP_LEFT: usize = 360;
     /// Audio only, an `AVChannelLayout` (see [`super::ch_layout`]).
@@ -87,6 +93,13 @@ pub const SAMPLE_FMT_NONE: i32 = -1;
 pub const EAGAIN: i32 = -11;
 pub const EOF: i32 = -541478725;
 pub const INVALIDDATA: i32 = -1094995529;
+/// `AV_FRAME_FLAG_INTERLACED` and `AV_FRAME_FLAG_TOP_FIELD_FIRST`.
+pub const FRAME_FLAG_INTERLACED: i32 = 8;
+pub const FRAME_FLAG_TOP_FIELD_FIRST: i32 = 16;
+/// `AVCHROMA_LOC_LEFT`, `AVCHROMA_LOC_CENTER` and `AVCHROMA_LOC_TOPLEFT`.
+pub const CHROMA_LOC_LEFT: i32 = 1;
+pub const CHROMA_LOC_CENTER: i32 = 2;
+pub const CHROMA_LOC_TOPLEFT: i32 = 3;
 /// `AVCOL_RANGE_MPEG` and `AVCOL_RANGE_JPEG`.
 pub const RANGE_MPEG: i32 = 1;
 pub const RANGE_JPEG: i32 = 2;
@@ -148,15 +161,22 @@ mod tests {
             ("AVFrame.extended_data", frame::EXTENDED_DATA as i64),
             ("AVFrame.width", frame::WIDTH as i64),
             ("AVFrame.height", frame::HEIGHT as i64),
+            (
+                "AVFrame.sample_aspect_ratio",
+                frame::SAMPLE_ASPECT_RATIO as i64,
+            ),
             ("AVFrame.nb_samples", frame::NB_SAMPLES as i64),
             ("AVFrame.format", frame::FORMAT as i64),
             ("AVFrame.pts", frame::PTS as i64),
+            ("AVFrame.repeat_pict", frame::REPEAT_PICT as i64),
             ("AVFrame.sample_rate", frame::SAMPLE_RATE as i64),
             ("AVFrame.ch_layout", frame::CH_LAYOUT as i64),
+            ("AVFrame.flags", frame::FLAGS as i64),
             ("AVFrame.color_range", frame::COLOR_RANGE as i64),
             ("AVFrame.color_primaries", frame::COLOR_PRIMARIES as i64),
             ("AVFrame.color_trc", frame::COLOR_TRC as i64),
             ("AVFrame.colorspace", frame::COLORSPACE as i64),
+            ("AVFrame.chroma_location", frame::CHROMA_LOCATION as i64),
             ("AVFrame.crop_top", frame::CROP_TOP as i64),
             ("AVFrame.crop_left", frame::CROP_LEFT as i64),
             ("AVCodecHWConfig.pix_fmt", hw_config::PIX_FMT as i64),
@@ -169,6 +189,14 @@ mod tests {
             ("EAGAIN", EAGAIN as i64),
             ("EOF", EOF as i64),
             ("INVALIDDATA", INVALIDDATA as i64),
+            ("FRAME_FLAG_INTERLACED", FRAME_FLAG_INTERLACED as i64),
+            (
+                "FRAME_FLAG_TOP_FIELD_FIRST",
+                FRAME_FLAG_TOP_FIELD_FIRST as i64,
+            ),
+            ("CHROMA_LOC_LEFT", CHROMA_LOC_LEFT as i64),
+            ("CHROMA_LOC_CENTER", CHROMA_LOC_CENTER as i64),
+            ("CHROMA_LOC_TOPLEFT", CHROMA_LOC_TOPLEFT as i64),
             ("RANGE_MPEG", RANGE_MPEG as i64),
             ("RANGE_JPEG", RANGE_JPEG as i64),
             ("LOG_ERROR", LOG_ERROR as i64),
@@ -199,16 +227,21 @@ int main(void) {
     O(AVCodecContext, hw_device_ctx);
     O(AVPacket, pts); O(AVPacket, data); O(AVPacket, size);
     O(AVFrame, data); O(AVFrame, linesize); O(AVFrame, extended_data);
-    O(AVFrame, width); O(AVFrame, height); O(AVFrame, nb_samples);
-    O(AVFrame, format); O(AVFrame, pts); O(AVFrame, sample_rate); O(AVFrame, ch_layout);
-    O(AVFrame, color_range); O(AVFrame, color_primaries);
-    O(AVFrame, color_trc); O(AVFrame, colorspace); O(AVFrame, crop_top); O(AVFrame, crop_left);
+    O(AVFrame, width); O(AVFrame, height); O(AVFrame, sample_aspect_ratio); O(AVFrame, nb_samples);
+    O(AVFrame, format); O(AVFrame, pts); O(AVFrame, repeat_pict); O(AVFrame, sample_rate);
+    O(AVFrame, ch_layout); O(AVFrame, flags); O(AVFrame, color_range); O(AVFrame, color_primaries);
+    O(AVFrame, color_trc); O(AVFrame, colorspace); O(AVFrame, chroma_location);
+    O(AVFrame, crop_top); O(AVFrame, crop_left);
     O(AVCodecHWConfig, pix_fmt); O(AVCodecHWConfig, methods); O(AVCodecHWConfig, device_type);
     V("METHOD_HW_DEVICE_CTX", AV_CODEC_HW_CONFIG_METHOD_HW_DEVICE_CTX);
     V("PIX_FMT_NONE", AV_PIX_FMT_NONE);
     V("HWDEVICE_TYPE_NONE", AV_HWDEVICE_TYPE_NONE);
     V("SAMPLE_FMT_NONE", AV_SAMPLE_FMT_NONE);
     V("EAGAIN", AVERROR(EAGAIN)); V("EOF", AVERROR_EOF); V("INVALIDDATA", AVERROR_INVALIDDATA);
+    V("FRAME_FLAG_INTERLACED", AV_FRAME_FLAG_INTERLACED);
+    V("FRAME_FLAG_TOP_FIELD_FIRST", AV_FRAME_FLAG_TOP_FIELD_FIRST);
+    V("CHROMA_LOC_LEFT", AVCHROMA_LOC_LEFT); V("CHROMA_LOC_CENTER", AVCHROMA_LOC_CENTER);
+    V("CHROMA_LOC_TOPLEFT", AVCHROMA_LOC_TOPLEFT);
     V("RANGE_MPEG", AVCOL_RANGE_MPEG); V("RANGE_JPEG", AVCOL_RANGE_JPEG);
     V("LOG_ERROR", AV_LOG_ERROR);
     V("INPUT_BUFFER_PADDING_SIZE", AV_INPUT_BUFFER_PADDING_SIZE);
