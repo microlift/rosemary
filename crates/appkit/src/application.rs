@@ -656,9 +656,32 @@ unsafe extern "C" fn next_event(
     mode: Id,
     dequeue: u8,
 ) -> Id {
+    let mode = match mode.is_null() {
+        true => corefoundation::runloop::DEFAULT_MODE.to_string(),
+        // SAFETY: a mode is a string object.
+        false => String::from_utf8_lossy(&unsafe { foundation::string::bytes(mode) }).into_owned(),
+    };
+    // SAFETY: the main thread's event call, where Apple runs the loop too.
+    unsafe { next_event_in_mode(receiver, mask, wait_interval(until), &mode, dequeue != 0) }
+}
+
+/// The body of `-nextEventMatchingMask:untilDate:inMode:dequeue:`, for a
+/// tracking loop of AppKit's own - a dragging session's - which must not reach
+/// a program's override of the method.
+///
+/// # Safety
+///
+/// Called on the main thread with `receiver` the application.
+pub(crate) unsafe fn next_event_in_mode(
+    receiver: Id,
+    mask: u64,
+    wait: f64,
+    mode: &str,
+    dequeue: bool,
+) -> Id {
     register_common_modes();
     crate::event::pump(receiver);
-    let event = queued_event(mask, dequeue != 0);
+    let event = queued_event(mask, dequeue);
     if !event.is_null() {
         return event;
     }
@@ -666,15 +689,8 @@ unsafe extern "C" fn next_event(
     // passes, and a toolkit waiting in here - Qt in a modal session does - relies
     // on its timers and sources firing meanwhile. Window-system input does not
     // wake the loop here, so the wait is a short slice and the caller asks again.
-    let mode = match mode.is_null() {
-        true => corefoundation::runloop::DEFAULT_MODE.to_string(),
-        // SAFETY: a mode is a string object.
-        false => String::from_utf8_lossy(&unsafe { foundation::string::bytes(mode) }).into_owned(),
-    };
-    let seconds = wait_interval(until).min(0.002);
-    // SAFETY: the main thread's event call, where Apple runs the loop too.
-    unsafe { service_run_loop(&mode, seconds) };
-    queued_event(mask, dequeue != 0)
+    unsafe { service_run_loop(mode, wait.min(0.002)) };
+    queued_event(mask, dequeue)
 }
 
 /// `-stop:`, which ends the loop above after the current turn.
@@ -1066,6 +1082,15 @@ pub(crate) fn enqueue_input(event: Id) {
     posted_events().push_back(objc::arc::retain(event) as usize);
 }
 
+/// Put events a tracking loop took back at the front of the queue, in their
+/// order. The queue takes over the caller's reference to each.
+pub(crate) fn requeue_front(events: Vec<Id>) {
+    let mut queue = posted_events();
+    for event in events.into_iter().rev() {
+        queue.push_front(event as usize);
+    }
+}
+
 /// Send every queued event through the application's dynamic `-sendEvent:`.
 ///
 /// # Safety
@@ -1110,6 +1135,16 @@ unsafe extern "C" fn reply_to_open_or_print(_receiver: Id, _sel: Sel, _reply: us
 
 pub(crate) unsafe extern "C" fn current_event(_receiver: Id, _sel: Sel) -> Id {
     CURRENT_EVENT.load(Ordering::Acquire) as Id
+}
+
+/// Run `f` with `event` as `-currentEvent`, for an event AppKit consumes
+/// itself rather than sending: a dragging destination reads the modifiers of
+/// the move that reached it from there.
+pub(crate) fn with_current_event<R>(event: Id, f: impl FnOnce() -> R) -> R {
+    let outer = CURRENT_EVENT.swap(event as usize, Ordering::AcqRel);
+    let result = f();
+    CURRENT_EVENT.store(outer, Ordering::Release);
+    result
 }
 
 /// `-sendEvent:`, the entry point a subclass overrides and then calls up into.

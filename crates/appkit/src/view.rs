@@ -3290,6 +3290,7 @@ unsafe extern "C" fn dealloc(receiver: Id, _sel: Sel) {
     unsafe { crate::layer::set_view(layer, std::ptr::null_mut()) };
     objc::arc::release(layer);
     crate::cursor::discard_rects(receiver);
+    crate::dragging::forget(receiver);
     objc::arc::finalize(receiver);
 }
 
@@ -3498,8 +3499,6 @@ pub fn is_hidden_or_has_hidden_ancestor(view: Id) -> bool {
 
 unsafe extern "C" fn ignored(_receiver: Id, _sel: Sel) {}
 
-unsafe extern "C" fn ignored_object(_receiver: Id, _sel: Sel, _object: Id) {}
-
 unsafe extern "C" fn ignored_flag(_receiver: Id, _sel: Sel, _flag: u8) {}
 
 unsafe extern "C" fn ignored_integer(_receiver: Id, _sel: Sel, _value: isize) {}
@@ -3636,10 +3635,6 @@ pub(crate) fn install() {
         // Drawing focus rings belongs to AppKit's control renderer, which this
         // view does not have; accepting the policy still lets Qt construct it.
         "setFocusRingType:" => ignored_integer, c"v24@0:8Q16";
-        // Drag delivery is not wired to SDL yet, but registration itself has
-        // no observable result other than which future drag messages arrive.
-        "registerForDraggedTypes:" => ignored_object, c"v24@0:8@16";
-        "unregisterDraggedTypes" => ignored, c"v16@0:8";
         "setAutoresizingMask:" => set_autoresizing_mask, c"v24@0:8Q16";
         "autoresizingMask" => autoresizing_mask, c"Q16@0:8";
         "setAutoresizesSubviews:" => set_autoresizes_subviews, c"v20@0:8c16";
