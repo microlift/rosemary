@@ -3496,7 +3496,10 @@ version = "0.5.0"
 dependencies = [
  "corefoundation",
  "coremedia",
+ "corevideo",
  "exports",
+ "mediabackend",
+ "objc",
 ]
 
 [[package]]

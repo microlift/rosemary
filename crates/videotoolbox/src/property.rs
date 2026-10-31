@@ -1,29 +1,38 @@
 #![allow(non_snake_case)]
 
-use crate::types::OSStatus;
-use crate::{
-    constants::{kVTParameterErr, kVTPropertyNotSupportedErr},
-    types::VTSessionRef,
-};
+//! `VTSession` properties. The only sessions there are decompression ones.
+
 use corefoundation::{
     api::CFAllocatorRef, base::CFTypeRef, collections::CFDictionaryRef, string::CFStringRef,
 };
 
+use crate::constants::{kVTParameterErr, kVTPropertyNotSupportedErr};
+use crate::decompression;
+use crate::types::{OSStatus, VTSessionRef};
+
+/// `OSStatus VTSessionSetProperty(VTSessionRef session, CFStringRef
+/// propertyKey, CFTypeRef propertyValue)`
 pub unsafe extern "C" fn VTSessionSetProperty(
-    _session: VTSessionRef,
-    _propertyKey: CFStringRef,
-    _propertyValue: CFTypeRef,
+    session: VTSessionRef,
+    property_key: CFStringRef,
+    property_value: CFTypeRef,
 ) -> OSStatus {
-    kVTPropertyNotSupportedErr
+    decompression::set_property(session.cast_const(), property_key.cast(), property_value)
 }
 
+/// `OSStatus VTSessionCopyProperty(VTSessionRef session, CFStringRef
+/// propertyKey, CFAllocatorRef allocator, void *propertyValueOut)`
 pub unsafe extern "C" fn VTSessionCopyProperty(
-    _session: VTSessionRef,
-    _propertyKey: CFStringRef,
+    session: VTSessionRef,
+    property_key: CFStringRef,
     _allocator: CFAllocatorRef,
-    _propertyValueOut: *mut CFTypeRef,
+    property_value_out: *mut CFTypeRef,
 ) -> OSStatus {
-    kVTPropertyNotSupportedErr
+    decompression::copy_property(
+        session.cast_const(),
+        property_key.cast(),
+        property_value_out,
+    )
 }
 
 pub unsafe extern "C" fn VTSessionSetProperties(
@@ -38,4 +47,11 @@ pub unsafe extern "C" fn VTSessionCopySupportedPropertyDictionary(
     _supportedPropertyDictionaryOut: *mut CFDictionaryRef,
 ) -> OSStatus {
     kVTParameterErr
+}
+
+exports::exports! {
+    functions {
+        "VTSessionSetProperty" => VTSessionSetProperty,
+        "VTSessionCopyProperty" => VTSessionCopyProperty,
+    }
 }
