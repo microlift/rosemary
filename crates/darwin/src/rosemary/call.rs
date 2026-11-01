@@ -14,11 +14,11 @@ unsafe extern "C" fn rosemary_host_call_trampoline(
     argcount: usize,
     mut args: ...
 ) -> usize {
+    let _savior = ScopedHostSyscallContext::new();
     if !cfg!(target_arch = "x86_64") && !cfg!(target_os = "macos") {
         panic!("This function is not safe to call on your platform due to VaList ABI differences.")
     }
 
-    let _savior = ScopedHostSyscallContext::new();
     let mut copied_args: Vec<usize> = Vec::new();
     let mut cif_typed_args: Vec<(Type, Arg)> = Vec::new();
     cif_typed_args.reserve(argcount);

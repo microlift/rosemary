@@ -13,9 +13,15 @@ unsafe extern "C" fn host_dlsym(handle: *mut c_void, symbol: *const c_char) -> *
     sym
 }
 
+unsafe extern "C" fn host_dlclose(handle: *mut c_void) -> i32 {
+    let _savior = ScopedHostSyscallContext::new();
+    unsafe { libc::dlclose(handle) }
+}
+
 exports::exports! {
     functions  {
         "rosemary_host_dlopen" => host_dlopen,
         "rosemary_host_dlsym" => host_dlsym,
+        "rosemary_host_dlclose" => host_dlclose,
     }
 }
