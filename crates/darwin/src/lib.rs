@@ -94,6 +94,7 @@ pub mod random;
 pub mod regex;
 mod resolv;
 pub mod rlimit;
+mod rosemary;
 pub mod sched;
 pub mod select;
 pub mod shm;
@@ -419,6 +420,8 @@ static NONPORTABLE_MODULES: &[exports::Module] = &[
     getopt::MODULE,
 ];
 
+static ROSEMARY_EXTENSION_MODULES: &[exports::Module] = &[crate::rosemary::MODULE];
+
 #[cfg(target_os = "macos")]
 static NONPORTABLE_MODULES: &[exports::Module] = &[];
 
@@ -430,9 +433,19 @@ fn modules() -> impl Iterator<Item = &'static exports::Module> {
     } else {
         &[]
     };
-    [DEFAULT_MODULES, builtin, NONPORTABLE_MODULES]
-        .into_iter()
-        .flatten()
+    let rosemary_extensions = if crate::rosemary::rosemary_extensions_enabled() {
+        ROSEMARY_EXTENSION_MODULES
+    } else {
+        &[]
+    };
+    [
+        DEFAULT_MODULES,
+        builtin,
+        NONPORTABLE_MODULES,
+        rosemary_extensions,
+    ]
+    .into_iter()
+    .flatten()
 }
 
 fn implemented(name: &str) -> Option<u64> {
