@@ -111,22 +111,10 @@ impl Gpu {
             return None;
         }
         let size = length.checked_next_multiple_of(host.alignment)?;
-        // SAFETY: a fresh private anonymous mapping; nothing else names it.
-        let base = unsafe {
-            libc::mmap(
-                std::ptr::null_mut(),
-                size as usize,
-                libc::PROT_READ | libc::PROT_WRITE,
-                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_NORESERVE,
-                -1,
-                0,
-            )
-        };
-        if base == libc::MAP_FAILED {
-            return None;
-        }
+        let base =
+            starnix::memory::anonymous(size as usize, libc::PROT_READ | libc::PROT_WRITE).ok()?;
         Some(HostPages {
-            base: base.cast(),
+            base: base.as_ptr(),
             size,
             whole: AtomicU64::new(0),
             imports: Mutex::new(Vec::new()),

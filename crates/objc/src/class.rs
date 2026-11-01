@@ -195,20 +195,13 @@ pub fn is_known(p: *const Class) -> bool {
 
 fn arena_slot() -> Option<*mut Class> {
     if ARENA.load(Ordering::Relaxed) == 0 {
-        // SAFETY: a fresh private anonymous reservation.
-        let mapped = unsafe {
-            libc::mmap(
-                std::ptr::null_mut(),
-                CLASS_CAPACITY * CLASS_STRIDE,
-                libc::PROT_READ | libc::PROT_WRITE,
-                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_NORESERVE,
-                -1,
-                0,
-            )
-        };
-        let base = match mapped == libc::MAP_FAILED {
-            true => NO_ARENA,
-            false => mapped as usize,
+        let mapped = starnix::memory::anonymous(
+            CLASS_CAPACITY * CLASS_STRIDE,
+            libc::PROT_READ | libc::PROT_WRITE,
+        );
+        let base = match mapped {
+            Ok(mapped) => mapped.as_ptr() as usize,
+            Err(_) => NO_ARENA,
         };
         ARENA.store(base, Ordering::Relaxed);
     }

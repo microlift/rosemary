@@ -90,10 +90,8 @@ pub fn map_flags(flags: i32) -> i32 {
             // These two do *not* agree by value, and are the reason this
             // function exists.
             (darwin::MAP_ANON, libc::MAP_ANONYMOUS),
-            // FreeBSD removed `MAP_NORESERVE` in 11 - it always overcommits -
-            // so the hint has nothing to carry to and is dropped.
-            #[cfg(not(target_os = "freebsd"))]
-            (darwin::MAP_NORESERVE, libc::MAP_NORESERVE),
+            // Zero, so dropped, on a host that always overcommits.
+            (darwin::MAP_NORESERVE, starnix::memory::NORESERVE),
             #[cfg(target_arch = "x86_64")]
             (darwin::MAP_32BIT, libc::MAP_32BIT),
         ] {

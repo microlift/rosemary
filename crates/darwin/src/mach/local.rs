@@ -295,21 +295,10 @@ pub fn place(
     let Some(span) = length.checked_add(align_mask) else {
         return Err(KERN_NO_SPACE);
     };
-    // SAFETY: a new inaccessible reservation.
-    let reserved = unsafe {
-        libc::mmap(
-            std::ptr::null_mut(),
-            span as usize,
-            libc::PROT_NONE,
-            libc::MAP_PRIVATE | libc::MAP_ANON | libc::MAP_NORESERVE,
-            -1,
-            0,
-        )
-    };
-    if reserved == libc::MAP_FAILED {
+    let Ok(reserved) = starnix::memory::anonymous(span as usize, libc::PROT_NONE) else {
         return Err(KERN_NO_SPACE);
-    }
-    let reserved = reserved as u64;
+    };
+    let reserved = reserved.as_ptr() as u64;
     let aligned = (reserved + align_mask) & !align_mask;
     let placed = map(aligned, libc::MAP_FIXED);
     // SAFETY: the parts of the reservation outside the mapping, or all of it

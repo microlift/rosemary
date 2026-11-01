@@ -2567,6 +2567,8 @@ fn fork_while_allocating(t: &mut T) {
             (*mark).store(0, Ordering::SeqCst);
             let pid = libc::fork();
             if pid == 0 {
+                // Yama is Linux's; elsewhere nothing stops the attach.
+                #[cfg(target_os = "linux")]
                 if stacks {
                     libc::prctl(libc::PR_SET_PTRACER, libc::PR_SET_PTRACER_ANY);
                 }

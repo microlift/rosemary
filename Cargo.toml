@@ -44,7 +44,7 @@ metal_translate = { path = "crates/metal_translate" }
 metal = { path = "crates/metal" }
 videotoolbox = { path = "crates/videotoolbox" }
 ash = "0.38"
-libc = "0.2"
+libc = "0.2.190"
 half = "2.7.1"
 libm = "0.2"
 backtrace = "0.3"
