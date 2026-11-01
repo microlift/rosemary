@@ -10,6 +10,9 @@ pub mod memory {
 
     pub use crate::memory::named::object;
 
+    /// Unknown here, and only a hint, so not asked for.
+    pub const NORESERVE: libc::c_int = 0;
+
     pub fn exclude_from_fork(_address: usize, _len: usize) -> std::io::Result<()> {
         Err(std::io::ErrorKind::Unsupported.into())
     }

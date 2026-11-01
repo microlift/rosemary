@@ -9,6 +9,8 @@ pub mod memory {
 
     pub use crate::memory::named::object;
 
+    pub const NORESERVE: libc::c_int = libc::MAP_NORESERVE;
+
     pub fn exclude_from_fork(address: usize, len: usize) -> std::io::Result<()> {
         unsafe extern "C" {
             fn minherit(address: *mut core::ffi::c_void, len: usize, flags: u32) -> i32;

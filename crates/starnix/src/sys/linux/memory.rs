@@ -8,6 +8,8 @@ use std::os::fd::{FromRawFd, OwnedFd};
 
 use crate::memory::piped;
 
+pub const NORESERVE: libc::c_int = libc::MAP_NORESERVE;
+
 /// Whether the calls were refused once, so the rest go straight to the pipe.
 static REFUSED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 

@@ -5,9 +5,11 @@
 //! the way the copy needs, comes back as an error rather than a signal. Both
 //! are async-signal-safe: no allocation, no locks.
 //!
-//! Also the anonymous shared-memory objects a Mach memory entry is made of.
+//! Also the anonymous shared-memory objects a Mach memory entry is made of,
+//! and private anonymous memory committed only as it is touched.
 
-use core::ffi::c_void;
+use core::ffi::{c_int, c_void};
+use core::ptr::NonNull;
 use std::io;
 use std::os::fd::{AsRawFd, OwnedFd};
 
@@ -85,6 +87,30 @@ pub fn exclude_from_fork(address: usize, len: usize) -> io::Result<()> {
     sys::memory::exclude_from_fork(address, len)
 }
 
+/// The `mmap` flag that asks for a mapping not to be charged against commit
+/// until it is touched, or `0` on a host that never charges up front.
+pub const NORESERVE: c_int = sys::memory::NORESERVE;
+
+/// `len` bytes of private, zero-filled memory at an address the kernel picks,
+/// committed only as it is touched. `PROT_NONE` reserves address space alone.
+pub fn anonymous(len: usize, prot: c_int) -> io::Result<NonNull<u8>> {
+    // SAFETY: a new mapping at no fixed address cannot displace anything.
+    let mapped = unsafe {
+        libc::mmap(
+            core::ptr::null_mut(),
+            len,
+            prot,
+            libc::MAP_PRIVATE | libc::MAP_ANON | NORESERVE,
+            -1,
+            0,
+        )
+    };
+    match mapped {
+        libc::MAP_FAILED => Err(io::Error::last_os_error()),
+        mapped => NonNull::new(mapped.cast()).ok_or_else(|| io::Error::other("mapped at null")),
+    }
+}
+
 fn fault(address: usize, offset: usize) -> Fault {
     let kind = match mapped(address.wrapping_add(offset)) {
         true => FaultKind::Protection,
@@ -108,13 +134,16 @@ pub(crate) mod named {
             // SAFETY: `getpid` has no preconditions.
             let name = format!("/rosemary.{}.{n}\0", unsafe { libc::getpid() });
             let mode: libc::mode_t = 0o600;
+            // Variadic on macOS, where the mode arrives promoted.
+            #[cfg(target_os = "macos")]
+            let mode = mode as libc::c_uint;
             // SAFETY: a NUL-terminated name; `O_EXCL` so nothing else's
             // object is opened.
             let fd = unsafe {
                 libc::shm_open(
                     name.as_ptr().cast(),
                     libc::O_RDWR | libc::O_CREAT | libc::O_EXCL,
-                    mode as libc::c_uint,
+                    mode,
                 )
             };
             if fd < 0 {
@@ -251,6 +280,18 @@ mod tests {
         };
         assert_ne!(at, libc::MAP_FAILED);
         (at.cast(), page)
+    }
+
+    #[test]
+    fn anonymous_memory_reads_zero_and_takes_writes() {
+        let page = crate::system::page_size() as usize;
+        let at = anonymous(page, libc::PROT_READ | libc::PROT_WRITE).unwrap();
+        // SAFETY: a page of read-write memory just mapped.
+        unsafe {
+            assert_eq!(*at.as_ptr(), 0);
+            *at.as_ptr() = 1;
+            libc::munmap(at.as_ptr().cast(), page);
+        }
     }
 
     #[test]

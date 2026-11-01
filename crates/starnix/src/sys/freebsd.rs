@@ -7,6 +7,9 @@ pub mod signal;
 pub mod memory {
     pub use crate::memory::piped::{read, write};
 
+    /// Removed in FreeBSD 11, which always overcommits anonymous memory.
+    pub const NORESERVE: libc::c_int = 0;
+
     pub fn object() -> std::io::Result<std::os::fd::OwnedFd> {
         use std::os::fd::FromRawFd;
         // SAFETY: a NUL-terminated name, which only labels the object.
