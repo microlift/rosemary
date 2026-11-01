@@ -22,6 +22,7 @@ pub mod corefoundation;
 pub mod coregraphics;
 pub mod curl;
 pub mod err;
+pub mod extension;
 pub(crate) mod host;
 pub mod intdiv;
 pub mod ioctl;
@@ -216,6 +217,7 @@ pub fn resolve(symbol: &str) -> Option<Resolved> {
             if let Some(f) = foundation_variadic(name)
                 .or_else(|| math::shim_for(name))
                 .or_else(|| err::shim_for(name))
+                .or_else(|| extension::shim_for(name))
                 .or_else(|| intdiv::shim_for(name))
                 .or_else(|| process::shim_for(name))
                 .or_else(|| stackprobe::shim_for(name))
@@ -254,6 +256,7 @@ pub fn is_shimmed(symbol: &str) -> bool {
     let name = symbol.strip_prefix('_').unwrap_or(symbol);
     if math::shim_for(name).is_some()
         || err::shim_for(name).is_some()
+        || extension::shim_for(name).is_some()
         || intdiv::shim_for(name).is_some()
         || process::shim_for(name).is_some()
         || stackprobe::shim_for(name).is_some()

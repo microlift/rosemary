@@ -94,7 +94,7 @@ pub mod random;
 pub mod regex;
 mod resolv;
 pub mod rlimit;
-mod rosemary;
+pub mod rosemary;
 pub mod sched;
 pub mod select;
 pub mod shm;

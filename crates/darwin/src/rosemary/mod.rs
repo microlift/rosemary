@@ -1,6 +1,6 @@
 //! C FFI implementation detail for Rosemary extension libraries to interact with the host
 //! operating system in a standardized manner.
-//! 
+//!
 //! Useful for implementing Rosemary specific extensions from a portable Darwin dylib,
 //! such as an OpenXR runtime, which would normally be out of scope for Rosemary since
 //! macOS does not have one itself.

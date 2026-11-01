@@ -3250,6 +3250,14 @@ pub static SIGNATURES: &[FunctionAbi] = &[
     sig!("recvmsg", I64, I32, P, I32),
     sig!("remove", I32, P),
     sig!("rename", I32, P, P),
+    // Rosemary's own extension API, exported only when
+    // `ROSEMARY_EXPOSE_LIBSYSTEM_EXTENSIONS` is set. The trampoline's tail is
+    // `argcount` word-sized integers.
+    sig!("rosemary_get_host_rtld_default", P),
+    vsig!("rosemary_host_call_trampoline", U64, P, U64),
+    sig!("rosemary_host_dlclose", I32, P),
+    sig!("rosemary_host_dlopen", P, P, I32),
+    sig!("rosemary_host_dlsym", P, P, P),
     sig!("rewind", V, P),
     // `strrchr` under the name BSD gave it first. `libsteam_api.dylib` uses it
     // to take the directory off its own path while looking for the client.
