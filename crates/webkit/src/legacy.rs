@@ -1112,7 +1112,7 @@ unsafe extern "C" fn set_application_name(receiver: Id, _sel: Sel, name: Id) {
     };
     let agent = match name.is_empty() {
         true => web_view::USER_AGENT.to_string(),
-        false => format!("{} {name}", web_view::USER_AGENT),
+        false => web_view::header_user_agent(&format!("{} {name}", web_view::USER_AGENT)),
     };
     if engine::tracing() {
         eprintln!("rosemary: webkit: user agent {agent}");
