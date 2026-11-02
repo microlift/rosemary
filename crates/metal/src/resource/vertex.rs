@@ -253,32 +253,27 @@ pub(crate) unsafe fn copy_vertex_descriptor(source: Id) -> Id {
 }
 
 pub(super) unsafe extern "C" fn vertex_descriptor_init(receiver: Id, _sel: Sel) -> Id {
-    // SAFETY: a freshly allocated vertex descriptor.
+    // SAFETY: a vertex descriptor of this crate's. This is `-reset` as well as
+    // `-init`; collections vended before a reset stay this descriptor's, and
+    // their elements read the reset values through it.
     let descriptor = unsafe { object::body::<VertexDescriptor>(receiver) };
     descriptor.layouts = [VertexLayout::default(); VERTEX_SLOTS];
     descriptor.attributes = [VertexAttribute::default(); VERTEX_SLOTS];
-    // `-init` is `-reset` here, and a reset descriptor still owns whatever a
-    // previous one vended.
-    release_collections(descriptor, false);
     receiver
 }
 
-/// Give up the collections a vertex descriptor vended.
+/// Give up the collections a vertex descriptor vended, as it goes.
 ///
-/// `orphaning` only where the descriptor itself is going: a guest which holds
-/// `-layouts` past the descriptor keeps the collection and its elements alive,
-/// and orphaning leaves their setters harmless rather than writing into freed
-/// memory. A `-reset` must not orphan, because the descriptor is still there
-/// and Metal keeps setting through a collection a guest took before it.
-fn release_collections(descriptor: &mut VertexDescriptor, orphaning: bool) {
+/// A guest which holds `-layouts` past the descriptor keeps the collection and
+/// its elements alive, and orphaning leaves their setters harmless rather than
+/// writing into freed memory.
+fn release_collections(descriptor: &mut VertexDescriptor) {
     for slot in [
         &mut descriptor.layout_objects,
         &mut descriptor.attribute_objects,
     ] {
         let collection = std::mem::replace(slot, std::ptr::null_mut());
-        if orphaning {
-            orphan(collection);
-        }
+        orphan(collection);
         objc::arc::release(collection);
     }
 }
@@ -359,7 +354,7 @@ pub(super) unsafe extern "C" fn collection_dealloc(receiver: Id, _sel: Sel) {
 /// `-[MTLVertexDescriptor dealloc]`.
 pub(super) unsafe extern "C" fn vertex_descriptor_dealloc(receiver: Id, _sel: Sel) {
     // SAFETY: a vertex descriptor of this crate's.
-    release_collections(unsafe { object::body::<VertexDescriptor>(receiver) }, true);
+    release_collections(unsafe { object::body::<VertexDescriptor>(receiver) });
     objc::arc::finalize(receiver);
 }
 
@@ -373,5 +368,32 @@ pub(super) unsafe extern "C" fn set_vertex_element_value(receiver: Id, sel: Sel,
         b"setOffset:" => attribute_of(receiver).offset = value,
         b"setBufferIndex:" => attribute_of(receiver).buffer_index = value,
         _ => (),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_collection_held_across_reset_is_orphaned_when_its_descriptor_goes() {
+        crate::bootstrap();
+        let descriptor = new_empty_vertex_descriptor();
+        // SAFETY: the registered methods of a vertex descriptor this test made.
+        unsafe {
+            let layouts = objc::arc::retain(vertex_layouts(descriptor, objc::sel::get("layouts")));
+            let element = indexed_element(layouts, objc::sel::get("objectAtIndexedSubscript:"), 1);
+            set_vertex_element_value(element, objc::sel::get("setStride:"), 16);
+            vertex_descriptor_init(descriptor, objc::sel::get("reset"));
+            assert_eq!(
+                vertex_layouts(descriptor, objc::sel::get("layouts")),
+                layouts
+            );
+            assert_eq!(vertex_element_value(element, objc::sel::get("stride")), 0);
+
+            objc::arc::release(descriptor);
+            assert!(object::body::<VertexElement>(element).owner.is_null());
+            objc::arc::release(layouts);
+        }
     }
 }

@@ -751,21 +751,30 @@ pub(crate) fn begin_render_pass(
 pub(super) unsafe extern "C" fn render_pass_descriptor_init(receiver: Id, _sel: Sel) -> Id {
     // SAFETY: a render pass descriptor of this crate's. `-init` reaches a fresh
     // one, whose body is zero, and a reused one, which still owns what it holds.
-    unsafe { release_pass_contents(receiver, false) };
-    *unsafe { object::body::<RenderPassDescriptor>(receiver) } = RenderPassDescriptor::default();
+    unsafe { release_pass_resources(receiver) };
+    let descriptor = unsafe { object::body::<RenderPassDescriptor>(receiver) };
+    // Attachment objects vended before stay this descriptor's, and read the
+    // reset values through it.
+    let (color_objects, depth_object, stencil_object) = (
+        descriptor.color_objects,
+        descriptor.depth_object,
+        descriptor.stencil_object,
+    );
+    *descriptor = RenderPassDescriptor {
+        color_objects,
+        depth_object,
+        stencil_object,
+        ..RenderPassDescriptor::default()
+    };
     receiver
 }
 
-/// Give up every reference a render pass descriptor holds, leaving it null.
-///
-/// `orphaning` only where the descriptor itself is going: `-init` reaches a
-/// reused descriptor which is still alive, and Metal keeps setting through an
-/// attachment object a guest took before it.
+/// Give up the textures and visibility buffer a render pass descriptor holds.
 ///
 /// # Safety
 ///
 /// `receiver` must be a `MTLRenderPassDescriptor` of this crate's.
-pub(super) unsafe fn release_pass_contents(receiver: Id, orphaning: bool) {
+unsafe fn release_pass_resources(receiver: Id) {
     let descriptor = unsafe { object::body::<RenderPassDescriptor>(receiver) };
     let mut attachments: Vec<&mut AttachmentDescriptor> = descriptor.colors.iter_mut().collect();
     attachments.push(&mut descriptor.depth);
@@ -780,34 +789,42 @@ pub(super) unsafe fn release_pass_contents(receiver: Id, orphaning: bool) {
             std::ptr::null_mut(),
         ));
     }
-    // The attachment objects point back at this descriptor, and a guest may
-    // hold one - or the collection - after releasing the descriptor. Orphan
-    // each before it goes, so a later setter is a no-op rather than a write
-    // through a dangling pointer.
-    let colors = std::mem::replace(&mut descriptor.color_objects, std::ptr::null_mut());
-    if orphaning {
-        crate::resource::orphan(colors);
-    }
-    objc::arc::release(colors);
-    for slot in [&mut descriptor.depth_object, &mut descriptor.stencil_object] {
-        let element = std::mem::replace(slot, std::ptr::null_mut());
-        if orphaning && !element.is_null() {
-            // SAFETY: an `RosemaryMTLRenderPassAttachmentDescriptor` this descriptor
-            // made.
-            unsafe { crate::resource::orphan_element::<AttachmentElement>(element) };
-        }
-        objc::arc::release(element);
-    }
     objc::arc::release(std::mem::replace(
         &mut descriptor.visibility_result_buffer,
         std::ptr::null_mut(),
     ));
 }
 
+/// Give up every reference a render pass descriptor holds, as it goes.
+///
+/// # Safety
+///
+/// `receiver` must be a `MTLRenderPassDescriptor` of this crate's.
+pub(super) unsafe fn release_pass_contents(receiver: Id) {
+    unsafe { release_pass_resources(receiver) };
+    let descriptor = unsafe { object::body::<RenderPassDescriptor>(receiver) };
+    // The attachment objects point back at this descriptor, and a guest may
+    // hold one - or the collection - after releasing the descriptor. Orphan
+    // each before it goes, so a later setter is a no-op rather than a write
+    // through a dangling pointer.
+    let colors = std::mem::replace(&mut descriptor.color_objects, std::ptr::null_mut());
+    crate::resource::orphan(colors);
+    objc::arc::release(colors);
+    for slot in [&mut descriptor.depth_object, &mut descriptor.stencil_object] {
+        let element = std::mem::replace(slot, std::ptr::null_mut());
+        if !element.is_null() {
+            // SAFETY: an `RosemaryMTLRenderPassAttachmentDescriptor` this descriptor
+            // made.
+            unsafe { crate::resource::orphan_element::<AttachmentElement>(element) };
+        }
+        objc::arc::release(element);
+    }
+}
+
 /// `-[MTLRenderPassDescriptor dealloc]`.
 pub(super) unsafe extern "C" fn render_pass_descriptor_dealloc(receiver: Id, _sel: Sel) {
     // SAFETY: a render pass descriptor of this crate's.
-    unsafe { release_pass_contents(receiver, true) };
+    unsafe { release_pass_contents(receiver) };
     objc::arc::finalize(receiver);
 }
 
@@ -984,6 +1001,17 @@ pub(super) unsafe extern "C" fn set_attachment_object(receiver: Id, sel: Sel, va
         b"setResolveTexture:" => &mut attachment.resolve_texture,
         _ => return,
     };
+    // A texture buffer has no image to attach: Metal refuses it as a render
+    // target, and every attachment path here reads the image.
+    // SAFETY: only a texture of this crate's is attached.
+    let value =
+        match !value.is_null() && unsafe { object::body::<Texture>(value) }.is_texture_buffer() {
+            true => {
+                gpu::trace("rejecting a texture buffer as a render pass attachment");
+                std::ptr::null_mut()
+            }
+            false => value,
+        };
     objc::arc::release(std::mem::replace(slot, objc::arc::retain(value)));
 }
 
@@ -1290,5 +1318,37 @@ mod tests {
         let error = resolve_modes(everything(), vk::ImageAspectFlags::DEPTH, None, Some(0))
             .expect_err("no stencil aspect");
         assert!(error.contains("no stencil aspect"), "{error}");
+    }
+
+    #[test]
+    fn attachments_held_across_init_are_orphaned_when_their_descriptor_goes() {
+        crate::bootstrap();
+        let pass = object::make(c"MTLRenderPassDescriptor", RenderPassDescriptor::default());
+        // SAFETY: the registered methods of a descriptor this test made.
+        unsafe {
+            let colors = objc::arc::retain(pass_color_attachments(
+                pass,
+                objc::sel::get("colorAttachments"),
+            ));
+            let depth = objc::arc::retain(pass_single_attachment(
+                pass,
+                objc::sel::get("depthAttachment"),
+            ));
+            let color = object::body::<crate::resource::IndexedCollection>(colors).elements[0];
+            set_attachment_number(color, objc::sel::get("setLoadAction:"), 2);
+            render_pass_descriptor_init(pass, objc::sel::get("init"));
+            assert_eq!(
+                pass_color_attachments(pass, objc::sel::get("colorAttachments")),
+                colors
+            );
+            assert_eq!(attachment_of(color).map(|a| a.load_action), Some(0));
+
+            objc::arc::release(pass);
+            for element in [color, depth] {
+                assert!(object::body::<AttachmentElement>(element).owner.is_null());
+            }
+            objc::arc::release(colors);
+            objc::arc::release(depth);
+        }
     }
 }

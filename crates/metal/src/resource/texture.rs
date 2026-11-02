@@ -40,6 +40,11 @@ impl Texture {
         }
     }
 
+    /// Whether this is a view of a buffer's memory, which has no image.
+    pub fn is_texture_buffer(&self) -> bool {
+        self.texel_view != vk::BufferView::null()
+    }
+
     /// The bytes `-[MTLDevice currentAllocatedSize]` counts this texture as.
     /// Read from the image rather than the descriptor, so that the figure a
     /// deallocation subtracts is the one its creation added.
@@ -424,6 +429,11 @@ pub(super) unsafe extern "C" fn replace_region(
     }
     // SAFETY: a texture of this crate's.
     let texture = unsafe { object::body::<Texture>(receiver) };
+    if texture.is_texture_buffer() {
+        // Its bytes are its buffer's, which a guest writes through
+        // `-contents`; an image copy here would name a null `VkImage`.
+        return gpu::trace("replaceRegion: of a texture buffer is not supported");
+    }
     // Every number below this line came from the guest. A region outside the
     // texture, or a size which overflows, is a Metal programming error and
     // becomes a diagnostic here rather than an invalid `vkCmdCopyBufferToImage`
@@ -582,6 +592,10 @@ pub(super) unsafe extern "C" fn get_bytes_slice(
     }
     // SAFETY: a texture of this crate's.
     let texture = unsafe { object::body::<Texture>(receiver) };
+    if texture.is_texture_buffer() {
+        // As for `-replaceRegion:`: there is no image to copy from.
+        return gpu::trace("getBytes: of a texture buffer is not supported".to_string());
+    }
     let image = &texture.image;
     if image.samples != vk::SampleCountFlags::TYPE_1 {
         return gpu::trace("getBytes: of a multisampled texture".to_string());
@@ -884,6 +898,10 @@ fn texture_view(
 ) -> Id {
     // SAFETY: a texture of this crate's.
     let texture = unsafe { object::body::<Texture>(receiver) };
+    if texture.is_texture_buffer() {
+        gpu::trace("rejecting newTextureViewWithPixelFormat: of a texture buffer");
+        return std::ptr::null_mut();
+    }
     let format = gpu::pixel_format(pixel_format);
     if format == vk::Format::UNDEFINED {
         gpu::trace(format!(

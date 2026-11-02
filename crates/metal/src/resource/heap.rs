@@ -443,13 +443,28 @@ unsafe extern "C" fn heap_value(receiver: Id, sel: Sel) -> u64 {
     descriptor_field(descriptor, sel)
 }
 
+/// The placement memory `heap` holds, without keeping it alive.
+#[cfg(test)]
+pub(crate) fn placement_of(heap: Id) -> Option<std::sync::Weak<gpu::Placement>> {
+    // SAFETY: the caller passes a heap of this crate's.
+    unsafe { object::body::<Heap>(heap) }
+        .placement
+        .as_ref()
+        .map(Arc::downgrade)
+}
+
 unsafe extern "C" fn heap_purgeable_state(_receiver: Id, _sel: Sel, _state: u64) -> u64 {
     MTL_PURGEABLE_STATE_NON_VOLATILE
 }
 
 unsafe extern "C" fn heap_dealloc(receiver: Id, _sel: Sel) {
     // SAFETY: a heap of this crate's; its device was retained when it was made.
-    objc::arc::release(unsafe { object::body::<Heap>(receiver) }.device);
+    let heap = unsafe { object::body::<Heap>(receiver) };
+    objc::arc::release(heap.device);
+    // The heap's reference to a placement's memory is the last one once its
+    // resources are gone, and dropping it is what frees the memory.
+    // SAFETY: the body was established by `object::make` and is not read again.
+    unsafe { std::ptr::drop_in_place(heap as *mut Heap) };
     objc::arc::finalize(receiver);
 }
 

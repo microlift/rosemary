@@ -2239,6 +2239,113 @@ fn placement_heap_buffers_at_one_offset_share_memory() {
 }
 
 #[test]
+fn a_released_placement_heap_frees_its_memory_after_its_last_resource() {
+    isolate_metal_fixture!();
+    let Some(device) = gpu_device() else {
+        return;
+    };
+    const PLACEMENT: u64 = 1;
+    const PRIVATE: u64 = 2;
+    // SAFETY: objects this test made, sent the selectors they implement.
+    unsafe {
+        let descriptor = send(
+            send(
+                objc::class::ptr(objc::class::lookup(c"MTLHeapDescriptor").expect("registered"))
+                    as Id,
+                "alloc",
+            ),
+            "init",
+        );
+        let (set, _) = method::<unsafe extern "C" fn(Id, Sel, u64)>(descriptor, "setSize:");
+        set(descriptor, objc::sel::get("setSize:"), 1 << 20);
+        set(descriptor, objc::sel::get("setType:"), PLACEMENT);
+        set(descriptor, objc::sel::get("setStorageMode:"), PRIVATE);
+        let heap = new_heap(device, std::ptr::null(), descriptor);
+        assert!(!heap.is_null());
+        let memory = resource::placement_of(heap).expect("a placement heap");
+        let (place, sel) = method::<unsafe extern "C" fn(Id, Sel, u64, u64, u64) -> Id>(
+            heap,
+            "newBufferWithLength:options:offset:",
+        );
+        let buffer = place(heap, sel, 16, PRIVATE << 4, 0);
+        assert!(!buffer.is_null());
+
+        objc::arc::release(heap);
+        assert!(
+            memory.upgrade().is_some(),
+            "the placed buffer still holds it"
+        );
+        objc::arc::release(buffer);
+        assert!(memory.upgrade().is_none());
+    }
+}
+
+/// A texture buffer has no image, so every call which would copy or attach
+/// one is refused rather than handed to Vulkan with a null `VkImage`.
+#[test]
+fn a_texture_buffer_refuses_image_operations() {
+    isolate_metal_fixture!();
+    let Some(device) = gpu_device() else {
+        return;
+    };
+    const R32_UINT: u64 = 53;
+    const SHADER_READ: u64 = 1;
+    // SAFETY: objects this test made, sent the selectors they implement.
+    unsafe {
+        let texels: [u32; 4] = [10, 20, 30, 40];
+        let backing =
+            new_buffer_with_bytes(device, std::ptr::null(), texels.as_ptr().cast(), 16, 0);
+        let class =
+            objc::class::ptr(objc::class::lookup(c"MTLTextureDescriptor").expect("registered"))
+                as Id;
+        let (describe, sel) = method::<unsafe extern "C" fn(Id, Sel, u64, u64, u64, u64) -> Id>(
+            class,
+            "textureBufferDescriptorWithPixelFormat:width:resourceOptions:usage:",
+        );
+        let descriptor = describe(class, sel, R32_UINT, 4, 0, SHADER_READ);
+        let (make, sel) = method::<unsafe extern "C" fn(Id, Sel, Id, u64, u64) -> Id>(
+            backing,
+            "newTextureWithDescriptor:offset:bytesPerRow:",
+        );
+        let texture = make(backing, sel, descriptor, 0, 16);
+        assert!(!texture.is_null());
+
+        let region = resource::Region {
+            origin: [0; 3],
+            size: [1, 1, 1],
+        };
+        let written = 7u32;
+        let (replace, sel) = method::<
+            unsafe extern "C" fn(Id, Sel, resource::Region, u64, *const u8, u64),
+        >(texture, "replaceRegion:mipmapLevel:withBytes:bytesPerRow:");
+        replace(texture, sel, region, 0, (&raw const written).cast(), 4);
+        let mut read = 0xdead_beefu32;
+        let (get, sel) = method::<unsafe extern "C" fn(Id, Sel, *mut u8, u64, resource::Region, u64)>(
+            texture,
+            "getBytes:bytesPerRow:fromRegion:mipmapLevel:",
+        );
+        get(texture, sel, (&raw mut read).cast(), 4, region, 0);
+        assert_eq!(read, 0xdead_beef);
+        let contents = object::body::<resource::Buffer>(backing).inner.contents as *const u32;
+        assert_eq!(*contents, 10);
+
+        let (view, sel) = method::<unsafe extern "C" fn(Id, Sel, u64) -> Id>(
+            texture,
+            "newTextureViewWithPixelFormat:",
+        );
+        assert!(view(texture, sel, R32_UINT).is_null());
+
+        let pass = object::make(
+            c"MTLRenderPassDescriptor",
+            encoder::RenderPassDescriptor::default(),
+        );
+        let attachment = element_at(send(pass, "colorAttachments"), 0);
+        send_with_object(attachment, "setTexture:", texture);
+        assert!(send(attachment, "texture").is_null());
+    }
+}
+
+#[test]
 fn a_texture_buffer_reads_the_buffer_it_was_made_from() {
     isolate_metal_fixture!();
     let Some(device) = gpu_device() else {
