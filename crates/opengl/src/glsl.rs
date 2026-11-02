@@ -1,4 +1,8 @@
+//! Shader source on its way to the driver.
+
 use std::ffi::{CStr, c_char};
+
+use crate::driver::Entry;
 
 /// Reassemble the source a guest passed as `count` pieces.
 ///
@@ -49,29 +53,18 @@ fn dump(shader: u32, before: &str, after: &str) {
     }
 }
 
-/// The driver's own `glShaderSource`, resolved once.
-fn driver_shader_source() -> Option<unsafe extern "C" fn(u32, i32, *const *const c_char, *const i32)>
-{
-    static F: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
-    let f =
-        (*F.get_or_init(|| sdl3::video::gl_proc_address(c"glShaderSource").map(|f| f as usize)))?;
-    // SAFETY: `void glShaderSource(GLuint, GLsizei, const GLchar *const *,
-    // const GLint *)`.
-    Some(unsafe {
-        std::mem::transmute::<usize, unsafe extern "C" fn(u32, i32, *const *const c_char, *const i32)>(
-            f,
-        )
-    })
-}
+// SAFETY: `void glShaderSource(GLuint, GLsizei, const GLchar *const *, const GLint *)`.
+static SHADER_SOURCE: Entry<unsafe extern "C" fn(u32, i32, *const *const c_char, *const i32)> =
+    unsafe { Entry::new(c"glShaderSource") };
 
 /// `glShaderSource`, with the rewrite in the middle.
-unsafe extern "C" fn shader_source(
+pub unsafe extern "C" fn shader_source(
     shader: u32,
     count: i32,
     strings: *const *const c_char,
     lengths: *const i32,
 ) {
-    let Some(driver) = driver_shader_source() else {
+    let Some(driver) = SHADER_SOURCE.get() else {
         return;
     };
     if strings.is_null() || count <= 0 {
@@ -124,8 +117,7 @@ fn declares_a_bindable_uniform(source: &str) -> bool {
 /// handed over turns every later diagnostic into a small puzzle.
 fn blank_directives(source: &str, extension: &str) -> String {
     let mut out = String::with_capacity(source.len());
-    for (i, line) in source.split_inclusive('\n').enumerate() {
-        let _ = i;
+    for line in source.split_inclusive('\n') {
         match is_directive_for(line, extension) {
             true => out.push('\n'),
             false => out.push_str(line),
@@ -139,19 +131,11 @@ fn blank_directives(source: &str, extension: &str) -> String {
 /// Only when it is unused, so a shader that really does want the feature is
 /// still refused by the driver, naming the extension - which is a far better
 /// report than one about a `bindable` keyword nothing explained.
-pub fn rewrite(source: &str) -> String {
+fn rewrite(source: &str) -> String {
     if !source.contains(BINDABLE_UNIFORM) || declares_a_bindable_uniform(source) {
         return source.to_string();
     }
     blank_directives(source, BINDABLE_UNIFORM)
-}
-
-/// The entry points this module answers instead of the driver.
-pub fn address(name: &str) -> Option<u64> {
-    match name {
-        "glShaderSource" => Some(shader_source as *const () as usize as u64),
-        _ => None,
-    }
 }
 
 #[cfg(test)]

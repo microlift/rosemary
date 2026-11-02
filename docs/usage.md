@@ -73,6 +73,7 @@ rosemary server --stop         # ask this prefix's server to exit
 | `ROSEMARY_STEAM_TRACE` | unset | Report every bridged Steamworks call on stderr: the dispatch id, the host interface, and the vtable slot it landed on. |
 | `ROSEMARY_TRACE_BINDINGS` | unset | Report on stderr each Cocoa binding value handed to a bound object through `-setValue:forKey:` (the plain `NSObject` binding, as opposed to a control's own setter): the bound class and binding, the observed class and key path, and the value's address. |
 | `ROSEMARY_SWAP_INTERVAL` | `none` | Force a specific swap interval on OpenGL applications. Allows enabling immediate (0), VSync (1), and -1 (Adaptive VSync), along with other V-blank values, allowing unlocked framerate on apps that use VSync. |
+| `ROSEMARY_GL_HOST_FEATURES` | `0` | (built-in OpenGL) Offer the GL driver's own version, extensions and entry points instead of a Mac's (GL 4.1 core, 2.1 legacy, Apple's export list). Some programs have newer GL paths that a Mac never takes; the price is that the program runs code no Mac tested, which is what the default exists to prevent. |
 | `ROSEMARY_PREFIX` | the default prefix (`off` on macOS) | The prefix a guest runs in: a directory holding a Darwin filesystem, whose `root/` subdirectory is the guest's `/`. Unset, `rosemary run` uses `$XDG_DATA_HOME/rosemary/prefixes/default` (or `$HOME/.local/share/rosemary/prefixes/default`), creating it on first use. Set it to another path to keep a guest's files separate, or to `off` to leave guest paths alone entirely. |
 | `ROSEMARY_PREFIX_HOME` | `prefix` | Where the guest's home directory is. `prefix` keeps it inside the prefix, so a prefix is one directory to copy, archive or delete. `host` mounts the guest's `/Users/<name>` onto the real `$HOME` instead, for a user who would rather keep one set of documents than two. |
 | `ROSEMARY_PREFIX_SETUP` | `ask` | What to do when a prefix needs its Darwin base and it is not cached. `ask` asks - a dialog under `rosemary run` when there is a display, then the terminal - and declines when there is nobody to ask. `download` fetches it without asking. `fail` never downloads. The base is verified against hashes compiled into Rosemary whichever route it takes. |
@@ -211,8 +212,14 @@ context. Contexts move between threads through a bounded handoff; an EGL backend
 can fall back to a sibling sharing textures and buffers, but not vertex arrays,
 framebuffers, or queries. Other backends report contention if handoff fails.
 
-Direct CGL pixel-format/context creation and lifetime APIs, and explicit context
-sharing, remain unsupported. The built-in GLU surface provides `gluOrtho2D`
-through SDL-resolved `glOrtho`; other GLU functions remain unsupported. No host
-GLU library is required. Driver capabilities still determine available profiles
-and extensions.
+The framework answers exactly the names Apple's `OpenGL.framework`, `libGL.dylib`
+and `libGLU.dylib` export (lists in `crates/opengl/src/exports/`), so a `dlsym`
+of a newer function such as `glDispatchCompute` is null, as on a Mac. Each GL
+name binds to the driver function of the same name or to Rosemary's own. A
+context reports a Mac's profile: core contexts are GL 4.1 with GLSL 4.10, legacy
+contexts GL 2.1 with GLSL 1.20, and both list only the extensions a Mac lists
+for that profile and the driver also has. `ROSEMARY_GL_HOST_FEATURES=1` offers
+the driver's own version, extensions and functions instead.
+
+The built-in GLU surface provides `gluOrtho2D` through the driver's `glOrtho`;
+other GLU functions are unbound. No host GLU library is required.

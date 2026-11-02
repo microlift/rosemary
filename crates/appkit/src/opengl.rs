@@ -332,7 +332,7 @@ unsafe extern "C" fn get_values(
              one virtual screen, so {screen} names no renderer"
         );
     }
-    // One renderer, so one virtual screen - see `crate::cgl`. Answered here
+    // One renderer, so one virtual screen - see `opengl::cgl`. Answered here
     // rather than from the list because it is a property of the machine and not
     // of what the program asked for.
     if attribute == attribute::VIRTUAL_SCREEN_COUNT {
@@ -2120,7 +2120,7 @@ unsafe extern "C" fn update(_receiver: Id, _sel: Sel) {}
 /// A virtual screen is one renderer of the context's pixel format, and a
 /// program reads this to find out which GPU it ended up on after the window
 /// moved between displays. There is one renderer here - see
-/// `crate::cgl::CGLQueryRendererInfo` - so there is one virtual screen, and it
+/// `opengl::cgl::CGLQueryRendererInfo` - so there is one virtual screen, and it
 /// is the one in use.
 unsafe extern "C" fn current_virtual_screen(_receiver: Id, _sel: Sel) -> isize {
     0

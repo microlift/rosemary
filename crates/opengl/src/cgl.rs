@@ -1,6 +1,14 @@
 #![allow(non_snake_case)]
 
+//! CGL: contexts, pixel formats and renderer queries.
+//!
+//! A CGL context here is the `NSOpenGLContext` AppKit made, and a pixel format
+//! its `NSOpenGLPixelFormat`, so those functions are AppKit's; the renderer
+//! queries need no context and live here.
+
 use std::ffi::c_void;
+
+use appkit::opengl as context;
 
 /// `CGLError`. Only the two this module can produce are named.
 type CGLError = i32;
@@ -304,6 +312,26 @@ pub unsafe extern "C" fn CGLDestroyRendererInfo(rend: *mut c_void) -> CGLError {
 
 exports::exports! {
     functions {
+        "CGLChoosePixelFormat" => context::CGLChoosePixelFormat,
+        "CGLDestroyPixelFormat" => context::CGLDestroyPixelFormat,
+        "CGLCreateContext" => context::CGLCreateContext,
+        "CGLDestroyContext" => context::CGLDestroyContext,
+        "CGLReleaseContext" => context::CGLReleaseContext,
+        "CGLRetainContext" => context::CGLRetainContext,
+        "CGLGetPixelFormat" => context::CGLGetPixelFormat,
+        "CGLErrorString" => context::CGLErrorString,
+        "CGLGetVersion" => context::CGLGetVersion,
+        "CGLEnable" => context::CGLEnable,
+        "CGLDisable" => context::CGLDisable,
+        "CGLGetParameter" => context::CGLGetParameter,
+        "CGLSetParameter" => context::CGLSetParameter,
+        "CGLSetCurrentContext" => context::CGLSetCurrentContext,
+        "CGLGetCurrentContext" => context::CGLGetCurrentContext,
+        "CGLFlushDrawable" => context::CGLFlushDrawable,
+        "CGLClearDrawable" => context::CGLClearDrawable,
+        "CGLLockContext" => context::CGLLockContext,
+        "CGLUnlockContext" => context::CGLUnlockContext,
+        "CGLGetShareGroup" => context::CGLGetShareGroup,
         "CGLQueryRendererInfo" => CGLQueryRendererInfo,
         "CGLDescribeRenderer" => CGLDescribeRenderer,
         "CGLDestroyRendererInfo" => CGLDestroyRendererInfo,
@@ -316,6 +344,14 @@ mod tests {
 
     /// One renderer, and it is accelerated and online - which is the pair a
     /// caller tests before it keeps a renderer at all.
+    /// Every name answered is one a Mac's framework exports.
+    #[test]
+    fn every_function_is_a_mac_export() {
+        for name in names() {
+            assert!(crate::names::library(name).is_some(), "{name}");
+        }
+    }
+
     #[test]
     fn the_one_renderer_is_accelerated_and_online() {
         let mut rend = std::ptr::null_mut();

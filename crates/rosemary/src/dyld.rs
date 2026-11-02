@@ -1531,8 +1531,8 @@ fn lookup(handle: u64, name: &str) -> Option<u64> {
 
     // A handle from the host's loader.
     if let Some(path) = native_handle(handle) {
-        if crate::opengl::owns(name) {
-            return crate::opengl::symbol(name)
+        if crate::gl::owns(name) {
+            return crate::gl::symbol(name)
                 .map(|addr| remember_native_symbol(addr, name, Some(path)));
         }
         let c = CString::new(name).ok()?;
@@ -2795,7 +2795,7 @@ mod tests {
             return;
         }
         crate::frameworks::provider();
-        let handle = open_native(crate::opengl::INSTALL_PATHS[0]).expect("host OpenGL framework");
+        let handle = open_native(opengl::INSTALL_PATHS[0]).expect("host OpenGL framework");
         // Prove the host really has the entry point that the guest must not see.
         let host = unsafe {
             libc::dlsym(

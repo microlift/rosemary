@@ -160,7 +160,7 @@ impl Native {
         darwin::divergent::deny_in(&mut host);
         crate::objc::host::deny_foreign_classes(&mut host);
         crate::frameworks::deny_host_frameworks(&mut host);
-        crate::opengl::deny_host_gl(&mut host);
+        crate::gl::deny_host_gl(&mut host);
 
         let eager = eager_binding_shims();
         // Share the TLV provider with the dlopen path.
@@ -171,7 +171,7 @@ impl Native {
         let dyld = crate::dyld::provider();
         let libc_lookup = crate::dyld::native_libc_provider();
         let steam = crate::steam::provider();
-        let opengl = crate::opengl::provider();
+        let opengl = crate::gl::provider();
         let openal = crate::openal::provider();
         let mut providers: Vec<&dyn SymbolProvider> = match crate::frameworks::using_builtin() {
             true => vec![

@@ -580,7 +580,7 @@ pub(crate) struct HostProviders {
     /// generated dylib. See [`crate::steam`].
     steam: machish::resolve::SyntheticDylib,
     /// OpenGL, on the GL library SDL made the context against rather than on
-    /// whichever one the host loader has. See [`crate::opengl`].
+    /// whichever one the host loader has. See [`crate::gl`].
     opengl: machish::resolve::LazyDylib,
     /// OpenAL, on this host's own implementation of the specification. See
     /// [`crate::openal`].
@@ -618,7 +618,7 @@ impl HostProviders {
         darwin::divergent::deny_in(&mut native);
         crate::objc::host::deny_foreign_classes(&mut native);
         crate::frameworks::deny_host_frameworks(&mut native);
-        crate::opengl::deny_host_gl(&mut native);
+        crate::gl::deny_host_gl(&mut native);
         HostProviders {
             runtime: crate::shims::runtime::provider(),
             darwin: darwin::provider(),
@@ -627,7 +627,7 @@ impl HostProviders {
             dyld: crate::dyld::provider(),
             steam: crate::steam::provider(),
             openal: crate::openal::provider(),
-            opengl: crate::opengl::provider(),
+            opengl: crate::gl::provider(),
             eager: eager_binding_shims(),
             native,
         }

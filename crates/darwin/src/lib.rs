@@ -205,7 +205,7 @@ pub fn host_symbol(name: &str) -> Option<u64> {
 /// GL itself is deliberately **not** opened here. Its entry points have to come
 /// out of the library SDL made the context against, which is not necessarily
 /// this loader's `libGL.so.1`, and a global one would answer every `gl` name
-/// first. See `rosemary::opengl`.
+/// first. See the `opengl` crate.
 fn load_host_libraries() {
     #[cfg(not(target_os = "macos"))]
     {

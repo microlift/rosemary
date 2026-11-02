@@ -40,6 +40,7 @@ webkit = { path = "crates/webkit" }
 forcefeedback = { path = "crates/forcefeedback" }
 network = { path = "crates/network" }
 opencl = { path = "crates/opencl" }
+opengl = { path = "crates/opengl" }
 metal_translate = { path = "crates/metal_translate" }
 metal = { path = "crates/metal" }
 videotoolbox = { path = "crates/videotoolbox" }

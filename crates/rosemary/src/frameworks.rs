@@ -16,7 +16,7 @@ fn install() {
     static ONCE: std::sync::Once = std::sync::Once::new();
     ONCE.call_once(|| {
         darwin::register_provider(symbol);
-        darwin::register_host_symbol_filter(|name| !crate::opengl::owns(name));
+        darwin::register_host_symbol_filter(|name| !crate::gl::owns(name));
         register_dlopen_names();
         crate::dyld::install_image_hooks();
         install_block_runtime();
@@ -289,10 +289,10 @@ fn objc_symbol(name: &str) -> Option<u64> {
 }
 
 fn register_opengl_framework() {
-    if !crate::opengl::interposed() {
+    if !crate::gl::interposed() {
         return;
     }
-    crate::dyld::register_synthetic(crate::opengl::INSTALL_PATHS, crate::opengl::symbol);
+    crate::dyld::register_synthetic(opengl::INSTALL_PATHS, crate::gl::symbol);
 }
 
 fn register_openal_framework() {
@@ -622,9 +622,9 @@ pub fn symbol(name: &str) -> Option<u64> {
         // `crate::shims::block`. Nothing on a host off Darwin defines it, and it
         // has no framework of its own to be a row.
         .or_else(|| objc::block::symbol(name))
-        // The host's GL, reached by `dlsym` rather than enumerated - see
-        // `crate::opengl`, which publishes it through its own lazy provider.
-        .or_else(|| crate::opengl::symbol(name))
+        // OpenGL, whose driver half is reached by `dlsym` rather than
+        // enumerated - see `crate::gl`, which publishes it lazily.
+        .or_else(|| crate::gl::symbol(name))
         .or_else(|| crate::openal::symbol(name))
 }
 

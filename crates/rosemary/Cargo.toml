@@ -33,6 +33,7 @@ webkit.workspace = true
 forcefeedback.workspace = true
 network.workspace = true
 opencl.workspace = true
+opengl.workspace = true
 metal.workspace = true
 videotoolbox.workspace = true
 gimli.workspace = true
