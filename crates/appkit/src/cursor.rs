@@ -286,9 +286,9 @@ unsafe extern "C" fn hot_spot(receiver: Id, _sel: Sel) -> NSPoint {
 
 /// One `-addCursorRect:cursor:`, kept until the view discards its rectangles.
 ///
-/// The view is retained. AppKit's rectangles are dropped by the view's own
-/// `-dealloc`; nothing here reaches that, so an unretained view would leave
-/// [`apply`] reading a freed object on the next mouse move.
+/// The view is not retained, as in AppKit: `-[NSView dealloc]` discards its
+/// rectangles. Retaining it would let a reset free the view mid-call, when it
+/// drops the last reference.
 struct CursorRect {
     view: usize,
     rect: NSRect,
@@ -333,7 +333,7 @@ pub fn add_rect(view: Id, rect: NSRect, cursor: Id) {
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .push(CursorRect {
-            view: objc::arc::retain(view) as usize,
+            view: view as usize,
             rect,
             cursor: objc::arc::retain(cursor) as usize,
         });
@@ -357,7 +357,6 @@ pub fn discard_rects(view: Id) {
     };
     for entry in taken {
         objc::arc::release(entry.cursor as Id);
-        objc::arc::release(entry.view as Id);
     }
 }
 
@@ -466,7 +465,7 @@ fn holding_rect() -> Option<Id> {
     let rects = RECTS.lock().unwrap_or_else(|e| e.into_inner());
     rects.iter().rev().find_map(|entry| {
         let view = entry.view as Id;
-        // SAFETY: an object this runtime allocated, retained by the entry.
+        // SAFETY: a live view; its `-dealloc` removes the entry.
         let point = unsafe { crate::view::pointer_in(view) }?;
         crate::view::holds(view, entry.rect, point).then_some(entry.cursor as Id)
     })
@@ -1344,17 +1343,39 @@ mod tests {
 
         discard_rects(one);
         assert_eq!(objc::arc::retain_count(cursor), before + 1);
+        let views: Vec<usize> = RECTS.lock().unwrap().iter().map(|e| e.view).collect();
         assert!(
-            RECTS
-                .lock()
-                .unwrap()
-                .iter()
-                .all(|entry| entry.view == two as usize),
+            !views.contains(&(one as usize)) && views.contains(&(two as usize)),
             "only the discarded view's rectangles go"
         );
 
         discard_rects(two);
         assert_eq!(objc::arc::retain_count(cursor), before);
+    }
+
+    /// A rectangle does not keep its view alive; the view's `-dealloc` takes
+    /// its rectangles with it.
+    #[test]
+    fn releasing_a_view_drops_its_cursor_rectangles() {
+        crate::bootstrap();
+        let cursor =
+            objc::object::create_instance(objc::class::lookup(c"NSCursor").expect("NSCursor"), 0);
+        let view =
+            objc::object::create_instance(objc::class::lookup(c"NSView").expect("NSView"), 0);
+        let before = objc::arc::retain_count(view);
+        add_rect(view, NSRect::default(), cursor);
+        assert_eq!(objc::arc::retain_count(view), before);
+
+        objc::arc::release(view);
+        assert!(
+            RECTS
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|entry| entry.view != view as usize),
+            "the dealloc'd view's rectangles go with it"
+        );
+        objc::arc::release(cursor);
     }
 
     /// The active option decides when an area is live: a key-window area stops
