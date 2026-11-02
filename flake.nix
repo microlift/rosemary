@@ -154,9 +154,12 @@
 
             # mediabackend's gstreamer feature: base has appsrc, appsink and
             # videoconvert, bad has h264parse, and libav has avdec_h264.
+            # Listing them replaces the host's plugin path, and WebKitGTK
+            # aborts on any media element without good's autoaudiosink.
             buildInputs = runtimeLibs ++ [
               pkgs.gst_all_1.gstreamer
               pkgs.gst_all_1.gst-plugins-base
+              pkgs.gst_all_1.gst-plugins-good
               pkgs.gst_all_1.gst-plugins-bad
               pkgs.gst_all_1.gst-libav
             ];
