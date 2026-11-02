@@ -63,9 +63,11 @@ int main(int argc, char **argv) {
     // GL 4.3, which a Mac's framework does not export.
     CHECK(dlsym(framework, "glDispatchCompute") == NULL);
     CHECK(dlsym(RTLD_DEFAULT, "glDispatchCompute") == NULL);
-    // A real host handle must obey the same fallback policy.
+    // libSystem does not link OpenGL, so its handle finds none of it.
     void *system = dlopen("/usr/lib/libSystem.B.dylib", RTLD_LAZY);
     CHECK(system && dlsym(system, "glDispatchCompute") == NULL);
+    CHECK(dlsym(system, "CGLChoosePixelFormat") == NULL);
+    CHECK(dlsym(system, "glGetString") == NULL);
     GLint zero = 0, one = 1;
     CHECK(CGLSetParameter(first_handle, kCGLCPSwapInterval, &zero) == kCGLNoError);
     CHECK(CGLSetParameter(second_handle, kCGLCPSwapInterval, &one) == kCGLNoError);
