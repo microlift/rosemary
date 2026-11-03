@@ -522,6 +522,7 @@ static EIGHT_INTS: FunctionAbi = FunctionAbi {
     name: "eight_ints",
     callbacks: &[],
     reenters_guest: false,
+    reads_caller: false,
     types: &[
         T::SignedDoubleword,
         T::SignedDoubleword,
@@ -564,6 +565,7 @@ static TWELVE_INTS: FunctionAbi = FunctionAbi {
     name: "twelve_ints_two_doubles",
     callbacks: &[],
     reenters_guest: false,
+    reads_caller: false,
     types: &[
         T::SignedDoubleword,
         T::SignedDoubleword,
@@ -635,6 +637,7 @@ static NARROW_TAIL_4_4_8: FunctionAbi = FunctionAbi {
     name: "eight_longs_int_int_ptr",
     callbacks: &[],
     reenters_guest: false,
+    reads_caller: false,
     types: &[
         T::SignedDoubleword,
         T::SignedDoubleword,
@@ -678,6 +681,7 @@ static NARROW_TAIL_4: FunctionAbi = FunctionAbi {
     name: "eight_longs_int",
     callbacks: &[],
     reenters_guest: false,
+    reads_caller: false,
     types: &[
         T::SignedDoubleword,
         T::SignedDoubleword,
@@ -783,6 +787,7 @@ static THIRTEEN_INTS: FunctionAbi = FunctionAbi {
     name: "thirteen_with_a_bool_on_the_stack",
     callbacks: &[],
     reenters_guest: false,
+    reads_caller: false,
     types: &[
         T::SignedDoubleword,
         T::SignedDoubleword,
@@ -848,6 +853,7 @@ fn an_overflow_too_wide_to_place_is_still_refused_by_name() {
         name: "adjacent_narrows_too_long",
         callbacks: &[],
         reenters_guest: false,
+        reads_caller: false,
         types: &[
             T::SignedDoubleword,
             T::SignedDoubleword,

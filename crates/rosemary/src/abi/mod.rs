@@ -455,7 +455,7 @@ pub fn classify(tag: u64, symbol: &str) -> Classification {
         // registers straight through - including the function pointer that has
         // to become a thunk first.
         Lookup::Known(abi) if !abi.callbacks.is_empty() => Classification::Slow,
-        Lookup::Known(abi) if abi.reenters_guest => Classification::Slow,
+        Lookup::Known(abi) if abi.reenters_guest || abi.reads_caller => Classification::Slow,
         Lookup::Known(abi) => {
             if guest_call_abi().can_fast_call(abi.types) && marshal::is_marshallable(abi) {
                 Classification::Fast

@@ -1185,6 +1185,23 @@ impl Vm {
         self.transfer_to_guest(target, ctx)
     }
 
+    /// Where the import this thread is servicing returns to in the guest.
+    ///
+    /// Only meaningful during a slow import: a fast one never synchronizes the
+    /// context.
+    pub(crate) fn import_return_address(&self) -> Option<u64> {
+        let state = crate::thread::current()?;
+        let ctx = state.published_context()?;
+        // A call exits with `rip` at its resume point; a jump leaves the
+        // return address its caller pushed on the stack.
+        if !state.entered_by_jump() {
+            return Some(ctx.rip);
+        }
+        let mut ret = [0u8; 8];
+        self.view.read(ctx.rsp, &mut ret).ok()?;
+        Some(u64::from_le_bytes(ret))
+    }
+
     /// Continue the guest at `target`, as the intercepted transfer would have.
     fn transfer_to_guest(&self, target: u64, ctx: &mut RegisterContext) -> Result<(), VmError> {
         let Some(state) = crate::thread::current() else {

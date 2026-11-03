@@ -122,6 +122,7 @@ fn abi_for(i: usize) -> &'static FunctionAbi {
                 variadic: false,
                 callbacks: &[],
                 reenters_guest: false,
+                reads_caller: false,
             })
             .collect()
     };

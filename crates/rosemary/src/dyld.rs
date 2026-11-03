@@ -92,6 +92,8 @@ static EXECUTABLE: Mutex<Option<(String, u64)>> = Mutex::new(None);
 
 /// One image this runtime mapped, as much of it as [`guest_image_at`] needs.
 struct MappedImage {
+    /// The install name or path the link knew it by, as [`LinkedImage::name`].
+    name: String,
     /// The mapped `mach_header`, which is what dyld calls an image's base.
     header: u64,
     slide: u64,
@@ -153,6 +155,14 @@ impl LinkedExports {
             reexports: names(true),
         })
     }
+
+    /// As [`LinkedExports::parse`], for the backend now running.
+    fn parse_for_engine(bytes: &[u8]) -> Option<Self> {
+        match crate::exec::active()?.engine() {
+            crate::exec::Engine::Native => Self::parse(bytes, crate::exec::native::HOST_SPEC),
+            crate::exec::Engine::Emulated => Self::parse(bytes, X86_64),
+        }
+    }
 }
 
 /// Deepest chain of re-exports followed before giving up, which only a cycle
@@ -189,12 +199,7 @@ impl LinkedImage {
                 let bytes = std::fs::read(&self.path)
                     .ok()
                     .or_else(|| std::fs::read(resolve_path(&self.name)?).ok())?;
-                match crate::exec::active()?.engine() {
-                    crate::exec::Engine::Native => {
-                        LinkedExports::parse(&bytes, crate::exec::native::HOST_SPEC)
-                    }
-                    crate::exec::Engine::Emulated => LinkedExports::parse(&bytes, X86_64),
-                }
+                LinkedExports::parse_for_engine(&bytes)
             })
             .as_ref()
     }
@@ -312,6 +317,7 @@ pub fn register_mapped_images(report: &LinkReport) {
         .images
         .iter()
         .map(|i| MappedImage {
+            name: i.name.clone(),
             header: i.base,
             slide: i.slide,
             segments: i
@@ -346,7 +352,8 @@ static MAIN_EXPORTS: Mutex<Option<&'static MainExports>> = Mutex::new(None);
 
 /// The main executable, as something a `dlopen`ed image can bind against.
 struct MainExports {
-    exports: ExportTable,
+    /// Its trie and the install names it links against.
+    linked: LinkedExports,
     slide: u64,
     /// The path the executable was loaded from, and its last component, which
     /// are the two spellings a two-level reference could use.
@@ -361,7 +368,7 @@ impl machish::resolve::SymbolProvider for MainExports {
     }
 
     fn resolve(&self, sym: &machish::fixups::SymbolRef<'_>) -> Option<machish::resolve::Resolved> {
-        let export = self.exports.get(sym.name)?;
+        let export = self.linked.exports.get(sym.name)?;
         // A re-export forwards into another library and has no address of its
         // own; answering zero would bind the caller to nothing and report
         // success.
@@ -487,17 +494,9 @@ fn main_exports() -> Option<&'static MainExports> {
         .unwrap_or_else(|e| e.into_inner())
         .clone()?;
     let bytes = std::fs::read(&path).ok()?;
-    let exports = match crate::exec::active()?.engine() {
-        crate::exec::Engine::Native => {
-            ExportTable::parse(&MachObject::parse_any(&bytes, crate::exec::native::HOST_SPEC).ok()?)
-                .ok()?
-        }
-        crate::exec::Engine::Emulated => {
-            ExportTable::parse(&MachObject::parse_any(&bytes, X86_64).ok()?).ok()?
-        }
-    };
+    let linked = LinkedExports::parse_for_engine(&bytes)?;
     let leaked: &'static MainExports = Box::leak(Box::new(MainExports {
-        exports,
+        linked,
         slide,
         path,
     }));
@@ -1542,8 +1541,15 @@ const RTLD_FIRST: i32 = 0x100;
 /// synthetic libraries are aligned, so bit 0 is free in both.
 const FIRST_ONLY: u64 = 1;
 
-/// The address `name` has in `handle`, as `dlsym` reports it.
+/// The address `name` has in `handle`, as `dlsym` reports it to a caller in
+/// no image this runtime mapped.
 fn lookup(handle: u64, name: &str) -> Option<u64> {
+    lookup_from(handle, name, None)
+}
+
+/// [`lookup`], for a caller in the image `caller`, which is what `RTLD_SELF`
+/// and `RTLD_NEXT` search from.
+fn lookup_from(handle: u64, name: &str, caller: Option<Scope>) -> Option<u64> {
     // A handle from the host's loader, which scopes the search itself.
     if let Some(path) = native_handle(handle) {
         if crate::gl::owns(name) {
@@ -1567,19 +1573,22 @@ fn lookup(handle: u64, name: &str) -> Option<u64> {
     // `dlsym` takes the C identifier; a Mach-O export carries the underscore.
     let mangled = format!("_{name}");
     match handle {
-        RTLD_MAIN_ONLY => {
-            let main = main_exports()?;
-            main.exports.get(&mangled)?.address(main.slide)
-        }
-        // FIXME (ACCURACY): `RTLD_SELF` and `RTLD_NEXT` search from the
-        // caller's image, which `dlsym` is not told; both search everything.
-        RTLD_DEFAULT | RTLD_SELF | RTLD_NEXT => global_lookup(name, &mangled),
+        RTLD_MAIN_ONLY => Scope::Main(main_exports()?).first_only(&mangled, 0),
+        // FIXME (ACCURACY): a caller in no image this runtime can name - host
+        // code, or a dylib an emulated program was linked with, which
+        // `PROGRAM_IMAGES` does not record - searches everything.
+        RTLD_SELF | RTLD_NEXT if caller.is_none() => global_lookup(name, &mangled),
+        // The caller's image and what it links against; dyld's `dlsymSelf`.
+        RTLD_SELF => search(caller?, &mangled, true),
+        // Only what the caller links against; dyld's `dlsymNext`.
+        RTLD_NEXT => search(caller?, &mangled, false),
+        RTLD_DEFAULT => global_lookup(name, &mangled),
         _ if handle == global_handle() => global_lookup(name, &mangled),
         _ => {
             let root = Scope::of_handle(handle & !FIRST_ONLY)?;
             match handle & FIRST_ONLY != 0 {
                 true => root.first_only(&mangled, 0),
-                false => search(root, &mangled),
+                false => search(root, &mangled, true),
             }
         }
     }
@@ -1596,7 +1605,7 @@ fn global_lookup(name: &str, mangled: &str) -> Option<u64> {
     }
     // The **main executable's** own exports, which nothing above covers.
     if let Some(main) = main_exports()
-        && let Some(export) = main.exports.get(mangled)
+        && let Some(export) = main.linked.exports.get(mangled)
         && let Some(addr) = export.address(main.slide)
     {
         return Some(addr);
@@ -1619,10 +1628,10 @@ fn global_lookup(name: &str, mangled: &str) -> Option<u64> {
     Some(remember_native_symbol(addr, name, None))
 }
 
-/// `mangled` as `dlsym` on a handle for `root` finds it: the image, then
-/// everything it links against, top down - dyld's `dlsym_search`.
-fn search(root: Scope, mangled: &str) -> Option<u64> {
-    if let Some(addr) = root.first_only(mangled, 0) {
+/// `mangled` as `dlsym` on a handle for `root` finds it: the image unless
+/// `with_root` is false, then everything it links against, breadth first.
+fn search(root: Scope, mangled: &str, with_root: bool) -> Option<u64> {
+    if with_root && let Some(addr) = root.first_only(mangled, 0) {
         return Some(addr);
     }
     let mut seen = vec![root.identity()];
@@ -1650,6 +1659,8 @@ enum Scope {
     Synthetic(&'static synthetic::Library),
     /// An image the guest `dlopen`ed.
     Loaded(&'static Image),
+    /// The main executable.
+    Main(&'static MainExports),
     /// A dylib mapped with the program or with a `dlopen`ed image, and the
     /// images it was linked with.
     Linked(&'static LinkedImage, &'static [LinkedImage]),
@@ -1657,9 +1668,62 @@ enum Scope {
 
 impl Scope {
     fn of_handle(handle: u64) -> Option<Scope> {
+        if handle != 0 && handle == MAIN_HEADER.load(Ordering::Acquire) {
+            return main_exports().map(Scope::Main);
+        }
         synthetic::by_handle(handle)
             .map(Scope::Synthetic)
             .or_else(|| find(|i| (i.handle == handle).then_some(Scope::Loaded(i))))
+    }
+
+    /// The guest image `addr` is in.
+    fn containing(addr: u64) -> Option<Scope> {
+        let in_image = |image: &machish::report::ImageReport| {
+            image
+                .segments
+                .iter()
+                .any(|s| addr >= s.vmaddr && addr < s.vmaddr.wrapping_add(s.vmsize))
+        };
+        let loaded = find(|image| {
+            if image.unloading.load(Ordering::Acquire) {
+                return None;
+            }
+            let hit = image.report.images.iter().find(|i| in_image(i))?;
+            if image
+                .report
+                .root()
+                .is_some_and(|root| root.name == hit.name)
+            {
+                return Some(Scope::Loaded(image));
+            }
+            let carried = image.linked.iter().find(|l| l.name == hit.name)?;
+            Some(Scope::Linked(carried, &image.linked))
+        });
+        if loaded.is_some() {
+            return loaded;
+        }
+        // The program's own link: its first image is the executable.
+        let (index, name) = match MAPPED.get() {
+            Some(mapped) => mapped
+                .iter()
+                .enumerate()
+                .find(|(_, i)| i.segments.iter().any(|(lo, hi)| addr >= *lo && addr < *hi))
+                .map(|(index, i)| (index, i.name.clone()))?,
+            None => crate::thunk::current()?
+                .program
+                .report
+                .images
+                .iter()
+                .enumerate()
+                .find(|(_, i)| in_image(i))
+                .map(|(index, i)| (index, i.name.clone()))?,
+        };
+        if index == 0 {
+            return main_exports().map(Scope::Main);
+        }
+        let program = PROGRAM_IMAGES.get()?;
+        let linked = program.iter().find(|l| l.name == name)?;
+        Some(Scope::Linked(linked, program))
     }
 
     /// The mapped image a load command's install name names, if any. A library
@@ -1686,6 +1750,7 @@ impl Scope {
         match self {
             Scope::Synthetic(library) => library as *const synthetic::Library as usize,
             Scope::Loaded(image) => image as *const Image as usize,
+            Scope::Main(main) => main as *const MainExports as usize,
             Scope::Linked(image, _) => image as *const LinkedImage as usize,
         }
     }
@@ -1700,6 +1765,14 @@ impl Scope {
             Scope::Loaded(image) => (
                 image.reexported_dylibs.iter().map(String::as_str).collect(),
                 image.dylibs.iter().map(String::as_str).collect(),
+            ),
+            Scope::Main(main) => (
+                main.linked.reexports.iter().map(String::as_str).collect(),
+                main.linked
+                    .dependencies
+                    .iter()
+                    .map(String::as_str)
+                    .collect(),
             ),
             Scope::Linked(image, _) => match image.parsed() {
                 Some(parsed) => (
@@ -1736,18 +1809,16 @@ impl Scope {
             }
             Scope::Loaded(image) => {
                 if let Some(export) = image.exports.get(mangled) {
-                    let ExportValue::Reexport {
-                        ordinal,
-                        imported_name,
-                    } = &export.value
-                    else {
-                        return export.address(image.slide);
-                    };
-                    let target = image.dylibs.get(usize::from(*ordinal).checked_sub(1)?)?;
-                    let name = imported_name.as_deref().unwrap_or(mangled);
-                    return Scope::named(target)?.first_only(name, depth + 1);
+                    return own_export(export, image.slide, &image.dylibs, mangled, depth);
                 }
                 image.reexported_dylibs.iter().map(String::as_str).collect()
+            }
+            Scope::Main(main) => {
+                let linked = &main.linked;
+                if let Some(export) = linked.exports.get(mangled) {
+                    return own_export(export, main.slide, &linked.dependencies, mangled, depth);
+                }
+                linked.reexports.iter().map(String::as_str).collect()
             }
             Scope::Linked(image, peers) => {
                 return image.resolve(peers, mangled, depth).map(|r| r.addr);
@@ -1758,6 +1829,27 @@ impl Scope {
             .filter_map(Scope::named)
             .find_map(|scope| scope.first_only(mangled, depth + 1))
     }
+}
+
+/// The address of `export`, an image's own entry for `mangled`, following a
+/// re-export into `dylibs`, the image's install names in ordinal order.
+fn own_export(
+    export: &machish::exports::Export,
+    slide: u64,
+    dylibs: &[String],
+    mangled: &str,
+    depth: usize,
+) -> Option<u64> {
+    let ExportValue::Reexport {
+        ordinal,
+        imported_name,
+    } = &export.value
+    else {
+        return export.address(slide);
+    };
+    let target = dylibs.get(usize::from(*ordinal).checked_sub(1)?)?;
+    let name = imported_name.as_deref().unwrap_or(mangled);
+    Scope::named(target)?.first_only(name, depth + 1)
 }
 
 /// The host half of the global search, which agrees with what the loader binds.
@@ -2024,7 +2116,7 @@ fn lookup_in_image(header: u64, mangled: &str) -> Option<u64> {
     // executable's header answer with any image's symbol.
     if header != 0 && header == MAIN_HEADER.load(Ordering::Acquire) {
         let main = main_exports()?;
-        return main.exports.get(mangled)?.address(main.slide);
+        return main.linked.exports.get(mangled)?.address(main.slide);
     }
     lookup(header, name)
 }
@@ -2293,7 +2385,7 @@ fn describe(addr: u64) -> Option<Described> {
         .unwrap_or_else(|e| e.into_inner())
         .clone()?;
     let (sname, saddr) = main_exports()
-        .map(|m| nearest_export(&m.exports, slide, addr))
+        .map(|m| nearest_export(&m.linked.exports, slide, addr))
         .unwrap_or((0, 0));
     Some(Described {
         fname: path_cstr(&path),
@@ -2613,12 +2705,40 @@ pub(crate) mod entry {
         }
     }
 
-    /// `void *dlsym(void *handle, const char *name)`
+    /// `void *dlsym(void *handle, const char *name)`, which hands its return
+    /// address to [`dlsym_from`]: `RTLD_SELF` and `RTLD_NEXT` search from the
+    /// caller's image, as dyld finds it by `__builtin_return_address`.
+    #[cfg(target_arch = "aarch64")]
+    #[unsafe(naked)]
+    pub unsafe extern "C" fn dlsym() {
+        core::arch::naked_asm!(
+            "mov x2, x30",
+            "b   {from}",
+            from = sym dlsym_from,
+        )
+    }
+
+    /// As the aarch64 `dlsym`: the return address is on top of the stack.
+    #[cfg(not(target_arch = "aarch64"))]
+    #[unsafe(naked)]
+    pub unsafe extern "C" fn dlsym() {
+        core::arch::naked_asm!(
+            "mov rdx, [rsp]",
+            "jmp {from}",
+            from = sym dlsym_from,
+        )
+    }
+
+    /// `dlsym`, called from `return_address`.
     ///
     /// # Safety
     ///
     /// `name` is NUL-terminated. `handle` is never dereferenced.
-    pub unsafe extern "C" fn dlsym(handle: *mut c_void, name: *const c_char) -> *mut c_void {
+    unsafe extern "C" fn dlsym_from(
+        handle: *mut c_void,
+        name: *const c_char,
+        return_address: u64,
+    ) -> *mut c_void {
         if name.is_null() {
             return std::ptr::null_mut();
         }
@@ -2626,7 +2746,16 @@ pub(crate) mod entry {
         let name = unsafe { CStr::from_ptr(name) }
             .to_string_lossy()
             .into_owned();
-        match super::lookup(handle as usize as u64, &name) {
+        // Emulated, this is reached from the import exit, so the guest's
+        // return address is in its context rather than in a register.
+        let caller = match crate::exec::active().map(|exec| exec.engine()) {
+            Some(crate::exec::Engine::Emulated) => {
+                crate::thunk::current().and_then(|vm| vm.import_return_address())
+            }
+            _ => Some(return_address),
+        };
+        let caller = caller.and_then(super::Scope::containing);
+        match super::lookup_from(handle as usize as u64, &name, caller) {
             Some(addr) => {
                 super::clear_error();
                 addr as usize as *mut c_void
@@ -3146,6 +3275,31 @@ mod tests {
         assert!(lookup(kit | FIRST_ONLY, "kit").is_some());
         assert!(lookup(kit | FIRST_ONLY, "base").is_none());
         assert!(lookup(base | FIRST_ONLY, "inner").is_some());
+    }
+
+    #[test]
+    fn rtld_self_searches_the_caller_and_what_it_links() {
+        let (kit, _) = probe_libraries();
+        let caller = Some(Scope::of_handle(kit).unwrap());
+        assert!(lookup_from(RTLD_SELF, "kit", caller).is_some());
+        assert!(lookup_from(RTLD_SELF, "inner", caller).is_some());
+    }
+
+    #[test]
+    fn rtld_next_skips_the_caller() {
+        let (kit, base) = probe_libraries();
+        let caller = Some(Scope::of_handle(kit).unwrap());
+        assert!(lookup_from(RTLD_NEXT, "kit", caller).is_none());
+        assert!(lookup_from(RTLD_NEXT, "base", caller).is_some());
+        assert!(lookup_from(RTLD_NEXT, "inner", caller).is_some());
+        let caller = Some(Scope::of_handle(base).unwrap());
+        assert!(lookup_from(RTLD_NEXT, "kit", caller).is_none());
+    }
+
+    /// Only an exit puts the guest's return address in its context.
+    #[test]
+    fn dlsym_is_never_inlined() {
+        assert_eq!(crate::abi::classify(0, "_dlsym"), Classification::Slow);
     }
 
     #[test]

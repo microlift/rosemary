@@ -16,6 +16,9 @@ pub struct FunctionAbi {
     /// May run guest code outside callbacks, as `dlopen` does with initializers.
     /// Such calls cannot be inlined before guest state is synchronized.
     pub reenters_guest: bool,
+    /// Reads its guest caller's return address, which only an exit
+    /// synchronizes into the context.
+    pub reads_caller: bool,
 }
 
 impl FunctionAbi {
@@ -127,7 +130,7 @@ fn by_tag(_tag: u64) -> Option<&'static FunctionAbi> {
 /// `(ret, args...)`, in `DynamicSymbol` order.
 macro_rules! sig {
     ($name:literal, $ret:expr $(, $arg:expr)* $(,)?) => {
-        FunctionAbi { name: $name, types: &[$ret $(, $arg)*], variadic: false, callbacks: &[], reenters_guest: false }
+        FunctionAbi { name: $name, types: &[$ret $(, $arg)*], variadic: false, callbacks: &[], reenters_guest: false, reads_caller: false }
     };
 }
 
@@ -141,6 +144,7 @@ macro_rules! vsig {
             variadic: true,
             callbacks: &[],
             reenters_guest: false,
+            reads_caller: false,
         }
     };
 }
@@ -155,6 +159,7 @@ macro_rules! cbsig {
             variadic: false,
             callbacks: &[$($cb),*],
             reenters_guest: false,
+            reads_caller: false,
         }
     };
 }
@@ -169,6 +174,22 @@ macro_rules! rsig {
             variadic: false,
             callbacks: &[],
             reenters_guest: true,
+            reads_caller: false,
+        }
+    };
+}
+
+/// As [`sig`], for a function that asks who called it; see
+/// [`FunctionAbi::reads_caller`].
+macro_rules! csig {
+    ($name:literal, $ret:expr $(, $arg:expr)* $(,)?) => {
+        FunctionAbi {
+            name: $name,
+            types: &[$ret $(, $arg)*],
+            variadic: false,
+            callbacks: &[],
+            reenters_guest: false,
+            reads_caller: true,
         }
     };
 }
@@ -1936,7 +1957,7 @@ pub static SIGNATURES: &[FunctionAbi] = &[
     rsig!("dlclose", I32, P),
     sig!("dlerror", P),
     rsig!("dlopen", P, P, I32),
-    sig!("dlsym", P, P, P),
+    csig!("dlsym", P, P, P),
     vsig!("dprintf", I32, I32, P),
     sig!("dup", I32, I32),
     sig!("dup2", I32, I32, I32),
