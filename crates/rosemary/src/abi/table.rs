@@ -13,8 +13,9 @@ pub struct FunctionAbi {
     pub variadic: bool,
     /// Parameter indices containing guest function pointers that need thunks.
     pub callbacks: &'static [u8],
-    /// May run guest code outside callbacks, as `dlopen` does with initializers.
-    /// Such calls cannot be inlined before guest state is synchronized.
+    /// May run guest code other than through its callback arguments, as `dlopen`
+    /// does with initializers and `inflate` with a stream's allocators. Such calls
+    /// cannot be inlined before guest state is synchronized.
     pub reenters_guest: bool,
     /// Reads its guest caller's return address, which only an exit
     /// synchronizes into the context.
@@ -1905,7 +1906,8 @@ pub static SIGNATURES: &[FunctionAbi] = &[
     sig!("curl_global_cleanup", V),
     sig!("curl_global_init", I32, I64),
     sig!("deflate", I32, P, I32),
-    sig!("deflateEnd", I32, P),
+    // Calls the stream's `zfree`, which the zlib shim made a thunk into guest code.
+    rsig!("deflateEnd", I32, P),
     sig!("deflateInit2_", I32, P, I32, I32, I32, I32, I32, P, I32),
     sig!("deflateInit_", I32, P, I32, P, I32),
     sig!("deflateReset", I32, P),
@@ -2806,8 +2808,10 @@ pub static SIGNATURES: &[FunctionAbi] = &[
     sig!("inet_aton", I32, P, P),
     sig!("inet_ntop", P, I32, P, P, U32),
     sig!("inet_pton", I32, I32, P, P),
-    sig!("inflate", I32, P, I32),
-    sig!("inflateEnd", I32, P),
+    // `inflate` allocates its window through the stream's `zalloc`, and
+    // `inflateEnd` frees through `zfree`: thunks into guest code.
+    rsig!("inflate", I32, P, I32),
+    rsig!("inflateEnd", I32, P),
     sig!("inflateInit2_", I32, P, I32, P, I32),
     sig!("inflateInit_", I32, P, P, I32),
     sig!("inflateReset", I32, P),

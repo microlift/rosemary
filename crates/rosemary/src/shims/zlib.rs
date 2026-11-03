@@ -251,6 +251,23 @@ mod tests {
         assert_eq!(core::mem::offset_of!(ZStream, zfree) as u64, ZFREE_OFFSET);
     }
 
+    /// The allocators the shim installs are thunks into guest code, and a call that can
+    /// reach one must exit first so the guest's stack pointer is published for it.
+    #[test]
+    fn entries_that_reach_the_streams_allocators_are_never_inlined() {
+        use crate::abi::{Classification, classify};
+        for reaches in ["_inflate", "_inflateEnd", "_deflateEnd"] {
+            assert_eq!(classify(0, reaches), Classification::Slow, "{reaches}");
+        }
+        for stays_in_zlib in ["_deflate", "_inflateReset", "_deflateReset"] {
+            assert_eq!(
+                classify(0, stays_in_zlib),
+                Classification::Fast,
+                "{stays_in_zlib}"
+            );
+        }
+    }
+
     /// A guest allocator that is really callable from the host, standing in for what a
     /// thunk would be. Returning real memory matters.
     extern "C" fn host_alloc(_opaque: *mut c_void, items: u32, size: u32) -> *mut c_void {
