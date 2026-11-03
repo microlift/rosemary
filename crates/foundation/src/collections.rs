@@ -419,6 +419,8 @@ unsafe extern "C" fn add_objects_from_array(receiver: Id, _sel: Sel, other: Id) 
     }
 }
 
+/// `-removeObjectAtIndex:`. Past the end is Apple's range exception, which
+/// fails here by name.
 unsafe extern "C" fn remove_object_at_index(receiver: Id, _sel: Sel, index: usize) {
     // SAFETY: an array.
     let Some(a) = (unsafe { collections::array(receiver as CFTypeRef) }) else {
@@ -427,10 +429,14 @@ unsafe extern "C" fn remove_object_at_index(receiver: Id, _sel: Sel, index: usiz
     if !a.mutable {
         immutable("NSArray", "removeObjectAtIndex:");
     }
-    if index < a.values.len() {
-        let gone = a.values.remove(index);
-        a.policy.release(gone);
+    if index >= a.values.len() {
+        objc::fail!(
+            "-[NSMutableArray removeObjectAtIndex:]: index {index} of {}",
+            a.values.len()
+        );
     }
+    let gone = a.values.remove(index);
+    a.policy.release(gone);
 }
 
 unsafe extern "C" fn remove_last_object(receiver: Id, sel: Sel) {
