@@ -143,7 +143,12 @@ pub fn post(name: &str, object: Id, user_info: Id) {
             .count();
         eprintln!("rosemary: foundation: post {name} object {object:p} to {takers} observer(s)");
     }
-    let notification = make(name, object, user_info);
+    deliver_to_all(make(name, object, user_info), name, object, user_info);
+}
+
+/// Hand `notification`, whose fields are `name`, `object` and `user_info`, to
+/// every kind of observer that asked for it.
+fn deliver_to_all(notification: Id, name: &str, object: Id, user_info: Id) {
     // Copied out before sending: an observer is entitled to add or remove one
     // from inside its own handler, and holding the lock across the send would
     // deadlock on the first that did.
@@ -156,12 +161,27 @@ pub fn post(name: &str, object: Id, user_info: Id) {
         .map(|o| (o.observer, o.selector))
         .collect();
     for (observer, selector) in targets {
+        // The center does not retain its observers, so one removed by an
+        // earlier handler of this same post may already be freed.
+        if !is_observing(observer, selector) {
+            continue;
+        }
         // SAFETY: an observer method is `void (id, SEL, NSNotification *)` by
-        // the contract of `-addObserver:selector:name:object:`.
+        // the contract of `-addObserver:selector:name:object:`, and the
+        // observer is still registered, so still live by that same contract.
         unsafe { send_notification(observer, selector, notification) };
     }
     post_to_blocks(name, object, notification);
     post_to_callbacks(cf::local_center(), name, object as *const c_void, user_info);
+}
+
+/// Whether `observer` is still registered for `selector`.
+fn is_observing(observer: Id, selector: Sel) -> bool {
+    OBSERVERS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+        .any(|o| o.observer == observer && o.selector == selector)
 }
 
 /// Hand the notification to every block observer of `name`.
@@ -237,6 +257,16 @@ pub(crate) fn post_to_callbacks(center: Id, name: &str, object: *const c_void, u
         .map(|o| (o.callback, o.observer))
         .collect();
     for (callback, observer) in targets {
+        // As for selector observers: an earlier callback may have removed this
+        // one and freed what `observer` points at.
+        let registered = CALLBACK_OBSERVERS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .any(|o| o.center == center && o.observer == observer);
+        if !registered {
+            continue;
+        }
         // SAFETY: the signature `CFNotificationCenterAddObserver` declares.
         unsafe { callback(center, observer, name_object, object, user_info) };
     }
@@ -466,7 +496,8 @@ unsafe extern "C" fn post_notification(_receiver: Id, _sel: Sel, notification: I
     let n = unsafe { &*(notification as *const Notification) };
     // SAFETY: its name field is a string.
     let text = unsafe { text_of(n.name) };
-    post(&text, n.object, n.user_info);
+    // The caller's own object is what observers receive, not a copy of it.
+    deliver_to_all(notification, &text, n.object, n.user_info);
 }
 
 unsafe extern "C" fn post_name(_receiver: Id, _sel: Sel, name: Id, object: Id) {
@@ -684,6 +715,63 @@ mod tests {
             "heard:" => record, c"v24@0:8@16";
         });
         objc::object::create_instance(class, 0)
+    }
+
+    static REMOVED_BY_HANDLER: AtomicUsize = AtomicUsize::new(0);
+
+    unsafe extern "C" fn remove_the_other(_receiver: Id, _sel: Sel, _notification: Id) {
+        let other = REMOVED_BY_HANDLER.load(Ordering::SeqCst) as Id;
+        // SAFETY: the center's own method, which ignores its receiver.
+        unsafe {
+            remove_observer(
+                std::ptr::null_mut(),
+                objc::sel::get("removeObserver:"),
+                other,
+            )
+        };
+    }
+
+    #[test]
+    fn an_observer_removed_by_an_earlier_handler_is_not_sent_the_post() {
+        crate::bootstrap();
+        let class = corefoundation::base::register(
+            c"RosemaryTestNotificationRemover",
+            None,
+            size_of::<usize>(),
+            false,
+        );
+        methods!(class, {
+            "removeOther:" => remove_the_other, c"v24@0:8@16";
+        });
+        let remover = objc::object::create_instance(class, 0);
+        let removed = observer(c"RosemaryTestNotificationRemovedObserver");
+        REMOVED_BY_HANDLER.store(removed as usize, Ordering::SeqCst);
+        for (who, selector) in [(remover, "removeOther:"), (removed, "heard:")] {
+            OBSERVERS
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push(Observer {
+                    observer: who,
+                    selector: objc::sel::get(selector),
+                    name: Some("RosemaryRemovedMidPost".into()),
+                    object: std::ptr::null_mut(),
+                });
+        }
+        post(
+            "RosemaryRemovedMidPost",
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+        );
+        let heard = SEEN
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .any(|n| n == "RosemaryRemovedMidPost");
+        OBSERVERS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .retain(|o| o.observer != remover);
+        assert!(!heard);
     }
 
     #[test]
