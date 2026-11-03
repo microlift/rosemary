@@ -7,6 +7,8 @@ mod memory;
 mod sync;
 mod texture;
 
+use std::collections::HashSet;
+
 use super::*;
 
 pub(super) struct Emitter {
@@ -20,6 +22,12 @@ pub(super) struct Emitter {
     /// and the only one `Workgroup` may use.
     pub(super) uses_variable_pointers: Option<Capability>,
     pub(super) builder: Builder,
+    /// What has been declared, since the builder appends a declaration each
+    /// time it is asked and an instruction asks once per operand.
+    capabilities: HashSet<Capability>,
+    extensions: HashSet<&'static str>,
+    /// `OpConstantFalse` and `OpConstantTrue`, indexed by the value.
+    booleans: [Option<u32>; 2],
     pub(super) types: HashMap<Type, u32>,
     pub(super) constants: HashMap<(Type, u64), u32>,
     pub(super) composites: HashMap<Operand, u32>,
@@ -68,6 +76,9 @@ impl Emitter {
             uses_int64: false,
             uses_variable_pointers: None,
             builder,
+            capabilities: HashSet::from([Capability::Shader]),
+            extensions: HashSet::new(),
+            booleans: [None; 2],
             types: HashMap::new(),
             constants: HashMap::new(),
             composites: HashMap::new(),
@@ -91,13 +102,36 @@ impl Emitter {
 
     /// Declare a capability only when the negotiated Vulkan target admits it.
     pub(super) fn capability(&mut self, capability: Capability) -> Result<(), TranslateError> {
+        if self.capabilities.contains(&capability) {
+            return Ok(());
+        }
         if !self.target.supports_capability(&format!("{capability:?}")) {
             return Err(emission(format!(
                 "target profile does not support {capability:?}"
             )));
         }
+        self.capabilities.insert(capability);
         self.builder.capability(capability);
         Ok(())
+    }
+
+    pub(super) fn extension(&mut self, extension: &'static str) {
+        if self.extensions.insert(extension) {
+            self.builder.extension(extension);
+        }
+    }
+
+    pub(super) fn boolean(&mut self, value: bool) -> Result<u32, TranslateError> {
+        if let Some(id) = self.booleans[usize::from(value)] {
+            return Ok(id);
+        }
+        let ty = self.type_id(&Type::Bool)?;
+        let id = match value {
+            true => self.builder.constant_true(ty),
+            false => self.builder.constant_false(ty),
+        };
+        self.booleans[usize::from(value)] = Some(id);
+        Ok(id)
     }
 
     /// Admit a small scalar used for calculations rather than only as the
@@ -149,7 +183,7 @@ impl Emitter {
             };
             self.capability(capability)?;
             if bits == 8 && self.spirv_version < (1, 5) {
-                self.builder.extension("SPV_KHR_8bit_storage");
+                self.extension("SPV_KHR_8bit_storage");
             }
         }
         Ok(())
@@ -341,7 +375,7 @@ impl Emitter {
             self.uses_variable_pointers = Some(capability);
             self.capability(capability)?;
             if self.spirv_version < (1, 3) {
-                self.builder.extension("SPV_KHR_variable_pointers");
+                self.extension("SPV_KHR_variable_pointers");
             }
         }
         Ok(())
@@ -523,14 +557,7 @@ impl Emitter {
         values: &HashMap<ValueId, u32>,
     ) -> Result<u32, TranslateError> {
         match operand {
-            Operand::Bool(value) => {
-                let ty = self.type_id(&Type::Bool)?;
-                Ok(if *value {
-                    self.builder.constant_true(ty)
-                } else {
-                    self.builder.constant_false(ty)
-                })
-            }
+            Operand::Bool(value) => self.boolean(*value),
             Operand::Value(value) => values
                 .get(value)
                 .copied()
