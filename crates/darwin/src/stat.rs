@@ -1484,11 +1484,11 @@ mod tests {
         };
         let (rc, followed) = stat_at(c"link", 0);
         assert_eq!(rc, 0);
-        assert_eq!(followed.mode as u32 & 0o170000, libc::S_IFREG);
+        assert_eq!(followed.mode as u32 & 0o170000, libc::S_IFREG as _);
         assert_eq!(followed.size, 3);
         let (rc, link) = stat_at(c"link", DARWIN_AT_SYMLINK_NOFOLLOW);
         assert_eq!(rc, 0);
-        assert_eq!(link.mode as u32 & 0o170000, libc::S_IFLNK);
+        assert_eq!(link.mode as u32 & 0o170000, libc::S_IFLNK as _);
         let (rc, folded) = stat_at(c"contents/game.ios", 0);
         assert_eq!(rc, 0, "the case fold stays relative to the descriptor");
         assert_eq!(folded.size, 3);
