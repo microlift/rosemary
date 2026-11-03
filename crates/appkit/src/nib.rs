@@ -205,6 +205,7 @@ pub fn load(path: &Path, owner: Id) -> Result<Loaded, String> {
         owner,
         file_owner: archive.field_object(root, "NSRoot"),
         decoding: None,
+        building: Vec::new(),
         loaded: Loaded {
             objects: BTreeMap::new(),
             placeholders: Vec::new(),
@@ -245,6 +246,9 @@ struct Builder<'a> {
     /// The entry the archive calls `NSRoot`, which is File's Owner: the one
     /// object a nib does not build, because the caller supplies it.
     file_owner: Option<Uid>,
+    /// The entries being built, outermost first. An archive whose references
+    /// lead back to one of these is a cycle the decoders cannot finish.
+    building: Vec<Uid>,
     loaded: Loaded,
 }
 
@@ -521,8 +525,23 @@ impl Builder<'_> {
             self.loaded.objects.insert(uid, self.owner);
             return Some(self.owner);
         }
+        // An object is remembered only once it is built, so a reference back
+        // to one still being built would build it again, without end.
+        if self.building.contains(&uid) {
+            return None;
+        }
+        self.building.push(uid);
+        let object = self.create(uid);
+        self.building.pop();
+        let object = object?;
+        objc::arc::retain(object);
+        self.loaded.objects.insert(uid, object);
+        Some(object)
+    }
 
-        let object = match self.archive.class_name(uid) {
+    /// A new object for an entry, which [`Builder::instantiate`] remembers.
+    fn create(&mut self, uid: Uid) -> Option<Id> {
+        Some(match self.archive.class_name(uid) {
             // A plain entry that is a string is a string, and the archive holds
             // its text rather than an object to build.
             None => foundation::string::from_str(self.archive.string(uid)?),
@@ -544,10 +563,7 @@ impl Builder<'_> {
                 self.decoding = None;
                 object
             }
-        };
-        objc::arc::retain(object);
-        self.loaded.objects.insert(uid, object);
-        Some(object)
+        })
     }
 
     /// An instance of `name`, or of a class invented for it.
@@ -929,6 +945,62 @@ mod tests {
                 "the first responder is a nil target"
             );
         }
+    }
+
+    /// A menu item whose submenu lists the item itself.
+    const CYCLE: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
+<plist version="1.0">
+<dict>
+	<key>$archiver</key><string>NSKeyedArchiver</string>
+	<key>$objects</key>
+	<array>
+		<string>$null</string>
+		<dict>
+			<key>$class</key><dict><key>CF$UID</key><integer>4</integer></dict>
+			<key>NSTitle</key><dict><key>CF$UID</key><integer>5</integer></dict>
+			<key>NSSubmenu</key><dict><key>CF$UID</key><integer>2</integer></dict>
+		</dict>
+		<dict>
+			<key>$class</key><dict><key>CF$UID</key><integer>6</integer></dict>
+			<key>NSMenuItems</key><dict><key>CF$UID</key><integer>3</integer></dict>
+		</dict>
+		<dict>
+			<key>$class</key><dict><key>CF$UID</key><integer>7</integer></dict>
+			<key>NS.objects</key><array><dict><key>CF$UID</key><integer>1</integer></dict></array>
+		</dict>
+		<dict><key>$classes</key><array><string>NSMenuItem</string></array>
+			<key>$classname</key><string>NSMenuItem</string></dict>
+		<string>Loop</string>
+		<dict><key>$classes</key><array><string>NSMenu</string></array>
+			<key>$classname</key><string>NSMenu</string></dict>
+		<dict><key>$classes</key><array><string>NSMutableArray</string></array>
+			<key>$classname</key><string>NSMutableArray</string></dict>
+	</array>
+	<key>$top</key>
+	<dict><key>root</key><dict><key>CF$UID</key><integer>1</integer></dict></dict>
+	<key>$version</key><integer>100000</integer>
+</dict>
+</plist>"#;
+
+    #[test]
+    fn a_reference_cycle_ends_instead_of_recursing() {
+        crate::bootstrap();
+        let archive = Archive::parse(CYCLE.as_bytes()).expect("a keyed archive");
+        let mut builder = Builder {
+            archive: &archive,
+            owner: std::ptr::null_mut(),
+            file_owner: None,
+            decoding: None,
+            building: Vec::new(),
+            loaded: Loaded {
+                objects: BTreeMap::new(),
+                placeholders: Vec::new(),
+                unwired: Vec::new(),
+            },
+        };
+        let item = builder.instantiate(Uid(1));
+        assert!(item.is_some_and(|item| !item.is_null()));
+        assert!(builder.building.is_empty());
     }
 
     #[test]
