@@ -58,6 +58,7 @@ pub(super) unsafe extern "C" fn new_command_buffer(receiver: Id, _sel: Sel) -> I
             batches: Vec::new(),
             waits: Vec::new(),
             descriptor_pools: Vec::new(),
+            descriptor_sets: Default::default(),
             retained: Vec::new(),
             retained_set: AddressSet::default(),
             uploads: Vec::new(),
@@ -96,6 +97,7 @@ pub(super) unsafe extern "C" fn command_buffer_dealloc(receiver: Id, _sel: Sel) 
         for capture in std::mem::take(&mut command.captures) {
             gpu.destroy_buffer(capture.buffer);
         }
+        command.descriptor_sets.iter_mut().for_each(SetMemo::clear);
         for pool in std::mem::take(&mut command.descriptor_pools) {
             gpu.release_descriptor_pool(pool);
         }
@@ -235,7 +237,10 @@ pub(super) unsafe extern "C" fn commit(receiver: Id, _sel: Sel) {
             .map(|batch| batch.command_buffer)
             .collect(),
         fence: command.fence,
-        descriptor_pools: std::mem::take(&mut command.descriptor_pools),
+        descriptor_pools: {
+            command.descriptor_sets.iter_mut().for_each(SetMemo::clear);
+            std::mem::take(&mut command.descriptor_pools)
+        },
         retained: {
             command.retained_set.clear();
             std::mem::take(&mut command.retained)

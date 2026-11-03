@@ -120,6 +120,61 @@ struct SetCache {
     entries: Vec<DescriptorEntry>,
 }
 
+/// How many written sets per set index a command buffer remembers, enough
+/// for the handful of material and object sets a frame alternates between.
+const SET_MEMO_CAPACITY: usize = 8;
+
+/// The descriptor sets one command buffer has written for one set index, most
+/// recently used first. A set is never written again once a draw has used it,
+/// and every handle its entries name belongs to an object the command buffer
+/// retains until its work retires, so each still holds what it was written
+/// with.
+#[derive(Default)]
+struct SetMemo {
+    sets: Vec<SetCache>,
+}
+
+impl SetMemo {
+    fn find(
+        &mut self,
+        layout: vk::DescriptorSetLayout,
+        entries: &[DescriptorEntry],
+    ) -> Option<vk::DescriptorSet> {
+        let at = self
+            .sets
+            .iter()
+            .position(|cached| cached.layout == layout && cached.entries == entries)?;
+        self.sets[..=at].rotate_right(1);
+        Some(self.sets[0].set)
+    }
+
+    /// Remember `set` as written with `entries`, taking them and handing back
+    /// the storage of whichever set it displaces.
+    fn insert(
+        &mut self,
+        layout: vk::DescriptorSetLayout,
+        set: vk::DescriptorSet,
+        entries: &mut Vec<DescriptorEntry>,
+    ) {
+        if self.sets.len() < SET_MEMO_CAPACITY {
+            self.sets.push(SetCache::default());
+        }
+        self.sets.rotate_right(1);
+        let slot = &mut self.sets[0];
+        slot.layout = layout;
+        slot.set = set;
+        std::mem::swap(&mut slot.entries, entries);
+    }
+
+    fn front(&self) -> &[DescriptorEntry] {
+        self.sets.first().map_or(&[], |cached| &cached.entries)
+    }
+
+    fn clear(&mut self) {
+        self.sets.clear();
+    }
+}
+
 /// What is bound at one bind point, so that a draw which changes nothing
 /// records nothing.
 #[derive(Default)]
@@ -151,6 +206,8 @@ pub(crate) struct CommandBuffer {
     /// Event values the batch now recording waits for.
     waits: Vec<(vk::Semaphore, u64)>,
     descriptor_pools: Vec<vk::DescriptorPool>,
+    /// Sets written from those pools, per set index.
+    descriptor_sets: [SetMemo; SETS],
     /// Objects the recording refers to, retained until the work completes.
     /// Each is retained once however often it is bound: a retain is a global
     /// lock in the Objective-C runtime, and a frame binds the same objects
@@ -228,6 +285,8 @@ pub(crate) struct Encoder {
     compute_variant: Option<(Id, [u32; 3], vk::Pipeline)>,
     /// Index by `bind_point_slot`.
     bound: [BindPoint; 2],
+    /// Per set index, the last set bound or pushed there; the push path
+    /// reads it to know whether the bind point still holds its push.
     set_cache: [SetCache; SETS],
     /// Scratch for the entries a draw needs, kept to avoid an allocation.
     wanted: [Vec<DescriptorEntry>; SETS],
@@ -797,5 +856,74 @@ pub(crate) fn install() {
             set_raster_value as *const std::ffi::c_void,
             c"v24@0:8Q16",
         );
+    }
+}
+
+#[cfg(test)]
+mod set_memo_tests {
+    use super::*;
+    use vk::Handle;
+
+    fn entries(handle: u64) -> Vec<DescriptorEntry> {
+        vec![DescriptorEntry {
+            binding: 0,
+            kind: vk::DescriptorType::STORAGE_BUFFER,
+            handle,
+            offset: 0,
+            range: vk::WHOLE_SIZE,
+            dynamic_offset: 0,
+        }]
+    }
+
+    fn layout(raw: u64) -> vk::DescriptorSetLayout {
+        vk::DescriptorSetLayout::from_raw(raw)
+    }
+
+    fn set(raw: u64) -> vk::DescriptorSet {
+        vk::DescriptorSet::from_raw(raw)
+    }
+
+    #[test]
+    fn finds_any_remembered_set_with_the_same_layout_and_entries() {
+        let mut memo = SetMemo::default();
+        memo.insert(layout(1), set(10), &mut entries(100));
+        memo.insert(layout(1), set(20), &mut entries(200));
+        assert_eq!(memo.find(layout(1), &entries(100)), Some(set(10)));
+        assert!(memo.front() == entries(100).as_slice());
+        assert_eq!(memo.find(layout(1), &entries(200)), Some(set(20)));
+        assert_eq!(memo.find(layout(2), &entries(100)), None);
+        assert_eq!(memo.find(layout(1), &entries(300)), None);
+    }
+
+    #[test]
+    fn ignores_dynamic_offsets_when_matching() {
+        let mut memo = SetMemo::default();
+        memo.insert(layout(1), set(10), &mut entries(100));
+        let mut moved = entries(100);
+        moved[0].dynamic_offset = 256;
+        assert_eq!(memo.find(layout(1), &moved), Some(set(10)));
+    }
+
+    #[test]
+    fn forgets_the_least_recently_used_set_when_full() {
+        let mut memo = SetMemo::default();
+        for index in 0..SET_MEMO_CAPACITY as u64 {
+            memo.insert(layout(1), set(index + 1), &mut entries(index));
+        }
+        // Touch the oldest so the second oldest is the one displaced.
+        assert_eq!(memo.find(layout(1), &entries(0)), Some(set(1)));
+        memo.insert(layout(1), set(99), &mut entries(99));
+        assert_eq!(memo.find(layout(1), &entries(0)), Some(set(1)));
+        assert_eq!(memo.find(layout(1), &entries(1)), None);
+        assert_eq!(memo.sets.len(), SET_MEMO_CAPACITY);
+    }
+
+    #[test]
+    fn forgets_everything_when_cleared() {
+        let mut memo = SetMemo::default();
+        memo.insert(layout(1), set(10), &mut entries(100));
+        memo.clear();
+        assert_eq!(memo.find(layout(1), &entries(100)), None);
+        assert!(memo.front().is_empty());
     }
 }

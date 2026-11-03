@@ -96,6 +96,7 @@ pub(super) unsafe extern "C" fn new_sub_encoder(receiver: Id, _sel: Sel) -> Id {
             batches: Vec::new(),
             waits: Vec::new(),
             descriptor_pools: Vec::new(),
+            descriptor_sets: Default::default(),
             retained: Vec::new(),
             retained_set: AddressSet::default(),
             uploads: Vec::new(),
@@ -171,6 +172,7 @@ pub(super) unsafe extern "C" fn end_parallel_encoding(receiver: Id, sel: Sel) {
         if command.recording {
             command.recording = false;
             executed.push(command.command_buffer);
+            command.descriptor_sets.iter_mut().for_each(SetMemo::clear);
             parent
                 .descriptor_pools
                 .append(&mut command.descriptor_pools);

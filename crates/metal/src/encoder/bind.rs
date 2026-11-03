@@ -454,7 +454,7 @@ impl Encoder {
     }
 
     /// Allocate or reuse a descriptor set per used set index, writing it only
-    /// when its contents differ from the one this encoder last wrote.
+    /// when no set this command buffer wrote already holds its contents.
     fn materialize_sets(
         &mut self,
         layouts: &[vk::DescriptorSetLayout; SETS],
@@ -463,28 +463,26 @@ impl Encoder {
     ) -> Option<[vk::DescriptorSet; SETS]> {
         let command = self.command();
         let gpu = command.gpu;
-        // A set whose layout and contents match the one this encoder last
-        // wrote is still valid: nothing writes a set once a draw has used it.
         let mut sets = [vk::DescriptorSet::null(); SETS];
         let mut fresh = [false; SETS];
         for index in 0..SETS {
             if !used[index] || push_set == Some(index) {
                 continue;
             }
+            let layout = layouts[index];
+            let set = match command.descriptor_sets[index].find(layout, &self.wanted[index]) {
+                Some(set) => set,
+                None => {
+                    let set = command.allocate_set(layout)?;
+                    command.descriptor_sets[index].insert(layout, set, &mut self.wanted[index]);
+                    fresh[index] = true;
+                    set
+                }
+            };
             let cache = &mut self.set_cache[index];
-            if cache.set != vk::DescriptorSet::null()
-                && cache.layout == layouts[index]
-                && cache.entries == self.wanted[index]
-            {
-                sets[index] = cache.set;
-                continue;
-            }
-            let set = command.allocate_set(layouts[index])?;
-            cache.layout = layouts[index];
+            cache.layout = layout;
             cache.set = set;
-            std::mem::swap(&mut cache.entries, &mut self.wanted[index]);
             sets[index] = set;
-            fresh[index] = true;
         }
 
         if fresh.iter().any(|fresh| *fresh) {
@@ -492,7 +490,7 @@ impl Encoder {
             let mut image_infos = Vec::new();
             let mut texel_views = Vec::new();
             for index in (0..SETS).filter(|index| fresh[*index]) {
-                for entry in &self.set_cache[index].entries {
+                for entry in command.descriptor_sets[index].front() {
                     use vk::Handle;
                     match entry.kind {
                         vk::DescriptorType::UNIFORM_TEXEL_BUFFER
@@ -521,7 +519,7 @@ impl Encoder {
             let (mut next_buffer, mut next_image, mut next_texel) = (0, 0, 0);
             let mut writes = Vec::with_capacity(buffer_infos.len() + image_infos.len());
             for index in (0..SETS).filter(|index| fresh[*index]) {
-                for entry in &self.set_cache[index].entries {
+                for entry in command.descriptor_sets[index].front() {
                     let write = vk::WriteDescriptorSet::default()
                         .dst_set(sets[index])
                         .dst_binding(entry.binding)
