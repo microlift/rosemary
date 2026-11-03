@@ -1687,10 +1687,9 @@ fn matrix_named(word: &str) -> Option<Ty> {
 fn texture_dimension(word: &str) -> Option<(TextureDimension, bool, bool, bool)> {
     let (depth, body) = if let Some(body) = word.strip_prefix("texture") {
         (false, body)
-    } else if let Some(body) = word.strip_prefix("depth") {
-        (true, body)
     } else {
-        return None;
+        let body = word.strip_prefix("depth")?;
+        (true, body)
     };
     let (body, array) = match body.strip_suffix("_array") {
         Some(body) => (body, true),

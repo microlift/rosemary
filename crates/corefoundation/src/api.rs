@@ -3865,7 +3865,7 @@ mod tests {
 
     #[test]
     fn no_copy_data_keeps_an_owned_snapshot() {
-        let mut source = vec![1u8, 2, 3];
+        let mut source = [1u8, 2, 3];
         // SAFETY: `source` covers the stated length.
         let data = unsafe {
             CFDataCreateWithBytesNoCopy(
@@ -3875,7 +3875,11 @@ mod tests {
                 std::ptr::null(),
             )
         };
-        source[0] = 9;
+        // The write is the point: the data must not observe it.
+        #[allow(unused_assignments)]
+        {
+            source[0] = 9;
+        }
 
         // SAFETY: `data` was created above and remains retained.
         let bytes = unsafe {

@@ -57,6 +57,7 @@ fn copy_one(from: &Path, to: &Path, flags: u32) -> std::io::Result<()> {
         let mut destination = std::fs::OpenOptions::new()
             .write(true)
             .create(true)
+            .truncate(false) // truncated below, after the same-file check
             .create_new(flags & EXCL != 0)
             .open(to)?;
         let dst = destination.metadata()?;

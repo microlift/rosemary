@@ -10,3 +10,6 @@ objc.workspace = true
 corefoundation.workspace = true
 foundation.workspace = true
 darwin.workspace = true
+
+[lints]
+workspace = true

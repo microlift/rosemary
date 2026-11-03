@@ -137,7 +137,7 @@ unsafe extern "C" fn temporary_directory() -> Id {
     // guest prefix does not contain.
     // TODO: make this read the guest's environ block incase they set TMPDIR
     // themselves
-    return crate::string::from_str("/tmp/");
+    crate::string::from_str("/tmp/")
 }
 
 exports::exports! {

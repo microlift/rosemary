@@ -9,3 +9,6 @@ license.workspace = true
 exports.workspace = true
 sdl3.workspace = true
 corefoundation.workspace = true
+
+[lints]
+workspace = true

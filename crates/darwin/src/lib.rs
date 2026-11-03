@@ -211,7 +211,8 @@ fn load_host_libraries() {
     {
         static ONCE: std::sync::Once = std::sync::Once::new();
         ONCE.call_once(|| {
-            for soname in [c"libm.so.6"] {
+            {
+                let soname = c"libm.so.6";
                 // SAFETY: a soname the dynamic loader resolves, opened globally
                 // so its exports join the default search, and never closed.
                 unsafe {

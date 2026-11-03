@@ -23,3 +23,6 @@ static_init.workspace = true
 [dev-dependencies]
 sdl3 = { workspace = true, features = ["test-support"] }
 iosurface.workspace = true
+
+[lints]
+workspace = true

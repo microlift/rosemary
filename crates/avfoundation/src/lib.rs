@@ -88,8 +88,7 @@ unsafe extern "C" fn authorization_status_for_media_type(
     _sel: Sel,
     media_type: Id,
 ) -> isize {
-    let status = authorization_status(media_type);
-    status
+    authorization_status(media_type)
 }
 
 /// A `void (^)(BOOL granted)` waiting to be called with its answer.

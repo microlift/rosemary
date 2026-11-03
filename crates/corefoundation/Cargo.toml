@@ -17,3 +17,6 @@ static_init.workspace = true
 sdl3.workspace = true
 icu_normalizer.workspace = true
 icu_properties.workspace = true
+
+[lints]
+workspace = true

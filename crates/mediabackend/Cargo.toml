@@ -19,3 +19,6 @@ gst_video = { package = "gstreamer-video", version = "0.25", features = ["v1_18"
 [[example]]
 name = "h264_stream"
 required-features = ["gstreamer"]
+
+[lints]
+workspace = true

@@ -14,3 +14,6 @@ sdl3.workspace = true
 
 [dev-dependencies]
 libc.workspace = true
+
+[lints]
+workspace = true

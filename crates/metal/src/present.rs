@@ -1313,19 +1313,19 @@ fn present_inner(drawable: Id) {
             gpu::milestone("presented frame");
             crate::stats::frame();
             dump_frame(pixels, width, height, texture.image.format);
-            if let Some(window) = window {
-                if let Some(properties) = sdl3::video::presentation_window(window) {
-                    enqueue_completed_readback(ReadbackFrame {
-                        window: window as usize,
-                        window_id: properties.id,
-                        layer: described.layer as usize,
-                        pixels: pixels.to_vec(),
-                        width,
-                        height,
-                        format: texture.image.format,
-                        placement,
-                    });
-                }
+            if let Some(window) = window
+                && let Some(properties) = sdl3::video::presentation_window(window)
+            {
+                enqueue_completed_readback(ReadbackFrame {
+                    window: window as usize,
+                    window_id: properties.id,
+                    layer: described.layer as usize,
+                    pixels: pixels.to_vec(),
+                    width,
+                    height,
+                    format: texture.image.format,
+                    placement,
+                });
             }
         }
     }
@@ -1418,7 +1418,7 @@ fn mask_readback_surface(
         let (x, w) = (band.x as usize, band.w as usize);
         for y in band.y as usize..(band.y + band.h) as usize {
             let row = &mut pixels[y * pitch + x * 4..y * pitch + (x + w) * 4];
-            for pixel in row.chunks_exact_mut(4) {
+            for pixel in row.as_chunks_mut::<4>().0 {
                 pixel.copy_from_slice(&[0, 0, 0, 255]);
             }
         }

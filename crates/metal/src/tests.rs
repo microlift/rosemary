@@ -75,8 +75,8 @@ fn source_library(device: Id, source: &str) -> Id {
 fn every_export_resolves_with_both_spellings() {
     isolate_metal_fixture!();
     for name in names() {
-        assert_ne!(symbol(&name), None);
-        assert_eq!(symbol(&format!("_{name}")), symbol(&name));
+        assert_ne!(symbol(name), None);
+        assert_eq!(symbol(&format!("_{name}")), symbol(name));
     }
 }
 

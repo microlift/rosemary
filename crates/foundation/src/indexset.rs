@@ -387,6 +387,20 @@ pub(crate) fn install() {
     });
 }
 
+/// The indexes `set` holds, in order, as half-open ranges.
+pub(crate) fn ranges_of(set: Id) -> Vec<(usize, usize)> {
+    get(set)
+}
+
+/// A new, autoreleased immutable set of `indexes`, which need not be sorted.
+pub(crate) fn from_indexes(indexes: &[usize]) -> Id {
+    let mut ranges = Ranges::new();
+    for &index in indexes {
+        add_range(&mut ranges, index, index.saturating_add(1));
+    }
+    make(c"NSIndexSet", ranges)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -416,18 +430,4 @@ mod tests {
         assert_eq!(greater_or_equal(&r, 9), NOT_FOUND);
         assert_eq!(less_or_equal(&r, 0), NOT_FOUND);
     }
-}
-
-/// The indexes `set` holds, in order, as half-open ranges.
-pub(crate) fn ranges_of(set: Id) -> Vec<(usize, usize)> {
-    get(set)
-}
-
-/// A new, autoreleased immutable set of `indexes`, which need not be sorted.
-pub(crate) fn from_indexes(indexes: &[usize]) -> Id {
-    let mut ranges = Ranges::new();
-    for &index in indexes {
-        add_range(&mut ranges, index, index.saturating_add(1));
-    }
-    make(c"NSIndexSet", ranges)
 }

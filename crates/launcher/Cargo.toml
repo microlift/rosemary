@@ -10,3 +10,6 @@ license.workspace = true
 [[bin]]
 name = "rosemary-launcher"
 path = "src/main.rs"
+
+[lints]
+workspace = true

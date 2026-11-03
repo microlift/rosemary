@@ -50,13 +50,14 @@ unsafe fn send1_bool(receiver: Id, sel: Sel, argument: usize) -> bool {
 /// the guest still holds in its class references. Read as a class, its
 /// garbage method-table lock hangs the first lookup instead of failing.
 fn expect_class(cls: Id, function: &str) {
-    if crate::debug::enabled() {
-        if !cls.is_null() && !crate::class::is_known(cls as *const crate::class::Class) {
-            crate::fail!(
-                "{function}({cls:p}): not a class this runtime built; a guest class whose \
+    if crate::debug::enabled()
+        && !cls.is_null()
+        && !crate::class::is_known(cls as *const crate::class::Class)
+    {
+        crate::fail!(
+            "{function}({cls:p}): not a class this runtime built; a guest class whose \
              registration was refused (see the refusals logged at load) is the usual cause"
-            );
-        }
+        );
     }
 }
 

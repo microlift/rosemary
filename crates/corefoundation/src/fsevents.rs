@@ -173,7 +173,7 @@ mod tests {
         RELEASES.store(0, Ordering::Relaxed);
         let context = Context {
             version: 0,
-            info: 1usize as *mut c_void,
+            info: std::ptr::dangling_mut::<c_void>(),
             retain: Some(retain),
             release: Some(release_info),
             copy_description: std::ptr::null(),

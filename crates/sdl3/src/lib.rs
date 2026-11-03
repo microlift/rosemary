@@ -4832,12 +4832,10 @@ pub mod video {
     }
 
     pub fn get_hint(name: &CStr) -> Option<&CStr> {
-        let Some(f) = api().and_then(|a| a.SDL_GetHint) else {
-            return None;
-        };
+        let f = api().and_then(|a| a.SDL_GetHint)?;
         let hint = unsafe { f(name.as_ptr()) };
         if hint.is_null() {
-            return None;
+            None
         } else {
             unsafe { Some(CStr::from_ptr(hint)) }
         }

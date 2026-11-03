@@ -8,3 +8,6 @@ license.workspace = true
 exports.workspace = true
 corefoundation.workspace = true
 coremedia.workspace = true
+
+[lints]
+workspace = true

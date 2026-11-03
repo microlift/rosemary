@@ -24,3 +24,6 @@ tiny-skia.workspace = true
 
 [dev-dependencies]
 sdl3 = { workspace = true, features = ["test-support"] }
+
+[lints]
+workspace = true

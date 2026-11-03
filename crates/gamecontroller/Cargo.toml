@@ -12,3 +12,6 @@ corefoundation.workspace = true
 foundation.workspace = true
 iokit.workspace = true
 sdl3.workspace = true
+
+[lints]
+workspace = true

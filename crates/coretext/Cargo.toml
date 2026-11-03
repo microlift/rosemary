@@ -12,3 +12,6 @@ foundation.workspace = true
 chrome.workspace = true
 prefix.workspace = true
 owned_ttf_parser.workspace = true
+
+[lints]
+workspace = true

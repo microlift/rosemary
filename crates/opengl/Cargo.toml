@@ -9,3 +9,6 @@ license.workspace = true
 exports.workspace = true
 appkit.workspace = true
 sdl3.workspace = true
+
+[lints]
+workspace = true

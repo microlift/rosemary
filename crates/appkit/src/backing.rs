@@ -403,7 +403,7 @@ impl NativePixelTiles {
         if width == 0
             || height == 0
             || pixels.len() != expected
-            || pixels.chunks_exact(4).any(|p| p[3] != 255)
+            || pixels.as_chunks::<4>().0.iter().any(|p| p[3] != 255)
         {
             return None;
         }
@@ -463,6 +463,8 @@ impl NativePixelTiles {
             if end_y > crop.height as usize || start_x.checked_add(columns)? > width {
                 return None;
             }
+            // `band_index` addresses several parallel band arrays.
+            #[allow(clippy::needless_range_loop)]
             for band_index in start_y / NATIVE_TILE_ROWS..=(end_y - 1) / NATIVE_TILE_ROWS {
                 let band_start = band_index * NATIVE_TILE_ROWS;
                 let from = start_y.max(band_start);
@@ -669,71 +671,72 @@ pub(crate) fn native_scene_tiled_pixels_cropped_with_damage(
     let mut cache = NATIVE_TILED_CAPTURES
         .lock()
         .unwrap_or_else(|e| e.into_inner());
-    if let Some(old) = cache.get_mut(&key) {
-        if old.layer == layer as usize
-            && old.store_instance == source.instance
-            && old.ca_revision == ca_revision
-            && old.descendant_revision == descendant_revision
-            && old.overlay_revision == overlay_revision
-        {
-            old.last_used = next_native_capture_use();
-            if old.view_generation == source.generation() {
+    if let Some(old) = cache.get_mut(&key)
+        && old.layer == layer as usize
+        && old.store_instance == source.instance
+        && old.ca_revision == ca_revision
+        && old.descendant_revision == descendant_revision
+        && old.overlay_revision == overlay_revision
+    {
+        old.last_used = next_native_capture_use();
+        if old.view_generation == source.generation() {
+            return Some((
+                std::sync::Arc::clone(&old.tiles),
+                old.tiles.revision,
+                old.damage,
+            ));
+        }
+        if let Some(all) = source.damage_regions_since(old.view_generation) {
+            let regions = all
+                .into_iter()
+                .map(|r| r.intersection(&crop))
+                .filter(|r| !r.is_empty())
+                .collect::<Vec<_>>();
+            if regions.is_empty() {
+                old.view_generation = source.generation();
                 return Some((
                     std::sync::Arc::clone(&old.tiles),
                     old.tiles.revision,
                     old.damage,
                 ));
             }
-            if let Some(all) = source.damage_regions_since(old.view_generation) {
-                let regions = all
-                    .into_iter()
-                    .map(|r| r.intersection(&crop))
-                    .filter(|r| !r.is_empty())
-                    .collect::<Vec<_>>();
-                if regions.is_empty() {
-                    old.view_generation = source.generation();
-                    return Some((
-                        std::sync::Arc::clone(&old.tiles),
-                        old.tiles.revision,
-                        old.damage,
-                    ));
-                }
-                // All previously accepted unchanged pixels were verified
-                // opaque; newly authored regions alone need an alpha check.
-                let opaque = regions.iter().all(|r| {
-                    (r.y..r.y + r.height).all(|row| {
-                        let offset = ((row as usize) * width as usize + r.x as usize) * 4;
-                        source.pixels[offset..offset + r.width as usize * 4]
-                            .chunks_exact(4)
-                            .all(|pixel| pixel[3] == 255)
-                    })
-                });
-                if !opaque {
-                    source.found_translucent();
-                    cache.remove(&key);
-                    return None;
-                }
-                let next = old.tiles.patched_regions(source, crop, &regions)?;
-                let prior = old.tiles.revision;
-                let revision = next.revision;
-                // Preserve exact dirty rectangles for CPU patch work,
-                // keep the old single-box GPU ABI conservative for now.
-                let union = regions.iter().copied().reduce(|a, b| a.union(&b))?;
-                if prior != revision {
-                    old.damage = Some(NativeCpuDamage {
-                        from_revision: prior,
-                        rect: Rect {
-                            x: union.x - crop.x,
-                            y: union.y - crop.y,
-                            width: union.width,
-                            height: union.height,
-                        },
-                    });
-                }
-                old.view_generation = source.generation();
-                old.tiles = std::sync::Arc::new(next);
-                return Some((std::sync::Arc::clone(&old.tiles), revision, old.damage));
+            // All previously accepted unchanged pixels were verified
+            // opaque; newly authored regions alone need an alpha check.
+            let opaque = regions.iter().all(|r| {
+                (r.y..r.y + r.height).all(|row| {
+                    let offset = ((row as usize) * width as usize + r.x as usize) * 4;
+                    source.pixels[offset..offset + r.width as usize * 4]
+                        .as_chunks::<4>()
+                        .0
+                        .iter()
+                        .all(|pixel| pixel[3] == 255)
+                })
+            });
+            if !opaque {
+                source.found_translucent();
+                cache.remove(&key);
+                return None;
             }
+            let next = old.tiles.patched_regions(source, crop, &regions)?;
+            let prior = old.tiles.revision;
+            let revision = next.revision;
+            // Preserve exact dirty rectangles for CPU patch work,
+            // keep the old single-box GPU ABI conservative for now.
+            let union = regions.iter().copied().reduce(|a, b| a.union(&b))?;
+            if prior != revision {
+                old.damage = Some(NativeCpuDamage {
+                    from_revision: prior,
+                    rect: Rect {
+                        x: union.x - crop.x,
+                        y: union.y - crop.y,
+                        width: union.width,
+                        height: union.height,
+                    },
+                });
+            }
+            old.view_generation = source.generation();
+            old.tiles = std::sync::Arc::new(next);
+            return Some((std::sync::Arc::clone(&old.tiles), revision, old.damage));
         }
     }
     // Cold capture and unknown mutation history require full alpha proof.
@@ -852,7 +855,7 @@ fn update_plain_opaque_capture(
     for row in y..y + h {
         let start = row.checked_mul(width)?.checked_add(x)?.checked_mul(4)?;
         let bytes = source.pixels.get(start..start + row_bytes)?;
-        if bytes.chunks_exact(4).any(|pixel| pixel[3] != 255) {
+        if bytes.as_chunks::<4>().0.iter().any(|pixel| pixel[3] != 255) {
             source.found_translucent();
             return None; // Re-render through the general alpha-aware path.
         }
@@ -3670,7 +3673,7 @@ fn two_large_native_views_capture_cache_pressure_benchmark() {
     }
     let repeat_ms = refresh.elapsed().as_secs_f64() * 1000.0 / loops as f64;
     let again = native_render_count_for_tests();
-    let misses = (again - after_warm) as usize;
+    let misses = again - after_warm;
     let total = loops * views.len() * tiles.len();
     let hits = total.saturating_sub(misses);
     let cache_bytes: usize = NATIVE_CAPTURES
@@ -4690,7 +4693,7 @@ mod tests {
         const WIDTH: u32 = 6;
         const HEIGHT: u32 = 4;
         let mut pixels = [12u8, 34, 56, 255].repeat((WIDTH * HEIGHT) as usize);
-        pixels[(1 * WIDTH as usize + 4) * 4..(1 * WIDTH as usize + 5) * 4]
+        pixels[((WIDTH as usize) + 4) * 4..((WIDTH as usize) + 5) * 4]
             .copy_from_slice(&[90, 80, 70, 255]);
         set_native_view_pixels_for_tests(view, WIDTH, HEIGHT, pixels);
         let crop = Rect {
@@ -4706,7 +4709,7 @@ mod tests {
         assert_eq!(&opaque[4..8], &[90, 80, 70, 255]);
         set_native_view_pixels_for_tests(view, WIDTH, HEIGHT, {
             let mut pixels = [12u8, 34, 56, 255].repeat((WIDTH * HEIGHT) as usize);
-            pixels[(1 * WIDTH as usize + 4) * 4..(1 * WIDTH as usize + 5) * 4]
+            pixels[((WIDTH as usize) + 4) * 4..((WIDTH as usize) + 5) * 4]
                 .copy_from_slice(&[90, 80, 70, 0]);
             pixels
         });
@@ -4831,7 +4834,7 @@ mod tests {
         {
             let mut stores = VIEW_STORES.lock().unwrap();
             let src = stores.as_mut().unwrap().get_mut(&(view as usize)).unwrap();
-            src.pixels[(1 * 8 + 6) * 4..(1 * 8 + 6) * 4 + 4].copy_from_slice(&[255, 0, 0, 255]);
+            src.pixels[(8 + 6) * 4..(8 + 6) * 4 + 4].copy_from_slice(&[255, 0, 0, 255]);
             src.touch_region(Rect {
                 x: 6,
                 y: 1,
@@ -5907,10 +5910,7 @@ mod tests {
                 },
             })
         );
-        assert_eq!(
-            &second.0[(1 * 4 + 2) * 4..(1 * 4 + 2) * 4 + 4],
-            &[0, 255, 0, 255]
-        );
+        assert_eq!(&second.0[(4 + 2) * 4..(4 + 2) * 4 + 4], &[0, 255, 0, 255]);
         {
             let mut stores = VIEW_STORES.lock().unwrap();
             let store = stores.as_mut().unwrap().get_mut(&(view as usize)).unwrap();
@@ -6014,14 +6014,11 @@ mod tests {
         uploading.dirty = true;
         let before_stores = {
             let mut stores = STORES.lock().expect("stores");
-            std::mem::replace(
-                &mut *stores,
-                Some(HashMap::from([
-                    (0x71a1usize, deferred),
-                    (0x71b2usize, independent),
-                    (0x71c3usize, uploading),
-                ])),
-            )
+            (*stores).replace(HashMap::from([
+                (0x71a1usize, deferred),
+                (0x71b2usize, independent),
+                (0x71c3usize, uploading),
+            ]))
         };
         present_dirty();
         {
@@ -6345,7 +6342,9 @@ mod tests {
             let mut store = Store::new(16, 8);
             store
                 .pixels
-                .chunks_exact_mut(4)
+                .as_chunks_mut::<4>()
+                .0
+                .iter_mut()
                 .for_each(|pixel| pixel[3] = 255);
             assert!(store.fully_opaque());
             assert_eq!(opaque_alpha_scan_count_for_tests(), 1);
@@ -6371,7 +6370,9 @@ mod tests {
         assert_eq!(opaque_alpha_scan_count_for_tests(), scanned + 1);
         store
             .pixels
-            .chunks_exact_mut(4)
+            .as_chunks_mut::<4>()
+            .0
+            .iter_mut()
             .for_each(|pixel| pixel[3] = 255);
         store.touch();
         for _ in 0..100 {

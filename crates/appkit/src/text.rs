@@ -1190,9 +1190,11 @@ unsafe extern "C" fn current_editor(receiver: Id, _sel: Sel) -> Id {
         let f: unsafe extern "C" fn(Id, Sel) -> Id = std::mem::transmute(objc::msg::entry());
         f(window, objc::sel::get("firstResponder"))
     };
-    (first == editor)
-        .then_some(editor)
-        .unwrap_or(std::ptr::null_mut())
+    if first == editor {
+        editor
+    } else {
+        std::ptr::null_mut()
+    }
 }
 
 unsafe extern "C" fn field_mouse_down(receiver: Id, _sel: Sel, _event: Id) {
@@ -2059,7 +2061,7 @@ mod tests {
         buffer
             .chunks_exact(width * 4)
             .enumerate()
-            .filter(|(_, row)| row.chunks_exact(4).any(|pixel| pixel[3] != 0))
+            .filter(|(_, row)| row.as_chunks::<4>().0.iter().any(|pixel| pixel[3] != 0))
             .map(|(at, _)| at)
             .collect()
     }

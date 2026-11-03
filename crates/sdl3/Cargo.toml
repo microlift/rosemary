@@ -11,3 +11,6 @@ libc.workspace = true
 [features]
 # What the crates driving SDL in their own tests share.
 test-support = []
+
+[lints]
+workspace = true

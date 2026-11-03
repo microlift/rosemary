@@ -478,10 +478,11 @@ pub fn from_bytes(bytes: &[u8], wide: bool) -> CFTypeRef {
     // other UTF-8 is kept as UTF-16, so its length and indices are the ones a
     // Mac reports, and a caller sizing a buffer from them does not cut a
     // character in half.
-    if !wide && !bytes.is_ascii() {
-        if let Ok(text) = std::str::from_utf8(bytes) {
-            return from_utf16(&text.encode_utf16().collect::<Vec<u16>>());
-        }
+    if !wide
+        && !bytes.is_ascii()
+        && let Ok(text) = std::str::from_utf8(bytes)
+    {
+        return from_utf16(&text.encode_utf16().collect::<Vec<u16>>());
     }
     if wide {
         // An odd trailing byte is not a code unit and there is nothing to pair

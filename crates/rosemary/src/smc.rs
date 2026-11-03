@@ -477,7 +477,7 @@ mod tests {
             (size * 2) as u64,
             libc::PROT_READ | libc::PROT_WRITE,
         );
-        guard(&[p as u64..p as u64 + 8]);
+        guard(std::slice::from_ref(&(p as u64..p as u64 + 8)));
         // Not the second page: it holds nothing.
         assert!(on_fault(p as u64 + 3));
         // SAFETY: writable again after `on_fault`.

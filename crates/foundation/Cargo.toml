@@ -14,3 +14,6 @@ prefix.workspace = true
 libc.workspace = true
 ureq.workspace = true
 fancy-regex = { version = "0.19.2", features = ["leftmost_longest"] }
+
+[lints]
+workspace = true

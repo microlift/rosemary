@@ -38,3 +38,6 @@ libc = { workspace = true, optional = true }
 # Only for tests that verify a resolved address is a real host image address
 # via `dladdr`. The crate itself keeps `libc` optional and `std`-gated.
 libc = { workspace = true }
+
+[lints]
+workspace = true

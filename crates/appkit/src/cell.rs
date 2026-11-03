@@ -1285,7 +1285,7 @@ mod tests {
                 );
             }
         });
-        assert!(pixels.chunks_exact(4).any(|pixel| pixel[3] != 0));
+        assert!(pixels.as_chunks::<4>().0.iter().any(|pixel| pixel[3] != 0));
         objc::arc::release(cell);
     }
 

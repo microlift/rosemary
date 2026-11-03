@@ -405,6 +405,7 @@ impl Gpu {
     /// Metal performs some work outside any command buffer the guest holds:
     /// putting a fresh texture into a usable layout, and copying bytes a guest
     /// handed to `-replaceRegion:`. Those go through here.
+    #[cfg(test)]
     pub fn one_shot(&self, body: impl FnOnce(&Device, vk::CommandBuffer)) -> Result<(), String> {
         self.one_shot_owned((), |device, cb, _| body(device, cb))
     }

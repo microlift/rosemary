@@ -85,3 +85,15 @@ inherits = "release"
 lto = true
 codegen-units = 1
 panic = "abort"
+
+# Members opt in with `[lints] workspace = true`.
+[workspace.lints.clippy]
+# FFI and ABI bridging code mirrors C/Darwin signatures: long argument lists,
+# many unsafe entry points whose contract is the Darwin API documentation, and
+# function-pointer transmutes whose types are already pinned by the binding.
+too_many_arguments = "allow"
+type_complexity = "allow"
+missing_safety_doc = "allow"
+missing_transmute_annotations = "allow"
+# Enum layout is not a concern for these cold, small-count types.
+large_enum_variant = "allow"

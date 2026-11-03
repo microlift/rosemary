@@ -837,13 +837,12 @@ impl Drop for InitializerRegistration {
         let mut pending = INITIALIZING
             .lock()
             .unwrap_or_else(|error| error.into_inner());
-        if let Some(all) = pending.as_mut() {
-            if all
+        if let Some(all) = pending.as_mut()
+            && all
                 .get(&self.window)
                 .is_some_and(|current| Arc::ptr_eq(current, &self.token))
-            {
-                all.remove(&self.window);
-            }
+        {
+            all.remove(&self.window);
         }
     }
 }
@@ -1359,11 +1358,11 @@ fn present_impl(
         let accepted = {
             let mut pending = INITIALIZING.lock().expect("initializers");
             let all = pending.get_or_insert_with(HashMap::new);
-            if all.contains_key(&window) {
-                false
-            } else {
-                all.insert(window, Arc::clone(&cancelled));
+            if let std::collections::hash_map::Entry::Vacant(e) = all.entry(window) {
+                e.insert(Arc::clone(&cancelled));
                 true
+            } else {
+                false
             }
         };
         if !accepted {
@@ -1503,13 +1502,12 @@ fn present_impl(
         if let Err(error) = spawned {
             cancelled.store(true, Ordering::Release);
             let mut pending = INITIALIZING.lock().expect("initializers");
-            if let Some(all) = pending.as_mut() {
-                if all
+            if let Some(all) = pending.as_mut()
+                && all
                     .get(&window)
                     .is_some_and(|job| Arc::ptr_eq(job, &cancelled))
-                {
-                    all.remove(&window);
-                }
+            {
+                all.remove(&window);
             }
             drop(pending);
             // The closure never executed, so no guard took this VkSurface.
@@ -1630,13 +1628,14 @@ fn present_impl(
     let drawable_scene = live_scene
         .as_deref()
         .map(|scene| swapchain.guest_present_scene(scene));
-    if let Some(scene) = live_scene.as_deref() {
-        if layer != window && !scene.iter().any(|item| item.id == layer) {
-            // A view removed while its GPU drawable was still queued cannot
-            // resurrect itself by a late presentation.
-            finish_source(owner.take());
-            return Ok(Some(true));
-        }
+    if let Some(scene) = live_scene.as_deref()
+        && layer != window
+        && !scene.iter().any(|item| item.id == layer)
+    {
+        // A view removed while its GPU drawable was still queued cannot
+        // resurrect itself by a late presentation.
+        finish_source(owner.take());
+        return Ok(Some(true));
     }
     let joined = !swapchain.layers.contains(&layer);
     if joined {
@@ -1993,14 +1992,13 @@ fn native_scene_source(
     if !supported {
         return None;
     }
-    if let Some((full_width, full_height, crop_x, crop_y)) = dma_sample {
-        if dmabuf.is_none()
+    if let Some((full_width, full_height, crop_x, crop_y)) = dma_sample
+        && (dmabuf.is_none()
             || !appkit::backing::native_scene_dma_extent_supported(full_width, full_height)
             || crop_x.checked_add(width).is_none_or(|x| x > full_width)
-            || crop_y.checked_add(height).is_none_or(|y| y > full_height)
-        {
-            return None;
-        }
+            || crop_y.checked_add(height).is_none_or(|y| y > full_height))
+    {
+        return None;
     }
     let bytes = u64::from(width) * u64::from(height) * 4;
     if tiles.as_ref().is_some_and(|tile| {
@@ -2470,13 +2468,13 @@ fn stage_tiled_native_source(
             };
         }
     }
-    if !window_gpu_capacity_available(layer.frame.window as usize, incoming) {
+    if !window_gpu_capacity_available(layer.frame.window, incoming) {
         // A flat CPU/DMA base is an optional performance cache, even when
         // the next source is tiled. Its lease can prevent an independent
         // image plus upload buffer from fitting the physical window ledger.
         state.shed_scene_spares();
     }
-    if !window_gpu_capacity_available(layer.frame.window as usize, incoming) {
+    if !window_gpu_capacity_available(layer.frame.window, incoming) {
         // Pinned/committed generations form an atomic floor which waiting
         // for unrelated submission fences cannot lower. The transaction
         // wrapper may first escrow a superseded source to reduce this floor.
@@ -2491,7 +2489,7 @@ fn stage_tiled_native_source(
     let allocation_start = std::time::Instant::now();
     let lease = BackingImageLease::create_for_window(
         gpu,
-        layer.frame.window as usize,
+        layer.frame.window,
         &ImageDescription {
             image_type: vk::ImageType::TYPE_2D,
             view_type: vk::ImageViewType::TYPE_2D,
@@ -2507,7 +2505,7 @@ fn stage_tiled_native_source(
             components: vk::ComponentMapping::default(),
         },
     )?;
-    let charge = GpuCharge::reserve(layer.frame.window as usize, upload)?;
+    let charge = GpuCharge::reserve(layer.frame.window, upload)?;
     let buffer = gpu.create_staging_buffer(upload)?;
     #[cfg(test)]
     let allocation_elapsed = allocation_start.elapsed();
@@ -2684,19 +2682,19 @@ fn stage_native_scene_source_effective(
     state
         .unsupported_native_dma
         .retain(|item| item.producer.strong_count() > 0);
-    if let Some(picture) = &native.dmabuf {
-        if state.unsupported_native_dma.iter().any(|item| {
+    if let Some(picture) = &native.dmabuf
+        && state.unsupported_native_dma.iter().any(|item| {
             item.id == layer.id
                 && item.revision == native.revision
                 && item.producer.ptr_eq(&Arc::downgrade(picture))
-        }) {
-            // Cache only the unsupported GPU representation. Placement and
-            // opacity changes still require recompositing exact CPU pixels.
-            if let Some(cpu) = linear_dmabuf_cpu_fallback(layer) {
-                return stage_native_scene_source_effective(state, &cpu);
-            }
-            return Err("native-dmabuf-import-refused".into());
+        })
+    {
+        // Cache only the unsupported GPU representation. Placement and
+        // opacity changes still require recompositing exact CPU pixels.
+        if let Some(cpu) = linear_dmabuf_cpu_fallback(layer) {
+            return stage_native_scene_source_effective(state, &cpu);
         }
+        return Err("native-dmabuf-import-refused".into());
     }
     if let Some(picture) = &native.dmabuf
         && appkit::backing::dmabuf_producer_refused(
@@ -3067,14 +3065,16 @@ fn stage_native_scene_source_effective(
     // Cache only when a new immutable base was actually uploaded and its
     // retained charge fits the scene budget. Existing native revisions may
     // share this GPU base but never share their DMA-blended result.
-    if native.dmabuf.is_some() && !native.bytes.is_empty() && reuse_base && patch.is_none() {
-        if let Some(cached) = state
+    if native.dmabuf.is_some()
+        && !native.bytes.is_empty()
+        && reuse_base
+        && patch.is_none()
+        && let Some(cached) = state
             .native_cpu_bases
             .iter_mut()
             .find(|base| base.id == layer.id)
-        {
-            cached.cpu_revision = native.cpu_capture.map(|c| c.revision);
-        }
+    {
+        cached.cpu_revision = native.cpu_capture.map(|c| c.revision);
     }
     if native.dmabuf.is_some() && !native.bytes.is_empty() && (!reuse_base || patch.is_some()) {
         state.native_cpu_bases.retain(|old| old.id != layer.id);
@@ -4089,13 +4089,13 @@ impl Swapchain {
         let Some(mut direct) = self.direct.take() else {
             return;
         };
-        if let Some(slot) = direct.submitted_slot {
-            if self.frames[slot].submitted {
-                debug_assert!(self.frames[slot].source.is_none());
-                debug_assert!(self.frames[slot].backing.is_none());
-                self.frames[slot].source = direct.owner.take();
-                self.frames[slot].backing = direct.backing.take();
-            }
+        if let Some(slot) = direct.submitted_slot
+            && self.frames[slot].submitted
+        {
+            debug_assert!(self.frames[slot].source.is_none());
+            debug_assert!(self.frames[slot].backing.is_none());
+            self.frames[slot].source = direct.owner.take();
+            self.frames[slot].backing = direct.backing.take();
         }
         // An unsubmitted drawable or a completed WSI copy is safe to release.
     }
@@ -4442,10 +4442,11 @@ impl Swapchain {
             ready.prepared,
             acquired,
         );
-        if ready.direct && self.frame != frame_before {
-            if let Some(single) = self.direct.as_mut() {
-                single.submitted_slot = Some(direct_slot);
-            }
+        if ready.direct
+            && self.frame != frame_before
+            && let Some(single) = self.direct.as_mut()
+        {
+            single.submitted_slot = Some(direct_slot);
         }
         if self.acquired_unsubmitted.is_some() {
             // A failed WSI copy must consume the acquisition semaphore and
@@ -5823,23 +5824,22 @@ impl Drop for Swapchain {
         // If both queue submissions failed, the WSI acquire may still be
         // scheduling its semaphore signal. The separate acquire fence proves
         // completion of that signal; queue idle alone does not.
-        if let Some((semaphore, _)) = self.acquired_unsubmitted {
-            if let Some(frame) = self.frames.iter().find(|f| f.acquired == semaphore) {
-                if let Err(reason) = self.gpu.wait(frame.acquire_done) {
-                    // A device-lost wait counts as completed for resource
-                    // lifetime under Vulkan's lost-device rules.
-                    gpu::trace(format!("unconsumed WSI acquire teardown: {reason}"));
-                }
-            }
+        if let Some((semaphore, _)) = self.acquired_unsubmitted
+            && let Some(frame) = self.frames.iter().find(|f| f.acquired == semaphore)
+            && let Err(reason) = self.gpu.wait(frame.acquire_done)
+        {
+            // A device-lost wait counts as completed for resource
+            // lifetime under Vulkan's lost-device rules.
+            gpu::trace(format!("unconsumed WSI acquire teardown: {reason}"));
         }
         let device = &self.gpu.device;
         // The swapchain first: its images are what the semaphores below were
         // signalled for, and a surface outlives the swapchain made on it.
-        if self.handle != vk::SwapchainKHR::null() {
-            if let Some(api) = self.gpu.swapchain_api() {
-                // SAFETY: teardown has finished references to this swapchain.
-                unsafe { api.destroy_swapchain(self.handle, None) };
-            }
+        if self.handle != vk::SwapchainKHR::null()
+            && let Some(api) = self.gpu.swapchain_api()
+        {
+            // SAFETY: teardown has finished references to this swapchain.
+            unsafe { api.destroy_swapchain(self.handle, None) };
         }
         for frame in &self.frames {
             // SAFETY: objects of this device's, with nothing in flight after
