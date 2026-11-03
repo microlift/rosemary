@@ -4,14 +4,15 @@
 
 use darwin::syscall::{ScopedGuestSyscallContext, ScopedHostSyscallContext, setup_syscall_handler};
 
-/// Darwin's `getpid` (class 2, number 20).
-const DARWIN_GETPID: u64 = 0x200_0014;
+/// Class 2 (BSD), number 8: unassigned in XNU's table (the retired `creat`),
+/// so it answers ENOSYS however many syscalls are implemented.
+const DARWIN_UNASSIGNED: u64 = 0x200_0008;
 const DARWIN_ENOSYS: u64 = 78;
 
 fn raw_syscall(number: u64) -> (u64, bool) {
     let rax: u64;
     let carry: u8;
-    // SAFETY: `getpid` in either numbering takes no arguments and touches no memory.
+    // SAFETY: callers pass syscalls that take no arguments and touch no memory.
     unsafe {
         std::arch::asm!(
             "syscall",
@@ -51,7 +52,7 @@ fn on_a_dispatching_thread(test: impl FnOnce() + Send + 'static) {
 fn a_guest_syscall_answers_enosys() {
     on_a_dispatching_thread(|| {
         let _guest = ScopedGuestSyscallContext::new();
-        assert_eq!(raw_syscall(DARWIN_GETPID), (DARWIN_ENOSYS, true));
+        assert_eq!(raw_syscall(DARWIN_UNASSIGNED), (DARWIN_ENOSYS, true));
     });
 }
 
@@ -70,7 +71,7 @@ fn a_thread_that_enters_guest_code_later_is_armed_too() {
     on_a_dispatching_thread(|| {
         let later = std::thread::spawn(|| {
             let _guest = ScopedGuestSyscallContext::new();
-            raw_syscall(DARWIN_GETPID)
+            raw_syscall(DARWIN_UNASSIGNED)
         });
         assert_eq!(later.join().unwrap(), (DARWIN_ENOSYS, true));
     });

@@ -958,12 +958,16 @@ fn a_callback_taker_is_refused_without_a_vm_rather_than_passed_through() {
 
 #[test]
 fn a_variadic_with_no_shim_is_refused_rather_than_forwarded() {
-    // `err(3, "...", ...)` cannot be forwarded: its variadic tail is in
-    // registers on the guest's side and on the stack on the host's.
+    // A variadic's tail is in registers on the guest's side and on the stack
+    // on the host's. Any shimless one will do; a shimmed one would really run.
+    let unshimmed = table::SIGNATURES
+        .iter()
+        .find(|abi| abi.variadic && rosemary::shims::resolve(abi.name).is_none())
+        .expect("a variadic with no shim");
     let mut mem = guest_stack();
     let mut ctx = RegisterContext::new();
     let err = rosemary::call_import(
-        "_err",
+        &format!("_{}", unshimmed.name),
         0,
         0x1000,
         &mut ctx,

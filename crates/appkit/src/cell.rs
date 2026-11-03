@@ -1187,7 +1187,8 @@ mod tests {
             },
         };
         // SAFETY: `-init`, `-setBezeled:` and `-drawingRectForBounds:` with
-        // their declared types.
+        // their declared types; `NSRect` returns through a buffer, hence the
+        // `_stret` entry.
         unsafe {
             let cell = send(cell, "init") as Id;
             let drawing_rect = |cell: Id| {
@@ -1195,7 +1196,7 @@ mod tests {
                     Id,
                     Sel,
                     foundation::geometry::NSRect,
-                ) -> foundation::geometry::NSRect = std::mem::transmute(objc::msg::entry());
+                ) -> foundation::geometry::NSRect = std::mem::transmute(objc::msg::entry_stret());
                 f(cell, objc::sel::get("drawingRectForBounds:"), bounds)
             };
             assert_eq!(drawing_rect(cell), bounds);

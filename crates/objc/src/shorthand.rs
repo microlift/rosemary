@@ -276,8 +276,10 @@ mod tests {
 
     #[test]
     fn allocating_from_a_pointer_that_is_not_a_class_stops_with_its_name() {
-        crate::bootstrap();
         if std::env::var(CHILD).is_ok() {
+            // The class check is one of the `--objc-debug` checks.
+            crate::debug::enable();
+            crate::bootstrap();
             // Shaped like a guest `class_t` that never registered: an `isa`
             // word and nothing this runtime made.
             let raw = [0usize; 8];
@@ -285,6 +287,7 @@ mod tests {
             unsafe { objc_alloc(raw.as_ptr() as Id) };
             return;
         }
+        crate::bootstrap();
         let class = crate::class::lookup(c"NSObject").expect("the runtime's own");
         // SAFETY: a registered class.
         let object = unsafe { objc_alloc(crate::class::ptr(class) as Id) };
