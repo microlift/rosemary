@@ -278,11 +278,14 @@ impl Gpu {
     }
 
     /// A host-visible buffer of [`UPLOAD_CHUNK`] bytes for small copies.
+    ///
+    /// Not zeroed: a descriptor or copy only ever covers bytes an upload
+    /// wrote, and a recycled chunk holds earlier uploads anyway.
     pub fn acquire_upload_chunk(&self) -> Result<GpuBuffer, String> {
         if let Some(chunk) = self.upload_chunks.lock().expect("upload chunks").pop() {
             return Ok(chunk);
         }
-        self.create_buffer(UPLOAD_CHUNK)
+        self.create_staging_buffer(UPLOAD_CHUNK)
     }
 
     /// Hand back an upload chunk no pending submission still reads.

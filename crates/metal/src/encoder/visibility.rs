@@ -236,8 +236,9 @@ fn record_resolve(
     if results_size.max(plan.len() as u64) > gpu::UPLOAD_CHUNK {
         return Err(format!("{} queries in one pass", segments.len()));
     }
-    let (results, results_offset) = command
-        .upload(&vec![0; results_size as usize])
+    // Not zeroed: a query copy below writes every result.
+    let (results, results_offset, _) = command
+        .reserve(results_size)
         .ok_or("no upload space for the query results")?;
     let (plan_buffer, plan_offset) = command
         .upload(&plan)

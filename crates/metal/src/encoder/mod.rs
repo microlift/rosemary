@@ -120,6 +120,10 @@ struct SetCache {
     entries: Vec<DescriptorEntry>,
 }
 
+/// The least an upload is aligned to, whatever the device asks, so that a
+/// 64-bit query result or a `float4` lands at its natural alignment.
+const UPLOAD_ALIGNMENT: u64 = 16;
+
 /// How many written sets per set index a command buffer remembers, enough
 /// for the handful of material and object sets a frame alternates between.
 const SET_MEMO_CAPACITY: usize = 8;
@@ -401,12 +405,22 @@ impl CommandBuffer {
     /// Copy `bytes` into this command buffer's upload chunks, answering the
     /// buffer and offset they landed at. The copy lives until the work does.
     pub(super) fn upload(&mut self, bytes: &[u8]) -> Option<(vk::Buffer, u64)> {
-        let length = bytes.len() as u64;
-        let limits = &self.gpu.limits;
-        let alignment = limits
+        let (buffer, offset, contents) = self.reserve(bytes.len() as u64)?;
+        // SAFETY: `reserve` handed out these `bytes.len()` mapped bytes once.
+        unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), contents, bytes.len()) };
+        Some((buffer, offset))
+    }
+
+    /// Set aside `length` bytes of the upload chunks for the device to write,
+    /// answering where they are and the mapping of their first byte.
+    pub(super) fn reserve(&mut self, length: u64) -> Option<(vk::Buffer, u64, *mut u8)> {
+        // Every upload is read through a storage descriptor, a vertex or
+        // index binding, or a copy; none is a uniform buffer.
+        let alignment = self
+            .gpu
+            .limits
             .min_storage_buffer_offset_alignment
-            .max(limits.min_uniform_buffer_offset_alignment)
-            .max(16);
+            .max(UPLOAD_ALIGNMENT);
         let offset = self.upload_used.next_multiple_of(alignment);
         let offset = match self.uploads.last() {
             Some(_) if offset + length <= gpu::UPLOAD_CHUNK => offset,
@@ -422,17 +436,12 @@ impl CommandBuffer {
             }
         };
         let chunk = self.uploads.last().expect("a chunk was just ensured");
-        // SAFETY: the chunk is mapped over `UPLOAD_CHUNK` bytes, and this range
-        // is inside it and handed out once.
-        unsafe {
-            std::ptr::copy_nonoverlapping(
-                bytes.as_ptr(),
-                chunk.contents.add(offset as usize),
-                bytes.len(),
-            )
-        };
         self.upload_used = offset + length;
-        Some((chunk.buffer, offset))
+        // SAFETY: the chunk is mapped over `UPLOAD_CHUNK` bytes, and this
+        // offset is inside it.
+        Some((chunk.buffer, offset, unsafe {
+            chunk.contents.add(offset as usize)
+        }))
     }
 }
 
