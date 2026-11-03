@@ -4,6 +4,7 @@ mod format;
 mod guard;
 mod host;
 mod memory;
+mod pipeline_cache;
 mod placement;
 mod pools;
 mod submit;
@@ -108,6 +109,7 @@ pub struct Gpu {
     /// sharing a resource shape share a layout.
     layouts: Mutex<DescriptorLayouts>,
     render_passes: Mutex<HashMap<RenderPassKey, vk::RenderPass>>,
+    pipeline_cache: pipeline_cache::PipelineCache,
     /// Fence-owned immediate command contexts. Recording or waiting on an
     /// unrelated window must not hold a global command-pool mutex.
     immediate: Mutex<ImmediatePool>,
@@ -723,6 +725,7 @@ impl Gpu {
         // SAFETY: the physical device belongs to this live instance.
         let memory = unsafe { instance.get_physical_device_memory_properties(physical) };
         let properties = unsafe { instance.get_physical_device_properties(physical) };
+        let pipeline_cache = pipeline_cache::PipelineCache::open(&device, &properties);
 
         let depth_stencil_resolve = resolve_support.map(|support| DepthStencilResolve {
             renderpass2: depth_stencil_resolve_extension
@@ -776,6 +779,7 @@ impl Gpu {
             limits: properties.limits,
             layouts: Mutex::new(HashMap::new()),
             render_passes: Mutex::new(HashMap::new()),
+            pipeline_cache,
             immediate: Mutex::new(ImmediatePool::default()),
             immediate_ready: Condvar::new(),
             #[cfg(test)]
@@ -811,6 +815,23 @@ impl Gpu {
             host_imported: std::sync::atomic::AtomicU64::new(0),
             calibration,
         })
+    }
+}
+
+impl Gpu {
+    /// The cache every pipeline of this device is made through.
+    pub(crate) fn pipeline_cache(&self) -> vk::PipelineCache {
+        self.pipeline_cache.handle
+    }
+
+    /// Note that a guest pipeline was made through [`Self::pipeline_cache`].
+    pub(crate) fn pipeline_created(&'static self) {
+        self.pipeline_cache.created(&self.device);
+    }
+
+    /// Write the pipeline cache out, if anything was added to it.
+    pub(crate) fn save_pipeline_cache(&self) {
+        self.pipeline_cache.save(&self.device);
     }
 }
 

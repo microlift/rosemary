@@ -72,9 +72,10 @@ impl ComputePipeline {
         let pipeline = crate::stats::pipeline(|| unsafe {
             self.gpu
                 .device
-                .create_compute_pipelines(vk::PipelineCache::null(), &[info], None)
+                .create_compute_pipelines(self.gpu.pipeline_cache(), &[info], None)
         })
         .map_err(|(_, error)| format!("vkCreateComputePipelines failed with {error:?}"))?[0];
+        self.gpu.pipeline_created();
         cache.insert(size, pipeline);
         Ok(pipeline)
     }

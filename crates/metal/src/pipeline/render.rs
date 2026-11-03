@@ -409,9 +409,10 @@ impl RenderPipeline {
         let pipeline = crate::stats::pipeline(|| unsafe {
             self.gpu
                 .device
-                .create_graphics_pipelines(vk::PipelineCache::null(), &[info], None)
+                .create_graphics_pipelines(self.gpu.pipeline_cache(), &[info], None)
         })
         .map_err(|(_, error)| format!("vkCreateGraphicsPipelines failed with {error:?}"))?[0];
+        self.gpu.pipeline_created();
         cache.insert(*key, pipeline);
         Ok(pipeline)
     }

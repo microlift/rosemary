@@ -115,7 +115,7 @@ impl Corners {
             .layout(*pipeline_layout);
         // SAFETY: every borrowed structure lives across the call.
         let pipeline =
-            unsafe { device.create_compute_pipelines(vk::PipelineCache::null(), &[info], None) };
+            unsafe { device.create_compute_pipelines(gpu.pipeline_cache(), &[info], None) };
         // SAFETY: a pipeline keeps nothing of the module it was made from.
         unsafe { device.destroy_shader_module(module, None) };
         let pipeline = pipeline
