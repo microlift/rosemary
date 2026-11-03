@@ -45,6 +45,18 @@ pub(crate) struct Layouts {
     pub dynamic: Vec<u32>,
 }
 
+/// The sampler each resource's `constexpr sampler` describes, null for every
+/// other resource, made with the pipeline rather than looked up per draw.
+pub(crate) fn inline_samplers(gpu: &Gpu, resources: &[ResourceBinding]) -> Vec<vk::Sampler> {
+    resources
+        .iter()
+        .map(|binding| match &binding.inline_sampler {
+            Some(sampler) => crate::resource::sampler::inline(gpu, sampler),
+            None => vk::Sampler::null(),
+        })
+        .collect()
+}
+
 /// The buffer set's index in the Metal resource ABI.
 pub(crate) const BUFFER_SET: usize = 0;
 

@@ -239,11 +239,12 @@ impl Encoder {
     pub(super) fn bind_resources(
         &mut self,
         resources: &[metal_translate::ResourceBinding],
+        inline_samplers: &[vk::Sampler],
         layouts: &Layouts,
         bind_point: vk::PipelineBindPoint,
     ) -> bool {
         let start = stats::enabled().then(std::time::Instant::now);
-        let bound = self.bind_resources_inner(resources, layouts, bind_point);
+        let bound = self.bind_resources_inner(resources, inline_samplers, layouts, bind_point);
         if let Some(start) = start {
             stats::add(Counter::BindMicros, start.elapsed().as_micros() as u64);
         }
@@ -254,10 +255,11 @@ impl Encoder {
     pub(super) fn bind_resources_inner(
         &mut self,
         resources: &[metal_translate::ResourceBinding],
+        inline_samplers: &[vk::Sampler],
         layouts: &Layouts,
         bind_point: vk::PipelineBindPoint,
     ) -> bool {
-        let used = self.collect_writes(resources, layouts);
+        let used = self.collect_writes(resources, inline_samplers, layouts);
         let push_compatible = self.bound[bind_point_slot(bind_point)].layouts == layouts.sets;
         let Some(sets) = self.materialize_sets(&layouts.sets, &used, layouts.push_set) else {
             gpu::trace_once(
@@ -291,6 +293,7 @@ impl Encoder {
     fn collect_writes(
         &mut self,
         resources: &[metal_translate::ResourceBinding],
+        inline_samplers: &[vk::Sampler],
         layouts: &Layouts,
     ) -> [bool; SETS] {
         let gpu = self.command().gpu;
@@ -299,7 +302,8 @@ impl Encoder {
         for wanted in &mut self.wanted {
             wanted.clear();
         }
-        for binding in resources {
+        debug_assert_eq!(resources.len(), inline_samplers.len());
+        for (binding, inline_sampler) in resources.iter().zip(inline_samplers) {
             let set = binding.descriptor_set as usize;
             if set >= SETS {
                 // Rejected by `layouts_for`, so not reachable through a
@@ -384,11 +388,7 @@ impl Encoder {
                     }
                 }
                 ResourceKind::Sampler if binding.inline_sampler.is_some() => {
-                    let made = binding
-                        .inline_sampler
-                        .as_ref()
-                        .map(|sampler| crate::resource::sampler::inline(gpu, sampler))
-                        .unwrap_or_default();
+                    let made = *inline_sampler;
                     use vk::Handle;
                     if made == vk::Sampler::null() {
                         unbound(
@@ -836,6 +836,7 @@ impl Encoder {
         }
         if !self.bind_resources(
             &state.resources,
+            &state.inline_samplers,
             &state.layouts,
             vk::PipelineBindPoint::GRAPHICS,
         ) {

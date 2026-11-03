@@ -86,6 +86,8 @@ pub(crate) struct RenderPipeline {
     pub fragment_name: std::ffi::CString,
     pub layouts: Layouts,
     pub resources: Vec<ResourceBinding>,
+    /// Parallel to `resources`.
+    pub inline_samplers: Vec<vk::Sampler>,
     /// Metal buffer indices which feed vertex attributes rather than a
     /// descriptor, taken from the pipeline's vertex descriptor.
     pub vertex_streams: Vec<u32>,
@@ -254,6 +256,7 @@ impl RenderPipeline {
 
         let mut resources = vertex.resources.clone();
         resources.extend(fragment.resources.iter().cloned());
+        let inline_samplers = inline_samplers(gpu, &resources);
         Ok(Self {
             gpu,
             vertex_module,
@@ -264,6 +267,7 @@ impl RenderPipeline {
                 .map_err(|_| "entry point name contains a NUL".to_string())?,
             layouts,
             resources,
+            inline_samplers,
             vertex_streams,
             bindings,
             attributes,
