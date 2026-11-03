@@ -37,6 +37,7 @@ opengl.workspace = true
 metal.workspace = true
 videotoolbox.workspace = true
 gimli.workspace = true
+sha2.workspace = true
 libc.workspace = true
 static_init.workspace = true
 clap = { version = "4", features = ["derive"] }

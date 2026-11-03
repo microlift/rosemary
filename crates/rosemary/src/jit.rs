@@ -663,6 +663,29 @@ fn boolean_env(name: &str, unset: bool, on_bad_value: &str) -> bool {
     }
 }
 
+/// Every knob this module reads, as the run uses it.
+///
+/// Part of a code cache's configuration key. Most already reach the lifter config or
+/// the ISA flags; all of them are listed so none can be forgotten.
+pub fn knobs() -> String {
+    format!(
+        "opt={} verify={} tso={} dead_flags={} block_link={} inline_probes={} cells={} \
+         call_return={:?} publish={:?} host_frames={:?} pinned={:?} regalloc={}",
+        opt_level().as_str(),
+        verify(),
+        total_store_order(),
+        eliminate_dead_flags(),
+        block_linking(),
+        inline_link_probes(),
+        link_cells(),
+        call_return_stack(),
+        link_publish(),
+        host_call_frames(),
+        pinned_link_abi(),
+        regalloc_algorithm(),
+    )
+}
+
 /// The Cranelift flags every backend in this process is built with.
 pub fn flags() -> settings::Flags {
     #[dynamic]

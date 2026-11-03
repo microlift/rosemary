@@ -16,6 +16,7 @@
 )]
 
 pub mod abi;
+pub mod aot;
 pub mod atomic128;
 pub mod audit;
 pub mod bridge;

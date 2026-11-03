@@ -491,6 +491,30 @@ pub fn promotable_abi(name: &str) -> Option<&'static FunctionAbi> {
     crate::objc::fast::abi_of(name)
 }
 
+/// The library a promoted import's callee comes from: the one that bound the site,
+/// or this runtime when the promotion substitutes a function of its own.
+pub fn provider<'a>(site: &'a crate::program::ImportSite, promotion: &Promotion) -> &'a str {
+    if promotion.address != site.resolved {
+        return microlift::core::symbol::RUNTIME_PROVIDER;
+    }
+    site.library
+        .as_deref()
+        .unwrap_or(microlift::core::symbol::RUNTIME_PROVIDER)
+}
+
+/// `site`, promoted, as the inline call microlift emits: keyed by provider, name and
+/// ABI, so a cached translation names the callee rather than its address.
+pub fn fast_import(
+    site: &crate::program::ImportSite,
+    promotion: &Promotion,
+) -> microlift::core::FastImport {
+    microlift::core::FastImport::new(
+        provider(site, promotion),
+        dynamic_symbol(promotion.abi, promotion.address),
+        guest_call_abi(),
+    )
+}
+
 /// The `DynamicSymbol` microlift wants for a fast import.
 pub fn dynamic_symbol(abi: &FunctionAbi, host: u64) -> DynamicSymbol {
     DynamicSymbol {

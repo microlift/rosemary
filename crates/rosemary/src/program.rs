@@ -64,6 +64,18 @@ impl ImportPolicy {
     }
 }
 
+/// `report`'s file and slide, if `va` is in one of its executable segments.
+pub(crate) fn code_image_in(
+    report: &machish::report::ImageReport,
+    va: u64,
+) -> Option<(String, u64)> {
+    report
+        .segments
+        .iter()
+        .any(|seg| seg.executable && va >= seg.vmaddr && va - seg.vmaddr < seg.vmsize)
+        .then(|| (report.path.clone(), report.slide))
+}
+
 /// Anything that can go wrong loading a program.
 #[derive(Debug)]
 pub enum ProgramError {
@@ -716,7 +728,10 @@ pub fn lifter_config_base() -> LifterConfig {
         interpreter_fallback: true,
         use_vector_xmm,
         outline_helpers: true,
-        address_mode: AddressMode::Direct,
+        // Guest addresses are relocations against the image's slide, which the JIT
+        // resolves to zero because it lifts at run-time addresses; a cached image
+        // resolves it at load. Either way the code is the same.
+        address_mode: AddressMode::Relocated,
         atomic128,
         total_store_order: crate::jit::total_store_order(),
         specialization,
@@ -947,11 +962,15 @@ impl<M: Regions> Program<M> {
                 .promotion_for(site)
                 .filter(|_| !self.is_guest_address(site.resolved));
             match promoted {
-                Some(p) => config.register_fast_import(
-                    va,
-                    crate::abi::dynamic_symbol(p.abi, p.address),
-                    crate::abi::guest_call_abi(),
-                ),
+                Some(p) => {
+                    let import = crate::abi::fast_import(site, &p);
+                    config.register_fast_import_from(
+                        va,
+                        &import.provider,
+                        import.symbol,
+                        import.abi,
+                    )
+                }
                 // Everything a fast import cannot express - a variadic, a
                 // callback taker, a shim, a signature the marshaller refuses -
                 // becomes a bridged call. See [`crate::bridge`].
@@ -1076,6 +1095,15 @@ impl<M: Regions> Program<M> {
             || crate::retstub::contains(va)
             // Or `tlv_get_addr`, which every thread-local read calls.
             || crate::tls::contains(va)
+    }
+
+    /// The file and slide of the image, linked or loaded since, whose code holds `va`.
+    pub fn code_image(&self, va: u64) -> Option<(String, u64)> {
+        self.report
+            .images
+            .iter()
+            .find_map(|report| code_image_in(report, va))
+            .or_else(|| crate::dyld::code_image(va))
     }
 
     /// `va` as `image+offset`, in the image's *own* address space.

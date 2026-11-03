@@ -268,8 +268,6 @@ impl ImportRegistry for DynamicImports {
 
 /// `site` as an inline call, if it is one an inline call can express.
 fn fast_import(site: &crate::program::ImportSite) -> Option<ImportKind> {
-    use microlift::core::FastImport;
-
     if site.resolved == 0 || crate::trace::watching(&site.symbol) {
         return None;
     }
@@ -297,10 +295,7 @@ fn fast_import(site: &crate::program::ImportSite) -> Option<ImportKind> {
             }
         }
     };
-    Some(ImportKind::Fast(FastImport {
-        symbol: crate::abi::dynamic_symbol(promotion.abi, promotion.address),
-        abi: crate::abi::guest_call_abi(),
-    }))
+    Some(ImportKind::Fast(crate::abi::fast_import(site, &promotion)))
 }
 
 /// The registry, as [`microlift::core::LifterConfig`] wants it.

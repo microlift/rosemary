@@ -90,6 +90,20 @@ fn mono_rule() -> bool {
     *ON
 }
 
+/// Every knob above, as region selection reads it.
+///
+/// Part of a code cache's configuration key: a cache built under other knobs holds
+/// other regions, which an offline pass must reproduce exactly.
+pub fn knobs() -> String {
+    format!(
+        "cap={} multiblock={} forward={} mono={}",
+        max_instructions(),
+        multiblock(),
+        forward_limit(),
+        mono_rule()
+    )
+}
+
 /// One basic block: a run of instructions entered at one address.
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct DecodedBlock {

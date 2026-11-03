@@ -863,6 +863,17 @@ pub fn locate(va: u64) -> Option<String> {
     })
 }
 
+/// The file and slide of the loaded image whose code holds `va`.
+pub fn code_image(va: u64) -> Option<(String, u64)> {
+    find(|image| {
+        image
+            .report
+            .images
+            .iter()
+            .find_map(|report| crate::program::code_image_in(report, va))
+    })
+}
+
 /// How many images the guest has loaded.
 pub fn loaded() -> usize {
     IMAGE_COUNT.load(Ordering::Acquire)

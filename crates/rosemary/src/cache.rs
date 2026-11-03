@@ -366,6 +366,7 @@ impl CodeCache {
         if let Some(hit) = self.lookup(pc) {
             return Ok(hit);
         }
+        crate::aot::profile::note_miss(program, pc);
         let mut attempt = 0;
         loop {
             match self.lift_and_publish(program, pc, attempt == STALE_RETRIES)? {
@@ -466,8 +467,8 @@ impl CodeCache {
             &compiled.map,
         );
 
-        // `AddressMode::Direct`, so the address a region was lifted for is the address
-        // it runs at, and the image base is the region's own start.
+        // Lifted at run-time addresses with a zero slide, so the address a region was
+        // lifted for is the address it runs at, and the image base is the region's own start.
         let translation = Translation::from_compiled(
             compiled.region,
             start,

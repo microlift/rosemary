@@ -1,7 +1,6 @@
 use std::sync::RwLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use microlift::core::FastImport;
 use microlift::core::bridge::ImportKind;
 use static_init::dynamic;
 
@@ -274,10 +273,13 @@ pub fn lift_region(va: u64) -> Option<(crate::region::Region, Vec<u8>)> {
 pub fn import_kind(va: u64) -> Option<ImportKind> {
     let slot = import_slot(va)?;
     with_entry(slot, |entry| {
-        ImportKind::Fast(FastImport {
-            symbol: crate::abi::dynamic_symbol(entry.abi, entry.site.resolved),
-            abi: crate::abi::guest_call_abi(),
-        })
+        ImportKind::Fast(crate::abi::fast_import(
+            entry.site,
+            &crate::abi::Promotion {
+                abi: entry.abi,
+                address: entry.site.resolved,
+            },
+        ))
     })
 }
 
