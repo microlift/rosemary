@@ -6,6 +6,7 @@ use foundation::geometry::{NSPoint, NSRect, NSSize};
 use objc::object::Id;
 use objc::sel::Sel;
 
+use crate::controls::NSEdgeInsets;
 use crate::define::{class_methods, methods};
 use crate::view;
 
@@ -524,6 +525,72 @@ unsafe extern "C" fn no_intrinsic_size(_receiver: Id, _sel: Sel) -> NSSize {
     NSSize {
         width: -1.0,
         height: -1.0,
+    }
+}
+
+/// `-[NSView alignmentRectInsets]`: a plain view's alignment rect is its frame.
+// FIXME (ACCURACY): AppKit's bezeled controls (push buttons, pop-ups) answer
+// insets for their shadows; the chrome here draws their bezels to the frame
+// and the solver lays frames out as alignment rects, so they answer none.
+unsafe extern "C" fn no_alignment_insets(_receiver: Id, _sel: Sel) -> NSEdgeInsets {
+    NSEdgeInsets::default()
+}
+
+/// `-alignmentRectInsets`, sent so a guest's override answers.
+fn alignment_insets(view: Id) -> NSEdgeInsets {
+    // SAFETY: `NSEdgeInsets (id, SEL)`, returned in memory.
+    unsafe {
+        let f: unsafe extern "C" fn(Id, Sel) -> NSEdgeInsets =
+            std::mem::transmute(objc::msg::entry_stret());
+        f(view, objc::sel::get("alignmentRectInsets"))
+    }
+}
+
+/// The distance from a frame's origin to its alignment rect's, and how much
+/// smaller the alignment rect is. The frame is in the superview's space, so
+/// its flippedness says which inset is at the origin.
+fn alignment_offsets(view: Id) -> (NSPoint, NSSize) {
+    let insets = alignment_insets(view);
+    // SAFETY: a live view.
+    let superview = unsafe { view::superview_of(view) };
+    let y = match !superview.is_null() && view::is_flipped(superview) {
+        true => insets.top,
+        false => insets.bottom,
+    };
+    (
+        NSPoint { x: insets.left, y },
+        NSSize {
+            width: insets.left + insets.right,
+            height: insets.top + insets.bottom,
+        },
+    )
+}
+
+unsafe extern "C" fn alignment_rect_for_frame(receiver: Id, _sel: Sel, frame: NSRect) -> NSRect {
+    let (origin, shrink) = alignment_offsets(receiver);
+    NSRect {
+        origin: NSPoint {
+            x: frame.origin.x + origin.x,
+            y: frame.origin.y + origin.y,
+        },
+        size: NSSize {
+            width: frame.size.width - shrink.width,
+            height: frame.size.height - shrink.height,
+        },
+    }
+}
+
+unsafe extern "C" fn frame_for_alignment_rect(receiver: Id, _sel: Sel, rect: NSRect) -> NSRect {
+    let (origin, shrink) = alignment_offsets(receiver);
+    NSRect {
+        origin: NSPoint {
+            x: rect.origin.x - origin.x,
+            y: rect.origin.y - origin.y,
+        },
+        size: NSSize {
+            width: rect.size.width + shrink.width,
+            height: rect.size.height + shrink.height,
+        },
     }
 }
 
@@ -1310,6 +1377,11 @@ pub(crate) fn install() {
     methods!(view, {
         "fittingSize" => fitting_size, c"{CGSize=dd}16@0:8";
         "intrinsicContentSize" => no_intrinsic_size, c"{CGSize=dd}16@0:8";
+        "alignmentRectInsets" => no_alignment_insets, c"{NSEdgeInsets=dddd}16@0:8";
+        "alignmentRectForFrame:" => alignment_rect_for_frame,
+            c"{CGRect={CGPoint=dd}{CGSize=dd}}48@0:8{CGRect={CGPoint=dd}{CGSize=dd}}16";
+        "frameForAlignmentRect:" => frame_for_alignment_rect,
+            c"{CGRect={CGPoint=dd}{CGSize=dd}}48@0:8{CGRect={CGPoint=dd}{CGSize=dd}}16";
         "invalidateIntrinsicContentSize" => invalidate_intrinsic_size, c"v16@0:8";
         "addConstraint:" => add_constraint, c"v24@0:8@16";
         "addConstraints:" => add_constraints, c"v24@0:8@16";
@@ -1646,5 +1718,70 @@ mod tests {
         for row in rows {
             assert_eq!(view::frame_of(row).size.width, 200.0);
         }
+    }
+
+    fn rect_message(receiver: Id, selector: &str, rect: NSRect) -> NSRect {
+        // SAFETY: both selectors are `NSRect (id, SEL, NSRect)`.
+        unsafe {
+            let f: unsafe extern "C" fn(Id, Sel, NSRect) -> NSRect =
+                std::mem::transmute(objc::msg::entry_stret());
+            f(receiver, objc::sel::get(selector), rect)
+        }
+    }
+
+    fn pop_up_button(class: &'static objc::class::Class, frame: NSRect) -> Id {
+        let object = objc::object::create_instance(class, 0);
+        // SAFETY: `-initWithFrame:pullsDown:` is `id (id, SEL, NSRect, BOOL)`.
+        unsafe {
+            let f: unsafe extern "C" fn(Id, Sel, NSRect, u8) -> Id =
+                std::mem::transmute(objc::msg::entry());
+            f(object, objc::sel::get("initWithFrame:pullsDown:"), frame, 0)
+        }
+    }
+
+    #[test]
+    fn pop_up_button_alignment_rect_is_its_frame() {
+        crate::bootstrap();
+        let class = objc::class::lookup(c"NSPopUpButton").expect("NSPopUpButton");
+        let frame = rect(20.0, 30.0, 120.0, 26.0);
+        let button = pop_up_button(class, frame);
+        let aligned = rect_message(button, "alignmentRectForFrame:", frame);
+        assert_eq!(aligned, frame);
+        assert_eq!(
+            rect_message(button, "frameForAlignmentRect:", aligned),
+            frame
+        );
+    }
+
+    #[test]
+    fn alignment_rect_applies_overridden_insets() {
+        unsafe extern "C" fn insets(_receiver: Id, _sel: Sel) -> NSEdgeInsets {
+            NSEdgeInsets {
+                top: 2.0,
+                left: 3.0,
+                bottom: 4.0,
+                right: 5.0,
+            }
+        }
+        crate::bootstrap();
+        let base = objc::class::lookup(c"NSPopUpButton").expect("NSPopUpButton");
+        let class =
+            objc::class::allocate_pair(Some(base), c"InsetPopUpButton", 0).expect("a subclass");
+        class.add_method(
+            objc::sel::get("alignmentRectInsets"),
+            insets as objc::class::Imp,
+            c"{NSEdgeInsets=dddd}16@0:8",
+        );
+        objc::class::register_pair(class);
+        let frame = rect(20.0, 30.0, 120.0, 26.0);
+        let button = pop_up_button(class, frame);
+        // With no superview the frame is unflipped, so the bottom inset is
+        // the one at its origin.
+        let aligned = rect_message(button, "alignmentRectForFrame:", frame);
+        assert_eq!(aligned, rect(23.0, 34.0, 112.0, 20.0));
+        assert_eq!(
+            rect_message(button, "frameForAlignmentRect:", aligned),
+            frame
+        );
     }
 }
