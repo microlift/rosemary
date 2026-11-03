@@ -1401,7 +1401,9 @@ pub unsafe extern "C" fn kevent(
         return -1;
     };
     let capacity = nevents as usize;
-    let mut out: Vec<Kevent> = Vec::with_capacity(capacity);
+    // Grown as events arrive: `nevents` is only how much room the caller has,
+    // and reserving all of it up front would abort on a large one.
+    let mut out: Vec<Kevent> = Vec::new();
 
     let changes = match nchanges {
         0 => &[][..],
