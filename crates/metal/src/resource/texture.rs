@@ -564,7 +564,7 @@ struct TextureReadbackOwner {
 impl Drop for TextureReadbackOwner {
     fn drop(&mut self) {
         if let Some(staging) = self.staging.take() {
-            self.gpu.destroy_buffer(staging);
+            self.gpu.release_staging_buffer(staging);
         }
         objc::arc::release(self.texture as Id);
     }
@@ -648,7 +648,7 @@ pub(super) unsafe extern "C" fn get_bytes_slice(
             checked.size[0], checked.size[1]
         ));
     }
-    let staging = match texture.gpu.create_staging_buffer(tight_image * images) {
+    let staging = match texture.gpu.acquire_staging_buffer(tight_image * images) {
         Ok(staging) => staging,
         Err(reason) => return gpu::trace(format!("getBytes: staging failed: {reason}")),
     };

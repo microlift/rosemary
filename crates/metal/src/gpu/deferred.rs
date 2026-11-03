@@ -80,7 +80,7 @@ impl Batch {
             let chunk = self.chunks.last().expect("a chunk was just ensured");
             (chunk.contents, chunk.buffer, offset)
         } else {
-            let buffer = gpu.create_staging_buffer(length)?;
+            let buffer = gpu.acquire_staging_buffer(length)?;
             let found = (buffer.contents, buffer.buffer, 0);
             self.buffers.push(buffer);
             found
@@ -249,7 +249,7 @@ impl Gpu {
             self.release_upload_chunk(chunk);
         }
         for buffer in buffers {
-            self.destroy_buffer(buffer);
+            self.release_staging_buffer(buffer);
         }
         for image in doomed {
             self.destroy_image_now(image);

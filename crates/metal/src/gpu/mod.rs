@@ -151,6 +151,8 @@ pub struct Gpu {
     context_budget: ContextBudget,
     descriptor_pools: Mutex<Vec<vk::DescriptorPool>>,
     upload_chunks: Mutex<Vec<GpuBuffer>>,
+    /// Larger host-visible buffers for texture uploads and readbacks.
+    staging_buffers: Mutex<Vec<GpuBuffer>>,
     /// `VK_KHR_push_descriptor`, where advertised, and the descriptor limit
     /// which decides whether one set in a pipeline can use it.
     push_descriptor_api: Option<ash::khr::push_descriptor::Device>,
@@ -270,6 +272,10 @@ const RECYCLED: usize = 32;
 /// The size of one chunk `-setBytes:` copies are cut from. Metal limits one
 /// copy to four kilobytes, so a chunk holds a frame's worth of them.
 pub const UPLOAD_CHUNK: u64 = 256 << 10;
+
+/// The most staging memory a device keeps for reuse between transfers too
+/// large for an upload chunk.
+const STAGING_POOL_BYTES: u64 = 64 << 20;
 
 /// How many occlusion queries one pool holds; a command buffer which needs
 /// more takes another pool.
@@ -800,6 +806,7 @@ impl Gpu {
             context_budget: ContextBudget::new(),
             descriptor_pools: Mutex::new(Vec::new()),
             upload_chunks: Mutex::new(Vec::new()),
+            staging_buffers: Mutex::new(Vec::new()),
             push_descriptor_api,
             max_push_descriptors,
             null_descriptors,
