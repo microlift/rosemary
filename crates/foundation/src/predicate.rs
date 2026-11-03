@@ -609,13 +609,36 @@ fn fold(text: &str, comparison: &Comparison) -> String {
 }
 
 /// `LIKE`'s wildcards: `*` any run, `?` any one character.
+///
+/// Only the latest `*` is ever retried, which is enough because a later one
+/// can absorb anything an earlier one would have: the walk is `O(text *
+/// pattern)` rather than exponential in the number of stars.
 fn like(text: &[char], pattern: &[char]) -> bool {
-    match pattern.split_first() {
-        None => text.is_empty(),
-        Some(('*', rest)) => (0..=text.len()).any(|skip| like(&text[skip..], rest)),
-        Some(('?', rest)) => !text.is_empty() && like(&text[1..], rest),
-        Some((c, rest)) => text.first() == Some(c) && like(&text[1..], rest),
+    let (mut t, mut p) = (0, 0);
+    // Where the pattern resumes after the latest `*`, and the text position
+    // that `*` has absorbed up to.
+    let mut retry: Option<(usize, usize)> = None;
+    while t < text.len() {
+        match pattern.get(p) {
+            Some('*') => {
+                p += 1;
+                retry = Some((p, t));
+            }
+            Some(c) if *c == '?' || *c == text[t] => {
+                t += 1;
+                p += 1;
+            }
+            _ => match retry {
+                Some((after, absorbed)) => {
+                    p = after;
+                    t = absorbed + 1;
+                    retry = Some((after, t));
+                }
+                None => return false,
+            },
+        }
     }
+    pattern[p..].iter().all(|c| *c == '*')
 }
 
 fn equal(left: Id, right: Id, comparison: &Comparison) -> bool {
@@ -1147,6 +1170,33 @@ pub(crate) fn install() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn matches(text: &str, pattern: &str) -> bool {
+        let (text, pattern): (Vec<char>, Vec<char>) =
+            (text.chars().collect(), pattern.chars().collect());
+        like(&text, &pattern)
+    }
+
+    #[test]
+    fn like_wildcards_match_runs_and_single_characters() {
+        assert!(matches("report.txt", "*.txt"));
+        assert!(matches("report.txt", "r?port*"));
+        assert!(matches("", "*"));
+        assert!(matches("abc", "a*b*c"));
+        assert!(matches("aXbYc", "a*b*c"));
+        assert!(!matches("abcd", "a*b*c"));
+        assert!(!matches("", "?"));
+        assert!(!matches("ab", "a"));
+        assert!(matches("mississippi", "*sip*"));
+        assert!(!matches("mississippi", "*sipx*"));
+    }
+
+    #[test]
+    fn like_with_many_stars_and_no_match_ends_promptly() {
+        let text = "a".repeat(200);
+        let pattern = format!("{}b", "*a".repeat(30));
+        assert!(!matches(&text, &pattern));
+    }
 
     fn dictionary(pairs: &[(&str, Id)]) -> Id {
         let keys: Vec<CFTypeRef> = pairs
