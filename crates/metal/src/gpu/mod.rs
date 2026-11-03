@@ -277,6 +277,11 @@ pub const UPLOAD_CHUNK: u64 = 256 << 10;
 /// large for an upload chunk.
 const STAGING_POOL_BYTES: u64 = 64 << 20;
 
+/// Makes the next device behave as one without `VK_KHR_push_descriptor`, so
+/// its descriptor paths are tested on a device which has the extension.
+#[cfg(test)]
+pub(crate) static TEST_WITHOUT_PUSH_DESCRIPTORS: AtomicBool = AtomicBool::new(false);
+
 /// How many occlusion queries one pool holds; a command buffer which needs
 /// more takes another pool.
 pub const OCCLUSION_QUERIES: u32 = 256;
@@ -749,6 +754,9 @@ impl Gpu {
         let host_import = host_import
             .then(|| host::HostImport::new(instance, physical, &device))
             .flatten();
+        #[cfg(test)]
+        let pushes =
+            pushes && !TEST_WITHOUT_PUSH_DESCRIPTORS.load(std::sync::atomic::Ordering::Acquire);
         let push_descriptor_api =
             pushes.then(|| ash::khr::push_descriptor::Device::new(instance, &device));
         let max_push_descriptors = if pushes {
@@ -830,6 +838,19 @@ impl Gpu {
     /// The cache every pipeline of this device is made through.
     pub(crate) fn pipeline_cache(&self) -> vk::PipelineCache {
         self.pipeline_cache.handle
+    }
+
+    /// Where the pipeline cache is saved, where the shader cache is enabled.
+    #[cfg(test)]
+    pub(crate) fn pipeline_cache_path(&self) -> Option<&std::path::Path> {
+        self.pipeline_cache.path()
+    }
+
+    /// How many bytes the driver reports for a cache made from `initial`, or
+    /// from the saved file where it is `None`.
+    #[cfg(test)]
+    pub(crate) fn reopened_pipeline_cache_bytes(&self, initial: Option<&[u8]>) -> Option<usize> {
+        self.pipeline_cache.reopened_bytes(&self.device, initial)
     }
 
     /// Note that a guest pipeline was made through [`Self::pipeline_cache`].

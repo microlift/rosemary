@@ -116,6 +116,35 @@ impl PipelineCache {
     }
 }
 
+#[cfg(test)]
+impl PipelineCache {
+    pub(super) fn path(&self) -> Option<&Path> {
+        self.path.as_deref()
+    }
+
+    /// How many bytes the driver reports for a new cache made from `initial`,
+    /// or from the saved file where it is `None`.
+    pub(super) fn reopened_bytes(&self, device: &Device, initial: Option<&[u8]>) -> Option<usize> {
+        let file = match initial {
+            Some(_) => Vec::new(),
+            None => std::fs::read(self.path.as_ref()?).ok()?,
+        };
+        let data = match initial {
+            Some(initial) => initial,
+            None => decode(&file)?,
+        };
+        let info = vk::PipelineCacheCreateInfo::default().initial_data(data);
+        // SAFETY: a well-formed create info on this live device, and a cache
+        // nothing else has seen.
+        unsafe {
+            let cache = device.create_pipeline_cache(&info, None).ok()?;
+            let held = device.get_pipeline_cache_data(cache);
+            device.destroy_pipeline_cache(cache, None);
+            held.ok().map(|held| held.len())
+        }
+    }
+}
+
 /// Replace the file whole, so a reader never sees a partial one.
 fn write(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     let temporary = path.with_extension(format!("tmp-{}", std::process::id()));
