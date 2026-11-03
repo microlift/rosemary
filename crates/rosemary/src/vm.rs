@@ -619,6 +619,11 @@ impl Vm {
         leaked
     }
 
+    /// The lifter config every region of this program is lifted under.
+    pub fn lifter_config(&self) -> &microlift::core::LifterConfig {
+        self.cache.config()
+    }
+
     /// The registered Objective-C classes, if [`Vm::register_objc`] has run.
     pub fn objc(&self) -> Option<&'static crate::objc::ObjcRuntime> {
         let published = self.objc.load(Ordering::Acquire);
@@ -1331,11 +1336,23 @@ impl Vm {
         Err(VmError::UnknownIndirectCall { callee, resume })
     }
 
-    /// A native arm64 address that re-enters the guest at `guest_va`.
+    /// A native arm64 address that re-enters the guest at `guest_va`, whose code
+    /// is lifted now.
     ///
     /// The generic trampoline forwards six integer and eight floating-point registers
     /// because a bare function pointer says nothing about its own shape.
     pub fn typed_thunk_for(
+        &self,
+        guest_va: u64,
+        signature: crate::thunk::ThunkSignature,
+    ) -> Result<u64, VmError> {
+        let host = self.typed_thunk(guest_va, signature)?;
+        // Handing the pointer out is the demand signal.
+        self.lift_now(guest_va);
+        Ok(host)
+    }
+
+    fn typed_thunk(
         &self,
         guest_va: u64,
         signature: crate::thunk::ThunkSignature,
@@ -1351,7 +1368,7 @@ impl Vm {
         if let Some(existing) = cached {
             return Ok(existing);
         }
-        // Compiled outside the lock; a thread that lost the race to insert
+        // Built outside the lock; a thread that lost the race to insert
         // drops its copy, which nothing has seen yet.
         let thunk = crate::thunk::build_typed(guest_va, signature.clone())?;
         let mut table = self.thunks.write().unwrap_or_else(|e| e.into_inner());
@@ -1359,24 +1376,39 @@ impl Vm {
         if kept {
             self.publish_thunk_view(&table);
         }
-        drop(table);
-        // As in `thunk_for`: handing the pointer out is the demand signal.
-        let _ = self.cache.get_or_lift(&self.program, guest_va);
         Ok(host)
     }
 
     pub fn thunk_for(&self, guest_va: u64) -> Result<u64, VmError> {
+        let host = self.thunk(guest_va)?;
+        // Translate the callback now, while translating is possible.
+        self.lift_now(guest_va);
+        Ok(host)
+    }
+
+    fn thunk(&self, guest_va: u64) -> Result<u64, VmError> {
         if let Some(existing) = self.host_thunk_for(guest_va) {
             return Ok(existing);
         }
         // As for typed thunks: built outside the lock, and the first one
         // inserted is the one every caller gets.
         let thunk = crate::thunk::build(guest_va)?;
-        let host = self.insert_thunk(thunk);
+        Ok(self.insert_thunk(thunk))
+    }
 
-        // Translate the callback now, while translating is possible.
+    /// Lift the code at `guest_va` if it is not already, ignoring a failure: the
+    /// call that reaches it reports the same failure where it can be raised.
+    pub(crate) fn lift_now(&self, guest_va: u64) {
         let _ = self.cache.get_or_lift(&self.program, guest_va);
-        Ok(host)
+    }
+
+    /// Lift the code at `guest_va` on a worker, or now if this VM is not the
+    /// process's published one and so cannot be handed to another thread.
+    fn lift_soon(&self, guest_va: u64) {
+        match crate::thunk::published() {
+            Some(vm) if std::ptr::eq(vm, self) => crate::prelift::queue(vm, guest_va),
+            _ => self.lift_now(guest_va),
+        }
     }
 
     /// How many host thunks exist, including typed variants of one guest address.
@@ -1572,17 +1604,20 @@ impl crate::objc::Realizer for Vm {
         m: &machish::extensions::objc::ObjcMethod,
     ) -> Result<(u64, Option<&'static str>), &'static str> {
         let typed = crate::objc::thunk_signature(m).and_then(|signature| {
-            self.typed_thunk_for(m.imp, signature)
+            self.typed_thunk(m.imp, signature)
                 .map_err(|_| "a host->guest thunk could not be built")
         });
-        match typed {
-            Ok(imp) => Ok((imp, None)),
-            Err(reason) => Ok((
-                self.thunk_for(m.imp)
+        let imp = match typed {
+            Ok(imp) => (imp, None),
+            Err(reason) => (
+                self.thunk(m.imp)
                     .map_err(|_| "a host->guest thunk could not be built")?,
                 Some(reason),
-            )),
-        }
+            ),
+        };
+        // Realization only hands the method out; its first call needs it lifted.
+        self.lift_soon(m.imp);
+        Ok(imp)
     }
 
     /// The guest's own `objc_class`: a send to it is intercepted, and

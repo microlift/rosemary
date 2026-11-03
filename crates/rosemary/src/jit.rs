@@ -712,6 +712,20 @@ pub fn backend() -> microlift::Result<CraneliftBackend> {
     CraneliftBackend::with_flags(flags(), isa_settings())
 }
 
+/// Every ISA setting the JIT's ISA resolved to, host CPU detection included.
+///
+/// An image compiled offline starts from the bare host triple, which knows no CPU
+/// features; naming each setting makes its ISA the one the JIT compiles for.
+pub fn resolved_isa_settings() -> microlift::Result<Vec<(&'static str, String)>> {
+    let backend = backend()?;
+    Ok(backend
+        .isa()
+        .isa_flags()
+        .iter()
+        .map(|value| (value.name, value.value_string()))
+        .collect())
+}
+
 /// How the frontend is told which machine a `Function` is being built for.
 ///
 /// Built from `cranelift-native`, which is where microlift's [`CraneliftBackend`] gets

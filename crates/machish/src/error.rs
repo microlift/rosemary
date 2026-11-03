@@ -77,6 +77,9 @@ pub enum Error {
     /// A structure nested or chained deeper than the loader's guard allows,
     /// which for untrusted input means a cycle or a decompression bomb.
     TooDeep(&'static str),
+    /// A `__gcc_except_tab` entry could not be read, or uses an encoding this
+    /// crate does not implement.
+    BadExceptionTable,
     /// Catch-all for spec/extension-defined failures.
     Custom(&'static str),
 }
@@ -115,6 +118,7 @@ impl fmt::Display for Error {
             }
             Error::Encrypted => write!(f, "image is encrypted"),
             Error::TooDeep(what) => write!(f, "{what} nested too deeply"),
+            Error::BadExceptionTable => write!(f, "malformed exception table"),
             Error::Custom(m) => write!(f, "{m}"),
         }
     }

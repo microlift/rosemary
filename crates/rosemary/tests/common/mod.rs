@@ -2007,6 +2007,8 @@ pub fn driver_command() -> Command {
     // A test must never download a Darwin base, nor wait on a dialog asking
     // whether to: the prefix is made without one.
     command.env("ROSEMARY_PREFIX_SETUP", "fail");
+    // Nor read or write the user's code cache, nor start a background build.
+    command.env("ROSEMARY_AOT_CACHE", "off");
     command
 }
 

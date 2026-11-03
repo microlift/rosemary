@@ -1,4 +1,5 @@
 use machish::image::UnwindEntry;
+use machish::image::lsda::{CallSite, Lsda, LsdaMemory};
 use microlift::arch::x86_64::context::RegisterContext;
 
 use crate::abi::{AbiError, GuestMemory, Result};
@@ -146,20 +147,6 @@ impl<'a> Reader<'a> {
         Reader { mem, at }
     }
 
-    fn u8(&mut self) -> Option<u8> {
-        let mut b = [0u8; 1];
-        self.mem.read(self.at, &mut b).ok()?;
-        self.at += 1;
-        Some(b[0])
-    }
-
-    fn u16(&mut self) -> Option<u16> {
-        let mut b = [0u8; 2];
-        self.mem.read(self.at, &mut b).ok()?;
-        self.at += 2;
-        Some(u16::from_le_bytes(b))
-    }
-
     fn u32(&mut self) -> Option<u32> {
         let mut b = [0u8; 4];
         self.mem.read(self.at, &mut b).ok()?;
@@ -173,87 +160,7 @@ impl<'a> Reader<'a> {
         self.at += 8;
         Some(u64::from_le_bytes(b))
     }
-
-    fn uleb128(&mut self) -> Option<u64> {
-        let (mut out, mut shift) = (0u64, 0u32);
-        loop {
-            let byte = self.u8()?;
-            if shift < 64 {
-                out |= u64::from(byte & 0x7f) << shift;
-            }
-            shift += 7;
-            if byte & 0x80 == 0 {
-                return Some(out);
-            }
-            if shift > 70 {
-                return None;
-            }
-        }
-    }
-
-    fn sleb128(&mut self) -> Option<i64> {
-        let (mut out, mut shift) = (0i64, 0u32);
-        loop {
-            let byte = self.u8()?;
-            if shift < 64 {
-                out |= i64::from(byte & 0x7f) << shift;
-            }
-            shift += 7;
-            if byte & 0x80 == 0 {
-                if shift < 64 && byte & 0x40 != 0 {
-                    out |= -1i64 << shift;
-                }
-                return Some(out);
-            }
-            if shift > 70 {
-                return None;
-            }
-        }
-    }
-
-    /// A DWARF-encoded pointer, of the subset clang emits for x86-64 Mach-O.
-    fn encoded(&mut self, encoding: u8) -> Option<u64> {
-        if encoding == DW_EH_PE_OMIT {
-            return None;
-        }
-        let base = self.at;
-        let value = match encoding & 0x0f {
-            0x00 => self.u64()?,                          // absptr
-            0x01 => self.uleb128()?,                      // uleb128
-            0x02 => u64::from(self.u16()?),               // udata2
-            0x03 => u64::from(self.u32()?),               // udata4
-            0x04 => self.u64()?,                          // udata8
-            0x09 => self.sleb128()? as u64,               // sleb128
-            0x0a => i64::from(self.u16()? as i16) as u64, // sdata2
-            0x0b => i64::from(self.u32()? as i32) as u64, // sdata4
-            0x0c => self.u64()?,                          // sdata8
-            _ => return None,
-        };
-        // A zero *stored* value is a null pointer, whatever the encoding says
-        // about relocating it. This is not a special case invented here.
-        if value == 0 {
-            return Some(0);
-        }
-        let value = match encoding & 0x70 {
-            0x00 => value,                    // absolute
-            0x10 => base.wrapping_add(value), // pcrel
-            _ => return None,
-        };
-        // An indirect encoding stores the address of the address: a GOT slot,
-        // because the value is only known after binding.
-        if encoding & DW_EH_PE_INDIRECT != 0 {
-            if value == 0 {
-                return Some(0);
-            }
-            let mut at = Reader::new(self.mem, value);
-            return at.u64();
-        }
-        Some(value)
-    }
 }
-
-const DW_EH_PE_OMIT: u8 = 0xff;
-const DW_EH_PE_INDIRECT: u8 = 0x80;
 
 /// Leave one frame: `regs` goes in describing frame *n* and comes out
 /// describing its caller.
@@ -409,27 +316,11 @@ fn decode_permutation(mut permutation: u32, count: usize) -> Vec<u8> {
     out
 }
 
-/// One function's `__gcc_except_tab` entry: where its `try` ranges are and what
-/// they catch.
-pub struct Lsda {
-    /// Base the call-site table's offsets are relative to. Almost always the
-    /// function start, which is what `DW_EH_PE_omit` on the field means.
-    lp_start: u64,
-    ttype_encoding: u8,
-    /// One past the end of the type table, which is indexed *backwards*.
-    class_info: u64,
-    call_site_encoding: u8,
-    call_sites: (u64, u64),
-    action_table: u64,
-}
-
-/// A `try` range's outcome for one address.
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub struct Site {
-    /// Absolute address of the landing pad, or zero for "nothing here".
-    pub landing_pad: u64,
-    /// 1-based byte offset into the action table, or zero for a pure cleanup.
-    pub action: u64,
+/// The exception table reads guest memory through the same view the unwinder does.
+impl LsdaMemory for dyn GuestMemory + '_ {
+    fn read(&self, addr: u64, out: &mut [u8]) -> machish::Result<()> {
+        GuestMemory::read(self, addr, out)
+    }
 }
 
 /// What this frame wants to do about an exception.
@@ -446,155 +337,73 @@ pub enum Outcome {
     Undecidable,
 }
 
-impl Lsda {
-    /// Parse the header of the table at `lsda`.
-    pub fn parse(
-        lsda: u64,
-        function: u64,
-        mem: &dyn GuestMemory,
-    ) -> core::result::Result<Self, UnwindError> {
-        let mut r = Reader::new(mem, lsda);
-        let bad = UnwindError::BadLsda;
-        let lp_encoding = r.u8().ok_or(bad)?;
-        let lp_start = if lp_encoding == DW_EH_PE_OMIT {
-            function
-        } else {
-            r.encoded(lp_encoding).ok_or(bad)?
-        };
-        let ttype_encoding = r.u8().ok_or(bad)?;
-        let class_info = if ttype_encoding == DW_EH_PE_OMIT {
-            0
-        } else {
-            let offset = r.uleb128().ok_or(bad)?;
-            r.at.wrapping_add(offset)
-        };
-        let call_site_encoding = r.u8().ok_or(bad)?;
-        let length = r.uleb128().ok_or(bad)?;
-        let start = r.at;
-        let end = start.wrapping_add(length);
-        Ok(Lsda {
-            lp_start,
-            ttype_encoding,
-            class_info,
-            call_site_encoding,
-            call_sites: (start, end),
-            action_table: end,
-        })
+/// The call site covering a frame returning to `ip`, if any.
+fn site_for(
+    table: &Lsda,
+    ip: u64,
+    mem: &dyn GuestMemory,
+) -> core::result::Result<Option<CallSite>, UnwindError> {
+    table.site_for(ip, mem).map_err(|_| UnwindError::BadLsda)
+}
+
+/// Walk a site's action chain and decide what this frame does.
+fn outcome(
+    table: &Lsda,
+    vm: &Vm,
+    site: &CallSite,
+    thrown_type: u64,
+    mem: &dyn GuestMemory,
+) -> core::result::Result<Outcome, UnwindError> {
+    let bad = |_| UnwindError::BadLsda;
+    if site.landing_pad == 0 {
+        return Ok(Outcome::Nothing);
     }
+    let Some(mut at) = table.first_action(site) else {
+        return Ok(Outcome::Cleanup {
+            landing_pad: site.landing_pad,
+        });
+    };
 
-    /// The call site covering `ip`, if any.
-    pub fn site_for(
-        &self,
-        ip: u64,
-        mem: &dyn GuestMemory,
-    ) -> core::result::Result<Option<Site>, UnwindError> {
-        let bad = UnwindError::BadLsda;
-        let offset = ip.wrapping_sub(1).wrapping_sub(self.lp_start);
-        let mut r = Reader::new(mem, self.call_sites.0);
-        while r.at < self.call_sites.1 {
-            let start = r.encoded(self.call_site_encoding).ok_or(bad)?;
-            let length = r.encoded(self.call_site_encoding).ok_or(bad)?;
-            let pad = r.encoded(self.call_site_encoding).ok_or(bad)?;
-            let action = r.uleb128().ok_or(bad)?;
-            if offset >= start && offset < start.wrapping_add(length) {
-                return Ok(Some(Site {
-                    landing_pad: if pad == 0 {
-                        0
-                    } else {
-                        self.lp_start.wrapping_add(pad)
-                    },
-                    action,
-                }));
-            }
-        }
-        Ok(None)
-    }
-
-    /// Walk a site's action chain and decide what this frame does.
-    pub fn outcome(
-        &self,
-        vm: &Vm,
-        site: Site,
-        thrown_type: u64,
-        mem: &dyn GuestMemory,
-    ) -> core::result::Result<Outcome, UnwindError> {
-        let bad = UnwindError::BadLsda;
-        if site.landing_pad == 0 {
-            return Ok(Outcome::Nothing);
-        }
-        if site.action == 0 {
-            return Ok(Outcome::Cleanup {
-                landing_pad: site.landing_pad,
-            });
-        }
-
-        let mut at = self.action_table.wrapping_add(site.action - 1);
-        let mut undecidable = false;
-        let mut cleanup = false;
-        loop {
-            let mut r = Reader::new(mem, at);
-            let filter = r.sleb128().ok_or(bad)?;
-            let next_at = r.at;
-            let next = r.sleb128().ok_or(bad)?;
-
-            match filter {
-                0 => cleanup = true,
-                f if f > 0 => {
-                    let catch_type = self.catch_type(f, mem)?;
-                    // A null entry is `catch (...)`, which takes anything. An
-                    // exact address match is the same object.
-                    match catches(vm, catch_type, thrown_type, mem) {
-                        Match::Yes => {
-                            return Ok(Outcome::Handler {
-                                landing_pad: site.landing_pad,
-                                selector: f,
-                            });
-                        }
-                        Match::No => {}
-                        Match::Unknown => undecidable = true,
+    let mut undecidable = false;
+    let mut cleanup = false;
+    loop {
+        let action = table.action(at, mem).map_err(bad)?;
+        match action.filter {
+            0 => cleanup = true,
+            f if f > 0 => {
+                let catch_type = table.catch_type(f, mem).map_err(bad)?;
+                // A null entry is `catch (...)`, which takes anything. An
+                // exact address match is the same object.
+                match catches(vm, catch_type, thrown_type, mem) {
+                    Match::Yes => {
+                        return Ok(Outcome::Handler {
+                            landing_pad: site.landing_pad,
+                            selector: f,
+                        });
                     }
+                    Match::No => {}
+                    Match::Unknown => undecidable = true,
                 }
-                _ => undecidable = true,
             }
-
-            if next == 0 {
-                break;
-            }
-            at = next_at.wrapping_add_signed(next);
+            _ => undecidable = true,
         }
-
-        if undecidable {
-            // Not "no handler": a clause here might well catch this, and saying
-            // so is the difference between a work item and a wrong answer.
-            return Ok(Outcome::Undecidable);
+        match action.next {
+            Some(next) => at = next,
+            None => break,
         }
-        if cleanup {
-            return Ok(Outcome::Cleanup {
-                landing_pad: site.landing_pad,
-            });
-        }
-        Ok(Outcome::Nothing)
     }
 
-    /// The `type_info` address a 1-based backwards index names.
-    fn catch_type(
-        &self,
-        index: i64,
-        mem: &dyn GuestMemory,
-    ) -> core::result::Result<u64, UnwindError> {
-        let bad = UnwindError::BadLsda;
-        if self.class_info == 0 {
-            return Err(bad);
-        }
-        let size = match self.ttype_encoding & 0x0f {
-            0x02 | 0x0a => 2,
-            0x03 | 0x0b => 4,
-            0x00 | 0x04 | 0x0c => 8,
-            _ => return Err(bad),
-        };
-        let at = self.class_info.wrapping_sub(index as u64 * size);
-        Reader::new(mem, at).encoded(self.ttype_encoding).ok_or(bad)
+    if undecidable {
+        // Not "no handler": a clause here might well catch this, and saying
+        // so is the difference between a work item and a wrong answer.
+        return Ok(Outcome::Undecidable);
     }
+    if cleanup {
+        return Ok(Outcome::Cleanup {
+            landing_pad: site.landing_pad,
+        });
+    }
+    Ok(Outcome::Nothing)
 }
 
 /// Whether a `catch` clause takes a thrown type.
@@ -699,6 +508,14 @@ pub struct InFlight {
     entry: u64,
 }
 
+fn parse_lsda(
+    lsda: u64,
+    function: u64,
+    mem: &dyn GuestMemory,
+) -> core::result::Result<Lsda, UnwindError> {
+    Lsda::parse(lsda, function, mem).map_err(|_| UnwindError::BadLsda)
+}
+
 /// Walk from `regs` to the frame that will catch `thrown_type`.
 fn find_handler(
     vm: &Vm,
@@ -714,9 +531,9 @@ fn find_handler(
         if entry.can_handle()
             && let Some(lsda) = entry.lsda
         {
-            let table = Lsda::parse(lsda, entry.function, mem)?;
-            if let Some(site) = table.site_for(regs.rip, mem)? {
-                match table.outcome(vm, site, thrown_type, mem)? {
+            let table = parse_lsda(lsda, entry.function, mem)?;
+            if let Some(site) = site_for(&table, regs.rip, mem)? {
+                match outcome(&table, vm, &site, thrown_type, mem)? {
                     Outcome::Handler { .. } => return Ok((regs.rip, regs.rsp)),
                     Outcome::Undecidable => undecidable = true,
                     _ => {}
@@ -778,9 +595,9 @@ fn enter_next_pad(
         let is_handler_frame = (regs.rip, regs.rsp) == flight.handler;
 
         if let Some(lsda) = entry.lsda.filter(|_| entry.can_handle()) {
-            let table = Lsda::parse(lsda, entry.function, mem)?;
-            if let Some(site) = table.site_for(regs.rip, mem)?
-                && let outcome = table.outcome(vm, site, flight.thrown_type, mem)?
+            let table = parse_lsda(lsda, entry.function, &*mem)?;
+            if let Some(site) = site_for(&table, regs.rip, &*mem)?
+                && let outcome = outcome(&table, vm, &site, flight.thrown_type, &*mem)?
                 && let Some(pad) = pad_of(outcome)
             {
                 flight.at = regs;

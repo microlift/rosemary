@@ -42,11 +42,19 @@ pub fn note_miss<M: Regions>(program: &Program<M>, pc: u64) {
 static LOGS: LazyLock<Mutex<HashMap<ImageId, Option<File>>>> = LazyLock::new(Mutex::default);
 
 /// Image ids by file, hashed once per process.
-fn image_id(path: &str) -> Option<ImageId> {
-    static IDS: LazyLock<Mutex<HashMap<String, Option<ImageId>>>> = LazyLock::new(Mutex::default);
+static IDS: LazyLock<Mutex<HashMap<String, Option<ImageId>>>> = LazyLock::new(Mutex::default);
+
+/// The id of the image file at `path`, hashed once per process.
+pub fn image_id(path: &str) -> Option<ImageId> {
     let mut ids = IDS.lock().unwrap_or_else(|e| e.into_inner());
     *ids.entry(path.to_string())
         .or_insert_with(|| std::fs::read(path).ok().map(|bytes| ImageId::of(&bytes)))
+}
+
+/// Records `id` for `path`, hashed by a caller that read the file anyway.
+pub fn remember_id(path: &str, id: ImageId) {
+    let mut ids = IDS.lock().unwrap_or_else(|e| e.into_inner());
+    ids.insert(path.to_string(), Some(id));
 }
 
 fn open(path: &Path) -> Option<File> {

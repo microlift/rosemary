@@ -5,8 +5,12 @@
 //! rename, so a reader never needs a lock; the `.lock` sidecar only keeps two
 //! processes from compiling the same image at once.
 
+pub mod build;
+pub mod entries;
+pub mod file;
 pub mod profile;
 pub mod resolve;
+pub mod spawn;
 pub mod store;
 
 use std::ffi::OsString;
@@ -21,7 +25,7 @@ pub const CACHE_ENV: &str = "ROSEMARY_AOT_CACHE";
 pub const KEEP_ENV: &str = "ROSEMARY_AOT_CACHE_KEEP";
 
 /// Bumped when what Rosemary stores beside Microlift's image changes meaning.
-const FORMAT_VERSION: u32 = 1;
+const FORMAT_VERSION: u32 = 2;
 
 /// Extension of a cached image.
 const IMAGE_EXTENSION: &str = "rmc";
@@ -137,27 +141,35 @@ impl Layout {
     }
 }
 
-/// Writes `image` as the cached code of the guest image `id`, replacing any older file.
-pub fn store(
-    layout: &Layout,
-    id: &ImageId,
-    image: &microlift::image::Image,
-) -> std::io::Result<()> {
+/// Writes `file` as the cached code of the guest image `id`, replacing any older one.
+pub fn store(layout: &Layout, id: &ImageId, file: &file::CacheFile) -> std::io::Result<()> {
     layout.prune();
-    store::write_atomic(&layout.image(id), &image.encode())
+    store::write_atomic(&layout.image(id), &file.encode())
 }
 
 /// Why a cache file was not used.
 #[derive(Debug)]
 pub enum LoadError {
     Io(std::io::Error),
+    File(file::DecodeError),
     /// Built for another ISA or configuration than this run's.
     Stale,
     Image(microlift::MicroliftError),
 }
 
-/// The cached regions of image `id`, loaded at `slide`, keeping only those whose
-/// import decisions `config` still gives; `Ok(None)` when nothing is cached.
+impl std::fmt::Display for LoadError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            LoadError::Io(e) => write!(f, "{e}"),
+            LoadError::File(e) => write!(f, "{e:?}"),
+            LoadError::Stale => write!(f, "built for another machine or configuration"),
+            LoadError::Image(e) => write!(f, "{e}"),
+        }
+    }
+}
+
+/// The cached regions of image `id`, which this run placed at `slide`, keeping only
+/// those `config` can still use; `Ok(None)` when nothing is cached.
 pub fn load(
     layout: &Layout,
     id: &ImageId,
@@ -167,22 +179,74 @@ pub fn load(
     let Some(mapped) = store::map(&layout.image(id)).map_err(LoadError::Io)? else {
         return Ok(None);
     };
-    let image = microlift::image::Image::decode(&mapped).map_err(LoadError::Image)?;
+    let file = file::CacheFile::decode(&mapped).map_err(LoadError::File)?;
     let backend = crate::jit::backend().map_err(LoadError::Image)?;
-    if image.isa_fingerprint != microlift::backend::isa_fingerprint(backend.isa())
-        || image.config_fingerprint != config.codegen_fingerprint()
+    let isa = microlift::backend::isa_fingerprint(backend.isa());
+    let fingerprint = config.codegen_fingerprint();
+    if file
+        .chunks
+        .iter()
+        .any(|chunk| chunk.isa_fingerprint != isa || chunk.config_fingerprint != fingerprint)
     {
         return Err(LoadError::Stale);
     }
-    let resolver = resolve::Resolver::new(config, slide);
-    let regions =
-        microlift::runtime::image::load_image(&image, &resolver).map_err(LoadError::Image)?;
-    Ok(Some(
-        regions
-            .into_iter()
-            .filter(|region| resolve::decisions_hold(config, &region.import_decisions))
-            .collect(),
-    ))
+    let moved = slide.wrapping_sub(file.lift_slide);
+    let resolver = resolve::Resolver::new(config, moved);
+    let mut regions = Vec::new();
+    for chunk in &file.chunks {
+        let loaded =
+            microlift::runtime::image::load_image(chunk, &resolver).map_err(LoadError::Image)?;
+        regions.extend(
+            loaded
+                .into_iter()
+                .filter(|region| usable(config, region, moved)),
+        );
+    }
+    Ok(Some(regions))
+}
+
+/// Whether a loaded region may run in this process.
+///
+/// Guest addresses in code are relocated, but a value the lift read out of a
+/// read-only segment and folded in is not: a rebased pointer there differs with
+/// the slide. So a region that read anything outside its own bytes is used only
+/// at the slide it was lifted at.
+fn usable(
+    config: &microlift::core::LifterConfig,
+    region: &microlift::runtime::image::LoadedRegion,
+    moved: u64,
+) -> bool {
+    (moved == 0 || region.translation.data_dependencies.is_empty())
+        && resolve::decisions_hold(config, &region.import_decisions)
+}
+
+/// Whether the code `memory` holds for `report` is the code in `bytes`, the file
+/// it was read from: every executable segment byte for byte.
+///
+/// A file id says what is on disk, and a loader may substitute other bytes under
+/// a path; code cached under the id must be code from the file.
+pub fn matches_file<M: machish::memory::AddressSpace + ?Sized>(
+    memory: &M,
+    report: &machish::report::ImageReport,
+    bytes: &[u8],
+) -> bool {
+    let Ok(thin) = machish::fat::select(bytes, &machish::spec::arch::X86_64) else {
+        return false;
+    };
+    report
+        .segments
+        .iter()
+        .filter(|segment| segment.executable)
+        .all(|segment| {
+            let Some(range) = segment.file_range.clone() else {
+                return true;
+            };
+            let Some(expected) = thin.get(range) else {
+                return false;
+            };
+            let mut mapped = vec![0u8; expected.len()];
+            memory.read(segment.vmaddr, &mut mapped).is_ok() && mapped == expected
+        })
 }
 
 /// Where the cache lives, given the three variables which can name it.

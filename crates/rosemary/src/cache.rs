@@ -248,6 +248,9 @@ pub struct CodeCache {
     /// answered after that many. See `len`.
     inserts: AtomicU64,
     counted: std::sync::Mutex<(u64, usize)>,
+    /// Images whose cached code has been looked for, by path: each is looked for
+    /// once, at its first miss.
+    adopted: std::sync::Mutex<std::collections::HashSet<String>>,
     /// Everything microlift needs to know before it lifts anything: the registered
     /// import addresses and the read-only segment hints. Immutable, so a lift reads it
     /// without taking anything.
@@ -304,6 +307,7 @@ impl CodeCache {
             index: EntryIndex::new(),
             inserts: AtomicU64::new(0),
             counted: std::sync::Mutex::new((0, 0)),
+            adopted: std::sync::Mutex::default(),
             config,
         }
     }
@@ -366,6 +370,11 @@ impl CodeCache {
         if let Some(hit) = self.lookup(pc) {
             return Ok(hit);
         }
+        if self.adopt_cached(program, pc)
+            && let Some(hit) = self.lookup(pc)
+        {
+            return Ok(hit);
+        }
         crate::aot::profile::note_miss(program, pc);
         let mut attempt = 0;
         loop {
@@ -374,6 +383,102 @@ impl CodeCache {
                 None => attempt += 1,
             }
         }
+    }
+
+    /// The lifter config every region of this cache is lifted under.
+    pub(crate) fn config(&self) -> &LifterConfig {
+        &self.config
+    }
+
+    /// Publish the cached code of the image holding `pc`, the first time one of its
+    /// addresses misses. Returns whether anything was published.
+    fn adopt_cached<M: Regions>(&self, program: &Program<M>, pc: u64) -> bool {
+        let Some(layout) = crate::aot::Layout::current() else {
+            return false;
+        };
+        let Some((path, slide)) = program.code_image(pc) else {
+            return false;
+        };
+        let first = self
+            .adopted
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(path.clone());
+        if !first {
+            return false;
+        }
+        // Only images linked with the program: the offline build sees no others.
+        let Some(report) = program.report.images.iter().find(|r| r.path == path) else {
+            return false;
+        };
+        let Ok(bytes) = std::fs::read(&path) else {
+            return false;
+        };
+        let id = crate::aot::ImageId::of(&bytes);
+        crate::aot::profile::remember_id(&path, id);
+        let tracing = crate::shims::vmmap::tracing();
+        if !crate::aot::matches_file(&program.memory, report, &bytes) {
+            if tracing {
+                eprintln!("rosemary: aot: {path}: the code loaded is not the code in its file");
+            }
+            return false;
+        }
+        let regions = match crate::aot::load(layout, &id, &self.config, slide) {
+            Ok(Some(regions)) => regions,
+            Ok(None) => {
+                if tracing {
+                    eprintln!(
+                        "rosemary: aot: {path}: nothing cached at {}",
+                        layout.image(&id).display()
+                    );
+                }
+                return false;
+            }
+            Err(e) => {
+                eprintln!("rosemary: aot: {path}: the cached code was not used: {e}");
+                return false;
+            }
+        };
+        if tracing {
+            eprintln!("rosemary: aot: {path}: {} cached region(s)", regions.len());
+        }
+        let mut published = self.write();
+        let any = !regions.is_empty();
+        for region in regions {
+            let translation = region.translation;
+            let start = translation.covered.iter().map(|r| r.start).min();
+            let end = translation.covered.iter().map(|r| r.end).max();
+            let (Some(start), Some(end)) = (start, end) else {
+                continue;
+            };
+            crate::fault::placed(
+                translation.entry as usize as u64,
+                translation.link_target as usize as u64,
+                start,
+                end,
+                region.lift_base,
+                &region.map,
+            );
+            if crate::lldb::enabled() {
+                let mut guest_bytes = vec![0u8; (end - start) as usize];
+                if program.memory.read(start, &mut guest_bytes).is_ok() {
+                    crate::lldb::register(
+                        translation.link_target as usize as u64,
+                        start,
+                        end,
+                        &program.locate(start).unwrap_or_default(),
+                        &guest_bytes,
+                        &region.map,
+                    );
+                }
+            }
+            let translation = published.cache.insert(translation);
+            published.retained.push(Arc::clone(&translation));
+            self.inserts.fetch_add(1, Ordering::Release);
+            self.index
+                .publish(&translation.resume_points, Arc::as_ptr(&translation));
+        }
+        any
     }
 
     /// One lift of `pc`, published - or `None` when the guest rewrote the bytes it

@@ -116,6 +116,8 @@ fn emulated(
     // Deliberately leaked, and published for the rest of the process.
     let vm: &'static Vm = Box::leak(Box::new(vm));
     rosemary::thunk::publish(vm);
+    // Before any guest code runs; see `aot::spawn`.
+    rosemary::aot::spawn::if_missing(&vm.program, path);
 
     // Objective-C registration happens inside `startup::run`, in dyld's order.
     // It is driven from here first only so that its refusals reach the user.
@@ -311,6 +313,26 @@ enum Command {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<OsString>,
     },
+    /// Compile a program's x86-64 code into the on-disk code cache without running it
+    Aot(AotOptions),
+}
+
+#[derive(Args, Debug)]
+struct AotOptions {
+    /// Mach-O executable or .app bundle
+    path: OsString,
+    /// Stop starting new work after this many seconds and write what finished
+    #[arg(long, value_name = "SECONDS")]
+    deadline: Option<u64>,
+    /// Compiler threads (default: one per CPU)
+    #[arg(long)]
+    threads: Option<usize>,
+    /// Leave images that already have a cache file alone
+    #[arg(long)]
+    only_missing: bool,
+    /// Continue in a detached, lowest-priority process and return at once
+    #[arg(long)]
+    detach: bool,
 }
 
 fn main() -> ExitCode {
@@ -323,6 +345,7 @@ fn main() -> ExitCode {
     match cli.command {
         Some(Command::Prefix { args }) => prefix_cli::command(args.into_iter()),
         Some(Command::Server { args }) => server_cli::command(args.into_iter()),
+        Some(Command::Aot(options)) => aot(options),
         Some(Command::Run {
             options,
             mut program,
@@ -504,6 +527,104 @@ fn claim_application(
             eprintln!("rosemary: {e}");
             Some(ExitCode::FAILURE)
         }
+    }
+}
+
+/// `rosemary aot`: load the program as `run` would, compile it into the code
+/// cache, and exit without running it.
+fn aot(options: AotOptions) -> ExitCode {
+    if options.detach
+        && let Err(e) = rosemary::aot::spawn::detach()
+    {
+        eprintln!("rosemary: aot: could not detach: {e}");
+        return ExitCode::FAILURE;
+    }
+    prefix_cli::settle_prefix();
+    #[cfg(target_os = "macos")]
+    imply_builtin_runtime();
+    let Some(layout) = rosemary::aot::Layout::current() else {
+        eprintln!(
+            "rosemary: aot: the code cache is disabled ({}) or has nowhere to go",
+            rosemary::aot::CACHE_ENV
+        );
+        return ExitCode::FAILURE;
+    };
+    let Some(path) = options.path.to_str().map(program_path) else {
+        eprintln!("rosemary: the program's path is not valid UTF-8");
+        return ExitCode::FAILURE;
+    };
+    let executable = match rosemary::bundle::executable(std::path::Path::new(&path)) {
+        Ok(executable) => executable,
+        Err(e) => {
+            eprintln!("rosemary: {path}: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let Some(path) = executable.to_str() else {
+        eprintln!("rosemary: the bundle executable's path is not valid UTF-8");
+        return ExitCode::FAILURE;
+    };
+    if let Err(e) = choose(path, Some(Engine::Emulated)) {
+        eprintln!("rosemary: {path}: {e}");
+        return ExitCode::FAILURE;
+    }
+    if let Err(e) = prefix_cli::ensure_cxx_runtime(Engine::Emulated) {
+        eprintln!("rosemary: {path}: {e}");
+        return ExitCode::FAILURE;
+    }
+    // What the providers a run links against are told before loading.
+    rosemary::shims::runtime::set_executable_path(std::path::Path::new(path));
+    rosemary::frameworks::set_main_bundle(std::path::Path::new(path));
+
+    let argv = [OsString::from(guest_spelling(path))];
+    let vm = match Program::load_executable(path, &[])
+        .map_err(|e| e.to_string())
+        .and_then(|program| {
+            Vm::with_policy(program, path, &argv, ImportPolicy::FastWhenKnown)
+                .map_err(|e| e.to_string())
+        }) {
+        Ok(vm) => vm,
+        Err(e) => {
+            eprintln!("rosemary: {path}: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let threads = options.threads.unwrap_or_else(|| {
+        std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get)
+    });
+    let build = rosemary::aot::build::Options {
+        deadline: options
+            .deadline
+            .map(|seconds| std::time::Instant::now() + std::time::Duration::from_secs(seconds)),
+        threads,
+        only_missing: options.only_missing,
+    };
+    let mut failed = false;
+    for (image, outcome) in rosemary::aot::build::build(&vm, layout, &build) {
+        use rosemary::aot::build::Outcome;
+        match outcome {
+            Outcome::Written {
+                regions,
+                refused,
+                complete,
+            } => println!(
+                "{image}: {regions} region(s) cached, {refused} refused{}",
+                if complete {
+                    ""
+                } else {
+                    ", stopped at the deadline"
+                }
+            ),
+            Outcome::Skipped(reason) => println!("{image}: skipped: {reason}"),
+            Outcome::Failed(e) => {
+                failed = true;
+                eprintln!("rosemary: aot: {image}: {e}");
+            }
+        }
+    }
+    match failed {
+        true => ExitCode::FAILURE,
+        false => ExitCode::SUCCESS,
     }
 }
 

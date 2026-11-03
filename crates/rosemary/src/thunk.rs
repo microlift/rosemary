@@ -36,15 +36,24 @@ pub struct Thunk {
     pub guest: u64,
     /// Its own address - what the host is given.
     pub host: u64,
-    /// Keeps the JIT module, and therefore `host`'s pages, mapped.
-    _backend: CraneliftBackend,
+    /// Keeps `host` callable.
+    _code: Code,
     /// Typed callbacks keep their signature at a stable address until this thunk dies.
     _signature: Option<Box<ThunkSignature>>,
 }
 
+/// What `host` is.
+enum Code {
+    /// A trampoline compiled for this guest address alone; the module keeps its
+    /// pages mapped.
+    Compiled { _backend: CraneliftBackend },
+    /// A stub entering a shared [`Template`], which lives for the process.
+    Stub { _stub: crate::thunk_stub::Stub },
+}
+
 // SAFETY: as for `Translation` in `crate::cache`, and for the same reason. A
 // thunk is immutable once compiled; `host` is an address the *host* calls, from
-// whichever thread it likes, which is the entire point of it. `_backend` is held
+// whichever thread it likes, which is the entire point of it. `code` is held
 // to keep that address mapped and is never read again.
 unsafe impl Send for Thunk {}
 unsafe impl Sync for Thunk {}
@@ -196,6 +205,13 @@ pub(crate) fn with_current<R>(vm: &Vm, f: impl FnOnce() -> R) -> R {
 /// thunk on a thread that has never been inside [`with_current`].
 pub fn publish(vm: &'static Vm) {
     PUBLISHED.store(vm as *const Vm as *mut Vm, Ordering::Release);
+}
+
+/// The VM published for the whole process, if any.
+pub(crate) fn published() -> Option<&'static Vm> {
+    let p = PUBLISHED.load(Ordering::Acquire);
+    // SAFETY: only `publish` stores here, and it takes a `&'static Vm`.
+    (!p.is_null()).then(|| unsafe { &*p })
 }
 
 /// The VM this thread is executing, if any.
@@ -443,15 +459,188 @@ fn build_typed_with_entry(
     signature: ThunkSignature,
     host_entry: u64,
 ) -> Result<Thunk, VmError> {
-    let conv = get_host_calling_conv();
     let fail = |reason: String| VmError::Thunk {
         guest: guest_va,
         reason,
     };
+    if let Some(stub) = from_template(Some(&signature), host_entry, guest_va).map_err(fail)? {
+        return Ok(stub);
+    }
+    let descriptor = Box::new(signature);
+    let func = typed_function(&descriptor, host_entry, GuestAddress::Constant(guest_va))
+        .map_err(fail)?
+        .0;
+    let (backend, host) = compile(func).map_err(fail)?;
+    Ok(Thunk {
+        guest: guest_va,
+        host,
+        _code: Code::Compiled { _backend: backend },
+        _signature: Some(descriptor),
+    })
+}
+
+/// Compile a trampoline that re-enters the guest at `guest_va`.
+pub(crate) fn build(guest_va: u64) -> Result<Thunk, VmError> {
+    let fail = |reason: String| VmError::Thunk {
+        guest: guest_va,
+        reason,
+    };
+    let entry = thunk_entry as *const () as usize as u64;
+    if let Some(stub) = from_template(None, entry, guest_va).map_err(fail)? {
+        return Ok(stub);
+    }
+    let func = generic_function(GuestAddress::Constant(guest_va))
+        .map_err(fail)?
+        .0;
+    let (backend, host) = compile(func).map_err(fail)?;
+    Ok(Thunk {
+        guest: guest_va,
+        host,
+        _code: Code::Compiled { _backend: backend },
+        _signature: None,
+    })
+}
+
+/// Where a trampoline gets the guest address it re-enters.
+#[derive(Clone, Copy)]
+enum GuestAddress {
+    /// Compiled in: a trampoline for one guest function.
+    Constant(u64),
+    /// One integer argument after the declared ones: a [`Template`].
+    Argument,
+}
+
+/// One trampoline per signature and Rust entry, entered through a
+/// [`crate::thunk_stub`] stub per guest function.
+struct Template {
+    /// `None` for the generic shape.
+    signature: Option<Box<ThunkSignature>>,
+    host_entry: u64,
+    /// The integer argument register the guest address arrives in.
+    register: usize,
+    code: u64,
+    _backend: CraneliftBackend,
+}
+
+// SAFETY: as for `Thunk`: immutable once compiled, and the module is held only to
+// keep `code` mapped.
+unsafe impl Send for Template {}
+
+/// Every template compiled, kept for the life of the process because stubs
+/// handed to the host name them.
+static TEMPLATES: std::sync::Mutex<Vec<Template>> = std::sync::Mutex::new(Vec::new());
+
+/// A stub thunk for `guest_va` through the template for `signature` and
+/// `host_entry`, compiling the template the first time; `Ok(None)` when the
+/// signature leaves no integer argument register for the guest address.
+fn from_template(
+    signature: Option<&ThunkSignature>,
+    host_entry: u64,
+    guest_va: u64,
+) -> Result<Option<Thunk>, String> {
+    let mut templates = TEMPLATES.lock().unwrap_or_else(|e| e.into_inner());
+    let found = templates
+        .iter()
+        .find(|t| t.host_entry == host_entry && t.signature.as_deref() == signature);
+    let (register, code) = match found {
+        Some(template) => (template.register, template.code),
+        None => {
+            let signature = signature.map(|s| Box::new(s.clone()));
+            let built = match signature.as_deref() {
+                Some(sig) => typed_function(sig, host_entry, GuestAddress::Argument),
+                None => generic_function(GuestAddress::Argument),
+            };
+            let (func, Some(register)) = built? else {
+                return Ok(None);
+            };
+            let (backend, code) = compile(func)?;
+            templates.push(Template {
+                signature,
+                host_entry,
+                register,
+                code,
+                _backend: backend,
+            });
+            (register, code)
+        }
+    };
+    drop(templates);
+    let Some(stub) = crate::thunk_stub::allocate(register, guest_va, code) else {
+        return Ok(None);
+    };
+    Ok(Some(Thunk {
+        guest: guest_va,
+        host: stub.address(),
+        _code: Code::Stub { _stub: stub },
+        _signature: None,
+    }))
+}
+
+/// Which integer argument register comes after `sig`'s parameters, or `None` if
+/// none is left or a parameter's placement is not one this can count.
+fn next_integer_register(sig: &Signature) -> Option<usize> {
+    let mut used = 0;
+    for param in &sig.params {
+        match param.purpose {
+            // x8 on AAPCS64, outside the argument registers; the first argument
+            // register on SysV.
+            ArgumentPurpose::StructReturn if cfg!(target_arch = "aarch64") => {}
+            // Copied to the stack.
+            ArgumentPurpose::StructArgument(_) => {}
+            _ if param.value_type.is_float() => {}
+            _ if param.value_type.is_int() && param.value_type.bits() <= 64 => used += 1,
+            _ => return None,
+        }
+    }
+    (used < crate::thunk_stub::ARGUMENT_REGISTERS).then_some(used)
+}
+
+/// Declares the guest address as a trailing integer parameter under
+/// [`GuestAddress::Argument`], returning the register it arrives in.
+fn declare_guest(sig: &mut Signature, guest: GuestAddress) -> Result<Option<usize>, ()> {
+    match guest {
+        GuestAddress::Constant(_) => Ok(None),
+        GuestAddress::Argument => {
+            let register = next_integer_register(sig).ok_or(())?;
+            sig.params.push(AbiParam::new(types::I64));
+            Ok(Some(register))
+        }
+    }
+}
+
+/// The guest address inside the function, given its entry block's parameters.
+fn guest_value(
+    b: &mut FunctionBuilder,
+    guest: GuestAddress,
+    params: &[cranelift_codegen::ir::Value],
+) -> cranelift_codegen::ir::Value {
+    match guest {
+        GuestAddress::Constant(va) => b.ins().iconst(types::I64, va as i64),
+        GuestAddress::Argument => *params.last().expect("declared by `declare_guest`"),
+    }
+}
+
+fn compile(func: Function) -> Result<(CraneliftBackend, u64), String> {
+    let mut backend = crate::jit::backend().map_err(|e| e.to_string())?;
+    let code = backend.compile(func).map_err(|e| e.to_string())?;
+    Ok((backend, code as usize as u64))
+}
+
+/// A trampoline for `signature` that calls `host_entry`, and the register the
+/// guest address arrives in under [`GuestAddress::Argument`].
+///
+/// Under [`GuestAddress::Argument`] a signature with no register to spare yields
+/// `(_, None)` rather than a function.
+fn typed_function(
+    signature: &ThunkSignature,
+    host_entry: u64,
+    guest: GuestAddress,
+) -> Result<(Function, Option<usize>), String> {
+    let conv = get_host_calling_conv();
 
     // The host machine this trampoline is being built for. Cranelift's frontend
     // is told rather than asked; see [`crate::jit::frontend_config`].
-    let frontend = crate::jit::frontend_config().map_err(|e| fail(e.to_string()))?;
+    let frontend = crate::jit::frontend_config().map_err(|e| e.to_string())?;
     let ptr = frontend.pointer_type();
 
     let incoming = signature.incoming();
@@ -484,7 +673,10 @@ fn build_typed_with_entry(
             }
         });
     }
-    let ret_leaves = signature.return_leaves().map_err(|e| fail(e.to_string()))?;
+    let Ok(register) = declare_guest(&mut sig, guest) else {
+        return Ok((Function::new(), None));
+    };
+    let ret_leaves = signature.return_leaves().map_err(|e| e.to_string())?;
     for (ty, _) in &ret_leaves {
         sig.returns.push(AbiParam::new(*ty));
     }
@@ -559,14 +751,14 @@ fn build_typed_with_entry(
         }
     }
 
-    let descriptor = Box::new(signature);
-    let desc = b.ins().iconst(
-        types::I64,
-        (&*descriptor as *const ThunkSignature) as usize as i64,
-    );
+    // The caller keeps `signature` at this address for as long as the function
+    // can be called: a thunk's own box, or a template's.
+    let desc = b
+        .ins()
+        .iconst(types::I64, std::ptr::from_ref(signature) as usize as i64);
     let spill_ptr = b.ins().stack_addr(types::I64, spill, 0);
     let out_ptr = b.ins().stack_addr(types::I64, out, 0);
-    let guest = b.ins().iconst(types::I64, guest_va as i64);
+    let guest = guest_value(&mut b, guest, &params);
 
     let mut callee_sig = Signature::new(conv);
     for _ in 0..4 {
@@ -591,24 +783,15 @@ fn build_typed_with_entry(
         b.ins().return_(&rets);
     }
     b.finalize(frontend);
-
-    let mut backend = crate::jit::backend().map_err(|e| fail(e.to_string()))?;
-    let code = backend.compile(func).map_err(|e| fail(e.to_string()))?;
-    Ok(Thunk {
-        guest: guest_va,
-        host: code as usize as u64,
-        _backend: backend,
-        _signature: Some(descriptor),
-    })
+    Ok((func, register))
 }
 
-/// Compile a trampoline that re-enters the guest at `guest_va`.
-pub(crate) fn build(guest_va: u64) -> Result<Thunk, VmError> {
+/// The generic trampoline: six integer and eight floating-point arguments, since a
+/// bare function pointer says nothing about its own shape. As for
+/// [`typed_function`], `(_, None)` under [`GuestAddress::Argument`] when no
+/// register is left for the guest address.
+fn generic_function(guest: GuestAddress) -> Result<(Function, Option<usize>), String> {
     let conv = get_host_calling_conv();
-    let fail = |reason: String| VmError::Thunk {
-        guest: guest_va,
-        reason,
-    };
 
     let mut sig = Signature::new(conv);
     for _ in 0..GUEST_INT_ARGS {
@@ -617,9 +800,12 @@ pub(crate) fn build(guest_va: u64) -> Result<Thunk, VmError> {
     for _ in 0..GUEST_FP_ARGS {
         sig.params.push(AbiParam::new(types::F64));
     }
+    let Ok(register) = declare_guest(&mut sig, guest) else {
+        return Ok((Function::new(), None));
+    };
     sig.returns.push(AbiParam::new(types::I64));
 
-    let frontend = crate::jit::frontend_config().map_err(|e| fail(e.to_string()))?;
+    let frontend = crate::jit::frontend_config().map_err(|e| e.to_string())?;
     let ptr = frontend.pointer_type();
 
     let mut func = Function::with_name_signature(UserFuncName::user(0, 0), sig);
@@ -646,13 +832,18 @@ pub(crate) fn build(guest_va: u64) -> Result<Thunk, VmError> {
     for (i, &v) in params.iter().take(GUEST_INT_ARGS).enumerate() {
         b.ins().stack_store(ptr, v, ints, (i * 8) as i32);
     }
-    for (i, &v) in params.iter().skip(GUEST_INT_ARGS).enumerate() {
+    for (i, &v) in params
+        .iter()
+        .skip(GUEST_INT_ARGS)
+        .take(GUEST_FP_ARGS)
+        .enumerate()
+    {
         b.ins().stack_store(ptr, v, floats, (i * 8) as i32);
     }
 
     let int_ptr = b.ins().stack_addr(types::I64, ints, 0);
     let fp_ptr = b.ins().stack_addr(types::I64, floats, 0);
-    let guest = b.ins().iconst(types::I64, guest_va as i64);
+    let guest = guest_value(&mut b, guest, &params);
 
     let mut callee_sig = Signature::new(conv);
     callee_sig.params.push(AbiParam::new(types::I64));
@@ -670,15 +861,7 @@ pub(crate) fn build(guest_va: u64) -> Result<Thunk, VmError> {
     let result = b.inst_results(call)[0];
     b.ins().return_(&[result]);
     b.finalize(frontend);
-
-    let mut backend = crate::jit::backend().map_err(|e| fail(e.to_string()))?;
-    let code = backend.compile(func).map_err(|e| fail(e.to_string()))?;
-    Ok(Thunk {
-        guest: guest_va,
-        host: code as usize as u64,
-        _backend: backend,
-        _signature: None,
-    })
+    Ok((func, register))
 }
 
 /// The guest's argument registers, being filled.
@@ -1187,11 +1370,13 @@ mod callback_abi_tests {
 
     thread_local! {
         static CAPTURED: std::cell::RefCell<Vec<u64>> = const { std::cell::RefCell::new(Vec::new()) };
+        static CAPTURED_CALL: std::cell::Cell<(u64, *const ThunkSignature)> =
+            const { std::cell::Cell::new((0, std::ptr::null())) };
     }
 
     unsafe extern "C" fn capture_spill(
-        _guest: u64,
-        _desc: *const ThunkSignature,
+        guest: u64,
+        desc: *const ThunkSignature,
         spill: *const u64,
         _out: *mut u8,
     ) {
@@ -1199,6 +1384,7 @@ mod callback_abi_tests {
         // spill words, and the callback runs synchronously before it returns.
         let words = unsafe { std::slice::from_raw_parts(spill, 11) };
         CAPTURED.with(|slot| *slot.borrow_mut() = words.to_vec());
+        CAPTURED_CALL.with(|slot| slot.set((guest, desc)));
     }
 
     #[test]
@@ -1210,14 +1396,8 @@ mod callback_abi_tests {
             capture_spill as *const () as usize as u64,
         )
         .expect("native ABI supports the callback");
-        let owned_descriptor = std::ptr::from_ref(thunk._signature.as_deref().unwrap());
         let mut table = ThunkTable::new();
         let (host, _) = table.insert_typed(signature.clone(), thunk);
-        let stored = &table.typed_by_guest[&0x1234][0].1;
-        assert_eq!(
-            owned_descriptor,
-            std::ptr::from_ref(stored._signature.as_deref().unwrap())
-        );
         assert_eq!(table.typed_host_for(0x1234, &signature), Some(host));
         let first = NativeTime {
             value: 0x0123_4567_89ab_cdef,
@@ -1237,6 +1417,10 @@ mod callback_abi_tests {
         let call: extern "C" fn(u64, u64, i32, u32, u64, NativeTime, NativeTime) =
             unsafe { std::mem::transmute(host as usize) };
         call(11, 22, -33, 44, 55, first, second);
+        let (guest, desc) = CAPTURED_CALL.with(std::cell::Cell::get);
+        assert_eq!(guest, 0x1234);
+        // SAFETY: the descriptor outlives the thunk, which is still in `table`.
+        assert!(unsafe { *desc == signature });
         let captured = CAPTURED.with(|slot| slot.borrow().clone());
         assert_eq!(captured[0], 11);
         assert_eq!(captured[1], 22);
@@ -1258,6 +1442,50 @@ mod callback_abi_tests {
         assert_eq!(guest.ints.len(), 5);
         let expected_bytes: Vec<u8> = expected.into_iter().flat_map(u64::to_le_bytes).collect();
         assert_eq!(guest.stack, expected_bytes);
+    }
+
+    unsafe extern "C" fn capture_guest(
+        guest: u64,
+        _desc: *const ThunkSignature,
+        _spill: *const u64,
+        _out: *mut u8,
+    ) {
+        CAPTURED_CALL.with(|slot| slot.set((guest, std::ptr::null())));
+    }
+
+    fn word_parameters(count: usize) -> ThunkSignature {
+        ThunkSignature::new(vec![Shape::Scalar(T::UnsignedDoubleword); count], None).unwrap()
+    }
+
+    #[test]
+    fn one_template_serves_every_guest_of_a_signature() {
+        let signature = word_parameters(2);
+        let entry = capture_guest as *const () as usize as u64;
+        let first = build_typed_with_entry(0x1000, signature.clone(), entry).unwrap();
+        let second = build_typed_with_entry(0x2000, signature.clone(), entry).unwrap();
+        assert!(matches!(first._code, Code::Stub { .. }));
+        assert!(matches!(second._code, Code::Stub { .. }));
+        let templates = TEMPLATES.lock().unwrap();
+        let shared = templates
+            .iter()
+            .filter(|t| t.host_entry == entry && t.signature.as_deref() == Some(&signature))
+            .count();
+        drop(templates);
+        assert_eq!(shared, 1);
+        for thunk in [&first, &second] {
+            // SAFETY: the template declares exactly two word parameters.
+            let call: extern "C" fn(u64, u64) = unsafe { std::mem::transmute(thunk.host as usize) };
+            call(1, 2);
+            assert_eq!(CAPTURED_CALL.with(std::cell::Cell::get).0, thunk.guest);
+        }
+    }
+
+    #[test]
+    fn a_signature_with_no_register_to_spare_is_compiled_per_address() {
+        let signature = word_parameters(crate::thunk_stub::ARGUMENT_REGISTERS);
+        let entry = capture_guest as *const () as usize as u64;
+        let thunk = build_typed_with_entry(0x3000, signature, entry).unwrap();
+        assert!(matches!(thunk._code, Code::Compiled { .. }));
     }
 
     #[test]

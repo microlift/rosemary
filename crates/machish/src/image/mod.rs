@@ -1,6 +1,7 @@
 mod commands;
 mod entry;
 mod functions;
+pub mod lsda;
 mod object;
 mod sdk;
 mod sections;

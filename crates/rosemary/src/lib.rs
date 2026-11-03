@@ -49,6 +49,7 @@ pub mod stats;
 pub mod steam;
 pub mod thread;
 pub mod thunk;
+pub mod thunk_stub;
 pub mod tls;
 pub mod trace;
 pub mod trampoline;
@@ -88,6 +89,7 @@ pub mod compat;
 #[cfg(target_os = "macos")]
 pub mod gui;
 #[cfg(target_os = "macos")]
+pub mod prelift;
 pub mod profile;
 
 pub use abi::{AbiError, Classification, call_import};
