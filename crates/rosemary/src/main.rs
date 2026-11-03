@@ -273,6 +273,11 @@ struct Target {
 #[command(
     name = "rosemary",
     version,
+    long_version = concat!(
+        env!("CARGO_PKG_VERSION"), "\n",
+        "commit: ", env!("GIT_HASH"), "\n",
+        "built:  ", env!("BUILD_DATE"),
+    ),
     about = "Run macOS applications across architectures and operating systems",
     args_conflicts_with_subcommands = true,
     arg_required_else_help = true

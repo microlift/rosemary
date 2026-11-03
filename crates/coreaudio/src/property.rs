@@ -553,6 +553,74 @@ pub unsafe extern "C" fn AudioUnitGetProperty(
     }
 }
 
+/// Whether `AudioUnitSetProperty` takes `id` on `unit` at all.
+fn writable(unit: &crate::Unit, id: u32) -> bool {
+    match id {
+        STREAM_FORMAT
+        | MAXIMUM_FRAMES_PER_SLICE
+        | AUDIO_CHANNEL_LAYOUT
+        | ENABLE_IO
+        | CURRENT_DEVICE
+        | OUTPUT_SET_INPUT_CALLBACK => true,
+        id if carries_a_callback(id) => true,
+        ELEMENT_COUNT => unit.kind == crate::Kind::Mixer,
+        MATRIX_LEVELS => unit.matrix,
+        id => unit.kind == crate::Kind::Mixer && SPATIALIZATION.contains(&id),
+    }
+}
+
+/// `OSStatus AudioUnitGetPropertyInfo(AudioUnit, AudioUnitPropertyID,
+/// AudioUnitScope, AudioUnitElement, UInt32 *outDataSize, Boolean *outWritable)`
+///
+/// The size is what `AudioUnitGetProperty` would fill. A callback property
+/// can only be set, and reports the `AURenderCallbackStruct` it takes.
+///
+/// # Safety
+///
+/// `out_size` and `out_writable` must each be null or writable.
+pub unsafe extern "C" fn AudioUnitGetPropertyInfo(
+    handle: *mut c_void,
+    id: u32,
+    scope: u32,
+    element: u32,
+    out_size: *mut u32,
+    out_writable: *mut u8,
+) -> i32 {
+    let Some(unit) = crate::unit_for(handle) else {
+        return unsafe {
+            crate::foreign::get_property_info(handle, id, scope, element, out_size, out_writable)
+        }
+        .unwrap_or(INVALID_COMPONENT);
+    };
+    let (status, size) = match id {
+        id if carries_a_callback(id) || id == OUTPUT_SET_INPUT_CALLBACK => {
+            (SUCCESS, size_of::<Callback>() as u32)
+        }
+        _ => {
+            let mut size = 0;
+            // SAFETY: a null `outData` asks for the size alone.
+            let status = unsafe {
+                AudioUnitGetProperty(handle, id, scope, element, std::ptr::null_mut(), &mut size)
+            };
+            (status, size)
+        }
+    };
+    if status != SUCCESS {
+        return status;
+    }
+    let writable = writable(&unit.lock().unwrap_or_else(|e| e.into_inner()), id);
+    // SAFETY: the caller's out-parameters, each null or writable.
+    unsafe {
+        if !out_size.is_null() {
+            *out_size = size;
+        }
+        if !out_writable.is_null() {
+            *out_writable = u8::from(writable);
+        }
+    }
+    SUCCESS
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -564,6 +632,39 @@ mod tests {
             crate::AudioComponentInstanceNew(crate::test_component(), &mut handle);
         }
         handle
+    }
+
+    #[test]
+    fn property_info_reports_the_size_get_property_fills() {
+        let handle = unit();
+        let (mut size, mut writable) = (0u32, 0u8);
+        // SAFETY: live out-parameters.
+        unsafe {
+            assert_eq!(
+                AudioUnitGetPropertyInfo(handle, STREAM_FORMAT, 1, 0, &mut size, &mut writable),
+                SUCCESS
+            );
+            assert_eq!(size, size_of::<Format>() as u32);
+            assert_eq!(writable, 1);
+            assert_eq!(
+                AudioUnitGetPropertyInfo(handle, HAS_IO, 2, 0, &mut size, &mut writable),
+                SUCCESS
+            );
+            assert_eq!((size, writable), (4, 0));
+            assert_eq!(
+                AudioUnitGetPropertyInfo(
+                    handle,
+                    SET_RENDER_CALLBACK,
+                    1,
+                    0,
+                    &mut size,
+                    &mut writable
+                ),
+                SUCCESS
+            );
+            assert_eq!((size, writable), (size_of::<Callback>() as u32, 1));
+            crate::AudioComponentInstanceDispose(handle);
+        }
     }
 
     #[test]

@@ -63,13 +63,25 @@ impl Timeval {
     }
 }
 
+/// `time_t time(time_t *)`. Darwin's `time_t` is 64-bit, as this host's.
+unsafe extern "C" fn time(out: *mut i64) -> i64 {
+    // The vDSO, like `clock_gettime`'s, may fall back to a raw syscall.
+    let _host = crate::syscall::ScopedHostSyscallContext::new();
+    // SAFETY: `out` is null or a writable `time_t`, as `time` requires.
+    unsafe { libc::time(out.cast()) }
+}
+
 /// `int gettimeofday(struct timeval *, void *)`.
 unsafe extern "C" fn gettimeofday(out: *mut Timeval, tz: *mut c_void) -> i32 {
     let mut host = libc::timeval {
         tv_sec: 0,
         tv_usec: 0,
     };
-    let rc = unsafe { libc::gettimeofday(&mut host, tz.cast()) };
+    // The vDSO, like `clock_gettime`'s, may fall back to a raw syscall.
+    let rc = {
+        let _host = crate::syscall::ScopedHostSyscallContext::new();
+        unsafe { libc::gettimeofday(&mut host, tz.cast()) }
+    };
     if rc == 0 && !out.is_null() {
         unsafe { Timeval::from_host(host).write(out) };
     }
@@ -206,7 +218,7 @@ unsafe extern "C" fn gettime(clock: id::clockid_t, ts: *mut c_void) -> i32 {
         crate::errno::set(libc::EINVAL);
         return -1;
     };
-    unsafe { libc::clock_gettime(host, ts.cast()) }
+    unsafe { crate::syscall::clock_gettime(host, ts.cast()) }
 }
 
 /// `int clock_getres(clockid_t, struct timespec *)`.
@@ -219,6 +231,7 @@ unsafe extern "C" fn getres(clock: id::clockid_t, ts: *mut c_void) -> i32 {
         crate::errno::set(libc::EINVAL);
         return -1;
     };
+    let _host = crate::syscall::ScopedHostSyscallContext::new();
     // SAFETY: the caller's guarantee, and the two layouts agree.
     unsafe { libc::clock_getres(host, ts as *mut libc::timespec) }
 }
@@ -272,7 +285,7 @@ unsafe extern "C" fn gettime_nsec_np(clock: id::clockid_t) -> u64 {
         tv_nsec: 0,
     };
     // SAFETY: `clock_gettime` writes the `timespec` it is given and nothing else.
-    if unsafe { libc::clock_gettime(host, &mut ts) } != 0 {
+    if unsafe { crate::syscall::clock_gettime(host, &mut ts) } != 0 {
         return 0;
     }
     (ts.tv_sec as u64)
@@ -286,6 +299,8 @@ unsafe extern "C" fn gettime_nsec_np(clock: id::clockid_t) -> u64 {
 /// microsecond CPU-time ticks, so only the signedness of the host representation
 /// needs adapting. Casting also preserves the `(clock_t)-1` failure sentinel.
 unsafe extern "C" fn clock() -> u64 {
+    // A CPU-time clock, which the vDSO always answers with a raw syscall.
+    let _host = crate::syscall::ScopedHostSyscallContext::new();
     unsafe { host::clock() as u64 }
 }
 
@@ -296,6 +311,7 @@ exports::exports! {
         "clock_settime" => settime,
         "clock_gettime_nsec_np" => gettime_nsec_np,
         "clock" => clock,
+        "time" => time,
         "gettimeofday" => gettimeofday,
         "utime" => utime,
         "utimes" => utimes,
@@ -308,6 +324,16 @@ exports::exports! {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn time_answers_and_stores_the_same_second() {
+        let mut stored = 0i64;
+        // SAFETY: a live local.
+        let answered = unsafe { time(&mut stored) };
+        assert_eq!(answered, stored);
+        // SAFETY: null is allowed.
+        assert!(unsafe { time(core::ptr::null_mut()) } >= answered);
+    }
 
     #[test]
     fn utime_sets_both_times() {

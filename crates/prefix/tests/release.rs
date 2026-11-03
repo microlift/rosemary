@@ -59,11 +59,11 @@ fn the_pinned_release_verifies_offline() {
             []
         );
         if arch == "x86_64" {
-            // The numbers the manifest recorded for v14.0.0.
+            // The numbers the manifest recorded for v15.0.0.
             let s = manifest.summary;
-            assert_eq!(manifest.entries.len(), 12898);
-            assert_eq!((s.files, s.symlinks, s.directories), (8669, 3733, 496));
-            assert_eq!(s.bytes, 161_809_838);
+            assert_eq!(manifest.entries.len(), 12982);
+            assert_eq!((s.files, s.symlinks, s.directories), (8747, 3735, 500));
+            assert_eq!(s.bytes, 178_197_640);
         }
         let _ = std::fs::remove_dir_all(&at);
     }

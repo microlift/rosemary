@@ -6,6 +6,24 @@ pub mod signal;
 /// than a pipe does.
 pub mod memory {
     pub use crate::memory::piped::{read, write};
+
+    pub use crate::memory::named::object;
+
+    pub const NORESERVE: libc::c_int = libc::MAP_NORESERVE;
+
+    pub fn exclude_from_fork(address: usize, len: usize) -> std::io::Result<()> {
+        unsafe extern "C" {
+            fn minherit(address: *mut core::ffi::c_void, len: usize, flags: u32) -> i32;
+        }
+
+        const VM_INHERIT_NONE: u32 = 2;
+
+        // SAFETY: changes only what a child inherits of the range.
+        match unsafe { minherit(address as *mut core::ffi::c_void, len, VM_INHERIT_NONE) } {
+            0 => Ok(()),
+            _ => Err(std::io::Error::last_os_error()),
+        }
+    }
 }
 
 use std::ffi::{CStr, c_int, c_void};
@@ -17,10 +35,10 @@ use std::sync::OnceLock;
 
 use super::sysctl;
 use crate::process::{
-    Audit, Descriptor, DescriptorKind, Identity, Process, Region, State, Thread, Usage,
+    Audit, Descriptor, DescriptorKind, Footprint, Identity, Process, Region, State, Thread, Usage,
 };
 use crate::socket::Peer;
-use crate::system::{CpuTicks, Memory, page_size};
+use crate::system::{CpuTicks, Memory, Swap, page_size};
 
 /// `<sys/proc_info.h>` flavours the `libc` crate does not name.
 const PROC_PIDREGIONINFO: c_int = 7;
@@ -250,6 +268,16 @@ fn regions_of(pid: i32) -> Vec<Region> {
     regions
 }
 
+pub fn footprint(pid: i32) -> Option<Footprint> {
+    let task: libc::proc_taskinfo = pidinfo(pid, libc::PROC_PIDTASKINFO, 0)?;
+    Some(Footprint {
+        virtual_size: task.pti_virtual_size,
+        resident_size: task.pti_resident_size,
+        resident_peak: task.pti_resident_size,
+        shared_size: 0,
+    })
+}
+
 pub fn usage(pid: i32) -> Option<Usage> {
     let task: libc::proc_taskinfo = pidinfo(pid, libc::PROC_PIDTASKINFO, 0)?;
     // SAFETY: plain data, valid when zeroed.
@@ -448,6 +476,45 @@ pub fn physical_cores() -> Option<u32> {
 
 pub fn cpu_brand() -> Option<String> {
     sysctl::string_by_name(c"machdep.cpu.brand_string")
+}
+
+pub fn packages() -> Option<u32> {
+    sysctl::by_name::<c_int>(c"hw.packages")
+        .filter(|&packages| packages > 0)
+        .map(|packages| packages as u32)
+}
+
+/// Absent on Apple silicon, which publishes no clock.
+pub fn cpu_frequency() -> Option<u64> {
+    sysctl::by_name::<u64>(c"hw.cpufrequency")
+}
+
+pub fn booted() -> Option<std::time::SystemTime> {
+    let boot = sysctl::by_name::<libc::timeval>(c"kern.boottime")?;
+    let since = std::time::Duration::new(boot.tv_sec as u64, boot.tv_usec as u32 * 1000);
+    Some(std::time::UNIX_EPOCH + since)
+}
+
+pub fn swap() -> Option<Swap> {
+    /// `struct xsw_usage`.
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    struct XswUsage {
+        total: u64,
+        avail: u64,
+        used: u64,
+        pagesize: u32,
+        encrypted: u32,
+    }
+    let usage = sysctl::by_name::<XswUsage>(c"vm.swapusage")?;
+    Some(Swap {
+        total: usage.total,
+        free: usage.avail,
+    })
+}
+
+pub fn max_processes() -> Option<u32> {
+    sysctl::by_name::<c_int>(c"kern.maxproc").map(|n| n as u32)
 }
 
 pub fn host_uuid() -> Option<[u8; 16]> {

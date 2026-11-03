@@ -1,7 +1,10 @@
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 
+use crate::cpu::{self, Feature};
+
 /// Top-level MIB identifiers.
 pub const CTL_KERN: i32 = 1;
+const CTL_VM: i32 = 2;
 pub const CTL_HW: i32 = 6;
 pub const CTL_USER: i32 = 8;
 const CTL_SYSCTL: i32 = 0;
@@ -14,9 +17,14 @@ pub const KERN_OSREV: i32 = 3;
 pub const KERN_VERSION: i32 = 4;
 pub const KERN_HOSTNAME: i32 = 10;
 pub const KERN_ARGMAX: i32 = 8;
+const KERN_MAXPROC: i32 = 6;
+const KERN_BOOTTIME: i32 = 21;
 pub const KERN_OSVERSION: i32 = 65;
 const KERN_OSPRODUCTVERSION: i32 = 138;
 const KERN_OSPRODUCTVERSIONCOMPAT: i32 = 137;
+
+/// `CTL_VM` second-level identifiers.
+const VM_SWAPUSAGE: i32 = 5;
 
 /// `CTL_USER` second-level identifiers.
 pub const USER_CS_PATH: i32 = 1;
@@ -31,11 +39,6 @@ pub const HW_MACHINE_ARCH: i32 = 12;
 pub const HW_CACHELINE: i32 = 16;
 pub const HW_MEMSIZE: i32 = 24;
 pub const HW_AVAILCPU: i32 = 25;
-const HW_OPTIONAL: i32 = 102;
-const HW_CPUTYPE: i32 = 109;
-const HW_CPUSUBTYPE: i32 = 110;
-const HW_CPUFAMILY: i32 = 112;
-const HW_CPUSUBFAMILY: i32 = 113;
 
 const SYSCTL_PROC_TRANSLATED: i32 = 100;
 
@@ -137,8 +140,6 @@ pub fn guest_arch() -> GuestArch {
 }
 
 /// One key's answer.
-///
-/// Numeric guest properties are answered here on every host.
 enum Value {
     Str(String),
     U32(u32),
@@ -162,112 +163,588 @@ impl Value {
     }
 }
 
-/// Keys whose answer is about the **guest**, and so is the same on either host.
-///
-/// Consulted before the host's own `sysctl`, which is the whole reason this module
-/// intercepts on macOS at all.
-fn guest_value(mib: &[i32]) -> Option<Value> {
-    let arch = guest_arch();
-    match mib {
-        [CTL_HW, HW_MACHINE] => Some(Value::Str(arch.machine().to_string())),
-        [CTL_HW, HW_MACHINE_ARCH] => Some(Value::Str(arch.machine_arch().to_string())),
-        [CTL_SYSCTL, SYSCTL_PROC_TRANSLATED] => proc_translated().map(Value::U32),
-        [CTL_HW, HW_OPTIONAL, 144] => Some(Value::U32(u32::from(arch == GuestArch::Arm64))),
-        [CTL_HW, HW_CPUTYPE] => Some(Value::U32(arch.cpu_type() as u32)),
-        // Without a pid, the asking process's own.
-        [CTL_SYSCTL, SYSCTL_PROC_CPUTYPE] if crate::libc_backend::using_builtin() => {
-            Some(Value::U32(arch.cpu_type() as u32))
-        }
-        [CTL_HW, HW_CPUSUBTYPE] => Some(Value::U32(arch.cpu_subtype() as u32)),
-        // The OS the guest believes it is on is a fixed identity, not the host's:
-        // a program comparing `uname`, `kern.osproductversion` and
-        // `_availability_version_check` against one another, or against what it
-        // saw on another host, must get the one answer from all of them.
-        [CTL_KERN, KERN_OSTYPE] => Some(Value::Str("Darwin".to_string())),
-        [CTL_KERN, KERN_OSRELEASE] => Some(Value::Str(release())),
-        [CTL_KERN, KERN_OSREV] => Some(Value::U32(199_506)),
-        [CTL_KERN, KERN_VERSION] => Some(Value::Str(version())),
-        [CTL_KERN, KERN_OSVERSION] => Some(Value::Str(build())),
-        [CTL_KERN, KERN_OSPRODUCTVERSION] | [CTL_KERN, KERN_OSPRODUCTVERSIONCOMPAT] => {
-            Some(Value::Str(product_version()))
-        }
-        _ => None,
-    }
+/// Where a key's answer comes from.
+#[derive(Clone, Copy)]
+enum Source {
+    /// A fact about the guest - its architecture, its processor, the OS it
+    /// believes it runs - answered here whatever the host and backend.
+    Guest(fn() -> Option<Value>),
+    /// A fact about the machine, which a Mac's own kernel answers when
+    /// [`passes_through`] and this module answers everywhere else.
+    Host(fn() -> Option<Value>),
 }
 
-/// Keys answered from this module's own table.
+/// A key this module knows: its name, its MIB, and where its answer comes from.
 ///
-/// Only reached on a host with no Darwin `sysctl` behind it. Deliberately narrow: a
-/// key nobody has needed yet is better as an `ENOENT` naming itself under
+/// A key whose answer is `None` does not exist here, by name or by MIB: Darwin
+/// removes a key rather than answering a placeholder, and a key nobody has
+/// needed yet is better as an `ENOENT` naming itself under
 /// `ROSEMARY_TRACE_SYSCTL` than as a plausible invention.
-fn host_value(mib: &[i32]) -> Option<Value> {
-    match mib {
-        [CTL_KERN, KERN_HOSTNAME] => Some(Value::Str(hostname())),
-        [CTL_KERN, KERN_ARGMAX] => Some(Value::U32(1024 * 1024)),
-        [CTL_HW, HW_MODEL] => Some(Value::Str(model())),
-        [CTL_HW, HW_NCPU] | [CTL_HW, HW_AVAILCPU] => Some(Value::U32(ncpu())),
-        [CTL_HW, HW_BYTEORDER] => Some(Value::U32(1234)),
-        [CTL_HW, HW_PAGESIZE] => Some(Value::U32(page_size())),
-        [CTL_HW, HW_CACHELINE] => Some(Value::U32(128)),
-        [CTL_HW, HW_MEMSIZE] => Some(Value::U64(memsize())),
-        // `_PATH_STDPATH`: where a Darwin userland keeps its utilities, which
-        // is also where a prefix's base puts them. `whereis` searches it.
-        [CTL_USER, USER_CS_PATH] => Some(Value::Str("/usr/bin:/bin:/usr/sbin:/sbin".to_string())),
-        _ => BY_NAME
-            .iter()
-            .find(|(_, known_mib)| *known_mib == mib)
-            .and_then(|(name, _)| named(name)),
+struct Key {
+    name: &'static str,
+    mib: &'static [i32],
+    source: Source,
+}
+
+impl Key {
+    /// Whether this module answers the key, rather than a Mac's kernel.
+    fn is_own(&self) -> bool {
+        matches!(self.source, Source::Guest(_)) || !passes_through()
     }
-}
 
-/// The `kern.*` strings, the same on every host and overridable so a guest can be
-/// told it is on a given release.
-///
-/// The defaults describe macOS 15.0. A program that branches on the OS version needs
-/// a *specific* answer far more than it needs a true one, and the environment is where
-/// that belongs rather than a rebuild.
-///
-/// Read once: [`macos_version`] is derived from it and cached, and the two must
-/// keep agreeing if the variable changes later.
-fn release() -> String {
-    static RELEASE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
-    RELEASE
-        .get_or_init(|| env_or("ROSEMARY_DARWIN_RELEASE", "24.0.0"))
-        .clone()
-}
-
-/// The macOS version the [`release`] above implies, as `(major, minor, patch)`.
-///
-/// One derivation rather than a second constant, because a guest that reads
-/// `kern.osrelease` and a guest that calls `Gestalt` are asking the same
-/// question and must not get two answers. Darwin 20 is macOS 11 and each is one
-/// apart after that; before it, every Darwin was some 10.x.
-pub fn macos_version() -> (i32, i32, i32) {
-    static VERSION: std::sync::OnceLock<(i32, i32, i32)> = std::sync::OnceLock::new();
-    *VERSION.get_or_init(|| {
-        let release = release();
-        let mut parts = release.split('.').map(|p| p.parse::<i32>().unwrap_or(0));
-        let darwin = parts.next().unwrap_or(24);
-        let minor = parts.next().unwrap_or(0);
-        let patch = parts.next().unwrap_or(0);
-        match darwin >= 20 {
-            true => (darwin - 9, minor, patch),
-            false => (10, darwin - 4, minor),
+    fn value(&self) -> Option<Value> {
+        match self.source {
+            Source::Guest(answer) | Source::Host(answer) => answer(),
         }
-    })
-}
-
-/// `kern.osproductversion`, spelled as macOS does: no patch component when it is 0.
-fn product_version() -> String {
-    let (major, minor, patch) = macos_version();
-    match patch {
-        0 => format!("{major}.{minor}"),
-        _ => format!("{major}.{minor}.{patch}"),
     }
 }
 
-fn build() -> String {
-    env_or("ROSEMARY_DARWIN_BUILD", "24A335")
+/// The key this module answers at `mib`.
+fn own_by_mib(mib: &[i32]) -> Option<&'static Key> {
+    KEYS.iter().find(|key| key.mib == mib && key.is_own())
+}
+
+/// The key this module answers as `name`.
+fn own_by_name(name: &str) -> Option<&'static Key> {
+    KEYS.iter().find(|key| key.name == name && key.is_own())
+}
+
+/// Whether a key this module does not answer goes to the host's own `sysctl`.
+///
+/// Only a Mac has one to ask, and only the native libc asks it: builtin is
+/// meant to behave the same on every host, so it keeps to this module's table.
+fn passes_through() -> bool {
+    cfg!(target_os = "macos") && !crate::libc_backend::using_builtin()
+}
+
+/// `CTL_HW` keys Darwin numbers at boot (`OID_AUTO`); these are this module's
+/// numbers for them, from the same range.
+const HW_OPTIONAL: i32 = 102;
+const HW_CPUTYPE: i32 = 109;
+const HW_CPUSUBTYPE: i32 = 110;
+const HW_CPU64BIT_CAPABLE: i32 = 111;
+const HW_CPUFAMILY: i32 = 112;
+const HW_CPUSUBFAMILY: i32 = 113;
+const HW_PHYSICALCPU: i32 = 114;
+const HW_PHYSICALCPU_MAX: i32 = 115;
+const HW_LOGICALCPU: i32 = 116;
+const HW_LOGICALCPU_MAX: i32 = 117;
+const HW_PACKAGES: i32 = 118;
+const HW_CPUFREQUENCY: i32 = 119;
+const HW_ACTIVECPU: i32 = 120;
+
+/// `machdep.cpu` and its leaves, likewise numbered here.
+const MACHDEP_CPU: i32 = 100;
+const MACHDEP_CPU_VENDOR: i32 = 101;
+const MACHDEP_CPU_FAMILY: i32 = 102;
+const MACHDEP_CPU_MODEL: i32 = 103;
+const MACHDEP_CPU_BRAND_STRING: i32 = 104;
+const MACHDEP_CPU_STEPPING: i32 = 105;
+const MACHDEP_CPU_SIGNATURE: i32 = 106;
+const MACHDEP_CPU_FEATURE_BITS: i32 = 107;
+const MACHDEP_CPU_EXTFEATURE_BITS: i32 = 108;
+const MACHDEP_CPU_LEAF7_FEATURE_BITS: i32 = 109;
+const MACHDEP_CPU_EXTMODEL: i32 = 110;
+const MACHDEP_CPU_EXTFAMILY: i32 = 111;
+const MACHDEP_CPU_CORE_COUNT: i32 = 112;
+const MACHDEP_CPU_THREAD_COUNT: i32 = 113;
+
+/// The value of an x86-64 processor's key, which an arm64 guest's Mac does not have.
+fn x86(answer: impl FnOnce() -> Value) -> Option<Value> {
+    (guest_arch() == GuestArch::X86_64).then(answer)
+}
+
+/// An x86 `hw.optional` key: 0 or 1, as XNU's `sysctl_cpu_capability` answers
+/// from the comm page's capability bits, which [`crate::cpu`] also decodes.
+fn x86_feature(feature: Feature) -> Option<Value> {
+    x86(|| Value::U32(u32::from(cpu::has(feature))))
+}
+
+/// An arm64 `hw.optional` key that is the architecture's baseline.
+fn arm64_baseline() -> Option<Value> {
+    (guest_arch() == GuestArch::Arm64).then_some(Value::U32(1))
+}
+
+/// Every key this module knows.
+const KEYS: &[Key] = &[
+    // The OS the guest believes it is on is a fixed identity, not the host's: a
+    // program comparing `uname`, `kern.osproductversion` and
+    // `_availability_version_check` against one another, or against what it
+    // saw on another host, must get the one answer from all of them.
+    Key {
+        name: "kern.ostype",
+        mib: &[CTL_KERN, KERN_OSTYPE],
+        source: Source::Guest(|| Some(Value::Str("Darwin".to_string()))),
+    },
+    Key {
+        name: "kern.osrelease",
+        mib: &[CTL_KERN, KERN_OSRELEASE],
+        source: Source::Guest(|| Some(Value::Str(release()))),
+    },
+    Key {
+        name: "kern.osrevision",
+        mib: &[CTL_KERN, KERN_OSREV],
+        source: Source::Guest(|| Some(Value::U32(KERN_OSREV_VALUE))),
+    },
+    Key {
+        name: "kern.version",
+        mib: &[CTL_KERN, KERN_VERSION],
+        source: Source::Guest(|| Some(Value::Str(version()))),
+    },
+    Key {
+        name: "kern.osversion",
+        mib: &[CTL_KERN, KERN_OSVERSION],
+        source: Source::Guest(|| Some(Value::Str(prefix::release::build().to_string()))),
+    },
+    Key {
+        name: "kern.osproductversion",
+        mib: &[CTL_KERN, KERN_OSPRODUCTVERSION],
+        source: Source::Guest(|| Some(Value::Str(prefix::release::product_version()))),
+    },
+    Key {
+        name: "kern.osproductversioncompat",
+        mib: &[CTL_KERN, KERN_OSPRODUCTVERSIONCOMPAT],
+        source: Source::Guest(|| Some(Value::Str(prefix::release::product_version()))),
+    },
+    Key {
+        name: "kern.hostname",
+        mib: &[CTL_KERN, KERN_HOSTNAME],
+        source: Source::Host(|| Some(Value::Str(hostname()))),
+    },
+    Key {
+        name: "kern.argmax",
+        mib: &[CTL_KERN, KERN_ARGMAX],
+        source: Source::Host(|| Some(Value::U32(ARG_MAX))),
+    },
+    Key {
+        name: "kern.maxproc",
+        mib: &[CTL_KERN, KERN_MAXPROC],
+        source: Source::Host(|| starnix::system::max_processes().map(Value::U32)),
+    },
+    Key {
+        name: "kern.boottime",
+        mib: &[CTL_KERN, KERN_BOOTTIME],
+        source: Source::Host(boot_time),
+    },
+    Key {
+        name: "vm.swapusage",
+        mib: &[CTL_VM, VM_SWAPUSAGE],
+        source: Source::Host(swap_usage),
+    },
+    // `_PATH_STDPATH`: where a Darwin userland keeps its utilities, which is
+    // also where a prefix's base puts them. `whereis` searches it.
+    Key {
+        name: "user.cs_path",
+        mib: &[CTL_USER, USER_CS_PATH],
+        source: Source::Host(|| Some(Value::Str("/usr/bin:/bin:/usr/sbin:/sbin".to_string()))),
+    },
+    Key {
+        name: "sysctl.proc_translated",
+        mib: &[CTL_SYSCTL, SYSCTL_PROC_TRANSLATED],
+        source: Source::Guest(|| proc_translated().map(Value::U32)),
+    },
+    // Without a pid, the asking process's own. A Mac numbers this key at boot,
+    // so its kernel is asked by name.
+    Key {
+        name: "sysctl.proc_cputype",
+        mib: &[CTL_SYSCTL, SYSCTL_PROC_CPUTYPE],
+        source: Source::Host(|| Some(Value::U32(guest_arch().cpu_type() as u32))),
+    },
+    Key {
+        name: "hw.machine",
+        mib: &[CTL_HW, HW_MACHINE],
+        source: Source::Guest(|| Some(Value::Str(guest_arch().machine().to_string()))),
+    },
+    Key {
+        name: "hw.machinearch",
+        mib: &[CTL_HW, HW_MACHINE_ARCH],
+        source: Source::Guest(|| Some(Value::Str(guest_arch().machine_arch().to_string()))),
+    },
+    Key {
+        name: "hw.model",
+        mib: &[CTL_HW, HW_MODEL],
+        source: Source::Host(|| Some(Value::Str(model()))),
+    },
+    Key {
+        name: "hw.ncpu",
+        mib: &[CTL_HW, HW_NCPU],
+        source: Source::Host(|| Some(Value::U32(ncpu()))),
+    },
+    Key {
+        name: "hw.availcpu",
+        mib: &[CTL_HW, HW_AVAILCPU],
+        source: Source::Host(|| Some(Value::U32(ncpu()))),
+    },
+    Key {
+        name: "hw.activecpu",
+        mib: &[CTL_HW, HW_ACTIVECPU],
+        source: Source::Host(|| Some(Value::U32(ncpu()))),
+    },
+    Key {
+        name: "hw.logicalcpu",
+        mib: &[CTL_HW, HW_LOGICALCPU],
+        source: Source::Host(|| Some(Value::U32(ncpu()))),
+    },
+    Key {
+        name: "hw.logicalcpu_max",
+        mib: &[CTL_HW, HW_LOGICALCPU_MAX],
+        source: Source::Host(|| Some(Value::U32(configured_cpus()))),
+    },
+    Key {
+        name: "hw.physicalcpu",
+        mib: &[CTL_HW, HW_PHYSICALCPU],
+        source: Source::Host(|| Some(Value::U32(physical_cpus()))),
+    },
+    Key {
+        name: "hw.physicalcpu_max",
+        mib: &[CTL_HW, HW_PHYSICALCPU_MAX],
+        source: Source::Host(|| Some(Value::U32(physical_cpus()))),
+    },
+    Key {
+        name: "hw.packages",
+        mib: &[CTL_HW, HW_PACKAGES],
+        source: Source::Host(|| starnix::system::packages().map(Value::U32)),
+    },
+    Key {
+        name: "machdep.cpu.core_count",
+        mib: &[CTL_MACHDEP, MACHDEP_CPU, MACHDEP_CPU_CORE_COUNT],
+        source: Source::Host(|| Some(Value::U32(physical_cpus()))),
+    },
+    Key {
+        name: "machdep.cpu.thread_count",
+        mib: &[CTL_MACHDEP, MACHDEP_CPU, MACHDEP_CPU_THREAD_COUNT],
+        source: Source::Host(|| Some(Value::U32(ncpu()))),
+    },
+    Key {
+        name: "hw.byteorder",
+        mib: &[CTL_HW, HW_BYTEORDER],
+        source: Source::Host(|| Some(Value::U32(LITTLE_ENDIAN))),
+    },
+    Key {
+        name: "hw.pagesize",
+        mib: &[CTL_HW, HW_PAGESIZE],
+        source: Source::Host(|| Some(Value::U32(page_size()))),
+    },
+    Key {
+        name: "hw.memsize",
+        mib: &[CTL_HW, HW_MEMSIZE],
+        source: Source::Host(|| Some(Value::U64(memsize()))),
+    },
+    Key {
+        name: "hw.cachelinesize",
+        mib: &[CTL_HW, HW_CACHELINE],
+        source: Source::Guest(|| Some(Value::U32(cache_line_size()))),
+    },
+    Key {
+        name: "hw.cputype",
+        mib: &[CTL_HW, HW_CPUTYPE],
+        source: Source::Guest(|| Some(Value::U32(guest_arch().cpu_type() as u32))),
+    },
+    Key {
+        name: "hw.cpusubtype",
+        mib: &[CTL_HW, HW_CPUSUBTYPE],
+        source: Source::Guest(|| Some(Value::U32(guest_arch().cpu_subtype() as u32))),
+    },
+    // Both guest architectures are 64-bit. A caller that reads a missing key
+    // as 0 decides it is on 32-bit i386.
+    Key {
+        name: "hw.cpu64bit_capable",
+        mib: &[CTL_HW, HW_CPU64BIT_CAPABLE],
+        source: Source::Guest(|| Some(Value::U32(1))),
+    },
+    // `CPUFAMILY_UNKNOWN`, which XNU itself answers for a part it does not list.
+    Key {
+        name: "hw.cpufamily",
+        mib: &[CTL_HW, HW_CPUFAMILY],
+        source: Source::Host(|| Some(Value::U32(0))),
+    },
+    Key {
+        name: "hw.cpusubfamily",
+        mib: &[CTL_HW, HW_CPUSUBFAMILY],
+        source: Source::Host(|| Some(Value::U32(0))),
+    },
+    // Apple silicon publishes no clock, so only an x86-64 guest has one.
+    Key {
+        name: "hw.cpufrequency",
+        mib: &[CTL_HW, HW_CPUFREQUENCY],
+        source: Source::Guest(|| {
+            let hz = cpu::nominal_frequency().or_else(starnix::system::cpu_frequency);
+            hz.and_then(|hz| x86(|| Value::U64(hz)))
+        }),
+    },
+    Key {
+        name: "machdep.cpu.brand_string",
+        mib: &[CTL_MACHDEP, MACHDEP_CPU, MACHDEP_CPU_BRAND_STRING],
+        source: Source::Guest(|| brand_string().map(Value::Str)),
+    },
+    Key {
+        name: "machdep.cpu.vendor",
+        mib: &[CTL_MACHDEP, MACHDEP_CPU, MACHDEP_CPU_VENDOR],
+        source: Source::Guest(|| x86(|| Value::Str(cpu::vendor()))),
+    },
+    Key {
+        name: "machdep.cpu.family",
+        mib: &[CTL_MACHDEP, MACHDEP_CPU, MACHDEP_CPU_FAMILY],
+        source: Source::Guest(|| x86(|| Value::U32(cpu::family()))),
+    },
+    Key {
+        name: "machdep.cpu.model",
+        mib: &[CTL_MACHDEP, MACHDEP_CPU, MACHDEP_CPU_MODEL],
+        source: Source::Guest(|| x86(|| Value::U32(cpu::model()))),
+    },
+    Key {
+        name: "machdep.cpu.extmodel",
+        mib: &[CTL_MACHDEP, MACHDEP_CPU, MACHDEP_CPU_EXTMODEL],
+        source: Source::Guest(|| x86(|| Value::U32(cpu::extended_model()))),
+    },
+    Key {
+        name: "machdep.cpu.extfamily",
+        mib: &[CTL_MACHDEP, MACHDEP_CPU, MACHDEP_CPU_EXTFAMILY],
+        source: Source::Guest(|| x86(|| Value::U32(cpu::extended_family()))),
+    },
+    Key {
+        name: "machdep.cpu.stepping",
+        mib: &[CTL_MACHDEP, MACHDEP_CPU, MACHDEP_CPU_STEPPING],
+        source: Source::Guest(|| x86(|| Value::U32(cpu::stepping()))),
+    },
+    Key {
+        name: "machdep.cpu.signature",
+        mib: &[CTL_MACHDEP, MACHDEP_CPU, MACHDEP_CPU_SIGNATURE],
+        source: Source::Guest(|| x86(|| Value::U32(cpu::signature()))),
+    },
+    Key {
+        name: "machdep.cpu.feature_bits",
+        mib: &[CTL_MACHDEP, MACHDEP_CPU, MACHDEP_CPU_FEATURE_BITS],
+        source: Source::Guest(|| x86(|| Value::U64(cpu::feature_bits()))),
+    },
+    Key {
+        name: "machdep.cpu.extfeature_bits",
+        mib: &[CTL_MACHDEP, MACHDEP_CPU, MACHDEP_CPU_EXTFEATURE_BITS],
+        source: Source::Guest(|| x86(|| Value::U64(cpu::extfeature_bits()))),
+    },
+    Key {
+        name: "machdep.cpu.leaf7_feature_bits",
+        mib: &[CTL_MACHDEP, MACHDEP_CPU, MACHDEP_CPU_LEAF7_FEATURE_BITS],
+        source: Source::Guest(|| x86(|| Value::U64(cpu::leaf7_feature_bits()))),
+    },
+    // Floating point is in both architectures' baseline.
+    Key {
+        name: "hw.optional.floatingpoint",
+        mib: &[CTL_HW, HW_OPTIONAL, 101],
+        source: Source::Guest(|| Some(Value::U32(1))),
+    },
+    Key {
+        name: "hw.optional.arm64",
+        mib: &[CTL_HW, HW_OPTIONAL, 144],
+        source: Source::Guest(|| Some(Value::U32(u32::from(guest_arch() == GuestArch::Arm64)))),
+    },
+    Key {
+        name: "hw.optional.neon",
+        mib: &[CTL_HW, HW_OPTIONAL, 131],
+        source: Source::Guest(arm64_baseline),
+    },
+    Key {
+        name: "hw.optional.AdvSIMD",
+        mib: &[CTL_HW, HW_OPTIONAL, 132],
+        source: Source::Guest(arm64_baseline),
+    },
+    Key {
+        name: "hw.optional.x86_64",
+        mib: &[CTL_HW, HW_OPTIONAL, 100],
+        source: Source::Guest(|| x86_feature(Feature::LongMode)),
+    },
+    Key {
+        name: "hw.optional.mmx",
+        mib: &[CTL_HW, HW_OPTIONAL, 102],
+        source: Source::Guest(|| x86_feature(Feature::Mmx)),
+    },
+    Key {
+        name: "hw.optional.sse",
+        mib: &[CTL_HW, HW_OPTIONAL, 103],
+        source: Source::Guest(|| x86_feature(Feature::Sse)),
+    },
+    Key {
+        name: "hw.optional.sse2",
+        mib: &[CTL_HW, HW_OPTIONAL, 104],
+        source: Source::Guest(|| x86_feature(Feature::Sse2)),
+    },
+    Key {
+        name: "hw.optional.sse3",
+        mib: &[CTL_HW, HW_OPTIONAL, 105],
+        source: Source::Guest(|| x86_feature(Feature::Sse3)),
+    },
+    Key {
+        name: "hw.optional.supplementalsse3",
+        mib: &[CTL_HW, HW_OPTIONAL, 106],
+        source: Source::Guest(|| x86_feature(Feature::Ssse3)),
+    },
+    Key {
+        name: "hw.optional.sse4_1",
+        mib: &[CTL_HW, HW_OPTIONAL, 107],
+        source: Source::Guest(|| x86_feature(Feature::Sse4_1)),
+    },
+    Key {
+        name: "hw.optional.sse4_2",
+        mib: &[CTL_HW, HW_OPTIONAL, 108],
+        source: Source::Guest(|| x86_feature(Feature::Sse4_2)),
+    },
+    Key {
+        name: "hw.optional.aes",
+        mib: &[CTL_HW, HW_OPTIONAL, 109],
+        source: Source::Guest(|| x86_feature(Feature::Aes)),
+    },
+    Key {
+        name: "hw.optional.avx1_0",
+        mib: &[CTL_HW, HW_OPTIONAL, 111],
+        source: Source::Guest(|| x86_feature(Feature::Avx)),
+    },
+    Key {
+        name: "hw.optional.rdrand",
+        mib: &[CTL_HW, HW_OPTIONAL, 112],
+        source: Source::Guest(|| x86_feature(Feature::Rdrand)),
+    },
+    Key {
+        name: "hw.optional.f16c",
+        mib: &[CTL_HW, HW_OPTIONAL, 113],
+        source: Source::Guest(|| x86_feature(Feature::F16c)),
+    },
+    Key {
+        name: "hw.optional.enfstrg",
+        mib: &[CTL_HW, HW_OPTIONAL, 114],
+        source: Source::Guest(|| x86_feature(Feature::Erms)),
+    },
+    Key {
+        name: "hw.optional.fma",
+        mib: &[CTL_HW, HW_OPTIONAL, 115],
+        source: Source::Guest(|| x86_feature(Feature::Fma)),
+    },
+    Key {
+        name: "hw.optional.avx2_0",
+        mib: &[CTL_HW, HW_OPTIONAL, 116],
+        source: Source::Guest(|| x86_feature(Feature::Avx2)),
+    },
+    Key {
+        name: "hw.optional.bmi1",
+        mib: &[CTL_HW, HW_OPTIONAL, 117],
+        source: Source::Guest(|| x86_feature(Feature::Bmi1)),
+    },
+    Key {
+        name: "hw.optional.bmi2",
+        mib: &[CTL_HW, HW_OPTIONAL, 118],
+        source: Source::Guest(|| x86_feature(Feature::Bmi2)),
+    },
+    Key {
+        name: "hw.optional.rtm",
+        mib: &[CTL_HW, HW_OPTIONAL, 119],
+        source: Source::Guest(|| x86_feature(Feature::Rtm)),
+    },
+    Key {
+        name: "hw.optional.hle",
+        mib: &[CTL_HW, HW_OPTIONAL, 120],
+        source: Source::Guest(|| x86_feature(Feature::Hle)),
+    },
+    Key {
+        name: "hw.optional.adx",
+        mib: &[CTL_HW, HW_OPTIONAL, 121],
+        source: Source::Guest(|| x86_feature(Feature::Adx)),
+    },
+    Key {
+        name: "hw.optional.avx512f",
+        mib: &[CTL_HW, HW_OPTIONAL, 124],
+        source: Source::Guest(|| x86_feature(Feature::Avx512f)),
+    },
+    Key {
+        name: "hw.optional.avx512cd",
+        mib: &[CTL_HW, HW_OPTIONAL, 125],
+        source: Source::Guest(|| x86_feature(Feature::Avx512cd)),
+    },
+    Key {
+        name: "hw.optional.avx512dq",
+        mib: &[CTL_HW, HW_OPTIONAL, 126],
+        source: Source::Guest(|| x86_feature(Feature::Avx512dq)),
+    },
+    Key {
+        name: "hw.optional.avx512bw",
+        mib: &[CTL_HW, HW_OPTIONAL, 127],
+        source: Source::Guest(|| x86_feature(Feature::Avx512bw)),
+    },
+    Key {
+        name: "hw.optional.avx512vl",
+        mib: &[CTL_HW, HW_OPTIONAL, 128],
+        source: Source::Guest(|| x86_feature(Feature::Avx512vl)),
+    },
+    Key {
+        name: "hw.optional.avx512ifma",
+        mib: &[CTL_HW, HW_OPTIONAL, 129],
+        source: Source::Guest(|| x86_feature(Feature::Avx512ifma)),
+    },
+    Key {
+        name: "hw.optional.avx512vbmi",
+        mib: &[CTL_HW, HW_OPTIONAL, 130],
+        source: Source::Guest(|| x86_feature(Feature::Avx512vbmi)),
+    },
+];
+
+/// `kern.osrevision`: `BSD`'s `199506`, which XNU still reports.
+const KERN_OSREV_VALUE: u32 = 199_506;
+
+/// `ARG_MAX` in `<sys/syslimits.h>`.
+const ARG_MAX: u32 = 1024 * 1024;
+
+/// `hw.byteorder`'s spelling of little-endian, as `<machine/endian.h>` has it.
+const LITTLE_ENDIAN: u32 = 1234;
+
+/// `machdep.cpu.brand_string`: the x86-64 guest's from `CPUID`, an arm64 one's
+/// from the host, which is the only processor it can name.
+fn brand_string() -> Option<String> {
+    match guest_arch() {
+        GuestArch::X86_64 => Some(cpu::brand()),
+        GuestArch::Arm64 => starnix::system::cpu_brand(),
+    }
+}
+
+/// `hw.cachelinesize`: what `CPUID` says for an x86-64 guest, and Apple
+/// silicon's 128 bytes for an arm64 one.
+fn cache_line_size() -> u32 {
+    const APPLE_SILICON_LINE_SIZE: u32 = 128;
+    match guest_arch() {
+        GuestArch::X86_64 => cpu::cache_line_size(),
+        GuestArch::Arm64 => APPLE_SILICON_LINE_SIZE,
+    }
+}
+
+/// `kern.boottime`: a `struct timeval`, padded to its 16 bytes.
+fn boot_time() -> Option<Value> {
+    let since = starnix::system::boot_time()?
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?;
+    let mut bytes = (since.as_secs() as i64).to_ne_bytes().to_vec();
+    bytes.extend_from_slice(&(since.subsec_micros() as i32).to_ne_bytes());
+    bytes.resize(size_of::<libc::timeval>().max(16), 0);
+    Some(Value::Bytes(bytes))
+}
+
+/// `vm.swapusage`: a `struct xsw_usage`.
+fn swap_usage() -> Option<Value> {
+    let swap = starnix::system::swap()?;
+    let mut bytes = Vec::with_capacity(32);
+    for field in [swap.total, swap.free, swap.total - swap.free] {
+        bytes.extend_from_slice(&field.to_ne_bytes());
+    }
+    bytes.extend_from_slice(&page_size().to_ne_bytes());
+    // `xsu_encrypted`, which this layer has no way to know of the host's swap.
+    bytes.extend_from_slice(&0u32.to_ne_bytes());
+    Some(Value::Bytes(bytes))
+}
+
+/// The `kern.*` release strings, the same on every host; see [`prefix::release`].
+fn release() -> String {
+    prefix::release::darwin().to_string()
+}
+
+/// The macOS version the guest is told it runs, as `(major, minor, patch)`.
+pub fn macos_version() -> (i32, i32, i32) {
+    prefix::release::macos_version()
 }
 
 fn version() -> String {
@@ -310,7 +787,21 @@ pub(crate) fn ncpu() -> u32 {
     std::thread::available_parallelism().map_or(1, |n| n.get() as u32)
 }
 
-fn page_size() -> u32 {
+/// Every processor the machine has, online or not.
+pub(crate) fn configured_cpus() -> u32 {
+    // SAFETY: `sysconf` reads a count and touches no memory of ours.
+    let configured = unsafe { libc::sysconf(libc::_SC_NPROCESSORS_CONF) };
+    u32::try_from(configured).unwrap_or(0).max(ncpu())
+}
+
+/// Cores, as opposed to SMT threads. A host that cannot tell the two apart
+/// answers what a machine without SMT would.
+pub(crate) fn physical_cpus() -> u32 {
+    let logical = ncpu();
+    starnix::system::physical_cores().map_or(logical, |cores| cores.min(logical))
+}
+
+pub(crate) fn page_size() -> u32 {
     (unsafe { libc::sysconf(libc::_SC_PAGESIZE) }).max(4096) as u32
 }
 
@@ -409,25 +900,19 @@ unsafe extern "C" fn sysctl(
     // SAFETY: the caller states `name` holds `namelen` integers.
     let mib = unsafe { std::slice::from_raw_parts(name, namelen as usize) };
 
-    // Not the host's: on a Mac this number is in the range the kernel hands
-    // out to dynamically registered keys, so forwarding it would answer some
-    // other key.
-    if mib == [CTL_SYSCTL, SYSCTL_PROC_TRANSLATED] && proc_translated().is_none() {
-        crate::errno::set(libc::ENOENT);
-        return -1;
-    }
     // SAFETY: every argument is the caller's, forwarded unchanged.
     if let Some(rc) = unsafe { describe_tree(mib, oldp, oldlenp, newp, newlen) } {
         return rc;
     }
-    if let Some(value) = guest_value(mib) {
-        // SAFETY: the caller's own `oldp`/`oldlenp`, unmodified.
-        return unsafe { copy_out(&value, oldp, oldlenp) };
+    if let Some(key) = own_by_mib(mib) {
+        // SAFETY: the caller's own `oldp`/`oldlenp`.
+        return unsafe { answer(key.value(), oldp, oldlenp) };
     }
-    if crate::libc_backend::using_builtin()
+    if !passes_through()
         && let Some(answer) = process_value(mib)
     {
         return match answer {
+            // SAFETY: the caller's own `oldp`/`oldlenp`.
             Ok(bytes) => unsafe { copy_out(&Value::Bytes(bytes), oldp, oldlenp) },
             Err(error) => {
                 crate::errno::set(error);
@@ -435,8 +920,40 @@ unsafe extern "C" fn sysctl(
             }
         };
     }
-    // SAFETY: every argument is the caller's, forwarded unchanged.
-    unsafe { fallback(mib, oldp, oldlenp, newp, newlen) }
+    #[cfg(target_os = "macos")]
+    if passes_through() {
+        // SAFETY: the host's own `sysctl`, given the caller's arguments unchanged.
+        return unsafe {
+            libc::sysctl(
+                mib.as_ptr() as *mut libc::c_int,
+                mib.len() as libc::c_uint,
+                oldp,
+                oldlenp,
+                newp,
+                newlen,
+            )
+        };
+    }
+    say_unanswered(&format_args!("mib {mib:?}"));
+    crate::errno::set(libc::ENOENT);
+    -1
+}
+
+/// Copy out a key's value, or fail with `ENOENT` for a key that does not exist
+/// here.
+///
+/// # Safety
+///
+/// As [`copy_out`].
+unsafe fn answer(value: Option<Value>, oldp: *mut libc::c_void, oldlenp: *mut libc::size_t) -> i32 {
+    match value {
+        // SAFETY: the caller's own `oldp`/`oldlenp`.
+        Some(value) => unsafe { copy_out(&value, oldp, oldlenp) },
+        None => {
+            crate::errno::set(libc::ENOENT);
+            -1
+        }
+    }
 }
 
 /// `CTL_SYSCTL` nodes that describe the tree itself. The `sysctl` command
@@ -453,30 +970,12 @@ const CTLTYPE_QUAD: u32 = 4;
 const CTLTYPE_OPAQUE: u32 = 5;
 const CTLFLAG_RD: u32 = 0x8000_0000;
 
-/// Whether a key this module does not answer goes to the host's own `sysctl`.
-///
-/// Only a Mac has one to ask, and only the native libc asks it: builtin is
-/// meant to behave the same on every host, so it keeps to this module's table.
-fn passes_through() -> bool {
-    cfg!(target_os = "macos") && !crate::libc_backend::using_builtin()
-}
-
-/// A leaf this module answers by itself, without asking a host kernel.
-fn own_value(mib: &[i32]) -> Option<Value> {
-    if let Some(value) = guest_value(mib) {
-        return Some(value);
-    }
-    match passes_through() {
-        true => None,
-        false => host_value(mib),
-    }
-}
-
-/// The tree-introspection nodes, for the keys [`own_value`] answers.
+/// The tree-introspection nodes, for the keys this module answers.
 ///
 /// `None` for anything else, which a Mac's kernel then answers about its own
-/// keys when [`passes_through`]. A key that is absent here is absent from these nodes too, so the
-/// `sysctl` command reports it as an unknown OID rather than printing a value.
+/// keys when [`passes_through`]. A key with no value is absent from these
+/// nodes too, so the `sysctl` command reports it as an unknown OID rather
+/// than printing a value.
 ///
 /// # Safety
 ///
@@ -497,22 +996,16 @@ unsafe fn describe_tree(
             let bytes = unsafe { std::slice::from_raw_parts(newp as *const u8, newlen) };
             // The command passes `strlen`, but a terminator is harmless.
             let name = bytes.split(|&b| b == 0).next().unwrap_or_default();
-            let name = std::str::from_utf8(name).ok()?;
-            if name == "sysctl.proc_translated" && proc_translated().is_none() {
-                crate::errno::set(libc::ENOENT);
-                return Some(-1);
-            }
-            let (_, oid) = BY_NAME.iter().find(|(known, _)| *known == name)?;
-            own_value(oid)?;
-            Value::Bytes(oid.iter().flat_map(|n| n.to_ne_bytes()).collect())
+            let key = own_by_name(std::str::from_utf8(name).ok()?)?;
+            key.value()
+                .map(|_| Value::Bytes(key.mib.iter().flat_map(|n| n.to_ne_bytes()).collect()))
         }
         [CTL_SYSCTL, SYSCTL_NAME, ref oid @ ..] => {
-            let (name, _) = BY_NAME.iter().find(|(_, known)| *known == oid)?;
-            own_value(oid)?;
-            Value::Str(name.to_string())
+            let key = own_by_mib(oid)?;
+            key.value().map(|_| Value::Str(key.name.to_string()))
         }
-        [CTL_SYSCTL, SYSCTL_OIDFMT, ref oid @ ..] => {
-            let (kind, format) = match own_value(oid)? {
+        [CTL_SYSCTL, SYSCTL_OIDFMT, ref oid @ ..] => own_by_mib(oid)?.value().map(|value| {
+            let (kind, format) = match value {
                 Value::Str(_) => (CTLTYPE_STRING, "A"),
                 Value::U32(_) => (CTLTYPE_INT, "I"),
                 Value::U64(_) => (CTLTYPE_QUAD, "Q"),
@@ -522,59 +1015,11 @@ unsafe fn describe_tree(
             bytes.extend_from_slice(format.as_bytes());
             bytes.push(0);
             Value::Bytes(bytes)
-        }
+        }),
         _ => return None,
     };
     // SAFETY: the caller's own `oldp`/`oldlenp`.
-    Some(unsafe { copy_out(&answer, oldp, oldlenp) })
-}
-
-/// Everything [`guest_value`] did not claim.
-///
-/// # Safety
-///
-/// As [`sysctl`].
-unsafe fn fallback(
-    mib: &[libc::c_int],
-    oldp: *mut libc::c_void,
-    oldlenp: *mut libc::size_t,
-    newp: *mut libc::c_void,
-    newlen: libc::size_t,
-) -> i32 {
-    #[cfg(target_os = "macos")]
-    if passes_through() {
-        // SAFETY: the host's own `sysctl`, given the caller's arguments unchanged.
-        return unsafe {
-            libc::sysctl(
-                mib.as_ptr() as *mut libc::c_int,
-                mib.len() as libc::c_uint,
-                oldp,
-                oldlenp,
-                newp,
-                newlen,
-            )
-        };
-    }
-    let _ = (newp, newlen);
-    match host_value(mib) {
-        // SAFETY: the caller's own `oldp`/`oldlenp`.
-        Some(value) => unsafe { copy_out(&value, oldp, oldlenp) },
-        None => {
-            if let Some(answer) = process_value(mib) {
-                return match answer {
-                    // SAFETY: the caller's own `oldp`/`oldlenp`.
-                    Ok(bytes) => unsafe { copy_out(&Value::Bytes(bytes), oldp, oldlenp) },
-                    Err(errno) => {
-                        crate::errno::set(errno);
-                        -1
-                    }
-                };
-            }
-            say_unanswered(&format_args!("mib {mib:?}"));
-            crate::errno::set(libc::ENOENT);
-            -1
-        }
-    }
+    Some(unsafe { self::answer(answer, oldp, oldlenp) })
 }
 
 /// `CTL_KERN` keys that describe processes.
@@ -620,153 +1065,6 @@ fn process_value(mib: &[i32]) -> Option<Result<Vec<u8>, i32>> {
     }
 }
 
-/// The names this module knows and their Darwin MIBs.
-const BY_NAME: &[(&str, &[i32])] = &[
-    ("kern.ostype", &[CTL_KERN, KERN_OSTYPE]),
-    ("kern.osrelease", &[CTL_KERN, KERN_OSRELEASE]),
-    ("kern.osrevision", &[CTL_KERN, KERN_OSREV]),
-    ("kern.version", &[CTL_KERN, KERN_VERSION]),
-    ("kern.osversion", &[CTL_KERN, KERN_OSVERSION]),
-    ("kern.hostname", &[CTL_KERN, KERN_HOSTNAME]),
-    ("kern.argmax", &[CTL_KERN, KERN_ARGMAX]),
-    ("kern.osproductversion", &[CTL_KERN, KERN_OSPRODUCTVERSION]),
-    (
-        "kern.osproductversioncompat",
-        &[CTL_KERN, KERN_OSPRODUCTVERSIONCOMPAT],
-    ),
-    (
-        "sysctl.proc_translated",
-        &[CTL_SYSCTL, SYSCTL_PROC_TRANSLATED],
-    ),
-    // Native macOS numbers this key at boot; builtin libc uses its own MIB.
-    ("sysctl.proc_cputype", &[CTL_SYSCTL, SYSCTL_PROC_CPUTYPE]),
-    ("hw.machine", &[CTL_HW, HW_MACHINE]),
-    ("hw.machinearch", &[CTL_HW, HW_MACHINE_ARCH]),
-    ("hw.model", &[CTL_HW, HW_MODEL]),
-    ("hw.ncpu", &[CTL_HW, HW_NCPU]),
-    ("hw.availcpu", &[CTL_HW, HW_AVAILCPU]),
-    ("hw.byteorder", &[CTL_HW, HW_BYTEORDER]),
-    ("hw.pagesize", &[CTL_HW, HW_PAGESIZE]),
-    ("hw.cachelinesize", &[CTL_HW, HW_CACHELINE]),
-    ("hw.memsize", &[CTL_HW, HW_MEMSIZE]),
-    ("hw.optional.arm64", &[CTL_HW, HW_OPTIONAL, 144]),
-    ("hw.cputype", &[CTL_HW, HW_CPUTYPE]),
-    ("hw.cpusubtype", &[CTL_HW, HW_CPUSUBTYPE]),
-    ("hw.cpufamily", &[CTL_HW, HW_CPUFAMILY]),
-    ("hw.cpusubfamily", &[CTL_HW, HW_CPUSUBFAMILY]),
-    ("machdep.cpu.brand_string", &[CTL_MACHDEP, 100, 104]),
-    ("hw.optional.sse", &[CTL_HW, HW_OPTIONAL, 103]),
-    ("hw.optional.sse2", &[CTL_HW, HW_OPTIONAL, 104]),
-    ("hw.optional.floatingpoint", &[CTL_HW, HW_OPTIONAL, 101]),
-    ("hw.optional.neon", &[CTL_HW, HW_OPTIONAL, 131]),
-    // Darwin has no AdvSIMD MIB on this host; Linux needs a private ID for
-    // name-to-MIB round trips of the alias it emulates.
-    #[cfg(not(target_os = "macos"))]
-    ("hw.optional.AdvSIMD", &[CTL_HW, HW_OPTIONAL, 0x7fff_0001]),
-    ("hw.optional.sse3", &[CTL_HW, HW_OPTIONAL, 105]),
-    ("hw.optional.supplementalsse3", &[CTL_HW, HW_OPTIONAL, 106]),
-    ("hw.optional.sse4_1", &[CTL_HW, HW_OPTIONAL, 107]),
-    ("hw.optional.sse4_2", &[CTL_HW, HW_OPTIONAL, 108]),
-    ("hw.optional.avx1_0", &[CTL_HW, HW_OPTIONAL, 111]),
-    ("hw.optional.avx2_0", &[CTL_HW, HW_OPTIONAL, 116]),
-    ("hw.optional.avx512f", &[CTL_HW, HW_OPTIONAL, 124]),
-    ("hw.optional.f16c", &[CTL_HW, HW_OPTIONAL, 113]),
-    ("hw.optional.fma", &[CTL_HW, HW_OPTIONAL, 115]),
-    ("user.cs_path", &[CTL_USER, USER_CS_PATH]),
-];
-
-/// Values supplied on non-macOS hosts after resolving a name or MIB.
-fn named(name: &str) -> Option<Value> {
-    match name {
-        "machdep.cpu.brand_string" => Some(Value::Str(brand_string())),
-        "hw.cpufamily" | "hw.cpusubfamily" => Some(Value::U32(0)),
-        // Both guest architectures are 64-bit. A caller that reads a missing
-        // key as 0 decides it is on 32-bit i386.
-        "hw.cpu64bit_capable" => Some(Value::U32(1)),
-        _ => optional_feature(name),
-    }
-}
-
-fn optional_feature(name: &str) -> Option<Value> {
-    // FIXME (ACCURACY): make this match what `cpuid` reports
-
-    let x86 = guest_arch() == GuestArch::X86_64;
-    let arm = !x86;
-    let present = match name {
-        // SSE and SSE2 are the x86-64 baseline; no such CPU lacks them.
-        "hw.optional.sse" | "hw.optional.sse2" | "hw.optional.floatingpoint" => x86,
-        // NEON is the arm64 baseline, likewise.
-        "hw.optional.AdvSIMD" | "hw.optional.neon" => arm,
-        "hw.optional.sse3" => x86 && host_has("sse3"),
-        "hw.optional.supplementalsse3" => x86 && host_has("ssse3"),
-        "hw.optional.sse4_1" => x86 && host_has("sse4.1"),
-        "hw.optional.sse4_2" => x86 && host_has("sse4.2"),
-        "hw.optional.avx1_0" => x86 && host_has("avx"),
-        "hw.optional.avx2_0" => x86 && host_has("avx2"),
-        "hw.optional.avx512f" => x86 && host_has("avx512f"),
-        "hw.optional.f16c" => x86 && host_has("f16c"),
-        "hw.optional.fma" => x86 && host_has("fma"),
-        // The arm64 feature names, none of which is a baseline. Answered only
-        // on a host whose own instructions the guest runs, which for an arm64
-        // guest means an arm64 host - and this crate cannot ask an aarch64 CPU
-        // for them portably, so they are absent rather than claimed.
-        _ if name.starts_with("hw.optional.arm.") => false,
-        _ => return None,
-    };
-    // Absent, not zero: Darwin removes the key rather than answering `0`, and a
-    // caller that checks for the key's *existence* - which is the documented way
-    // to read these - would read a zero as "present".
-    present.then_some(Value::U32(1))
-}
-
-/// Whether the guest's instructions are this CPU's own, and so whether
-/// `hw.optional` may report what this CPU has. See [`optional_feature`].
-static RUNS_HOST_INSTRUCTIONS: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
-
-/// Say that the program executes this CPU's instructions directly, which is what
-/// the native backend does and the emulated one does not.
-pub fn set_runs_host_instructions(native: bool) {
-    RUNS_HOST_INSTRUCTIONS.store(native, Ordering::Release);
-}
-
-fn host_has(feature: &str) -> bool {
-    if !RUNS_HOST_INSTRUCTIONS.load(Ordering::Acquire) {
-        return false;
-    }
-    #[cfg(target_arch = "x86_64")]
-    {
-        return match feature {
-            "sse3" => std::arch::is_x86_feature_detected!("sse3"),
-            "ssse3" => std::arch::is_x86_feature_detected!("ssse3"),
-            "sse4.1" => std::arch::is_x86_feature_detected!("sse4.1"),
-            "sse4.2" => std::arch::is_x86_feature_detected!("sse4.2"),
-            "avx" => std::arch::is_x86_feature_detected!("avx"),
-            "avx2" => std::arch::is_x86_feature_detected!("avx2"),
-            "avx512f" => std::arch::is_x86_feature_detected!("avx512f"),
-            "f16c" => std::arch::is_x86_feature_detected!("f16c"),
-            "fma" => std::arch::is_x86_feature_detected!("fma"),
-            _ => false,
-        };
-    }
-    #[cfg(not(target_arch = "x86_64"))]
-    {
-        let _ = feature;
-        false
-    }
-}
-
-/// `machdep.cpu.brand_string` - the CPU's marketing name.
-fn brand_string() -> String {
-    env_or_else("ROSEMARY_CPU_BRAND", || {
-        starnix::system::cpu_brand().unwrap_or_else(|| "Unknown CPU".to_string())
-    })
-}
-
-fn env_or_else(key: &str, fallback: impl FnOnce() -> String) -> String {
-    std::env::var(key).unwrap_or_else(|_| fallback())
-}
-
 /// `int sysctlbyname(const char *, void *, size_t *, void *, size_t)`.
 ///
 /// # Safety
@@ -784,61 +1082,21 @@ unsafe extern "C" fn sysctlbyname(
         return -1;
     }
     // SAFETY: the caller states `name` is NUL-terminated.
-    let key = unsafe { std::ffi::CStr::from_ptr(name) }
-        .to_string_lossy()
-        .into_owned();
-
-    #[cfg(target_os = "macos")]
-    if key == "sysctl.proc_cputype" && !crate::libc_backend::using_builtin() {
-        return unsafe { by_name_fallback(&key, oldp, oldlenp, newp, newlen) };
+    let key = unsafe { std::ffi::CStr::from_ptr(name) };
+    let spelled = key.to_string_lossy();
+    if let Some(key) = own_by_name(&spelled) {
+        // SAFETY: the caller's own `oldp`/`oldlenp`.
+        return unsafe { answer(key.value(), oldp, oldlenp) };
     }
-    if let Some((_, mib)) = BY_NAME.iter().find(|(n, _)| *n == key) {
-        // SAFETY: `mib` is a static slice of the right length; the rest is the
-        // caller's.
-        return unsafe {
-            sysctl(
-                mib.as_ptr(),
-                mib.len() as libc::c_uint,
-                oldp,
-                oldlenp,
-                newp,
-                newlen,
-            )
-        };
-    }
-    // SAFETY: every argument is the caller's, forwarded unchanged.
-    unsafe { by_name_fallback(&key, oldp, oldlenp, newp, newlen) }
-}
-
-/// # Safety
-///
-/// As [`sysctlbyname`].
-unsafe fn by_name_fallback(
-    key: &str,
-    oldp: *mut libc::c_void,
-    oldlenp: *mut libc::size_t,
-    newp: *mut libc::c_void,
-    newlen: libc::size_t,
-) -> i32 {
     #[cfg(target_os = "macos")]
     if passes_through() {
-        let Ok(c) = std::ffi::CString::new(key) else {
-            crate::errno::set(libc::EINVAL);
-            return -1;
-        };
-        // SAFETY: `c` outlives the call; the rest is the caller's.
-        return unsafe { libc::sysctlbyname(c.as_ptr(), oldp, oldlenp, newp, newlen) };
+        // SAFETY: the caller's arguments, unchanged.
+        return unsafe { libc::sysctlbyname(key.as_ptr(), oldp, oldlenp, newp, newlen) };
     }
     let _ = (newp, newlen);
-    match named(key) {
-        // SAFETY: the caller's own `oldp`/`oldlenp`.
-        Some(value) => unsafe { copy_out(&value, oldp, oldlenp) },
-        None => {
-            say_unanswered(&format_args!("name {key:?}"));
-            crate::errno::set(libc::ENOENT);
-            -1
-        }
-    }
+    say_unanswered(&format_args!("name {spelled:?}"));
+    crate::errno::set(libc::ENOENT);
+    -1
 }
 
 /// `int sysctlnametomib(const char *, int *, size_t *)`.
@@ -857,37 +1115,32 @@ unsafe extern "C" fn sysctlnametomib(
         return -1;
     }
     // SAFETY: the caller states `name` is NUL-terminated.
-    let key = unsafe { std::ffi::CStr::from_ptr(name) }
-        .to_string_lossy()
-        .into_owned();
-    #[cfg(target_os = "macos")]
-    if key == "sysctl.proc_cputype" && !crate::libc_backend::using_builtin() {
-        return unsafe { libc::sysctlnametomib(name, mibp, sizep) };
-    }
-    if key == "sysctl.proc_translated" && proc_translated().is_none() {
-        crate::errno::set(libc::ENOENT);
-        return -1;
-    }
-    let Some((_, mib)) = BY_NAME.iter().find(|(n, _)| *n == key) else {
+    let spelled = unsafe { std::ffi::CStr::from_ptr(name) }.to_string_lossy();
+    let Some(key) = own_by_name(&spelled) else {
         #[cfg(target_os = "macos")]
         if passes_through() {
+            // SAFETY: the caller's arguments, unchanged.
             return unsafe { libc::sysctlnametomib(name, mibp, sizep) };
         }
-        say_unanswered(&format_args!("name {key:?} as a mib"));
+        say_unanswered(&format_args!("name {spelled:?} as a mib"));
         crate::errno::set(libc::ENOENT);
         return -1;
     };
+    if key.value().is_none() {
+        crate::errno::set(libc::ENOENT);
+        return -1;
+    }
     // SAFETY: the caller states `sizep` is a writable `size_t`.
     let available = unsafe { *sizep };
-    if available < mib.len() {
+    if available < key.mib.len() {
         crate::errno::set(libc::ENOMEM);
         return -1;
     }
     // SAFETY: `mibp` is writable for `available` integers, which is at least
-    // `mib.len()`.
+    // `key.mib.len()`.
     unsafe {
-        std::ptr::copy_nonoverlapping(mib.as_ptr(), mibp, mib.len());
-        *sizep = mib.len();
+        std::ptr::copy_nonoverlapping(key.mib.as_ptr(), mibp, key.mib.len());
+        *sizep = key.mib.len();
     }
     0
 }
@@ -920,17 +1173,6 @@ pub(crate) fn lock_guest_arch(arch: GuestArch) -> std::sync::MutexGuard<'static,
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn the_release_and_the_macos_version_keep_agreeing() {
-        let version = macos_version();
-        let first = release();
-        // SAFETY: no other test reads or writes this variable.
-        unsafe { std::env::set_var("ROSEMARY_DARWIN_RELEASE", "99.0.0") };
-        assert_eq!(release(), first);
-        assert_eq!(macos_version(), version);
-        unsafe { std::env::remove_var("ROSEMARY_DARWIN_RELEASE") };
-    }
 
     /// Ask a key the way a guest does, and get the bytes back.
     fn ask(mib: &[i32]) -> Option<Vec<u8>> {
@@ -970,6 +1212,14 @@ mod tests {
 
     fn ask_str(mib: &[i32]) -> Option<String> {
         let mut bytes = ask(mib)?;
+        while bytes.last() == Some(&0) {
+            bytes.pop();
+        }
+        String::from_utf8(bytes).ok()
+    }
+
+    fn ask_str_name(name: &str) -> Option<String> {
+        let mut bytes = ask_name(name)?;
         while bytes.last() == Some(&0) {
             bytes.pop();
         }
@@ -1197,13 +1447,12 @@ mod tests {
     fn guest_cpu_properties_agree_by_name_and_mib() {
         let _held = lock_guest_arch(GuestArch::X86_64);
         for name in ["hw.cputype", "hw.cpusubtype", "hw.optional.arm64"] {
-            let mib = BY_NAME.iter().find(|(key, _)| *key == name).unwrap().1;
+            let mib = KEYS.iter().find(|key| key.name == name).unwrap().mib;
             assert_eq!(ask_name(name), ask(mib), "{name}");
         }
     }
 
     #[test]
-    #[cfg(not(target_os = "macos"))]
     fn reports_a_64_bit_capable_cpu() {
         assert_eq!(
             ask_name("hw.cpu64bit_capable"),
@@ -1236,8 +1485,96 @@ mod tests {
     #[cfg(not(target_os = "macos"))]
     fn every_named_key_agrees_with_its_mib() {
         let _held = lock_guest_arch(GuestArch::X86_64);
-        for (name, mib) in BY_NAME {
-            assert_eq!(ask_name(name), ask(mib), "{name}");
+        for key in KEYS {
+            assert_eq!(ask_name(key.name), ask(key.mib), "{}", key.name);
         }
+    }
+
+    #[test]
+    fn names_and_mibs_are_each_unique() {
+        for (i, key) in KEYS.iter().enumerate() {
+            for other in &KEYS[i + 1..] {
+                assert_ne!(key.name, other.name);
+                assert_ne!(key.mib, other.mib, "{} and {}", key.name, other.name);
+            }
+        }
+    }
+
+    /// The emulated processor, read through `sysctl`, is the one its `CPUID`
+    /// describes.
+    #[test]
+    fn the_emulated_processor_is_described_by_its_cpuid() {
+        let _held = lock_guest_arch(GuestArch::X86_64);
+        let _backend = crate::cpu::lock_backend(false);
+        assert_eq!(
+            ask_str_name("machdep.cpu.vendor").as_deref(),
+            Some("GenuineIntel")
+        );
+        assert_eq!(
+            ask_name("machdep.cpu.signature"),
+            Some(crate::cpu::emulated::cpuid(1, 0)[0].to_ne_bytes().to_vec())
+        );
+        let one = Some(1u32.to_ne_bytes().to_vec());
+        let zero = Some(0u32.to_ne_bytes().to_vec());
+        assert_eq!(ask_name("hw.optional.sse4_2"), one);
+        assert_eq!(
+            ask_name("hw.optional.avx2_0"),
+            zero,
+            "present, and 0, as on an Intel Mac"
+        );
+        assert_eq!(ask_name("hw.optional.neon"), None);
+        assert_eq!(
+            ask_name("hw.cpufrequency"),
+            Some(2_670_000_000u64.to_ne_bytes().to_vec())
+        );
+        assert_eq!(
+            ask_name("hw.cachelinesize"),
+            Some(64u32.to_ne_bytes().to_vec())
+        );
+    }
+
+    #[test]
+    fn an_arm64_guest_has_no_x86_processor_keys() {
+        let _held = lock_guest_arch(GuestArch::Arm64);
+        assert_eq!(ask_name("machdep.cpu.vendor"), None);
+        assert_eq!(ask_name("hw.optional.sse2"), None);
+        assert_eq!(ask_name("hw.cpufrequency"), None);
+        assert_eq!(
+            ask_name("hw.optional.neon"),
+            Some(1u32.to_ne_bytes().to_vec())
+        );
+        set_guest_arch(GuestArch::X86_64);
+    }
+
+    #[test]
+    #[cfg(not(target_os = "macos"))]
+    fn the_topology_counts_agree_with_one_another() {
+        let count = |name| u32::from_ne_bytes(ask_name(name).unwrap().try_into().unwrap());
+        assert!(count("hw.physicalcpu") >= 1);
+        assert!(count("hw.physicalcpu") <= count("hw.logicalcpu"));
+        assert!(count("hw.logicalcpu") <= count("hw.logicalcpu_max"));
+        assert_eq!(count("hw.logicalcpu"), count("hw.ncpu"));
+    }
+
+    #[test]
+    #[cfg(not(target_os = "macos"))]
+    fn boot_time_is_a_darwin_timeval() {
+        let Some(bytes) = ask_name("kern.boottime") else {
+            return;
+        };
+        assert_eq!(bytes.len(), 16);
+        let seconds = i64::from_ne_bytes(bytes[..8].try_into().unwrap());
+        assert!(seconds > 0);
+    }
+
+    #[test]
+    #[cfg(not(target_os = "macos"))]
+    fn swap_usage_is_an_xsw_usage() {
+        let Some(bytes) = ask_name("vm.swapusage") else {
+            return;
+        };
+        assert_eq!(bytes.len(), 32);
+        let word = |i: usize| u64::from_ne_bytes(bytes[i * 8..i * 8 + 8].try_into().unwrap());
+        assert_eq!(word(0), word(1) + word(2), "total = available + used");
     }
 }

@@ -57,7 +57,7 @@ impl Until {
                 };
                 // SAFETY: a live local; failure leaves the zero initialiser, which
                 // reads as a deadline far in the future rather than as an expiry.
-                unsafe { libc::clock_gettime(libc::CLOCK_REALTIME, &mut now) };
+                unsafe { crate::syscall::clock_gettime(libc::CLOCK_REALTIME, &mut now) };
                 let seconds = deadline.tv_sec.checked_sub(now.tv_sec)?;
                 let nanoseconds = (seconds as i128) * (NANOSECONDS as i128)
                     + (deadline.tv_nsec as i128 - now.tv_nsec as i128);
@@ -401,7 +401,7 @@ mod tests {
             assert_eq!(cond_init(cond.at(), 0), 0);
             assert_eq!(mutex_init(mutex.at(), 0), 0);
             assert_eq!(mutex_lock(mutex.at()), 0);
-            libc::clock_gettime(libc::CLOCK_REALTIME, &mut now);
+            crate::syscall::clock_gettime(libc::CLOCK_REALTIME, &mut now);
             let mut deadline = libc::timespec {
                 tv_sec: now.tv_sec,
                 tv_nsec: now.tv_nsec + 30_000_000,

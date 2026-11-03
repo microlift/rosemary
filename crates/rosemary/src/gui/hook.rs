@@ -1,6 +1,7 @@
 use microlift::arch::x86_64::context::RegisterContext;
 
 use crate::abi::{GuestMemory, Result};
+use crate::shims::bind;
 use crate::shims::coregraphics::Shim;
 
 /// The selectors a present goes through, uniqued once.
@@ -176,7 +177,7 @@ pub fn shim_for(name: &str) -> Option<Shim> {
         // is counted on the CGL path. The shim calls straight through to the
         // selected framework's `CGLFlushDrawable`, so the only cost of taking it
         // when nothing is drawing is one indirection per presented frame.
-        "CGLFlushDrawable" => Some(flush_drawable),
+        "CGLFlushDrawable" => Some(bind!("CGLFlushDrawable" => flush_drawable)),
         _ => None,
     }
 }

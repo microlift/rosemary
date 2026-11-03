@@ -229,7 +229,10 @@ pub unsafe extern "C" fn wake(operation: u32, addr: *mut c_void, _wake_value: u6
 
 #[inline]
 fn monotonic_nanoseconds() -> u64 {
-    let now = rustix::time::clock_gettime(ClockId::Monotonic);
+    let now = {
+        let _host = crate::syscall::ScopedHostSyscallContext::new();
+        rustix::time::clock_gettime(ClockId::Monotonic)
+    };
     (now.tv_sec as u64)
         .saturating_mul(1_000_000_000)
         .saturating_add(now.tv_nsec as u64)

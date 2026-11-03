@@ -40,7 +40,7 @@ const _: () = {
 
 /// Whether this process has a controlling terminal.
 fn has_tty() -> bool {
-    starnix::process::process(starnix::process::me()).is_some_and(|me| me.has_tty())
+    starnix::process::process(crate::process::host_self()).is_some_and(|me| me.has_tty())
 }
 
 fn session() -> AuditinfoAddr {

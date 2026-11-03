@@ -30,6 +30,27 @@ mod result {
     pub const FATAL: u32 = 6;
 }
 
+/// `errSecNoTrustSettings`: the domain holds no trust settings.
+const NO_TRUST_SETTINGS: OSStatus = -25263;
+/// `errSecItemNotFound`.
+const ITEM_NOT_FOUND: OSStatus = -25300;
+
+/// `kSecTrustSettingsDomainSystem`: the system's own roots, which on this host
+/// are its CA bundle. The user and admin domains hold no settings here.
+const DOMAIN_SYSTEM: u32 = 2;
+
+const POLICY_OID: &str = "SecPolicyOid";
+/// `kSecPolicyAppleX509Basic`, the OID of [`SecPolicyCreateBasicX509`].
+const POLICY_APPLE_X509_BASIC: &str = "1.2.840.113635.100.1.2";
+
+/// The policy key globals, as (Mach-O name, value).
+pub const KEYS: &[(&str, &str)] = &[
+    ("_kSecPolicyOid", POLICY_OID),
+    ("_kSecPolicyAppleX509Basic", POLICY_APPLE_X509_BASIC),
+    ("_kSecPolicyAppleSSL", "1.2.840.113635.100.1.3"),
+    ("_kSecPolicyClient", "SecPolicyClient"),
+];
+
 /// `kSecTrustOptionAllowExpired`.
 const ALLOW_EXPIRED: u32 = 0x1;
 /// `kSecTrustOptionAllowExpiredRoot`.
@@ -212,6 +233,78 @@ pub unsafe extern "C" fn SecTrustCopyAnchorCertificates(anchors: *mut CFTypeRef)
     // SAFETY: writable, per the caller.
     unsafe { anchors.write(array) };
     SUCCESS
+}
+
+/// `OSStatus SecTrustSettingsCopyCertificates(SecTrustSettingsDomain domain,
+/// CFArrayRef *certArray)`: the system domain's roots are the host's anchors.
+///
+/// # Safety
+///
+/// `certificates` is null or writable.
+pub unsafe extern "C" fn SecTrustSettingsCopyCertificates(
+    domain: u32,
+    certificates: *mut CFTypeRef,
+) -> OSStatus {
+    if domain != DOMAIN_SYSTEM {
+        return NO_TRUST_SETTINGS;
+    }
+    // SAFETY: as the caller states.
+    unsafe { SecTrustCopyAnchorCertificates(certificates) }
+}
+
+/// `OSStatus SecTrustSettingsCopyTrustSettings(SecCertificateRef,
+/// SecTrustSettingsDomain, CFArrayRef *trustSettings)`
+///
+/// An empty array for a system root, which Apple documents as "always trusted
+/// as a root"; nothing for any other certificate or domain.
+///
+/// # Safety
+///
+/// `certificate` is null or an object; `settings` is null or writable.
+pub unsafe extern "C" fn SecTrustSettingsCopyTrustSettings(
+    certificate: CFTypeRef,
+    domain: u32,
+    settings: *mut CFTypeRef,
+) -> OSStatus {
+    if settings.is_null() {
+        return PARAM;
+    }
+    // SAFETY: as the caller states.
+    let Some(der) = (unsafe { der_of(certificate) }) else {
+        return PARAM;
+    };
+    if domain != DOMAIN_SYSTEM || !host_anchors().iter().any(|anchor| anchor == der) {
+        return ITEM_NOT_FOUND;
+    }
+    let empty = corefoundation::collections::new_array(
+        &[],
+        corefoundation::callbacks::Policy::from_type_callbacks(),
+        false,
+    );
+    // SAFETY: writable, per the caller.
+    unsafe { settings.write(empty) };
+    SUCCESS
+}
+
+/// `CFDictionaryRef SecPolicyCopyProperties(SecPolicyRef)`: the policy's OID,
+/// for the one policy there is.
+///
+/// # Safety
+///
+/// `policy` is null or an object.
+pub unsafe extern "C" fn SecPolicyCopyProperties(policy: CFTypeRef) -> CFTypeRef {
+    // SAFETY: as the caller states.
+    if !matches!(unsafe { payload(policy) }, Some(Payload::BasicX509)) {
+        return std::ptr::null();
+    }
+    let key = foundation::notification::name_object(POLICY_OID) as CFTypeRef;
+    let oid = foundation::notification::name_object(POLICY_APPLE_X509_BASIC) as CFTypeRef;
+    corefoundation::collections::new_dictionary(
+        &[(key, oid)],
+        corefoundation::callbacks::Policy::from_key_callbacks(),
+        corefoundation::callbacks::Policy::from_type_callbacks(),
+        false,
+    )
 }
 
 /// The DER bytes of a certificate handle.
@@ -437,6 +530,9 @@ exports::exports! {
         "SecTrustEvaluate" => SecTrustEvaluate,
         "SecRandomCopyBytes" => SecRandomCopyBytes,
         "SecTrustCopyAnchorCertificates" => SecTrustCopyAnchorCertificates,
+        "SecTrustSettingsCopyCertificates" => SecTrustSettingsCopyCertificates,
+        "SecTrustSettingsCopyTrustSettings" => SecTrustSettingsCopyTrustSettings,
+        "SecPolicyCopyProperties" => SecPolicyCopyProperties,
         "SecCertificateCopyData" => SecCertificateCopyData,
         "SecCertificateGetData" => SecCertificateGetData,
     }

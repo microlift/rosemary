@@ -7,53 +7,80 @@
 //! Vulkan function variable may not.
 
 mod expr;
+mod inline;
 mod library;
+mod matrix;
+mod pointer;
 
 use std::collections::HashMap;
 
 use super::ast::*;
 use super::syntax_error;
-use crate::TranslateError;
 use crate::ir::{
     self, Access, AddressSpace, Block, BlockId, Builtin, EntryPoint, Function, GlobalVariable,
     Instruction, InstructionKind, Interpolation, Module, Operand, Parameter, Resource,
     ResourceKind, Sampling, Stage, StageBinding, StageInput, StageOutput, StructField, StructType,
     Terminator, Type, ValueId,
 };
+use crate::{RejectedEntry, TranslateError};
 
 type Result<T> = std::result::Result<T, TranslateError>;
 
-pub(super) fn lower(program: &Program) -> Result<Module> {
+/// Lower every entry point that can be, with the reason each other one
+/// cannot. A library none of whose entry points lowers is an error.
+pub(super) fn lower(program: &Program) -> Result<(Module, Vec<RejectedEntry>)> {
     let mut module = Module {
         functions: Vec::new(),
         entries: Vec::new(),
         globals: Vec::new(),
         static_initializers: Vec::new(),
     };
+    let mut rejected = Vec::new();
+    let mut first_error = None;
+    let mut reject = |name: &str, error: TranslateError| {
+        rejected.push(RejectedEntry {
+            name: name.to_string(),
+            reason: error.to_string(),
+        });
+        first_error.get_or_insert(error);
+    };
+    for failed in program.failed.iter().filter(|failed| failed.entry) {
+        let name = failed.name.as_deref().unwrap_or("an entry point");
+        reject(name, failed.error.clone());
+    }
     let context = Context::new(program, &mut module)?;
     for function in &program.functions {
+        // A helper is inlined where it is called.
         let Some(stage) = function.stage else {
-            // Nothing calls a function: the IR has no call, and an inlined
-            // helper is the only way one could be honoured.
-            return Err(syntax_error(
-                function.line,
-                format!(
-                    "function {} is not an entry point; helper functions are not supported",
-                    function.name
-                ),
-            ));
+            continue;
         };
-        let (lowered, entry) = Lowerer::entry(
+        let globals = module.globals.len();
+        let lowered = Lowerer::entry(
             &context,
             function,
             stage,
             module.functions.len(),
             &mut module.globals,
-        )?;
-        module.functions.push(lowered);
-        module.entries.push(entry);
+        )
+        .and_then(|(lowered, entry)| lowered.verify().map(|()| (lowered, entry)));
+        match lowered {
+            Ok((lowered, entry)) => {
+                module.functions.push(lowered);
+                module.entries.push(entry);
+            }
+            Err(error) => {
+                module.globals.truncate(globals);
+                reject(&function.name, error);
+            }
+        }
     }
-    Ok(module)
+    // A library none of whose entry points lowers - or which has none, its
+    // declarations having failed to parse - is a failed library.
+    let first_error = first_error.or_else(|| program.failed.first().map(|f| f.error.clone()));
+    match first_error {
+        Some(error) if module.entries.is_empty() => Err(error),
+        _ => Ok((module, rejected)),
+    }
 }
 
 /// What every function of the library shares: structure layouts and the
@@ -105,6 +132,20 @@ impl<'p> Context<'p> {
                 element: Box::new(self.ir(element)),
                 count: *count,
             },
+            // Only a template's own body names one, and every use there is
+            // resolved first; an unresolved one has no IR form.
+            Ty::Param(_) => Type::Void,
+            Ty::ByteBool => scalar_ir(Scalar::UCHAR),
+            // Packed lanes are an array of them in memory.
+            Ty::Packed(scalar, lanes) => Type::Array {
+                element: Box::new(scalar_ir(*scalar)),
+                count: u32::from(*lanes),
+            },
+            // A matrix is its columns, laid out as an array of them is.
+            Ty::Matrix { columns, .. } => Type::Array {
+                element: Box::new(self.ir(&ty.column().expect("a matrix"))),
+                count: u32::from(*columns),
+            },
             Ty::Struct(index) => Type::Struct(self.layouts[*index].clone()),
             Ty::Texture(texture) => Type::Texture(texture.clone()),
             Ty::Sampler => Type::Sampler,
@@ -128,6 +169,15 @@ impl<'p> Context<'p> {
                 let (size, align) = self.size_align(element, line)?;
                 (size.next_multiple_of(align) * count, align)
             }
+            Ty::Matrix { columns, .. } => {
+                let (size, align) = self.size_align(&ty.column().expect("a matrix"), line)?;
+                (size * u32::from(*columns), align)
+            }
+            Ty::Packed(scalar, lanes) => {
+                let lane = (u32::from(scalar.bits()) / 8).max(1);
+                (lane * u32::from(*lanes), lane)
+            }
+            Ty::ByteBool => (1, 1),
             Ty::Struct(index) => {
                 let layout = self
                     .layouts
@@ -339,6 +389,15 @@ pub(super) enum Number {
     Float(f64),
 }
 
+pub(super) fn address_space(space: Space) -> AddressSpace {
+    match space {
+        Space::Constant => AddressSpace::Constant,
+        Space::Device => AddressSpace::Device,
+        Space::Thread => AddressSpace::Thread,
+        Space::Threadgroup => AddressSpace::Threadgroup,
+    }
+}
+
 pub(super) fn scalar_ir(scalar: Scalar) -> Type {
     match scalar {
         Scalar::Bool => Type::Bool,
@@ -415,14 +474,30 @@ pub(super) enum LValue {
     Dynamic(Box<LValue>, Operand, Ty),
     /// A structure local, split into one place per field.
     Fields(usize, Vec<LValue>),
+    /// A type viewed in a buffer of bytes.
+    Bytes(pointer::Bytes),
 }
 
 impl LValue {
+    /// The type of the value the place holds: a packed vector is read and
+    /// written as an ordinary one.
     pub fn ty(&self) -> Ty {
         match self {
-            LValue::Memory(place) => place.ty.clone(),
+            LValue::Memory(place) => place.ty.unpacked(),
             LValue::Lanes(_, _, ty) | LValue::Dynamic(_, _, ty) => ty.clone(),
             LValue::Fields(index, _) => Ty::Struct(*index),
+            LValue::Bytes(bytes) => bytes.ty.unpacked(),
+        }
+    }
+
+    /// The address space of the memory a reference to this place names;
+    /// `None` for lanes of a vector, which no reference can name.
+    fn space(&self) -> Option<AddressSpace> {
+        match self {
+            LValue::Memory(place) => Some(place.space),
+            LValue::Bytes(bytes) => Some(bytes.space),
+            LValue::Fields(..) => Some(AddressSpace::Thread),
+            LValue::Lanes(..) | LValue::Dynamic(..) => None,
         }
     }
 }
@@ -433,8 +508,16 @@ pub(super) enum Binding {
     LValue(LValue),
     /// A read-only value: a texture, a sampler or a built-in input.
     Value(Value),
-    /// A buffer pointer, which only indexing turns into a place.
-    Pointer(Place),
+    /// A pointer, which indexing or `*` turns into a place.
+    Pointer(pointer::Pointer),
+}
+
+/// What `break` leaves.
+#[derive(Clone, Debug)]
+enum BreakTarget {
+    /// A loop, through its check block and its `break` flag.
+    Loop(BlockId, Place),
+    Switch(BlockId),
 }
 
 pub(super) struct Lowerer<'c, 'p> {
@@ -448,9 +531,8 @@ pub(super) struct Lowerer<'c, 'p> {
     /// `thread` variables, declared in the entry block.
     locals: Vec<Instruction>,
     scopes: Vec<HashMap<String, Binding>>,
-    /// The continue and break targets of each enclosing loop.
-    /// Each enclosing loop's check block and its `break` flag.
-    loops: Vec<(BlockId, Place)>,
+    /// What each enclosing loop or `switch` is left by.
+    loops: Vec<BreakTarget>,
     /// The source return type and how each returned field reaches the IR
     /// result.
     returns: Returns,
@@ -459,6 +541,8 @@ pub(super) struct Lowerer<'c, 'p> {
     /// globals numbered from `globals_base`.
     globals: Vec<GlobalVariable>,
     globals_base: u32,
+    /// The functions being inlined, innermost last.
+    frames: Vec<inline::Frame>,
 }
 
 /// How a `return` builds the entry point's result.
@@ -497,6 +581,7 @@ impl<'c, 'p> Lowerer<'c, 'p> {
             result: Type::Void,
             globals: Vec::new(),
             globals_base: 0,
+            frames: Vec::new(),
         }
     }
 
@@ -606,6 +691,12 @@ impl<'c, 'p> Lowerer<'c, 'p> {
                 return Some(binding.clone());
             }
         }
+        if let Some(&(value, scalar)) = self.context.program.enumerators.get(name) {
+            return Some(Binding::Value(Value {
+                op: number_operand(scalar, Number::Int(value as i64)),
+                ty: Ty::Scalar(scalar),
+            }));
+        }
         let (index, ty) = self.context.globals.get(name)?;
         Some(Binding::LValue(LValue::Memory(Place {
             root: Operand::Global {
@@ -667,6 +758,7 @@ impl<'c, 'p> Lowerer<'c, 'p> {
     fn statement(&mut self, statement: &Stmt) -> Result<()> {
         match statement {
             Stmt::Threadgroup { ty, name, line } => {
+                let ty = &self.resolve(ty, *line)?;
                 if self.stage != Stage::Kernel {
                     return Err(syntax_error(
                         *line,
@@ -710,6 +802,7 @@ impl<'c, 'p> Lowerer<'c, 'p> {
                 init,
                 line,
             } => {
+                let ty = &self.resolve(ty, *line)?;
                 if matches!(ty, Ty::Texture(_) | Ty::Sampler) {
                     // `constexpr sampler s(...)` is a sampler the shader
                     // describes itself, which needs an immutable sampler.
@@ -721,10 +814,23 @@ impl<'c, 'p> Lowerer<'c, 'p> {
                 let lvalue = self.local_lvalue(ty);
                 if let Some(init) = init {
                     match (&init.kind, ty) {
-                        (ExprKind::InitList(items), Ty::Array(element, _)) => {
-                            for (index, item) in items.iter().enumerate() {
-                                let value = self.rvalue(item)?;
-                                let value = self.convert(value, element, item.line)?;
+                        (ExprKind::InitList(items), Ty::Array(element, count)) => {
+                            if items.len() > *count as usize {
+                                return Err(syntax_error(*line, "too many initializers"));
+                            }
+                            // Elements the list leaves out are zero, as C++
+                            // value-initializes them.
+                            for index in 0..*count as usize {
+                                let value = match items.get(index) {
+                                    Some(item) => {
+                                        let value = self.rvalue(item)?;
+                                        self.convert(value, element, item.line)?
+                                    }
+                                    None => Value {
+                                        op: self.zero(element, *line)?,
+                                        ty: (**element).clone(),
+                                    },
+                                };
                                 let LValue::Memory(place) = &lvalue else {
                                     unreachable!("an array local is one variable");
                                 };
@@ -734,7 +840,7 @@ impl<'c, 'p> Lowerer<'c, 'p> {
                                 }
                                 element_place.indices.push(Operand::u32(index as u32));
                                 element_place.ty = (**element).clone();
-                                self.store(&LValue::Memory(element_place), value, item.line)?;
+                                self.store(&LValue::Memory(element_place), value, *line)?;
                             }
                         }
                         // `S s = { a, b };` is `(S){ a, b }`: the fields in
@@ -759,6 +865,65 @@ impl<'c, 'p> Lowerer<'c, 'p> {
                 }
                 self.bind(name, Binding::LValue(lvalue));
             }
+            Stmt::Auto { name, init, line } => {
+                let value = self.rvalue(init)?;
+                if matches!(value.ty, Ty::Void | Ty::Texture(_) | Ty::Sampler) {
+                    return Err(syntax_error(
+                        *line,
+                        format!(
+                            "auto {name} is initialized with {}",
+                            expr::describe(&value.ty)
+                        ),
+                    ));
+                }
+                let lvalue = self.local_lvalue(&value.ty);
+                self.store(&lvalue, value, *line)?;
+                self.bind(name, Binding::LValue(lvalue));
+            }
+            Stmt::Reference {
+                space,
+                ty,
+                name,
+                init,
+                line,
+            } => {
+                let lvalue = self.lvalue(init)?.ok_or_else(|| {
+                    syntax_error(*line, format!("{name} is bound to something not in memory"))
+                })?;
+                let Some(actual) = lvalue.space() else {
+                    return Err(syntax_error(
+                        *line,
+                        format!("{name} is bound to a lane of a vector"),
+                    ));
+                };
+                if let Some(space) = space
+                    && address_space(*space) != actual
+                {
+                    return Err(syntax_error(
+                        *line,
+                        format!("{name} is bound to memory in another address space"),
+                    ));
+                }
+                if let Some(ty) = ty {
+                    let ty = self.resolve(ty, *line)?;
+                    if ty.unpacked() != lvalue.ty() {
+                        return Err(syntax_error(
+                            *line,
+                            format!(
+                                "{name} is a reference to {}, bound to {}",
+                                expr::describe(&ty),
+                                expr::describe(&lvalue.ty())
+                            ),
+                        ));
+                    }
+                }
+                self.bind(name, Binding::LValue(lvalue));
+            }
+            Stmt::Switch {
+                selector,
+                cases,
+                line,
+            } => self.switch(selector, cases, *line)?,
             Stmt::Expr(expr) => {
                 self.effect(expr)?;
             }
@@ -863,29 +1028,37 @@ impl<'c, 'p> Lowerer<'c, 'p> {
                 self.scopes.pop();
             }
             Stmt::Break(line) => {
-                let (check, flag) = self
-                    .loops
-                    .last()
-                    .cloned()
-                    .ok_or_else(|| syntax_error(*line, "break outside a loop"))?;
-                let truth = Value {
-                    op: Operand::Bool(true),
-                    ty: Ty::Scalar(Scalar::Bool),
-                };
-                self.store(&LValue::Memory(flag), truth, *line)?;
-                self.terminate(Terminator::Branch(check));
+                match self.loops.last().cloned() {
+                    Some(BreakTarget::Loop(check, flag)) => {
+                        let truth = Value {
+                            op: Operand::Bool(true),
+                            ty: Ty::Scalar(Scalar::Bool),
+                        };
+                        self.store(&LValue::Memory(flag), truth, *line)?;
+                        self.terminate(Terminator::Branch(check));
+                    }
+                    Some(BreakTarget::Switch(exit)) => self.terminate(Terminator::Branch(exit)),
+                    None => return Err(syntax_error(*line, "break outside a loop or switch")),
+                }
                 self.after_jump();
             }
             Stmt::Continue(line) => {
-                let (check, _) = self
+                let check = self
                     .loops
-                    .last()
-                    .cloned()
+                    .iter()
+                    .rev()
+                    .find_map(|target| match target {
+                        BreakTarget::Loop(check, _) => Some(*check),
+                        BreakTarget::Switch(_) => None,
+                    })
                     .ok_or_else(|| syntax_error(*line, "continue outside a loop"))?;
                 self.terminate(Terminator::Branch(check));
                 self.after_jump();
             }
             Stmt::Return(value, line) => {
+                if self.inline_return(value.as_ref(), *line)?.is_some() {
+                    return Ok(());
+                }
                 let result = self.return_value(value.as_ref(), *line)?;
                 self.terminate(Terminator::Return(result));
                 self.after_jump();
@@ -918,7 +1091,7 @@ impl<'c, 'p> Lowerer<'c, 'p> {
         exit: BlockId,
     ) -> Result<()> {
         let check = self.new_block("loopcheck");
-        self.loops.push((check, flag.clone()));
+        self.loops.push(BreakTarget::Loop(check, flag.clone()));
         self.statements(body)?;
         self.loops.pop();
         self.terminate(Terminator::Branch(check));
@@ -929,6 +1102,55 @@ impl<'c, 'p> Lowerer<'c, 'p> {
             true_block: exit,
             false_block: next,
         });
+        Ok(())
+    }
+
+    /// A `switch`: each label tested in turn, then the cases in order, each
+    /// falling through to the next.
+    fn switch(&mut self, selector: &Expr, cases: &[Case], line: usize) -> Result<()> {
+        let selector = self.rvalue(selector)?;
+        if !matches!(selector.ty, Ty::Scalar(Scalar::Int { .. })) {
+            return Err(syntax_error(line, "a switch on something not an integer"));
+        }
+        let bodies: Vec<BlockId> = cases.iter().map(|_| self.new_block("case")).collect();
+        let exit = self.new_block("endswitch");
+        let mut otherwise = exit;
+        for (case, &body) in cases.iter().zip(&bodies) {
+            let Some(label) = &case.label else {
+                otherwise = body;
+                continue;
+            };
+            let label = self.rvalue(label)?;
+            let matched = self.arithmetic("==", selector.clone(), label, line)?;
+            let next = self.new_block("casetest");
+            self.terminate(Terminator::CondBranch {
+                condition: matched.op,
+                true_block: body,
+                false_block: next,
+            });
+            self.switch_to(next);
+        }
+        self.terminate(Terminator::Branch(otherwise));
+        // The whole body is one scope, as in C++.
+        self.scopes.push(HashMap::new());
+        self.loops.push(BreakTarget::Switch(exit));
+        let mut lowered = Ok(());
+        for (index, case) in cases.iter().enumerate() {
+            self.switch_to(bodies[index]);
+            lowered = case
+                .body
+                .iter()
+                .try_for_each(|statement| self.statement(statement));
+            if lowered.is_err() {
+                break;
+            }
+            let next = bodies.get(index + 1).copied().unwrap_or(exit);
+            self.terminate(Terminator::Branch(next));
+        }
+        self.loops.pop();
+        self.scopes.pop();
+        lowered?;
+        self.switch_to(exit);
         Ok(())
     }
 
@@ -973,12 +1195,11 @@ impl<'c, 'p> Lowerer<'c, 'p> {
 
     /// Each field of a structure-typed expression, in order.
     pub fn struct_fields(&mut self, expr: &Expr, index: usize, line: usize) -> Result<Vec<Value>> {
-        if let Some(lvalue) = self.lvalue(expr)? {
-            if let LValue::Fields(found, fields) = &lvalue
-                && *found == index
-            {
-                return fields.iter().map(|field| self.load(field, line)).collect();
-            }
+        if let Some(lvalue) = self.lvalue(expr)?
+            && let LValue::Fields(found, fields) = &lvalue
+            && *found == index
+        {
+            return fields.iter().map(|field| self.load(field, line)).collect();
         }
         let value = self.rvalue(expr)?;
         if value.ty != Ty::Struct(index) {
@@ -993,15 +1214,18 @@ impl<'c, 'p> Lowerer<'c, 'p> {
         Ok(fields
             .iter()
             .enumerate()
-            .map(|(position, field)| Value {
-                op: self.emit(
+            .map(|(position, field)| {
+                let op = self.emit(
                     self.context.ir(&field.ty),
                     InstructionKind::CompositeExtract {
                         composite: value.op.clone(),
                         index: position as u32,
                     },
-                ),
-                ty: field.ty.clone(),
+                );
+                self.unpack(Value {
+                    op,
+                    ty: field.ty.clone(),
+                })
             })
             .collect())
     }
@@ -1087,8 +1311,7 @@ impl<'c, 'p> Lowerer<'c, 'p> {
                     return Err(syntax_error(line, "a buffer passed by value"));
                 }
                 let space = match param.space {
-                    Some(Space::Constant) => AddressSpace::Constant,
-                    Some(Space::Device) => AddressSpace::Device,
+                    Some(space @ (Space::Constant | Space::Device)) => address_space(space),
                     _ => {
                         return Err(syntax_error(
                             line,
@@ -1096,9 +1319,15 @@ impl<'c, 'p> Lowerer<'c, 'p> {
                         ));
                     }
                 };
+                let element = param.ty.in_memory();
+                let pointee = match element {
+                    // A `void` buffer is bytes, reached through a cast.
+                    Ty::Void => scalar_ir(Scalar::UCHAR),
+                    _ => self.context.ir(&element),
+                };
                 let ty = Type::Pointer {
                     space,
-                    pointee: Box::new(self.context.ir(&param.ty)),
+                    pointee: Box::new(pointee),
                 };
                 let (argument, root) = self.add_parameter(parameters, &param.name, ty.clone());
                 entry.resources.push(Resource {
@@ -1121,14 +1350,14 @@ impl<'c, 'p> Lowerer<'c, 'p> {
                     root,
                     space,
                     indices: Vec::new(),
-                    ty: param.ty.clone(),
+                    ty: element,
                 };
                 let binding = match param.indirection {
                     Indirection::Reference => Binding::LValue(LValue::Memory(Place {
                         indices: vec![Operand::u32(0)],
                         ..place
                     })),
-                    _ => Binding::Pointer(place),
+                    _ => Binding::Pointer(pointer::Pointer::Elements(place)),
                 };
                 self.bind(&param.name, binding);
             }
@@ -1367,6 +1596,10 @@ impl<'c, 'p> Lowerer<'c, 'p> {
                         field: Some(position as u32),
                         binding,
                         name: Some(name),
+                        invariant: field
+                            .attributes
+                            .iter()
+                            .any(|attribute| attribute.name == "invariant"),
                     });
                     let ty = interface_ty(&field.ty, field.line)?;
                     layout.push(StructField {
@@ -1397,6 +1630,7 @@ impl<'c, 'p> Lowerer<'c, 'p> {
                     field: None,
                     binding,
                     name: None,
+                    invariant: false,
                 });
                 let interface = interface_ty(ty, line)?;
                 self.result = self.context.ir(&interface);

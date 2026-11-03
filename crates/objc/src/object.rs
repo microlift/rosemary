@@ -53,6 +53,8 @@ pub unsafe fn destruct_instance(object: Id) {
         return;
     };
     let destruct = crate::sel::get(".cxx_destruct");
+    // Apple's order: the ivars first, then the associations.
+    let _associations = RemoveAssociations(object);
     for class in class.chain() {
         // Only a class's own: an inherited one runs once, for its own class.
         let Some(method) = class.own_method(destruct) else {
@@ -65,6 +67,16 @@ pub unsafe fn destruct_instance(object: Id) {
                 std::mem::transmute(method.implementation());
             f(object, destruct);
         }
+    }
+}
+
+/// Drops `object`'s associations when it goes out of scope, so they go even
+/// if a `.cxx_destruct` unwinds.
+struct RemoveAssociations(Id);
+
+impl Drop for RemoveAssociations {
+    fn drop(&mut self) {
+        crate::arc::remove_associated(self.0);
     }
 }
 

@@ -40,6 +40,21 @@ pub struct Window {
     /// compositor answers later and a program that counts its own transitions
     /// by these notifications must hear of every one.
     reported_fullscreen: usize,
+    /// AppKit accepts a smaller frame inside a fullscreen Space; SDL keeps
+    /// the host container at display size. Zero width means no override.
+    fullscreen_frame: NSRect,
+    /// Fullscreen size requests must not change the restored window frame.
+    fullscreen_restore: NSRect,
+    /// Suppress reentrant toggles from fullscreen lifecycle callbacks: when
+    /// the pending transition began, from [`transition_stamp`], or zero.
+    fullscreen_transition: usize,
+    /// Expected SDL host geometry after a fullscreen transition. Some window
+    /// managers queue its move/resize events after the state notification.
+    fullscreen_announced_frame: NSRect,
+    fullscreen_announced_move: usize,
+    fullscreen_announced_resize: usize,
+    /// Guest confinement is measured in AppKit coordinates, not SDL coordinates.
+    mouse_confinement: NSRect,
     miniaturized: usize,
     /// `-representedFilename`, an owned `NSString` or null for the empty
     /// string AppKit answers before one is set.
@@ -80,9 +95,17 @@ pub struct Window {
     window_controller: Id,
     /// `-setHidesOnDeactivate:`, kept so a program reads back what it set.
     hides_on_deactivate: usize,
+    /// `-setExcludedFromWindowsMenu:`, likewise; no Windows menu lists windows.
+    excluded_from_windows_menu: usize,
     /// When this window was last ordered front, from [`ORDERED`]: the stacking
     /// order, which creation order is not.
     ordered: u64,
+    /// The view the content view and the titlebar accessories share, retained,
+    /// made when the first accessory is added; null until then. It is what
+    /// AppKit's `NSThemeFrame` is to the content view: its superview.
+    frame_view: Id,
+    /// `-titlebarAccessoryViewControllers`, an owned mutable array or null.
+    accessories: Id,
 }
 
 pub const INSTANCE_SIZE: usize = size_of::<Window>();
@@ -375,22 +398,129 @@ pub fn add_destroy_hook(hook: fn(sdl3::Window)) {
     }
 }
 
+/// Preserve guest NSWindow popup objects when their SDL parent is remade.
+/// SDL attaches native popups to a particular parent allocation, so they
+/// cannot outlive that parent without being recreated themselves.
+fn rehome_popup_descendants(old: sdl3::Window, replacement: sdl3::Window) {
+    let mut replacements = std::collections::HashMap::from([(old as usize, replacement)]);
+    for child in sdl3::video::window_family(old).into_iter().skip(1) {
+        if sdl3::video::live_window_id(child).is_none() {
+            continue;
+        }
+        let parent = sdl3::video::window_parent(child);
+        let Some(&new_parent) = replacements.get(&(parent as usize)) else {
+            continue;
+        };
+        let Some(popup) = presentation_of_sdl(child).popup_flags() else {
+            continue;
+        };
+        let Some(object) = (!window_for(child).is_null()).then(|| window_for(child)) else {
+            continue;
+        };
+        // SDL makes a new popup visible when its parent is shown, even if
+        // the old popup was explicitly ordered out by the guest.
+        let shown = window_of(object).shown != 0;
+        let (x, y) = sdl3::video::window_position(child).unwrap_or((0, 0));
+        let (width, height) = sdl3::video::window_size(child).unwrap_or((1, 1));
+        let api = if draws_with_opengl(child) {
+            Api::OpenGl
+        } else {
+            Api::Undecided
+        };
+        let flags = (creation_flags(window_of(object).style_mask, api)
+            & !sdl3::video::flags::BORDERLESS)
+            | popup;
+        let Some(new) =
+            sdl3::video::create_popup_window(new_parent, x, y, width.max(1), height.max(1), flags)
+        else {
+            continue; // old mapping is invalidated by the destroy path.
+        };
+        // Hide before the replacement parent is shown so SDL does not
+        // resurrect a popup that AppKit still considers ordered out.
+        if !shown {
+            sdl3::video::hide_window(new);
+        }
+        // SDL's GL flag is not enough: AppKit separately tracks which window
+        // surface belongs to a guest context. Transfer that ownership before
+        // the original popup's teardown hook removes the old registration.
+        if api == Api::OpenGl {
+            OPENGL_WINDOWS
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push(new as usize);
+        }
+        window_of(object).sdl = new;
+        // Rebind before SDL recursively destroys the old popup. Never try
+        // to move a context that belongs to another rendering thread.
+        crate::opengl::popup_rehomed(child, new);
+        WINDOWS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter_mut()
+            .filter(|entry| entry.0 == child as usize)
+            .for_each(|entry| entry.0 = new as usize);
+        replacements.insert(child as usize, new);
+        let content = window_of(object).content_view;
+        if !content.is_null() {
+            crate::backing::needs_display(content);
+        }
+    }
+}
+
 /// Destroy an SDL window, telling everything keyed on it first.
 fn destroy_sdl_window(sdl: sdl3::Window) {
-    OPENGL_WINDOWS
+    // SDL_DestroyWindow recursively frees popups. Reconcile every descendant
+    // NSWindow and retire every Metal/CPU owner *before* native destruction.
+    let family = sdl3::video::begin_window_family_destroy(sdl);
+    let hooks = DESTROY_HOOKS
         .lock()
         .unwrap_or_else(|e| e.into_inner())
-        .retain(|window| *window != sdl as usize);
-    crate::backing::forget_window(sdl);
-    crate::decor::destroyed(sdl);
-    for hook in DESTROY_HOOKS
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .clone()
-    {
-        hook(sdl);
+        .clone();
+    for member in family.into_iter().rev() {
+        // Remove fullscreen native overlays before retiring each member,
+        // including SDL popups which SDL otherwise destroys recursively.
+        #[cfg(target_os = "linux")]
+        sdl3::x11_mask::forget(member);
+        #[cfg(target_os = "linux")]
+        sdl3::wayland_mask::forget(member);
+        // A separately retired child has already received its own cleanup.
+        if sdl3::video::live_window_id(member).is_none() {
+            continue;
+        }
+        if member != sdl {
+            let owned = {
+                let mut windows = WINDOWS.lock().unwrap_or_else(|e| e.into_inner());
+                windows
+                    .iter()
+                    .position(|(key, _)| *key == member as usize)
+                    .map(|at| windows.remove(at).1 as Id)
+            };
+            if let Some(object) = owned {
+                let child = window_of(object);
+                child.sdl = std::ptr::null_mut();
+                child.shown = 0;
+                if KEY.load(std::sync::atomic::Ordering::Acquire) == object as usize {
+                    KEY.store(0, std::sync::atomic::Ordering::Release);
+                    crate::event::announce_resign(object);
+                }
+                crate::event::forget_announced(object);
+            }
+        }
+        OPENGL_WINDOWS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .retain(|window| *window != member as usize);
+        crate::backing::forget_window(member);
+        crate::view::forget_metal_scene(member);
+        crate::screen::forget_relative_pointer(member);
+        for hook in &hooks {
+            hook(member);
+        }
+        // After the hooks, which cancel a Metal swapchain initializer that
+        // would otherwise mark the window opaque once this had forgotten it.
+        crate::decor::destroyed(member);
     }
-    sdl3::video::destroy_window(sdl);
+    sdl3::video::destroy_window_after_hooks(sdl);
 }
 
 /// Every live window, so an SDL event's window id can find the object it belongs
@@ -467,12 +597,215 @@ pub fn is_shown(object: Id) -> bool {
     !unsafe { sdl_window(object) }.is_null() && window_of(object).shown != 0
 }
 
-/// A window's content view, for the event pump.
+/// The root of a window's views, for the event pump and drawing: the content
+/// view, or the view it shares with the titlebar accessories.
 pub fn content_view_of(object: Id) -> Id {
-    match object.is_null() {
-        true => std::ptr::null_mut(),
-        false => window_of(object).content_view,
+    if object.is_null() {
+        return std::ptr::null_mut();
     }
+    let window = window_of(object);
+    match window.frame_view.is_null() {
+        true => window.content_view,
+        false => window.frame_view,
+    }
+}
+
+fn send_view(receiver: Id, sel: &str, argument: Id) {
+    // SAFETY: `void (id, SEL, id)`, which every selector this is used with is.
+    unsafe {
+        let f: unsafe extern "C" fn(Id, Sel, Id) = std::mem::transmute(objc::msg::entry());
+        f(receiver, objc::sel::get(sel), argument);
+    }
+}
+
+fn send_frame(receiver: Id, frame: NSRect) {
+    // SAFETY: `-setFrame:` is `void (id, SEL, NSRect)`.
+    unsafe {
+        let f: unsafe extern "C" fn(Id, Sel, NSRect) = std::mem::transmute(objc::msg::entry());
+        f(receiver, objc::sel::get("setFrame:"), frame);
+    }
+}
+
+/// The accessory controllers of a window, in order.
+fn accessories_of(object: Id) -> Vec<Id> {
+    let accessories = window_of(object).accessories;
+    // SAFETY: null or the array `add_titlebar_accessory` made.
+    unsafe { corefoundation::collections::array(accessories as corefoundation::base::CFTypeRef) }
+        .map(|a| a.values.iter().map(|v| *v as Id).collect())
+        .unwrap_or_default()
+}
+
+/// The controller's view, loading it if need be.
+fn accessory_view(controller: Id) -> Id {
+    // SAFETY: an `NSViewController`, sent `-view`.
+    unsafe {
+        let f: unsafe extern "C" fn(Id, Sel) -> Id = std::mem::transmute(objc::msg::entry());
+        f(controller, objc::sel::get("view"))
+    }
+}
+
+/// Place the accessories along the top of the frame view, each its own
+/// height, and the content view in what is left.
+///
+/// FIXME (ACCURACY): an accessory placed at the titlebar's leading or
+/// trailing edge goes under it with the rest, since the titlebar here is not
+/// made of views it could join.
+fn layout_titlebar(object: Id, size: NSSize) {
+    let window = window_of(object);
+    if window.frame_view.is_null() {
+        return;
+    }
+    send_frame(
+        window.frame_view,
+        NSRect {
+            origin: NSPoint::default(),
+            size,
+        },
+    );
+    let mut top = size.height;
+    for controller in accessories_of(object) {
+        let view = accessory_view(controller);
+        if view.is_null() || crate::props::integer(controller, "hidden") != 0 {
+            continue;
+        }
+        let height = match crate::layout::own_size(view)[1] {
+            (Some(exact), _) => exact,
+            (None, Some(least)) => least.max(crate::view::frame_of(view).size.height),
+            (None, None) => crate::view::frame_of(view).size.height,
+        };
+        top -= height;
+        send_frame(
+            view,
+            NSRect {
+                origin: NSPoint { x: 0.0, y: top },
+                size: NSSize {
+                    width: size.width,
+                    height,
+                },
+            },
+        );
+    }
+    if !window.content_view.is_null() {
+        send_frame(
+            window.content_view,
+            NSRect {
+                origin: NSPoint::default(),
+                size: NSSize {
+                    width: size.width,
+                    height: top.max(0.0),
+                },
+            },
+        );
+    }
+}
+
+/// `-addTitlebarAccessoryViewController:`.
+unsafe extern "C" fn add_titlebar_accessory(receiver: Id, sel: Sel, controller: Id) {
+    let count = accessories_of(receiver).len();
+    unsafe { insert_titlebar_accessory(receiver, sel, controller, count) };
+}
+
+/// `-insertTitlebarAccessoryViewController:atIndex:`.
+unsafe extern "C" fn insert_titlebar_accessory(
+    receiver: Id,
+    _sel: Sel,
+    controller: Id,
+    index: usize,
+) {
+    if controller.is_null() {
+        return;
+    }
+    let window = window_of(receiver);
+    if window.accessories.is_null() {
+        window.accessories = corefoundation::collections::new_array(
+            &[],
+            corefoundation::callbacks::Policy::from_type_callbacks(),
+            true,
+        ) as Id;
+    }
+    if window.frame_view.is_null() {
+        let class = objc::class::lookup(c"NSView").expect("NSView");
+        let frame_view = objc::object::create_instance(class, 0);
+        // SAFETY: `-initWithFrame:` is `id (id, SEL, NSRect)`.
+        let frame_view = unsafe {
+            let f: unsafe extern "C" fn(Id, Sel, NSRect) -> Id =
+                std::mem::transmute(objc::msg::entry());
+            f(
+                frame_view,
+                objc::sel::get("initWithFrame:"),
+                NSRect::default(),
+            )
+        };
+        window.frame_view = frame_view;
+        if !window.content_view.is_null() {
+            send_view(frame_view, "addSubview:", window.content_view);
+        }
+        // SAFETY: a view of this crate's, now this window's root.
+        unsafe { crate::view::set_window(frame_view, receiver) };
+    }
+    // SAFETY: the array made above, and an object to put in it.
+    if let Some(array) = unsafe {
+        corefoundation::collections::array(window.accessories as corefoundation::base::CFTypeRef)
+    } {
+        let at = index.min(array.values.len());
+        array.values.insert(
+            at,
+            objc::arc::retain(controller) as corefoundation::base::CFTypeRef,
+        );
+    }
+    crate::view_controller::set_accessory_window(controller, receiver);
+    let view = accessory_view(controller);
+    if !view.is_null() {
+        send_view(window.frame_view, "addSubview:", view);
+        if crate::props::integer(controller, "hidden") != 0 {
+            // SAFETY: `-setHidden:` is `void (id, SEL, BOOL)`.
+            unsafe {
+                let f: unsafe extern "C" fn(Id, Sel, u8) = std::mem::transmute(objc::msg::entry());
+                f(view, objc::sel::get("setHidden:"), 1);
+            }
+        }
+    }
+    fit_content_view(receiver);
+}
+
+/// `-removeTitlebarAccessoryViewControllerAtIndex:`.
+unsafe extern "C" fn remove_titlebar_accessory(receiver: Id, _sel: Sel, index: usize) {
+    let window = window_of(receiver);
+    // SAFETY: null or the array `insert_titlebar_accessory` made.
+    let Some(array) = (unsafe {
+        corefoundation::collections::array(window.accessories as corefoundation::base::CFTypeRef)
+    }) else {
+        return;
+    };
+    if index >= array.values.len() {
+        return;
+    }
+    let controller = array.values.remove(index) as Id;
+    let view = accessory_view(controller);
+    if !view.is_null() {
+        // SAFETY: `-removeFromSuperview` is `void (id, SEL)`.
+        unsafe {
+            let f: unsafe extern "C" fn(Id, Sel) = std::mem::transmute(objc::msg::entry());
+            f(view, objc::sel::get("removeFromSuperview"));
+        }
+    }
+    crate::view_controller::set_accessory_window(controller, std::ptr::null_mut());
+    objc::arc::release(controller);
+    fit_content_view(receiver);
+}
+
+/// `-titlebarAccessoryViewControllers`.
+unsafe extern "C" fn titlebar_accessories(receiver: Id, _sel: Sel) -> Id {
+    let values: Vec<corefoundation::base::CFTypeRef> = accessories_of(receiver)
+        .into_iter()
+        .map(|c| c as corefoundation::base::CFTypeRef)
+        .collect();
+    let array = corefoundation::collections::new_array(
+        &values,
+        corefoundation::callbacks::Policy::from_type_callbacks(),
+        false,
+    );
+    objc::arc::autorelease(array as Id)
 }
 
 /// Whether `object` is an `NSPanel`, which gets a titlebar and no menu bar.
@@ -492,7 +825,13 @@ pub(crate) fn content_inset(object: Id) -> CGFloat {
         return 0.0;
     }
     let window = window_of(object);
-    inset_of(object, window.style_mask, is_fullscreen(window.sdl))
+    let fullscreen = if sdl3::video::is_video_thread() {
+        is_fullscreen(window.sdl)
+    } else {
+        sdl3::video::presentation_window(window.sdl)
+            .is_some_and(|snapshot| snapshot.flags & sdl3::video::flags::FULLSCREEN != 0)
+    };
+    inset_of(object, window.style_mask, fullscreen)
 }
 
 fn inset_of(object: Id, style_mask: usize, fullscreen: bool) -> CGFloat {
@@ -506,6 +845,360 @@ fn inset_of(object: Id, style_mask: usize, fullscreen: bool) -> CGFloat {
 
 fn is_fullscreen(sdl: sdl3::Window) -> bool {
     !sdl.is_null() && sdl3::video::window_flags(sdl) & sdl3::video::flags::FULLSCREEN != 0
+}
+
+/// Whether a shown fullscreen window covers `display`. Hidden and minimized
+/// ones leave the desktop panels visible.
+pub(crate) fn fullscreen_on(display: u32) -> bool {
+    use sdl3::video::flags::{FULLSCREEN, HIDDEN, MINIMIZED};
+    all().into_iter().any(|object| {
+        let window = window_of(object);
+        if window.shown == 0 || window.sdl.is_null() {
+            return false;
+        }
+        let flags = sdl3::video::window_flags(window.sdl);
+        flags & FULLSCREEN != 0
+            && flags & (HIDDEN | MINIMIZED) == 0
+            && sdl3::video::display_for_window(window.sdl) == Some(display)
+    })
+}
+
+fn host_frame(object: Id) -> Option<NSRect> {
+    if object.is_null() {
+        return None;
+    }
+    let sdl = window_of(object).sdl;
+    if sdl.is_null() {
+        return None;
+    }
+    // Metal presentation can resolve this frame from a worker, which reads
+    // the SDL owner's published snapshot, never SDL window properties. The
+    // owner asks SDL itself: -frame straight after -setFrame: must not wait
+    // for the resize event, and popup-relative and Wayland virtual-desktop
+    // positions come from global_position.
+    let ((width, height), (x, y)) = if sdl3::video::is_video_thread() {
+        (sdl3::video::window_size(sdl)?, global_position(sdl)?)
+    } else {
+        let snapshot = sdl3::video::presentation_window(sdl)?;
+        (snapshot.logical_size, snapshot.position)
+    };
+    Some(crate::geometry::rect_from_sdl(x, y, width, height))
+}
+
+pub(crate) fn fullscreen_frame(object: Id) -> Option<NSRect> {
+    if object.is_null() {
+        return None;
+    }
+    let window = window_of(object);
+    let flags = if sdl3::video::is_video_thread() {
+        sdl3::video::window_flags(window.sdl)
+    } else {
+        sdl3::video::presentation_window(window.sdl)?.flags
+    };
+    (flags & sdl3::video::flags::FULLSCREEN != 0 && window.fullscreen_frame.size.width > 0.0)
+        .then_some(window.fullscreen_frame)
+}
+
+/// The logical AppKit frame in host surface points, with a top-left origin.
+/// The physical surface remains display-sized even when AppKit's frame shrinks.
+pub(crate) fn surface_frame(object: Id) -> Option<NSRect> {
+    let host = host_frame(object)?;
+    let logical = fullscreen_frame(object).unwrap_or(host);
+    Some(NSRect {
+        origin: NSPoint {
+            x: logical.origin.x - host.origin.x,
+            y: host.origin.y + host.size.height - logical.origin.y - logical.size.height,
+        },
+        size: logical.size,
+    })
+}
+
+/// Pixel bounds of the guest's logical NSWindow inside its SDL host surface.
+/// The host may stay display-sized in fullscreen. Round each edge separately
+/// to preserve half-point boundaries and use the same extent for every
+/// presentation backend, including those outside AppKit.
+pub fn presentation_clip(sdl: sdl3::Window) -> Option<sdl3::Rect> {
+    // The clip is consumed by Metal's FIFO worker. Use dimensions already
+    // published by the SDL video owner, never query the native SDL window.
+    let snapshot = sdl3::video::presentation_window(sdl)?;
+    let (width, height) = snapshot.logical_size;
+    let (pixels_w, pixels_h) = snapshot.pixel_size;
+    if width <= 0 || height <= 0 || pixels_w <= 0 || pixels_h <= 0 {
+        return None;
+    }
+    let window = window_for(sdl);
+    let surface = (!window.is_null()).then(|| surface_frame(window)).flatten();
+    let Some(surface) = surface else {
+        return Some(sdl3::Rect {
+            x: 0,
+            y: 0,
+            w: pixels_w,
+            h: pixels_h,
+        });
+    };
+    Some(pixel_clip_from_surface(
+        surface,
+        (width, height),
+        (pixels_w, pixels_h),
+    ))
+}
+
+/// Convert a top-origin AppKit rectangle to a half-open *unclipped* pixel
+/// rectangle. Every drawable and backing presenter uses this conversion so
+/// fractional origins and extents cannot disagree about the final edge.
+///
+/// A view can extend outside the physical window. Do not clamp here: Metal
+/// needs its full destination frame to map a clipped region back to the right
+/// source texels. Only `pixel_clip_from_surface` clamps to the host surface.
+pub(crate) fn pixel_rect_from_surface(
+    surface: NSRect,
+    (width, height): (i32, i32),
+    (pixels_w, pixels_h): (i32, i32),
+) -> sdl3::Rect {
+    let sx = f64::from(pixels_w) / f64::from(width.max(1));
+    let sy = f64::from(pixels_h) / f64::from(height.max(1));
+    let x0 = (surface.origin.x * sx).round() as i32;
+    let y0 = (surface.origin.y * sy).round() as i32;
+    let x1 = ((surface.origin.x + surface.size.width) * sx).round() as i32;
+    let y1 = ((surface.origin.y + surface.size.height) * sy).round() as i32;
+    sdl3::Rect {
+        x: x0,
+        y: y0,
+        w: x1.saturating_sub(x0).max(0),
+        h: y1.saturating_sub(y0).max(0),
+    }
+}
+
+/// The canonical host-clipped pixel rectangle: identical rounded endpoints
+/// to an unclipped drawable, intersected with SDL's physical pixel bounds.
+pub(crate) fn pixel_clip_from_surface(
+    surface: NSRect,
+    (width, height): (i32, i32),
+    (pixels_w, pixels_h): (i32, i32),
+) -> sdl3::Rect {
+    let pixels = pixel_rect_from_surface(surface, (width, height), (pixels_w, pixels_h));
+    let x0 = pixels.x.clamp(0, pixels_w);
+    let y0 = pixels.y.clamp(0, pixels_h);
+    let x1 = pixels.x.saturating_add(pixels.w).clamp(x0, pixels_w);
+    let y1 = pixels.y.saturating_add(pixels.h).clamp(y0, pixels_h);
+    sdl3::Rect {
+        x: x0,
+        y: y0,
+        w: x1 - x0,
+        h: y1 - y0,
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn physical_pixel_rects_share_independent_edge_rounding_at_one_and_two_x() {
+    let bounds = NSRect {
+        origin: NSPoint { x: 0.5, y: 0.5 },
+        size: NSSize {
+            width: 1438.5,
+            height: 898.5,
+        },
+    };
+    let uncut = pixel_rect_from_surface(bounds, (1440, 900), (1440, 900));
+    assert_eq!(
+        uncut,
+        sdl3::Rect {
+            x: 1,
+            y: 1,
+            w: 1438,
+            h: 898
+        }
+    );
+    assert_eq!(
+        pixel_clip_from_surface(bounds, (1440, 900), (1440, 900)),
+        uncut
+    );
+    let retina = pixel_rect_from_surface(bounds, (1440, 900), (2880, 1800));
+    assert_eq!(
+        retina,
+        sdl3::Rect {
+            x: 1,
+            y: 1,
+            w: 2877,
+            h: 1797
+        }
+    );
+    assert_eq!(
+        pixel_clip_from_surface(bounds, (1440, 900), (2880, 1800)),
+        retina
+    );
+    // An overhanging Metal child must keep its negative origin, even when
+    // its visible destination will subsequently be clipped to the window.
+    let outside = NSRect {
+        origin: NSPoint { x: -0.5, y: -0.5 },
+        size: NSSize {
+            width: 1441.0,
+            height: 901.0,
+        },
+    };
+    let raw = pixel_rect_from_surface(outside, (1440, 900), (1440, 900));
+    assert_eq!(
+        raw,
+        sdl3::Rect {
+            x: -1,
+            y: -1,
+            w: 1442,
+            h: 902
+        }
+    );
+    let visible = pixel_clip_from_surface(outside, (1440, 900), (1440, 900));
+    assert_eq!(
+        visible,
+        sdl3::Rect {
+            x: 0,
+            y: 0,
+            w: 1440,
+            h: 900
+        }
+    );
+}
+
+/// Map a rectangle in AppKit window base coordinates onto the host surface.
+pub(crate) fn rect_to_surface(object: Id, rect: NSRect) -> Option<NSRect> {
+    let surface = surface_frame(object)?;
+    Some(NSRect {
+        origin: NSPoint {
+            x: surface.origin.x + rect.origin.x,
+            y: surface.origin.y + surface.size.height - rect.origin.y - rect.size.height,
+        },
+        size: rect.size,
+    })
+}
+
+/// Whether a host-SDL point actually belongs to the guest's logical window.
+/// SDL's fullscreen container may be larger than the NSWindow. The same
+/// half-open edges are used for hit testing at windowed and fullscreen sizes.
+pub(crate) fn accepts_surface_point(object: Id, x: f32, y: f32) -> bool {
+    if fullscreen_frame(object).is_none() {
+        return true;
+    }
+    surface_frame(object).is_some_and(|surface| {
+        let x = f64::from(x);
+        let y = f64::from(y);
+        x >= surface.origin.x
+            && y >= surface.origin.y
+            && x < surface.origin.x + surface.size.width
+            && y < surface.origin.y + surface.size.height
+    })
+}
+
+/// The reverse mapping used by mouse events and cursor tracking.
+pub(crate) fn point_from_surface(object: Id, x: f64, y: f64) -> Option<NSPoint> {
+    let surface = surface_frame(object)?;
+    Some(NSPoint {
+        x: x - surface.origin.x,
+        y: surface.size.height - (y - surface.origin.y),
+    })
+}
+
+fn constrain_fullscreen_frame(mut rect: NSRect, host: NSRect) -> NSRect {
+    rect.size.width = rect.size.width.clamp(1.0, host.size.width.max(1.0));
+    rect.size.height = rect.size.height.clamp(1.0, host.size.height.max(1.0));
+    rect.origin.x = rect.origin.x.clamp(
+        host.origin.x,
+        host.origin.x + host.size.width - rect.size.width,
+    );
+    rect.origin.y = rect.origin.y.clamp(
+        host.origin.y,
+        host.origin.y + host.size.height - rect.size.height,
+    );
+    rect
+}
+
+/// Refresh the *already displayed* OpenGL surface's host-side boundary.
+/// A guest may stop swapping immediately after changing its NSWindow frame;
+/// its GL context can be current on another thread. Never issue GL commands
+/// here. On X11 an input-transparent shaped black child above the host window
+/// obscures out-of-bounds pixels immediately, including old front buffers.
+pub(crate) fn refresh_idle_opengl_clip(sdl: sdl3::Window) {
+    if sdl.is_null() || !draws_with_opengl(sdl) {
+        return;
+    }
+    #[cfg(target_os = "linux")]
+    {
+        if !sdl3::video::is_x11() && !sdl3::video::is_wayland() {
+            return;
+        }
+        let logical = if is_fullscreen(sdl) {
+            let clip = presentation_clip(sdl);
+            let points = sdl3::video::window_size(sdl);
+            let pixels = sdl3::video::window_size_in_pixels(sdl);
+            match (clip, points, pixels) {
+                (Some(clip), Some((w, h)), Some((pw, ph))) if pw > 0 && ph > 0 => {
+                    // X11 child coordinates are window points. Map *edges*
+                    // from the canonical pixel clip rather than rounding
+                    // origin and size independently.
+                    let x0 = (f64::from(clip.x) * f64::from(w) / f64::from(pw)).round() as i32;
+                    let x1 =
+                        (f64::from(clip.x + clip.w) * f64::from(w) / f64::from(pw)).round() as i32;
+                    let y0 = (f64::from(clip.y) * f64::from(h) / f64::from(ph)).round() as i32;
+                    let y1 =
+                        (f64::from(clip.y + clip.h) * f64::from(h) / f64::from(ph)).round() as i32;
+                    Some(sdl3::Rect {
+                        x: x0,
+                        y: y0,
+                        w: x1 - x0,
+                        h: y1 - y0,
+                    })
+                }
+                _ => None,
+            }
+        } else {
+            None
+        };
+        // If fullscreen ended, unmap the masking child immediately; the SDL
+        // fullscreen transition restores the physical window geometry.
+        if sdl3::video::is_x11() {
+            let _ = sdl3::x11_mask::update(sdl, logical);
+        } else {
+            let _ = sdl3::wayland_mask::update(sdl, logical);
+        }
+    }
+}
+
+fn set_fullscreen_frame(object: Id, rect: NSRect) {
+    let Some(host) = host_frame(object) else {
+        return;
+    };
+    let before = fullscreen_frame(object).unwrap_or(host);
+    // Will-exit callbacks still expose fullscreen style, but native AppKit
+    // has already lifted the settled Space's frame constraints.
+    let rect = if !in_fullscreen_transition(object) {
+        constrain_fullscreen_frame(rect, host)
+    } else {
+        rect
+    };
+    let window = window_of(object);
+    window.fullscreen_frame = rect;
+    window.requested = rect;
+    window.size_pending = 0;
+    trace!("{object:p} fullscreen logical frame {rect:?}; host {host:?}");
+    // Refresh the backing even when SDL's physical fullscreen extent stays
+    // unchanged; background and view clips may have changed in place.
+    crate::backing::window_background_changed(object);
+    refresh_idle_opengl_clip(window_of(object).sdl);
+    fit_content_view(object);
+    crate::screen::confine_pointer(object);
+    apply_mouse_confinement(object);
+    let content = window_of(object).content_view;
+    unsafe {
+        crate::view::update_tracking_areas(content);
+        crate::cursor::reset_rects_in_tree(content);
+    }
+    // Native AppKit posts resize synchronously, after fitting the content.
+    if before.size != rect.size {
+        crate::event::post_for(object, DID_RESIZE);
+    }
+    if before.origin.x != rect.origin.x
+        || before.origin.y + before.size.height != rect.origin.y + rect.size.height
+    {
+        crate::event::post_for(object, DID_MOVE);
+    }
 }
 
 /// Whether a titled toplevel is in full screen, where its chrome is hidden
@@ -542,10 +1235,9 @@ pub(crate) fn facts(object: Id) -> Option<crate::decor::Facts> {
             .to_string_lossy()
             .into_owned(),
         title_hidden: window.title_visibility == 1,
-        // A transparent titlebar shows the window behind it, which is its
-        // background colour, or AppKit's window background when none was set.
+        // A transparent titlebar shows the window behind it.
         titlebar_color: (window.titlebar_transparent != 0).then(|| {
-            let (r, g, b, a) = background_rgba(object).unwrap_or((0.93, 0.93, 0.93, 1.0));
+            let (r, g, b, a) = background_rgba(object);
             let byte = |v: f64| (v.clamp(0.0, 1.0) * 255.0).round() as u8;
             [byte(r), byte(g), byte(b), byte(a)]
         }),
@@ -559,10 +1251,16 @@ pub(crate) fn fit_content_view(object: Id) {
     if window.sdl.is_null() || window.content_view.is_null() {
         return;
     }
-    let Some((width, height)) = sdl3::video::window_size(window.sdl) else {
+    let size = fullscreen_frame(object).map(|rect| rect.size).or_else(|| {
+        sdl3::video::window_size(window.sdl).map(|(width, height)| NSSize {
+            width: f64::from(width),
+            height: f64::from(height),
+        })
+    });
+    let Some(size) = size else {
         return;
     };
-    fit_content_view_to(object, width, height);
+    fit_content_view_to(object, size);
 }
 
 /// SDL has reported the window's size, so it is the one to answer with again.
@@ -573,7 +1271,7 @@ pub(crate) fn size_settled(object: Id) {
 }
 
 /// The content view sized to a window `width` by `height`, titlebar included.
-fn fit_content_view_to(object: Id, width: i32, height: i32) {
+fn fit_content_view_to(object: Id, size: NSSize) {
     let window = window_of(object);
     if window.content_view.is_null() {
         return;
@@ -581,10 +1279,14 @@ fn fit_content_view_to(object: Id, width: i32, height: i32) {
     let frame = NSRect {
         origin: NSPoint::default(),
         size: NSSize {
-            width: f64::from(width),
-            height: (f64::from(height) - content_inset(object)).max(0.0),
+            width: size.width,
+            height: (size.height - content_inset(object)).max(0.0),
         },
     };
+    if !window.frame_view.is_null() {
+        layout_titlebar(object, frame.size);
+        return;
+    }
     // Sent rather than written, so a view that tracks its own size hears
     // about it.
     // SAFETY: `-setFrame:` is `void (id, SEL, NSRect)`.
@@ -943,6 +1645,11 @@ fn remake(receiver: Id, api: Api, want: Presentation) -> bool {
     // those are resolved through. Its backing store goes with it - SDL reuses
     // addresses, and a store left behind would be the next window's, at the
     // wrong size.
+    // Native GL contexts on render threads may remain current across raw GL
+    // calls. Retain the old parent and its popup family until those threads
+    // unbind or bind their replacement drawables.
+    crate::opengl::protect_remade_family(old);
+    rehome_popup_descendants(old, new);
     destroy_sdl_window(old);
     update_text_input(receiver);
     trace!("{receiver:p} remade as {want:?} ({api:?})");
@@ -952,6 +1659,7 @@ fn remake(receiver: Id, api: Api, want: Presentation) -> bool {
             sdl3::video::raise_window(new);
         }
     }
+    apply_mouse_confinement(receiver);
     true
 }
 
@@ -960,6 +1668,9 @@ fn remake(receiver: Id, api: Api, want: Presentation) -> bool {
 /// A user can drag or resize a window, and a remembered rectangle would then be
 /// where the program last put it rather than where it is.
 unsafe extern "C" fn frame(receiver: Id, _sel: Sel) -> NSRect {
+    if let Some(rect) = fullscreen_frame(receiver) {
+        return rect;
+    }
     let window = window_of(receiver);
     if window.sdl.is_null() {
         return NSRect::default();
@@ -1034,6 +1745,14 @@ unsafe extern "C" fn mouse_location_outside_of_event_stream(receiver: Id, _sel: 
     pointer_location(receiver)
 }
 
+#[cfg(test)]
+thread_local! {
+    /// A pointer in base coordinates that wins over every real source, so a
+    /// test does not depend on where the host's mouse happens to be.
+    pub(crate) static TEST_POINTER: std::cell::Cell<Option<NSPoint>> =
+        const { std::cell::Cell::new(None) };
+}
+
 /// Where the pointer is in a window's base coordinates, for the cursor
 /// rectangles as well as for the method above: [`crate::cursor`] has to decide
 /// which rectangle holds the pointer, and asking through `objc_msgSend` would
@@ -1041,6 +1760,10 @@ unsafe extern "C" fn mouse_location_outside_of_event_stream(receiver: Id, _sel: 
 pub fn pointer_location(window: Id) -> NSPoint {
     if window.is_null() {
         return NSPoint::default();
+    }
+    #[cfg(test)]
+    if let Some(point) = TEST_POINTER.get() {
+        return point;
     }
     let point = match crate::script::pointer().or_else(crate::event::frozen_pointer) {
         Some((x, y)) => crate::geometry::point_from_sdl(x as f64, y as f64),
@@ -1146,31 +1869,39 @@ unsafe extern "C" fn content_layout_rect(receiver: Id, _sel: Sel) -> NSRect {
 ///
 /// SDL2 sends it unasked-about whenever `NSAppKitVersionNumber` says 10.13, to
 /// implement a grabbed or confined window.
+/// Recompute guest confinement whenever the AppKit frame moves within SDL's surface.
+fn mouse_confinement_in_surface(receiver: Id) -> Option<sdl3::Rect> {
+    let rect = window_of(receiver).mouse_confinement;
+    if rect.size.width <= 0.0 || rect.size.height <= 0.0 {
+        return None;
+    }
+    let mapped = rect_to_surface(receiver, rect)?;
+    let points = sdl3::video::window_size(window_of(receiver).sdl)?;
+    Some(pixel_rect_from_surface(mapped, points, points))
+}
+
+fn apply_mouse_confinement(receiver: Id) {
+    let sdl = window_of(receiver).sdl;
+    if sdl.is_null() {
+        return;
+    }
+    if let Some(rect) = mouse_confinement_in_surface(receiver) {
+        crate::screen::set_pointer_confinement(sdl, Some(rect));
+    }
+}
+
+/// `-setMouseConfinementRect:` (10.13): keep guest coordinates across resizing.
 unsafe extern "C" fn set_mouse_confinement_rect(receiver: Id, _sel: Sel, rect: NSRect) {
-    // SAFETY: the receiver is a window of this crate's.
-    let sdl = unsafe { sdl_window(receiver) };
+    window_of(receiver).mouse_confinement = rect;
+    let sdl = window_of(receiver).sdl;
     if sdl.is_null() {
         return;
     }
     if rect.size.width <= 0.0 || rect.size.height <= 0.0 {
-        sdl3::video::set_mouse_rect(sdl, None);
-        return;
+        crate::screen::set_pointer_confinement(sdl, None);
+    } else {
+        apply_mouse_confinement(receiver);
     }
-    // SAFETY: as above.
-    let height = unsafe { frame(receiver, objc::sel::get("frame")) }
-        .size
-        .height;
-    // Window coordinates rise from the bottom of the frame; SDL's fall from its top.
-    let top = height - (rect.origin.y + rect.size.height);
-    sdl3::video::set_mouse_rect(
-        sdl,
-        Some(sdl3::Rect {
-            x: rect.origin.x.round() as i32,
-            y: top.round() as i32,
-            w: rect.size.width.round() as i32,
-            h: rect.size.height.round() as i32,
-        }),
-    );
 }
 
 /// The spellings that take the style explicitly, on the class and - for some
@@ -1194,6 +1925,10 @@ unsafe extern "C" fn frame_rect_for_content_style(
 }
 
 unsafe extern "C" fn set_frame(receiver: Id, _sel: Sel, rect: NSRect) {
+    if is_fullscreen(window_of(receiver).sdl) {
+        set_fullscreen_frame(receiver, rect);
+        return;
+    }
     let window = window_of(receiver);
     window.requested = rect;
     let sdl = window.sdl;
@@ -1214,7 +1949,13 @@ unsafe extern "C" fn set_frame(receiver: Id, _sel: Sel, rect: NSRect) {
     if sdl3::video::window_size(sdl) != Some((width.max(1), height.max(1))) {
         window.size_pending = 1;
     }
-    fit_content_view_to(receiver, width.max(1), height.max(1));
+    fit_content_view_to(
+        receiver,
+        NSSize {
+            width: f64::from(width.max(1)),
+            height: f64::from(height.max(1)),
+        },
+    );
 }
 
 unsafe extern "C" fn set_frame_display(receiver: Id, sel: Sel, rect: NSRect, _display: u8) {
@@ -1239,6 +1980,16 @@ unsafe extern "C" fn set_frame_origin(
     _sel: Sel,
     origin: foundation::geometry::NSPoint,
 ) {
+    // A standalone origin request is ignored in a settled fullscreen Space,
+    // but accepted inside will-exit callbacks (before the style bit clears).
+    if is_fullscreen(window_of(receiver).sdl) {
+        if in_fullscreen_transition(receiver) {
+            let mut rect = unsafe { frame(receiver, objc::sel::get("frame")) };
+            rect.origin = origin;
+            set_fullscreen_frame(receiver, rect);
+        }
+        return;
+    }
     let window = window_of(receiver);
     let sdl = window.sdl;
     if sdl.is_null() {
@@ -1264,6 +2015,18 @@ unsafe extern "C" fn set_frame_origin(
 
 unsafe extern "C" fn set_content_size(receiver: Id, _sel: Sel, size: NSSize) {
     let inset = content_inset(receiver);
+    if is_fullscreen(window_of(receiver).sdl) {
+        // Native content-size changes keep the top edge, unlike assigning
+        // just the size of a bottom-left-origin frame.
+        let mut rect = unsafe { frame(receiver, objc::sel::get("frame")) };
+        rect.origin.y += rect.size.height - (size.height + inset);
+        rect.size = NSSize {
+            width: size.width,
+            height: size.height + inset,
+        };
+        set_fullscreen_frame(receiver, rect);
+        return;
+    }
     let window = window_of(receiver);
     let size = NSSize {
         width: size.width,
@@ -1277,7 +2040,7 @@ unsafe extern "C" fn set_content_size(receiver: Id, _sel: Sel, size: NSSize) {
         if sdl3::video::window_size(sdl) != Some((width, height)) {
             window.size_pending = 1;
         }
-        fit_content_view_to(receiver, width, height);
+        fit_content_view_to(receiver, size);
     }
 }
 
@@ -1293,6 +2056,13 @@ unsafe extern "C" fn content_view(receiver: Id, _sel: Sel) -> Id {
 /// draws into a fraction of the window and reports a backing store that does not
 /// match it.
 unsafe extern "C" fn set_content_view(receiver: Id, _sel: Sel, view: Id) {
+    let previous = window_of(receiver).content_view;
+    if previous != view {
+        crate::view::will_move_to_window(previous, receiver, std::ptr::null_mut());
+        // SAFETY: null or a view of this crate's.
+        let from = unsafe { crate::view::window_of(view) };
+        crate::view::will_move_to_window(view, from, receiver);
+    }
     let window = window_of(receiver);
     let old = std::mem::replace(&mut window.content_view, objc::arc::retain(view));
     // The view being replaced may outlive this window: Qt keeps its own reference
@@ -1302,15 +2072,52 @@ unsafe extern "C" fn set_content_view(receiver: Id, _sel: Sel, view: Id) {
         // SAFETY: null or an object this runtime allocated.
         unsafe { crate::view::detach_window(old, receiver) };
     }
+    if !window.frame_view.is_null() && old != view {
+        if !old.is_null() {
+            // SAFETY: `-removeFromSuperview` is `void (id, SEL)`.
+            unsafe {
+                let f: unsafe extern "C" fn(Id, Sel) = std::mem::transmute(objc::msg::entry());
+                f(old, objc::sel::get("removeFromSuperview"));
+            }
+        }
+        if !view.is_null() {
+            send_view(window.frame_view, "addSubview:", view);
+        }
+    }
+    let moved = old != view;
+    if moved {
+        crate::view::did_move_to_window(old, receiver, std::ptr::null_mut());
+    }
     objc::arc::release(old);
     // SAFETY: `view` is null or an object this runtime allocated.
     unsafe { crate::view::set_window(view, receiver) };
+    if moved {
+        crate::view::did_move_to_window(view, std::ptr::null_mut(), receiver);
+    }
     if view.is_null() || window.sdl.is_null() {
         return;
     }
     fit_content_view(receiver);
     // SAFETY: a view this crate made, now this window's.
     unsafe { crate::view::update_tracking_areas(view) };
+}
+
+/// `-init`: a titled window with an empty content rectangle, through the
+/// designated initializer so a subclass's runs.
+unsafe extern "C" fn init_plain(receiver: Id, _sel: Sel) -> Id {
+    // SAFETY: `id (id, SEL, NSRect, NSUInteger, NSUInteger, BOOL)`.
+    unsafe {
+        let f: unsafe extern "C" fn(Id, Sel, NSRect, usize, usize, u8) -> Id =
+            std::mem::transmute(objc::msg::entry());
+        f(
+            receiver,
+            objc::sel::get("initWithContentRect:styleMask:backing:defer:"),
+            NSRect::default(),
+            style::TITLED,
+            2,
+            0,
+        )
+    }
 }
 
 unsafe extern "C" fn window_controller(receiver: Id, _sel: Sel) -> Id {
@@ -1395,9 +2202,47 @@ unsafe extern "C" fn set_title_with_represented_filename(receiver: Id, sel: Sel,
 
 /// `-display`: redraw the whole content view at the next pump.
 unsafe extern "C" fn display_window(receiver: Id, _sel: Sel) {
-    let content = window_of(receiver).content_view;
+    let content = content_view_of(receiver);
     if !content.is_null() {
         crate::backing::needs_display(content);
+    }
+}
+
+/// A window coming onto the screen with no first responder gets its initial
+/// first responder, or else the first view of its key view loop that takes
+/// it, before it becomes key. Qt ignores becoming key unless its view is
+/// already first responder by then.
+///
+/// FIXME (ACCURACY): the key view loop is only the one a program wired;
+/// AppKit's automatic loop over every subview is not computed.
+fn set_up_first_responder(receiver: Id) {
+    let window = window_of(receiver);
+    if !window.first_responder.is_null() {
+        return;
+    }
+    let initial = match window.initial_first_responder {
+        initial if !initial.is_null() => initial,
+        _ => default_first_responder(receiver),
+    };
+    if !initial.is_null() {
+        // SAFETY: this window, and a responder in it.
+        unsafe { make_first_responder(receiver, objc::sel::get("makeFirstResponder:"), initial) };
+    }
+}
+
+fn default_first_responder(receiver: Id) -> Id {
+    let content = content_view_of(receiver);
+    if content.is_null() || crate::event::accepts_first_responder(content) {
+        return content;
+    }
+    // SAFETY: `-nextValidKeyView` is `NSView *(id, SEL)`.
+    let next = unsafe {
+        let f: unsafe extern "C" fn(Id, Sel) -> Id = std::mem::transmute(objc::msg::entry());
+        f(content, objc::sel::get("nextValidKeyView"))
+    };
+    match crate::event::accepts_first_responder(next) {
+        true => next,
+        false => std::ptr::null_mut(),
     }
 }
 
@@ -1410,6 +2255,8 @@ unsafe extern "C" fn order_front_regardless(receiver: Id, _sel: Sel) {
 }
 
 fn order_front(receiver: Id, make_key: bool) {
+    // Its views are owed their first `-updateConstraints` before it draws.
+    crate::layout::note_tree_changed();
     let window = window_of(receiver);
     if window.sdl.is_null() {
         return;
@@ -1457,15 +2304,10 @@ fn order_front(receiver: Id, make_key: bool) {
         sdl3::video::window_position(sdl),
         sdl3::video::window_size(sdl),
     );
+    set_up_first_responder(receiver);
     if make_key && want != Presentation::Tooltip {
         KEY.store(receiver as usize, std::sync::atomic::Ordering::Release);
         crate::event::announce_key(receiver);
-    }
-    let window = window_of(receiver);
-    if window.first_responder.is_null() && !window.initial_first_responder.is_null() {
-        let initial = window.initial_first_responder;
-        // SAFETY: this window, and a responder the guest named.
-        unsafe { make_first_responder(receiver, objc::sel::get("makeFirstResponder:"), initial) };
     }
     // Where the window actually ended up. On a Mac a window is placed exactly
     // where it was asked to be, so a toolkit has no reason to look again; here
@@ -1515,11 +2357,15 @@ unsafe extern "C" fn order_out(receiver: Id, _sel: Sel, _sender: Id) {
 /// be keyed by it, and that table is not this crate's to clear.
 pub(crate) unsafe extern "C" fn dealloc(receiver: Id, sel: Sel) {
     crate::event::forget_announced(receiver);
+    crate::sheet::forget(receiver);
     children()
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .retain(|(p, c)| *p != receiver as usize && *c != receiver as usize);
     let window = window_of(receiver);
+    if !window.sdl.is_null() {
+        crate::view::forget_metal_scene(window.sdl);
+    }
     objc::arc::release(std::mem::replace(
         &mut window.appearance,
         std::ptr::null_mut(),
@@ -1534,6 +2380,14 @@ pub(crate) unsafe extern "C" fn dealloc(receiver: Id, sel: Sel) {
     ));
     objc::arc::release(std::mem::replace(
         &mut window.represented_filename,
+        std::ptr::null_mut(),
+    ));
+    let frame_view = std::mem::replace(&mut window.frame_view, std::ptr::null_mut());
+    // SAFETY: null or an object this runtime allocated.
+    unsafe { crate::view::detach_window(frame_view, receiver) };
+    objc::arc::release(frame_view);
+    objc::arc::release(std::mem::replace(
+        &mut window.accessories,
         std::ptr::null_mut(),
     ));
     // SAFETY: `-orderOut:` is `void (id, SEL, id)`; it also gives up key status.
@@ -1765,6 +2619,14 @@ unsafe extern "C" fn set_hides_on_deactivate(receiver: Id, _sel: Sel, value: u8)
     window_of(receiver).hides_on_deactivate = value as usize;
 }
 
+unsafe extern "C" fn is_excluded_from_windows_menu(receiver: Id, _sel: Sel) -> u8 {
+    (window_of(receiver).excluded_from_windows_menu != 0) as u8
+}
+
+unsafe extern "C" fn set_excluded_from_windows_menu(receiver: Id, _sel: Sel, value: u8) {
+    window_of(receiver).excluded_from_windows_menu = value as usize;
+}
+
 unsafe extern "C" fn is_key_window(receiver: Id, _sel: Sel) -> u8 {
     (key_window() == receiver) as u8
 }
@@ -1803,16 +2665,24 @@ unsafe extern "C" fn constrain_frame_rect(
     rect
 }
 
+/// An attached sheet is visible whether or not it has a window of its own:
+/// an alert's is drawn by `crate::dialog`.
 unsafe extern "C" fn is_visible(receiver: Id, _sel: Sel) -> u8 {
-    (window_of(receiver).shown != 0) as u8
+    (window_of(receiver).shown != 0 || crate::sheet::parent_of(receiver).is_some()) as u8
 }
 
+/// `-screen`: the display SDL puts the window on, so per-display answers such
+/// as a fullscreen work area reach a window on a secondary monitor.
 unsafe extern "C" fn screen(receiver: Id, _sel: Sel) -> Id {
+    let sdl = window_of(receiver).sdl;
+    if let Some(display) = (!sdl.is_null())
+        .then(|| sdl3::video::display_for_window(sdl))
+        .flatten()
+    {
+        return crate::screen::screen_object(c"NSScreen", display);
+    }
     let class = objc::class::ptr(objc::class::lookup(c"NSScreen").expect("NSScreen")) as Id;
-    // SAFETY: `+mainScreen` is `id (Class, SEL)`. The display a window is
-    // actually on is a question SDL can answer and this does not ask, because
-    // nothing in this tree yet distinguishes them.
-    let _ = receiver;
+    // SAFETY: `+mainScreen` is `id (Class, SEL)`.
     unsafe {
         let f: unsafe extern "C" fn(Id, Sel) -> Id = std::mem::transmute(objc::msg::entry());
         f(class, objc::sel::get("mainScreen"))
@@ -1871,30 +2741,40 @@ unsafe extern "C" fn set_background_color(receiver: Id, _sel: Sel, color: Id) {
     crate::backing::window_background_changed(receiver);
 }
 
-/// The window's `backgroundColor` as straight RGBA, or `None` when the
-/// program never set one.
-fn background_rgba(window: Id) -> Option<(f64, f64, f64, f64)> {
+/// The window's `backgroundColor` as straight RGBA: `windowBackgroundColor`
+/// in the current appearance when the program never set one.
+fn background_rgba(window: Id) -> (f64, f64, f64, f64) {
     let color = window_of(window).background;
-    // SAFETY: an object the window retained.
-    (!color.is_null()).then(|| unsafe { crate::color::components(color) })
+    match color.is_null() {
+        true => crate::color::named_components(WINDOW_BACKGROUND)
+            .expect("windowBackgroundColor is a named colour"),
+        // SAFETY: an object the window retained.
+        false => unsafe { crate::color::components(color) },
+    }
 }
 
-/// The window's `backgroundColor` as one premultiplied BGRA pixel, or `None`
-/// when the program never set one.
-pub(crate) fn background_pixel(window: Id) -> Option<[u8; 4]> {
-    let (red, green, blue, alpha) = background_rgba(window)?;
+/// The window's `backgroundColor` as one premultiplied BGRA pixel.
+pub(crate) fn background_pixel(window: Id) -> [u8; 4] {
+    let (red, green, blue, alpha) = background_rgba(window);
     let alpha = alpha.clamp(0.0, 1.0);
     let channel = |value: f64| (value.clamp(0.0, 1.0) * alpha * 255.0).round() as u8;
-    Some([
+    [
         channel(blue),
         channel(green),
         channel(red),
         (alpha * 255.0).round() as u8,
-    ])
+    ]
 }
 
+/// The colour a window has until the program sets its own.
+const WINDOW_BACKGROUND: &str = "windowBackgroundColor";
+
 unsafe extern "C" fn background_color(receiver: Id, _sel: Sel) -> Id {
-    window_of(receiver).background
+    let color = window_of(receiver).background;
+    match color.is_null() {
+        true => crate::color::named_color(WINDOW_BACKGROUND).unwrap_or(color),
+        false => color,
+    }
 }
 
 unsafe extern "C" fn set_accepts_mouse_moved(receiver: Id, _sel: Sel, accepts: u8) {
@@ -2102,6 +2982,39 @@ fn update_text_input(receiver: Id) {
     }
 }
 
+/// Keep the host input method on only while the first responder sends its keys
+/// through the text system, once a key down has reached it.
+///
+/// AppKit's input method sees only the keys a view hands to its input context.
+/// A view may stay first responder and stop doing that - Roblox keeps a hidden
+/// text view focused and sends game keys around it - and a host input method
+/// left on would keep composing and offering accents for those keys.
+pub(crate) fn follow_key_interpretation(receiver: Id) {
+    let window = window_of(receiver);
+    if window.sdl.is_null() || !crate::text::is_input_client(window.first_responder) {
+        return;
+    }
+    let interpreting = crate::text::accepts_host_text(window.first_responder);
+    if interpreting == sdl3::video::text_input_active(window.sdl) {
+        return;
+    }
+    match interpreting {
+        true => {
+            set_text_input_area(window);
+            sdl3::video::start_text_input(window.sdl);
+        }
+        false => {
+            sdl3::video::stop_text_input(window.sdl);
+        }
+    }
+}
+
+/// Whether the host input method is resolving this window's keys into text.
+pub(crate) fn host_text_input_active(receiver: Id) -> bool {
+    let window = window_of(receiver);
+    !window.sdl.is_null() && sdl3::video::text_input_active(window.sdl)
+}
+
 fn set_text_input_area(window: &Window) {
     let area = crate::text::input_area(window.first_responder);
     // SAFETY: an input client or the text field whose editor it is; both are
@@ -2159,29 +3072,118 @@ unsafe extern "C" fn accepts_responder_change(_receiver: Id, _sel: Sel) -> u8 {
     1
 }
 
-/// `-toggleFullScreen:`, which SDL does have.
-///
-/// The one window operation in this file that is not bookkeeping: a game asks
-/// for it from a menu item or a keystroke, and a window that stayed the same
-/// size would look like the request was lost.
-unsafe extern "C" fn toggle_full_screen(receiver: Id, _sel: Sel, _sender: Id) {
-    let window = window_of(receiver);
-    if window.sdl.is_null() {
+#[cfg(test)]
+thread_local! {
+    static REJECT_NEXT_FULLSCREEN_REQUEST: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+fn request_host_fullscreen(sdl: sdl3::Window, wanted: bool) -> bool {
+    #[cfg(test)]
+    if REJECT_NEXT_FULLSCREEN_REQUEST.with(|reject| reject.replace(false)) {
+        return false;
+    }
+    sdl3::video::set_window_fullscreen(sdl, wanted)
+}
+
+/// Failure is a delegate method taking NSWindow*, not an NSNotification.
+fn report_fullscreen_failure(receiver: Id, entering: bool) {
+    let delegate = window_of(receiver).delegate;
+    if delegate.is_null() {
         return;
     }
-    let wanted = window.fullscreen == 0;
-    if sdl3::video::set_window_fullscreen(window.sdl, wanted) {
-        window.fullscreen = wanted as usize;
-        // The matching "did" is posted from the event pump once the
-        // compositor has made the change; see `window_state_changed`.
-        crate::event::post_for(
-            receiver,
-            match wanted {
-                true => WILL_ENTER_FULL_SCREEN,
-                false => WILL_EXIT_FULL_SCREEN,
-            },
-        );
+    let sel = objc::sel::get(if entering {
+        "windowDidFailToEnterFullScreen:"
+    } else {
+        "windowDidFailToExitFullScreen:"
+    });
+    let method = unsafe { objc::object::class_of(delegate) }.and_then(|c| c.method(sel));
+    if let Some(method) = method {
+        // SAFETY: these NSWindowDelegate callbacks take the window itself.
+        unsafe {
+            let f: unsafe extern "C" fn(Id, Sel, Id) = std::mem::transmute(method.implementation());
+            f(delegate, sel, receiver);
+        }
     }
+}
+
+/// Longer than any compositor's fullscreen animation. A request still
+/// unanswered after this was refused or deferred, not in progress.
+const FULLSCREEN_TRANSITION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// Milliseconds since the first transition, plus one: the nonzero value of
+/// `fullscreen_transition` is when it began.
+fn transition_stamp() -> usize {
+    static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    START
+        .get_or_init(std::time::Instant::now)
+        .elapsed()
+        .as_millis() as usize
+        + 1
+}
+
+/// Whether a fullscreen transition is still in progress. One the host never
+/// answered ends here as a failure, or every later toggle would be ignored.
+fn in_fullscreen_transition(receiver: Id) -> bool {
+    let window = window_of(receiver);
+    let began = window.fullscreen_transition;
+    if began == 0 {
+        return false;
+    }
+    if transition_stamp().saturating_sub(began) < FULLSCREEN_TRANSITION_TIMEOUT.as_millis() as usize
+    {
+        return true;
+    }
+    let entering = window.fullscreen != 0;
+    window.fullscreen_transition = 0;
+    window.fullscreen = window.reported_fullscreen;
+    if entering {
+        window.fullscreen_restore = NSRect::default();
+    }
+    report_fullscreen_failure(receiver, entering);
+    false
+}
+
+/// `-toggleFullScreen:` requests an SDL transition. Keep the window alive
+/// across its synchronous AppKit will-notification and handle host rejection.
+unsafe extern "C" fn toggle_full_screen(receiver: Id, _sel: Sel, _sender: Id) {
+    if window_of(receiver).sdl.is_null() || in_fullscreen_transition(receiver) {
+        return;
+    }
+    let window = window_of(receiver);
+    let wanted = window.fullscreen == 0;
+    let was_shown = window.shown != 0;
+    if wanted {
+        window.fullscreen_restore = unsafe { frame(receiver, objc::sel::get("frame")) };
+    }
+    window.fullscreen_transition = transition_stamp();
+    // Lifecycle observers may release the window or replace its SDL surface.
+    // Retain AppKit ownership across callbacks and reacquire the live host handle.
+    objc::arc::retain(receiver);
+    crate::event::post_for(
+        receiver,
+        if wanted {
+            WILL_ENTER_FULL_SCREEN
+        } else {
+            WILL_EXIT_FULL_SCREEN
+        },
+    );
+    let live = window_of(receiver).sdl;
+    let cancelled = live.is_null() || (was_shown && window_of(receiver).shown == 0);
+    if !cancelled && request_host_fullscreen(live, wanted) {
+        window_of(receiver).fullscreen = wanted as usize;
+        // SDL only records a hidden window's request; its state event comes
+        // when the window is shown, and a toggle before then is a new request.
+        if sdl3::video::window_flags(live) & sdl3::video::flags::HIDDEN != 0 {
+            window_of(receiver).fullscreen_transition = 0;
+        }
+    } else {
+        window_of(receiver).fullscreen_transition = 0;
+        if wanted {
+            window_of(receiver).fullscreen_restore = NSRect::default();
+        }
+        report_fullscreen_failure(receiver, wanted);
+    }
+    objc::arc::release(receiver);
 }
 
 /// The `NSWindowCollectionBehavior` bits that decide full screen.
@@ -2255,6 +3257,44 @@ unsafe extern "C" fn deminiaturize(receiver: Id, sel: Sel, sender: Id) {
     unsafe { make_key_and_order_front(receiver, sel, sender) };
 }
 
+/// A host resize/move can be queued before the matching window-state event.
+/// The fullscreen transition itself posts the native-ordered geometry notices.
+pub(crate) fn fullscreen_state_pending(receiver: Id) -> bool {
+    if receiver.is_null() || window_of(receiver).sdl.is_null() {
+        return false;
+    }
+    is_fullscreen(window_of(receiver).sdl) != (window_of(receiver).reported_fullscreen != 0)
+}
+
+/// Suppress the host's redundant post-transition event, not a later real move.
+/// Keep the remembered frame while it matches: some WMs send multiple echoes.
+pub(crate) fn redundant_fullscreen_geometry(receiver: Id, resize: Option<(i32, i32)>) -> bool {
+    if receiver.is_null() {
+        return false;
+    }
+    let window = window_of(receiver);
+    let expected = window.fullscreen_announced_frame;
+    let redundant = if let Some((width, height)) = resize {
+        if window.fullscreen_announced_resize == 0 {
+            return false;
+        }
+        expected.size.width == f64::from(width) && expected.size.height == f64::from(height)
+    } else {
+        if window.fullscreen_announced_move == 0 {
+            return false;
+        }
+        host_frame(receiver).is_some_and(|host| host.origin == expected.origin)
+    };
+    if !redundant {
+        if resize.is_some() {
+            window_of(receiver).fullscreen_announced_resize = 0;
+        } else {
+            window_of(receiver).fullscreen_announced_move = 0;
+        }
+    }
+    redundant
+}
+
 /// Follow the window manager minimizing or restoring a window, from the
 /// event pump; answers the notification to post, if any.
 pub(crate) fn window_state_changed(receiver: Id) -> Option<&'static str> {
@@ -2273,7 +3313,46 @@ pub(crate) fn window_state_changed(receiver: Id) -> Option<&'static str> {
     let minimized = flags & sdl3::video::flags::MINIMIZED != 0;
     let changed = minimized != (window.miniaturized != 0);
     window.miniaturized = minimized as usize;
+    if entered {
+        window.fullscreen_frame = NSRect::default();
+        window.fullscreen_transition = 0;
+    }
     refit_inset(receiver);
+    // SDL can report the new fullscreen state before it settles physical
+    // window geometry. Recompute after clearing stale transition geometry.
+    if entered {
+        refresh_idle_opengl_clip(window_of(receiver).sdl);
+    }
+    if entered {
+        crate::screen::confine_pointer(receiver);
+        apply_mouse_confinement(receiver);
+    }
+    let restore_target = window_of(receiver).fullscreen_restore;
+    if entered && !fullscreen && restore_target.size.width > 0.0 {
+        let restore = std::mem::take(&mut window_of(receiver).fullscreen_restore);
+        // SDL's restore state and AppKit's restore frame are separate: a
+        // request from a will-enter callback must not overwrite the latter.
+        unsafe { set_frame(receiver, objc::sel::get("setFrame:"), restore) };
+    }
+    if entered && !changed {
+        // Native AppKit settles geometry before -windowDidEnter/ExitFullScreen:.
+        // SDL can deliver its resize/move events only after its state event, so
+        // announce the settled AppKit geometry now and discard their later echoes.
+        let host_target = if !fullscreen && restore_target.size.width > 0.0 {
+            restore_target
+        } else {
+            host_frame(receiver).unwrap_or_default()
+        };
+        let window = window_of(receiver);
+        window.fullscreen_announced_frame = host_target;
+        window.fullscreen_announced_resize = 1;
+        window.fullscreen_announced_move = 1;
+        fit_content_view(receiver);
+        crate::event::post_for(receiver, DID_RESIZE);
+        if !fullscreen {
+            crate::event::post_for(receiver, DID_MOVE);
+        }
+    }
     match (changed, minimized, entered, fullscreen) {
         (true, true, ..) => Some(DID_MINIATURIZE),
         (true, false, ..) => Some(DID_DEMINIATURIZE),
@@ -2572,6 +3651,62 @@ unsafe extern "C" fn effective_appearance(receiver: Id, sel: Sel) -> Id {
     crate::appearance::effective_of(crate::application::shared())
 }
 
+/// Send a getter answering an `NSRect`, which returns through `_stret`.
+fn send_rect(receiver: Id, selector: &str) -> NSRect {
+    if receiver.is_null() {
+        return NSRect::default();
+    }
+    // SAFETY: `NSRect (id, SEL)`.
+    unsafe {
+        let f: unsafe extern "C" fn(Id, Sel) -> NSRect =
+            std::mem::transmute(objc::msg::entry_stret());
+        f(receiver, objc::sel::get(selector))
+    }
+}
+
+/// `-stringWithSavedFrame`: the frame and its screen's visible frame, as
+/// AppKit spells them: eight numbers, each followed by a space.
+unsafe extern "C" fn string_with_saved_frame(receiver: Id, _sel: Sel) -> Id {
+    let frame = send_rect(receiver, "frame");
+    // SAFETY: `NSScreen * (id, SEL)`.
+    let screen = unsafe {
+        let f: unsafe extern "C" fn(Id, Sel) -> Id = std::mem::transmute(objc::msg::entry());
+        f(receiver, objc::sel::get("screen"))
+    };
+    let visible = send_rect(screen, "visibleFrame");
+    let text: String = [frame, visible]
+        .iter()
+        .flat_map(|r| [r.origin.x, r.origin.y, r.size.width, r.size.height])
+        .map(|n| format!("{} ", n.round() as i64))
+        .collect();
+    objc::arc::autorelease(foundation::string::from_str(&text))
+}
+
+/// `-setFrameFromString:`: the first four numbers of a saved frame.
+unsafe extern "C" fn set_frame_from_string(receiver: Id, _sel: Sel, string: Id) {
+    // SAFETY: an `NSString` or nil.
+    let text = String::from_utf8_lossy(&unsafe { foundation::string::bytes(string) }).into_owned();
+    let numbers: Vec<f64> = text
+        .split_whitespace()
+        .filter_map(|n| n.parse().ok())
+        .collect();
+    let [x, y, width, height, ..] = numbers[..] else {
+        return;
+    };
+    if width <= 0.0 || height <= 0.0 {
+        return;
+    }
+    let frame = NSRect {
+        origin: NSPoint { x, y },
+        size: NSSize { width, height },
+    };
+    // SAFETY: `void (id, SEL, NSRect, BOOL)`.
+    unsafe {
+        let f: unsafe extern "C" fn(Id, Sel, NSRect, u8) = std::mem::transmute(objc::msg::entry());
+        f(receiver, objc::sel::get("setFrame:display:"), frame, 1);
+    }
+}
+
 pub(crate) fn install() {
     let responder = objc::class::lookup(c"NSResponder").expect("declared before its methods");
     methods!(responder, {
@@ -2598,6 +3733,7 @@ pub(crate) fn install() {
         "appearance" => appearance, c"@16@0:8";
         "setAppearance:" => set_appearance, c"v24@0:8@16";
         "effectiveAppearance" => effective_appearance, c"@16@0:8";
+        "init" => init_plain, c"@16@0:8";
         "initWithContentRect:styleMask:backing:defer:" => init_with_content_rect,
             c"@56@0:8{CGRect={CGPoint=dd}{CGSize=dd}}16Q48Q56c64";
         "initWithContentRect:styleMask:backing:defer:screen:" => init_with_content_rect_screen,
@@ -2638,6 +3774,10 @@ pub(crate) fn install() {
             c"{CGRect={CGPoint=dd}{CGSize=dd}}48@0:8{CGRect={CGPoint=dd}{CGSize=dd}}16";
         "setContentSize:" => set_content_size, c"v32@0:8{CGSize=dd}16";
         "contentView" => content_view, c"@16@0:8";
+        "addTitlebarAccessoryViewController:" => add_titlebar_accessory, c"v24@0:8@16";
+        "insertTitlebarAccessoryViewController:atIndex:" => insert_titlebar_accessory, c"v32@0:8@16q24";
+        "removeTitlebarAccessoryViewControllerAtIndex:" => remove_titlebar_accessory, c"v24@0:8q16";
+        "titlebarAccessoryViewControllers" => titlebar_accessories, c"@16@0:8";
         "setContentView:" => set_content_view, c"v24@0:8@16";
         "delegate" => delegate, c"@16@0:8";
         "windowController" => window_controller, c"@16@0:8";
@@ -2655,11 +3795,12 @@ pub(crate) fn install() {
         "orderFront:" => make_key_and_order_front, c"v24@0:8@16";
         "orderFrontRegardless" => order_front_regardless, c"v16@0:8";
         "orderOut:" => order_out, c"v24@0:8@16";
-        "endSheet:" => ignored_object, c"v24@0:8@16";
         "close" => close, c"v16@0:8";
         "dealloc" => dealloc, c"v16@0:8";
         "performClose:" => perform_close, c"v24@0:8@16";
         "isKeyWindow" => is_key_window, c"c16@0:8";
+        // The application's: a window has no event of its own.
+        "currentEvent" => crate::application::current_event, c"@16@0:8";
         "canBecomeKeyWindow" => can_become_key, c"c16@0:8";
         "canBecomeMainWindow" => can_become_key, c"c16@0:8";
         "constrainFrameRect:toScreen:" => constrain_frame_rect,
@@ -2667,9 +3808,8 @@ pub(crate) fn install() {
         "isMainWindow" => is_key_window, c"c16@0:8";
         "isVisible" => is_visible, c"c16@0:8";
         "setIsVisible:" => set_is_visible, c"v20@0:8c16";
-        // No window is ever attached as a sheet: nothing implements -beginSheet:.
-        "isSheet" => no, c"c16@0:8";
-        "attachedSheet" => nil, c"@16@0:8";
+        // One space: ordering any window in puts it on the active one.
+        "isOnActiveSpace" => yes, c"c16@0:8";
         "screen" => screen, c"@16@0:8";
         "backingScaleFactor" => backing_scale_factor, c"d16@0:8";
         "userSpaceScaleFactor" => user_space_scale_factor, c"d16@0:8";
@@ -2690,6 +3830,8 @@ pub(crate) fn install() {
         "setOpaque:" => ignored_flag, c"v20@0:8c16";
         "setHidesOnDeactivate:" => set_hides_on_deactivate, c"v20@0:8c16";
         "hidesOnDeactivate" => hides_on_deactivate, c"c16@0:8";
+        "setExcludedFromWindowsMenu:" => set_excluded_from_windows_menu, c"v20@0:8c16";
+        "isExcludedFromWindowsMenu" => is_excluded_from_windows_menu, c"c16@0:8";
         "orderBack:" => ignored_object, c"v24@0:8@16";
         "occlusionState" => visible_occlusion, c"Q16@0:8";
         "setToolbar:" => ignored_object, c"v24@0:8@16";
@@ -2704,6 +3846,8 @@ pub(crate) fn install() {
         "saveFrameUsingName:" => ignored_integer, c"v24@0:8@16";
         "setFrameUsingName:" => no_with_object, c"c24@0:8@16";
         "setFrameAutosaveName:" => yes_with_object, c"c24@0:8@16";
+        "stringWithSavedFrame" => string_with_saved_frame, c"@16@0:8";
+        "setFrameFromString:" => set_frame_from_string, c"v24@0:8@16";
         // The textured bottom bar: no such chrome is drawn here.
         "setContentBorderThickness:forEdge:" => ignored_border, c"v32@0:8d16Q24";
         "setAutorecalculatesContentBorderThickness:forEdge:" => ignored_border_flag, c"v28@0:8c16Q20";
@@ -2794,6 +3938,10 @@ pub(crate) fn install() {
         "discardCursorRects" => discard_cursor_rects, c"v16@0:8";
     });
 }
+
+#[cfg(test)]
+#[path = "window_fullscreen_tests.rs"]
+mod fullscreen_tests;
 
 #[cfg(test)]
 mod tests {
@@ -3145,6 +4293,9 @@ mod tests {
     /// keeps its identity and its place when it does.
     #[test]
     fn a_window_rebuilt_for_opengl_keeps_what_it_had() {
+        if !sdl3::isolated::run_here() {
+            return;
+        }
         crate::bootstrap();
         let object =
             objc::object::create_instance(objc::class::lookup(c"NSWindow").expect("NSWindow"), 0);
@@ -3207,11 +4358,570 @@ mod tests {
         assert_eq!(unsafe { sdl_window(object) }, after);
     }
 
+    /// An explicitly ordered-out popup must not reappear when its parent is
+    /// remade, even though SDL shows native child popups with their parent.
+    #[test]
+    fn hidden_popup_stays_hidden_across_parent_remake_until_order_front() {
+        if !sdl3::isolated::run_here() {
+            return;
+        }
+
+        crate::bootstrap();
+        let Some(probe) = sdl3::video::create_window(c"hidden popup preflight", 32, 32, 0) else {
+            return; // no graphical SDL display available
+        };
+        sdl3::video::destroy_window(probe);
+        let rect = NSRect {
+            origin: NSPoint { x: 20.0, y: 20.0 },
+            size: NSSize {
+                width: 180.0,
+                height: 120.0,
+            },
+        };
+        let class = objc::class::lookup(c"NSWindow").unwrap();
+        let make = || {
+            let object = objc::object::create_instance(class, 0);
+            unsafe {
+                init_with_content_rect(
+                    object,
+                    objc::sel::get("initWithContentRect:styleMask:backing:defer:"),
+                    rect,
+                    0,
+                    0,
+                    0,
+                )
+            }
+        };
+        // Both undecided (potential Vulkan) and OpenGL-owned popup paths
+        // must retain the guest's ordered-out state.
+        for gl_child in [false, true] {
+            let parent = make();
+            let child = make();
+            order_front(parent, true);
+            unsafe { set_level(child, objc::sel::get("setLevel:"), window_level::POPUP_MENU) };
+            order_front(child, false);
+            if gl_child {
+                assert!(rebuild_for_opengl(child), "convert child to OpenGL");
+            }
+            let original_parent = unsafe { sdl_window(parent) };
+            let original_child = unsafe { sdl_window(child) };
+            assert_eq!(sdl3::video::window_parent(original_child), original_parent);
+            assert!(is_shown(child));
+            assert_eq!(
+                sdl3::video::window_flags(original_child) & sdl3::video::flags::HIDDEN,
+                0
+            );
+
+            // Exercise the public Objective-C guest operation, not simply
+            // mutate AppKit's visibility marker.
+            unsafe {
+                let order: unsafe extern "C" fn(Id, Sel, Id) =
+                    std::mem::transmute(objc::msg::entry());
+                order(child, objc::sel::get("orderOut:"), std::ptr::null_mut());
+            }
+            assert!(!is_shown(child));
+            assert_ne!(
+                sdl3::video::window_flags(original_child) & sdl3::video::flags::HIDDEN,
+                0
+            );
+
+            assert!(rebuild_for_opengl(parent), "parent remake");
+            let replacement_parent = unsafe { sdl_window(parent) };
+            let replacement_child = unsafe { sdl_window(child) };
+            assert_ne!(replacement_parent, original_parent);
+            assert_ne!(replacement_child, original_child);
+            assert_eq!(
+                sdl3::video::window_parent(replacement_child),
+                replacement_parent
+            );
+            assert_eq!(window_for(replacement_child), child);
+            assert!(is_shown(parent));
+            assert!(!is_shown(child), "AppKit resurrected the ordered-out popup");
+            assert_ne!(
+                sdl3::video::window_flags(replacement_child) & sdl3::video::flags::HIDDEN,
+                0,
+                "SDL resurrected the ordered-out popup when its parent was shown"
+            );
+            assert_eq!(draws_with_opengl(replacement_child), gl_child);
+
+            unsafe {
+                let order: unsafe extern "C" fn(Id, Sel, Id) =
+                    std::mem::transmute(objc::msg::entry());
+                order(child, objc::sel::get("orderFront:"), std::ptr::null_mut());
+            }
+            assert!(is_shown(child));
+            assert_eq!(
+                sdl3::video::window_flags(replacement_child) & sdl3::video::flags::HIDDEN,
+                0,
+                "orderFront did not restore the popup's native visibility"
+            );
+            assert_eq!(
+                unsafe { sdl_window(child) },
+                replacement_child,
+                "orderFront unnecessarily remade the popup"
+            );
+        }
+    }
+
+    /// A guest NSOpenGLContext must keep its native context when its SDL popup
+    /// is reparented by an unrelated parent window recreation.
+    #[test]
+    fn gl_popup_rehome_preserves_guest_context_and_surface_ownership() {
+        if !sdl3::isolated::run_here() {
+            return;
+        }
+
+        crate::bootstrap();
+        let Some(probe) = sdl3::video::create_window(c"GL test preflight", 32, 32, 0) else {
+            return; // graphical display unavailable
+        };
+        sdl3::video::destroy_window(probe);
+        let rect = NSRect {
+            origin: NSPoint { x: 20.0, y: 20.0 },
+            size: NSSize {
+                width: 180.0,
+                height: 120.0,
+            },
+        };
+        let class = objc::class::lookup(c"NSWindow").unwrap();
+        let make = || {
+            let object = objc::object::create_instance(class, 0);
+            // SAFETY: normal designated NSWindow initializer and a fresh object.
+            unsafe {
+                init_with_content_rect(
+                    object,
+                    objc::sel::get("initWithContentRect:styleMask:backing:defer:"),
+                    rect,
+                    0,
+                    0,
+                    0,
+                )
+            }
+        };
+        let parent = make();
+        let child = make();
+        order_front(parent, true);
+        unsafe { set_level(child, objc::sel::get("setLevel:"), window_level::POPUP_MENU) };
+        order_front(child, false);
+        let original_parent = unsafe { sdl_window(parent) };
+        assert!(!original_parent.is_null());
+        assert!(rebuild_for_opengl(child));
+        let original_popup = unsafe { sdl_window(child) };
+        assert_eq!(sdl3::video::window_parent(original_popup), original_parent);
+        assert!(draws_with_opengl(original_popup));
+
+        let view = objc::object::create_instance(objc::class::lookup(c"NSView").unwrap(), 0);
+        unsafe {
+            crate::view::init_with_frame(view, objc::sel::get("initWithFrame:"), rect);
+            set_content_view(child, objc::sel::get("setContentView:"), view);
+        }
+        let context =
+            objc::object::create_instance(objc::class::lookup(c"NSOpenGLContext").unwrap(), 0);
+        // Real Objective-C entrypoints of the guest NSOpenGLContext.
+        unsafe {
+            let init: unsafe extern "C" fn(Id, Sel, Id, Id) -> Id =
+                std::mem::transmute(objc::msg::entry());
+            assert_eq!(
+                init(
+                    context,
+                    objc::sel::get("initWithFormat:shareContext:"),
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut()
+                ),
+                context
+            );
+            let set_view: unsafe extern "C" fn(Id, Sel, Id) =
+                std::mem::transmute(objc::msg::entry());
+            set_view(context, objc::sel::get("setView:"), view);
+            let make_current: unsafe extern "C" fn(Id, Sel) =
+                std::mem::transmute(objc::msg::entry());
+            make_current(context, objc::sel::get("makeCurrentContext"));
+        }
+        let native = sdl3::video::gl_current_context();
+        assert!(!native.is_null(), "guest created no native GL context");
+        assert_eq!(sdl3::video::gl_current_window(), original_popup);
+
+        assert!(rebuild_for_opengl(parent));
+        let new_parent = unsafe { sdl_window(parent) };
+        let new_popup = unsafe { sdl_window(child) };
+        assert_ne!(new_popup, original_popup);
+        assert_eq!(sdl3::video::window_parent(new_popup), new_parent);
+        assert_ne!(
+            sdl3::video::window_flags(new_popup) & sdl3::video::flags::OPENGL,
+            0
+        );
+        assert!(
+            draws_with_opengl(new_popup),
+            "GL popup lost OPENGL_WINDOWS ownership"
+        );
+        assert!(
+            !draws_with_opengl(original_popup),
+            "old popup ownership was not retired"
+        );
+        assert_eq!(window_for(new_popup), child);
+        assert!(window_for(original_popup).is_null());
+
+        // The guest kept its NSOpenGLContext current throughout the parent
+        // remake. No second makeCurrentContext call is allowed here.
+        assert_eq!(
+            sdl3::video::gl_current_context(),
+            native,
+            "parent remake detached the guest's original GL context"
+        );
+        assert_eq!(
+            sdl3::video::gl_current_window(),
+            new_popup,
+            "parent remake failed to rebind the already-current context"
+        );
+        // Exercise real driver drawing and readback against the replacement
+        // drawable before the guest flushes it, not merely an SDL identity.
+        unsafe {
+            let clear_color: unsafe extern "C" fn(f32, f32, f32, f32) =
+                std::mem::transmute(sdl3::video::gl_proc_address(c"glClearColor").unwrap());
+            let clear: unsafe extern "C" fn(u32) =
+                std::mem::transmute(sdl3::video::gl_proc_address(c"glClear").unwrap());
+            let read: unsafe extern "C" fn(i32, i32, i32, i32, u32, u32, *mut u8) =
+                std::mem::transmute(sdl3::video::gl_proc_address(c"glReadPixels").unwrap());
+            clear_color(0.1, 0.75, 0.25, 1.0);
+            clear(0x4000); // GL_COLOR_BUFFER_BIT
+            let mut pixel = [0_u8; 4];
+            read(8, 8, 1, 1, 0x1908, 0x1401, pixel.as_mut_ptr()); // RGBA, UNSIGNED_BYTE
+            assert!(
+                pixel[1] > 160 && pixel[0] < 90 && pixel[2] < 130,
+                "GL drew to the wrong or an invalid popup drawable: {pixel:?}"
+            );
+            let flush: unsafe extern "C" fn(Id, Sel) = std::mem::transmute(objc::msg::entry());
+            flush(context, objc::sel::get("flushBuffer"));
+        }
+        assert_eq!(sdl3::video::gl_current_context(), native);
+        assert_eq!(sdl3::video::gl_current_window(), new_popup);
+
+        // Exercise the actual backing-store pump: this child gets a composed
+        // dirty store but must never try SDL_GetWindowSurface on the GL window.
+        crate::backing::queue_dirty_store_for_tests(new_popup);
+        crate::backing::pump();
+        assert!(crate::backing::has_store_for_tests(new_popup));
+        crate::backing::present_again(new_popup);
+        crate::backing::pump();
+        assert_eq!(
+            crate::backing::cpu_fallback_calls_for_tests(new_popup),
+            0,
+            "backing store attempted to replace the guest's OpenGL surface"
+        );
+        assert_eq!(sdl3::video::gl_current_context(), native);
+        assert_eq!(sdl3::video::gl_current_window(), new_popup);
+        assert!(
+            rebuild_for_opengl(child),
+            "existing GL popup needlessly rebuilt"
+        );
+        assert_eq!(unsafe { sdl_window(child) }, new_popup);
+    }
+
+    /// Parent remake must observe a binding still between native make-current
+    /// and its publication to the cross-thread drawable registry.
+    #[test]
+    fn gl_popup_rehome_waits_for_inflight_native_binding() {
+        if !sdl3::isolated::run_here() {
+            return;
+        }
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::time::{Duration, Instant};
+
+        crate::bootstrap();
+        let rect = NSRect {
+            origin: NSPoint { x: 10.0, y: 10.0 },
+            size: NSSize {
+                width: 150.0,
+                height: 100.0,
+            },
+        };
+        let class = objc::class::lookup(c"NSWindow").unwrap();
+        let make = || {
+            let object = objc::object::create_instance(class, 0);
+            unsafe {
+                init_with_content_rect(
+                    object,
+                    objc::sel::get("initWithContentRect:styleMask:backing:defer:"),
+                    rect,
+                    0,
+                    0,
+                    0,
+                )
+            }
+        };
+        let parent = make();
+        let child = make();
+        order_front(parent, true);
+        unsafe { set_level(child, objc::sel::get("setLevel:"), window_level::POPUP_MENU) };
+        order_front(child, false);
+        assert!(rebuild_for_opengl(child));
+        let old = unsafe { sdl_window(child) };
+        let old_id = sdl3::video::window_id(old);
+        let old_addr = old as usize;
+        assert_ne!(old_id, 0);
+        let view = objc::object::create_instance(objc::class::lookup(c"NSView").unwrap(), 0);
+        unsafe {
+            crate::view::init_with_frame(view, objc::sel::get("initWithFrame:"), rect);
+            set_content_view(child, objc::sel::get("setContentView:"), view);
+        }
+        let context =
+            objc::object::create_instance(objc::class::lookup(c"NSOpenGLContext").unwrap(), 0);
+        unsafe {
+            let init: unsafe extern "C" fn(Id, Sel, Id, Id) -> Id =
+                std::mem::transmute(objc::msg::entry());
+            assert_eq!(
+                init(
+                    context,
+                    objc::sel::get("initWithFormat:shareContext:"),
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                ),
+                context
+            );
+            let set_view: unsafe extern "C" fn(Id, Sel, Id) =
+                std::mem::transmute(objc::msg::entry());
+            set_view(context, objc::sel::get("setView:"), view);
+        }
+
+        crate::opengl::test_pause_binding(old);
+        let (resume_tx, resume_rx) = std::sync::mpsc::channel();
+        let context_addr = context as usize;
+        let worker = std::thread::spawn(move || {
+            let context = context_addr as Id;
+            unsafe {
+                let make_current: unsafe extern "C" fn(Id, Sel) =
+                    std::mem::transmute(objc::msg::entry());
+                make_current(context, objc::sel::get("makeCurrentContext"));
+            }
+            resume_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            unsafe {
+                let flush: unsafe extern "C" fn(Id, Sel) = std::mem::transmute(objc::msg::entry());
+                flush(context, objc::sel::get("flushBuffer"));
+            }
+        });
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !crate::opengl::test_binding_paused() {
+            assert!(
+                Instant::now() < deadline,
+                "GL binding never reached test barrier"
+            );
+            std::thread::yield_now();
+        }
+        // The main thread tries to recreate the parent while the worker holds
+        // the binding gate after the real SDL_GL_MakeCurrent succeeded.
+        let protected = std::sync::Arc::new(AtomicBool::new(false));
+        let released = std::sync::Arc::new(AtomicBool::new(false));
+        let flag = std::sync::Arc::clone(&protected);
+        let release_flag = std::sync::Arc::clone(&released);
+        let releaser = std::thread::spawn(move || {
+            let until = Instant::now() + Duration::from_secs(5);
+            while !crate::opengl::test_protection_waiting() {
+                if Instant::now() >= until {
+                    crate::opengl::test_resume_binding();
+                    return;
+                }
+                std::thread::yield_now();
+            }
+            flag.store(true, Ordering::Release);
+            // The old drawable must still exist while registration is pending.
+            assert_eq!(
+                sdl3::video::live_window_id(old_addr as sdl3::Window),
+                Some(old_id)
+            );
+            release_flag.store(true, Ordering::Release);
+            crate::opengl::test_resume_binding();
+        });
+
+        assert!(rebuild_for_opengl(parent));
+        releaser.join().unwrap();
+        assert!(
+            protected.load(Ordering::Acquire),
+            "retirement missed binding gate"
+        );
+        assert!(
+            released.load(Ordering::Acquire),
+            "bind wasn't released at protection"
+        );
+        let new = unsafe { sdl_window(child) };
+        assert_ne!(old, new);
+        sdl3::video::vulkan::service_surface_requests();
+        assert_eq!(
+            sdl3::video::window_from_id(old_id),
+            old,
+            "native popup freed even though render thread has not rebound"
+        );
+        assert_eq!(crate::opengl::retired_drawable_count_for_tests(), 1);
+
+        resume_tx.send(()).unwrap();
+        worker.join().unwrap();
+        assert_eq!(crate::opengl::retired_drawable_count_for_tests(), 0);
+        sdl3::video::vulkan::service_surface_requests();
+        assert!(sdl3::video::window_from_id(old_id).is_null());
+    }
+
+    /// A context bound on the guest render thread cannot be made current on
+    /// the SDL event thread. The owning thread repairs its binding at the
+    /// first AppKit GL boundary, with no guest makeCurrentContext call.
+    #[test]
+    fn gl_popup_rehome_restores_render_thread_before_flush() {
+        if !sdl3::isolated::run_here() {
+            return;
+        }
+        crate::bootstrap();
+        let rect = NSRect {
+            origin: NSPoint { x: 12.0, y: 12.0 },
+            size: NSSize {
+                width: 160.0,
+                height: 100.0,
+            },
+        };
+        let class = objc::class::lookup(c"NSWindow").unwrap();
+        let make = || {
+            let object = objc::object::create_instance(class, 0);
+            unsafe {
+                init_with_content_rect(
+                    object,
+                    objc::sel::get("initWithContentRect:styleMask:backing:defer:"),
+                    rect,
+                    0,
+                    0,
+                    0,
+                )
+            }
+        };
+        let parent = make();
+        let child = make();
+        order_front(parent, true);
+        unsafe { set_level(child, objc::sel::get("setLevel:"), window_level::POPUP_MENU) };
+        order_front(child, false);
+        assert!(rebuild_for_opengl(child));
+        let old = unsafe { sdl_window(child) };
+        let view = objc::object::create_instance(objc::class::lookup(c"NSView").unwrap(), 0);
+        unsafe {
+            crate::view::init_with_frame(view, objc::sel::get("initWithFrame:"), rect);
+            set_content_view(child, objc::sel::get("setContentView:"), view);
+        }
+        let context =
+            objc::object::create_instance(objc::class::lookup(c"NSOpenGLContext").unwrap(), 0);
+        unsafe {
+            let init: unsafe extern "C" fn(Id, Sel, Id, Id) -> Id =
+                std::mem::transmute(objc::msg::entry());
+            assert_eq!(
+                init(
+                    context,
+                    objc::sel::get("initWithFormat:shareContext:"),
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut()
+                ),
+                context
+            );
+            let set_view: unsafe extern "C" fn(Id, Sel, Id) =
+                std::mem::transmute(objc::msg::entry());
+            set_view(context, objc::sel::get("setView:"), view);
+        }
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let (continue_tx, continue_rx) = std::sync::mpsc::channel();
+        let (raw_done_tx, raw_done_rx) = std::sync::mpsc::channel();
+        let (flush_tx, flush_rx) = std::sync::mpsc::channel();
+        let context_addr = context as usize;
+        let old_addr = old as usize;
+        let worker = std::thread::spawn(move || {
+            let context = context_addr as Id;
+            unsafe {
+                let make_current: unsafe extern "C" fn(Id, Sel) =
+                    std::mem::transmute(objc::msg::entry());
+                make_current(context, objc::sel::get("makeCurrentContext"));
+            }
+            let native = sdl3::video::gl_current_context();
+            assert!(!native.is_null());
+            assert_eq!(sdl3::video::gl_current_window() as usize, old_addr);
+            ready_tx.send(native as usize).unwrap();
+            let replacement = continue_rx.recv().unwrap() as sdl3::Window;
+            // No AppKit/CGL call or makeCurrent occurs here. The old popup
+            // MUST still be a valid native drawable during raw driver work.
+            assert_eq!(sdl3::video::gl_current_window() as usize, old_addr);
+            unsafe {
+                let color: unsafe extern "C" fn(f32, f32, f32, f32) =
+                    std::mem::transmute(sdl3::video::gl_proc_address(c"glClearColor").unwrap());
+                let clear: unsafe extern "C" fn(u32) =
+                    std::mem::transmute(sdl3::video::gl_proc_address(c"glClear").unwrap());
+                let read: unsafe extern "C" fn(i32, i32, i32, i32, u32, u32, *mut u8) =
+                    std::mem::transmute(sdl3::video::gl_proc_address(c"glReadPixels").unwrap());
+                color(0.125, 0.75, 0.25, 1.0);
+                clear(0x4000);
+                let mut pixels = [0u8; 4];
+                read(8, 8, 1, 1, 0x1908, 0x1401, pixels.as_mut_ptr());
+                assert!(
+                    pixels[1] > 160 && pixels[0] < 90,
+                    "raw GL calls before flush rendered through invalid drawable: {pixels:?}"
+                );
+            }
+            raw_done_tx.send(()).unwrap();
+            flush_rx.recv().unwrap();
+            // Only now is the guest entering an AppKit boundary. The owner
+            // rebinds and acknowledges the native retirement barrier.
+            unsafe {
+                let flush: unsafe extern "C" fn(Id, Sel) = std::mem::transmute(objc::msg::entry());
+                flush(context, objc::sel::get("flushBuffer"));
+            }
+            assert_eq!(sdl3::video::gl_current_context() as usize, native as usize);
+            assert_eq!(sdl3::video::gl_current_window(), replacement);
+            unsafe {
+                let clear: unsafe extern "C" fn(u32) =
+                    std::mem::transmute(sdl3::video::gl_proc_address(c"glClear").unwrap());
+                clear(0x4000);
+                let flush: unsafe extern "C" fn(Id, Sel) = std::mem::transmute(objc::msg::entry());
+                flush(context, objc::sel::get("flushBuffer"));
+            }
+            assert_eq!(sdl3::video::gl_current_window(), replacement);
+        });
+        let native = ready_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap();
+        let original_id = sdl3::video::window_id(old);
+        assert_ne!(original_id, 0);
+        assert!(rebuild_for_opengl(parent));
+        let new = unsafe { sdl_window(child) };
+        assert_ne!(new, old);
+        assert!(
+            sdl3::video::gl_current_context().is_null(),
+            "SDL video thread incorrectly stole the render thread's GL context"
+        );
+        assert_eq!(crate::opengl::retired_drawable_count_for_tests(), 1);
+        // Servicing SDL retirement BEFORE the render thread acknowledges
+        // must leave the old popup's native SDL allocation intact.
+        sdl3::video::vulkan::service_surface_requests();
+        assert_eq!(sdl3::video::window_from_id(original_id), old);
+        continue_tx.send(new as usize).unwrap();
+        raw_done_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap();
+        sdl3::video::vulkan::service_surface_requests();
+        assert_eq!(
+            sdl3::video::window_from_id(original_id),
+            old,
+            "old native GL drawable freed while raw rendering was in flight"
+        );
+        assert_eq!(crate::opengl::retired_drawable_count_for_tests(), 1);
+        flush_tx.send(()).unwrap();
+        worker.join().unwrap();
+        assert_eq!(crate::opengl::retired_drawable_count_for_tests(), 0);
+        sdl3::video::vulkan::service_surface_requests();
+        assert!(
+            sdl3::video::window_from_id(original_id).is_null(),
+            "old SDL popup did not retire after its GL owner rebound"
+        );
+        assert_ne!(native, 0);
+    }
+
     /// Under this runtime's own titlebar the SDL window is the frame, and the
     /// content rectangle a window was made with is what its content view
     /// gets - the two conversions agreeing on the difference.
     #[test]
     fn a_titled_window_is_its_content_plus_the_chrome() {
+        if !sdl3::isolated::run_here() {
+            return;
+        }
         crate::bootstrap();
         let object =
             objc::object::create_instance(objc::class::lookup(c"NSWindow").expect("NSWindow"), 0);
@@ -3278,6 +4988,38 @@ mod tests {
         let answered = unsafe { make_first_responder(window, objc::sel::get("x"), engine) };
         assert_eq!(answered, 1);
         assert_eq!(window_of(window).first_responder, handler);
+    }
+
+    unsafe extern "C" fn accepts(_receiver: Id, _sel: Sel) -> u8 {
+        1
+    }
+
+    #[test]
+    fn a_window_ordered_in_makes_a_content_view_that_accepts_it_first_responder() {
+        crate::bootstrap();
+        let view = objc::class::lookup(c"NSView").expect("NSView");
+        let accepting = objc::class::allocate_pair(Some(view), c"AcceptingContentView", 0)
+            .expect("a class of this name is not declared elsewhere");
+        accepting.add_method(
+            objc::sel::get("acceptsFirstResponder"),
+            accepts as objc::class::Imp,
+            c"c16@0:8",
+        );
+        objc::class::register_pair(accepting);
+        let window_class = objc::class::lookup(c"NSWindow").expect("NSWindow");
+        for (class, takes_it) in [(view, false), (accepting, true)] {
+            let window = objc::object::create_instance(window_class, 0);
+            let content = objc::object::create_instance(class, 0);
+            // SAFETY: `-setContentView:` is `void (id, SEL, id)`.
+            unsafe { set_content_view(window, objc::sel::get("setContentView:"), content) };
+            set_up_first_responder(window);
+            let expected = if takes_it {
+                content
+            } else {
+                std::ptr::null_mut()
+            };
+            assert_eq!(window_of(window).first_responder, expected);
+        }
     }
 
     #[test]

@@ -859,7 +859,7 @@ pub mod cf {
     /// `CFBundleGetFunctionPointerForName`.
     ///
     /// A `Get`, so not retained: every bundle here lives for the process.
-    unsafe extern "C" fn CFBundleGetBundleWithIdentifier(identifier: Id) -> Id {
+    pub(crate) unsafe extern "C" fn CFBundleGetBundleWithIdentifier(identifier: Id) -> Id {
         if identifier.is_null() {
             return std::ptr::null_mut();
         }
@@ -1106,6 +1106,43 @@ mod tests {
         </dict></plist>"#;
 
     #[test]
+    fn a_bundle_is_found_by_its_file_url_as_by_its_path() {
+        crate::bootstrap();
+        let exe = scratch("url", INFO);
+        let app = exe.parent().unwrap().parent().unwrap().parent().unwrap();
+        let guest = spelled(app).unwrap().to_string_lossy().into_owned();
+        let ns_bundle =
+            objc::class::ptr(objc::class::lookup(c"NSBundle").unwrap()) as objc::object::Id;
+        let by_path = class::at_path(ns_bundle, &guest);
+        assert!(!by_path.is_null());
+
+        let url = corefoundation::url::new_file_url(&guest, true);
+        // SAFETY: `+bundleWithURL:` takes one object.
+        let by_url = unsafe {
+            class::bundle_with_url(
+                ns_bundle,
+                objc::sel::get("bundleWithURL:"),
+                url as objc::object::Id,
+            )
+        };
+        assert_eq!(by_url, by_path);
+
+        let web = corefoundation::url::new("https://example.com/Thing.app");
+        let none = unsafe {
+            class::bundle_with_url(
+                ns_bundle,
+                objc::sel::get("bundleWithURL:"),
+                web as objc::object::Id,
+            )
+        };
+        assert!(none.is_null());
+        unsafe {
+            corefoundation::api::CFRelease(url);
+            corefoundation::api::CFRelease(web);
+        }
+    }
+
+    #[test]
     fn a_bundle_is_recognised_by_shape_and_read_through() {
         let exe = scratch("shape", INFO);
         let layout = Layout::enclosing(&exe).expect("a bundle");
@@ -1225,8 +1262,16 @@ pub(crate) mod class {
     /// class, so every class answers with the main bundle - Apple's answer for
     /// the guest's own classes, which are the ones a program asks about.
     unsafe extern "C" fn bundle_for_class(class: Id, sel: Sel, of: Id) -> Id {
-        // SAFETY: a class object, or nil.
-        let image = unsafe { objc::class::from_ptr(of as *const objc::class::Class) }
+        // A class object, or nil - or an instance, which Apple answers for by
+        // its class, and which a program passing `self` relies on.
+        let class_ptr = of as *const objc::class::Class;
+        let of = match objc::class::is_known(class_ptr) {
+            // SAFETY: a class this runtime registered.
+            true => unsafe { objc::class::from_ptr(class_ptr) },
+            // SAFETY: nil or a live object.
+            false => unsafe { objc::object::class_of(of) },
+        };
+        let image = of
             .and_then(|of| of.own_methods().first().map(|m| m.implementation() as u64))
             .and_then(darwin::images::image_path);
         let main = super::main();
@@ -1307,6 +1352,25 @@ pub(crate) mod class {
             return std::ptr::null_mut();
         };
         at_path(class, guest)
+    }
+
+    /// `+bundleWithIdentifier:`, which finds the bundles
+    /// `CFBundleGetBundleWithIdentifier` does - the two are one object here.
+    unsafe extern "C" fn bundle_with_identifier(_class: Id, _sel: Sel, identifier: Id) -> Id {
+        // SAFETY: an `NSString`, or nil.
+        unsafe { crate::bundle::cf::CFBundleGetBundleWithIdentifier(identifier) }
+    }
+
+    /// `+bundleWithURL:`: `+bundleWithPath:` for a `file:` URL, nil for any
+    /// other.
+    pub(crate) unsafe extern "C" fn bundle_with_url(class: Id, _sel: Sel, url: Id) -> Id {
+        // SAFETY: an `NSURL`, or nil, which is no URL.
+        let Some(path) = unsafe { corefoundation::url::as_url(url as _) }
+            .and_then(|contents| contents.file_path())
+        else {
+            return std::ptr::null_mut();
+        };
+        at_path(class, &path)
     }
 
     /// The bundle at the guest path `guest`, unretained: the main one, one on
@@ -1672,6 +1736,24 @@ pub(crate) mod class {
         path(unsafe { layout_of(receiver) }.map(|b| b.executable.clone()))
     }
 
+    /// `-pathForAuxiliaryExecutable:`: a file of that name beside the main
+    /// executable, or nil.
+    unsafe extern "C" fn path_for_auxiliary_executable(receiver: Id, _sel: Sel, name: Id) -> Id {
+        // SAFETY: an `NSString` or nil.
+        let name = unsafe { crate::string::bytes(name) };
+        let Ok(name) = std::str::from_utf8(&name) else {
+            return std::ptr::null_mut();
+        };
+        if name.is_empty() {
+            return std::ptr::null_mut();
+        }
+        // SAFETY: the receiver is an `NSBundle`.
+        path(unsafe { layout_of(receiver) }.and_then(|b| {
+            let candidate = b.executable.parent()?.join(name);
+            candidate.exists().then_some(candidate)
+        }))
+    }
+
     unsafe extern "C" fn private_frameworks_path(receiver: Id, _sel: Sel) -> Id {
         path(unsafe { layout_of(receiver) }.map(|b| b.frameworks.clone()))
     }
@@ -1773,6 +1855,7 @@ pub(crate) mod class {
             "executableURL" => executable_url, c"@16@0:8";
             "resourcePath" => resource_path, c"@16@0:8";
             "executablePath" => executable_path, c"@16@0:8";
+            "pathForAuxiliaryExecutable:" => path_for_auxiliary_executable, c"@24@0:8@16";
             "privateFrameworksPath" => private_frameworks_path, c"@16@0:8";
             "builtInPlugInsPath" => built_in_plug_ins_path, c"@16@0:8";
             "bundleIdentifier" => bundle_identifier, c"@16@0:8";
@@ -1796,7 +1879,9 @@ pub(crate) mod class {
             "mainBundle" => main_bundle, c"@16@0:8";
             "bundleForClass:" => bundle_for_class, c"@24@0:8#16";
             "pathsForResourcesOfType:inDirectory:" => class_paths_for_resources_of_type, c"@32@0:8@16@24";
-            "bundleWithPath:" => bundle_with_path, c"@24@0:8@16"
+            "bundleWithPath:" => bundle_with_path, c"@24@0:8@16";
+            "bundleWithIdentifier:" => bundle_with_identifier, c"@24@0:8@16";
+            "bundleWithURL:" => bundle_with_url, c"@24@0:8@16"
         });
     }
 }

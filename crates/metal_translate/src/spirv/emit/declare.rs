@@ -99,6 +99,10 @@ impl Emitter {
                     Type::Texture(texture) => texture.sampled_image(),
                     _ => false,
                 },
+                texel_buffer: matches!(
+                    &parameter.ty,
+                    Type::Texture(texture) if texture.dimension == TextureDimension::Buffer
+                ),
                 inline_sampler: resource.inline_sampler,
             });
         }
@@ -213,6 +217,9 @@ impl Emitter {
                 .builder
                 .variable(pointer, None, StorageClass::Output, None);
             self.decorate_binding(variable, entry.stage, output.binding)?;
+            if output.invariant {
+                self.builder.decorate(variable, Decoration::Invariant, []);
+            }
             self.interface.push(variable);
             self.stage_outputs.push(variable);
         }

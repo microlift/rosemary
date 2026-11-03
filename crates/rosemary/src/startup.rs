@@ -50,6 +50,11 @@ pub fn run(exec: &dyn Execution) -> Result<i32, VmError> {
     // Before the program's own code, because `SteamAPI_Init` asks the name
     // server for Steam and a service published after the question is not there.
     crate::steam::install();
+    // Before the first initializer, which may read it: QtCore's do.
+    #[cfg(not(target_os = "macos"))]
+    if let Err(e) = darwin::commpage::install() {
+        eprintln!("rosemary: no comm page: {e}");
+    }
     say_image_map(exec);
     // Whatever this backend must do before any of the program's own code runs.
     exec.prepare()?;

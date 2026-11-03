@@ -5,6 +5,7 @@ use microlift::arch::x86_64::context::RegisterContext;
 use crate::abi::{Callbacks, GuestMemory, Result};
 
 use super::set_int_return;
+use crate::shims::bind;
 
 /// One of this module's implementations, in the shape [`crate::shims`] wants - the
 /// wider one, carrying [`Callbacks`].
@@ -98,8 +99,8 @@ pub fn easy_getinfo(
 /// Whether `name` (underscore already stripped) is one of this module's.
 pub fn shim_for(name: &str) -> Option<Shim> {
     match name {
-        "curl_easy_setopt" => Some(easy_setopt),
-        "curl_easy_getinfo" => Some(easy_getinfo),
+        "curl_easy_setopt" => Some(bind!(callback "curl_easy_setopt" => easy_setopt)),
+        "curl_easy_getinfo" => Some(bind!(callback "curl_easy_getinfo" => easy_getinfo)),
         _ => None,
     }
 }

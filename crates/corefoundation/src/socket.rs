@@ -158,8 +158,9 @@ pub unsafe extern "C" fn invalidate(socket: CFTypeRef) {
     if socket.valid.swap(false, Ordering::AcqRel)
         && socket.flags.load(Ordering::Acquire) & 0x80 != 0
     {
+        // Route owned descriptor closes through Darwin's bookkeeping layer.
         // SAFETY: this CFSocket owns the native descriptor under this flag.
-        unsafe { libc::close(socket.native) };
+        unsafe { darwin::net::descriptor::close(socket.native) };
     }
     if let Some(source) = socket
         .source

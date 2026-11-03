@@ -173,7 +173,7 @@ fn deadline(timeout: std::time::Duration) -> libc::timespec {
         tv_nsec: 0,
     };
     // SAFETY: a writable timespec.
-    unsafe { libc::clock_gettime(libc::CLOCK_REALTIME, &mut now) };
+    unsafe { crate::syscall::clock_gettime(libc::CLOCK_REALTIME, &mut now) };
     let nanos = now.tv_nsec as u64 + u64::from(timeout.subsec_nanos());
     libc::timespec {
         tv_sec: now.tv_sec
@@ -569,7 +569,7 @@ extern "C" fn interrupt(_signo: i32, _info: *mut libc::siginfo_t, _raw: *mut c_v
 /// The thread `thread` names, if it is one of this process's.
 fn local_thread(thread: Name) -> Option<i32> {
     let (pid, tid) = space::thread_of(thread)?;
-    (pid == starnix::process::me()).then_some(tid)
+    (pid == crate::process::host_self()).then_some(tid)
 }
 
 /// How long to wait for a thread to park before checking it still exists.
@@ -1128,7 +1128,7 @@ mod tests {
             }
         });
         let (tid, stack) = rx.recv().unwrap();
-        let name = space::insert_thread(starnix::process::me(), tid);
+        let name = space::insert_thread(crate::process::host_self(), tid);
 
         assert_eq!(thread_suspend(name), KERN_SUCCESS);
         let before = COUNTER.load(Ordering::Relaxed);
@@ -1175,7 +1175,7 @@ mod tests {
             }
         });
         let tid = rx.recv().unwrap();
-        let name = space::insert_thread(starnix::process::me(), tid);
+        let name = space::insert_thread(crate::process::host_self(), tid);
         let mut words = [0u32; 42];
         let mut count = words.len() as u32;
         let rc = unsafe { thread_get_state(name, 4, words.as_mut_ptr(), &mut count) };
@@ -1188,7 +1188,7 @@ mod tests {
     /// Except the caller itself, which cannot stop to be read.
     #[test]
     fn the_calling_thread_has_no_state_to_read() {
-        let name = space::insert_thread(starnix::process::me(), crate::pthread::id() as i32);
+        let name = space::insert_thread(crate::process::host_self(), crate::pthread::id() as i32);
         let mut words = [0u32; 42];
         let mut count = words.len() as u32;
         let rc = unsafe { thread_get_state(name, 4, words.as_mut_ptr(), &mut count) };

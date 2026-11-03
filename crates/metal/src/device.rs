@@ -288,6 +288,86 @@ pub(super) unsafe extern "C" fn argument_buffers_tier(_receiver: Id, _sel: Sel) 
     MTL_ARGUMENT_BUFFERS_TIER_1
 }
 
+/// `-readWriteTextureSupport`: tier 1, the single-channel 32-bit formats
+/// every Vulkan device can read and write as storage images.
+pub(super) unsafe extern "C" fn read_write_texture_tier(_receiver: Id, _sel: Sel) -> u64 {
+    MTL_READ_WRITE_TEXTURE_TIER_1
+}
+
+pub(super) unsafe extern "C" fn max_threads_per_threadgroup(
+    receiver: Id,
+    _sel: Sel,
+) -> encoder::MtlSize {
+    let [width, height, depth] =
+        gpu_of(receiver).map_or([0; 3], |gpu| gpu.limits.max_compute_work_group_size);
+    encoder::MtlSize {
+        width: u64::from(width),
+        height: u64::from(height),
+        depth: u64::from(depth),
+    }
+}
+
+/// `-maxArgumentBufferSamplerCount`: the number of distinct sampler objects
+/// the device can hold at once.
+pub(super) unsafe extern "C" fn max_argument_buffer_samplers(receiver: Id, _sel: Sel) -> u64 {
+    gpu_of(receiver).map_or(0, |gpu| u64::from(gpu.limits.max_sampler_allocation_count))
+}
+
+/// `-minimumTextureBufferAlignmentForPixelFormat:` and its linear-texture
+/// sibling: a texture over buffer memory is a Vulkan texel buffer.
+pub(super) unsafe extern "C" fn texel_buffer_alignment(
+    receiver: Id,
+    _sel: Sel,
+    _format: u64,
+) -> u64 {
+    gpu_of(receiver).map_or(0, |gpu| gpu.limits.min_texel_buffer_offset_alignment)
+}
+
+/// `-counterSets`: no GPU counters are exposed, so there is no set to sample.
+pub(super) unsafe extern "C" fn counter_sets(_receiver: Id, _sel: Sel) -> Id {
+    // SAFETY: an empty array.
+    unsafe {
+        corefoundation::api::CFAutorelease(corefoundation::collections::new_array(
+            &[],
+            corefoundation::callbacks::Policy::from_type_callbacks(),
+            false,
+        )) as Id
+    }
+}
+
+/// `-location`: Vulkan does not say how an adapter is attached.
+pub(super) unsafe extern "C" fn location(_receiver: Id, _sel: Sel) -> u64 {
+    MTL_DEVICE_LOCATION_UNSPECIFIED
+}
+
+/// `-sampleTimestamps:gpuTimestamp:`: the CPU stamp in `mach_absolute_time`
+/// nanoseconds, the GPU stamp in the device's own ticks.
+pub(super) unsafe extern "C" fn sample_timestamps(
+    receiver: Id,
+    _sel: Sel,
+    cpu_timestamp: *mut u64,
+    gpu_timestamp: *mut u64,
+) {
+    let Some((cpu, gpu)) = gpu_of(receiver).and_then(Gpu::sample_timestamps) else {
+        // FIXME (ACCURACY): without calibrated timestamps the device clock
+        // cannot be read on demand, so both stamps are zero, which callers
+        // take as "no sample".
+        // SAFETY: Metal writes both through the guest's pointers.
+        unsafe { (cpu_timestamp.write(0), gpu_timestamp.write(0)) };
+        return;
+    };
+    // SAFETY: Metal writes both through the guest's pointers.
+    unsafe { (cpu_timestamp.write(cpu), gpu_timestamp.write(gpu)) };
+}
+
+pub(super) unsafe extern "C" fn supports_counter_sampling(
+    _receiver: Id,
+    _sel: Sel,
+    _sampling_point: u64,
+) -> bool {
+    false
+}
+
 pub(super) unsafe extern "C" fn supports_sample_count(receiver: Id, _sel: Sel, count: u64) -> bool {
     let Some(gpu) = gpu_of(receiver) else {
         return false;
@@ -296,4 +376,18 @@ pub(super) unsafe extern "C" fn supports_sample_count(receiver: Id, _sel: Sel, c
         return false;
     };
     gpu.limits.framebuffer_color_sample_counts.contains(samples)
+}
+
+pub(super) unsafe extern "C" fn new_event(receiver: Id, _sel: Sel) -> Id {
+    let Some(gpu) = gpu_of(receiver) else {
+        return std::ptr::null_mut();
+    };
+    event::new_event(gpu, receiver, c"RosemaryMTLEvent")
+}
+
+pub(super) unsafe extern "C" fn new_shared_event(receiver: Id, _sel: Sel) -> Id {
+    let Some(gpu) = gpu_of(receiver) else {
+        return std::ptr::null_mut();
+    };
+    event::new_event(gpu, receiver, c"RosemaryMTLSharedEvent")
 }

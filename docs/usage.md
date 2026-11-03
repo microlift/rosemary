@@ -63,13 +63,17 @@ rosemary server --stop         # ask this prefix's server to exit
 | `ROSEMARY_LINK_WAYS` | `4` | How many rows of the block-link table one guest address may occupy: `1`, `2` or `4`. Fewer ways let hot addresses that share a row evict each other on every transfer, which Mono's densely packed JIT code does as soon as ASLR overlaps it with another image modulo the table's span. Measure with `tools/unitybench`. |
 | `ROSEMARY_STRICT_IMPORTS` | `0` | Refuse to run a program that has unbound imports, rather than announcing them on stderr and running anyway. Unbound imports are always announced; this only decides whether they are fatal. |
 | `ROSEMARY_NO_PASSTHROUGH` | `0` | (non-macOS) Never answer a guest import with a host library's symbol. Only what Rosemary implements (Darwin, the frameworks, the Objective-C runtime, OpenGL/OpenAL bridges and other explicit shims) binds; everything else is reported unbound. Covers the program's link, `dlopen`ed images, `dlsym`, and `dlopen` of host libraries, which is refused. Use it to catch a guest silently bound to a coincidentally-named host function, such as the host's `libstdc++` in place of `libc++`. Combine with `ROSEMARY_STRICT_IMPORTS=1` to make any gap fatal. |
+| `ROSEMARY_SYSCALL_INTERPOSE` | `0` | (native mode, x86-64 Linux with glibc) Set to `1` to trap the raw `syscall` instructions guest code makes itself, rather than through a libc function, before they reach the host kernel under Darwin's numbering. Uses the kernel's syscall user dispatch (Linux 5.11 or later). A trapped call currently fails with `ENOSYS`. Experimental and off by default: host code that makes raw syscalls outside libc while a guest thread is running can be trapped by mistake, until Rosemary switches the trap off at every guest-to-host boundary. Elsewhere, and in emulated mode, it has no effect. |
+| `ROSEMARY_SYSCALL_TRACE` | unset | (native mode, x86-64 Linux with glibc) The mode for which to trace system calls in. `unknown` logs only unknown syscalls, `all` logs every system call made. |
 | `ROSEMARY_UNBOUND_DETAIL` | `40` | How many unbound imports are named one by one before the rest are only counted. Set to `all` for the whole list. A large application has hundreds, so the default keeps the interesting output - what comes *after* the list - on screen; raise it when a fault at address zero has to be matched against a symbol. |
 | `ROSEMARY_NO_FOREIGN` | `0` | (macOS only - unsafe) Assume that we have reimplemented every framework this app asks of us, disabling foreign Objective-C support in the reimplementations for a slight performance boost. Assumed to be always on with non-macOS systems, since there are no native Objective C frameworks to conflict with. |
 | `ROSEMARY_STEAM` | `1` | Bridge a guest's Steamworks calls to the host's own Steam client, and publish the Mach service `libsteam_api` asks where Steam is. Set to `0` to turn both off, so that a guest asking for Steam is told there is none. Has no effect unless a generated `steamclient.dylib` exists. |
 | `ROSEMARY_STEAM_CLIENT` | (found) | The generated guest-facing `steamclient.dylib`. Looked for beside the `rosemary` binary, and then in `tools/steamclient/generated/` above it, which is where a checkout leaves it. |
 | `ROSEMARY_STEAM_HOST_CLIENT` | (found) | The host's own `steamclient.so`. Looked for under `$STEAM_COMPAT_CLIENT_INSTALL_PATH`, `~/.steam/sdk64`, `~/.steam/root`, `~/.steam/steam` and `~/.local/share/Steam`. |
 | `ROSEMARY_STEAM_TRACE` | unset | Report every bridged Steamworks call on stderr: the dispatch id, the host interface, and the vtable slot it landed on. |
+| `ROSEMARY_TRACE_BINDINGS` | unset | Report on stderr each Cocoa binding value handed to a bound object through `-setValue:forKey:` (the plain `NSObject` binding, as opposed to a control's own setter): the bound class and binding, the observed class and key path, and the value's address. |
 | `ROSEMARY_SWAP_INTERVAL` | `none` | Force a specific swap interval on OpenGL applications. Allows enabling immediate (0), VSync (1), and -1 (Adaptive VSync), along with other V-blank values, allowing unlocked framerate on apps that use VSync. |
+| `ROSEMARY_GL_HOST_FEATURES` | `0` | (built-in OpenGL) Offer the GL driver's own version, extensions and entry points instead of a Mac's (GL 4.1 core, 2.1 legacy, Apple's export list). Some programs have newer GL paths that a Mac never takes; the price is that the program runs code no Mac tested, which is what the default exists to prevent. |
 | `ROSEMARY_PREFIX` | the default prefix (`off` on macOS) | The prefix a guest runs in: a directory holding a Darwin filesystem, whose `root/` subdirectory is the guest's `/`. Unset, `rosemary run` uses `$XDG_DATA_HOME/rosemary/prefixes/default` (or `$HOME/.local/share/rosemary/prefixes/default`), creating it on first use. Set it to another path to keep a guest's files separate, or to `off` to leave guest paths alone entirely. |
 | `ROSEMARY_PREFIX_HOME` | `prefix` | Where the guest's home directory is. `prefix` keeps it inside the prefix, so a prefix is one directory to copy, archive or delete. `host` mounts the guest's `/Users/<name>` onto the real `$HOME` instead, for a user who would rather keep one set of documents than two. |
 | `ROSEMARY_PREFIX_SETUP` | `ask` | What to do when a prefix needs its Darwin base and it is not cached. `ask` asks - a dialog under `rosemary run` when there is a display, then the terminal - and declines when there is nobody to ask. `download` fetches it without asking. `fail` never downloads. The base is verified against hashes compiled into Rosemary whichever route it takes. |
@@ -92,6 +96,7 @@ rosemary server --stop         # ask this prefix's server to exit
 | `ROSEMARY_EXE` | (set by the launcher) | The path that starts another copy of Rosemary. Under the bundled glibc the kernel reports the bundled dynamic loader as this process's executable, so the runtime re-launches itself (`rosemary server`, a guest spawning a Mach-O) through this instead. |
 | `ROSEMARY_METAL_PRESENTATION_MODE` | unset | Set the presentation mode used by Vulkan in Rosemary's Metal translation. Valid values are `immediate`, `fifo`, `fifo_relaxed`, and `mailbox`. |
 | `ROSEMARY_SCREEN_REFRESH_RATE` | unset | Hertz that guests are told the display refreshes at, in place of the host's mode: `NSScreen`/`UIScreen` `maximumFramesPerSecond` and the refresh-interval properties. |
+| `ROSEMARY_EXPOSE_LIBSYSTEM_EXTENSIONS` | unset | Whether to enable Rosemary specific extensions useful for implementing out of tree features to Rosemary. Disabled by default for full environment accuracy. Set to `1` to enable it - See `crates/darwin/src/rosemary/mod.rs` for more details. |
 
 ## Prefixes
 
@@ -207,8 +212,14 @@ context. Contexts move between threads through a bounded handoff; an EGL backend
 can fall back to a sibling sharing textures and buffers, but not vertex arrays,
 framebuffers, or queries. Other backends report contention if handoff fails.
 
-Direct CGL pixel-format/context creation and lifetime APIs, and explicit context
-sharing, remain unsupported. The built-in GLU surface provides `gluOrtho2D`
-through SDL-resolved `glOrtho`; other GLU functions remain unsupported. No host
-GLU library is required. Driver capabilities still determine available profiles
-and extensions.
+The framework answers exactly the names Apple's `OpenGL.framework`, `libGL.dylib`
+and `libGLU.dylib` export (lists in `crates/opengl/src/exports/`), so a `dlsym`
+of a newer function such as `glDispatchCompute` is null, as on a Mac. Each GL
+name binds to the driver function of the same name or to Rosemary's own. A
+context reports a Mac's profile: core contexts are GL 4.1 with GLSL 4.10, legacy
+contexts GL 2.1 with GLSL 1.20, and both list only the extensions a Mac lists
+for that profile and the driver also has. `ROSEMARY_GL_HOST_FEATURES=1` offers
+the driver's own version, extensions and functions instead.
+
+The built-in GLU surface provides `gluOrtho2D` through the driver's `glOrtho`;
+other GLU functions are unbound. No host GLU library is required.

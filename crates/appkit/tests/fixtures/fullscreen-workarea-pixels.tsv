@@ -1,0 +1,14 @@
+# macOS 26.5 (25F71), arm64, 1440x900 points, 2x scale. See fullscreen-workarea-native.md.
+# backend	phase	x	y	width	height	black_top_points	black_bottom_points	sequence
+native-appkit	settled-fullscreen	0	0	1440	900	0	0	22
+native-appkit	set-visible-frame	0	0	1440	870	30	0	51
+native-appkit	set-shorter-frame	0	31	1440	869	0	31	61
+native-metal-resize-drawable	settled-fullscreen	0	0	1440	900	0	0	123
+native-metal-resize-drawable	set-visible-frame	0	0	1440	870	30	0	152
+native-metal-resize-drawable	set-shorter-frame	0	31	1440	869	0	31	162
+native-metal-retain-drawable	settled-fullscreen	0	0	1440	900	0	0	224
+native-metal-retain-drawable	set-visible-frame	0	0	1440	870	30	0	253
+native-metal-retain-drawable	set-shorter-frame	0	31	1440	869	0	31	263
+native-metal-idle	settled-fullscreen	0	0	1440	900	0	0	325
+native-metal-idle	set-visible-frame	0	0	1440	870	30	0	354
+native-metal-idle	set-shorter-frame	0	31	1440	869	0	31	364

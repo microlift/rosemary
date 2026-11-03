@@ -3,6 +3,7 @@ use core::ffi::{c_int, c_void};
 use microlift::arch::x86_64::context::RegisterContext;
 
 use crate::abi::{Callbacks, GuestMemory, Result};
+use crate::shims::bind;
 
 unsafe extern "C" {
     /// libsystem's own, spelled `___cxa_atexit` in the Mach-O.
@@ -78,8 +79,8 @@ pub type Shim = crate::signal::Shim;
 /// Whether `name` (underscore already stripped) is one of this module's.
 pub fn shim_for(name: &str) -> Option<Shim> {
     match name {
-        "__cxa_atexit" => Some(cxa_atexit),
-        "atexit" => Some(atexit),
+        "__cxa_atexit" => Some(bind!(callback "__cxa_atexit" => cxa_atexit)),
+        "atexit" => Some(bind!(callback "atexit" => atexit)),
         // `__cxa_thread_atexit` is *not* here.
         _ => None,
     }

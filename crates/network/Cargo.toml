@@ -11,3 +11,6 @@ objc.workspace = true
 corefoundation.workspace = true
 darwin.workspace = true
 starnix.workspace = true
+
+[lints]
+workspace = true

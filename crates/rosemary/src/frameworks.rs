@@ -1,6 +1,7 @@
 use exports::Exports;
 use machish::resolve::{NativeDylibProvider, SyntheticDylib};
 
+use crate::dyld::Links;
 use crate::objc::host::{Backend, backend};
 
 pub fn using_builtin() -> bool {
@@ -16,7 +17,7 @@ fn install() {
     static ONCE: std::sync::Once = std::sync::Once::new();
     ONCE.call_once(|| {
         darwin::register_provider(symbol);
-        darwin::register_host_symbol_filter(|name| !crate::opengl::owns(name));
+        darwin::register_host_symbol_filter(|name| !crate::gl::owns(name));
         register_dlopen_names();
         crate::dyld::install_image_hooks();
         install_block_runtime();
@@ -48,7 +49,24 @@ struct Framework {
     provide: Option<fn(&mut dyn exports::Exports)>,
     data: Option<fn() -> Vec<(String, u64)>>,
     symbol: Option<fn(&str) -> Option<u64>>,
+    links: Links,
 }
+
+/// The install name of the framework `leaf` names.
+macro_rules! framework {
+    ($leaf:literal) => {
+        concat!("/System/Library/Frameworks/", $leaf, ".framework/", $leaf)
+    };
+}
+
+const LIBSYSTEM: &str = "/usr/lib/libSystem.B.dylib";
+const LIBOBJC: &str = "/usr/lib/libobjc.A.dylib";
+const LIBOBJC_NAMES: &[&str] = &[LIBOBJC, "/usr/lib/libobjc.dylib"];
+
+// FIXME (ACCURACY): each row's `links` is a recollection of that framework's
+// `otool -L` on macOS, cut to libraries this runtime provides, and not checked
+// against a real install. A row standing for several frameworks - AppKit with
+// CoreGraphics - answers for all of them wherever any one is linked.
 
 static FRAMEWORKS: &[Framework] = &[
     Framework {
@@ -56,8 +74,12 @@ static FRAMEWORKS: &[Framework] = &[
         version: 'A',
         umbrellas: &[],
         provide: Some(corefoundation::provide),
-        data: Some(corefoundation::data_symbols),
+        data: Some(corefoundation_data),
         symbol: Some(corefoundation::symbol),
+        links: Links {
+            reexports: &[],
+            dependencies: &[LIBOBJC, LIBSYSTEM],
+        },
     },
     Framework {
         leaf: "Foundation",
@@ -66,6 +88,17 @@ static FRAMEWORKS: &[Framework] = &[
         provide: Some(foundation::provide),
         data: Some(foundation::data_symbols),
         symbol: Some(foundation::symbol),
+        links: Links {
+            reexports: &[],
+            dependencies: &[
+                framework!("CoreFoundation"),
+                LIBOBJC,
+                framework!("Security"),
+                framework!("IOKit"),
+                framework!("CoreServices"),
+                LIBSYSTEM,
+            ],
+        },
     },
     Framework {
         leaf: "IOKit",
@@ -74,6 +107,10 @@ static FRAMEWORKS: &[Framework] = &[
         provide: Some(iokit::provide),
         data: Some(iokit::data_symbols),
         symbol: Some(iokit::symbol),
+        links: Links {
+            reexports: &[],
+            dependencies: &[framework!("CoreFoundation"), LIBSYSTEM],
+        },
     },
     Framework {
         leaf: "ForceFeedback",
@@ -82,6 +119,10 @@ static FRAMEWORKS: &[Framework] = &[
         provide: Some(forcefeedback::provide),
         data: None,
         symbol: Some(forcefeedback::symbol),
+        links: Links {
+            reexports: &[],
+            dependencies: &[framework!("IOKit"), framework!("CoreFoundation"), LIBSYSTEM],
+        },
     },
     Framework {
         leaf: "Network",
@@ -90,6 +131,15 @@ static FRAMEWORKS: &[Framework] = &[
         provide: Some(network::provide),
         data: None,
         symbol: Some(network::symbol),
+        links: Links {
+            reexports: &[],
+            dependencies: &[
+                framework!("CoreFoundation"),
+                framework!("Security"),
+                LIBOBJC,
+                LIBSYSTEM,
+            ],
+        },
     },
     Framework {
         leaf: "OpenCL",
@@ -98,14 +148,59 @@ static FRAMEWORKS: &[Framework] = &[
         provide: Some(opencl::provide),
         data: None,
         symbol: Some(opencl::symbol),
+        links: Links {
+            reexports: &[],
+            dependencies: &[
+                framework!("CoreFoundation"),
+                framework!("IOSurface"),
+                LIBSYSTEM,
+            ],
+        },
     },
     Framework {
         leaf: "AppKit",
         version: 'C',
-        umbrellas: &["Cocoa"],
+        // AppKit's crate also implements Quartz, so a `dlopen` of
+        // CoreGraphics by path has to find these too.
+        umbrellas: &["Cocoa", "CoreGraphics"],
         provide: Some(appkit::provide),
         data: Some(appkit::data_symbols),
         symbol: Some(appkit::symbol),
+        links: Links {
+            reexports: &[],
+            dependencies: &[
+                framework!("Foundation"),
+                framework!("CoreFoundation"),
+                framework!("ApplicationServices"),
+                framework!("CoreText"),
+                framework!("CoreServices"),
+                framework!("IOKit"),
+                framework!("IOSurface"),
+                framework!("CoreVideo"),
+                framework!("Metal"),
+                framework!("Security"),
+                framework!("UniformTypeIdentifiers"),
+                framework!("OpenGL"),
+                LIBOBJC,
+                LIBSYSTEM,
+            ],
+        },
+    },
+    Framework {
+        leaf: "CoreText",
+        version: 'A',
+        umbrellas: &[],
+        provide: Some(coretext::provide),
+        data: Some(coretext::data_symbols),
+        symbol: Some(coretext::symbol),
+        links: Links {
+            reexports: &[],
+            dependencies: &[
+                framework!("CoreFoundation"),
+                framework!("CoreGraphics"),
+                LIBSYSTEM,
+            ],
+        },
     },
     Framework {
         leaf: "ApplicationServices",
@@ -114,6 +209,14 @@ static FRAMEWORKS: &[Framework] = &[
         provide: Some(applicationservices::provide),
         data: None,
         symbol: Some(applicationservices::symbol),
+        links: Links {
+            reexports: &[framework!("CoreGraphics"), framework!("CoreText")],
+            dependencies: &[
+                framework!("CoreFoundation"),
+                framework!("CoreServices"),
+                LIBSYSTEM,
+            ],
+        },
     },
     Framework {
         leaf: "CoreServices",
@@ -122,6 +225,16 @@ static FRAMEWORKS: &[Framework] = &[
         provide: Some(coreservices::provide),
         data: None,
         symbol: Some(coreservices::symbol),
+        links: Links {
+            reexports: &[],
+            dependencies: &[
+                framework!("CoreFoundation"),
+                framework!("IOKit"),
+                framework!("Security"),
+                LIBOBJC,
+                LIBSYSTEM,
+            ],
+        },
     },
     Framework {
         leaf: "AudioToolbox",
@@ -130,14 +243,72 @@ static FRAMEWORKS: &[Framework] = &[
         provide: Some(audiotoolbox::provide),
         data: None,
         symbol: Some(audiotoolbox::symbol),
+        links: Links {
+            reexports: &[],
+            dependencies: &[
+                framework!("CoreAudio"),
+                framework!("CoreFoundation"),
+                framework!("Foundation"),
+                LIBOBJC,
+                LIBSYSTEM,
+            ],
+        },
+    },
+    Framework {
+        leaf: "CoreMedia",
+        version: 'A',
+        umbrellas: &[],
+        provide: Some(coremedia::provide),
+        data: Some(coremedia_data),
+        symbol: Some(coremedia::symbol),
+        links: Links {
+            reexports: &[],
+            dependencies: &[
+                framework!("CoreFoundation"),
+                framework!("CoreAudio"),
+                framework!("CoreVideo"),
+                LIBOBJC,
+                LIBSYSTEM,
+            ],
+        },
     },
     Framework {
         leaf: "CoreVideo",
         version: 'A',
         umbrellas: &[],
         provide: Some(corevideo::provide),
-        data: None,
+        data: Some(corevideo_data),
         symbol: Some(corevideo::symbol),
+        links: Links {
+            reexports: &[],
+            dependencies: &[
+                framework!("CoreFoundation"),
+                framework!("IOSurface"),
+                framework!("Metal"),
+                framework!("CoreGraphics"),
+                framework!("OpenGL"),
+                LIBOBJC,
+                LIBSYSTEM,
+            ],
+        },
+    },
+    Framework {
+        leaf: "VideoToolbox",
+        version: 'A',
+        umbrellas: &[],
+        provide: Some(videotoolbox::provide),
+        data: Some(videotoolbox::data_symbols),
+        symbol: Some(videotoolbox::symbol),
+        links: Links {
+            reexports: &[],
+            dependencies: &[
+                framework!("CoreMedia"),
+                framework!("CoreVideo"),
+                framework!("CoreFoundation"),
+                framework!("IOSurface"),
+                LIBSYSTEM,
+            ],
+        },
     },
     Framework {
         leaf: "IOSurface",
@@ -146,6 +317,15 @@ static FRAMEWORKS: &[Framework] = &[
         provide: Some(iosurface::provide),
         data: Some(iosurface::data_symbols),
         symbol: Some(iosurface::symbol),
+        links: Links {
+            reexports: &[],
+            dependencies: &[
+                framework!("IOKit"),
+                framework!("CoreFoundation"),
+                LIBOBJC,
+                LIBSYSTEM,
+            ],
+        },
     },
     Framework {
         leaf: "CoreAudio",
@@ -154,6 +334,33 @@ static FRAMEWORKS: &[Framework] = &[
         provide: Some(coreaudio::provide),
         data: None,
         symbol: Some(coreaudio::symbol),
+        links: Links {
+            reexports: &[],
+            dependencies: &[
+                framework!("CoreFoundation"),
+                framework!("IOKit"),
+                LIBOBJC,
+                LIBSYSTEM,
+            ],
+        },
+    },
+    Framework {
+        leaf: "UniformTypeIdentifiers",
+        version: 'A',
+        umbrellas: &[],
+        provide: None,
+        data: Some(coreservices::uttype::data_symbols),
+        symbol: None,
+        links: Links {
+            reexports: &[],
+            dependencies: &[
+                framework!("Foundation"),
+                framework!("CoreFoundation"),
+                framework!("CoreServices"),
+                LIBOBJC,
+                LIBSYSTEM,
+            ],
+        },
     },
     Framework {
         leaf: "Contacts",
@@ -162,14 +369,37 @@ static FRAMEWORKS: &[Framework] = &[
         provide: None,
         data: Some(contacts::data_symbols),
         symbol: None,
+        links: Links {
+            reexports: &[],
+            dependencies: &[
+                framework!("Foundation"),
+                framework!("CoreFoundation"),
+                LIBOBJC,
+                LIBSYSTEM,
+            ],
+        },
     },
     Framework {
         leaf: "AVFoundation",
         version: 'A',
         umbrellas: &[],
         provide: None,
-        data: Some(avfoundation::data_symbols),
+        data: Some(avfoundation_data),
         symbol: None,
+        links: Links {
+            reexports: &[],
+            dependencies: &[
+                framework!("CoreMedia"),
+                framework!("CoreVideo"),
+                framework!("CoreAudio"),
+                framework!("AudioToolbox"),
+                framework!("Foundation"),
+                framework!("CoreFoundation"),
+                framework!("IOSurface"),
+                LIBOBJC,
+                LIBSYSTEM,
+            ],
+        },
     },
     Framework {
         leaf: "Security",
@@ -178,6 +408,16 @@ static FRAMEWORKS: &[Framework] = &[
         provide: Some(security::provide),
         data: Some(security::data_symbols),
         symbol: Some(security::symbol),
+        links: Links {
+            reexports: &[],
+            dependencies: &[
+                framework!("CoreFoundation"),
+                framework!("Foundation"),
+                framework!("IOKit"),
+                LIBOBJC,
+                LIBSYSTEM,
+            ],
+        },
     },
     Framework {
         leaf: "GameController",
@@ -186,6 +426,16 @@ static FRAMEWORKS: &[Framework] = &[
         provide: None,
         data: Some(gamecontroller::data_symbols),
         symbol: Some(gamecontroller::symbol),
+        links: Links {
+            reexports: &[],
+            dependencies: &[
+                framework!("Foundation"),
+                framework!("CoreFoundation"),
+                framework!("IOKit"),
+                LIBOBJC,
+                LIBSYSTEM,
+            ],
+        },
     },
     Framework {
         leaf: "WebKit",
@@ -194,6 +444,16 @@ static FRAMEWORKS: &[Framework] = &[
         provide: None,
         data: Some(webkit::data_symbols),
         symbol: Some(webkit::symbol),
+        links: Links {
+            reexports: &[],
+            dependencies: &[
+                framework!("AppKit"),
+                framework!("Foundation"),
+                framework!("CoreFoundation"),
+                LIBOBJC,
+                LIBSYSTEM,
+            ],
+        },
     },
     Framework {
         leaf: "Metal",
@@ -202,6 +462,17 @@ static FRAMEWORKS: &[Framework] = &[
         provide: Some(metal::provide),
         data: Some(metal::data_symbols),
         symbol: Some(metal::symbol),
+        links: Links {
+            reexports: &[],
+            dependencies: &[
+                framework!("Foundation"),
+                framework!("CoreFoundation"),
+                framework!("IOSurface"),
+                framework!("IOKit"),
+                LIBOBJC,
+                LIBSYSTEM,
+            ],
+        },
     },
 ];
 
@@ -228,10 +499,14 @@ fn register_dlopen_names() {
     if !using_builtin() {
         return;
     }
-    for framework in FRAMEWORKS {
+    for (row, framework) in FRAMEWORKS.iter().enumerate() {
         let paths = paths_of(framework);
         let borrowed: Vec<&str> = paths.iter().map(String::as_str).collect();
-        crate::dyld::register_synthetic(&borrowed, dlsym_symbol);
+        crate::dyld::register_synthetic(
+            &borrowed,
+            move |name| framework_symbol(row, name),
+            framework.links,
+        );
     }
     register_opengl_framework();
     register_openal_framework();
@@ -239,29 +514,61 @@ fn register_dlopen_names() {
 }
 
 fn register_system_libraries() {
-    crate::dyld::register_synthetic(darwin::LIBRARY_NAMES, crate::dyld::system_symbol);
     crate::dyld::register_synthetic(
-        &["/usr/lib/libobjc.A.dylib", "/usr/lib/libobjc.dylib"],
-        objc_symbol,
+        darwin::LIBRARY_NAMES,
+        libsystem_symbol,
+        Links {
+            reexports: darwin::reexports(),
+            dependencies: &[],
+        },
+    );
+    crate::dyld::register_synthetic(
+        LIBOBJC_NAMES,
+        crate::objc::host::symbol,
+        Links {
+            reexports: &[],
+            dependencies: &[LIBSYSTEM],
+        },
     );
 }
 
-fn objc_symbol(name: &str) -> Option<u64> {
-    symbol(name).or_else(|| crate::objc::host::symbol(name))
+/// What libSystem's own image exports: `darwin`, and libclosure, which is
+/// `libsystem_blocks` and which nothing on a host off Darwin defines.
+fn libsystem_symbol(name: &str) -> Option<u64> {
+    crate::dyld::libsystem_symbol(name).or_else(|| objc::block::symbol(name))
 }
 
 fn register_opengl_framework() {
-    if !crate::opengl::interposed() {
+    if !crate::gl::interposed() {
         return;
     }
-    crate::dyld::register_synthetic(crate::opengl::INSTALL_PATHS, crate::opengl::symbol);
+    crate::dyld::register_synthetic(
+        opengl::INSTALL_PATHS,
+        crate::gl::symbol,
+        Links {
+            reexports: &[],
+            dependencies: &[framework!("CoreFoundation"), framework!("IOKit"), LIBSYSTEM],
+        },
+    );
 }
 
 fn register_openal_framework() {
     if !crate::openal::interposed() {
         return;
     }
-    crate::dyld::register_synthetic(crate::openal::INSTALL_PATHS, crate::openal::symbol);
+    crate::dyld::register_synthetic(
+        crate::openal::INSTALL_PATHS,
+        crate::openal::symbol,
+        Links {
+            reexports: &[],
+            dependencies: &[
+                framework!("CoreAudio"),
+                framework!("AudioToolbox"),
+                framework!("CoreFoundation"),
+                LIBSYSTEM,
+            ],
+        },
+    );
 }
 
 fn push_main_pool() {
@@ -312,16 +619,14 @@ pub fn provider() -> SyntheticDylib {
             }
         }
     }
-    for (name, addr) in media_constants() {
-        out.data(&name, addr);
-    }
     for (name, addr) in shimmed() {
         out.function(&format!("_{name}"), addr as usize as u64);
     }
     lib
 }
 
-const MEDIA_CONSTANTS: &[(&str, &str)] = &[
+/// AVFoundation's string constants.
+const AV_CONSTANTS: &[(&str, &str)] = &[
     (
         "_AVCaptureDeviceWasConnectedNotification",
         "AVCaptureDeviceWasConnectedNotification",
@@ -346,15 +651,232 @@ const MEDIA_CONSTANTS: &[(&str, &str)] = &[
     ("_AVMediaTypeVideo", "vide"),
     ("_AVMediaTypeAudio", "soun"),
     ("_AVMediaTypeText", "text"),
-    // Pixel buffer attribute keys, which SDL's camera puts in an AVFoundation
-    // settings dictionary.
+];
+
+/// CoreVideo's pixel buffer, attachment and pool keys. The texts are Apple's,
+/// as a guest may compare against a CFSTR.
+const CV_CONSTANTS: &[(&str, &str)] = &[
     ("_kCVPixelBufferPixelFormatTypeKey", "PixelFormatType"),
     ("_kCVPixelBufferWidthKey", "Width"),
     ("_kCVPixelBufferHeightKey", "Height"),
+    ("_kCVPixelBufferMemoryAllocatorKey", "MemoryAllocator"),
+    (
+        "_kCVPixelBufferBytesPerRowAlignmentKey",
+        "BytesPerRowAlignment",
+    ),
+    ("_kCVPixelBufferPlaneAlignmentKey", "PlaneAlignment"),
+    (
+        "_kCVPixelBufferIOSurfacePropertiesKey",
+        "IOSurfaceProperties",
+    ),
+    (
+        "_kCVPixelBufferOpenGLCompatibilityKey",
+        "OpenGLCompatibility",
+    ),
+    ("_kCVPixelBufferMetalCompatibilityKey", "MetalCompatibility"),
+    (
+        "_kCVPixelBufferOpenGLESCompatibilityKey",
+        "OpenGLESCompatibility",
+    ),
+    (
+        "_kCVPixelBufferOpenGLESTextureCacheCompatibilityKey",
+        "OpenGLESTextureCacheCompatibility",
+    ),
+    (
+        "_kCVPixelBufferIOSurfaceCoreAnimationCompatibilityKey",
+        "IOSurfaceCoreAnimationCompatibility",
+    ),
+    (
+        "_kCVPixelBufferIOSurfaceOpenGLFBOCompatibilityKey",
+        "IOSurfaceOpenGLFBOCompatibility",
+    ),
+    (
+        "_kCVPixelBufferIOSurfaceOpenGLESFBOCompatibilityKey",
+        "IOSurfaceOpenGLESFBOCompatibility",
+    ),
+    (
+        "_kCVPixelBufferIOSurfaceOpenGLTextureCompatibilityKey",
+        "IOSurfaceOpenGLTextureCompatibility",
+    ),
+    (
+        "_kCVPixelBufferIOSurfaceOpenGLESTextureCompatibilityKey",
+        "IOSurfaceOpenGLESTextureCompatibility",
+    ),
+    ("_kCVPixelBufferIOSurfacePurgeableKey", "IOSurfacePurgeable"),
+    (
+        "_kCVPixelBufferOpenGLTextureCacheCompatibilityKey",
+        "OpenGLTextureCacheCompatibility",
+    ),
+    (
+        "_kCVPixelBufferCGBitmapContextCompatibilityKey",
+        "CGBitmapContextCompatibility",
+    ),
+    (
+        "_kCVPixelBufferCGImageCompatibilityKey",
+        "CGImageCompatibility",
+    ),
+    ("_kCVPixelBufferExtendedPixelsLeftKey", "ExtendedPixelsLeft"),
+    ("_kCVPixelBufferExtendedPixelsTopKey", "ExtendedPixelsTop"),
+    (
+        "_kCVPixelBufferExtendedPixelsRightKey",
+        "ExtendedPixelsRight",
+    ),
+    (
+        "_kCVPixelBufferExtendedPixelsBottomKey",
+        "ExtendedPixelsBottom",
+    ),
+    (
+        "_kCVBufferPropagatedAttachmentsKey",
+        "PropagatedAttachments",
+    ),
+    (
+        "_kCVBufferNonPropagatedAttachmentsKey",
+        "NonPropagatedAttachments",
+    ),
+    (
+        "_kCVImageBufferCGColorSpaceKey",
+        "CVImageBufferCGColorSpace",
+    ),
+    ("_kCVImageBufferCleanApertureKey", "CVCleanAperture"),
+    ("_kCVImageBufferPixelAspectRatioKey", "CVPixelAspectRatio"),
+    (
+        "_kCVImageBufferPixelAspectRatioHorizontalSpacingKey",
+        "HorizontalSpacing",
+    ),
+    (
+        "_kCVImageBufferPixelAspectRatioVerticalSpacingKey",
+        "VerticalSpacing",
+    ),
+    ("_kCVImageBufferFieldCountKey", "CVFieldCount"),
+    ("_kCVImageBufferFieldDetailKey", "CVFieldDetail"),
+    ("_kCVImageBufferYCbCrMatrixKey", "CVImageBufferYCbCrMatrix"),
+    ("_kCVImageBufferYCbCrMatrix_ITU_R_709_2", "ITU_R_709_2"),
+    ("_kCVImageBufferYCbCrMatrix_ITU_R_601_4", "ITU_R_601_4"),
+    (
+        "_kCVImageBufferYCbCrMatrix_SMPTE_240M_1995",
+        "SMPTE_240M_1995",
+    ),
+    ("_kCVImageBufferYCbCrMatrix_ITU_R_2020", "ITU_R_2020"),
+    (
+        "_kCVImageBufferColorPrimariesKey",
+        "CVImageBufferColorPrimaries",
+    ),
+    ("_kCVImageBufferColorPrimaries_ITU_R_709_2", "ITU_R_709_2"),
+    ("_kCVImageBufferColorPrimaries_EBU_3213", "EBU_3213"),
+    ("_kCVImageBufferColorPrimaries_SMPTE_C", "SMPTE_C"),
+    ("_kCVImageBufferColorPrimaries_ITU_R_2020", "ITU_R_2020"),
+    (
+        "_kCVImageBufferTransferFunctionKey",
+        "CVImageBufferTransferFunction",
+    ),
+    ("_kCVImageBufferTransferFunction_ITU_R_709_2", "ITU_R_709_2"),
+    (
+        "_kCVImageBufferTransferFunction_SMPTE_240M_1995",
+        "SMPTE_240M_1995",
+    ),
+    ("_kCVImageBufferTransferFunction_ITU_R_2020", "ITU_R_2020"),
+    (
+        "_kCVImageBufferChromaLocationTopFieldKey",
+        "CVImageBufferChromaLocationTopField",
+    ),
+    (
+        "_kCVImageBufferChromaLocationBottomFieldKey",
+        "CVImageBufferChromaLocationBottomField",
+    ),
+    ("_kCVImageBufferChromaLocation_Left", "Left"),
+    ("_kCVImageBufferChromaLocation_Center", "Center"),
+    ("_kCVImageBufferChromaLocation_TopLeft", "TopLeft"),
+    ("_kCVImageBufferChromaLocation_Top", "Top"),
+    ("_kCVImageBufferChromaLocation_BottomLeft", "BottomLeft"),
+    ("_kCVImageBufferChromaLocation_Bottom", "Bottom"),
+    (
+        "_kCVPixelBufferPoolMinimumBufferCountKey",
+        "MinimumBufferCount",
+    ),
+    ("_kCVPixelBufferPoolMaximumBufferAgeKey", "MaximumBufferAge"),
+    (
+        "_kCVPixelBufferPoolAllocationThresholdKey",
+        "kCVPixelBufferPoolAllocationThresholdKey",
+    ),
 ];
 
-fn media_constants() -> Vec<(String, u64)> {
-    corefoundation::base::string_globals(MEDIA_CONSTANTS)
+/// CoreFoundation's `CFUserNotification` keys.
+const CF_USER_NOTIFICATION_CONSTANTS: &[(&str, &str)] = &[
+    ("_kCFUserNotificationAlertHeaderKey", "AlertHeader"),
+    ("_kCFUserNotificationAlertMessageKey", "AlertMessage"),
+    (
+        "_kCFUserNotificationDefaultButtonTitleKey",
+        "DefaultButtonTitle",
+    ),
+];
+
+/// `CMTimeFlags`, from CMTime.h.
+const CM_TIME_VALID: u32 = 1;
+const CM_TIME_POSITIVE_INFINITY: u32 = 1 << 2;
+const CM_TIME_NEGATIVE_INFINITY: u32 = 1 << 3;
+
+/// `(symbol, value, timescale, flags)` for the `CMTime` globals, which are
+/// structs rather than objects: the symbol is the struct's own address.
+const CM_TIME_CONSTANTS: &[(&str, i64, i32, u32)] = &[
+    ("_kCMTimeInvalid", 0, 0, 0),
+    ("_kCMTimeZero", 0, 1, CM_TIME_VALID),
+    (
+        "_kCMTimePositiveInfinity",
+        0,
+        0,
+        CM_TIME_VALID | CM_TIME_POSITIVE_INFINITY,
+    ),
+    (
+        "_kCMTimeNegativeInfinity",
+        0,
+        0,
+        CM_TIME_VALID | CM_TIME_NEGATIVE_INFINITY,
+    ),
+];
+
+fn cm_time_constants() -> Vec<(String, u64)> {
+    // Built once, so the same call answers the same addresses.
+    static TIMES: std::sync::OnceLock<Vec<(String, u64)>> = std::sync::OnceLock::new();
+    TIMES
+        .get_or_init(|| {
+            CM_TIME_CONSTANTS
+                .iter()
+                .map(|&(symbol, value, timescale, flags)| {
+                    // Leaked: the guest holds the address for the life of the process.
+                    let words: &'static mut [u64; 3] = Box::leak(Box::new([
+                        value as u64,
+                        u64::from(timescale as u32) | u64::from(flags) << 32,
+                        0,
+                    ]));
+                    (symbol.to_string(), words.as_ptr() as u64)
+                })
+                .collect()
+        })
+        .clone()
+}
+
+fn corefoundation_data() -> Vec<(String, u64)> {
+    let mut out = corefoundation::data_symbols();
+    out.extend(corefoundation::base::string_globals(
+        CF_USER_NOTIFICATION_CONSTANTS,
+    ));
+    out
+}
+
+fn coremedia_data() -> Vec<(String, u64)> {
+    let mut out = coremedia::data_symbols();
+    out.extend(cm_time_constants());
+    out
+}
+
+fn corevideo_data() -> Vec<(String, u64)> {
+    corefoundation::base::string_globals(CV_CONSTANTS)
+}
+
+fn avfoundation_data() -> Vec<(String, u64)> {
+    let mut out = avfoundation::data_symbols();
+    out.extend(corefoundation::base::string_globals(AV_CONSTANTS));
+    out
 }
 
 fn shimmed() -> Vec<(&'static str, *const ())> {
@@ -390,42 +912,46 @@ pub fn symbol(name: &str) -> Option<u64> {
         // `crate::shims::block`. Nothing on a host off Darwin defines it, and it
         // has no framework of its own to be a row.
         .or_else(|| objc::block::symbol(name))
-        // The host's GL, reached by `dlsym` rather than enumerated - see
-        // `crate::opengl`, which publishes it through its own lazy provider.
-        .or_else(|| crate::opengl::symbol(name))
+        // OpenGL, whose driver half is reached by `dlsym` rather than
+        // enumerated - see `crate::gl`, which publishes it lazily.
+        .or_else(|| crate::gl::symbol(name))
         .or_else(|| crate::openal::symbol(name))
 }
 
-/// What `dlsym` on a provided framework answers: its functions, and then its
+/// What `dlsym` on the framework at `row` answers: its functions, and then its
 /// variables - `CFBundleGetDataPointerForName` asks for `kCFTypeArrayCallBacks`
 /// this way, and has to be handed the address the guest's own bind got.
-fn dlsym_symbol(name: &str) -> Option<u64> {
-    symbol(name).or_else(|| data_symbol(name))
+fn framework_symbol(row: usize, name: &str) -> Option<u64> {
+    foundation::bootstrap();
+    FRAMEWORKS[row]
+        .symbol
+        .and_then(|symbol| symbol(name))
+        .or_else(|| data_symbol(row, name))
 }
 
-/// A variable the flat provider publishes, by its C name.
-fn data_symbol(name: &str) -> Option<u64> {
-    if !using_builtin() {
-        return None;
-    }
+/// A variable the flat provider publishes for the framework at `row`, by its C
+/// name.
+fn data_symbol(row: usize, name: &str) -> Option<u64> {
     // Built once: the tables allocate their objects on first use and answer
     // the same addresses after, which is what makes a cache of them correct.
-    static DATA: std::sync::OnceLock<std::collections::HashMap<String, u64>> =
+    static DATA: std::sync::OnceLock<std::collections::HashMap<String, (usize, u64)>> =
         std::sync::OnceLock::new();
     let data = DATA.get_or_init(|| {
         foundation::bootstrap();
         FRAMEWORKS
             .iter()
-            .filter_map(|f| f.data)
-            .flat_map(|data| data())
-            .chain(media_constants())
+            .enumerate()
+            .filter_map(|(row, f)| Some((row, f.data?)))
+            .flat_map(|(row, data)| data().into_iter().map(move |(n, a)| (n, (row, a))))
             .collect()
     });
     let mangled = format!("_{name}");
     if withheld(&mangled) {
         return None;
     }
-    data.get(&mangled).copied()
+    data.get(&mangled)
+        .filter(|(owner, _)| *owner == row)
+        .map(|&(_, addr)| addr)
 }
 
 pub fn set_main_bundle(executable: &std::path::Path) {

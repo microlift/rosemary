@@ -527,6 +527,15 @@ pub fn chord_control(side: u16) -> u16 {
     }
 }
 
+/// The scancode a virtual key code names, the inverse of [`virtual_key`]
+/// before any remapping.
+pub fn scancode_of(vk: u16) -> Option<u32> {
+    VIRTUAL_KEYS
+        .iter()
+        .find(|(_, v)| *v == vk)
+        .map(|(scancode, _)| *scancode)
+}
+
 pub fn virtual_key(scancode: u32) -> u16 {
     let scancode = guest_scancode(command_key(), edit_chord() != 0, scancode);
     VIRTUAL_KEYS

@@ -79,6 +79,7 @@ fn truthy(value: &Value) -> bool {
 /// Without a process server every launch is a new instance, as it was before
 /// there was one to ask.
 pub fn launch(bundle: &Path, launch: Launch, urls: &[String]) -> Result<Outcome, String> {
+    let _host = darwin::syscall::ScopedHostSyscallContext::new();
     if !server::client::configured() {
         return Ok(Outcome::Run);
     }
@@ -118,6 +119,7 @@ pub fn is_launch_url(argument: &str) -> bool {
 
 /// The instance a launch of the host path `bundle` would be handed to.
 pub(crate) fn running_instance(bundle: &Path, launch: Launch) -> Option<Application> {
+    let _host = darwin::syscall::ScopedHostSyscallContext::new();
     let wanted = describe(bundle)?;
     server::client::applications(None)?
         .into_iter()

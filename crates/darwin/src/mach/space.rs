@@ -72,6 +72,11 @@ pub enum Right {
     Dead { refs: u32 },
     /// A Mach semaphore, which is named out of the same space and is not a port.
     Semaphore(Arc<super::sync::Semaphore>),
+    /// A send right to a named memory entry, from `mach_make_memory_entry_64`.
+    Memory {
+        entry: Arc<super::entry::Entry>,
+        refs: u32,
+    },
     /// A send right to a task: another guest's, from `task_for_pid`, by its
     /// guest pid. Every question about the task goes to the process server,
     /// and every change to it to the task itself through the server.
@@ -100,7 +105,7 @@ impl Right {
             // it as a send right because that is what the task and host ports
             // are on a real system.
             Right::Semaphore(_) | Right::Special => type_of(RIGHT_SEND),
-            Right::Task { .. } | Right::Thread { .. } => type_of(RIGHT_SEND),
+            Right::Task { .. } | Right::Thread { .. } | Right::Memory { .. } => type_of(RIGHT_SEND),
         }
     }
 }
@@ -380,7 +385,7 @@ fn thread_name(pid: i32, tid: i32, add_reference: bool) -> Name {
 }
 
 fn own_pid() -> i32 {
-    starnix::process::me()
+    crate::process::host_self()
 }
 
 /// The pid of the task `name` is a right to.
@@ -443,7 +448,8 @@ fn release(space: &mut Space, name: Name) -> i32 {
         Right::Send { refs, .. }
         | Right::Dead { refs }
         | Right::Task { refs, .. }
-        | Right::Thread { refs, .. } => {
+        | Right::Thread { refs, .. }
+        | Right::Memory { refs, .. } => {
             *refs -= 1;
             if *refs == 0 {
                 space.names.remove(&name);
@@ -540,7 +546,8 @@ pub extern "C" fn mach_port_mod_refs(task: Name, name: Name, right: u32, delta: 
             Right::Send { refs, .. }
             | Right::Dead { refs }
             | Right::Task { refs, .. }
-            | Right::Thread { refs, .. } => {
+            | Right::Thread { refs, .. }
+            | Right::Memory { refs, .. } => {
                 let updated = *refs as i64 + delta as i64;
                 if updated < 0 {
                     return KERN_INVALID_VALUE;
@@ -592,7 +599,9 @@ pub unsafe extern "C" fn mach_port_get_refs(
     };
     let refs = match (held, held.type_bits() == type_of(right)) {
         (_, false) => 0,
-        (Right::Send { refs, .. } | Right::Dead { refs }, true) => *refs,
+        (Right::Send { refs, .. } | Right::Dead { refs } | Right::Memory { refs, .. }, true) => {
+            *refs
+        }
         (_, true) => 1,
     };
     // SAFETY: the caller's `mach_port_urefs_t`.

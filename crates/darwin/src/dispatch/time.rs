@@ -10,7 +10,7 @@ pub fn now() -> u64 {
         tv_nsec: 0,
     };
     // SAFETY: `clock_gettime` writes the `timespec` it is given and nothing else.
-    if unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts) } != 0 {
+    if unsafe { crate::syscall::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts) } != 0 {
         return 0;
     }
     (ts.tv_sec as u64)

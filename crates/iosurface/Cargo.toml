@@ -9,3 +9,6 @@ license.workspace = true
 exports.workspace = true
 corefoundation.workspace = true
 objc.workspace = true
+
+[lints]
+workspace = true

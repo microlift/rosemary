@@ -25,12 +25,16 @@ pub(crate) use buffer::leaking;
 pub(crate) use buffer::new_buffer;
 pub(crate) use depth_stencil::{DepthStencilState, StencilState, new_depth_stencil_state};
 pub(crate) use heap::new_heap;
+#[cfg(test)]
+pub(crate) use heap::placement_of;
 pub(crate) use heap::{heap_buffer_size_and_align, heap_texture_size_and_align};
 pub(crate) use sampler::{SamplerDescriptor, SamplerState, compare_op, new_sampler};
+#[cfg(test)]
+pub(crate) use texture::Region;
 pub(crate) use texture::{Texture, TextureDescriptor, drawable_texture, new_texture};
 pub(crate) use vertex::{
     Element, IndexedCollection, VERTEX_SLOTS, VertexAttribute, VertexDescriptor, VertexLayout,
-    orphan, orphan_element,
+    copy_vertex_descriptor, new_empty_vertex_descriptor, orphan, orphan_element,
 };
 
 pub(crate) struct Buffer {
@@ -89,6 +93,8 @@ impl Default for DepthStencilState {
 pub(crate) fn install() {
     let buffer = object::register::<Buffer>(c"RosemaryMTLBuffer");
     methods!(buffer, {
+        "newTextureWithDescriptor:offset:bytesPerRow:" => texture::buffer_new_texture,
+            c"@40@0:8@16Q24Q32";
         "dealloc" => buffer_dealloc, c"v16@0:8";
         "contents" => buffer_contents, c"^v16@0:8";
         "length" => buffer_length, c"Q16@0:8";
@@ -107,12 +113,18 @@ pub(crate) fn install() {
         "setCpuCacheMode:" => crate::no_op, c"v24@0:8Q16";
         "hazardTrackingMode" => crate::zero, c"Q16@0:8";
         "setHazardTrackingMode:" => crate::no_op, c"v24@0:8Q16";
+        // How a texture's memory is laid out is the Vulkan driver's choice,
+        // as it is Metal's when this is left at its default.
+        "allowGPUOptimizedContents" => crate::device::yes, c"B16@0:8";
+        "setAllowGPUOptimizedContents:" => crate::no_op, c"v20@0:8c16";
     });
     methods!(descriptor.metaclass(), {
         "texture2DDescriptorWithPixelFormat:width:height:mipmapped:"
             => texture::texture_2d_descriptor, c"@44@0:8Q16Q24Q32B40";
         "textureCubeDescriptorWithPixelFormat:size:mipmapped:"
             => texture::texture_cube_descriptor, c"@36@0:8Q16Q24B32";
+        "textureBufferDescriptorWithPixelFormat:width:resourceOptions:usage:"
+            => texture::texture_buffer_descriptor, c"@48@0:8Q16Q24Q32Q40";
     });
     for selector in [
         "setTextureType:",
@@ -175,6 +187,9 @@ pub(crate) fn install() {
         "newTextureViewWithPixelFormat:" => new_texture_view, c"@24@0:8Q16";
         "newTextureViewWithPixelFormat:textureType:levels:slices:" => new_texture_view_range,
             c"@64@0:8Q16Q24{_NSRange=QQ}32{_NSRange=QQ}48";
+        "newTextureViewWithPixelFormat:textureType:levels:slices:swizzle:"
+            => texture::new_texture_view_swizzled,
+            c"@68@0:8Q16Q24{_NSRange=QQ}32{_NSRange=QQ}48{MTLTextureSwizzleChannels=CCCC}64";
     });
     methods!(texture, {
         "parentTexture" => texture_parent, c"@16@0:8";
@@ -192,6 +207,9 @@ pub(crate) fn install() {
         "setLodMinClamp:" => set_sampler_clamp, c"v20@0:8f16";
         "setLodMaxClamp:" => set_sampler_clamp, c"v20@0:8f16";
         "setLabel:" => crate::no_op, c"v24@0:8@16";
+        // A Vulkan sampler can be bound anywhere a sampler can, so no
+        // sampler needs to be made differently for an argument buffer.
+        "setSupportArgumentBuffers:" => crate::no_op, c"v20@0:8c16";
     });
     for selector in [
         "setMinFilter:",

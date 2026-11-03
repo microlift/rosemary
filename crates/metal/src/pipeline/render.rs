@@ -71,6 +71,9 @@ pub(crate) struct RenderPipelineDescriptor {
     pub stencil_format: u64,
     pub sample_count: u64,
     pub alpha_to_coverage: bool,
+    pub alpha_to_one: bool,
+    /// `NO` runs only the vertex function: nothing is rasterized.
+    pub rasterization: bool,
     /// The `-colorAttachments` collection, made on first use.
     pub color_objects: objc::object::Id,
 }
@@ -94,6 +97,8 @@ pub(crate) struct RenderPipeline {
     pub stencil_format: vk::Format,
     pub samples: vk::SampleCountFlags,
     alpha_to_coverage: bool,
+    alpha_to_one: bool,
+    rasterization: bool,
     /// The pass shape this pipeline was declared against, without resolves;
     /// `variant` adds those from the key and asks the cache for the pass.
     pass: RenderPassKey,
@@ -118,6 +123,9 @@ impl RenderPipeline {
                 descriptor.sample_count
             )
         })?;
+        if descriptor.alpha_to_one && !gpu.alpha_to_one {
+            return Err("alphaToOneEnabled needs the Vulkan alphaToOne feature".into());
+        }
         let vertex_module = gpu.create_shader_module(&vertex.words, &vertex.name)?;
         let linked =
             super::link::link_varyings(&vertex.varyings, &fragment.varyings, &fragment.words);
@@ -265,6 +273,8 @@ impl RenderPipeline {
             stencil_format,
             samples,
             alpha_to_coverage: descriptor.alpha_to_coverage,
+            alpha_to_one: descriptor.alpha_to_one,
+            rasterization: descriptor.rasterization,
             pass: key,
             variants: Mutex::new(HashMap::new()),
             profile_label: crate::profile::pipeline_label(&[vertex, fragment]),
@@ -332,10 +342,12 @@ impl RenderPipeline {
                 _ => vk::FrontFace::CLOCKWISE,
             })
             .depth_bias_enable(true)
+            .rasterizer_discard_enable(!self.rasterization)
             .line_width(1.0);
         let multisample = vk::PipelineMultisampleStateCreateInfo::default()
             .rasterization_samples(self.samples)
-            .alpha_to_coverage_enable(self.alpha_to_coverage);
+            .alpha_to_coverage_enable(self.alpha_to_coverage)
+            .alpha_to_one_enable(self.alpha_to_one);
         let stencil_face = |face: &[u64; 6]| {
             vk::StencilOpState::default()
                 .compare_op(compare_op(face[0]))

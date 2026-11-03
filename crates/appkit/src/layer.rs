@@ -85,7 +85,9 @@ unsafe extern "C" fn new_layer(class: Id, _sel: Sel) -> Id {
         })
     }) {
         let metal = metal_layer_of(object);
-        // CAMetalLayer's documented defaults.
+        // CAMetalLayer, unlike CALayer, defaults to opaque. The guest can
+        // opt into alpha through -setOpaque: and the presenter must honor it.
+        metal.layer.opaque = 1;
         metal.pixel_format = 80; // MTLPixelFormatBGRA8Unorm
         metal.framebuffer_only = 1;
         metal.display_sync_enabled = 1;
@@ -145,6 +147,12 @@ pub(crate) fn contents_scale_of(layer: Id) -> f64 {
         true => layer_of(layer).contents_scale,
         false => 1.0,
     }
+}
+
+/// The CA `opaque` contract is a guarantee about a layer's drawable
+/// contents; unlike opacity=1, this permits skipping alpha compositing.
+pub(crate) fn opaque_of(layer: Id) -> bool {
+    is_layer(layer) && layer_of(layer).opaque != 0
 }
 
 /// Whether `layer` is a `CAMetalLayer`, whose pixels are presented by Metal
@@ -221,7 +229,11 @@ unsafe extern "C" fn set_contents_scale(receiver: Id, _sel: Sel, scale: f64) {
 }
 
 unsafe extern "C" fn set_opaque(receiver: Id, _sel: Sel, opaque: u8) {
-    layer_of(receiver).opaque = opaque;
+    let changed = (layer_of(receiver).opaque != 0) != (opaque != 0);
+    layer_of(receiver).opaque = u8::from(opaque != 0);
+    if changed {
+        crate::coreanimation::changed(receiver);
+    }
 }
 
 unsafe extern "C" fn is_opaque(receiver: Id, _sel: Sel) -> u8 {

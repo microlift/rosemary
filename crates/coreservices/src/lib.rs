@@ -11,6 +11,7 @@ pub mod icons;
 pub mod process;
 pub mod resources;
 pub mod uti;
+pub mod uttype;
 
 exports::group! {
     collator,

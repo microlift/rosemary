@@ -81,7 +81,7 @@ fn kind_to_host(darwin: i32) -> i32 {
 }
 
 /// `int socket(int domain, int type, int protocol)`
-unsafe extern "C" fn socket(domain: i32, kind: i32, protocol: i32) -> i32 {
+pub unsafe extern "C" fn socket(domain: i32, kind: i32, protocol: i32) -> i32 {
     let Some(domain) = addr::family_to_host(domain) else {
         crate::errno::set(libc::EAFNOSUPPORT);
         return -1;
@@ -97,7 +97,7 @@ unsafe extern "C" fn socket(domain: i32, kind: i32, protocol: i32) -> i32 {
 /// # Safety
 ///
 /// `sv` is two writable `int`s.
-unsafe extern "C" fn socketpair(domain: i32, kind: i32, protocol: i32, sv: *mut i32) -> i32 {
+pub unsafe extern "C" fn socketpair(domain: i32, kind: i32, protocol: i32, sv: *mut i32) -> i32 {
     let Some(domain) = addr::family_to_host(domain) else {
         crate::errno::set(libc::EAFNOSUPPORT);
         return -1;
@@ -125,9 +125,12 @@ unsafe fn with_address(
     len: u32,
     call: unsafe extern "C" fn(i32, *const libc::sockaddr, libc::socklen_t) -> i32,
 ) -> i32 {
-    let Some(host) = (unsafe { addr::to_host(address, len) }) else {
-        crate::errno::set(libc::EAFNOSUPPORT);
-        return -1;
+    let host = match unsafe { addr::to_host(address, len) } {
+        Ok(host) => host,
+        Err(errno) => {
+            crate::errno::set(errno);
+            return -1;
+        }
     };
     // SAFETY: an address this function owns, with the length it was built with.
     unsafe { call(fd, host.as_ptr(), host.len()) }
@@ -139,17 +142,19 @@ unsafe fn with_address(
 ///
 /// `address` is `len` readable bytes.
 unsafe extern "C" fn bind(fd: i32, address: *const c_void, len: u32) -> i32 {
-    let Some(host) = (unsafe { addr::to_host(address, len) }) else {
-        crate::errno::set(libc::EAFNOSUPPORT);
-        return -1;
+    let host = match unsafe { addr::to_host(address, len) } {
+        Ok(host) => host,
+        Err(errno) => {
+            crate::errno::set(errno);
+            return -1;
+        }
     };
     // SAFETY: an address this function owns, with the length it was built with.
     let rc = unsafe { libc::bind(fd, host.as_ptr(), host.len()) };
-    // SAFETY: the address's own bytes, `len` of them.
-    let family = unsafe { (*host.as_ptr()).sa_family } as i32;
-    if rc == 0 && family == libc::AF_UNIX {
-        let path = core::mem::offset_of!(libc::sockaddr_un, sun_path);
-        crate::sockpath::bound(&host.as_bytes()[path..host.len() as usize]);
+    if rc == 0
+        && let Some(file) = host.unix_file()
+    {
+        crate::sockpath::bound(file);
     }
     rc
 }
@@ -159,7 +164,7 @@ unsafe extern "C" fn bind(fd: i32, address: *const c_void, len: u32) -> i32 {
 /// # Safety
 ///
 /// As [`bind`].
-unsafe extern "C" fn connect(fd: i32, address: *const c_void, len: u32) -> i32 {
+pub unsafe extern "C" fn connect(fd: i32, address: *const c_void, len: u32) -> i32 {
     // SAFETY: the caller's guarantee, passed along.
     unsafe { with_address(fd, address, len, libc::connect) }
 }
@@ -245,6 +250,7 @@ pub(super) struct PeerIds {
 /// `host_uid` is the peer's real uid, and only a peer still running as it, not
 /// one that became another virtual user, is answered this way.
 fn as_launchd_owner(ids: PeerIds, host_uid: u32) -> PeerIds {
+    let _host = crate::syscall::ScopedHostSyscallContext::new();
     // SAFETY: `getpid` and `getuid` take nothing and cannot fail.
     let (me, owner) = unsafe { (libc::getpid(), libc::getuid()) };
     if server::client::launchd() != Some(me) || host_uid != owner || ids.euid != owner {
@@ -268,6 +274,7 @@ fn as_launchd_owner(ids: PeerIds, host_uid: u32) -> PeerIds {
 /// answered the way a Mac would. A peer the server does not know is the host
 /// user at the other end.
 pub(super) fn peer_ids(fd: i32) -> Option<PeerIds> {
+    let _host = crate::syscall::ScopedHostSyscallContext::new();
     /// Names the guest's descriptor without owning it, or asserting it is valid.
     struct Raw(i32);
     impl std::os::fd::AsRawFd for Raw {
@@ -396,9 +403,12 @@ unsafe extern "C" fn sendto(
         let sent = unsafe { libc::sendto(fd, buf, len, host_flags, core::ptr::null(), 0) };
         return half_close_if_asked(fd, flags, sent);
     }
-    let Some(host) = (unsafe { addr::to_host(address, addrlen) }) else {
-        crate::errno::set(libc::EAFNOSUPPORT);
-        return -1;
+    let host = match unsafe { addr::to_host(address, addrlen) } {
+        Ok(host) => host,
+        Err(errno) => {
+            crate::errno::set(errno);
+            return -1;
+        }
     };
     // SAFETY: the caller's buffer and an address this function owns.
     let sent = unsafe { libc::sendto(fd, buf, len, host_flags, host.as_ptr(), host.len()) };
@@ -482,8 +492,10 @@ fn say_control_refused(refused: super::control::Untranslatable) {
 
 /// The two halves `sendmsg` and `recvmsg` share: a guest `msghdr` as the host's.
 ///
-/// `None` when the message carries ancillary data this host cannot be given -
-/// see [`super::control`], which owns that decision and the conversion behind it. `control` is the host buffer the returned
+/// `Err(EOPNOTSUPP)` when the message carries ancillary data this host cannot
+/// be given - see [`super::control`], which owns that decision and the
+/// conversion behind it - and the errno for a name that does not convert.
+/// `control` is the host buffer the returned
 /// `msghdr` points into, so the caller has to keep it alive across the call.
 ///
 /// # Safety
@@ -494,7 +506,7 @@ unsafe fn msghdr_to_host(
     name: &mut Option<HostAddr>,
     control: &mut Vec<u8>,
     sending: bool,
-) -> Option<libc::msghdr> {
+) -> Result<libc::msghdr, i32> {
     let g = unsafe { guest.read() };
     if sending && !g.control.is_null() && g.controllen != 0 {
         // SAFETY: the guest's control buffer, with the length it gave for it.
@@ -502,7 +514,7 @@ unsafe fn msghdr_to_host(
             Ok(host) => *control = host,
             Err(refused) => {
                 say_control_refused(refused);
-                return None;
+                return Err(libc::EOPNOTSUPP);
             }
         }
     }
@@ -526,7 +538,7 @@ unsafe fn msghdr_to_host(
         host.msg_control = control.as_mut_ptr().cast();
         host.msg_controllen = control.len() as _;
     }
-    Some(host)
+    Ok(host)
 }
 
 /// `ssize_t sendmsg(int, const struct msghdr *, int)`
@@ -546,10 +558,12 @@ unsafe extern "C" fn sendmsg(fd: i32, message: *const c_void, flags: i32) -> isi
     }
     let mut name = None;
     let mut control = Vec::new();
-    let Some(host) = (unsafe { msghdr_to_host(message.cast(), &mut name, &mut control, true) })
-    else {
-        crate::errno::set(libc::EOPNOTSUPP);
-        return -1;
+    let host = match unsafe { msghdr_to_host(message.cast(), &mut name, &mut control, true) } {
+        Ok(host) => host,
+        Err(errno) => {
+            crate::errno::set(errno);
+            return -1;
+        }
     };
     // SAFETY: a `msghdr` this function built, pointing at the caller's own
     // iovecs - which `struct iovec` has the same layout for on both platforms -
@@ -575,10 +589,12 @@ unsafe extern "C" fn recvmsg(fd: i32, message: *mut c_void, flags: i32) -> isize
     }
     let mut name = None;
     let mut sent_control = Vec::new();
-    let Some(mut host) = (unsafe { msghdr_to_host(guest, &mut name, &mut sent_control, false) })
-    else {
-        crate::errno::set(libc::EOPNOTSUPP);
-        return -1;
+    let mut host = match unsafe { msghdr_to_host(guest, &mut name, &mut sent_control, false) } {
+        Ok(host) => host,
+        Err(errno) => {
+            crate::errno::set(errno);
+            return -1;
+        }
     };
     // The name is written by the kernel, so it needs room rather than a copy of
     // what the guest had there.
@@ -915,6 +931,14 @@ struct Endpoints {
     dstaddrlen: u32,
 }
 
+/// The `sae_connid_t` Darwin's TCP and UDP number their one connection with.
+const SAE_CONNID_ONLY: u32 = 1;
+
+/// `SAE_ASSOCID_ANY` and `SAE_ASSOCID_ALL`, the only associations a socket
+/// that is not multipath has.
+const SAE_ASSOCID_ANY: u32 = 0;
+const SAE_ASSOCID_ALL: u32 = u32::MAX;
+
 /// Implements `connectx` with `bind`, `connect`, and `writev`. Refuses a source
 /// interface because binding to a different interface would be incorrect.
 ///
@@ -956,9 +980,8 @@ unsafe extern "C" fn connectx(
         return rc;
     }
     if !connid.is_null() {
-        // SAFETY: the caller's slot. `SAE_CONNID_ANY` is the only connection
-        // this socket has, there being no association to number it within.
-        unsafe { connid.write(0) };
+        // SAFETY: the caller's slot.
+        unsafe { connid.write(SAE_CONNID_ONLY) };
     }
     if iov.is_null() || iovcnt == 0 {
         return 0;
@@ -976,6 +999,85 @@ unsafe extern "C" fn connectx(
         unsafe { len.write(written as usize) };
     }
     0
+}
+
+/// `int disconnectx(int s, sae_associd_t aid, sae_connid_t cid)`
+///
+/// Darwin's TCP and UDP answer it, ignoring `cid` because each has only one
+/// connection; every other protocol refuses it.
+///
+/// FIXME (ACCURACY): a TCP disconnect is a `shutdown`, which sends a FIN where
+/// Darwin resets a connection with unread data or a zero linger, and leaves
+/// unread data to be received where Darwin discards it. A UDP disconnect keeps
+/// an address the socket was explicitly bound to where Darwin clears it.
+pub unsafe extern "C" fn disconnectx(fd: i32, aid: u32, _cid: u32) -> i32 {
+    let Some((family, kind)) = family_and_type(fd) else {
+        return -1;
+    };
+    if !matches!(family, libc::AF_INET | libc::AF_INET6)
+        || !matches!(kind, libc::SOCK_STREAM | libc::SOCK_DGRAM)
+    {
+        crate::errno::set_guest(crate::errno::DARWIN_EOPNOTSUPP);
+        return -1;
+    }
+    if aid != SAE_ASSOCID_ANY && aid != SAE_ASSOCID_ALL {
+        crate::errno::set(libc::EINVAL);
+        return -1;
+    }
+    if kind == libc::SOCK_STREAM {
+        // SAFETY: a call on a descriptor number.
+        if unsafe { libc::shutdown(fd, libc::SHUT_RDWR) } < 0 {
+            // Darwin closes a connection that never was without complaint.
+            return match crate::errno::get() {
+                libc::ENOTCONN => 0,
+                _ => -1,
+            };
+        }
+        return 0;
+    }
+    // SAFETY: a zeroed `sockaddr_storage` is a valid empty address.
+    let mut peer: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
+    let mut len = size_of_val(&peer) as libc::socklen_t;
+    // SAFETY: a local to receive the address.
+    if unsafe { libc::getpeername(fd, (&raw mut peer).cast(), &raw mut len) } < 0 {
+        return -1;
+    }
+    // SAFETY: as above.
+    let mut unspecified: libc::sockaddr = unsafe { std::mem::zeroed() };
+    unspecified.sa_family = libc::AF_UNSPEC as libc::sa_family_t;
+    // SAFETY: an address this function owns, at its own length.
+    unsafe {
+        libc::connect(
+            fd,
+            &raw const unspecified,
+            size_of_val(&unspecified) as libc::socklen_t,
+        )
+    }
+}
+
+/// The host address family and `SOCK_*` type of socket `fd`, or `None` with
+/// `errno` set.
+fn family_and_type(fd: i32) -> Option<(i32, i32)> {
+    // SAFETY: a zeroed `sockaddr_storage` is a valid empty address.
+    let mut address: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
+    let mut len = size_of_val(&address) as libc::socklen_t;
+    // SAFETY: a local to receive the address.
+    if unsafe { libc::getsockname(fd, (&raw mut address).cast(), &raw mut len) } < 0 {
+        return None;
+    }
+    let mut kind = 0i32;
+    let mut len = size_of::<i32>() as libc::socklen_t;
+    // SAFETY: a local to receive the type.
+    let rc = unsafe {
+        libc::getsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_TYPE,
+            (&raw mut kind).cast(),
+            &raw mut len,
+        )
+    };
+    (rc == 0).then_some((i32::from(address.ss_family), kind))
 }
 
 // Not in the `libc` crate on any platform, so declared here. Both take an
@@ -1032,6 +1134,7 @@ exports::exports! {
         "writev" => writev,
         "sendfile" => sendfile,
         "connectx" => connectx,
+        "disconnectx" => disconnectx,
         "socket" => socket,
         "socketpair" => socketpair,
         "bind" => bind,
@@ -1089,7 +1192,7 @@ mod tests {
         let mut control = Vec::new();
         // SAFETY: guest is initialized and its output buffers are writable.
         let host = unsafe { super::msghdr_to_host(&guest, &mut name, &mut control, false) };
-        assert!(host.is_some());
+        assert!(host.is_ok());
         assert!(name.is_none());
         assert!(control.is_empty());
     }
@@ -1442,6 +1545,43 @@ mod tests {
         unsafe { libc::close(file) };
     }
 
+    /// The name a Unix socket was bound by comes back from `getsockname` in
+    /// Darwin's shape and the guest's spelling, with Darwin's length.
+    #[test]
+    fn getsockname_reports_a_unix_socket_by_the_path_it_was_bound_to() {
+        let path = std::env::temp_dir().join(format!("gsn-{}.sock", std::process::id()));
+        let path = path.as_os_str().as_encoded_bytes();
+        let mut guest = [0u8; 106];
+        guest[0] = guest.len() as u8;
+        guest[1] = addr::family::UNIX as u8;
+        guest[2..2 + path.len()].copy_from_slice(path);
+
+        // SAFETY: three integers.
+        let fd = unsafe { socket(addr::family::UNIX, libc::SOCK_STREAM, 0) };
+        assert!(fd >= 0);
+        // SAFETY: a Darwin `sockaddr_un` this test owns, with its length.
+        assert_eq!(
+            unsafe { bind(fd, guest.as_ptr().cast(), guest.len() as u32) },
+            0
+        );
+        let mut back = [0xffu8; 106];
+        let mut len = back.len() as u32;
+        // SAFETY: a writable buffer and its length.
+        assert_eq!(
+            unsafe { getsockname(fd, back.as_mut_ptr().cast(), &mut len) },
+            0
+        );
+        assert_eq!(back[1], addr::family::UNIX as u8);
+        assert_eq!(&back[2..2 + path.len()], path);
+        assert_eq!(back[2 + path.len()], 0);
+        assert_eq!(len as usize, 2 + path.len() + 1);
+        assert_eq!(back[0] as u32, len);
+
+        // SAFETY: a descriptor this test owns and no longer uses.
+        unsafe { libc::close(fd) };
+        let _ = std::fs::remove_file(std::str::from_utf8(path).unwrap());
+    }
+
     #[test]
     fn a_socket_of_a_family_this_host_lacks_is_refused_rather_than_opened() {
         // Darwin's `AF_LINK`.
@@ -1572,5 +1712,66 @@ mod tests {
             core::mem::size_of::<libc::msghdr>() > core::mem::size_of::<MsgHdr>(),
             "this host's struct msghdr is Darwin-shaped after all"
         );
+    }
+    /// A TCP disconnect ends the connection the way a close would, so the
+    /// peer reads the end of the stream.
+    #[test]
+    fn disconnectx_ends_a_tcp_connection() {
+        use std::io::Read;
+        use std::os::fd::AsRawFd;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let ours = std::net::TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (mut theirs, _) = listener.accept().unwrap();
+        // SAFETY: a live socket.
+        assert_eq!(
+            unsafe { disconnectx(ours.as_raw_fd(), SAE_ASSOCID_ANY, 0) },
+            0
+        );
+        let mut byte = [0u8];
+        assert_eq!(theirs.read(&mut byte).unwrap(), 0);
+    }
+
+    /// A UDP disconnect dissolves the association, and a second has nothing
+    /// left to dissolve.
+    #[test]
+    fn disconnectx_dissolves_a_udp_association() {
+        use std::os::fd::AsRawFd;
+        let socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        socket.connect("127.0.0.1:9").unwrap();
+        let fd = socket.as_raw_fd();
+        // SAFETY: a live socket.
+        assert_eq!(
+            unsafe { disconnectx(fd, SAE_ASSOCID_ALL, SAE_CONNID_ONLY) },
+            0
+        );
+        assert!(socket.peer_addr().is_err());
+        // SAFETY: as above.
+        assert_eq!(unsafe { disconnectx(fd, SAE_ASSOCID_ANY, 0) }, -1);
+        assert_eq!(crate::errno::get(), libc::ENOTCONN);
+    }
+
+    #[test]
+    fn disconnectx_refuses_an_association_a_socket_cannot_have() {
+        use std::os::fd::AsRawFd;
+        let socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        // SAFETY: a live socket.
+        assert_eq!(unsafe { disconnectx(socket.as_raw_fd(), 7, 0) }, -1);
+        assert_eq!(crate::errno::get(), libc::EINVAL);
+    }
+
+    /// Darwin's local sockets have no disconnect, and the guest is told so in
+    /// Darwin's own number, which this host would otherwise call `ENOTSUP`.
+    #[test]
+    fn disconnectx_is_not_supported_on_a_local_socket() {
+        let (one, other) = pair();
+        // SAFETY: a live socket.
+        assert_eq!(unsafe { disconnectx(one, SAE_ASSOCID_ANY, 0) }, -1);
+        assert_eq!(crate::errno::guest_errno(), crate::errno::DARWIN_EOPNOTSUPP);
+        crate::errno::set(0);
+        // SAFETY: descriptors this test opened.
+        unsafe {
+            libc::close(one);
+            libc::close(other);
+        }
     }
 }

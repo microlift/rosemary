@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::ffi::{CStr, CString, c_char};
 use std::sync::{LazyLock, RwLock};
 
+use crate::property::Property;
 use crate::sel::Sel;
 
 /// One declared method: what to send, and what its signature is.
@@ -29,6 +30,10 @@ pub struct Protocol {
 struct Contents {
     methods: HashMap<(usize, bool, bool), &'static CStr>,
     adopted: Vec<&'static Protocol>,
+    /// Required properties only, as Apple keeps them: instance ones, then
+    /// class ones.
+    instance_properties: Vec<&'static Property>,
+    class_properties: Vec<&'static Property>,
 }
 
 // SAFETY: `name` is immutable, the rest is behind a lock or an atomic, and the
@@ -88,6 +93,80 @@ impl Protocol {
         }
     }
 
+    pub fn name_c(&self) -> &CStr {
+        &self.name
+    }
+
+    /// The protocols this one adopts directly.
+    pub fn adopted(&self) -> Vec<&'static Protocol> {
+        self.contents
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .adopted
+            .clone()
+    }
+
+    /// Declare a property. Only while the protocol is being built, and only a
+    /// required one is kept: Apple's runtime has nowhere to put an optional one.
+    pub fn add_property(&self, name: &CStr, attributes: &CStr, required: bool, instance: bool) {
+        if self.is_registered() || !required {
+            return;
+        }
+        let property = crate::property::make(name, attributes);
+        let mut contents = self.contents.write().unwrap_or_else(|e| e.into_inner());
+        match instance {
+            true => contents.instance_properties.push(property),
+            false => contents.class_properties.push(property),
+        }
+    }
+
+    /// The methods this protocol declares itself in one of the four groups.
+    pub fn methods(&self, required: bool, instance: bool) -> Vec<Description> {
+        self.contents
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .methods
+            .iter()
+            .filter(|((_, r, i), _)| *r == required && *i == instance)
+            .map(|((sel, _, _), types)| Description {
+                sel: *sel as Sel,
+                types: types.as_ptr(),
+            })
+            .collect()
+    }
+
+    /// The required properties this protocol declares itself.
+    pub fn properties(&self, instance: bool) -> Vec<&'static Property> {
+        let contents = self.contents.read().unwrap_or_else(|e| e.into_inner());
+        match instance {
+            true => contents.instance_properties.clone(),
+            false => contents.class_properties.clone(),
+        }
+    }
+
+    /// The required property `name`, declared here or by an adopted protocol.
+    pub fn property(&self, name: &CStr, instance: bool) -> Option<&'static Property> {
+        self.properties(instance)
+            .into_iter()
+            .find(|p| p.name_c() == name)
+            .or_else(|| {
+                self.adopted()
+                    .into_iter()
+                    .find_map(|p| p.property(name, instance))
+            })
+    }
+
+    /// `protocol_conformsToProtocol`: the same name, or adopted directly or
+    /// through another. By name, as Apple's is, because two images may each
+    /// carry a copy of one protocol.
+    pub fn conforms_by_name(&self, other: &Protocol) -> bool {
+        self.name == other.name
+            || self
+                .adopted()
+                .into_iter()
+                .any(|p| p.conforms_by_name(other))
+    }
+
     /// Whether this protocol adopts `other`, directly or through another.
     pub fn conforms_to(&self, other: &Protocol) -> bool {
         let contents = self.contents.read().unwrap_or_else(|e| e.into_inner());
@@ -109,6 +188,16 @@ pub fn lookup(name: &CStr) -> Option<&'static Protocol> {
         .unwrap_or_else(|e| e.into_inner())
         .get(name)
         .copied()
+}
+
+/// Every registered protocol, in no particular order.
+pub fn registered() -> Vec<&'static Protocol> {
+    PROTOCOLS
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .values()
+        .copied()
+        .collect()
 }
 
 /// Allocate an unregistered protocol, or `None` if the name is taken.

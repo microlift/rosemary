@@ -21,6 +21,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         shader_storage_image_write_without_format: true,
         variable_pointers_storage_buffer: true,
         variable_pointers: true,
+        demote_to_helper_invocation: true,
         ..TargetProfile::vulkan_1_3()
     };
     for (ordinal, offset) in bytes

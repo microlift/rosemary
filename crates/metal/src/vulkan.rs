@@ -33,9 +33,10 @@ impl Adapter {
     pub fn gpu(&self) -> Result<&Gpu, &str> {
         match self.gpu.get_or_init(|| {
             let state = STATE.get().expect("adapters were enumerated first");
-            let instance = &state.as_ref().expect("this adapter came from it").instance;
+            let state = state.as_ref().expect("this adapter came from it");
             Gpu::create(
-                instance,
+                &state.entry,
+                &state.instance,
                 vk::PhysicalDevice::from_raw(self.handle as u64),
                 &self.target,
             )
@@ -56,7 +57,7 @@ struct State {
     /// `VK_EXT_surface_maintenance1`, which a device's
     /// `VK_EXT_swapchain_maintenance1` requires of its instance.
     surface_maintenance1: bool,
-    _entry: Entry,
+    entry: Entry,
     adapters: Vec<Adapter>,
 }
 
@@ -197,7 +198,7 @@ fn initialize() -> Result<State, String> {
         library,
         surface_api,
         surface_maintenance1,
-        _entry: entry,
+        entry,
         adapters,
     })
 }
@@ -677,15 +678,21 @@ mod tests {
         device_type: vk::PhysicalDeviceType,
         image_dimension: u32,
     ) -> vk::PhysicalDeviceProperties {
-        let mut properties = vk::PhysicalDeviceProperties::default();
-        properties.device_type = device_type;
-        properties.limits.max_image_dimension2_d = image_dimension;
-        properties
+        vk::PhysicalDeviceProperties {
+            device_type,
+            limits: vk::PhysicalDeviceLimits {
+                max_image_dimension2_d: image_dimension,
+                ..Default::default()
+            },
+            ..Default::default()
+        }
     }
 
     fn memory(device_local: u64) -> vk::PhysicalDeviceMemoryProperties {
-        let mut memory = vk::PhysicalDeviceMemoryProperties::default();
-        memory.memory_heap_count = 1;
+        let mut memory = vk::PhysicalDeviceMemoryProperties {
+            memory_heap_count: 1,
+            ..Default::default()
+        };
         memory.memory_heaps[0].size = device_local;
         memory.memory_heaps[0].flags = vk::MemoryHeapFlags::DEVICE_LOCAL;
         memory

@@ -68,7 +68,92 @@ pub fn install() {
         originals.push((key, previous as u64));
     }
     let _ = ORIGINALS.set(originals);
+    install_va_list_formatters();
+    install_predicate();
     install_object_lists();
+}
+
+/// Add `-[NSString initWithFormat:arguments:]` and its `locale:` spelling,
+/// which take a `va_list` and so need no trampoline to capture one.
+fn install_va_list_formatters() {
+    // SAFETY: NUL-terminated literals; every pointer is checked before use.
+    unsafe {
+        let class = host::objc_lookUpClass(c"NSString".as_ptr());
+        if class.is_null() {
+            return;
+        }
+        host::class_addMethod(
+            class,
+            host::sel_registerName(c"initWithFormat:arguments:".as_ptr()),
+            init_with_format_arguments as Imp,
+            c"@32@0:8@16^v24".as_ptr(),
+        );
+        host::class_addMethod(
+            class,
+            host::sel_registerName(c"initWithFormat:locale:arguments:".as_ptr()),
+            init_with_format_locale_arguments as Imp,
+            c"@40@0:8@16@24^v32".as_ptr(),
+        );
+    }
+}
+
+/// `-initWithFormat:arguments:`: the format rendered against `arguments`, then
+/// handed to `-initWithFormat:` so the receiver is initialised in one place.
+unsafe extern "C" fn init_with_format_arguments(
+    receiver: u64,
+    _sel: Sel,
+    format: u64,
+    arguments: u64,
+) -> u64 {
+    // SAFETY: a NUL-terminated literal.
+    let init = unsafe { host::sel_registerName(c"initWithFormat:".as_ptr()) };
+    let Some(original) = original(init) else {
+        objc::fail!("-initWithFormat:arguments: was sent before -initWithFormat: was recorded");
+    };
+    let rendered =
+        super::nslog::native::render_escaped("initWithFormat:arguments:", format, arguments)
+            .unwrap_or(format);
+    // SAFETY: the `IMP` `-initWithFormat:` had, which is `id (id, SEL, NSString *)`.
+    unsafe {
+        let f: unsafe extern "C" fn(u64, Sel, u64) -> u64 = core::mem::transmute(original);
+        f(receiver, init, rendered)
+    }
+}
+
+// FIXME (ACCURACY): the locale is not consulted, as `CFStringCreateWithFormat`
+// here does not consult one either.
+unsafe extern "C" fn init_with_format_locale_arguments(
+    receiver: u64,
+    sel: Sel,
+    format: u64,
+    _locale: u64,
+    arguments: u64,
+) -> u64 {
+    // SAFETY: the same receiver, format and `va_list`.
+    unsafe { init_with_format_arguments(receiver, sel, format, arguments) }
+}
+
+/// `+predicateWithFormat:`'s selector, which [`service`] answers itself.
+static PREDICATE: OnceLock<u64> = OnceLock::new();
+
+/// Add `+[NSPredicate predicateWithFormat:]` in front of [`service`]: the
+/// arguments its conversions name are read off the tail and parsed with it.
+fn install_predicate() {
+    // SAFETY: NUL-terminated strings; every pointer is checked before use.
+    unsafe {
+        let class = host::objc_lookUpClass(c"NSPredicate".as_ptr());
+        if class.is_null() {
+            return;
+        }
+        let sel = host::sel_registerName(c"predicateWithFormat:".as_ptr());
+        host::class_addMethod(
+            host::object_getClass(class),
+            sel,
+            trampoline as Imp,
+            c"@24@0:8@16".as_ptr(),
+        );
+        let _ = PREDICATE.set(sel as u64);
+    }
 }
 
 /// The implementation `sel` had before [`install`].
@@ -87,6 +172,18 @@ fn original(sel: Sel) -> Option<Imp> {
 /// `tail` is a `va_list` on x86-64 and the address of the first stack argument
 /// on AArch64, which is what Darwin's `va_list` is there.
 unsafe extern "C" fn service(receiver: u64, sel: Sel, format: u64, tail: u64) -> u64 {
+    if Some(sel as u64) == PREDICATE.get().copied() {
+        // SAFETY: `+predicateWithFormat:`'s format is an `NSString`.
+        let text = unsafe { foundation::string::bytes(format as usize as objc::object::Id) };
+        let text = String::from_utf8_lossy(&text);
+        let kinds = foundation::predicate::conversions(&text);
+        let Some(arguments) =
+            super::nslog::native::tail_arguments("predicateWithFormat:", tail, &kinds)
+        else {
+            objc::fail!("+[NSPredicate predicateWithFormat:]: unreadable arguments for {text:?}");
+        };
+        return foundation::predicate::with_arguments(&text, &arguments) as usize as u64;
+    }
     let Some(original) = original(sel) else {
         objc::fail!("a format method was serviced before its implementation was recorded");
     };
@@ -191,6 +288,20 @@ const OBJECT_LISTS: &[(&str, &str, &str, bool, bool)] = &[
         "initWithObjectsAndKeys:",
         "initWithObjects:forKeys:count:",
         true,
+        true,
+    ),
+    (
+        "NSSet",
+        "setWithObjects:",
+        "setWithObjects:count:",
+        false,
+        false,
+    ),
+    (
+        "NSSet",
+        "initWithObjects:",
+        "initWithObjects:count:",
+        false,
         true,
     ),
 ];

@@ -1,6 +1,7 @@
 use microlift::arch::x86_64::context::RegisterContext;
 
 use crate::abi::{AbiError, GuestMemory, Result};
+use crate::shims::bind;
 
 /// Bytes an x86-64 Darwin guest sets aside for a `jmp_buf` (`int[37]`).
 pub const GUEST_JMP_BUF: usize = 148;
@@ -205,15 +206,17 @@ impl SecondArgument for RegisterContext {
 }
 
 /// One of this module's implementations, in the shape [`crate::shims`] dispatches.
-pub type Shim = fn(&str, &mut RegisterContext, &mut dyn GuestMemory) -> Result<()>;
+pub type Shim = crate::shims::Shim;
 
 /// Whether `name` (underscore already stripped) is one of this module's.
 pub fn shim_for(name: &str) -> Option<Shim> {
     Some(match name {
-        "setjmp" | "_setjmp" => setjmp,
-        "sigsetjmp" => sigsetjmp,
-        "longjmp" | "_longjmp" => longjmp,
-        "siglongjmp" => siglongjmp,
+        "setjmp" => bind!("setjmp" => setjmp),
+        "_setjmp" => bind!("_setjmp" => setjmp),
+        "sigsetjmp" => bind!("sigsetjmp" => sigsetjmp),
+        "longjmp" => bind!("longjmp" => longjmp),
+        "_longjmp" => bind!("_longjmp" => longjmp),
+        "siglongjmp" => bind!("siglongjmp" => siglongjmp),
         _ => return None,
     })
 }

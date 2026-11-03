@@ -64,8 +64,17 @@ fn resolved() -> &'static Resolved {
                 .append(true)
                 .open(console);
         }
-        let table =
-            Table::rooted_with_console(&prefix.drive(), &user, host_home(), console.as_deref());
+        let system_version = system_version_file(&prefix);
+        let files: Vec<(&str, &Path)> = [
+            console.as_deref().map(|host| ("/dev/console", host)),
+            system_version
+                .as_deref()
+                .map(|host| (crate::release::SYSTEM_VERSION_PLIST, host)),
+        ]
+        .into_iter()
+        .flatten()
+        .collect();
+        let table = Table::rooted_with_files(&prefix.drive(), &user, host_home(), &files);
         Resolved {
             home: format!("/Users/{user}"),
             prefix: Some(prefix),
@@ -73,6 +82,29 @@ fn resolved() -> &'static Resolved {
         }
     });
     &RESOLVED
+}
+
+/// The host file behind the guest's `SystemVersion.plist`, written from
+/// [`crate::release`] so it cannot disagree with `kern.osproductversion`.
+///
+/// Named for its contents: processes told different releases share a prefix
+/// without rewriting each other's answer. Read-only, as the real one is to
+/// anyone but root.
+fn system_version_file(prefix: &Prefix) -> Option<PathBuf> {
+    use std::os::unix::fs::PermissionsExt;
+    let contents = crate::release::system_version_plist();
+    let digest = crate::format::sha256_hex(contents.as_bytes());
+    let directory = prefix.control().join("system-version");
+    let path = directory.join(format!("{digest}.plist"));
+    if path.is_file() {
+        return Some(path);
+    }
+    std::fs::create_dir_all(&directory).ok()?;
+    let staged = directory.join(format!("{digest}.{}.new", std::process::id()));
+    std::fs::write(&staged, contents).ok()?;
+    std::fs::set_permissions(&staged, std::fs::Permissions::from_mode(0o444)).ok()?;
+    std::fs::rename(&staged, &path).ok()?;
+    Some(path)
 }
 
 /// This host's own home directory, which is the guest's too in identity mode.

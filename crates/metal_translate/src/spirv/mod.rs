@@ -1,7 +1,7 @@
 mod cfg;
 mod emit;
-mod half;
 mod structurize;
+mod widen;
 
 use cfg::{Merge, control_flow_merges};
 use emit::Emitter;
@@ -137,6 +137,8 @@ impl TargetProfile {
             "DemoteToHelperInvocation" => self.demote_to_helper_invocation,
             "GroupNonUniform" => self.group_non_uniform,
             "Image1D" => self.image_1d,
+            // Every Vulkan implementation supports texel buffers.
+            "SampledBuffer" | "ImageBuffer" => self.shader,
             "ImageQuery" => self.image_query,
             "VariablePointersStorageBuffer" => {
                 self.variable_pointers_storage_buffer || self.variable_pointers
@@ -208,6 +210,9 @@ pub struct ResourceBinding {
     /// a storage image. See [`ir::TextureType::sampled_image`]; a buffer or a
     /// sampler leaves it false.
     pub sampled: bool,
+    /// For a texture, whether it is a `texture_buffer`: a Vulkan texel
+    /// buffer, uniform where `sampled` and storage otherwise.
+    pub texel_buffer: bool,
     /// Set for a sampler the shader describes itself, which the runtime binds.
     pub inline_sampler: Option<crate::ir::InlineSampler>,
 }
@@ -244,6 +249,16 @@ pub struct TranslatedLibrary {
     /// any has to be translated again for each set of values a function is
     /// made with.
     pub function_constants: Vec<FunctionConstantInfo>,
+    /// Entry points the source declares which could not be translated, and
+    /// why: the rest of the library is usable, and asking for one of these
+    /// reports its reason.
+    pub rejected: Vec<RejectedEntry>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RejectedEntry {
+    pub name: String,
+    pub reason: String,
 }
 
 /// One function constant a library declares, as reflection reports it.
@@ -267,22 +282,35 @@ pub fn emit_spirv(
         ));
     }
     let widened;
-    let module = match target.shader_float16 {
-        false => match half::widen(module) {
-            Some(module) => {
-                module.verify()?;
-                widened = module;
-                &widened
-            }
-            None => module,
-        },
-        true => module,
+    let module = match widen::widen(module, target) {
+        Some(module) => {
+            module.verify()?;
+            widened = module;
+            &widened
+        }
+        None => module,
     };
-    let entries = module
-        .entries
-        .iter()
-        .map(|entry| emit_entry(module, entry, target))
-        .collect::<Result<Vec<_>, _>>()?;
+    let mut entries = Vec::new();
+    let mut rejected = Vec::new();
+    let mut first_error = None;
+    for entry in &module.entries {
+        match emit_entry(module, entry, target) {
+            Ok(artifact) => entries.push(artifact),
+            Err(error) => {
+                rejected.push(RejectedEntry {
+                    name: module.functions[entry.function].name.clone(),
+                    reason: error.to_string(),
+                });
+                first_error.get_or_insert(error);
+            }
+        }
+    }
+    // A library none of whose entry points translate is a failed library.
+    if entries.is_empty()
+        && let Some(error) = first_error
+    {
+        return Err(error);
+    }
     let function_constants = module
         .globals
         .iter()
@@ -296,6 +324,7 @@ pub fn emit_spirv(
     Ok(TranslatedLibrary {
         entries,
         function_constants,
+        rejected,
     })
 }
 

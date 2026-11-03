@@ -187,6 +187,10 @@ impl NumberFormat {
         self.settings.grouping_separator.as_deref().unwrap_or(",")
     }
 
+    fn grouping_size(&self) -> usize {
+        self.settings.grouping_size.unwrap_or(3)
+    }
+
     /// Whether the Objective-C settings shape the digits, which they do for
     /// the plain and decimal styles; the others keep [`NumberFormat::format`].
     fn digit_style(&self) -> bool {
@@ -209,7 +213,7 @@ impl NumberFormat {
             .unwrap_or(if decimal { 3 } else { 0 });
         let minimum = settings.minimum_fraction_digits.unwrap_or(0).min(maximum);
         let grouping = settings.uses_grouping_separator.unwrap_or(decimal);
-        let size = settings.grouping_size.unwrap_or(3);
+        let size = self.grouping_size();
         let scale = i16::try_from(maximum).unwrap_or(i16::MAX - 1);
         let text = value.round(scale, Rounding::Bankers).to_string_with(".");
         let (sign, digits) = match text.strip_prefix('-') {
@@ -1077,6 +1081,40 @@ pub mod cf {
         format.currency_symbol = String::from_utf8(text).ok();
     }
 
+    /// `CFTypeRef CFNumberFormatterCopyProperty(CFNumberFormatterRef,
+    /// CFStringRef key)`
+    ///
+    /// The properties this formatter models; null for the rest, as for a key
+    /// the formatter has no value for.
+    ///
+    /// # Safety
+    ///
+    /// Each argument is null or an object this runtime allocated.
+    unsafe extern "C" fn CFNumberFormatterCopyProperty(
+        formatter: CFTypeRef,
+        key: CFTypeRef,
+    ) -> CFTypeRef {
+        let Some(format) =
+            (unsafe { super::contents::<NumberFormat>(formatter, super::number_class()) })
+        else {
+            return std::ptr::null();
+        };
+        // SAFETY: as above - an `NSString` or nil.
+        let key = unsafe { crate::string::bytes(key as Id) };
+        match std::str::from_utf8(&key) {
+            Ok(GROUPING_SIZE) => corefoundation::collections::new_number(
+                corefoundation::collections::Number::Integer(format.grouping_size() as i64),
+            ),
+            Ok(CURRENCY_SYMBOL) => format
+                .currency_symbol
+                .as_deref()
+                .map_or(std::ptr::null(), |symbol| {
+                    crate::string::from_str(symbol) as CFTypeRef
+                }),
+            _ => std::ptr::null(),
+        }
+    }
+
     /// `CFStringRef CFNumberFormatterCreateStringWithNumber(CFAllocatorRef,
     /// CFNumberFormatterRef, CFNumberRef)`
     ///
@@ -1273,6 +1311,13 @@ pub mod cf {
             }
             SHORT_WEEKDAY_SYMBOLS | SHORT_STANDALONE_WEEKDAY_SYMBOLS => {
                 WEEKDAYS.iter().map(|(_, short)| *short).collect()
+            }
+            // The narrow forms, which in English are each name's first letter.
+            VERY_SHORT_MONTH_SYMBOLS | VERY_SHORT_STANDALONE_MONTH_SYMBOLS => {
+                MONTHS.iter().map(|(long, _)| &long[..1]).collect()
+            }
+            VERY_SHORT_WEEKDAY_SYMBOLS | VERY_SHORT_STANDALONE_WEEKDAY_SYMBOLS => {
+                WEEKDAYS.iter().map(|(long, _)| &long[..1]).collect()
             }
             AM_SYMBOL => return crate::string::from_str("AM") as CFTypeRef,
             PM_SYMBOL => return crate::string::from_str("PM") as CFTypeRef,
@@ -1628,6 +1673,13 @@ pub mod cf {
     /// `CFNumberFormatterKey`/`CFDateFormatterKey` names. Each is its own symbol
     /// without the leading `k`, which is how CoreFoundation spells them.
     const CURRENCY_SYMBOL: &str = "kCFNumberFormatterCurrencySymbol";
+    const GROUPING_SIZE: &str = "kCFNumberFormatterGroupingSize";
+    const VERY_SHORT_MONTH_SYMBOLS: &str = "kCFDateFormatterVeryShortMonthSymbols";
+    const VERY_SHORT_STANDALONE_MONTH_SYMBOLS: &str =
+        "kCFDateFormatterVeryShortStandaloneMonthSymbols";
+    const VERY_SHORT_WEEKDAY_SYMBOLS: &str = "kCFDateFormatterVeryShortWeekdaySymbols";
+    const VERY_SHORT_STANDALONE_WEEKDAY_SYMBOLS: &str =
+        "kCFDateFormatterVeryShortStandaloneWeekdaySymbols";
     const MONTH_SYMBOLS: &str = "kCFDateFormatterMonthSymbols";
     const SHORT_MONTH_SYMBOLS: &str = "kCFDateFormatterShortMonthSymbols";
     const STANDALONE_MONTH_SYMBOLS: &str = "kCFDateFormatterStandaloneMonthSymbols";
@@ -1646,6 +1698,23 @@ pub mod cf {
     /// key. The value is the key's own name, which is what CoreFoundation's is.
     pub const KEYS: &[(&str, &str)] = &[
         ("_kCFNumberFormatterCurrencySymbol", CURRENCY_SYMBOL),
+        ("_kCFNumberFormatterGroupingSize", GROUPING_SIZE),
+        (
+            "_kCFDateFormatterVeryShortMonthSymbols",
+            VERY_SHORT_MONTH_SYMBOLS,
+        ),
+        (
+            "_kCFDateFormatterVeryShortStandaloneMonthSymbols",
+            VERY_SHORT_STANDALONE_MONTH_SYMBOLS,
+        ),
+        (
+            "_kCFDateFormatterVeryShortWeekdaySymbols",
+            VERY_SHORT_WEEKDAY_SYMBOLS,
+        ),
+        (
+            "_kCFDateFormatterVeryShortStandaloneWeekdaySymbols",
+            VERY_SHORT_STANDALONE_WEEKDAY_SYMBOLS,
+        ),
         ("_kCFDateFormatterMonthSymbols", MONTH_SYMBOLS),
         ("_kCFDateFormatterShortMonthSymbols", SHORT_MONTH_SYMBOLS),
         (
@@ -1677,6 +1746,7 @@ pub mod cf {
         functions {
             "CFNumberFormatterCreate" => CFNumberFormatterCreate,
             "CFNumberFormatterSetProperty" => CFNumberFormatterSetProperty,
+            "CFNumberFormatterCopyProperty" => CFNumberFormatterCopyProperty,
             "CFNumberFormatterCreateStringWithNumber" => CFNumberFormatterCreateStringWithNumber,
             "CFNumberFormatterCreateStringWithValue" => CFNumberFormatterCreateStringWithValue,
             "CFDateFormatterCreate" => CFDateFormatterCreate,

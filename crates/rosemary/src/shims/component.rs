@@ -3,16 +3,17 @@ use microlift::arch::x86_64::context::RegisterContext;
 use crate::abi::{GuestMemory, Result};
 
 use super::set_int_return;
+use crate::shims::bind;
 
 /// One of this module's implementations, in the shape [`crate::shims`] wants.
-pub type Shim = fn(&str, &mut RegisterContext, &mut dyn GuestMemory) -> Result<()>;
+pub type Shim = crate::shims::Shim;
 
 /// Whether `name` (underscore already stripped) is one of this module's.
 pub fn shim_for(name: &str) -> Option<Shim> {
     match name {
-        "FindNextComponent" => Some(find_next_component),
-        "OpenAComponent" => Some(open_a_component),
-        "CloseComponent" => Some(close_component),
+        "FindNextComponent" => Some(bind!("FindNextComponent" => find_next_component)),
+        "OpenAComponent" => Some(bind!("OpenAComponent" => open_a_component)),
+        "CloseComponent" => Some(bind!("CloseComponent" => close_component)),
         _ => None,
     }
 }

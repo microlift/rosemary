@@ -5,6 +5,7 @@ use microlift::arch::x86_64::context::RegisterContext;
 use crate::abi::{Callbacks, GuestMemory, Result};
 
 use super::{bad_pointer, set_int_return};
+use crate::shims::bind;
 
 /// `kAudioUnitProperty_SetRenderCallback`, the one a program that plays audio
 /// installs.
@@ -163,7 +164,7 @@ pub type Shim = crate::signal::Shim;
 /// `AudioUnitGetProperty` is deliberately absent.
 pub fn shim_for(name: &str) -> Option<Shim> {
     match name {
-        "AudioUnitSetProperty" => Some(set_property),
+        "AudioUnitSetProperty" => Some(bind!(callback "AudioUnitSetProperty" => set_property)),
         _ => None,
     }
 }

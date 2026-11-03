@@ -258,6 +258,7 @@ pub static SIGNATURES: &[FunctionAbi] = &[
     sig!("AudioQueueStart", I32, P, P),
     sig!("AudioQueueStop", I32, P, BOOL),
     sig!("AudioUnitGetProperty", I32, P, U32, U32, U32, P, P),
+    sig!("AudioUnitGetPropertyInfo", I32, P, U32, U32, U32, P, P),
     sig!("AudioUnitInitialize", I32, P),
     sig!("AudioUnitRender", I32, P, P, P, U32, U32, P),
     sig!("AudioUnitSetProperty", I32, P, U32, U32, U32, P, U32),
@@ -377,6 +378,7 @@ pub static SIGNATURES: &[FunctionAbi] = &[
     sig!("CFArrayRemoveValueAtIndex", V, P, I64),
     sig!("CFArrayRemoveAllValues", V, P),
     sig!("CFArrayExchangeValuesAtIndices", V, P, I64, I64),
+    cbsig!([3], "CFArraySortValues", V, P, I64, I64, P, P),
     sig!("CFArrayGetCount", I64, P),
     sig!("CFArrayGetTypeID", U64),
     sig!("CFArrayGetValueAtIndex", P, P, I64),
@@ -531,6 +533,9 @@ pub static SIGNATURES: &[FunctionAbi] = &[
     // through directly.
     sig!("CFPreferencesCopyAppValue", P, P, P),
     sig!("CFPropertyListCreateWithData", P, P, P, U64, P, P),
+    // `CFPropertyListCreateData(allocator, list, CFPropertyListFormat,
+    // CFOptionFlags, CFErrorRef *)`.
+    sig!("CFPropertyListCreateData", P, P, P, I64, U64, P),
     sig!("CFPreferencesCopyValue", P, P, P, P, P),
     sig!("CFPreferencesCopyKeyList", P, P, P, P),
     sig!("CFPreferencesCopyMultiple", P, P, P, P, P),
@@ -615,6 +620,7 @@ pub static SIGNATURES: &[FunctionAbi] = &[
     sig!("CFStringCompare", I64, P, P, U64),
     sig!("CFCopyDescription", P, P),
     sig!("CFErrorCopyDescription", P, P),
+    sig!("CFErrorGetCode", I64, P),
     sig!("CFMakeCollectable", P, P),
     sig!("CFCopyTypeIDDescription", P, U64),
     sig!("CFStringCompareWithOptions", I64, P, P, I64, I64, U64),
@@ -655,6 +661,7 @@ pub static SIGNATURES: &[FunctionAbi] = &[
     sig!("CFTimeZoneCopyDefault", P),
     sig!("CFTimeZoneCopySystem", P),
     sig!("CFTimeZoneCreateWithName", P, P, P, U8),
+    sig!("CFTimeZoneCreateWithTimeIntervalFromGMT", P, P, F64),
     sig!("CFTimeZoneGetName", P, P),
     sig!("CFStringGetCString", BOOL, P, P, I64, U32),
     sig!("CFStringGetCStringPtr", P, P, U32),
@@ -744,6 +751,8 @@ pub static SIGNATURES: &[FunctionAbi] = &[
     // the file's bytes produces a `CGImage`, a bitmap context is created over
     // a buffer the *guest* allocated, and the image is drawn into it.
     sig!("CGBitmapContextCreate", P, P, U64, U64, U64, U64, P, U32),
+    sig!("CGBitmapContextGetData", P, P),
+    sig!("CGBitmapContextCreateImage", P, P),
     //
     // The whole-desktop forms take nothing and the per-display ones a
     // `CGDirectDisplayID`; every one returns a `CGError`.
@@ -752,6 +761,7 @@ pub static SIGNATURES: &[FunctionAbi] = &[
     sig!("CGDisplayCapture", I32, U32),
     sig!("CGDisplayRelease", I32, U32),
     sig!("CGColorSpaceCreateDeviceRGB", P),
+    sig!("CGColorSpaceCreateDeviceGray", P),
     sig!("CGColorSpaceRelease", V, P),
     // `CGFloat` is `double` on both architectures, so the CTM translation is
     // two ordinary vector arguments.
@@ -807,6 +817,15 @@ pub static SIGNATURES: &[FunctionAbi] = &[
     sig!("CGEventCreate", P, P),
     sig!("CGEventPost", V, U32, P),
     sig!("CGEventSetType", V, P, U32),
+    sig!("CGEventGetType", U32, P),
+    // `CGEventCreateKeyboardEvent(CGEventSourceRef, CGKeyCode, bool keyDown)`.
+    sig!("CGEventCreateKeyboardEvent", P, P, U16, BOOL),
+    // `CGEventFlags` is a `uint64_t` of modifier bits.
+    sig!("CGEventGetFlags", U64, P),
+    sig!("CGEventSetFlags", V, P, U64),
+    // `CGEventField` is a `uint32_t` enum; the value an `int64_t`.
+    sig!("CGEventGetIntegerValueField", I64, P, U32),
+    sig!("CGEventSetIntegerValueField", V, P, U32, I64),
     // The gamma ramp, read and written.
     sig!("CGGetDisplayTransferByTable", I32, U32, U32, P, P, P, P),
     sig!("CGSetDisplayTransferByTable", I32, U32, U32, P, P, P),
@@ -893,6 +912,10 @@ pub static SIGNATURES: &[FunctionAbi] = &[
     sig!("CGImageGetWidth", U64, P),
     sig!("CGImageSourceCreateImageAtIndex", P, P, U64, P),
     sig!("CGImageSourceCreateWithData", P, P, P),
+    sig!("CGImageSourceCopyTypeIdentifiers", P),
+    sig!("CGImageDestinationCopyTypeIdentifiers", P),
+    sig!("CGImageDestinationCreateWithData", P, P, P, U64, P),
+    sig!("CGImageDestinationCreateWithDataConsumer", P, P, P, U64, P),
     sig!("CGMainDisplayID", U32),
     sig!("CGDisplayRestoreColorSyncSettings", V),
     sig!("NXGetLocalArchInfo", P),
@@ -1049,6 +1072,74 @@ pub static SIGNATURES: &[FunctionAbi] = &[
     sig!("CVPixelBufferGetBytesPerRow", U64, P),
     sig!("CVPixelBufferGetHeight", U64, P),
     sig!("CVPixelBufferGetWidth", U64, P),
+    sig!("CVPixelBufferGetTypeID", U64),
+    sig!("CVPixelBufferGetPlaneCount", U64, P),
+    sig!("CVPixelBufferIsPlanar", BOOL, P),
+    sig!("CVPixelBufferGetDataSize", U64, P),
+    sig!("CVPixelBufferGetIOSurface", P, P),
+    sig!("CVPixelBufferRetain", P, P),
+    // Attachments: a `CVAttachmentMode` is a `uint32_t`.
+    sig!("CVBufferSetAttachment", V, P, P, P, U32),
+    sig!("CVBufferGetAttachment", P, P, P, P),
+    sig!("CVBufferCopyAttachment", P, P, P, P),
+    sig!("CVBufferRemoveAttachment", V, P, P),
+    sig!("CVBufferRemoveAllAttachments", V, P),
+    sig!("CVBufferGetAttachments", P, P, U32),
+    sig!("CVBufferCopyAttachments", P, P, U32),
+    sig!("CVBufferSetAttachments", V, P, P, U32),
+    sig!("CVBufferPropagateAttachments", V, P, P),
+    sig!("CVPixelBufferGetExtendedPixels", V, P, P, P, P, P),
+    // The release callbacks take only pointers and sizes.
+    cbsig!(
+        [6],
+        "CVPixelBufferCreateWithBytes",
+        I32,
+        P,
+        U64,
+        U64,
+        U32,
+        P,
+        U64,
+        P,
+        P,
+        P,
+        P
+    ),
+    cbsig!(
+        [11],
+        "CVPixelBufferCreateWithPlanarBytes",
+        I32,
+        P,
+        U64,
+        U64,
+        U32,
+        P,
+        U64,
+        U64,
+        P,
+        P,
+        P,
+        P,
+        P,
+        P,
+        P,
+        P
+    ),
+    sig!("CVPixelBufferPoolCreate", I32, P, P, P, P),
+    sig!(
+        "CVPixelBufferPoolCreatePixelBufferWithAuxAttributes",
+        I32,
+        P,
+        P,
+        P,
+        P
+    ),
+    sig!("CVPixelBufferPoolRetain", P, P),
+    sig!("CVPixelBufferPoolRelease", V, P),
+    sig!("CVPixelBufferPoolGetTypeID", U64),
+    sig!("CVPixelBufferPoolGetAttributes", P, P),
+    sig!("CVPixelBufferPoolGetPixelBufferAttributes", P, P),
+    sig!("CVPixelBufferPoolFlush", V, P, U64),
     sig!("CVPixelBufferLockBaseAddress", I32, P, U64),
     sig!("CVPixelBufferUnlockBaseAddress", I32, P, U64),
     //
@@ -1353,6 +1444,7 @@ pub static SIGNATURES: &[FunctionAbi] = &[
     // `applicationDidFinishLaunching:` to the guest's delegate, and does not return
     // until the application terminates.
     sig!("NSApplicationMain", I32, I32, P),
+    sig!("NSApplicationLoad", U8),
     // `NSLog` takes an `NSString` format, not a C one, so even the rendering
     // path the `printf` family uses needs a conversion first.
     vsig!("NSLog", V, P),
@@ -1439,6 +1531,8 @@ pub static SIGNATURES: &[FunctionAbi] = &[
     sig!("SCPreferencesCreate", P, P, P, P),
     sig!("SCPreferencesGetValue", P, P, P),
     sig!("SCNetworkReachabilityCreateWithAddress", P, P, P),
+    sig!("SCNetworkReachabilityCreateWithAddressPair", P, P, P, P),
+    sig!("SCNetworkReachabilitySetDispatchQueue", U8, P, P),
     sig!("SCNetworkReachabilityCreateWithName", P, P, P),
     sig!("SCNetworkReachabilityGetFlags", U8, P, P),
     sig!("SCNetworkReachabilityScheduleWithRunLoop", U8, P, P, P),
@@ -1456,11 +1550,15 @@ pub static SIGNATURES: &[FunctionAbi] = &[
     sig!("SecKeychainSearchCopyNext", I32, P, P),
     sig!("SecKeychainSearchCreateFromAttributes", I32, P, U32, P, P),
     sig!("SecTrustCopyAnchorCertificates", I32, P),
+    sig!("SecTrustSettingsCopyCertificates", I32, U32, P),
+    sig!("SecTrustSettingsCopyTrustSettings", I32, P, U32, P),
+    sig!("SecPolicyCopyProperties", P, P),
     sig!("SecStaticCodeCreateWithPath", I32, P, U64, P),
     sig!("SecRequirementCreateWithString", I32, P, U64, P),
     sig!("SecRequirementCreateWithData", I32, P, U32, P),
     sig!("SecCodeCopySelf", I32, U32, P),
     sig!("SecCodeCheckValidity", I32, P, U32, P),
+    sig!("SecStaticCodeCheckValidity", I32, P, U32, P),
     sig!("SecStaticCodeCheckValidityWithErrors", I32, P, U64, P, P),
     //
     // SDL3 asks the current layout for its Unicode key-layout data so it can
@@ -1642,6 +1740,19 @@ pub static SIGNATURES: &[FunctionAbi] = &[
     sig!("acl_get_permset", I32, P, P),
     sig!("acl_get_qualifier", P, P),
     sig!("acl_get_tag_type", I32, P, P),
+    sig!("acl_init", P, I32),
+    sig!("acl_from_text", P, P),
+    sig!("acl_to_text", P, P, P),
+    sig!("acl_create_entry", I32, P, P),
+    sig!("acl_create_entry_np", I32, P, P, I32),
+    sig!("acl_copy_entry", I32, P, P),
+    sig!("acl_delete_entry", I32, P, P),
+    sig!("acl_set_tag_type", I32, P, I32),
+    sig!("acl_set_qualifier", I32, P, P),
+    sig!("acl_set_permset", I32, P, P),
+    sig!("acl_add_perm", I32, P, I32),
+    sig!("acl_clear_perms", I32, P),
+    sig!("acl_set_fd", I32, I32, P),
     sig!("acos", F64, F64),
     sig!("acosf", F32, F32),
     sig!("acosh", F64, F64),
@@ -1655,6 +1766,7 @@ pub static SIGNATURES: &[FunctionAbi] = &[
     sig!("asinf", F32, F32),
     sig!("asinh", F64, F64),
     sig!("asinhf", F32, F32),
+    vsig!("asl_log", I32, P, P, I32, P),
     vsig!("asprintf", I32, P, P),
     sig!("atan", F64, F64),
     sig!("atan2", F64, F64, F64),
@@ -1697,6 +1809,20 @@ pub static SIGNATURES: &[FunctionAbi] = &[
     sig!("ceilf", F32, F32),
     sig!("chdir", I32, P),
     sig!("chmod", I32, P, U32),
+    // `filesec_t` is opaque; `chmodx_np` and the `statx_np` family take one
+    // after the path or descriptor and the `struct stat`.
+    sig!("chmodx_np", I32, P, P),
+    sig!("fchmodx_np", I32, I32, P),
+    sig!("statx_np", I32, P, P, P),
+    sig!("lstatx_np", I32, P, P, P),
+    sig!("fstatx_np", I32, I32, P, P),
+    sig!("filesec_init", P),
+    sig!("filesec_dup", P, P),
+    sig!("filesec_free", V, P),
+    sig!("filesec_get_property", I32, P, I32, P),
+    sig!("filesec_set_property", I32, P, I32, P),
+    sig!("filesec_unset_property", I32, P, I32),
+    sig!("filesec_query_property", I32, P, I32, P),
     sig!("clearerr", V, P),
     // `clock_t clock(void)`.
     sig!("clock", U64),
@@ -1740,6 +1866,7 @@ pub static SIGNATURES: &[FunctionAbi] = &[
     sig!("cfsetspeed", I32, P, U64),
     sig!("chflags", I32, P, U32),
     sig!("lchflags", I32, P, U32),
+    sig!("fchflags", I32, I32, U32),
     sig!("closelog", V),
     sig!("confstr", U64, I32, P, U64),
     sig!("crc32", U64, U64, P, U32),
@@ -1768,6 +1895,7 @@ pub static SIGNATURES: &[FunctionAbi] = &[
     // back - nothing about the object crosses.
     sig!("difftime", F64, I64, I64),
     sig!("dirname", P, P),
+    sig!("dirname_r", P, P, P),
     sig!("dispatch_get_context", P, P),
     sig!("dispatch_get_global_queue", P, I64, U64),
     cbsig!([3], "dispatch_group_async_f", V, P, P, P, P),
@@ -1789,10 +1917,15 @@ pub static SIGNATURES: &[FunctionAbi] = &[
     sig!("dispatch_set_context", V, P, P),
     sig!("dispatch_source_cancel", V, P),
     sig!("dispatch_source_create", P, P, U64, U64, P),
+    sig!("dispatch_source_get_data", U64, P),
+    sig!("dispatch_source_get_handle", U64, P),
+    sig!("dispatch_source_get_mask", U64, P),
+    sig!("dispatch_source_merge_data", V, P, U64),
     cbsig!([1], "dispatch_source_set_cancel_handler_f", V, P, P),
     cbsig!([1], "dispatch_source_set_event_handler_f", V, P, P),
     sig!("dispatch_source_set_timer", V, P, U64, U64, U64),
     sig!("dispatch_suspend", V, P),
+    sig!("dispatch_source_testcancel", I64, P),
     // `dispatch_time(dispatch_time_t base, int64_t delta)` - the base is an
     // opaque absolute time and the delta is signed nanoseconds, which is why
     // the two arguments are not the same type despite both being doublewords.
@@ -1862,13 +1995,6 @@ pub static SIGNATURES: &[FunctionAbi] = &[
     sig!("fclose", I32, P),
     sig!("clonefileat", I32, I32, P, I32, P, I32),
     vsig!("fcntl", I32, I32, I32),
-    // `copyfile(const char *, const char *, copyfile_state_t,
-    // copyfile_flags_t)`: the state is an opaque pointer and Darwin's flag
-    // word is unsigned 32-bit on both architectures.
-    sig!("copyfile", I32, P, P, P, U32),
-    sig!("fcopyfile", I32, I32, P, U32),
-    sig!("copyfile_state_set", I32, P, U32, P),
-    sig!("copyfile_state_get", I32, P, U32, P),
     sig!("fdopen", P, I32, P),
     sig!("feof", I32, P),
     sig!("ferror", I32, P),
@@ -2025,9 +2151,11 @@ pub static SIGNATURES: &[FunctionAbi] = &[
     sig!("getaudit_addr", I32, P, U32),
     sig!("getwc", I32, P),
     sig!("getxattr", I64, P, P, P, U64, U32, I32),
+    sig!("fgetxattr", I64, I32, P, P, U64, U32, I32),
     sig!("getentropy", I32, P, U64),
     sig!("getattrlist", I32, P, P, P, U64, U64),
     sig!("fgetattrlist", I32, I32, P, P, U64, U64),
+    sig!("fsetattrlist", I32, I32, P, P, U64, U64),
     // `int getattrlistbulk(int, struct attrlist *, void *, size_t, uint64_t)`
     sig!("getattrlistbulk", I32, I32, P, P, U64, U64),
     sig!("csops", I32, I32, U32, P, U64),
@@ -2687,6 +2815,7 @@ pub static SIGNATURES: &[FunctionAbi] = &[
     sig!("ldexpf", F32, F32, I32),
     sig!("listen", I32, I32, I32),
     sig!("listxattr", I64, P, P, U64, I32),
+    sig!("flistxattr", I64, I32, P, U64, I32),
     // `struct lconv *localeconv(void)` - the current locale's numeric
     // punctuation, which C++'s `num_put` reads on the way to formatting a
     // number. A pointer to storage the host owns.
@@ -2742,9 +2871,10 @@ pub static SIGNATURES: &[FunctionAbi] = &[
     sig!("mach_port_mod_refs", I32, U32, U32, U32, I32),
     sig!("mach_port_type", I32, U32, U32, P),
     //
-    // Passthrough, and unlike `mmap` they need no shim: none of these carries
-    // a protection argument, so none of them can hand the guest a page this
+    // Passthrough, and unlike `mmap` they need no shim: none of these maps
+    // memory with a protection, so none of them can hand the guest a page this
     // CPU would be asked to execute.
+    sig!("mach_make_memory_entry", I32, U32, P, U64, I32, P, U32),
     sig!("mach_make_memory_entry_64", I32, U32, P, U64, I32, P, U32),
     sig!("mach_vm_allocate", I32, U32, P, U64, I32),
     sig!("mach_vm_deallocate", I32, U32, U64, U64),
@@ -2765,6 +2895,64 @@ pub static SIGNATURES: &[FunctionAbi] = &[
     // same bookkeeping as the `mprotect` shim (`shims::vmmap::protect_hook`).
     sig!("mach_vm_protect", I32, U32, U64, U64, U32, I32),
     sig!("vm_protect", I32, U32, U64, U64, U32, I32),
+    // `kern_return_t mach_vm_map(vm_map_t, mach_vm_address_t *, mach_vm_size_t,
+    // mach_vm_offset_t mask, int flags, mem_entry_name_port_t, memory_object_offset_t,
+    // boolean_t copy, vm_prot_t cur, vm_prot_t max, vm_inherit_t)`, whose
+    // protection takes the same path.
+    sig!(
+        "mach_vm_map",
+        I32,
+        U32,
+        P,
+        U64,
+        U64,
+        I32,
+        U32,
+        U64,
+        U32,
+        I32,
+        I32,
+        U32
+    ),
+    sig!(
+        "vm_map", I32, U32, P, U64, U64, I32, U32, U64, U32, I32, I32, U32
+    ),
+    sig!(
+        "vm_map_64",
+        I32,
+        U32,
+        P,
+        U64,
+        U64,
+        I32,
+        U32,
+        U64,
+        U32,
+        I32,
+        I32,
+        U32
+    ),
+    // `kern_return_t mach_vm_remap(vm_map_t, mach_vm_address_t *, mach_vm_size_t,
+    // mach_vm_offset_t mask, int flags, vm_map_t src, mach_vm_address_t src_address,
+    // boolean_t copy, vm_prot_t *cur, vm_prot_t *max, vm_inherit_t)`.
+    sig!(
+        "mach_vm_remap",
+        I32,
+        U32,
+        P,
+        U64,
+        U64,
+        I32,
+        U32,
+        U64,
+        U32,
+        P,
+        P,
+        U32
+    ),
+    sig!(
+        "vm_remap", I32, U32, P, U64, U64, I32, U32, U64, U32, P, P, U32
+    ),
     sig!("mach_thread_self", U32),
     sig!("mach_timebase_info", I32, P),
     sig!("madvise", U64, P, U64, I32),
@@ -2777,6 +2965,8 @@ pub static SIGNATURES: &[FunctionAbi] = &[
     sig!("mbrlen", U64, P, U64, P),
     sig!("mbsinit", I32, P),
     sig!("mbr_identifier_translate", I32, I32, P, U64, I32, P, P),
+    sig!("mbr_uid_to_uuid", I32, U32, P),
+    sig!("mbr_gid_to_uuid", I32, U32, P),
     sig!("mbrtowc_l", U64, P, P, U64, P, P),
     sig!("mbsnrtowcs_l", U64, P, P, U64, U64, P, P),
     sig!("mbsrtowcs", U64, P, P, U64, P),
@@ -2798,10 +2988,12 @@ pub static SIGNATURES: &[FunctionAbi] = &[
     // Answered honestly rather than usefully.
     sig!("mincore", I32, P, U64, P),
     sig!("mkdir", I32, P, U32),
+    sig!("mkdirat", I32, I32, P, U16),
     sig!("mkdtemp", P, P),
     sig!("mknod", I32, P, U32, I32),
     sig!("mkstemp", I32, P),
     sig!("mktemp", P, P),
+    sig!("_mktemp", P, P),
     sig!("mktime", I64, P),
     sig!("mlock", I32, P, U64),
     //
@@ -2827,6 +3019,8 @@ pub static SIGNATURES: &[FunctionAbi] = &[
     // Fixed-arity adapters for x86-64 imports. Native Apple arm64 retains
     // the host's variadic ABI, whose optional arguments are on the stack.
     sig!("open", I32, P, I32, U32),
+    // The mode is variadic, read as `open`'s is.
+    sig!("open_dprotected_np", I32, P, I32, I32, I32, U32),
     sig!("openat", I32, I32, P, I32, U32),
     sig!("opendir", P, P),
     sig!("openlog", V, P, I32, I32),
@@ -3058,6 +3252,14 @@ pub static SIGNATURES: &[FunctionAbi] = &[
     sig!("recvmsg", I64, I32, P, I32),
     sig!("remove", I32, P),
     sig!("rename", I32, P, P),
+    // Rosemary's own extension API, exported only when
+    // `ROSEMARY_EXPOSE_LIBSYSTEM_EXTENSIONS` is set. The trampoline's tail is
+    // `argcount` word-sized integers.
+    sig!("rosemary_get_host_rtld_default", P),
+    vsig!("rosemary_host_call_trampoline", U64, P, U64),
+    sig!("rosemary_host_dlclose", I32, P),
+    sig!("rosemary_host_dlopen", P, P, I32),
+    sig!("rosemary_host_dlsym", P, P, P),
     sig!("rewind", V, P),
     // `strrchr` under the name BSD gave it first. `libsteam_api.dylib` uses it
     // to take the directory off its own path while looking for the client.
@@ -3337,6 +3539,7 @@ pub static SIGNATURES: &[FunctionAbi] = &[
     sig!("ungetc", I32, I32, P),
     sig!("ungetwc", I32, I32, P),
     sig!("unlink", I32, P),
+    sig!("unlinkat", I32, I32, P, I32),
     sig!("undelete", I32, P),
     sig!("unsetenv", I32, P),
     sig!("unvis", I32, P, I32, P, I32),
@@ -3480,8 +3683,17 @@ pub static SIGNATURES: &[FunctionAbi] = &[
         P
     ),
     sig!("CMBlockBufferGetDataPointer", I32, P, U64, P, P, P),
+    sig!("CMBlockBufferGetTypeID", U64),
+    sig!("CMBlockBufferGetDataLength", U64, P),
+    sig!("CMBlockBufferCopyDataBytes", I32, P, U64, U64, P),
+    sig!("CMBlockBufferReplaceDataBytes", I32, P, P, U64, U64),
     sig!("CMCopyDictionaryOfAttachments", P, P, P, U32),
+    sig!("CMFormatDescriptionEqual", BOOL, P, P),
+    sig!("CMFormatDescriptionGetExtension", P, P, P),
+    sig!("CMFormatDescriptionGetExtensions", P, P),
     sig!("CMFormatDescriptionGetMediaSubType", U32, P),
+    sig!("CMFormatDescriptionGetMediaType", U32, P),
+    sig!("CMFormatDescriptionGetTypeID", U64),
     // Twelve parameters, four past AAPCS64's eighth, and the fourth is guest
     // code.
     cbsig!(
@@ -3501,6 +3713,23 @@ pub static SIGNATURES: &[FunctionAbi] = &[
         P,
         P
     ),
+    sig!("CMSampleBufferGetTypeID", U64),
+    sig!(
+        "CMSampleBufferCreateReady",
+        I32,
+        P,
+        P,
+        P,
+        I64,
+        I64,
+        P,
+        I64,
+        P,
+        P
+    ),
+    rsig!("CMSampleBufferMakeDataReady", I32, P),
+    sig!("CMSampleBufferSetDataReady", I32, P),
+    sig!("CMSampleBufferGetSampleSize", U64, P, I64),
     sig!("CMSampleBufferDataIsReady", BOOL, P),
     sig!("CMSampleBufferIsValid", BOOL, P),
     sig!("CMSampleBufferGetDataBuffer", P, P),
@@ -3667,6 +3896,7 @@ pub static SIGNATURES: &[FunctionAbi] = &[
     sig!("CTFontDescriptorCreateMatchingFontDescriptor", P, P, P),
     sig!("CTFontCreateWithFontDescriptor", P, P, F64, P),
     sig!("CTFontCopyTable", P, P, U32, U32),
+    sig!("CTFontCopyVariationAxes", P, P),
     sig!("CTFontCopyDefaultCascadeListForLanguages", P, P, P),
     sig!("CTFontManagerCopyAvailableFontFamilyNames", P),
     sig!("CTFontManagerCreateFontDescriptorsFromURL", P, P),
@@ -3702,6 +3932,9 @@ pub static SIGNATURES: &[FunctionAbi] = &[
     // *format, uint8_t *buf, uint32_t size)` - **not** variadic, which is the
     // surprise.
     sig!("_os_log_impl", V, P, P, U8, P, P, U32),
+    sig!("_os_log_debug_impl", V, P, P, U8, P, P, U32),
+    sig!("_os_log_error_impl", V, P, P, U8, P, P, U32),
+    sig!("_os_log_fault_impl", V, P, P, U8, P, P, U32),
     sig!("os_log_create", P, P, P),
     sig!("os_log_type_enabled", BOOL, P, U8),
     sig!("os_release", V, P),
@@ -3913,12 +4146,17 @@ pub static SIGNATURES: &[FunctionAbi] = &[
     sig!("link", I32, P, P),
     sig!("dirfd", I32, P),
     sig!("fsctl", I32, P, U64, P, U32),
+    sig!("ffsctl", I32, I32, U64, P, U32),
     sig!("gethostuuid", I32, P, P),
+    sig!("___gethostuuid", I32, P, P),
     sig!("uuid_generate", V, P),
     sig!("setxattr", I32, P, P, P, U64, U32, I32),
     sig!("removexattr", I32, P, P, I32),
+    sig!("fsetxattr", I32, I32, P, P, U64, U32, I32),
+    sig!("fremovexattr", I32, I32, P, I32),
     sig!("sendfile", I32, I32, I32, I64, P, P, I32),
     sig!("connectx", I32, I32, P, U32, U32, P, U32, P, P),
+    sig!("disconnectx", I32, I32, U32, U32),
     sig!("posix_spawnattr_setsigdefault", I32, P, P),
     sig!("pthread_mutexattr_setpolicy_np", I32, P, I32),
     sig!("pthread_rwlock_tryrdlock", I32, P),
@@ -4242,6 +4480,7 @@ mod tests {
         const SPLIT_AGGREGATES: &[&str] = &[
             "CFArrayApplyFunction",
             "CFArrayGetValues",
+            "CFArraySortValues",
             "CFDataDeleteBytes",
             "CFDataReplaceBytes",
             "CFStringGetBytes",

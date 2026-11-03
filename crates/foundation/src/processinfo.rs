@@ -272,6 +272,10 @@ unsafe extern "C" fn begin_activity(_receiver: Id, _sel: Sel, _options: u64, _re
 
 unsafe extern "C" fn end_activity(_receiver: Id, _sel: Sel, _activity: Id) {}
 
+/// `-disableAutomaticTermination:` and `-enableAutomaticTermination:`. Nothing
+/// here terminates an idle program, so there is no count to keep.
+unsafe extern "C" fn automatic_termination(_receiver: Id, _sel: Sel, _reason: Id) {}
+
 pub(crate) fn install() {
     let class =
         corefoundation::base::register(c"NSProcessInfo", None, std::mem::size_of::<usize>(), false);
@@ -298,6 +302,8 @@ pub(crate) fn install() {
         "hostName" => host_name, c"@16@0:8";
         "beginActivityWithOptions:reason:" => begin_activity, c"@32@0:8Q16@24";
         "endActivity:" => end_activity, c"v24@0:8@16";
+        "disableAutomaticTermination:" => automatic_termination, c"v24@0:8@16";
+        "enableAutomaticTermination:" => automatic_termination, c"v24@0:8@16";
     });
 }
 

@@ -120,6 +120,22 @@ pub fn metal_data_type_size(data_type: u64) -> Option<usize> {
     Some(size * lanes)
 }
 
+/// The `MTLDataType` of a constant AIR spells this way, as reflection
+/// reports it.
+pub fn metal_data_type_of_encoding(encoding: &str) -> Option<u64> {
+    let (scalar, lanes) = match encoding.strip_prefix("Dv") {
+        Some(vector) => {
+            let (lanes, scalar) = vector.split_once('_')?;
+            (scalar, lanes.parse::<u64>().ok()?)
+        }
+        None => (encoding, 1),
+    };
+    let &(first, _, _) = SCALARS
+        .iter()
+        .find(|&&(_, spelling, _)| spelling == scalar)?;
+    (1..=4).contains(&lanes).then(|| first + lanes - 1)
+}
+
 /// The Itanium spelling AIR gives a constant of an `MTLDataType`.
 fn metal_data_type_encoding(data_type: u64) -> Option<String> {
     let (encoding, _, lanes) = layout(data_type)?;

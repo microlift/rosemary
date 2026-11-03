@@ -1,9 +1,8 @@
-/// Darwin's `errno` values, paired with this host's for the same name.
-///
-/// The first thirty-four agree and are still listed: the point of the table is
-/// that it is the whole answer, and a reader should not have to know where the
-/// agreement stops.
-///
+pub const DARWIN_ENOSYS: i32 = 78;
+/// Darwin's `EOPNOTSUPP`, which this host numbers the same as `ENOTSUP` and so
+/// hands back as that. Set with [`set_guest`].
+pub const DARWIN_EOPNOTSUPP: i32 = 102;
+
 /// Darwin's `EPROCLIM`, `EBADRPC`, `ERPCMISMATCH`, `EPROGUNAVAIL`,
 /// `EPROGMISMATCH`, `EPROCUNAVAIL`, `EFTYPE`, `EAUTH`, `ENEEDAUTH`, `EPWROFF`,
 /// `EDEVERR`, `EBADEXEC`, `EBADARCH`, `ESHLIBVERS`, `EBADMACHO`, `ENOPOLICY`
@@ -87,7 +86,7 @@ const NUMBERS: &[(i32, i32)] = &[
     (70, libc::ESTALE),
     (71, libc::EREMOTE),
     (77, libc::ENOLCK),
-    (78, libc::ENOSYS),
+    (DARWIN_ENOSYS, libc::ENOSYS),
     (84, libc::EOVERFLOW),
     (89, libc::ECANCELED),
     (90, libc::EIDRM),
@@ -198,6 +197,12 @@ mod guest_slot {
     }
 }
 
+/// What [`guest_location`] leaves in the host's slot: no host call writes it, so
+/// any number found there later is a host write, even one that repeats the last
+/// error the guest read.
+#[cfg(not(target_os = "macos"))]
+const UNWRITTEN: libc::c_int = libc::c_int::MIN;
+
 /// `int *__error(void)`, as the guest imports it.
 ///
 /// A real function rather than a rebound host symbol, so the guest gets the same
@@ -210,12 +215,12 @@ mod guest_slot {
 /// before every read *and* every write. That is the whole hook available: the
 /// write itself cannot be seen. Each call therefore does three things.
 ///
-/// 1. If the host's slot differs from what this function last put there, a host
-///    call changed it; the guest's slot is refreshed from it.
+/// 1. If the host's slot no longer holds [`UNWRITTEN`], a host call changed it;
+///    the guest's slot is refreshed from it.
 /// 2. Otherwise the guest's slot is left alone, which is what makes `errno = 0`
 ///    stick across an intervening host call that succeeded quietly.
-/// 3. The guest's value is pushed back to the host's slot and remembered, so
-///    that a shim in this crate reading [`get`] sees what the guest set.
+/// 3. The host's slot is reset to [`UNWRITTEN`]. A shim wanting what the guest
+///    set reads [`guest_errno`], not [`get`].
 ///
 /// The one case it cannot get right is a guest write and a host write between
 /// the same pair of calls, where the host's wins. There is no `errno` read
@@ -243,9 +248,8 @@ pub fn guest_location() -> *mut libc::c_int {
                 if host != pushed.get() {
                     value.set(from_host(host));
                 }
-                let now = to_host(value.get());
-                pushed.set(now);
-                set(now);
+                pushed.set(UNWRITTEN);
+                set(UNWRITTEN);
                 value.as_ptr()
             })
         })
@@ -284,19 +288,38 @@ pub fn guest_errno() -> i32 {
 /// A host library that returns successfully is still entitled to leave `errno` wherever it likes, and a guest
 /// that checks it after a call this runtime made on its behalf sees the runtime's failure rather than its
 /// own.
-pub struct Held(i32);
+///
+/// Off Darwin the guest's own slot is held too, so that a [`set_guest`] or a
+/// [`guest_errno`] read inside the hold does not outlive it.
+pub struct Held {
+    host: i32,
+    #[cfg(not(target_os = "macos"))]
+    guest: (libc::c_int, libc::c_int),
+}
 
 impl Held {
     #[inline(always)]
     pub fn now() -> Held {
-        Held(get())
+        Held {
+            host: get(),
+            #[cfg(not(target_os = "macos"))]
+            guest: (
+                guest_slot::VALUE.with(|value| value.get()),
+                guest_slot::PUSHED.with(|pushed| pushed.get()),
+            ),
+        }
     }
 }
 
 impl Drop for Held {
     #[inline(always)]
     fn drop(&mut self) {
-        set(self.0);
+        set(self.host);
+        #[cfg(not(target_os = "macos"))]
+        {
+            guest_slot::VALUE.with(|value| value.set(self.guest.0));
+            guest_slot::PUSHED.with(|pushed| pushed.set(self.guest.1));
+        }
     }
 }
 
@@ -409,6 +432,23 @@ mod tests {
         set(0);
     }
 
+    /// Non-blocking I/O fails with the same `EAGAIN` over and over; a guest that
+    /// clears `errno` between two of them must still see the second.
+    #[test]
+    #[cfg(not(target_os = "macos"))]
+    fn a_repeated_host_error_reaches_a_guest_that_cleared_errno() {
+        set(libc::EAGAIN);
+        // SAFETY: as above; the guest reads the first EAGAIN, then clears.
+        unsafe {
+            assert_eq!(*error(), 35);
+            *error() = 0;
+        }
+        set(libc::EAGAIN);
+        // SAFETY: as above.
+        assert_eq!(unsafe { *error() }, 35, "the second EAGAIN was lost");
+        set(0);
+    }
+
     /// A number this host cannot name survives to the guest, and is not
     /// renamed by the next reconciliation.
     #[test]
@@ -429,6 +469,21 @@ mod tests {
             set(libc::ENOENT);
         }
         assert_eq!(get(), libc::EPIPE);
+        set(0);
+    }
+
+    #[test]
+    #[cfg(not(target_os = "macos"))]
+    fn holding_errno_puts_back_a_guest_write() {
+        set(libc::EPIPE);
+        // SAFETY: this thread's live slot; the guest writes `errno = 0`.
+        unsafe { *guest_location() = 0 };
+        {
+            let _held = Held::now();
+            set_guest(93);
+            assert_eq!(guest_errno(), 93);
+        }
+        assert_eq!(guest_errno(), 0, "the guest's own errno = 0 survives");
         set(0);
     }
 

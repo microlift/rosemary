@@ -398,6 +398,7 @@ impl Metadata {
                 field: Some(position as u32),
                 binding: output_binding(&items, &mut next_output)?,
                 name: varying_link_name(&items).or_else(|| argument_name(&items)),
+                invariant: false,
             });
         }
         for items in inputs {

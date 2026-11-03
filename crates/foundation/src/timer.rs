@@ -338,6 +338,60 @@ unsafe extern "C" fn perform_after_delay(
     let _ = make(delay, receiver, selector, object, false, true, false);
 }
 
+/// Invalidate every pending `-performSelector:withObject:afterDelay:` on
+/// `target` that `matches` accepts.
+fn cancel_delayed_performs(target: Id, matches: impl Fn(&Timer) -> bool) {
+    // Retained and matched outside the lock: `matches` may send `-isEqual:`,
+    // and `-invalidate` takes the lock itself.
+    let pending: Vec<Id> = SCHEDULED
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+        .map(|&object| object as Id)
+        .filter(|&object| {
+            let timer = timer_of(object);
+            timer.passes_timer == 0 && timer.target == target
+        })
+        .map(objc::arc::retain)
+        .collect();
+    for object in pending {
+        if matches(timer_of(object)) {
+            // SAFETY: `-invalidate` is `void (id, SEL)`; a no-op on a timer
+            // that fired or was cancelled since the table was read.
+            unsafe { invalidate(object, objc::sel::get("invalidate")) };
+        }
+        objc::arc::release(object);
+    }
+}
+
+unsafe extern "C" fn cancel_previous_performs(_class: Id, _sel: Sel, target: Id) {
+    cancel_delayed_performs(target, |_| true);
+}
+
+/// The argument is matched with `-isEqual:`, as Apple documents, so a nil
+/// argument matches only requests made with nil.
+unsafe extern "C" fn cancel_previous_performs_matching(
+    _class: Id,
+    _sel: Sel,
+    target: Id,
+    selector: Sel,
+    argument: Id,
+) {
+    cancel_delayed_performs(target, |timer| {
+        timer.selector == selector
+            && (timer.user_info == argument
+                || (!argument.is_null()
+                    && !timer.user_info.is_null()
+                    // SAFETY: `-isEqual:` is `BOOL (id, SEL, id)`, sent to a
+                    // live argument the request retained.
+                    && unsafe {
+                        let f: unsafe extern "C" fn(Id, Sel, Id) -> u8 =
+                            std::mem::transmute(objc::msg::entry());
+                        f(argument, objc::sel::get("isEqual:"), timer.user_info) != 0
+                    }))
+    });
+}
+
 /// The state owned by a `-performSelectorOnMainThread:...` queue entry.
 ///
 /// Both objects are retained before the entry is submitted. This is necessary
@@ -516,6 +570,11 @@ pub(crate) fn install() {
         "performSelectorOnMainThread:withObject:waitUntilDone:" => perform_on_main_thread,
             c"v40@0:8:16@24c32";
     });
+    class_methods!(nsobject, {
+        "cancelPreviousPerformRequestsWithTarget:" => cancel_previous_performs, c"v24@0:8@16";
+        "cancelPreviousPerformRequestsWithTarget:selector:object:"
+            => cancel_previous_performs_matching, c"v40@0:8@16:24@32";
+    });
 
     let date_class = corefoundation::base::register(c"NSDate", None, DATE_INSTANCE_SIZE, false);
     corefoundation::base::note_type_class(date_class);
@@ -616,6 +675,17 @@ mod tests {
 
     unsafe extern "C" fn once(_receiver: Id, _sel: Sel, _timer: Id) {
         ONCE.fetch_add(1, Ordering::SeqCst);
+    }
+
+    static CANCEL_ARGUMENTS: std::sync::Mutex<Vec<usize>> = std::sync::Mutex::new(Vec::new());
+    static CANCEL_ALL: AtomicUsize = AtomicUsize::new(0);
+
+    unsafe extern "C" fn record_argument(_receiver: Id, _sel: Sel, object: Id) {
+        CANCEL_ARGUMENTS.lock().unwrap().push(object as usize);
+    }
+
+    unsafe extern "C" fn count_cancel_all(_receiver: Id, _sel: Sel, _object: Id) {
+        CANCEL_ALL.fetch_add(1, Ordering::SeqCst);
     }
 
     unsafe extern "C" fn performed_on_main(_receiver: Id, _sel: Sel, object: Id) {
@@ -752,6 +822,69 @@ mod tests {
         );
         // SAFETY: `-isValid` is `BOOL (id, SEL)`.
         assert_eq!(unsafe { is_valid(timer, objc::sel::get("isValid")) }, 0);
+    }
+
+    /// Cancelling by selector and argument removes only the request made with
+    /// that argument; the target's other delayed performs still run.
+    #[test]
+    fn cancelling_a_delayed_perform_spares_other_arguments() {
+        let receiver = target(c"RosemaryTestCancelledPerformTarget", record_argument);
+        let kept = target(c"RosemaryTestCancelledPerformKept", once);
+        let cancelled = target(c"RosemaryTestCancelledPerformDropped", once);
+        CANCEL_ARGUMENTS.lock().unwrap().clear();
+        let tick = objc::sel::get("tick:");
+        // SAFETY: live objects; `tick:` takes one object.
+        unsafe {
+            for argument in [cancelled, kept] {
+                perform_after_delay(receiver, std::ptr::null(), tick, argument, 0.005);
+            }
+            cancel_previous_performs_matching(
+                std::ptr::null_mut(),
+                std::ptr::null(),
+                receiver,
+                tick,
+                cancelled,
+            );
+        }
+        for _ in 0..100 {
+            if !CANCEL_ARGUMENTS.lock().unwrap().is_empty() {
+                break;
+            }
+            corefoundation::runloop::main().run_in_mode(
+                corefoundation::runloop::DEFAULT_MODE,
+                0.01,
+                false,
+            );
+        }
+        assert_eq!(*CANCEL_ARGUMENTS.lock().unwrap(), [kept as usize]);
+    }
+
+    /// Cancelling by target alone removes every delayed perform on it.
+    #[test]
+    fn cancelling_by_target_removes_every_delayed_perform() {
+        let receiver = target(c"RosemaryTestCancelAllTarget", count_cancel_all);
+        CANCEL_ALL.store(0, Ordering::SeqCst);
+        // SAFETY: a live object; `tick:` takes one object.
+        unsafe {
+            for _ in 0..2 {
+                perform_after_delay(
+                    receiver,
+                    std::ptr::null(),
+                    objc::sel::get("tick:"),
+                    std::ptr::null_mut(),
+                    0.005,
+                );
+            }
+            cancel_previous_performs(std::ptr::null_mut(), std::ptr::null(), receiver);
+        }
+        for _ in 0..5 {
+            corefoundation::runloop::main().run_in_mode(
+                corefoundation::runloop::DEFAULT_MODE,
+                0.01,
+                false,
+            );
+        }
+        assert_eq!(CANCEL_ALL.load(Ordering::SeqCst), 0);
     }
 
     /// A date is seconds since Apple's epoch, and the Unix conversion is the

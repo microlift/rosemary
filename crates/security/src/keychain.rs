@@ -30,6 +30,11 @@ pub const KEYS: &[(&str, &str)] = &[
     ("_kSecClassInternetPassword", "inet"),
     ("_kSecAttrService", "svce"),
     ("_kSecAttrAccount", "acct"),
+    ("_kSecAttrServer", "srvr"),
+    ("_kSecAttrProtocol", "ptcl"),
+    ("_kSecAttrProtocolFTPProxy", "ftpx"),
+    ("_kSecAttrProtocolHTTPProxy", "htpx"),
+    ("_kSecAttrProtocolHTTPSProxy", "htsx"),
     ("_kSecAttrLabel", "labl"),
     ("_kSecAttrAccessible", "pdmn"),
     ("_kSecAttrAccessibleAfterFirstUnlock", "ck"),
@@ -39,6 +44,12 @@ pub const KEYS: &[(&str, &str)] = &[
     ("_kSecReturnAttributes", "r_Attributes"),
     ("_kSecMatchLimit", "m_Limit"),
     ("_kSecMatchLimitOne", "m_LimitOne"),
+    ("_kSecMatchLimitAll", "m_LimitAll"),
+    ("_kSecReturnRef", "r_Ref"),
+    ("_kSecAttrComment", "icmt"),
+    ("_kSecAttrDescription", "desc"),
+    ("_kSecKeyAlgorithmRSAEncryptionRaw", "algid:encrypt:RSA:raw"),
+    ("_kSecTransformInputAttributeName", "INPUT"),
 ];
 
 /// What identifies an item: its class, its service and its account.

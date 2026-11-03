@@ -4,8 +4,14 @@
 //! The kernel does the copy, so an address that is not mapped, or not mapped
 //! the way the copy needs, comes back as an error rather than a signal. Both
 //! are async-signal-safe: no allocation, no locks.
+//!
+//! Also the anonymous shared-memory objects a Mach memory entry is made of,
+//! and private anonymous memory committed only as it is touched.
 
-use core::ffi::c_void;
+use core::ffi::{c_int, c_void};
+use core::ptr::NonNull;
+use std::io;
+use std::os::fd::{AsRawFd, OwnedFd};
 
 use crate::sys;
 
@@ -62,12 +68,98 @@ pub fn mapped(address: usize) -> bool {
     unsafe { libc::msync(start as *mut c_void, page, libc::MS_ASYNC) == 0 }
 }
 
+/// A new shared-memory object of `len` zero bytes, named nowhere: every
+/// mapping of it shares the same pages, and it lives as long as a descriptor
+/// for it or a mapping of it does.
+pub fn object(len: u64) -> io::Result<OwnedFd> {
+    let fd = sys::memory::object()?;
+    let len = libc::off_t::try_from(len).map_err(|_| io::Error::from_raw_os_error(libc::EFBIG))?;
+    // SAFETY: a descriptor this call just opened.
+    match unsafe { libc::ftruncate(fd.as_raw_fd(), len) } {
+        0 => Ok(fd),
+        _ => Err(io::Error::last_os_error()),
+    }
+}
+
+/// Leave `[address, address + len)` out of any child this process forks, as
+/// Mach's `VM_INHERIT_NONE` does.
+pub fn exclude_from_fork(address: usize, len: usize) -> io::Result<()> {
+    sys::memory::exclude_from_fork(address, len)
+}
+
+/// The `mmap` flag that asks for a mapping not to be charged against commit
+/// until it is touched, or `0` on a host that never charges up front.
+pub const NORESERVE: c_int = sys::memory::NORESERVE;
+
+/// `len` bytes of private, zero-filled memory at an address the kernel picks,
+/// committed only as it is touched. `PROT_NONE` reserves address space alone.
+pub fn anonymous(len: usize, prot: c_int) -> io::Result<NonNull<u8>> {
+    // SAFETY: a new mapping at no fixed address cannot displace anything.
+    let mapped = unsafe {
+        libc::mmap(
+            core::ptr::null_mut(),
+            len,
+            prot,
+            libc::MAP_PRIVATE | libc::MAP_ANON | NORESERVE,
+            -1,
+            0,
+        )
+    };
+    match mapped {
+        libc::MAP_FAILED => Err(io::Error::last_os_error()),
+        mapped => NonNull::new(mapped.cast()).ok_or_else(|| io::Error::other("mapped at null")),
+    }
+}
+
 fn fault(address: usize, offset: usize) -> Fault {
     let kind = match mapped(address.wrapping_add(offset)) {
         true => FaultKind::Protection,
         false => FaultKind::Unmapped,
     };
     Fault { offset, kind }
+}
+
+/// [`object`] where the host has no anonymous one: a POSIX object under a name
+/// no other process uses, unlinked as soon as it is open.
+#[cfg_attr(any(target_os = "linux", target_os = "freebsd"), allow(dead_code))]
+pub(crate) mod named {
+    use std::io;
+    use std::os::fd::{FromRawFd, OwnedFd};
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    pub fn object() -> io::Result<OwnedFd> {
+        static NEXT: AtomicU32 = AtomicU32::new(0);
+        loop {
+            let n = NEXT.fetch_add(1, Ordering::Relaxed);
+            // SAFETY: `getpid` has no preconditions.
+            let name = format!("/rosemary.{}.{n}\0", unsafe { libc::getpid() });
+            let mode: libc::mode_t = 0o600;
+            // Variadic on macOS, where the mode arrives promoted.
+            #[cfg(target_os = "macos")]
+            let mode = mode as libc::c_uint;
+            // SAFETY: a NUL-terminated name; `O_EXCL` so nothing else's
+            // object is opened.
+            let fd = unsafe {
+                libc::shm_open(
+                    name.as_ptr().cast(),
+                    libc::O_RDWR | libc::O_CREAT | libc::O_EXCL,
+                    mode,
+                )
+            };
+            if fd < 0 {
+                match io::Error::last_os_error() {
+                    e if e.raw_os_error() == Some(libc::EEXIST) => continue,
+                    e => return Err(e),
+                }
+            }
+            // SAFETY: the name just created, and the descriptor just opened.
+            unsafe {
+                libc::shm_unlink(name.as_ptr().cast());
+                libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC);
+                return Ok(OwnedFd::from_raw_fd(fd));
+            }
+        }
+    }
 }
 
 /// The copy any host can do: through a pipe, whose `write` and `read` answer
@@ -188,6 +280,18 @@ mod tests {
         };
         assert_ne!(at, libc::MAP_FAILED);
         (at.cast(), page)
+    }
+
+    #[test]
+    fn anonymous_memory_reads_zero_and_takes_writes() {
+        let page = crate::system::page_size() as usize;
+        let at = anonymous(page, libc::PROT_READ | libc::PROT_WRITE).unwrap();
+        // SAFETY: a page of read-write memory just mapped.
+        unsafe {
+            assert_eq!(*at.as_ptr(), 0);
+            *at.as_ptr() = 1;
+            libc::munmap(at.as_ptr().cast(), page);
+        }
     }
 
     #[test]

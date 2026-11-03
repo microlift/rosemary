@@ -22,6 +22,7 @@ pub mod corefoundation;
 pub mod coregraphics;
 pub mod curl;
 pub mod err;
+pub mod extension;
 pub(crate) mod host;
 pub mod intdiv;
 pub mod ioctl;
@@ -39,11 +40,8 @@ pub mod sysvsem;
 pub mod vmmap;
 pub mod zlib;
 
-#[cfg(target_os = "macos")]
 pub mod cfuuid;
-#[cfg(target_os = "macos")]
 pub mod coremedia;
-#[cfg(target_os = "macos")]
 pub mod iokit;
 #[cfg(target_os = "macos")]
 pub mod machthread;
@@ -56,22 +54,55 @@ pub mod nslog;
 pub mod variadic;
 
 /// A shim that reads and writes the guest's registers and memory.
-pub type Shim = fn(&str, &mut RegisterContext, &mut dyn GuestMemory) -> Result<()>;
+///
+/// Takes no name: each one is bound to the symbol it serves by [`bind!`], so a
+/// call neither carries nor re-derives it.
+pub type Shim = fn(&mut RegisterContext, &mut dyn GuestMemory) -> Result<()>;
 
 /// A shim that may also call *into* the guest.
 pub type CallbackShim =
-    fn(&str, &mut RegisterContext, &mut dyn GuestMemory, &dyn crate::abi::Callbacks) -> Result<()>;
+    fn(&mut RegisterContext, &mut dyn GuestMemory, &dyn crate::abi::Callbacks) -> Result<()>;
+
+/// `f` as a [`Shim`] (or, with `callback`, a [`CallbackShim`]) bound to `name`.
+///
+/// Implementations still take the name - for their diagnostics, for what they
+/// look up by it, and to tell apart the spellings they share - but as a constant
+/// fixed where the table spells it, not an argument every call has to pass.
+macro_rules! bind {
+    ($name:literal => $f:path) => {{
+        fn bound(
+            ctx: &mut ::microlift::arch::x86_64::context::RegisterContext,
+            mem: &mut dyn $crate::abi::GuestMemory,
+        ) -> $crate::abi::Result<()> {
+            $f($name, ctx, mem)
+        }
+        bound as $crate::shims::Shim
+    }};
+    (callback $name:literal => $f:path) => {{
+        fn bound(
+            ctx: &mut ::microlift::arch::x86_64::context::RegisterContext,
+            mem: &mut dyn $crate::abi::GuestMemory,
+            callbacks: &dyn $crate::abi::Callbacks,
+        ) -> $crate::abi::Result<()> {
+            $f($name, ctx, mem, callbacks)
+        }
+        bound as $crate::shims::CallbackShim
+    }};
+}
+pub(crate) use bind;
 
 /// The families this host has, whichever host it is.
 ///
-/// The Objective-C runtime is here on both, because [`crate::objc::host`] chooses
-/// one rather than requiring the host to be one.
+/// The Objective-C runtime is on both too, because [`crate::objc::host`] chooses
+/// one rather than requiring the host to be one; [`resolve`] asks it first, for
+/// an entry rather than a [`Shim`].
 fn platform_shim_for(name: &str) -> Option<Shim> {
-    crate::objc::dispatch::shim_for(name)
-        .or_else(|| component::shim_for(name))
+    component::shim_for(name)
         .or_else(|| coregraphics::shim_for(name))
         .or_else(|| appkit::shim_for(name))
         .or_else(|| opengl::shim_for(name))
+        .or_else(|| coremedia::shim_for(name))
+        .or_else(|| cfuuid::shim_for(name))
         .or_else(|| macos_shim_for(name))
 }
 
@@ -79,10 +110,7 @@ fn platform_shim_for(name: &str) -> Option<Shim> {
 /// and no Mach.
 #[cfg(target_os = "macos")]
 fn macos_shim_for(name: &str) -> Option<Shim> {
-    coremedia::shim_for(name)
-        .or_else(|| cfuuid::shim_for(name))
-        .or_else(|| machthread::shim_for(name))
-        .or_else(|| crate::gui::hook::shim_for(name))
+    machthread::shim_for(name).or_else(|| crate::gui::hook::shim_for(name))
 }
 
 #[cfg(not(target_os = "macos"))]
@@ -97,40 +125,19 @@ fn callback_shim_for(name: &str) -> Option<CallbackShim> {
         .or_else(|| macos_callback_shim_for(name))
 }
 
-/// The macOS-only families that may call into the guest.
-#[cfg(target_os = "macos")]
 fn macos_callback_shim_for(name: &str) -> Option<CallbackShim> {
     iokit::shim_for(name).or_else(|| coremedia::callback_shim_for(name))
-}
-
-#[cfg(not(target_os = "macos"))]
-fn macos_callback_shim_for(_name: &str) -> Option<CallbackShim> {
-    None
 }
 
 /// The two variadics whose format string is an `NSString`, and so are Foundation's.
 fn foundation_variadic(name: &str) -> Option<Shim> {
     match name {
-        "NSLog" => Some(nslog::nslog),
+        "NSLog" => Some(bind!("NSLog" => nslog::nslog)),
         // The other `NSString`-format variadic, and the one a Cocoa game reports a
         // fatal error through. See [`nslog::run_alert_panel`].
-        "NSRunAlertPanel" => Some(nslog::run_alert_panel),
+        "NSRunAlertPanel" => Some(bind!("NSRunAlertPanel" => nslog::run_alert_panel)),
         _ => None,
     }
-}
-
-/// Run the shim for `symbol`, if there is one.
-///
-/// `None` means "not shimmed" and the caller should carry on with the table;
-/// `Some(Err(..))` means the shim itself refused, which is a different thing
-/// and must not fall through to a passthrough call.
-pub fn dispatch(
-    symbol: &str,
-    ctx: &mut RegisterContext,
-    mem: &mut dyn GuestMemory,
-    callbacks: &dyn crate::abi::Callbacks,
-) -> Option<Result<()>> {
-    resolve(symbol).map(|shim| shim.call(symbol, ctx, mem, callbacks))
 }
 
 /// A shim of either shape, as [`resolve`] finds it.
@@ -144,19 +151,17 @@ pub enum Resolved {
 }
 
 impl Resolved {
-    /// Run the shim for a call to `symbol`, the Mach-O name it was resolved from.
+    /// Run the shim. It already knows which symbol it serves.
     pub fn call(
         self,
-        symbol: &str,
         ctx: &mut RegisterContext,
         mem: &mut dyn GuestMemory,
         callbacks: &dyn crate::abi::Callbacks,
     ) -> Result<()> {
-        let name = symbol.strip_prefix('_').unwrap_or(symbol);
         match self {
-            Resolved::Plain(f) => f(name, ctx, mem),
-            Resolved::WithCallbacks(f) => f(name, ctx, mem, callbacks),
-            Resolved::Objc(entry) => entry.call(name, ctx, mem),
+            Resolved::Plain(f) => f(ctx, mem),
+            Resolved::WithCallbacks(f) => f(ctx, mem, callbacks),
+            Resolved::Objc(entry) => entry.call(ctx, mem),
         }
     }
 }
@@ -169,47 +174,50 @@ impl Resolved {
 pub fn resolve(symbol: &str) -> Option<Resolved> {
     let name = symbol.strip_prefix('_').unwrap_or(symbol);
     let f = match name {
-        "printf" => printf::printf,
-        "fprintf" => printf::fprintf,
-        "sprintf" => printf::sprintf,
-        "snprintf" => printf::snprintf,
+        "printf" => bind!("printf" => printf::printf),
+        "fprintf" => bind!("fprintf" => printf::fprintf),
+        "sprintf" => bind!("sprintf" => printf::sprintf),
+        "snprintf" => bind!("snprintf" => printf::snprintf),
         // The locale-aware pair, which the **vendored libc++** uses for every
         // number it formats so that `std::to_string` does not pick up the
         // program's locale.
-        "snprintf_l" => printf::snprintf_l,
-        "sprintf_l" => printf::sprintf_l,
+        "snprintf_l" => bind!("snprintf_l" => printf::snprintf_l),
+        "sprintf_l" => bind!("sprintf_l" => printf::sprintf_l),
         // The `_FORTIFY_SOURCE` variants clang emits by default on macOS.
-        "__sprintf_chk" => printf::sprintf_chk,
-        "__snprintf_chk" => printf::snprintf_chk,
+        "__sprintf_chk" => bind!("__sprintf_chk" => printf::sprintf_chk),
+        "__snprintf_chk" => bind!("__snprintf_chk" => printf::snprintf_chk),
         // The `v`-prefixed family.
-        "vprintf" => printf::vprintf,
-        "vfprintf" => printf::vfprintf,
-        "vsprintf" => printf::vsprintf,
-        "vsnprintf" => printf::vsnprintf,
+        "vprintf" => bind!("vprintf" => printf::vprintf),
+        "vfprintf" => bind!("vfprintf" => printf::vfprintf),
+        "vsprintf" => bind!("vsprintf" => printf::vsprintf),
+        "vsnprintf" => bind!("vsnprintf" => printf::vsnprintf),
         // The wide form, which is how Unreal Engine 3 formats every string it
         // has.
-        "vswprintf" => printf::vswprintf,
-        "vasprintf" => printf::vasprintf,
-        "asprintf" => printf::asprintf,
-        "syslog" | "syslog$DARWIN_EXTSN" => printf::syslog,
-        "__vsnprintf_chk" => printf::vsnprintf_chk,
-        "sscanf" => sscanf::sscanf,
+        "vswprintf" => bind!("vswprintf" => printf::vswprintf),
+        "vasprintf" => bind!("vasprintf" => printf::vasprintf),
+        "asprintf" => bind!("asprintf" => printf::asprintf),
+        "syslog" => bind!("syslog" => printf::syslog),
+        "asl_log" => bind!("asl_log" => printf::asl_log),
+        "syslog$DARWIN_EXTSN" => bind!("syslog$DARWIN_EXTSN" => printf::syslog),
+        "__vsnprintf_chk" => bind!("__vsnprintf_chk" => printf::vsnprintf_chk),
+        "sscanf" => bind!("sscanf" => sscanf::sscanf),
         // The locale-aware and `va_list` spellings, which are the same parser
         // reached with the destinations somewhere else.
-        "sscanf_l" => sscanf::sscanf_l,
-        "vsscanf" => sscanf::vsscanf,
+        "sscanf_l" => bind!("sscanf_l" => sscanf::sscanf_l),
+        "vsscanf" => bind!("vsscanf" => sscanf::vsscanf),
         // libsystem_malloc's own printer, which the interposing mimalloc uses.
-        "malloc_printf" => printf::malloc_printf,
-        "ioctl" => ioctl::ioctl,
+        "malloc_printf" => bind!("malloc_printf" => printf::malloc_printf),
+        "ioctl" => bind!("ioctl" => ioctl::ioctl),
         // Variadic in its declaration and one argument wide in fact, decided by
         // a command number rather than a format string; see [`openat`].
-        "fcntl" => openat::fcntl,
+        "fcntl" => bind!("fcntl" => openat::fcntl),
         // Not variadic, and here for the same underlying reason: forwarding it
         // would operate on the *host's* registers and the host's stack.
         _ => {
             if let Some(f) = foundation_variadic(name)
                 .or_else(|| math::shim_for(name))
                 .or_else(|| err::shim_for(name))
+                .or_else(|| extension::shim_for(name))
                 .or_else(|| intdiv::shim_for(name))
                 .or_else(|| process::shim_for(name))
                 .or_else(|| stackprobe::shim_for(name))
@@ -221,8 +229,8 @@ pub fn resolve(symbol: &str) -> Option<Resolved> {
             {
                 return Some(Resolved::Plain(f));
             }
-            // First of the platform shims, kept as an entry rather than the
-            // `serve` that `platform_shim_for` would give.
+            // First of the platform shims, kept as an entry so a message send
+            // does not search its tables again.
             if let Some(entry) = crate::objc::dispatch::resolve(name) {
                 return Some(Resolved::Objc(entry));
             }
@@ -243,11 +251,12 @@ pub fn resolve(symbol: &str) -> Option<Resolved> {
     Some(Resolved::Plain(f))
 }
 
-/// Whether [`dispatch`] would handle `symbol`.
+/// Whether [`resolve`] would handle `symbol`.
 pub fn is_shimmed(symbol: &str) -> bool {
     let name = symbol.strip_prefix('_').unwrap_or(symbol);
     if math::shim_for(name).is_some()
         || err::shim_for(name).is_some()
+        || extension::shim_for(name).is_some()
         || intdiv::shim_for(name).is_some()
         || process::shim_for(name).is_some()
         || stackprobe::shim_for(name).is_some()
@@ -263,6 +272,7 @@ pub fn is_shimmed(symbol: &str) -> bool {
         || zlib::shim_for(name).is_some()
         || curl::shim_for(name).is_some()
         || foundation_variadic(name).is_some()
+        || crate::objc::dispatch::resolve(name).is_some()
         || platform_shim_for(name).is_some()
         || callback_shim_for(name).is_some()
     {

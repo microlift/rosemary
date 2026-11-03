@@ -38,6 +38,8 @@ pub struct Thunk {
     pub host: u64,
     /// Keeps the JIT module, and therefore `host`'s pages, mapped.
     _backend: CraneliftBackend,
+    /// Typed callbacks keep their signature at a stable address until this thunk dies.
+    _signature: Option<Box<ThunkSignature>>,
 }
 
 // SAFETY: as for `Translation` in `crate::cache`, and for the same reason. A
@@ -50,6 +52,9 @@ unsafe impl Sync for Thunk {}
 /// Every thunk handed out, both ways round.
 pub struct ThunkTable {
     by_guest: BTreeMap<u64, Thunk>,
+    // One guest entry can be registered with different callback prototypes.
+    // Neither a generic thunk nor a differently typed one may be reused.
+    typed_by_guest: BTreeMap<u64, Vec<(ThunkSignature, Thunk)>>,
     by_host: BTreeMap<u64, u64>,
 }
 
@@ -57,6 +62,7 @@ impl ThunkTable {
     pub fn new() -> Self {
         ThunkTable {
             by_guest: BTreeMap::new(),
+            typed_by_guest: BTreeMap::new(),
             by_host: BTreeMap::new(),
         }
     }
@@ -66,25 +72,57 @@ impl ThunkTable {
         self.by_guest.get(&guest).map(|t| t.host)
     }
 
+    /// A typed thunk for the exact guest address and callback signature.
+    pub fn typed_host_for(&self, guest: u64, signature: &ThunkSignature) -> Option<u64> {
+        self.typed_by_guest
+            .get(&guest)?
+            .iter()
+            .find(|(s, _)| s == signature)
+            .map(|(_, t)| t.host)
+    }
+
     /// The guest address behind a thunk, if this is one.
     pub fn guest_for(&self, host: u64) -> Option<u64> {
         self.by_host.get(&host).copied()
     }
 
-    /// How many distinct guest pointers have crossed outward.
+    /// How many native thunks this table owns, including typed variants.
     pub fn len(&self) -> usize {
-        self.by_guest.len()
+        self.by_host.len()
     }
 
     pub fn is_empty(&self) -> bool {
-        self.by_guest.is_empty()
+        self.by_host.is_empty()
     }
 
-    pub fn insert(&mut self, thunk: Thunk) -> u64 {
+    /// Add a typed thunk, unless one for the same guest and signature already exists.
+    ///
+    /// Returns the host address to hand out and whether `thunk` was the one kept. The
+    /// first thunk wins: its address may already be in host hands, so it must stay
+    /// mapped, and a racing duplicate that never left this table is the one dropped.
+    pub fn insert_typed(&mut self, signature: ThunkSignature, thunk: Thunk) -> (u64, bool) {
+        if let Some(existing) = self.typed_host_for(thunk.guest, &signature) {
+            return (existing, false);
+        }
+        let (guest, host) = (thunk.guest, thunk.host);
+        self.by_host.insert(host, guest);
+        self.typed_by_guest
+            .entry(guest)
+            .or_default()
+            .push((signature, thunk));
+        (host, true)
+    }
+
+    /// Add a generic thunk, unless the guest address already has one. As for
+    /// [`ThunkTable::insert_typed`], the first thunk wins.
+    pub fn insert(&mut self, thunk: Thunk) -> (u64, bool) {
+        if let Some(existing) = self.host_for(thunk.guest) {
+            return (existing, false);
+        }
         let (guest, host) = (thunk.guest, thunk.host);
         self.by_host.insert(host, guest);
         self.by_guest.insert(guest, thunk);
-        host
+        (host, true)
     }
 
     /// A snapshot of both directions, for [`ThunkView`].
@@ -92,7 +130,7 @@ impl ThunkTable {
         ThunkView {
             by_guest: self.by_guest.iter().map(|(g, t)| (*g, t.host)).collect(),
             by_host: self.by_host.iter().map(|(h, g)| (*h, *g)).collect(),
-            count: self.by_guest.len(),
+            count: self.by_host.len(),
         }
     }
 }
@@ -179,6 +217,7 @@ pub(crate) fn current() -> Option<&'static Vm> {
 
 /// A callback whose argument and return types are known, as the emitted trampoline and
 /// the Rust entry both need them.
+#[derive(Clone, PartialEq, Eq)]
 pub struct ThunkSignature {
     /// `self` and `_cmd` included: these are the arguments the guest really
     /// takes, in order.
@@ -196,11 +235,10 @@ type Unsupported = &'static str;
 impl ThunkSignature {
     /// Decide the host-side shape of every argument, or say what stopped it.
     ///
-    /// An aggregate's host placement is indistinguishable from its leaves' - an HFA of
-    /// *n* occupies the same registers as *n* floating-point arguments, and a composite
-    /// of at most sixteen bytes the same as one or two integer ones - which is what
-    /// lets the trampoline declare a signature of plain scalars and still be called
-    /// correctly by AAPCS64.
+    /// An HFA occupies the same registers as its floating-point members and a
+    /// composite of at most sixteen bytes as one or two integers. Larger AAPCS64
+    /// composites arrive as pointers to a caller-owned copy; SysV composites
+    /// instead occupy the incoming stack argument area.
     pub fn new(params: Vec<Shape>, returns: Option<Shape>) -> Result<Self, Unsupported> {
         let mut host_leaves = Vec::with_capacity(params.len());
         for shape in &params {
@@ -222,19 +260,11 @@ impl ThunkSignature {
                             Eightbyte::Integer => T::UnsignedDoubleword,
                         })
                         .collect(),
-                    // AAPCS64 copies an argument this large to the *caller's*
-                    // stack, and the trampoline would have to find it there.
-                    // SysV puts it in the callee's own incoming stack area,
-                    // which Cranelift declares as a `StructArgument` - so the
-                    // trampoline is handed its address and this shape is
-                    // carried. The leaves here are the spill slot's words and
-                    // not declared parameters; see [`build_typed`].
-                    HostClass::Indirect => {
-                        if cfg!(target_arch = "aarch64") {
-                            return Err("takes an aggregate too large for AAPCS64's registers");
-                        }
-                        vec![T::UnsignedDoubleword; agg.size.div_ceil(8)]
-                    }
+                    // Both hosts deliver an address for a large composite.
+                    // AAPCS64 passes a pointer in the next integer argument
+                    // slot; SysV uses the incoming stack argument area.
+                    // These leaves describe the spill words, not ABI parameters.
+                    HostClass::Indirect => vec![T::UnsignedDoubleword; agg.size.div_ceil(8)],
                 },
             });
         }
@@ -401,6 +431,18 @@ fn copy_out(
 /// The generic thunk takes six integer and eight floating-point registers because it
 /// has no types to work from.
 pub(crate) fn build_typed(guest_va: u64, signature: ThunkSignature) -> Result<Thunk, VmError> {
+    build_typed_with_entry(
+        guest_va,
+        signature,
+        typed_entry as *const () as usize as u64,
+    )
+}
+
+fn build_typed_with_entry(
+    guest_va: u64,
+    signature: ThunkSignature,
+    host_entry: u64,
+) -> Result<Thunk, VmError> {
     let conv = get_host_calling_conv();
     let fail = |reason: String| VmError::Thunk {
         guest: guest_va,
@@ -428,10 +470,18 @@ pub(crate) fn build_typed(guest_va: u64, signature: ThunkSignature) -> Result<Th
             Incoming::Leaf { ty, .. } => AbiParam::new(ThunkSignature::cl_type(*ty)),
             // Rounded up because the backend requires whole eightbytes, which is
             // also what the caller reserved: SysV pads a stack argument out.
-            Incoming::Aggregate { size, .. } => AbiParam::special(
-                ptr,
-                ArgumentPurpose::StructArgument(size.next_multiple_of(8) as u32),
-            ),
+            Incoming::Aggregate { size, .. } => {
+                if cfg!(target_arch = "aarch64") {
+                    // AAPCS64 passes composites larger than 16 bytes by
+                    // pointer. Cranelift does not support StructArgument there.
+                    AbiParam::new(ptr)
+                } else {
+                    AbiParam::special(
+                        ptr,
+                        ArgumentPurpose::StructArgument(size.next_multiple_of(8) as u32),
+                    )
+                }
+            }
         });
     }
     let ret_leaves = signature.return_leaves().map_err(|e| fail(e.to_string()))?;
@@ -479,17 +529,41 @@ pub(crate) fn build_typed(guest_va: u64, signature: ThunkSignature) -> Result<Th
             // through it into the words the entry expects to find them in.
             Incoming::Aggregate { word, size } => {
                 for i in 0..size.div_ceil(8) {
-                    let w = b
-                        .ins()
-                        .load(types::I64, MemFlagsData::trusted(), v, (i * 8) as i32);
+                    let offset = i * 8;
+                    let bytes = (size - offset).min(8);
+                    // A SysV caller reserved whole eightbytes (see the
+                    // `StructArgument` above); an AAPCS64 caller's copy is only
+                    // the object's own size, so its last partial eightbyte is
+                    // read a byte at a time.
+                    let w = if bytes == 8 || !cfg!(target_arch = "aarch64") {
+                        b.ins()
+                            .load(types::I64, MemFlagsData::trusted(), v, offset as i32)
+                    } else {
+                        let mut w = b.ins().iconst(types::I64, 0);
+                        for j in 0..bytes {
+                            let byte = b.ins().load(
+                                types::I8,
+                                MemFlagsData::trusted(),
+                                v,
+                                (offset + j) as i32,
+                            );
+                            let byte = b.ins().uextend(types::I64, byte);
+                            let byte = b.ins().ishl_imm_u(byte, (j * 8) as i64);
+                            w = b.ins().bor(w, byte);
+                        }
+                        w
+                    };
                     b.ins().stack_store(ptr, w, spill, ((word + i) * 8) as i32);
                 }
             }
         }
     }
 
-    let desc = Box::leak(Box::new(signature)) as *const ThunkSignature;
-    let desc = b.ins().iconst(types::I64, desc as usize as i64);
+    let descriptor = Box::new(signature);
+    let desc = b.ins().iconst(
+        types::I64,
+        (&*descriptor as *const ThunkSignature) as usize as i64,
+    );
     let spill_ptr = b.ins().stack_addr(types::I64, spill, 0);
     let out_ptr = b.ins().stack_addr(types::I64, out, 0);
     let guest = b.ins().iconst(types::I64, guest_va as i64);
@@ -499,9 +573,7 @@ pub(crate) fn build_typed(guest_va: u64, signature: ThunkSignature) -> Result<Th
         callee_sig.params.push(AbiParam::new(types::I64));
     }
     let callee_sig = b.import_signature(callee_sig);
-    let callee = b
-        .ins()
-        .iconst(types::I64, typed_entry as *const () as usize as i64);
+    let callee = b.ins().iconst(types::I64, host_entry as i64);
     b.ins()
         .call_indirect(callee_sig, callee, &[guest, desc, spill_ptr, out_ptr]);
 
@@ -526,6 +598,7 @@ pub(crate) fn build_typed(guest_va: u64, signature: ThunkSignature) -> Result<Th
         guest: guest_va,
         host: code as usize as u64,
         _backend: backend,
+        _signature: Some(descriptor),
     })
 }
 
@@ -604,6 +677,7 @@ pub(crate) fn build(guest_va: u64) -> Result<Thunk, VmError> {
         guest: guest_va,
         host: code as usize as u64,
         _backend: backend,
+        _signature: None,
     })
 }
 
@@ -727,6 +801,43 @@ fn reassemble(agg: &Aggregate, host: HostClass, words: &[u64]) -> Vec<u8> {
     raw
 }
 
+/// Rebuild the guest's ABI argument registers and stack from the exact
+/// host-side words spilled by the typed trampoline, or say why they cannot be.
+fn guest_arguments(
+    signature: &ThunkSignature,
+    spill: &[u64],
+    result_buffer: &mut [u8; RESULT_BYTES],
+) -> Result<GuestArgs, Unsupported> {
+    let mut args = GuestArgs::default();
+    if let Some(Shape::Struct(agg)) = signature.returns.as_ref()
+        && agg.guest_class() == GuestClass::Memory
+    {
+        if agg.size > RESULT_BYTES {
+            return Err("an aggregate return larger than this runtime buffers");
+        }
+        // The shared guest/host address space lets a guest return into this
+        // local as though the caller had passed a hidden sret pointer.
+        args.push_int(result_buffer.as_mut_ptr() as usize as u64);
+    }
+    let mut at = 0usize;
+    for (shape, leaves) in signature.params.iter().zip(&signature.host_leaves) {
+        let words = spill
+            .get(at..at + leaves.len())
+            .ok_or("fewer spilled words than the signature describes")?;
+        at += leaves.len();
+        match shape {
+            Shape::Scalar(t) if crate::abi::aggregate::is_fp(*t) => args.push_sse(words[0]),
+            Shape::Scalar(_) => args.push_int(words[0]),
+            Shape::Struct(agg) => {
+                let host = agg.host_class()?;
+                let raw = reassemble(agg, host, words);
+                args.push_aggregate(agg, &raw);
+            }
+        }
+    }
+    Ok(args)
+}
+
 /// The aggregate a returning guest call left behind, as its own bytes.
 ///
 /// `buffer` is what a MEMORY-class return was given to fill; for the register
@@ -779,8 +890,8 @@ unsafe extern "C" fn typed_entry(
     if !vm.program.is_guest_address(guest_va) {
         return;
     }
-    // SAFETY: `desc` was leaked at build time and is never freed; `spill` points
-    // at a slot the calling trampoline just filled with exactly as many words as
+    // SAFETY: `desc` is owned by the VM's thunk and remains valid while the
+    // host can call this trampoline; `spill` points at exactly as many words as
     // `desc.host_leaves` flattens to.
     let (signature, spill) = unsafe {
         let signature = &*desc;
@@ -788,42 +899,22 @@ unsafe extern "C" fn typed_entry(
         (signature, std::slice::from_raw_parts(spill, n))
     };
 
-    // An aggregate SysV classifies MEMORY comes back through a buffer whose
-    // address the *caller* passes in the first integer register, ahead of
-    // `self` - so this is pushed before any argument is read.
-    let sret = match signature.returns.as_ref() {
-        Some(Shape::Struct(agg)) if agg.guest_class() == GuestClass::Memory => {
-            // Not reachable through `ThunkSignature::new`, which takes only the
-            // classes AAPCS64 returns in registers, none of them wider.
-            if agg.size > RESULT_BYTES {
-                return;
-            }
-            true
-        }
-        _ => false,
-    };
     let mut buffer = [0u8; RESULT_BYTES];
-
-    let mut args = GuestArgs::default();
-    if sret {
-        // Guest and host share one address space, so a host local is an address
-        // the guest can store through. See `GuestView`.
-        args.push_int(buffer.as_mut_ptr() as usize as u64);
-    }
-    let mut at = 0usize;
-    for (shape, leaves) in signature.params.iter().zip(&signature.host_leaves) {
-        let words = &spill[at..at + leaves.len()];
-        at += leaves.len();
-        match shape {
-            Shape::Scalar(t) if crate::abi::aggregate::is_fp(*t) => args.push_sse(words[0]),
-            Shape::Scalar(_) => args.push_int(words[0]),
-            Shape::Struct(agg) => {
-                let Ok(host) = agg.host_class() else { return };
-                let raw = reassemble(agg, host, words);
-                args.push_aggregate(agg, &raw);
-            }
+    // A refusal, not a zeroed return the host would read as the callback
+    // having run.
+    let args = match guest_arguments(signature, spill, &mut buffer) {
+        Ok(args) => args,
+        Err(reason) => {
+            park_or_die(
+                vm,
+                VmError::Thunk {
+                    guest: guest_va,
+                    reason: format!("the callback's arguments cannot be placed: {reason}"),
+                },
+            );
+            return;
         }
-    }
+    };
 
     let mut ctx = RegisterContext::new();
     for (slot, &v) in [
@@ -985,5 +1076,792 @@ unsafe extern "C" fn thunk_entry(guest_va: u64, ints: *const u64, floats: *const
             );
             0
         }
+    }
+}
+
+#[cfg(test)]
+mod callback_abi_tests {
+    use super::*;
+
+    #[test]
+    fn video_toolbox_signature_has_two_indirect_times() {
+        let signature = crate::shims::coremedia::decompression_output_signature();
+        assert_eq!(signature.params.len(), 7);
+        assert!(signature.returns.is_none());
+        assert_eq!(
+            signature
+                .host_leaves
+                .iter()
+                .map(Vec::len)
+                .collect::<Vec<_>>(),
+            [1, 1, 1, 1, 1, 3, 3]
+        );
+        let incoming = signature.incoming();
+        assert_eq!(incoming.len(), 7);
+        assert!(matches!(
+            incoming[5],
+            Incoming::Aggregate { word: 5, size: 24 }
+        ));
+        assert!(matches!(
+            incoming[6],
+            Incoming::Aggregate { word: 8, size: 24 }
+        ));
+        for shape in &signature.params[5..] {
+            let Shape::Struct(agg) = shape else {
+                panic!("CMTime must be an aggregate")
+            };
+            assert_eq!(agg.size, 24);
+            assert_eq!(agg.align, 8);
+            assert_eq!(agg.guest_class(), GuestClass::Memory);
+            assert_eq!(agg.host_class(), Ok(HostClass::Indirect));
+        }
+    }
+
+    #[test]
+    fn video_toolbox_two_times_reach_guest_stack_untruncated() {
+        let signature = crate::shims::coremedia::decompression_output_signature();
+        let first = [
+            0x0123_4567_89ab_cdef,
+            0x1234_5678_9abc_def0,
+            0xfedc_ba98_7654_3210,
+        ];
+        let second = [
+            0x7fff_ffff_ffff_fffe,
+            0xabcd_1234_0000_0001,
+            0x8000_0000_0000_0001,
+        ];
+        let spill = [
+            0x1001,
+            0x2002,
+            (-129i64) as u64,
+            0x8000_0012,
+            0x5005,
+            first[0],
+            first[1],
+            first[2],
+            second[0],
+            second[1],
+            second[2],
+        ];
+        let mut buffer = [0; RESULT_BYTES];
+        let guest = guest_arguments(&signature, &spill, &mut buffer).expect("supported ABI");
+        assert_eq!(guest.ints, spill[..5]);
+        assert!(guest.sse.is_empty());
+        let expected: Vec<u8> = first
+            .into_iter()
+            .chain(second)
+            .flat_map(u64::to_le_bytes)
+            .collect();
+        assert_eq!(guest.stack.len(), 48);
+        assert_eq!(guest.stack, expected);
+    }
+
+    #[test]
+    fn a_register_after_two_stack_times_keeps_its_guest_slot() {
+        let mut sig = crate::shims::coremedia::decompression_output_signature();
+        sig.params.push(Shape::Scalar(T::UnsignedDoubleword));
+        sig.host_leaves.push(vec![T::UnsignedDoubleword]);
+        let spill = [10, 20, 30, 40, 50, 1, 2, 3, 4, 5, 6, 70];
+        let mut buffer = [0; RESULT_BYTES];
+        let guest = guest_arguments(&sig, &spill, &mut buffer).unwrap();
+        assert_eq!(guest.ints, [10, 20, 30, 40, 50, 70]);
+        assert_eq!(guest.stack.len(), 48);
+    }
+
+    #[test]
+    fn a_short_spill_is_refused_rather_than_zeroed() {
+        let signature = crate::shims::coremedia::decompression_output_signature();
+        let mut buffer = [0; RESULT_BYTES];
+        let refused = guest_arguments(&signature, &[1, 2, 3], &mut buffer);
+        assert!(refused.is_err());
+    }
+
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    struct NativeTime {
+        value: i64,
+        timescale: i32,
+        flags: u32,
+        epoch: i64,
+    }
+
+    thread_local! {
+        static CAPTURED: std::cell::RefCell<Vec<u64>> = const { std::cell::RefCell::new(Vec::new()) };
+    }
+
+    unsafe extern "C" fn capture_spill(
+        _guest: u64,
+        _desc: *const ThunkSignature,
+        spill: *const u64,
+        _out: *mut u8,
+    ) {
+        // SAFETY: this test constructs the trampoline with exactly eleven
+        // spill words, and the callback runs synchronously before it returns.
+        let words = unsafe { std::slice::from_raw_parts(spill, 11) };
+        CAPTURED.with(|slot| *slot.borrow_mut() = words.to_vec());
+    }
+
+    #[test]
+    fn native_c_callback_thunk_carries_both_times_in_full() {
+        let signature = crate::shims::coremedia::decompression_output_signature();
+        let thunk = build_typed_with_entry(
+            0x1234,
+            signature.clone(),
+            capture_spill as *const () as usize as u64,
+        )
+        .expect("native ABI supports the callback");
+        let owned_descriptor = std::ptr::from_ref(thunk._signature.as_deref().unwrap());
+        let mut table = ThunkTable::new();
+        let (host, _) = table.insert_typed(signature.clone(), thunk);
+        let stored = &table.typed_by_guest[&0x1234][0].1;
+        assert_eq!(
+            owned_descriptor,
+            std::ptr::from_ref(stored._signature.as_deref().unwrap())
+        );
+        assert_eq!(table.typed_host_for(0x1234, &signature), Some(host));
+        let first = NativeTime {
+            value: 0x0123_4567_89ab_cdef,
+            timescale: 600,
+            flags: 0x1234_5678,
+            epoch: -8,
+        };
+        let second = NativeTime {
+            value: -0x0123_4567_890a_bcde,
+            timescale: -300,
+            flags: 0x9876_5432,
+            epoch: 0x1122_3344_5566_7788,
+        };
+        assert_eq!(size_of::<NativeTime>(), 24);
+        // SAFETY: the generated trampoline declares precisely this host
+        // callback signature, with two native CMTime-layout arguments.
+        let call: extern "C" fn(u64, u64, i32, u32, u64, NativeTime, NativeTime) =
+            unsafe { std::mem::transmute(host as usize) };
+        call(11, 22, -33, 44, 55, first, second);
+        let captured = CAPTURED.with(|slot| slot.borrow().clone());
+        assert_eq!(captured[0], 11);
+        assert_eq!(captured[1], 22);
+        assert_eq!(captured[3] as u32, 44);
+        assert_eq!(captured[4], 55);
+        // Signed 32-bit callback parameters only promise their low 32 bits.
+        assert_eq!(captured[2] as u32 as i32, -33);
+        let mut expected = Vec::new();
+        for time in [first, second] {
+            expected.extend_from_slice(&[
+                time.value as u64,
+                u64::from(time.timescale as u32) | (u64::from(time.flags) << 32),
+                time.epoch as u64,
+            ]);
+        }
+        assert_eq!(&captured[5..], expected.as_slice());
+        let mut buffer = [0; RESULT_BYTES];
+        let guest = guest_arguments(&signature, &captured, &mut buffer).unwrap();
+        assert_eq!(guest.ints.len(), 5);
+        let expected_bytes: Vec<u8> = expected.into_iter().flat_map(u64::to_le_bytes).collect();
+        assert_eq!(guest.stack, expected_bytes);
+    }
+
+    #[test]
+    fn typed_and_generic_thunks_cannot_be_confused_in_the_table() {
+        let signature = crate::shims::coremedia::decompression_output_signature();
+        let typed = build_typed(0x1234, signature.clone()).unwrap();
+        let generic = build(0x1234).unwrap();
+        let mut table = ThunkTable::new();
+        let (typed_host, _) = table.insert_typed(signature.clone(), typed);
+        let (generic_host, _) = table.insert(generic);
+        assert_ne!(typed_host, generic_host);
+        assert_eq!(table.typed_host_for(0x1234, &signature), Some(typed_host));
+        assert_eq!(table.host_for(0x1234), Some(generic_host));
+        assert_eq!(table.guest_for(typed_host), Some(0x1234));
+        assert_eq!(table.guest_for(generic_host), Some(0x1234));
+        assert_eq!(table.len(), 2);
+        assert_eq!(table.view().count, 2);
+    }
+
+    #[test]
+    fn typed_cache_distinguishes_exact_signatures_for_one_guest_address() {
+        let original = crate::shims::coremedia::decompression_output_signature();
+        let mut changed_params = original.params.clone();
+        // A different signedness is still a different callback prototype even
+        // if the two machine register layouts happen to be identical.
+        changed_params[3] = Shape::Scalar(T::SignedWord);
+        let changed = ThunkSignature::new(changed_params, None).unwrap();
+        let mut table = ThunkTable::new();
+        let (first, _) = table.insert_typed(
+            original.clone(),
+            build_typed(0x1234, original.clone()).unwrap(),
+        );
+        assert_eq!(table.typed_host_for(0x1234, &original), Some(first));
+        assert_eq!(table.typed_host_for(0x1234, &original.clone()), Some(first));
+        assert_eq!(table.typed_host_for(0x1234, &changed), None);
+        let (second, _) = table.insert_typed(
+            changed.clone(),
+            build_typed(0x1234, changed.clone()).unwrap(),
+        );
+        assert_ne!(first, second);
+        assert_eq!(table.typed_host_for(0x1234, &changed), Some(second));
+        assert_eq!(table.guest_for(first), Some(0x1234));
+        assert_eq!(table.guest_for(second), Some(0x1234));
+        assert_eq!(table.len(), 2);
+    }
+
+    #[test]
+    fn a_racing_duplicate_thunk_does_not_replace_the_first() {
+        let signature = crate::shims::coremedia::decompression_output_signature();
+        let mut table = ThunkTable::new();
+        let (generic, kept) = table.insert(build(0x1234).unwrap());
+        assert!(kept);
+        let (again, kept) = table.insert(build(0x1234).unwrap());
+        assert!(!kept);
+        assert_eq!(again, generic);
+        let (typed, kept) = table.insert_typed(
+            signature.clone(),
+            build_typed(0x1234, signature.clone()).unwrap(),
+        );
+        assert!(kept);
+        let (again, kept) =
+            table.insert_typed(signature.clone(), build_typed(0x1234, signature).unwrap());
+        assert!(!kept);
+        assert_eq!(again, typed);
+        // Only the kept thunks are reachable from their host addresses.
+        assert_eq!(table.len(), 2);
+        assert_eq!(table.view().count, 2);
+    }
+
+    thread_local! {
+        static REENTER_THUNK: Cell<u64> = const { Cell::new(0) };
+        static REENTER_DEPTH: Cell<usize> = const { Cell::new(0) };
+        static REENTER_SPILLS: std::cell::RefCell<Vec<(usize, Vec<u64>)>> = const {
+            std::cell::RefCell::new(Vec::new())
+        };
+    }
+
+    unsafe extern "C" fn capture_reentrant(
+        _guest: u64,
+        _desc: *const ThunkSignature,
+        spill: *const u64,
+        _out: *mut u8,
+    ) {
+        // SAFETY: the seven-argument callback always has eleven spill words.
+        let words = unsafe { std::slice::from_raw_parts(spill, 11) }.to_vec();
+        let depth = REENTER_DEPTH.with(|slot| slot.replace(slot.get() + 1));
+        if depth == 0 {
+            let host = REENTER_THUNK.with(Cell::get);
+            // SAFETY: this is the same typed trampoline currently executing.
+            let call: extern "C" fn(u64, u64, i32, u32, u64, NativeTime, NativeTime) =
+                unsafe { std::mem::transmute(host as usize) };
+            let time = NativeTime {
+                value: 111,
+                timescale: 222,
+                flags: 333,
+                epoch: 444,
+            };
+            call(10, 20, 30, 40, 50, time, time);
+        }
+        REENTER_SPILLS.with(|slot| slot.borrow_mut().push((depth, words)));
+        REENTER_DEPTH.with(|slot| slot.set(depth));
+    }
+
+    #[test]
+    fn typed_callback_trampoline_can_reenter_itself_without_clobbering_spills() {
+        let signature = crate::shims::coremedia::decompression_output_signature();
+        let thunk = build_typed_with_entry(
+            0x1234,
+            signature,
+            capture_reentrant as *const () as usize as u64,
+        )
+        .unwrap();
+        REENTER_THUNK.with(|slot| slot.set(thunk.host));
+        REENTER_SPILLS.with(|slot| slot.borrow_mut().clear());
+        // SAFETY: the generated thunk declares this exact native callback ABI.
+        let call: extern "C" fn(u64, u64, i32, u32, u64, NativeTime, NativeTime) =
+            unsafe { std::mem::transmute(thunk.host as usize) };
+        let outer = NativeTime {
+            value: 555,
+            timescale: 666,
+            flags: 777,
+            epoch: 888,
+        };
+        call(1, 2, 3, 4, 5, outer, outer);
+        let samples = REENTER_SPILLS.with(|slot| slot.borrow().clone());
+        assert_eq!(samples.len(), 2);
+        assert_eq!(samples[0].0, 1);
+        assert_eq!(samples[1].0, 0);
+        assert_eq!(&samples[0].1[..5], &[10, 20, 30, 40, 50]);
+        assert_eq!(&samples[1].1[..5], &[1, 2, 3, 4, 5]);
+        assert_eq!(samples[0].1[5], 111);
+        assert_eq!(samples[0].1[7], 444);
+        assert_eq!(samples[1].1[5], 555);
+        assert_eq!(samples[1].1[7], 888);
+        REENTER_THUNK.with(|slot| slot.set(0));
+    }
+
+    // This fixture needs no Apple SDK or imported libraries. On macOS, the
+    // system compiler can link it; on Linux, Clang and ld64.lld can do so.
+    /// A scratch directory removed when the test ends, pass or fail.
+    struct FixtureDir(std::path::PathBuf);
+
+    impl FixtureDir {
+        fn new() -> Option<Self> {
+            let dir =
+                std::env::temp_dir().join(format!("rosemary-callback-abi-{}", std::process::id()));
+            std::fs::create_dir_all(&dir).ok()?;
+            Some(FixtureDir(dir))
+        }
+    }
+
+    impl Drop for FixtureDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn macho_callback_fixture(dir: &std::path::Path) -> Option<std::path::PathBuf> {
+        use std::process::Command;
+
+        const SOURCE: &str = r#"
+            typedef unsigned long long U64;
+            typedef struct { long long value; int timescale; unsigned flags; long long epoch; } Time;
+            typedef void (*Callback)(void*, void*, int, unsigned, void*, Time, Time);
+            static volatile U64 observed[2][13];
+            __attribute__((used,noinline)) U64 guest_callback(void* refcon, void* frame, int status,
+                                                unsigned flags, void* image, Time pts, Time duration) {
+                if ((U64)refcon == 0xfeedfaceULL)
+                    return observed[(U64)frame / 13][(U64)frame % 13];
+                volatile U64* row = observed[(U64)refcon == 101 ? 1 : 0];
+                row[0] = (U64)refcon;
+                row[1] = (U64)frame;
+                row[2] = (U64)(unsigned)status;
+                row[3] = flags;
+                row[4] = (U64)image;
+                row[5] = (U64)pts.value;
+                row[6] = (U64)(unsigned)pts.timescale;
+                row[7] = pts.flags;
+                row[8] = (U64)pts.epoch;
+                row[9] = (U64)duration.value;
+                row[10] = (U64)(unsigned)duration.timescale;
+                row[11] = duration.flags;
+                row[12] = (U64)duration.epoch;
+                if ((U64)refcon == 11) {
+                    Time a = {-999, 123, 0xff000011U, 4444};
+                    Time b = {4321, -432, 0x12345678U, -123};
+                    ((Callback)frame)((void*)101, (void*)202, -303, 404, (void*)505, a, b);
+                }
+                return 0;
+            }
+        "#;
+        let src = dir.join("callback.c");
+        let obj = dir.join("callback.o");
+        let exe = dir.join("callback");
+        std::fs::write(&src, SOURCE).ok()?;
+        if cfg!(target_os = "macos") {
+            let status = Command::new("cc")
+                .args(["-arch", "x86_64", "-O1", "-Wl,-e,_guest_callback", "-o"])
+                .arg(&exe)
+                .arg(&src)
+                .status()
+                .ok()?;
+            return status.success().then_some(exe);
+        }
+        let compiled = Command::new("clang")
+            .args([
+                "-target",
+                "x86_64-apple-macos10.15",
+                "-O1",
+                "-fno-stack-protector",
+                "-c",
+                "-o",
+            ])
+            .arg(&obj)
+            .arg(&src)
+            .status()
+            .ok()?;
+        if !compiled.success() {
+            return None;
+        }
+        let linker =
+            std::env::var_os("ROSEMARY_TEST_LD64_LLD").unwrap_or_else(|| "ld64.lld".into());
+        let linked = Command::new(linker)
+            .args([
+                "-arch",
+                "x86_64",
+                "-platform_version",
+                "macos",
+                "10.15",
+                "10.15",
+                "-e",
+                "_guest_callback",
+                "-o",
+            ])
+            .arg(&exe)
+            .arg(&obj)
+            .status()
+            .ok()?;
+        linked.success().then_some(exe)
+    }
+
+    // A Clang-compiled caller, rather than Rust's extern "C" lowering,
+    // validates the host macOS ABI at the generated callee boundary.
+    #[cfg(target_os = "macos")]
+    fn native_c_caller_fixture(dir: &std::path::Path) -> Option<(*mut libc::c_void, usize)> {
+        use std::ffi::CString;
+        use std::process::Command;
+
+        const SOURCE: &str = r#"
+            typedef struct { long long value; int timescale; unsigned flags; long long epoch; } Time;
+            typedef void (*Callback)(void*, void*, int, unsigned, void*, Time, Time);
+            __attribute__((visibility("default"))) void invoke_guest_callback(void *thunk, int which) {
+                Time first = { 0x0123456789abcdefLL, -360, 0xabcd1234U, -555 };
+                Time second = { -0x1234567890abcdeLL, 777, 0x80000001U, 0x1122334455667788LL };
+                Callback cb = (Callback)thunk;
+                if (!which) {
+                    cb((void*)11, thunk, -33, 0x87654321U, (void*)55, first, second);
+                } else {
+                    cb((void*)12, (void*)23, -34, 0x13572468U, (void*)56, second, first);
+                }
+            }
+        "#;
+        let source = dir.join("native-c-caller.c");
+        let library = dir.join("native-c-caller.dylib");
+        std::fs::write(&source, SOURCE).expect("write C callback caller");
+        let arch = match std::env::consts::ARCH {
+            "aarch64" => "arm64",
+            "x86_64" => "x86_64",
+            other => panic!("unsupported macOS callback test host architecture: {other}"),
+        };
+        let status = Command::new("cc")
+            .args(["-arch", arch, "-dynamiclib", "-o"])
+            .arg(&library)
+            .arg(&source)
+            .status()
+            .ok()?;
+        if !status.success() {
+            return None;
+        }
+        let dylib_path = CString::new(library.to_str().unwrap()).unwrap();
+        // SAFETY: path and symbol are valid NUL-terminated strings.
+        let handle = unsafe { libc::dlopen(dylib_path.as_ptr(), libc::RTLD_NOW) };
+        assert!(!handle.is_null(), "load native macOS C callback caller");
+        let symbol = CString::new("invoke_guest_callback").unwrap();
+        // SAFETY: the library owns this exported function until dlclose below.
+        let entry = unsafe { libc::dlsym(handle, symbol.as_ptr()) };
+        assert!(!entry.is_null(), "find native macOS callback caller entry");
+        Some((handle, entry as usize))
+    }
+
+    #[test]
+    #[cfg_attr(
+        not(target_os = "macos"),
+        ignore = "requires Clang and ld64.lld: run explicitly with --ignored and ROSEMARY_TEST_LD64_LLD"
+    )]
+    fn native_callback_enters_a_real_emulated_macho_guest_with_full_times() {
+        // Runs by default only on macOS, where a missing x86_64 toolchain is the
+        // host's limit and not a failure. Elsewhere it runs only when asked for.
+        let dir = FixtureDir::new();
+        let Some(path) = dir.as_ref().and_then(|d| macho_callback_fixture(&d.0)) else {
+            if !cfg!(target_os = "macos") {
+                panic!(
+                    "Mach-O fixture compilation failed: provide Clang and ROSEMARY_TEST_LD64_LLD"
+                );
+            }
+            eprintln!("skipping: cannot build an x86_64 Mach-O fixture");
+            return;
+        };
+        let path = path.to_str().unwrap();
+        let program = crate::Program::load_executable(path, &[]).expect("load guest Mach-O");
+        let entry = program.report.root().unwrap().entry.expect("Mach-O entry");
+        let vm = crate::Vm::new(program, path, &[]).expect("guest VM");
+        // Counted from here, so thunks the VM makes for itself do not matter.
+        let thunks_before = vm.thunks();
+        let signature = crate::shims::coremedia::decompression_output_signature();
+        let host = vm
+            .typed_thunk_for(entry, signature.clone())
+            .expect("typed guest callback");
+
+        // Guest-visible callback values may contain a native thunk created
+        // earlier for a generic or incompatible signature. Re-substituting
+        // them must recover the same guest entry and use the requested ABI.
+        use crate::abi::Callbacks as _;
+        let generic = vm.thunk_for(entry).expect("generic guest callback");
+        assert_ne!(generic, host);
+        assert_eq!(
+            vm.substitute_typed("roundtrip", generic, signature.clone())
+                .unwrap(),
+            host
+        );
+        assert_eq!(
+            vm.substitute_typed("roundtrip", host, signature.clone())
+                .unwrap(),
+            host
+        );
+        let mut alternate_params = signature.params.clone();
+        alternate_params[3] = Shape::Scalar(T::SignedWord);
+        let alternate = ThunkSignature::new(alternate_params, None).unwrap();
+        let other_host = vm
+            .substitute_typed("roundtrip", host, alternate.clone())
+            .expect("alternate typed guest callback");
+        assert_ne!(other_host, host);
+        assert_ne!(other_host, generic);
+        assert_eq!(
+            vm.substitute_typed("roundtrip", generic, alternate.clone())
+                .unwrap(),
+            other_host
+        );
+        assert_eq!(
+            vm.substitute_typed("roundtrip", other_host, signature.clone())
+                .unwrap(),
+            host
+        );
+        assert_eq!(
+            vm.substitute_typed("roundtrip", other_host, alternate.clone())
+                .unwrap(),
+            other_host
+        );
+        assert_eq!(vm.guest_behind_thunk(other_host), Some(entry));
+        // And back: a typed thunk handed to a generic callback slot becomes
+        // the generic thunk, never a typed one called with generic registers.
+        assert_eq!(vm.substitute("roundtrip", host).unwrap(), generic);
+        assert_eq!(vm.substitute("roundtrip", other_host).unwrap(), generic);
+        assert_eq!(vm.substitute("roundtrip", generic).unwrap(), generic);
+        assert_eq!(vm.thunks() - thunks_before, 3);
+        assert_eq!(
+            vm.substitute_typed("roundtrip", 0, alternate.clone())
+                .unwrap(),
+            0
+        );
+        let native = std::ptr::from_ref(&vm) as u64;
+        assert_eq!(
+            vm.substitute_typed("roundtrip", native, alternate).unwrap(),
+            native
+        );
+
+        // SAFETY: the C caller has exactly the trampoline's native signature.
+        #[cfg(not(target_os = "macos"))]
+        let callback: extern "C" fn(u64, u64, i32, u32, u64, NativeTime, NativeTime) =
+            unsafe { std::mem::transmute(host as usize) };
+        #[cfg(target_os = "macos")]
+        let Some((native_c_handle, native_c_addr)) =
+            native_c_caller_fixture(std::path::Path::new(path).parent().unwrap())
+        else {
+            eprintln!("skipping: cannot build the native C callback caller");
+            return;
+        };
+        #[cfg(target_os = "macos")]
+        let native_c_call: unsafe extern "C" fn(u64, i32) =
+            unsafe { std::mem::transmute(native_c_addr) };
+        let first = NativeTime {
+            value: 0x0123_4567_89ab_cdef,
+            timescale: -360,
+            flags: 0xabcd_1234,
+            epoch: -555,
+        };
+        let second = NativeTime {
+            value: -0x0123_4567_890a_bcde,
+            timescale: 777,
+            flags: 0x8000_0001,
+            epoch: 0x1122_3344_5566_7788,
+        };
+        #[cfg(target_os = "macos")]
+        with_current(&vm, || unsafe { native_c_call(host, 0) });
+        #[cfg(not(target_os = "macos"))]
+        with_current(&vm, || {
+            callback(11, host, -33, 0x8765_4321, 55, first, second)
+        });
+        let expected = [
+            11,
+            host,
+            (-33i32 as u32) as u64,
+            0x8765_4321,
+            55,
+            first.value as u64,
+            (first.timescale as u32) as u64,
+            first.flags as u64,
+            first.epoch as u64,
+            second.value as u64,
+            (second.timescale as u32) as u64,
+            second.flags as u64,
+            second.epoch as u64,
+        ];
+        for (index, want) in expected.iter().enumerate() {
+            let got = vm
+                .call(entry, &[0xfeedface, index as u64])
+                .expect("read guest capture");
+            assert_eq!(got, *want, "outer guest CMTime word {index}");
+        }
+        let nested = [
+            101,
+            202,
+            (-303i32 as u32) as u64,
+            404,
+            505,
+            (-999i64) as u64,
+            123,
+            0xff00_0011,
+            4444,
+            4321,
+            (-432i32 as u32) as u64,
+            0x1234_5678,
+            (-123i64) as u64,
+        ];
+        for (index, want) in nested.iter().enumerate() {
+            let got = vm
+                .call(entry, &[0xfeedface, (13 + index) as u64])
+                .expect("read nested guest capture");
+            assert_eq!(got, *want, "nested guest CMTime word {index}");
+        }
+
+        // A host callback thread has no preexisting guest stack or VM TLS.
+        // Enter the same trampoline from a second native thread and check
+        // every field again after that thread has exited.
+        std::thread::scope(|scope| {
+            scope
+                .spawn(|| {
+                    #[cfg(target_os = "macos")]
+                    with_current(&vm, || unsafe { native_c_call(host, 1) });
+                    #[cfg(not(target_os = "macos"))]
+                    with_current(&vm, || {
+                        callback(12, 23, -34, 0x1357_2468, 56, second, first)
+                    });
+                })
+                .join()
+                .expect("native callback worker");
+        });
+        let threaded = [
+            12,
+            23,
+            (-34i32 as u32) as u64,
+            0x1357_2468,
+            56,
+            second.value as u64,
+            (second.timescale as u32) as u64,
+            second.flags as u64,
+            second.epoch as u64,
+            first.value as u64,
+            (first.timescale as u32) as u64,
+            first.flags as u64,
+            first.epoch as u64,
+        ];
+        for (index, want) in threaded.iter().enumerate() {
+            let got = vm
+                .call(entry, &[0xfeedface, index as u64])
+                .expect("read threaded guest capture");
+            assert_eq!(got, *want, "threaded guest CMTime word {index}");
+        }
+        #[cfg(target_os = "macos")]
+        assert_eq!(unsafe { libc::dlclose(native_c_handle) }, 0);
+    }
+
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    struct NativeTwentyFive([u8; 25]);
+
+    unsafe extern "C" fn capture_partial(
+        _guest: u64,
+        desc: *const ThunkSignature,
+        spill: *const u64,
+        _out: *mut u8,
+    ) {
+        // SAFETY: the trampoline owns the descriptor and the synchronous
+        // spill slot it passes here has exactly the declared word count.
+        let words = unsafe {
+            let count: usize = (*desc).host_leaves.iter().map(Vec::len).sum();
+            std::slice::from_raw_parts(spill, count)
+        };
+        CAPTURED.with(|slot| *slot.borrow_mut() = words.to_vec());
+    }
+
+    #[test]
+    fn partial_final_aggregate_word_does_not_copy_padding() {
+        let signature = ThunkSignature::new(
+            vec![Shape::Struct(Aggregate {
+                size: 25,
+                align: 1,
+                leaves: vec![crate::abi::aggregate::Leaf {
+                    ty: T::UnsignedByte,
+                    offset: 0,
+                }],
+            })],
+            None,
+        )
+        .unwrap();
+        let thunk = build_typed_with_entry(
+            0x5678,
+            signature.clone(),
+            capture_partial as *const () as usize as u64,
+        )
+        .unwrap();
+        let mut bytes = [0u8; 25];
+        for (i, byte) in bytes.iter_mut().enumerate() {
+            *byte = i as u8 + 1;
+        }
+        // SAFETY: the generated function declares one 25-byte by-value C
+        // aggregate, which the host ABI passes in memory.
+        let call: extern "C" fn(NativeTwentyFive) =
+            unsafe { std::mem::transmute(thunk.host as usize) };
+        call(NativeTwentyFive(bytes));
+        let captured = CAPTURED.with(|slot| slot.borrow().clone());
+        assert_eq!(captured.len(), 4);
+        // A SysV host loads the whole padded eightbyte, so only the object's
+        // own byte is meaningful there.
+        assert_eq!(captured[3] & 0xff, 25);
+        if cfg!(target_arch = "aarch64") {
+            assert_eq!(captured[3], 25);
+        }
+        let mut buffer = [0u8; RESULT_BYTES];
+        let guest = guest_arguments(&signature, &captured, &mut buffer).unwrap();
+        assert_eq!(&guest.stack[..25], &bytes);
+        assert_eq!(&guest.stack[25..], &[0; 7]);
+    }
+
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    struct NativeMixed {
+        a: i64,
+        b: f64,
+        c: i32,
+        d: i64,
+    }
+
+    // ObjC methods reach `build_typed` through their decoded type encoding, and
+    // one taking a large non-HFA struct is passed by pointer on AAPCS64 and on
+    // the stack on SysV. The argument after it must keep its own slot either way.
+    #[test]
+    fn an_objc_method_with_a_large_struct_argument_reaches_the_guest_intact() {
+        let method = machish::extensions::objc::ObjcMethod {
+            name: "takeMixed:after:".into(),
+            types: "v48@0:8{Mixed=qdiq}16q48".into(),
+            imp: 0x9abc,
+        };
+        let signature = crate::objc::thunk_signature(&method).expect("supported encoding");
+        let thunk = build_typed_with_entry(
+            0x9abc,
+            signature.clone(),
+            capture_partial as *const () as usize as u64,
+        )
+        .unwrap();
+        let mixed = NativeMixed {
+            a: -0x0102_0304_0506_0708,
+            b: 1.5,
+            c: -9,
+            d: 0x1122_3344_5566_7788,
+        };
+        // SAFETY: the trampoline was built from exactly this method's encoding.
+        let call: extern "C" fn(u64, u64, NativeMixed, i64) =
+            unsafe { std::mem::transmute(thunk.host as usize) };
+        call(0x5e1f, 0xc0de, mixed, -77);
+        let captured = CAPTURED.with(|slot| slot.borrow().clone());
+        let mut buffer = [0u8; RESULT_BYTES];
+        let guest = guest_arguments(&signature, &captured, &mut buffer).unwrap();
+        assert_eq!(guest.ints, [0x5e1f, 0xc0de, (-77i64) as u64]);
+        assert!(guest.sse.is_empty());
+        let mut expected = Vec::new();
+        expected.extend_from_slice(&mixed.a.to_le_bytes());
+        expected.extend_from_slice(&mixed.b.to_le_bytes());
+        expected.extend_from_slice(&mixed.c.to_le_bytes());
+        expected.extend_from_slice(&[0; 4]);
+        expected.extend_from_slice(&mixed.d.to_le_bytes());
+        assert_eq!(guest.stack.len(), 32);
+        // The padding after `c` is the caller's; only the members must match.
+        assert_eq!(&guest.stack[..20], &expected[..20]);
+        assert_eq!(&guest.stack[24..], &expected[24..]);
     }
 }

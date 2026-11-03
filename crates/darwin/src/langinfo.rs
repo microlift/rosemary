@@ -86,9 +86,23 @@ pub unsafe extern "C" fn nl_langinfo(item: c_int) -> *mut c_char {
     answer
 }
 
+/// `char *nl_langinfo_l(nl_item item, locale_t loc)`
+///
+/// # Safety
+///
+/// `loc` is a `locale_t` this process obtained, `LC_GLOBAL_LOCALE`, or null
+/// for the C locale. The answer belongs to `loc` and a caller must not write
+/// to it.
+pub unsafe extern "C" fn nl_langinfo_l(item: c_int, loc: libc::locale_t) -> *mut c_char {
+    let _switched = crate::xlocale::switch(loc);
+    // SAFETY: a scalar, answered for the locale just selected.
+    unsafe { nl_langinfo(item) }
+}
+
 exports::exports! {
     functions {
         "nl_langinfo" => nl_langinfo,
+        "nl_langinfo_l" => nl_langinfo_l,
     }
 }
 
@@ -114,5 +128,19 @@ mod tests {
         assert_eq!(ask(50), ".");
         assert_eq!(ask(D_MD_ORDER), "md");
         assert_eq!(ask(1000), "");
+    }
+
+    #[test]
+    fn nl_langinfo_l_answers_for_the_named_locale() {
+        let at = |item, loc| {
+            // SAFETY: a scalar and a locale this test owns, or null.
+            unsafe { CStr::from_ptr(nl_langinfo_l(item, loc)) }
+                .to_string_lossy()
+                .into_owned()
+        };
+        // Darwin's null `locale_t` is the C locale.
+        assert_eq!(at(0, std::ptr::null_mut()), "US-ASCII");
+        assert_eq!(at(D_MD_ORDER, std::ptr::null_mut()), "md");
+        assert_eq!(at(21, crate::xlocale::global_locale()), "January");
     }
 }

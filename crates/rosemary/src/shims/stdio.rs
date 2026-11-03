@@ -8,6 +8,7 @@ use super::printf::{
 };
 use super::{bad_pointer, set_int_return};
 use crate::abi::{AbiError, GuestMemory, Result};
+use crate::shims::bind;
 
 /// Where a conversion's arguments are.
 #[derive(Clone, Copy)]
@@ -263,22 +264,22 @@ pub fn vwprintf(symbol: &str, ctx: &mut RegisterContext, mem: &mut dyn GuestMemo
 /// The shim for `name`, if this family has one.
 pub fn shim_for(name: &str) -> Option<super::Shim> {
     Some(match name {
-        "fscanf" => fscanf,
-        "scanf" => scanf,
-        "vfscanf" => vfscanf,
-        "vscanf" => vscanf,
-        "fscanf_l" => fscanf_l,
-        "scanf_l" => scanf_l,
-        "vfscanf_l" => vfscanf_l,
-        "vscanf_l" => vscanf_l,
-        "fprintf_l" => fprintf_l,
-        "printf_l" => printf_l,
-        "vfprintf_l" => vfprintf_l,
-        "vprintf_l" => vprintf_l,
-        "fwprintf" => fwprintf,
-        "wprintf" => wprintf,
-        "vfwprintf" => vfwprintf,
-        "vwprintf" => vwprintf,
+        "fscanf" => bind!("fscanf" => fscanf),
+        "scanf" => bind!("scanf" => scanf),
+        "vfscanf" => bind!("vfscanf" => vfscanf),
+        "vscanf" => bind!("vscanf" => vscanf),
+        "fscanf_l" => bind!("fscanf_l" => fscanf_l),
+        "scanf_l" => bind!("scanf_l" => scanf_l),
+        "vfscanf_l" => bind!("vfscanf_l" => vfscanf_l),
+        "vscanf_l" => bind!("vscanf_l" => vscanf_l),
+        "fprintf_l" => bind!("fprintf_l" => fprintf_l),
+        "printf_l" => bind!("printf_l" => printf_l),
+        "vfprintf_l" => bind!("vfprintf_l" => vfprintf_l),
+        "vprintf_l" => bind!("vprintf_l" => vprintf_l),
+        "fwprintf" => bind!("fwprintf" => fwprintf),
+        "wprintf" => bind!("wprintf" => wprintf),
+        "vfwprintf" => bind!("vfwprintf" => vfwprintf),
+        "vwprintf" => bind!("vwprintf" => vwprintf),
         _ => return None,
     })
 }

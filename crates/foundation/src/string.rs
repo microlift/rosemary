@@ -240,6 +240,25 @@ unsafe extern "C" fn string_with_characters(
     unsafe { api::CFAutorelease(string) as Id }
 }
 
+/// `-initWithCharacters:length:`, which owns its answer as every `-init...`
+/// does; [`string_with_characters`] autoreleases its.
+unsafe extern "C" fn init_with_characters(
+    receiver: Id,
+    _sel: Sel,
+    chars: *const u16,
+    count: usize,
+) -> Id {
+    objc::arc::release(receiver);
+    // SAFETY: the caller says `chars` covers `count` UTF-16 units.
+    unsafe {
+        api::CFStringCreateWithCharacters(
+            std::ptr::null(),
+            chars,
+            count as corefoundation::base::CFIndex,
+        ) as Id
+    }
+}
+
 unsafe extern "C" fn string_with_cstring_encoding(
     _class: Id,
     _sel: Sel,
@@ -1637,6 +1656,15 @@ unsafe extern "C" fn string_with_string(_class: Id, _sel: Sel, other: Id) -> Id 
     unsafe { api::CFAutorelease(s) as Id }
 }
 
+/// `-initWithString:`, which owns its answer as every `-init...` does;
+/// [`string_with_string`] autoreleases its.
+unsafe extern "C" fn init_with_string(receiver: Id, _sel: Sel, other: Id) -> Id {
+    // SAFETY: an `NSString`, or nil.
+    let text = unsafe { bytes(other) };
+    objc::arc::release(receiver);
+    corefoundation::string::from_bytes(&text, false) as Id
+}
+
 unsafe extern "C" fn mutable_string_with_string(_class: Id, _sel: Sel, other: Id) -> Id {
     let bytes = unsafe { bytes(other) };
     let s = corefoundation::string::new_mutable();
@@ -1770,12 +1798,12 @@ pub(crate) fn install() {
         "pathWithComponents:" => path_with_components, c"@24@0:8@16";
     });
     methods!(class, {
-        "initWithString:" => string_with_string, c"@24@0:8@16";
+        "initWithString:" => init_with_string, c"@24@0:8@16";
         // `-initWithCharacters:length:` on a freshly allocated `NSString` answers
         // a new object rather than filling the receiver in. That is what every
         // other initializer here does, and what the immutable storage allows:
         // `corefoundation::string` lays a string out at creation.
-        "initWithCharacters:length:" => string_with_characters, c"@32@0:8^S16Q24";
+        "initWithCharacters:length:" => init_with_characters, c"@32@0:8^S16Q24";
     });
 }
 

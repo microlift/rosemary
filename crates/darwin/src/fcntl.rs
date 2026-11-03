@@ -148,6 +148,9 @@ pub mod oflag {
     pub const O_CLOEXEC: i32 = 0x0100_0000;
     /// Execute-only open; Linux has no separate execute access mode.
     pub const O_EXEC: i32 = 0x4000_0000;
+    /// Opened only to watch for events. Its one difference from a read-only
+    /// open is that it does not hold the volume mounted.
+    pub const O_EVTONLY: i32 = 0x8000;
 }
 
 pub fn creates(flags: i32) -> bool {
@@ -157,7 +160,7 @@ pub fn creates(flags: i32) -> bool {
 /// The guest's `open` flags as the host's.
 ///
 /// Bit for bit on macOS. Elsewhere a translation, and one that drops nothing silently:
-/// a Darwin-only flag with no host equivalent - `O_SHLOCK`, `O_EVTONLY`, `O_SYMLINK` -
+/// a Darwin-only flag with no host equivalent - `O_SHLOCK`, `O_SYMLINK` -
 /// is reported rather than ignored, because a guest that asked for a shared lock and
 /// did not get one has been told it succeeded.
 #[cfg(not(target_os = "macos"))]
@@ -185,6 +188,8 @@ const PAIRS: &[(i32, libc::c_int)] = &[
     (oflag::O_CLOEXEC, libc::O_CLOEXEC),
     // Linux represents an execute-only open as a normal read-only descriptor.
     (oflag::O_EXEC, 0),
+    // A read-only descriptor, which is what a watch needs here.
+    (oflag::O_EVTONLY, 0),
 ];
 
 #[cfg(not(target_os = "macos"))]
@@ -367,6 +372,7 @@ pub mod entry {
         let rc = unsafe { libc::fcntl(fd, host_command, arg) };
         if rc >= 0 && matches!(command, cmd::F_DUPFD | cmd::F_DUPFD_CLOEXEC) {
             crate::net::sockopt::inherit_sigpipe_suppression(fd, rc);
+            crate::kqueue::duplicate(fd, rc);
         }
         match command == cmd::F_GETFL && rc >= 0 {
             true => flags_to_guest(rc),

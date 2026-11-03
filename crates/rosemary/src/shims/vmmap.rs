@@ -4,6 +4,7 @@ use static_init::dynamic;
 use crate::abi::{GuestMemory, Result};
 
 use super::set_int_return;
+use crate::shims::bind;
 
 /// `MAP_JIT`. Not in the `libc` crate's Darwin bindings, and it is the flag this
 /// module exists to remove, so it is spelled out with the value from `mman.h`.
@@ -151,12 +152,10 @@ pub fn contains(va: u64) -> bool {
 }
 
 /// The shim for `name`, if this module has one.
-pub fn shim_for(
-    name: &str,
-) -> Option<fn(&str, &mut RegisterContext, &mut dyn GuestMemory) -> Result<()>> {
+pub fn shim_for(name: &str) -> Option<super::Shim> {
     match name {
-        "mmap" => Some(mmap),
-        "mprotect" => Some(mprotect),
+        "mmap" => Some(bind!("mmap" => mmap)),
+        "mprotect" => Some(bind!("mprotect" => mprotect)),
         _ => None,
     }
 }

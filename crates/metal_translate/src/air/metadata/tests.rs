@@ -91,6 +91,7 @@ fn decodes_a_fragment_stage_interface_from_metadata() {
             field: Some(0),
             binding: StageBinding::RenderTarget { index: 0 },
             name: None,
+            invariant: false,
         }]
     );
     assert_eq!(

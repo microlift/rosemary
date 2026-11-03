@@ -19,6 +19,7 @@ use std::time::Duration;
 pub const MAX_MESSAGE: usize = 64 * 1024;
 
 fn directory() -> Option<PathBuf> {
+    let _host = crate::syscall::ScopedHostSyscallContext::new();
     Some(server::client::directory()?.join("applications"))
 }
 

@@ -10,6 +10,9 @@ pub use synthetic::SyntheticDylib;
 #[cfg(feature = "std")]
 pub use native::NativeDylibProvider;
 
+use alloc::string::String;
+use alloc::vec::Vec;
+
 use crate::fixups::{LibraryRef, SymbolRef};
 use crate::raw::Word;
 
@@ -84,6 +87,16 @@ pub trait SymbolProvider {
         false
     }
 
+    /// The real images this provider's stand-in for `install_name` re-exports,
+    /// as `LC_REEXPORT_DYLIB` would name them: the loader fetches them in its
+    /// place, and a two-level import of `install_name` this provider does not
+    /// define is looked for in them next.
+    ///
+    /// Empty unless [`stands_for`](Self::stands_for) is true for the name.
+    fn reexports(&self, _install_name: &str) -> Vec<String> {
+        Vec::new()
+    }
+
     /// The address `sym` names, or `None` if this provider does not define it.
     fn resolve(&self, sym: &SymbolRef<'_>) -> Option<Resolved>;
 
@@ -103,11 +116,36 @@ pub fn eager_binding_shims() -> SyntheticDylib {
 /// A two-level reference consults only providers that claim its library; a flat
 /// or special reference consults all of them in order, first match winning.
 pub fn resolve_in(providers: &[&dyn SymbolProvider], sym: &SymbolRef<'_>) -> Option<Resolved> {
+    resolve_at_depth(providers, sym, 0)
+}
+
+/// How many stand-in re-export hops to follow before giving up on a cycle.
+const MAX_REEXPORT_DEPTH: usize = 16;
+
+fn resolve_at_depth(
+    providers: &[&dyn SymbolProvider],
+    sym: &SymbolRef<'_>,
+    depth: usize,
+) -> Option<Resolved> {
     match sym.library {
-        LibraryRef::InstallName(name) => providers
-            .iter()
-            .filter(|p| p.provides(name))
-            .find_map(|p| p.resolve(sym)),
+        LibraryRef::InstallName(name) => {
+            providers.iter().filter(|p| p.provides(name)).find_map(|p| {
+                p.resolve(sym).or_else(|| {
+                    // Where the stand-in sits in the chain, as dyld searches an
+                    // umbrella's re-exports right after the umbrella itself.
+                    if depth >= MAX_REEXPORT_DEPTH {
+                        return None;
+                    }
+                    p.reexports(name).iter().find_map(|target| {
+                        let forwarded = SymbolRef {
+                            library: LibraryRef::InstallName(target),
+                            ..*sym
+                        };
+                        resolve_at_depth(providers, &forwarded, depth + 1)
+                    })
+                })
+            })
+        }
         // Everything else - flat lookup, weak lookup, an ordinal we could not
         // match to a load command - is a search across all providers. For an
         // unknown ordinal that is a deliberate softening: the alternative is

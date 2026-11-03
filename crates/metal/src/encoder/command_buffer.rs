@@ -55,6 +55,8 @@ pub(super) unsafe extern "C" fn new_command_buffer(receiver: Id, _sel: Sel) -> I
             pool,
             command_buffer,
             fence,
+            batches: Vec::new(),
+            waits: Vec::new(),
             descriptor_pools: Vec::new(),
             retained: Vec::new(),
             retained_set: AddressSet::default(),
@@ -71,6 +73,7 @@ pub(super) unsafe extern "C" fn new_command_buffer(receiver: Id, _sel: Sel) -> I
             completion: Arc::new(CommandCompletion::new()),
             recording: true,
             profile,
+            occlusion: Occlusion::default(),
         },
     ))
 }
@@ -103,6 +106,17 @@ pub(super) unsafe extern "C" fn command_buffer_dealloc(receiver: Id, _sel: Sel) 
             gpu.release_secondary(secondary);
         }
         // Never submitted, so nothing allocated from the pool is pending.
+        if let Some(first) = command.batches.first().map(|batch| batch.command_buffer) {
+            let mut split: Vec<_> = command
+                .batches
+                .drain(1..)
+                .map(|batch| batch.command_buffer)
+                .collect();
+            split.push(std::mem::replace(&mut command.command_buffer, first));
+            command.batches.clear();
+            // SAFETY: as above; all were allocated from this pool.
+            unsafe { gpu.device.free_command_buffers(command.pool, &split) };
+        }
         if command.secondary {
             gpu.release_secondary(gpu::SecondaryContext {
                 pool: command.pool,
@@ -119,6 +133,9 @@ pub(super) unsafe extern "C" fn command_buffer_dealloc(receiver: Id, _sel: Sel) 
             &mut command.timestamps,
             vk::QueryPool::null(),
         ));
+        for pool in command.occlusion.take_pools() {
+            gpu.release_occlusion_pool(pool);
+        }
         command.retained.clear();
         for drawable in command.presents.drain(..) {
             crate::present::complete(drawable.as_id());
@@ -201,11 +218,22 @@ pub(super) unsafe extern "C" fn commit(receiver: Id, _sel: Sel) {
     // is still recording, so a failure between the two would otherwise strand
     // the pool, the fence, the descriptor pools, the retained objects and
     // every handler for good.
+    let mut batches = std::mem::take(&mut command.batches);
+    batches.push(gpu::Batch {
+        waits: std::mem::take(&mut command.waits),
+        command_buffer: command.command_buffer,
+        signals: Vec::new(),
+    });
     let mut submission = Some(Submission {
         gpu,
         timestamps: std::mem::replace(&mut command.timestamps, vk::QueryPool::null()),
+        occlusion_pools: command.occlusion.take_pools(),
         pool: command.pool,
-        command_buffer: command.command_buffer,
+        command_buffer: batches[0].command_buffer,
+        split_buffers: batches[1..]
+            .iter()
+            .map(|batch| batch.command_buffer)
+            .collect(),
         fence: command.fence,
         descriptor_pools: std::mem::take(&mut command.descriptor_pools),
         retained: {
@@ -246,7 +274,7 @@ pub(super) unsafe extern "C" fn commit(receiver: Id, _sel: Sel) {
     gpu.submissions.start(gpu);
     let completion = Arc::clone(&command.completion);
     let submitted = stats::timed(Counter::SubmitMicros, || {
-        gpu.submit_ordered(command.command_buffer, command.fence, |serial| {
+        gpu.submit_ordered(&batches, command.fence, |serial| {
             let pending = submission.as_mut().expect("pending submission");
             pending.serial = serial;
             pending.scheduled_time = darwin::mach::media_time();
@@ -314,4 +342,96 @@ pub(super) unsafe extern "C" fn present_drawable_at_time(
 ) {
     // SAFETY: forwards to the untimed form; the runtime presents immediately.
     unsafe { present_drawable(receiver, sel, drawable) }
+}
+
+/// `-encodeSignalEvent:value:`: the event reaches `value` once everything
+/// encoded before it has completed.
+pub(super) unsafe extern "C" fn encode_signal_event(
+    receiver: Id,
+    _sel: Sel,
+    event: Id,
+    value: u64,
+) {
+    // SAFETY: a command buffer of this crate's.
+    let command = unsafe { object::body::<CommandBuffer>(receiver) };
+    if let Some(semaphore) = event_semaphore(command, event) {
+        split(command, vec![(semaphore, value)], Vec::new());
+    }
+}
+
+/// `-encodeWaitForEvent:value:`: nothing encoded after this starts until the
+/// event reaches `value`.
+pub(super) unsafe extern "C" fn encode_wait_for_event(
+    receiver: Id,
+    _sel: Sel,
+    event: Id,
+    value: u64,
+) {
+    // SAFETY: a command buffer of this crate's.
+    let command = unsafe { object::body::<CommandBuffer>(receiver) };
+    if let Some(semaphore) = event_semaphore(command, event) {
+        split(command, Vec::new(), vec![(semaphore, value)]);
+    }
+}
+
+/// The timeline behind `event`, which the command buffer keeps alive until
+/// its work is done.
+fn event_semaphore(command: &mut CommandBuffer, event: Id) -> Option<vk::Semaphore> {
+    if !command.recording || command.secondary {
+        return None;
+    }
+    if !object::is_kind(event, c"RosemaryMTLEvent")
+        && !object::is_kind(event, c"RosemaryMTLSharedEvent")
+    {
+        gpu::trace("an event encoded into a command buffer is not an MTLEvent of this device");
+        return None;
+    }
+    command.retain(event);
+    // SAFETY: an event of this crate's, checked above.
+    Some(unsafe { object::body::<crate::event::Event>(event) }.semaphore)
+}
+
+/// End the recording so far as one batch, signalling `signals` once it is
+/// done, and continue in a new command buffer that first waits for `waits`.
+/// Vulkan waits and signals only between submitted batches, and Metal allows
+/// either between any two encoders.
+fn split(
+    command: &mut CommandBuffer,
+    signals: Vec<(vk::Semaphore, u64)>,
+    waits: Vec<(vk::Semaphore, u64)>,
+) {
+    let gpu = command.gpu;
+    let allocate = vk::CommandBufferAllocateInfo::default()
+        .command_pool(command.pool)
+        .level(vk::CommandBufferLevel::PRIMARY)
+        .command_buffer_count(1);
+    // SAFETY: the pool belongs to this recording command buffer.
+    let next = match unsafe { gpu.device.allocate_command_buffers(&allocate) } {
+        Ok(buffers) => buffers[0],
+        Err(error) => {
+            gpu::trace(format!(
+                "vkAllocateCommandBuffers for an event failed with {error:?}"
+            ));
+            return;
+        }
+    };
+    let begin =
+        vk::CommandBufferBeginInfo::default().flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
+    // SAFETY: freshly allocated; the current one is still recording, and no
+    // encoder is open, which Metal requires around an event.
+    let switched = unsafe { gpu.device.begin_command_buffer(next, &begin) }
+        .and_then(|()| unsafe { gpu.device.end_command_buffer(command.command_buffer) });
+    if let Err(error) = switched {
+        gpu::trace(format!(
+            "splitting a command buffer at an event failed with {error:?}"
+        ));
+        // SAFETY: never submitted.
+        unsafe { gpu.device.free_command_buffers(command.pool, &[next]) };
+        return;
+    }
+    command.batches.push(gpu::Batch {
+        waits: std::mem::replace(&mut command.waits, waits),
+        command_buffer: std::mem::replace(&mut command.command_buffer, next),
+        signals,
+    });
 }

@@ -1,13 +1,32 @@
+use std::ffi::c_void;
+use std::sync::LazyLock;
+
 use microlift::arch::x86_64::context::RegisterContext;
 
-use crate::abi::{Callbacks, GuestMemory, Result};
+use crate::abi::aggregate::{Aggregate, Leaf, Shape};
+use crate::abi::{ArgType as T, Callbacks, GuestMemory, Result};
+use crate::thunk::ThunkSignature;
 
 use super::coregraphics::CgPoint;
-use super::host::host_or_refuse;
+use super::host::builtin_or_host;
+use crate::shims::bind;
+
+/// The function `symbol` forwards to, as `F`.
+///
+/// # Safety
+///
+/// `F` must be the `extern "C"` function pointer type `symbol` is declared with.
+unsafe fn entry<F: Copy>(symbol: &str) -> Result<F> {
+    const { assert!(size_of::<F>() == size_of::<u64>()) };
+    let address = builtin_or_host(symbol)?;
+    // SAFETY: a function pointer is one address wide (checked above), and the
+    // caller vouches for the signature.
+    Ok(unsafe { core::mem::transmute_copy::<u64, F>(&address) })
+}
 
 /// `CMTime`, laid out the way both architectures lay it out.
 #[repr(C)]
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Copy, Default, Debug, PartialEq, Eq)]
 struct CmTime {
     value: i64,
     timescale: i32,
@@ -15,51 +34,54 @@ struct CmTime {
     epoch: i64,
 }
 
-/// Bytes long, and the reason this module exists: over sixteen.
-const CM_TIME_SIZE: usize = 24;
+/// Bytes long, and the reason this module exists: over sixteen, so SysV passes
+/// and returns it in memory where AAPCS64 does not.
+const CM_TIME_SIZE: u64 = 24;
 
 impl CmTime {
-    fn from_le_bytes(bytes: &[u8]) -> Self {
-        let word = |at: usize| {
-            let mut w = [0u8; 8];
-            w.copy_from_slice(&bytes[at..at + 8]);
-            u64::from_le_bytes(w)
-        };
-        let middle = word(8);
+    fn from_words([value, middle, epoch]: [u64; 3]) -> Self {
         CmTime {
-            value: word(0) as i64,
+            value: value as i64,
             timescale: middle as u32 as i32,
             flags: (middle >> 32) as u32,
-            epoch: word(16) as i64,
+            epoch: epoch as i64,
         }
     }
 
-    fn to_le_bytes(self) -> [u8; CM_TIME_SIZE] {
-        let mut out = [0u8; CM_TIME_SIZE];
-        out[0..8].copy_from_slice(&self.value.to_le_bytes());
-        out[8..12].copy_from_slice(&self.timescale.to_le_bytes());
-        out[12..16].copy_from_slice(&self.flags.to_le_bytes());
-        out[16..24].copy_from_slice(&self.epoch.to_le_bytes());
-        out
+    fn to_words(self) -> [u64; 3] {
+        let middle = u64::from(self.timescale as u32) | (u64::from(self.flags) << 32);
+        [self.value as u64, middle, self.epoch as u64]
+    }
+
+    fn read(mem: &mut dyn GuestMemory, at: u64, symbol: &str) -> Result<Self> {
+        let mut words = [0; 3];
+        for (i, word) in words.iter_mut().enumerate() {
+            *word = mem.read_u64(at + 8 * i as u64, symbol)?;
+        }
+        Ok(Self::from_words(words))
+    }
+
+    fn write(self, mem: &mut dyn GuestMemory, at: u64, symbol: &str) -> Result<()> {
+        for (i, word) in self.to_words().into_iter().enumerate() {
+            mem.write_u64(at + 8 * i as u64, word, symbol)?;
+        }
+        Ok(())
     }
 }
 
-/// Read the `CMTime` the guest left `offset` bytes into its argument area.
+/// The `n`th `CMTime` in the guest's stack argument area. The call has not
+/// pushed a return address yet, so the area starts at `rsp`.
 fn time_argument(
     symbol: &str,
     ctx: &RegisterContext,
     mem: &mut dyn GuestMemory,
-    offset: u64,
+    n: u64,
 ) -> Result<CmTime> {
-    let bytes = mem.read_bytes(ctx.rsp.wrapping_add(offset), CM_TIME_SIZE, symbol)?;
-    Ok(CmTime::from_le_bytes(&bytes))
+    CmTime::read(mem, ctx.rsp.wrapping_add(n * CM_TIME_SIZE), symbol)
 }
 
-/// Place a `CMTime` the way a SysV AMD64 MEMORY return is placed.
-///
-/// The buffer is the hidden first argument the guest passed in `rdi`, and `rax`
-/// gets it back - which is what a MEMORY-returning callee must do and what a
-/// caller reading the result through `rax` depends on.
+/// Return a `CMTime` the SysV MEMORY way: into the hidden buffer in `rdi`,
+/// which `rax` hands back. Every real argument is one register along for it.
 fn return_time(
     symbol: &str,
     ctx: &mut RegisterContext,
@@ -70,82 +92,57 @@ fn return_time(
     if buffer == 0 {
         return Err(super::bad_pointer(symbol, 0));
     }
-    mem.write_bytes(buffer, &time.to_le_bytes(), symbol)?;
+    time.write(mem, buffer, symbol)?;
     ctx.rax = buffer;
     Ok(())
 }
 
 /// `CMTime CMTimeMake(int64_t value, int32_t timescale)`
-///
-/// The hidden return buffer takes `rdi`, so `value` is in `rsi` and `timescale`
-/// in `edx` - one register along from where a reader counting parameters would
-/// look for them.
 fn time_make(symbol: &str, ctx: &mut RegisterContext, mem: &mut dyn GuestMemory) -> Result<()> {
-    let host = host_or_refuse(symbol)?;
-    // SAFETY: the symbol [`shim_for`] matched, which really is
-    // `CMTime (*)(int64_t, int32_t)`, resolved out of a CoreMedia this process
-    // has loaded. Declaring the aggregate return leaves the `x8` placement to
-    // the compiler.
-    let f: extern "C" fn(i64, i32) -> CmTime =
-        unsafe { core::mem::transmute::<u64, extern "C" fn(i64, i32) -> CmTime>(host) };
+    // SAFETY: the declaration from CMTime.h.
+    let f = unsafe { entry::<extern "C" fn(i64, i32) -> CmTime>(symbol)? };
     let time = f(ctx.rsi as i64, ctx.rdx as i32);
     return_time(symbol, ctx, mem, time)
 }
 
 /// `Float64 CMTimeGetSeconds(CMTime time)`
 ///
-/// The time is the only argument and is entirely on the guest's stack, so no integer
-/// register is involved at all. **Forwarded rather than divided**.
+/// Forwarded rather than divided: the flags make it more than a division.
 fn time_get_seconds(
     symbol: &str,
     ctx: &mut RegisterContext,
     mem: &mut dyn GuestMemory,
 ) -> Result<()> {
-    let host = host_or_refuse(symbol)?;
+    // SAFETY: the declaration from CMTime.h.
+    let f = unsafe { entry::<extern "C" fn(CmTime) -> f64>(symbol)? };
     let time = time_argument(symbol, ctx, mem, 0)?;
-    // SAFETY: the symbol [`shim_for`] matched, which is `Float64 (*)(CMTime)`.
-    let f: extern "C" fn(CmTime) -> f64 =
-        unsafe { core::mem::transmute::<u64, extern "C" fn(CmTime) -> f64>(host) };
     ctx.xmm[0] = [f(time).to_bits(), 0];
     Ok(())
 }
 
 /// `CMTime CMSampleBufferGetPresentationTimeStamp(CMSampleBufferRef sbuf)`
-///
-/// A MEMORY return in front of one handle: the buffer is `rdi` and the sample
-/// buffer `rsi`.
 fn presentation_time_stamp(
     symbol: &str,
     ctx: &mut RegisterContext,
     mem: &mut dyn GuestMemory,
 ) -> Result<()> {
-    let host = host_or_refuse(symbol)?;
-    // SAFETY: the symbol [`shim_for`] matched, which is
-    // `CMTime (*)(CMSampleBufferRef)`. The sample buffer is an opaque handle
-    // CoreMedia made.
-    let f: extern "C" fn(u64) -> CmTime =
-        unsafe { core::mem::transmute::<u64, extern "C" fn(u64) -> CmTime>(host) };
+    // SAFETY: the declaration from CMSampleBuffer.h.
+    let f = unsafe { entry::<extern "C" fn(u64) -> CmTime>(symbol)? };
     let time = f(ctx.rsi);
     return_time(symbol, ctx, mem, time)
 }
 
 /// `OSStatus VTCompressionSessionCompleteFrames(VTCompressionSessionRef session,
 /// CMTime completeUntilPresentationTimeStamp)`
-///
-/// The session keeps `rdi` - a MEMORY argument consumes no register - and the
-/// time is the whole of the stack argument area.
 fn complete_frames(
     symbol: &str,
     ctx: &mut RegisterContext,
     mem: &mut dyn GuestMemory,
 ) -> Result<()> {
-    let host = host_or_refuse(symbol)?;
+    // SAFETY: the declaration from VTCompressionSession.h.
+    let f = unsafe { entry::<extern "C" fn(u64, CmTime) -> i32>(symbol)? };
     let until = time_argument(symbol, ctx, mem, 0)?;
-    // SAFETY: the symbol [`shim_for`] matched, which is
-    // `OSStatus (*)(VTCompressionSessionRef, CMTime)`.
-    let f: extern "C" fn(u64, CmTime) -> i32 =
-        unsafe { core::mem::transmute::<u64, extern "C" fn(u64, CmTime) -> i32>(host) };
-    ctx.rax = f(ctx.rdi, until) as u32 as u64;
+    super::set_int_return(ctx, f(ctx.rdi, until));
     Ok(())
 }
 
@@ -154,43 +151,45 @@ fn complete_frames(
 /// CFDictionaryRef frameProperties, void *sourceFrameRefcon, VTEncodeInfoFlags
 /// *infoFlagsOut)`
 ///
-/// Seven parameters, two of them twenty-four bytes on the stack, and the reason the
-/// register mapping is written out here rather than left to a reader:
-///
-/// `sourceFrameRefcon` is an opaque token VideoToolbox hands straight back to the
-/// output callback and never dereferences, so it crosses as it is.
+/// The two times go on the stack and take no registers, so the last three
+/// arguments are in `rdx`, `rcx` and `r8`.
 fn encode_frame(symbol: &str, ctx: &mut RegisterContext, mem: &mut dyn GuestMemory) -> Result<()> {
-    let host = host_or_refuse(symbol)?;
+    type EncodeFrame = extern "C" fn(u64, u64, CmTime, CmTime, u64, u64, u64) -> i32;
+    // SAFETY: the declaration from VTCompressionSession.h. The output callback
+    // was substituted when the session was created.
+    let f = unsafe { entry::<EncodeFrame>(symbol)? };
     let pts = time_argument(symbol, ctx, mem, 0)?;
-    let duration = time_argument(symbol, ctx, mem, CM_TIME_SIZE as u64)?;
-    // SAFETY: the symbol [`shim_for`] matched, whose declaration is the one
-    // above. The session and image buffer are handles VideoToolbox and
-    // CoreVideo made; the output callback was substituted for a thunk when the
-    // session was created.
-    let f: extern "C" fn(u64, u64, CmTime, CmTime, u64, u64, u64) -> i32 = unsafe {
-        core::mem::transmute::<u64, extern "C" fn(u64, u64, CmTime, CmTime, u64, u64, u64) -> i32>(
-            host,
-        )
+    let duration = time_argument(symbol, ctx, mem, 1)?;
+    // The encoder is the host's even with the builtin frameworks, and cannot
+    // read this runtime's pixel buffers; it is handed a copy the host made.
+    let copy = match crate::frameworks::using_builtin() {
+        true => corevideo::pixel_buffer::host_copy(ctx.rsi as usize as *const c_void),
+        false => None,
     };
-    ctx.rax = f(ctx.rdi, ctx.rsi, pts, duration, ctx.rdx, ctx.rcx, ctx.r8) as u32 as u64;
+    let image = copy.map_or(ctx.rsi, |copy| copy as usize as u64);
+    let status = f(ctx.rdi, image, pts, duration, ctx.rdx, ctx.rcx, ctx.r8);
+    if let Some(copy) = copy {
+        // SAFETY: the reference `host_copy` returned; the encoder took its own.
+        unsafe { corefoundation::api::CFRelease(copy) };
+    }
+    super::set_int_return(ctx, status);
     Ok(())
 }
 
-/// `CGSize CVImageBufferGetEncodedSize(CVImageBufferRef imageBuffer)`
-fn encoded_size(symbol: &str, ctx: &mut RegisterContext, _mem: &mut dyn GuestMemory) -> Result<()> {
-    let host = host_or_refuse(symbol)?;
-    // SAFETY: the symbol [`shim_for`] matched, which is
-    // `CGSize (*)(CVImageBufferRef)`, resolved out of a CoreVideo this process
-    // has loaded.
-    let f: extern "C" fn(u64) -> CgPoint =
-        unsafe { core::mem::transmute::<u64, extern "C" fn(u64) -> CgPoint>(host) };
+/// `CGSize CVImageBufferGetEncodedSize(CVImageBufferRef imageBuffer)`, and
+/// `CVImageBufferGetDisplaySize`, which is declared the same way.
+fn image_size(symbol: &str, ctx: &mut RegisterContext, _mem: &mut dyn GuestMemory) -> Result<()> {
+    // SAFETY: the declaration from CVImageBuffer.h; a `CGSize` is laid out as a
+    // `CGPoint` is.
+    let f = unsafe { entry::<extern "C" fn(u64) -> CgPoint>(symbol)? };
     let size = f(ctx.rdi);
     ctx.xmm[0] = [size.x.to_bits(), 0];
     ctx.xmm[1] = [size.y.to_bits(), 0];
     Ok(())
 }
 
-/// `CAFrameRateRange`, as AAPCS64 returns one: three `float`s, `s0`–`s2`.
+/// `CAFrameRateRange`: three `float`s, which SysV returns two in `xmm0` and one
+/// in `xmm1`, and AAPCS64 in `s0`-`s2`.
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
 struct CaFrameRateRange {
@@ -206,26 +205,63 @@ fn frame_rate_range_make(
     ctx: &mut RegisterContext,
     _mem: &mut dyn GuestMemory,
 ) -> Result<()> {
-    let host = host_or_refuse(symbol)?;
+    // SAFETY: the declaration from CAFrameRateRange.h.
+    let f = unsafe { entry::<extern "C" fn(f32, f32, f32) -> CaFrameRateRange>(symbol)? };
     let arg = |i: usize| f32::from_bits(ctx.xmm[i][0] as u32);
-    // SAFETY: the symbol [`shim_for`] matched, which is
-    // `CAFrameRateRange (*)(float, float, float)`, resolved out of a QuartzCore
-    // this process has loaded.
-    let f: extern "C" fn(f32, f32, f32) -> CaFrameRateRange = unsafe {
-        core::mem::transmute::<u64, extern "C" fn(f32, f32, f32) -> CaFrameRateRange>(host)
-    };
     let range = f(arg(0), arg(1), arg(2));
-    ctx.xmm[0] = [
-        u64::from(range.minimum.to_bits()) | (u64::from(range.maximum.to_bits()) << 32),
-        0,
-    ];
-    ctx.xmm[1] = [u64::from(range.preferred.to_bits()), 0];
+    let bits = |v: f32| u64::from(v.to_bits());
+    ctx.xmm[0] = [bits(range.minimum) | (bits(range.maximum) << 32), 0];
+    ctx.xmm[1] = [bits(range.preferred), 0];
     Ok(())
+}
+
+/// The callback's two 24-byte times are passed on the guest SysV stack,
+/// but by pointer to a caller-owned copy on AAPCS64 hosts.
+pub(crate) fn decompression_output_signature() -> ThunkSignature {
+    static SIGNATURE: LazyLock<ThunkSignature> = LazyLock::new(decompression_output_shape);
+    SIGNATURE.clone()
+}
+
+fn decompression_output_shape() -> ThunkSignature {
+    let time = Shape::Struct(Aggregate {
+        size: size_of::<CmTime>(),
+        align: align_of::<CmTime>(),
+        leaves: vec![
+            Leaf {
+                ty: T::SignedDoubleword,
+                offset: 0,
+            },
+            Leaf {
+                ty: T::SignedWord,
+                offset: 8,
+            },
+            Leaf {
+                ty: T::UnsignedWord,
+                offset: 12,
+            },
+            Leaf {
+                ty: T::SignedDoubleword,
+                offset: 16,
+            },
+        ],
+    });
+    ThunkSignature::new(
+        vec![
+            Shape::Scalar(T::Pointer),
+            Shape::Scalar(T::Pointer),
+            Shape::Scalar(T::SignedWord),
+            Shape::Scalar(T::UnsignedWord),
+            Shape::Scalar(T::Pointer),
+            time.clone(),
+            time,
+        ],
+        None,
+    )
+    .expect("the VideoToolbox output callback uses a supported ABI")
 }
 
 /// `VTDecompressionOutputCallbackRecord` - a function pointer and its refcon.
 #[repr(C)]
-#[derive(Clone, Copy, Default)]
 struct OutputCallbackRecord {
     callback: u64,
     refcon: u64,
@@ -237,50 +273,32 @@ struct OutputCallbackRecord {
 /// VTDecompressionOutputCallbackRecord *outputCallback, VTDecompressionSessionRef
 /// *decompressionSessionOut)`
 ///
-/// The compression side takes its callback as an ordinary argument and is a `cbsig!`
-/// entry; this one takes it *inside a two-word record*, which the marshaller's
-/// per-argument substitution cannot see into - it would replace the **record pointer**
-/// with a thunk and VideoToolbox would read a trampoline's first eight bytes as the
-/// callback.
-///
-/// So the record is read out of guest memory, its callback replaced with a thunk, and
-/// the host handed a copy that lives here rather than in the guest's address space.
+/// The callback is inside a record, which per-argument substitution cannot see
+/// into, so the host gets a local copy of the record with its callback thunked.
 fn decompression_session_create(
     symbol: &str,
     ctx: &mut RegisterContext,
     mem: &mut dyn GuestMemory,
     callbacks: &dyn Callbacks,
 ) -> Result<()> {
-    let host = host_or_refuse(symbol)?;
-    let record_va = ctx.r8;
-    let mut record = OutputCallbackRecord::default();
-    if record_va != 0 {
-        let bytes = mem.read_bytes(record_va, 16, symbol)?;
-        let word = |at: usize| {
-            let mut w = [0u8; 8];
-            w.copy_from_slice(&bytes[at..at + 8]);
-            u64::from_le_bytes(w)
-        };
-        record.callback = match word(0) {
-            0 => 0,
-            guest => callbacks.substitute(symbol, guest)?,
-        };
-        record.refcon = word(8);
-    }
-    let record_ptr = match record_va {
-        0 => core::ptr::null(),
-        _ => &record as *const OutputCallbackRecord,
+    type SessionCreate = extern "C" fn(u64, u64, u64, u64, *const OutputCallbackRecord, u64) -> i32;
+    // SAFETY: the declaration from VTDecompressionSession.h.
+    let f = unsafe { entry::<SessionCreate>(symbol)? };
+    let record = match ctx.r8 {
+        0 => None,
+        va => Some(OutputCallbackRecord {
+            callback: callbacks.substitute_typed(
+                symbol,
+                mem.read_u64(va, symbol)?,
+                decompression_output_signature(),
+            )?,
+            refcon: mem.read_u64(va + 8, symbol)?,
+        }),
     };
-    // SAFETY: the symbol [`shim_for`] matched, whose declaration is the one
-    // above. The record's callback is a native thunk by the lines above, and the
-    // record itself outlives the call - which is all VideoToolbox reads it for.
-    let f: extern "C" fn(u64, u64, u64, u64, *const OutputCallbackRecord, u64) -> i32 = unsafe {
-        core::mem::transmute::<
-            u64,
-            extern "C" fn(u64, u64, u64, u64, *const OutputCallbackRecord, u64) -> i32,
-        >(host)
-    };
-    ctx.rax = f(ctx.rdi, ctx.rsi, ctx.rdx, ctx.rcx, record_ptr, ctx.r9) as u32 as u64;
+    // VideoToolbox copies the record during the call, so a local one suffices.
+    let record_ptr = record.as_ref().map_or(core::ptr::null(), |r| r as *const _);
+    let status = f(ctx.rdi, ctx.rsi, ctx.rdx, ctx.rcx, record_ptr, ctx.r9);
+    super::set_int_return(ctx, status);
     Ok(())
 }
 
@@ -291,13 +309,26 @@ pub type Shim = super::coregraphics::Shim;
 /// shims.
 pub fn shim_for(name: &str) -> Option<Shim> {
     Some(match name {
-        "CMTimeMake" => time_make,
-        "CMTimeGetSeconds" => time_get_seconds,
-        "CMSampleBufferGetPresentationTimeStamp" => presentation_time_stamp,
-        "VTCompressionSessionCompleteFrames" => complete_frames,
-        "VTCompressionSessionEncodeFrame" => encode_frame,
-        "CVImageBufferGetEncodedSize" => encoded_size,
-        "CAFrameRateRangeMake" => frame_rate_range_make,
+        "CMTimeMake" => bind!("CMTimeMake" => time_make),
+        "CMTimeGetSeconds" => bind!("CMTimeGetSeconds" => time_get_seconds),
+        "CMSampleBufferGetPresentationTimeStamp" => {
+            bind!("CMSampleBufferGetPresentationTimeStamp" => presentation_time_stamp)
+        }
+        "CMSampleBufferGetDecodeTimeStamp" => {
+            bind!("CMSampleBufferGetDecodeTimeStamp" => presentation_time_stamp)
+        }
+        "CMSampleBufferGetDuration" => {
+            bind!("CMSampleBufferGetDuration" => presentation_time_stamp)
+        }
+        "VTCompressionSessionCompleteFrames" => {
+            bind!("VTCompressionSessionCompleteFrames" => complete_frames)
+        }
+        "VTCompressionSessionEncodeFrame" => {
+            bind!("VTCompressionSessionEncodeFrame" => encode_frame)
+        }
+        "CVImageBufferGetEncodedSize" => bind!("CVImageBufferGetEncodedSize" => image_size),
+        "CVImageBufferGetDisplaySize" => bind!("CVImageBufferGetDisplaySize" => image_size),
+        "CAFrameRateRangeMake" => bind!("CAFrameRateRangeMake" => frame_rate_range_make),
         _ => return None,
     })
 }
@@ -305,7 +336,9 @@ pub fn shim_for(name: &str) -> Option<Shim> {
 /// Whether `name` is this module's one callback-carrying shim.
 pub fn callback_shim_for(name: &str) -> Option<crate::signal::Shim> {
     match name {
-        "VTDecompressionSessionCreate" => Some(decompression_session_create),
+        "VTDecompressionSessionCreate" => {
+            Some(bind!(callback "VTDecompressionSessionCreate" => decompression_session_create))
+        }
         _ => None,
     }
 }
@@ -318,29 +351,33 @@ mod tests {
     /// violate silently.
     #[test]
     fn cm_time_is_the_layout_both_architectures_use() {
-        assert_eq!(core::mem::size_of::<CmTime>(), CM_TIME_SIZE);
+        assert_eq!(size_of::<CmTime>() as u64, CM_TIME_SIZE);
         let time = CmTime {
             value: 0x0102_0304_0506_0708,
             timescale: 600,
             flags: 1,
             epoch: -1,
         };
-        let bytes = time.to_le_bytes();
-        assert_eq!(&bytes[0..8], &0x0102_0304_0506_0708u64.to_le_bytes());
-        assert_eq!(&bytes[8..12], &600i32.to_le_bytes());
-        assert_eq!(&bytes[12..16], &1u32.to_le_bytes());
-        assert_eq!(&bytes[16..24], &(-1i64).to_le_bytes());
-        let back = CmTime::from_le_bytes(&bytes);
-        assert_eq!(back.value, time.value);
-        assert_eq!(back.timescale, time.timescale);
-        assert_eq!(back.flags, time.flags);
-        assert_eq!(back.epoch, time.epoch);
+        let words = time.to_words();
+        assert_eq!(words, [0x0102_0304_0506_0708, (1 << 32) | 600, u64::MAX]);
+        assert_eq!(CmTime::from_words(words), time);
+    }
+
+    #[test]
+    fn all_sample_time_getters_use_the_guest_struct_return_shim() {
+        for name in [
+            "CMSampleBufferGetPresentationTimeStamp",
+            "CMSampleBufferGetDecodeTimeStamp",
+            "CMSampleBufferGetDuration",
+        ] {
+            assert!(shim_for(name).is_some(), "{name}");
+        }
     }
 
     /// Twelve bytes and three members, which is what makes the SysV return
     /// packing - two members in `xmm0`, one in `xmm1` - the right arrangement.
     #[test]
     fn a_frame_rate_range_is_three_floats() {
-        assert_eq!(core::mem::size_of::<CaFrameRateRange>(), 12);
+        assert_eq!(size_of::<CaFrameRateRange>(), 12);
     }
 }

@@ -7,12 +7,6 @@ use objc::sel::Sel;
 
 use crate::define::{class_methods, methods};
 
-#[repr(C)]
-struct Predicate {
-    isa: *const objc::class::Class,
-    block: usize,
-}
-
 /// Report a mutation of a collection that was not created mutable.
 ///
 /// A named abort rather than a wrong answer: an `NSArray` that silently accepted
@@ -34,6 +28,44 @@ unsafe extern "C" fn object_at_index(receiver: Id, _sel: Sel, index: usize) -> I
 }
 
 /// `-subarrayWithRange:`, or `NSRangeException` by name for a range past the end.
+/// A fresh array of the receiver's elements followed by `extra`, autoreleased.
+///
+/// # Safety
+///
+/// `receiver` is an array.
+unsafe fn array_adding(receiver: Id, extra: &[CFTypeRef]) -> Id {
+    // SAFETY: an array, by the caller.
+    let mut values = unsafe { collections::array(receiver as CFTypeRef) }
+        .map(|a| a.values.clone())
+        .unwrap_or_default();
+    values.extend_from_slice(extra);
+    // SAFETY: a fresh array holding live objects.
+    unsafe {
+        api::CFAutorelease(collections::new_array(
+            &values,
+            Policy::from_type_callbacks(),
+            false,
+        )) as Id
+    }
+}
+
+unsafe extern "C" fn array_by_adding_object(receiver: Id, _sel: Sel, object: Id) -> Id {
+    if object.is_null() {
+        objc::fail!("-[NSArray arrayByAddingObject:]: object cannot be nil");
+    }
+    // SAFETY: an array and a live object.
+    unsafe { array_adding(receiver, &[object as CFTypeRef]) }
+}
+
+unsafe extern "C" fn array_by_adding_objects(receiver: Id, _sel: Sel, other: Id) -> Id {
+    // SAFETY: an array, and an array or nil.
+    let extra = unsafe { collections::array(other as CFTypeRef) }
+        .map(|a| a.values.clone())
+        .unwrap_or_default();
+    // SAFETY: an array.
+    unsafe { array_adding(receiver, &extra) }
+}
+
 unsafe extern "C" fn subarray_with_range(
     receiver: Id,
     _sel: Sel,
@@ -145,56 +177,6 @@ unsafe extern "C" fn index_of_object_with_options_passing_test(
         }
     }
     NOT_FOUND
-}
-
-unsafe extern "C" fn filtered_array_using_predicate(receiver: Id, _sel: Sel, predicate: Id) -> Id {
-    let Some(array) = (unsafe { collections::array(receiver as CFTypeRef) }) else {
-        return std::ptr::null_mut();
-    };
-    if predicate.is_null() {
-        return std::ptr::null_mut();
-    }
-    // SAFETY: `predicateWithBlock:` creates this layout.
-    let block = unsafe { (*(predicate as *const Predicate)).block as Id };
-    let mut values = Vec::new();
-    if let Some(invoke) = unsafe { objc::block::invoke(block) } {
-        // `NSPredicate` block predicates receive the object and a bindings
-        // dictionary. There are no substitution variables in this operation.
-        let call: unsafe extern "C" fn(Id, Id, Id) -> bool = unsafe { std::mem::transmute(invoke) };
-        for value in &array.values {
-            if unsafe { call(block, *value as Id, std::ptr::null_mut()) } {
-                values.push(*value);
-            }
-        }
-    }
-    // SAFETY: a fresh array follows the convenience-constructor rule.
-    unsafe {
-        api::CFAutorelease(collections::new_array(
-            &values,
-            Policy::from_type_callbacks(),
-            false,
-        )) as Id
-    }
-}
-
-unsafe extern "C" fn predicate_with_block(_class: Id, _sel: Sel, block: Id) -> Id {
-    let class = objc::class::lookup(c"NSPredicate").expect("NSPredicate is installed");
-    // SAFETY: `Predicate` is the registered layout for this class.
-    let predicate = unsafe { corefoundation::base::allocate::<Predicate>(class) };
-    if predicate.is_null() {
-        return std::ptr::null_mut();
-    }
-    // SAFETY: a fresh instance.
-    unsafe { (*predicate).block = objc::block::copy(block) as usize };
-    // SAFETY: a fresh object follows the convenience-constructor rule.
-    unsafe { api::CFAutorelease(predicate as CFTypeRef) as Id }
-}
-
-unsafe extern "C" fn predicate_dealloc(receiver: Id, _sel: Sel) {
-    // SAFETY: a Predicate instance at the end of its lifetime.
-    let block = unsafe { (*(receiver as *mut Predicate)).block as Id };
-    objc::block::release(block);
-    objc::arc::finalize(receiver);
 }
 
 /// An array enumerator: a snapshot of the array's elements and a cursor.
@@ -502,24 +484,37 @@ unsafe extern "C" fn sorted_array_using_function(
     }
 }
 
-unsafe extern "C" fn sorted_array_using_comparator(receiver: Id, _sel: Sel, block: Id) -> Id {
-    // SAFETY: an array.
-    let Some(array) = (unsafe { collections::array(receiver as CFTypeRef) }) else {
-        return std::ptr::null_mut();
-    };
-    // SAFETY: null or a block.
+/// `values` ordered by an `NSComparator` block, stably; `false` for a nil one.
+///
+/// # Safety
+/// `block` is null or a block of type `NSComparisonResult (^)(id, id)`.
+unsafe fn sort_by_comparator(values: &mut [CFTypeRef], block: Id) -> bool {
+    // SAFETY: null or a block, per the caller.
     let Some(invoke) = (unsafe { objc::block::invoke(block) }) else {
-        return std::ptr::null_mut();
+        return false;
     };
-    // SAFETY: the block is `NSComparisonResult (^)(id, id)`.
+    // SAFETY: the block is `NSComparisonResult (^)(id, id)`, per the caller.
     let call: unsafe extern "C" fn(Id, Id, Id) -> isize = unsafe { std::mem::transmute(invoke) };
-    // Sorted out of place: the block may read the array it is sorting.
-    let mut values = array.values.clone();
+    // SAFETY: the guest's block, given two of the array's objects.
     values.sort_by(|a, b| match unsafe { call(block, *a as Id, *b as Id) } {
         ..0 => std::cmp::Ordering::Less,
         0 => std::cmp::Ordering::Equal,
         _ => std::cmp::Ordering::Greater,
     });
+    true
+}
+
+unsafe extern "C" fn sorted_array_using_comparator(receiver: Id, _sel: Sel, block: Id) -> Id {
+    // SAFETY: an array.
+    let Some(array) = (unsafe { collections::array(receiver as CFTypeRef) }) else {
+        return std::ptr::null_mut();
+    };
+    // Sorted out of place: the block may read the array it is sorting.
+    let mut values = array.values.clone();
+    // SAFETY: null or an `NSComparator`.
+    if !unsafe { sort_by_comparator(&mut values, block) } {
+        return std::ptr::null_mut();
+    }
     // SAFETY: a fresh array follows the convenience-constructor rule.
     unsafe {
         api::CFAutorelease(collections::new_array(
@@ -549,6 +544,26 @@ unsafe extern "C" fn sort_using_function(
         sort_by_function(&mut values, compare, context);
     }
     // SAFETY: the same array; the comparator is done with it.
+    if let Some(array) = unsafe { collections::array(receiver as CFTypeRef) } {
+        array.values = values;
+    }
+}
+
+unsafe extern "C" fn sort_using_comparator(receiver: Id, _sel: Sel, block: Id) {
+    // SAFETY: an array.
+    let Some(array) = (unsafe { collections::array(receiver as CFTypeRef) }) else {
+        return;
+    };
+    if !array.mutable {
+        immutable("NSArray", "sortUsingComparator:");
+    }
+    // Sorted out of place: the block may read the array it is sorting.
+    let mut values = array.values.clone();
+    // SAFETY: null or an `NSComparator`.
+    if !unsafe { sort_by_comparator(&mut values, block) } {
+        return;
+    }
+    // SAFETY: the same array; the block is done with it.
     if let Some(array) = unsafe { collections::array(receiver as CFTypeRef) } {
         array.values = values;
     }
@@ -868,6 +883,34 @@ unsafe extern "C" fn write_to_file(receiver: Id, _sel: Sel, path: Id, atomically
     write_bytes_to_file(&path, bytes, atomically != 0).is_ok() as u8
 }
 
+/// `-[NSArray writeToFile:atomically:]` and `-[NSDictionary ...]`: an XML
+/// property list, or NO for contents that are not property list types.
+unsafe extern "C" fn write_plist_to_file(receiver: Id, _sel: Sel, path: Id, atomically: u8) -> u8 {
+    // SAFETY: an `NSString`, or nil.
+    let path = unsafe { crate::string::bytes(path) };
+    let Ok(path) = String::from_utf8(path) else {
+        return 0;
+    };
+    // SAFETY: a collection of this runtime's.
+    let Some(value) = (unsafe { corefoundation::propertylist::value_of(receiver as CFTypeRef) })
+    else {
+        return 0;
+    };
+    let bytes = corefoundation::plist::write_xml(&value);
+    write_bytes_to_file(&path, &bytes, atomically != 0).is_ok() as u8
+}
+
+/// `-writeToURL:atomically:`, for a file URL.
+unsafe extern "C" fn write_plist_to_url(receiver: Id, sel: Sel, url: Id, atomically: u8) -> u8 {
+    // SAFETY: `NSString * (id, SEL)` on an `NSURL`.
+    let path = unsafe {
+        let f: unsafe extern "C" fn(Id, Sel) -> Id = std::mem::transmute(objc::msg::entry());
+        f(url, objc::sel::get("path"))
+    };
+    // SAFETY: as above.
+    unsafe { write_plist_to_file(receiver, sel, path, atomically) }
+}
+
 pub(crate) fn write_bytes_to_file(
     guest_path: &str,
     bytes: &[u8],
@@ -1097,6 +1140,31 @@ unsafe extern "C" fn remove_all_objects(receiver: Id, _sel: Sel) {
         immutable("NSArray", "removeAllObjects");
     }
     for value in a.values.drain(..) {
+        a.policy.release(value);
+    }
+}
+
+/// `-setArray:`. The new contents are retained before the old are released,
+/// so an array may be set to (a copy of) itself.
+unsafe extern "C" fn set_array(receiver: Id, _sel: Sel, other: Id) {
+    // SAFETY: an array.
+    let Some(a) = (unsafe { collections::array(receiver as CFTypeRef) }) else {
+        return;
+    };
+    if !a.mutable {
+        immutable("NSArray", "setArray:");
+    }
+    let values = match other.is_null() {
+        true => Vec::new(),
+        // SAFETY: the argument is an array if it is one of ours.
+        false => match unsafe { collections::array(other as CFTypeRef) } {
+            Some(o) => o.values.clone(),
+            None => objc::fail!("-[NSMutableArray setArray:]: the argument is not an array"),
+        },
+    };
+    let retained = values.into_iter().map(|v| a.policy.retain(v)).collect();
+    let old = std::mem::replace(&mut a.values, retained);
+    for value in old {
         a.policy.release(value);
     }
 }
@@ -1984,6 +2052,66 @@ unsafe extern "C" fn data_init_with_contents_of_file(receiver: Id, sel: Sel, pat
     objc::arc::retain(unsafe { data_with_contents_of_file(receiver, sel, path) })
 }
 
+/// `NSDataBase64DecodingIgnoreUnknownCharacters`.
+const BASE64_IGNORE_UNKNOWN_CHARACTERS: usize = 1 << 0;
+
+/// Standard base64, padded as Apple's decoder requires; `None` for text it
+/// rejects. Unknown characters - line breaks included - are rejected unless
+/// `ignore_unknown`.
+fn base64_decode(text: &[u8], ignore_unknown: bool) -> Option<Vec<u8>> {
+    let mut symbols = Vec::with_capacity(text.len());
+    for &byte in text {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'+' | b'/' | b'=' => symbols.push(byte),
+            _ if ignore_unknown => {}
+            _ => return None,
+        }
+    }
+    if symbols.len() % 4 != 0 {
+        return None;
+    }
+    let padding = symbols.iter().rev().take_while(|&&b| b == b'=').count();
+    if padding > 2 || symbols[..symbols.len() - padding].contains(&b'=') {
+        return None;
+    }
+    let value = |b: u8| -> u32 {
+        match b {
+            b'A'..=b'Z' => u32::from(b - b'A'),
+            b'a'..=b'z' => u32::from(b - b'a' + 26),
+            b'0'..=b'9' => u32::from(b - b'0' + 52),
+            b'+' => 62,
+            b'/' => 63,
+            _ => 0,
+        }
+    };
+    let mut out = Vec::with_capacity(symbols.len() / 4 * 3);
+    for quad in symbols.chunks(4) {
+        let word = quad.iter().fold(0, |word, &b| (word << 6) | value(b));
+        let bytes = [(word >> 16) as u8, (word >> 8) as u8, word as u8];
+        let kept = 3 - quad.iter().filter(|&&b| b == b'=').count();
+        out.extend_from_slice(&bytes[..kept]);
+    }
+    Some(out)
+}
+
+/// `-initWithBase64EncodedString:options:`, nil for text that is not base64.
+unsafe extern "C" fn data_init_with_base64_string(
+    receiver: Id,
+    _sel: Sel,
+    text: Id,
+    options: usize,
+) -> Id {
+    // SAFETY: an `NSString` or nil.
+    let text = unsafe { crate::string::bytes(text) };
+    match base64_decode(&text, options & BASE64_IGNORE_UNKNOWN_CHARACTERS != 0) {
+        Some(bytes) => replace_receiver(receiver, bytes),
+        None => {
+            objc::arc::release(receiver);
+            std::ptr::null_mut()
+        }
+    }
+}
+
 unsafe extern "C" fn data_init_with_capacity(receiver: Id, _sel: Sel, capacity: usize) -> Id {
     replace_receiver(receiver, Vec::with_capacity(capacity.min(1 << 24)))
 }
@@ -2414,6 +2542,11 @@ unsafe extern "C" fn set_with_object(_class: Id, _sel: Sel, object: Id) -> Id {
     unsafe { api::CFAutorelease(collections::new_set(values, Policy::from_type_callbacks())) as Id }
 }
 
+unsafe extern "C" fn empty_set(_class: Id, _sel: Sel) -> Id {
+    // SAFETY: a fresh object.
+    unsafe { api::CFAutorelease(collections::new_set(&[], Policy::from_type_callbacks())) as Id }
+}
+
 unsafe extern "C" fn set_with_capacity(_class: Id, _sel: Sel, _capacity: usize) -> Id {
     // SAFETY: a fresh object.
     unsafe { api::CFAutorelease(collections::new_set(&[], Policy::from_type_callbacks())) as Id }
@@ -2426,6 +2559,58 @@ unsafe extern "C" fn set_with_array(_class: Id, _sel: Sel, array: Id) -> Id {
         .unwrap_or(&[]);
     // SAFETY: the new set retains its elements.
     unsafe { api::CFAutorelease(collections::new_set(values, Policy::from_type_callbacks())) as Id }
+}
+
+/// `+setWithObjects:count:`, which the nil-terminated `+setWithObjects:` is
+/// rewritten into.
+unsafe extern "C" fn set_with_objects_count(
+    _class: Id,
+    _sel: Sel,
+    objects: *const Id,
+    count: usize,
+) -> Id {
+    let values = match objects.is_null() || count == 0 {
+        true => &[][..],
+        // SAFETY: the caller says `objects` covers `count` entries.
+        false => unsafe { std::slice::from_raw_parts(objects as *const CFTypeRef, count) },
+    };
+    let mut unique: Vec<CFTypeRef> = Vec::with_capacity(values.len());
+    let policy = Policy::from_type_callbacks();
+    for value in values {
+        if !unique.iter().any(|u| policy.equal(*u, *value)) {
+            unique.push(*value);
+        }
+    }
+    // SAFETY: the new set retains its elements.
+    unsafe { api::CFAutorelease(collections::new_set(&unique, policy)) as Id }
+}
+
+unsafe extern "C" fn set_init_with_objects_count(
+    receiver: Id,
+    sel: Sel,
+    objects: *const Id,
+    count: usize,
+) -> Id {
+    objc::arc::release(receiver);
+    // SAFETY: forwarded; the answer is autoreleased and the caller owns an init.
+    objc::arc::retain(unsafe { set_with_objects_count(receiver, sel, objects, count) })
+}
+
+/// `-initWithArray:` and `-initWithSet:`.
+unsafe extern "C" fn set_init_with_collection(receiver: Id, sel: Sel, other: Id) -> Id {
+    // SAFETY: a set or an array.
+    let values = unsafe { members_of(other) };
+    // SAFETY: `values` is a live slice of `values.len()` objects.
+    unsafe {
+        set_init_with_objects_count(receiver, sel, values.as_ptr() as *const Id, values.len())
+    }
+}
+
+unsafe extern "C" fn set_with_collection(class: Id, sel: Sel, other: Id) -> Id {
+    // SAFETY: a set or an array.
+    let values = unsafe { members_of(other) };
+    // SAFETY: as above.
+    unsafe { set_with_objects_count(class, sel, values.as_ptr() as *const Id, values.len()) }
 }
 
 unsafe extern "C" fn set_count(receiver: Id, _sel: Sel) -> usize {
@@ -2461,6 +2646,215 @@ unsafe extern "C" fn set_add_object(receiver: Id, _sel: Sel, object: Id) {
     }
 }
 
+/// `-copy` and `-mutableCopy` of a set: a new set of the same objects, for the
+/// same reason as [`copy_array`].
+fn copy_set(receiver: Id) -> Id {
+    // SAFETY: the receiver is a set.
+    let Some(set) = (unsafe { collections::set(receiver as CFTypeRef) }) else {
+        return std::ptr::null_mut();
+    };
+    let values = set.values.clone();
+    collections::new_set(&values, Policy::from_type_callbacks()) as Id
+}
+
+unsafe extern "C" fn set_copy(receiver: Id, _sel: Sel) -> Id {
+    copy_set(receiver)
+}
+
+unsafe extern "C" fn set_copy_with_zone(receiver: Id, _sel: Sel, _zone: *const ()) -> Id {
+    copy_set(receiver)
+}
+
+/// The set's members, as a fresh autoreleased array.
+///
+/// # Safety
+///
+/// `receiver` is a set.
+unsafe fn set_members_array(receiver: Id) -> Id {
+    // SAFETY: a set, by the caller.
+    let values = unsafe { collections::set(receiver as CFTypeRef) }
+        .map(|set| set.values.clone())
+        .unwrap_or_default();
+    // SAFETY: a fresh object holding live ones.
+    unsafe {
+        api::CFAutorelease(collections::new_array(
+            &values,
+            Policy::from_type_callbacks(),
+            false,
+        )) as Id
+    }
+}
+
+unsafe extern "C" fn set_all_objects(receiver: Id, _sel: Sel) -> Id {
+    // SAFETY: a set.
+    unsafe { set_members_array(receiver) }
+}
+
+unsafe extern "C" fn set_object_enumerator(receiver: Id, _sel: Sel) -> Id {
+    // SAFETY: a set; the array enumerates the snapshot it was given.
+    unsafe { new_array_enumerator(set_members_array(receiver), false) }
+}
+
+/// `-member:`: the member equal to `object`, or nil.
+unsafe extern "C" fn set_member(receiver: Id, _sel: Sel, object: Id) -> Id {
+    // SAFETY: a set.
+    unsafe { collections::set(receiver as CFTypeRef) }
+        .and_then(|set| {
+            set.values
+                .iter()
+                .find(|value| set.policy.equal(**value, object as CFTypeRef))
+                .copied()
+        })
+        .map_or(std::ptr::null_mut(), |value| value as Id)
+}
+
+/// The elements of a set or an array, whichever `collection` is.
+///
+/// # Safety
+///
+/// `collection` is null, a set or an array.
+unsafe fn members_of(collection: Id) -> Vec<CFTypeRef> {
+    // SAFETY: the caller's obligation.
+    unsafe {
+        if let Some(set) = collections::set(collection as CFTypeRef) {
+            return set.values.clone();
+        }
+        collections::array(collection as CFTypeRef)
+            .map(|array| array.values.clone())
+            .unwrap_or_default()
+    }
+}
+
+/// A fresh set of the receiver's members and `extra`.
+///
+/// # Safety
+///
+/// `receiver` is a set.
+unsafe fn set_adding(receiver: Id, extra: &[CFTypeRef]) -> Id {
+    // SAFETY: a set, by the caller.
+    let Some(set) = (unsafe { collections::set(receiver as CFTypeRef) }) else {
+        return std::ptr::null_mut();
+    };
+    let mut values = set.values.clone();
+    for value in extra {
+        if !values.iter().any(|v| set.policy.equal(*v, *value)) {
+            values.push(*value);
+        }
+    }
+    // SAFETY: a fresh object holding live ones.
+    unsafe {
+        api::CFAutorelease(collections::new_set(&values, Policy::from_type_callbacks())) as Id
+    }
+}
+
+unsafe extern "C" fn set_by_adding_object(receiver: Id, _sel: Sel, object: Id) -> Id {
+    // SAFETY: a set and a live object.
+    unsafe { set_adding(receiver, &[object as CFTypeRef]) }
+}
+
+unsafe extern "C" fn set_by_adding_objects(receiver: Id, _sel: Sel, other: Id) -> Id {
+    // SAFETY: a set, and a set or an array.
+    unsafe { set_adding(receiver, &members_of(other)) }
+}
+
+unsafe extern "C" fn set_add_objects(receiver: Id, sel: Sel, other: Id) {
+    // SAFETY: a set or an array.
+    for value in unsafe { members_of(other) } {
+        // SAFETY: a mutable set and a live member.
+        unsafe { set_add_object(receiver, sel, value as Id) };
+    }
+}
+
+unsafe extern "C" fn set_remove_object(receiver: Id, _sel: Sel, object: Id) {
+    // SAFETY: a set.
+    let Some(set) = (unsafe { collections::set(receiver as CFTypeRef) }) else {
+        return;
+    };
+    if let Some(at) = set
+        .values
+        .iter()
+        .position(|value| set.policy.equal(*value, object as CFTypeRef))
+    {
+        let value = set.values.remove(at);
+        set.policy.release(value);
+    }
+}
+
+unsafe extern "C" fn set_minus(receiver: Id, sel: Sel, other: Id) {
+    // SAFETY: a set or an array.
+    for value in unsafe { members_of(other) } {
+        // SAFETY: a mutable set.
+        unsafe { set_remove_object(receiver, sel, value as Id) };
+    }
+}
+
+/// Whether `set` holds a member equal to `value`, by the set's own equality.
+fn set_holds(set: &collections::SetContents, value: CFTypeRef) -> bool {
+    set.values.iter().any(|v| set.policy.equal(*v, value))
+}
+
+unsafe extern "C" fn set_intersect(receiver: Id, _sel: Sel, other: Id) {
+    // SAFETY: a set or an array.
+    let others = unsafe { members_of(other) };
+    // SAFETY: a mutable set.
+    let Some(set) = (unsafe { collections::set(receiver as CFTypeRef) }) else {
+        return;
+    };
+    let policy = set.policy;
+    let (kept, dropped): (Vec<CFTypeRef>, Vec<CFTypeRef>) = std::mem::take(&mut set.values)
+        .into_iter()
+        .partition(|v| others.iter().any(|o| policy.equal(*v, *o)));
+    set.values = kept;
+    for value in dropped {
+        policy.release(value);
+    }
+}
+
+unsafe extern "C" fn set_intersects(receiver: Id, _sel: Sel, other: Id) -> u8 {
+    // SAFETY: a set, and a set or an array.
+    let (Some(set), others) = (unsafe { collections::set(receiver as CFTypeRef) }, unsafe {
+        members_of(other)
+    }) else {
+        return 0;
+    };
+    others.iter().any(|o| set_holds(set, *o)) as u8
+}
+
+unsafe extern "C" fn set_is_subset(receiver: Id, _sel: Sel, other: Id) -> u8 {
+    // SAFETY: a set, and a set.
+    let (Some(set), Some(superset)) =
+        (unsafe { collections::set(receiver as CFTypeRef) }, unsafe {
+            collections::set(other as CFTypeRef)
+        })
+    else {
+        return 0;
+    };
+    set.values.iter().all(|v| set_holds(superset, *v)) as u8
+}
+
+unsafe extern "C" fn set_is_equal_to_set(receiver: Id, sel: Sel, other: Id) -> u8 {
+    // SAFETY: two sets, or nil.
+    let counts = unsafe {
+        (
+            collections::set(receiver as CFTypeRef).map(|s| s.values.len()),
+            collections::set(other as CFTypeRef).map(|s| s.values.len()),
+        )
+    };
+    // SAFETY: as `-isSubsetOfSet:`.
+    (counts.0.is_some()
+        && counts.0 == counts.1
+        && unsafe { set_is_subset(receiver, sel, other) } != 0) as u8
+}
+
+unsafe extern "C" fn set_remove_all(receiver: Id, _sel: Sel) {
+    // SAFETY: a set.
+    if let Some(set) = unsafe { collections::set(receiver as CFTypeRef) } {
+        for value in std::mem::take(&mut set.values) {
+            set.policy.release(value);
+        }
+    }
+}
+
 unsafe extern "C" fn set_any_object(receiver: Id, _sel: Sel) -> Id {
     // SAFETY: a set.
     unsafe { collections::set(receiver as CFTypeRef) }
@@ -2487,19 +2881,44 @@ unsafe extern "C" fn set_enumerate(
 pub(crate) fn install() {
     let set = objc::class::lookup(c"NSSet").expect("CoreFoundation registered NSSet");
     class_methods!(set, {
+        "set" => empty_set, c"@16@0:8";
         "setWithObject:" => set_with_object, c"@24@0:8@16";
         "setWithCapacity:" => set_with_capacity, c"@24@0:8Q16";
         "setWithArray:" => set_with_array, c"@24@0:8@16";
+        "setWithSet:" => set_with_collection, c"@24@0:8@16";
+        "setWithObjects:count:" => set_with_objects_count, c"@32@0:8^@16Q24";
     });
     methods!(set, {
         "count" => set_count, c"Q16@0:8";
         "containsObject:" => set_contains_object, c"B24@0:8@16";
         "anyObject" => set_any_object, c"@16@0:8";
+        "allObjects" => set_all_objects, c"@16@0:8";
+        "initWithObjects:count:" => set_init_with_objects_count, c"@32@0:8^@16Q24";
+        "initWithArray:" => set_init_with_collection, c"@24@0:8@16";
+        "initWithSet:" => set_init_with_collection, c"@24@0:8@16";
+        "objectEnumerator" => set_object_enumerator, c"@16@0:8";
+        "member:" => set_member, c"@24@0:8@16";
+        "setByAddingObject:" => set_by_adding_object, c"@24@0:8@16";
+        "setByAddingObjectsFromSet:" => set_by_adding_objects, c"@24@0:8@16";
+        "setByAddingObjectsFromArray:" => set_by_adding_objects, c"@24@0:8@16";
+        "intersectsSet:" => set_intersects, c"c24@0:8@16";
+        "isSubsetOfSet:" => set_is_subset, c"c24@0:8@16";
+        "isEqualToSet:" => set_is_equal_to_set, c"c24@0:8@16";
         "countByEnumeratingWithState:objects:count:" => set_enumerate, c"Q40@0:8^{?=Q^@^QQ5}16^@24Q32";
+        "copy" => set_copy, c"@16@0:8";
+        "copyWithZone:" => set_copy_with_zone, c"@24@0:8^v16";
+        "mutableCopy" => set_copy, c"@16@0:8";
+        "mutableCopyWithZone:" => set_copy_with_zone, c"@24@0:8^v16";
     });
     let mutable_set = objc::class::lookup(c"NSMutableSet").expect("NSMutableSet");
     methods!(mutable_set, {
         "addObject:" => set_add_object, c"v24@0:8@16";
+        "addObjectsFromArray:" => set_add_objects, c"v24@0:8@16";
+        "unionSet:" => set_add_objects, c"v24@0:8@16";
+        "removeObject:" => set_remove_object, c"v24@0:8@16";
+        "minusSet:" => set_minus, c"v24@0:8@16";
+        "intersectSet:" => set_intersect, c"v24@0:8@16";
+        "removeAllObjects" => set_remove_all, c"v16@0:8";
     });
 
     let enumerator = corefoundation::base::abstract_class(c"NSEnumerator", None);
@@ -2519,7 +2938,11 @@ pub(crate) fn install() {
     let array = objc::class::lookup(c"NSArray").expect("CoreFoundation registered NSArray");
     let mutable_array = objc::class::lookup(c"NSMutableArray").expect("NSMutableArray");
     methods!(array, {
+        "writeToFile:atomically:" => write_plist_to_file, c"B28@0:8@16c24";
+        "writeToURL:atomically:" => write_plist_to_url, c"B28@0:8@16c24";
         "count" => count, c"Q16@0:8";
+        "arrayByAddingObject:" => array_by_adding_object, c"@24@0:8@16";
+        "arrayByAddingObjectsFromArray:" => array_by_adding_objects, c"@24@0:8@16";
         "objectAtIndex:" => object_at_index, c"@24@0:8Q16";
         "subarrayWithRange:" => subarray_with_range, c"@32@0:8{_NSRange=QQ}16";
         "objectAtIndexedSubscript:" => object_at_index, c"@24@0:8Q16";
@@ -2533,7 +2956,6 @@ pub(crate) fn install() {
         "sortedArrayUsingSelector:" => sorted_array_using_selector, c"@24@0:8:16";
         "sortedArrayUsingComparator:" => sorted_array_using_comparator, c"@24@0:8@?16";
         "sortedArrayUsingFunction:context:" => sorted_array_using_function, c"@32@0:8^?16^v24";
-        "filteredArrayUsingPredicate:" => filtered_array_using_predicate, c"@24@0:8@16";
         "indexOfObjectWithOptions:passingTest:" => index_of_object_with_options_passing_test, c"Q32@0:8Q16@?24";
         "countByEnumeratingWithState:objects:count:" => array_enumerate, c"Q40@0:8^{?=Q^@^QQ5}16^@24Q32";
         "description" => array_description, c"@16@0:8";
@@ -2571,7 +2993,9 @@ pub(crate) fn install() {
         "replaceObjectAtIndex:withObject:" => replace_object_at_index, c"v32@0:8Q16@24";
         "setObject:atIndexedSubscript:" => set_object_at_indexed_subscript, c"v32@0:8@16Q24";
         "sortUsingFunction:context:" => sort_using_function, c"v32@0:8^?16^v24";
+        "sortUsingComparator:" => sort_using_comparator, c"v24@0:8@?16";
         "removeAllObjects" => remove_all_objects, c"v16@0:8";
+        "setArray:" => set_array, c"v24@0:8@16";
     });
     class_methods!(mutable_array, {
         "new" => new_array, c"@16@0:8";
@@ -2585,6 +3009,8 @@ pub(crate) fn install() {
     let mutable_dictionary =
         objc::class::lookup(c"NSMutableDictionary").expect("NSMutableDictionary");
     methods!(dictionary_class, {
+        "writeToFile:atomically:" => write_plist_to_file, c"B28@0:8@16c24";
+        "writeToURL:atomically:" => write_plist_to_url, c"B28@0:8@16c24";
         "count" => dictionary_count, c"Q16@0:8";
         "objectForKey:" => object_for_key, c"@24@0:8@16";
         "objectForKeyedSubscript:" => object_for_key, c"@24@0:8@16";
@@ -2638,19 +3064,6 @@ pub(crate) fn install() {
         "dictionaryWithCapacity:" => dictionary_with_capacity, c"@24@0:8Q16";
     });
 
-    let predicate = corefoundation::base::register(
-        c"NSPredicate",
-        None,
-        std::mem::size_of::<Predicate>(),
-        false,
-    );
-    methods!(predicate, {
-        "dealloc" => predicate_dealloc, c"v16@0:8";
-    });
-    class_methods!(predicate, {
-        "predicateWithBlock:" => predicate_with_block, c"@24@0:8@?16";
-    });
-
     let data = objc::class::lookup(c"NSData").expect("CoreFoundation registered NSData");
     let mutable_data = objc::class::lookup(c"NSMutableData").expect("NSMutableData");
     methods!(data, {
@@ -2670,6 +3083,7 @@ pub(crate) fn install() {
         "writeToFile:atomically:" => write_to_file, c"B28@0:8@16c24";
         "init" => data_init, c"@16@0:8";
         "initWithData:" => data_init_with_data, c"@24@0:8@16";
+        "initWithBase64EncodedString:options:" => data_init_with_base64_string, c"@32@0:8@16Q24";
         "initWithBytes:length:" => data_init_with_bytes, c"@32@0:8r^v16Q24";
         "initWithBytesNoCopy:length:" => data_init_no_copy, c"@32@0:8^v16Q24";
         "initWithBytesNoCopy:length:freeWhenDone:" => data_init_no_copy_free, c"@36@0:8^v16Q24B32";
@@ -2765,4 +3179,77 @@ pub(crate) fn install() {
         "numberWithUnsignedChar:" => number_with_unsigned_char, c"@24@0:8C16";
         "numberWithFloat:" => number_with_float, c"@24@0:8f16";
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn base64_decodes_padded_text_and_rejects_the_rest() {
+        assert_eq!(base64_decode(b"aGk=", false).as_deref(), Some(&b"hi"[..]));
+        assert_eq!(base64_decode(b"aGV5", false).as_deref(), Some(&b"hey"[..]));
+        assert_eq!(base64_decode(b"aGk", false), None);
+        assert_eq!(base64_decode(b"aG=k", false), None);
+        assert_eq!(base64_decode(b"aGV5\naGk=", false), None);
+        assert_eq!(
+            base64_decode(b"aGV5\naGk=", true).as_deref(),
+            Some(&b"heyhi"[..])
+        );
+    }
+
+    #[test]
+    fn sort_using_comparator_orders_a_mutable_array_in_place() {
+        crate::bootstrap();
+        unsafe extern "C" fn compare(_block: Id, a: Id, b: Id) -> isize {
+            // SAFETY: the array holds only strings.
+            unsafe { api::CFStringCompare(a as CFTypeRef, b as CFTypeRef, 0) }
+        }
+        let block = crate::block::fake::block(compare as *const std::ffi::c_void);
+        let strings = ["c", "a", "b"].map(|s| crate::string::from_str(s) as CFTypeRef);
+        let array = collections::new_array(&strings, Policy::from_type_callbacks(), true) as Id;
+        // SAFETY: a mutable array and an `NSComparator`.
+        unsafe { sort_using_comparator(array, objc::sel::get("sortUsingComparator:"), block.id()) };
+        let at = objc::sel::get("objectAtIndex:");
+        // SAFETY: an array of three.
+        let sorted = [0, 1, 2].map(|i| unsafe { object_at_index(array, at, i) } as CFTypeRef);
+        assert_eq!(sorted, [strings[1], strings[2], strings[0]]);
+        objc::arc::release(array);
+        for string in strings {
+            objc::arc::release(string as Id);
+        }
+    }
+
+    #[test]
+    fn copying_a_set_leaves_the_copy_alone_when_the_original_changes() {
+        crate::bootstrap();
+        let (a, b) = (crate::string::from_str("a"), crate::string::from_str("b"));
+        let set = collections::new_set(&[a as CFTypeRef], Policy::from_type_callbacks()) as Id;
+        let sel = objc::sel::get("copyWithZone:");
+        // SAFETY: a set this test made, so a class it has.
+        let class = unsafe { objc::object::class_of(set) }.expect("a set");
+        // SAFETY: `-copyWithZone:` is `id (id, SEL, NSZone *)`.
+        let copy = unsafe {
+            let f: unsafe extern "C" fn(Id, Sel, *const ()) -> Id =
+                std::mem::transmute(objc::class::method_implementation(class, sel));
+            f(set, sel, std::ptr::null())
+        };
+        assert_ne!(copy, set);
+        // SAFETY: a set and a live string.
+        unsafe { set_add_object(set, objc::sel::get("addObject:"), b) };
+        let count = objc::sel::get("count");
+        // SAFETY: both are sets.
+        unsafe {
+            assert_eq!(set_count(set, count), 2);
+            assert_eq!(set_count(copy, count), 1);
+            assert!(set_contains_object(
+                copy,
+                objc::sel::get("containsObject:"),
+                a
+            ));
+        }
+        for object in [copy, set, a, b] {
+            objc::arc::release(object);
+        }
+    }
 }

@@ -6,6 +6,7 @@ use crate::abi::{AbiError, Callbacks, GuestMemory, Result};
 
 use super::bad_pointer;
 use super::host::host_or_refuse;
+use crate::shims::bind;
 
 /// Byte offset of `invoke` in a `Block_layout`: `isa`, `flags`, `reserved`.
 const INVOKE_OFFSET: u64 = 16;
@@ -131,6 +132,9 @@ fn call_block(symbol: &str, host: u64, args: &[u64]) {
             [a, b, c] => {
                 core::mem::transmute::<u64, extern "C" fn(u64, u64, u64)>(host)(*a, *b, *c)
             }
+            [a, b, c, d] => {
+                core::mem::transmute::<u64, extern "C" fn(u64, u64, u64, u64)>(host)(*a, *b, *c, *d)
+            }
             _ => unreachable!("unsupported block dispatch arity for {symbol}"),
         }
     }
@@ -202,6 +206,23 @@ fn dispatch_once(
     }
     substitute_block(symbol, block, mem, callbacks)?;
     call_block(symbol, host_or_refuse(symbol)?, &[predicate, block]);
+    Ok(())
+}
+
+/// `void qsort_b(void *base, size_t nel, size_t width, int (^compar)(const
+/// void *, const void *))`: the block is called before the sort returns.
+fn qsort_b(
+    symbol: &str,
+    ctx: &mut RegisterContext,
+    mem: &mut dyn GuestMemory,
+    callbacks: &dyn Callbacks,
+) -> Result<()> {
+    let (base, nel, width, block) = (ctx.rdi, ctx.rsi, ctx.rdx, ctx.rcx);
+    if block == 0 {
+        return Err(bad_pointer(symbol, 0));
+    }
+    substitute_block(symbol, block, mem, callbacks)?;
+    call_block(symbol, host_or_refuse(symbol)?, &[base, nel, width, block]);
     Ok(())
 }
 
@@ -338,6 +359,23 @@ fn object_and_block(
     Ok(())
 }
 
+/// `void CFRunLoopPerformBlock(CFRunLoopRef, CFTypeRef mode, block)`: two
+/// objects, then a block the run loop copies.
+fn run_loop_perform_block(
+    symbol: &str,
+    ctx: &mut RegisterContext,
+    mem: &mut dyn GuestMemory,
+    callbacks: &dyn Callbacks,
+) -> Result<()> {
+    let (run_loop, mode, block) = (ctx.rdi, ctx.rsi, ctx.rdx);
+    if block == 0 {
+        return Err(bad_pointer(symbol, 0));
+    }
+    substitute_block(symbol, block, mem, callbacks)?;
+    call_block(symbol, host_or_refuse(symbol)?, &[run_loop, mode, block]);
+    Ok(())
+}
+
 /// One of this module's implementations, in the shape [`crate::shims`] wants -
 /// the wider one, carrying [`Callbacks`].
 pub type Shim = crate::signal::Shim;
@@ -348,19 +386,44 @@ pub type Shim = crate::signal::Shim;
 /// libdispatch.
 pub fn shim_for(name: &str) -> Option<Shim> {
     match name {
-        "dispatch_async" => Some(dispatch_async),
-        "dispatch_sync" => Some(dispatch_sync),
-        "dispatch_after" => Some(dispatch_after),
-        "dispatch_once" => Some(dispatch_once),
-        "dispatch_data_create" => Some(dispatch_data_create),
-        "dispatch_group_notify" => Some(dispatch_group_notify),
-        "dispatch_group_async" => Some(dispatch_group_async),
-        "CFRunLoopObserverCreateWithHandler" => Some(run_loop_observer_create_with_handler),
-        "nw_path_monitor_set_update_handler"
-        | "nw_path_monitor_set_cancel_handler"
-        | "nw_path_enumerate_interfaces" => Some(object_and_block),
+        "dispatch_async" => Some(bind!(callback "dispatch_async" => dispatch_async)),
+        "dispatch_sync" => Some(bind!(callback "dispatch_sync" => dispatch_sync)),
+        "dispatch_after" => Some(bind!(callback "dispatch_after" => dispatch_after)),
+        "dispatch_once" => Some(bind!(callback "dispatch_once" => dispatch_once)),
+        "dispatch_data_create" => {
+            Some(bind!(callback "dispatch_data_create" => dispatch_data_create))
+        }
+        "dispatch_group_notify" => {
+            Some(bind!(callback "dispatch_group_notify" => dispatch_group_notify))
+        }
+        "dispatch_group_async" => {
+            Some(bind!(callback "dispatch_group_async" => dispatch_group_async))
+        }
+        "CFRunLoopPerformBlock" => {
+            Some(bind!(callback "CFRunLoopPerformBlock" => run_loop_perform_block))
+        }
+        "CFRunLoopObserverCreateWithHandler" => Some(
+            bind!(callback "CFRunLoopObserverCreateWithHandler" => run_loop_observer_create_with_handler),
+        ),
+        "nw_path_monitor_set_update_handler" => {
+            Some(bind!(callback "nw_path_monitor_set_update_handler" => object_and_block))
+        }
+        "nw_path_monitor_set_cancel_handler" => {
+            Some(bind!(callback "nw_path_monitor_set_cancel_handler" => object_and_block))
+        }
+        "dispatch_source_set_event_handler" => {
+            Some(bind!(callback "dispatch_source_set_event_handler" => object_and_block))
+        }
+        "dispatch_source_set_cancel_handler" => {
+            Some(bind!(callback "dispatch_source_set_cancel_handler" => object_and_block))
+        }
+        "nw_path_enumerate_interfaces" => {
+            Some(bind!(callback "nw_path_enumerate_interfaces" => object_and_block))
+        }
+        "qsort_b" => Some(bind!(callback "qsort_b" => qsort_b)),
         // Both spellings.
-        "_Block_copy" | "Block_copy" => Some(block_copy),
+        "_Block_copy" => Some(bind!(callback "_Block_copy" => block_copy)),
+        "Block_copy" => Some(bind!(callback "Block_copy" => block_copy)),
         _ => None,
     }
 }

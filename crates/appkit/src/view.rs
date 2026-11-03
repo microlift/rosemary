@@ -1,4 +1,7 @@
+use std::collections::HashMap;
 use std::ffi::c_void;
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use foundation::geometry::{CGFloat, NSPoint, NSRect, NSSize};
 use objc::object::Id;
@@ -23,10 +26,10 @@ pub struct View {
     allowed_touch_types: usize,
     frame: NSRect,
     wants_best_resolution: usize,
-    /// `-setPostsFrameChangedNotifications:` and its bounds twin, as the two
-    /// low bits. A view posts nothing until it is asked to, which is AppKit's
-    /// default for a view built with `-initWithFrame:`.
-    posts: usize,
+    /// `-setPostsFrameChangedNotifications:NO` and its bounds twin, as the two
+    /// low bits. Stored inverted: a view posts both until it is told not to,
+    /// which is AppKit's default, so zero means posting.
+    quiet: usize,
     /// `NSAutoresizingMaskOptions`, which says which of the six lengths around
     /// and inside this view give when its superview resizes. See
     /// [`resize_subviews`].
@@ -50,6 +53,9 @@ pub struct View {
     /// [`WANTS_LAYER`] and [`BACKING_LAYER`], and `-setLayerContentsPlacement:`
     /// from [`PLACEMENT_SHIFT`] up.
     layer_backing: usize,
+    /// `-setBoundsOrigin:`: where the view's own coordinates start, which is
+    /// how a clip view scrolls its document. The bounds' size is the frame's.
+    bounds_origin: NSPoint,
 }
 
 /// The bits of [`View::layer_backing`]: the view asked for a layer, and the
@@ -79,6 +85,1301 @@ pub const FRAME_DID_CHANGE: &str = "NSViewFrameDidChangeNotification";
 /// ...and when its bounds do.
 pub const BOUNDS_DID_CHANGE: &str = "NSViewBoundsDidChangeNotification";
 
+/// A live Metal layer in bottom-to-top AppKit view order. IDs are identities,
+/// not owned Objective-C references: consumers must not dereference them.
+/// A rounded CA masksToBounds ancestor in physical window coordinates.
+/// All nested rounded masks are retained rather than collapsing them into a
+/// rectangular intersection which would reveal corner pixels incorrectly.
+#[derive(Clone, Copy)]
+pub struct RoundedSceneClip {
+    pub frame: Frame,
+    pub radius: f32,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct OpacityGroup {
+    /// A Core Animation tree identity, captured on AppKit's video thread.
+    pub id: usize,
+    pub opacity: f32,
+}
+
+#[derive(Clone)]
+pub struct MetalSceneLayer {
+    pub layer: usize,
+    pub opacity_groups: Vec<OpacityGroup>,
+    pub frame: Frame,
+    pub opacity: f32,
+    pub opaque: bool,
+    /// Clip from enclosing AppKit/CA bounds, expressed in physical window pixels.
+    pub clip: Option<Frame>,
+    pub rounded: Vec<RoundedSceneClip>,
+    /// Live opaque AppKit/native coverage above this Metal layer, in window
+    /// pixels. The compositor must not retain coverage from a past drawable.
+    pub occluded: Vec<Frame>,
+    /// Independent CPU-backed native content stacked above a Metal layer.
+    /// None for actual CAMetalLayers. The GPU worker uploads immutable bytes.
+    pub native_pixels: Option<std::sync::Arc<Vec<u8>>>,
+    /// Large plain opaque sources are represented as immutable row bands.
+    /// A present CPU snapshot never materializes a full contiguous image.
+    pub native_tiles: Option<std::sync::Arc<crate::backing::NativePixelTiles>>,
+    pub native_cpu_capture: Option<crate::backing::NativeCpuCapture>,
+    pub native_dmabuf: Option<std::sync::Arc<crate::backing::Dmabuf>>,
+    pub native_revision: u64,
+    /// Full native frame and origin of this tile in the DMA source's scaled
+    /// image space. Unlike cropped CPU bytes, the DMA allocation is imported
+    /// without cloning or changing its underlying extent.
+    pub native_dma_sample: Option<(u32, u32, u32, u32)>,
+    /// Original NSView pointer that owns an independent CPU/DMA image. A
+    /// large view can publish multiple tiles with distinct GPU layer IDs.
+    pub native_owner: usize,
+}
+
+impl MetalSceneLayer {
+    /// Whether the GPU worker gets CPU pixels for this layer, contiguous or
+    /// row-banded.
+    pub fn has_native_cpu_source(&self) -> bool {
+        self.native_pixels.is_some() || self.native_tiles.is_some()
+    }
+}
+
+static NATIVE_TILE_IDS: std::sync::LazyLock<Mutex<HashMap<(usize, u32), usize>>> =
+    std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
+static NATIVE_NEXT_TILE: AtomicUsize = AtomicUsize::new(1);
+
+pub(crate) fn descendant_view_layers(view: Id) -> Vec<usize> {
+    fn collect(view: Id, result: &mut Vec<usize>, depth: usize) {
+        if depth >= 64 || !is_view(view) {
+            return;
+        }
+        let children = view_of(view).subviews;
+        if let Some(children) =
+            unsafe { corefoundation::collections::array(children as *const c_void) }
+        {
+            for &child in &children.values {
+                let child = child as Id;
+                if !is_view(child) {
+                    continue;
+                }
+                let layer = view_of(child).layer;
+                if !layer.is_null() {
+                    result.push(layer as usize);
+                }
+                collect(child, result, depth + 1);
+            }
+        }
+    }
+    let mut result = Vec::new();
+    collect(view, &mut result, 0);
+    result
+}
+
+fn native_tile_id(view: Id, index: u32) -> usize {
+    if index == 0 {
+        return view as usize | (1usize << (usize::BITS - 1));
+    }
+    let mut ids = NATIVE_TILE_IDS.lock().expect("native tile IDs");
+    *ids.entry((view as usize, index)).or_insert_with(|| {
+        (3usize << (usize::BITS - 2)) | NATIVE_NEXT_TILE.fetch_add(1, Ordering::Relaxed)
+    })
+}
+
+pub(crate) fn forget_native_tile_ids(view: Id) {
+    NATIVE_TILE_IDS
+        .lock()
+        .expect("native tile IDs")
+        .retain(|(owner, _), _| *owner != view as usize);
+}
+
+fn native_tile_owner(scene_layer: usize) -> usize {
+    NATIVE_TILE_IDS
+        .lock()
+        .expect("native tile IDs")
+        .iter()
+        .find_map(|((owner, _), &layer)| (layer == scene_layer).then_some(*owner))
+        .unwrap_or(scene_layer & !(1usize << (usize::BITS - 1)))
+}
+
+// SAFETY: a snapshot owns only integer layer identities and a copied SDL
+// window handle, which is compared as an identity and never dereferenced by
+// a compositor worker. The AppKit event thread creates the values.
+unsafe impl Send for MetalSceneLayer {}
+
+/// AppKit sends value-only snapshots; Metal owns GPU resources independently.
+/// The hook must not wait for a presentation lock or the Vulkan device.
+static METAL_SCENE_CHANGED: std::sync::OnceLock<fn(sdl3::Window, Vec<MetalSceneLayer>)> =
+    std::sync::OnceLock::new();
+/// Event-thread-published scene snapshots. The Metal presenter must not walk
+/// mutable NSView subview arrays from a separate GPU presentation thread.
+static METAL_SCENES: std::sync::Mutex<
+    Option<std::collections::HashMap<usize, Vec<MetalSceneLayer>>>,
+> = std::sync::Mutex::new(None);
+
+// No guest setter thread is allowed to borrow an NSView's subviews. Mark a
+// transaction dirty and let the video owner capture it once per event turn.
+static METAL_SCENE_DIRTY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static METAL_VIEW_SCENE_DIRTY: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+/// SDL window identities are published without borrowing NSViews. Targeted
+/// AppKit changes only recapture the affected window; unresolved reparenting
+/// still goes through the process-wide fallback flag above.
+// Swapchain initialization can occur after an otherwise unchanged AppKit
+// publication. Replay only the registered window on its owner thread.
+static METAL_SCENE_REPLAY_WINDOWS: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashSet<usize>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashSet::new()));
+
+static METAL_VIEW_DIRTY_WINDOWS: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashSet<usize>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashSet::new()));
+static METAL_CA_DAMAGE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// CA roots are numerical identities; only the video owner associates them
+/// with live windows after walking the NSView tree.
+static METAL_CA_ROOTS: std::sync::Mutex<Vec<usize>> = std::sync::Mutex::new(Vec::new());
+/// DMA-BUF import failures originate on the GPU worker. Only the AppKit
+/// owner can safely ask a still-live NSView to redraw via CPU pixels.
+static NATIVE_CPU_FALLBACKS: std::sync::Mutex<Vec<(usize, usize)>> =
+    std::sync::Mutex::new(Vec::new());
+
+pub fn request_native_cpu_fallback(window: sdl3::Window, scene_layer: usize) {
+    let mut pending = NATIVE_CPU_FALLBACKS
+        .lock()
+        .expect("native CPU redraw requests");
+    if !pending.contains(&(window as usize, scene_layer)) {
+        pending.push((window as usize, scene_layer));
+    }
+    invalidate_metal_scene_for_window(window);
+}
+
+fn find_scene_native_view(root: Id, owner: usize, depth: usize) -> Option<Id> {
+    if root.is_null() || depth >= 64 || !is_view(root) {
+        return None;
+    }
+    if root as usize == owner {
+        return Some(root);
+    }
+    for child in unsafe { children(root) } {
+        if let Some(found) = find_scene_native_view(child, owner, depth + 1) {
+            return Some(found);
+        }
+    }
+    None
+}
+
+fn service_native_cpu_fallbacks() {
+    let pending = std::mem::take(
+        &mut *NATIVE_CPU_FALLBACKS
+            .lock()
+            .expect("native CPU redraw requests"),
+    );
+    for (sdl, layer) in pending {
+        let window = crate::window::window_for(sdl as sdl3::Window);
+        if window.is_null() {
+            continue;
+        }
+        if let Some(view) = find_scene_native_view(
+            crate::window::content_view_of(window),
+            native_tile_owner(layer),
+            0,
+        ) {
+            crate::backing::needs_display(view);
+        }
+    }
+}
+
+static METAL_SCENE_OWNERS: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashMap<usize, Vec<usize>>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+// Capture-time index. Each live owner retains its view until the next
+// capture or window teardown, so the event pump never dereferences a freed
+// Objective-C instance after a concurrent view removal.
+struct MetalSurfacePollOwner {
+    view: usize,
+}
+
+impl MetalSurfacePollOwner {
+    fn new(view: Id) -> Self {
+        objc::arc::retain(view);
+        Self {
+            view: view as usize,
+        }
+    }
+}
+
+impl Drop for MetalSurfacePollOwner {
+    fn drop(&mut self) {
+        objc::arc::release(self.view as Id);
+    }
+}
+
+static METAL_SURFACE_POLL_OWNERS: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashMap<usize, Vec<std::sync::Arc<MetalSurfacePollOwner>>>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+
+#[cfg(test)]
+static METAL_SURFACE_POLL_VISITS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+static METAL_SCENE_WAS_ANIMATING: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+static METAL_SCENE_LAST_ANIM_FRAME: std::sync::Mutex<Option<std::time::Instant>> =
+    std::sync::Mutex::new(None);
+static METAL_LAST_ANIM_ROOTS: std::sync::Mutex<Vec<usize>> = std::sync::Mutex::new(Vec::new());
+#[cfg(test)]
+static METAL_SCENE_CAPTURES: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+#[cfg(test)]
+static METAL_SCENE_DAMAGED_WINDOWS: std::sync::Mutex<Vec<usize>> =
+    std::sync::Mutex::new(Vec::new());
+
+/// Queue from any guest thread, including while AppKit is reparenting views.
+/// No Objective-C pointer or mutable NSView field is touched here.
+/// Until the main event pump captures an invalidation, the Metal fast path
+/// must fail closed: a previous snapshot can omit a newly installed CA mask.
+pub fn metal_scene_pending() -> bool {
+    METAL_SCENE_DIRTY.load(std::sync::atomic::Ordering::Acquire)
+}
+
+pub(crate) fn invalidate_ca_layer(root: usize) {
+    // Never inspect NSView or SDL from the setter thread. A root not in the
+    // published owner table triggers a conservative full-window fallback.
+    let mut roots = METAL_CA_ROOTS.lock().expect("CA dirty roots");
+    if !roots.contains(&root) {
+        roots.push(root);
+    }
+    METAL_SCENE_DIRTY.store(true, std::sync::atomic::Ordering::Release);
+}
+
+pub(crate) fn invalidate_metal_scene(ca_damage: bool) {
+    METAL_VIEW_SCENE_DIRTY.store(true, std::sync::atomic::Ordering::Release);
+    if ca_damage {
+        METAL_CA_DAMAGE.store(true, std::sync::atomic::Ordering::Release);
+    }
+    METAL_SCENE_DIRTY.store(true, std::sync::atomic::Ordering::Release);
+}
+
+/// Safe on any thread: only numeric SDL identities cross this queue.
+pub(crate) fn invalidate_metal_scene_for_window(sdl: sdl3::Window) {
+    if sdl.is_null() {
+        invalidate_metal_scene(false);
+        return;
+    }
+    METAL_VIEW_DIRTY_WINDOWS
+        .lock()
+        .expect("view dirty windows")
+        .insert(sdl as usize);
+    METAL_SCENE_DIRTY.store(true, std::sync::atomic::Ordering::Release);
+}
+
+/// Request from the Vulkan initializer. No AppKit/NSView state is read on
+/// that thread; the next video pump recaptures and publishes even if identical.
+pub fn request_metal_scene_replay(sdl: sdl3::Window) {
+    if sdl.is_null()
+        || !METAL_SCENES
+            .lock()
+            .expect("AppKit scene snapshots")
+            .as_ref()
+            .is_some_and(|scenes| scenes.contains_key(&(sdl as usize)))
+    {
+        return;
+    }
+    METAL_SCENE_REPLAY_WINDOWS
+        .lock()
+        .expect("Metal swapchain replay requests")
+        .insert(sdl as usize);
+    invalidate_metal_scene_for_window(sdl);
+}
+
+/// Ordinary view setters run in AppKit's owner context. Never dereference an
+/// NSView on a Metal presentation worker or other unknown guest thread.
+pub(crate) fn invalidate_metal_scene_for_view(view: Id) {
+    if !sdl3::video::is_video_thread() || !is_view(view) {
+        invalidate_metal_scene(false);
+        return;
+    }
+    let window = unsafe { window_of(view) };
+    if window.is_null() {
+        invalidate_metal_scene(false);
+        return;
+    }
+    invalidate_metal_scene_for_window(unsafe { crate::window::sdl_window(window) });
+}
+
+/// Called by the video-thread event pump after dispatching guest input.
+/// An invalidation racing a capture stays dirty for the following turn.
+/// IOSurface writers need not call setContents: again. Poll only the CA
+/// descendants which belong to a Metal-backed view, on AppKit's event thread.
+fn poll_metal_surface_publications() {
+    if !crate::coreanimation::has_surface_publications() {
+        return;
+    }
+    let owners = METAL_SURFACE_POLL_OWNERS
+        .lock()
+        .expect("Metal IOSurface owner registry")
+        .iter()
+        .flat_map(|(window, views)| {
+            views
+                .iter()
+                .cloned()
+                .map(|view| (*window, view))
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
+    for (window, owner) in owners {
+        let view = owner.view as Id;
+        let attached = unsafe { window_of(view) };
+        if attached.is_null() || unsafe { crate::window::sdl_window(attached) } as usize != window {
+            continue;
+        }
+        let layer = view_of(view).layer;
+        if layer.is_null() || !crate::layer::is_metal(layer) {
+            continue;
+        }
+        #[cfg(test)]
+        METAL_SURFACE_POLL_VISITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if let Some(frame) = unsafe { presentation_frame(view) } {
+            let rect = crate::backing::Rect {
+                x: i64::from(frame.x),
+                y: i64::from(frame.y),
+                width: i64::from(frame.width),
+                height: i64::from(frame.height),
+            };
+            let viewport = crate::backing::Rect {
+                x: 0,
+                y: 0,
+                width: i64::from(frame.window_width),
+                height: i64::from(frame.window_height),
+            };
+            if crate::coreanimation::metal_surface_publication_changed(view, rect, viewport) {
+                crate::coreanimation::changed(layer);
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn surface_poll_owner_count_for_test(window: sdl3::Window) -> usize {
+    METAL_SURFACE_POLL_OWNERS
+        .lock()
+        .expect("Metal IOSurface owner registry")
+        .get(&(window as usize))
+        .map_or(0, Vec::len)
+}
+
+#[cfg(test)]
+pub(crate) fn surface_poll_visits_for_test() -> usize {
+    METAL_SURFACE_POLL_VISITS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+fn capture_surface_poll_owners(window: sdl3::Window) {
+    let mut owners = Vec::new();
+    if crate::coreanimation::has_surface_publications() {
+        let nswindow = crate::window::window_for(window);
+        if !nswindow.is_null() {
+            fn visit(
+                view: Id,
+                depth: usize,
+                owners: &mut Vec<std::sync::Arc<MetalSurfacePollOwner>>,
+            ) {
+                if depth >= 64 || !is_view(view) {
+                    return;
+                }
+                let layer = view_of(view).layer;
+                if !layer.is_null()
+                    && crate::layer::is_metal(layer)
+                    && crate::coreanimation::metal_subtree_has_surface(layer)
+                {
+                    owners.push(std::sync::Arc::new(MetalSurfacePollOwner::new(view)));
+                }
+                let children = view_of(view).subviews;
+                if let Some(children) =
+                    unsafe { corefoundation::collections::array(children as *const c_void) }
+                {
+                    for &child in &children.values {
+                        visit(child as Id, depth + 1, owners);
+                    }
+                }
+            }
+            visit(crate::window::content_view_of(nswindow), 0, &mut owners);
+        }
+    }
+    // Destructors release NSViews and may invalidate another scene. Drop old
+    // registry entries without holding this registry's lock.
+    let old = METAL_SURFACE_POLL_OWNERS
+        .lock()
+        .expect("Metal IOSurface owner registry")
+        .insert(window as usize, owners);
+    drop(old);
+}
+
+/// Animation frames intentionally publish without waiting for new drawables.
+pub(crate) fn flush_metal_scenes() {
+    if !sdl3::video::is_video_thread() {
+        return;
+    }
+    service_native_cpu_fallbacks();
+    poll_metal_surface_publications();
+    let now = darwin::mach::media_time();
+    let animated_roots = crate::coreanimation::scene_animation_roots(now);
+    let animating = !animated_roots.is_empty();
+    let was_animating =
+        METAL_SCENE_WAS_ANIMATING.swap(animating, std::sync::atomic::Ordering::AcqRel);
+    if animating && !metal_scene_pending() {
+        let last = METAL_SCENE_LAST_ANIM_FRAME
+            .lock()
+            .expect("Metal animation tick");
+        if last.is_some_and(|at| at.elapsed() < std::time::Duration::from_millis(4)) {
+            return;
+        }
+    }
+    let replay = std::mem::take(
+        &mut *METAL_SCENE_REPLAY_WINDOWS
+            .lock()
+            .expect("Metal swapchain replay requests"),
+    );
+    let dirty = METAL_SCENE_DIRTY.swap(false, std::sync::atomic::Ordering::AcqRel);
+    let damage = METAL_CA_DAMAGE.swap(false, std::sync::atomic::Ordering::AcqRel);
+    let view_dirty = METAL_VIEW_SCENE_DIRTY.swap(false, std::sync::atomic::Ordering::AcqRel);
+    let targeted =
+        std::mem::take(&mut *METAL_VIEW_DIRTY_WINDOWS.lock().expect("view dirty windows"));
+    if (damage || view_dirty || !targeted.is_empty() || !replay.is_empty()) && !dirty {
+        if damage {
+            METAL_CA_DAMAGE.store(true, std::sync::atomic::Ordering::Release);
+        }
+        if view_dirty {
+            METAL_VIEW_SCENE_DIRTY.store(true, std::sync::atomic::Ordering::Release);
+        }
+        METAL_VIEW_DIRTY_WINDOWS
+            .lock()
+            .expect("view dirty windows")
+            .extend(targeted.iter().copied());
+        METAL_SCENE_REPLAY_WINDOWS
+            .lock()
+            .expect("Metal swapchain replay requests")
+            .extend(replay.iter().copied());
+        METAL_SCENE_DIRTY.store(true, std::sync::atomic::Ordering::Release);
+    }
+    if !dirty && !animating && !was_animating {
+        return;
+    }
+    if animating {
+        *METAL_SCENE_LAST_ANIM_FRAME
+            .lock()
+            .expect("Metal animation tick") = Some(std::time::Instant::now());
+    }
+    // Drain only the roots pending at this transaction boundary. A CA setter
+    // racing the drain re-sets DIRTY and its root persists to the next turn.
+    let roots = std::mem::take(&mut *METAL_CA_ROOTS.lock().expect("CA dirty roots"));
+    let mut all_roots = roots.clone();
+    {
+        let mut last = METAL_LAST_ANIM_ROOTS
+            .lock()
+            .expect("last CA animation roots");
+        if was_animating && !animating {
+            all_roots.extend(last.iter().copied());
+        }
+        *last = animated_roots.clone();
+    }
+    all_roots.extend(animated_roots);
+    let owners = METAL_SCENE_OWNERS.lock().expect("CA owner windows");
+    let mut affected = std::collections::HashSet::new();
+    let mut unknown = false;
+    for root in all_roots {
+        let mut matched = false;
+        for (window, layers) in owners.iter() {
+            if layers.contains(&root) {
+                affected.insert(*window);
+                matched = true;
+            }
+        }
+        if !matched && roots.contains(&root) {
+            // A newly mutated CA root without a known window still needs a
+            // conservative recapture. An idle detached animation does not:
+            // it must not redraw unrelated windows every video-thread tick.
+            unknown = true;
+        }
+    }
+    drop(owners);
+    // Known view/overlay/window mutations only affect that live SDL owner.
+    // Unknown lifecycle owners and unscoped CA damage conservatively fan out.
+    let global = damage || view_dirty || unknown;
+    affected.extend(targeted);
+    affected.extend(replay.iter().copied());
+    for window in crate::window::all() {
+        let sdl = unsafe { crate::window::sdl_window(window) };
+        if sdl.is_null() {
+            continue;
+        }
+        if !global && !affected.contains(&(sdl as usize)) {
+            continue;
+        }
+        let underlay_animating =
+            (animating || was_animating) && crate::backing::underlay_animation_tick(sdl, now);
+        if underlay_animating
+            || damage
+            || !roots.is_empty() && (unknown || affected.contains(&(sdl as usize)))
+        {
+            #[cfg(test)]
+            METAL_SCENE_DAMAGED_WINDOWS
+                .lock()
+                .expect("CA damage audit")
+                .push(sdl as usize);
+            crate::backing::damage_view(crate::window::content_view_of(window));
+        }
+        publish_metal_scene_at(sdl, now, replay.contains(&(sdl as usize)));
+    }
+}
+
+pub fn set_metal_scene_changed(hook: fn(sdl3::Window, Vec<MetalSceneLayer>)) {
+    let _ = METAL_SCENE_CHANGED.set(hook);
+}
+
+/// Capture visible CAMetalLayer views in the order their enclosing NSViews
+/// would paint: ancestors precede descendants, later siblings are on top.
+/// A missing AppKit window is distinct from a window with no Metal layers.
+/// Gate backing pixel redraw recaptures by published Metal membership, not
+/// previously captured native pixels. The first drawRect: of a native view
+/// *creates* the source and must be discovered even if none existed before.
+/// Unrelated software-only windows still avoid scene captures.
+pub(crate) fn native_metal_scene_active(window: sdl3::Window) -> bool {
+    METAL_SCENES
+        .lock()
+        .expect("AppKit scene snapshots")
+        .as_ref()
+        .and_then(|all| all.get(&(window as usize)))
+        .is_some_and(|scene| {
+            scene
+                .iter()
+                .any(|item| !item.has_native_cpu_source() && item.native_dmabuf.is_none())
+        })
+}
+
+pub fn metal_scene(window: sdl3::Window) -> Option<Vec<MetalSceneLayer>> {
+    METAL_SCENES
+        .lock()
+        .expect("AppKit scene snapshots")
+        .as_ref()
+        .and_then(|all| all.get(&(window as usize)).cloned())
+}
+
+/// Evaluate CA opacity/visibility of every NSView backing layer from the
+/// view root down. The CA superlayer chain can omit an NSView's enclosing
+/// view layer; scene_properties_below stops at that enclosing layer so the
+/// two representations of the same ancestor are not multiplied twice.
+/// This function is only valid on AppKit's event thread.
+pub(crate) fn native_scene_ca_opacity(view: Id, now: f64) -> f32 {
+    let mut chain = Vec::new();
+    let mut at = view;
+    for _ in 0..64 {
+        if at.is_null() || !is_view(at) {
+            break;
+        }
+        chain.push(at);
+        at = view_of(at).superview;
+    }
+    let mut opacity = 1.0;
+    let mut parent_layer = std::ptr::null_mut();
+    for &view in chain.iter().rev() {
+        let layer = view_of(view).layer;
+        if layer.is_null() {
+            continue;
+        }
+        let (hidden, local_opacity) =
+            crate::coreanimation::scene_properties_below(layer, parent_layer, now);
+        if hidden {
+            return 0.0;
+        }
+        opacity *= local_opacity;
+        parent_layer = layer;
+    }
+    opacity
+}
+
+/// Project an intermediate CA mask through its enclosing NSView's bounds
+/// into the same physical pixel coordinate system as the Metal compositor.
+fn project_ca_mask(ancestor_view: Id, rect: NSRect) -> Option<Frame> {
+    let ancestor = unsafe { presentation_frame(ancestor_view) }?;
+    let bounds = bounds_of(ancestor_view);
+    if bounds.size.width <= 0.0 || bounds.size.height <= 0.0 {
+        return None;
+    }
+    let sx = f64::from(ancestor.width) / bounds.size.width;
+    let sy = f64::from(ancestor.height) / bounds.size.height;
+    let left = f64::from(ancestor.x) + (rect.origin.x - bounds.origin.x) * sx;
+    let top = if is_flipped(ancestor_view) {
+        f64::from(ancestor.y) + (rect.origin.y - bounds.origin.y) * sy
+    } else {
+        f64::from(ancestor.y)
+            + (bounds.origin.y + bounds.size.height - rect.origin.y - rect.size.height) * sy
+    };
+    let right = left + rect.size.width * sx;
+    let bottom = top + rect.size.height * sy;
+    if ![left, top, right, bottom].iter().all(|f| f.is_finite()) {
+        return None;
+    }
+    let clamp = |n: f64| n.round().clamp(f64::from(i32::MIN), f64::from(i32::MAX)) as i32;
+    let (x0, y0, x1, y1) = (clamp(left), clamp(top), clamp(right), clamp(bottom));
+    Some(Frame {
+        x: x0,
+        y: y0,
+        width: i64::from(x1)
+            .saturating_sub(i64::from(x0))
+            .clamp(0, i64::from(u32::MAX)) as u32,
+        height: i64::from(y1)
+            .saturating_sub(i64::from(y0))
+            .clamp(0, i64::from(u32::MAX)) as u32,
+        ..ancestor
+    })
+}
+
+/// Opaque native coverage can only subtract a rectangle from Metal if no
+/// ancestor's rounded CA mask removes any of its pixels. Otherwise both
+/// sources must be drawn and the native source gets its rounded GPU mask.
+pub(crate) fn has_rounded_mask_ancestor(view: Id) -> bool {
+    let mut at = view;
+    for _ in 0..64 {
+        if at.is_null() || !is_view(at) {
+            break;
+        }
+        let layer = view_of(at).layer;
+        let parent_view = view_of(at).superview;
+        let mut parent = parent_view;
+        let mut ancestor_layer = std::ptr::null_mut();
+        for _ in 0..64 {
+            if parent.is_null() || !is_view(parent) {
+                break;
+            }
+            ancestor_layer = view_of(parent).layer;
+            if !ancestor_layer.is_null() {
+                break;
+            }
+            parent = view_of(parent).superview;
+        }
+        if !layer.is_null()
+            && ((crate::coreanimation::scene_masks_to_bounds(layer)
+                && crate::coreanimation::scene_corner_radius(layer) > 0.0)
+                || crate::coreanimation::scene_has_rounded_masks_below(layer, ancestor_layer))
+        {
+            return true;
+        }
+        at = parent_view;
+    }
+    false
+}
+
+/// Only invoked on the AppKit mutator thread, not from Metal's presenter.
+fn capture_metal_scene(
+    window: sdl3::Window,
+    now: f64,
+) -> Option<(Vec<MetalSceneLayer>, Vec<usize>)> {
+    // CA content reads may release their last guest reference. Defer such
+    // releases until no backing/view locks are held by this capture.
+    let _owed = crate::coreanimation::defer_releases();
+    let nswindow = crate::window::window_for(window);
+    if nswindow.is_null() {
+        return None;
+    }
+    let content = crate::window::content_view_of(nswindow);
+    let mut result = Vec::new();
+    let mut roots = Vec::new();
+    let mut seen_metal = false;
+    visit_metal_scene(
+        content,
+        window,
+        &mut result,
+        &mut roots,
+        &mut seen_metal,
+        None,
+        1.0,
+        std::ptr::null_mut(),
+        std::ptr::null_mut(),
+        &[],
+        &[],
+        now,
+        0,
+    );
+    // Live native occlusion is orthogonal to drawable submission order: a
+    // toolbar may move after Metal's last present or before CPU backing exists.
+    for (layer, coverage) in crate::backing::live_metal_occlusion(window, &result) {
+        if let Some(scene) = result.iter_mut().find(|item| item.layer == layer) {
+            scene.occluded = coverage
+                .into_iter()
+                .map(|rect| Frame {
+                    window,
+                    x: rect.x.clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32,
+                    y: rect.y.clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32,
+                    width: rect.width.clamp(0, i64::from(u32::MAX)) as u32,
+                    height: rect.height.clamp(0, i64::from(u32::MAX)) as u32,
+                    ..scene.frame
+                })
+                .collect();
+        }
+    }
+    #[cfg(test)]
+    METAL_SCENE_CAPTURES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    Some((result, roots))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn capture_metal_subtree_segment(
+    view: Id,
+    frame: Frame,
+    selected: &[usize],
+    isolated_group_ids: &[usize],
+    ca_clip: Option<Frame>,
+    rounded: &[RoundedSceneClip],
+    opacity: f32,
+    opacity_groups: &[OpacityGroup],
+    tile: &mut u32,
+    scene: &mut Vec<MetalSceneLayer>,
+) {
+    let viewport = Frame {
+        x: 0,
+        y: 0,
+        width: frame.window_width,
+        height: frame.window_height,
+        ..frame
+    };
+    let descendants = crate::coreanimation::metal_sublayers_extent_selected(
+        view,
+        crate::backing::Rect {
+            x: i64::from(frame.x),
+            y: i64::from(frame.y),
+            width: i64::from(frame.width),
+            height: i64::from(frame.height),
+        },
+        selected,
+    )
+    .unwrap_or_default();
+    let extent = Frame {
+        x: descendants
+            .x
+            .clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32,
+        y: descendants
+            .y
+            .clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32,
+        width: descendants.width.clamp(0, i64::from(u32::MAX)) as u32,
+        height: descendants.height.clamp(0, i64::from(u32::MAX)) as u32,
+        ..frame
+    };
+    let visible = intersect_scene_clips(extent, viewport);
+    let visible = ca_clip.map_or(visible, |clip| intersect_scene_clips(visible, clip));
+    const TILE_EDGE: u32 = 2048;
+    let mut y = 0u32;
+    while y < visible.height {
+        let h = (visible.height - y).min(TILE_EDGE);
+        let mut x = 0u32;
+        while x < visible.width {
+            let w = (visible.width - x).min(TILE_EDGE);
+            let part = Frame {
+                x: visible.x.saturating_add(x as i32),
+                y: visible.y.saturating_add(y as i32),
+                width: w,
+                height: h,
+                ..visible
+            };
+            let crop = crate::backing::Rect {
+                x: i64::from(part.x) - i64::from(frame.x),
+                y: i64::from(part.y) - i64::from(frame.y),
+                width: i64::from(w),
+                height: i64::from(h),
+            };
+            if let Some((pixels, revision)) = crate::backing::metal_sublayers_segment_pixels_cropped(
+                view,
+                frame.width,
+                frame.height,
+                crop,
+                selected,
+                isolated_group_ids,
+            ) {
+                scene.push(MetalSceneLayer {
+                    opacity_groups: opacity_groups.to_vec(),
+                    layer: native_tile_id(view, *tile),
+                    native_owner: view as usize,
+                    frame: part,
+                    opacity,
+                    opaque: false,
+                    clip: ca_clip,
+                    rounded: rounded.to_vec(),
+                    occluded: Vec::new(),
+                    native_cpu_capture: None,
+                    native_pixels: Some(pixels),
+                    native_tiles: None,
+                    native_dmabuf: None,
+                    native_revision: revision,
+                    native_dma_sample: None,
+                });
+            }
+            *tile = tile.saturating_add(1);
+            x += w;
+        }
+        y += h;
+    }
+}
+
+fn visit_metal_scene(
+    view: Id,
+    window: sdl3::Window,
+    scene: &mut Vec<MetalSceneLayer>,
+    roots: &mut Vec<usize>,
+    seen_metal: &mut bool,
+    inherited_clip: Option<Frame>,
+    inherited_layer_opacity: f32,
+    parent_layer: Id,
+    parent_view: Id,
+    inherited_rounded: &[RoundedSceneClip],
+    inherited_groups: &[OpacityGroup],
+    now: f64,
+    depth: usize,
+) {
+    if depth >= 64 || !is_view(view) || view_of(view).hidden != 0 {
+        return;
+    }
+    let layer = view_of(view).layer;
+    if !layer.is_null() {
+        roots.push(layer as usize);
+    }
+    let (hidden, own_layer_opacity) = if layer.is_null() {
+        (false, 1.0)
+    } else {
+        let excluded_ids = inherited_groups
+            .iter()
+            .map(|group| group.id)
+            .collect::<Vec<_>>();
+        crate::coreanimation::scene_properties_below_excluding(
+            layer,
+            parent_layer,
+            now,
+            &excluded_ids,
+        )
+    };
+    // Retain an invisible source's identity and immutable CPU pixels so an
+    // opacity-only transition back to visible does not force a new raster.
+    // The Metal compositor excludes its zero-alpha placement from drawing
+    // and group scratch preflight, rather than dropping the source itself.
+    if hidden {
+        return;
+    }
+    let descendants = unsafe { children(view) };
+    let backed_descendants = !descendants.is_empty();
+    // Both NSView alphaValue and CALayer opacity attenuate their *completed*
+    // subtree. A scalar applied separately to retained children leaks the
+    // lower opaque child through an opaque higher child.
+    let own_view_alpha = alpha_of(view) as f32;
+    let has_view_group = own_view_alpha < 1.0
+        && (backed_descendants
+            || !layer.is_null()
+                && crate::layer::is_metal(layer)
+                && crate::coreanimation::has_renderable_sublayers(layer));
+    let has_layer_group = !layer.is_null()
+        && own_layer_opacity < 1.0
+        && (backed_descendants
+            || crate::layer::is_metal(layer)
+                && crate::coreanimation::has_renderable_sublayers(layer));
+    let mut opacity_groups = inherited_groups.to_vec();
+    if has_view_group {
+        opacity_groups.push(OpacityGroup {
+            id: view as usize,
+            opacity: own_view_alpha,
+        });
+    }
+    if has_layer_group {
+        opacity_groups.push(OpacityGroup {
+            id: layer as usize,
+            opacity: own_layer_opacity,
+        });
+    }
+    let source_view_alpha = if has_view_group { 1.0 } else { own_view_alpha };
+    let layer_opacity = inherited_layer_opacity
+        * if has_layer_group {
+            1.0
+        } else {
+            own_layer_opacity
+        };
+    let has_ca_mask = !layer.is_null() && crate::coreanimation::scene_masks_to_bounds(layer);
+    let current_masks = view_of(view).layer_backing & CLIPS_TO_BOUNDS != 0 || has_ca_mask;
+    let own_frame = current_masks
+        .then(|| unsafe { presentation_frame(view) })
+        .flatten();
+    let mut rounded = inherited_rounded.to_vec();
+    let mut ca_clip = inherited_clip;
+    if !layer.is_null() && !parent_view.is_null() {
+        for (mask, radius) in crate::coreanimation::scene_masks_below(layer, parent_layer, now) {
+            if let Some(frame) = project_ca_mask(parent_view, mask) {
+                ca_clip = Some(ca_clip.map_or(frame, |clip| intersect_scene_clips(frame, clip)));
+                if radius > 0.0 {
+                    let bounds = bounds_of(parent_view).size;
+                    let parent = unsafe { presentation_frame(parent_view) };
+                    if let Some(parent) = parent {
+                        let sx =
+                            f64::from(parent.width) / bounds.width.abs().max(f64::MIN_POSITIVE);
+                        let sy =
+                            f64::from(parent.height) / bounds.height.abs().max(f64::MIN_POSITIVE);
+                        let physical = radius * sx.min(sy);
+                        if physical.is_finite() && physical > 0.0 {
+                            rounded.push(RoundedSceneClip {
+                                frame,
+                                radius: physical as f32,
+                            });
+                        }
+                    }
+                }
+            }
+        }
+    }
+    if has_ca_mask {
+        let radius = crate::coreanimation::scene_corner_radius(layer);
+        if radius > 0.0
+            && let Some(frame) = own_frame
+        {
+            let bounds = bounds_of(view).size;
+            let scale_x = f64::from(frame.width) / bounds.width.abs().max(f64::MIN_POSITIVE);
+            let scale_y = f64::from(frame.height) / bounds.height.abs().max(f64::MIN_POSITIVE);
+            let physical = radius * scale_x.min(scale_y);
+            if physical.is_finite() && physical > 0.0 {
+                rounded.push(RoundedSceneClip {
+                    frame,
+                    radius: physical as f32,
+                });
+            }
+        }
+    }
+    if !layer.is_null()
+        && crate::layer::is_metal(layer)
+        && let Some(frame) = unsafe { presentation_frame(view) }
+        && frame.window == window
+    {
+        scene.push(MetalSceneLayer {
+            opacity_groups: opacity_groups.clone(),
+            layer: layer as usize,
+            frame,
+            opacity: source_view_alpha * layer_opacity,
+            opaque: crate::layer::opaque_of(layer),
+            clip: ca_clip,
+            rounded: rounded.clone(),
+            occluded: Vec::new(),
+            native_pixels: None,
+            native_tiles: None,
+            native_cpu_capture: None,
+            native_dmabuf: None,
+            native_revision: 0,
+            native_dma_sample: None,
+            native_owner: 0,
+        });
+        *seen_metal = true;
+    }
+    let child_clip = if current_masks {
+        own_frame.map(|frame| ca_clip.map_or(frame, |clip| intersect_scene_clips(frame, clip)))
+    } else {
+        ca_clip
+    };
+    // The effective CA hierarchy, not the NSView child list alone, owns the
+    // stacking order when ordinary layers interleave with backed views.
+    let children = view_of(view).subviews;
+    let child_views: Vec<Id> =
+        unsafe { corefoundation::collections::array(children as *const c_void) }
+            .map_or_else(Vec::new, |array| {
+                array.values.iter().map(|child| *child as Id).collect()
+            });
+    let mut ca_visited = std::collections::HashSet::new();
+    if !layer.is_null()
+        && crate::layer::is_metal(layer)
+        && let Some(frame) = unsafe { presentation_frame(view) }
+        && frame.window == window
+    {
+        let backed: Vec<(usize, Id)> = child_views
+            .iter()
+            .copied()
+            .filter_map(|child| {
+                let backing = crate::view::layer_of(child);
+                (!backing.is_null()).then_some((backing as usize, child))
+            })
+            .collect();
+        let layer_ids = backed.iter().map(|entry| entry.0).collect::<Vec<_>>();
+        let paint = crate::coreanimation::metal_paint_steps(layer, &layer_ids, now);
+        let mut tile = 0u32;
+        for step in paint {
+            match step {
+                crate::coreanimation::MetalPaintStep::Native { selected, groups } => {
+                    let mut combined = opacity_groups.clone();
+                    combined.extend(groups.iter().copied());
+                    let isolated_ids = groups.iter().map(|g| g.id).collect::<Vec<_>>();
+                    capture_metal_subtree_segment(
+                        view,
+                        frame,
+                        &selected,
+                        &isolated_ids,
+                        ca_clip,
+                        &rounded,
+                        source_view_alpha * layer_opacity,
+                        &combined,
+                        &mut tile,
+                        scene,
+                    );
+                }
+                crate::coreanimation::MetalPaintStep::View { id, groups } => {
+                    if let Some((_, child)) = backed.iter().find(|entry| entry.0 == id) {
+                        let mut combined = opacity_groups.clone();
+                        combined.extend(groups.iter().copied());
+                        ca_visited.insert(*child as usize);
+                        visit_metal_scene(
+                            *child,
+                            window,
+                            scene,
+                            roots,
+                            seen_metal,
+                            child_clip,
+                            layer_opacity,
+                            layer,
+                            view,
+                            &rounded,
+                            &combined,
+                            now,
+                            depth + 1,
+                        );
+                    }
+                }
+            }
+        }
+    }
+    // Per-view native content needs its own source above the preceding
+    // drawable. The high bit reserves an identity namespace distinct from
+    // user-space Objective-C layer pointers and SDL window identities.
+    if *seen_metal
+        && (layer.is_null() || !crate::layer::is_metal(layer))
+        && let Some(frame) = unsafe { presentation_frame(view) }
+        && frame.window == window
+    {
+        // A 6K NSView clipped into a small Metal window only needs
+        // that visible rectangle in GPU memory. Preserve source-local
+        // coordinates while publishing the cropped frame in window
+        // pixels; Metal never gets the flattened-underlay version.
+        let viewport = Frame {
+            x: 0,
+            y: 0,
+            width: frame.window_width,
+            height: frame.window_height,
+            ..frame
+        };
+        let visible = ca_clip.map_or(intersect_scene_clips(frame, viewport), |clip| {
+            intersect_scene_clips(intersect_scene_clips(frame, viewport), clip)
+        });
+        let dma = crate::backing::native_scene_dma_extent_supported(frame.width, frame.height)
+            .then(|| crate::backing::native_dma_overlay(view))
+            .flatten();
+        // The 64 MiB capture bound applies to one allocation, not an
+        // entire visible NSView. Publish 2048x2048 pixel tiles in the
+        // same paint order, each with an independent GPU lease.
+        let large_visible =
+            !crate::backing::native_scene_extent_supported(visible.width, visible.height);
+        let tiled_candidate = dma.is_none()
+            && crate::backing::native_scene_tiled_candidate(view, frame.width, frame.height);
+        let tile_edge = if large_visible { 2048 } else { u32::MAX };
+        let mut index = 0u32;
+        let mut y = 0u32;
+        while y < visible.height {
+            let height = (visible.height - y).min(tile_edge);
+            let mut x = 0u32;
+            while x < visible.width {
+                let width = (visible.width - x).min(tile_edge);
+                let part = Frame {
+                    x: visible.x.saturating_add(x as i32),
+                    y: visible.y.saturating_add(y as i32),
+                    width,
+                    height,
+                    ..visible
+                };
+                let cropped = crate::backing::Rect {
+                    x: i64::from(part.x) - i64::from(frame.x),
+                    y: i64::from(part.y) - i64::from(frame.y),
+                    width: i64::from(width),
+                    height: i64::from(height),
+                };
+                let tiled = if tiled_candidate {
+                    crate::backing::native_scene_tiled_pixels_cropped_with_damage(
+                        view,
+                        frame.width,
+                        frame.height,
+                        cropped,
+                    )
+                } else {
+                    None
+                };
+                let cpu = if tiled.is_some() {
+                    None
+                } else {
+                    crate::backing::native_scene_pixels_cropped_with_damage(
+                        view,
+                        frame.width,
+                        frame.height,
+                        cropped,
+                    )
+                };
+                // A DMA source remains one coherent GPU image. A CPU
+                // tile never borrows a DMA producer's unrelated frame.
+                if cpu.is_some() || tiled.is_some() || dma.is_some() {
+                    let sample = dma.as_ref().map(|_| {
+                        (
+                            frame.width,
+                            frame.height,
+                            cropped.x as u32,
+                            cropped.y as u32,
+                        )
+                    });
+                    // Moving a large static DMA view can keep the
+                    // visible output frame unchanged while changing
+                    // which producer texels are sampled.
+                    let revision = cpu.as_ref().map_or(0, |(_, rev, _)| *rev)
+                        ^ tiled.as_ref().map_or(0, |(_, rev, _)| *rev)
+                        ^ dma.as_ref().map_or(0, |(_, rev)| rev.rotate_left(19))
+                        ^ sample.map_or(0, |(w, h, x, y)| {
+                            (u64::from(w) << 32 | u64::from(h)).rotate_left(11)
+                                ^ (u64::from(x) << 32 | u64::from(y)).rotate_left(37)
+                        });
+                    scene.push(MetalSceneLayer {
+                        opacity_groups: opacity_groups.clone(),
+                        layer: native_tile_id(view, index),
+                        native_owner: view as usize,
+                        frame: part,
+                        opacity: source_view_alpha * layer_opacity,
+                        opaque: false,
+                        clip: ca_clip,
+                        rounded: rounded.clone(),
+                        occluded: Vec::new(),
+                        native_cpu_capture: cpu
+                            .as_ref()
+                            .map(|(_, rev, damage)| (*rev, *damage))
+                            .or_else(|| tiled.as_ref().map(|(_, rev, damage)| (*rev, *damage)))
+                            .map(|(revision, damage)| crate::backing::NativeCpuCapture {
+                                revision,
+                                damage,
+                            }),
+                        native_pixels: cpu.map(|(pixels, _, _)| pixels),
+                        native_tiles: tiled.map(|(tiles, _, _)| tiles),
+                        native_dmabuf: dma.as_ref().map(|(p, _)| std::sync::Arc::clone(p)),
+                        native_dma_sample: sample,
+                        native_revision: revision,
+                    });
+                }
+                index += 1;
+                x += width;
+            }
+            y += height;
+        }
+    }
+    for child in child_views {
+        if !ca_visited.contains(&(child as usize)) {
+            visit_metal_scene(
+                child,
+                window,
+                scene,
+                roots,
+                seen_metal,
+                child_clip,
+                layer_opacity,
+                if layer.is_null() { parent_layer } else { layer },
+                if layer.is_null() { parent_view } else { view },
+                &rounded,
+                &opacity_groups,
+                now,
+                depth + 1,
+            );
+        }
+    }
+}
+
+/// Clipping uses independently rounded window-pixel bounds. Saturating i64
+/// endpoints prevent a malformed guest view rectangle from wrapping i32.
+fn intersect_scene_clips(a: Frame, b: Frame) -> Frame {
+    let left = i64::from(a.x).max(i64::from(b.x));
+    let top = i64::from(a.y).max(i64::from(b.y));
+    let right = (i64::from(a.x) + i64::from(a.width)).min(i64::from(b.x) + i64::from(b.width));
+    let bottom = (i64::from(a.y) + i64::from(a.height)).min(i64::from(b.y) + i64::from(b.height));
+    Frame {
+        x: left.clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32,
+        y: top.clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32,
+        width: right.saturating_sub(left).clamp(0, i64::from(u32::MAX)) as u32,
+        height: bottom.saturating_sub(top).clamp(0, i64::from(u32::MAX)) as u32,
+        ..a
+    }
+}
+
+fn publish_metal_scene_at(sdl: sdl3::Window, now: f64, force: bool) {
+    debug_assert!(sdl3::video::is_video_thread());
+    let (scene, roots) = capture_metal_scene(sdl, now).unwrap_or_default();
+    capture_surface_poll_owners(sdl);
+    METAL_SCENE_OWNERS
+        .lock()
+        .expect("CA owner windows")
+        .insert(sdl as usize, roots);
+    let changed = METAL_SCENES
+        .lock()
+        .expect("AppKit scene snapshots")
+        .get_or_insert_with(std::collections::HashMap::new)
+        .insert(sdl as usize, scene.clone());
+    // Avoid waking the GPU worker for identical snapshots after a scene
+    // mutation or an animation that has reached its final presentation value.
+    // Metadata comparisons are value-only and never dereference guest IDs.
+    let differs = changed
+        .as_ref()
+        .is_none_or(|old| !same_metal_scene(old, &scene));
+    if (differs || force)
+        && let Some(hook) = METAL_SCENE_CHANGED.get()
+    {
+        hook(sdl, scene);
+    }
+}
+
+fn same_metal_scene(a: &[MetalSceneLayer], b: &[MetalSceneLayer]) -> bool {
+    a.len() == b.len()
+        && a.iter().zip(b).all(|(a, b)| {
+            a.layer == b.layer
+                && a.opacity_groups == b.opacity_groups
+                && a.frame == b.frame
+                && a.opacity == b.opacity
+                && a.opaque == b.opaque
+                && a.clip == b.clip
+                && a.occluded == b.occluded
+                && a.native_revision == b.native_revision
+                && a.native_dma_sample == b.native_dma_sample
+                && a.native_pixels.is_some() == b.native_pixels.is_some()
+                && a.native_tiles.is_some() == b.native_tiles.is_some()
+                && a.native_dmabuf.is_some() == b.native_dmabuf.is_some()
+                && a.rounded.len() == b.rounded.len()
+                && a.rounded
+                    .iter()
+                    .zip(&b.rounded)
+                    .all(|(a, b)| a.frame == b.frame && a.radius == b.radius)
+        })
+}
+
+pub fn forget_metal_scene(sdl: sdl3::Window) {
+    METAL_SCENE_REPLAY_WINDOWS
+        .lock()
+        .expect("Metal swapchain replay requests")
+        .remove(&(sdl as usize));
+    let old = METAL_SURFACE_POLL_OWNERS
+        .lock()
+        .expect("Metal IOSurface owner registry")
+        .remove(&(sdl as usize));
+    drop(old);
+    METAL_SCENE_OWNERS
+        .lock()
+        .expect("CA owner windows")
+        .remove(&(sdl as usize));
+    if let Some(cache) = METAL_SCENES
+        .lock()
+        .expect("AppKit scene snapshots")
+        .as_mut()
+    {
+        cache.remove(&(sdl as usize));
+    }
+    invalidate_metal_scene_for_window(sdl);
+}
+
+fn notify_metal_scene(view: Id) {
+    invalidate_metal_scene_for_view(view);
+}
+
 /// Post the frame and bounds notifications a resized view owes its observers.
 ///
 /// Both, because this tree's `-bounds` is the frame's size at the origin: a
@@ -100,16 +1401,17 @@ fn note_geometry_change(receiver: Id, before: NSRect) {
     }
     crate::layout::solve();
     let view = view_of(receiver);
-    let posts = view.posts;
-    if posts & POSTS_FRAME != 0 {
+    let quiet = view.quiet;
+    if quiet & POSTS_FRAME == 0 {
         foundation::notification::post(FRAME_DID_CHANGE, receiver, std::ptr::null_mut());
     }
-    if posts & POSTS_BOUNDS != 0 && view.frame.size != before.size {
+    if quiet & POSTS_BOUNDS == 0 && view.frame.size != before.size {
         foundation::notification::post(BOUNDS_DID_CHANGE, receiver, std::ptr::null_mut());
     }
     // Moving or resizing the focused editor also moves the host IME UI.
     // SAFETY: `receiver` is the live view whose geometry changed.
     unsafe { crate::window::refresh_text_input_area_for(receiver) };
+    notify_metal_scene(receiver);
 }
 
 /// Resize `receiver`'s subviews for a superview that went from `old` to its
@@ -202,6 +1504,42 @@ unsafe extern "C" fn resize_with_old_superview_size(receiver: Id, _sel: Sel, old
     }
 }
 
+/// How a view its autoresizing mask places follows its superview: what its
+/// origin and its size gain per point the superview grows, along x then y.
+/// The solver reads this as AppKit reads a mask into constraints, so a
+/// constraint on such a view can size its superview. `None` when the
+/// superview does not resize its subviews.
+pub(crate) fn autoresizing_rates(view: Id) -> Option<[(CGFloat, CGFloat); 2]> {
+    let v = view_of(view);
+    if !is_view(v.superview) || view_of(v.superview).does_not_autoresize_subviews != 0 {
+        return None;
+    }
+    let old = view_of(v.superview).frame.size;
+    let mask = v.autoresizing_mask;
+    let rate = |leading, sizable, trailing, origin: CGFloat, size: CGFloat, old: CGFloat| {
+        let (o, s) = distribute(leading, sizable, trailing, origin, size, old, old + 1.0);
+        (o - origin, s - size)
+    };
+    Some([
+        rate(
+            mask & autoresizing::MIN_X_MARGIN != 0,
+            mask & autoresizing::WIDTH_SIZABLE != 0,
+            mask & autoresizing::MAX_X_MARGIN != 0,
+            v.frame.origin.x,
+            v.frame.size.width,
+            old.width,
+        ),
+        rate(
+            mask & autoresizing::MIN_Y_MARGIN != 0,
+            mask & autoresizing::HEIGHT_SIZABLE != 0,
+            mask & autoresizing::MAX_Y_MARGIN != 0,
+            v.frame.origin.y,
+            v.frame.size.height,
+            old.height,
+        ),
+    ])
+}
+
 /// Spread a superview's change along one axis over the three lengths that make
 /// it up: the leading margin, the subview itself, and the trailing margin.
 ///
@@ -291,18 +1629,18 @@ unsafe extern "C" fn set_posts_bounds_changed(receiver: Id, _sel: Sel, flag: u8)
 
 fn set_posts(receiver: Id, bit: usize, flag: u8) {
     let view = view_of(receiver);
-    view.posts = match flag != 0 {
-        true => view.posts | bit,
-        false => view.posts & !bit,
+    view.quiet = match flag != 0 {
+        true => view.quiet & !bit,
+        false => view.quiet | bit,
     };
 }
 
 unsafe extern "C" fn posts_frame_changed(receiver: Id, _sel: Sel) -> u8 {
-    u8::from(view_of(receiver).posts & POSTS_FRAME != 0)
+    u8::from(view_of(receiver).quiet & POSTS_FRAME == 0)
 }
 
 unsafe extern "C" fn posts_bounds_changed(receiver: Id, _sel: Sel) -> u8 {
-    u8::from(view_of(receiver).posts & POSTS_BOUNDS != 0)
+    u8::from(view_of(receiver).quiet & POSTS_BOUNDS == 0)
 }
 
 /// `-setLayer:`, which stores the layer and points it back at this view.
@@ -336,6 +1674,7 @@ unsafe extern "C" fn set_layer(receiver: Id, _sel: Sel, layer: Id) {
         crate::layer::set_masks_to_bounds_of(layer, true);
     }
     objc::arc::release(previous);
+    notify_metal_scene(receiver);
 }
 
 /// `-setWantsLayer:`. Asking for a layer makes the view layer-backed: AppKit
@@ -439,6 +1778,7 @@ unsafe extern "C" fn set_layer_contents_placement(receiver: Id, _sel: Sel, place
 /// `masksToBounds`.
 unsafe extern "C" fn set_clips_to_bounds(receiver: Id, _sel: Sel, clips: u8) {
     let view = view_of(receiver);
+    let was_clipped = view.layer_backing & CLIPS_TO_BOUNDS != 0;
     if clips != 0 {
         view.layer_backing |= CLIPS_TO_BOUNDS;
     } else {
@@ -447,6 +1787,9 @@ unsafe extern "C" fn set_clips_to_bounds(receiver: Id, _sel: Sel, clips: u8) {
     let layer = view.layer;
     if !layer.is_null() {
         crate::layer::set_masks_to_bounds_of(layer, clips != 0);
+    }
+    if was_clipped != (clips != 0) {
+        notify_metal_scene(receiver);
     }
 }
 
@@ -513,6 +1856,7 @@ unsafe extern "C" fn set_alpha_value(receiver: Id, _sel: Sel, alpha: CGFloat) {
     view_of(receiver).transparency = (1.0 - alpha).to_bits();
     if before != alpha {
         crate::backing::needs_display(receiver);
+        notify_metal_scene(receiver);
     }
 }
 
@@ -552,7 +1896,12 @@ pub unsafe fn set_window(view: Id, window: Id) {
     if !is_view(view) {
         return;
     }
+    let previous = unsafe { window_of(view) };
     view_of(view).window = window;
+    if !previous.is_null() {
+        invalidate_metal_scene_for_window(unsafe { crate::window::sdl_window(previous) });
+    }
+    notify_metal_scene(view);
 }
 
 /// Forget `window` as the window `view` is the content view of, if it still is.
@@ -562,7 +1911,11 @@ pub unsafe fn set_window(view: Id, window: Id) {
 /// As [`set_window`].
 pub unsafe fn detach_window(view: Id, window: Id) {
     if is_view(view) && view_of(view).window == window {
+        let sdl = unsafe { crate::window::sdl_window(window) };
         view_of(view).window = std::ptr::null_mut();
+        if !sdl.is_null() {
+            invalidate_metal_scene_for_window(sdl);
+        }
     }
 }
 
@@ -713,9 +2066,13 @@ fn y_from_superview(frame: NSRect, flipped: bool, outer_flipped: bool, y: f64) -
 /// A point in `view`'s coordinates, in its superview's.
 fn to_superview(view: Id, point: NSPoint) -> NSPoint {
     let v = view_of(view);
+    let local = NSPoint {
+        x: point.x - v.bounds_origin.x,
+        y: point.y - v.bounds_origin.y,
+    };
     NSPoint {
-        x: point.x + v.frame.origin.x,
-        y: y_to_superview(v.frame, is_flipped(view), is_flipped(v.superview), point.y),
+        x: local.x + v.frame.origin.x,
+        y: y_to_superview(v.frame, is_flipped(view), is_flipped(v.superview), local.y),
     }
 }
 
@@ -723,8 +2080,9 @@ fn to_superview(view: Id, point: NSPoint) -> NSPoint {
 fn from_superview(view: Id, point: NSPoint) -> NSPoint {
     let v = view_of(view);
     NSPoint {
-        x: point.x - v.frame.origin.x,
-        y: y_from_superview(v.frame, is_flipped(view), is_flipped(v.superview), point.y),
+        x: point.x - v.frame.origin.x + v.bounds_origin.x,
+        y: y_from_superview(v.frame, is_flipped(view), is_flipped(v.superview), point.y)
+            + v.bounds_origin.y,
     }
 }
 
@@ -785,22 +2143,28 @@ fn rect_between(rect: NSRect, map: impl Fn(NSPoint) -> NSPoint) -> NSRect {
 
 /// A view's bounds in its window's base coordinates.
 pub fn rect_in_window(view: Id) -> NSRect {
-    let size = match is_view(view) {
-        true => view_of(view).frame.size,
-        false => NSSize::default(),
-    };
-    rect_between(
-        NSRect {
-            origin: NSPoint::default(),
-            size,
+    let bounds = match is_view(view) {
+        true => NSRect {
+            origin: view_of(view).bounds_origin,
+            size: view_of(view).frame.size,
         },
-        |point| point_to_window(view, point),
-    )
+        false => NSRect::default(),
+    };
+    rect_between(bounds, |point| point_to_window(view, point))
+}
+
+/// Where a view's subviews' frames are measured from: its bounds origin, which
+/// a clip view moves to scroll.
+pub(crate) fn bounds_origin_of(view: Id) -> NSPoint {
+    match is_view(view) {
+        true => view_of(view).bounds_origin,
+        false => NSPoint::default(),
+    }
 }
 
 /// Whether a rectangle of a view's holds a point, for [`crate::cursor`].
 pub fn holds(view: Id, rect: NSRect, point: NSPoint) -> bool {
-    is_view(view) && contains(rect, point)
+    is_view(view) && crate::geometry::mouse_in_rect(point, rect, is_flipped(view))
 }
 
 /// Where a view's layer lands in its window, in pixels from the top left.
@@ -832,40 +2196,106 @@ pub unsafe fn presentation_frame(view: Id) -> Option<Frame> {
         return None;
     }
     let rect = rect_in_window(view);
-    let (x, y, size) = (rect.origin.x, rect.origin.y, rect.size);
-    let (_, window_height) = sdl3::video::window_size(sdl)?;
-    let (pixel_width, pixel_height) = sdl3::video::window_size_in_pixels(sdl)?;
-    let density = sdl3::video::window_pixel_density(sdl) as f64;
-    let density = if density > 0.0 { density } else { 1.0 };
-    // AppKit counts up from the bottom of the window's content rect; a
-    // swapchain image counts down from the top of it.
-    let top = f64::from(window_height) - (y + size.height);
+    let mapped = crate::window::rect_to_surface(window, rect)?;
+    // The SDL video thread publishes these dimensions. No native SDL
+    // query is permitted from a renderer resolving a Metal view frame.
+    let snapshot = sdl3::video::presentation_window(sdl)?;
+    let host_points = snapshot.logical_size;
+    let host_pixels = snapshot.pixel_size;
+    let mut rounded = crate::window::pixel_rect_from_surface(mapped, host_points, host_pixels);
+    // A view's source extent uses exactly the same separately rounded pixel
+    // edges as the destination clip; the *unclipped* rectangle is needed for
+    // Metal's destination-to-source mapping when views overhang the window.
+    if rounded.w == 0 || rounded.h == 0 {
+        let surface = crate::window::surface_frame(window)?;
+        let inset = crate::window::content_inset(window).min(surface.size.height);
+        rounded = crate::window::pixel_rect_from_surface(
+            NSRect {
+                origin: NSPoint {
+                    x: surface.origin.x,
+                    y: surface.origin.y + inset,
+                },
+                size: NSSize {
+                    width: surface.size.width,
+                    height: (surface.size.height - inset).max(0.0),
+                },
+            },
+            host_points,
+            host_pixels,
+        );
+    }
     let frame = Frame {
         window: sdl,
-        x: (x * density).round() as i32,
-        y: (top * density).round() as i32,
-        width: (size.width * density).round().max(0.0) as u32,
-        height: (size.height * density).round().max(0.0) as u32,
-        window_width: pixel_width.max(0) as u32,
-        window_height: pixel_height.max(0) as u32,
+        x: rounded.x,
+        y: rounded.y,
+        width: rounded.w as u32,
+        height: rounded.h as u32,
+        window_width: host_pixels.0.max(0) as u32,
+        window_height: host_pixels.1.max(0) as u32,
     };
-    // A view with no frame of its own - one a guest made with
-    // `-initWithFrame:` of a zero rect and then never sized - covers its
-    // window's content rather than nothing, which is what AppKit's own
-    // autoresizing would have made of it.
-    match frame.width == 0 || frame.height == 0 {
-        true => {
-            let inset = (crate::window::content_inset(window) * density).round() as u32;
-            let inset = inset.min(frame.window_height);
-            Some(Frame {
-                x: 0,
-                y: inset as i32,
-                width: frame.window_width,
-                height: frame.window_height - inset,
-                ..frame
-            })
+    Some(frame)
+}
+
+/// The part of a view its ancestors and its window leave on screen, in the
+/// window pixels [`presentation_frame`] answers `frame` in; empty when none of
+/// it is.
+///
+/// AppKit draws only this part: a document view thousands of lines tall
+/// inside a clip view is asked for the lines that show.
+///
+/// # Safety
+///
+/// `view` is null or a view of this crate's, and `frame` is its frame.
+pub unsafe fn presentation_visible(view: Id, frame: &Frame) -> sdl3::Rect {
+    let empty = sdl3::Rect {
+        x: frame.x,
+        y: frame.y,
+        w: 0,
+        h: 0,
+    };
+    if !is_view(view) {
+        return empty;
+    }
+    // SAFETY: the caller's obligation, checked above.
+    let window = unsafe { window_of(view) };
+    let Some(snapshot) = sdl3::video::presentation_window(frame.window) else {
+        return empty;
+    };
+    let mut visible = rect_in_window(view);
+    let mut node = view_of(view).superview;
+    for _ in 0..64 {
+        if !is_view(node) {
+            break;
         }
-        false => Some(frame),
+        visible = intersection(visible, rect_in_window(node));
+        node = view_of(node).superview;
+    }
+    if visible.size.width <= 0.0 || visible.size.height <= 0.0 {
+        return empty;
+    }
+    let Some(mapped) = crate::window::rect_to_surface(window, visible) else {
+        return empty;
+    };
+    let pixels =
+        crate::window::pixel_rect_from_surface(mapped, snapshot.logical_size, snapshot.pixel_size);
+    // Rounded the way the frame is, so its edges are the frame's where they
+    // coincide; then kept inside both the frame and the window.
+    let x0 = pixels.x.max(frame.x).max(0);
+    let y0 = pixels.y.max(frame.y).max(0);
+    let x1 = (pixels.x + pixels.w)
+        .min(frame.x + frame.width as i32)
+        .min(frame.window_width as i32);
+    let y1 = (pixels.y + pixels.h)
+        .min(frame.y + frame.height as i32)
+        .min(frame.window_height as i32);
+    if x0 >= x1 || y0 >= y1 {
+        return empty;
+    }
+    sdl3::Rect {
+        x: x0,
+        y: y0,
+        w: x1 - x0,
+        h: y1 - y0,
     }
 }
 
@@ -890,22 +2320,19 @@ pub unsafe fn input_frame(view: Id) -> Option<(sdl3::Window, sdl3::Rect)> {
         return None;
     }
     let rect = rect_in_window(view);
-    let (x, y, size) = (rect.origin.x, rect.origin.y, rect.size);
-    let (_, window_height) = sdl3::video::window_size(sdl)?;
-    let top = f64::from(window_height) - (y + size.height);
+    let mapped = crate::window::rect_to_surface(window, rect)?;
+    let points = sdl3::video::window_size(sdl)?;
+    // SDL text-input areas use window points rather than physical pixels,
+    // but their half-open edges must follow the same rounding convention.
     Some((
         sdl,
-        sdl3::Rect {
-            x: x.round() as i32,
-            y: top.round() as i32,
-            w: size.width.round().max(0.0) as i32,
-            h: size.height.round().max(0.0) as i32,
-        },
+        crate::window::pixel_rect_from_surface(mapped, points, points),
     ))
 }
 
 /// A view's layer as a window system sees it: a rectangle of pixels, and the
 /// window it is a rectangle of.
+#[derive(Clone, Copy, PartialEq)]
 pub struct Frame {
     pub window: sdl3::Window,
     pub x: i32,
@@ -971,7 +2398,8 @@ unsafe fn hit(view: Id, point: NSPoint, depth: usize) -> Id {
 /// on `view`. This distinction matters when that override calls `super`.
 unsafe fn hit_base(view: Id, point: NSPoint, depth: usize) -> Id {
     let frame = view_of(view).frame;
-    if !contains(frame, point) {
+    let superview = view_of(view).superview;
+    if !crate::geometry::mouse_in_rect(point, frame, is_flipped(superview)) {
         return std::ptr::null_mut();
     }
     let local = from_superview(view, point);
@@ -999,16 +2427,6 @@ unsafe extern "C" fn hit_test_method(receiver: Id, _sel: Sel, point: NSPoint) ->
     // SAFETY: the receiver is a live view and the point is in its superview's
     // coordinates, as expected by this module's tree walk.
     unsafe { hit_base(receiver, point, 0) }
-}
-
-/// Whether a rectangle holds a point, on AppKit's half-open rule: the minimum
-/// edges are inside and the maximum ones are not, so two views that share an
-/// edge do not both claim the click.
-fn contains(rect: NSRect, point: NSPoint) -> bool {
-    point.x >= rect.origin.x
-        && point.y >= rect.origin.y
-        && point.x < rect.origin.x + rect.size.width
-        && point.y < rect.origin.y + rect.size.height
 }
 
 /// Send `-updateTrackingAreas` down a view tree.
@@ -1146,6 +2564,21 @@ fn scale(receiver: Id) -> f64 {
     }
 }
 
+/// `-init`, which is `-initWithFrame:` with an empty frame: sent, so a
+/// subclass's designated initializer runs, as it does under AppKit.
+unsafe extern "C" fn init(receiver: Id, _sel: Sel) -> Id {
+    // SAFETY: `-initWithFrame:` is `id (id, SEL, NSRect)`.
+    unsafe {
+        let f: unsafe extern "C" fn(Id, Sel, NSRect) -> Id =
+            std::mem::transmute(objc::msg::entry());
+        f(
+            receiver,
+            objc::sel::get("initWithFrame:"),
+            NSRect::default(),
+        )
+    }
+}
+
 pub(crate) unsafe extern "C" fn init_with_frame(receiver: Id, _sel: Sel, frame: NSRect) -> Id {
     view_of(receiver).frame = frame;
     receiver
@@ -1173,30 +2606,105 @@ unsafe extern "C" fn set_frame_origin(receiver: Id, _sel: Sel, origin: NSPoint) 
     note_geometry_change(receiver, before);
 }
 
+/// `-safeAreaInsets`: none, because no window here extends its content view
+/// under the title bar.
+unsafe extern "C" fn safe_area_insets(_receiver: Id, _sel: Sel) -> crate::controls::NSEdgeInsets {
+    crate::controls::NSEdgeInsets::default()
+}
+
 /// `-bounds`: the frame's size at the origin, which is what a view with no
 /// transform of its own has.
 unsafe extern "C" fn bounds(receiver: Id, _sel: Sel) -> NSRect {
     NSRect {
-        origin: NSPoint::default(),
+        origin: view_of(receiver).bounds_origin,
         size: view_of(receiver).frame.size,
     }
 }
 
-unsafe extern "C" fn set_bounds(receiver: Id, _sel: Sel, bounds: NSRect) {
+/// FIXME (ACCURACY): a bounds size other than the frame's would scale the
+/// view's coordinates; here it resizes the frame instead.
+unsafe extern "C" fn set_bounds(receiver: Id, sel: Sel, bounds: NSRect) {
     let before = view_of(receiver).frame;
     view_of(receiver).frame.size = bounds.size;
     note_geometry_change(receiver, before);
+    // SAFETY: as `-setBoundsOrigin:`.
+    unsafe { set_bounds_origin(receiver, sel, bounds.origin) };
 }
 
-/// `-visibleRect`: the part of the view not clipped away by an ancestor.
-///
-/// The bounds, because nothing in this tree clips: there is no scroll view and
-/// no clip view with a smaller frame, so every view is wholly visible. A guest
-/// sizing a viewport from this gets the same answer it would from `-bounds`,
-/// which is what it would get from AppKit for a view that fills its window.
-unsafe extern "C" fn visible_rect(receiver: Id, sel: Sel) -> NSRect {
-    // SAFETY: `-bounds` is `NSRect (id, SEL)`.
-    unsafe { bounds(receiver, sel) }
+/// `-setBoundsOrigin:`: the subviews move the other way, and the whole view
+/// is to be drawn again.
+pub(crate) unsafe extern "C" fn set_bounds_origin(receiver: Id, _sel: Sel, origin: NSPoint) {
+    let view = view_of(receiver);
+    if view.bounds_origin == origin {
+        return;
+    }
+    view.bounds_origin = origin;
+    let layer = view.layer;
+    if !layer.is_null() {
+        crate::layer::set_bounds_of(layer, bounds_of(receiver));
+    }
+    crate::backing::needs_display(receiver);
+    if view_of(receiver).quiet & POSTS_BOUNDS == 0 {
+        foundation::notification::post(BOUNDS_DID_CHANGE, receiver, std::ptr::null_mut());
+    }
+}
+
+/// `-translateOriginToPoint:`.
+unsafe extern "C" fn translate_origin(receiver: Id, sel: Sel, by: NSPoint) {
+    let origin = view_of(receiver).bounds_origin;
+    // SAFETY: as `-setBoundsOrigin:`.
+    unsafe {
+        set_bounds_origin(
+            receiver,
+            sel,
+            NSPoint {
+                x: origin.x - by.x,
+                y: origin.y - by.y,
+            },
+        )
+    };
+}
+
+/// `-visibleRect`: the part of the view's bounds no ancestor clips away, in
+/// the view's own coordinates. Every view clips its subviews to its frame.
+unsafe extern "C" fn visible_rect(receiver: Id, _sel: Sel) -> NSRect {
+    visible_rect_of(receiver)
+}
+
+pub(crate) fn visible_rect_of(view: Id) -> NSRect {
+    if !is_view(view) {
+        return NSRect::default();
+    }
+    let mut visible = rect_in_window(view);
+    let mut node = view_of(view).superview;
+    for _ in 0..64 {
+        if !is_view(node) {
+            break;
+        }
+        visible = intersection(visible, rect_in_window(node));
+        node = view_of(node).superview;
+    }
+    if visible.size.width <= 0.0 || visible.size.height <= 0.0 {
+        return NSRect {
+            origin: view_of(view).bounds_origin,
+            size: NSSize::default(),
+        };
+    }
+    rect_between(visible, |point| point_from_window(view, point))
+}
+
+fn intersection(a: NSRect, b: NSRect) -> NSRect {
+    let left = a.origin.x.max(b.origin.x);
+    let bottom = a.origin.y.max(b.origin.y);
+    let right = (a.origin.x + a.size.width).min(b.origin.x + b.size.width);
+    let top = (a.origin.y + a.size.height).min(b.origin.y + b.size.height);
+    NSRect {
+        origin: NSPoint { x: left, y: bottom },
+        size: NSSize {
+            width: (right - left).max(0.0),
+            height: (top - bottom).max(0.0),
+        },
+    }
 }
 
 /// `-convertRectToBacking:`, which is the whole reason a Retina program asks a
@@ -1240,13 +2748,7 @@ unsafe extern "C" fn convert_size_to_backing(receiver: Id, _sel: Sel, size: NSSi
 /// `-mouse:inRect:`, which is `NSMouseInRect` with the view's own flippedness:
 /// the edge a point on it counts as inside is the top one either way up.
 unsafe extern "C" fn mouse_in_rect(receiver: Id, _sel: Sel, point: NSPoint, rect: NSRect) -> u8 {
-    let (min_y, max_y) = (rect.origin.y, rect.origin.y + rect.size.height);
-    let x = point.x >= rect.origin.x && point.x < rect.origin.x + rect.size.width;
-    let y = match is_flipped(receiver) {
-        true => point.y >= min_y && point.y < max_y,
-        false => point.y > min_y && point.y <= max_y,
-    };
-    (x && y) as u8
+    crate::geometry::mouse_in_rect(point, rect, is_flipped(receiver)) as u8
 }
 
 /// A point from `from`'s coordinates to `to`'s, through their window; `nil`
@@ -1342,6 +2844,38 @@ unsafe extern "C" fn next_key_view(receiver: Id, _sel: Sel) -> Id {
         .iter()
         .find(|(view, _)| *view == receiver as usize)
         .map_or(std::ptr::null_mut(), |(_, next)| *next as Id)
+}
+
+/// The first view after `receiver` in the key view loop that can become key,
+/// or nil when the loop returns to `receiver` or ends first.
+unsafe extern "C" fn next_valid_key_view(receiver: Id, _sel: Sel) -> Id {
+    // SAFETY: `-nextKeyView` is `id (id, SEL)`, `-canBecomeKeyView` is `BOOL (id, SEL)`.
+    let (next, can_become_key): (
+        unsafe extern "C" fn(Id, Sel) -> Id,
+        unsafe extern "C" fn(Id, Sel) -> u8,
+    ) = unsafe {
+        (
+            std::mem::transmute(objc::msg::entry()),
+            std::mem::transmute(objc::msg::entry()),
+        )
+    };
+    let (next_sel, can_become_key_sel) = (
+        objc::sel::get("nextKeyView"),
+        objc::sel::get("canBecomeKeyView"),
+    );
+    // A loop that never comes back to `receiver` still ends: stop at a view
+    // already visited.
+    let mut visited = Vec::new();
+    // SAFETY: each candidate is a live view the loop links to.
+    let mut candidate = unsafe { next(receiver, next_sel) };
+    while !candidate.is_null() && candidate != receiver && !visited.contains(&candidate) {
+        if unsafe { can_become_key(candidate, can_become_key_sel) } != 0 {
+            return candidate;
+        }
+        visited.push(candidate);
+        candidate = unsafe { next(candidate, next_sel) };
+    }
+    std::ptr::null_mut()
 }
 
 /// `(view, retained tool tip)`. Kept for `-toolTip`; nothing here shows one.
@@ -1470,6 +3004,104 @@ unsafe extern "C" fn subviews(receiver: Id, _sel: Sel) -> Id {
     view.subviews
 }
 
+/// Send `selector`, taking one object, to `view` and every view under it.
+fn tell_tree(view: Id, selector: &str, argument: Id) {
+    if !is_view(view) {
+        return;
+    }
+    let sel = objc::sel::get(selector);
+    // SAFETY: `void (id, SEL, id)`, which the hierarchy hooks are.
+    unsafe {
+        let f: unsafe extern "C" fn(Id, Sel, Id) = std::mem::transmute(objc::msg::entry());
+        f(view, sel, argument);
+    }
+    for child in subviews_of(view) {
+        tell_tree(child, selector, argument);
+    }
+}
+
+/// [`tell_tree`] for a hook that takes nothing.
+fn tell_tree_bare(view: Id, selector: &str) {
+    if !is_view(view) {
+        return;
+    }
+    let sel = objc::sel::get(selector);
+    // SAFETY: `void (id, SEL)`.
+    unsafe {
+        let f: unsafe extern "C" fn(Id, Sel) = std::mem::transmute(objc::msg::entry());
+        f(view, sel);
+    }
+    for child in subviews_of(view) {
+        tell_tree_bare(child, selector);
+    }
+}
+
+fn tell(view: Id, selector: &str, argument: Id) {
+    // SAFETY: `void (id, SEL, id)`.
+    unsafe {
+        let f: unsafe extern "C" fn(Id, Sel, Id) = std::mem::transmute(objc::msg::entry());
+        f(view, objc::sel::get(selector), argument);
+    }
+}
+
+fn tell_bare(view: Id, selector: &str) {
+    // SAFETY: `void (id, SEL)`.
+    unsafe {
+        let f: unsafe extern "C" fn(Id, Sel) = std::mem::transmute(objc::msg::entry());
+        f(view, objc::sel::get(selector));
+    }
+}
+
+/// `view` and its subtree are leaving `old` for `new`: the will-move hooks.
+pub(crate) fn will_move_to_window(view: Id, old: Id, new: Id) {
+    if old != new {
+        tell_tree(view, "viewWillMoveToWindow:", new);
+    }
+}
+
+/// ...and the did-move ones, once the move is made.
+pub(crate) fn did_move_to_window(view: Id, old: Id, new: Id) {
+    if old != new {
+        crate::layout::note_tree_changed();
+        tell_tree_bare(view, "viewDidMoveToWindow");
+    }
+}
+
+/// `-enclosingScrollView`: the nearest scroll view above this one.
+unsafe extern "C" fn enclosing_scroll_view(receiver: Id, _sel: Sel) -> Id {
+    let Some(scroll) = objc::class::lookup(c"NSScrollView") else {
+        return std::ptr::null_mut();
+    };
+    // SAFETY: a view of this crate's.
+    let mut at = unsafe { superview_of(receiver) };
+    while is_view(at) {
+        // SAFETY: a live view.
+        if unsafe { corefoundation::base::is_kind_of(at.cast(), scroll) } {
+            return at;
+        }
+        // SAFETY: as above.
+        at = unsafe { superview_of(at) };
+    }
+    std::ptr::null_mut()
+}
+
+/// `-isDescendantOf:`, counting the view itself.
+unsafe extern "C" fn is_descendant_of(receiver: Id, _sel: Sel, other: Id) -> u8 {
+    let mut at = receiver;
+    while is_view(at) {
+        if at == other {
+            return 1;
+        }
+        // SAFETY: a view of this crate's.
+        at = unsafe { superview_of(at) };
+    }
+    0
+}
+
+unsafe extern "C" fn hook_with_object(_receiver: Id, _sel: Sel, _argument: Id) {}
+
+unsafe extern "C" fn hook(_receiver: Id, _sel: Sel) {}
+
 unsafe extern "C" fn add_subview(receiver: Id, sel: Sel, subview: Id) {
     if !is_view(subview) {
         return;
@@ -1478,9 +3110,12 @@ unsafe extern "C" fn add_subview(receiver: Id, sel: Sel, subview: Id) {
     // old parent keeps a reference and, when it goes, frees what it no longer owns.
     // Held across the move because the old list may own the only reference.
     objc::arc::retain(subview);
+    // SAFETY: both are views of this crate's.
+    let (old_window, new_window) = unsafe { (window_of(subview), window_of(receiver)) };
+    will_move_to_window(subview, old_window, new_window);
+    tell(subview, "viewWillMoveToSuperview:", receiver);
     if !view_of(subview).superview.is_null() {
-        // SAFETY: `-removeFromSuperview` is `void (id, SEL)`.
-        unsafe { remove_from_superview(subview, objc::sel::get("removeFromSuperview")) };
+        detach_from_superview(subview);
     }
     view_of(subview).superview = receiver;
     // A window's content view that becomes a subview is in its new parent's
@@ -1493,11 +3128,15 @@ unsafe extern "C" fn add_subview(receiver: Id, sel: Sel, subview: Id) {
             .values
             .push(array.policy.retain(subview as *const c_void));
     }
+    tell_bare(subview, "viewDidMoveToSuperview");
+    tell(receiver, "didAddSubview:", subview);
+    did_move_to_window(subview, old_window, new_window);
     objc::arc::release(subview);
     // SAFETY: a view this crate made, now in a window.
     unsafe { update_tracking_areas(subview) };
     crate::backing::needs_display_in_tree(subview, 0);
     crate::layout::solve();
+    notify_metal_scene(receiver);
 }
 
 /// `NSWindowOrderingMode`'s `NSWindowBelow`; `NSWindowAbove` is everything else.
@@ -1546,6 +3185,7 @@ unsafe extern "C" fn add_subview_positioned(
         (None, false) => array.values.len(),
     };
     array.values.insert(at, entry);
+    notify_metal_scene(receiver);
 }
 
 unsafe extern "C" fn set_translates_autoresizing_mask(receiver: Id, _sel: Sel, flag: u8) {
@@ -1571,8 +3211,31 @@ pub(crate) fn convert_rect(rect: NSRect, from: Id, to: Id) -> NSRect {
     rect_between(rect, |point| convert_point(point, from, to))
 }
 
+/// `-removeFromSuperview`, with the hooks a view is told of around it.
 unsafe extern "C" fn remove_from_superview(receiver: Id, _sel: Sel) {
+    let parent = view_of(receiver).superview;
+    if !is_view(parent) {
+        view_of(receiver).superview = std::ptr::null_mut();
+        return;
+    }
+    // Held: the superview's list may own the only reference.
+    objc::arc::retain(receiver);
+    // SAFETY: a view of this crate's.
+    let old_window = unsafe { window_of(receiver) };
+    tell(parent, "willRemoveSubview:", receiver);
+    will_move_to_window(receiver, old_window, std::ptr::null_mut());
+    tell(receiver, "viewWillMoveToSuperview:", std::ptr::null_mut());
+    detach_from_superview(receiver);
+    tell_bare(receiver, "viewDidMoveToSuperview");
+    did_move_to_window(receiver, old_window, std::ptr::null_mut());
+    objc::arc::release(receiver);
+}
+
+/// Take `receiver` out of its superview's list, telling no one.
+fn detach_from_superview(receiver: Id) {
     let view = view_of(receiver);
+    // Notify after detachment but before potentially releasing the last
+    // reference, using the old parent's window as the notification identity.
     let parent = view.superview;
     view.superview = std::ptr::null_mut();
     if !is_view(parent) {
@@ -1580,6 +3243,7 @@ unsafe extern "C" fn remove_from_superview(receiver: Id, _sel: Sel) {
     }
     let list = view_of(parent).subviews;
     if list.is_null() {
+        notify_metal_scene(parent);
         return;
     }
     // SAFETY: an array this module made.
@@ -1592,6 +3256,9 @@ unsafe extern "C" fn remove_from_superview(receiver: Id, _sel: Sel) {
             array.policy.release(receiver as *const c_void);
         }
     }
+    // The old parent's child array must no longer contain the removed view
+    // when the compositor snapshots its visible membership.
+    notify_metal_scene(parent);
 }
 
 /// `-dealloc`. Subviews are told their superview is gone before the list that
@@ -1749,8 +3416,13 @@ unsafe extern "C" fn no(_receiver: Id, _sel: Sel) -> u8 {
 
 /// Whether `imp` is NSView's own `-acceptsFirstResponder`. It answers yes for
 /// every view, so it says nothing about whether a click should focus one.
+///
+/// Compared with the IMP NSView holds, not with `yes`: a function's address
+/// is not unique, and codegen can give the registered copy another.
 pub(crate) fn is_default_accepts_first_responder(imp: objc::class::Imp) -> bool {
-    imp == yes as objc::class::Imp
+    objc::class::lookup(c"NSView")
+        .and_then(|class| class.method(objc::sel::get("acceptsFirstResponder")))
+        .is_some_and(|method| method.implementation() == imp)
 }
 
 /// `-display`: draw the view now.
@@ -1784,8 +3456,8 @@ unsafe extern "C" fn mark_needs_display(receiver: Id, _sel: Sel) {
     crate::backing::needs_display(receiver);
 }
 
-unsafe extern "C" fn set_needs_display_in_rect(receiver: Id, _sel: Sel, _rect: NSRect) {
-    crate::backing::needs_display(receiver);
+unsafe extern "C" fn set_needs_display_in_rect(receiver: Id, _sel: Sel, rect: NSRect) {
+    crate::backing::needs_display_in_rect(receiver, rect);
 }
 
 unsafe extern "C" fn set_hidden(receiver: Id, _sel: Sel, hidden: u8) {
@@ -1793,6 +3465,9 @@ unsafe extern "C" fn set_hidden(receiver: Id, _sel: Sel, hidden: u8) {
     view_of(receiver).hidden = usize::from(hidden != 0);
     if was && hidden == 0 {
         crate::backing::needs_display(receiver);
+    }
+    if was != (hidden != 0) {
+        notify_metal_scene(receiver);
     }
 }
 
@@ -1877,14 +3552,18 @@ pub(crate) fn install() {
         "appearance" => appearance, c"@16@0:8";
         "setAppearance:" => set_appearance, c"v24@0:8@16";
         "effectiveAppearance" => effective_appearance, c"@16@0:8";
+        "init" => init, c"@16@0:8";
         "initWithFrame:" => init_with_frame, c"@48@0:8{CGRect={CGPoint=dd}{CGSize=dd}}16";
         "frame" => frame, c"{CGRect={CGPoint=dd}{CGSize=dd}}16@0:8";
         "setFrame:" => set_frame, c"v48@0:8{CGRect={CGPoint=dd}{CGSize=dd}}16";
         "setFrameSize:" => set_frame_size, c"v32@0:8{CGSize=dd}16";
         "setFrameOrigin:" => set_frame_origin, c"v32@0:8{CGPoint=dd}16";
         "bounds" => bounds, c"{CGRect={CGPoint=dd}{CGSize=dd}}16@0:8";
+        "safeAreaInsets" => safe_area_insets, c"{NSEdgeInsets=dddd}16@0:8";
         "visibleRect" => visible_rect, c"{CGRect={CGPoint=dd}{CGSize=dd}}16@0:8";
         "setBounds:" => set_bounds, c"v48@0:8{CGRect={CGPoint=dd}{CGSize=dd}}16";
+        "setBoundsOrigin:" => set_bounds_origin, c"v32@0:8{CGPoint=dd}16";
+        "translateOriginToPoint:" => translate_origin, c"v32@0:8{CGPoint=dd}16";
         "convertRectToBacking:" => convert_rect_to_backing,
             c"{CGRect={CGPoint=dd}{CGSize=dd}}48@0:8{CGRect={CGPoint=dd}{CGSize=dd}}16";
         "convertRectFromBacking:" => convert_rect_from_backing,
@@ -1905,6 +3584,7 @@ pub(crate) fn install() {
         "setToolTip:" => set_tool_tip, c"v24@0:8@16";
         "toolTip" => tool_tip, c"@16@0:8";
         "nextKeyView" => next_key_view, c"@16@0:8";
+        "nextValidKeyView" => next_valid_key_view, c"@16@0:8";
         "viewWithTag:" => view_with_tag, c"@24@0:8q16";
         "window" => window, c"@16@0:8";
         "isInFullScreenMode" => is_in_full_screen_mode, c"c16@0:8";
@@ -1919,7 +3599,17 @@ pub(crate) fn install() {
         "setTranslatesAutoresizingMaskIntoConstraints:" => set_translates_autoresizing_mask,
             c"v20@0:8c16";
         "translatesAutoresizingMaskIntoConstraints" => translates_autoresizing_mask, c"c16@0:8";
+        "enclosingScrollView" => enclosing_scroll_view, c"@16@0:8";
+        "isDescendantOf:" => is_descendant_of, c"c24@0:8@16";
+        "viewWillMoveToWindow:" => hook_with_object, c"v24@0:8@16";
+        "viewDidMoveToWindow" => hook, c"v16@0:8";
+        "viewWillMoveToSuperview:" => hook_with_object, c"v24@0:8@16";
+        "viewDidMoveToSuperview" => hook, c"v16@0:8";
+        "didAddSubview:" => hook_with_object, c"v24@0:8@16";
+        "willRemoveSubview:" => hook_with_object, c"v24@0:8@16";
         "removeFromSuperview" => remove_from_superview, c"v16@0:8";
+        // The same: removing a view here marks nothing as needing display.
+        "removeFromSuperviewWithoutNeedingDisplay" => remove_from_superview, c"v16@0:8";
         "dealloc" => dealloc, c"v16@0:8";
         "setWantsBestResolutionOpenGLSurface:" => set_wants_best_resolution, c"v20@0:8c16";
         "wantsBestResolutionOpenGLSurface" => wants_best_resolution, c"c16@0:8";
@@ -2000,6 +3690,18 @@ pub(crate) fn install() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// AppKit unit fixtures have no Vulkan worker. Model a completed GPU
+    /// commit explicitly; publication alone must not grant admission.
+    fn accept_published_native_for_tests(sdl: sdl3::Window) {
+        let admitted = metal_scene(sdl)
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|p| p.has_native_cpu_source() || p.native_dmabuf.is_some())
+            .map(|p| (p.layer, p.native_revision))
+            .collect::<Vec<_>>();
+        crate::backing::set_native_gpu_admission(sdl, &admitted);
+    }
 
     fn view(frame: NSRect) -> Id {
         crate::bootstrap();
@@ -2147,6 +3849,62 @@ mod tests {
         let object = objc::object::create_instance(class, 0);
         // SAFETY: the object has `View` storage.
         unsafe { init_with_frame(object, objc::sel::get("initWithFrame:"), frame) }
+    }
+
+    #[test]
+    fn the_top_window_edge_hits_the_topmost_view_in_either_orientation() {
+        for parent_flipped in [false, true] {
+            for child_flipped in [false, true] {
+                let make = |flipped, frame| match flipped {
+                    true => flipped_view(frame),
+                    false => view(frame),
+                };
+                let content = make(parent_flipped, rect(0.0, 0.0, 200.0, 100.0));
+                let upper_y = if parent_flipped { 0.0 } else { 80.0 };
+                let lower_y = if parent_flipped { 20.0 } else { 60.0 };
+                let upper = make(child_flipped, rect(0.0, upper_y, 200.0, 20.0));
+                let lower = make(child_flipped, rect(0.0, lower_y, 200.0, 20.0));
+                // SAFETY: live views; hit-test points are in window coordinates.
+                unsafe {
+                    add_subview(content, objc::sel::get("addSubview:"), upper);
+                    add_subview(content, objc::sel::get("addSubview:"), lower);
+                    let top = crate::geometry::point_in_window(0.0, 0.0, 100.0);
+                    assert_eq!(hit_test(content, top), upper);
+                    let shared_edge = crate::geometry::point_in_window(0.0, 20.0, 100.0);
+                    assert_eq!(hit_test(content, shared_edge), lower);
+                    for (x, y) in [(200.0, 0.0), (0.0, 100.0), (0.0, -0.1)] {
+                        let outside = crate::geometry::point_in_window(x, y, 100.0);
+                        assert!(hit_test(content, outside).is_null());
+                    }
+                }
+                objc::arc::release(upper);
+                objc::arc::release(lower);
+                objc::arc::release(content);
+            }
+        }
+    }
+
+    #[test]
+    fn tracking_rectangles_include_the_visual_top_edge_in_either_orientation() {
+        for flipped in [false, true] {
+            let frame = rect(0.0, 0.0, 200.0, 100.0);
+            let content = match flipped {
+                true => flipped_view(frame),
+                false => view(frame),
+            };
+            for (x, y, expected) in [
+                (0.0, 0.0, true),
+                (100.0, 0.0, true),
+                (200.0, 0.0, false),
+                (0.0, 100.0, false),
+                (0.0, -0.1, false),
+            ] {
+                let window_point = crate::geometry::point_in_window(x, y, 100.0);
+                let local = point_from_window(content, window_point);
+                assert_eq!(holds(content, frame, local), expected);
+            }
+            objc::arc::release(content);
+        }
     }
 
     /// Qt's views are flipped, and a subview at `y = 0` of one is along its
@@ -2418,6 +4176,1720 @@ mod tests {
         assert_eq!(unsafe { window_of(child) }, window);
     }
 
+    static FIRST_NATIVE_DRAW_CONTENT: std::sync::atomic::AtomicBool =
+        std::sync::atomic::AtomicBool::new(true);
+
+    unsafe extern "C" fn first_native_draw_rect(
+        _receiver: Id,
+        _selector: objc::sel::Sel,
+        _rect: NSRect,
+    ) {
+        if !FIRST_NATIVE_DRAW_CONTENT.load(std::sync::atomic::Ordering::Relaxed) {
+            return;
+        }
+        assert!(crate::backing::draw_focused(|pixels, width, height| {
+            for pixel in pixels.as_chunks_mut::<4>().0 {
+                pixel.copy_from_slice(&[0, 0, 255, 255]);
+            }
+            Some(crate::backing::Rect {
+                x: 0,
+                y: 0,
+                width: i64::from(width),
+                height: i64::from(height),
+            })
+        }));
+    }
+
+    #[test]
+    fn first_native_draw_rect_after_static_metal_publishes_independent_scene() {
+        if !sdl3::isolated::run_here() {
+            return;
+        }
+        crate::bootstrap();
+        if !sdl3::may_pump() {
+            return;
+        }
+        let window = objc::object::create_instance(objc::class::lookup(c"NSWindow").unwrap(), 0);
+        if !unsafe {
+            crate::window::init_with_content_rect_for_tests(window, rect(0.0, 0.0, 320.0, 240.0))
+        } {
+            return;
+        }
+        FIRST_NATIVE_DRAW_CONTENT.store(true, std::sync::atomic::Ordering::Relaxed);
+        let sdl = unsafe { crate::window::sdl_window(window) };
+        let content = view(rect(0.0, 0.0, 320.0, 240.0));
+        let set_content: unsafe extern "C" fn(Id, objc::sel::Sel, Id) =
+            unsafe { std::mem::transmute(objc::msg::entry()) };
+        unsafe { set_content(window, objc::sel::get("setContentView:"), content) };
+        let metal_view = view(rect(0.0, 0.0, 320.0, 240.0));
+        let cls = objc::class::lookup(c"CAMetalLayer").unwrap();
+        let maker = objc::sel::get("layer");
+        let make: unsafe extern "C" fn(Id, objc::sel::Sel) -> Id =
+            unsafe { std::mem::transmute(cls.metaclass().method(maker).unwrap().implementation()) };
+        let metal = unsafe { make(cls as *const _ as Id, maker) };
+        let draw_class =
+            objc::class::lookup(c"RosemaryFirstNativeDrawTestView").unwrap_or_else(|| {
+                let class = objc::class::allocate_pair(
+                    objc::class::lookup(c"NSView"),
+                    c"RosemaryFirstNativeDrawTestView",
+                    0,
+                )
+                .expect("native draw test class");
+                assert!(class.add_method(
+                    objc::sel::get("drawRect:"),
+                    first_native_draw_rect as objc::class::Imp,
+                    c"v48@0:8{CGRect={CGPoint=dd}{CGSize=dd}}16",
+                ));
+                objc::class::register_pair(class);
+                class
+            });
+        let native = unsafe {
+            init_with_frame(
+                objc::object::create_instance(draw_class, 0),
+                objc::sel::get("initWithFrame:"),
+                rect(40.0, 35.0, 30.0, 25.0),
+            )
+        };
+        unsafe {
+            set_layer(metal_view, objc::sel::get("setLayer:"), metal);
+            add_subview(content, objc::sel::get("addSubview:"), metal_view);
+            add_subview(content, objc::sel::get("addSubview:"), native);
+        }
+        flush_metal_scenes();
+        assert_eq!(
+            metal_scene(sdl).unwrap().len(),
+            1,
+            "a native view with no drawRect pixels must not publish a source"
+        );
+        assert!(
+            native_metal_scene_active(sdl),
+            "first native drawing must invalidate an already-published Metal window"
+        );
+        let set_needs: unsafe extern "C" fn(Id, objc::sel::Sel, u8) =
+            unsafe { std::mem::transmute(objc::msg::entry()) };
+        unsafe { set_needs(native, objc::sel::get("setNeedsDisplay:"), 1) };
+        crate::backing::display_view(native);
+        crate::backing::compose_window_for_tests(window);
+        flush_metal_scenes();
+        let scene = metal_scene(sdl).unwrap();
+        assert_eq!(
+            scene.len(),
+            2,
+            "first drawRect: failed to publish native source"
+        );
+        assert_eq!(
+            &scene[1].native_pixels.as_ref().unwrap()[..4],
+            &[0, 0, 255, 255]
+        );
+        // Repeated normal setNeedsDisplay:/drawRect: can also empty the
+        // native store. That transition must remove the stale source.
+        FIRST_NATIVE_DRAW_CONTENT.store(false, std::sync::atomic::Ordering::Relaxed);
+        unsafe { set_needs(native, objc::sel::get("setNeedsDisplay:"), 1) };
+        crate::backing::display_view(native);
+        crate::backing::compose_window_for_tests(window);
+        flush_metal_scenes();
+        assert_eq!(
+            metal_scene(sdl).unwrap().len(),
+            1,
+            "empty redraw left native pixels above the static Metal source"
+        );
+        crate::backing::forget(native);
+        objc::arc::release(window);
+    }
+
+    #[test]
+    fn opaque_native_occlusion_responds_to_ancestor_ca_opacity() {
+        if !sdl3::isolated::run_here() {
+            return;
+        }
+        crate::bootstrap();
+        if !sdl3::may_pump() {
+            return;
+        }
+        let window = objc::object::create_instance(objc::class::lookup(c"NSWindow").unwrap(), 0);
+        if !unsafe {
+            crate::window::init_with_content_rect_for_tests(window, rect(0.0, 0.0, 320.0, 240.0))
+        } {
+            return;
+        }
+        let sdl = unsafe { crate::window::sdl_window(window) };
+        let content = view(rect(0.0, 0.0, 320.0, 240.0));
+        let set_content: unsafe extern "C" fn(Id, objc::sel::Sel, Id) =
+            unsafe { std::mem::transmute(objc::msg::entry()) };
+        unsafe { set_content(window, objc::sel::get("setContentView:"), content) };
+        let metal_view = view(rect(0.0, 0.0, 320.0, 240.0));
+        let parent = view(rect(0.0, 0.0, 320.0, 240.0));
+        let native = view(rect(40.0, 35.0, 30.0, 25.0));
+        let metal_cls = objc::class::lookup(c"CAMetalLayer").unwrap();
+        let maker = objc::sel::get("layer");
+        let make_metal: unsafe extern "C" fn(Id, objc::sel::Sel) -> Id = unsafe {
+            std::mem::transmute(
+                metal_cls
+                    .metaclass()
+                    .method(maker)
+                    .unwrap()
+                    .implementation(),
+            )
+        };
+        let metal = unsafe { make_metal(metal_cls as *const _ as Id, maker) };
+        unsafe {
+            set_layer(metal_view, objc::sel::get("setLayer:"), metal);
+            add_subview(content, objc::sel::get("addSubview:"), metal_view);
+            add_subview(content, objc::sel::get("addSubview:"), parent);
+            add_subview(parent, objc::sel::get("addSubview:"), native);
+        }
+        crate::backing::set_native_view_pixels_for_tests(
+            native,
+            30,
+            25,
+            [0u8, 0, 255, 255].repeat(30 * 25),
+        );
+        let covers = || {
+            crate::backing::live_metal_occlusion(
+                sdl,
+                &capture_metal_scene(sdl, darwin::mach::media_time())
+                    .unwrap()
+                    .0,
+            )
+            .into_iter()
+            .find(|(id, _)| *id == metal as usize)
+            .unwrap()
+            .1
+        };
+        assert_eq!(
+            covers().len(),
+            1,
+            "fully opaque native pixels should occlude metal"
+        );
+        let ca = objc::class::lookup(c"CALayer").unwrap();
+        let make_ca: unsafe extern "C" fn(Id, objc::sel::Sel) -> Id =
+            unsafe { std::mem::transmute(ca.metaclass().method(maker).unwrap().implementation()) };
+        let ancestor = unsafe { make_ca(ca as *const _ as Id, maker) };
+        unsafe { set_layer(parent, objc::sel::get("setLayer:"), ancestor) };
+        let opacity: unsafe extern "C" fn(Id, objc::sel::Sel, f32) =
+            unsafe { std::mem::transmute(objc::msg::entry()) };
+        unsafe { opacity(ancestor, objc::sel::get("setOpacity:"), 0.5) };
+        assert!(
+            covers().is_empty(),
+            "fractional ancestor CA opacity incorrectly punched a metal hole"
+        );
+        unsafe { opacity(ancestor, objc::sel::get("setOpacity:"), 1.0) };
+        assert_eq!(covers().len(), 1);
+        let radius: unsafe extern "C" fn(Id, objc::sel::Sel, f64) =
+            unsafe { std::mem::transmute(objc::msg::entry()) };
+        let mask: unsafe extern "C" fn(Id, objc::sel::Sel, u8) =
+            unsafe { std::mem::transmute(objc::msg::entry()) };
+        unsafe {
+            radius(ancestor, objc::sel::get("setCornerRadius:"), 16.0);
+            mask(ancestor, objc::sel::get("setMasksToBounds:"), 1);
+        }
+        assert!(
+            covers().is_empty(),
+            "rounded ancestor mask must not punch a rectangular hole in Metal"
+        );
+        flush_metal_scenes();
+        assert!(
+            metal_scene(sdl)
+                .unwrap()
+                .iter()
+                .any(|item| item.native_pixels.is_some() && !item.rounded.is_empty())
+        );
+        unsafe { mask(ancestor, objc::sel::get("setMasksToBounds:"), 0) };
+        assert_eq!(covers().len(), 1);
+        // A rectangular CA superlayer clips the native source more tightly
+        // than its NSView frame. Metal must not be excluded outside the very
+        // same GPU clip used by the retained native layer.
+        let middle = unsafe { make_ca(ca as *const _ as Id, maker) };
+        let own = unsafe { make_ca(ca as *const _ as Id, maker) };
+        let set_frame: unsafe extern "C" fn(Id, objc::sel::Sel, NSRect) =
+            unsafe { std::mem::transmute(objc::msg::entry()) };
+        let add_ca: unsafe extern "C" fn(Id, objc::sel::Sel, Id) =
+            unsafe { std::mem::transmute(objc::msg::entry()) };
+        unsafe {
+            set_layer(native, objc::sel::get("setLayer:"), own);
+            set_frame(
+                middle,
+                objc::sel::get("setFrame:"),
+                rect(42.0, 38.0, 14.0, 11.0),
+            );
+            add_ca(ancestor, objc::sel::get("addSublayer:"), middle);
+            add_ca(middle, objc::sel::get("addSublayer:"), own);
+            mask(middle, objc::sel::get("setMasksToBounds:"), 1);
+        }
+        let expected_coverage = || {
+            let (scene, _) = capture_metal_scene(sdl, darwin::mach::media_time()).unwrap();
+            let native = scene
+                .iter()
+                .find(|entry| entry.native_pixels.is_some())
+                .unwrap();
+            let masked = native
+                .clip
+                .expect("middle rectangular mask projects onto native");
+            crate::backing::Rect {
+                x: i64::from(masked.x),
+                y: i64::from(masked.y),
+                width: i64::from(masked.width),
+                height: i64::from(masked.height),
+            }
+        };
+        assert_eq!(covers(), vec![expected_coverage()]);
+        assert!(covers()[0].width < 30 && covers()[0].height < 25);
+        unsafe {
+            set_frame(
+                middle,
+                objc::sel::get("setFrame:"),
+                rect(42.0, 38.0, 8.0, 7.0),
+            )
+        };
+        assert_eq!(covers(), vec![expected_coverage()]);
+        assert!(covers()[0].width <= 8 && covers()[0].height <= 7);
+        unsafe { mask(middle, objc::sel::get("setMasksToBounds:"), 0) };
+        assert_eq!(covers().len(), 1);
+        let hidden: unsafe extern "C" fn(Id, objc::sel::Sel, u8) =
+            unsafe { std::mem::transmute(objc::msg::entry()) };
+        unsafe { hidden(ancestor, objc::sel::get("setHidden:"), 1) };
+        assert!(
+            covers().is_empty(),
+            "hidden ancestor CA layer still occluded metal"
+        );
+        objc::arc::release(window);
+    }
+
+    #[test]
+    fn metal_root_nonview_ca_sublayers_are_independent_ordered_native_pixels() {
+        if !sdl3::isolated::run_here() {
+            return;
+        }
+        crate::bootstrap();
+        if !sdl3::may_pump() {
+            return;
+        }
+        let window = objc::object::create_instance(objc::class::lookup(c"NSWindow").unwrap(), 0);
+        if !unsafe {
+            crate::window::init_with_content_rect_for_tests(window, rect(0.0, 0.0, 100.0, 80.0))
+        } {
+            return;
+        }
+        let sdl = unsafe { crate::window::sdl_window(window) };
+        let content = view(rect(0.0, 0.0, 100.0, 80.0));
+        let metal_view = view(rect(0.0, 0.0, 100.0, 80.0));
+        let metal_cls = objc::class::lookup(c"CAMetalLayer").unwrap();
+        let ordinary = objc::class::lookup(c"CALayer").unwrap();
+        let make: unsafe extern "C" fn(Id, objc::sel::Sel) -> Id =
+            unsafe { std::mem::transmute(objc::msg::entry()) };
+        let metal = unsafe { make(metal_cls as *const _ as Id, objc::sel::get("layer")) };
+        let child = unsafe { make(ordinary as *const _ as Id, objc::sel::get("layer")) };
+        let set_layer: unsafe extern "C" fn(Id, objc::sel::Sel, Id) =
+            unsafe { std::mem::transmute(objc::msg::entry()) };
+        let set_frame: unsafe extern "C" fn(Id, objc::sel::Sel, NSRect) =
+            unsafe { std::mem::transmute(objc::msg::entry()) };
+        let add_layer: unsafe extern "C" fn(Id, objc::sel::Sel, Id) =
+            unsafe { std::mem::transmute(objc::msg::entry()) };
+        let color = unsafe { crate::cgcontext::CGColorCreateGenericRGB(1., 0., 0., 1.) };
+        unsafe {
+            set_layer(window, objc::sel::get("setContentView:"), content);
+            set_layer(metal_view, objc::sel::get("setLayer:"), metal);
+            add_layer(content, objc::sel::get("addSubview:"), metal_view);
+            set_frame(child, objc::sel::get("setFrame:"), rect(10., 10., 22., 15.));
+            set_layer(child, objc::sel::get("setBackgroundColor:"), color as Id);
+            add_layer(metal, objc::sel::get("addSublayer:"), child);
+        }
+        flush_metal_scenes();
+        let initial = metal_scene(sdl).unwrap();
+        assert_eq!(initial[0].layer, metal as usize);
+        let native = initial
+            .iter()
+            .find(|item| item.native_pixels.is_some())
+            .expect("non-view CALayer child missing above Metal drawable");
+        assert_eq!(native.native_owner, metal_view as usize);
+        let before = native.native_pixels.as_ref().unwrap();
+        assert!(before.as_chunks::<4>().0.iter().any(|pixel| pixel[3] != 0));
+        let full = crate::backing::metal_sublayers_pixels_cropped(
+            metal_view,
+            100,
+            80,
+            crate::backing::Rect {
+                x: 0,
+                y: 0,
+                width: 100,
+                height: 80,
+            },
+        )
+        .expect("full retained CA raster")
+        .0;
+        assert!(
+            full.as_chunks::<4>().0.iter().any(|pixel| pixel[3] == 0),
+            "root Metal background must not be rasterized over its drawable"
+        );
+        let original_revision = native.native_revision;
+        let original_frame = native.frame;
+        let original_pixels = std::sync::Arc::clone(before);
+        // Move the non-view child; no new Metal drawable is submitted.
+        unsafe {
+            set_frame(child, objc::sel::get("setFrame:"), rect(44., 20., 22., 15.));
+        }
+        flush_metal_scenes();
+        let moved = metal_scene(sdl).unwrap();
+        assert_eq!(moved[0].layer, metal as usize);
+        let changed = moved
+            .iter()
+            .find(|item| item.native_pixels.is_some())
+            .unwrap();
+        assert!(
+            changed.frame != original_frame,
+            "moving CA child must move scene geometry"
+        );
+        assert_eq!(changed.native_revision, original_revision);
+        assert_eq!(
+            changed.native_pixels.as_ref().unwrap().as_slice(),
+            original_pixels.as_slice()
+        );
+        assert!(std::sync::Arc::ptr_eq(&original_pixels, before));
+        // Root opacity is scene metadata, not pre-applied to sublayer pixels.
+        unsafe {
+            crate::coreanimation::set_opacity_for_test(metal, 0.5);
+        }
+        flush_metal_scenes();
+        let faded = metal_scene(sdl).unwrap();
+        let group = [OpacityGroup {
+            id: metal as usize,
+            opacity: 0.5,
+        }];
+        assert_eq!(faded[0].opacity_groups, group);
+        assert_eq!(faded[1].opacity_groups, group);
+        assert_eq!(faded[1].opacity, 1.0);
+        assert_eq!(faded[1].native_revision, changed.native_revision);
+        // Descendant opacity modifies CPU pixels, unlike Metal root opacity.
+        unsafe {
+            crate::coreanimation::set_opacity_for_test(metal, 1.0);
+        }
+        unsafe {
+            crate::coreanimation::set_opacity_for_test(child, 0.5);
+        }
+        flush_metal_scenes();
+        let translucent = metal_scene(sdl).unwrap();
+        let alpha = translucent[1]
+            .native_pixels
+            .as_ref()
+            .unwrap()
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|pixel| pixel[3])
+            .max()
+            .unwrap();
+        assert!((127..=129).contains(&alpha));
+        assert_ne!(translucent[1].native_revision, changed.native_revision);
+        // Removing the descendant must restore the prior Metal-only scene.
+        let remove: unsafe extern "C" fn(Id, objc::sel::Sel) =
+            unsafe { std::mem::transmute(objc::msg::entry()) };
+        unsafe {
+            remove(child, objc::sel::get("removeFromSuperlayer"));
+        }
+        flush_metal_scenes();
+        assert_eq!(
+            metal_scene(sdl)
+                .unwrap()
+                .iter()
+                .filter(|layer| layer.native_pixels.is_some())
+                .count(),
+            0
+        );
+        objc::arc::release(window);
+    }
+
+    #[test]
+    fn unmasked_metal_root_child_extends_beyond_view_and_masks_clip_it() {
+        if !sdl3::isolated::run_here() {
+            return;
+        }
+        crate::bootstrap();
+        if !sdl3::may_pump() {
+            return;
+        }
+        let window = objc::object::create_instance(objc::class::lookup(c"NSWindow").unwrap(), 0);
+        if !unsafe {
+            crate::window::init_with_content_rect_for_tests(window, rect(0., 0., 100., 80.))
+        } {
+            return;
+        }
+        let sdl = unsafe { crate::window::sdl_window(window) };
+        let content = view(rect(0., 0., 100., 80.));
+        let metal_view = view(rect(20., 20., 40., 30.));
+        let class = objc::class::lookup(c"CAMetalLayer").unwrap();
+        let child_cls = objc::class::lookup(c"CALayer").unwrap();
+        let make: unsafe extern "C" fn(Id, objc::sel::Sel) -> Id =
+            unsafe { std::mem::transmute(objc::msg::entry()) };
+        let root = unsafe { make(class as *const _ as Id, objc::sel::get("layer")) };
+        let child = unsafe { make(child_cls as *const _ as Id, objc::sel::get("layer")) };
+        let set: unsafe extern "C" fn(Id, objc::sel::Sel, Id) =
+            unsafe { std::mem::transmute(objc::msg::entry()) };
+        let set_frame: unsafe extern "C" fn(Id, objc::sel::Sel, NSRect) =
+            unsafe { std::mem::transmute(objc::msg::entry()) };
+        let set_mask: unsafe extern "C" fn(Id, objc::sel::Sel, u8) =
+            unsafe { std::mem::transmute(objc::msg::entry()) };
+        let red = unsafe { crate::cgcontext::CGColorCreateGenericRGB(1., 0., 0., 1.) };
+        unsafe {
+            set(window, objc::sel::get("setContentView:"), content);
+            set(metal_view, objc::sel::get("setLayer:"), root);
+            set(content, objc::sel::get("addSubview:"), metal_view);
+            set_frame(child, objc::sel::get("setFrame:"), rect(-15., 5., 25., 12.));
+            set(child, objc::sel::get("setBackgroundColor:"), red as Id);
+            set(root, objc::sel::get("addSublayer:"), child);
+        }
+        flush_metal_scenes();
+        let unmasked = metal_scene(sdl).unwrap();
+        let drawable = unmasked
+            .iter()
+            .find(|item| item.layer == root as usize)
+            .unwrap();
+        let unmasked_raster = unmasked
+            .iter()
+            .find(|item| item.native_pixels.is_some())
+            .unwrap();
+        assert!(
+            unmasked_raster.frame.x < drawable.frame.x,
+            "unmasked CA descendant was clipped at the Metal view boundary"
+        );
+        assert!(
+            unmasked_raster
+                .native_pixels
+                .as_ref()
+                .unwrap()
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .any(|px| px[3] > 0)
+        );
+        unsafe {
+            set_mask(root, objc::sel::get("setMasksToBounds:"), 1);
+        }
+        flush_metal_scenes();
+        let masked = metal_scene(sdl).unwrap();
+        let masked_raster = masked
+            .iter()
+            .find(|item| item.native_pixels.is_some())
+            .unwrap();
+        assert!(
+            masked_raster.frame.x >= drawable.frame.x,
+            "masksToBounds did not clip the escaped CA child"
+        );
+        // The CA-ordered NSView-backed path must inherit the Metal root clip,
+        // just like the ordinary CALayer raster path above.
+        let backed_view = view(rect(-15., 0., 25., 12.));
+        let backed_layer = unsafe { make(child_cls as *const _ as Id, objc::sel::get("layer")) };
+        unsafe {
+            set(backed_view, objc::sel::get("setLayer:"), backed_layer);
+            set(metal_view, objc::sel::get("addSubview:"), backed_view);
+            set_frame(
+                backed_layer,
+                objc::sel::get("setFrame:"),
+                rect(-15., 0., 25., 12.),
+            );
+            set(
+                backed_layer,
+                objc::sel::get("setBackgroundColor:"),
+                red as Id,
+            );
+            set(root, objc::sel::get("addSublayer:"), backed_layer);
+        }
+        flush_metal_scenes();
+        let scene = metal_scene(sdl).unwrap();
+        let backed = scene
+            .iter()
+            .find(|item| item.native_owner == backed_view as usize)
+            .expect("view-backed CA child missing from ordered scene");
+        let clip = backed.clip.expect("Metal root masksToBounds clip missing");
+        assert!(clip.x >= drawable.frame.x && clip.width <= drawable.frame.width);
+        objc::arc::release(window);
+    }
+
+    #[test]
+    fn metal_ca_sublayers_interleave_view_backings_in_effective_order() {
+        if !sdl3::isolated::run_here() {
+            return;
+        }
+        crate::bootstrap();
+        if !sdl3::may_pump() {
+            return;
+        }
+        let window = objc::object::create_instance(objc::class::lookup(c"NSWindow").unwrap(), 0);
+        if !unsafe {
+            crate::window::init_with_content_rect_for_tests(window, rect(0., 0., 100., 80.))
+        } {
+            return;
+        }
+        let sdl = unsafe { crate::window::sdl_window(window) };
+        let content = view(rect(0., 0., 100., 80.));
+        let metal_view = view(rect(0., 0., 100., 80.));
+        let blue_view = view(rect(10., 10., 20., 20.));
+        let metal_class = objc::class::lookup(c"CAMetalLayer").unwrap();
+        let ca_class = objc::class::lookup(c"CALayer").unwrap();
+        let create: unsafe extern "C" fn(Id, objc::sel::Sel) -> Id =
+            unsafe { std::mem::transmute(objc::msg::entry()) };
+        let metal = unsafe { create(metal_class as *const _ as Id, objc::sel::get("layer")) };
+        let a = unsafe { create(ca_class as *const _ as Id, objc::sel::get("layer")) };
+        let b = unsafe { create(ca_class as *const _ as Id, objc::sel::get("layer")) };
+        let c = unsafe { create(ca_class as *const _ as Id, objc::sel::get("layer")) };
+        let set: unsafe extern "C" fn(Id, objc::sel::Sel, Id) =
+            unsafe { std::mem::transmute(objc::msg::entry()) };
+        let set_frame: unsafe extern "C" fn(Id, objc::sel::Sel, NSRect) =
+            unsafe { std::mem::transmute(objc::msg::entry()) };
+        let color = |r, g, bl| unsafe { crate::cgcontext::CGColorCreateGenericRGB(r, g, bl, 1.) };
+        let (red, blue, green) = (color(1., 0., 0.), color(0., 0., 1.), color(0., 1., 0.));
+        unsafe {
+            set(window, objc::sel::get("setContentView:"), content);
+            set(metal_view, objc::sel::get("setLayer:"), metal);
+            set(blue_view, objc::sel::get("setLayer:"), b);
+            set(content, objc::sel::get("addSubview:"), metal_view);
+            set(metal_view, objc::sel::get("addSubview:"), blue_view);
+            set_frame(a, objc::sel::get("setFrame:"), rect(10., 10., 20., 20.));
+            set_frame(b, objc::sel::get("setFrame:"), rect(10., 10., 20., 20.));
+            set_frame(c, objc::sel::get("setFrame:"), rect(10., 10., 20., 20.));
+            set(a, objc::sel::get("setBackgroundColor:"), red as Id);
+            set(b, objc::sel::get("setBackgroundColor:"), blue as Id);
+            set(c, objc::sel::get("setBackgroundColor:"), green as Id);
+            set(metal, objc::sel::get("addSublayer:"), a);
+            set(metal, objc::sel::get("addSublayer:"), b);
+            set(metal, objc::sel::get("addSublayer:"), c);
+        }
+        let verify = |expected: &[usize]| {
+            flush_metal_scenes();
+            let scene = metal_scene(sdl).unwrap();
+            assert_eq!(scene[0].layer, metal as usize);
+            let owners = scene
+                .iter()
+                .skip(1)
+                .filter(|item| item.native_pixels.is_some())
+                .map(|item| item.native_owner)
+                .collect::<Vec<_>>();
+            assert_eq!(owners, expected);
+
+            scene
+                .iter()
+                .skip(1)
+                .filter_map(|item| item.native_pixels.as_ref())
+                .map(|data| {
+                    data.as_chunks::<4>()
+                        .0
+                        .iter()
+                        .find(|p| p[3] == 255)
+                        .map(|pixel| pixel.to_vec())
+                        .unwrap()
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            verify(&[metal_view as usize, blue_view as usize, metal_view as usize]),
+            vec![
+                vec![0, 0, 255, 255],
+                vec![255, 0, 0, 255],
+                vec![0, 255, 0, 255]
+            ]
+        );
+        // Changing the CA tree order must change GPU paint order, even though
+        // the NSView hierarchy itself and all content bytes remain unchanged.
+        let insert: unsafe extern "C" fn(Id, objc::sel::Sel, Id, u32) =
+            unsafe { std::mem::transmute(objc::msg::entry()) };
+        unsafe {
+            insert(metal, objc::sel::get("insertSublayer:atIndex:"), c, 0);
+        }
+        assert_eq!(
+            verify(&[metal_view as usize, blue_view as usize]),
+            vec![vec![0, 0, 255, 255], vec![255, 0, 0, 255]]
+        );
+        let hidden: unsafe extern "C" fn(Id, objc::sel::Sel, u8) =
+            unsafe { std::mem::transmute(objc::msg::entry()) };
+        unsafe {
+            hidden(c, objc::sel::get("setHidden:"), 1);
+        }
+        assert_eq!(
+            verify(&[metal_view as usize, blue_view as usize]),
+            vec![vec![0, 0, 255, 255], vec![255, 0, 0, 255]]
+        );
+        let remove: unsafe extern "C" fn(Id, objc::sel::Sel) =
+            unsafe { std::mem::transmute(objc::msg::entry()) };
+        unsafe {
+            remove(c, objc::sel::get("removeFromSuperlayer"));
+        }
+        assert_eq!(
+            verify(&[metal_view as usize, blue_view as usize]),
+            vec![vec![0, 0, 255, 255], vec![255, 0, 0, 255]]
+        );
+        objc::arc::release(window);
+    }
+
+    #[test]
+    fn interleaved_view_and_native_children_share_one_isolated_ca_opacity_group() {
+        if !sdl3::isolated::run_here() {
+            return;
+        }
+        crate::bootstrap();
+        if !sdl3::may_pump() {
+            return;
+        }
+        let window = objc::object::create_instance(objc::class::lookup(c"NSWindow").unwrap(), 0);
+        if !unsafe {
+            crate::window::init_with_content_rect_for_tests(window, rect(0., 0., 100., 80.))
+        } {
+            return;
+        }
+        let sdl = unsafe { crate::window::sdl_window(window) };
+        let content = view(rect(0., 0., 100., 80.));
+        let metal_view = view(rect(0., 0., 100., 80.));
+        let blue_view = view(rect(10., 10., 20., 20.));
+        let metal_class = objc::class::lookup(c"CAMetalLayer").unwrap();
+        let ca_class = objc::class::lookup(c"CALayer").unwrap();
+        let create: unsafe extern "C" fn(Id, objc::sel::Sel) -> Id =
+            unsafe { std::mem::transmute(objc::msg::entry()) };
+        let metal = unsafe { create(metal_class as *const _ as Id, objc::sel::get("layer")) };
+        let wrap = unsafe { create(ca_class as *const _ as Id, objc::sel::get("layer")) };
+        let a = unsafe { create(ca_class as *const _ as Id, objc::sel::get("layer")) };
+        let b = unsafe { create(ca_class as *const _ as Id, objc::sel::get("layer")) };
+        let c = unsafe { create(ca_class as *const _ as Id, objc::sel::get("layer")) };
+        let set: unsafe extern "C" fn(Id, objc::sel::Sel, Id) =
+            unsafe { std::mem::transmute(objc::msg::entry()) };
+        let set_frame: unsafe extern "C" fn(Id, objc::sel::Sel, NSRect) =
+            unsafe { std::mem::transmute(objc::msg::entry()) };
+        let rgba = |r, g, bl| unsafe { crate::cgcontext::CGColorCreateGenericRGB(r, g, bl, 1.) };
+        let (red, blue, green) = (rgba(1., 0., 0.), rgba(0., 0., 1.), rgba(0., 1., 0.));
+        unsafe {
+            set(window, objc::sel::get("setContentView:"), content);
+            set(metal_view, objc::sel::get("setLayer:"), metal);
+            set(blue_view, objc::sel::get("setLayer:"), b);
+            set(content, objc::sel::get("addSubview:"), metal_view);
+            set(metal_view, objc::sel::get("addSubview:"), blue_view);
+            set_frame(wrap, objc::sel::get("setFrame:"), rect(0., 0., 100., 80.));
+            for layer in [a, b, c] {
+                set_frame(layer, objc::sel::get("setFrame:"), rect(10., 10., 20., 20.));
+            }
+            set(a, objc::sel::get("setBackgroundColor:"), red as Id);
+            set(b, objc::sel::get("setBackgroundColor:"), blue as Id);
+            set(c, objc::sel::get("setBackgroundColor:"), green as Id);
+            set(metal, objc::sel::get("addSublayer:"), wrap);
+            for child in [a, b, c] {
+                set(wrap, objc::sel::get("addSublayer:"), child);
+            }
+            crate::coreanimation::set_opacity_for_test(wrap, 0.5);
+        }
+        let capture = || {
+            flush_metal_scenes();
+            metal_scene(sdl).unwrap()
+        };
+        let scene = capture();
+        assert_eq!(scene.len(), 4, "A/B/C must remain independent sources");
+        assert_eq!(scene[0].layer, metal as usize);
+        let path = [OpacityGroup {
+            id: wrap as usize,
+            opacity: 0.5,
+        }];
+        for part in &scene[1..] {
+            assert_eq!(part.opacity_groups, path);
+            assert_eq!(part.opacity, 1.0, "container alpha was applied per source");
+        }
+        assert_eq!(
+            scene
+                .iter()
+                .skip(1)
+                .map(|p| p.native_owner)
+                .collect::<Vec<_>>(),
+            [metal_view as usize, blue_view as usize, metal_view as usize]
+        );
+        for native in [1, 2, 3] {
+            let pixel = scene[native]
+                .native_pixels
+                .as_ref()
+                .unwrap()
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .find(|px| px[3] != 0)
+                .unwrap();
+            assert_eq!(pixel[3], 255, "CPU capture premultiplied GPU group alpha");
+        }
+        unsafe {
+            crate::coreanimation::set_opacity_for_test(wrap, 0.25);
+        }
+        let quarter = capture();
+        assert!(quarter[1..].iter().all(|p| p.opacity_groups
+            == [OpacityGroup {
+                id: wrap as usize,
+                opacity: 0.25
+            }]
+            && p.opacity == 1.0));
+        // A live CABasicAnimation changes the shared isolation-group alpha
+        // without altering any individual source opacity or guest Metal pixel.
+        let animation_class =
+            objc::class::ptr(objc::class::lookup(c"CABasicAnimation").unwrap()) as Id;
+        let key = foundation::string::from_str("opacity");
+        let make: unsafe extern "C" fn(Id, objc::sel::Sel, Id) -> Id =
+            unsafe { std::mem::transmute(objc::msg::entry()) };
+        let anim = unsafe {
+            make(
+                animation_class,
+                objc::sel::get("animationWithKeyPath:"),
+                key,
+            )
+        };
+        let number = |v| {
+            corefoundation::collections::new_number(corefoundation::collections::Number::Float(v))
+                as Id
+        };
+        let (from, to) = (number(0.2), number(0.8));
+        let set_obj: unsafe extern "C" fn(Id, objc::sel::Sel, Id) =
+            unsafe { std::mem::transmute(objc::msg::entry()) };
+        let set_duration: unsafe extern "C" fn(Id, objc::sel::Sel, f64) =
+            unsafe { std::mem::transmute(objc::msg::entry()) };
+        let add: unsafe extern "C" fn(Id, objc::sel::Sel, Id, Id) =
+            unsafe { std::mem::transmute(objc::msg::entry()) };
+        unsafe {
+            set_obj(anim, objc::sel::get("setFromValue:"), from);
+            set_obj(anim, objc::sel::get("setToValue:"), to);
+            set_duration(anim, objc::sel::get("setDuration:"), 0.18);
+            add(wrap, objc::sel::get("addAnimation:forKey:"), anim, key);
+        }
+        let initial = capture();
+        let start_alpha = initial[1].opacity_groups[0].opacity;
+        std::thread::sleep(std::time::Duration::from_millis(48));
+        let animated = capture();
+        let next_alpha = animated[1].opacity_groups[0].opacity;
+        assert!(
+            next_alpha > start_alpha + 0.08,
+            "independently retained children failed to track animated group opacity"
+        );
+        assert!(animated[1..].iter().all(|source| source.opacity_groups
+            == [OpacityGroup {
+                id: wrap as usize,
+                opacity: next_alpha
+            }]
+            && source.opacity == 1.0));
+        std::thread::sleep(std::time::Duration::from_millis(190));
+        assert!((capture()[1].opacity_groups[0].opacity - 0.25).abs() < 0.001);
+        let remove: unsafe extern "C" fn(Id, objc::sel::Sel, Id) =
+            unsafe { std::mem::transmute(objc::msg::entry()) };
+        unsafe { remove(wrap, objc::sel::get("removeAnimationForKey:"), key) };
+        for object in [key, from, to] {
+            objc::arc::release(object);
+        }
+
+        let insert: unsafe extern "C" fn(Id, objc::sel::Sel, Id, u32) =
+            unsafe { std::mem::transmute(objc::msg::entry()) };
+        unsafe {
+            insert(wrap, objc::sel::get("insertSublayer:atIndex:"), a, 2);
+        }
+        let reordered = capture();
+        assert_eq!(
+            reordered
+                .iter()
+                .skip(1)
+                .map(|p| p.native_owner)
+                .collect::<Vec<_>>(),
+            [blue_view as usize, metal_view as usize]
+        );
+        let hidden: unsafe extern "C" fn(Id, objc::sel::Sel, u8) =
+            unsafe { std::mem::transmute(objc::msg::entry()) };
+        unsafe {
+            hidden(a, objc::sel::get("setHidden:"), 1);
+        }
+        let fewer = capture();
+        assert_eq!(fewer.len(), reordered.len());
+        assert_ne!(
+            fewer.last().unwrap().native_pixels.as_ref().unwrap(),
+            reordered.last().unwrap().native_pixels.as_ref().unwrap(),
+            "hidden top child kept its previous opaque CPU content"
+        );
+        objc::arc::release(window);
+    }
+
+    #[test]
+    fn transparent_ca_sibling_is_neutral_to_admitted_native_foreground() {
+        if !sdl3::isolated::run_here() {
+            return;
+        }
+        crate::bootstrap();
+        // The empty window's background is checked as Aqua's.
+        crate::appearance::use_aqua_on_this_thread();
+        if !sdl3::may_pump() {
+            return;
+        }
+        let window = objc::object::create_instance(objc::class::lookup(c"NSWindow").unwrap(), 0);
+        if !unsafe {
+            crate::window::init_with_content_rect_for_tests(window, rect(0.0, 0.0, 160.0, 120.0))
+        } {
+            return;
+        }
+        let sdl = unsafe { crate::window::sdl_window(window) };
+        let content = view(rect(0.0, 0.0, 160.0, 120.0));
+        let metal_view = view(rect(0.0, 0.0, 160.0, 120.0));
+        let label = view(rect(25.0, 20.0, 30.0, 22.0));
+        let empty = view(rect(55.0, 25.0, 24.0, 16.0));
+        let set: unsafe extern "C" fn(Id, objc::sel::Sel, Id) =
+            unsafe { std::mem::transmute(objc::msg::entry()) };
+        let metal_class = objc::class::lookup(c"CAMetalLayer").unwrap();
+        let ca_class = objc::class::lookup(c"CALayer").unwrap();
+        let make: unsafe extern "C" fn(Id, objc::sel::Sel) -> Id =
+            unsafe { std::mem::transmute(objc::msg::entry()) };
+        let metal = unsafe { make(metal_class as *const _ as Id, objc::sel::get("layer")) };
+        let ca = unsafe { make(ca_class as *const _ as Id, objc::sel::get("layer")) };
+        let transparent = unsafe { crate::cgcontext::CGColorCreateGenericRGB(1.0, 0.0, 0.0, 0.0) };
+        let opaque = unsafe { crate::cgcontext::CGColorCreateGenericRGB(1.0, 0.0, 0.0, 1.0) };
+        unsafe {
+            set(window, objc::sel::get("setContentView:"), content);
+            set(metal_view, objc::sel::get("setLayer:"), metal);
+            set(empty, objc::sel::get("setLayer:"), ca);
+            set(ca, objc::sel::get("setBackgroundColor:"), transparent as Id);
+            add_subview(content, objc::sel::get("addSubview:"), metal_view);
+            add_subview(content, objc::sel::get("addSubview:"), label);
+        }
+        crate::backing::set_native_view_pixels_for_tests(
+            label,
+            30,
+            22,
+            [0u8, 0, 255, 255].repeat(30 * 22),
+        );
+        flush_metal_scenes();
+        assert_eq!(metal_scene(sdl).unwrap().len(), 2);
+        assert!(
+            crate::backing::gpu_under_metal_cached(sdl, &crate::backing::Store::new(160, 120))
+                .is_none()
+        );
+        accept_published_native_for_tests(sdl);
+        let bottom =
+            crate::backing::gpu_under_metal_cached(sdl, &crate::backing::Store::new(160, 120))
+                .expect("admitted red foreground is separated from Metal");
+        unsafe { add_subview(content, objc::sel::get("addSubview:"), empty) };
+        flush_metal_scenes();
+        let scene = metal_scene(sdl).unwrap();
+        assert_eq!(
+            scene.len(),
+            2,
+            "all-transparent CA view unexpectedly published a GPU image"
+        );
+        assert_eq!(scene[1].native_owner, label as usize);
+        assert_eq!(
+            &scene[1].native_pixels.as_ref().unwrap()[..4],
+            &[0, 0, 255, 255]
+        );
+        let visible_frame = scene[1].frame;
+        let underlay_at_label =
+            ((visible_frame.y as usize * 160 + visible_frame.x as usize) * 4) as usize;
+        assert_eq!(
+            &bottom.pixels[underlay_at_label..underlay_at_label + 4],
+            &[237, 237, 237, 255],
+            "visible native foreground was incorrectly baked into the Metal underlay"
+        );
+        assert!(
+            crate::backing::gpu_under_metal_cached(sdl, &crate::backing::Store::new(160, 120))
+                .is_some(),
+            "known-empty CA sibling blocked the admitted foreground"
+        );
+
+        // New visible pixels invalidate the negative cache, but cannot be
+        // removed from the bottom source before GPU admission.
+        unsafe { set(ca, objc::sel::get("setBackgroundColor:"), opaque as Id) };
+        flush_metal_scenes();
+        assert_eq!(metal_scene(sdl).unwrap().len(), 3);
+        assert!(
+            crate::backing::gpu_under_metal_cached(sdl, &crate::backing::Store::new(160, 120))
+                .is_none(),
+            "an unadmitted newly opaque CA sibling was treated as empty"
+        );
+        accept_published_native_for_tests(sdl);
+        assert!(
+            crate::backing::gpu_under_metal_cached(sdl, &crate::backing::Store::new(160, 120))
+                .is_some()
+        );
+        unsafe { set(ca, objc::sel::get("setBackgroundColor:"), transparent as Id) };
+        flush_metal_scenes();
+        assert_eq!(metal_scene(sdl).unwrap().len(), 2);
+        assert!(
+            crate::backing::gpu_under_metal_cached(sdl, &crate::backing::Store::new(160, 120))
+                .is_some()
+        );
+        let remove: unsafe extern "C" fn(Id, objc::sel::Sel) =
+            unsafe { std::mem::transmute(objc::msg::entry()) };
+        unsafe { remove(empty, objc::sel::get("removeFromSuperview")) };
+        flush_metal_scenes();
+        assert_eq!(metal_scene(sdl).unwrap().len(), 2);
+        assert!(
+            std::sync::Arc::ptr_eq(
+                &bottom,
+                &crate::backing::gpu_under_metal_cached(sdl, &crate::backing::Store::new(160, 120))
+                    .unwrap()
+            ),
+            "transparent sibling changed the independently cached underlay"
+        );
+        objc::arc::release(window);
+    }
+
+    #[test]
+    fn transparent_four_k_ca_capture_is_negatively_cached_and_invalidated() {
+        crate::bootstrap();
+        let large = view(rect(0.0, 0.0, 3840.0, 2160.0));
+        let other = view(rect(0.0, 0.0, 16.0, 16.0));
+        let cls = objc::class::lookup(c"CALayer").unwrap();
+        let make: unsafe extern "C" fn(Id, objc::sel::Sel) -> Id =
+            unsafe { std::mem::transmute(objc::msg::entry()) };
+        let set: unsafe extern "C" fn(Id, objc::sel::Sel, Id) =
+            unsafe { std::mem::transmute(objc::msg::entry()) };
+        let ca = unsafe { make(cls as *const _ as Id, objc::sel::get("layer")) };
+        let unrelated = unsafe { make(cls as *const _ as Id, objc::sel::get("layer")) };
+        let transparent = unsafe { crate::cgcontext::CGColorCreateGenericRGB(0.0, 0.0, 1.0, 0.0) };
+        let opaque = unsafe { crate::cgcontext::CGColorCreateGenericRGB(0.0, 0.0, 1.0, 1.0) };
+        unsafe {
+            set(large, objc::sel::get("setLayer:"), ca);
+            set(other, objc::sel::get("setLayer:"), unrelated);
+            set(ca, objc::sel::get("setBackgroundColor:"), transparent as Id);
+        }
+        let before = crate::backing::native_render_count_for_tests();
+        assert!(crate::backing::native_scene_pixels(large, 3840, 2160).is_none());
+        for _ in 0..24 {
+            crate::coreanimation::changed(unrelated);
+            assert!(crate::backing::native_scene_pixels(large, 3840, 2160).is_none());
+        }
+        assert_eq!(
+            crate::backing::native_render_count_for_tests() - before,
+            1,
+            "unchanged 4K transparent CA was rasterized more than once"
+        );
+        unsafe { set(ca, objc::sel::get("setBackgroundColor:"), opaque as Id) };
+        let image = crate::backing::native_scene_pixels(large, 3840, 2160)
+            .expect("a changed opaque CA layer must invalidate empty cache");
+        assert!(image.0.as_chunks::<4>().0.iter().any(|pixel| pixel[3] != 0));
+        assert_eq!(crate::backing::native_render_count_for_tests() - before, 2);
+        unsafe { set(ca, objc::sel::get("setBackgroundColor:"), transparent as Id) };
+        assert!(crate::backing::native_scene_pixels(large, 3840, 2160).is_none());
+        assert_eq!(crate::backing::native_render_count_for_tests() - before, 3);
+        crate::backing::forget(large);
+        crate::backing::forget(other);
+        objc::arc::release(large);
+        objc::arc::release(other);
+    }
+
+    #[test]
+    fn native_cpu_pixels_are_separate_above_metal_and_underneath_below_it() {
+        if !sdl3::isolated::run_here() {
+            return;
+        }
+        crate::bootstrap();
+        // The empty window's background is checked as Aqua's.
+        crate::appearance::use_aqua_on_this_thread();
+        if !sdl3::may_pump() {
+            return;
+        }
+        let window =
+            objc::object::create_instance(objc::class::lookup(c"NSWindow").expect("NSWindow"), 0);
+        if !unsafe {
+            crate::window::init_with_content_rect_for_tests(window, rect(0.0, 0.0, 320.0, 240.0))
+        } {
+            return;
+        }
+        let sdl = unsafe { crate::window::sdl_window(window) };
+        let content = view(rect(0.0, 0.0, 320.0, 240.0));
+        let set_content: unsafe extern "C" fn(Id, objc::sel::Sel, Id) =
+            unsafe { std::mem::transmute(objc::msg::entry()) };
+        unsafe { set_content(window, objc::sel::get("setContentView:"), content) };
+        let metal_view = view(rect(0.0, 0.0, 320.0, 240.0));
+        let native = view(rect(40.0, 35.0, 30.0, 25.0));
+        let cls = objc::class::lookup(c"CAMetalLayer").expect("CAMetalLayer");
+        let maker = objc::sel::get("layer");
+        let make: unsafe extern "C" fn(Id, objc::sel::Sel) -> Id =
+            unsafe { std::mem::transmute(cls.metaclass().method(maker).unwrap().implementation()) };
+        let metal = unsafe { make(cls as *const _ as Id, maker) };
+        unsafe {
+            set_layer(metal_view, objc::sel::get("setLayer:"), metal);
+            add_subview(content, objc::sel::get("addSubview:"), metal_view);
+            add_subview(content, objc::sel::get("addSubview:"), native);
+        }
+        crate::backing::set_native_view_pixels_for_tests(
+            native,
+            30,
+            25,
+            [0u8, 0, 128, 128].repeat(30 * 25),
+        );
+        flush_metal_scenes();
+        assert!(
+            crate::backing::gpu_under_metal_cached(sdl, &crate::backing::Store::new(320, 240),)
+                .is_none(),
+            "publishing AppKit pixels before Vulkan admission must not exclude them"
+        );
+        accept_published_native_for_tests(sdl);
+        assert!(
+            crate::backing::gpu_under_metal_cached(sdl, &crate::backing::Store::new(320, 240),)
+                .is_some(),
+            "completed GPU scene admission must enable independent native stacking"
+        );
+        let scene = metal_scene(sdl).expect("live AppKit Metal/native scene");
+        assert_eq!(scene.len(), 2);
+        assert_eq!(scene[0].layer, metal as usize);
+        assert_eq!(
+            scene[1].layer,
+            (native as usize) | (1usize << (usize::BITS - 1))
+        );
+        assert_eq!(scene[1].native_pixels.as_ref().unwrap().len(), 30 * 25 * 4);
+        let original_revision = scene[1].native_revision;
+        let previous_underlay =
+            crate::backing::gpu_under_metal_cached(sdl, &crate::backing::Store::new(320, 240))
+                .expect("GPU first acknowledgment produced native separation");
+        // A new source with the *same* view address is only a proposal until
+        // Metal commits those new pixels. The previously accepted revision
+        // must not exclude current pixels beneath a translucent drawable.
+        crate::backing::set_native_view_pixels_for_tests(
+            native,
+            30,
+            25,
+            [1u8, 0, 128, 128].repeat(30 * 25),
+        );
+        flush_metal_scenes();
+        let proposed = metal_scene(sdl).unwrap();
+        assert_ne!(proposed[1].native_revision, original_revision);
+        assert!(
+            crate::backing::gpu_under_metal_cached(sdl, &crate::backing::Store::new(320, 240),)
+                .is_none(),
+            "published revision was subtracted without GPU admission"
+        );
+        accept_published_native_for_tests(sdl);
+        let accepted_underlay =
+            crate::backing::gpu_under_metal_cached(sdl, &crate::backing::Store::new(320, 240))
+                .expect("newly committed revision reenabled separation");
+        assert!(
+            std::sync::Arc::ptr_eq(&previous_underlay, &accepted_underlay),
+            "unchanged lower-content underlay was rebuilt for a foreground admission revision"
+        );
+        // Restore the original test pixels after checking the transition.
+        crate::backing::set_native_view_pixels_for_tests(
+            native,
+            30,
+            25,
+            [0u8, 0, 128, 128].repeat(30 * 25),
+        );
+        flush_metal_scenes();
+        accept_published_native_for_tests(sdl);
+        // Software-backed view overlays follow the same above-Metal order,
+        // rather than being silently baked into the bottom CPU image.
+        crate::backing::set_overlay(
+            native,
+            crate::backing::Overlay {
+                width: 30,
+                height: 25,
+                picture: crate::backing::Picture::Pixels([0u8, 0, 64, 128].repeat(30 * 25)),
+            },
+        );
+        invalidate_metal_scene(false);
+        flush_metal_scenes();
+        let with_overlay = metal_scene(sdl).unwrap();
+        assert_eq!(
+            &with_overlay[1].native_pixels.as_ref().unwrap()[..4],
+            &[0, 0, 127, 191]
+        );
+        crate::backing::remove_overlay(native);
+        invalidate_metal_scene(false);
+        flush_metal_scenes();
+        // Root Core Animation opacity belongs in the scene placement, not in
+        // pre-faded CPU pixels. That would double-fade CA content while view
+        // drawRect pixels remained unaffected.
+        let ordinary = objc::class::lookup(c"CALayer").expect("CALayer");
+        let native_layer = unsafe {
+            let make: unsafe extern "C" fn(Id, objc::sel::Sel) -> Id = std::mem::transmute(
+                ordinary
+                    .metaclass()
+                    .method(objc::sel::get("layer"))
+                    .unwrap()
+                    .implementation(),
+            );
+            make(ordinary as *const _ as Id, objc::sel::get("layer"))
+        };
+        unsafe { set_layer(native, objc::sel::get("setLayer:"), native_layer) };
+        unsafe { crate::coreanimation::set_opacity_for_test(native_layer, 0.5) };
+        flush_metal_scenes();
+        let faded = metal_scene(sdl).unwrap();
+        assert!((faded[1].opacity - 0.5).abs() <= f32::EPSILON);
+        // Metadata-only CA animation/opacity changes must reuse both the CPU
+        // capture and immutable Arc; the GPU revision must stay identical.
+        let captured = crate::backing::native_render_count_for_tests();
+        let pixels = faded[1].native_pixels.as_ref().unwrap().clone();
+        for step in 0..32 {
+            unsafe { crate::coreanimation::set_opacity_for_test(native_layer, step as f32 / 31.0) };
+            flush_metal_scenes();
+            let latest = metal_scene(sdl).unwrap();
+            assert!(std::sync::Arc::ptr_eq(
+                latest[1].native_pixels.as_ref().unwrap(),
+                &pixels,
+            ));
+            assert_eq!(latest[1].native_revision, faded[1].native_revision);
+        }
+        assert_eq!(
+            crate::backing::native_render_count_for_tests(),
+            captured,
+            "opacity-only scene updates re-rendered unchanged native pixels"
+        );
+        assert_eq!(
+            &faded[1].native_pixels.as_ref().unwrap()[..4],
+            &[0, 0, 128, 128]
+        );
+        unsafe { crate::coreanimation::set_opacity_for_test(native_layer, 1.0) };
+        flush_metal_scenes();
+        let flat = crate::backing::Store::new(320, 240);
+        let underneath = crate::backing::gpu_under_metal(sdl, &flat)
+            .expect("native top view requires separately composited bottom source");
+        let old = scene[1].frame;
+        let pixel = &underneath.pixels[(old.y as usize * 320 + old.x as usize) * 4..][..4];
+        assert_eq!(
+            pixel,
+            &[237, 237, 237, 255],
+            "translucent top native pixels were incorrectly baked under Metal"
+        );
+        unsafe {
+            set_frame_origin(
+                native,
+                objc::sel::get("setFrameOrigin:"),
+                NSPoint { x: 90.0, y: 60.0 },
+            )
+        };
+        flush_metal_scenes();
+        let moved = metal_scene(sdl).unwrap();
+        assert_ne!(moved[1].frame.x, old.x);
+        assert_eq!(moved[1].native_revision, scene[1].native_revision);
+        unsafe {
+            add_subview_positioned(
+                content,
+                objc::sel::get("addSubview:positioned:relativeTo:"),
+                native,
+                ORDER_BELOW,
+                metal_view,
+            )
+        };
+        flush_metal_scenes();
+        assert_eq!(
+            metal_scene(sdl)
+                .unwrap()
+                .iter()
+                .map(|p| p.layer)
+                .collect::<Vec<_>>(),
+            [metal as usize],
+            "native content below Metal must remain in the base backing"
+        );
+        assert!(crate::backing::gpu_under_metal(sdl, &flat).is_none());
+        unsafe { remove_from_superview(native, objc::sel::get("removeFromSuperview")) };
+        flush_metal_scenes();
+        assert_eq!(metal_scene(sdl).unwrap().len(), 1);
+        objc::arc::release(window);
+    }
+
+    /// The compositor consumes authoritative live AppKit order, not the order
+    /// in which a guest submits Metal command buffers. Hidden and removed
+    /// views must disappear from its scene before their next drawable.
+    #[test]
+    fn metal_scene_tracks_sibling_order_hiding_and_removal() {
+        if !sdl3::isolated::run_here() {
+            return;
+        }
+        crate::bootstrap();
+        if !sdl3::may_pump() {
+            return;
+        }
+        let window =
+            objc::object::create_instance(objc::class::lookup(c"NSWindow").expect("NSWindow"), 0);
+        if !unsafe {
+            crate::window::init_with_content_rect_for_tests(window, rect(0.0, 0.0, 320.0, 240.0))
+        } {
+            return;
+        }
+        let sdl = unsafe { crate::window::sdl_window(window) };
+        let content = view(rect(0.0, 0.0, 320.0, 240.0));
+        let set_content = objc::sel::get("setContentView:");
+        unsafe {
+            let f: unsafe extern "C" fn(Id, objc::sel::Sel, Id) =
+                std::mem::transmute(objc::msg::entry());
+            f(window, set_content, content);
+        }
+        let metal = objc::class::lookup(c"CAMetalLayer").expect("CAMetalLayer");
+        let maker = objc::sel::get("layer");
+        let make: unsafe extern "C" fn(Id, objc::sel::Sel) -> Id = unsafe {
+            std::mem::transmute(metal.metaclass().method(maker).unwrap().implementation())
+        };
+        let (a, b) = (
+            view(rect(0.0, 0.0, 320.0, 240.0)),
+            view(rect(25.0, 35.0, 120.0, 70.0)),
+        );
+        let (first, second) = unsafe {
+            (
+                make(metal as *const _ as Id, maker),
+                make(metal as *const _ as Id, maker),
+            )
+        };
+        unsafe {
+            set_layer(a, objc::sel::get("setLayer:"), first);
+            set_layer(b, objc::sel::get("setLayer:"), second);
+            add_subview(content, objc::sel::get("addSubview:"), a);
+            add_subview(content, objc::sel::get("addSubview:"), b);
+        }
+        let metal_scene = |sdl| {
+            flush_metal_scenes();
+            super::metal_scene(sdl)
+        };
+        let ids = |sdl| {
+            metal_scene(sdl)
+                .unwrap()
+                .iter()
+                .map(|entry| entry.layer)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(ids(sdl), [first as usize, second as usize]);
+        let baseline = METAL_SCENE_CAPTURES.load(std::sync::atomic::Ordering::Relaxed);
+        // Bulk CA mutations do not traverse views synchronously. The
+        // last model value is captured once at the event-pump boundary.
+        let set_opacity: unsafe extern "C" fn(Id, objc::sel::Sel, f32) =
+            unsafe { std::mem::transmute(objc::msg::entry()) };
+        for index in 0..64 {
+            unsafe { set_opacity(second, objc::sel::get("setOpacity:"), index as f32 / 64.0) };
+        }
+        assert_eq!(
+            METAL_SCENE_CAPTURES.load(std::sync::atomic::Ordering::Relaxed),
+            baseline
+        );
+        flush_metal_scenes();
+        let after = METAL_SCENE_CAPTURES.load(std::sync::atomic::Ordering::Relaxed);
+        assert!(
+            after - baseline <= crate::window::all().len(),
+            "bulk layout triggered more than one scene capture per window"
+        );
+        assert!((metal_scene(sdl).unwrap()[1].opacity - 63.0 / 64.0).abs() < 0.0001);
+        unsafe { set_opacity(second, objc::sel::get("setOpacity:"), 1.0) };
+        assert_eq!(ids(sdl), [first as usize, second as usize]);
+        unsafe { set_hidden(b, objc::sel::get("setHidden:"), 1) };
+        assert_eq!(ids(sdl), [first as usize]);
+        unsafe { set_hidden(b, objc::sel::get("setHidden:"), 0) };
+        assert_eq!(ids(sdl), [first as usize, second as usize]);
+        // A CAMetalLayer can change opacity or visibility without its NSView
+        // doing so. The published scene must reflect both transitions.
+        unsafe {
+            let hidden: unsafe extern "C" fn(Id, objc::sel::Sel, u8) =
+                std::mem::transmute(objc::msg::entry());
+            hidden(second, objc::sel::get("setHidden:"), 1);
+        }
+        assert_eq!(ids(sdl), [first as usize]);
+        unsafe {
+            let hidden: unsafe extern "C" fn(Id, objc::sel::Sel, u8) =
+                std::mem::transmute(objc::msg::entry());
+            hidden(second, objc::sel::get("setHidden:"), 0);
+            let opacity: unsafe extern "C" fn(Id, objc::sel::Sel, f32) =
+                std::mem::transmute(objc::msg::entry());
+            opacity(second, objc::sel::get("setOpacity:"), 0.5);
+        }
+        let current = metal_scene(sdl).expect("published layer snapshot");
+        assert_eq!(current.len(), 2);
+        assert!((current[1].opacity - 0.5).abs() <= f32::EPSILON);
+        assert!(current[1].opaque, "CAMetalLayer should default to opaque");
+        // The model opacity stays at 0.5 while the presentation-layer
+        // animation interpolates on each event turn, without new Metal pixels.
+        let animation_class =
+            objc::class::ptr(objc::class::lookup(c"CABasicAnimation").expect("CABasicAnimation"))
+                as Id;
+        let key = foundation::string::from_str("opacity");
+        let send_obj: unsafe extern "C" fn(Id, objc::sel::Sel, Id) -> Id =
+            unsafe { std::mem::transmute(objc::msg::entry()) };
+        let animation = unsafe {
+            send_obj(
+                animation_class,
+                objc::sel::get("animationWithKeyPath:"),
+                key,
+            )
+        };
+        let num = |value| {
+            corefoundation::collections::new_number(corefoundation::collections::Number::Float(
+                value,
+            )) as Id
+        };
+        let (from, to) = (num(0.0), num(1.0));
+        unsafe {
+            let set_obj: unsafe extern "C" fn(Id, objc::sel::Sel, Id) =
+                std::mem::transmute(objc::msg::entry());
+            let set_duration: unsafe extern "C" fn(Id, objc::sel::Sel, f64) =
+                std::mem::transmute(objc::msg::entry());
+            let add: unsafe extern "C" fn(Id, objc::sel::Sel, Id, Id) =
+                std::mem::transmute(objc::msg::entry());
+            set_obj(animation, objc::sel::get("setFromValue:"), from);
+            set_obj(animation, objc::sel::get("setToValue:"), to);
+            set_duration(animation, objc::sel::get("setDuration:"), 0.16);
+            add(
+                second,
+                objc::sel::get("addAnimation:forKey:"),
+                animation,
+                key,
+            );
+        }
+        flush_metal_scenes();
+        let animated_start = metal_scene(sdl).unwrap()[1].opacity;
+        std::thread::sleep(std::time::Duration::from_millis(45));
+        flush_metal_scenes();
+        let animated_next = metal_scene(sdl).unwrap()[1].opacity;
+        assert!(
+            animated_next > animated_start + 0.10,
+            "presentation opacity did not advance without another drawable"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(160));
+        flush_metal_scenes();
+        assert!(
+            (metal_scene(sdl).unwrap()[1].opacity - 0.5).abs() < 0.001,
+            "removed-on-completion CA animation did not restore model alpha"
+        );
+        unsafe {
+            let remove: unsafe extern "C" fn(Id, objc::sel::Sel, Id) =
+                std::mem::transmute(objc::msg::entry());
+            remove(second, objc::sel::get("removeAnimationForKey:"), key);
+        }
+        for value in [key, from, to] {
+            objc::arc::release(value);
+        }
+        let set_opaque: unsafe extern "C" fn(Id, objc::sel::Sel, u8) =
+            unsafe { std::mem::transmute(objc::msg::entry()) };
+        unsafe { set_opaque(second, objc::sel::get("setOpaque:"), 0) };
+        assert!(!metal_scene(sdl).unwrap()[1].opaque);
+        unsafe { set_opaque(second, objc::sel::get("setOpaque:"), 1) };
+        assert!(metal_scene(sdl).unwrap()[1].opaque);
+        // Moving a live Metal layer changes placement without requiring it to
+        // submit another drawable. Sibling reordering changes compositing
+        // order even if neither layer publishes a new frame.
+        let old_frame = current[1].frame;
+        unsafe {
+            set_frame_origin(
+                b,
+                objc::sel::get("setFrameOrigin:"),
+                NSPoint { x: 42.0, y: 50.0 },
+            )
+        };
+        let moved = metal_scene(sdl).expect("updated geometry");
+        assert_ne!(moved[1].frame.x, old_frame.x);
+        assert_ne!(moved[1].frame.y, old_frame.y);
+        unsafe {
+            add_subview_positioned(
+                content,
+                objc::sel::get("addSubview:positioned:relativeTo:"),
+                a,
+                1,
+                b,
+            )
+        };
+        assert_eq!(ids(sdl), [second as usize, first as usize]);
+        unsafe {
+            add_subview_positioned(
+                content,
+                objc::sel::get("addSubview:positioned:relativeTo:"),
+                a,
+                ORDER_BELOW,
+                b,
+            )
+        };
+        assert_eq!(ids(sdl), [first as usize, second as usize]);
+        // Reparent B beneath a container. Hiding an ancestor must retire the
+        // nested Metal layer without changing B's own hidden flag.
+        let container = view(rect(15.0, 10.0, 280.0, 200.0));
+        unsafe {
+            add_subview(content, objc::sel::get("addSubview:"), container);
+            add_subview(container, objc::sel::get("addSubview:"), b);
+        }
+        assert_eq!(ids(sdl), [first as usize, second as usize]);
+        // The parent view's ordinary CA backing layer is not necessarily a
+        // superlayer of its child's CAMetalLayer. Its hidden/opacity state
+        // must nonetheless be inherited by the child view's presentation.
+        let ca = objc::class::lookup(c"CALayer").expect("CALayer");
+        let parent_layer = unsafe { make(ca as *const _ as Id, maker) };
+        unsafe { set_layer(container, objc::sel::get("setLayer:"), parent_layer) };
+        let ca_opacity: unsafe extern "C" fn(Id, objc::sel::Sel, f32) =
+            unsafe { std::mem::transmute(objc::msg::entry()) };
+        let ca_hidden: unsafe extern "C" fn(Id, objc::sel::Sel, u8) =
+            unsafe { std::mem::transmute(objc::msg::entry()) };
+        unsafe { ca_opacity(parent_layer, objc::sel::get("setOpacity:"), 0.4) };
+        let grouped = metal_scene(sdl).unwrap();
+        assert_eq!(
+            grouped[1].opacity_groups,
+            [OpacityGroup {
+                id: parent_layer as usize,
+                opacity: 0.4
+            }]
+        );
+        assert!((grouped[1].opacity - 0.5).abs() < 0.0001);
+        unsafe { ca_hidden(parent_layer, objc::sel::get("setHidden:"), 1) };
+        assert_eq!(ids(sdl), [first as usize]);
+        unsafe { ca_hidden(parent_layer, objc::sel::get("setHidden:"), 0) };
+        assert_eq!(ids(sdl), [first as usize, second as usize]);
+        // A genuinely linked CA superlayer must not be multiplied twice.
+        let ca_add: unsafe extern "C" fn(Id, objc::sel::Sel, Id) =
+            unsafe { std::mem::transmute(objc::msg::entry()) };
+        unsafe { ca_add(parent_layer, objc::sel::get("addSublayer:"), second) };
+        assert_eq!(
+            metal_scene(sdl).unwrap()[1].opacity_groups,
+            [OpacityGroup {
+                id: parent_layer as usize,
+                opacity: 0.4
+            }]
+        );
+        // NSView alpha remains independent from the ordinary CA opacity.
+        unsafe { set_alpha_value(container, objc::sel::get("setAlphaValue:"), 0.5) };
+        assert_eq!(
+            metal_scene(sdl).unwrap()[1].opacity_groups,
+            [
+                OpacityGroup {
+                    id: container as usize,
+                    opacity: 0.5
+                },
+                OpacityGroup {
+                    id: parent_layer as usize,
+                    opacity: 0.4
+                }
+            ]
+        );
+        unsafe { ca_opacity(parent_layer, objc::sel::get("setOpacity:"), 1.0) };
+        let before_container_move = metal_scene(sdl).unwrap()[1].frame;
+        unsafe {
+            set_frame_origin(
+                container,
+                objc::sel::get("setFrameOrigin:"),
+                NSPoint { x: 35.0, y: 22.0 },
+            )
+        };
+        let after_container_move = metal_scene(sdl).unwrap()[1].frame;
+        assert_ne!(after_container_move.x, before_container_move.x);
+        // A clipped parent must constrain a retained descendant's pixels
+        // even when the descendant never submits another drawable.
+        unsafe {
+            set_frame(
+                container,
+                objc::sel::get("setFrame:"),
+                rect(35.0, 22.0, 60.0, 45.0),
+            );
+            set_clips_to_bounds(container, objc::sel::get("setClipsToBounds:"), 1);
+        }
+        let scene = metal_scene(sdl).unwrap();
+        assert_eq!(scene.len(), 2);
+        let expected = unsafe { presentation_frame(container) }.unwrap();
+        let clip = scene[1].clip.expect("subview not clipped to parent bounds");
+        assert_eq!(
+            (clip.x, clip.y, clip.width, clip.height),
+            (expected.x, expected.y, expected.width, expected.height)
+        );
+        // A CA rounded masksToBounds ancestor must reach the Metal scene
+        // even when neither child view nor drawable publishes new content.
+        let ca_masks: unsafe extern "C" fn(Id, objc::sel::Sel, u8) =
+            unsafe { std::mem::transmute(objc::msg::entry()) };
+        let ca_radius: unsafe extern "C" fn(Id, objc::sel::Sel, f64) =
+            unsafe { std::mem::transmute(objc::msg::entry()) };
+        unsafe {
+            ca_masks(parent_layer, objc::sel::get("setMasksToBounds:"), 1);
+            ca_radius(parent_layer, objc::sel::get("setCornerRadius:"), 80.0);
+        }
+        let rounded = metal_scene(sdl).unwrap();
+        assert_eq!(rounded[1].rounded.len(), 1);
+        assert_eq!(rounded[1].rounded[0].frame.x, expected.x);
+        assert_eq!(rounded[1].rounded[0].frame.y, expected.y);
+        assert!(
+            rounded[1].rounded[0].radius
+                > rounded[1].rounded[0]
+                    .frame
+                    .width
+                    .min(rounded[1].rounded[0].frame.height) as f32
+                    / 2.0,
+            "intermediate CALayer radius incorrectly clamped before GPU scene capture"
+        );
+        unsafe {
+            ca_masks(second, objc::sel::get("setMasksToBounds:"), 1);
+            ca_radius(second, objc::sel::get("setCornerRadius:"), 180.0);
+        }
+        let both = metal_scene(sdl).unwrap();
+        assert_eq!(both[1].rounded.len(), 2);
+        assert!(
+            both[1].rounded[1].radius
+                > both[1].rounded[1]
+                    .frame
+                    .width
+                    .min(both[1].rounded[1].frame.height) as f32
+                    / 2.0,
+            "NSView-backed CALayer radius incorrectly clamped before GPU scene capture"
+        );
+        unsafe {
+            ca_masks(parent_layer, objc::sel::get("setMasksToBounds:"), 0);
+            ca_masks(second, objc::sel::get("setMasksToBounds:"), 0);
+        }
+        assert!(metal_scene(sdl).unwrap()[1].rounded.is_empty());
+        unsafe { set_clips_to_bounds(container, objc::sel::get("setClipsToBounds:"), 0) };
+        assert!(metal_scene(sdl).unwrap()[1].clip.is_none());
+        unsafe { set_hidden(container, objc::sel::get("setHidden:"), 1) };
+        assert_eq!(ids(sdl), [first as usize]);
+        unsafe { set_hidden(container, objc::sel::get("setHidden:"), 0) };
+        assert_eq!(ids(sdl), [first as usize, second as usize]);
+        // Moving an existing view into a second window must evict it from the
+        // first compositor before the second window can accept its drawable.
+        let other_window =
+            objc::object::create_instance(objc::class::lookup(c"NSWindow").expect("NSWindow"), 0);
+        let mut other_sdl_for_teardown = std::ptr::null_mut();
+        if unsafe {
+            crate::window::init_with_content_rect_for_tests(
+                other_window,
+                rect(0.0, 0.0, 320.0, 240.0),
+            )
+        } {
+            let other_sdl = unsafe { crate::window::sdl_window(other_window) };
+            other_sdl_for_teardown = other_sdl;
+            let other_content = view(rect(0.0, 0.0, 320.0, 240.0));
+            unsafe {
+                let set_content: unsafe extern "C" fn(Id, objc::sel::Sel, Id) =
+                    std::mem::transmute(objc::msg::entry());
+                set_content(
+                    other_window,
+                    objc::sel::get("setContentView:"),
+                    other_content,
+                );
+                add_subview(other_content, objc::sel::get("addSubview:"), b);
+            }
+            assert_eq!(ids(sdl), [first as usize]);
+            assert_eq!(ids(other_sdl), [second as usize]);
+            METAL_SCENE_DAMAGED_WINDOWS.lock().unwrap().clear();
+            let before = METAL_SCENE_CAPTURES.load(std::sync::atomic::Ordering::Relaxed);
+            // A CA setter on the first window neither walks nor damages the
+            // second window, although both remain alive and visible.
+            unsafe { crate::coreanimation::set_opacity_for_test(first, 0.83) };
+            assert_eq!(
+                METAL_SCENE_CAPTURES.load(std::sync::atomic::Ordering::Relaxed),
+                before
+            );
+            flush_metal_scenes();
+            assert_eq!(
+                METAL_SCENE_CAPTURES.load(std::sync::atomic::Ordering::Relaxed) - before,
+                1,
+                "one CA setter captured an unrelated NSWindow"
+            );
+            assert_eq!(
+                *METAL_SCENE_DAMAGED_WINDOWS.lock().unwrap(),
+                [sdl as usize],
+                "CA property mutation damaged another window's CPU backing"
+            );
+            assert!((metal_scene(sdl).unwrap()[0].opacity - 0.83).abs() < 0.001);
+            assert_eq!(metal_scene(other_sdl).unwrap()[0].opacity, 0.5);
+            unsafe { remove_from_superview(b, objc::sel::get("removeFromSuperview")) };
+            assert_eq!(ids(other_sdl), []);
+            // Another guest thread may mutate an ordinary CALayer while the
+            // video owner reparents and detaches its Metal view. Publication
+            // cannot borrow the reparented view from the setter thread.
+            std::thread::scope(|scope| {
+                let parent = parent_layer as usize;
+                let writer = scope.spawn(move || {
+                    let layer = parent as Id;
+                    for i in 0..256 {
+                        unsafe {
+                            crate::coreanimation::set_opacity_for_test(
+                                layer,
+                                (i % 100) as f32 / 100.0,
+                            )
+                        };
+                    }
+                });
+                for _ in 0..32 {
+                    unsafe {
+                        add_subview(content, objc::sel::get("addSubview:"), b);
+                        add_subview(other_content, objc::sel::get("addSubview:"), b);
+                    }
+                }
+                unsafe { remove_from_superview(b, objc::sel::get("removeFromSuperview")) };
+                writer.join().expect("CALayer mutation thread");
+            });
+            assert_eq!(ids(other_sdl), []);
+            assert_eq!(ids(sdl), [first as usize]);
+        } else {
+            unsafe { remove_from_superview(b, objc::sel::get("removeFromSuperview")) };
+        }
+        assert_eq!(ids(sdl), [first as usize]);
+        objc::arc::release(other_window);
+        if !other_sdl_for_teardown.is_null() {
+            assert!(
+                super::metal_scene(other_sdl_for_teardown).is_none(),
+                "destroyed NSWindow retained stale Metal scene metadata"
+            );
+        }
+        objc::arc::release(window);
+    }
+
+    /// Opt-in AppKit owner-thread benchmark. Mutating N layered views in one
+    /// transaction should make one O(N) capture, not N O(N) captures.
+    #[test]
+    fn batch_metal_scene_capture_cost() {
+        if std::env::var_os("ROSEMARY_BENCH_APPKIT_SCENE").is_none() {
+            return;
+        }
+        if !sdl3::isolated::run_here() {
+            return;
+        }
+        crate::bootstrap();
+        if !sdl3::may_pump() {
+            return;
+        }
+        let window =
+            objc::object::create_instance(objc::class::lookup(c"NSWindow").expect("NSWindow"), 0);
+        if !unsafe {
+            crate::window::init_with_content_rect_for_tests(window, rect(0.0, 0.0, 640.0, 480.0))
+        } {
+            return;
+        }
+        let content = view(rect(0.0, 0.0, 640.0, 480.0));
+        let attach: unsafe extern "C" fn(Id, objc::sel::Sel, Id) =
+            unsafe { std::mem::transmute(objc::msg::entry()) };
+        unsafe { attach(window, objc::sel::get("setContentView:"), content) };
+        let metal = objc::class::lookup(c"CAMetalLayer").expect("CAMetalLayer");
+        let maker = objc::sel::get("layer");
+        let make: unsafe extern "C" fn(Id, objc::sel::Sel) -> Id = unsafe {
+            std::mem::transmute(metal.metaclass().method(maker).unwrap().implementation())
+        };
+        let mut layers = Vec::new();
+        for i in 0..128 {
+            let child = view(rect((i % 16 * 36) as f64, (i / 16 * 50) as f64, 34.0, 45.0));
+            let layer = unsafe { make(metal as *const _ as Id, maker) };
+            unsafe {
+                set_layer(child, objc::sel::get("setLayer:"), layer);
+                add_subview(content, objc::sel::get("addSubview:"), child);
+            }
+            layers.push(layer);
+        }
+        let sdl = unsafe { crate::window::sdl_window(window) };
+        flush_metal_scenes();
+        let baseline = METAL_SCENE_CAPTURES.load(std::sync::atomic::Ordering::Relaxed);
+        let start = std::time::Instant::now();
+        for i in 0..2048usize {
+            unsafe {
+                crate::coreanimation::set_opacity_for_test(
+                    layers[i % layers.len()],
+                    ((i % 97) as f32 + 1.0) / 100.0,
+                )
+            };
+        }
+        let mutations_us = start.elapsed().as_secs_f64() * 1e6;
+        let prior = METAL_SCENE_CAPTURES.load(std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(
+            baseline, prior,
+            "setter threads performed hierarchy captures"
+        );
+        let start = std::time::Instant::now();
+        flush_metal_scenes();
+        let one_us = start.elapsed().as_secs_f64() * 1e6;
+        let after = METAL_SCENE_CAPTURES.load(std::sync::atomic::Ordering::Relaxed);
+        assert!(after - prior <= crate::window::all().len());
+        let start = std::time::Instant::now();
+        for _ in 0..128 {
+            let _ = capture_metal_scene(sdl, darwin::mach::media_time());
+        }
+        let naive_us = start.elapsed().as_secs_f64() * 1e6 / 128.0;
+        let start = std::time::Instant::now();
+        for _ in 0..2048 {
+            flush_metal_scenes();
+        }
+        let clean_us = start.elapsed().as_secs_f64() * 1e6 / 2048.0;
+        eprintln!(
+            "AppKit 128 metal-layer/2048 setter benchmark: queued-mutations-total-us={mutations_us:.1} one-pump-us={one_us:.1} forced-capture-mean-us={naive_us:.1} idle-clean-pump-mean-us={clean_us:.3} captures-per-transaction={}",
+            after - prior
+        );
+        assert_eq!(metal_scene(sdl).unwrap().len(), 128);
+        objc::arc::release(window);
+    }
+
     /// A subview's rectangle in the pixels of the window it is in, which is
     /// what presentation blits a `CAMetalLayer`'s drawable into.
     ///
@@ -2426,7 +5898,16 @@ mod tests {
     /// it is skipped where no window can be made.
     #[test]
     fn a_subviews_frame_reaches_the_window_in_pixels() {
+        if !sdl3::isolated::run_here() {
+            return;
+        }
         crate::bootstrap();
+        // SDL belongs to the video thread. Concurrent window tests can claim
+        // it first; on another thread the presentation cache cannot be built.
+        // Run this graphical integration test in a single-threaded harness.
+        if !sdl3::may_pump() {
+            return;
+        }
         let window =
             objc::object::create_instance(objc::class::lookup(c"NSWindow").expect("NSWindow"), 0);
         // SAFETY: `-initWithContentRect:styleMask:backing:defer:` is
@@ -2475,6 +5956,55 @@ mod tests {
         assert!(frame.covers_window());
     }
 
+    /// A zero-sized view is fitted to its window's drawable with exactly the
+    /// canonical rounded edges, including the content inset. No alternative
+    /// origin/width rounding is permitted in the fallback.
+    #[test]
+    fn zero_sized_presentation_fallback_preserves_fractional_surface_edges() {
+        if !sdl3::isolated::run_here() {
+            return;
+        }
+        crate::bootstrap();
+        let class = objc::class::lookup(c"NSWindow").unwrap();
+        let window = objc::object::create_instance(class, 0);
+        let made = unsafe {
+            crate::window::init_with_content_rect_for_tests(window, rect(0.0, 0.0, 320.0, 240.0))
+        };
+        if !made {
+            return;
+        }
+        // Only the SDL video thread can build the presentation cache.
+        if !sdl3::video::is_video_thread() {
+            return;
+        }
+        let child = view(rect(0.0, 0.0, 0.0, 0.0));
+        unsafe { set_window(child, window) };
+        let sdl = unsafe { crate::window::sdl_window(window) };
+        let rounded = unsafe { presentation_frame(child) }.unwrap();
+        let surface = crate::window::surface_frame(window).unwrap();
+        let inset = crate::window::content_inset(window).min(surface.size.height);
+        let expected = crate::window::pixel_rect_from_surface(
+            NSRect {
+                origin: NSPoint {
+                    x: surface.origin.x,
+                    y: surface.origin.y + inset,
+                },
+                size: NSSize {
+                    width: surface.size.width,
+                    height: (surface.size.height - inset).max(0.0),
+                },
+            },
+            sdl3::video::window_size(sdl).unwrap(),
+            sdl3::video::window_size_in_pixels(sdl).unwrap(),
+        );
+        assert_eq!(
+            (rounded.x, rounded.y, rounded.width, rounded.height),
+            (expected.x, expected.y, expected.w as u32, expected.h as u32)
+        );
+        objc::arc::release(child);
+        objc::arc::release(window);
+    }
+
     /// A view with no window has nowhere to be presented, which is what
     /// sends a drawable down the readback path instead.
     #[test]
@@ -2484,6 +6014,43 @@ mod tests {
         assert!(unsafe { presentation_frame(orphan) }.is_none());
         // SAFETY: null is one of the values this accepts.
         assert!(unsafe { presentation_frame(std::ptr::null_mut()) }.is_none());
+    }
+
+    #[test]
+    fn next_valid_key_view_skips_views_that_cannot_become_key() {
+        crate::bootstrap();
+        unsafe extern "C" fn refuse(_receiver: Id, _sel: Sel) -> u8 {
+            0
+        }
+        let base = objc::class::lookup(c"NSView").expect("NSView");
+        let class =
+            objc::class::allocate_pair(Some(base), c"KeyViewRefuser", 0).expect("a subclass");
+        class.add_method(
+            objc::sel::get("canBecomeKeyView"),
+            refuse as objc::class::Imp,
+            c"c16@0:8",
+        );
+        objc::class::register_pair(class);
+        let first = view(rect(0.0, 0.0, 10.0, 10.0));
+        let skipped = objc::object::create_instance(class, 0);
+        let last = view(rect(0.0, 0.0, 10.0, 10.0));
+        let set = objc::sel::get("setNextKeyView:");
+        let valid = objc::sel::get("nextValidKeyView");
+        // SAFETY: views of this crate's.
+        unsafe {
+            set_next_key_view(first, set, skipped);
+            set_next_key_view(skipped, set, last);
+            assert_eq!(next_valid_key_view(first, valid), last);
+            // A loop back to `first` has no other view that can become key.
+            set_next_key_view(skipped, set, first);
+            assert!(next_valid_key_view(first, valid).is_null());
+            set_next_key_view(first, set, std::ptr::null_mut());
+            set_next_key_view(skipped, set, std::ptr::null_mut());
+            set_next_key_view(last, set, std::ptr::null_mut());
+        }
+        objc::arc::release(first);
+        objc::arc::release(skipped);
+        objc::arc::release(last);
     }
 
     #[test]
@@ -2508,5 +6075,1541 @@ mod tests {
             assert_eq!(f(layer, get_masks), 0);
         }
         objc::arc::release(view);
+    }
+
+    #[test]
+    fn animated_ca_ancestor_position_and_bounds_republish_static_metal_clipping() {
+        if !sdl3::isolated::run_here() {
+            return;
+        }
+        crate::bootstrap();
+        if !sdl3::may_pump() {
+            return;
+        }
+        let window = objc::object::create_instance(objc::class::lookup(c"NSWindow").unwrap(), 0);
+        if !unsafe {
+            crate::window::init_with_content_rect_for_tests(window, rect(0.0, 0.0, 120.0, 90.0))
+        } {
+            return;
+        }
+        let sdl = unsafe { crate::window::sdl_window(window) };
+        let content = view(rect(0.0, 0.0, 120.0, 90.0));
+        let metal_view = view(rect(0.0, 0.0, 120.0, 90.0));
+        let set_content: unsafe extern "C" fn(Id, objc::sel::Sel, Id) =
+            unsafe { std::mem::transmute(objc::msg::entry()) };
+        unsafe { set_content(window, objc::sel::get("setContentView:"), content) };
+        let ca = objc::class::lookup(c"CALayer").unwrap();
+        let maker = objc::sel::get("layer");
+        let make: unsafe extern "C" fn(Id, objc::sel::Sel) -> Id =
+            unsafe { std::mem::transmute(ca.metaclass().method(maker).unwrap().implementation()) };
+        let root = unsafe { make(ca as *const _ as Id, maker) };
+        let mask = unsafe { make(ca as *const _ as Id, maker) };
+        let metal_cls = objc::class::lookup(c"CAMetalLayer").unwrap();
+        let make_metal: unsafe extern "C" fn(Id, objc::sel::Sel) -> Id = unsafe {
+            std::mem::transmute(
+                metal_cls
+                    .metaclass()
+                    .method(maker)
+                    .unwrap()
+                    .implementation(),
+            )
+        };
+        let metal = unsafe { make_metal(metal_cls as *const _ as Id, maker) };
+        let set_rect: unsafe extern "C" fn(Id, objc::sel::Sel, NSRect) =
+            unsafe { std::mem::transmute(objc::msg::entry()) };
+        let mask_clip: unsafe extern "C" fn(Id, objc::sel::Sel, u8) =
+            unsafe { std::mem::transmute(objc::msg::entry()) };
+        unsafe {
+            set_layer(content, objc::sel::get("setLayer:"), root);
+            set_layer(metal_view, objc::sel::get("setLayer:"), metal);
+            add_subview(content, objc::sel::get("addSubview:"), metal_view);
+            set_rect(
+                mask,
+                objc::sel::get("setFrame:"),
+                rect(12.0, 8.0, 42.0, 30.0),
+            );
+            set_content(root, objc::sel::get("addSublayer:"), mask);
+            set_content(mask, objc::sel::get("addSublayer:"), metal);
+            mask_clip(mask, objc::sel::get("setMasksToBounds:"), 1);
+        }
+        flush_metal_scenes();
+        let clip = || {
+            metal_scene(sdl)
+                .unwrap()
+                .into_iter()
+                .find(|source| source.layer == metal as usize)
+                .and_then(|source| source.clip)
+                .expect("animated middle CA mask clipped static Metal")
+        };
+        let model = clip();
+        assert!(model.width > 0 && model.height > 0);
+        let anim_cls = objc::class::lookup(c"CABasicAnimation").unwrap();
+        let animate: unsafe extern "C" fn(Id, objc::sel::Sel, Id) -> Id =
+            unsafe { std::mem::transmute(objc::msg::entry()) };
+        let set_obj: unsafe extern "C" fn(Id, objc::sel::Sel, Id) =
+            unsafe { std::mem::transmute(objc::msg::entry()) };
+        let set_f64: unsafe extern "C" fn(Id, objc::sel::Sel, f64) =
+            unsafe { std::mem::transmute(objc::msg::entry()) };
+        let add_animation: unsafe extern "C" fn(Id, objc::sel::Sel, Id, Id) =
+            unsafe { std::mem::transmute(objc::msg::entry()) };
+        let number = |value: f64| {
+            corefoundation::collections::new_number(corefoundation::collections::Number::Float(
+                value,
+            )) as Id
+        };
+        let animate_path = |path: &str, from: f64, to: f64| {
+            let key = foundation::string::from_str(path);
+            let anim = unsafe {
+                animate(
+                    anim_cls as *const _ as Id,
+                    objc::sel::get("animationWithKeyPath:"),
+                    key,
+                )
+            };
+            let start = number(from);
+            let end = number(to);
+            unsafe {
+                set_obj(anim, objc::sel::get("setFromValue:"), start);
+                set_obj(anim, objc::sel::get("setToValue:"), end);
+                set_f64(anim, objc::sel::get("setDuration:"), 0.30);
+                set_f64(
+                    anim,
+                    objc::sel::get("setBeginTime:"),
+                    darwin::mach::media_time() - 0.15,
+                );
+                add_animation(mask, objc::sel::get("addAnimation:forKey:"), anim, key);
+            }
+            objc::arc::release(start);
+            objc::arc::release(end);
+            objc::arc::release(key);
+        };
+        animate_path("position.x", 33.0, 69.0);
+        animate_path("bounds.size.width", 32.0, 70.0);
+        assert!(
+            !crate::coreanimation::scene_animation_roots(darwin::mach::media_time()).is_empty()
+        );
+        flush_metal_scenes();
+        let middle = clip();
+        assert!(
+            middle.x != model.x || middle.width != model.width,
+            "static Metal clipping did not reflect interpolated CA position/width"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(30));
+        flush_metal_scenes();
+        let later = clip();
+        assert!(
+            middle.x != later.x || middle.width != later.width,
+            "static Metal did not receive a subsequent geometry-only CA animation tick"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(165));
+        flush_metal_scenes();
+        let final_clip = clip();
+        assert_eq!(
+            (
+                final_clip.x,
+                final_clip.y,
+                final_clip.width,
+                final_clip.height
+            ),
+            (model.x, model.y, model.width, model.height),
+            "finished position/bounds animation did not restore model clip without new drawable"
+        );
+        objc::arc::release(window);
+    }
+
+    #[test]
+    fn fully_visible_six_k_cpu_foreground_tiles_above_opaque_metal() {
+        if !sdl3::isolated::run_here() {
+            return;
+        }
+        crate::bootstrap();
+        if !sdl3::may_pump() {
+            return;
+        }
+        const WIDTH: usize = 6016;
+        const HEIGHT: usize = 3384;
+        let window = objc::object::create_instance(objc::class::lookup(c"NSWindow").unwrap(), 0);
+        if !unsafe {
+            crate::window::init_with_content_rect_for_tests(
+                window,
+                rect(0.0, 0.0, WIDTH as f64, HEIGHT as f64),
+            )
+        } {
+            return;
+        }
+        let sdl = unsafe { crate::window::sdl_window(window) };
+        let content = view(rect(0.0, 0.0, WIDTH as f64, HEIGHT as f64));
+        let metal_view = view(rect(0.0, 0.0, WIDTH as f64, HEIGHT as f64));
+        let above = view(rect(0.0, 0.0, WIDTH as f64, HEIGHT as f64));
+        let set_content: unsafe extern "C" fn(Id, objc::sel::Sel, Id) =
+            unsafe { std::mem::transmute(objc::msg::entry()) };
+        unsafe { set_content(window, objc::sel::get("setContentView:"), content) };
+        let metal_cls = objc::class::lookup(c"CAMetalLayer").unwrap();
+        let maker = objc::sel::get("layer");
+        let make: unsafe extern "C" fn(Id, objc::sel::Sel) -> Id = unsafe {
+            std::mem::transmute(
+                metal_cls
+                    .metaclass()
+                    .method(maker)
+                    .unwrap()
+                    .implementation(),
+            )
+        };
+        let metal = unsafe { make(metal_cls as *const _ as Id, maker) };
+        unsafe {
+            set_layer(metal_view, objc::sel::get("setLayer:"), metal);
+            add_subview(content, objc::sel::get("addSubview:"), metal_view);
+            add_subview(content, objc::sel::get("addSubview:"), above);
+        }
+        crate::backing::set_native_view_pixels_for_tests(
+            above,
+            WIDTH as u32,
+            HEIGHT as u32,
+            [0u8, 0, 255, 255].repeat(WIDTH * HEIGHT),
+        );
+        assert!(!crate::backing::native_scene_extent_supported(
+            WIDTH as u32,
+            HEIGHT as u32
+        ));
+        flush_metal_scenes();
+        let published = metal_scene(sdl).expect("Metal/native scene");
+        let tiles: Vec<_> = published
+            .iter()
+            .filter(|p| p.native_owner == above as usize)
+            .collect();
+        assert!(
+            tiles.len() >= 6,
+            "large visible native view is missing its tiled scene: {} tiles",
+            tiles.len()
+        );
+        assert_eq!(published[0].layer, metal as usize);
+        let mut ids = std::collections::HashSet::new();
+        let mut total = 0u64;
+        for tile in &tiles {
+            assert!(ids.insert(tile.layer), "two tiles shared one GPU layer ID");
+            if let Some(snapshot) = tile.native_tiles.as_ref() {
+                assert_eq!(
+                    snapshot.len(),
+                    tile.frame.width as usize * tile.frame.height as usize * 4
+                );
+                let mut first = [0u8; 4];
+                snapshot.copy_rect_to(0, 0, 1, 1, &mut first).unwrap();
+                assert_eq!(first, [0, 0, 255, 255]);
+                assert!(tile.native_pixels.is_none());
+            } else {
+                assert!(tile.native_pixels.as_ref().unwrap().len() <= 64 * 1024 * 1024);
+                assert_eq!(
+                    tile.native_pixels.as_ref().unwrap().len(),
+                    tile.frame.width as usize * tile.frame.height as usize * 4
+                );
+                assert_eq!(
+                    &tile.native_pixels.as_ref().unwrap()[..4],
+                    &[0, 0, 255, 255]
+                );
+            }
+            total += u64::from(tile.frame.width) * u64::from(tile.frame.height);
+        }
+        assert_eq!(
+            total,
+            (WIDTH * HEIGHT) as u64,
+            "tile coverage had a hole or overlap"
+        );
+        assert!(
+            crate::backing::gpu_under_metal_cached(
+                sdl,
+                &crate::backing::Store::new(WIDTH as u32, HEIGHT as u32)
+            )
+            .is_none(),
+            "unadmitted large foreground was removed from flattened backup"
+        );
+        let admitted: Vec<_> = tiles.iter().map(|p| (p.layer, p.native_revision)).collect();
+        crate::backing::set_native_gpu_admission(sdl, &admitted[..admitted.len() - 1]);
+        assert!(
+            crate::backing::gpu_under_metal_cached(
+                sdl,
+                &crate::backing::Store::new(WIDTH as u32, HEIGHT as u32)
+            )
+            .is_none(),
+            "one accepted tile prematurely excluded the whole native view"
+        );
+        crate::backing::set_native_gpu_admission(sdl, &admitted);
+        let underlay = crate::backing::gpu_under_metal_cached(
+            sdl,
+            &crate::backing::Store::new(WIDTH as u32, HEIGHT as u32),
+        )
+        .expect("all tile revisions were admitted");
+        assert_eq!(underlay.pixels.len(), WIDTH * HEIGHT * 4);
+        let first_capture = crate::backing::native_render_count_for_tests();
+        let old: Vec<_> = tiles
+            .iter()
+            .map(|p| (p.native_pixels.clone(), p.native_tiles.clone()))
+            .collect();
+        for _ in 0..3 {
+            invalidate_metal_scene_for_window(sdl);
+            flush_metal_scenes();
+            let current = metal_scene(sdl).unwrap();
+            let actual: Vec<_> = current
+                .iter()
+                .filter(|p| p.native_owner == above as usize)
+                .collect();
+            assert_eq!(actual.len(), old.len());
+            for (tile, (pixels, snapshot)) in actual.iter().zip(old.iter()) {
+                let same_pixels = match (&tile.native_pixels, pixels) {
+                    (Some(now), Some(old)) => std::sync::Arc::ptr_eq(now, old),
+                    _ => false,
+                };
+                let same_tiles = match (&tile.native_tiles, snapshot) {
+                    (Some(now), Some(old)) => std::sync::Arc::ptr_eq(now, old),
+                    _ => false,
+                };
+                assert!(
+                    same_pixels || same_tiles,
+                    "unchanged 6K tile rerendered instead of using retained Arc"
+                );
+            }
+        }
+        assert_eq!(
+            crate::backing::native_render_count_for_tests(),
+            first_capture
+        );
+        // A DMA-BUF overlay is layered over, not substituted for, the 6K
+        // CPU view. No GPU admission may erase CPU content until all six
+        // *mixed* source revisions have been accepted, not a DMA-only tile.
+        crate::backing::set_overlay(
+            above,
+            crate::backing::Overlay {
+                width: WIDTH as u32,
+                height: HEIGHT as u32,
+                picture: crate::backing::Picture::Dmabuf(std::sync::Arc::new(
+                    crate::backing::Dmabuf {
+                        width: WIDTH as u32,
+                        height: HEIGHT as u32,
+                        fourcc: 0,
+                        modifier: 0,
+                        planes: vec![],
+                    },
+                )),
+            },
+        );
+        flush_metal_scenes();
+        let mixed_scene = metal_scene(sdl).unwrap();
+        let mixed: Vec<_> = mixed_scene
+            .iter()
+            .filter(|source| source.native_owner == above as usize)
+            .collect();
+        assert_eq!(
+            mixed.len(),
+            6,
+            "mixed CPU/DMA foreground lost bounded tiles"
+        );
+        let original = unsafe { presentation_frame(above) }.unwrap();
+        for tile in &mixed {
+            assert!(
+                tile.native_pixels.is_some(),
+                "DMA wrongly replaced CPU background"
+            );
+            assert!(tile.native_dmabuf.is_some());
+            let (fw, fh, x, y) = tile
+                .native_dma_sample
+                .expect("tile producer sampling transform");
+            assert_eq!((fw, fh), (WIDTH as u32, HEIGHT as u32));
+            assert_eq!(
+                (x as i64, y as i64),
+                (
+                    i64::from(tile.frame.x) - i64::from(original.x),
+                    i64::from(tile.frame.y) - i64::from(original.y)
+                )
+            );
+        }
+        let accepted: Vec<_> = mixed.iter().map(|s| (s.layer, s.native_revision)).collect();
+        crate::backing::set_native_gpu_admission(sdl, &accepted[..5]);
+        assert!(
+            crate::backing::gpu_under_metal(
+                sdl,
+                &crate::backing::Store::new(WIDTH as u32, HEIGHT as u32)
+            )
+            .is_none(),
+            "partial GPU acceptance removed mixed CPU backing below opaque Metal"
+        );
+        crate::backing::set_native_gpu_admission(sdl, &accepted);
+        assert!(
+            crate::backing::gpu_under_metal_cached(
+                sdl,
+                &crate::backing::Store::new(WIDTH as u32, HEIGHT as u32)
+            )
+            .is_some(),
+            "all mixed native source tiles were admitted but no underlay was produced"
+        );
+        crate::backing::remove_overlay(above);
+        crate::backing::forget(above);
+        objc::arc::release(window);
+    }
+
+    #[test]
+    fn oversized_native_cpu_foreground_crops_visible_pixels_above_metal() {
+        if !sdl3::isolated::run_here() {
+            return;
+        }
+        crate::bootstrap();
+        if !sdl3::may_pump() {
+            return;
+        }
+        let window = objc::object::create_instance(objc::class::lookup(c"NSWindow").unwrap(), 0);
+        if !unsafe {
+            crate::window::init_with_content_rect_for_tests(window, rect(0.0, 0.0, 320.0, 240.0))
+        } {
+            return;
+        }
+        let sdl = unsafe { crate::window::sdl_window(window) };
+        let content = view(rect(0.0, 0.0, 320.0, 240.0));
+        let set_content: unsafe extern "C" fn(Id, objc::sel::Sel, Id) =
+            unsafe { std::mem::transmute(objc::msg::entry()) };
+        unsafe { set_content(window, objc::sel::get("setContentView:"), content) };
+        let metal_view = view(rect(0.0, 0.0, 320.0, 240.0));
+        let oversized = view(rect(-43.0, -27.0, 6016.0, 3384.0));
+        let cls = objc::class::lookup(c"CAMetalLayer").unwrap();
+        let maker = objc::sel::get("layer");
+        let make: unsafe extern "C" fn(Id, objc::sel::Sel) -> Id =
+            unsafe { std::mem::transmute(cls.metaclass().method(maker).unwrap().implementation()) };
+        let metal = unsafe { make(cls as *const _ as Id, maker) };
+        unsafe {
+            set_layer(metal_view, objc::sel::get("setLayer:"), metal);
+            add_subview(content, objc::sel::get("addSubview:"), metal_view);
+            add_subview(content, objc::sel::get("addSubview:"), oversized);
+        }
+        let width = 6016usize;
+        let height = 3384usize;
+        let mut pixels = vec![0u8; width * height * 4];
+        for row in 0..height {
+            for column in 0..width {
+                let at = (row * width + column) * 4;
+                pixels[at..at + 4].copy_from_slice(&[
+                    (column % 256) as u8,
+                    (row % 256) as u8,
+                    220,
+                    255,
+                ]);
+            }
+        }
+        crate::backing::set_native_view_pixels_for_tests(
+            oversized,
+            width as u32,
+            height as u32,
+            pixels,
+        );
+        flush_metal_scenes();
+        accept_published_native_for_tests(sdl);
+        let scene = metal_scene(sdl).unwrap();
+        assert_eq!(scene.len(), 2, "oversize view disappeared beneath Metal");
+        assert_eq!(scene[0].layer, metal as usize);
+        assert_eq!(
+            scene[1].layer,
+            (oversized as usize) | (1usize << (usize::BITS - 1))
+        );
+        let frame = scene[1].frame;
+        let logical = unsafe { presentation_frame(oversized) }.unwrap();
+        assert_eq!((frame.x, frame.y), (0, 0));
+        assert!(frame.width <= frame.window_width && frame.height <= frame.window_height);
+        let crop_x = (i64::from(frame.x) - i64::from(logical.x)) as usize;
+        let crop_y = (i64::from(frame.y) - i64::from(logical.y)) as usize;
+        let source = scene[1].native_pixels.as_ref().unwrap();
+        assert_eq!(
+            source.len(),
+            frame.width as usize * frame.height as usize * 4,
+            "full 6K source was copied instead of bounded visible crop"
+        );
+        assert_eq!(
+            &source[..4],
+            &[(crop_x % 256) as u8, (crop_y % 256) as u8, 220, 255]
+        );
+        let at = (20 * frame.width as usize + 15) * 4;
+        assert_eq!(
+            &source[at..at + 4],
+            &[
+                ((crop_x + 15) % 256) as u8,
+                ((crop_y + 20) % 256) as u8,
+                220,
+                255
+            ]
+        );
+        assert!(
+            crate::backing::gpu_under_metal(sdl, &crate::backing::Store::new(320, 240)).is_some()
+        );
+        // A move without new pixels has to recapture the different viewport.
+        unsafe {
+            set_frame_origin(
+                oversized,
+                objc::sel::get("setFrameOrigin:"),
+                NSPoint { x: -58.0, y: -47.0 },
+            )
+        };
+        flush_metal_scenes();
+        let next = metal_scene(sdl).unwrap();
+        let moved = unsafe { presentation_frame(oversized) }.unwrap();
+        let cropped = next[1].frame;
+        let moved_x = (i64::from(cropped.x) - i64::from(moved.x)) as usize;
+        let moved_y = (i64::from(cropped.y) - i64::from(moved.y)) as usize;
+        assert_eq!(
+            &next[1].native_pixels.as_ref().unwrap()[..4],
+            &[(moved_x % 256) as u8, (moved_y % 256) as u8, 220, 255]
+        );
+        assert_ne!((crop_x, crop_y), (moved_x, moved_y));
+        crate::backing::forget(oversized);
+        objc::arc::release(window);
+    }
+
+    #[test]
+    fn changing_one_native_view_does_not_recapture_other_windows() {
+        if !sdl3::isolated::run_here() {
+            return;
+        }
+        crate::bootstrap();
+        if !sdl3::may_pump() {
+            return;
+        }
+        let cls = objc::class::lookup(c"CAMetalLayer").unwrap();
+        let maker = objc::sel::get("layer");
+        let make: unsafe extern "C" fn(Id, objc::sel::Sel) -> Id =
+            unsafe { std::mem::transmute(cls.metaclass().method(maker).unwrap().implementation()) };
+        let set_content: unsafe extern "C" fn(Id, objc::sel::Sel, Id) =
+            unsafe { std::mem::transmute(objc::msg::entry()) };
+        let mut windows = Vec::new();
+        let mut natives = Vec::new();
+        let mut sdl = Vec::new();
+        for _ in 0..2 {
+            let window =
+                objc::object::create_instance(objc::class::lookup(c"NSWindow").unwrap(), 0);
+            if !unsafe {
+                crate::window::init_with_content_rect_for_tests(
+                    window,
+                    rect(0.0, 0.0, 160.0, 120.0),
+                )
+            } {
+                for old in windows {
+                    objc::arc::release(old);
+                }
+                return;
+            }
+            let content = view(rect(0.0, 0.0, 160.0, 120.0));
+            unsafe { set_content(window, objc::sel::get("setContentView:"), content) };
+            let metal_view = view(rect(0.0, 0.0, 160.0, 120.0));
+            let native = view(rect(10.0, 10.0, 60.0, 40.0));
+            unsafe {
+                set_layer(
+                    metal_view,
+                    objc::sel::get("setLayer:"),
+                    make(cls as *const _ as Id, maker),
+                );
+                add_subview(content, objc::sel::get("addSubview:"), metal_view);
+                add_subview(content, objc::sel::get("addSubview:"), native);
+            }
+            crate::backing::set_native_view_pixels_for_tests(
+                native,
+                60,
+                40,
+                [0, 0, 255, 255].repeat(60 * 40),
+            );
+            windows.push(window);
+            natives.push(native);
+            sdl.push(unsafe { crate::window::sdl_window(window) });
+        }
+        flush_metal_scenes();
+        assert_eq!(metal_scene(sdl[0]).unwrap().len(), 2);
+        assert_eq!(metal_scene(sdl[1]).unwrap().len(), 2);
+        for n in 0..12 {
+            let old = METAL_SCENE_CAPTURES.load(std::sync::atomic::Ordering::Relaxed);
+            crate::backing::set_native_view_pixels_for_tests(
+                natives[0],
+                60,
+                40,
+                [n as u8, 0, 255, 255].repeat(60 * 40),
+            );
+            flush_metal_scenes();
+            assert_eq!(
+                METAL_SCENE_CAPTURES.load(std::sync::atomic::Ordering::Relaxed) - old,
+                1,
+                "native mutation in window A recaptured unrelated window B"
+            );
+        }
+        for native in natives {
+            crate::backing::forget(native);
+        }
+        for window in windows {
+            objc::arc::release(window);
+        }
+    }
+
+    #[test]
+    fn moved_static_dma_source_sampling_must_invalidate_identical_output_frame() {
+        let mut old = MetalSceneLayer {
+            opacity_groups: Vec::new(),
+            layer: 7,
+            frame: Frame {
+                window: std::ptr::null_mut(),
+                x: 0,
+                y: 0,
+                width: 160,
+                height: 120,
+                window_width: 160,
+                window_height: 120,
+            },
+            native_owner: 3,
+            opacity: 1.0,
+            opaque: false,
+            clip: None,
+            rounded: vec![],
+            occluded: vec![],
+            native_pixels: None,
+            native_tiles: None,
+            native_cpu_capture: None,
+            native_dmabuf: Some(std::sync::Arc::new(crate::backing::Dmabuf {
+                width: 6016,
+                height: 3384,
+                fourcc: 0,
+                modifier: 0,
+                planes: vec![],
+            })),
+            native_dma_sample: Some((6016, 3384, 5500, 3200)),
+            native_revision: 88,
+        };
+        let previous = vec![old.clone()];
+        old.native_dma_sample = Some((6016, 3384, 5800, 3200));
+        assert!(
+            !same_metal_scene(&previous, &[old]),
+            "moving a static producer behind the same visible window must publish a new source"
+        );
+    }
+
+    #[test]
+    fn independent_dma_overlays_preserve_view_ownership_and_oversize_fallback() {
+        if !sdl3::isolated::run_here() {
+            return;
+        }
+        crate::bootstrap();
+        if !sdl3::may_pump() {
+            return;
+        }
+        let window = objc::object::create_instance(objc::class::lookup(c"NSWindow").unwrap(), 0);
+        if !unsafe {
+            crate::window::init_with_content_rect_for_tests(window, rect(0.0, 0.0, 320.0, 240.0))
+        } {
+            return;
+        }
+        let sdl = unsafe { crate::window::sdl_window(window) };
+        let content = view(rect(0.0, 0.0, 320.0, 240.0));
+        let set_content: unsafe extern "C" fn(Id, objc::sel::Sel, Id) =
+            unsafe { std::mem::transmute(objc::msg::entry()) };
+        unsafe { set_content(window, objc::sel::get("setContentView:"), content) };
+        let below = view(rect(0.0, 0.0, 100.0, 100.0));
+        let metal_view = view(rect(0.0, 0.0, 320.0, 240.0));
+        let above = view(rect(20.0, 20.0, 100.0, 100.0));
+        let huge = view(rect(0.0, 0.0, 6016.0, 3384.0));
+        let metal_class = objc::class::lookup(c"CAMetalLayer").unwrap();
+        let maker = objc::sel::get("layer");
+        let make: unsafe extern "C" fn(Id, objc::sel::Sel) -> Id = unsafe {
+            std::mem::transmute(
+                metal_class
+                    .metaclass()
+                    .method(maker)
+                    .unwrap()
+                    .implementation(),
+            )
+        };
+        let metal = unsafe { make(metal_class as *const _ as Id, maker) };
+        unsafe {
+            set_layer(metal_view, objc::sel::get("setLayer:"), metal);
+            add_subview(content, objc::sel::get("addSubview:"), below);
+            add_subview(content, objc::sel::get("addSubview:"), metal_view);
+            add_subview(content, objc::sel::get("addSubview:"), above);
+            add_subview(content, objc::sel::get("addSubview:"), huge);
+        }
+        // The regular presenter only collects overlays from shown windows.
+        let front: unsafe extern "C" fn(Id, objc::sel::Sel, Id) =
+            unsafe { std::mem::transmute(objc::msg::entry()) };
+        unsafe { front(window, objc::sel::get("orderFront:"), std::ptr::null_mut()) };
+        let shared = std::sync::Arc::new(crate::backing::Dmabuf {
+            width: 100,
+            height: 100,
+            fourcc: 0,
+            modifier: 0,
+            planes: vec![],
+        });
+        for native in [below, above, huge] {
+            crate::backing::set_overlay(
+                native,
+                crate::backing::Overlay {
+                    width: 100,
+                    height: 100,
+                    picture: crate::backing::Picture::Dmabuf(std::sync::Arc::clone(&shared)),
+                },
+            );
+        }
+        flush_metal_scenes();
+        assert!(
+            crate::backing::native_dma_above_metal(sdl).is_empty(),
+            "unadmitted DMA source must remain in original backing overlay path"
+        );
+        accept_published_native_for_tests(sdl);
+        let scene = metal_scene(sdl).unwrap();
+        assert_eq!(
+            scene
+                .iter()
+                .filter(|layer| layer.native_dmabuf.is_some())
+                .count(),
+            2
+        );
+        assert!(
+            scene
+                .iter()
+                .any(|layer| layer.layer == ((above as usize) | (1usize << (usize::BITS - 1))))
+        );
+        let admitted = crate::backing::native_dma_above_metal(sdl);
+        assert_eq!(
+            admitted,
+            [above as usize, huge as usize],
+            "both the small upper overlay and 6K DMA-only view are independent"
+        );
+        assert!(!crate::backing::native_scene_extent_supported(6016, 3384));
+        assert!(crate::backing::native_scene_dma_extent_supported(
+            6016, 3384
+        ));
+        assert!(!crate::backing::native_scene_dma_extent_supported(
+            9000, 9000
+        ));
+        let overlays = crate::backing::gpu_overlay_instances_for_tests(
+            sdl,
+            &crate::backing::Store::new(320, 240),
+        );
+        assert_eq!(overlays.len(), 3);
+        assert_eq!(
+            overlays
+                .iter()
+                .map(|overlay| overlay.view)
+                .collect::<Vec<_>>(),
+            [below as usize, above as usize, huge as usize]
+        );
+        assert!(
+            overlays
+                .iter()
+                .all(|overlay| std::sync::Arc::ptr_eq(&overlay.picture, &shared))
+        );
+        // A 6K DMA source is accepted without a full CPU allocation and
+        // must remain an independent top layer rather than being flattened.
+        assert!(
+            crate::backing::gpu_under_metal(sdl, &crate::backing::Store::new(320, 240)).is_some()
+        );
+        // An extreme geometry unsupported by the bounded GPU importer must
+        // remain in the original backing overlay path, never be excluded.
+        let set_size: unsafe extern "C" fn(Id, objc::sel::Sel, NSSize) =
+            unsafe { std::mem::transmute(objc::msg::entry()) };
+        unsafe {
+            set_size(
+                huge,
+                objc::sel::get("setFrameSize:"),
+                NSSize {
+                    width: 9000.0,
+                    height: 9000.0,
+                },
+            )
+        };
+        flush_metal_scenes();
+        assert_eq!(
+            crate::backing::native_dma_above_metal(sdl),
+            [above as usize]
+        );
+        assert!(
+            crate::backing::gpu_under_metal(sdl, &crate::backing::Store::new(320, 240)).is_none()
+        );
+        for native in [below, above, huge] {
+            crate::backing::remove_overlay(native);
+        }
+        objc::arc::release(window);
+    }
+
+    #[test]
+    fn flattened_root_ca_opacity_animation_refreshes_underlay_and_final_tick() {
+        if !sdl3::isolated::run_here() {
+            return;
+        }
+        crate::bootstrap();
+        if !sdl3::may_pump() {
+            return;
+        }
+        let window = objc::object::create_instance(objc::class::lookup(c"NSWindow").unwrap(), 0);
+        if !unsafe {
+            crate::window::init_with_content_rect_for_tests(window, rect(0.0, 0.0, 160.0, 120.0))
+        } {
+            return;
+        }
+        let sdl = unsafe { crate::window::sdl_window(window) };
+        let content = view(rect(0.0, 0.0, 160.0, 120.0));
+        let set_content: unsafe extern "C" fn(Id, objc::sel::Sel, Id) =
+            unsafe { std::mem::transmute(objc::msg::entry()) };
+        unsafe { set_content(window, objc::sel::get("setContentView:"), content) };
+        let back = view(rect(0.0, 0.0, 160.0, 120.0));
+        let middle = view(rect(0.0, 0.0, 160.0, 120.0));
+        let front = view(rect(16.0, 18.0, 48.0, 32.0));
+        let ca = objc::class::lookup(c"CALayer").unwrap();
+        let metal = objc::class::lookup(c"CAMetalLayer").unwrap();
+        let maker = objc::sel::get("layer");
+        let make: unsafe extern "C" fn(Id, objc::sel::Sel) -> Id =
+            unsafe { std::mem::transmute(ca.metaclass().method(maker).unwrap().implementation()) };
+        let make_metal: unsafe extern "C" fn(Id, objc::sel::Sel) -> Id = unsafe {
+            std::mem::transmute(metal.metaclass().method(maker).unwrap().implementation())
+        };
+        let back_layer = unsafe { make(ca as *const _ as Id, maker) };
+        crate::layer::set_bounds_of(back_layer, bounds_of(back));
+        unsafe {
+            set_layer(back, objc::sel::get("setLayer:"), back_layer);
+            set_layer(
+                middle,
+                objc::sel::get("setLayer:"),
+                make_metal(metal as *const _ as Id, maker),
+            );
+            add_subview(content, objc::sel::get("addSubview:"), back);
+            add_subview(content, objc::sel::get("addSubview:"), middle);
+            add_subview(content, objc::sel::get("addSubview:"), front);
+        }
+        crate::backing::set_native_view_pixels_for_tests(
+            front,
+            48,
+            32,
+            [0, 255, 0, 255].repeat(48 * 32),
+        );
+        flush_metal_scenes();
+        accept_published_native_for_tests(sdl);
+        let flat = crate::backing::Store::new(160, 120);
+        crate::coreanimation::set_underlay_animation_for_test(back_layer, None);
+        let original = crate::backing::gpu_under_metal_cached(sdl, &flat).unwrap();
+        let sample = (64 * original.width as usize + 100) * 4;
+        let initial = &original.pixels[sample..sample + 4];
+        assert_eq!(initial[2], 255);
+        for fraction in [0.2, 0.5, 0.8] {
+            crate::coreanimation::set_underlay_animation_for_test(back_layer, Some(fraction));
+            assert!(crate::coreanimation::flattened_underlay_content_animating(
+                back_layer,
+                darwin::mach::media_time()
+            ));
+            assert!(
+                !crate::coreanimation::native_scene_content_animating(
+                    back_layer,
+                    darwin::mach::media_time()
+                ),
+                "foreground native captures must still exclude root-opacity-only animation"
+            );
+            let redraw_before = crate::backing::gpu_underlay_render_count_for_tests();
+            let updated = crate::backing::gpu_under_metal_cached(sdl, &flat).unwrap();
+            assert!(!std::sync::Arc::ptr_eq(&original, &updated));
+            assert!(crate::backing::gpu_underlay_render_count_for_tests() > redraw_before);
+            let red = updated.pixels[sample + 2];
+            assert!(
+                red > 0 && red < 255,
+                "interpolated background opacity missing: {red}"
+            );
+            assert!(crate::backing::underlay_animation_tick(
+                sdl,
+                darwin::mach::media_time()
+            ));
+            flush_metal_scenes();
+        }
+        crate::coreanimation::set_underlay_animation_for_test(back_layer, None);
+        // End-of-animation model opacity is restored, even if the previous
+        // content epoch and the static geometry remain unchanged.
+        assert!(crate::backing::underlay_animation_tick(
+            sdl,
+            darwin::mach::media_time()
+        ));
+        let final_pixels = crate::backing::gpu_under_metal_cached(sdl, &flat).unwrap();
+        assert_eq!(final_pixels.pixels[sample + 2], 255);
+        assert!(!std::sync::Arc::ptr_eq(&original, &final_pixels));
+        assert_eq!(
+            crate::backing::gpu_under_metal_cached(sdl, &flat)
+                .unwrap()
+                .pixels,
+            final_pixels.pixels
+        );
+        objc::arc::release(window);
+    }
+
+    #[test]
+    fn destroyed_view_only_evicts_its_window_underlay() {
+        if !sdl3::isolated::run_here() {
+            return;
+        }
+        crate::bootstrap();
+        if !sdl3::may_pump() {
+            return;
+        }
+        let metal = objc::class::lookup(c"CAMetalLayer").unwrap();
+        let maker = objc::sel::get("layer");
+        let make: unsafe extern "C" fn(Id, objc::sel::Sel) -> Id = unsafe {
+            std::mem::transmute(metal.metaclass().method(maker).unwrap().implementation())
+        };
+        let set_content: unsafe extern "C" fn(Id, objc::sel::Sel, Id) =
+            unsafe { std::mem::transmute(objc::msg::entry()) };
+        let mut windows = Vec::new();
+        let mut sdls = Vec::new();
+        let mut transient = Vec::new();
+        for _ in 0..2 {
+            let window =
+                objc::object::create_instance(objc::class::lookup(c"NSWindow").unwrap(), 0);
+            if !unsafe {
+                crate::window::init_with_content_rect_for_tests(
+                    window,
+                    rect(0.0, 0.0, 160.0, 120.0),
+                )
+            } {
+                for old in windows {
+                    objc::arc::release(old);
+                }
+                return;
+            }
+            let sdl = unsafe { crate::window::sdl_window(window) };
+            let content = view(rect(0.0, 0.0, 160.0, 120.0));
+            unsafe { set_content(window, objc::sel::get("setContentView:"), content) };
+            let beneath = view(rect(5.0, 6.0, 70.0, 40.0));
+            let metal_view = view(rect(0.0, 0.0, 160.0, 120.0));
+            let above = view(rect(10.0, 10.0, 40.0, 30.0));
+            unsafe {
+                set_layer(
+                    metal_view,
+                    objc::sel::get("setLayer:"),
+                    make(metal as *const _ as Id, maker),
+                );
+                add_subview(content, objc::sel::get("addSubview:"), beneath);
+                add_subview(content, objc::sel::get("addSubview:"), metal_view);
+                add_subview(content, objc::sel::get("addSubview:"), above);
+            }
+            crate::backing::set_native_view_pixels_for_tests(
+                above,
+                40,
+                30,
+                [0, 0, 255, 255].repeat(40 * 30),
+            );
+            windows.push(window);
+            sdls.push(sdl);
+            transient.push(beneath);
+        }
+        flush_metal_scenes();
+        for &sdl in &sdls {
+            accept_published_native_for_tests(sdl);
+        }
+        let flat = crate::backing::Store::new(160, 120);
+        let first = crate::backing::gpu_under_metal_cached(sdls[0], &flat).unwrap();
+        let second = crate::backing::gpu_under_metal_cached(sdls[1], &flat).unwrap();
+        let before = crate::backing::gpu_underlay_render_count_for_tests();
+        // Simulate the exact deallocation invalidation before Objective-C
+        // recycles an address with the same initial backing generation.
+        crate::backing::forget(transient[0]);
+        let unchanged = crate::backing::gpu_under_metal_cached(sdls[1], &flat).unwrap();
+        assert!(
+            std::sync::Arc::ptr_eq(&second, &unchanged),
+            "destroying window A view evicted window B cached backing"
+        );
+        assert_eq!(
+            crate::backing::gpu_underlay_render_count_for_tests(),
+            before
+        );
+        let recreated = crate::backing::gpu_under_metal_cached(sdls[0], &flat).unwrap();
+        assert!(
+            !std::sync::Arc::ptr_eq(&first, &recreated),
+            "view address reuse must not preserve its former cached underlay"
+        );
+        for window in windows {
+            objc::arc::release(window);
+        }
+    }
+
+    #[test]
+    fn native_foreground_revision_changes_require_gpu_acknowledgment() {
+        if !sdl3::isolated::run_here() {
+            return;
+        }
+        crate::bootstrap();
+        // The empty window's background is checked as Aqua's.
+        crate::appearance::use_aqua_on_this_thread();
+        if !sdl3::may_pump() {
+            return;
+        }
+        let window = objc::object::create_instance(objc::class::lookup(c"NSWindow").unwrap(), 0);
+        if !unsafe {
+            crate::window::init_with_content_rect_for_tests(window, rect(0.0, 0.0, 3840.0, 2160.0))
+        } {
+            return;
+        }
+        let sdl = unsafe { crate::window::sdl_window(window) };
+        let content = view(rect(0.0, 0.0, 3840.0, 2160.0));
+        let set_content: unsafe extern "C" fn(Id, objc::sel::Sel, Id) =
+            unsafe { std::mem::transmute(objc::msg::entry()) };
+        unsafe { set_content(window, objc::sel::get("setContentView:"), content) };
+        let metal_view = view(rect(0.0, 0.0, 3840.0, 2160.0));
+        let foreground = view(rect(40.0, 35.0, 30.0, 25.0));
+        let metal_class = objc::class::lookup(c"CAMetalLayer").unwrap();
+        let maker = objc::sel::get("layer");
+        let make: unsafe extern "C" fn(Id, objc::sel::Sel) -> Id = unsafe {
+            std::mem::transmute(
+                metal_class
+                    .metaclass()
+                    .method(maker)
+                    .unwrap()
+                    .implementation(),
+            )
+        };
+        unsafe {
+            set_layer(
+                metal_view,
+                objc::sel::get("setLayer:"),
+                make(metal_class as *const _ as Id, maker),
+            );
+            add_subview(content, objc::sel::get("addSubview:"), metal_view);
+            add_subview(content, objc::sel::get("addSubview:"), foreground);
+        }
+        let mut flat = crate::backing::Store::new(3840, 2160);
+        crate::backing::set_native_view_pixels_for_tests(
+            foreground,
+            30,
+            25,
+            [0, 0, 255, 255].repeat(30 * 25),
+        );
+        flush_metal_scenes();
+        accept_published_native_for_tests(sdl);
+        let initial =
+            crate::backing::gpu_under_metal_cached(sdl, &flat).expect("independent foreground");
+        let count = crate::backing::gpu_underlay_render_count_for_tests();
+        assert_eq!(initial.pixels.len(), 3840 * 2160 * 4);
+        let start = std::time::Instant::now();
+        for index in 1..49u8 {
+            crate::backing::set_native_view_pixels_for_tests(
+                foreground,
+                30,
+                25,
+                [index, 0, 255, 255].repeat(30 * 25),
+            );
+            flush_metal_scenes();
+            // Every draw dirties the *flattened* fallback store.
+            flat.pixels[0] = index;
+            assert!(
+                crate::backing::gpu_under_metal_cached(sdl, &flat).is_none(),
+                "unadmitted new view content excluded its own fallback pixels"
+            );
+            accept_published_native_for_tests(sdl);
+            let after = crate::backing::gpu_under_metal_cached(sdl, &flat).unwrap();
+            assert!(
+                std::sync::Arc::ptr_eq(&initial, &after),
+                "revised foreground acknowledgment rebuilt the unchanged lower underlay"
+            );
+        }
+        assert_eq!(
+            crate::backing::gpu_underlay_render_count_for_tests(),
+            count,
+            "48 foreground-only updates allocated new full-window underlays"
+        );
+        eprintln!(
+            "4K underlay: 48 native revisions in {:?}; unchanged lower pixels = {} bytes retained, 0 reconstructed",
+            start.elapsed(),
+            initial.pixels.len()
+        );
+        assert_eq!(&initial.pixels[0..4], &[237, 237, 237, 255]);
+        crate::backing::set_native_view_pixels_for_tests(
+            content,
+            3840,
+            2160,
+            [0, 255, 0, 255].repeat(3840 * 2160),
+        );
+        flush_metal_scenes();
+        let changed = crate::backing::gpu_under_metal_cached(sdl, &flat).unwrap();
+        assert!(!std::sync::Arc::ptr_eq(&initial, &changed));
+        let offset = (100 * 3840 + 200) * 4;
+        assert_eq!(&changed.pixels[offset..offset + 4], &[0, 255, 0, 255]);
+        objc::arc::release(window);
+    }
+
+    #[test]
+    fn native_pixel_cache_does_not_invalidate_from_another_window_ca_tree() {
+        if !sdl3::isolated::run_here() {
+            return;
+        }
+        crate::bootstrap();
+        if !sdl3::may_pump() {
+            return;
+        }
+        let ca = objc::class::lookup(c"CALayer").unwrap();
+        let maker = objc::sel::get("layer");
+        let make_ca: unsafe extern "C" fn(Id, objc::sel::Sel) -> Id =
+            unsafe { std::mem::transmute(ca.metaclass().method(maker).unwrap().implementation()) };
+        let set_content: unsafe extern "C" fn(Id, objc::sel::Sel, Id) =
+            unsafe { std::mem::transmute(objc::msg::entry()) };
+        let mut windows = Vec::new();
+        let mut views = Vec::new();
+        let mut layers = Vec::new();
+        for _ in 0..2 {
+            let window =
+                objc::object::create_instance(objc::class::lookup(c"NSWindow").unwrap(), 0);
+            if !unsafe {
+                crate::window::init_with_content_rect_for_tests(window, rect(0.0, 0.0, 80.0, 60.0))
+            } {
+                for old in windows {
+                    objc::arc::release(old);
+                }
+                return;
+            }
+            let content = view(rect(0.0, 0.0, 80.0, 60.0));
+            unsafe { set_content(window, objc::sel::get("setContentView:"), content) };
+            let native = view(rect(0.0, 0.0, 40.0, 30.0));
+            let layer = unsafe { make_ca(ca as *const _ as Id, maker) };
+            unsafe {
+                set_layer(native, objc::sel::get("setLayer:"), layer);
+                add_subview(content, objc::sel::get("addSubview:"), native);
+            }
+            crate::backing::set_native_view_pixels_for_tests(
+                native,
+                40,
+                30,
+                [0, 0, 255, 255].repeat(40 * 30),
+            );
+            windows.push(window);
+            views.push(native);
+            layers.push(layer);
+        }
+        let first = crate::backing::native_scene_pixels(views[0], 40, 30).unwrap();
+        let scanned = crate::backing::native_render_count_for_tests();
+        for _ in 0..30 {
+            crate::coreanimation::changed(layers[1]);
+            let next = crate::backing::native_scene_pixels(views[0], 40, 30).unwrap();
+            assert!(std::sync::Arc::ptr_eq(&first.0, &next.0));
+            assert_eq!(first.1, next.1);
+        }
+        assert_eq!(crate::backing::native_render_count_for_tests(), scanned);
+        crate::coreanimation::changed(layers[0]);
+        let updated = crate::backing::native_scene_pixels(views[0], 40, 30).unwrap();
+        assert!(!std::sync::Arc::ptr_eq(&first.0, &updated.0));
+        for view in views {
+            crate::backing::forget(view);
+        }
+        for window in windows {
+            objc::arc::release(window);
+        }
+    }
+
+    #[test]
+    fn intermediate_ca_superlayer_mask_updates_static_metal_scene() {
+        if !sdl3::isolated::run_here() {
+            return;
+        }
+        crate::bootstrap();
+        if !sdl3::may_pump() {
+            return;
+        }
+        let window = objc::object::create_instance(objc::class::lookup(c"NSWindow").unwrap(), 0);
+        if !unsafe {
+            crate::window::init_with_content_rect_for_tests(window, rect(0.0, 0.0, 320.0, 240.0))
+        } {
+            return;
+        }
+        let sdl = unsafe { crate::window::sdl_window(window) };
+        let content = view(rect(0.0, 0.0, 320.0, 240.0));
+        let set_content: unsafe extern "C" fn(Id, objc::sel::Sel, Id) =
+            unsafe { std::mem::transmute(objc::msg::entry()) };
+        unsafe { set_content(window, objc::sel::get("setContentView:"), content) };
+        let metal_view = view(rect(0.0, 0.0, 320.0, 240.0));
+        let ca = objc::class::lookup(c"CALayer").unwrap();
+        let metal_class = objc::class::lookup(c"CAMetalLayer").unwrap();
+        let maker = objc::sel::get("layer");
+        let make: unsafe extern "C" fn(Id, objc::sel::Sel) -> Id =
+            unsafe { std::mem::transmute(objc::msg::entry()) };
+        let root = unsafe { make(ca as *const _ as Id, maker) };
+        let middle = unsafe { make(ca as *const _ as Id, maker) };
+        let metal = unsafe { make(metal_class as *const _ as Id, maker) };
+        unsafe {
+            set_layer(content, objc::sel::get("setLayer:"), root);
+            set_layer(metal_view, objc::sel::get("setLayer:"), metal);
+            add_subview(content, objc::sel::get("addSubview:"), metal_view);
+        }
+        let set_frame: unsafe extern "C" fn(Id, objc::sel::Sel, NSRect) =
+            unsafe { std::mem::transmute(objc::msg::entry()) };
+        let add_ca: unsafe extern "C" fn(Id, objc::sel::Sel, Id) =
+            unsafe { std::mem::transmute(objc::msg::entry()) };
+        let radius: unsafe extern "C" fn(Id, objc::sel::Sel, f64) =
+            unsafe { std::mem::transmute(objc::msg::entry()) };
+        unsafe {
+            set_frame(
+                middle,
+                objc::sel::get("setFrame:"),
+                rect(30.0, 20.0, 100.0, 90.0),
+            );
+            add_ca(root, objc::sel::get("addSublayer:"), middle);
+            add_ca(middle, objc::sel::get("addSublayer:"), metal);
+            radius(middle, objc::sel::get("setCornerRadius:"), 17.0);
+        }
+        crate::coreanimation::set_masks(middle, true);
+        flush_metal_scenes();
+        let first = metal_scene(sdl).unwrap();
+        let entry = first
+            .iter()
+            .find(|layer| layer.layer == metal as usize)
+            .unwrap();
+        assert_eq!(
+            entry.rounded.len(),
+            1,
+            "intermediate CA radius was not inherited"
+        );
+        let mask = entry.rounded[0];
+        assert_eq!(
+            (mask.frame.x, mask.frame.width, mask.frame.height),
+            (30, 100, 90)
+        );
+        assert_eq!(mask.radius, 17.0);
+        assert!(entry.clip.is_some());
+        crate::coreanimation::set_masks(middle, false);
+        flush_metal_scenes();
+        let unmasked = metal_scene(sdl).unwrap();
+        let entry = unmasked
+            .iter()
+            .find(|layer| layer.layer == metal as usize)
+            .unwrap();
+        assert!(entry.rounded.is_empty());
+        assert!(entry.clip.is_none());
+        // Re-masking only changes CA metadata. No guest Metal submission.
+        crate::coreanimation::set_masks(middle, true);
+        flush_metal_scenes();
+        assert_eq!(
+            metal_scene(sdl)
+                .unwrap()
+                .iter()
+                .find(|layer| layer.layer == metal as usize)
+                .unwrap()
+                .rounded
+                .len(),
+            1
+        );
+        objc::arc::release(window);
+    }
+}
+
+#[cfg(test)]
+mod visible_part_drawing {
+    use super::*;
+    use std::sync::Mutex;
+
+    fn rect(x: f64, y: f64, width: f64, height: f64) -> NSRect {
+        NSRect {
+            origin: NSPoint { x, y },
+            size: NSSize { width, height },
+        }
+    }
+
+    static ASKED: Mutex<Vec<NSRect>> = Mutex::new(Vec::new());
+
+    unsafe extern "C" fn record_draw_rect(_receiver: Id, _sel: Sel, dirty: NSRect) {
+        ASKED.lock().unwrap().push(dirty);
+        crate::color::NSRectFill(dirty);
+    }
+
+    fn send_rect(receiver: Id, name: &str, value: NSRect) {
+        // SAFETY: `void (id, SEL, NSRect)`.
+        unsafe {
+            let f: unsafe extern "C" fn(Id, Sel, NSRect) = std::mem::transmute(objc::msg::entry());
+            f(receiver, objc::sel::get(name), value);
+        }
+    }
+
+    /// A view taller than what holds it is asked for, and stores, only the
+    /// part that shows, and the part that shows after a scroll.
+    #[test]
+    fn a_tall_view_draws_only_the_part_that_shows() {
+        if !sdl3::isolated::run_here() {
+            return;
+        }
+        crate::bootstrap();
+        if !sdl3::may_pump() {
+            return;
+        }
+        let window = objc::object::create_instance(objc::class::lookup(c"NSWindow").unwrap(), 0);
+        // SAFETY: a fresh window.
+        if !unsafe {
+            crate::window::init_with_content_rect_for_tests(window, rect(0., 0., 160., 120.))
+        } {
+            return;
+        }
+        let new_view = |class: &'static objc::class::Class, frame: NSRect| unsafe {
+            init_with_frame(
+                objc::object::create_instance(class, 0),
+                objc::sel::get("initWithFrame:"),
+                frame,
+            )
+        };
+        let content = new_view(
+            objc::class::lookup(c"NSView").unwrap(),
+            rect(0., 0., 160., 120.),
+        );
+        // SAFETY: `void (id, SEL, id)`.
+        let send_id: unsafe extern "C" fn(Id, Sel, Id) =
+            unsafe { std::mem::transmute(objc::msg::entry()) };
+        unsafe { send_id(window, objc::sel::get("setContentView:"), content) };
+        let class = objc::class::lookup(c"RosemaryVisiblePartTestView").unwrap_or_else(|| {
+            let class = objc::class::allocate_pair(
+                objc::class::lookup(c"NSView"),
+                c"RosemaryVisiblePartTestView",
+                0,
+            )
+            .unwrap();
+            assert!(class.add_method(
+                objc::sel::get("drawRect:"),
+                record_draw_rect as objc::class::Imp,
+                c"v48@0:8{CGRect={CGPoint=dd}{CGSize=dd}}16"
+            ));
+            objc::class::register_pair(class);
+            class
+        });
+        let tall = new_view(class, rect(10., 10., 40., 1000.));
+        unsafe { send_id(content, objc::sel::get("addSubview:"), tall) };
+        let density = crate::backing::focus_density_of_for_tests(tall);
+
+        ASKED.lock().unwrap().clear();
+        crate::backing::display_view(tall);
+        assert_eq!(*ASKED.lock().unwrap(), [rect(0., 0., 40., 110.)]);
+        let held = crate::backing::view_store_geometry_for_tests(tall).unwrap();
+        assert_eq!(held.1.1 as f64, (110. * density).round());
+
+        send_rect(content, "setBounds:", rect(0., 500., 160., 120.));
+        ASKED.lock().unwrap().clear();
+        crate::backing::display_view(tall);
+        assert_eq!(*ASKED.lock().unwrap(), [rect(0., 490., 40., 120.)]);
+        let moved = crate::backing::view_store_geometry_for_tests(tall).unwrap();
+        assert_eq!(moved.1.1 as f64, (120. * density).round());
+        assert_ne!(moved.0, held.0, "the store moved with the part that shows");
+        objc::arc::release(window);
+    }
+
+    /// AppKit's default: a view posts both notifications until told not to.
+    #[test]
+    fn a_view_posts_frame_and_bounds_changes_by_default() {
+        crate::bootstrap();
+        let view = unsafe {
+            init_with_frame(
+                objc::object::create_instance(objc::class::lookup(c"NSView").unwrap(), 0),
+                objc::sel::get("initWithFrame:"),
+                rect(0., 0., 10., 10.),
+            )
+        };
+        let sel = objc::sel::get("");
+        // SAFETY: a view made above.
+        unsafe {
+            assert_eq!(posts_frame_changed(view, sel), 1);
+            assert_eq!(posts_bounds_changed(view, sel), 1);
+            set_posts_bounds_changed(view, sel, 0);
+            assert_eq!(posts_bounds_changed(view, sel), 0);
+            assert_eq!(posts_frame_changed(view, sel), 1);
+        }
+    }
+}
+
+#[cfg(test)]
+mod native_partial_draw_regression {
+    use super::*;
+    use std::sync::atomic::{AtomicU8, Ordering};
+
+    fn rect(x: f64, y: f64, width: f64, height: f64) -> NSRect {
+        NSRect {
+            origin: NSPoint { x, y },
+            size: NSSize { width, height },
+        }
+    }
+
+    fn view(frame: NSRect) -> Id {
+        unsafe {
+            init_with_frame(
+                objc::object::create_instance(objc::class::lookup(c"NSView").unwrap(), 0),
+                objc::sel::get("initWithFrame:"),
+                frame,
+            )
+        }
+    }
+
+    static DRAW_PHASE: AtomicU8 = AtomicU8::new(0);
+    static PARTIAL_RECT_OBSERVED: AtomicU8 = AtomicU8::new(0);
+
+    unsafe extern "C" fn paint_native_partial_rect(receiver: Id, _selector: Sel, dirty: NSRect) {
+        match DRAW_PHASE.load(Ordering::Relaxed) {
+            0 => {
+                assert!(crate::backing::draw_focused(|pixels, width, height| {
+                    for pixel in pixels.as_chunks_mut::<4>().0 {
+                        pixel.copy_from_slice(&[255, 0, 0, 255]);
+                    }
+                    Some(crate::backing::Rect {
+                        x: 0,
+                        y: 0,
+                        width: width as i64,
+                        height: height as i64,
+                    })
+                }));
+            }
+            1 => {
+                let expected = NSRect {
+                    origin: NSPoint { x: 6., y: 19. },
+                    size: NSSize {
+                        width: 1.,
+                        height: 1.,
+                    },
+                };
+                let passed_dirty = dirty == expected;
+                let mut rects = std::ptr::null();
+                let mut count = 0isize;
+                let send: unsafe extern "C" fn(Id, Sel, *mut *const NSRect, *mut isize) =
+                    unsafe { std::mem::transmute(objc::msg::entry()) };
+                unsafe {
+                    send(
+                        receiver,
+                        objc::sel::get("getRectsBeingDrawn:count:"),
+                        &mut rects,
+                        &mut count,
+                    )
+                };
+                PARTIAL_RECT_OBSERVED.store(
+                    u8::from(
+                        passed_dirty
+                            && count == 1
+                            && !rects.is_null()
+                            && unsafe { *rects } == expected,
+                    ),
+                    Ordering::Relaxed,
+                );
+                // Draw a full view on purpose: AppKit clips it to the
+                // partial invalidation and keeps every outside blue texel.
+                crate::backing::paint_coverage(0, 0, 32, &vec![1.0; 32 * 24], [0., 1., 0., 1.]);
+            }
+            _ => {
+                assert!(crate::backing::draw_focused(|pixels, _, _| {
+                    pixels[..4].copy_from_slice(&[0, 0, 255, 255]);
+                    Some(crate::backing::Rect {
+                        x: 0,
+                        y: 0,
+                        width: 1,
+                        height: 1,
+                    })
+                }));
+            }
+        }
+    }
+
+    #[test]
+    fn live_draw_rect_partial_invalidation_preserves_old_pixels_and_capture_damage() {
+        if !sdl3::isolated::run_here() {
+            return;
+        }
+        crate::bootstrap();
+        if !sdl3::may_pump() {
+            return;
+        }
+        let window = objc::object::create_instance(objc::class::lookup(c"NSWindow").unwrap(), 0);
+        if !unsafe {
+            crate::window::init_with_content_rect_for_tests(window, rect(0., 0., 160., 120.))
+        } {
+            return;
+        }
+        let content = view(rect(0., 0., 160., 120.));
+        let set_content: unsafe extern "C" fn(Id, Sel, Id) =
+            unsafe { std::mem::transmute(objc::msg::entry()) };
+        unsafe { set_content(window, objc::sel::get("setContentView:"), content) };
+        let cls = objc::class::lookup(c"RosemaryPartialDrawRectTestView").unwrap_or_else(|| {
+            let class = objc::class::allocate_pair(
+                objc::class::lookup(c"NSView"),
+                c"RosemaryPartialDrawRectTestView",
+                0,
+            )
+            .unwrap();
+            assert!(class.add_method(
+                objc::sel::get("drawRect:"),
+                paint_native_partial_rect as objc::class::Imp,
+                c"v48@0:8{CGRect={CGPoint=dd}{CGSize=dd}}16"
+            ));
+            objc::class::register_pair(class);
+            class
+        });
+        let child = unsafe {
+            init_with_frame(
+                objc::object::create_instance(cls, 0),
+                objc::sel::get("initWithFrame:"),
+                rect(12., 12., 32., 24.),
+            )
+        };
+        let add_subview: unsafe extern "C" fn(Id, Sel, Id) =
+            unsafe { std::mem::transmute(objc::msg::entry()) };
+        unsafe { add_subview(content, objc::sel::get("addSubview:"), child) };
+        DRAW_PHASE.store(0, Ordering::Relaxed);
+        PARTIAL_RECT_OBSERVED.store(0, Ordering::Relaxed);
+        crate::backing::display_view(child);
+        let crop = crate::backing::Rect {
+            x: 0,
+            y: 0,
+            width: 32,
+            height: 24,
+        };
+        let first =
+            crate::backing::native_scene_pixels_cropped_with_damage(child, 32, 24, crop).unwrap();
+        assert_eq!(first.2, None);
+        DRAW_PHASE.store(1, Ordering::Relaxed);
+        let invalidate: unsafe extern "C" fn(Id, Sel, NSRect) =
+            unsafe { std::mem::transmute(objc::msg::entry()) };
+        unsafe {
+            invalidate(
+                child,
+                objc::sel::get("setNeedsDisplayInRect:"),
+                NSRect {
+                    origin: NSPoint { x: 6., y: 19. },
+                    size: NSSize {
+                        width: 1.,
+                        height: 1.,
+                    },
+                },
+            )
+        };
+        crate::backing::display_view(child);
+        assert_eq!(PARTIAL_RECT_OBSERVED.load(Ordering::Relaxed), 1);
+        let next =
+            crate::backing::native_scene_pixels_cropped_with_damage(child, 32, 24, crop).unwrap();
+        assert_eq!(
+            next.2,
+            Some(crate::backing::NativeCpuDamage {
+                from_revision: first.1,
+                rect: crate::backing::Rect {
+                    x: 6,
+                    y: 4,
+                    width: 1,
+                    height: 1
+                },
+            })
+        );
+        assert_eq!(
+            &next.0[(4 * 32 + 6) * 4..(4 * 32 + 7) * 4],
+            &[0, 255, 0, 255]
+        );
+        assert_eq!(&next.0[..4], &[255, 0, 0, 255]);
+        assert_eq!(
+            &next.0[(4 * 32 + 7) * 4..(4 * 32 + 8) * 4],
+            &[255, 0, 0, 255]
+        );
+        // A raw canvas callback bypasses clipped drawing primitives. Such a
+        // callback cannot make an authoritative small-region damage claim.
+        DRAW_PHASE.store(2, Ordering::Relaxed);
+        unsafe {
+            invalidate(
+                child,
+                objc::sel::get("setNeedsDisplayInRect:"),
+                NSRect {
+                    origin: NSPoint { x: 6., y: 19. },
+                    size: NSSize {
+                        width: 1.,
+                        height: 1.,
+                    },
+                },
+            )
+        };
+        crate::backing::display_view(child);
+        let opaque =
+            crate::backing::native_scene_pixels_cropped_with_damage(child, 32, 24, crop).unwrap();
+        assert_eq!(opaque.2.unwrap().rect, crop);
+        crate::backing::forget(child);
+        objc::arc::release(window);
     }
 }

@@ -8,6 +8,7 @@ mod why {
     pub const DIRENT: &str = "struct dirent is laid out differently";
     pub const SIGNAL: &str = "the signal numbers and sigaction layout differ";
     pub const TERMIOS: &str = "struct termios is laid out differently";
+    pub const FENV: &str = "fenv_t is laid out differently";
     pub const MACH: &str = "Mach is a Darwin kernel interface";
     pub const SYSCTL: &str = "reimplemented; see darwin::sysctl";
     pub const XATTR: &str =
@@ -121,6 +122,11 @@ pub const NAMES: &[(&str, &str)] = &[
     // `RLIMIT_*` are not the same numbers, and `RLIM_INFINITY` is a different
     // sentinel. `crate::rlimit` answers both; the entries are what stop the
     // host's own being bound instead.
+    // `crate::fenv` answers these on x86-64.
+    ("fegetenv", FENV),
+    ("fesetenv", FENV),
+    ("feholdexcept", FENV),
+    ("feupdateenv", FENV),
     ("getrlimit", "the RLIMIT_ resource numbers differ"),
     ("setrlimit", "the RLIMIT_ resource numbers differ"),
     // `fd_set` is the same 128 bytes on both and the *timeout* is not; `crate::select`
@@ -137,10 +143,11 @@ pub const NAMES: &[(&str, &str)] = &[
     ("open", "the O_ flags differ"),
     ("openat", "the O_ flags differ"),
     // Their ABI agrees, but their effect on the emulated per-socket
-    // `SO_NOSIGPIPE` state must be observed. See `crate::net::descriptor`.
-    ("close", "must discard emulated per-descriptor socket state"),
-    ("dup", "must inherit emulated per-descriptor socket state"),
-    ("dup2", "must replace emulated per-descriptor socket state"),
+    // `SO_NOSIGPIPE` state and on the kqueue table must be observed. See
+    // `crate::net::descriptor`.
+    ("close", "must discard emulated per-descriptor state"),
+    ("dup", "must inherit emulated per-descriptor state"),
+    ("dup2", "must replace emulated per-descriptor state"),
     // Darwin's `struct passwd` has BSD's `pw_change` and `pw_class` in the middle,
     // so `pw_dir` is at offset 48 - past the end of this host's whole structure.
     // `crate::passwd` answers the two lookups; the reentrant pair stay denied.
@@ -172,6 +179,7 @@ pub const NAMES: &[(&str, &str)] = &[
     ("inet_pton", SOCKET),
     ("inet_ntop", SOCKET),
     ("connectx", SOCKET),
+    ("disconnectx", SOCKET),
     // Not socket calls, and here for what they do to a socket: `SO_NOSIGPIPE` is a
     // property of the descriptor on Darwin and of the call here, and neither takes
     // flags. See `crate::net::socket`.
@@ -218,9 +226,9 @@ pub const NAMES: &[(&str, &str)] = &[
     ("newlocale", "the LC_*_MASK values differ"),
     ("duplocale", "a null locale has different semantics"),
     ("freelocale", "Darwin returns int and glibc returns void"),
-    // These are still unsupported: `nl_item` is another platform-specific
-    // integer namespace, and passing Darwin's value to glibc asks a different
-    // question (or indexes no item at all).
+    // `nl_item` is another platform-specific integer namespace, and passing
+    // Darwin's value to glibc asks a different question (or indexes no item at
+    // all). `crate::langinfo` translates it.
     ("nl_langinfo", "the nl_item values differ"),
     ("nl_langinfo_l", "the nl_item values differ"),
     ("dladdr", "Dl_info is laid out differently"),
@@ -359,9 +367,8 @@ mod tests {
         // itself was here until `crate::dirent` answered it, and is asserted
         // the other way round below.
         assert_eq!(reason("getdirentries"), Some(DIRENT));
-        // A Mach call that maps another task's memory into this one, which
-        // `crate::mach` does not answer.
-        assert_eq!(reason("mach_vm_remap"), Some(MACH));
+        // A Mach call that `crate::mach` does not answer.
+        assert_eq!(reason("mach_vm_purgable_control"), Some(MACH));
         assert_eq!(
             reason("strlen"),
             None,
@@ -393,6 +400,7 @@ mod tests {
             "mach_vm_read",
             "mach_vm_write",
             "mach_vm_protect",
+            "mach_vm_remap",
             "dispatch_once_f",
             // The libdispatch this crate implements, which the `dispatch_` prefix
             // would otherwise deny along with the rest of the family.
@@ -409,10 +417,10 @@ mod tests {
         }
         // And the families around them are still shut: a member of one that this
         // crate has *not* implemented is refused rather than passed through.
-        assert!(contains("dispatch_source_create"));
-        // The half of Mach that is still refused: mapping another task's
-        // memory, and ending it.
-        assert!(contains("mach_vm_remap"));
+        assert!(contains("dispatch_io_create"));
+        // The half of Mach that is still refused: purgeable memory, and ending
+        // another task.
+        assert!(contains("mach_vm_purgable_control"));
         assert!(contains("task_terminate"));
         for name in ["task_for_pid", "task_threads", "pid_for_task"] {
             assert!(!contains(name), "{name} is answered by the process server");

@@ -524,7 +524,7 @@ mod slot {
     pub const FILL_COLOR: usize = 1;
     pub const BORDER_COLOR: usize = 2;
     pub const TRANSPARENT: usize = 3;
-    /// An `f64`'s bits.
+    /// An `f64`'s bits, inverted so that zero is "never set".
     pub const BORDER_WIDTH: usize = 4;
     /// `-contentViewMargins`, each an `f64`'s bits.
     pub const MARGIN_WIDTH: usize = 5;
@@ -535,12 +535,19 @@ mod slot {
     /// `NSTitlePosition`, plus one so that zero is "never set".
     pub const TITLE_POSITION: usize = 9;
     pub const BOX_TITLE_FONT: usize = 10;
+    /// An `f64`'s bits.
+    pub const CORNER_RADIUS: usize = 11;
     pub const BOX_OBJECTS: [usize; 4] = [FILL_COLOR, BORDER_COLOR, BOX_TITLE, BOX_TITLE_FONT];
 
     pub const INDETERMINATE: usize = 0;
     pub const STYLE: usize = 1;
     pub const ANIMATING: usize = 2;
+    /// `f64` bits, as are the bounds.
     pub const VALUE: usize = 3;
+    pub const MIN_VALUE: usize = 4;
+    pub const MAX_VALUE: usize = 5;
+    /// Nonzero once `-setMaxValue:` was called, before which it is 100.
+    pub const MAX_VALUE_SET: usize = 6;
 
     pub const IMAGE: usize = 0;
     pub const TARGET: usize = 1;
@@ -578,6 +585,8 @@ mod slot {
     pub const ALLOWS_MIXED_STATE: usize = 24;
     /// `NSImageScaling`; zero is proportionally down, a button's default.
     pub const BUTTON_IMAGE_SCALING: usize = 25;
+    /// `-hasDestructiveAction`, only read back: nothing here draws it red.
+    pub const DESTRUCTIVE: usize = 26;
     pub const BUTTON_OBJECTS: [usize; 8] = [
         TINT_COLOR,
         IMAGE,
@@ -597,9 +606,12 @@ mod slot {
     /// Both `f64` bits.
     pub const SCROLLER_VALUE: usize = 0;
     pub const KNOB_PROPORTION: usize = 1;
+    /// `NSScrollerKnobStyle` and `NSScrollerStyle`, zero being each default.
+    pub const KNOB_STYLE: usize = 2;
+    pub const SCROLLER_STYLE: usize = 3;
 }
 
-const ROW: usize = 26;
+const ROW: usize = 27;
 
 fn read(table: &Mutex<HashMap<usize, Vec<usize>>>, receiver: Id, at: usize) -> usize {
     table
@@ -725,13 +737,37 @@ unsafe extern "C" fn box_set_border_width(receiver: Id, _sel: Sel, value: f64) {
         boxes(),
         receiver,
         slot::BORDER_WIDTH,
-        value.to_bits() as usize,
+        !value.to_bits() as usize,
     );
     crate::backing::needs_display(receiver);
 }
 
 unsafe extern "C" fn box_border_width(receiver: Id, _sel: Sel) -> f64 {
-    f64::from_bits(read(boxes(), receiver, slot::BORDER_WIDTH) as u64)
+    border_width(receiver)
+}
+
+/// AppKit's default for a custom box's border.
+const DEFAULT_BORDER_WIDTH: f64 = 1.0;
+
+fn border_width(receiver: Id) -> f64 {
+    match read(boxes(), receiver, slot::BORDER_WIDTH) {
+        0 => DEFAULT_BORDER_WIDTH,
+        bits => f64::from_bits(!(bits as u64)),
+    }
+}
+
+unsafe extern "C" fn box_set_corner_radius(receiver: Id, _sel: Sel, value: f64) {
+    write(
+        boxes(),
+        receiver,
+        slot::CORNER_RADIUS,
+        value.to_bits() as usize,
+    );
+    crate::backing::needs_display(receiver);
+}
+
+unsafe extern "C" fn box_corner_radius(receiver: Id, _sel: Sel) -> f64 {
+    f64::from_bits(read(boxes(), receiver, slot::CORNER_RADIUS) as u64)
 }
 
 /// `NSBoxCustom`, the type whose look is entirely its fill and border colours.
@@ -750,6 +786,10 @@ unsafe extern "C" fn box_draw_rect(receiver: Id, _sel: Sel, _dirty: NSRect) {
         _ => return draw_group_box(receiver),
     }
     let bounds = view::bounds_of(receiver);
+    let radius = f64::from_bits(read(boxes(), receiver, slot::CORNER_RADIUS) as u64);
+    if radius > 0.0 {
+        return draw_rounded_custom_box(receiver, bounds, radius);
+    }
     let fill = |color: Id, rect: NSRect| {
         if color.is_null() || rect.size.width <= 0.0 || rect.size.height <= 0.0 {
             return;
@@ -762,7 +802,7 @@ unsafe extern "C" fn box_draw_rect(receiver: Id, _sel: Sel, _dirty: NSRect) {
         crate::color::NSRectFill(rect);
     };
     fill(read(boxes(), receiver, slot::FILL_COLOR) as Id, bounds);
-    let width = f64::from_bits(read(boxes(), receiver, slot::BORDER_WIDTH) as u64);
+    let width = border_width(receiver);
     let border = read(boxes(), receiver, slot::BORDER_COLOR) as Id;
     if width > 0.0 {
         let NSRect { origin, size } = bounds;
@@ -783,6 +823,56 @@ unsafe extern "C" fn box_draw_rect(receiver: Id, _sel: Sel, _dirty: NSRect) {
             border,
             edge(origin.x + size.width - width, origin.y, width, size.height),
         );
+    }
+}
+
+/// A custom box with rounded corners: one path, the bounds inset by half the
+/// border so the stroke stays inside them, filled and then stroked.
+fn draw_rounded_custom_box(receiver: Id, bounds: NSRect, radius: f64) {
+    let width = border_width(receiver);
+    let inset = (width / 2.0).max(0.0);
+    let path = NSRect {
+        origin: NSPoint {
+            x: bounds.origin.x + inset,
+            y: bounds.origin.y + inset,
+        },
+        size: NSSize {
+            width: bounds.size.width - 2.0 * inset,
+            height: bounds.size.height - 2.0 * inset,
+        },
+    };
+    if path.size.width <= 0.0 || path.size.height <= 0.0 {
+        return;
+    }
+    let fill = read(boxes(), receiver, slot::FILL_COLOR) as Id;
+    let border = read(boxes(), receiver, slot::BORDER_COLOR) as Id;
+    // NSBezierPath paints the focused view; a context made over a caller's
+    // `CGContext` (Qt's dark group box) is drawn into through Quartz.
+    if let Some((port, flipped)) = crate::backing::current_port() {
+        let Some(p) = crate::aqua::Painter::new(port.cast_mut(), bounds, flipped) else {
+            return;
+        };
+        let rgba = |color: Id| {
+            // SAFETY: a colour this box retained.
+            let (r, g, b, a) = unsafe { crate::color::components(color) };
+            [r, g, b, a]
+        };
+        let fill = (!fill.is_null()).then(|| rgba(fill));
+        let border = (width > 0.0 && !border.is_null()).then(|| (rgba(border), width));
+        return crate::aqua::rounded_box(&p, path, radius, fill, border);
+    }
+    // SAFETY: `-setFill` and `-setStroke` take no arguments.
+    let set = |color: Id, selector: &str| unsafe {
+        let f: unsafe extern "C" fn(Id, Sel) = std::mem::transmute(objc::msg::entry());
+        f(color, objc::sel::get(selector));
+    };
+    if !fill.is_null() {
+        set(fill, "setFill");
+        crate::bezier::fill_rounded_rect(path, radius);
+    }
+    if width > 0.0 && !border.is_null() {
+        set(border, "setStroke");
+        crate::bezier::stroke_rounded_rect(path, radius, width);
     }
 }
 
@@ -919,7 +1009,10 @@ fn draw_group_box(receiver: Id) {
 /// the view's own coordinates.
 fn draw_pixels(receiver: Id, paint: impl FnOnce(&mut chrome::Canvas, NSPoint)) {
     let bounds = view::bounds_of(receiver);
-    let density = crate::backing::focus_density();
+    let port = crate::backing::current_port();
+    let density = port.map_or_else(crate::backing::focus_density, |(port, _)| {
+        crate::text::port_density(port)
+    });
     let width = (bounds.size.width * density).ceil() as usize;
     let height = (bounds.size.height * density).ceil() as usize;
     if width == 0 || height == 0 {
@@ -934,6 +1027,12 @@ fn draw_pixels(receiver: Id, paint: impl FnOnce(&mut chrome::Canvas, NSPoint)) {
             y: bounds.origin.y + bounds.size.height,
         },
     );
+    // A context made over a caller's `CGContext` is drawn into in the view's
+    // own coordinates, as `-displayRectIgnoringOpacity:inContext:` sets up.
+    if let Some((port, _)) = port {
+        let flipped = view::is_flipped(receiver);
+        return crate::text::draw_into_port(port, flipped, bounds, width, height, pixels);
+    }
     crate::backing::draw_image(
         &pixels,
         width,
@@ -973,7 +1072,7 @@ unsafe extern "C" fn indicator_style(receiver: Id, _sel: Sel) -> usize {
     read(indicators(), receiver, slot::STYLE)
 }
 
-/// `-startAnimation:`. Nothing spins, since nothing draws; the state is kept
+/// `-startAnimation:`. Nothing animates; the state is kept
 /// for `-isAnimating`-style reads a program makes of its own indicator.
 unsafe extern "C" fn indicator_start_animation(receiver: Id, _sel: Sel, _sender: Id) {
     write(indicators(), receiver, slot::ANIMATING, 1);
@@ -994,6 +1093,74 @@ unsafe extern "C" fn indicator_set_double_value(receiver: Id, _sel: Sel, value: 
 
 unsafe extern "C" fn indicator_double_value(receiver: Id, _sel: Sel) -> f64 {
     f64::from_bits(read(indicators(), receiver, slot::VALUE) as u64)
+}
+
+unsafe extern "C" fn indicator_set_min_value(receiver: Id, _sel: Sel, value: f64) {
+    write(
+        indicators(),
+        receiver,
+        slot::MIN_VALUE,
+        value.to_bits() as usize,
+    );
+}
+
+unsafe extern "C" fn indicator_min_value(receiver: Id, _sel: Sel) -> f64 {
+    f64::from_bits(read(indicators(), receiver, slot::MIN_VALUE) as u64)
+}
+
+unsafe extern "C" fn indicator_set_max_value(receiver: Id, _sel: Sel, value: f64) {
+    write(
+        indicators(),
+        receiver,
+        slot::MAX_VALUE,
+        value.to_bits() as usize,
+    );
+    write(indicators(), receiver, slot::MAX_VALUE_SET, 1);
+}
+
+unsafe extern "C" fn indicator_max_value(receiver: Id, _sel: Sel) -> f64 {
+    /// AppKit's `maxValue` for a fresh indicator.
+    const DEFAULT_MAX: f64 = 100.0;
+    match read(indicators(), receiver, slot::MAX_VALUE_SET) {
+        0 => DEFAULT_MAX,
+        _ => f64::from_bits(read(indicators(), receiver, slot::MAX_VALUE) as u64),
+    }
+}
+
+/// `-[NSProgressIndicator drawRect:]`: a bar over the bounds, filled to the
+/// value's share of the range, or half filled while indeterminate.
+// FIXME (ACCURACY): the spinning style and the indeterminate animation are
+// not drawn.
+unsafe extern "C" fn indicator_draw_rect(receiver: Id, sel: Sel, _dirty: NSRect) {
+    /// `NSProgressIndicatorStyleSpinning`.
+    const SPINNING: usize = 1;
+    // SAFETY: the getters take only the receiver and selector.
+    let (style, indeterminate, value, min, max) = unsafe {
+        (
+            indicator_style(receiver, sel),
+            indicator_is_indeterminate(receiver, sel) != 0,
+            indicator_double_value(receiver, sel),
+            indicator_min_value(receiver, sel),
+            indicator_max_value(receiver, sel),
+        )
+    };
+    if style == SPINNING {
+        return;
+    }
+    let Some((port, flipped)) = crate::cell::current_port() else {
+        return;
+    };
+    let bounds = view::bounds_of(receiver);
+    let Some(p) = crate::aqua::Painter::new(port, bounds, flipped) else {
+        return;
+    };
+    let fraction = match indeterminate || max <= min {
+        true => None,
+        false => Some((value - min) / (max - min)),
+    };
+    let size = crate::aqua::Size::from_control_size(crate::props::integer(receiver, "controlSize"));
+    let horizontal = bounds.size.width >= bounds.size.height;
+    crate::aqua::progress_bar(&p, bounds, horizontal, fraction, size);
 }
 
 unsafe extern "C" fn button_set_image(receiver: Id, _sel: Sel, value: Id) {
@@ -1030,6 +1197,19 @@ unsafe extern "C" fn button_set_bordered(receiver: Id, _sel: Sel, value: u8) {
 
 unsafe extern "C" fn button_is_bordered(receiver: Id, _sel: Sel) -> u8 {
     u8::from(read(buttons(), receiver, slot::NOT_BORDERED) == 0)
+}
+
+unsafe extern "C" fn button_set_destructive(receiver: Id, _sel: Sel, value: u8) {
+    write(
+        buttons(),
+        receiver,
+        slot::DESTRUCTIVE,
+        usize::from(value != 0),
+    );
+}
+
+unsafe extern "C" fn button_is_destructive(receiver: Id, _sel: Sel) -> u8 {
+    u8::from(read(buttons(), receiver, slot::DESTRUCTIVE) != 0)
 }
 
 unsafe extern "C" fn button_set_transparent(receiver: Id, _sel: Sel, value: u8) {
@@ -1123,6 +1303,24 @@ unsafe extern "C" fn control_tag(receiver: Id, _sel: Sel) -> isize {
     read(buttons(), receiver, slot::TAG) as isize
 }
 
+/// `-[NSButtonCell drawBezelWithFrame:inView:]` draws only the border, in
+/// the cell's own state. The view is only where it is drawn: Qt passes the
+/// button's superview.
+unsafe extern "C" fn button_cell_draw_bezel_with_frame(
+    receiver: Id,
+    _sel: Sel,
+    frame: NSRect,
+    _control_view: Id,
+) {
+    if crate::cell::draw_bezel(receiver, frame) {
+        return;
+    }
+    let control = crate::cell::control_of(receiver);
+    if !control.is_null() {
+        draw_button(control, frame, false);
+    }
+}
+
 /// The bezel of a bordered button and its title, which is how a text button
 /// built in Interface Builder looks. An image button that is not bordered
 /// draws neither.
@@ -1130,27 +1328,62 @@ unsafe extern "C" fn control_tag(receiver: Id, _sel: Sel) -> isize {
 /// FIXME (ACCURACY): one rounded, lightly shaded bezel stands in for every
 /// `NSBezelStyle`; Apple's artwork differs per style.
 fn draw_bezel_and_title(receiver: Id) {
+    draw_button(receiver, view::bounds_of(receiver), true);
+}
+
+fn draw_button(receiver: Id, frame: NSRect, draw_title: bool) {
+    let Some((pixels, width, height)) = button_surface(receiver, frame, draw_title) else {
+        return;
+    };
+    crate::backing::draw_image(
+        &pixels,
+        width,
+        height,
+        frame.size,
+        frame,
+        NSRect {
+            origin: NSPoint::default(),
+            size: frame.size,
+        },
+        // Source-over.
+        2,
+        1.0,
+        true,
+    );
+}
+
+fn button_surface(
+    receiver: Id,
+    frame: NSRect,
+    draw_title: bool,
+) -> Option<(Vec<u8>, usize, usize)> {
     let bordered = read(buttons(), receiver, slot::NOT_BORDERED) == 0;
-    let title = button_text(receiver);
+    let title = if draw_title {
+        button_text(receiver)
+    } else {
+        String::new()
+    };
     if !bordered && title.is_empty() {
-        return;
+        return None;
     }
-    let bounds = view::bounds_of(receiver);
     let density = crate::backing::focus_density();
-    let width = (bounds.size.width * density).ceil() as usize;
-    let height = (bounds.size.height * density).ceil() as usize;
+    let width = (frame.size.width * density).ceil() as usize;
+    let height = (frame.size.height * density).ceil() as usize;
     if width == 0 || height == 0 {
-        return;
+        return None;
     }
     let mut pixels = vec![0u8; width * height * 4];
     let mut canvas = chrome::Canvas::new(&mut pixels, width, height, width * 4, density as f32);
-    let (w, h) = (bounds.size.width as f32, bounds.size.height as f32);
+    let (w, h) = (frame.size.width as f32, frame.size.height as f32);
     let pressed = read(buttons(), receiver, slot::HIGHLIGHTED) != 0;
     let enabled = read(buttons(), receiver, slot::DISABLED) == 0;
+    let dark = crate::appearance::is_dark();
     if bordered {
-        let face = match pressed {
-            true => chrome::Color::rgba(178, 178, 178, 1.0),
-            false => chrome::Color::rgba(236, 236, 236, 1.0),
+        let face = match (dark, pressed) {
+            (false, true) => chrome::Color::rgba(178, 178, 178, 1.0),
+            (false, false) => chrome::Color::rgba(236, 236, 236, 1.0),
+            (true, true) => chrome::Color::rgba(128, 128, 128, 1.0),
+            (true, false) => chrome::Color::rgba(101, 101, 101, 1.0),
         };
         let inset = chrome::Rect::new(1.0, 1.0, w - 2.0, h - 3.0);
         canvas.fill_rounded_rect(inset, 3.0, face);
@@ -1180,34 +1413,26 @@ fn draw_bezel_and_title(receiver: Id) {
             &font,
             size,
             chrome::Point::new(x, baseline),
-            chrome::Color::rgba(0, 0, 0, alpha),
+            match dark {
+                true => chrome::Color::rgba(255, 255, 255, alpha),
+                false => chrome::Color::rgba(0, 0, 0, alpha),
+            },
         );
     }
-    crate::backing::draw_image(
-        &pixels,
-        width,
-        height,
-        bounds.size,
-        bounds,
-        NSRect {
-            origin: NSPoint::default(),
-            size: bounds.size,
-        },
-        // Source-over.
-        2,
-        1.0,
-        true,
-    );
+    Some((pixels, width, height))
 }
 
 /// A check box or radio button: its box, its mark and its title beside it.
 ///
-/// FIXME (ACCURACY): drawn in the light theme's colours with the system font,
-/// whatever font the button names, like the toolkit's own check box.
+/// FIXME (ACCURACY): drawn with the system font, whatever font the button
+/// names, like the toolkit's own check box.
 fn draw_check(receiver: Id, radio: bool) {
     use chrome::View;
     let bounds = view::bounds_of(receiver);
-    let density = crate::backing::focus_density();
+    let port = crate::backing::current_port();
+    let density = port.map_or_else(crate::backing::focus_density, |(port, _)| {
+        crate::text::port_density(port)
+    });
     let width = (bounds.size.width * density).ceil() as usize;
     let height = (bounds.size.height * density).ceil() as usize;
     if width == 0 || height == 0 {
@@ -1215,7 +1440,7 @@ fn draw_check(receiver: Id, radio: bool) {
     }
     let mut pixels = vec![0u8; width * height * 4];
     let mut canvas = chrome::Canvas::new(&mut pixels, width, height, width * 4, density as f32);
-    let theme = chrome::Theme::light();
+    let theme = chrome::Theme::for_appearance(crate::appearance::is_dark());
     let check = chrome::checkbox::Checkbox {
         title: button_text(receiver),
         state: match read(buttons(), receiver, slot::BUTTON_STATE) as isize {
@@ -1267,7 +1492,7 @@ pub(crate) mod button_type {
 }
 
 /// `NSCellStyleMask`, what `-highlightsBy` and `-showsStateBy` hold.
-mod cell_mask {
+pub(crate) mod cell_mask {
     pub const CONTENTS: usize = 1;
     pub const PUSH_IN: usize = 2;
     pub const CHANGE_GRAY: usize = 4;
@@ -1592,6 +1817,7 @@ fn send_button_action(receiver: Id) {
     if read(buttons(), receiver, slot::DISABLED) != 0 {
         return;
     }
+    crate::bindings::control_changed(receiver);
     let action = read(buttons(), receiver, slot::ACTION) as Sel;
     let app = crate::application::shared();
     if action.is_null() || app.is_null() {
@@ -1927,6 +2153,101 @@ fn new_view(class: Id) -> Option<Id> {
     (!object.is_null()).then(|| objc::arc::autorelease(object))
 }
 
+fn send_word(receiver: Id, selector: &str, value: usize) {
+    // SAFETY: every selector this is used with is `void (id, SEL, NSUInteger)`
+    // or takes a BOOL, which the ABI passes in the same register.
+    unsafe {
+        let f: unsafe extern "C" fn(Id, Sel, usize) = std::mem::transmute(objc::msg::entry());
+        f(receiver, objc::sel::get(selector), value);
+    }
+}
+
+/// A button of `kind` titled `title`, sized to fit, for the `+...WithTitle:`
+/// constructors.
+fn titled_button(class: Id, title: Id, target: Id, action: Sel, kind: usize) -> Id {
+    let Some(button) = new_view(class) else {
+        return std::ptr::null_mut();
+    };
+    send_word(button, "setButtonType:", kind);
+    if kind == button_type::MOMENTARY_PUSH_IN {
+        // `NSBezelStyleRounded`.
+        send_word(button, "setBezelStyle:", 1);
+    }
+    send_object(button, "setTitle:", title);
+    send_object(button, "setTarget:", target);
+    // SAFETY: `-setAction:` is `void (id, SEL, SEL)`, and `-sizeToFit`
+    // `void (id, SEL)`.
+    unsafe {
+        let f: unsafe extern "C" fn(Id, Sel, Sel) = std::mem::transmute(objc::msg::entry());
+        f(button, objc::sel::get("setAction:"), action);
+        let f: unsafe extern "C" fn(Id, Sel) = std::mem::transmute(objc::msg::entry());
+        f(button, objc::sel::get("sizeToFit"));
+    }
+    button
+}
+
+/// `+buttonWithTitle:target:action:`: a rounded push button.
+unsafe extern "C" fn button_with_title(
+    class: Id,
+    _sel: Sel,
+    title: Id,
+    target: Id,
+    action: Sel,
+) -> Id {
+    titled_button(class, title, target, action, button_type::MOMENTARY_PUSH_IN)
+}
+
+unsafe extern "C" fn checkbox_with_title(
+    class: Id,
+    _sel: Sel,
+    title: Id,
+    target: Id,
+    action: Sel,
+) -> Id {
+    titled_button(class, title, target, action, button_type::SWITCH)
+}
+
+/// `-setAttributedAlternateTitle:`. Kept, and shown as its characters: a
+/// button here draws its alternate title as plain text.
+unsafe extern "C" fn button_set_attributed_alternate_title(receiver: Id, sel: Sel, value: Id) {
+    // SAFETY: the property's own setter and getter selectors.
+    unsafe { crate::props::set_copied(receiver, sel, value) };
+    let string = match value.is_null() {
+        true => std::ptr::null_mut(),
+        // SAFETY: `-string` is `id (id, SEL)` on an attributed string.
+        false => unsafe {
+            let f: unsafe extern "C" fn(Id, Sel) -> Id = std::mem::transmute(objc::msg::entry());
+            f(value, objc::sel::get("string"))
+        },
+    };
+    // SAFETY: the receiver is a button and the argument an NSString or nil.
+    unsafe { button_set_alternate_title(receiver, objc::sel::get("setAlternateTitle:"), string) };
+}
+
+/// `+stackViewWithViews:`: a horizontal stack arranging `views` in order.
+unsafe extern "C" fn stack_with_views(class: Id, _sel: Sel, views: Id) -> Id {
+    let Some(stack) = new_view(class) else {
+        return std::ptr::null_mut();
+    };
+    // SAFETY: an array, or nil.
+    if let Some(array) = unsafe { corefoundation::collections::array(views as _) } {
+        for view in array.values.clone() {
+            arrange_view(stack, view as Id, 1);
+        }
+    }
+    stack
+}
+
+/// `-isDisplayedWhenStopped`, stored inverted: AppKit's default is YES.
+/// FIXME (ACCURACY): kept only; an indicator here draws nothing either way.
+unsafe extern "C" fn indicator_set_displayed_when_stopped(receiver: Id, _sel: Sel, value: u8) {
+    crate::props::set_integer_of(receiver, "hiddenWhenStopped", usize::from(value == 0));
+}
+
+unsafe extern "C" fn indicator_is_displayed_when_stopped(receiver: Id, _sel: Sel) -> u8 {
+    u8::from(crate::props::integer(receiver, "hiddenWhenStopped") == 0)
+}
+
 /// `+buttonWithImage:target:action:`, sized to the image as AppKit sizes it to
 /// fit.
 unsafe extern "C" fn button_with_image(
@@ -2067,6 +2388,12 @@ unsafe extern "C" fn scroller_init_with_frame(receiver: Id, sel: Sel, frame: NSR
 const MIN_KNOB_LENGTH: f64 = 18.0;
 
 /// `NSScrollerPart`.
+/// `NSScrollerKnobStyle`.
+mod knob_style {
+    pub const DARK: isize = 1;
+    pub const LIGHT: isize = 2;
+}
+
 mod part {
     pub const DECREMENT_PAGE: usize = 1;
     pub const KNOB: usize = 2;
@@ -2112,6 +2439,22 @@ unsafe extern "C" fn scroller_knob_proportion(receiver: Id, _sel: Sel) -> f64 {
     scroller_f64(receiver, slot::KNOB_PROPORTION)
 }
 
+unsafe extern "C" fn scroller_set_knob_style(receiver: Id, _sel: Sel, value: isize) {
+    write(scrollers(), receiver, slot::KNOB_STYLE, value as usize);
+}
+
+unsafe extern "C" fn scroller_knob_style(receiver: Id, _sel: Sel) -> isize {
+    read(scrollers(), receiver, slot::KNOB_STYLE) as isize
+}
+
+unsafe extern "C" fn scroller_set_scroller_style(receiver: Id, _sel: Sel, value: isize) {
+    write(scrollers(), receiver, slot::SCROLLER_STYLE, value as usize);
+}
+
+unsafe extern "C" fn scroller_scroller_style(receiver: Id, _sel: Sel) -> isize {
+    read(scrollers(), receiver, slot::SCROLLER_STYLE) as isize
+}
+
 /// `-[NSScroller rectForPart:]`, in the scroller's own flipped coordinates.
 ///
 /// A scroller since 10.7 has no arrows, so the slot is the whole bounds and
@@ -2127,6 +2470,66 @@ unsafe extern "C" fn scroller_rect_for_part(receiver: Id, _sel: Sel, which: usiz
         scroller_f64(receiver, slot::KNOB_PROPORTION),
         which,
     )
+}
+
+/// Paint into the current context over the scroller's bounds.
+///
+/// The parts land at [`scroller_rect_for_part`]'s coordinates in the current
+/// user space as it stands, whatever the context says of its flippedness: a
+/// scroller is a flipped view, and drawn directly rather than by the view
+/// system nothing flips the space for it.
+fn paint_scroller(receiver: Id, paint: impl FnOnce(&crate::aqua::Painter, NSRect, bool)) {
+    let Some((port, _)) = crate::cell::current_port() else {
+        return;
+    };
+    let size = view::frame_of(receiver).size;
+    let bounds = NSRect {
+        origin: NSPoint::default(),
+        size,
+    };
+    if let Some(p) = crate::aqua::Painter::new(port, bounds, true) {
+        paint(&p, bounds, size.width > size.height);
+    }
+}
+
+/// `-[NSScroller drawKnobSlotInRect:highlight:]`
+unsafe extern "C" fn scroller_draw_knob_slot(
+    receiver: Id,
+    _sel: Sel,
+    slot: NSRect,
+    _highlight: u8,
+) {
+    let shade = match crate::appearance::is_dark() {
+        true => crate::aqua::Shade::Dark,
+        false => crate::aqua::Shade::Light,
+    };
+    paint_scroller(receiver, |p, _, horizontal| {
+        crate::aqua::scroll_track(p, slot, horizontal, shade)
+    });
+}
+
+/// `-[NSScroller drawKnob]`: nothing when there is no knob to draw.
+unsafe extern "C" fn scroller_draw_knob(receiver: Id, sel: Sel) {
+    // SAFETY: a scroller of this crate's.
+    let knob = unsafe { scroller_rect_for_part(receiver, sel, part::KNOB) };
+    if knob.size.width <= 0.0 || knob.size.height <= 0.0 {
+        return;
+    }
+    let shade = knob_shade(read(scrollers(), receiver, slot::KNOB_STYLE) as isize);
+    paint_scroller(receiver, |p, _, horizontal| {
+        crate::aqua::scroll_thumb(p, knob, horizontal, false, shade)
+    });
+}
+
+/// The background a knob of this `NSScrollerKnobStyle` is drawn for: a light
+/// knob is for a dark background, and the default follows the appearance.
+fn knob_shade(style: isize) -> crate::aqua::Shade {
+    match style {
+        knob_style::DARK => crate::aqua::Shade::Light,
+        knob_style::LIGHT => crate::aqua::Shade::Dark,
+        _ if crate::appearance::is_dark() => crate::aqua::Shade::Dark,
+        _ => crate::aqua::Shade::Light,
+    }
 }
 
 fn scroller_part(size: NSSize, value: f64, proportion: f64, which: usize) -> NSRect {
@@ -2216,6 +2619,9 @@ pub(crate) fn install() {
         "removeArrangedSubview:" => stack_remove_arranged_subview, c"v24@0:8@16";
         "arrangedSubviews" => stack_arranged_subviews, c"@16@0:8";
     });
+    class_methods!(class, {
+        "stackViewWithViews:" => stack_with_views, c"@24@0:8@16";
+    });
 
     let class = objc::class::lookup(c"NSBox").expect("declared before its methods");
     methods!(class, {
@@ -2233,6 +2639,8 @@ pub(crate) fn install() {
         "setContentViewMargins:" => box_set_content_view_margins, c"v32@0:8{CGSize=dd}16";
         "contentViewMargins" => box_content_view_margins, c"{CGSize=dd}16@0:8";
         "borderWidth" => box_border_width, c"d16@0:8";
+        "setCornerRadius:" => box_set_corner_radius, c"v24@0:8d16";
+        "cornerRadius" => box_corner_radius, c"d16@0:8";
         "setTitle:" => box_set_title, c"v24@0:8@16";
         "title" => box_title, c"@16@0:8";
         "setTitlePosition:" => box_set_title_position, c"v24@0:8Q16";
@@ -2252,6 +2660,18 @@ pub(crate) fn install() {
         "stopAnimation:" => indicator_stop_animation, c"v24@0:8@16";
         "setDoubleValue:" => indicator_set_double_value, c"v24@0:8d16";
         "doubleValue" => indicator_double_value, c"d16@0:8";
+        "setMinValue:" => indicator_set_min_value, c"v24@0:8d16";
+        "minValue" => indicator_min_value, c"d16@0:8";
+        "setMaxValue:" => indicator_set_max_value, c"v24@0:8d16";
+        "maxValue" => indicator_max_value, c"d16@0:8";
+        "drawRect:" => indicator_draw_rect, c"v48@0:8{CGRect={CGPoint=dd}{CGSize=dd}}16";
+        "setDisplayedWhenStopped:" => indicator_set_displayed_when_stopped, c"v20@0:8c16";
+        "isDisplayedWhenStopped" => indicator_is_displayed_when_stopped, c"c16@0:8";
+        "controlSize" => crate::props::get_integer, c"Q16@0:8";
+        "setControlSize:" => crate::props::set_integer, c"v24@0:8Q16";
+        // Kept only: nothing animates, on any thread.
+        "usesThreadedAnimation" => crate::props::get_bool, c"c16@0:8";
+        "setUsesThreadedAnimation:" => crate::props::set_bool, c"v20@0:8c16";
     });
 
     // Every control has a target and an action; a subclass a program writes
@@ -2271,11 +2691,21 @@ pub(crate) fn install() {
         "setContinuous:" => control_ignored_flag, c"v20@0:8c16";
         "isContinuous" => control_no, c"c16@0:8";
         "sendActionOn:" => control_send_action_on, c"q24@0:8Q16";
+        // FIXME (ACCURACY): kept, and not drawn: controls here draw at the
+        // regular size.
+        "controlSize" => crate::props::get_integer, c"Q16@0:8";
+        "setControlSize:" => crate::props::set_integer, c"v24@0:8Q16";
+        // FIXME (ACCURACY): kept, not applied: a field shows its string value
+        // as set, unformatted.
+        "formatter" => crate::props::get_object, c"@16@0:8";
+        "setFormatter:" => crate::props::set_retained, c"v24@0:8@16";
     });
 
     let class = objc::class::lookup(c"NSButton").expect("declared before its methods");
     class_methods!(class, {
         "buttonWithImage:target:action:" => button_with_image, c"@40@0:8@16@24:32";
+        "buttonWithTitle:target:action:" => button_with_title, c"@40@0:8@16@24:32";
+        "checkboxWithTitle:target:action:" => checkbox_with_title, c"@40@0:8@16@24:32";
     });
     methods!(class, {
         "setImage:" => button_set_image, c"v24@0:8@16";
@@ -2308,6 +2738,8 @@ pub(crate) fn install() {
         "alternateImage" => button_alternate_image, c"@16@0:8";
         "setBordered:" => button_set_bordered, c"v20@0:8c16";
         "isBordered" => button_is_bordered, c"c16@0:8";
+        "setHasDestructiveAction:" => button_set_destructive, c"v20@0:8c16";
+        "hasDestructiveAction" => button_is_destructive, c"c16@0:8";
         "setTransparent:" => button_set_transparent, c"v20@0:8c16";
         "isTransparent" => button_is_transparent, c"c16@0:8";
         "setHighlighted:" => button_set_highlighted, c"v20@0:8c16";
@@ -2318,6 +2750,8 @@ pub(crate) fn install() {
         "font" => button_font, c"@16@0:8";
         "setAlternateTitle:" => button_set_alternate_title, c"v24@0:8@16";
         "alternateTitle" => button_alternate_title, c"@16@0:8";
+        "setAttributedAlternateTitle:" => button_set_attributed_alternate_title, c"v24@0:8@16";
+        "attributedAlternateTitle" => crate::props::get_object, c"@16@0:8";
         "setAttributedTitle:" => button_set_attributed_title, c"v24@0:8@16";
         "attributedTitle" => button_attributed_title, c"@16@0:8";
         "setKeyEquivalent:" => button_set_key_equivalent, c"v24@0:8@16";
@@ -2332,6 +2766,12 @@ pub(crate) fn install() {
         "performClick:" => button_perform_click, c"v24@0:8@16";
         "mouseDown:" => button_mouse_down, c"v24@0:8@16";
         "mouseUp:" => button_mouse_up, c"v24@0:8@16";
+    });
+
+    let class = objc::class::lookup(c"NSButtonCell").expect("declared before its methods");
+    methods!(class, {
+        "drawBezelWithFrame:inView:" => button_cell_draw_bezel_with_frame,
+            c"v56@0:8{CGRect={CGPoint=dd}{CGSize=dd}}16@48";
     });
 
     let class = objc::class::lookup(c"NSImageView").expect("declared before its methods");
@@ -2376,6 +2816,13 @@ pub(crate) fn install() {
         "floatValue" => scroller_float_value, c"f16@0:8";
         "setKnobProportion:" => scroller_set_knob_proportion, c"v24@0:8d16";
         "knobProportion" => scroller_knob_proportion, c"d16@0:8";
+        "setKnobStyle:" => scroller_set_knob_style, c"v24@0:8q16";
+        "drawKnobSlotInRect:highlight:" => scroller_draw_knob_slot,
+            c"v52@0:8{CGRect={CGPoint=dd}{CGSize=dd}}16c48";
+        "drawKnob" => scroller_draw_knob, c"v16@0:8";
+        "knobStyle" => scroller_knob_style, c"q16@0:8";
+        "setScrollerStyle:" => scroller_set_scroller_style, c"v24@0:8q16";
+        "scrollerStyle" => scroller_scroller_style, c"q16@0:8";
         "rectForPart:" => scroller_rect_for_part,
             c"{CGRect={CGPoint=dd}{CGSize=dd}}24@0:8Q16";
     });
@@ -2384,6 +2831,77 @@ pub(crate) fn install() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn box_border_width_is_one_point_until_set() {
+        crate::bootstrap();
+        let class = objc::class::lookup(c"NSBox").expect("NSBox");
+        let view = objc::object::create_instance(class, 0);
+        // SAFETY: the accessors take and return one `CGFloat`.
+        unsafe {
+            let get: unsafe extern "C" fn(Id, Sel) -> f64 = std::mem::transmute(objc::msg::entry());
+            let set: unsafe extern "C" fn(Id, Sel, f64) = std::mem::transmute(objc::msg::entry());
+            assert_eq!(get(view, objc::sel::get("borderWidth")), 1.0);
+            set(view, objc::sel::get("setBorderWidth:"), 0.0);
+            assert_eq!(get(view, objc::sel::get("borderWidth")), 0.0);
+            set(view, objc::sel::get("setBorderWidth:"), 2.5);
+            assert_eq!(get(view, objc::sel::get("borderWidth")), 2.5);
+        }
+    }
+
+    #[test]
+    fn box_corner_radius_is_read_back() {
+        crate::bootstrap();
+        let class = objc::class::lookup(c"NSBox").expect("NSBox");
+        let view = objc::object::create_instance(class, 0);
+        // SAFETY: the accessors take and return one `CGFloat`.
+        unsafe {
+            let get: unsafe extern "C" fn(Id, Sel) -> f64 = std::mem::transmute(objc::msg::entry());
+            let set: unsafe extern "C" fn(Id, Sel, f64) = std::mem::transmute(objc::msg::entry());
+            assert_eq!(get(view, objc::sel::get("cornerRadius")), 0.0);
+            set(view, objc::sel::get("setCornerRadius:"), 6.5);
+            assert_eq!(get(view, objc::sel::get("cornerRadius")), 6.5);
+        }
+    }
+
+    #[test]
+    fn button_cell_draw_bezel_uses_its_frame_and_control_view() {
+        crate::bootstrap();
+        let button_class = objc::class::lookup(c"NSButton").expect("NSButton");
+        let button = objc::object::create_instance(button_class, 0);
+        write(buttons(), button, slot::NOT_BORDERED, 0);
+
+        let cell = crate::cell::cell_of(button);
+        let cell_class = objc::class::lookup(c"NSButtonCell").expect("NSButtonCell");
+        let selector = objc::sel::get("drawBezelWithFrame:inView:");
+        let method = cell_class
+            .method(selector)
+            .expect("button-cell bezel method");
+        // SAFETY: the registered IMP and type encoding match this Objective-C signature.
+        assert_eq!(
+            unsafe { std::ffi::CStr::from_ptr(method.types()) },
+            c"v56@0:8{CGRect={CGPoint=dd}{CGSize=dd}}16@48"
+        );
+
+        let frame = NSRect {
+            origin: NSPoint { x: 3.0, y: 5.0 },
+            size: NSSize {
+                width: 24.0,
+                height: 16.0,
+            },
+        };
+        let (pixels, width, height) =
+            button_surface(button, frame, false).expect("bordered buttons have a bezel");
+        assert_eq!((width, height), (24, 16));
+        assert!(pixels.as_chunks::<4>().0.iter().any(|pixel| pixel[3] != 0));
+
+        // SAFETY: the selector is registered above and receives a live button cell,
+        // a CGRect, and the NSButton that owns that cell.
+        let draw: unsafe extern "C" fn(Id, Sel, NSRect, Id) =
+            unsafe { std::mem::transmute(objc::msg::entry()) };
+        unsafe { draw(cell, selector, frame, button) };
+        objc::arc::release(button);
+    }
 
     #[test]
     fn button_title_is_retained_and_read_back() {

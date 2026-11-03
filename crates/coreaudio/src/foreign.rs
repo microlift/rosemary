@@ -91,3 +91,25 @@ pub unsafe fn get_property(
         f(handle, id, scope, element, out, size)
     })
 }
+
+/// Forward `AudioUnitGetPropertyInfo`.
+///
+/// # Safety
+///
+/// As the entry point's: each out-parameter is null or writable.
+pub unsafe fn get_property_info(
+    handle: *mut c_void,
+    id: u32,
+    scope: u32,
+    element: u32,
+    size: *mut u32,
+    writable: *mut u8,
+) -> Option<i32> {
+    let f = entry(c"AudioUnitGetPropertyInfo")?;
+    // SAFETY: the declaration is the framework's, and the handle is one it made.
+    Some(unsafe {
+        let f: unsafe extern "C" fn(*mut c_void, u32, u32, u32, *mut u32, *mut u8) -> i32 =
+            std::mem::transmute(f);
+        f(handle, id, scope, element, size, writable)
+    })
+}

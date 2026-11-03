@@ -47,8 +47,19 @@ pub(crate) fn new_buffer(gpu: &'static Gpu, length: usize, options: u64) -> Id {
             }
         },
     };
+    wrap_buffer(gpu, inner, options, host)
+}
+
+/// The `MTLBuffer` over a Vulkan buffer this crate made.
+pub(crate) fn wrap_buffer(
+    gpu: &'static Gpu,
+    inner: GpuBuffer,
+    options: u64,
+    host: Option<gpu::HostPages>,
+) -> Id {
+    let length = inner.length as usize;
     crate::account(length as i64);
-    if !private {
+    if (options >> 4) & 0xf != STORAGE_MODE_PRIVATE {
         crate::add_shared_buffer_bytes(length as u64);
     }
     crate::stats::count(crate::stats::Counter::BuffersCreated);

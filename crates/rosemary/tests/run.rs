@@ -110,10 +110,12 @@ fn objc_debug_is_accepted_with_the_default_builtin_runtime() {
     assert!(!err.contains("usage:"), "{err}");
     assert!(!err.contains("--objc-debug requires"), "{err}");
     // The first driver to run makes the shared test prefix and says so first.
+    // The path is named as resolved: inside the prefix, once its rootfs has an
+    // /etc/hosts of its own.
     assert!(
         err.lines()
             .last()
-            .is_some_and(|l| l.starts_with("rosemary: /etc/hosts:")),
+            .is_some_and(|l| l.starts_with("rosemary: ") && l.contains("/etc/hosts: ")),
         "{err}"
     );
 }
@@ -277,10 +279,12 @@ fn an_untranslatable_stop_names_itself_instead_of_crashing() {
     assert_eq!(status, Some(1));
     assert!(out.is_empty());
     // The first driver to run makes the shared test prefix and says so first.
+    // The path is named as resolved: inside the prefix, once its rootfs has an
+    // /etc/hosts of its own.
     assert!(
         err.lines()
             .last()
-            .is_some_and(|l| l.starts_with("rosemary: /etc/hosts:")),
+            .is_some_and(|l| l.starts_with("rosemary: ") && l.contains("/etc/hosts: ")),
         "{err:?}"
     );
 }

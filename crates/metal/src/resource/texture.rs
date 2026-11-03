@@ -12,6 +12,10 @@ pub(crate) struct Texture {
     /// made on first use. A texture usually has one and a blur pyramid has one
     /// per level, so this is a short list rather than a map.
     attachment_views: Vec<((u32, u32), vk::ImageView)>,
+    /// A texture buffer's view of its buffer's memory, and that buffer,
+    /// retained; null for a texture with an image.
+    pub texel_view: vk::BufferView,
+    buffer: Id,
 }
 
 impl Texture {
@@ -34,6 +38,11 @@ impl Texture {
                 self.image.view
             }
         }
+    }
+
+    /// Whether this is a view of a buffer's memory, which has no image.
+    pub fn is_texture_buffer(&self) -> bool {
+        self.texel_view != vk::BufferView::null()
     }
 
     /// The bytes `-[MTLDevice currentAllocatedSize]` counts this texture as.
@@ -132,6 +141,20 @@ pub(super) unsafe extern "C" fn texture_dealloc(receiver: Id, _sel: Sel) {
             unsafe { texture.gpu.device.destroy_image_view(view, None) };
         }
     }
+    if texture.texel_view != vk::BufferView::null() {
+        if !leaking() {
+            // SAFETY: as above.
+            unsafe {
+                texture
+                    .gpu
+                    .device
+                    .destroy_buffer_view(texture.texel_view, None)
+            };
+        }
+        objc::arc::release(std::mem::replace(&mut texture.buffer, std::ptr::null_mut()));
+        objc::arc::finalize(receiver);
+        return;
+    }
     let image = std::mem::replace(&mut texture.image, GpuImage::none());
     if !leaking() {
         if texture.parent.is_null() {
@@ -145,16 +168,57 @@ pub(super) unsafe extern "C" fn texture_dealloc(receiver: Id, _sel: Sel) {
 }
 
 pub(crate) fn new_texture(gpu: &'static Gpu, descriptor: TextureDescriptor) -> Id {
-    let format = gpu::pixel_format(descriptor.pixel_format);
-    if format == vk::Format::UNDEFINED {
+    new_texture_in(gpu, descriptor, None)
+}
+
+/// A texture in memory of its own, or at an offset into a placement heap's.
+pub(crate) fn new_texture_in(
+    gpu: &'static Gpu,
+    descriptor: TextureDescriptor,
+    placed: Option<(std::sync::Arc<gpu::Placement>, u64)>,
+) -> Id {
+    let Some(description) = image_description(&descriptor) else {
         gpu::trace(format!(
             "newTextureWithDescriptor: has no Vulkan form for MTLPixelFormat {}",
             descriptor.pixel_format
         ));
         return std::ptr::null_mut();
+    };
+    let image = match gpu.create_image_in(&description, placed) {
+        Ok(image) => image,
+        Err(reason) => {
+            gpu::trace(format!("newTextureWithDescriptor: failed: {reason}"));
+            return std::ptr::null_mut();
+        }
+    };
+    let texture = object::make(
+        c"RosemaryMTLTexture",
+        Texture {
+            gpu,
+            descriptor,
+            image,
+            parent: std::ptr::null_mut(),
+            attachment_views: Vec::new(),
+            texel_view: vk::BufferView::null(),
+            buffer: std::ptr::null_mut(),
+        },
+    );
+    if !texture.is_null() {
+        // SAFETY: the texture this call just made.
+        crate::account(unsafe { object::body::<Texture>(texture) }.accounted());
+    }
+    texture
+}
+
+/// The Vulkan image a texture descriptor asks for, or `None` for a pixel
+/// format Vulkan has no form of.
+pub(crate) fn image_description(descriptor: &TextureDescriptor) -> Option<ImageDescription> {
+    let format = gpu::pixel_format(descriptor.pixel_format);
+    if format == vk::Format::UNDEFINED {
+        return None;
     }
     let (image_type, view_type, layers, cube) = descriptor.shape();
-    let image = match gpu.create_image(&ImageDescription {
+    Some(ImageDescription {
         image_type,
         view_type,
         format,
@@ -171,28 +235,7 @@ pub(crate) fn new_texture(gpu: &'static Gpu, descriptor: TextureDescriptor) -> I
         usage: descriptor.usage,
         cube,
         components: gpu::pixel_format_components(descriptor.pixel_format),
-    }) {
-        Ok(image) => image,
-        Err(reason) => {
-            gpu::trace(format!("newTextureWithDescriptor: failed: {reason}"));
-            return std::ptr::null_mut();
-        }
-    };
-    let texture = object::make(
-        c"RosemaryMTLTexture",
-        Texture {
-            gpu,
-            descriptor,
-            image,
-            parent: std::ptr::null_mut(),
-            attachment_views: Vec::new(),
-        },
-    );
-    if !texture.is_null() {
-        // SAFETY: the texture this call just made.
-        crate::account(unsafe { object::body::<Texture>(texture) }.accounted());
-    }
-    texture
+    })
 }
 
 /// Wrap an existing image as a Metal texture, for presentation, whose images
@@ -218,6 +261,8 @@ pub(crate) fn drawable_texture(gpu: &'static Gpu, image: GpuImage, pixel_format:
             image,
             parent: std::ptr::null_mut(),
             attachment_views: Vec::new(),
+            texel_view: vk::BufferView::null(),
+            buffer: std::ptr::null_mut(),
         },
     )
 }
@@ -384,6 +429,11 @@ pub(super) unsafe extern "C" fn replace_region(
     }
     // SAFETY: a texture of this crate's.
     let texture = unsafe { object::body::<Texture>(receiver) };
+    if texture.is_texture_buffer() {
+        // Its bytes are its buffer's, which a guest writes through
+        // `-contents`; an image copy here would name a null `VkImage`.
+        return gpu::trace("replaceRegion: of a texture buffer is not supported");
+    }
     // Every number below this line came from the guest. A region outside the
     // texture, or a size which overflows, is a Metal programming error and
     // becomes a diagnostic here rather than an invalid `vkCmdCopyBufferToImage`
@@ -502,6 +552,24 @@ pub(super) unsafe extern "C" fn get_bytes(
     unsafe { get_bytes_slice(receiver, sel, bytes, bytes_per_row, 0, region, level, 0) }
 }
 
+// A failed post-submit Vulkan wait must retain both the GPU staging buffer
+// and the source MTLTexture. The caller's guest destination is only touched
+// after confirmed completion, never while the GPU may still be writing.
+struct TextureReadbackOwner {
+    gpu: &'static Gpu,
+    staging: Option<gpu::GpuBuffer>,
+    texture: usize,
+}
+
+impl Drop for TextureReadbackOwner {
+    fn drop(&mut self) {
+        if let Some(staging) = self.staging.take() {
+            self.gpu.destroy_buffer(staging);
+        }
+        objc::arc::release(self.texture as Id);
+    }
+}
+
 /// `-[MTLTexture getBytes:bytesPerRow:bytesPerImage:fromRegion:mipmapLevel:slice:]`.
 ///
 /// Metal copies on the spot and leaves ordering against GPU writes to the
@@ -524,6 +592,10 @@ pub(super) unsafe extern "C" fn get_bytes_slice(
     }
     // SAFETY: a texture of this crate's.
     let texture = unsafe { object::body::<Texture>(receiver) };
+    if texture.is_texture_buffer() {
+        // As for `-replaceRegion:`: there is no image to copy from.
+        return gpu::trace("getBytes: of a texture buffer is not supported".to_string());
+    }
     let image = &texture.image;
     if image.samples != vk::SampleCountFlags::TYPE_1 {
         return gpu::trace("getBytes: of a multisampled texture".to_string());
@@ -600,44 +672,53 @@ pub(super) unsafe extern "C" fn get_bytes_slice(
             height: checked.size[1],
             depth: checked.size[2],
         });
-    let (vk_image, buffer) = (image.image, staging.buffer);
-    let result = texture.gpu.one_shot(|device, command_buffer| {
-        let before = vk::MemoryBarrier::default()
-            .src_access_mask(vk::AccessFlags::MEMORY_WRITE)
-            .dst_access_mask(vk::AccessFlags::TRANSFER_READ);
-        let after = vk::MemoryBarrier::default()
-            .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
-            .dst_access_mask(vk::AccessFlags::HOST_READ);
-        // SAFETY: recording into the immediate command buffer, which the call
-        // owns; every image this runtime makes stays in GENERAL.
-        unsafe {
-            device.cmd_pipeline_barrier(
-                command_buffer,
-                vk::PipelineStageFlags::ALL_COMMANDS,
-                vk::PipelineStageFlags::TRANSFER,
-                vk::DependencyFlags::empty(),
-                &[before],
-                &[],
-                &[],
-            );
-            device.cmd_copy_image_to_buffer(
-                command_buffer,
-                vk_image,
-                vk::ImageLayout::GENERAL,
-                buffer,
-                &[copy],
-            );
-            device.cmd_pipeline_barrier(
-                command_buffer,
-                vk::PipelineStageFlags::TRANSFER,
-                vk::PipelineStageFlags::HOST,
-                vk::DependencyFlags::empty(),
-                &[after],
-                &[],
-                &[],
-            );
-        }
-    });
+    let (vk_image, gpu) = (image.image, texture.gpu);
+    let staging = std::sync::Arc::new(std::sync::Mutex::new(TextureReadbackOwner {
+        gpu,
+        staging: Some(staging),
+        texture: objc::arc::retain(receiver) as usize,
+    }));
+    let result = gpu.one_shot_owned(
+        std::sync::Arc::clone(&staging),
+        |device, command_buffer, owned| {
+            let buffer = owned.lock().unwrap().staging.as_ref().unwrap().buffer;
+            let before = vk::MemoryBarrier::default()
+                .src_access_mask(vk::AccessFlags::MEMORY_WRITE)
+                .dst_access_mask(vk::AccessFlags::TRANSFER_READ);
+            let after = vk::MemoryBarrier::default()
+                .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+                .dst_access_mask(vk::AccessFlags::HOST_READ);
+            // SAFETY: recording into the immediate command buffer, which the call
+            // owns; every image this runtime makes stays in GENERAL.
+            unsafe {
+                device.cmd_pipeline_barrier(
+                    command_buffer,
+                    vk::PipelineStageFlags::ALL_COMMANDS,
+                    vk::PipelineStageFlags::TRANSFER,
+                    vk::DependencyFlags::empty(),
+                    &[before],
+                    &[],
+                    &[],
+                );
+                device.cmd_copy_image_to_buffer(
+                    command_buffer,
+                    vk_image,
+                    vk::ImageLayout::GENERAL,
+                    buffer,
+                    &[copy],
+                );
+                device.cmd_pipeline_barrier(
+                    command_buffer,
+                    vk::PipelineStageFlags::TRANSFER,
+                    vk::PipelineStageFlags::HOST,
+                    vk::DependencyFlags::empty(),
+                    &[after],
+                    &[],
+                    &[],
+                );
+            }
+        },
+    );
     match result {
         Err(reason) => gpu::trace(format!("getBytes: copy failed: {reason}")),
         Ok(()) => {
@@ -650,7 +731,14 @@ pub(super) unsafe extern "C" fn get_bytes_slice(
                     // its own strides.
                     unsafe {
                         std::ptr::copy_nonoverlapping(
-                            staging.contents.add(from),
+                            staging
+                                .lock()
+                                .unwrap()
+                                .staging
+                                .as_ref()
+                                .unwrap()
+                                .contents
+                                .add(from),
                             bytes.add(to),
                             tight_row as usize,
                         )
@@ -659,7 +747,6 @@ pub(super) unsafe extern "C" fn get_bytes_slice(
             }
         }
     }
-    texture.gpu.destroy_buffer(staging);
 }
 
 fn lcm(a: u64, b: u64) -> u64 {
@@ -716,8 +803,105 @@ pub(super) unsafe extern "C" fn new_texture_view_range(
     levels: ViewRange,
     slices: ViewRange,
 ) -> Id {
+    texture_view(
+        receiver,
+        pixel_format,
+        texture_type,
+        levels,
+        slices,
+        IDENTITY_SWIZZLE,
+    )
+}
+
+/// `MTLTextureSwizzleChannels`: each output channel's `MTLTextureSwizzle`.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub(super) struct SwizzleChannels {
+    red: u8,
+    green: u8,
+    blue: u8,
+    alpha: u8,
+}
+
+const MTL_TEXTURE_SWIZZLE_ZERO: u8 = 0;
+const MTL_TEXTURE_SWIZZLE_ONE: u8 = 1;
+const MTL_TEXTURE_SWIZZLE_RED: u8 = 2;
+const MTL_TEXTURE_SWIZZLE_GREEN: u8 = 3;
+const MTL_TEXTURE_SWIZZLE_BLUE: u8 = 4;
+const MTL_TEXTURE_SWIZZLE_ALPHA: u8 = 5;
+
+const IDENTITY_SWIZZLE: SwizzleChannels = SwizzleChannels {
+    red: MTL_TEXTURE_SWIZZLE_RED,
+    green: MTL_TEXTURE_SWIZZLE_GREEN,
+    blue: MTL_TEXTURE_SWIZZLE_BLUE,
+    alpha: MTL_TEXTURE_SWIZZLE_ALPHA,
+};
+
+/// `-newTextureViewWithPixelFormat:textureType:levels:slices:swizzle:`.
+pub(super) unsafe extern "C" fn new_texture_view_swizzled(
+    receiver: Id,
+    _sel: Sel,
+    pixel_format: u64,
+    texture_type: u64,
+    levels: ViewRange,
+    slices: ViewRange,
+    swizzle: SwizzleChannels,
+) -> Id {
+    texture_view(
+        receiver,
+        pixel_format,
+        texture_type,
+        levels,
+        slices,
+        swizzle,
+    )
+}
+
+/// The swizzle applied over what the format itself maps each channel to,
+/// or `None` for a channel value `MTLTextureSwizzle` does not have.
+fn compose_swizzle(
+    format: vk::ComponentMapping,
+    swizzle: SwizzleChannels,
+) -> Option<vk::ComponentMapping> {
+    use vk::ComponentSwizzle as S;
+    // A format's identity channel is the channel itself.
+    let resolve = |mapped: S, own: S| if mapped == S::IDENTITY { own } else { mapped };
+    let source = [
+        resolve(format.r, S::R),
+        resolve(format.g, S::G),
+        resolve(format.b, S::B),
+        resolve(format.a, S::A),
+    ];
+    let pick = |channel: u8| match channel {
+        MTL_TEXTURE_SWIZZLE_ZERO => Some(S::ZERO),
+        MTL_TEXTURE_SWIZZLE_ONE => Some(S::ONE),
+        MTL_TEXTURE_SWIZZLE_RED..=MTL_TEXTURE_SWIZZLE_ALPHA => {
+            Some(source[usize::from(channel - MTL_TEXTURE_SWIZZLE_RED)])
+        }
+        _ => None,
+    };
+    Some(vk::ComponentMapping {
+        r: pick(swizzle.red)?,
+        g: pick(swizzle.green)?,
+        b: pick(swizzle.blue)?,
+        a: pick(swizzle.alpha)?,
+    })
+}
+
+fn texture_view(
+    receiver: Id,
+    pixel_format: u64,
+    texture_type: u64,
+    levels: ViewRange,
+    slices: ViewRange,
+    swizzle: SwizzleChannels,
+) -> Id {
     // SAFETY: a texture of this crate's.
     let texture = unsafe { object::body::<Texture>(receiver) };
+    if texture.is_texture_buffer() {
+        gpu::trace("rejecting newTextureViewWithPixelFormat: of a texture buffer");
+        return std::ptr::null_mut();
+    }
     let format = gpu::pixel_format(pixel_format);
     if format == vk::Format::UNDEFINED {
         gpu::trace(format!(
@@ -757,6 +941,11 @@ pub(super) unsafe extern "C" fn new_texture_view_range(
         ..texture.descriptor
     };
     let (_, view_type, _, _) = descriptor.shape();
+    let Some(components) = compose_swizzle(gpu::pixel_format_components(pixel_format), swizzle)
+    else {
+        gpu::trace("newTextureViewWithPixelFormat: a swizzle channel is not an MTLTextureSwizzle");
+        return std::ptr::null_mut();
+    };
     let base_level = texture.image.base_level + levels.location as u32;
     let base_layer = texture.image.base_layer + slices.location as u32;
     let image = match texture.gpu.create_texture_view(
@@ -765,7 +954,7 @@ pub(super) unsafe extern "C" fn new_texture_view_range(
         view_type,
         base_level..base_level + levels.length as u32,
         base_layer..base_layer + slices.length as u32,
-        gpu::pixel_format_components(pixel_format),
+        components,
         gpu::shader_aspect(pixel_format),
     ) {
         Ok(image) => image,
@@ -788,6 +977,8 @@ pub(super) unsafe extern "C" fn new_texture_view_range(
             image,
             parent: objc::arc::retain(owner),
             attachment_views: Vec::new(),
+            texel_view: vk::BufferView::null(),
+            buffer: std::ptr::null_mut(),
         },
     )
 }
@@ -795,4 +986,97 @@ pub(super) unsafe extern "C" fn new_texture_view_range(
 pub(super) unsafe extern "C" fn texture_parent(receiver: Id, _sel: Sel) -> Id {
     // SAFETY: a texture of this crate's.
     unsafe { object::body::<Texture>(receiver) }.parent
+}
+
+/// `+[MTLTextureDescriptor textureBufferDescriptorWithPixelFormat:width:resourceOptions:usage:]`.
+pub(super) unsafe extern "C" fn texture_buffer_descriptor(
+    _class: Id,
+    _sel: Sel,
+    pixel_format: u64,
+    width: u64,
+    resource_options: u64,
+    usage: u64,
+) -> Id {
+    let mut descriptor = TextureDescriptor {
+        texture_type: MTL_TEXTURE_TYPE_TEXTURE_BUFFER,
+        pixel_format,
+        width,
+        usage,
+        ..TextureDescriptor::fresh()
+    };
+    descriptor.storage_mode = (resource_options >> 4) & 0xf;
+    autoreleased_descriptor(descriptor)
+}
+
+/// `-[MTLBuffer newTextureWithDescriptor:offset:bytesPerRow:]`: a texture
+/// buffer seeing `width` texels of the buffer from `offset`, which is a
+/// Vulkan texel buffer view.
+pub(super) unsafe extern "C" fn buffer_new_texture(
+    receiver: Id,
+    _sel: Sel,
+    descriptor: Id,
+    offset: u64,
+    _bytes_per_row: u64,
+) -> Id {
+    if descriptor.is_null() {
+        return std::ptr::null_mut();
+    }
+    // SAFETY: a buffer of this crate's, and `MTLTextureDescriptor` is this
+    // crate's class.
+    let buffer = unsafe { object::body::<Buffer>(receiver) };
+    let descriptor = *unsafe { object::body::<TextureDescriptor>(descriptor) };
+    if descriptor.texture_type != MTL_TEXTURE_TYPE_TEXTURE_BUFFER {
+        gpu::trace(
+            "newTextureWithDescriptor:offset:bytesPerRow: of a linear 2D texture is not supported",
+        );
+        return std::ptr::null_mut();
+    }
+    let format = gpu::pixel_format(descriptor.pixel_format);
+    if format == vk::Format::UNDEFINED {
+        gpu::trace(format!(
+            "newTextureWithDescriptor:offset:bytesPerRow: has no Vulkan form for MTLPixelFormat {}",
+            descriptor.pixel_format
+        ));
+        return std::ptr::null_mut();
+    }
+    let range = descriptor.width * u64::from(gpu::texel_size(format));
+    if offset
+        .checked_add(range)
+        .is_none_or(|end| end > buffer.inner.length)
+    {
+        gpu::trace("newTextureWithDescriptor:offset:bytesPerRow: reaches past the buffer");
+        return std::ptr::null_mut();
+    }
+    let gpu = buffer.gpu;
+    // A binding has no stated extent, so the device sees the whole buffer.
+    let info = vk::BufferViewCreateInfo::default()
+        .buffer(buffer.device_buffer())
+        .format(format)
+        .offset(offset)
+        .range(range);
+    // SAFETY: a live buffer of this device's, created with texel buffer usage,
+    // and a range checked to be inside it.
+    let texel_view = match unsafe { gpu.device.create_buffer_view(&info, None) } {
+        Ok(view) => view,
+        Err(error) => {
+            gpu::trace(format!("vkCreateBufferView failed with {error:?}"));
+            return std::ptr::null_mut();
+        }
+    };
+    object::make(
+        c"RosemaryMTLTexture",
+        Texture {
+            gpu,
+            descriptor,
+            image: GpuImage {
+                format,
+                width: descriptor.width.max(1) as u32,
+                ..GpuImage::none()
+            },
+            parent: std::ptr::null_mut(),
+            attachment_views: Vec::new(),
+            texel_view,
+            buffer: objc::arc::retain(receiver),
+        },
+    )
 }

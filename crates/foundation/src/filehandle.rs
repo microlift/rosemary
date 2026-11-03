@@ -22,8 +22,9 @@ struct Handle {
 impl Drop for Handle {
     fn drop(&mut self) {
         if self.close_on_dealloc && self.fd >= 0 {
+            // Release Darwin descriptor-associated state as well as the host FD.
             // SAFETY: a descriptor this handle owns.
-            unsafe { libc::close(self.fd) };
+            unsafe { darwin::net::descriptor::close(self.fd) };
         }
     }
 }
@@ -59,7 +60,7 @@ pub unsafe fn close(object: Id) {
     if let Some(handle) = unsafe { handle_of(object) } {
         if handle.fd >= 0 {
             // SAFETY: the handle's own descriptor, forgotten below.
-            unsafe { libc::close(handle.fd) };
+            unsafe { darwin::net::descriptor::close(handle.fd) };
         }
         handle.fd = -1;
     }
@@ -508,6 +509,64 @@ mod tests {
             objc::arc::release(message);
         }
         objc::arc::pool_pop(pool);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn closing_filehandle_clears_darwin_socket_state() {
+        crate::bootstrap();
+        let pool = objc::arc::pool_push();
+        let mut fds = [-1; 2];
+        assert_eq!(
+            unsafe { libc::socketpair(libc::AF_UNIX, libc::SOCK_STREAM, 0, fds.as_mut_ptr()) },
+            0
+        );
+        type SetSockOpt = unsafe extern "C" fn(i32, i32, i32, *const libc::c_void, u32) -> i32;
+        let shim: SetSockOpt = unsafe {
+            std::mem::transmute(darwin::symbol("_setsockopt").expect("Darwin setsockopt"))
+        };
+        let enabled = 1i32;
+        assert_eq!(
+            unsafe { shim(fds[0], 0xffff, 0x1022, (&raw const enabled).cast(), 4) },
+            0
+        );
+        assert!(darwin::net::sockopt::suppresses_sigpipe(fds[0]));
+        let file = autoreleased_handle(fds[0], true);
+        unsafe { close_file(file, objc::sel::get("closeFile")) };
+        assert_eq!(unsafe { libc::fcntl(fds[0], libc::F_GETFD) }, -1);
+        assert!(!darwin::net::sockopt::suppresses_sigpipe(fds[0]));
+        assert_eq!(unsafe { libc::close(fds[1]) }, 0);
+        objc::arc::pool_pop(pool);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn filehandle_deallocation_clears_darwin_socket_state() {
+        crate::bootstrap();
+        let pool = objc::arc::pool_push();
+        let mut fds = [-1; 2];
+        assert_eq!(
+            unsafe { libc::socketpair(libc::AF_UNIX, libc::SOCK_STREAM, 0, fds.as_mut_ptr()) },
+            0
+        );
+        type SetSockOpt = unsafe extern "C" fn(i32, i32, i32, *const libc::c_void, u32) -> i32;
+        let shim: SetSockOpt = unsafe {
+            std::mem::transmute(darwin::symbol("_setsockopt").expect("Darwin setsockopt"))
+        };
+        let enabled = 1i32;
+        assert_eq!(
+            unsafe { shim(fds[0], 0xffff, 0x1022, (&raw const enabled).cast(), 4) },
+            0
+        );
+        assert!(darwin::net::sockopt::suppresses_sigpipe(fds[0]));
+        let file = autoreleased_handle(fds[0], true);
+        assert!(!file.is_null());
+        // The last reference is released by the autorelease pool; the
+        // destructor must follow the same descriptor lifecycle as -closeFile.
+        objc::arc::pool_pop(pool);
+        assert_eq!(unsafe { libc::fcntl(fds[0], libc::F_GETFD) }, -1);
+        assert!(!darwin::net::sockopt::suppresses_sigpipe(fds[0]));
+        assert_eq!(unsafe { libc::close(fds[1]) }, 0);
     }
 
     #[test]

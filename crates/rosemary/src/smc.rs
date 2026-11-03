@@ -22,6 +22,11 @@
 //! memory the guest writes, and a write the kernel makes on the guest's behalf
 //! (a `read(2)` into an arena) returns `EFAULT` rather than faulting - acceptable
 //! for code memory, which no guest fills that way.
+//!
+//! FIXME (ACCURACY): only the executable view's pages are guarded. A write
+//! through another mapping of the same shared pages - a W^X JIT's writable
+//! `mach_vm_map` of the memory entry it executes from, or a second `mmap` of
+//! one descriptor - is not seen, and a translation of the old bytes stays.
 
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicPtr, AtomicU32, AtomicU64, AtomicUsize, Ordering, fence};
@@ -472,7 +477,7 @@ mod tests {
             (size * 2) as u64,
             libc::PROT_READ | libc::PROT_WRITE,
         );
-        guard(&[p as u64..p as u64 + 8]);
+        guard(std::slice::from_ref(&(p as u64..p as u64 + 8)));
         // Not the second page: it holds nothing.
         assert!(on_fault(p as u64 + 3));
         // SAFETY: writable again after `on_fault`.

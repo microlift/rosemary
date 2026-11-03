@@ -3,10 +3,16 @@
 use std::ffi::{CStr, CString, c_char, c_int, c_void};
 use std::sync::OnceLock;
 
+#[cfg(any(test, feature = "test-support"))]
+pub mod isolated;
 pub mod keycodes;
 pub mod mouse;
 pub mod tray;
 pub mod wayland;
+#[cfg(target_os = "linux")]
+pub mod wayland_mask;
+#[cfg(target_os = "linux")]
+pub mod x11_mask;
 
 pub mod init {
     pub const VIDEO: u32 = 0x0000_0020;
@@ -75,6 +81,29 @@ pub struct Rect {
     pub y: c_int,
     pub w: c_int,
     pub h: c_int,
+}
+
+impl Rect {
+    /// The parts of a `width` by `height` surface outside this rectangle:
+    /// full-height columns left and right, then the strips above and below
+    /// between them. Every mask and blackout uses these, so they agree on
+    /// each edge pixel; empty bands are left out.
+    pub fn complements(self, (width, height): (c_int, c_int)) -> impl Iterator<Item = Rect> {
+        let (width, height) = (width.max(0), height.max(0));
+        let x0 = self.x.clamp(0, width);
+        let y0 = self.y.clamp(0, height);
+        let x1 = self.x.saturating_add(self.w).clamp(x0, width);
+        let y1 = self.y.saturating_add(self.h).clamp(y0, height);
+        [
+            (0, 0, x0, height),
+            (x1, 0, width - x1, height),
+            (x0, 0, x1 - x0, y0),
+            (x0, y1, x1 - x0, height - y1),
+        ]
+        .into_iter()
+        .map(|(x, y, w, h)| Rect { x, y, w, h })
+        .filter(|band| band.w > 0 && band.h > 0)
+    }
 }
 
 /// `SDL_DisplayMode`.
@@ -191,6 +220,7 @@ struct Api {
     SDL_SetWindowFocusable: Option<unsafe extern "C" fn(Window, bool) -> bool>,
     SDL_GetWindowPixelDensity: Option<unsafe extern "C" fn(Window) -> f32>,
     SDL_GetWindowID: Option<unsafe extern "C" fn(Window) -> u32>,
+    SDL_GetWindowFromID: Option<unsafe extern "C" fn(u32) -> Window>,
     SDL_GetWindowFlags: Option<unsafe extern "C" fn(Window) -> u64>,
     SDL_SetWindowIcon: Option<unsafe extern "C" fn(Window, *mut c_void) -> bool>,
     SDL_CreateSurfaceFrom:
@@ -205,6 +235,7 @@ struct Api {
     /// not, so a `uint64_t` on every platform. Neither is spelled in Vulkan's
     /// own types here, because this crate does not depend on `ash`.
     SDL_Vulkan_LoadLibrary: Option<unsafe extern "C" fn(*const c_char) -> bool>,
+    SDL_Vulkan_UnloadLibrary: Option<unsafe extern "C" fn()>,
     SDL_Vulkan_CreateSurface:
         Option<unsafe extern "C" fn(Window, *mut c_void, *const c_void, *mut u64) -> bool>,
     SDL_Vulkan_DestroySurface: Option<unsafe extern "C" fn(*mut c_void, u64, *const c_void)>,
@@ -245,6 +276,7 @@ struct Api {
     SDL_WaitEventTimeout: Option<unsafe extern "C" fn(*mut Event, i32) -> bool>,
     SDL_StartTextInput: Option<unsafe extern "C" fn(Window) -> bool>,
     SDL_StopTextInput: Option<unsafe extern "C" fn(Window) -> bool>,
+    SDL_TextInputActive: Option<unsafe extern "C" fn(Window) -> bool>,
     SDL_SetTextInputArea: Option<unsafe extern "C" fn(Window, *const Rect, c_int) -> bool>,
     SDL_HideCursor: Option<unsafe extern "C" fn() -> bool>,
     SDL_ShowCursor: Option<unsafe extern "C" fn() -> bool>,
@@ -261,13 +293,16 @@ struct Api {
     SDL_GetWindowRelativeMouseMode: Option<unsafe extern "C" fn(Window) -> bool>,
     SDL_SetWindowMouseGrab: Option<unsafe extern "C" fn(Window, bool) -> bool>,
     SDL_SetWindowMouseRect: Option<unsafe extern "C" fn(Window, *const Rect) -> bool>,
+    SDL_GetWindowMouseRect: Option<unsafe extern "C" fn(Window) -> *const Rect>,
     SDL_GetModState: Option<unsafe extern "C" fn() -> u16>,
     SDL_GetKeyFromScancode: Option<unsafe extern "C" fn(u32, u16, bool) -> u32>,
     SDL_SetHint: Option<unsafe extern "C" fn(*const c_char, *const c_char) -> bool>,
+    SDL_GetHint: Option<unsafe extern "C" fn(*const c_char) -> *const c_char>,
     SDL_ResetHint: Option<unsafe extern "C" fn(*const c_char) -> bool>,
     SDL_GetSystemTheme: Option<unsafe extern "C" fn() -> c_int>,
     SDL_GetCurrentVideoDriver: Option<unsafe extern "C" fn() -> *const c_char>,
     SDL_GetWindowProperties: Option<unsafe extern "C" fn(Window) -> PropertiesId>,
+    SDL_GetNumberProperty: Option<unsafe extern "C" fn(PropertiesId, *const c_char, i64) -> i64>,
     SDL_GetPointerProperty:
         Option<unsafe extern "C" fn(PropertiesId, *const c_char, *mut c_void) -> *mut c_void>,
 
@@ -435,6 +470,7 @@ fn api() -> Option<&'static Api> {
             SDL_SetWindowFocusable,
             SDL_GetWindowPixelDensity,
             SDL_GetWindowID,
+            SDL_GetWindowFromID,
             SDL_GetWindowFlags,
             SDL_SetWindowIcon,
             SDL_CreateSurfaceFrom,
@@ -444,6 +480,7 @@ fn api() -> Option<&'static Api> {
             SDL_LockSurface,
             SDL_UnlockSurface,
             SDL_Vulkan_LoadLibrary,
+            SDL_Vulkan_UnloadLibrary,
             SDL_Vulkan_CreateSurface,
             SDL_Vulkan_DestroySurface,
             SDL_GL_LoadLibrary,
@@ -476,6 +513,7 @@ fn api() -> Option<&'static Api> {
             SDL_WaitEventTimeout,
             SDL_StartTextInput,
             SDL_StopTextInput,
+            SDL_TextInputActive,
             SDL_SetTextInputArea,
             SDL_HideCursor,
             SDL_ShowCursor,
@@ -492,13 +530,16 @@ fn api() -> Option<&'static Api> {
             SDL_GetWindowRelativeMouseMode,
             SDL_SetWindowMouseGrab,
             SDL_SetWindowMouseRect,
+            SDL_GetWindowMouseRect,
             SDL_GetModState,
             SDL_GetKeyFromScancode,
             SDL_SetHint,
+            SDL_GetHint,
             SDL_ResetHint,
             SDL_GetSystemTheme,
             SDL_GetCurrentVideoDriver,
             SDL_GetWindowProperties,
+            SDL_GetNumberProperty,
             SDL_GetPointerProperty,
             SDL_OpenAudioDeviceStream,
             SDL_DestroyAudioStream,
@@ -1564,6 +1605,12 @@ mod tests {
 
     #[test]
     fn a_virtual_joystick_attaches_and_reads_back() {
+        // SDL's joystick event updates are global and compete with libtest
+        // threads pumping SDL. Preserve the real state assertions in a
+        // process where the test exclusively owns the SDL subsystem.
+        if !crate::isolated::run_here() {
+            return;
+        }
         if !available() || !virtual_joystick::available() {
             return;
         }
@@ -1634,6 +1681,7 @@ pub mod video {
         pub const RESIZABLE: u64 = 0x0000_0020;
         pub const MINIMIZED: u64 = 0x0000_0040;
         pub const MAXIMIZED: u64 = 0x0000_0080;
+        pub const INPUT_FOCUS: u64 = 0x0000_0200;
         pub const HIGH_PIXEL_DENSITY: u64 = 0x0000_2000;
         pub const ALWAYS_ON_TOP: u64 = 0x0001_0000;
         pub const UTILITY: u64 = 0x0002_0000;
@@ -1685,6 +1733,8 @@ pub mod video {
     pub mod event_type {
         pub const QUIT: u32 = 0x100;
         pub const SYSTEM_THEME_CHANGED: u32 = 0x108;
+        pub const DISPLAY_DESKTOP_MODE_CHANGED: u32 = 0x155;
+        pub const DISPLAY_CURRENT_MODE_CHANGED: u32 = 0x156;
         pub const WINDOW_EXPOSED: u32 = 0x204;
         pub const WINDOW_MOVED: u32 = 0x205;
         pub const WINDOW_RESIZED: u32 = 0x206;
@@ -1843,6 +1893,9 @@ pub mod video {
         WindowDisplayChanged {
             window: u32,
         },
+        DisplayModeChanged {
+            display: u32,
+        },
         WindowResized {
             window: u32,
             width: i32,
@@ -1994,6 +2047,13 @@ pub mod video {
                     let e: WindowEvent = decode(&raw);
                     Event::WindowMoved { window: e.window }
                 }
+                event_type::DISPLAY_DESKTOP_MODE_CHANGED
+                | event_type::DISPLAY_CURRENT_MODE_CHANGED => {
+                    // DisplayEvent and WindowEvent share their four-field
+                    // header, including the display/window ID at byte 16.
+                    let e: WindowEvent = decode(&raw);
+                    Event::DisplayModeChanged { display: e.window }
+                }
                 event_type::WINDOW_DISPLAY_CHANGED => {
                     let e: WindowEvent = decode(&raw);
                     Event::WindowDisplayChanged { window: e.window }
@@ -2115,14 +2175,16 @@ pub mod video {
         }
     }
 
-    /// Start the video subsystem, once.
-    ///
-    /// SDL refuses to create a window without it, and there is no earlier point
-    /// to do it from: a program that never opens a window should not have paid
-    /// for a display connection.
     pub fn init_video() -> bool {
         let mut up = VIDEO_UP.lock().unwrap_or_else(|e| e.into_inner());
         if !*up {
+            if cfg!(target_os = "linux") && get_hint(c"SDL_VIDEO_DRIVER").is_none() {
+                // Hack for an SDL bug where SDL mistakenly classifies Niri as incapable of being
+                // a Wayland compositor, yet somehow capable of being an Xwayland one.
+                // Unsure if this is a Niri or SDL bug to be honest, it literally ONLY happens on Niri.
+                // Also kmsdrm is here because it's awesome
+                set_hint(c"SDL_VIDEO_DRIVER", c"wayland,x11,kmsdrm");
+            }
             *up = super::init(super::init::VIDEO).is_ok();
             if *up {
                 // This thread now owns the event queue: see [`super::pump`].
@@ -2147,6 +2209,8 @@ pub mod video {
         if !*up {
             return;
         }
+        vulkan::service_surface_requests();
+        vulkan::unload_library_if_idle();
         if let Some(quit) = api().and_then(|a| a.SDL_QuitSubSystem) {
             // SAFETY: takes a flag word, for a subsystem this crate started.
             unsafe { quit(super::init::VIDEO) };
@@ -2168,7 +2232,482 @@ pub mod video {
     /// drawing into with OpenGL.
     pub mod vulkan {
         use super::Window;
-        use std::ffi::{CStr, c_void};
+        use std::collections::HashMap;
+        use std::ffi::{CStr, CString, c_void};
+        use std::sync::{LazyLock, Mutex};
+
+        /// Surface initialization is an SDL video operation. A Metal worker
+        /// can request it but must never perform it on a background thread.
+        use std::sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+        };
+
+        /// Owns the surface-initialization lifetime. SDL_Window cannot be
+        /// freed while the detached Vulkan initializer is still using the
+        /// surface created from it. The main pump defers actual destruction.
+        pub struct SurfaceInitToken(Arc<AtomicBool>);
+        impl Drop for SurfaceInitToken {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::Release);
+            }
+        }
+
+        #[cfg(test)]
+        pub fn test_publish_window_graphics_state(window: Window) {
+            publish_window_graphics_state(window);
+        }
+
+        #[cfg(test)]
+        pub fn test_insert_failed_surface(
+            window: Window,
+            instance: u64,
+            reason: &str,
+            transient: bool,
+        ) {
+            SURFACES.lock().unwrap().requests.insert(
+                (window as usize, instance),
+                State::Failed(SurfaceFailure {
+                    reason: reason.to_owned(),
+                    transient,
+                }),
+            );
+        }
+
+        #[cfg(test)]
+        pub fn test_insert_ready_surface(window: Window, instance: u64) {
+            SURFACES
+                .lock()
+                .unwrap()
+                .requests
+                .insert((window as usize, instance), State::Ready(0));
+        }
+
+        #[cfg(test)]
+        pub fn test_pending_windows() -> Vec<(usize, usize)> {
+            SURFACES
+                .lock()
+                .unwrap()
+                .pending_windows
+                .iter()
+                .map(|(window, tokens)| (*window, tokens.len()))
+                .collect()
+        }
+
+        #[derive(Clone, Debug)]
+        pub struct SurfaceFailure {
+            pub reason: String,
+            pub transient: bool,
+        }
+
+        pub enum PreparedSurface {
+            Pending,
+            Ready(u64, SurfaceInitToken),
+            Failed(SurfaceFailure),
+            Abandoned,
+            Retired,
+        }
+
+        enum State {
+            Pending(Option<CString>, u32),
+            Creating,
+            Ready(u64),
+            Taken,
+            /// Vulkan conversion succeeded, but initialization was abandoned.
+            /// The SDL window-surface API remains incompatible with it.
+            Abandoned,
+            Failed(SurfaceFailure),
+        }
+
+        struct Surfaces {
+            requests: HashMap<(usize, u64), State>,
+            destruction: Vec<(u64, u64)>,
+            pending_windows: Vec<(usize, Vec<Arc<AtomicBool>>)>,
+            converted: std::collections::HashSet<usize>,
+            // Independent of request state: a retry can replace Taken while
+            // the old initializer still holds its SDL window lifetime token.
+            active_initializers: HashMap<usize, Vec<Arc<AtomicBool>>>,
+            // SDL_Vulkan_LoadLibrary is reference-counted. Load once per
+            // video subsystem, not again on every failed surface retry.
+            loaded_library: Option<Option<CString>>,
+        }
+        static SURFACES: LazyLock<Mutex<Surfaces>> = LazyLock::new(|| {
+            Mutex::new(Surfaces {
+                requests: HashMap::new(),
+                destruction: Vec::new(),
+                pending_windows: Vec::new(),
+                converted: std::collections::HashSet::new(),
+                active_initializers: HashMap::new(),
+                loaded_library: None,
+            })
+        });
+
+        /// SDL may set SDL_WINDOW_VULKAN before backend surface creation
+        /// fails. Publish the actual SDL graphics state even on failure.
+        /// This runs only on SDL's video thread, never on a Metal worker.
+        fn publish_window_graphics_state(window: Window) {
+            if super::window_flags(window) & super::flags::VULKAN != 0 {
+                let live = super::LIVE_WINDOWS.lock().expect("live SDL windows");
+                if live
+                    .get(&(window as usize))
+                    .is_some_and(|state| !state.retired)
+                {
+                    SURFACES
+                        .lock()
+                        .expect("SDL Vulkan surfaces")
+                        .converted
+                        .insert(window as usize);
+                }
+            }
+        }
+
+        /// A Vulkan-owned window must never be passed into SDL_GetWindowSurface.
+        pub fn owns_window(window: Window) -> bool {
+            SURFACES
+                .lock()
+                .expect("SDL Vulkan surfaces")
+                .converted
+                .contains(&(window as usize))
+        }
+
+        /// The worker receives a ready surface only once, after SDL created
+        /// it on its video thread. Pending requests are serviced at the pump.
+        pub fn acquire_prepared_surface(
+            window: Window,
+            instance: u64,
+            library: Option<&CStr>,
+        ) -> PreparedSurface {
+            let key = (window as usize, instance);
+            // Match destruction lock order. An identity check separated from
+            // the insertion would still admit a request after teardown.
+            let live = super::LIVE_WINDOWS.lock().expect("live SDL windows");
+            let Some(id) = live
+                .get(&key.0)
+                .filter(|state| !state.retired && !state.closing)
+                .map(|state| state.id)
+            else {
+                return PreparedSurface::Retired;
+            };
+            let mut queue = SURFACES.lock().expect("SDL Vulkan surfaces");
+            drop(live);
+            match queue.requests.get_mut(&key) {
+                Some(State::Ready(surface)) => {
+                    let result = *surface;
+                    let done = Arc::new(AtomicBool::new(false));
+                    queue.requests.insert(key, State::Taken);
+                    queue
+                        .active_initializers
+                        .entry(window as usize)
+                        .or_default()
+                        .push(Arc::clone(&done));
+                    PreparedSurface::Ready(result, SurfaceInitToken(done))
+                }
+                Some(State::Failed(reason)) => PreparedSurface::Failed(reason.clone()),
+                Some(State::Abandoned) => PreparedSurface::Abandoned,
+                Some(State::Pending(_, _) | State::Creating | State::Taken) => {
+                    PreparedSurface::Pending
+                }
+                None => {
+                    queue
+                        .requests
+                        .insert(key, State::Pending(library.map(CStr::to_owned), id));
+                    drop(queue);
+                    // Unit tests create windows and present on the SDL owner
+                    // directly, without an AppKit event pump.
+                    if super::is_video_thread() {
+                        service_surface_requests();
+                        return acquire_prepared_surface(window, instance, library);
+                    }
+                    PreparedSurface::Pending
+                }
+            }
+        }
+
+        /// A state still owned by SDL or an asynchronous initializer must
+        /// not trigger redundant backing-store GPU uploads on each pump.
+        pub fn surface_request_pending(window: Window) -> bool {
+            SURFACES
+                .lock()
+                .expect("SDL Vulkan surfaces")
+                .requests
+                .iter()
+                .any(|(&(key, _), state)| {
+                    key == window as usize
+                        && matches!(state, State::Pending(_, _) | State::Creating | State::Taken)
+                })
+        }
+
+        /// An initializer failed after SDL converted the window to Vulkan.
+        /// Retire its old VkSurface, then let the SDL owner create another.
+        /// Conversion remains one-way: the window cannot use SDL readback.
+        pub fn retry_surface(window: Window, instance: u64, library: Option<&CStr>) -> bool {
+            let Some(id) = super::live_window_id(window) else {
+                return false;
+            };
+            let mut registry = SURFACES.lock().expect("SDL Vulkan surfaces");
+            let key = (window as usize, instance);
+            match registry.requests.get_mut(&key) {
+                Some(state @ State::Taken) | Some(state @ State::Failed(_)) => {
+                    *state = State::Pending(library.map(CStr::to_owned), id);
+                    true
+                }
+                _ => false, // Destroyed, cancelled, or already retrying.
+            }
+        }
+
+        /// Refuse a permanently unsupported, never-converted SDL surface.
+        /// Retain a terminal state until the window's normal destruction.
+        pub fn refuse_failed_surface(window: Window, instance: u64) {
+            let mut registry = SURFACES.lock().expect("SDL Vulkan surfaces");
+            if matches!(
+                registry.requests.get(&(window as usize, instance)),
+                Some(State::Failed(_))
+            ) {
+                registry
+                    .requests
+                    .insert((window as usize, instance), State::Abandoned);
+            }
+        }
+
+        pub fn abandon_surface(window: Window, instance: u64) {
+            let mut registry = SURFACES.lock().expect("SDL Vulkan surfaces");
+            if matches!(
+                registry.requests.get(&(window as usize, instance)),
+                Some(State::Taken)
+            ) {
+                registry
+                    .requests
+                    .insert((window as usize, instance), State::Abandoned);
+            }
+        }
+
+        /// Called on the SDL video thread after input polling, before AppKit
+        /// can submit new drawables. No queue mutex spans SDL_Vulkan_* calls.
+        pub fn service_surface_requests() {
+            if !super::is_video_thread() {
+                return;
+            }
+            let (pending, destroyed) = {
+                let mut q = SURFACES.lock().expect("SDL Vulkan surfaces");
+                q.active_initializers.retain(|_, tokens| {
+                    tokens.retain(|done| !done.load(Ordering::Acquire));
+                    !tokens.is_empty()
+                });
+                let pending = q
+                    .requests
+                    .iter_mut()
+                    .filter_map(|(&key, value)| match value {
+                        State::Pending(library, id) => {
+                            let library = library.clone();
+                            let id = *id;
+                            *value = State::Creating;
+                            Some((key, library, id))
+                        }
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>();
+                (pending, std::mem::take(&mut q.destruction))
+            };
+            for (instance, surface) in destroyed {
+                destroy_surface_now(instance, surface);
+            }
+            for ((window, instance), library, id) in pending {
+                // SDL native deletion runs on this same video thread.
+                // Reject work logically retired by a different thread before
+                // calling any SDL_Window native API with its former pointer.
+                if super::live_window_id(window as Window) != Some(id) {
+                    let mut q = SURFACES.lock().expect("SDL Vulkan surfaces");
+                    if matches!(q.requests.get(&(window, instance)), Some(State::Creating)) {
+                        q.requests.remove(&(window, instance));
+                    }
+                    continue;
+                }
+                let created = create_surface(window as Window, instance, library.as_deref());
+                let failure = if created.is_none() {
+                    // Capture SDL_GetError on the thread that made the call.
+                    // Window conversion cannot be inferred from the error.
+                    let reason = super::super::error();
+                    let minimized =
+                        super::window_flags(window as Window) & super::flags::MINIMIZED != 0;
+                    let zero_area = super::window_size_in_pixels(window as Window)
+                        .is_some_and(|(w, h)| w <= 0 || h <= 0);
+                    let lower = reason.to_ascii_lowercase();
+                    Some(SurfaceFailure {
+                        transient: minimized
+                            || zero_area
+                            || lower.contains("out of date")
+                            || lower.contains("out_of_date")
+                            || lower.contains("not ready")
+                            || lower.contains("temporarily unavailable"),
+                        reason,
+                    })
+                } else {
+                    None
+                };
+                let mut q = SURFACES.lock().expect("SDL Vulkan surfaces");
+                let accepted = match q.requests.get_mut(&(window, instance)) {
+                    Some(slot @ State::Creating) => {
+                        *slot = match created {
+                            Some(handle) => State::Ready(handle),
+                            None => State::Failed(failure.expect("SDL error captured")),
+                        };
+                        true
+                    }
+                    _ => false,
+                };
+                if accepted && created.is_some() {
+                    q.converted.insert(window);
+                }
+                drop(q);
+                if !accepted && let Some(surface) = created {
+                    destroy_surface_now(instance, surface);
+                }
+            }
+            // Destroy only after the Vulkan initializer has retired its
+            // resources and queued SDL_Vulkan_DestroySurface on this thread.
+            let retired = {
+                let mut q = SURFACES.lock().expect("SDL Vulkan surfaces");
+                let (done, pending): (Vec<_>, Vec<_>) = std::mem::take(&mut q.pending_windows)
+                    .into_iter()
+                    .partition(|(_, tokens)| {
+                        tokens.iter().all(|done| done.load(Ordering::Acquire))
+                    });
+                q.pending_windows = pending;
+                done
+            };
+            // Worker teardown may have queued more surface destruction after
+            // the first queue drain; retire those before the SDL_Window.
+            let destroyed =
+                std::mem::take(&mut SURFACES.lock().expect("SDL Vulkan surfaces").destruction);
+            for (instance, surface) in destroyed {
+                destroy_surface_now(instance, surface);
+            }
+            for (window, _) in retired {
+                super::destroy_window_now(window as Window);
+            }
+        }
+
+        /// A WSI present and SDL's own show or hide commit the same
+        /// wl_surface from different threads. Under explicit sync a present
+        /// sets its acquire point before it attaches, and an SDL commit in
+        /// between commits that point with no buffer - a protocol error that
+        /// closes the display connection.
+        static SURFACE_COMMITS: Mutex<()> = Mutex::new(());
+
+        /// Hold across a `vkQueuePresentKHR` to a surface of an SDL window.
+        pub fn surface_commit_guard() -> std::sync::MutexGuard<'static, ()> {
+            SURFACE_COMMITS.lock().unwrap_or_else(|e| e.into_inner())
+        }
+
+        /// Hold SDL_Window alive while a Metal swapchain and its worker
+        /// threads retire. The video thread observes this token at the same
+        /// destruction barrier used for asynchronous Vulkan initializers.
+        pub fn hold_window_until(window: Window, retired: Arc<AtomicBool>) -> bool {
+            hold_window_until_inner(window, retired, false)
+        }
+
+        /// Only teardown hooks may retain a frozen native window while
+        /// cancelling its Metal worker. New background producers are refused.
+        pub fn hold_window_for_teardown(window: Window, retired: Arc<AtomicBool>) -> bool {
+            hold_window_until_inner(window, retired, true)
+        }
+
+        fn hold_window_until_inner(
+            window: Window,
+            retired: Arc<AtomicBool>,
+            teardown: bool,
+        ) -> bool {
+            let live = super::LIVE_WINDOWS.lock().expect("live SDL windows");
+            if !live
+                .get(&(window as usize))
+                .is_some_and(|state| !state.retired && (teardown || !state.closing))
+            {
+                return false;
+            }
+            SURFACES
+                .lock()
+                .expect("SDL Vulkan surfaces")
+                .active_initializers
+                .entry(window as usize)
+                .or_default()
+                .push(retired);
+            true
+        }
+
+        /// Centralized at SDL_DestroyWindow, including callers that bypass
+        /// AppKit hooks (notably independent Vulkan tests).
+        /// Returns true when SDL destruction must await an active initializer.
+        pub fn defer_window_destruction(window: Window) {
+            SURFACES
+                .lock()
+                .expect("SDL Vulkan surfaces")
+                .pending_windows
+                .push((window as usize, Vec::new()));
+        }
+
+        /// SDL destroys popups recursively: retain the parent until every
+        /// Vulkan surface initializer belonging to its descendants retires.
+        pub fn forget_window_family(window: Window, family: &[Window]) -> bool {
+            let keys: std::collections::HashSet<usize> =
+                family.iter().map(|member| *member as usize).collect();
+            let (removed, active) = {
+                let mut q = SURFACES.lock().expect("SDL Vulkan surfaces");
+                for key in &keys {
+                    q.converted.remove(key);
+                }
+                let mut active: Vec<_> = keys
+                    .iter()
+                    .flat_map(|key| q.active_initializers.remove(key).unwrap_or_default())
+                    .collect();
+                // A popup can have been logically destroyed on its own
+                // while its physical SDL_Window is retained by an initializer.
+                // Merge that deferred deletion into the parent's barrier;
+                // otherwise SDL's recursive destroy would free it early.
+                q.pending_windows.retain_mut(|(pending, tokens)| {
+                    if !keys.contains(pending) {
+                        return true;
+                    }
+                    active.append(tokens);
+                    false
+                });
+                let requests: Vec<_> = q
+                    .requests
+                    .keys()
+                    .filter(|(key, _)| keys.contains(key))
+                    .copied()
+                    .collect();
+                let removed = requests
+                    .into_iter()
+                    .filter_map(|key| q.requests.remove(&key).map(|state| (key.1, state)))
+                    .collect::<Vec<_>>();
+                (removed, active)
+            };
+            let active: Vec<_> = active
+                .into_iter()
+                .filter(|done| !done.load(Ordering::Acquire))
+                .collect();
+            for (instance, state) in removed {
+                match state {
+                    State::Ready(surface) => destroy_surface(instance, surface),
+                    State::Taken => {}
+                    _ => {}
+                }
+            }
+            if !active.is_empty() {
+                SURFACES
+                    .lock()
+                    .expect("SDL Vulkan surfaces")
+                    .pending_windows
+                    .push((window as usize, active));
+                true
+            } else {
+                false
+            }
+        }
+
+        pub fn forget_window(window: Window) -> bool {
+            forget_window_family(window, &[window])
+        }
 
         /// A Vulkan surface for `window`, as a raw `VkSurfaceKHR`.
         ///
@@ -2182,15 +2721,26 @@ pub mod video {
             instance: u64,
             library: Option<&CStr>,
         ) -> Option<u64> {
+            if !super::is_video_thread() {
+                return None;
+            }
             let api = super::api()?;
             let create = api.SDL_Vulkan_CreateSurface?;
-            if let Some(load) = api.SDL_Vulkan_LoadLibrary {
-                // SDL loads the loader itself inside `CreateSurface`, but
-                // doing it here separates "no Vulkan on this host" from "this
-                // window cannot have a surface" in the error a caller reports.
-                // SAFETY: the path lives across the call; null asks for SDL's default.
-                if !unsafe { load(library.map_or(std::ptr::null(), CStr::as_ptr)) } {
-                    return None;
+            // SDL load calls increment a global reference count. Retrying
+            // surface creation must not repeatedly increment that count.
+            {
+                let mut state = SURFACES.lock().expect("SDL Vulkan surfaces");
+                match &state.loaded_library {
+                    Some(loaded) if loaded.as_deref() == library => {}
+                    Some(_) => return None, // Cannot switch loaders mid-instance.
+                    None => {
+                        let load = api.SDL_Vulkan_LoadLibrary?;
+                        // SAFETY: SDL copies/uses this path during the call.
+                        if !unsafe { load(library.map_or(std::ptr::null(), CStr::as_ptr)) } {
+                            return None;
+                        }
+                        state.loaded_library = Some(library.map(CStr::to_owned));
+                    }
                 }
             }
             let mut surface = 0u64;
@@ -2205,10 +2755,64 @@ pub mod video {
                     &raw mut surface,
                 )
             };
-            (made && surface != 0).then_some(surface)
+            // SDL sets SDL_WINDOW_VULKAN before its backend is asked to
+            // create a VkSurface. A backend failure does not undo conversion.
+            publish_window_graphics_state(window);
+            if !made || surface == 0 {
+                return None;
+            }
+            // Successful surface creation is authoritative even if a host
+            // SDL build did not expose the updated flag through the getter.
+            {
+                let live = super::LIVE_WINDOWS.lock().expect("live SDL windows");
+                if live
+                    .get(&(window as usize))
+                    .is_some_and(|state| !state.retired)
+                {
+                    SURFACES
+                        .lock()
+                        .expect("SDL Vulkan surfaces")
+                        .converted
+                        .insert(window as usize);
+                }
+            }
+            Some(surface)
         }
 
         pub fn destroy_surface(instance: u64, surface: u64) {
+            if !super::is_video_thread() {
+                SURFACES
+                    .lock()
+                    .expect("SDL Vulkan surfaces")
+                    .destruction
+                    .push((instance, surface));
+                return;
+            }
+            destroy_surface_now(instance, surface);
+        }
+
+        pub fn unload_library_if_idle() {
+            if !super::is_video_thread() {
+                return;
+            }
+            let mut state = SURFACES.lock().expect("SDL Vulkan surfaces");
+            if !state.requests.is_empty()
+                || !state.converted.is_empty()
+                || !state.pending_windows.is_empty()
+                || !state.destruction.is_empty()
+                || !state.active_initializers.is_empty()
+            {
+                return;
+            }
+            if state.loaded_library.take().is_some()
+                && let Some(unload) = super::api().and_then(|a| a.SDL_Vulkan_UnloadLibrary)
+            {
+                // SAFETY: all SDL Vulkan surfaces and windows have retired.
+                unsafe { unload() };
+            }
+        }
+
+        fn destroy_surface_now(instance: u64, surface: u64) {
             let Some(destroy) = super::api().and_then(|a| a.SDL_Vulkan_DestroySurface) else {
                 return;
             };
@@ -2239,6 +2843,11 @@ pub mod video {
     ///
     /// The calling thread's GL context is kept; see [`keep_gl_context`].
     pub fn present_window(window: Window, body: impl FnOnce(&Presentation) -> bool) -> bool {
+        // SDL explicitly forbids mixing SDL_GetWindowSurface with Vulkan.
+        // Losing the Vulkan WSI surface does not undo the conversion.
+        if !is_video_thread() || vulkan::owns_window(window) {
+            return false;
+        }
         // A window's store and a Metal layer read back for it present from
         // different threads, and the GL context behind a renderer's surface
         // can be current on only one of them at a time.
@@ -2308,6 +2917,171 @@ pub mod video {
         drew && unsafe { update(window) }
     }
 
+    /// Native addresses may be recycled after SDL_DestroyWindow. Cache the
+    /// identity while the pointer is valid, so consumers can reject stale
+    /// frames without calling SDL on an already destroyed window.
+    #[derive(Clone, Copy)]
+    struct LiveWindow {
+        id: u32,
+        readbacks_allowed: bool,
+        parent: Option<usize>,
+        // A logically retired popup may remain allocated while its Vulkan
+        // worker runs; preserve parent ancestry until physical SDL deletion.
+        retired: bool,
+        closing: bool,
+    }
+
+    static LIVE_WINDOWS: std::sync::LazyLock<
+        std::sync::Mutex<std::collections::HashMap<usize, LiveWindow>>,
+    > = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+
+    fn register_live_window(window: Window, parent: Option<Window>) {
+        let id = window_id(window);
+        if id != 0 {
+            LIVE_WINDOWS.lock().expect("live SDL windows").insert(
+                window as usize,
+                LiveWindow {
+                    id,
+                    readbacks_allowed: true,
+                    parent: parent.map(|parent| parent as usize),
+                    retired: false,
+                    closing: false,
+                },
+            );
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_register_synthetic_window(window: Window) {
+        LIVE_WINDOWS.lock().unwrap().insert(
+            window as usize,
+            LiveWindow {
+                id: 0x57ab,
+                readbacks_allowed: true,
+                parent: None,
+                retired: false,
+                closing: false,
+            },
+        );
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_unregister_synthetic_window(window: Window) {
+        LIVE_WINDOWS.lock().unwrap().remove(&(window as usize));
+    }
+
+    /// Mark the native SDL family logically dead, retaining ancestry for
+    /// popups whose Vulkan workers defer their actual physical destruction.
+    fn retire_window_family(window: Window, reserved: bool) -> Option<Vec<Window>> {
+        let root = window as usize;
+        let mut live = LIVE_WINDOWS.lock().expect("live SDL windows");
+        if !live
+            .get(&root)
+            .is_some_and(|state| !state.retired && state.closing == reserved)
+        {
+            return None;
+        }
+        let family = family_keys(&live, root);
+        for key in &family {
+            if let Some(state) = live.get_mut(key) {
+                state.retired = true;
+                state.readbacks_allowed = false;
+            }
+        }
+        Some(family.into_iter().map(|key| key as Window).collect())
+    }
+
+    fn family_keys(live: &std::collections::HashMap<usize, LiveWindow>, root: usize) -> Vec<usize> {
+        let mut family = vec![root];
+        let mut index = 0;
+        while index < family.len() {
+            let parent = family[index];
+            for (&key, state) in live.iter() {
+                if state.parent == Some(parent) && !family.contains(&key) {
+                    family.push(key);
+                }
+            }
+            index += 1;
+        }
+        family
+    }
+
+    /// Only the SDL owner can drop native windows. Release their tombstones
+    /// at the same moment SDL recursively frees the child allocations.
+    fn forget_native_window_family(window: Window) {
+        let mut live = LIVE_WINDOWS.lock().expect("live SDL windows");
+        for key in family_keys(&live, window as usize) {
+            live.remove(&key);
+        }
+    }
+
+    /// Freeze family membership while AppKit notifies Metal and other owners.
+    /// A concurrently creating popup cannot join after this snapshot.
+    pub fn begin_window_family_destroy(window: Window) -> Vec<Window> {
+        let mut live = LIVE_WINDOWS.lock().expect("live SDL windows");
+        if !live
+            .get(&(window as usize))
+            .is_some_and(|s| !s.retired && !s.closing)
+        {
+            return Vec::new();
+        }
+        let family = family_keys(&live, window as usize);
+        for key in &family {
+            if let Some(state) = live.get_mut(key) {
+                state.closing = true;
+            }
+        }
+        family.into_iter().map(|key| key as Window).collect()
+    }
+
+    /// The native SDL family which recursive destruction will consume.
+    /// Entries already logically retired remain for lifetime coordination,
+    /// but callers should only notify owners for live entries.
+    pub fn window_family(window: Window) -> Vec<Window> {
+        let live = LIVE_WINDOWS.lock().expect("live SDL windows");
+        if !live
+            .get(&(window as usize))
+            .is_some_and(|state| !state.retired)
+        {
+            return Vec::new();
+        }
+        family_keys(&live, window as usize)
+            .into_iter()
+            .map(|key| key as Window)
+            .collect()
+    }
+
+    /// Pure registry lookup: unlike SDL_GetWindowID, safe for a stale pointer.
+    pub fn live_window_id(window: Window) -> Option<u32> {
+        LIVE_WINDOWS
+            .lock()
+            .expect("live SDL windows")
+            .get(&(window as usize))
+            .filter(|live| !live.retired)
+            .map(|live| live.id)
+    }
+
+    /// A window may still physically exist while AppKit is tearing it down.
+    /// This prevents a GPU readback from being published after its destroy hook.
+    pub fn readback_window_id(window: Window) -> Option<u32> {
+        LIVE_WINDOWS
+            .lock()
+            .expect("live SDL windows")
+            .get(&(window as usize))
+            .filter(|live| !live.retired && live.readbacks_allowed)
+            .map(|live| live.id)
+    }
+
+    pub fn revoke_window_readbacks(window: Window) {
+        if let Some(live) = LIVE_WINDOWS
+            .lock()
+            .expect("live SDL windows")
+            .get_mut(&(window as usize))
+        {
+            live.readbacks_allowed = false;
+        }
+    }
+
     pub fn create_window(title: &CStr, width: i32, height: i32, flags: u64) -> Option<Window> {
         if !init_video() {
             return None;
@@ -2315,7 +3089,11 @@ pub mod video {
         let create = api()?.SDL_CreateWindow?;
         // SAFETY: a NUL-terminated title and SDL's own flags.
         let window = unsafe { create(title.as_ptr(), width, height, flags) };
-        (!window.is_null()).then_some(window)
+        if window.is_null() {
+            return None;
+        }
+        register_live_window(window, None);
+        Some(window)
     }
 
     pub fn create_popup_window(
@@ -2330,9 +3108,33 @@ pub mod video {
             return None;
         }
         let create = api()?.SDL_CreatePopupWindow?;
-        // SAFETY: a window this crate created, and SDL's own flags.
+        let mut live = LIVE_WINDOWS.lock().expect("live SDL windows");
+        if !live
+            .get(&(parent as usize))
+            .is_some_and(|state| !state.retired && !state.closing)
+        {
+            return None;
+        }
+        // SAFETY: the live registry prevents logical parent teardown until
+        // the child has been inserted.
         let window = unsafe { create(parent, offset_x, offset_y, width, height, flags) };
-        (!window.is_null()).then_some(window)
+        if window.is_null() {
+            return None;
+        }
+        let id = window_id(window);
+        if id != 0 {
+            live.insert(
+                window as usize,
+                LiveWindow {
+                    id,
+                    readbacks_allowed: true,
+                    parent: Some(parent as usize),
+                    retired: false,
+                    closing: false,
+                },
+            );
+        }
+        Some(window)
     }
 
     /// Make `window` a dialog of `parent` that blocks input to it until it
@@ -2345,9 +3147,23 @@ pub mod video {
         else {
             return false;
         };
-        // SAFETY: two windows this crate created; modal needs the parent set
-        // first.
-        unsafe { set_parent(window, parent) && set_modal(window, true) }
+        let mut live = LIVE_WINDOWS.lock().expect("live SDL windows");
+        if ![parent, window].iter().all(|window| {
+            live.get(&(*window as usize))
+                .is_some_and(|state| !state.retired && !state.closing)
+        }) {
+            return false;
+        }
+        // Hold the live-registry lock until the child association is recorded.
+        // SDL may attach the child even if SDL_SetWindowModal later fails.
+        if !unsafe { set_parent(window, parent) } {
+            return false;
+        }
+        live.get_mut(&(window as usize))
+            .expect("checked live child")
+            .parent = Some(parent as usize);
+        drop(live);
+        unsafe { set_modal(window, true) }
     }
 
     /// The window a popup is positioned against, or null for a toplevel.
@@ -2374,16 +3190,40 @@ pub mod video {
         };
     }
 
-    window_call! {
+    /// [`window_call`]s that change what [`presentation_window`] reports.
+    macro_rules! window_state_call {
+        ($($name:ident => $entry:ident),* $(,)?) => {
+            $(
+                pub fn $name(window: Window) -> bool {
+                    let Some(f) = api().and_then(|a| a.$entry) else {
+                        return false;
+                    };
+                    // Showing and hiding commit the window's surface.
+                    let commits = vulkan::surface_commit_guard();
+                    // SAFETY: a window this crate created.
+                    let done = unsafe { f(window) };
+                    drop(commits);
+                    resample_presentation_window(window);
+                    done
+                }
+            )*
+        };
+    }
+
+    window_state_call! {
         show_window => SDL_ShowWindow,
         hide_window => SDL_HideWindow,
-        raise_window => SDL_RaiseWindow,
         minimize_window => SDL_MinimizeWindow,
         maximize_window => SDL_MaximizeWindow,
         restore_window => SDL_RestoreWindow,
+    }
+
+    window_call! {
+        raise_window => SDL_RaiseWindow,
         swap_window => SDL_GL_SwapWindow,
         start_text_input => SDL_StartTextInput,
         stop_text_input => SDL_StopTextInput,
+        text_input_active => SDL_TextInputActive,
     }
 
     /// Tell the host input method where the active editor and caret are.
@@ -2400,10 +3240,38 @@ pub mod video {
 
     /// The calling thread's GL context is kept; see [`keep_gl_context`].
     pub fn destroy_window(window: Window) {
+        destroy_window_inner(window, false);
+    }
+
+    /// Finish an AppKit-initiated family destroy after its hooks have run.
+    pub fn destroy_window_after_hooks(window: Window) {
+        destroy_window_inner(window, true);
+    }
+
+    fn destroy_window_inner(window: Window, reserved: bool) {
+        let Some(family) = retire_window_family(window, reserved) else {
+            return;
+        };
+        let pending = vulkan::forget_window_family(window, &family);
+        for member in family {
+            forget_cached_window_refresh_rate(member);
+        }
+        vulkan::service_surface_requests();
+        if !pending {
+            if is_video_thread() {
+                destroy_window_now(window);
+            } else {
+                vulkan::defer_window_destruction(window);
+            }
+        }
+    }
+
+    fn destroy_window_now(window: Window) {
         let Some(f) = api().and_then(|a| a.SDL_DestroyWindow) else {
             return;
         };
-        // SAFETY: a window this crate created.
+        forget_native_window_family(window);
+        // SAFETY: the SDL owner thread has finished using this window.
         keep_gl_context(|| unsafe { f(window) });
     }
 
@@ -2477,6 +3345,13 @@ pub mod video {
         unsafe { f(window) }
     }
 
+    /// SDL's window registry lookup does not dereference a stale Window.
+    pub fn window_from_id(id: u32) -> Window {
+        api()
+            .and_then(|api| api.SDL_GetWindowFromID)
+            .map_or(std::ptr::null_mut(), |get| unsafe { get(id) })
+    }
+
     /// The window's title, empty where it has none.
     ///
     /// SDL owns the string and keeps it until the title is set again or the
@@ -2508,7 +3383,9 @@ pub mod video {
             return false;
         };
         // SAFETY: a window this crate created.
-        unsafe { f(window, width, height) }
+        let done = unsafe { f(window, width, height) };
+        resample_presentation_window(window);
+        done
     }
 
     pub fn window_size_in_pixels(window: Window) -> Option<(i32, i32)> {
@@ -2530,7 +3407,9 @@ pub mod video {
             return false;
         };
         // SAFETY: a window this crate created.
-        unsafe { f(window, x, y) }
+        let done = unsafe { f(window, x, y) };
+        resample_presentation_window(window);
+        done
     }
 
     /// `SDL_SetWindowOpacity`, where 1.0 is opaque.
@@ -2560,7 +3439,9 @@ pub mod video {
             return false;
         };
         // SAFETY: a window this crate created.
-        unsafe { f(window, on) }
+        let done = unsafe { f(window, on) };
+        resample_presentation_window(window);
+        done
     }
 
     /// `SDL_SetWindowBordered`: whether the window system draws a frame around
@@ -2573,7 +3454,9 @@ pub mod video {
             return false;
         };
         // SAFETY: a window this crate created.
-        unsafe { f(window, on) }
+        let done = unsafe { f(window, on) };
+        resample_presentation_window(window);
+        done
     }
 
     /// `SDL_SetWindowMinimumSize`, in window coordinates.
@@ -3090,6 +3973,599 @@ pub mod video {
         *RATE
     }
 
+    /// Captured on the SDL video thread, consumed by presentation workers.
+    #[derive(Clone, Copy, Debug, PartialEq)]
+    pub struct PresentationWindow {
+        pub id: u32,
+        pub logical_size: (i32, i32),
+        /// SDL host-window position, sampled by the video owner for workers.
+        pub position: (i32, i32),
+        pub pixel_size: (i32, i32),
+        pub density: f32,
+        pub flags: u64,
+    }
+
+    static PRESENTATION_WINDOWS: std::sync::Mutex<
+        Option<std::collections::HashMap<usize, PresentationWindow>>,
+    > = std::sync::Mutex::new(None);
+
+    pub fn is_video_thread() -> bool {
+        let owner = super::VIDEO_THREAD.load(std::sync::atomic::Ordering::Acquire);
+        owner != 0 && owner == super::this_thread()
+    }
+
+    #[cfg(test)]
+    static WINDOW_SNAPSHOT_QUERIES: std::sync::atomic::AtomicUsize =
+        std::sync::atomic::AtomicUsize::new(0);
+
+    fn sample_presentation_window(window: Window) -> Option<PresentationWindow> {
+        if !is_video_thread() {
+            return None;
+        }
+        #[cfg(test)]
+        WINDOW_SNAPSHOT_QUERIES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Some(PresentationWindow {
+            id: window_id(window),
+            logical_size: window_size(window)?,
+            position: window_position(window)?,
+            pixel_size: window_size_in_pixels(window)?,
+            density: window_pixel_density(window),
+            flags: window_flags(window),
+        })
+    }
+
+    /// Access on the Metal threads is a cache lookup only. The main thread
+    /// may publish a freshly created window before its first event pump.
+    pub fn presentation_window(window: Window) -> Option<PresentationWindow> {
+        let key = window as usize;
+        // Reject stale native addresses before any SDL call or cache query.
+        let id = live_window_id(window)?;
+        if let Some(snapshot) = PRESENTATION_WINDOWS
+            .lock()
+            .expect("presentation windows")
+            .as_ref()
+            .and_then(|windows| windows.get(&key).copied())
+        {
+            return (snapshot.id == id).then_some(snapshot);
+        }
+        // Only the SDL video owner can sample native window properties.
+        let snapshot = sample_presentation_window(window)?;
+        if snapshot.id != id || live_window_id(window) != Some(id) {
+            return None;
+        }
+        PRESENTATION_WINDOWS
+            .lock()
+            .expect("presentation windows")
+            .get_or_insert_with(std::collections::HashMap::new)
+            .insert(key, snapshot);
+        Some(snapshot)
+    }
+
+    pub fn invalidate_presentation_window(id: u32, windows: &[Window]) {
+        if !is_video_thread() {
+            return;
+        }
+        let Some(window) = windows
+            .iter()
+            .copied()
+            .find(|&window| window_id(window) == id)
+        else {
+            return;
+        };
+        if let Some(cache) = PRESENTATION_WINDOWS
+            .lock()
+            .expect("presentation windows")
+            .as_mut()
+        {
+            cache.remove(&(window as usize));
+        }
+    }
+
+    /// Take the snapshot again after this process changed the window. Not
+    /// every change comes back as an event to invalidate it: a hidden window
+    /// takes a new size at once and reports no resize.
+    fn resample_presentation_window(window: Window) {
+        let Some(snapshot) = sample_presentation_window(window) else {
+            return;
+        };
+        PRESENTATION_WINDOWS
+            .lock()
+            .expect("presentation windows")
+            .get_or_insert_with(std::collections::HashMap::new)
+            .insert(window as usize, snapshot);
+    }
+
+    /// SDL event pump publishes geometry/flags before CPU backing stores are
+    /// presented, without querying unchanged windows on every redraw.
+    pub fn publish_presentation_windows(windows: &[Window]) {
+        if !is_video_thread() {
+            return;
+        }
+        let unknown: Vec<Window> = {
+            let cache = PRESENTATION_WINDOWS.lock().expect("presentation windows");
+            windows
+                .iter()
+                .copied()
+                .filter(|window| {
+                    !cache
+                        .as_ref()
+                        .is_some_and(|cache| cache.contains_key(&(*window as usize)))
+                })
+                .collect()
+        };
+        let sampled: Vec<_> = unknown
+            .into_iter()
+            .filter_map(|window| {
+                sample_presentation_window(window).map(|value| (window as usize, value))
+            })
+            .collect();
+        let mut cache = PRESENTATION_WINDOWS.lock().expect("presentation windows");
+        let cache = cache.get_or_insert_with(std::collections::HashMap::new);
+        cache.retain(|key, _| windows.iter().any(|window| *key == *window as usize));
+        cache.extend(sampled);
+    }
+
+    /// Published only by the SDL video thread; the Metal worker never calls
+    /// SDL_GetDisplayForWindow or SDL_GetDesktopDisplayMode. `None` is cached
+    /// too, so missing display information does not trigger a query each pump.
+    static WINDOW_REFRESH_RATES: std::sync::Mutex<
+        Option<std::collections::HashMap<usize, Option<f32>>>,
+    > = std::sync::Mutex::new(None);
+
+    pub fn cached_window_refresh_rate(window: Window) -> Option<f32> {
+        WINDOW_REFRESH_RATES
+            .lock()
+            .expect("window refresh rates")
+            .as_ref()
+            .and_then(|rates| rates.get(&(window as usize)).copied().flatten())
+    }
+
+    /// Called only by the AppKit pump on the main video thread. Query newly
+    /// created windows once, not every 250ms: SDL display queries can block
+    /// an entire guest frame, especially when many windows are present.
+    pub fn publish_window_refresh_rates(windows: &[Window]) {
+        if super::VIDEO_THREAD.load(std::sync::atomic::Ordering::Acquire) == 0 || !super::may_pump()
+        {
+            return;
+        }
+        let unknown: Vec<Window> = {
+            let cache = WINDOW_REFRESH_RATES.lock().expect("window refresh rates");
+            windows
+                .iter()
+                .copied()
+                .filter(|w| {
+                    !cache
+                        .as_ref()
+                        .is_some_and(|cache| cache.contains_key(&(*w as usize)))
+                })
+                .collect()
+        };
+        let new_rates: Vec<(usize, Option<f32>)> = unknown
+            .into_iter()
+            .map(|window| {
+                let rate = display_for_window(window)
+                    .and_then(display_refresh_rate)
+                    .filter(|rate| rate.is_finite() && *rate > 0.0);
+                (window as usize, rate)
+            })
+            .collect();
+        let mut cache = WINDOW_REFRESH_RATES.lock().expect("window refresh rates");
+        let cache = cache.get_or_insert_with(std::collections::HashMap::new);
+        cache.retain(|key, _| windows.iter().any(|window| *key == *window as usize));
+        cache.extend(new_rates);
+    }
+
+    /// Re-query display modes periodically even if the window never moves.
+    /// A monitor may switch refresh rate without WINDOW_DISPLAY_CHANGED.
+    pub fn refresh_window_display_modes(windows: &[Window]) {
+        if !is_video_thread() {
+            return;
+        }
+        // One main-thread SDL query per distinct display, even when many
+        // windows share it. Never hold the cache mutex across SDL calls.
+        let mut by_display = std::collections::HashMap::new();
+        let results: Vec<_> = windows
+            .iter()
+            .copied()
+            .map(|window| {
+                let display = display_for_window(window);
+                let rate = display.and_then(|id| {
+                    *by_display
+                        .entry(id)
+                        .or_insert_with(|| display_refresh_rate(id))
+                });
+                (window as usize, rate)
+            })
+            .collect();
+        let mut cache = WINDOW_REFRESH_RATES.lock().expect("window refresh rates");
+        let cache = cache.get_or_insert_with(std::collections::HashMap::new);
+        cache.retain(|key, _| windows.iter().any(|window| *key == *window as usize));
+        cache.extend(results);
+    }
+
+    /// The SDL_WINDOW_DISPLAY_CHANGED event reaches the main thread before
+    /// the next pump. Re-query only that window on its new display.
+    pub fn window_display_changed(window: u32, windows: &[Window]) {
+        let Some(window) = windows.iter().copied().find(|&w| window_id(w) == window) else {
+            return;
+        };
+        WINDOW_REFRESH_RATES
+            .lock()
+            .expect("window refresh rates")
+            .get_or_insert_with(std::collections::HashMap::new)
+            .remove(&(window as usize));
+    }
+
+    pub fn forget_cached_window_refresh_rate(window: Window) {
+        if let Some(cache) = PRESENTATION_WINDOWS
+            .lock()
+            .expect("presentation windows")
+            .as_mut()
+        {
+            cache.remove(&(window as usize));
+        }
+        if let Some(cache) = WINDOW_REFRESH_RATES
+            .lock()
+            .expect("window refresh rates")
+            .as_mut()
+        {
+            cache.remove(&(window as usize));
+        }
+    }
+
+    #[cfg(test)]
+    #[test]
+    fn destroyed_window_cannot_requeue_vulkan_initialization_after_metadata_lookup() {
+        if !crate::isolated::run_here() {
+            return;
+        }
+        let window = create_window(c"late Vulkan initialization", 120, 90, 0).unwrap();
+        let id = presentation_window(window).unwrap().id;
+        let key = window as usize;
+        let instance = 0x7251_1500u64;
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let (continue_tx, continue_rx) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            assert_eq!(presentation_window(key as Window).unwrap().id, id);
+            ready_tx.send(()).unwrap();
+            continue_rx.recv().unwrap();
+            assert!(matches!(
+                vulkan::acquire_prepared_surface(key as Window, instance, None),
+                vulkan::PreparedSurface::Retired
+            ));
+        });
+        ready_rx
+            .recv_timeout(std::time::Duration::from_secs(3))
+            .unwrap();
+        destroy_window(window);
+        assert!(
+            window_from_id(id).is_null(),
+            "SDL still has the retired window"
+        );
+        continue_tx.send(()).unwrap();
+        worker.join().unwrap();
+        assert!(!vulkan::surface_request_pending(window));
+        assert!(
+            !vulkan::hold_window_until(
+                window,
+                std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false))
+            ),
+            "a retired window accepted a new native-lifetime token"
+        );
+        // Would have invoked SDL_Vulkan_CreateSurface on a dangling address
+        // before the generation gate was added.
+        vulkan::service_surface_requests();
+        assert!(!vulkan::surface_request_pending(window));
+
+        // A request admitted before teardown must be cancelled, too.
+        let window = create_window(c"pending Vulkan initialization", 120, 90, 0).unwrap();
+        let key = window as usize;
+        assert!(matches!(
+            std::thread::spawn(move || vulkan::acquire_prepared_surface(
+                key as Window,
+                instance + 1,
+                None
+            ))
+            .join()
+            .unwrap(),
+            vulkan::PreparedSurface::Pending
+        ));
+        assert!(vulkan::surface_request_pending(window));
+        destroy_window(window);
+        assert!(!vulkan::surface_request_pending(window));
+        vulkan::service_surface_requests();
+    }
+
+    #[cfg(test)]
+    #[test]
+    fn frozen_popup_family_rejects_late_children_and_vulkan_initializers() {
+        if !crate::isolated::run_here() {
+            return;
+        }
+        let parent = create_window(c"SDL family reservation", 120, 90, 0).unwrap();
+        let id = window_id(parent);
+        assert_eq!(begin_window_family_destroy(parent), [parent]);
+        assert!(
+            begin_window_family_destroy(parent).is_empty(),
+            "double reservation"
+        );
+        assert!(create_popup_window(parent, 2, 2, 20, 20, flags::TOOLTIP).is_none());
+        let old = parent as usize;
+        assert!(matches!(
+            std::thread::spawn(move || vulkan::acquire_prepared_surface(
+                old as Window,
+                0xbeef,
+                None
+            ))
+            .join()
+            .unwrap(),
+            vulkan::PreparedSurface::Retired
+        ));
+        let retired = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+        assert!(!vulkan::hold_window_until(
+            parent,
+            std::sync::Arc::clone(&retired)
+        ));
+        assert!(vulkan::hold_window_for_teardown(parent, retired));
+        destroy_window(parent); // ordinary concurrent destruction cannot steal the reservation
+        assert_eq!(window_from_id(id), parent);
+        destroy_window_after_hooks(parent);
+        vulkan::service_surface_requests();
+        assert!(window_from_id(id).is_null());
+        assert_eq!(live_window_id(parent), None);
+    }
+
+    #[cfg(test)]
+    #[test]
+    fn parent_destruction_retires_popup_identity_and_waits_for_child_surface_token() {
+        if !crate::isolated::run_here() {
+            return;
+        }
+        let parent = create_window(c"popup lifetime parent", 160, 120, 0).unwrap();
+        let popup = create_popup_window(parent, 8, 8, 64, 40, flags::TOOLTIP)
+            .expect("real SDL tooltip popup");
+        let parent_id = window_id(parent);
+        let popup_id = window_id(popup);
+        assert_eq!(live_window_id(popup), Some(popup_id));
+        assert_eq!(window_from_id(popup_id), popup);
+
+        // A child initializer must retain the parent's native allocation,
+        // because SDL destroys both natively in one recursive operation.
+        let instance = 0x7650_7650u64;
+        vulkan::test_insert_ready_surface(popup, instance);
+        let popup_key = popup as usize;
+        let token = match std::thread::spawn(move || {
+            vulkan::acquire_prepared_surface(popup_key as Window, instance, None)
+        })
+        .join()
+        .unwrap()
+        {
+            vulkan::PreparedSurface::Ready(_, token) => token,
+            _ => panic!("child Vulkan initializer not ready"),
+        };
+        destroy_window(parent);
+        assert_eq!(live_window_id(parent), None);
+        assert_eq!(live_window_id(popup), None);
+        assert_eq!(presentation_window(popup), None);
+        assert!(!vulkan::surface_request_pending(popup));
+        assert!(matches!(
+            vulkan::acquire_prepared_surface(popup, instance + 1, None),
+            vulkan::PreparedSurface::Retired
+        ));
+        assert_eq!(window_from_id(parent_id), parent);
+        assert_eq!(window_from_id(popup_id), popup);
+        assert!(
+            vulkan::test_pending_windows()
+                .iter()
+                .any(|(root, tokens)| *root == parent as usize && *tokens >= 1),
+            "child initializer did not defer the parent's native destruction"
+        );
+        drop(token);
+        vulkan::service_surface_requests();
+        assert!(window_from_id(parent_id).is_null());
+        assert!(
+            window_from_id(popup_id).is_null(),
+            "SDL freed popup but left its identity registered"
+        );
+        assert_eq!(live_window_id(popup), None);
+
+        // The child may already have been *logically* destroyed on its own
+        // while its native allocation is held by Vulkan. Parent destruction
+        // must absorb the child's existing retirement token instead of
+        // recursively deleting its still-in-use SDL_Window.
+        let parent = create_window(c"deferred child parent", 160, 120, 0).unwrap();
+        let popup = create_popup_window(parent, 8, 8, 64, 40, flags::TOOLTIP).unwrap();
+        let parent_id = window_id(parent);
+        let popup_id = window_id(popup);
+        let instance = 0x7650_7651u64;
+        vulkan::test_insert_ready_surface(popup, instance);
+        let popup_key = popup as usize;
+        let token = match std::thread::spawn(move || {
+            vulkan::acquire_prepared_surface(popup_key as Window, instance, None)
+        })
+        .join()
+        .unwrap()
+        {
+            vulkan::PreparedSurface::Ready(_, token) => token,
+            _ => panic!("child Vulkan initializer not ready"),
+        };
+        destroy_window(popup);
+        assert_eq!(live_window_id(popup), None);
+        assert_eq!(window_from_id(popup_id), popup);
+        destroy_window(parent);
+        assert_eq!(window_from_id(parent_id), parent);
+        assert_eq!(window_from_id(popup_id), popup);
+        assert!(
+            vulkan::test_pending_windows()
+                .iter()
+                .any(|(root, count)| *root == parent as usize && *count >= 1),
+            "parent did not absorb an already-deferred child initializer"
+        );
+        assert!(
+            !vulkan::test_pending_windows()
+                .iter()
+                .any(|(root, _)| *root == popup as usize),
+            "child must not be destroyed twice after parent destruction"
+        );
+        drop(token);
+        vulkan::service_surface_requests();
+        assert!(window_from_id(parent_id).is_null());
+        assert!(window_from_id(popup_id).is_null());
+        assert_eq!(live_window_id(popup), None);
+    }
+
+    #[cfg(test)]
+    #[test]
+    fn destroying_an_sdl_window_invalidates_flags_before_pointer_reuse() {
+        if !crate::isolated::run_here() {
+            return;
+        }
+        if !super::may_pump() {
+            return;
+        }
+        let Some(window) = create_window(c"SDL cached Vulkan window", 160, 120, 0) else {
+            return;
+        };
+        // Another test thread may have claimed video since `may_pump`.
+        if !is_video_thread() {
+            return;
+        }
+        let first = presentation_window(window).expect("video owner sampled window");
+        assert_eq!(first.flags & flags::OPENGL, 0);
+        let key = window as usize;
+        destroy_window(window);
+        let queried_before = WINDOW_SNAPSHOT_QUERIES.load(std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(live_window_id(window), None);
+        assert_eq!(presentation_window(window), None);
+        assert_eq!(
+            WINDOW_SNAPSHOT_QUERIES.load(std::sync::atomic::Ordering::Relaxed),
+            queried_before,
+            "stale SDL pointer triggered a native metadata query"
+        );
+        assert!(
+            PRESENTATION_WINDOWS
+                .lock()
+                .unwrap()
+                .as_ref()
+                .is_none_or(|cached| !cached.contains_key(&key)),
+            "stale metadata after SDL_DestroyWindow"
+        );
+        // A later SDL allocation may reuse exactly the same address. Its
+        // graphics flags must be sampled from the replacement, not inherited.
+        let Some(opengl) = create_window(c"SDL OpenGL successor", 160, 120, flags::OPENGL) else {
+            return;
+        };
+        let successor = presentation_window(opengl).expect("fresh SDL window metadata");
+        assert_ne!(successor.flags & flags::OPENGL, 0);
+        destroy_window(opengl);
+    }
+
+    #[cfg(test)]
+    #[test]
+    fn retry_does_not_lose_an_initializer_window_lifetime_token() {
+        if !crate::isolated::run_here() {
+            return;
+        }
+        if !super::may_pump() {
+            return;
+        }
+        let Some(window) = create_window(c"SDL token lifetime", 64, 64, 0) else {
+            return;
+        };
+        // Another test thread may have claimed video since `may_pump`.
+        if !is_video_thread() {
+            return;
+        }
+        let key = (window as usize, 0xfeedu64);
+        vulkan::test_insert_ready_surface(window, key.1);
+        let token = match vulkan::acquire_prepared_surface(window, key.1, None) {
+            vulkan::PreparedSurface::Ready(_, token) => token,
+            _ => panic!("fixture must be ready"),
+        };
+        assert!(vulkan::retry_surface(window, key.1, None));
+        // destroy_window must not discard the token simply because retry
+        // replaced Taken with Pending.
+        destroy_window(window);
+        assert!(
+            vulkan::test_pending_windows()
+                .iter()
+                .any(|(ptr, tokens)| *ptr == key.0 && *tokens > 0)
+        );
+        drop(token);
+        vulkan::service_surface_requests();
+        assert!(
+            !vulkan::test_pending_windows()
+                .iter()
+                .any(|(ptr, _)| *ptr == key.0)
+        );
+    }
+
+    #[cfg(test)]
+    #[test]
+    fn a_hidden_windows_resize_reaches_its_presentation_snapshot() {
+        if !crate::isolated::run_here() {
+            return;
+        }
+        let Some(window) = create_window(c"hidden resize", 140, 90, flags::HIDDEN) else {
+            return;
+        };
+        assert_eq!(presentation_window(window).unwrap().logical_size, (140, 90));
+        assert!(set_window_size(window, 200, 120));
+        let live = window_size(window).unwrap();
+        let key = window as usize;
+        let seen = std::thread::spawn(move || presentation_window(key as Window))
+            .join()
+            .unwrap()
+            .expect("a published snapshot");
+        assert_eq!(
+            seen.logical_size, live,
+            "a worker saw a size SDL no longer has"
+        );
+        destroy_window(window);
+    }
+
+    #[cfg(test)]
+    #[test]
+    fn uncached_video_queries_are_rejected_on_non_owner_threads() {
+        if !super::may_pump() {
+            return;
+        }
+        let Some(window) = create_window(c"SDL threading metadata", 140, 90, 0) else {
+            return;
+        };
+        // Another test thread may have claimed video since `may_pump`.
+        if !is_video_thread() {
+            return;
+        }
+        let original = presentation_window(window).expect("SDL owner snapshot");
+        let key = window as usize;
+        let count = WINDOW_SNAPSHOT_QUERIES.load(std::sync::atomic::Ordering::Relaxed);
+        let from_worker = std::thread::spawn(move || presentation_window(key as Window));
+        assert_eq!(from_worker.join().expect("worker"), Some(original));
+        assert_eq!(
+            WINDOW_SNAPSHOT_QUERIES.load(std::sync::atomic::Ordering::Relaxed),
+            count,
+            "background thread must not invoke SDL video queries"
+        );
+        PRESENTATION_WINDOWS
+            .lock()
+            .unwrap()
+            .as_mut()
+            .unwrap()
+            .remove(&key);
+        let missing = std::thread::spawn(move || presentation_window(key as Window));
+        assert_eq!(missing.join().expect("worker"), None);
+        assert_eq!(
+            WINDOW_SNAPSHOT_QUERIES.load(std::sync::atomic::Ordering::Relaxed),
+            count
+        );
+        // No SDL_Vulkan_LoadLibrary/CreateSurface on a background thread,
+        // even if the window itself and requested instance are invalid.
+        let surface = std::thread::spawn(move || vulkan::create_surface(key as Window, 0, None));
+        assert_eq!(surface.join().expect("worker"), None);
+        destroy_window(window);
+    }
+
     /// The desktop mode's refresh rate in hertz, or `None` when SDL has no
     /// mode for the display - which is every host with no video subsystem.
     ///
@@ -3233,13 +4709,19 @@ pub mod video {
 
         pub const TEXT: c_int = 1;
         pub const CROSSHAIR: c_int = 3;
+        pub const NWSE_RESIZE: c_int = 5;
+        pub const NESW_RESIZE: c_int = 6;
         pub const EW_RESIZE: c_int = 7;
         pub const NS_RESIZE: c_int = 8;
         pub const NOT_ALLOWED: c_int = 10;
         pub const POINTER: c_int = 11;
+        pub const NW_RESIZE: c_int = 12;
         pub const N_RESIZE: c_int = 13;
+        pub const NE_RESIZE: c_int = 14;
         pub const E_RESIZE: c_int = 15;
+        pub const SE_RESIZE: c_int = 16;
         pub const S_RESIZE: c_int = 17;
+        pub const SW_RESIZE: c_int = 18;
         pub const W_RESIZE: c_int = 19;
     }
 
@@ -3341,14 +4823,22 @@ pub mod video {
         true
     }
 
-    /// `SDL_SetHint`, for the hints this tree has to override rather than
-    /// leave at SDL's default. False on a host whose SDL does not have it.
     pub fn set_hint(name: &CStr, value: &CStr) -> bool {
         let Some(f) = api().and_then(|a| a.SDL_SetHint) else {
             return false;
         };
         // SAFETY: two NUL-terminated strings.
         unsafe { f(name.as_ptr(), value.as_ptr()) }
+    }
+
+    pub fn get_hint(name: &CStr) -> Option<&CStr> {
+        let f = api().and_then(|a| a.SDL_GetHint)?;
+        let hint = unsafe { f(name.as_ptr()) };
+        if hint.is_null() {
+            None
+        } else {
+            unsafe { Some(CStr::from_ptr(hint)) }
+        }
     }
 
     /// Whether SDL's video driver is Wayland's. False until video has
@@ -3371,6 +4861,31 @@ pub mod video {
         let name = unsafe { f() };
         // SAFETY: a NUL-terminated string SDL keeps for the process.
         !name.is_null() && unsafe { CStr::from_ptr(name) } == expected
+    }
+
+    /// X11's live display and native window handle. Borrowed from SDL; do
+    /// not close the display, and finish host requests before destroying SDL.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn x11_native_window(window: Window) -> Option<(*mut c_void, u64)> {
+        if !is_x11() {
+            return None;
+        }
+        let api = api()?;
+        let (props, pointer, number) = (
+            api.SDL_GetWindowProperties?,
+            api.SDL_GetPointerProperty?,
+            api.SDL_GetNumberProperty?,
+        );
+        let properties = unsafe { props(window) };
+        let display = unsafe {
+            pointer(
+                properties,
+                c"SDL.window.x11.display".as_ptr(),
+                std::ptr::null_mut(),
+            )
+        };
+        let handle = unsafe { number(properties, c"SDL.window.x11.window".as_ptr(), 0) };
+        (!display.is_null() && handle != 0).then_some((display, handle as u64))
     }
 
     /// A window's `wl_display` and `wl_surface`, on Wayland.
@@ -3463,6 +4978,15 @@ pub mod video {
         let ptr = rect.as_ref().map_or(std::ptr::null(), |r| r as *const Rect);
         // SAFETY: a window from SDL, and null or a rectangle SDL copies.
         unsafe { f(window, ptr) }
+    }
+
+    /// The current pointer-confinement rectangle, if any. SDL owns the
+    /// returned memory, so copy the rectangle before returning it to a caller.
+    pub fn get_mouse_rect(window: Window) -> Option<Rect> {
+        let f = api()?.SDL_GetWindowMouseRect?;
+        // SAFETY: this is a valid SDL window, and the returned pointer, if
+        // non-null, refers to SDL-owned memory valid through this call.
+        unsafe { f(window).as_ref().copied() }
     }
 
     /// Whether `window` is holding the pointer, asked of SDL rather than
@@ -3807,4 +5331,94 @@ pub mod audio {
         };
         unsafe { f(stream) }
     }
+}
+
+#[cfg(test)]
+#[test]
+fn failed_sdl_vulkan_surface_retains_failure_classification_and_refusal() {
+    let window = 0x7e0411usize as Window;
+    // This fixture injects a synthetic SDL pointer to test failure state,
+    // rather than running an actual native surface initialization.
+    video::test_register_synthetic_window(window);
+    let instance = 0x7e0412u64;
+    video::vulkan::test_insert_failed_surface(
+        window,
+        instance,
+        "SDL Vulkan is not supported by this window",
+        false,
+    );
+    match video::vulkan::acquire_prepared_surface(window, instance, None) {
+        video::vulkan::PreparedSurface::Failed(reason) => {
+            assert_eq!(reason.reason, "SDL Vulkan is not supported by this window");
+            assert!(!reason.transient);
+        }
+        _ => panic!("SDL failure reason was discarded"),
+    }
+    video::vulkan::refuse_failed_surface(window, instance);
+    assert!(matches!(
+        video::vulkan::acquire_prepared_surface(window, instance, None),
+        video::vulkan::PreparedSurface::Abandoned,
+    ));
+    assert!(!video::vulkan::owns_window(window));
+    assert!(!video::vulkan::forget_window(window));
+
+    video::vulkan::test_insert_failed_surface(
+        window,
+        instance,
+        "temporarily unavailable during minimization",
+        true,
+    );
+    match video::vulkan::acquire_prepared_surface(window, instance, None) {
+        video::vulkan::PreparedSurface::Failed(reason) => assert!(reason.transient),
+        _ => panic!("transient SDL failure was discarded"),
+    }
+    assert!(video::vulkan::retry_surface(window, instance, None));
+    assert!(!video::vulkan::owns_window(window));
+    assert!(!video::vulkan::forget_window(window));
+    video::test_unregister_synthetic_window(window);
+}
+
+#[cfg(test)]
+#[test]
+fn failed_backend_surface_creation_preserves_vulkan_window_graphics_state() {
+    // SDL video ownership belongs to one OS thread per process, not the
+    // moving libtest thread pool. Run the real window assertion in isolation.
+    if !crate::isolated::run_here() {
+        return;
+    }
+    if !video::init_video() {
+        return; // Graphical preflight is required in the Vulkan integration suite.
+    }
+    assert!(video::is_video_thread());
+    // A real SDL_WINDOW_VULKAN window, with the backend failure injected
+    // after SDL changed the graphics flags, as SDL can do during conversion.
+    let window = video::create_window(
+        c"failed backend Vulkan conversion",
+        80,
+        64,
+        video::flags::VULKAN,
+    )
+    .expect("create real SDL Vulkan window");
+    assert_ne!(video::window_flags(window) & video::flags::VULKAN, 0);
+    let instance = 0x8e09311_u64;
+    video::vulkan::test_insert_failed_surface(
+        window,
+        instance,
+        "unsupported Vulkan surface backend",
+        false,
+    );
+    video::vulkan::test_publish_window_graphics_state(window);
+    assert!(
+        video::vulkan::owns_window(window),
+        "a failed backend must not lose SDL's earlier Vulkan conversion"
+    );
+    assert!(matches!(
+        video::vulkan::acquire_prepared_surface(window, instance, None),
+        video::vulkan::PreparedSurface::Failed(_),
+    ));
+    assert!(
+        !video::present_window(window, |_| true),
+        "CPU SDL window-surface fallback is illegal after Vulkan conversion"
+    );
+    video::destroy_window(window);
 }

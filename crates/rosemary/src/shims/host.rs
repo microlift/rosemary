@@ -9,6 +9,16 @@ type HostSymbols = BTreeMap<&'static str, u64>;
 static HOST_SYMBOLS: AtomicPtr<HostSymbols> = AtomicPtr::new(std::ptr::null_mut());
 static HOST_SYMBOL_WRITER: Mutex<()> = Mutex::new(());
 
+/// [`host_or_refuse`], except that the tree's own framework answers first when
+/// the builtin frameworks are selected: a host function would be handed this
+/// tree's objects, which it cannot read.
+pub(crate) fn builtin_or_host(symbol: &str) -> Result<u64> {
+    match crate::frameworks::symbol(darwin::c_name(symbol)) {
+        Some(address) => Ok(address),
+        None => host_or_refuse(symbol),
+    }
+}
+
 /// Resolve a shim entry point, refusing by name when this host has no answer.
 pub(crate) fn host_or_refuse(symbol: &str) -> Result<u64> {
     let name = darwin::c_name(symbol);

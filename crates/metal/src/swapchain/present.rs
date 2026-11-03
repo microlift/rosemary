@@ -55,6 +55,23 @@ pub(super) fn choose_present_mode(modes: &[vk::PresentModeKHR]) -> vk::PresentMo
     }
 }
 
+/// Match DXVK's Presenter::pickImageCount: IMMEDIATE uses the surface
+/// minimum, and queued modes request one more, subject to the WSI maximum.
+/// Rosemary does not expose DXVK's separate caller-requested image count.
+pub(super) fn desired_image_count(mode: vk::PresentModeKHR, minimum: u32, maximum: u32) -> u32 {
+    // DXVK Presenter::pickImageCount: IMMEDIATE needs no extra queued image.
+    let requested = if mode == vk::PresentModeKHR::IMMEDIATE {
+        minimum
+    } else {
+        minimum.saturating_add(1)
+    };
+    if maximum == 0 {
+        requested
+    } else {
+        requested.min(maximum)
+    }
+}
+
 /// `OPAQUE` where the surface offers it, which is what a game's window is -
 /// unless the window's corners are to be `see_through`, which takes
 /// `PRE_MULTIPLIED` wherever it is offered.
@@ -88,16 +105,35 @@ pub(super) fn clamp(
     frame: &appkit::view::Frame,
     extent: vk::Extent2D,
 ) -> Option<[vk::Offset3D; 2]> {
-    let left = frame.x.clamp(0, extent.width as i32);
-    let top = frame.y.clamp(0, extent.height as i32);
-    let right = frame
-        .x
-        .saturating_add(frame.width as i32)
-        .clamp(0, extent.width as i32);
-    let bottom = frame
+    let allowed = appkit::window::presentation_clip(frame.window);
+    clamp_to(frame, extent, allowed)
+}
+
+/// The intersection of the layer rectangle, the physical image and the
+/// accepted AppKit logical window. Keep the original Frame so source_of()
+/// samples the original texels instead of stretching a cropped image.
+pub(super) fn clamp_to(
+    frame: &appkit::view::Frame,
+    extent: vk::Extent2D,
+    allowed: Option<sdl3::Rect>,
+) -> Option<[vk::Offset3D; 2]> {
+    let clip = allowed.unwrap_or(sdl3::Rect {
+        x: 0,
+        y: 0,
+        w: extent.width as i32,
+        h: extent.height as i32,
+    });
+    let x0 = clip.x.clamp(0, extent.width as i32);
+    let y0 = clip.y.clamp(0, extent.height as i32);
+    let x1 = clip.x.saturating_add(clip.w).clamp(x0, extent.width as i32);
+    let y1 = clip
         .y
-        .saturating_add(frame.height as i32)
-        .clamp(0, extent.height as i32);
+        .saturating_add(clip.h)
+        .clamp(y0, extent.height as i32);
+    let left = frame.x.clamp(x0, x1);
+    let top = frame.y.clamp(y0, y1);
+    let right = frame.x.saturating_add(frame.width as i32).clamp(x0, x1);
+    let bottom = frame.y.saturating_add(frame.height as i32).clamp(y0, y1);
     (right > left && bottom > top).then_some([
         vk::Offset3D {
             x: left,
@@ -112,16 +148,23 @@ pub(super) fn clamp(
     ])
 }
 
-/// The whole of an image's level zero, as a blit's pair of offsets.
-pub(super) fn extent_of(image: &GpuImage) -> [vk::Offset3D; 2] {
-    [
-        vk::Offset3D { x: 0, y: 0, z: 0 },
-        vk::Offset3D {
-            x: image.width.max(1) as i32,
-            y: image.height.max(1) as i32,
-            z: 1,
-        },
-    ]
+/// Physical swapchain bounds intersected with the logical NSWindow.
+/// The accumulator may contain DMA-BUF overlay pixels beyond this area;
+/// only this region is transferred into the final presented image.
+pub(super) fn logical_image_clip(
+    window: sdl3::Window,
+    extent: vk::Extent2D,
+) -> Option<[vk::Offset3D; 2]> {
+    let full = appkit::view::Frame {
+        window,
+        x: 0,
+        y: 0,
+        width: extent.width,
+        height: extent.height,
+        window_width: extent.width,
+        window_height: extent.height,
+    };
+    clamp(&full, extent)
 }
 
 /// The part of a `width` by `height` source, which is scaled over the whole
@@ -140,6 +183,38 @@ pub(super) fn source_of(
         z: at.z,
     };
     [map(into[0]), map(into[1])]
+}
+
+/// Where a layer covering its window goes in an image of `extent`, and the
+/// part of a `source`-sized drawable that lands there.
+pub(super) fn direct_blit_to(
+    frame: &appkit::view::Frame,
+    extent: vk::Extent2D,
+    allowed: Option<sdl3::Rect>,
+    source: (u32, u32),
+) -> Option<([vk::Offset3D; 2], [vk::Offset3D; 2])> {
+    // The frame and clip are in window pixels; the image may not be yet.
+    let sx = f64::from(extent.width) / f64::from(frame.window_width.max(1));
+    let sy = f64::from(extent.height) / f64::from(frame.window_height.max(1));
+    let x = |v: i32| (f64::from(v) * sx).round() as i32;
+    let y = |v: i32| (f64::from(v) * sy).round() as i32;
+    let scaled = appkit::view::Frame {
+        window: frame.window,
+        x: x(frame.x),
+        y: y(frame.y),
+        width: (x(frame.x.saturating_add(frame.width as i32)) - x(frame.x)).max(0) as u32,
+        height: (y(frame.y.saturating_add(frame.height as i32)) - y(frame.y)).max(0) as u32,
+        window_width: extent.width,
+        window_height: extent.height,
+    };
+    let allowed = allowed.map(|clip| sdl3::Rect {
+        x: x(clip.x),
+        y: y(clip.y),
+        w: x(clip.x.saturating_add(clip.w)) - x(clip.x),
+        h: y(clip.y.saturating_add(clip.h)) - y(clip.y),
+    });
+    let into = clamp_to(&scaled, extent, allowed)?;
+    Some((source_of(into, &scaled, source), into))
 }
 
 /// One colour mip level, which is all any image here has.

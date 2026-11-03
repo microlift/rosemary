@@ -8,6 +8,7 @@ mod queue;
 mod render;
 mod retire;
 mod state;
+mod visibility;
 
 use bind::*;
 use blit::*;
@@ -19,6 +20,7 @@ use queue::*;
 use render::*;
 use retire::*;
 use state::*;
+use visibility::*;
 
 use objc::address::AddressSet;
 
@@ -143,6 +145,11 @@ pub(crate) struct CommandBuffer {
     pub pool: vk::CommandPool,
     pub command_buffer: vk::CommandBuffer,
     pub fence: vk::Fence,
+    /// Recording already ended at an encoded event, each its own submission
+    /// batch; the first holds the context's command buffer.
+    batches: Vec<gpu::Batch>,
+    /// Event values the batch now recording waits for.
+    waits: Vec<(vk::Semaphore, u64)>,
     descriptor_pools: Vec<vk::DescriptorPool>,
     /// Objects the recording refers to, retained until the work completes.
     /// Each is retained once however often it is bound: a retain is a global
@@ -173,11 +180,15 @@ pub(crate) struct CommandBuffer {
     recording: bool,
     /// `ROSEMARY_METAL_PROFILE`: shared with its parallel sub-encoders.
     profile: Option<Arc<crate::profile::Profile>>,
+    occlusion: Occlusion,
 }
 
 pub(crate) struct Encoder {
     pub command_buffer: Id,
     pub kind: Kind,
+    /// `MTLDispatchTypeConcurrent`: dispatches may overlap, and the guest
+    /// orders them with memory barriers. Every other compute encoder is serial.
+    concurrent: bool,
     compute_pipeline: Id,
     render_pipeline: Id,
     depth_state: Id,
@@ -209,6 +220,8 @@ pub(crate) struct Encoder {
     /// and the ordinal the capture of this pass is named by.
     capture_targets: Vec<crate::capture::Target>,
     capture_pass: Option<u64>,
+    /// Where the pass being recorded writes its visibility results.
+    visibility: Option<VisibilityTarget>,
     /// The pipeline variant the last draw or dispatch used, with the state
     /// which chose it, so a run of draws with one state asks no cache.
     render_variant: Option<(Id, RenderVariantKey, vk::Pipeline)>,
@@ -404,6 +417,8 @@ impl Default for RenderPassDescriptor {
             depth_object: std::ptr::null_mut(),
             stencil_object: std::ptr::null_mut(),
             visibility_result_buffer: std::ptr::null_mut(),
+            visibility_result_type: 0,
+            render_target_array_length: 0,
         }
     }
 }
@@ -473,6 +488,15 @@ pub(crate) fn install() {
     object::register::<CommandQueue>(c"RosemaryMTLCommandQueue");
     object::register::<CommandBuffer>(c"RosemaryMTLCommandBuffer");
     object::register::<Encoder>(c"RosemaryMTLCommandEncoder");
+    let descriptor =
+        object::register::<queue::CommandBufferDescriptor>(c"MTLCommandBufferDescriptor");
+    methods!(descriptor, {
+        "init" => queue::command_buffer_descriptor_init, c"@16@0:8";
+        "retainedReferences" => queue::retained_references, c"B16@0:8";
+        "setRetainedReferences:" => queue::set_retained_references, c"v20@0:8B16";
+        "errorOptions" => queue::error_options, c"Q16@0:8";
+        "setErrorOptions:" => queue::set_error_options, c"v24@0:8Q16";
+    });
 
     let queue = objc::class::lookup(c"RosemaryMTLCommandQueue").expect("just registered");
     methods!(queue, {
@@ -480,6 +504,7 @@ pub(crate) fn install() {
         "commandBuffer" => new_command_buffer, c"@16@0:8";
         "dealloc" => queue_dealloc, c"v16@0:8";
         "commandBufferWithUnretainedReferences" => new_command_buffer, c"@16@0:8";
+        "commandBufferWithDescriptor:" => new_command_buffer_with_descriptor, c"@24@0:8@16";
         "setLabel:" => crate::no_op, c"v24@0:8@16";
     });
 
@@ -492,6 +517,8 @@ pub(crate) fn install() {
         "addScheduledHandler:" => add_handler, c"v24@0:8@?16";
         "addCompletedHandler:" => add_handler, c"v24@0:8@?16";
         "commit" => commit, c"v16@0:8";
+        "encodeSignalEvent:value:" => encode_signal_event, c"v32@0:8@16Q24";
+        "encodeWaitForEvent:value:" => encode_wait_for_event, c"v32@0:8@16Q24";
         "dealloc" => command_buffer_dealloc, c"v16@0:8";
         "waitUntilCompleted" => wait_until_completed, c"v16@0:8";
         "waitUntilScheduled" => wait_until_scheduled, c"v16@0:8";
@@ -553,8 +580,11 @@ pub(crate) fn install() {
         // which is everything a fence could ask for.
         "updateFence:afterStages:" => crate::no_op, c"v32@0:8@16Q24";
         "waitForFence:beforeStages:" => crate::no_op, c"v32@0:8@16Q24";
-        "memoryBarrierWithScope:" => crate::no_op, c"v24@0:8Q16";
-        "memoryBarrierWithScope:afterStages:beforeStages:" => crate::no_op, c"v40@0:8Q16Q24Q32";
+        "memoryBarrierWithScope:" => memory_barrier, c"v24@0:8Q16";
+        "memoryBarrierWithScope:afterStages:beforeStages:" => memory_barrier, c"v40@0:8Q16Q24Q32";
+        "memoryBarrierWithResources:count:" => memory_barrier, c"v32@0:8^@16Q24";
+        "memoryBarrierWithResources:count:afterStages:beforeStages:" => memory_barrier,
+            c"v48@0:8^@16Q24Q32Q40";
         "useResource:usage:stages:" => crate::no_op, c"v40@0:8@16Q24Q32";
         "useHeap:" => crate::no_op, c"v24@0:8@16";
         "setStencilFrontReferenceValue:backReferenceValue:" => set_stencil_references,
@@ -577,7 +607,7 @@ pub(crate) fn install() {
         "insertDebugSignpost:" => crate::no_op, c"v24@0:8@16";
         "setLabel:" => crate::no_op, c"v24@0:8@16";
         "useResource:usage:" => crate::no_op, c"v32@0:8@16Q24";
-        "setVisibilityResultMode:offset:" => crate::no_op, c"v32@0:8Q16Q24";
+        "setVisibilityResultMode:offset:" => set_visibility_result_mode, c"v32@0:8Q16Q24";
     });
 
     let pass = object::register::<RenderPassDescriptor>(c"MTLRenderPassDescriptor");
@@ -597,10 +627,13 @@ pub(crate) fn install() {
         "stencilAttachment" => pass_single_attachment, c"@16@0:8";
         "visibilityResultBuffer" => pass_visibility_result_buffer, c"@16@0:8";
         "setVisibilityResultBuffer:" => set_pass_visibility_result_buffer, c"v24@0:8@16";
+        "visibilityResultType" => pass_visibility_result_type, c"Q16@0:8";
+        "setVisibilityResultType:" => set_pass_visibility_result_type, c"v24@0:8Q16";
         "setRenderTargetWidth:" => crate::no_op, c"v24@0:8Q16";
         "setRenderTargetHeight:" => crate::no_op, c"v24@0:8Q16";
         "setDefaultRasterSampleCount:" => crate::no_op, c"v24@0:8Q16";
         "setRenderTargetArrayLength:" => set_render_target_array_length, c"v24@0:8Q16";
+        "renderTargetArrayLength" => render_target_array_length, c"Q16@0:8";
     });
     methods!(pass, {
         "setDepthAttachment:" => set_pass_single_attachment, c"v24@0:8@16";
@@ -619,6 +652,8 @@ pub(crate) fn install() {
 
     methods!(command, {
         "computeCommandEncoder" => new_compute_encoder, c"@16@0:8";
+        "computeCommandEncoderWithDispatchType:" => new_compute_encoder_with_dispatch_type,
+            c"@24@0:8Q16";
         "blitCommandEncoder" => new_blit_encoder, c"@16@0:8";
         "renderCommandEncoderWithDescriptor:" => new_render_encoder, c"@24@0:8@16";
         "parallelRenderCommandEncoderWithDescriptor:" => new_parallel_encoder,

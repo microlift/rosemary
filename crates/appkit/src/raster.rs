@@ -32,6 +32,14 @@ impl Bitmap {
     }
 }
 
+/// The uniform type identifiers of the containers [`decode`] reads.
+pub const TYPE_IDENTIFIERS: &[&str] = &[
+    "com.microsoft.bmp",
+    "public.tiff",
+    "public.png",
+    "com.apple.icns",
+];
+
 /// Decode whatever `bytes` is, or `None` for a container this cannot read.
 pub fn decode(bytes: &[u8]) -> Option<Bitmap> {
     if bytes.starts_with(b"BM") {
@@ -275,6 +283,37 @@ unsafe extern "C" {
         source: *const u8,
         source_len: std::ffi::c_ulong,
     ) -> std::ffi::c_int;
+}
+
+/// A whole zlib stream inflated, for data whose inflated size is not known
+/// up front: the one-shot call is retried with a larger buffer until it fits.
+pub(crate) fn inflate(source: &[u8]) -> Option<Vec<u8>> {
+    const Z_OK: std::ffi::c_int = 0;
+    const Z_BUF_ERROR: std::ffi::c_int = -5;
+    let mut capacity = source.len().saturating_mul(4).max(1024);
+    loop {
+        let mut out = vec![0u8; capacity];
+        let mut length = capacity as std::ffi::c_ulong;
+        // SAFETY: both buffers are live and their lengths are the ones passed.
+        let status = unsafe {
+            uncompress(
+                out.as_mut_ptr(),
+                &mut length,
+                source.as_ptr(),
+                source.len() as std::ffi::c_ulong,
+            )
+        };
+        match status {
+            Z_OK => {
+                out.truncate(length as usize);
+                return Some(out);
+            }
+            // Short of room only when the buffer was filled; otherwise the
+            // input ran out, which more room does not fix.
+            Z_BUF_ERROR if length as usize == capacity && capacity < 256 << 20 => capacity *= 4,
+            _ => return None,
+        }
+    }
 }
 
 const PNG_SIGNATURE: &[u8] = b"\x89PNG\r\n\x1a\n";

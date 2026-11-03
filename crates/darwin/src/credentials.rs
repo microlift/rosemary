@@ -70,6 +70,7 @@ pub fn offered() -> Credentials {
 
 /// Apply `change`, through the server when there is one.
 fn apply(change: Change) -> c_int {
+    let _host = crate::syscall::ScopedHostSyscallContext::new();
     let result = match server::client::change_credentials(change.clone()) {
         Some(result) => result,
         None => {

@@ -23,8 +23,21 @@ use crate::gpu::{self, Gpu, GpuImage, ImageDescription};
 /// The shader's workgroup edge.
 const GROUP: u32 = 8;
 
-/// The most overlays one window blends in a frame; one descriptor set each.
+/// The most overlays in one blend pass; one descriptor set each.
 const MOST: usize = 8;
+
+pub(crate) const fn overlay_batch_capacity() -> usize {
+    MOST
+}
+
+pub(crate) fn check_overlay_capacity(count: usize) -> Result<(), String> {
+    if count > MOST {
+        return Err(format!(
+            "DMA blend requires {count} overlays, but this pass supports {MOST}"
+        ));
+    }
+    Ok(())
+}
 
 /// DRM fourccs the pass can sample, the Vulkan format each is read as, and
 /// whether its fourth byte is padding rather than alpha.
@@ -153,7 +166,50 @@ unsafe impl Send for Imported {}
 /// destroyed at the next blend, once the one that used it last has finished.
 static IMPORTED: Mutex<Vec<Imported>> = Mutex::new(Vec::new());
 
-fn import(gpu: &'static Gpu, picture: &Arc<Dmabuf>) -> Result<(vk::Image, vk::ImageView), String> {
+#[cfg(test)]
+static TEST_IMPORT_ATTEMPTS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+#[cfg(test)]
+pub(crate) fn import_attempts_for_test() -> usize {
+    TEST_IMPORT_ATTEMPTS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+#[cfg(test)]
+static INJECT_IMPORT_FAILURE_ONCE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+#[cfg(test)]
+static INJECT_UNSUPPORTED_IMPORT_ONCE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+#[cfg(test)]
+pub(crate) fn fail_next_dma_import_for_test() {
+    INJECT_IMPORT_FAILURE_ONCE.store(true, std::sync::atomic::Ordering::Release);
+}
+#[cfg(test)]
+pub(crate) fn fail_next_unsupported_dma_import_for_test() {
+    INJECT_UNSUPPORTED_IMPORT_ONCE.store(true, std::sync::atomic::Ordering::Release);
+}
+
+fn import(
+    gpu: &'static Gpu,
+    picture: &Arc<Dmabuf>,
+) -> Result<(vk::Image, vk::ImageView), (ImportFailureKind, String)> {
+    #[cfg(test)]
+    TEST_IMPORT_ATTEMPTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    #[cfg(test)]
+    if INJECT_IMPORT_FAILURE_ONCE.swap(false, std::sync::atomic::Ordering::AcqRel) {
+        return Err((
+            ImportFailureKind::Retryable,
+            "injected temporary DMA allocation failure".into(),
+        ));
+    }
+    #[cfg(test)]
+    if INJECT_UNSUPPORTED_IMPORT_ONCE.swap(false, std::sync::atomic::Ordering::AcqRel) {
+        return Err((
+            ImportFailureKind::UnsupportedProducer,
+            "injected unsupported DMA producer".into(),
+        ));
+    }
     let mut imported = IMPORTED.lock().expect("imported dma-bufs");
     if let Some(found) = imported
         .iter()
@@ -161,22 +217,144 @@ fn import(gpu: &'static Gpu, picture: &Arc<Dmabuf>) -> Result<(vk::Image, vk::Im
     {
         return Ok((found.image, found.view));
     }
-    let made = make(gpu, picture)?;
+    let made = make(gpu, picture).map_err(|error| {
+        let kind = if error.kind == ImportFailureKind::UnsupportedProducer {
+            error.kind
+        } else {
+            import_failure_kind(gpu, picture, &error.reason)
+        };
+        (kind, error.reason)
+    })?;
     let handles = (made.image, made.view);
     imported.push(made);
     Ok(handles)
 }
 
-fn make(gpu: &'static Gpu, picture: &Arc<Dmabuf>) -> Result<Imported, String> {
+struct ImportMakeError {
+    kind: ImportFailureKind,
+    reason: String,
+}
+
+impl ImportMakeError {
+    fn unsupported(reason: impl Into<String>) -> Self {
+        Self {
+            kind: ImportFailureKind::UnsupportedProducer,
+            reason: reason.into(),
+        }
+    }
+    fn retryable(reason: impl Into<String>) -> Self {
+        Self {
+            kind: ImportFailureKind::Retryable,
+            reason: reason.into(),
+        }
+    }
+}
+
+impl From<String> for ImportMakeError {
+    fn from(reason: String) -> Self {
+        Self::retryable(reason)
+    }
+}
+impl From<&str> for ImportMakeError {
+    fn from(reason: &str) -> Self {
+        Self::retryable(reason)
+    }
+}
+
+fn permanent_vk_import_error(error: vk::Result) -> bool {
+    matches!(
+        error,
+        vk::Result::ERROR_FORMAT_NOT_SUPPORTED
+            | vk::Result::ERROR_FEATURE_NOT_PRESENT
+            | vk::Result::ERROR_INVALID_DRM_FORMAT_MODIFIER_PLANE_LAYOUT_EXT
+            | vk::Result::ERROR_INVALID_EXTERNAL_HANDLE
+    )
+}
+
+fn vk_import_error(stage: &str, error: vk::Result) -> ImportMakeError {
+    let reason = format!("{stage} failed with {error:?}");
+    if permanent_vk_import_error(error) {
+        ImportMakeError::unsupported(reason)
+    } else {
+        ImportMakeError::retryable(reason)
+    }
+}
+
+fn modifier_plane_count(
+    instance: &ash::Instance,
+    physical: vk::PhysicalDevice,
+    format: vk::Format,
+    modifier: u64,
+) -> Option<u32> {
+    let mut list = vk::DrmFormatModifierPropertiesListEXT::default();
+    let mut properties = vk::FormatProperties2::default().push_next(&mut list);
+    unsafe { instance.get_physical_device_format_properties2(physical, format, &mut properties) };
+    let mut entries = vec![
+        vk::DrmFormatModifierPropertiesEXT::default();
+        list.drm_format_modifier_count as usize
+    ];
+    let mut list = vk::DrmFormatModifierPropertiesListEXT::default()
+        .drm_format_modifier_properties(&mut entries);
+    let mut properties = vk::FormatProperties2::default().push_next(&mut list);
+    unsafe { instance.get_physical_device_format_properties2(physical, format, &mut properties) };
+    let filled = list.drm_format_modifier_count as usize;
+    entries.truncate(filled);
+    entries
+        .iter()
+        .find(|entry| entry.drm_format_modifier == modifier)
+        .map(|entry| entry.drm_format_modifier_plane_count)
+}
+
+fn make(gpu: &'static Gpu, picture: &Arc<Dmabuf>) -> Result<Imported, ImportMakeError> {
     let support = gpu
         .dmabuf
         .as_ref()
-        .ok_or("the device cannot import dma-bufs")?;
+        .ok_or_else(|| ImportMakeError::unsupported("the device cannot import dma-bufs"))?;
     let &(_, format, opaque) = FORMATS
         .iter()
         .find(|(code, _, _)| *code == picture.fourcc)
-        .ok_or_else(|| format!("fourcc {:#x} is not one the pass samples", picture.fourcc))?;
-    let first = picture.planes.first().ok_or("a dma-buf with no planes")?;
+        .ok_or_else(|| {
+            ImportMakeError::unsupported(format!(
+                "fourcc {:#x} is not one the pass samples",
+                picture.fourcc
+            ))
+        })?;
+    // The advertised modifier list already verifies sampled-image features
+    // AND external DMA_BUF importability for the selected physical device.
+    // An unsupported tuple cannot become valid through retrying allocations.
+    if let Some(instance) = crate::vulkan::instance()
+        && !modifiers(instance, gpu.physical, format).contains(&picture.modifier)
+    {
+        return Err(ImportMakeError::unsupported(
+            "the device cannot sample this DRM format/modifier as an external DMA-BUF",
+        ));
+    }
+    if let Some(instance) = crate::vulkan::instance()
+        && let Some(planes) = modifier_plane_count(instance, gpu.physical, format, picture.modifier)
+        && picture.planes.len() != planes as usize
+    {
+        return Err(ImportMakeError::unsupported(format!(
+            "DRM modifier requires {planes} planes, producer supplied {}",
+            picture.planes.len()
+        )));
+    }
+    if picture.planes.iter().any(|plane| plane.stride == 0) {
+        return Err(ImportMakeError::unsupported("zero DMA-BUF plane stride"));
+    }
+    if picture.modifier == 0
+        && picture
+            .planes
+            .iter()
+            .any(|plane| plane.stride < picture.width.saturating_mul(4))
+    {
+        return Err(ImportMakeError::unsupported(
+            "linear DMA-BUF stride shorter than one row",
+        ));
+    }
+    let first = picture
+        .planes
+        .first()
+        .ok_or_else(|| ImportMakeError::unsupported("a dma-buf with no planes"))?;
     // One allocation holds every plane; planes in separate buffers would
     // need a disjoint image.
     if picture
@@ -184,7 +362,9 @@ fn make(gpu: &'static Gpu, picture: &Arc<Dmabuf>) -> Result<Imported, String> {
         .iter()
         .any(|plane| !same_file(plane.fd.as_raw_fd(), first.fd.as_raw_fd()))
     {
-        return Err("a dma-buf whose planes are in separate buffers".into());
+        return Err(ImportMakeError::unsupported(
+            "a dma-buf whose planes are in separate buffers",
+        ));
     }
     let layouts: Vec<vk::SubresourceLayout> = picture
         .planes
@@ -220,7 +400,7 @@ fn make(gpu: &'static Gpu, picture: &Arc<Dmabuf>) -> Result<Imported, String> {
     let device = &gpu.device;
     // SAFETY: a well-formed create info on this live device.
     let image = unsafe { device.create_image(&info, None) }
-        .map_err(|error| format!("vkCreateImage for a dma-buf failed with {error:?}"))?;
+        .map_err(|error| vk_import_error("vkCreateImage for a dma-buf", error))?;
     let image = gpu::Guard::new(image, |image| {
         // SAFETY: an image of this device's, referred to by nothing.
         unsafe { device.destroy_image(image, None) };
@@ -236,12 +416,14 @@ fn make(gpu: &'static Gpu, picture: &Arc<Dmabuf>) -> Result<Imported, String> {
             &mut accepted,
         )
     }
-    .map_err(|error| format!("vkGetMemoryFdPropertiesKHR failed with {error:?}"))?;
+    .map_err(|error| vk_import_error("vkGetMemoryFdPropertiesKHR", error))?;
     // SAFETY: the image was just created by this device.
     let requirements = unsafe { device.get_image_memory_requirements(*image) };
     let types = requirements.memory_type_bits & accepted.memory_type_bits;
     if types == 0 {
-        return Err("no memory type both the image and the dma-buf allow".into());
+        return Err(ImportMakeError::unsupported(
+            "no memory type both the image and the dma-buf allow",
+        ));
     }
     let mut dedicated = vk::MemoryDedicatedAllocateInfo::default().image(*image);
     let mut import = vk::ImportMemoryFdInfoKHR::default()
@@ -263,7 +445,7 @@ fn make(gpu: &'static Gpu, picture: &Arc<Dmabuf>) -> Result<Imported, String> {
     });
     // SAFETY: fresh, unbound image and memory from this device.
     unsafe { device.bind_image_memory(*image, *memory, 0) }
-        .map_err(|error| format!("vkBindImageMemory for a dma-buf failed with {error:?}"))?;
+        .map_err(|error| vk_import_error("vkBindImageMemory for a dma-buf", error))?;
     let alpha = match opaque {
         true => vk::ComponentSwizzle::ONE,
         false => vk::ComponentSwizzle::IDENTITY,
@@ -323,17 +505,35 @@ fn color_range() -> vk::ImageSubresourceRange {
 /// Where one overlay goes, as the shader's push constants.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq)]
-struct Placement {
-    x: i32,
-    y: i32,
-    width: u32,
-    height: u32,
-    target_width: u32,
-    target_height: u32,
+pub(crate) struct Placement {
+    pub x: i32,
+    pub y: i32,
+    pub width: u32,
+    pub height: u32,
+    pub target_width: u32,
+    pub target_height: u32,
+    /// The dispatched region of the placement, in window pixels. The source
+    /// UV stays relative to the *full* placement even when clipped.
+    pub clip_x: i32,
+    pub clip_y: i32,
+    pub clip_width: u32,
+    pub clip_height: u32,
+    /// Core Animation opacity multiplies the entire premultiplied source.
+    pub opacity: f32,
+    /// Only the scene compositor uses this to clear a damaged subrectangle.
+    /// The DMA-BUF overlay path always uses source-over (false).
+    pub clear: bool,
+    /// Index and length of consecutive rounded CA ancestor masks in the
+    /// scene's per-frame GPU clip buffer (zero for ordinary overlays).
+    pub round_start: u32,
+    pub round_count: u32,
+    /// The sampled source has Vulkan's implicit sRGB-to-linear decode, but
+    /// the scene accumulator stores display-referred RGBA8 bytes.
+    pub sampled_srgb: u32,
 }
 
 impl Placement {
-    fn bytes(&self) -> [u8; 24] {
+    pub(crate) fn bytes(&self) -> [u8; 60] {
         let words = [
             self.x as u32,
             self.y as u32,
@@ -341,8 +541,17 @@ impl Placement {
             self.height,
             self.target_width,
             self.target_height,
+            self.clip_x as u32,
+            self.clip_y as u32,
+            self.clip_width,
+            self.clip_height,
+            self.opacity.to_bits(),
+            u32::from(self.clear),
+            self.round_start,
+            self.round_count,
+            self.sampled_srgb,
         ];
-        let mut bytes = [0; 24];
+        let mut bytes = [0; 60];
         for (at, word) in words.into_iter().enumerate() {
             bytes[at * 4..at * 4 + 4].copy_from_slice(&word.to_ne_bytes());
         }
@@ -362,8 +571,54 @@ struct Pass {
 // SAFETY: Vulkan handles, used under `PASSES`.
 unsafe impl Send for Pass {}
 
-/// One pass per device, made on first use and kept for the run.
+/// Free descriptor/pipeline passes. A pass is exclusively leased through its
+/// final GPU completion fence: no other window can modify its descriptor sets
+/// while a previous command buffer still uses them. The registry mutex is
+/// held only while checking out or returning a pass, never during GPU waits.
 static PASSES: Mutex<Vec<Pass>> = Mutex::new(Vec::new());
+
+struct PassLease(Option<Pass>);
+
+impl std::ops::Deref for PassLease {
+    type Target = Pass;
+    fn deref(&self) -> &Pass {
+        self.0.as_ref().expect("owned overlay pass")
+    }
+}
+
+impl Drop for PassLease {
+    fn drop(&mut self) {
+        if let Some(pass) = self.0.take() {
+            PASSES.lock().expect("overlay passes").push(pass);
+        }
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn available_passes_for_test(gpu: &'static Gpu) -> usize {
+    PASSES
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|pass| std::ptr::eq(pass.gpu, gpu))
+        .count()
+}
+
+fn lease_pass(gpu: &'static Gpu) -> Result<PassLease, String> {
+    let cached = {
+        let mut registry = PASSES.lock().expect("overlay passes");
+        registry
+            .iter()
+            .position(|pass| std::ptr::eq(pass.gpu, gpu))
+            .map(|i| registry.swap_remove(i))
+    };
+    // A second worker obtains independent Vulkan descriptor resources. The
+    // expensive first-time Pass::new is also outside the shared registry lock.
+    Ok(PassLease(Some(match cached {
+        Some(pass) => pass,
+        None => Pass::new(gpu)?,
+    })))
+}
 
 impl Pass {
     fn new(gpu: &'static Gpu) -> Result<Self, String> {
@@ -477,33 +732,94 @@ pub(crate) fn target_description(width: u32, height: u32) -> ImageDescription {
     }
 }
 
-/// Copy `store` into `target`, of the same size, and blend `overlays` over
-/// it, waiting until that is done. Overlays that could not be imported are
-/// left out and returned.
-pub(crate) fn blend<'a>(
+/// An AppKit native base can be initialized inside the *same* synchronous
+/// GPU submission as its DMA overlay blend. Staging buffers remain owned by
+/// the caller until this operation has completed its GPU fence.
+#[derive(Clone, Copy)]
+pub(crate) enum StoreInit {
+    Transparent,
+    Upload(vk::Buffer),
+    UploadRegion {
+        buffer: vk::Buffer,
+        x: u32,
+        y: u32,
+        width: u32,
+        height: u32,
+    },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ImportFailureKind {
+    // No path through this import backend can represent this producer on the
+    // current device. Other producers may still be supported.
+    UnsupportedProducer,
+    // Vulkan allocation, fd availability, descriptor pressure or a driver
+    // error may recover; retry this producer on a future transaction.
+    Retryable,
+}
+
+#[derive(Debug)]
+pub(crate) struct ImportRefusal {
+    pub kind: ImportFailureKind,
+    pub reason: String,
+    pub producer_view: usize,
+}
+
+fn import_failure_kind(gpu: &'static Gpu, picture: &Dmabuf, reason: &str) -> ImportFailureKind {
+    let format = FORMATS.iter().find(|(code, _, _)| *code == picture.fourcc);
+    let static_mismatch = reason.contains("ERROR_FORMAT_NOT_SUPPORTED")
+        || reason.contains("ERROR_FEATURE_NOT_PRESENT")
+        || gpu.dmabuf.is_none()
+        || format.is_none()
+        || picture.planes.first().is_none_or(|first| {
+            picture
+                .planes
+                .iter()
+                .any(|plane| !same_file(plane.fd.as_raw_fd(), first.fd.as_raw_fd()))
+        })
+        || format.is_some_and(|(_, format, _)| {
+            crate::vulkan::instance().is_some_and(|instance| {
+                !modifiers(instance, gpu.physical, *format).contains(&picture.modifier)
+            })
+        });
+    if static_mismatch {
+        ImportFailureKind::UnsupportedProducer
+    } else {
+        ImportFailureKind::Retryable
+    }
+}
+
+/// Copy a retained source into a target and blend DMA overlays in order.
+/// The caller owns any image/upload leases touched by this blend. The pass,
+/// producer pictures and these leases retire together on the submission fence.
+pub(crate) fn blend_with_store_init_owned<R: Send + 'static>(
     gpu: &'static Gpu,
     store: &GpuImage,
     target: &GpuImage,
-    overlays: &'a [GpuOverlay],
-) -> Result<Vec<&'a GpuOverlay>, String> {
-    let mut passes = PASSES.lock().expect("overlay passes");
-    if !passes.iter().any(|pass| std::ptr::eq(pass.gpu, gpu)) {
-        passes.push(Pass::new(gpu)?);
-    }
-    let pass = passes
-        .iter()
-        .find(|pass| std::ptr::eq(pass.gpu, gpu))
-        .expect("made above");
+    overlays: &[GpuOverlay],
+    base: Option<StoreInit>,
+    initialize_target: bool,
+    retained: R,
+) -> Result<Vec<ImportRefusal>, String> {
+    // Never accept a partial scene: descriptor sets only cover MOST sources.
+    check_overlay_capacity(overlays.len())?;
+    let pass = lease_pass(gpu)?;
     prune(gpu);
 
     let mut refused = Vec::new();
     let mut placed = Vec::new();
-    for overlay in overlays.iter().take(MOST) {
+    for overlay in overlays {
         match import(gpu, &overlay.picture) {
             Ok((image, view)) => placed.push((overlay, image, view)),
-            Err(reason) => {
-                gpu::trace_once(format!("a dma-buf overlay was not imported: {reason}"));
-                refused.push(overlay);
+            Err((kind, reason)) => {
+                gpu::trace_once(format!(
+                    "a dma-buf overlay was not imported ({kind:?}): {reason}"
+                ));
+                refused.push(ImportRefusal {
+                    kind,
+                    reason,
+                    producer_view: overlay.view,
+                });
             }
         }
     }
@@ -537,159 +853,278 @@ pub(crate) fn blend<'a>(
         false => vk::QUEUE_FAMILY_EXTERNAL,
     };
     let (width, height) = (store.width, store.height);
-    gpu.one_shot(|device, command_buffer| {
-        // SAFETY: recording into the call's command buffer; the store and
-        // target are in GENERAL from creation, and each imported image is
-        // taken from its producer and handed back around its read.
-        unsafe {
-            // The store's upload lands, and the last present's read of the
-            // target is done, before the copy.
-            general_barrier(
-                device,
-                command_buffer,
-                vk::PipelineStageFlags::ALL_COMMANDS,
-                vk::PipelineStageFlags::TRANSFER,
-                &[
-                    (
-                        store.image,
-                        vk::AccessFlags::MEMORY_WRITE,
-                        vk::AccessFlags::TRANSFER_READ,
-                    ),
-                    (
-                        target.image,
-                        vk::AccessFlags::empty(),
-                        vk::AccessFlags::TRANSFER_WRITE,
-                    ),
-                ],
-            );
-            let whole = vk::ImageSubresourceLayers {
-                aspect_mask: vk::ImageAspectFlags::COLOR,
-                mip_level: 0,
-                base_array_layer: 0,
-                layer_count: 1,
-            };
-            let corner = vk::Offset3D {
-                x: width as i32,
-                y: height as i32,
-                z: 1,
-            };
-            let region = vk::ImageBlit::default()
-                .src_subresource(whole)
-                .src_offsets([vk::Offset3D::default(), corner])
-                .dst_subresource(whole)
-                .dst_offsets([vk::Offset3D::default(), corner]);
-            device.cmd_blit_image(
-                command_buffer,
-                store.image,
-                vk::ImageLayout::GENERAL,
-                target.image,
-                vk::ImageLayout::GENERAL,
-                &[region],
-                vk::Filter::NEAREST,
-            );
-            general_barrier(
-                device,
-                command_buffer,
-                vk::PipelineStageFlags::TRANSFER,
-                vk::PipelineStageFlags::COMPUTE_SHADER,
-                &[(
-                    target.image,
-                    vk::AccessFlags::TRANSFER_WRITE,
-                    vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE,
-                )],
-            );
-            let acquire: Vec<_> = placed
-                .iter()
-                .map(|(_, image, _)| ownership(*image, external, gpu.queue_family, true))
-                .collect();
-            device.cmd_pipeline_barrier(
-                command_buffer,
-                vk::PipelineStageFlags::TOP_OF_PIPE,
-                vk::PipelineStageFlags::COMPUTE_SHADER,
-                vk::DependencyFlags::empty(),
-                &[],
-                &[],
-                &acquire,
-            );
-            device.cmd_bind_pipeline(
-                command_buffer,
-                vk::PipelineBindPoint::COMPUTE,
-                pass.pipeline,
-            );
-            for (at, (overlay, _, _)) in placed.iter().enumerate() {
-                let rect = overlay.rect;
-                let placement = Placement {
-                    x: rect.x.clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32,
-                    y: rect.y.clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32,
-                    width: rect.width.clamp(0, i64::from(u32::MAX)) as u32,
-                    height: rect.height.clamp(0, i64::from(u32::MAX)) as u32,
-                    target_width: width,
-                    target_height: height,
-                };
-                if placement.width == 0 || placement.height == 0 {
-                    continue;
+    let producer_leases = placed
+        .iter()
+        .map(|(overlay, _, _)| Arc::clone(&overlay.picture))
+        .collect::<Vec<_>>();
+    gpu.one_shot_owned(
+        (pass, producer_leases, retained),
+        |device, command_buffer, resources| {
+            let pass = &resources.0;
+            // SAFETY: recording into the call's command buffer; the store and
+            // target are in GENERAL from creation, and each imported image is
+            // taken from its producer and handed back around its read.
+            unsafe {
+                // A native scene's CPU base initialization and imported DMA
+                // blend share one command buffer and one completed GPU fence.
+                // A transfer-write -> transfer-read barrier below orders this
+                // upload before the store-to-target blit.
+                if let Some(init) = base {
+                    match init {
+                        StoreInit::Transparent => device.cmd_clear_color_image(
+                            command_buffer,
+                            store.image,
+                            vk::ImageLayout::GENERAL,
+                            &vk::ClearColorValue {
+                                float32: [0.0, 0.0, 0.0, 0.0],
+                            },
+                            &[vk::ImageSubresourceRange {
+                                aspect_mask: vk::ImageAspectFlags::COLOR,
+                                base_mip_level: 0,
+                                level_count: 1,
+                                base_array_layer: 0,
+                                layer_count: 1,
+                            }],
+                        ),
+                        StoreInit::UploadRegion {
+                            buffer,
+                            x,
+                            y,
+                            width,
+                            height,
+                        } => device.cmd_copy_buffer_to_image(
+                            command_buffer,
+                            buffer,
+                            store.image,
+                            vk::ImageLayout::GENERAL,
+                            &[vk::BufferImageCopy::default()
+                                .image_subresource(vk::ImageSubresourceLayers {
+                                    aspect_mask: vk::ImageAspectFlags::COLOR,
+                                    mip_level: 0,
+                                    base_array_layer: 0,
+                                    layer_count: 1,
+                                })
+                                .image_offset(vk::Offset3D {
+                                    x: x as i32,
+                                    y: y as i32,
+                                    z: 0,
+                                })
+                                .image_extent(vk::Extent3D {
+                                    width,
+                                    height,
+                                    depth: 1,
+                                })],
+                        ),
+                        StoreInit::Upload(buffer) => device.cmd_copy_buffer_to_image(
+                            command_buffer,
+                            buffer,
+                            store.image,
+                            vk::ImageLayout::GENERAL,
+                            &[vk::BufferImageCopy::default()
+                                .image_subresource(vk::ImageSubresourceLayers {
+                                    aspect_mask: vk::ImageAspectFlags::COLOR,
+                                    mip_level: 0,
+                                    base_array_layer: 0,
+                                    layer_count: 1,
+                                })
+                                .image_extent(vk::Extent3D {
+                                    width: store.width,
+                                    height: store.height,
+                                    depth: 1,
+                                })],
+                        ),
+                    }
                 }
-                device.cmd_bind_descriptor_sets(
+                // Each later descriptor batch continues blending into the
+                // already completed target; recopying the CPU store here
+                // would erase all prior overlays.
+                if initialize_target {
+                    // The store's upload lands before the target copy.
+                    general_barrier(
+                        device,
+                        command_buffer,
+                        vk::PipelineStageFlags::ALL_COMMANDS,
+                        vk::PipelineStageFlags::TRANSFER,
+                        &[
+                            (
+                                store.image,
+                                vk::AccessFlags::MEMORY_WRITE,
+                                vk::AccessFlags::TRANSFER_READ,
+                            ),
+                            (
+                                target.image,
+                                vk::AccessFlags::empty(),
+                                vk::AccessFlags::TRANSFER_WRITE,
+                            ),
+                        ],
+                    );
+                    let whole = vk::ImageSubresourceLayers {
+                        aspect_mask: vk::ImageAspectFlags::COLOR,
+                        mip_level: 0,
+                        base_array_layer: 0,
+                        layer_count: 1,
+                    };
+                    let corner = vk::Offset3D {
+                        x: width as i32,
+                        y: height as i32,
+                        z: 1,
+                    };
+                    let region = vk::ImageBlit::default()
+                        .src_subresource(whole)
+                        .src_offsets([vk::Offset3D::default(), corner])
+                        .dst_subresource(whole)
+                        .dst_offsets([vk::Offset3D::default(), corner]);
+                    device.cmd_blit_image(
+                        command_buffer,
+                        store.image,
+                        vk::ImageLayout::GENERAL,
+                        target.image,
+                        vk::ImageLayout::GENERAL,
+                        &[region],
+                        vk::Filter::NEAREST,
+                    );
+                    general_barrier(
+                        device,
+                        command_buffer,
+                        vk::PipelineStageFlags::TRANSFER,
+                        vk::PipelineStageFlags::COMPUTE_SHADER,
+                        &[(
+                            target.image,
+                            vk::AccessFlags::TRANSFER_WRITE,
+                            vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE,
+                        )],
+                    );
+                } else {
+                    general_barrier(
+                        device,
+                        command_buffer,
+                        vk::PipelineStageFlags::ALL_COMMANDS,
+                        vk::PipelineStageFlags::COMPUTE_SHADER,
+                        &[(
+                            target.image,
+                            vk::AccessFlags::MEMORY_WRITE,
+                            vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE,
+                        )],
+                    );
+                }
+                let acquire: Vec<_> = placed
+                    .iter()
+                    .map(|(_, image, _)| ownership(*image, external, gpu.queue_family, true))
+                    .collect();
+                device.cmd_pipeline_barrier(
+                    command_buffer,
+                    vk::PipelineStageFlags::TOP_OF_PIPE,
+                    vk::PipelineStageFlags::COMPUTE_SHADER,
+                    vk::DependencyFlags::empty(),
+                    &[],
+                    &[],
+                    &acquire,
+                );
+                device.cmd_bind_pipeline(
                     command_buffer,
                     vk::PipelineBindPoint::COMPUTE,
-                    pass.pipeline_layout,
-                    0,
-                    &[pass.sets[at]],
+                    pass.pipeline,
+                );
+                for (at, (overlay, _, _)) in placed.iter().enumerate() {
+                    let rect = overlay.rect;
+                    // The imported DMA allocation keeps its original dimensions
+                    // and UV transform. Dispatch only the intersection with the
+                    // destination: an offscreen 6K producer over a 160x120 window
+                    // must not dispatch millions of out-of-bounds invocations.
+                    let left = rect.x.max(0).min(i64::from(width));
+                    let top = rect.y.max(0).min(i64::from(height));
+                    let right = rect
+                        .x
+                        .saturating_add(rect.width)
+                        .max(left)
+                        .min(i64::from(width));
+                    let bottom = rect
+                        .y
+                        .saturating_add(rect.height)
+                        .max(top)
+                        .min(i64::from(height));
+                    let placement = Placement {
+                        x: rect.x.clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32,
+                        y: rect.y.clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32,
+                        width: rect.width.clamp(0, i64::from(u32::MAX)) as u32,
+                        height: rect.height.clamp(0, i64::from(u32::MAX)) as u32,
+                        target_width: width,
+                        target_height: height,
+                        clip_x: left as i32,
+                        clip_y: top as i32,
+                        clip_width: (right - left) as u32,
+                        clip_height: (bottom - top) as u32,
+                        opacity: 1.0,
+                        clear: false,
+                        round_start: 0,
+                        round_count: 0,
+                        sampled_srgb: 0,
+                    };
+                    if placement.clip_width == 0 || placement.clip_height == 0 {
+                        continue;
+                    }
+                    device.cmd_bind_descriptor_sets(
+                        command_buffer,
+                        vk::PipelineBindPoint::COMPUTE,
+                        pass.pipeline_layout,
+                        0,
+                        &[pass.sets[at]],
+                        &[],
+                    );
+                    device.cmd_push_constants(
+                        command_buffer,
+                        pass.pipeline_layout,
+                        vk::ShaderStageFlags::COMPUTE,
+                        0,
+                        &placement.bytes(),
+                    );
+                    device.cmd_dispatch(
+                        command_buffer,
+                        placement.clip_width.div_ceil(GROUP),
+                        placement.clip_height.div_ceil(GROUP),
+                        1,
+                    );
+                    // Overlapping overlays blend in order.
+                    general_barrier(
+                        device,
+                        command_buffer,
+                        vk::PipelineStageFlags::COMPUTE_SHADER,
+                        vk::PipelineStageFlags::COMPUTE_SHADER,
+                        &[(
+                            target.image,
+                            vk::AccessFlags::SHADER_WRITE,
+                            vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE,
+                        )],
+                    );
+                }
+                let release: Vec<_> = placed
+                    .iter()
+                    .map(|(_, image, _)| ownership(*image, gpu.queue_family, external, false))
+                    .collect();
+                device.cmd_pipeline_barrier(
+                    command_buffer,
+                    vk::PipelineStageFlags::COMPUTE_SHADER,
+                    vk::PipelineStageFlags::BOTTOM_OF_PIPE,
+                    vk::DependencyFlags::empty(),
                     &[],
+                    &[],
+                    &release,
                 );
-                device.cmd_push_constants(
-                    command_buffer,
-                    pass.pipeline_layout,
-                    vk::ShaderStageFlags::COMPUTE,
-                    0,
-                    &placement.bytes(),
-                );
-                device.cmd_dispatch(
-                    command_buffer,
-                    placement.width.div_ceil(GROUP),
-                    placement.height.div_ceil(GROUP),
-                    1,
-                );
-                // Overlapping overlays blend in order.
+                // The swapchain blits the target next.
                 general_barrier(
                     device,
                     command_buffer,
                     vk::PipelineStageFlags::COMPUTE_SHADER,
-                    vk::PipelineStageFlags::COMPUTE_SHADER,
+                    vk::PipelineStageFlags::TRANSFER,
                     &[(
                         target.image,
                         vk::AccessFlags::SHADER_WRITE,
-                        vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE,
+                        vk::AccessFlags::TRANSFER_READ,
                     )],
                 );
             }
-            let release: Vec<_> = placed
-                .iter()
-                .map(|(_, image, _)| ownership(*image, gpu.queue_family, external, false))
-                .collect();
-            device.cmd_pipeline_barrier(
-                command_buffer,
-                vk::PipelineStageFlags::COMPUTE_SHADER,
-                vk::PipelineStageFlags::BOTTOM_OF_PIPE,
-                vk::DependencyFlags::empty(),
-                &[],
-                &[],
-                &release,
-            );
-            // The swapchain blits the target next.
-            general_barrier(
-                device,
-                command_buffer,
-                vk::PipelineStageFlags::COMPUTE_SHADER,
-                vk::PipelineStageFlags::TRANSFER,
-                &[(
-                    target.image,
-                    vk::AccessFlags::SHADER_WRITE,
-                    vk::AccessFlags::TRANSFER_READ,
-                )],
-            );
-        }
-    })?;
+        },
+    )?;
     Ok(refused)
 }
 
@@ -799,15 +1234,22 @@ unsafe fn general_barrier(
 ///     }
 /// }
 /// ```
-fn shader() -> Vec<u32> {
-    build_shader().expect("the overlay shader is well formed")
+pub(crate) fn shader() -> Vec<u32> {
+    build_shader(false).expect("the overlay shader is well formed")
 }
 
-fn build_shader() -> Result<Vec<u32>, rspirv::dr::Error> {
+/// The scene shader additionally reads variable-length rounded masks. The
+/// ordinary DMA-BUF overlay shader keeps the original two bindings.
+pub(crate) fn scene_shader() -> Vec<u32> {
+    build_shader(true).expect("the rounded scene shader is well formed")
+}
+
+fn build_shader(scene: bool) -> Result<Vec<u32>, rspirv::dr::Error> {
     use spirv::{Decoration, StorageClass};
     let mut b = Builder::new();
     b.set_version(1, 0);
     b.capability(spirv::Capability::Shader);
+    let glsl = b.ext_inst_import("GLSL.std.450");
     b.memory_model(spirv::AddressingModel::Logical, spirv::MemoryModel::GLSL450);
 
     let void = b.type_void();
@@ -844,6 +1286,31 @@ fn build_shader() -> Result<Vec<u32>, rspirv::dr::Error> {
     let storage_pointer = b.type_pointer(None, StorageClass::UniformConstant, storage);
     let overlay = b.variable(sampled_pointer, None, StorageClass::UniformConstant, None);
     let target = b.variable(storage_pointer, None, StorageClass::UniformConstant, None);
+    let rounded = if scene {
+        // A runtime array of pairs of vec4: (left,top,right,bottom) and
+        // (radius,0,0,0). The GPU loop handles any number of ancestor masks.
+        let array = b.type_runtime_array(vec4);
+        b.decorate(array, Decoration::ArrayStride, [Operand::LiteralBit32(16)]);
+        let block = b.type_struct([array]);
+        b.decorate(block, Decoration::Block, []);
+        b.member_decorate(block, 0, Decoration::Offset, [Operand::LiteralBit32(0)]);
+        let ptr = b.type_pointer(None, StorageClass::StorageBuffer, block);
+        let variable = b.variable(ptr, None, StorageClass::StorageBuffer, None);
+        b.decorate(
+            variable,
+            Decoration::DescriptorSet,
+            [Operand::LiteralBit32(0)],
+        );
+        b.decorate(variable, Decoration::Binding, [Operand::LiteralBit32(2)]);
+        Some(variable)
+    } else {
+        None
+    };
+    let rounded_vec_pointer = if scene {
+        Some(b.type_pointer(None, StorageClass::StorageBuffer, vec4))
+    } else {
+        None
+    };
     for (variable, binding) in [(overlay, 0), (target, 1)] {
         b.decorate(
             variable,
@@ -857,9 +1324,15 @@ fn build_shader() -> Result<Vec<u32>, rspirv::dr::Error> {
         );
     }
 
-    let placement = b.type_struct([int, int, uint, uint, uint, uint]);
+    let mut placement_types = vec![
+        int, int, uint, uint, uint, uint, int, int, uint, uint, float, uint, uint, uint, uint,
+    ];
+    if scene {
+        placement_types.extend_from_slice(&[int, int]);
+    }
+    let placement = b.type_struct(placement_types);
     b.decorate(placement, Decoration::Block, []);
-    for member in 0..6 {
+    for member in 0..if scene { 17 } else { 15 } {
         b.member_decorate(
             placement,
             member,
@@ -888,6 +1361,22 @@ fn build_shader() -> Result<Vec<u32>, rspirv::dr::Error> {
     let function = b.type_function(void, []);
     let main = b.begin_function(void, None, spirv::FunctionControl::NONE, function)?;
     b.begin_block(None)?;
+    let encoded_source = if scene {
+        let ptr = b.type_pointer(None, StorageClass::Function, vec4);
+        Some(b.variable(ptr, None, StorageClass::Function, None))
+    } else {
+        None
+    };
+    let (round_index, coverage) = if scene {
+        let uint_var = b.type_pointer(None, StorageClass::Function, uint);
+        let float_var = b.type_pointer(None, StorageClass::Function, float);
+        (
+            Some(b.variable(uint_var, None, StorageClass::Function, None)),
+            Some(b.variable(float_var, None, StorageClass::Function, None)),
+        )
+    } else {
+        (None, None)
+    };
     let member = |b: &mut Builder, at: u32, pointer: u32, ty: u32| {
         let at = b.constant_bit32(int, at);
         let address = b.access_chain(pointer, None, placement, [at])?;
@@ -899,22 +1388,42 @@ fn build_shader() -> Result<Vec<u32>, rspirv::dr::Error> {
     let height = member(&mut b, 3, uint_pointer, uint)?;
     let target_width = member(&mut b, 4, uint_pointer, uint)?;
     let target_height = member(&mut b, 5, uint_pointer, uint)?;
+    let clip_x = member(&mut b, 6, int_pointer, int)?;
+    let clip_y = member(&mut b, 7, int_pointer, int)?;
+    let clip_width = member(&mut b, 8, uint_pointer, uint)?;
+    let clip_height = member(&mut b, 9, uint_pointer, uint)?;
+    let float_pointer = b.type_pointer(None, StorageClass::PushConstant, float);
+    let opacity = member(&mut b, 10, float_pointer, float)?;
+    let clear = member(&mut b, 11, uint_pointer, uint)?;
+    let round_start = member(&mut b, 12, uint_pointer, uint)?;
+    let round_count = member(&mut b, 13, uint_pointer, uint)?;
+    let sampled_srgb = member(&mut b, 14, uint_pointer, uint)?;
+    let target_origin = if scene {
+        (
+            member(&mut b, 15, int_pointer, int)?,
+            member(&mut b, 16, int_pointer, int)?,
+        )
+    } else {
+        (zero_int, zero_int)
+    };
     let target_width = b.bitcast(int, None, target_width)?;
     let target_height = b.bitcast(int, None, target_height)?;
     let global = b.load(uvec3, None, id, None, [])?;
     let column = b.composite_extract(uint, None, global, [0])?;
     let row = b.composite_extract(uint, None, global, [1])?;
     let at_x = b.bitcast(int, None, column)?;
-    let at_x = b.i_add(int, None, x, at_x)?;
+    let at_x = b.i_add(int, None, clip_x, at_x)?;
     let at_y = b.bitcast(int, None, row)?;
-    let at_y = b.i_add(int, None, y, at_y)?;
-    let mut inside = b.u_less_than(boolean, None, column, width)?;
+    let at_y = b.i_add(int, None, clip_y, at_y)?;
+    let target_x = b.i_sub(int, None, at_x, target_origin.0)?;
+    let target_y = b.i_sub(int, None, at_y, target_origin.1)?;
+    let mut inside = b.u_less_than(boolean, None, column, clip_width)?;
     for condition in [
-        b.u_less_than(boolean, None, row, height)?,
-        b.s_greater_than_equal(boolean, None, at_x, zero_int)?,
-        b.s_greater_than_equal(boolean, None, at_y, zero_int)?,
-        b.s_less_than(boolean, None, at_x, target_width)?,
-        b.s_less_than(boolean, None, at_y, target_height)?,
+        b.u_less_than(boolean, None, row, clip_height)?,
+        b.s_greater_than_equal(boolean, None, target_x, zero_int)?,
+        b.s_greater_than_equal(boolean, None, target_y, zero_int)?,
+        b.s_less_than(boolean, None, target_x, target_width)?,
+        b.s_less_than(boolean, None, target_y, target_height)?,
     ] {
         inside = b.logical_and(boolean, None, inside, condition)?;
     }
@@ -924,8 +1433,26 @@ fn build_shader() -> Result<Vec<u32>, rspirv::dr::Error> {
     b.branch_conditional(inside, body, merge, [])?;
 
     b.begin_block(Some(body))?;
-    let u = b.convert_u_to_f(float, None, column)?;
-    let v = b.convert_u_to_f(float, None, row)?;
+    // The damaged-area clear uses this same storage image and deliberately
+    // skips texture sampling. It does not need a separate Vulkan render pass.
+    let zero_uint = b.constant_bit32(uint, 0);
+    let is_clear = b.i_not_equal(boolean, None, clear, zero_uint)?;
+    let clearing = b.id();
+    let blending = b.id();
+    let complete = b.id();
+    b.selection_merge(complete, spirv::SelectionControl::NONE)?;
+    b.branch_conditional(is_clear, clearing, blending, [])?;
+    b.begin_block(Some(clearing))?;
+    let at = b.composite_construct(ivec2, None, [target_x, target_y])?;
+    let image = b.load(storage, None, target, None, [])?;
+    let transparent = b.constant_composite(vec4, [zero, zero, zero, zero]);
+    b.image_write(image, at, transparent, None, [])?;
+    b.branch(complete)?;
+    b.begin_block(Some(blending))?;
+    let source_x = b.i_sub(int, None, at_x, x)?;
+    let source_y = b.i_sub(int, None, at_y, y)?;
+    let u = b.convert_s_to_f(float, None, source_x)?;
+    let v = b.convert_s_to_f(float, None, source_y)?;
     let u = b.f_add(float, None, u, half)?;
     let v = b.f_add(float, None, v, half)?;
     let across = b.convert_u_to_f(float, None, width)?;
@@ -942,7 +1469,173 @@ fn build_shader() -> Result<Vec<u32>, rspirv::dr::Error> {
         spirv::ImageOperands::LOD,
         [Operand::IdRef(zero)],
     )?;
-    let at = b.composite_construct(ivec2, None, [at_x, at_y])?;
+    // Vulkan sampled-image reads decode R8/B8G8R8A8_SRGB RGB to linear.
+    // Rosemary's AppKit backing and RGBA8_UNORM scene accumulator currently
+    // use display-referred (encoded) sRGB bytes for source-over composition.
+    // Restore that encoding exactly once for explicitly sRGB Metal sources;
+    // UNORM sources remain numerically unchanged. Alpha is never gamma-coded.
+    let over = if let Some(encoded_source) = encoded_source {
+        b.store(encoded_source, over, None, [])?;
+        let zero_uint = b.constant_bit32(uint, 0);
+        let nonzero = b.i_not_equal(boolean, None, sampled_srgb, zero_uint)?;
+        let encode = b.id();
+        let done = b.id();
+        b.selection_merge(done, spirv::SelectionControl::NONE)?;
+        b.branch_conditional(nonzero, encode, done, [])?;
+        b.begin_block(Some(encode))?;
+        let threshold = b.constant_bit32(float, 0.0031308f32.to_bits());
+        let factor = b.constant_bit32(float, 12.92f32.to_bits());
+        let offset = b.constant_bit32(float, 0.055f32.to_bits());
+        let one055 = b.constant_bit32(float, 1.055f32.to_bits());
+        let exponent = b.constant_bit32(float, (1.0f32 / 2.4).to_bits());
+        let mut channels = Vec::with_capacity(4);
+        for index in 0..3 {
+            let input = b.composite_extract(float, None, over, [index])?;
+            let low = b.f_mul(float, None, input, factor)?;
+            let pow = b.ext_inst(
+                float,
+                None,
+                glsl,
+                26,
+                [Operand::IdRef(input), Operand::IdRef(exponent)],
+            )?;
+            let high = b.f_mul(float, None, pow, one055)?;
+            let high = b.f_sub(float, None, high, offset)?;
+            let near_zero = b.f_ord_less_than_equal(boolean, None, input, threshold)?;
+            let encoded = b.select(float, None, near_zero, low, high)?;
+            channels.push(encoded);
+        }
+        channels.push(b.composite_extract(float, None, over, [3])?);
+        let corrected = b.composite_construct(vec4, None, channels)?;
+        b.store(encoded_source, corrected, None, [])?;
+        b.branch(done)?;
+        b.begin_block(Some(done))?;
+        b.load(vec4, None, encoded_source, None, [])?
+    } else {
+        over
+    };
+    let over = b.vector_times_scalar(vec4, None, over, opacity)?;
+    let over = if let (Some(buffer), Some(ptr), Some(index_var), Some(coverage_var)) =
+        (rounded, rounded_vec_pointer, round_index, coverage)
+    {
+        let zero_uint = b.constant_bit32(uint, 0);
+        let one_uint = b.constant_bit32(uint, 1);
+        let two_uint = b.constant_bit32(uint, 2);
+        let zero_int = b.constant_bit32(int, 0);
+        b.store(index_var, zero_uint, None, [])?;
+        b.store(coverage_var, one, None, [])?;
+        let header = b.id();
+        let body = b.id();
+        let repeat = b.id();
+        let end = b.id();
+        b.branch(header)?;
+        b.begin_block(Some(header))?;
+        let index = b.load(uint, None, index_var, None, [])?;
+        let inside = b.u_less_than(boolean, None, index, round_count)?;
+        b.loop_merge(end, repeat, spirv::LoopControl::NONE, [])?;
+        b.branch_conditional(inside, body, end, [])?;
+        b.begin_block(Some(body))?;
+        let offset = b.i_add(uint, None, round_start, index)?;
+        let offset = b.i_mul(uint, None, offset, two_uint)?;
+        let next = b.i_add(uint, None, offset, one_uint)?;
+        let bounds_ptr = b.access_chain(ptr, None, buffer, [zero_int, offset])?;
+        let params_ptr = b.access_chain(ptr, None, buffer, [zero_int, next])?;
+        let bounds = b.load(vec4, None, bounds_ptr, None, [])?;
+        let params = b.load(vec4, None, params_ptr, None, [])?;
+        let left = b.composite_extract(float, None, bounds, [0])?;
+        let top = b.composite_extract(float, None, bounds, [1])?;
+        let right = b.composite_extract(float, None, bounds, [2])?;
+        let bottom = b.composite_extract(float, None, bounds, [3])?;
+        let radius = b.composite_extract(float, None, params, [0])?;
+        let cx = b.convert_s_to_f(float, None, at_x)?;
+        let cy = b.convert_s_to_f(float, None, at_y)?;
+        let cx = b.f_add(float, None, cx, half)?;
+        let cy = b.f_add(float, None, cy, half)?;
+        let left_radius = b.f_add(float, None, left, radius)?;
+        let right_radius = b.f_sub(float, None, right, radius)?;
+        let top_radius = b.f_add(float, None, top, radius)?;
+        let bottom_radius = b.f_sub(float, None, bottom, radius)?;
+        let dx1 = b.f_sub(float, None, left_radius, cx)?;
+        let dx2 = b.f_sub(float, None, cx, right_radius)?;
+        let dy1 = b.f_sub(float, None, top_radius, cy)?;
+        let dy2 = b.f_sub(float, None, cy, bottom_radius)?;
+        let dx = b.ext_inst(
+            float,
+            None,
+            glsl,
+            40,
+            [Operand::IdRef(dx1), Operand::IdRef(dx2)],
+        )?;
+        let dy = b.ext_inst(
+            float,
+            None,
+            glsl,
+            40,
+            [Operand::IdRef(dy1), Operand::IdRef(dy2)],
+        )?;
+        let dx = b.ext_inst(
+            float,
+            None,
+            glsl,
+            40,
+            [Operand::IdRef(dx), Operand::IdRef(zero)],
+        )?;
+        let dy = b.ext_inst(
+            float,
+            None,
+            glsl,
+            40,
+            [Operand::IdRef(dy), Operand::IdRef(zero)],
+        )?;
+        let delta = b.composite_construct(vec2, None, [dx, dy])?;
+        let distance = b.ext_inst(float, None, glsl, 66, [Operand::IdRef(delta)])?;
+        // Match appkit::coreanimation::rounded_coverage in window pixels:
+        // an unbounded radius and SQRT_2-wide fractional edge transition.
+        let inv_sqrt2 = b.constant_bit32(float, std::f32::consts::FRAC_1_SQRT_2.to_bits());
+        let cov = b.f_sub(float, None, radius, distance)?;
+        let cov = b.f_mul(float, None, cov, inv_sqrt2)?;
+        let cov = b.f_add(float, None, cov, half)?;
+        let cov = b.ext_inst(
+            float,
+            None,
+            glsl,
+            43,
+            [
+                Operand::IdRef(cov),
+                Operand::IdRef(zero),
+                Operand::IdRef(one),
+            ],
+        )?;
+        let two = b.constant_bit32(float, 2f32.to_bits());
+        let width = b.f_sub(float, None, right, left)?;
+        let half_width = b.f_div(float, None, width, two)?;
+        let radius_fits = b.f_ord_less_than_equal(boolean, None, radius, half_width)?;
+        let strip_left = b.f_sub(float, None, left_radius, one)?;
+        let strip_right = b.f_add(float, None, right_radius, one)?;
+        let past_left = b.f_ord_greater_than_equal(boolean, None, cx, strip_left)?;
+        let before_right = b.f_ord_less_than_equal(boolean, None, cx, strip_right)?;
+        let strip = b.logical_and(boolean, None, past_left, before_right)?;
+        let strip = b.logical_and(boolean, None, radius_fits, strip)?;
+        let vertical_center_band = b.f_ord_less_than_equal(boolean, None, dy, zero)?;
+        let smaller_than_pixel = b.f_ord_less_than(boolean, None, radius, half)?;
+        let full_strip = b.logical_or(boolean, None, strip, vertical_center_band)?;
+        let fully_covered = b.logical_or(boolean, None, full_strip, smaller_than_pixel)?;
+        let cov = b.select(float, None, fully_covered, one, cov)?;
+        let aggregate = b.load(float, None, coverage_var, None, [])?;
+        let aggregate = b.f_mul(float, None, aggregate, cov)?;
+        b.store(coverage_var, aggregate, None, [])?;
+        b.branch(repeat)?;
+        b.begin_block(Some(repeat))?;
+        let next = b.i_add(uint, None, index, one_uint)?;
+        b.store(index_var, next, None, [])?;
+        b.branch(header)?;
+        b.begin_block(Some(end))?;
+        let aggregate = b.load(float, None, coverage_var, None, [])?;
+        b.vector_times_scalar(vec4, None, over, aggregate)?
+    } else {
+        over
+    };
+    let at = b.composite_construct(ivec2, None, [target_x, target_y])?;
     let image = b.load(storage, None, target, None, [])?;
     let under = b.image_read(vec4, None, image, at, None, [])?;
     let alpha = b.composite_extract(float, None, over, [3])?;
@@ -950,6 +1643,8 @@ fn build_shader() -> Result<Vec<u32>, rspirv::dr::Error> {
     let under = b.vector_times_scalar(vec4, None, under, keep)?;
     let blended = b.f_add(vec4, None, over, under)?;
     b.image_write(image, at, blended, None, [])?;
+    b.branch(complete)?;
+    b.begin_block(Some(complete))?;
     b.branch(merge)?;
 
     b.begin_block(Some(merge))?;
@@ -981,10 +1676,50 @@ mod tests {
             height: 6,
             target_width: 7,
             target_height: 8,
+            clip_x: -2,
+            clip_y: 5,
+            clip_width: 3,
+            clip_height: 4,
+            opacity: 0.5,
+            clear: false,
+            round_start: 0,
+            round_count: 0,
+            sampled_srgb: 0,
         };
         let bytes = placement.bytes();
         assert_eq!(&bytes[0..4], &(-3i32).to_ne_bytes());
         assert_eq!(&bytes[20..24], &8u32.to_ne_bytes());
+        assert_eq!(&bytes[24..28], &(-2i32).to_ne_bytes());
+        assert_eq!(&bytes[40..44], &0.5f32.to_ne_bytes());
+        assert_eq!(&bytes[56..60], &0u32.to_ne_bytes());
+    }
+
+    /// Two windows on the same GPU must not share a descriptor set while the
+    /// first one's GPU command is still in flight. The second checkout must
+    /// succeed without waiting for the first lease to return its pass.
+    #[test]
+    fn independent_overlay_pass_leases_do_not_hold_registry_across_gpu_waits() {
+        if std::env::var_os("ROSEMARY_TEST_VULKAN").is_none() {
+            return;
+        }
+        let gpu = crate::vulkan::adapters()
+            .unwrap()
+            .first()
+            .unwrap()
+            .gpu()
+            .unwrap();
+        let first = lease_pass(gpu).expect("first window descriptor resources");
+        let original_set = first.sets[0];
+        let second = std::thread::spawn(move || {
+            let leased = lease_pass(gpu).expect("independent second window descriptor resources");
+            leased.sets[0]
+        })
+        .join()
+        .unwrap();
+        assert_ne!(
+            original_set, second,
+            "one window reused a descriptor set still leased by another window"
+        );
     }
 
     #[test]

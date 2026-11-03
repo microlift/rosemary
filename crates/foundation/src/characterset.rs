@@ -26,7 +26,10 @@ const CONTROL: usize = 10;
 const LOWERCASE: usize = 11;
 const UPPERCASE: usize = 12;
 const SYMBOLS: usize = 13;
-const KINDS: usize = 14;
+const URL_QUERY: usize = 14;
+const URL_HOST: usize = 15;
+const URL_USER: usize = 16;
+const KINDS: usize = 17;
 
 /// The members of each `CUSTOM` set: inclusive code point ranges, and whether
 /// the set is everything *but* them.
@@ -59,6 +62,18 @@ fn standard(kind: usize) -> Id {
 
 pub(crate) unsafe extern "C" fn url_path_allowed_character_set(_class: Id, _sel: Sel) -> Id {
     standard(URL_PATH)
+}
+
+unsafe extern "C" fn url_query_allowed_character_set(_class: Id, _sel: Sel) -> Id {
+    standard(URL_QUERY)
+}
+
+unsafe extern "C" fn url_host_allowed_character_set(_class: Id, _sel: Sel) -> Id {
+    standard(URL_HOST)
+}
+
+unsafe extern "C" fn url_user_allowed_character_set(_class: Id, _sel: Sel) -> Id {
+    standard(URL_USER)
 }
 
 unsafe extern "C" fn whitespace_character_set(_class: Id, _sel: Sel) -> Id {
@@ -108,6 +123,16 @@ pub(crate) unsafe fn contains_char(set: Id, c: char) -> bool {
     match kind {
         URL_PATH => {
             ascii.is_some_and(|b| b.is_ascii_alphanumeric() || b"-._~/!$&'()*+,;=:@".contains(&b))
+        }
+        // RFC 3986's sets, as Foundation draws them.
+        URL_QUERY => {
+            ascii.is_some_and(|b| b.is_ascii_alphanumeric() || b"-._~/?!$&'()*+,;=:@".contains(&b))
+        }
+        URL_HOST => {
+            ascii.is_some_and(|b| b.is_ascii_alphanumeric() || b"-._~!$&'()*+,;=:[]".contains(&b))
+        }
+        URL_USER => {
+            ascii.is_some_and(|b| b.is_ascii_alphanumeric() || b"-._~!$&'()*+,;=".contains(&b))
         }
         WHITESPACE => matches!(ascii, Some(b' ' | b'\t')),
         NEWLINE => ascii.is_some_and(|b| (0x0a..=0x0d).contains(&b)),
@@ -250,6 +275,13 @@ pub(crate) fn install() {
     let class = corefoundation::base::register(c"NSCharacterSet", None, size_of::<Body>(), false);
     class_methods!(class, {
         "URLPathAllowedCharacterSet" => url_path_allowed_character_set, c"@16@0:8";
+        "URLQueryAllowedCharacterSet" => url_query_allowed_character_set, c"@16@0:8";
+        // The fragment set is the query set.
+        "URLFragmentAllowedCharacterSet" => url_query_allowed_character_set, c"@16@0:8";
+        "URLHostAllowedCharacterSet" => url_host_allowed_character_set, c"@16@0:8";
+        // The password set is the user set.
+        "URLUserAllowedCharacterSet" => url_user_allowed_character_set, c"@16@0:8";
+        "URLPasswordAllowedCharacterSet" => url_user_allowed_character_set, c"@16@0:8";
         "whitespaceCharacterSet" => whitespace_character_set, c"@16@0:8";
         "newlineCharacterSet" => newline_character_set, c"@16@0:8";
         "whitespaceAndNewlineCharacterSet" => whitespace_and_newline_character_set, c"@16@0:8";
@@ -285,6 +317,58 @@ pub unsafe extern "C" fn CFCharacterSetGetPredefined(set: isize) -> Id {
         _ => CUSTOM,
     };
     standard(kind)
+}
+
+/// `CFMutableCharacterSetRef CFCharacterSetCreateMutable(CFAllocatorRef)`: an
+/// empty set the caller owns.
+#[allow(non_snake_case)]
+pub unsafe extern "C" fn CFCharacterSetCreateMutable(_allocator: *const std::ffi::c_void) -> Id {
+    let set = make_custom(Members::default());
+    objc::arc::retain(set);
+    set
+}
+
+/// `void CFCharacterSetAddCharactersInRange(CFMutableCharacterSetRef, CFRange)`,
+/// over UTF-32 code points.
+#[allow(non_snake_case)]
+pub unsafe extern "C" fn CFCharacterSetAddCharactersInRange(
+    set: Id,
+    location: isize,
+    length: isize,
+) {
+    if kind_of(set) != Some(CUSTOM) || location < 0 || length <= 0 {
+        return;
+    }
+    let mut custom = custom().lock().unwrap_or_else(|e| e.into_inner());
+    let members = custom.entry(set as usize).or_default();
+    let range = (location as u32, (location + length - 1) as u32);
+    if members.inverted {
+        // Adding to a complement removes from what it excludes.
+        members.ranges = members
+            .ranges
+            .iter()
+            .flat_map(|&(low, high)| {
+                let mut parts = Vec::new();
+                if low < range.0 {
+                    parts.push((low, high.min(range.0 - 1)));
+                }
+                if high > range.1 {
+                    parts.push((low.max(range.1 + 1), high));
+                }
+                parts
+            })
+            .collect();
+    } else {
+        members.ranges.push(range);
+    }
+}
+
+/// `Boolean CFCharacterSetIsLongCharacterMember(CFCharacterSetRef, UTF32Char)`.
+#[allow(non_snake_case)]
+pub unsafe extern "C" fn CFCharacterSetIsLongCharacterMember(set: Id, code: u32) -> u8 {
+    char::from_u32(code)
+        .is_some_and(|c| unsafe { contains_char(set, c) })
+        .into()
 }
 
 /// `Boolean CFCharacterSetIsCharacterMember(CFCharacterSetRef, UniChar)`.

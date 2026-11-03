@@ -1,5 +1,26 @@
 use super::*;
 
+/// Do not execute independent Vulkan/Metal integration fixtures against a
+/// shared process-global Metal runtime concurrently. Libtest may choose
+/// different OS threads for each test, and the fake device uses global
+/// resources. Keep the assertions real, one test per child process.
+static GPU_TEST_SUBPROCESS: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+macro_rules! isolate_metal_fixture {
+    () => {
+        let here = {
+            // A child that fails poisons this; the next must still run.
+            let _serial = GPU_TEST_SUBPROCESS
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            sdl3::isolated::run_here()
+        };
+        if !here {
+            return;
+        }
+    };
+}
+
 fn device_for_tests() -> Id {
     bootstrap();
     let target = Box::leak(Box::new(metal_translate::TargetProfile::vulkan_1_3()));
@@ -52,14 +73,16 @@ fn source_library(device: Id, source: &str) -> Id {
 
 #[test]
 fn every_export_resolves_with_both_spellings() {
+    isolate_metal_fixture!();
     for name in names() {
-        assert_ne!(symbol(&name), None);
-        assert_eq!(symbol(&format!("_{name}")), symbol(&name));
+        assert_ne!(symbol(name), None);
+        assert_eq!(symbol(&format!("_{name}")), symbol(name));
     }
 }
 
 #[test]
 fn device_registers_the_metal_object_graph() {
+    isolate_metal_fixture!();
     bootstrap();
     for (class, selector) in [
         (c"RosemaryMTLDevice", "newLibraryWithSource:options:error:"),
@@ -105,6 +128,7 @@ fn device_registers_the_metal_object_graph() {
 /// unusable: a game asks before it decides which renderer to run.
 #[test]
 fn the_device_reports_the_mac_gpu_families() {
+    isolate_metal_fixture!();
     bootstrap();
     // SAFETY: the same calls the guest makes; neither reads the receiver.
     unsafe {
@@ -140,6 +164,7 @@ fn the_device_reports_the_mac_gpu_families() {
 
 #[test]
 fn sample_counts_follow_the_vulkan_device() {
+    isolate_metal_fixture!();
     for (count, sample) in [
         (1, ash::vk::SampleCountFlags::TYPE_1),
         (2, ash::vk::SampleCountFlags::TYPE_2),
@@ -178,6 +203,7 @@ fn sample_counts_follow_the_vulkan_device() {
 
 #[test]
 fn source_library_creation_reports_invalid_source() {
+    isolate_metal_fixture!();
     let device = device_for_tests();
     let mut error = std::ptr::null_mut();
     // SAFETY: the same call the guest makes.
@@ -196,6 +222,7 @@ fn source_library_creation_reports_invalid_source() {
 
 #[test]
 fn a_translated_library_exposes_its_entry_points() {
+    isolate_metal_fixture!();
     let device = device_for_tests();
     let library = source_library(device, TEST_KERNEL);
     assert!(!library.is_null());
@@ -229,6 +256,7 @@ fn constant_values() -> Id {
 
 #[test]
 fn function_constant_values_are_kept_by_index_name_and_range() {
+    isolate_metal_fixture!();
     let values = constant_values();
     let flag = 1u8;
     let lanes = [7u32, 11];
@@ -262,6 +290,7 @@ fn function_constant_values_are_kept_by_index_name_and_range() {
 /// so Metal hands back the function the values would not have changed.
 #[test]
 fn a_library_without_function_constants_ignores_the_values() {
+    isolate_metal_fixture!();
     let device = device_for_tests();
     let library = source_library(device, TEST_KERNEL);
     let values = constant_values();
@@ -302,6 +331,7 @@ fn a_library_without_function_constants_ignores_the_values() {
 /// answer an object which cannot back any GPU work.
 #[test]
 fn a_device_without_vulkan_refuses_resources() {
+    isolate_metal_fixture!();
     let device = device_for_tests();
     // SAFETY: the same calls the guest makes.
     unsafe {
@@ -314,6 +344,7 @@ fn a_device_without_vulkan_refuses_resources() {
 /// encode a dispatch against a Vulkan buffer, and read the result back.
 #[test]
 fn a_translated_kernel_runs_on_the_gpu() {
+    isolate_metal_fixture!();
     let Some(device) = gpu_device() else {
         return;
     };
@@ -370,6 +401,7 @@ fn a_translated_kernel_runs_on_the_gpu() {
 /// already replaced, and one to a `-setBytes:` copy in between.
 #[test]
 fn rebinding_between_dispatches_reaches_each_buffer() {
+    isolate_metal_fixture!();
     let Some(device) = gpu_device() else {
         return;
     };
@@ -417,6 +449,7 @@ fn rebinding_between_dispatches_reaches_each_buffer() {
 /// it must still all arrive, and a reused range must read back as zeros.
 #[test]
 fn a_private_buffer_is_filled_written_and_copied_by_the_device() {
+    isolate_metal_fixture!();
     let Some(device) = gpu_device() else {
         return;
     };
@@ -479,6 +512,7 @@ fn a_private_buffer_is_filled_written_and_copied_by_the_device() {
 /// host what each wrote.
 #[test]
 fn a_large_shared_buffer_is_seen_through_its_host_pages() {
+    isolate_metal_fixture!();
     let Some(device) = gpu_device() else {
         return;
     };
@@ -576,6 +610,7 @@ unsafe fn copy_buffer_range(
 /// makes conditional on a feature.
 #[test]
 fn a_mirror_clamp_sampler_follows_the_device_feature() {
+    isolate_metal_fixture!();
     let Some(device) = gpu_device() else {
         return;
     };
@@ -596,6 +631,7 @@ fn a_mirror_clamp_sampler_follows_the_device_feature() {
 /// store is valid and discarded instead of reaching an undefined descriptor.
 #[test]
 fn a_nil_buffer_store_is_discarded_with_robustness2() {
+    isolate_metal_fixture!();
     let Some(device) = gpu_device() else {
         return;
     };
@@ -802,6 +838,7 @@ fn triangle_library() -> metal_translate::TranslatedLibrary {
                     field: None,
                     binding: ir::StageBinding::Builtin(ir::Builtin::Position),
                     name: None,
+                    invariant: false,
                 }],
             },
             ir::EntryPoint {
@@ -813,6 +850,7 @@ fn triangle_library() -> metal_translate::TranslatedLibrary {
                     field: None,
                     binding: ir::StageBinding::RenderTarget { index: 0 },
                     name: None,
+                    invariant: false,
                 }],
             },
         ],
@@ -857,6 +895,7 @@ unsafe fn element_at(receiver: Id, index: u64) -> Id {
 /// resolve destination must hold the half rather than the clear.
 #[test]
 fn a_multisampled_depth_attachment_resolves_into_its_destination() {
+    isolate_metal_fixture!();
     let Some(device) = gpu_device() else {
         return;
     };
@@ -936,6 +975,8 @@ fn a_multisampled_depth_attachment_resolves_into_its_destination() {
             stencil_format: 0,
             sample_count: SAMPLES,
             alpha_to_coverage: false,
+            alpha_to_one: false,
+            rasterization: true,
             color_objects: std::ptr::null_mut(),
         },
     );
@@ -1054,6 +1095,7 @@ fn a_multisampled_depth_attachment_resolves_into_its_destination() {
 /// reads the result back.
 #[test]
 fn a_translated_triangle_draws_on_the_gpu() {
+    isolate_metal_fixture!();
     let Some(device) = gpu_device() else {
         return;
     };
@@ -1108,6 +1150,8 @@ fn a_translated_triangle_draws_on_the_gpu() {
             stencil_format: 0,
             sample_count: 1,
             alpha_to_coverage: false,
+            alpha_to_one: false,
+            rasterization: true,
             color_objects: std::ptr::null_mut(),
         },
     );
@@ -1204,6 +1248,7 @@ fn a_translated_triangle_draws_on_the_gpu() {
 /// made - by the time a command buffer reads them.
 #[test]
 fn replaced_texels_reach_the_next_command_buffer() {
+    isolate_metal_fixture!();
     let Some(device) = gpu_device() else {
         return;
     };
@@ -1266,6 +1311,7 @@ fn replaced_texels_reach_the_next_command_buffer() {
 /// buffer in between, and lays the rows out at the guest's stride.
 #[test]
 fn get_bytes_reads_back_replaced_texels() {
+    isolate_metal_fixture!();
     let Some(device) = gpu_device() else {
         return;
     };
@@ -1359,6 +1405,7 @@ unsafe fn get_bytes(texture: Id, region: [u64; 4], bytes: &mut [u8], bytes_per_r
 /// submission must outlive that copy rather than be destroyed under it.
 #[test]
 fn a_texture_released_before_its_upload_runs_outlives_it() {
+    isolate_metal_fixture!();
     let Some(device) = gpu_device() else {
         return;
     };
@@ -1647,6 +1694,8 @@ fn recording_cost() {
                 stencil_format: 0,
                 sample_count: 1,
                 alpha_to_coverage: false,
+                alpha_to_one: false,
+                rasterization: true,
                 color_objects: std::ptr::null_mut(),
             },
         );
@@ -1708,4 +1757,890 @@ fn recording_cost() {
         compute.as_secs_f64() * 1e6 / DISPATCHES as f64,
         render.as_secs_f64() * 1e6 / DRAWS as f64,
     );
+}
+
+/// `MTLVisibilityResultMode`.
+const VISIBILITY_DISABLED: u64 = 0;
+const VISIBILITY_BOOLEAN: u64 = 1;
+const VISIBILITY_COUNTING: u64 = 2;
+
+/// The side of the target a covering draw fills, so each draw passes
+/// `COVERING_SIZE` squared samples.
+const COVERING_SIZE: u64 = 8;
+
+/// A pipeline, a one-sample target and a triangle which covers all of it.
+struct CoveringDraw {
+    state: Id,
+    target: Id,
+    vertices: Id,
+    queue: Id,
+}
+
+/// The triangle program and target of `a_translated_triangle_draws_on_the_gpu`,
+/// or `None` where the device cannot count samples exactly.
+fn covering_draw(device: Id) -> Option<CoveringDraw> {
+    let gpu = gpu_of(device).expect("a Vulkan device");
+    if !gpu.occlusion_precise {
+        return None;
+    }
+    let library = retain_library(device, triangle_library(), None, vec![0, 0], None);
+    // SAFETY: a library this test made.
+    let (vertex, fragment) = unsafe {
+        (
+            new_function_with_name(
+                library,
+                std::ptr::null(),
+                foundation::string::from_str("triangle_vertex"),
+            ),
+            new_function_with_name(
+                library,
+                std::ptr::null(),
+                foundation::string::from_str("triangle_fragment"),
+            ),
+        )
+    };
+    let vertex_descriptor = object::make(
+        c"MTLVertexDescriptor",
+        resource::VertexDescriptor {
+            layouts: [resource::VertexLayout::default(); resource::VERTEX_SLOTS],
+            attributes: [resource::VertexAttribute::default(); resource::VERTEX_SLOTS],
+            layout_objects: std::ptr::null_mut(),
+            attribute_objects: std::ptr::null_mut(),
+        },
+    );
+    let descriptor = object::make(
+        c"MTLRenderPipelineDescriptor",
+        pipeline::RenderPipelineDescriptor {
+            vertex_function: vertex,
+            fragment_function: fragment,
+            vertex_descriptor,
+            colors: [pipeline::ColorAttachment::fresh(); pipeline::COLOR_ATTACHMENTS],
+            depth_format: 0,
+            stencil_format: 0,
+            sample_count: 1,
+            alpha_to_coverage: false,
+            alpha_to_one: false,
+            rasterization: true,
+            color_objects: std::ptr::null_mut(),
+        },
+    );
+    let mut error = std::ptr::null_mut();
+    // SAFETY: objects this test made, sent the selectors they implement.
+    let state = unsafe {
+        let layouts = send(vertex_descriptor, "layouts");
+        send_number(element_at(layouts, 0), "setStride:", 16);
+        let attribute = element_at(send(vertex_descriptor, "attributes"), 0);
+        send_number(attribute, "setFormat:", 31); // MTLVertexFormatFloat4
+        send_number(attribute, "setOffset:", 0);
+        send_number(attribute, "setBufferIndex:", 0);
+        let colors = send(descriptor, "colorAttachments");
+        send_number(element_at(colors, 0), "setPixelFormat:", 80); // BGRA8Unorm
+        new_render_pipeline(device, std::ptr::null(), descriptor, &mut error)
+    };
+    assert!(!state.is_null(), "render pipeline creation failed");
+    let target = resource::new_texture(
+        gpu,
+        resource::TextureDescriptor {
+            texture_type: 2,
+            pixel_format: 80,
+            width: COVERING_SIZE,
+            height: COVERING_SIZE,
+            depth: 1,
+            mipmap_level_count: 1,
+            sample_count: 1,
+            array_length: 1,
+            storage_mode: 2,
+            usage: gpu::USAGE_RENDER_TARGET,
+        },
+    );
+    // SAFETY: the same calls the guest makes.
+    let (vertices, queue) = unsafe {
+        (
+            new_buffer(device, std::ptr::null(), 48, 0),
+            new_command_queue(device, std::ptr::null()),
+        )
+    };
+    // SAFETY: a buffer this test made, mapped over its whole length.
+    unsafe {
+        let contents = object::body::<resource::Buffer>(vertices).inner.contents as *mut f32;
+        for (index, value) in [
+            -1.0f32, -1.0, 0.0, 1.0, //
+            3.0, -1.0, 0.0, 1.0, //
+            -1.0, 3.0, 0.0, 1.0,
+        ]
+        .iter()
+        .enumerate()
+        {
+            contents.add(index).write(*value);
+        }
+    }
+    Some(CoveringDraw {
+        state,
+        target,
+        vertices,
+        queue,
+    })
+}
+
+impl CoveringDraw {
+    /// A pass clearing the target, with its visibility results in `results`.
+    fn pass(&self, results: Id) -> Id {
+        let pass = object::make(
+            c"MTLRenderPassDescriptor",
+            encoder::RenderPassDescriptor::default(),
+        );
+        // SAFETY: objects this test made, sent the selectors they implement.
+        unsafe {
+            let attachment = element_at(send(pass, "colorAttachments"), 0);
+            send_with_object(attachment, "setTexture:", self.target);
+            send_number(attachment, "setLoadAction:", 2); // Clear
+            send_number(attachment, "setStoreAction:", 1); // Store
+            send_with_object(pass, "setVisibilityResultBuffer:", results);
+        }
+        pass
+    }
+
+    /// # Safety
+    ///
+    /// `encoder` must be a render encoder inside a pass.
+    unsafe fn bind(&self, encoder: Id) {
+        unsafe {
+            send_with_object(encoder, "setRenderPipelineState:", self.state);
+            set_buffer_named(
+                encoder,
+                "setVertexBuffer:offset:atIndex:",
+                self.vertices,
+                0,
+                0,
+            );
+        }
+    }
+}
+
+/// A shared buffer of `words` results, each holding `value`.
+fn results_buffer(device: Id, words: usize, value: u64) -> Id {
+    // SAFETY: the same call the guest makes.
+    let buffer = unsafe { new_buffer(device, std::ptr::null(), words * 8, 0) };
+    for at in 0..words {
+        // SAFETY: a buffer this test made, mapped over its whole length.
+        unsafe {
+            (object::body::<resource::Buffer>(buffer).inner.contents as *mut u64)
+                .add(at)
+                .write(value)
+        };
+    }
+    buffer
+}
+
+fn result_at(buffer: Id, at: usize) -> u64 {
+    // SAFETY: a shared buffer this test made, read after its work completed.
+    unsafe {
+        (object::body::<resource::Buffer>(buffer).inner.contents as *const u64)
+            .add(at)
+            .read()
+    }
+}
+
+/// # Safety
+///
+/// `encoder` must be an `RosemaryMTLCommandEncoder`.
+unsafe fn set_visibility_mode(encoder: Id, mode: u64, offset: u64) {
+    let sel = objc::sel::get("setVisibilityResultMode:offset:");
+    // SAFETY: an object the runtime allocated.
+    let method = unsafe { objc::object::class_of(encoder) }
+        .and_then(|class| class.method(sel))
+        .expect("the selector is registered");
+    // SAFETY: the registered signature.
+    let call: unsafe extern "C" fn(Id, Sel, u64, u64) =
+        unsafe { std::mem::transmute(method.implementation()) };
+    unsafe { call(encoder, sel, mode, offset) };
+}
+
+/// Runs at one offset in one pass add up, a disabled run is not counted, and
+/// an offset the pass never names keeps what it held.
+#[test]
+fn visibility_results_add_each_offsets_runs_in_a_pass() {
+    isolate_metal_fixture!();
+    let Some(device) = gpu_device() else {
+        return;
+    };
+    let Some(fixture) = covering_draw(device) else {
+        return;
+    };
+    const UNTOUCHED: u64 = 0xabab_abab_abab_abab;
+    let results = results_buffer(device, 3, UNTOUCHED);
+    let pass = fixture.pass(results);
+    // SAFETY: objects this test made, sent the selectors they implement.
+    unsafe {
+        let command = send(fixture.queue, "commandBuffer");
+        let render = render_encoder(command, pass);
+        fixture.bind(render);
+        set_visibility_mode(render, VISIBILITY_COUNTING, 0);
+        draw(render, 3);
+        set_visibility_mode(render, VISIBILITY_DISABLED, 0);
+        draw(render, 3);
+        set_visibility_mode(render, VISIBILITY_COUNTING, 0);
+        draw(render, 3);
+        set_visibility_mode(render, VISIBILITY_BOOLEAN, 8);
+        draw(render, 3);
+        send_void(render, "endEncoding");
+        send_void(command, "commit");
+        send_void(command, "waitUntilCompleted");
+    }
+    assert_eq!(result_at(results, 0), 2 * COVERING_SIZE * COVERING_SIZE);
+    assert_ne!(result_at(results, 1), 0);
+    assert_eq!(result_at(results, 2), UNTOUCHED);
+}
+
+/// `MTLVisibilityResultTypeAccumulate` adds to the count already in the
+/// buffer rather than starting from zero.
+#[test]
+fn an_accumulating_pass_adds_to_the_held_result() {
+    isolate_metal_fixture!();
+    let Some(device) = gpu_device() else {
+        return;
+    };
+    let Some(fixture) = covering_draw(device) else {
+        return;
+    };
+    const HELD: u64 = 5;
+    let results = results_buffer(device, 1, HELD);
+    let pass = fixture.pass(results);
+    // SAFETY: objects this test made, sent the selectors they implement.
+    unsafe {
+        send_number(pass, "setVisibilityResultType:", 1); // Accumulate
+        let command = send(fixture.queue, "commandBuffer");
+        let render = render_encoder(command, pass);
+        fixture.bind(render);
+        set_visibility_mode(render, VISIBILITY_COUNTING, 0);
+        draw(render, 3);
+        send_void(render, "endEncoding");
+        send_void(command, "commit");
+        send_void(command, "waitUntilCompleted");
+    }
+    assert_eq!(result_at(results, 0), HELD + COVERING_SIZE * COVERING_SIZE);
+}
+
+/// Each parallel sub-encoder records its own queries, and the pass sums them
+/// all into the one offset they name.
+#[test]
+fn parallel_sub_encoders_add_into_one_result() {
+    isolate_metal_fixture!();
+    let Some(device) = gpu_device() else {
+        return;
+    };
+    let Some(fixture) = covering_draw(device) else {
+        return;
+    };
+    let results = results_buffer(device, 1, 0);
+    let pass = fixture.pass(results);
+    // SAFETY: objects this test made, sent the selectors they implement.
+    unsafe {
+        let command = send(fixture.queue, "commandBuffer");
+        let sel = objc::sel::get("parallelRenderCommandEncoderWithDescriptor:");
+        let method = objc::object::class_of(command)
+            .and_then(|class| class.method(sel))
+            .expect("the selector is registered");
+        let call: unsafe extern "C" fn(Id, Sel, Id) -> Id =
+            std::mem::transmute(method.implementation());
+        let parallel = call(command, sel, pass);
+        for _ in 0..2 {
+            let render = send(parallel, "renderCommandEncoder");
+            fixture.bind(render);
+            set_visibility_mode(render, VISIBILITY_COUNTING, 0);
+            draw(render, 3);
+            send_void(render, "endEncoding");
+        }
+        send_void(parallel, "endEncoding");
+        send_void(command, "commit");
+        send_void(command, "waitUntilCompleted");
+    }
+    assert_eq!(result_at(results, 0), 2 * COVERING_SIZE * COVERING_SIZE);
+}
+
+/// The implementation `selector` has on `receiver`, as a function of type `F`.
+///
+/// # Safety
+///
+/// `F` must be the registered signature.
+unsafe fn method<F: Copy>(receiver: Id, selector: &str) -> (F, Sel) {
+    let sel = objc::sel::get(selector);
+    // SAFETY: an object the runtime allocated.
+    let method = unsafe { objc::object::class_of(receiver) }
+        .and_then(|class| class.method(sel))
+        .expect("the selector is registered");
+    let implementation = method.implementation();
+    // SAFETY: the caller guarantees the signature.
+    (unsafe { std::mem::transmute_copy(&implementation) }, sel)
+}
+
+/// Commit a command buffer which writes 42 into `output` through `kernel`,
+/// after `before` has run on it.
+///
+/// # Safety
+///
+/// Objects of this crate's, `kernel` a compute pipeline writing `output[0]`.
+unsafe fn commit_clear(queue: Id, kernel: Id, output: Id, before: impl FnOnce(Id)) -> Id {
+    unsafe {
+        let command = send(queue, "commandBuffer");
+        before(command);
+        let encoder = send(command, "computeCommandEncoder");
+        send_with_object(encoder, "setComputePipelineState:", kernel);
+        set_buffer_at(encoder, output, 0, 0);
+        dispatch(encoder, 1);
+        send_void(encoder, "endEncoding");
+        send_void(command, "commit");
+        command
+    }
+}
+
+#[test]
+fn an_encoded_event_wait_holds_work_until_the_host_signals() {
+    isolate_metal_fixture!();
+    let Some(device) = gpu_device() else {
+        return;
+    };
+    // SAFETY: objects this test made, sent the selectors they implement.
+    unsafe {
+        let event = send(device, "newSharedEvent");
+        assert!(!event.is_null());
+        let library = source_library(device, TEST_KERNEL);
+        let function = new_function_with_name(
+            library,
+            std::ptr::null(),
+            foundation::string::from_str("clear"),
+        );
+        let mut error = std::ptr::null_mut();
+        let kernel = new_compute_pipeline(device, std::ptr::null(), function, &mut error);
+        let output = new_buffer(device, std::ptr::null(), 16, 0);
+        let queue = new_command_queue(device, std::ptr::null());
+        let (encode, _) = method::<unsafe extern "C" fn(Id, Sel, Id, u64)>(
+            send(queue, "commandBuffer"),
+            "encodeWaitForEvent:value:",
+        );
+        let command = commit_clear(queue, kernel, output, |command| {
+            encode(
+                command,
+                objc::sel::get("encodeWaitForEvent:value:"),
+                event,
+                1,
+            );
+        });
+        let contents = object::body::<resource::Buffer>(output).inner.contents as *const u32;
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        assert_eq!(
+            *contents, 0,
+            "the dispatch ran before the event was signalled"
+        );
+
+        let (set_value, sel) =
+            method::<unsafe extern "C" fn(Id, Sel, u64)>(event, "setSignaledValue:");
+        set_value(event, sel, 1);
+        send_void(command, "waitUntilCompleted");
+        assert_eq!(*contents, 42);
+        assert_eq!(send_number_result(event, "signaledValue"), 1);
+    }
+}
+
+#[test]
+fn an_encoded_event_signal_follows_the_work_before_it() {
+    isolate_metal_fixture!();
+    let Some(device) = gpu_device() else {
+        return;
+    };
+    // SAFETY: objects this test made, sent the selectors they implement.
+    unsafe {
+        let event = send(device, "newSharedEvent");
+        let library = source_library(device, TEST_KERNEL);
+        let function = new_function_with_name(
+            library,
+            std::ptr::null(),
+            foundation::string::from_str("clear"),
+        );
+        let mut error = std::ptr::null_mut();
+        let kernel = new_compute_pipeline(device, std::ptr::null(), function, &mut error);
+        let output = new_buffer(device, std::ptr::null(), 16, 0);
+        let queue = new_command_queue(device, std::ptr::null());
+        let command = send(queue, "commandBuffer");
+        let encoder = send(command, "computeCommandEncoder");
+        send_with_object(encoder, "setComputePipelineState:", kernel);
+        set_buffer_at(encoder, output, 0, 0);
+        dispatch(encoder, 1);
+        send_void(encoder, "endEncoding");
+        let (signal, sel) =
+            method::<unsafe extern "C" fn(Id, Sel, Id, u64)>(command, "encodeSignalEvent:value:");
+        signal(command, sel, event, 5);
+        send_void(command, "commit");
+        let (wait, sel) = method::<unsafe extern "C" fn(Id, Sel, u64, u64) -> bool>(
+            event,
+            "waitUntilSignaledValue:timeoutMS:",
+        );
+        assert!(wait(event, sel, 5, 5_000));
+        let contents = object::body::<resource::Buffer>(output).inner.contents as *const u32;
+        assert_eq!(*contents, 42);
+        send_void(command, "waitUntilCompleted");
+    }
+}
+
+#[test]
+fn placement_heap_buffers_at_one_offset_share_memory() {
+    isolate_metal_fixture!();
+    let Some(device) = gpu_device() else {
+        return;
+    };
+    const PLACEMENT: u64 = 1;
+    const PRIVATE: u64 = 2;
+    // SAFETY: objects this test made, sent the selectors they implement.
+    unsafe {
+        let descriptor = send(
+            send(
+                objc::class::ptr(objc::class::lookup(c"MTLHeapDescriptor").expect("registered"))
+                    as Id,
+                "alloc",
+            ),
+            "init",
+        );
+        let (set, _) = method::<unsafe extern "C" fn(Id, Sel, u64)>(descriptor, "setSize:");
+        set(descriptor, objc::sel::get("setSize:"), 1 << 20);
+        set(descriptor, objc::sel::get("setType:"), PLACEMENT);
+        set(descriptor, objc::sel::get("setStorageMode:"), PRIVATE);
+        let heap = new_heap(device, std::ptr::null(), descriptor);
+        assert!(!heap.is_null());
+        let (place, sel) = method::<unsafe extern "C" fn(Id, Sel, u64, u64, u64) -> Id>(
+            heap,
+            "newBufferWithLength:options:offset:",
+        );
+        let written = place(heap, sel, 16, PRIVATE << 4, 0);
+        let aliased = place(heap, sel, 16, PRIVATE << 4, 0);
+        assert!(!written.is_null() && !aliased.is_null());
+        assert!(place(heap, sel, 16, PRIVATE << 4, 1 << 20).is_null());
+
+        let library = source_library(device, TEST_KERNEL);
+        let function = new_function_with_name(
+            library,
+            std::ptr::null(),
+            foundation::string::from_str("clear"),
+        );
+        let mut error = std::ptr::null_mut();
+        let kernel = new_compute_pipeline(device, std::ptr::null(), function, &mut error);
+        let shared = new_buffer(device, std::ptr::null(), 16, 0);
+        let queue = new_command_queue(device, std::ptr::null());
+        let command = commit_clear(queue, kernel, written, |_| {});
+        send_void(command, "waitUntilCompleted");
+        let command = send(queue, "commandBuffer");
+        let blit = send(command, "blitCommandEncoder");
+        copy_buffer(blit, aliased, shared, 4);
+        send_void(blit, "endEncoding");
+        send_void(command, "commit");
+        send_void(command, "waitUntilCompleted");
+        let contents = object::body::<resource::Buffer>(shared).inner.contents as *const u32;
+        assert_eq!(*contents, 42);
+    }
+}
+
+#[test]
+fn a_released_placement_heap_frees_its_memory_after_its_last_resource() {
+    isolate_metal_fixture!();
+    let Some(device) = gpu_device() else {
+        return;
+    };
+    const PLACEMENT: u64 = 1;
+    const PRIVATE: u64 = 2;
+    // SAFETY: objects this test made, sent the selectors they implement.
+    unsafe {
+        let descriptor = send(
+            send(
+                objc::class::ptr(objc::class::lookup(c"MTLHeapDescriptor").expect("registered"))
+                    as Id,
+                "alloc",
+            ),
+            "init",
+        );
+        let (set, _) = method::<unsafe extern "C" fn(Id, Sel, u64)>(descriptor, "setSize:");
+        set(descriptor, objc::sel::get("setSize:"), 1 << 20);
+        set(descriptor, objc::sel::get("setType:"), PLACEMENT);
+        set(descriptor, objc::sel::get("setStorageMode:"), PRIVATE);
+        let heap = new_heap(device, std::ptr::null(), descriptor);
+        assert!(!heap.is_null());
+        let memory = resource::placement_of(heap).expect("a placement heap");
+        let (place, sel) = method::<unsafe extern "C" fn(Id, Sel, u64, u64, u64) -> Id>(
+            heap,
+            "newBufferWithLength:options:offset:",
+        );
+        let buffer = place(heap, sel, 16, PRIVATE << 4, 0);
+        assert!(!buffer.is_null());
+
+        objc::arc::release(heap);
+        assert!(
+            memory.upgrade().is_some(),
+            "the placed buffer still holds it"
+        );
+        objc::arc::release(buffer);
+        assert!(memory.upgrade().is_none());
+    }
+}
+
+/// A texture buffer has no image, so every call which would copy or attach
+/// one is refused rather than handed to Vulkan with a null `VkImage`.
+#[test]
+fn a_texture_buffer_refuses_image_operations() {
+    isolate_metal_fixture!();
+    let Some(device) = gpu_device() else {
+        return;
+    };
+    const R32_UINT: u64 = 53;
+    const SHADER_READ: u64 = 1;
+    // SAFETY: objects this test made, sent the selectors they implement.
+    unsafe {
+        let texels: [u32; 4] = [10, 20, 30, 40];
+        let backing =
+            new_buffer_with_bytes(device, std::ptr::null(), texels.as_ptr().cast(), 16, 0);
+        let class =
+            objc::class::ptr(objc::class::lookup(c"MTLTextureDescriptor").expect("registered"))
+                as Id;
+        let (describe, sel) = method::<unsafe extern "C" fn(Id, Sel, u64, u64, u64, u64) -> Id>(
+            class,
+            "textureBufferDescriptorWithPixelFormat:width:resourceOptions:usage:",
+        );
+        let descriptor = describe(class, sel, R32_UINT, 4, 0, SHADER_READ);
+        let (make, sel) = method::<unsafe extern "C" fn(Id, Sel, Id, u64, u64) -> Id>(
+            backing,
+            "newTextureWithDescriptor:offset:bytesPerRow:",
+        );
+        let texture = make(backing, sel, descriptor, 0, 16);
+        assert!(!texture.is_null());
+
+        let region = resource::Region {
+            origin: [0; 3],
+            size: [1, 1, 1],
+        };
+        let written = 7u32;
+        let (replace, sel) = method::<
+            unsafe extern "C" fn(Id, Sel, resource::Region, u64, *const u8, u64),
+        >(texture, "replaceRegion:mipmapLevel:withBytes:bytesPerRow:");
+        replace(texture, sel, region, 0, (&raw const written).cast(), 4);
+        let mut read = 0xdead_beefu32;
+        let (get, sel) = method::<unsafe extern "C" fn(Id, Sel, *mut u8, u64, resource::Region, u64)>(
+            texture,
+            "getBytes:bytesPerRow:fromRegion:mipmapLevel:",
+        );
+        get(texture, sel, (&raw mut read).cast(), 4, region, 0);
+        assert_eq!(read, 0xdead_beef);
+        let contents = object::body::<resource::Buffer>(backing).inner.contents as *const u32;
+        assert_eq!(*contents, 10);
+
+        let (view, sel) = method::<unsafe extern "C" fn(Id, Sel, u64) -> Id>(
+            texture,
+            "newTextureViewWithPixelFormat:",
+        );
+        assert!(view(texture, sel, R32_UINT).is_null());
+
+        let pass = object::make(
+            c"MTLRenderPassDescriptor",
+            encoder::RenderPassDescriptor::default(),
+        );
+        let attachment = element_at(send(pass, "colorAttachments"), 0);
+        send_with_object(attachment, "setTexture:", texture);
+        assert!(send(attachment, "texture").is_null());
+    }
+}
+
+#[test]
+fn a_texture_buffer_reads_the_buffer_it_was_made_from() {
+    isolate_metal_fixture!();
+    let Some(device) = gpu_device() else {
+        return;
+    };
+    const R32_UINT: u64 = 53;
+    const SHADER_READ: u64 = 1;
+    let source = "kernel void copy(texture_buffer<uint> source [[texture(0)]],\n\
+                                   device uint* output [[buffer(0)]]) {\n\
+                      output[0] = source.read(uint(2)).x + source.get_width();\n\
+                  }";
+    // SAFETY: objects this test made, sent the selectors they implement.
+    unsafe {
+        let library = source_library(device, source);
+        let function = new_function_with_name(
+            library,
+            std::ptr::null(),
+            foundation::string::from_str("copy"),
+        );
+        let mut error = std::ptr::null_mut();
+        let kernel = new_compute_pipeline(device, std::ptr::null(), function, &mut error);
+        assert!(!kernel.is_null());
+        let texels: [u32; 4] = [10, 20, 30, 40];
+        let backing =
+            new_buffer_with_bytes(device, std::ptr::null(), texels.as_ptr().cast(), 16, 0);
+        let class =
+            objc::class::ptr(objc::class::lookup(c"MTLTextureDescriptor").expect("registered"))
+                as Id;
+        let (describe, sel) = method::<unsafe extern "C" fn(Id, Sel, u64, u64, u64, u64) -> Id>(
+            class,
+            "textureBufferDescriptorWithPixelFormat:width:resourceOptions:usage:",
+        );
+        let descriptor = describe(class, sel, R32_UINT, 4, 0, SHADER_READ);
+        let (make, sel) = method::<unsafe extern "C" fn(Id, Sel, Id, u64, u64) -> Id>(
+            backing,
+            "newTextureWithDescriptor:offset:bytesPerRow:",
+        );
+        let texture = make(backing, sel, descriptor, 0, 16);
+        assert!(!texture.is_null());
+
+        let output = new_buffer(device, std::ptr::null(), 16, 0);
+        let queue = new_command_queue(device, std::ptr::null());
+        let command = send(queue, "commandBuffer");
+        let encoder = send(command, "computeCommandEncoder");
+        send_with_object(encoder, "setComputePipelineState:", kernel);
+        set_buffer_at(encoder, output, 0, 0);
+        let (bind, sel) =
+            method::<unsafe extern "C" fn(Id, Sel, Id, u64)>(encoder, "setTexture:atIndex:");
+        bind(encoder, sel, texture, 0);
+        dispatch(encoder, 1);
+        send_void(encoder, "endEncoding");
+        send_void(command, "commit");
+        send_void(command, "waitUntilCompleted");
+        let contents = object::body::<resource::Buffer>(output).inner.contents as *const u32;
+        assert_eq!(*contents, 30 + 4);
+    }
+}
+
+/// MoltenVK fills in the vertex descriptor a pipeline descriptor vends instead
+/// of setting one, and a set descriptor is a copy the guest can go on editing.
+#[test]
+fn a_pipeline_descriptor_vends_and_copies_its_vertex_descriptor() {
+    isolate_metal_fixture!();
+    bootstrap();
+    const FLOAT3: u64 = 30;
+    let class_of = |name: &std::ffi::CStr| {
+        objc::class::ptr(objc::class::lookup(name).expect("registered")) as Id
+    };
+    // SAFETY: objects this test made, sent the selectors they implement.
+    unsafe {
+        let descriptor = send(
+            send(class_of(c"MTLRenderPipelineDescriptor"), "alloc"),
+            "init",
+        );
+        let vended = send(descriptor, "vertexDescriptor");
+        assert!(!vended.is_null());
+        assert_eq!(vended, send(descriptor, "vertexDescriptor"));
+        send_number(
+            element_at(send(vended, "attributes"), 2),
+            "setFormat:",
+            FLOAT3,
+        );
+        let held = object::body::<pipeline::RenderPipelineDescriptor>(descriptor).vertex_descriptor;
+        assert_eq!(
+            object::body::<resource::VertexDescriptor>(held).attributes[2].format,
+            FLOAT3
+        );
+
+        let own = send(send(class_of(c"MTLVertexDescriptor"), "alloc"), "init");
+        let attribute = element_at(send(own, "attributes"), 0);
+        send_number(attribute, "setFormat:", FLOAT3);
+        send_with_object(descriptor, "setVertexDescriptor:", own);
+        send_number(attribute, "setFormat:", 0);
+        let held = send(descriptor, "vertexDescriptor");
+        assert_ne!(held, own);
+        assert_eq!(
+            object::body::<resource::VertexDescriptor>(held).attributes[0].format,
+            FLOAT3
+        );
+    }
+}
+
+/// Each dispatch reads what the one before it wrote: in a serial encoder by
+/// Metal's ordering, in a concurrent one by the barrier between them.
+#[test]
+fn serial_dispatches_and_concurrent_barriers_order_writes() {
+    isolate_metal_fixture!();
+    let Some(device) = gpu_device() else {
+        return;
+    };
+    const STEPS: u32 = 256;
+    const DISPATCH_SERIAL: u64 = 0;
+    const DISPATCH_CONCURRENT: u64 = 1;
+    const SCOPE_BUFFERS: u64 = 1;
+    let library = source_library(
+        device,
+        "kernel void step(device uint* value [[buffer(0)]]) { value[0] = value[0] + 1; }",
+    );
+    // SAFETY: objects this test made, sent the selectors they implement.
+    unsafe {
+        let function = new_function_with_name(
+            library,
+            std::ptr::null(),
+            foundation::string::from_str("step"),
+        );
+        let mut error = std::ptr::null_mut();
+        let pipeline = new_compute_pipeline(device, std::ptr::null(), function, &mut error);
+        assert!(!pipeline.is_null());
+        let queue = new_command_queue(device, std::ptr::null());
+        for dispatch_type in [DISPATCH_SERIAL, DISPATCH_CONCURRENT] {
+            let buffer = new_buffer(device, std::ptr::null(), 16, 0);
+            let command = send(queue, "commandBuffer");
+            let (make, sel) = method::<unsafe extern "C" fn(Id, Sel, u64) -> Id>(
+                command,
+                "computeCommandEncoderWithDispatchType:",
+            );
+            let encoder = make(command, sel, dispatch_type);
+            send_with_object(encoder, "setComputePipelineState:", pipeline);
+            set_buffer_at(encoder, buffer, 0, 0);
+            for _ in 0..STEPS {
+                dispatch(encoder, 1);
+                if dispatch_type == DISPATCH_CONCURRENT {
+                    send_number(encoder, "memoryBarrierWithScope:", SCOPE_BUFFERS);
+                }
+            }
+            send_void(encoder, "endEncoding");
+            send_void(command, "commit");
+            send_void(command, "waitUntilCompleted");
+            let contents = object::body::<resource::Buffer>(buffer).inner.contents;
+            assert_eq!(
+                std::ptr::read(contents as *const u32),
+                STEPS,
+                "type {dispatch_type}"
+            );
+        }
+    }
+}
+
+/// Run `name` from `source` once per element of a one-dimensional grid of
+/// `threads`, with `buffers` bound from index 0.
+fn run_source_kernel(device: Id, source: &str, name: &str, buffers: &[Id], threads: u64) {
+    let library = source_library(device, source);
+    assert!(!library.is_null(), "the kernel must translate");
+    // SAFETY: objects this test made, sent the selectors they implement.
+    unsafe {
+        let function = new_function_with_name(
+            library,
+            std::ptr::null(),
+            foundation::string::from_str(name),
+        );
+        assert!(!function.is_null(), "{name} must translate");
+        let mut error = std::ptr::null_mut();
+        let pipeline = new_compute_pipeline(device, std::ptr::null(), function, &mut error);
+        assert!(!pipeline.is_null());
+        let queue = new_command_queue(device, std::ptr::null());
+        let command = send(queue, "commandBuffer");
+        let encoder = send(command, "computeCommandEncoder");
+        send_with_object(encoder, "setComputePipelineState:", pipeline);
+        for (index, buffer) in buffers.iter().enumerate() {
+            set_buffer_at(encoder, *buffer, 0, index as u64);
+        }
+        dispatch(encoder, threads);
+        send_void(encoder, "endEncoding");
+        send_void(command, "commit");
+        send_void(command, "waitUntilCompleted");
+    }
+}
+
+fn buffer_with_bytes(device: Id, bytes: &[u8]) -> Id {
+    // SAFETY: the same call the guest makes, with bytes it copies.
+    unsafe {
+        new_buffer_with_bytes(
+            device,
+            std::ptr::null(),
+            bytes.as_ptr().cast(),
+            bytes.len(),
+            0,
+        )
+    }
+}
+
+fn buffer_bytes(buffer: Id, length: usize) -> Vec<u8> {
+    // SAFETY: a shared buffer of at least `length` bytes the device is done with.
+    unsafe {
+        let contents = object::body::<resource::Buffer>(buffer).inner.contents;
+        std::slice::from_raw_parts(contents as *const u8, length).to_vec()
+    }
+}
+
+/// A `char` or `void` buffer viewed through a cast reads and writes whole
+/// values at any byte offset, leaving the bytes around them alone, and a
+/// `bool` member is the byte Metal lays out.
+#[test]
+fn a_byte_buffer_is_read_and_written_as_any_type_at_any_offset() {
+    isolate_metal_fixture!();
+    let Some(device) = gpu_device() else {
+        return;
+    };
+    const SOURCE: &str = "#include <metal_stdlib>\n\
+        using namespace metal;\n\
+        struct Flags { bool negate; bool twice; };\n\
+        template<typename T>\n\
+        static void split(device T* out, uint value) { out[0] = (T)value; out[1] = (T)(value >> 16); }\n\
+        kernel void view(const device char* records [[buffer(0)]],\n\
+                         device MTLDrawIndexedPrimitivesIndirectArguments* args [[buffer(1)]],\n\
+                         device void* halves [[buffer(2)]],\n\
+                         constant Flags& flags [[buffer(3)]],\n\
+                         uint idx [[thread_position_in_grid]]) {\n\
+            const device auto& record = *reinterpret_cast<const device MTLDrawIndexedPrimitivesIndirectArguments*>(records + idx * 22 + 1);\n\
+            args[idx] = record;\n\
+            device auto& arg = args[idx];\n\
+            if (flags.twice) { arg.instanceCount *= 2; }\n\
+            if (flags.negate) { arg.baseVertex = -arg.baseVertex; }\n\
+            split(&((device ushort*)halves)[idx * 3 + 1], record.indexCount);\n\
+        }";
+    let records: [[i32; 5]; 2] = [[0x0003_0007, 5, 9, -4, 11], [0x0001_0002, 6, 10, 7, 12]];
+    let mut packed = vec![0xEEu8; 2 * 22 + 1];
+    for (index, record) in records.iter().enumerate() {
+        let at = index * 22 + 1;
+        for (field, value) in record.iter().enumerate() {
+            packed[at + field * 4..at + field * 4 + 4].copy_from_slice(&value.to_le_bytes());
+        }
+    }
+    let buffers = [
+        buffer_with_bytes(device, &packed),
+        buffer_with_bytes(device, &[0; 40]),
+        buffer_with_bytes(device, &[0xFF; 12]),
+        buffer_with_bytes(device, &[0, 1]),
+    ];
+    run_source_kernel(device, SOURCE, "view", &buffers, 2);
+
+    let args: Vec<i32> = buffer_bytes(buffers[1], 40)
+        .chunks(4)
+        .map(|word| i32::from_le_bytes(word.try_into().unwrap()))
+        .collect();
+    assert_eq!(
+        args,
+        [0x0003_0007, 10, 9, -4, 11, 0x0001_0002, 12, 10, 7, 12]
+    );
+    let halves: Vec<u16> = buffer_bytes(buffers[2], 12)
+        .chunks(2)
+        .map(|half| u16::from_le_bytes(half.try_into().unwrap()))
+        .collect();
+    assert_eq!(halves, [0xFFFF, 7, 3, 0xFFFF, 2, 1]);
+}
+
+/// A `switch` enters at its matching label, or `default` wherever that is,
+/// falls through to the cases after it, and `break` leaves only the switch.
+#[test]
+fn a_switch_falls_through_from_its_label_until_a_break() {
+    isolate_metal_fixture!();
+    let Some(device) = gpu_device() else {
+        return;
+    };
+    const SOURCE: &str = "#include <metal_stdlib>\n\
+        using namespace metal;\n\
+        typedef enum : uint8_t { Zero, One, Four = 4, Five } Step;\n\
+        kernel void steps(device uint* out [[buffer(0)]], uint idx [[thread_position_in_grid]]) {\n\
+            uint trail = 0;\n\
+            for (uint pass = 0; pass < 2; pass++) {\n\
+                switch ((Step)idx) {\n\
+                    case Zero: trail = trail * 10 + 1;\n\
+                    case One: trail = trail * 10 + 2; break;\n\
+                    case Four: trail = trail * 10 + 3;\n\
+                    default: trail = trail * 10 + 9;\n\
+                    case Five: trail = trail * 10 + 5; break;\n\
+                }\n\
+            }\n\
+            out[idx] = trail;\n\
+        }";
+    let out = buffer_with_bytes(device, &[0; 28]);
+    run_source_kernel(device, SOURCE, "steps", &[out], 7);
+    let trails: Vec<u32> = buffer_bytes(out, 28)
+        .chunks(4)
+        .map(|word| u32::from_le_bytes(word.try_into().unwrap()))
+        .collect();
+    assert_eq!(trails, [1212, 22, 9595, 9595, 395395, 55, 9595]);
 }

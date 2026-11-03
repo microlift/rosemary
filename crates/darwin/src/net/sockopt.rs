@@ -740,6 +740,20 @@ unsafe fn local_option(fd: i32, name: i32, value: *mut c_void, len: *mut u32) ->
     0
 }
 
+/// Whether `fd` is a Unix-domain socket.
+///
+/// `SOL_LOCAL` and `IPPROTO_IP` are both level 0; Darwin tells them apart by
+/// the socket's domain, so `IP_MULTICAST_IF` on an inet socket is not
+/// `SOL_LOCAL`'s option 9.
+fn is_local_socket(fd: i32) -> bool {
+    // SAFETY: zero is a valid `sockaddr_storage`.
+    let mut addr: libc::sockaddr_storage = unsafe { core::mem::zeroed() };
+    let mut len = size_of::<libc::sockaddr_storage>() as libc::socklen_t;
+    // SAFETY: a `sockaddr_storage` this function owns, with its own size.
+    let rc = unsafe { libc::getsockname(fd, (&raw mut addr).cast(), &mut len) };
+    rc == 0 && i32::from(addr.ss_family) == libc::AF_UNIX
+}
+
 /// `int getsockopt(int, int, int, void *, socklen_t *)`
 ///
 /// # Safety
@@ -764,7 +778,7 @@ unsafe extern "C" fn getsockopt(
         // SAFETY: the caller's buffer and length slot.
         return unsafe { queued_bytes(fd, name, value, len) };
     }
-    if level == SOL_LOCAL {
+    if level == SOL_LOCAL && is_local_socket(fd) {
         // SAFETY: the caller's buffer and length slot.
         return unsafe { local_option(fd, name, value, len) };
     }
@@ -1019,6 +1033,46 @@ mod tests {
 
         // SAFETY: a descriptor this test opened and no longer uses.
         unsafe { libc::close(fd) };
+    }
+
+    /// Level 0 is `IPPROTO_IP` on an inet socket and `SOL_LOCAL` on a Unix
+    /// one, so the same name reaches a different option on each.
+    #[test]
+    fn level_zero_is_chosen_by_the_sockets_domain() {
+        use std::os::fd::AsRawFd;
+        // SAFETY: a UDP socket of this host's own making.
+        let inet = unsafe { libc::socket(libc::AF_INET, libc::SOCK_DGRAM, 0) };
+        assert!(inet >= 0);
+        let mut interface = [0xffu8; 4];
+        let mut len = 4u32;
+        // SAFETY: four writable bytes and a live length.
+        let rc = unsafe {
+            getsockopt(
+                inet,
+                IPPROTO_IP,
+                ip::MULTICAST_IF,
+                interface.as_mut_ptr().cast(),
+                &mut len,
+            )
+        };
+        assert_eq!((rc, len, interface), (0, 4, [0; 4]), "INADDR_ANY");
+        // SAFETY: a descriptor this test opened and no longer uses.
+        unsafe { libc::close(inet) };
+
+        let (local, _other) = std::os::unix::net::UnixStream::pair().unwrap();
+        let mut pid = 0i32;
+        let mut len = 4u32;
+        // SAFETY: four writable bytes and a live length.
+        let rc = unsafe {
+            getsockopt(
+                local.as_raw_fd(),
+                SOL_LOCAL,
+                LOCAL_PEERPID,
+                (&raw mut pid).cast(),
+                &mut len,
+            )
+        };
+        assert_eq!((rc, pid), (0, std::process::id() as i32));
     }
 
     /// The timeout's `tv_usec` is thirty-two bits wide on Darwin and sixty-four

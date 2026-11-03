@@ -1,6 +1,6 @@
 use std::collections::VecDeque;
 use std::ffi::{CString, c_char, c_void};
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 
 use super::block;
@@ -108,6 +108,8 @@ struct State {
     /// Held by the one worker allowed to run this serial queue's work. Unused for a
     /// concurrent queue, which has no such restriction.
     draining: bool,
+    /// `dispatch_suspend`s not yet balanced by a resume. Work stays queued.
+    suspended: u32,
 }
 
 /// The queue a handle names, if it names a live one.
@@ -133,6 +135,7 @@ fn new(label: &str, concurrent: bool, main: bool) -> u64 {
         state: Mutex::new(State {
             pending: VecDeque::new(),
             draining: false,
+            suspended: 0,
         }),
     });
     Box::into_raw(queue) as u64
@@ -151,21 +154,15 @@ pub fn create_serial(label: &str) -> u64 {
     new(label, false, false)
 }
 
-/// The main thread, as `pthread` numbers threads. Recorded rather than assumed:
-/// `dispatch_sync` to the main queue has to know whether it is already there, and
-/// answering that wrongly is either a deadlock or a broken ordering promise.
-static MAIN_THREAD: AtomicU32 = AtomicU32::new(0);
-
-/// Record the calling thread as the main one.
+/// Whether the caller is the process's first thread, the one the main queue
+/// belongs to.
 ///
-/// Called from `provide`, which runs on the main thread while the guest is being
-/// linked - before any queue exists, let alone any work on one.
-pub fn note_main_thread() {
-    MAIN_THREAD.store(crate::pthread::id(), Ordering::Release);
-}
-
+/// Not whichever thread bound `_dispatch_main_q`: the Java launcher loads the
+/// VM and its libraries from a second thread, then sends `JavaMain` back to the
+/// first one with a synchronous main-queue perform.
 fn on_main_thread() -> bool {
-    MAIN_THREAD.load(Ordering::Acquire) == crate::pthread::id()
+    // SAFETY: no arguments; answers about the calling thread.
+    unsafe { crate::pthread::main_np() != 0 }
 }
 
 /// `_dispatch_main_q`, which a guest takes the address of.
@@ -178,24 +175,55 @@ pub fn main_queue() -> u64 {
     *MAIN.get_or_init(|| global("com.apple.main-thread", false, true))
 }
 
-/// Run everything the main queue is holding.
+/// What wakes the main thread's run loop when work lands on the main queue.
+static MAIN_WAKE: AtomicUsize = AtomicUsize::new(0);
+
+/// Install the waker for the main queue.
+///
+/// On a Mac the main queue is a port the main run loop listens on, so work sent
+/// to it from another thread ends the loop's wait at once. Without a waker it
+/// waits for whatever else ends the wait - a frame posted by a worker sat out the
+/// rest of the run loop's slice.
+pub fn set_main_wake_hook(hook: fn()) {
+    MAIN_WAKE.store(hook as usize, Ordering::Release);
+    // Anything queued before the hook existed is still owed a turn.
+    hook();
+}
+
+fn wake_main() {
+    let hook = MAIN_WAKE.load(Ordering::Acquire);
+    if hook != 0 {
+        // SAFETY: only `set_main_wake_hook` stores here, and it stores a `fn()`.
+        let hook: fn() = unsafe { std::mem::transmute(hook) };
+        hook();
+    }
+}
+
+/// Run everything the main queue is holding; true if anything ran.
 ///
 /// Called from whatever turns the main thread's run loop. Only the work already
 /// queued on entry runs: a block that submits to the main queue would otherwise be
 /// able to hold the run loop here forever, and starving the run loop starves drawing
-/// and input along with it.
-pub fn drain_main() {
+/// and input along with it. A run loop turned from inside a main-queue block does
+/// not drain it again, since the queue is serial.
+pub fn drain_main() -> bool {
     let handle = main_queue();
     // SAFETY: the main queue is this module's own and lives for the process.
     let Some(main) = (unsafe { queue(handle) }) else {
-        return;
+        return false;
     };
-    let mut budget = main
-        .state
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .pending
-        .len();
+    if inside(handle) {
+        return false;
+    }
+    let mut budget = {
+        let state = main.state.lock().unwrap_or_else(|e| e.into_inner());
+        if state.suspended > 0 {
+            0
+        } else {
+            state.pending.len()
+        }
+    };
+    let mut ran = false;
     while budget > 0 {
         let Some(item) = main
             .state
@@ -204,13 +232,15 @@ pub fn drain_main() {
             .pending
             .pop_front()
         else {
-            return;
+            break;
         };
         budget -= 1;
+        ran = true;
         // SAFETY: guest work whose pointers are thunks. Run with no lock held: it is
         // guest code, and it may submit to this very queue.
         run_tracked(handle, || unsafe { item.run() });
     }
+    ran
 }
 
 thread_local! {
@@ -363,7 +393,7 @@ fn run_one(handle: u64) {
         let mut state = q.state.lock().unwrap_or_else(|e| e.into_inner());
         // Another worker already owns this serial queue. It re-enqueues when it is
         // done, so the work is not lost by returning here.
-        if !q.concurrent && state.draining {
+        if (!q.concurrent && state.draining) || state.suspended > 0 {
             return;
         }
         match state.pending.pop_front() {
@@ -408,7 +438,9 @@ fn submit(handle: u64, item: Item) {
         .push_back(item);
     // The main queue is drained by the main thread alone; handing it to the pool
     // would run its work on the wrong thread, which is the one thing it promises.
-    if !q.main {
+    if q.main {
+        wake_main();
+    } else {
         schedule(handle);
     }
 }
@@ -426,6 +458,43 @@ pub unsafe extern "C" fn queue_create(label: *const c_char, attr: u64) -> u64 {
     // SAFETY: a null or NUL-terminated C string from the guest.
     let label = unsafe { label_of(label) };
     new(&label, attr == concurrent_attr(), false)
+}
+
+/// `void dispatch_suspend(dispatch_object_t)`.
+pub unsafe extern "C" fn suspend(handle: u64) {
+    if super::source::suspend(handle) {
+        return;
+    }
+    // SAFETY: the guest holds a reference for the duration of the call.
+    if let Some(q) = unsafe { queue(handle) } {
+        q.state.lock().unwrap_or_else(|e| e.into_inner()).suspended += 1;
+    }
+}
+
+/// `void dispatch_resume(dispatch_object_t)`.
+pub unsafe extern "C" fn resume(handle: u64) {
+    if super::source::resume(handle) {
+        return;
+    }
+    // SAFETY: the guest holds a reference for the duration of the call.
+    let Some(q) = (unsafe { queue(handle) }) else {
+        return;
+    };
+    let runnable = {
+        let mut state = q.state.lock().unwrap_or_else(|e| e.into_inner());
+        if state.suspended == 0 {
+            return;
+        }
+        state.suspended -= 1;
+        state.suspended == 0 && !state.pending.is_empty()
+    };
+    if runnable {
+        if q.main {
+            wake_main();
+        } else {
+            schedule(handle);
+        }
+    }
 }
 
 /// `dispatch_queue_t dispatch_queue_create_with_target(const char *,
@@ -757,7 +826,7 @@ pub unsafe extern "C" fn after_f(when: u64, handle: u64, context: u64, function:
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::AtomicU64;
+    use std::sync::atomic::{AtomicU32, AtomicU64};
 
     static ORDER: Mutex<Vec<u64>> = Mutex::new(Vec::new());
 
@@ -880,11 +949,47 @@ mod tests {
         unsafe { object::release(q) };
     }
 
+    /// The tests that drain the main queue, one at a time: each would run the
+    /// other's work.
+    static MAIN_QUEUE: Mutex<()> = Mutex::new(());
+
+    unsafe extern "C" fn note_thread(context: u64) {
+        // SAFETY: every caller passes the address of a live `AtomicU32`.
+        let ran_on = unsafe { &*(context as *const AtomicU32) };
+        ran_on.store(crate::pthread::id(), Ordering::Release);
+    }
+
+    /// A `dispatch_sync` to the main queue from another thread waits for the
+    /// main thread rather than running where it was sent from.
+    #[test]
+    fn a_main_queue_sync_from_another_thread_runs_where_the_queue_is_drained() {
+        let _main = MAIN_QUEUE.lock().unwrap_or_else(|e| e.into_inner());
+        static RAN_ON: AtomicU32 = AtomicU32::new(0);
+        let sender = std::thread::spawn(|| {
+            // SAFETY: the main queue is live for the process, and so is the slot.
+            unsafe {
+                sync_f(
+                    main_queue(),
+                    &RAN_ON as *const _ as u64,
+                    note_thread as *const () as usize as u64,
+                )
+            };
+            crate::pthread::id()
+        });
+        while !sender.is_finished() {
+            drain_main();
+            std::thread::yield_now();
+        }
+        let sender = sender.join().unwrap();
+        assert_eq!(RAN_ON.load(Ordering::Acquire), crate::pthread::id());
+        assert_ne!(RAN_ON.load(Ordering::Acquire), sender);
+    }
+
     /// The main queue must not be drained by the pool, only by the main thread.
     #[test]
     fn the_main_queue_waits_for_a_drain() {
+        let _main = MAIN_QUEUE.lock().unwrap_or_else(|e| e.into_inner());
         let counter = AtomicU32::new(0);
-        note_main_thread();
         // SAFETY: the main queue is live for the process, and so is the counter.
         unsafe {
             async_f(

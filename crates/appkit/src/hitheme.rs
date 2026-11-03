@@ -442,7 +442,12 @@ pub unsafe extern "C" fn HIThemeDrawTrack(
                 disabled,
                 ..aqua::Look::default()
             };
-            aqua::slider(&p, r, horizontal, fraction, look);
+            let size = match kind {
+                6 => Small,
+                13 => Mini,
+                _ => Regular,
+            };
+            aqua::slider(&p, r, horizontal, size, fraction, look);
         }
         // Determinate bars, and the relevance bar, which fills the same way.
         3 | 5 => aqua::progress_bar(&p, r, horizontal, Some(fraction), Small),

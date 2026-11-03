@@ -95,6 +95,27 @@ pub struct Usage {
     pub start_ns: u64,
 }
 
+/// What a process has mapped and resident: the memory figures of [`Usage`].
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Footprint {
+    pub virtual_size: u64,
+    pub resident_size: u64,
+    pub resident_peak: u64,
+    /// As [`Usage::shared_size`].
+    pub shared_size: u64,
+}
+
+impl From<&Usage> for Footprint {
+    fn from(usage: &Usage) -> Footprint {
+        Footprint {
+            virtual_size: usage.virtual_size,
+            resident_size: usage.resident_size,
+            resident_peak: usage.resident_peak,
+            shared_size: usage.shared_size,
+        }
+    }
+}
+
 /// One thread of a process.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Thread {
@@ -173,6 +194,13 @@ pub fn process(pid: i32) -> Option<Process> {
 
 pub fn usage(pid: i32) -> Option<Usage> {
     sys::usage(pid)
+}
+
+/// `pid`'s [`Footprint`], which costs far less than [`usage`] where the host
+/// makes the rest expensive: Linux counts threads by reading each one's `stat`,
+/// milliseconds in a process with a hundred of them.
+pub fn footprint(pid: i32) -> Option<Footprint> {
+    sys::footprint(pid)
 }
 
 /// `pid`'s threads, in tid order.

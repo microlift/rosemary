@@ -3,6 +3,7 @@ use microlift::arch::x86_64::context::RegisterContext;
 use crate::abi::{GuestMemory, Result};
 
 use super::{bad_pointer, set_int_return};
+use crate::shims::bind;
 
 /// `x86_THREAD_STATE64`, and the number of 32-bit words it occupies.
 const X86_THREAD_STATE64: u32 = 4;
@@ -188,8 +189,7 @@ pub fn warm() {
 /// every flavour but the two above - a guest crash reporter asking for
 /// `THREAD_IDENTIFIER_INFO` is asking something the kernel can answer.
 fn passthrough(symbol: &str, ctx: &mut RegisterContext) -> Result<()> {
-    let name = symbol.strip_prefix('_').unwrap_or(symbol);
-    let index = match name {
+    let index = match symbol {
         "thread_get_state" => 0,
         "pthread_get_stackaddr_np" => 1,
         _ => 2,
@@ -210,14 +210,18 @@ fn passthrough(symbol: &str, ctx: &mut RegisterContext) -> Result<()> {
     Ok(())
 }
 
-pub type Shim = fn(&str, &mut RegisterContext, &mut dyn GuestMemory) -> Result<()>;
+pub type Shim = crate::shims::Shim;
 
 /// Whether `name` (underscore already stripped) is one of this module's.
 pub fn shim_for(name: &str) -> Option<Shim> {
     match name {
-        "thread_get_state" => Some(thread_get_state),
-        "pthread_get_stackaddr_np" => Some(pthread_get_stackaddr_np),
-        "pthread_get_stacksize_np" => Some(pthread_get_stacksize_np),
+        "thread_get_state" => Some(bind!("thread_get_state" => thread_get_state)),
+        "pthread_get_stackaddr_np" => {
+            Some(bind!("pthread_get_stackaddr_np" => pthread_get_stackaddr_np))
+        }
+        "pthread_get_stacksize_np" => {
+            Some(bind!("pthread_get_stacksize_np" => pthread_get_stacksize_np))
+        }
         _ => None,
     }
 }

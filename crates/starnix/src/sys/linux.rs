@@ -10,11 +10,11 @@ use std::path::PathBuf;
 use std::sync::OnceLock;
 
 use crate::process::{
-    Audit, Descriptor, DescriptorKind, FileId, Identity, InUse, Process, Region, State, Thread,
-    Usage,
+    Audit, Descriptor, DescriptorKind, FileId, Footprint, Identity, InUse, Process, Region, State,
+    Thread, Usage,
 };
 use crate::socket::Peer;
-use crate::system::{CpuTicks, Memory, page_size};
+use crate::system::{CpuTicks, Memory, Swap, page_size};
 
 /// `/proc/<pid>/stat` from the state onwards, split on whitespace.
 ///
@@ -139,10 +139,8 @@ pub fn process(pid: i32) -> Option<Process> {
     })
 }
 
-pub fn usage(pid: i32) -> Option<Usage> {
-    let stat = Stat::read(&format!("/proc/{pid}/stat"))?;
-    let status = std::fs::read_to_string(format!("/proc/{pid}/status")).unwrap_or_default();
-    let statm = std::fs::read_to_string(format!("/proc/{pid}/statm")).unwrap_or_default();
+/// The sizes `statm` gives, with the peak from `status`.
+fn footprint_from(statm: &str, status: &str) -> Footprint {
     let mut pages = statm
         .split_whitespace()
         .map(|word| word.parse::<u64>().unwrap_or(0));
@@ -150,6 +148,25 @@ pub fn usage(pid: i32) -> Option<Usage> {
     let virtual_size = pages.next().unwrap_or(0) * page;
     let resident_size = pages.next().unwrap_or(0) * page;
     let shared_size = pages.next().unwrap_or(0) * page;
+    Footprint {
+        virtual_size,
+        resident_size,
+        resident_peak: (status_number(status, "VmHWM:") * 1024).max(resident_size),
+        shared_size,
+    }
+}
+
+pub fn footprint(pid: i32) -> Option<Footprint> {
+    let statm = std::fs::read_to_string(format!("/proc/{pid}/statm")).ok()?;
+    let status = std::fs::read_to_string(format!("/proc/{pid}/status")).unwrap_or_default();
+    Some(footprint_from(&statm, &status))
+}
+
+pub fn usage(pid: i32) -> Option<Usage> {
+    let stat = Stat::read(&format!("/proc/{pid}/stat"))?;
+    let status = std::fs::read_to_string(format!("/proc/{pid}/status")).unwrap_or_default();
+    let statm = std::fs::read_to_string(format!("/proc/{pid}/statm")).unwrap_or_default();
+    let footprint = footprint_from(&statm, &status);
     // Unreadable for a process that changed credentials, which leaves the
     // counters at zero rather than refusing the whole answer.
     let io = std::fs::read_to_string(format!("/proc/{pid}/io")).unwrap_or_default();
@@ -158,10 +175,10 @@ pub fn usage(pid: i32) -> Option<Usage> {
         .map_or(0, |regions| regions.len() as u32);
     let threads = threads(pid).unwrap_or_default();
     Some(Usage {
-        virtual_size,
-        resident_size,
-        resident_peak: (status_number(&status, "VmHWM:") * 1024).max(resident_size),
-        shared_size,
+        virtual_size: footprint.virtual_size,
+        resident_size: footprint.resident_size,
+        resident_peak: footprint.resident_peak,
+        shared_size: footprint.shared_size,
         user_ns: ticks_to_ns(stat.num(14)),
         system_ns: ticks_to_ns(stat.num(15)),
         minor_faults: stat.num(10).max(0) as u64,
@@ -389,22 +406,21 @@ pub fn cpu_ticks() -> CpuTicks {
 
 /// Distinct sibling sets in sysfs: one per core, however many threads it runs.
 pub fn physical_cores() -> Option<u32> {
-    let mut cores = std::collections::BTreeSet::new();
-    for entry in std::fs::read_dir("/sys/devices/system/cpu").ok()?.flatten() {
-        let name = entry.file_name();
-        let Some(index) = name.to_str().and_then(|n| n.strip_prefix("cpu")) else {
-            continue;
-        };
-        if index.is_empty() || !index.bytes().all(|b| b.is_ascii_digit()) {
-            continue;
-        }
-        if let Ok(siblings) =
-            std::fs::read_to_string(entry.path().join("topology/thread_siblings_list"))
-        {
-            cores.insert(siblings.trim().to_string());
-        }
-    }
+    let cores: std::collections::BTreeSet<String> = cpus()?
+        .filter_map(|cpu| std::fs::read_to_string(cpu.join("topology/thread_siblings_list")).ok())
+        .map(|siblings| siblings.trim().to_string())
+        .collect();
     (!cores.is_empty()).then_some(cores.len() as u32)
+}
+
+/// Each `cpuN` directory in sysfs.
+fn cpus() -> Option<impl Iterator<Item = PathBuf>> {
+    let entries = std::fs::read_dir("/sys/devices/system/cpu").ok()?;
+    Some(entries.flatten().filter_map(|entry| {
+        let name = entry.file_name();
+        let index = name.to_str()?.strip_prefix("cpu")?;
+        (!index.is_empty() && index.bytes().all(|b| b.is_ascii_digit())).then(|| entry.path())
+    }))
 }
 
 pub fn cpu_brand() -> Option<String> {
@@ -414,6 +430,54 @@ pub fn cpu_brand() -> Option<String> {
         matches!(key.trim(), "model name" | "Model name" | "Processor")
             .then(|| value.trim().to_string())
     })
+}
+
+/// Distinct `physical_package_id`s in sysfs: one per socket.
+pub fn packages() -> Option<u32> {
+    let packages: std::collections::BTreeSet<String> = cpus()?
+        .filter_map(|cpu| std::fs::read_to_string(cpu.join("topology/physical_package_id")).ok())
+        .map(|id| id.trim().to_string())
+        .collect();
+    (!packages.is_empty()).then_some(packages.len() as u32)
+}
+
+/// `cpufreq`'s base frequency where the driver knows it (`intel_pstate`), and
+/// its highest otherwise; both in kHz.
+pub fn cpu_frequency() -> Option<u64> {
+    const HZ_PER_KHZ: u64 = 1000;
+    let cpufreq = std::path::Path::new("/sys/devices/system/cpu/cpu0/cpufreq");
+    ["base_frequency", "cpuinfo_max_freq"]
+        .into_iter()
+        .find_map(|file| {
+            let text = std::fs::read_to_string(cpufreq.join(file)).ok()?;
+            text.trim().parse::<u64>().ok()
+        })
+        .map(|khz| khz * HZ_PER_KHZ)
+}
+
+pub fn booted() -> Option<std::time::SystemTime> {
+    let seconds = u64::try_from(boot_time()).ok().filter(|&s| s > 0)?;
+    Some(std::time::UNIX_EPOCH + std::time::Duration::from_secs(seconds))
+}
+
+pub fn swap() -> Option<Swap> {
+    let text = std::fs::read_to_string("/proc/meminfo").ok()?;
+    Some(Swap {
+        total: meminfo(&text, "SwapTotal:"),
+        free: meminfo(&text, "SwapFree:"),
+    })
+}
+
+/// A process needs both a pid and a task, so whichever runs out first.
+pub fn max_processes() -> Option<u32> {
+    let limit = |name: &str| {
+        let text = std::fs::read_to_string(format!("/proc/sys/kernel/{name}")).ok()?;
+        text.trim().parse::<u32>().ok()
+    };
+    match (limit("threads-max"), limit("pid_max")) {
+        (Some(tasks), Some(pids)) => Some(tasks.min(pids)),
+        (tasks, pids) => tasks.or(pids),
+    }
 }
 
 /// systemd's machine id, or D-Bus's where it is not installed.

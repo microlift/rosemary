@@ -3,6 +3,7 @@ use core::ffi::c_void;
 use microlift::arch::x86_64::context::RegisterContext;
 
 use crate::abi::{Callbacks, GuestMemory, Result};
+use crate::shims::bind;
 
 /// `CFRunLoopSourceContext`: ten words, with `perform` last.
 const SOURCE_CONTEXT_WORDS: usize = 10;
@@ -150,8 +151,12 @@ pub fn shim_for(name: &str) -> Option<CallbackShim> {
         return None;
     }
     match name {
-        "CFRunLoopSourceCreate" => Some(run_loop_source_create),
-        "CFRunLoopTimerCreate" => Some(run_loop_timer_create),
+        "CFRunLoopSourceCreate" => {
+            Some(bind!(callback "CFRunLoopSourceCreate" => run_loop_source_create))
+        }
+        "CFRunLoopTimerCreate" => {
+            Some(bind!(callback "CFRunLoopTimerCreate" => run_loop_timer_create))
+        }
         _ => None,
     }
 }

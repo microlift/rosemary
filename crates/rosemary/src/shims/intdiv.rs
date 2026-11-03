@@ -1,23 +1,26 @@
 use microlift::arch::x86_64::context::RegisterContext;
 
 use crate::abi::{AbiError, GuestMemory, Result};
+use crate::shims::bind;
 
 /// One of this module's implementations, in the shape [`crate::shims`] wants.
-pub type Shim = fn(&str, &mut RegisterContext, &mut dyn GuestMemory) -> Result<()>;
+pub type Shim = crate::shims::Shim;
 
 /// Whether `name` (underscore already stripped) is one of this module's.
 pub fn shim_for(name: &str) -> Option<Shim> {
     match name {
-        "div" => Some(div),
+        "div" => Some(bind!("div" => div)),
         // `lldiv` and `imaxdiv` are `ldiv` under other names on an LP64
         // platform.
-        "ldiv" | "lldiv" | "imaxdiv" => Some(ldiv),
+        "ldiv" => Some(bind!("ldiv" => ldiv)),
+        "lldiv" => Some(bind!("lldiv" => ldiv)),
+        "imaxdiv" => Some(bind!("imaxdiv" => ldiv)),
         // The compiler-rt 128-bit helpers.
-        "__udivti3" => Some(udivti3),
-        "__umodti3" => Some(umodti3),
-        "__divti3" => Some(divti3),
-        "__modti3" => Some(modti3),
-        "__udivmodti4" => Some(udivmodti4),
+        "__udivti3" => Some(bind!("__udivti3" => udivti3)),
+        "__umodti3" => Some(bind!("__umodti3" => umodti3)),
+        "__divti3" => Some(bind!("__divti3" => divti3)),
+        "__modti3" => Some(bind!("__modti3" => modti3)),
+        "__udivmodti4" => Some(bind!("__udivmodti4" => udivmodti4)),
         _ => None,
     }
 }
@@ -150,22 +153,22 @@ mod tests {
         }
     }
 
-    fn call(shim: Shim, numer: u64, denom: u64) -> (u64, u64) {
+    fn call(name: &str, numer: u64, denom: u64) -> (u64, u64) {
         let mut ctx = RegisterContext::new();
         ctx.rdi = numer;
         ctx.rsi = denom;
-        shim("div", &mut ctx, &mut NoMemory).expect("divides");
+        shim_for(name).expect("shimmed")(&mut ctx, &mut NoMemory).expect("divides");
         (ctx.rax, ctx.rdx)
     }
 
     /// Call a 128-bit helper the way SysV would: `rdi:rsi`, then `rdx:rcx`.
-    fn call128(shim: Shim, a: u128, b: u128) -> (u128, RegisterContext) {
+    fn call128(name: &str, a: u128, b: u128) -> (u128, RegisterContext) {
         let mut ctx = RegisterContext::new();
         ctx.rdi = a as u64;
         ctx.rsi = (a >> 64) as u64;
         ctx.rdx = b as u64;
         ctx.rcx = (b >> 64) as u64;
-        shim("__udivti3", &mut ctx, &mut NoMemory).expect("divides");
+        shim_for(name).expect("shimmed")(&mut ctx, &mut NoMemory).expect("divides");
         (u128::from(ctx.rax) | (u128::from(ctx.rdx) << 64), ctx)
     }
 
@@ -175,28 +178,34 @@ mod tests {
         // `rdi` and `rdx` would get a different answer rather than a wrong-
         // looking one.
         let a = 1u128 << 100;
-        let (q, _) = call128(udivti3, a, 3);
+        let (q, _) = call128("__udivti3", a, 3);
         assert_eq!(q, a / 3);
-        let (r, _) = call128(umodti3, a, 3);
+        let (r, _) = call128("__umodti3", a, 3);
         assert_eq!(r, a % 3);
     }
 
     #[test]
     fn the_signed_forms_truncate_toward_zero() {
         let a = -(1i128 << 100);
-        let (q, _) = call128(divti3, a as u128, 3);
+        let (q, _) = call128("__divti3", a as u128, 3);
         assert_eq!(q as i128, a / 3);
-        let (r, _) = call128(modti3, a as u128, 3);
+        let (r, _) = call128("__modti3", a as u128, 3);
         assert_eq!(r as i128, a % 3);
     }
 
     #[test]
     fn a_zero_divisor_is_refused_rather_than_answered() {
-        for shim in [udivti3, umodti3, divti3, modti3, udivmodti4] {
+        for name in [
+            "__udivti3",
+            "__umodti3",
+            "__divti3",
+            "__modti3",
+            "__udivmodti4",
+        ] {
             let mut ctx = RegisterContext::new();
             ctx.rdi = 1;
             assert!(
-                shim("__udivti3", &mut ctx, &mut NoMemory).is_err(),
+                shim_for(name).expect("shimmed")(&mut ctx, &mut NoMemory).is_err(),
                 "a zero divisor answered"
             );
         }
@@ -211,7 +220,7 @@ mod tests {
     #[test]
     fn a_div_t_arrives_whole_in_rax() {
         // 17 / 5 = 3 remainder 2, packed low-half-first.
-        let (rax, _) = call(div, 17, 5);
+        let (rax, _) = call("div", 17, 5);
         assert_eq!(rax & 0xffff_ffff, 3);
         assert_eq!(rax >> 32, 2);
     }
@@ -220,18 +229,18 @@ mod tests {
     fn division_truncates_toward_zero_as_c_says() {
         // Not floor division: -7 / 2 is -3 remainder -1, and the sign of the
         // remainder follows the numerator.
-        let (rax, _) = call(div, (-7i32) as u32 as u64, 2);
+        let (rax, _) = call("div", (-7i32) as u32 as u64, 2);
         assert_eq!(rax as u32 as i32, -3);
         assert_eq!((rax >> 32) as u32 as i32, -1);
 
-        let (quot, rem) = call(ldiv, (-7i64) as u64, 2);
+        let (quot, rem) = call("ldiv", (-7i64) as u64, 2);
         assert_eq!(quot as i64, -3);
         assert_eq!(rem as i64, -1);
     }
 
     #[test]
     fn an_ldiv_t_is_two_registers() {
-        let (quot, rem) = call(ldiv, 1_000_000_000_007, 1_000_000);
+        let (quot, rem) = call("ldiv", 1_000_000_000_007, 1_000_000);
         assert_eq!(quot, 1_000_000);
         assert_eq!(rem, 7);
     }

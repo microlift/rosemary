@@ -1,6 +1,7 @@
 use microlift::arch::x86_64::context::RegisterContext;
 
 use crate::abi::{GuestMemory, Result};
+use crate::shims::bind;
 
 /// Count CGL presentation without passing compatibility handles to the native
 /// overlay. Register and memory handling stays in the runtime bridge.
@@ -17,5 +18,6 @@ fn flush_drawable(
 }
 
 pub fn shim_for(name: &str) -> Option<super::Shim> {
-    (crate::frameworks::using_builtin() && name == "CGLFlushDrawable").then_some(flush_drawable)
+    (crate::frameworks::using_builtin() && name == "CGLFlushDrawable")
+        .then_some(bind!("CGLFlushDrawable" => flush_drawable))
 }

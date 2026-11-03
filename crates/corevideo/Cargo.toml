@@ -11,3 +11,9 @@ corefoundation.workspace = true
 darwin.workspace = true
 objc.workspace = true
 sdl3.workspace = true
+
+[dev-dependencies]
+libc.workspace = true
+
+[lints]
+workspace = true

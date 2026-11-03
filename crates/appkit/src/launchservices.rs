@@ -86,6 +86,14 @@ fn main_url() -> Option<CFTypeRef> {
     ))
 }
 
+/// A file URL for the application whose bundle identifier is `identifier`,
+/// which the caller owns. The running application is the only one registered.
+pub(crate) fn application_url(identifier: &str) -> Option<CFTypeRef> {
+    (main_identifier().as_deref() == Some(identifier))
+        .then(main_url)
+        .flatten()
+}
+
 /// Answer an application lookup that found the running application: through
 /// the URL, since there is no `FSRef` to give.
 fn found_main(app_ref: *mut c_void, app_url: *mut CFTypeRef) -> OSStatus {

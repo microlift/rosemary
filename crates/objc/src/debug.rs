@@ -202,23 +202,37 @@ fn violation(operation: &str, object: Id, reason: &str) -> ! {
 /// `objc_constructInstance` are not allocated by this runtime, but their `isa`
 /// is validated separately by the ordinary class lookup.
 pub(crate) fn validate(object: Id, operation: &str) {
-    if !enabled() || object.is_null() {
+    if !enabled() || object.is_null() || validate_tracked(object, operation) {
         return;
     }
+    if !(object as usize).is_multiple_of(std::mem::align_of::<*const Class>()) {
+        violation(operation, object, "object pointer is not aligned");
+    }
+    // SAFETY: Objective-C API callers promise a readable object pointer.
+    // External guest allocations are accepted only when their first word
+    // identifies a class belonging to this runtime.
+    let isa = unsafe { *(object as *const *const Class) };
+    if !crate::class::is_known(isa) {
+        violation(operation, object, "object has an invalid isa");
+    }
+}
+
+/// Validate classless storage, such as a `__block` variable, before an
+/// operation reads it.
+///
+/// Only storage this runtime allocated is checked: a `__block` variable starts
+/// on the guest's stack, with a null `isa`, until a block copies it.
+pub(crate) fn validate_storage(storage: Id, operation: &str) {
+    if enabled() && !storage.is_null() {
+        validate_tracked(storage, operation);
+    }
+}
+
+/// Check an allocation this runtime tracks, answering whether it was one.
+fn validate_tracked(object: Id, operation: &str) -> bool {
     let objects = OBJECTS.lock().unwrap_or_else(|e| e.into_inner());
     let Some(allocation) = objects.get(&(object as usize)) else {
-        drop(objects);
-        if !(object as usize).is_multiple_of(std::mem::align_of::<*const Class>()) {
-            violation(operation, object, "object pointer is not aligned");
-        }
-        // SAFETY: Objective-C API callers promise a readable object pointer.
-        // External guest allocations are accepted only when their first word
-        // identifies a class belonging to this runtime.
-        let isa = unsafe { *(object as *const *const Class) };
-        if !crate::class::is_known(isa) {
-            violation(operation, object, "object has an invalid isa");
-        }
-        return;
+        return false;
     };
     match allocation.state {
         State::Dead => violation(
@@ -244,6 +258,7 @@ pub(crate) fn validate(object: Id, operation: &str) {
             ),
         );
     }
+    true
 }
 
 thread_local! {
@@ -678,6 +693,42 @@ mod tests {
                 let mut storage: *mut Class = std::ptr::null_mut();
                 validate((&raw mut storage).cast(), "invalid isa test");
             }
+            // A `__block` variable has no class: its stack original has a null
+            // `isa`, and only the heap copy this runtime makes is tracked.
+            "byref" | "byref-overrelease" => {
+                #[repr(C)]
+                struct Byref {
+                    isa: *const c_void,
+                    forwarding: *mut Byref,
+                    flags: i32,
+                    size: u32,
+                    value: i64,
+                }
+                let mut byref = Byref {
+                    isa: std::ptr::null(),
+                    forwarding: std::ptr::null_mut(),
+                    flags: 0,
+                    size: size_of::<Byref>() as u32,
+                    value: 1,
+                };
+                byref.forwarding = &raw mut byref;
+                let mut captured: *mut c_void = std::ptr::null_mut();
+                let byref_field = crate::block::field::BYREF;
+                // SAFETY: a pointer-sized slot and a byref of the shape it says.
+                unsafe {
+                    crate::block::object_assign(
+                        (&raw mut captured).cast(),
+                        (&raw const byref).cast(),
+                        byref_field,
+                    );
+                    // The capture's reference, then the stack frame's.
+                    crate::block::object_dispose(captured, byref_field);
+                    crate::block::object_dispose((&raw const byref).cast(), byref_field);
+                    if case == "byref-overrelease" {
+                        crate::block::object_dispose(captured, byref_field);
+                    }
+                }
+            }
             _ => panic!("unknown child case"),
         }
     }
@@ -705,6 +756,8 @@ mod tests {
             ("sync", Some("without a matching enter")),
             ("external", None),
             ("isa", Some("invalid isa")),
+            ("byref", None),
+            ("byref-overrelease", Some("use of finalized")),
         ] {
             let output = std::process::Command::new(&executable)
                 .args([

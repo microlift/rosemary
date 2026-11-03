@@ -2,6 +2,7 @@ use microlift::arch::x86_64::context::RegisterContext;
 
 use super::printf::{format_from, format_from_list, write_guest};
 use crate::abi::{GuestMemory, Result};
+use crate::shims::bind;
 
 /// What follows the message: nothing, or the text for an error number.
 #[derive(Clone, Copy)]
@@ -142,20 +143,19 @@ fn shim(name: &str, ctx: &mut RegisterContext, mem: &mut dyn GuestMemory) -> Res
 }
 
 pub fn shim_for(name: &str) -> Option<super::Shim> {
-    matches!(
-        name,
-        "warn"
-            | "warnx"
-            | "warnc"
-            | "vwarn"
-            | "vwarnx"
-            | "vwarnc"
-            | "err"
-            | "errx"
-            | "errc"
-            | "verr"
-            | "verrx"
-            | "verrc"
-    )
-    .then_some(shim as super::Shim)
+    Some(match name {
+        "warn" => bind!("warn" => shim),
+        "warnx" => bind!("warnx" => shim),
+        "warnc" => bind!("warnc" => shim),
+        "vwarn" => bind!("vwarn" => shim),
+        "vwarnx" => bind!("vwarnx" => shim),
+        "vwarnc" => bind!("vwarnc" => shim),
+        "err" => bind!("err" => shim),
+        "errx" => bind!("errx" => shim),
+        "errc" => bind!("errc" => shim),
+        "verr" => bind!("verr" => shim),
+        "verrx" => bind!("verrx" => shim),
+        "verrc" => bind!("verrc" => shim),
+        _ => return None,
+    })
 }

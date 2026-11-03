@@ -136,7 +136,7 @@ pub(crate) unsafe extern "C" fn order_front_with_options(_receiver: Id, _sel: Se
         application_icon: true,
         ..Default::default()
     };
-    match crate::dialog::show(&request, |_| OPEN.store(0, Ordering::Release)) {
+    match crate::dialog::show(&request, |_, _| OPEN.store(0, Ordering::Release)) {
         Some(id) => OPEN.store(id, Ordering::Release),
         None => eprintln!("rosemary: appkit: could not show the About panel"),
     }

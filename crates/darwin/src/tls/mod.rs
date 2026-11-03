@@ -128,28 +128,38 @@ unsafe extern "C" fn release(block: *mut core::ffi::c_void) {
     if passes < DESTRUCTOR_PASSES {
         return;
     }
-    // SAFETY: as above; the last pass takes the array away before freeing it.
+    // SAFETY: as above; the last pass takes the array away. It is not freed: it
+    // lives in the thread's `pthread_t`, which `handle` keeps.
     unsafe { libc::pthread_setspecific(synthetic_key(), core::ptr::null()) };
     BASE.with(|base| {
         if base.get() == block as usize as u64 {
             base.set(0);
         }
     });
-    // SAFETY: as above. Reconstituting the same `Box<[u64]>` `allocate` leaked, with
-    // the same length.
-    drop(unsafe { Box::from_raw(core::ptr::slice_from_raw_parts_mut(words, WORDS)) });
 }
 
 #[cfg(not(target_os = "macos"))]
+const _: () = assert!(
+    crate::pthread::handle::TSD_OFFSET + WORDS * 8 <= crate::pthread::handle::SIZE,
+    "the array must fit in the thread's pthread_t"
+);
+
+/// This thread's array, inside its `pthread_t` as libpthread places it. Zeroed
+/// here rather than on release: the block outlives the thread, and glibc hands
+/// its control block - and so the block - to a later thread.
+#[cfg(not(target_os = "macos"))]
 fn allocate() -> u64 {
-    let mut words = vec![0u64; WORDS].into_boxed_slice();
-    let base = words.as_ptr() as usize as u64;
-    words[slot::SELF] = base;
+    let thread = crate::pthread::handle::current();
+    let base = thread + crate::pthread::handle::TSD_OFFSET as u64;
+    // SAFETY: `handle` leaked a `SIZE`-byte block for this thread, which the
+    // assertion above shows holds `WORDS` words from `TSD_OFFSET`.
+    let words = unsafe { core::slice::from_raw_parts_mut(base as usize as *mut u64, WORDS) };
+    words.fill(0);
+    words[slot::SELF] = thread;
     words[slot::ERRNO] = crate::errno::guest_location() as usize as u64;
     words[slot::STACK_GUARD] = STACK_CHK_GUARD;
     words[slot::PTR_MUNGE] = base.rotate_left(17) | 1;
     words[HOST_THREAD_POINTER] = host_thread_pointer();
-    Box::leak(words);
     base
 }
 
@@ -194,7 +204,12 @@ macro_rules! call_as_darwin {
 /// thread exit, a callback a host library makes on its own - must still find
 /// this thread's array, as [`tsd_base`] already arranges for a thread that
 /// never entered.
-pub struct DarwinThread(());
+///
+/// The guest's syscalls, unlike the register, are interposed only for the
+/// scope's life - see [`crate::syscall`].
+pub struct DarwinThread {
+    _syscalls: crate::syscall::ScopedGuestSyscallContext,
+}
 
 pub const fn can_enter_darwin() -> bool {
     cfg!(target_os = "macos")
@@ -213,28 +228,42 @@ impl DarwinThread {
         if !entered() {
             set_thread_pointer(tsd_base());
         }
-        DarwinThread(())
+        DarwinThread {
+            _syscalls: crate::syscall::ScopedGuestSyscallContext::new(),
+        }
     }
 }
 
+// FIXME: This abstraction probably won't be used anywhere. Do we just remove it?
 pub struct HostThread {
     saved: Option<u64>,
+    _syscalls: crate::syscall::ScopedHostSyscallContext,
 }
 
 impl HostThread {
     pub fn enter() -> HostThread {
+        let syscalls = crate::syscall::ScopedHostSyscallContext::new();
         if !swaps() {
-            return HostThread { saved: None };
+            return HostThread {
+                saved: None,
+                _syscalls: syscalls,
+            };
         }
         let saved = host_thread_pointer();
         let base = tsd_base() as usize as *const u64;
         // SAFETY: `base` is this thread's own array, which has `WORDS` words.
         let host = unsafe { *base.add(HOST_THREAD_POINTER) };
         if host == 0 {
-            return HostThread { saved: None };
+            return HostThread {
+                saved: None,
+                _syscalls: syscalls,
+            };
         }
         set_thread_pointer(host);
-        HostThread { saved: Some(saved) }
+        HostThread {
+            saved: Some(saved),
+            _syscalls: syscalls,
+        }
     }
 }
 
@@ -364,10 +393,28 @@ mod tests {
 
     #[test]
     #[cfg(not(target_os = "macos"))]
-    fn slot_zero_is_the_array_itself() {
+    fn slot_zero_is_pthread_self() {
         let base = tsd_base();
         // SAFETY: `base` is this thread's own array, live for the thread.
-        assert_eq!(unsafe { *(base as usize as *const u64) }, base);
+        let thread = unsafe { *(base as usize as *const u64) };
+        assert_eq!(thread, unsafe { crate::pthread::handle::pthread_self() });
+    }
+
+    /// Mono's `mono_mach_init` finds a thread's values this way, and falls back to
+    /// guessing when no offset it probes holds the value it set.
+    #[test]
+    #[cfg(all(
+        any(target_os = "linux", target_os = "freebsd"),
+        target_arch = "x86_64"
+    ))]
+    fn a_value_is_at_its_key_in_pthread_self() {
+        let key = key::Key::create(None).unwrap();
+        key.set(0xdead_beef as *mut core::ffi::c_void);
+        let thread = unsafe { crate::pthread::handle::pthread_self() } as usize;
+        let at = thread + crate::pthread::handle::TSD_OFFSET + key.index() as usize * 8;
+        // SAFETY: inside this thread's `pthread_t` block, which is live.
+        assert_eq!(unsafe { *(at as *const u64) }, 0xdead_beef);
+        key.delete();
     }
 
     #[test]
@@ -447,16 +494,12 @@ mod tests {
         any(target_os = "linux", target_os = "freebsd"),
         target_arch = "x86_64"
     ))]
-    fn darwin_code_finds_its_array_in_gs() {
+    fn darwin_code_reads_pthread_self_from_gs() {
         let _darwin = DarwinThread::enter();
-        let base: u64;
+        let thread: u64;
         unsafe {
-            std::arch::asm!("mov {}, gs:0", out(reg) base, options(nostack, preserves_flags))
+            std::arch::asm!("mov {}, gs:0", out(reg) thread, options(nostack, preserves_flags))
         };
-        assert_eq!(
-            base,
-            tsd_base(),
-            "slot zero of the array in `%gs` is the array"
-        );
+        assert_eq!(thread, unsafe { crate::pthread::handle::pthread_self() });
     }
 }

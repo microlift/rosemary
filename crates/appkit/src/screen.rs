@@ -114,14 +114,23 @@ unsafe extern "C" fn frame(receiver: Id, _sel: Sel) -> NSRect {
     }
 }
 
-/// `-visibleFrame`: the part not under the menu bar or the Dock.
-///
-/// SDL's usable bounds is the same question, and where it cannot answer the
-/// whole frame is the honest fallback - a program using it to place a window
-/// gets one that may sit under the menu bar, rather than one placed against a
-/// margin this runtime invented.
+/// A fullscreen Space hides desktop docks, but keeps its global menu area.
+/// This backend puts menus in each window instead, so that reservation is zero.
+fn fullscreen_visible_frame(mut frame: NSRect, menu_height: CGFloat) -> NSRect {
+    frame.size.height = (frame.size.height - menu_height.max(0.0)).max(0.0);
+    frame
+}
+
+/// `-visibleFrame`: desktop panels constrain ordinary windows, not a fullscreen
+/// Space. SDL's usable bounds keep those reservations even when panels are
+/// covered; passing them to the guest can shrink its fullscreen window.
 unsafe extern "C" fn visible_frame(receiver: Id, sel: Sel) -> NSRect {
     let display = display_of(receiver);
+    if crate::window::fullscreen_on(display) {
+        // SAFETY: the receiver is this runtime's NSScreen.
+        let full = unsafe { frame(receiver, sel) };
+        return fullscreen_visible_frame(full, crate::menu::global_menu_bar_height());
+    }
     match sdl3::video::display_usable_bounds(display) {
         Some(b) => crate::geometry::rect_from_sdl(b.x, b.y, b.w, b.h),
         // SAFETY: `-frame` is `NSRect (id, SEL)`.
@@ -370,17 +379,6 @@ pub unsafe extern "C" fn NSBestDepth(
         unsafe { exact.write(1) };
     }
     WINDOW_DEPTH_24_BIT_RGB
-}
-
-/// `-[NSScreen colorSpace]`, an `NSColorSpace`.
-///
-/// Nil, and deliberately. A colour space here would have to be one this tree can
-/// convert *through*, and `crate::color`'s note says why there is no conversion:
-/// every colour in this runtime is already in the space its only consumer wants.
-/// Nil is the documented answer for a screen whose profile cannot be read, and a
-/// caller takes its "assume sRGB" branch - which is what the display is.
-unsafe extern "C" fn color_space(_receiver: Id, _sel: Sel) -> Id {
-    std::ptr::null_mut()
 }
 
 /// AppKit's user-space unit is 1/72 inch, so an unscaled display is 72 dpi by
@@ -1179,7 +1177,7 @@ pub(crate) fn install() {
         "maximumRefreshInterval" => refresh_interval, c"d16@0:8";
         "displayUpdateGranularity" => refresh_interval, c"d16@0:8";
         "depth" => depth, c"i16@0:8";
-        "colorSpace" => color_space, c"@16@0:8";
+        "colorSpace" => crate::backing::shared_color_space, c"@16@0:8";
         "deviceDescription" => device_description, c"@16@0:8";
         "localizedName" => localized_name, c"@16@0:8";
         "safeAreaInsets" => safe_area_insets, c"{NSEdgeInsets=dddd}16@0:8";
@@ -1356,6 +1354,72 @@ mod tests {
     fn a_global_warp_is_translated_to_window_coordinates() {
         assert_eq!(local_warp_point((420.0, 310.0), (100, 50)), (320.0, 260.0));
     }
+
+    /// Serialises the tests that touch the process-wide pointer state, and
+    /// puts it back even when one fails.
+    struct MouseState {
+        _lock: std::sync::MutexGuard<'static, ()>,
+        associated: bool,
+        recentring: Option<Recentring>,
+    }
+
+    impl MouseState {
+        fn take(associated: bool, recentring: Option<Recentring>) -> Self {
+            static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+            let lock = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            Self {
+                _lock: lock,
+                associated: ASSOCIATED.swap(associated, std::sync::atomic::Ordering::AcqRel),
+                recentring: std::mem::replace(
+                    &mut *RECENTRING.lock().unwrap_or_else(|e| e.into_inner()),
+                    recentring,
+                ),
+            }
+        }
+    }
+
+    impl Drop for MouseState {
+        fn drop(&mut self) {
+            *RECENTRING.lock().unwrap_or_else(|e| e.into_inner()) = self.recentring;
+            ASSOCIATED.store(self.associated, std::sync::atomic::Ordering::Release);
+        }
+    }
+
+    fn camera_recentre(at: std::time::Instant) -> Option<Recentring> {
+        Some(Recentring {
+            window: 0,
+            target: (420.0, 300.0),
+            at,
+            moved: true,
+            active: true,
+        })
+    }
+
+    #[test]
+    fn redundant_mouse_association_preserves_camera_recentring() {
+        let _state = MouseState::take(true, camera_recentre(std::time::Instant::now()));
+        assert_eq!(unsafe { CGAssociateMouseAndMouseCursorPosition(1) }, 0);
+        assert!(
+            recentring(),
+            "a reasserted association dropped the recentre"
+        );
+    }
+
+    #[test]
+    fn mouse_association_releases_an_idle_recentre() {
+        let stale = std::time::Instant::now() - 2 * RECENTRE_IDLE;
+        let _state = MouseState::take(true, camera_recentre(stale));
+        assert_eq!(unsafe { CGAssociateMouseAndMouseCursorPosition(1) }, 0);
+        assert!(!recentring(), "an idle recentre outlived the association");
+    }
+
+    #[test]
+    fn disassociating_takes_over_from_a_recentre() {
+        let _state = MouseState::take(true, camera_recentre(std::time::Instant::now()));
+        assert_eq!(unsafe { CGAssociateMouseAndMouseCursorPosition(0) }, 0);
+        assert!(!mouse_is_associated());
+        assert!(!recentring(), "disassociation left the recentre in charge");
+    }
 }
 
 /// `CGError CGWarpMouseCursorPosition(CGPoint)` - move the pointer, in global
@@ -1421,6 +1485,11 @@ pub unsafe extern "C" fn CGWarpMouseCursorPosition(point: foundation::geometry::
             let origin = crate::window::global_position(window).unwrap_or((0, 0));
             let local = local_warp_point(point, origin);
             sdl3::video::warp_mouse_in_window(window, local.0, local.1);
+            // SDL only changes its virtual position for repeated relative
+            // warps. If the physical pointer has drifted or another API
+            // replaced the X11 barriers, repair that without changing the
+            // relative input stream or generating an artificial camera delta.
+            lock_relative_pointer(window, local);
         }
         return 0;
     }
@@ -1428,11 +1497,18 @@ pub unsafe extern "C" fn CGWarpMouseCursorPosition(point: foundation::geometry::
     crate::event::expect_warp_echo(from, local);
     let mut released = true;
     for window in &relative {
+        // A visible relative cursor on X11 is confined at the last guest warp.
+        // Lift the barrier before relocating it; otherwise it may stay outside
+        // the new one-pixel rectangle and be free to move indefinitely.
+        clear_relative_pointer_lock(*window);
         released &= sdl3::video::set_relative_mouse_mode(*window, false);
     }
     let warped = warp_physical(target, point, local);
     for window in relative {
-        sdl3::video::set_relative_mouse_mode(window, true);
+        if sdl3::video::set_relative_mouse_mode(window, true) && warped {
+            let origin = crate::window::global_position(window).unwrap_or((0, 0));
+            lock_relative_pointer(window, local_warp_point(point, origin));
+        }
     }
     match released && warped {
         true => remember_relative_warp(point),
@@ -1638,11 +1714,13 @@ pub(crate) fn forget_recentring() {
 /// unavailable rather than running without capture.
 #[allow(non_snake_case)]
 pub unsafe extern "C" fn CGAssociateMouseAndMouseCursorPosition(connected: u32) -> i32 {
+    let was = ASSOCIATED.swap(connected != 0, std::sync::atomic::Ordering::AcqRel);
     // The cursor stops where it is, which is what the guest is told from here.
-    if connected == 0 && mouse_is_associated() {
+    if connected == 0 && was {
         crate::event::settle_pointer();
     }
-    ASSOCIATED.store(connected != 0, std::sync::atomic::Ordering::Release);
+    // Reapplied even when unchanged: games reassert every frame, and that is
+    // what puts back a window that lost relative mode without a focus event.
     apply_mouse_association();
     0
 }
@@ -1690,18 +1768,19 @@ pub fn confine_pointer(window: Id) {
         return;
     }
     if let Some(rect) = content_rect(window, sdl) {
-        sdl3::video::set_mouse_rect(sdl, Some(rect));
+        set_pointer_confinement(sdl, Some(rect));
     }
     sdl3::video::set_mouse_grab(sdl, true);
 }
 
 /// The content area of `window` in SDL window coordinates.
-fn content_rect(window: Id, sdl: sdl3::Window) -> Option<sdl3::Rect> {
-    let (w, h) = sdl3::video::window_size(sdl)?;
+fn content_rect(window: Id, _sdl: sdl3::Window) -> Option<sdl3::Rect> {
+    let surface = crate::window::surface_frame(window)?;
+    let (w, h) = (surface.size.width as i32, surface.size.height as i32);
     let inset = crate::window::content_inset(window).ceil() as i32;
     (w > 0 && h > inset).then_some(sdl3::Rect {
-        x: 0,
-        y: inset,
+        x: surface.origin.x.round() as i32,
+        y: surface.origin.y.round() as i32 + inset,
         w,
         h: h - inset,
     })
@@ -1817,15 +1896,205 @@ fn end_edge_hold() {
     }
 }
 
+/// When the guest disassociates its pointer from the cursor, SDL's X11
+/// relative mode delivers raw deltas but only *hides* the physical cursor by
+/// default. We explicitly leave the cursor visible (as macOS does), so without
+/// an additional constraint it can travel across the window while the guest
+/// sees it frozen. A one-point SDL mouse rectangle restricts physical motion
+/// without interfering with XI2 raw motion.
+// Keep any confinement the application already requested through AppKit's
+// `-setMouseConfinementRect:` or the optional ROSEMARY_CONFINE_POINTER path.
+// Relative-mode confinement is temporary and must restore the previous rect.
+static PREVIOUS_MOUSE_RECTS: std::sync::Mutex<Vec<(usize, Option<sdl3::Rect>)>> =
+    std::sync::Mutex::new(Vec::new());
+
+fn lock_relative_pointer(window: sdl3::Window, point: (f32, f32)) {
+    // Recentring and edge holds also use relative mode while associated, and
+    // the paths that end them never lift a lock: only disassociation gets one.
+    if !sdl3::video::is_x11()
+        || mouse_is_associated()
+        || sdl3::video::window_flags(window) & sdl3::video::flags::INPUT_FOCUS == 0
+    {
+        return;
+    }
+    // XFixes barriers only block crossing their edges from inside. Enabling
+    // them when the physical pointer is outside produces exactly the observed
+    // intermittent horizontal/vertical cursor drift: it cannot enter the one-
+    // pixel region until a later input happens to cross the barrier.
+    let rect = sdl3::Rect {
+        x: point.0.round() as i32,
+        y: point.1.round() as i32,
+        w: 1,
+        h: 1,
+    };
+    // Avoid calling into SDL while holding the bookkeeping lock: SDL may
+    // dispatch window events while updating pointer confinement.
+    let original = {
+        let previous = PREVIOUS_MOUSE_RECTS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if previous.iter().any(|(id, _)| *id == window as usize) {
+            None
+        } else {
+            Some(sdl3::video::get_mouse_rect(window))
+        }
+    };
+    let origin = crate::window::global_position(window).unwrap_or((0, 0));
+    let global = (
+        origin.0 as f32 + rect.x as f32,
+        origin.1 as f32 + rect.y as f32,
+    );
+    let physical = sdl3::video::global_mouse_state();
+    let outside =
+        physical.is_none_or(|(x, y, _)| (x - global.0).abs() > 0.5 || (y - global.1).abs() > 0.5);
+    if outside {
+        // SDL_WarpMouseGlobal *does* reposition the physical X11 cursor even
+        // during relative mode, unlike SDL_WarpMouseInWindow. Verified with
+        // SDL 3.4 and XI2 raw events: this produces no false camera delta.
+        sdl3::video::warp_mouse_global(global.0, global.1);
+    }
+    let installed = if sdl3::video::get_mouse_rect(window) != Some(rect) {
+        // A fullscreen/resize/confinement transition can replace the active
+        // barrier. SDL uses cached rect equality to skip reinstallation; drop
+        // the old barrier before requesting the correct one.
+        sdl3::video::set_mouse_rect(window, None);
+        sdl3::video::set_mouse_rect(window, Some(rect))
+    } else {
+        true
+    };
+    if installed && let Some(previous_rect) = original {
+        let mut previous = PREVIOUS_MOUSE_RECTS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if !previous.iter().any(|(id, _)| *id == window as usize) {
+            previous.push((window as usize, previous_rect));
+        }
+    }
+}
+
+/// Keep the visible host cursor at the guest's fixed point while XI2 delivers
+/// raw mouse deltas. Explicit host warps and window transitions can place the
+/// physical pointer outside an active XFixes region; barriers do not pull it
+/// back in, so correct that on the next actual mouse motion, not only if the
+/// guest subsequently calls CGWarpMouseCursorPosition again.
+pub(crate) fn refresh_relative_pointer(window_id: u32) {
+    if !sdl3::video::is_x11() || mouse_is_associated() {
+        return;
+    }
+    let Some(window) = crate::window::sdl_windows().into_iter().find(|window| {
+        sdl3::video::window_id(*window) == window_id && sdl3::video::relative_mouse_mode(*window)
+    }) else {
+        return;
+    };
+    lock_at_frozen_pointer(window);
+}
+
+/// [`refresh_relative_pointer`] for real motion, which only needs to repair a
+/// window already locked: found in the lock table rather than by listing every
+/// window, so an unlocked one costs nothing per report.
+pub(crate) fn repair_relative_pointer(window_id: u32) {
+    if mouse_is_associated() {
+        return;
+    }
+    let locked = PREVIOUS_MOUSE_RECTS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+        .map(|(window, _)| *window as sdl3::Window)
+        .find(|window| sdl3::video::window_id(*window) == window_id);
+    let Some(window) = locked else {
+        return;
+    };
+    lock_at_frozen_pointer(window);
+}
+
+/// Lock `window` where the disassociated guest's cursor is frozen.
+fn lock_at_frozen_pointer(window: sdl3::Window) {
+    let Some(frozen) = crate::event::frozen_pointer() else {
+        return;
+    };
+    let origin = crate::window::global_position(window).unwrap_or((0, 0));
+    lock_relative_pointer(window, local_warp_point(frozen, origin));
+}
+
+fn clear_relative_pointer_lock(window: sdl3::Window) {
+    let original = {
+        let mut previous = PREVIOUS_MOUSE_RECTS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        previous
+            .iter()
+            .position(|(id, _)| *id == window as usize)
+            .map(|index| previous.swap_remove(index).1)
+    };
+    if let Some(rect) = original {
+        sdl3::video::set_mouse_rect(window, rect);
+    }
+}
+
+/// Confine `window`'s pointer to `rect`, or lift it for `None`. While a
+/// relative lock holds the pointer, the rectangle replaces the one saved for
+/// when the lock lifts instead, or the next refresh would discard it.
+pub(crate) fn set_pointer_confinement(window: sdl3::Window, rect: Option<sdl3::Rect>) {
+    if let Some(saved) = PREVIOUS_MOUSE_RECTS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter_mut()
+        .find(|(id, _)| *id == window as usize)
+    {
+        saved.1 = rect;
+        return;
+    }
+    sdl3::video::set_mouse_rect(window, rect);
+}
+
+/// Drop a destroyed window's saved rectangle without touching SDL. Its focus
+/// and close events arrive once the window has left [`crate::window::sdl_windows`],
+/// so [`release_relative_pointer`] cannot find it, and SDL reuses the address.
+pub(crate) fn forget_relative_pointer(window: sdl3::Window) {
+    PREVIOUS_MOUSE_RECTS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .retain(|(id, _)| *id != window as usize);
+}
+
+pub(crate) fn release_relative_pointer(window_id: u32) {
+    if !sdl3::video::is_x11() {
+        return;
+    }
+    if let Some(window) = crate::window::sdl_windows()
+        .into_iter()
+        .find(|window| sdl3::video::window_id(*window) == window_id)
+    {
+        clear_relative_pointer_lock(window);
+    }
+}
+
 /// Put every window into relative mouse mode, or take it out, to match the last
 /// [`CGAssociateMouseAndMouseCursorPosition`].
 ///
 /// Called again when a window takes focus, because SDL leaves the mode when
 /// focus goes and a window made after the guest disassociated never had it.
 pub fn apply_mouse_association() {
-    *EDGE_HOLD.lock().unwrap_or_else(|e| e.into_inner()) = None;
-    *RECENTRING.lock().unwrap_or_else(|e| e.into_inner()) = None;
     let relative = !mouse_is_associated();
+    // While associated, a live recentre or edge hold owns its window's
+    // relative mode: Studio reasserts association mid-drag, and dropping the
+    // recentre there turns each camera warp into real cursor movement. A
+    // recentre gone idle is stale, so it is released like any other.
+    let (held, recentred) = {
+        let mut hold = EDGE_HOLD.lock().unwrap_or_else(|e| e.into_inner());
+        let mut state = RECENTRING.lock().unwrap_or_else(|e| e.into_inner());
+        if relative || state.is_some_and(|r| r.active && r.at.elapsed() > RECENTRE_IDLE) {
+            *state = None;
+        }
+        if relative {
+            *hold = None;
+        }
+        (
+            hold.map(|h| h.id),
+            state.filter(|r| r.active).map(|r| r.window),
+        )
+    };
     // Disassociating is not hiding: on macOS the cursor stays on screen where
     // it was, and only `+[NSCursor hide]` takes it away - which this tree
     // already counts in `crate::cursor`. SDL's relative mode hides the pointer
@@ -1833,7 +2102,14 @@ pub fn apply_mouse_association() {
     sdl3::video::set_hint(sdl3::video::HINT_RELATIVE_CURSOR_VISIBLE, c"1");
     let mut changed = false;
     for window in crate::window::sdl_windows() {
-        if sdl3::video::relative_mouse_mode(window) != relative {
+        if !relative {
+            // Remove the X11 lock before SDL releases relative mode and the
+            // guest's cursor position is restored.
+            clear_relative_pointer_lock(window);
+        }
+        let owned =
+            held == Some(sdl3::video::window_id(window)) || recentred == Some(window as usize);
+        if !owned && sdl3::video::relative_mouse_mode(window) != relative {
             if !relative {
                 // Reset both positions on release. The in-window warp supplies
                 // SDL's restore point; the global warp after disabling reaches
@@ -1848,6 +2124,9 @@ pub fn apply_mouse_association() {
                 sdl3::video::set_relative_mouse_mode(window, true);
             }
             changed = true;
+        }
+        if relative && sdl3::video::relative_mouse_mode(window) {
+            lock_at_frozen_pointer(window);
         }
     }
     if changed {

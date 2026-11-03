@@ -13,16 +13,14 @@ pub type Boolean = u8;
 
 /// Everything a `CFCreate` call ignores about its allocator.
 ///
-/// Apple's allocators exist so a caller can account for, or place, the memory a
-/// framework takes. Nothing in this tree does either, and a guest that passes
-/// `kCFAllocatorDefault` - which is null - is asking for the default one, which
-/// is the only one here.
+/// Apple's allocators exist so callers can account for or place framework
+/// memory. This implementation supports its standard malloc-backed allocator
+/// identities, but not arbitrary custom allocation callbacks.
 pub type CFAllocatorRef = *const c_void;
 
-/// The default allocator is represented by null, as it is by the allocator
-/// globals this crate publishes. A custom allocator still needs an object of
-/// its own: callers retain and release it, even though this CoreFoundation does
-/// not route its allocations through the callback table.
+/// `kCFAllocatorDefault` is a NULL sentinel; `CFAllocatorGetDefault()` instead
+/// returns the non-null system-default singleton. Custom allocators retain
+/// their own identity, but this CoreFoundation does not invoke their callbacks.
 fn allocator_class() -> &'static objc::class::Class {
     crate::base::register(c"__NSCFAllocator", None, std::mem::size_of::<usize>(), true)
 }
@@ -32,7 +30,87 @@ pub unsafe extern "C" fn CFAllocatorGetTypeID() -> CFTypeID {
 }
 
 pub unsafe extern "C" fn CFAllocatorGetDefault() -> CFAllocatorRef {
-    std::ptr::null()
+    standard_allocator(StandardAllocator::SystemDefault)
+}
+
+/// Distinguished singleton allocators exported as CFAllocatorRef globals.
+/// Unlike the default (NULL), these must remain distinguishable from custom
+/// allocators and from kCFAllocatorNull, which cannot allocate memory.
+#[derive(Clone, Copy)]
+pub enum StandardAllocator {
+    SystemDefault,
+    Malloc,
+    MallocZone,
+    Null,
+}
+
+pub fn standard_allocator(kind: StandardAllocator) -> CFAllocatorRef {
+    use std::sync::OnceLock;
+    static SYSTEM: OnceLock<usize> = OnceLock::new();
+    static MALLOC: OnceLock<usize> = OnceLock::new();
+    static ZONE: OnceLock<usize> = OnceLock::new();
+    static NULL: OnceLock<usize> = OnceLock::new();
+    let cell = match kind {
+        StandardAllocator::SystemDefault => &SYSTEM,
+        StandardAllocator::Malloc => &MALLOC,
+        StandardAllocator::MallocZone => &ZONE,
+        StandardAllocator::Null => &NULL,
+    };
+    *cell.get_or_init(|| {
+        let object = objc::object::create_instance(allocator_class(), 0);
+        // Standard allocator globals are process-lifetime singletons; a
+        // client's CFRelease must never invalidate their exported pointers.
+        objc::arc::make_immortal(object);
+        object as usize
+    }) as CFAllocatorRef
+}
+
+pub fn supports_malloc_allocator(allocator: CFAllocatorRef) -> bool {
+    allocator.is_null()
+        || [
+            StandardAllocator::SystemDefault,
+            StandardAllocator::Malloc,
+            StandardAllocator::MallocZone,
+        ]
+        .into_iter()
+        .any(|kind| allocator == standard_allocator(kind))
+}
+
+/// The allocator to hand a host framework in place of `allocator`.
+///
+/// This runtime's allocators are its own objects, which the host's
+/// CoreFoundation would read as its own `CFAllocator`. A standard one maps to
+/// the host's global of the same name, and any other to null - the host's
+/// default - since this runtime does not run custom allocator callbacks
+/// either. Null, and an allocator the host made, pass through.
+#[cfg(target_os = "macos")]
+pub fn host_allocator(allocator: CFAllocatorRef) -> CFAllocatorRef {
+    // SAFETY: null or an allocator object, whose first word is readable.
+    if allocator.is_null() || unsafe { crate::foreign::is(allocator) } {
+        return allocator;
+    }
+    [
+        (
+            StandardAllocator::SystemDefault,
+            c"kCFAllocatorSystemDefault",
+        ),
+        (StandardAllocator::Malloc, c"kCFAllocatorMalloc"),
+        (StandardAllocator::MallocZone, c"kCFAllocatorMallocZone"),
+        (StandardAllocator::Null, c"kCFAllocatorNull"),
+    ]
+    .into_iter()
+    .find(|(kind, _)| allocator == standard_allocator(*kind))
+    .and_then(|(_, name)| crate::foreign::entry(name))
+    // SAFETY: each of those names is a `CFAllocatorRef` variable.
+    .map_or(std::ptr::null(), |cell| unsafe {
+        *(cell as *const CFAllocatorRef)
+    })
+}
+
+/// Off Darwin there is no host CoreFoundation to hand an allocator to.
+#[cfg(not(target_os = "macos"))]
+pub fn host_allocator(allocator: CFAllocatorRef) -> CFAllocatorRef {
+    allocator
 }
 
 pub unsafe extern "C" fn CFAllocatorCreate(
@@ -144,6 +222,22 @@ pub unsafe extern "C" fn CFGetTypeID(object: CFTypeRef) -> CFTypeID {
     }
     // SAFETY: an object this runtime allocated.
     unsafe { crate::base::class_of(object) }.map_or(0, crate::base::type_id_of)
+}
+
+/// `void CFShow(CFTypeRef)`: the object's description on stderr, or `(null)`.
+pub unsafe extern "C" fn CFShow(object: CFTypeRef) {
+    // SAFETY: as `CFCopyDescription`'s caller states.
+    let description = unsafe { CFCopyDescription(object) };
+    // SAFETY: null or a string `CFCopyDescription` made.
+    let text = unsafe { crate::string::as_string(description) }.map_or_else(
+        || "(null)".to_string(),
+        |s| String::from_utf8_lossy(&s.utf8()).into_owned(),
+    );
+    eprintln!("{text}");
+    if !description.is_null() {
+        // SAFETY: the copy above is this call's own.
+        unsafe { CFRelease(description) };
+    }
 }
 
 /// `CFStringRef CFCopyDescription(CFTypeRef)`: NULL for NULL, as CFRuntime.c
@@ -408,7 +502,8 @@ pub unsafe extern "C" fn CFStringGetCString(
     buffer_size: CFIndex,
     encoding: u32,
 ) -> Boolean {
-    let Some(s) = (unsafe { string::as_string(s) }) else {
+    let string = s;
+    let Some(s) = (unsafe { string::as_string(string) }) else {
         return 0;
     };
     if buffer.is_null() || buffer_size <= 0 {
@@ -416,8 +511,9 @@ pub unsafe extern "C" fn CFStringGetCString(
     }
     let bytes = match encoding {
         string::encoding::UTF8 => s.utf8(),
-        // Every other encoding this runtime answers for is one where an ASCII
-        // byte is itself, and a non-ASCII one has no defined answer here.
+        // Apple encodes these as `CFStringGetBytes` does, without a byte-order
+        // mark, and terminates them with a single NUL byte all the same. The
+        // JDK reads file names back through `kCFStringEncodingUnicode` this way.
         e if e == string::encoding::UTF16
             || e == string::encoding::UTF16_BE
             || e == string::encoding::UTF16_LE
@@ -425,7 +521,28 @@ pub unsafe extern "C" fn CFStringGetCString(
             || e == string::encoding::UTF32_BE
             || e == string::encoding::UTF32_LE =>
         {
-            return 0;
+            let length = s.units().len() as CFIndex;
+            let mut used = 0;
+            // SAFETY: the caller's buffer, less the byte the NUL needs.
+            let converted = unsafe {
+                CFStringGetBytes(
+                    string,
+                    0,
+                    length,
+                    e,
+                    0,
+                    0,
+                    buffer.cast(),
+                    buffer_size - 1,
+                    &mut used,
+                )
+            };
+            if converted != length {
+                return 0;
+            }
+            // SAFETY: `used` is at most `buffer_size - 1`.
+            unsafe { *buffer.add(used as usize) = 0 };
+            return 1;
         }
         e if crate::eightbit::is_table(e) => {
             let encoded: Option<Vec<u8>> = s
@@ -886,6 +1003,101 @@ unsafe fn recase(target: CFTypeRef, map: fn(&str) -> String) {
     unsafe { string::set_bytes(target, mapped.as_bytes()) };
 }
 
+fn nfd(text: &str) -> String {
+    icu_normalizer::DecomposingNormalizerBorrowed::new_nfd()
+        .normalize(text)
+        .into_owned()
+}
+
+fn nfkd(text: &str) -> String {
+    icu_normalizer::DecomposingNormalizerBorrowed::new_nfkd()
+        .normalize(text)
+        .into_owned()
+}
+
+fn nfc(text: &str) -> String {
+    icu_normalizer::ComposingNormalizerBorrowed::new_nfc()
+        .normalize(text)
+        .into_owned()
+}
+
+fn nfkc(text: &str) -> String {
+    icu_normalizer::ComposingNormalizerBorrowed::new_nfkc()
+        .normalize(text)
+        .into_owned()
+}
+
+/// Decomposed, the nonspacing marks dropped, and composed again: what
+/// "strip combining marks" and "strip diacritics" both do to text.
+pub fn strip_marks(text: &str) -> String {
+    use icu_properties::props::GeneralCategory;
+    let categories = icu_properties::CodePointMapData::<GeneralCategory>::new();
+    let bare: String = nfd(text)
+        .chars()
+        .filter(|c| categories.get(*c) != GeneralCategory::NonspacingMark)
+        .collect();
+    nfc(&bare)
+}
+
+/// `void CFStringNormalize(CFMutableStringRef, CFStringNormalizationForm)`.
+pub unsafe extern "C" fn CFStringNormalize(target: CFTypeRef, form: CFIndex) {
+    let map: fn(&str) -> String = match form {
+        0 => nfd,
+        1 => nfkd,
+        2 => nfc,
+        3 => nfkc,
+        _ => return,
+    };
+    unsafe { recase(target, map) }
+}
+
+pub const TRANSFORM_STRIP_COMBINING_MARKS: &str = "kCFStringTransformStripCombiningMarks";
+pub const TRANSFORM_STRIP_DIACRITICS: &str = "kCFStringTransformStripDiacritics";
+
+/// `Boolean CFStringTransform(CFMutableStringRef, CFRange *range, CFStringRef
+/// transform, Boolean reverse)`.
+///
+/// The transforms that drop marks are done; any other, and any reverse
+/// transform, answers false and leaves the string as it was, which is what
+/// Apple's does with a transform it cannot apply.
+pub unsafe extern "C" fn CFStringTransform(
+    target: CFTypeRef,
+    range: *mut CFRange,
+    transform: CFTypeRef,
+    reverse: u8,
+) -> u8 {
+    let Some(name) = (unsafe { string::as_string(transform) }) else {
+        return 0;
+    };
+    let name = String::from_utf8_lossy(&name.utf8()).into_owned();
+    if reverse != 0
+        || (name != TRANSFORM_STRIP_COMBINING_MARKS && name != TRANSFORM_STRIP_DIACRITICS)
+    {
+        return 0;
+    }
+    let Some(s) = (unsafe { string::as_string(target) }) else {
+        return 0;
+    };
+    let units = s.utf16();
+    let (start, length) = match unsafe { range.as_ref() } {
+        Some(r) => (r.location.max(0) as usize, r.length.max(0) as usize),
+        None => (0, units.len()),
+    };
+    let end = (start + length).min(units.len());
+    let start = start.min(end);
+    let middle = strip_marks(&String::from_utf16_lossy(&units[start..end]));
+    let middle: Vec<u16> = middle.encode_utf16().collect();
+    let mut out = units[..start].to_vec();
+    out.extend_from_slice(&middle);
+    out.extend_from_slice(&units[end..]);
+    unsafe { string::set_utf16(target, &out) };
+    // SAFETY: the caller's range, which says where the result now is.
+    if let Some(r) = unsafe { range.as_mut() } {
+        r.length = middle.len() as CFIndex;
+    }
+    1
+}
+
 /// `UniChar CFStringGetCharacterAtIndex(CFStringRef, CFIndex)`.
 ///
 /// Zero for an index outside the string, which Apple's would fault on: there is
@@ -1186,6 +1398,79 @@ pub unsafe extern "C" fn CFArrayExchangeValuesAtIndices(array: CFTypeRef, a: CFI
     let len = array.values.len();
     if let (Some(a), Some(b)) = (collections::at(a, len), collections::at(b, len)) {
         array.values.swap(a, b);
+    }
+}
+
+/// `CFComparatorFunction`; negative, zero or positive as `a` sorts before, with or
+/// after `b`.
+pub type ComparatorFunction = unsafe extern "C" fn(CFTypeRef, CFTypeRef, *mut c_void) -> CFIndex;
+
+/// Stable merge sort. A comparator is guest code and may not be a total order,
+/// which `slice::sort_by` is allowed to panic over.
+fn merge_sort(values: &mut Vec<CFTypeRef>, less_or_equal: &impl Fn(CFTypeRef, CFTypeRef) -> bool) {
+    if values.len() < 2 {
+        return;
+    }
+    let mut right = values.split_off(values.len() / 2);
+    merge_sort(values, less_or_equal);
+    merge_sort(&mut right, less_or_equal);
+    let left = std::mem::take(values);
+    let (mut l, mut r) = (left.into_iter().peekable(), right.into_iter().peekable());
+    while let (Some(&a), Some(&b)) = (l.peek(), r.peek()) {
+        values.push(
+            if less_or_equal(a, b) {
+                l.next()
+            } else {
+                r.next()
+            }
+            .unwrap(),
+        );
+    }
+    values.extend(l);
+    values.extend(r);
+}
+
+/// `void CFArraySortValues(CFMutableArrayRef, CFRange, CFComparatorFunction, void *context)`
+///
+/// `CFRange` is passed as its two fields, as in [`CFArrayApplyFunction`]. The range
+/// is copied out and written back, so the comparator never sees a half-sorted array.
+pub unsafe extern "C" fn CFArraySortValues(
+    array: CFTypeRef,
+    range_location: CFIndex,
+    range_length: CFIndex,
+    comparator: Option<ComparatorFunction>,
+    context: *mut c_void,
+) {
+    let Some(comparator) = comparator else {
+        return;
+    };
+    let (Ok(start), Some(end)) = (
+        usize::try_from(range_location),
+        range_location
+            .checked_add(range_length)
+            .and_then(|end| usize::try_from(end).ok()),
+    ) else {
+        return;
+    };
+    let Some(a) = (unsafe { collections::array(array) }) else {
+        return;
+    };
+    if !a.mutable {
+        return;
+    }
+    let Some(mut values) = a.values.get(start..end).map(ToOwned::to_owned) else {
+        return;
+    };
+    // SAFETY: `comparator` is supplied by the caller with this signature.
+    merge_sort(
+        &mut values,
+        &|x, y| unsafe { comparator(x, y, context) } <= 0,
+    );
+    if let Some(a) = unsafe { collections::array(array) }
+        && let Some(slot) = a.values.get_mut(start..end)
+        && slot.len() == values.len()
+    {
+        slot.copy_from_slice(&values);
     }
 }
 
@@ -1658,7 +1943,7 @@ pub unsafe extern "C" fn CFDataCreateCopy(allocator: CFAllocatorRef, data: CFTyp
         return unsafe {
             let f: unsafe extern "C" fn(CFAllocatorRef, CFTypeRef) -> CFTypeRef =
                 std::mem::transmute(f);
-            f(allocator, data)
+            f(host_allocator(allocator), data)
         };
     }
     // silence clippy warning on non-macos
@@ -2712,6 +2997,31 @@ pub unsafe extern "C" fn CFRunLoopStop(loop_: CFTypeRef) {
     }
 }
 
+/// `void CFRunLoopPerformBlock(CFRunLoopRef, CFTypeRef mode, void (^)(void))`.
+/// The mode is one mode's name or an array of them.
+pub unsafe extern "C" fn CFRunLoopPerformBlock(
+    loop_: CFTypeRef,
+    mode: CFTypeRef,
+    block: CFTypeRef,
+) {
+    let Some(l) = (unsafe { borrow::<RunLoop>(loop_) }) else {
+        return;
+    };
+    let modes = match unsafe { collections::array(mode) } {
+        // SAFETY: the array's elements are mode names.
+        Some(array) => array
+            .values
+            .iter()
+            .map(|m| unsafe { mode_name(*m) })
+            .collect(),
+        None => vec![unsafe { mode_name(mode) }],
+    };
+    let block = objc::block::copy(block as objc::object::Id);
+    if !block.is_null() {
+        l.perform_block(&modes, block as usize);
+    }
+}
+
 pub unsafe extern "C" fn CFRunLoopWakeUp(loop_: CFTypeRef) {
     if let Some(l) = unsafe { borrow::<RunLoop>(loop_) } {
         l.wake();
@@ -3598,7 +3908,7 @@ mod tests {
 
     #[test]
     fn no_copy_data_keeps_an_owned_snapshot() {
-        let mut source = vec![1u8, 2, 3];
+        let mut source = [1u8, 2, 3];
         // SAFETY: `source` covers the stated length.
         let data = unsafe {
             CFDataCreateWithBytesNoCopy(
@@ -3608,7 +3918,11 @@ mod tests {
                 std::ptr::null(),
             )
         };
-        source[0] = 9;
+        // The write is the point: the data must not observe it.
+        #[allow(unused_assignments)]
+        {
+            source[0] = 9;
+        }
 
         // SAFETY: `data` was created above and remains retained.
         let bytes = unsafe {

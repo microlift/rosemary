@@ -23,8 +23,8 @@ pub fn pump(app: Id) {
     while let Some(event) = sdl3::video::poll() {
         deliver(event);
     }
-    // Copied out first: a guard in the loop's head would be held across every
-    // hook, and a hook that runs guest code can turn this pump again.
+    service_presentation();
+    // General pump hooks may run guest code and are not modal-safe.
     let hooks = PUMP_HOOKS.lock().unwrap_or_else(|e| e.into_inner()).clone();
     for hook in hooks {
         hook();
@@ -33,7 +33,76 @@ pub fn pump(app: Id) {
     crate::backing::pump();
 }
 
+/// Service SDL surface work and publication on the video thread. Both the
+/// regular pump and a synchronous modal loop need these SDL-only operations.
+fn service_presentation() {
+    sdl3::video::vulkan::service_surface_requests();
+    let windows = window::sdl_windows();
+    sdl3::video::publish_presentation_windows(&windows);
+    // Scene geometry consumes the *current* SDL pixel bounds, so it must
+    // capture after publishing these owner-thread window snapshots.
+    crate::view::flush_metal_scenes();
+    // SDL_GetDisplayForWindow and SDL_GetDesktopDisplayMode require the
+    // main thread. Publish their results for Metal's asynchronous presenter.
+    // Mode change events invalidate immediately; poll less frequently as a
+    // fallback for compositors that do not emit them.
+    static LAST_REFRESH: std::sync::Mutex<Option<std::time::Instant>> = std::sync::Mutex::new(None);
+    if refresh_due(&LAST_REFRESH, std::time::Duration::from_millis(250)) {
+        sdl3::video::publish_window_refresh_rates(&windows);
+    }
+    static LAST_MODE_REFRESH: std::sync::Mutex<Option<std::time::Instant>> =
+        std::sync::Mutex::new(None);
+    if refresh_due(&LAST_MODE_REFRESH, std::time::Duration::from_secs(2)) {
+        sdl3::video::refresh_window_display_modes(&windows);
+    }
+}
+
+/// Keep completed host presentation moving without delivering guest input or
+/// running the general callbacks, which may call back into guest code.
+pub(crate) fn service_modal_presentation() {
+    service_presentation();
+    // Copy before callbacks, since these can reenter the modal loop.
+    let hooks = MODAL_PRESENTATION_HOOKS
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .clone();
+    for hook in hooks {
+        hook();
+    }
+}
+
+/// Never keep a timer guard across guest callbacks or a nested event pump.
+/// A timer's deadline is updated atomically, but SDL queries run unlocked.
+fn refresh_due(
+    timer: &std::sync::Mutex<Option<std::time::Instant>>,
+    interval: std::time::Duration,
+) -> bool {
+    let mut last = timer.lock().expect("refresh timer");
+    if last.is_none_or(|t| t.elapsed() >= interval) {
+        *last = Some(std::time::Instant::now());
+        true
+    } else {
+        false
+    }
+}
+
 static PUMP_HOOKS: std::sync::Mutex<Vec<fn()>> = std::sync::Mutex::new(Vec::new());
+static MODAL_PRESENTATION_HOOKS: std::sync::Mutex<Vec<fn()>> = std::sync::Mutex::new(Vec::new());
+
+/// Register a video-thread-only completion hook for nested modal dialogs.
+/// Continue registering the same callback with add_pump_hook for regular
+/// event turns, retaining existing normal-pump hook ordering.
+pub fn add_modal_presentation_hook(hook: fn()) {
+    let mut hooks = MODAL_PRESENTATION_HOOKS
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    if !hooks
+        .iter()
+        .any(|existing| std::ptr::fn_addr_eq(*existing, hook))
+    {
+        hooks.push(hook);
+    }
+}
 
 /// Run `hook` on every turn of the main thread's event pump, after input is
 /// delivered and before stores are presented.
@@ -253,6 +322,10 @@ pub(crate) fn deliver_past_modal(event: sdl3::video::Event) {
         // title bar's close button is on a Mac: `-performClose:`, so the
         // delegate may refuse and `-close` does the rest.
         Event::WindowClosed { window } => {
+            crate::screen::release_relative_pointer(window);
+            LOGICAL_MOUSE_CAPTURE.with_borrow_mut(|captures| {
+                captures.remove(&window);
+            });
             if crate::decor::window_closed(window) {
                 return;
             }
@@ -269,11 +342,17 @@ pub(crate) fn deliver_past_modal(event: sdl3::video::Event) {
         }
         Event::WindowHitTest { window } => crate::decor::hit_test_pressed(window),
         Event::WindowState { window } => {
+            // Fullscreen may change without a preceding resize event. A
+            // presentation worker must not keep the previous fullscreen flag.
+            sdl3::video::invalidate_presentation_window(window, &window::sdl_windows());
             let object = object_for(window);
-            if !object.is_null()
-                && let Some(name) = window::window_state_changed(object)
-            {
-                post(window, name);
+            if !object.is_null() {
+                // Synchronous resize/move delegates may release their window.
+                objc::arc::retain(object);
+                if let Some(name) = window::window_state_changed(object) {
+                    post_for(object, name);
+                }
+                objc::arc::release(object);
             }
         }
         // A program that keeps its own copy of where its window is - a Win32
@@ -282,9 +361,30 @@ pub(crate) fn deliver_past_modal(event: sdl3::video::Event) {
         // this runtime reports (see `window::global_position`), because a
         // program that only listens for the moves it makes itself would keep
         // mapping the pointer against the origin it asked for.
-        Event::WindowMoved { window } => post(window, window::DID_MOVE),
-        Event::WindowDisplayChanged { window } => post(window, window::DID_CHANGE_SCREEN),
-        Event::WindowResized { window, .. } => {
+        Event::WindowMoved { window } => {
+            crate::screen::refresh_relative_pointer(window);
+            sdl3::video::invalidate_presentation_window(window, &window::sdl_windows());
+            let object = object_for(window);
+            if !window::fullscreen_state_pending(object)
+                && !window::redundant_fullscreen_geometry(object, None)
+            {
+                post(window, window::DID_MOVE);
+            }
+        }
+        Event::DisplayModeChanged { display: _ } => {
+            sdl3::video::refresh_window_display_modes(&window::sdl_windows());
+        }
+        Event::WindowDisplayChanged { window } => {
+            sdl3::video::invalidate_presentation_window(window, &window::sdl_windows());
+            sdl3::video::window_display_changed(window, &window::sdl_windows());
+            post(window, window::DID_CHANGE_SCREEN);
+        }
+        Event::WindowResized {
+            window,
+            width,
+            height,
+        } => {
+            sdl3::video::invalidate_presentation_window(window, &window::sdl_windows());
             // The content view follows the window, as it does on
             // `-setContentView:` and for the same reason: a view that kept its
             // old size after a resize would draw into part of the window and
@@ -293,8 +393,11 @@ pub(crate) fn deliver_past_modal(event: sdl3::video::Event) {
             let content = window::content_view_of(object);
             if !object.is_null() {
                 window::size_settled(object);
+                // SAFETY: object resolves this SDL window's live NSWindow.
+                window::refresh_idle_opengl_clip(unsafe { window::sdl_window(object) });
                 window::fit_content_view(object);
                 crate::screen::confine_pointer(object);
+                crate::screen::refresh_relative_pointer(window);
             }
             // A resized view's tracking rectangle is the wrong shape, and
             // AppKit asks for a new one here rather than resizing the old.
@@ -305,12 +408,17 @@ pub(crate) fn deliver_past_modal(event: sdl3::video::Event) {
             // before the next cursor hit test chooses the wrong cursor.
             // SAFETY: null or the content view of a window this crate made.
             unsafe { crate::cursor::reset_rects_in_tree(content) };
-            post(window, window::DID_RESIZE);
+            if !window::fullscreen_state_pending(object)
+                && !window::redundant_fullscreen_geometry(object, Some((width, height)))
+            {
+                post(window, window::DID_RESIZE);
+            }
         }
         // The frame remains in points when a window crosses onto a display at
         // another scale, but its backing store does not. AppKit tells guests to
         // recompute pixel-sized viewports with this notification.
         Event::WindowBackingChanged { window } => {
+            sdl3::video::invalidate_presentation_window(window, &window::sdl_windows());
             post(window, window::DID_CHANGE_BACKING_PROPERTIES);
         }
         Event::WindowMouse { window, entered } => {
@@ -347,10 +455,14 @@ pub(crate) fn deliver_past_modal(event: sdl3::video::Event) {
             // Control may be let go where this pump never hears of it.
             if !gained {
                 leave_edit_chord(0);
+                LOGICAL_MOUSE_CAPTURE.with_borrow_mut(|captures| {
+                    captures.remove(&window);
+                });
             }
             let object = object_for(window);
             if !gained {
                 crate::screen::forget_recentring();
+                crate::screen::release_relative_pointer(window);
             }
             if !object.is_null() && gained {
                 window::set_key_window(object);
@@ -415,9 +527,10 @@ pub(crate) fn deliver_past_modal(event: sdl3::video::Event) {
             // moved on. The text goes with the key so the responder that
             // interprets it is the one that types it.
             if down && !modifier {
-                let typed = SCRIPTED_TEXT
-                    .with(|scripted| scripted.take())
-                    .unwrap_or_else(sdl3::video::take_next_text);
+                let typed = match SCRIPTED_TEXT.with(|scripted| scripted.take()) {
+                    Some(scripted) => scripted,
+                    None => sdl3::video::take_next_text().or_else(|| layout_text(window, &text)),
+                };
                 if let Some(typed) = typed {
                     nsevent::attach_text(event, &typed);
                 }
@@ -463,6 +576,10 @@ pub(crate) fn deliver_past_modal(event: sdl3::video::Event) {
             buttons,
         } => {
             crate::cursor::mouse_moved();
+            // A physical X11 pointer that starts outside its 1-pixel barrier
+            // can move on one axis until it crosses the region again. The
+            // repair affects only cursor position, not the SDL raw deltas.
+            crate::screen::repair_relative_pointer(id);
             if take_warp_echo(x, y) {
                 return;
             }
@@ -506,6 +623,10 @@ pub(crate) fn deliver_past_modal(event: sdl3::video::Event) {
             // when it broke the link, which is what CoreGraphics does and what
             // SDL, still tracking a position inside the window, does not.
             let (x, y) = track_pointer(id, x, y);
+            if !mouse_inside_logical_window(id, x, y) && !capture_allows_drag(id, buttons) {
+                crate::cursor::forget_tracking(object_for(id));
+                return;
+            }
             // Before the drop below: a cursor rectangle applies whether or not
             // anything asked for `-mouseMoved:`, and AppKit re-decides the
             // pointer on every move rather than only when a rectangle changes.
@@ -564,6 +685,11 @@ pub(crate) fn deliver_past_modal(event: sdl3::video::Event) {
             // where its cursor froze, not where SDL's integrated position is.
             let (cx, cy) = track_pointer(id, x, y);
             if crate::decor::pointer_button(id, button, down, clicks, cx, cy) {
+                // A release consumed by chrome must still end any previous
+                // guest capture; otherwise later motion could leak past the edge.
+                if !down {
+                    capture_mouse_button(id, button, false, false);
+                }
                 return;
             }
             let kind = crate::button::event_kind(button, down);
@@ -575,6 +701,9 @@ pub(crate) fn deliver_past_modal(event: sdl3::video::Event) {
                 crate::window::end_drag();
             }
             let (x, y) = track_pointer(id, x, y);
+            if !capture_mouse_button(id, button, down, mouse_inside_logical_window(id, x, y)) {
+                return;
+            }
             // A Control-click during an editing chord is a Control-click.
             if down {
                 leave_edit_chord(sdl3::video::keyboard_modifiers());
@@ -597,6 +726,9 @@ pub(crate) fn deliver_past_modal(event: sdl3::video::Event) {
         // was last over - which is where the wheel turned.
         Event::MouseWheel { window: id, x, y } => {
             let at = *POINTER.lock().unwrap_or_else(|e| e.into_inner());
+            if !mouse_inside_logical_window(id, at.0, at.1) {
+                return;
+            }
             send(id, Some(at), |window, location| Fields {
                 kind: kind::SCROLL_WHEEL,
                 modifiers: current_modifiers(),
@@ -635,7 +767,8 @@ pub fn window_geometry_changed(object: Id) {
     // taking it on the thread that runs this - and a context handed back and
     // forth is the one thing the GL under this runtime cannot do. A window that
     // came back the size it asked for has nothing to say.
-    if let Some((width, height)) = sdl3::video::window_size(sdl)
+    if window::fullscreen_frame(object).is_none()
+        && let Some((width, height)) = sdl3::video::window_size(sdl)
         && window::requested_size(object) != Some((width, height))
     {
         deliver(sdl3::video::Event::WindowResized {
@@ -800,12 +933,62 @@ fn key_equivalent(window: Id, fields: Fields, text: &str) -> bool {
     offer(window, event) || offer(menu, event)
 }
 
+// Only the physical SDL container receives host mouse input. Mouse-downs
+// within the logical AppKit window establish capture: subsequent drags and
+// their matching mouse-up must still reach the guest across its boundary.
+// Store capture per SDL window and per button (SDL button masks).
+thread_local! {
+    static LOGICAL_MOUSE_CAPTURE: std::cell::RefCell<std::collections::HashMap<u32, u32>> =
+        std::cell::RefCell::new(std::collections::HashMap::new());
+}
+
+fn mouse_inside_logical_window(id: u32, x: f32, y: f32) -> bool {
+    // A disassociated or recentred pointer's position is frozen, not where the
+    // input is: its deltas and clicks belong to the window wherever it froze.
+    if !crate::screen::mouse_is_associated() || crate::screen::recentring() {
+        return true;
+    }
+    let object = object_for(id);
+    !object.is_null() && window::accepts_surface_point(object, x, y)
+}
+
+fn capture_mouse_button(id: u32, button: u8, down: bool, inside: bool) -> bool {
+    LOGICAL_MOUSE_CAPTURE.with_borrow_mut(|captures| {
+        let held = captures.entry(id).or_default();
+        let mask = sdl3::mouse::mask(button);
+        let delivery = inside || (!down && *held & mask != 0);
+        if down {
+            if inside {
+                *held |= mask;
+            }
+        } else {
+            *held &= !mask;
+        }
+        if *held == 0 {
+            captures.remove(&id);
+        }
+        delivery
+    })
+}
+
+fn capture_allows_drag(id: u32, buttons: u32) -> bool {
+    LOGICAL_MOUSE_CAPTURE
+        .with_borrow(|captures| captures.get(&id).is_some_and(|held| *held & buttons != 0))
+}
+
 /// A pointer position SDL reports against the window's top-left, in the
 /// bottom-left frame `-locationInWindow` promises.
 ///
 /// The base coordinate system is the whole frame, so a titlebar this runtime
 /// draws is above the content view's top.
 fn location(window: Id, x: f32, y: f32) -> NSPoint {
+    // Only a fullscreen logical frame is placed by the host surface: a
+    // windowed frame follows `-setFrame:` before SDL's resize lands.
+    if window::fullscreen_frame(window).is_some()
+        && let Some(point) = window::point_from_surface(window, f64::from(x), f64::from(y))
+    {
+        return point;
+    }
     let content = window::content_view_of(window);
     let height = match content.is_null() {
         true => 0.0,
@@ -865,6 +1048,9 @@ fn send_to_window(window: Id, event: Id) {
         let f: unsafe extern "C" fn(Id, objc::sel::Sel, Id) =
             std::mem::transmute(objc::msg::entry());
         f(window, sel, event);
+    }
+    if nsevent::kind_of(event) == kind::KEY_DOWN {
+        window::follow_key_interpretation(window);
     }
 }
 
@@ -1027,22 +1213,27 @@ pub fn route(window: Id, event: Id) {
     }
 }
 
-fn focus_clicked(window: Id, view: Id) {
+/// Whether `view` takes first responder by its own answer: NSView's default
+/// here says yes for every view, so it does not count.
+pub(crate) fn accepts_first_responder(view: Id) -> bool {
     let sel = objc::sel::get("acceptsFirstResponder");
     // SAFETY: null or a live object this runtime allocated.
     let Some(method) = unsafe { objc::object::class_of(view) }.and_then(|c| c.method(sel)) else {
-        return;
+        return false;
     };
     if crate::view::is_default_accepts_first_responder(method.implementation()) {
-        return;
+        return false;
     }
     // SAFETY: `BOOL (id, SEL)`, the class's own implementation.
-    let accepts = unsafe {
+    unsafe {
         let f: unsafe extern "C" fn(Id, objc::sel::Sel) -> u8 =
             std::mem::transmute(method.implementation());
         f(view, sel) != 0
-    };
-    if !accepts || responder_of(window) == view {
+    }
+}
+
+fn focus_clicked(window: Id, view: Id) {
+    if !accepts_first_responder(view) || responder_of(window) == view {
         return;
     }
     // SAFETY: `-makeFirstResponder:` is `BOOL (id, SEL, NSResponder *)`.
@@ -1051,6 +1242,32 @@ fn focus_clicked(window: Id, view: Id) {
             std::mem::transmute(objc::msg::entry());
         f(window, objc::sel::get("makeFirstResponder:"), view);
     }
+}
+
+/// The text a key types by the keyboard layout alone, when the host input
+/// method was off for it and so resolved none.
+///
+/// It is off while the first responder keeps keys from the text system, and
+/// comes back once one is interpreted: that key still has to type.
+///
+/// FIXME (ACCURACY): the key that turns the input method back on is not
+/// composed by it, so a dead key or an IME's first keystroke types its plain
+/// character instead.
+fn layout_text(window: Id, characters: &str) -> Option<String> {
+    match window::host_text_input_active(window) {
+        true => None,
+        false => typed_characters(characters),
+    }
+}
+
+/// A key's `-characters` when they are text, and not the control character
+/// or private-use scalar AppKit gives an editing or function key.
+fn typed_characters(characters: &str) -> Option<String> {
+    let function_keys = '\u{F700}'..='\u{F8FF}';
+    let typed = characters
+        .chars()
+        .all(|c| !c.is_control() && !function_keys.contains(&c));
+    (typed && !characters.is_empty()).then(|| characters.to_owned())
 }
 
 thread_local! {
@@ -1502,6 +1719,8 @@ fn delegate_selector(name: &str) -> &'static str {
         window::DID_CHANGE_BACKING_PROPERTIES => "windowDidChangeBackingProperties:",
         window::WILL_START_LIVE_RESIZE => "windowWillStartLiveResize:",
         window::DID_END_LIVE_RESIZE => "windowDidEndLiveResize:",
+        crate::sheet::WILL_BEGIN => "windowWillBeginSheet:",
+        crate::sheet::DID_END => "windowDidEndSheet:",
         // Published but not yet posted; see `crate::NOTIFICATION_NAMES`.
         "NSWindowWillMiniaturizeNotification" => "windowWillMiniaturize:",
         "NSWindowWillMoveNotification" => "windowWillMove:",
@@ -1513,6 +1732,90 @@ fn delegate_selector(name: &str) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_printable_characters_are_typed_without_the_input_method() {
+        assert_eq!(typed_characters("a").as_deref(), Some("a"));
+        assert_eq!(typed_characters("?").as_deref(), Some("?"));
+        assert_eq!(typed_characters("\u{e9}").as_deref(), Some("\u{e9}"));
+        assert_eq!(typed_characters(""), None, "a modifier types nothing");
+        assert_eq!(typed_characters("\r"), None, "return is a command");
+        assert_eq!(typed_characters("\u{8}"), None, "backspace is a command");
+        assert_eq!(typed_characters("\u{F700}"), None, "up arrow");
+        assert_eq!(typed_characters("\u{F704}"), None, "F1");
+    }
+
+    #[test]
+    fn reentrant_event_pump_hook_returns_before_refresh_deadlines() {
+        if !sdl3::isolated::run_here() {
+            return;
+        }
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static NESTED: AtomicUsize = AtomicUsize::new(0);
+        fn reenter() {
+            if NESTED.fetch_add(1, Ordering::SeqCst) == 0 {
+                // The nested pump runs immediately, so neither refresh
+                // deadline is due. This used to deadlock on LAST_REFRESH.
+                pump(std::ptr::null_mut());
+            }
+        }
+        crate::bootstrap();
+        NESTED.store(0, Ordering::SeqCst);
+        // Arm both static refresh timers before installing the hook.
+        pump(std::ptr::null_mut());
+        add_pump_hook(reenter);
+        pump(std::ptr::null_mut());
+        PUMP_HOOKS
+            .lock()
+            .expect("pump hooks")
+            .retain(|f| !std::ptr::fn_addr_eq(*f, reenter as fn()));
+        assert!(
+            NESTED.load(Ordering::SeqCst) >= 2,
+            "the actual AppKit event pump did not reenter its hooks"
+        );
+    }
+
+    #[test]
+    fn nested_pump_when_both_refresh_deadlines_are_in_future_never_deadlocks() {
+        use std::sync::Mutex;
+        use std::time::{Duration, Instant};
+        // Simulate two nested pumps including the not-due branch which used
+        // to retain both guards until all AppKit hooks returned.
+        let refresh = Mutex::new(Some(Instant::now()));
+        let mode = Mutex::new(Some(Instant::now()));
+        fn nested(refresh: &Mutex<Option<Instant>>, mode: &Mutex<Option<Instant>>, depth: usize) {
+            assert!(!refresh_due(refresh, Duration::from_secs(60)));
+            assert!(!refresh_due(mode, Duration::from_secs(60)));
+            if depth > 0 {
+                nested(refresh, mode, depth - 1);
+            }
+            assert!(
+                refresh.try_lock().is_ok(),
+                "refresh timer retained during guest hook"
+            );
+            assert!(
+                mode.try_lock().is_ok(),
+                "mode timer retained during guest hook"
+            );
+        }
+        nested(&refresh, &mode, 3);
+    }
+
+    #[test]
+    fn logical_window_capture_keeps_drag_and_matching_release_but_not_stray_input() {
+        let window = 0x8675309;
+        let left = sdl3::mouse::LEFT;
+        let right = sdl3::mouse::RIGHT;
+        assert!(!capture_mouse_button(window, left, true, false));
+        assert!(!capture_allows_drag(window, sdl3::mouse::mask(left)));
+        assert!(capture_mouse_button(window, left, true, true));
+        assert!(capture_allows_drag(window, sdl3::mouse::mask(left)));
+        assert!(!capture_allows_drag(window, sdl3::mouse::mask(right)));
+        assert!(!capture_mouse_button(window, right, false, false));
+        assert!(capture_mouse_button(window, left, false, false));
+        assert!(!capture_allows_drag(window, sdl3::mouse::mask(left)));
+        assert!(!capture_mouse_button(window, left, false, false));
+    }
 
     #[test]
     fn a_programmatic_warp_updates_the_reported_pointer() {
@@ -1559,5 +1862,99 @@ mod tests {
                 assert!(!delegate_selector(name).is_empty(), "{name}");
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod modal_presentation_tests {
+    use super::*;
+    use crate::dialog::{Request, deliver_modal, modal_window, run};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    static PRESENTATION_TURNS: AtomicUsize = AtomicUsize::new(0);
+    static GENERAL_PUMP_TURNS: AtomicUsize = AtomicUsize::new(0);
+    static DISPLAY_WINDOW: AtomicUsize = AtomicUsize::new(0);
+    static SURFACE_PRESENTS: AtomicUsize = AtomicUsize::new(0);
+
+    fn completed_presentation() {
+        let turns = PRESENTATION_TURNS.fetch_add(1, Ordering::SeqCst) + 1;
+        let window = modal_window().expect("presentation served while dialog remains modal");
+        assert!(
+            sdl3::may_pump(),
+            "presentation must stay on SDL video thread"
+        );
+        if turns == 2 || turns == 3 {
+            let display = DISPLAY_WINDOW.load(Ordering::SeqCst) as sdl3::Window;
+            assert!(
+                sdl3::video::present_window(display, |surface| {
+                    assert!(surface.width > 0 && surface.height > 0);
+                    assert!(!surface.pixels.is_null());
+                    // Exercise the same video-thread SDL surface update used by
+                    // completed Metal CPU readbacks while the dialog stays open.
+                    unsafe { *surface.pixels = 0x5a };
+                    true
+                }),
+                "completed presentation starved inside modal dialog"
+            );
+            SURFACE_PRESENTS.fetch_add(1, Ordering::SeqCst);
+        }
+        if turns == 4 {
+            assert!(deliver_modal(&sdl3::video::Event::WindowClosed {
+                window: sdl3::video::window_id(window),
+            }));
+        }
+    }
+
+    fn general_guest_pump_hook() {
+        GENERAL_PUMP_TURNS.fetch_add(1, Ordering::SeqCst);
+    }
+
+    #[test]
+    fn modal_dialog_keeps_presentation_serviced_without_running_guest_pump_hooks() {
+        // Rust libtest may schedule graphical cases on different OS threads.
+        // SDL attaches video ownership to the first thread in the process,
+        // so execute this real modal/SDL assertion in its own fresh process.
+        if !sdl3::isolated::run_here() {
+            return;
+        }
+        crate::bootstrap();
+        assert!(sdl3::video::init_video());
+        let display = sdl3::video::create_window(c"independent modal display", 96, 72, 0)
+            .expect("independent SDL output window");
+        sdl3::video::show_window(display);
+        DISPLAY_WINDOW.store(display as usize, Ordering::SeqCst);
+        PRESENTATION_TURNS.store(0, Ordering::SeqCst);
+        SURFACE_PRESENTS.store(0, Ordering::SeqCst);
+        GENERAL_PUMP_TURNS.store(0, Ordering::SeqCst);
+        add_modal_presentation_hook(completed_presentation);
+        add_pump_hook(general_guest_pump_hook);
+        let result = run(&Request {
+            title: "Modal presentation test".into(),
+            message: "Keep presenting".into(),
+            buttons: vec!["OK".into()],
+            ..Request::default()
+        });
+        MODAL_PRESENTATION_HOOKS
+            .lock()
+            .expect("presentation hooks")
+            .retain(|hook| !std::ptr::fn_addr_eq(*hook, completed_presentation as fn()));
+        PUMP_HOOKS
+            .lock()
+            .expect("general hooks")
+            .retain(|hook| !std::ptr::fn_addr_eq(*hook, general_guest_pump_hook as fn()));
+        assert_eq!(
+            result,
+            Some(0),
+            "real modal alert never reached scripted answer"
+        );
+        assert_eq!(PRESENTATION_TURNS.load(Ordering::SeqCst), 4);
+        assert_eq!(SURFACE_PRESENTS.load(Ordering::SeqCst), 2);
+        sdl3::video::destroy_window(display);
+        DISPLAY_WINDOW.store(0, Ordering::SeqCst);
+        assert_eq!(
+            GENERAL_PUMP_TURNS.load(Ordering::SeqCst),
+            0,
+            "modal presentation must not invoke arbitrary guest pump hooks"
+        );
     }
 }

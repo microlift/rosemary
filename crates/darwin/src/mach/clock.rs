@@ -71,7 +71,7 @@ pub unsafe extern "C" fn clock_get_time(clock: Name, out: *mut MachTimespec) -> 
         tv_nsec: 0,
     };
     // SAFETY: `clock_gettime` writes the `timespec` it is given and nothing else.
-    if unsafe { libc::clock_gettime(host, &mut ts) } != 0 {
+    if unsafe { crate::syscall::clock_gettime(host, &mut ts) } != 0 {
         return KERN_FAILURE;
     }
     let value = MachTimespec {
@@ -127,7 +127,7 @@ pub unsafe extern "C" fn clock_sleep(
             tv_nsec: 0,
         };
         // SAFETY: `clock_gettime` writes the `timespec` it is given and nothing else.
-        if unsafe { libc::clock_gettime(host, &mut now) } != 0 {
+        if unsafe { crate::syscall::clock_gettime(host, &mut now) } != 0 {
             return KERN_FAILURE;
         }
         deadline.tv_sec = now.tv_sec.saturating_add(deadline.tv_sec);
@@ -158,7 +158,7 @@ pub unsafe extern "C" fn clock_sleep(
             tv_nsec: 0,
         };
         // SAFETY: `clock_gettime` writes the `timespec` it is given and nothing else.
-        if unsafe { libc::clock_gettime(host, &mut now) } != 0 {
+        if unsafe { crate::syscall::clock_gettime(host, &mut now) } != 0 {
             return KERN_FAILURE;
         }
         let mut gap_sec = deadline.tv_sec - now.tv_sec;

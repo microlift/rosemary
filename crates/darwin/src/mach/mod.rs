@@ -2,6 +2,7 @@ use std::ffi::c_void;
 
 pub mod bootstrap;
 pub mod clock;
+pub mod entry;
 pub mod info;
 pub mod kern;
 pub mod local;
@@ -31,7 +32,7 @@ fn nanoseconds(clock: libc::clockid_t) -> u64 {
         tv_nsec: 0,
     };
     // SAFETY: `clock_gettime` writes the `timespec` it is given and nothing else.
-    if unsafe { libc::clock_gettime(clock, &mut ts) } != 0 {
+    if unsafe { crate::syscall::clock_gettime(clock, &mut ts) } != 0 {
         return 0;
     }
     (ts.tv_sec as u64)
@@ -168,6 +169,9 @@ exports::exports! {
         "vm_read" | "mach_vm_read" => vm::vm_read,
         "vm_write" | "mach_vm_write" => vm::vm_write,
         "vm_protect" | "mach_vm_protect" => vm::vm_protect,
+        "vm_map" | "vm_map_64" | "mach_vm_map" => vm::mach_vm_map,
+        "vm_remap" | "mach_vm_remap" => vm::mach_vm_remap,
+        "mach_make_memory_entry" | "mach_make_memory_entry_64" => entry::mach_make_memory_entry_64,
         "vm_copy" | "mach_vm_copy" => vm::vm_copy,
 
         "mach_msg" => msg::mach_msg,

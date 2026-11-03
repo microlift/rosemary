@@ -25,7 +25,8 @@ pub const TRACKING_AREA_INSTANCE_SIZE: usize = size_of::<TrackingArea>();
 #[repr(C)]
 pub struct Cursor {
     isa: *const c_void,
-    /// Which of the named cursors this is, an index into [`SHAPES`].
+    /// Which of the named cursors this is: an index into [`SHAPES`], then
+    /// past its end into [`FRAME_RESIZE`].
     shape: usize,
     /// The image a custom cursor was made from, retained, and where its point
     /// is. Both are read back by a program, and both are what `sdl` was built
@@ -145,7 +146,7 @@ fn show(cursor: Id) {
 fn sdl_of(cursor: &mut Cursor) -> sdl3::Cursor {
     if cursor.sdl.is_null()
         && cursor.image.is_null()
-        && let Some(id) = SHAPES.get(cursor.shape).and_then(|s| system_cursor(s))
+        && let Some(id) = shape_cursor(cursor.shape)
     {
         cursor.sdl = sdl3::video::create_system_cursor(id).unwrap_or(std::ptr::null_mut());
     }
@@ -285,9 +286,9 @@ unsafe extern "C" fn hot_spot(receiver: Id, _sel: Sel) -> NSPoint {
 
 /// One `-addCursorRect:cursor:`, kept until the view discards its rectangles.
 ///
-/// The view is retained. AppKit's rectangles are dropped by the view's own
-/// `-dealloc`; nothing here reaches that, so an unretained view would leave
-/// [`apply`] reading a freed object on the next mouse move.
+/// The view is not retained, as in AppKit: `-[NSView dealloc]` discards its
+/// rectangles. Retaining it would let a reset free the view mid-call, when it
+/// drops the last reference.
 struct CursorRect {
     view: usize,
     rect: NSRect,
@@ -332,7 +333,7 @@ pub fn add_rect(view: Id, rect: NSRect, cursor: Id) {
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .push(CursorRect {
-            view: objc::arc::retain(view) as usize,
+            view: view as usize,
             rect,
             cursor: objc::arc::retain(cursor) as usize,
         });
@@ -356,7 +357,6 @@ pub fn discard_rects(view: Id) {
     };
     for entry in taken {
         objc::arc::release(entry.cursor as Id);
-        objc::arc::release(entry.view as Id);
     }
 }
 
@@ -465,7 +465,7 @@ fn holding_rect() -> Option<Id> {
     let rects = RECTS.lock().unwrap_or_else(|e| e.into_inner());
     rects.iter().rev().find_map(|entry| {
         let view = entry.view as Id;
-        // SAFETY: an object this runtime allocated, retained by the entry.
+        // SAFETY: a live view; its `-dealloc` removes the entry.
         let point = unsafe { crate::view::pointer_in(view) }?;
         crate::view::holds(view, entry.rect, point).then_some(entry.cursor as Id)
     })
@@ -535,8 +535,9 @@ struct Installed {
     holds: bool,
 }
 
-/// Every area in a view tree, in drawing order - parents before children and
-/// siblings in order - so the last one holding the pointer is the topmost.
+/// Every area in a view tree, in drawing order: parents before children,
+/// siblings in order, and a view's areas in the order they were added.
+/// [`installed`] reverses it.
 ///
 /// Areas on hidden views are listed as holding nothing: a view that is hidden
 /// with the pointer inside it is one the pointer has left.
@@ -570,7 +571,10 @@ unsafe fn installed_in(view: Id, key: bool, first: Id, out: &mut Vec<Installed>)
     }
 }
 
-/// The areas of `window`'s content view, retained; see [`Installed`].
+/// The areas of `window`'s content view, retained, frontmost first: children
+/// before parents, later siblings before earlier ones, and a view's newest area
+/// before its older ones. That is the order AppKit delivers tracking events in,
+/// so the first area holding the pointer is the topmost. See [`Installed`].
 fn installed(window: Id) -> Vec<Installed> {
     let key = crate::window::key_window() == window;
     let first = match key {
@@ -584,6 +588,7 @@ fn installed(window: Id) -> Vec<Installed> {
     let mut out = Vec::new();
     // SAFETY: null or the content view, which this crate made.
     unsafe { installed_in(crate::window::content_view_of(window), key, first, &mut out) };
+    out.reverse();
     out
 }
 
@@ -595,7 +600,8 @@ fn installed(window: Id) -> Vec<Installed> {
 /// takes its state with it, and a new one at the same address starts clean.
 ///
 /// - `NSTrackingMouseEnteredAndExited`: `-mouseEntered:` and `-mouseExited:` to
-///   the owner of every area the pointer crosses, exits first.
+///   the owner of every area the pointer crosses, exits first, each frontmost
+///   first.
 /// - `NSTrackingCursorUpdate`: `-cursorUpdate:` when the topmost such area
 ///   changes, to its owner; leaving the last one sends it to the view under the
 ///   pointer, whose inherited method walks up to the window and puts the arrow
@@ -645,7 +651,7 @@ pub fn update_tracking(window: Id, dragging: bool) {
         .iter()
         .filter(wants_cursor)
         .filter(|e| e.active && e.holds)
-        .rfind(|e| area_of(e.area).is_some_and(|a| !held_by_drag(a.options, dragging)))
+        .find(|e| area_of(e.area).is_some_and(|a| !held_by_drag(a.options, dragging)))
         .map(|e| e.area);
     let previous = areas
         .iter()
@@ -688,7 +694,8 @@ pub fn update_tracking(window: Id, dragging: bool) {
 
 /// The areas of `window` that `-mouseMoved:` goes to for a move with no
 /// button held: active, holding the pointer, and made with
-/// `NSTrackingMouseMoved`. Retained, for the caller to release.
+/// `NSTrackingMouseMoved`. Retained, for the caller to release, and frontmost
+/// first, which is the order AppKit sends the moves in.
 ///
 /// AppKit sends those moves to each area's owner, which is the only place Qt
 /// listens for them: its `QNSView` gives a helper object the area, and the
@@ -811,6 +818,96 @@ fn cursor_for(shape: usize) -> Id {
     objc::arc::make_immortal(cursor as Id);
     cursors.push((shape, cursor as usize));
     cursor as Id
+}
+
+/// The frame-resize cursors' shapes, after [`SHAPES`]: each edge's and corner's
+/// one-way arrow, then the two-way ones.
+static FRAME_RESIZE: &[std::ffi::c_int] = {
+    use sdl3::video::system_cursor::*;
+    &[
+        N_RESIZE,
+        S_RESIZE,
+        E_RESIZE,
+        W_RESIZE,
+        NW_RESIZE,
+        NE_RESIZE,
+        SW_RESIZE,
+        SE_RESIZE,
+        NS_RESIZE,
+        EW_RESIZE,
+        NWSE_RESIZE,
+        NESW_RESIZE,
+    ]
+};
+
+/// The desktop's shape for any cursor shape, or `None` to show its arrow.
+fn shape_cursor(shape: usize) -> Option<std::ffi::c_int> {
+    match SHAPES.get(shape) {
+        Some(name) => system_cursor(name),
+        None => FRAME_RESIZE.get(shape - SHAPES.len()).copied(),
+    }
+}
+
+/// `NSCursorFrameResizePosition`.
+mod position {
+    pub const TOP: usize = 1 << 0;
+    pub const LEFT: usize = 1 << 1;
+    pub const BOTTOM: usize = 1 << 2;
+    pub const RIGHT: usize = 1 << 3;
+}
+
+/// `NSCursorFrameResizeDirections`.
+mod directions {
+    pub const INWARD: usize = 1 << 0;
+    pub const OUTWARD: usize = 1 << 1;
+    pub const ALL: usize = INWARD | OUTWARD;
+}
+
+/// The frame-resize shape for an edge or corner, as the index into
+/// [`FRAME_RESIZE`]; `None` for a position that is neither.
+fn frame_resize_shape(at: usize, toward: usize) -> Option<usize> {
+    use sdl3::video::system_cursor::*;
+    // The outward direction from the edge, y growing downward.
+    let dy: i32 = match at & (position::TOP | position::BOTTOM) {
+        0 => 0,
+        position::TOP => -1,
+        position::BOTTOM => 1,
+        _ => return None,
+    };
+    let dx: i32 = match at & (position::LEFT | position::RIGHT) {
+        0 => 0,
+        position::LEFT => -1,
+        position::RIGHT => 1,
+        _ => return None,
+    };
+    let (dx, dy) = match toward {
+        directions::INWARD => (-dx, -dy),
+        directions::OUTWARD | directions::ALL => (dx, dy),
+        _ => return None,
+    };
+    let id = match (toward == directions::ALL, dx, dy) {
+        (_, 0, 0) => return None,
+        (true, 0, _) => NS_RESIZE,
+        (true, _, 0) => EW_RESIZE,
+        (true, _, _) if dx == dy => NWSE_RESIZE,
+        (true, _, _) => NESW_RESIZE,
+        (false, 0, -1) => N_RESIZE,
+        (false, 0, _) => S_RESIZE,
+        (false, 1, 0) => E_RESIZE,
+        (false, _, 0) => W_RESIZE,
+        (false, -1, -1) => NW_RESIZE,
+        (false, 1, -1) => NE_RESIZE,
+        (false, -1, _) => SW_RESIZE,
+        (false, _, _) => SE_RESIZE,
+    };
+    FRAME_RESIZE.iter().position(|shape| *shape == id)
+}
+
+/// `+[NSCursor frameResizeCursorFromPosition:inDirections:]`
+unsafe extern "C" fn frame_resize_cursor(_class: Id, _sel: Sel, at: usize, toward: usize) -> Id {
+    frame_resize_shape(at, toward).map_or(std::ptr::null_mut(), |index| {
+        cursor_for(SHAPES.len() + index)
+    })
 }
 
 /// The desktop's shape for a named cursor, or `None` to show its arrow. The
@@ -1113,6 +1210,7 @@ pub(crate) fn install() {
     class_methods!(cursor, {
         "currentCursor" => current_cursor, c"@16@0:8";
         "currentSystemCursor" => current_system_cursor, c"@16@0:8";
+        "frameResizeCursorFromPosition:inDirections:" => frame_resize_cursor, c"@32@0:8Q16Q24";
         "pop" => class_pop, c"v16@0:8";
         "hide" => hide, c"v16@0:8";
         "unhide" => unhide, c"v16@0:8";
@@ -1138,6 +1236,25 @@ pub(crate) fn install() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn frame_resize_cursors_point_along_their_edge() {
+        use sdl3::video::system_cursor::*;
+        let shape = |at, toward| frame_resize_shape(at, toward).map(|i| FRAME_RESIZE[i]);
+        assert_eq!(shape(position::TOP, directions::OUTWARD), Some(N_RESIZE));
+        assert_eq!(shape(position::TOP, directions::INWARD), Some(S_RESIZE));
+        assert_eq!(shape(position::LEFT, directions::ALL), Some(EW_RESIZE));
+        let top_left = position::TOP | position::LEFT;
+        assert_eq!(shape(top_left, directions::OUTWARD), Some(NW_RESIZE));
+        assert_eq!(shape(top_left, directions::INWARD), Some(SE_RESIZE));
+        assert_eq!(shape(top_left, directions::ALL), Some(NWSE_RESIZE));
+        let bottom_left = position::BOTTOM | position::LEFT;
+        assert_eq!(shape(bottom_left, directions::ALL), Some(NESW_RESIZE));
+        assert_eq!(
+            shape(position::TOP | position::BOTTOM, directions::ALL),
+            None
+        );
+    }
 
     /// The hide state is process-wide, so the tests that touch it take turns.
     static HIDE_STATE: std::sync::Mutex<()> = std::sync::Mutex::new(());
@@ -1226,17 +1343,39 @@ mod tests {
 
         discard_rects(one);
         assert_eq!(objc::arc::retain_count(cursor), before + 1);
+        let views: Vec<usize> = RECTS.lock().unwrap().iter().map(|e| e.view).collect();
         assert!(
-            RECTS
-                .lock()
-                .unwrap()
-                .iter()
-                .all(|entry| entry.view == two as usize),
+            !views.contains(&(one as usize)) && views.contains(&(two as usize)),
             "only the discarded view's rectangles go"
         );
 
         discard_rects(two);
         assert_eq!(objc::arc::retain_count(cursor), before);
+    }
+
+    /// A rectangle does not keep its view alive; the view's `-dealloc` takes
+    /// its rectangles with it.
+    #[test]
+    fn releasing_a_view_drops_its_cursor_rectangles() {
+        crate::bootstrap();
+        let cursor =
+            objc::object::create_instance(objc::class::lookup(c"NSCursor").expect("NSCursor"), 0);
+        let view =
+            objc::object::create_instance(objc::class::lookup(c"NSView").expect("NSView"), 0);
+        let before = objc::arc::retain_count(view);
+        add_rect(view, NSRect::default(), cursor);
+        assert_eq!(objc::arc::retain_count(view), before);
+
+        objc::arc::release(view);
+        assert!(
+            RECTS
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|entry| entry.view != view as usize),
+            "the dealloc'd view's rectangles go with it"
+        );
+        objc::arc::release(cursor);
     }
 
     /// The active option decides when an area is live: a key-window area stops
@@ -1256,6 +1395,82 @@ mod tests {
         assert!(held_by_drag(ACTIVE_ALWAYS, true));
         assert!(!held_by_drag(ACTIVE_ALWAYS, false));
         assert!(!held_by_drag(ENABLED_DURING_MOUSE_DRAG, true));
+    }
+
+    /// Overlapping areas get `-mouseMoved:` frontmost first, as on macOS:
+    /// later siblings before earlier ones, children before parents, and a
+    /// view's newest area before its older ones.
+    #[test]
+    fn overlapping_mouse_moves_reach_frontmost_views_first() {
+        crate::bootstrap();
+        // SAFETY: each cast matches the method's declared prototype.
+        let send: unsafe extern "C" fn(Id, Sel, Id) =
+            unsafe { std::mem::transmute(objc::msg::entry()) };
+        let new_view = || {
+            let view = objc::object::create_instance(objc::class::lookup(c"NSView").unwrap(), 0);
+            let rect = NSRect {
+                origin: NSPoint::default(),
+                size: NSSize {
+                    width: 100.0,
+                    height: 100.0,
+                },
+            };
+            unsafe {
+                let init: unsafe extern "C" fn(Id, Sel, NSRect) -> Id =
+                    std::mem::transmute(objc::msg::entry());
+                init(view, objc::sel::get("initWithFrame:"), rect)
+            }
+        };
+        let add_area = |view: Id| {
+            let area =
+                objc::object::create_instance(objc::class::lookup(c"NSTrackingArea").unwrap(), 0);
+            unsafe {
+                init_tracking_area(
+                    area,
+                    objc::sel::get("initWithRect:options:owner:userInfo:"),
+                    NSRect::default(),
+                    tracking::MOUSE_MOVED | tracking::ACTIVE_ALWAYS | tracking::IN_VISIBLE_RECT,
+                    view,
+                    std::ptr::null_mut(),
+                );
+                send(view, objc::sel::get("addTrackingArea:"), area);
+            }
+            // The view holds it now.
+            objc::arc::release(area);
+            area
+        };
+
+        // root
+        // |- back      (one area, and a child with one)
+        // |  `- inner
+        // `- front     (two areas)
+        // A window without an SDL handle keeps this fixture headless.
+        let window = objc::object::create_instance(objc::class::lookup(c"NSWindow").unwrap(), 0);
+        let [root, back, inner, front] = [new_view(), new_view(), new_view(), new_view()];
+        unsafe {
+            send(window, objc::sel::get("setContentView:"), root);
+            send(root, objc::sel::get("addSubview:"), back);
+            send(back, objc::sel::get("addSubview:"), inner);
+            send(root, objc::sel::get("addSubview:"), front);
+        }
+        for view in [root, back, inner, front] {
+            objc::arc::release(view);
+        }
+        let root_area = add_area(root);
+        let back_area = add_area(back);
+        let inner_area = add_area(inner);
+        let front_older = add_area(front);
+        let front_newer = add_area(front);
+
+        crate::window::TEST_POINTER.set(Some(NSPoint { x: 10.0, y: 10.0 }));
+        let delivered = mouse_moved_areas(window);
+        crate::window::TEST_POINTER.set(None);
+        assert_eq!(
+            delivered,
+            vec![front_newer, front_older, inner_area, back_area, root_area]
+        );
+        delivered.into_iter().for_each(objc::arc::release);
+        objc::arc::release(window);
     }
 
     /// `NSTrackingAssumeInside` starts an area inside, so the first move that

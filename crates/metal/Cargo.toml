@@ -17,4 +17,12 @@ metal_translate.workspace = true
 rspirv.workspace = true
 appkit.workspace = true
 sdl3.workspace = true
+starnix.workspace = true
 static_init.workspace = true
+
+[dev-dependencies]
+sdl3 = { workspace = true, features = ["test-support"] }
+iosurface.workspace = true
+
+[lints]
+workspace = true

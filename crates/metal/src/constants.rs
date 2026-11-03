@@ -6,6 +6,7 @@ pub(crate) const MTL_PIXEL_FORMAT_BGRA8_UNORM: u64 = 80;
 
 pub(crate) const MTL_TEXTURE_TYPE_2D: u64 = 2;
 pub(crate) const MTL_TEXTURE_TYPE_CUBE: u64 = 5;
+pub(crate) const MTL_TEXTURE_TYPE_TEXTURE_BUFFER: u64 = 9;
 
 pub(crate) const MTL_STORAGE_MODE_MANAGED: u64 = 1;
 
@@ -18,6 +19,10 @@ pub(crate) const MTL_FEATURE_SET_MACOS_GPU_FAMILY_1_V1: u64 = 10000;
 pub(crate) const MTL_FEATURE_SET_MACOS_GPU_FAMILY_2_V1: u64 = 10005;
 
 pub(crate) const MTL_ARGUMENT_BUFFERS_TIER_1: u64 = 0;
+
+pub(crate) const MTL_READ_WRITE_TEXTURE_TIER_1: u64 = 1;
+
+pub(crate) const MTL_DEVICE_LOCATION_UNSPECIFIED: u64 = u64::MAX;
 
 pub(crate) const MTL_COLOR_WRITE_MASK_ALL: u64 = 0xf;
 pub(crate) const MTL_DEPTH_CLIP_MODE_CLAMP: u64 = 1;

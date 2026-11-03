@@ -16,6 +16,8 @@ const DIRECTORIES: &[&str] = &[
     "/Library",
     "/System",
     "/System/Library",
+    // Where `SystemVersion.plist` is mounted; see `ns`.
+    "/System/Library/CoreServices",
     "/usr",
     "/usr/lib",
     "/private",

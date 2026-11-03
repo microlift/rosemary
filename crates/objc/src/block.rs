@@ -31,7 +31,7 @@ mod byref_flag {
 }
 
 /// What a `__block` variable or captured field is, as the helpers describe it.
-mod field {
+pub(crate) mod field {
     pub const OBJECT: i32 = 3;
     pub const BLOCK: i32 = 7;
     pub const BYREF: i32 = 8;
@@ -336,7 +336,7 @@ pub unsafe fn object_dispose(object: *const c_void, flags: i32) {
 ///
 /// `source` must be a `Block_byref`.
 unsafe fn byref_copy(source: *mut Byref) -> *mut Byref {
-    crate::debug::validate(source as Id, "_Block_object_assign byref");
+    crate::debug::validate_storage(source as Id, "_Block_object_assign byref");
     let forwarding = unsafe { (*source).forwarding };
     if forwarding.is_null() {
         return source;
@@ -413,7 +413,7 @@ unsafe fn byref_copy(source: *mut Byref) -> *mut Byref {
             ),
         }
     }
-    crate::debug::validate(copied as Id, "__block copy helper");
+    crate::debug::validate_storage(copied as Id, "__block copy helper");
     copied
 }
 
@@ -421,12 +421,12 @@ unsafe fn byref_copy(source: *mut Byref) -> *mut Byref {
 ///
 /// As [`byref_copy`].
 unsafe fn byref_release(byref: *mut Byref) {
-    crate::debug::validate(byref as Id, "_Block_object_dispose byref");
+    crate::debug::validate_storage(byref as Id, "_Block_object_dispose byref");
     let byref = unsafe { (*byref).forwarding };
     if byref.is_null() {
         return;
     }
-    crate::debug::validate(byref as Id, "_Block_object_dispose byref");
+    crate::debug::validate_storage(byref as Id, "_Block_object_dispose byref");
     // SAFETY: a byref.
     let flags = unsafe { (*byref).flags.load(Ordering::Relaxed) };
     if flags & byref_flag::NEEDS_FREE == 0 {

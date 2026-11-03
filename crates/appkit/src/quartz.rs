@@ -198,16 +198,20 @@ pub(crate) fn frame_of(context: CFTypeRef) -> Option<Frame> {
     if ctx.focus {
         let device = crate::backing::focused_device()?;
         let d = device.density;
+        // The store holds the part of the view on screen, from `left`, `top`.
         let base = match device.flipped {
             true => CGAffineTransform {
                 a: d,
                 d,
+                tx: -device.left,
+                ty: -device.top,
                 ..IDENTITY
             },
             false => CGAffineTransform {
                 a: d,
                 d: -d,
-                ty: f64::from(device.height),
+                tx: -device.left,
+                ty: device.view_height - device.top,
                 ..IDENTITY
             },
         };
@@ -812,6 +816,15 @@ fn clip_by(gs: &mut GState, coverage: sk::Mask) {
     gs.clip = Some(Arc::new(mask));
 }
 
+/// Run `body` with a context's clip as coverage bytes, row by row, and the
+/// row width; `None` when the context is not clipped.
+pub(crate) fn with_clip<R>(context: CFTypeRef, body: impl FnOnce(&[u8], u32) -> R) -> Option<R> {
+    let frame = frame_of(context)?;
+    let state = state_of(context)?;
+    let mask = clip_for(&state.current, frame.width, frame.height)?;
+    Some(body(mask.data(), mask.width()))
+}
+
 /// The device rectangle the clip leaves drawable, as left, top, right,
 /// bottom.
 pub(crate) fn clip_device_bounds(context: CFTypeRef) -> Option<[f64; 4]> {
@@ -848,7 +861,13 @@ fn coverage_mask(
     coverage: &[u8],
 ) -> Option<sk::Mask> {
     let mut alpha = sk::Pixmap::new(width as u32, height as u32)?;
-    for (pixel, value) in alpha.data_mut().chunks_exact_mut(4).zip(coverage) {
+    for (pixel, value) in alpha
+        .data_mut()
+        .as_chunks_mut::<4>()
+        .0
+        .iter_mut()
+        .zip(coverage)
+    {
         pixel.copy_from_slice(&[0, 0, 0, *value]);
     }
     let mut device = sk::Pixmap::new(frame.width, frame.height)?;
@@ -898,7 +917,7 @@ fn image_to_user(rect: NSRect, width: usize, height: usize) -> CGAffineTransform
 fn raster(bgra: Vec<u8>, width: usize, height: usize, swap: bool) -> Option<sk::Pixmap> {
     let mut pixels = bgra;
     if !swap {
-        for pixel in pixels.chunks_exact_mut(4) {
+        for pixel in pixels.as_chunks_mut::<4>().0 {
             pixel.swap(0, 2);
         }
     }
@@ -1196,7 +1215,10 @@ pub(crate) fn draw_glyphs(
     let mode = state.current.text_mode;
     let units = f64::from(face.face().units_per_em().max(1));
     let s = size / units;
-    let mut text = Elements::default();
+    // Into base space, which is where a context's paths are drawn from.
+    let to_base = state.current.text_matrix.then(state.current.ctm);
+    let to_device = frame_of(context).map(|frame| frame.base);
+    let mut path = Elements::default();
     for (glyph, (x, y)) in glyphs.iter().zip(positions) {
         let at = CGAffineTransform {
             a: s,
@@ -1205,15 +1227,15 @@ pub(crate) fn draw_glyphs(
             ty: *y,
             ..IDENTITY
         };
-        crate::cgpath::glyph_outline(face.face(), *glyph, at, &mut text);
+        let mut at = at.then(to_base);
+        if let Some(base) = to_device {
+            (at.tx, at.ty) = row_aligned_origin((at.tx, at.ty), at, base);
+        }
+        crate::cgpath::glyph_outline(face.face(), *glyph, at, &mut path);
     }
-    if text.is_empty() {
+    if path.is_empty() {
         return;
     }
-    // Into base space, which is where a context's paths are drawn from.
-    let to_base = state.current.text_matrix.then(state.current.ctm);
-    let mut path = Elements::default();
-    path.append(to_base, &text);
     // `kCGTextFill`, `Stroke`, `FillStroke`, `Invisible`, then the same four
     // with the glyphs also added to the clip.
     if matches!(mode, 0 | 2 | 4 | 6) {
@@ -1227,6 +1249,30 @@ pub(crate) fn draw_glyphs(
     }
 }
 
+/// A glyph origin in base space, moved down onto the device pixel row below
+/// it when the glyph is drawn upright. Core Graphics positions glyphs at
+/// whole device pixels vertically; Qt's glyph cache offsets its images by
+/// exactly that rounding, so a fractional origin shifts each glyph by a
+/// different amount.
+fn row_aligned_origin(
+    origin: (f64, f64),
+    glyph: CGAffineTransform,
+    base: CGAffineTransform,
+) -> (f64, f64) {
+    // Allows for rounding in the transforms; finer than Qt's 1/64 pixel.
+    const SLACK: f64 = 1.0 / 1024.0;
+    let to_device = glyph.then(base);
+    let Some(from_device) = base.inverse() else {
+        return origin;
+    };
+    if to_device.b != 0.0 || to_device.c != 0.0 {
+        return origin;
+    }
+    // Device rows grow downward, so the row below is the ceiling.
+    let (x, y) = base.apply(origin.0, origin.1);
+    from_device.apply(x, (y - SLACK).ceil())
+}
+
 /// Write a pixel buffer's B, G, R, A copy for `CGBitmapContextCreateImage` -
 /// the context's own bytes in whatever layout - as premultiplied B, G, R, A.
 pub(crate) fn snapshot_bgra(ctx: &BitmapContext) -> Option<Vec<u8>> {
@@ -1237,7 +1283,7 @@ pub(crate) fn snapshot_bgra(ctx: &BitmapContext) -> Option<Vec<u8>> {
     let bytes = unsafe { std::slice::from_raw_parts(ctx.data, ctx.bytes_per_row * ctx.height) };
     let mut rgba = vec![0u8; ctx.width * ctx.height * 4];
     read_in(bytes, ctx, layout(ctx), &mut rgba);
-    for pixel in rgba.chunks_exact_mut(4) {
+    for pixel in rgba.as_chunks_mut::<4>().0 {
         pixel.swap(0, 2);
     }
     Some(rgba)
@@ -1260,5 +1306,35 @@ mod tests {
         let back = t.then(t.inverse().expect("invertible"));
         let (x, y) = back.apply(1.25, -3.5);
         assert!((x - 1.25).abs() < 1e-9 && (y + 3.5).abs() < 1e-9);
+    }
+
+    #[test]
+    fn an_upright_glyph_lands_on_the_device_row_below_its_origin() {
+        // A 20-row bitmap context: base space grows up, device rows down.
+        let base = CGAffineTransform {
+            d: -1.0,
+            ty: 20.0,
+            ..IDENTITY
+        };
+        let glyph = CGAffineTransform {
+            a: 0.01,
+            d: 0.01,
+            ..IDENTITY
+        };
+        // 10.4 up is device row 9.6, so the glyph drops to row 10.
+        let (x, y) = row_aligned_origin((3.3, 10.4), glyph, base);
+        assert!((x - 3.3).abs() < 1e-9, "x moved to {x}");
+        assert!((y - 10.0).abs() < 1e-9, "y is {y}");
+        // Already on a row: left alone.
+        assert_eq!(row_aligned_origin((0.0, 7.0), glyph, base), (0.0, 7.0));
+        // Rotated text is not snapped.
+        let rotated = CGAffineTransform {
+            a: 0.0,
+            b: 0.01,
+            c: -0.01,
+            d: 0.0,
+            ..IDENTITY
+        };
+        assert_eq!(row_aligned_origin((3.3, 10.4), rotated, base), (3.3, 10.4));
     }
 }

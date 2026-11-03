@@ -1,4 +1,4 @@
-use std::ffi::{CStr, c_char, c_int, c_uint, c_void};
+use std::ffi::{CStr, CString, c_char, c_int, c_uint, c_void};
 use std::sync::atomic::{AtomicI32, Ordering};
 
 /// POSIX's distinguished `(locale_t)-1`, omitted by the Rust libc bindings on
@@ -63,6 +63,38 @@ fn host_category_mask(guest: c_int) -> Option<c_int> {
     Some(host)
 }
 
+/// Darwin's categories in the order its composite `LC_ALL` name lists them,
+/// with the variable `setlocale(category, "")` reads for each.
+const CATEGORIES: [(c_int, &CStr); 6] = [
+    (libc::LC_COLLATE, c"LC_COLLATE"),
+    (libc::LC_CTYPE, c"LC_CTYPE"),
+    (libc::LC_MONETARY, c"LC_MONETARY"),
+    (libc::LC_NUMERIC, c"LC_NUMERIC"),
+    (libc::LC_TIME, c"LC_TIME"),
+    (libc::LC_MESSAGES, c"LC_MESSAGES"),
+];
+
+/// Darwin ships a ctype-only locale named `UTF-8`, which programs ask for when
+/// the environment names none. glibc's equivalent is `C.UTF-8`.
+const DARWIN_UTF8: &CStr = c"UTF-8";
+const HOST_UTF8: &CStr = c"C.UTF-8";
+
+fn host_name(category: c_int, name: &CStr) -> &CStr {
+    if category == libc::LC_CTYPE && name == DARWIN_UTF8 {
+        HOST_UTF8
+    } else {
+        name
+    }
+}
+
+fn darwin_name(category: c_int, name: &CStr) -> &CStr {
+    if category == libc::LC_CTYPE && name == HOST_UTF8 {
+        DARWIN_UTF8
+    } else {
+        name
+    }
+}
+
 /// `char *setlocale(int category, const char *locale)`.
 ///
 /// # Safety
@@ -74,36 +106,39 @@ pub unsafe extern "C" fn setlocale(category: c_int, locale: *const c_char) -> *m
         return core::ptr::null_mut();
     };
     // SAFETY: the caller's string, which is null or NUL-terminated.
-    let name = if !locale.is_null() && unsafe { *locale } == 0 {
-        unsafe { set_from_guest_environment(category) }
-    } else {
-        // SAFETY: the caller's string and the translated host category.
-        unsafe { libc::setlocale(category, locale) }
+    let locale = (!locale.is_null()).then(|| unsafe { CStr::from_ptr(locale) });
+    let changed = match locale {
+        None => true,
+        Some(name) if name.is_empty() => unsafe { set_from_guest_environment(category) },
+        Some(name) if category == libc::LC_ALL && name.to_bytes().contains(&b'/') => {
+            let Some(names) = split_composite(name) else {
+                crate::errno::set(libc::EINVAL);
+                return core::ptr::null_mut();
+            };
+            unsafe { set_categories(&names) }
+        }
+        // SAFETY: a NUL-terminated name and a host category.
+        Some(name) => unsafe {
+            !libc::setlocale(category, host_name(category, name).as_ptr()).is_null()
+        },
     };
-    if !name.is_null() && (category == libc::LC_ALL || category == libc::LC_CTYPE) {
+    if !changed {
+        return core::ptr::null_mut();
+    }
+    if locale.is_some() && (category == libc::LC_ALL || category == libc::LC_CTYPE) {
         let max = unsafe { plain::__ctype_get_mb_cur_max() };
         MB_CUR_MAX.store(max as c_int, Ordering::Relaxed);
     }
-    name
+    unsafe { current_name(category) }
 }
 
 /// `setlocale(category, "")`: each category from the guest's `LC_ALL`, then
-/// its own variable, then `LANG`, never the host's environment. All or
-/// nothing, as POSIX asks: when one category's name is refused, the ones
-/// already changed are put back.
+/// its own variable, then `LANG`, never the host's environment.
 ///
 /// # Safety
 ///
 /// `category` is a host category.
-unsafe fn set_from_guest_environment(category: c_int) -> *mut c_char {
-    const CATEGORIES: [(c_int, &CStr); 6] = [
-        (libc::LC_COLLATE, c"LC_COLLATE"),
-        (libc::LC_CTYPE, c"LC_CTYPE"),
-        (libc::LC_MONETARY, c"LC_MONETARY"),
-        (libc::LC_NUMERIC, c"LC_NUMERIC"),
-        (libc::LC_TIME, c"LC_TIME"),
-        (libc::LC_MESSAGES, c"LC_MESSAGES"),
-    ];
+unsafe fn set_from_guest_environment(category: c_int) -> bool {
     let guest = |name: &CStr| {
         // SAFETY: a NUL-terminated name; the answer is null or a guest string.
         let value = unsafe { crate::env::getenv(name.as_ptr()) };
@@ -112,32 +147,109 @@ unsafe fn set_from_guest_environment(category: c_int) -> *mut c_char {
         (!value.is_null() && unsafe { *value } != 0)
             .then(|| unsafe { CStr::from_ptr(value) }.to_owned())
     };
-    let mut changed: Vec<(c_int, std::ffi::CString)> = Vec::new();
-    for (host, variable) in CATEGORIES {
-        if category != libc::LC_ALL && category != host {
-            continue;
-        }
-        let name = guest(c"LC_ALL")
-            .or_else(|| guest(variable))
-            .or_else(|| guest(c"LANG"))
-            .unwrap_or_else(|| c"C".to_owned());
+    let names: Vec<_> = CATEGORIES
+        .iter()
+        .filter(|&&(host, _)| category == libc::LC_ALL || category == host)
+        .map(|&(host, variable)| {
+            let name = guest(c"LC_ALL")
+                .or_else(|| guest(variable))
+                .or_else(|| guest(c"LANG"))
+                .unwrap_or_else(|| c"C".to_owned());
+            (host, name)
+        })
+        .collect();
+    unsafe { set_categories(&names) }
+}
+
+/// Darwin's composite `LC_ALL` name, one name per category in [`CATEGORIES`]
+/// order separated by `/`. Like libSystem, a short list repeats its last name
+/// for the categories it leaves out.
+fn split_composite(name: &CStr) -> Option<Vec<(c_int, CString)>> {
+    let parts: Vec<&[u8]> = name.to_bytes().split(|&b| b == b'/').collect();
+    if parts.len() > CATEGORIES.len() || parts.iter().any(|part| part.is_empty()) {
+        return None;
+    }
+    let last = *parts.last()?;
+    Some(
+        CATEGORIES
+            .iter()
+            .enumerate()
+            .map(|(i, &(host, _))| {
+                let part = parts.get(i).copied().unwrap_or(last);
+                // A part of a `CStr` holds no NUL.
+                (host, CString::new(part).expect("no NUL in a C string"))
+            })
+            .collect(),
+    )
+}
+
+/// Sets each category to its Darwin name, all or nothing, as POSIX asks: when
+/// one category's name is refused, the ones already changed are put back.
+///
+/// # Safety
+///
+/// Each category is a host category.
+unsafe fn set_categories(names: &[(c_int, CString)]) -> bool {
+    let mut changed: Vec<(c_int, CString)> = Vec::new();
+    for (host, name) in names {
         // SAFETY: a query, whose answer is copied before the next call.
-        let before = unsafe { libc::setlocale(host, core::ptr::null()) };
+        let before = unsafe { libc::setlocale(*host, core::ptr::null()) };
         let before = (!before.is_null()).then(|| unsafe { CStr::from_ptr(before) }.to_owned());
         // SAFETY: a NUL-terminated name and a host category.
-        if unsafe { libc::setlocale(host, name.as_ptr()) }.is_null() {
+        if unsafe { libc::setlocale(*host, host_name(*host, name).as_ptr()) }.is_null() {
             for (host, before) in changed.iter().rev() {
                 // SAFETY: a name the host itself reported for this category.
                 unsafe { libc::setlocale(*host, before.as_ptr()) };
             }
-            return core::ptr::null_mut();
+            return false;
         }
         if let Some(before) = before {
-            changed.push((host, before));
+            changed.push((*host, before));
         }
     }
-    // SAFETY: a query, which changes nothing.
-    unsafe { libc::setlocale(category, core::ptr::null()) }
+    true
+}
+
+/// The current name of `category` as Darwin spells it. For `LC_ALL` that is
+/// one name when every category agrees and the `/`-separated composite
+/// otherwise; glibc's own composite also lists categories Darwin lacks.
+///
+/// # Safety
+///
+/// `category` is a host category. The answer is valid until the next call.
+unsafe fn current_name(category: c_int) -> *mut c_char {
+    static NAME: std::sync::Mutex<Option<CString>> = std::sync::Mutex::new(None);
+    let query = |host: c_int| {
+        // SAFETY: a query, whose answer is copied before the next call.
+        let name = unsafe { libc::setlocale(host, core::ptr::null()) };
+        (!name.is_null()).then(|| darwin_name(host, unsafe { CStr::from_ptr(name) }).to_owned())
+    };
+    let name = if category == libc::LC_ALL {
+        let Some(names) = CATEGORIES
+            .iter()
+            .map(|&(host, _)| query(host))
+            .collect::<Option<Vec<_>>>()
+        else {
+            return core::ptr::null_mut();
+        };
+        if names.iter().all(|name| *name == names[0]) {
+            names[0].clone()
+        } else {
+            let joined = names
+                .iter()
+                .map(|name| name.to_bytes())
+                .collect::<Vec<_>>()
+                .join(&b'/');
+            CString::new(joined).expect("no NUL in a C string")
+        }
+    } else {
+        match query(category) {
+            Some(name) => name,
+            None => return core::ptr::null_mut(),
+        }
+    };
+    let mut slot = NAME.lock().unwrap_or_else(|e| e.into_inner());
+    slot.insert(name).as_ptr().cast_mut()
 }
 
 /// Darwin's `int __mb_cur_max`, the global `MB_CUR_MAX` read before it became
@@ -1016,6 +1128,77 @@ mod tests {
             assert_eq!(CStr::from_ptr(ctype), c"C");
         }
         assert_eq!(MB_CUR_MAX.load(Ordering::Relaxed), 1);
+    }
+
+    fn host_has_utf8_ctype() -> bool {
+        // SAFETY: NUL-terminated names; the global locale is the test's.
+        unsafe {
+            let found = !libc::setlocale(libc::LC_CTYPE, HOST_UTF8.as_ptr()).is_null();
+            libc::setlocale(libc::LC_CTYPE, c"C".as_ptr());
+            found
+        }
+    }
+
+    #[test]
+    fn darwins_utf8_name_selects_a_utf8_ctype() {
+        let _turn = turn();
+        if !host_has_utf8_ctype() {
+            eprintln!("skipping: this host has no C.UTF-8");
+            return;
+        }
+        let _guest = GuestLocale::new(&[]);
+        // SAFETY: NUL-terminated names.
+        unsafe {
+            let set = setlocale(category::CTYPE, c"UTF-8".as_ptr());
+            assert!(!set.is_null());
+            assert_eq!(CStr::from_ptr(set), c"UTF-8");
+            let query = setlocale(category::CTYPE, core::ptr::null());
+            assert_eq!(CStr::from_ptr(query), c"UTF-8");
+            assert!(setlocale(category::NUMERIC, c"UTF-8".as_ptr()).is_null());
+        }
+        assert!(MB_CUR_MAX.load(Ordering::Relaxed) > 1);
+    }
+
+    #[test]
+    fn mixed_categories_report_darwins_composite_name() {
+        let _turn = turn();
+        if !host_has_utf8_ctype() {
+            eprintln!("skipping: this host has no C.UTF-8");
+            return;
+        }
+        let _guest = GuestLocale::new(&[]);
+        // SAFETY: NUL-terminated names.
+        unsafe {
+            setlocale(category::ALL, c"C".as_ptr());
+            setlocale(category::CTYPE, c"UTF-8".as_ptr());
+            let all = setlocale(category::ALL, core::ptr::null());
+            assert_eq!(CStr::from_ptr(all), c"C/UTF-8/C/C/C/C");
+
+            setlocale(category::ALL, c"C".as_ptr());
+            let all = setlocale(category::ALL, c"C/UTF-8/C/C/C/C".as_ptr());
+            assert!(!all.is_null());
+            assert_eq!(CStr::from_ptr(all), c"C/UTF-8/C/C/C/C");
+        }
+    }
+
+    #[test]
+    fn a_short_composite_name_repeats_its_last_category() {
+        let _turn = turn();
+        if !host_has_utf8_ctype() {
+            eprintln!("skipping: this host has no C.UTF-8");
+            return;
+        }
+        let _guest = GuestLocale::new(&[]);
+        // SAFETY: NUL-terminated names.
+        unsafe {
+            // The repeated `UTF-8` reaches LC_MONETARY, which has no such name.
+            assert!(setlocale(category::ALL, c"C/UTF-8".as_ptr()).is_null());
+            let all = setlocale(category::ALL, c"C/UTF-8/C".as_ptr());
+            assert!(!all.is_null());
+            assert_eq!(CStr::from_ptr(all), c"C/UTF-8/C/C/C/C");
+            assert!(setlocale(category::ALL, c"C//C".as_ptr()).is_null());
+            assert!(setlocale(category::ALL, c"C/C/C/C/C/C/C".as_ptr()).is_null());
+        }
     }
 
     /// The switch is undone even when the wrapped call fails, which is the whole

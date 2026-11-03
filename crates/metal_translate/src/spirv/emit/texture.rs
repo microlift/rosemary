@@ -1,10 +1,22 @@
 use super::*;
 use crate::ir::TextureType;
 
-/// The IR's signless result a signed image access is bitcast into.
-struct Unsigned {
+/// How the texels an image access carries become the IR's texels.
+#[derive(Clone, Copy)]
+enum Resize {
+    /// A signed image's texels against the IR's signless ones.
+    Bitcast,
+    /// A `half` texel against Vulkan's 32-bit sampled type.
+    Float,
+    /// A `short` texel against Vulkan's 32-bit sampled type.
+    Integer { signed: bool },
+}
+
+/// The IR's result an image access is converted into.
+struct Narrowed {
     ty: u32,
     result_id: Option<u32>,
+    resize: Resize,
 }
 
 impl Emitter {
@@ -32,11 +44,15 @@ impl Emitter {
                 let coordinate =
                     self.texture_coordinate(function, coordinate, array_index.as_ref(), values)?;
                 let mut value = self.operand(value, values)?;
-                if let Some(signed) = self.signed_texels(&image_type, &written)? {
-                    value = self
-                        .builder
-                        .bitcast(signed, None, value)
-                        .map_err(build_error)?;
+                if let Some((access, resize)) = self.image_texels(&image_type, &written)? {
+                    let builder = &mut self.builder;
+                    value = match resize {
+                        Resize::Bitcast => builder.bitcast(access, None, value),
+                        Resize::Float => builder.f_convert(access, None, value),
+                        Resize::Integer { signed: true } => builder.s_convert(access, None, value),
+                        Resize::Integer { signed: false } => builder.u_convert(access, None, value),
+                    }
+                    .map_err(build_error)?;
                 }
                 self.builder
                     .image_write(image, coordinate, value, None, [])
@@ -60,7 +76,7 @@ impl Emitter {
                 let Some(Type::Texture(image_type)) = operand_type(function, texture) else {
                     return Err(emission("texture sample has no texture operand"));
                 };
-                let (ty, result_id, signed) =
+                let (ty, result_id, narrowed) =
                     self.texel_result(&image_type, &function.values[result.0 as usize], result_id)?;
                 let image_id = self.type_id(&Type::Texture(image_type))?;
                 let sampled_type = self.builder.type_sampled_image(image_id);
@@ -163,7 +179,7 @@ impl Emitter {
                             .map_err(build_error)?;
                     }
                 }
-                self.unsign_texels(signed, result_id)?;
+                self.narrow_texels(narrowed, result_id)?;
             }
             InstructionKind::TextureRead {
                 texture,
@@ -178,7 +194,7 @@ impl Emitter {
                 let Some(Type::Texture(image_type)) = operand_type(function, texture) else {
                     return Err(emission("texture read has no texture operand"));
                 };
-                let (ty, result_id, signed) =
+                let (ty, result_id, narrowed) =
                     self.texel_result(&image_type, &function.values[result.0 as usize], result_id)?;
                 let image = self.operand(texture, values)?;
                 let coordinate =
@@ -203,7 +219,7 @@ impl Emitter {
                         .image_read(ty, result_id, image, coordinate, Some(mask), extra)
                         .map_err(build_error)?;
                 }
-                self.unsign_texels(signed, result_id)?;
+                self.narrow_texels(narrowed, result_id)?;
             }
             InstructionKind::TextureQuerySize {
                 texture,
@@ -228,12 +244,16 @@ impl Emitter {
                     }
                 })?;
                 let image = self.operand(texture, values)?;
-                // `OpImageQuerySize` covers a storage image and a multisampled
-                // one; every other sampled image needs the level named, and
+                // `OpImageQuerySize` covers a storage image, a multisampled
+                // one and a buffer; every other sampled image needs the level
+                // named, and
                 // Metal's `get_width()` on a texture it only reads names none.
                 let level = match lod {
                     Some(lod) => Some(self.operand(lod, values)?),
-                    None if image_type.sampled_image() && !image_type.multisampled => {
+                    None if image_type.sampled_image()
+                        && !image_type.multisampled
+                        && image_type.dimension != TextureDimension::Buffer =>
+                    {
                         Some(self.constant(&Type::u32(), 0)?)
                     }
                     None => None,
@@ -263,51 +283,84 @@ impl Emitter {
         Ok(())
     }
 
-    /// The signed form of `ty` where `texture` holds signed integers and `ty`
-    /// is an integer value, which is the type Vulkan requires an image access
-    /// to use; `None` where the IR's own signless type already matches.
-    fn signed_texels(
+    /// The type an image access of `ty` texels is emitted with, and how its
+    /// texels convert to `ty`'s; `None` where `ty` is already that type.
+    fn image_texels(
         &mut self,
         texture: &TextureType,
         ty: &Type,
-    ) -> Result<Option<u32>, TranslateError> {
-        match ty.signed_integer().filter(|_| texture.signed) {
-            Some(signed) => self.type_id(&signed).map(Some),
-            None => Ok(None),
+    ) -> Result<Option<(u32, Resize)>, TranslateError> {
+        let (element, lanes) = match ty {
+            Type::Vector { element, lanes } => (element.as_ref(), Some(*lanes)),
+            scalar => (scalar, None),
+        };
+        let sampled = texture.sampled_scalar();
+        if *element == sampled {
+            return Ok(None);
         }
+        let resize = match (element, &sampled) {
+            (Type::Float { .. }, Type::Float { .. }) => Resize::Float,
+            (Type::Int { bits: 32, .. }, Type::Int { bits: 32, .. }) => Resize::Bitcast,
+            (Type::Int { .. }, Type::Int { signed, .. }) => Resize::Integer { signed: *signed },
+            _ => return Err(emission("an image access of the wrong texel kind")),
+        };
+        let access = match lanes {
+            Some(lanes) => Type::Vector {
+                element: Box::new(sampled),
+                lanes,
+            },
+            None => sampled,
+        };
+        Ok(Some((self.type_id(&access)?, resize)))
     }
 
-    /// The result type and id an image access is emitted with. A signed
-    /// access gets a fresh id, and `unsign_texels` later bitcasts it into the
-    /// IR's signless result under the original id.
+    /// The result type and id an image access is emitted with. An access
+    /// whose texels differ from the IR's gets a fresh id, and `narrow_texels`
+    /// later converts it into the IR's result under the original id.
     fn texel_result(
         &mut self,
         texture: &TextureType,
         result: &Type,
         result_id: Option<u32>,
-    ) -> Result<(u32, Option<u32>, Option<Unsigned>), TranslateError> {
+    ) -> Result<(u32, Option<u32>, Option<Narrowed>), TranslateError> {
         let ty = self.type_id(result)?;
-        Ok(match self.signed_texels(texture, result)? {
-            Some(signed) => (
-                signed,
+        Ok(match self.image_texels(texture, result)? {
+            Some((access, resize)) => (
+                access,
                 Some(self.builder.id()),
-                Some(Unsigned { ty, result_id }),
+                Some(Narrowed {
+                    ty,
+                    result_id,
+                    resize,
+                }),
             ),
             None => (ty, result_id, None),
         })
     }
 
-    fn unsign_texels(
+    fn narrow_texels(
         &mut self,
-        unsigned: Option<Unsigned>,
+        narrowed: Option<Narrowed>,
         value: Option<u32>,
     ) -> Result<(), TranslateError> {
-        let (Some(Unsigned { ty, result_id }), Some(value)) = (unsigned, value) else {
+        let (
+            Some(Narrowed {
+                ty,
+                result_id,
+                resize,
+            }),
+            Some(value),
+        ) = (narrowed, value)
+        else {
             return Ok(());
         };
-        self.builder
-            .bitcast(ty, result_id, value)
-            .map_err(build_error)?;
+        match resize {
+            Resize::Bitcast => self.builder.bitcast(ty, result_id, value),
+            Resize::Float => self.builder.f_convert(ty, result_id, value),
+            // Narrowing keeps the low bits whatever the image's signedness.
+            Resize::Integer { .. } => self.builder.u_convert(ty, result_id, value),
+        }
+        .map_err(build_error)?;
         Ok(())
     }
 }

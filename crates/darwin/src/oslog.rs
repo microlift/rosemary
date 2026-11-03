@@ -391,6 +391,11 @@ exports::exports! {
         // `_os_log_impl` and `_os_activity_create` begin with an underscore of
         // their own, in addition to Mach-O's.
         "_os_log_impl" => _os_log_impl,
+        // The level-specific entry points take the same arguments, the level
+        // included, and differ only in what Apple records alongside.
+        "_os_log_debug_impl" => _os_log_impl,
+        "_os_log_error_impl" => _os_log_impl,
+        "_os_log_fault_impl" => _os_log_impl,
         "os_retain" => os_retain,
         "os_release" => os_release,
         "_os_activity_create" => _os_activity_create,

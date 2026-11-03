@@ -3,9 +3,7 @@
 
 use std::ffi::{CStr, c_char, c_int};
 
-#[cfg(not(target_os = "macos"))]
 mod posix;
-#[cfg(not(target_os = "macos"))]
 pub use posix::*;
 
 /// `bool _dyld_func_lookup(const char *name, void **address)`

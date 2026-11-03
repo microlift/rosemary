@@ -171,7 +171,7 @@ pub(crate) fn unsuffixed_is_legacy() -> bool {
 /// # Safety
 ///
 /// `out` is null or a writable `struct stat` of that layout.
-unsafe fn unsuffixed(
+pub(crate) unsafe fn unsuffixed(
     out: *mut c_void,
     legacy: bool,
     fill: impl FnOnce(*mut Stat) -> c_int,
@@ -607,6 +607,40 @@ pub unsafe extern "C" fn open(path: *const c_char, flags: c_int, mode: u32) -> c
     })
 }
 
+/// `O_DP_GETRAWENCRYPTED` and `O_DP_GETRAWUNENCRYPTED`, which ask for a
+/// protected file's bytes as stored.
+const O_DP_GETRAW: c_int = 0x0001 | 0x0002;
+/// Darwin's `O_ACCMODE` and `ACCESSPERMS`.
+const DARWIN_O_ACCMODE: c_int = 0x0003;
+const ACCESSPERMS: u32 = 0o777;
+
+/// `int open_dprotected_np(const char *, int flags, int class, int dpflags,
+/// ...)`, the mode taken as a fixed argument as [`open`] takes it.
+///
+/// No host volume has content protection - `statfs` never reports
+/// `MNT_CPROTECT` - so this is `open`, as xnu's is on such a volume: the class
+/// is an attribute the file system ignores, and a protected file's raw bytes
+/// are its bytes.
+///
+/// # Safety
+///
+/// `path` is a NUL-terminated string.
+pub unsafe extern "C" fn open_dprotected_np(
+    path: *const c_char,
+    flags: c_int,
+    _class: c_int,
+    dpflags: c_int,
+    mode: u32,
+) -> c_int {
+    // Raw bytes are only ever read.
+    if dpflags & O_DP_GETRAW != 0 && flags & DARWIN_O_ACCMODE != 0 {
+        crate::errno::set(libc::EINVAL);
+        return -1;
+    }
+    // SAFETY: the caller's obligations, unchanged.
+    unsafe { open(path, flags, mode & ACCESSPERMS) }
+}
+
 /// `int openat(int, const char *, int, ...)`, with Darwin's flag word.
 ///
 /// The case-insensitive fallback remains relative to `dirfd`, including when it
@@ -779,12 +813,12 @@ pub unsafe extern "C" fn fstatat(
 /// Darwin's `AT_RESOLVE_BENEATH`, which fails a lookup that would leave the
 /// directory it starts from, by `..`, an absolute path or a symlink. Safe
 /// archive extraction (`unzip`) relies on it, so it is kept rather than dropped.
-mod beneath {
+pub(crate) mod beneath {
     use super::Stat;
     #[cfg(target_os = "linux")]
     use super::{Found, as_seen};
     #[cfg(target_os = "linux")]
-    use std::ffi::CStr;
+    use std::ffi::{CStr, CString};
     use std::ffi::{c_char, c_int};
 
     /// The `AT_` flag where the host can honour it, and no bits elsewhere, so
@@ -874,6 +908,60 @@ mod beneath {
 
     #[cfg(not(target_os = "linux"))]
     pub unsafe fn fstatat(_: c_int, _: *const c_char, _: *mut Stat, _: bool) -> c_int {
+        unreachable!("SUPPORTED is zero here, so nothing asks for it")
+    }
+
+    /// `unlinkat` beneath `dirfd`: the parent opened with `RESOLVE_BENEATH`,
+    /// then the last component removed from it. The last component is not
+    /// followed, so only the parent's lookup can escape.
+    ///
+    /// # Safety
+    ///
+    /// `path` is a NUL-terminated host path.
+    #[cfg(target_os = "linux")]
+    pub unsafe fn unlinkat(dirfd: c_int, path: *const c_char, flags: c_int) -> c_int {
+        // SAFETY: the caller's NUL-terminated path.
+        let bytes = unsafe { CStr::from_ptr(path) }.to_bytes();
+        // Trailing slashes stay on the name, where they mean "a directory".
+        let end = bytes
+            .iter()
+            .rposition(|b| *b != b'/')
+            .map_or(0, |at| at + 1);
+        let start = bytes[..end]
+            .iter()
+            .rposition(|b| *b == b'/')
+            .map(|at| at + 1);
+        let (parent, name) = match start {
+            Some(start) => (&bytes[..start - 1], &bytes[start..]),
+            None => (&b"."[..], bytes),
+        };
+        // An absolute path or a last `..` leaves `dirfd` without a lookup
+        // the host could refuse. FIXME (ACCURACY): EXDEV, as in `fstatat`.
+        if bytes.first() == Some(&b'/') || bytes[start.unwrap_or(0)..end] == *b".." {
+            crate::errno::set(libc::EXDEV);
+            return -1;
+        }
+        let (Ok(parent), Ok(name)) = (CString::new(parent), CString::new(name)) else {
+            crate::errno::set(libc::EINVAL);
+            return -1;
+        };
+        let flags_parent = libc::O_PATH | libc::O_DIRECTORY | libc::O_CLOEXEC;
+        // SAFETY: a NUL-terminated path this call built.
+        let fd = unsafe { open(dirfd, parent.as_ptr(), flags_parent, 0) };
+        if fd < 0 {
+            return -1;
+        }
+        // SAFETY: an `O_PATH` directory descriptor this call owns.
+        let rc = unsafe { libc::unlinkat(fd, name.as_ptr(), flags) };
+        let saved = crate::errno::get();
+        // SAFETY: closed exactly once.
+        unsafe { libc::close(fd) };
+        crate::errno::set(saved);
+        rc
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    pub unsafe fn unlinkat(_: c_int, _: *const c_char, _: c_int) -> c_int {
         unreachable!("SUPPORTED is zero here, so nothing asks for it")
     }
 }
@@ -1141,6 +1229,7 @@ exports::exports! {
         "realpath" => realpath,
         "readlink" => readlink,
         "open" => open,
+        "open_dprotected_np" => open_dprotected_np,
         "openat" => openat,
     }
 }
@@ -1395,11 +1484,11 @@ mod tests {
         };
         let (rc, followed) = stat_at(c"link", 0);
         assert_eq!(rc, 0);
-        assert_eq!(followed.mode as u32 & 0o170000, libc::S_IFREG.into());
+        assert_eq!(followed.mode as u32 & 0o170000, libc::S_IFREG);
         assert_eq!(followed.size, 3);
         let (rc, link) = stat_at(c"link", DARWIN_AT_SYMLINK_NOFOLLOW);
         assert_eq!(rc, 0);
-        assert_eq!(link.mode as u32 & 0o170000, libc::S_IFLNK.into());
+        assert_eq!(link.mode as u32 & 0o170000, libc::S_IFLNK);
         let (rc, folded) = stat_at(c"contents/game.ios", 0);
         assert_eq!(rc, 0, "the case fold stays relative to the descriptor");
         assert_eq!(folded.size, 3);

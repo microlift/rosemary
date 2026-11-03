@@ -4,11 +4,13 @@ members = ["crates/*"]
 exclude = ["third_party"]
 
 [workspace.package]
-version = "0.3.0"
+version = "0.5.0"
 edition = "2024"
 license = "GPL-3.0-only"
 
 [workspace.dependencies]
+icu_normalizer = { version = "2.3", default-features = false, features = ["compiled_data"] }
+icu_properties = { version = "2.3", default-features = false, features = ["compiled_data"] }
 machish = { path = "crates/machish" }
 exports = { path = "crates/exports" }
 darwin = { path = "crates/darwin" }
@@ -25,7 +27,9 @@ chrome = { path = "crates/chrome" }
 applicationservices = { path = "crates/applicationservices" }
 coreservices = { path = "crates/coreservices" }
 audiotoolbox = { path = "crates/audiotoolbox" }
+coremedia = { path = "crates/coremedia" }
 corevideo = { path = "crates/corevideo" }
+coretext = { path = "crates/coretext" }
 iosurface = { path = "crates/iosurface" }
 coreaudio = { path = "crates/coreaudio" }
 contacts = { path = "crates/contacts" }
@@ -36,10 +40,12 @@ webkit = { path = "crates/webkit" }
 forcefeedback = { path = "crates/forcefeedback" }
 network = { path = "crates/network" }
 opencl = { path = "crates/opencl" }
+opengl = { path = "crates/opengl" }
 metal_translate = { path = "crates/metal_translate" }
 metal = { path = "crates/metal" }
+videotoolbox = { path = "crates/videotoolbox" }
 ash = "0.38"
-libc = "0.2"
+libc = "0.2.190"
 half = "2.7.1"
 libm = "0.2"
 backtrace = "0.3"
@@ -67,6 +73,7 @@ des = "0.9.0"
 rc2 = "0.9.0"
 rc4 = "0.2.0"
 rustix = { version = "1.1.5", features = ["time", "thread", "process", "net"] }
+libffi = "5.2.0"
 
 # mimalloc with a fork gate and a block check, which darwin's malloc needs for
 # libmalloc's guarantees. See third_party/libmimalloc-sys/ROSEMARY.md.
@@ -78,3 +85,15 @@ inherits = "release"
 lto = true
 codegen-units = 1
 panic = "abort"
+
+# Members opt in with `[lints] workspace = true`.
+[workspace.lints.clippy]
+# FFI and ABI bridging code mirrors C/Darwin signatures: long argument lists,
+# many unsafe entry points whose contract is the Darwin API documentation, and
+# function-pointer transmutes whose types are already pinned by the binding.
+too_many_arguments = "allow"
+type_complexity = "allow"
+missing_safety_doc = "allow"
+missing_transmute_annotations = "allow"
+# Enum layout is not a concern for these cold, small-count types.
+large_enum_variant = "allow"

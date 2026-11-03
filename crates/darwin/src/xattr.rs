@@ -1,19 +1,11 @@
+// FIXME (PORTABILITY): entire module is unportable and contains too much #[cfg] - prefer cfg!() where platform specificity is truly needed
+// and build abstractions
+
 use std::ffi::{CStr, CString, c_char, c_void};
 
-/// `XATTR_NOFOLLOW`, the one Darwin option with a host counterpart - and it has
-/// one only as a different function (`lgetxattr`, `extattr_get_link`).
 const NOFOLLOW: i32 = 0x0001;
-
-/// Darwin's `XATTR_CREATE`, which is not this host's number.
-#[cfg(not(target_os = "macos"))]
 const CREATE: i32 = 0x0002;
-
-/// Darwin's `XATTR_REPLACE`, likewise.
-#[cfg(not(target_os = "macos"))]
 const REPLACE: i32 = 0x0004;
-
-/// Darwin's `ENOATTR`: the attribute named is not on the file.
-#[cfg(target_os = "linux")]
 const ENOATTR: i32 = 93;
 
 /// Whether this host's `errno` means the attribute named is not on the file.
@@ -46,6 +38,14 @@ fn absent_as_enoattr<T>(rc: T) -> T {
     rc
 }
 
+/// The file an attribute call is about: a host path, and whether a final
+/// symlink is the file rather than the way to it, or an open descriptor.
+#[derive(Clone, Copy)]
+enum File {
+    Path(*const c_char, bool),
+    Fd(libc::c_int),
+}
+
 /// This host's extended-attribute calls, over the guest's own flat names.
 ///
 /// Every function here takes the name the guest wrote and answers in Darwin's
@@ -55,6 +55,8 @@ fn absent_as_enoattr<T>(rc: T) -> T {
 #[cfg(target_os = "linux")]
 mod host {
     use std::ffi::{CStr, CString, c_char, c_void};
+
+    use super::File;
 
     /// Linux's own attribute namespaces, which are not the guest's to use.
     ///
@@ -74,35 +76,29 @@ mod host {
 
     /// # Safety
     ///
-    /// `path` is NUL-terminated and `value` is `size` writable bytes, or `size`
-    /// is zero.
-    pub unsafe fn get(
-        path: *const c_char,
-        name: &CStr,
-        value: *mut c_void,
-        size: usize,
-        nofollow: bool,
-    ) -> isize {
-        // SAFETY: the caller's path and buffer, with a name this module owns.
+    /// A path in `file` is NUL-terminated, and `value` is `size` writable
+    /// bytes, or `size` is zero.
+    pub unsafe fn get(file: File, name: &CStr, value: *mut c_void, size: usize) -> isize {
+        // SAFETY: the caller's file and buffer, with a name this module owns.
         unsafe {
-            match nofollow {
-                false => libc::getxattr(path, name.as_ptr(), value, size),
-                true => libc::lgetxattr(path, name.as_ptr(), value, size),
+            match file {
+                File::Path(path, false) => libc::getxattr(path, name.as_ptr(), value, size),
+                File::Path(path, true) => libc::lgetxattr(path, name.as_ptr(), value, size),
+                File::Fd(fd) => libc::fgetxattr(fd, name.as_ptr(), value, size),
             }
         }
     }
 
     /// # Safety
     ///
-    /// `path` is NUL-terminated and `value` is `size` readable bytes.
+    /// A path in `file` is NUL-terminated, and `value` is `size` readable bytes.
     pub unsafe fn set(
-        path: *const c_char,
+        file: File,
         name: &CStr,
         value: *const c_void,
         size: usize,
         create: bool,
         replace: bool,
-        nofollow: bool,
     ) -> i32 {
         let mut flags = 0;
         if create {
@@ -111,59 +107,47 @@ mod host {
         if replace {
             flags |= libc::XATTR_REPLACE;
         }
-        // SAFETY: the caller's path and buffer, with a name this module owns.
+        let name = name.as_ptr();
+        // SAFETY: the caller's file and buffer, with a name this module owns.
         unsafe {
-            match nofollow {
-                false => libc::setxattr(path, name.as_ptr(), value, size, flags),
-                true => libc::lsetxattr(path, name.as_ptr(), value, size, flags),
+            match file {
+                File::Path(path, false) => libc::setxattr(path, name, value, size, flags),
+                File::Path(path, true) => libc::lsetxattr(path, name, value, size, flags),
+                File::Fd(fd) => libc::fsetxattr(fd, name, value, size, flags),
             }
         }
     }
 
     /// # Safety
     ///
-    /// `path` is NUL-terminated.
-    pub unsafe fn remove(path: *const c_char, name: &CStr, nofollow: bool) -> i32 {
-        // SAFETY: the caller's path, with a name this module owns.
+    /// A path in `file` is NUL-terminated.
+    pub unsafe fn remove(file: File, name: &CStr) -> i32 {
+        // SAFETY: the caller's file, with a name this module owns.
         unsafe {
-            match nofollow {
-                false => libc::removexattr(path, name.as_ptr()),
-                true => libc::lremovexattr(path, name.as_ptr()),
+            match file {
+                File::Path(path, false) => libc::removexattr(path, name.as_ptr()),
+                File::Path(path, true) => libc::lremovexattr(path, name.as_ptr()),
+                File::Fd(fd) => libc::fremovexattr(fd, name.as_ptr()),
             }
         }
     }
 
-    /// [`set`] on an open descriptor, neither creating nor replacing only.
-    ///
-    /// # Safety
-    ///
-    /// `value` is `size` readable bytes.
-    pub unsafe fn set_fd(fd: libc::c_int, name: &CStr, value: *const c_void, size: usize) -> i32 {
-        // SAFETY: the caller's descriptor and buffer, with a name this module owns.
-        unsafe { libc::fsetxattr(fd, name.as_ptr(), value, size, 0) }
-    }
-
-    /// [`remove`] on an open descriptor.
-    pub fn remove_fd(fd: libc::c_int, name: &CStr) -> i32 {
-        // SAFETY: the caller's descriptor, with a name this module owns.
-        unsafe { libc::fremovexattr(fd, name.as_ptr()) }
-    }
-
-    /// Every attribute on `path` the guest could have written, in its own
+    /// Every attribute on `file` the guest could have written, in its own
     /// spelling. `None` leaves `errno` set.
     ///
     /// # Safety
     ///
-    /// `path` is NUL-terminated.
-    pub unsafe fn list(path: *const c_char, nofollow: bool) -> Option<Vec<Vec<u8>>> {
+    /// A path in `file` is NUL-terminated.
+    pub unsafe fn list(file: File) -> Option<Vec<Vec<u8>>> {
         let mut buffer = vec![0u8; 4096];
         loop {
-            // SAFETY: the caller's path, and a buffer this function owns.
+            // SAFETY: the caller's file, and a buffer this function owns.
             let rc = unsafe {
                 let (p, n) = (buffer.as_mut_ptr().cast::<c_char>(), buffer.len());
-                match nofollow {
-                    false => libc::listxattr(path, p, n),
-                    true => libc::llistxattr(path, p, n),
+                match file {
+                    File::Path(path, false) => libc::listxattr(path, p, n),
+                    File::Path(path, true) => libc::llistxattr(path, p, n),
+                    File::Fd(fd) => libc::flistxattr(fd, p, n),
                 }
             };
             if rc >= 0 {
@@ -189,7 +173,9 @@ mod host {
 
 #[cfg(target_os = "freebsd")]
 mod host {
-    use std::ffi::{CStr, CString, c_char, c_void};
+    use std::ffi::{CStr, CString, c_void};
+
+    use super::File;
 
     /// Every guest attribute lives in the user namespace. The guest cannot have
     /// meant one of the kernel's, and `EXTATTR_NAMESPACE_SYSTEM` needs a
@@ -202,24 +188,35 @@ mod host {
         CString::new(guest.to_bytes()).ok()
     }
 
+    /// `extattr_get_*` on `file`: up to `n` bytes into `p`, or the length for a
+    /// null `p`.
+    ///
+    /// # Safety
+    ///
+    /// A path in `file` is NUL-terminated, and `p` is null or `n` writable bytes.
+    unsafe fn read(file: File, name: &CStr, p: *mut c_void, n: usize) -> isize {
+        // SAFETY: the caller's.
+        unsafe {
+            match file {
+                File::Path(path, false) => {
+                    libc::extattr_get_file(path, NAMESPACE, name.as_ptr(), p, n)
+                }
+                File::Path(path, true) => {
+                    libc::extattr_get_link(path, NAMESPACE, name.as_ptr(), p, n)
+                }
+                File::Fd(fd) => libc::extattr_get_fd(fd, NAMESPACE, name.as_ptr(), p, n),
+            }
+        }
+    }
+
     /// The attribute's length, or `None` with `errno` set.
     ///
     /// # Safety
     ///
-    /// `path` is NUL-terminated.
-    unsafe fn length(path: *const c_char, name: &CStr, nofollow: bool) -> Option<usize> {
-        // SAFETY: the caller's path, with a name this module owns. A null
-        // buffer asks for the length, which is what `nbytes` of zero means.
-        let rc = unsafe {
-            match nofollow {
-                false => {
-                    libc::extattr_get_file(path, NAMESPACE, name.as_ptr(), core::ptr::null_mut(), 0)
-                }
-                true => {
-                    libc::extattr_get_link(path, NAMESPACE, name.as_ptr(), core::ptr::null_mut(), 0)
-                }
-            }
-        };
+    /// A path in `file` is NUL-terminated.
+    unsafe fn length(file: File, name: &CStr) -> Option<usize> {
+        // SAFETY: the caller's file. A null buffer asks for the length.
+        let rc = unsafe { read(file, name, core::ptr::null_mut(), 0) };
         match rc < 0 {
             true => None,
             false => Some(rc as usize),
@@ -228,21 +225,15 @@ mod host {
 
     /// # Safety
     ///
-    /// `path` is NUL-terminated and `value` is `size` writable bytes, or `size`
-    /// is zero.
-    pub unsafe fn get(
-        path: *const c_char,
-        name: &CStr,
-        value: *mut c_void,
-        size: usize,
-        nofollow: bool,
-    ) -> isize {
+    /// A path in `file` is NUL-terminated, and `value` is `size` writable
+    /// bytes, or `size` is zero.
+    pub unsafe fn get(file: File, name: &CStr, value: *mut c_void, size: usize) -> isize {
         // Read through a buffer of this module's own rather than the caller's,
         // because FreeBSD truncates into a short buffer where Darwin refuses
         // with `ERANGE` - and a truncated attribute reported as a whole one is
         // the answer a caller cannot tell is wrong.
-        // SAFETY: the caller's path.
-        let Some(length) = (unsafe { length(path, name, nofollow) }) else {
+        // SAFETY: the caller's file.
+        let Some(length) = (unsafe { length(file, name) }) else {
             return -1;
         };
         if size == 0 {
@@ -253,15 +244,9 @@ mod host {
             return -1;
         }
         let mut owned = vec![0u8; length];
-        // SAFETY: the caller's path, into a buffer of exactly the length the
+        // SAFETY: the caller's file, into a buffer of exactly the length the
         // kernel just reported.
-        let rc = unsafe {
-            let (p, n) = (owned.as_mut_ptr().cast::<c_void>(), owned.len());
-            match nofollow {
-                false => libc::extattr_get_file(path, NAMESPACE, name.as_ptr(), p, n),
-                true => libc::extattr_get_link(path, NAMESPACE, name.as_ptr(), p, n),
-            }
-        };
+        let rc = unsafe { read(file, name, owned.as_mut_ptr().cast(), owned.len()) };
         if rc < 0 {
             return -1;
         }
@@ -273,15 +258,14 @@ mod host {
 
     /// # Safety
     ///
-    /// `path` is NUL-terminated and `value` is `size` readable bytes.
+    /// A path in `file` is NUL-terminated, and `value` is `size` readable bytes.
     pub unsafe fn set(
-        path: *const c_char,
+        file: File,
         name: &CStr,
         value: *const c_void,
         size: usize,
         create: bool,
         replace: bool,
-        nofollow: bool,
     ) -> i32 {
         // FreeBSD has no counterpart to `XATTR_CREATE`/`XATTR_REPLACE` - its
         // set always overwrites - so the condition is checked here. That is a
@@ -289,8 +273,8 @@ mod host {
         // the same attribute can both see it absent and both succeed, where
         // Darwin would fail one of them.
         if create || replace {
-            // SAFETY: the caller's path.
-            let present = unsafe { length(path, name, nofollow) }.is_some();
+            // SAFETY: the caller's file.
+            let present = unsafe { length(file, name) }.is_some();
             if create && present {
                 crate::errno::set(libc::EEXIST);
                 return -1;
@@ -300,11 +284,17 @@ mod host {
                 return -1;
             }
         }
-        // SAFETY: the caller's path and buffer, with a name this module owns.
+        let name = name.as_ptr();
+        // SAFETY: the caller's file and buffer, with a name this module owns.
         let rc = unsafe {
-            match nofollow {
-                false => libc::extattr_set_file(path, NAMESPACE, name.as_ptr(), value, size),
-                true => libc::extattr_set_link(path, NAMESPACE, name.as_ptr(), value, size),
+            match file {
+                File::Path(path, false) => {
+                    libc::extattr_set_file(path, NAMESPACE, name, value, size)
+                }
+                File::Path(path, true) => {
+                    libc::extattr_set_link(path, NAMESPACE, name, value, size)
+                }
+                File::Fd(fd) => libc::extattr_set_fd(fd, NAMESPACE, name, value, size),
             }
         };
         // Darwin's `setxattr` answers zero, not a count.
@@ -316,52 +306,36 @@ mod host {
 
     /// # Safety
     ///
-    /// `path` is NUL-terminated.
-    pub unsafe fn remove(path: *const c_char, name: &CStr, nofollow: bool) -> i32 {
-        // SAFETY: the caller's path, with a name this module owns.
+    /// A path in `file` is NUL-terminated.
+    pub unsafe fn remove(file: File, name: &CStr) -> i32 {
+        // SAFETY: the caller's file, with a name this module owns.
         unsafe {
-            match nofollow {
-                false => libc::extattr_delete_file(path, NAMESPACE, name.as_ptr()),
-                true => libc::extattr_delete_link(path, NAMESPACE, name.as_ptr()),
+            match file {
+                File::Path(path, false) => {
+                    libc::extattr_delete_file(path, NAMESPACE, name.as_ptr())
+                }
+                File::Path(path, true) => libc::extattr_delete_link(path, NAMESPACE, name.as_ptr()),
+                File::Fd(fd) => libc::extattr_delete_fd(fd, NAMESPACE, name.as_ptr()),
             }
         }
     }
 
-    /// [`set`] on an open descriptor, neither creating nor replacing only.
-    ///
-    /// # Safety
-    ///
-    /// `value` is `size` readable bytes.
-    pub unsafe fn set_fd(fd: libc::c_int, name: &CStr, value: *const c_void, size: usize) -> i32 {
-        // SAFETY: the caller's descriptor and buffer, with a name this module owns.
-        let rc = unsafe { libc::extattr_set_fd(fd, NAMESPACE, name.as_ptr(), value, size) };
-        match rc < 0 {
-            true => -1,
-            false => 0,
-        }
-    }
-
-    /// [`remove`] on an open descriptor.
-    pub fn remove_fd(fd: libc::c_int, name: &CStr) -> i32 {
-        // SAFETY: the caller's descriptor, with a name this module owns.
-        unsafe { libc::extattr_delete_fd(fd, NAMESPACE, name.as_ptr()) }
-    }
-
-    /// Every attribute on `path` the guest could have written. `None` leaves
+    /// Every attribute on `file` the guest could have written. `None` leaves
     /// `errno` set.
     ///
     /// # Safety
     ///
-    /// `path` is NUL-terminated.
-    pub unsafe fn list(path: *const c_char, nofollow: bool) -> Option<Vec<Vec<u8>>> {
+    /// A path in `file` is NUL-terminated.
+    pub unsafe fn list(file: File) -> Option<Vec<Vec<u8>>> {
         let mut buffer = vec![0u8; 4096];
         loop {
-            // SAFETY: the caller's path, and a buffer this function owns.
+            // SAFETY: the caller's file, and a buffer this function owns.
             let rc = unsafe {
                 let (p, n) = (buffer.as_mut_ptr().cast::<c_void>(), buffer.len());
-                match nofollow {
-                    false => libc::extattr_list_file(path, NAMESPACE, p, n),
-                    true => libc::extattr_list_link(path, NAMESPACE, p, n),
+                match file {
+                    File::Path(path, false) => libc::extattr_list_file(path, NAMESPACE, p, n),
+                    File::Path(path, true) => libc::extattr_list_link(path, NAMESPACE, p, n),
+                    File::Fd(fd) => libc::extattr_list_fd(fd, NAMESPACE, p, n),
                 }
             };
             if rc >= 0 && (rc as usize) < buffer.len() {
@@ -404,24 +378,33 @@ mod host {
         Some(name.to_owned())
     }
 
-    pub unsafe fn remove(path: *const c_char, name: &CStr, nofollow: bool) -> i32 {
-        unsafe { libc::removexattr(path, name.as_ptr(), if nofollow { NOFOLLOW } else { 0 }) }
+    pub unsafe fn remove(file: File, name: &CStr) -> i32 {
+        unsafe {
+            match file {
+                File::Path(path, nofollow) => {
+                    libc::removexattr(path, name.as_ptr(), if nofollow { NOFOLLOW } else { 0 })
+                }
+                File::Fd(fd) => libc::fremovexattr(fd, name.as_ptr(), 0),
+            }
+        }
     }
 
     pub unsafe fn set_fd(fd: libc::c_int, name: &CStr, value: *const c_void, size: usize) -> i32 {
         unsafe { libc::fsetxattr(fd, name.as_ptr(), value, size, 0, 0) }
     }
 
-    pub fn remove_fd(fd: libc::c_int, name: &CStr) -> i32 {
-        unsafe { libc::fremovexattr(fd, name.as_ptr(), 0) }
-    }
-
-    pub unsafe fn list(path: *const c_char, nofollow: bool) -> Option<Vec<Vec<u8>>> {
-        let options = if nofollow { NOFOLLOW } else { 0 };
+    pub unsafe fn list(file: File) -> Option<Vec<Vec<u8>>> {
         let mut bytes = vec![0u8; 256];
         loop {
-            let got =
-                unsafe { libc::listxattr(path, bytes.as_mut_ptr().cast(), bytes.len(), options) };
+            let (p, n) = (bytes.as_mut_ptr().cast(), bytes.len());
+            let got = unsafe {
+                match file {
+                    File::Path(path, nofollow) => {
+                        libc::listxattr(path, p, n, if nofollow { NOFOLLOW } else { 0 })
+                    }
+                    File::Fd(fd) => libc::flistxattr(fd, p, n, 0),
+                }
+            };
             if got >= 0 {
                 bytes.truncate(got as usize);
                 return Some(
@@ -458,25 +441,86 @@ unsafe extern "C" fn getxattr(
     position: u32,
     options: i32,
 ) -> isize {
-    #[cfg(not(target_os = "macos"))]
-    if position != 0 {
-        crate::errno::set(libc::EINVAL);
-        return -1;
-    }
-    let Some(host) = (unsafe { host_name(name) }) else {
-        crate::errno::set(libc::EINVAL);
+    // SAFETY: the caller's, for each.
+    let Some(host) = (unsafe { checked_name(name, position) }) else {
         return -1;
     };
     let Some(path) = (unsafe { host_file(path) }) else {
         return -1;
     };
-    // SAFETY: a translated path and the caller's buffer.
-    #[cfg(target_os = "macos")]
-    return unsafe { libc::getxattr(path.as_ptr(), host.as_ptr(), value, size, position, options) };
+    let file = File::Path(path.as_ptr(), options & NOFOLLOW != 0);
+    unsafe { get(file, &host, value, size, position, options) }
+}
+
+/// `ssize_t fgetxattr(int, const char *, void *, size_t, u_int32_t, int)`
+///
+/// # Safety
+///
+/// As [`getxattr`], on an open descriptor.
+unsafe extern "C" fn fgetxattr(
+    fd: libc::c_int,
+    name: *const c_char,
+    value: *mut c_void,
+    size: usize,
+    position: u32,
+    options: i32,
+) -> isize {
+    // SAFETY: the caller's, for each.
+    let Some(host) = (unsafe { checked_name(name, position) }) else {
+        return -1;
+    };
+    unsafe { get(File::Fd(fd), &host, value, size, position, options) }
+}
+
+/// The guest's attribute `name` in this host's namespace, refusing what
+/// [`getxattr`] and [`setxattr`] refuse before they look for the file.
+///
+/// # Safety
+///
+/// `name` is NUL-terminated or null.
+unsafe fn checked_name(name: *const c_char, position: u32) -> Option<CString> {
     #[cfg(not(target_os = "macos"))]
-    absent_as_enoattr(unsafe {
-        host::get(path.as_ptr(), &host, value, size, options & NOFOLLOW != 0)
-    })
+    if position != 0 {
+        crate::errno::set(libc::EINVAL);
+        return None;
+    }
+    #[cfg(target_os = "macos")]
+    let _ = position;
+    // SAFETY: the caller's.
+    let host = unsafe { host_name(name) };
+    if host.is_none() {
+        crate::errno::set(libc::EINVAL);
+    }
+    host
+}
+
+/// # Safety
+///
+/// A path in `file` is NUL-terminated; `value` is `size` writable bytes, or
+/// `size` is zero.
+unsafe fn get(
+    file: File,
+    host: &CStr,
+    value: *mut c_void,
+    size: usize,
+    position: u32,
+    options: i32,
+) -> isize {
+    // SAFETY: the caller's file and buffer.
+    #[cfg(target_os = "macos")]
+    return unsafe {
+        match file {
+            File::Path(path, _) => {
+                libc::getxattr(path, host.as_ptr(), value, size, position, options)
+            }
+            File::Fd(fd) => libc::fgetxattr(fd, host.as_ptr(), value, size, position, options),
+        }
+    };
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = (position, options);
+        absent_as_enoattr(unsafe { host::get(file, host, value, size) })
+    }
 }
 
 /// `int setxattr(const char *, const char *, const void *, size_t, u_int32_t, int)`
@@ -492,33 +536,64 @@ unsafe extern "C" fn setxattr(
     position: u32,
     options: i32,
 ) -> i32 {
-    #[cfg(not(target_os = "macos"))]
-    if position != 0 {
-        crate::errno::set(libc::EINVAL);
-        return -1;
-    }
-    let Some(host) = (unsafe { host_name(name) }) else {
-        crate::errno::set(libc::EINVAL);
+    // SAFETY: the caller's, for each.
+    let Some(host) = (unsafe { checked_name(name, position) }) else {
         return -1;
     };
     let Some(path) = (unsafe { host_file(path) }) else {
         return -1;
     };
-    // SAFETY: a translated path and the caller's buffer.
+    let file = File::Path(path.as_ptr(), options & NOFOLLOW != 0);
+    unsafe { set(file, &host, value, size, position, options) }
+}
+
+/// `int fsetxattr(int, const char *, const void *, size_t, u_int32_t, int)`
+///
+/// # Safety
+///
+/// As [`setxattr`], on an open descriptor.
+unsafe extern "C" fn fsetxattr(
+    fd: libc::c_int,
+    name: *const c_char,
+    value: *const c_void,
+    size: usize,
+    position: u32,
+    options: i32,
+) -> i32 {
+    // SAFETY: the caller's, for each.
+    let Some(host) = (unsafe { checked_name(name, position) }) else {
+        return -1;
+    };
+    unsafe { set(File::Fd(fd), &host, value, size, position, options) }
+}
+
+/// # Safety
+///
+/// A path in `file` is NUL-terminated, and `value` is `size` readable bytes.
+unsafe fn set(
+    file: File,
+    host: &CStr,
+    value: *const c_void,
+    size: usize,
+    position: u32,
+    options: i32,
+) -> i32 {
+    // SAFETY: the caller's file and buffer.
     #[cfg(target_os = "macos")]
-    return unsafe { libc::setxattr(path.as_ptr(), host.as_ptr(), value, size, position, options) };
+    return unsafe {
+        match file {
+            File::Path(path, _) => {
+                libc::setxattr(path, host.as_ptr(), value, size, position, options)
+            }
+            File::Fd(fd) => libc::fsetxattr(fd, host.as_ptr(), value, size, position, options),
+        }
+    };
     #[cfg(not(target_os = "macos"))]
-    absent_as_enoattr(unsafe {
-        host::set(
-            path.as_ptr(),
-            &host,
-            value,
-            size,
-            options & CREATE != 0,
-            options & REPLACE != 0,
-            options & NOFOLLOW != 0,
-        )
-    })
+    {
+        let _ = position;
+        let (create, replace) = (options & CREATE != 0, options & REPLACE != 0);
+        absent_as_enoattr(unsafe { host::set(file, host, value, size, create, replace) })
+    }
 }
 
 /// `int removexattr(const char *, const char *, int)`
@@ -534,8 +609,23 @@ unsafe extern "C" fn removexattr(path: *const c_char, name: *const c_char, optio
     let Some(path) = (unsafe { host_file(path) }) else {
         return -1;
     };
+    let file = File::Path(path.as_ptr(), options & NOFOLLOW != 0);
     // SAFETY: a translated path.
-    absent_as_enoattr(unsafe { host::remove(path.as_ptr(), &host, options & NOFOLLOW != 0) })
+    absent_as_enoattr(unsafe { host::remove(file, &host) })
+}
+
+/// `int fremovexattr(int, const char *, int)`
+///
+/// # Safety
+///
+/// `name` is NUL-terminated.
+unsafe extern "C" fn fremovexattr(fd: libc::c_int, name: *const c_char, _options: i32) -> i32 {
+    let Some(host) = (unsafe { host_name(name) }) else {
+        crate::errno::set(libc::EINVAL);
+        return -1;
+    };
+    // SAFETY: a descriptor names no memory.
+    absent_as_enoattr(unsafe { host::remove(File::Fd(fd), &host) })
 }
 
 /// `ssize_t listxattr(const char *, char *, size_t, int)`
@@ -557,8 +647,40 @@ unsafe extern "C" fn listxattr(
     let Some(path) = (unsafe { host_file(path) }) else {
         return -1;
     };
-    // SAFETY: a translated path.
-    let Some(names) = (unsafe { host::list(path.as_ptr(), options & NOFOLLOW != 0) }) else {
+    // SAFETY: a translated path, and the caller's buffer.
+    unsafe {
+        list_into(
+            File::Path(path.as_ptr(), options & NOFOLLOW != 0),
+            list,
+            size,
+        )
+    }
+}
+
+/// `ssize_t flistxattr(int, char *, size_t, int)`
+///
+/// # Safety
+///
+/// `list` is `size` writable bytes, or `size` is zero.
+unsafe extern "C" fn flistxattr(
+    fd: libc::c_int,
+    list: *mut c_char,
+    size: usize,
+    _options: i32,
+) -> isize {
+    // SAFETY: the caller's buffer.
+    unsafe { list_into(File::Fd(fd), list, size) }
+}
+
+/// The names on `file` as `listxattr` answers them.
+///
+/// # Safety
+///
+/// A path in `file` is NUL-terminated and `list` is `size` writable bytes, or
+/// `size` is zero.
+unsafe fn list_into(file: File, list: *mut c_char, size: usize) -> isize {
+    // SAFETY: the caller's file.
+    let Some(names) = (unsafe { host::list(file) }) else {
         return -1;
     };
     let mut out: Vec<u8> = Vec::new();
@@ -630,18 +752,18 @@ pub(crate) unsafe fn set_on_host(
         // SAFETY: as above.
         #[cfg(not(target_os = "macos"))]
         Some(value) => unsafe {
+            let file = File::Path(path.as_ptr(), nofollow);
             host::set(
-                path.as_ptr(),
+                file,
                 &host,
                 value.as_ptr().cast(),
                 value.len(),
                 false,
                 false,
-                nofollow,
             )
         },
         // SAFETY: the caller's path.
-        None => unsafe { host::remove(path.as_ptr(), &host, nofollow) },
+        None => unsafe { host::remove(File::Path(path.as_ptr(), nofollow), &host) },
     };
     absent_as_enoattr(rc)
 }
@@ -659,8 +781,21 @@ pub(crate) unsafe fn set_on_fd(fd: libc::c_int, name: &CStr, value: Option<&[u8]
     };
     let rc = match value {
         // SAFETY: the caller's descriptor, and a buffer of the length given.
+        #[cfg(target_os = "macos")]
         Some(value) => unsafe { host::set_fd(fd, &host, value.as_ptr().cast(), value.len()) },
-        None => host::remove_fd(fd, &host),
+        #[cfg(not(target_os = "macos"))]
+        Some(value) => unsafe {
+            host::set(
+                File::Fd(fd),
+                &host,
+                value.as_ptr().cast(),
+                value.len(),
+                false,
+                false,
+            )
+        },
+        // SAFETY: a descriptor names no memory.
+        None => unsafe { host::remove(File::Fd(fd), &host) },
     };
     absent_as_enoattr(rc)
 }
@@ -698,6 +833,10 @@ exports::exports! {
         "setxattr" => setxattr,
         "removexattr" => removexattr,
         "listxattr" => listxattr,
+        "fgetxattr" => fgetxattr,
+        "fsetxattr" => fsetxattr,
+        "fremovexattr" => fremovexattr,
+        "flistxattr" => flistxattr,
     }
 }
 
@@ -796,6 +935,52 @@ mod tests {
             0
         );
         let _ = std::fs::remove_file(&path);
+    }
+
+    /// The descriptor calls speak the guest's spelling too, which is what
+    /// `libcopyfile` copies attributes through.
+    #[test]
+    fn an_attribute_round_trips_through_a_descriptor() {
+        use std::os::fd::AsRawFd;
+        let path = std::env::temp_dir().join(format!("rosemary-fxattr-{}", std::process::id()));
+        let file = std::fs::File::create(&path).expect("a scratch file");
+        let _ = std::fs::remove_file(&path);
+        let fd = file.as_raw_fd();
+        let name = c"com.example.tag";
+
+        // SAFETY: a descriptor and name this test owns, with buffers of its own.
+        unsafe {
+            if fsetxattr(fd, name.as_ptr(), c"7".as_ptr().cast(), 1, 0, 0) != 0 {
+                eprintln!("skipping: this filesystem has no extended attributes");
+                return;
+            }
+            assert_eq!(
+                fsetxattr(fd, name.as_ptr(), c"8".as_ptr().cast(), 1, 0, CREATE),
+                -1
+            );
+            assert_eq!(crate::errno::get(), libc::EEXIST);
+
+            let mut value = [0u8; 8];
+            let got = fgetxattr(
+                fd,
+                name.as_ptr(),
+                value.as_mut_ptr().cast(),
+                value.len(),
+                0,
+                0,
+            );
+            assert_eq!((got, value[0]), (1, b'7'));
+
+            let mut names = [0u8; 64];
+            let listed = flistxattr(fd, names.as_mut_ptr().cast(), names.len(), 0);
+            assert_eq!(&names[..listed as usize], b"com.example.tag\0");
+
+            assert_eq!(fremovexattr(fd, name.as_ptr(), 0), 0);
+            assert_eq!(
+                fgetxattr(fd, name.as_ptr(), core::ptr::null_mut(), 0, 0, 0),
+                -1
+            );
+        }
     }
 
     /// A missing attribute is Darwin's `ENOATTR` (93) whatever this host calls

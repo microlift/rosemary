@@ -17,7 +17,8 @@ struct Me {
 static ME: OnceLock<Me> = OnceLock::new();
 
 /// This process's host pid.
-fn host_self() -> i32 {
+pub(crate) fn host_self() -> i32 {
+    let _host = crate::syscall::ScopedHostSyscallContext::new();
     starnix::process::me()
 }
 
@@ -29,6 +30,7 @@ fn pid() -> i32 {
 /// A host pid as guests know it: the prefix's launchd is pid 1, as on a Mac,
 /// where launchd's own start-up refuses to run as anything else.
 pub fn guest_pid(host: i32) -> i32 {
+    let _host = crate::syscall::ScopedHostSyscallContext::new();
     match server::client::launchd() == Some(host) {
         true => server::registry::LAUNCHD,
         false => host,
@@ -38,6 +40,7 @@ pub fn guest_pid(host: i32) -> i32 {
 /// A pid a guest named, as the host knows it. The host's own pid 1 is never a
 /// guest's to signal or ask about, so pid 1 can only mean launchd.
 pub fn host_pid(guest: i32) -> i32 {
+    let _host = crate::syscall::ScopedHostSyscallContext::new();
     match (guest, server::client::launchd()) {
         (server::registry::LAUNCHD, Some(host)) => host,
         _ => guest,
@@ -45,12 +48,12 @@ pub fn host_pid(guest: i32) -> i32 {
 }
 
 /// `pid_t getpid(void)`.
-extern "C" fn getpid() -> libc::pid_t {
+pub extern "C" fn getpid() -> libc::pid_t {
     pid()
 }
 
 /// `pid_t getppid(void)`.
-extern "C" fn getppid() -> libc::pid_t {
+pub extern "C" fn getppid() -> libc::pid_t {
     // SAFETY: `getppid` has no preconditions.
     guest_pid(unsafe { libc::getppid() })
 }
@@ -61,7 +64,7 @@ extern "C" fn getppid() -> libc::pid_t {
 /// the machine going down, and its end is launchd's exit, after which the
 /// server ends whatever is left. Nobody else may: a guest that wants the
 /// prefix down asks launchd, which is how it is done on a Mac too.
-extern "C" fn reboot(_howto: libc::c_int) -> libc::c_int {
+pub extern "C" fn reboot(_howto: libc::c_int) -> libc::c_int {
     if pid() != server::registry::LAUNCHD {
         crate::errno::set(libc::EPERM);
         return -1;
@@ -80,6 +83,7 @@ extern "C" fn reboot(_howto: libc::c_int) -> libc::c_int {
 /// `path` is the guest's spelling. Called once, by the runtime, before the
 /// program's first instruction.
 pub fn check_in(path: &str, argv: Vec<Vec<u8>>) {
+    let _host = crate::syscall::ScopedHostSyscallContext::new();
     let arch = crate::sysctl::guest_arch();
     let setid = crate::credentials::setid_of(&prefix::ns::host_path(path));
     let checkin = Checkin {
@@ -106,6 +110,7 @@ pub fn check_in(path: &str, argv: Vec<Vec<u8>>) {
 
 /// This process, described without the server.
 fn me() -> Option<Process> {
+    let _host = crate::syscall::ScopedHostSyscallContext::new();
     let host = starnix::process::process(host_self())?;
     let (path, argv) = match ME.get() {
         Some(me) => (me.path.clone(), me.argv.clone()),
@@ -155,6 +160,7 @@ fn me() -> Option<Process> {
 
 /// Every guest process this one can see, in pid order.
 pub fn list() -> Vec<Process> {
+    let _host = crate::syscall::ScopedHostSyscallContext::new();
     let mut list = server::client::processes().unwrap_or_default();
     if !list.iter().any(|process| process.pid == pid())
         && let Some(me) = me()
@@ -167,6 +173,7 @@ pub fn list() -> Vec<Process> {
 
 /// The guest process `pid`, if it is one this process can see.
 pub fn describe(pid: i32) -> Option<Process> {
+    let _host = crate::syscall::ScopedHostSyscallContext::new();
     match server::client::process(pid) {
         Some(process) => Some(process),
         None if pid == self::pid() => me(),
@@ -177,6 +184,7 @@ pub fn describe(pid: i32) -> Option<Process> {
 /// What `pid` has used. Answered locally for this process, which is the
 /// common case and needs no round trip.
 pub fn usage(pid: i32) -> Option<Usage> {
+    let _host = crate::syscall::ScopedHostSyscallContext::new();
     match host_pid(pid) == host_self() {
         true => starnix::process::usage(host_self()),
         false => server::client::usage(pid),
@@ -184,6 +192,7 @@ pub fn usage(pid: i32) -> Option<Usage> {
 }
 
 pub fn threads(pid: i32) -> Option<Vec<Thread>> {
+    let _host = crate::syscall::ScopedHostSyscallContext::new();
     match host_pid(pid) == host_self() {
         true => starnix::process::threads(host_self()),
         false => server::client::threads(pid),
@@ -192,6 +201,7 @@ pub fn threads(pid: i32) -> Option<Vec<Thread>> {
 
 /// Whether `pid` is a guest process this one may hold a task port for.
 pub fn visible(pid: i32) -> bool {
+    let _host = crate::syscall::ScopedHostSyscallContext::new();
     pid == self::pid() || server::client::process(pid).is_some()
 }
 
@@ -212,6 +222,7 @@ pub(crate) fn thread_id() -> i32 {
 
 /// Tell the server a thread's full name, which the host may have cut short.
 pub fn name_thread(name: &str) {
+    let _host = crate::syscall::ScopedHostSyscallContext::new();
     if server::client::configured() {
         server::client::name_thread(thread_id(), name);
     }
@@ -223,6 +234,7 @@ pub fn name_thread(name: &str) {
 /// `fork` returns to it - so it is listed even if it never asks the server
 /// anything, which a daemonising child usually does not.
 unsafe extern "C" fn fork() -> libc::pid_t {
+    let _host = crate::syscall::ScopedHostSyscallContext::new();
     // SAFETY: the host's `fork`; the server's lock is held across it by the
     // client's own `pthread_atfork` handlers.
     let child = unsafe { libc::fork() };

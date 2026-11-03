@@ -12,13 +12,13 @@ use corefoundation::base::CFTypeRef;
 
 /// `kUTTagClassMIMEType` and `kUTTagClassFilenameExtension`, as published by
 /// AppKit's string globals - the same characters, which is what is compared.
-const MIME_TYPE: &str = "public.mime-type";
-const FILENAME_EXTENSION: &str = "public.filename-extension";
+pub(crate) const MIME_TYPE: &str = "public.mime-type";
+pub(crate) const FILENAME_EXTENSION: &str = "public.filename-extension";
 
 /// Identifier, preferred MIME type, preferred extension.
-type Row = (&'static str, &'static str, &'static str);
+pub(crate) type Row = (&'static str, &'static str, &'static str);
 
-const TYPES: &[Row] = &[
+pub(crate) const TYPES: &[Row] = &[
     ("public.utf8-plain-text", "text/plain;charset=utf-8", "txt"),
     ("public.plain-text", "text/plain", "txt"),
     ("public.html", "text/html", "html"),
@@ -32,11 +32,12 @@ const TYPES: &[Row] = &[
     ("public.json", "application/json", "json"),
     ("com.adobe.pdf", "application/pdf", "pdf"),
     ("public.zip-archive", "application/zip", "zip"),
+    ("public.vcard", "text/vcard", "vcf"),
 ];
 
 /// The prefix of an identifier made up for a tag the table lacks. Apple's
 /// encode the tag opaquely after `dyn.`; this one keeps it readable.
-const DYNAMIC: &str = "dyn.rosemary.";
+pub(crate) const DYNAMIC: &str = "dyn.rosemary.";
 
 fn read(string: *const c_void) -> Option<String> {
     // SAFETY: a CoreFoundation string or null, by the callers' contracts.
@@ -58,7 +59,7 @@ fn column(tag_class: &str) -> Option<fn(&Row) -> &'static str> {
 
 /// The identifier for `tag`, matched case-insensitively, as MIME types and
 /// extensions both are. A MIME type's parameters only narrow it.
-fn identifier_for(tag_class: &str, tag: &str) -> Option<String> {
+pub(crate) fn identifier_for(tag_class: &str, tag: &str) -> Option<String> {
     let of = column(tag_class)?;
     let tag = tag.to_ascii_lowercase();
     let found = TYPES
@@ -72,7 +73,7 @@ fn identifier_for(tag_class: &str, tag: &str) -> Option<String> {
     Some(found.unwrap_or_else(|| format!("{DYNAMIC}{tag_class}.{tag}")))
 }
 
-fn tag_for(identifier: &str, tag_class: &str) -> Option<String> {
+pub(crate) fn tag_for(identifier: &str, tag_class: &str) -> Option<String> {
     let of = column(tag_class)?;
     if let Some(t) = TYPES.iter().find(|t| t.0 == identifier) {
         return Some(of(t).to_string());

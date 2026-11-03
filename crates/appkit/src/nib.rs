@@ -883,6 +883,10 @@ mod tests {
     /// items get the actions their connections give them.
     #[test]
     fn a_nibs_main_menu_is_installed_with_its_actions() {
+        // Main menus and shared NSApplication state are process-wide.
+        if !sdl3::isolated::run_here() {
+            return;
+        }
         crate::bootstrap();
         let class = objc::class::ptr(objc::class::lookup(c"NSApplication").expect("NSApplication"));
         // SAFETY: `+sharedApplication` is `id (Class, SEL)`.

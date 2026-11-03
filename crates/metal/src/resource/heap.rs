@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use super::*;
 
@@ -52,6 +52,10 @@ pub(crate) struct Heap {
     gpu: &'static Gpu,
     descriptor: HeapDescriptor,
     used: Mutex<u64>,
+    /// A placement heap's memory, which its resources are bound into at the
+    /// offsets the guest gives. An automatic heap only keeps the books, and
+    /// each of its resources has memory of its own.
+    placement: Option<Arc<gpu::Placement>>,
 }
 
 /// What a resource made from a heap owes it.
@@ -115,19 +119,41 @@ fn texture_quote(descriptor: &TextureDescriptor) -> Option<SizeAndAlign> {
     })
 }
 
+fn quote(requirements: vk::MemoryRequirements) -> SizeAndAlign {
+    SizeAndAlign {
+        size: requirements.size,
+        align: requirements.alignment.max(1),
+    }
+}
+
+/// What a buffer takes from a heap: what Vulkan needs for it, which is what
+/// a placement heap must leave room for, or an estimate without a device.
+fn device_buffer_quote(gpu: Option<&Gpu>, length: u64) -> SizeAndAlign {
+    gpu.and_then(|gpu| gpu.buffer_requirements(length).ok())
+        .map_or_else(|| buffer_quote(length), quote)
+}
+
+/// As `device_buffer_quote`, for a texture.
+fn device_texture_quote(gpu: Option<&Gpu>, descriptor: &TextureDescriptor) -> Option<SizeAndAlign> {
+    let description = texture::image_description(descriptor)?;
+    gpu.and_then(|gpu| gpu.image_requirements(&description).ok())
+        .map(quote)
+        .or_else(|| texture_quote(descriptor))
+}
+
 /// `-[MTLDevice heapBufferSizeAndAlignWithLength:options:]`.
 pub(crate) unsafe extern "C" fn heap_buffer_size_and_align(
-    _receiver: Id,
+    receiver: Id,
     _sel: Sel,
     length: u64,
     _options: u64,
 ) -> SizeAndAlign {
-    buffer_quote(length)
+    device_buffer_quote(crate::gpu_of_device(receiver), length)
 }
 
 /// `-[MTLDevice heapTextureSizeAndAlignWithDescriptor:]`.
 pub(crate) unsafe extern "C" fn heap_texture_size_and_align(
-    _receiver: Id,
+    receiver: Id,
     _sel: Sel,
     descriptor: Id,
 ) -> SizeAndAlign {
@@ -136,7 +162,8 @@ pub(crate) unsafe extern "C" fn heap_texture_size_and_align(
     }
     // SAFETY: `MTLTextureDescriptor` is this crate's class.
     let descriptor = unsafe { object::body::<TextureDescriptor>(descriptor) };
-    texture_quote(descriptor).unwrap_or(SizeAndAlign { size: 0, align: 1 })
+    device_texture_quote(crate::gpu_of_device(receiver), descriptor)
+        .unwrap_or(SizeAndAlign { size: 0, align: 1 })
 }
 
 /// `-[MTLDevice newHeapWithDescriptor:]`.
@@ -149,10 +176,21 @@ pub(crate) fn new_heap(gpu: &'static Gpu, device: Id, descriptor: Id) -> Id {
     if descriptor.size == 0 {
         return std::ptr::null_mut();
     }
-    if descriptor.heap_type == MTL_HEAP_TYPE_PLACEMENT {
-        gpu::trace("rejecting newHeapWithDescriptor: MTLHeapTypePlacement is not implemented");
-        return std::ptr::null_mut();
-    }
+    let placement = match descriptor.heap_type {
+        MTL_HEAP_TYPE_PLACEMENT if descriptor.storage_mode != MTL_STORAGE_MODE_PRIVATE => {
+            // Only Apple silicon places resources in host-visible heaps.
+            gpu::trace("rejecting newHeapWithDescriptor: a placement heap must be private");
+            return std::ptr::null_mut();
+        }
+        MTL_HEAP_TYPE_PLACEMENT => match gpu::Placement::new(gpu, descriptor.size) {
+            Ok(placement) => Some(placement),
+            Err(reason) => {
+                gpu::trace(format!("newHeapWithDescriptor: failed: {reason}"));
+                return std::ptr::null_mut();
+            }
+        },
+        _ => None,
+    };
     object::make(
         c"RosemaryMTLHeap",
         Heap {
@@ -160,6 +198,7 @@ pub(crate) fn new_heap(gpu: &'static Gpu, device: Id, descriptor: Id) -> Id {
             gpu,
             descriptor,
             used: Mutex::new(0),
+            placement,
         },
     )
 }
@@ -260,7 +299,11 @@ pub(super) unsafe extern "C" fn resource_make_aliasable(receiver: Id, _sel: Sel)
 unsafe extern "C" fn heap_new_buffer(receiver: Id, _sel: Sel, length: u64, options: u64) -> Id {
     // SAFETY: a heap of this crate's.
     let heap = unsafe { object::body::<Heap>(receiver) };
-    let quote = buffer_quote(length);
+    if heap.placement.is_some() {
+        gpu::trace("newBufferWithLength:options: on a placement heap, which needs an offset");
+        return std::ptr::null_mut();
+    }
+    let quote = device_buffer_quote(Some(heap.gpu), length);
     if length == 0 || !reserve(heap, &quote) {
         return std::ptr::null_mut();
     }
@@ -282,9 +325,13 @@ unsafe extern "C" fn heap_new_texture(receiver: Id, _sel: Sel, descriptor: Id) -
     if descriptor.is_null() {
         return std::ptr::null_mut();
     }
+    if heap.placement.is_some() {
+        gpu::trace("newTextureWithDescriptor: on a placement heap, which needs an offset");
+        return std::ptr::null_mut();
+    }
     // SAFETY: `MTLTextureDescriptor` is this crate's class.
     let mut descriptor = *unsafe { object::body::<TextureDescriptor>(descriptor) };
-    let Some(quote) = texture_quote(&descriptor) else {
+    let Some(quote) = device_texture_quote(Some(heap.gpu), &descriptor) else {
         return std::ptr::null_mut();
     };
     if !reserve(heap, &quote) {
@@ -296,6 +343,70 @@ unsafe extern "C" fn heap_new_texture(receiver: Id, _sel: Sel, descriptor: Id) -
         give_back(receiver, quote.size);
     } else {
         join(texture, receiver, quote.size);
+    }
+    texture
+}
+
+/// `-newBufferWithLength:options:offset:`, on a placement heap.
+unsafe extern "C" fn heap_place_buffer(
+    receiver: Id,
+    _sel: Sel,
+    length: u64,
+    options: u64,
+    offset: u64,
+) -> Id {
+    // SAFETY: a heap of this crate's.
+    let heap = unsafe { object::body::<Heap>(receiver) };
+    let Some(placement) = &heap.placement else {
+        gpu::trace("newBufferWithLength:options:offset: on a heap which is not a placement heap");
+        return std::ptr::null_mut();
+    };
+    if length == 0 {
+        return std::ptr::null_mut();
+    }
+    let options = (options & !0x3ff) | heap.descriptor.resource_options();
+    let inner = match heap
+        .gpu
+        .create_placed_buffer(length, Arc::clone(placement), offset)
+    {
+        Ok(inner) => inner,
+        Err(reason) => {
+            gpu::trace(format!(
+                "newBufferWithLength:options:offset: failed: {reason}"
+            ));
+            return std::ptr::null_mut();
+        }
+    };
+    let buffer = buffer::wrap_buffer(heap.gpu, inner, options, None);
+    if !buffer.is_null() {
+        join(buffer, receiver, 0);
+    }
+    buffer
+}
+
+/// `-newTextureWithDescriptor:offset:`, on a placement heap.
+unsafe extern "C" fn heap_place_texture(
+    receiver: Id,
+    _sel: Sel,
+    descriptor: Id,
+    offset: u64,
+) -> Id {
+    // SAFETY: a heap of this crate's.
+    let heap = unsafe { object::body::<Heap>(receiver) };
+    let Some(placement) = &heap.placement else {
+        gpu::trace("newTextureWithDescriptor:offset: on a heap which is not a placement heap");
+        return std::ptr::null_mut();
+    };
+    if descriptor.is_null() {
+        return std::ptr::null_mut();
+    }
+    // SAFETY: `MTLTextureDescriptor` is this crate's class.
+    let mut descriptor = *unsafe { object::body::<TextureDescriptor>(descriptor) };
+    descriptor.storage_mode = heap.descriptor.storage_mode;
+    let texture =
+        texture::new_texture_in(heap.gpu, descriptor, Some((Arc::clone(placement), offset)));
+    if !texture.is_null() {
+        join(texture, receiver, 0);
     }
     texture
 }
@@ -332,13 +443,28 @@ unsafe extern "C" fn heap_value(receiver: Id, sel: Sel) -> u64 {
     descriptor_field(descriptor, sel)
 }
 
+/// The placement memory `heap` holds, without keeping it alive.
+#[cfg(test)]
+pub(crate) fn placement_of(heap: Id) -> Option<std::sync::Weak<gpu::Placement>> {
+    // SAFETY: the caller passes a heap of this crate's.
+    unsafe { object::body::<Heap>(heap) }
+        .placement
+        .as_ref()
+        .map(Arc::downgrade)
+}
+
 unsafe extern "C" fn heap_purgeable_state(_receiver: Id, _sel: Sel, _state: u64) -> u64 {
     MTL_PURGEABLE_STATE_NON_VOLATILE
 }
 
 unsafe extern "C" fn heap_dealloc(receiver: Id, _sel: Sel) {
     // SAFETY: a heap of this crate's; its device was retained when it was made.
-    objc::arc::release(unsafe { object::body::<Heap>(receiver) }.device);
+    let heap = unsafe { object::body::<Heap>(receiver) };
+    objc::arc::release(heap.device);
+    // The heap's reference to a placement's memory is the last one once its
+    // resources are gone, and dropping it is what frees the memory.
+    // SAFETY: the body was established by `object::make` and is not read again.
+    unsafe { std::ptr::drop_in_place(heap as *mut Heap) };
     objc::arc::finalize(receiver);
 }
 
@@ -433,6 +559,8 @@ pub(super) fn install() {
         "maxAvailableSizeWithAlignment:" => heap_max_available, c"Q24@0:8Q16";
         "newBufferWithLength:options:" => heap_new_buffer, c"@32@0:8Q16Q24";
         "newTextureWithDescriptor:" => heap_new_texture, c"@24@0:8@16";
+        "newBufferWithLength:options:offset:" => heap_place_buffer, c"@40@0:8Q16Q24Q32";
+        "newTextureWithDescriptor:offset:" => heap_place_texture, c"@32@0:8@16Q24";
         "setPurgeableState:" => heap_purgeable_state, c"Q24@0:8Q16";
         "dealloc" => heap_dealloc, c"v16@0:8";
     });

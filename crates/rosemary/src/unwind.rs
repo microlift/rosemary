@@ -2,6 +2,7 @@ use machish::image::UnwindEntry;
 use microlift::arch::x86_64::context::RegisterContext;
 
 use crate::abi::{AbiError, GuestMemory, Result};
+use crate::shims::bind;
 use crate::vm::Vm;
 
 /// The callee-saved state a frame restores, plus where it resumes.
@@ -1057,13 +1058,13 @@ fn current_vm(symbol: &str) -> Result<&'static Vm> {
 /// Whether `name` (underscore already stripped) is one of this module's.
 pub fn shim_for(name: &str) -> Option<crate::jmpbuf::Shim> {
     Some(match name {
-        "__cxa_allocate_exception" => allocate_exception,
-        "__cxa_free_exception" => free_exception,
-        "__cxa_throw" => throw,
-        "__cxa_rethrow" => rethrow,
-        "__cxa_begin_catch" => begin_catch,
-        "__cxa_end_catch" => end_catch,
-        "_Unwind_Resume" => resume,
+        "__cxa_allocate_exception" => bind!("__cxa_allocate_exception" => allocate_exception),
+        "__cxa_free_exception" => bind!("__cxa_free_exception" => free_exception),
+        "__cxa_throw" => bind!("__cxa_throw" => throw),
+        "__cxa_rethrow" => bind!("__cxa_rethrow" => rethrow),
+        "__cxa_begin_catch" => bind!("__cxa_begin_catch" => begin_catch),
+        "__cxa_end_catch" => bind!("__cxa_end_catch" => end_catch),
+        "_Unwind_Resume" => bind!("_Unwind_Resume" => resume),
         _ => return None,
     })
 }

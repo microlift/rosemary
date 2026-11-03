@@ -18,7 +18,87 @@ exports::exports! {
         "NSGetUncaughtExceptionHandler" => NSGetUncaughtExceptionHandler,
         "CFCharacterSetGetPredefined" => crate::characterset::CFCharacterSetGetPredefined,
         "CFCharacterSetIsCharacterMember" => crate::characterset::CFCharacterSetIsCharacterMember,
+        "CFCharacterSetIsLongCharacterMember" => crate::characterset::CFCharacterSetIsLongCharacterMember,
+        "CFCharacterSetCreateMutable" => crate::characterset::CFCharacterSetCreateMutable,
+        "CFCharacterSetAddCharactersInRange" => crate::characterset::CFCharacterSetAddCharactersInRange,
+        "_NSDictionaryOfVariableBindings" => _NSDictionaryOfVariableBindings,
     }
+}
+
+/// The most variables `NSDictionaryOfVariableBindings` reads.
+const MAX_BINDINGS: usize = 16;
+
+/// `NSDictionary *_NSDictionaryOfVariableBindings(NSString *keys, id first, ...)`,
+/// behind the `NSDictionaryOfVariableBindings(a, b, ...)` macro: `keys` is the
+/// macro's arguments as written, comma separated, and the values follow.
+///
+/// Variadic, read as fixed parameters: on the System V ABI pointer-sized
+/// variadic arguments travel exactly as named ones, and the parameters past
+/// the caller's last are never read.
+///
+/// # Safety
+///
+/// `keys` is an NSString naming as many values as were passed.
+#[allow(clippy::too_many_arguments)]
+unsafe extern "C" fn _NSDictionaryOfVariableBindings(
+    keys: Id,
+    v0: Id,
+    v1: Id,
+    v2: Id,
+    v3: Id,
+    v4: Id,
+    v5: Id,
+    v6: Id,
+    v7: Id,
+    v8: Id,
+    v9: Id,
+    v10: Id,
+    v11: Id,
+    v12: Id,
+    v13: Id,
+    v14: Id,
+    v15: Id,
+) -> Id {
+    let values = [
+        v0, v1, v2, v3, v4, v5, v6, v7, v8, v9, v10, v11, v12, v13, v14, v15,
+    ];
+    // SAFETY: an NSString.
+    let text = String::from_utf8_lossy(&unsafe { crate::string::bytes(keys) }).into_owned();
+    let names: Vec<&str> = text
+        .split(',')
+        .map(str::trim)
+        .filter(|n| !n.is_empty())
+        .collect();
+    if names.len() > MAX_BINDINGS {
+        objc::fail!(
+            "NSDictionaryOfVariableBindings: {} variables is more than the {MAX_BINDINGS} \
+             this runtime reads out of a variadic call",
+            names.len()
+        );
+    }
+    let mut pairs = Vec::with_capacity(names.len());
+    for (name, value) in names.iter().zip(values) {
+        if value.is_null() {
+            objc::fail!(
+                "NSInvalidArgumentException: NSDictionaryOfVariableBindings: '{name}' is nil"
+            );
+        }
+        pairs.push((crate::string::from_str(name), value));
+    }
+    let entries: Vec<(
+        corefoundation::base::CFTypeRef,
+        corefoundation::base::CFTypeRef,
+    )> = pairs.iter().map(|(k, v)| (*k as _, *v as _)).collect();
+    let dictionary = corefoundation::collections::new_dictionary(
+        &entries,
+        corefoundation::callbacks::Policy::from_key_callbacks(),
+        corefoundation::callbacks::Policy::from_type_callbacks(),
+        false,
+    );
+    for (key, _) in pairs {
+        objc::arc::release(key);
+    }
+    objc::arc::autorelease(dictionary as Id)
 }
 
 /// `NSString *NSUserName(void)`: the login name, which names `/Users/<name>`.
@@ -167,10 +247,23 @@ unsafe extern "C" fn class_name(receiver: Id, _sel: Sel) -> Id {
     unsafe { corefoundation::api::CFAutorelease(string as corefoundation::base::CFTypeRef) as Id }
 }
 
+/// `-description` and `-debugDescription`, `<ClassName: 0xaddress>` as Foundation
+/// spells them. Callers send these to any object without checking first (Qt's
+/// `QDebug << id` does), so a missing one aborts the guest.
+unsafe extern "C" fn description(receiver: Id, _sel: Sel) -> Id {
+    // SAFETY: the receiver is a live object.
+    let name = unsafe { objc::object::class_of(receiver) }.map_or("nil", |c| c.name_str());
+    let string = crate::string::from_str(&format!("<{name}: {receiver:p}>"));
+    // SAFETY: a fresh object.
+    unsafe { corefoundation::api::CFAutorelease(string as corefoundation::base::CFTypeRef) as Id }
+}
+
 pub(crate) fn install() {
     let nsobject = objc::class::lookup(c"NSObject").expect("the runtime's own NSObject");
     methods!(nsobject, {
         "className" => class_name, c"@16@0:8";
+        "description" => description, c"@16@0:8";
+        "debugDescription" => description, c"@16@0:8";
     });
 }
 
@@ -185,5 +278,29 @@ mod tests {
         let encoded = unsafe { NSFileTypeForHFSTypeCode(u32::from_be_bytes(*b"APPL")) };
         // SAFETY: `encoded` is the string created immediately above.
         assert_eq!(unsafe { crate::string::bytes(encoded) }, b"'APPL'");
+    }
+
+    #[test]
+    fn description_names_the_class_unless_it_has_its_own() {
+        crate::bootstrap();
+        let base = objc::class::lookup(c"NSObject").expect("NSObject");
+        let class = objc::class::allocate_pair(Some(base), c"DescriptionTestLayer", 0)
+            .expect("a fresh class name");
+        objc::class::register_pair(class);
+        let object = objc::object::create_instance(class, 0);
+        let string = crate::string::from_str("as written");
+        // SAFETY: live objects; `-description` is `id (id, SEL)`.
+        unsafe {
+            let send: unsafe extern "C" fn(Id, Sel) -> Id = std::mem::transmute(objc::msg::entry());
+            for sel in ["description", "debugDescription"] {
+                let text = crate::string::bytes(send(object, objc::sel::get(sel)));
+                assert_eq!(
+                    text,
+                    format!("<DescriptionTestLayer: {object:p}>").as_bytes()
+                );
+            }
+            let text = crate::string::bytes(send(string, objc::sel::get("description")));
+            assert_eq!(text, b"as written");
+        }
     }
 }

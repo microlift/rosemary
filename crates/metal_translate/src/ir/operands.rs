@@ -48,7 +48,7 @@ pub(crate) fn instruction_name(kind: &InstructionKind) -> &'static str {
 /// the array slice, which Metal passes separately.
 pub(crate) fn coordinate_lanes(texture: &TextureType) -> u8 {
     match texture.dimension {
-        TextureDimension::D1 => 1,
+        TextureDimension::D1 | TextureDimension::Buffer => 1,
         TextureDimension::D2 => 2,
         TextureDimension::D3 | TextureDimension::Cube => 3,
     }

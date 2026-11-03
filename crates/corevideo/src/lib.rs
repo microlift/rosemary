@@ -1,6 +1,8 @@
 #![allow(clippy::manual_dangling_ptr, clippy::missing_safety_doc)]
 #![allow(non_snake_case)]
 
+pub mod pixel_buffer;
+
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -361,6 +363,50 @@ exports::exports! {
         "CVDisplayLinkRetain" => CVDisplayLinkRetain,
         "CVDisplayLinkRelease" => CVDisplayLinkRelease,
         "CVDisplayLinkIsRunning" => CVDisplayLinkIsRunning,
+        "CVBufferRetain" => pixel_buffer::CVBufferRetain,
+        "CVBufferRelease" => pixel_buffer::CVBufferRelease,
+        "CVPixelBufferCreate" => pixel_buffer::CVPixelBufferCreate,
+        "CVPixelBufferRetain" => pixel_buffer::CVPixelBufferRetain,
+        "CVPixelBufferRelease" => pixel_buffer::CVPixelBufferRelease,
+        "CVPixelBufferGetTypeID" => pixel_buffer::CVPixelBufferGetTypeID,
+        "CVPixelBufferGetWidth" => pixel_buffer::CVPixelBufferGetWidth,
+        "CVPixelBufferGetHeight" => pixel_buffer::CVPixelBufferGetHeight,
+        "CVPixelBufferGetPixelFormatType" => pixel_buffer::CVPixelBufferGetPixelFormatType,
+        "CVPixelBufferIsPlanar" => pixel_buffer::CVPixelBufferIsPlanar,
+        "CVPixelBufferGetPlaneCount" => pixel_buffer::CVPixelBufferGetPlaneCount,
+        "CVPixelBufferGetDataSize" => pixel_buffer::CVPixelBufferGetDataSize,
+        "CVPixelBufferGetBytesPerRow" => pixel_buffer::CVPixelBufferGetBytesPerRow,
+        "CVPixelBufferGetWidthOfPlane" => pixel_buffer::CVPixelBufferGetWidthOfPlane,
+        "CVPixelBufferGetHeightOfPlane" => pixel_buffer::CVPixelBufferGetHeightOfPlane,
+        "CVPixelBufferGetBytesPerRowOfPlane" => pixel_buffer::CVPixelBufferGetBytesPerRowOfPlane,
+        "CVPixelBufferGetBaseAddress" => pixel_buffer::CVPixelBufferGetBaseAddress,
+        "CVPixelBufferGetBaseAddressOfPlane" => pixel_buffer::CVPixelBufferGetBaseAddressOfPlane,
+        "CVPixelBufferLockBaseAddress" => pixel_buffer::CVPixelBufferLockBaseAddress,
+        "CVPixelBufferUnlockBaseAddress" => pixel_buffer::CVPixelBufferUnlockBaseAddress,
+        "CVPixelBufferGetIOSurface" => pixel_buffer::CVPixelBufferGetIOSurface,
+        "CVPixelBufferCreateWithBytes" => pixel_buffer::CVPixelBufferCreateWithBytes,
+        "CVPixelBufferCreateWithPlanarBytes" => pixel_buffer::CVPixelBufferCreateWithPlanarBytes,
+        "CVPixelBufferGetExtendedPixels" => pixel_buffer::CVPixelBufferGetExtendedPixels,
+        "CVImageBufferGetEncodedSize" => pixel_buffer::CVImageBufferGetEncodedSize,
+        "CVImageBufferGetDisplaySize" => pixel_buffer::CVImageBufferGetDisplaySize,
+        "CVBufferSetAttachment" => pixel_buffer::CVBufferSetAttachment,
+        "CVBufferGetAttachment" => pixel_buffer::CVBufferGetAttachment,
+        "CVBufferCopyAttachment" => pixel_buffer::CVBufferCopyAttachment,
+        "CVBufferRemoveAttachment" => pixel_buffer::CVBufferRemoveAttachment,
+        "CVBufferRemoveAllAttachments" => pixel_buffer::CVBufferRemoveAllAttachments,
+        "CVBufferGetAttachments" => pixel_buffer::CVBufferGetAttachments,
+        "CVBufferCopyAttachments" => pixel_buffer::CVBufferCopyAttachments,
+        "CVBufferSetAttachments" => pixel_buffer::CVBufferSetAttachments,
+        "CVBufferPropagateAttachments" => pixel_buffer::CVBufferPropagateAttachments,
+        "CVPixelBufferPoolGetTypeID" => pixel_buffer::CVPixelBufferPoolGetTypeID,
+        "CVPixelBufferPoolCreate" => pixel_buffer::CVPixelBufferPoolCreate,
+        "CVPixelBufferPoolRetain" => pixel_buffer::CVPixelBufferPoolRetain,
+        "CVPixelBufferPoolRelease" => pixel_buffer::CVPixelBufferPoolRelease,
+        "CVPixelBufferPoolGetAttributes" => pixel_buffer::CVPixelBufferPoolGetAttributes,
+        "CVPixelBufferPoolGetPixelBufferAttributes" => pixel_buffer::CVPixelBufferPoolGetPixelBufferAttributes,
+        "CVPixelBufferPoolCreatePixelBuffer" => pixel_buffer::CVPixelBufferPoolCreatePixelBuffer,
+        "CVPixelBufferPoolCreatePixelBufferWithAuxAttributes" => pixel_buffer::CVPixelBufferPoolCreatePixelBufferWithAuxAttributes,
+        "CVPixelBufferPoolFlush" => pixel_buffer::CVPixelBufferPoolFlush,
     }
 }
 

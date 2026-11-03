@@ -77,4 +77,20 @@ pub(super) unsafe extern "C" fn dispatch_threadgroups(
             .device
             .cmd_dispatch(command.command_buffer, counts[0], counts[1], counts[2])
     });
+    // A serial encoder's next dispatch sees everything this one wrote.
+    if !encoder.concurrent {
+        encoder.barrier();
+    }
+}
+
+/// `-memoryBarrierWithScope:`, and the forms which name resources or stages.
+///
+/// Only a compute encoder orders work here: a render encoder's barrier falls
+/// inside a Vulkan render pass, where this runtime records none.
+pub(super) unsafe extern "C" fn memory_barrier(receiver: Id, _sel: Sel) {
+    // SAFETY: an encoder of this crate's.
+    let encoder = unsafe { object::body::<Encoder>(receiver) };
+    if encoder.kind == Kind::Compute {
+        encoder.barrier();
+    }
 }

@@ -8,6 +8,8 @@ pub(super) const BUFFER_USAGE: vk::BufferUsageFlags = vk::BufferUsageFlags::from
         | vk::BufferUsageFlags::VERTEX_BUFFER.as_raw()
         | vk::BufferUsageFlags::INDEX_BUFFER.as_raw()
         | vk::BufferUsageFlags::INDIRECT_BUFFER.as_raw()
+        | vk::BufferUsageFlags::UNIFORM_TEXEL_BUFFER.as_raw()
+        | vk::BufferUsageFlags::STORAGE_TEXEL_BUFFER.as_raw()
         | vk::BufferUsageFlags::TRANSFER_SRC.as_raw()
         | vk::BufferUsageFlags::TRANSFER_DST.as_raw(),
 );
@@ -113,6 +115,7 @@ impl Gpu {
             contents: allocation.contents,
             length,
             private,
+            placement: None,
         };
         if zeroed && !allocation.pristine {
             if allocation.contents.is_null() {
@@ -204,6 +207,8 @@ impl Gpu {
         if let Some(heap) = heap {
             heap.free(&self.device, buffer.allocation);
         }
+        // Only now that the buffer is gone may its heap's memory go.
+        drop(buffer.placement);
     }
 
     /// What the buffer heaps hold, for `ROSEMARY_METAL_STATS`: blocks, their
@@ -272,6 +277,28 @@ impl Gpu {
     }
 
     pub fn create_image(&self, description: &ImageDescription) -> Result<GpuImage, String> {
+        self.create_image_in(description, None)
+    }
+
+    /// The memory an image of this description needs, which is what a heap
+    /// quotes for it.
+    pub fn image_requirements(
+        &self,
+        description: &ImageDescription,
+    ) -> Result<vk::MemoryRequirements, String> {
+        let (image, _) = self.new_image(description)?;
+        // SAFETY: the image was just created by this device.
+        let requirements = unsafe { self.device.get_image_memory_requirements(image) };
+        // SAFETY: never bound or used.
+        unsafe { self.device.destroy_image(image, None) };
+        Ok(requirements)
+    }
+
+    /// An unbound image for `description`, and the usage it was made with.
+    fn new_image(
+        &self,
+        description: &ImageDescription,
+    ) -> Result<(vk::Image, vk::ImageUsageFlags), String> {
         let samples = sample_count(description.samples).ok_or_else(|| {
             format!(
                 "texture has invalid Metal sample count {}",
@@ -342,6 +369,23 @@ impl Gpu {
         // SAFETY: a well-formed create info on this live device.
         let image = unsafe { self.device.create_image(&info, None) }
             .map_err(|error| format!("vkCreateImage failed with {error:?}"))?;
+        Ok((image, usage))
+    }
+
+    /// An image in memory of its own, or `placed` at an offset into a
+    /// placement heap's.
+    pub fn create_image_in(
+        &self,
+        description: &ImageDescription,
+        placed: Option<(Arc<Placement>, u64)>,
+    ) -> Result<GpuImage, String> {
+        let samples = sample_count(description.samples).ok_or_else(|| {
+            format!(
+                "texture has invalid Metal sample count {}",
+                description.samples
+            )
+        })?;
+        let (image, usage) = self.new_image(description)?;
         // Everything below can fail; the guards unwind what has been made so
         // far, and only the last statement of the function takes them.
         let image = Guard::new(image, |image| {
@@ -350,18 +394,35 @@ impl Gpu {
         });
         // SAFETY: the image was just created by this device.
         let requirements = unsafe { self.device.get_image_memory_requirements(*image) };
-        let memory = self.allocate(
-            requirements,
-            vk::MemoryPropertyFlags::DEVICE_LOCAL,
-            vk::MemoryPropertyFlags::empty(),
-        )?;
-        let memory = Guard::new(memory, |memory| {
-            // SAFETY: memory of this device's, bound to nothing which survives.
-            unsafe { self.device.free_memory(memory, None) };
-        });
-        // SAFETY: fresh, unbound image and memory from this device.
-        unsafe { self.device.bind_image_memory(*image, *memory, 0) }
-            .map_err(|error| format!("vkBindImageMemory failed with {error:?}"))?;
+        let (memory, placement) = match placed {
+            None => {
+                let memory = self.allocate(
+                    requirements,
+                    vk::MemoryPropertyFlags::DEVICE_LOCAL,
+                    vk::MemoryPropertyFlags::empty(),
+                )?;
+                let memory = Guard::new(memory, |memory| {
+                    // SAFETY: memory of this device's, bound to nothing which
+                    // survives.
+                    unsafe { self.device.free_memory(memory, None) };
+                });
+                // SAFETY: fresh, unbound image and memory from this device.
+                unsafe { self.device.bind_image_memory(*image, *memory, 0) }
+                    .map_err(|error| format!("vkBindImageMemory failed with {error:?}"))?;
+                (Some(memory), None)
+            }
+            Some((placement, offset)) => {
+                placement.admits(&requirements, offset)?;
+                // SAFETY: a fresh, unbound image, and a range of the heap's
+                // memory `admits` checked.
+                unsafe {
+                    self.device
+                        .bind_image_memory(*image, placement.memory, offset)
+                }
+                .map_err(|error| format!("vkBindImageMemory failed with {error:?}"))?;
+                (None, Some(placement))
+            }
+        };
         let aspect = aspect_of(description.format);
         let levels = description.levels.max(1);
         let layers = description.layers.max(1);
@@ -407,7 +468,8 @@ impl Gpu {
         let view = view.take();
         Ok(GpuImage {
             image: image.take(),
-            memory: Some(memory.take()),
+            memory: memory.map(Guard::take),
+            placement,
             view,
             format: description.format,
             aspect: aspect_of(description.format),
@@ -489,6 +551,7 @@ impl Gpu {
         Ok(GpuImage {
             image: source.image,
             memory: None,
+            placement: None,
             view,
             format,
             aspect,
@@ -509,6 +572,7 @@ impl Gpu {
         let image = GpuImage {
             image: vk::Image::null(),
             memory: None,
+            placement: None,
             ..image
         };
         if let Some(image) = self.defer_destruction(image) {
@@ -565,6 +629,8 @@ impl Gpu {
                 self.device.free_memory(memory, None);
             }
         }
+        // Only now that the image is gone may its heap's memory go.
+        drop(image.placement);
     }
 
     pub fn create_shader_module(

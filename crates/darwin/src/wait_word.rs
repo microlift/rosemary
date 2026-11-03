@@ -79,6 +79,7 @@ unsafe fn park_u32(
         Scope::Private => Flags::PRIVATE,
         Scope::Shared => Flags::empty(),
     };
+    let _host = crate::syscall::ScopedHostSyscallContext::new();
     futex::wait(word, flags, expected, timeout.as_ref())
         .map_err(|error| classify(error.raw_os_error()))
 }
@@ -104,6 +105,7 @@ pub(crate) unsafe fn wake_u32(
         WakeCount::One => 1,
         WakeCount::All => i32::MAX as u32,
     };
+    let _host = crate::syscall::ScopedHostSyscallContext::new();
     futex::wake(word, flags, count)
         .map(|woken| woken as usize)
         .map_err(|error| error.raw_os_error())

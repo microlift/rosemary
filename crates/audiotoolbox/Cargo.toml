@@ -10,3 +10,6 @@ exports.workspace = true
 coreaudio.workspace = true
 darwin.workspace = true
 sdl3.workspace = true
+
+[lints]
+workspace = true

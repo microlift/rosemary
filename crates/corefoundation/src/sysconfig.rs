@@ -219,13 +219,11 @@ mod darwin {
         };
         // SAFETY: the declaration above is the framework's own, and `address` is
         // the caller's `struct sockaddr` - a host layout on the one host this
-        // reaches. The allocator is passed along; every caller in practice
-        // passes the default, which is null in Apple's CoreFoundation as well as
-        // in this one.
+        // reaches. The allocator is this runtime's, so the host gets its own.
         unsafe {
             let f: unsafe extern "C" fn(CFTypeRef, *const c_void) -> CFTypeRef =
                 std::mem::transmute(f);
-            f(allocator, address)
+            f(crate::api::host_allocator(allocator), address)
         }
     }
 
@@ -241,7 +239,7 @@ mod darwin {
         unsafe {
             let f: unsafe extern "C" fn(CFTypeRef, *const c_void) -> CFTypeRef =
                 std::mem::transmute(f);
-            f(allocator, name)
+            f(crate::api::host_allocator(allocator), name)
         }
     }
 
@@ -294,6 +292,32 @@ mod darwin {
         _mode: CFTypeRef,
     ) -> u8 {
         0
+    }
+
+    /// `Boolean SCNetworkReachabilitySetDispatchQueue(SCNetworkReachabilityRef, dispatch_queue_t)`,
+    /// declined for the reason scheduling on a run loop is.
+    pub unsafe extern "C" fn SCNetworkReachabilitySetDispatchQueue(
+        _target: CFTypeRef,
+        _queue: *const c_void,
+    ) -> u8 {
+        0
+    }
+
+    /// `SCNetworkReachabilityRef SCNetworkReachabilityCreateWithAddressPair(CFAllocatorRef, const struct sockaddr *, const struct sockaddr *)`
+    pub unsafe extern "C" fn SCNetworkReachabilityCreateWithAddressPair(
+        allocator: CFTypeRef,
+        local: *const c_void,
+        remote: *const c_void,
+    ) -> CFTypeRef {
+        let Some(f) = host(c"SCNetworkReachabilityCreateWithAddressPair") else {
+            return std::ptr::null();
+        };
+        // SAFETY: as `SCNetworkReachabilityCreateWithAddress`.
+        unsafe {
+            let f: unsafe extern "C" fn(CFTypeRef, *const c_void, *const c_void) -> CFTypeRef =
+                std::mem::transmute(f);
+            f(crate::api::host_allocator(allocator), local, remote)
+        }
     }
 
     /// `Boolean SCNetworkReachabilityUnscheduleFromRunLoop(SCNetworkReachabilityRef, CFRunLoopRef, CFStringRef)`
@@ -437,6 +461,70 @@ mod local {
             unsafe { callback(target, reachable_flags(local), info) };
         }
         1
+    }
+
+    /// `SCNetworkReachabilityRef SCNetworkReachabilityCreateWithAddressPair(CFAllocatorRef, const struct sockaddr *local, const struct sockaddr *remote)`
+    ///
+    /// Local when there is no remote end, or when the remote end is this
+    /// machine; NULL when both are missing, as Apple's answers.
+    pub unsafe extern "C" fn SCNetworkReachabilityCreateWithAddressPair(
+        _allocator: CFTypeRef,
+        local: *const c_void,
+        remote: *const c_void,
+    ) -> CFTypeRef {
+        if local.is_null() && remote.is_null() {
+            return std::ptr::null();
+        }
+        // SAFETY: null or the caller's Darwin `struct sockaddr`.
+        new_target(remote.is_null() || unsafe { names_this_machine(remote) })
+    }
+
+    /// `Boolean SCNetworkReachabilitySetDispatchQueue(SCNetworkReachabilityRef, dispatch_queue_t)`
+    ///
+    /// The queue spelling of [`SCNetworkReachabilityScheduleWithRunLoop`], with
+    /// the one callback delivered on `queue` as Apple's is. It is still the only
+    /// one, for the reason given there. A null queue unschedules.
+    pub unsafe extern "C" fn SCNetworkReachabilitySetDispatchQueue(
+        target: CFTypeRef,
+        queue: *const c_void,
+    ) -> u8 {
+        if unsafe { target_state(target) }.is_none() {
+            return 0;
+        }
+        if !queue.is_null() {
+            // Held until the delivery has run.
+            // SAFETY: an object of this runtime's, checked above.
+            let held = unsafe { crate::api::CFRetain(target) };
+            // SAFETY: a queue the caller holds; `deliver` takes `held` back.
+            unsafe {
+                darwin::dispatch::queue::async_f(
+                    queue as u64,
+                    held as u64,
+                    deliver as *const () as usize as u64,
+                )
+            };
+        }
+        1
+    }
+
+    /// The callback registered on `target` when it runs - not when it was
+    /// queued, as a caller may have cleared it since - then the queue's hold
+    /// on the target dropped.
+    unsafe extern "C" fn deliver(target: *mut c_void) {
+        let target = target as CFTypeRef;
+        // SAFETY: the target `SCNetworkReachabilitySetDispatchQueue` retained.
+        if let Some(state) = unsafe { target_state(target) } {
+            let delivery = {
+                let state = state.lock().unwrap_or_else(|e| e.into_inner());
+                state.callback.map(|f| (f, state.info, state.local))
+            };
+            if let Some((callback, info, local)) = delivery {
+                // SAFETY: the callback and info the caller registered.
+                unsafe { callback(target, reachable_flags(local), info) };
+            }
+        }
+        // SAFETY: the retain taken when this was queued.
+        unsafe { crate::api::CFRelease(target) };
     }
 
     /// `Boolean SCNetworkReachabilityUnscheduleFromRunLoop(SCNetworkReachabilityRef, CFRunLoopRef, CFStringRef)`
@@ -763,6 +851,8 @@ exports::exports! {
     functions {
         "SCNetworkReachabilityCreateWithAddress" => SCNetworkReachabilityCreateWithAddress,
         "SCNetworkReachabilityCreateWithName" => SCNetworkReachabilityCreateWithName,
+        "SCNetworkReachabilityCreateWithAddressPair" => SCNetworkReachabilityCreateWithAddressPair,
+        "SCNetworkReachabilitySetDispatchQueue" => SCNetworkReachabilitySetDispatchQueue,
         "SCNetworkReachabilityGetFlags" => SCNetworkReachabilityGetFlags,
         "SCNetworkReachabilitySetCallback" => SCNetworkReachabilitySetCallback,
         "SCNetworkReachabilityScheduleWithRunLoop" => SCNetworkReachabilityScheduleWithRunLoop,

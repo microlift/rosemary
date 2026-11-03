@@ -409,7 +409,7 @@ pub unsafe extern "C" fn mach_port_space_basic_info(task: Name, out: *mut c_void
     if out.is_null() {
         return KERN_INVALID_ARGUMENT;
     }
-    if space::task_pid(task) != Some(starnix::process::me()) {
+    if space::task_pid(task) != Some(crate::process::host_self()) {
         return KERN_INVALID_ARGUMENT;
     }
     let names = space::count() as u32;
@@ -477,7 +477,7 @@ mod tests {
     use crate::mach::space::TASK_SELF;
 
     fn me() -> i32 {
-        starnix::process::me()
+        crate::process::host_self()
     }
 
     #[test]

@@ -13,6 +13,7 @@ pub fn data_symbols() -> Vec<(String, u64)> {
     foundation::bootstrap();
     let mut symbols: Vec<_> = keychain::KEYS
         .iter()
+        .chain(trust::KEYS)
         .map(|(symbol, text)| {
             (
                 (*symbol).to_string(),

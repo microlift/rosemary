@@ -2,6 +2,7 @@ use microlift::arch::x86_64::context::RegisterContext;
 
 use super::bad_pointer;
 use crate::abi::{GuestMemory, Result};
+use crate::shims::bind;
 
 /// `int proc_pidpath(int pid, void *buffer, uint32_t buffersize)`.
 ///
@@ -90,13 +91,17 @@ pub fn execl_family(
     Ok(())
 }
 
-pub type Shim = fn(&str, &mut RegisterContext, &mut dyn GuestMemory) -> Result<()>;
+pub type Shim = crate::shims::Shim;
 
 pub fn shim_for(name: &str) -> Option<Shim> {
     match name {
-        "proc_pidpath" => Some(proc_pidpath),
-        "pthread_jit_write_protect_np" => Some(pthread_jit_write_protect_np),
-        "execl" | "execlp" | "execle" => Some(execl_family),
+        "proc_pidpath" => Some(bind!("proc_pidpath" => proc_pidpath)),
+        "pthread_jit_write_protect_np" => {
+            Some(bind!("pthread_jit_write_protect_np" => pthread_jit_write_protect_np))
+        }
+        "execl" => Some(bind!("execl" => execl_family)),
+        "execlp" => Some(bind!("execlp" => execl_family)),
+        "execle" => Some(bind!("execle" => execl_family)),
         _ => None,
     }
 }

@@ -20,8 +20,10 @@ applicationservices.workspace = true
 coreservices.workspace = true
 audiotoolbox.workspace = true
 sdl3.workspace = true
+coremedia.workspace = true
 corevideo.workspace = true
 iosurface.workspace = true
+coretext.workspace = true
 coreaudio.workspace = true
 contacts.workspace = true
 avfoundation.workspace = true
@@ -31,7 +33,9 @@ webkit.workspace = true
 forcefeedback.workspace = true
 network.workspace = true
 opencl.workspace = true
+opengl.workspace = true
 metal.workspace = true
+videotoolbox.workspace = true
 gimli.workspace = true
 libc.workspace = true
 static_init.workspace = true
@@ -49,3 +53,6 @@ mimalloc = { version = "0.1.52", features = ["override"] }
 [dev-dependencies]
 libc.workspace = true
 darwin.workspace = true
+
+[lints]
+workspace = true

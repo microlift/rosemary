@@ -29,6 +29,10 @@ impl Drop for Scratch {
 
 fn library() -> TranslatedLibrary {
     TranslatedLibrary {
+        rejected: vec![crate::RejectedEntry {
+            name: "kernel_untranslatable".to_owned(),
+            reason: "AirSyntax: unsupported statement".to_owned(),
+        }],
         function_constants: vec![FunctionConstantInfo {
             index: 3,
             name: "useFog".to_owned(),
@@ -49,6 +53,7 @@ fn library() -> TranslatedLibrary {
                         count: 1,
                         access: Access::ReadWrite,
                         sampled: false,
+                        texel_buffer: false,
                         inline_sampler: None,
                     },
                     ResourceBinding {
@@ -60,6 +65,7 @@ fn library() -> TranslatedLibrary {
                         count: 1,
                         access: Access::Sample,
                         sampled: true,
+                        texel_buffer: false,
                         inline_sampler: None,
                     },
                 ],

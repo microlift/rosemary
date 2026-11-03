@@ -332,7 +332,7 @@ unsafe extern "C" fn get_values(
              one virtual screen, so {screen} names no renderer"
         );
     }
-    // One renderer, so one virtual screen - see `crate::cgl`. Answered here
+    // One renderer, so one virtual screen - see `opengl::cgl`. Answered here
     // rather than from the list because it is a property of the machine and not
     // of what the program asked for.
     if attribute == attribute::VIRTUAL_SCREEN_COUNT {
@@ -917,22 +917,235 @@ fn gl_debug() -> bool {
 static BOUND: std::sync::Mutex<Vec<(std::thread::ThreadId, usize, usize)>> =
     std::sync::Mutex::new(Vec::new());
 
-/// Record that this thread now has `window` bound through `receiver`.
-fn note_bound(receiver: Id, window: sdl3::Window) {
+/// Physical SDL family retirement waits until every thread that had an old
+/// GL drawable bound relinquishes that drawable. The SDL Vulkan lifetime
+/// barrier also covers GL because SDL destroys native popup children
+/// recursively when their parent allocation is freed.
+struct RetiredDrawable {
+    thread: std::thread::ThreadId,
+    window: usize,
+    done: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+static RETIRED_DRAWABLES: std::sync::Mutex<Vec<RetiredDrawable>> =
+    std::sync::Mutex::new(Vec::new());
+
+/// Called before remapping a parent or child SDL window. Hold the old native
+/// family until GL render threads acknowledge the drawable transition.
+pub(crate) fn protect_remade_family(root: sdl3::Window) {
+    let family = sdl3::video::window_family(root);
+    let keys: std::collections::HashSet<usize> = family.iter().map(|w| *w as usize).collect();
+    #[cfg(test)]
+    if TEST_PAUSE_NATIVE_BIND.load(std::sync::atomic::Ordering::Acquire) != 0 {
+        TEST_PROTECTION_WANTS_GATE.store(true, std::sync::atomic::Ordering::Release);
+    }
+    let bound = BOUND.lock().unwrap_or_else(|e| e.into_inner());
+    let mut retired = RETIRED_DRAWABLES.lock().unwrap_or_else(|e| e.into_inner());
+    for &(thread, window, _) in bound.iter() {
+        if !keys.contains(&window) {
+            continue;
+        }
+        let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        if sdl3::video::vulkan::hold_window_until(root, done.clone()) {
+            retired.push(RetiredDrawable {
+                thread,
+                window,
+                done,
+            });
+        }
+    }
+}
+
+/// Ack only after SDL_GL_MakeCurrent has switched to the new drawable or
+/// SDL_GL_MakeCurrent(NULL,NULL) has released the old drawable. This is
+/// invoked with BOUND held, serializing against a pending parent recreation.
+fn release_retired_drawables(thread: std::thread::ThreadId, new: Option<usize>) {
+    let mut retired = RETIRED_DRAWABLES.lock().unwrap_or_else(|e| e.into_inner());
+    retired.retain(|item| {
+        let release = item.thread == thread && new != Some(item.window);
+        if release {
+            item.done.store(true, std::sync::atomic::Ordering::Release);
+        }
+        !release
+    });
+}
+
+#[cfg(test)]
+pub(crate) fn retired_drawable_count_for_tests() -> usize {
+    RETIRED_DRAWABLES
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .len()
+}
+
+/// Record a completed native binding while the retirement gate is held.
+fn note_bound_locked(
+    bound: &mut Vec<(std::thread::ThreadId, usize, usize)>,
+    receiver: Id,
+    window: sdl3::Window,
+) {
     let me = std::thread::current().id();
-    let mut bound = BOUND.lock().unwrap_or_else(|e| e.into_inner());
     bound.retain(|(thread, _, _)| *thread != me);
     bound.push((me, window as usize, receiver as usize));
+    release_retired_drawables(me, Some(window as usize));
+}
+
+/// Native binding and publication must be indivisible to a family retirement.
+fn bind_native_context(
+    receiver: Id,
+    window: sdl3::Window,
+    native: sdl3::GlContext,
+) -> Option<bool> {
+    let mut bound = BOUND.lock().unwrap_or_else(|e| e.into_inner());
+    let already =
+        sdl3::video::gl_current_context() == native && sdl3::video::gl_current_window() == window;
+    if !already && !sdl3::video::gl_make_current(window, native) {
+        return None;
+    }
+    #[cfg(test)]
+    pause_native_bind_for_test(window);
+    note_bound_locked(&mut bound, receiver, window);
+    Some(already)
+}
+
+#[cfg(test)]
+static TEST_PAUSE_NATIVE_BIND: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+#[cfg(test)]
+static TEST_NATIVE_BIND_PAUSED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+#[cfg(test)]
+static TEST_PROTECTION_WANTS_GATE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+#[cfg(test)]
+pub(crate) fn test_pause_binding(window: sdl3::Window) {
+    use std::sync::atomic::Ordering;
+    TEST_PROTECTION_WANTS_GATE.store(false, Ordering::Release);
+    TEST_NATIVE_BIND_PAUSED.store(false, Ordering::Release);
+    TEST_PAUSE_NATIVE_BIND.store(window as usize, Ordering::Release);
+}
+
+#[cfg(test)]
+pub(crate) fn test_binding_paused() -> bool {
+    TEST_NATIVE_BIND_PAUSED.load(std::sync::atomic::Ordering::Acquire)
+}
+
+#[cfg(test)]
+pub(crate) fn test_protection_waiting() -> bool {
+    TEST_PROTECTION_WANTS_GATE.load(std::sync::atomic::Ordering::Acquire)
+}
+
+#[cfg(test)]
+pub(crate) fn test_resume_binding() {
+    TEST_PAUSE_NATIVE_BIND.store(0, std::sync::atomic::Ordering::Release);
+}
+
+#[cfg(test)]
+fn pause_native_bind_for_test(window: sdl3::Window) {
+    use std::sync::atomic::Ordering;
+    if TEST_PAUSE_NATIVE_BIND.load(Ordering::Acquire) != window as usize {
+        return;
+    }
+    TEST_NATIVE_BIND_PAUSED.store(true, Ordering::Release);
+    while TEST_PAUSE_NATIVE_BIND.load(Ordering::Acquire) == window as usize {
+        std::thread::yield_now();
+    }
+    TEST_NATIVE_BIND_PAUSED.store(false, Ordering::Release);
+}
+
+/// Reapply the guest's swap interval after changing a native GL drawable.
+fn restore_popup_swap_interval(receiver: Id, native: sdl3::GlContext, window: sdl3::Window) {
+    let interval = shared_of(context_of(receiver))
+        .state
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .swap_interval
+        .or_else(swap_interval);
+    if let Some(interval) = interval
+        && sdl3::video::gl_set_swap_interval(interval)
+    {
+        APPLIED_INTERVAL.set((native, window, Some(interval)));
+    } else {
+        APPLIED_INTERVAL.set((std::ptr::null_mut(), std::ptr::null_mut(), None));
+    }
+}
+
+/// Move an already-current GL popup to its replacement SDL drawable.
+/// Only its owning thread may call SDL_GL_MakeCurrent. A context current on
+/// another thread is repaired from that thread's next GL/AppKit boundary.
+pub(crate) fn popup_rehomed(old: sdl3::Window, new: sdl3::Window) {
+    if sdl3::video::gl_current_window() != old {
+        return;
+    }
+    let native = sdl3::video::gl_current_context();
+    if native.is_null() {
+        return;
+    }
+    let me = std::thread::current().id();
+    let mut bound = BOUND.lock().unwrap_or_else(|e| e.into_inner());
+    let receiver = bound
+        .iter()
+        .find(|(thread, window, _)| *thread == me && *window == old as usize)
+        .map(|(_, _, context)| *context as Id);
+    let Some(receiver) = receiver else {
+        return;
+    };
+    if sdl3::video::gl_make_current(new, native) {
+        note_bound_locked(&mut bound, receiver, new);
+        drop(bound);
+        restore_popup_swap_interval(receiver, native, new);
+        chrome_blit::fit_viewport(drawable_window(context_of(receiver)), new, native);
+    } else {
+        eprintln!("rosemary: OpenGL popup rebind failed: {}", sdl3::error());
+    }
+}
+
+/// Restore a context whose SDL drawable was replaced from its owning thread.
+/// This also handles the case where the parent was rebuilt on the SDL event
+/// thread while the guest kept its GL context current on a render thread.
+fn restore_current_drawable(receiver: Id) {
+    if CURRENT.get() != receiver {
+        return;
+    }
+    let context = context_of(receiver);
+    let window = drawable(context);
+    if window.is_null() || sdl3::video::gl_current_window() == window {
+        return;
+    }
+    let cell = shared_of(context);
+    let state = cell.state.lock().unwrap_or_else(|e| e.into_inner());
+    let me = std::thread::current().id();
+    let native = if state.owner == Some(me) {
+        context.sdl
+    } else if let Some((_, native)) = state.siblings.iter().find(|(thread, _)| *thread == me) {
+        *native
+    } else {
+        return;
+    };
+    if native.is_null() {
+        return;
+    }
+    drop(state);
+    if bind_native_context(receiver, window, native).is_some() {
+        restore_popup_swap_interval(receiver, native, window);
+        chrome_blit::fit_viewport(drawable_window(context), window, native);
+    } else {
+        eprintln!(
+            "rosemary: OpenGL drawable restore failed: {}",
+            sdl3::error()
+        );
+    }
 }
 
 /// Unbind whatever SDL has current on this thread.
 fn unbind_here() {
-    sdl3::video::gl_make_current(std::ptr::null_mut(), std::ptr::null_mut());
     let me = std::thread::current().id();
-    BOUND
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .retain(|(thread, _, _)| *thread != me);
+    let mut bound = BOUND.lock().unwrap_or_else(|e| e.into_inner());
+    if sdl3::video::gl_make_current(std::ptr::null_mut(), std::ptr::null_mut()) {
+        bound.retain(|(thread, _, _)| *thread != me);
+        release_retired_drawables(me, None);
+    }
 }
 
 /// Wait for any other thread that has `window` bound through a context other
@@ -1048,6 +1261,10 @@ const HANDOFF: std::time::Duration = std::time::Duration::from_secs(2);
 /// threads itself, which is a thing the GL underneath has no call for - so the
 /// handover has to happen somewhere, and this is the somewhere that is safe.
 pub fn release_for_other_threads() {
+    let current = CURRENT.get();
+    if !current.is_null() {
+        restore_current_drawable(current);
+    }
     let lingering = LINGERING.get();
     if !lingering.is_null() {
         let cell = shared_of(context_of(lingering));
@@ -1165,15 +1382,12 @@ unsafe extern "C" fn make_current_context(receiver: Id, _sel: Sel) {
 
     // Still bound from before this thread's last clear - see
     // `clear_current_context` - so there is nothing to ask the driver for.
-    let bound =
-        sdl3::video::gl_current_context() == sdl && sdl3::video::gl_current_window() == window;
-    if !bound && !sdl3::video::gl_make_current(window, sdl) {
+    let bound = bind_native_context(receiver, window, sdl).unwrap_or_else(|| {
         objc::fail!(
             "-[NSOpenGLContext makeCurrentContext]: SDL could not make the context current: {}",
             sdl3::error()
-        );
-    }
-    note_bound(receiver, window);
+        )
+    });
     chrome_blit::fit_viewport(drawable_window(context), window, sdl);
 
     if holds_primary {
@@ -1829,9 +2043,22 @@ pub fn present_single_buffered() {
 
 /// `-flushBuffer`: the swap that puts a frame on the screen.
 unsafe extern "C" fn flush_buffer(receiver: Id, _sel: Sel) {
+    restore_current_drawable(receiver);
     let window = drawable(context_of(receiver));
     if !window.is_null() {
+        // A fullscreen resize may happen while the context remains current.
+        // Preserve explicit guest viewports; update only an auto-fitted one.
+        if CURRENT.get() == receiver && sdl3::video::gl_current_window() == window {
+            chrome_blit::fit_viewport(
+                drawable_window(context_of(receiver)),
+                window,
+                sdl3::video::gl_current_context(),
+            );
+        }
         chrome_blit::draw(window);
+        if sdl3::video::gl_current_window() == window {
+            chrome_blit::mask_outside_logical_frame(drawable_window(context_of(receiver)), window);
+        }
         sdl3::video::swap_window(window);
     }
 }
@@ -1893,7 +2120,7 @@ unsafe extern "C" fn update(_receiver: Id, _sel: Sel) {}
 /// A virtual screen is one renderer of the context's pixel format, and a
 /// program reads this to find out which GPU it ended up on after the window
 /// moved between displays. There is one renderer here - see
-/// `crate::cgl::CGLQueryRendererInfo` - so there is one virtual screen, and it
+/// `opengl::cgl::CGLQueryRendererInfo` - so there is one virtual screen, and it
 /// is the one in use.
 unsafe extern "C" fn current_virtual_screen(_receiver: Id, _sel: Sel) -> isize {
     0
@@ -1959,6 +2186,16 @@ pub(crate) fn install() {
     });
 }
 
+#[cfg(test)]
+pub(crate) fn fit_viewport_for_test(object: Id, window: sdl3::Window, context: sdl3::GlContext) {
+    chrome_blit::fit_viewport(object, window, context);
+}
+
+#[cfg(test)]
+pub(crate) fn mask_logical_frame_for_test(object: Id, window: sdl3::Window) {
+    chrome_blit::mask_outside_logical_frame(object, window);
+}
+
 /// The chrome `crate::decor` paints, put over the top of a GL window's
 /// default framebuffer just before it is swapped.
 ///
@@ -1999,6 +2236,10 @@ mod chrome_blit {
     const COLOR_CLEAR_VALUE: u32 = 0x0C22;
     const COLOR_WRITEMASK: u32 = 0x0C23;
     const RASTERIZER_DISCARD: u32 = 0x8C89;
+    const DRAW_BUFFER: u32 = 0x0C01;
+    const DOUBLEBUFFER: u32 = 0x0C32;
+    const BACK: u32 = 0x0405;
+    const FRONT: u32 = 0x0404;
 
     #[allow(non_snake_case)]
     struct Gl {
@@ -2023,6 +2264,7 @@ mod chrome_blit {
         ClearColor: unsafe extern "C" fn(f32, f32, f32, f32),
         Clear: unsafe extern "C" fn(u32),
         Scissor: unsafe extern "C" fn(i32, i32, i32, i32),
+        DrawBuffer: unsafe extern "C" fn(u32),
     }
 
     impl Gl {
@@ -2055,6 +2297,7 @@ mod chrome_blit {
                 ClearColor: get(c"glClearColor")?,
                 Clear: get(c"glClear")?,
                 Scissor: get(c"glScissor")?,
+                DrawBuffer: get(c"glDrawBuffer")?,
             })
         }
     }
@@ -2073,57 +2316,274 @@ mod chrome_blit {
         static CACHED: RefCell<Vec<Cached>> = const { RefCell::new(Vec::new()) };
     }
 
-    /// The contexts whose first viewport has been fitted to a window's
-    /// content, as (context, window) addresses.
-    static FITTED: std::sync::Mutex<Vec<(usize, usize)>> = std::sync::Mutex::new(Vec::new());
+    const VIEWPORT: u32 = 0x0BA2;
 
-    /// Give a context made current on a decorated window, the first time,
-    /// a viewport of the content rather than of the whole frame.
-    ///
-    /// GL starts a context's viewport at its drawable's size, and a guest
-    /// that never sets one relies on that matching its view - which, under
-    /// the chrome, it no longer does.
+    #[derive(Clone, Copy)]
+    struct ViewportFit {
+        context: usize,
+        window: usize,
+        // Last viewport applied by AppKit, not a guest-supplied viewport.
+        applied: (i32, i32, i32, i32),
+        // Whether `applied` was the whole drawable, which a resize leaves be.
+        applied_whole: bool,
+        guest_owned: bool,
+    }
+
+    static FITTED: std::sync::Mutex<Vec<ViewportFit>> = std::sync::Mutex::new(Vec::new());
+
+    #[cfg(test)]
+    #[test]
+    fn fractional_gl_mask_matches_canonical_appkit_pixels_exactly() {
+        use foundation::geometry::{NSPoint, NSRect, NSSize};
+        for (surface, host, pixels) in [
+            (
+                NSRect {
+                    origin: NSPoint { x: 0.0, y: 0.5 },
+                    size: NSSize {
+                        width: 1440.0,
+                        height: 899.0,
+                    },
+                },
+                NSSize {
+                    width: 1440.0,
+                    height: 900.0,
+                },
+                (1440, 900),
+            ),
+            (
+                NSRect {
+                    origin: NSPoint { x: 0.5, y: 31.5 },
+                    size: NSSize {
+                        width: 1438.5,
+                        height: 868.0,
+                    },
+                },
+                NSSize {
+                    width: 1440.0,
+                    height: 900.0,
+                },
+                (1440, 900),
+            ),
+            (
+                NSRect {
+                    origin: NSPoint { x: 0.25, y: 0.25 },
+                    size: NSSize {
+                        width: 99.25,
+                        height: 79.25,
+                    },
+                },
+                NSSize {
+                    width: 100.0,
+                    height: 80.0,
+                },
+                (200, 160),
+            ),
+        ] {
+            let clip = crate::window::pixel_clip_from_surface(
+                surface,
+                (host.width as i32, host.height as i32),
+                pixels,
+            );
+            let gl = logical_viewport(surface, host, pixels, 0.0);
+            assert_eq!(gl, gl_rect_from_top_clip(clip, pixels.1));
+            assert_eq!(clip.y, pixels.1 - (gl.1 + gl.3));
+            assert_eq!(clip.y + clip.h, pixels.1 - gl.1);
+            assert_eq!(clip.x, gl.0);
+            assert_eq!(clip.x + clip.w, gl.0 + gl.2);
+        }
+    }
+
+    /// Convert the *already rounded* SDL/NSWindow top-origin pixel rectangle
+    /// into GL's bottom-origin coordinates. Rounding after reversing the Y
+    /// axis moves a half-point edge by a pixel because ties round toward +inf.
+    fn gl_rect_from_top_clip(clip: sdl3::Rect, pixel_height: i32) -> (i32, i32, i32, i32) {
+        (clip.x, pixel_height - clip.y - clip.h, clip.w, clip.h)
+    }
+
+    /// AppKit content view excludes a titlebar inset at the *top* of the
+    /// canonical logical frame. Round its end in top-origin coordinates too.
+    fn logical_viewport(
+        surface: foundation::geometry::NSRect,
+        host: foundation::geometry::NSSize,
+        pixels: (i32, i32),
+        inset: f64,
+    ) -> (i32, i32, i32, i32) {
+        let clip = crate::window::pixel_clip_from_surface(
+            surface,
+            (host.width as i32, host.height as i32),
+            pixels,
+        );
+        let (x, y, w, h) = gl_rect_from_top_clip(clip, pixels.1);
+        let top = ((surface.origin.y + inset) * f64::from(pixels.1) / host.height.max(1.0)).round()
+            as i32;
+        let top = top.clamp(clip.y, clip.y + clip.h);
+        (x, y, w, (clip.y + clip.h - top).clamp(0, h))
+    }
+
+    /// Initialize GL's default viewport for AppKit's drawable, and adjust it
+    /// when AppKit's logical content changes without rebinding the context.
+    /// If the guest explicitly replaces that viewport, leave its GL state alone.
     pub(super) fn fit_viewport(
         object: objc::object::Id,
         window: sdl3::Window,
         context: sdl3::GlContext,
     ) {
-        // SAFETY: null or a window this crate made.
-        if unsafe { crate::window::sdl_window(object) } != window {
-            // The hidden window a context waits in before it has a view.
+        if context.is_null() || unsafe { crate::window::sdl_window(object) } != window {
             return;
         }
-        let inset = crate::window::content_inset(object);
-        if inset <= 0.0 {
-            return;
-        }
-        {
-            let mut fitted = FITTED.lock().unwrap_or_else(|e| e.into_inner());
-            let key = (context as usize, window as usize);
-            if fitted.contains(&key) {
-                return;
-            }
-            fitted.push(key);
-        }
-        let (Some((points, _)), Some((width, height))) = (
+        let (Some(surface), Some((width, height)), Some(pixels)) = (
+            crate::window::surface_frame(object),
             sdl3::video::window_size(window),
             sdl3::video::window_size_in_pixels(window),
         ) else {
             return;
         };
-        let density = match points > 0 {
-            true => f64::from(width) / f64::from(points),
-            false => 1.0,
-        };
-        let Some(viewport) = sdl3::video::gl_proc_address(c"glViewport") else {
+        let target = logical_viewport(
+            surface,
+            foundation::geometry::NSSize {
+                width: f64::from(width),
+                height: f64::from(height),
+            },
+            pixels,
+            crate::window::content_inset(object),
+        );
+        let whole = target == (0, 0, pixels.0, pixels.1);
+        let mut fitted = FITTED.lock().unwrap_or_else(|e| e.into_inner());
+        // A viewport belongs to the context and survives SDL window rebinding.
+        let item = fitted
+            .iter_mut()
+            .find(|item| item.context == context as usize);
+        // Nothing to fit, so nothing to ask the driver: a guest's viewport,
+        // or a whole-drawable one that macOS does not change on a resize.
+        if let Some(item) = &item
+            && (item.guest_owned || (whole && item.applied_whole))
+        {
+            return;
+        }
+        type Viewport = (
+            unsafe extern "C" fn(u32, *mut i32),
+            unsafe extern "C" fn(i32, i32, i32, i32),
+        );
+        static ENTRY: std::sync::OnceLock<Option<Viewport>> = std::sync::OnceLock::new();
+        let Some((get, set)) = *ENTRY.get_or_init(|| {
+            let get = sdl3::video::gl_proc_address(c"glGetIntegerv")?;
+            let set = sdl3::video::gl_proc_address(c"glViewport")?;
+            // SAFETY: both GL entrypoints have stable C signatures.
+            Some(unsafe { (std::mem::transmute(get), std::mem::transmute(set)) })
+        }) else {
             return;
         };
-        let inset = (inset * density).round() as i32;
-        // SAFETY: `glViewport(GLint, GLint, GLsizei, GLsizei)` on the context
-        // just made current.
+        // SAFETY: the context supplied to this function is bound on the
+        // calling thread.
+        let mut actual = [0i32; 4];
+        unsafe { get(VIEWPORT, actual.as_mut_ptr()) };
+        let current = (actual[0], actual[1], actual[2], actual[3]);
+        if let Some(item) = item {
+            let inherited_ours = !item.guest_owned && current == item.applied;
+            if !inherited_ours {
+                item.guest_owned = true;
+            }
+            let switched_window = item.window != window as usize;
+            if switched_window {
+                item.window = window as usize;
+            }
+            if !inherited_ours || current == target {
+                return;
+            }
+            unsafe { set(target.0, target.1, target.2, target.3) };
+            item.applied = target;
+            item.applied_whole = whole;
+        } else {
+            // On a new context the GL default viewport is the entire surface.
+            // It is not a guest custom viewport unless it differs already.
+            let guest_owned = current != (0, 0, pixels.0, pixels.1);
+            if !guest_owned && current != target {
+                unsafe { set(target.0, target.1, target.2, target.3) };
+            }
+            fitted.push(ViewportFit {
+                context: context as usize,
+                window: window as usize,
+                applied: target,
+                applied_whole: whole,
+                guest_owned,
+            });
+        }
+    }
+
+    /// Suppress physical-container pixels outside the logical fullscreen window.
+    /// A viewport cannot constrain glClear or a guest-selected viewport; mask
+    /// only at presentation and restore the guest's GL state in full.
+    pub(super) fn mask_outside_logical_frame(object: objc::object::Id, window: sdl3::Window) {
+        if object.is_null()
+            || crate::window::fullscreen_frame(object).is_none()
+            || unsafe { crate::window::sdl_window(object) } != window
+        {
+            return;
+        }
+        let (Some(clip), Some(pixels)) = (
+            crate::window::presentation_clip(window),
+            sdl3::video::window_size_in_pixels(window),
+        ) else {
+            return;
+        };
+        let (x, y, w, h) = gl_rect_from_top_clip(clip, pixels.1);
+        if (x, y, w, h) == (0, 0, pixels.0, pixels.1) {
+            return;
+        }
+        static GL: std::sync::OnceLock<Option<Gl>> = std::sync::OnceLock::new();
+        let Some(gl) = GL.get_or_init(Gl::load) else {
+            return;
+        };
+        // SAFETY: all entrypoints refer to the current context. The default
+        // framebuffer is bound only temporarily and all changed state restored.
         unsafe {
-            let f: unsafe extern "C" fn(i32, i32, i32, i32) = std::mem::transmute(viewport);
-            f(0, 0, width, (height - inset).max(0));
+            let mut prev_draw = 0;
+            let mut prev_scissor = [0; 4];
+            let mut prev_color_mask = [0u8; 4];
+            let mut prev_clear = [0f32; 4];
+            (gl.GetIntegerv)(DRAW_FRAMEBUFFER_BINDING, &mut prev_draw);
+            (gl.GetIntegerv)(SCISSOR_BOX, prev_scissor.as_mut_ptr());
+            (gl.GetBooleanv)(COLOR_WRITEMASK, prev_color_mask.as_mut_ptr());
+            (gl.GetFloatv)(COLOR_CLEAR_VALUE, prev_clear.as_mut_ptr());
+            let scissor = (gl.IsEnabled)(SCISSOR_TEST) != 0;
+            let discard = (gl.IsEnabled)(RASTERIZER_DISCARD) != 0;
+            (gl.BindFramebuffer)(DRAW_FRAMEBUFFER, 0);
+            let mut prev_buffer = 0;
+            let mut double = 0;
+            (gl.GetIntegerv)(DRAW_BUFFER, &mut prev_buffer);
+            (gl.GetIntegerv)(DOUBLEBUFFER, &mut double);
+            (gl.DrawBuffer)(if double != 0 { BACK } else { FRONT });
+            (gl.Enable)(SCISSOR_TEST);
+            (gl.Disable)(RASTERIZER_DISCARD);
+            (gl.ColorMask)(1, 1, 1, 1);
+            (gl.ClearColor)(0.0, 0.0, 0.0, 1.0);
+            // GL counts rows from the bottom; the bands only need the same
+            // axis as the rectangle they surround.
+            for band in (sdl3::Rect { x, y, w, h }).complements(pixels) {
+                (gl.Scissor)(band.x, band.y, band.w, band.h);
+                (gl.Clear)(COLOR_BUFFER_BIT);
+            }
+            (gl.ClearColor)(prev_clear[0], prev_clear[1], prev_clear[2], prev_clear[3]);
+            (gl.ColorMask)(
+                prev_color_mask[0],
+                prev_color_mask[1],
+                prev_color_mask[2],
+                prev_color_mask[3],
+            );
+            (gl.Scissor)(
+                prev_scissor[0],
+                prev_scissor[1],
+                prev_scissor[2],
+                prev_scissor[3],
+            );
+            if !scissor {
+                (gl.Disable)(SCISSOR_TEST);
+            }
+            if discard {
+                (gl.Enable)(RASTERIZER_DISCARD);
+            }
+            (gl.DrawBuffer)(prev_buffer as u32);
+            (gl.BindFramebuffer)(DRAW_FRAMEBUFFER, prev_draw as u32);
         }
     }
 
@@ -2343,6 +2803,47 @@ mod chrome_blit {
             (gl.PixelStorei)(UNPACK_SKIP_PIXELS, unpack[3]);
             (gl.BindFramebuffer)(READ_FRAMEBUFFER, read as u32);
             (gl.BindFramebuffer)(DRAW_FRAMEBUFFER, draw as u32);
+        }
+    }
+    #[cfg(test)]
+    mod viewport_tests {
+        use super::*;
+        use foundation::geometry::{NSPoint, NSRect, NSSize};
+
+        #[test]
+        fn fractional_edges_preserve_retina_pixels() {
+            let host = NSSize {
+                width: 1440.0,
+                height: 900.0,
+            };
+            let rect = NSRect {
+                origin: NSPoint { x: 0.5, y: 0.5 },
+                size: NSSize {
+                    width: 1439.0,
+                    height: 899.0,
+                },
+            };
+            assert_eq!(
+                logical_viewport(rect, host, (1440, 900), 0.0),
+                // Pixel Y=0 is included by the canonical top-origin clip:
+                // [1,900) maps to GL [0,899), not independently rounded [1,900).
+                (1, 0, 1439, 899)
+            );
+            assert_eq!(
+                logical_viewport(rect, host, (2880, 1800), 0.0),
+                (1, 1, 2878, 1798)
+            );
+            let changed = NSRect {
+                origin: rect.origin,
+                size: NSSize {
+                    width: 1439.5,
+                    height: 899.5,
+                },
+            };
+            assert_eq!(
+                logical_viewport(changed, host, (2880, 1800), 0.0),
+                (1, 0, 2879, 1799)
+            );
         }
     }
 }

@@ -1,6 +1,6 @@
 # CLAUDE.md
 
-This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+This file provides guidance to AI agents when working with code in this repository.
 
 ## What this is
 
@@ -105,6 +105,13 @@ and AArch64 ABIs differ enough that bridging isn't attempted — most C++ calls 
 * Put platform-specific behavior in `darwin`, not behind conditionals scattered through the runtime.
 * Keep `machish` free of `std`.
 * Comments should be short, ASCII-only, and explain *why* a constraint exists — not narrate what the code does.
+* Semantic accuracy, simplicity, and self-explanatory code is prioritized over everything else. Do not write program-specific
+  hacks, rejection over approximation. If you must have some inaccurate behavior, mark it as such with `FIXME (ACCURACY)`
+  comments explaining the inaccuracy.
+* Do not write entire paragraphs worth of comments — if code needs heavy commenting, consider if the approach could be more
+  self-explanatory. Heavy commenting is permitted if the code is genuinely complex, if it's something simple like flag translation,
+  it likely does not need entire paragraphs.
+* Do not use "magic numbers". Assign constants or enums where macOS would, and in your own code where it is appropriate.
 
 ## Testing conventions
 
@@ -116,6 +123,8 @@ and AArch64 ABIs differ enough that bridging isn't attempted — most C++ calls 
 * Most LLDB tests need a Mach-O guest and skip on Linux. `lldb_symbolicates_a_published_region` is the exception
   (covers the ELF symbol file) and runs everywhere. On macOS, LLDB tests need
   `ROSEMARY_ENABLE_PRIVILEGED_TESTS` and will prompt for developer-tools access.
+* Do not make giant "mega tests". Condense the tests down to just semantic accuracy — complex subsystem interaction
+  tests are only permitted if it is to ensure semantic accuracy.
 
 ## Commits and PRs
 

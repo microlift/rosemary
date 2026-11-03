@@ -1220,7 +1220,7 @@ pub fn tick(engine: &Engine) {
                     scale: density,
                     suspended: !shown,
                     monitor: monitor_of(frame.window),
-                    dmabuf: appkit::backing::shows_dmabufs(frame.window),
+                    dmabuf: appkit::backing::shows_dmabufs_for_view(frame.window, object as usize),
                 })
             }
             // Off every window: keep the size, and stop drawing.

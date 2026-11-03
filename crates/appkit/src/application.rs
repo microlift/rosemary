@@ -231,10 +231,15 @@ unsafe extern "C" fn finish_launching(receiver: Id, _sel: Sel) {
         if name == DID_FINISH_LAUNCHING {
             // SAFETY: an application, and a delegate the program set.
             unsafe { open_launch_urls(receiver, delegate) };
-            foundation::appleevent::raise(
-                foundation::appleevent::CORE_EVENT_CLASS,
-                foundation::appleevent::OPEN_APPLICATION,
-            );
+            // A launch with documents opens them instead of announcing a bare
+            // launch, which is what would make an untitled document.
+            // SAFETY: as above.
+            if !unsafe { open_launch_files(receiver, delegate) } {
+                foundation::appleevent::raise(
+                    foundation::appleevent::CORE_EVENT_CLASS,
+                    foundation::appleevent::OPEN_APPLICATION,
+                );
+            }
         }
         let notification = foundation::notification::make(name, receiver, std::ptr::null_mut());
         // SAFETY: a delegate method is `void (id, SEL, NSNotification *)`.
@@ -278,6 +283,138 @@ unsafe fn open_launch_urls(receiver: Id, delegate: Id) {
     }
     // SAFETY: the caller's.
     unsafe { send_open_urls(receiver, delegate, &urls) };
+}
+
+/// The files named on the command line, as AppKit opens them: every
+/// argument that is not an option (`-Key value` pairs are the argument domain's)
+/// or a URL and names a file that exists, made absolute against the working
+/// directory.
+fn launch_files() -> Vec<String> {
+    let arguments: Vec<String> = foundation::processinfo::guest_arguments()
+        .iter()
+        .skip(1)
+        .filter_map(|argument| argument.to_str().map(str::to_owned))
+        .collect();
+    let manager = {
+        let class = objc::class::lookup(c"NSFileManager").expect("Foundation registered it");
+        // SAFETY: `id (Class, SEL)`.
+        unsafe {
+            let f: unsafe extern "C" fn(Id, Sel) -> Id = std::mem::transmute(objc::msg::entry());
+            f(
+                objc::class::ptr(class) as Id,
+                objc::sel::get("defaultManager"),
+            )
+        }
+    };
+    let directory = {
+        // SAFETY: `NSString * (id, SEL)`.
+        let path = unsafe {
+            let f: unsafe extern "C" fn(Id, Sel) -> Id = std::mem::transmute(objc::msg::entry());
+            f(manager, objc::sel::get("currentDirectoryPath"))
+        };
+        // SAFETY: a string or nil.
+        String::from_utf8_lossy(&unsafe { foundation::string::bytes(path) }).into_owned()
+    };
+    let exists = |path: &str| {
+        let string = foundation::string::from_str(path);
+        // SAFETY: `BOOL (id, SEL, NSString *)`.
+        let found = unsafe {
+            let f: unsafe extern "C" fn(Id, Sel, Id) -> u8 =
+                std::mem::transmute(objc::msg::entry());
+            f(manager, objc::sel::get("fileExistsAtPath:"), string)
+        } != 0;
+        objc::arc::release(string);
+        found
+    };
+    let mut files = Vec::new();
+    let mut arguments = arguments.into_iter();
+    while let Some(argument) = arguments.next() {
+        if argument.starts_with("-psn_") {
+            continue;
+        }
+        if argument.starts_with('-') {
+            arguments.next();
+            continue;
+        }
+        if crate::launch::is_launch_url(&argument) {
+            continue;
+        }
+        let path = match argument.starts_with('/') {
+            true => argument,
+            false => format!("{}/{argument}", directory.trim_end_matches('/')),
+        };
+        if exists(&path) {
+            files.push(path);
+        }
+    }
+    files
+}
+
+/// `-[delegate application:openFiles:]`, or `-application:openFile:` for
+/// each, for the files named on the command line. False when there are none
+/// or the delegate takes neither.
+///
+/// # Safety
+///
+/// `receiver` is an application and `delegate` is null or live.
+unsafe fn open_launch_files(receiver: Id, delegate: Id) -> bool {
+    if delegate.is_null() {
+        return false;
+    }
+    let files = launch_files();
+    if files.is_empty() {
+        return false;
+    }
+    // SAFETY: a live delegate.
+    let class = unsafe { objc::object::class_of(delegate) };
+    let responds = |sel: &str| class.is_some_and(|c| c.method(objc::sel::get(sel)).is_some());
+    let strings: Vec<Id> = files
+        .iter()
+        .map(|f| foundation::string::from_str(f))
+        .collect();
+    let opened = if responds("application:openFiles:") {
+        let array = corefoundation::collections::new_array(
+            &strings
+                .iter()
+                .map(|s| *s as corefoundation::base::CFTypeRef)
+                .collect::<Vec<_>>(),
+            corefoundation::callbacks::Policy::from_type_callbacks(),
+            false,
+        );
+        // SAFETY: `void (id, SEL, NSApplication *, NSArray<NSString *> *)`.
+        unsafe {
+            let f: unsafe extern "C" fn(Id, Sel, Id, Id) = std::mem::transmute(objc::msg::entry());
+            f(
+                delegate,
+                objc::sel::get("application:openFiles:"),
+                receiver,
+                array as Id,
+            );
+            corefoundation::api::CFRelease(array);
+        }
+        true
+    } else if responds("application:openFile:") {
+        for string in &strings {
+            // SAFETY: `BOOL (id, SEL, NSApplication *, NSString *)`.
+            unsafe {
+                let f: unsafe extern "C" fn(Id, Sel, Id, Id) -> u8 =
+                    std::mem::transmute(objc::msg::entry());
+                f(
+                    delegate,
+                    objc::sel::get("application:openFile:"),
+                    receiver,
+                    *string,
+                );
+            }
+        }
+        true
+    } else {
+        false
+    };
+    for string in strings {
+        objc::arc::release(string);
+    }
+    opened
 }
 
 /// The delegate of the shared application, or nil.
@@ -408,18 +545,17 @@ unsafe fn turn_in_pool(receiver: Id, mode: &str) {
     unsafe { service_run_loop(mode, 0.002) };
 }
 
-/// Drain the main queue and run the main run loop in `mode` for `seconds`.
+/// Run the main run loop in `mode` for `seconds`, which also drains the main
+/// queue in the common modes.
 ///
-/// The main queue is drained here because this is the main thread: a block sent
-/// to it with `dispatch_async` runs nowhere else. The slice is short because the
-/// run loop's timers are what drive a frame - see `corevideo` - and the window
-/// system is pumped between slices, not by the loop.
+/// The slice is short because the run loop's timers are what drive a frame -
+/// see `corevideo` - and the window system is pumped between slices, not by the
+/// loop.
 ///
 /// # Safety
 ///
 /// Called on the main thread, from a place a run loop callback may reenter.
 unsafe fn service_run_loop(mode: &str, seconds: f64) {
-    darwin::dispatch::queue::drain_main();
     // Returning after a source lets an event posted from another thread be sent
     // now rather than when the slice ends - see `POSTED_SOURCE`.
     let result = corefoundation::runloop::main().run_in_mode(mode, seconds, true);
@@ -621,8 +757,53 @@ pub(crate) fn check_last_window_closed() {
 /// window to bring forward.
 unsafe extern "C" fn activate(_receiver: Id, _sel: Sel, _flag: u8) {}
 
-/// `-setActivationPolicy:`, which answers that it succeeded.
-unsafe extern "C" fn set_activation_policy(_receiver: Id, _sel: Sel, _policy: isize) -> u8 {
+/// `NSApplicationActivationPolicy`.
+mod activation_policy {
+    pub const REGULAR: isize = 0;
+    pub const ACCESSORY: isize = 1;
+    pub const PROHIBITED: isize = 2;
+}
+
+/// What `-setActivationPolicy:` was last told, or `UNSET` before then.
+static ACTIVATION_POLICY: std::sync::atomic::AtomicIsize =
+    std::sync::atomic::AtomicIsize::new(UNSET_POLICY);
+const UNSET_POLICY: isize = -1;
+
+/// The policy Launch Services starts a bundle with, from its `Info.plist`.
+fn initial_activation_policy() -> isize {
+    use corefoundation::plist::Value;
+    let claims = |key: &str| {
+        foundation::bundle::main()
+            .and_then(|bundle| bundle.info.get(key))
+            .is_some_and(|value| match value {
+                Value::Bool(set) => *set,
+                Value::Integer(set) => *set != 0,
+                Value::String(set) => matches!(set.as_str(), "1" | "YES" | "true"),
+                _ => false,
+            })
+    };
+    match (claims("LSBackgroundOnly"), claims("LSUIElement")) {
+        (true, _) => activation_policy::PROHIBITED,
+        (_, true) => activation_policy::ACCESSORY,
+        _ => activation_policy::REGULAR,
+    }
+}
+
+/// `-activationPolicy`, read back as it was set.
+unsafe extern "C" fn activation_policy_of(_receiver: Id, _sel: Sel) -> isize {
+    match ACTIVATION_POLICY.load(std::sync::atomic::Ordering::Acquire) {
+        UNSET_POLICY => initial_activation_policy(),
+        policy => policy,
+    }
+}
+
+/// `-setActivationPolicy:`, kept so it reads back; there is no Dock or menu
+/// bar here for it to change.
+unsafe extern "C" fn set_activation_policy(_receiver: Id, _sel: Sel, policy: isize) -> u8 {
+    if !(activation_policy::REGULAR..=activation_policy::PROHIBITED).contains(&policy) {
+        return 0;
+    }
+    ACTIVATION_POLICY.store(policy, std::sync::atomic::Ordering::Release);
     1
 }
 
@@ -668,6 +849,27 @@ unsafe extern "C" fn window_with_window_number(_receiver: Id, _sel: Sel, number:
 unsafe extern "C" fn windows(_receiver: Id, _sel: Sel) -> Id {
     let objects: Vec<corefoundation::base::CFTypeRef> = crate::window::all()
         .into_iter()
+        .map(|w| w as corefoundation::base::CFTypeRef)
+        .collect();
+    let array = corefoundation::collections::new_array(
+        &objects,
+        corefoundation::callbacks::Policy::from_type_callbacks(),
+        false,
+    );
+    // SAFETY: a fresh array.
+    unsafe { corefoundation::api::CFAutorelease(array) as Id }
+}
+
+/// `-orderedWindows`: front to back, and without panels, which Apple leaves
+/// out as not scriptable.
+unsafe extern "C" fn ordered_windows(_receiver: Id, _sel: Sel) -> Id {
+    let panel = objc::class::lookup(c"NSPanel");
+    let objects: Vec<corefoundation::base::CFTypeRef> = crate::window::front_to_back()
+        .into_iter()
+        .filter(|w| {
+            // SAFETY: a live window of this crate's.
+            !panel.is_some_and(|p| unsafe { corefoundation::base::is_kind_of(w.cast(), p) })
+        })
         .map(|w| w as corefoundation::base::CFTypeRef)
         .collect();
     let array = corefoundation::collections::new_array(
@@ -808,7 +1010,11 @@ pub(crate) unsafe fn send_event_through(receiver: Id, event: Id) {
 }
 
 /// `-currentEvent`, the event inside `-sendEvent:`, and nil outside it.
-unsafe extern "C" fn current_event(_receiver: Id, _sel: Sel) -> Id {
+unsafe extern "C" fn register_services(_receiver: Id, _sel: Sel, _send: Id, _return: Id) {}
+
+unsafe extern "C" fn reply_to_open_or_print(_receiver: Id, _sel: Sel, _reply: usize) {}
+
+pub(crate) unsafe extern "C" fn current_event(_receiver: Id, _sel: Sel) -> Id {
     CURRENT_EVENT.load(Ordering::Acquire) as Id
 }
 
@@ -990,6 +1196,23 @@ unsafe fn send_if_implemented(target: Id, selector: &str, argument: Id) {
     unsafe { f(target, sel, argument) };
 }
 
+/// `BOOL NSApplicationLoad(void)`: makes sure `NSApp` exists - the program's
+/// own, if it made one - so Cocoa can be used from code that did not start
+/// with `NSApplicationMain`.
+#[expect(non_snake_case, reason = "the C spelling is the interface")]
+pub unsafe extern "C" fn NSApplicationLoad() -> u8 {
+    crate::bootstrap();
+    let class = objc::class::lookup(c"NSApplication").expect("declared during bootstrap");
+    // SAFETY: `+sharedApplication` is `id (Class, SEL)`, installed on this class.
+    let app = unsafe {
+        shared_application(
+            objc::class::ptr(class) as Id,
+            objc::sel::get("sharedApplication"),
+        )
+    };
+    u8::from(!app.is_null())
+}
+
 /// `int NSApplicationMain(int argc, const char *argv[])`.
 ///
 /// The arguments are ignored, as Apple's are: everything it needs is in the
@@ -1096,11 +1319,13 @@ pub(crate) fn install() {
         "terminate:" => terminate, c"v24@0:8@16";
         "activateIgnoringOtherApps:" => activate, c"v20@0:8c16";
         "setActivationPolicy:" => set_activation_policy, c"c24@0:8q16";
+        "activationPolicy" => activation_policy_of, c"q16@0:8";
         "currentSystemPresentationOptions" => presentation_options, c"Q16@0:8";
         "presentationOptions" => presentation_options, c"Q16@0:8";
         "setPresentationOptions:" => set_presentation_options, c"v24@0:8Q16";
         "nextEventMatchingMask:untilDate:inMode:dequeue:" => next_event, c"@48@0:8Q16@24@32B40";
         "windows" => windows, c"@16@0:8";
+        "orderedWindows" => ordered_windows, c"@16@0:8";
         "enumerateWindowsWithOptions:usingBlock:" => enumerate_windows, c"v32@0:8Q16@?24";
         "windowWithWindowNumber:" => window_with_window_number, c"@24@0:8q16";
         "keyWindow" => key_window, c"@16@0:8";
@@ -1115,6 +1340,11 @@ pub(crate) fn install() {
         "setDockMenu:" => set_menu_for, c"v24@0:8@16";
         "postEvent:atStart:" => post_event, c"v28@0:8@16B24";
         "currentEvent" => current_event, c"@16@0:8";
+        // Documents opened by command-line arguments, not an Apple Event, so
+        // there is no reply to send.
+        "replyToOpenOrPrint:" => reply_to_open_or_print, c"v24@0:8Q16";
+        // There is no Services menu to offer types to.
+        "registerServicesMenuSendTypes:returnTypes:" => register_services, c"v32@0:8@16@24";
         "sendEvent:" => send_event, c"v24@0:8@16";
         // Private: the window server's hit-testing cache, which this runtime
         // has none of. Gecko drops a hidden popup from it.
@@ -1142,7 +1372,8 @@ pub(crate) fn install() {
         "stopModal" => stop_modal, c"v16@0:8";
         "stopModalWithCode:" => stop_modal_with_code, c"v24@0:8q16";
         "occlusionState" => crate::window::visible_occlusion, c"Q16@0:8";
-        "endSheet:" => ignored_sender, c"v24@0:8@16";
+        "endSheet:" => crate::sheet::application_end_sheet, c"v24@0:8@16";
+        "endSheet:returnCode:" => crate::sheet::application_end_sheet_with_code, c"v32@0:8@16q24";
         "abortModal" => stop_modal, c"v16@0:8";
     });
 }
@@ -1411,6 +1642,9 @@ mod tests {
     /// `-run` turns the run loop, and `-stop:` ends it.
     #[test]
     fn run_services_the_run_loop_until_it_is_stopped() {
+        if !sdl3::isolated::run_here() {
+            return;
+        }
         crate::bootstrap();
         static FIRED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
         static APP: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
@@ -1449,12 +1683,24 @@ mod tests {
 
     #[test]
     fn what_a_turn_autoreleases_is_released_when_it_ends() {
+        if !sdl3::isolated::run_here() {
+            return;
+        }
         crate::bootstrap();
         static OBJECT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        thread_local! {
+            static PERFORMED: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+        }
 
+        // The main loop is shared with every other test in the process, so
+        // another test's turn may service the source; only this one counts.
         unsafe extern "C" fn perform(_info: *mut std::ffi::c_void) {
+            if PERFORMED.get().is_none() {
+                return;
+            }
             let object = OBJECT.load(std::sync::atomic::Ordering::SeqCst) as Id;
             objc::arc::autorelease(objc::arc::retain(object));
+            PERFORMED.set(Some(true));
         }
 
         let app = objc::object::create_instance(
@@ -1467,14 +1713,23 @@ mod tests {
         let source = corefoundation::runloop::new_source(Some(perform), 0);
         let loop_ = corefoundation::runloop::main();
         loop_.add_source(&source, corefoundation::runloop::DEFAULT_MODE);
-        source.signal();
+        PERFORMED.set(Some(false));
 
         let outer = objc::arc::pool_push();
-        // SAFETY: `app` is an application.
-        unsafe { turn(app, corefoundation::runloop::DEFAULT_MODE) };
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while PERFORMED.get() != Some(true) && std::time::Instant::now() < deadline {
+            source.signal();
+            // SAFETY: `app` is an application.
+            unsafe { turn(app, corefoundation::runloop::DEFAULT_MODE) };
+        }
+        assert_eq!(PERFORMED.get(), Some(true), "the source never fired here");
         assert_eq!(objc::arc::retain_count(object), 1);
         objc::arc::pool_pop(outer);
         loop_.remove_source(&source, corefoundation::runloop::DEFAULT_MODE);
         objc::arc::release(object);
     }
 }
+
+/// `void NSBeep(void)`: the alert sound. There is no system sound to play.
+#[allow(non_snake_case)]
+pub extern "C" fn NSBeep() {}

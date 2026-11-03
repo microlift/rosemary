@@ -8,6 +8,10 @@
 //! on the thread (a GL driver's, say) reads through a stack frame. Each host
 //! thread therefore gets a block of Darwin's size for the guest to hold, and
 //! every call that takes a `pthread_t` maps it back first.
+//!
+//! As in libpthread, the block also holds the thread's TSD array, the one its
+//! thread pointer addresses: Mono, for one, reads another thread's
+//! thread-specific data at `pthread_t + TSD_OFFSET + key * 8`.
 
 #[cfg(not(target_os = "macos"))]
 mod imp {
@@ -15,8 +19,13 @@ mod imp {
     use std::collections::HashMap;
     use std::sync::{LazyLock, Mutex};
 
-    /// `sizeof(struct _opaque_pthread_t)`, in words.
-    const WORDS: usize = 8192 / 8;
+    /// `sizeof(struct _opaque_pthread_t)`.
+    pub const SIZE: usize = 8192;
+
+    /// `_PTHREAD_STRUCT_DIRECT_TSD_OFFSET`: where `struct _pthread` keeps `tsd`.
+    pub const TSD_OFFSET: usize = 0xe0;
+
+    const WORDS: usize = SIZE / 8;
 
     /// `_PTHREAD_SIG`, which `__sig` holds for a live thread.
     const SIG: u64 = 0x5448_5244;
@@ -87,6 +96,9 @@ mod imp {
         unsafe { (guest as *mut u64).add(CLEANUP_STACK).write(0) };
     }
 }
+
+#[cfg(not(target_os = "macos"))]
+pub use imp::{SIZE, TSD_OFFSET};
 
 #[cfg(target_os = "macos")]
 mod imp {

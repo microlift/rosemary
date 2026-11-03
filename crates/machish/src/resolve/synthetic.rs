@@ -21,6 +21,7 @@ use crate::resolve::{Resolved, SymbolKind, SymbolProvider};
 pub struct SyntheticDylib {
     install_name: String,
     aliases: Vec<String>,
+    reexports: Vec<String>,
     flat: bool,
     symbols: BTreeMap<String, Resolved>,
 }
@@ -31,6 +32,7 @@ impl SyntheticDylib {
         SyntheticDylib {
             install_name: install_name.to_string(),
             aliases: Vec::new(),
+            reexports: Vec::new(),
             flat: false,
             symbols: BTreeMap::new(),
         }
@@ -43,6 +45,14 @@ impl SyntheticDylib {
     /// Also answer to `install_name`, for umbrellas and re-export chains.
     pub fn alias(&mut self, install_name: &str) -> &mut Self {
         self.aliases.push(install_name.to_string());
+        self
+    }
+
+    /// Re-export the real image `install_name`, as the library this stands
+    /// for does: the loader fetches it, and what this does not define is
+    /// looked for there. See [`SymbolProvider::reexports`].
+    pub fn reexport(&mut self, install_name: &str) -> &mut Self {
+        self.reexports.push(install_name.to_string());
         self
     }
 
@@ -102,6 +112,13 @@ impl SymbolProvider for SyntheticDylib {
 
     fn stands_for(&self, install_name: &str) -> bool {
         self.install_name == install_name || self.aliases.iter().any(|a| a == install_name)
+    }
+
+    fn reexports(&self, install_name: &str) -> Vec<String> {
+        match self.stands_for(install_name) {
+            true => self.reexports.clone(),
+            false => Vec::new(),
+        }
     }
 
     fn resolve(&self, sym: &SymbolRef<'_>) -> Option<Resolved> {
@@ -186,6 +203,30 @@ mod tests {
 
         umbrella.flat(true);
         assert!(umbrella.provides("/usr/lib/libobjc.A.dylib"));
+    }
+
+    /// The umbrella's own definitions first, then the image it re-exports,
+    /// and only then whatever comes after it in the chain.
+    #[test]
+    fn a_two_level_import_follows_the_stand_ins_reexport() {
+        let mut umbrella = SyntheticDylib::new("/usr/lib/libSystem.B.dylib");
+        umbrella
+            .reexport("/usr/lib/libcopyfile.dylib")
+            .define_fn("_write", 0x1111 as *const ());
+        let mut copyfile = SyntheticDylib::new("/usr/lib/libcopyfile.dylib");
+        copyfile.define_fn("_copyfile", 0x2222 as *const ());
+        let mut fallback = SyntheticDylib::new("fallback");
+        fallback
+            .flat(true)
+            .define_fn("_copyfile", 0x3333 as *const ());
+        let providers: [&dyn SymbolProvider; 3] = [&umbrella, &copyfile, &fallback];
+
+        let system = LibraryRef::InstallName("/usr/lib/libSystem.B.dylib");
+        let found = |name| resolve_in(&providers, &sym(name, system)).map(|r| r.addr);
+        assert_eq!(found("_write"), Some(0x1111));
+        assert_eq!(found("_copyfile"), Some(0x2222));
+        assert_eq!(found("_missing"), None);
+        assert!(umbrella.reexports("/usr/lib/libobjc.A.dylib").is_empty());
     }
 
     #[test]

@@ -425,6 +425,148 @@ mod xml {
     }
 }
 
+/// The binary spelling of `value` (`bplist00`), which is what
+/// `kCFPropertyListBinaryFormat_v1_0` asks for. Objects are not shared: each
+/// value is written where it occurs.
+pub fn write_binary(value: &Value) -> Vec<u8> {
+    /// One object to write: a value, or a dictionary key, which is a string
+    /// the dictionary holds as text rather than as a `Value`.
+    enum Item<'a> {
+        Value(&'a Value),
+        Key(&'a str),
+    }
+    // Every object, flattened, with the key and value references each
+    // container holds.
+    fn flatten<'a>(
+        value: &'a Value,
+        objects: &mut Vec<(Item<'a>, Vec<usize>, Vec<usize>)>,
+    ) -> usize {
+        let at = objects.len();
+        objects.push((Item::Value(value), Vec::new(), Vec::new()));
+        match value {
+            Value::Array(items) => {
+                let refs: Vec<usize> = items.iter().map(|v| flatten(v, objects)).collect();
+                objects[at].2 = refs;
+            }
+            Value::Dictionary(entries) => {
+                let mut keys = Vec::new();
+                let mut values = Vec::new();
+                for (key, item) in entries {
+                    keys.push(objects.len());
+                    objects.push((Item::Key(key), Vec::new(), Vec::new()));
+                    values.push(flatten(item, objects));
+                }
+                objects[at].1 = keys;
+                objects[at].2 = values;
+            }
+            _ => {}
+        }
+        at
+    }
+    let mut objects = Vec::new();
+    flatten(value, &mut objects);
+    let width = |max: u64| match max {
+        0..=0xFF => 1u8,
+        0x100..=0xFFFF => 2,
+        0x1_0000..=0xFFFF_FFFF => 4,
+        _ => 8,
+    };
+    let ref_size = width(objects.len() as u64);
+    let push_sized = |out: &mut Vec<u8>, value: u64, size: u8| {
+        out.extend_from_slice(&value.to_be_bytes()[8 - size as usize..]);
+    };
+    let push_header = |out: &mut Vec<u8>, marker: u8, count: usize| {
+        if count < 15 {
+            out.push(marker | count as u8);
+        } else {
+            out.push(marker | 0x0F);
+            let size = width(count as u64);
+            out.push(0x10 | size.trailing_zeros() as u8);
+            push_sized(out, count as u64, size);
+        }
+    };
+    let mut out = b"bplist00".to_vec();
+    let mut offsets = Vec::with_capacity(objects.len());
+    for (item, keys, refs) in &objects {
+        offsets.push(out.len() as u64);
+        let key;
+        let value = match item {
+            Item::Value(value) => *value,
+            Item::Key(text) => {
+                key = Value::String(text.to_string());
+                &key
+            }
+        };
+        match value {
+            Value::Null => out.push(0x00),
+            Value::Bool(false) => out.push(0x08),
+            Value::Bool(true) => out.push(0x09),
+            Value::Integer(v) => {
+                let size = match *v < 0 {
+                    true => 8,
+                    false => width(*v as u64),
+                };
+                out.push(0x10 | size.trailing_zeros() as u8);
+                push_sized(&mut out, *v as u64, size);
+            }
+            Value::Real(v) => {
+                out.push(0x23);
+                out.extend_from_slice(&v.to_be_bytes());
+            }
+            Value::Date(v) => {
+                out.push(0x33);
+                out.extend_from_slice(&v.to_be_bytes());
+            }
+            Value::Data(bytes) => {
+                push_header(&mut out, 0x40, bytes.len());
+                out.extend_from_slice(bytes);
+            }
+            Value::String(text) if text.is_ascii() => {
+                push_header(&mut out, 0x50, text.len());
+                out.extend_from_slice(text.as_bytes());
+            }
+            Value::String(text) => {
+                let units: Vec<u16> = text.encode_utf16().collect();
+                push_header(&mut out, 0x60, units.len());
+                for unit in units {
+                    out.extend_from_slice(&unit.to_be_bytes());
+                }
+            }
+            Value::Uid(v) => {
+                let size = width(*v);
+                out.push(0x80 | (size - 1));
+                push_sized(&mut out, *v, size);
+            }
+            Value::Array(_) => {
+                push_header(&mut out, 0xA0, refs.len());
+                for r in refs {
+                    push_sized(&mut out, *r as u64, ref_size);
+                }
+            }
+            Value::Dictionary(_) => {
+                push_header(&mut out, 0xD0, refs.len());
+                for r in keys.iter().chain(refs) {
+                    push_sized(&mut out, *r as u64, ref_size);
+                }
+            }
+            // Nothing a writer is handed holds one: it is only ever read.
+            Value::Unsupported(_) => out.push(0x00),
+        }
+    }
+    let table_at = out.len() as u64;
+    let offset_size = width(table_at);
+    for offset in &offsets {
+        push_sized(&mut out, *offset, offset_size);
+    }
+    out.extend_from_slice(&[0; 6]);
+    out.push(offset_size);
+    out.push(ref_size);
+    out.extend_from_slice(&(objects.len() as u64).to_be_bytes());
+    out.extend_from_slice(&0u64.to_be_bytes());
+    out.extend_from_slice(&table_at.to_be_bytes());
+    out
+}
+
 /// The XML spelling of `value`, which is what Apple's own tools read and what
 /// `defaults read` shows. Dictionary keys come out sorted.
 pub fn write_xml(value: &Value) -> Vec<u8> {
@@ -644,6 +786,33 @@ mod tests {
     fn a_date_is_written_in_iso_8601() {
         assert_eq!(format_date(0.0), "2001-01-01T00:00:00Z");
         assert_eq!(xml::parse_date("2001-01-02T00:00:01Z"), Some(86401.0));
+    }
+
+    #[test]
+    fn a_written_binary_plist_reads_back_the_same() {
+        let mut inner = BTreeMap::new();
+        inner.insert(
+            "caf\u{e9}".to_string(),
+            Value::String("\u{1F600} text".into()),
+        );
+        inner.insert("n".to_string(), Value::Integer(-7));
+        let mut top = BTreeMap::new();
+        top.insert(
+            "array".to_string(),
+            Value::Array(vec![
+                Value::Bool(true),
+                Value::Bool(false),
+                Value::Integer(300),
+                Value::Integer(1 << 40),
+                Value::Real(2.5),
+                Value::Date(1.0e8),
+                Value::Data(vec![0; 20]),
+                Value::String("x".repeat(40)),
+            ]),
+        );
+        top.insert("inner".to_string(), Value::Dictionary(inner));
+        let value = Value::Dictionary(top);
+        assert_eq!(parse(&write_binary(&value)), Ok(value));
     }
 
     #[test]

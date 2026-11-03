@@ -2505,6 +2505,17 @@ fn threaded_stress(t: &mut T) {
     }
 }
 
+/// The thread `fork_while_allocating` starts in its child; `mark` is the
+/// shared step marker.
+extern "C" fn allocate_on_a_forked_thread(mark: *mut c_void) -> *mut c_void {
+    // SAFETY: the child passes its live shared marker.
+    unsafe {
+        (*mark.cast::<AtomicUsize>()).store(4, Ordering::SeqCst);
+        m::free(m::malloc(32));
+    }
+    std::ptr::null_mut()
+}
+
 /// The prepare handler holds every lock across `fork`, so a child can always
 /// allocate, create a zone or start a thread. Other threads churn zones while
 /// the main thread forks; each child marks shared memory before each step so
@@ -2567,6 +2578,8 @@ fn fork_while_allocating(t: &mut T) {
             (*mark).store(0, Ordering::SeqCst);
             let pid = libc::fork();
             if pid == 0 {
+                // Yama is Linux's; elsewhere nothing stops the attach.
+                #[cfg(target_os = "linux")]
                 if stacks {
                     libc::prctl(libc::PR_SET_PTRACER, libc::PR_SET_PTRACER_ANY);
                 }
@@ -2577,13 +2590,18 @@ fn fork_while_allocating(t: &mut T) {
                 m::free(p);
                 m::malloc_destroy_zone(zone);
                 (*mark).store(3, Ordering::SeqCst);
-                let shared = mark as usize;
-                std::thread::spawn(move || {
-                    (*(shared as *const AtomicUsize)).store(4, Ordering::SeqCst);
-                    m::free(m::malloc(32))
-                })
-                .join()
-                .unwrap();
+                // Not `std::thread::spawn`: std's own thread bookkeeping lock
+                // can be inherited held from a parent thread, and it has no
+                // fork handler. glibc's thread creation does.
+                let mut thread = std::mem::zeroed();
+                let created = libc::pthread_create(
+                    &mut thread,
+                    std::ptr::null(),
+                    allocate_on_a_forked_thread,
+                    mark.cast(),
+                );
+                assert_eq!(created, 0);
+                libc::pthread_join(thread, std::ptr::null_mut());
                 (*mark).store(5, Ordering::SeqCst);
                 m::free(m::malloc(3 * MIB));
                 libc::_exit(0);

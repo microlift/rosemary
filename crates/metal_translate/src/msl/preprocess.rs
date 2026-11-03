@@ -123,9 +123,14 @@ pub(super) fn preprocess(
                 }
                 // Metal's own headers declare the language this frontend
                 // implements natively; a guest's own header is not available.
+                // `<simd/simd.h>` only adds `simd_` and `vector_` names for
+                // vector types, which are rejected as unknown if used.
                 "include" => {
                     let target = rest.trim();
-                    if !(target.starts_with("<metal") || target.starts_with("\"metal")) {
+                    if !(target.starts_with("<metal")
+                        || target.starts_with("\"metal")
+                        || target == "<simd/simd.h>")
+                    {
                         return Err(syntax_error(
                             line_number,
                             format!("#include {target} names a file which is not available"),

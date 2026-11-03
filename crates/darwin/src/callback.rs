@@ -35,9 +35,52 @@ pub unsafe extern "C" fn bsearch(
     unsafe { crate::call_as_darwin!(libc::bsearch(key, base, nel, width, compar)) }
 }
 
+std::thread_local! {
+    /// The block [`qsort_b`] on this thread is sorting with, which the host's
+    /// `qsort` has no argument to carry.
+    static SORT_BLOCK: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// The comparator [`qsort_b`] hands the host: its block's `invoke`, called
+/// with the block first as the Block ABI has it.
+unsafe extern "C" fn compare_with_block(a: *const c_void, b: *const c_void) -> c_int {
+    let block = SORT_BLOCK.get();
+    // SAFETY: `qsort_b`'s caller gave a live block; `invoke` is at a fixed
+    // offset by the Block ABI, and is `int (*)(void *, const void *, const
+    // void *)` for a comparator.
+    unsafe {
+        let invoke = ((block + crate::dispatch::block::INVOKE_OFFSET) as *const u64).read();
+        let invoke = core::mem::transmute::<
+            u64,
+            unsafe extern "C" fn(u64, *const c_void, *const c_void) -> c_int,
+        >(invoke);
+        crate::call_as_darwin!(invoke(block, a, b))
+    }
+}
+
+/// `void qsort_b(void *base, size_t nel, size_t width, int (^compar)(const
+/// void *, const void *))`
+///
+/// # Safety
+///
+/// As [`qsort`], with `compar` a live block taking two elements.
+pub unsafe extern "C" fn qsort_b(
+    base: *mut c_void,
+    nel: usize,
+    width: usize,
+    compar: *const c_void,
+) {
+    // A comparator may sort something of its own.
+    let outer = SORT_BLOCK.replace(compar as u64);
+    // SAFETY: the caller's; the comparator reads the block set above.
+    unsafe { qsort(base, nel, width, Some(compare_with_block)) };
+    SORT_BLOCK.set(outer);
+}
+
 exports::exports! {
     functions {
         "qsort" => qsort,
+        "qsort_b" => qsort_b,
         "bsearch" => bsearch,
     }
 }
@@ -45,6 +88,43 @@ exports::exports! {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A block literal with no captures, as a global block is laid out.
+    #[repr(C)]
+    struct Literal {
+        isa: u64,
+        flags: u32,
+        reserved: u32,
+        invoke: unsafe extern "C" fn(u64, *const c_void, *const c_void) -> c_int,
+        descriptor: u64,
+    }
+
+    unsafe extern "C" fn descending(_block: u64, a: *const c_void, b: *const c_void) -> c_int {
+        // SAFETY: the test below sorts `i32`s.
+        unsafe { *b.cast::<i32>() - *a.cast::<i32>() }
+    }
+
+    #[test]
+    fn qsort_b_orders_by_the_block() {
+        let block = Literal {
+            isa: 0,
+            flags: 0,
+            reserved: 0,
+            invoke: descending,
+            descriptor: 0,
+        };
+        let mut values = [2i32, 7, 1, 5];
+        // SAFETY: four `i32`s and a block comparing two of them.
+        unsafe {
+            qsort_b(
+                values.as_mut_ptr().cast(),
+                values.len(),
+                size_of::<i32>(),
+                (&raw const block).cast(),
+            )
+        };
+        assert_eq!(values, [7, 5, 2, 1]);
+    }
 
     /// What the wrappers exist for: the comparator is entered with the Darwin
     /// thread pointer even though the thread that called `qsort` had the host's.

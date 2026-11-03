@@ -5,6 +5,7 @@ use microlift::arch::x86_64::context::RegisterContext;
 use crate::abi::{Callbacks, GuestMemory, Result};
 
 use super::{bad_pointer, set_int_return};
+use crate::shims::bind;
 
 /// Byte offset of `zalloc` in a `z_stream`.
 ///
@@ -205,10 +206,10 @@ pub type Shim = crate::signal::Shim;
 /// `inflate`, `inflateEnd`, `deflate` and the rest are deliberately **not** here.
 pub fn shim_for(name: &str) -> Option<Shim> {
     match name {
-        "inflateInit_" => Some(inflate_init),
-        "inflateInit2_" => Some(inflate_init2),
-        "deflateInit_" => Some(deflate_init),
-        "deflateInit2_" => Some(deflate_init2),
+        "inflateInit_" => Some(bind!(callback "inflateInit_" => inflate_init)),
+        "inflateInit2_" => Some(bind!(callback "inflateInit2_" => inflate_init2)),
+        "deflateInit_" => Some(bind!(callback "deflateInit_" => deflate_init)),
+        "deflateInit2_" => Some(bind!(callback "deflateInit2_" => deflate_init2)),
         _ => None,
     }
 }

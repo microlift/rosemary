@@ -1,0 +1,24 @@
+# Native AppKit on arm64, macOS 26.5 (25F71), 1440x900 points, backing scale 2.
+# Columns: case style operation step arg_x arg_y arg_w arg_h frame_x frame_y frame_w frame_h sequence
+4	standard	frame	0	0	31	1440	869	0	31	1440	869	118
+9	standard	frame-display	0	0	31	1440	869	0	31	1440	869	277
+14	standard	frame-animate	0	0	31	1440	869	0	31	1440	869	449
+19	standard	content-size	0	0	0	1440	869	0	31	1440	869	615
+24	standard	origin	0	23	31	0	0	0	0	1440	900	778
+29	standard	burst	0	0	31	1440	867	0	31	1440	867	993
+29	standard	burst	1	0	31	1440	869	0	31	1440	869	996
+29	standard	burst	2	0	31	1440	450	0	31	1440	450	999
+29	standard	burst	3	0	31	1440	971	0	0	1440	900	1002
+34	standard	roblox-transition	0	0	32	1440	867	0	32	1440	867	1215
+34	standard	roblox-transition	1	0	31	1440	869	0	31	1440	869	1218
+39	full-size-content	frame	0	0	31	1440	869	0	31	1440	869	1386
+44	full-size-content	frame-display	0	0	31	1440	869	0	31	1440	869	1546
+49	full-size-content	frame-animate	0	0	31	1440	869	0	31	1440	869	1719
+54	full-size-content	content-size	0	0	0	1440	869	0	31	1440	869	1886
+59	full-size-content	origin	0	23	31	0	0	0	0	1440	900	2049
+64	full-size-content	burst	0	0	31	1440	867	0	31	1440	867	2264
+64	full-size-content	burst	1	0	31	1440	869	0	31	1440	869	2267
+64	full-size-content	burst	2	0	31	1440	450	0	31	1440	450	2270
+64	full-size-content	burst	3	0	31	1440	971	0	0	1440	900	2273
+69	full-size-content	roblox-transition	0	0	32	1440	867	0	32	1440	867	2488
+69	full-size-content	roblox-transition	1	0	31	1440	869	0	31	1440	869	2491

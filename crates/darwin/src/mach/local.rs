@@ -18,6 +18,10 @@ use super::kern::*;
 pub const VM_PROT_READ: i32 = 1;
 pub const VM_PROT_WRITE: i32 = 2;
 pub const VM_PROT_EXECUTE: i32 = 4;
+pub const VM_PROT_ALL: i32 = VM_PROT_READ | VM_PROT_WRITE | VM_PROT_EXECUTE;
+/// `VM_PROT_IS_MASK`: whichever of the protections asked for are available,
+/// rather than all of them or a failure.
+pub const VM_PROT_IS_MASK: i32 = 0x40;
 /// `VM_PROT_COPY`: make a private copy to write to. A private mapping here is
 /// copied on write already.
 const VM_PROT_COPY: i32 = 0x10;
@@ -25,8 +29,8 @@ const VM_PROT_COPY: i32 = 0x10;
 /// `VM_FLAGS_*` that `vm_allocate` answers. `FIXED` is zero: the absence of
 /// `ANYWHERE`.
 pub const VM_FLAGS_ANYWHERE: i32 = 0x0001;
-const VM_FLAGS_RANDOM_ADDR: i32 = 0x0008;
-const VM_FLAGS_OVERWRITE: i32 = 0x4000;
+pub const VM_FLAGS_RANDOM_ADDR: i32 = 0x0008;
+pub const VM_FLAGS_OVERWRITE: i32 = 0x4000;
 /// `VM_FLAGS_ALIAS_MASK`: the `VM_MAKE_TAG` label, which only feeds `vmmap`'s
 /// statistics and has nothing to attach to on this host.
 const VM_FLAGS_ALIAS_MASK: i32 = 0xff00_0000u32 as i32;
@@ -59,7 +63,7 @@ fn page() -> u64 {
 
 /// `[address, address + size)` widened to whole pages, as Mach widens every
 /// range it maps, unmaps or protects. `None` when the end overflows.
-fn pages(address: u64, size: u64) -> Option<(u64, u64)> {
+pub fn pages(address: u64, size: u64) -> Option<(u64, u64)> {
     let mask = page() - 1;
     let start = address & !mask;
     let end = address.checked_add(size)?.checked_add(mask)? & !mask;
@@ -199,14 +203,124 @@ pub fn protect(address: u64, size: u64, set_maximum: bool, protection: i32) -> i
     }
 }
 
+/// The `VM_FLAGS_*` [`place`] answers. Purgeable, superpage, 4GB-chunk and the
+/// rest change what the memory is, and pretending to honour them would hand
+/// back something else.
+const PLACEMENT_FLAGS: i32 =
+    VM_FLAGS_ANYWHERE | VM_FLAGS_RANDOM_ADDR | VM_FLAGS_OVERWRITE | VM_FLAGS_ALIAS_MASK;
+
+/// What a mapping [`place`] makes is backed by.
+#[derive(Clone, Copy)]
+pub enum Backing {
+    /// Zero-filled memory, copied into a child on `fork`.
+    Private,
+    /// Zero-filled memory shared with a child on `fork`.
+    Shared,
+    /// `fd` from `offset`, shared with every other mapping of it.
+    Object { fd: libc::c_int, offset: u64 },
+}
+
+/// Map `length` bytes (a page multiple) of `backing` with host protection
+/// `prot`, where `flags` and `mask` say: anywhere aligned to `mask`, or at
+/// `address`, replacing what is there only with `VM_FLAGS_OVERWRITE`.
+pub fn place(
+    address: u64,
+    length: u64,
+    mask: u64,
+    flags: i32,
+    backing: Backing,
+    prot: i32,
+) -> Result<u64, i32> {
+    if flags & !PLACEMENT_FLAGS != 0 {
+        return Err(KERN_INVALID_ARGUMENT);
+    }
+    // Mach rounds the start up under the mask until it is clear, which is an
+    // alignment only when the mask is contiguous low bits.
+    let align_mask = mask | (page() - 1);
+    if align_mask
+        .checked_add(1)
+        .is_none_or(|align| !align.is_power_of_two())
+    {
+        return Err(KERN_INVALID_ARGUMENT);
+    }
+    let anywhere = flags & VM_FLAGS_ANYWHERE != 0;
+    if !anywhere && address & mask != 0 {
+        return Err(KERN_NO_SPACE);
+    }
+    let (sharing, fd, offset) = match backing {
+        Backing::Private => (libc::MAP_PRIVATE | libc::MAP_ANON, -1, 0),
+        Backing::Shared => (libc::MAP_SHARED | libc::MAP_ANON, -1, 0),
+        Backing::Object { fd, offset } => (libc::MAP_SHARED, fd, offset),
+    };
+    let Ok(offset) = libc::off_t::try_from(offset) else {
+        return Err(KERN_INVALID_ARGUMENT);
+    };
+    let map = |at: u64, fixed: i32| {
+        // SAFETY: a new mapping; `MAP_FIXED` only where the caller asked to
+        // replace what is there, or over a reservation made here.
+        let mapped = unsafe {
+            libc::mmap(
+                at as *mut c_void,
+                length as usize,
+                prot,
+                sharing | fixed,
+                fd,
+                offset,
+            )
+        };
+        match mapped {
+            libc::MAP_FAILED => Err(KERN_NO_SPACE),
+            mapped => Ok(mapped as u64),
+        }
+    };
+    if !anywhere {
+        if flags & VM_FLAGS_OVERWRITE != 0 {
+            return map(address, libc::MAP_FIXED);
+        }
+        // A fixed request without `OVERWRITE` must not land anywhere else, and
+        // a hint is all `mmap` will take without displacing a neighbour.
+        let mapped = map(address, 0)?;
+        if mapped != address {
+            // SAFETY: the mapping made above, which nothing else has seen.
+            unsafe { libc::munmap(mapped as *mut c_void, length as usize) };
+            return Err(KERN_NO_SPACE);
+        }
+        return Ok(mapped);
+    }
+    if align_mask == page() - 1 {
+        return map(0, 0);
+    }
+    // Reserve enough to find an aligned start in, map over that start, and
+    // give back the slack either side.
+    let Some(span) = length.checked_add(align_mask) else {
+        return Err(KERN_NO_SPACE);
+    };
+    let Ok(reserved) = starnix::memory::anonymous(span as usize, libc::PROT_NONE) else {
+        return Err(KERN_NO_SPACE);
+    };
+    let reserved = reserved.as_ptr() as u64;
+    let aligned = (reserved + align_mask) & !align_mask;
+    let placed = map(aligned, libc::MAP_FIXED);
+    // SAFETY: the parts of the reservation outside the mapping, or all of it
+    // when the mapping failed.
+    unsafe {
+        match placed {
+            Ok(_) => {
+                let tail = aligned + length;
+                libc::munmap(reserved as *mut c_void, (aligned - reserved) as usize);
+                libc::munmap(tail as *mut c_void, (reserved + span - tail) as usize);
+            }
+            Err(_) => {
+                libc::munmap(reserved as *mut c_void, span as usize);
+            }
+        }
+    }
+    placed
+}
+
 /// `vm_allocate`: zero-filled anonymous memory, anywhere or at `address`.
 pub fn allocate(address: u64, size: u64, flags: i32) -> Result<u64, i32> {
-    // Purgeable, superpage, 4GB-chunk and the rest change what the memory is,
-    // and pretending to honour them would hand back something else.
-    if flags
-        & !(VM_FLAGS_ANYWHERE | VM_FLAGS_RANDOM_ADDR | VM_FLAGS_OVERWRITE | VM_FLAGS_ALIAS_MASK)
-        != 0
-    {
+    if flags & !PLACEMENT_FLAGS != 0 {
         return Err(KERN_INVALID_ARGUMENT);
     }
     if size == 0 {
@@ -216,38 +330,12 @@ pub fn allocate(address: u64, size: u64, flags: i32) -> Result<u64, i32> {
     let Some(length) = size.checked_next_multiple_of(page) else {
         return Err(KERN_INVALID_ARGUMENT);
     };
-    let anywhere = flags & VM_FLAGS_ANYWHERE != 0;
-    let hint = match anywhere {
-        true => 0,
-        false => address & !(page - 1),
+    let address = match flags & VM_FLAGS_ANYWHERE {
+        0 => address & !(page - 1),
+        _ => 0,
     };
-    let fixed = match !anywhere && flags & VM_FLAGS_OVERWRITE != 0 {
-        true => libc::MAP_FIXED,
-        false => 0,
-    };
-    // SAFETY: a new anonymous mapping; `MAP_FIXED` only where the caller asked
-    // to replace what is there.
-    let mapped = unsafe {
-        libc::mmap(
-            hint as *mut c_void,
-            length as usize,
-            libc::PROT_READ | libc::PROT_WRITE,
-            libc::MAP_PRIVATE | libc::MAP_ANON | fixed,
-            -1,
-            0,
-        )
-    };
-    if mapped == libc::MAP_FAILED {
-        return Err(KERN_NO_SPACE);
-    }
-    // A fixed request without `OVERWRITE` must not land anywhere else, and a
-    // hint is all `mmap` will take without displacing a neighbour.
-    if !anywhere && mapped as u64 != hint {
-        // SAFETY: the mapping made above, which nothing else has seen.
-        unsafe { libc::munmap(mapped, length as usize) };
-        return Err(KERN_NO_SPACE);
-    }
-    Ok(mapped as u64)
+    let prot = libc::PROT_READ | libc::PROT_WRITE;
+    place(address, length, 0, flags, Backing::Private, prot)
 }
 
 /// `vm_deallocate`, over whole pages as Mach's is.

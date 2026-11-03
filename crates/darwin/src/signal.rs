@@ -893,6 +893,18 @@ fn delivers(host_handler: libc::sighandler_t) -> bool {
     host_handler == deliver as *const () as libc::sighandler_t
 }
 
+/// A handler the host installed, as the guest sees it: the default.
+///
+/// It is the runtime's or a host library's, takes Linux's `siginfo_t` and
+/// context, and a Darwin process would not have had one. A guest that chains
+/// to it - HotSpot does, for a fault it does not own - would pass it Darwin's.
+fn guest_view(host_handler: libc::sighandler_t) -> u64 {
+    match is_sentinel(host_handler as u64) {
+        true => host_handler as u64,
+        false => libc::SIG_DFL as u64,
+    }
+}
+
 /// Install `handler` for `slot` behind [`deliver`], returning what to give
 /// the host.
 fn route(slot: usize, handler: u64, siginfo: bool) -> libc::sighandler_t {
@@ -973,17 +985,27 @@ pub unsafe fn sigaction(
         && let Some(old) = old
     {
         let through_us = delivers(host_old.sa_sigaction);
-        let mut flags = flags_from_host(host_old.sa_flags);
-        if through_us && !previous_siginfo {
-            flags &= !SA_SIGINFO;
-        }
-        *old = Disposition {
-            handler: match through_us {
-                true => previous_handler,
-                false => host_old.sa_sigaction as u64,
+        *old = match through_us {
+            true => {
+                let mut flags = flags_from_host(host_old.sa_flags);
+                if !previous_siginfo {
+                    flags &= !SA_SIGINFO;
+                }
+                Disposition {
+                    handler: previous_handler,
+                    mask: mask_from_host(&host_old.sa_mask),
+                    flags,
+                }
+            }
+            false if is_sentinel(host_old.sa_sigaction as u64) => Disposition {
+                handler: host_old.sa_sigaction as u64,
+                mask: mask_from_host(&host_old.sa_mask),
+                flags: flags_from_host(host_old.sa_flags),
             },
-            mask: mask_from_host(&host_old.sa_mask),
-            flags,
+            false => Disposition {
+                handler: guest_view(host_old.sa_sigaction),
+                ..Disposition::default()
+            },
         };
     }
     rc
@@ -1015,7 +1037,7 @@ pub unsafe fn signal(darwin_signum: i32, handler: u64) -> u64 {
     let old = unsafe { libc::signal(host_signum, installed) };
     match delivers(old) {
         true => previous,
-        false => old as u64,
+        false => guest_view(old),
     }
 }
 
@@ -1526,7 +1548,7 @@ pub mod entry {
 
         #[test]
         fn signal_zero_probes_existence_rather_than_being_translated() {
-            let me = starnix::process::me();
+            let me = crate::process::host_self();
             assert_eq!(kill_(me, 0), 0);
             assert_eq!(kill_(me, 99), -1, "not a signal");
         }
@@ -1585,6 +1607,25 @@ mod tests {
 
     fn real() -> std::sync::MutexGuard<'static, ()> {
         REAL.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    extern "C" fn host_handler(_: c_int) {}
+
+    #[test]
+    fn a_host_installed_handler_reads_back_as_the_default() {
+        let _real = real();
+        let host = signal_to_host(signum::SIGURG).unwrap();
+        // SAFETY: a handler that does nothing, then the old disposition put back.
+        unsafe {
+            let mut action: libc::sigaction = core::mem::zeroed();
+            action.sa_sigaction = host_handler as *const () as libc::sighandler_t;
+            let mut saved: libc::sigaction = core::mem::zeroed();
+            libc::sigaction(host, &action, &mut saved);
+            let mut back = Disposition::default();
+            assert_eq!(sigaction(signum::SIGURG, None, Some(&mut back)), 0);
+            libc::sigaction(host, &saved, core::ptr::null_mut());
+            assert_eq!(back, Disposition::default());
+        }
     }
 
     #[test]
@@ -1805,7 +1846,7 @@ mod tests {
         let (info, mcsize, pc, mask) = SEEN.lock().unwrap().take().expect("the handler ran");
         assert_eq!(info.signo, signum::SIGURG);
         assert_eq!(info.code, 0x10001, "SI_USER");
-        assert_eq!(info.pid, starnix::process::me());
+        assert_eq!(info.pid, crate::process::host_self());
         assert_eq!(mcsize, size_of::<Mcontext>() as u64);
         assert_ne!(pc, 0);
         assert_eq!(

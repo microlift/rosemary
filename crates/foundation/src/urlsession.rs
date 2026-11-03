@@ -25,6 +25,9 @@ struct Request {
     body: Vec<u8>,
     timeout: f64,
     cache_policy: usize,
+    /// `NSURLRequestNetworkServiceType`, only read back: the host decides how
+    /// traffic is classified.
+    service_type: usize,
 }
 
 impl Request {
@@ -36,6 +39,7 @@ impl Request {
             body: Vec::new(),
             timeout,
             cache_policy: 0,
+            service_type: 0,
         }
     }
 }
@@ -292,6 +296,18 @@ unsafe extern "C" fn set_cache_policy(receiver: Id, _sel: Sel, policy: usize) {
 unsafe extern "C" fn cache_policy(receiver: Id, _sel: Sel) -> usize {
     // SAFETY: the receiver is a request this module made.
     unsafe { request_of(receiver) }.map_or(0, |request| request.cache_policy)
+}
+
+unsafe extern "C" fn set_network_service_type(receiver: Id, _sel: Sel, kind: usize) {
+    // SAFETY: the receiver is a request this module made.
+    if let Some(request) = unsafe { request_of(receiver) } {
+        request.service_type = kind;
+    }
+}
+
+unsafe extern "C" fn network_service_type(receiver: Id, _sel: Sel) -> usize {
+    // SAFETY: the receiver is a request this module made.
+    unsafe { request_of(receiver) }.map_or(0, |request| request.service_type)
 }
 
 unsafe extern "C" fn timeout_interval(receiver: Id, _sel: Sel) -> f64 {
@@ -990,6 +1006,8 @@ pub(crate) fn install() {
         "addValue:forHTTPHeaderField:" => add_value_for_header, c"v32@0:8@16@24";
         "setTimeoutInterval:" => set_timeout_interval, c"v24@0:8d16";
         "setCachePolicy:" => set_cache_policy, c"v24@0:8Q16";
+        "networkServiceType" => network_service_type, c"Q16@0:8";
+        "setNetworkServiceType:" => set_network_service_type, c"v24@0:8Q16";
     });
 
     let response = response_class();

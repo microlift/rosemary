@@ -290,6 +290,7 @@ pub fn queue(pid: i32, signo: c_int, value: usize) -> std::io::Result<()> {
 
 /// Call `each` with every thread id of this process, async-signal-safely: no
 /// allocation and no locks, so a signal handler may walk its own threads.
+/// A thread may be missed while others exit; list again to catch it.
 /// False where the host cannot list them that way.
 pub fn for_each_thread(each: &mut dyn FnMut(i32)) -> bool {
     sys::signal::for_each_thread(each)

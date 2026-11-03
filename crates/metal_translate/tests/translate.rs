@@ -442,7 +442,7 @@ fn source_msl_rejects_unimplemented_operations() {
     let error = parse_msl(
         "\n\
          kernel void f(device uint* output [[buffer(0)]]) {\n\
-             switch (output[0]) { default: break; }\n\
+             goto end;\n\
          }",
     )
     .unwrap_err();
@@ -743,8 +743,31 @@ fn source_msl_rejects_an_unknown_constexpr_sampler_argument() {
     );
 }
 
+/// The width of the float or integer type `id` names.
+fn scalar_width(module: &rspirv::dr::Module, id: u32) -> Option<u32> {
+    let ty = module
+        .types_global_values
+        .iter()
+        .find(|instruction| instruction.result_id == Some(id))?;
+    match ty.class.opcode {
+        Op::TypeFloat | Op::TypeInt => Some(ty.operands[0].unwrap_literal_bit32()),
+        Op::TypeVector => scalar_width(module, ty.operands[0].unwrap_id_ref()),
+        _ => None,
+    }
+}
+
+fn image_sampled_width(module: &rspirv::dr::Module) -> Option<u32> {
+    let image = module
+        .types_global_values
+        .iter()
+        .find(|instruction| instruction.class.opcode == Op::TypeImage)?;
+    scalar_width(module, image.operands[0].unwrap_id_ref())
+}
+
+/// Vulkan's sampled type is 32-bit, so a `half` texture samples through a
+/// 32-bit image and narrows the result before computing with it.
 #[test]
-fn source_msl_a_half_texture_samples_through_a_32_bit_image() {
+fn source_msl_a_half_texture_computes_at_half_precision() {
     let source = "#include <metal_stdlib>\n\
         using namespace metal;\n\
         struct Varyings { float4 pos [[position]]; float2 uv; };\n\
@@ -752,8 +775,7 @@ fn source_msl_a_half_texture_samples_through_a_32_bit_image() {
             texture2d<half, access::sample> tex [[ texture(0) ]],\n\
             sampler s [[ sampler(0) ]])\n\
         {\n\
-            half4 color = tex.sample(s, input.uv);\n\
-            return color;\n\
+            return tex.sample(s, input.uv) * 3.0h;\n\
         }\0";
     let target = TargetProfile {
         shader_float16: true,
@@ -761,19 +783,84 @@ fn source_msl_a_half_texture_samples_through_a_32_bit_image() {
     };
     let library = translate_msl(source, &target).unwrap();
     let module = rspirv::dr::load_words(&library.entries[0].words).unwrap();
-    let image = module
-        .types_global_values
-        .iter()
-        .find(|instruction| instruction.class.opcode == Op::TypeImage)
-        .expect("an image type");
-    let sampled = image.operands[0].unwrap_id_ref();
-    let float32 = module.types_global_values.iter().any(|instruction| {
-        instruction.result_id == Some(sampled)
-            && instruction.class.opcode == Op::TypeFloat
-            && instruction.operands[0] == rspirv::dr::Operand::LiteralBit32(32)
-    });
-    assert!(float32, "Vulkan requires a 32-bit sampled type");
+    assert_eq!(image_sampled_width(&module), Some(32));
+    let [sample] = &body_instructions(&module, Op::ImageSampleImplicitLod)[..] else {
+        panic!("expected one sample");
+    };
+    let convert = body_instructions(&module, Op::FConvert)
+        .into_iter()
+        .find(|convert| convert.operands[0].unwrap_id_ref() == sample.result_id.unwrap())
+        .expect("the sample is narrowed");
+    assert_eq!(
+        scalar_width(&module, convert.result_type.unwrap()),
+        Some(16)
+    );
+    let [multiply] = &body_instructions(&module, Op::FMul)[..] else {
+        panic!("expected one multiply");
+    };
+    assert_eq!(
+        scalar_width(&module, multiply.result_type.unwrap()),
+        Some(16)
+    );
 }
+
+/// A `ushort` texture reads and writes 32-bit texels and computes with
+/// 16-bit ones, so an addition wraps as Metal's does.
+#[test]
+fn source_msl_a_short_texture_computes_at_short_width() {
+    let target = TargetProfile {
+        shader_int16: true,
+        shader_storage_image_read_without_format: true,
+        shader_storage_image_write_without_format: true,
+        ..TargetProfile::vulkan_1_3()
+    };
+    let library = translate_msl(SHORT_TEXTURE_KERNEL, &target).unwrap();
+    let module = rspirv::dr::load_words(&library.entries[0].words).unwrap();
+    assert_eq!(image_sampled_width(&module), Some(32));
+    let [read] = &body_instructions(&module, Op::ImageRead)[..] else {
+        panic!("expected one read");
+    };
+    assert_eq!(scalar_width(&module, read.result_type.unwrap()), Some(32));
+    let [add] = &body_instructions(&module, Op::IAdd)[..] else {
+        panic!("expected one addition");
+    };
+    assert_eq!(scalar_width(&module, add.result_type.unwrap()), Some(16));
+    let [write] = &body_instructions(&module, Op::ImageWrite)[..] else {
+        panic!("expected one write");
+    };
+    let written = write.operands[2].unwrap_id_ref();
+    let widen = body_instructions(&module, Op::UConvert)
+        .into_iter()
+        .find(|convert| convert.result_id == Some(written))
+        .expect("the written texel is widened");
+    assert_eq!(scalar_width(&module, widen.result_type.unwrap()), Some(32));
+}
+
+/// Without `shaderInt16` a `ushort` texture's texels are computed as `uint`
+/// rather than rejected.
+#[test]
+fn source_msl_a_short_texture_widens_without_shader_int16() {
+    let target = TargetProfile {
+        shader_storage_image_read_without_format: true,
+        shader_storage_image_write_without_format: true,
+        ..TargetProfile::vulkan_1_3()
+    };
+    let library = translate_msl(SHORT_TEXTURE_KERNEL, &target).unwrap();
+    let module = rspirv::dr::load_words(&library.entries[0].words).unwrap();
+    let [add] = &body_instructions(&module, Op::IAdd)[..] else {
+        panic!("expected one addition");
+    };
+    assert_eq!(scalar_width(&module, add.result_type.unwrap()), Some(32));
+    assert!(body_instructions(&module, Op::UConvert).is_empty());
+}
+
+const SHORT_TEXTURE_KERNEL: &str = "#include <metal_stdlib>\n\
+    using namespace metal;\n\
+    kernel void add(texture2d<ushort, access::read_write> counts [[ texture(0) ]],\n\
+        uint2 gid [[ thread_position_in_grid ]])\n\
+    {\n\
+        counts.write(counts.read(gid) + ushort4(1), gid);\n\
+    }\0";
 
 #[test]
 fn source_msl_loops_leave_through_one_block() {
@@ -2367,4 +2454,145 @@ fn omits_a_zero_sampling_offset() {
         };
         assert_eq!(*mask, ImageOperands::LOD);
     }
+}
+
+#[test]
+fn source_msl_transforms_by_column_major_matrices() {
+    let source = "#include <metal_stdlib>\n\
+        #include <simd/simd.h>\n\
+        using namespace metal;\n\
+        struct Transforms { float4x4 projection; float3x3 normal; };\n\
+        struct Out { float4 position [[position, invariant]]; float3 normal [[user(locn0)]]; };\n\
+        vertex Out main0(constant Transforms& t [[buffer(0)]], uint id [[vertex_id]]) {\n\
+            Out out = {};\n\
+            float4x4 scale = float4x4(2.0);\n\
+            out.position = (t.projection * scale) * float4(float(id), 0.0, 0.0, 1.0);\n\
+            out.normal = float3(1.0, 0.0, 0.0) * transpose(t.normal);\n\
+            out.position.y = -out.position.y;\n\
+            return out;\n\
+        }";
+    let library = translate_msl(source, &TargetProfile::vulkan_1_3()).unwrap();
+    assert_eq!(library.entries.len(), 1);
+    assert!(library.rejected.is_empty());
+}
+
+#[test]
+fn source_msl_inlines_helpers_overloads_and_templates() {
+    let source = "#include <metal_stdlib>\n\
+        using namespace metal;\n\
+        template<typename Tx, typename Ty>\n\
+        inline Tx spvSMod(Tx x, Ty y) { Tx remainder = x - y * (x / y); return remainder; }\n\
+        static inline __attribute__((always_inline))\n\
+        float scaled(float value, float by) { return value * by; }\n\
+        static inline __attribute__((always_inline))\n\
+        float scaled(float value) { return scaled(value, 2.0); }\n\
+        static inline __attribute__((always_inline))\n\
+        void bump(thread int& counter) { counter += 1; }\n\
+        kernel void main0(device float* output [[buffer(0)]], uint id [[thread_position_in_grid]]) {\n\
+            int counter = spvSMod(int(id), 3);\n\
+            bump(counter);\n\
+            output[id] = scaled(float(counter));\n\
+        }";
+    let library = translate_msl(source, &TargetProfile::vulkan_1_3()).unwrap();
+    assert_eq!(library.entries.len(), 1);
+}
+
+#[test]
+fn source_msl_lays_out_array_templates_and_packed_vectors() {
+    let source = "#include <metal_stdlib>\n\
+        using namespace metal;\n\
+        template<typename T, size_t Num>\n\
+        struct spvUnsafeArray\n\
+        {\n\
+            T elements[Num ? Num : 1];\n\
+            thread T& operator [] (size_t pos) thread { return elements[pos]; }\n\
+            constexpr const thread T& operator [] (size_t pos) const thread { return elements[pos]; }\n\
+        };\n\
+        struct Globals { packed_float3 offset; float time; };\n\
+        kernel void main0(constant Globals& g [[buffer(0)]], device float4* output [[buffer(1)]]) {\n\
+            spvUnsafeArray<float, 4> weights = {};\n\
+            weights[1] = g.time;\n\
+            spvUnsafeArray<float, 4> copy = weights;\n\
+            output[0] = float4(g.offset, copy[1]);\n\
+        }";
+    let module = parse_msl(source).unwrap();
+    assert_eq!(module.entries.len(), 1);
+    let library = translate_msl(source, &TargetProfile::vulkan_1_3()).unwrap();
+    assert!(library.rejected.is_empty());
+}
+
+#[test]
+fn source_msl_keeps_entry_points_that_translate() {
+    let source = "#include <metal_stdlib>\n\
+        using namespace metal;\n\
+        kernel void good(device uint* output [[buffer(0)]]) { output[0] = 1; }\n\
+        kernel void bad(device uint* output [[buffer(0)]]) {\n\
+            goto end;\n\
+        }";
+    let library = translate_msl(source, &TargetProfile::vulkan_1_3()).unwrap();
+    assert_eq!(library.entries.len(), 1);
+    assert_eq!(library.entries[0].name, "good");
+    assert_eq!(library.rejected.len(), 1);
+    assert_eq!(library.rejected[0].name, "bad");
+    // The library as a whole is still refused where every entry is.
+    assert!(parse_msl(source).is_err());
+}
+
+#[test]
+fn source_msl_reads_texture_buffers_as_texel_buffers() {
+    let source = "#include <metal_stdlib>\n\
+        using namespace metal;\n\
+        kernel void main0(texture_buffer<int> faces [[texture(0)]], device int* output [[buffer(0)]],\n\
+                          uint id [[thread_position_in_grid]]) {\n\
+            output[id] = faces.read(id).x + int(faces.get_width());\n\
+        }";
+    let library = translate_msl(source, &TargetProfile::vulkan_1_3()).unwrap();
+    let texture = library.entries[0]
+        .resources
+        .iter()
+        .find(|resource| resource.kind == metal_translate::ir::ResourceKind::Texture)
+        .expect("the texture buffer is a resource");
+    assert!(texture.texel_buffer);
+    assert!(texture.sampled);
+}
+
+#[test]
+fn source_msl_knows_the_standard_indirect_argument_structures() {
+    let source = "#include <metal_stdlib>\n\
+        using namespace metal;\n\
+        kernel void main0(const device MTLDrawIndexedPrimitivesIndirectArguments* src [[buffer(0)]],\n\
+                          device MTLDrawIndexedPrimitivesIndirectArguments* dst [[buffer(1)]]) {\n\
+            dst[0] = src[0];\n\
+            dst[0].instanceCount *= 2;\n\
+            dst[0].baseVertex = -src[0].baseVertex;\n\
+        }";
+    let library = translate_msl(source, &TargetProfile::vulkan_1_3()).unwrap();
+    assert!(library.rejected.is_empty());
+    assert_eq!(library.entries.len(), 1);
+}
+
+#[test]
+fn source_msl_rejects_a_pointer_cast_between_typed_buffers() {
+    let source = "#include <metal_stdlib>\n\
+        using namespace metal;\n\
+        kernel void main0(device float* values [[buffer(0)]]) {\n\
+            ((device uint*)values)[0] = 1;\n\
+        }";
+    let error = translate_msl(source, &TargetProfile::vulkan_1_3()).unwrap_err();
+    assert!(
+        error.to_string().contains("only a buffer of bytes allows"),
+        "{error}"
+    );
+}
+
+#[test]
+fn source_msl_prefers_its_own_declaration_of_a_standard_structure() {
+    let source = "#include <metal_stdlib>\n\
+        using namespace metal;\n\
+        struct MTLDrawPrimitivesIndirectArguments { uint only; };\n\
+        kernel void main0(device MTLDrawPrimitivesIndirectArguments* args [[buffer(0)]]) {\n\
+            args[0].only = 1;\n\
+        }";
+    let library = translate_msl(source, &TargetProfile::vulkan_1_3()).unwrap();
+    assert!(library.rejected.is_empty());
 }

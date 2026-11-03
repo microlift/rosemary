@@ -5,6 +5,7 @@ use crate::abi::{Callbacks, GuestMemory, Result};
 use crate::thread::{GuestStart, StackRequest};
 
 use super::set_int_return;
+use crate::shims::bind;
 
 /// `EINVAL`, the one failure this shim produces without asking the host.
 const EINVAL: i32 = 22;
@@ -173,16 +174,20 @@ pub fn shim_for(name: &str) -> Option<Shim> {
     // therefore shims only where that is true. See [`pthread_once`].
     if darwin::libc_backend::using_builtin() {
         match name {
-            "pthread_once" => return Some(pthread_once),
-            "pthread_key_create" => return Some(pthread_key_create),
+            "pthread_once" => return Some(bind!(callback "pthread_once" => pthread_once)),
+            "pthread_key_create" => {
+                return Some(bind!(callback "pthread_key_create" => pthread_key_create));
+            }
             _ => {}
         }
     }
     match name {
-        "pthread_create" => Some(pthread_create),
+        "pthread_create" => Some(bind!(callback "pthread_create" => pthread_create)),
         // Off unless asked for: this turns every lock in the program into a VM
         // exit, which is not a price to pay for a diagnostic nobody is reading.
-        "pthread_mutex_lock" if debug_mutex() => Some(mutex_lock),
+        "pthread_mutex_lock" if debug_mutex() => {
+            Some(bind!(callback "pthread_mutex_lock" => mutex_lock))
+        }
         _ => None,
     }
 }

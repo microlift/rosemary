@@ -111,7 +111,7 @@ impl Emitter {
         }
         let ty_id = self.type_id(ty)?;
         let id = match ty {
-            Type::Int { bits: 1..=32, .. } | Type::Float { bits: 32 } => {
+            Type::Int { bits: 1..=32, .. } | Type::Float { bits: 16 | 32 } => {
                 self.builder.constant_bit32(ty_id, value as u32)
             }
             Type::Int { bits: 33..=64, .. } => self.builder.constant_bit64(ty_id, value),
@@ -251,6 +251,7 @@ impl Emitter {
                     TextureDimension::D2 => Dim::Dim2D,
                     TextureDimension::D3 => Dim::Dim3D,
                     TextureDimension::Cube => Dim::DimCube,
+                    TextureDimension::Buffer => Dim::DimBuffer,
                 };
                 // `Sampled` distinguishes an image a sampler or a fetch reads
                 // from a storage image; only a texture a shader writes is the
@@ -258,6 +259,14 @@ impl Emitter {
                 let sampled = if texture.sampled_image() { 1 } else { 2 };
                 if texture.dimension == TextureDimension::D1 && sampled == 2 {
                     self.capability(Capability::Image1D)?;
+                }
+                // A uniform texel buffer is a sampled one, a storage texel
+                // buffer an image.
+                if texture.dimension == TextureDimension::Buffer {
+                    self.capability(match sampled {
+                        1 => Capability::SampledBuffer,
+                        _ => Capability::ImageBuffer,
+                    })?;
                 }
                 if texture.multisampled && sampled == 2 {
                     self.capability(Capability::StorageImageMultisample)?;

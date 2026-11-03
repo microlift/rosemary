@@ -825,6 +825,7 @@ exports::exports! {
         "AudioOutputUnitStart" => AudioOutputUnitStart,
         "AudioOutputUnitStop" => AudioOutputUnitStop,
         "AudioUnitGetProperty" => property::AudioUnitGetProperty,
+        "AudioUnitGetPropertyInfo" => property::AudioUnitGetPropertyInfo,
         "AudioUnitSetProperty" => property::AudioUnitSetProperty,
         "AudioUnitRender" => AudioUnitRender,
         "AudioUnitSetParameter" => AudioUnitSetParameter,

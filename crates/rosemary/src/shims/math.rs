@@ -1,6 +1,7 @@
 use microlift::arch::x86_64::context::RegisterContext;
 
 use crate::abi::{GuestMemory, Result};
+use crate::shims::bind;
 
 /// `__float2 __sincosf_stret(float x)`
 ///
@@ -80,15 +81,15 @@ pub fn mulsc3(_symbol: &str, ctx: &mut RegisterContext, _mem: &mut dyn GuestMemo
 }
 
 /// One of this module's implementations, in the shape [`crate::shims`] wants.
-pub type Shim = fn(&str, &mut RegisterContext, &mut dyn GuestMemory) -> Result<()>;
+pub type Shim = crate::shims::Shim;
 
 /// Whether `name` (underscore already stripped) is one of this module's.
 pub fn shim_for(name: &str) -> Option<Shim> {
     match name {
-        "__divdc3" => Some(divdc3),
-        "__mulsc3" => Some(mulsc3),
-        "__sincosf_stret" => Some(sincosf_stret),
-        "__sincos_stret" => Some(sincos_stret),
+        "__divdc3" => Some(bind!("__divdc3" => divdc3)),
+        "__mulsc3" => Some(bind!("__mulsc3" => mulsc3)),
+        "__sincosf_stret" => Some(bind!("__sincosf_stret" => sincosf_stret)),
+        "__sincos_stret" => Some(bind!("__sincos_stret" => sincos_stret)),
         _ => None,
     }
 }

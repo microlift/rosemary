@@ -1,22 +1,14 @@
-use std::ffi::c_void;
 use std::sync::OnceLock;
 
 use objc::class::Class;
-use objc::object::Id;
 
 use crate::base::{CFIndex, CFTypeRef};
+use crate::boxed::{contents, make};
 use crate::callbacks::Policy;
 
-/// The shape every collection here shares: the object, and a pointer to the
-/// Rust value holding its contents.
-#[repr(C)]
-struct Body<T> {
-    isa: *const Class,
-    contents: *mut T,
-}
+pub type CFDictionaryRef = CFTypeRef;
 
-/// Register a class whose instances are a [`Body<T>`], with a `-dealloc` that
-/// gives the contents back.
+/// Register a class whose instances hold a `T`; see [`crate::boxed`].
 ///
 /// `superclass` is the abstract Foundation class the guest binds and asks
 /// `isKindOfClass:` about; it is what carries the CoreFoundation type.
@@ -25,54 +17,7 @@ fn register<T: 'static>(
     superclass: &'static Class,
 ) -> &'static Class {
     crate::base::note_type_class(superclass);
-    let class = crate::base::register(name, Some(superclass), size_of::<Body<T>>(), false);
-    unsafe extern "C" fn dealloc<T>(receiver: Id, _sel: objc::sel::Sel) {
-        // SAFETY: `-dealloc` is reached with the last reference gone, and the
-        // receiver is a `Body<T>` whose `contents` came from `Box::into_raw`.
-        unsafe {
-            let body = receiver as *mut Body<T>;
-            if !(*body).contents.is_null() {
-                drop(Box::from_raw((*body).contents));
-                (*body).contents = std::ptr::null_mut();
-            }
-            objc::arc::finalize(receiver);
-        }
-    }
-    class.replace_method(
-        objc::sel::get("dealloc"),
-        dealloc::<T> as *const c_void,
-        c"v16@0:8",
-    );
-    class
-}
-
-/// Allocate an instance of `class` holding `contents`.
-fn make<T>(class: &'static Class, contents: T) -> CFTypeRef {
-    // SAFETY: `Body<T>` begins with `isa` and is the layout `class` was
-    // registered with.
-    let body: *mut Body<T> = unsafe { crate::base::allocate(class) };
-    if body.is_null() {
-        return std::ptr::null();
-    }
-    // SAFETY: a live instance whose second word is ours to fill in.
-    unsafe { (*body).contents = Box::into_raw(Box::new(contents)) };
-    body as CFTypeRef
-}
-
-/// The contents of `object`, if it is an instance of `class`.
-///
-/// # Safety
-///
-/// `object` must be null or an object this runtime allocated.
-unsafe fn contents<'a, T>(object: CFTypeRef, class: &'static Class) -> Option<&'a mut T> {
-    if !unsafe { crate::base::is_kind_of(object, class) } {
-        return None;
-    }
-    // SAFETY: an instance of `class` is a `Body<T>` with a live `contents`.
-    unsafe {
-        let body = object as *mut Body<T>;
-        (!(*body).contents.is_null()).then(|| &mut *(*body).contents)
-    }
+    crate::boxed::register::<T>(name, Some(superclass), false)
 }
 
 //

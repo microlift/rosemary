@@ -114,6 +114,9 @@ impl Lowerer<'_, '_> {
         args: &[Expr],
         line: usize,
     ) -> Result<Value> {
+        if let Some(function) = self.helper(name, args.len(), line)? {
+            return self.inline_call(function, args, line);
+        }
         if let Some(op) = atomic_op(name) {
             return self.atomic(name, op, args, line);
         }
@@ -368,6 +371,7 @@ impl Lowerer<'_, '_> {
                 let square = self.arithmetic("*", t.clone(), t, line)?;
                 self.arithmetic("*", square, tail, line)
             }
+            ("transpose", [m]) => self.transpose(m.clone(), line),
             ("dot", [a, b]) => {
                 let ty = self.float_common(&[a, b], line)?;
                 let Ty::Vector(scalar, lanes) = ty else {
@@ -527,7 +531,12 @@ impl Lowerer<'_, '_> {
         }
     }
 
-    fn call_values(&mut self, name: &str, values: &[Value], line: usize) -> Result<Value> {
+    pub(super) fn call_values(
+        &mut self,
+        name: &str,
+        values: &[Value],
+        line: usize,
+    ) -> Result<Value> {
         // Re-enter `call` with values already evaluated, by binding them to
         // names nothing in the source can spell.
         self.scopes.push(HashMap::new());
@@ -920,6 +929,12 @@ impl Lowerer<'_, '_> {
         } else {
             (None, next_uint(self, "level")?)
         };
+        if lod.is_some() && texture_type.dimension == TextureDimension::Buffer {
+            return Err(syntax_error(
+                line,
+                "a texture_buffer has no mipmap level to read",
+            ));
+        }
         let texel = Ty::of(
             match *texture_type.texel {
                 Type::Float { bits } => Scalar::Float { bits },

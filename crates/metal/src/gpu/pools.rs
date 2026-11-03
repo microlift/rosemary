@@ -29,6 +29,41 @@ impl Gpu {
         }
     }
 
+    /// A pool of `OCCLUSION_QUERIES` occlusion queries, every one reset.
+    pub fn acquire_occlusion_pool(&self) -> Result<vk::QueryPool, String> {
+        if !self.host_query_reset {
+            return Err("occlusion queries need hostQueryReset, which this device lacks".into());
+        }
+        let recycled = self.occlusion_pools.lock().expect("occlusion pools").pop();
+        let pool = match recycled {
+            Some(pool) => pool,
+            None => {
+                let info = vk::QueryPoolCreateInfo::default()
+                    .query_type(vk::QueryType::OCCLUSION)
+                    .query_count(OCCLUSION_QUERIES);
+                // SAFETY: a well-formed create info on this live device.
+                unsafe { self.device.create_query_pool(&info, None) }
+                    .map_err(|error| format!("vkCreateQueryPool failed with {error:?}"))?
+            }
+        };
+        // SAFETY: the pool is fresh or its last submission has retired, so no
+        // pending work uses it; the feature was enabled with the device.
+        unsafe { self.device.reset_query_pool(pool, 0, OCCLUSION_QUERIES) };
+        Ok(pool)
+    }
+
+    /// Hand back an occlusion query pool no pending submission still uses.
+    pub fn release_occlusion_pool(&self, pool: vk::QueryPool) {
+        let mut pools = self.occlusion_pools.lock().expect("occlusion pools");
+        if pools.len() < RECYCLED {
+            pools.push(pool);
+            return;
+        }
+        drop(pools);
+        // SAFETY: nothing pending uses it.
+        unsafe { self.device.destroy_query_pool(pool, None) };
+    }
+
     /// A command buffer ready to begin, recycled where one has retired.
     pub fn acquire_context(&self) -> Result<CommandContext, String> {
         let mut used = self
@@ -210,6 +245,12 @@ impl Gpu {
             vk::DescriptorPoolSize::default()
                 .ty(vk::DescriptorType::SAMPLER)
                 .descriptor_count(CAPACITY * 2),
+            vk::DescriptorPoolSize::default()
+                .ty(vk::DescriptorType::UNIFORM_TEXEL_BUFFER)
+                .descriptor_count(CAPACITY),
+            vk::DescriptorPoolSize::default()
+                .ty(vk::DescriptorType::STORAGE_TEXEL_BUFFER)
+                .descriptor_count(CAPACITY),
         ];
         let info = vk::DescriptorPoolCreateInfo::default()
             .max_sets(CAPACITY)

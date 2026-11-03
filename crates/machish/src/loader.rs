@@ -58,6 +58,9 @@ pub struct Loader<S: MachSpec> {
     /// What `@executable_path` expands against, when the root is not the
     /// executable - a `dlopen`ed image. `None` means the root itself.
     executable: Option<String>,
+    /// `LC_RPATH` entries the root inherits from the images that loaded it,
+    /// searched after its own - for a `dlopen`ed image, the executable's.
+    inherited_rpaths: Vec<String>,
 }
 
 /// An image's bytes plus where they came from, owned for the link's duration.
@@ -97,6 +100,7 @@ impl<S: MachSpec + 'static> Loader<S> {
             extensions: ExtensionSet::defaults(),
             inserted: Vec::new(),
             executable: None,
+            inherited_rpaths: Vec::new(),
         }
     }
 
@@ -107,6 +111,7 @@ impl<S: MachSpec + 'static> Loader<S> {
             extensions: ExtensionSet::defaults(),
             inserted: Vec::new(),
             executable: None,
+            inherited_rpaths: Vec::new(),
         }
     }
 
@@ -118,6 +123,7 @@ impl<S: MachSpec + 'static> Loader<S> {
             extensions: ExtensionSet::empty(),
             inserted: Vec::new(),
             executable: None,
+            inherited_rpaths: Vec::new(),
         }
     }
 
@@ -130,6 +136,15 @@ impl<S: MachSpec + 'static> Loader<S> {
     /// does for every image loaded after the program started.
     pub fn executable_path(&mut self, path: String) -> &mut Self {
         self.executable = Some(path);
+        self
+    }
+
+    /// Search `rpaths` for the root's `@rpath` dependencies after its own, as
+    /// dyld does with the rpaths of the images that loaded it. Each entry must
+    /// already be expanded against the image that declared it: an
+    /// `@loader_path` here would be read against the wrong image.
+    pub fn inherit_rpaths(&mut self, rpaths: Vec<String>) -> &mut Self {
+        self.inherited_rpaths = rpaths;
         self
     }
 
@@ -199,7 +214,11 @@ impl<S: MachSpec + 'static> Loader<S> {
             bytes: root_obj.bytes().to_vec(),
             file_offset: slice_offset(root, root_obj.bytes()),
             requested_as: Vec::new(),
-            rpaths: root_obj.rpaths().map(|r| r.to_string()).collect(),
+            rpaths: root_obj
+                .rpaths()
+                .map(|r| r.to_string())
+                .chain(self.inherited_rpaths.iter().cloned())
+                .collect(),
             implied: self.inserted.clone(),
         }];
         if !self.policy.load_dependencies {
@@ -229,6 +248,14 @@ impl<S: MachSpec + 'static> Loader<S> {
                         .iter()
                         .map(|n| (n.clone(), DependencyKind::Load)),
                 );
+                // A stand-in is not fetched, but what it re-exports is real and
+                // has to be. Weak, because a base without one leaves its imports
+                // to be named unbound rather than failing the link.
+                let reexported: Vec<String> = deps
+                    .iter()
+                    .flat_map(|(name, _)| providers.iter().flat_map(|p| p.reexports(name)))
+                    .collect();
+                deps.extend(reexported.into_iter().map(|n| (n, DependencyKind::Weak)));
                 (deps, img.path.clone(), img.rpaths.clone())
             };
             next += 1;

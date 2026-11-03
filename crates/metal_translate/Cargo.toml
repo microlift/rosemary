@@ -19,3 +19,6 @@ sha2.workspace = true
 # Only `examples/shader_stats`, which compiles translated modules on a real
 # adapter; the translator itself knows nothing of Vulkan.
 ash.workspace = true
+
+[lints]
+workspace = true

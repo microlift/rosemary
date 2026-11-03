@@ -30,8 +30,6 @@
     # be there for hosts without them; the host's still comes first.
     "libgbm.so*" "libdrm.so*" "libsystemd.so*" "libudev.so*" "libdbus-1.so*"
     "libxcb*.so*" "libX11-xcb.so*" "libXinerama.so*"
-    # Flite, WebKit's speech synthesizer, links PulseAudio.
-    "libpulse.so*" "libpulse-simple.so*"
   ] else [ ]);
 
   # Tied to the host's hardware, drivers, sound servers or window system, so a
@@ -43,10 +41,16 @@
     "libX11*" "libX11-xcb*" "libXext*" "libXcursor*" "libXi.so*" "libXfixes*"
     "libXrandr*" "libXrender*" "libXss*" "libXinerama*" "libXtst*"
     "libXxf86vm*" "libXau*" "libXdmcp*" "libxcb*"
-    "libasound*" "libpulse*" "libpipewire*" "libjack*" "libsndio*"
+    "libasound*" "libpipewire*" "libjack*" "libsndio*"
     "libudev*" "libdbus-1*" "libsystemd*" "libdecor*" "libibus*"
     "libxkbcommon-x11*"
   ] ++ (if withWebkit then [ ] else [
+    # Flite, WebKit's speech synthesizer, links libpulse-simple, which links
+    # libpulse and its private libpulsecommon. With WebKit all three are
+    # vendored as one set: mixed with the host's, as a host-first fallback
+    # allows, they fail on symbols an older host copy lacks. The client
+    # protocol is stable, so the set talks to any PulseAudio or pipewire-pulse.
+    "libpulse*"
     # Left to the host's GTK stack; Rosemary reports the library missing when
     # the host has none.
     "libwebkitgtk-*" "libjavascriptcoregtk-*"

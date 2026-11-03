@@ -3,8 +3,12 @@
 //! Where a sandbox refuses them, the pipe does the same job a page at a time.
 
 use core::ffi::c_void;
+use std::io;
+use std::os::fd::{FromRawFd, OwnedFd};
 
 use crate::memory::piped;
+
+pub const NORESERVE: libc::c_int = libc::MAP_NORESERVE;
 
 /// Whether the calls were refused once, so the rest go straight to the pipe.
 static REFUSED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
@@ -65,4 +69,21 @@ pub unsafe fn write(address: usize, data: &[u8]) -> usize {
     }
     // SAFETY: the caller's obligation.
     unsafe { piped::write(address, data) }
+}
+
+pub fn object() -> io::Result<OwnedFd> {
+    // SAFETY: a NUL-terminated name, which only labels the object in `/proc`.
+    match unsafe { libc::memfd_create(c"rosemary-memory-object".as_ptr(), libc::MFD_CLOEXEC) } {
+        -1 => Err(io::Error::last_os_error()),
+        // SAFETY: a descriptor the call just opened.
+        fd => Ok(unsafe { OwnedFd::from_raw_fd(fd) }),
+    }
+}
+
+pub fn exclude_from_fork(address: usize, len: usize) -> io::Result<()> {
+    // SAFETY: advice about a range, which the kernel checks is mapped.
+    match unsafe { libc::madvise(address as *mut c_void, len, libc::MADV_DONTFORK) } {
+        0 => Ok(()),
+        _ => Err(io::Error::last_os_error()),
+    }
 }

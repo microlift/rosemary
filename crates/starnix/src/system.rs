@@ -28,6 +28,13 @@ pub struct CpuTicks {
     pub idle: u64,
 }
 
+/// Swap space, in bytes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub struct Swap {
+    pub total: u64,
+    pub free: u64,
+}
+
 pub fn page_size() -> u64 {
     // SAFETY: `sysconf` only reads its argument.
     (unsafe { libc::sysconf(libc::_SC_PAGESIZE) }).max(4096) as u64
@@ -49,6 +56,31 @@ pub fn physical_cores() -> Option<u32> {
 /// The CPU's marketing name.
 pub fn cpu_brand() -> Option<String> {
     sys::cpu_brand()
+}
+
+/// Processor packages - sockets - however many cores each carries.
+pub fn packages() -> Option<u32> {
+    sys::packages()
+}
+
+/// The CPU's nominal clock in hertz, or its highest where the host does not
+/// say which is nominal.
+pub fn cpu_frequency() -> Option<u64> {
+    sys::cpu_frequency()
+}
+
+/// When the machine booted, on the wall clock.
+pub fn boot_time() -> Option<std::time::SystemTime> {
+    sys::booted()
+}
+
+pub fn swap() -> Option<Swap> {
+    sys::swap()
+}
+
+/// The most processes the system runs at once.
+pub fn max_processes() -> Option<u32> {
+    sys::max_processes()
 }
 
 /// A UUID that names this machine and stays the same across boots.
@@ -94,5 +126,17 @@ mod tests {
     #[test]
     fn there_is_at_least_one_core() {
         assert!(physical_cores().is_none_or(|cores| cores >= 1));
+        assert!(packages().is_none_or(|packages| packages >= 1));
+    }
+
+    #[test]
+    fn the_machine_booted_in_the_past() {
+        let now = std::time::SystemTime::now();
+        assert!(boot_time().is_none_or(|booted| booted < now));
+    }
+
+    #[test]
+    fn free_swap_fits_in_the_total() {
+        assert!(swap().is_none_or(|swap| swap.free <= swap.total));
     }
 }

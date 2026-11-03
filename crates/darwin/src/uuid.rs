@@ -230,7 +230,7 @@ unsafe extern "C" fn gethostuuid(out: *mut u8, _wait: *const libc::timespec) -> 
 
 exports::exports! {
     functions {
-        "gethostuuid" => gethostuuid,
+        "gethostuuid" | "___gethostuuid" => gethostuuid,
         "uuid_clear" => clear,
         "uuid_compare" => compare,
         "uuid_copy" => copy,

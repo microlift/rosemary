@@ -1,7 +1,7 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Byte offset of `invoke` in a `Block_layout`, after `isa`, `flags` and `reserved`.
-const INVOKE_OFFSET: u64 = 16;
+pub(crate) const INVOKE_OFFSET: u64 = 16;
 
 /// `_Block_copy` and `_Block_release`, as the crate that owns them registers them.
 static COPY: AtomicU64 = AtomicU64::new(0);

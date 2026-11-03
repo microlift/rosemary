@@ -19,6 +19,7 @@ pub const KERN_UREFS_OVERFLOW: i32 = 19;
 pub const KERN_INVALID_CAPABILITY: i32 = 20;
 pub const KERN_RIGHT_EXISTS: i32 = 21;
 pub const KERN_NOT_IN_SET: i32 = 23;
+pub const KERN_INVALID_OBJECT: i32 = 29;
 pub const KERN_TERMINATED: i32 = 37;
 pub const KERN_OPERATION_TIMED_OUT: i32 = 49;
 
@@ -71,6 +72,7 @@ pub fn describe(code: i32) -> Option<&'static str> {
         KERN_INVALID_CAPABILITY => "(os/kern) invalid capability",
         KERN_RIGHT_EXISTS => "(os/kern) right exists",
         KERN_NOT_IN_SET => "(os/kern) not in set",
+        KERN_INVALID_OBJECT => "(os/kern) invalid object",
         KERN_TERMINATED => "(os/kern) terminated",
         KERN_OPERATION_TIMED_OUT => "(os/kern) operation timed out",
         MACH_SEND_INVALID_DEST => "(ipc/send) invalid destination port",

@@ -1079,7 +1079,7 @@ impl Vm {
 
             // The guest asked what CPU it is running on.
             ExitReason::Cpuid => {
-                let [eax, ebx, ecx, edx] = cpuid(ctx.rax as u32, ctx.rcx as u32);
+                let [eax, ebx, ecx, edx] = darwin::cpu::cpuid(ctx.rax as u32, ctx.rcx as u32);
                 // `CPUID` writes the 32-bit registers, which zero-extend.
                 ctx.rax = eax as u64;
                 ctx.rbx = ebx as u64;
@@ -1323,11 +1323,26 @@ impl Vm {
         guest_va: u64,
         signature: crate::thunk::ThunkSignature,
     ) -> Result<u64, VmError> {
-        if let Some(existing) = self.host_thunk_for(guest_va) {
+        // A generic thunk is not ABI-compatible, and a guest address may be
+        // used with more than one callback prototype. Typed thunks are not in
+        // the published view, but a read lock does not stall other readers.
+        let cached = self
+            .thunks
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .typed_host_for(guest_va, &signature);
+        if let Some(existing) = cached {
             return Ok(existing);
         }
-        let thunk = crate::thunk::build_typed(guest_va, signature)?;
-        let host = self.insert_thunk(thunk);
+        // Compiled outside the lock; a thread that lost the race to insert
+        // drops its copy, which nothing has seen yet.
+        let thunk = crate::thunk::build_typed(guest_va, signature.clone())?;
+        let mut table = self.thunks.write().unwrap_or_else(|e| e.into_inner());
+        let (host, kept) = table.insert_typed(signature, thunk);
+        if kept {
+            self.publish_thunk_view(&table);
+        }
+        drop(table);
         // As in `thunk_for`: handing the pointer out is the demand signal.
         let _ = self.cache.get_or_lift(&self.program, guest_va);
         Ok(host)
@@ -1337,6 +1352,8 @@ impl Vm {
         if let Some(existing) = self.host_thunk_for(guest_va) {
             return Ok(existing);
         }
+        // As for typed thunks: built outside the lock, and the first one
+        // inserted is the one every caller gets.
         let thunk = crate::thunk::build(guest_va)?;
         let host = self.insert_thunk(thunk);
 
@@ -1345,7 +1362,7 @@ impl Vm {
         Ok(host)
     }
 
-    /// How many guest function pointers have been handed to host code.
+    /// How many host thunks exist, including typed variants of one guest address.
     pub fn thunks(&self) -> usize {
         self.thunks.read().unwrap_or_else(|e| e.into_inner()).len()
     }
@@ -1395,7 +1412,14 @@ impl Vm {
     /// Add a thunk and republish the snapshot, both under the one lock.
     fn insert_thunk(&self, thunk: crate::thunk::Thunk) -> u64 {
         let mut table = self.thunks.write().unwrap_or_else(|e| e.into_inner());
-        let host = table.insert(thunk);
+        let (host, kept) = table.insert(thunk);
+        if kept {
+            self.publish_thunk_view(&table);
+        }
+        host
+    }
+
+    fn publish_thunk_view(&self, table: &ThunkTable) {
         let view = Box::leak(Box::new(table.view()));
         let count = view.count;
         self.thunk_view.store(view, Ordering::Release);
@@ -1405,7 +1429,6 @@ impl Vm {
         // An address that meant nothing a moment ago is now a thunk. See
         // [`crate::dispatch::invalidate`].
         crate::dispatch::invalidate();
-        host
     }
 
     /// Record an error raised inside a host->guest callback, on the thread it happened
@@ -1424,119 +1447,6 @@ impl Vm {
     /// Take whatever error a callback left behind on this thread.
     pub fn take_pending(&self) -> Option<VmError> {
         crate::thread::current().and_then(|s| s.pending.borrow_mut().take())
-    }
-}
-
-/// The highest basic leaf this runtime answers. Leaves above it read as zero.
-const MAX_BASIC_LEAF: u32 = 1;
-
-/// The highest extended leaf answered: the last quarter of the brand string.
-const MAX_EXTENDED_LEAF: u32 = 0x8000_0004;
-
-/// The processor brand string, `NUL`-padded to the 48 bytes leaves
-/// `0x80000002..=0x80000004` spell out.
-const BRAND: [u8; 48] = brand();
-
-const fn brand() -> [u8; 48] {
-    let name = b"rosemary (microlift x86-64 on arm64) @ 2.67GHz";
-    let mut out = [0u8; 48];
-    let mut i = 0;
-    while i < name.len() {
-        out[i] = name[i];
-        i += 1;
-    }
-    out
-}
-
-fn cpuid(leaf: u32, subleaf: u32) -> [u32; 4] {
-    /// A four-byte slice of the brand string, as the little-endian word the
-    /// register holds.
-    fn brand_word(offset: usize) -> u32 {
-        u32::from_le_bytes([
-            BRAND[offset],
-            BRAND[offset + 1],
-            BRAND[offset + 2],
-            BRAND[offset + 3],
-        ])
-    }
-
-    match leaf {
-        // Vendor String: "GenuineIntel"
-        0x0 => [
-            MAX_BASIC_LEAF,
-            u32::from_le_bytes(*b"Genu"),
-            u32::from_le_bytes(*b"ntel"),
-            u32::from_le_bytes(*b"ineI"),
-        ],
-
-        // Family / Model / Stepping & Standard Features
-        0x1 => {
-            // Family 6, Model 44 (0x2C), Stepping 0.
-            let version = 0x0002_06C0;
-
-            // Cache line size (64 bytes -> 8 units of 8-bytes) in bits 15:8
-            let misc = 8 << 8;
-
-            // FPU | TSC | CX8 | CMOV | SSE | SSE2
-            let edx = (1 << 0) | (1 << 4) | (1 << 8) | (1 << 15) | (1 << 25) | (1 << 26);
-
-            // SSE3 (bit 0) | SSSE3 (bit 9) | SSE4.1 (bit 19) | SSE4.2 (bit 20) | AES-NI (bit 25) | Hypervisor (bit 31)
-            let ecx = (1 << 0) | (1 << 9) | (1 << 19) | (1 << 20) | (1 << 25) | (1 << 31);
-
-            [version, misc, ecx, edx]
-        }
-
-        // Leaf 4: Deterministic Cache Parameters
-        0x4 => match subleaf {
-            // L1 Data Cache (128 KB, 64-byte line, 8-way)
-            0 => {
-                let eax = (1 << 0) | (1 << 5) | (1 << 8); // Type: Data (1), Level: 1, Self Initializing
-                let ebx = (63 << 0) | (0 << 12) | (7 << 22); // Line size (63+1=64), Partitions (0+1=1), Ways (7+1=8)
-                let ecx = 255; // Sets (255+1=256) -> 256 * 64 * 1 * 8 = 128 KB
-                let edx = 0;
-                [eax, ebx, ecx, edx]
-            }
-            // L1 Instruction Cache (128 KB, 64-byte line, 8-way)
-            1 => {
-                let eax = (2 << 0) | (1 << 5) | (1 << 8); // Type: Instruction (2), Level: 1, Self Initializing
-                let ebx = (63 << 0) | (0 << 12) | (7 << 22); // Line size 64, 8-way
-                let ecx = 255; // Sets 256 -> 128 KB
-                let edx = 0;
-                [eax, ebx, ecx, edx]
-            }
-            // L2 Unified Cache (8192 KB / 8 MB, 64-byte line, 16-way)
-            2 => {
-                let eax = (3 << 0) | (2 << 5) | (1 << 8); // Type: Unified (3), Level: 2, Self Initializing
-                let ebx = (63 << 0) | (0 << 12) | (15 << 22); // Line size 64, Ways (15+1=16)
-                let ecx = 8191; // Sets (8191+1=8192) -> 8192 * 64 * 1 * 16 = 8192 KB
-                let edx = 0;
-                [eax, ebx, ecx, edx]
-            }
-            // No more caches
-            _ => [0, 0, 0, 0],
-        },
-
-        // Leaf 7: Structured Extended Feature Flags
-        0x7 => [0, 0, 0, 0], // Sub-leaf 0: No AVX2, BMI, AVX-512, SHA, etc.
-
-        // Extended Leaves
-        0x8000_0000 => [MAX_EXTENDED_LEAF, 0, 0, 0],
-
-        // Extended Processor Info (64-bit Long Mode enabled)
-        0x8000_0001 => [0, 0, 0, 1 << 29],
-
-        // Brand String across leaves 0x80000002 to 0x80000004
-        0x8000_0002..=0x8000_0004 => {
-            let base = (leaf - 0x8000_0002) as usize * 16;
-            [
-                brand_word(base),
-                brand_word(base + 4),
-                brand_word(base + 8),
-                brand_word(base + 12),
-            ]
-        }
-
-        _ => [0, 0, 0, 0],
     }
 }
 
@@ -1665,28 +1575,71 @@ impl crate::objc::Realizer for Vm {
     }
 }
 
-impl crate::abi::Callbacks for Vm {
-    fn substitute(&self, symbol: &str, va: u64) -> Result<u64, AbiError> {
+/// What a guest-held function pointer is on its way out to host code.
+enum Outbound {
+    /// Already callable by the host, and passed as it is.
+    Host(u64),
+    /// Guest code, which needs a thunk of the callee's chosen kind.
+    Guest(u64),
+}
+
+impl Vm {
+    /// Classify a pointer for [`crate::abi::Callbacks::substitute`] and its typed twin,
+    /// so both apply the same rules.
+    fn outbound(&self, va: u64) -> Outbound {
         if va == 0 {
-            return Ok(0);
+            return Outbound::Host(0);
+        }
+        // A thunk the guest read back out of host-visible state. Its guest
+        // target is what gets a thunk again: the one it came from may have a
+        // different ABI from the one this callee calls through.
+        if let Some(guest) = self.guest_behind_thunk(va) {
+            return Outbound::Guest(guest);
         }
         // One of this runtime's own import stubs, which the guest is holding
         // because a slot it loaded was substituted for one.
         if let Some(host) = crate::trampoline::host_behind(va) {
-            return Ok(host);
+            return Outbound::Host(host);
         }
         // Not guest code: a host pointer the guest is handing back, which the
         // host may compare against one it gave out.
         if !self.program.is_guest_address(va) {
-            return Ok(va);
+            return Outbound::Host(va);
         }
-        self.thunk_for(va).map_err(|e: VmError| AbiError::Refused {
-            symbol: symbol.to_string(),
-            reason: match e {
-                VmError::Thunk { .. } => "a host->guest thunk could not be built",
-                _ => "the guest function pointer could not be made callable",
-            },
-        })
+        Outbound::Guest(va)
+    }
+}
+
+fn thunk_refusal(symbol: &str, e: VmError) -> AbiError {
+    AbiError::Refused {
+        symbol: symbol.to_string(),
+        reason: match e {
+            VmError::Thunk { .. } => "a host->guest thunk could not be built",
+            _ => "the guest function pointer could not be made callable",
+        },
+    }
+}
+
+impl crate::abi::Callbacks for Vm {
+    fn substitute(&self, symbol: &str, va: u64) -> Result<u64, AbiError> {
+        match self.outbound(va) {
+            Outbound::Host(host) => Ok(host),
+            Outbound::Guest(guest) => self.thunk_for(guest).map_err(|e| thunk_refusal(symbol, e)),
+        }
+    }
+
+    fn substitute_typed(
+        &self,
+        symbol: &str,
+        va: u64,
+        signature: crate::thunk::ThunkSignature,
+    ) -> Result<u64, AbiError> {
+        match self.outbound(va) {
+            Outbound::Host(host) => Ok(host),
+            Outbound::Guest(guest) => self
+                .typed_thunk_for(guest, signature)
+                .map_err(|e| thunk_refusal(symbol, e)),
+        }
     }
 
     /// A thunk handed back by host code becomes the guest pointer it stands for.
@@ -1731,85 +1684,5 @@ mod tests {
         // And a span may not bridge two regions, however close they look in a
         // sorted list.
         assert!(!fits(0x10ff, 0x2f02));
-    }
-
-    /// A guest reads the vendor before it reads anything else, and it reads it
-    /// out of three registers in an order that is easy to transpose.
-    #[test]
-    fn leaf_zero_spells_the_vendor() {
-        let [eax, ebx, ecx, edx] = cpuid(0, 0);
-        let mut vendor = Vec::new();
-        vendor.extend_from_slice(&ebx.to_le_bytes());
-        vendor.extend_from_slice(&edx.to_le_bytes());
-        vendor.extend_from_slice(&ecx.to_le_bytes());
-        assert_eq!(&vendor, b"GenuineIntel");
-        assert_eq!(eax, MAX_BASIC_LEAF);
-    }
-
-    /// The whole point of the reply: SSE2 yes, everything microlift cannot lift no.
-    #[test]
-    fn leaf_one_advertises_the_baseline_and_no_more() {
-        let [_, _, ecx, edx] = cpuid(1, 0);
-        for (bit, name) in [
-            (0, "fpu"),
-            (4, "tsc"),
-            (8, "cx8"),
-            (25, "sse"),
-            (26, "sse2"),
-        ] {
-            assert_ne!(edx & (1 << bit), 0, "{name} should be advertised");
-        }
-        // MMX and FXSR: baseline on real hardware, unimplemented here.
-        for (bit, name) in [(23, "mmx"), (24, "fxsr")] {
-            assert_eq!(edx & (1 << bit), 0, "{name} should not be advertised");
-        }
-        for (bit, name) in [
-            (13, "cmpxchg16b"),
-            (23, "popcnt"),
-            (26, "xsave"),
-            (27, "osxsave"),
-            (28, "avx"),
-        ] {
-            assert_eq!(ecx & (1 << bit), 0, "{name} should not be advertised");
-        }
-        // Emulated, and saying so.
-        assert_ne!(ecx & (1 << 31), 0, "hypervisor bit should be set");
-    }
-
-    /// The brand string is one 48-byte block split across twelve registers,
-    /// and a misordered word would still look like a plausible string.
-    #[test]
-    fn brand_string_reassembles() {
-        let mut bytes = Vec::new();
-        for leaf in 0x8000_0002..=0x8000_0004 {
-            for word in cpuid(leaf, 0) {
-                bytes.extend_from_slice(&word.to_le_bytes());
-            }
-        }
-        assert_eq!(bytes.len(), 48);
-        let text = String::from_utf8(bytes).expect("brand is ascii");
-        assert!(
-            text.starts_with("rosemary (microlift x86-64 on arm64)"),
-            "{text}"
-        );
-        assert!(text.ends_with('\0'), "brand string is NUL-terminated");
-        assert_eq!(cpuid(0x8000_0000, 0)[0], MAX_EXTENDED_LEAF);
-    }
-
-    /// Long mode, since the code asking is 64-bit and already running.
-    #[test]
-    fn extended_leaf_one_reports_long_mode() {
-        assert_ne!(cpuid(0x8000_0001, 0)[3] & (1 << 29), 0);
-    }
-
-    /// Out of range in either space reads as zero rather than as some other
-    /// leaf's feature words, and the sub-leaf changes nothing.
-    #[test]
-    fn unknown_leaves_are_zero() {
-        assert_eq!(cpuid(MAX_BASIC_LEAF + 1, 0), [0, 0, 0, 0]);
-        assert_eq!(cpuid(7, 0), [0, 0, 0, 0]);
-        assert_eq!(cpuid(0x4000_0000, 0), [0, 0, 0, 0]);
-        assert_eq!(cpuid(MAX_EXTENDED_LEAF + 1, 0), [0, 0, 0, 0]);
-        assert_eq!(cpuid(1, 0), cpuid(1, 7));
     }
 }

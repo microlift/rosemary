@@ -94,6 +94,11 @@ pub fn data_symbols() -> Vec<(String, u64)> {
         "MTLRenderPipelineDescriptor",
         "MTLRenderPassDescriptor",
         "MTLCompileOptions",
+        "MTLComputePipelineDescriptor",
+        "MTLFunctionConstantValues",
+        "MTLStageInputOutputDescriptor",
+        "MTLSharedEventListener",
+        "MTLCommandBufferDescriptor",
     ]
     .into_iter()
     .filter_map(|name| {

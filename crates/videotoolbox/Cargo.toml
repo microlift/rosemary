@@ -1,0 +1,13 @@
+[package]
+name = "videotoolbox"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+exports.workspace = true
+corefoundation.workspace = true
+coremedia.workspace = true
+
+[lints]
+workspace = true

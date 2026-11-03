@@ -14,7 +14,8 @@
  *
  * <root> is the directory above the one this library is in. Bubblewrap's
  * arguments arrive in a sealed memfd (`--args N`), so that is rewritten into
- * a new one at the same descriptor, with the bundle bound into the sandbox.
+ * a new one at the same descriptor, with the bundle bound into the sandbox
+ * and nixpkgs' bind of /nix/store made optional.
  *
  * A program from the bundle runs under the bundle's loader when the launcher
  * chose the bundled glibc (ROSEMARY_GLIBC_SELECTED); a program from the host
@@ -114,6 +115,8 @@ static int located(void)
     pthread_once(&once, locate);
     return self.root[0] != 0;
 }
+
+static const char NIX_STORE[] = "/nix/store";
 
 static const char *const BAKED[] = {BAKED_LIBEXEC, BAKED_BWRAP, BAKED_DBUS_PROXY};
 
@@ -249,6 +252,13 @@ static int rewrite_bwrap_args(int fd, int command_from_host)
             at += strnlen(data + at, size - at) + 1;
             const char *host = host_library_path();
             if (host && *host && (push(&out, "--setenv", 0) || push(&out, "LD_LIBRARY_PATH", 0) || push(&out, host, 0)))
+                goto fail_out;
+            continue;
+        }
+        /* nixpkgs' WebKit binds the store unconditionally, and bwrap refuses
+         * to start on a host without one. Nothing from it is needed here. */
+        if (strcmp(arg, "--ro-bind") == 0 && at < size && strcmp(data + at, NIX_STORE) == 0) {
+            if (push(&out, "--ro-bind-try", 0))
                 goto fail_out;
             continue;
         }

@@ -15,23 +15,107 @@ use crate::quartz::{self, Shading};
 
 type Rgba = [f64; 4];
 
-const BORDER: Rgba = [0.0, 0.0, 0.0, 0.32];
-const BORDER_DISABLED: Rgba = [0.0, 0.0, 0.0, 0.16];
-const FACE_TOP: Rgba = [1.0, 1.0, 1.0, 1.0];
-const FACE_BOTTOM: Rgba = [0.94, 0.94, 0.94, 1.0];
-const PRESSED_TOP: Rgba = [0.80, 0.80, 0.80, 1.0];
-const PRESSED_BOTTOM: Rgba = [0.74, 0.74, 0.74, 1.0];
 const ACCENT_TOP: Rgba = [0.33, 0.62, 0.98, 1.0];
 const ACCENT_BOTTOM: Rgba = [0.07, 0.43, 0.92, 1.0];
 const ACCENT_BORDER: Rgba = [0.0, 0.25, 0.65, 0.6];
-const MARK: Rgba = [0.0, 0.0, 0.0, 0.85];
-const MARK_DISABLED: Rgba = [0.0, 0.0, 0.0, 0.3];
 const FOCUS: Rgba = [0.23, 0.53, 0.96, 0.55];
 const TRACK: Rgba = [0.98, 0.98, 0.98, 1.0];
 const TRACK_EDGE: Rgba = [0.0, 0.0, 0.0, 0.12];
 const THUMB: Rgba = [0.0, 0.0, 0.0, 0.38];
-const FIELD_TOP: Rgba = [0.0, 0.0, 0.0, 0.42];
-const FIELD_SIDE: Rgba = [0.0, 0.0, 0.0, 0.25];
+const DARK_TRACK: Rgba = [0.17, 0.17, 0.17, 1.0];
+const DARK_TRACK_EDGE: Rgba = [1.0, 1.0, 1.0, 0.08];
+const LIGHT_THUMB: Rgba = [1.0, 1.0, 1.0, 0.38];
+const CLEAR: Rgba = [0.0; 4];
+const WHITE: Rgba = [1.0; 4];
+
+/// The colours of the controls in one appearance.
+pub(crate) struct Palette {
+    face_top: Rgba,
+    face_bottom: Rgba,
+    pressed_top: Rgba,
+    pressed_bottom: Rgba,
+    /// A line along the top of a face, the light catching its edge.
+    highlight: Rgba,
+    border: Rgba,
+    border_disabled: Rgba,
+    /// The drop shadow a point under a face.
+    shadow: Rgba,
+    mark: Rgba,
+    mark_secondary: Rgba,
+    mark_disabled: Rgba,
+    field_fill: Rgba,
+    field_top: Rgba,
+    field_side: Rgba,
+    /// A hairline between parts: a header's divider, a group box's edge.
+    edge: Rgba,
+    panel: Rgba,
+    menu: Rgba,
+    trough_top: Rgba,
+    trough_bottom: Rgba,
+    slider_track: Rgba,
+    tick: Rgba,
+}
+
+const AQUA: Palette = Palette {
+    face_top: WHITE,
+    face_bottom: [0.94, 0.94, 0.94, 1.0],
+    pressed_top: [0.80, 0.80, 0.80, 1.0],
+    pressed_bottom: [0.74, 0.74, 0.74, 1.0],
+    highlight: CLEAR,
+    border: [0.0, 0.0, 0.0, 0.32],
+    border_disabled: [0.0, 0.0, 0.0, 0.16],
+    shadow: [0.0, 0.0, 0.0, 0.08],
+    mark: [0.0, 0.0, 0.0, 0.85],
+    mark_secondary: [0.0, 0.0, 0.0, 0.6],
+    mark_disabled: [0.0, 0.0, 0.0, 0.3],
+    field_fill: WHITE,
+    field_top: [0.0, 0.0, 0.0, 0.42],
+    field_side: [0.0, 0.0, 0.0, 0.25],
+    edge: TRACK_EDGE,
+    panel: [0.0, 0.0, 0.0, 0.04],
+    menu: [0.97, 0.97, 0.97, 1.0],
+    trough_top: [0.88, 0.88, 0.88, 1.0],
+    trough_bottom: [0.94, 0.94, 0.94, 1.0],
+    slider_track: [0.0, 0.0, 0.0, 0.2],
+    tick: [0.0, 0.0, 0.0, 0.5],
+};
+
+/// Dark Aqua as Catalina draws it: lifted grey faces with a lit top edge and
+/// a shadow beneath. The borders are stronger than Apple's so that a control
+/// still reads against the window's grey.
+const DARK_AQUA: Palette = Palette {
+    face_top: [0.42, 0.42, 0.42, 1.0],
+    face_bottom: [0.38, 0.38, 0.38, 1.0],
+    pressed_top: [0.52, 0.52, 0.52, 1.0],
+    pressed_bottom: [0.48, 0.48, 0.48, 1.0],
+    highlight: [1.0, 1.0, 1.0, 0.2],
+    border: [0.0, 0.0, 0.0, 0.35],
+    border_disabled: [0.0, 0.0, 0.0, 0.2],
+    shadow: [0.0, 0.0, 0.0, 0.3],
+    mark: [1.0, 1.0, 1.0, 0.88],
+    mark_secondary: [1.0, 1.0, 1.0, 0.6],
+    mark_disabled: [1.0, 1.0, 1.0, 0.3],
+    field_fill: [1.0, 1.0, 1.0, 0.05],
+    field_top: [1.0, 1.0, 1.0, 0.3],
+    field_side: [1.0, 1.0, 1.0, 0.2],
+    edge: [1.0, 1.0, 1.0, 0.12],
+    panel: [1.0, 1.0, 1.0, 0.03],
+    menu: [0.16, 0.16, 0.16, 1.0],
+    trough_top: [0.20, 0.20, 0.20, 1.0],
+    trough_bottom: [0.25, 0.25, 0.25, 1.0],
+    slider_track: [1.0, 1.0, 1.0, 0.2],
+    tick: [1.0, 1.0, 1.0, 0.5],
+};
+
+impl Palette {
+    /// The palette of the current drawing appearance.
+    fn current() -> &'static Palette {
+        match crate::appearance::is_dark() {
+            true => &DARK_AQUA,
+            false => &AQUA,
+        }
+    }
+}
 
 /// The size class a control is drawn at.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -75,6 +159,7 @@ pub(crate) enum Value {
 /// with the top edge at `bounds.origin.y`. The state is restored on drop.
 pub(crate) struct Painter {
     context: CFTypeRef,
+    palette: &'static Palette,
 }
 
 impl Painter {
@@ -93,7 +178,10 @@ impl Painter {
             cg::CGContextSetShouldAntialias(context, 1);
             cg::CGContextBeginPath(context);
         }
-        Some(Painter { context })
+        Some(Painter {
+            context,
+            palette: Palette::current(),
+        })
     }
 
     fn rounded(&self, r: NSRect, radius: f64) {
@@ -201,20 +289,39 @@ impl Painter {
 
     /// A button face: the gradient and its border, or the accent colour.
     fn face(&self, r: NSRect, radius: f64, look: Look, accent: bool) {
-        let (top, bottom, border) = match (look.pressed, accent && !look.disabled) {
-            (true, false) => (PRESSED_TOP, PRESSED_BOTTOM, BORDER),
+        let palette = self.palette;
+        let accent = accent && !look.disabled;
+        let (top, bottom, border) = match (look.pressed, accent) {
+            (true, false) => (palette.pressed_top, palette.pressed_bottom, palette.border),
             (false, true) => (ACCENT_TOP, ACCENT_BOTTOM, ACCENT_BORDER),
             (true, true) => (ACCENT_BOTTOM, ACCENT_BOTTOM, ACCENT_BORDER),
-            (false, false) => (FACE_TOP, FACE_BOTTOM, BORDER),
+            (false, false) => (palette.face_top, palette.face_bottom, palette.border),
         };
         let border = if look.disabled {
-            BORDER_DISABLED
+            palette.border_disabled
         } else {
             border
         };
         // A one-point shadow under the face.
-        self.fill_rounded(offset(r, 0.0, 0.5), radius, [0.0, 0.0, 0.0, 0.08]);
-        self.gradient_rounded(r, radius, top, bottom);
+        self.fill_rounded(offset(r, 0.0, 0.5), radius, palette.shadow);
+        if palette.highlight[3] > 0.0 && !accent {
+            // The face drawn a point lower leaves the highlight showing
+            // along the top, following its corners.
+            self.fill_rounded(r, radius, palette.highlight);
+            self.gradient_rounded(
+                rect(
+                    r.origin.x,
+                    r.origin.y + 1.0,
+                    r.size.width,
+                    r.size.height - 1.0,
+                ),
+                radius,
+                top,
+                bottom,
+            );
+        } else {
+            self.gradient_rounded(r, radius, top, bottom);
+        }
         self.stroke_rounded(r, radius, 1.0, border);
         if look.focused {
             self.focus_ring_rounded(r, radius);
@@ -334,9 +441,9 @@ pub(crate) fn check_box(p: &Painter, frame: NSRect, size: Size, value: Value, lo
     let on = value != Value::Off;
     p.face(r, 3.0, look, on);
     let mark = match (on, look.disabled) {
-        (_, true) => MARK_DISABLED,
-        (true, false) => [1.0, 1.0, 1.0, 1.0],
-        (false, false) => MARK,
+        (_, true) => p.palette.mark_disabled,
+        (true, false) => WHITE,
+        (false, false) => p.palette.mark,
     };
     let (x, y, s) = (r.origin.x, r.origin.y, side);
     match value {
@@ -380,9 +487,9 @@ pub(crate) fn radio_button(p: &Painter, frame: NSRect, size: Size, value: Value,
         let dot = centred_square(r, (side * 0.4).round());
         p.ellipse(dot);
         p.fill(if look.disabled {
-            MARK_DISABLED
+            p.palette.mark_disabled
         } else {
-            [1.0, 1.0, 1.0, 1.0]
+            WHITE
         });
     }
 }
@@ -421,7 +528,11 @@ pub(crate) fn popup_button(p: &Painter, frame: NSRect, size: Size, look: Look, p
     if !disabled {
         p.gradient_rounded(seg, 3.0, ACCENT_TOP, ACCENT_BOTTOM);
     }
-    let color = if disabled { MARK_DISABLED } else { [1.0; 4] };
+    let color = if disabled {
+        p.palette.mark_disabled
+    } else {
+        WHITE
+    };
     let (cx, cy) = (
         seg.origin.x + seg.size.width / 2.0,
         seg.origin.y + seg.size.height / 2.0,
@@ -478,9 +589,9 @@ pub(crate) fn combo_box(p: &Painter, frame: NSRect, size: Size, look: Look) {
         !look.disabled,
     );
     let color = if look.disabled {
-        MARK_DISABLED
+        p.palette.mark_disabled
     } else {
-        [1.0; 4]
+        WHITE
     };
     let (cx, cy) = (
         b.origin.x + b.size.width / 2.0,
@@ -502,19 +613,31 @@ pub(crate) fn combo_box(p: &Painter, frame: NSRect, size: Size, look: Look) {
 /// `r`, which the caller has filled itself.
 pub(crate) fn text_field(p: &Painter, r: NSRect, focused: bool) {
     let (x, y, w, h) = (r.origin.x, r.origin.y, r.size.width, r.size.height);
-    p.rect(rect(x, y, w, 1.0), FIELD_TOP);
-    p.rect(rect(x, y + 1.0, 1.0, h - 1.0), FIELD_SIDE);
-    p.rect(rect(x + w - 1.0, y + 1.0, 1.0, h - 1.0), FIELD_SIDE);
-    p.rect(rect(x + 1.0, y + h - 1.0, w - 2.0, 1.0), FIELD_SIDE);
+    p.rect(rect(x, y, w, 1.0), p.palette.field_top);
+    p.rect(rect(x, y + 1.0, 1.0, h - 1.0), p.palette.field_side);
+    p.rect(
+        rect(x + w - 1.0, y + 1.0, 1.0, h - 1.0),
+        p.palette.field_side,
+    );
+    p.rect(
+        rect(x + 1.0, y + h - 1.0, w - 2.0, 1.0),
+        p.palette.field_side,
+    );
     if focused {
         focus_ring(p, r);
     }
 }
 
+/// A bezeled text field's interior, which the bezel artwork fills whether or
+/// not the field draws its own background.
+pub(crate) fn text_field_fill(p: &Painter, r: NSRect) {
+    p.rect(r, p.palette.field_fill);
+}
+
 /// A round (search) field's frame: a capsule outline.
 pub(crate) fn round_field(p: &Painter, r: NSRect, focused: bool) {
     let radius = r.size.height / 2.0;
-    p.stroke_rounded(r, radius, 1.0, FIELD_SIDE);
+    p.stroke_rounded(r, radius, 1.0, p.palette.field_side);
     if focused {
         p.focus_ring_rounded(r, radius);
     }
@@ -523,10 +646,16 @@ pub(crate) fn round_field(p: &Painter, r: NSRect, focused: bool) {
 /// A list box's frame: one even line.
 pub(crate) fn list_box(p: &Painter, r: NSRect, focused: bool) {
     let (x, y, w, h) = (r.origin.x, r.origin.y, r.size.width, r.size.height);
-    p.rect(rect(x, y, w, 1.0), FIELD_SIDE);
-    p.rect(rect(x, y + 1.0, 1.0, h - 1.0), FIELD_SIDE);
-    p.rect(rect(x + w - 1.0, y + 1.0, 1.0, h - 1.0), FIELD_SIDE);
-    p.rect(rect(x + 1.0, y + h - 1.0, w - 2.0, 1.0), FIELD_SIDE);
+    p.rect(rect(x, y, w, 1.0), p.palette.field_side);
+    p.rect(rect(x, y + 1.0, 1.0, h - 1.0), p.palette.field_side);
+    p.rect(
+        rect(x + w - 1.0, y + 1.0, 1.0, h - 1.0),
+        p.palette.field_side,
+    );
+    p.rect(
+        rect(x + 1.0, y + h - 1.0, w - 2.0, 1.0),
+        p.palette.field_side,
+    );
     if focused {
         focus_ring(p, r);
     }
@@ -542,14 +671,14 @@ pub(crate) fn focus_ring(p: &Painter, r: NSRect) {
 /// trailing edge and a line beneath.
 pub(crate) fn list_header(p: &Painter, r: NSRect, look: Look, sorted: bool) {
     let (top, bottom) = match (look.pressed, sorted) {
-        (true, _) => (PRESSED_TOP, PRESSED_BOTTOM),
+        (true, _) => (p.palette.pressed_top, p.palette.pressed_bottom),
         (false, true) => ([0.93, 0.95, 0.99, 1.0], [0.86, 0.89, 0.96, 1.0]),
-        (false, false) => (FACE_TOP, FACE_BOTTOM),
+        (false, false) => (p.palette.face_top, p.palette.face_bottom),
     };
     p.gradient_rounded(r, 0.0, top, bottom);
     let (x, y, w, h) = (r.origin.x, r.origin.y, r.size.width, r.size.height);
-    p.rect(rect(x, y + h - 1.0, w, 1.0), TRACK_EDGE);
-    p.rect(rect(x + w - 1.0, y + 3.0, 1.0, h - 6.0), TRACK_EDGE);
+    p.rect(rect(x, y + h - 1.0, w, 1.0), p.palette.edge);
+    p.rect(rect(x + w - 1.0, y + 3.0, 1.0, h - 6.0), p.palette.edge);
 }
 
 /// A disclosure triangle pointing right, down or left.
@@ -578,9 +707,9 @@ pub(crate) fn disclosure(p: &Painter, r: NSRect, direction: u16, look: Look) {
     };
     p.polyline(&points, true);
     p.fill(match (look.disabled, look.pressed) {
-        (true, _) => MARK_DISABLED,
-        (false, true) => [0.0, 0.0, 0.0, 1.0],
-        (false, false) => [0.0, 0.0, 0.0, 0.6],
+        (true, _) => p.palette.mark_disabled,
+        (false, true) => p.palette.mark,
+        (false, false) => p.palette.mark_secondary,
     });
 }
 
@@ -626,9 +755,13 @@ pub(crate) fn inc_dec(
     }
     p.rect(
         rect(r.origin.x + 1.0, r.origin.y + half - 0.5, w - 2.0, 1.0),
-        TRACK_EDGE,
+        p.palette.edge,
     );
-    let color = if look.disabled { MARK_DISABLED } else { MARK };
+    let color = if look.disabled {
+        p.palette.mark_disabled
+    } else {
+        p.palette.mark
+    };
     let cx = r.origin.x + w / 2.0;
     let s = (w / 4.5).max(1.5);
     let up_y = r.origin.y + half / 2.0;
@@ -668,7 +801,11 @@ pub(crate) fn arrow_button(p: &Painter, frame: NSRect, look: Look) {
         ],
         true,
     );
-    p.fill(if look.disabled { MARK_DISABLED } else { MARK });
+    p.fill(if look.disabled {
+        p.palette.mark_disabled
+    } else {
+        p.palette.mark
+    });
 }
 
 /// Where a scroll bar's thumb lies along its track, from the track's range,
@@ -699,25 +836,66 @@ pub(crate) fn scroll_bar(
     thumb: Option<(f64, f64)>,
     pressed: bool,
 ) {
-    p.rect(r, TRACK);
-    let (x, y, w, h) = (r.origin.x, r.origin.y, r.size.width, r.size.height);
-    match horizontal {
-        true => p.rect(rect(x, y, w, 1.0), TRACK_EDGE),
-        false => p.rect(rect(x, y, 1.0, h), TRACK_EDGE),
-    }
+    scroll_track(p, r, horizontal, Shade::Light);
     let Some((at, length)) = thumb else {
         return;
     };
+    let (x, y, w, h) = (r.origin.x, r.origin.y, r.size.width, r.size.height);
+    let knob = match horizontal {
+        true => rect(x + at, y, length, h),
+        false => rect(x, y + at, w, length),
+    };
+    scroll_thumb(p, knob, horizontal, pressed, Shade::Light);
+}
+
+/// What a scroll bar is drawn to sit on: a light background, with a pale
+/// track and a dark thumb, or a dark one with the reverse.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Shade {
+    Light,
+    Dark,
+}
+
+/// A scroll bar's track, edged on the side facing the content.
+pub(crate) fn scroll_track(p: &Painter, r: NSRect, horizontal: bool, shade: Shade) {
+    let (fill, edge) = match shade {
+        Shade::Light => (TRACK, TRACK_EDGE),
+        Shade::Dark => (DARK_TRACK, DARK_TRACK_EDGE),
+    };
+    p.rect(r, fill);
+    let (x, y, w, h) = (r.origin.x, r.origin.y, r.size.width, r.size.height);
+    match horizontal {
+        true => p.rect(rect(x, y, w, 1.0), edge),
+        false => p.rect(rect(x, y, 1.0, h), edge),
+    }
+}
+
+/// A scroll bar's capsule thumb, inset within `knob` - the span it occupies
+/// along the track, the track's full breadth across.
+pub(crate) fn scroll_thumb(
+    p: &Painter,
+    knob: NSRect,
+    horizontal: bool,
+    pressed: bool,
+    shade: Shade,
+) {
+    let (x, y, w, h) = (
+        knob.origin.x,
+        knob.origin.y,
+        knob.size.width,
+        knob.size.height,
+    );
     let girth = if horizontal { h } else { w };
     let pad = (girth * 0.2).round().max(2.0);
     let thumb = match horizontal {
-        true => rect(x + at + 2.0, y + pad, length - 4.0, h - 2.0 * pad + 1.0),
-        false => rect(x + pad, y + at + 2.0, w - 2.0 * pad + 1.0, length - 4.0),
+        true => rect(x + 2.0, y + pad, w - 4.0, h - 2.0 * pad + 1.0),
+        false => rect(x + pad, y + 2.0, w - 2.0 * pad + 1.0, h - 4.0),
     };
-    let color = if pressed {
-        [0.0, 0.0, 0.0, 0.55]
-    } else {
-        THUMB
+    let color = match (shade, pressed) {
+        (Shade::Light, false) => THUMB,
+        (Shade::Light, true) => [0.0, 0.0, 0.0, 0.55],
+        (Shade::Dark, false) => LIGHT_THUMB,
+        (Shade::Dark, true) => [1.0, 1.0, 1.0, 0.55],
     };
     let radius = (girth - 2.0 * pad + 1.0) / 2.0;
     p.fill_rounded(thumb, radius, color);
@@ -746,13 +924,8 @@ pub(crate) fn progress_bar(
         ),
     };
     let radius = girth / 2.0;
-    p.gradient_rounded(
-        bar,
-        radius,
-        [0.88, 0.88, 0.88, 1.0],
-        [0.94, 0.94, 0.94, 1.0],
-    );
-    p.stroke_rounded(bar, radius, 1.0, TRACK_EDGE);
+    p.gradient_rounded(bar, radius, p.palette.trough_top, p.palette.trough_bottom);
+    p.stroke_rounded(bar, radius, 1.0, p.palette.edge);
     let fraction = fraction.unwrap_or(0.5).clamp(0.0, 1.0);
     if fraction > 0.0 {
         let filled = match horizontal {
@@ -776,50 +949,241 @@ pub(crate) fn progress_bar(
     }
 }
 
-/// A slider: a thin track and a round knob at `fraction` along it.
-pub(crate) fn slider(p: &Painter, r: NSRect, horizontal: bool, fraction: f64, look: Look) {
-    let knob = r.size.width.min(r.size.height).min(18.0) - 2.0;
-    let fraction = fraction.clamp(0.0, 1.0);
-    let (track, knob_rect) = match horizontal {
-        true => {
-            let cy = r.origin.y + r.size.height / 2.0;
-            let x = r.origin.x + knob / 2.0;
-            let len = r.size.width - knob;
-            (
-                rect(x, cy - 2.0, len, 4.0),
-                rect(x + len * fraction - knob / 2.0, cy - knob / 2.0, knob, knob),
-            )
+/// Which side of a slider's bar its tick marks are on: above or leading, or
+/// below or trailing.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum TickSide {
+    Before,
+    After,
+}
+
+/// Where a linear slider's bar, knob and tick marks lie within its frame, in
+/// y-down coordinates. The minimum is at the left, or at the bottom when the
+/// slider is vertical.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct SliderLayout {
+    pub frame: NSRect,
+    pub horizontal: bool,
+    pub size: Size,
+    pub ticks: Option<TickSide>,
+}
+
+const SLIDER_BAR_END_INSET: f64 = 2.0;
+const SLIDER_TICK_GAP: f64 = 2.0;
+const SLIDER_TICK_WIDTH: f64 = 1.0;
+
+// FIXME (ACCURACY): the knob, bar and tick sizes are Aqua's proportions, not
+// measured from AppKit; with tick marks AppKit's knob is pointed, not round.
+impl SliderLayout {
+    fn knob_metric(&self) -> f64 {
+        match self.size {
+            Size::Regular => 18.0,
+            Size::Small => 14.0,
+            Size::Mini => 11.0,
         }
+    }
+
+    fn bar_thickness(&self) -> f64 {
+        match self.size {
+            Size::Regular => 4.0,
+            Size::Small => 3.0,
+            Size::Mini => 2.0,
+        }
+    }
+
+    fn tick_length(&self) -> f64 {
+        match self.size {
+            Size::Regular => 4.0,
+            Size::Small | Size::Mini => 3.0,
+        }
+    }
+
+    /// The frame's extent along the bar, and across it.
+    fn extents(&self) -> (f64, f64) {
+        let NSSize { width, height } = self.frame.size;
+        match self.horizontal {
+            true => (width, height),
+            false => (height, width),
+        }
+    }
+
+    /// A rectangle given along and across the bar, from the frame's top left.
+    fn place(&self, along: f64, across: f64, length: f64, breadth: f64) -> NSRect {
+        let NSPoint { x, y } = self.frame.origin;
+        match self.horizontal {
+            true => rect(x + along, y + across, length, breadth),
+            false => rect(x + across, y + along, breadth, length),
+        }
+    }
+
+    /// Where the knob and bar sit across the frame: what is left beside the
+    /// tick marks, as an offset and a breadth.
+    fn band(&self) -> (f64, f64) {
+        let (_, breadth) = self.extents();
+        let reserve = match self.ticks {
+            Some(_) => (SLIDER_TICK_GAP + self.tick_length()).min(breadth),
+            None => 0.0,
+        };
+        match self.ticks {
+            Some(TickSide::Before) => (reserve, breadth - reserve),
+            _ => (0.0, breadth - reserve),
+        }
+    }
+
+    /// The knob's side: its metric, or less in a frame too small for it.
+    pub(crate) fn knob_side(&self) -> f64 {
+        let (length, _) = self.extents();
+        self.knob_metric().min(self.band().1).min(length).max(0.0)
+    }
+
+    /// How far along the frame the centre of a knob at `fraction` is.
+    fn centre_along(&self, fraction: f64) -> f64 {
+        let (length, _) = self.extents();
+        let k = self.knob_side();
+        let fraction = fraction.clamp(0.0, 1.0);
+        let from_start = match self.horizontal {
+            true => fraction,
+            false => 1.0 - fraction,
+        };
+        k / 2.0 + from_start * (length - k)
+    }
+
+    pub(crate) fn knob(&self, fraction: f64) -> NSRect {
+        let k = self.knob_side();
+        let (offset, breadth) = self.band();
+        let along = (self.centre_along(fraction) - k / 2.0).round();
+        let across = (offset + (breadth - k) / 2.0).round();
+        self.place(along, across, k, k)
+    }
+
+    pub(crate) fn bar(&self) -> NSRect {
+        let (length, _) = self.extents();
+        let (offset, breadth) = self.band();
+        let t = self.bar_thickness().min(breadth);
+        let across = (offset + (breadth - t) / 2.0).round();
+        self.place(
+            SLIDER_BAR_END_INSET,
+            across,
+            length - 2.0 * SLIDER_BAR_END_INSET,
+            t,
+        )
+    }
+
+    /// Tick mark `index` of `count`, the first at the minimum; `None` for a
+    /// slider without tick marks.
+    pub(crate) fn tick(&self, index: usize, count: usize) -> Option<NSRect> {
+        let side = self.ticks?;
+        let fraction = match count {
+            0 | 1 => 0.5,
+            n => index as f64 / (n - 1) as f64,
+        };
+        let length = self.tick_length();
+        let (offset, breadth) = self.band();
+        let across = match side {
+            TickSide::Before => offset - SLIDER_TICK_GAP - length,
+            TickSide::After => offset + breadth + SLIDER_TICK_GAP,
+        };
+        let along = (self.centre_along(fraction) - SLIDER_TICK_WIDTH / 2.0).floor();
+        Some(self.place(along, across, SLIDER_TICK_WIDTH, length))
+    }
+}
+
+/// A slider's bar, filled with the accent colour from the minimum to
+/// `fraction` unless disabled.
+pub(crate) fn slider_bar(
+    p: &Painter,
+    bar: NSRect,
+    horizontal: bool,
+    fraction: f64,
+    disabled: bool,
+) {
+    let track = p.palette.slider_track;
+    let radius = bar.size.width.min(bar.size.height) / 2.0;
+    p.fill_rounded(bar, radius, track);
+    if disabled {
+        return;
+    }
+    let fraction = fraction.clamp(0.0, 1.0);
+    let filled = match horizontal {
+        true => rect(
+            bar.origin.x,
+            bar.origin.y,
+            bar.size.width * fraction,
+            bar.size.height,
+        ),
         false => {
-            let cx = r.origin.x + r.size.width / 2.0;
-            let y = r.origin.y + knob / 2.0;
-            let len = r.size.height - knob;
-            (
-                rect(cx - 2.0, y, 4.0, len),
-                // A vertical slider's minimum is at the bottom.
-                rect(
-                    cx - knob / 2.0,
-                    y + len * (1.0 - fraction) - knob / 2.0,
-                    knob,
-                    knob,
-                ),
+            let h = bar.size.height * fraction;
+            rect(
+                bar.origin.x,
+                bar.origin.y + bar.size.height - h,
+                bar.size.width,
+                h,
             )
         }
     };
-    p.fill_rounded(track, 2.0, [0.0, 0.0, 0.0, 0.2]);
-    p.face(knob_rect, knob / 2.0, look, false);
+    p.fill_rounded(filled, radius, ACCENT_BOTTOM);
+}
+
+pub(crate) fn slider_knob(p: &Painter, knob: NSRect, look: Look) {
+    p.face(
+        knob,
+        knob.size.width.min(knob.size.height) / 2.0,
+        look,
+        false,
+    );
+}
+
+pub(crate) fn slider_tick(p: &Painter, tick: NSRect) {
+    p.rect(tick, p.palette.tick);
+}
+
+/// A slider without tick marks: the bar and a round knob at `fraction`.
+pub(crate) fn slider(
+    p: &Painter,
+    r: NSRect,
+    horizontal: bool,
+    size: Size,
+    fraction: f64,
+    look: Look,
+) {
+    let layout = SliderLayout {
+        frame: r,
+        horizontal,
+        size,
+        ticks: None,
+    };
+    slider_bar(p, layout.bar(), horizontal, fraction, look.disabled);
+    slider_knob(p, layout.knob(fraction), look);
 }
 
 /// A group box or tab pane: a faintly shaded, rounded panel.
 pub(crate) fn group_box(p: &Painter, r: NSRect) {
     let r = inset(r, 0.5, 0.5);
-    p.fill_rounded(r, 4.0, [0.0, 0.0, 0.0, 0.04]);
-    p.stroke_rounded(r, 4.0, 1.0, TRACK_EDGE);
+    p.fill_rounded(r, 4.0, p.palette.panel);
+    p.stroke_rounded(r, 4.0, 1.0, p.palette.edge);
+}
+
+/// A rounded panel in a program's own colours: `path` filled, and stroked
+/// along its outline with the border's width.
+pub(crate) fn rounded_box(
+    p: &Painter,
+    path: NSRect,
+    radius: f64,
+    fill: Option<Rgba>,
+    border: Option<(Rgba, f64)>,
+) {
+    if let Some(fill) = fill {
+        p.fill_rounded(path, radius, fill);
+    }
+    if let Some((color, width)) = border {
+        p.rounded(path, radius);
+        p.stroke(width, color);
+    }
 }
 
 /// A menu's background.
 pub(crate) fn menu_background(p: &Painter, r: NSRect) {
-    p.rect(r, [0.97, 0.97, 0.97, 1.0]);
+    p.rect(r, p.palette.menu);
 }
 
 /// A menu item's background: the accent colour when selected.
@@ -832,10 +1196,19 @@ pub(crate) fn menu_item(p: &Painter, r: NSRect, selected: bool) {
 /// A horizontal separator through the middle of `r`.
 pub(crate) fn separator(p: &Painter, r: NSRect) {
     let y = (r.origin.y + r.size.height / 2.0).floor();
-    p.rect(
-        rect(r.origin.x, y, r.size.width, 1.0),
-        [0.0, 0.0, 0.0, 0.12],
-    );
+    p.rect(rect(r.origin.x, y, r.size.width, 1.0), p.palette.edge);
+}
+
+/// The side of the round dimple in a thick split view divider.
+const DIMPLE: f64 = 6.0;
+
+/// A thick split view divider's dimple, centred in `r`.
+pub(crate) fn split_dimple(p: &Painter, r: NSRect) {
+    let side = DIMPLE.min(r.size.width).min(r.size.height);
+    let x = r.origin.x + (r.size.width - side) / 2.0;
+    let y = r.origin.y + (r.size.height - side) / 2.0;
+    p.ellipse(rect(x, y, side, side));
+    p.fill(p.palette.mark_disabled);
 }
 
 /// A window's grow box: three diagonal ridges in its corner.
@@ -847,7 +1220,7 @@ pub(crate) fn grow_box(p: &Painter, r: NSRect) {
     for step in [3.0, 6.5, 10.0] {
         p.polyline(&[(x1 - step, y1), (x1, y1 - step)], false);
     }
-    p.stroke(1.0, [0.0, 0.0, 0.0, 0.35]);
+    p.stroke(1.0, p.palette.border);
 }
 
 /// A plain fill of `color`, for a theme brush.
@@ -869,6 +1242,47 @@ mod tests {
     fn a_thumb_never_shrinks_below_its_minimum_or_outgrows_its_track() {
         assert_eq!(thumb_span(100.0, 0, 100_000, 0, 10), Some((0.0, 18.0)));
         assert_eq!(thumb_span(10.0, 0, 5, 0, 1000), Some((0.0, 10.0)));
+    }
+
+    fn horizontal(width: f64, height: f64, ticks: Option<TickSide>) -> SliderLayout {
+        SliderLayout {
+            frame: rect(0.0, 0.0, width, height),
+            horizontal: true,
+            size: Size::Regular,
+            ticks,
+        }
+    }
+
+    #[test]
+    fn a_slider_knob_travels_the_frame_between_its_ends() {
+        let layout = horizontal(100.0, 20.0, None);
+        assert_eq!(layout.knob(0.0), rect(0.0, 1.0, 18.0, 18.0));
+        assert_eq!(layout.knob(1.0), rect(82.0, 1.0, 18.0, 18.0));
+        assert_eq!(layout.knob(0.5), rect(41.0, 1.0, 18.0, 18.0));
+    }
+
+    #[test]
+    fn a_vertical_slider_has_its_minimum_at_the_bottom() {
+        let layout = SliderLayout {
+            frame: rect(0.0, 0.0, 20.0, 100.0),
+            horizontal: false,
+            size: Size::Regular,
+            ticks: None,
+        };
+        assert_eq!(layout.knob(0.0), rect(1.0, 82.0, 18.0, 18.0));
+        assert_eq!(layout.knob(1.0), rect(1.0, 0.0, 18.0, 18.0));
+    }
+
+    #[test]
+    fn slider_tick_marks_sit_beside_the_bar_under_the_knob_centres() {
+        let layout = horizontal(100.0, 26.0, Some(TickSide::After));
+        let bar = layout.bar();
+        let first = layout.tick(0, 3).expect("a tick mark");
+        let last = layout.tick(2, 3).expect("a tick mark");
+        assert!(first.origin.y >= bar.origin.y + bar.size.height);
+        assert_eq!(first.origin.x, 8.0);
+        assert_eq!(last.origin.x, 90.0);
+        assert_eq!(horizontal(100.0, 26.0, None).tick(0, 3), None);
     }
 
     #[test]

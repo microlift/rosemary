@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::ffi::{CStr, CString, c_char, c_void};
-use std::sync::atomic::{AtomicPtr, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicPtr, AtomicUsize, Ordering};
 use std::sync::{LazyLock, Mutex, OnceLock, RwLock};
 
 use crate::sel::Sel;
@@ -72,6 +72,9 @@ struct Contents {
     ivars: Vec<&'static Ivar>,
     protocols: Vec<&'static crate::protocol::Protocol>,
     properties: Vec<&'static crate::property::Property>,
+    /// The ARC layouts `class_setIvarLayout` and `class_setWeakIvarLayout` set.
+    ivar_layout: Option<&'static CStr>,
+    weak_ivar_layout: Option<&'static CStr>,
 }
 
 /// A class.
@@ -91,6 +94,12 @@ pub struct Class {
     /// Whether `objc_registerClassPair` has run. An unregistered class is not
     /// findable by name and must not be instantiated.
     registered: AtomicUsize,
+    /// Whether `+initialize` has been sent; see [`ensure_initialized`].
+    initialized: AtomicBool,
+    /// For a metaclass, the class it is the metaclass of.
+    instances: AtomicPtr<Class>,
+    /// `class_getVersion`'s answer.
+    version: AtomicI32,
     contents: RwLock<Contents>,
 }
 
@@ -186,20 +195,13 @@ pub fn is_known(p: *const Class) -> bool {
 
 fn arena_slot() -> Option<*mut Class> {
     if ARENA.load(Ordering::Relaxed) == 0 {
-        // SAFETY: a fresh private anonymous reservation.
-        let mapped = unsafe {
-            libc::mmap(
-                std::ptr::null_mut(),
-                CLASS_CAPACITY * CLASS_STRIDE,
-                libc::PROT_READ | libc::PROT_WRITE,
-                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_NORESERVE,
-                -1,
-                0,
-            )
-        };
-        let base = match mapped == libc::MAP_FAILED {
-            true => NO_ARENA,
-            false => mapped as usize,
+        let mapped = starnix::memory::anonymous(
+            CLASS_CAPACITY * CLASS_STRIDE,
+            libc::PROT_READ | libc::PROT_WRITE,
+        );
+        let base = match mapped {
+            Ok(mapped) => mapped.as_ptr() as usize,
+            Err(_) => NO_ARENA,
         };
         ARENA.store(base, Ordering::Relaxed);
     }
@@ -223,6 +225,10 @@ impl Class {
             instance_size: AtomicUsize::new(instance_size),
             is_meta,
             registered: AtomicUsize::new(0),
+            initialized: AtomicBool::new(false),
+            instances: AtomicPtr::new(std::ptr::null_mut()),
+            // What Apple's runtime starts a class at when it realizes one.
+            version: AtomicI32::new(if is_meta { 7 } else { 0 }),
             contents: RwLock::new(Contents::default()),
         };
         let _building = BUILDING.lock().unwrap_or_else(|e| e.into_inner());
@@ -409,6 +415,47 @@ impl Class {
         true
     }
 
+    /// The ivars this class declares itself, in the order they were added.
+    pub fn own_ivars(&self) -> Vec<&'static Ivar> {
+        self.contents
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .ivars
+            .clone()
+    }
+
+    pub fn version(&self) -> i32 {
+        self.version.load(Ordering::Acquire)
+    }
+
+    pub fn set_version(&self, version: i32) {
+        self.version.store(version, Ordering::Release);
+    }
+
+    /// The strong (`weak` false) or weak ivar layout, if one was set.
+    pub fn ivar_layout(&self, weak: bool) -> Option<&'static CStr> {
+        let contents = self.contents.read().unwrap_or_else(|e| e.into_inner());
+        match weak {
+            true => contents.weak_ivar_layout,
+            false => contents.ivar_layout,
+        }
+    }
+
+    /// Set a layout. Only before registration, as with ivars: the layout
+    /// describes them.
+    pub fn set_ivar_layout(&self, weak: bool, layout: Option<&CStr>) -> bool {
+        if self.is_registered() {
+            return false;
+        }
+        let layout = layout.map(|l| &*Box::leak(CString::from(l).into_boxed_c_str()));
+        let mut contents = self.contents.write().unwrap_or_else(|e| e.into_inner());
+        match weak {
+            true => contents.weak_ivar_layout = layout,
+            false => contents.ivar_layout = layout,
+        }
+        true
+    }
+
     /// The ivar this class or a superclass declares under `name`.
     pub fn ivar(&'static self, name: &CStr) -> Option<&'static Ivar> {
         self.chain().find_map(|c| {
@@ -487,6 +534,15 @@ impl Class {
         true
     }
 
+    /// The protocols this class adopts itself, in the order it adopted them.
+    pub fn own_protocols(&self) -> Vec<&'static crate::protocol::Protocol> {
+        self.contents
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .protocols
+            .clone()
+    }
+
     /// Whether this class or a superclass adopts `protocol`.
     pub fn conforms_to(&'static self, protocol: &crate::protocol::Protocol) -> bool {
         self.chain().any(|c| {
@@ -498,6 +554,77 @@ impl Class {
                 .any(|p| std::ptr::eq(*p, protocol) || p.conforms_to(protocol))
         })
     }
+}
+
+/// Classes whose `+initialize` is running, and the thread running each.
+static INITIALIZING: Mutex<Vec<(usize, std::thread::ThreadId)>> = Mutex::new(Vec::new());
+static INITIALIZED: std::sync::Condvar = std::sync::Condvar::new();
+
+/// Send `+initialize` to `class` - its superclasses' first - unless it has
+/// been already, as Apple's runtime does before the first message to a class
+/// or to an instance of it.
+///
+/// Sent, so a class with no `+initialize` of its own runs its superclass's
+/// with itself as the receiver, which is what a guard of
+/// `if (self == [Foo class])` is written against. A message the class's own
+/// `+initialize` sends to the class goes straight through; a message from
+/// another thread waits until it has returned.
+pub fn ensure_initialized(class: &'static Class) {
+    if class.initialized.load(Ordering::Acquire) {
+        return;
+    }
+    let class = match class.is_meta() {
+        true => {
+            let instances = class.instances.load(Ordering::Acquire);
+            match instances.is_null() {
+                true => return,
+                // SAFETY: a leaked class, set when the pair was allocated.
+                false => unsafe { &*(instances as *const Class) },
+            }
+        }
+        false => class,
+    };
+    if class.initialized.load(Ordering::Acquire) || !class.is_registered() {
+        return;
+    }
+    if let Some(superclass) = class.superclass() {
+        ensure_initialized(superclass);
+    }
+    let address = ptr(class) as usize;
+    let me = std::thread::current().id();
+    {
+        let mut running = INITIALIZING.lock().unwrap_or_else(|e| e.into_inner());
+        loop {
+            if class.initialized.load(Ordering::Acquire) {
+                return;
+            }
+            match running.iter().find(|(c, _)| *c == address) {
+                Some((_, thread)) if *thread == me => return,
+                Some(_) => {
+                    running = INITIALIZED.wait(running).unwrap_or_else(|e| e.into_inner());
+                }
+                None => {
+                    running.push((address, me));
+                    break;
+                }
+            }
+        }
+    }
+    let sel = crate::sel::get("initialize");
+    if let Some(method) = class.metaclass().method(sel) {
+        // SAFETY: `+initialize` is `void (Class, SEL)`.
+        unsafe {
+            let f: unsafe extern "C" fn(*mut Class, Sel) =
+                std::mem::transmute(method.implementation());
+            f(ptr(class), sel);
+        }
+    }
+    class.initialized.store(true, Ordering::Release);
+    INITIALIZING
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .retain(|(c, _)| *c != address);
+    INITIALIZED.notify_all();
 }
 
 /// A class by name, or `None` if none is registered.
@@ -538,6 +665,16 @@ thread_local! {
 /// Every registered class, by name.
 static CLASSES: LazyLock<RwLock<HashMap<String, &'static Class>>> =
     LazyLock::new(|| RwLock::new(HashMap::new()));
+
+/// Every registered class, in no particular order.
+pub fn registered() -> Vec<&'static Class> {
+    CLASSES
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .values()
+        .copied()
+        .collect()
+}
 
 /// Guards a class pair being built, so two threads cannot allocate the same name.
 static ALLOCATION: Mutex<()> = Mutex::new(());
@@ -582,6 +719,7 @@ pub fn allocate_pair(
         None => meta,
     };
     meta.isa.store(ptr(root_meta), Ordering::Release);
+    meta.instances.store(ptr(class), Ordering::Release);
     class.isa.store(ptr(meta), Ordering::Release);
     Some(class)
 }

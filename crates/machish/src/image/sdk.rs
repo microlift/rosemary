@@ -124,7 +124,10 @@ mod tests {
         let mut text = name.as_bytes().to_vec();
         text.resize((text.len() + 4) & !3, 0);
         let mut fields = alloc::vec![24, 2, current, 0x0001_0000];
-        fields.extend(text.chunks(4).map(|w| u32::from_le_bytes([w[0], w[1], w[2], w[3]])));
+        fields.extend(
+            text.chunks(4)
+                .map(|w| u32::from_le_bytes([w[0], w[1], w[2], w[3]])),
+        );
         (c::LC_LOAD_DYLIB, fields)
     }
 

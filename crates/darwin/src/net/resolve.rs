@@ -351,7 +351,7 @@ unsafe extern "C" fn getnameinfo(
     servicelen: u32,
     flags: i32,
 ) -> i32 {
-    let Some(sockaddr) = (unsafe { addr::to_host(address, addrlen) }) else {
+    let Ok(sockaddr) = (unsafe { addr::to_host(address, addrlen) }) else {
         // Darwin's `EAI_FAMILY`.
         return 5;
     };

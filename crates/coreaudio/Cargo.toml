@@ -12,3 +12,6 @@ darwin.workspace = true
 libc.workspace = true
 sdl3.workspace = true
 static_init.workspace = true
+
+[lints]
+workspace = true

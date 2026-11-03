@@ -3,6 +3,7 @@ use microlift::arch::x86_64::context::RegisterContext;
 use super::coregraphics::{CgPoint, CgRect, rect_argument};
 use super::host::host_or_refuse;
 use crate::abi::{GuestMemory, Result};
+use crate::shims::bind;
 
 /// `BOOL NSMouseInRect(NSPoint aPoint, NSRect aRect, BOOL isFlipped)`
 ///
@@ -58,9 +59,9 @@ fn rect_fill(symbol: &str, ctx: &mut RegisterContext, mem: &mut dyn GuestMemory)
 /// Whether `name` (underscore already stripped) is one of this module's.
 pub fn shim_for(name: &str) -> Option<super::coregraphics::Shim> {
     match name {
-        "NSMouseInRect" => Some(mouse_in_rect),
-        "NSPointInRect" => Some(point_in_rect),
-        "NSRectFill" => Some(rect_fill),
+        "NSMouseInRect" => Some(bind!("NSMouseInRect" => mouse_in_rect)),
+        "NSPointInRect" => Some(bind!("NSPointInRect" => point_in_rect)),
+        "NSRectFill" => Some(bind!("NSRectFill" => rect_fill)),
         _ => None,
     }
 }

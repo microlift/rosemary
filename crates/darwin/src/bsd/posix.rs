@@ -1,9 +1,6 @@
 use std::ffi::{CStr, c_char, c_int, c_void};
 
-extern "C" fn errc(_: c_int, _: c_int, _: *const c_char) {
-    todo!()
-}
-extern "C" fn warnc(_: c_int, _: *const c_char) {
+extern "C" fn abort_report_np(_: *const c_char) -> ! {
     todo!()
 }
 
@@ -131,14 +128,7 @@ pub unsafe extern "C" fn assert_rtn(
 
 pub unsafe extern "C" fn srandomdev() {
     let mut seed = [0u8; 4];
-    let read = unsafe {
-        libc::getrandom(
-            seed.as_mut_ptr().cast::<c_void>(),
-            seed.len(),
-            0 as libc::c_uint,
-        )
-    };
-    if read < seed.len() as isize {
+    if getrandom::fill(&mut seed).is_err() {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map_or(0, |d| d.subsec_nanos());
@@ -346,7 +336,7 @@ pub unsafe extern "C" fn csops(
     useraddr: *mut c_void,
     usersize: usize,
 ) -> c_int {
-    if pid != 0 && pid != starnix::process::me() {
+    if pid != 0 && pid != crate::process::host_self() {
         crate::errno::set(libc::ESRCH);
         return -1;
     }
@@ -392,8 +382,7 @@ pub extern "C" fn keymgr_dwarf2_register_sections() {}
 
 exports::exports! {
     functions {
-        "errc" => errc,
-        "warnc" => warnc,
+        "abort_report_np" => abort_report_np,
         #[cfg(target_os = "linux")]
         "sigsetjmp" => sigsetjmp,
         "csops" => csops,

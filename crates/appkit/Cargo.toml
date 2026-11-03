@@ -10,6 +10,7 @@ exports.workspace = true
 darwin.workspace = true
 objc.workspace = true
 corefoundation.workspace = true
+coretext.workspace = true
 prefix.workspace = true
 server.workspace = true
 foundation.workspace = true
@@ -20,3 +21,9 @@ iosurface.workspace = true
 static_init.workspace = true
 owned_ttf_parser.workspace = true
 tiny-skia.workspace = true
+
+[dev-dependencies]
+sdl3 = { workspace = true, features = ["test-support"] }
+
+[lints]
+workspace = true

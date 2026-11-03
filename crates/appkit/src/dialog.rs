@@ -522,7 +522,7 @@ pub fn run_with_accessories(request: &Request) -> Option<(usize, bool, Vec<bool>
 /// A dialog up without a caller waiting on it, and what to do with its answer.
 struct Modeless {
     dialog: Dialog,
-    answered: Box<dyn FnOnce(usize)>,
+    answered: Box<dyn FnOnce(usize, Vec<bool>)>,
 }
 
 thread_local! {
@@ -531,12 +531,12 @@ thread_local! {
 }
 
 /// Show `request` and return at once; `answered` is called with the button
-/// chosen, from the program's event pump. The window's id, or `None` when no
-/// dialog could be shown.
+/// chosen and the accessory checkboxes' states, from the program's event pump.
+/// The window's id, or `None` when no dialog could be shown.
 ///
 /// The program's other windows go on taking input, as an `NSPanel` ordered
 /// front rather than run modally does.
-pub fn show(request: &Request, answered: impl FnOnce(usize) + 'static) -> Option<u32> {
+pub fn show(request: &Request, answered: impl FnOnce(usize, Vec<bool>) + 'static) -> Option<u32> {
     let dialog = Dialog::open(request, false)?;
     let id = dialog.id;
     MODELESS.with_borrow_mut(|open| {
@@ -546,6 +546,18 @@ pub fn show(request: &Request, answered: impl FnOnce(usize) + 'static) -> Option
         })
     });
     Some(id)
+}
+
+/// Close the modeless dialog `id` unanswered, as a program taking its sheet
+/// down itself does.
+pub fn dismiss(id: u32) {
+    let gone = MODELESS.with_borrow_mut(|open| {
+        let at = open.iter().position(|m| m.dialog.id == id)?;
+        Some(open.remove(at))
+    });
+    if let Some(modeless) = gone {
+        modeless.dialog.close();
+    }
 }
 
 /// Bring the modeless dialog `id` back to the front; false when it has been
@@ -574,8 +586,15 @@ pub(crate) fn deliver(event: &sdl3::video::Event) -> bool {
     });
     // Out of the borrow: the answer may well open another dialog.
     if let Some((modeless, answer)) = answered {
+        let states = modeless
+            .dialog
+            .alert
+            .accessories
+            .iter()
+            .map(|item| item.checked)
+            .collect();
         modeless.dialog.close();
-        (modeless.answered)(answer);
+        (modeless.answered)(answer, states);
     }
     taken
 }
@@ -610,6 +629,9 @@ fn modal_loop(dialog: &mut Dialog) -> (usize, bool) {
         // for as long as the dialog is up.
         crate::opengl::release_for_other_threads();
         crate::script::run();
+        // Modal input restrictions do not suspend SDL surface creation or
+        // completion of Metal readbacks on the video thread.
+        crate::event::service_modal_presentation();
         let scripted = MODAL.with_borrow_mut(|modal| modal.as_mut()?.1.pop_front());
         let Some(event) = scripted.or_else(|| sdl3::video::wait(50)) else {
             continue;

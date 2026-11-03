@@ -16,10 +16,12 @@ pub use cache::{
 };
 pub use msl::parse_msl;
 pub use passes::{Pass, PassPipeline};
-pub use specialize::{FunctionConstantValues, metal_data_type_size, specialize};
+pub use specialize::{
+    FunctionConstantValues, metal_data_type_of_encoding, metal_data_type_size, specialize,
+};
 pub use spirv::{
-    EntryArtifact, FunctionConstantInfo, RequiredFeatures, ResourceBinding, StageVariable,
-    TargetProfile, TranslatedLibrary, WORKGROUP_SIZE_SPEC_IDS, emit_spirv,
+    EntryArtifact, FunctionConstantInfo, RejectedEntry, RequiredFeatures, ResourceBinding,
+    StageVariable, TargetProfile, TranslatedLibrary, WORKGROUP_SIZE_SPEC_IDS, emit_spirv,
 };
 
 /// The phase which reported a translation diagnostic.
@@ -151,7 +153,7 @@ pub fn translate_msl_with_macros(
     target: &TargetProfile,
     passes: &PassPipeline,
 ) -> Result<TranslatedLibrary, TranslateError> {
-    let mut module = msl::parse_msl_with_macros(source, macros).map_err(|mut error| {
+    let with_context = |mut error: TranslateError| {
         for diagnostic in &mut error.diagnostics {
             if let Some(line) = diagnostic.line {
                 diagnostic
@@ -160,10 +162,13 @@ pub fn translate_msl_with_macros(
             }
         }
         error
-    })?;
+    };
+    let (mut module, rejected) = msl::parse_msl_partial(source, macros).map_err(with_context)?;
     specialize(&mut module, &FunctionConstantValues::new())?;
     passes.run(&mut module)?;
-    emit_spirv(&module, target)
+    let mut library = emit_spirv(&module, target)?;
+    library.rejected.extend(rejected);
+    Ok(library)
 }
 
 /// Render a small source window under an MSL diagnostic.

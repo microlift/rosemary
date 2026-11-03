@@ -53,6 +53,14 @@ fi
 # A Steam launch has nobody to ask about downloading the Darwin base.
 export ROSEMARY_PREFIX_SETUP=${ROSEMARY_PREFIX_SETUP:-download}
 
+# `rosemary run` only offers base updates for the default prefix, so a per-game
+# prefix would otherwise stay on the release it was created with. Update is a
+# no-op when current; a failure (offline, not yet a prefix) must not block launch.
+if [ -d "${ROSEMARY_PREFIX:-}" ]; then
+    "$rosemary" prefix update "$ROSEMARY_PREFIX" >&2 ||
+        echo "rosemary-steam: prefix update failed; launching anyway" >&2
+fi
+
 # A guest sees none of the host's environment unless asked for (see
 # ROSEMARY_ENVIRON in docs/usage.md), and libsteam_api reads these to learn
 # that Steam launched it and for which app. Bare names copy the host's value

@@ -12,6 +12,7 @@ use super::space::{self, Name};
 /// `op`. A task that is gone turns `name` into a dead name, as the kernel
 /// does on Darwin, and answers what sending to one answers.
 pub fn perform(name: Name, pid: i32, image: u64, op: TaskOp) -> Result<TaskOutcome, i32> {
+    let _host = crate::syscall::ScopedHostSyscallContext::new();
     match server::client::perform(pid, image, op) {
         Some(TaskOutcome::Gone) => {
             space::task_died(name);

@@ -61,6 +61,7 @@ const NATURAL: isize = 4;
 /// `NSLineBreakMode`.
 const WORD_WRAP: isize = 0;
 const CHAR_WRAP: isize = 1;
+const CLIP: isize = 2;
 const TRUNCATE_TAIL: isize = 4;
 
 /// The room `NSTextFieldCell` leaves either side of its text.
@@ -131,7 +132,7 @@ fn font_of(look: &Look) -> Option<(Arc<chrome::Font>, f64)> {
 /// An `NSFont` as the face and point size chrome draws with; the system font
 /// for nil or a font with no face here.
 pub(crate) fn chrome_font(font: Id) -> Option<(Arc<chrome::Font>, f64)> {
-    if let Some((face, size)) = crate::coretext::face_of(font as *const _)
+    if let Some((face, size)) = coretext::face_of(font as *const _)
         && let Some(font) = chrome::Font::from_faces_with_fallback(vec![face])
     {
         return Some((Arc::new(font), if size > 0.0 { size } else { SYSTEM_SIZE }));
@@ -174,6 +175,51 @@ pub(crate) fn intrinsic_size(receiver: Id) -> Option<NSSize> {
         width: (f64::from(font.measure(&text, size as f32)) + 2.0 * PADDING).ceil(),
         height: f64::from(ascent + descent).ceil(),
     })
+}
+
+/// `-[NSTextFieldCell cellSizeForBounds:]`: the intrinsic size, except that a
+/// wrapping field breaks its text to the width of `bounds` and is as tall as
+/// its lines.
+pub(crate) fn cell_size(receiver: Id, bounds: NSRect) -> Option<NSSize> {
+    let natural = intrinsic_size(receiver)?;
+    let look = look(receiver);
+    if !look.wraps() || natural.width <= bounds.size.width {
+        return Some(natural);
+    }
+    let (font, size) = font_of(&look)?;
+    let room = (bounds.size.width - 2.0 * PADDING).max(0.0) as f32;
+    let text = crate::text::field_text(receiver);
+    let mut lines = match look.line_break {
+        CHAR_WRAP => char_wrap(&font, &text, size as f32, room),
+        _ => font.wrap(&text, size as f32, room),
+    };
+    if look.max_lines > 0 {
+        lines.truncate(look.max_lines as usize);
+    }
+    let widest = lines
+        .iter()
+        .map(|line| font.measure(line, size as f32))
+        .fold(0.0f32, f32::max);
+    let (ascent, descent) = font.metrics(size as f32);
+    Some(NSSize {
+        width: (f64::from(widest) + 2.0 * PADDING).ceil(),
+        height: f64::from((ascent + descent).ceil()) * lines.len().max(1) as f64,
+    })
+}
+
+/// `-setWraps:`, which AppKit spells as a line break mode: word wrapping, or
+/// clipping.
+unsafe extern "C" fn set_wraps(receiver: Id, _sel: Sel, wraps: u8) {
+    update(receiver, |look| {
+        look.line_break = match wraps {
+            0 => CLIP,
+            _ => WORD_WRAP,
+        }
+    });
+}
+
+unsafe extern "C" fn wraps(receiver: Id, _sel: Sel) -> u8 {
+    u8::from(matches!(look(receiver).line_break, WORD_WRAP | CHAR_WRAP))
 }
 
 unsafe extern "C" fn intrinsic_content_size(receiver: Id, _sel: Sel) -> NSSize {
@@ -380,6 +426,12 @@ pub(crate) fn install() {
         "drawsBackground" => draws_background, c"c16@0:8";
         "setBordered:" => set_bordered, c"v20@0:8c16";
         "isBordered" => is_bordered, c"c16@0:8";
+        // FIXME (ACCURACY): kept, and not drawn: a field here draws its border
+        // the same way bezeled or not.
+        "isBezeled" => crate::props::get_bool, c"c16@0:8";
+        "setBezeled:" => crate::props::set_bool, c"v20@0:8c16";
+        "bezelStyle" => crate::props::get_integer, c"q16@0:8";
+        "setBezelStyle:" => crate::props::set_integer, c"v24@0:8q16";
         "setAlignment:" => set_alignment, c"v24@0:8q16";
         "alignment" => alignment, c"q16@0:8";
         "setLineBreakMode:" => set_line_break_mode, c"v24@0:8q16";
@@ -388,6 +440,8 @@ pub(crate) fn install() {
         "maximumNumberOfLines" => maximum_number_of_lines, c"q16@0:8";
         "setUsesSingleLineMode:" => set_uses_single_line_mode, c"v20@0:8c16";
         "usesSingleLineMode" => uses_single_line_mode, c"c16@0:8";
+        "setWraps:" => set_wraps, c"v20@0:8c16";
+        "wraps" => wraps, c"c16@0:8";
         "intrinsicContentSize" => intrinsic_content_size, c"{CGSize=dd}16@0:8";
         "drawRect:" => draw_rect, c"v48@0:8{CGRect={CGPoint=dd}{CGSize=dd}}16";
     });

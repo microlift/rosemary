@@ -229,10 +229,11 @@ fn on_service_stack(body: extern "C" fn(*mut c_void), argument: *mut c_void) {
 
 /// The handler the kernel enters.
 extern "C" fn entry(_signo: i32, info: *mut libc::siginfo_t, raw: *mut c_void) {
+    let _host = crate::syscall::ScopedHostSyscallContext::new();
     let errno = starnix::errno::get();
     // SAFETY: the kernel's own `siginfo_t`.
     let info = unsafe { starnix::signal::info(info) };
-    let me = starnix::process::me();
+    let me = crate::process::host_self();
     let server = server::client::server_pid();
     let ours = info.code == starnix::signal::Code::Queue
         && info.pid != 0
@@ -308,6 +309,7 @@ struct Broken;
 /// Fetch and do work until the server has none left. True if a suspension
 /// asked this thread to park once it is done.
 fn drain() -> bool {
+    let _host = crate::syscall::ScopedHostSyscallContext::new();
     let fd = server::client::service_fd();
     if fd < 0 {
         // Not open yet, or lost: the next one opened raises the signal again.

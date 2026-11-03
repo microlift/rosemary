@@ -1,6 +1,7 @@
 use std::ffi::{c_int, c_void};
 
 const PROC_PIDLISTFDS: c_int = 1;
+const PROC_PIDTASKALLINFO: c_int = 2;
 const PROC_PIDTBSDINFO: c_int = 3;
 const PROC_PIDTASKINFO: c_int = 4;
 
@@ -68,7 +69,7 @@ pub unsafe extern "C" fn proc_pidinfo(
     buffer: *mut c_void,
     size: c_int,
 ) -> c_int {
-    let me = starnix::process::me();
+    let me = crate::process::host_self();
     let pid = if pid == 0 {
         me
     } else {
@@ -83,7 +84,7 @@ pub unsafe extern "C" fn proc_pidinfo(
     if pid != me {
         return match flavor {
             // SAFETY: the caller's buffer, as for this process below.
-            PROC_PIDTASKINFO | PROC_PIDTBSDINFO => unsafe {
+            PROC_PIDTASKINFO | PROC_PIDTBSDINFO | PROC_PIDTASKALLINFO => unsafe {
                 other_process_info(pid, flavor, buffer, size)
             },
             _ => {
@@ -94,7 +95,9 @@ pub unsafe extern "C" fn proc_pidinfo(
     }
     match flavor {
         // SAFETY: the caller's buffer.
-        PROC_PIDTBSDINFO => unsafe { other_process_info(pid, flavor, buffer, size) },
+        PROC_PIDTBSDINFO | PROC_PIDTASKALLINFO => unsafe {
+            other_process_info(pid, flavor, buffer, size)
+        },
         PROC_PIDLISTFDS => {
             let fds = match open_descriptors() {
                 Ok(fds) => fds,
@@ -268,6 +271,16 @@ struct ProcBsdInfo {
 
 const _: () = assert!(size_of::<ProcBsdInfo>() == 136);
 
+/// `struct proc_taskallinfo`.
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct ProcTaskAllInfo {
+    pbsd: ProcBsdInfo,
+    ptinfo: ProcTaskInfo,
+}
+
+const _: () = assert!(size_of::<ProcTaskAllInfo>() == 232);
+
 /// `PROC_FLAG_*`.
 const PROC_FLAG_LP64: u32 = 0x10;
 const PROC_FLAG_SLEADER: u32 = 0x20;
@@ -337,8 +350,8 @@ unsafe fn copy_record<T: Copy>(record: T, buffer: *mut c_void, size: c_int) -> c
     wanted
 }
 
-/// `PROC_PIDTASKINFO` and `PROC_PIDTBSDINFO` for any guest, this one
-/// included.
+/// `PROC_PIDTASKINFO`, `PROC_PIDTBSDINFO` and `PROC_PIDTASKALLINFO` for any
+/// guest, this one included.
 ///
 /// # Safety
 ///
@@ -361,6 +374,22 @@ unsafe fn other_process_info(pid: c_int, flavor: c_int, buffer: *mut c_void, siz
                 0
             }
         },
+        PROC_PIDTASKALLINFO => {
+            match (crate::process::describe(pid), crate::process::usage(pid)) {
+                (Some(process), Some(usage)) => {
+                    let record = ProcTaskAllInfo {
+                        pbsd: bsd_record(&process),
+                        ptinfo: task_record(&usage),
+                    };
+                    // SAFETY: the caller's buffer.
+                    unsafe { copy_record(record, buffer, size) }
+                }
+                _ => {
+                    crate::errno::set(libc::ESRCH);
+                    0
+                }
+            }
+        }
         _ => {
             crate::errno::set(libc::ESRCH);
             0
@@ -635,6 +664,25 @@ mod tests {
     }
 
     #[test]
+    fn the_task_all_flavour_is_the_bsd_and_task_records_together() {
+        // SAFETY: plain data, valid when zeroed.
+        let mut info: ProcTaskAllInfo = unsafe { std::mem::zeroed() };
+        let bytes = unsafe {
+            proc_pidinfo(
+                0,
+                PROC_PIDTASKALLINFO,
+                0,
+                (&raw mut info).cast(),
+                size_of::<ProcTaskAllInfo>() as c_int,
+            )
+        };
+        assert_eq!(bytes, size_of::<ProcTaskAllInfo>() as c_int);
+        let me = crate::process::guest_pid(crate::process::host_self());
+        assert_eq!(info.pbsd.pbi_pid, me as u32);
+        assert!(info.ptinfo.resident_size > 0);
+    }
+
+    #[test]
     fn another_process_and_an_unknown_flavour_are_refused() {
         let mut info = ProcTaskInfo::default();
         let mut ask = |pid, flavor| unsafe {
@@ -653,7 +701,7 @@ mod tests {
     #[test]
     fn the_wakeups_monitor_reads_as_disabled() {
         let (mut rate, mut flags) = (0, 0);
-        let me = crate::process::guest_pid(starnix::process::me());
+        let me = crate::process::guest_pid(crate::process::host_self());
         let rc = unsafe { proc_get_wakemon_params(me, &mut rate, &mut flags) };
         assert_eq!((rc, rate, flags), (0, -1, WAKEMON_DISABLE));
         let rc = unsafe { proc_get_wakemon_params(me, std::ptr::null_mut(), &mut flags) };

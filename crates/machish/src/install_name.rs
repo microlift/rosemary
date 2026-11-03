@@ -56,6 +56,12 @@ pub fn expand(install_name: &str, ctx: &PathContext<'_>) -> Vec<String> {
     out
 }
 
+/// Expand one `LC_RPATH` entry against the image that declared it, which is
+/// `ctx.loader`; empty when its prefix cannot be expanded.
+pub fn expand_rpath(entry: &str, ctx: &PathContext<'_>) -> Vec<String> {
+    expand_base(entry, ctx)
+}
+
 /// Expand a path that may start with `@executable_path` or `@loader_path`, but
 /// not `@rpath`. Used both for install names and for `LC_RPATH` entries.
 fn expand_base(path: &str, ctx: &PathContext<'_>) -> Vec<String> {
@@ -139,6 +145,24 @@ mod tests {
 
     fn rp(paths: &[&str]) -> Vec<String> {
         paths.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// An inherited rpath is expanded against the image that declared it, so a
+    /// plugin searching the executable's `@loader_path/../Frameworks` looks in
+    /// the executable's bundle rather than beside itself.
+    #[test]
+    fn expands_an_rpath_against_its_declaring_image() {
+        let exe = "/Apps/Demo.app/Contents/MacOS/Demo";
+        let ctx = PathContext {
+            executable: Some(exe),
+            loader: Some(exe),
+            rpaths: &[],
+        };
+        assert_eq!(
+            expand_rpath("@loader_path/../Frameworks/", &ctx),
+            ["/Apps/Demo.app/Contents/MacOS/../Frameworks/"]
+        );
+        assert_eq!(expand_rpath("/opt/lib", &ctx), ["/opt/lib"]);
     }
 
     /// Table-driven, because the interesting content here is the *cases*, and a

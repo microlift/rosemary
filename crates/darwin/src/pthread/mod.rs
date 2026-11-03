@@ -40,6 +40,7 @@ pub fn id() -> u32 {
     }
     #[cfg(target_os = "linux")]
     {
+        let _host = crate::syscall::ScopedHostSyscallContext::new();
         rustix::thread::gettid().as_raw_pid() as u32
     }
     #[cfg(not(any(target_os = "macos", target_os = "linux")))]
@@ -494,6 +495,70 @@ pub fn set_main_stack(stack: core::ops::Range<u64>) {
     let _ = MAIN_STACK.set((me, stack));
 }
 
+/// Map all of the calling (main) thread's stack, as Darwin's exec does, and
+/// report that stack from then on.
+///
+/// Darwin's main stack is `RLIMIT_STACK` bytes below its top, all mapped. A
+/// Linux one is mapped only as it grows, and glibc reports it a little smaller
+/// than the limit. HotSpot guards the bottom pages of the thread it starts on,
+/// placed by the limit, and `mprotect` on the unmapped range fails.
+pub fn commit_main_stack() {
+    #[cfg(target_os = "linux")]
+    {
+        // SAFETY: a zeroed attribute object is what `pthread_getattr_np` fills
+        // in, and it is only read on success.
+        let mut attr: libc::pthread_attr_t = unsafe { core::mem::zeroed() };
+        // SAFETY: the calling thread and a live attribute object.
+        if unsafe { libc::pthread_getattr_np(libc::pthread_self(), &mut attr) } != 0 {
+            return;
+        }
+        let mut low = core::ptr::null_mut();
+        let mut size = 0;
+        // SAFETY: an attribute object `pthread_getattr_np` initialised.
+        unsafe {
+            libc::pthread_attr_getstack(&attr, &mut low, &mut size);
+            libc::pthread_attr_destroy(&mut attr);
+        }
+        let top = low as u64 + size as u64;
+        let mut limit: libc::rlimit = unsafe { core::mem::zeroed() };
+        // SAFETY: a live out-parameter.
+        let limited = unsafe { libc::getrlimit(libc::RLIMIT_STACK, &mut limit) } == 0
+            && limit.rlim_cur != libc::RLIM_INFINITY;
+        let bottom = match limited {
+            true => top.saturating_sub(limit.rlim_cur),
+            false => low as u64,
+        };
+        let here = &raw const size as u64;
+        let Some(grown) = starnix::process::regions().ok().and_then(|regions| {
+            regions
+                .into_iter()
+                .find(|region| (region.start..region.end).contains(&here))
+        }) else {
+            return;
+        };
+        if bottom == 0 || grown.start <= bottom {
+            return;
+        }
+        // SAFETY: NOREPLACE fails rather than take over anything in the range.
+        let mapped = unsafe {
+            libc::mmap(
+                bottom as *mut core::ffi::c_void,
+                (grown.start - bottom) as usize,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE
+                    | libc::MAP_ANONYMOUS
+                    | libc::MAP_FIXED_NOREPLACE
+                    | libc::MAP_NORESERVE,
+                -1,
+                0,
+            )
+        };
+        if mapped as u64 == bottom {
+            set_main_stack(bottom..top);
+        }
+    }
+}
+
 /// The moved stack, when `thread` is the main thread and it was moved.
 fn moved_main_stack(thread: u64) -> Option<core::ops::Range<u64>> {
     let (main, stack) = MAIN_STACK.get()?;
@@ -679,7 +744,7 @@ pub unsafe extern "C" fn mach_thread_np(thread: u64) -> u32 {
         if unsafe { threadid_np(thread, (&raw mut tid) as usize as u64) } != 0 {
             return 0;
         }
-        return crate::mach::space::borrow_thread(starnix::process::me(), tid as i32);
+        return crate::mach::space::borrow_thread(crate::process::host_self(), tid as i32);
     }
     #[cfg(not(target_os = "macos"))]
     {

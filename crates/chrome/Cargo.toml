@@ -1,6 +1,6 @@
 [package]
 name = "chrome"
-description = "Host-side toolkit that draws Rosemary's own Mac-style window chrome and menus"
+description = "Catalina with a modern patterns: Host-side toolkit that draws Rosemary's own Mac-style window chrome and menus"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -9,3 +9,6 @@ license.workspace = true
 owned_ttf_parser.workspace = true
 ab_glyph_rasterizer.workspace = true
 rust-fontconfig.workspace = true
+
+[lints]
+workspace = true

@@ -662,6 +662,9 @@ fn composite_is_well_typed(
                 Some(Type::Vector { element, lanes }) => {
                     *index < u32::from(lanes) && result.as_ref() == Some(element.as_ref())
                 }
+                Some(Type::Array { element, count }) => {
+                    *index < count && result.as_ref() == Some(element.as_ref())
+                }
                 _ => false,
             }
         }
@@ -672,6 +675,11 @@ fn composite_is_well_typed(
         } => match operand_type(function, composite) {
             Some(Type::Vector { element, lanes }) => {
                 *index < u32::from(lanes)
+                    && operand_type(function, object) == Some(*element)
+                    && result == operand_type(function, composite)
+            }
+            Some(Type::Array { element, count }) => {
+                *index < count
                     && operand_type(function, object) == Some(*element)
                     && result == operand_type(function, composite)
             }

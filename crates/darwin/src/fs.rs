@@ -165,6 +165,46 @@ pub unsafe extern "C" fn remove(path: *const c_char) -> c_int {
     })
 }
 
+/// `int unlinkat(int, const char *, int)`
+///
+/// Darwin spells `AT_FDCWD` and `AT_REMOVEDIR` its own way. A dataless
+/// directory is one whose contents live elsewhere, which no host directory
+/// is, so `AT_REMOVEDIR_DATALESS` is plain `AT_REMOVEDIR`.
+///
+/// # Safety
+///
+/// `path` is a NUL-terminated string and `dirfd` a directory descriptor or
+/// Darwin's `AT_FDCWD`.
+pub unsafe extern "C" fn unlinkat(dirfd: c_int, path: *const c_char, flag: c_int) -> c_int {
+    const DARWIN_AT_REMOVEDIR: c_int = 0x0080;
+    const DARWIN_AT_REMOVEDIR_DATALESS: c_int = 0x0100;
+    let removes_dir = DARWIN_AT_REMOVEDIR | DARWIN_AT_REMOVEDIR_DATALESS;
+    let beneath = crate::stat::beneath::SUPPORTED;
+    if flag & !(removes_dir | beneath) != 0 {
+        crate::errno::set(libc::EINVAL);
+        return -1;
+    }
+    let dirfd = match dirfd {
+        crate::stat::DARWIN_AT_FDCWD => libc::AT_FDCWD,
+        fd => fd,
+    };
+    let host_flag = match flag & removes_dir {
+        0 => 0,
+        _ => libc::AT_REMOVEDIR,
+    };
+    crate::stat::with_fallback_at(dirfd, path, |path| {
+        if !crate::stat::may_write_at(dirfd, path) {
+            return (-1, false);
+        }
+        let rc = match flag & beneath {
+            // SAFETY: the caller's descriptor, and a translated path.
+            0 => unsafe { libc::unlinkat(dirfd, path, host_flag) },
+            _ => unsafe { crate::stat::beneath::unlinkat(dirfd, path, host_flag) },
+        };
+        (rc, rc == 0)
+    })
+}
+
 /// `int mkdir(const char *, mode_t)`
 ///
 /// # Safety
@@ -175,13 +215,44 @@ pub unsafe extern "C" fn mkdir(path: *const c_char, mode: libc::mode_t) -> c_int
         crate::errno::set(libc::EFAULT);
         return -1;
     };
-    // No fold: the directory is one this call is about to create, and a
-    // case-insensitive reading of a name that does not exist yet would answer
-    // about a different directory.
-    // SAFETY: a NUL-terminated path.
-    let rc = unsafe { libc::mkdir(path.as_ptr(), mode) };
+    make_dir(libc::AT_FDCWD, &path, mode)
+}
+
+/// `int mkdirat(int, const char *, mode_t)`
+///
+/// The path stays relative to `dirfd`, so the directory is made where the
+/// descriptor now is even after it was renamed, as the host's `mkdirat` would.
+///
+/// # Safety
+///
+/// `path` is a NUL-terminated string and `dirfd` a directory descriptor or
+/// Darwin's `AT_FDCWD`.
+pub unsafe extern "C" fn mkdirat(dirfd: c_int, path: *const c_char, mode: libc::mode_t) -> c_int {
+    if path.is_null() {
+        crate::errno::set(libc::EFAULT);
+        return -1;
+    }
+    let dirfd = match dirfd {
+        crate::stat::DARWIN_AT_FDCWD => libc::AT_FDCWD,
+        fd => fd,
+    };
+    // SAFETY: non-null, and a `const char *` is NUL-terminated by contract.
+    let path = prefix::ns::to_host_at(dirfd, unsafe { CStr::from_ptr(path) });
+    make_dir(dirfd, &path, mode)
+}
+
+/// Make the directory at host path `path`, relative to `dirfd`, and record it
+/// as the guest's when it is acting as another user.
+///
+/// No fold: the directory is one this call is about to create, and a
+/// case-insensitive reading of a name that does not exist yet would answer
+/// about a different directory. No `may_write` either: a name the prefix's
+/// base owns already exists, and the host answers `EEXIST` for it.
+fn make_dir(dirfd: c_int, path: &CStr, mode: libc::mode_t) -> c_int {
+    // SAFETY: a NUL-terminated path, and the caller's descriptor.
+    let rc = unsafe { libc::mkdirat(dirfd, path.as_ptr(), mode) };
     if rc == 0 && crate::credentials::creates_as_another() {
-        crate::credentials::created(libc::AT_FDCWD, &path);
+        crate::credentials::created(dirfd, path);
     }
     rc
 }
@@ -361,6 +432,18 @@ pub unsafe extern "C" fn lchflags(path: *const c_char, _flags: u32) -> c_int {
     })
 }
 
+/// `int fchflags(int, uint32_t)`, refused as [`lchflags`] is once the
+/// descriptor is known to be open.
+pub extern "C" fn fchflags(fd: c_int, _flags: u32) -> c_int {
+    let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+    // SAFETY: a `stat` to fill, for the descriptor check alone.
+    if unsafe { libc::fstat(fd, stat.as_mut_ptr()) } != 0 {
+        return -1;
+    }
+    crate::errno::set(libc::ENOTSUP);
+    -1
+}
+
 /// `int undelete(const char *)`
 ///
 /// Recovery is not supported, but validate the path as an existing object so
@@ -395,6 +478,33 @@ pub unsafe extern "C" fn truncate(path: *const c_char, length: libc::off_t) -> c
         let rc = unsafe { libc::truncate(path, length) };
         (rc, rc == 0)
     })
+}
+
+/// Darwin's `lseek` whence values. The first three are POSIX's everywhere, but
+/// Linux and FreeBSD number `SEEK_DATA` and `SEEK_HOLE` the other way round.
+mod whence {
+    pub const SEEK_SET: i32 = 0;
+    pub const SEEK_CUR: i32 = 1;
+    pub const SEEK_END: i32 = 2;
+    pub const SEEK_HOLE: i32 = 3;
+    pub const SEEK_DATA: i32 = 4;
+}
+
+/// `off_t lseek(int fd, off_t offset, int whence)`
+pub extern "C" fn lseek(fd: c_int, offset: libc::off_t, whence: c_int) -> libc::off_t {
+    let host = match whence {
+        whence::SEEK_SET => libc::SEEK_SET,
+        whence::SEEK_CUR => libc::SEEK_CUR,
+        whence::SEEK_END => libc::SEEK_END,
+        whence::SEEK_HOLE => libc::SEEK_HOLE,
+        whence::SEEK_DATA => libc::SEEK_DATA,
+        _ => {
+            crate::errno::set(libc::EINVAL);
+            return -1;
+        }
+    };
+    // SAFETY: `lseek` reads no memory of the caller's.
+    unsafe { libc::lseek(fd, offset, host) }
 }
 
 /// `int link(const char *, const char *)`
@@ -483,7 +593,7 @@ pub unsafe extern "C" fn clonefileat(
         let destination = Path::new(std::ffi::OsStr::from_bytes(
             unsafe { CStr::from_ptr(destination) }.to_bytes(),
         ));
-        match crate::copyfile::clonefile(from_path, destination, flags & CLONE_NOFOLLOW != 0) {
+        match crate::clonecopy::clonefile(from_path, destination, flags & CLONE_NOFOLLOW != 0) {
             Ok(()) => (0, true),
             Err(error) => {
                 crate::errno::set(error.raw_os_error().unwrap_or(libc::EIO));
@@ -716,11 +826,7 @@ pub unsafe extern "C" fn mkdtempat_np(dfd: c_int, path: *mut c_char) -> *mut c_c
             *slot = ALPHABET[byte as usize % ALPHABET.len()];
         }
         // SAFETY: the template, rewritten in place and still NUL-terminated.
-        if unsafe { libc::mkdirat(dfd, path, 0o700) } == 0 {
-            if crate::credentials::creates_as_another() {
-                // SAFETY: the template, NUL-terminated.
-                crate::credentials::created(dfd, unsafe { CStr::from_ptr(path) });
-            }
+        if make_dir(dfd, unsafe { CStr::from_ptr(path) }, 0o700) == 0 {
             return path;
         }
         if crate::errno::get() != libc::EEXIST {
@@ -729,6 +835,81 @@ pub unsafe extern "C" fn mkdtempat_np(dfd: c_int, path: *mut c_char) -> *mut c_c
     }
     crate::errno::set(libc::EEXIST);
     std::ptr::null_mut()
+}
+
+/// Darwin's temporary-name alphabet, in its order: a collision advances a
+/// character to the next one here.
+const TEMP_PADCHAR: &[u8] = b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
+
+/// `char *_mktemp(char *path)`, which Darwin's `mktemp` is.
+///
+/// Darwin's `_gettemp` without a descriptor: the trailing `X`s are randomised,
+/// then the name is stepped through the alphabet until `lstat` finds nothing.
+/// Only the guest's buffer is rewritten; each candidate is looked up by its
+/// guest spelling, case-folded as every other lookup is.
+///
+/// # Safety
+///
+/// `path` is a writable NUL-terminated template.
+pub unsafe extern "C" fn _mktemp(path: *mut c_char) -> *mut c_char {
+    if path.is_null() {
+        crate::errno::set(libc::EFAULT);
+        return std::ptr::null_mut();
+    }
+    // SAFETY: the caller's NUL-terminated string.
+    let len = unsafe { libc::strlen(path) };
+    if len >= DARWIN_PATH_MAX {
+        crate::errno::set(libc::ENAMETOOLONG);
+        return std::ptr::null_mut();
+    }
+    if len == 0 {
+        crate::errno::set(libc::EINVAL);
+        return std::ptr::null_mut();
+    }
+    // SAFETY: the caller's template, writable for its own length.
+    let template = unsafe { std::slice::from_raw_parts_mut(path.cast::<u8>(), len) };
+    let start = len - template.iter().rev().take_while(|b| **b == b'X').count();
+    let mut random = vec![0u8; (len - start) * size_of::<u32>()];
+    if getrandom::fill(&mut random).is_err() {
+        crate::errno::set(libc::EIO);
+        return std::ptr::null_mut();
+    }
+    for (slot, word) in template[start..]
+        .iter_mut()
+        .zip(random.chunks_exact(size_of::<u32>()))
+    {
+        let word = u32::from_ne_bytes(word.try_into().unwrap());
+        *slot = TEMP_PADCHAR[word as usize % TEMP_PADCHAR.len()];
+    }
+    let first = template[start..].to_vec();
+    loop {
+        // SAFETY: the template, rewritten in place and still NUL-terminated;
+        // a null `struct stat` asks only whether the name exists.
+        if unsafe { crate::stat::lstat(template.as_ptr().cast(), std::ptr::null_mut()) } != 0 {
+            return match crate::errno::get() {
+                libc::ENOENT => path,
+                _ => std::ptr::null_mut(),
+            };
+        }
+        // Count through every name the `X`s can spell, as an odometer started
+        // at the first random draw, so each is tried once.
+        let mut at = start;
+        loop {
+            if at == len {
+                crate::errno::set(libc::EEXIST);
+                return std::ptr::null_mut();
+            }
+            let next = TEMP_PADCHAR
+                .iter()
+                .position(|c| *c == template[at])
+                .map_or(0, |i| (i + 1) % TEMP_PADCHAR.len());
+            template[at] = TEMP_PADCHAR[next];
+            if template[at] != first[at - start] {
+                break;
+            }
+            at += 1;
+        }
+    }
 }
 
 /// The host spelling of a `XXXXXX` template, and how many bytes the caller's
@@ -819,6 +1000,38 @@ pub unsafe extern "C" fn fsctl(
     if found != 0 {
         return -1;
     }
+    // SAFETY: the caller's.
+    unsafe { volume_request(request, data) }
+}
+
+/// `int ffsctl(int fd, unsigned long request, void *data, unsigned int options)`
+///
+/// [`fsctl`] on the volume holding an open descriptor.
+///
+/// # Safety
+///
+/// `data` is what `request` says.
+pub unsafe extern "C" fn ffsctl(
+    fd: c_int,
+    request: u64,
+    data: *mut c_void,
+    _options: u32,
+) -> c_int {
+    let mut st = std::mem::MaybeUninit::<libc::stat>::uninit();
+    // SAFETY: a `stat` to fill, for the descriptor check alone.
+    if unsafe { libc::fstat(fd, st.as_mut_ptr()) } != 0 {
+        return -1;
+    }
+    // SAFETY: the caller's.
+    unsafe { volume_request(request, data) }
+}
+
+/// Answer an `fsctl` request on a volume that exists.
+///
+/// # Safety
+///
+/// `data` is what `request` says.
+unsafe fn volume_request(request: u64, data: *mut c_void) -> c_int {
     match request {
         FSIOC_SYNC_VOLUME => {
             // The argument is `FSCTL_SYNC_WAIT` and `FSCTL_SYNC_FULLSYNC`
@@ -844,19 +1057,24 @@ exports::exports! {
     functions {
         "chdir" => chdir,
         "fsctl" => fsctl,
+        "ffsctl" => ffsctl,
         "getcwd" => getcwd,
         "unlink" => unlink,
+        "unlinkat" => unlinkat,
         "rmdir" => rmdir,
         "remove" => remove,
         "mkdir" => mkdir,
+        "mkdirat" => mkdirat,
         "chmod" => chmod,
         "chown" => chown,
         "lchown" => lchown,
         "fchown" => fchown,
         "fchownat" => fchownat,
         "lchflags" => lchflags,
+        "fchflags" => fchflags,
         "undelete" => undelete,
         "truncate" => truncate,
+        "lseek" => lseek,
         "link" => link,
         "clonefileat" => clonefileat,
         "clonefile" => clonefile,
@@ -866,12 +1084,31 @@ exports::exports! {
         "mkstemp" => mkstemp,
         "mkdtemp" => mkdtemp,
         "mkdtempat_np" => mkdtempat_np,
+        "_mktemp" => _mktemp,
+        "mktemp" => _mktemp,
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::fd::AsRawFd;
+    use std::os::unix::fs::PermissionsExt;
+
+    /// A file with no holes has its data at the start and its only hole, the
+    /// implicit one, at the end - whichever way the host numbers the two.
+    #[test]
+    fn lseek_finds_holes_and_data_by_darwins_numbering() {
+        let at = std::env::temp_dir().join(format!("rosemary-lseek-{}", std::process::id()));
+        std::fs::write(&at, vec![1u8; 4096]).unwrap();
+        let file = std::fs::File::open(&at).unwrap();
+        let _ = std::fs::remove_file(&at);
+        let fd = file.as_raw_fd();
+        assert_eq!(lseek(fd, 0, whence::SEEK_HOLE), 4096);
+        assert_eq!(lseek(fd, 0, whence::SEEK_DATA), 0);
+        assert_eq!(lseek(fd, 0, 5), -1);
+        assert_eq!(crate::errno::get(), libc::EINVAL);
+    }
 
     #[test]
     fn fsctl_syncs_a_volume_and_refuses_what_the_file_system_would() {
@@ -892,5 +1129,244 @@ mod tests {
             -1
         );
         assert_eq!(crate::errno::get(), libc::ENOENT);
+    }
+
+    #[test]
+    fn fchflags_refuses_an_open_file_and_a_closed_descriptor() {
+        let file = std::fs::File::open("/").unwrap();
+        assert_eq!(fchflags(file.as_raw_fd(), 0), -1);
+        assert_eq!(crate::errno::get(), libc::ENOTSUP);
+        assert_eq!(fchflags(-1, 0), -1);
+        assert_eq!(crate::errno::get(), libc::EBADF);
+    }
+
+    #[test]
+    fn ffsctl_refuses_a_file_system_request_and_a_closed_descriptor() {
+        let file = std::fs::File::open("/").unwrap();
+        let mut flags = 0u32;
+        let data = (&raw mut flags).cast();
+        assert_eq!(
+            unsafe { ffsctl(file.as_raw_fd(), 0xc008_6801, data, 0) },
+            -1
+        );
+        assert_eq!(crate::errno::get(), libc::ENOTTY);
+        assert_eq!(unsafe { ffsctl(-1, FSIOC_SYNC_VOLUME, data, 0) }, -1);
+        assert_eq!(crate::errno::get(), libc::EBADF);
+    }
+
+    /// A directory under the host's temporary directory, removed on drop so
+    /// a failed assertion does not leave it for the next run.
+    struct Scratch(std::path::PathBuf);
+
+    impl Scratch {
+        fn new(test: &str) -> Self {
+            let dir =
+                std::env::temp_dir().join(format!("rosemary-fs-{test}-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).expect("a temporary directory");
+            Self(dir)
+        }
+
+        fn c_path(&self, name: &str) -> CString {
+            let path = self.0.join(name);
+            CString::new(path.as_os_str().as_bytes()).expect("no NUL")
+        }
+
+        /// A read-only descriptor for `name`, closed on drop.
+        fn open(&self, name: &str) -> std::fs::File {
+            std::fs::File::open(self.0.join(name)).expect("an openable path")
+        }
+    }
+
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn mkdirat_translates_darwin_at_fdcwd() {
+        let scratch = Scratch::new("mkdirat-cwd");
+        let path = scratch.c_path("made");
+        // SAFETY: a NUL-terminated path and Darwin's AT_FDCWD.
+        let rc = unsafe { mkdirat(crate::stat::DARWIN_AT_FDCWD, path.as_ptr(), 0o755) };
+        assert_eq!(rc, 0, "mkdirat: {}", std::io::Error::last_os_error());
+        assert!(scratch.0.join("made").is_dir());
+    }
+
+    #[test]
+    fn mkdirat_resolves_a_relative_path_against_its_descriptor() {
+        // SAFETY: takes no argument and cannot fail.
+        if unsafe { libc::geteuid() } == 0 {
+            eprintln!("skipped: root searches a locked directory anyway");
+            return;
+        }
+        let scratch = Scratch::new("mkdirat-relative");
+        std::fs::create_dir_all(scratch.0.join("locked/inner")).expect("a directory");
+        let dir = scratch.open("locked/inner");
+        let locked = scratch.0.join("locked");
+        let permissions = |mode| std::fs::Permissions::from_mode(mode);
+        // No search permission above `inner`: only a lookup that starts from
+        // the descriptor, rather than from an absolute spelling of it, works.
+        std::fs::set_permissions(&locked, permissions(0o000)).expect("a chmod");
+        // SAFETY: a live directory descriptor and a NUL-terminated relative path.
+        let rc = unsafe { mkdirat(dir.as_raw_fd(), c"child".as_ptr(), 0o755) };
+        let error = std::io::Error::last_os_error();
+        std::fs::set_permissions(&locked, permissions(0o755)).expect("a chmod");
+        assert_eq!(rc, 0, "mkdirat: {error}");
+        assert!(scratch.0.join("locked/inner/child").is_dir());
+    }
+
+    #[test]
+    fn mkdirat_reports_a_bad_descriptor_as_the_host_does() {
+        let scratch = Scratch::new("mkdirat-badfd");
+        std::fs::write(scratch.0.join("file"), b"x").expect("a file");
+        let file = scratch.open("file");
+        crate::errno::set(0);
+        // SAFETY: a NUL-terminated relative path; -5 is never a descriptor.
+        assert_eq!(unsafe { mkdirat(-5, c"child".as_ptr(), 0o755) }, -1);
+        assert_eq!(crate::errno::get(), libc::EBADF);
+        // SAFETY: a live, non-directory descriptor and a NUL-terminated path.
+        assert_eq!(
+            unsafe { mkdirat(file.as_raw_fd(), c"child".as_ptr(), 0o755) },
+            -1
+        );
+        assert_eq!(crate::errno::get(), libc::ENOTDIR);
+        crate::errno::set(0);
+    }
+
+    const DARWIN_AT_REMOVEDIR: c_int = 0x0080;
+    const DARWIN_AT_REMOVEDIR_DATALESS: c_int = 0x0100;
+
+    #[test]
+    fn unlinkat_translates_darwin_at_fdcwd_and_removedir() {
+        let scratch = Scratch::new("unlinkat-cwd");
+        std::fs::create_dir(scratch.0.join("dir")).expect("a directory");
+        let path = scratch.c_path("dir");
+        crate::errno::set(0);
+        // SAFETY: a NUL-terminated path and Darwin's AT_FDCWD.
+        unsafe {
+            assert_eq!(unlinkat(crate::stat::DARWIN_AT_FDCWD, path.as_ptr(), 0), -1);
+            assert_eq!(crate::errno::get(), libc::EISDIR);
+            let flag = DARWIN_AT_REMOVEDIR;
+            assert_eq!(
+                unlinkat(crate::stat::DARWIN_AT_FDCWD, path.as_ptr(), flag),
+                0
+            );
+        }
+        assert!(!scratch.0.join("dir").exists());
+        crate::errno::set(0);
+    }
+
+    #[test]
+    fn unlinkat_removes_relative_to_its_descriptor() {
+        let scratch = Scratch::new("unlinkat-relative");
+        std::fs::create_dir(scratch.0.join("dir")).expect("a directory");
+        std::fs::write(scratch.0.join("file"), b"x").expect("a file");
+        let dir = scratch.open(".");
+        let fd = dir.as_raw_fd();
+        // SAFETY: a live directory descriptor and NUL-terminated relative paths.
+        unsafe {
+            assert_eq!(unlinkat(fd, c"file".as_ptr(), 0), 0);
+            assert_eq!(
+                unlinkat(fd, c"dir".as_ptr(), DARWIN_AT_REMOVEDIR_DATALESS),
+                0
+            );
+        }
+        assert!(!scratch.0.join("file").exists());
+        assert!(!scratch.0.join("dir").exists());
+    }
+
+    #[test]
+    fn unlinkat_refuses_a_flag_it_cannot_honour() {
+        let scratch = Scratch::new("unlinkat-flags");
+        std::fs::write(scratch.0.join("file"), b"x").expect("a file");
+        let dir = scratch.open(".");
+        // Darwin's AT_SYMLINK_NOFOLLOW_ANY, which has no host equivalent.
+        const DARWIN_AT_SYMLINK_NOFOLLOW_ANY: c_int = 0x0800;
+        crate::errno::set(0);
+        // SAFETY: a live directory descriptor and a NUL-terminated relative path.
+        let rc = unsafe {
+            unlinkat(
+                dir.as_raw_fd(),
+                c"file".as_ptr(),
+                DARWIN_AT_SYMLINK_NOFOLLOW_ANY,
+            )
+        };
+        assert_eq!(rc, -1);
+        assert_eq!(crate::errno::get(), libc::EINVAL);
+        assert!(scratch.0.join("file").exists());
+        crate::errno::set(0);
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn unlinkat_resolve_beneath_removes_inside_and_refuses_an_escape() {
+        let flag = crate::stat::beneath::SUPPORTED;
+        let scratch = Scratch::new("unlinkat-beneath");
+        std::fs::create_dir_all(scratch.0.join("root/sub/dir")).expect("a directory");
+        std::fs::write(scratch.0.join("root/sub/file"), b"x").expect("a file");
+        std::fs::write(scratch.0.join("outside"), b"x").expect("a file");
+        std::os::unix::fs::symlink("..", scratch.0.join("root/up")).expect("a symlink");
+        let root = scratch.open("root");
+        let fd = root.as_raw_fd();
+        // SAFETY: a live directory descriptor and NUL-terminated relative paths.
+        unsafe {
+            assert_eq!(unlinkat(fd, c"sub/file".as_ptr(), flag), 0);
+            assert_eq!(
+                unlinkat(fd, c"sub/dir/".as_ptr(), flag | DARWIN_AT_REMOVEDIR),
+                0
+            );
+            for escape in [c"../outside", c"up/outside", c"sub/../..", c"/tmp/x"] {
+                crate::errno::set(0);
+                assert_eq!(unlinkat(fd, escape.as_ptr(), flag), -1, "{escape:?}");
+                assert_eq!(crate::errno::get(), libc::EXDEV, "{escape:?}");
+            }
+            // The symlink itself is inside, and removing it does not follow it.
+            assert_eq!(unlinkat(fd, c"up".as_ptr(), flag), 0);
+        }
+        assert!(!scratch.0.join("root/sub/file").exists());
+        assert!(!scratch.0.join("root/sub/dir").exists());
+        assert!(scratch.0.join("outside").exists());
+        assert!(!scratch.0.join("root/up").exists());
+        crate::errno::set(0);
+    }
+
+    #[test]
+    fn mktemp_names_a_free_file_without_creating_it() {
+        let scratch = Scratch::new("mktemp-free");
+        let template = scratch.c_path("name.XXXXXX");
+        let mut buffer = template.into_bytes_with_nul();
+        let path = buffer.as_mut_ptr().cast::<c_char>();
+        // SAFETY: a writable NUL-terminated template.
+        assert_eq!(unsafe { _mktemp(path) }, path);
+        // SAFETY: rewritten in place, still NUL-terminated.
+        let made = unsafe { CStr::from_ptr(path) }.to_str().unwrap();
+        let name = made.rsplit('/').next().unwrap();
+        assert_eq!(name.len(), "name.XXXXXX".len());
+        assert!(name[5..].bytes().all(|b| TEMP_PADCHAR.contains(&b)));
+        assert!(!Path::new(made).exists());
+    }
+
+    #[test]
+    fn mktemp_steps_past_taken_names_and_reports_exhaustion() {
+        let scratch = Scratch::new("mktemp-taken");
+        // One `X` spells 62 names; with all but one taken, the free one is found.
+        for &c in &TEMP_PADCHAR[1..] {
+            std::fs::write(scratch.0.join(format!("f{}", c as char)), b"").unwrap();
+        }
+        let mut buffer = scratch.c_path("fX").into_bytes_with_nul();
+        let path = buffer.as_mut_ptr().cast::<c_char>();
+        // SAFETY: a writable NUL-terminated template.
+        assert_eq!(unsafe { _mktemp(path) }, path);
+        // SAFETY: rewritten in place, still NUL-terminated.
+        assert!(unsafe { CStr::from_ptr(path) }.to_bytes().ends_with(b"/f0"));
+
+        std::fs::write(scratch.0.join("f0"), b"").unwrap();
+        let mut buffer = scratch.c_path("fX").into_bytes_with_nul();
+        // SAFETY: as above.
+        assert!(unsafe { _mktemp(buffer.as_mut_ptr().cast()) }.is_null());
+        assert_eq!(crate::errno::get(), libc::EEXIST);
+        crate::errno::set(0);
     }
 }

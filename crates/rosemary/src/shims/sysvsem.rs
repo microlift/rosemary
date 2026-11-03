@@ -3,13 +3,12 @@ use microlift::arch::x86_64::context::RegisterContext;
 use crate::abi::{GuestMemory, Result};
 
 use super::set_int_return;
+use crate::shims::bind;
 
 /// The shim for `name`, if this module has one.
-pub fn shim_for(
-    name: &str,
-) -> Option<fn(&str, &mut RegisterContext, &mut dyn GuestMemory) -> Result<()>> {
+pub fn shim_for(name: &str) -> Option<super::Shim> {
     match name {
-        "semctl" => Some(semctl),
+        "semctl" => Some(bind!("semctl" => semctl)),
         _ => None,
     }
 }

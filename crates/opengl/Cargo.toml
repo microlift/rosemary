@@ -1,0 +1,14 @@
+[package]
+name = "opengl"
+description = "OpenGL.framework reimplementation: CGL, GL and GLU over the GL driver SDL loads"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+exports.workspace = true
+appkit.workspace = true
+sdl3.workspace = true
+
+[lints]
+workspace = true

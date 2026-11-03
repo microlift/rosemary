@@ -206,8 +206,11 @@ pub unsafe extern "C" fn class_getClassMethod(cls: *const c_void, name: Sel) -> 
 ///
 /// `rosemary`'s dispatch caches this value and re-probes it to notice a swizzle,
 /// so it must change exactly when the resolution does. See the crate doc.
+/// Like Apple's, this sends `+initialize` first: a caller that looks up an
+/// `IMP` to call it is about to message the class.
 pub unsafe extern "C" fn class_getMethodImplementation(cls: *const c_void, name: Sel) -> Imp {
     unsafe { class(cls) }.map_or(std::ptr::null(), |c| {
+        crate::class::ensure_initialized(c);
         crate::class::method_implementation(c, name)
     })
 }
@@ -285,6 +288,226 @@ pub unsafe extern "C" fn ivar_getName(ivar: *const c_void) -> *const c_char {
         true => std::ptr::null(),
         false => unsafe { &*(ivar as *const Ivar) }.name(),
     }
+}
+
+pub unsafe extern "C" fn ivar_getTypeEncoding(ivar: *const c_void) -> *const c_char {
+    crate::debug::validate_handle(ivar, "ivar", "ivar_getTypeEncoding");
+    match ivar.is_null() {
+        true => std::ptr::null(),
+        false => unsafe { &*(ivar as *const Ivar) }.types().as_ptr(),
+    }
+}
+
+/// The bytes of a method's type encoding.
+///
+/// # Safety
+///
+/// As [`method`].
+unsafe fn method_types<'a>(m: *const c_void) -> Option<&'a [u8]> {
+    unsafe { method(m) }.map(|m| unsafe { CStr::from_ptr(m.types()) }.to_bytes())
+}
+
+pub unsafe extern "C" fn method_getNumberOfArguments(m: *const c_void) -> u32 {
+    unsafe { method_types(m) }.map_or(0, |t| crate::encoding::arguments(t).count() as u32)
+}
+
+pub unsafe extern "C" fn method_copyReturnType(m: *const c_void) -> *mut c_char {
+    let types = unsafe { method_types(m) }.unwrap_or_default();
+    unsafe { copied_string(crate::encoding::return_type(types)) }
+}
+
+/// Null when the method has no argument `index`.
+pub unsafe extern "C" fn method_copyArgumentType(m: *const c_void, index: u32) -> *mut c_char {
+    match unsafe { method_types(m) }.and_then(|t| crate::encoding::arguments(t).nth(index as usize))
+    {
+        Some(argument) => unsafe { copied_string(argument) },
+        None => std::ptr::null_mut(),
+    }
+}
+
+pub unsafe extern "C" fn method_getReturnType(m: *const c_void, dst: *mut c_char, dst_len: usize) {
+    let types = unsafe { method_types(m) }.unwrap_or_default();
+    unsafe { fill(dst, dst_len, crate::encoding::return_type(types)) };
+}
+
+/// An empty string when the method has no argument `index`.
+pub unsafe extern "C" fn method_getArgumentType(
+    m: *const c_void,
+    index: u32,
+    dst: *mut c_char,
+    dst_len: usize,
+) {
+    let argument = unsafe { method_types(m) }
+        .and_then(|t| crate::encoding::arguments(t).nth(index as usize))
+        .unwrap_or_default();
+    unsafe { fill(dst, dst_len, argument) };
+}
+
+/// `strncpy` of `value` into `dst`: truncated without a terminator if it does
+/// not fit, and the rest of the buffer zeroed if it does.
+///
+/// # Safety
+///
+/// `dst` must be null or writable for `dst_len` bytes.
+unsafe fn fill(dst: *mut c_char, dst_len: usize, value: &[u8]) {
+    if dst.is_null() {
+        return;
+    }
+    let copied = value.len().min(dst_len);
+    // SAFETY: the caller's obligation; `copied` and the rest are within `dst_len`.
+    unsafe {
+        std::ptr::copy_nonoverlapping(value.as_ptr(), dst as *mut u8, copied);
+        std::ptr::write_bytes((dst as *mut u8).add(copied), 0, dst_len - copied);
+    }
+}
+
+/// A NUL-terminated copy of `value` the caller frees with `free`.
+///
+/// # Safety
+///
+/// As [`copied_list`].
+unsafe fn copied_string(value: &[u8]) -> *mut c_char {
+    // SAFETY: a positive size, and the result is checked before it is written.
+    let block = unsafe { crate::allocator::guest_malloc(value.len() + 1) } as *mut u8;
+    if !block.is_null() {
+        // SAFETY: `value.len() + 1` bytes, freshly ours.
+        unsafe {
+            std::ptr::copy_nonoverlapping(value.as_ptr(), block, value.len());
+            block.add(value.len()).write(0);
+        }
+    }
+    block as *mut c_char
+}
+
+pub unsafe extern "C" fn class_copyIvarList(
+    cls: *const c_void,
+    out_count: *mut u32,
+) -> *mut *const c_void {
+    let ivars = unsafe { class(cls) }
+        .map(|c| c.own_ivars())
+        .unwrap_or_default();
+    let values = ivars.into_iter().map(|i| i as *const Ivar as *const c_void);
+    unsafe { copied_handles(values.collect(), out_count) }
+}
+
+pub unsafe extern "C" fn class_copyMethodList(
+    cls: *const c_void,
+    out_count: *mut u32,
+) -> *mut *const c_void {
+    let methods = unsafe { class(cls) }
+        .map(|c| c.own_methods())
+        .unwrap_or_default();
+    let values = methods
+        .into_iter()
+        .map(|m| m as *const Method as *const c_void);
+    unsafe { copied_handles(values.collect(), out_count) }
+}
+
+pub unsafe extern "C" fn class_copyProtocolList(
+    cls: *const c_void,
+    out_count: *mut u32,
+) -> *mut *const c_void {
+    let protocols = unsafe { class(cls) }
+        .map(|c| c.own_protocols())
+        .unwrap_or_default();
+    let values = protocols
+        .into_iter()
+        .map(|p| p as *const Protocol as *const c_void);
+    unsafe { copied_handles(values.collect(), out_count) }
+}
+
+/// An ivar of the metaclass, which is what Apple means by a class variable.
+pub unsafe extern "C" fn class_getClassVariable(
+    cls: *const c_void,
+    name: *const c_char,
+) -> *const c_void {
+    let (Some(cls), Some(name)) = (unsafe { class(cls) }, unsafe { cstr(name) }) else {
+        return std::ptr::null();
+    };
+    cls.metaclass()
+        .ivar(name)
+        .map_or(std::ptr::null(), |i| i as *const Ivar as *const c_void)
+}
+
+pub unsafe extern "C" fn class_getVersion(cls: *const c_void) -> i32 {
+    unsafe { class(cls) }.map_or(0, |c| c.version())
+}
+
+pub unsafe extern "C" fn class_setVersion(cls: *const c_void, version: i32) {
+    if let Some(cls) = unsafe { class(cls) } {
+        cls.set_version(version);
+    }
+}
+
+/// FIXME (ACCURACY): only a layout `class_setIvarLayout` set is known. The
+/// layout the compiler emits for a guest class is not carried across, so a
+/// guest class with strong ivars answers null, which means it has none.
+pub unsafe extern "C" fn class_getIvarLayout(cls: *const c_void) -> *const u8 {
+    unsafe { class(cls) }
+        .and_then(|c| c.ivar_layout(false))
+        .map_or(std::ptr::null(), |l| l.as_ptr().cast())
+}
+
+/// FIXME (ACCURACY): as [`class_getIvarLayout`], for weak ivars.
+pub unsafe extern "C" fn class_getWeakIvarLayout(cls: *const c_void) -> *const u8 {
+    unsafe { class(cls) }
+        .and_then(|c| c.ivar_layout(true))
+        .map_or(std::ptr::null(), |l| l.as_ptr().cast())
+}
+
+pub unsafe extern "C" fn class_setIvarLayout(cls: *const c_void, layout: *const u8) {
+    if let Some(cls) = unsafe { class(cls) } {
+        cls.set_ivar_layout(false, unsafe { cstr(layout.cast()) });
+    }
+}
+
+pub unsafe extern "C" fn class_setWeakIvarLayout(cls: *const c_void, layout: *const u8) {
+    if let Some(cls) = unsafe { class(cls) } {
+        cls.set_ivar_layout(true, unsafe { cstr(layout.cast()) });
+    }
+}
+
+/// FIXME (ACCURACY): classes are not tracked by the image that declared them,
+/// so every class answers null, which Apple reserves for one made at run time.
+pub unsafe extern "C" fn class_getImageName(_cls: *const c_void) -> *const c_char {
+    std::ptr::null()
+}
+
+/// FIXME (ACCURACY): no image is listed, for the reason
+/// [`class_getImageName`] gives.
+pub unsafe extern "C" fn objc_copyImageNames(out_count: *mut u32) -> *mut *const c_char {
+    unsafe { copied_handles(Vec::new(), out_count) }.cast()
+}
+
+/// FIXME (ACCURACY): no image is known, so this answers as Apple's does for a
+/// path that names none.
+pub unsafe extern "C" fn objc_copyClassNamesForImage(
+    _image: *const c_char,
+    out_count: *mut u32,
+) -> *mut *const c_char {
+    unsafe { copied_handles(Vec::new(), out_count) }.cast()
+}
+
+/// Every registered class: the count, and as many as `buffer` holds.
+pub unsafe extern "C" fn objc_getClassList(buffer: *mut *const c_void, buffer_count: i32) -> i32 {
+    let classes = crate::class::registered();
+    if !buffer.is_null() {
+        for (i, class) in classes
+            .iter()
+            .take(buffer_count.max(0) as usize)
+            .enumerate()
+        {
+            // SAFETY: `i` is below the caller's `buffer_count`.
+            unsafe { *buffer.add(i) = crate::class::ptr(class) as *const c_void };
+        }
+    }
+    classes.len() as i32
+}
+
+pub unsafe extern "C" fn objc_copyClassList(out_count: *mut u32) -> *mut *const c_void {
+    let classes = crate::class::registered().into_iter();
+    let values = classes.map(|c| crate::class::ptr(c) as *const c_void);
+    unsafe { copied_handles(values.collect(), out_count) }
 }
 
 pub unsafe extern "C" fn object_getClass(object: Id) -> *mut c_void {
@@ -380,6 +603,54 @@ pub unsafe extern "C" fn objc_destructInstance(object: Id) -> Id {
     object
 }
 
+/// A new instance of `object`'s class holding a copy of its bytes, with `extra`
+/// bytes after the ivars.
+///
+/// FIXME (ACCURACY): Apple's then retains the strong ivars an ARC class's ivar
+/// layout names; without those layouts (see [`class_getIvarLayout`]) the copy
+/// shares them unretained.
+pub unsafe extern "C" fn object_copy(object: Id, extra: usize) -> Id {
+    let Some(class) = (unsafe { crate::object::class_of(object) }) else {
+        return std::ptr::null_mut();
+    };
+    let copy = crate::object::create_instance(class, extra);
+    if !copy.is_null() {
+        let word = size_of::<usize>();
+        // SAFETY: both are `instance_size + extra` bytes, as Apple's contract
+        // for `extra` requires of the original; the `isa` is already set.
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                (object as *const u8).add(word),
+                (copy as *mut u8).add(word),
+                class.instance_size() + extra - word,
+            )
+        };
+    }
+    copy
+}
+
+pub unsafe extern "C" fn object_dispose(object: Id) -> Id {
+    crate::debug::validate(object, "object_dispose");
+    // SAFETY: the caller gives up the object.
+    unsafe { crate::object::dispose_instance(object) };
+    std::ptr::null_mut()
+}
+
+pub unsafe extern "C" fn object_setInstanceVariable(
+    object: Id,
+    name: *const c_char,
+    value: *mut c_void,
+) -> *const c_void {
+    let Some(class) = (unsafe { crate::object::class_of(object) }) else {
+        return std::ptr::null();
+    };
+    let ivar = unsafe { class_getInstanceVariable(crate::class::ptr(class).cast(), name) };
+    if !ivar.is_null() {
+        unsafe { object_setIvar(object, ivar, value) };
+    }
+    ivar
+}
+
 /// `objc_property_attribute_t`: a name and a value, both C strings.
 #[repr(C)]
 pub struct PropertyAttribute {
@@ -424,6 +695,28 @@ unsafe fn copied_list<T>(values: Vec<T>, out_count: *mut u32) -> *mut T {
     block
 }
 
+/// A nil-terminated list the caller frees with `free`, or null when empty, as
+/// every `copy...List` of handles is.
+///
+/// # Safety
+///
+/// As [`copied_list`].
+unsafe fn copied_handles(
+    mut values: Vec<*const c_void>,
+    out_count: *mut u32,
+) -> *mut *const c_void {
+    let count = values.len() as u32;
+    if !values.is_empty() {
+        values.push(std::ptr::null());
+    }
+    let list = unsafe { copied_list(values, out_count) };
+    // SAFETY: null or writable, as above.
+    if !out_count.is_null() {
+        unsafe { *out_count = count };
+    }
+    list
+}
+
 pub unsafe extern "C" fn class_copyPropertyList(
     cls: *const c_void,
     out_count: *mut u32,
@@ -436,7 +729,7 @@ pub unsafe extern "C" fn class_copyPropertyList(
         .map(|p| p as *const crate::property::Property as *const c_void)
         .collect();
     // SAFETY: `out_count` is null or writable, as the C prototype requires.
-    unsafe { copied_list(values, out_count) }
+    unsafe { copied_handles(values, out_count) }
 }
 
 pub unsafe extern "C" fn class_getProperty(
@@ -542,6 +835,25 @@ pub unsafe extern "C" fn property_copyAttributeList(
     unsafe { copied_list(values, out_count) }
 }
 
+/// The value of the attribute `name`, a copy the caller frees, or null if the
+/// property has no such attribute.
+pub unsafe extern "C" fn property_copyAttributeValue(
+    p: *const c_void,
+    name: *const c_char,
+) -> *mut c_char {
+    let (Some(p), Some(name)) = (unsafe { property(p) }, unsafe { cstr(name) }) else {
+        return std::ptr::null_mut();
+    };
+    match p
+        .attribute_list()
+        .into_iter()
+        .find(|(n, _)| n.as_c_str() == name)
+    {
+        Some((_, value)) => unsafe { copied_string(value.to_bytes()) },
+        None => std::ptr::null_mut(),
+    }
+}
+
 /// `objc_loadClassref`, which resolves a class reference slot.
 ///
 /// Apple's low bit marks a *stub* class, whose initializer has to be called
@@ -608,6 +920,117 @@ pub unsafe extern "C" fn protocol_getMethodDescription(
         },
         |p| p.method(name, is_required, is_instance),
     )
+}
+
+/// The protocol's own methods in one group, ending in a zeroed entry.
+pub unsafe extern "C" fn protocol_copyMethodDescriptionList(
+    proto: *const c_void,
+    is_required: bool,
+    is_instance: bool,
+    out_count: *mut u32,
+) -> *mut Description {
+    let mut values = unsafe { protocol(proto) }
+        .map(|p| p.methods(is_required, is_instance))
+        .unwrap_or_default();
+    let count = values.len() as u32;
+    if !values.is_empty() {
+        values.push(Description {
+            sel: std::ptr::null(),
+            types: std::ptr::null(),
+        });
+    }
+    let list = unsafe { copied_list(values, out_count) };
+    // SAFETY: null or writable.
+    if !out_count.is_null() {
+        unsafe { *out_count = count };
+    }
+    list
+}
+
+pub unsafe extern "C" fn protocol_conformsToProtocol(
+    proto: *const c_void,
+    other: *const c_void,
+) -> bool {
+    let (Some(proto), Some(other)) = (unsafe { protocol(proto) }, unsafe { protocol(other) })
+    else {
+        return false;
+    };
+    proto.conforms_by_name(other)
+}
+
+/// Equal when each conforms to the other, which is how Apple's decides.
+pub unsafe extern "C" fn protocol_isEqual(proto: *const c_void, other: *const c_void) -> bool {
+    std::ptr::eq(proto, other)
+        || unsafe {
+            protocol_conformsToProtocol(proto, other) && protocol_conformsToProtocol(other, proto)
+        }
+}
+
+pub unsafe extern "C" fn protocol_copyProtocolList(
+    proto: *const c_void,
+    out_count: *mut u32,
+) -> *mut *const c_void {
+    let adopted = unsafe { protocol(proto) }
+        .map(|p| p.adopted())
+        .unwrap_or_default();
+    let values = adopted
+        .into_iter()
+        .map(|p| p as *const Protocol as *const c_void);
+    unsafe { copied_handles(values.collect(), out_count) }
+}
+
+pub unsafe extern "C" fn objc_copyProtocolList(out_count: *mut u32) -> *mut *const c_void {
+    let protocols = crate::protocol::registered().into_iter();
+    let values = protocols.map(|p| p as *const Protocol as *const c_void);
+    unsafe { copied_handles(values.collect(), out_count) }
+}
+
+pub unsafe extern "C" fn protocol_addProperty(
+    proto: *const c_void,
+    name: *const c_char,
+    attributes: *const PropertyAttribute,
+    count: u32,
+    is_required: bool,
+    is_instance: bool,
+) {
+    let (Some(proto), Some(name)) = (unsafe { protocol(proto) }, unsafe { cstr(name) }) else {
+        return;
+    };
+    // SAFETY: `attributes` is null or `count` entries long.
+    let attributes = unsafe { attribute_string(attributes, count) };
+    proto.add_property(name, &attributes, is_required, is_instance);
+}
+
+/// Only a required property is ever found, because only those are kept.
+pub unsafe extern "C" fn protocol_getProperty(
+    proto: *const c_void,
+    name: *const c_char,
+    is_required: bool,
+    is_instance: bool,
+) -> *const c_void {
+    let (Some(proto), Some(name)) = (unsafe { protocol(proto) }, unsafe { cstr(name) }) else {
+        return std::ptr::null();
+    };
+    if !is_required {
+        return std::ptr::null();
+    }
+    proto
+        .property(name, is_instance)
+        .map_or(std::ptr::null(), |p| p as *const _ as *const c_void)
+}
+
+/// The required instance properties the protocol declares itself.
+pub unsafe extern "C" fn protocol_copyPropertyList(
+    proto: *const c_void,
+    out_count: *mut u32,
+) -> *mut *const c_void {
+    let properties = unsafe { protocol(proto) }
+        .map(|p| p.properties(true))
+        .unwrap_or_default();
+    let values = properties
+        .into_iter()
+        .map(|p| p as *const crate::property::Property as *const c_void);
+    unsafe { copied_handles(values.collect(), out_count) }
 }
 
 pub unsafe extern "C" fn objc_retain(object: Id) -> Id {
@@ -848,9 +1271,13 @@ pub unsafe extern "C" fn objc_setAssociatedObject(
     object: Id,
     key: *const c_void,
     value: Id,
-    _policy: usize,
+    policy: usize,
 ) {
-    crate::arc::set_associated(object, key, value);
+    crate::arc::set_associated_with_policy(object, key, value, policy);
+}
+
+pub unsafe extern "C" fn objc_removeAssociatedObjects(object: Id) {
+    crate::arc::remove_associated(object);
 }
 
 pub unsafe extern "C" fn objc_getAssociatedObject(object: Id, key: *const c_void) -> Id {
@@ -946,5 +1373,210 @@ mod tests {
         assert_eq!(crate::arc::retain_count(object), 2);
         crate::arc::release(object);
         crate::arc::release(object);
+    }
+
+    /// A retaining association keeps its value alive, and the value is let
+    /// go of when the owner is destroyed - so a later object at the owner's
+    /// address does not inherit it.
+    #[test]
+    fn a_retained_association_lives_and_dies_with_its_owner() {
+        static KEY: u8 = 0;
+        let key = &KEY as *const u8 as *const c_void;
+        let (owner, value) = (object(), object());
+        // SAFETY: two live objects; 0x301 is OBJC_ASSOCIATION_RETAIN.
+        unsafe { objc_setAssociatedObject(owner, key, value, 0x301) };
+        assert_eq!(crate::arc::retain_count(value), 2);
+        assert_eq!(unsafe { objc_getAssociatedObject(owner, key) }, value);
+        // SAFETY: the owner is intact and about to be freed.
+        unsafe { crate::object::destruct_instance(owner) };
+        assert_eq!(crate::arc::retain_count(value), 1);
+        assert!(unsafe { objc_getAssociatedObject(owner, key) }.is_null());
+        crate::arc::release(value);
+    }
+
+    static FORWARD_TARGET: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+    unsafe extern "C" fn answer(_receiver: Id, _sel: crate::sel::Sel) -> usize {
+        42
+    }
+
+    unsafe extern "C" fn target_for(
+        _receiver: Id,
+        _sel: crate::sel::Sel,
+        _wanted: crate::sel::Sel,
+    ) -> Id {
+        FORWARD_TARGET.load(std::sync::atomic::Ordering::Acquire) as Id
+    }
+
+    /// A message the receiver does not answer goes to the object its
+    /// `-forwardingTargetForSelector:` names, and arrives with that object as
+    /// its receiver.
+    #[test]
+    fn a_forwarding_target_receives_the_message() {
+        crate::bootstrap();
+        let root = crate::class::lookup(c"NSObject").unwrap();
+        let answering = crate::class::allocate_pair(Some(root), c"ForwardTestTarget", 0).unwrap();
+        answering.add_method(
+            crate::sel::get("forwardTestAnswer"),
+            answer as crate::class::Imp,
+            c"Q16@0:8",
+        );
+        crate::class::register_pair(answering);
+        let proxy = crate::class::allocate_pair(Some(root), c"ForwardTestProxy", 0).unwrap();
+        proxy.add_method(
+            crate::sel::get("forwardingTargetForSelector:"),
+            target_for as crate::class::Imp,
+            c"@24@0:8:16",
+        );
+        crate::class::register_pair(proxy);
+        let target = crate::object::create_instance(answering, 0);
+        FORWARD_TARGET.store(target as usize, std::sync::atomic::Ordering::Release);
+        let sender = crate::object::create_instance(proxy, 0);
+        // SAFETY: `NSUInteger (id, SEL)`, sent through the trampoline.
+        let got = unsafe {
+            let f: unsafe extern "C" fn(Id, crate::sel::Sel) -> usize =
+                std::mem::transmute(crate::msg::entry());
+            f(sender, crate::sel::get("forwardTestAnswer"))
+        };
+        assert_eq!(got, 42);
+        crate::arc::release(sender);
+        crate::arc::release(target);
+    }
+}
+
+#[cfg(test)]
+mod introspection {
+    use super::*;
+
+    unsafe extern "C" fn nothing(_receiver: Id, _sel: Sel) {}
+
+    fn class_named(name: &CStr) -> &'static Class {
+        crate::bootstrap();
+        let nsobject = crate::class::lookup(c"NSObject").expect("NSObject");
+        crate::class::allocate_pair(Some(nsobject), name, 0).expect("a fresh name")
+    }
+
+    /// The handles in a nil-terminated list, which is freed.
+    unsafe fn take(list: *mut *const c_void, count: u32) -> Vec<*const c_void> {
+        if list.is_null() {
+            return Vec::new();
+        }
+        let handles = unsafe { std::slice::from_raw_parts(list, count as usize + 1) }.to_vec();
+        assert!(
+            handles[count as usize].is_null(),
+            "the list is nil-terminated"
+        );
+        unsafe { crate::allocator::guest_free(list.cast()) };
+        handles[..count as usize].to_vec()
+    }
+
+    #[test]
+    fn copies_a_classs_own_ivars_and_methods() {
+        let class = class_named(c"RosemaryCopyLists");
+        assert!(class.add_ivar(c"first", 8, 3, c"@"));
+        assert!(class.add_ivar(c"second", 4, 2, c"i"));
+        let sel = crate::sel::get("tick:");
+        assert!(class.add_method(sel, nothing as *const c_void, c"v24@0:8@16"));
+        crate::class::register_pair(class);
+        let cls = crate::class::ptr(class) as *const c_void;
+        let mut count = 0;
+        unsafe {
+            let ivars = take(class_copyIvarList(cls, &mut count), count);
+            let names: Vec<&CStr> = ivars
+                .iter()
+                .map(|&i| CStr::from_ptr(ivar_getName(i)))
+                .collect();
+            assert_eq!(names, [c"first", c"second"]);
+            assert_eq!(CStr::from_ptr(ivar_getTypeEncoding(ivars[1])), c"i");
+
+            let methods = take(class_copyMethodList(cls, &mut count), count);
+            assert_eq!(methods.len(), 1);
+            assert_eq!(method_getName(methods[0]), sel);
+        }
+    }
+
+    #[test]
+    fn reads_argument_types_out_of_a_method_encoding() {
+        let class = class_named(c"RosemaryMethodTypes");
+        let sel = crate::sel::get("tick:");
+        assert!(class.add_method(sel, nothing as *const c_void, c"v24@0:8^{CGPoint=dd}16"));
+        let method = class.own_method(sel).unwrap() as *const Method as *const c_void;
+        unsafe {
+            assert_eq!(method_getNumberOfArguments(method), 3);
+            let argument = method_copyArgumentType(method, 2);
+            assert_eq!(CStr::from_ptr(argument), c"^{CGPoint=dd}");
+            crate::allocator::guest_free(argument.cast());
+            assert!(method_copyArgumentType(method, 3).is_null());
+
+            let mut buffer = [0x7f as c_char; 4];
+            method_getReturnType(method, buffer.as_mut_ptr(), buffer.len());
+            assert_eq!(buffer, [b'v' as c_char, 0, 0, 0]);
+            method_getArgumentType(method, 9, buffer.as_mut_ptr(), buffer.len());
+            assert_eq!(buffer, [0; 4]);
+        }
+    }
+
+    #[test]
+    fn a_metaclass_starts_at_version_seven() {
+        let class = class_named(c"RosemaryVersions");
+        let cls = crate::class::ptr(class) as *const c_void;
+        let meta = crate::class::ptr(class.metaclass()) as *const c_void;
+        unsafe {
+            assert_eq!(class_getVersion(cls), 0);
+            assert_eq!(class_getVersion(meta), 7);
+            class_setVersion(cls, 3);
+            assert_eq!(class_getVersion(cls), 3);
+        }
+    }
+
+    #[test]
+    fn protocol_properties_and_conformance() {
+        let base = crate::protocol::allocate(c"RosemaryBaseProtocol").unwrap();
+        let attributes = [PropertyAttribute {
+            name: c"T".as_ptr(),
+            value: c"@".as_ptr(),
+        }];
+        let base_ptr = base as *const Protocol as *const c_void;
+        unsafe {
+            protocol_addProperty(
+                base_ptr,
+                c"title".as_ptr(),
+                attributes.as_ptr(),
+                1,
+                true,
+                true,
+            );
+            protocol_addProperty(
+                base_ptr,
+                c"hint".as_ptr(),
+                attributes.as_ptr(),
+                1,
+                false,
+                true,
+            );
+        }
+        crate::protocol::register(base);
+        let derived = crate::protocol::allocate(c"RosemaryDerivedProtocol").unwrap();
+        derived.add_protocol(base);
+        crate::protocol::register(derived);
+        let derived_ptr = derived as *const Protocol as *const c_void;
+        let mut count = 0;
+        unsafe {
+            let title = protocol_getProperty(derived_ptr, c"title".as_ptr(), true, true);
+            assert_eq!(CStr::from_ptr(property_getAttributes(title)), c"T@");
+            assert!(protocol_getProperty(base_ptr, c"hint".as_ptr(), false, true).is_null());
+            assert_eq!(
+                take(protocol_copyPropertyList(base_ptr, &mut count), count).len(),
+                1
+            );
+            assert_eq!(
+                take(protocol_copyProtocolList(derived_ptr, &mut count), count),
+                [base_ptr]
+            );
+
+            assert!(protocol_conformsToProtocol(derived_ptr, base_ptr));
+            assert!(!protocol_conformsToProtocol(base_ptr, derived_ptr));
+            assert!(!protocol_isEqual(derived_ptr, base_ptr));
+        }
     }
 }

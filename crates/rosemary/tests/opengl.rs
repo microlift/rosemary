@@ -57,13 +57,17 @@ int main(int argc, char **argv) {
     CHECK(dlsym(framework, "CGLFlushDrawable") == (void *)CGLFlushDrawable);
     CHECK(dlsym(framework, "gluOrtho2D") == (void *)gluOrtho2D);
     CHECK(dlsym(framework, "glGetString") == (void *)glGetString);
-    CHECK(dlsym(framework, "CGLChoosePixelFormat") == NULL);
-    CHECK(dlsym(RTLD_DEFAULT, "CGLChoosePixelFormat") == NULL);
+    CHECK(dlsym(framework, "CGLChoosePixelFormat") == (void *)CGLChoosePixelFormat);
     CHECK(dlsym(framework, "gluPerspective") == NULL);
     CHECK(dlsym(RTLD_DEFAULT, "gluPerspective") == NULL);
-    // A real host handle must obey the same fallback policy.
+    // GL 4.3, which a Mac's framework does not export.
+    CHECK(dlsym(framework, "glDispatchCompute") == NULL);
+    CHECK(dlsym(RTLD_DEFAULT, "glDispatchCompute") == NULL);
+    // libSystem does not link OpenGL, so its handle finds none of it.
     void *system = dlopen("/usr/lib/libSystem.B.dylib", RTLD_LAZY);
-    CHECK(system && dlsym(system, "CGLChoosePixelFormat") == NULL);
+    CHECK(system && dlsym(system, "glDispatchCompute") == NULL);
+    CHECK(dlsym(system, "CGLChoosePixelFormat") == NULL);
+    CHECK(dlsym(system, "glGetString") == NULL);
     GLint zero = 0, one = 1;
     CHECK(CGLSetParameter(first_handle, kCGLCPSwapInterval, &zero) == kCGLNoError);
     CHECK(CGLSetParameter(second_handle, kCGLCPSwapInterval, &one) == kCGLNoError);
@@ -126,6 +130,13 @@ int main(int argc, char **argv) {
         CHECK(compiled && glGetError() == GL_NO_ERROR);
         glDeleteShader(shader);
     } else {
+        // A Mac's legacy profile is GL 2.1, which has no GL_MAJOR_VERSION.
+        CHECK(!strncmp((const char *)glGetString(GL_VERSION), "2.1", 3));
+        CHECK(!strcmp((const char *)glGetString(GL_SHADING_LANGUAGE_VERSION), "1.20"));
+        GLint major = -1;
+        glGetIntegerv(GL_MAJOR_VERSION, &major);
+        CHECK(major == -1 && glGetError() == GL_INVALID_ENUM);
+        CHECK(!strstr((const char *)glGetString(GL_EXTENSIONS), "GL_ARB_direct_state_access"));
         glMatrixMode(GL_PROJECTION);
         glLoadIdentity();
         gluOrtho2D(0, 10, 0, 20);

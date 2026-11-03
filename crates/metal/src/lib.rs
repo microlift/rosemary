@@ -1,10 +1,12 @@
 #![allow(non_snake_case)]
 
 mod capture;
+mod compile;
 mod completion;
 mod constants;
 mod device;
 mod encoder;
+mod event;
 mod exports;
 mod gpu;
 mod heap;
@@ -188,6 +190,23 @@ pub fn bootstrap() {
             "supports32BitFloatFiltering" => yes, c"B16@0:8";
             "supportsBCTextureCompression" => supports_bc, c"B16@0:8";
             "supportsPullModelInterpolation" => no, c"B16@0:8";
+            "areProgrammableSamplePositionsSupported" => no, c"B16@0:8";
+            "areRasterOrderGroupsSupported" => no, c"B16@0:8";
+            "supportsCounterSampling:" => supports_counter_sampling, c"B24@0:8Q16";
+            "counterSets" => counter_sets, c"@16@0:8";
+            "sampleTimestamps:gpuTimestamp:" => sample_timestamps, c"v32@0:8^Q16^Q24";
+            "readWriteTextureSupport" => read_write_texture_tier, c"Q16@0:8";
+            "maxThreadsPerThreadgroup" => max_threads_per_threadgroup, c"{MTLSize=QQQ}16@0:8";
+            "maxArgumentBufferSamplerCount" => max_argument_buffer_samplers, c"Q16@0:8";
+            "minimumTextureBufferAlignmentForPixelFormat:" => texel_buffer_alignment,
+                c"Q24@0:8Q16";
+            "minimumLinearTextureAlignmentForPixelFormat:" => texel_buffer_alignment,
+                c"Q24@0:8Q16";
+            "location" => location, c"Q16@0:8";
+            // Not a peer-group member: Vulkan exposes no such grouping.
+            "locationNumber" => zero, c"Q16@0:8";
+            "peerGroupID" => zero, c"Q16@0:8";
+            "peerIndex" => zero, c"I16@0:8";
             "supportsTextureSampleCount:" => supports_sample_count, c"B24@0:8Q16";
             "newCommandQueue" => new_command_queue, c"@16@0:8";
             "newCommandQueueWithMaxCommandBufferCount:" => new_command_queue_with_count,
@@ -200,6 +219,12 @@ pub fn bootstrap() {
             "newDefaultLibrary" => new_default_library, c"@16@0:8";
             "newLibraryWithData:error:" => new_library_with_data, c"@32@0:8@16^@24";
             "newLibraryWithSource:options:error:" => new_library_with_source, c"@40@0:8@16@24^@32";
+            "newLibraryWithSource:options:completionHandler:" => compile::new_library_with_source,
+                c"v40@0:8@16@24@?32";
+            "newRenderPipelineStateWithDescriptor:completionHandler:" => compile::new_render_pipeline,
+                c"v32@0:8@16@?24";
+            "newComputePipelineStateWithDescriptor:options:completionHandler:"
+                => compile::new_compute_pipeline_with_descriptor, c"v40@0:8@16Q24@?32";
             "newComputePipelineStateWithDescriptor:options:reflection:error:"
                 => pipeline::new_compute_pipeline_with_descriptor, c"@48@0:8@16Q24^@32^@40";
             "newComputePipelineStateWithFunction:options:reflection:error:"
@@ -210,6 +235,8 @@ pub fn bootstrap() {
                 c"@32@0:8@16^@24";
             "currentAllocatedSize" => current_allocated_size, c"Q16@0:8";
             "newFence" => new_fence, c"@16@0:8";
+            "newEvent" => new_event, c"@16@0:8";
+            "newSharedEvent" => new_shared_event, c"@16@0:8";
             "newHeapWithDescriptor:" => new_heap, c"@24@0:8@16";
             "heapBufferSizeAndAlignWithLength:options:" => resource::heap_buffer_size_and_align,
                 c"{MTLSizeAndAlign=QQ}32@0:8Q16Q24";
@@ -228,6 +255,8 @@ pub fn bootstrap() {
             "newFunctionWithName:" => new_function_with_name, c"@24@0:8@16";
             "newFunctionWithName:constantValues:error:" => new_function_with_constants,
                 c"@40@0:8@16@24^@32";
+            "newFunctionWithName:constantValues:completionHandler:"
+                => compile::new_function_with_constants, c"v40@0:8@16@24@?32";
             "functionNames" => library_function_names, c"@16@0:8";
             "device" => library_device, c"@16@0:8";
             "setLabel:" => no_op, c"v24@0:8@16";
@@ -251,6 +280,7 @@ pub fn bootstrap() {
             "stageInputAttributes" => function_vertex_attributes, c"@16@0:8";
             "patchType" => zero, c"Q16@0:8";
             "patchControlPointCount" => zero, c"q16@0:8";
+            "functionConstantsDictionary" => function_constants_dictionary, c"@16@0:8";
             "device" => function_device, c"@16@0:8";
             "setLabel:" => no_op, c"v24@0:8@16";
         });
@@ -268,6 +298,8 @@ pub fn bootstrap() {
         encoder::install();
         pipeline::install();
         present::install();
+        event::install();
+        install_function_constants();
         install_labels();
     });
 }
@@ -275,8 +307,11 @@ pub fn bootstrap() {
 /// Every Metal object and descriptor answers `-label` and `-setLabel:`. A
 /// label is a debugging aid nothing here displays, so it is not kept.
 fn install_labels() {
-    let names: [&std::ffi::CStr; 25] = [
+    let names: [&std::ffi::CStr; 28] = [
         c"RosemaryMTLFence",
+        c"RosemaryMTLEvent",
+        c"RosemaryMTLSharedEvent",
+        c"MTLSharedEventListener",
         c"MTLHeapDescriptor",
         c"RosemaryMTLHeap",
         c"MTLDepthStencilDescriptor",

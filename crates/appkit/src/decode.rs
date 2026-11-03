@@ -1036,11 +1036,16 @@ fn box_view(builder: &mut dyn Builder, uid: Uid) -> Option<Id> {
             unsafe { send_object(view, "setTitleFont:", font) };
         }
     }
-    if let Some(width) = real(builder, uid, "NSBorderWidth2") {
-        // SAFETY: `-setBorderWidth:` takes one `CGFloat`.
-        unsafe {
-            let f: unsafe extern "C" fn(Id, Sel, f64) = std::mem::transmute(objc::msg::entry());
-            f(view, objc::sel::get("setBorderWidth:"), width);
+    for (key, selector) in [
+        ("NSBorderWidth2", "setBorderWidth:"),
+        ("NSCornerRadius2", "setCornerRadius:"),
+    ] {
+        if let Some(value) = real(builder, uid, key) {
+            // SAFETY: both setters take one `CGFloat`.
+            unsafe {
+                let f: unsafe extern "C" fn(Id, Sel, f64) = std::mem::transmute(objc::msg::entry());
+                f(view, objc::sel::get(selector), value);
+            }
         }
     }
     Some(view)

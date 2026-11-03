@@ -32,6 +32,7 @@ des.workspace = true
 rc2.workspace = true
 rc4.workspace = true
 rustix.workspace = true
+libffi.workspace = true
 posix-regex = { path = "../posix-regex" }
 fancy-regex = { version = "0.19.2", features = ["leftmost_longest"] }
 
@@ -39,3 +40,6 @@ fancy-regex = { version = "0.19.2", features = ["leftmost_longest"] }
 # `override`, so its main heap is also the host's own `malloc`.
 [target.'cfg(not(target_os = "macos"))'.dependencies]
 libmimalloc-sys = { version = "0.1.49", default-features = false, features = ["extended"] }
+
+[lints]
+workspace = true

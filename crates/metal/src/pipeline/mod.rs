@@ -72,10 +72,11 @@ pub(super) fn destroy_variants(gpu: &Gpu, variants: impl IntoIterator<Item = vk:
 pub(crate) fn descriptor_type(binding: &ResourceBinding) -> Option<vk::DescriptorType> {
     match binding.kind {
         ResourceKind::Buffer => Some(vk::DescriptorType::STORAGE_BUFFER),
-        ResourceKind::Texture => Some(if binding.sampled {
-            vk::DescriptorType::SAMPLED_IMAGE
-        } else {
-            vk::DescriptorType::STORAGE_IMAGE
+        ResourceKind::Texture => Some(match (binding.texel_buffer, binding.sampled) {
+            (true, true) => vk::DescriptorType::UNIFORM_TEXEL_BUFFER,
+            (true, false) => vk::DescriptorType::STORAGE_TEXEL_BUFFER,
+            (false, true) => vk::DescriptorType::SAMPLED_IMAGE,
+            (false, false) => vk::DescriptorType::STORAGE_IMAGE,
         }),
         ResourceKind::Sampler => Some(vk::DescriptorType::SAMPLER),
         _ => None,
@@ -291,11 +292,14 @@ pub(crate) fn install() {
     // Of `MTLCompileOptions` only the preprocessor macros change what a
     // library says. The frontend accepts one dialect whatever language
     // version is asked for, and fast math is the driver's choice.
+    // `[[invariant]]` is always honored, which preserving invariance asks for
+    // and not preserving it permits.
     let options = object::register::<CompileOptions>(c"MTLCompileOptions");
     methods!(options, {
         "init" => compile_options_init, c"@16@0:8";
         "dealloc" => compile_options_dealloc, c"v16@0:8";
         "setFastMathEnabled:" => crate::no_op, c"v20@0:8c16";
+        "setPreserveInvariance:" => crate::no_op, c"v20@0:8c16";
         "setLanguageVersion:" => crate::no_op, c"v24@0:8Q16";
         "setPreprocessorMacros:" => set_preprocessor_macros, c"v24@0:8@16";
     });
@@ -319,6 +323,8 @@ pub(crate) fn install() {
         "sampleCount" => descriptor_number, c"Q16@0:8";
         "rasterSampleCount" => descriptor_number, c"Q16@0:8";
         "isAlphaToCoverageEnabled" => descriptor_number, c"Q16@0:8";
+        "isAlphaToOneEnabled" => descriptor_number, c"Q16@0:8";
+        "isRasterizationEnabled" => descriptor_number, c"Q16@0:8";
         "init" => descriptor_init, c"@16@0:8";
         "colorAttachments" => color_attachments, c"@16@0:8";
         "dealloc" => descriptor_dealloc, c"v16@0:8";
@@ -342,6 +348,8 @@ pub(crate) fn install() {
         "setSampleCount:",
         "setRasterSampleCount:",
         "setAlphaToCoverageEnabled:",
+        "setAlphaToOneEnabled:",
+        "setRasterizationEnabled:",
     ] {
         descriptor.replace_method(
             objc::sel::get(selector),

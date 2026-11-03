@@ -102,11 +102,64 @@ pub fn zone(name: &str) -> Option<std::sync::Arc<crate::tzif::Zone>> {
         })
         .or_else(|| match name {
             "UTC" | "GMT" | "Etc/UTC" | "Etc/GMT" => Some(crate::tzif::Zone::fixed(0, name)),
-            _ => None,
+            _ => offset_of_fixed_name(name).map(|offset| crate::tzif::Zone::fixed(offset, name)),
         })
         .map(Arc::new);
     zones.insert(name.to_owned(), found.clone());
     found
+}
+
+/// The largest offset CFTimeZone accepts for a fixed zone, either side of GMT.
+const MAX_FIXED_OFFSET: i64 = 18 * 3600;
+
+/// The name CFTimeZone gives a fixed-offset zone: `GMT`, or `GMT+HHMM` with
+/// `SS` appended only when the offset has seconds.
+fn fixed_name(offset: i64) -> String {
+    if offset == 0 {
+        return "GMT".to_owned();
+    }
+    let sign = if offset < 0 { '-' } else { '+' };
+    let magnitude = offset.unsigned_abs();
+    let (hours, minutes, seconds) = (magnitude / 3600, magnitude / 60 % 60, magnitude % 60);
+    match seconds {
+        0 => format!("GMT{sign}{hours:02}{minutes:02}"),
+        _ => format!("GMT{sign}{hours:02}{minutes:02}{seconds:02}"),
+    }
+}
+
+/// The offset a [`fixed_name`] stands for, so such a zone resolves by name.
+fn offset_of_fixed_name(name: &str) -> Option<i64> {
+    let rest = name.strip_prefix("GMT")?;
+    let (sign, digits) = match rest.as_bytes().first()? {
+        b'+' => (1, &rest[1..]),
+        b'-' => (-1, &rest[1..]),
+        _ => return None,
+    };
+    if !matches!(digits.len(), 4 | 6) || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let field = |range: std::ops::Range<usize>| digits.get(range)?.parse::<i64>().ok();
+    let (hours, minutes) = (field(0..2)?, field(2..4)?);
+    let seconds = if digits.len() == 6 { field(4..6)? } else { 0 };
+    if minutes >= 60 || seconds >= 60 {
+        return None;
+    }
+    let offset = sign * (hours * 3600 + minutes * 60 + seconds);
+    (offset.abs() <= MAX_FIXED_OFFSET && fixed_name(offset) == name).then_some(offset)
+}
+
+/// `CFTimeZoneRef CFTimeZoneCreateWithTimeIntervalFromGMT(CFAllocatorRef, CFTimeInterval)`:
+/// a zone always `interval` seconds from GMT, or NULL beyond +-18 hours.
+pub unsafe extern "C" fn create_with_time_interval_from_gmt(
+    _allocator: CFTypeRef,
+    interval: f64,
+) -> CFTypeRef {
+    let bound = MAX_FIXED_OFFSET as f64;
+    if !(-bound..=bound).contains(&interval) {
+        return std::ptr::null();
+    }
+    // CF drops the fraction of a second, toward zero.
+    new(&fixed_name(interval.trunc() as i64))
 }
 
 /// The zone this host is set to, as an IANA name.

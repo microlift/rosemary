@@ -61,7 +61,7 @@ pub fn fresh_address() -> Address {
     // the process, the thread, and a counter.
     static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
     let count = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let pid = starnix::process::me() as u64;
+    let pid = crate::process::host_self() as u64;
     (pid << 32) | count
 }
 

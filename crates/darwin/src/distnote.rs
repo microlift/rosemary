@@ -10,7 +10,7 @@
 //! removed by the first post that finds it so.
 //!
 //! What a message *is* belongs to Foundation; this moves bytes.
-//! 
+//!
 //! FIXME (ACCURACY): make an actual `distnoted` rather than implement it here weirdly
 
 use std::os::unix::net::UnixDatagram;
@@ -21,6 +21,7 @@ use std::sync::Mutex;
 /// a test binary, or a host with no server configured - where distributed
 /// notifications stay inside the process.
 fn directory() -> Option<PathBuf> {
+    let _host = crate::syscall::ScopedHostSyscallContext::new();
     Some(server::client::directory()?.join("distnote"))
 }
 

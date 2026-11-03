@@ -171,10 +171,14 @@ pub fn publish_page_size() {
 ///
 /// This process's CPU time comes from `getrusage`, which is exact where the
 /// host's per-process accounting rounds to a clock tick.
-fn measure(task: Name) -> Option<Usage> {
+fn measure(task: Name, flavor: i32) -> Option<Usage> {
     let pid = space::task_pid(task)?;
-    let mut usage = crate::process::usage(pid)?;
-    if pid == starnix::process::me() {
+    let me = pid == crate::process::host_self();
+    let mut usage = match me && sizes_only(flavor) {
+        true => own_sizes(matches!(flavor, TASK_VM_INFO | TASK_VM_INFO_PURGEABLE))?,
+        false => crate::process::usage(pid)?,
+    };
+    if me {
         let mut rusage = std::mem::MaybeUninit::<libc::rusage>::uninit();
         // SAFETY: `getrusage` fills the `rusage` it is given and nothing else.
         if unsafe { libc::getrusage(libc::RUSAGE_SELF, rusage.as_mut_ptr()) } == 0 {
@@ -186,6 +190,39 @@ fn measure(task: Name) -> Option<Usage> {
         }
     }
     Some(usage)
+}
+
+/// Whether a flavour reports nothing but sizes and CPU times.
+///
+/// Engines poll these every few frames for their memory budget, so for this
+/// process they skip the rest of [`Usage`]: on Linux its thread counts read
+/// every thread's `stat`, about 3 ms in a process with a hundred threads.
+fn sizes_only(flavor: i32) -> bool {
+    matches!(
+        flavor,
+        TASK_BASIC_INFO_64 | MACH_TASK_BASIC_INFO | TASK_VM_INFO | TASK_VM_INFO_PURGEABLE
+    )
+}
+
+/// This process's sizes, and its region count if asked for. Only the fields
+/// the flavours of [`sizes_only`] read are filled; the times come after.
+fn own_sizes(regions: bool) -> Option<Usage> {
+    let footprint = starnix::process::footprint(crate::process::host_self())?;
+    Some(Usage {
+        virtual_size: footprint.virtual_size,
+        resident_size: footprint.resident_size,
+        resident_peak: footprint.resident_peak,
+        shared_size: footprint.shared_size,
+        regions: if regions { region_count() } else { 0 },
+        ..Usage::default()
+    })
+}
+
+/// How many mappings this process has
+fn region_count() -> u32 {
+    let _host = crate::syscall::ScopedHostSyscallContext::new();
+
+    starnix::process::regions().map_or(0, |regions| regions.len() as u32)
 }
 
 /// Resident memory the task does not share with another, which is the
@@ -243,7 +280,7 @@ pub unsafe extern "C" fn task_info(
     // A name that is not a task, or a task that has gone: answering about the
     // wrong task with a straight face is the failure this crate refuses
     // everywhere else.
-    let Some(usage) = measure(task) else {
+    let Some(usage) = measure(task, flavor) else {
         return KERN_INVALID_ARGUMENT;
     };
     let user_time = TimeValue::from_ns(usage.user_ns);
@@ -620,12 +657,8 @@ const _: () = {
 fn host_basic_info() -> HostBasicInfo {
     let arch = crate::sysctl::guest_arch();
     let logical = crate::sysctl::ncpu() as i32;
-    // SAFETY: `sysconf` reads a count and touches no memory of ours.
-    let configured = (unsafe { libc::sysconf(libc::_SC_NPROCESSORS_CONF) } as i32).max(logical);
-    // A host that cannot tell cores from SMT threads answers what a machine
-    // without SMT would.
-    let physical =
-        starnix::system::physical_cores().map_or(logical, |cores| (cores as i32).min(logical));
+    let configured = crate::sysctl::configured_cpus() as i32;
+    let physical = crate::sysctl::physical_cpus() as i32;
     let max_mem = crate::sysctl::memsize();
     HostBasicInfo {
         max_cpus: configured,

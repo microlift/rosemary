@@ -6,6 +6,28 @@ pub mod signal;
 /// than a pipe does.
 pub mod memory {
     pub use crate::memory::piped::{read, write};
+
+    /// Removed in FreeBSD 11, which always overcommits anonymous memory.
+    pub const NORESERVE: libc::c_int = 0;
+
+    pub fn object() -> std::io::Result<std::os::fd::OwnedFd> {
+        use std::os::fd::FromRawFd;
+        // SAFETY: a NUL-terminated name, which only labels the object.
+        match unsafe { libc::memfd_create(c"rosemary-memory-object".as_ptr(), libc::MFD_CLOEXEC) } {
+            -1 => Err(std::io::Error::last_os_error()),
+            // SAFETY: a descriptor the call just opened.
+            fd => Ok(unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) }),
+        }
+    }
+
+    pub fn exclude_from_fork(address: usize, len: usize) -> std::io::Result<()> {
+        // SAFETY: changes only what a child inherits of the range.
+        match unsafe { libc::minherit(address as *mut core::ffi::c_void, len, libc::INHERIT_NONE) }
+        {
+            0 => Ok(()),
+            _ => Err(std::io::Error::last_os_error()),
+        }
+    }
 }
 
 use std::ffi::{CStr, c_char};
@@ -15,9 +37,11 @@ use std::os::unix::fs::MetadataExt;
 use std::path::PathBuf;
 
 use super::{kinfo, sysctl};
-use crate::process::{Audit, Descriptor, Identity, Process, Region, State, Thread, Usage};
+use crate::process::{
+    Audit, Descriptor, Footprint, Identity, Process, Region, State, Thread, Usage,
+};
 use crate::socket::Peer;
-use crate::system::{CpuTicks, Memory, page_size};
+use crate::system::{CpuTicks, Memory, Swap, page_size};
 
 /// `NODEV`: no controlling terminal.
 const NODEV: u64 = u64::MAX;
@@ -128,6 +152,17 @@ pub fn process(pid: i32) -> Option<Process> {
 /// When the machine booted, on the wall clock.
 fn boot_time() -> Option<libc::timeval> {
     sysctl::by_name::<libc::timeval>(c"kern.boottime")
+}
+
+pub fn footprint(pid: i32) -> Option<Footprint> {
+    let proc = kinfo_proc(pid)?;
+    let resident_size = (proc.ki_rssize.max(0) as u64).saturating_mul(page_size());
+    Some(Footprint {
+        virtual_size: proc.ki_size as u64,
+        resident_size,
+        resident_peak: (proc.ki_rusage.ru_maxrss.max(0) as u64 * 1024).max(resident_size),
+        shared_size: 0,
+    })
 }
 
 pub fn usage(pid: i32) -> Option<Usage> {
@@ -266,6 +301,33 @@ pub fn physical_cores() -> Option<u32> {
 
 pub fn cpu_brand() -> Option<String> {
     sysctl::string_by_name(c"hw.model")
+}
+
+/// FreeBSD keeps no count of sockets apart from its topology description.
+pub fn packages() -> Option<u32> {
+    None
+}
+
+pub fn cpu_frequency() -> Option<u64> {
+    const HZ_PER_MHZ: u64 = 1_000_000;
+    sysctl::by_name::<libc::c_int>(c"hw.clockrate")
+        .filter(|&mhz| mhz > 0)
+        .map(|mhz| mhz as u64 * HZ_PER_MHZ)
+}
+
+pub fn booted() -> Option<std::time::SystemTime> {
+    let boot = boot_time()?;
+    let since = std::time::Duration::new(boot.tv_sec as u64, boot.tv_usec as u32 * 1000);
+    Some(std::time::UNIX_EPOCH + since)
+}
+
+/// Swap is reported per device, through `vm.swap_info`, which is not read here.
+pub fn swap() -> Option<Swap> {
+    None
+}
+
+pub fn max_processes() -> Option<u32> {
+    sysctl::by_name::<libc::c_int>(c"kern.maxproc").map(|n| n as u32)
 }
 
 pub fn host_uuid() -> Option<[u8; 16]> {

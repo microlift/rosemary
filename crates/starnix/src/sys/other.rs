@@ -7,15 +7,24 @@ pub mod signal;
 /// than a pipe does.
 pub mod memory {
     pub use crate::memory::piped::{read, write};
+
+    pub use crate::memory::named::object;
+
+    /// Unknown here, and only a hint, so not asked for.
+    pub const NORESERVE: libc::c_int = 0;
+
+    pub fn exclude_from_fork(_address: usize, _len: usize) -> std::io::Result<()> {
+        Err(std::io::ErrorKind::Unsupported.into())
+    }
 }
 
 use std::io;
 use std::os::fd::RawFd;
 use std::path::PathBuf;
 
-use crate::process::{Audit, Descriptor, Identity, Process, Region, Thread, Usage};
+use crate::process::{Audit, Descriptor, Footprint, Identity, Process, Region, Thread, Usage};
 use crate::socket::Peer;
-use crate::system::{CpuTicks, Memory};
+use crate::system::{CpuTicks, Memory, Swap};
 
 fn exists(pid: i32) -> bool {
     // SAFETY: signal zero only checks that the pid can be signalled.
@@ -33,6 +42,10 @@ pub fn identity(pid: i32) -> Option<Identity> {
 
 pub fn process(pid: i32) -> Option<Process> {
     exists(pid).then(Process::default)
+}
+
+pub fn footprint(pid: i32) -> Option<Footprint> {
+    exists(pid).then(Footprint::default)
 }
 
 pub fn usage(pid: i32) -> Option<Usage> {
@@ -80,6 +93,26 @@ pub fn cpu_brand() -> Option<String> {
 }
 
 pub fn host_uuid() -> Option<[u8; 16]> {
+    None
+}
+
+pub fn packages() -> Option<u32> {
+    None
+}
+
+pub fn cpu_frequency() -> Option<u64> {
+    None
+}
+
+pub fn booted() -> Option<std::time::SystemTime> {
+    None
+}
+
+pub fn swap() -> Option<Swap> {
+    None
+}
+
+pub fn max_processes() -> Option<u32> {
     None
 }
 

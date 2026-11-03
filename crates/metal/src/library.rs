@@ -76,6 +76,7 @@ fn translate_metallib<'a>(
     let modules = metal_translate::metallib_airs(bytes)?;
     let mut entries = Vec::new();
     let mut function_constants = Vec::new();
+    let mut rejected = Vec::new();
     let mut entry_modules = Vec::new();
     for (module, air) in modules.iter().enumerate() {
         let translated =
@@ -83,11 +84,13 @@ fn translate_metallib<'a>(
         entry_modules.extend(std::iter::repeat_n(module, translated.entries.len()));
         entries.extend(translated.entries);
         function_constants.extend(translated.function_constants);
+        rejected.extend(translated.rejected);
     }
     Ok((
         metal_translate::TranslatedLibrary {
             entries,
             function_constants,
+            rejected,
         },
         modules,
         entry_modules,
@@ -218,6 +221,7 @@ pub(super) unsafe extern "C" fn new_function_with_name(receiver: Id, _sel: Sel, 
         .iter()
         .position(|entry| entry.name == name)
     else {
+        report_rejected(library, name);
         return std::ptr::null_mut();
     };
     object::make(
@@ -262,7 +266,21 @@ pub(super) unsafe extern "C" fn new_function_with_constants(
         .iter()
         .position(|entry| entry.name == name)
     else {
-        return fail_library(error, &format!("the library has no function named {name}"));
+        let reason = library
+            .translated
+            .rejected
+            .iter()
+            .find(|rejected| rejected.name == name)
+            .map_or_else(
+                || format!("the library has no function named {name}"),
+                |rejected| {
+                    format!(
+                        "function {name} could not be translated: {}",
+                        rejected.reason
+                    )
+                },
+            );
+        return fail_library(error, &reason);
     };
     // A library which declares no function constants has nothing to
     // specialize: Metal ignores the values, and so does this.
@@ -522,4 +540,99 @@ pub(super) unsafe extern "C" fn function_dealloc(receiver: Id, _sel: Sel) {
     // SAFETY: as above. The specialized artifact is this body's own.
     unsafe { std::ptr::drop_in_place(function as *mut Function) };
     objc::arc::finalize(receiver);
+}
+
+/// `MTLFunctionConstant`: one constant a function can be specialized with.
+pub(super) struct FunctionConstant {
+    name: Id,
+    data_type: u64,
+    index: u64,
+}
+
+/// `-[MTLFunction functionConstantsDictionary]`: name to `MTLFunctionConstant`.
+///
+/// FIXME (ACCURACY): every constant the library declares is listed, not only
+/// those this function uses; specializing with a constant a function does
+/// not use changes nothing it computes.
+pub(super) unsafe extern "C" fn function_constants_dictionary(receiver: Id, _sel: Sel) -> Id {
+    // SAFETY: an `RosemaryMTLFunction`.
+    let function = unsafe { object::body::<Function>(receiver) };
+    // SAFETY: the library which vended the function.
+    let library = unsafe { object::body::<Library>(function.library) };
+    let mut pairs = Vec::new();
+    for constant in &library.translated.function_constants {
+        let Some(data_type) = metal_translate::metal_data_type_of_encoding(&constant.encoding)
+        else {
+            report_library_error(format!(
+                "function constant {} has a type, {}, MTLDataType has no value for",
+                constant.name, constant.encoding
+            ));
+            continue;
+        };
+        let name = foundation::string::from_str(&constant.name);
+        let object = object::make(
+            c"RosemaryMTLFunctionConstant",
+            FunctionConstant {
+                name: objc::arc::retain(name),
+                data_type,
+                index: u64::from(constant.index),
+            },
+        );
+        pairs.push((name as CFTypeRef, object as CFTypeRef));
+    }
+    let policy = corefoundation::callbacks::Policy::from_type_callbacks();
+    let dictionary = corefoundation::collections::new_dictionary(&pairs, policy, policy, false);
+    for (name, object) in pairs {
+        // The dictionary holds its own references.
+        objc::arc::release(name as Id);
+        objc::arc::release(object as Id);
+    }
+    // SAFETY: a fresh dictionary, handed back autoreleased as a getter's is.
+    unsafe { corefoundation::api::CFAutorelease(dictionary) as Id }
+}
+
+unsafe extern "C" fn function_constant_name(receiver: Id, _sel: Sel) -> Id {
+    // SAFETY: an `MTLFunctionConstant` of this crate's.
+    unsafe { object::body::<FunctionConstant>(receiver) }.name
+}
+
+unsafe extern "C" fn function_constant_type(receiver: Id, _sel: Sel) -> u64 {
+    // SAFETY: as above.
+    unsafe { object::body::<FunctionConstant>(receiver) }.data_type
+}
+
+unsafe extern "C" fn function_constant_index(receiver: Id, _sel: Sel) -> u64 {
+    // SAFETY: as above.
+    unsafe { object::body::<FunctionConstant>(receiver) }.index
+}
+
+unsafe extern "C" fn function_constant_dealloc(receiver: Id, _sel: Sel) {
+    // SAFETY: as above; the name was retained when the constant was made.
+    objc::arc::release(unsafe { object::body::<FunctionConstant>(receiver) }.name);
+    objc::arc::finalize(receiver);
+}
+
+pub(super) fn install_function_constants() {
+    let class = object::register::<FunctionConstant>(c"RosemaryMTLFunctionConstant");
+    methods!(class, {
+        "name" => function_constant_name, c"@16@0:8";
+        "type" => function_constant_type, c"Q16@0:8";
+        "index" => function_constant_index, c"Q16@0:8";
+        "dealloc" => function_constant_dealloc, c"v16@0:8";
+    });
+}
+
+/// Say why a function the library declares has no translation, if it does.
+fn report_rejected(library: &Library, name: &str) {
+    if let Some(rejected) = library
+        .translated
+        .rejected
+        .iter()
+        .find(|rejected| rejected.name == name)
+    {
+        report_library_error(format!(
+            "function {name} could not be translated: {}",
+            rejected.reason
+        ));
+    }
 }

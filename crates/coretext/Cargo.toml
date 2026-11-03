@@ -1,0 +1,17 @@
+[package]
+name = "coretext"
+description = "Reimplementation of CoreText's fonts and font descriptors"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+exports.workspace = true
+corefoundation.workspace = true
+foundation.workspace = true
+chrome.workspace = true
+prefix.workspace = true
+owned_ttf_parser.workspace = true
+
+[lints]
+workspace = true

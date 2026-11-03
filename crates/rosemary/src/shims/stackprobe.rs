@@ -2,6 +2,7 @@ use microlift::arch::x86_64::context::RegisterContext;
 
 use super::bad_pointer;
 use crate::abi::{GuestMemory, Result};
+use crate::shims::bind;
 
 const GUEST_PAGE: u64 = 4096;
 
@@ -33,10 +34,10 @@ fn probe_at(symbol: &str, rsp: u64, distance: u64, mem: &mut dyn GuestMemory) ->
         .map_err(|_| bad_pointer(symbol, address))
 }
 
-pub type Shim = fn(&str, &mut RegisterContext, &mut dyn GuestMemory) -> Result<()>;
+pub type Shim = crate::shims::Shim;
 
 pub fn shim_for(name: &str) -> Option<Shim> {
-    (name == "___chkstk_darwin").then_some(chkstk)
+    (name == "___chkstk_darwin").then_some(bind!("___chkstk_darwin" => chkstk))
 }
 
 #[cfg(test)]

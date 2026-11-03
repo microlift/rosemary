@@ -189,7 +189,23 @@ unsafe extern "C" fn named(_class: Id, sel: Sel) -> Id {
     // SAFETY: a registered selector is a NUL-terminated interned name.
     let name = unsafe { std::ffi::CStr::from_ptr(sel) };
     let name = name.to_string_lossy();
-    let dark = match name.as_ref() {
+    let dark = dark_variant(&name).is_some() && crate::appearance::is_dark();
+    let key = match dark {
+        true => format!("{name}:dark"),
+        false => name.to_string(),
+    };
+    match components_in(&name, dark) {
+        Some((r, g, b, a)) => singleton(&key, r, g, b, a),
+        // Unreachable through dispatch - the selector was installed from this
+        // very table - and named rather than silent in case it stops being.
+        None => objc::fail!("+[NSColor {name}]: not one of this runtime's named colours"),
+    }
+}
+
+/// The gray and alpha a semantic colour has in the dark appearance, or `None`
+/// for one that looks the same in both.
+fn dark_variant(name: &str) -> Option<(f64, f64)> {
+    match name {
         "textColor"
         | "labelColor"
         | "controlTextColor"
@@ -211,18 +227,23 @@ unsafe extern "C" fn named(_class: Id, sel: Sel) -> Id {
         "underPageBackgroundColor" => Some((0.10, 1.0)),
         "alternatingContentBackgroundColor" => Some((0.16, 1.0)),
         _ => None,
-    };
-    if let Some((gray, alpha)) = dark
-        && crate::appearance::is_dark()
-    {
-        return singleton(&format!("{name}:dark"), gray, gray, gray, alpha);
     }
-    match NAMED.iter().find(|(n, ..)| *n == name) {
-        Some((_, r, g, b, a)) => singleton(&name, *r, *g, *b, *a),
-        // Unreachable through dispatch - the selector was installed from this
-        // very table - and named rather than silent in case it stops being.
-        None => objc::fail!("+[NSColor {name}]: not one of this runtime's named colours"),
+}
+
+/// The straight RGBA of the named system colour `name` in the current
+/// appearance, without making a colour object.
+pub(crate) fn named_components(name: &str) -> Option<(f64, f64, f64, f64)> {
+    components_in(name, crate::appearance::is_dark())
+}
+
+fn components_in(name: &str, dark: bool) -> Option<(f64, f64, f64, f64)> {
+    if let Some((gray, alpha)) = dark_variant(name).filter(|_| dark) {
+        return Some((gray, gray, gray, alpha));
     }
+    NAMED
+        .iter()
+        .find(|(n, ..)| *n == name)
+        .map(|(_, r, g, b, a)| (*r, *g, *b, *a))
 }
 
 /// An autoreleased colour of these components, for a decoder.
@@ -311,6 +332,29 @@ unsafe extern "C" fn highlight_with_level(receiver: Id, _sel: Sel, level: CGFloa
     make(mix(r), mix(g), mix(b), a)
 }
 
+/// `-colorWithAlphaComponent:`: the receiver's colour with its alpha replaced,
+/// clamped to 0...1 as AppKit clamps it.
+unsafe extern "C" fn color_with_alpha_component(receiver: Id, _sel: Sel, alpha: CGFloat) -> Id {
+    // SAFETY: a colour of this crate's.
+    let (r, g, b, _) = unsafe { components(receiver) };
+    make(r, g, b, alpha.clamp(0.0, 1.0))
+}
+
+/// `+colorWithCGColor:`: the same components, as RGBA.
+unsafe extern "C" fn color_with_cg_color(_class: Id, _sel: Sel, color: *const c_void) -> Id {
+    if color.is_null() {
+        return std::ptr::null_mut();
+    }
+    // SAFETY: a `CGColorRef`; this runtime's colours are RGBA, four components.
+    let components = unsafe { crate::cgcontext::CGColorGetComponents(color as _) };
+    if components.is_null() {
+        return std::ptr::null_mut();
+    }
+    // SAFETY: four components, as above.
+    let [red, green, blue, alpha] = unsafe { *(components as *const [f64; 4]) };
+    make(red, green, blue, alpha)
+}
+
 unsafe extern "C" fn color_with_rgba(
     _class: Id,
     _sel: Sel,
@@ -336,6 +380,15 @@ unsafe extern "C" fn component(receiver: Id, sel: Sel) -> CGFloat {
         b"blueComponent" => c.blue,
         _ => c.alpha,
     }
+}
+
+/// `NSColorTypeComponentBased`.
+const NS_COLOR_TYPE_COMPONENT_BASED: isize = 0;
+
+/// `-type`: component-based, which every colour here is - see
+/// [`color_space_name`] and [`name_component`].
+unsafe extern "C" fn color_type(_receiver: Id, _sel: Sel) -> isize {
+    NS_COLOR_TYPE_COMPONENT_BASED
 }
 
 /// `-colorSpaceName`, the deprecated name of the space a colour is in.
@@ -410,6 +463,22 @@ unsafe extern "C" fn name_component(_receiver: Id, _sel: Sel) -> Id {
 /// `-numberOfComponents`, which is four: red, green, blue and alpha.
 unsafe extern "C" fn number_of_components(_receiver: Id, _sel: Sel) -> isize {
     4
+}
+
+/// `-getComponents:`: as many values as [`number_of_components`] says, in the
+/// order of the receiver's space - red, green, blue, alpha.
+///
+/// # Safety
+///
+/// `out` is null or has room for four `CGFloat`s.
+unsafe extern "C" fn get_component_array(receiver: Id, _sel: Sel, out: *mut CGFloat) {
+    if out.is_null() {
+        return;
+    }
+    // SAFETY: a colour of this crate's.
+    let c = unsafe { &*(receiver as *const Color) };
+    // SAFETY: the caller states there is room for every component.
+    unsafe { std::ptr::copy_nonoverlapping([c.red, c.green, c.blue, c.alpha].as_ptr(), out, 4) };
 }
 
 /// `-whiteComponent`, the brightness of a grey colour.
@@ -565,12 +634,14 @@ pub(crate) fn install() {
         "colorWithDeviceRed:green:blue:alpha:" => color_with_rgba, c"@48@0:8d16d24d32d40";
         "colorWithSRGBRed:green:blue:alpha:" => color_with_rgba, c"@48@0:8d16d24d32d40";
         "colorWithRed:green:blue:alpha:" => color_with_rgba, c"@48@0:8d16d24d32d40";
+        "colorWithCGColor:" => color_with_cg_color, c"@24@0:8^{CGColor=}16";
         "colorWithCalibratedWhite:alpha:" => color_with_white, c"@32@0:8d16d24";
         "colorWithDeviceWhite:alpha:" => color_with_white, c"@32@0:8d16d24";
         "colorWithWhite:alpha:" => color_with_white, c"@32@0:8d16d24";
     });
     methods!(class, {
         "highlightWithLevel:" => highlight_with_level, c"@24@0:8d16";
+        "colorWithAlphaComponent:" => color_with_alpha_component, c"@24@0:8d16";
         "setFill" => set_fill, c"v16@0:8";
         "setStroke" => set_stroke, c"v16@0:8";
         "set" => set_both, c"v16@0:8";
@@ -583,7 +654,9 @@ pub(crate) fn install() {
         "whiteComponent" => white_component, c"d16@0:8";
         "getWhite:alpha:" => get_white, c"v32@0:8^d16^d24";
         "numberOfComponents" => number_of_components, c"q16@0:8";
+        "getComponents:" => get_component_array, c"v24@0:8^d16";
         "colorSpaceName" => color_space_name, c"@16@0:8";
+        "type" => color_type, c"q16@0:8";
         "colorUsingColorSpaceName:" => color_using_color_space_name, c"@24@0:8@16";
         "colorUsingColorSpaceName:device:" => color_using_color_space_name, c"@32@0:8@16@24";
         "colorUsingColorSpace:" => color_using_color_space, c"@24@0:8@16";
@@ -636,6 +709,26 @@ mod tests {
         // SAFETY: still live, because nothing autoreleased it.
         assert_eq!(unsafe { components(first) }, before);
         assert_eq!(before, (0.0, 0.0, 0.0, 1.0));
+    }
+
+    #[test]
+    fn color_with_alpha_component_replaces_only_alpha() {
+        crate::bootstrap();
+        let color = make(0.25, 0.5, 0.75, 1.0);
+        // SAFETY: `-colorWithAlphaComponent:` is `id (id, SEL, CGFloat)`.
+        let (half, over) = unsafe {
+            let sel = objc::sel::get("colorWithAlphaComponent:");
+            (
+                color_with_alpha_component(color, sel, 0.5),
+                color_with_alpha_component(color, sel, 2.0),
+            )
+        };
+        // SAFETY: colours this crate just made.
+        unsafe {
+            assert_eq!(components(half), (0.25, 0.5, 0.75, 0.5));
+            assert_eq!(components(over), (0.25, 0.5, 0.75, 1.0));
+            assert_eq!(components(color), (0.25, 0.5, 0.75, 1.0));
+        }
     }
 
     /// `+alternatingContentBackgroundColors` is the same kept pair as the older
@@ -700,4 +793,54 @@ mod tests {
             (0.0, 0.0, 0.0, 1.0)
         );
     }
+}
+
+/// `void NSFrameRect(NSRect)`: a one-point border inside `rect`, in the fill
+/// colour.
+#[allow(non_snake_case)]
+pub extern "C" fn NSFrameRect(rect: NSRect) {
+    NSFrameRectWithWidth(rect, 1.0);
+}
+
+/// `void NSFrameRectWithWidth(NSRect, CGFloat)`.
+#[allow(non_snake_case)]
+pub extern "C" fn NSFrameRectWithWidth(rect: NSRect, width: f64) {
+    let (x, y) = (rect.origin.x, rect.origin.y);
+    let (w, h) = (rect.size.width, rect.size.height);
+    if w <= 0.0 || h <= 0.0 {
+        return;
+    }
+    let edge = |x, y, width, height| NSRect {
+        origin: NSPoint { x, y },
+        size: NSSize { width, height },
+    };
+    let inner = (h - 2.0 * width).max(0.0);
+    NSRectFill(edge(x, y, w, width.min(h)));
+    NSRectFill(edge(x, y + h - width.min(h), w, width.min(h)));
+    NSRectFill(edge(x, y + width, width.min(w), inner));
+    NSRectFill(edge(x + w - width.min(w), y + width, width.min(w), inner));
+}
+
+/// `void NSEraseRect(NSRect)`: white, whatever the fill colour is.
+#[allow(non_snake_case)]
+pub extern "C" fn NSEraseRect(rect: NSRect) {
+    let saved = FILL.with(Cell::get);
+    FILL.with(|fill| fill.set([1.0, 1.0, 1.0, 1.0]));
+    NSRectFill(rect);
+    FILL.with(|fill| fill.set(saved));
+}
+
+/// `void NSRectClip(NSRect)`.
+#[allow(non_snake_case)]
+pub extern "C" fn NSRectClip(rect: NSRect) {
+    crate::bezier::clip_rect(rect);
+}
+
+/// `void NSRectFillUsingOperation(NSRect, NSCompositingOperation)`.
+///
+/// FIXME (ACCURACY): every operation draws source-over, which is right for
+/// `NSCompositingOperationSourceOver`, and for `Copy` with an opaque colour.
+#[allow(non_snake_case)]
+pub extern "C" fn NSRectFillUsingOperation(rect: NSRect, _operation: usize) {
+    NSRectFill(rect);
 }

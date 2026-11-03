@@ -54,6 +54,8 @@ pub struct MenuItem {
     indentation: isize,
     /// `-representedObject`, retained.
     represented: Id,
+    /// `-allowsKeyEquivalentWhenHidden`.
+    key_equivalent_when_hidden: usize,
 }
 
 pub const MENU_INSTANCE_SIZE: usize = size_of::<Menu>();
@@ -297,6 +299,42 @@ unsafe extern "C" fn set_item_title(receiver: Id, _sel: Sel, title: Id) {
     item.title = objc::arc::retain(title);
 }
 
+/// `-setAttributedTitle:`: kept for reading back, and its characters become
+/// the title the chrome draws.
+/// FIXME (ACCURACY): the attributes are not drawn.
+unsafe extern "C" fn set_attributed_title(receiver: Id, sel: Sel, title: Id) {
+    // SAFETY: the property setter for `attributedTitle`.
+    unsafe { crate::props::set_copied(receiver, sel, title) };
+    let string = match title.is_null() {
+        true => title,
+        // SAFETY: `NSString * (id, SEL)` on an attributed string.
+        false => unsafe {
+            let f: unsafe extern "C" fn(Id, Sel) -> Id = std::mem::transmute(objc::msg::entry());
+            f(title, objc::sel::get("string"))
+        },
+    };
+    // SAFETY: as `-setTitle:`.
+    unsafe { set_item_title(receiver, objc::sel::get("setTitle:"), string) };
+}
+
+/// `-[NSMenu font]`: what was set, or the menu font.
+unsafe extern "C" fn menu_font(receiver: Id, _sel: Sel) -> Id {
+    let set = crate::props::object(receiver, "font");
+    if !set.is_null() {
+        return set;
+    }
+    let class = objc::class::lookup(c"NSFont").expect("declared");
+    // SAFETY: `id (Class, SEL, CGFloat)`.
+    unsafe {
+        let f: unsafe extern "C" fn(Id, Sel, f64) -> Id = std::mem::transmute(objc::msg::entry());
+        f(
+            objc::class::ptr(class) as Id,
+            objc::sel::get("menuFontOfSize:"),
+            0.0,
+        )
+    }
+}
+
 unsafe extern "C" fn item_action(receiver: Id, _sel: Sel) -> Sel {
     item_of(receiver).action
 }
@@ -347,6 +385,98 @@ unsafe extern "C" fn set_key_equivalent(receiver: Id, _sel: Sel, key: Id) {
     item.key_equivalent = objc::arc::retain(key);
 }
 
+/// `+usesUserKeyEquivalents`, YES until a caller turns it off.
+static USES_USER_KEY_EQUIVALENTS: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(true);
+
+unsafe extern "C" fn uses_user_key_equivalents(_class: Id, _sel: Sel) -> u8 {
+    USES_USER_KEY_EQUIVALENTS.load(std::sync::atomic::Ordering::Relaxed) as u8
+}
+
+unsafe extern "C" fn set_uses_user_key_equivalents(_class: Id, _sel: Sel, uses: u8) {
+    USES_USER_KEY_EQUIVALENTS.store(uses != 0, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Split an `NSUserKeyEquivalents` value such as `@~s` into its modifier
+/// flags and its key. The last character is always the key, so a shortcut on
+/// `@` itself survives.
+fn parse_user_key_equivalent(value: &str) -> (usize, &str) {
+    use crate::keymap::flags;
+    let key_start = value.char_indices().last().map_or(0, |(at, _)| at);
+    let mut mask = 0;
+    let mut start = 0;
+    for (at, ch) in value[..key_start].char_indices() {
+        let flag = match ch {
+            '@' => flags::COMMAND,
+            '$' => flags::SHIFT,
+            '~' => flags::OPTION,
+            '^' => flags::CONTROL,
+            _ => break,
+        };
+        mask |= flag as usize;
+        start = at + ch.len_utf8();
+    }
+    (mask, &value[start..])
+}
+
+/// The user's shortcut for this item's title from `NSUserKeyEquivalents`,
+/// which is how System Settings' App Shortcuts reach an app.
+fn user_key_equivalent_of(receiver: Id) -> Option<(usize, String)> {
+    if !USES_USER_KEY_EQUIVALENTS.load(std::sync::atomic::Ordering::Relaxed) {
+        return None;
+    }
+    let title = item_of(receiver).title;
+    let class = objc::class::lookup(c"NSUserDefaults")?;
+    let defaults = send_id(objc::class::ptr(class) as Id, "standardUserDefaults");
+    if title.is_null() || defaults.is_null() {
+        return None;
+    }
+    let key = foundation::string::from_str("NSUserKeyEquivalents");
+    // SAFETY: `-dictionaryForKey:` and `-objectForKey:` are `id (id, SEL, id)`;
+    // `-isKindOfClass:` is `BOOL (id, SEL, Class)`.
+    let value = unsafe {
+        let object: unsafe extern "C" fn(Id, Sel, Id) -> Id =
+            std::mem::transmute(objc::msg::entry());
+        let kind: unsafe extern "C" fn(Id, Sel, Id) -> u8 = std::mem::transmute(objc::msg::entry());
+        let shortcuts = object(defaults, objc::sel::get("dictionaryForKey:"), key);
+        let value = match shortcuts.is_null() {
+            true => std::ptr::null_mut(),
+            false => object(shortcuts, objc::sel::get("objectForKey:"), title),
+        };
+        let string = objc::class::lookup(c"NSString").map(|class| objc::class::ptr(class) as Id);
+        match string {
+            Some(string)
+                if !value.is_null()
+                    && kind(value, objc::sel::get("isKindOfClass:"), string) != 0 =>
+            {
+                value
+            }
+            _ => std::ptr::null_mut(),
+        }
+    };
+    objc::arc::release(key);
+    if value.is_null() {
+        return None;
+    }
+    let value = string_of(value);
+    let (mask, key) = parse_user_key_equivalent(&value);
+    (!key.is_empty()).then(|| (mask, key.to_owned()))
+}
+
+/// `-userKeyEquivalent`: the key of the user's shortcut, or "" when there is
+/// none.
+unsafe extern "C" fn user_key_equivalent(receiver: Id, _sel: Sel) -> Id {
+    let key = user_key_equivalent_of(receiver)
+        .map(|(_, key)| key)
+        .unwrap_or_default();
+    objc::arc::autorelease(foundation::string::from_str(&key))
+}
+
+/// `-userKeyEquivalentModifierMask`, the modifiers of that shortcut.
+unsafe extern "C" fn user_key_equivalent_modifier_mask(receiver: Id, _sel: Sel) -> usize {
+    user_key_equivalent_of(receiver).map_or(0, |(mask, _)| mask)
+}
+
 /// The plain integer accessors, each reading or writing one field.
 macro_rules! integer_accessors {
     ($($get:ident / $set:ident => $field:ident),* $(,)?) => {
@@ -380,6 +510,14 @@ unsafe extern "C" fn is_hidden(receiver: Id, _sel: Sel) -> u8 {
 
 unsafe extern "C" fn set_hidden(receiver: Id, _sel: Sel, hidden: u8) {
     item_of(receiver).hidden = hidden as usize;
+}
+
+unsafe extern "C" fn allows_key_equivalent_when_hidden(receiver: Id, _sel: Sel) -> u8 {
+    (item_of(receiver).key_equivalent_when_hidden != 0) as u8
+}
+
+unsafe extern "C" fn set_allows_key_equivalent_when_hidden(receiver: Id, _sel: Sel, allows: u8) {
+    item_of(receiver).key_equivalent_when_hidden = allows as usize;
 }
 
 /// The requests that describe how a menu *looks*, which nothing here draws.
@@ -594,11 +732,16 @@ unsafe extern "C" fn zero_width(_receiver: Id, _sel: Sel) -> f64 {
     0.0
 }
 
-/// `-menuBarHeight`: zero, because menus are shown in each window's chrome and
-/// nothing is reserved across the top of the screen - which `-visibleFrame`
-/// already says by not subtracting a menu bar.
-unsafe extern "C" fn menu_bar_height(_receiver: Id, _sel: Sel) -> f64 {
+/// The height reserved across the top of the screen for a global menu bar:
+/// zero, because menus are shown in each window's chrome. A fullscreen
+/// `-visibleFrame` subtracts it, so it must stay in step with `-menuBarHeight`.
+pub(crate) fn global_menu_bar_height() -> f64 {
     0.0
+}
+
+/// `-menuBarHeight`: see [`global_menu_bar_height`].
+unsafe extern "C" fn menu_bar_height(_receiver: Id, _sel: Sel) -> f64 {
+    global_menu_bar_height()
 }
 
 pub(crate) fn install() {
@@ -639,11 +782,15 @@ pub(crate) fn install() {
         "performActionForItemAtIndex:" => perform_action_for_item_at_index, c"v24@0:8q16";
         "setSubmenu:forItem:" => ignored_object, c"v32@0:8@16@24";
         "indexOfItemWithSubmenu:" => index_of_item_with_submenu, c"q24@0:8@16";
+        "font" => menu_font, c"@16@0:8";
+        "setFont:" => crate::props::set_retained, c"v24@0:8@16";
     });
 
     let item = objc::class::lookup(c"NSMenuItem").expect("declared before its methods");
     class_methods!(item, {
         "separatorItem" => separator_item, c"@16@0:8";
+        "usesUserKeyEquivalents" => uses_user_key_equivalents, c"c16@0:8";
+        "setUsesUserKeyEquivalents:" => set_uses_user_key_equivalents, c"v20@0:8c16";
     });
     methods!(item, {
         "init" => init_plain_item, c"@16@0:8";
@@ -672,8 +819,12 @@ pub(crate) fn install() {
         "setEnabled:" => set_enabled, c"v20@0:8c16";
         "isHidden" => is_hidden, c"c16@0:8";
         "setHidden:" => set_hidden, c"v20@0:8c16";
+        "allowsKeyEquivalentWhenHidden" => allows_key_equivalent_when_hidden, c"c16@0:8";
+        "setAllowsKeyEquivalentWhenHidden:" => set_allows_key_equivalent_when_hidden, c"v20@0:8c16";
         "setKeyEquivalentModifierMask:" => set_key_equivalent_modifier_mask, c"v24@0:8Q16";
         "keyEquivalentModifierMask" => key_equivalent_modifier_mask, c"Q16@0:8";
+        "userKeyEquivalent" => user_key_equivalent, c"@16@0:8";
+        "userKeyEquivalentModifierMask" => user_key_equivalent_modifier_mask, c"Q16@0:8";
         "isSeparatorItem" => is_separator_item, c"c16@0:8";
         "hasSubmenu" => has_submenu, c"c16@0:8";
         "toolTip" => item_tool_tip, c"@16@0:8";
@@ -686,6 +837,8 @@ pub(crate) fn install() {
         "setMixedStateImage:" => ignored_object, c"v24@0:8@16";
         "setRepresentedObject:" => set_represented_object, c"v24@0:8@16";
         "representedObject" => represented_object, c"@16@0:8";
+        "attributedTitle" => crate::props::get_object, c"@16@0:8";
+        "setAttributedTitle:" => set_attributed_title, c"v24@0:8@16";
     });
 }
 
@@ -1169,6 +1322,36 @@ mod tests {
             COMMAND | CAPS_LOCK
         ));
         assert!(!matches_key_equivalent("", COMMAND, "s", COMMAND));
+    }
+
+    #[test]
+    fn a_user_key_equivalent_splits_into_modifiers_and_key() {
+        use crate::keymap::flags::{COMMAND, CONTROL, OPTION, SHIFT};
+        let both = (COMMAND | OPTION) as usize;
+        assert_eq!(parse_user_key_equivalent("@~s"), (both, "s"));
+        assert_eq!(
+            parse_user_key_equivalent("^$k"),
+            ((CONTROL | SHIFT) as usize, "k")
+        );
+        assert_eq!(parse_user_key_equivalent("@@"), (COMMAND as usize, "@"));
+        assert_eq!(parse_user_key_equivalent("x"), (0, "x"));
+        assert_eq!(parse_user_key_equivalent(""), (0, ""));
+    }
+
+    #[test]
+    fn an_item_without_a_user_shortcut_answers_an_empty_user_key_equivalent() {
+        let item = item(0);
+        // SAFETY: `-setTitle:` is `void (id, SEL, id)`; `-userKeyEquivalent` is
+        // `id (id, SEL)`.
+        let key = unsafe {
+            let title = foundation::string::from_str("Rosemary Test Item With No Shortcut");
+            set_item_title(item, objc::sel::get("setTitle:"), title);
+            objc::arc::release(title);
+            user_key_equivalent(item, objc::sel::get("userKeyEquivalent"))
+        };
+        assert!(!key.is_null());
+        assert_eq!(string_of(key), "");
+        objc::arc::release(item);
     }
 
     static SAVES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);

@@ -559,7 +559,13 @@ fn register_class(
     // The `IMP` installed for `.cxx_construct`, if the class has one.
     let mut cxx_construct: Option<host::Imp> = None;
     for (target, list) in [(cls, &class.ro.methods), (meta, class_methods)] {
+        let mut declared = std::collections::HashSet::new();
         for m in list {
+            // A list may name a selector twice - Qt's QNSView does - and Apple's
+            // runtime finds the first, so the later one is never reachable.
+            if !declared.insert(m.name.as_str()) {
+                continue;
+            }
             match add_method(r, target, m) {
                 Ok(carried) => {
                     methods += 1;

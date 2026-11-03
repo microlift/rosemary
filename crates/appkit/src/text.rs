@@ -1015,6 +1015,12 @@ pub(crate) fn commit(receiver: Id, text: &str) {
 
 /// Deliver an in-progress host IME composition to the focused input client.
 pub(crate) fn compose(receiver: Id, text: &str, start: i32, length: i32) {
+    // SDL reports an empty composition at the end of every input method round,
+    // composing or not, but AppKit's input context only clears marked text
+    // that the client has.
+    if text.is_empty() && !client_has_marked_text(receiver) {
+        return;
+    }
     let value = objc::arc::autorelease(foundation::string::from_str(text));
     let character_range = NSRange {
         location: usize::try_from(start).unwrap_or(0),
@@ -1059,6 +1065,20 @@ pub(crate) fn compose(receiver: Id, text: &str, start: i32, length: i32) {
                 std::mem::transmute(method.implementation());
             f(receiver, legacy, value, selected);
         }
+    }
+}
+
+fn client_has_marked_text(receiver: Id) -> bool {
+    let sel = objc::sel::get("hasMarkedText");
+    // SAFETY: a live first responder.
+    let Some(method) = (unsafe { objc::object::class_of(receiver) }).and_then(|c| c.method(sel))
+    else {
+        return false;
+    };
+    // SAFETY: `-hasMarkedText` is `BOOL (id, SEL)`.
+    unsafe {
+        let f: unsafe extern "C" fn(Id, Sel) -> u8 = std::mem::transmute(method.implementation());
+        f(receiver, sel) != 0
     }
 }
 
@@ -1170,9 +1190,11 @@ unsafe extern "C" fn current_editor(receiver: Id, _sel: Sel) -> Id {
         let f: unsafe extern "C" fn(Id, Sel) -> Id = std::mem::transmute(objc::msg::entry());
         f(window, objc::sel::get("firstResponder"))
     };
-    (first == editor)
-        .then_some(editor)
-        .unwrap_or(std::ptr::null_mut())
+    if first == editor {
+        editor
+    } else {
+        std::ptr::null_mut()
+    }
 }
 
 unsafe extern "C" fn field_mouse_down(receiver: Id, _sel: Sel, _event: Id) {
@@ -1253,8 +1275,8 @@ impl TextStyle {
     /// Helvetica 12 - here the system face - in black, left aligned.
     fn of(attributes: Id) -> Option<TextStyle> {
         let attributes = attributes as corefoundation::base::CFTypeRef;
-        let font = crate::coretext::get(attributes, "NSFont");
-        let (font, size) = crate::coretext::face_of(font)
+        let font = coretext::get(attributes, "NSFont");
+        let (font, size) = coretext::face_of(font)
             .and_then(|(face, size)| {
                 let size = if size > 0.0 { size } else { 12.0 };
                 Some((
@@ -1263,7 +1285,7 @@ impl TextStyle {
                 ))
             })
             .or_else(|| Some((chrome::Font::system(400)?, 12.0)))?;
-        let color = crate::coretext::get(attributes, "NSColor");
+        let color = coretext::get(attributes, "NSColor");
         let color = match color.is_null() {
             true => chrome::Color::rgba(0, 0, 0, 1.0),
             false => {
@@ -1277,7 +1299,7 @@ impl TextStyle {
                 }
             }
         };
-        let paragraph = crate::coretext::get(attributes, "NSParagraphStyle");
+        let paragraph = coretext::get(attributes, "NSParagraphStyle");
         let alignment = crate::paragraph::alignment(paragraph as Id).unwrap_or(0);
         Some(TextStyle {
             font,
@@ -1307,7 +1329,11 @@ impl TextStyle {
     /// Draw `text` into `rect` of the focused view, from its top, wrapping at
     /// its width when `wrap`.
     fn draw(&self, text: &str, rect: NSRect, wrap: bool) {
-        let density = crate::backing::focus_density();
+        let port = crate::backing::current_port();
+        let density = match port {
+            Some((port, _)) => port_density(port),
+            None => crate::backing::focus_density(),
+        };
         let width = (rect.size.width * density).ceil() as usize;
         let height = (rect.size.height * density).ceil() as usize;
         if width == 0 || height == 0 || text.is_empty() {
@@ -1338,6 +1364,10 @@ impl TextStyle {
                 self.color,
             );
         }
+        if let Some((port, flipped)) = port {
+            draw_into_port(port, flipped, rect, width, height, pixels);
+            return;
+        }
         crate::backing::draw_image(
             &pixels,
             width,
@@ -1353,6 +1383,60 @@ impl TextStyle {
             1.0,
             true,
         );
+    }
+}
+
+/// Device pixels per point under `port`'s current transform, so text drawn
+/// through it is rasterised at the resolution it lands at.
+pub(crate) fn port_density(port: *const std::ffi::c_void) -> f64 {
+    // SAFETY: the live context the current `NSGraphicsContext` holds.
+    let m = unsafe { crate::cgcontext::CGContextGetCTM(port) };
+    let scale = (m.a * m.d - m.b * m.c).abs().sqrt();
+    if scale.is_finite() && scale > 0.0 {
+        scale
+    } else {
+        1.0
+    }
+}
+
+/// Text or a control rasterised into `rect`, top row first, painted into
+/// `port` the way AppKit draws a string into a context a program made over its own
+/// `CGContext`: through that context's transform, clip and blend mode, and
+/// upright whether or not the context is flipped.
+///
+/// FIXME (ACCURACY): the text goes through the context as an image at
+/// `port_density`, not as glyph outlines, so a rotated or skewed transform
+/// resamples it.
+pub(crate) fn draw_into_port(
+    port: *const std::ffi::c_void,
+    flipped: bool,
+    rect: NSRect,
+    width: usize,
+    height: usize,
+    pixels: Vec<u8>,
+) {
+    // SAFETY: the live context the current `NSGraphicsContext` holds, its
+    // state saved and restored around this one image.
+    unsafe {
+        crate::cgcontext::CGContextSaveGState(port);
+        if flipped {
+            // An image's first row lands at the rectangle's maximum y; in a
+            // flipped context that is its bottom, so mirror the rectangle
+            // onto itself to keep the first row on top.
+            crate::cgcontext::CGContextConcatCTM(
+                port,
+                crate::cgcontext::CGAffineTransform {
+                    a: 1.0,
+                    b: 0.0,
+                    c: 0.0,
+                    d: -1.0,
+                    tx: 0.0,
+                    ty: 2.0 * rect.origin.y + rect.size.height,
+                },
+            );
+        }
+        crate::quartz::draw_pixels(port, rect, width, height, pixels);
+        crate::cgcontext::CGContextRestoreGState(port);
     }
 }
 
@@ -1704,6 +1788,9 @@ mod tests {
 
     #[test]
     fn paste_inserts_general_pasteboard_text_at_the_selection() {
+        if !sdl3::isolated::run_here_with_dummy_video() {
+            return;
+        }
         let view = text_view();
         let board_class =
             objc::class::ptr(objc::class::lookup(c"NSPasteboard").expect("NSPasteboard")) as Id;
@@ -1846,6 +1933,44 @@ mod tests {
     }
 
     #[test]
+    fn an_empty_composition_only_clears_marked_text_the_client_has() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        static MARKED: AtomicBool = AtomicBool::new(false);
+        static CLEARS: AtomicUsize = AtomicUsize::new(0);
+        unsafe extern "C" fn has_marked(_: Id, _: Sel) -> u8 {
+            MARKED.load(Ordering::Relaxed) as u8
+        }
+        unsafe extern "C" fn set_marked(_: Id, _: Sel, value: Id, _: NSRange) {
+            // SAFETY: an `NSString`.
+            if unsafe { foundation::string::bytes(value) }.is_empty() {
+                CLEARS.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        crate::bootstrap();
+        let view = objc::class::lookup(c"NSView").expect("NSView");
+        let class =
+            objc::class::allocate_pair(Some(view), c"MarkedTextRecorder", 0).expect("a subclass");
+        class.add_method(
+            objc::sel::get("hasMarkedText"),
+            has_marked as objc::class::Imp,
+            c"c16@0:8",
+        );
+        class.add_method(
+            objc::sel::get("setMarkedText:selectedRange:"),
+            set_marked as objc::class::Imp,
+            c"v40@0:8@16{_NSRange=QQ}24",
+        );
+        objc::class::register_pair(class);
+        let client = objc::object::create_instance(class, 0);
+
+        compose(client, "", 0, 0);
+        assert_eq!(CLEARS.load(Ordering::Relaxed), 0);
+        MARKED.store(true, Ordering::Relaxed);
+        compose(client, "", 0, 0);
+        assert_eq!(CLEARS.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
     fn ranges_and_deletion_count_utf16_code_units() {
         let view = text_view();
         // SAFETY: a live view and string.
@@ -1861,5 +1986,156 @@ mod tests {
         }
         assert_eq!(read(view).text, "a");
         assert_eq!(read(view).selected.location, 1);
+    }
+
+    /// A 32x48 premultiplied B, G, R, A bitmap context, its buffer, and an
+    /// `NSGraphicsContext` over it made current, flipped or not as a program
+    /// building one with `+graphicsContextWithGraphicsPort:flipped:` would.
+    fn current_bitmap_context(
+        flipped: bool,
+    ) -> (Vec<u8>, corefoundation::base::CFTypeRef, (usize, usize)) {
+        crate::bootstrap();
+        let (width, height) = (32usize, 48usize);
+        let mut buffer = vec![0u8; width * height * 4];
+        // SAFETY: a buffer of `height` rows of `width * 4` bytes that outlives
+        // every use of the context in these tests.
+        let port = unsafe {
+            let space = crate::graphics::CGColorSpaceCreateDeviceRGB();
+            let port = crate::cgcontext::CGBitmapContextCreate(
+                buffer.as_mut_ptr().cast(),
+                width,
+                height,
+                8,
+                width * 4,
+                space,
+                // kCGImageAlphaPremultipliedFirst | kCGBitmapByteOrder32Little
+                2 | 0x2000,
+            );
+            crate::graphics::CGColorSpaceRelease(space);
+            if flipped {
+                crate::cgcontext::CGContextTranslateCTM(port, 0.0, height as f64);
+                crate::cgcontext::CGContextScaleCTM(port, 1.0, -1.0);
+            }
+            port
+        };
+        assert!(!port.is_null());
+        let class = objc::class::lookup(c"NSGraphicsContext").expect("declared");
+        // SAFETY: the registered class methods' own prototypes.
+        unsafe {
+            let make: unsafe extern "C" fn(Id, Sel, *const std::ffi::c_void, u8) -> Id =
+                std::mem::transmute(objc::msg::entry());
+            let context = make(
+                objc::class::ptr(class).cast(),
+                objc::sel::get("graphicsContextWithGraphicsPort:flipped:"),
+                port,
+                u8::from(flipped),
+            );
+            assert!(!context.is_null());
+            let set: unsafe extern "C" fn(Id, Sel, Id) = std::mem::transmute(objc::msg::entry());
+            set(
+                objc::class::ptr(class).cast(),
+                objc::sel::get("setCurrentContext:"),
+                context,
+            );
+        }
+        (buffer, port, (width, height))
+    }
+
+    fn clear_current_context(port: corefoundation::base::CFTypeRef) {
+        let class = objc::class::lookup(c"NSGraphicsContext").expect("declared");
+        // SAFETY: the registered setter's prototype, then the reference
+        // `CGBitmapContextCreate` gave this test.
+        unsafe {
+            let set: unsafe extern "C" fn(Id, Sel, Id) = std::mem::transmute(objc::msg::entry());
+            set(
+                objc::class::ptr(class).cast(),
+                objc::sel::get("setCurrentContext:"),
+                std::ptr::null_mut(),
+            );
+            crate::cgcontext::CGContextRelease(port);
+        }
+    }
+
+    /// The rows, top first in memory, that any ink landed on.
+    fn inked_rows(buffer: &[u8], width: usize) -> Vec<usize> {
+        buffer
+            .chunks_exact(width * 4)
+            .enumerate()
+            .filter(|(_, row)| row.as_chunks::<4>().0.iter().any(|pixel| pixel[3] != 0))
+            .map(|(at, _)| at)
+            .collect()
+    }
+
+    fn draw_string_in(rect: NSRect) {
+        let text = foundation::string::from_str("Hg");
+        // SAFETY: an NSString this runtime made, and no attributes, which is
+        // AppKit's default style.
+        unsafe {
+            string_draw_in_rect(
+                text,
+                objc::sel::get("drawInRect:withAttributes:"),
+                rect,
+                std::ptr::null_mut(),
+            )
+        };
+        objc::arc::release(text);
+    }
+
+    /// A program that makes its own bitmap context current and draws a string
+    /// expects the string in that bitmap, not in whatever view is focused.
+    #[test]
+    fn a_string_draws_into_the_current_contexts_own_bitmap() {
+        let (buffer, port, (width, height)) = current_bitmap_context(false);
+        draw_string_in(NSRect {
+            origin: NSPoint::default(),
+            size: NSSize {
+                width: width as f64,
+                height: height as f64,
+            },
+        });
+        let rows = inked_rows(&buffer, width);
+        clear_current_context(port);
+        assert!(!rows.is_empty(), "the string reached the bitmap");
+        // `-drawInRect:` sets text from the top of the rectangle, which in
+        // an unflipped context is its maximum y - the first rows in memory.
+        assert!(rows[0] < height / 2, "inked rows {rows:?}");
+    }
+
+    /// In a flipped context the rectangle's top is its minimum y, and the
+    /// text there still reads upright, so its ink stays in the upper rows.
+    #[test]
+    fn a_string_stays_upright_in_a_flipped_context() {
+        let (unflipped, port, (width, height)) = current_bitmap_context(false);
+        let rect = NSRect {
+            origin: NSPoint::default(),
+            size: NSSize {
+                width: width as f64,
+                height: height as f64,
+            },
+        };
+        draw_string_in(rect);
+        clear_current_context(port);
+        let (flipped, port, _) = current_bitmap_context(true);
+        draw_string_in(rect);
+        clear_current_context(port);
+        assert!(!inked_rows(&flipped, width).is_empty());
+        assert_eq!(
+            inked_rows(&flipped, width),
+            inked_rows(&unflipped, width),
+            "the same rows, so the same way up"
+        );
+        assert!(inked_rows(&flipped, width)[0] < height / 2);
+        assert_eq!(flipped, unflipped);
+    }
+
+    /// Text drawn through a context scaled up is rasterised at the scale it
+    /// lands at rather than enlarged from a point-sized bitmap.
+    #[test]
+    fn a_ports_density_is_its_transforms_scale() {
+        let (_buffer, port, _) = current_bitmap_context(false);
+        // SAFETY: the live context made above.
+        unsafe { crate::cgcontext::CGContextScaleCTM(port, 2.0, 2.0) };
+        assert_eq!(port_density(port), 2.0);
+        clear_current_context(port);
     }
 }

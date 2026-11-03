@@ -10,3 +10,6 @@ exports.workspace = true
 objc.workspace = true
 corefoundation.workspace = true
 foundation.workspace = true
+
+[lints]
+workspace = true

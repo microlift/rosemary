@@ -20,6 +20,7 @@ pub(super) fn encode(key: &[u8; 32], library: &TranslatedLibrary) -> Vec<u8> {
             write_u32(&mut payload, resource.count);
             payload.push(access_tag(resource.access));
             payload.push(u8::from(resource.sampled));
+            payload.push(u8::from(resource.texel_buffer));
             write_inline_sampler(&mut payload, resource.inline_sampler.as_ref());
         }
         write_strings(&mut payload, &entry.required.capabilities);
@@ -38,6 +39,11 @@ pub(super) fn encode(key: &[u8; 32], library: &TranslatedLibrary) -> Vec<u8> {
         write_u32(&mut payload, constant.index);
         write_string(&mut payload, &constant.name);
         write_string(&mut payload, &constant.encoding);
+    }
+    write_u32(&mut payload, library.rejected.len() as u32);
+    for rejected in &library.rejected {
+        write_string(&mut payload, &rejected.name);
+        write_string(&mut payload, &rejected.reason);
     }
 
     let mut bytes = Vec::with_capacity(payload.len() + 112);
@@ -93,6 +99,7 @@ pub(super) fn decode(bytes: &[u8], key: &[u8; 32]) -> Option<TranslatedLibrary> 
                 count: reader.u32()?,
                 access: access_of_tag(reader.u8()?)?,
                 sampled: reader.boolean()?,
+                texel_buffer: reader.boolean()?,
                 inline_sampler: read_inline_sampler(&mut reader)?,
             });
         }
@@ -131,9 +138,18 @@ pub(super) fn decode(bytes: &[u8], key: &[u8; 32]) -> Option<TranslatedLibrary> 
             encoding: reader.string()?,
         });
     }
+    let count = reader.u32()? as usize;
+    let mut rejected = Vec::with_capacity(count.min(1024));
+    for _ in 0..count {
+        rejected.push(crate::RejectedEntry {
+            name: reader.string()?,
+            reason: reader.string()?,
+        });
+    }
     reader.at_end().then_some(TranslatedLibrary {
         entries,
         function_constants,
+        rejected,
     })
 }
 

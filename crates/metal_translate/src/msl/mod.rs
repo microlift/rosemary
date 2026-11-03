@@ -35,21 +35,39 @@ pub fn parse_msl_with_macros(
     source: &str,
     macros: &[(String, String)],
 ) -> Result<Module, TranslateError> {
+    let (module, rejected) = parse_msl_partial(source, macros)?;
+    match rejected.into_iter().next() {
+        Some(rejected) => Err(TranslateError::one(Diagnostic::new(
+            Phase::AirSyntax,
+            format!("{}: {}", rejected.name, rejected.reason),
+        ))),
+        None => Ok(module),
+    }
+}
+
+/// [`parse_msl_with_macros`], keeping the entry points which parse and
+/// lower and naming each other one with its reason.
+pub fn parse_msl_partial(
+    source: &str,
+    macros: &[(String, String)],
+) -> Result<(Module, Vec<crate::RejectedEntry>), TranslateError> {
     // A guest's string may carry its C terminator.
     let source = source.trim_end_matches('\0');
     let compiled = (|| {
         let text = preprocess::preprocess(source, macros)?;
         let tokens = lex::lex(&text, 1)?;
         let program = parse::parse(&tokens)?;
-        let module = lower::lower(&program)?;
+        let (module, rejected) = lower::lower(&program)?;
         module.verify()?;
-        Ok(module)
+        Ok((module, rejected))
     })();
     match compiled {
-        Ok(module) => Ok(module),
+        Ok(compiled) => Ok(compiled),
         // The narrow kernels the first frontend parsed are still accepted
         // exactly as before where the general frontend refuses them.
-        Err(error) => parse_legacy(source).map_err(|_| error),
+        Err(error) => parse_legacy(source)
+            .map(|module| (module, Vec::new()))
+            .map_err(|_| error),
     }
 }
 

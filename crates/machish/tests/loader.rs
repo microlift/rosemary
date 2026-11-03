@@ -413,3 +413,23 @@ fn a_loaded_bundle_expands_executable_path_against_the_program() {
     let _ = loader.link_with(&bytes, "/app/MacOS/Lib/mod.so", &mut mem, &mut source, &[]);
     assert_eq!(source.0, ["/app/MacOS/libSDL2.dylib"]);
 }
+
+/// A stand-in for libSystem is not fetched, but the real image it re-exports
+/// is - and only once, however many images depend on the umbrella.
+#[test]
+fn a_stand_ins_reexport_is_fetched_in_its_place() {
+    let bytes = bundle_depending_on("/usr/lib/libSystem.B.dylib");
+    let mut mem = BufferSpace::new(0x1_0000_0000);
+    let mut source = Recording::default();
+    let mut system = SyntheticDylib::new("/usr/lib/libSystem.B.dylib");
+    system.reexport("/usr/lib/libcopyfile.dylib");
+    let providers: [&dyn SymbolProvider; 1] = [&system];
+    let _ = Loader::new(X86_64).link_with(
+        &bytes,
+        "/app/plugin.bundle",
+        &mut mem,
+        &mut source,
+        &providers,
+    );
+    assert_eq!(source.0, ["/usr/lib/libcopyfile.dylib"]);
+}

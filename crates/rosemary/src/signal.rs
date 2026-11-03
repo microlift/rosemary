@@ -2,6 +2,7 @@ use microlift::arch::x86_64::context::RegisterContext;
 use static_init::dynamic;
 
 use crate::abi::{AbiError, Callbacks, GuestMemory, Result};
+use crate::shims::bind;
 
 /// `sa_flags` bit asking for the three-argument handler. See the module note.
 const SA_SIGINFO: u32 = 0x0040;
@@ -344,20 +345,35 @@ fn write_port_count(symbol: &str, at: u64, mem: &mut dyn GuestMemory) -> Result<
 }
 
 /// One of this module's implementations, in the shape [`crate::shims`] wants.
-pub type Shim = fn(&str, &mut RegisterContext, &mut dyn GuestMemory, &dyn Callbacks) -> Result<()>;
+pub type Shim = crate::shims::CallbackShim;
 
 /// Whether `name` (underscore already stripped) is one of this module's.
 pub fn shim_for(name: &str) -> Option<Shim> {
     Some(match name {
-        "signal" => signal,
-        "sigaction" => sigaction,
-        "sigaltstack" => sigaltstack,
-        "task_set_exception_ports" => task_set_exception_ports,
-        "host_set_exception_ports" => set_exception_ports,
-        "task_get_exception_ports" | "host_get_exception_ports" => get_exception_ports,
-        "task_swap_exception_ports"
-        | "host_swap_exception_ports"
-        | "thread_swap_exception_ports" => swap_exception_ports,
+        "signal" => bind!(callback "signal" => signal),
+        "sigaction" => bind!(callback "sigaction" => sigaction),
+        "sigaltstack" => bind!(callback "sigaltstack" => sigaltstack),
+        "task_set_exception_ports" => {
+            bind!(callback "task_set_exception_ports" => task_set_exception_ports)
+        }
+        "host_set_exception_ports" => {
+            bind!(callback "host_set_exception_ports" => set_exception_ports)
+        }
+        "task_get_exception_ports" => {
+            bind!(callback "task_get_exception_ports" => get_exception_ports)
+        }
+        "host_get_exception_ports" => {
+            bind!(callback "host_get_exception_ports" => get_exception_ports)
+        }
+        "task_swap_exception_ports" => {
+            bind!(callback "task_swap_exception_ports" => swap_exception_ports)
+        }
+        "host_swap_exception_ports" => {
+            bind!(callback "host_swap_exception_ports" => swap_exception_ports)
+        }
+        "thread_swap_exception_ports" => {
+            bind!(callback "thread_swap_exception_ports" => swap_exception_ports)
+        }
         _ => return None,
     })
 }

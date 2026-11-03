@@ -275,7 +275,7 @@ pub unsafe extern "C" fn ATSFontActivateFromMemory(
     }
     // SAFETY: the caller supplies `length` readable bytes.
     let bytes = unsafe { std::slice::from_raw_parts(data, length) };
-    let Some(path) = crate::coretext::spill_font(bytes) else {
+    let Some(path) = coretext::spill_font(bytes) else {
         return PARAM_ERR;
     };
     let faces = fonts::register_file(&path);
@@ -362,8 +362,7 @@ pub unsafe extern "C" fn ATSFontFamilyGetName(
 
 /// The face a `CGFont` or `CTFont` draws with, as a reference.
 fn reference_of(font: CFTypeRef) -> u32 {
-    crate::coretext::face_location(font)
-        .map_or(INVALID_FONT, |(path, index)| reference(&path, index))
+    coretext::face_location(font).map_or(INVALID_FONT, |(path, index)| reference(&path, index))
 }
 
 /// `CGFontRef CGFontCreateWithPlatformFont(void *platformFontReference)`: the
@@ -376,7 +375,7 @@ pub unsafe extern "C" fn CGFontCreateWithPlatformFont(platform: *const u32) -> C
     let Some(face) = face_for(unsafe { *platform }) else {
         return std::ptr::null();
     };
-    crate::coretext::face_attributes(&face, 0.0)
+    coretext::face_attributes(&face, 0.0)
 }
 
 /// `CTFontRef CTFontCreateWithPlatformFont(ATSFontRef, CGFloat, const
@@ -390,7 +389,7 @@ pub unsafe extern "C" fn CTFontCreateWithPlatformFont(
     let Some(face) = face_for(font) else {
         return std::ptr::null();
     };
-    crate::coretext::face_attributes(&face, size)
+    coretext::face_attributes(&face, size)
 }
 
 /// `ATSFontRef CTFontGetPlatformFont(CTFontRef, CTFontDescriptorRef *)`
@@ -406,7 +405,7 @@ pub unsafe extern "C" fn CTFontGetPlatformFont(font: CFTypeRef, attributes: *mut
 /// name, as `CTFontCreateWithName` resolves one.
 pub unsafe extern "C" fn CGFontCreateWithFontName(name: CFTypeRef) -> CFTypeRef {
     // SAFETY: a string or null.
-    unsafe { crate::coretext::CTFontCreateWithName(name, 0.0, std::ptr::null()) }
+    unsafe { coretext::CTFontCreateWithName(name, 0.0, std::ptr::null()) }
 }
 
 /// `CGFontRef CGFontCreateWithDataProvider(CGDataProviderRef)`: a font file's
@@ -415,13 +414,13 @@ pub unsafe extern "C" fn CGFontCreateWithDataProvider(provider: CFTypeRef) -> CF
     let Some(bytes) = crate::graphics::provider_bytes(provider) else {
         return std::ptr::null();
     };
-    let Some(path) = crate::coretext::spill_font(bytes) else {
+    let Some(path) = coretext::spill_font(bytes) else {
         return std::ptr::null();
     };
     match fonts::register_file(&path).first() {
         Some(face) => {
             GENERATION.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            crate::coretext::face_attributes(face, 0.0)
+            coretext::face_attributes(face, 0.0)
         }
         None => std::ptr::null(),
     }
@@ -445,12 +444,12 @@ pub unsafe extern "C" fn CGFontRelease(font: CFTypeRef) {
 /// `int CGFontGetUnitsPerEm(CGFontRef)`
 pub unsafe extern "C" fn CGFontGetUnitsPerEm(font: CFTypeRef) -> i32 {
     // SAFETY: a font this runtime made, or null.
-    unsafe { crate::coretext::CTFontGetUnitsPerEm(font) as i32 }
+    unsafe { coretext::CTFontGetUnitsPerEm(font) as i32 }
 }
 
 /// `int CGFontGetXHeight(CGFontRef)`, in font units.
 pub unsafe extern "C" fn CGFontGetXHeight(font: CFTypeRef) -> i32 {
-    crate::coretext::loaded(font).map_or(0, |face| {
+    coretext::loaded(font).map_or(0, |face| {
         let face = face.face();
         i32::from(face.x_height().unwrap_or(face.ascender() / 2))
     })
@@ -464,7 +463,7 @@ pub unsafe extern "C" fn CGFontGetGlyphAdvances(
     count: usize,
     advances: *mut i32,
 ) -> bool {
-    let Some(face) = crate::coretext::loaded(font) else {
+    let Some(face) = coretext::loaded(font) else {
         return false;
     };
     if count > 0 && (glyphs.is_null() || advances.is_null()) {
@@ -484,12 +483,12 @@ pub unsafe extern "C" fn CGFontGetGlyphAdvances(
 /// `CFDataRef CGFontCopyTableForTag(CGFontRef, uint32_t)`
 pub unsafe extern "C" fn CGFontCopyTableForTag(font: CFTypeRef, tag: u32) -> CFTypeRef {
     // SAFETY: a font this runtime made, or null.
-    unsafe { crate::coretext::CTFontCopyTable(font, tag, 0) }
+    unsafe { coretext::CTFontCopyTable(font, tag, 0) }
 }
 
 /// `CFIndex CTFontGetGlyphCount(CTFontRef)`
 pub unsafe extern "C" fn CTFontGetGlyphCount(font: CFTypeRef) -> isize {
-    crate::coretext::loaded(font).map_or(0, |face| face.face().number_of_glyphs() as isize)
+    coretext::loaded(font).map_or(0, |face| face.face().number_of_glyphs() as isize)
 }
 
 /// A face's design-unit rectangle as a `CGRect`.
@@ -514,7 +513,7 @@ pub unsafe extern "C" fn CGFontGetGlyphBBoxes(
     count: usize,
     boxes: *mut NSRect,
 ) -> bool {
-    let Some(face) = crate::coretext::loaded(font) else {
+    let Some(face) = coretext::loaded(font) else {
         return false;
     };
     if count > 0 && (glyphs.is_null() || boxes.is_null()) {
@@ -556,7 +555,7 @@ pub unsafe extern "C" fn CGFontGetGlyphsForUnichars(
         )
     };
     out.fill(0);
-    let Some(face) = crate::coretext::loaded(font) else {
+    let Some(face) = coretext::loaded(font) else {
         return;
     };
     let mut at = 0;
@@ -578,7 +577,7 @@ pub unsafe extern "C" fn CGFontGetGlyphPath(
     _unknown: i32,
     glyph: u16,
 ) -> CFTypeRef {
-    let Some(face) = crate::coretext::loaded(font) else {
+    let Some(face) = coretext::loaded(font) else {
         return std::ptr::null();
     };
     let m = match transform.is_null() {
@@ -593,22 +592,22 @@ pub unsafe extern "C" fn CGFontGetGlyphPath(
 
 /// `CGRect CGFontGetFontBBox(CGFontRef)`, the `head` table's, in font units.
 pub unsafe extern "C" fn CGFontGetFontBBox(font: CFTypeRef) -> NSRect {
-    crate::coretext::loaded(font).map_or(NSRect::default(), |face| {
+    coretext::loaded(font).map_or(NSRect::default(), |face| {
         unit_rect(face.face().global_bounding_box())
     })
 }
 
 /// `int CGFontGetAscent(CGFontRef)` and its two neighbours, in font units.
 pub unsafe extern "C" fn CGFontGetAscent(font: CFTypeRef) -> i32 {
-    crate::coretext::loaded(font).map_or(0, |face| i32::from(face.face().ascender()))
+    coretext::loaded(font).map_or(0, |face| i32::from(face.face().ascender()))
 }
 
 pub unsafe extern "C" fn CGFontGetDescent(font: CFTypeRef) -> i32 {
-    crate::coretext::loaded(font).map_or(0, |face| i32::from(face.face().descender()))
+    coretext::loaded(font).map_or(0, |face| i32::from(face.face().descender()))
 }
 
 pub unsafe extern "C" fn CGFontGetLeading(font: CFTypeRef) -> i32 {
-    crate::coretext::loaded(font).map_or(0, |face| i32::from(face.face().line_gap()))
+    coretext::loaded(font).map_or(0, |face| i32::from(face.face().line_gap()))
 }
 
 exports::exports! {

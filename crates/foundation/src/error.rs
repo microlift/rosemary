@@ -321,9 +321,40 @@ pub mod cf {
         }
     }
 
+    /// `CFIndex CFErrorGetCode(CFErrorRef)`: CFIndex is a signed pointer-width
+    /// integer. CFError and NSError are toll-free bridged, so use `-code` to
+    /// retrieve the error's actual domain-specific value without truncation.
+    unsafe extern "C" fn CFErrorGetCode(err: Id) -> isize {
+        if err.is_null() {
+            return 0;
+        }
+        // SAFETY: the caller's live CFError handle responds to -code and
+        // Objective-C NSInteger has the same width/sign as CFIndex.
+        unsafe {
+            let msg: unsafe extern "C" fn(Id, Sel) -> isize =
+                std::mem::transmute(objc::msg::entry());
+            msg(err, objc::sel::get("code"))
+        }
+    }
+
     exports::exports! {
         functions {
             "CFErrorCopyDescription" => CFErrorCopyDescription,
+            "CFErrorGetCode" => CFErrorGetCode,
+        }
+    }
+
+    #[cfg(test)]
+    #[test]
+    fn cf_error_get_code_preserves_signed_cfindex() {
+        crate::bootstrap();
+        let error_code: i64 = -0x1_0000_0001;
+        let error = super::create("NSOSStatusErrorDomain", error_code, "test", &[]);
+        assert!(!error.is_null());
+        // SAFETY: the error above is an owned Foundation NSError handle.
+        unsafe {
+            assert_eq!(CFErrorGetCode(error), error_code as isize);
+            objc::arc::release(error);
         }
     }
 }

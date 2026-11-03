@@ -8,7 +8,7 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock};
 
-use foundation::geometry::{NSPoint, NSRect};
+use foundation::geometry::{NSPoint, NSRect, NSSize};
 use objc::object::Id;
 use objc::sel::Sel;
 
@@ -546,6 +546,53 @@ pub(crate) fn chose(button: Id, item: Id) {
     }
 }
 
+/// `-intrinsicContentSize`: wide enough for the widest item's title and the
+/// arrows, as tall as AppKit's pop-up bezel at the control's size.
+unsafe extern "C" fn intrinsic_content_size(receiver: Id, _sel: Sel) -> NSSize {
+    let responds = |sel: &str| {
+        // SAFETY: a live object.
+        unsafe { objc::object::class_of(receiver) }
+            .is_some_and(|c| c.method(objc::sel::get(sel)).is_some())
+    };
+    let control_size = match responds("controlSize") {
+        // SAFETY: `NSControlSize (id, SEL)`.
+        true => unsafe {
+            let f: unsafe extern "C" fn(Id, Sel) -> usize = std::mem::transmute(objc::msg::entry());
+            f(receiver, objc::sel::get("controlSize"))
+        },
+        false => 0,
+    };
+    // `NSControlSizeRegular`, `Small` and `Mini`.
+    let height = match control_size {
+        1 => 17.0,
+        2 => 14.0,
+        _ => 20.0,
+    };
+    let Some((font, size)) = crate::label::chrome_font(send_get(receiver, "font")) else {
+        return NSSize {
+            width: -1.0,
+            height,
+        };
+    };
+    let titles: Vec<String> = match state(receiver).pulls_down {
+        true => items(receiver)
+            .first()
+            .map(|i| title_of(*i))
+            .into_iter()
+            .collect(),
+        false => items(receiver).iter().map(|i| title_of(*i)).collect(),
+    };
+    let widest = titles
+        .iter()
+        .map(|t| font.measure(t, size as f32))
+        .fold(0.0f32, f32::max);
+    // The title's inset, the arrows, and the gap before them; see `draw_rect`.
+    NSSize {
+        width: (f64::from(widest) + 8.0 + 16.0 + 12.0).ceil(),
+        height,
+    }
+}
+
 /// The bezel, the selected item's title, and the arrows that say this button
 /// opens a menu.
 unsafe extern "C" fn draw_rect(receiver: Id, _sel: Sel, _dirty: NSRect) {
@@ -559,17 +606,30 @@ unsafe extern "C" fn draw_rect(receiver: Id, _sel: Sel, _dirty: NSRect) {
     let mut pixels = vec![0u8; width * height * 4];
     let mut canvas = chrome::Canvas::new(&mut pixels, width, height, width * 4, density as f32);
     let (w, h) = (bounds.size.width as f32, bounds.size.height as f32);
-    canvas.fill_rounded_rect(
-        chrome::Rect::new(1.0, 1.0, w - 2.0, h - 3.0),
-        4.0,
-        chrome::Color::rgba(255, 255, 255, 1.0),
-    );
-    canvas.stroke_rounded_rect(
-        chrome::Rect::new(1.5, 1.5, w - 3.0, h - 4.0),
-        4.0,
-        1.0,
-        chrome::Color::rgba(0, 0, 0, 0.3),
-    );
+    // A borderless pop-up is its title and arrows on whatever is behind it,
+    // in the appearance's label colour.
+    // SAFETY: `-isBordered` is `BOOL (id, SEL)`.
+    let bordered = unsafe {
+        let f: unsafe extern "C" fn(Id, Sel) -> u8 = std::mem::transmute(objc::msg::entry());
+        f(receiver, objc::sel::get("isBordered")) != 0
+    };
+    if bordered {
+        canvas.fill_rounded_rect(
+            chrome::Rect::new(1.0, 1.0, w - 2.0, h - 3.0),
+            4.0,
+            chrome::Color::rgba(255, 255, 255, 1.0),
+        );
+        canvas.stroke_rounded_rect(
+            chrome::Rect::new(1.5, 1.5, w - 3.0, h - 4.0),
+            4.0,
+            1.0,
+            chrome::Color::rgba(0, 0, 0, 0.3),
+        );
+    }
+    let ink = match !bordered && crate::appearance::is_dark() {
+        true => 255,
+        false => 0,
+    };
     let enabled = crate::controls::is_enabled(receiver);
     let alpha = if enabled { 0.85 } else { 0.35 };
     let font: Option<(Arc<chrome::Font>, f64)> =
@@ -586,7 +646,7 @@ unsafe extern "C" fn draw_rect(receiver: Id, _sel: Sel, _dirty: NSRect) {
         });
         let line = font.truncate(&title, size, (w - 12.0 - arrows).max(0.0));
         let baseline = font.centered_baseline(size, 0.0, h - 1.0);
-        let color = chrome::Color::rgba(0, 0, 0, alpha);
+        let color = chrome::Color::rgba(ink, ink, ink, alpha);
         canvas.draw_text(&line, &font, size, chrome::Point::new(8.0, baseline), color);
         let glyph = if state(receiver).pulls_down {
             "\u{25BE}"
@@ -660,5 +720,6 @@ pub(crate) fn install() {
         "synchronizeTitleAndSelectedItem" => synchronize_title, c"v16@0:8";
         "mouseDown:" => mouse_down, c"v24@0:8@16";
         "drawRect:" => draw_rect, c"v48@0:8{CGRect={CGPoint=dd}{CGSize=dd}}16";
+        "intrinsicContentSize" => intrinsic_content_size, c"{CGSize=dd}16@0:8";
     });
 }

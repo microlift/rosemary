@@ -328,6 +328,9 @@ pub fn install() {
         return;
     }
     darwin::signal::set_fault_filter(guarded_write_filter);
+    // The main thread runs the guest too, and still has the 8 KiB stack the
+    // Rust runtime gave it.
+    install_alternate_stack();
     keep_the_fault_signals();
     // `SIGABRT` beside the two faults, because the allocator is the third way a
     // program of this size dies and the only one that used to leave no report at
@@ -390,7 +393,6 @@ fn keep_the_fault_signals() {
             darwin::signal::retain(darwin);
         }
     }
-    install_alternate_stack();
     darwin::signal::retain_altstack();
     eprintln!(
         "rosemary: the guest's own handlers for SIGSEGV, SIGBUS, SIGABRT and SIGILL will be \
