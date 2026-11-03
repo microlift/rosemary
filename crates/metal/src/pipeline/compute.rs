@@ -36,8 +36,15 @@ impl ComputePipeline {
 
     /// The Vulkan pipeline for one Metal threadgroup size.
     pub fn variant(&self, size: [u32; 3]) -> Result<vk::Pipeline, String> {
-        let mut cache = self.variants.lock().expect("compute pipeline cache");
-        if let Some(pipeline) = cache.get(&size) {
+        // Compiled without the lock held: a driver can take tens of
+        // milliseconds, and other encoders drawing with this state must not
+        // wait on a variant they do not need.
+        if let Some(pipeline) = self
+            .variants
+            .lock()
+            .expect("compute pipeline cache")
+            .get(&size)
+        {
             return Ok(*pipeline);
         }
         let entries = metal_translate::WORKGROUP_SIZE_SPEC_IDS
@@ -76,8 +83,16 @@ impl ComputePipeline {
         })
         .map_err(|(_, error)| format!("vkCreateComputePipelines failed with {error:?}"))?[0];
         self.gpu.pipeline_created();
-        cache.insert(size, pipeline);
-        Ok(pipeline)
+        let mut cache = self.variants.lock().expect("compute pipeline cache");
+        match cache.entry(size) {
+            std::collections::hash_map::Entry::Occupied(made) => {
+                // Another thread compiled it first; this one was never recorded.
+                // SAFETY: a pipeline of this device's which nothing refers to.
+                unsafe { self.gpu.device.destroy_pipeline(pipeline, None) };
+                Ok(*made.get())
+            }
+            std::collections::hash_map::Entry::Vacant(slot) => Ok(*slot.insert(pipeline)),
+        }
     }
 }
 

@@ -282,8 +282,15 @@ impl RenderPipeline {
     }
 
     pub fn variant(&self, key: &RenderVariantKey) -> Result<vk::Pipeline, String> {
-        let mut cache = self.variants.lock().expect("render pipeline cache");
-        if let Some(pipeline) = cache.get(key) {
+        // Compiled without the lock held: a driver can take tens of
+        // milliseconds, and other encoders drawing with this state must not
+        // wait on a variant they do not need.
+        if let Some(pipeline) = self
+            .variants
+            .lock()
+            .expect("render pipeline cache")
+            .get(key)
+        {
             return Ok(*pipeline);
         }
         let mut shape = self.pass.clone();
@@ -413,8 +420,16 @@ impl RenderPipeline {
         })
         .map_err(|(_, error)| format!("vkCreateGraphicsPipelines failed with {error:?}"))?[0];
         self.gpu.pipeline_created();
-        cache.insert(*key, pipeline);
-        Ok(pipeline)
+        let mut cache = self.variants.lock().expect("render pipeline cache");
+        match cache.entry(*key) {
+            std::collections::hash_map::Entry::Occupied(made) => {
+                // Another thread compiled it first; this one was never recorded.
+                // SAFETY: a pipeline of this device's which nothing refers to.
+                unsafe { self.gpu.device.destroy_pipeline(pipeline, None) };
+                Ok(*made.get())
+            }
+            std::collections::hash_map::Entry::Vacant(slot) => Ok(*slot.insert(pipeline)),
+        }
     }
 
     pub fn supports_base_instance(&self, base_instance: u64) -> bool {
