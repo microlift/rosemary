@@ -722,6 +722,14 @@ pub(super) unsafe extern "C" fn get_bytes_slice(
     match result {
         Err(reason) => gpu::trace(format!("getBytes: copy failed: {reason}")),
         Ok(()) => {
+            let contents = staging.lock().unwrap().staging.as_ref().unwrap().contents;
+            if row_stride == tight_row && image_stride == tight_image {
+                // SAFETY: as below, for a region whose strides leave no gaps.
+                unsafe {
+                    std::ptr::copy_nonoverlapping(contents, bytes, (tight_image * images) as usize)
+                };
+                return;
+            }
             for image in 0..images {
                 for row in 0..rows {
                     let from = (image * tight_image + row * tight_row) as usize;
@@ -731,14 +739,7 @@ pub(super) unsafe extern "C" fn get_bytes_slice(
                     // its own strides.
                     unsafe {
                         std::ptr::copy_nonoverlapping(
-                            staging
-                                .lock()
-                                .unwrap()
-                                .staging
-                                .as_ref()
-                                .unwrap()
-                                .contents
-                                .add(from),
+                            contents.add(from),
                             bytes.add(to),
                             tight_row as usize,
                         )
