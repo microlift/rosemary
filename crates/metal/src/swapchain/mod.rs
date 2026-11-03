@@ -624,6 +624,7 @@ fn ensure_resize_worker(window: usize, entry: &Arc<WindowSwapchain>) {
     if entry.resize_worker_started.swap(true, Ordering::AcqRel) {
         return;
     }
+    retire_workers_at_exit();
     let owned = Arc::clone(entry);
     let handle = std::thread::Builder::new()
         .name("rosemary-wsi-resize".into())
@@ -1947,10 +1948,69 @@ const DIRECT_IDLE_SNAPSHOT_DELAY: Duration = Duration::from_millis(100);
 
 /// One presentation worker per window prevents an occluded window from
 /// stalling other windows and decouples Metal drawables from WSI acquisitions.
+/// How long `exit` waits for the windows' workers to finish what they are
+/// doing on the GPU before letting the process's libraries finalize anyway.
+const EXIT_RETIRE_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Retire every window's workers when the process exits.
+///
+/// `exit` runs the Vulkan driver's destructors on the exiting thread, and a
+/// worker still waiting on one of the driver's fences then reads what they
+/// freed. Registered once a worker exists, so after the driver loaded: `exit`
+/// runs this before the driver's own handlers.
+fn retire_workers_at_exit() {
+    static HOOK: std::sync::Once = std::sync::Once::new();
+    HOOK.call_once(|| {
+        extern "C" fn at_exit() {
+            retire_all_workers(EXIT_RETIRE_TIMEOUT);
+        }
+        // SAFETY: a plain `extern "C"` function with no captures.
+        unsafe { libc::atexit(at_exit) };
+    });
+}
+
+/// Stop every window's workers, as [`forget_window`] does for one, waiting
+/// up to `timeout` in all for them to return.
+fn retire_all_workers(timeout: Duration) {
+    let entries: Vec<Arc<WindowSwapchain>> = SWAPCHAINS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_ref()
+        .map(|all| all.values().cloned().collect())
+        .unwrap_or_default();
+    let mut workers = Vec::new();
+    for entry in &entries {
+        entry.alive.store(false, Ordering::Release);
+        entry.wake.notify_all();
+        let worker = entry
+            .worker
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take();
+        let resize = entry
+            .resize_worker
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take();
+        workers.extend(worker.into_iter().chain(resize));
+    }
+    let deadline = Instant::now() + timeout;
+    for worker in workers {
+        worker.thread().unpark();
+        while !worker.is_finished() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        if worker.is_finished() {
+            let _ = worker.join();
+        }
+    }
+}
+
 fn ensure_layer_compositor_worker(window: usize, entry: &Arc<WindowSwapchain>) {
     if entry.worker_started.swap(true, Ordering::AcqRel) {
         return;
     }
+    retire_workers_at_exit();
     let worker_entry = Arc::clone(entry);
     let handle = std::thread::Builder::new()
         .name("rosemary-layer-present".into())

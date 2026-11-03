@@ -21,9 +21,9 @@ pub struct Image {
     cg_image: *const c_void,
     /// `-setTemplate:`. Only read back: nothing here tints an image.
     template: usize,
-    /// RGBA pixels for an image made with `-initWithSize:` and subsequently
-    /// locked for offscreen drawing.
-    focused_pixels: *mut Vec<u8>,
+    /// Nonzero once `-lockFocus` has drawn the image, whose pixels are then
+    /// `cg_image` whatever it was made from.
+    focus_drawn: usize,
     /// The copied `BOOL (^)(NSRect)` of `+imageWithSize:flipped:drawingHandler:`,
     /// run once, when the image's pixels are first wanted.
     handler: Id,
@@ -122,6 +122,9 @@ fn image_of<'a>(receiver: Id) -> &'a mut Image {
     unsafe { &mut *(receiver as *mut Image) }
 }
 
+/// `NSCompositingOperationCopy`.
+const COMPOSITE_COPY: usize = 1;
+
 thread_local! {
     /// Images locked for offscreen drawing, innermost last.
     static IMAGE_FOCUS: RefCell<Vec<usize>> = const { RefCell::new(Vec::new()) };
@@ -141,60 +144,120 @@ fn pixel_extent(size: NSSize) -> Option<(usize, usize)> {
     Some((width, height))
 }
 
-/// `-[NSImage lockFocus]`: make the receiver the destination for immediate
-/// offscreen drawing.
-unsafe extern "C" fn lock_focus(receiver: Id, _sel: Sel) {
+/// `-[NSImage lockFocusFlipped:]`: send drawing to the receiver's pixels,
+/// starting from what it already shows, until `-unlockFocus`.
+unsafe extern "C" fn lock_focus_flipped(receiver: Id, _sel: Sel, flipped: u8) {
     let image = image_of(receiver);
     let Some((width, height)) = pixel_extent(image.size) else {
         return;
     };
-    let len = width * height * 4;
-    if image.focused_pixels.is_null() {
-        image.focused_pixels = Box::into_raw(Box::new(vec![0; len]));
-    } else {
-        // SAFETY: this field is created only by this method and remains owned
-        // by the image.
-        unsafe { (*image.focused_pixels).resize(len, 0) };
+    let key = receiver as usize;
+    crate::backing::begin_offscreen(key, width as u32, height as u32, 1.0, flipped != 0);
+    IMAGE_FOCUS.with(|stack| stack.borrow_mut().push(key));
+    if has_content(image)
+        && let Some(cg_image) = cg_image_of(receiver)
+        && let Some((source_width, source_height, pixels)) = crate::graphics::image_bgra(cg_image)
+    {
+        let whole = NSRect {
+            origin: foundation::geometry::NSPoint::default(),
+            size: image.size,
+        };
+        crate::backing::draw_image(
+            &pixels,
+            source_width,
+            source_height,
+            image.size,
+            whole,
+            NSRect::default(),
+            COMPOSITE_COPY,
+            1.0,
+            true,
+        );
     }
-    IMAGE_FOCUS.with(|stack| stack.borrow_mut().push(receiver as usize));
 }
 
-/// `-[NSImage unlockFocus]`.
+/// `-[NSImage lockFocus]`: `-lockFocusFlipped:NO`.
+unsafe extern "C" fn lock_focus(receiver: Id, sel: Sel) {
+    // SAFETY: the same receiver and the unflipped flag.
+    unsafe { lock_focus_flipped(receiver, sel, 0) };
+}
+
+/// `-[NSImage unlockFocus]`: what was drawn becomes the image's pixels.
 unsafe extern "C" fn unlock_focus(receiver: Id, _sel: Sel) {
-    IMAGE_FOCUS.with(|stack| {
+    let key = receiver as usize;
+    let focused = IMAGE_FOCUS.with(|stack| {
         let mut stack = stack.borrow_mut();
-        if stack.last().copied() == Some(receiver as usize) {
+        let top = stack.last() == Some(&key);
+        if top {
             stack.pop();
         }
+        top
     });
+    if !focused {
+        return;
+    }
+    let Some(store) = crate::backing::end_offscreen(key) else {
+        return;
+    };
+    let mut pixels = store.pixels;
+    straighten(&mut pixels);
+    let image = image_of(receiver);
+    if !image.cg_image.is_null() {
+        // SAFETY: the reference the image held for its previous pixels.
+        unsafe { corefoundation::api::CFRelease(image.cg_image) };
+    }
+    image.cg_image = crate::graphics::image_from_bitmap(crate::raster::Bitmap {
+        width: store.width,
+        height: store.height,
+        pixels,
+    });
+    image.focus_drawn = 1;
 }
 
-/// Copy a rectangle from the currently focused image into an RGBA bitmap.
+/// Premultiplied B, G, R, A, as [`crate::backing`] draws, to the straight
+/// R, G, B, A a bitmap holds.
+fn straighten(pixels: &mut [u8]) {
+    for texel in pixels.as_chunks_mut::<4>().0 {
+        let [b, g, r, a] = *texel;
+        let straight = |c: u8| match a {
+            0 => 0,
+            a => ((u32::from(c) * 255 + u32::from(a) / 2) / u32::from(a)).min(255) as u8,
+        };
+        *texel = [straight(r), straight(g), straight(b), a];
+    }
+}
+
+/// Copy a rectangle of the image being drawn under `-lockFocus` into an RGBA
+/// bitmap; `rect` is in the focus's own coordinates.
 fn focused_bitmap(rect: NSRect) -> Option<crate::raster::Bitmap> {
-    let receiver = IMAGE_FOCUS.with(|stack| stack.borrow().last().copied())? as Id;
-    let image = image_of(receiver);
-    let (image_width, image_height) = pixel_extent(image.size)?;
-    // A focused-view rect uses integral device pixels for this one-scale
-    // offscreen image. Clamp it rather than reading outside a partially
-    // intersecting image.
-    let left = rect.origin.x.floor().max(0.0) as usize;
-    let bottom = rect.origin.y.floor().max(0.0) as usize;
-    let width = rect.size.width.ceil().max(0.0) as usize;
-    let height = rect.size.height.ceil().max(0.0) as usize;
-    let width = width.min(image_width.saturating_sub(left));
-    let height = height.min(image_height.saturating_sub(bottom));
-    if width == 0 || height == 0 || image.focused_pixels.is_null() {
+    let key = IMAGE_FOCUS.with(|stack| stack.borrow().last().copied())?;
+    let device = crate::backing::focused_device().filter(|device| device.key == key)?;
+    let (image_width, image_height, source) = crate::backing::offscreen_snapshot(key)?;
+    let [x0, y0] = device.to_pixels(rect.origin.x, rect.origin.y);
+    let [x1, y1] = device.to_pixels(
+        rect.origin.x + rect.size.width,
+        rect.origin.y + rect.size.height,
+    );
+    // Clamped rather than reading outside a partially intersecting image.
+    let clamp = |value: f64, limit: u32| value.max(0.0).min(f64::from(limit)) as usize;
+    let (left, right) = (
+        clamp(x0.min(x1).floor(), image_width),
+        clamp(x0.max(x1).ceil(), image_width),
+    );
+    let (top, bottom) = (
+        clamp(y0.min(y1).floor(), image_height),
+        clamp(y0.max(y1).ceil(), image_height),
+    );
+    let (width, height) = (right - left, bottom - top);
+    if width == 0 || height == 0 {
         return None;
     }
-    // SAFETY: allocated and sized for this image by `lock_focus`.
-    let source = unsafe { &*image.focused_pixels };
-    let mut pixels = vec![0; width.checked_mul(height)?.checked_mul(4)?];
-    for row in 0..height {
-        let source_row = image_height - bottom - height + row;
-        let from = (source_row * image_width + left) * 4;
-        let to = row * width * 4;
-        pixels[to..to + width * 4].copy_from_slice(&source[from..from + width * 4]);
+    let mut pixels = Vec::with_capacity(width * height * 4);
+    for row in top..bottom {
+        let from = (row * image_width as usize + left) * 4;
+        pixels.extend_from_slice(&source[from..from + width * 4]);
     }
+    straighten(&mut pixels);
     Some(crate::raster::Bitmap {
         width: width as u32,
         height: height as u32,
@@ -254,7 +317,7 @@ pub fn is_blank(object: Id) -> bool {
     image.data.is_null()
         && no_reps
         && image.cg_image.is_null()
-        && image.focused_pixels.is_null()
+        && image.focus_drawn == 0
         && image.handler.is_null()
 }
 
@@ -263,6 +326,16 @@ pub fn is_blank(object: Id) -> bool {
 pub fn bitmap(object: Id) -> Option<crate::raster::Bitmap> {
     if !is_image(object) {
         return None;
+    }
+    let image = image_of(object);
+    if image.focus_drawn != 0 {
+        let (width, height, mut pixels) = crate::graphics::image_bgra(image.cg_image)?;
+        straighten(&mut pixels);
+        return Some(crate::raster::Bitmap {
+            width: width as u32,
+            height: height as u32,
+            pixels,
+        });
     }
     let bytes = bytes_of(object);
     if bytes.starts_with(b"%PDF-") {
@@ -357,6 +430,20 @@ unsafe extern "C" fn cg_image_for_proposed_rect(
     }
     match cg_image_of(receiver) {
         Some(cg_image) => cg_image,
+        // SAFETY: `needs_pixels` reads only the receiver and selector.
+        None => unsafe { needs_pixels(receiver, sel) },
+    }
+}
+
+/// `-layerContentsForContentsScale:`: what a layer shows for the image - its
+/// one bitmap as the `CGImage` it holds, whatever scale is asked for, since
+/// there is no other representation to choose.
+unsafe extern "C" fn layer_contents_for_contents_scale(receiver: Id, sel: Sel, _scale: f64) -> Id {
+    if !has_content(image_of(receiver)) {
+        return std::ptr::null_mut();
+    }
+    match cg_image_of(receiver) {
+        Some(cg_image) => cg_image as Id,
         // SAFETY: `needs_pixels` reads only the receiver and selector.
         None => unsafe { needs_pixels(receiver, sel) },
     }
@@ -662,16 +749,8 @@ fn render_handler(receiver: Id) -> Option<crate::raster::Bitmap> {
         f(image.handler, rect);
     }
     let store = crate::backing::end_offscreen(key)?;
-    // Premultiplied B, G, R, A to the straight R, G, B, A a bitmap holds.
     let mut pixels = store.pixels;
-    for texel in pixels.as_chunks_mut::<4>().0 {
-        let [b, g, r, a] = *texel;
-        let straight = |c: u8| match a {
-            0 => 0,
-            a => ((u32::from(c) * 255 + u32::from(a) / 2) / u32::from(a)).min(255) as u8,
-        };
-        *texel = [straight(r), straight(g), straight(b), a];
-    }
+    straighten(&mut pixels);
     Some(crate::raster::Bitmap {
         width: store.width,
         height: store.height,
@@ -702,6 +781,7 @@ unsafe extern "C" fn copy_with_zone(receiver: Id, _sel: Sel, _zone: *mut c_void)
     to.reps = objc::arc::retain(from.reps);
     to.size = from.size;
     to.template = from.template;
+    to.focus_drawn = from.focus_drawn;
     let description = crate::props::object(receiver, "accessibilityDescription");
     if !description.is_null() {
         let key = objc::sel::get("accessibilityDescription") as *const c_void;
@@ -757,11 +837,6 @@ unsafe extern "C" fn dealloc(receiver: Id, _sel: Sel) {
         // SAFETY: the reference `-initWithCGImage:size:` took.
         unsafe { corefoundation::api::CFRelease(image.cg_image) };
         image.cg_image = std::ptr::null();
-    }
-    if !image.focused_pixels.is_null() {
-        // SAFETY: allocated by `lock_focus`, and the image owns it.
-        drop(unsafe { Box::from_raw(image.focused_pixels) });
-        image.focused_pixels = ptr::null_mut();
     }
     if !image.handler.is_null() {
         objc::block::release(image.handler);
@@ -1066,6 +1141,8 @@ pub(crate) fn install() {
     }
     methods!(class, {
         "lockFocus" => lock_focus, c"v16@0:8";
+        "lockFocusFlipped:" => lock_focus_flipped, c"v20@0:8c16";
+        "layerContentsForContentsScale:" => layer_contents_for_contents_scale, c"@24@0:8d16";
         "unlockFocus" => unlock_focus, c"v16@0:8";
         "drawInRect:" => draw_in_rect_plain, c"v48@0:8{CGRect={CGPoint=dd}{CGSize=dd}}16";
         "drawInRect:fromRect:operation:fraction:" => draw_in_rect,
@@ -1079,6 +1156,73 @@ pub(crate) fn install() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The alpha of each row of an image's pixels, top row first.
+    fn row_alphas(image: Id) -> Vec<u8> {
+        let bitmap = bitmap(image).expect("a focused image has pixels");
+        let row = bitmap.width as usize * 4;
+        bitmap.pixels.chunks(row).map(|r| r[3]).collect()
+    }
+
+    /// A layer showing an image drawn under focus gets that drawing, at the
+    /// image's size.
+    #[test]
+    fn a_focused_image_is_its_own_layer_contents() {
+        crate::bootstrap();
+        let image = empty(NSSize {
+            width: 6.0,
+            height: 3.0,
+        });
+        let sel = objc::sel::get("layerContentsForContentsScale:");
+        // SAFETY: a live image throughout.
+        unsafe {
+            assert!(
+                layer_contents_for_contents_scale(image, sel, 2.0).is_null(),
+                "nothing yet"
+            );
+            lock_focus(image, objc::sel::get("lockFocus"));
+            crate::color::NSRectFill(NSRect {
+                origin: foundation::geometry::NSPoint::default(),
+                size: NSSize {
+                    width: 6.0,
+                    height: 3.0,
+                },
+            });
+            unlock_focus(image, objc::sel::get("unlockFocus"));
+            let contents = layer_contents_for_contents_scale(image, sel, 2.0);
+            assert!(!contents.is_null());
+            assert_eq!(crate::graphics::CGImageGetWidth(contents as _), 6);
+            assert_eq!(crate::graphics::CGImageGetHeight(contents as _), 3);
+        }
+    }
+
+    /// A rectangle at y = 0 is the top row under a flipped focus and the
+    /// bottom row under an unflipped one, and stays drawn after the unlock.
+    #[test]
+    fn a_fill_at_the_origin_of_a_flipped_focus_lands_in_the_top_rows() {
+        crate::bootstrap();
+        let size = NSSize {
+            width: 4.0,
+            height: 4.0,
+        };
+        let first_row = NSRect {
+            origin: foundation::geometry::NSPoint::default(),
+            size: NSSize {
+                width: 4.0,
+                height: 1.0,
+            },
+        };
+        for (flipped, expected) in [(1, [255, 0, 0, 0]), (0, [0, 0, 0, 255])] {
+            let image = empty(size);
+            // SAFETY: a live image, focused for the fill and unlocked after.
+            unsafe {
+                lock_focus_flipped(image, objc::sel::get("lockFocusFlipped:"), flipped);
+                crate::color::NSRectFill(first_row);
+                unlock_focus(image, objc::sel::get("unlockFocus"));
+            }
+            assert_eq!(row_alphas(image), expected, "flipped = {flipped}");
+        }
+    }
 
     /// The two containers Deltarune actually hands over, measured from their
     /// headers - and the BMP is the one that matters, because the file is called

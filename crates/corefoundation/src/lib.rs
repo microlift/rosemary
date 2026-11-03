@@ -170,6 +170,7 @@ exports::exports! {
         "CFTimeZoneCopyDefault" => timezone::copy_default,
         "CFTimeZoneCopySystem" => timezone::copy_system,
         "CFTimeZoneCreateWithName" => timezone::create_with_name,
+        "CFTimeZoneCreateWithTimeIntervalFromGMT" => timezone::create_with_time_interval_from_gmt,
         "CFTimeZoneGetName" => timezone::get_name,
         "CFURLCreateFromFSRef" => api::CFURLCreateFromFSRef,
         "CFURLGetFSRef" => api::CFURLGetFSRef,

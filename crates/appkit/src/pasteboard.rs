@@ -9,7 +9,9 @@ use objc::sel::Sel;
 
 use crate::define::{class_methods, methods};
 
-const GENERAL: &str = "NSGeneralPboard";
+/// `NSGeneralPboard`'s value, so `+generalPasteboard` and
+/// `+pasteboardWithName:NSGeneralPboard` are one board, as on a Mac.
+const GENERAL: &str = "Apple CFPasteboard general";
 const STRING: &str = "public.utf8-plain-text";
 
 #[derive(Default)]
@@ -336,9 +338,17 @@ unsafe extern "C" fn types(receiver: Id, _sel: Sel) -> Id {
     strings(values)
 }
 
+/// `-changeCount`, which a program polls to notice another application's
+/// copy, so the general board takes in the desktop's first.
 unsafe extern "C" fn change_count(receiver: Id, _sel: Sel) -> isize {
     let mut all = boards().lock().unwrap_or_else(|e| e.into_inner());
-    board_mut(&mut all, receiver).map_or(0, |board| board.change_count)
+    let general = is_general(&all, receiver);
+    board_mut(&mut all, receiver).map_or(0, |board| {
+        if general {
+            sync_system_text(board);
+        }
+        board.change_count
+    })
 }
 
 fn clear(board: &mut Board) -> isize {
@@ -678,6 +688,60 @@ pub(crate) fn install() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `NSGeneralPboard` names the board `+generalPasteboard` answers.
+    #[test]
+    fn the_general_board_is_the_one_its_name_constant_names() {
+        if !sdl3::isolated::run_here_with_dummy_video() {
+            return;
+        }
+        crate::bootstrap();
+        let name = corefoundation::string::from_bytes(b"Apple CFPasteboard general", false) as Id;
+        // SAFETY: the two class methods' signatures.
+        let (general, by_name) = unsafe {
+            (
+                general_pasteboard(std::ptr::null_mut(), objc::sel::get("generalPasteboard")),
+                pasteboard_with_name(
+                    std::ptr::null_mut(),
+                    objc::sel::get("pasteboardWithName:"),
+                    name,
+                ),
+            )
+        };
+        assert_eq!(general, by_name);
+    }
+
+    /// Another application's copy shows in the general board's change count,
+    /// which is how a program polling it notices.
+    #[test]
+    fn change_count_notices_a_copy_made_elsewhere() {
+        if !sdl3::isolated::run_here_with_dummy_video() {
+            return;
+        }
+        crate::bootstrap();
+        // The desktop clipboard is the video subsystem's.
+        if !sdl3::may_pump() || !sdl3::video::init_video() {
+            return;
+        }
+        let sel = objc::sel::get("changeCount");
+        // SAFETY: `+generalPasteboard` is `id (Class, SEL)`.
+        let board = unsafe {
+            general_pasteboard(std::ptr::null_mut(), objc::sel::get("generalPasteboard"))
+        };
+        assert!(sdl3::clipboard::set_text(b"first copy elsewhere"));
+        // SAFETY: `-changeCount` on the general board.
+        let before = unsafe { change_count(board, sel) };
+        assert!(sdl3::clipboard::set_text(b"second copy elsewhere"));
+        let after = unsafe { change_count(board, sel) };
+        assert!(after > before, "{before} -> {after}");
+        let ty = corefoundation::string::from_bytes(STRING.as_bytes(), false) as Id;
+        // SAFETY: `-stringForType:` on the general board.
+        let read = unsafe { string_for_type(board, objc::sel::get("stringForType:"), ty) };
+        assert_eq!(
+            unsafe { foundation::string::bytes(read) },
+            b"second copy elsewhere"
+        );
+    }
 
     #[test]
     fn general_pasteboard_keeps_string_data_and_type_order() {

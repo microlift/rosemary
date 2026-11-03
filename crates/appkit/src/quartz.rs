@@ -198,16 +198,20 @@ pub(crate) fn frame_of(context: CFTypeRef) -> Option<Frame> {
     if ctx.focus {
         let device = crate::backing::focused_device()?;
         let d = device.density;
+        // The store holds the part of the view on screen, from `left`, `top`.
         let base = match device.flipped {
             true => CGAffineTransform {
                 a: d,
                 d,
+                tx: -device.left,
+                ty: -device.top,
                 ..IDENTITY
             },
             false => CGAffineTransform {
                 a: d,
                 d: -d,
-                ty: f64::from(device.height),
+                tx: -device.left,
+                ty: device.view_height - device.top,
                 ..IDENTITY
             },
         };

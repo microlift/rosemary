@@ -145,20 +145,26 @@ pub fn forward() -> *const c_void {
     }
 }
 
-/// The class and selector of a message nothing answers, as one line.
+/// The class and selector of a message nothing answers, as one line, with a
+/// class receiver called a class: a missing `+` method otherwise reads as a
+/// missing instance method.
 ///
 /// # Safety
 ///
 /// `receiver` is null or a live object.
-unsafe fn describe_unrecognised(receiver: Id, sel: Sel) -> String {
+pub(crate) unsafe fn describe_unrecognised(receiver: Id, sel: Sel) -> String {
     let class = unsafe { crate::object::class_of(receiver) };
     let name = class.map_or("nil", |c| c.name_str());
+    let kind = match class.is_some_and(|c| c.is_meta()) {
+        true => "class",
+        false => "instance of",
+    };
     let selector = match sel.is_null() {
         true => std::borrow::Cow::Borrowed("<null selector>"),
         // SAFETY: a registered selector is a NUL-terminated interned name.
         false => unsafe { std::ffi::CStr::from_ptr(sel) }.to_string_lossy(),
     };
-    format!("unrecognized selector sent to instance of {name}: {selector}")
+    format!("unrecognized selector sent to {kind} {name}: {selector}")
 }
 
 /// `ROSEMARY_LOG_UNRECOGNIZED=1`: report each unanswered message once and answer
@@ -851,4 +857,34 @@ unsafe extern "C" fn forward_to_first_word() {
         "b {send}",
         send = sym msg_send,
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A missing `+` method names the class as the receiver, not an instance.
+    #[test]
+    fn unrecognised_names_a_class_receiver_as_a_class() {
+        crate::bootstrap();
+        let nsobject = crate::class::lookup(c"NSObject").expect("NSObject");
+        let sel = crate::sel::get("noSuchMessage");
+        let instance = crate::object::create_instance(nsobject, 0);
+        let class = crate::class::ptr(nsobject) as Id;
+        // SAFETY: a live instance and a registered class.
+        let (to_instance, to_class) = unsafe {
+            (
+                describe_unrecognised(instance, sel),
+                describe_unrecognised(class, sel),
+            )
+        };
+        assert_eq!(
+            to_instance,
+            "unrecognized selector sent to instance of NSObject: noSuchMessage"
+        );
+        assert_eq!(
+            to_class,
+            "unrecognized selector sent to class NSObject: noSuchMessage"
+        );
+    }
 }

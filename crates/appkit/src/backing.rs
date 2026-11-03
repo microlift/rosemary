@@ -18,6 +18,9 @@ pub struct Store {
     instance: u64,
     pub width: u32,
     pub height: u32,
+    /// Where the store's top-left pixel is in the view it holds: a view's
+    /// store covers only the part of it on screen. Zero for every other store.
+    pub origin: (i64, i64),
     /// Premultiplied B, G, R, A, top row first.
     pub pixels: Vec<u8>,
     dirty: bool,
@@ -48,6 +51,7 @@ impl Store {
             instance: NEXT_STORE_ID.fetch_add(1, Ordering::Relaxed),
             width,
             height,
+            origin: (0, 0),
             pixels: vec![0; width as usize * height as usize * 4],
             dirty: false,
             generation: 0,
@@ -93,7 +97,8 @@ impl Store {
     }
 
     /// Only consecutive producer-verified versions authorize localized
-    /// work. Preserve disjoint rectangles: unioning six 1px changes at
+    /// work. Answered in the coordinates of what the store holds, which for a
+    /// view's store is the view. Preserve disjoint rectangles: unioning six 1px changes at
     /// distant 6K positions would needlessly dirty megabytes of pixels.
     fn damage_regions_since(&self, generation: u64) -> Option<Vec<Rect>> {
         if generation >= self.generation {
@@ -109,7 +114,11 @@ impl Store {
                 return None;
             }
             if !rect.is_empty() {
-                regions.push(rect);
+                regions.push(Rect {
+                    x: rect.x + self.origin.0,
+                    y: rect.y + self.origin.1,
+                    ..rect
+                });
             }
             expected = expected.checked_add(1)?;
         }
@@ -176,6 +185,7 @@ impl Store {
             instance: NEXT_STORE_ID.fetch_add(1, Ordering::Relaxed),
             width,
             height,
+            origin: self.origin,
             pixels,
             dirty: true,
             generation: self.generation.wrapping_add(1),
@@ -1169,11 +1179,18 @@ pub fn set_presenter(presenter: Presenter) {
 struct Focus {
     view: Id,
     window: sdl3::Window,
-    /// The view's top-left corner in window pixels, and its size in pixels.
+    /// The part of the view its store covers - the part on screen - in
+    /// window pixels: its top-left corner and its size.
     x: f64,
     y: f64,
     width: f64,
     height: f64,
+    /// Where that part starts in the view, in pixels from its top left, and
+    /// the whole view's height in pixels, which an unflipped view counts
+    /// up from.
+    left: f64,
+    top: f64,
+    view_height: f64,
     /// Window pixels per point.
     density: f64,
     flipped: bool,
@@ -1208,6 +1225,9 @@ pub(crate) fn begin_offscreen(key: usize, width: u32, height: u32, density: f64,
             y: 0.0,
             width: f64::from(width.max(1)),
             height: f64::from(height.max(1)),
+            left: 0.0,
+            top: 0.0,
+            view_height: f64::from(height.max(1)),
             density: if density > 0.0 { density } else { 1.0 },
             flipped,
             offscreen: true,
@@ -1236,6 +1256,14 @@ pub(crate) fn end_offscreen(key: usize) -> Option<Store> {
         .remove(&key)
 }
 
+/// A copy of the premultiplied B, G, R, A pixels drawn so far into the image
+/// [`begin_offscreen`] started under `key`, as `(width, height, pixels)`.
+pub(crate) fn offscreen_snapshot(key: usize) -> Option<(u32, u32, Vec<u8>)> {
+    let stores = OFFSCREEN.lock().unwrap_or_else(|e| e.into_inner());
+    let store = stores.as_ref()?.get(&key)?;
+    Some((store.width, store.height, store.pixels.clone()))
+}
+
 fn focus_on(view: Id) -> Option<Focus> {
     // SAFETY: null or an object this runtime allocated.
     let frame = unsafe { crate::view::presentation_frame(view) }?;
@@ -1244,13 +1272,18 @@ fn focus_on(view: Id) -> Option<Focus> {
         true => f64::from(frame.window_width) / f64::from(points),
         false => 1.0,
     };
+    // SAFETY: as above, and `frame` is the view's.
+    let visible = unsafe { crate::view::presentation_visible(view, &frame) };
     Some(Focus {
         view,
         window: frame.window,
-        x: f64::from(frame.x),
-        y: f64::from(frame.y),
-        width: f64::from(frame.width),
-        height: f64::from(frame.height),
+        x: f64::from(visible.x),
+        y: f64::from(visible.y),
+        width: f64::from(visible.w),
+        height: f64::from(visible.h),
+        left: f64::from(visible.x - frame.x),
+        top: f64::from(visible.y - frame.y),
+        view_height: f64::from(frame.height),
         density: if density > 0.0 { density } else { 1.0 },
         flipped: crate::view::is_flipped(view),
         offscreen: false,
@@ -1279,6 +1312,62 @@ fn current_focus() -> Option<Focus> {
     FOCUS.with(|stack| stack.borrow().last().copied())
 }
 
+impl Focus {
+    /// The store's top-left pixel in the view.
+    fn origin(&self) -> (i64, i64) {
+        (self.left as i64, self.top as i64)
+    }
+
+    /// The rectangle of the view, in its own points, that `area` - a
+    /// rectangle of the store's pixels - shows.
+    fn points_of(&self, area: Rect) -> NSRect {
+        let top = area.y as f64 + self.top;
+        let y = match self.flipped {
+            true => top,
+            false => self.view_height - (top + area.height as f64),
+        };
+        NSRect {
+            origin: NSPoint {
+                x: (area.x as f64 + self.left) / self.density,
+                y: y / self.density,
+            },
+            size: NSSize {
+                width: area.width as f64 / self.density,
+                height: area.height as f64 / self.density,
+            },
+        }
+    }
+
+    /// What `-drawRect:` is asked to draw: the requested region, or all of
+    /// the part on screen.
+    fn drawn_rect(&self) -> NSRect {
+        self.points_of(self.clip.unwrap_or(Rect {
+            x: 0,
+            y: 0,
+            width: self.width as i64,
+            height: self.height as i64,
+        }))
+    }
+}
+
+/// The focused view's store in `stores`, made or resized to the part of the
+/// view on screen. A store whose part moved holds pixels of somewhere else,
+/// so it starts over.
+fn focused_store<'a>(stores: &'a mut HashMap<usize, Store>, focus: &Focus) -> &'a mut Store {
+    let (width, height) = (focus.width.max(1.0) as u32, focus.height.max(1.0) as u32);
+    let origin = focus.origin();
+    let store = stores
+        .entry(focus.view as usize)
+        .or_insert_with(|| Store::new(width, height));
+    if store.origin != origin {
+        *store = Store::new(width, height);
+        store.origin = origin;
+        store.touch();
+    }
+    store.resize(width, height);
+    store
+}
+
 /// What vector drawing needs to know about the focused view: where its pixels
 /// are, and which focus it is.
 #[derive(Clone, Copy, PartialEq)]
@@ -1287,20 +1376,26 @@ pub(crate) struct Device {
     /// which together tell one `-drawRect:` from the next.
     pub key: usize,
     pub depth: usize,
+    /// The store's size: the part of the view on screen.
     pub width: u32,
     pub height: u32,
+    /// Where that part starts in the view, and the view's whole height, in
+    /// pixels.
+    pub left: f64,
+    pub top: f64,
+    pub view_height: f64,
     pub density: f64,
     pub flipped: bool,
 }
 
 impl Device {
-    /// A point in the view's coordinates, in pixels from its top left.
+    /// A point in the view's coordinates, in pixels from the store's top left.
     pub fn to_pixels(self, x: f64, y: f64) -> [f64; 2] {
         let y = match self.flipped {
             true => y * self.density,
-            false => f64::from(self.height) - y * self.density,
+            false => self.view_height - y * self.density,
         };
-        [x * self.density, y]
+        [x * self.density - self.left, y - self.top]
     }
 }
 
@@ -1313,6 +1408,9 @@ pub(crate) fn focused_device() -> Option<Device> {
             depth: stack.len(),
             width: focus.width.max(1.0) as u32,
             height: focus.height.max(1.0) as u32,
+            left: focus.left,
+            top: focus.top,
+            view_height: focus.view_height,
             density: focus.density,
             flipped: focus.flipped,
         })
@@ -1328,7 +1426,6 @@ pub(crate) fn paint_coverage(left: i64, top: i64, width: usize, coverage: &[f32]
     if width == 0 || coverage.is_empty() {
         return;
     }
-    let (store_width, store_height) = (focus.width.max(1.0) as u32, focus.height.max(1.0) as u32);
     let [red, green, blue, alpha] = color.map(|c| c.clamp(0.0, 1.0));
     let drawn = {
         let stores = match focus.offscreen {
@@ -1336,11 +1433,7 @@ pub(crate) fn paint_coverage(left: i64, top: i64, width: usize, coverage: &[f32]
             false => &VIEW_STORES,
         };
         let mut stores = stores.lock().unwrap_or_else(|e| e.into_inner());
-        let store = stores
-            .get_or_insert_with(HashMap::new)
-            .entry(focus.view as usize)
-            .or_insert_with(|| Store::new(store_width, store_height));
-        store.resize(store_width, store_height);
+        let store = focused_store(stores.get_or_insert_with(HashMap::new), &focus);
         let rows = coverage.len() / width;
         let clip = focus.clip.unwrap_or(Rect {
             x: 0,
@@ -1441,18 +1534,13 @@ pub(crate) fn draw_image(
         return;
     };
     let destination = crate::bezier::transform_rect(destination);
-    let (width, height) = (focus.width.max(1.0) as u32, focus.height.max(1.0) as u32);
     let drawn = {
         let stores = match focus.offscreen {
             true => &OFFSCREEN,
             false => &VIEW_STORES,
         };
         let mut stores = stores.lock().unwrap_or_else(|e| e.into_inner());
-        let store = stores
-            .get_or_insert_with(HashMap::new)
-            .entry(focus.view as usize)
-            .or_insert_with(|| Store::new(width, height));
-        store.resize(width, height);
+        let store = focused_store(stores.get_or_insert_with(HashMap::new), &focus);
         draw_into(
             store,
             source,
@@ -1493,11 +1581,7 @@ pub(crate) fn draw_focused(draw: impl FnOnce(&mut [u8], u32, u32) -> Option<Rect
             false => &VIEW_STORES,
         };
         let mut stores = stores.lock().unwrap_or_else(|e| e.into_inner());
-        let store = stores
-            .get_or_insert_with(HashMap::new)
-            .entry(focus.view as usize)
-            .or_insert_with(|| Store::new(width, height));
-        store.resize(width, height);
+        let store = focused_store(stores.get_or_insert_with(HashMap::new), &focus);
         let drawn = draw(&mut store.pixels, store.width, store.height);
         if let Some(area) = drawn.filter(|r| !r.is_empty()) {
             if focus.clip.is_some() {
@@ -1574,13 +1658,13 @@ fn draw_into(
     let source_w = from.size.width * scale_x;
     let source_h = from.size.height * scale_y;
 
-    let view_height = f64::from(store.height) / focus.density;
+    let view_height = focus.view_height / focus.density;
     let top = match focus.flipped {
         true => destination.origin.y,
         false => view_height - (destination.origin.y + destination.size.height),
     };
-    let left = destination.origin.x * focus.density;
-    let top = top * focus.density;
+    let left = destination.origin.x * focus.density - focus.left;
+    let top = top * focus.density - focus.top;
     let width = destination.size.width * focus.density;
     let height = destination.size.height * focus.density;
     if width <= 0.0 || height <= 0.0 {
@@ -1710,17 +1794,17 @@ fn focus_dirty_pixels(focus: Focus, requested: NSRect) -> Option<Rect> {
         requested.size.width,
         requested.size.height,
     ];
-    let left = (x * focus.density).floor();
-    let right = ((x + w) * focus.density).ceil();
+    let left = (x * focus.density - focus.left).floor();
+    let right = ((x + w) * focus.density - focus.left).ceil();
     let top = if focus.flipped {
-        (y * focus.density).floor()
+        (y * focus.density - focus.top).floor()
     } else {
-        (focus.height - (y + h) * focus.density).floor()
+        (focus.view_height - (y + h) * focus.density - focus.top).floor()
     };
     let bottom = if focus.flipped {
-        ((y + h) * focus.density).ceil()
+        ((y + h) * focus.density - focus.top).ceil()
     } else {
-        (focus.height - y * focus.density).ceil()
+        (focus.view_height - y * focus.density - focus.top).ceil()
     };
     if ![left, right, top, bottom].iter().all(|v| v.is_finite()) {
         return None;
@@ -1919,6 +2003,22 @@ pub(crate) fn display_view(view: Id) {
     if !responds || !push_focus(view) {
         return;
     }
+    let on_screen = current_focus().is_some_and(|focus| focus.width >= 1.0 && focus.height >= 1.0);
+    if !on_screen {
+        // Nothing of it shows, so AppKit asks it to draw nothing. The empty
+        // store records that, for `redisplay_moved` to notice it showing.
+        if let Some(focus) = current_focus() {
+            let mut store = Store::new(0, 0);
+            store.origin = focus.origin();
+            VIEW_STORES
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .get_or_insert_with(HashMap::new)
+                .insert(view as usize, store);
+        }
+        pop_focus();
+        return;
+    }
     FOCUS.with(|stack| {
         let mut stack = stack.borrow_mut();
         let focus = stack.last_mut().unwrap();
@@ -1929,7 +2029,9 @@ pub(crate) fn display_view(view: Id) {
                 .as_ref()
                 .and_then(|stores| stores.get(&(view as usize)))
                 .is_some_and(|store| {
-                    store.width == focus.width as u32 && store.height == focus.height as u32
+                    store.width == focus.width as u32
+                        && store.height == focus.height as u32
+                        && store.origin == focus.origin()
                 });
             if has_base {
                 focus.clip = focus_dirty_pixels(*focus, requested);
@@ -1937,29 +2039,7 @@ pub(crate) fn display_view(view: Id) {
         }
     });
     clear_focused_store();
-    let bounds = current_focus().map_or(NSRect::default(), |focus| {
-        let area = focus.clip.unwrap_or(Rect {
-            x: 0,
-            y: 0,
-            width: focus.width as i64,
-            height: focus.height as i64,
-        });
-        let origin_y = if focus.flipped {
-            area.y as f64 / focus.density
-        } else {
-            (focus.height - (area.y + area.height) as f64) / focus.density
-        };
-        NSRect {
-            size: NSSize {
-                width: area.width as f64 / focus.density,
-                height: area.height as f64 / focus.density,
-            },
-            origin: NSPoint {
-                x: area.x as f64 / focus.density,
-                y: origin_y,
-            },
-        }
-    });
+    let bounds = current_focus().map_or(NSRect::default(), |focus| focus.drawn_rect());
     // SAFETY: `-drawRect:` is `void (id, SEL, NSRect)`.
     unsafe {
         let send: unsafe extern "C" fn(Id, Sel, NSRect) = std::mem::transmute(objc::msg::entry());
@@ -1979,7 +2059,8 @@ fn clear_focused_store() {
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .as_mut()
-        .and_then(|stores| stores.get_mut(&(focus.view as usize)))
+        .filter(|stores| stores.contains_key(&(focus.view as usize)))
+        .map(|stores| focused_store(stores, &focus))
         .map(|store| {
             let area = focus.clip.unwrap_or(Rect {
                 x: 0,
@@ -2063,6 +2144,7 @@ pub fn pump() {
             needs_display_in_tree(crate::window::content_view_of(window), 0);
         }
     }
+    redisplay_moved();
     let pending = std::mem::take(&mut *NEEDS_DISPLAY.lock().unwrap_or_else(|e| e.into_inner()));
     let count = pending.len();
     let depth = {
@@ -2089,6 +2171,43 @@ pub fn pump() {
         }
     }
     present_dirty();
+}
+
+/// Mark for display each view whose store no longer holds the part of it on
+/// screen: scrolling, or a move, showed another part, which it has not drawn.
+fn redisplay_moved() {
+    let held: Vec<(usize, (i64, i64), (u32, u32))> = VIEW_STORES
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_ref()
+        .map(|stores| {
+            stores
+                .iter()
+                .map(|(view, store)| (*view, store.origin, (store.width, store.height)))
+                .collect()
+        })
+        .unwrap_or_default();
+    for (view, origin, size) in held {
+        let view = view as Id;
+        // SAFETY: a view whose store this crate holds, so a live one.
+        let window = unsafe { crate::view::window_of(view) };
+        if !crate::window::is_shown(window) || crate::view::is_hidden_or_has_hidden_ancestor(view) {
+            continue;
+        }
+        // SAFETY: as above.
+        let Some(frame) = (unsafe { crate::view::presentation_frame(view) }) else {
+            continue;
+        };
+        // SAFETY: as above, and `frame` is the view's.
+        let visible = unsafe { crate::view::presentation_visible(view, &frame) };
+        let now = (
+            i64::from(visible.x - frame.x),
+            i64::from(visible.y - frame.y),
+        );
+        if (now, (visible.w as u32, visible.h as u32)) != (origin, size) {
+            needs_display(view);
+        }
+    }
 }
 
 /// Views whose layer trees were still animating when last composed, by window.
@@ -2207,6 +2326,20 @@ fn place_tree(window: Id, sdl: sdl3::Window) -> Vec<Placed> {
     out
 }
 
+/// Window pixels per point where `view` would draw.
+#[cfg(test)]
+pub(crate) fn focus_density_of_for_tests(view: Id) -> f64 {
+    focus_on(view).map_or(1.0, |focus| focus.density)
+}
+
+/// Where a view's store starts in the view, and its size, in pixels.
+#[cfg(test)]
+pub(crate) fn view_store_geometry_for_tests(view: Id) -> Option<((i64, i64), (u32, u32))> {
+    let stores = VIEW_STORES.lock().unwrap_or_else(|e| e.into_inner());
+    let store = stores.as_ref()?.get(&(view as usize))?;
+    Some((store.origin, (store.width, store.height)))
+}
+
 #[cfg(test)]
 pub(crate) fn placed_rect_for_tests(window: Id, view: Id) -> Option<Rect> {
     let sdl = unsafe { crate::window::sdl_window(window) };
@@ -2318,9 +2451,13 @@ fn opaque_views(placed: &[Placed]) -> Vec<usize> {
         })
         .filter(|p| {
             stores.get(&(p.view as usize)).is_some_and(|store| {
-                i64::from(store.width) >= p.rect.width
-                    && i64::from(store.height) >= p.rect.height
-                    && store.fully_opaque()
+                let held = Rect {
+                    x: p.rect.x + store.origin.0,
+                    y: p.rect.y + store.origin.1,
+                    width: i64::from(store.width),
+                    height: i64::from(store.height),
+                };
+                held.intersection(&p.clip) == p.clip && store.fully_opaque()
             })
         })
         .map(|p| p.view as usize)
@@ -2708,6 +2845,7 @@ fn native_scene_pixels_impl(
             instance: NEXT_STORE_ID.fetch_add(1, Ordering::Relaxed),
             width: crop.width as u32,
             height: crop.height as u32,
+            origin: (0, 0),
             pixels,
             dirty: false,
             generation: 0,
@@ -3522,6 +3660,8 @@ fn blend_at(store: &mut Store, source: &Store, left: i64, top: i64, clip: Rect, 
     // 256 is exact: a scaled channel is then `texel * scale >> 8` with no
     // rounding error at full opacity.
     let scale = (opacity.min(1.0) * 256.0).round() as u32;
+    // A view's store holds only the part of the view on screen.
+    let (left, top) = (left + source.origin.0, top + source.origin.1);
     let source_rect = Rect {
         x: left,
         y: top,
@@ -4124,6 +4264,7 @@ fn compose(window: sdl3::Window, store: &Store) -> (Option<Store>, Vec<GpuOverla
             instance: NEXT_STORE_ID.fetch_add(1, Ordering::Relaxed),
             width: store.width,
             height: store.height,
+            origin: store.origin,
             pixels: store.pixels.clone(),
             dirty: false,
             // An overlay that changes damages the store under it.
@@ -4323,28 +4464,7 @@ unsafe extern "C" fn get_rects_being_drawn(
     }
     let rect = current_focus()
         .filter(|focus| focus.view == receiver)
-        .map(|focus| {
-            let area = focus.clip.unwrap_or(Rect {
-                x: 0,
-                y: 0,
-                width: focus.width as i64,
-                height: focus.height as i64,
-            });
-            NSRect {
-                origin: NSPoint {
-                    x: area.x as f64 / focus.density,
-                    y: if focus.flipped {
-                        area.y as f64 / focus.density
-                    } else {
-                        (focus.height - (area.y + area.height) as f64) / focus.density
-                    },
-                },
-                size: NSSize {
-                    width: area.width as f64 / focus.density,
-                    height: area.height as f64 / focus.density,
-                },
-            }
-        })
+        .map(|focus| focus.drawn_rect())
         .unwrap_or_default();
     DRAWN.with(|drawn| {
         *drawn.borrow_mut() = rect;
@@ -6325,6 +6445,7 @@ mod tests {
             instance: NEXT_STORE_ID.fetch_add(1, Ordering::Relaxed),
             width,
             height,
+            origin: (0, 0),
             pixels: vec![0; width as usize * height as usize * 4],
             dirty: false,
             generation: 0,
@@ -6398,6 +6519,9 @@ mod tests {
             y: 0.0,
             width: 1.0,
             height: 2.0,
+            left: 0.0,
+            top: 0.0,
+            view_height: 2.0,
             density: 1.0,
             flipped: true,
             offscreen: false,
@@ -6628,6 +6752,9 @@ mod tests {
             y: 0.0,
             width: 1.0,
             height: 1.0,
+            left: 0.0,
+            top: 0.0,
+            view_height: 1.0,
             density: 1.0,
             flipped: true,
             offscreen: false,

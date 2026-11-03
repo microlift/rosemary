@@ -106,6 +106,22 @@ unsafe extern "C" fn time_zone_with_name(_class: Id, _sel: Sel, name: Id) -> Id 
     }
 }
 
+/// `+[NSTimeZone timeZoneForSecondsFromGMT:]`: a fixed-offset zone named
+/// `GMT+HHMM`, autoreleased, or nil beyond +-18 hours.
+unsafe extern "C" fn time_zone_for_seconds_from_gmt(_class: Id, _sel: Sel, seconds: isize) -> Id {
+    // SAFETY: `create_with_time_interval_from_gmt` answers NULL or a new reference.
+    unsafe {
+        let zone = corefoundation::timezone::create_with_time_interval_from_gmt(
+            std::ptr::null(),
+            seconds as f64,
+        );
+        match zone.is_null() {
+            true => std::ptr::null_mut(),
+            false => corefoundation::api::CFAutorelease(zone) as Id,
+        }
+    }
+}
+
 /// `+[NSTimeZone timeZoneWithAbbreviation:]`: nil unless the abbreviation is
 /// in the default dictionary, as on a Mac.
 unsafe extern "C" fn time_zone_with_abbreviation(_class: Id, sel: Sel, abbreviation: Id) -> Id {
@@ -245,6 +261,7 @@ pub(crate) fn install() {
         "knownTimeZoneNames" => known_time_zone_names, c"@16@0:8";
         "timeZoneWithName:" => time_zone_with_name, c"@24@0:8@16";
         "timeZoneWithAbbreviation:" => time_zone_with_abbreviation, c"@24@0:8@16";
+        "timeZoneForSecondsFromGMT:" => time_zone_for_seconds_from_gmt, c"@24@0:8q16";
     });
     methods!(class, {
         "name" => name, c"@16@0:8";
@@ -343,6 +360,44 @@ mod tests {
             // SAFETY: as above.
             let zone = unsafe { time_zone_with_name(std::ptr::null_mut(), sel, text) };
             assert!(zone.is_null(), "{bogus:?} resolved");
+        }
+    }
+
+    /// A fixed offset is a zone named for it, which resolves by that name again,
+    /// and an offset past 18 hours is nil.
+    #[test]
+    fn a_zone_is_made_for_a_fixed_offset() {
+        crate::bootstrap();
+        let sel = objc::sel::get("timeZoneForSecondsFromGMT:");
+        let cases: [(isize, &[u8]); 5] = [
+            (0, b"GMT"),
+            (5400, b"GMT+0130"),
+            (-18000, b"GMT-0500"),
+            (3723, b"GMT+010203"),
+            (18 * 3600, b"GMT+1800"),
+        ];
+        for (seconds, expected) in cases {
+            // SAFETY: `+timeZoneForSecondsFromGMT:` is `id (Class, SEL, NSInteger)`.
+            let zone =
+                unsafe { time_zone_for_seconds_from_gmt(std::ptr::null_mut(), sel, seconds) };
+            assert!(!zone.is_null(), "{seconds} made no zone");
+            // SAFETY: the zone made just above.
+            unsafe {
+                let named = name(zone, objc::sel::get("name"));
+                assert_eq!(crate::string::bytes(named), expected);
+                assert_eq!(
+                    seconds_from_gmt(zone, objc::sel::get("secondsFromGMT")),
+                    seconds
+                );
+                let again = time_zone_with_name(std::ptr::null_mut(), sel, named);
+                assert!(!again.is_null(), "{seconds}: its own name does not resolve");
+            }
+        }
+        for seconds in [18 * 3600 + 1, -18 * 3600 - 60] {
+            // SAFETY: as above.
+            let zone =
+                unsafe { time_zone_for_seconds_from_gmt(std::ptr::null_mut(), sel, seconds) };
+            assert!(zone.is_null(), "{seconds} made a zone");
         }
     }
 

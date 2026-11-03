@@ -716,6 +716,8 @@ pub const STRING_GLOBALS: &[(&str, &str)] = &[
     // The drag pasteboard's name, which is Apple's string and not the symbol's:
     // a program naming the board by hand has to name the same one.
     ("_NSPasteboardNameDrag", "Apple CFPasteboard drag"),
+    ("_NSPasteboardNameGeneral", "Apple CFPasteboard general"),
+    ("_NSPasteboardNameFind", "Apple CFPasteboard find"),
     // Attributed-string attribute names. Each is shorter than its symbol, as
     // `NSForegroundColorAttributeName` above already is.
     ("_NSUnderlineStyleAttributeName", "NSUnderline"),

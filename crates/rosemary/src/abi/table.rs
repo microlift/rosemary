@@ -660,6 +660,7 @@ pub static SIGNATURES: &[FunctionAbi] = &[
     sig!("CFTimeZoneCopyDefault", P),
     sig!("CFTimeZoneCopySystem", P),
     sig!("CFTimeZoneCreateWithName", P, P, P, U8),
+    sig!("CFTimeZoneCreateWithTimeIntervalFromGMT", P, P, F64),
     sig!("CFTimeZoneGetName", P, P),
     sig!("CFStringGetCString", BOOL, P, P, I64, U32),
     sig!("CFStringGetCStringPtr", P, P, U32),

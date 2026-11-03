@@ -501,15 +501,9 @@ fn protocol_of(protocol: Id) -> Option<&'static crate::protocol::Protocol> {
 }
 
 unsafe extern "C" fn does_not_recognize(receiver: Id, _sel: Sel, selector: Sel) {
-    // SAFETY: an instance.
-    let class = unsafe { crate::object::class_of(receiver) };
-    let name = class.map_or("nil", |c| c.name_str());
-    let selector = match selector.is_null() {
-        true => std::borrow::Cow::Borrowed("<null selector>"),
-        // SAFETY: a registered selector is its own NUL-terminated name.
-        false => unsafe { CStr::from_ptr(selector) }.to_string_lossy(),
-    };
-    crate::fail!("unrecognized selector sent to instance of {name}: {selector}");
+    // SAFETY: the receiver of a message, so a live object.
+    let line = unsafe { crate::msg::describe_unrecognised(receiver, selector) };
+    crate::fail!("{line}");
 }
 
 /// `-copy` is `[self copyWithZone:nil]`, sent rather than looked up here.

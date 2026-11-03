@@ -112,6 +112,25 @@ impl Elements {
         self.close();
     }
 
+    /// A rectangle whose corners are quarter ellipses `cw` wide and `ch` tall,
+    /// counterclockwise from the middle of its right edge. A zero radius is a
+    /// square corner.
+    pub fn rounded_rect(&mut self, m: CGAffineTransform, r: NSRect, cw: f64, ch: f64) {
+        let (x0, y0) = (r.origin.x, r.origin.y);
+        let (x1, y1) = (x0 + r.size.width, y0 + r.size.height);
+        let (kx, ky) = (cw * KAPPA, ch * KAPPA);
+        self.move_to(m, x1, y0 + r.size.height / 2.0);
+        self.line_to(m, x1, y1 - ch);
+        self.cubic_to(m, x1, y1 - ch + ky, x1 - cw + kx, y1, x1 - cw, y1);
+        self.line_to(m, x0 + cw, y1);
+        self.cubic_to(m, x0 + cw - kx, y1, x0, y1 - ch + ky, x0, y1 - ch);
+        self.line_to(m, x0, y0 + ch);
+        self.cubic_to(m, x0, y0 + ch - ky, x0 + cw - kx, y0, x0 + cw, y0);
+        self.line_to(m, x1 - cw, y0);
+        self.cubic_to(m, x1 - cw + kx, y0, x1, y0 + ch - ky, x1, y0 + ch);
+        self.close();
+    }
+
     pub fn ellipse(&mut self, m: CGAffineTransform, r: NSRect) {
         let (cx, cy) = (
             r.origin.x + r.size.width / 2.0,
@@ -464,6 +483,61 @@ pub unsafe extern "C" fn CGPathCreateWithEllipseInRect(
     new_path(out)
 }
 
+/// `rect` with its size made positive, as `CGRectStandardize` does.
+fn standardized(rect: NSRect) -> NSRect {
+    let (w, h) = (rect.size.width, rect.size.height);
+    NSRect {
+        origin: NSPoint {
+            x: rect.origin.x + w.min(0.0),
+            y: rect.origin.y + h.min(0.0),
+        },
+        size: NSSize {
+            width: w.abs(),
+            height: h.abs(),
+        },
+    }
+}
+
+/// Add a rounded rectangle, refusing the corner sizes Quartz asserts on: a
+/// negative one, or one more than half the side it rounds.
+fn add_rounded_rect(out: &mut Elements, m: CGAffineTransform, rect: NSRect, cw: f64, ch: f64) {
+    let rect = standardized(rect);
+    if !(0.0..=rect.size.width / 2.0).contains(&cw) || !(0.0..=rect.size.height / 2.0).contains(&ch)
+    {
+        objc::fail!(
+            "CGPathAddRoundedRect: corner {cw}x{ch} does not fit {}x{}",
+            rect.size.width,
+            rect.size.height
+        );
+    }
+    out.rounded_rect(m, rect, cw, ch);
+}
+
+/// `CGPathRef CGPathCreateWithRoundedRect(CGRect, CGFloat, CGFloat, const CGAffineTransform *)`
+pub unsafe extern "C" fn CGPathCreateWithRoundedRect(
+    rect: NSRect,
+    corner_width: f64,
+    corner_height: f64,
+    m: *const CGAffineTransform,
+) -> CFTypeRef {
+    let mut out = Elements::default();
+    add_rounded_rect(&mut out, transform(m), rect, corner_width, corner_height);
+    new_path(out)
+}
+
+/// `void CGPathAddRoundedRect(CGMutablePathRef, const CGAffineTransform *, CGRect, CGFloat, CGFloat)`
+pub unsafe extern "C" fn CGPathAddRoundedRect(
+    path: CFTypeRef,
+    m: *const CGAffineTransform,
+    rect: NSRect,
+    corner_width: f64,
+    corner_height: f64,
+) {
+    if let Some(e) = elements_of(path) {
+        add_rounded_rect(e, transform(m), rect, corner_width, corner_height);
+    }
+}
+
 pub unsafe extern "C" fn CGPathRetain(path: CFTypeRef) -> CFTypeRef {
     if !path.is_null() {
         // SAFETY: a path the caller holds.
@@ -754,6 +828,8 @@ exports::exports! {
         "CGPathCreateCopyByTransformingPath" | "CGPathCreateMutableCopyByTransformingPath" => CGPathCreateCopyByTransformingPath,
         "CGPathCreateWithRect" => CGPathCreateWithRect,
         "CGPathCreateWithEllipseInRect" => CGPathCreateWithEllipseInRect,
+        "CGPathCreateWithRoundedRect" => CGPathCreateWithRoundedRect,
+        "CGPathAddRoundedRect" => CGPathAddRoundedRect,
         "CGPathRetain" => CGPathRetain,
         "CGPathRelease" => CGPathRelease,
         "CGPathMoveToPoint" => CGPathMoveToPoint,
@@ -784,6 +860,39 @@ mod tests {
     unsafe extern "C" fn count(info: *mut c_void, element: *const PathElement) {
         // SAFETY: a `Vec<i32>` the test passed, and a live element.
         unsafe { (*(info as *mut Vec<i32>)).push((*element).kind) };
+    }
+
+    /// A rounded rectangle fills its rectangle except the corners it rounds.
+    #[test]
+    fn a_rounded_rect_leaves_its_corners_out() {
+        crate::bootstrap();
+        let rect = NSRect {
+            origin: NSPoint { x: 10.0, y: 20.0 },
+            size: NSSize {
+                width: 40.0,
+                height: 30.0,
+            },
+        };
+        let at = |x, y| NSPoint { x, y };
+        // SAFETY: a path this test made and releases.
+        unsafe {
+            let path = CGPathCreateWithRoundedRect(rect, 8.0, 6.0, std::ptr::null());
+            let bounds = CGPathGetBoundingBox(path);
+            assert_eq!(bounds, rect);
+            let inside = |p| CGPathContainsPoint(path, std::ptr::null(), p, false);
+            assert!(inside(at(30.0, 35.0)), "the middle");
+            assert!(inside(at(10.5, 35.0)), "the left edge between corners");
+            assert!(inside(at(30.0, 20.5)), "the bottom edge between corners");
+            for corner in [
+                at(10.5, 20.5),
+                at(49.5, 20.5),
+                at(10.5, 49.5),
+                at(49.5, 49.5),
+            ] {
+                assert!(!inside(corner), "{corner:?} is rounded off");
+            }
+            CGPathRelease(path);
+        }
     }
 
     /// A rectangle is a move, three lines and a close, which is what a program
