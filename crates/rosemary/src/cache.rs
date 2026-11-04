@@ -257,6 +257,24 @@ pub struct CodeCache {
     config: LifterConfig,
 }
 
+/// Reads image code at `va`, from the program or an image the guest `dlopen`ed.
+fn read_image_code<M: Regions>(program: &Program<M>, va: u64, out: &mut [u8]) -> bool {
+    if program.memory.read(va, out).is_ok() {
+        return true;
+    }
+    let Some((base, bytes)) = crate::dyld::region_containing(va) else {
+        return false;
+    };
+    let from = (va - base) as usize;
+    match bytes.get(from..from + out.len()) {
+        Some(code) => {
+            out.copy_from_slice(code);
+            true
+        }
+        None => false,
+    }
+}
+
 /// The half of the cache a lift mutates.
 struct Published {
     cache: microlift::runtime::CodeCache,
@@ -407,17 +425,25 @@ impl CodeCache {
         if !first {
             return false;
         }
-        // Only images linked with the program: the offline build sees no others.
-        let Some(report) = program.report.images.iter().find(|r| r.path == path) else {
-            return false;
-        };
         let Ok(bytes) = std::fs::read(&path) else {
             return false;
         };
         let id = crate::aot::ImageId::of(&bytes);
         crate::aot::profile::remember_id(&path, id);
+        // Linked with the program, or brought in by a `dlopen`.
+        let matches = match program.report.images.iter().find(|r| r.path == path) {
+            Some(report) => crate::aot::matches_file(&program.memory, report, &bytes),
+            None => crate::dyld::image_holding(pc).is_some_and(|image| {
+                image.report.images.iter().any(|report| {
+                    report.path == path
+                        && image
+                            .with_memory(|memory| crate::aot::matches_file(memory, report, &bytes))
+                            .unwrap_or(false)
+                })
+            }),
+        };
         let tracing = crate::shims::vmmap::tracing();
-        if !crate::aot::matches_file(&program.memory, report, &bytes) {
+        if !matches {
             if tracing {
                 eprintln!("rosemary: aot: {path}: the code loaded is not the code in its file");
             }
@@ -461,7 +487,7 @@ impl CodeCache {
             );
             if crate::lldb::enabled() {
                 let mut guest_bytes = vec![0u8; (end - start) as usize];
-                if program.memory.read(start, &mut guest_bytes).is_ok() {
+                if read_image_code(program, start, &mut guest_bytes) {
                     crate::lldb::register(
                         translation.link_target as usize as u64,
                         start,

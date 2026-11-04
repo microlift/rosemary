@@ -73,9 +73,9 @@ impl Image {
     }
 }
 
-/// An [`MmapSpace`] shared across the threads running the guest. Held only to be
-/// dropped: its `Drop` is the unmap.
-struct SharedSpace(#[allow(dead_code)] MmapSpace);
+/// An [`MmapSpace`] shared across the threads running the guest. Its `Drop` is the
+/// unmap; otherwise it is only read, by [`Image::with_memory`].
+struct SharedSpace(MmapSpace);
 
 // SAFETY: see the type note.
 unsafe impl Sync for SharedSpace {}
@@ -677,6 +677,15 @@ pub fn executable_path() -> Option<String> {
         .map(|(path, _)| guest_spelling(path))
 }
 
+/// The executable's host path, which [`executable_path`] spells as the guest sees it.
+pub fn executable_host_path() -> Option<String> {
+    EXECUTABLE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_ref()
+        .map(|(path, _)| path.clone())
+}
+
 /// How many images are loaded, and the address range they span.
 ///
 /// A program that never calls `dlopen` now pays one relaxed atomic load, and a program
@@ -874,6 +883,19 @@ pub fn code_image(va: u64) -> Option<(String, u64)> {
     })
 }
 
+/// The loaded image whose mapping holds `va`.
+pub fn image_holding(va: u64) -> Option<&'static Image> {
+    find(|image| region_of(image, va).map(|_| image))
+}
+
+impl Image {
+    /// Runs `f` on the image's mapping, or returns `None` once it is unloaded.
+    pub fn with_memory<R>(&self, f: impl FnOnce(&MmapSpace) -> R) -> Option<R> {
+        let memory = self.memory.lock().unwrap_or_else(|e| e.into_inner());
+        memory.as_ref().map(|shared| f(&shared.0))
+    }
+}
+
 /// How many images the guest has loaded.
 pub fn loaded() -> usize {
     IMAGE_COUNT.load(Ordering::Acquire)
@@ -903,9 +925,27 @@ pub fn open(path: &str) -> std::result::Result<u64, String> {
             crate::exec::native::HOST_SPEC,
             crate::cxxlib::HOST,
         ),
-        Some(crate::exec::Engine::Emulated) => open_with(&resolved, &bytes, X86_64, Flavor::Intel),
+        Some(crate::exec::Engine::Emulated) => {
+            let handle = open_with(&resolved, &bytes, X86_64, Flavor::Intel)?;
+            crate::aot::profile::note_dlopen(&resolved);
+            Ok(handle)
+        }
         None => Err("no execution backend is active".to_string()),
     }
+}
+
+/// Link `path` as the emulated backend's `dlopen` would, running none of its code:
+/// no Objective-C realization, `+load`, add-image callback or initializer.
+///
+/// For `rosemary aot`, which compiles the images a run `dlopen`ed and must see them
+/// placed and bound as a run would.
+pub fn link_without_running(path: &str) -> std::result::Result<&'static Image, String> {
+    let resolved = resolve_path(path).ok_or_else(|| format!("no such file: {path}"))?;
+    if let Some(image) = find(|i| (i.path == resolved).then_some(i)) {
+        return Ok(image);
+    }
+    let bytes = std::fs::read(&resolved).map_err(|e| format!("{resolved}: {e}"))?;
+    link(&resolved, &bytes, X86_64, Flavor::Intel)
 }
 
 /// Give `darwin::images` this loader's answers, which is how `CFBundle` and the
@@ -974,6 +1014,43 @@ fn open_with<S: MachSpec + 'static>(
     spec: S,
     flavor: Flavor,
 ) -> std::result::Result<u64, String> {
+    let leaked = link(resolved, bytes, spec, flavor)?;
+
+    // A loaded image's thread-locals are its own, and nothing else registers
+    // them.
+    let engine = crate::exec::active().map_or(crate::exec::Engine::Emulated, |e| e.engine());
+    crate::tls::register(&leaked.report, engine);
+
+    // Before any of this image's code runs, and after it is findable. Asked of
+    // the *backend* rather than of a `Vm`, because a native guest has no `Vm` and
+    // would otherwise get an image whose selector references were never uniqued.
+    let exec = crate::exec::active();
+    if let Some(exec) = exec {
+        exec.realize_loaded_objc(&leaked.report)
+            .map_err(|e| format!("{resolved}: objc: {e}"))?;
+    }
+
+    // Every `_dyld_register_func_for_add_image` callback, before this image's
+    // own code runs. See [`announce`].
+    announce(leaked.handle, leaked.slide);
+
+    // Now the image's own code, in dyld's order.
+    if let Some(exec) = exec {
+        exec.run_loaded_load_methods(&leaked.report)
+            .map_err(|e| format!("{resolved}: objc +load: {e}"))?;
+    }
+
+    run_initializers(leaked)?;
+    Ok(leaked.handle)
+}
+
+/// Map, bind and publish one image, running none of its code.
+fn link<S: MachSpec + 'static>(
+    resolved: &str,
+    bytes: &[u8],
+    spec: S,
+    flavor: Flavor,
+) -> std::result::Result<&'static Image, String> {
     let object = MachObject::parse_any(bytes, spec)
         .map_err(|e| format!("{resolved}: not a loadable Mach-O for this backend: {e}"))?;
 
@@ -1134,33 +1211,7 @@ fn open_with<S: MachSpec + 'static>(
         }
         publish(&images);
     }
-
-    // A loaded image's thread-locals are its own, and nothing else registers
-    // them.
-    let engine = crate::exec::active().map_or(crate::exec::Engine::Emulated, |e| e.engine());
-    crate::tls::register(&leaked.report, engine);
-
-    // Before any of this image's code runs, and after it is findable. Asked of
-    // the *backend* rather than of a `Vm`, because a native guest has no `Vm` and
-    // would otherwise get an image whose selector references were never uniqued.
-    let exec = crate::exec::active();
-    if let Some(exec) = exec {
-        exec.realize_loaded_objc(&leaked.report)
-            .map_err(|e| format!("{resolved}: objc: {e}"))?;
-    }
-
-    // Every `_dyld_register_func_for_add_image` callback, before this image's
-    // own code runs. See [`announce`].
-    announce(leaked.handle, leaked.slide);
-
-    // Now the image's own code, in dyld's order.
-    if let Some(exec) = exec {
-        exec.run_loaded_load_methods(&leaked.report)
-            .map_err(|e| format!("{resolved}: objc +load: {e}"))?;
-    }
-
-    run_initializers(leaked)?;
-    Ok(leaked.handle)
+    Ok(leaked)
 }
 
 /// Publish `images` as the view readers search. Called under the [`IMAGES`] lock.

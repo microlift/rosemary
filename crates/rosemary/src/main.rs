@@ -589,6 +589,9 @@ fn aot(options: AotOptions) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
+    // Published as a run publishes it: linking the images runs `dlopen`ed asks it.
+    let vm: &'static Vm = Box::leak(Box::new(vm));
+    rosemary::thunk::publish(vm);
     let threads = options.threads.unwrap_or_else(|| {
         std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get)
     });
@@ -600,7 +603,7 @@ fn aot(options: AotOptions) -> ExitCode {
         only_missing: options.only_missing,
     };
     let mut failed = false;
-    for (image, outcome) in rosemary::aot::build::build(&vm, layout, &build) {
+    for (image, outcome) in rosemary::aot::build::build(vm, layout, &build) {
         use rosemary::aot::build::Outcome;
         match outcome {
             Outcome::Written {

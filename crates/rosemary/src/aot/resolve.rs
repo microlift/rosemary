@@ -37,6 +37,26 @@ impl Resolver {
         }
         Resolver { symbols, slide }
     }
+
+    /// Also resolves the fast imports `config` answers today for the slid sites
+    /// `decisions` name: a `dlopen`ed image's sites are answered by the import
+    /// registry, not by `config.imports`. A site answered otherwise than recorded
+    /// adds nothing, and its region is refused by [`decisions_hold`].
+    pub fn learn<'a>(
+        &mut self,
+        config: &LifterConfig,
+        decisions: impl IntoIterator<Item = &'a (u64, ImportDecision)>,
+    ) {
+        for (va, decision) in decisions {
+            if !matches!(decision, ImportDecision::Fast { .. }) {
+                continue;
+            }
+            if let Some(ImportKind::Fast(import)) = kind_now(config, va.wrapping_add(self.slide)) {
+                self.symbols
+                    .insert(import.host_symbol(), import.symbol.value as usize);
+            }
+        }
+    }
 }
 
 impl SymbolResolver for Resolver {
@@ -61,12 +81,15 @@ fn libcall(name: &str) -> Option<usize> {
 }
 
 /// What `config` answers for `va` now, consulting the registry as a lift would.
-fn decision_now(config: &LifterConfig, va: u64) -> ImportDecision {
-    let kind = match config.imports.get(&va) {
+fn kind_now(config: &LifterConfig, va: u64) -> Option<ImportKind> {
+    match config.imports.get(&va) {
         Some(kind) => Some(kind.clone()),
         None => config.import_registry.as_ref().and_then(|r| r.lookup(va)),
-    };
-    ImportDecision::of(kind.as_ref())
+    }
+}
+
+fn decision_now(config: &LifterConfig, va: u64) -> ImportDecision {
+    ImportDecision::of(kind_now(config, va).as_ref())
 }
 
 /// Whether a region lifted with these decisions may be used under `config`: every
@@ -79,11 +102,18 @@ pub fn decisions_hold(config: &LifterConfig, decisions: &[(u64, ImportDecision)]
 }
 
 /// Whether a region may go into a cache at all: only sites the program's own
-/// bindings answer. A site only `dlsym` or the import registry can answer depends on
-/// what this run happened to load.
-pub fn cacheable(config: &LifterConfig, decisions: &[(u64, ImportDecision)]) -> bool {
+/// bindings answer, or sites in the region's own image, which `in_image` says.
+///
+/// A site of another loaded image moves with that image, not with this one, so a
+/// recorded address for it means nothing in another run. Every decision is checked
+/// again when the file is loaded.
+pub fn cacheable(
+    config: &LifterConfig,
+    decisions: &[(u64, ImportDecision)],
+    in_image: impl Fn(u64) -> bool,
+) -> bool {
     decisions.iter().all(|(va, decision)| {
-        *decision == ImportDecision::NotImport || config.imports.contains_key(va)
+        *decision == ImportDecision::NotImport || config.imports.contains_key(va) || in_image(*va)
     })
 }
 
@@ -163,17 +193,44 @@ mod tests {
     }
 
     #[test]
-    fn a_site_the_program_does_not_bind_is_not_cacheable() {
+    fn a_site_outside_the_program_and_the_image_is_not_cacheable() {
         let config = config();
-        assert!(cacheable(&config, &[(0x30, ImportDecision::Slow)]));
-        assert!(!cacheable(
-            &config,
-            &[(
-                0x50,
-                ImportDecision::Bridge {
-                    name: "rosemary-import".into()
-                }
-            )]
-        ));
+        let bridged = [(
+            0x50,
+            ImportDecision::Bridge {
+                name: "rosemary-import".into(),
+            },
+        )];
+        assert!(cacheable(&config, &[(0x30, ImportDecision::Slow)], |_| {
+            false
+        }));
+        assert!(!cacheable(&config, &bridged, |_| false));
+        assert!(cacheable(&config, &bridged, |va| va == 0x50));
+    }
+
+    #[derive(Debug)]
+    struct Registry;
+
+    impl microlift::core::bridge::ImportRegistry for Registry {
+        fn lookup(&self, va: u64) -> Option<ImportKind> {
+            (va == 0x1050).then(|| config().imports[&0x20].clone())
+        }
+    }
+
+    #[test]
+    fn a_registry_answered_fast_import_resolves_at_its_slid_site() {
+        let mut config = config();
+        config.set_import_registry(std::sync::Arc::new(Registry));
+        let ImportKind::Fast(b) = &config.imports[&0x20] else {
+            unreachable!()
+        };
+        let recorded = [(0x50, ImportDecision::of(config.imports.get(&0x20)))];
+        let mut resolver = Resolver::new(&LifterConfig::default(), 0x1000);
+        assert_eq!(resolver.resolve(&b.host_symbol()), None);
+        resolver.learn(&config, &recorded);
+        assert_eq!(
+            resolver.resolve(&b.host_symbol()),
+            Some(from_b as *const () as usize)
+        );
     }
 }

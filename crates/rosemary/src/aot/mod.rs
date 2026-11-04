@@ -133,6 +133,13 @@ impl Layout {
         self.base.join(PROFILE_DIRECTORY).join(format!("{id}.log"))
     }
 
+    /// The images runs of the executable `id` `dlopen`ed.
+    pub fn dlopens(&self, id: &ImageId) -> PathBuf {
+        self.base
+            .join(PROFILE_DIRECTORY)
+            .join(format!("{id}.dlopen"))
+    }
+
     /// Removes every other build's cache, unless [`KEEP_ENV`] is set.
     pub fn prune(&self) {
         if std::env::var_os(KEEP_ENV).is_none() {
@@ -191,7 +198,14 @@ pub fn load(
         return Err(LoadError::Stale);
     }
     let moved = slide.wrapping_sub(file.lift_slide);
-    let resolver = resolve::Resolver::new(config, moved);
+    let mut resolver = resolve::Resolver::new(config, moved);
+    resolver.learn(
+        config,
+        file.chunks
+            .iter()
+            .flat_map(|chunk| &chunk.regions)
+            .flat_map(|region| &region.import_decisions),
+    );
     let mut regions = Vec::new();
     for chunk in &file.chunks {
         let loaded =
