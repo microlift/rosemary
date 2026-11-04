@@ -144,6 +144,23 @@ class ContextTests(unittest.TestCase):
         self.assertEqual((whole.size, whole.align), (656, 16))
         self.assertEqual(context.layout_of(context.LINK_ENTRY).size, rmc.LINK_ENTRY_SIZE)
 
+    def test_control_fields_sit_where_regions_store_them(self):
+        self.assertEqual(context.control_offset("exit_reason"), 168)
+        self.assertEqual(context.control_offset("exit_code"), 172)
+
+    def test_reads_an_exit_code_under_its_reason(self):
+        reason = lambda name: next(v for n, v in context.ENUMS[context.EXIT_REASON].members if n == name)
+        jump = context.describe_exit_code(reason("ExitUnknownJump"), 8)
+        self.assertEqual((jump.text, jump.enum), ("TransferIndirectCall", context.TRANSFER_KIND))
+        self.assertEqual(context.describe_exit_code(reason("ExitInterrupt"), 0x80).text, "vector 0x80")
+        self.assertEqual(context.describe_exit_code(reason("ExitPortOutput"), 2).text, "2-byte elements")
+        self.assertIsNone(context.describe_exit_code(reason("ExitReturn"), 1))
+        self.assertIsNone(context.describe_exit_code(reason("ExitUnknownJump"), 99))
+
+    def test_retired_exit_reasons_have_no_name(self):
+        self.assertIsNone(context.enum_member(context.EXIT_REASON, 2))
+        self.assertIsNone(context.enum_member(context.EXIT_REASON, 4))
+
     def test_names_whole_guest_registers_only(self):
         self.assertEqual(context.guest_register_at(32, 8), "rsp")
         self.assertEqual(context.guest_register_at(192 + 3 * 16, 16), "xmm3")

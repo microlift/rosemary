@@ -124,6 +124,43 @@ ENUMS: Dict[str, Enum] = {
     ),
 }
 
+EXIT_REASON = "ExitReason"
+TRANSFER_KIND = "TransferKind"
+
+
+def enum_member(enum: str, value: int) -> Optional[str]:
+    return next((name for name, v in ENUMS[enum].members if v == value), None)
+
+
+def _exit(name: str) -> int:
+    return next(v for n, v in ENUMS[EXIT_REASON].members if n == name)
+
+
+EXIT_UNKNOWN_JUMP = _exit("ExitUnknownJump")
+EXIT_INTERRUPT = _exit("ExitInterrupt")
+EXIT_PORT_IO = (_exit("ExitPortInput"), _exit("ExitPortOutput"))
+
+
+@dataclass(frozen=True)
+class ExitCode:
+    """What `ControlHeader::exit_code` means under one exit reason."""
+
+    text: str
+    # The enum the constant is a member of, if any.
+    enum: Optional[str] = None
+
+
+def describe_exit_code(reason: int, code: int) -> Optional[ExitCode]:
+    if reason == EXIT_UNKNOWN_JUMP:
+        name = enum_member(TRANSFER_KIND, code)
+        return ExitCode(name, TRANSFER_KIND) if name else None
+    if reason == EXIT_INTERRUPT:
+        return ExitCode(f"vector {code:#x}")
+    if reason in EXIT_PORT_IO:
+        return ExitCode(f"{code}-byte elements")
+    return None
+
+
 _CTX = Pointer(Named(REGISTER_CONTEXT))
 
 TYPES: Dict[str, Aggregate] = {
@@ -250,6 +287,11 @@ def layout_of(name: str) -> Layout:
 
 def offset_of(name: str, field: str) -> int:
     return next(offset for f, offset in layout_of(name).offsets if f.name == field)
+
+
+def control_offset(field: str) -> int:
+    """Offset of a `ControlHeader` field from the start of `RegisterContext`."""
+    return offset_of(REGISTER_CONTEXT, "control") + offset_of("ControlHeader", field)
 
 
 def guest_register_at(offset: int, size: int) -> Optional[str]:

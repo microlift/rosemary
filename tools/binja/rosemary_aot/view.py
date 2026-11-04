@@ -15,8 +15,15 @@ from binaryninja import (
     Type,
     log,
 )
-from binaryninja.enums import NamedTypeReferenceClass, StructureVariant
-from binaryninja.types import FunctionParameter, StructureBuilder
+from binaryninja.enums import (
+    InstructionTextTokenType,
+    IntegerDisplayType,
+    MediumLevelILOperation,
+    NamedTypeReferenceClass,
+    RegisterValueType,
+    StructureVariant,
+)
+from binaryninja.types import FunctionParameter, NamedTypeReferenceType, PointerType, StructureBuilder
 
 from . import context as cx
 from . import layout as lay
@@ -26,6 +33,10 @@ SETTINGS_GROUP = "rosemaryAot"
 SETTING_ARCH = "rosemaryAot.architecture"
 SETTING_GUEST_ADDRESSES = "rosemaryAot.guestAddresses"
 SETTING_ANNOTATION_LIMIT = "rosemaryAot.annotationLimit"
+
+EXIT_REASON_OFFSET = cx.control_offset("exit_reason")
+EXIT_CODE_OFFSET = cx.control_offset("exit_code")
+EXIT_FIELD_SIZE = EXIT_CODE_OFFSET - EXIT_REASON_OFFSET
 
 # Cranelift calling-convention names -> Binary Ninja platform, per architecture.
 PLATFORMS = {
@@ -75,7 +86,7 @@ def register_settings() -> None:
             "default": 250000,
             "minValue": 0,
             "maxValue": 100000000,
-            "description": "Per-instruction guest comments and relocation data variables are added on load only when a file has at most this many of them; use 'Rosemary AOT > Annotate guest addresses' for single functions otherwise.",
+            "description": "Per-instruction guest comments, exit names and relocation data variables are added on load only when a file has at most this many of them; use 'Rosemary AOT > Annotate guest addresses and exits' for single functions otherwise.",
             "ignore": ["SettingsProjectScope"]
         }""",
     )
@@ -154,6 +165,8 @@ class RosemaryAotView(BinaryView):
             self._add_externs()
             self._add_regions()
             self._store_metadata()
+            if self.annotate:
+                self._exits_event = self.add_analysis_completion_event(self._annotate_all_exits)
             if self.cache.source:
                 log.log_info(f"Rosemary AOT: cache of {self.cache.source}")
             return True
@@ -251,11 +264,11 @@ class RosemaryAotView(BinaryView):
 
     def _add_regions(self) -> None:
         annotations = sum(len(image.relocs) + sum(r.map_len for r in image.regions) for image in self.cache.chunks)
-        annotate = annotations <= self.annotation_limit
+        annotate = self.annotate = annotations <= self.annotation_limit
         if not annotate:
             log.log_info(
                 f"Rosemary AOT: {annotations} annotations exceed the limit of {self.annotation_limit}; "
-                "use 'Rosemary AOT > Annotate guest addresses' per function"
+                "use 'Rosemary AOT > Annotate guest addresses and exits' per function"
             )
         entry_type = Type.function(Type.void(), [FunctionParameter(self.context_pointer, "ctx")])
         link_entry = self._named(cx.LINK_ENTRY)
@@ -344,9 +357,98 @@ class RosemaryAotView(BinaryView):
             previous = va
             addr = body + start
             if addr != body:
-                self.set_comment_at(addr, f"guest {self.guest(va):#x}")
+                self.add_comment(addr, f"guest {self.guest(va):#x}")
                 count += 1
         return count
+
+    def add_comment(self, addr: int, line: str) -> None:
+        """Adds a line to the comment at `addr`, keeping the other annotations there."""
+        existing = self.get_comment_at(addr)
+        if line not in existing.splitlines():
+            self.set_comment_at(addr, f"{existing}\n{line}" if existing else line)
+
+    def annotate_exits(self, function) -> int:
+        """Names the constants a region stores into `ctx->control.exit_reason` and `exit_code`.
+
+        An exit code is read under the reason stored before it in the same block. Returns the count."""
+        mlil = None if function.analysis_skipped else function.mlil
+        if mlil is None:
+            return 0
+        count = 0
+        for block in mlil:
+            reason = None
+            for instr in block:
+                for offset, value in self._control_stores(instr):
+                    if offset == EXIT_REASON_OFFSET:
+                        reason = value
+                        name = cx.enum_member(cx.EXIT_REASON, value)
+                        if name is not None:
+                            self._name_exit_constant(function, instr, value, f"exit_reason = {name}", cx.EXIT_REASON)
+                            count += 1
+                    elif offset == EXIT_CODE_OFFSET and reason is not None:
+                        code = cx.describe_exit_code(reason, value)
+                        if code is not None:
+                            self._name_exit_constant(function, instr, value, f"exit_code = {code.text}", code.enum)
+                            count += 1
+        if count:
+            # Display types only reach the decompiler once the function is analyzed again.
+            function.reanalyze()
+        return count
+
+    def _control_stores(self, instr) -> List[Tuple[int, int]]:
+        """(context offset, constant) for each control field `instr` stores a known constant into."""
+        if instr.operation != MediumLevelILOperation.MLIL_STORE_STRUCT or not self._is_context(instr.dest.expr_type):
+            return []
+        value = instr.src.value
+        if value.type != RegisterValueType.ConstantValue:
+            return []
+        stores = []
+        mask = (1 << (EXIT_FIELD_SIZE * 8)) - 1
+        # A wide store can set both fields at once.
+        for field in range(instr.size // EXIT_FIELD_SIZE):
+            offset = instr.offset + field * EXIT_FIELD_SIZE
+            if offset in (EXIT_REASON_OFFSET, EXIT_CODE_OFFSET):
+                stores.append((offset, (value.value >> (field * EXIT_FIELD_SIZE * 8)) & mask))
+        return stores
+
+    @staticmethod
+    def _is_context(pointer) -> bool:
+        if not isinstance(pointer, PointerType):
+            return False
+        target = pointer.target
+        # A resolved structure names itself through its registered reference.
+        if not isinstance(target, NamedTypeReferenceType):
+            target = target.registered_name
+        return isinstance(target, NamedTypeReferenceType) and str(target.name) == cx.REGISTER_CONTEXT
+
+    def _name_exit_constant(self, function, instr, value: int, comment: str, enum: Optional[str]) -> None:
+        self.add_comment(instr.address, comment)
+        hlil = instr.hlil
+        if enum is None or hlil is None:
+            return
+        for token in hlil.tokens:
+            if token.type == InstructionTextTokenType.IntegerToken and token.value == value:
+                function.set_int_display_type(
+                    token.address or hlil.address,
+                    value,
+                    token.operand,
+                    IntegerDisplayType.EnumerationDisplayType,
+                    enum_display_typeid=enum,
+                )
+
+    def annotate_region_exits(self, chunk: int, index: int) -> int:
+        """`annotate_exits` for a region's entry and body. Returns the count."""
+        region = self.cache.chunks[chunk].regions[index]
+        text = self.layout.chunks[chunk].text
+        return sum(self._annotate_exits_at(start) for start in {text + region.entry, text + region.link_target})
+
+    def _annotate_exits_at(self, start: int) -> int:
+        function = self.get_function_at(start, self.platform)
+        return self.annotate_exits(function) if function is not None else 0
+
+    def _annotate_all_exits(self) -> None:
+        count = sum(self._annotate_exits_at(start) for start in self.function_starts)
+        log.log_info(f"Rosemary AOT: named {count} exit reasons and codes")
 
     def region_at(self, addr: int) -> Optional[Tuple[int, int]]:
         """The (chunk, region) whose entry or body function holds `addr`."""

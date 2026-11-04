@@ -19,14 +19,18 @@
   type a body that returns its pinned registers, so the body shows their incoming values but not the ones it
   hands back; read the disassembly before the `ret` for those;
 * the guest code map becomes `guest 0x...` comments on the host code;
+* once analysis finishes, each constant a region stores into `ctx->control.exit_reason` is shown as its
+  `ExitReason` and commented (`exit_reason = ExitUnknownJump`). Each `exit_code` is read under the reason stored
+  before it in the same block: a `TransferKind` for `ExitUnknownJump`, a vector for `ExitInterrupt`, or an
+  element size for port I/O;
 * the path of the Mach-O the cache was built from is logged, stored as the `rosemary_aot.source` metadata, and
   commented at the entry point (files written before it was recorded, `RMAOTv1`, still open without it).
 
 Guest addresses are the image's file VAs by default, so they match the Mach-O opened on its own; the
 `Rosemary AOT > Guest address space` setting switches to the run-time VAs the image was lifted at.
-Files with more than `Annotation limit` code-map ranges and relocations skip per-instruction annotations on
-load; `Rosemary AOT > Annotate guest addresses` adds them for one function, and `Rosemary AOT > Find host code
-for guest address` jumps to the code compiled for a guest address.
+Files with more than `Annotation limit` code-map ranges and relocations skip per-instruction annotations and
+exit names on load; `Rosemary AOT > Annotate guest addresses and exits` adds them for one region, and
+`Rosemary AOT > Find host code for guest address` jumps to the code compiled for a guest address.
 
 The cache records only a hash of its ISA, so the architecture is guessed from the code (`Host architecture`
 overrides it).

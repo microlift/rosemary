@@ -23,7 +23,8 @@ if binaryninja is not None:
             log.log_warn("Rosemary AOT: this function is not a lifted region")
             return
         count = view.annotate_region(*found)
-        log.log_info(f"Rosemary AOT: annotated {count} guest instructions")
+        exits = view.annotate_region_exits(*found)
+        log.log_info(f"Rosemary AOT: annotated {count} guest instructions and {exits} exit constants")
 
     def _find_guest(bv):
         view = _view(bv)
@@ -48,8 +49,9 @@ if binaryninja is not None:
     register_settings()
     RosemaryAotView.register()
     PluginCommand.register_for_function(
-        "Rosemary AOT\\Annotate guest addresses",
-        "Comment each host instruction run of this region with the guest instruction it came from",
+        "Rosemary AOT\\Annotate guest addresses and exits",
+        "Comment each host instruction run of this region with the guest instruction it came from, "
+        "and name the exit reasons and codes it stores",
         _annotate_function,
         lambda bv, function: _view(bv) is not None,
     )
