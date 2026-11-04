@@ -9,9 +9,9 @@ mod pools;
 mod submit;
 mod trace;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::{
-    Arc, Condvar, Mutex, OnceLock,
+    Arc, Condvar, Mutex, MutexGuard, Once, OnceLock,
     atomic::{AtomicBool, AtomicUsize},
 };
 
@@ -28,7 +28,7 @@ pub use format::{
 pub(crate) use guard::{Guard, GuardedVec};
 pub use host::HostPages;
 pub use placement::Placement;
-pub use submit::Batch;
+pub use submit::{Batch, Commit};
 use trace::dump_spirv;
 pub use trace::{milestone, trace, trace_once};
 
@@ -90,10 +90,9 @@ pub struct Gpu {
     /// Some ICDs do not tolerate concurrent VkSwapchain/semaphore creation
     /// and vkQueuePresentKHR for different windows on a shared device.
     pub(crate) wsi: Mutex<()>,
-    /// Commits hold this across the guest submit and every presentation
-    /// submit attached to it. Queue calls themselves keep using `queue` for
-    /// Vulkan's external-synchronization rule.
-    submission_boundary: Mutex<()>,
+    /// Command buffers committed and not yet submitted. Whoever takes the
+    /// queue submits them first, so the queue keeps the order of commits.
+    commits: submit::Commits,
     /// Submissions on the queue which wait for an event. Work behind one may
     /// run only once the CPU signals it, after writes it makes past commit.
     pub(crate) event_waits_in_flight: AtomicUsize,
@@ -773,7 +772,7 @@ impl Gpu {
             queue_family,
             queue: Mutex::new(queue),
             wsi: Mutex::new(()),
-            submission_boundary: Mutex::new(()),
+            commits: submit::Commits::default(),
             event_waits_in_flight: AtomicUsize::new(0),
             submissions: crate::submission::Tracker::new(),
             deferred: deferred::Deferred::default(),

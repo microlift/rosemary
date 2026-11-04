@@ -140,6 +140,11 @@ pub(crate) struct Submission {
     pub(super) profile: Option<Arc<crate::profile::Profile>>,
     /// Counted in `Gpu::event_waits_in_flight` until it finishes.
     pub(super) waits_for_event: bool,
+    /// Why the batches never reached the queue, so the fence never signals.
+    pub(crate) failure: Option<String>,
+    /// The fence which signals once this work is done: `fence`, or that of
+    /// a later submission it reached the queue together with.
+    pub(crate) signal: vk::Fence,
 }
 
 impl Submission {
@@ -168,8 +173,11 @@ impl Submission {
         }
     }
 
-    pub(crate) fn wait_and_finish(self) {
-        let result = self.gpu.wait(self.fence);
+    pub(crate) fn wait_and_finish(mut self) {
+        if let Some(reason) = self.failure.take() {
+            return self.finish(Err(reason));
+        }
+        let result = self.gpu.wait(self.signal);
         stats::timed(Counter::FenceWakeToRetiredMicros, || self.finish(result));
     }
 

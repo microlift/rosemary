@@ -657,6 +657,52 @@ fn a_copy_out_of_host_pages_follows_device_writes_queued_before_it() {
     }
 }
 
+/// Command buffers committed faster than they reach the queue are submitted
+/// together, and each still completes with its own work done.
+#[test]
+fn command_buffers_committed_back_to_back_each_complete() {
+    isolate_metal_fixture!();
+    let Some(device) = gpu_device() else {
+        return;
+    };
+    const COUNT: usize = 256;
+    const COMPLETED: u64 = 4; // MTLCommandBufferStatusCompleted
+    // SAFETY: objects this test made, sent the selectors they implement.
+    unsafe {
+        let source = new_buffer(device, std::ptr::null(), COUNT * 4, 0);
+        let target = new_buffer(device, std::ptr::null(), COUNT * 4, 0);
+        let values: Vec<u32> = (1..=COUNT as u32).collect();
+        let source_contents = object::body::<resource::Buffer>(source).inner.contents;
+        std::ptr::copy_nonoverlapping(values.as_ptr(), source_contents.cast(), COUNT);
+        let queue = new_command_queue(device, std::ptr::null());
+        let commands: Vec<Id> = (0..COUNT)
+            .map(|index| {
+                let command = objc::arc::retain(send(queue, "commandBuffer"));
+                let blit = send(command, "blitCommandEncoder");
+                let offset = (index * 4) as u64;
+                copy_buffer_range(blit, source, offset, target, offset, 4);
+                send_void(blit, "endEncoding");
+                send_void(command, "commit");
+                command
+            })
+            .collect();
+        send_void(commands[COUNT - 1], "waitUntilCompleted");
+        for &command in &commands {
+            send_void(command, "waitUntilCompleted");
+            assert_eq!(send_number_result(command, "status"), COMPLETED);
+            objc::arc::release(command);
+        }
+        let target_contents = object::body::<resource::Buffer>(target).inner.contents;
+        assert_eq!(
+            std::slice::from_raw_parts(target_contents as *const u32, COUNT),
+            values
+        );
+        for buffer in [source, target] {
+            objc::arc::release(buffer);
+        }
+    }
+}
+
 /// Work queued behind an event wait runs once the host signals it, so a copy
 /// there reads what the host wrote after committing it.
 #[test]

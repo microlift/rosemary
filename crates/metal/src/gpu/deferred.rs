@@ -208,7 +208,7 @@ impl Gpu {
 
     /// Submit the pending batch now, taking the queue for it.
     fn flush_deferred_now(&self) {
-        let queue = self.queue.lock().expect("Vulkan queue");
+        let queue = self.lock_queue();
         self.flush_deferred(*queue);
     }
 

@@ -96,9 +96,10 @@ impl Tracker {
     fn pop_signalled(&self, gpu: &Gpu) -> Option<Submission> {
         let mut pending = self.pending.lock().expect("the device submission queue");
         let signalled = pending.front().is_some_and(|submission| {
+            submission.failure.is_none() &&
             // SAFETY: this device created the fence and the in-flight record
             // keeps it alive until it is removed here.
-            unsafe { gpu.device.get_fence_status(submission.fence) }.unwrap_or(false)
+            unsafe { gpu.device.get_fence_status(submission.signal) }.unwrap_or(false)
         });
         signalled.then(|| {
             self.depth.fetch_sub(1, Ordering::Relaxed);

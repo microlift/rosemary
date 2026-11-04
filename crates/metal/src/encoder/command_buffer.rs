@@ -362,6 +362,8 @@ pub(super) unsafe extern "C" fn commit(receiver: Id, _sel: Sel) {
         scheduled_time: 0.0,
         profile: command.profile.take(),
         waits_for_event: false,
+        failure: None,
+        signal: command.fence,
     });
     if waits_for_event {
         submission
@@ -399,41 +401,39 @@ pub(super) unsafe extern "C" fn commit(receiver: Id, _sel: Sel) {
     }
     command.completion.set(2); // MTLCommandBufferStatusCommitted
     gpu.submissions.start(gpu);
-    let completion = Arc::clone(&command.completion);
-    let submitted = stats::timed(Counter::SubmitMicros, || {
-        gpu.submit_ordered(&batches, command.fence, |serial| {
-            let pending = submission.as_mut().expect("pending submission");
-            pending.serial = serial;
-            pending.scheduled_time = darwin::mach::media_time();
-            completion.set(3); // MTLCommandBufferStatusScheduled
-            for block in std::mem::take(&mut command.scheduled_handlers) {
+    let mut submission = submission.take().expect("pending submission");
+    let scheduled_handlers = std::mem::take(&mut command.scheduled_handlers);
+    gpu.commit(gpu::Commit {
+        batches,
+        fence: command.fence,
+        submitted: Box::new(move |serial, result, signal| {
+            let object = submission.object.as_id();
+            submission.serial = serial;
+            submission.signal = signal;
+            match result {
+                Ok(()) => {
+                    submission.scheduled_time = darwin::mach::media_time();
+                    submission.completion.set(3); // MTLCommandBufferStatusScheduled
+                }
+                Err(reason) => {
+                    gpu::trace(format!("command buffer submission failed: {reason}"));
+                    submission.completion.set(5); // MTLCommandBufferStatusError
+                    // Finished by the completion worker, in order and with no
+                    // lock held; the error status is installed then.
+                    submission.failure = Some(reason);
+                }
+            }
+            for block in scheduled_handlers {
                 // SAFETY: the retained block reference is transferred to the
-                // handler worker, and `receiver` is live during this call.
-                unsafe { crate::completion::deliver(block.into_raw(), receiver) };
+                // handler worker, and the submission retains `object`.
+                unsafe { crate::completion::deliver(block.into_raw(), object) };
             }
-            submission
-                .as_mut()
-                .expect("pending submission")
-                .schedule_presents();
-            gpu.submissions
-                .push(submission.take().expect("pending submission"));
-        })
+            if submission.failure.is_none() {
+                submission.schedule_presents();
+            }
+            gpu.submissions.push(submission);
+        }),
     });
-    match submitted {
-        Ok(()) => {}
-        Err(reason) => {
-            gpu::trace(format!("command buffer submission failed: {reason}"));
-            command.completion.set(5); // MTLCommandBufferStatusError
-            for block in std::mem::take(&mut command.scheduled_handlers) {
-                // SAFETY: as above. The error status is installed by `finish`.
-                unsafe { crate::completion::deliver(block.into_raw(), receiver) };
-            }
-            submission
-                .take()
-                .expect("unsubmitted command")
-                .finish(Err(reason));
-        }
-    }
 }
 
 pub(super) unsafe extern "C" fn wait_until_completed(receiver: Id, _sel: Sel) {
