@@ -11,7 +11,7 @@ pub(crate) fn new_encoder(command_buffer: Id, kind: Kind) -> Id {
             command_buffer: objc::arc::retain(command_buffer),
             kind,
             concurrent: false,
-            compute_barrier_recorded: false,
+            barrier_is_last: std::cell::Cell::new(false),
             compute_pipeline: std::ptr::null_mut(),
             render_pipeline: std::ptr::null_mut(),
             depth_state: std::ptr::null_mut(),
@@ -150,11 +150,7 @@ pub(super) unsafe extern "C" fn end_encoding(receiver: Id, _sel: Sel) {
             }
         }
     }
-    // A serial compute dispatch or explicit barrier already orders the next
-    // encoder; recording another identical full memory barrier changes nothing.
-    if encoder.kind != Kind::Compute || !encoder.compute_barrier_recorded {
-        encoder.barrier();
-    }
+    encoder.barrier();
 }
 
 /// Whether two entries write one binding - a buffer both stages declare -
@@ -191,6 +187,7 @@ impl Encoder {
 
     /// Record one draw or dispatch, timed under `ROSEMARY_METAL_PROFILE`.
     pub(super) fn record(&self, body: impl FnOnce()) {
+        self.barrier_is_last.set(false);
         let command = self.command();
         let Some(profile) = &command.profile else {
             return body();
@@ -213,6 +210,7 @@ impl Encoder {
 
     /// Record work timed under a fixed name rather than the bound pipeline's.
     pub(super) fn record_named(&self, name: &'static str, body: impl FnOnce()) {
+        self.barrier_is_last.set(false);
         let command = self.command();
         match &command.profile {
             Some(profile) => profile.span(
@@ -227,6 +225,7 @@ impl Encoder {
 
     /// Record work timed under an explicit label, or untimed without one.
     pub(super) fn record_as(&self, label: Option<std::sync::Arc<str>>, body: impl FnOnce()) {
+        self.barrier_is_last.set(false);
         let command = self.command();
         match (&command.profile, label) {
             (Some(profile), Some(label)) => {
@@ -749,7 +748,13 @@ impl Encoder {
     ///
     /// It is not what makes a frame slow: removing it entirely takes an app's
     /// home page from 6.65 ms of device time a frame to 6.45 ms.
+    ///
+    /// Every barrier is the same full one, so a second with no work recorded
+    /// since the first orders nothing more and is skipped.
     pub(super) fn barrier(&self) {
+        if self.barrier_is_last.replace(true) {
+            return;
+        }
         let command = self.command();
         let memory = vk::MemoryBarrier::default()
             .src_access_mask(vk::AccessFlags::MEMORY_WRITE)

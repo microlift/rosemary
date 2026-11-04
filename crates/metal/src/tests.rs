@@ -2617,11 +2617,12 @@ fn compute_encoders_order_subsequent_dispatches() {
         let pipeline = new_compute_pipeline(device, std::ptr::null(), function, &mut error);
         assert!(!pipeline.is_null());
         let queue = new_command_queue(device, std::ptr::null());
-        for (kind, dispatches_per_encoder, encoders, manual_after_last) in [
+        for (kind, dispatches_per_encoder, encoders, barrier_after_each) in [
             (DISPATCH_SERIAL, 0, 16, false),
             (DISPATCH_CONCURRENT, 0, 16, false),
             (DISPATCH_SERIAL, 1, 64, false),
             (DISPATCH_SERIAL, 3, 32, false),
+            (DISPATCH_SERIAL, 3, 32, true),
             (DISPATCH_CONCURRENT, 1, 64, false),
             (DISPATCH_CONCURRENT, 2, 32, false),
             (DISPATCH_CONCURRENT, 2, 32, true),
@@ -2640,8 +2641,8 @@ fn compute_encoders_order_subsequent_dispatches() {
                     encoder::TEST_RECORDED_BARRIERS.load(std::sync::atomic::Ordering::Relaxed);
                 for index in 0..dispatches_per_encoder {
                     dispatch(encoder, 1);
-                    if kind == DISPATCH_CONCURRENT
-                        && (index + 1 < dispatches_per_encoder || manual_after_last)
+                    if barrier_after_each
+                        || (kind == DISPATCH_CONCURRENT && index + 1 < dispatches_per_encoder)
                     {
                         send_number(encoder, "memoryBarrierWithScope:", SCOPE_BUFFERS);
                     }
@@ -2653,7 +2654,7 @@ fn compute_encoders_order_subsequent_dispatches() {
                 let expected = u64::from(dispatches_per_encoder.max(1));
                 assert_eq!(
                     recorded, expected,
-                    "type {kind}: unexpected terminal barrier"
+                    "type {kind}: unexpected redundant barrier"
                 );
             }
             send_void(command, "commit");
@@ -2666,6 +2667,48 @@ fn compute_encoders_order_subsequent_dispatches() {
             );
         }
     }
+}
+
+#[test]
+fn generating_mipmaps_ends_a_blit_encoder_with_one_barrier() {
+    isolate_metal_fixture!();
+    let Some(device) = gpu_device() else {
+        return;
+    };
+    const LEVELS: u64 = 4;
+    let gpu = gpu_of(device).expect("a Vulkan device");
+    let texture = resource::new_texture(
+        gpu,
+        resource::TextureDescriptor {
+            texture_type: 2,
+            pixel_format: 70, // RGBA8Unorm
+            width: 1 << (LEVELS - 1),
+            height: 1 << (LEVELS - 1),
+            depth: 1,
+            mipmap_level_count: LEVELS,
+            sample_count: 1,
+            array_length: 1,
+            storage_mode: 0,
+            usage: gpu::USAGE_SHADER_READ,
+        },
+    );
+    assert!(!texture.is_null());
+    // SAFETY: live Metal objects and registered selectors with their ABI.
+    unsafe {
+        let queue = new_command_queue(device, std::ptr::null());
+        let command = send(queue, "commandBuffer");
+        let blit = send(command, "blitCommandEncoder");
+        let before = encoder::TEST_RECORDED_BARRIERS.load(std::sync::atomic::Ordering::Relaxed);
+        send_with_object(blit, "generateMipmapsForTexture:", texture);
+        send_void(blit, "endEncoding");
+        let recorded =
+            encoder::TEST_RECORDED_BARRIERS.load(std::sync::atomic::Ordering::Relaxed) - before;
+        assert_eq!(recorded, LEVELS - 1);
+        send_void(command, "commit");
+        send_void(command, "waitUntilCompleted");
+        assert_eq!(send_number_result(command, "status"), 4);
+    }
+    objc::arc::release(texture);
 }
 
 /// Run `name` from `source` once per element of a one-dimensional grid of

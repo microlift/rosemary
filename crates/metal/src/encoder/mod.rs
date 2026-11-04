@@ -195,8 +195,8 @@ pub(crate) struct Encoder {
     /// `MTLDispatchTypeConcurrent`: dispatches may overlap, and the guest
     /// orders them with memory barriers. Every other compute encoder is serial.
     concurrent: bool,
-    /// Whether a full memory barrier followed the most recent compute dispatch.
-    compute_barrier_recorded: bool,
+    /// Whether a full memory barrier follows everything this encoder recorded.
+    barrier_is_last: std::cell::Cell<bool>,
     compute_pipeline: Id,
     render_pipeline: Id,
     depth_state: Id,
