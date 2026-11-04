@@ -1,6 +1,6 @@
 """Binary Ninja loader for Rosemary AOT cache files (`*.rmc`).
 
-`rmc` and `layout` do not need Binary Ninja, so they can be imported on their own.
+`rmc`, `layout` and `context` do not need Binary Ninja, so they can be imported on their own.
 """
 
 try:

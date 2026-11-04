@@ -7,9 +7,17 @@
 * each Microlift chunk's `.text`, `.rodata` and `.bss` are mapped with every relocation applied;
 * host imports, bridges and Cranelift libcalls become typed externs (`name@provider` when two libraries
   export the same name);
-* each region gets `region_<guest va>` (the host entry, `void (RegisterContext*)`) and
+* each region gets `region_<guest va>` (the host entry, `void (RegisterContext* ctx)`) and
   `region_<guest va>_body` (its link target), with covered ranges, resume points, link cells and import
   decisions in a comment, and `cells_<guest va>` as a `BlockLinkEntry` array;
+* `RegisterContext` has Microlift's full x86-64 layout (`context.py` mirrors `src/arch/x86_64/context.rs`), along
+  with `ControlHeader`, `ExitReason`, `TransferKind`, `XmmRegister`, `X87Register`, `BlockLinkEntry` and
+  `CallRetEntry`, so context accesses read as `ctx->rip` or `ctx->control.exit_reason`;
+* on AArch64 hosts, region bodies are typed with the pinned ABI read off their entry thunk: `ctx` and each pinned
+  guest register (`rsp @ x3`, `rdi @ x4`, ...) arrive in the registers the thunk loads them into, and the
+  thunk decompiles to `region_<va>_body(ctx, ctx->rsp, ...)` followed by the write-back. Binary Ninja cannot
+  type a body that returns its pinned registers, so the body shows their incoming values but not the ones it
+  hands back; read the disassembly before the `ret` for those;
 * the guest code map becomes `guest 0x...` comments on the host code;
 * the path of the Mach-O the cache was built from is logged, stored as the `rosemary_aot.source` metadata, and
   commented at the entry point (files written before it was recorded, `RMAOTv1`, still open without it).
@@ -32,7 +40,7 @@ ln -s "$PWD/tools/binja/rosemary_aot" ~/.binaryninja/plugins/                   
 
 ## Test
 
-`rmc.py` and `layout.py` do not need Binary Ninja:
+`rmc.py`, `layout.py` and `context.py` do not need Binary Ninja:
 
 ```sh
 cd tools/binja && python3 -m unittest test_rosemary_aot

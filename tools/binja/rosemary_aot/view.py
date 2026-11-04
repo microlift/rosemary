@@ -15,8 +15,10 @@ from binaryninja import (
     Type,
     log,
 )
-from binaryninja.types import StructureBuilder
+from binaryninja.enums import NamedTypeReferenceClass, StructureVariant
+from binaryninja.types import FunctionParameter, StructureBuilder
 
+from . import context as cx
 from . import layout as lay
 from . import rmc
 
@@ -34,8 +36,6 @@ PLATFORMS = {
 }
 DEFAULT_PLATFORMS = {"aarch64": "linux-aarch64", "x86_64": "linux-x86_64"}
 
-LINK_ENTRY_TYPE = "BlockLinkEntry"
-REGISTER_CONTEXT_TYPE = "RegisterContext"
 
 
 def register_settings() -> None:
@@ -139,6 +139,7 @@ class RosemaryAotView(BinaryView):
         BinaryView.__init__(self, file_metadata=data.file, parent_view=data)
         # Entry and body address -> (chunk index, region index).
         self.function_starts: Dict[int, Tuple[int, int]] = {}
+        self.body_types: Dict[cx.PinnedAbi, Optional[Tuple[Type, List[str]]]] = {}
 
     def guest(self, lift_va: int) -> int:
         return lay.guest_va(self.layout, lift_va)
@@ -192,13 +193,45 @@ class RosemaryAotView(BinaryView):
         memory.add_memory_region("extern", self.layout.extern_start, None, SegmentFlag.SegmentReadable, length=extern_len)
         self.add_auto_section("extern", self.layout.extern_start, extern_len, SectionSemantics.ExternalSectionSemantics)
 
+    def _named(self, name: str) -> Type:
+        if name in cx.ENUMS:
+            enum = cx.ENUMS[name]
+            enum_class = NamedTypeReferenceClass.EnumNamedTypeClass
+            return Type.named_type_reference(enum_class, name, name, enum.size, enum.size)
+        layout = cx.layout_of(name)
+        variant = NamedTypeReferenceClass.StructNamedTypeClass
+        if cx.TYPES[name].union:
+            variant = NamedTypeReferenceClass.UnionNamedTypeClass
+        return Type.named_type_reference(variant, name, name, layout.align, layout.size)
+
+    def _type(self, spec: cx.Spec) -> Type:
+        if isinstance(spec, cx.Int):
+            return Type.int(spec.size, sign=spec.signed)
+        if isinstance(spec, cx.Float):
+            return Type.float(spec.size)
+        if isinstance(spec, cx.Named):
+            return self._named(spec.name)
+        if isinstance(spec, cx.Pointer):
+            return Type.pointer(self.arch, Type.void() if spec.target is None else self._type(spec.target))
+        if isinstance(spec, cx.FunctionPointer):
+            params = [FunctionParameter(self._type(t), name) for t, name in spec.params]
+            return Type.pointer(self.arch, Type.function(Type.void(), params))
+        return Type.array(self._type(spec.element), spec.count)
+
     def _add_types(self) -> None:
-        entry = StructureBuilder.create()
-        u64 = Type.int(8, sign=False)
-        for name in ("guest_pc", "code", "image_base", "reserved"):
-            entry.append(u64, name)
-        self.define_type(LINK_ENTRY_TYPE, LINK_ENTRY_TYPE, Type.structure_type(entry))
-        self.define_type(REGISTER_CONTEXT_TYPE, REGISTER_CONTEXT_TYPE, Type.structure_type(StructureBuilder.create()))
+        for name, enum in cx.ENUMS.items():
+            self.define_type(name, name, Type.enumeration(self.arch, list(enum.members), enum.size))
+        for name, aggregate in cx.TYPES.items():
+            layout = cx.layout_of(name)
+            builder = StructureBuilder.create(
+                type=StructureVariant.UnionStructureType if aggregate.union else StructureVariant.StructStructureType
+            )
+            for field, offset in layout.offsets:
+                builder.insert(offset, self._type(field.spec), field.name, overwrite_existing=False)
+            builder.width = layout.size
+            builder.alignment = layout.align
+            self.define_type(name, name, Type.structure_type(builder))
+        self.context_pointer = self._type(cx.Pointer(cx.Named(cx.REGISTER_CONTEXT)))
 
     def _add_externs(self) -> None:
         for extern in self.layout.externs:
@@ -224,20 +257,18 @@ class RosemaryAotView(BinaryView):
                 f"Rosemary AOT: {annotations} annotations exceed the limit of {self.annotation_limit}; "
                 "use 'Rosemary AOT > Annotate guest addresses' per function"
             )
-        entry_type = Type.function(Type.void(), [Type.pointer(self.arch, Type.named_type_from_registered_type(self, REGISTER_CONTEXT_TYPE))])
-        link_entry = Type.named_type_from_registered_type(self, LINK_ENTRY_TYPE)
+        entry_type = Type.function(Type.void(), [FunctionParameter(self.context_pointer, "ctx")])
+        link_entry = self._named(cx.LINK_ENTRY)
         for c, (image, placed) in enumerate(zip(self.cache.chunks, self.layout.chunks)):
             for r, region in enumerate(image.regions):
                 name = f"region_{self.guest(region.lift_base):x}"
                 entry = placed.text + region.entry
                 body = placed.text + region.link_target
-                self.define_auto_symbol(Symbol(SymbolType.FunctionSymbol, entry, name))
-                self.add_function(entry, self.platform)
-                function = self.get_function_at(entry, self.platform)
-                if function is not None:
-                    function.type = entry_type
-                self.define_auto_symbol(Symbol(SymbolType.FunctionSymbol, body, f"{name}_body"))
-                self.add_function(body, self.platform)
+                self.define_auto_symbol_and_var_or_function(
+                    Symbol(SymbolType.FunctionSymbol, entry, name), entry_type, self.platform
+                )
+                if body != entry:
+                    self._add_body(image, region, body, f"{name}_body")
                 self.set_comment_at(body, self.describe_region(region))
                 self.function_starts[entry] = self.function_starts[body] = (c, r)
                 if region.cells is not None:
@@ -259,6 +290,34 @@ class RosemaryAotView(BinaryView):
             self.add_entry_point(entry)
             if self.cache.source:
                 self.set_comment_at(entry, f"compiled from {self.cache.source}")
+
+    def _add_body(self, image: rmc.Image, region: rmc.Region, body: int, name: str) -> None:
+        """Adds a body called through an entry thunk. Its context and pinned guest registers arrive,
+        and leave, in the registers the thunk loads them into rather than where the platform ABI says."""
+        typed = None
+        abi = cx.decode_aarch64_thunk(image.text, region.entry) if self.arch_name == "aarch64" else None
+        if abi is not None:
+            if abi not in self.body_types:
+                self.body_types[abi] = self._pinned_body_type(abi)
+            typed = self.body_types[abi]
+        symbol = Symbol(SymbolType.FunctionSymbol, body, name)
+        self.define_auto_symbol_and_var_or_function(symbol, typed[0] if typed else None, self.platform)
+        function = self.get_function_at(body, self.platform)
+        if function is not None and typed:
+            function.set_auto_return_regs(typed[1])
+
+    def _pinned_body_type(self, abi: cx.PinnedAbi) -> Optional[Tuple[Type, List[str]]]:
+        params = [f"{cx.REGISTER_CONTEXT}* ctx @ {abi.context}"]
+        params += [f"{cx.XMM_REGISTER if s.vector else 'uint64_t'} {s.guest} @ {s.register}" for s in abi.slots]
+        try:
+            parsed, _ = self.parse_type_string(f"void body({', '.join(params)})")
+        except SyntaxError as error:
+            log.log_warn(f"Rosemary AOT: cannot type region bodies for pinned ABI {abi}: {error}")
+            return None
+        # FIXME (ACCURACY): a body returns its pinned registers in the registers they arrived in.
+        # Binary Ninja cannot type that, so they are only marked as return registers: callers see
+        # them come back, but the body's own final values for them are not shown as results.
+        return parsed, [s.register for s in abi.slots]
 
     def describe_region(self, region: rmc.Region) -> str:
         guest = self.guest
