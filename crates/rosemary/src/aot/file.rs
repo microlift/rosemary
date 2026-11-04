@@ -1,5 +1,5 @@
-//! What one cache file holds: the slide its image was lifted at, and the
-//! Microlift images compiled for it, in the order they finished.
+//! What one cache file holds: the slide its image was lifted at, the path it was
+//! read from, and the Microlift images compiled for it, in the order they finished.
 //!
 //! Several images rather than one so the offline compiler can build them on
 //! separate threads and write each as it finishes, and so a build stopped by its
@@ -10,7 +10,7 @@ use std::io::{Seek, SeekFrom, Write};
 use microlift::image::Image;
 
 /// Identifies a Rosemary cache file, ahead of anything Microlift reads.
-const MAGIC: [u8; 8] = *b"RMAOTv1\0";
+const MAGIC: [u8; 8] = *b"RMAOTv2\0";
 
 /// Where the chunk count is, after the magic and the lift slide.
 const COUNT_OFFSET: u64 = (MAGIC.len() + 8) as u64;
@@ -20,6 +20,10 @@ pub struct CacheFile {
     /// Run-time minus file address of the image when it was lifted. A run that
     /// places it elsewhere loads the code at the difference.
     pub lift_slide: u64,
+    /// Where the image was read from when the file was built. Files are keyed by
+    /// the image's contents, so a copy elsewhere can find this file too; this is
+    /// for tools reading the file, never for loading it.
+    pub source: String,
     pub chunks: Vec<Image>,
 }
 
@@ -28,13 +32,18 @@ pub struct CacheFile {
 pub enum DecodeError {
     NotACacheFile,
     Truncated,
+    SourceNotUtf8,
     Image(microlift::MicroliftError),
 }
 
 impl CacheFile {
     pub fn encode(&self) -> Vec<u8> {
-        let mut writer = Writer::new(std::io::Cursor::new(Vec::new()), self.lift_slide)
-            .expect("writing to memory");
+        let mut writer = Writer::new(
+            std::io::Cursor::new(Vec::new()),
+            self.lift_slide,
+            &self.source,
+        )
+        .expect("writing to memory");
         for chunk in &self.chunks {
             writer.push(chunk).expect("writing to memory");
         }
@@ -53,6 +62,11 @@ impl CacheFile {
         };
         let lift_slide = word(&mut at)?;
         let count = word(&mut at)?;
+        let source_len = usize::try_from(word(&mut at)?).map_err(|_| DecodeError::Truncated)?;
+        let source_end = at.checked_add(source_len).ok_or(DecodeError::Truncated)?;
+        let source = bytes.get(at..source_end).ok_or(DecodeError::Truncated)?;
+        let source = String::from_utf8(source.to_vec()).map_err(|_| DecodeError::SourceNotUtf8)?;
+        at = source_end;
         let mut chunks = Vec::new();
         for _ in 0..count {
             let len = usize::try_from(word(&mut at)?).map_err(|_| DecodeError::Truncated)?;
@@ -64,7 +78,11 @@ impl CacheFile {
         if at != bytes.len() {
             return Err(DecodeError::Truncated);
         }
-        Ok(CacheFile { lift_slide, chunks })
+        Ok(CacheFile {
+            lift_slide,
+            source,
+            chunks,
+        })
     }
 }
 
@@ -76,11 +94,13 @@ pub struct Writer<W: Write + Seek> {
 }
 
 impl<W: Write + Seek> Writer<W> {
-    pub fn new(mut out: W, lift_slide: u64) -> std::io::Result<Self> {
+    pub fn new(mut out: W, lift_slide: u64, source: &str) -> std::io::Result<Self> {
         out.write_all(&MAGIC)?;
         out.write_all(&lift_slide.to_le_bytes())?;
         // The chunk count, filled in by `finish`.
         out.write_all(&0u64.to_le_bytes())?;
+        out.write_all(&(source.len() as u64).to_le_bytes())?;
+        out.write_all(source.as_bytes())?;
         Ok(Writer { out, chunks: 0 })
     }
 
@@ -122,6 +142,7 @@ mod tests {
     fn a_file_round_trips_with_its_chunks_in_order() {
         let file = CacheFile {
             lift_slide: 0x1000,
+            source: "/Applications/Example.app/Contents/MacOS/Example".into(),
             chunks: vec![image(2), image(3)],
         };
         assert_eq!(CacheFile::decode(&file.encode()).unwrap(), file);
@@ -129,12 +150,18 @@ mod tests {
 
     #[test]
     fn a_streamed_file_counts_the_chunks_written() {
-        let mut writer = Writer::new(std::io::Cursor::new(Vec::new()), 0x2000).unwrap();
+        let mut writer = Writer::new(
+            std::io::Cursor::new(Vec::new()),
+            0x2000,
+            "/usr/lib/libexample.dylib",
+        )
+        .unwrap();
         writer.push(&image(4)).unwrap();
         writer.push(&image(5)).unwrap();
         let bytes = writer.finish().unwrap().into_inner();
         let file = CacheFile::decode(&bytes).unwrap();
         assert_eq!(file.lift_slide, 0x2000);
+        assert_eq!(file.source, "/usr/lib/libexample.dylib");
         assert_eq!(file.chunks, [image(4), image(5)]);
     }
 
@@ -142,6 +169,7 @@ mod tests {
     fn a_truncated_file_is_refused() {
         let bytes = CacheFile {
             lift_slide: 0,
+            source: "/bin/example".into(),
             chunks: vec![image(2)],
         }
         .encode();

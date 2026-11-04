@@ -10,7 +10,9 @@
 * each region gets `region_<guest va>` (the host entry, `void (RegisterContext*)`) and
   `region_<guest va>_body` (its link target), with covered ranges, resume points, link cells and import
   decisions in a comment, and `cells_<guest va>` as a `BlockLinkEntry` array;
-* the guest code map becomes `guest 0x...` comments on the host code.
+* the guest code map becomes `guest 0x...` comments on the host code;
+* the path of the Mach-O the cache was built from is logged, stored as the `rosemary_aot.source` metadata, and
+  commented at the entry point (files written before it was recorded, `RMAOTv1`, still open without it).
 
 Guest addresses are the image's file VAs by default, so they match the Mach-O opened on its own; the
 `Rosemary AOT > Guest address space` setting switches to the run-time VAs the image was lifted at.

@@ -42,15 +42,24 @@ def sample_image():
     return out
 
 
+SAMPLE_SOURCE = "/Applications/Example.app/Contents/MacOS/Example"
+
+
 def sample_file(lift_slide=0x800):
     image = sample_image()
-    return rmc.CACHE_MAGIC + u64(lift_slide) + u64(1) + u64(len(image)) + image
+    return rmc.CACHE_MAGIC + u64(lift_slide) + u64(1) + string(SAMPLE_SOURCE) + u64(len(image)) + image
+
+
+def sample_v1_file(lift_slide=0x800):
+    image = sample_image()
+    return rmc.CACHE_MAGIC_V1 + u64(lift_slide) + u64(1) + u64(len(image)) + image
 
 
 class ReaderTests(unittest.TestCase):
     def test_reads_a_file_with_its_regions(self):
         cache = rmc.decode(sample_file())
         self.assertEqual(cache.lift_slide, 0x800)
+        self.assertEqual(cache.source, SAMPLE_SOURCE)
         image = cache.chunks[0]
         self.assertEqual(image.isa_fingerprint, 1)
         self.assertIsInstance(image.symbols[0], rmc.GuestSlide)
@@ -60,6 +69,11 @@ class ReaderTests(unittest.TestCase):
         self.assertEqual(region.link_sites, [(0x2000, rmc.LinkSiteKind.STATIC_EDGE)])
         self.assertEqual(region.import_decisions[0][1].kind, rmc.DecisionKind.SLOW)
         self.assertEqual(region.map, [(0, 4, 0x1000)])
+
+    def test_reads_a_v1_file_without_a_source(self):
+        cache = rmc.decode(sample_v1_file())
+        self.assertIsNone(cache.source)
+        self.assertEqual(len(cache.chunks), 1)
 
     def test_rejects_truncated_and_foreign_files(self):
         data = sample_file()

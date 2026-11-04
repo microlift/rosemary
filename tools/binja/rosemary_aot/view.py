@@ -153,6 +153,8 @@ class RosemaryAotView(BinaryView):
             self._add_externs()
             self._add_regions()
             self._store_metadata()
+            if self.cache.source:
+                log.log_info(f"Rosemary AOT: cache of {self.cache.source}")
             return True
         except Exception:
             log.log_error(f"Rosemary AOT: failed to load cache file\n{traceback.format_exc()}")
@@ -253,7 +255,10 @@ class RosemaryAotView(BinaryView):
                 for reloc in image.relocs:
                     self.define_data_var(placed.text + reloc.offset, pointer)
         if self.function_starts:
-            self.add_entry_point(self.perform_get_entry_point())
+            entry = self.perform_get_entry_point()
+            self.add_entry_point(entry)
+            if self.cache.source:
+                self.set_comment_at(entry, f"compiled from {self.cache.source}")
 
     def describe_region(self, region: rmc.Region) -> str:
         guest = self.guest
@@ -301,6 +306,8 @@ class RosemaryAotView(BinaryView):
         return found
 
     def _store_metadata(self) -> None:
+        if self.cache.source:
+            self.store_metadata("rosemary_aot.source", self.cache.source, isAuto=True)
         self.store_metadata("rosemary_aot.lift_slide", self.cache.lift_slide, isAuto=True)
         self.store_metadata("rosemary_aot.guest_slide", self.layout.guest_slide, isAuto=True)
         fingerprints = sorted({(i.isa_fingerprint, i.config_fingerprint) for i in self.cache.chunks})
