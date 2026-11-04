@@ -247,14 +247,17 @@ pub(super) unsafe extern "C" fn set_depth_bias(
     clamp: f32,
 ) {
     // SAFETY: an encoder of this crate's.
-    let command = unsafe { object::body::<Encoder>(receiver) }.command();
-    // SAFETY: recording into this command buffer.
-    unsafe {
-        command
-            .gpu
-            .device
-            .cmd_set_depth_bias(command.command_buffer, bias, clamp, slope_scale)
-    };
+    let encoder = unsafe { object::body::<Encoder>(receiver) };
+    let command = encoder.command();
+    encoder.depth_bias.record(
+        &command.gpu.device,
+        command.command_buffer,
+        DepthBias {
+            bias,
+            slope_scale,
+            clamp,
+        },
+    );
 }
 
 pub(super) unsafe extern "C" fn set_blend_color(

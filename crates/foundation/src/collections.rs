@@ -1755,8 +1755,8 @@ unsafe extern "C" fn dictionary_mutable_copy_with_zone(
     unsafe { dictionary_mutable_copy(receiver, sel) }
 }
 
-/// `-init` on `NSMutableArray` and `NSMutableDictionary`, which are class
-/// clusters.
+/// `-init` on `NSMutableArray`, `NSMutableDictionary` and `NSMutableSet`,
+/// which are class clusters.
 ///
 /// `+alloc` on one of those answers an instance of the abstract class itself -
 /// an isa and nothing else - because that is all an abstract class has room
@@ -2552,6 +2552,22 @@ unsafe extern "C" fn set_with_capacity(_class: Id, _sel: Sel, _capacity: usize) 
     unsafe { api::CFAutorelease(collections::new_set(&[], Policy::from_type_callbacks())) as Id }
 }
 
+/// `-initWithCapacity:`, where the capacity is a hint this store has no use for.
+unsafe extern "C" fn init_mutable_set_with_capacity(
+    receiver: Id,
+    _sel: Sel,
+    _capacity: usize,
+) -> Id {
+    // SAFETY: an object of this class.
+    let known = unsafe { collections::set(receiver as CFTypeRef) }.is_some();
+    // SAFETY: as above, with a fresh empty set.
+    unsafe {
+        cluster_init(receiver, known, || {
+            collections::new_set(&[], Policy::from_type_callbacks())
+        })
+    }
+}
+
 unsafe extern "C" fn set_with_array(_class: Id, _sel: Sel, array: Id) -> Id {
     // SAFETY: the argument is an NSArray or nil.
     let values = unsafe { collections::array(array as CFTypeRef) }
@@ -2912,6 +2928,7 @@ pub(crate) fn install() {
     });
     let mutable_set = objc::class::lookup(c"NSMutableSet").expect("NSMutableSet");
     methods!(mutable_set, {
+        "initWithCapacity:" => init_mutable_set_with_capacity, c"@24@0:8Q16";
         "addObject:" => set_add_object, c"v24@0:8@16";
         "addObjectsFromArray:" => set_add_objects, c"v24@0:8@16";
         "unionSet:" => set_add_objects, c"v24@0:8@16";
@@ -3196,6 +3213,23 @@ mod tests {
             base64_decode(b"aGV5\naGk=", true).as_deref(),
             Some(&b"heyhi"[..])
         );
+    }
+
+    #[test]
+    fn mutable_set_init_with_capacity_answers_a_usable_set() {
+        crate::bootstrap();
+        let class = objc::class::lookup(c"NSMutableSet").expect("NSMutableSet");
+        let placeholder = objc::object::create_instance(class, 0);
+        // SAFETY: a fresh NSMutableSet placeholder, owned here.
+        let set = unsafe {
+            init_mutable_set_with_capacity(placeholder, objc::sel::get("initWithCapacity:"), 4)
+        };
+        let member = crate::string::from_str("member");
+        // SAFETY: `set` is a live set and `member` a live object.
+        unsafe {
+            set_add_object(set, objc::sel::get("addObject:"), member);
+            assert_eq!(set_count(set, objc::sel::get("count")), 1);
+        }
     }
 
     #[test]

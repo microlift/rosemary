@@ -7,10 +7,12 @@
 //! Microlift images; the file lists the chunks in priority order, and a build
 //! stopped by its deadline writes every chunk that finished.
 
+use std::collections::HashSet;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Instant;
 
+use machish::memory::MmapSpace;
 use machish::report::ImageReport;
 use microlift::arch::x86_64::X86_64;
 use microlift::core::{LifterConfig, lift_to_code};
@@ -45,22 +47,56 @@ pub enum Outcome {
     Failed(String),
 }
 
-/// Compiles every image of `vm`'s program into `layout`, reporting each by path.
+/// Compiles every image of `vm`'s program into `layout`, then every image earlier
+/// runs `dlopen`ed and what each brought in, reporting each by path.
+///
+/// `vm` must be published (`thunk::publish`): linking a `dlopen`ed image asks it
+/// what is guest code, as a run does.
 pub fn build(vm: &Vm, layout: &Layout, options: &Options) -> Vec<(String, Outcome)> {
-    vm.program
-        .report
-        .images
-        .iter()
-        .map(|report| {
-            (
-                report.path.clone(),
-                build_image(vm, layout, report, options),
-            )
-        })
-        .collect()
+    let mut built = HashSet::new();
+    let mut out = Vec::new();
+    for report in &vm.program.report.images {
+        built.insert(report.path.clone());
+        let outcome = build_image(vm, layout, report, &vm.program.memory, options);
+        out.push((report.path.clone(), outcome));
+    }
+    for path in dlopened(layout) {
+        // In the order runs opened them, so each binds as it did there.
+        let image = match crate::dyld::link_without_running(&path) {
+            Ok(image) => image,
+            Err(e) => {
+                out.push((path, Outcome::Failed(format!("dlopen: {e}"))));
+                continue;
+            }
+        };
+        for report in &image.report.images {
+            if !built.insert(report.path.clone()) {
+                continue;
+            }
+            let outcome = image
+                .with_memory(|memory| build_image(vm, layout, report, memory, options))
+                .unwrap_or(Outcome::Skipped("unloaded"));
+            out.push((report.path.clone(), outcome));
+        }
+    }
+    out
 }
 
-fn build_image(vm: &Vm, layout: &Layout, report: &ImageReport, options: &Options) -> Outcome {
+/// The images runs of this executable `dlopen`ed, in first-opened order.
+fn dlopened(layout: &Layout) -> Vec<String> {
+    crate::dyld::executable_host_path()
+        .and_then(|executable| super::profile::image_id(&executable))
+        .and_then(|id| super::profile::read_dlopens(&layout.dlopens(&id)).ok())
+        .unwrap_or_default()
+}
+
+fn build_image(
+    vm: &Vm,
+    layout: &Layout,
+    report: &ImageReport,
+    memory: &MmapSpace,
+    options: &Options,
+) -> Outcome {
     if !report.segments.iter().any(|segment| segment.executable) {
         return Outcome::Skipped("no code");
     }
@@ -72,7 +108,7 @@ fn build_image(vm: &Vm, layout: &Layout, report: &ImageReport, options: &Options
     if options.only_missing && path.exists() {
         return Outcome::Skipped("already cached");
     }
-    if !super::matches_file(&vm.program.memory, report, &bytes) {
+    if !super::matches_file(memory, report, &bytes) {
         return Outcome::Skipped("the code loaded is not the code in its file");
     }
     let _lock = match super::store::try_lock(&path) {
@@ -85,10 +121,10 @@ fn build_image(vm: &Vm, layout: &Layout, report: &ImageReport, options: &Options
         Err(e) => return Outcome::Failed(e.to_string()),
     };
     let profiled = super::profile::read(&layout.profile(&id)).unwrap_or_default();
-    let entries = entries::of(report, &vm.program.memory, &image_layout, &profiled);
+    let entries = entries::of(report, memory, &image_layout, &profiled);
     let plan = plan(vm, &entries);
 
-    let compiled = compile(vm, &plan, options);
+    let compiled = compile(vm, report, &plan, options);
     let complete = compiled.finished == plan.len();
     let file = CacheFile {
         lift_slide: report.slide,
@@ -155,7 +191,7 @@ struct Compiled {
     finished: usize,
 }
 
-fn compile(vm: &Vm, plan: &[Planned], options: &Options) -> Compiled {
+fn compile(vm: &Vm, report: &ImageReport, plan: &[Planned], options: &Options) -> Compiled {
     let chunks: Vec<&[Planned]> = plan.chunks(CHUNK_REGIONS).collect();
     let next = AtomicUsize::new(0);
     let done: Mutex<Vec<(usize, Chunk)>> = Mutex::new(Vec::new());
@@ -187,8 +223,14 @@ fn compile(vm: &Vm, plan: &[Planned], options: &Options) -> Compiled {
                     if past(options.deadline) {
                         break;
                     }
-                    let built =
-                        compile_chunk(&config, fingerprint, &isa_settings, chunk, options.deadline);
+                    let built = compile_chunk(
+                        &config,
+                        report,
+                        fingerprint,
+                        &isa_settings,
+                        chunk,
+                        options.deadline,
+                    );
                     done.lock()
                         .unwrap_or_else(|e| e.into_inner())
                         .push((index, built));
@@ -223,6 +265,7 @@ struct Chunk {
 
 fn compile_chunk(
     config: &LifterConfig,
+    report: &ImageReport,
     fingerprint: u64,
     isa_settings: &[(&str, &str)],
     plan: &[Planned],
@@ -246,7 +289,8 @@ fn compile_chunk(
         if past(deadline) {
             break;
         }
-        let added = lift(config, planned).is_some_and(|lifted| builder.add_region(lifted).is_ok());
+        let added =
+            lift(config, report, planned).is_some_and(|lifted| builder.add_region(lifted).is_ok());
         match added {
             true => chunk.regions += 1,
             false => chunk.refused += 1,
@@ -256,14 +300,25 @@ fn compile_chunk(
     chunk
 }
 
-/// `planned` lifted as [`crate::cache`] lifts it, or `None` if it may not be cached.
-fn lift(config: &LifterConfig, planned: &Planned) -> Option<microlift::core::LiftedCode> {
+/// `planned`, a region of `report`, lifted as [`crate::cache`] lifts it, or `None`
+/// if it may not be cached.
+fn lift(
+    config: &LifterConfig,
+    report: &ImageReport,
+    planned: &Planned,
+) -> Option<microlift::core::LiftedCode> {
     let mut region_config = config.clone();
     region_config.resume_points = planned.resume_points.clone();
     region_config.block_ranges = planned.region.blocks.clone();
     let lifted =
         lift_to_code::<X86_64>(&planned.bytes, planned.region.range.start, region_config).ok()?;
-    super::resolve::cacheable(config, &lifted.import_decisions).then_some(lifted)
+    let in_image = |va: u64| {
+        report
+            .segments
+            .iter()
+            .any(|segment| va.wrapping_sub(segment.vmaddr) < segment.vmsize)
+    };
+    super::resolve::cacheable(config, &lifted.import_decisions, in_image).then_some(lifted)
 }
 
 fn past(deadline: Option<Instant>) -> bool {

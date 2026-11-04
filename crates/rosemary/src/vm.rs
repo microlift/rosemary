@@ -542,6 +542,9 @@ impl Vm {
         if let Some(root) = program.report.root() {
             crate::dyld::set_executable_header(root.base);
         }
+        // What `RTLD_NEXT` and a later `dlopen` resolve against, which a
+        // static initializer may already ask for.
+        crate::dyld::register_mapped_images(&program.report);
 
         let cache = CodeCache::new(program.lifter_config_with(policy));
         // The calling thread becomes the guest's main thread: this is the stack

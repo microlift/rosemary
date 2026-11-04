@@ -114,3 +114,50 @@ fn a_run_with_nothing_cached_builds_the_cache_in_the_background() {
         std::thread::sleep(std::time::Duration::from_millis(200));
     }
 }
+
+#[test]
+fn an_image_a_run_dlopened_is_compiled_and_runs_from_its_cache() {
+    let Some(path) = common::dlopen_fixture() else {
+        skip!("cannot build x86_64 fixtures")
+    };
+    let plugin = Path::new(&path).with_file_name("libplugin.dylib");
+    let plugin = std::fs::canonicalize(plugin).expect("the fixture's plugin");
+    let plugin = plugin.to_str().expect("a UTF-8 fixture path");
+    let dir = cache("aot-cache-dlopen");
+    let quiet = [("ROSEMARY_AOT_BACKGROUND", "0")];
+
+    let first = run(&dir, &path, &quiet);
+    assert!(
+        first.status.success(),
+        "{}",
+        String::from_utf8_lossy(&first.stderr)
+    );
+
+    let built = common::driver_command()
+        .env("ROSEMARY_AOT_CACHE", &dir)
+        .args(["aot", &path])
+        .output()
+        .expect("running the driver");
+    let report = String::from_utf8_lossy(&built.stdout);
+    assert!(
+        built.status.success()
+            && report
+                .lines()
+                .any(|line| line.starts_with(&format!("{plugin}: ")) && line.contains("cached")),
+        "{report}{}",
+        String::from_utf8_lossy(&built.stderr)
+    );
+
+    let cached = run(&dir, &path, &[quiet[0], ("ROSEMARY_TRACE_VM", "1")]);
+    let stderr = String::from_utf8_lossy(&cached.stderr);
+    assert_eq!(cached.status.code(), first.status.code(), "{stderr}");
+    assert_eq!(cached.stdout, first.stdout);
+    let prefix = format!("rosemary: aot: {plugin}: ");
+    assert!(
+        stderr.lines().any(|line| line
+            .strip_prefix(&prefix)
+            .and_then(|rest| rest.split(' ').next()?.parse::<usize>().ok())
+            .is_some_and(|regions| regions > 0)),
+        "{stderr}"
+    );
+}

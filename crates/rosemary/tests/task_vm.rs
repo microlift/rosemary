@@ -20,6 +20,9 @@ kern_return_t mach_vm_deallocate(mach_port_t, mach_vm_address_t, mach_vm_address
 kern_return_t task_suspend(mach_port_t);
 kern_return_t task_resume(mach_port_t);
 int fork(void);
+int getpid(void);
+int getppid(void);
+int close(int);
 int pipe(int[2]);
 long read(int, void *, unsigned long);
 long write(int, const void *, unsigned long);
@@ -43,6 +46,7 @@ void *signal(int, void (*)(int));
 static volatile long counter;
 static volatile char marker[16] = "child-side";
 static volatile int continued;
+static int parent;
 static const char constant[16] = "read-only";
 
 static void on_continue(int signo) { (void)signo; continued = 1; }
@@ -60,7 +64,12 @@ static long counter_of(mach_port_t task) {
 static int spin(int ready) {
     signal(SIGCONT, on_continue);
     write(ready, "r", 1);
-    while (strcmp((const char *)marker, "parent-wrote") != 0) counter++;
+    // A parent that gave up never writes the marker; without it the child
+    // spins forever and holds the test's output pipe open.
+    while (strcmp((const char *)marker, "parent-wrote") != 0) {
+        if (getppid() != parent) _exit(4);
+        counter++;
+    }
     // Let the parent check it runs again before going.
     for (long i = 0; i < 50000000; i++) counter++;
     _exit(continued ? 3 : 0);
@@ -71,6 +80,7 @@ int main(int argc, char **argv) {
         usleep(5000000);
         return 0;
     }
+    parent = getpid();
     int ready[2];
     CHECK(pipe(ready) == 0);
     int child = fork();
@@ -116,6 +126,8 @@ int main(int argc, char **argv) {
     child = fork();
     CHECK(child >= 0);
     if (child == 0) {
+        // Only the parent's end left, so a parent that gave up is EOF.
+        close(go[1]);
         write(ready[1], "r", 1);
         read(go[0], &byte, 1);
         char *args[] = {argv[0], "exec-target", 0};
@@ -140,6 +152,10 @@ int main(int argc, char **argv) {
 "#;
 
 #[test]
+#[cfg_attr(
+    target_os = "macos",
+    ignore = "a macOS host has no realtime signal for the task service handler; see darwin::mach::service::install"
+)]
 fn a_guest_reads_writes_and_suspends_another() {
     let built = [
         (
