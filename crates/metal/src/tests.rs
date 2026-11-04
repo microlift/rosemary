@@ -1759,6 +1759,12 @@ fn recording_cost() {
     );
 }
 
+const MTL_PIXEL_FORMAT_DEPTH32_FLOAT: u64 = 252;
+const MTL_STORAGE_MODE_PRIVATE: u64 = 2;
+const MTL_COMPARE_FUNCTION_LESS_EQUAL: u64 = 3;
+const MTL_LOAD_ACTION_CLEAR: u64 = 2;
+const MTL_STORE_ACTION_STORE: u64 = 1;
+
 /// `MTLVisibilityResultMode`.
 const VISIBILITY_DISABLED: u64 = 0;
 const VISIBILITY_BOOLEAN: u64 = 1;
@@ -1779,10 +1785,12 @@ struct CoveringDraw {
 /// The triangle program and target of `a_translated_triangle_draws_on_the_gpu`,
 /// or `None` where the device cannot count samples exactly.
 fn covering_draw(device: Id) -> Option<CoveringDraw> {
-    covering_draw_with_depth(device, 0)
+    covering_draw_with_depth(device, MTL_PIXEL_FORMAT_INVALID, 0.0)
 }
 
-fn covering_draw_with_depth(device: Id, depth_format: u64) -> Option<CoveringDraw> {
+/// A covering draw whose pipeline has `depth_format`, with its triangle at
+/// depth `z`.
+fn covering_draw_with_depth(device: Id, depth_format: u64, z: f32) -> Option<CoveringDraw> {
     let gpu = gpu_of(device).expect("a Vulkan device");
     if !gpu.occlusion_precise {
         return None;
@@ -1868,9 +1876,9 @@ fn covering_draw_with_depth(device: Id, depth_format: u64) -> Option<CoveringDra
     unsafe {
         let contents = object::body::<resource::Buffer>(vertices).inner.contents as *mut f32;
         for (index, value) in [
-            -1.0f32, -1.0, 0.0, 1.0, //
-            3.0, -1.0, 0.0, 1.0, //
-            -1.0, 3.0, 0.0, 1.0,
+            -1.0f32, -1.0, z, 1.0, //
+            3.0, -1.0, z, 1.0, //
+            -1.0, 3.0, z, 1.0,
         ]
         .iter()
         .enumerate()
@@ -1968,32 +1976,33 @@ fn repeated_depth_bias_preserves_changed_depth_tests() {
     let Some(device) = gpu_device() else {
         return;
     };
-    // MTLPixelFormatDepth32Float.
-    const DEPTH32: u64 = 252;
-    // The Vulkan constant bias is scaled by the depth format's resolution.
-    const NONZERO_BIAS: f32 = 32_768.0;
-    let Some(fixture) = covering_draw_with_depth(device, DEPTH32) else {
+    // On a float format the constant bias is in units of the primitive's
+    // depth exponent, which a depth of zero leaves to the implementation.
+    const DEPTH: f32 = 0.5;
+    const NONZERO_BIAS: f32 = 1024.0;
+    let Some(fixture) = covering_draw_with_depth(device, MTL_PIXEL_FORMAT_DEPTH32_FLOAT, DEPTH)
+    else {
         return;
     };
     let gpu = gpu_of(device).expect("a Vulkan device");
     let depth = resource::new_texture(
         gpu,
         resource::TextureDescriptor {
-            texture_type: 2,
-            pixel_format: DEPTH32,
+            texture_type: MTL_TEXTURE_TYPE_2D,
+            pixel_format: MTL_PIXEL_FORMAT_DEPTH32_FLOAT,
             width: COVERING_SIZE,
             height: COVERING_SIZE,
             depth: 1,
             mipmap_level_count: 1,
             sample_count: 1,
             array_length: 1,
-            storage_mode: 2,
+            storage_mode: MTL_STORAGE_MODE_PRIVATE,
             usage: gpu::USAGE_RENDER_TARGET,
         },
     );
     assert!(!depth.is_null());
     let depth_state = resource::new_depth_stencil_state(resource::DepthStencilState {
-        depth_compare: 3, // MTLCompareFunctionLessEqual.
+        depth_compare: MTL_COMPARE_FUNCTION_LESS_EQUAL,
         depth_write: true,
         ..resource::DepthStencilState::default()
     });
@@ -2003,8 +2012,8 @@ fn repeated_depth_bias_preserves_changed_depth_tests() {
     unsafe {
         let attachment = send(pass, "depthAttachment");
         send_with_object(attachment, "setTexture:", depth);
-        send_number(attachment, "setLoadAction:", 2); // Clear.
-        send_number(attachment, "setStoreAction:", 1); // Store.
+        send_number(attachment, "setLoadAction:", MTL_LOAD_ACTION_CLEAR);
+        send_number(attachment, "setStoreAction:", MTL_STORE_ACTION_STORE);
         let command = send(fixture.queue, "commandBuffer");
         let render = render_encoder(command, pass);
         fixture.bind(render);
