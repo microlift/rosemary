@@ -10,7 +10,10 @@ mod submit;
 mod trace;
 
 use std::collections::HashMap;
-use std::sync::{Arc, Condvar, Mutex, OnceLock, atomic::AtomicBool};
+use std::sync::{
+    Arc, Condvar, Mutex, OnceLock,
+    atomic::{AtomicBool, AtomicUsize},
+};
 
 use ash::{Device, Entry, Instance, vk};
 use static_init::dynamic;
@@ -91,6 +94,9 @@ pub struct Gpu {
     /// submit attached to it. Queue calls themselves keep using `queue` for
     /// Vulkan's external-synchronization rule.
     submission_boundary: Mutex<()>,
+    /// Submissions on the queue which wait for an event. Work behind one may
+    /// run only once the CPU signals it, after writes it makes past commit.
+    pub(crate) event_waits_in_flight: AtomicUsize,
     /// In-flight work and its completion worker are device-local. Independent
     /// Vulkan devices must never head-of-line block one another.
     pub(crate) submissions: crate::submission::Tracker,
@@ -768,6 +774,7 @@ impl Gpu {
             queue: Mutex::new(queue),
             wsi: Mutex::new(()),
             submission_boundary: Mutex::new(()),
+            event_waits_in_flight: AtomicUsize::new(0),
             submissions: crate::submission::Tracker::new(),
             deferred: deferred::Deferred::default(),
             presenter: crate::present::Presenter::new(),

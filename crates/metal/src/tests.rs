@@ -507,9 +507,9 @@ fn a_private_buffer_is_filled_written_and_copied_by_the_device() {
 }
 
 /// A large shared buffer is host pages the device imports as it uses them: a
-/// copy imports only the range it names and a binding the whole buffer, over
-/// pages a copy already imported. Each must see what the host wrote, and the
-/// host what each wrote.
+/// copy into it imports only the range it names and a binding the whole
+/// buffer, over pages a copy already imported. Each must see what the host
+/// wrote, and the host what each wrote.
 #[test]
 fn a_large_shared_buffer_is_seen_through_its_host_pages() {
     isolate_metal_fixture!();
@@ -534,18 +534,18 @@ fn a_large_shared_buffer_is_seen_through_its_host_pages() {
         let other = new_buffer(device, std::ptr::null(), LENGTH, 0);
         let small = new_buffer(device, std::ptr::null(), 16, 0);
         let contents = object::body::<resource::Buffer>(large).inner.contents;
-        std::ptr::copy_nonoverlapping([1u32, 2, 3, 4].as_ptr(), contents.add(OFFSET).cast(), 4);
+        let small_contents = object::body::<resource::Buffer>(small).inner.contents;
+        std::ptr::copy_nonoverlapping([1u32, 2, 3, 4].as_ptr(), small_contents.cast(), 4);
         let queue = new_command_queue(device, std::ptr::null());
 
         let command = send(queue, "commandBuffer");
         let blit = send(command, "blitCommandEncoder");
-        copy_buffer_range(blit, large, OFFSET as u64, small, 0, 16);
+        copy_buffer_range(blit, small, 0, large, OFFSET as u64, 16);
         send_void(blit, "endEncoding");
         send_void(command, "commit");
         send_void(command, "waitUntilCompleted");
-        let small_contents = object::body::<resource::Buffer>(small).inner.contents;
         assert_eq!(
-            std::slice::from_raw_parts(small_contents as *const u32, 4),
+            std::slice::from_raw_parts(contents.add(OFFSET) as *const u32, 4),
             [1, 2, 3, 4]
         );
 
@@ -571,6 +571,139 @@ fn a_large_shared_buffer_is_seen_through_its_host_pages() {
             [1, 2, 3, 4]
         );
         for buffer in [large, other, small] {
+            objc::arc::release(buffer);
+        }
+    }
+}
+
+/// Bytes a large shared buffer copy reads, written by the host after the copy
+/// was encoded but before commit, never importing the source.
+#[test]
+fn a_copy_out_of_host_pages_reads_them_as_committed() {
+    isolate_metal_fixture!();
+    let Some(device) = gpu_device() else {
+        return;
+    };
+    const LENGTH: usize = 4 << 20;
+    // SAFETY: objects this test made, sent the selectors they implement.
+    unsafe {
+        let large = new_buffer(device, std::ptr::null(), LENGTH, 0);
+        let small = new_buffer(device, std::ptr::null(), 16, 0);
+        let queue = new_command_queue(device, std::ptr::null());
+        let command = send(queue, "commandBuffer");
+        let blit = send(command, "blitCommandEncoder");
+        copy_buffer_range(blit, large, (LENGTH - 16) as u64, small, 0, 16);
+        send_void(blit, "endEncoding");
+        let contents = object::body::<resource::Buffer>(large).inner.contents;
+        std::ptr::copy_nonoverlapping(
+            [1u32, 2, 3, 4].as_ptr(),
+            contents.add(LENGTH - 16).cast(),
+            4,
+        );
+        send_void(command, "commit");
+        send_void(command, "waitUntilCompleted");
+        let small_contents = object::body::<resource::Buffer>(small).inner.contents;
+        assert_eq!(
+            std::slice::from_raw_parts(small_contents as *const u32, 4),
+            [1, 2, 3, 4]
+        );
+        let pages = object::body::<resource::Buffer>(large).host_pages();
+        assert!(pages.is_some_and(|pages| !pages.imported()));
+        for buffer in [large, small] {
+            objc::arc::release(buffer);
+        }
+    }
+}
+
+/// A copy encoded before the device was given its source, committed after
+/// work which writes that source, reads what the work wrote.
+#[test]
+fn a_copy_out_of_host_pages_follows_device_writes_queued_before_it() {
+    isolate_metal_fixture!();
+    let Some(device) = gpu_device() else {
+        return;
+    };
+    const LENGTH: usize = 4 << 20;
+    // SAFETY: objects this test made, sent the selectors they implement.
+    unsafe {
+        let large = new_buffer(device, std::ptr::null(), LENGTH, 0);
+        let source = new_buffer(device, std::ptr::null(), 16, 0);
+        let small = new_buffer(device, std::ptr::null(), 16, 0);
+        let source_contents = object::body::<resource::Buffer>(source).inner.contents;
+        std::ptr::copy_nonoverlapping([5u32, 6, 7, 8].as_ptr(), source_contents.cast(), 4);
+        let queue = new_command_queue(device, std::ptr::null());
+
+        let reader = send(queue, "commandBuffer");
+        let blit = send(reader, "blitCommandEncoder");
+        copy_buffer_range(blit, large, 0, small, 0, 16);
+        send_void(blit, "endEncoding");
+
+        let writer = send(queue, "commandBuffer");
+        let blit = send(writer, "blitCommandEncoder");
+        copy_buffer_range(blit, source, 0, large, 0, 16);
+        send_void(blit, "endEncoding");
+        send_void(writer, "commit");
+
+        send_void(reader, "commit");
+        send_void(reader, "waitUntilCompleted");
+        let small_contents = object::body::<resource::Buffer>(small).inner.contents;
+        assert_eq!(
+            std::slice::from_raw_parts(small_contents as *const u32, 4),
+            [5, 6, 7, 8]
+        );
+        for buffer in [large, source, small] {
+            objc::arc::release(buffer);
+        }
+    }
+}
+
+/// Work queued behind an event wait runs once the host signals it, so a copy
+/// there reads what the host wrote after committing it.
+#[test]
+fn a_copy_out_of_host_pages_behind_an_event_wait_reads_them_as_signalled() {
+    isolate_metal_fixture!();
+    let Some(device) = gpu_device() else {
+        return;
+    };
+    const LENGTH: usize = 4 << 20;
+    // SAFETY: objects this test made, sent the selectors they implement.
+    unsafe {
+        let event = send(device, "newSharedEvent");
+        assert!(!event.is_null());
+        let large = new_buffer(device, std::ptr::null(), LENGTH, 0);
+        let small = new_buffer(device, std::ptr::null(), 16, 0);
+        let queue = new_command_queue(device, std::ptr::null());
+        let waiting = send(queue, "commandBuffer");
+        let (encode, wait) =
+            method::<unsafe extern "C" fn(Id, Sel, Id, u64)>(waiting, "encodeWaitForEvent:value:");
+        encode(waiting, wait, event, 1);
+        send_void(waiting, "commit");
+
+        let command = send(queue, "commandBuffer");
+        let blit = send(command, "blitCommandEncoder");
+        copy_buffer_range(blit, large, 0, small, 0, 16);
+        send_void(blit, "endEncoding");
+        send_void(command, "commit");
+
+        let contents = object::body::<resource::Buffer>(large).inner.contents;
+        std::ptr::copy_nonoverlapping([9u32, 10, 11, 12].as_ptr(), contents.cast(), 4);
+        let (set_value, sel) =
+            method::<unsafe extern "C" fn(Id, Sel, u64)>(event, "setSignaledValue:");
+        set_value(event, sel, 1);
+        send_void(command, "waitUntilCompleted");
+        let small_contents = object::body::<resource::Buffer>(small).inner.contents;
+        assert_eq!(
+            std::slice::from_raw_parts(small_contents as *const u32, 4),
+            [9, 10, 11, 12]
+        );
+        send_void(waiting, "waitUntilCompleted");
+        let gpu = gpu_of(device).expect("a Vulkan device");
+        assert_eq!(
+            gpu.event_waits_in_flight
+                .load(std::sync::atomic::Ordering::Acquire),
+            0
+        );
+        for buffer in [large, small] {
             objc::arc::release(buffer);
         }
     }

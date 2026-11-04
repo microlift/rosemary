@@ -64,6 +64,7 @@ counters!(
     ImmediateCalls = "immediate_calls",
     ImmediateMicros = "immediate_micros",
     DeferredTransfers = "deferred_transfers",
+    CopySnapshots = "copy_snapshots",
 );
 
 #[allow(clippy::declare_interior_mutable_const)]

@@ -76,6 +76,10 @@ pub(crate) fn wrap_buffer(
 }
 
 impl Buffer {
+    pub(crate) fn host_pages(&self) -> Option<&gpu::HostPages> {
+        self.host.as_ref()
+    }
+
     /// The buffer the device sees all of this one through, for a use whose
     /// extent no call states.
     pub(crate) fn device_buffer(&self) -> vk::Buffer {

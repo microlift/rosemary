@@ -124,6 +124,7 @@ pub(crate) struct Submission {
     pub(super) descriptor_pools: Vec<vk::DescriptorPool>,
     pub(super) retained: Vec<OwnedObjcRef>,
     pub(super) uploads: Vec<GpuBuffer>,
+    pub(super) staging: Vec<GpuBuffer>,
     pub(super) framebuffers: Vec<vk::Framebuffer>,
     /// The parallel render sub-encoders' command buffers this one executed.
     pub(super) secondaries: Vec<gpu::SecondaryContext>,
@@ -137,12 +138,22 @@ pub(crate) struct Submission {
     /// no device timestamps or reading them fails.
     pub(super) scheduled_time: f64,
     pub(super) profile: Option<Arc<crate::profile::Profile>>,
+    /// Counted in `Gpu::event_waits_in_flight` until it finishes.
+    pub(super) waits_for_event: bool,
 }
 
 impl Submission {
+    pub(super) fn begin_event_wait(&mut self) {
+        self.waits_for_event = true;
+        self.gpu
+            .event_waits_in_flight
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+    }
+
     pub(crate) fn transient_bytes(&self) -> u64 {
         self.uploads
             .iter()
+            .chain(&self.staging)
             .map(|buffer| buffer.length)
             .chain(self.captures.iter().map(|capture| capture.buffer.length))
             .sum()
@@ -220,8 +231,16 @@ impl Submission {
         for chunk in self.uploads.drain(..) {
             self.gpu.release_upload_chunk(chunk);
         }
+        for staging in self.staging.drain(..) {
+            self.gpu.destroy_buffer(staging);
+        }
         for secondary in self.secondaries.drain(..) {
             self.gpu.release_secondary(secondary);
+        }
+        if std::mem::take(&mut self.waits_for_event) {
+            self.gpu
+                .event_waits_in_flight
+                .fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
         }
         self.retained.clear();
         if !self.split_buffers.is_empty() {
