@@ -700,8 +700,16 @@ pub(crate) fn begin_render_pass(
         Err(reason) => return gpu::trace(format!("framebuffer creation failed: {reason}")),
     };
     for texture in textures {
+        // SAFETY: only textures of this crate's are attached.
+        let image = &unsafe { object::body::<Texture>(texture) }.image;
+        encoder
+            .attachments
+            .push((image.image, gpu::aspect_of(image.format)));
         command.retain(texture);
     }
+    // Sub-encoders record into command buffers of their own, and query
+    // results land in a buffer: both reach memory other than the attachments.
+    encoder.writes_elsewhere |= secondary || !descriptor.visibility_result_buffer.is_null();
     encoder.visibility = VisibilityTarget::of(descriptor);
     command.retain(descriptor.visibility_result_buffer);
     command.framebuffers.push(framebuffer);

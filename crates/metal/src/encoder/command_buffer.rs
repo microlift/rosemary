@@ -58,6 +58,7 @@ pub(super) unsafe extern "C" fn new_command_buffer(receiver: Id, _sel: Sel) -> I
             batches: Vec::new(),
             waits: Vec::new(),
             descriptor_pools: Vec::new(),
+            written_sets: Default::default(),
             retained: Vec::new(),
             retained_set: AddressSet::default(),
             uploads: Vec::new(),
@@ -344,7 +345,10 @@ pub(super) unsafe extern "C" fn commit(receiver: Id, _sel: Sel) {
             .map(|batch| batch.command_buffer)
             .collect(),
         fence: command.fence,
-        descriptor_pools: std::mem::take(&mut command.descriptor_pools),
+        descriptor_pools: {
+            command.written_sets.clear();
+            std::mem::take(&mut command.descriptor_pools)
+        },
         retained: {
             command.retained_set.clear();
             std::mem::take(&mut command.retained)

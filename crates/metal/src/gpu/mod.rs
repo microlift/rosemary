@@ -112,7 +112,7 @@ pub struct Gpu {
     /// One layout per distinct set of Metal binding indices, so pipelines
     /// sharing a resource shape share a layout.
     layouts: Mutex<DescriptorLayouts>,
-    render_passes: Mutex<HashMap<RenderPassKey, vk::RenderPass>>,
+    render_passes: Mutex<crate::hash::FastMap<RenderPassKey, vk::RenderPass>>,
     /// Fence-owned immediate command contexts. Recording or waiting on an
     /// unrelated window must not hold a global command-pool mutex.
     immediate: Mutex<ImmediatePool>,
@@ -781,7 +781,7 @@ impl Gpu {
             memory,
             limits: properties.limits,
             layouts: Mutex::new(HashMap::new()),
-            render_passes: Mutex::new(HashMap::new()),
+            render_passes: Mutex::new(Default::default()),
             immediate: Mutex::new(ImmediatePool::default()),
             immediate_ready: Condvar::new(),
             #[cfg(test)]

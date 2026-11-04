@@ -86,6 +86,9 @@ pub(crate) struct RenderPipeline {
     pub fragment_name: std::ffi::CString,
     pub layouts: Layouts,
     pub resources: Vec<ResourceBinding>,
+    /// Whether a shader writes a buffer or texture it is bound, rather than
+    /// only the pass's attachments.
+    pub writes_resources: bool,
     /// Metal buffer indices which feed vertex attributes rather than a
     /// descriptor, taken from the pipeline's vertex descriptor.
     pub vertex_streams: Vec<u32>,
@@ -102,7 +105,7 @@ pub(crate) struct RenderPipeline {
     /// The pass shape this pipeline was declared against, without resolves;
     /// `variant` adds those from the key and asks the cache for the pass.
     pass: RenderPassKey,
-    variants: Mutex<HashMap<RenderVariantKey, vk::Pipeline>>,
+    variants: Mutex<crate::hash::FastMap<RenderVariantKey, vk::Pipeline>>,
     /// `ROSEMARY_METAL_PROFILE`: what its draws are totalled under.
     pub profile_label: Option<std::sync::Arc<str>>,
 }
@@ -263,6 +266,12 @@ impl RenderPipeline {
             fragment_name: std::ffi::CString::new(fragment.name.as_str())
                 .map_err(|_| "entry point name contains a NUL".to_string())?,
             layouts,
+            writes_resources: resources.iter().any(|binding| {
+                matches!(
+                    binding.access,
+                    metal_translate::ir::Access::Write | metal_translate::ir::Access::ReadWrite
+                )
+            }),
             resources,
             vertex_streams,
             bindings,
@@ -276,7 +285,7 @@ impl RenderPipeline {
             alpha_to_one: descriptor.alpha_to_one,
             rasterization: descriptor.rasterization,
             pass: key,
-            variants: Mutex::new(HashMap::new()),
+            variants: Mutex::new(Default::default()),
             profile_label: crate::profile::pipeline_label(&[vertex, fragment]),
         })
     }

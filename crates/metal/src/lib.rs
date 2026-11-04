@@ -9,6 +9,7 @@ mod encoder;
 mod event;
 mod exports;
 mod gpu;
+mod hash;
 mod heap;
 mod library;
 mod object;

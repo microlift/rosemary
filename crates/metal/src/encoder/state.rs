@@ -34,25 +34,34 @@ pub(super) unsafe extern "C" fn set_buffer<const STAGE: usize>(
 ) {
     // SAFETY: an encoder of this crate's.
     let encoder = unsafe { object::body::<Encoder>(receiver) };
-    let binding = if buffer.is_null() {
+    let Some(slot) = encoder.buffers[STAGE].get_mut(index as usize) else {
+        // Metal retains what an encoder binds, and a guest is entitled to
+        // release its own reference the moment the call returns. The command
+        // buffer's reference outlives the work the binding is recorded into.
+        encoder.command().retain(buffer);
+        return;
+    };
+    // A guest rebinds the same buffer at a new offset far more often than it
+    // binds another; the command buffer retained it when it was first bound.
+    if slot.object == buffer && !buffer.is_null() {
+        slot.offset = offset;
+        slot.uploaded = false;
+        return;
+    }
+    *slot = if buffer.is_null() {
         BufferBinding::default()
     } else {
         // SAFETY: only a buffer of this crate's is ever bound.
-        let buffer = unsafe { object::body::<Buffer>(buffer) };
+        let body = unsafe { object::body::<Buffer>(buffer) };
         BufferBinding {
-            buffer: buffer.device_buffer(),
+            buffer: body.device_buffer(),
             offset,
-            end: buffer.inner.length,
+            end: body.inner.length,
             range: vk::WHOLE_SIZE,
             uploaded: false,
+            object: buffer,
         }
     };
-    if let Some(slot) = encoder.buffers[STAGE].get_mut(index as usize) {
-        *slot = binding;
-    }
-    // Metal retains what an encoder binds, and a guest is entitled to release
-    // its own reference the moment the call returns. The command buffer's
-    // reference outlives the work the binding is recorded into.
     encoder.command().retain(buffer);
 }
 
@@ -95,6 +104,7 @@ pub(super) unsafe extern "C" fn set_bytes<const STAGE: usize>(
             end: offset + length,
             range: length,
             uploaded: true,
+            object: std::ptr::null_mut(),
         };
     }
 }
@@ -124,10 +134,14 @@ pub(super) unsafe extern "C" fn set_texture<const STAGE: usize>(
 ) {
     // SAFETY: an encoder of this crate's.
     let encoder = unsafe { object::body::<Encoder>(receiver) };
-    encoder.command().retain(texture);
     if let Some(slot) = encoder.textures[STAGE].get_mut(index as usize) {
+        // Retained when it was bound here before.
+        if *slot == texture {
+            return;
+        }
         *slot = texture;
     }
+    encoder.command().retain(texture);
 }
 
 pub(super) unsafe extern "C" fn set_sampler<const STAGE: usize>(
@@ -138,10 +152,14 @@ pub(super) unsafe extern "C" fn set_sampler<const STAGE: usize>(
 ) {
     // SAFETY: an encoder of this crate's.
     let encoder = unsafe { object::body::<Encoder>(receiver) };
-    encoder.command().retain(sampler);
     if let Some(slot) = encoder.samplers[STAGE].get_mut(index as usize) {
+        // Retained when it was bound here before.
+        if *slot == sampler {
+            return;
+        }
         *slot = sampler;
     }
+    encoder.command().retain(sampler);
 }
 
 pub(super) unsafe extern "C" fn set_stencil_reference(receiver: Id, _sel: Sel, value: u32) {
@@ -159,18 +177,22 @@ pub(super) unsafe extern "C" fn set_stencil_reference(receiver: Id, _sel: Sel, v
     };
 }
 
-pub(super) unsafe extern "C" fn set_raster_value(receiver: Id, sel: Sel, value: u64) {
-    // SAFETY: an encoder of this crate's.
-    let encoder = unsafe { object::body::<Encoder>(receiver) };
-    // SAFETY: a selector the runtime owns.
-    match unsafe { std::ffi::CStr::from_ptr(sel) }.to_bytes() {
-        b"setCullMode:" => encoder.cull_mode = value,
-        b"setFrontFacingWinding:" => encoder.winding = value,
-        b"setTriangleFillMode:" => encoder.fill_mode = value,
-        b"setDepthClipMode:" => encoder.depth_clip = value,
-        _ => (),
-    }
+/// The raster states a draw's pipeline variant is chosen by. One function
+/// each rather than one which reads the selector's name: a game sets them
+/// for nearly every draw.
+macro_rules! raster_setter {
+    ($name:ident, $field:ident) => {
+        pub(super) unsafe extern "C" fn $name(receiver: Id, _sel: Sel, value: u64) {
+            // SAFETY: an encoder of this crate's.
+            unsafe { object::body::<Encoder>(receiver) }.$field = value;
+        }
+    };
 }
+
+raster_setter!(set_cull_mode, cull_mode);
+raster_setter!(set_front_facing_winding, winding);
+raster_setter!(set_triangle_fill_mode, fill_mode);
+raster_setter!(set_depth_clip_mode, depth_clip);
 
 pub(super) unsafe extern "C" fn set_viewport(receiver: Id, _sel: Sel, viewport: Viewport) {
     // SAFETY: an encoder of this crate's.

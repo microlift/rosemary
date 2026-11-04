@@ -657,6 +657,73 @@ fn a_copy_out_of_host_pages_follows_device_writes_queued_before_it() {
     }
 }
 
+/// A descriptor set written for one binding of resources is used again by a
+/// later dispatch in the command buffer which binds the same ones, and each
+/// dispatch still reads what was bound for it.
+#[test]
+fn a_texture_bound_again_in_one_command_buffer_is_the_one_read() {
+    isolate_metal_fixture!();
+    let Some(device) = gpu_device() else {
+        return;
+    };
+    const R32_UINT: u64 = 53; // MTLPixelFormatR32Uint
+    const DISPATCHES: usize = 6;
+    let source = "kernel void probe(texture2d<uint, access::read> source [[texture(0)]], \
+                  device uint* out [[buffer(0)]]) { out[0] = source.read(uint2(0, 0)).x; }";
+    let gpu = gpu_of(device).expect("a Vulkan device");
+    // SAFETY: objects this test made, sent the selectors they implement.
+    unsafe {
+        let library = source_library(device, source);
+        let function = new_function_with_name(
+            library,
+            std::ptr::null(),
+            foundation::string::from_str("probe"),
+        );
+        let mut error = std::ptr::null_mut();
+        let kernel = new_compute_pipeline(device, std::ptr::null(), function, &mut error);
+        assert!(!kernel.is_null());
+        let textures = [1u32, 2].map(|value| {
+            let texture = resource::new_texture(
+                gpu,
+                resource::TextureDescriptor {
+                    texture_type: 2,
+                    pixel_format: R32_UINT,
+                    width: 1,
+                    height: 1,
+                    depth: 1,
+                    mipmap_level_count: 1,
+                    sample_count: 1,
+                    array_length: 1,
+                    storage_mode: 0,
+                    usage: gpu::USAGE_SHADER_READ,
+                },
+            );
+            replace_region(texture, [0, 0, 1, 1], &value.to_le_bytes(), 4);
+            texture
+        });
+        let output = new_buffer(device, std::ptr::null(), DISPATCHES * 4, 0);
+        let queue = new_command_queue(device, std::ptr::null());
+        let command = send(queue, "commandBuffer");
+        let encoder = send(command, "computeCommandEncoder");
+        send_with_object(encoder, "setComputePipelineState:", kernel);
+        let (bind, sel) =
+            method::<unsafe extern "C" fn(Id, Sel, Id, u64)>(encoder, "setTexture:atIndex:");
+        for index in 0..DISPATCHES {
+            set_buffer_at(encoder, output, (index * 4) as u64, 0);
+            bind(encoder, sel, textures[index % 2], 0);
+            dispatch(encoder, 1);
+        }
+        send_void(encoder, "endEncoding");
+        send_void(command, "commit");
+        send_void(command, "waitUntilCompleted");
+        let contents = object::body::<resource::Buffer>(output).inner.contents as *const u32;
+        assert_eq!(
+            std::slice::from_raw_parts(contents, DISPATCHES),
+            [1, 2, 1, 2, 1, 2]
+        );
+    }
+}
+
 /// Command buffers committed faster than they reach the queue are submitted
 /// together, and each still completes with its own work done.
 #[test]
@@ -2038,7 +2105,11 @@ fn recording_cost_with_resources() {
     let Some(device) = gpu_device() else {
         return;
     };
-    const DRAWS: usize = 20_000;
+    // Shaped like a game's frame: tens of passes of tens of draws each.
+    const FRAMES: usize = 25;
+    const ENCODERS_PER_FRAME: usize = 40;
+    const DRAWS_PER_ENCODER: usize = 20;
+    const DRAWS: usize = FRAMES * ENCODERS_PER_FRAME * DRAWS_PER_ENCODER;
     const ROUNDS: usize = 5;
     const RGBA8: u64 = 70; // MTLPixelFormatRGBA8Unorm
     const UINT16: u64 = 0; // MTLIndexTypeUInt16
@@ -2085,60 +2156,93 @@ fn recording_cost_with_resources() {
         send_number(attachment, "setStoreAction:", 1);
 
         let mut best = f64::MAX;
+        let mut best_cpu = f64::MAX;
         for _ in 0..ROUNDS {
             let pool = objc::arc::pool_push();
             let start = std::time::Instant::now();
-            let command = send(queue, "commandBuffer");
-            let encoder = render_encoder(command, pass);
-            let (set_texture, set_texture_sel) = method::<unsafe extern "C" fn(Id, Sel, Id, u64)>(
-                encoder,
-                "setFragmentTexture:atIndex:",
-            );
-            let (set_sampler, set_sampler_sel) = method::<unsafe extern "C" fn(Id, Sel, Id, u64)>(
-                encoder,
-                "setFragmentSamplerState:atIndex:",
-            );
-            let (draw_indexed, draw_indexed_sel) =
-                method::<unsafe extern "C" fn(Id, Sel, u64, u64, u64, Id, u64)>(
-                    encoder,
-                    "drawIndexedPrimitives:indexCount:indexType:indexBuffer:indexBufferOffset:",
-                );
-            send_with_object(encoder, "setRenderPipelineState:", state);
-            set_buffer_named(encoder, "setVertexBuffer:offset:atIndex:", vertices, 0, 0);
-            set_sampler(encoder, set_sampler_sel, sampler, 0);
-            for index in 0..DRAWS {
-                let slot = (index % 64) as u64;
-                set_buffer_named(
-                    encoder,
-                    "setVertexBuffer:offset:atIndex:",
-                    uniforms,
-                    slot * UNIFORM_STRIDE,
-                    1,
-                );
-                set_buffer_named(
-                    encoder,
-                    "setVertexBuffer:offset:atIndex:",
-                    instances,
-                    slot * 16,
-                    2,
-                );
-                set_texture(encoder, set_texture_sel, textures[index % 8], 0);
-                set_texture(encoder, set_texture_sel, textures[(index / 8) % 8], 1);
-                if index % 4 == 0 {
-                    set_bytes_named(encoder, "setFragmentBytes:length:atIndex:", &[1; 16], 0);
+            let cpu_start = thread_cpu_time();
+            let mut last = std::ptr::null_mut();
+            for _ in 0..FRAMES {
+                let command = send(queue, "commandBuffer");
+                for encoder_index in 0..ENCODERS_PER_FRAME {
+                    let encoder = render_encoder(command, pass);
+                    let (set_texture, set_texture_sel) = method::<
+                        unsafe extern "C" fn(Id, Sel, Id, u64),
+                    >(
+                        encoder, "setFragmentTexture:atIndex:"
+                    );
+                    let (set_sampler, set_sampler_sel) =
+                        method::<unsafe extern "C" fn(Id, Sel, Id, u64)>(
+                            encoder,
+                            "setFragmentSamplerState:atIndex:",
+                        );
+                    let (draw_indexed, draw_indexed_sel) = method::<
+                        unsafe extern "C" fn(Id, Sel, u64, u64, u64, Id, u64),
+                    >(
+                        encoder,
+                        "drawIndexedPrimitives:indexCount:indexType:indexBuffer:indexBufferOffset:",
+                    );
+                    send_with_object(encoder, "setRenderPipelineState:", state);
+                    set_buffer_named(encoder, "setVertexBuffer:offset:atIndex:", vertices, 0, 0);
+                    set_sampler(encoder, set_sampler_sel, sampler, 0);
+                    for draw in 0..DRAWS_PER_ENCODER {
+                        let index = encoder_index * DRAWS_PER_ENCODER + draw;
+                        let slot = (index % 64) as u64;
+                        set_buffer_named(
+                            encoder,
+                            "setVertexBuffer:offset:atIndex:",
+                            uniforms,
+                            slot * UNIFORM_STRIDE,
+                            1,
+                        );
+                        set_buffer_named(
+                            encoder,
+                            "setVertexBuffer:offset:atIndex:",
+                            instances,
+                            slot * 16,
+                            2,
+                        );
+                        set_texture(encoder, set_texture_sel, textures[index % 8], 0);
+                        set_texture(encoder, set_texture_sel, textures[(index / 8) % 8], 1);
+                        if index.is_multiple_of(4) {
+                            set_bytes_named(
+                                encoder,
+                                "setFragmentBytes:length:atIndex:",
+                                &[1; 16],
+                                0,
+                            );
+                        }
+                        draw_indexed(encoder, draw_indexed_sel, TRIANGLES, 3, UINT16, indices, 0);
+                    }
+                    send_void(encoder, "endEncoding");
                 }
-                draw_indexed(encoder, draw_indexed_sel, TRIANGLES, 3, UINT16, indices, 0);
+                send_void(command, "commit");
+                last = command;
             }
-            send_void(encoder, "endEncoding");
-            send_void(command, "commit");
             let recorded = start.elapsed();
-            send_void(command, "waitUntilCompleted");
-            assert_eq!(send_number_result(command, "status"), 4);
+            let recorded_cpu = thread_cpu_time() - cpu_start;
+            send_void(last, "waitUntilCompleted");
+            assert_eq!(send_number_result(last, "status"), 4);
             objc::arc::pool_pop(pool);
             best = best.min(recorded.as_secs_f64() * 1e6 / DRAWS as f64);
+            best_cpu = best_cpu.min(recorded_cpu * 1e6 / DRAWS as f64);
         }
-        eprintln!("recording with resources: {best:.3} us/draw (best of {ROUNDS})");
+        eprintln!(
+            "recording with resources: {best:.3} us/draw, {best_cpu:.3} us/draw of this \
+             thread's CPU (best of {ROUNDS})"
+        );
     }
+}
+
+/// Seconds of CPU time the calling thread has used.
+fn thread_cpu_time() -> f64 {
+    let mut now = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    // SAFETY: a valid clock and a live timespec.
+    unsafe { libc::clock_gettime(libc::CLOCK_THREAD_CPUTIME_ID, &mut now) };
+    now.tv_sec as f64 + now.tv_nsec as f64 * 1e-9
 }
 
 /// The device time of a frame made like a game's: many short render passes,
@@ -2258,6 +2362,254 @@ fn encoder_barrier_device_cost() {
             times[FRAMES / 2] * 1e3,
             times[0] * 1e3,
         );
+    }
+}
+
+/// Clear colour as `-setClearColor:` takes it.
+#[repr(C)]
+struct ClearColor([f64; 4]);
+
+/// A render pass descriptor drawing into `target` with `load` and storing.
+///
+/// # Safety
+///
+/// `target` must be a texture of this crate's.
+unsafe fn single_target_pass(target: Id, load: u64, clear: [f64; 4]) -> Id {
+    const STORE: u64 = 1;
+    // SAFETY: objects this function makes, sent the selectors they implement.
+    unsafe {
+        let pass = object::make(
+            c"MTLRenderPassDescriptor",
+            encoder::RenderPassDescriptor::default(),
+        );
+        let attachment = element_at(send(pass, "colorAttachments"), 0);
+        send_with_object(attachment, "setTexture:", target);
+        send_number(attachment, "setLoadAction:", load);
+        send_number(attachment, "setStoreAction:", STORE);
+        let (set_clear, sel) =
+            method::<unsafe extern "C" fn(Id, Sel, ClearColor)>(attachment, "setClearColor:");
+        set_clear(attachment, sel, ClearColor(clear));
+        pass
+    }
+}
+
+/// A pass which only draws into its attachments ends with a barrier naming
+/// them, and the pass after it, which samples that attachment, and a copy
+/// after that both see what was drawn.
+#[test]
+fn a_pass_samples_what_the_pass_before_drew() {
+    isolate_metal_fixture!();
+    let Some(device) = gpu_device() else {
+        return;
+    };
+    const SIZE: u64 = 4;
+    const CLEAR: u64 = 2; // MTLLoadActionClear
+    const DONT_CARE: u64 = 0; // MTLLoadActionDontCare
+    let gpu = gpu_of(device).expect("a Vulkan device");
+    let state = resource_draw_pipeline(device);
+    // SAFETY: objects this test made, sent the selectors they implement.
+    unsafe {
+        let target = || {
+            resource::new_texture(
+                gpu,
+                resource::TextureDescriptor {
+                    texture_type: 2,
+                    pixel_format: BGRA8,
+                    width: SIZE,
+                    height: SIZE,
+                    depth: 1,
+                    mipmap_level_count: 1,
+                    sample_count: 1,
+                    array_length: 1,
+                    storage_mode: 2,
+                    usage: gpu::USAGE_RENDER_TARGET | gpu::USAGE_SHADER_READ,
+                },
+            )
+        };
+        let (drawn, sampled) = (target(), target());
+        let sampler = resource::new_sampler(gpu, &resource::SamplerDescriptor::default());
+        let corners: [f32; 12] = [
+            -1.0, -1.0, 0.0, 1.0, 3.0, -1.0, 0.0, 1.0, -1.0, 3.0, 0.0, 1.0,
+        ];
+        let vertices =
+            new_buffer_with_bytes(device, std::ptr::null(), corners.as_ptr().cast(), 48, 0);
+        let mut uniform = [0f32; 20];
+        for diagonal in 0..4 {
+            uniform[diagonal * 5] = 1.0;
+        }
+        let uniforms =
+            new_buffer_with_bytes(device, std::ptr::null(), uniform.as_ptr().cast(), 80, 0);
+        let instances = new_buffer(device, std::ptr::null(), 16, 0);
+        let readback = new_buffer(device, std::ptr::null(), (SIZE * SIZE * 4) as usize, 0);
+        let queue = new_command_queue(device, std::ptr::null());
+        let command = send(queue, "commandBuffer");
+
+        // Blue, which is [255, 0, 0, 255] in BGRA.
+        let clear = render_encoder(
+            command,
+            single_target_pass(drawn, CLEAR, [0.0, 0.0, 1.0, 1.0]),
+        );
+        send_void(clear, "endEncoding");
+
+        let encoder = render_encoder(command, single_target_pass(sampled, DONT_CARE, [0.0; 4]));
+        send_with_object(encoder, "setRenderPipelineState:", state);
+        set_buffer_named(encoder, "setVertexBuffer:offset:atIndex:", vertices, 0, 0);
+        set_buffer_named(encoder, "setVertexBuffer:offset:atIndex:", uniforms, 0, 1);
+        set_buffer_named(encoder, "setVertexBuffer:offset:atIndex:", instances, 0, 2);
+        let tint = [1.0f32; 4];
+        set_bytes_named(
+            encoder,
+            "setFragmentBytes:length:atIndex:",
+            std::slice::from_raw_parts(tint.as_ptr().cast(), 16),
+            0,
+        );
+        let (set_texture, sel) = method::<unsafe extern "C" fn(Id, Sel, Id, u64)>(
+            encoder,
+            "setFragmentTexture:atIndex:",
+        );
+        set_texture(encoder, sel, drawn, 0);
+        set_texture(encoder, sel, drawn, 1);
+        let (set_sampler, sel) = method::<unsafe extern "C" fn(Id, Sel, Id, u64)>(
+            encoder,
+            "setFragmentSamplerState:atIndex:",
+        );
+        set_sampler(encoder, sel, sampler, 0);
+        draw(encoder, 3);
+        send_void(encoder, "endEncoding");
+
+        let blit = send(command, "blitCommandEncoder");
+        copy_texture_to_buffer(blit, sampled, readback, SIZE);
+        send_void(blit, "endEncoding");
+        send_void(command, "commit");
+        send_void(command, "waitUntilCompleted");
+        assert_eq!(send_number_result(command, "status"), 4);
+        let pixels = std::slice::from_raw_parts(
+            object::body::<resource::Buffer>(readback).inner.contents,
+            (SIZE * SIZE * 4) as usize,
+        );
+        for pixel in pixels.chunks(4) {
+            assert_eq!(pixel, [255, 0, 0, 255]);
+        }
+    }
+}
+
+/// A pass whose fragment shader writes a buffer is followed by work which
+/// sees the write, though the pass's attachments are not what was written.
+/// On a device whose caches keep buffers coherent this passes whichever
+/// barrier follows the pass; it keeps the path which names all memory working.
+#[test]
+fn a_buffer_a_fragment_shader_writes_is_seen_by_the_next_encoder() {
+    isolate_metal_fixture!();
+    let Some(device) = gpu_device() else {
+        return;
+    };
+    const SIZE: u64 = 4;
+    const DONT_CARE: u64 = 0; // MTLLoadActionDontCare
+    let source = r#"
+#include <metal_stdlib>
+using namespace metal;
+struct VertexIn { float4 position [[attribute(0)]]; };
+vertex float4 cover(VertexIn in [[stage_in]]) { return in.position; }
+fragment float4 mark(float4 position [[position]], device uint* out [[buffer(0)]]) {
+    out[0] = 7;
+    return float4(0.0);
+}
+"#;
+    let gpu = gpu_of(device).expect("a Vulkan device");
+    let library = source_library(device, source);
+    assert!(!library.is_null(), "the shaders must translate");
+    // SAFETY: objects this test made, sent the selectors they implement.
+    unsafe {
+        let vertex = new_function_with_name(
+            library,
+            std::ptr::null(),
+            foundation::string::from_str("cover"),
+        );
+        let fragment = new_function_with_name(
+            library,
+            std::ptr::null(),
+            foundation::string::from_str("mark"),
+        );
+        let vertex_descriptor = object::make(
+            c"MTLVertexDescriptor",
+            resource::VertexDescriptor {
+                layouts: [resource::VertexLayout::default(); resource::VERTEX_SLOTS],
+                attributes: [resource::VertexAttribute::default(); resource::VERTEX_SLOTS],
+                layout_objects: std::ptr::null_mut(),
+                attribute_objects: std::ptr::null_mut(),
+            },
+        );
+        send_number(
+            element_at(send(vertex_descriptor, "layouts"), 0),
+            "setStride:",
+            16,
+        );
+        let attribute = element_at(send(vertex_descriptor, "attributes"), 0);
+        send_number(attribute, "setFormat:", 31);
+        send_number(attribute, "setBufferIndex:", 0);
+        let descriptor = object::make(
+            c"MTLRenderPipelineDescriptor",
+            pipeline::RenderPipelineDescriptor {
+                vertex_function: vertex,
+                fragment_function: fragment,
+                vertex_descriptor,
+                colors: [pipeline::ColorAttachment::fresh(); pipeline::COLOR_ATTACHMENTS],
+                depth_format: 0,
+                stencil_format: 0,
+                sample_count: 1,
+                alpha_to_coverage: false,
+                alpha_to_one: false,
+                rasterization: true,
+                color_objects: std::ptr::null_mut(),
+            },
+        );
+        send_number(
+            element_at(send(descriptor, "colorAttachments"), 0),
+            "setPixelFormat:",
+            BGRA8,
+        );
+        let mut error = std::ptr::null_mut();
+        let state = new_render_pipeline(device, std::ptr::null(), descriptor, &mut error);
+        assert!(!state.is_null(), "the pipeline must build");
+        let target = resource::new_texture(
+            gpu,
+            resource::TextureDescriptor {
+                texture_type: 2,
+                pixel_format: BGRA8,
+                width: SIZE,
+                height: SIZE,
+                depth: 1,
+                mipmap_level_count: 1,
+                sample_count: 1,
+                array_length: 1,
+                storage_mode: 2,
+                usage: gpu::USAGE_RENDER_TARGET,
+            },
+        );
+        let corners: [f32; 12] = [
+            -1.0, -1.0, 0.0, 1.0, 3.0, -1.0, 0.0, 1.0, -1.0, 3.0, 0.0, 1.0,
+        ];
+        let vertices =
+            new_buffer_with_bytes(device, std::ptr::null(), corners.as_ptr().cast(), 48, 0);
+        const PRIVATE: u64 = 0x20;
+        let written = new_buffer(device, std::ptr::null(), 16, PRIVATE);
+        let readback = new_buffer(device, std::ptr::null(), 16, 0);
+        let queue = new_command_queue(device, std::ptr::null());
+        let command = send(queue, "commandBuffer");
+        let encoder = render_encoder(command, single_target_pass(target, DONT_CARE, [0.0; 4]));
+        send_with_object(encoder, "setRenderPipelineState:", state);
+        set_buffer_named(encoder, "setVertexBuffer:offset:atIndex:", vertices, 0, 0);
+        set_buffer_named(encoder, "setFragmentBuffer:offset:atIndex:", written, 0, 0);
+        draw(encoder, 3);
+        send_void(encoder, "endEncoding");
+        let blit = send(command, "blitCommandEncoder");
+        copy_buffer(blit, written, readback, 4);
+        send_void(blit, "endEncoding");
+        send_void(command, "commit");
+        send_void(command, "waitUntilCompleted");
+        assert_eq!(send_number_result(command, "status"), 4);
+        let contents = object::body::<resource::Buffer>(readback).inner.contents as *const u32;
+        assert_eq!(*contents, 7);
     }
 }
 

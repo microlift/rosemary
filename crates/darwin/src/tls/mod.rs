@@ -47,12 +47,23 @@ thread_local! {
     static BASE: core::cell::Cell<u64> = const { core::cell::Cell::new(0) };
 }
 
+/// Guest code reaches this on every `pthread_getspecific` and thread-local
+/// access, so the cached answer is a read, inlined where it is asked for, and
+/// making the array the first time is a call of its own.
 #[cfg(not(target_os = "macos"))]
+#[inline]
 pub fn tsd_base() -> u64 {
     let cached = BASE.with(|base| base.get());
     if cached != 0 {
         return cached;
     }
+    first_tsd_base()
+}
+
+#[cfg(not(target_os = "macos"))]
+#[cold]
+#[inline(never)]
+fn first_tsd_base() -> u64 {
     let key = synthetic_key();
     // SAFETY: `key` was created by `pthread_key_create` below and is never deleted.
     let existing = unsafe { libc::pthread_getspecific(key) };
