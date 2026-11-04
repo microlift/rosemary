@@ -148,12 +148,6 @@ impl Layout {
     }
 }
 
-/// Writes `file` as the cached code of the guest image `id`, replacing any older one.
-pub fn store(layout: &Layout, id: &ImageId, file: &file::CacheFile) -> std::io::Result<()> {
-    layout.prune();
-    store::write_atomic(&layout.image(id), &file.encode())
-}
-
 /// Why a cache file was not used.
 #[derive(Debug)]
 pub enum LoadError {

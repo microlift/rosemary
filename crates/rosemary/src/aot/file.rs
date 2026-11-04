@@ -1,17 +1,19 @@
 //! What one cache file holds: the slide its image was lifted at, and the
-//! Microlift images compiled for it, highest priority first.
+//! Microlift images compiled for it, in the order they finished.
 //!
 //! Several images rather than one so the offline compiler can build them on
-//! separate threads, and so a build stopped by its deadline still writes every
-//! chunk that finished.
+//! separate threads and write each as it finishes, and so a build stopped by its
+//! deadline still writes every chunk that finished.
+
+use std::io::{Seek, SeekFrom, Write};
 
 use microlift::image::Image;
 
 /// Identifies a Rosemary cache file, ahead of anything Microlift reads.
 const MAGIC: [u8; 8] = *b"RMAOTv1\0";
 
-/// Bytes before the first chunk: the magic, the lift slide and the chunk count.
-const HEADER_LEN: usize = MAGIC.len() + 8 + 8;
+/// Where the chunk count is, after the magic and the lift slide.
+const COUNT_OFFSET: u64 = (MAGIC.len() + 8) as u64;
 
 #[derive(Debug, PartialEq)]
 pub struct CacheFile {
@@ -31,17 +33,12 @@ pub enum DecodeError {
 
 impl CacheFile {
     pub fn encode(&self) -> Vec<u8> {
-        let chunks: Vec<Vec<u8>> = self.chunks.iter().map(Image::encode).collect();
-        let len = HEADER_LEN + chunks.iter().map(|c| 8 + c.len()).sum::<usize>();
-        let mut out = Vec::with_capacity(len);
-        out.extend_from_slice(&MAGIC);
-        out.extend_from_slice(&self.lift_slide.to_le_bytes());
-        out.extend_from_slice(&(chunks.len() as u64).to_le_bytes());
-        for chunk in &chunks {
-            out.extend_from_slice(&(chunk.len() as u64).to_le_bytes());
-            out.extend_from_slice(chunk);
+        let mut writer = Writer::new(std::io::Cursor::new(Vec::new()), self.lift_slide)
+            .expect("writing to memory");
+        for chunk in &self.chunks {
+            writer.push(chunk).expect("writing to memory");
         }
-        out
+        writer.finish().expect("writing to memory").into_inner()
     }
 
     pub fn decode(bytes: &[u8]) -> Result<Self, DecodeError> {
@@ -71,6 +68,38 @@ impl CacheFile {
     }
 }
 
+/// Writes a cache file one chunk at a time, so a build never holds more than the
+/// chunk it is writing.
+pub struct Writer<W: Write + Seek> {
+    out: W,
+    chunks: u64,
+}
+
+impl<W: Write + Seek> Writer<W> {
+    pub fn new(mut out: W, lift_slide: u64) -> std::io::Result<Self> {
+        out.write_all(&MAGIC)?;
+        out.write_all(&lift_slide.to_le_bytes())?;
+        // The chunk count, filled in by `finish`.
+        out.write_all(&0u64.to_le_bytes())?;
+        Ok(Writer { out, chunks: 0 })
+    }
+
+    pub fn push(&mut self, chunk: &Image) -> std::io::Result<()> {
+        let bytes = chunk.encode();
+        self.out.write_all(&(bytes.len() as u64).to_le_bytes())?;
+        self.out.write_all(&bytes)?;
+        self.chunks += 1;
+        Ok(())
+    }
+
+    pub fn finish(mut self) -> std::io::Result<W> {
+        self.out.seek(SeekFrom::Start(COUNT_OFFSET))?;
+        self.out.write_all(&self.chunks.to_le_bytes())?;
+        self.out.seek(SeekFrom::End(0))?;
+        Ok(self.out)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -96,6 +125,17 @@ mod tests {
             chunks: vec![image(2), image(3)],
         };
         assert_eq!(CacheFile::decode(&file.encode()).unwrap(), file);
+    }
+
+    #[test]
+    fn a_streamed_file_counts_the_chunks_written() {
+        let mut writer = Writer::new(std::io::Cursor::new(Vec::new()), 0x2000).unwrap();
+        writer.push(&image(4)).unwrap();
+        writer.push(&image(5)).unwrap();
+        let bytes = writer.finish().unwrap().into_inner();
+        let file = CacheFile::decode(&bytes).unwrap();
+        assert_eq!(file.lift_slide, 0x2000);
+        assert_eq!(file.chunks, [image(4), image(5)]);
     }
 
     #[test]
