@@ -226,19 +226,16 @@ pub(super) unsafe extern "C" fn set_depth_bias(
 ) {
     // SAFETY: an encoder of this crate's.
     let encoder = unsafe { object::body::<Encoder>(receiver) };
-    let values = [bias.to_bits(), slope_scale.to_bits(), clamp.to_bits()];
-    if encoder.recorded_depth_bias == Some(values) {
-        return;
-    }
-    encoder.recorded_depth_bias = Some(values);
     let command = encoder.command();
-    // SAFETY: recording into this command buffer.
-    unsafe {
-        command
-            .gpu
-            .device
-            .cmd_set_depth_bias(command.command_buffer, bias, clamp, slope_scale)
-    };
+    encoder.depth_bias.record(
+        &command.gpu.device,
+        command.command_buffer,
+        DepthBias {
+            bias,
+            slope_scale,
+            clamp,
+        },
+    );
 }
 
 pub(super) unsafe extern "C" fn set_blend_color(

@@ -1,0 +1,3 @@
+disallowed-methods = [
+    { path = "ash::Device::cmd_set_depth_bias", reason = "record depth bias through metal's RecordedDepthBias, which caches what the command buffer holds" },
+]

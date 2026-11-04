@@ -22,7 +22,7 @@ pub(crate) fn new_encoder(command_buffer: Id, kind: Kind) -> Id {
             winding: 0,
             fill_mode: 0,
             depth_clip: 0,
-            recorded_depth_bias: None,
+            depth_bias: RecordedDepthBias::default(),
             in_render_pass: false,
             sub_encoder: false,
             inheritance: None,
