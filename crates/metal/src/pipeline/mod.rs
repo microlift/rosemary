@@ -9,7 +9,6 @@ mod enums;
 mod link;
 mod render;
 
-use std::collections::HashMap;
 use std::sync::Mutex;
 
 use ash::vk;

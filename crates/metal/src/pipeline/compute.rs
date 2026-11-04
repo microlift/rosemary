@@ -8,7 +8,7 @@ pub(crate) struct ComputePipeline {
     pub layouts: Layouts,
     pub resources: Vec<ResourceBinding>,
     /// One Vulkan pipeline per threadgroup size the guest has dispatched.
-    variants: Mutex<HashMap<[u32; 3], vk::Pipeline>>,
+    variants: Mutex<crate::hash::FastMap<[u32; 3], vk::Pipeline>>,
     /// `ROSEMARY_METAL_PROFILE`: what its dispatches are totalled under.
     pub profile_label: Option<std::sync::Arc<str>>,
 }
@@ -29,7 +29,7 @@ impl ComputePipeline {
                 .map_err(|_| "entry point name contains a NUL".to_string())?,
             layouts,
             resources: entry.resources.clone(),
-            variants: Mutex::new(HashMap::new()),
+            variants: Mutex::new(Default::default()),
             profile_label: crate::profile::pipeline_label(&[entry]),
         })
     }

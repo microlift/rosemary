@@ -102,7 +102,7 @@ pub(crate) struct RenderPipeline {
     /// The pass shape this pipeline was declared against, without resolves;
     /// `variant` adds those from the key and asks the cache for the pass.
     pass: RenderPassKey,
-    variants: Mutex<HashMap<RenderVariantKey, vk::Pipeline>>,
+    variants: Mutex<crate::hash::FastMap<RenderVariantKey, vk::Pipeline>>,
     /// `ROSEMARY_METAL_PROFILE`: what its draws are totalled under.
     pub profile_label: Option<std::sync::Arc<str>>,
 }
@@ -276,7 +276,7 @@ impl RenderPipeline {
             alpha_to_one: descriptor.alpha_to_one,
             rasterization: descriptor.rasterization,
             pass: key,
-            variants: Mutex::new(HashMap::new()),
+            variants: Mutex::new(Default::default()),
             profile_label: crate::profile::pipeline_label(&[vertex, fragment]),
         })
     }

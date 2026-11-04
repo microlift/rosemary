@@ -657,6 +657,73 @@ fn a_copy_out_of_host_pages_follows_device_writes_queued_before_it() {
     }
 }
 
+/// A descriptor set written for one binding of resources is used again by a
+/// later dispatch in the command buffer which binds the same ones, and each
+/// dispatch still reads what was bound for it.
+#[test]
+fn a_texture_bound_again_in_one_command_buffer_is_the_one_read() {
+    isolate_metal_fixture!();
+    let Some(device) = gpu_device() else {
+        return;
+    };
+    const R32_UINT: u64 = 53; // MTLPixelFormatR32Uint
+    const DISPATCHES: usize = 6;
+    let source = "kernel void probe(texture2d<uint, access::read> source [[texture(0)]], \
+                  device uint* out [[buffer(0)]]) { out[0] = source.read(uint2(0, 0)).x; }";
+    let gpu = gpu_of(device).expect("a Vulkan device");
+    // SAFETY: objects this test made, sent the selectors they implement.
+    unsafe {
+        let library = source_library(device, source);
+        let function = new_function_with_name(
+            library,
+            std::ptr::null(),
+            foundation::string::from_str("probe"),
+        );
+        let mut error = std::ptr::null_mut();
+        let kernel = new_compute_pipeline(device, std::ptr::null(), function, &mut error);
+        assert!(!kernel.is_null());
+        let textures = [1u32, 2].map(|value| {
+            let texture = resource::new_texture(
+                gpu,
+                resource::TextureDescriptor {
+                    texture_type: 2,
+                    pixel_format: R32_UINT,
+                    width: 1,
+                    height: 1,
+                    depth: 1,
+                    mipmap_level_count: 1,
+                    sample_count: 1,
+                    array_length: 1,
+                    storage_mode: 0,
+                    usage: gpu::USAGE_SHADER_READ,
+                },
+            );
+            replace_region(texture, [0, 0, 1, 1], &value.to_le_bytes(), 4);
+            texture
+        });
+        let output = new_buffer(device, std::ptr::null(), DISPATCHES * 4, 0);
+        let queue = new_command_queue(device, std::ptr::null());
+        let command = send(queue, "commandBuffer");
+        let encoder = send(command, "computeCommandEncoder");
+        send_with_object(encoder, "setComputePipelineState:", kernel);
+        let (bind, sel) =
+            method::<unsafe extern "C" fn(Id, Sel, Id, u64)>(encoder, "setTexture:atIndex:");
+        for index in 0..DISPATCHES {
+            set_buffer_at(encoder, output, (index * 4) as u64, 0);
+            bind(encoder, sel, textures[index % 2], 0);
+            dispatch(encoder, 1);
+        }
+        send_void(encoder, "endEncoding");
+        send_void(command, "commit");
+        send_void(command, "waitUntilCompleted");
+        let contents = object::body::<resource::Buffer>(output).inner.contents as *const u32;
+        assert_eq!(
+            std::slice::from_raw_parts(contents, DISPATCHES),
+            [1, 2, 1, 2, 1, 2]
+        );
+    }
+}
+
 /// Command buffers committed faster than they reach the queue are submitted
 /// together, and each still completes with its own work done.
 #[test]
@@ -2038,7 +2105,11 @@ fn recording_cost_with_resources() {
     let Some(device) = gpu_device() else {
         return;
     };
-    const DRAWS: usize = 20_000;
+    // Shaped like a game's frame: tens of passes of tens of draws each.
+    const FRAMES: usize = 25;
+    const ENCODERS_PER_FRAME: usize = 40;
+    const DRAWS_PER_ENCODER: usize = 20;
+    const DRAWS: usize = FRAMES * ENCODERS_PER_FRAME * DRAWS_PER_ENCODER;
     const ROUNDS: usize = 5;
     const RGBA8: u64 = 70; // MTLPixelFormatRGBA8Unorm
     const UINT16: u64 = 0; // MTLIndexTypeUInt16
@@ -2085,60 +2156,93 @@ fn recording_cost_with_resources() {
         send_number(attachment, "setStoreAction:", 1);
 
         let mut best = f64::MAX;
+        let mut best_cpu = f64::MAX;
         for _ in 0..ROUNDS {
             let pool = objc::arc::pool_push();
             let start = std::time::Instant::now();
-            let command = send(queue, "commandBuffer");
-            let encoder = render_encoder(command, pass);
-            let (set_texture, set_texture_sel) = method::<unsafe extern "C" fn(Id, Sel, Id, u64)>(
-                encoder,
-                "setFragmentTexture:atIndex:",
-            );
-            let (set_sampler, set_sampler_sel) = method::<unsafe extern "C" fn(Id, Sel, Id, u64)>(
-                encoder,
-                "setFragmentSamplerState:atIndex:",
-            );
-            let (draw_indexed, draw_indexed_sel) =
-                method::<unsafe extern "C" fn(Id, Sel, u64, u64, u64, Id, u64)>(
-                    encoder,
-                    "drawIndexedPrimitives:indexCount:indexType:indexBuffer:indexBufferOffset:",
-                );
-            send_with_object(encoder, "setRenderPipelineState:", state);
-            set_buffer_named(encoder, "setVertexBuffer:offset:atIndex:", vertices, 0, 0);
-            set_sampler(encoder, set_sampler_sel, sampler, 0);
-            for index in 0..DRAWS {
-                let slot = (index % 64) as u64;
-                set_buffer_named(
-                    encoder,
-                    "setVertexBuffer:offset:atIndex:",
-                    uniforms,
-                    slot * UNIFORM_STRIDE,
-                    1,
-                );
-                set_buffer_named(
-                    encoder,
-                    "setVertexBuffer:offset:atIndex:",
-                    instances,
-                    slot * 16,
-                    2,
-                );
-                set_texture(encoder, set_texture_sel, textures[index % 8], 0);
-                set_texture(encoder, set_texture_sel, textures[(index / 8) % 8], 1);
-                if index % 4 == 0 {
-                    set_bytes_named(encoder, "setFragmentBytes:length:atIndex:", &[1; 16], 0);
+            let cpu_start = thread_cpu_time();
+            let mut last = std::ptr::null_mut();
+            for _ in 0..FRAMES {
+                let command = send(queue, "commandBuffer");
+                for encoder_index in 0..ENCODERS_PER_FRAME {
+                    let encoder = render_encoder(command, pass);
+                    let (set_texture, set_texture_sel) = method::<
+                        unsafe extern "C" fn(Id, Sel, Id, u64),
+                    >(
+                        encoder, "setFragmentTexture:atIndex:"
+                    );
+                    let (set_sampler, set_sampler_sel) =
+                        method::<unsafe extern "C" fn(Id, Sel, Id, u64)>(
+                            encoder,
+                            "setFragmentSamplerState:atIndex:",
+                        );
+                    let (draw_indexed, draw_indexed_sel) = method::<
+                        unsafe extern "C" fn(Id, Sel, u64, u64, u64, Id, u64),
+                    >(
+                        encoder,
+                        "drawIndexedPrimitives:indexCount:indexType:indexBuffer:indexBufferOffset:",
+                    );
+                    send_with_object(encoder, "setRenderPipelineState:", state);
+                    set_buffer_named(encoder, "setVertexBuffer:offset:atIndex:", vertices, 0, 0);
+                    set_sampler(encoder, set_sampler_sel, sampler, 0);
+                    for draw in 0..DRAWS_PER_ENCODER {
+                        let index = encoder_index * DRAWS_PER_ENCODER + draw;
+                        let slot = (index % 64) as u64;
+                        set_buffer_named(
+                            encoder,
+                            "setVertexBuffer:offset:atIndex:",
+                            uniforms,
+                            slot * UNIFORM_STRIDE,
+                            1,
+                        );
+                        set_buffer_named(
+                            encoder,
+                            "setVertexBuffer:offset:atIndex:",
+                            instances,
+                            slot * 16,
+                            2,
+                        );
+                        set_texture(encoder, set_texture_sel, textures[index % 8], 0);
+                        set_texture(encoder, set_texture_sel, textures[(index / 8) % 8], 1);
+                        if index.is_multiple_of(4) {
+                            set_bytes_named(
+                                encoder,
+                                "setFragmentBytes:length:atIndex:",
+                                &[1; 16],
+                                0,
+                            );
+                        }
+                        draw_indexed(encoder, draw_indexed_sel, TRIANGLES, 3, UINT16, indices, 0);
+                    }
+                    send_void(encoder, "endEncoding");
                 }
-                draw_indexed(encoder, draw_indexed_sel, TRIANGLES, 3, UINT16, indices, 0);
+                send_void(command, "commit");
+                last = command;
             }
-            send_void(encoder, "endEncoding");
-            send_void(command, "commit");
             let recorded = start.elapsed();
-            send_void(command, "waitUntilCompleted");
-            assert_eq!(send_number_result(command, "status"), 4);
+            let recorded_cpu = thread_cpu_time() - cpu_start;
+            send_void(last, "waitUntilCompleted");
+            assert_eq!(send_number_result(last, "status"), 4);
             objc::arc::pool_pop(pool);
             best = best.min(recorded.as_secs_f64() * 1e6 / DRAWS as f64);
+            best_cpu = best_cpu.min(recorded_cpu * 1e6 / DRAWS as f64);
         }
-        eprintln!("recording with resources: {best:.3} us/draw (best of {ROUNDS})");
+        eprintln!(
+            "recording with resources: {best:.3} us/draw, {best_cpu:.3} us/draw of this \
+             thread's CPU (best of {ROUNDS})"
+        );
     }
+}
+
+/// Seconds of CPU time the calling thread has used.
+fn thread_cpu_time() -> f64 {
+    let mut now = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    // SAFETY: a valid clock and a live timespec.
+    unsafe { libc::clock_gettime(libc::CLOCK_THREAD_CPUTIME_ID, &mut now) };
+    now.tv_sec as f64 + now.tv_nsec as f64 * 1e-9
 }
 
 /// The device time of a frame made like a game's: many short render passes,

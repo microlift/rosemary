@@ -64,6 +64,9 @@ struct BufferBinding {
     /// Whether `buffer` is an upload chunk `-setBytes:` copied into, whose
     /// offset can be a dynamic one.
     uploaded: bool,
+    /// The `MTLBuffer` bound, which the command buffer has retained, or null
+    /// for `-setBytes:` copies.
+    object: Id,
 }
 
 impl Default for BufferBinding {
@@ -74,6 +77,7 @@ impl Default for BufferBinding {
             end: 0,
             range: vk::WHOLE_SIZE,
             uploaded: false,
+            object: std::ptr::null_mut(),
         }
     }
 }
@@ -111,6 +115,90 @@ impl PartialEq for DescriptorEntry {
 }
 
 impl Eq for DescriptorEntry {}
+
+/// The descriptor sets a command buffer has written, in two flat lists so
+/// that remembering one allocates nothing once they have grown.
+#[derive(Default)]
+struct WrittenSets {
+    /// The newest set with each contents hash; older ones are chained.
+    newest: crate::hash::FastMap<u64, u32>,
+    sets: Vec<WrittenSet>,
+    entries: Vec<DescriptorEntry>,
+}
+
+struct WrittenSet {
+    layout: vk::DescriptorSetLayout,
+    set: vk::DescriptorSet,
+    /// Its entries, as a range of [`WrittenSets::entries`].
+    start: u32,
+    len: u32,
+    /// The set written before it with the same hash, or [`NO_SET`].
+    older: u32,
+}
+
+const NO_SET: u32 = u32::MAX;
+
+impl WrittenSets {
+    fn find(
+        &self,
+        layout: vk::DescriptorSetLayout,
+        entries: &[DescriptorEntry],
+    ) -> Option<vk::DescriptorSet> {
+        let mut at = *self.newest.get(&contents_key(layout, entries))?;
+        while at != NO_SET {
+            let written = &self.sets[at as usize];
+            let range = written.start as usize..(written.start + written.len) as usize;
+            if written.layout == layout && self.entries[range] == *entries {
+                return Some(written.set);
+            }
+            at = written.older;
+        }
+        None
+    }
+
+    fn remember(
+        &mut self,
+        layout: vk::DescriptorSetLayout,
+        entries: &[DescriptorEntry],
+        set: vk::DescriptorSet,
+    ) {
+        let at = self.sets.len() as u32;
+        let older = self
+            .newest
+            .insert(contents_key(layout, entries), at)
+            .unwrap_or(NO_SET);
+        self.sets.push(WrittenSet {
+            layout,
+            set,
+            start: self.entries.len() as u32,
+            len: entries.len() as u32,
+            older,
+        });
+        self.entries.extend_from_slice(entries);
+    }
+
+    fn clear(&mut self) {
+        self.newest.clear();
+        self.sets.clear();
+        self.entries.clear();
+    }
+}
+
+/// A hash of what [`DescriptorEntry`]'s equality compares, under `layout`.
+fn contents_key(layout: vk::DescriptorSetLayout, entries: &[DescriptorEntry]) -> u64 {
+    use std::hash::Hasher;
+    use vk::Handle;
+    let mut hasher = crate::hash::FastHasher::default();
+    hasher.write_u64(layout.as_raw());
+    for entry in entries {
+        hasher.write_u32(entry.binding);
+        hasher.write_i32(entry.kind.as_raw());
+        hasher.write_u64(entry.handle);
+        hasher.write_u64(entry.offset);
+        hasher.write_u64(entry.range);
+    }
+    hasher.finish()
+}
 
 /// The descriptor set last written for one set index, reused while the
 /// resources a draw needs are the ones it already holds.
@@ -152,6 +240,10 @@ pub(crate) struct CommandBuffer {
     /// Event values the batch now recording waits for.
     waits: Vec<(vk::Semaphore, u64)>,
     descriptor_pools: Vec<vk::DescriptorPool>,
+    /// The sets written from those pools, by layout and contents. A set is
+    /// never written again once a draw has used it, so a draw which needs the
+    /// same descriptors binds it rather than allocating and writing another.
+    written_sets: WrittenSets,
     /// Objects the recording refers to, retained until the work completes.
     /// Each is retained once however often it is bound: a retain is a global
     /// lock in the Objective-C runtime, and a frame binds the same objects
@@ -306,6 +398,24 @@ impl CommandBuffer {
         if !object.is_null() && self.retained_set.insert(object as usize) {
             self.retained.push(OwnedObjcRef::retain(object));
         }
+    }
+
+    /// A set this command buffer already wrote with exactly `entries`.
+    fn written_set(
+        &self,
+        layout: vk::DescriptorSetLayout,
+        entries: &[DescriptorEntry],
+    ) -> Option<vk::DescriptorSet> {
+        self.written_sets.find(layout, entries)
+    }
+
+    fn remember_set(
+        &mut self,
+        layout: vk::DescriptorSetLayout,
+        entries: &[DescriptorEntry],
+        set: vk::DescriptorSet,
+    ) {
+        self.written_sets.remember(layout, entries, set);
     }
 
     /// A descriptor set for `layout`, from a pool this command buffer owns.
@@ -863,15 +973,16 @@ pub(crate) fn install() {
     for (selector, implementation, types) in per_stage.into_iter().chain(ranged) {
         encoder.replace_method(objc::sel::get(selector), implementation, types);
     }
-    for selector in [
-        "setCullMode:",
-        "setFrontFacingWinding:",
-        "setTriangleFillMode:",
-        "setDepthClipMode:",
-    ] {
+    let raster: [(&str, unsafe extern "C" fn(Id, Sel, u64)); 4] = [
+        ("setCullMode:", set_cull_mode),
+        ("setFrontFacingWinding:", set_front_facing_winding),
+        ("setTriangleFillMode:", set_triangle_fill_mode),
+        ("setDepthClipMode:", set_depth_clip_mode),
+    ];
+    for (selector, implementation) in raster {
         encoder.replace_method(
             objc::sel::get(selector),
-            set_raster_value as *const std::ffi::c_void,
+            implementation as *const std::ffi::c_void,
             c"v24@0:8Q16",
         );
     }

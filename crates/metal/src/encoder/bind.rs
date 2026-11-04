@@ -479,6 +479,13 @@ impl Encoder {
                 sets[index] = cache.set;
                 continue;
             }
+            if let Some(set) = command.written_set(layouts[index], &self.wanted[index]) {
+                cache.layout = layouts[index];
+                cache.set = set;
+                std::mem::swap(&mut cache.entries, &mut self.wanted[index]);
+                sets[index] = set;
+                continue;
+            }
             let set = command.allocate_set(layouts[index])?;
             cache.layout = layouts[index];
             cache.set = set;
@@ -550,6 +557,9 @@ impl Encoder {
                 // SAFETY: every referenced info lives across the call, and the
                 // sets are fresh, so no recorded command refers to them yet.
                 unsafe { gpu.device.update_descriptor_sets(&writes, &[]) };
+            }
+            for index in (0..SETS).filter(|index| fresh[*index]) {
+                command.remember_set(layouts[index], &self.set_cache[index].entries, sets[index]);
             }
         }
         Some(sets)
