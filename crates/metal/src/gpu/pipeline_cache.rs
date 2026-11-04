@@ -2,8 +2,8 @@
 //! translated shaders it compiles.
 
 use std::path::{Path, PathBuf};
-use std::sync::Once;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Mutex, Once};
 
 use ash::{Device, vk};
 use sha2::{Digest, Sha256};
@@ -24,6 +24,9 @@ pub(crate) struct PipelineCache {
     path: Option<PathBuf>,
     unsaved: AtomicU64,
     saving: AtomicBool,
+    /// Held across a save: the background save and the one at exit share a
+    /// temporary file.
+    writing: Mutex<()>,
 }
 
 impl PipelineCache {
@@ -73,6 +76,7 @@ impl PipelineCache {
             path,
             unsaved: AtomicU64::new(0),
             saving: AtomicBool::new(false),
+            writing: Mutex::new(()),
         }
     }
 
@@ -99,6 +103,7 @@ impl PipelineCache {
         let Some(path) = &self.path else {
             return;
         };
+        let _writing = self.writing.lock().unwrap_or_else(|e| e.into_inner());
         if self.unsaved.swap(0, Ordering::Relaxed) == 0 {
             return;
         }

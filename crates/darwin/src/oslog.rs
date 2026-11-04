@@ -246,7 +246,9 @@ unsafe fn format_message(format: *const c_char, buffer: *const u8, size: u32) ->
             b'x' => write!(out, "{:x}", item.unsigned()),
             b'X' => write!(out, "{:X}", item.unsigned()),
             b'o' => write!(out, "{:o}", item.unsigned()),
-            b'c' => out.write_all(&[item.unsigned() as u8]),
+            // As a Latin-1 character, so a high byte stays readable in the
+            // UTF-8 text rather than becoming a replacement character.
+            b'c' => write!(out, "{}", item.unsigned() as u8 as char),
             b'f' | b'F' => write!(out, "{:.6}", item.double()),
             b'e' | b'E' | b'g' | b'G' => write!(out, "{}", item.double()),
             b'p' | b'P' => write!(out, "{:#x}", item.unsigned()),
@@ -482,6 +484,12 @@ mod tests {
             render(c"caf\u{e9} \u{2192} %d", &bytes),
             "caf\u{e9} \u{2192} 3"
         );
+    }
+
+    #[test]
+    fn a_high_byte_character_reads_as_latin_1() {
+        let bytes = buffer(&[&0xe9u32.to_le_bytes()]);
+        assert_eq!(render(c"%c", &bytes), "\u{e9}");
     }
 
     #[test]

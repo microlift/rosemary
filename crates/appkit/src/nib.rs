@@ -527,7 +527,13 @@ impl Builder<'_> {
         }
         // An object is remembered only once it is built, so a reference back
         // to one still being built would build it again, without end.
+        // FIXME (ACCURACY): NSKeyedUnarchiver hands back the partly built
+        // object; here the back-reference is left nil.
         if self.building.contains(&uid) {
+            self.loaded.unwired.push(format!(
+                "a reference back to entry {} while it was being built was left nil",
+                uid.0
+            ));
             return None;
         }
         self.building.push(uid);
@@ -1001,6 +1007,7 @@ mod tests {
         let item = builder.instantiate(Uid(1));
         assert!(item.is_some_and(|item| !item.is_null()));
         assert!(builder.building.is_empty());
+        assert_eq!(builder.loaded.unwired.len(), 1);
     }
 
     #[test]

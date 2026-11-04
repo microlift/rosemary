@@ -192,18 +192,19 @@ unsafe extern "C" fn with_characters_in_string(_class: Id, _sel: Sel, text: Id) 
 }
 
 /// The first and last member of `length` (nonzero) characters from
-/// `location`, clamped to what a member can be rather than wrapped.
-fn inclusive(location: usize, length: usize) -> (u32, u32) {
+/// `location`, with the end clamped to what a member can be rather than
+/// wrapped, or `None` where the range starts past every member.
+fn inclusive(location: usize, length: usize) -> Option<(u32, u32)> {
+    let first = u32::try_from(location).ok()?;
     let last = location.saturating_add(length - 1);
-    let clamp = |at: usize| u32::try_from(at).unwrap_or(u32::MAX);
-    (clamp(location), clamp(last))
+    Some((first, u32::try_from(last).unwrap_or(u32::MAX)))
 }
 
 /// `+characterSetWithRange:`, over UTF-16 code units as `NSRange` counts them.
 unsafe extern "C" fn with_range(_class: Id, _sel: Sel, range: crate::geometry::NSRange) -> Id {
     let ranges = match range.length {
         0 => Vec::new(),
-        n => vec![inclusive(range.location, n)],
+        n => inclusive(range.location, n).into_iter().collect(),
     };
     make_custom(Members {
         ranges,
@@ -349,7 +350,9 @@ pub unsafe extern "C" fn CFCharacterSetAddCharactersInRange(
     }
     let mut custom = custom().lock().unwrap_or_else(|e| e.into_inner());
     let members = custom.entry(set as usize).or_default();
-    let range = inclusive(location as usize, length as usize);
+    let Some(range) = inclusive(location as usize, length as usize) else {
+        return;
+    };
     if members.inverted {
         // Adding to a complement removes from what it excludes.
         members.ranges = members
@@ -392,10 +395,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn a_range_past_the_last_character_is_clamped_rather_than_wrapped() {
-        assert_eq!(inclusive(0x41, 26), (0x41, 0x5a));
-        assert_eq!(inclusive(usize::MAX - 1, 4), (u32::MAX, u32::MAX));
-        assert_eq!(inclusive(0x10, usize::MAX), (0x10, u32::MAX));
+    fn a_range_past_the_last_character_is_clamped_or_empty_rather_than_wrapped() {
+        assert_eq!(inclusive(0x41, 26), Some((0x41, 0x5a)));
+        assert_eq!(inclusive(usize::MAX - 1, 4), None);
+        assert_eq!(inclusive(0x10, usize::MAX), Some((0x10, u32::MAX)));
     }
 
     #[test]

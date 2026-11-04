@@ -152,7 +152,8 @@ pub struct Gpu {
     descriptor_pools: Mutex<Vec<vk::DescriptorPool>>,
     upload_chunks: Mutex<Vec<GpuBuffer>>,
     /// Larger host-visible buffers for texture uploads and readbacks.
-    staging_buffers: Mutex<Vec<GpuBuffer>>,
+    /// Each with when it was handed back, so idle ones can be freed.
+    staging_buffers: Mutex<Vec<(GpuBuffer, std::time::Instant)>>,
     /// `VK_KHR_push_descriptor`, where advertised, and the descriptor limit
     /// which decides whether one set in a pipeline can use it.
     push_descriptor_api: Option<ash::khr::push_descriptor::Device>,
@@ -276,6 +277,10 @@ pub const UPLOAD_CHUNK: u64 = 256 << 10;
 /// The most staging memory a device keeps for reuse between transfers too
 /// large for an upload chunk.
 const STAGING_POOL_BYTES: u64 = 64 << 20;
+
+/// How long a pooled staging buffer may sit unused before it is freed, so a
+/// burst of large transfers does not keep its memory for good.
+const STAGING_IDLE: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// Makes the next device behave as one without `VK_KHR_push_descriptor`, so
 /// its descriptor paths are tested on a device which has the extension.

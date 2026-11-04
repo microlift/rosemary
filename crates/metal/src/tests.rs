@@ -2962,7 +2962,7 @@ fn the_staging_pool_recycles_the_smallest_fit() {
     };
     let gpu = gpu_of(device).expect("a Vulkan device");
     const MIB: u64 = 1 << 20;
-    let small = gpu.acquire_staging_buffer(3 * MIB / 4).expect("staging");
+    let small = gpu.acquire_staging_buffer(MIB).expect("staging");
     assert_eq!(small.length, MIB);
     assert!(!small.contents.is_null());
     let handle = small.buffer;

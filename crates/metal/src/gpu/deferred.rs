@@ -214,6 +214,7 @@ impl Gpu {
 
     /// Give back every batch the device has finished, oldest first.
     pub(super) fn retire_deferred(&self) {
+        self.trim_staging_buffers();
         loop {
             let batch = {
                 let mut in_flight = self.deferred.in_flight.lock().expect("deferred transfers");

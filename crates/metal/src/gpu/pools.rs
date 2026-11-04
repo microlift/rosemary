@@ -293,32 +293,40 @@ impl Gpu {
     /// textures in would otherwise create and free a buffer for each.
     pub fn acquire_staging_buffer(&self, length: u64) -> Result<GpuBuffer, String> {
         let mut pool = self.staging_buffers.lock().expect("staging buffers");
+        let idle = take_idle_staging(&mut pool);
         let fit = (0..pool.len())
-            .filter(|at| pool[*at].length >= length)
-            .min_by_key(|at| pool[*at].length);
-        if let Some(at) = fit {
-            return Ok(pool.swap_remove(at));
-        }
+            .filter(|at| pool[*at].0.length >= length)
+            .min_by_key(|at| pool[*at].0.length);
+        let found = fit.map(|at| pool.swap_remove(at).0);
         drop(pool);
-        // Sizes rounded to a power of two, so that a texture's mips and
-        // its neighbours of similar size can share the same few buffers.
-        let size = match length.checked_next_power_of_two() {
-            Some(rounded) if rounded <= STAGING_POOL_BYTES => rounded,
-            _ => length,
-        };
-        self.create_staging_buffer(size)
+        idle.into_iter()
+            .for_each(|buffer| self.destroy_buffer(buffer));
+        match found {
+            Some(buffer) => Ok(buffer),
+            None => self.create_staging_buffer(length),
+        }
     }
 
     /// Hand back a staging buffer no pending submission still uses.
     pub fn release_staging_buffer(&self, buffer: GpuBuffer) {
         let mut pool = self.staging_buffers.lock().expect("staging buffers");
-        let held: u64 = pool.iter().map(|buffer| buffer.length).sum();
+        let mut idle = take_idle_staging(&mut pool);
+        let held: u64 = pool.iter().map(|(buffer, _)| buffer.length).sum();
         if held + buffer.length <= STAGING_POOL_BYTES {
-            pool.push(buffer);
-            return;
+            pool.push((buffer, std::time::Instant::now()));
+        } else {
+            idle.push(buffer);
         }
         drop(pool);
-        self.destroy_buffer(buffer);
+        idle.into_iter()
+            .for_each(|buffer| self.destroy_buffer(buffer));
+    }
+
+    /// Free the pooled staging buffers left unused for [`STAGING_IDLE`].
+    pub(super) fn trim_staging_buffers(&self) {
+        let idle = take_idle_staging(&mut self.staging_buffers.lock().expect("staging buffers"));
+        idle.into_iter()
+            .for_each(|buffer| self.destroy_buffer(buffer));
     }
 
     /// Hand back an upload chunk no pending submission still reads.
@@ -339,4 +347,17 @@ impl Gpu {
     pub fn timestamp_valid_bits(&self) -> u32 {
         self.timestamp_valid_bits
     }
+}
+
+/// Take out the pooled staging buffers unused for longer than [`STAGING_IDLE`].
+fn take_idle_staging(pool: &mut Vec<(GpuBuffer, std::time::Instant)>) -> Vec<GpuBuffer> {
+    let mut idle = Vec::new();
+    let mut at = 0;
+    while at < pool.len() {
+        match pool[at].1.elapsed() > STAGING_IDLE {
+            true => idle.push(pool.swap_remove(at).0),
+            false => at += 1,
+        }
+    }
+    idle
 }

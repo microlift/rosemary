@@ -27,6 +27,9 @@ const _: () = {
     assert!(std::mem::offset_of!(Kevent, udata) == 24);
 };
 
+/// The most events one host wait is asked for.
+const HOST_WAIT_BATCH: usize = 1024;
+
 const EVFILT_READ: i16 = -1;
 const EVFILT_WRITE: i16 = -2;
 const EVFILT_SIGNAL: i16 = -6;
@@ -1481,7 +1484,10 @@ pub unsafe extern "C" fn kevent(
         let registrations = state.registrations.clone();
         drop(state);
         let port_fds: Vec<c_int> = ports.iter().map(|port| port.fd()).collect();
-        match backend.wait(queue, &registrations, &port_fds, capacity, wait) {
+        // The host queue keeps what one wait leaves unread, so a huge
+        // `nevents` need not size the host buffer.
+        let batch = capacity.min(HOST_WAIT_BATCH);
+        match backend.wait(queue, &registrations, &port_fds, batch, wait) {
             Ok(ready) => ready,
             Err(errno) => {
                 crate::errno::set(errno);

@@ -1,4 +1,6 @@
+use std::collections::HashSet;
 use std::ffi::c_void;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use objc::class::Class;
 use objc::object::Id;
@@ -35,6 +37,11 @@ struct Observer {
 unsafe impl Send for Observer {}
 
 static OBSERVERS: std::sync::Mutex<Vec<Observer>> = std::sync::Mutex::new(Vec::new());
+
+/// Bumped by every removal from [`OBSERVERS`] or [`CALLBACK_OBSERVERS`], so a
+/// post in progress rescans a table only after one of its handlers removed
+/// something.
+static REMOVALS: AtomicU64 = AtomicU64::new(0);
 
 /// A `CFNotificationCallback`.
 pub type Callback = unsafe extern "C" fn(Id, *const c_void, Id, *const c_void, Id);
@@ -152,18 +159,21 @@ fn deliver_to_all(notification: Id, name: &str, object: Id, user_info: Id) {
     // Copied out before sending: an observer is entitled to add or remove one
     // from inside its own handler, and holding the lock across the send would
     // deadlock on the first that did.
-    let targets: Vec<(Id, Sel)> = OBSERVERS
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .iter()
-        .filter(|o| o.name.as_deref().is_none_or(|n| n == name))
-        .filter(|o| o.object.is_null() || o.object == object)
-        .map(|o| (o.observer, o.selector))
-        .collect();
+    let mut removals = REMOVALS.load(Ordering::Acquire);
+    let targets = observers_of(name, object);
+    let mut live: Option<HashSet<(Id, Sel)>> = None;
     for (observer, selector) in targets {
         // The center does not retain its observers, so one removed by an
         // earlier handler of this same post may already be freed.
-        if !is_observing(observer, selector) {
+        let now = REMOVALS.load(Ordering::Acquire);
+        if now != removals {
+            removals = now;
+            live = Some(observers_of(name, object).into_iter().collect());
+        }
+        if live
+            .as_ref()
+            .is_some_and(|live| !live.contains(&(observer, selector)))
+        {
             continue;
         }
         // SAFETY: an observer method is `void (id, SEL, NSNotification *)` by
@@ -175,13 +185,16 @@ fn deliver_to_all(notification: Id, name: &str, object: Id, user_info: Id) {
     post_to_callbacks(cf::local_center(), name, object as *const c_void, user_info);
 }
 
-/// Whether `observer` is still registered for `selector`.
-fn is_observing(observer: Id, selector: Sel) -> bool {
+/// The selector observers registered for `name` from `object`.
+fn observers_of(name: &str, object: Id) -> Vec<(Id, Sel)> {
     OBSERVERS
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .iter()
-        .any(|o| o.observer == observer && o.selector == selector)
+        .filter(|o| o.name.as_deref().is_none_or(|n| n == name))
+        .filter(|o| o.object.is_null() || o.object == object)
+        .map(|o| (o.observer, o.selector))
+        .collect()
 }
 
 /// Hand the notification to every block observer of `name`.
@@ -247,7 +260,41 @@ pub(crate) fn deliver(block: usize, queue: Id, notification: Id) {
 /// callback may add or remove one.
 pub(crate) fn post_to_callbacks(center: Id, name: &str, object: *const c_void, user_info: Id) {
     let name_object = crate::string::from_str(name);
-    let targets: Vec<(Callback, *const c_void)> = CALLBACK_OBSERVERS
+    let mut removals = REMOVALS.load(Ordering::Acquire);
+    let targets = callback_observers_of(center, name, object);
+    let mut live: Option<HashSet<(usize, *const c_void)>> = None;
+    for (callback, observer) in targets {
+        // As for selector observers: an earlier callback may have removed this
+        // one and freed what `observer` points at.
+        let now = REMOVALS.load(Ordering::Acquire);
+        if now != removals {
+            removals = now;
+            live = Some(
+                callback_observers_of(center, name, object)
+                    .into_iter()
+                    .map(|(callback, observer)| (callback as usize, observer))
+                    .collect(),
+            );
+        }
+        if live
+            .as_ref()
+            .is_some_and(|live| !live.contains(&(callback as usize, observer)))
+        {
+            continue;
+        }
+        // SAFETY: the signature `CFNotificationCenterAddObserver` declares.
+        unsafe { callback(center, observer, name_object, object, user_info) };
+    }
+    objc::arc::release(name_object);
+}
+
+/// The callback observers of `center` registered for `name` from `object`.
+fn callback_observers_of(
+    center: Id,
+    name: &str,
+    object: *const c_void,
+) -> Vec<(Callback, *const c_void)> {
+    CALLBACK_OBSERVERS
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .iter()
@@ -255,22 +302,7 @@ pub(crate) fn post_to_callbacks(center: Id, name: &str, object: *const c_void, u
         .filter(|o| o.name.as_deref().is_none_or(|n| n == name))
         .filter(|o| o.object.is_null() || o.object == object)
         .map(|o| (o.callback, o.observer))
-        .collect();
-    for (callback, observer) in targets {
-        // As for selector observers: an earlier callback may have removed this
-        // one and freed what `observer` points at.
-        let registered = CALLBACK_OBSERVERS
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .iter()
-            .any(|o| o.center == center && o.observer == observer);
-        if !registered {
-            continue;
-        }
-        // SAFETY: the signature `CFNotificationCenterAddObserver` declares.
-        unsafe { callback(center, observer, name_object, object, user_info) };
-    }
-    objc::arc::release(name_object);
+        .collect()
 }
 
 /// # Safety
@@ -461,6 +493,7 @@ unsafe extern "C" fn remove_observer(_receiver: Id, _sel: Sel, observer: Id) {
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .retain(|o| o.observer != observer);
+    REMOVALS.fetch_add(1, Ordering::Release);
     drop_block_observers(|o| o.token != observer);
 }
 
@@ -481,6 +514,7 @@ unsafe extern "C" fn remove_observer_name(
                 || (name.is_some() && o.name != name)
                 || (!object.is_null() && o.object != object)
         });
+    REMOVALS.fetch_add(1, Ordering::Release);
     drop_block_observers(|o| {
         o.token != observer
             || (name.is_some() && o.name != name)
@@ -613,6 +647,7 @@ pub mod cf {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .retain(|o| o.center != center || o.observer != observer);
+        super::REMOVALS.fetch_add(1, std::sync::atomic::Ordering::Release);
     }
 
     /// `CFNotificationCenterPostNotification(center, name, object, userInfo,
