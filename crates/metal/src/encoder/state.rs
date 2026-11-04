@@ -225,7 +225,13 @@ pub(super) unsafe extern "C" fn set_depth_bias(
     clamp: f32,
 ) {
     // SAFETY: an encoder of this crate's.
-    let command = unsafe { object::body::<Encoder>(receiver) }.command();
+    let encoder = unsafe { object::body::<Encoder>(receiver) };
+    let values = [bias.to_bits(), slope_scale.to_bits(), clamp.to_bits()];
+    if encoder.recorded_depth_bias == Some(values) {
+        return;
+    }
+    encoder.recorded_depth_bias = Some(values);
+    let command = encoder.command();
     // SAFETY: recording into this command buffer.
     unsafe {
         command

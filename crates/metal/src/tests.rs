@@ -1779,6 +1779,10 @@ struct CoveringDraw {
 /// The triangle program and target of `a_translated_triangle_draws_on_the_gpu`,
 /// or `None` where the device cannot count samples exactly.
 fn covering_draw(device: Id) -> Option<CoveringDraw> {
+    covering_draw_with_depth(device, 0)
+}
+
+fn covering_draw_with_depth(device: Id, depth_format: u64) -> Option<CoveringDraw> {
     let gpu = gpu_of(device).expect("a Vulkan device");
     if !gpu.occlusion_precise {
         return None;
@@ -1815,7 +1819,7 @@ fn covering_draw(device: Id) -> Option<CoveringDraw> {
             fragment_function: fragment,
             vertex_descriptor,
             colors: [pipeline::ColorAttachment::fresh(); pipeline::COLOR_ATTACHMENTS],
-            depth_format: 0,
+            depth_format,
             stencil_format: 0,
             sample_count: 1,
             alpha_to_coverage: false,
@@ -1954,6 +1958,80 @@ unsafe fn set_visibility_mode(encoder: Id, mode: u64, offset: u64) {
     let call: unsafe extern "C" fn(Id, Sel, u64, u64) =
         unsafe { std::mem::transmute(method.implementation()) };
     unsafe { call(encoder, sel, mode, offset) };
+}
+
+/// An unchanged depth bias is reusable, but a later nonzero bias must still
+/// change rasterized depth across draws in the same encoder.
+#[test]
+fn repeated_depth_bias_preserves_changed_depth_tests() {
+    isolate_metal_fixture!();
+    let Some(device) = gpu_device() else {
+        return;
+    };
+    // MTLPixelFormatDepth32Float.
+    const DEPTH32: u64 = 252;
+    // The Vulkan constant bias is scaled by the depth format's resolution.
+    const NONZERO_BIAS: f32 = 32_768.0;
+    let Some(fixture) = covering_draw_with_depth(device, DEPTH32) else {
+        return;
+    };
+    let gpu = gpu_of(device).expect("a Vulkan device");
+    let depth = resource::new_texture(
+        gpu,
+        resource::TextureDescriptor {
+            texture_type: 2,
+            pixel_format: DEPTH32,
+            width: COVERING_SIZE,
+            height: COVERING_SIZE,
+            depth: 1,
+            mipmap_level_count: 1,
+            sample_count: 1,
+            array_length: 1,
+            storage_mode: 2,
+            usage: gpu::USAGE_RENDER_TARGET,
+        },
+    );
+    assert!(!depth.is_null());
+    let depth_state = resource::new_depth_stencil_state(resource::DepthStencilState {
+        depth_compare: 3, // MTLCompareFunctionLessEqual.
+        depth_write: true,
+        ..resource::DepthStencilState::default()
+    });
+    let results = results_buffer(device, 6, 0);
+    let pass = fixture.pass(results);
+    // SAFETY: the same selectors and resources an MTLRenderCommandEncoder uses.
+    unsafe {
+        let attachment = send(pass, "depthAttachment");
+        send_with_object(attachment, "setTexture:", depth);
+        send_number(attachment, "setLoadAction:", 2); // Clear.
+        send_number(attachment, "setStoreAction:", 1); // Store.
+        let command = send(fixture.queue, "commandBuffer");
+        let render = render_encoder(command, pass);
+        fixture.bind(render);
+        send_with_object(render, "setDepthStencilState:", depth_state);
+        let (set_bias, selector) = method::<unsafe extern "C" fn(Id, Sel, f32, f32, f32)>(
+            render,
+            "setDepthBias:slopeScale:clamp:",
+        );
+        for (index, bias) in [0.0f32, 0.0, NONZERO_BIAS, NONZERO_BIAS, 0.0, 0.0]
+            .into_iter()
+            .enumerate()
+        {
+            set_bias(render, selector, bias, 0.0, 0.0);
+            set_visibility_mode(render, VISIBILITY_COUNTING, (index * 8) as u64);
+            draw(render, 3);
+        }
+        send_void(render, "endEncoding");
+        send_void(command, "commit");
+        send_void(command, "waitUntilCompleted");
+    }
+    let filled = COVERING_SIZE * COVERING_SIZE;
+    assert_eq!(
+        (0..6)
+            .map(|index| result_at(results, index))
+            .collect::<Vec<_>>(),
+        [filled, filled, 0, 0, filled, filled],
+    );
 }
 
 /// Runs at one offset in one pass add up, a disabled run is not counted, and

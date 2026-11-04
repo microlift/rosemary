@@ -200,6 +200,7 @@ pub(crate) struct Encoder {
     winding: u64,
     fill_mode: u64,
     depth_clip: u64,
+    recorded_depth_bias: Option<[u32; 3]>,
     in_render_pass: bool,
     /// Whether this is a parallel render sub-encoder, which records into a
     /// secondary command buffer inside a pass its parallel encoder began.
