@@ -1,0 +1,19 @@
+{
+  "pluginmetadataversion": 2,
+  "name": "Rosemary AOT",
+  "type": ["binaryview"],
+  "api": ["python3"],
+  "description": "Loads Rosemary AOT cache files (*.rmc) as relocated, symbolized host code.",
+  "longdescription": "Opens the code cache `rosemary aot` writes: every Microlift chunk is mapped with its relocations applied, host imports become externs, each region gets `region_<guest va>` (entry) and `region_<guest va>_body` (link target) functions, and the guest code map becomes comments.",
+  "license": {"name": "See the Rosemary repository"},
+  "platforms": ["Darwin", "Linux", "Windows"],
+  "installinstructions": {
+    "Darwin": "Symlink tools/binja/rosemary_aot into ~/Library/Application Support/Binary Ninja/plugins.",
+    "Linux": "Symlink tools/binja/rosemary_aot into ~/.binaryninja/plugins.",
+    "Windows": "Copy tools/binja/rosemary_aot into %APPDATA%\\Binary Ninja\\plugins."
+  },
+  "dependencies": {},
+  "version": "1.0.0",
+  "author": "Rosemary contributors",
+  "minimumbinaryninjaversion": 5000
+}
