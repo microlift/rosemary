@@ -47,7 +47,10 @@ impl Tracker {
         }
         std::thread::Builder::new()
             .name("metal:retire".to_string())
-            .spawn(move || worker(gpu))
+            .spawn(move || {
+                crate::enter_darwin_thread();
+                worker(gpu)
+            })
             .expect("a thread for Metal submissions");
     }
 

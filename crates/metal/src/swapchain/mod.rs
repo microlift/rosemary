@@ -628,7 +628,10 @@ fn ensure_resize_worker(window: usize, entry: &Arc<WindowSwapchain>) {
     let owned = Arc::clone(entry);
     let handle = std::thread::Builder::new()
         .name("rosemary-wsi-resize".into())
-        .spawn(move || resize_worker(window, owned))
+        .spawn(move || {
+            crate::enter_darwin_thread();
+            resize_worker(window, owned)
+        })
         .expect("window-local WSI resize worker");
     *entry.resize_worker.lock().expect("resize worker") = Some(handle);
 }
@@ -1043,6 +1046,7 @@ pub(crate) fn forget_window(window: sdl3::Window) {
         std::thread::Builder::new()
             .name("rosemary-wsi-retire".into())
             .spawn(move || {
+                crate::enter_darwin_thread();
                 let worker = entry.worker.lock().expect("layer compositor worker").take();
                 if let Some(worker) = worker {
                     worker.thread().unpark();
@@ -1380,6 +1384,7 @@ fn present_impl(
         let spawned = std::thread::Builder::new()
             .name("metal:swapchain-init".into())
             .spawn(move || {
+                crate::enter_darwin_thread();
                 let cancelled = cancellation;
                 let registration = InitializerRegistration {
                     window,
@@ -2014,7 +2019,10 @@ fn ensure_layer_compositor_worker(window: usize, entry: &Arc<WindowSwapchain>) {
     let worker_entry = Arc::clone(entry);
     let handle = std::thread::Builder::new()
         .name("rosemary-layer-present".into())
-        .spawn(move || layer_compositor_worker(window, worker_entry))
+        .spawn(move || {
+            crate::enter_darwin_thread();
+            layer_compositor_worker(window, worker_entry)
+        })
         .expect("layer presenter thread");
     // Started under the window presentation mutex, so forget_window cannot
     // run between launching the worker and recording its join handle.

@@ -241,7 +241,10 @@ unsafe extern "C" fn notify_listener(receiver: Id, _sel: Sel, listener: Id, valu
         // Detached deliberately, like the completion worker.
         std::thread::Builder::new()
             .name("metal:events".to_string())
-            .spawn(watch_events)
+            .spawn(|| {
+                crate::enter_darwin_thread();
+                watch_events()
+            })
             .expect("a thread for MTLSharedEvent notifications");
     });
 }
@@ -252,7 +255,8 @@ unsafe extern "C" fn notify_listener(receiver: Id, _sel: Sel, listener: Id, valu
 ///
 /// The entry carries one reference to its event, block and queue.
 unsafe fn deliver_never(notification: Notification) {
-    objc::block::release(notification.block as Id);
+    // The guest's block; see `drawable_dealloc`.
+    darwin::call_as_darwin!(objc::block::release(notification.block as Id));
     objc::arc::release(notification.event as Id);
     // SAFETY: the caller's reference.
     unsafe { darwin::dispatch::object::release(notification.queue) };

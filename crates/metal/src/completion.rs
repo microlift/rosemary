@@ -90,8 +90,10 @@ unsafe fn run(entry: Pending) {
             unsafe { call(block, command_buffer) };
         }
         objc::arc::pool_pop(pool);
+        // The references this entry owned, now spent. The last reference to
+        // either may run guest code: the block's dispose helper, or whatever
+        // the guest associated with the command buffer.
+        objc::block::release(block);
+        objc::arc::release(command_buffer);
     }
-    // The reference this entry owned, now spent.
-    objc::block::release(block);
-    objc::arc::release(command_buffer);
 }

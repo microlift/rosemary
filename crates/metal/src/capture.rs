@@ -169,7 +169,10 @@ pub(crate) fn finish(gpu: &'static Gpu, captures: Vec<Capture>) {
     QUEUE.worker.call_once(|| {
         std::thread::Builder::new()
             .name("metal:capture".to_string())
-            .spawn(worker)
+            .spawn(|| {
+                crate::enter_darwin_thread();
+                worker()
+            })
             .expect("a thread for Metal capture output");
     });
     let mut pending = QUEUE.pending.lock().expect("capture output queue");
