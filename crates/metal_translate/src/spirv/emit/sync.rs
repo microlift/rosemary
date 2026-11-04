@@ -31,8 +31,7 @@ impl Emitter {
             InstructionKind::DiscardFragment => {
                 self.capability(Capability::DemoteToHelperInvocation)?;
                 if self.spirv_version < (1, 6) {
-                    self.builder
-                        .extension("SPV_EXT_demote_to_helper_invocation");
+                    self.extension("SPV_EXT_demote_to_helper_invocation");
                 }
                 // rspirv classifies this as a terminator and would close the
                 // block. SPIR-V lets execution continue after it, as Metal

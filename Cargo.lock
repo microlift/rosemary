@@ -2044,6 +2044,7 @@ dependencies = [
  "objc",
  "rspirv",
  "sdl3",
+ "sha2 0.11.0",
  "starnix",
  "static_init",
 ]

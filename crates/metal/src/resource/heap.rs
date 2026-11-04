@@ -310,7 +310,7 @@ unsafe extern "C" fn heap_new_buffer(receiver: Id, _sel: Sel, length: u64, optio
     // The heap decides where the memory lives; the call's options only add
     // to that, so its storage and cache bits are the heap's.
     let options = (options & !0x3ff) | heap.descriptor.resource_options();
-    let buffer = new_buffer(heap.gpu, length as usize, options);
+    let buffer = new_buffer(heap.gpu, length as usize, options, gpu::Fill::Zero);
     if buffer.is_null() {
         give_back(receiver, quote.size);
     } else {

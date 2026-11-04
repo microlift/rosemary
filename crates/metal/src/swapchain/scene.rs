@@ -475,7 +475,7 @@ impl SceneBlender {
             .stage(stage)
             .layout(*layout);
         let pipeline =
-            unsafe { device.create_compute_pipelines(vk::PipelineCache::null(), &[info], None) };
+            unsafe { device.create_compute_pipelines(gpu.pipeline_cache(), &[info], None) };
         unsafe { device.destroy_shader_module(module, None) };
         let pipeline =
             pipeline.map_err(|(_, e)| format!("scene vkCreateComputePipelines: {e:?}"))?[0];

@@ -26,7 +26,7 @@ pub(super) unsafe extern "C" fn new_buffer(
     let Some(gpu) = gpu_of(receiver) else {
         return std::ptr::null_mut();
     };
-    resource::new_buffer(gpu, length, options)
+    resource::new_buffer(gpu, length, options, gpu::Fill::Zero)
 }
 
 pub(super) unsafe extern "C" fn new_buffer_with_bytes(
@@ -39,7 +39,11 @@ pub(super) unsafe extern "C" fn new_buffer_with_bytes(
     let Some(gpu) = gpu_of(receiver) else {
         return std::ptr::null_mut();
     };
-    let buffer = resource::new_buffer(gpu, length, options);
+    let fill = match bytes.is_null() {
+        true => gpu::Fill::Zero,
+        false => gpu::Fill::Overwritten,
+    };
+    let buffer = resource::new_buffer(gpu, length, options, fill);
     if !buffer.is_null() && !bytes.is_null() {
         // SAFETY: a buffer this call just made.
         let inner = unsafe { &object::body::<resource::Buffer>(buffer).inner };

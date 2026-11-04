@@ -164,6 +164,8 @@ fn items(buffer: &[u8]) -> Vec<Item<'_>> {
 /// `format` is a NUL-terminated string, `buffer` holds `size` readable bytes, and
 /// any pointer argument in it points to a NUL-terminated string.
 unsafe fn format_message(format: *const c_char, buffer: *const u8, size: u32) -> String {
+    use std::io::Write as _;
+
     if format.is_null() {
         return String::new();
     }
@@ -175,16 +177,18 @@ unsafe fn format_message(format: *const c_char, buffer: *const u8, size: u32) ->
     };
     let args = items(bytes);
     let mut next = 0usize;
-    let mut out = String::with_capacity(template.len() + 32);
+    // Bytes until the end: the template is UTF-8, and a character of it is
+    // not one byte.
+    let mut out: Vec<u8> = Vec::with_capacity(template.len() + 32);
     let mut chars = template.iter().copied().peekable();
     while let Some(byte) = chars.next() {
         if byte != b'%' {
-            out.push(byte as char);
+            out.push(byte);
             continue;
         }
         if chars.peek() == Some(&b'%') {
             chars.next();
-            out.push('%');
+            out.push(b'%');
             continue;
         }
         // The annotation, then the flags, width and precision, then the
@@ -229,31 +233,34 @@ unsafe fn format_message(format: *const c_char, buffer: *const u8, size: u32) ->
         let Some(item) = args.get(next) else {
             // More conversions than arguments: say so in place rather than
             // dropping the rest of the line.
-            out.push_str("<missing>");
+            out.extend_from_slice(b"<missing>");
             continue;
         };
         next += 1;
-        match conversion {
+        // Writing to a `Vec` cannot fail.
+        let _ = match conversion {
             // SAFETY: the caller states a pointer argument is a string.
-            b's' | b'S' => out.push_str(&unsafe { item.string() }),
-            b'd' | b'i' => out.push_str(&item.signed().to_string()),
-            b'u' => out.push_str(&item.unsigned().to_string()),
-            b'x' => out.push_str(&format!("{:x}", item.unsigned())),
-            b'X' => out.push_str(&format!("{:X}", item.unsigned())),
-            b'o' => out.push_str(&format!("{:o}", item.unsigned())),
-            b'c' => out.push(item.unsigned() as u8 as char),
-            b'f' | b'F' => out.push_str(&format!("{:.6}", item.double())),
-            b'e' | b'E' | b'g' | b'G' => out.push_str(&format!("{}", item.double())),
-            b'p' | b'P' => out.push_str(&format!("{:#x}", item.unsigned())),
+            b's' | b'S' => out.write_all(unsafe { item.string() }.as_bytes()),
+            b'd' | b'i' => write!(out, "{}", item.signed()),
+            b'u' => write!(out, "{}", item.unsigned()),
+            b'x' => write!(out, "{:x}", item.unsigned()),
+            b'X' => write!(out, "{:X}", item.unsigned()),
+            b'o' => write!(out, "{:o}", item.unsigned()),
+            // As a Latin-1 character, so a high byte stays readable in the
+            // UTF-8 text rather than becoming a replacement character.
+            b'c' => write!(out, "{}", item.unsigned() as u8 as char),
+            b'f' | b'F' => write!(out, "{:.6}", item.double()),
+            b'e' | b'E' | b'g' | b'G' => write!(out, "{}", item.double()),
+            b'p' | b'P' => write!(out, "{:#x}", item.unsigned()),
             // An object's `-description` is Foundation's to answer and this crate
             // is underneath it, so the pointer is what there is. The descriptor
             // is what says it was an object rather than a number.
-            b'@' => out.push_str(&format!("<object {:#x}>", item.unsigned())),
-            other => out.push_str(&format!("<%{}>", other as char)),
-        }
+            b'@' => write!(out, "<object {:#x}>", item.unsigned()),
+            other => write!(out, "<%{}>", other as char),
+        };
         let _ = item.descriptor;
     }
-    out
+    String::from_utf8_lossy(&out).into_owned()
 }
 
 /// `os_log_t os_log_create(const char *subsystem, const char *category)`
@@ -468,6 +475,21 @@ mod tests {
     fn a_missing_argument_is_named_rather_than_dropped() {
         let bytes = buffer(&[]);
         assert_eq!(render(c"a=%d b=%d", &bytes), "a=<missing> b=<missing>");
+    }
+
+    #[test]
+    fn non_ascii_text_in_the_format_keeps_its_encoding() {
+        let bytes = buffer(&[&3u32.to_le_bytes()]);
+        assert_eq!(
+            render(c"caf\u{e9} \u{2192} %d", &bytes),
+            "caf\u{e9} \u{2192} 3"
+        );
+    }
+
+    #[test]
+    fn a_high_byte_character_reads_as_latin_1() {
+        let bytes = buffer(&[&0xe9u32.to_le_bytes()]);
+        assert_eq!(render(c"%c", &bytes), "\u{e9}");
     }
 
     #[test]

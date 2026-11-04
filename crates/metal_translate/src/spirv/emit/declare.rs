@@ -528,16 +528,24 @@ impl Emitter {
         Ok(())
     }
 
-    /// Declare the module's global variables.
+    /// Declare the module's global variables the entry function refers to.
     ///
     /// Metal's `constant` tables become `Private` variables with their
     /// initializer, and its `threadgroup` arrays become `Workgroup` variables,
-    /// which Vulkan does not let an initializer reach.
+    /// which Vulkan does not let an initializer reach. Another entry point's
+    /// globals are left out: on SPIR-V 1.4 each would join this entry's
+    /// interface, and its `threadgroup` arrays would count against this
+    /// kernel's shared memory.
     pub(in crate::spirv) fn declare_globals(
         &mut self,
         module: &Module,
+        function: &Function,
     ) -> Result<(), TranslateError> {
+        let used = referenced_globals(function);
         for (index, global) in module.globals.iter().enumerate() {
+            if !used.contains(&(index as u32)) {
+                continue;
+            }
             let storage = match global.space {
                 crate::ir::AddressSpace::Constant | crate::ir::AddressSpace::Thread => {
                     StorageClass::Private
@@ -573,4 +581,33 @@ impl Emitter {
         }
         Ok(())
     }
+}
+
+/// The indices of the module globals `function` names.
+fn referenced_globals(function: &Function) -> BTreeSet<u32> {
+    fn visit(operand: &Operand, used: &mut BTreeSet<u32>) {
+        match operand {
+            Operand::Global { index, .. } => {
+                used.insert(*index);
+            }
+            Operand::Composite { elements, .. } => {
+                for element in elements {
+                    visit(element, used);
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut used = BTreeSet::new();
+    for block in &function.blocks {
+        for instruction in &block.instructions {
+            for operand in instruction_operands(&instruction.kind) {
+                visit(operand, &mut used);
+            }
+        }
+        for operand in terminator_operands(&block.terminator) {
+            visit(operand, &mut used);
+        }
+    }
+    used
 }

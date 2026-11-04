@@ -244,11 +244,12 @@ impl Encoder {
     pub(super) fn bind_resources(
         &mut self,
         resources: &[metal_translate::ResourceBinding],
+        inline_samplers: &[vk::Sampler],
         layouts: &Layouts,
         bind_point: vk::PipelineBindPoint,
     ) -> bool {
         let start = stats::enabled().then(std::time::Instant::now);
-        let bound = self.bind_resources_inner(resources, layouts, bind_point);
+        let bound = self.bind_resources_inner(resources, inline_samplers, layouts, bind_point);
         if let Some(start) = start {
             stats::add(Counter::BindMicros, start.elapsed().as_micros() as u64);
         }
@@ -259,10 +260,11 @@ impl Encoder {
     pub(super) fn bind_resources_inner(
         &mut self,
         resources: &[metal_translate::ResourceBinding],
+        inline_samplers: &[vk::Sampler],
         layouts: &Layouts,
         bind_point: vk::PipelineBindPoint,
     ) -> bool {
-        let used = self.collect_writes(resources, layouts);
+        let used = self.collect_writes(resources, inline_samplers, layouts);
         let push_compatible = self.bound[bind_point_slot(bind_point)].layouts == layouts.sets;
         let Some(sets) = self.materialize_sets(&layouts.sets, &used, layouts.push_set) else {
             gpu::trace_once(
@@ -296,6 +298,7 @@ impl Encoder {
     fn collect_writes(
         &mut self,
         resources: &[metal_translate::ResourceBinding],
+        inline_samplers: &[vk::Sampler],
         layouts: &Layouts,
     ) -> [bool; SETS] {
         let gpu = self.command().gpu;
@@ -304,7 +307,8 @@ impl Encoder {
         for wanted in &mut self.wanted {
             wanted.clear();
         }
-        for binding in resources {
+        debug_assert_eq!(resources.len(), inline_samplers.len());
+        for (binding, inline_sampler) in resources.iter().zip(inline_samplers) {
             let set = binding.descriptor_set as usize;
             if set >= SETS {
                 // Rejected by `layouts_for`, so not reachable through a
@@ -389,11 +393,7 @@ impl Encoder {
                     }
                 }
                 ResourceKind::Sampler if binding.inline_sampler.is_some() => {
-                    let made = binding
-                        .inline_sampler
-                        .as_ref()
-                        .map(|sampler| crate::resource::sampler::inline(gpu, sampler))
-                        .unwrap_or_default();
+                    let made = *inline_sampler;
                     use vk::Handle;
                     if made == vk::Sampler::null() {
                         unbound(
@@ -459,7 +459,7 @@ impl Encoder {
     }
 
     /// Allocate or reuse a descriptor set per used set index, writing it only
-    /// when its contents differ from the one this encoder last wrote.
+    /// when no set this command buffer wrote already holds its contents.
     fn materialize_sets(
         &mut self,
         layouts: &[vk::DescriptorSetLayout; SETS],
@@ -468,28 +468,26 @@ impl Encoder {
     ) -> Option<[vk::DescriptorSet; SETS]> {
         let command = self.command();
         let gpu = command.gpu;
-        // A set whose layout and contents match the one this encoder last
-        // wrote is still valid: nothing writes a set once a draw has used it.
         let mut sets = [vk::DescriptorSet::null(); SETS];
         let mut fresh = [false; SETS];
         for index in 0..SETS {
             if !used[index] || push_set == Some(index) {
                 continue;
             }
+            let layout = layouts[index];
+            let set = match command.descriptor_sets[index].find(layout, &self.wanted[index]) {
+                Some(set) => set,
+                None => {
+                    let set = command.allocate_set(layout)?;
+                    command.descriptor_sets[index].insert(layout, set, &mut self.wanted[index]);
+                    fresh[index] = true;
+                    set
+                }
+            };
             let cache = &mut self.set_cache[index];
-            if cache.set != vk::DescriptorSet::null()
-                && cache.layout == layouts[index]
-                && cache.entries == self.wanted[index]
-            {
-                sets[index] = cache.set;
-                continue;
-            }
-            let set = command.allocate_set(layouts[index])?;
-            cache.layout = layouts[index];
+            cache.layout = layout;
             cache.set = set;
-            std::mem::swap(&mut cache.entries, &mut self.wanted[index]);
             sets[index] = set;
-            fresh[index] = true;
         }
 
         if fresh.iter().any(|fresh| *fresh) {
@@ -497,7 +495,7 @@ impl Encoder {
             let mut image_infos = Vec::new();
             let mut texel_views = Vec::new();
             for index in (0..SETS).filter(|index| fresh[*index]) {
-                for entry in &self.set_cache[index].entries {
+                for entry in command.descriptor_sets[index].front() {
                     use vk::Handle;
                     match entry.kind {
                         vk::DescriptorType::UNIFORM_TEXEL_BUFFER
@@ -526,7 +524,7 @@ impl Encoder {
             let (mut next_buffer, mut next_image, mut next_texel) = (0, 0, 0);
             let mut writes = Vec::with_capacity(buffer_infos.len() + image_infos.len());
             for index in (0..SETS).filter(|index| fresh[*index]) {
-                for entry in &self.set_cache[index].entries {
+                for entry in command.descriptor_sets[index].front() {
                     let write = vk::WriteDescriptorSet::default()
                         .dst_set(sets[index])
                         .dst_binding(entry.binding)
@@ -851,6 +849,7 @@ impl Encoder {
         }
         if !self.bind_resources(
             &state.resources,
+            &state.inline_samplers,
             &state.layouts,
             vk::PipelineBindPoint::GRAPHICS,
         ) {
