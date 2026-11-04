@@ -20,8 +20,131 @@ unsafe extern "C" fn lookup(receiver: Id, sel: Sel, slot: *mut Id) -> *const c_v
         true => unrecognised_logged as *const c_void,
         false => unrecognised as *const c_void,
     };
+    let generation = crate::class::generation();
     // SAFETY: the caller's obligations.
-    unsafe { resolve(receiver, sel, slot) }.unwrap_or(refused)
+    let resolved = unsafe { resolve(receiver, sel, slot) };
+    if let Some(imp) = resolved {
+        // SAFETY: as above.
+        unsafe { sends::remember(receiver, sel, slot, imp, generation) };
+    }
+    resolved.unwrap_or(refused)
+}
+
+/// Every send [`msg_send`] resolved, cached by the receiver's class and the
+/// selector, which its x86-64 prologue probes before it saves a register.
+///
+/// A message from a game is a Metal or Foundation call, tens of thousands a
+/// frame; spilling every argument register to ask Rust was most of their cost.
+/// An entry is a sequence lock: odd while it is written, so a probe which reads
+/// the same even sequence before and after its loads saw a whole entry. Writers
+/// take [`WRITER`]; the probe takes nothing.
+mod sends {
+    use super::*;
+    use std::sync::Mutex;
+    use std::sync::atomic::AtomicU64;
+
+    /// log2 of the entry count.
+    pub(super) const BITS: u32 = 12;
+    /// The probe's `imul` takes a sign-extended 32-bit immediate.
+    pub(super) const MULTIPLIER: i32 = -1_640_531_535;
+
+    #[repr(C, align(32))]
+    pub(super) struct Entry {
+        sequence: AtomicU64,
+        class: AtomicUsize,
+        sel: AtomicUsize,
+        imp: AtomicUsize,
+    }
+
+    #[allow(clippy::declare_interior_mutable_const)]
+    const EMPTY: Entry = Entry {
+        sequence: AtomicU64::new(0),
+        class: AtomicUsize::new(0),
+        sel: AtomicUsize::new(0),
+        imp: AtomicUsize::new(0),
+    };
+
+    pub(super) static TABLE: [Entry; 1 << BITS] = [EMPTY; 1 << BITS];
+    static WRITER: Mutex<()> = Mutex::new(());
+
+    /// The entry the probe reads for `(class, sel)`: the same arithmetic as
+    /// its assembly.
+    pub(super) fn index(class: usize, sel: usize) -> usize {
+        let key = ((class as u64) << 7) ^ sel as u64;
+        (key.wrapping_mul(MULTIPLIER as i64 as u64) >> (64 - BITS)) as usize
+    }
+
+    /// The `IMP` cached for `(class, sel)`, read as the probe reads it.
+    #[cfg(test)]
+    pub(super) fn cached(class: usize, sel: usize) -> Option<usize> {
+        let entry = &TABLE[index(class, sel)];
+        let before = entry.sequence.load(Ordering::Acquire);
+        let found = (entry.class.load(Ordering::Acquire) == class
+            && entry.sel.load(Ordering::Acquire) == sel)
+            .then(|| entry.imp.load(Ordering::Acquire));
+        (before.is_multiple_of(2) && entry.sequence.load(Ordering::Acquire) == before)
+            .then_some(found)
+            .flatten()
+    }
+
+    /// Cache what [`resolve`] found for a direct send, unless the receiver was
+    /// forwarded, its class is still being initialized, a method table changed
+    /// since `generation`, or hardening is on (the probe checks nothing).
+    ///
+    /// # Safety
+    ///
+    /// As [`lookup`].
+    pub(super) unsafe fn remember(
+        receiver: Id,
+        sel: Sel,
+        slot: *mut Id,
+        imp: *const c_void,
+        generation: usize,
+    ) {
+        if !cfg!(target_arch = "x86_64") || crate::debug::enabled() {
+            return;
+        }
+        // SAFETY: the trampoline's spill slot, by the caller.
+        if !slot.is_null() && unsafe { *slot } != receiver {
+            return;
+        }
+        // SAFETY: a live object, whose first word is what the probe reads.
+        let isa = unsafe { *(receiver as *const usize) };
+        // SAFETY: `resolve` just found a method on this class.
+        let Some(class) = (unsafe { crate::class::from_ptr(isa as *const crate::class::Class) })
+        else {
+            return;
+        };
+        if !crate::class::is_initialized(class) {
+            return;
+        }
+        let _writer = WRITER.lock().unwrap_or_else(|e| e.into_inner());
+        if crate::class::generation() != generation {
+            return;
+        }
+        let entry = &TABLE[index(isa, sel as usize)];
+        let sequence = entry.sequence.load(Ordering::Relaxed);
+        entry.sequence.store(sequence + 1, Ordering::Release);
+        entry.class.store(isa, Ordering::Release);
+        entry.sel.store(sel as usize, Ordering::Release);
+        entry.imp.store(imp as usize, Ordering::Release);
+        entry.sequence.store(sequence + 2, Ordering::Release);
+    }
+
+    pub(super) fn forget() {
+        let _writer = WRITER.lock().unwrap_or_else(|e| e.into_inner());
+        for entry in &TABLE {
+            let sequence = entry.sequence.load(Ordering::Relaxed);
+            entry.sequence.store(sequence + 1, Ordering::Release);
+            entry.class.store(0, Ordering::Release);
+            entry.sequence.store(sequence + 2, Ordering::Release);
+        }
+    }
+}
+
+/// Drop every cached send, for a method table which changed.
+pub(crate) fn forget_cached_sends() {
+    sends::forget();
 }
 
 /// The method `sel` resolves to for `receiver`, after the class has had its
@@ -317,6 +440,33 @@ unsafe extern "C" fn msg_send() {
     core::arch::naked_asm!(
         "test    rdi, rdi",
         "je      9f",
+        // The cached send, probed with r10, r11 and rax, which carries a
+        // variadic call's vector count and so is saved around the probe.
+        "push    rax",
+        "mov     rax, [rdi]",
+        "mov     r11, rax",
+        "shl     r11, 7",
+        "xor     r11, rsi",
+        "imul    r11, r11, {multiplier}",
+        "shr     r11, {shift}",
+        "shl     r11, 5",
+        "lea     r10, [rip + {table}]",
+        "add     r10, r11",
+        "mov     r11, [r10]",
+        "test    r11, 1",
+        "jnz     8f",
+        "cmp     rax, [r10 + 8]",
+        "jne     8f",
+        "cmp     rsi, [r10 + 16]",
+        "jne     8f",
+        "mov     rax, [r10 + 24]",
+        "cmp     r11, [r10]",
+        "jne     8f",
+        "mov     r11, rax",
+        "pop     rax",
+        "jmp     r11",
+        "8:",
+        "pop     rax",
         "push    rbp",
         "mov     rbp, rsp",
         "sub     rsp, 192",
@@ -363,6 +513,9 @@ unsafe extern "C" fn msg_send() {
         "xorps   xmm1, xmm1",
         "ret",
         lookup = sym lookup,
+        table = sym sends::TABLE,
+        multiplier = const sends::MULTIPLIER,
+        shift = const 64 - sends::BITS,
     )
 }
 
@@ -862,6 +1015,163 @@ unsafe extern "C" fn forward_to_first_word() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `objc_msgSend` for a message taking no arguments and answering an
+    /// integer, called as a guest calls it.
+    fn send_answer(receiver: Id, sel: Sel) -> u64 {
+        // SAFETY: the trampoline takes any message; this one's signature.
+        let send: unsafe extern "C" fn(Id, Sel) -> u64 = unsafe { std::mem::transmute(entry()) };
+        // SAFETY: a live receiver whose method has this signature.
+        unsafe { send(receiver, sel) }
+    }
+
+    unsafe extern "C" fn answer_one(_receiver: Id, _sel: Sel) -> u64 {
+        1
+    }
+
+    unsafe extern "C" fn answer_two(_receiver: Id, _sel: Sel) -> u64 {
+        2
+    }
+
+    /// A fresh NSObject subclass answering `sel` with `imp`.
+    fn class_answering(
+        name: &std::ffi::CStr,
+        sel: Sel,
+        imp: unsafe extern "C" fn(Id, Sel) -> u64,
+    ) -> &'static crate::class::Class {
+        crate::bootstrap();
+        let nsobject = crate::class::lookup(c"NSObject").expect("NSObject");
+        let class = crate::class::allocate_pair(Some(nsobject), name, 0).expect("an unused name");
+        assert!(class.add_method(sel, imp as crate::class::Imp, c"Q16@0:8"));
+        crate::class::register_pair(class);
+        class
+    }
+
+    fn isa(object: Id) -> usize {
+        // SAFETY: a live object, whose first word is its class.
+        unsafe { *(object as *const usize) }
+    }
+
+    #[test]
+    fn a_cached_send_follows_a_replaced_implementation() {
+        let sel = crate::sel::get("rosemaryCachedAnswer");
+        let class = class_answering(c"RosemaryCachedSendReplaced", sel, answer_one);
+        let instance = crate::object::create_instance(class, 0);
+        assert_eq!(send_answer(instance, sel), 1);
+        assert_eq!(send_answer(instance, sel), 1);
+        if cfg!(target_arch = "x86_64") {
+            assert_eq!(
+                sends::cached(isa(instance), sel as usize),
+                Some(answer_one as *const () as usize)
+            );
+        }
+        class.replace_method(sel, answer_two as crate::class::Imp, c"Q16@0:8");
+        assert_eq!(send_answer(instance, sel), 2);
+    }
+
+    #[test]
+    fn classes_sharing_a_selector_each_reach_their_own_method() {
+        let sel = crate::sel::get("rosemaryCachedShared");
+        let first = crate::object::create_instance(
+            class_answering(c"RosemaryCachedSharedOne", sel, answer_one),
+            0,
+        );
+        let second = crate::object::create_instance(
+            class_answering(c"RosemaryCachedSharedTwo", sel, answer_two),
+            0,
+        );
+        for _ in 0..100 {
+            assert_eq!(send_answer(first, sel), 1);
+            assert_eq!(send_answer(second, sel), 2);
+        }
+    }
+
+    unsafe extern "C" fn forward_to_target(_receiver: Id, _sel: Sel, _asked: Sel) -> Id {
+        FORWARD_TARGET.load(Ordering::Acquire) as Id
+    }
+
+    static FORWARD_TARGET: AtomicUsize = AtomicUsize::new(0);
+
+    #[test]
+    fn a_forwarded_send_is_not_cached_for_the_forwarder() {
+        let sel = crate::sel::get("rosemaryCachedForwarded");
+        let target = crate::object::create_instance(
+            class_answering(c"RosemaryCachedForwardTarget", sel, answer_two),
+            0,
+        );
+        FORWARD_TARGET.store(target as usize, Ordering::Release);
+        let nsobject = crate::class::lookup(c"NSObject").expect("NSObject");
+        let forwarder_class =
+            crate::class::allocate_pair(Some(nsobject), c"RosemaryCachedForwarder", 0)
+                .expect("an unused name");
+        assert!(forwarder_class.add_method(
+            crate::sel::get("forwardingTargetForSelector:"),
+            forward_to_target as crate::class::Imp,
+            c"@24@0:8:16",
+        ));
+        crate::class::register_pair(forwarder_class);
+        let forwarder = crate::object::create_instance(forwarder_class, 0);
+        assert_eq!(send_answer(forwarder, sel), 2);
+        assert_eq!(send_answer(forwarder, sel), 2);
+        assert_eq!(sends::cached(isa(forwarder), sel as usize), None);
+    }
+
+    #[test]
+    fn sends_racing_replaced_implementations_reach_one_of_them() {
+        let sel = crate::sel::get("rosemaryCachedRace");
+        let class = class_answering(c"RosemaryCachedRace", sel, answer_one);
+        let instance = crate::object::create_instance(class, 0) as usize;
+        let sel_address = sel as usize;
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let senders: Vec<_> = (0..4)
+            .map(|_| {
+                let stop = std::sync::Arc::clone(&stop);
+                std::thread::spawn(move || {
+                    let mut sent = 0u64;
+                    while !stop.load(Ordering::Relaxed) {
+                        let answer = send_answer(instance as Id, sel_address as Sel);
+                        assert!(answer == 1 || answer == 2, "a send reached {answer}");
+                        sent += 1;
+                    }
+                    sent
+                })
+            })
+            .collect();
+        for round in 0..20_000 {
+            let imp = match round % 2 {
+                0 => answer_two as crate::class::Imp,
+                _ => answer_one as crate::class::Imp,
+            };
+            class.replace_method(sel, imp, c"Q16@0:8");
+        }
+        stop.store(true, Ordering::Relaxed);
+        for sender in senders {
+            assert!(sender.join().expect("a sender") > 0);
+        }
+    }
+
+    /// Dispatch cost of a send whose method is found. Run with `cargo test
+    /// --release -p objc -- --ignored --nocapture send_cost`.
+    #[test]
+    #[ignore = "a benchmark, not a check"]
+    fn send_cost() {
+        const SENDS: u64 = 20_000_000;
+        let sel = crate::sel::get("rosemaryBenchmarkAnswer");
+        let instance = crate::object::create_instance(
+            class_answering(c"RosemaryBenchmarkSend", sel, answer_one),
+            0,
+        );
+        let start = std::time::Instant::now();
+        let mut total = 0;
+        for _ in 0..SENDS {
+            total += send_answer(std::hint::black_box(instance), sel);
+        }
+        assert_eq!(total, SENDS);
+        eprintln!(
+            "send: {:.2} ns each",
+            start.elapsed().as_nanos() as f64 / SENDS as f64
+        );
+    }
 
     /// A missing `+` method names the class as the receiver, not an instance.
     #[test]

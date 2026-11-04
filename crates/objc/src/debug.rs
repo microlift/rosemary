@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::ffi::c_void;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
 use std::sync::{LazyLock, Mutex};
 
 use crate::class::Class;
@@ -10,7 +10,13 @@ const GUARD_BYTES: usize = 32;
 const GUARD: u8 = 0xa5;
 const DEAD: u8 = 0xdd;
 
-static ENABLED: AtomicBool = AtomicBool::new(false);
+static ENABLED: AtomicU8 = AtomicU8::new(UNDECIDED);
+
+/// What [`ENABLED`] holds. Asked on every retain and message send, so once
+/// the launch arguments have been read the answer is one load.
+const UNDECIDED: u8 = 0;
+const OFF: u8 = 1;
+const ON: u8 = 2;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum State {
@@ -65,22 +71,28 @@ pub(crate) fn validate_handle<T>(handle: *const T, kind: &'static str, operation
 /// irreversible: changing allocation rules halfway through a process would
 /// make the absence of a record ambiguous.
 pub fn enable() {
-    ENABLED.store(true, Ordering::Release);
+    ENABLED.store(ON, Ordering::Release);
 }
 
 /// Whether Objective-C hardening is enabled.
 #[inline]
 pub fn enabled() -> bool {
-    if ENABLED.load(Ordering::Acquire) {
-        return true;
+    match ENABLED.load(Ordering::Acquire) {
+        ON => true,
+        OFF => false,
+        _ => decide(),
     }
-    static REQUESTED_AT_LAUNCH: LazyLock<bool> =
-        LazyLock::new(|| requested_at_launch(std::env::args_os().skip(1)));
-    if *REQUESTED_AT_LAUNCH {
-        ENABLED.store(true, Ordering::Release);
-        return true;
+}
+
+#[cold]
+fn decide() -> bool {
+    let requested = requested_at_launch(std::env::args_os().skip(1));
+    // `enable` may have run meanwhile; it wins.
+    let state = if requested { ON } else { OFF };
+    match ENABLED.compare_exchange(UNDECIDED, state, Ordering::AcqRel, Ordering::Acquire) {
+        Ok(_) => requested,
+        Err(current) => current == ON,
     }
-    false
 }
 
 fn requested_at_launch(mut arguments: impl Iterator<Item = std::ffi::OsString>) -> bool {
@@ -201,8 +213,16 @@ fn violation(operation: &str, object: Id, reason: &str) -> ! {
 /// Unknown objects are admitted. Guest constant objects and storage passed to
 /// `objc_constructInstance` are not allocated by this runtime, but their `isa`
 /// is validated separately by the ordinary class lookup.
+#[inline]
 pub(crate) fn validate(object: Id, operation: &str) {
-    if !enabled() || object.is_null() || validate_tracked(object, operation) {
+    if enabled() {
+        validate_enabled(object, operation);
+    }
+}
+
+#[cold]
+fn validate_enabled(object: Id, operation: &str) {
+    if object.is_null() || validate_tracked(object, operation) {
         return;
     }
     if !(object as usize).is_multiple_of(std::mem::align_of::<*const Class>()) {
