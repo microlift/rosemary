@@ -77,9 +77,12 @@ pub(super) unsafe extern "C" fn dispatch_threadgroups(
             .device
             .cmd_dispatch(command.command_buffer, counts[0], counts[1], counts[2])
     });
-    // A serial encoder's next dispatch sees everything this one wrote.
+    // A concurrent dispatch needs a later barrier, even if an earlier one
+    // was explicitly recorded in this encoder.
+    encoder.compute_barrier_recorded = false;
     if !encoder.concurrent {
         encoder.barrier();
+        encoder.compute_barrier_recorded = true;
     }
 }
 
@@ -92,5 +95,6 @@ pub(super) unsafe extern "C" fn memory_barrier(receiver: Id, _sel: Sel) {
     let encoder = unsafe { object::body::<Encoder>(receiver) };
     if encoder.kind == Kind::Compute {
         encoder.barrier();
+        encoder.compute_barrier_recorded = true;
     }
 }

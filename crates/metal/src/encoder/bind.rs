@@ -11,6 +11,7 @@ pub(crate) fn new_encoder(command_buffer: Id, kind: Kind) -> Id {
             command_buffer: objc::arc::retain(command_buffer),
             kind,
             concurrent: false,
+            compute_barrier_recorded: false,
             compute_pipeline: std::ptr::null_mut(),
             render_pipeline: std::ptr::null_mut(),
             depth_state: std::ptr::null_mut(),
@@ -148,7 +149,11 @@ pub(super) unsafe extern "C" fn end_encoding(receiver: Id, _sel: Sel) {
             }
         }
     }
-    encoder.barrier();
+    // A serial compute dispatch or explicit barrier already orders the next
+    // encoder; recording another identical full memory barrier changes nothing.
+    if encoder.kind != Kind::Compute || !encoder.compute_barrier_recorded {
+        encoder.barrier();
+    }
 }
 
 /// Whether two entries write one binding - a buffer both stages declare -
@@ -760,6 +765,8 @@ impl Encoder {
                 &[],
             )
         };
+        #[cfg(test)]
+        TEST_RECORDED_BARRIERS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Bind the pipeline variant and the resources one draw needs.

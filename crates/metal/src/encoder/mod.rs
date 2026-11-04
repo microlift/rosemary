@@ -45,6 +45,10 @@ use crate::pipeline::{
 use crate::resource::{Buffer, DepthStencilState, SamplerState, Texture};
 use crate::stats::{self, Counter};
 
+#[cfg(test)]
+pub(crate) static TEST_RECORDED_BARRIERS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
 /// Metal's per-stage binding tables. Index by `Stage::ordinal`.
 const STAGES: usize = 3;
 const SLOTS: usize = 32;
@@ -189,6 +193,8 @@ pub(crate) struct Encoder {
     /// `MTLDispatchTypeConcurrent`: dispatches may overlap, and the guest
     /// orders them with memory barriers. Every other compute encoder is serial.
     concurrent: bool,
+    /// Whether a full memory barrier followed the most recent compute dispatch.
+    compute_barrier_recorded: bool,
     compute_pipeline: Id,
     render_pipeline: Id,
     depth_state: Id,

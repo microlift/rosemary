@@ -2504,6 +2504,83 @@ fn serial_dispatches_and_concurrent_barriers_order_writes() {
     }
 }
 
+/// Serial dispatch barriers and concurrent closing barriers must order
+/// subsequent encoders, even when only one dispatch precedes the boundary.
+#[test]
+fn compute_encoders_order_subsequent_dispatches() {
+    isolate_metal_fixture!();
+    let Some(device) = gpu_device() else {
+        return;
+    };
+    const DISPATCH_SERIAL: u64 = 0;
+    const DISPATCH_CONCURRENT: u64 = 1;
+    const SCOPE_BUFFERS: u64 = 1;
+    let library = source_library(
+        device,
+        "kernel void step(device uint* value [[buffer(0)]]) { value[0] += 1; }",
+    );
+    // SAFETY: live Metal objects and registered selectors with their ABI.
+    unsafe {
+        let function = new_function_with_name(
+            library,
+            std::ptr::null(),
+            foundation::string::from_str("step"),
+        );
+        let mut error = std::ptr::null_mut();
+        let pipeline = new_compute_pipeline(device, std::ptr::null(), function, &mut error);
+        assert!(!pipeline.is_null());
+        let queue = new_command_queue(device, std::ptr::null());
+        for (kind, dispatches_per_encoder, encoders, manual_after_last) in [
+            (DISPATCH_SERIAL, 0, 16, false),
+            (DISPATCH_CONCURRENT, 0, 16, false),
+            (DISPATCH_SERIAL, 1, 64, false),
+            (DISPATCH_SERIAL, 3, 32, false),
+            (DISPATCH_CONCURRENT, 1, 64, false),
+            (DISPATCH_CONCURRENT, 2, 32, false),
+            (DISPATCH_CONCURRENT, 2, 32, true),
+        ] {
+            let buffer = new_buffer(device, std::ptr::null(), 16, 0);
+            let command = send(queue, "commandBuffer");
+            let (make, sel) = method::<unsafe extern "C" fn(Id, Sel, u64) -> Id>(
+                command,
+                "computeCommandEncoderWithDispatchType:",
+            );
+            for _ in 0..encoders {
+                let encoder = make(command, sel, kind);
+                send_with_object(encoder, "setComputePipelineState:", pipeline);
+                set_buffer_at(encoder, buffer, 0, 0);
+                let before =
+                    encoder::TEST_RECORDED_BARRIERS.load(std::sync::atomic::Ordering::Relaxed);
+                for index in 0..dispatches_per_encoder {
+                    dispatch(encoder, 1);
+                    if kind == DISPATCH_CONCURRENT
+                        && (index + 1 < dispatches_per_encoder || manual_after_last)
+                    {
+                        send_number(encoder, "memoryBarrierWithScope:", SCOPE_BUFFERS);
+                    }
+                }
+                send_void(encoder, "endEncoding");
+                let recorded = encoder::TEST_RECORDED_BARRIERS
+                    .load(std::sync::atomic::Ordering::Relaxed)
+                    - before;
+                let expected = u64::from(dispatches_per_encoder.max(1));
+                assert_eq!(
+                    recorded, expected,
+                    "type {kind}: unexpected terminal barrier"
+                );
+            }
+            send_void(command, "commit");
+            send_void(command, "waitUntilCompleted");
+            let contents = object::body::<resource::Buffer>(buffer).inner.contents;
+            assert_eq!(
+                std::ptr::read(contents.cast::<u32>()),
+                encoders * dispatches_per_encoder,
+                "type {kind}"
+            );
+        }
+    }
+}
+
 /// Run `name` from `source` once per element of a one-dimensional grid of
 /// `threads`, with `buffers` bound from index 0.
 fn run_source_kernel(device: Id, source: &str, name: &str, buffers: &[Id], threads: u64) {
