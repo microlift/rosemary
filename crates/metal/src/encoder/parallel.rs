@@ -62,6 +62,7 @@ pub(super) unsafe extern "C" fn new_sub_encoder(receiver: Id, _sel: Sel) -> Id {
             return std::ptr::null_mut();
         }
     };
+    let command_buffer = context.command_buffer;
     let inheritance = vk::CommandBufferInheritanceInfo::default()
         .render_pass(pass)
         .subpass(0)
@@ -83,7 +84,6 @@ pub(super) unsafe extern "C" fn new_sub_encoder(receiver: Id, _sel: Sel) -> Id {
         gpu.release_secondary(context);
         return std::ptr::null_mut();
     }
-    record_pass_defaults(&gpu.device, context.command_buffer, area);
     let child = object::make(
         c"RosemaryMTLCommandBuffer",
         CommandBuffer {
@@ -129,6 +129,7 @@ pub(super) unsafe extern "C" fn new_sub_encoder(receiver: Id, _sel: Sel) -> Id {
     sub.resolve_mask = inner.resolve_mask;
     sub.depth_resolve = inner.depth_resolve;
     sub.visibility = inner.visibility;
+    record_pass_defaults(&gpu.device, command_buffer, area, &mut sub.depth_bias);
     parallel.children.push(child);
     encoder
 }

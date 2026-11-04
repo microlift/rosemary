@@ -2,6 +2,7 @@ mod bind;
 mod blit;
 mod command_buffer;
 mod compute;
+mod depth_bias;
 mod parallel;
 mod pass;
 mod queue;
@@ -14,6 +15,7 @@ use bind::*;
 use blit::*;
 use command_buffer::*;
 use compute::*;
+use depth_bias::*;
 use parallel::*;
 use pass::*;
 use queue::*;
@@ -45,6 +47,10 @@ use crate::pipeline::{
 };
 use crate::resource::{Buffer, DepthStencilState, SamplerState, Texture};
 use crate::stats::{self, Counter};
+
+#[cfg(test)]
+pub(crate) static TEST_RECORDED_BARRIERS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
 
 /// Metal's per-stage binding tables. Index by `Stage::ordinal`.
 const STAGES: usize = 3;
@@ -286,6 +292,8 @@ pub(crate) struct Encoder {
     /// `MTLDispatchTypeConcurrent`: dispatches may overlap, and the guest
     /// orders them with memory barriers. Every other compute encoder is serial.
     concurrent: bool,
+    /// Whether a full memory barrier follows everything this encoder recorded.
+    barrier_is_last: std::cell::Cell<bool>,
     compute_pipeline: Id,
     render_pipeline: Id,
     depth_state: Id,
@@ -297,6 +305,7 @@ pub(crate) struct Encoder {
     winding: u64,
     fill_mode: u64,
     depth_clip: u64,
+    depth_bias: RecordedDepthBias,
     in_render_pass: bool,
     /// Whether this is a parallel render sub-encoder, which records into a
     /// secondary command buffer inside a pass its parallel encoder began.

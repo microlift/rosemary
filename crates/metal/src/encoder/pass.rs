@@ -629,7 +629,9 @@ pub(super) fn record_pass_defaults(
     device: &ash::Device,
     command_buffer: vk::CommandBuffer,
     area: vk::Rect2D,
+    depth_bias: &mut RecordedDepthBias,
 ) {
+    depth_bias.record(device, command_buffer, DepthBias::NONE);
     let (width, height) = (area.extent.width, area.extent.height);
     // SAFETY: recording into a command buffer inside the pass.
     unsafe {
@@ -648,7 +650,6 @@ pub(super) fn record_pass_defaults(
             }],
         );
         device.cmd_set_scissor(command_buffer, 0, &[area]);
-        device.cmd_set_depth_bias(command_buffer, 0.0, 0.0, 0.0);
         device.cmd_set_blend_constants(command_buffer, &[0.0; 4]);
         device.cmd_set_stencil_reference(command_buffer, vk::StencilFaceFlags::FRONT_AND_BACK, 0);
     }
@@ -746,7 +747,12 @@ pub(crate) fn begin_render_pass(
     if secondary {
         encoder.inheritance = Some((pass, framebuffer, area));
     } else {
-        record_pass_defaults(&gpu.device, command.command_buffer, area);
+        record_pass_defaults(
+            &gpu.device,
+            command.command_buffer,
+            area,
+            &mut encoder.depth_bias,
+        );
     }
     gpu::milestone("render pass");
     encoder.in_render_pass = true;

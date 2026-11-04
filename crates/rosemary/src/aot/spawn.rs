@@ -44,6 +44,14 @@ pub fn if_missing<M: Regions>(program: &Program<M>, executable: &str) {
         .filter(|report| report.segments.iter().any(|segment| segment.executable))
         .filter_map(|report| super::profile::image_id(&report.path))
         .any(|id| !layout.image(&id).exists());
+    // Only the image each record names: what it brings in is known after linking.
+    let missing = missing
+        || super::profile::image_id(executable)
+            .and_then(|id| super::profile::read_dlopens(&layout.dlopens(&id)).ok())
+            .unwrap_or_default()
+            .iter()
+            .filter_map(|path| super::profile::image_id(path))
+            .any(|id| !layout.image(&id).exists());
     if !missing {
         return;
     }

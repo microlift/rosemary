@@ -11,6 +11,7 @@ pub(crate) fn new_encoder(command_buffer: Id, kind: Kind) -> Id {
             command_buffer: objc::arc::retain(command_buffer),
             kind,
             concurrent: false,
+            barrier_is_last: std::cell::Cell::new(false),
             compute_pipeline: std::ptr::null_mut(),
             render_pipeline: std::ptr::null_mut(),
             depth_state: std::ptr::null_mut(),
@@ -22,6 +23,7 @@ pub(crate) fn new_encoder(command_buffer: Id, kind: Kind) -> Id {
             winding: 0,
             fill_mode: 0,
             depth_clip: 0,
+            depth_bias: RecordedDepthBias::default(),
             in_render_pass: false,
             sub_encoder: false,
             inheritance: None,
@@ -190,6 +192,7 @@ impl Encoder {
 
     /// Record one draw or dispatch, timed under `ROSEMARY_METAL_PROFILE`.
     pub(super) fn record(&self, body: impl FnOnce()) {
+        self.barrier_is_last.set(false);
         let command = self.command();
         let Some(profile) = &command.profile else {
             return body();
@@ -212,6 +215,7 @@ impl Encoder {
 
     /// Record work timed under a fixed name rather than the bound pipeline's.
     pub(super) fn record_named(&self, name: &'static str, body: impl FnOnce()) {
+        self.barrier_is_last.set(false);
         let command = self.command();
         match &command.profile {
             Some(profile) => profile.span(
@@ -226,6 +230,7 @@ impl Encoder {
 
     /// Record work timed under an explicit label, or untimed without one.
     pub(super) fn record_as(&self, label: Option<std::sync::Arc<str>>, body: impl FnOnce()) {
+        self.barrier_is_last.set(false);
         let command = self.command();
         match (&command.profile, label) {
             (Some(profile), Some(label)) => {
@@ -758,7 +763,15 @@ impl Encoder {
     ///
     /// It is not what makes a frame slow: removing it entirely takes an app's
     /// home page from 6.65 ms of device time a frame to 6.45 ms.
+    ///
+    /// An encoder's barriers are all of one kind - a render encoder's single
+    /// closing one, or a compute or blit encoder's full ones - so a second
+    /// with no work recorded since the first orders nothing more and is
+    /// skipped.
     pub(super) fn barrier(&self) {
+        if self.barrier_is_last.replace(true) {
+            return;
+        }
         if self.kind == Kind::Render && !self.writes_elsewhere && !self.attachments.is_empty() {
             return self.attachment_barrier();
         }
@@ -778,6 +791,8 @@ impl Encoder {
                 &[],
             )
         };
+        #[cfg(test)]
+        TEST_RECORDED_BARRIERS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// The barrier after a render encoder whose only writes were to its
@@ -824,6 +839,8 @@ impl Encoder {
                 &barriers,
             )
         };
+        #[cfg(test)]
+        TEST_RECORDED_BARRIERS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Bind the pipeline variant and the resources one draw needs.
