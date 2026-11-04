@@ -35,6 +35,7 @@ pub mod interpose;
 pub mod jit;
 pub mod jmpbuf;
 pub mod lldb;
+pub mod prelift;
 pub mod program;
 pub mod region;
 pub mod retstub;
@@ -89,7 +90,6 @@ pub mod compat;
 #[cfg(target_os = "macos")]
 pub mod gui;
 #[cfg(target_os = "macos")]
-pub mod prelift;
 pub mod profile;
 
 pub use abi::{AbiError, Classification, call_import};

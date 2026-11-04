@@ -132,7 +132,10 @@ mod tests {
         let ImportKind::Fast(b) = &config.imports[&0x20] else {
             unreachable!()
         };
-        assert_eq!(resolver.resolve(&b.host_symbol()), Some(from_b as usize));
+        assert_eq!(
+            resolver.resolve(&b.host_symbol()),
+            Some(from_b as *const () as usize)
+        );
         let mut elsewhere = b.host_symbol();
         elsewhere.provider = "libC.dylib".into();
         assert_eq!(resolver.resolve(&elsewhere), None);
