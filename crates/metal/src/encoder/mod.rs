@@ -2,6 +2,7 @@ mod bind;
 mod blit;
 mod command_buffer;
 mod compute;
+mod depth_bias;
 mod parallel;
 mod pass;
 mod queue;
@@ -14,6 +15,7 @@ use bind::*;
 use blit::*;
 use command_buffer::*;
 use compute::*;
+use depth_bias::*;
 use parallel::*;
 use pass::*;
 use queue::*;
@@ -200,6 +202,7 @@ pub(crate) struct Encoder {
     winding: u64,
     fill_mode: u64,
     depth_clip: u64,
+    depth_bias: RecordedDepthBias,
     in_render_pass: bool,
     /// Whether this is a parallel render sub-encoder, which records into a
     /// secondary command buffer inside a pass its parallel encoder began.

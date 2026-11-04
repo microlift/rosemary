@@ -1759,6 +1759,12 @@ fn recording_cost() {
     );
 }
 
+const MTL_PIXEL_FORMAT_DEPTH32_FLOAT: u64 = 252;
+const MTL_STORAGE_MODE_PRIVATE: u64 = 2;
+const MTL_COMPARE_FUNCTION_LESS_EQUAL: u64 = 3;
+const MTL_LOAD_ACTION_CLEAR: u64 = 2;
+const MTL_STORE_ACTION_STORE: u64 = 1;
+
 /// `MTLVisibilityResultMode`.
 const VISIBILITY_DISABLED: u64 = 0;
 const VISIBILITY_BOOLEAN: u64 = 1;
@@ -1779,6 +1785,12 @@ struct CoveringDraw {
 /// The triangle program and target of `a_translated_triangle_draws_on_the_gpu`,
 /// or `None` where the device cannot count samples exactly.
 fn covering_draw(device: Id) -> Option<CoveringDraw> {
+    covering_draw_with_depth(device, MTL_PIXEL_FORMAT_INVALID, 0.0)
+}
+
+/// A covering draw whose pipeline has `depth_format`, with its triangle at
+/// depth `z`.
+fn covering_draw_with_depth(device: Id, depth_format: u64, z: f32) -> Option<CoveringDraw> {
     let gpu = gpu_of(device).expect("a Vulkan device");
     if !gpu.occlusion_precise {
         return None;
@@ -1815,7 +1827,7 @@ fn covering_draw(device: Id) -> Option<CoveringDraw> {
             fragment_function: fragment,
             vertex_descriptor,
             colors: [pipeline::ColorAttachment::fresh(); pipeline::COLOR_ATTACHMENTS],
-            depth_format: 0,
+            depth_format,
             stencil_format: 0,
             sample_count: 1,
             alpha_to_coverage: false,
@@ -1864,9 +1876,9 @@ fn covering_draw(device: Id) -> Option<CoveringDraw> {
     unsafe {
         let contents = object::body::<resource::Buffer>(vertices).inner.contents as *mut f32;
         for (index, value) in [
-            -1.0f32, -1.0, 0.0, 1.0, //
-            3.0, -1.0, 0.0, 1.0, //
-            -1.0, 3.0, 0.0, 1.0,
+            -1.0f32, -1.0, z, 1.0, //
+            3.0, -1.0, z, 1.0, //
+            -1.0, 3.0, z, 1.0,
         ]
         .iter()
         .enumerate()
@@ -1954,6 +1966,81 @@ unsafe fn set_visibility_mode(encoder: Id, mode: u64, offset: u64) {
     let call: unsafe extern "C" fn(Id, Sel, u64, u64) =
         unsafe { std::mem::transmute(method.implementation()) };
     unsafe { call(encoder, sel, mode, offset) };
+}
+
+/// An unchanged depth bias is reusable, but a later nonzero bias must still
+/// change rasterized depth across draws in the same encoder.
+#[test]
+fn repeated_depth_bias_preserves_changed_depth_tests() {
+    isolate_metal_fixture!();
+    let Some(device) = gpu_device() else {
+        return;
+    };
+    // On a float format the constant bias is in units of the primitive's
+    // depth exponent, which a depth of zero leaves to the implementation.
+    const DEPTH: f32 = 0.5;
+    const NONZERO_BIAS: f32 = 1024.0;
+    let Some(fixture) = covering_draw_with_depth(device, MTL_PIXEL_FORMAT_DEPTH32_FLOAT, DEPTH)
+    else {
+        return;
+    };
+    let gpu = gpu_of(device).expect("a Vulkan device");
+    let depth = resource::new_texture(
+        gpu,
+        resource::TextureDescriptor {
+            texture_type: MTL_TEXTURE_TYPE_2D,
+            pixel_format: MTL_PIXEL_FORMAT_DEPTH32_FLOAT,
+            width: COVERING_SIZE,
+            height: COVERING_SIZE,
+            depth: 1,
+            mipmap_level_count: 1,
+            sample_count: 1,
+            array_length: 1,
+            storage_mode: MTL_STORAGE_MODE_PRIVATE,
+            usage: gpu::USAGE_RENDER_TARGET,
+        },
+    );
+    assert!(!depth.is_null());
+    let depth_state = resource::new_depth_stencil_state(resource::DepthStencilState {
+        depth_compare: MTL_COMPARE_FUNCTION_LESS_EQUAL,
+        depth_write: true,
+        ..resource::DepthStencilState::default()
+    });
+    let results = results_buffer(device, 6, 0);
+    let pass = fixture.pass(results);
+    // SAFETY: the same selectors and resources an MTLRenderCommandEncoder uses.
+    unsafe {
+        let attachment = send(pass, "depthAttachment");
+        send_with_object(attachment, "setTexture:", depth);
+        send_number(attachment, "setLoadAction:", MTL_LOAD_ACTION_CLEAR);
+        send_number(attachment, "setStoreAction:", MTL_STORE_ACTION_STORE);
+        let command = send(fixture.queue, "commandBuffer");
+        let render = render_encoder(command, pass);
+        fixture.bind(render);
+        send_with_object(render, "setDepthStencilState:", depth_state);
+        let (set_bias, selector) = method::<unsafe extern "C" fn(Id, Sel, f32, f32, f32)>(
+            render,
+            "setDepthBias:slopeScale:clamp:",
+        );
+        for (index, bias) in [0.0f32, 0.0, NONZERO_BIAS, NONZERO_BIAS, 0.0, 0.0]
+            .into_iter()
+            .enumerate()
+        {
+            set_bias(render, selector, bias, 0.0, 0.0);
+            set_visibility_mode(render, VISIBILITY_COUNTING, (index * 8) as u64);
+            draw(render, 3);
+        }
+        send_void(render, "endEncoding");
+        send_void(command, "commit");
+        send_void(command, "waitUntilCompleted");
+    }
+    let filled = COVERING_SIZE * COVERING_SIZE;
+    assert_eq!(
+        (0..6)
+            .map(|index| result_at(results, index))
+            .collect::<Vec<_>>(),
+        [filled, filled, 0, 0, filled, filled],
+    );
 }
 
 /// Runs at one offset in one pass add up, a disabled run is not counted, and
