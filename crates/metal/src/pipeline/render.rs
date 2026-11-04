@@ -86,6 +86,9 @@ pub(crate) struct RenderPipeline {
     pub fragment_name: std::ffi::CString,
     pub layouts: Layouts,
     pub resources: Vec<ResourceBinding>,
+    /// Whether a shader writes a buffer or texture it is bound, rather than
+    /// only the pass's attachments.
+    pub writes_resources: bool,
     /// Metal buffer indices which feed vertex attributes rather than a
     /// descriptor, taken from the pipeline's vertex descriptor.
     pub vertex_streams: Vec<u32>,
@@ -263,6 +266,12 @@ impl RenderPipeline {
             fragment_name: std::ffi::CString::new(fragment.name.as_str())
                 .map_err(|_| "entry point name contains a NUL".to_string())?,
             layouts,
+            writes_resources: resources.iter().any(|binding| {
+                matches!(
+                    binding.access,
+                    metal_translate::ir::Access::Write | metal_translate::ir::Access::ReadWrite
+                )
+            }),
             resources,
             vertex_streams,
             bindings,

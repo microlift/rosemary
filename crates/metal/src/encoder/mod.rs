@@ -323,6 +323,13 @@ pub(crate) struct Encoder {
     /// which chose it, so a run of draws with one state asks no cache.
     render_variant: Option<(Id, RenderVariantKey, vk::Pipeline)>,
     compute_variant: Option<(Id, [u32; 3], vk::Pipeline)>,
+    /// A render encoder's attachment images, which its closing barrier names
+    /// when they are all it wrote.
+    attachments: Vec<(vk::Image, vk::ImageAspectFlags)>,
+    /// Whether this encoder wrote anything but its attachments: a resource a
+    /// shader writes, a resolve copy, query results. Its closing barrier then
+    /// covers all memory.
+    writes_elsewhere: bool,
     /// Index by `bind_point_slot`.
     bound: [BindPoint; 2],
     set_cache: [SetCache; SETS],
