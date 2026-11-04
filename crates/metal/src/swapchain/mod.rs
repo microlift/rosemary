@@ -4561,6 +4561,18 @@ pub(crate) fn retire_copied() {
     retire_copied_in(&every_swapchain());
 }
 
+/// [`retire_copied`] for `gpu`'s windows only. The device's retire worker
+/// calls it as submissions complete: nothing else signals when a copy is
+/// done, and a drawable left for the next `-nextDrawable` to find runs its
+/// presented handlers two frames late.
+pub(crate) fn retire_copied_on(gpu: &Gpu) {
+    let mine: Vec<_> = every_swapchain()
+        .into_iter()
+        .filter(|swapchain| std::ptr::eq(swapchain.gpu, gpu))
+        .collect();
+    retire_copied_in(&mine);
+}
+
 fn every_swapchain() -> Vec<Arc<WindowSwapchain>> {
     SWAPCHAINS
         .lock()
