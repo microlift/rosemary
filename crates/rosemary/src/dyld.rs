@@ -1563,22 +1563,7 @@ fn lookup(handle: u64, name: &str) -> Option<u64> {
 fn lookup_from(handle: u64, name: &str, caller: Option<Scope>) -> Option<u64> {
     // A handle from the host's loader, which scopes the search itself.
     if let Some(path) = native_handle(handle) {
-        if crate::gl::owns(name) {
-            return crate::gl::symbol(name)
-                .map(|addr| remember_native_symbol(addr, name, Some(path)));
-        }
-        let c = CString::new(name).ok()?;
-        // SAFETY: a handle this module obtained from `dlopen` and never closed,
-        // and a null-terminated name.
-        let found = unsafe { libc::dlsym(handle as usize as *mut libc::c_void, c.as_ptr()) };
-        if found.is_null() {
-            return None;
-        }
-        return Some(remember_native_symbol(
-            selected_native_symbol(found as usize as u64, name),
-            name,
-            Some(path),
-        ));
+        return native_lookup(handle, name, path);
     }
 
     // `dlsym` takes the C identifier; a Mach-O export carries the underscore.
@@ -1603,6 +1588,24 @@ fn lookup_from(handle: u64, name: &str, caller: Option<Scope>) -> Option<u64> {
             }
         }
     }
+}
+
+/// `name` behind `handle`, a library the host's loader opened as `path`.
+fn native_lookup(handle: u64, name: &str, path: String) -> Option<u64> {
+    if crate::gl::owns(name) {
+        return crate::gl::symbol(name).map(|addr| remember_native_symbol(addr, name, Some(path)));
+    }
+    let c = CString::new(name).ok()?;
+    // SAFETY: a handle the host's loader holds open, and a null-terminated name.
+    let found = unsafe { libc::dlsym(handle as usize as *mut libc::c_void, c.as_ptr()) };
+    if found.is_null() {
+        return None;
+    }
+    Some(remember_native_symbol(
+        selected_native_symbol(found as usize as u64, name),
+        name,
+        Some(path),
+    ))
 }
 
 /// `dlsym(RTLD_DEFAULT, name)`.
@@ -1675,6 +1678,10 @@ enum Scope {
     /// A dylib mapped with the program or with a `dlopen`ed image, and the
     /// images it was linked with.
     Linked(&'static LinkedImage, &'static [LinkedImage]),
+    /// A library the host's loader bound the link to - the host's libobjc
+    /// under the `native` runtime - by its handle and the install name that
+    /// reached it.
+    Host(u64, &'static str),
 }
 
 impl Scope {
@@ -1739,7 +1746,7 @@ impl Scope {
 
     /// The mapped image a load command's install name names, if any. A library
     /// this runtime is comes first, as it does for [`open`].
-    fn named(install_name: &str) -> Option<Scope> {
+    fn named(install_name: &'static str) -> Option<Scope> {
         if let Some(library) = synthetic::find(install_name) {
             return Some(Scope::Synthetic(library));
         }
@@ -1752,8 +1759,10 @@ impl Scope {
             return Some(Scope::Linked(carried, &image.linked));
         }
         let program = PROGRAM_IMAGES.get()?;
-        let linked = program.iter().find(|l| l.answers_to(wanted))?;
-        Some(Scope::Linked(linked, program))
+        match program.iter().find(|l| l.answers_to(wanted)) {
+            Some(linked) => Some(Scope::Linked(linked, program)),
+            None => host_loaded(install_name).map(|handle| Scope::Host(handle, install_name)),
+        }
     }
 
     /// What tells two scopes apart, whichever install name reached them.
@@ -1763,6 +1772,7 @@ impl Scope {
             Scope::Loaded(image) => image as *const Image as usize,
             Scope::Main(main) => main as *const MainExports as usize,
             Scope::Linked(image, _) => image as *const LinkedImage as usize,
+            Scope::Host(handle, _) => handle as usize,
         }
     }
 
@@ -1792,6 +1802,9 @@ impl Scope {
                 ),
                 None => return Vec::new(),
             },
+            // FIXME (ACCURACY): the host's `dlsym` on the handle already went
+            // through the library's own dependencies, in the host's order.
+            Scope::Host(..) => return Vec::new(),
         };
         let rest: Vec<&'static str> = all.into_iter().filter(|d| !reexports.contains(d)).collect();
         reexports.into_iter().chain(rest).collect()
@@ -1834,6 +1847,10 @@ impl Scope {
             Scope::Linked(image, peers) => {
                 return image.resolve(peers, mangled, depth).map(|r| r.addr);
             }
+            Scope::Host(handle, path) => {
+                let name = mangled.strip_prefix('_')?;
+                return native_lookup(handle, name, path.to_string());
+            }
         };
         reexports
             .into_iter()
@@ -1847,7 +1864,7 @@ impl Scope {
 fn own_export(
     export: &machish::exports::Export,
     slide: u64,
-    dylibs: &[String],
+    dylibs: &'static [String],
     mangled: &str,
     depth: usize,
 ) -> Option<u64> {
@@ -1937,13 +1954,7 @@ static NATIVE_SYMBOL_COUNT: AtomicUsize = AtomicUsize::new(0);
 /// `RTLD_GLOBAL` and never closed, for the reason the native provider's own fallback
 /// is: closing it would dangle every pointer already written into a guest slot.
 fn open_native(path: &str) -> Option<u64> {
-    // Every symbol behind such a handle is the host's own, which is exactly what
-    // `darwin::strict` withdraws; a guest `dlopen("libstdc++.so.6")` must not
-    // undo it at run time.
-    if darwin::strict::enabled() {
-        return None;
-    }
-    if crate::frameworks::no_host_frameworks() && crate::frameworks::is_host_framework_path(path) {
+    if !host_may_serve(path) {
         return None;
     }
     let c = CString::new(path).ok()?;
@@ -1959,6 +1970,34 @@ fn open_native(path: &str) -> Option<u64> {
         native.push((handle, path.to_string()));
     }
     Some(handle)
+}
+
+/// Whether the guest may reach the host's own library at `path`. Every symbol
+/// behind a host handle is the host's, which is exactly what `darwin::strict`
+/// withdraws; a guest `dlopen("libstdc++.so.6")` must not undo it at run time.
+fn host_may_serve(path: &str) -> bool {
+    !darwin::strict::enabled()
+        && !(crate::frameworks::no_host_frameworks()
+            && crate::frameworks::is_host_framework_path(path))
+}
+
+/// The host loader's handle for `install_name` if it already loaded it, which
+/// it has for every library it bound the program's link to.
+fn host_loaded(install_name: &str) -> Option<u64> {
+    if !host_may_serve(install_name) {
+        return None;
+    }
+    let c = CString::new(install_name).ok()?;
+    // SAFETY: a null-terminated path. `RTLD_NOLOAD` only looks a library up:
+    // a search visits what the link loaded and never loads more.
+    let handle = unsafe { libc::dlopen(c.as_ptr(), libc::RTLD_LAZY | libc::RTLD_NOLOAD) };
+    if handle.is_null() {
+        return None;
+    }
+    // SAFETY: drops the reference the lookup took; the link's own keeps the
+    // library, and so the handle, valid for the process.
+    unsafe { libc::dlclose(handle) };
+    Some(handle as usize as u64)
 }
 
 /// Whether `handle` came from [`open_native`], and the path it was opened as.
