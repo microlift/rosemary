@@ -3,28 +3,43 @@
 //!
 //! Regions are chosen by the same [`crate::region::region_for`] the JIT uses, so a
 //! cached region is one the JIT would have made, and lifted under the program's own
-//! lifter config. Chunks of them compile on separate threads into separate
-//! Microlift images; the file lists the chunks in priority order, and a build
-//! stopped by its deadline writes every chunk that finished.
+//! lifter config. Every image is planned first; then threads take regions one at a
+//! time from all of them, in priority order, so a region that is slow to compile
+//! holds up only the thread compiling it. Each thread gathers what it takes into a
+//! chunk, a Microlift image, which it writes to the image's file once full; a build
+//! stopped by its deadline keeps every chunk written.
 
-use std::collections::HashSet;
-use std::sync::Mutex;
+use std::collections::{HashSet, VecDeque};
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Condvar, Mutex};
 use std::time::Instant;
 
 use machish::memory::MmapSpace;
 use machish::report::ImageReport;
 use microlift::arch::x86_64::X86_64;
-use microlift::core::{LifterConfig, lift_to_code};
+use microlift::backend::ImageBuilder;
+use microlift::core::{LiftedCode, LifterConfig, lift_to_code};
 
 use super::entries::{self, Entries};
-use super::file::CacheFile;
+use super::file;
+use super::store::{AtomicFile, BuildLock};
 use super::{ImageId, Layout};
 use crate::vm::Vm;
 
 /// Regions per chunk: enough that each image's helpers are shared by many, few
-/// enough that the first chunks are written early in a time-boxed build.
+/// enough that a chunk is written, and its memory freed, soon after it starts.
 const CHUNK_REGIONS: usize = 64;
+
+/// Regions of at least this many CLIF instructions are large: they compile only
+/// within [`LARGE_BUDGET`].
+const LARGE_REGION: usize = 16 * 1024;
+
+/// CLIF instructions of large regions compiled at once. Cranelift's peak memory
+/// grows faster than a function's size: about 1 KiB per instruction is typical,
+/// but a few regions of unrolled crypto code lift to over 130,000 instructions
+/// and take 1 to 2 GiB each. This lets one of those compile beside smaller large
+/// regions, never beside another.
+const LARGE_BUDGET: usize = 256 * 1024;
 
 pub struct Options {
     /// When to stop starting work. `None` compiles everything.
@@ -53,33 +68,41 @@ pub enum Outcome {
 /// `vm` must be published (`thunk::publish`): linking a `dlopen`ed image asks it
 /// what is guest code, as a run does.
 pub fn build(vm: &Vm, layout: &Layout, options: &Options) -> Vec<(String, Outcome)> {
-    let mut built = HashSet::new();
-    let mut out = Vec::new();
+    let mut seen = HashSet::new();
+    let mut prepared = Vec::new();
     for report in &vm.program.report.images {
-        built.insert(report.path.clone());
-        let outcome = build_image(vm, layout, report, &vm.program.memory, options);
-        out.push((report.path.clone(), outcome));
+        seen.insert(report.path.clone());
+        let job = prepare(vm, layout, report, &vm.program.memory, options);
+        prepared.push((report.path.clone(), job));
     }
     for path in dlopened(layout) {
         // In the order runs opened them, so each binds as it did there.
         let image = match crate::dyld::link_without_running(&path) {
             Ok(image) => image,
             Err(e) => {
-                out.push((path, Outcome::Failed(format!("dlopen: {e}"))));
+                prepared.push((path, Err(Outcome::Failed(format!("dlopen: {e}")))));
                 continue;
             }
         };
         for report in &image.report.images {
-            if !built.insert(report.path.clone()) {
+            if !seen.insert(report.path.clone()) {
                 continue;
             }
-            let outcome = image
-                .with_memory(|memory| build_image(vm, layout, report, memory, options))
-                .unwrap_or(Outcome::Skipped("unloaded"));
-            out.push((report.path.clone(), outcome));
+            let job = image
+                .with_memory(|memory| prepare(vm, layout, report, memory, options))
+                .unwrap_or(Err(Outcome::Skipped("unloaded")));
+            prepared.push((report.path.clone(), job));
         }
     }
-    out
+    let jobs: Vec<&Job> = prepared
+        .iter()
+        .filter_map(|(_, job)| job.as_ref().ok())
+        .collect();
+    compile(vm, &jobs, options);
+    prepared
+        .into_iter()
+        .map(|(path, job)| (path, job.map_or_else(|skipped| skipped, Job::finish)))
+        .collect()
 }
 
 /// The images runs of this executable `dlopen`ed, in first-opened order.
@@ -90,54 +113,96 @@ fn dlopened(layout: &Layout) -> Vec<String> {
         .unwrap_or_default()
 }
 
-fn build_image(
+/// One image being compiled: its plan, and its file as far as it is written.
+struct Job<'a> {
+    report: &'a ImageReport,
+    plan: Vec<Planned>,
+    out: Mutex<std::io::Result<file::Writer<AtomicFile>>>,
+    regions: AtomicUsize,
+    /// Regions that would not lift or compile, or that consulted an import only
+    /// this run's registry answered.
+    refused: AtomicUsize,
+    _lock: BuildLock,
+}
+
+impl Job<'_> {
+    fn write(&self, chunk: ImageBuilder) {
+        let chunk = chunk.finish();
+        if chunk.regions.is_empty() {
+            return;
+        }
+        let mut out = self.out.lock().unwrap_or_else(|e| e.into_inner());
+        if let Ok(writer) = &mut *out
+            && let Err(e) = writer.push(&chunk)
+        {
+            *out = Err(e);
+        }
+    }
+
+    fn finish(self) -> Outcome {
+        let regions = self.regions.into_inner();
+        let refused = self.refused.into_inner();
+        let written = self
+            .out
+            .into_inner()
+            .unwrap_or_else(|e| e.into_inner())
+            .and_then(file::Writer::finish)
+            .and_then(AtomicFile::commit);
+        match written {
+            Ok(()) => Outcome::Written {
+                regions,
+                refused,
+                complete: regions + refused == self.plan.len(),
+            },
+            Err(e) => Outcome::Failed(e.to_string()),
+        }
+    }
+}
+
+/// Plans `report`'s regions and opens its cache file, or says why it will not be built.
+fn prepare<'a>(
     vm: &Vm,
     layout: &Layout,
-    report: &ImageReport,
+    report: &'a ImageReport,
     memory: &MmapSpace,
     options: &Options,
-) -> Outcome {
+) -> Result<Job<'a>, Outcome> {
     if !report.segments.iter().any(|segment| segment.executable) {
-        return Outcome::Skipped("no code");
+        return Err(Outcome::Skipped("no code"));
     }
     let Ok(bytes) = std::fs::read(&report.path) else {
-        return Outcome::Skipped("its file cannot be read");
+        return Err(Outcome::Skipped("its file cannot be read"));
     };
     let id = ImageId::of(&bytes);
     let path = layout.image(&id);
     if options.only_missing && path.exists() {
-        return Outcome::Skipped("already cached");
+        return Err(Outcome::Skipped("already cached"));
     }
     if !super::matches_file(memory, report, &bytes) {
-        return Outcome::Skipped("the code loaded is not the code in its file");
+        return Err(Outcome::Skipped(
+            "the code loaded is not the code in its file",
+        ));
     }
-    let _lock = match super::store::try_lock(&path) {
+    let lock = match super::store::try_lock(&path) {
         Ok(Some(lock)) => lock,
-        Ok(None) => return Outcome::Skipped("another process is building it"),
-        Err(e) => return Outcome::Failed(e.to_string()),
+        Ok(None) => return Err(Outcome::Skipped("another process is building it")),
+        Err(e) => return Err(Outcome::Failed(e.to_string())),
     };
-    let image_layout = match entries::Layout::parse(&bytes, report.slide) {
-        Ok(layout) => layout,
-        Err(e) => return Outcome::Failed(e.to_string()),
-    };
+    let image_layout =
+        entries::Layout::parse(&bytes, report.slide).map_err(|e| Outcome::Failed(e.to_string()))?;
     let profiled = super::profile::read(&layout.profile(&id)).unwrap_or_default();
     let entries = entries::of(report, memory, &image_layout, &profiled);
     let plan = plan(vm, &entries);
-
-    let compiled = compile(vm, report, &plan, options);
-    let complete = compiled.finished == plan.len();
-    let file = CacheFile {
-        lift_slide: report.slide,
-        chunks: compiled.chunks,
-    };
-    match super::store(layout, &id, &file) {
-        Ok(()) => Outcome::Written {
-            regions: compiled.regions,
-            refused: compiled.refused,
-            complete,
-        },
-        Err(e) => Outcome::Failed(e.to_string()),
-    }
+    layout.prune();
+    let out = AtomicFile::create(&path).and_then(|file| file::Writer::new(file, report.slide));
+    Ok(Job {
+        report,
+        plan,
+        out: Mutex::new(out),
+        regions: AtomicUsize::new(0),
+        refused: AtomicUsize::new(0),
+        _lock: lock,
+    })
 }
 
 /// One region to compile, as the JIT would select it.
@@ -181,132 +246,230 @@ fn plan(vm: &Vm, entries: &Entries) -> Vec<Planned> {
     out
 }
 
-struct Compiled {
-    chunks: Vec<microlift::image::Image>,
-    regions: usize,
-    /// Regions that would not lift or compile, or that consulted an import only
-    /// this run's registry answered.
-    refused: usize,
-    /// Planned regions reached before the deadline, compiled or refused.
-    finished: usize,
-}
-
-fn compile(vm: &Vm, report: &ImageReport, plan: &[Planned], options: &Options) -> Compiled {
-    let chunks: Vec<&[Planned]> = plan.chunks(CHUNK_REGIONS).collect();
-    let next = AtomicUsize::new(0);
-    let done: Mutex<Vec<(usize, Chunk)>> = Mutex::new(Vec::new());
-    let fingerprint = vm.lifter_config().codegen_fingerprint();
+/// Compiles every planned region of `jobs` on `options.threads` threads, taking
+/// regions one at a time in the order planned.
+fn compile(vm: &Vm, jobs: &[&Job<'_>], options: &Options) {
     let Ok(resolved) = crate::jit::resolved_isa_settings() else {
-        return Compiled {
-            chunks: Vec::new(),
-            regions: 0,
-            refused: plan.len(),
-            finished: plan.len(),
-        };
+        for job in jobs {
+            job.refused.store(job.plan.len(), Ordering::Relaxed);
+        }
+        return;
     };
     let isa_settings: Vec<(&str, &str)> = resolved
         .iter()
         .map(|(name, value)| (*name, value.as_str()))
         .collect();
-    let threads = options.threads.clamp(1, chunks.len().max(1));
+    let queue = Queue {
+        work: jobs
+            .iter()
+            .enumerate()
+            .flat_map(|(job, planned)| (0..planned.plan.len()).map(move |region| (job, region)))
+            .collect(),
+        next: AtomicUsize::new(0),
+        deferred: Mutex::new(VecDeque::new()),
+        budget: Budget::default(),
+        deadline: options.deadline,
+    };
+    let fingerprint = vm.lifter_config().codegen_fingerprint();
+    let threads = options.threads.clamp(1, queue.work.len().max(1));
     std::thread::scope(|scope| {
         for _ in 0..threads {
             scope.spawn(|| {
-                // Each thread lifts under its own copy, which shares the program's
-                // segments and imports through `Arc`s.
-                let config = vm.lifter_config().clone();
-                loop {
-                    let index = next.fetch_add(1, Ordering::Relaxed);
-                    let Some(chunk) = chunks.get(index) else {
-                        break;
+                let mut worker = Worker {
+                    jobs,
+                    isa_settings: &isa_settings,
+                    fingerprint,
+                    // Each thread lifts under its own copy, which shares the
+                    // program's segments and imports through `Arc`s.
+                    config: vm.lifter_config().clone(),
+                    chunks: jobs.iter().map(|_| None).collect(),
+                };
+                while let Some(next) = queue.take(&worker) {
+                    let job = jobs[next.job];
+                    match next.code.and_then(|code| worker.add(next.job, code)) {
+                        Some(()) => job.regions.fetch_add(1, Ordering::Relaxed),
+                        None => job.refused.fetch_add(1, Ordering::Relaxed),
                     };
-                    if past(options.deadline) {
-                        break;
-                    }
-                    let built = compile_chunk(
-                        &config,
-                        report,
-                        fingerprint,
-                        &isa_settings,
-                        chunk,
-                        options.deadline,
-                    );
-                    done.lock()
-                        .unwrap_or_else(|e| e.into_inner())
-                        .push((index, built));
+                    queue.budget.give(next.cost);
                 }
+                worker.flush_all();
             });
         }
     });
-    let mut done = done.into_inner().unwrap_or_else(|e| e.into_inner());
-    done.sort_by_key(|(index, _)| *index);
-    let mut out = Compiled {
-        chunks: Vec::new(),
-        regions: 0,
-        refused: 0,
-        finished: 0,
-    };
-    for (_, chunk) in done {
-        out.regions += chunk.regions;
-        out.refused += chunk.refused;
-        out.finished += chunk.regions + chunk.refused;
-        if let Some(image) = chunk.image.filter(|image| !image.regions.is_empty()) {
-            out.chunks.push(image);
-        }
-    }
-    out
 }
 
-struct Chunk {
-    image: Option<microlift::image::Image>,
-    regions: usize,
-    refused: usize,
-}
-
-fn compile_chunk(
-    config: &LifterConfig,
-    report: &ImageReport,
-    fingerprint: u64,
-    isa_settings: &[(&str, &str)],
-    plan: &[Planned],
+/// The regions left to compile.
+struct Queue {
+    /// Every planned region, as `(job, region)`, in the order planned.
+    work: Vec<(usize, usize)>,
+    next: AtomicUsize,
+    /// Large regions the budget had no room for when they were lifted, with their
+    /// cost. Their code is dropped and lifted again when there is room, so a
+    /// waiting region holds no memory.
+    deferred: Mutex<VecDeque<((usize, usize), usize)>>,
+    budget: Budget,
     deadline: Option<Instant>,
-) -> Chunk {
-    let mut chunk = Chunk {
-        image: None,
-        regions: 0,
-        refused: 0,
-    };
-    let Ok(mut builder) = microlift::backend::ArtifactBackend::image(
-        None,
-        Some(crate::jit::flags()),
-        isa_settings,
-        fingerprint,
-    ) else {
-        chunk.refused = plan.len();
-        return chunk;
-    };
-    for planned in plan {
-        if past(deadline) {
-            break;
-        }
-        let added =
-            lift(config, report, planned).is_some_and(|lifted| builder.add_region(lifted).is_ok());
-        match added {
-            true => chunk.regions += 1,
-            false => chunk.refused += 1,
+}
+
+/// A region to compile, holding `cost` of the budget.
+struct Lifted {
+    job: usize,
+    /// `None` when it would not lift or may not be cached.
+    code: Option<LiftedCode>,
+    cost: usize,
+}
+
+impl Queue {
+    /// The next region to compile, its share of the budget taken.
+    ///
+    /// A large region the budget has no room for is deferred while this thread
+    /// goes on to the next region; deferred regions go first once they fit, and
+    /// once nothing else is left this thread waits for room.
+    fn take(&self, worker: &Worker<'_, '_>) -> Option<Lifted> {
+        loop {
+            if past(self.deadline) {
+                return None;
+            }
+            if let Some(((job, region), cost)) = self.deferred_that_fits() {
+                let code = worker.lift(job, region);
+                return Some(Lifted { job, code, cost });
+            }
+            let Some(&(job, region)) = self.work.get(self.next.fetch_add(1, Ordering::Relaxed))
+            else {
+                let ((job, region), cost) = self.wait_for_deferred()?;
+                let code = worker.lift(job, region);
+                return Some(Lifted { job, code, cost });
+            };
+            let code = worker.lift(job, region);
+            let cost = code.as_ref().map_or(0, cost);
+            if self.budget.try_take(cost) {
+                return Some(Lifted { job, code, cost });
+            }
+            self.deferred
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push_back(((job, region), cost));
         }
     }
-    chunk.image = Some(builder.finish());
-    chunk
+
+    /// The first deferred region that fits, its share of the budget taken.
+    fn deferred_that_fits(&self) -> Option<((usize, usize), usize)> {
+        let mut deferred = self.deferred.lock().unwrap_or_else(|e| e.into_inner());
+        let at = deferred
+            .iter()
+            .position(|&(_, cost)| self.budget.try_take(cost))?;
+        deferred.remove(at)
+    }
+
+    fn wait_for_deferred(&self) -> Option<((usize, usize), usize)> {
+        let waiting = self
+            .deferred
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .pop_front()?;
+        self.budget.take(waiting.1);
+        Some(waiting)
+    }
+}
+
+/// What a region costs against [`LARGE_BUDGET`].
+fn cost(code: &LiftedCode) -> usize {
+    let instructions = code.func.dfg.num_insts();
+    match instructions >= LARGE_REGION {
+        true => instructions,
+        false => 0,
+    }
+}
+
+/// The CLIF instructions of large regions being compiled. A region always fits
+/// when nothing else holds any, so one larger than the whole budget still runs.
+#[derive(Default)]
+struct Budget {
+    used: Mutex<usize>,
+    freed: Condvar,
+}
+
+impl Budget {
+    fn fits(used: usize, cost: usize) -> bool {
+        cost == 0 || used == 0 || used + cost <= LARGE_BUDGET
+    }
+
+    fn try_take(&self, cost: usize) -> bool {
+        let mut used = self.used.lock().unwrap_or_else(|e| e.into_inner());
+        let fits = Self::fits(*used, cost);
+        if fits {
+            *used += cost;
+        }
+        fits
+    }
+
+    fn take(&self, cost: usize) {
+        let mut used = self.used.lock().unwrap_or_else(|e| e.into_inner());
+        while !Self::fits(*used, cost) {
+            used = self.freed.wait(used).unwrap_or_else(|e| e.into_inner());
+        }
+        *used += cost;
+    }
+
+    fn give(&self, cost: usize) {
+        if cost == 0 {
+            return;
+        }
+        *self.used.lock().unwrap_or_else(|e| e.into_inner()) -= cost;
+        self.freed.notify_all();
+    }
+}
+
+/// One thread's compiler, and the chunk it is filling for each job.
+struct Worker<'j, 'a> {
+    jobs: &'j [&'j Job<'a>],
+    isa_settings: &'j [(&'j str, &'j str)],
+    fingerprint: u64,
+    config: LifterConfig,
+    chunks: Vec<Option<ImageBuilder>>,
+}
+
+impl Worker<'_, '_> {
+    fn lift(&self, job: usize, region: usize) -> Option<LiftedCode> {
+        let job = self.jobs[job];
+        lift(&self.config, job.report, &job.plan[region])
+    }
+
+    /// Compiles `code` into the chunk for `job`, which is written out once full.
+    fn add(&mut self, job: usize, code: LiftedCode) -> Option<()> {
+        let chunk = match &mut self.chunks[job] {
+            Some(chunk) => chunk,
+            empty => empty.insert(
+                microlift::backend::ArtifactBackend::image(
+                    None,
+                    Some(crate::jit::flags()),
+                    self.isa_settings,
+                    self.fingerprint,
+                )
+                .ok()?,
+            ),
+        };
+        let added = chunk.add_region(code).ok();
+        if chunk.region_count() >= CHUNK_REGIONS {
+            self.flush(job);
+        }
+        added
+    }
+
+    fn flush(&mut self, job: usize) {
+        if let Some(chunk) = self.chunks[job].take() {
+            self.jobs[job].write(chunk);
+        }
+    }
+
+    fn flush_all(&mut self) {
+        (0..self.chunks.len()).for_each(|job| self.flush(job));
+    }
 }
 
 /// `planned`, a region of `report`, lifted as [`crate::cache`] lifts it, or `None`
 /// if it may not be cached.
-fn lift(
-    config: &LifterConfig,
-    report: &ImageReport,
-    planned: &Planned,
-) -> Option<microlift::core::LiftedCode> {
+fn lift(config: &LifterConfig, report: &ImageReport, planned: &Planned) -> Option<LiftedCode> {
     let mut region_config = config.clone();
     region_config.resume_points = planned.resume_points.clone();
     region_config.block_ranges = planned.region.blocks.clone();
@@ -327,6 +490,35 @@ fn past(deadline: Option<Instant>) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
+    #[test]
+    fn small_regions_never_wait_for_the_budget() {
+        let budget = Budget::default();
+        assert!(budget.try_take(LARGE_BUDGET));
+        assert!(budget.try_take(0));
+    }
+
+    #[test]
+    fn large_regions_share_the_budget() {
+        let budget = Budget::default();
+        assert!(budget.try_take(LARGE_BUDGET / 2));
+        assert!(!budget.try_take(LARGE_BUDGET / 2 + 1));
+        assert!(budget.try_take(LARGE_BUDGET / 2));
+        budget.give(LARGE_BUDGET / 2);
+        budget.give(LARGE_BUDGET / 2);
+        assert_eq!(*budget.used.lock().unwrap(), 0);
+    }
+
+    #[test]
+    fn a_region_larger_than_the_budget_runs_alone() {
+        let budget = Budget::default();
+        assert!(budget.try_take(2 * LARGE_BUDGET));
+        assert!(!budget.try_take(LARGE_REGION));
+        budget.give(2 * LARGE_BUDGET);
+        assert!(budget.try_take(LARGE_REGION));
+    }
+
     #[test]
     fn an_offline_image_is_compiled_for_the_jit_isa() {
         let resolved = crate::jit::resolved_isa_settings().unwrap();

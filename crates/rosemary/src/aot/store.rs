@@ -7,34 +7,78 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Writes `bytes` to `path` through a temporary file in the same directory.
+pub fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    let mut file = AtomicFile::create(path)?;
+    file.write_all(bytes)?;
+    file.commit()
+}
+
+/// A file written under a temporary name in its directory and renamed to its own
+/// name by [`AtomicFile::commit`]; dropped uncommitted, it is removed.
 ///
 /// Several processes may build the same image, so the file appears at its name only
 /// by a rename, which is atomic within a filesystem; two writers write equivalent
 /// bytes, so whichever rename lands last is correct.
-pub fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
-    static COUNTER: AtomicU64 = AtomicU64::new(0);
+pub struct AtomicFile {
+    file: File,
+    temporary: PathBuf,
+    path: PathBuf,
+    committed: bool,
+}
 
-    let directory = path
-        .parent()
-        .ok_or_else(|| std::io::Error::other("a cache file needs a directory"))?;
-    std::fs::create_dir_all(directory)?;
-    let temporary = directory.join(format!(
-        ".{}.{}.tmp",
-        std::process::id(),
-        COUNTER.fetch_add(1, Ordering::Relaxed)
-    ));
-    let written = (|| {
-        let mut file = File::create(&temporary)?;
-        file.write_all(bytes)?;
-        file.sync_all()?;
-        std::fs::rename(&temporary, path)?;
-        // The rename itself is durable only once the directory is.
-        File::open(directory)?.sync_all()
-    })();
-    if written.is_err() {
-        let _ = std::fs::remove_file(&temporary);
+impl AtomicFile {
+    pub fn create(path: &Path) -> std::io::Result<Self> {
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+        let directory = path
+            .parent()
+            .ok_or_else(|| std::io::Error::other("a cache file needs a directory"))?;
+        std::fs::create_dir_all(directory)?;
+        let temporary = directory.join(format!(
+            ".{}.{}.tmp",
+            std::process::id(),
+            COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        Ok(AtomicFile {
+            file: File::create(&temporary)?,
+            temporary,
+            path: path.to_owned(),
+            committed: false,
+        })
     }
-    written
+
+    pub fn commit(mut self) -> std::io::Result<()> {
+        self.file.sync_all()?;
+        std::fs::rename(&self.temporary, &self.path)?;
+        self.committed = true;
+        // The rename itself is durable only once the directory is.
+        let directory = self.path.parent().expect("created with a directory");
+        File::open(directory)?.sync_all()
+    }
+}
+
+impl Write for AtomicFile {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.file.write(bytes)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.file.flush()
+    }
+}
+
+impl std::io::Seek for AtomicFile {
+    fn seek(&mut self, to: std::io::SeekFrom) -> std::io::Result<u64> {
+        self.file.seek(to)
+    }
+}
+
+impl Drop for AtomicFile {
+    fn drop(&mut self) {
+        if !self.committed {
+            let _ = std::fs::remove_file(&self.temporary);
+        }
+    }
 }
 
 /// A cache file mapped read-only. A rename over it later leaves this mapping intact.
@@ -179,6 +223,17 @@ mod tests {
             .map(|e| e.file_name())
             .collect();
         assert_eq!(names, ["b.rmc"], "a temporary file was left behind");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn an_uncommitted_file_leaves_nothing_behind() {
+        let dir = scratch("uncommitted");
+        let path = dir.join("e.rmc");
+        let mut file = AtomicFile::create(&path).unwrap();
+        file.write_all(b"partial").unwrap();
+        drop(file);
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 0);
         std::fs::remove_dir_all(dir).unwrap();
     }
 
