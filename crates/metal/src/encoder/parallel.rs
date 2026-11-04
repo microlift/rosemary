@@ -100,6 +100,8 @@ pub(super) unsafe extern "C" fn new_sub_encoder(receiver: Id, _sel: Sel) -> Id {
             retained_set: AddressSet::default(),
             uploads: Vec::new(),
             upload_used: 0,
+            snapshots: Vec::new(),
+            staging: Vec::new(),
             framebuffers: Vec::new(),
             secondaries: Vec::new(),
             secondary: true,
@@ -175,6 +177,8 @@ pub(super) unsafe extern "C" fn end_parallel_encoding(receiver: Id, sel: Sel) {
                 .descriptor_pools
                 .append(&mut command.descriptor_pools);
             parent.uploads.append(&mut command.uploads);
+            parent.snapshots.append(&mut command.snapshots);
+            parent.staging.append(&mut command.staging);
             parent.occlusion.adopt(&mut command.occlusion);
             command.retained_set.clear();
             parent.retained.append(&mut command.retained);

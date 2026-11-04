@@ -27,6 +27,9 @@ counters!(
     TexturesCreated = "textures_created",
     PipelinesCreated = "pipelines_created",
     SubmitMicros = "submit_micros",
+    SubmitLockMicros = "submit_lock_micros",
+    SubmitFlushMicros = "submit_flush_micros",
+    SubmitDriverMicros = "submit_driver_micros",
     SubmissionQueueDepth = "submission_queue_depth_peak",
     FenceWaitMicros = "fence_wait_micros",
     FenceWakeToRetiredMicros = "fence_wake_to_retired_micros",
@@ -64,6 +67,11 @@ counters!(
     ImmediateCalls = "immediate_calls",
     ImmediateMicros = "immediate_micros",
     DeferredTransfers = "deferred_transfers",
+    CopySnapshots = "copy_snapshots",
+    Handlers = "completion_handlers",
+    HandlerQueueMicros = "completion_handler_queue_micros",
+    HandlerQueuePeakMicros = "completion_handler_queue_micros_peak",
+    HandlerRunMicros = "completion_handler_run_micros",
 );
 
 #[allow(clippy::declare_interior_mutable_const)]

@@ -62,6 +62,8 @@ pub(super) unsafe extern "C" fn new_command_buffer(receiver: Id, _sel: Sel) -> I
             retained_set: AddressSet::default(),
             uploads: Vec::new(),
             upload_used: 0,
+            snapshots: Vec::new(),
+            staging: Vec::new(),
             framebuffers: Vec::new(),
             secondaries: Vec::new(),
             secondary: false,
@@ -101,6 +103,10 @@ pub(super) unsafe extern "C" fn command_buffer_dealloc(receiver: Id, _sel: Sel) 
         }
         for chunk in std::mem::take(&mut command.uploads) {
             gpu.release_upload_chunk(chunk);
+        }
+        command.snapshots.clear();
+        for staging in std::mem::take(&mut command.staging) {
+            gpu.destroy_buffer(staging);
         }
         for secondary in std::mem::take(&mut command.secondaries) {
             gpu.release_secondary(secondary);
@@ -192,6 +198,107 @@ pub(super) unsafe extern "C" fn add_handler(receiver: Id, sel: Sel, block: Id) {
     }
 }
 
+/// Fill the upload memory of every snapshotted blit source. Where the device
+/// may have written the source since the copy was encoded, or an event wait
+/// queued since may hold this work until the CPU writes more, the device
+/// copies the bytes instead, in the command buffer this returns.
+fn resolve_snapshots(command: &mut CommandBuffer) -> Option<vk::CommandBuffer> {
+    let snapshots = std::mem::take(&mut command.snapshots);
+    if snapshots.is_empty() {
+        return None;
+    }
+    let gpu = command.gpu;
+    let behind_event = gpu.event_waits_in_flight.load(Ordering::Acquire) != 0;
+    let mut on_device = Vec::new();
+    for snapshot in snapshots {
+        // SAFETY: the command buffer retained the buffer with the copy.
+        let source = unsafe { object::body::<Buffer>(snapshot.source) };
+        let pages = source
+            .host_pages()
+            .expect("only host pages are snapshotted");
+        if behind_event || pages.imported() {
+            on_device.push(snapshot);
+            continue;
+        }
+        // SAFETY: the range was checked against the buffer when the copy was
+        // encoded, and the reservation holds `length` bytes.
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                pages.contents().add(snapshot.offset as usize),
+                snapshot.target,
+                snapshot.length as usize,
+            )
+        };
+    }
+    if on_device.is_empty() {
+        return None;
+    }
+    let allocate = vk::CommandBufferAllocateInfo::default()
+        .command_pool(command.pool)
+        .level(vk::CommandBufferLevel::PRIMARY)
+        .command_buffer_count(1);
+    let begin =
+        vk::CommandBufferBeginInfo::default().flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
+    // SAFETY: the pool belongs to this command buffer, which is not recording
+    // into it on any other thread.
+    let prelude = match unsafe { gpu.device.allocate_command_buffers(&allocate) } {
+        Ok(buffers) => buffers[0],
+        Err(error) => {
+            gpu::trace(format!(
+                "vkAllocateCommandBuffers for blit sources failed with {error:?}"
+            ));
+            return None;
+        }
+    };
+    // SAFETY: freshly allocated from this pool.
+    if let Err(error) = unsafe { gpu.device.begin_command_buffer(prelude, &begin) } {
+        gpu::trace(format!(
+            "vkBeginCommandBuffer for blit sources failed with {error:?}"
+        ));
+        unsafe { gpu.device.free_command_buffers(command.pool, &[prelude]) };
+        return None;
+    }
+    for snapshot in on_device {
+        // SAFETY: as above.
+        let source = unsafe { object::body::<Buffer>(snapshot.source) };
+        let (from, offset) = source.device_range(snapshot.offset, snapshot.length);
+        let region = vk::BufferCopy::default()
+            .src_offset(offset)
+            .dst_offset(snapshot.at)
+            .size(snapshot.length);
+        // SAFETY: recording into the prelude; both buffers outlive the work.
+        unsafe {
+            gpu.device
+                .cmd_copy_buffer(prelude, from, snapshot.buffer, &[region])
+        };
+    }
+    let memory = vk::MemoryBarrier::default()
+        .src_access_mask(vk::AccessFlags::MEMORY_WRITE)
+        .dst_access_mask(vk::AccessFlags::MEMORY_READ | vk::AccessFlags::MEMORY_WRITE);
+    // SAFETY: recording into the prelude.
+    let ended = unsafe {
+        gpu.device.cmd_pipeline_barrier(
+            prelude,
+            vk::PipelineStageFlags::ALL_COMMANDS,
+            vk::PipelineStageFlags::ALL_COMMANDS,
+            vk::DependencyFlags::empty(),
+            &[memory],
+            &[],
+            &[],
+        );
+        gpu.device.end_command_buffer(prelude)
+    };
+    if let Err(error) = ended {
+        gpu::trace(format!(
+            "vkEndCommandBuffer for blit sources failed with {error:?}"
+        ));
+        // SAFETY: never submitted.
+        unsafe { gpu.device.free_command_buffers(command.pool, &[prelude]) };
+        return None;
+    }
+    Some(prelude)
+}
+
 /// `-[MTLCommandBuffer commit]`: end recording and submit asynchronously.
 pub(super) unsafe extern "C" fn commit(receiver: Id, _sel: Sel) {
     // SAFETY: a command buffer of this crate's.
@@ -218,12 +325,14 @@ pub(super) unsafe extern "C" fn commit(receiver: Id, _sel: Sel) {
     // is still recording, so a failure between the two would otherwise strand
     // the pool, the fence, the descriptor pools, the retained objects and
     // every handler for good.
+    let prelude = resolve_snapshots(command);
     let mut batches = std::mem::take(&mut command.batches);
     batches.push(gpu::Batch {
         waits: std::mem::take(&mut command.waits),
         command_buffer: command.command_buffer,
         signals: Vec::new(),
     });
+    let waits_for_event = batches.iter().any(|batch| !batch.waits.is_empty());
     let mut submission = Some(Submission {
         gpu,
         timestamps: std::mem::replace(&mut command.timestamps, vk::QueryPool::null()),
@@ -241,6 +350,7 @@ pub(super) unsafe extern "C" fn commit(receiver: Id, _sel: Sel) {
             std::mem::take(&mut command.retained)
         },
         uploads: std::mem::take(&mut command.uploads),
+        staging: std::mem::take(&mut command.staging),
         framebuffers: std::mem::take(&mut command.framebuffers),
         secondaries: std::mem::take(&mut command.secondaries),
         captures: std::mem::take(&mut command.captures),
@@ -251,7 +361,26 @@ pub(super) unsafe extern "C" fn commit(receiver: Id, _sel: Sel) {
         completion: Arc::clone(&command.completion),
         scheduled_time: 0.0,
         profile: command.profile.take(),
+        waits_for_event: false,
+        failure: None,
+        signal: command.fence,
     });
+    if waits_for_event {
+        submission
+            .as_mut()
+            .expect("pending submission")
+            .begin_event_wait();
+    }
+    if let Some(prelude) = prelude {
+        // Ahead of everything this command buffer recorded, which has no
+        // event wait before its snapshotted copies.
+        batches.insert(0, gpu::Batch::plain(prelude));
+        submission
+            .as_mut()
+            .expect("pending submission")
+            .split_buffers
+            .push(prelude);
+    }
     // SAFETY: recording began when the command buffer was made.
     if let Err(error) = unsafe { gpu.device.end_command_buffer(command.command_buffer) } {
         gpu::trace(format!("vkEndCommandBuffer failed with {error:?}"));
@@ -272,41 +401,39 @@ pub(super) unsafe extern "C" fn commit(receiver: Id, _sel: Sel) {
     }
     command.completion.set(2); // MTLCommandBufferStatusCommitted
     gpu.submissions.start(gpu);
-    let completion = Arc::clone(&command.completion);
-    let submitted = stats::timed(Counter::SubmitMicros, || {
-        gpu.submit_ordered(&batches, command.fence, |serial| {
-            let pending = submission.as_mut().expect("pending submission");
-            pending.serial = serial;
-            pending.scheduled_time = darwin::mach::media_time();
-            completion.set(3); // MTLCommandBufferStatusScheduled
-            for block in std::mem::take(&mut command.scheduled_handlers) {
+    let mut submission = submission.take().expect("pending submission");
+    let scheduled_handlers = std::mem::take(&mut command.scheduled_handlers);
+    gpu.commit(gpu::Commit {
+        batches,
+        fence: command.fence,
+        submitted: Box::new(move |serial, result, signal| {
+            let object = submission.object.as_id();
+            submission.serial = serial;
+            submission.signal = signal;
+            match result {
+                Ok(()) => {
+                    submission.scheduled_time = darwin::mach::media_time();
+                    submission.completion.set(3); // MTLCommandBufferStatusScheduled
+                }
+                Err(reason) => {
+                    gpu::trace(format!("command buffer submission failed: {reason}"));
+                    submission.completion.set(5); // MTLCommandBufferStatusError
+                    // Finished by the completion worker, in order and with no
+                    // lock held; the error status is installed then.
+                    submission.failure = Some(reason);
+                }
+            }
+            for block in scheduled_handlers {
                 // SAFETY: the retained block reference is transferred to the
-                // handler worker, and `receiver` is live during this call.
-                unsafe { crate::completion::deliver(block.into_raw(), receiver) };
+                // handler worker, and the submission retains `object`.
+                unsafe { crate::completion::deliver(block.into_raw(), object) };
             }
-            submission
-                .as_mut()
-                .expect("pending submission")
-                .schedule_presents();
-            gpu.submissions
-                .push(submission.take().expect("pending submission"));
-        })
+            if submission.failure.is_none() {
+                submission.schedule_presents();
+            }
+            gpu.submissions.push(submission);
+        }),
     });
-    match submitted {
-        Ok(()) => {}
-        Err(reason) => {
-            gpu::trace(format!("command buffer submission failed: {reason}"));
-            command.completion.set(5); // MTLCommandBufferStatusError
-            for block in std::mem::take(&mut command.scheduled_handlers) {
-                // SAFETY: as above. The error status is installed by `finish`.
-                unsafe { crate::completion::deliver(block.into_raw(), receiver) };
-            }
-            submission
-                .take()
-                .expect("unsubmitted command")
-                .finish(Err(reason));
-        }
-    }
 }
 
 pub(super) unsafe extern "C" fn wait_until_completed(receiver: Id, _sel: Sel) {

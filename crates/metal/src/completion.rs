@@ -9,6 +9,8 @@ use objc::object::Id;
 struct Pending {
     block: usize,
     command_buffer: usize,
+    /// When it was queued, while statistics are on.
+    queued: Option<std::time::Instant>,
 }
 
 struct Queue {
@@ -42,6 +44,7 @@ pub(crate) unsafe fn deliver(block: Id, command_buffer: Id) {
         // The guest may release the command buffer the moment `-commit` returns,
         // and the handler is handed it as its argument.
         command_buffer: objc::arc::retain(command_buffer) as usize,
+        queued: crate::stats::timer(),
     };
     let mut pending = QUEUE.pending.lock().expect("the completion queue");
     pending.push_back(entry);
@@ -73,6 +76,13 @@ fn worker() {
 unsafe fn run(entry: Pending) {
     let block = entry.block as Id;
     let command_buffer = entry.command_buffer as Id;
+    if let Some(queued) = entry.queued {
+        let waited = queued.elapsed().as_micros() as u64;
+        crate::stats::count(crate::stats::Counter::Handlers);
+        crate::stats::add(crate::stats::Counter::HandlerQueueMicros, waited);
+        crate::stats::peak(crate::stats::Counter::HandlerQueuePeakMicros, waited);
+    }
+    let running = crate::stats::timer();
     {
         // This thread is the runtime's, so Darwin code running on it needs the
         // thread-local array it reads `errno`, its stack canary and its
@@ -90,8 +100,11 @@ unsafe fn run(entry: Pending) {
             unsafe { call(block, command_buffer) };
         }
         objc::arc::pool_pop(pool);
+        // The references this entry owned, now spent. The last reference to
+        // either may run guest code: the block's dispose helper, or whatever
+        // the guest associated with the command buffer.
+        objc::block::release(block);
+        objc::arc::release(command_buffer);
     }
-    // The reference this entry owned, now spent.
-    objc::block::release(block);
-    objc::arc::release(command_buffer);
+    crate::stats::finish_timer(crate::stats::Counter::HandlerRunMicros, running);
 }

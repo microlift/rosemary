@@ -32,6 +32,7 @@ use ash::vk;
 use metal_translate::ir::{ResourceKind, Stage};
 use objc::object::Id;
 use objc::sel::Sel;
+use std::sync::atomic::Ordering;
 use std::sync::{Arc, Condvar, Mutex};
 
 use crate::gpu::{
@@ -161,6 +162,10 @@ pub(crate) struct CommandBuffer {
     /// one the copies have reached.
     uploads: Vec<GpuBuffer>,
     upload_used: u64,
+    /// Blit sources read from host pages at commit; see [`Self::copy_source`].
+    snapshots: Vec<Snapshot>,
+    /// Upload memory for snapshots too large for an upload chunk.
+    staging: Vec<GpuBuffer>,
     framebuffers: Vec<vk::Framebuffer>,
     /// Sub-encoders' secondary command buffers this one executes.
     secondaries: Vec<gpu::SecondaryContext>,
@@ -342,7 +347,16 @@ impl CommandBuffer {
     /// Copy `bytes` into this command buffer's upload chunks, answering the
     /// buffer and offset they landed at. The copy lives until the work does.
     pub(super) fn upload(&mut self, bytes: &[u8]) -> Option<(vk::Buffer, u64)> {
-        let length = bytes.len() as u64;
+        let (buffer, offset, contents) = self.reserve_upload(bytes.len() as u64)?;
+        // SAFETY: the reservation is `bytes.len()` mapped bytes, handed out once.
+        unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), contents, bytes.len()) };
+        Some((buffer, offset))
+    }
+
+    /// `length` bytes of this command buffer's upload chunks, which live until
+    /// the work does: the buffer and offset the device reads them at, and
+    /// where the host writes them.
+    fn reserve_upload(&mut self, length: u64) -> Option<(vk::Buffer, u64, *mut u8)> {
         let limits = &self.gpu.limits;
         let alignment = limits
             .min_storage_buffer_offset_alignment
@@ -363,18 +377,81 @@ impl CommandBuffer {
             }
         };
         let chunk = self.uploads.last().expect("a chunk was just ensured");
-        // SAFETY: the chunk is mapped over `UPLOAD_CHUNK` bytes, and this range
-        // is inside it and handed out once.
-        unsafe {
-            std::ptr::copy_nonoverlapping(
-                bytes.as_ptr(),
-                chunk.contents.add(offset as usize),
-                bytes.len(),
-            )
-        };
         self.upload_used = offset + length;
-        Some((chunk.buffer, offset))
+        // SAFETY: the chunk is mapped over `UPLOAD_CHUNK` bytes, and this range
+        // is inside it.
+        Some((chunk.buffer, offset, unsafe {
+            chunk.contents.add(offset as usize)
+        }))
     }
+
+    /// The buffer and offset a blit reads `offset..offset + length` of
+    /// `source` through. The caller has checked the range is inside.
+    ///
+    /// Host pages the device has never been given cannot have been written by
+    /// it, so their bytes at commit are what the copy would read, and Metal
+    /// requires the CPU's writes be done by then. Those are copied into upload
+    /// memory at commit instead of being imported. Behind an event wait the
+    /// CPU may still write after commit, so the pages are imported as before.
+    pub(super) fn copy_source(
+        &mut self,
+        source: Id,
+        offset: u64,
+        length: u64,
+    ) -> (vk::Buffer, u64) {
+        // SAFETY: only buffers of this crate's reach a blit encoder.
+        let body = unsafe { object::body::<Buffer>(source) };
+        let snapshot = body.host_pages().is_some_and(|pages| !pages.imported())
+            && !self.waits_for_event()
+            && self.gpu.event_waits_in_flight.load(Ordering::Acquire) == 0;
+        if snapshot && let Some((buffer, at, target)) = self.reserve_snapshot(length) {
+            self.snapshots.push(Snapshot {
+                source,
+                offset,
+                length,
+                target,
+                buffer,
+                at,
+            });
+            stats::count(Counter::CopySnapshots);
+            return (buffer, at);
+        }
+        body.device_range(offset, length)
+    }
+
+    fn reserve_snapshot(&mut self, length: u64) -> Option<(vk::Buffer, u64, *mut u8)> {
+        if length <= gpu::UPLOAD_CHUNK {
+            return self.reserve_upload(length);
+        }
+        match self.gpu.create_staging_buffer(length) {
+            Ok(staging) => {
+                let found = (staging.buffer, 0, staging.contents);
+                self.staging.push(staging);
+                Some(found)
+            }
+            Err(reason) => {
+                gpu::trace(format!("blit snapshot staging failed: {reason}"));
+                None
+            }
+        }
+    }
+
+    /// Whether any batch recorded so far, or the one recording, waits for an
+    /// event.
+    fn waits_for_event(&self) -> bool {
+        !self.waits.is_empty() || self.batches.iter().any(|batch| !batch.waits.is_empty())
+    }
+}
+
+/// Bytes a blit reads from host pages, copied into upload memory at commit.
+struct Snapshot {
+    /// The `MTLBuffer`, retained by the command buffer with the copy.
+    source: Id,
+    offset: u64,
+    length: u64,
+    target: *mut u8,
+    buffer: vk::Buffer,
+    at: u64,
 }
 
 impl Encoder {}
