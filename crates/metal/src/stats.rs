@@ -68,6 +68,10 @@ counters!(
     ImmediateMicros = "immediate_micros",
     DeferredTransfers = "deferred_transfers",
     CopySnapshots = "copy_snapshots",
+    Handlers = "completion_handlers",
+    HandlerQueueMicros = "completion_handler_queue_micros",
+    HandlerQueuePeakMicros = "completion_handler_queue_micros_peak",
+    HandlerRunMicros = "completion_handler_run_micros",
 );
 
 #[allow(clippy::declare_interior_mutable_const)]
