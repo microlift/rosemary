@@ -111,12 +111,17 @@ pub fn release(object: Id) {
     }
     {
         let mut map = counts(object);
-        if let Some(extra) = map.get_mut(&(object as usize)) {
-            *extra -= 1;
-            if *extra == 0 {
+        // An entry at zero is a count of one, kept so that an object retained
+        // and released over and over is not inserted and removed each time.
+        match map.get_mut(&(object as usize)) {
+            Some(extra) if *extra > 0 => {
+                *extra -= 1;
+                return;
+            }
+            Some(_) => {
                 map.remove(&(object as usize));
             }
-            return;
+            None => {}
         }
     }
     deallocate(object);
@@ -135,6 +140,12 @@ pub fn retain_count(object: Id) -> usize {
         return (refcount.count)(object);
     }
     1 + counts(object).get(&(object as usize)).copied().unwrap_or(0)
+}
+
+/// Drop `object`'s entry, which an entry at zero outlives every reference
+/// to, before its memory is reused for another object.
+pub(crate) fn forget_count(object: Id) {
+    counts(object).remove(&(object as usize));
 }
 
 /// Send `-dealloc` if there is one, then give the memory back.
@@ -552,4 +563,45 @@ pub fn associated(object: Id, key: *const c_void) -> Id {
         .get(&(object as usize))
         .and_then(|entries| entries.get(&(key as usize)))
         .map_or(std::ptr::null_mut(), |(v, _)| *v as Id)
+}
+
+#[cfg(test)]
+mod lifetime_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    static DEALLOCATED: AtomicUsize = AtomicUsize::new(0);
+
+    unsafe extern "C" fn counting_dealloc(object: Id, _sel: crate::sel::Sel) {
+        DEALLOCATED.fetch_add(1, Ordering::SeqCst);
+        finalize(object);
+    }
+
+    /// An object retained and released back to one reference many times keeps
+    /// its count, and is freed once, by the release which ends the last one.
+    #[test]
+    fn an_object_released_back_to_one_reference_is_freed_by_its_last_release() {
+        crate::bootstrap();
+        let nsobject = crate::class::lookup(c"NSObject").expect("NSObject");
+        let class = crate::class::allocate_pair(Some(nsobject), c"RosemaryCountedDealloc", 0)
+            .expect("an unused name");
+        assert!(class.add_method(
+            crate::sel::get("dealloc"),
+            counting_dealloc as crate::class::Imp,
+            c"v16@0:8",
+        ));
+        crate::class::register_pair(class);
+        let object = crate::object::create_instance(class, 0);
+        for _ in 0..3 {
+            retain(object);
+            retain(object);
+            assert_eq!(retain_count(object), 3);
+            release(object);
+            release(object);
+            assert_eq!(retain_count(object), 1);
+        }
+        assert_eq!(DEALLOCATED.load(Ordering::SeqCst), 0);
+        release(object);
+        assert_eq!(DEALLOCATED.load(Ordering::SeqCst), 1);
+    }
 }
