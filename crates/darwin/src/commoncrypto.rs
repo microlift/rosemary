@@ -1,135 +1,447 @@
-use std::collections::HashMap;
 use std::ffi::c_void;
-use std::sync::{Mutex, OnceLock};
 
 use aes::{Aes128, Aes192, Aes256};
 use blowfish::Blowfish;
 use cast5::Cast5;
 use cipher::{BlockCipherDecrypt, BlockCipherEncrypt, KeyInit, StreamCipher};
 use des::{Des, TdesEde3};
-use md5::Md5;
 use rc2::Rc2;
 use rc4::Rc4;
-use sha1::Sha1;
-use sha2::digest::Digest;
-use sha2::{Sha224, Sha256, Sha384, Sha512};
 
-enum Context {
-    Md5(Md5),
-    Sha1(Sha1),
-    Sha224(Sha224),
-    Sha256(Sha256),
-    Sha384(Sha384),
-    Sha512(Sha512),
+const CC_MD5_DIGEST_LENGTH: usize = 16;
+const CC_SHA1_DIGEST_LENGTH: usize = 20;
+const CC_SHA224_DIGEST_LENGTH: usize = 28;
+const CC_SHA256_DIGEST_LENGTH: usize = 32;
+const CC_SHA384_DIGEST_LENGTH: usize = 48;
+const CC_SHA512_DIGEST_LENGTH: usize = 64;
+
+const CC_MD5_BLOCK_BYTES: usize = 64;
+const CC_SHA1_BLOCK_BYTES: usize = 64;
+const CC_SHA256_BLOCK_BYTES: usize = 64;
+const CC_SHA512_BLOCK_BYTES: usize = 128;
+
+const MD5_INITIAL_STATE: [u32; 4] = [0x6745_2301, 0xEFCD_AB89, 0x98BA_DCFE, 0x1032_5476];
+const SHA1_INITIAL_STATE: [u32; 5] = [
+    0x6745_2301,
+    0xEFCD_AB89,
+    0x98BA_DCFE,
+    0x1032_5476,
+    0xC3D2_E1F0,
+];
+const SHA224_INITIAL_STATE: [u32; 8] = [
+    0xc105_9ed8,
+    0x367c_d507,
+    0x3070_dd17,
+    0xf70e_5939,
+    0xffc0_0b31,
+    0x6858_1511,
+    0x64f9_8fa7,
+    0xbefa_4fa4,
+];
+const SHA256_INITIAL_STATE: [u32; 8] = [
+    0x6a09_e667,
+    0xbb67_ae85,
+    0x3c6e_f372,
+    0xa54f_f53a,
+    0x510e_527f,
+    0x9b05_688c,
+    0x1f83_d9ab,
+    0x5be0_cd19,
+];
+const SHA384_INITIAL_STATE: [u64; 8] = [
+    0xcbbb_9d5d_c105_9ed8,
+    0x629a_292a_367c_d507,
+    0x9159_015a_3070_dd17,
+    0x152f_ecd8_f70e_5939,
+    0x6733_2667_ffc0_0b31,
+    0x8eb4_4a87_6858_1511,
+    0xdb0c_2e0d_64f9_8fa7,
+    0x47b5_481d_befa_4fa4,
+];
+const SHA512_INITIAL_STATE: [u64; 8] = [
+    0x6a09_e667_f3bc_c908,
+    0xbb67_ae85_84ca_a73b,
+    0x3c6e_f372_fe94_f82b,
+    0xa54f_f53a_5f1d_36f1,
+    0x510e_527f_ade6_82d1,
+    0x9b05_688c_2b3e_6c1f,
+    0x1f83_d9ab_fb41_bd6b,
+    0x5be0_cd19_137e_2179,
+];
+
+/// Merkle-Damgard padding: this byte, zeros, then the message length in bits.
+const PADDING_MARKER: u8 = 0x80;
+const BITS_PER_BYTE: u128 = u8::BITS as u128;
+
+/// The guest's CC_*_CTX holds all digest state, so contexts can be copied and dropped freely.
+trait DigestContext<const BLOCK: usize>: Copy {
+    const LENGTH_FIELD_BYTES: usize;
+    fn message_bits(&self) -> u128;
+    fn set_message_bits(&mut self, bits: u128);
+    fn buffer(&mut self) -> &mut [u8; BLOCK];
+    fn compress(&mut self, blocks: &[[u8; BLOCK]]);
+    fn write_length(field: &mut [u8], bits: u128);
+    fn write_digest(&self, output: &mut [u8]);
 }
 
-impl Context {
-    fn update(&mut self, bytes: &[u8]) {
-        match self {
-            Self::Md5(h) => h.update(bytes),
-            Self::Sha1(h) => h.update(bytes),
-            Self::Sha224(h) => h.update(bytes),
-            Self::Sha256(h) => h.update(bytes),
-            Self::Sha384(h) => h.update(bytes),
-            Self::Sha512(h) => h.update(bytes),
+/// `CC_MD5_CTX`: A-D, Nl, Nh, data[16], num.
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct Md5Context {
+    state: [u32; 4],
+    bit_count: [u32; 2],
+    data: [u8; CC_MD5_BLOCK_BYTES],
+    num: u32,
+}
+
+/// `CC_SHA1_CTX`: h0-h4, Nl, Nh, data[16], num.
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct Sha1Context {
+    state: [u32; 5],
+    bit_count: [u32; 2],
+    data: [u8; CC_SHA1_BLOCK_BYTES],
+    num: u32,
+}
+
+/// `CC_SHA256_CTX`, shared by SHA-224: count[2], hash[8], wbuf[16].
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct Sha256Context {
+    bit_count: [u32; 2],
+    state: [u32; 8],
+    data: [u8; CC_SHA256_BLOCK_BYTES],
+}
+
+/// `CC_SHA512_CTX`, shared by SHA-384: count[2], hash[8], wbuf[16].
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct Sha512Context {
+    bit_count: [u64; 2],
+    state: [u64; 8],
+    data: [u8; CC_SHA512_BLOCK_BYTES],
+}
+
+fn split_u64(value: u128) -> [u32; 2] {
+    let value = value as u64;
+    [value as u32, (value >> u32::BITS) as u32]
+}
+
+fn join_u32(words: [u32; 2]) -> u128 {
+    u128::from(words[0]) | u128::from(words[1]) << u32::BITS
+}
+
+fn buffered_bytes<const BLOCK: usize>(bits: u128) -> usize {
+    ((bits / BITS_PER_BYTE) % BLOCK as u128) as usize
+}
+
+impl Md5Context {
+    fn new() -> Self {
+        Self {
+            state: MD5_INITIAL_STATE,
+            bit_count: [0; 2],
+            data: [0; CC_MD5_BLOCK_BYTES],
+            num: 0,
         }
     }
-    fn finish(self) -> Vec<u8> {
-        match self {
-            Self::Md5(h) => h.finalize().to_vec(),
-            Self::Sha1(h) => h.finalize().to_vec(),
-            Self::Sha224(h) => h.finalize().to_vec(),
-            Self::Sha256(h) => h.finalize().to_vec(),
-            Self::Sha384(h) => h.finalize().to_vec(),
-            Self::Sha512(h) => h.finalize().to_vec(),
+}
+
+impl DigestContext<CC_MD5_BLOCK_BYTES> for Md5Context {
+    const LENGTH_FIELD_BYTES: usize = size_of::<u64>();
+    fn message_bits(&self) -> u128 {
+        join_u32(self.bit_count)
+    }
+    fn set_message_bits(&mut self, bits: u128) {
+        self.bit_count = split_u64(bits);
+        self.num = buffered_bytes::<CC_MD5_BLOCK_BYTES>(bits) as u32;
+    }
+    fn buffer(&mut self) -> &mut [u8; CC_MD5_BLOCK_BYTES] {
+        &mut self.data
+    }
+    fn compress(&mut self, blocks: &[[u8; CC_MD5_BLOCK_BYTES]]) {
+        md5::block_api::compress(&mut self.state, blocks);
+    }
+    fn write_length(field: &mut [u8], bits: u128) {
+        field.copy_from_slice(&(bits as u64).to_le_bytes());
+    }
+    fn write_digest(&self, output: &mut [u8]) {
+        for (bytes, word) in output.chunks_exact_mut(size_of::<u32>()).zip(self.state) {
+            bytes.copy_from_slice(&word.to_le_bytes());
         }
     }
 }
 
-fn contexts() -> &'static Mutex<HashMap<usize, Context>> {
-    static CONTEXTS: OnceLock<Mutex<HashMap<usize, Context>>> = OnceLock::new();
-    CONTEXTS.get_or_init(|| Mutex::new(HashMap::new()))
+impl Sha1Context {
+    fn new() -> Self {
+        Self {
+            state: SHA1_INITIAL_STATE,
+            bit_count: [0; 2],
+            data: [0; CC_SHA1_BLOCK_BYTES],
+            num: 0,
+        }
+    }
 }
 
-unsafe fn init(context: *mut c_void, hash: Context) -> i32 {
+impl DigestContext<CC_SHA1_BLOCK_BYTES> for Sha1Context {
+    const LENGTH_FIELD_BYTES: usize = size_of::<u64>();
+    fn message_bits(&self) -> u128 {
+        join_u32(self.bit_count)
+    }
+    fn set_message_bits(&mut self, bits: u128) {
+        self.bit_count = split_u64(bits);
+        self.num = buffered_bytes::<CC_SHA1_BLOCK_BYTES>(bits) as u32;
+    }
+    fn buffer(&mut self) -> &mut [u8; CC_SHA1_BLOCK_BYTES] {
+        &mut self.data
+    }
+    fn compress(&mut self, blocks: &[[u8; CC_SHA1_BLOCK_BYTES]]) {
+        sha1::block_api::compress(&mut self.state, blocks);
+    }
+    fn write_length(field: &mut [u8], bits: u128) {
+        field.copy_from_slice(&(bits as u64).to_be_bytes());
+    }
+    fn write_digest(&self, output: &mut [u8]) {
+        for (bytes, word) in output.chunks_exact_mut(size_of::<u32>()).zip(self.state) {
+            bytes.copy_from_slice(&word.to_be_bytes());
+        }
+    }
+}
+
+impl Sha256Context {
+    fn new(state: [u32; 8]) -> Self {
+        Self {
+            bit_count: [0; 2],
+            state,
+            data: [0; CC_SHA256_BLOCK_BYTES],
+        }
+    }
+}
+
+impl DigestContext<CC_SHA256_BLOCK_BYTES> for Sha256Context {
+    const LENGTH_FIELD_BYTES: usize = size_of::<u64>();
+    fn message_bits(&self) -> u128 {
+        join_u32(self.bit_count)
+    }
+    fn set_message_bits(&mut self, bits: u128) {
+        self.bit_count = split_u64(bits);
+    }
+    fn buffer(&mut self) -> &mut [u8; CC_SHA256_BLOCK_BYTES] {
+        &mut self.data
+    }
+    fn compress(&mut self, blocks: &[[u8; CC_SHA256_BLOCK_BYTES]]) {
+        sha2::block_api::compress256(&mut self.state, blocks);
+    }
+    fn write_length(field: &mut [u8], bits: u128) {
+        field.copy_from_slice(&(bits as u64).to_be_bytes());
+    }
+    fn write_digest(&self, output: &mut [u8]) {
+        for (bytes, word) in output.chunks_exact_mut(size_of::<u32>()).zip(self.state) {
+            bytes.copy_from_slice(&word.to_be_bytes());
+        }
+    }
+}
+
+impl Sha512Context {
+    fn new(state: [u64; 8]) -> Self {
+        Self {
+            bit_count: [0; 2],
+            state,
+            data: [0; CC_SHA512_BLOCK_BYTES],
+        }
+    }
+}
+
+impl DigestContext<CC_SHA512_BLOCK_BYTES> for Sha512Context {
+    const LENGTH_FIELD_BYTES: usize = size_of::<u128>();
+    fn message_bits(&self) -> u128 {
+        u128::from(self.bit_count[0]) | u128::from(self.bit_count[1]) << u64::BITS
+    }
+    fn set_message_bits(&mut self, bits: u128) {
+        self.bit_count = [bits as u64, (bits >> u64::BITS) as u64];
+    }
+    fn buffer(&mut self) -> &mut [u8; CC_SHA512_BLOCK_BYTES] {
+        &mut self.data
+    }
+    fn compress(&mut self, blocks: &[[u8; CC_SHA512_BLOCK_BYTES]]) {
+        sha2::block_api::compress512(&mut self.state, blocks);
+    }
+    fn write_length(field: &mut [u8], bits: u128) {
+        field.copy_from_slice(&bits.to_be_bytes());
+    }
+    fn write_digest(&self, output: &mut [u8]) {
+        for (bytes, word) in output.chunks_exact_mut(size_of::<u64>()).zip(self.state) {
+            bytes.copy_from_slice(&word.to_be_bytes());
+        }
+    }
+}
+
+fn absorb<const BLOCK: usize, C: DigestContext<BLOCK>>(context: &mut C, mut input: &[u8]) {
+    let bits = context.message_bits();
+    let mut buffered = buffered_bytes::<BLOCK>(bits);
+    context.set_message_bits(bits.wrapping_add(input.len() as u128 * BITS_PER_BYTE));
+    if buffered != 0 {
+        let taken = input.len().min(BLOCK - buffered);
+        context.buffer()[buffered..buffered + taken].copy_from_slice(&input[..taken]);
+        input = &input[taken..];
+        buffered += taken;
+        if buffered < BLOCK {
+            return;
+        }
+        let block = *context.buffer();
+        context.compress(&[block]);
+    }
+    let (blocks, rest) = input.as_chunks::<BLOCK>();
+    context.compress(blocks);
+    context.buffer()[..rest.len()].copy_from_slice(rest);
+}
+
+fn finish<const BLOCK: usize, C: DigestContext<BLOCK>>(mut context: C, output: &mut [u8]) {
+    let bits = context.message_bits();
+    let buffered = buffered_bytes::<BLOCK>(bits);
+    let buffer = context.buffer();
+    buffer[buffered] = PADDING_MARKER;
+    buffer[buffered + 1..].fill(0);
+    if BLOCK - buffered - 1 < C::LENGTH_FIELD_BYTES {
+        let block = *buffer;
+        context.compress(&[block]);
+        context.buffer().fill(0);
+    }
+    C::write_length(&mut context.buffer()[BLOCK - C::LENGTH_FIELD_BYTES..], bits);
+    let block = *context.buffer();
+    context.compress(&[block]);
+    context.write_digest(output);
+}
+
+unsafe fn guest_input<'a>(input: *const c_void, len: u32) -> Option<&'a [u8]> {
+    match (input.is_null(), len) {
+        (_, 0) => Some(&[]),
+        (true, _) => None,
+        (false, len) => Some(unsafe { std::slice::from_raw_parts(input.cast(), len as usize) }),
+    }
+}
+
+// Guest contexts may be under-aligned for Rust, so they are only accessed unaligned.
+unsafe fn init<C>(context: *mut c_void, initial: C) -> i32 {
     if context.is_null() {
         return 0;
     }
-    contexts()
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .insert(context as usize, hash);
+    unsafe { context.cast::<C>().write_unaligned(initial) };
     1
 }
 
-unsafe fn update(context: *mut c_void, input: *const c_void, len: u32) -> i32 {
-    if context.is_null() || (input.is_null() && len != 0) {
+unsafe fn update<const BLOCK: usize, C: DigestContext<BLOCK>>(
+    context: *mut c_void,
+    input: *const c_void,
+    len: u32,
+) -> i32 {
+    let Some(input) = (unsafe { guest_input(input, len) }) else {
+        return 0;
+    };
+    if context.is_null() {
         return 0;
     }
-    let input = if len == 0 {
-        &[]
-    } else {
-        unsafe { std::slice::from_raw_parts(input.cast(), len as usize) }
-    };
-    let mut all = contexts().lock().unwrap_or_else(|e| e.into_inner());
-    let Some(hash) = all.get_mut(&(context as usize)) else {
-        return 0;
-    };
-    hash.update(input);
+    let context = context.cast::<C>();
+    let mut state = unsafe { context.read_unaligned() };
+    absorb(&mut state, input);
+    unsafe { context.write_unaligned(state) };
     1
 }
 
-unsafe fn final_(output: *mut u8, context: *mut c_void) -> i32 {
+unsafe fn final_<const BLOCK: usize, C: DigestContext<BLOCK>>(
+    output: *mut u8,
+    context: *mut c_void,
+    digest_length: usize,
+) -> i32 {
     if output.is_null() || context.is_null() {
         return 0;
     }
-    let Some(hash) = contexts()
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .remove(&(context as usize))
-    else {
-        return 0;
-    };
-    let result = hash.finish();
-    unsafe { std::ptr::copy_nonoverlapping(result.as_ptr(), output, result.len()) };
+    let state = unsafe { context.cast::<C>().read_unaligned() };
+    finish(state, unsafe {
+        std::slice::from_raw_parts_mut(output, digest_length)
+    });
     1
 }
 
 macro_rules! digest_api {
-    ($i:ident,$u:ident,$f:ident,$one:ident,$variant:ident,$ty:ty) => {
+    ($i:ident, $u:ident, $f:ident, $one:ident, $context:ty, $initial:expr, $length:expr) => {
         unsafe extern "C" fn $i(context: *mut c_void) -> i32 {
-            unsafe { init(context, Context::$variant(<$ty>::new())) }
+            unsafe { init::<$context>(context, $initial) }
         }
         unsafe extern "C" fn $u(context: *mut c_void, input: *const c_void, len: u32) -> i32 {
-            unsafe { update(context, input, len) }
+            unsafe { update::<_, $context>(context, input, len) }
         }
         unsafe extern "C" fn $f(output: *mut u8, context: *mut c_void) -> i32 {
-            unsafe { final_(output, context) }
+            unsafe { final_::<_, $context>(output, context, $length) }
         }
         unsafe extern "C" fn $one(input: *const c_void, len: u32, output: *mut u8) -> *mut u8 {
-            if output.is_null() || (input.is_null() && len != 0) {
+            let Some(input) = (unsafe { guest_input(input, len) }) else {
+                return std::ptr::null_mut();
+            };
+            if output.is_null() {
                 return std::ptr::null_mut();
             }
-            let input = if len == 0 {
-                &[]
-            } else {
-                unsafe { std::slice::from_raw_parts(input.cast(), len as usize) }
-            };
-            let result = <$ty>::digest(input);
-            unsafe { std::ptr::copy_nonoverlapping(result.as_ptr(), output, result.len()) };
+            let mut context: $context = $initial;
+            absorb(&mut context, input);
+            finish(context, unsafe {
+                std::slice::from_raw_parts_mut(output, $length)
+            });
             output
         }
     };
 }
-digest_api!(md5_init, md5_update, md5_final, md5, Md5, Md5);
-digest_api!(sha1_init, sha1_update, sha1_final, sha1, Sha1, Sha1);
+digest_api!(
+    md5_init,
+    md5_update,
+    md5_final,
+    md5,
+    Md5Context,
+    Md5Context::new(),
+    CC_MD5_DIGEST_LENGTH
+);
+digest_api!(
+    sha1_init,
+    sha1_update,
+    sha1_final,
+    sha1,
+    Sha1Context,
+    Sha1Context::new(),
+    CC_SHA1_DIGEST_LENGTH
+);
 digest_api!(
     sha224_init,
     sha224_update,
     sha224_final,
     sha224,
-    Sha224,
-    Sha224
+    Sha256Context,
+    Sha256Context::new(SHA224_INITIAL_STATE),
+    CC_SHA224_DIGEST_LENGTH
+);
+digest_api!(
+    sha256_init,
+    sha256_update,
+    sha256_final,
+    sha256,
+    Sha256Context,
+    Sha256Context::new(SHA256_INITIAL_STATE),
+    CC_SHA256_DIGEST_LENGTH
+);
+digest_api!(
+    sha384_init,
+    sha384_update,
+    sha384_final,
+    sha384,
+    Sha512Context,
+    Sha512Context::new(SHA384_INITIAL_STATE),
+    CC_SHA384_DIGEST_LENGTH
+);
+digest_api!(
+    sha512_init,
+    sha512_update,
+    sha512_final,
+    sha512,
+    Sha512Context,
+    Sha512Context::new(SHA512_INITIAL_STATE),
+    CC_SHA512_DIGEST_LENGTH
 );
 
 /// `CCRandomGenerateBytes`: fill the supplied buffer from the OS CSPRNG.
@@ -702,30 +1014,6 @@ unsafe extern "C" fn crypt(
     }
     status
 }
-digest_api!(
-    sha256_init,
-    sha256_update,
-    sha256_final,
-    sha256,
-    Sha256,
-    Sha256
-);
-digest_api!(
-    sha384_init,
-    sha384_update,
-    sha384_final,
-    sha384,
-    Sha384,
-    Sha384
-);
-digest_api!(
-    sha512_init,
-    sha512_update,
-    sha512_final,
-    sha512,
-    Sha512,
-    Sha512
-);
 exports::exports! {
     functions {
         "CC_MD5_Init"=>md5_init,
@@ -805,6 +1093,170 @@ mod tests {
             ]
         );
     }
+
+    type Init = unsafe extern "C" fn(*mut c_void) -> i32;
+    type Update = unsafe extern "C" fn(*mut c_void, *const c_void, u32) -> i32;
+    type Final = unsafe extern "C" fn(*mut u8, *mut c_void) -> i32;
+    type OneShot = unsafe extern "C" fn(*const c_void, u32, *mut u8) -> *mut u8;
+
+    struct Algorithm {
+        init: Init,
+        update: Update,
+        final_: Final,
+        one_shot: OneShot,
+        reference: fn(&[u8]) -> Vec<u8>,
+        context_size: usize,
+        digest_length: usize,
+    }
+
+    fn reference<D: sha2::Digest>(input: &[u8]) -> Vec<u8> {
+        D::digest(input).to_vec()
+    }
+
+    fn algorithms() -> [Algorithm; 6] {
+        [
+            Algorithm {
+                init: md5_init,
+                update: md5_update,
+                final_: md5_final,
+                one_shot: md5,
+                reference: reference::<md5::Md5>,
+                context_size: size_of::<Md5Context>(),
+                digest_length: CC_MD5_DIGEST_LENGTH,
+            },
+            Algorithm {
+                init: sha1_init,
+                update: sha1_update,
+                final_: sha1_final,
+                one_shot: sha1,
+                reference: reference::<sha1::Sha1>,
+                context_size: size_of::<Sha1Context>(),
+                digest_length: CC_SHA1_DIGEST_LENGTH,
+            },
+            Algorithm {
+                init: sha224_init,
+                update: sha224_update,
+                final_: sha224_final,
+                one_shot: sha224,
+                reference: reference::<sha2::Sha224>,
+                context_size: size_of::<Sha256Context>(),
+                digest_length: CC_SHA224_DIGEST_LENGTH,
+            },
+            Algorithm {
+                init: sha256_init,
+                update: sha256_update,
+                final_: sha256_final,
+                one_shot: sha256,
+                reference: reference::<sha2::Sha256>,
+                context_size: size_of::<Sha256Context>(),
+                digest_length: CC_SHA256_DIGEST_LENGTH,
+            },
+            Algorithm {
+                init: sha384_init,
+                update: sha384_update,
+                final_: sha384_final,
+                one_shot: sha384,
+                reference: reference::<sha2::Sha384>,
+                context_size: size_of::<Sha512Context>(),
+                digest_length: CC_SHA384_DIGEST_LENGTH,
+            },
+            Algorithm {
+                init: sha512_init,
+                update: sha512_update,
+                final_: sha512_final,
+                one_shot: sha512,
+                reference: reference::<sha2::Sha512>,
+                context_size: size_of::<Sha512Context>(),
+                digest_length: CC_SHA512_DIGEST_LENGTH,
+            },
+        ]
+    }
+
+    impl Algorithm {
+        fn feed(&self, context: &mut [u8], input: &[u8]) {
+            let len = input.len() as u32;
+            assert_eq!(
+                unsafe { (self.update)(context.as_mut_ptr().cast(), input.as_ptr().cast(), len) },
+                1
+            );
+        }
+
+        fn finish(&self, context: &mut [u8]) -> Vec<u8> {
+            let mut output = vec![0; self.digest_length];
+            assert_eq!(
+                unsafe { (self.final_)(output.as_mut_ptr(), context.as_mut_ptr().cast()) },
+                1
+            );
+            output
+        }
+
+        fn streamed(&self, chunks: &[&[u8]]) -> Vec<u8> {
+            let mut context = vec![0; self.context_size];
+            assert_eq!(unsafe { (self.init)(context.as_mut_ptr().cast()) }, 1);
+            for chunk in chunks {
+                self.feed(&mut context, chunk);
+            }
+            self.finish(&mut context)
+        }
+    }
+
+    #[test]
+    fn digest_contexts_have_common_digest_sizes() {
+        assert_eq!(size_of::<Md5Context>(), 92);
+        assert_eq!(size_of::<Sha1Context>(), 96);
+        assert_eq!(size_of::<Sha256Context>(), 104);
+        assert_eq!(size_of::<Sha512Context>(), 208);
+    }
+
+    #[test]
+    fn digests_match_reference_across_block_boundaries() {
+        let message: Vec<u8> = (0..=u8::MAX).cycle().take(300).collect();
+        for algorithm in algorithms() {
+            for len in [0, 1, 55, 56, 63, 64, 65, 111, 112, 127, 128, 129, 300] {
+                let input = &message[..len];
+                let expected = (algorithm.reference)(input);
+                let mut one_shot = vec![0; algorithm.digest_length];
+                unsafe {
+                    (algorithm.one_shot)(input.as_ptr().cast(), len as u32, one_shot.as_mut_ptr());
+                }
+                assert_eq!(one_shot, expected, "one-shot, {len} bytes");
+                assert_eq!(algorithm.streamed(&[input]), expected, "{len} bytes");
+                for split in [1, 7, 63, 64, 65, 127, 128]
+                    .into_iter()
+                    .filter(|&s| s < len)
+                {
+                    let (head, tail) = input.split_at(split);
+                    assert_eq!(
+                        algorithm.streamed(&[head, &[], tail]),
+                        expected,
+                        "{len} bytes split at {split}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_copied_digest_context_finishes_independently() {
+        let prefix: Vec<u8> = (0..100).collect();
+        for algorithm in algorithms() {
+            let mut original = vec![0; algorithm.context_size];
+            assert_eq!(unsafe { (algorithm.init)(original.as_mut_ptr().cast()) }, 1);
+            algorithm.feed(&mut original, &prefix);
+            let mut copy = original.clone();
+            algorithm.feed(&mut original, b"left");
+            algorithm.feed(&mut copy, b"right side");
+            assert_eq!(
+                algorithm.finish(&mut copy),
+                (algorithm.reference)(&[&prefix[..], b"right side"].concat())
+            );
+            assert_eq!(
+                algorithm.finish(&mut original),
+                (algorithm.reference)(&[&prefix[..], b"left"].concat())
+            );
+        }
+    }
+
     #[test]
     fn one_shot_returns_output_argument() {
         let mut out = [0u8; 20];
