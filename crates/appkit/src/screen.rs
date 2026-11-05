@@ -1430,11 +1430,11 @@ mod tests {
 /// No event is posted, but the jump is not lost either: the next motion event's
 /// deltas include it (see `event::note_warp_delta`).
 ///
-/// SDL treats an in-window warp during relative mode as virtual, so the first
-/// warp to a target momentarily releases relative mode and moves the physical
-/// desktop cursor, as CoreGraphics promises. Repeated warps to that same target
-/// only refresh SDL's virtual position: the physical cursor is already there,
-/// and toggling relative mode every frame would flush real camera motion.
+/// SDL treats an in-window warp during relative mode as virtual, so a window
+/// in relative mode gets two: SDL's position, which its deltas advance and
+/// which it exposes when the mode ends, and the physical pointer, which
+/// [`warp_physical`] moves as CoreGraphics promises. Repeated warps to one
+/// target only refresh SDL's position: the physical pointer is already there.
 /// `kCGErrorSuccess` is `0`.
 #[allow(non_snake_case)]
 pub unsafe extern "C" fn CGWarpMouseCursorPosition(point: foundation::geometry::NSPoint) -> i32 {
@@ -1475,44 +1475,30 @@ pub unsafe extern "C" fn CGWarpMouseCursorPosition(point: foundation::geometry::
         .collect();
     if relative.is_empty() {
         forget_relative_warp();
-        crate::event::expect_warp_echo(from, local);
-        warp_physical(target, point, local);
-        return 0;
-    }
-    if known_relative_warp() == Some(point) {
-        // Relative deltas advance SDL's virtual absolute position. Refresh it
-        // even when the physical cursor needs no second warp, or SDL exposes
-        // the accumulated drag when relative mode ends.
-        for window in relative {
-            let origin = crate::window::global_position(window).unwrap_or((0, 0));
-            let local = local_warp_point(point, origin);
-            sdl3::video::warp_mouse_in_window(window, local.0, local.1);
-            // SDL only changes its virtual position for repeated relative
-            // warps. If the physical pointer has drifted or another API
-            // replaced the X11 barriers, repair that without changing the
-            // relative input stream or generating an artificial camera delta.
-            lock_relative_pointer(window, local);
+        if warp_physical(target, point, local) {
+            crate::event::expect_warp_echo(from, local);
         }
         return 0;
     }
-
-    crate::event::expect_warp_echo(from, local);
-    let mut released = true;
+    // A relative-mode window reports deltas, never the warp: no echo.
+    let repeated = known_relative_warp() == Some(point);
     for window in &relative {
-        // A visible relative cursor on X11 is confined at the last guest warp.
-        // Lift the barrier before relocating it; otherwise it may stay outside
-        // the new one-pixel rectangle and be free to move indefinitely.
-        clear_relative_pointer_lock(*window);
-        released &= sdl3::video::set_relative_mouse_mode(*window, false);
-    }
-    let warped = warp_physical(target, point, local);
-    for window in relative {
-        if sdl3::video::set_relative_mouse_mode(window, true) && warped {
-            let origin = crate::window::global_position(window).unwrap_or((0, 0));
-            lock_relative_pointer(window, local_warp_point(point, origin));
+        let origin = crate::window::global_position(*window).unwrap_or((0, 0));
+        let local = local_warp_point(point, origin);
+        sdl3::video::warp_mouse_in_window(*window, local.0, local.1);
+        if !repeated {
+            // An X11 barrier still holds the old point, and blocks crossing
+            // only from inside: lifted first, or the pointer moves freely.
+            clear_relative_pointer_lock(*window);
         }
     }
-    match released && warped {
+    let warped = repeated || warp_physical(target, point, local);
+    for window in relative {
+        // Also repairs a pointer that drifted from a repeated target.
+        let origin = crate::window::global_position(window).unwrap_or((0, 0));
+        lock_relative_pointer(window, local_warp_point(point, origin));
+    }
+    match warped {
         true => remember_relative_warp(point),
         false => forget_relative_warp(),
     }
@@ -1539,13 +1525,18 @@ pub unsafe extern "C" fn CGSetLocalEventsSuppressionInterval(seconds: f64) -> i3
 }
 
 /// Move the physical cursor to a desktop point, `local` being the same point
-/// in `window`'s coordinates.
+/// in `window`'s coordinates. True when it moved, and the window system will
+/// report the move as motion.
 ///
 /// On Wayland the desktop is this runtime's own (see
-/// `window::global_position`) and SDL would measure a global warp from its
-/// placeholder window origin, so the warp goes through the window instead.
+/// `window::global_position`), and only a pointer over one of the client's
+/// surfaces can be moved: [`sdl3::pointer::warp`].
 fn warp_physical(window: Option<sdl3::Window>, global: (f32, f32), local: (f32, f32)) -> bool {
-    if !sdl3::video::is_wayland() && sdl3::video::warp_mouse_global(global.0, global.1) {
+    if sdl3::video::is_wayland() {
+        return window
+            .is_some_and(|window| sdl3::pointer::warp(window, local.0, local.1).is_some());
+    }
+    if sdl3::video::warp_mouse_global(global.0, global.1) {
         return true;
     }
     window.is_some_and(|window| sdl3::video::warp_mouse_in_window(window, local.0, local.1))
@@ -1683,10 +1674,11 @@ pub(crate) fn end_recentring_if_idle(from: (f32, f32)) -> bool {
     // Before relative mode ends, or SDL exposes the position it integrated.
     sdl3::video::warp_mouse_in_window(window, local.0, local.1);
     sdl3::video::set_relative_mouse_mode(window, false);
-    crate::event::expect_warp_echo(from, local);
     let origin = crate::window::global_position(window).unwrap_or((0, 0));
     let global = (local.0 + origin.0 as f32, local.1 + origin.1 as f32);
-    warp_physical(Some(window), global, local);
+    if warp_physical(Some(window), global, local) {
+        crate::event::expect_warp_echo(from, local);
+    }
     true
 }
 
@@ -1842,16 +1834,13 @@ pub(crate) fn hold_at_edge(id: u32, x: f32, y: f32, dx: f32, dy: f32) {
         (true, true) => *hold = Some(next),
         (true, false) => {
             *hold = None;
-            // The in-window warp is the lock's position hint on Wayland, where
-            // the physical cursor then reappears; elsewhere the host cursor
-            // kept moving under the grab and has to be brought back.
+            // The pointer stayed at the edge, or on X11 kept moving under the
+            // grab, while SDL's position followed the deltas: bring it back.
             sdl3::video::warp_mouse_in_window(sdl, x, y);
             sdl3::video::set_relative_mouse_mode(sdl, false);
-            if !sdl3::video::is_wayland() {
-                let origin = crate::window::global_position(sdl).unwrap_or((0, 0));
-                let global = (x + origin.0 as f32, y + origin.1 as f32);
-                warp_physical(Some(sdl), global, (x, y));
-            }
+            let origin = crate::window::global_position(sdl).unwrap_or((0, 0));
+            let global = (x + origin.0 as f32, y + origin.1 as f32);
+            warp_physical(Some(sdl), global, (x, y));
         }
         (false, false) => *hold = None,
     }
@@ -1898,12 +1887,18 @@ fn end_edge_hold() {
     }
 }
 
-/// When the guest disassociates its pointer from the cursor, SDL's X11
-/// relative mode delivers raw deltas but only *hides* the physical cursor by
-/// default. We explicitly leave the cursor visible (as macOS does), so without
-/// an additional constraint it can travel across the window while the guest
-/// sees it frozen. A one-point SDL mouse rectangle restricts physical motion
-/// without interfering with XI2 raw motion.
+/// When the guest disassociates its pointer from the cursor, the visible host
+/// pointer has to stay at the guest's frozen point.
+///
+/// SDL's X11 relative mode delivers raw deltas but only *hides* the physical
+/// cursor by default. We explicitly leave the cursor visible (as macOS does),
+/// so without an additional constraint it can travel across the window while
+/// the guest sees it frozen. A one-point SDL mouse rectangle restricts
+/// physical motion without interfering with XI2 raw motion.
+///
+/// A Wayland lock holds the pointer still, but wherever it was when the lock
+/// took hold - which for a pointer that was off the window is wherever it
+/// came back on. There it is pinned to the point instead.
 // Keep any confinement the application already requested through AppKit's
 // `-setMouseConfinementRect:` or the optional ROSEMARY_CONFINE_POINTER path.
 // Relative-mode confinement is temporary and must restore the previous rect.
@@ -1913,10 +1908,17 @@ static PREVIOUS_MOUSE_RECTS: std::sync::Mutex<Vec<(usize, Option<sdl3::Rect>)>> 
 fn lock_relative_pointer(window: sdl3::Window, point: (f32, f32)) {
     // Recentring and edge holds also use relative mode while associated, and
     // the paths that end them never lift a lock: only disassociation gets one.
-    if !sdl3::video::is_x11()
-        || mouse_is_associated()
+    if mouse_is_associated()
         || sdl3::video::window_flags(window) & sdl3::video::flags::INPUT_FOCUS == 0
     {
+        return;
+    }
+    if sdl3::video::is_wayland() {
+        sdl3::pointer::pin(window, Some(point));
+        sdl3::pointer::warp(window, point.0, point.1);
+        return;
+    }
+    if !sdl3::video::is_x11() {
         return;
     }
     // XFixes barriers only block crossing their edges from inside. Enabling
@@ -1974,13 +1976,13 @@ fn lock_relative_pointer(window: sdl3::Window, point: (f32, f32)) {
     }
 }
 
-/// Keep the visible host cursor at the guest's fixed point while XI2 delivers
-/// raw mouse deltas. Explicit host warps and window transitions can place the
-/// physical pointer outside an active XFixes region; barriers do not pull it
-/// back in, so correct that on the next actual mouse motion, not only if the
-/// guest subsequently calls CGWarpMouseCursorPosition again.
+/// Keep the visible host cursor at the guest's fixed point while relative
+/// mode delivers deltas. Explicit host warps and window transitions can place
+/// the physical pointer outside an active XFixes region, which does not pull
+/// it back in, or move the window under a Wayland lock; correct that then,
+/// not only if the guest calls CGWarpMouseCursorPosition again.
 pub(crate) fn refresh_relative_pointer(window_id: u32) {
-    if !sdl3::video::is_x11() || mouse_is_associated() {
+    if mouse_is_associated() {
         return;
     }
     let Some(window) = crate::window::sdl_windows().into_iter().find(|window| {
@@ -2020,6 +2022,7 @@ fn lock_at_frozen_pointer(window: sdl3::Window) {
 }
 
 fn clear_relative_pointer_lock(window: sdl3::Window) {
+    sdl3::pointer::pin(window, None);
     let original = {
         let mut previous = PREVIOUS_MOUSE_RECTS
             .lock()
@@ -2050,7 +2053,7 @@ pub(crate) fn set_pointer_confinement(window: sdl3::Window, rect: Option<sdl3::R
     sdl3::video::set_mouse_rect(window, rect);
 }
 
-/// Drop a destroyed window's saved rectangle without touching SDL. Its focus
+/// Drop a destroyed window's saved rectangle and pin without touching SDL. Its focus
 /// and close events arrive once the window has left [`crate::window::sdl_windows`],
 /// so [`release_relative_pointer`] cannot find it, and SDL reuses the address.
 pub(crate) fn forget_relative_pointer(window: sdl3::Window) {
@@ -2058,12 +2061,10 @@ pub(crate) fn forget_relative_pointer(window: sdl3::Window) {
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .retain(|(id, _)| *id != window as usize);
+    sdl3::pointer::forget(window);
 }
 
 pub(crate) fn release_relative_pointer(window_id: u32) {
-    if !sdl3::video::is_x11() {
-        return;
-    }
     if let Some(window) = crate::window::sdl_windows()
         .into_iter()
         .find(|window| sdl3::video::window_id(*window) == window_id)
