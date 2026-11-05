@@ -255,6 +255,26 @@ fn run(wake_read: c_int, owner: u32) {
 ///
 /// `listener` is a listening socket.
 unsafe fn accept(listener: c_int) -> Option<c_int> {
+    loop {
+        // SAFETY: the caller's listener.
+        let fd = unsafe { accept_any(listener) }?;
+        // A claim from another user would hold off no-senders forever.
+        #[cfg(target_os = "linux")]
+        if !peer_is_this_user(fd) {
+            // SAFETY: the descriptor just accepted, never handed on.
+            unsafe { libc::close(fd) };
+            continue;
+        }
+        return Some(fd);
+    }
+}
+
+/// Accept one pending connection from anyone without waiting.
+///
+/// # Safety
+///
+/// `listener` is a listening socket.
+unsafe fn accept_any(listener: c_int) -> Option<c_int> {
     #[cfg(not(target_os = "macos"))]
     // SAFETY: the caller's listener; null address pointers are allowed.
     let fd = unsafe {
@@ -279,6 +299,25 @@ unsafe fn accept(listener: c_int) -> Option<c_int> {
         libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
     }
     Some(fd)
+}
+
+/// Whether the process that connected `fd` runs as this user.
+#[cfg(target_os = "linux")]
+fn peer_is_this_user(fd: c_int) -> bool {
+    // SAFETY: `ucred` is plain integers.
+    let mut credentials: libc::ucred = unsafe { core::mem::zeroed() };
+    let mut len = core::mem::size_of::<libc::ucred>() as libc::socklen_t;
+    // SAFETY: a `ucred` out-parameter of the length given.
+    let rc = unsafe {
+        libc::getsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_PEERCRED,
+            (&raw mut credentials).cast(),
+            &mut len,
+        )
+    };
+    rc == 0 && super::wire::same_user(credentials.uid)
 }
 
 /// Whether the holder end of a claim has gone. Nothing is ever written to a
