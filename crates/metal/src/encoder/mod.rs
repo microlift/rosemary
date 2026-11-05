@@ -3,6 +3,7 @@ mod blit;
 mod command_buffer;
 mod compute;
 mod depth_bias;
+mod hazards;
 mod parallel;
 mod pass;
 mod queue;
@@ -16,6 +17,7 @@ use blit::*;
 use command_buffer::*;
 use compute::*;
 use depth_bias::*;
+use hazards::*;
 use parallel::*;
 use pass::*;
 use queue::*;
@@ -288,6 +290,9 @@ pub(crate) struct CommandBuffer {
     /// `ROSEMARY_METAL_PROFILE`: shared with its parallel sub-encoders.
     profile: Option<Arc<crate::profile::Profile>>,
     occlusion: Occlusion,
+    /// What render passes since the last full barrier touched, which later
+    /// work waits for only where it conflicts.
+    hazards: Hazards,
 }
 
 pub(crate) struct Encoder {
@@ -311,6 +316,10 @@ pub(crate) struct Encoder {
     depth_clip: u64,
     depth_bias: RecordedDepthBias,
     in_render_pass: bool,
+    /// A render pass whose Vulkan pass begins at its first draw and is
+    /// ordered against earlier passes by what it touches; `None` for every
+    /// other encoder, which is ordered by full barriers.
+    lazy: Option<LazyPass>,
     /// Whether this is a parallel render sub-encoder, which records into a
     /// secondary command buffer inside a pass its parallel encoder began.
     sub_encoder: bool,
@@ -336,12 +345,12 @@ pub(crate) struct Encoder {
     /// which chose it, so a run of draws with one state asks no cache.
     render_variant: Option<(Id, RenderVariantKey, vk::Pipeline)>,
     compute_variant: Option<(Id, [u32; 3], vk::Pipeline)>,
-    /// A render encoder's attachment images, which its closing barrier names
-    /// when they are all it wrote.
+    /// A render encoder's attachment images, all of them written.
     attachments: Vec<(vk::Image, vk::ImageAspectFlags)>,
-    /// Whether this encoder wrote anything but its attachments: a resource a
-    /// shader writes, a resolve copy, query results. Its closing barrier then
-    /// covers all memory.
+    /// Whether this encoder may write anything but its attachments: a
+    /// resource a shader writes, a resolve copy, query results, an attachment
+    /// whose memory another resource can share. It then waits for every
+    /// earlier pass and ends with a barrier over all memory.
     writes_elsewhere: bool,
     /// Index by `bind_point_slot`.
     bound: [BindPoint; 2],
@@ -786,17 +795,17 @@ pub(crate) fn install() {
         "setColorStoreAction:atIndex:" => crate::no_op, c"v32@0:8Q16Q24";
         "setDepthStoreAction:" => crate::no_op, c"v24@0:8Q16";
         "setStencilStoreAction:" => crate::no_op, c"v24@0:8Q16";
-        // One Vulkan queue runs every encoder in order behind a full barrier,
-        // which is everything a fence could ask for.
+        // A pass which updates a fence is ordered against later passes by
+        // what it writes; one which waits for a fence waits for them all.
         "updateFence:afterStages:" => crate::no_op, c"v32@0:8@16Q24";
-        "waitForFence:beforeStages:" => crate::no_op, c"v32@0:8@16Q24";
+        "waitForFence:beforeStages:" => order_after_earlier_passes, c"v32@0:8@16Q24";
         "memoryBarrierWithScope:" => memory_barrier, c"v24@0:8Q16";
         "memoryBarrierWithScope:afterStages:beforeStages:" => memory_barrier, c"v40@0:8Q16Q24Q32";
         "memoryBarrierWithResources:count:" => memory_barrier, c"v32@0:8^@16Q24";
         "memoryBarrierWithResources:count:afterStages:beforeStages:" => memory_barrier,
             c"v48@0:8^@16Q24Q32Q40";
-        "useResource:usage:stages:" => crate::no_op, c"v40@0:8@16Q24Q32";
-        "useHeap:" => crate::no_op, c"v24@0:8@16";
+        "useResource:usage:stages:" => order_after_earlier_passes, c"v40@0:8@16Q24Q32";
+        "useHeap:" => order_after_earlier_passes, c"v24@0:8@16";
         "setStencilFrontReferenceValue:backReferenceValue:" => set_stencil_references,
             c"v24@0:8I16I20";
         "copyFromTexture:sourceSlice:sourceLevel:sourceOrigin:sourceSize:toTexture:destinationSlice:destinationLevel:destinationOrigin:"
@@ -811,12 +820,12 @@ pub(crate) fn install() {
         "optimizeContentsForCPUAccess:" => crate::no_op, c"v24@0:8@16";
         "optimizeContentsForCPUAccess:slice:level:" => crate::no_op, c"v40@0:8@16Q24Q32";
         "updateFence:" => crate::no_op, c"v24@0:8@16";
-        "waitForFence:" => crate::no_op, c"v24@0:8@16";
+        "waitForFence:" => order_after_earlier_passes, c"v24@0:8@16";
         "pushDebugGroup:" => crate::no_op, c"v24@0:8@16";
         "popDebugGroup" => crate::no_op, c"v16@0:8";
         "insertDebugSignpost:" => crate::no_op, c"v24@0:8@16";
         "setLabel:" => crate::no_op, c"v24@0:8@16";
-        "useResource:usage:" => crate::no_op, c"v32@0:8@16Q24";
+        "useResource:usage:" => order_after_earlier_passes, c"v32@0:8@16Q24";
         "setVisibilityResultMode:offset:" => set_visibility_result_mode, c"v32@0:8Q16Q24";
     });
 

@@ -706,11 +706,15 @@ pub(crate) fn begin_render_pass(
         encoder
             .attachments
             .push((image.image, gpu::aspect_of(image.format)));
+        // Memory another resource may share is not ordered by its image.
+        encoder.writes_elsewhere |= hazards::tracked_image(texture).is_none();
         command.retain(texture);
     }
-    // Sub-encoders record into command buffers of their own, and query
-    // results land in a buffer: both reach memory other than the attachments.
-    encoder.writes_elsewhere |= secondary || !descriptor.visibility_result_buffer.is_null();
+    // Sub-encoders record into command buffers of their own, query results
+    // land in a buffer, and a resolve copy writes through a transfer: each
+    // reaches memory other than through the attachments.
+    encoder.writes_elsewhere |=
+        secondary || !descriptor.visibility_result_buffer.is_null() || !copies.is_empty();
     encoder.visibility = VisibilityTarget::of(descriptor);
     command.retain(descriptor.visibility_result_buffer);
     command.framebuffers.push(framebuffer);
@@ -720,6 +724,42 @@ pub(crate) fn begin_render_pass(
     };
     trace_pass(&key, width, height);
     encoder.capture_pass = crate::capture::claim();
+    encoder.resolve_mask = resolve_mask;
+    encoder.depth_resolve = key.depth_resolve;
+    encoder.in_render_pass = true;
+    // Queries and captures run in the pass as it is begun, and a parallel
+    // pass's sub-encoders inherit it, so those begin now, behind every pass
+    // before them. Every other pass begins at its first draw.
+    if !secondary && encoder.visibility.is_none() && encoder.capture_pass.is_none() {
+        record_pass_defaults(
+            &gpu.device,
+            command.command_buffer,
+            area,
+            &mut encoder.depth_bias,
+        );
+        let is_clear = |op: vk::AttachmentLoadOp| op == vk::AttachmentLoadOp::CLEAR;
+        let works_undrawn = key.colors.iter().any(|color| is_clear(color.1))
+            || key.depth.is_some_and(|depth| is_clear(depth.1))
+            || key.stencil.is_some_and(|stencil| is_clear(stencil.0))
+            || resolve_mask != 0
+            || key.depth_resolve.is_some()
+            || !copies.is_empty();
+        encoder.lazy = Some(LazyPass {
+            key,
+            pass,
+            framebuffer,
+            area,
+            clears,
+            begun: false,
+            works_undrawn,
+            reads: Vec::new(),
+            read_hazard: false,
+        });
+        encoder.pending_copies = copies;
+        encoder.capture_targets = capture_targets;
+        return;
+    }
+    command.flush_hazards();
     if let Some(pass) = encoder.capture_pass {
         for target in &capture_targets {
             if let Some(capture) =
@@ -755,9 +795,6 @@ pub(crate) fn begin_render_pass(
         );
     }
     gpu::milestone("render pass");
-    encoder.in_render_pass = true;
-    encoder.resolve_mask = resolve_mask;
-    encoder.depth_resolve = key.depth_resolve;
     encoder.pending_copies = copies;
     encoder.capture_targets = capture_targets;
 }

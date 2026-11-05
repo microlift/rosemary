@@ -59,6 +59,7 @@ pub(super) unsafe extern "C" fn new_command_buffer(receiver: Id, _sel: Sel) -> I
             waits: Vec::new(),
             descriptor_pools: Vec::new(),
             written_sets: Default::default(),
+            hazards: Hazards::default(),
             retained: Vec::new(),
             retained_set: AddressSet::default(),
             uploads: Vec::new(),
@@ -310,6 +311,9 @@ pub(super) unsafe extern "C" fn commit(receiver: Id, _sel: Sel) {
     }
     command.recording = false;
     let gpu = command.gpu;
+    // Later submissions, and the presentation of what this one drew, see
+    // everything it wrote.
+    command.flush_hazards();
     if command.timestamps != vk::QueryPool::null() {
         // SAFETY: recording into this command buffer, which has not ended.
         unsafe {
@@ -533,6 +537,8 @@ fn split(
     waits: Vec<(vk::Semaphore, u64)>,
 ) {
     let gpu = command.gpu;
+    // Work on another queue waiting for the signal reads what came before.
+    command.flush_hazards();
     let allocate = vk::CommandBufferAllocateInfo::default()
         .command_pool(command.pool)
         .level(vk::CommandBufferLevel::PRIMARY)
