@@ -25,6 +25,14 @@ pub mod kind {
     pub const OTHER_MOUSE_DOWN: u64 = 25;
     pub const OTHER_MOUSE_UP: u64 = 26;
     pub const OTHER_MOUSE_DRAGGED: u64 = 27;
+    pub const MAGNIFY: u64 = 30;
+}
+
+/// `NSEventPhase` values carried by a pinch gesture.
+pub mod phase {
+    pub const BEGAN: u64 = 1 << 0;
+    pub const CHANGED: u64 = 1 << 2;
+    pub const ENDED: u64 = 1 << 3;
 }
 
 #[repr(C)]
@@ -34,6 +42,8 @@ struct Event {
     modifiers: u64,
     location: NSPoint,
     delta: NSPoint,
+    magnification: CGFloat,
+    phase: u64,
     /// The window the event is in, unretained: an event lives for one dispatch
     /// and the window that made it outlives that.
     window: Id,
@@ -97,6 +107,8 @@ reader! {
     click_count -> i64 { |e| e.clicks },
     delta_x -> CGFloat { |e| e.delta.x },
     delta_y -> CGFloat { |e| e.delta.y },
+    magnification -> CGFloat { |e| e.magnification },
+    phase -> u64 { |e| e.phase },
     characters -> Id { |e| e.characters },
     window -> Id { |e| e.window },
     is_a_repeat -> u8 { |e| e.repeat as u8 },
@@ -106,14 +118,7 @@ reader! {
     tracking_area -> Id { |e| e.tracking_area },
 }
 
-/// The scroll accessors, which a program reads on every wheel event.
-///
-/// All four describe a *trackpad*, and this runtime has none: SDL reports a
-/// wheel, which is a discrete notch from a device with no fingers on it. So the
-/// answers are the ones AppKit gives for a mouse wheel, and each of them
-/// matters to a caller - `-hasPreciseScrollingDeltas` says the deltas are lines
-/// rather than points, and the two phases say the gesture is not one AppKit is
-/// tracking, so nothing waits for an end that never comes.
+/// SDL wheel events have no momentum phase; pinch phases are stored separately.
 unsafe extern "C" fn no_phase(_receiver: Id, _sel: Sel) -> u64 {
     // `NSEventPhaseNone`.
     0
@@ -211,6 +216,8 @@ pub struct Fields {
     pub modifiers: u64,
     pub location: NSPoint,
     pub delta: NSPoint,
+    pub magnification: CGFloat,
+    pub phase: u64,
     pub window: Id,
     pub characters: Id,
     pub key_code: u16,
@@ -238,6 +245,8 @@ pub fn make(fields: Fields) -> Id {
         (*event).modifiers = fields.modifiers;
         (*event).location = fields.location;
         (*event).delta = fields.delta;
+        (*event).magnification = fields.magnification;
+        (*event).phase = fields.phase;
         (*event).window = fields.window;
         (*event).characters = objc::arc::retain(fields.characters);
         (*event).key_code = fields.key_code;
@@ -315,6 +324,8 @@ pub fn fields_of(event: Id) -> Option<Fields> {
         modifiers: e.modifiers,
         location: e.location,
         delta: e.delta,
+        magnification: e.magnification,
+        phase: e.phase,
         window: e.window,
         characters: e.characters,
         key_code: e.key_code,
@@ -566,7 +577,7 @@ pub(crate) fn install() {
         "charactersIgnoringModifiers" => characters, c"@16@0:8";
         "window" => window, c"@16@0:8";
         "isARepeat" => is_a_repeat, c"c16@0:8";
-        "phase" => no_phase, c"Q16@0:8";
+        "phase" => phase, c"Q16@0:8";
         "momentumPhase" => no_phase, c"Q16@0:8";
         "hasPreciseScrollingDeltas" => no, c"c16@0:8";
         "isDirectionInvertedFromDevice" => no, c"c16@0:8";
@@ -585,8 +596,7 @@ pub(crate) fn install() {
         "trackingArea" => tracking_area, c"@16@0:8";
         "userData" => user_data, c"^v16@0:8";
         "_eventRef" => event_ref, c"^v16@0:8";
-        // `-magnification` is the pinch gesture's, and SDL delivers no pinch.
-        "magnification" => zero_double, c"d16@0:8";
+        "magnification" => magnification, c"d16@0:8";
         "deltaZ" => zero_double, c"d16@0:8";
         "timestamp" => timestamp, c"d16@0:8";
         "copyWithZone:" => copy_with_zone, c"@24@0:8^v16";
@@ -677,5 +687,22 @@ mod tests {
         let string = foundation::string::from_str("not an event");
         // SAFETY: `-type` is `NSUInteger (id, SEL)`.
         assert_eq!(unsafe { super::kind(string, objc::sel::get("type")) }, 0);
+    }
+
+    #[test]
+    fn mouse_wheels_have_no_gesture_phase_or_magnification() {
+        crate::bootstrap();
+        let event = make(Fields {
+            kind: kind::SCROLL_WHEEL,
+            ..Fields::default()
+        });
+        // SAFETY: an event this test made, with the readers' declared signatures.
+        unsafe {
+            assert_eq!(super::phase(event, objc::sel::get("phase")), 0);
+            assert_eq!(
+                super::magnification(event, objc::sel::get("magnification")),
+                0.0
+            );
+        }
     }
 }

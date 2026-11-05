@@ -387,6 +387,7 @@ impl Dialog {
             | Event::TextEditing { window, .. }
             | Event::MouseButton { window, .. }
             | Event::MouseWheel { window, .. }
+            | Event::Pinch { window, .. }
             | Event::WindowFocus { window, .. }
             | Event::WindowState { window }
             | Event::WindowHitTest { window }
@@ -656,7 +657,8 @@ fn modal_loop(dialog: &mut Dialog) -> (usize, bool) {
             | Event::TextEditing { .. }
             | Event::MouseMotion { .. }
             | Event::MouseButton { .. }
-            | Event::MouseWheel { .. } => {}
+            | Event::MouseWheel { .. }
+            | Event::Pinch { .. } => {}
             Event::WindowClosed { .. } | Event::WindowHitTest { .. } => {}
             other => crate::event::deliver_past_modal(other),
         }
