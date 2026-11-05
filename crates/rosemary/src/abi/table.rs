@@ -466,7 +466,6 @@ pub static SIGNATURES: &[FunctionAbi] = &[
     sig!("CFBooleanGetValue", BOOL, P),
     sig!("CFDateCreate", P, P, F64),
     sig!("CFDateGetAbsoluteTime", F64, P),
-    sig!("CFAllocatorCreate", P, P, P),
     sig!("CFAllocatorGetDefault", P),
     sig!("CFAllocatorGetTypeID", U64),
     // `CFDataRef CFDataCreate(CFAllocatorRef, const UInt8 *, CFIndex)` - the
@@ -4238,6 +4237,10 @@ pub static REFUSED: &[(&str, &str)] = &[
     // rather than a callback. Refused only against the host's CoreFoundation:
     // with this tree's own, `shims::corefoundation` copies the structure out and
     // substitutes the pointers inside it, and a shim is consulted first.
+    (
+        "CFAllocatorCreate",
+        "its context structure holds guest function pointers the host would call as arm64",
+    ),
     (
         "CFRunLoopSourceCreate",
         "its context structure holds guest function pointers the host would call as arm64",

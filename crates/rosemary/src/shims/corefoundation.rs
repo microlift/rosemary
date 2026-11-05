@@ -16,6 +16,13 @@ const VERSION: usize = 0;
 /// separate argument in a register, so the ordinary path handles it.
 const TIMER_CONTEXT_WORDS: usize = 5;
 
+/// `CFAllocatorContext`: nine words, with `deallocate` the eighth.
+const ALLOCATOR_CONTEXT_WORDS: usize = 9;
+/// Where `info` sits in it.
+const ALLOCATOR_INFO: usize = 1;
+/// Where `deallocate` sits in it.
+const ALLOCATOR_DEALLOCATE: usize = 7;
+
 /// Read `words` words from `va`.
 fn read_words(symbol: &str, va: u64, words: usize, mem: &dyn GuestMemory) -> Result<Vec<u64>> {
     (0..words)
@@ -119,6 +126,30 @@ pub fn run_loop_timer_create(
     Ok(())
 }
 
+/// `CFAllocatorRef CFAllocatorCreate(CFAllocatorRef, CFAllocatorContext *)`
+///
+/// Only `info` and `deallocate` are read by this tree's CoreFoundation, which
+/// copies them; every other callback slot is guest code it never calls, so
+/// it is passed as null rather than as an address the host cannot run.
+pub fn allocator_create(
+    symbol: &str,
+    ctx: &mut RegisterContext,
+    mem: &mut dyn GuestMemory,
+    callbacks: &dyn Callbacks,
+) -> Result<()> {
+    let context_va = ctx.rsi;
+    if context_va == 0 {
+        return forward(symbol, ctx, &[ctx.rdi, 0, 0]);
+    }
+    let words = read_words(symbol, context_va, ALLOCATOR_CONTEXT_WORDS, &*mem)?;
+    let mut host_context = [0u64; ALLOCATOR_CONTEXT_WORDS];
+    host_context[ALLOCATOR_INFO] = words[ALLOCATOR_INFO];
+    host_context[ALLOCATOR_DEALLOCATE] =
+        callbacks.substitute(symbol, words[ALLOCATOR_DEALLOCATE])?;
+    let host_context_va = host_context.as_ptr() as usize as u64;
+    forward(symbol, ctx, &[ctx.rdi, host_context_va, 0])
+}
+
 /// Call this tree's own implementation with the three integer arguments given.
 fn forward(symbol: &str, ctx: &mut RegisterContext, args: &[u64; 3]) -> Result<()> {
     let host = crate::frameworks::symbol(crate::darwin_name(symbol)).ok_or(
@@ -151,6 +182,7 @@ pub fn shim_for(name: &str) -> Option<CallbackShim> {
         return None;
     }
     match name {
+        "CFAllocatorCreate" => Some(bind!(callback "CFAllocatorCreate" => allocator_create)),
         "CFRunLoopSourceCreate" => {
             Some(bind!(callback "CFRunLoopSourceCreate" => run_loop_source_create))
         }
@@ -158,5 +190,58 @@ pub fn shim_for(name: &str) -> Option<CallbackShim> {
             Some(bind!(callback "CFRunLoopTimerCreate" => run_loop_timer_create))
         }
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct Recording(std::cell::RefCell<Vec<u64>>);
+
+    impl Callbacks for Recording {
+        fn substitute(&self, _symbol: &str, va: u64) -> Result<u64> {
+            self.0.borrow_mut().push(va);
+            Ok(va ^ 0xffff_0000)
+        }
+    }
+
+    /// Guest memory that is this process's memory.
+    struct Identity;
+
+    impl GuestMemory for Identity {
+        fn read(&self, va: u64, out: &mut [u8]) -> core::result::Result<(), machish::Error> {
+            // SAFETY: the tests only pass the address of a live local array.
+            unsafe { core::ptr::copy_nonoverlapping(va as *const u8, out.as_mut_ptr(), out.len()) };
+            Ok(())
+        }
+        fn write(&mut self, va: u64, data: &[u8]) -> core::result::Result<(), machish::Error> {
+            Err(machish::Error::OutOfBounds {
+                addr: va,
+                len: data.len(),
+            })
+        }
+    }
+
+    #[test]
+    fn allocator_create_substitutes_only_the_deallocate_callback() {
+        if !crate::frameworks::using_builtin() {
+            eprintln!("skipping: the host's CoreFoundation is in use");
+            return;
+        }
+        let mut context = [0x1_0000_0000u64; ALLOCATOR_CONTEXT_WORDS];
+        context[ALLOCATOR_INFO] = 0x1234;
+        context[ALLOCATOR_DEALLOCATE] = 0x1_0000_5678;
+        let callbacks = Recording(std::cell::RefCell::new(Vec::new()));
+        let mut ctx = RegisterContext::new();
+        ctx.rsi = context.as_ptr() as u64;
+
+        allocator_create("_CFAllocatorCreate", &mut ctx, &mut Identity, &callbacks)
+            .expect("create");
+
+        assert_eq!(*callbacks.0.borrow(), vec![0x1_0000_5678]);
+        assert_ne!(ctx.rax, 0);
+        // SAFETY: the allocator this test created.
+        unsafe { corefoundation::api::CFRelease(ctx.rax as usize as *const c_void) };
     }
 }
