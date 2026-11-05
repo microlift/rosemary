@@ -9,6 +9,9 @@ pub struct Mount {
     host: PathBuf,
     /// Whether a listing of the guest parent shows this mount.
     listed: bool,
+    /// Whether `host` is a directory rather than a single file, which has no
+    /// parent the guest can climb to through it.
+    directory: bool,
 }
 
 /// The mounts, ordered so that the first match is the longest one.
@@ -52,16 +55,19 @@ impl Table {
                 guest: "/".to_string(),
                 host: root.to_path_buf(),
                 listed: true,
+                directory: true,
             },
             Mount {
                 guest: "/dev".to_string(),
                 host: PathBuf::from("/dev"),
                 listed: true,
+                directory: true,
             },
             Mount {
                 guest: "/private/etc/resolv.conf".to_string(),
                 host: PathBuf::from("/etc/resolv.conf"),
                 listed: true,
+                directory: false,
             },
             // Unlisted, so a program that walks `/Volumes` - a backup tool, a
             // "clean up old files" pass, a recursive delete gone wrong - never
@@ -70,18 +76,21 @@ impl Table {
                 guest: "/Volumes/Host".to_string(),
                 host: PathBuf::from("/"),
                 listed: false,
+                directory: true,
             },
         ];
         mounts.extend(files.iter().map(|(guest, host)| Mount {
             guest: guest.to_string(),
             host: host.to_path_buf(),
             listed: true,
+            directory: false,
         }));
         if let Some(host_home) = host_home {
             mounts.push(Mount {
                 guest: format!("/Users/{user}"),
                 host: host_home.to_path_buf(),
                 listed: true,
+                directory: true,
             });
         }
         let mut table = Table::new(mounts);
@@ -139,11 +148,13 @@ impl Table {
             guest: "/".to_string(),
             host: root.to_path_buf(),
             listed: true,
+            directory: true,
         };
         let rest = mounts.into_iter().map(|(guest, host, listed)| Mount {
             guest: guest.to_string(),
             host,
             listed,
+            directory: true,
         });
         Table::new(std::iter::once(root).chain(rest).collect())
     }
@@ -174,16 +185,29 @@ impl Table {
     /// `None` for a relative path: it is resolved against the working
     /// directory, which is already a host directory inside the prefix, so
     /// rewriting it would apply the prefix twice.
+    ///
+    /// A `..` that climbs above the mount it is under is resolved here, in
+    /// guest space: the kernel would resolve it against the host directory
+    /// behind the mount, which is not the guest's parent.
     pub fn to_host(&self, guest: &str) -> Option<PathBuf> {
-        let normalised = normalise(guest)?;
-        let mount = self
-            .by_guest
-            .iter()
-            .find(|m| under(&normalised, &m.guest))?;
-        Some(join(
-            &mount.host,
-            &normalised[trimmed(&mount.guest).len()..],
-        ))
+        let mut normalised = normalise(guest)?;
+        loop {
+            let mount = self
+                .by_guest
+                .iter()
+                .find(|m| under(&normalised, &m.guest))?;
+            let rest = &normalised[trimmed(&mount.guest).len()..];
+            match climb_out(rest) {
+                // A file has no parent to climb to; the kernel says ENOTDIR.
+                Some(after) if mount.directory => {
+                    normalised = format!("{}{after}", trimmed(parent(&mount.guest)));
+                    if normalised.is_empty() {
+                        normalised.push('/');
+                    }
+                }
+                _ => return Some(join(&mount.host, rest)),
+            }
+        }
     }
 
     /// Every mount point but the root, as the directory listing it sits in
@@ -268,6 +292,33 @@ fn normalise(path: &str) -> Option<String> {
         true => "/".to_string(),
         false => out,
     })
+}
+
+/// What follows the first `..` in `rest` that climbs above where `rest`
+/// starts, or `None` if every `..` stays inside.
+///
+/// FIXME (ACCURACY): depth is counted lexically, so a `..` after a symlink
+/// inside the mount is judged by the link's name, not its target.
+fn climb_out(rest: &str) -> Option<&str> {
+    let mut depth = 0usize;
+    let mut at = 0;
+    for part in rest.split('/').skip(1) {
+        at += 1 + part.len();
+        match part {
+            ".." if depth == 0 => return Some(&rest[at..]),
+            ".." => depth -= 1,
+            _ => depth += 1,
+        }
+    }
+    None
+}
+
+/// The guest directory `guest` is an entry of; the root is its own parent.
+fn parent(guest: &str) -> &str {
+    match guest.rsplit_once('/') {
+        Some(("", _)) | None => "/",
+        Some((parent, _)) => parent,
+    }
 }
 
 /// Whether the normalised `path` is `root` or something inside it.
@@ -507,6 +558,43 @@ mod tests {
         );
         // The root is the directory being listed, never an entry of one.
         assert!(table.mount_points().all(|p| !p.name.is_empty()));
+    }
+
+    /// The kernel would resolve a `..` out of a mount against the host
+    /// directory behind it, so the climb out is the table's to resolve.
+    #[test]
+    fn parent_of_a_mount_point_is_the_guest_parent() {
+        let table = Table::rooted(
+            Path::new("/prefixes/default/root"),
+            "u",
+            Some(Path::new("/home/u")),
+        );
+        let root = Path::new("/prefixes/default/root");
+        for (guest, host) in [
+            ("/dev/..", root.to_path_buf()),
+            ("/dev/../etc/passwd", root.join("etc/passwd")),
+            ("/Volumes/Host/..", root.join("Volumes")),
+            ("/Volumes/Host/home/../..", root.join("Volumes")),
+            ("/Users/u/..", root.join("Users")),
+            (
+                "/Users/u/../u/Documents",
+                PathBuf::from("/home/u/Documents"),
+            ),
+            ("/..", root.to_path_buf()),
+            ("/../../usr", root.join("usr")),
+        ] {
+            assert_eq!(table.to_host(guest), Some(host), "{guest}");
+        }
+    }
+
+    /// A file mount has no parent to climb to, so the kernel's ENOTDIR stands
+    /// rather than the host file's neighbours.
+    #[test]
+    fn a_climb_out_of_a_file_mount_stays_on_the_file() {
+        assert_eq!(
+            table().to_host("/private/etc/resolv.conf/../hosts"),
+            Some(PathBuf::from("/etc/resolv.conf/../hosts"))
+        );
     }
 
     /// The escape hatch is reachable by name and nowhere else.
