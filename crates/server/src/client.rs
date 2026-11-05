@@ -39,18 +39,27 @@ pub struct Client {
 
 impl Client {
     pub fn connect(socket: &Path) -> io::Result<Client> {
-        let stream = UnixStream::connect(socket)?;
+        let client = Client::connect_patient(socket)?;
         // A server that stops answering must not hang the guest forever.
-        stream.set_read_timeout(Some(Duration::from_secs(10)))?;
-        Ok(Client { stream })
+        client
+            .stream
+            .set_read_timeout(Some(Duration::from_secs(10)))?;
+        Ok(client)
     }
 
     /// A connection with no read timeout, for a request that waits as long
     /// as another process takes to answer it.
     pub fn connect_patient(socket: &Path) -> io::Result<Client> {
-        Ok(Client {
-            stream: UnixStream::connect(socket)?,
-        })
+        let stream = UnixStream::connect(socket)?;
+        // The server can write this process's memory, so whoever listens
+        // must be this user, as the server asks the same of its clients.
+        if !is_this_user(starnix::socket::peer(&stream)) {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                format!("{} is served by another user", socket.display()),
+            ));
+        }
+        Ok(Client { stream })
     }
 
     pub fn call(&mut self, request: &Request) -> io::Result<Reply> {
@@ -59,6 +68,12 @@ impl Client {
             .ok_or_else(|| io::Error::from(io::ErrorKind::UnexpectedEof))?;
         Ok(codec::decode(&frame)?)
     }
+}
+
+/// Whether `peer` is this user; a peer the host cannot name is not.
+fn is_this_user(peer: Option<starnix::socket::Peer>) -> bool {
+    // SAFETY: `getuid` has no preconditions.
+    peer.is_some_and(|peer| peer.uid == unsafe { libc::getuid() })
 }
 
 /// Starts a server for a prefix directory. The runtime supplies this - it is
@@ -228,6 +243,9 @@ fn open(config: &Config, launch: bool) -> io::Result<Client> {
     let Some(start) = config.launch else {
         return Client::connect(&socket);
     };
+    // The server's own refusal of the directory would be lost with its
+    // stderr; checked here, the reason reaches the user.
+    location::prepare(&config.directory)?;
     start(&config.directory)?;
     let deadline = Instant::now() + STARTUP;
     let mut pause = Duration::from_millis(2);
@@ -605,5 +623,24 @@ pub fn applications(identifier: Option<&str>) -> Option<Vec<Application>> {
     })? {
         Reply::Applications(list) => Some(list),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use starnix::socket::Peer;
+
+    #[test]
+    fn a_server_run_by_another_user_is_refused() {
+        // SAFETY: `getuid` has no preconditions.
+        let me = unsafe { libc::getuid() };
+        let other = Peer {
+            pid: Some(1),
+            uid: me.wrapping_add(1),
+        };
+        assert!(!is_this_user(Some(other)));
+        assert!(!is_this_user(None));
+        assert!(is_this_user(Some(Peer { pid: None, uid: me })));
     }
 }
