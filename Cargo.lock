@@ -167,6 +167,7 @@ dependencies = [
  "foundation",
  "gamecontroller",
  "iosurface",
+ "libc",
  "objc",
  "owned_ttf_parser",
  "prefix",
