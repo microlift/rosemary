@@ -956,6 +956,94 @@ mod tests {
         }
     }
 
+    /// Copies `units` into a CFString and runs `CFStringGetBytes` over all
+    /// of it into `room` bytes: the return, `usedBufLen`, and the bytes.
+    fn get_bytes(units: &[u16], encoding: u32, loss_byte: u8, room: usize) -> (i64, i64, Vec<u8>) {
+        bootstrap();
+        let mut buffer = vec![0u8; room];
+        let mut used = 0;
+        // SAFETY: a live buffer and out-parameter sized here.
+        unsafe {
+            let s = api::CFStringCreateWithCharacters(
+                std::ptr::null(),
+                units.as_ptr(),
+                units.len() as base::CFIndex,
+            );
+            let converted = api::CFStringGetBytes(
+                s,
+                0,
+                units.len() as base::CFIndex,
+                encoding,
+                loss_byte,
+                0,
+                buffer.as_mut_ptr(),
+                room as base::CFIndex,
+                &mut used,
+            );
+            api::CFRelease(s);
+            buffer.truncate(used as usize);
+            (converted as i64, used as i64, buffer)
+        }
+    }
+
+    #[test]
+    fn utf32_bytes_count_utf16_units() {
+        let units: Vec<u16> = "a\u{1F600}b".encode_utf16().collect();
+        let (converted, used, bytes) = get_bytes(&units, string::encoding::UTF32_LE, 0, 16);
+        assert_eq!(converted, 4, "a surrogate pair is two characters");
+        assert_eq!(used, 12);
+        let scalars: Vec<u8> = [0x61u32, 0x1F600, 0x62]
+            .iter()
+            .flat_map(|c| c.to_le_bytes())
+            .collect();
+        assert_eq!(bytes, scalars);
+    }
+
+    #[test]
+    fn utf32_bytes_truncate_after_a_whole_pair() {
+        let units: Vec<u16> = "a\u{1F600}b".encode_utf16().collect();
+        let (converted, used, _) = get_bytes(&units, string::encoding::UTF32_BE, 0, 11);
+        assert_eq!((converted, used), (3, 8));
+    }
+
+    #[test]
+    fn utf32_bytes_stop_at_an_unpaired_surrogate_without_a_loss_byte() {
+        let units = [u16::from(b'a'), 0xD83D, u16::from(b'b')];
+        let (converted, used, _) = get_bytes(&units, string::encoding::UTF32_LE, 0, 16);
+        assert_eq!((converted, used), (1, 4));
+    }
+
+    #[test]
+    fn utf32_bytes_write_the_loss_byte_for_an_unpaired_surrogate() {
+        let units = [u16::from(b'a'), 0xDE00, u16::from(b'b')];
+        let (converted, used, bytes) = get_bytes(&units, string::encoding::UTF32_LE, b'?', 16);
+        assert_eq!((converted, used), (3, 12));
+        assert_eq!(&bytes[4..8], &u32::from(b'?').to_le_bytes());
+    }
+
+    #[test]
+    fn a_c_string_with_a_non_bmp_character_fits_in_utf32() {
+        bootstrap();
+        let units: Vec<u16> = "a\u{1F600}b".encode_utf16().collect();
+        let mut buffer = [0 as std::ffi::c_char; 13];
+        // SAFETY: a live buffer sized here.
+        unsafe {
+            let s = api::CFStringCreateWithCharacters(
+                std::ptr::null(),
+                units.as_ptr(),
+                units.len() as base::CFIndex,
+            );
+            let ok = api::CFStringGetCString(
+                s,
+                buffer.as_mut_ptr(),
+                buffer.len() as base::CFIndex,
+                string::encoding::UTF32_LE,
+            );
+            api::CFRelease(s);
+            assert_eq!(ok, 1);
+        }
+    }
+
     /// `-UTF8String` has to answer for a wide string too, where
     /// `CFStringGetCStringPtr` correctly does not.
     #[test]

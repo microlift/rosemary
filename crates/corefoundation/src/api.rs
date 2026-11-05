@@ -723,7 +723,11 @@ pub unsafe extern "C" fn CFStringGetBytes(
             let mark = external_representation != 0 && encoding == string::encoding::UTF16;
             let big_endian = encoding == string::encoding::UTF16_BE;
             let mut bytes = Vec::with_capacity((end - start) * 2 + 2 * mark as usize);
-            for unit in mark.then_some(0xFEFF_u16).iter().chain(&units[start..end]) {
+            for unit in mark
+                .then_some(BYTE_ORDER_MARK)
+                .iter()
+                .chain(&units[start..end])
+            {
                 match big_endian {
                     true => bytes.extend_from_slice(&unit.to_be_bytes()),
                     false => bytes.extend_from_slice(&unit.to_le_bytes()),
@@ -732,26 +736,20 @@ pub unsafe extern "C" fn CFStringGetBytes(
             (bytes, 2, 2 * mark as usize)
         }
         string::encoding::UTF32 | string::encoding::UTF32_BE | string::encoding::UTF32_LE => {
-            // Characters here are UTF-16 units, so a range may split a pair;
-            // the half is dropped rather than written as an invalid scalar.
-            let units = s.units();
-            if start > units.len() {
-                return 0;
-            }
-            let end = (start + length).min(units.len());
-            let mark = external_representation != 0 && encoding == string::encoding::UTF32;
-            let big_endian = encoding == string::encoding::UTF32_BE;
-            let scalars = char::decode_utf16(units[start..end].iter().copied())
-                .filter_map(Result::ok)
-                .map(u32::from);
-            let mut bytes = Vec::new();
-            for scalar in mark.then_some(0xFEFF_u32).into_iter().chain(scalars) {
-                match big_endian {
-                    true => bytes.extend_from_slice(&scalar.to_be_bytes()),
-                    false => bytes.extend_from_slice(&scalar.to_le_bytes()),
-                }
-            }
-            (bytes, 4, 4 * mark as usize)
+            // SAFETY: the caller's buffer and out-parameter, as for the others.
+            return unsafe {
+                get_bytes_utf32(
+                    &s.units(),
+                    start,
+                    length,
+                    encoding,
+                    _loss_byte,
+                    external_representation != 0,
+                    buffer,
+                    max_buffer_length,
+                    used_buffer_length,
+                )
+            };
         }
         // An encoding with no table here converts nothing, which is what a
         // caller checking the return against zero already handles.
@@ -846,6 +844,81 @@ unsafe fn get_bytes_by_character(
         unsafe { *used_buffer_length = used as CFIndex };
     }
     converted as CFIndex
+}
+
+/// U+FEFF, written first by the order-less Unicode encodings' external form.
+const BYTE_ORDER_MARK: u16 = 0xFEFF;
+
+/// `CFStringGetBytes` for the UTF-32 encodings, as Apple's
+/// `__CFStringEncodeByteStream` does it: the return counts UTF-16 units, so a
+/// surrogate pair is two characters written as one scalar. A half pair, which
+/// a range can also produce by splitting one, is written as the loss byte's
+/// value or, with no loss byte, ends the conversion.
+///
+/// # Safety
+///
+/// `buffer` is null or holds `max_buffer_length` bytes; `used_buffer_length` is
+/// null or writable.
+#[allow(clippy::too_many_arguments)]
+unsafe fn get_bytes_utf32(
+    units: &[u16],
+    start: usize,
+    length: usize,
+    encoding: u32,
+    loss_byte: u8,
+    external_representation: bool,
+    buffer: *mut u8,
+    max_buffer_length: CFIndex,
+    used_buffer_length: *mut CFIndex,
+) -> CFIndex {
+    const SCALAR_SIZE: usize = size_of::<u32>();
+    if start > units.len() {
+        return 0;
+    }
+    let end = (start + length).min(units.len());
+    let room = match buffer.is_null() {
+        true => usize::MAX,
+        false => max_buffer_length.max(0) as usize,
+    };
+    let big_endian = encoding == string::encoding::UTF32_BE;
+    let mut used = 0usize;
+    let mut write = |scalar: u32| -> bool {
+        if used + SCALAR_SIZE > room {
+            return false;
+        }
+        let bytes = match big_endian {
+            true => scalar.to_be_bytes(),
+            false => scalar.to_le_bytes(),
+        };
+        if !buffer.is_null() {
+            // SAFETY: within the `room` bytes the caller provided.
+            unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), buffer.add(used), SCALAR_SIZE) };
+        }
+        used += SCALAR_SIZE;
+        true
+    };
+    // A byte-order mark only for the order-less encoding's external form, as
+    // for UTF-16. It is not a character.
+    if external_representation && encoding == string::encoding::UTF32 {
+        write(u32::from(BYTE_ORDER_MARK));
+    }
+    let mut at = start;
+    while at < end {
+        let (scalar, span) = match char::decode_utf16(units[at..end].iter().copied()).next() {
+            Some(Ok(c)) => (u32::from(c), c.len_utf16()),
+            _ if loss_byte != 0 => (u32::from(loss_byte), 1),
+            _ => break,
+        };
+        if !write(scalar) {
+            break;
+        }
+        at += span;
+    }
+    if !used_buffer_length.is_null() {
+        // SAFETY: the caller's out-parameter.
+        unsafe { *used_buffer_length = used as CFIndex };
+    }
+    (at - start) as CFIndex
 }
 
 pub unsafe extern "C" fn CFStringCreateExternalRepresentation(
