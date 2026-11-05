@@ -2,6 +2,12 @@ use super::*;
 
 pub(crate) fn new_encoder(command_buffer: Id, kind: Kind) -> Id {
     stats::count(Counter::Encoders);
+    if kind != Kind::Render {
+        // Blits and dispatches are not tracked by what they touch, so they
+        // wait for every render pass before them.
+        // SAFETY: an encoder is only made by a command buffer of this crate's.
+        unsafe { object::body::<CommandBuffer>(command_buffer) }.flush_hazards();
+    }
     // An encoder is vended autoreleased, as Metal vends one, and reads its
     // command buffer for as long as it lives - so it holds a reference to it
     // rather than trusting the guest to outlive the encoder it made.
@@ -25,6 +31,7 @@ pub(crate) fn new_encoder(command_buffer: Id, kind: Kind) -> Id {
             depth_clip: 0,
             depth_bias: RecordedDepthBias::default(),
             in_render_pass: false,
+            lazy: None,
             sub_encoder: false,
             inheritance: None,
             resolve_mask: 0,
@@ -89,21 +96,34 @@ pub(super) unsafe extern "C" fn end_encoding(receiver: Id, _sel: Sel) {
         }
         return;
     }
+    let mut recorded = true;
     if encoder.in_render_pass {
         let command = encoder.command();
         command
             .occlusion
             .end(&command.gpu.device, command.command_buffer);
-        // SAFETY: a render pass began when the encoder was made.
-        unsafe {
-            command
-                .gpu
-                .device
-                .cmd_end_render_pass(command.command_buffer)
-        };
+        if encoder.lazy.is_some() {
+            recorded = encoder.end_lazy_pass();
+        } else {
+            // SAFETY: a render pass began when the encoder was made.
+            unsafe {
+                command
+                    .gpu
+                    .device
+                    .cmd_end_render_pass(command.command_buffer)
+            };
+        }
         encoder.in_render_pass = false;
         visibility::resolve(encoder);
-        for copy in std::mem::take(&mut encoder.pending_copies) {
+        let copies = std::mem::take(&mut encoder.pending_copies);
+        if !copies.is_empty() {
+            // The copies read what the pass just drew.
+            for &(image, aspect) in &encoder.attachments {
+                command.hazards.note_written(image, aspect);
+            }
+            command.flush_hazards();
+        }
+        for copy in copies {
             let source = vk::ImageSubresourceLayers {
                 aspect_mask: copy.aspect,
                 mip_level: copy.source_level,
@@ -137,9 +157,8 @@ pub(super) unsafe extern "C" fn end_encoding(receiver: Id, _sel: Sel) {
                 )
             };
         }
-        // Resolve copies write images through transfers; captures, buffers.
-        encoder.writes_elsewhere |=
-            !encoder.pending_copies.is_empty() || encoder.capture_pass.is_some();
+        // Captures write buffers.
+        encoder.writes_elsewhere |= encoder.capture_pass.is_some();
         let targets = std::mem::take(&mut encoder.capture_targets);
         if let Some(pass) = encoder.capture_pass.take() {
             for target in &targets {
@@ -155,7 +174,17 @@ pub(super) unsafe extern "C" fn end_encoding(receiver: Id, _sel: Sel) {
             }
         }
     }
-    encoder.barrier();
+    if encoder.lazy.is_some() && !encoder.writes_elsewhere {
+        if recorded {
+            encoder.leave_pending();
+        }
+        encoder.lazy = None;
+        return;
+    }
+    encoder.lazy = None;
+    if recorded {
+        encoder.barrier();
+    }
 }
 
 /// Whether two entries write one binding - a buffer both stages declare -
@@ -757,23 +786,17 @@ impl Encoder {
         };
     }
 
-    /// Metal orders the work of one encoder against the next; nothing here
-    /// tracks which resource a later encoder reads, so one full barrier
-    /// between encoders is what keeps the order Metal promises.
+    /// A full barrier: everything recorded before it completes, and its
+    /// writes are visible, before anything after it runs. It closes compute
+    /// and blit encoders, which are not tracked by what they touch, and
+    /// render passes which wrote more than their attachments; see
+    /// [`hazards`](super::hazards) for the passes which did not.
     ///
-    /// It is not what makes a frame slow: removing it entirely takes an app's
-    /// home page from 6.65 ms of device time a frame to 6.45 ms.
-    ///
-    /// An encoder's barriers are all of one kind - a render encoder's single
-    /// closing one, or a compute or blit encoder's full ones - so a second
-    /// with no work recorded since the first orders nothing more and is
-    /// skipped.
+    /// A second barrier with no work recorded since the first orders
+    /// nothing more and is skipped.
     pub(super) fn barrier(&self) {
         if self.barrier_is_last.replace(true) {
             return;
-        }
-        if self.kind == Kind::Render && !self.writes_elsewhere && !self.attachments.is_empty() {
-            return self.attachment_barrier();
         }
         let command = self.command();
         let memory = vk::MemoryBarrier::default()
@@ -791,56 +814,8 @@ impl Encoder {
                 &[],
             )
         };
-        #[cfg(test)]
-        TEST_RECORDED_BARRIERS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    }
-
-    /// The barrier after a render encoder whose only writes were to its
-    /// attachments. The stages are all of them, as for any encoder, so
-    /// everything before waits and everything after is held; only the memory
-    /// made visible is narrowed to those images, which is what lets the
-    /// driver skip flushing every cache for memory nothing wrote.
-    fn attachment_barrier(&self) {
-        let command = self.command();
-        let barriers: Vec<_> = self
-            .attachments
-            .iter()
-            .map(|&(image, aspect)| {
-                vk::ImageMemoryBarrier::default()
-                    .src_access_mask(
-                        vk::AccessFlags::COLOR_ATTACHMENT_WRITE
-                            | vk::AccessFlags::DEPTH_STENCIL_ATTACHMENT_WRITE,
-                    )
-                    .dst_access_mask(vk::AccessFlags::MEMORY_READ | vk::AccessFlags::MEMORY_WRITE)
-                    .old_layout(vk::ImageLayout::GENERAL)
-                    .new_layout(vk::ImageLayout::GENERAL)
-                    .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                    .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                    .image(image)
-                    .subresource_range(vk::ImageSubresourceRange {
-                        aspect_mask: aspect,
-                        base_mip_level: 0,
-                        level_count: vk::REMAINING_MIP_LEVELS,
-                        base_array_layer: 0,
-                        layer_count: vk::REMAINING_ARRAY_LAYERS,
-                    })
-            })
-            .collect();
-        // SAFETY: recording into this command buffer, outside a render pass;
-        // every attachment image lives in GENERAL.
-        unsafe {
-            command.gpu.device.cmd_pipeline_barrier(
-                command.command_buffer,
-                vk::PipelineStageFlags::ALL_COMMANDS,
-                vk::PipelineStageFlags::ALL_COMMANDS,
-                vk::DependencyFlags::empty(),
-                &[],
-                &[],
-                &barriers,
-            )
-        };
-        #[cfg(test)]
-        TEST_RECORDED_BARRIERS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        command.hazards.clear();
+        count_barrier();
     }
 
     /// Bind the pipeline variant and the resources one draw needs.
@@ -926,6 +901,7 @@ impl Encoder {
         ) {
             return None;
         }
+        self.ensure_pass();
         gpu::milestone("draw");
         stats::count(Counter::Draws);
         Some((device, vk_command))

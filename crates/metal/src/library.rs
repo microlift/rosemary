@@ -32,7 +32,9 @@ pub(super) unsafe extern "C" fn new_default_library(receiver: Id, _sel: Sel) -> 
             return std::ptr::null_mut();
         }
     };
-    retain_library(receiver, translated, Some(air), entry_modules, Some(target))
+    let library = retain_library(receiver, translated, Some(air), entry_modules, Some(target));
+    label_metallib(library, &bytes);
+    library
 }
 
 pub(super) unsafe extern "C" fn new_library_with_data(
@@ -59,7 +61,30 @@ pub(super) unsafe extern "C" fn new_library_with_data(
         Ok(result) => result,
         Err(failure) => return fail_library(error, &failure.to_string()),
     };
-    retain_library(receiver, translated, Some(air), entry_modules, Some(target))
+    let library = retain_library(receiver, translated, Some(air), entry_modules, Some(target));
+    label_metallib(library, bytes);
+    library
+}
+
+/// Name a precompiled library's entries for `ROSEMARY_METAL_PROFILE` by the
+/// hash `ROSEMARY_MSL_OUT` files the library under, since precompiled
+/// shaders tend to share one entry name.
+fn label_metallib(library: Id, bytes: &[u8]) {
+    if library.is_null() || !crate::profile::enabled() {
+        return;
+    }
+    let hash = fnv1a64(bytes);
+    if let Some(directory) = std::env::var_os("ROSEMARY_MSL_OUT") {
+        let directory = std::path::PathBuf::from(directory);
+        if std::fs::create_dir_all(&directory).is_ok() {
+            let _ = std::fs::write(directory.join(format!("air-{hash:016x}.metallib")), bytes);
+        }
+    }
+    // SAFETY: a library just made by `retain_library`.
+    let library = unsafe { object::body::<Library>(library) };
+    for (index, entry) in library.translated.entries.iter().enumerate() {
+        crate::profile::label_entry(entry, format!("air-{hash:016x}#{index}:{}", entry.name));
+    }
 }
 
 fn translate_metallib<'a>(
@@ -332,14 +357,24 @@ pub(super) unsafe extern "C" fn new_function_with_constants(
         }
         _ => None,
     };
-    object::make(
+    let function = object::make(
         c"RosemaryMTLFunction",
         Function {
             library: objc::arc::retain(receiver),
             entry,
             specialized,
         },
-    )
+    );
+    if crate::profile::enabled() && !function.is_null() {
+        // SAFETY: the function just made, whose library is alive.
+        let function = unsafe { object::body::<Function>(function) };
+        if let (Some(specialized), Some(base)) =
+            (&function.specialized, library.translated.entries.get(entry))
+        {
+            crate::profile::label_specialized(specialized, base);
+        }
+    }
+    function
 }
 
 /// `-[MTLLibrary functionNames]`: the entry points the translation produced,

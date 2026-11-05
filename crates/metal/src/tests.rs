@@ -2246,10 +2246,12 @@ fn thread_cpu_time() -> f64 {
 }
 
 /// The device time of a frame made like a game's: many short render passes,
-/// each sampling the texture the one before drew, so every pass depends on
-/// its predecessor and the barriers between encoders are what is measured.
-/// Run with `cargo test --release -p metal -- --ignored --nocapture
-/// encoder_barrier_device_cost`.
+/// measured three ways. Dependent passes each sample what the one before
+/// drew, so each waits for its predecessor. Rewriting passes draw over one of
+/// two targets in turn, sampling a texture nothing in the frame writes, so
+/// each waits only at its attachment. Independent passes each draw a target
+/// of their own and wait for nothing. Run with `cargo test --release -p metal
+/// -- --ignored --nocapture encoder_barrier_device_cost`.
 #[test]
 #[ignore = "a benchmark, not a check"]
 fn encoder_barrier_device_cost() {
@@ -2286,7 +2288,8 @@ fn encoder_barrier_device_cost() {
                 },
             )
         };
-        let targets = [target(), target()];
+        let targets: Vec<Id> = (0..PASSES).map(|_| target()).collect();
+        let source = target();
         let sampler = resource::new_sampler(gpu, &resource::SamplerDescriptor::default());
         // A triangle which covers the target.
         let corners: [f32; 12] = [
@@ -2305,63 +2308,80 @@ fn encoder_barrier_device_cost() {
             new_buffer_with_bytes(device, std::ptr::null(), uniform.as_ptr().cast(), 80, 0);
         let instances = new_buffer(device, std::ptr::null(), 16, 0);
         let queue = new_command_queue(device, std::ptr::null());
-        let passes = targets.map(|target| {
-            let pass = object::make(
-                c"MTLRenderPassDescriptor",
-                encoder::RenderPassDescriptor::default(),
-            );
-            let attachment = element_at(send(pass, "colorAttachments"), 0);
-            send_with_object(attachment, "setTexture:", target);
-            send_number(attachment, "setLoadAction:", LOAD);
-            send_number(attachment, "setStoreAction:", STORE);
-            pass
-        });
+        let passes: Vec<Id> = targets
+            .iter()
+            .map(|&target| {
+                let pass = object::make(
+                    c"MTLRenderPassDescriptor",
+                    encoder::RenderPassDescriptor::default(),
+                );
+                let attachment = element_at(send(pass, "colorAttachments"), 0);
+                send_with_object(attachment, "setTexture:", target);
+                send_number(attachment, "setLoadAction:", LOAD);
+                send_number(attachment, "setStoreAction:", STORE);
+                pass
+            })
+            .collect();
 
-        let mut times = Vec::new();
-        for _ in 0..FRAMES {
-            let pool = objc::arc::pool_push();
-            let command = send(queue, "commandBuffer");
-            for index in 0..PASSES {
-                let encoder = render_encoder(command, passes[index % 2]);
-                let (set_texture, set_texture_sel) = method::<unsafe extern "C" fn(Id, Sel, Id, u64)>(
-                    encoder,
-                    "setFragmentTexture:atIndex:",
-                );
-                let (set_sampler, set_sampler_sel) = method::<unsafe extern "C" fn(Id, Sel, Id, u64)>(
-                    encoder,
-                    "setFragmentSamplerState:atIndex:",
-                );
-                let (draw_indexed, draw_indexed_sel) =
-                    method::<unsafe extern "C" fn(Id, Sel, u64, u64, u64, Id, u64)>(
+        type Pick = fn(usize) -> (usize, Option<usize>);
+        let modes: [(&str, Pick); 3] = [
+            ("dependent", |index| (index % 2, Some((index + 1) % 2))),
+            ("rewriting", |index| (index % 2, None)),
+            ("independent", |index| (index, None)),
+        ];
+        for (mode, pick) in modes {
+            let mut times = Vec::new();
+            for _ in 0..FRAMES {
+                let pool = objc::arc::pool_push();
+                let command = send(queue, "commandBuffer");
+                for index in 0..PASSES {
+                    let (drawn, sampled) = pick(index);
+                    let sampled = sampled.map_or(source, |sampled| targets[sampled]);
+                    let encoder = render_encoder(command, passes[drawn]);
+                    let (set_texture, set_texture_sel) = method::<
+                        unsafe extern "C" fn(Id, Sel, Id, u64),
+                    >(
+                        encoder, "setFragmentTexture:atIndex:"
+                    );
+                    let (set_sampler, set_sampler_sel) =
+                        method::<unsafe extern "C" fn(Id, Sel, Id, u64)>(
+                            encoder,
+                            "setFragmentSamplerState:atIndex:",
+                        );
+                    let (draw_indexed, draw_indexed_sel) = method::<
+                        unsafe extern "C" fn(Id, Sel, u64, u64, u64, Id, u64),
+                    >(
                         encoder,
                         "drawIndexedPrimitives:indexCount:indexType:indexBuffer:indexBufferOffset:",
                     );
-                send_with_object(encoder, "setRenderPipelineState:", state);
-                set_buffer_named(encoder, "setVertexBuffer:offset:atIndex:", vertices, 0, 0);
-                set_buffer_named(encoder, "setVertexBuffer:offset:atIndex:", uniforms, 0, 1);
-                set_buffer_named(encoder, "setVertexBuffer:offset:atIndex:", instances, 0, 2);
-                set_bytes_named(encoder, "setFragmentBytes:length:atIndex:", &[0; 16], 0);
-                // What the previous pass drew.
-                set_texture(encoder, set_texture_sel, targets[(index + 1) % 2], 0);
-                set_texture(encoder, set_texture_sel, targets[(index + 1) % 2], 1);
-                set_sampler(encoder, set_sampler_sel, sampler, 0);
-                for _ in 0..DRAWS_PER_PASS {
-                    draw_indexed(encoder, draw_indexed_sel, TRIANGLES, 3, UINT16, indices, 0);
+                    send_with_object(encoder, "setRenderPipelineState:", state);
+                    set_buffer_named(encoder, "setVertexBuffer:offset:atIndex:", vertices, 0, 0);
+                    set_buffer_named(encoder, "setVertexBuffer:offset:atIndex:", uniforms, 0, 1);
+                    set_buffer_named(encoder, "setVertexBuffer:offset:atIndex:", instances, 0, 2);
+                    set_bytes_named(encoder, "setFragmentBytes:length:atIndex:", &[0; 16], 0);
+                    set_texture(encoder, set_texture_sel, sampled, 0);
+                    set_texture(encoder, set_texture_sel, sampled, 1);
+                    set_sampler(encoder, set_sampler_sel, sampler, 0);
+                    for _ in 0..DRAWS_PER_PASS {
+                        draw_indexed(encoder, draw_indexed_sel, TRIANGLES, 3, UINT16, indices, 0);
+                    }
+                    send_void(encoder, "endEncoding");
                 }
-                send_void(encoder, "endEncoding");
+                send_void(command, "commit");
+                send_void(command, "waitUntilCompleted");
+                assert_eq!(send_number_result(command, "status"), 4);
+                times.push(
+                    send_double(command, "GPUEndTime") - send_double(command, "GPUStartTime"),
+                );
+                objc::arc::pool_pop(pool);
             }
-            send_void(command, "commit");
-            send_void(command, "waitUntilCompleted");
-            assert_eq!(send_number_result(command, "status"), 4);
-            times.push(send_double(command, "GPUEndTime") - send_double(command, "GPUStartTime"));
-            objc::arc::pool_pop(pool);
+            times.sort_by(f64::total_cmp);
+            eprintln!(
+                "device time for {PASSES} {mode} passes: {:.3} ms median, {:.3} ms best",
+                times[FRAMES / 2] * 1e3,
+                times[0] * 1e3,
+            );
         }
-        times.sort_by(f64::total_cmp);
-        eprintln!(
-            "device time for {PASSES} dependent passes: {:.3} ms median, {:.3} ms best",
-            times[FRAMES / 2] * 1e3,
-            times[0] * 1e3,
-        );
     }
 }
 
@@ -2610,6 +2630,341 @@ fragment float4 mark(float4 position [[position]], device uint* out [[buffer(0)]
         assert_eq!(send_number_result(command, "status"), 4);
         let contents = object::body::<resource::Buffer>(readback).inner.contents as *const u32;
         assert_eq!(*contents, 7);
+    }
+}
+
+/// The side of the targets the hazard tests draw into.
+const HAZARD_SIZE: u64 = 4;
+const LOAD_CLEAR: u64 = 2; // MTLLoadActionClear
+const LOAD_LOAD: u64 = 1; // MTLLoadActionLoad
+const LOAD_DONT_CARE: u64 = 0; // MTLLoadActionDontCare
+/// Blue and red as `-setClearColor:` takes them, and as BGRA8 bytes.
+const BLUE: [f64; 4] = [0.0, 0.0, 1.0, 1.0];
+const RED: [f64; 4] = [1.0, 0.0, 0.0, 1.0];
+const BLUE_PIXEL: [u8; 4] = [255, 0, 0, 255];
+const RED_PIXEL: [u8; 4] = [0, 0, 255, 255];
+
+/// [`RESOURCE_DRAW_SOURCE`] covering its target with what it samples.
+struct SamplingDraw {
+    device: Id,
+    state: Id,
+    vertices: Id,
+    uniforms: Id,
+    instances: Id,
+    sampler: Id,
+    queue: Id,
+}
+
+impl SamplingDraw {
+    fn new(device: Id) -> Self {
+        let gpu = gpu_of(device).expect("a Vulkan device");
+        let corners: [f32; 12] = [
+            -1.0, -1.0, 0.0, 1.0, 3.0, -1.0, 0.0, 1.0, -1.0, 3.0, 0.0, 1.0,
+        ];
+        let mut uniform = [0f32; 20];
+        for diagonal in 0..4 {
+            uniform[diagonal * 5] = 1.0;
+        }
+        // SAFETY: a device of this crate's.
+        unsafe {
+            Self {
+                device,
+                state: resource_draw_pipeline(device),
+                vertices: new_buffer_with_bytes(
+                    device,
+                    std::ptr::null(),
+                    corners.as_ptr().cast(),
+                    48,
+                    0,
+                ),
+                uniforms: new_buffer_with_bytes(
+                    device,
+                    std::ptr::null(),
+                    uniform.as_ptr().cast(),
+                    80,
+                    0,
+                ),
+                instances: new_buffer(device, std::ptr::null(), 16, 0),
+                sampler: resource::new_sampler(gpu, &resource::SamplerDescriptor::default()),
+                queue: new_command_queue(device, std::ptr::null()),
+            }
+        }
+    }
+
+    fn target(&self) -> Id {
+        resource::new_texture(
+            gpu_of(self.device).expect("a Vulkan device"),
+            resource::TextureDescriptor {
+                texture_type: 2,
+                pixel_format: BGRA8,
+                width: HAZARD_SIZE,
+                height: HAZARD_SIZE,
+                depth: 1,
+                mipmap_level_count: 1,
+                sample_count: 1,
+                array_length: 1,
+                storage_mode: 2,
+                usage: gpu::USAGE_RENDER_TARGET | gpu::USAGE_SHADER_READ,
+            },
+        )
+    }
+
+    /// A target cleared to `color` by work which has completed.
+    fn filled(&self, color: [f64; 4]) -> Id {
+        let target = self.target();
+        // SAFETY: objects this fixture made.
+        unsafe {
+            let command = send(self.queue, "commandBuffer");
+            let pass = render_encoder(command, single_target_pass(target, LOAD_CLEAR, color));
+            send_void(pass, "endEncoding");
+            send_void(command, "commit");
+            send_void(command, "waitUntilCompleted");
+        }
+        target
+    }
+
+    /// Set up `encoder` to draw `texture`, sampled, over its whole target.
+    ///
+    /// # Safety
+    ///
+    /// `encoder` must be a render encoder of this crate's.
+    unsafe fn prepare(&self, encoder: Id, texture: Id) {
+        // SAFETY: the caller guarantees the encoder.
+        unsafe {
+            send_with_object(encoder, "setRenderPipelineState:", self.state);
+            set_buffer_named(
+                encoder,
+                "setVertexBuffer:offset:atIndex:",
+                self.vertices,
+                0,
+                0,
+            );
+            set_buffer_named(
+                encoder,
+                "setVertexBuffer:offset:atIndex:",
+                self.uniforms,
+                0,
+                1,
+            );
+            set_buffer_named(
+                encoder,
+                "setVertexBuffer:offset:atIndex:",
+                self.instances,
+                0,
+                2,
+            );
+            let tint = [1.0f32; 4];
+            set_bytes_named(
+                encoder,
+                "setFragmentBytes:length:atIndex:",
+                std::slice::from_raw_parts(tint.as_ptr().cast(), 16),
+                0,
+            );
+            let (set_sampler, sel) = method::<unsafe extern "C" fn(Id, Sel, Id, u64)>(
+                encoder,
+                "setFragmentSamplerState:atIndex:",
+            );
+            set_sampler(encoder, sel, self.sampler, 0);
+            self.bind(encoder, texture);
+        }
+    }
+
+    /// Bind `texture` as both textures the shader multiplies.
+    ///
+    /// # Safety
+    ///
+    /// As for [`Self::prepare`].
+    unsafe fn bind(&self, encoder: Id, texture: Id) {
+        // SAFETY: the caller guarantees the encoder.
+        unsafe {
+            let (set_texture, sel) = method::<unsafe extern "C" fn(Id, Sel, Id, u64)>(
+                encoder,
+                "setFragmentTexture:atIndex:",
+            );
+            set_texture(encoder, sel, texture, 0);
+            set_texture(encoder, sel, texture, 1);
+        }
+    }
+
+    /// Copy each of `targets` out after the rest of `command`, commit it, and
+    /// answer their pixels.
+    ///
+    /// # Safety
+    ///
+    /// `command` must be a recording command buffer of this crate's.
+    unsafe fn read(&self, command: Id, targets: &[Id]) -> Vec<Vec<[u8; 4]>> {
+        let bytes = (HAZARD_SIZE * HAZARD_SIZE * 4) as usize;
+        // SAFETY: the caller guarantees the command buffer.
+        unsafe {
+            let blit = send(command, "blitCommandEncoder");
+            let readbacks: Vec<Id> = targets
+                .iter()
+                .map(|target| {
+                    let readback = new_buffer(self.device, std::ptr::null(), bytes, 0);
+                    copy_texture_to_buffer(blit, *target, readback, HAZARD_SIZE);
+                    readback
+                })
+                .collect();
+            send_void(blit, "endEncoding");
+            send_void(command, "commit");
+            send_void(command, "waitUntilCompleted");
+            assert_eq!(send_number_result(command, "status"), 4);
+            readbacks
+                .iter()
+                .map(|readback| {
+                    let contents = object::body::<resource::Buffer>(*readback).inner.contents;
+                    std::slice::from_raw_parts(contents, bytes)
+                        .chunks(4)
+                        .map(|pixel| pixel.try_into().expect("four bytes"))
+                        .collect()
+                })
+                .collect()
+        }
+    }
+}
+
+fn recorded_barriers() -> u64 {
+    encoder::TEST_RECORDED_BARRIERS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+fn assert_all(pixels: &[[u8; 4]], expected: [u8; 4], what: &str) {
+    assert!(
+        pixels.iter().all(|pixel| *pixel == expected),
+        "{what}: {pixels:?}"
+    );
+}
+
+/// Passes which share no resource are not ordered against each other: no
+/// barrier is recorded between them, and the copy after both sees each.
+#[test]
+fn passes_sharing_nothing_record_no_barrier_between_them() {
+    isolate_metal_fixture!();
+    let Some(device) = gpu_device() else {
+        return;
+    };
+    let fixture = SamplingDraw::new(device);
+    let (blue, red) = (fixture.filled(BLUE), fixture.filled(RED));
+    let (first, second) = (fixture.target(), fixture.target());
+    // SAFETY: objects this test made, sent the selectors they implement.
+    unsafe {
+        let command = send(fixture.queue, "commandBuffer");
+        let before = recorded_barriers();
+        for (target, source) in [(first, blue), (second, red)] {
+            let pass = render_encoder(command, single_target_pass(target, LOAD_DONT_CARE, BLUE));
+            fixture.prepare(pass, source);
+            draw(pass, 3);
+            send_void(pass, "endEncoding");
+        }
+        assert_eq!(recorded_barriers() - before, 0);
+        let pixels = fixture.read(command, &[first, second]);
+        assert_all(&pixels[0], BLUE_PIXEL, "first pass");
+        assert_all(&pixels[1], RED_PIXEL, "second pass");
+    }
+}
+
+/// A texture an earlier pass drew which is bound after a pass began drawing
+/// splits it: the draws after the binding see what the earlier pass drew.
+#[test]
+fn a_texture_bound_after_drawing_began_waits_for_the_pass_which_drew_it() {
+    isolate_metal_fixture!();
+    let Some(device) = gpu_device() else {
+        return;
+    };
+    let fixture = SamplingDraw::new(device);
+    let red = fixture.filled(RED);
+    let (drawn, target) = (fixture.target(), fixture.target());
+    // SAFETY: objects this test made, sent the selectors they implement.
+    unsafe {
+        let command = send(fixture.queue, "commandBuffer");
+        let clear = render_encoder(command, single_target_pass(drawn, LOAD_CLEAR, BLUE));
+        send_void(clear, "endEncoding");
+        let before = recorded_barriers();
+        let pass = render_encoder(command, single_target_pass(target, LOAD_DONT_CARE, RED));
+        fixture.prepare(pass, red);
+        draw(pass, 3);
+        fixture.bind(pass, drawn);
+        draw(pass, 3);
+        send_void(pass, "endEncoding");
+        assert_eq!(recorded_barriers() - before, 1, "one split");
+        let pixels = fixture.read(command, &[target]);
+        assert_all(&pixels[0], BLUE_PIXEL, "the draw after the split");
+    }
+}
+
+/// A pass which overwrites a texture an earlier pass sampled waits for that
+/// pass, which sees what the texture held before.
+#[test]
+fn a_pass_overwriting_a_texture_waits_for_the_pass_which_sampled_it() {
+    isolate_metal_fixture!();
+    let Some(device) = gpu_device() else {
+        return;
+    };
+    let fixture = SamplingDraw::new(device);
+    let sampled = fixture.filled(BLUE);
+    let target = fixture.target();
+    // SAFETY: objects this test made, sent the selectors they implement.
+    unsafe {
+        let command = send(fixture.queue, "commandBuffer");
+        let pass = render_encoder(command, single_target_pass(target, LOAD_DONT_CARE, RED));
+        fixture.prepare(pass, sampled);
+        draw(pass, 3);
+        send_void(pass, "endEncoding");
+        let before = recorded_barriers();
+        let clear = render_encoder(command, single_target_pass(sampled, LOAD_CLEAR, RED));
+        send_void(clear, "endEncoding");
+        assert_eq!(recorded_barriers() - before, 1);
+        let pixels = fixture.read(command, &[target, sampled]);
+        assert_all(&pixels[0], BLUE_PIXEL, "what the first pass sampled");
+        assert_all(&pixels[1], RED_PIXEL, "the overwritten texture");
+    }
+}
+
+/// A pass which draws over an attachment an earlier pass wrote lands after
+/// it, behind a barrier over the attachment alone.
+#[test]
+fn a_pass_drawing_over_an_earlier_passes_attachment_lands_after_it() {
+    isolate_metal_fixture!();
+    let Some(device) = gpu_device() else {
+        return;
+    };
+    let fixture = SamplingDraw::new(device);
+    let red = fixture.filled(RED);
+    let target = fixture.target();
+    // SAFETY: objects this test made, sent the selectors they implement.
+    unsafe {
+        let command = send(fixture.queue, "commandBuffer");
+        let clear = render_encoder(command, single_target_pass(target, LOAD_CLEAR, BLUE));
+        send_void(clear, "endEncoding");
+        let before = recorded_barriers();
+        let pass = render_encoder(command, single_target_pass(target, LOAD_LOAD, BLUE));
+        fixture.prepare(pass, red);
+        draw(pass, 3);
+        send_void(pass, "endEncoding");
+        assert_eq!(recorded_barriers() - before, 1);
+        let pixels = fixture.read(command, &[target]);
+        assert_all(&pixels[0], RED_PIXEL, "the later pass");
+    }
+}
+
+/// A pass which loads its attachment and draws nothing changes nothing, so
+/// it is not recorded and orders nothing.
+#[test]
+fn a_pass_which_loads_and_draws_nothing_leaves_its_attachment_alone() {
+    isolate_metal_fixture!();
+    let Some(device) = gpu_device() else {
+        return;
+    };
+    let fixture = SamplingDraw::new(device);
+    let target = fixture.filled(BLUE);
+    // SAFETY: objects this test made, sent the selectors they implement.
+    unsafe {
+        let command = send(fixture.queue, "commandBuffer");
+        let before = recorded_barriers();
+        let pass = render_encoder(command, single_target_pass(target, LOAD_LOAD, RED));
+        send_void(pass, "endEncoding");
+        assert_eq!(recorded_barriers() - before, 0);
+        let pixels = fixture.read(command, &[target]);
+        assert_all(&pixels[0], BLUE_PIXEL, "the loaded attachment");
     }
 }
 
