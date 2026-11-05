@@ -194,7 +194,8 @@ fn prepare<'a>(
     let entries = entries::of(report, memory, &image_layout, &profiled);
     let plan = plan(vm, &entries);
     layout.prune();
-    let out = AtomicFile::create(&path).and_then(|file| file::Writer::new(file, report.slide));
+    let out = AtomicFile::create(&path)
+        .and_then(|file| file::Writer::new(file, report.slide, &report.path));
     Ok(Job {
         report,
         plan,

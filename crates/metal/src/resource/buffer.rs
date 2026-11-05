@@ -13,7 +13,7 @@ pub(super) fn tracing_buffers() -> bool {
 /// `MTLStorageModePrivate`, as `MTLResourceOptions` carries it in bits 4-7.
 const STORAGE_MODE_PRIVATE: u64 = 2;
 
-pub(crate) fn new_buffer(gpu: &'static Gpu, length: usize, options: u64) -> Id {
+pub(crate) fn new_buffer(gpu: &'static Gpu, length: usize, options: u64, fill: gpu::Fill) -> Id {
     if length == 0 {
         return std::ptr::null_mut();
     }
@@ -37,8 +37,11 @@ pub(crate) fn new_buffer(gpu: &'static Gpu, length: usize, options: u64) -> Id {
             ..GpuBuffer::none()
         },
         None => match crate::stats::timed(crate::stats::Counter::BufferMicros, || match private {
-            true => gpu.create_private_buffer(length as u64),
-            false => gpu.create_buffer(length as u64),
+            true => gpu.create_private_buffer(length as u64, fill),
+            false => match fill {
+                gpu::Fill::Zero => gpu.create_buffer(length as u64),
+                gpu::Fill::Overwritten => gpu.create_staging_buffer(length as u64),
+            },
         }) {
             Ok(inner) => inner,
             Err(reason) => {

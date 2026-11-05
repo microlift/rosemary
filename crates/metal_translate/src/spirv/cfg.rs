@@ -1,4 +1,5 @@
 use super::*;
+use crate::ir::Dominance;
 
 pub(super) struct ControlFlow {
     pub(super) blocks: Vec<BlockId>,
@@ -27,142 +28,14 @@ impl ControlFlow {
         graph
     }
 
-    /// Immediate dominators, by the Cooper-Harvey-Kennedy iteration, used for
-    /// both dominators and post-dominators by swapping the edge direction.
-    ///
-    /// `edges` names each block's incoming edges for the chosen direction, so
-    /// the walk itself follows their reverse. A dominator tree rather than a
-    /// set per block: a shader whose entry point inlines to a few thousand
-    /// blocks makes the set form quadratic in both time and memory, and every
-    /// restructuring pass recomputes this.
+    /// See [`Dominance::new`].
     pub(super) fn dominance(
         &self,
         roots: &[BlockId],
         edges: &HashMap<BlockId, Vec<BlockId>>,
     ) -> Dominance {
-        let mut forward: HashMap<BlockId, Vec<BlockId>> = HashMap::new();
-        for (block, incoming) in edges {
-            for source in incoming {
-                forward.entry(*source).or_default().push(*block);
-            }
-        }
-        // Reverse post-order, so that a block is visited after the blocks
-        // whose dominators it depends on wherever the graph is acyclic.
-        let mut visited = BTreeSet::new();
-        let mut post = Vec::new();
-        for root in roots {
-            if !visited.insert(*root) {
-                continue;
-            }
-            let mut stack = vec![(*root, 0usize)];
-            while let Some((block, index)) = stack.pop() {
-                let next = forward.get(&block).map(|s| s.as_slice()).unwrap_or(&[]);
-                match next.get(index) {
-                    Some(successor) => {
-                        stack.push((block, index + 1));
-                        if visited.insert(*successor) {
-                            stack.push((*successor, 0));
-                        }
-                    }
-                    None => post.push(block),
-                }
-            }
-        }
-        post.reverse();
-        let order: HashMap<BlockId, usize> = post
-            .iter()
-            .enumerate()
-            .map(|(index, block)| (*block, index))
-            .collect();
-
-        let mut idom: HashMap<BlockId, BlockId> = roots.iter().map(|root| (*root, *root)).collect();
-        loop {
-            let mut changed = false;
-            for block in &post {
-                if roots.contains(block) {
-                    continue;
-                }
-                let mut candidate = None;
-                for source in edges.get(block).into_iter().flatten() {
-                    if !idom.contains_key(source) {
-                        continue;
-                    }
-                    candidate = Some(match candidate {
-                        None => *source,
-                        // Two paths which meet at no common block leave this
-                        // one dominated by nothing but itself, which is what
-                        // its own identity records.
-                        Some(current) => match meet(*source, current, &idom, &order) {
-                            Some(meet) => meet,
-                            None => *block,
-                        },
-                    });
-                }
-                let candidate = candidate.unwrap_or(*block);
-                if idom.insert(*block, candidate) != Some(candidate) {
-                    changed = true;
-                }
-            }
-            if !changed {
-                return Dominance { idom };
-            }
-        }
+        Dominance::new(roots, edges)
     }
-}
-
-/// A dominator tree: each block's immediate dominator, with a root naming
-/// itself.
-pub(super) struct Dominance {
-    idom: HashMap<BlockId, BlockId>,
-}
-
-impl Dominance {
-    /// Reflexive, as a dominator set which contains its own block is.
-    pub(super) fn dominates(&self, dominator: BlockId, block: BlockId) -> bool {
-        let mut current = block;
-        loop {
-            if current == dominator {
-                return true;
-            }
-            match self.idom.get(&current) {
-                Some(next) if *next != current => current = *next,
-                _ => return false,
-            }
-        }
-    }
-
-    /// The closest strict dominator, or `None` for a root and for a block
-    /// whose paths in are dominated by nothing they share.
-    pub(super) fn immediate(&self, block: BlockId) -> Option<BlockId> {
-        self.idom
-            .get(&block)
-            .copied()
-            .filter(|dominator| *dominator != block)
-    }
-}
-
-/// The closest block both `a` and `b` are dominated by, or `None` when they
-/// are reached from separate roots and share none.
-fn meet(
-    mut a: BlockId,
-    mut b: BlockId,
-    idom: &HashMap<BlockId, BlockId>,
-    order: &HashMap<BlockId, usize>,
-) -> Option<BlockId> {
-    while a != b {
-        let (deeper, shallower) = match order.get(&a)? > order.get(&b)? {
-            true => (&mut a, b),
-            false => (&mut b, a),
-        };
-        let next = *idom.get(deeper)?;
-        if next == *deeper {
-            // A root, and the other block is not below it.
-            let _ = shallower;
-            return None;
-        }
-        *deeper = next;
-    }
-    Some(a)
 }
 
 /// Recover the structured constructs of a function's control-flow graph.

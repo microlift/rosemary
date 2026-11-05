@@ -191,11 +191,20 @@ unsafe extern "C" fn with_characters_in_string(_class: Id, _sel: Sel, text: Id) 
     })
 }
 
+/// The first and last member of `length` (nonzero) characters from
+/// `location`, with the end clamped to what a member can be rather than
+/// wrapped, or `None` where the range starts past every member.
+fn inclusive(location: usize, length: usize) -> Option<(u32, u32)> {
+    let first = u32::try_from(location).ok()?;
+    let last = location.saturating_add(length - 1);
+    Some((first, u32::try_from(last).unwrap_or(u32::MAX)))
+}
+
 /// `+characterSetWithRange:`, over UTF-16 code units as `NSRange` counts them.
 unsafe extern "C" fn with_range(_class: Id, _sel: Sel, range: crate::geometry::NSRange) -> Id {
     let ranges = match range.length {
         0 => Vec::new(),
-        n => vec![(range.location as u32, (range.location + n - 1) as u32)],
+        n => inclusive(range.location, n).into_iter().collect(),
     };
     make_custom(Members {
         ranges,
@@ -341,7 +350,9 @@ pub unsafe extern "C" fn CFCharacterSetAddCharactersInRange(
     }
     let mut custom = custom().lock().unwrap_or_else(|e| e.into_inner());
     let members = custom.entry(set as usize).or_default();
-    let range = (location as u32, (location + length - 1) as u32);
+    let Some(range) = inclusive(location as usize, length as usize) else {
+        return;
+    };
     if members.inverted {
         // Adding to a complement removes from what it excludes.
         members.ranges = members
@@ -382,6 +393,13 @@ pub unsafe extern "C" fn CFCharacterSetIsCharacterMember(set: Id, unit: u16) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_range_past_the_last_character_is_clamped_or_empty_rather_than_wrapped() {
+        assert_eq!(inclusive(0x41, 26), Some((0x41, 0x5a)));
+        assert_eq!(inclusive(usize::MAX - 1, 4), None);
+        assert_eq!(inclusive(0x10, usize::MAX), Some((0x10, u32::MAX)));
+    }
 
     #[test]
     fn standard_url_path_set_is_a_stable_object() {

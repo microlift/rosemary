@@ -236,8 +236,9 @@ fn record_resolve(
     if results_size.max(plan.len() as u64) > gpu::UPLOAD_CHUNK {
         return Err(format!("{} queries in one pass", segments.len()));
     }
-    let (results, results_offset) = command
-        .upload(&vec![0; results_size as usize])
+    // Not zeroed: a query copy below writes every result.
+    let (results, results_offset, _) = command
+        .reserve(results_size)
         .ok_or("no upload space for the query results")?;
     let (plan_buffer, plan_offset) = command
         .upload(&plan)
@@ -395,7 +396,7 @@ impl Summation {
             .layout(*layout);
         // SAFETY: every borrowed structure lives across the call.
         let pipeline =
-            unsafe { device.create_compute_pipelines(vk::PipelineCache::null(), &[info], None) };
+            unsafe { device.create_compute_pipelines(gpu.pipeline_cache(), &[info], None) };
         // SAFETY: a pipeline keeps nothing of the module it was made from.
         unsafe { device.destroy_shader_module(module, None) };
         let pipeline = pipeline

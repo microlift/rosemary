@@ -3705,3 +3705,666 @@ fn a_switch_falls_through_from_its_label_until_a_break() {
         .collect();
     assert_eq!(trails, [1212, 22, 9595, 9595, 395395, 55, 9595]);
 }
+
+/// `MTLPixelFormat`.
+const PIXEL_FORMAT_R32_UINT: u64 = 53;
+const PIXEL_FORMAT_RGBA8_UNORM: u64 = 70;
+/// `MTLTextureType`.
+const TEXTURE_TYPE_2D: u64 = 2;
+const TEXTURE_TYPE_3D: u64 = 7;
+
+fn kernel_from_source(device: Id, source: &str, name: &str) -> Id {
+    let library = source_library(device, source);
+    assert!(!library.is_null(), "{name} must translate");
+    // SAFETY: a device and a library this test made.
+    unsafe {
+        let function = new_function_with_name(
+            library,
+            std::ptr::null(),
+            foundation::string::from_str(name),
+        );
+        assert!(!function.is_null());
+        let mut error = std::ptr::null_mut();
+        let pipeline = new_compute_pipeline(device, std::ptr::null(), function, &mut error);
+        assert!(!pipeline.is_null(), "{name} pipeline");
+        pipeline
+    }
+}
+
+fn readable_texture(device: Id, texture_type: u64, pixel_format: u64, size: [u64; 3]) -> Id {
+    let gpu = gpu_of(device).expect("a Vulkan device");
+    let texture = resource::new_texture(
+        gpu,
+        resource::TextureDescriptor {
+            texture_type,
+            pixel_format,
+            width: size[0],
+            height: size[1],
+            depth: size[2],
+            mipmap_level_count: 1,
+            sample_count: 1,
+            array_length: 1,
+            storage_mode: 0,
+            usage: gpu::USAGE_SHADER_READ,
+        },
+    );
+    assert!(!texture.is_null());
+    texture
+}
+
+/// Four bytes a texel, differing between texels and between seeds.
+fn texel_pattern(texels: u64, seed: u32) -> Vec<u8> {
+    (0..texels as u32)
+        .flat_map(|at| {
+            at.wrapping_mul(2_654_435_761)
+                .wrapping_add(seed)
+                .to_ne_bytes()
+        })
+        .collect()
+}
+
+/// A device which does not push descriptors, so that buffers go through
+/// remembered sets and dynamic offsets as well.
+fn gpu_device_without_push_descriptors() -> Option<Id> {
+    gpu::TEST_WITHOUT_PUSH_DESCRIPTORS.store(true, Ordering::Release);
+    let device = gpu_device()?;
+    assert_eq!(gpu_of(device).expect("a GPU").max_push_descriptors, 0);
+    Some(device)
+}
+
+fn check_remembered_sets_keep_their_textures(device: Id) {
+    let kernel = kernel_from_source(
+        device,
+        "kernel void add(device uint* output [[buffer(0)]],\n\
+                         texture2d<uint> source [[texture(0)]]) {\n\
+             output[0] = output[0] + source.read(uint2(0, 0)).x;\n\
+         }",
+        "add",
+    );
+    // More than a command buffer remembers per set index.
+    const TEXTURES: usize = 12;
+    let mut expected = [0u32; TEXTURES];
+    let values: [u32; TEXTURES] = std::array::from_fn(|at| 1 + 37 * at as u32);
+    // SAFETY: objects this test made, sent the selectors they implement.
+    unsafe {
+        let textures: [Id; TEXTURES] = std::array::from_fn(|at| {
+            let texture =
+                readable_texture(device, TEXTURE_TYPE_2D, PIXEL_FORMAT_R32_UINT, [1, 1, 1]);
+            replace_region(texture, [0, 0, 1, 1], &values[at].to_ne_bytes(), 4);
+            texture
+        });
+        let outputs: [Id; TEXTURES] =
+            std::array::from_fn(|_| new_buffer(device, std::ptr::null(), 16, 0));
+        let queue = new_command_queue(device, std::ptr::null());
+        let command = send(queue, "commandBuffer");
+        for pass in 0..4 {
+            let encoder = send(command, "computeCommandEncoder");
+            send_with_object(encoder, "setComputePipelineState:", kernel);
+            let (bind, sel) =
+                method::<unsafe extern "C" fn(Id, Sel, Id, u64)>(encoder, "setTexture:atIndex:");
+            for step in 0..TEXTURES * 3 {
+                // Two materials alternating, then a sweep which displaces them.
+                let at = match step % 3 {
+                    0 => pass % TEXTURES,
+                    1 => (pass + 1) % TEXTURES,
+                    _ => step % TEXTURES,
+                };
+                bind(encoder, sel, textures[at], 0);
+                set_buffer_at(encoder, outputs[at], 0, 0);
+                dispatch(encoder, 1);
+                expected[at] += values[at];
+            }
+            send_void(encoder, "endEncoding");
+        }
+        send_void(command, "commit");
+        send_void(command, "waitUntilCompleted");
+        for at in 0..TEXTURES {
+            let contents = object::body::<resource::Buffer>(outputs[at]).inner.contents;
+            assert_eq!(
+                std::ptr::read(contents as *const u32),
+                expected[at],
+                "texture {at}"
+            );
+        }
+    }
+}
+
+/// A set remembered from an earlier encoder, or displaced and written again,
+/// still names the texture it was written with.
+#[test]
+fn a_remembered_descriptor_set_keeps_its_texture_across_encoders() {
+    isolate_metal_fixture!();
+    if let Some(device) = gpu_device() {
+        check_remembered_sets_keep_their_textures(device);
+    }
+}
+
+#[test]
+fn a_remembered_descriptor_set_keeps_its_texture_without_push_descriptors() {
+    isolate_metal_fixture!();
+    if let Some(device) = gpu_device_without_push_descriptors() {
+        check_remembered_sets_keep_their_textures(device);
+    }
+}
+
+fn check_each_dispatch_reads_its_own_bytes(device: Id) {
+    let kernel = kernel_from_source(
+        device,
+        "kernel void add(device uint* output [[buffer(0)]],\n\
+                         constant uint& amount [[buffer(1)]]) {\n\
+             output[0] = output[0] + amount;\n\
+         }",
+        "add",
+    );
+    const OUTPUTS: usize = 3;
+    // Enough copies to pass the end of an upload chunk at any alignment.
+    const DISPATCHES: u32 = 20_000;
+    const DISPATCHES_PER_ENCODER: u32 = 5_000;
+    let mut expected = [0u32; OUTPUTS];
+    // SAFETY: objects this test made, sent the selectors they implement.
+    unsafe {
+        let outputs: [Id; OUTPUTS] =
+            std::array::from_fn(|_| new_buffer(device, std::ptr::null(), 16, 0));
+        let queue = new_command_queue(device, std::ptr::null());
+        let command = send(queue, "commandBuffer");
+        let mut encoder: Id = std::ptr::null_mut();
+        for step in 0..DISPATCHES {
+            if step % DISPATCHES_PER_ENCODER == 0 {
+                if !encoder.is_null() {
+                    send_void(encoder, "endEncoding");
+                }
+                encoder = send(command, "computeCommandEncoder");
+                send_with_object(encoder, "setComputePipelineState:", kernel);
+            }
+            let at = step as usize % OUTPUTS;
+            let amount = step % 251 + 1;
+            set_buffer_at(encoder, outputs[at], 0, 0);
+            set_bytes_named(
+                encoder,
+                "setBytes:length:atIndex:",
+                &amount.to_ne_bytes(),
+                1,
+            );
+            dispatch(encoder, 1);
+            expected[at] += amount;
+        }
+        send_void(encoder, "endEncoding");
+        send_void(command, "commit");
+        send_void(command, "waitUntilCompleted");
+        for at in 0..OUTPUTS {
+            let contents = object::body::<resource::Buffer>(outputs[at]).inner.contents;
+            assert_eq!(std::ptr::read(contents as *const u32), expected[at]);
+        }
+    }
+}
+
+#[test]
+fn each_dispatch_reads_its_own_set_bytes_across_chunks_and_encoders() {
+    isolate_metal_fixture!();
+    if let Some(device) = gpu_device() {
+        check_each_dispatch_reads_its_own_bytes(device);
+    }
+}
+
+/// Without pushes a remembered set matches whatever its dynamic offsets are,
+/// so each dispatch must still be handed the offset of its own copy.
+#[test]
+fn each_dispatch_reads_its_own_set_bytes_without_push_descriptors() {
+    isolate_metal_fixture!();
+    if let Some(device) = gpu_device_without_push_descriptors() {
+        check_each_dispatch_reads_its_own_bytes(device);
+    }
+}
+
+/// Samplers are resolved when the pipeline is made and read by position when
+/// binding, so each must reach the shader as the one it declared.
+#[test]
+fn each_constexpr_sampler_keeps_its_own_filter() {
+    isolate_metal_fixture!();
+    let Some(device) = gpu_device() else {
+        return;
+    };
+    let kernel = kernel_from_source(
+        device,
+        "kernel void probe(device float* output [[buffer(0)]],\n\
+                           texture2d<float> source [[texture(0)]]) {\n\
+             constexpr sampler near(coord::normalized, address::clamp_to_edge, filter::nearest);\n\
+             constexpr sampler smooth(coord::normalized, address::clamp_to_edge, filter::linear);\n\
+             output[0] = source.sample(near, float2(0.4, 0.5), level(0.0)).x;\n\
+             output[1] = source.sample(smooth, float2(0.5, 0.5), level(0.0)).x;\n\
+             output[2] = source.sample(near, float2(0.9, 0.5), level(0.0)).x;\n\
+         }",
+        "probe",
+    );
+    let texels: [u8; 8] = [0, 0, 0, 255, 255, 255, 255, 255];
+    // SAFETY: objects this test made, sent the selectors they implement.
+    unsafe {
+        let texture =
+            readable_texture(device, TEXTURE_TYPE_2D, PIXEL_FORMAT_RGBA8_UNORM, [2, 1, 1]);
+        replace_region(texture, [0, 0, 2, 1], &texels, 8);
+        let output = new_buffer(device, std::ptr::null(), 16, 0);
+        let queue = new_command_queue(device, std::ptr::null());
+        let command = send(queue, "commandBuffer");
+        let encoder = send(command, "computeCommandEncoder");
+        send_with_object(encoder, "setComputePipelineState:", kernel);
+        set_buffer_at(encoder, output, 0, 0);
+        let (bind, sel) =
+            method::<unsafe extern "C" fn(Id, Sel, Id, u64)>(encoder, "setTexture:atIndex:");
+        bind(encoder, sel, texture, 0);
+        dispatch(encoder, 1);
+        send_void(encoder, "endEncoding");
+        send_void(command, "commit");
+        send_void(command, "waitUntilCompleted");
+        let contents = object::body::<resource::Buffer>(output).inner.contents as *const f32;
+        let read = [*contents, *contents.add(1), *contents.add(2)];
+        assert!(read[0].abs() < 0.01, "nearest, left texel: {read:?}");
+        assert!((read[1] - 0.5).abs() < 0.03, "linear, midpoint: {read:?}");
+        assert!(
+            (read[2] - 1.0).abs() < 0.01,
+            "nearest, right texel: {read:?}"
+        );
+    }
+}
+
+/// Threads racing to compile one variant all answer the one kept in the map,
+/// and it runs: the losers' pipelines were destroyed, not the winner's.
+#[test]
+fn racing_variant_compiles_agree_on_one_pipeline_which_runs() {
+    isolate_metal_fixture!();
+    let Some(device) = gpu_device() else {
+        return;
+    };
+    let kernel = kernel_from_source(device, TEST_KERNEL, "clear");
+    const THREADS: usize = 8;
+    for width in 1..=16u32 {
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(THREADS));
+        let threads: Vec<_> = (0..THREADS)
+            .map(|_| {
+                let barrier = barrier.clone();
+                let state = kernel as usize;
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    // SAFETY: a compute pipeline this test made and never frees.
+                    let state = unsafe { object::body::<pipeline::ComputePipeline>(state as Id) };
+                    state.variant([width, 1, 1]).expect("the variant compiles")
+                })
+            })
+            .collect();
+        let made: Vec<_> = threads
+            .into_iter()
+            .map(|thread| thread.join().expect("no panic"))
+            .collect();
+        assert!(made.windows(2).all(|pair| pair[0] == pair[1]), "{made:?}");
+    }
+    // SAFETY: objects this test made, sent the selectors they implement.
+    unsafe {
+        let output = new_buffer(device, std::ptr::null(), 16, 0);
+        let queue = new_command_queue(device, std::ptr::null());
+        let command = send(queue, "commandBuffer");
+        let encoder = send(command, "computeCommandEncoder");
+        send_with_object(encoder, "setComputePipelineState:", kernel);
+        set_buffer_at(encoder, output, 0, 0);
+        dispatch(encoder, 1);
+        send_void(encoder, "endEncoding");
+        send_void(command, "commit");
+        send_void(command, "waitUntilCompleted");
+        let contents = object::body::<resource::Buffer>(output).inner.contents;
+        assert_eq!(std::ptr::read(contents as *const u32), 42);
+    }
+}
+
+/// Requests round up to a power of two and take the smallest buffer which
+/// fits; one larger than the pool ever keeps is made at exactly its size.
+#[test]
+fn the_staging_pool_recycles_the_smallest_fit() {
+    isolate_metal_fixture!();
+    let Some(device) = gpu_device() else {
+        return;
+    };
+    let gpu = gpu_of(device).expect("a Vulkan device");
+    const MIB: u64 = 1 << 20;
+    let small = gpu.acquire_staging_buffer(MIB).expect("staging");
+    assert_eq!(small.length, MIB);
+    assert!(!small.contents.is_null());
+    let handle = small.buffer;
+    gpu.release_staging_buffer(small);
+    let again = gpu.acquire_staging_buffer(MIB - 1).expect("staging");
+    assert_eq!(again.buffer, handle);
+    gpu.release_staging_buffer(again);
+
+    let huge = gpu.acquire_staging_buffer(65 * MIB).expect("staging");
+    assert_eq!(huge.length, 65 * MIB);
+    gpu.release_staging_buffer(huge);
+
+    let smaller = gpu.acquire_staging_buffer(8 * MIB).expect("staging");
+    let (smaller_buffer, smaller_length) = (smaller.buffer, smaller.length);
+    let larger = gpu.acquire_staging_buffer(16 * MIB).expect("staging");
+    gpu.release_staging_buffer(larger);
+    gpu.release_staging_buffer(smaller);
+    let fit = gpu.acquire_staging_buffer(4 * MIB).expect("staging");
+    assert_eq!(fit.buffer, smaller_buffer);
+    assert_eq!(fit.length, smaller_length);
+    gpu.release_staging_buffer(fit);
+}
+
+/// Transfers too large for an upload chunk round-trip through recycled
+/// staging at tight and padded strides, and none sees another's bytes.
+#[test]
+fn large_texture_transfers_round_trip_through_recycled_staging() {
+    isolate_metal_fixture!();
+    let Some(device) = gpu_device() else {
+        return;
+    };
+    const SIZE: u64 = 1024;
+    const WIDTH: u64 = 600;
+    const HEIGHT: u64 = 500;
+    const PADDING: usize = 12;
+    const ROW: usize = WIDTH as usize * 4;
+    const STRIDE: usize = ROW + PADDING;
+    let size = [SIZE, SIZE, 1];
+    let texture = readable_texture(device, TEXTURE_TYPE_2D, PIXEL_FORMAT_RGBA8_UNORM, size);
+    let other = readable_texture(device, TEXTURE_TYPE_2D, PIXEL_FORMAT_RGBA8_UNORM, size);
+    for seed in 0..8u32 {
+        let whole = texel_pattern(SIZE * SIZE, seed);
+        let other_whole = texel_pattern(SIZE * SIZE, !seed);
+        // SAFETY: textures this test made, and bytes covering their regions.
+        unsafe {
+            // Both pending at once, so they must not share a staging buffer.
+            replace_region(texture, [0, 0, SIZE, SIZE], &whole, SIZE * 4);
+            replace_region(other, [0, 0, SIZE, SIZE], &other_whole, SIZE * 4);
+
+            let mut read = vec![0xEE_u8; whole.len()];
+            get_bytes(texture, [0, 0, SIZE, SIZE], &mut read, SIZE * 4);
+            assert!(read == whole, "tight read, seed {seed}");
+            get_bytes(other, [0, 0, SIZE, SIZE], &mut read, SIZE * 4);
+            assert!(read == other_whole, "second texture, seed {seed}");
+
+            // A smaller region out of a larger recycled buffer.
+            let mut padded = vec![0xEE_u8; STRIDE * HEIGHT as usize];
+            get_bytes(texture, [10, 20, WIDTH, HEIGHT], &mut padded, STRIDE as u64);
+            for row in 0..HEIGHT {
+                let at = (((20 + row) * SIZE + 10) * 4) as usize;
+                let line = &padded[row as usize * STRIDE..][..STRIDE];
+                assert!(line[..ROW] == whole[at..at + ROW], "row {row}, seed {seed}");
+                assert_eq!(line[ROW..], [0xEE; PADDING], "padding of row {row}");
+            }
+        }
+    }
+}
+
+/// A 3D region reads back whole through the one copy of tight strides, and
+/// image by image through a padded image stride.
+#[test]
+fn get_bytes_reads_every_image_of_a_3d_region() {
+    isolate_metal_fixture!();
+    let Some(device) = gpu_device() else {
+        return;
+    };
+    const WIDTH: u64 = 16;
+    const HEIGHT: u64 = 8;
+    const DEPTH: u64 = 4;
+    const ROW: usize = WIDTH as usize * 4;
+    const IMAGE: usize = ROW * HEIGHT as usize;
+    const PADDING: usize = 32;
+    const PADDED_IMAGE: usize = IMAGE + PADDING;
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    struct Region {
+        origin: [u64; 3],
+        size: [u64; 3],
+    }
+    let region = Region {
+        origin: [0, 0, 0],
+        size: [WIDTH, HEIGHT, DEPTH],
+    };
+    let texture = readable_texture(
+        device,
+        TEXTURE_TYPE_3D,
+        PIXEL_FORMAT_RGBA8_UNORM,
+        [WIDTH, HEIGHT, DEPTH],
+    );
+    let whole = texel_pattern(WIDTH * HEIGHT * DEPTH, 7);
+    // SAFETY: a texture this test made, and bytes covering its region.
+    unsafe {
+        let (replace, sel) =
+            method::<unsafe extern "C" fn(Id, Sel, Region, u64, u64, *const u8, u64, u64)>(
+                texture,
+                "replaceRegion:mipmapLevel:slice:withBytes:bytesPerRow:bytesPerImage:",
+            );
+        replace(
+            texture,
+            sel,
+            region,
+            0,
+            0,
+            whole.as_ptr(),
+            ROW as u64,
+            IMAGE as u64,
+        );
+        let (read, sel) =
+            method::<unsafe extern "C" fn(Id, Sel, *mut u8, u64, u64, Region, u64, u64)>(
+                texture,
+                "getBytes:bytesPerRow:bytesPerImage:fromRegion:mipmapLevel:slice:",
+            );
+        let mut tight = vec![0xEE_u8; whole.len()];
+        read(
+            texture,
+            sel,
+            tight.as_mut_ptr(),
+            ROW as u64,
+            IMAGE as u64,
+            region,
+            0,
+            0,
+        );
+        assert!(tight == whole, "tight strides");
+
+        let mut padded = vec![0xEE_u8; PADDED_IMAGE * DEPTH as usize];
+        read(
+            texture,
+            sel,
+            padded.as_mut_ptr(),
+            ROW as u64,
+            PADDED_IMAGE as u64,
+            region,
+            0,
+            0,
+        );
+        for image in 0..DEPTH as usize {
+            let line = &padded[image * PADDED_IMAGE..][..PADDED_IMAGE];
+            assert!(
+                line[..IMAGE] == whole[image * IMAGE..][..IMAGE],
+                "image {image}"
+            );
+            assert_eq!(line[IMAGE..], [0xEE; PADDING], "padding of image {image}");
+        }
+    }
+}
+
+/// `-newBufferWithBytes:` does not zero its memory first, so a later
+/// `-newBufferWithLength:` over the same range must still read as zeros.
+#[test]
+fn a_new_buffer_reads_zero_over_a_range_bytes_were_written_to() {
+    isolate_metal_fixture!();
+    let Some(device) = gpu_device() else {
+        return;
+    };
+    const PRIVATE: u64 = 2 << 4;
+    const ROUNDS: usize = 8;
+    // SAFETY: objects this test made, sent the selectors they implement.
+    unsafe {
+        let queue = new_command_queue(device, std::ptr::null());
+        for length in [4usize << 10, 64 << 10, 1 << 20, 8 << 20] {
+            let bytes = vec![0xAB_u8; length];
+            for round in 0..ROUNDS {
+                let dirty =
+                    new_buffer_with_bytes(device, std::ptr::null(), bytes.as_ptr(), length, 0);
+                let contents = object::body::<resource::Buffer>(dirty).inner.contents;
+                assert!(std::slice::from_raw_parts(contents, length) == &bytes[..]);
+                objc::arc::release(dirty);
+                let clean = new_buffer(device, std::ptr::null(), length, 0);
+                let contents = object::body::<resource::Buffer>(clean).inner.contents;
+                assert!(
+                    std::slice::from_raw_parts(contents, length)
+                        .iter()
+                        .all(|byte| *byte == 0),
+                    "shared, {length} bytes, round {round}"
+                );
+                objc::arc::release(clean);
+            }
+            let read_back = new_buffer(device, std::ptr::null(), length, 0);
+            let read = |private: Id| {
+                let command = send(queue, "commandBuffer");
+                let blit = send(command, "blitCommandEncoder");
+                copy_buffer(blit, private, read_back, length as u64);
+                send_void(blit, "endEncoding");
+                send_void(command, "commit");
+                send_void(command, "waitUntilCompleted");
+                std::slice::from_raw_parts(
+                    object::body::<resource::Buffer>(read_back).inner.contents,
+                    length,
+                )
+            };
+            for round in 0..ROUNDS {
+                let dirty = new_buffer_with_bytes(
+                    device,
+                    std::ptr::null(),
+                    bytes.as_ptr(),
+                    length,
+                    PRIVATE,
+                );
+                assert!(read(dirty) == &bytes[..], "private bytes, round {round}");
+                objc::arc::release(dirty);
+                let clean = new_buffer(device, std::ptr::null(), length, PRIVATE);
+                assert!(
+                    read(clean).iter().all(|byte| *byte == 0),
+                    "private, {length} bytes, round {round}"
+                );
+                objc::arc::release(clean);
+            }
+            objc::arc::release(read_back);
+        }
+    }
+}
+
+/// The resolve does not zero the space its results go in, so what earlier
+/// uploads left in a recycled chunk must not reach the visibility buffer.
+#[test]
+fn visibility_results_ignore_a_dirty_recycled_upload_chunk() {
+    isolate_metal_fixture!();
+    let Some(device) = gpu_device() else {
+        return;
+    };
+    let Some(fixture) = covering_draw(device) else {
+        return;
+    };
+    let kernel = kernel_from_source(device, TEST_KERNEL, "clear");
+    let junk = [0xFF_u8; 4096];
+    // SAFETY: objects this test made, sent the selectors they implement.
+    unsafe {
+        for _ in 0..4 {
+            let command = send(fixture.queue, "commandBuffer");
+            let encoder = send(command, "computeCommandEncoder");
+            send_with_object(encoder, "setComputePipelineState:", kernel);
+            for _ in 0..400 {
+                set_bytes_named(encoder, "setBytes:length:atIndex:", &junk, 0);
+                dispatch(encoder, 1);
+            }
+            send_void(encoder, "endEncoding");
+            send_void(command, "commit");
+            send_void(command, "waitUntilCompleted");
+        }
+        for _ in 0..4 {
+            let results = results_buffer(device, 2, 0x1234);
+            let pass = fixture.pass(results);
+            let command = send(fixture.queue, "commandBuffer");
+            let render = render_encoder(command, pass);
+            fixture.bind(render);
+            set_visibility_mode(render, VISIBILITY_COUNTING, 0);
+            draw(render, 3);
+            set_visibility_mode(render, VISIBILITY_BOOLEAN, 8);
+            draw(render, 3);
+            send_void(render, "endEncoding");
+            send_void(command, "commit");
+            send_void(command, "waitUntilCompleted");
+            assert_eq!(result_at(results, 0), COVERING_SIZE * COVERING_SIZE);
+            assert_ne!(result_at(results, 1), 0);
+            assert_ne!(result_at(results, 1), u64::MAX);
+        }
+    }
+}
+
+/// What the cache saves is in a form the driver takes back: a new cache made
+/// from the file holds more than an empty one.
+#[test]
+fn a_saved_pipeline_cache_is_taken_back_by_the_driver() {
+    isolate_metal_fixture!();
+    let Some(device) = gpu_device() else {
+        return;
+    };
+    let gpu = gpu_of(device).expect("a Vulkan device");
+    if gpu.pipeline_cache_path().is_none() {
+        return;
+    }
+    let kernel = kernel_from_source(device, TEST_KERNEL, "clear");
+    // SAFETY: a compute pipeline this test made.
+    let state = unsafe { object::body::<pipeline::ComputePipeline>(kernel) };
+    for width in 1..=8 {
+        state.variant([width, 1, 1]).expect("the variant compiles");
+    }
+    gpu.save_pipeline_cache();
+    let empty = gpu
+        .reopened_pipeline_cache_bytes(Some(&[]))
+        .expect("a cache");
+    // SAFETY: the device's own cache.
+    let held = unsafe { gpu.device.get_pipeline_cache_data(gpu.pipeline_cache()) }
+        .expect("cache data")
+        .len();
+    if held <= empty {
+        // A driver is free to keep nothing, and then has nothing to take back.
+        return;
+    }
+    let reopened = gpu
+        .reopened_pipeline_cache_bytes(None)
+        .expect("the saved file is whole");
+    assert!(
+        reopened > empty,
+        "{reopened} bytes against {empty} when empty"
+    );
+}
+
+/// A guest which is killed keeps most of what it compiled: enough new
+/// pipelines save the cache without the process exiting.
+#[test]
+fn the_pipeline_cache_saves_after_enough_new_pipelines_without_exiting() {
+    isolate_metal_fixture!();
+    let Some(device) = gpu_device() else {
+        return;
+    };
+    let gpu = gpu_of(device).expect("a Vulkan device");
+    let Some(path) = gpu.pipeline_cache_path() else {
+        return;
+    };
+    let modified = || {
+        std::fs::metadata(path)
+            .and_then(|file| file.modified())
+            .ok()
+    };
+    let before = modified();
+    let kernel = kernel_from_source(device, TEST_KERNEL, "clear");
+    // SAFETY: a compute pipeline this test made.
+    let state = unsafe { object::body::<pipeline::ComputePipeline>(kernel) };
+    // Past the save interval, whatever already counted towards it.
+    for width in 1..=70 {
+        state.variant([width, 1, 1]).expect("the variant compiles");
+    }
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    while modified() == before {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "no save after 70 new pipelines"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    assert!(gpu.reopened_pipeline_cache_bytes(None).is_some());
+}

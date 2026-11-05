@@ -1,3 +1,4 @@
+mod dominance;
 mod operands;
 mod verify;
 
@@ -5,6 +6,7 @@ use std::collections::BTreeSet;
 
 use crate::{Diagnostic, Phase, TranslateError};
 
+pub(crate) use dominance::Dominance;
 use operands::resource_namespace;
 pub(crate) use operands::{
     coordinate_lanes, instruction_name, instruction_operands, instruction_operands_mut,

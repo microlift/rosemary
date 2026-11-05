@@ -104,12 +104,11 @@ mod binary {
         if offset_size == 0 || offset_size > 8 || ref_size == 0 || ref_size > 8 {
             return Err(bad("a binary plist trailer with an impossible width"));
         }
-        let end = table
-            .checked_add(count * offset_size)
+        count
+            .checked_mul(offset_size)
+            .and_then(|len| table.checked_add(len))
+            .filter(|end| *end <= bytes.len())
             .ok_or_else(|| bad("an offset table past the end of the file"))?;
-        if end > bytes.len() {
-            return Err(bad("an offset table past the end of the file"));
-        }
 
         let offsets: Vec<usize> = (0..count)
             .map(|i| be(&bytes[table + i * offset_size..][..offset_size]) as usize)
@@ -160,11 +159,9 @@ mod binary {
                 // rest are not.
                 0x1 => {
                     let width = 1usize << low;
-                    let raw = be(self.slice(at + 1, width)?);
-                    Ok(Value::Integer(match width {
-                        8 => raw as i64,
-                        _ => raw as i64,
-                    }))
+                    // Narrower widths are zero-extended, so the cast only
+                    // reinterprets the eight-byte form.
+                    Ok(Value::Integer(be(self.slice(at + 1, width)?) as i64))
                 }
                 0x2 => {
                     let width = 1usize << low;
@@ -192,7 +189,10 @@ mod binary {
                 // UTF-16, big-endian, `len` *characters* rather than bytes.
                 0x6 => {
                     let (len, body) = self.counted(at, low)?;
-                    let raw = self.slice(body, len * 2)?;
+                    let bytes = len
+                        .checked_mul(2)
+                        .ok_or_else(|| bad("a UTF-16 string longer than the file"))?;
+                    let raw = self.slice(body, bytes)?;
                     let units: Vec<u16> = raw
                         .chunks_exact(2)
                         .map(|c| u16::from_be_bytes([c[0], c[1]]))
@@ -202,20 +202,21 @@ mod binary {
                 0x8 => Ok(Value::Uid(be(self.slice(at + 1, low + 1)?))),
                 0xa | 0xc => {
                     let (len, body) = self.counted(at, low)?;
+                    let refs = self.references(body, len)?;
                     let mut out = Vec::with_capacity(len);
                     for i in 0..len {
-                        let r = be(self.slice(body + i * self.ref_size, self.ref_size)?) as usize;
-                        out.push(self.object(r, depth + 1)?);
+                        out.push(self.object(self.reference(refs, i), depth + 1)?);
                     }
                     Ok(Value::Array(out))
                 }
                 0xd => {
                     let (len, body) = self.counted(at, low)?;
+                    // Every key reference, then every value reference.
+                    let refs = self.references(body, len.saturating_mul(2))?;
                     let mut out = BTreeMap::new();
                     for i in 0..len {
-                        let k = be(self.slice(body + i * self.ref_size, self.ref_size)?) as usize;
-                        let v = be(self.slice(body + (len + i) * self.ref_size, self.ref_size)?)
-                            as usize;
+                        let k = self.reference(refs, i);
+                        let v = self.reference(refs, len + i);
                         let key = match self.object(k, depth + 1)? {
                             Value::String(s) => s,
                             // A non-string key is legal in the format and means
@@ -250,9 +251,22 @@ mod binary {
             Ok((be(self.slice(at + 2, width)?) as usize, at + 2 + width))
         }
 
+        /// The `count` object references at `at`, checked to lie in the file
+        /// before anything is sized by `count`.
+        fn references(&self, at: usize, count: usize) -> Result<&[u8], Error> {
+            let len = count
+                .checked_mul(self.ref_size)
+                .ok_or_else(|| bad("a container longer than the file"))?;
+            self.slice(at, len)
+        }
+
+        fn reference(&self, refs: &[u8], i: usize) -> usize {
+            be(&refs[i * self.ref_size..][..self.ref_size]) as usize
+        }
+
         fn slice(&self, at: usize, len: usize) -> Result<&[u8], Error> {
-            self.bytes
-                .get(at..at + len)
+            at.checked_add(len)
+                .and_then(|end| self.bytes.get(at..end))
                 .ok_or_else(|| bad(format!("a value at {at} runs past the end of the file")))
         }
     }
@@ -826,5 +840,43 @@ mod tests {
         bytes[64 - 32 + 7] = 8;
         bytes[64 - 32 + 15] = 0xff;
         assert!(parse(&bytes).is_err());
+    }
+
+    /// A trailer whose fields are 64-bit file data, chosen to overflow.
+    fn trailer(offset_size: u8, ref_size: u8, count: u64, root: u64, table: u64) -> [u8; 32] {
+        let mut out = [0u8; 32];
+        out[6] = offset_size;
+        out[7] = ref_size;
+        out[8..16].copy_from_slice(&count.to_be_bytes());
+        out[16..24].copy_from_slice(&root.to_be_bytes());
+        out[24..32].copy_from_slice(&table.to_be_bytes());
+        out
+    }
+
+    #[test]
+    fn an_offset_table_size_that_overflows_is_an_error() {
+        let mut bytes = b"bplist00\x08".to_vec();
+        bytes.extend_from_slice(&trailer(8, 1, u64::MAX / 4, 0, 8));
+        assert!(parse(&bytes).is_err());
+    }
+
+    #[test]
+    fn a_container_count_larger_than_the_file_is_an_error() {
+        // One array object at offset 8 whose count is an eight-byte integer
+        // near `u64::MAX`, then a one-entry offset table pointing at it.
+        let mut bytes = b"bplist00".to_vec();
+        bytes.push(0xaf);
+        bytes.push(0x13);
+        bytes.extend_from_slice(&(u64::MAX / 2).to_be_bytes());
+        let table = bytes.len() as u64;
+        bytes.push(8);
+        bytes.extend_from_slice(&trailer(1, 1, 1, 0, table));
+        assert!(parse(&bytes).is_err());
+
+        // The same for a dictionary and a UTF-16 string.
+        for marker in [0xdf, 0x6f] {
+            bytes[8] = marker;
+            assert!(parse(&bytes).is_err());
+        }
     }
 }

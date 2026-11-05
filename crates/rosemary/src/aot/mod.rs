@@ -25,7 +25,7 @@ pub const CACHE_ENV: &str = "ROSEMARY_AOT_CACHE";
 pub const KEEP_ENV: &str = "ROSEMARY_AOT_CACHE_KEEP";
 
 /// Bumped when what Rosemary stores beside Microlift's image changes meaning.
-const FORMAT_VERSION: u32 = 2;
+const FORMAT_VERSION: u32 = 3;
 
 /// Extension of a cached image.
 const IMAGE_EXTENSION: &str = "rmc";

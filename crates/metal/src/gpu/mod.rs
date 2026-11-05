@@ -4,6 +4,7 @@ mod format;
 mod guard;
 mod host;
 mod memory;
+mod pipeline_cache;
 mod placement;
 mod pools;
 mod submit;
@@ -27,6 +28,7 @@ pub use format::{
 };
 pub(crate) use guard::{Guard, GuardedVec};
 pub use host::HostPages;
+pub use memory::Fill;
 pub use placement::Placement;
 pub use submit::{Batch, Commit};
 use trace::dump_spirv;
@@ -113,6 +115,7 @@ pub struct Gpu {
     /// sharing a resource shape share a layout.
     layouts: Mutex<DescriptorLayouts>,
     render_passes: Mutex<crate::hash::FastMap<RenderPassKey, vk::RenderPass>>,
+    pipeline_cache: pipeline_cache::PipelineCache,
     /// Fence-owned immediate command contexts. Recording or waiting on an
     /// unrelated window must not hold a global command-pool mutex.
     immediate: Mutex<ImmediatePool>,
@@ -153,6 +156,9 @@ pub struct Gpu {
     context_budget: ContextBudget,
     descriptor_pools: Mutex<Vec<vk::DescriptorPool>>,
     upload_chunks: Mutex<Vec<GpuBuffer>>,
+    /// Larger host-visible buffers for texture uploads and readbacks.
+    /// Each with when it was handed back, so idle ones can be freed.
+    staging_buffers: Mutex<Vec<(GpuBuffer, std::time::Instant)>>,
     /// `VK_KHR_push_descriptor`, where advertised, and the descriptor limit
     /// which decides whether one set in a pipeline can use it.
     push_descriptor_api: Option<ash::khr::push_descriptor::Device>,
@@ -272,6 +278,19 @@ const RECYCLED: usize = 32;
 /// The size of one chunk `-setBytes:` copies are cut from. Metal limits one
 /// copy to four kilobytes, so a chunk holds a frame's worth of them.
 pub const UPLOAD_CHUNK: u64 = 256 << 10;
+
+/// The most staging memory a device keeps for reuse between transfers too
+/// large for an upload chunk.
+const STAGING_POOL_BYTES: u64 = 64 << 20;
+
+/// How long a pooled staging buffer may sit unused before it is freed, so a
+/// burst of large transfers does not keep its memory for good.
+const STAGING_IDLE: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Makes the next device behave as one without `VK_KHR_push_descriptor`, so
+/// its descriptor paths are tested on a device which has the extension.
+#[cfg(test)]
+pub(crate) static TEST_WITHOUT_PUSH_DESCRIPTORS: AtomicBool = AtomicBool::new(false);
 
 /// How many occlusion queries one pool holds; a command buffer which needs
 /// more takes another pool.
@@ -728,6 +747,7 @@ impl Gpu {
         // SAFETY: the physical device belongs to this live instance.
         let memory = unsafe { instance.get_physical_device_memory_properties(physical) };
         let properties = unsafe { instance.get_physical_device_properties(physical) };
+        let pipeline_cache = pipeline_cache::PipelineCache::open(&device, &properties);
 
         let depth_stencil_resolve = resolve_support.map(|support| DepthStencilResolve {
             renderpass2: depth_stencil_resolve_extension
@@ -744,6 +764,9 @@ impl Gpu {
         let host_import = host_import
             .then(|| host::HostImport::new(instance, physical, &device))
             .flatten();
+        #[cfg(test)]
+        let pushes =
+            pushes && !TEST_WITHOUT_PUSH_DESCRIPTORS.load(std::sync::atomic::Ordering::Acquire);
         let push_descriptor_api =
             pushes.then(|| ash::khr::push_descriptor::Device::new(instance, &device));
         let max_push_descriptors = if pushes {
@@ -782,6 +805,7 @@ impl Gpu {
             limits: properties.limits,
             layouts: Mutex::new(HashMap::new()),
             render_passes: Mutex::new(Default::default()),
+            pipeline_cache,
             immediate: Mutex::new(ImmediatePool::default()),
             immediate_ready: Condvar::new(),
             #[cfg(test)]
@@ -801,6 +825,7 @@ impl Gpu {
             context_budget: ContextBudget::new(),
             descriptor_pools: Mutex::new(Vec::new()),
             upload_chunks: Mutex::new(Vec::new()),
+            staging_buffers: Mutex::new(Vec::new()),
             push_descriptor_api,
             max_push_descriptors,
             null_descriptors,
@@ -817,6 +842,36 @@ impl Gpu {
             host_imported: std::sync::atomic::AtomicU64::new(0),
             calibration,
         })
+    }
+}
+
+impl Gpu {
+    /// The cache every pipeline of this device is made through.
+    pub(crate) fn pipeline_cache(&self) -> vk::PipelineCache {
+        self.pipeline_cache.handle
+    }
+
+    /// Where the pipeline cache is saved, where the shader cache is enabled.
+    #[cfg(test)]
+    pub(crate) fn pipeline_cache_path(&self) -> Option<&std::path::Path> {
+        self.pipeline_cache.path()
+    }
+
+    /// How many bytes the driver reports for a cache made from `initial`, or
+    /// from the saved file where it is `None`.
+    #[cfg(test)]
+    pub(crate) fn reopened_pipeline_cache_bytes(&self, initial: Option<&[u8]>) -> Option<usize> {
+        self.pipeline_cache.reopened_bytes(&self.device, initial)
+    }
+
+    /// Note that a guest pipeline was made through [`Self::pipeline_cache`].
+    pub(crate) fn pipeline_created(&'static self) {
+        self.pipeline_cache.created(&self.device);
+    }
+
+    /// Write the pipeline cache out, if anything was added to it.
+    pub(crate) fn save_pipeline_cache(&self) {
+        self.pipeline_cache.save(&self.device);
     }
 }
 

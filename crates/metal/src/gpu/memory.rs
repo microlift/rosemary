@@ -14,6 +14,16 @@ pub(super) const BUFFER_USAGE: vk::BufferUsageFlags = vk::BufferUsageFlags::from
         | vk::BufferUsageFlags::TRANSFER_DST.as_raw(),
 );
 
+/// What a new buffer must hold before anything is written to it.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Fill {
+    /// Zero, as Metal's are: a guest may read one before writing it.
+    Zero,
+    /// Nothing, because the caller writes all of it before the device or the
+    /// guest can read it.
+    Overwritten,
+}
+
 impl Gpu {
     pub(super) fn memory_type(&self, bits: u32, wanted: vk::MemoryPropertyFlags) -> Option<u32> {
         (0..self.memory.memory_type_count).find(|index| {
@@ -64,8 +74,8 @@ impl Gpu {
     /// it: a compute pass over host memory crosses the bus for every access,
     /// which made an FFT over a few megabytes take forty milliseconds a
     /// dispatch. Its `-contents` is null, as Metal's is.
-    pub fn create_private_buffer(&self, length: u64) -> Result<GpuBuffer, String> {
-        self.create_buffer_with(length, true, true)
+    pub fn create_private_buffer(&self, length: u64, fill: Fill) -> Result<GpuBuffer, String> {
+        self.create_buffer_with(length, fill == Fill::Zero, true)
     }
 
     fn create_buffer_with(

@@ -400,7 +400,7 @@ fn emit_entry(
     reverse_post_order(&mut function);
     let function = &function;
     let mut emitter = Emitter::new(target);
-    emitter.declare_globals(module)?;
+    emitter.declare_globals(module, function)?;
     let resources = emitter.declare_resources(entry, function)?;
     emitter.declare_stage_io(entry, function)?;
     let function_id = emitter.emit_function(entry, function)?;

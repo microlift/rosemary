@@ -89,6 +89,8 @@ pub(crate) struct RenderPipeline {
     /// Whether a shader writes a buffer or texture it is bound, rather than
     /// only the pass's attachments.
     pub writes_resources: bool,
+    /// Parallel to `resources`.
+    pub inline_samplers: Vec<vk::Sampler>,
     /// Metal buffer indices which feed vertex attributes rather than a
     /// descriptor, taken from the pipeline's vertex descriptor.
     pub vertex_streams: Vec<u32>,
@@ -257,6 +259,7 @@ impl RenderPipeline {
 
         let mut resources = vertex.resources.clone();
         resources.extend(fragment.resources.iter().cloned());
+        let inline_samplers = inline_samplers(gpu, &resources);
         Ok(Self {
             gpu,
             vertex_module,
@@ -273,6 +276,7 @@ impl RenderPipeline {
                 )
             }),
             resources,
+            inline_samplers,
             vertex_streams,
             bindings,
             attributes,
@@ -291,8 +295,15 @@ impl RenderPipeline {
     }
 
     pub fn variant(&self, key: &RenderVariantKey) -> Result<vk::Pipeline, String> {
-        let mut cache = self.variants.lock().expect("render pipeline cache");
-        if let Some(pipeline) = cache.get(key) {
+        // Compiled without the lock held: a driver can take tens of
+        // milliseconds, and other encoders drawing with this state must not
+        // wait on a variant they do not need.
+        if let Some(pipeline) = self
+            .variants
+            .lock()
+            .expect("render pipeline cache")
+            .get(key)
+        {
             return Ok(*pipeline);
         }
         let mut shape = self.pass.clone();
@@ -418,11 +429,20 @@ impl RenderPipeline {
         let pipeline = crate::stats::pipeline(|| unsafe {
             self.gpu
                 .device
-                .create_graphics_pipelines(vk::PipelineCache::null(), &[info], None)
+                .create_graphics_pipelines(self.gpu.pipeline_cache(), &[info], None)
         })
         .map_err(|(_, error)| format!("vkCreateGraphicsPipelines failed with {error:?}"))?[0];
-        cache.insert(*key, pipeline);
-        Ok(pipeline)
+        self.gpu.pipeline_created();
+        let mut cache = self.variants.lock().expect("render pipeline cache");
+        match cache.entry(*key) {
+            std::collections::hash_map::Entry::Occupied(made) => {
+                // Another thread compiled it first; this one was never recorded.
+                // SAFETY: a pipeline of this device's which nothing refers to.
+                unsafe { self.gpu.device.destroy_pipeline(pipeline, None) };
+                Ok(*made.get())
+            }
+            std::collections::hash_map::Entry::Vacant(slot) => Ok(*slot.insert(pipeline)),
+        }
     }
 
     pub fn supports_base_instance(&self, base_instance: u64) -> bool {

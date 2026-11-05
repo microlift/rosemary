@@ -1,6 +1,7 @@
 """Reader for Rosemary AOT cache files (`*.rmc`), independent of Binary Ninja.
 
-Mirrors `crates/rosemary/src/aot/file.rs` (the `RMAOTv1` wrapper) and Microlift's
+Mirrors `crates/rosemary/src/aot/file.rs` (the `RMAOTv2` wrapper; `RMAOTv1` files, which lack the
+source path, are still read) and Microlift's
 `src/image.rs` (each `MLIMAGE` chunk). Little-endian throughout.
 """
 
@@ -9,7 +10,9 @@ from dataclasses import dataclass, field
 from enum import IntEnum
 from typing import List, Optional, Tuple, Union
 
-CACHE_MAGIC = b"RMAOTv1\0"
+CACHE_MAGIC = b"RMAOTv2\0"
+# The previous wrapper, identical but for the missing source path.
+CACHE_MAGIC_V1 = b"RMAOTv1\0"
 IMAGE_MAGIC = b"MLIMAGE\0"
 IMAGE_FORMAT_VERSION = 1
 
@@ -146,6 +149,8 @@ class Image:
 @dataclass
 class CacheFile:
     lift_slide: int
+    # Where the image was read from when the file was built; None in `RMAOTv1` files.
+    source: Optional[str] = None
     chunks: List[Image] = field(default_factory=list)
 
 
@@ -299,17 +304,18 @@ def _validate(image: Image) -> None:
 
 
 def is_cache_file(data) -> bool:
-    return bytes(data[: len(CACHE_MAGIC)]) == CACHE_MAGIC
+    return bytes(data[: len(CACHE_MAGIC)]) in (CACHE_MAGIC, CACHE_MAGIC_V1)
 
 
 def decode(data) -> CacheFile:
     """Decodes a whole cache file. `data` is any sliceable byte sequence."""
     if not is_cache_file(data):
         raise FormatError("not a Rosemary cache file")
+    has_source = bytes(data[: len(CACHE_MAGIC)]) == CACHE_MAGIC
     r = _Reader(data, len(CACHE_MAGIC))
     lift_slide = r.u64()
     count = r.u64()
-    out = CacheFile(lift_slide)
+    out = CacheFile(lift_slide, r.str() if has_source else None)
     for _ in range(count):
         length = r.u64()
         if length > r.end - r.at:
@@ -338,7 +344,8 @@ if __name__ == "__main__":
     for path in sys.argv[1:]:
         with open(path, "rb") as f:
             cache = decode(f.read())
-        print(f"{path}: lift slide {cache.lift_slide:#x}, {len(cache.chunks)} chunk(s)")
+        source = cache.source or "unknown source"
+        print(f"{path}: {source}, lift slide {cache.lift_slide:#x}, {len(cache.chunks)} chunk(s)")
         for i, image in enumerate(cache.chunks):
             print(
                 f"  chunk {i}: isa {image.isa_fingerprint:016x} config {image.config_fingerprint:016x} "

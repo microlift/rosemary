@@ -73,6 +73,13 @@ static MISSES: AtomicU64 = AtomicU64::new(0);
 static WRITES: AtomicU64 = AtomicU64::new(0);
 static ERRORS: AtomicU64 = AtomicU64::new(0);
 
+/// The directory this build's entries live in, for a runtime which keeps
+/// what it derives from them (a driver's compiled pipelines) beside them:
+/// pruned with them, and disabled with them.
+pub fn directory() -> Option<&'static Path> {
+    root()
+}
+
 /// What the cache has done so far, for a runtime which reports counters.
 pub fn stats() -> Stats {
     Stats {

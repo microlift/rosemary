@@ -65,11 +65,16 @@ fn build(value: &Value, mutability: u64, depth: usize) -> Result<CFTypeRef, Stri
             return Err("the document holds a null, which is not a property list type".into());
         }
         Value::Array(values) => {
-            let elements = values
-                .iter()
-                .map(|v| build(v, mutability, depth + 1))
-                .collect::<Result<Vec<_>, _>>();
-            let elements = elements?;
+            let mut elements = Vec::with_capacity(values.len());
+            for value in values {
+                match build(value, mutability, depth + 1) {
+                    Ok(element) => elements.push(element),
+                    Err(why) => {
+                        release_each(&elements);
+                        return Err(why);
+                    }
+                }
+            }
             let array =
                 collections::new_array(&elements, Policy::from_type_callbacks(), containers);
             release_each(&elements);

@@ -15,6 +15,7 @@ foundation.workspace = true
 objc.workspace = true
 metal_translate.workspace = true
 rspirv.workspace = true
+sha2.workspace = true
 appkit.workspace = true
 sdl3.workspace = true
 starnix.workspace = true

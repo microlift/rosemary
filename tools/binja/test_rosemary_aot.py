@@ -3,7 +3,7 @@
 import struct
 import unittest
 
-from rosemary_aot import layout, rmc
+from rosemary_aot import context, layout, rmc
 
 
 def u64(v):
@@ -42,15 +42,24 @@ def sample_image():
     return out
 
 
+SAMPLE_SOURCE = "/Applications/Example.app/Contents/MacOS/Example"
+
+
 def sample_file(lift_slide=0x800):
     image = sample_image()
-    return rmc.CACHE_MAGIC + u64(lift_slide) + u64(1) + u64(len(image)) + image
+    return rmc.CACHE_MAGIC + u64(lift_slide) + u64(1) + string(SAMPLE_SOURCE) + u64(len(image)) + image
+
+
+def sample_v1_file(lift_slide=0x800):
+    image = sample_image()
+    return rmc.CACHE_MAGIC_V1 + u64(lift_slide) + u64(1) + u64(len(image)) + image
 
 
 class ReaderTests(unittest.TestCase):
     def test_reads_a_file_with_its_regions(self):
         cache = rmc.decode(sample_file())
         self.assertEqual(cache.lift_slide, 0x800)
+        self.assertEqual(cache.source, SAMPLE_SOURCE)
         image = cache.chunks[0]
         self.assertEqual(image.isa_fingerprint, 1)
         self.assertIsInstance(image.symbols[0], rmc.GuestSlide)
@@ -60,6 +69,11 @@ class ReaderTests(unittest.TestCase):
         self.assertEqual(region.link_sites, [(0x2000, rmc.LinkSiteKind.STATIC_EDGE)])
         self.assertEqual(region.import_decisions[0][1].kind, rmc.DecisionKind.SLOW)
         self.assertEqual(region.map, [(0, 4, 0x1000)])
+
+    def test_reads_a_v1_file_without_a_source(self):
+        cache = rmc.decode(sample_v1_file())
+        self.assertIsNone(cache.source)
+        self.assertEqual(len(cache.chunks), 1)
 
     def test_rejects_truncated_and_foreign_files(self):
         data = sample_file()
@@ -98,6 +112,81 @@ class LayoutTests(unittest.TestCase):
     def test_splits_cranelift_signatures(self):
         self.assertEqual(layout.parse_signature("(i64, f64) -> i32 apple_aarch64"), (["i64", "f64"], ["i32"], "apple_aarch64"))
         self.assertEqual(layout.parse_signature("() system_v"), ([], [], "system_v"))
+
+
+def ldr_x(rt, rn, offset):
+    return 0xF9400000 | (offset // 8) << 10 | rn << 5 | rt
+
+
+def ldr_q(rt, rn, offset):
+    return 0x3DC00000 | (offset // 16) << 10 | rn << 5 | rt
+
+
+STUR_X0_SP = 0xF80003E0
+LDUR_X2_SP = 0xF84003E2
+BLR_X1 = 0xD63F0020
+RET = 0xD65F03C0
+
+
+def code(*words):
+    return struct.pack(f"<{len(words)}I", *words)
+
+
+class ContextTests(unittest.TestCase):
+    def test_register_context_matches_microlift_offsets(self):
+        offset = lambda field: context.offset_of(context.REGISTER_CONTEXT, field)
+        # The offsets Microlift's own `context::tests` pin.
+        self.assertEqual(offset("link_table"), 152)
+        self.assertEqual(offset("xmm"), 192)
+        self.assertEqual(offset("link_hit"), 616)
+        self.assertEqual((offset("cf"), offset("control"), offset("callret_base")), (160, 168, 624))
+        whole = context.layout_of(context.REGISTER_CONTEXT)
+        self.assertEqual((whole.size, whole.align), (656, 16))
+        self.assertEqual(context.layout_of(context.LINK_ENTRY).size, rmc.LINK_ENTRY_SIZE)
+
+    def test_control_fields_sit_where_regions_store_them(self):
+        self.assertEqual(context.control_offset("exit_reason"), 168)
+        self.assertEqual(context.control_offset("exit_code"), 172)
+
+    def test_reads_an_exit_code_under_its_reason(self):
+        reason = lambda name: next(v for n, v in context.ENUMS[context.EXIT_REASON].members if n == name)
+        jump = context.describe_exit_code(reason("ExitUnknownJump"), 8)
+        self.assertEqual((jump.text, jump.enum), ("TransferIndirectCall", context.TRANSFER_KIND))
+        self.assertEqual(context.describe_exit_code(reason("ExitInterrupt"), 0x80).text, "vector 0x80")
+        self.assertEqual(context.describe_exit_code(reason("ExitPortOutput"), 2).text, "2-byte elements")
+        self.assertIsNone(context.describe_exit_code(reason("ExitReturn"), 1))
+        self.assertIsNone(context.describe_exit_code(reason("ExitUnknownJump"), 99))
+
+    def test_retired_exit_reasons_have_no_name(self):
+        self.assertIsNone(context.enum_member(context.EXIT_REASON, 2))
+        self.assertIsNone(context.enum_member(context.EXIT_REASON, 4))
+
+    def test_names_whole_guest_registers_only(self):
+        self.assertEqual(context.guest_register_at(32, 8), "rsp")
+        self.assertEqual(context.guest_register_at(192 + 3 * 16, 16), "xmm3")
+        self.assertIsNone(context.guest_register_at(128, 8))
+        self.assertIsNone(context.guest_register_at(36, 8))
+
+    def test_decodes_pinned_registers_from_an_entry_thunk(self):
+        thunk = code(
+            ldr_x(3, 0, 32),
+            ldr_x(4, 0, 56),
+            ldr_q(8, 0, 192 + 2 * 16),
+            ldr_x(5, 1, 0),
+            STUR_X0_SP,
+            LDUR_X2_SP,
+            BLR_X1,
+        )
+        abi = context.decode_aarch64_thunk(b"\0" * 4 + thunk, 4)
+        self.assertEqual(abi.context, "x2")
+        self.assertEqual(
+            [(s.register, s.guest, s.vector) for s in abi.slots],
+            [("x3", "rsp", False), ("x4", "rdi", False), ("q8", "xmm2", True)],
+        )
+
+    def test_types_nothing_for_a_thunk_of_another_shape(self):
+        self.assertIsNone(context.decode_aarch64_thunk(code(ldr_x(3, 0, 32), RET), 0))
+        self.assertIsNone(context.decode_aarch64_thunk(code(ldr_x(3, 0, 32), BLR_X1), 0))
 
 
 if __name__ == "__main__":
