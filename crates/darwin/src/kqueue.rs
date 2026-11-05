@@ -1802,11 +1802,26 @@ mod tests {
         tv_nsec: 0,
     };
 
-    /// A pipe, as the two descriptors a readiness test needs.
+    /// Held while a test starts a child, and by a test that needs to see a
+    /// descriptor's last close: until the child execs it holds a copy of every
+    /// descriptor, close-on-exec or not.
+    static CHILD_START: Mutex<()> = Mutex::new(());
+
+    fn child_start() -> std::sync::MutexGuard<'static, ()> {
+        CHILD_START.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// A pipe, as the two descriptors a readiness test needs. Close-on-exec,
+    /// so a child another test starts does not hold an end open.
     fn pipe() -> (c_int, c_int) {
         let mut ends = [0 as c_int; 2];
-        // SAFETY: a live array of two `int`.
-        assert_eq!(unsafe { libc::pipe(ends.as_mut_ptr()) }, 0);
+        // SAFETY: a live array of two `int`, then the two descriptors it got.
+        unsafe {
+            assert_eq!(libc::pipe(ends.as_mut_ptr()), 0);
+            for end in ends {
+                libc::fcntl(end, libc::F_SETFD, libc::FD_CLOEXEC);
+            }
+        }
         (ends[0], ends[1])
     }
 
@@ -2143,7 +2158,9 @@ mod tests {
             ..Kevent::default()
         };
         assert_eq!(collect(queue, Some(&add)).0, 0);
+        let start = child_start();
         let mut child = std::process::Command::new("true").spawn().expect("true");
+        drop(start);
         child.wait().expect("the child");
         let mut got = [Kevent::default(); 1];
         let timeout = libc::timespec {
@@ -2165,6 +2182,111 @@ mod tests {
         assert!(got[0].data >= 1);
         // SAFETY: this test's own descriptor.
         unsafe { crate::net::descriptor::close(queue) };
+    }
+
+    /// How many stops [`a_signal_event_sees_every_stop_of_a_default_stop_signal`]
+    /// sends.
+    const STOPS: isize = 2;
+
+    /// Marks the process running [`stop_watcher_child`].
+    const STOP_WATCHER: &str = "ROSEMARY_KQUEUE_TEST_STOP_WATCHER";
+
+    /// Where [`stop_watcher_child`] reports: stderr, which the test harness
+    /// leaves alone when nothing fails.
+    const STOP_WATCHER_REPORT: c_int = libc::STDERR_FILENO;
+
+    /// A watched stop signal still stops the process, and the watch survives
+    /// the stop: a job-control shell sees every ^Z, not only the first.
+    #[test]
+    fn a_signal_event_sees_every_stop_of_a_default_stop_signal() {
+        use std::os::fd::{FromRawFd, OwnedFd};
+        use std::os::unix::process::CommandExt;
+        let host =
+            crate::signal::signal_to_host(crate::signal::signum::SIGTSTP).expect("a host signal");
+        let (report_read, report_write) = pipe();
+        let start = child_start();
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "kqueue::tests::stop_watcher_child"])
+            .env(STOP_WATCHER, "1")
+            // SAFETY: the write end, owned from here on.
+            .stderr(unsafe { OwnedFd::from_raw_fd(report_write) })
+            // A group of its own, with this process outside it: the kernel
+            // discards stop signals sent to an orphaned group.
+            .process_group(0)
+            .spawn()
+            .expect("the test binary");
+        drop(start);
+        let pid = child.id() as libc::pid_t;
+        let mut byte = 0u8;
+        let mut status = 0;
+        // SAFETY: this test's own pipe and child.
+        unsafe {
+            assert_eq!(libc::read(report_read, (&raw mut byte).cast(), 1), 1);
+            for _ in 0..STOPS {
+                assert_eq!(libc::kill(pid, host), 0);
+                assert_eq!(libc::waitpid(pid, &mut status, libc::WUNTRACED), pid);
+                assert!(libc::WIFSTOPPED(status));
+                assert_eq!(libc::WSTOPSIG(status), host, "stopped by the signal itself");
+                assert_eq!(libc::kill(pid, libc::SIGCONT), 0);
+                assert_eq!(libc::read(report_read, (&raw mut byte).cast(), 1), 1);
+            }
+            libc::close(report_read);
+        }
+        let status = child.wait().expect("the child");
+        assert_eq!(status.code().map(|code| code as isize), Some(STOPS));
+    }
+
+    /// The watcher for the test above, in a process of its own: it reports
+    /// once ready and once per event, and exits with the number of stops seen.
+    #[test]
+    fn stop_watcher_child() {
+        if std::env::var_os(STOP_WATCHER).is_none() {
+            return;
+        }
+        let report = STOP_WATCHER_REPORT;
+        let queue = kqueue();
+        let add = Kevent {
+            ident: crate::signal::signum::SIGTSTP as usize,
+            filter: EVFILT_SIGNAL,
+            flags: EV_ADD,
+            ..Kevent::default()
+        };
+        let timeout = libc::timespec {
+            tv_sec: 5,
+            tv_nsec: 0,
+        };
+        let mut got = [Kevent::default(); 1];
+        let mut seen = 0;
+        // SAFETY: one change, room for one event, then this process's exit.
+        unsafe {
+            kevent(
+                queue,
+                &raw const add,
+                1,
+                got.as_mut_ptr(),
+                0,
+                &raw const NO_WAIT,
+            );
+            libc::write(report, c"r".as_ptr().cast(), 1);
+            while seen < STOPS {
+                match kevent(
+                    queue,
+                    std::ptr::null(),
+                    0,
+                    got.as_mut_ptr(),
+                    1,
+                    &raw const timeout,
+                ) {
+                    0 => break,
+                    1 => {
+                        seen += got[0].data;
+                        libc::write(report, c"e".as_ptr().cast(), 1);
+                    }
+                    _ => continue,
+                }
+            }
+            libc::_exit(seen as c_int);
+        }
     }
 
     /// A wakeup for a signal another queue watches is not an event, and the
@@ -2485,8 +2607,10 @@ mod tests {
         assert_eq!(got.data, SOCKEV_CONNECTED);
         assert_eq!(collect(queue, None).0, 0, "and only once");
 
+        let start = child_start();
         drop(peer);
         let (n, got) = collect(queue, None);
+        drop(start);
         assert_eq!(n, 1);
         assert_eq!(got.fflags, NOTE_READCLOSED | NOTE_DISCONNECTED);
         assert_eq!(got.data, SOCKEV_DISCONNECTED);
@@ -2545,6 +2669,7 @@ mod tests {
         assert_eq!(collect(queue, None).0, 1, "writable when registered");
         assert_eq!(collect(queue, None).0, 0, "and not again until it changes");
         // SAFETY: this test's own descriptors.
+        let start = child_start();
         unsafe {
             libc::close(read_end);
             assert_eq!(
@@ -2552,6 +2677,7 @@ mod tests {
                 1,
                 "the reader going away is a change"
             );
+            drop(start);
             libc::close(write_end);
             crate::net::descriptor::close(queue);
         }
