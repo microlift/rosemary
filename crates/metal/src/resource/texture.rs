@@ -500,7 +500,7 @@ pub(super) unsafe extern "C" fn replace_region(
     let aspect = texture.image.aspect;
     let result = texture.gpu.defer(|gpu, batch| {
         let (buffer, offset) = batch.stage(gpu, source, alignment)?;
-        batch.touch(image);
+        batch.touch_subresource(gpu, image, checked.level, checked.slice);
         let copy = vk::BufferImageCopy::default()
             .buffer_offset(offset)
             .buffer_row_length(row_length as u32)
