@@ -142,6 +142,10 @@ pub struct Gpu {
     pub(crate) occlusion_precise: bool,
     /// Whether a pipeline can force coverage-written alpha to one.
     pub(crate) alpha_to_one: bool,
+    /// Whether culling, winding, depth and stencil state and the topology
+    /// within its class are set per draw, as Vulkan 1.3 can, rather than
+    /// compiled into one pipeline per combination.
+    pub(crate) dynamic_render_state: bool,
     host_query_reset: bool,
     /// Whether the device has timeline semaphores, which `MTLEvent`s are.
     pub(crate) timeline_semaphores: bool,
@@ -818,6 +822,7 @@ impl Gpu {
             occlusion_pools: Mutex::new(Vec::new()),
             occlusion_precise: features.occlusion_query_precise == vk::TRUE,
             alpha_to_one: features.alpha_to_one == vk::TRUE,
+            dynamic_render_state: target.vulkan_version >= (1, 3),
             host_query_reset,
             timeline_semaphores,
             contexts: Mutex::new(Vec::new()),

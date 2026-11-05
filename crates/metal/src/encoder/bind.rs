@@ -41,6 +41,7 @@ pub(crate) fn new_encoder(command_buffer: Id, kind: Kind) -> Id {
             capture_pass: None,
             visibility: None,
             render_variant: None,
+            render_dynamic: None,
             compute_variant: None,
             attachments: Vec::new(),
             writes_elsewhere: false,
@@ -852,14 +853,17 @@ impl Encoder {
             resolve_mask: self.resolve_mask,
             depth_resolve: self.depth_resolve,
         };
-        let pipeline = match self.render_variant {
-            Some((object, cached, pipeline)) if object == self.render_pipeline && cached == key => {
-                pipeline
+        let (pipeline, wanted) = match self.render_variant {
+            Some((object, cached, pipeline, dynamic))
+                if object == self.render_pipeline && cached == key =>
+            {
+                (pipeline, dynamic)
             }
-            _ => match state.variant(&key) {
+            _ => match state.variant(&state.pipeline_key(&key)) {
                 Ok(pipeline) => {
-                    self.render_variant = Some((self.render_pipeline, key, pipeline));
-                    pipeline
+                    let dynamic = state.dynamic_state(&key);
+                    self.render_variant = Some((self.render_pipeline, key, pipeline, dynamic));
+                    (pipeline, dynamic)
                 }
                 Err(reason) => {
                     gpu::trace(format!("render pipeline creation failed: {reason}"));
@@ -871,6 +875,10 @@ impl Encoder {
         let command = self.command();
         let device = &command.gpu.device;
         let vk_command = command.command_buffer;
+        if command.gpu.dynamic_render_state && self.render_dynamic != Some(wanted) {
+            wanted.record(device, vk_command, self.render_dynamic.as_ref());
+            self.render_dynamic = Some(wanted);
+        }
 
         // Vertex streams are the buffer indices the vertex descriptor claims;
         // every other bound buffer is a descriptor resource. The buffers were

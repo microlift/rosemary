@@ -44,8 +44,8 @@ use crate::gpu::{
 };
 use crate::object::{self, methods};
 use crate::pipeline::{
-    BUFFER_SET, ComputePipeline, DepthStencilKey, Layouts, RenderPipeline, RenderVariantKey, SETS,
-    binding_type,
+    BUFFER_SET, ComputePipeline, DepthStencilKey, Layouts, RenderDynamicState, RenderPipeline,
+    RenderVariantKey, SETS, binding_type,
 };
 use crate::resource::{Buffer, DepthStencilState, SamplerState, Texture};
 use crate::stats::{self, Counter};
@@ -343,7 +343,10 @@ pub(crate) struct Encoder {
     visibility: Option<VisibilityTarget>,
     /// The pipeline variant the last draw or dispatch used, with the state
     /// which chose it, so a run of draws with one state asks no cache.
-    render_variant: Option<(Id, RenderVariantKey, vk::Pipeline)>,
+    render_variant: Option<(Id, RenderVariantKey, vk::Pipeline, RenderDynamicState)>,
+    /// The per-draw state this encoder last recorded, where the device sets
+    /// it per draw; `None` until the first draw, as nothing is inherited.
+    render_dynamic: Option<RenderDynamicState>,
     compute_variant: Option<(Id, [u32; 3], vk::Pipeline)>,
     /// A render encoder's attachment images, all of them written.
     attachments: Vec<(vk::Image, vk::ImageAspectFlags)>,

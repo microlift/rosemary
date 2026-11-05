@@ -2968,6 +2968,59 @@ fn a_pass_which_loads_and_draws_nothing_leaves_its_attachment_alone() {
     }
 }
 
+/// Culling and winding are set per draw: one pipeline drawn under each
+/// combination culls exactly the triangles Metal would, and is compiled
+/// once, when it is made, rather than once per combination.
+#[test]
+fn culling_and_winding_change_without_another_pipeline() {
+    isolate_metal_fixture!();
+    let Some(device) = gpu_device() else {
+        return;
+    };
+    const CULL_NONE: u64 = 0;
+    const CULL_BACK: u64 = 2;
+    const CLOCKWISE: u64 = 0;
+    const COUNTER_CLOCKWISE: u64 = 1;
+    let fixture = SamplingDraw::new(device);
+    let blue = fixture.filled(BLUE);
+    let cases = [
+        (CULL_BACK, CLOCKWISE),
+        (CULL_BACK, COUNTER_CLOCKWISE),
+        (CULL_NONE, CLOCKWISE),
+    ];
+    let targets: Vec<Id> = cases.iter().map(|_| fixture.target()).collect();
+    // SAFETY: objects this test made, sent the selectors they implement.
+    unsafe {
+        let command = send(fixture.queue, "commandBuffer");
+        for (&(cull, winding), &target) in cases.iter().zip(&targets) {
+            let pass = render_encoder(command, single_target_pass(target, LOAD_CLEAR, RED));
+            fixture.prepare(pass, blue);
+            send_number(pass, "setCullMode:", cull);
+            send_number(pass, "setFrontFacingWinding:", winding);
+            draw(pass, 3);
+            send_void(pass, "endEncoding");
+        }
+        let pixels = fixture.read(command, &targets);
+        let drawn = |pixels: &[[u8; 4]]| pixels.iter().all(|pixel| *pixel == BLUE_PIXEL);
+        let cleared = |pixels: &[[u8; 4]]| pixels.iter().all(|pixel| *pixel == RED_PIXEL);
+        // The triangle faces one way, so back-face culling removes it under
+        // exactly one of the two windings.
+        assert!(
+            (drawn(&pixels[0]) && cleared(&pixels[1]))
+                || (cleared(&pixels[0]) && drawn(&pixels[1])),
+            "{:?} / {:?}",
+            pixels[0],
+            pixels[1]
+        );
+        assert_all(&pixels[2], BLUE_PIXEL, "unculled");
+        let gpu = gpu_of(device).expect("a Vulkan device");
+        if gpu.dynamic_render_state {
+            let state = object::body::<crate::pipeline::RenderPipeline>(fixture.state);
+            assert_eq!(state.variant_count(), 1);
+        }
+    }
+}
+
 const MTL_PIXEL_FORMAT_DEPTH32_FLOAT: u64 = 252;
 const MTL_STORAGE_MODE_PRIVATE: u64 = 2;
 const MTL_COMPARE_FUNCTION_LESS_EQUAL: u64 = 3;
