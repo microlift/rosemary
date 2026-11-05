@@ -12,8 +12,13 @@
 //! Every submission to the queue goes through [`Gpu::submit`] or
 //! [`Gpu::submit_synchronized`], which flush the batch first, so nothing can
 //! reach the device before the work Metal says already happened.
+//!
+//! The transfers in a batch overlap on the device unless one reaches what an
+//! earlier one wrote: a game streaming its world in fills hundreds of mip
+//! levels a frame, and a barrier after each drained the device as many
+//! times ahead of the frame. One barrier closes the batch.
 
-use std::collections::{HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 
 use super::*;
 
@@ -34,6 +39,12 @@ pub struct Batch {
     /// Likewise the private buffers it names, and those destroyed since.
     buffers_named: HashSet<vk::Buffer>,
     doomed_buffers: Vec<GpuBuffer>,
+    /// What the recording wrote since its last barrier, by image or buffer
+    /// handle: the mip level and array slice of each write, or `None` for a
+    /// write to all of it.
+    written: HashMap<u64, Option<Vec<(u32, u32)>>>,
+    /// Whether anything was recorded since the last barrier.
+    unordered: bool,
 }
 
 #[derive(Default)]
@@ -48,14 +59,73 @@ impl Batch {
         self.context.command_buffer
     }
 
-    /// Note that the recording names `image`.
-    pub fn touch(&mut self, image: vk::Image) {
+    /// Note that the recording names `image` only to lay it out, behind a
+    /// barrier of its own which orders whatever follows. Every other command
+    /// on an image is noted with [`Self::touch_subresource`].
+    pub fn name(&mut self, image: vk::Image) {
         self.images.insert(image);
     }
 
-    /// Note that the recording names `buffer`.
-    pub fn touch_buffer(&mut self, buffer: vk::Buffer) {
+    /// Note that the next command recorded writes one mip level and array
+    /// slice of `image`.
+    pub fn touch_subresource(&mut self, gpu: &Gpu, image: vk::Image, level: u32, slice: u32) {
+        self.images.insert(image);
+        self.order(gpu, vk::Handle::as_raw(image), Some((level, slice)));
+    }
+
+    /// Note that the next command recorded writes `buffer`.
+    pub fn touch_buffer(&mut self, gpu: &Gpu, buffer: vk::Buffer) {
         self.buffers_named.insert(buffer);
+        self.order(gpu, vk::Handle::as_raw(buffer), None);
+    }
+
+    /// Order a write to `part` of `handle` after an earlier write in this
+    /// batch to the same memory, which Metal performed first.
+    fn order(&mut self, gpu: &Gpu, handle: u64, part: Option<(u32, u32)>) {
+        let overlaps = match (self.written.get(&handle), part) {
+            (None, _) => false,
+            (Some(None), _) | (Some(Some(_)), None) => true,
+            (Some(Some(parts)), Some(part)) => parts.contains(&part),
+        };
+        if overlaps {
+            self.barrier(gpu);
+        }
+        self.unordered = true;
+        match (
+            self.written
+                .entry(handle)
+                .or_insert_with(|| Some(Vec::new())),
+            part,
+        ) {
+            (Some(parts), Some(part)) => parts.push(part),
+            (entry, _) => *entry = None,
+        }
+    }
+
+    /// Everything recorded so far completes, with its writes visible, before
+    /// anything recorded after.
+    fn barrier(&mut self, gpu: &Gpu) {
+        if !self.unordered {
+            return;
+        }
+        let memory = vk::MemoryBarrier::default()
+            .src_access_mask(vk::AccessFlags::MEMORY_WRITE)
+            .dst_access_mask(vk::AccessFlags::MEMORY_READ | vk::AccessFlags::MEMORY_WRITE);
+        // SAFETY: the batch's command buffer is recording, and the batch lock
+        // makes this the only thread recording into it.
+        unsafe {
+            gpu.device.cmd_pipeline_barrier(
+                self.command_buffer(),
+                vk::PipelineStageFlags::ALL_COMMANDS,
+                vk::PipelineStageFlags::ALL_COMMANDS,
+                vk::DependencyFlags::empty(),
+                &[memory],
+                &[],
+                &[],
+            )
+        };
+        self.written.clear();
+        self.unordered = false;
     }
 
     /// Copy `bytes` somewhere the device can read them until the batch has
@@ -113,24 +183,6 @@ impl Gpu {
         }
         let batch = pending.as_mut().expect("just opened");
         let result = body(self, batch);
-        // Metal performed these one after another, so a later copy over the
-        // same texels must land after an earlier one.
-        let memory = vk::MemoryBarrier::default()
-            .src_access_mask(vk::AccessFlags::MEMORY_WRITE)
-            .dst_access_mask(vk::AccessFlags::MEMORY_READ | vk::AccessFlags::MEMORY_WRITE);
-        // SAFETY: the batch's command buffer is recording, and the lock makes
-        // this the only thread recording into it.
-        unsafe {
-            self.device.cmd_pipeline_barrier(
-                batch.command_buffer(),
-                vk::PipelineStageFlags::ALL_COMMANDS,
-                vk::PipelineStageFlags::ALL_COMMANDS,
-                vk::DependencyFlags::empty(),
-                &[memory],
-                &[],
-                &[],
-            )
-        };
         crate::stats::count(crate::stats::Counter::DeferredTransfers);
         result
     }
@@ -159,13 +211,15 @@ impl Gpu {
             doomed: Vec::new(),
             buffers_named: HashSet::new(),
             doomed_buffers: Vec::new(),
+            written: HashMap::new(),
+            unordered: false,
         })
     }
 
     /// Submit the pending batch, if any, ahead of whatever the caller submits
     /// next. `queue` is the Vulkan queue, which the caller holds locked.
     pub(super) fn flush_deferred(&self, queue: vk::Queue) {
-        let Some(batch) = self
+        let Some(mut batch) = self
             .deferred
             .pending
             .lock()
@@ -174,6 +228,8 @@ impl Gpu {
         else {
             return;
         };
+        // The work submitted after the batch sees everything it wrote.
+        batch.barrier(self);
         let command_buffer = batch.command_buffer();
         let buffers = [command_buffer];
         let submit = vk::SubmitInfo::default().command_buffers(&buffers);

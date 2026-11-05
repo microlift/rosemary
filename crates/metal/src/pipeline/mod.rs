@@ -28,8 +28,8 @@ use render::render_pipeline_dealloc;
 
 pub(crate) use compute::ComputePipeline;
 pub(crate) use render::{
-    COLOR_ATTACHMENTS, ColorAttachment, DepthStencilKey, RenderPipeline, RenderPipelineDescriptor,
-    RenderVariantKey,
+    COLOR_ATTACHMENTS, ColorAttachment, DepthStencilKey, RenderDynamicState, RenderPipeline,
+    RenderPipelineDescriptor, RenderVariantKey,
 };
 
 /// The four descriptor sets of the Metal resource ABI.

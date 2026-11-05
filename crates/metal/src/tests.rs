@@ -1647,6 +1647,138 @@ unsafe fn get_bytes(texture: Id, region: [u64; 4], bytes: &mut [u8], bytes_per_r
     };
 }
 
+/// Copies queued for one submission overlap on the device unless they reach
+/// the same texels: a later copy over part of a texture lands after the copy
+/// of the whole, and a copy into another texture between them is untouched.
+#[test]
+fn a_later_copy_over_the_same_texels_lands_after_an_earlier_one() {
+    isolate_metal_fixture!();
+    let Some(device) = gpu_device() else {
+        return;
+    };
+    const SIZE: u64 = 8;
+    let gpu = gpu_of(device).expect("a Vulkan device");
+    let texture = || {
+        resource::new_texture(
+            gpu,
+            resource::TextureDescriptor {
+                texture_type: 2,
+                pixel_format: 70, // RGBA8Unorm
+                width: SIZE,
+                height: SIZE,
+                depth: 1,
+                mipmap_level_count: 1,
+                sample_count: 1,
+                array_length: 1,
+                storage_mode: 0,
+                usage: gpu::USAGE_SHADER_READ,
+            },
+        )
+    };
+    let (patched, other) = (texture(), texture());
+    let whole = vec![0x11u8; (SIZE * SIZE * 4) as usize];
+    let patch = vec![0x22u8; 4 * 4 * 4];
+    let elsewhere = vec![0x33u8; (SIZE * SIZE * 4) as usize];
+    // SAFETY: textures this test made, and bytes covering each region.
+    unsafe {
+        replace_region(patched, [0, 0, SIZE, SIZE], &whole, SIZE * 4);
+        replace_region(other, [0, 0, SIZE, SIZE], &elsewhere, SIZE * 4);
+        replace_region(patched, [2, 2, 4, 4], &patch, 4 * 4);
+    }
+    let mut read = vec![0u8; (SIZE * SIZE * 4) as usize];
+    // SAFETY: the buffer covers the texture at its tight stride.
+    unsafe { get_bytes(patched, [0, 0, SIZE, SIZE], &mut read, SIZE * 4) };
+    for (index, texel) in read.chunks(4).enumerate() {
+        let (x, y) = (index as u64 % SIZE, index as u64 / SIZE);
+        let inside = (2..6).contains(&x) && (2..6).contains(&y);
+        let expected = if inside { 0x22 } else { 0x11 };
+        assert_eq!(texel, [expected; 4], "texel ({x}, {y})");
+    }
+    // SAFETY: as above.
+    unsafe { get_bytes(other, [0, 0, SIZE, SIZE], &mut read, SIZE * 4) };
+    assert!(read.iter().all(|byte| *byte == 0x33));
+    objc::arc::release(patched);
+    objc::arc::release(other);
+}
+
+/// The time a burst of texture streaming takes to reach the device: textures
+/// made and filled mip by mip, as a game loading assets fills them, then the
+/// submission they run ahead of. Run with `cargo test --release -p metal --
+/// --ignored --nocapture streaming_upload_cost`.
+#[test]
+#[ignore = "a benchmark, not a check"]
+fn streaming_upload_cost() {
+    let Some(device) = gpu_device() else {
+        return;
+    };
+    const TEXTURES: usize = 64;
+    const SIZE: u64 = 256;
+    const LEVELS: u64 = 9;
+    const ROUNDS: usize = 9;
+    let gpu = gpu_of(device).expect("a Vulkan device");
+    let bytes = vec![0x5Au8; (SIZE * SIZE * 4) as usize];
+    // SAFETY: a device of this crate's.
+    let queue = unsafe { new_command_queue(device, std::ptr::null()) };
+    let mut times = Vec::new();
+    for _ in 0..ROUNDS {
+        let start = std::time::Instant::now();
+        let textures: Vec<Id> = (0..TEXTURES)
+            .map(|_| {
+                resource::new_texture(
+                    gpu,
+                    resource::TextureDescriptor {
+                        texture_type: 2,
+                        pixel_format: 70, // RGBA8Unorm
+                        width: SIZE,
+                        height: SIZE,
+                        depth: 1,
+                        mipmap_level_count: LEVELS,
+                        sample_count: 1,
+                        array_length: 1,
+                        storage_mode: 0,
+                        usage: gpu::USAGE_SHADER_READ,
+                    },
+                )
+            })
+            .collect();
+        // SAFETY: textures this test made, and bytes covering each level.
+        unsafe {
+            let sel = objc::sel::get("replaceRegion:mipmapLevel:withBytes:bytesPerRow:");
+            let method = objc::object::class_of(textures[0])
+                .and_then(|class| class.method(sel))
+                .expect("the selector is registered");
+            let call: unsafe extern "C" fn(Id, Sel, [u64; 6], u64, *const u8, u64) =
+                std::mem::transmute(method.implementation());
+            for &texture in &textures {
+                for level in 0..LEVELS {
+                    let side = (SIZE >> level).max(1);
+                    call(
+                        texture,
+                        sel,
+                        [0, 0, 0, side, side, 1],
+                        level,
+                        bytes.as_ptr(),
+                        side * 4,
+                    );
+                }
+            }
+            let command = send(queue, "commandBuffer");
+            send_void(command, "commit");
+            send_void(command, "waitUntilCompleted");
+        }
+        times.push(start.elapsed().as_secs_f64());
+        for texture in textures {
+            objc::arc::release(texture);
+        }
+    }
+    times.sort_by(f64::total_cmp);
+    eprintln!(
+        "{TEXTURES} textures of {LEVELS} levels made, filled and submitted: {:.2} ms median, {:.2} ms best",
+        times[ROUNDS / 2] * 1e3,
+        times[0] * 1e3,
+    );
+}
+
 /// A texture released while a copy into it is still waiting for a
 /// submission must outlive that copy rather than be destroyed under it.
 #[test]
@@ -2965,6 +3097,59 @@ fn a_pass_which_loads_and_draws_nothing_leaves_its_attachment_alone() {
         assert_eq!(recorded_barriers() - before, 0);
         let pixels = fixture.read(command, &[target]);
         assert_all(&pixels[0], BLUE_PIXEL, "the loaded attachment");
+    }
+}
+
+/// Culling and winding are set per draw: one pipeline drawn under each
+/// combination culls exactly the triangles Metal would, and is compiled
+/// once, when it is made, rather than once per combination.
+#[test]
+fn culling_and_winding_change_without_another_pipeline() {
+    isolate_metal_fixture!();
+    let Some(device) = gpu_device() else {
+        return;
+    };
+    const CULL_NONE: u64 = 0;
+    const CULL_BACK: u64 = 2;
+    const CLOCKWISE: u64 = 0;
+    const COUNTER_CLOCKWISE: u64 = 1;
+    let fixture = SamplingDraw::new(device);
+    let blue = fixture.filled(BLUE);
+    let cases = [
+        (CULL_BACK, CLOCKWISE),
+        (CULL_BACK, COUNTER_CLOCKWISE),
+        (CULL_NONE, CLOCKWISE),
+    ];
+    let targets: Vec<Id> = cases.iter().map(|_| fixture.target()).collect();
+    // SAFETY: objects this test made, sent the selectors they implement.
+    unsafe {
+        let command = send(fixture.queue, "commandBuffer");
+        for (&(cull, winding), &target) in cases.iter().zip(&targets) {
+            let pass = render_encoder(command, single_target_pass(target, LOAD_CLEAR, RED));
+            fixture.prepare(pass, blue);
+            send_number(pass, "setCullMode:", cull);
+            send_number(pass, "setFrontFacingWinding:", winding);
+            draw(pass, 3);
+            send_void(pass, "endEncoding");
+        }
+        let pixels = fixture.read(command, &targets);
+        let drawn = |pixels: &[[u8; 4]]| pixels.iter().all(|pixel| *pixel == BLUE_PIXEL);
+        let cleared = |pixels: &[[u8; 4]]| pixels.iter().all(|pixel| *pixel == RED_PIXEL);
+        // The triangle faces one way, so back-face culling removes it under
+        // exactly one of the two windings.
+        assert!(
+            (drawn(&pixels[0]) && cleared(&pixels[1]))
+                || (cleared(&pixels[0]) && drawn(&pixels[1])),
+            "{:?} / {:?}",
+            pixels[0],
+            pixels[1]
+        );
+        assert_all(&pixels[2], BLUE_PIXEL, "unculled");
+        let gpu = gpu_of(device).expect("a Vulkan device");
+        if gpu.dynamic_render_state {
+            let state = object::body::<crate::pipeline::RenderPipeline>(fixture.state);
+            assert_eq!(state.variant_count(), 1);
+        }
     }
 }
 
