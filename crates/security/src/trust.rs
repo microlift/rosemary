@@ -192,12 +192,27 @@ pub unsafe extern "C" fn SecCertificateCreateWithData(
     new(Payload::Certificate(bytes))
 }
 
+// An explicit CA-file override must never silently expand trust to a
+// different bundle if the selected file cannot be read.
+fn read_ca_bundle(
+    override_file: Option<&std::path::Path>,
+    defaults: &[&std::path::Path],
+) -> Vec<u8> {
+    if let Some(path) = override_file {
+        return std::fs::read(path).unwrap_or_default();
+    }
+    defaults
+        .iter()
+        .find_map(|path| std::fs::read(path).ok())
+        .unwrap_or_default()
+}
+
 /// The host's root certificates, DER-encoded, read once.
 ///
 /// From the bundle the host's own TLS libraries trust, so a program running
 /// its own stack trusts the same servers the rest of the machine does.
-/// `SSL_CERT_FILE` first, as OpenSSL reads it, then where Debian, Fedora,
-/// NixOS and the BSDs keep theirs.
+/// `SSL_CERT_FILE` overrides the default CA file; without it, discover
+/// bundles in the usual Debian, Fedora, NixOS and BSD locations.
 fn host_anchors() -> &'static [Vec<u8>] {
     static ANCHORS: std::sync::OnceLock<Vec<Vec<u8>>> = std::sync::OnceLock::new();
     ANCHORS.get_or_init(|| {
@@ -209,12 +224,9 @@ fn host_anchors() -> &'static [Vec<u8>] {
             "/etc/ssl/cert.pem",
             "/usr/local/share/certs/ca-root-nss.crt",
         ];
-        let named = std::env::var_os("SSL_CERT_FILE").map(std::path::PathBuf::from);
-        let pem = named
-            .into_iter()
-            .chain(BUNDLES.iter().map(std::path::PathBuf::from))
-            .find_map(|path| std::fs::read(path).ok())
-            .unwrap_or_default();
+        let named = std::env::var_os("SSL_CERT_FILE");
+        let defaults: Vec<_> = BUNDLES.iter().map(std::path::Path::new).collect();
+        let pem = read_ca_bundle(named.as_deref().map(std::path::Path::new), &defaults);
         CertificateDer::pem_slice_iter(&pem)
             .filter_map(Result::ok)
             .filter(|der| webpki::anchor_from_trusted_cert(der).is_ok())
@@ -1029,6 +1041,35 @@ exports::exports! {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn explicit_ca_file_override_never_falls_back_to_system_bundles() {
+        use std::path::Path;
+        let fixture = Path::new(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/src/testdata/tls_unit_ca.pem"
+        ));
+        let missing = fixture.with_extension("nonexistent-override-test");
+        let directory = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let defaults = [missing.as_path(), fixture];
+        let expected = include_bytes!("testdata/tls_unit_ca.pem").to_vec();
+
+        // Without an override, default discovery skips unreadable paths.
+        assert_eq!(read_ca_bundle(None, &defaults), expected);
+        // A readable override wins even if system discovery points elsewhere.
+        assert_eq!(
+            read_ca_bundle(Some(fixture), &[missing.as_path()]),
+            expected
+        );
+        // An explicitly selected missing/unreadable/empty path must not
+        // silently load the valid default CA bundle.
+        for override_file in [missing.as_path(), directory, Path::new("")] {
+            assert!(
+                read_ca_bundle(Some(override_file), &defaults).is_empty(),
+                "unexpected fallback for {override_file:?}"
+            );
+        }
+    }
 
     /// Every anchor reads back as the bytes it was made from, through both
     /// spellings of the question.
