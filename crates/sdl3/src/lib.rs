@@ -8,6 +8,7 @@ pub mod compositor;
 pub mod isolated;
 pub mod keycodes;
 pub mod mouse;
+pub mod pointer;
 pub mod tray;
 pub mod wayland;
 #[cfg(target_os = "linux")]
@@ -1682,6 +1683,7 @@ pub mod video {
         pub const RESIZABLE: u64 = 0x0000_0020;
         pub const MINIMIZED: u64 = 0x0000_0040;
         pub const MAXIMIZED: u64 = 0x0000_0080;
+        pub const MOUSE_GRABBED: u64 = 0x0000_0100;
         pub const INPUT_FOCUS: u64 = 0x0000_0200;
         pub const HIGH_PIXEL_DENSITY: u64 = 0x0000_2000;
         pub const ALWAYS_ON_TOP: u64 = 0x0001_0000;
@@ -2201,6 +2203,11 @@ pub mod video {
                 // Also kmsdrm is here because it's awesome
                 set_hint(c"SDL_VIDEO_DRIVER", c"wayland,x11,kmsdrm");
             }
+            // Two warps to the centre with the cursor hidden - a game's mouse
+            // look - would put a window into relative mode behind the
+            // runtime's back. Relative mode is the guest's to ask for, and a
+            // Wayland lock SDL took unasked collides with `crate::pointer`'s.
+            set_hint(HINT_MOUSE_EMULATE_WARP_WITH_RELATIVE, c"0");
             *up = super::init(super::init::VIDEO).is_ok();
             if *up {
                 // This thread now owns the event queue: see [`super::pump`].
@@ -3100,6 +3107,11 @@ pub mod video {
             return None;
         }
         register_live_window(window, None);
+        // Before the first warp: `crate::pointer` needs to know where the
+        // pointer is, and the watch's seats arrive a roundtrip later.
+        if let Some((display, _)) = wayland_surface(window) {
+            crate::wayland::watch(display);
+        }
         Some(window)
     }
 
@@ -4960,6 +4972,10 @@ pub mod video {
     /// GTK 3, which cannot share a process with the GTK 4 WebKit uses, so a
     /// runtime drawing its own decorations turns it off before video starts.
     pub const HINT_WAYLAND_ALLOW_LIBDECOR: &CStr = c"SDL_VIDEO_WAYLAND_ALLOW_LIBDECOR";
+
+    /// `SDL_HINT_MOUSE_EMULATE_WARP_WITH_RELATIVE`.
+    pub const HINT_MOUSE_EMULATE_WARP_WITH_RELATIVE: &CStr =
+        c"SDL_MOUSE_EMULATE_WARP_WITH_RELATIVE";
 
     /// `SDL_HINT_VIDEO_WAYLAND_PREFER_LIBDECOR`.
     pub const HINT_WAYLAND_PREFER_LIBDECOR: &CStr = c"SDL_VIDEO_WAYLAND_PREFER_LIBDECOR";
