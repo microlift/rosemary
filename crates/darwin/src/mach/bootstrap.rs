@@ -1,5 +1,5 @@
 use std::ffi::{CStr, c_char};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use super::kern::*;
 use super::space::{self, BOOTSTRAP, MACH_PORT_NULL, Name};
@@ -14,24 +14,11 @@ use super::wire::{self, Address};
 pub static BOOTSTRAP_PORT: Name = BOOTSTRAP;
 
 /// The directory services register themselves in.
-fn namespace() -> Option<&'static Path> {
-    static DIR: std::sync::OnceLock<Option<PathBuf>> = std::sync::OnceLock::new();
-    DIR.get_or_init(|| {
-        let base = match std::env::var_os("XDG_RUNTIME_DIR") {
-            Some(runtime) => PathBuf::from(runtime).join("rosemary"),
-            None => PathBuf::from(format!("/tmp/rosemary-{}", unsafe { libc::getuid() })),
-        };
-        let dir = base.join("bootstrap");
-        std::fs::create_dir_all(&dir).ok()?;
-        // The namespace is this user's, and a service name is a rendezvous
-        // token: another user able to write one could answer a lookup with a
-        // port of their own.
-        let _ =
-            std::fs::set_permissions(&base, std::os::unix::fs::PermissionsExt::from_mode(0o700));
-        let _ = std::fs::set_permissions(&dir, std::os::unix::fs::PermissionsExt::from_mode(0o700));
-        Some(dir)
-    })
-    .as_deref()
+///
+/// Private to this user: a service name is a rendezvous token, and another
+/// user able to write one could answer a lookup with a port of their own.
+fn namespace() -> Option<PathBuf> {
+    server::location::private_runtime_directory("bootstrap").ok()
 }
 
 /// The file a service name maps to.
@@ -317,7 +304,7 @@ mod tests {
     #[test]
     fn a_service_name_cannot_name_a_file_outside_the_namespace() {
         let escaping = entry("../../etc/passwd").expect("a name, however hostile");
-        assert_eq!(escaping.parent(), namespace());
+        assert_eq!(escaping.parent(), namespace().as_deref());
         assert!(entry("").is_none());
     }
 }

@@ -98,23 +98,26 @@ fn named(address: Address, suffix: &str) -> std::io::Result<(libc::sockaddr_un, 
 
 /// BSD hosts bind a filesystem socket in Rosemary's private runtime directory.
 #[cfg(not(target_os = "linux"))]
-fn socket_path(address: Address) -> std::path::PathBuf {
-    server::location::runtime_directory().join(format!("mach/{address:016x}"))
+fn socket_path(address: Address) -> std::io::Result<std::path::PathBuf> {
+    Ok(server::location::private_runtime_directory("mach")?.join(format!("{address:016x}")))
 }
 
 #[cfg(not(target_os = "linux"))]
-fn senders_path(address: Address) -> std::path::PathBuf {
-    server::location::runtime_directory().join(format!("mach/{address:016x}.senders"))
+fn senders_path(address: Address) -> std::io::Result<std::path::PathBuf> {
+    Ok(
+        server::location::private_runtime_directory("mach")?
+            .join(format!("{address:016x}.senders")),
+    )
 }
 
 #[cfg(not(target_os = "linux"))]
 fn sockaddr(address: Address) -> std::io::Result<(libc::sockaddr_un, libc::socklen_t)> {
-    at_path(socket_path(address))
+    at_path(socket_path(address)?)
 }
 
 #[cfg(not(target_os = "linux"))]
 fn senders_sockaddr(address: Address) -> std::io::Result<(libc::sockaddr_un, libc::socklen_t)> {
-    at_path(senders_path(address))
+    at_path(senders_path(address)?)
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -196,8 +199,10 @@ impl Drop for Receiver {
         }
         #[cfg(not(target_os = "linux"))]
         {
-            let _ = std::fs::remove_file(socket_path(self.address));
-            let _ = std::fs::remove_file(senders_path(self.address));
+            let paths = [socket_path(self.address), senders_path(self.address)];
+            for path in paths.into_iter().flatten() {
+                let _ = std::fs::remove_file(path);
+            }
         }
     }
 }
@@ -205,8 +210,6 @@ impl Drop for Receiver {
 impl Receiver {
     /// Bind a new port. The address it answers on is fresh and unused.
     pub fn bind() -> std::io::Result<Self> {
-        #[cfg(not(target_os = "linux"))]
-        server::location::prepare(&server::location::runtime_directory().join("mach"))?;
         // Retried because two processes can draw the same address, however
         // unlikely - and the failure mode of not retrying is one run receiving
         // another's messages, which no caller could diagnose.
