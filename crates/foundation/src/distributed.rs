@@ -16,11 +16,13 @@ use objc::object::Id;
 use objc::sel::Sel;
 
 use crate::define::{class_methods, methods};
-use crate::notification::text_of;
+use crate::notification::{WeakObserver, text_of};
 use crate::plist::Value;
 
+/// One `-addObserver:selector:name:object:`, holding its observer weakly as
+/// the local center does.
 struct Observer {
-    observer: Id,
+    observer: WeakObserver,
     selector: Sel,
     /// `None` matches any name.
     name: Option<String>,
@@ -153,17 +155,22 @@ fn deliver(message: &[u8]) {
         eprintln!("rosemary: foundation: distributed {name} arrived");
     }
 
-    let targets: Vec<(Id, Sel)> = OBSERVERS
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .iter()
-        .filter(|o| matches(&o.name, &o.object))
-        .map(|o| (o.observer, o.selector))
-        .collect();
+    let targets: Vec<(Id, Sel)> = {
+        let mut table = OBSERVERS.lock().unwrap_or_else(|e| e.into_inner());
+        table.retain(|o| !o.observer.address().is_null());
+        table
+            .iter()
+            .filter(|o| matches(&o.name, &o.object))
+            .map(|o| (o.observer.load(), o.selector))
+            .filter(|(observer, _)| !observer.is_null())
+            .collect()
+    };
     for (observer, selector) in targets {
         // SAFETY: an observer method takes the notification, by the contract
-        // of `-addObserver:selector:name:object:`.
+        // of `-addObserver:selector:name:object:`, and the observer is
+        // retained for the send.
         unsafe { crate::notification::send_notification(observer, selector, notification) };
+        objc::arc::release(observer);
     }
     let blocks: Vec<(usize, Id)> = BLOCK_OBSERVERS
         .lock()
@@ -233,7 +240,7 @@ unsafe extern "C" fn add_observer_suspension(
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .push(Observer {
-            observer,
+            observer: WeakObserver::new(observer),
             selector,
             name: text(name),
             object: text(object),
@@ -303,7 +310,7 @@ unsafe extern "C" fn remove_observer(_receiver: Id, _sel: Sel, observer: Id) {
     OBSERVERS
         .lock()
         .unwrap_or_else(|e| e.into_inner())
-        .retain(|o| o.observer != observer);
+        .retain(|o| o.observer.address() != observer);
     drop_blocks(|o| o.token != observer);
 }
 
@@ -321,7 +328,7 @@ unsafe extern "C" fn remove_observer_name(
     OBSERVERS
         .lock()
         .unwrap_or_else(|e| e.into_inner())
-        .retain(|o| o.observer != observer || other(&o.name, &o.object));
+        .retain(|o| o.observer.address() != observer || other(&o.name, &o.object));
     drop_blocks(|o| o.token != observer || other(&o.name, &o.object));
 }
 

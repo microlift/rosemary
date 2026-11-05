@@ -1,3 +1,4 @@
+use std::cell::UnsafeCell;
 use std::collections::HashSet;
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -18,13 +19,48 @@ struct Notification {
     user_info: Id,
 }
 
+/// A zeroing weak reference to a selector observer.
+///
+/// Since OS X 10.11 a center holds its observers weakly: one that deallocates
+/// without `-removeObserver:` is skipped rather than messaged, so a program
+/// built for 10.11 or later need not remove itself in `-dealloc`.
+pub(crate) struct WeakObserver(Box<UnsafeCell<Id>>);
+
+impl WeakObserver {
+    pub(crate) fn new(observer: Id) -> Self {
+        let slot = Box::new(UnsafeCell::new(std::ptr::null_mut()));
+        objc::arc::init_weak(slot.get(), observer);
+        Self(slot)
+    }
+
+    /// The observer's address, null once it has deallocated. For comparing
+    /// identity only: nothing keeps it alive.
+    pub(crate) fn address(&self) -> Id {
+        // SAFETY: a slot this owns; the runtime only ever stores a word to it.
+        unsafe { *self.0.get() }
+    }
+
+    /// The observer, retained, or null once it has begun deallocating.
+    pub(crate) fn load(&self) -> Id {
+        objc::arc::load_weak_retained(self.0.get())
+    }
+}
+
+impl Drop for WeakObserver {
+    fn drop(&mut self) {
+        objc::arc::destroy_weak(self.0.get());
+    }
+}
+
+// SAFETY: the slot is a heap word the runtime zeroes from whichever thread
+// deallocates the observer; it is never borrowed across threads.
+unsafe impl Send for WeakObserver {}
+
 /// One `-addObserver:selector:name:object:`.
 ///
-/// The observer is *not* retained, which is Apple's rule and the reason
-/// `-removeObserver:` exists at all. A center that retained its observers would
-/// keep every one of them alive forever.
+/// The observer is held weakly - see [`WeakObserver`].
 struct Observer {
-    observer: Id,
+    observer: WeakObserver,
     selector: Sel,
     /// `None` matches any name.
     name: Option<String>,
@@ -145,8 +181,7 @@ pub fn post(name: &str, object: Id, user_info: Id) {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .iter()
-            .filter(|o| o.name.as_deref().is_none_or(|n| n == name))
-            .filter(|o| o.object.is_null() || o.object == object)
+            .filter(|o| wants(o, name, object))
             .count();
         eprintln!("rosemary: foundation: post {name} object {object:p} to {takers} observer(s)");
     }
@@ -163,37 +198,53 @@ fn deliver_to_all(notification: Id, name: &str, object: Id, user_info: Id) {
     let targets = observers_of(name, object);
     let mut live: Option<HashSet<(Id, Sel)>> = None;
     for (observer, selector) in targets {
-        // The center does not retain its observers, so one removed by an
-        // earlier handler of this same post may already be freed.
+        // One removed by an earlier handler of this same post must not hear it.
         let now = REMOVALS.load(Ordering::Acquire);
         if now != removals {
             removals = now;
-            live = Some(observers_of(name, object).into_iter().collect());
+            live = Some(registered(name, object));
         }
-        if live
+        let removed = live
             .as_ref()
-            .is_some_and(|live| !live.contains(&(observer, selector)))
-        {
-            continue;
+            .is_some_and(|live| !live.contains(&(observer, selector)));
+        if !removed {
+            // SAFETY: an observer method is `void (id, SEL, NSNotification *)`
+            // by the contract of `-addObserver:selector:name:object:`, and the
+            // observer is retained for the send.
+            unsafe { send_notification(observer, selector, notification) };
         }
-        // SAFETY: an observer method is `void (id, SEL, NSNotification *)` by
-        // the contract of `-addObserver:selector:name:object:`, and the
-        // observer is still registered, so still live by that same contract.
-        unsafe { send_notification(observer, selector, notification) };
+        objc::arc::release(observer);
     }
     post_to_blocks(name, object, notification);
     post_to_callbacks(cf::local_center(), name, object as *const c_void, user_info);
 }
 
-/// The selector observers registered for `name` from `object`.
+/// Whether a row of [`OBSERVERS`] wants `name` from `object`.
+fn wants(o: &Observer, name: &str, object: Id) -> bool {
+    o.name.as_deref().is_none_or(|n| n == name) && (o.object.is_null() || o.object == object)
+}
+
+/// The live selector observers registered for `name` from `object`, each
+/// retained, forgetting those that have deallocated.
 fn observers_of(name: &str, object: Id) -> Vec<(Id, Sel)> {
+    let mut table = OBSERVERS.lock().unwrap_or_else(|e| e.into_inner());
+    table.retain(|o| !o.observer.address().is_null());
+    table
+        .iter()
+        .filter(|o| wants(o, name, object))
+        .map(|o| (o.observer.load(), o.selector))
+        .filter(|(observer, _)| !observer.is_null())
+        .collect()
+}
+
+/// What [`observers_of`] would answer, by identity alone.
+fn registered(name: &str, object: Id) -> HashSet<(Id, Sel)> {
     OBSERVERS
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .iter()
-        .filter(|o| o.name.as_deref().is_none_or(|n| n == name))
-        .filter(|o| o.object.is_null() || o.object == object)
-        .map(|o| (o.observer, o.selector))
+        .filter(|o| wants(o, name, object))
+        .map(|o| (o.observer.address(), o.selector))
         .collect()
 }
 
@@ -416,7 +467,7 @@ unsafe extern "C" fn add_observer(
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .push(Observer {
-            observer,
+            observer: WeakObserver::new(observer),
             selector,
             name,
             object,
@@ -492,7 +543,7 @@ unsafe extern "C" fn remove_observer(_receiver: Id, _sel: Sel, observer: Id) {
     OBSERVERS
         .lock()
         .unwrap_or_else(|e| e.into_inner())
-        .retain(|o| o.observer != observer);
+        .retain(|o| o.observer.address() != observer);
     REMOVALS.fetch_add(1, Ordering::Release);
     drop_block_observers(|o| o.token != observer);
 }
@@ -510,7 +561,7 @@ unsafe extern "C" fn remove_observer_name(
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .retain(|o| {
-            o.observer != observer
+            o.observer.address() != observer
                 || (name.is_some() && o.name != name)
                 || (!object.is_null() && o.object != object)
         });
@@ -786,7 +837,7 @@ mod tests {
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .push(Observer {
-                    observer: who,
+                    observer: WeakObserver::new(who),
                     selector: objc::sel::get(selector),
                     name: Some("RosemaryRemovedMidPost".into()),
                     object: std::ptr::null_mut(),
@@ -805,7 +856,7 @@ mod tests {
         OBSERVERS
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .retain(|o| o.observer != remover);
+            .retain(|o| o.observer.address() != remover);
         assert!(!heard);
     }
 
@@ -816,7 +867,7 @@ mod tests {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .push(Observer {
-                observer: who,
+                observer: WeakObserver::new(who),
                 selector: objc::sel::get("heard:"),
                 name: Some("RosemaryWanted".into()),
                 object: std::ptr::null_mut(),
