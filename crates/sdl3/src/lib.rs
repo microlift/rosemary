@@ -280,6 +280,7 @@ struct Api {
     SDL_SetTextInputArea: Option<unsafe extern "C" fn(Window, *const Rect, c_int) -> bool>,
     SDL_HideCursor: Option<unsafe extern "C" fn() -> bool>,
     SDL_ShowCursor: Option<unsafe extern "C" fn() -> bool>,
+    SDL_CursorVisible: Option<unsafe extern "C" fn() -> bool>,
     SDL_CreateColorCursor: Option<unsafe extern "C" fn(*mut c_void, c_int, c_int) -> Cursor>,
     SDL_CreateSystemCursor: Option<unsafe extern "C" fn(c_int) -> Cursor>,
     SDL_SetCursor: Option<unsafe extern "C" fn(Cursor) -> bool>,
@@ -517,6 +518,7 @@ fn api() -> Option<&'static Api> {
             SDL_SetTextInputArea,
             SDL_HideCursor,
             SDL_ShowCursor,
+            SDL_CursorVisible,
             SDL_CreateColorCursor,
             SDL_CreateSystemCursor,
             SDL_SetCursor,
@@ -1681,8 +1683,10 @@ pub mod video {
         pub const RESIZABLE: u64 = 0x0000_0020;
         pub const MINIMIZED: u64 = 0x0000_0040;
         pub const MAXIMIZED: u64 = 0x0000_0080;
+        pub const MOUSE_GRABBED: u64 = 0x0000_0100;
         pub const INPUT_FOCUS: u64 = 0x0000_0200;
         pub const HIGH_PIXEL_DENSITY: u64 = 0x0000_2000;
+        pub const MOUSE_RELATIVE_MODE: u64 = 0x0000_8000;
         pub const ALWAYS_ON_TOP: u64 = 0x0001_0000;
         pub const UTILITY: u64 = 0x0002_0000;
         pub const TOOLTIP: u64 = 0x0004_0000;
@@ -3093,6 +3097,10 @@ pub mod video {
             return None;
         }
         register_live_window(window, None);
+        // Before the first warp: the watch's seats arrive a roundtrip later.
+        if let Some((display, _)) = wayland_surface(window) {
+            crate::wayland::watch(display);
+        }
         Some(window)
     }
 
@@ -4987,6 +4995,30 @@ pub mod video {
         // SAFETY: this is a valid SDL window, and the returned pointer, if
         // non-null, refers to SDL-owned memory valid through this call.
         unsafe { f(window).as_ref().copied() }
+    }
+
+    /// On Wayland, also put the pointer at `(x, y)` in `window` through a
+    /// momentary pointer lock, after [`warp_mouse_in_window`] has asked the
+    /// compositor in its own way (see [`crate::wayland::warp_through_lock`]).
+    ///
+    /// Skipped while SDL may hold a constraint on the window: relative mode,
+    /// a grab, a confinement rectangle, or a hidden cursor, which can let SDL
+    /// emulate warps with relative mode on its own.
+    pub fn warp_mouse_through_lock(window: Window, x: f32, y: f32) -> bool {
+        const CONSTRAINING: u64 = flags::MOUSE_RELATIVE_MODE | flags::MOUSE_GRABBED;
+        let cursor_visible = api()
+            .and_then(|a| a.SDL_CursorVisible)
+            // SAFETY: takes nothing.
+            .is_some_and(|f| unsafe { f() });
+        if !is_wayland()
+            || window_flags(window) & CONSTRAINING != 0
+            || get_mouse_rect(window).is_some()
+            || !cursor_visible
+        {
+            return false;
+        }
+        wayland_surface(window)
+            .is_some_and(|(_, surface)| crate::wayland::warp_through_lock(surface, x, y))
     }
 
     /// Whether `window` is holding the pointer, asked of SDL rather than

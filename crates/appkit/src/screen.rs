@@ -1544,11 +1544,18 @@ pub unsafe extern "C" fn CGSetLocalEventsSuppressionInterval(seconds: f64) -> i3
 /// On Wayland the desktop is this runtime's own (see
 /// `window::global_position`) and SDL would measure a global warp from its
 /// placeholder window origin, so the warp goes through the window instead.
+/// SDL's warp can be refused there - mutter takes it only after a click -
+/// so a momentary pointer lock repeats it.
 fn warp_physical(window: Option<sdl3::Window>, global: (f32, f32), local: (f32, f32)) -> bool {
     if !sdl3::video::is_wayland() && sdl3::video::warp_mouse_global(global.0, global.1) {
         return true;
     }
-    window.is_some_and(|window| sdl3::video::warp_mouse_in_window(window, local.0, local.1))
+    let Some(window) = window else {
+        return false;
+    };
+    let warped = sdl3::video::warp_mouse_in_window(window, local.0, local.1);
+    sdl3::video::warp_mouse_through_lock(window, local.0, local.1);
+    warped
 }
 
 fn local_warp_point(point: (f32, f32), origin: (i32, i32)) -> (f32, f32) {
