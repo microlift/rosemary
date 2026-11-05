@@ -259,7 +259,7 @@ impl Gpu {
             info = info.push_next(&mut fence_info);
         }
         let lock_timer = crate::stats::timer();
-        let _commits = sdl3::video::vulkan::surface_commit_guard();
+        let _commits = sdl3::compositor::guard();
         let _wsi = self.wsi.lock().expect("Vulkan WSI");
         let queue = self.queue.lock().expect("Vulkan queue");
         crate::stats::finish_timer(crate::stats::Counter::QueuePresentLockMicros, lock_timer);
