@@ -2017,6 +2017,41 @@ pub(crate) fn repair_relative_pointer(window_id: u32) {
     lock_at_frozen_pointer(window);
 }
 
+/// Bring a disassociated pointer to the guest's frozen point as it comes onto
+/// the Wayland `surface`.
+///
+/// A Wayland compositor moves and locks the pointer only over the client's
+/// own surface. A guest that disassociates and warps while the pointer is
+/// outside - flung past the window edge - gets neither, and SDL's relative
+/// lock takes hold wherever the pointer re-enters. CoreGraphics would have
+/// warped it from anywhere; entry is the first moment the host allows it.
+pub(crate) fn pin_entering_pointer(surface: usize) {
+    if mouse_is_associated() {
+        return;
+    }
+    let Some(window) = crate::window::sdl_windows().into_iter().find(|window| {
+        sdl3::video::relative_mouse_mode(*window)
+            && sdl3::video::wayland_surface(*window)
+                .is_some_and(|(_, entered)| entered as usize == surface)
+    }) else {
+        return;
+    };
+    let Some(frozen) = crate::event::frozen_pointer() else {
+        return;
+    };
+    let origin = crate::window::global_position(window).unwrap_or((0, 0));
+    let local = local_warp_point(frozen, origin);
+    let entered_at = sdl3::video::mouse_state().map_or(local, |(x, y, _)| (x, y));
+    // SDL warps only outside relative mode, and its lock would be a second
+    // constraint beside the momentary one. Its restore point goes first, so
+    // that leaving relative mode does not expose the entry position.
+    sdl3::video::warp_mouse_in_window(window, local.0, local.1);
+    sdl3::video::set_relative_mouse_mode(window, false);
+    crate::event::expect_warp_echo(entered_at, local);
+    warp_physical(Some(window), frozen, local);
+    sdl3::video::set_relative_mouse_mode(window, true);
+}
+
 /// Lock `window` where the disassociated guest's cursor is frozen.
 fn lock_at_frozen_pointer(window: sdl3::Window) {
     let Some(frozen) = crate::event::frozen_pointer() else {

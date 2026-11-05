@@ -228,6 +228,8 @@ struct State {
     seats: Vec<usize>,
     /// The display's `zwp_pointer_constraints_v1`, once bound.
     constraints: usize,
+    /// Surfaces the pointer came onto since [`take_entered`] last asked.
+    entered: Vec<usize>,
     events: Vec<PointerEvent>,
 }
 
@@ -269,6 +271,15 @@ pub fn watch(display: *mut c_void) {
             std::ptr::null_mut(),
         );
     }
+}
+
+/// The surfaces a pointer entered since the last call.
+///
+/// Apart from [`take_events`], which belongs to the titlebar: SDL reports no
+/// entry of its own for a window it already counts as the mouse focus, as it
+/// does for one in relative mode that the pointer had left.
+pub fn take_entered() -> Vec<usize> {
+    with_state(|state| std::mem::take(&mut state.entered))
 }
 
 /// The events seen since the last call, oldest first.
@@ -530,6 +541,9 @@ unsafe extern "C" fn enter(
 ) {
     set_focus(pointer, surface as usize, fixed(x), fixed(y));
     with_state(|state| {
+        if !state.entered.contains(&(surface as usize)) {
+            state.entered.push(surface as usize);
+        }
         record(
             state,
             PointerEvent::Enter {
@@ -605,5 +619,19 @@ mod tests {
         assert_eq!(to_fixed(1024.0), 1024 * 256);
         assert_eq!(to_fixed(531.2), 135_987);
         assert_eq!(fixed(to_fixed(-3.5)), -3.5);
+    }
+
+    #[test]
+    fn an_entered_surface_is_taken_once() {
+        let (pointer, surface) = (0x10 as *mut c_void, 0x20 as *mut c_void);
+        take_entered();
+        // SAFETY: the listener reads only its scalar arguments.
+        unsafe {
+            enter(std::ptr::null_mut(), pointer, 1, surface, 0, 0);
+            enter(std::ptr::null_mut(), pointer, 2, surface, 0, 0);
+        }
+        assert_eq!(take_entered(), vec![surface as usize]);
+        assert!(take_entered().is_empty());
+        set_focus(pointer, 0, 0.0, 0.0);
     }
 }
