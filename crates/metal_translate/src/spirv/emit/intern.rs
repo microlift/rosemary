@@ -84,14 +84,7 @@ impl Emitter {
                 Operand::Composite { .. } => self.composite_constant(element),
                 Operand::Integer { ty, value } => self.constant(ty, *value),
                 Operand::Float { ty, bits } => self.constant(ty, *bits),
-                Operand::Bool(value) => {
-                    let ty = self.type_id(&Type::Bool)?;
-                    Ok(if *value {
-                        self.builder.constant_true(ty)
-                    } else {
-                        self.builder.constant_false(ty)
-                    })
-                }
+                Operand::Bool(value) => self.boolean(*value),
                 Operand::Undef(ty) => self.undef(ty),
                 Operand::Global { .. } => {
                     Err(emission("a global variable is not a constant element"))
@@ -126,14 +119,7 @@ impl Emitter {
         match operand {
             Operand::Integer { ty, value } => self.constant(ty, *value),
             Operand::Float { ty, bits } => self.constant(ty, *bits),
-            Operand::Bool(value) => {
-                let ty = self.type_id(&Type::Bool)?;
-                Ok(if *value {
-                    self.builder.constant_true(ty)
-                } else {
-                    self.builder.constant_false(ty)
-                })
-            }
+            Operand::Bool(value) => self.boolean(*value),
             Operand::Composite { ty, elements } => {
                 if let Some(id) = self.unlaid_composites.get(operand) {
                     return Ok(*id);

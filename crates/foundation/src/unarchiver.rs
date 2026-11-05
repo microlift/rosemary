@@ -312,7 +312,7 @@ mod nib {
         }
 
         let mut at = object_offset;
-        let mut raw_objects = Vec::with_capacity(object_count);
+        let mut raw_objects = Vec::with_capacity(reserve(object_count, bytes));
         for _ in 0..object_count {
             raw_objects.push(Object {
                 class: varint(bytes, &mut at)?,
@@ -326,7 +326,7 @@ mod nib {
             )));
         }
 
-        let mut keys = Vec::with_capacity(key_count);
+        let mut keys = Vec::with_capacity(reserve(key_count, bytes));
         at = key_offset;
         for _ in 0..key_count {
             let len = varint(bytes, &mut at)?;
@@ -339,7 +339,7 @@ mod nib {
             )));
         }
 
-        let mut values = Vec::with_capacity(value_count);
+        let mut values = Vec::with_capacity(reserve(value_count, bytes));
         at = value_offset;
         for _ in 0..value_count {
             let key = varint(bytes, &mut at)?;
@@ -386,12 +386,12 @@ mod nib {
             )));
         }
 
-        let mut classes = Vec::with_capacity(class_count);
+        let mut classes = Vec::with_capacity(reserve(class_count, bytes));
         at = class_offset;
         for _ in 0..class_count {
             let len = varint(bytes, &mut at)?;
             let fallback_count = varint(bytes, &mut at)?;
-            let mut fallbacks = Vec::with_capacity(fallback_count);
+            let mut fallbacks = Vec::with_capacity(reserve(fallback_count, bytes));
             for _ in 0..fallback_count {
                 fallbacks.push(u32::from_le_bytes(read(bytes, &mut at)?) as usize);
             }
@@ -401,7 +401,7 @@ mod nib {
             classes.push(Class { name, fallbacks });
         }
 
-        let mut nib_objects = Vec::with_capacity(object_count);
+        let mut nib_objects = Vec::with_capacity(raw_objects.len());
         for object in raw_objects {
             let class = classes.get(object.class).ok_or_else(|| {
                 bad(format!(
@@ -446,6 +446,13 @@ mod nib {
             nib_objects,
             top,
         })
+    }
+
+    /// Room for `count` table entries, which each take at least a byte: a
+    /// count the file cannot hold is refused when it runs out, not by an
+    /// allocation that aborts first.
+    fn reserve(count: usize, bytes: &[u8]) -> usize {
+        count.min(bytes.len())
     }
 
     fn le32(bytes: &[u8], at: usize) -> Result<u32, Error> {
@@ -619,5 +626,18 @@ mod tests {
         let err = Archive::parse(b"<plist version=\"1.0\"><dict></dict></plist>")
             .expect_err("not an archive");
         assert!(err.0.contains("$archiver"), "{}", err.0);
+    }
+
+    #[test]
+    fn a_nib_archive_with_counts_larger_than_the_file_is_an_error() {
+        let mut bytes = b"NIBArchive".to_vec();
+        bytes.resize(50, 0);
+        bytes[10..14].copy_from_slice(&1u32.to_le_bytes());
+        // Every table claims `u32::MAX` entries and starts at the end.
+        for field in [18, 26, 34, 42] {
+            bytes[field..field + 4].copy_from_slice(&u32::MAX.to_le_bytes());
+            bytes[field + 4..field + 8].copy_from_slice(&50u32.to_le_bytes());
+        }
+        assert!(Archive::parse(&bytes).is_err());
     }
 }

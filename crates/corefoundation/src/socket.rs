@@ -34,10 +34,13 @@ unsafe impl Sync for Socket {}
 static SOCKETS: Mutex<Vec<Weak<Socket>>> = Mutex::new(Vec::new());
 
 unsafe fn borrow(socket: CFTypeRef) -> Option<std::mem::ManuallyDrop<Arc<Socket>>> {
-    if socket.is_null() || !crate::base::is_opaque(socket) {
+    // Typed, not merely opaque: a run loop source or timer is an opaque
+    // handle too, and is not laid out as a `Socket`.
+    if socket.is_null() || !crate::runloop::is_noted::<Socket>(socket as usize) {
         return None;
     }
-    // SAFETY: CFSocket handles below are leaked `Arc<Socket>` pointers.
+    // SAFETY: a handle `create_with_native` made, which is a leaked
+    // `Arc<Socket>`.
     Some(std::mem::ManuallyDrop::new(unsafe {
         Arc::from_raw(socket.cast::<Socket>())
     }))
@@ -73,9 +76,9 @@ pub unsafe extern "C" fn create_with_native(
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .push(Arc::downgrade(&socket));
-    let handle = Arc::into_raw(socket).cast::<c_void>();
-    crate::base::note_opaque(handle);
-    handle
+    let handle = Arc::into_raw(socket);
+    crate::runloop::note(handle);
+    handle.cast::<c_void>()
 }
 
 unsafe extern "C" fn perform(info: *mut c_void) {
@@ -216,5 +219,30 @@ pub(crate) fn poll() {
                 source.signal();
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_handle_of_another_kind_is_not_a_socket() {
+        let timer = crate::runloop::new_timer(std::time::Duration::from_secs(60), None, None, 0);
+        let handle = Arc::as_ptr(&timer).cast::<c_void>();
+        assert!(crate::base::is_opaque(handle));
+        // SAFETY: the functions validate the handle before reading it.
+        unsafe {
+            assert_eq!(get_native(handle), -1);
+            assert_eq!(is_valid(handle), 0);
+        }
+    }
+
+    #[test]
+    fn a_socket_handle_reads_back_its_descriptor() {
+        // SAFETY: no context; the descriptor is never used.
+        let socket = unsafe { create_with_native(std::ptr::null(), 7, 0, None, std::ptr::null()) };
+        // SAFETY: a handle `create_with_native` made.
+        assert_eq!(unsafe { get_native(socket) }, 7);
     }
 }

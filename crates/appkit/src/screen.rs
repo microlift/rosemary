@@ -779,17 +779,19 @@ fn new_mode(display: u32, fixed: Option<sdl3::DisplayMode>) -> *const c_void {
         display,
         fixed,
     }));
-    let handle = mode as *const DisplayMode as *const c_void;
-    corefoundation::base::note_opaque(handle);
-    handle
+    let handle = mode as *const DisplayMode;
+    corefoundation::runloop::note(handle);
+    handle.cast()
 }
 
 /// The SDL mode behind a handle this module made, or `None`.
 fn sdl_mode_of(mode: *const c_void) -> Option<sdl3::DisplayMode> {
-    if mode.is_null() || !corefoundation::base::is_opaque(mode) {
+    // Typed, not merely opaque: other handles, a `PasteboardRef` among them,
+    // are opaque too.
+    if mode.is_null() || !corefoundation::runloop::is_noted::<DisplayMode>(mode as usize) {
         return None;
     }
-    // SAFETY: an opaque handle this module made, whose layout is `DisplayMode`.
+    // SAFETY: a handle this module made, whose layout is `DisplayMode`.
     let mode = unsafe { &*(mode as *const DisplayMode) };
     mode.fixed
         .or_else(|| sdl3::video::desktop_mode(mode.display))

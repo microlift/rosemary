@@ -175,6 +175,7 @@ pub(super) unsafe extern "C" fn end_parallel_encoding(receiver: Id, sel: Sel) {
         if command.recording {
             command.recording = false;
             executed.push(command.command_buffer);
+            command.written_sets.clear();
             parent
                 .descriptor_pools
                 .append(&mut command.descriptor_pools);

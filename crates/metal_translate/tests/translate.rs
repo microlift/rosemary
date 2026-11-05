@@ -647,6 +647,110 @@ fn source_msl_threadgroup_atomics_reach_workgroup_and_buffer_memory() {
     assert_eq!(body_instructions(&module, Op::AtomicSMax).len(), 1);
 }
 
+fn workgroup_variables(words: &[u32]) -> usize {
+    let module = rspirv::dr::load_words(words).unwrap();
+    module
+        .types_global_values
+        .iter()
+        .filter(|instruction| instruction.class.opcode == Op::Variable)
+        .filter(|instruction| {
+            instruction.operands.first()
+                == Some(&rspirv::dr::Operand::StorageClass(
+                    rspirv::spirv::StorageClass::Workgroup,
+                ))
+        })
+        .count()
+}
+
+#[test]
+fn source_msl_entry_points_declare_only_their_own_threadgroup_memory() {
+    let source = "#include <metal_stdlib>\n\
+        using namespace metal;\n\
+        kernel void first(device uint *out [[ buffer(0) ]], uint3 local [[ thread_position_in_threadgroup ]])\n\
+        {\n\
+            threadgroup uint a[64];\n\
+            a[local.x] = local.x;\n\
+            threadgroup_barrier(mem_flags::mem_threadgroup);\n\
+            out[local.x] = a[63u - local.x];\n\
+        }\n\
+        kernel void second(device uint *out [[ buffer(0) ]], uint3 local [[ thread_position_in_threadgroup ]])\n\
+        {\n\
+            threadgroup uint b[32];\n\
+            b[local.x] = local.x;\n\
+            threadgroup_barrier(mem_flags::mem_threadgroup);\n\
+            out[local.x] = b[31u - local.x];\n\
+        }\0";
+    let library = translate_msl(source, &TargetProfile::vulkan_1_3()).unwrap();
+    assert_eq!(library.entries.len(), 2);
+    for entry in &library.entries {
+        assert_eq!(workgroup_variables(&entry.words), 1, "{}", entry.name);
+    }
+}
+
+#[test]
+fn declares_each_capability_extension_and_boolean_once() {
+    let source = "#include <metal_stdlib>\n\
+        using namespace metal;\n\
+        struct Varyings { float4 pos [[position]]; float2 uv; };\n\
+        fragment half4 shade(Varyings input [[stage_in]],\n\
+            texture2d<half, access::sample> tex [[ texture(0) ]],\n\
+            sampler s [[ sampler(0) ]])\n\
+        {\n\
+            half4 color = tex.sample(s, input.uv) * 3.0h + 1.0h;\n\
+            bool keep = color.w > 0.5h;\n\
+            if (!keep) { discard_fragment(); }\n\
+            if (color.x < 0.25h) { discard_fragment(); }\n\
+            return color * (keep ? 2.0h : 0.5h);\n\
+        }\0";
+    let target = TargetProfile {
+        shader_float16: true,
+        demote_to_helper_invocation: true,
+        spirv_version: (1, 5),
+        ..TargetProfile::vulkan_1_3()
+    };
+    let library = translate_msl(source, &target).unwrap();
+    let entry = &library.entries[0];
+    let unique = |names: &[String]| {
+        let mut sorted = names.to_vec();
+        sorted.sort();
+        sorted.dedup();
+        sorted.len() == names.len()
+    };
+    assert!(
+        entry
+            .required
+            .capabilities
+            .iter()
+            .any(|name| name == "Float16")
+    );
+    assert!(
+        unique(&entry.required.capabilities),
+        "{:?}",
+        entry.required.capabilities
+    );
+    assert!(
+        entry
+            .required
+            .extensions
+            .iter()
+            .any(|name| name == "SPV_EXT_demote_to_helper_invocation")
+    );
+    assert!(
+        unique(&entry.required.extensions),
+        "{:?}",
+        entry.required.extensions
+    );
+    let module = rspirv::dr::load_words(&entry.words).unwrap();
+    for opcode in [Op::ConstantTrue, Op::ConstantFalse] {
+        let count = module
+            .types_global_values
+            .iter()
+            .filter(|instruction| instruction.class.opcode == opcode)
+            .count();
+        assert!(count <= 1, "{count} {opcode:?}");
+    }
+}
+
 /// Unity's blit to the drawable, which describes its sampler in the source.
 const UNITY_BLIT: &str = "#include <metal_stdlib>\n\
     using namespace metal;\n\

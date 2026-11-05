@@ -99,6 +99,7 @@ pub(super) unsafe extern "C" fn command_buffer_dealloc(receiver: Id, _sel: Sel) 
         for capture in std::mem::take(&mut command.captures) {
             gpu.destroy_buffer(capture.buffer);
         }
+        command.written_sets.clear();
         for pool in std::mem::take(&mut command.descriptor_pools) {
             gpu.release_descriptor_pool(pool);
         }

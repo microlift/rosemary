@@ -71,6 +71,16 @@ impl Drop for State {
 
 static STATE: OnceLock<Result<State, String>> = OnceLock::new();
 
+/// Write out the pipeline cache of every device opened so far.
+pub(crate) fn save_pipeline_caches() {
+    let Some(Ok(state)) = STATE.get() else {
+        return;
+    };
+    for gpu in state.adapters.iter().filter_map(Adapter::opened_gpu) {
+        gpu.save_pipeline_cache();
+    }
+}
+
 pub fn adapters() -> Result<&'static [Adapter], &'static str> {
     match STATE.get_or_init(initialize) {
         Ok(state) => Ok(&state.adapters),

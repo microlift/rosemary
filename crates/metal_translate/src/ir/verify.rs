@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use super::*;
 use crate::{Diagnostic, Phase};
@@ -25,7 +25,7 @@ pub(super) fn verify_function(function: &Function, diagnostics: &mut Vec<Diagnos
         }
     }
     let entry = function.blocks[0].id;
-    let dominators = dominators(&blocks, &predecessors, entry);
+    let dominators = Dominators::new(&blocks, &predecessors, entry);
     let mut definitions = BTreeMap::new();
     for parameter in &function.parameters {
         if function.values.get(parameter.value.0 as usize) != Some(&parameter.ty) {
@@ -164,40 +164,79 @@ pub(super) fn verify_function(function: &Function, diagnostics: &mut Vec<Diagnos
 
 type Definition = Option<(BlockId, usize)>;
 
-fn dominators(
-    blocks: &BTreeSet<BlockId>,
-    predecessors: &BTreeMap<BlockId, BTreeSet<BlockId>>,
-    entry: BlockId,
-) -> BTreeMap<BlockId, BTreeSet<BlockId>> {
-    let mut result = BTreeMap::new();
-    for block in blocks {
-        result.insert(
-            *block,
-            if *block == entry {
-                BTreeSet::from([entry])
-            } else {
-                blocks.clone()
-            },
-        );
-    }
-    loop {
-        let previous = result.clone();
-        for block in blocks.iter().copied().filter(|block| *block != entry) {
-            let incoming = predecessors.get(&block).cloned().unwrap_or_default();
-            let mut next = if incoming.is_empty() {
-                BTreeSet::new()
-            } else {
-                let mut incoming = incoming.into_iter();
-                let first = incoming.next().unwrap();
-                incoming.fold(previous[&first].clone(), |set, predecessor| {
-                    set.intersection(&previous[&predecessor]).copied().collect()
-                })
-            };
-            next.insert(block);
-            result.insert(block, next);
+/// Which blocks dominate which: a dominator tree over the blocks the entry
+/// reaches, and dominator sets over the rest.
+struct Dominators {
+    reachable: Dominance,
+    /// Each unreachable block's dominators by the maximal solution of the
+    /// set equations: only itself where nothing branches in, and every block
+    /// where only an unreachable cycle does. Typically empty.
+    unreachable: BTreeMap<BlockId, BTreeSet<BlockId>>,
+}
+
+impl Dominators {
+    fn new(
+        blocks: &BTreeSet<BlockId>,
+        predecessors: &BTreeMap<BlockId, BTreeSet<BlockId>>,
+        entry: BlockId,
+    ) -> Self {
+        let edges: HashMap<BlockId, Vec<BlockId>> = predecessors
+            .iter()
+            .map(|(block, incoming)| (*block, incoming.iter().copied().collect()))
+            .collect();
+        let reachable = Dominance::new(&[entry], &edges);
+        let mut reached = BTreeSet::from([entry]);
+        let mut pending = vec![entry];
+        let mut successors: BTreeMap<BlockId, Vec<BlockId>> = BTreeMap::new();
+        for (block, incoming) in predecessors {
+            for source in incoming {
+                successors.entry(*source).or_default().push(*block);
+            }
         }
-        if result == previous {
-            return result;
+        while let Some(block) = pending.pop() {
+            for successor in successors.get(&block).into_iter().flatten() {
+                if reached.insert(*successor) {
+                    pending.push(*successor);
+                }
+            }
+        }
+        // Every predecessor of an unreachable block is itself unreachable, so
+        // these equations never consult the tree.
+        let unreached: Vec<_> = blocks.difference(&reached).copied().collect();
+        let mut unreachable: BTreeMap<_, _> = unreached
+            .iter()
+            .map(|block| (*block, blocks.clone()))
+            .collect();
+        let mut changed = !unreached.is_empty();
+        while changed {
+            changed = false;
+            for block in &unreached {
+                let mut incoming = predecessors.get(block).into_iter().flatten();
+                let mut next = match incoming.next() {
+                    None => BTreeSet::new(),
+                    Some(first) => incoming.fold(unreachable[first].clone(), |set, predecessor| {
+                        set.intersection(&unreachable[predecessor])
+                            .copied()
+                            .collect()
+                    }),
+                };
+                next.insert(*block);
+                if unreachable[block] != next {
+                    unreachable.insert(*block, next);
+                    changed = true;
+                }
+            }
+        }
+        Self {
+            reachable,
+            unreachable,
+        }
+    }
+
+    fn dominates(&self, dominator: BlockId, block: BlockId) -> bool {
+        match self.unreachable.get(&block) {
+            Some(set) => set.contains(&dominator),
+            None => self.reachable.dominates(dominator, block),
         }
     }
 }
@@ -208,7 +247,7 @@ fn verify_use(
     use_block: BlockId,
     use_index: usize,
     definitions: &BTreeMap<ValueId, Definition>,
-    dominators: &BTreeMap<BlockId, BTreeSet<BlockId>>,
+    dominators: &Dominators,
     diagnostics: &mut Vec<Diagnostic>,
 ) {
     let Operand::Value(value) = operand else {
@@ -225,9 +264,7 @@ fn verify_use(
         let dominates = if *definition_block == use_block {
             *definition_index < use_index
         } else {
-            dominators
-                .get(&use_block)
-                .is_some_and(|set| set.contains(definition_block))
+            dominators.dominates(*definition_block, use_block)
         };
         if !dominates {
             diagnostics.push(Diagnostic::new(
@@ -896,5 +933,105 @@ fn sync_is_well_typed(function: &Function, kind: &InstructionKind, result: Optio
             result == Some(Type::Bool) && matches!(constant, Operand::Global { .. })
         }
         _ => unreachable!("not a sync instruction"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn add(result: u32, lhs: Operand) -> Instruction {
+        Instruction {
+            result: Some(ValueId(result)),
+            kind: InstructionKind::IntegerBinary {
+                op: IntegerBinaryOp::Add,
+                lhs,
+                rhs: Operand::u32(1),
+            },
+        }
+    }
+
+    /// `%0 = 1 + 1` in block `defines` and `%1 = %0 + 1` in block `uses`.
+    fn function(blocks: Vec<(u32, Terminator)>, defines: u32, uses: u32) -> Function {
+        Function {
+            name: "f".to_string(),
+            result: Type::Void,
+            parameters: Vec::new(),
+            values: vec![Type::u32(), Type::u32()],
+            blocks: blocks
+                .into_iter()
+                .map(|(id, terminator)| {
+                    let mut instructions = Vec::new();
+                    if id == defines {
+                        instructions.push(add(0, Operand::u32(1)));
+                    }
+                    if id == uses {
+                        instructions.push(add(1, Operand::Value(ValueId(0))));
+                    }
+                    Block {
+                        id: BlockId(id),
+                        name: String::new(),
+                        instructions,
+                        terminator,
+                    }
+                })
+                .collect(),
+        }
+    }
+
+    fn branch(to: u32) -> Terminator {
+        Terminator::Branch(BlockId(to))
+    }
+
+    fn either(a: u32, b: u32) -> Terminator {
+        Terminator::CondBranch {
+            condition: Operand::Bool(true),
+            true_block: BlockId(a),
+            false_block: BlockId(b),
+        }
+    }
+
+    const END: Terminator = Terminator::Return(None);
+
+    #[test]
+    fn accepts_a_use_dominated_through_a_long_chain() {
+        const LENGTH: u32 = 5000;
+        let blocks = (0..LENGTH)
+            .map(|id| {
+                (
+                    id,
+                    if id + 1 == LENGTH {
+                        END
+                    } else {
+                        branch(id + 1)
+                    },
+                )
+            })
+            .collect();
+        assert!(function(blocks, 0, LENGTH - 1).verify().is_ok());
+    }
+
+    #[test]
+    fn rejects_a_use_after_a_join_defined_on_one_arm() {
+        let blocks = vec![(0, either(1, 2)), (1, branch(3)), (2, branch(3)), (3, END)];
+        assert!(function(blocks, 1, 3).verify().is_err());
+    }
+
+    #[test]
+    fn ignores_an_unreachable_predecessor_of_a_reachable_block() {
+        let blocks = vec![(0, branch(2)), (1, branch(2)), (2, END)];
+        assert!(function(blocks, 0, 2).verify().is_ok());
+    }
+
+    #[test]
+    fn rejects_a_use_in_an_unreachable_block_nothing_branches_to() {
+        let blocks = vec![(0, END), (1, END)];
+        assert!(function(blocks, 0, 1).verify().is_err());
+    }
+
+    #[test]
+    fn accepts_a_use_in_an_unreachable_cycle() {
+        let blocks = vec![(0, END), (1, branch(2)), (2, branch(1))];
+        assert!(function(blocks, 0, 2).verify().is_ok());
     }
 }

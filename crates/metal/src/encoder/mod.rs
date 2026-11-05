@@ -215,6 +215,10 @@ struct SetCache {
     entries: Vec<DescriptorEntry>,
 }
 
+/// The least an upload is aligned to, whatever the device asks, so that a
+/// 64-bit query result or a `float4` lands at its natural alignment.
+const UPLOAD_ALIGNMENT: u64 = 16;
+
 /// What is bound at one bind point, so that a draw which changes nothing
 /// records nothing.
 #[derive(Default)]
@@ -341,6 +345,8 @@ pub(crate) struct Encoder {
     writes_elsewhere: bool,
     /// Index by `bind_point_slot`.
     bound: [BindPoint; 2],
+    /// Per set index, the last set bound or pushed there; the push path
+    /// reads it to know whether the bind point still holds its push.
     set_cache: [SetCache; SETS],
     /// Scratch for the entries a draw needs, kept to avoid an allocation.
     wanted: [Vec<DescriptorEntry>; SETS],
@@ -473,21 +479,22 @@ impl CommandBuffer {
     /// Copy `bytes` into this command buffer's upload chunks, answering the
     /// buffer and offset they landed at. The copy lives until the work does.
     pub(super) fn upload(&mut self, bytes: &[u8]) -> Option<(vk::Buffer, u64)> {
-        let (buffer, offset, contents) = self.reserve_upload(bytes.len() as u64)?;
-        // SAFETY: the reservation is `bytes.len()` mapped bytes, handed out once.
+        let (buffer, offset, contents) = self.reserve(bytes.len() as u64)?;
+        // SAFETY: `reserve` handed out these `bytes.len()` mapped bytes once.
         unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), contents, bytes.len()) };
         Some((buffer, offset))
     }
 
-    /// `length` bytes of this command buffer's upload chunks, which live until
-    /// the work does: the buffer and offset the device reads them at, and
-    /// where the host writes them.
-    fn reserve_upload(&mut self, length: u64) -> Option<(vk::Buffer, u64, *mut u8)> {
-        let limits = &self.gpu.limits;
-        let alignment = limits
+    /// Set aside `length` bytes of the upload chunks for the device to write,
+    /// answering where they are and the mapping of their first byte.
+    pub(super) fn reserve(&mut self, length: u64) -> Option<(vk::Buffer, u64, *mut u8)> {
+        // Every upload is read through a storage descriptor, a vertex or
+        // index binding, or a copy; none is a uniform buffer.
+        let alignment = self
+            .gpu
+            .limits
             .min_storage_buffer_offset_alignment
-            .max(limits.min_uniform_buffer_offset_alignment)
-            .max(16);
+            .max(UPLOAD_ALIGNMENT);
         let offset = self.upload_used.next_multiple_of(alignment);
         let offset = match self.uploads.last() {
             Some(_) if offset + length <= gpu::UPLOAD_CHUNK => offset,
@@ -504,8 +511,8 @@ impl CommandBuffer {
         };
         let chunk = self.uploads.last().expect("a chunk was just ensured");
         self.upload_used = offset + length;
-        // SAFETY: the chunk is mapped over `UPLOAD_CHUNK` bytes, and this range
-        // is inside it.
+        // SAFETY: the chunk is mapped over `UPLOAD_CHUNK` bytes, and this
+        // offset is inside it.
         Some((chunk.buffer, offset, unsafe {
             chunk.contents.add(offset as usize)
         }))
@@ -547,7 +554,7 @@ impl CommandBuffer {
 
     fn reserve_snapshot(&mut self, length: u64) -> Option<(vk::Buffer, u64, *mut u8)> {
         if length <= gpu::UPLOAD_CHUNK {
-            return self.reserve_upload(length);
+            return self.reserve(length);
         }
         match self.gpu.create_staging_buffer(length) {
             Ok(staging) => {
@@ -1001,5 +1008,68 @@ pub(crate) fn install() {
             implementation as *const std::ffi::c_void,
             c"v24@0:8Q16",
         );
+    }
+}
+
+#[cfg(test)]
+mod written_sets_tests {
+    use super::*;
+    use vk::Handle;
+
+    fn entries(handle: u64) -> Vec<DescriptorEntry> {
+        vec![DescriptorEntry {
+            binding: 0,
+            kind: vk::DescriptorType::STORAGE_BUFFER,
+            handle,
+            offset: 0,
+            range: vk::WHOLE_SIZE,
+            dynamic_offset: 0,
+        }]
+    }
+
+    fn layout(raw: u64) -> vk::DescriptorSetLayout {
+        vk::DescriptorSetLayout::from_raw(raw)
+    }
+
+    fn set(raw: u64) -> vk::DescriptorSet {
+        vk::DescriptorSet::from_raw(raw)
+    }
+
+    #[test]
+    fn finds_any_remembered_set_with_the_same_layout_and_entries() {
+        let mut written = WrittenSets::default();
+        written.remember(layout(1), &entries(100), set(10));
+        written.remember(layout(1), &entries(200), set(20));
+        assert_eq!(written.find(layout(1), &entries(100)), Some(set(10)));
+        assert_eq!(written.find(layout(1), &entries(200)), Some(set(20)));
+        assert_eq!(written.find(layout(2), &entries(100)), None);
+        assert_eq!(written.find(layout(1), &entries(300)), None);
+    }
+
+    #[test]
+    fn ignores_dynamic_offsets_when_matching() {
+        let mut written = WrittenSets::default();
+        written.remember(layout(1), &entries(100), set(10));
+        let mut moved = entries(100);
+        moved[0].dynamic_offset = 256;
+        assert_eq!(written.find(layout(1), &moved), Some(set(10)));
+    }
+
+    #[test]
+    fn remembers_every_set_a_frame_writes() {
+        let mut written = WrittenSets::default();
+        for index in 0..64 {
+            written.remember(layout(1), &entries(index), set(index + 1));
+        }
+        assert_eq!(written.find(layout(1), &entries(0)), Some(set(1)));
+        assert_eq!(written.find(layout(1), &entries(63)), Some(set(64)));
+    }
+
+    #[test]
+    fn forgets_everything_when_cleared() {
+        let mut written = WrittenSets::default();
+        written.remember(layout(1), &entries(100), set(10));
+        written.clear();
+        assert_eq!(written.find(layout(1), &entries(100)), None);
     }
 }
