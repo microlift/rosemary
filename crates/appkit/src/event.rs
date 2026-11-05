@@ -23,6 +23,7 @@ pub fn pump(app: Id) {
     while let Some(event) = sdl3::video::poll() {
         deliver(event);
     }
+    sdl3::pointer::service();
     service_presentation();
     // General pump hooks may run guest code and are not modal-safe.
     let hooks = PUMP_HOOKS.lock().unwrap_or_else(|e| e.into_inner()).clone();
