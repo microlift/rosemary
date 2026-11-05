@@ -1933,38 +1933,40 @@ unsafe extern "C" fn data_with_bytes(_class: Id, _sel: Sel, bytes: *const u8, le
     unsafe { api::CFAutorelease(api::CFDataCreate(std::ptr::null(), bytes, length as isize)) as Id }
 }
 
-/// `+[NSData dataWithBytesNoCopy:length:]` with an owned compatibility copy.
-///
-/// CoreFoundation's data storage owns a `Vec`, so use the same compatibility
-/// behavior as `CFDataCreateWithBytesNoCopy` rather than borrowing guest memory.
+/// `+[NSData dataWithBytesNoCopy:length:]`, which takes the buffer: this is
+/// `freeWhenDone:YES`.
 unsafe extern "C" fn data_with_bytes_no_copy(
+    class: Id,
+    sel: Sel,
+    bytes: *const u8,
+    length: usize,
+) -> Id {
+    // SAFETY: forwarded.
+    unsafe { data_with_bytes_no_copy_free(class, sel, bytes, length, 1) }
+}
+
+/// `+[NSData dataWithBytesNoCopy:length:freeWhenDone:]`: CoreFoundation's
+/// "no copy" data, with the buffer kept by the caller unless it is to be freed.
+unsafe extern "C" fn data_with_bytes_no_copy_free(
     _class: Id,
     _sel: Sel,
     bytes: *const u8,
     length: usize,
+    free_when_done: u8,
 ) -> Id {
+    let deallocator = match free_when_done {
+        0 => api::standard_allocator(api::StandardAllocator::Null),
+        _ => std::ptr::null(),
+    };
     // SAFETY: the caller says `bytes` covers `length` bytes.
     unsafe {
         api::CFAutorelease(api::CFDataCreateWithBytesNoCopy(
             std::ptr::null(),
             bytes,
             length as isize,
-            std::ptr::null(),
+            deallocator,
         )) as Id
     }
-}
-
-/// `+[NSData dataWithBytesNoCopy:length:freeWhenDone:]`, which is the copy above:
-/// the buffer a guest asked to be freed is simply left to it.
-unsafe extern "C" fn data_with_bytes_no_copy_free(
-    class: Id,
-    sel: Sel,
-    bytes: *const u8,
-    length: usize,
-    _free_when_done: u8,
-) -> Id {
-    // SAFETY: the same contract.
-    unsafe { data_with_bytes_no_copy(class, sel, bytes, length) }
 }
 
 /// The bytes of a data object, or empty for nil or anything else.
@@ -2023,9 +2025,8 @@ unsafe extern "C" fn data_init_with_bytes(
     replace_receiver(receiver, unsafe { raw(bytes, length) }.to_vec())
 }
 
-/// `-initWithBytesNoCopy:length:freeWhenDone:`. Copied, as
-/// [`data_with_bytes_no_copy`] explains, and the caller's buffer released
-/// now when it handed it over.
+/// `-initWithBytesNoCopy:length:freeWhenDone:`. Copied, since data here owns a
+/// `Vec`, and the caller's buffer released now when it handed it over.
 unsafe extern "C" fn data_init_no_copy_free(
     receiver: Id,
     _sel: Sel,
@@ -3258,6 +3259,22 @@ mod tests {
         for string in strings {
             objc::arc::release(string as Id);
         }
+    }
+
+    /// The buffer is on the stack, so freeing it would abort the test.
+    #[test]
+    fn data_with_bytes_no_copy_leaves_the_buffer_unless_free_when_done() {
+        crate::bootstrap();
+        let source = [1u8, 2, 3];
+        let pool = objc::arc::pool_push();
+        let sel = objc::sel::get("dataWithBytesNoCopy:length:freeWhenDone:");
+        // SAFETY: `source` covers the stated length and stays the caller's.
+        let data = unsafe {
+            data_with_bytes_no_copy_free(std::ptr::null_mut(), sel, source.as_ptr(), 3, 0)
+        };
+        // SAFETY: a data object this test made.
+        assert_eq!(unsafe { data_contents(data) }, source);
+        objc::arc::pool_pop(pool);
     }
 
     #[test]
