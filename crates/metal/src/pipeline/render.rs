@@ -37,6 +37,13 @@ const PRIMITIVE_LINE: u64 = 1;
 const PRIMITIVE_LINE_STRIP: u64 = 2;
 const PRIMITIVE_TRIANGLE: u64 = 3;
 
+/// `MTLCullMode`.
+const CULL_MODE_FRONT: u64 = 1;
+const CULL_MODE_BACK: u64 = 2;
+
+/// `MTLWinding`.
+const WINDING_COUNTER_CLOCKWISE: u64 = 1;
+
 /// One face's stencil test as Vulkan takes it: the fail, pass and depth-fail
 /// operations, the comparison, and the compare and write masks.
 #[derive(Clone, Copy, Eq, PartialEq)]
@@ -75,8 +82,8 @@ impl StencilFace {
 
 fn cull_mode(metal: u64) -> vk::CullModeFlags {
     match metal {
-        1 => vk::CullModeFlags::FRONT,
-        2 => vk::CullModeFlags::BACK,
+        CULL_MODE_FRONT => vk::CullModeFlags::FRONT,
+        CULL_MODE_BACK => vk::CullModeFlags::BACK,
         _ => vk::CullModeFlags::NONE,
     }
 }
@@ -85,7 +92,7 @@ fn cull_mode(metal: u64) -> vk::CullModeFlags {
 /// is flipped, so a Metal clockwise front face is a Vulkan clockwise one.
 fn front_face(metal: u64) -> vk::FrontFace {
     match metal {
-        1 => vk::FrontFace::COUNTER_CLOCKWISE,
+        WINDING_COUNTER_CLOCKWISE => vk::FrontFace::COUNTER_CLOCKWISE,
         _ => vk::FrontFace::CLOCKWISE,
     }
 }
