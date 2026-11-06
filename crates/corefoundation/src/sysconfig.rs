@@ -552,14 +552,18 @@ pub unsafe extern "C" fn SCDynamicStoreCopyProxies(_store: CFTypeRef) -> CFTypeR
 
 /// An `SCDynamicStoreRef`.
 ///
-/// A handle and nothing else: the store below answers from the host's own
-/// interfaces rather than from a session, and the name and callback a guest
-/// passes name a notification channel this tree does not deliver on. It is a
-/// real object of this runtime's because the caller releases it with
-/// `CFRelease`, which walks the isa.
+/// A local handle with the session-key option recorded. Reads come from the
+/// host's interfaces; this is not a configd store and has no writable keys.
+/// The name and callback do not establish a notification channel here. It is
+/// a real object of this runtime because callers release it with `CFRelease`,
+/// which walks the isa.
 #[repr(C)]
 struct Store {
     isa: *const Class,
+    // Apple configd's _configopen records this on the store session. No
+    // dynamic-store mutation APIs are implemented here yet, so there are no
+    // session-owned keys to remove when the session is released.
+    use_session_keys: bool,
 }
 
 fn store_class() -> &'static Class {
@@ -585,7 +589,59 @@ pub unsafe extern "C" fn SCDynamicStoreCreate(
     // SAFETY: `Store` begins with `isa` and is the layout `store_class` was
     // registered with.
     let store: *mut Store = unsafe { crate::base::allocate(store_class()) };
+    if !store.is_null() {
+        // SAFETY: allocated as Store and its state was not yet initialized.
+        unsafe { (*store).use_session_keys = false };
+    }
     store as CFTypeRef
+}
+
+/// `SCDynamicStoreCreateWithOptions(CFAllocatorRef, CFStringRef,
+/// CFDictionaryRef, SCDynamicStoreCallBack, SCDynamicStoreContext *)`.
+///
+/// configd's `_configopen` accepts only a dictionary for `options`, and a
+/// CFBoolean for its `kSCDynamicStoreUseSessionKeys` entry. Other keys are
+/// ignored. We preserve the flag on the session, without claiming to provide
+/// the unsupported dynamic-store writes or their session-close cleanup.
+pub unsafe extern "C" fn SCDynamicStoreCreateWithOptions(
+    allocator: CFTypeRef,
+    name: CFTypeRef,
+    options: CFTypeRef,
+    callout: *const c_void,
+    context: *mut c_void,
+) -> CFTypeRef {
+    // The framework's server validates the name before opening a session.
+    // SAFETY: caller supplies a CFString or an invalid argument.
+    if unsafe { crate::api::CFGetTypeID(name) != crate::api::CFStringGetTypeID() } {
+        return std::ptr::null();
+    }
+
+    let mut use_session_keys = false;
+    if !options.is_null() {
+        // SAFETY: caller supplies a CFDictionary or an invalid argument.
+        if unsafe { crate::api::CFGetTypeID(options) != crate::api::CFDictionaryGetTypeID() } {
+            return std::ptr::null();
+        }
+        let key = crate::base::interned_name("UseSessionKeys") as CFTypeRef;
+        // SAFETY: type checked above, and the key is a permanent CFString.
+        let value = unsafe { crate::api::CFDictionaryGetValue(options, key) };
+        if !value.is_null() {
+            // SAFETY: configd requires a CFBoolean (not a CFNumber) for this key.
+            if unsafe { crate::api::CFGetTypeID(value) != crate::api::CFBooleanGetTypeID() } {
+                return std::ptr::null();
+            }
+            // SAFETY: the type check guarantees this is a CFBoolean.
+            use_session_keys = unsafe { crate::api::CFBooleanGetValue(value) != 0 };
+        }
+    }
+
+    // SAFETY: the base constructor accepts the same allocator/callback/context.
+    let store = unsafe { SCDynamicStoreCreate(allocator, name, callout, context) };
+    if !store.is_null() {
+        // SAFETY: SCDynamicStoreCreate returns this module's Store object.
+        unsafe { (*(store as *mut Store)).use_session_keys = use_session_keys };
+    }
+    store
 }
 
 /// `CFStringRef SCDynamicStoreCopyComputerName(SCDynamicStoreRef, CFStringEncoding *)`
@@ -794,6 +850,7 @@ const PRIMARY_INTERFACE: &str = "PrimaryInterface";
 const KEY_STRINGS: &[(&str, &str)] = &[
     ("_kSCDynamicStoreDomainState", "State:"),
     ("_kSCDynamicStoreDomainSetup", "Setup:"),
+    ("_kSCDynamicStoreUseSessionKeys", "UseSessionKeys"),
     ("_kSCDynamicStorePropNetPrimaryInterface", PRIMARY_INTERFACE),
     ("_kSCDynamicStorePropNetPrimaryService", "PrimaryService"),
     ("_kSCEntNetIPv4", "IPv4"),
@@ -859,6 +916,7 @@ exports::exports! {
         "SCNetworkReachabilityUnscheduleFromRunLoop" => SCNetworkReachabilityUnscheduleFromRunLoop,
         "SCDynamicStoreCopyProxies" => SCDynamicStoreCopyProxies,
         "SCDynamicStoreCreate" => SCDynamicStoreCreate,
+        "SCDynamicStoreCreateWithOptions" => SCDynamicStoreCreateWithOptions,
         "SCDynamicStoreCopyComputerName" => SCDynamicStoreCopyComputerName,
         "SCDynamicStoreKeyCreateNetworkGlobalEntity" => SCDynamicStoreKeyCreateNetworkGlobalEntity,
         "SCDynamicStoreCopyValue" => SCDynamicStoreCopyValue,
@@ -876,6 +934,131 @@ exports::exports! {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The global is a *cell holding a CFStringRef*, not a CFString object at
+    /// the symbol address. The guest loads it through an imported data symbol.
+    #[test]
+    fn use_session_keys_export_is_a_cfstring_cell() {
+        crate::bootstrap();
+        let address = data_symbols()
+            .into_iter()
+            .find(|(name, _)| name == "_kSCDynamicStoreUseSessionKeys")
+            .expect("session option data symbol")
+            .1;
+        assert_ne!(address, 0);
+        // SAFETY: data_symbols gives the address of a static CFStringRef cell.
+        let key = unsafe { *(address as usize as *const CFTypeRef) };
+        assert_eq!(unsafe { text_of(key) }, Some(b"UseSessionKeys".to_vec()));
+        assert_eq!(unsafe { crate::api::CFGetTypeID(key) }, unsafe {
+            crate::api::CFStringGetTypeID()
+        });
+    }
+
+    #[test]
+    fn create_with_options_checks_apple_option_types() {
+        crate::bootstrap();
+        let nil = std::ptr::null();
+        let name = crate::base::interned_name("sysconfig-option-test") as CFTypeRef;
+        let key = crate::base::interned_name("UseSessionKeys") as CFTypeRef;
+        let bad = crate::string::from_bytes(b"not-a-boolean", false);
+        let options = |k: CFTypeRef, v: CFTypeRef| {
+            crate::collections::new_dictionary(
+                &[(k, v)],
+                Policy::from_key_callbacks(),
+                Policy::from_type_callbacks(),
+                false,
+            )
+        };
+
+        // SAFETY: owned CoreFoundation objects, with a null callback/context.
+        unsafe {
+            assert!(
+                SCDynamicStoreCreateWithOptions(nil, nil, nil, nil, std::ptr::null_mut()).is_null()
+            );
+            assert!(
+                SCDynamicStoreCreateWithOptions(
+                    nil,
+                    crate::collections::boolean(true),
+                    nil,
+                    nil,
+                    std::ptr::null_mut(),
+                )
+                .is_null()
+            );
+            assert!(
+                SCDynamicStoreCreateWithOptions(nil, name, bad, nil, std::ptr::null_mut())
+                    .is_null()
+            );
+            for invalid in [
+                bad,
+                crate::collections::new_number(crate::collections::Number::Integer(1)),
+            ] {
+                let dict = options(key, invalid);
+                assert!(
+                    SCDynamicStoreCreateWithOptions(nil, name, dict, nil, std::ptr::null_mut())
+                        .is_null()
+                );
+                crate::api::CFRelease(dict);
+                if invalid != bad {
+                    crate::api::CFRelease(invalid);
+                }
+            }
+            crate::api::CFRelease(bad);
+        }
+    }
+
+    #[test]
+    fn create_with_options_preserves_session_flag_and_read_api() {
+        crate::bootstrap();
+        let nil = std::ptr::null();
+        let name = crate::base::interned_name("sysconfig-option-test") as CFTypeRef;
+        let key = crate::string::from_bytes(b"UseSessionKeys", false);
+        // A NULL options dictionary must have the same default as Create.
+        unsafe {
+            let store = SCDynamicStoreCreateWithOptions(nil, name, nil, nil, std::ptr::null_mut());
+            assert!(!store.is_null());
+            assert!(!(*(store as *const Store)).use_session_keys);
+            crate::api::CFRelease(store);
+        }
+        for (value, expected) in [
+            (crate::collections::boolean(false), false),
+            (crate::collections::boolean(true), true),
+        ] {
+            let dict = crate::collections::new_dictionary(
+                &[(key, value)],
+                Policy::from_key_callbacks(),
+                Policy::from_type_callbacks(),
+                false,
+            );
+            // SAFETY: owned CoreFoundation values and nil callback/context.
+            unsafe {
+                let store =
+                    SCDynamicStoreCreateWithOptions(nil, name, dict, nil, std::ptr::null_mut());
+                assert!(!store.is_null());
+                assert_eq!((*(store as *const Store)).use_session_keys, expected);
+                let nonexistent_key = crate::base::interned_name("State:/NotPresent") as CFTypeRef;
+                assert!(SCDynamicStoreCopyValue(store, nonexistent_key).is_null());
+                crate::api::CFRelease(store);
+                crate::api::CFRelease(dict);
+            }
+        }
+        // Apple's configd ignores unknown option names.
+        let unknown = crate::base::interned_name("UnknownOption") as CFTypeRef;
+        let dict = crate::collections::new_dictionary(
+            &[(unknown, crate::collections::boolean(true))],
+            Policy::from_key_callbacks(),
+            Policy::from_type_callbacks(),
+            false,
+        );
+        unsafe {
+            let store = SCDynamicStoreCreateWithOptions(nil, name, dict, nil, std::ptr::null_mut());
+            assert!(!store.is_null());
+            assert!(!(*(store as *const Store)).use_session_keys);
+            crate::api::CFRelease(store);
+            crate::api::CFRelease(dict);
+            crate::api::CFRelease(key);
+        }
+    }
 
     /// A null argument is the one case that still answers NULL, on both hosts.
     #[test]
