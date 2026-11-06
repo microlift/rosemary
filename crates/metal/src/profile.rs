@@ -42,6 +42,18 @@ pub fn label_entry(artifact: &metal_translate::EntryArtifact, label: String) {
         .insert(artifact as *const _ as usize, label.into());
 }
 
+/// Label a specialization of `base` after it, numbered so that variants
+/// made with different constants total apart.
+pub fn label_specialized(
+    specialized: &metal_translate::EntryArtifact,
+    base: &metal_translate::EntryArtifact,
+) {
+    static NEXT: AtomicU32 = AtomicU32::new(0);
+    let serial = NEXT.fetch_add(1, Ordering::Relaxed);
+    let label = format!("{}~{serial}", entry_label(base));
+    label_entry(specialized, label);
+}
+
 pub fn entry_label(artifact: &metal_translate::EntryArtifact) -> Arc<str> {
     let labels = ENTRY_LABELS.lock().expect("profile labels");
     labels

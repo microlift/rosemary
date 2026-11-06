@@ -498,9 +498,10 @@ pub(super) unsafe extern "C" fn replace_region(
     let alignment = lcm(texel.max(1), 16);
     let image = texture.image.image;
     let aspect = texture.image.aspect;
+    let heap = texture.image.placement.as_deref();
     let result = texture.gpu.defer(|gpu, batch| {
         let (buffer, offset) = batch.stage(gpu, source, alignment)?;
-        batch.touch(image);
+        batch.touch_subresource(gpu, image, heap, checked.level, checked.slice);
         let copy = vk::BufferImageCopy::default()
             .buffer_offset(offset)
             .buffer_row_length(row_length as u32)

@@ -10,8 +10,11 @@ mod pools;
 mod submit;
 mod trace;
 
-use std::collections::HashMap;
-use std::sync::{Arc, Condvar, Mutex, OnceLock, atomic::AtomicBool};
+use std::collections::{HashMap, VecDeque};
+use std::sync::{
+    Arc, Condvar, Mutex, MutexGuard, Once, OnceLock,
+    atomic::{AtomicBool, AtomicUsize},
+};
 
 use ash::{Device, Entry, Instance, vk};
 use static_init::dynamic;
@@ -27,7 +30,7 @@ pub(crate) use guard::{Guard, GuardedVec};
 pub use host::HostPages;
 pub use memory::Fill;
 pub use placement::Placement;
-pub use submit::Batch;
+pub use submit::{Batch, Commit};
 use trace::dump_spirv;
 pub use trace::{milestone, trace, trace_once};
 
@@ -89,10 +92,12 @@ pub struct Gpu {
     /// Some ICDs do not tolerate concurrent VkSwapchain/semaphore creation
     /// and vkQueuePresentKHR for different windows on a shared device.
     pub(crate) wsi: Mutex<()>,
-    /// Commits hold this across the guest submit and every presentation
-    /// submit attached to it. Queue calls themselves keep using `queue` for
-    /// Vulkan's external-synchronization rule.
-    submission_boundary: Mutex<()>,
+    /// Command buffers committed and not yet submitted. Whoever takes the
+    /// queue submits them first, so the queue keeps the order of commits.
+    commits: submit::Commits,
+    /// Submissions on the queue which wait for an event. Work behind one may
+    /// run only once the CPU signals it, after writes it makes past commit.
+    pub(crate) event_waits_in_flight: AtomicUsize,
     /// In-flight work and its completion worker are device-local. Independent
     /// Vulkan devices must never head-of-line block one another.
     pub(crate) submissions: crate::submission::Tracker,
@@ -109,7 +114,7 @@ pub struct Gpu {
     /// One layout per distinct set of Metal binding indices, so pipelines
     /// sharing a resource shape share a layout.
     layouts: Mutex<DescriptorLayouts>,
-    render_passes: Mutex<HashMap<RenderPassKey, vk::RenderPass>>,
+    render_passes: Mutex<crate::hash::FastMap<RenderPassKey, vk::RenderPass>>,
     pipeline_cache: pipeline_cache::PipelineCache,
     /// Fence-owned immediate command contexts. Recording or waiting on an
     /// unrelated window must not hold a global command-pool mutex.
@@ -137,6 +142,10 @@ pub struct Gpu {
     pub(crate) occlusion_precise: bool,
     /// Whether a pipeline can force coverage-written alpha to one.
     pub(crate) alpha_to_one: bool,
+    /// Whether culling, winding, depth and stencil state and the topology
+    /// within its class are set per draw, as Vulkan 1.3 can, rather than
+    /// compiled into one pipeline per combination.
+    pub(crate) dynamic_render_state: bool,
     host_query_reset: bool,
     /// Whether the device has timeline semaphores, which `MTLEvent`s are.
     pub(crate) timeline_semaphores: bool,
@@ -790,7 +799,8 @@ impl Gpu {
             queue_family,
             queue: Mutex::new(queue),
             wsi: Mutex::new(()),
-            submission_boundary: Mutex::new(()),
+            commits: submit::Commits::default(),
+            event_waits_in_flight: AtomicUsize::new(0),
             submissions: crate::submission::Tracker::new(),
             deferred: deferred::Deferred::default(),
             presenter: crate::present::Presenter::new(),
@@ -798,7 +808,7 @@ impl Gpu {
             memory,
             limits: properties.limits,
             layouts: Mutex::new(HashMap::new()),
-            render_passes: Mutex::new(HashMap::new()),
+            render_passes: Mutex::new(Default::default()),
             pipeline_cache,
             immediate: Mutex::new(ImmediatePool::default()),
             immediate_ready: Condvar::new(),
@@ -812,6 +822,7 @@ impl Gpu {
             occlusion_pools: Mutex::new(Vec::new()),
             occlusion_precise: features.occlusion_query_precise == vk::TRUE,
             alpha_to_one: features.alpha_to_one == vk::TRUE,
+            dynamic_render_state: target.vulkan_version >= (1, 3),
             host_query_reset,
             timeline_semaphores,
             contexts: Mutex::new(Vec::new()),

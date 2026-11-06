@@ -9,7 +9,6 @@ mod enums;
 mod link;
 mod render;
 
-use std::collections::HashMap;
 use std::sync::Mutex;
 
 use ash::vk;
@@ -29,8 +28,8 @@ use render::render_pipeline_dealloc;
 
 pub(crate) use compute::ComputePipeline;
 pub(crate) use render::{
-    COLOR_ATTACHMENTS, ColorAttachment, DepthStencilKey, RenderPipeline, RenderPipelineDescriptor,
-    RenderVariantKey,
+    COLOR_ATTACHMENTS, ColorAttachment, DepthStencilKey, RenderDynamicState, RenderPipeline,
+    RenderPipelineDescriptor, RenderVariantKey,
 };
 
 /// The four descriptor sets of the Metal resource ABI.
@@ -316,10 +315,9 @@ pub(crate) fn install() {
         "setPreprocessorMacros:" => set_preprocessor_macros, c"v24@0:8@16";
     });
     methods!(descriptor, {
-        // Vulkan takes the topology from each draw, and no function here is
-        // ever a post-tessellation vertex function, so tessellation state has
-        // nothing to configure: a patch function is refused when it is made.
-        "setInputPrimitiveTopology:" => crate::no_op, c"v24@0:8Q16";
+        // No function here is ever a post-tessellation vertex function, so
+        // tessellation state has nothing to configure: a patch function is
+        // refused when it is made.
         "setMaxTessellationFactor:" => crate::no_op, c"v24@0:8Q16";
         "setTessellationControlPointIndexType:" => crate::no_op, c"v24@0:8Q16";
         "setTessellationFactorFormat:" => crate::no_op, c"v24@0:8Q16";
@@ -337,6 +335,7 @@ pub(crate) fn install() {
         "isAlphaToCoverageEnabled" => descriptor_number, c"Q16@0:8";
         "isAlphaToOneEnabled" => descriptor_number, c"Q16@0:8";
         "isRasterizationEnabled" => descriptor_number, c"Q16@0:8";
+        "inputPrimitiveTopology" => descriptor_number, c"Q16@0:8";
         "init" => descriptor_init, c"@16@0:8";
         "colorAttachments" => color_attachments, c"@16@0:8";
         "dealloc" => descriptor_dealloc, c"v16@0:8";
@@ -362,6 +361,7 @@ pub(crate) fn install() {
         "setAlphaToCoverageEnabled:",
         "setAlphaToOneEnabled:",
         "setRasterizationEnabled:",
+        "setInputPrimitiveTopology:",
     ] {
         descriptor.replace_method(
             objc::sel::get(selector),

@@ -115,6 +115,9 @@ static GENERATION: AtomicUsize = AtomicUsize::new(1);
 
 fn bump_generation() {
     GENERATION.fetch_add(1, Ordering::AcqRel);
+    // After the bump: a lookup which raced the change sees a new generation
+    // and does not cache what it found.
+    crate::msg::forget_cached_sends();
 }
 
 /// A counter that changes whenever any method table does.
@@ -569,10 +572,32 @@ static INITIALIZED: std::sync::Condvar = std::sync::Condvar::new();
 /// `if (self == [Foo class])` is written against. A message the class's own
 /// `+initialize` sends to the class goes straight through; a message from
 /// another thread waits until it has returned.
-pub fn ensure_initialized(class: &'static Class) {
-    if class.initialized.load(Ordering::Acquire) {
-        return;
+/// Whether `+initialize` has finished for `class`, or for the class whose
+/// metaclass it is.
+pub(crate) fn is_initialized(class: &'static Class) -> bool {
+    match class.is_meta() {
+        true => {
+            let instances = class.instances.load(Ordering::Acquire);
+            // SAFETY: a leaked class, set when the pair was allocated.
+            !instances.is_null()
+                && unsafe { &*(instances as *const Class) }
+                    .initialized
+                    .load(Ordering::Acquire)
+        }
+        false => class.initialized.load(Ordering::Acquire),
     }
+}
+
+#[inline]
+pub fn ensure_initialized(class: &'static Class) {
+    // Every message send asks, and the answer is nearly always yes.
+    if !class.initialized.load(Ordering::Acquire) {
+        initialize(class);
+    }
+}
+
+#[cold]
+fn initialize(class: &'static Class) {
     let class = match class.is_meta() {
         true => {
             let instances = class.instances.load(Ordering::Acquire);

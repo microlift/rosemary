@@ -9,6 +9,7 @@ mod encoder;
 mod event;
 mod exports;
 mod gpu;
+mod hash;
 mod heap;
 mod library;
 mod object;
@@ -101,6 +102,18 @@ struct ConstantValues {
 static ALLOCATED_SIZE: AtomicU64 = AtomicU64::new(0);
 /// Bytes of live shared and managed `MTLBuffer`s, for `ROSEMARY_METAL_STATS`.
 static SHARED_BUFFER_BYTES: AtomicU64 = AtomicU64::new(0);
+
+/// Give a thread this crate starts the Darwin thread state guest code reads.
+/// Guest code reaches these threads without being called on them: a block's
+/// dispose helper when the last reference to it goes, or the `dealloc` of an
+/// object the guest owns. Its allocator finds its heap through that state.
+///
+/// The thread pointer stays installed, but guest syscalls are interposed only
+/// within a [`darwin::tls::DarwinThread`] scope, which every release that may
+/// run guest code still enters.
+pub(crate) fn enter_darwin_thread() {
+    drop(darwin::tls::DarwinThread::enter());
+}
 
 pub(crate) fn add_shared_buffer_bytes(amount: u64) {
     if stats::enabled() {

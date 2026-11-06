@@ -20,7 +20,110 @@ impl Batch {
     }
 }
 
+/// A committed command buffer on its way to the queue.
+pub struct Commit {
+    pub batches: Vec<Batch>,
+    pub fence: vk::Fence,
+    /// Called with the commit's place in queue order once the batches reach
+    /// the queue, or with why they did not, and the fence which signals once
+    /// they are done: `fence`, or a later commit's submitted with it. Called
+    /// with the queue held, so in that order, and so it must not take the
+    /// queue itself.
+    pub submitted: Box<dyn FnOnce(u64, Result<(), String>, vk::Fence) + Send>,
+}
+
+/// The most commits submitted together, so the first of a long run is not
+/// held back until the last is recorded into the call.
+const MERGED_COMMITS: usize = 64;
+
+/// Commits waiting for the submission thread, oldest first.
+pub(crate) struct Commits {
+    pending: Mutex<VecDeque<Commit>>,
+    ready: Condvar,
+    worker: Once,
+}
+
+impl Default for Commits {
+    fn default() -> Self {
+        Self {
+            pending: Mutex::new(VecDeque::new()),
+            ready: Condvar::new(),
+            worker: Once::new(),
+        }
+    }
+}
+
 impl Gpu {
+    /// Hand a committed command buffer to the submission thread.
+    ///
+    /// Metal's `-commit` returns before the work reaches the device, and
+    /// `vkQueueSubmit` costs tens of microseconds of driver and kernel time,
+    /// so that time is spent off the thread which commits.
+    pub(crate) fn commit(&'static self, commit: Commit) {
+        self.commits.worker.call_once(|| {
+            std::thread::Builder::new()
+                .name("metal:submit".to_string())
+                .spawn(move || {
+                    crate::enter_darwin_thread();
+                    self.submit_worker()
+                })
+                .expect("a thread for Metal submissions");
+        });
+        let mut pending = self.commits.pending.lock().expect("Metal commits");
+        pending.push_back(commit);
+        self.commits.ready.notify_one();
+    }
+
+    fn submit_worker(&self) {
+        loop {
+            {
+                let mut pending = self.commits.pending.lock().expect("Metal commits");
+                while pending.is_empty() {
+                    pending = self.commits.ready.wait(pending).expect("Metal commits");
+                }
+            }
+            drop(self.lock_queue());
+            // Outside the queue lock: this destroys buffers and images.
+            self.retire_deferred();
+        }
+    }
+
+    /// The queue, once every command buffer committed before this call is on
+    /// it, so whatever is submitted next lands behind them as it would have
+    /// had they been submitted when committed.
+    pub(super) fn lock_queue(&self) -> MutexGuard<'_, vk::Queue> {
+        let queue = self.queue.lock().expect("Vulkan queue");
+        loop {
+            let commits: Vec<Commit> = {
+                let mut pending = self.commits.pending.lock().expect("Metal commits");
+                let count = pending.len().min(MERGED_COMMITS);
+                pending.drain(..count).collect()
+            };
+            let Some(last) = commits.last() else {
+                break;
+            };
+            // One fence for all of them: it signals once the last is done,
+            // and they retire in order, so it outlives every wait on it.
+            let fence = last.fence;
+            let batches: Vec<Batch> = commits
+                .iter()
+                .flat_map(|commit| commit.batches.iter())
+                .map(|batch| Batch {
+                    waits: batch.waits.clone(),
+                    command_buffer: batch.command_buffer,
+                    signals: batch.signals.clone(),
+                })
+                .collect();
+            let result = crate::stats::timed(crate::stats::Counter::SubmitMicros, || {
+                self.submit_locked(*queue, &batches, fence)
+            });
+            for commit in commits {
+                (commit.submitted)(self.submissions.next_serial(), result.clone(), fence);
+            }
+        }
+        queue
+    }
+
     /// Test controlled device-wide queue contention while AppKit presents
     /// another window. No guest or production path calls this.
     #[cfg(test)]
@@ -44,19 +147,56 @@ impl Gpu {
 
     /// Submit batches in order, `fence` signalling once all are done.
     pub fn submit_batches(&self, batches: &[Batch], fence: vk::Fence) -> Result<(), String> {
+        let submitted = {
+            let waiting = crate::stats::timer();
+            let queue = self.lock_queue();
+            crate::stats::finish_timer(crate::stats::Counter::SubmitLockMicros, waiting);
+            self.submit_locked(*queue, batches, fence)
+        };
+        // Outside the queue lock: this destroys buffers and images.
+        self.retire_deferred();
+        submitted
+    }
+
+    /// [`Self::submit_batches`], with the queue already held.
+    fn submit_locked(
+        &self,
+        queue: vk::Queue,
+        batches: &[Batch],
+        fence: vk::Fence,
+    ) -> Result<(), String> {
         if self.lost.load(Ordering::Acquire) {
             return Err("Vulkan logical device is lost".into());
+        }
+        // Batches nothing separates - no event signalled after the first or
+        // waited for before the second - share one `VkSubmitInfo`, which the
+        // driver hands the kernel as one submission. Each submission costs
+        // the kernel a validation of every host import, every time.
+        let mut groups: Vec<(Vec<vk::CommandBuffer>, &Batch, &Batch)> = Vec::new();
+        for batch in batches {
+            match groups.last_mut() {
+                Some((buffers, _, last)) if last.signals.is_empty() && batch.waits.is_empty() => {
+                    buffers.push(batch.command_buffer);
+                    *last = batch;
+                }
+                _ => groups.push((vec![batch.command_buffer], batch, batch)),
+            }
         }
         let split = |pairs: &[(vk::Semaphore, u64)]| -> (Vec<vk::Semaphore>, Vec<u64>) {
             pairs.iter().copied().unzip()
         };
-        let waits: Vec<_> = batches.iter().map(|batch| split(&batch.waits)).collect();
-        let signals: Vec<_> = batches.iter().map(|batch| split(&batch.signals)).collect();
-        let stages: Vec<_> = batches
+        let waits: Vec<_> = groups
             .iter()
-            .map(|batch| vec![vk::PipelineStageFlags::ALL_COMMANDS; batch.waits.len()])
+            .map(|(_, first, _)| split(&first.waits))
             .collect();
-        let buffers: Vec<_> = batches.iter().map(|batch| [batch.command_buffer]).collect();
+        let signals: Vec<_> = groups
+            .iter()
+            .map(|(_, _, last)| split(&last.signals))
+            .collect();
+        let stages: Vec<_> = groups
+            .iter()
+            .map(|(_, first, _)| vec![vk::PipelineStageFlags::ALL_COMMANDS; first.waits.len()])
+            .collect();
         let mut timelines: Vec<_> = waits
             .iter()
             .zip(&signals)
@@ -68,57 +208,39 @@ impl Gpu {
             .collect();
         let submits: Vec<_> = timelines
             .iter_mut()
+            .zip(&groups)
             .enumerate()
-            .map(|(index, timeline)| {
+            .map(|(index, (timeline, (buffers, first, last)))| {
                 let submit = vk::SubmitInfo::default()
-                    .command_buffers(&buffers[index])
+                    .command_buffers(buffers)
                     .wait_semaphores(&waits[index].0)
                     .wait_dst_stage_mask(&stages[index])
                     .signal_semaphores(&signals[index].0);
                 // Only an event's semaphores are timelines; a plain batch
                 // must not name the structure on a device without them.
-                match batches[index].waits.is_empty() && batches[index].signals.is_empty() {
+                match first.waits.is_empty() && last.signals.is_empty() {
                     true => submit,
                     false => submit.push_next(timeline),
                 }
             })
             .collect();
-        {
-            let queue = self.queue.lock().expect("Vulkan queue");
-            self.flush_deferred(*queue);
-            // SAFETY: the queue is held exclusively for the submission.
-            unsafe { self.device.reset_fences(&[fence]) }
-                .map_err(|error| format!("vkResetFences failed with {error:?}"))?;
-            // SAFETY: as above; the command buffers have finished recording
-            // and every borrowed array lives across the call.
-            if let Err(error) = unsafe { self.device.queue_submit(*queue, &submits, fence) } {
-                if error == vk::Result::ERROR_DEVICE_LOST {
-                    crate::swapchain::record_device_loss(self);
-                }
-                return Err(format!("vkQueueSubmit failed with {error:?}"));
+        crate::stats::timed(crate::stats::Counter::SubmitFlushMicros, || {
+            self.flush_deferred(queue)
+        });
+        let driver = crate::stats::timer();
+        // SAFETY: the caller holds the queue exclusively for the submission.
+        unsafe { self.device.reset_fences(&[fence]) }
+            .map_err(|error| format!("vkResetFences failed with {error:?}"))?;
+        // SAFETY: as above; the command buffers have finished recording and
+        // every borrowed array lives across the call.
+        let submitted = unsafe { self.device.queue_submit(queue, &submits, fence) };
+        crate::stats::finish_timer(crate::stats::Counter::SubmitDriverMicros, driver);
+        if let Err(error) = submitted {
+            if error == vk::Result::ERROR_DEVICE_LOST {
+                crate::swapchain::record_device_loss(self);
             }
+            return Err(format!("vkQueueSubmit failed with {error:?}"));
         }
-        // Outside the queue lock: this destroys buffers and images.
-        self.retire_deferred();
-        Ok(())
-    }
-
-    /// Submit guest work and attach its presentation submissions as one
-    /// ordering transaction. Presentation preparation and recording happen
-    /// after the Vulkan queue mutex is released, while concurrent guest
-    /// commits remain ordered by `submission_boundary`.
-    pub fn submit_ordered(
-        &self,
-        batches: &[Batch],
-        fence: vk::Fence,
-        submitted: impl FnOnce(u64),
-    ) -> Result<(), String> {
-        let _boundary = self
-            .submission_boundary
-            .lock()
-            .expect("Vulkan submission boundary");
-        self.submit_batches(batches, fence)?;
-        submitted(self.submissions.next_serial());
         Ok(())
     }
 
@@ -173,7 +295,7 @@ impl Gpu {
             .wait_semaphores(&wait_semaphores)
             .wait_dst_stage_mask(&wait_stages)
             .signal_semaphores(signal);
-        let queue = self.queue.lock().expect("Vulkan queue");
+        let queue = self.lock_queue();
         self.flush_deferred(*queue);
         // SAFETY: the queue is held exclusively; the fence and semaphores
         // belong to this device.
@@ -207,7 +329,7 @@ impl Gpu {
             .wait_semaphores(&semaphores)
             .wait_dst_stage_mask(&stages);
         {
-            let queue = self.queue.lock().expect("Vulkan queue");
+            let queue = self.lock_queue();
             // The failed render submission did not associate the fence with
             // queued work. Reset here even if recording failed before the
             // original vkResetFences operation.
@@ -261,7 +383,7 @@ impl Gpu {
         let lock_timer = crate::stats::timer();
         let _commits = sdl3::compositor::guard();
         let _wsi = self.wsi.lock().expect("Vulkan WSI");
-        let queue = self.queue.lock().expect("Vulkan queue");
+        let queue = self.lock_queue();
         crate::stats::finish_timer(crate::stats::Counter::QueuePresentLockMicros, lock_timer);
         // SAFETY: the queue is held exclusively, every borrowed slice lives
         // across the call, and the image was acquired from this swapchain.
@@ -286,7 +408,7 @@ impl Gpu {
     /// swapchain, which is a resize or a teardown and never a frame.
     pub fn wait_queue_idle(&self) {
         let idle = {
-            let queue = self.queue.lock().expect("Vulkan queue");
+            let queue = self.lock_queue();
             // SAFETY: the queue is held exclusively for the wait.
             unsafe { self.device.queue_wait_idle(*queue) }.is_ok()
         };

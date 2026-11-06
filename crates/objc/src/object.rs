@@ -93,6 +93,7 @@ pub unsafe fn dispose_instance(object: Id) {
     unsafe { destruct_instance(object) };
     // SAFETY: the object is still readable, which is what names its class.
     unsafe { crate::census::freed(object) };
+    crate::arc::forget_count(object);
     if crate::debug::finalized(object) {
         return;
     }

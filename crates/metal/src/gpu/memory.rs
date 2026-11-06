@@ -132,7 +132,7 @@ impl Gpu {
                 // Unmapped, so the device zeroes it ahead of any work which
                 // could read it.
                 let filled = self.defer(|gpu, batch| {
-                    batch.touch_buffer(buffer);
+                    batch.touch_buffer(gpu, buffer, None);
                     // SAFETY: the batch is recording, and the buffer lives
                     // until it has run: see `destroy_buffer`.
                     unsafe {
@@ -170,7 +170,7 @@ impl Gpu {
         let target = buffer.buffer;
         self.defer(|gpu, batch| {
             let (staging, offset) = batch.stage(gpu, &bytes[..length as usize], 4)?;
-            batch.touch_buffer(target);
+            batch.touch_buffer(gpu, target, buffer.placement.as_deref());
             let region = vk::BufferCopy::default()
                 .src_offset(offset)
                 .dst_offset(0)
@@ -445,7 +445,7 @@ impl Gpu {
         // Nothing below may fail once the transition is recorded, because the
         // batch then names the image.
         self.defer(|gpu, batch| {
-            batch.touch(*image);
+            batch.name(gpu, *image, placement.as_deref());
             let barrier = vk::ImageMemoryBarrier::default()
                 .old_layout(vk::ImageLayout::UNDEFINED)
                 .new_layout(vk::ImageLayout::GENERAL)

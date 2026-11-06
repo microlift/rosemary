@@ -102,6 +102,7 @@ pub(super) unsafe extern "C" fn descriptor_init(receiver: Id, _sel: Sel) -> Id {
         alpha_to_coverage: false,
         alpha_to_one: false,
         rasterization: true,
+        input_topology: 0,
         color_objects,
     };
     receiver
@@ -191,6 +192,7 @@ pub(super) unsafe extern "C" fn descriptor_number(receiver: Id, sel: Sel) -> u64
         b"isAlphaToCoverageEnabled" => u64::from(descriptor.alpha_to_coverage),
         b"isAlphaToOneEnabled" => u64::from(descriptor.alpha_to_one),
         b"isRasterizationEnabled" => u64::from(descriptor.rasterization),
+        b"inputPrimitiveTopology" => descriptor.input_topology,
         _ => 0,
     }
 }
@@ -206,6 +208,7 @@ pub(super) unsafe extern "C" fn set_descriptor_number(receiver: Id, sel: Sel, va
         b"setAlphaToCoverageEnabled:" => descriptor.alpha_to_coverage = value & 0xff != 0,
         b"setAlphaToOneEnabled:" => descriptor.alpha_to_one = value & 0xff != 0,
         b"setRasterizationEnabled:" => descriptor.rasterization = value & 0xff != 0,
+        b"setInputPrimitiveTopology:" => descriptor.input_topology = value,
         _ => (),
     }
 }
@@ -278,6 +281,7 @@ mod tests {
                 alpha_to_coverage: false,
                 alpha_to_one: false,
                 rasterization: true,
+                input_topology: 0,
                 color_objects: std::ptr::null_mut(),
             },
         );

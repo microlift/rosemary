@@ -10,7 +10,7 @@ pub(crate) struct ComputePipeline {
     /// Parallel to `resources`.
     pub inline_samplers: Vec<vk::Sampler>,
     /// One Vulkan pipeline per threadgroup size the guest has dispatched.
-    variants: Mutex<HashMap<[u32; 3], vk::Pipeline>>,
+    variants: Mutex<crate::hash::FastMap<[u32; 3], vk::Pipeline>>,
     /// `ROSEMARY_METAL_PROFILE`: what its dispatches are totalled under.
     pub profile_label: Option<std::sync::Arc<str>>,
 }
@@ -32,7 +32,7 @@ impl ComputePipeline {
             layouts,
             resources: entry.resources.clone(),
             inline_samplers: inline_samplers(gpu, &entry.resources),
-            variants: Mutex::new(HashMap::new()),
+            variants: Mutex::new(Default::default()),
             profile_label: crate::profile::pipeline_label(&[entry]),
         })
     }

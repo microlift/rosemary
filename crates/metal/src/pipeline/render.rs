@@ -21,13 +21,174 @@ pub(crate) struct RenderVariantKey {
     pub depth_resolve: Option<DepthResolve>,
 }
 
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
 pub(crate) struct DepthStencilKey {
     pub compare: u64,
     pub write: bool,
     pub stencil: bool,
     pub front: [u64; 6],
     pub back: [u64; 6],
+}
+
+/// `MTLPrimitiveType`'s point, line and triangle lists: the first of each
+/// class, which a pipeline whose topology is dynamic is made with.
+const PRIMITIVE_POINT: u64 = 0;
+const PRIMITIVE_LINE: u64 = 1;
+const PRIMITIVE_LINE_STRIP: u64 = 2;
+const PRIMITIVE_TRIANGLE: u64 = 3;
+
+/// `MTLPrimitiveTopologyClass`.
+const TOPOLOGY_CLASS_POINT: u64 = 1;
+const TOPOLOGY_CLASS_LINE: u64 = 2;
+
+/// `MTLCullMode`.
+const CULL_MODE_FRONT: u64 = 1;
+const CULL_MODE_BACK: u64 = 2;
+
+/// `MTLWinding`.
+const WINDING_COUNTER_CLOCKWISE: u64 = 1;
+
+/// One face's stencil test as Vulkan takes it: the fail, pass and depth-fail
+/// operations, the comparison, and the compare and write masks.
+#[derive(Clone, Copy, Eq, PartialEq)]
+struct StencilFace {
+    fail: vk::StencilOp,
+    pass: vk::StencilOp,
+    depth_fail: vk::StencilOp,
+    compare: vk::CompareOp,
+    compare_mask: u32,
+    write_mask: u32,
+}
+
+impl StencilFace {
+    /// A Metal stencil descriptor as the depth/stencil key packs it.
+    fn of(face: &[u64; 6]) -> Self {
+        Self {
+            compare: compare_op(face[0]),
+            fail: stencil_op(face[1]),
+            depth_fail: stencil_op(face[2]),
+            pass: stencil_op(face[3]),
+            compare_mask: face[4] as u32,
+            write_mask: face[5] as u32,
+        }
+    }
+
+    fn state(&self) -> vk::StencilOpState {
+        vk::StencilOpState::default()
+            .compare_op(self.compare)
+            .fail_op(self.fail)
+            .depth_fail_op(self.depth_fail)
+            .pass_op(self.pass)
+            .compare_mask(self.compare_mask)
+            .write_mask(self.write_mask)
+    }
+}
+
+fn cull_mode(metal: u64) -> vk::CullModeFlags {
+    match metal {
+        CULL_MODE_FRONT => vk::CullModeFlags::FRONT,
+        CULL_MODE_BACK => vk::CullModeFlags::BACK,
+        _ => vk::CullModeFlags::NONE,
+    }
+}
+
+/// Metal's window origin is upper-left and Vulkan's is too once the viewport
+/// is flipped, so a Metal clockwise front face is a Vulkan clockwise one.
+fn front_face(metal: u64) -> vk::FrontFace {
+    match metal {
+        WINDING_COUNTER_CLOCKWISE => vk::FrontFace::COUNTER_CLOCKWISE,
+        _ => vk::FrontFace::CLOCKWISE,
+    }
+}
+
+/// The encoder state a draw sets as Vulkan dynamic state, on a device with
+/// Vulkan 1.3. In a pipeline it would make one pipeline per combination, and
+/// a game draws one Metal pipeline under many: each new one met mid-frame is
+/// a compile, which is a stutter.
+#[derive(Clone, Copy, Eq, PartialEq)]
+pub(crate) struct RenderDynamicState {
+    cull_mode: vk::CullModeFlags,
+    front_face: vk::FrontFace,
+    topology: vk::PrimitiveTopology,
+    depth_test: bool,
+    depth_write: bool,
+    depth_compare: vk::CompareOp,
+    stencil_test: bool,
+    front: StencilFace,
+    back: StencilFace,
+}
+
+impl RenderDynamicState {
+    /// Record what differs from `previous`, everything where nothing is known
+    /// to have been recorded.
+    pub fn record(
+        &self,
+        device: &ash::Device,
+        command_buffer: vk::CommandBuffer,
+        previous: Option<&Self>,
+    ) {
+        // Whether `field` differs from what was last recorded.
+        let differs = |field: fn(&Self) -> u64| {
+            previous.is_none_or(|previous| field(previous) != field(self))
+        };
+        // SAFETY: recording into a command buffer whose bound pipeline
+        // declares these states dynamic, on a Vulkan 1.3 device.
+        unsafe {
+            if differs(|state| u64::from(state.cull_mode.as_raw())) {
+                device.cmd_set_cull_mode(command_buffer, self.cull_mode);
+            }
+            if differs(|state| state.front_face.as_raw() as u64) {
+                device.cmd_set_front_face(command_buffer, self.front_face);
+            }
+            if differs(|state| state.topology.as_raw() as u64) {
+                device.cmd_set_primitive_topology(command_buffer, self.topology);
+            }
+            if differs(|state| u64::from(state.depth_test)) {
+                device.cmd_set_depth_test_enable(command_buffer, self.depth_test);
+            }
+            if differs(|state| u64::from(state.depth_write)) {
+                device.cmd_set_depth_write_enable(command_buffer, self.depth_write);
+            }
+            if differs(|state| state.depth_compare.as_raw() as u64) {
+                device.cmd_set_depth_compare_op(command_buffer, self.depth_compare);
+            }
+            if differs(|state| u64::from(state.stencil_test)) {
+                device.cmd_set_stencil_test_enable(command_buffer, self.stencil_test);
+            }
+            let faces = [
+                (
+                    vk::StencilFaceFlags::FRONT,
+                    self.front,
+                    previous.map(|p| p.front),
+                ),
+                (
+                    vk::StencilFaceFlags::BACK,
+                    self.back,
+                    previous.map(|p| p.back),
+                ),
+            ];
+            for (flags, face, previous) in faces {
+                let ops =
+                    |face: &StencilFace| (face.fail, face.pass, face.depth_fail, face.compare);
+                if previous.is_none_or(|previous| ops(&previous) != ops(&face)) {
+                    device.cmd_set_stencil_op(
+                        command_buffer,
+                        flags,
+                        face.fail,
+                        face.pass,
+                        face.depth_fail,
+                        face.compare,
+                    );
+                }
+                if previous.is_none_or(|previous| previous.compare_mask != face.compare_mask) {
+                    device.cmd_set_stencil_compare_mask(command_buffer, flags, face.compare_mask);
+                }
+                if previous.is_none_or(|previous| previous.write_mask != face.write_mask) {
+                    device.cmd_set_stencil_write_mask(command_buffer, flags, face.write_mask);
+                }
+            }
+        }
+    }
 }
 
 /// One `MTLRenderPipelineColorAttachmentDescriptor`.
@@ -74,6 +235,8 @@ pub(crate) struct RenderPipelineDescriptor {
     pub alpha_to_one: bool,
     /// `NO` runs only the vertex function: nothing is rasterized.
     pub rasterization: bool,
+    /// The `MTLPrimitiveTopologyClass` the pipeline draws, or unspecified.
+    pub input_topology: u64,
     /// The `-colorAttachments` collection, made on first use.
     pub color_objects: objc::object::Id,
 }
@@ -86,6 +249,9 @@ pub(crate) struct RenderPipeline {
     pub fragment_name: std::ffi::CString,
     pub layouts: Layouts,
     pub resources: Vec<ResourceBinding>,
+    /// Whether a shader writes a buffer or texture it is bound, rather than
+    /// only the pass's attachments.
+    pub writes_resources: bool,
     /// Parallel to `resources`.
     pub inline_samplers: Vec<vk::Sampler>,
     /// Metal buffer indices which feed vertex attributes rather than a
@@ -104,7 +270,7 @@ pub(crate) struct RenderPipeline {
     /// The pass shape this pipeline was declared against, without resolves;
     /// `variant` adds those from the key and asks the cache for the pass.
     pass: RenderPassKey,
-    variants: Mutex<HashMap<RenderVariantKey, vk::Pipeline>>,
+    variants: Mutex<crate::hash::FastMap<RenderVariantKey, vk::Pipeline>>,
     /// `ROSEMARY_METAL_PROFILE`: what its draws are totalled under.
     pub profile_label: Option<std::sync::Arc<str>>,
 }
@@ -257,7 +423,7 @@ impl RenderPipeline {
         let mut resources = vertex.resources.clone();
         resources.extend(fragment.resources.iter().cloned());
         let inline_samplers = inline_samplers(gpu, &resources);
-        Ok(Self {
+        let pipeline = Self {
             gpu,
             vertex_module,
             fragment_module,
@@ -266,6 +432,12 @@ impl RenderPipeline {
             fragment_name: std::ffi::CString::new(fragment.name.as_str())
                 .map_err(|_| "entry point name contains a NUL".to_string())?,
             layouts,
+            writes_resources: resources.iter().any(|binding| {
+                matches!(
+                    binding.access,
+                    metal_translate::ir::Access::Write | metal_translate::ir::Access::ReadWrite
+                )
+            }),
             resources,
             inline_samplers,
             vertex_streams,
@@ -280,9 +452,34 @@ impl RenderPipeline {
             alpha_to_one: descriptor.alpha_to_one,
             rasterization: descriptor.rasterization,
             pass: key,
-            variants: Mutex::new(HashMap::new()),
+            variants: Mutex::new(Default::default()),
             profile_label: crate::profile::pipeline_label(&[vertex, fragment]),
-        })
+        };
+        if gpu.dynamic_render_state {
+            // Metal compiles a pipeline state when it is made, so a game makes
+            // them where a compile is affordable. With the draw state dynamic
+            // nearly every draw uses this one variant, so compiling it now
+            // keeps the compile out of the frame which first draws with it.
+            let topology = match descriptor.input_topology {
+                TOPOLOGY_CLASS_POINT => PRIMITIVE_POINT,
+                TOPOLOGY_CLASS_LINE => PRIMITIVE_LINE,
+                _ => PRIMITIVE_TRIANGLE,
+            };
+            let expected = RenderVariantKey {
+                topology,
+                cull_mode: 0,
+                winding: 0,
+                fill_mode: 0,
+                depth_clip: 0,
+                depth: DepthStencilKey::default(),
+                resolve_mask: 0,
+                depth_resolve: None,
+            };
+            if let Err(reason) = pipeline.variant(&pipeline.pipeline_key(&expected)) {
+                gpu::trace(format!("render pipeline creation failed: {reason}"));
+            }
+        }
+        Ok(pipeline)
     }
 
     pub fn variant(&self, key: &RenderVariantKey) -> Result<vk::Pipeline, String> {
@@ -340,18 +537,8 @@ impl RenderPipeline {
                 1 => vk::PolygonMode::LINE,
                 _ => vk::PolygonMode::FILL,
             })
-            .cull_mode(match key.cull_mode {
-                1 => vk::CullModeFlags::FRONT,
-                2 => vk::CullModeFlags::BACK,
-                _ => vk::CullModeFlags::NONE,
-            })
-            // Metal's window origin is upper-left and Vulkan's is too once the
-            // viewport is flipped, so a Metal clockwise front face is a Vulkan
-            // clockwise front face.
-            .front_face(match key.winding {
-                1 => vk::FrontFace::COUNTER_CLOCKWISE,
-                _ => vk::FrontFace::CLOCKWISE,
-            })
+            .cull_mode(cull_mode(key.cull_mode))
+            .front_face(front_face(key.winding))
             .depth_bias_enable(true)
             .rasterizer_discard_enable(!self.rasterization)
             .line_width(1.0);
@@ -359,26 +546,14 @@ impl RenderPipeline {
             .rasterization_samples(self.samples)
             .alpha_to_coverage_enable(self.alpha_to_coverage)
             .alpha_to_one_enable(self.alpha_to_one);
-        let stencil_face = |face: &[u64; 6]| {
-            vk::StencilOpState::default()
-                .compare_op(compare_op(face[0]))
-                .fail_op(stencil_op(face[1]))
-                .depth_fail_op(stencil_op(face[2]))
-                .pass_op(stencil_op(face[3]))
-                .compare_mask(face[4] as u32)
-                .write_mask(face[5] as u32)
-        };
-        let has_depth = self.depth_format != vk::Format::UNDEFINED
-            || self.stencil_format != vk::Format::UNDEFINED;
+        let depth = self.dynamic_state(key);
         let depth_stencil = vk::PipelineDepthStencilStateCreateInfo::default()
-            // Metal has no depth-test switch: `MTLCompareFunctionAlways` with
-            // writes off is how a game turns depth off.
-            .depth_test_enable(has_depth)
-            .depth_write_enable(has_depth && key.depth.write)
-            .depth_compare_op(compare_op(key.depth.compare))
-            .stencil_test_enable(has_depth && key.depth.stencil)
-            .front(stencil_face(&key.depth.front))
-            .back(stencil_face(&key.depth.back));
+            .depth_test_enable(depth.depth_test)
+            .depth_write_enable(depth.depth_write)
+            .depth_compare_op(depth.depth_compare)
+            .stencil_test_enable(depth.stencil_test)
+            .front(depth.front.state())
+            .back(depth.back.state());
         let blends = self
             .colors
             .iter()
@@ -395,13 +570,27 @@ impl RenderPipeline {
             })
             .collect::<Vec<_>>();
         let blend = vk::PipelineColorBlendStateCreateInfo::default().attachments(&blends);
-        let dynamic_states = [
+        let mut dynamic_states = vec![
             vk::DynamicState::VIEWPORT,
             vk::DynamicState::SCISSOR,
             vk::DynamicState::STENCIL_REFERENCE,
             vk::DynamicState::DEPTH_BIAS,
             vk::DynamicState::BLEND_CONSTANTS,
         ];
+        if self.gpu.dynamic_render_state {
+            dynamic_states.extend([
+                vk::DynamicState::CULL_MODE,
+                vk::DynamicState::FRONT_FACE,
+                vk::DynamicState::PRIMITIVE_TOPOLOGY,
+                vk::DynamicState::DEPTH_TEST_ENABLE,
+                vk::DynamicState::DEPTH_WRITE_ENABLE,
+                vk::DynamicState::DEPTH_COMPARE_OP,
+                vk::DynamicState::STENCIL_TEST_ENABLE,
+                vk::DynamicState::STENCIL_OP,
+                vk::DynamicState::STENCIL_COMPARE_MASK,
+                vk::DynamicState::STENCIL_WRITE_MASK,
+            ]);
+        }
         let dynamic = vk::PipelineDynamicStateCreateInfo::default().dynamic_states(&dynamic_states);
         let info = vk::GraphicsPipelineCreateInfo::default()
             .stages(&stages)
@@ -434,6 +623,51 @@ impl RenderPipeline {
             }
             std::collections::hash_map::Entry::Vacant(slot) => Ok(*slot.insert(pipeline)),
         }
+    }
+
+    /// The key of the Vulkan pipeline a draw under `key` uses. Where the
+    /// device sets culling, winding, depth and stencil state and the exact
+    /// topology per draw, every combination of them shares one pipeline.
+    pub fn pipeline_key(&self, key: &RenderVariantKey) -> RenderVariantKey {
+        if !self.gpu.dynamic_render_state {
+            return *key;
+        }
+        RenderVariantKey {
+            topology: match key.topology {
+                PRIMITIVE_POINT => PRIMITIVE_POINT,
+                PRIMITIVE_LINE | PRIMITIVE_LINE_STRIP => PRIMITIVE_LINE,
+                _ => PRIMITIVE_TRIANGLE,
+            },
+            cull_mode: 0,
+            winding: 0,
+            depth: DepthStencilKey::default(),
+            ..*key
+        }
+    }
+
+    /// The state a draw under `key` sets per draw on a device which can.
+    pub fn dynamic_state(&self, key: &RenderVariantKey) -> RenderDynamicState {
+        let has_depth = self.depth_format != vk::Format::UNDEFINED
+            || self.stencil_format != vk::Format::UNDEFINED;
+        RenderDynamicState {
+            cull_mode: cull_mode(key.cull_mode),
+            front_face: front_face(key.winding),
+            topology: topology(key.topology),
+            // Metal has no depth-test switch: `MTLCompareFunctionAlways` with
+            // writes off is how a game turns depth off.
+            depth_test: has_depth,
+            depth_write: has_depth && key.depth.write,
+            depth_compare: compare_op(key.depth.compare),
+            stencil_test: has_depth && key.depth.stencil,
+            front: StencilFace::of(&key.depth.front),
+            back: StencilFace::of(&key.depth.back),
+        }
+    }
+
+    /// How many Vulkan pipelines this one has compiled.
+    #[cfg(test)]
+    pub fn variant_count(&self) -> usize {
+        self.variants.lock().expect("render pipeline cache").len()
     }
 
     pub fn supports_base_instance(&self, base_instance: u64) -> bool {
