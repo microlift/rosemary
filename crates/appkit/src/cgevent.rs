@@ -43,6 +43,13 @@ mod kind {
     }
 }
 
+/// How many `CGEventField` slots [`Body::fields`] holds.
+///
+/// Apple's own enumerators run well under this; a field past the end answers
+/// zero and ignores a write, the same honest "no such field" this runtime
+/// gives any index it does not reach.
+const FIELD_SLOTS: usize = 128;
+
 #[repr(C)]
 struct Body {
     isa: *const Class,
@@ -50,6 +57,17 @@ struct Body {
     location: NSPoint,
     /// `CGEventType`.
     kind: u32,
+    /// `CGEventTimestamp`: nanoseconds since this process started.
+    timestamp: u64,
+    /// `CGEventGetIntegerValueField`/`CGEventGetDoubleValueField`'s backing
+    /// store, indexed by `CGEventField`.
+    ///
+    /// FIXME (ACCURACY): one shared slot per field rather than each field's
+    /// own declared type, so a value written as an integer and read as a
+    /// double (or the reverse) does not reinterpret bits the way Apple's
+    /// typed storage would - only same-type round trips, which is how a
+    /// program that builds its own synthetic events uses these, are exact.
+    fields: [f64; FIELD_SLOTS],
     /// `CGEventFlags`, which share their bits with `NSEventModifierFlags`.
     flags: u64,
     /// `kCGKeyboardEventKeycode`: the virtual key, for a keyboard event.
@@ -65,6 +83,18 @@ fn class() -> &'static Class {
     });
     // SAFETY: the cell holds a pointer to the class this function registered.
     unsafe { objc::class::from_ptr(ptr as *const Class).expect("a class") }
+}
+
+/// Nanoseconds since this process started, which is what [`Body::timestamp`]
+/// is measured from rather than from boot - nothing here reads the host's
+/// boot time, and every timestamp this runtime hands out only has to be
+/// internally consistent and monotonic.
+fn now_nanos() -> u64 {
+    static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    START
+        .get_or_init(std::time::Instant::now)
+        .elapsed()
+        .as_nanos() as u64
 }
 
 /// An event object the caller owns and releases with `CFRelease`.
@@ -83,28 +113,45 @@ fn new_with(location: NSPoint, kind: u32, flags: u64, key_code: u16) -> CFTypeRe
     unsafe {
         (*body).location = location;
         (*body).kind = kind;
+        (*body).timestamp = now_nanos();
+        (*body).fields = [0.0; FIELD_SLOTS];
+        (*body).fields[9] = key_code as f64;
         (*body).flags = flags;
         (*body).key_code = key_code;
     }
     body as CFTypeRef
 }
 
-/// The event's body, for anything this module made.
-fn body_of<'a>(event: CFTypeRef) -> Option<&'a mut Body> {
-    // SAFETY: null or an object this runtime allocated.
-    if !unsafe { corefoundation::base::is_kind_of(event, class()) } {
-        return None;
+/// An event the caller owns, with `fields` set: what `-[NSEvent CGEvent]`
+/// hands back for an AppKit event.
+pub(crate) fn with_fields(location: NSPoint, kind: u32, fields: &[(u32, f64)]) -> CFTypeRef {
+    let event = new_with(location, kind, 0, 0);
+    if let Some(body) = body_of(event) {
+        for &(field, value) in fields {
+            if let Some(i) = field_slot(field) {
+                body.fields[i] = value;
+                if field == 9 {
+                    body.key_code = value as u16;
+                }
+            }
+        }
     }
-    // SAFETY: an instance of `class()` is a `Body`.
-    Some(unsafe { &mut *(event as *mut Body) })
+    event
 }
 
-/// A CoreGraphics event describing an `NSEvent`, autoreleased: what
-/// `-[NSEvent CGEvent]` hands back, which lives as long as the event does.
-pub(crate) fn describing(kind: u64, flags: u64, key_code: u16, location: NSPoint) -> CFTypeRef {
-    let event = new_with(location, kind as u32, flags, key_code);
-    // SAFETY: a fresh object.
-    unsafe { corefoundation::api::CFAutorelease(event) }
+/// The event's body, or `None` for anything that is not an event this module
+/// made.
+fn body_of<'a>(event: CFTypeRef) -> Option<&'a mut Body> {
+    // SAFETY: null or an object a guest received from this runtime.
+    let is_event = !event.is_null() && unsafe { corefoundation::base::is_kind_of(event, class()) };
+    // SAFETY: checked above to be a `Body`.
+    is_event.then(|| unsafe { &mut *(event as *mut Body) })
+}
+
+/// The `fields` slot `field` names, or `None` past the range this runtime
+/// keeps.
+fn field_slot(field: u32) -> Option<usize> {
+    usize::try_from(field).ok().filter(|&i| i < FIELD_SLOTS)
 }
 
 /// What `+[NSEvent eventWithCGEvent:]` reads: the type, flags, key and place.
@@ -137,33 +184,6 @@ pub unsafe extern "C" fn CGEventGetFlags(event: CFTypeRef) -> u64 {
 pub unsafe extern "C" fn CGEventSetFlags(event: CFTypeRef, flags: u64) {
     if let Some(body) = body_of(event) {
         body.flags = flags;
-    }
-}
-
-/// `CGEventGetType`.
-#[allow(non_snake_case)]
-pub unsafe extern "C" fn CGEventGetType(event: CFTypeRef) -> u32 {
-    body_of(event).map_or(kind::NULL, |b| b.kind)
-}
-
-/// `int64_t CGEventGetIntegerValueField(CGEventRef, CGEventField)`: the key
-/// code; every other field this runtime does not track reads as zero, which
-/// is what a fresh event of that type holds.
-#[allow(non_snake_case)]
-pub unsafe extern "C" fn CGEventGetIntegerValueField(event: CFTypeRef, field: u32) -> i64 {
-    // `kCGKeyboardEventKeycode`.
-    const KEYCODE: u32 = 9;
-    match (body_of(event), field) {
-        (Some(body), KEYCODE) => i64::from(body.key_code),
-        _ => 0,
-    }
-}
-
-/// `void CGEventSetIntegerValueField(CGEventRef, CGEventField, int64_t)`.
-#[allow(non_snake_case)]
-pub unsafe extern "C" fn CGEventSetIntegerValueField(event: CFTypeRef, field: u32, value: i64) {
-    if let (Some(body), 9) = (body_of(event), field) {
-        body.key_code = value as u16;
     }
 }
 
@@ -357,9 +377,117 @@ pub extern "C" fn CGEventTapCreate(
     std::ptr::null_mut()
 }
 
+/// `void CGEventTapEnable(CFMachPortRef tap, bool enable)`.
+///
+/// Every tap this runtime hands out is NULL (see [`CGEventTapCreate`]), so
+/// there is never a real one to switch on or off.
+#[allow(non_snake_case)]
+pub unsafe extern "C" fn CGEventTapEnable(_tap: *mut c_void, _enable: u8) {}
+
+/// `double CGEventGetDoubleValueField(CGEventRef, CGEventField)`.
+#[allow(non_snake_case)]
+pub unsafe extern "C" fn CGEventGetDoubleValueField(event: CFTypeRef, field: u32) -> f64 {
+    let Some(body) = body_of(event) else {
+        return 0.0;
+    };
+    field_slot(field).map_or(0.0, |i| body.fields[i])
+}
+
+/// `int64_t CGEventGetIntegerValueField(CGEventRef, CGEventField)`.
+#[allow(non_snake_case)]
+pub unsafe extern "C" fn CGEventGetIntegerValueField(event: CFTypeRef, field: u32) -> i64 {
+    let Some(body) = body_of(event) else {
+        return 0;
+    };
+    field_slot(field).map_or(0, |i| body.fields[i] as i64)
+}
+
+/// `void CGEventSetDoubleValueField(CGEventRef, CGEventField, double)`.
+#[allow(non_snake_case)]
+pub unsafe extern "C" fn CGEventSetDoubleValueField(event: CFTypeRef, field: u32, value: f64) {
+    if let Some(body) = body_of(event)
+        && let Some(i) = field_slot(field)
+    {
+        body.fields[i] = value;
+        if field == 9 {
+            body.key_code = value as u16;
+        }
+    }
+}
+
+/// `void CGEventSetIntegerValueField(CGEventRef, CGEventField, int64_t)`.
+#[allow(non_snake_case)]
+pub unsafe extern "C" fn CGEventSetIntegerValueField(event: CFTypeRef, field: u32, value: i64) {
+    if let Some(body) = body_of(event)
+        && let Some(i) = field_slot(field)
+    {
+        body.fields[i] = value as f64;
+        if field == 9 {
+            body.key_code = value as u16;
+        }
+    }
+}
+
+/// `CGEventTimestamp CGEventGetTimestamp(CGEventRef)`.
+#[allow(non_snake_case)]
+pub unsafe extern "C" fn CGEventGetTimestamp(event: CFTypeRef) -> u64 {
+    body_of(event).map_or(0, |body| body.timestamp)
+}
+
+/// `void CGEventSetTimestamp(CGEventRef, CGEventTimestamp)`.
+#[allow(non_snake_case)]
+pub unsafe extern "C" fn CGEventSetTimestamp(event: CFTypeRef, timestamp: u64) {
+    if let Some(body) = body_of(event) {
+        body.timestamp = timestamp;
+    }
+}
+
 /// The keyboard's modifiers now. The flags are NSEvent's modifier bits, which
 /// is how AppKit defines them, so the same translation answers both.
 #[allow(non_snake_case)]
 pub extern "C" fn CGEventSourceFlagsState(_state: u32) -> u64 {
     crate::keymap::modifiers(sdl3::video::keyboard_modifiers())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_field_round_trips_through_its_own_accessor_pair() {
+        crate::bootstrap();
+        // SAFETY: the event stays live until its release below.
+        unsafe {
+            let event = CGEventCreate(std::ptr::null());
+            CGEventSetIntegerValueField(event, 9, 36);
+            assert_eq!(CGEventGetIntegerValueField(event, 9), 36);
+            CGEventSetDoubleValueField(event, 2, 0.5);
+            assert_eq!(CGEventGetDoubleValueField(event, 2), 0.5);
+            // A field past this runtime's range is the same "nothing here"
+            // answer a null event gives, not a crash.
+            assert_eq!(CGEventGetIntegerValueField(event, u32::MAX), 0);
+            CGEventSetIntegerValueField(event, u32::MAX, 1);
+            corefoundation::api::CFRelease(event);
+        }
+    }
+
+    #[test]
+    fn a_fresh_event_carries_a_timestamp_a_later_one_moves_past() {
+        crate::bootstrap();
+        // SAFETY: both events stay live until released below.
+        unsafe {
+            let first = CGEventCreate(std::ptr::null());
+            let second = CGEventCreate(std::ptr::null());
+            assert!(CGEventGetTimestamp(second) >= CGEventGetTimestamp(first));
+            CGEventSetTimestamp(first, 42);
+            assert_eq!(CGEventGetTimestamp(first), 42);
+            corefoundation::api::CFRelease(first);
+            corefoundation::api::CFRelease(second);
+        }
+    }
+}
+
+#[allow(non_snake_case)]
+pub unsafe extern "C" fn CGEventGetType(event: CFTypeRef) -> u32 {
+    body_of(event).map_or(kind::NULL, |b| b.kind)
 }

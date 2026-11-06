@@ -320,6 +320,50 @@ pub mod cf {
         super::preferred_languages_array() as Id
     }
 
+    /// `CFStringRef CFLocaleCreateCanonicalLanguageIdentifierFromString(
+    /// CFAllocatorRef, CFStringRef localeIdentifier)`: BCP 47 casing and
+    /// hyphens in place of underscores, as `en_us` -> `en-US` and
+    /// `zh_hans_cn` -> `zh-Hans-CN`.
+    ///
+    /// FIXME (ACCURACY): a three-letter ISO 639-2 language code (`eng`) is kept
+    /// as-is rather than mapped to its two-letter ISO 639-1 equivalent (`en`),
+    /// which is the one case Apple's own canonicalization also changes the
+    /// length of.
+    unsafe extern "C" fn CFLocaleCreateCanonicalLanguageIdentifierFromString(
+        _allocator: Id,
+        identifier: Id,
+    ) -> Id {
+        // SAFETY: an `NSString`, or nil.
+        let text = unsafe { crate::string::bytes(identifier) };
+        let Ok(text) = std::str::from_utf8(&text) else {
+            return std::ptr::null_mut();
+        };
+        if text.is_empty() {
+            return std::ptr::null_mut();
+        }
+        let canonical: Vec<String> = text
+            .split(['-', '_'])
+            .enumerate()
+            .map(
+                |(i, part)| match (i, part.len(), part.chars().all(|c| c.is_ascii_alphabetic())) {
+                    (0, _, _) => part.to_ascii_lowercase(),
+                    (_, 4, true) => {
+                        let mut chars = part.chars();
+                        let Some(first) = chars.next() else {
+                            return String::new();
+                        };
+                        first.to_ascii_uppercase().to_string()
+                            + &chars.as_str().to_ascii_lowercase()
+                    }
+                    (_, 2, true) => part.to_ascii_uppercase(),
+                    (_, 3, _) if part.chars().all(|c| c.is_ascii_digit()) => part.to_string(),
+                    _ => part.to_ascii_lowercase(),
+                },
+            )
+            .collect();
+        crate::string::from_str(&canonical.join("-"))
+    }
+
     exports::exports! {
         functions {
             "CFLocaleCreate" => CFLocaleCreate,
@@ -328,6 +372,8 @@ pub mod cf {
             "CFLocaleCopyCurrent" => CFLocaleCopyCurrent,
             "CFLocaleGetIdentifier" => CFLocaleGetIdentifier,
             "CFLocaleGetValue" => CFLocaleGetValue,
+            "CFLocaleCreateCanonicalLanguageIdentifierFromString"
+                => CFLocaleCreateCanonicalLanguageIdentifierFromString,
         }
     }
 }
@@ -369,6 +415,32 @@ mod tests {
             shared(),
             "and it is the locale every other call gets"
         );
+    }
+
+    /// `en_us` canonicalizes to `en-US`, and a script subtag is title-cased.
+    #[test]
+    fn canonical_language_identifier_fixes_hyphens_and_casing() {
+        crate::bootstrap();
+        let address = cf::symbol("CFLocaleCreateCanonicalLanguageIdentifierFromString")
+            .expect("the name has to resolve");
+        // SAFETY: the address of the function above, which takes two objects
+        // and returns one the caller owns.
+        let canonicalize: unsafe extern "C" fn(Id, Id) -> Id =
+            unsafe { std::mem::transmute(address as usize) };
+        let check = |input: &str, want: &str| {
+            let text = crate::string::from_str(input);
+            // SAFETY: a live `NSString`.
+            let result = unsafe { canonicalize(std::ptr::null_mut(), text) };
+            assert!(!result.is_null());
+            // SAFETY: a live `NSString` this call owns.
+            let got = String::from_utf8(unsafe { crate::string::bytes(result) }).unwrap();
+            assert_eq!(got, want, "canonicalizing {input:?}");
+            objc::arc::release(text);
+            objc::arc::release(result);
+        };
+        check("en_us", "en-US");
+        check("zh_hans_cn", "zh-Hans-CN");
+        check("EN", "en");
     }
 
     /// The components a caller reads through the CoreFoundation spelling are

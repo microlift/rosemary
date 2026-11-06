@@ -19,8 +19,8 @@ impl<const N: usize> Guest<N> {
         Arc::new(object)
     }
 
-    /// A byte-for-byte copy of another object, which POSIX does not allow and the
-    /// identity word exists to catch.
+    /// A byte-for-byte copy of another object, which POSIX does not allow and
+    /// Darwin tolerates.
     pub fn copy_of(other: &Self) -> Arc<Self> {
         Arc::new(Self(other.0))
     }

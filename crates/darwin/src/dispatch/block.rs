@@ -64,6 +64,25 @@ pub unsafe fn invoke(block: u64) {
     unsafe { std::mem::transmute::<u64, extern "C" fn(u64)>(entry)(block) };
 }
 
+/// Call a block taking one `size_t`, the shape `dispatch_apply` hands its
+/// iteration index to.
+///
+/// # Safety
+///
+/// As [`invoke`], for a block whose `invoke` is `void (*)(void *, size_t)`.
+pub unsafe fn invoke_with_index(block: u64, index: usize) {
+    if block == 0 {
+        return;
+    }
+    // SAFETY: the caller's guarantee; `invoke` is at a fixed offset by the Block ABI.
+    let entry = unsafe { ((block + INVOKE_OFFSET) as *const u64).read() };
+    if entry == 0 {
+        return;
+    }
+    // SAFETY: the prototype the caller vouched for.
+    unsafe { std::mem::transmute::<u64, extern "C" fn(u64, usize)>(entry)(block, index) };
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

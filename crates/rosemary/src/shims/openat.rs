@@ -131,26 +131,34 @@ pub unsafe extern "C" fn sem_open_with_mode(
     let Some(host_oflag) = host_flags(oflag) else {
         return DARWIN_SEM_FAILED;
     };
-    // Decided by the guest's flags; made with the host's.
-    let sem = match darwin::fcntl::creates(oflag) {
-        // SAFETY: the caller's guarantee, above. The mode is narrowed to the
-        // `mode_t` the callee will read and re-promoted, exactly as `mode_for`
-        // does - a guest register's spare bits are not permissions.
-        true => unsafe {
-            libc::sem_open(
-                name,
-                host_oflag,
-                mode as libc::mode_t as libc::c_uint,
-                value as libc::c_uint,
-            )
-        },
-        // SAFETY: as above, and the two arguments the guest did not pass are
-        // not passed on. See the note on the value's range.
-        false => unsafe { libc::sem_open(name, host_oflag) },
+    // Darwin's own checks and handle bookkeeping; see [`darwin::sem`].
+    #[cfg(not(target_os = "macos"))]
+    return unsafe {
+        darwin::sem::open(name, host_oflag, darwin::fcntl::creates(oflag), mode, value)
     };
-    match sem == libc::SEM_FAILED {
-        true => DARWIN_SEM_FAILED,
-        false => sem,
+    // Decided by the guest's flags; made with the host's.
+    #[cfg(target_os = "macos")]
+    {
+        let sem = match darwin::fcntl::creates(oflag) {
+            // SAFETY: the caller's guarantee, above. The mode is narrowed to the
+            // `mode_t` the callee will read and re-promoted, exactly as `mode_for`
+            // does - a guest register's spare bits are not permissions.
+            true => unsafe {
+                libc::sem_open(
+                    name,
+                    host_oflag,
+                    mode as libc::mode_t as libc::c_uint,
+                    value as libc::c_uint,
+                )
+            },
+            // SAFETY: as above, and the two arguments the guest did not pass are
+            // not passed on.
+            false => unsafe { libc::sem_open(name, host_oflag) },
+        };
+        match sem == libc::SEM_FAILED {
+            true => DARWIN_SEM_FAILED,
+            false => sem,
+        }
     }
 }
 

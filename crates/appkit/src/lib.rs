@@ -18,6 +18,7 @@ pub mod appearance;
 pub mod application;
 mod aqua;
 pub mod backing;
+mod beep;
 mod bezier;
 mod bindings;
 pub mod button;
@@ -42,9 +43,12 @@ mod define;
 pub mod dialog;
 mod displaylink;
 pub mod dock;
+mod document;
 pub mod event;
+mod file_promise;
 mod font;
 pub mod hitheme;
+mod input_manager;
 pub mod launch;
 pub mod launchservices;
 mod props;
@@ -77,6 +81,7 @@ pub mod pasteboard;
 mod pasteboard_manager;
 mod pdf;
 mod popup;
+pub mod printing;
 pub mod raster;
 mod responder;
 pub mod screen;
@@ -123,6 +128,7 @@ pub fn bootstrap() {
         cgcontext::install();
         cursor::install();
         font::install();
+        coretext::install();
         image::install();
         image::bitmap::install();
         menu::install();
@@ -164,6 +170,10 @@ pub fn bootstrap() {
         nsevent::install();
         monitor::install();
         status::install();
+        document::install();
+        printing::install();
+        input_manager::install();
+        file_promise::install();
     });
 }
 
@@ -217,6 +227,8 @@ exports::exports! {
         "CGDisplayRegisterReconfigurationCallback" => screen::CGDisplayRegisterReconfigurationCallback,
         "CGDisplayRemoveReconfigurationCallback" => screen::CGDisplayRemoveReconfigurationCallback,
         "CGGetDisplaysWithRect" => screen::CGGetDisplaysWithRect,
+        "CGGetDisplaysWithPoint" => screen::CGGetDisplaysWithPoint,
+        "CGDisplayCreateImageForRect" => screen::CGDisplayCreateImageForRect,
         "CGDisplayCreateUUIDFromDisplayID" => screen::CGDisplayCreateUUIDFromDisplayID,
         "CGDisplayGetDisplayIDFromUUID" => screen::CGDisplayGetDisplayIDFromUUID,
         "NSBitsPerSampleFromDepth" => screen::NSBitsPerSampleFromDepth,
@@ -250,6 +262,11 @@ exports::exports! {
         "CGEventSourceFlagsState" => cgevent::CGEventSourceFlagsState,
         "CGEventSourceCounterForEventType" => cgevent::CGEventSourceCounterForEventType,
         "CGEventTapCreate" => cgevent::CGEventTapCreate,
+        "CGEventTapEnable" => cgevent::CGEventTapEnable,
+        "CGEventGetDoubleValueField" => cgevent::CGEventGetDoubleValueField,
+        "CGEventSetDoubleValueField" => cgevent::CGEventSetDoubleValueField,
+        "CGEventGetTimestamp" => cgevent::CGEventGetTimestamp,
+        "CGEventSetTimestamp" => cgevent::CGEventSetTimestamp,
         "CGDisplayModeCopyPixelEncoding" => screen::CGDisplayModeCopyPixelEncoding,
         "CGColorSpaceCreateWithName" => graphics::CGColorSpaceCreateWithName,
         "CGColorSpaceCreateDeviceRGB" => graphics::CGColorSpaceCreateDeviceRGB,
@@ -261,7 +278,9 @@ exports::exports! {
         "CGColorSpaceGetName" => graphics::CGColorSpaceGetName,
         "CGColorSpaceCopyName" => graphics::CGColorSpaceCopyName,
         "CGColorSpaceCopyPropertyList" => graphics::CGColorSpaceCopyPropertyList,
+        "CGColorSpaceRetain" => graphics::CGColorSpaceRetain,
         "CGDataProviderCreateWithData" => graphics::CGDataProviderCreateWithData,
+        "CGDataProviderCreateDirect" => graphics::CGDataProviderCreateDirect,
         "CGDataProviderRelease" => graphics::CGDataProviderRelease,
         "CGImageCreate" => graphics::CGImageCreate,
         "CGImageMaskCreate" => graphics::CGImageMaskCreate,
@@ -276,11 +295,13 @@ exports::exports! {
         "CGImageGetAlphaInfo" => graphics::CGImageGetAlphaInfo,
         "CGImageGetColorSpace" => graphics::CGImageGetColorSpace,
         "CGImageSourceCreateWithData" => graphics::CGImageSourceCreateWithData,
+        "CGImageSourceCreateWithDataProvider" => graphics::CGImageSourceCreateWithDataProvider,
         "CGImageSourceCopyTypeIdentifiers" => graphics::CGImageSourceCopyTypeIdentifiers,
         "CGImageDestinationCopyTypeIdentifiers" => graphics::CGImageDestinationCopyTypeIdentifiers,
         "CGImageDestinationCreateWithData" => graphics::CGImageDestinationCreateWithData,
         "CGImageDestinationCreateWithDataConsumer" => graphics::CGImageDestinationCreateWithData,
         "CGImageSourceCreateImageAtIndex" => graphics::CGImageSourceCreateImageAtIndex,
+        "CGImageSourceCopyPropertiesAtIndex" => graphics::CGImageSourceCopyPropertiesAtIndex,
         "CGRectGetWidth" => geometry::CGRectGetWidth,
         "CGRectGetHeight" => geometry::CGRectGetHeight,
         "CGRectGetMinX" => geometry::CGRectGetMinX,
@@ -297,17 +318,14 @@ exports::exports! {
         "NSIntersectionRect" => geometry::NSIntersectionRect,
         "NSOffsetRect" => geometry::NSOffsetRect,
         "CGRectInset" => geometry::CGRectInset,
+        "CGRectIntersection" => geometry::CGRectIntersection,
         "CGRectOffset" => geometry::CGRectOffset,
         "CGRectIntegral" => geometry::CGRectIntegral,
         "CGRectIsEmpty" => geometry::CGRectIsEmpty,
-        "CGRectIntersection" => geometry::CGRectIntersection,
         "CGRectContainsPoint" => geometry::CGRectContainsPoint,
         "CGRectContainsRect" => geometry::CGRectContainsRect,
-        "NSContainsRect" => geometry::NSContainsRect,
-        "NSIntersectsRect" => geometry::NSIntersectsRect,
         "NSIntegralRect" => geometry::NSIntegralRect,
         "NSEqualPoints" => geometry::NSEqualPoints,
-        "NSEqualSizes" => geometry::NSEqualSizes,
         "NSIntersectionRange" => geometry::NSIntersectionRange,
         "NSStringFromPoint" => geometry::NSStringFromPoint,
         "NSStringFromSize" => geometry::NSStringFromSize,
@@ -321,7 +339,6 @@ exports::exports! {
         "NSEraseRect" => color::NSEraseRect,
         "NSRectClip" => color::NSRectClip,
         "NSRectFillUsingOperation" => color::NSRectFillUsingOperation,
-        "NSBeep" => application::NSBeep,
         "NSAccessibilityPostNotification" => accessibility::NSAccessibilityPostNotification,
         "NSAccessibilityPostNotificationWithUserInfo" => accessibility::NSAccessibilityPostNotificationWithUserInfo,
         "NSAccessibilityActionDescription" => accessibility::NSAccessibilityActionDescription,
@@ -355,6 +372,7 @@ exports::exports! {
         "LMGetKbdType" => textinput::LMGetKbdType,
         "LMGetKbdLast" => textinput::LMGetKbdLast,
         "UCKeyTranslate" => textinput::UCKeyTranslate,
+        "NSBeep" => beep::NSBeep,
     }
     groups {
         ctline,
@@ -444,6 +462,7 @@ pub const NOTIFICATION_NAMES: &[&str] = &[
     application::WILL_BECOME_ACTIVE,
     application::DID_BECOME_ACTIVE,
     application::WILL_RESIGN_ACTIVE,
+    application::DID_RESIGN_ACTIVE,
     window::DID_RESIZE,
     window::DID_MOVE,
     window::DID_CHANGE_SCREEN,
@@ -469,6 +488,13 @@ pub const NOTIFICATION_NAMES: &[&str] = &[
     workspace::DID_WAKE,
     workspace::SCREENS_DID_SLEEP,
     workspace::SCREENS_DID_WAKE,
+    // Posted by nothing here: there is no removable-volume tracking to notice
+    // a mount or unmount with. Published for the same reason as the note
+    // below this list.
+    workspace::DID_MOUNT,
+    workspace::DID_UNMOUNT,
+    menu::DID_BEGIN_TRACKING,
+    menu::DID_END_TRACKING,
     view::FRAME_DID_CHANGE,
     view::BOUNDS_DID_CHANGE,
     // Watched by a widget toolkit and posted by nothing here: there is no system
@@ -493,9 +519,6 @@ pub const NOTIFICATION_NAMES: &[&str] = &[
     "NSControlTintDidChangeNotification",
     "NSMenuWillSendActionNotification",
     "NSViewGlobalFrameDidChangeNotification",
-    "NSApplicationDidResignActiveNotification",
-    "NSWorkspaceDidMountNotification",
-    "NSWorkspaceDidUnmountNotification",
     "NSWorkspaceDidRenameVolumeNotification",
     "NSOutlineViewItemDidCollapseNotification",
     "NSOutlineViewItemDidExpandNotification",
@@ -504,7 +527,6 @@ pub const NOTIFICATION_NAMES: &[&str] = &[
     "NSFontSetChangedNotification",
     // Observed by Qt's Cocoa platform plugin; no menu tracking or other
     // application's activation posts them here.
-    "NSMenuDidBeginTrackingNotification",
     "NSWorkspaceDidActivateApplicationNotification",
     // Keys and option names whose text is their own name.
     "NSApplicationLaunchUserNotificationKey",
@@ -567,6 +589,26 @@ pub const STRING_GLOBALS: &[(&str, &str)] = &[
     (
         "_kCGImageSourceTypeIdentifierHint",
         "kCGImageSourceTypeIdentifierHint",
+    ),
+    // ImageIO property keys `CGImageSourceCopyPropertiesAtIndex` answers with,
+    // each the documented value - its own name with the `kCGImageProperty`
+    // prefix dropped.
+    ("_kCGImagePropertyPixelWidth", "PixelWidth"),
+    ("_kCGImagePropertyPixelHeight", "PixelHeight"),
+    ("_kCGImagePropertyHasAlpha", "HasAlpha"),
+    ("_kCGImagePropertyOrientation", "Orientation"),
+    (
+        "_NSFontDescriptorSystemDesignDefault",
+        coretext::DESIGN_DEFAULT,
+    ),
+    ("_NSFontDescriptorSystemDesignSerif", coretext::DESIGN_SERIF),
+    (
+        "_NSFontDescriptorSystemDesignMonospaced",
+        coretext::DESIGN_MONOSPACED,
+    ),
+    (
+        "_NSFontDescriptorSystemDesignRounded",
+        coretext::DESIGN_ROUNDED,
     ),
     ("_kUTTypeImage", "public.image"),
     ("_kUTTypeMovie", "public.movie"),
@@ -693,6 +735,7 @@ pub const STRING_GLOBALS: &[(&str, &str)] = &[
     // The rest of the deprecated pasteboard types, whose values are their own
     // names - which is what they are on a Mac, and what makes a program that
     // writes with the old spelling and reads with it find its own data.
+    ("_NSPICTPboardType", "NSPICTPboardType"),
     ("_NSFilenamesPboardType", "NSFilenamesPboardType"),
     ("_NSFilesPromisePboardType", "NSFilesPromisePboardType"),
     ("_NSURLPboardType", "NSURLPboardType"),
@@ -722,10 +765,18 @@ pub const STRING_GLOBALS: &[(&str, &str)] = &[
     // `NSForegroundColorAttributeName` above already is.
     ("_NSUnderlineStyleAttributeName", "NSUnderline"),
     ("_NSUnderlineColorAttributeName", "NSUnderlineColor"),
+    ("_NSStrikethroughStyleAttributeName", "NSStrikethrough"),
     ("_NSDocumentTypeDocumentAttribute", "DocumentType"),
     ("_NSHTMLTextDocumentType", "NSHTML"),
     ("_NSRTFTextDocumentType", "NSRTF"),
     ("_NSBaselineOffsetAttributeName", "NSBaselineOffset"),
+    // The marked-clause-segment key an input method annotates composed text
+    // with; this runtime's own `crate::input_context` never sets it, but a
+    // program is free to look for it in marked text it builds itself.
+    (
+        "_NSMarkedClauseSegmentAttributeName",
+        "NSMarkedClauseSegment",
+    ),
     // `NSViewAnimation`'s dictionary keys and effects, Apple's strings.
     ("_NSViewAnimationTargetKey", "NSViewAnimationTargetKey"),
     (
@@ -911,6 +962,16 @@ pub const STRING_GLOBALS: &[(&str, &str)] = &[
     ("_NSAccessibilityAnnouncementKey", "AXAnnouncementKey"),
     // The only named system image a program asks for here.
     ("_NSImageNameApplicationIcon", "NSApplicationIcon"),
+    // `NSPrintInfo`'s dictionary keys, a program reads and writes through the
+    // symbol rather than the literal - their value is free to be their own
+    // name, as the deprecated pasteboard types above are.
+    ("_NSPrintAllPages", "NSPrintAllPages"),
+    ("_NSPrintFirstPage", "NSPrintFirstPage"),
+    ("_NSPrintLastPage", "NSPrintLastPage"),
+    ("_NSPrintScalingFactor", "NSPrintScalingFactor"),
+    // A deprecated `-performFileOperation:` operation type; see
+    // `crate::workspace::RECYCLE_OPERATION`.
+    ("_NSWorkspaceRecycleOperation", workspace::RECYCLE_OPERATION),
     ("_NSImageNameActionTemplate", "NSActionTemplate"),
     ("_NSImageNameAddTemplate", "NSAddTemplate"),
     ("_NSImageNameRemoveTemplate", "NSRemoveTemplate"),
@@ -927,7 +988,6 @@ pub const STRING_GLOBALS: &[(&str, &str)] = &[
     ("_NSImageNameStatusUnavailable", "NSStatusUnavailable"),
     ("_NSBackgroundColorAttributeName", "NSBackgroundColor"),
     ("_NSShadowAttributeName", "NSShadow"),
-    ("_NSStrikethroughStyleAttributeName", "NSStrikethrough"),
     ("_NSExpansionAttributeName", "NSExpansion"),
     ("_NSGlyphInfoAttributeName", "NSGlyphInfo"),
     (

@@ -55,6 +55,11 @@ struct Event {
     /// taken once by whichever responder interprets the key. See
     /// [`take_text`].
     text: Id,
+    /// `-pressure` as a caller of `+mouseEventWithType:...pressure:` gave it
+    /// explicitly, or `None` for every event this runtime builds from host
+    /// input, which has no such reading and falls back to [`pressure`]'s
+    /// down-or-not guess.
+    pressure: Option<f32>,
 }
 
 pub const INSTANCE_SIZE: usize = size_of::<Event>();
@@ -134,6 +139,52 @@ unsafe extern "C" fn event_ref(_receiver: Id, _sel: Sel) -> *mut c_void {
     std::ptr::null_mut()
 }
 
+/// `-CGEvent`: the event as Quartz describes it, at the same place in global
+/// top-left coordinates, with the mouse fields a program reads off it.
+///
+/// Autoreleased: Apple's belongs to the NSEvent and lives as long as it does,
+/// and an event is only kept past its dispatch by a program that retains it.
+// FIXME (ACCURACY): a fresh object per call rather than one per event, and no
+// tablet fields, since no pen reaches this runtime as a tablet event yet.
+unsafe extern "C" fn cg_event(receiver: Id, _sel: Sel) -> *const c_void {
+    // SAFETY: the caller sends to a live object.
+    let Some(event) = (unsafe { event_of(receiver) }) else {
+        return std::ptr::null();
+    };
+    let mut screen = event.location;
+    if !event.window.is_null() {
+        let frame = crate::window::frame_of(event.window);
+        screen.x += frame.origin.x;
+        screen.y += frame.origin.y;
+    }
+    let global = NSPoint {
+        x: screen.x,
+        y: crate::geometry::primary_height() - screen.y,
+    };
+    // SAFETY: the same receiver, for the method that answers the same question.
+    let pressure = unsafe { pressure(receiver, std::ptr::null()) };
+    // kCGMouseEventClickState, Pressure, ButtonNumber, DeltaX, DeltaY, Subtype.
+    let fields = [
+        (1, event.clicks as f64),
+        (2, f64::from(pressure)),
+        (3, event.button as f64),
+        (4, event.delta.x),
+        (5, event.delta.y),
+        (7, f64::from(event.subtype)),
+    ];
+    // NSEventType and CGEventType number the mouse and key events alike.
+    let made = crate::cgevent::with_fields(global, event.kind as u32, &fields);
+    unsafe {
+        crate::cgevent::CGEventSetFlags(made, event.modifiers);
+        crate::cgevent::CGEventSetIntegerValueField(made, 9, event.key_code as i64);
+    }
+    objc::arc::autorelease(made as Id) as *const c_void
+}
+
+unsafe extern "C" fn nil_object(_receiver: Id, _sel: Sel) -> Id {
+    std::ptr::null_mut()
+}
+
 unsafe extern "C" fn zero_double(_receiver: Id, _sel: Sel) -> CGFloat {
     0.0
 }
@@ -145,17 +196,22 @@ unsafe extern "C" fn zero_double(_receiver: Id, _sel: Sel) -> CGFloat {
 /// answered zero throughout.
 unsafe extern "C" fn pressure(receiver: Id, _sel: Sel) -> f32 {
     // SAFETY: the caller sends to a live object.
-    let down = unsafe { event_of(receiver) }.is_some_and(|e| {
-        matches!(
-            e.kind,
-            kind::LEFT_MOUSE_DOWN
-                | kind::RIGHT_MOUSE_DOWN
-                | kind::OTHER_MOUSE_DOWN
-                | kind::LEFT_MOUSE_DRAGGED
-                | kind::RIGHT_MOUSE_DRAGGED
-                | kind::OTHER_MOUSE_DRAGGED
-        )
-    });
+    let Some(event) = (unsafe { event_of(receiver) }) else {
+        return 0.0;
+    };
+    // `+mouseEventWithType:...pressure:` gave a real reading; honor it.
+    if let Some(pressure) = event.pressure {
+        return pressure;
+    }
+    let down = matches!(
+        event.kind,
+        kind::LEFT_MOUSE_DOWN
+            | kind::RIGHT_MOUSE_DOWN
+            | kind::OTHER_MOUSE_DOWN
+            | kind::LEFT_MOUSE_DRAGGED
+            | kind::RIGHT_MOUSE_DRAGGED
+            | kind::OTHER_MOUSE_DRAGGED
+    );
     f32::from(u8::from(down))
 }
 
@@ -221,6 +277,7 @@ pub struct Fields {
     pub data1: isize,
     pub data2: isize,
     pub tracking_area: Id,
+    pub pressure: Option<f32>,
 }
 
 /// Build an autoreleased event.
@@ -249,6 +306,7 @@ pub fn make(fields: Fields) -> Id {
         (*event).data2 = fields.data2;
         (*event).tracking_area = fields.tracking_area;
         (*event).text = std::ptr::null_mut();
+        (*event).pressure = fields.pressure;
     }
     objc::arc::autorelease(event as Id)
 }
@@ -325,6 +383,7 @@ pub fn fields_of(event: Id) -> Option<Fields> {
         data1: e.data1,
         data2: e.data2,
         tracking_area: e.tracking_area,
+        pressure: e.pressure,
     })
 }
 
@@ -380,6 +439,28 @@ unsafe extern "C" fn pressed_mouse_buttons(_class: Id, _sel: Sel) -> u64 {
     sdl3::video::global_mouse_state().map_or(0, |(_, _, mask)| crate::button::pressed_mask(mask))
 }
 
+/// The runtime's window whose `-windowNumber` is `window_number`, or null.
+///
+/// Shared by every `NSEvent` class constructor that takes a window number
+/// rather than a window: each looks its window up the same way a real
+/// `-windowNumber` or `+windowNumberAtPoint:` reader would.
+fn window_by_number(window_number: isize) -> Id {
+    crate::window::all()
+        .into_iter()
+        .find(|window| {
+            let sel = objc::sel::get("windowNumber");
+            // SAFETY: every entry is a live `NSWindow`, and this is
+            // `NSInteger (id, SEL)`.
+            let number = unsafe {
+                let f: unsafe extern "C" fn(Id, Sel) -> isize =
+                    std::mem::transmute(objc::msg::entry());
+                f(*window, sel)
+            };
+            number == window_number
+        })
+        .unwrap_or(std::ptr::null_mut())
+}
+
 /// `+[NSEvent enterExitEventWithType:location:modifierFlags:timestamp:
 /// windowNumber:context:eventNumber:trackingNumber:userData:]`.
 ///
@@ -399,25 +480,82 @@ unsafe extern "C" fn enter_exit_event(
     _tracking_number: isize,
     _user_data: *mut c_void,
 ) -> Id {
-    let window = crate::window::all()
-        .into_iter()
-        .find(|window| {
-            let sel = objc::sel::get("windowNumber");
-            // SAFETY: every entry is a live `NSWindow`, and this is
-            // `NSInteger (id, SEL)`.
-            let number = unsafe {
-                let f: unsafe extern "C" fn(Id, Sel) -> isize =
-                    std::mem::transmute(objc::msg::entry());
-                f(*window, sel)
-            };
-            number == window_number
-        })
-        .unwrap_or(std::ptr::null_mut());
     make(Fields {
         kind,
         modifiers,
         location,
-        window,
+        window: window_by_number(window_number),
+        ..Fields::default()
+    })
+}
+
+/// `+[NSEvent keyEventWithType:location:modifierFlags:timestamp:windowNumber:
+/// context:characters:charactersIgnoringModifiers:isARepeat:keyCode:]`.
+// FIXME (ACCURACY): `-charactersIgnoringModifiers` answers `characters` for
+// every event here, so the second string is not kept.
+#[allow(clippy::too_many_arguments)]
+unsafe extern "C" fn key_event(
+    _class: Id,
+    _sel: Sel,
+    kind: u64,
+    location: NSPoint,
+    modifiers: u64,
+    _timestamp: CGFloat,
+    window_number: isize,
+    _context: Id,
+    characters: Id,
+    _unmodified: Id,
+    repeat: u8,
+    key_code: u16,
+) -> Id {
+    make(Fields {
+        kind,
+        modifiers,
+        location,
+        window: window_by_number(window_number),
+        characters,
+        key_code,
+        repeat: repeat != 0,
+        ..Fields::default()
+    })
+}
+
+unsafe extern "C" fn mouse_event(
+    _class: Id,
+    _sel: Sel,
+    kind: u64,
+    location: NSPoint,
+    modifiers: u64,
+    _timestamp: CGFloat,
+    window_number: isize,
+    _context: Id,
+    _event_number: isize,
+    click_count: isize,
+    pressure: f32,
+) -> Id {
+    // `-buttonNumber`: 0/1/2 for the three named buttons AppKit's type covers,
+    // -1 for a type with none - `MOUSE_MOVED` among them - which is what
+    // Apple's docs say that property answers outside a click.
+    let button = match kind {
+        self::kind::LEFT_MOUSE_DOWN
+        | self::kind::LEFT_MOUSE_UP
+        | self::kind::LEFT_MOUSE_DRAGGED => 0,
+        self::kind::RIGHT_MOUSE_DOWN
+        | self::kind::RIGHT_MOUSE_UP
+        | self::kind::RIGHT_MOUSE_DRAGGED => 1,
+        self::kind::OTHER_MOUSE_DOWN
+        | self::kind::OTHER_MOUSE_UP
+        | self::kind::OTHER_MOUSE_DRAGGED => 2,
+        _ => -1,
+    };
+    make(Fields {
+        kind,
+        modifiers,
+        location,
+        window: window_by_number(window_number),
+        button,
+        clicks: click_count as i64,
+        pressure: Some(pressure),
         ..Fields::default()
     })
 }
@@ -468,13 +606,17 @@ unsafe extern "C" fn other_event(
     event
 }
 
-/// `-CGEvent`: a CoreGraphics event with this one's type, flags and key.
-unsafe extern "C" fn cg_event(receiver: Id, _sel: Sel) -> *const c_void {
-    // SAFETY: null or a live object this runtime allocated.
-    let Some(event) = (unsafe { event_of(receiver) }) else {
-        return std::ptr::null();
-    };
-    crate::cgevent::describing(event.kind, event.modifiers, event.key_code, event.location)
+static COALESCING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+
+/// `+isMouseCoalescingEnabled`, on by default as Apple's is.
+// FIXME (ACCURACY): remembered, but motion reaches the program as the window
+// system delivers it either way.
+unsafe extern "C" fn is_mouse_coalescing(_class: Id, _sel: Sel) -> u8 {
+    COALESCING.load(std::sync::atomic::Ordering::Relaxed) as u8
+}
+
+unsafe extern "C" fn set_mouse_coalescing(_class: Id, _sel: Sel, on: u8) {
+    COALESCING.store(on != 0, std::sync::atomic::Ordering::Relaxed);
 }
 
 /// The text a key types with `flags` held, from the keyboard layout: Shift,
@@ -540,6 +682,8 @@ unsafe extern "C" fn event_with_cg_event(_class: Id, _sel: Sel, cg: *const c_voi
 pub(crate) fn install() {
     let class = objc::class::lookup(c"NSEvent").expect("declared before its methods");
     crate::define::class_methods!(class, {
+        "isMouseCoalescingEnabled" => is_mouse_coalescing, c"c16@0:8";
+        "setMouseCoalescingEnabled:" => set_mouse_coalescing, c"v20@0:8c16";
         "modifierFlags" => current_modifier_flags, c"Q16@0:8";
         "mouseLocation" => mouse_location, c"{CGPoint=dd}16@0:8";
         "pressedMouseButtons" => pressed_mouse_buttons, c"Q16@0:8";
@@ -549,6 +693,10 @@ pub(crate) fn install() {
             => enter_exit_event, c"@96@0:8Q16{CGPoint=dd}24Q40d48q56@64q72q80^v88";
         "otherEventWithType:location:modifierFlags:timestamp:windowNumber:context:subtype:data1:data2:"
             => other_event, c"@96@0:8Q16{CGPoint=dd}24Q40d48q56@64s72q80q88";
+        "keyEventWithType:location:modifierFlags:timestamp:windowNumber:context:characters:charactersIgnoringModifiers:isARepeat:keyCode:"
+            => key_event, c"@92@0:8Q16{CGPoint=dd}24Q40d48q56@64@72@80c88S90";
+        "mouseEventWithType:location:modifierFlags:timestamp:windowNumber:context:eventNumber:clickCount:pressure:"
+            => mouse_event, c"@96@0:8Q16{CGPoint=dd}24Q40d48q56@64q72q80f88";
     });
     methods!(class, {
         "type" => kind, c"Q16@0:8";
@@ -571,6 +719,9 @@ pub(crate) fn install() {
         "hasPreciseScrollingDeltas" => no, c"c16@0:8";
         "isDirectionInvertedFromDevice" => no, c"c16@0:8";
         "pressure" => pressure, c"f16@0:8";
+        "CGEvent" => cg_event, c"^{__CGEvent=}16@0:8";
+        // Deprecated in 10.12, and nil there since: no event carries a context.
+        "context" => nil_object, c"@16@0:8";
         "windowNumber" => window_number, c"q16@0:8";
         // An event number counts *tracking* sequences on a Mac, and nothing
         // here tracks one; zero is what an event outside any sequence carries.
@@ -599,6 +750,29 @@ mod tests {
     use super::*;
 
     #[test]
+    fn a_mouse_event_describes_itself_as_a_quartz_event() {
+        crate::bootstrap();
+        let event = make(Fields {
+            kind: kind::LEFT_MOUSE_DOWN,
+            location: NSPoint { x: 10.0, y: 20.0 },
+            button: 0,
+            clicks: 2,
+            ..Default::default()
+        });
+        // SAFETY: an event this module made.
+        let quartz = unsafe { cg_event(event, std::ptr::null()) };
+        assert!(!quartz.is_null());
+        // SAFETY: the event `-CGEvent` returned.
+        unsafe {
+            let location = crate::cgevent::CGEventGetLocation(quartz);
+            assert_eq!(location.x, 10.0);
+            assert_eq!(location.y, crate::geometry::primary_height() - 20.0);
+            assert_eq!(crate::cgevent::CGEventGetIntegerValueField(quartz, 1), 2);
+            assert_eq!(crate::cgevent::CGEventGetDoubleValueField(quartz, 2), 1.0);
+        }
+    }
+
+    #[test]
     fn an_event_reports_what_it_was_built_with() {
         crate::bootstrap();
         let event = make(Fields {
@@ -616,6 +790,48 @@ mod tests {
                 super::location_in_window(event, objc::sel::get("locationInWindow")),
                 NSPoint { x: 3.0, y: 4.0 }
             );
+        }
+    }
+
+    /// `+mouseEventWithType:...` must hand back a real event the rest of the
+    /// crate's event code understands: `-type`, `-buttonNumber` and
+    /// `-clickCount` are what a guest reads back, and `-pressure` must be the
+    /// value it asked for rather than the down/up guess a host-built event
+    /// falls back to.
+    #[test]
+    fn mouse_event_with_type_builds_a_usable_event() {
+        crate::bootstrap();
+        let event = unsafe {
+            mouse_event(
+                std::ptr::null_mut(),
+                objc::sel::get(
+                    "mouseEventWithType:location:modifierFlags:timestamp:windowNumber:\
+                     context:eventNumber:clickCount:pressure:",
+                ),
+                kind::LEFT_MOUSE_DOWN,
+                NSPoint { x: 1.0, y: 2.0 },
+                0,
+                0.0,
+                0,
+                std::ptr::null_mut(),
+                0,
+                2,
+                0.75,
+            )
+        };
+        assert!(!event.is_null());
+        // SAFETY: each prototype is the one its selector declares.
+        unsafe {
+            assert_eq!(
+                super::kind(event, objc::sel::get("type")),
+                kind::LEFT_MOUSE_DOWN
+            );
+            assert_eq!(
+                super::button_number(event, objc::sel::get("buttonNumber")),
+                0
+            );
+            assert_eq!(super::click_count(event, objc::sel::get("clickCount")), 2);
+            assert_eq!(super::pressure(event, objc::sel::get("pressure")), 0.75);
         }
     }
 

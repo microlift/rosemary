@@ -90,7 +90,7 @@ fn autoreleased_array(values: &[CFTypeRef]) -> Id {
 }
 
 fn autoreleased_set(values: &[CFTypeRef]) -> Id {
-    let set = collections::new_set(values, Policy::from_type_callbacks());
+    let set = collections::new_set(values, Policy::from_type_callbacks(), false);
     objc::arc::autorelease(set as Id)
 }
 

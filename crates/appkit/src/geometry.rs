@@ -327,6 +327,56 @@ mod tests {
         }
     }
 
+    #[test]
+    fn overlapping_rects_intersect_to_their_shared_area() {
+        let a = NSRect {
+            origin: NSPoint { x: 0.0, y: 0.0 },
+            size: NSSize {
+                width: 10.0,
+                height: 10.0,
+            },
+        };
+        let b = NSRect {
+            origin: NSPoint { x: 5.0, y: 5.0 },
+            size: NSSize {
+                width: 10.0,
+                height: 10.0,
+            },
+        };
+        // SAFETY: both take a `CGRect` by value.
+        let result = unsafe { CGRectIntersection(a, b) };
+        assert_eq!(result.origin, NSPoint { x: 5.0, y: 5.0 });
+        assert_eq!(
+            result.size,
+            NSSize {
+                width: 5.0,
+                height: 5.0
+            }
+        );
+    }
+
+    #[test]
+    fn rects_that_do_not_overlap_intersect_to_the_null_rect_not_the_zero_one() {
+        let a = NSRect {
+            origin: NSPoint { x: 0.0, y: 0.0 },
+            size: NSSize {
+                width: 1.0,
+                height: 1.0,
+            },
+        };
+        let b = NSRect {
+            origin: NSPoint { x: 5.0, y: 5.0 },
+            size: NSSize {
+                width: 1.0,
+                height: 1.0,
+            },
+        };
+        // SAFETY: both take a `CGRect` by value.
+        let result = unsafe { CGRectIntersection(a, b) };
+        assert!(result.origin.x.is_infinite());
+        assert!(result.origin.y.is_infinite());
+    }
+
     /// The conversion is its own inverse, whatever the display height is -
     /// which is the property that makes a round trip through SDL and back leave
     /// a window where it started.

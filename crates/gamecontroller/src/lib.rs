@@ -608,7 +608,7 @@ unsafe extern "C" fn set_should_monitor_background_events(_class: Id, _sel: Sel,
 }
 
 unsafe extern "C" fn supported_localities(_receiver: Id, _sel: Sel) -> Id {
-    let set = corefoundation::collections::new_set(&[], Policy::from_type_callbacks());
+    let set = corefoundation::collections::new_set(&[], Policy::from_type_callbacks(), false);
     unsafe { corefoundation::api::CFAutorelease(set) as Id }
 }
 

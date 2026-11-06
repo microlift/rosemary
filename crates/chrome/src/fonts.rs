@@ -456,6 +456,39 @@ pub fn load(path: &str, index: u32) -> Option<Arc<LoadedFace>> {
     Some(face)
 }
 
+/// The value each of the face's variation axes currently holds: the named
+/// instance's coordinate where `index` names one, and the axis default
+/// otherwise - what `CTFontCopyVariation` reports.
+pub fn current_variation(path: &str, index: u32) -> Vec<(u32, f32)> {
+    let Ok(bytes) = std::fs::read(path) else {
+        return Vec::new();
+    };
+    let Ok(face) = owned_ttf_parser::Face::parse(&bytes, index & 0xffff) else {
+        return Vec::new();
+    };
+    let instance = (index >> 16).checked_sub(1).and_then(|at| {
+        fvar_instances(&face)
+            .into_iter()
+            .nth(usize::try_from(at).ok()?)
+    });
+    face.variation_axes()
+        .into_iter()
+        .map(|axis| {
+            let value = instance
+                .as_ref()
+                .and_then(|instance| {
+                    instance
+                        .coordinates
+                        .iter()
+                        .find(|(tag, _)| *tag == axis.tag)
+                        .map(|(_, value)| *value)
+                })
+                .unwrap_or(axis.def_value);
+            (axis.tag.0, value)
+        })
+        .collect()
+}
+
 /// A glyph's outline as line and curve segments, in font units, y up.
 pub fn outline(face: &owned_ttf_parser::Face<'_>, glyph: u16) -> Vec<Segment> {
     let mut builder = OutlineCollector::default();

@@ -401,6 +401,21 @@ impl RunLoop {
         }
     }
 
+    /// Take a timer out of every mode it was added to, as invalidating an
+    /// `NSTimer` does.
+    pub fn remove_timer_everywhere(&self, timer: &Arc<Timer>) {
+        self.common
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .items
+            .timers
+            .retain(|t| !Arc::ptr_eq(t, timer));
+        let mut modes = self.modes.lock().unwrap_or_else(|e| e.into_inner());
+        for entry in modes.values_mut() {
+            entry.timers.retain(|t| !Arc::ptr_eq(t, timer));
+        }
+    }
+
     pub fn add_observer(&self, observer: &Arc<Observer>, mode: &str) {
         self.note_common(mode, |common| {
             if !common.observers.iter().any(|o| Arc::ptr_eq(o, observer)) {
@@ -933,6 +948,23 @@ mod tests {
             result::HANDLED_SOURCE
         );
         waker.join().unwrap();
+    }
+
+    #[test]
+    fn a_timer_removed_everywhere_leaves_every_mode() {
+        let (_, _, tick) = counter!();
+        let loop_ = Arc::new(RunLoop::new());
+        let timer = new_timer(Duration::from_secs(10), None, Some(tick), 0);
+        loop_.add_timer(&timer, DEFAULT_MODE);
+        loop_.add_timer(&timer, "tracking");
+        loop_.add_timer(&timer, COMMON_MODES);
+        loop_.remove_timer_everywhere(&timer);
+        for mode in [DEFAULT_MODE, "tracking", COMMON_MODES] {
+            assert!(loop_.contents(mode).1.is_empty(), "still in {mode}");
+        }
+        // A mode joining the common set later does not get it back.
+        loop_.add_common_mode("later");
+        assert!(loop_.contents("later").1.is_empty());
     }
 
     #[test]

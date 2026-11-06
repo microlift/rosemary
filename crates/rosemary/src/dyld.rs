@@ -3205,7 +3205,8 @@ mod tests {
         };
         assert!(!host.is_null());
         assert!(lookup(handle, "CGLDescribePixelFormat").is_none());
-        assert!(lookup(handle, "gluPerspective").is_none());
+        assert!(lookup(handle, "gluNewTess").is_none());
+        assert!(lookup(handle, "gluPerspective").is_some());
         let expected = appkit::symbol("CGLGetCurrentContext").unwrap();
         assert_eq!(
             lookup(handle, "CGLGetCurrentContext"),

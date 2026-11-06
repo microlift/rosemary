@@ -48,14 +48,6 @@ unsafe extern "C" fn client(_receiver: Id, _sel: Sel) -> Id {
 /// area follows the first responder from [`crate::window`] already.
 unsafe extern "C" fn ignored(_receiver: Id, _sel: Sel) {}
 
-/// `-[NSView inputContext]`: the context, for a view that takes text.
-unsafe extern "C" fn view_input_context(receiver: Id, _sel: Sel) -> Id {
-    match crate::text::is_input_client(receiver) {
-        true => shared(),
-        false => std::ptr::null_mut(),
-    }
-}
-
 /// `-handleEvent:`: a key event goes to the client's `-interpretKeyEvents:`,
 /// which is where a composition would start; anything else is not consumed.
 unsafe extern "C" fn handle_event(_receiver: Id, _sel: Sel, event: Id) -> u8 {
@@ -87,6 +79,15 @@ unsafe extern "C" fn handle_event(_receiver: Id, _sel: Sel, event: Id) -> u8 {
 /// `-selectedKeyboardInputSource`: the one layout this host reports.
 unsafe extern "C" fn selected_keyboard_input_source(_receiver: Id, _sel: Sel) -> Id {
     foundation::notification::name_object(crate::textinput::SOURCE_ID) as Id
+}
+
+/// `-[NSView inputContext]`: the context for a view that takes text, nil for
+/// one that does not, as Apple decides by `NSTextInputClient` conformance.
+unsafe extern "C" fn view_input_context(receiver: Id, _sel: Sel) -> Id {
+    match crate::text::is_input_client(receiver) {
+        true => shared(),
+        false => std::ptr::null_mut(),
+    }
 }
 
 pub(crate) fn install() {

@@ -30,13 +30,22 @@ const DIRECTORIES: &[&str] = &[
     "/Volumes",
 ];
 const SYMLINKS: &[(&str, &str)] = &[("/tmp", "private/tmp"), ("/var", "private/var")];
+// The folders every macOS account has; programs create files in them without
+// checking that they exist.
 const USER_DIRECTORIES: &[&str] = &[
+    "Desktop",
+    "Documents",
+    "Downloads",
     "Library",
     "Library/Application Support",
     "Library/Caches",
     "Library/Logs",
     "Library/Preferences",
     "Library/Saved Application State",
+    "Movies",
+    "Music",
+    "Pictures",
+    "Public",
 ];
 
 /// Add prefix-owned layout paths to a base manifest for prefix checks and
@@ -153,8 +162,8 @@ pub fn create(directory: &Path) -> std::io::Result<bool> {
         // `original` should not be absolute because that would make the prefix unmovable from folder to folder
         std::os::unix::fs::symlink(target, drive.join(path.trim_start_matches('/')))?;
     }
-    // The `~/Library` subtree every Mac ships. `foundation::paths` creates
-    // these too, for a guest that runs before anything made a prefix; listing
+    // The home folders every Mac ships. `foundation::paths` creates the
+    // `~/Library` ones too, for a guest that runs before anything made a prefix; listing
     // them here is what makes a fresh prefix complete on its own.
     for relative in USER_DIRECTORIES {
         std::fs::create_dir_all(drive.join("Users").join(&user).join(relative))?;
@@ -323,6 +332,10 @@ mod tests {
                 .join("Library/Application Support")
                 .is_dir()
         );
+        for folder in ["Desktop", "Documents", "Downloads", "Pictures"] {
+            let path = drive.join("Users").join(user_name()).join(folder);
+            assert!(path.is_dir(), "~/{folder} is missing");
+        }
         // Making one twice is not an error and does not write again.
         assert!(!create(&at).expect("the second call is a no-op"));
 

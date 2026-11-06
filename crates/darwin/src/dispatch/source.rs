@@ -123,6 +123,7 @@ struct State {
     cancel: Option<Handler>,
     /// Starts at one: a source does nothing until its first resume.
     suspended: u32,
+    activated: bool,
     /// Merged but not yet delivered.
     pending: u64,
     /// The monitor's id for this source, once armed.
@@ -146,6 +147,7 @@ impl Default for State {
             event: None,
             cancel: None,
             suspended: 0,
+            activated: false,
             pending: 0,
             id: None,
             scheduled: false,
@@ -611,11 +613,19 @@ pub unsafe extern "C" fn merge_data(handle: u64, value: u64) {
 
 /// `dispatch_resume` for a source: the first one arms it.
 pub(crate) fn resume(handle: u64) -> bool {
+    resume_or_activate(handle, false)
+}
+
+fn resume_or_activate(handle: u64, activating: bool) -> bool {
     // SAFETY: the guest holds a reference for the call.
     let Some(s) = (unsafe { source(handle) }) else {
         return false;
     };
     let mut state = s.lock();
+    if activating && state.activated {
+        return true;
+    }
+    state.activated = true;
     if state.suspended == 0 {
         return true;
     }
@@ -746,6 +756,16 @@ pub(crate) fn suspend(handle: u64) -> bool {
     true
 }
 
+/// The finalizer is delivered to the source's target queue.
+pub(crate) fn target(handle: u64) -> u64 {
+    unsafe { source(handle) }.map_or(0, |s| s.queue)
+}
+
+/// Activation balances the initial inactive state only once.
+pub(crate) fn activate(handle: u64) {
+    resume_or_activate(handle, true);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -846,6 +866,23 @@ mod tests {
             wait_for(|| TICKS.load(Ordering::Acquire) >= 3);
             cancel(s);
             object::release(s);
+            object::release(queue);
+        }
+    }
+
+    #[test]
+    fn activating_twice_preserves_an_explicit_suspension() {
+        let queue = queue::create_serial("activation suspension test");
+        // SAFETY: these are live handles created and released by this test.
+        unsafe {
+            let handle = create(type_data_add(), 0, 0, queue);
+            suspend(handle);
+            activate(handle);
+            activate(handle);
+            assert_eq!(source(handle).unwrap().lock().suspended, 1);
+            cancel(handle);
+            resume(handle);
+            object::release(handle);
             object::release(queue);
         }
     }

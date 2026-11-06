@@ -996,6 +996,58 @@ pub unsafe extern "C" fn CGGetDisplaysWithRect(
     CG_SUCCESS
 }
 
+/// `CGError CGGetDisplaysWithPoint(CGPoint, uint32_t maxDisplays,
+/// CGDirectDisplayID *displays, uint32_t *matchingDisplayCount)`
+///
+/// Half-open on the far edges, as a point test has to be: a point sitting
+/// exactly on the seam between two edge-to-edge displays belongs to one of
+/// them, not to neither.
+#[allow(non_snake_case)]
+pub unsafe extern "C" fn CGGetDisplaysWithPoint(
+    point: foundation::geometry::NSPoint,
+    max: u32,
+    list: *mut u32,
+    count: *mut u32,
+) -> i32 {
+    let matching: Vec<u32> = sdl3::video::displays()
+        .into_iter()
+        .filter(|display| {
+            // SAFETY: a display id from SDL's own list.
+            let bounds = unsafe { CGDisplayBounds(*display) };
+            point.x >= bounds.origin.x
+                && point.x < bounds.origin.x + bounds.size.width
+                && point.y >= bounds.origin.y
+                && point.y < bounds.origin.y + bounds.size.height
+        })
+        .collect();
+    if list.is_null() {
+        if count.is_null() {
+            return CG_ILLEGAL_ARGUMENT;
+        }
+        // SAFETY: the caller states it is writable.
+        unsafe { count.write(matching.len() as u32) };
+        return CG_SUCCESS;
+    }
+    let room = (max as usize).min(matching.len());
+    // SAFETY: the caller states `list` holds `max` ids.
+    unsafe { std::ptr::copy_nonoverlapping(matching.as_ptr(), list, room) };
+    if !count.is_null() {
+        // SAFETY: the caller states it is writable.
+        unsafe { count.write(room as u32) };
+    }
+    CG_SUCCESS
+}
+
+/// `CGImageRef CGDisplayCreateImageForRect(CGDirectDisplayID, CGRect)`.
+///
+/// FIXME (ACCURACY): this runtime has no compositor-level pixel readback, so
+/// it always answers the way a real Mac does when the process has not been
+/// granted Screen Recording permission: NULL.
+#[allow(non_snake_case)]
+pub unsafe extern "C" fn CGDisplayCreateImageForRect(_display: u32, _rect: NSRect) -> CFTypeRef {
+    std::ptr::null()
+}
+
 /// `CFUUIDRef CGDisplayCreateUUIDFromDisplayID(CGDirectDisplayID)`
 ///
 /// A display's UUID is how a program remembers *which* monitor a window was on

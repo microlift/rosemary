@@ -240,25 +240,6 @@ unsafe extern "C" fn string_with_characters(
     unsafe { api::CFAutorelease(string) as Id }
 }
 
-/// `-initWithCharacters:length:`, which owns its answer as every `-init...`
-/// does; [`string_with_characters`] autoreleases its.
-unsafe extern "C" fn init_with_characters(
-    receiver: Id,
-    _sel: Sel,
-    chars: *const u16,
-    count: usize,
-) -> Id {
-    objc::arc::release(receiver);
-    // SAFETY: the caller says `chars` covers `count` UTF-16 units.
-    unsafe {
-        api::CFStringCreateWithCharacters(
-            std::ptr::null(),
-            chars,
-            count as corefoundation::base::CFIndex,
-        ) as Id
-    }
-}
-
 unsafe extern "C" fn string_with_cstring_encoding(
     _class: Id,
     _sel: Sel,
@@ -441,6 +422,101 @@ fn is_mutable_receiver(receiver: Id) -> bool {
         || class
             .chain()
             .any(|ancestor| ancestor.name_str() == "NSMutableString")
+}
+
+/// `made`, autoreleased, or a mutable string with its contents when the factory
+/// was sent to `NSMutableString`: the factories are inherited, and
+/// `+[NSMutableString stringWithCharacters:length:]` answers a mutable string.
+fn for_receiver(receiver: Id, made: Id) -> Id {
+    if made.is_null() || !is_mutable_receiver(receiver) {
+        return made;
+    }
+    // SAFETY: `made` is a string this module just made.
+    let bytes = unsafe { bytes(made) };
+    let copy = corefoundation::string::new_mutable();
+    // SAFETY: a fresh mutable string.
+    unsafe { corefoundation::string::set_bytes(copy, &bytes) };
+    // SAFETY: a fresh object.
+    unsafe { api::CFAutorelease(copy) as Id }
+}
+
+/// An initializer's answer from a factory's: owned by the caller, and the
+/// allocated receiver it replaces given back.
+fn initialized(receiver: Id, made: Id) -> Id {
+    let made = for_receiver(receiver, made);
+    objc::arc::release(receiver);
+    objc::arc::retain(made)
+}
+
+unsafe extern "C" fn class_string_with_utf8(class: Id, sel: Sel, cstr: *const c_char) -> Id {
+    for_receiver(class, unsafe { string_with_utf8(class, sel, cstr) })
+}
+
+unsafe extern "C" fn class_string_with_cstring_encoding(
+    class: Id,
+    sel: Sel,
+    cstr: *const c_char,
+    ns: usize,
+) -> Id {
+    for_receiver(class, unsafe {
+        string_with_cstring_encoding(class, sel, cstr, ns)
+    })
+}
+
+unsafe extern "C" fn class_string_with_cstring(class: Id, sel: Sel, cstr: *const c_char) -> Id {
+    for_receiver(class, unsafe { string_with_cstring(class, sel, cstr) })
+}
+
+unsafe extern "C" fn class_string_with_characters(
+    class: Id,
+    sel: Sel,
+    chars: *const u16,
+    count: usize,
+) -> Id {
+    for_receiver(class, unsafe {
+        string_with_characters(class, sel, chars, count)
+    })
+}
+
+unsafe extern "C" fn class_string_with_contents_of_file(
+    class: Id,
+    sel: Sel,
+    path: Id,
+    encoding: usize,
+    error: *mut Id,
+) -> Id {
+    for_receiver(class, unsafe {
+        string_with_contents_of_file(class, sel, path, encoding, error)
+    })
+}
+
+unsafe extern "C" fn class_string_with_contents_of_url(
+    class: Id,
+    sel: Sel,
+    url: Id,
+    encoding: usize,
+    error: *mut Id,
+) -> Id {
+    for_receiver(class, unsafe {
+        string_with_contents_of_url(class, sel, url, encoding, error)
+    })
+}
+
+unsafe extern "C" fn init_with_string(receiver: Id, sel: Sel, other: Id) -> Id {
+    initialized(receiver, unsafe {
+        string_with_string(receiver, sel, other)
+    })
+}
+
+unsafe extern "C" fn init_with_characters(
+    receiver: Id,
+    sel: Sel,
+    chars: *const u16,
+    count: usize,
+) -> Id {
+    initialized(receiver, unsafe {
+        string_with_characters(receiver, sel, chars, count)
+    })
 }
 
 unsafe extern "C" fn string_with_format(class: Id, _sel: Sel, format: Id) -> Id {
@@ -1198,6 +1274,38 @@ unsafe extern "C" fn get_characters(receiver: Id, sel: Sel, buffer: *mut u16) {
     }
 }
 
+/// The receiver in a Unicode normalization form, as `CFStringNormalize`'s
+/// `CFStringNormalizationForm` numbers them.
+fn normalized(receiver: Id, form: corefoundation::base::CFIndex) -> Id {
+    // SAFETY: an `NSString`, copied before it is changed.
+    unsafe {
+        let mutable = api::CFStringCreateMutableCopy(std::ptr::null(), 0, receiver as _);
+        if mutable.is_null() {
+            return std::ptr::null_mut();
+        }
+        api::CFStringNormalize(mutable, form);
+        let copy = api::CFStringCreateCopy(std::ptr::null(), mutable);
+        api::CFRelease(mutable);
+        api::CFAutorelease(copy) as Id
+    }
+}
+
+unsafe extern "C" fn decomposed_canonical(receiver: Id, _sel: Sel) -> Id {
+    normalized(receiver, 0)
+}
+
+unsafe extern "C" fn precomposed_canonical(receiver: Id, _sel: Sel) -> Id {
+    normalized(receiver, 2)
+}
+
+unsafe extern "C" fn decomposed_compatibility(receiver: Id, _sel: Sel) -> Id {
+    normalized(receiver, 1)
+}
+
+unsafe extern "C" fn precomposed_compatibility(receiver: Id, _sel: Sel) -> Id {
+    normalized(receiver, 3)
+}
+
 unsafe extern "C" fn lowercase(receiver: Id, _sel: Sel) -> Id {
     // SAFETY: an `NSString`.
     let mut whole = unsafe { bytes(receiver) };
@@ -1656,15 +1764,6 @@ unsafe extern "C" fn string_with_string(_class: Id, _sel: Sel, other: Id) -> Id 
     unsafe { api::CFAutorelease(s) as Id }
 }
 
-/// `-initWithString:`, which owns its answer as every `-init...` does;
-/// [`string_with_string`] autoreleases its.
-unsafe extern "C" fn init_with_string(receiver: Id, _sel: Sel, other: Id) -> Id {
-    // SAFETY: an `NSString`, or nil.
-    let text = unsafe { bytes(other) };
-    objc::arc::release(receiver);
-    corefoundation::string::from_bytes(&text, false) as Id
-}
-
 unsafe extern "C" fn mutable_string_with_string(_class: Id, _sel: Sel, other: Id) -> Id {
     let bytes = unsafe { bytes(other) };
     let s = corefoundation::string::new_mutable();
@@ -1719,6 +1818,10 @@ pub(crate) fn install() {
         "componentsSeparatedByString:" => components_separated_by_string, c"@24@0:8@16";
         "componentsSeparatedByCharactersInSet:" => components_separated_by_characters, c"@24@0:8@16";
         "lowercaseString" => lowercase, c"@16@0:8";
+        "decomposedStringWithCanonicalMapping" => decomposed_canonical, c"@16@0:8";
+        "precomposedStringWithCanonicalMapping" => precomposed_canonical, c"@16@0:8";
+        "decomposedStringWithCompatibilityMapping" => decomposed_compatibility, c"@16@0:8";
+        "precomposedStringWithCompatibilityMapping" => precomposed_compatibility, c"@16@0:8";
         "uppercaseString" => uppercase, c"@16@0:8";
         "compare:" => compare, c"q24@0:8@16";
         "caseInsensitiveCompare:" => case_insensitive_compare, c"q24@0:8@16";
@@ -1782,19 +1885,19 @@ pub(crate) fn install() {
     });
 
     class_methods!(class, {
-        "stringWithUTF8String:" => string_with_utf8, c"@24@0:8*16";
-        "stringWithCString:encoding:" => string_with_cstring_encoding, c"@32@0:8*16Q24";
-        "stringWithCString:" => string_with_cstring, c"@24@0:8*16";
+        "stringWithUTF8String:" => class_string_with_utf8, c"@24@0:8*16";
+        "stringWithCString:encoding:" => class_string_with_cstring_encoding, c"@32@0:8*16Q24";
+        "stringWithCString:" => class_string_with_cstring, c"@24@0:8*16";
         "defaultCStringEncoding" => default_cstring_encoding, c"Q16@0:8";
-        "stringWithContentsOfFile:encoding:error:" => string_with_contents_of_file,
+        "stringWithContentsOfFile:encoding:error:" => class_string_with_contents_of_file,
             c"@40@0:8@16Q24^@32";
-        "stringWithContentsOfURL:encoding:error:" => string_with_contents_of_url,
+        "stringWithContentsOfURL:encoding:error:" => class_string_with_contents_of_url,
         c"@40@0:8@16Q24^@32";
         "string" => empty_string, c"@16@0:8";
         "stringWithFormat:" => string_with_format, c"@24@0:8@16";
         "localizedStringWithFormat:" => string_with_format, c"@24@0:8@16";
         "stringWithString:" => string_with_string, c"@24@0:8@16";
-        "stringWithCharacters:length:" => string_with_characters, c"@32@0:8^S16Q24";
+        "stringWithCharacters:length:" => class_string_with_characters, c"@32@0:8^S16Q24";
         "pathWithComponents:" => path_with_components, c"@24@0:8@16";
     });
     methods!(class, {
@@ -1810,6 +1913,36 @@ pub(crate) fn install() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn factories_sent_to_the_mutable_class_answer_mutable_strings() {
+        crate::bootstrap();
+        let mutable = objc::class::ptr(objc::class::lookup(c"NSMutableString").unwrap()) as Id;
+        let immutable = objc::class::ptr(objc::class::lookup(c"NSString").unwrap()) as Id;
+        let units = [104u16, 105];
+        let sel = objc::sel::get("stringWithCharacters:length:");
+        // SAFETY: two classes and a two-unit buffer.
+        unsafe {
+            let made = class_string_with_characters(mutable, sel, units.as_ptr(), 2);
+            assert!(corefoundation::string::is_mutable(made as CFTypeRef));
+            assert_eq!(bytes(made), b"hi");
+            let made = class_string_with_characters(immutable, sel, units.as_ptr(), 2);
+            assert!(!corefoundation::string::is_mutable(made as CFTypeRef));
+        }
+    }
+
+    #[test]
+    fn normalization_forms_compose_and_decompose_an_accent() {
+        crate::bootstrap();
+        let decomposed = from_str("e\u{301}");
+        let composed = unsafe { precomposed_canonical(decomposed as Id, std::ptr::null()) };
+        assert_eq!(unsafe { bytes(composed) }, "\u{e9}".as_bytes());
+        let back = unsafe { decomposed_canonical(composed, std::ptr::null()) };
+        assert_eq!(unsafe { bytes(back) }, "e\u{301}".as_bytes());
+        let ligature = from_str("\u{fb01}");
+        let folded = unsafe { precomposed_compatibility(ligature as Id, std::ptr::null()) };
+        assert_eq!(unsafe { bytes(folded) }, b"fi");
+    }
 
     #[test]
     fn joins_path_components_as_apple_does() {

@@ -617,6 +617,13 @@ fn resource_value(path: &str, key: &str) -> Option<corefoundation::base::CFTypeR
         // the modification date is the nearest thing it does record, and a
         // Finder sorting by "date added" needs some date for every entry.
         ADDED_TO_DIRECTORY_DATE => modified(),
+        // Value type `UTType`, not a string - see `uttype::for_path`. Already
+        // a fresh +1 reference, like every other object this function hands
+        // back for a caller to release or autorelease.
+        "NSURLContentTypeKey" => {
+            let host = prefix::ns::existing_host_path(path);
+            crate::uttype::for_path(&host).map(|ut| ut as corefoundation::base::CFTypeRef)
+        }
         // There is no backup daemon here, so nothing is ever excluded from one.
         // Answered rather than omitted because a caller reads it back to
         // confirm the exclusion it just asked for, and a missing key reads as a
@@ -1094,5 +1101,33 @@ mod tests {
         assert_eq!(standardized_file_path("/../../a"), "/a");
         assert_eq!(standardized_file_path("a/../../b"), "../b");
         assert_eq!(standardized_file_path("/"), "/");
+    }
+
+    /// `NSURLContentTypeKey` answers a `UTType`, not a string - the one real
+    /// difference from every other resource key this module computes.
+    #[test]
+    fn content_type_key_answers_a_uttype_matching_the_extension() {
+        crate::bootstrap();
+        let dir = std::env::temp_dir().join(format!("rosemary-url-ct-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let file = dir.join("picture.png");
+        std::fs::write(&file, b"x").expect("a file to look at");
+
+        let value = super::resource_value(&file.to_string_lossy(), "NSURLContentTypeKey")
+            .expect("a content type for a file that exists");
+        // SAFETY: `resource_value` hands over a `UTType` for this key.
+        assert_eq!(
+            unsafe { crate::uttype::identifier_of(value as objc::object::Id) },
+            Some("public.png".to_string())
+        );
+        objc::arc::release(value as objc::object::Id);
+
+        let missing = super::resource_value(
+            &dir.join("nowhere.png").to_string_lossy(),
+            "NSURLContentTypeKey",
+        );
+        assert!(missing.is_none(), "a resource that does not exist");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

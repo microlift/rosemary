@@ -1,0 +1,9 @@
+[package]
+name = "accelerate"
+description = "Accelerate's CBLAS surface, computed in plain Rust"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+exports.workspace = true

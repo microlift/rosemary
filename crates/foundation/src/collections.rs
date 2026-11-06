@@ -555,21 +555,69 @@ unsafe extern "C" fn sort_using_function(
     }
 }
 
-unsafe extern "C" fn sort_using_comparator(receiver: Id, _sel: Sel, block: Id) {
+/// Order by each `NSSortDescriptor` in turn, the next one breaking a tie.
+///
+/// Each descriptor is *sent* `-compareObject:toObject:`, so a guest's own
+/// subclass of one is honoured.
+fn sort_by_descriptors(values: &mut [CFTypeRef], descriptors: Id) {
+    // SAFETY: an array, or nil for none.
+    let Some(descriptors) =
+        (unsafe { collections::array(descriptors as CFTypeRef) }).map(|a| a.values.clone())
+    else {
+        return;
+    };
+    let compare = objc::sel::get("compareObject:toObject:");
+    // SAFETY: `-compareObject:toObject:` is `NSComparisonResult (id, SEL, id, id)`.
+    let send: unsafe extern "C" fn(Id, Sel, Id, Id) -> i64 =
+        unsafe { std::mem::transmute(objc::msg::entry()) };
+    values.sort_by(|a, b| {
+        for descriptor in &descriptors {
+            // SAFETY: a descriptor the array holds, and two of the sorted objects.
+            match unsafe { send(*descriptor as Id, compare, *a as Id, *b as Id) } {
+                ..0 => return std::cmp::Ordering::Less,
+                0 => continue,
+                _ => return std::cmp::Ordering::Greater,
+            }
+        }
+        std::cmp::Ordering::Equal
+    });
+}
+
+/// `-[NSArray sortedArrayUsingDescriptors:]`.
+unsafe extern "C" fn sorted_array_using_descriptors(
+    receiver: Id,
+    _sel: Sel,
+    descriptors: Id,
+) -> Id {
+    // SAFETY: an array.
+    let Some(array) = (unsafe { collections::array(receiver as CFTypeRef) }) else {
+        return std::ptr::null_mut();
+    };
+    let mut values = array.values.clone();
+    sort_by_descriptors(&mut values, descriptors);
+    // SAFETY: a fresh array follows the convenience-constructor rule.
+    unsafe {
+        api::CFAutorelease(collections::new_array(
+            &values,
+            Policy::from_type_callbacks(),
+            false,
+        )) as Id
+    }
+}
+
+/// `-[NSMutableArray sortUsingDescriptors:]`.
+unsafe extern "C" fn sort_using_descriptors(receiver: Id, _sel: Sel, descriptors: Id) {
     // SAFETY: an array.
     let Some(array) = (unsafe { collections::array(receiver as CFTypeRef) }) else {
         return;
     };
     if !array.mutable {
-        immutable("NSArray", "sortUsingComparator:");
+        immutable("NSArray", "sortUsingDescriptors:");
     }
-    // Sorted out of place: the block may read the array it is sorting.
+    // Sorted out of place, as `-sortUsingFunction:context:` is.
     let mut values = array.values.clone();
-    // SAFETY: null or an `NSComparator`.
-    if !unsafe { sort_by_comparator(&mut values, block) } {
-        return;
-    }
-    // SAFETY: the same array; the block is done with it.
+    sort_by_descriptors(&mut values, descriptors);
+    // SAFETY: the same array; the descriptors are done with it.
     if let Some(array) = unsafe { collections::array(receiver as CFTypeRef) } {
         array.values = values;
     }
@@ -1222,6 +1270,68 @@ unsafe extern "C" fn contains_object(receiver: Id, _sel: Sel, object: Id) -> boo
     a.values
         .iter()
         .any(|v| a.policy.equal(*v, object as CFTypeRef))
+}
+
+/// `-enumerateObjectsWithOptions:usingBlock:`, serially and over a copy, so
+/// the block may change the array. Serial is a valid answer to
+/// `NSEnumerationConcurrent`, which only permits concurrency.
+unsafe extern "C" fn enumerate_objects_with_options(
+    receiver: Id,
+    _sel: Sel,
+    options: usize,
+    block: Id,
+) {
+    let Some(array) = (unsafe { collections::array(receiver as CFTypeRef) }) else {
+        return;
+    };
+    // SAFETY: null or a block.
+    let Some(invoke) = (unsafe { objc::block::invoke(block) }) else {
+        return;
+    };
+    // SAFETY: the block is `void (^)(id, NSUInteger, BOOL *)`.
+    let call: unsafe extern "C" fn(Id, Id, usize, *mut bool) =
+        unsafe { std::mem::transmute(invoke) };
+    let values = array.values.clone();
+    let order: Box<dyn Iterator<Item = usize>> = match options & ENUMERATION_REVERSE {
+        0 => Box::new(0..values.len()),
+        _ => Box::new((0..values.len()).rev()),
+    };
+    let mut stop = false;
+    for at in order {
+        // SAFETY: as above; `stop` outlives the call.
+        unsafe { call(block, values[at] as Id, at, &mut stop) };
+        if stop {
+            break;
+        }
+    }
+}
+
+unsafe extern "C" fn enumerate_objects(receiver: Id, sel: Sel, block: Id) {
+    unsafe { enumerate_objects_with_options(receiver, sel, 0, block) };
+}
+
+/// `-makeObjectsPerformSelector:withObject:`, over a copy so the selector may
+/// change the array.
+unsafe extern "C" fn make_objects_perform_with(
+    receiver: Id,
+    _sel: Sel,
+    selector: Sel,
+    argument: Id,
+) {
+    let Some(a) = (unsafe { collections::array(receiver as CFTypeRef) }) else {
+        return;
+    };
+    let values = a.values.clone();
+    // SAFETY: the selector takes at most one object, which Apple requires.
+    let send: unsafe extern "C" fn(Id, Sel, Id) =
+        unsafe { std::mem::transmute(objc::msg::entry()) };
+    for value in values {
+        unsafe { send(value as Id, selector, argument) };
+    }
+}
+
+unsafe extern "C" fn make_objects_perform(receiver: Id, sel: Sel, selector: Sel) {
+    unsafe { make_objects_perform_with(receiver, sel, selector, std::ptr::null_mut()) };
 }
 
 unsafe extern "C" fn index_of_object(receiver: Id, _sel: Sel, object: Id) -> usize {
@@ -2530,23 +2640,41 @@ number_init! {
     number_init_float => number_with_float: f32,
 }
 
-unsafe extern "C" fn set_with_object(_class: Id, _sel: Sel, object: Id) -> Id {
+unsafe extern "C" fn set_with_object(class: Id, _sel: Sel, object: Id) -> Id {
     let values: &[CFTypeRef] = match object.is_null() {
         true => &[],
         false => &[object as CFTypeRef],
     };
     // SAFETY: a fresh object.
-    unsafe { api::CFAutorelease(collections::new_set(values, Policy::from_type_callbacks())) as Id }
+    unsafe {
+        api::CFAutorelease(collections::new_set(
+            values,
+            Policy::from_type_callbacks(),
+            mutable_receiver(class, c"NSMutableSet"),
+        )) as Id
+    }
 }
 
-unsafe extern "C" fn empty_set(_class: Id, _sel: Sel) -> Id {
+unsafe extern "C" fn empty_set(class: Id, _sel: Sel) -> Id {
     // SAFETY: a fresh object.
-    unsafe { api::CFAutorelease(collections::new_set(&[], Policy::from_type_callbacks())) as Id }
+    unsafe {
+        api::CFAutorelease(collections::new_set(
+            &[],
+            Policy::from_type_callbacks(),
+            mutable_receiver(class, c"NSMutableSet"),
+        )) as Id
+    }
 }
 
-unsafe extern "C" fn set_with_capacity(_class: Id, _sel: Sel, _capacity: usize) -> Id {
+unsafe extern "C" fn set_with_capacity(class: Id, _sel: Sel, _capacity: usize) -> Id {
     // SAFETY: a fresh object.
-    unsafe { api::CFAutorelease(collections::new_set(&[], Policy::from_type_callbacks())) as Id }
+    unsafe {
+        api::CFAutorelease(collections::new_set(
+            &[],
+            Policy::from_type_callbacks(),
+            mutable_receiver(class, c"NSMutableSet"),
+        )) as Id
+    }
 }
 
 /// `-initWithCapacity:`, where the capacity is a hint this store has no use for.
@@ -2560,24 +2688,30 @@ unsafe extern "C" fn init_mutable_set_with_capacity(
     // SAFETY: as above, with a fresh empty set.
     unsafe {
         cluster_init(receiver, known, || {
-            collections::new_set(&[], Policy::from_type_callbacks())
+            collections::new_set(&[], Policy::from_type_callbacks(), true)
         })
     }
 }
 
-unsafe extern "C" fn set_with_array(_class: Id, _sel: Sel, array: Id) -> Id {
+unsafe extern "C" fn set_with_array(class: Id, _sel: Sel, array: Id) -> Id {
     // SAFETY: the argument is an NSArray or nil.
     let values = unsafe { collections::array(array as CFTypeRef) }
         .map(|array| array.values.as_slice())
         .unwrap_or(&[]);
     // SAFETY: the new set retains its elements.
-    unsafe { api::CFAutorelease(collections::new_set(values, Policy::from_type_callbacks())) as Id }
+    unsafe {
+        api::CFAutorelease(collections::new_set(
+            values,
+            Policy::from_type_callbacks(),
+            mutable_receiver(class, c"NSMutableSet"),
+        )) as Id
+    }
 }
 
 /// `+setWithObjects:count:`, which the nil-terminated `+setWithObjects:` is
 /// rewritten into.
 unsafe extern "C" fn set_with_objects_count(
-    _class: Id,
+    class: Id,
     _sel: Sel,
     objects: *const Id,
     count: usize,
@@ -2588,7 +2722,13 @@ unsafe extern "C" fn set_with_objects_count(
         false => unsafe { std::slice::from_raw_parts(objects as *const CFTypeRef, count) },
     };
     // SAFETY: the new set retains its elements, keeping the first of equals.
-    unsafe { api::CFAutorelease(collections::new_set(values, Policy::from_type_callbacks())) as Id }
+    unsafe {
+        api::CFAutorelease(collections::new_set(
+            values,
+            Policy::from_type_callbacks(),
+            mutable_receiver(class, c"NSMutableSet"),
+        )) as Id
+    }
 }
 
 unsafe extern "C" fn set_init_with_objects_count(
@@ -2597,9 +2737,10 @@ unsafe extern "C" fn set_init_with_objects_count(
     objects: *const Id,
     count: usize,
 ) -> Id {
+    let class = class_of_placeholder(receiver);
     objc::arc::release(receiver);
     // SAFETY: forwarded; the answer is autoreleased and the caller owns an init.
-    objc::arc::retain(unsafe { set_with_objects_count(receiver, sel, objects, count) })
+    objc::arc::retain(unsafe { set_with_objects_count(class, sel, objects, count) })
 }
 
 /// `-initWithArray:` and `-initWithSet:`.
@@ -2644,21 +2785,29 @@ unsafe extern "C" fn set_add_object(receiver: Id, _sel: Sel, object: Id) {
 
 /// `-copy` and `-mutableCopy` of a set: a new set of the same objects, for the
 /// same reason as [`copy_array`].
-fn copy_set(receiver: Id) -> Id {
+fn copy_set(receiver: Id, mutable: bool) -> Id {
     // SAFETY: the receiver is a set.
     let Some(set) = (unsafe { collections::set(receiver as CFTypeRef) }) else {
         return std::ptr::null_mut();
     };
     let values = set.values().to_vec();
-    collections::new_set(&values, Policy::from_type_callbacks()) as Id
+    collections::new_set(&values, Policy::from_type_callbacks(), mutable) as Id
 }
 
 unsafe extern "C" fn set_copy(receiver: Id, _sel: Sel) -> Id {
-    copy_set(receiver)
+    copy_set(receiver, false)
 }
 
 unsafe extern "C" fn set_copy_with_zone(receiver: Id, _sel: Sel, _zone: *const ()) -> Id {
-    copy_set(receiver)
+    copy_set(receiver, false)
+}
+
+unsafe extern "C" fn set_mutable_copy(receiver: Id, _sel: Sel) -> Id {
+    copy_set(receiver, true)
+}
+
+unsafe extern "C" fn set_mutable_copy_with_zone(receiver: Id, _sel: Sel, _zone: *const ()) -> Id {
+    copy_set(receiver, true)
 }
 
 /// The set's members, as a fresh autoreleased array.
@@ -2730,7 +2879,11 @@ unsafe fn set_adding(receiver: Id, extra: &[CFTypeRef]) -> Id {
     // SAFETY: a fresh object holding live ones; it keeps the first of equals,
     // so the receiver's own members.
     unsafe {
-        api::CFAutorelease(collections::new_set(&values, Policy::from_type_callbacks())) as Id
+        api::CFAutorelease(collections::new_set(
+            &values,
+            Policy::from_type_callbacks(),
+            false,
+        )) as Id
     }
 }
 
@@ -2891,8 +3044,8 @@ pub(crate) fn install() {
         "countByEnumeratingWithState:objects:count:" => set_enumerate, c"Q40@0:8^{?=Q^@^QQ5}16^@24Q32";
         "copy" => set_copy, c"@16@0:8";
         "copyWithZone:" => set_copy_with_zone, c"@24@0:8^v16";
-        "mutableCopy" => set_copy, c"@16@0:8";
-        "mutableCopyWithZone:" => set_copy_with_zone, c"@24@0:8^v16";
+        "mutableCopy" => set_mutable_copy, c"@16@0:8";
+        "mutableCopyWithZone:" => set_mutable_copy_with_zone, c"@24@0:8^v16";
     });
     let mutable_set = objc::class::lookup(c"NSMutableSet").expect("NSMutableSet");
     methods!(mutable_set, {
@@ -2934,6 +3087,10 @@ pub(crate) fn install() {
         "containsObject:" => contains_object, c"B24@0:8@16";
         "indexOfObject:" => index_of_object, c"Q24@0:8@16";
         "indexOfObjectIdenticalTo:" => index_of_object_identical_to, c"Q24@0:8@16";
+        "makeObjectsPerformSelector:" => make_objects_perform, c"v24@0:8:16";
+        "enumerateObjectsUsingBlock:" => enumerate_objects, c"v24@0:8@?16";
+        "enumerateObjectsWithOptions:usingBlock:" => enumerate_objects_with_options, c"v32@0:8Q16@?24";
+        "makeObjectsPerformSelector:withObject:" => make_objects_perform_with, c"v32@0:8:16@24";
         "firstObject" => first_object, c"@16@0:8";
         "lastObject" => last_object, c"@16@0:8";
         "componentsJoinedByString:" => components_joined_by_string, c"@24@0:8@16";
@@ -2941,6 +3098,7 @@ pub(crate) fn install() {
         "sortedArrayUsingSelector:" => sorted_array_using_selector, c"@24@0:8:16";
         "sortedArrayUsingComparator:" => sorted_array_using_comparator, c"@24@0:8@?16";
         "sortedArrayUsingFunction:context:" => sorted_array_using_function, c"@32@0:8^?16^v24";
+        "sortedArrayUsingDescriptors:" => sorted_array_using_descriptors, c"@24@0:8@16";
         "indexOfObjectWithOptions:passingTest:" => index_of_object_with_options_passing_test, c"Q32@0:8Q16@?24";
         "countByEnumeratingWithState:objects:count:" => array_enumerate, c"Q40@0:8^{?=Q^@^QQ5}16^@24Q32";
         "description" => array_description, c"@16@0:8";
@@ -2978,6 +3136,7 @@ pub(crate) fn install() {
         "replaceObjectAtIndex:withObject:" => replace_object_at_index, c"v32@0:8Q16@24";
         "setObject:atIndexedSubscript:" => set_object_at_indexed_subscript, c"v32@0:8@16Q24";
         "sortUsingFunction:context:" => sort_using_function, c"v32@0:8^?16^v24";
+        "sortUsingDescriptors:" => sort_using_descriptors, c"v24@0:8@16";
         "sortUsingComparator:" => sort_using_comparator, c"v24@0:8@?16";
         "removeAllObjects" => remove_all_objects, c"v16@0:8";
         "setArray:" => set_array, c"v24@0:8@16";
@@ -3166,6 +3325,26 @@ pub(crate) fn install() {
     });
 }
 
+unsafe extern "C" fn sort_using_comparator(receiver: Id, _sel: Sel, block: Id) {
+    // SAFETY: an array.
+    let Some(array) = (unsafe { collections::array(receiver as CFTypeRef) }) else {
+        return;
+    };
+    if !array.mutable {
+        immutable("NSArray", "sortUsingComparator:");
+    }
+    // Sorted out of place: the block may read the array it is sorting.
+    let mut values = array.values.clone();
+    // SAFETY: null or an `NSComparator`.
+    if !unsafe { sort_by_comparator(&mut values, block) } {
+        return;
+    }
+    // SAFETY: the same array; the block is done with it.
+    if let Some(array) = unsafe { collections::array(receiver as CFTypeRef) } {
+        array.values = values;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3242,7 +3421,8 @@ mod tests {
     fn copying_a_set_leaves_the_copy_alone_when_the_original_changes() {
         crate::bootstrap();
         let (a, b) = (crate::string::from_str("a"), crate::string::from_str("b"));
-        let set = collections::new_set(&[a as CFTypeRef], Policy::from_type_callbacks()) as Id;
+        let set =
+            collections::new_set(&[a as CFTypeRef], Policy::from_type_callbacks(), false) as Id;
         let sel = objc::sel::get("copyWithZone:");
         // SAFETY: a set this test made, so a class it has.
         let class = unsafe { objc::object::class_of(set) }.expect("a set");
@@ -3312,6 +3492,7 @@ mod tests {
         let set = collections::new_set(
             &[a as CFTypeRef, b as CFTypeRef, c as CFTypeRef],
             Policy::from_type_callbacks(),
+            false,
         ) as Id;
         let other_b = crate::string::from_str("b");
         let others = collections::new_array(

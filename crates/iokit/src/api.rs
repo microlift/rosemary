@@ -446,6 +446,10 @@ element_field!(/// The lowest value this element reports.
     IOHIDElementGetLogicalMin, CFIndex, |e: &crate::hid::Element| e.logical_min as CFIndex, 0);
 element_field!(/// The highest.
     IOHIDElementGetLogicalMax, CFIndex, |e: &crate::hid::Element| e.logical_max as CFIndex, 0);
+element_field!(/// Bits this element occupies in one report.
+    IOHIDElementGetReportSize, u32, |e: &crate::hid::Element| e.report_size_bits(), 0);
+element_field!(/// How many report-size-wide fields this element has.
+    IOHIDElementGetReportCount, u32, |e: &crate::hid::Element| e.report_count(), 0);
 
 pub unsafe extern "C" fn IOHIDElementGetDevice(element: *const c_void) -> CFTypeRef {
     unsafe { value::element(element) }.map_or(std::ptr::null(), |(device, _)| {
@@ -575,6 +579,7 @@ pub unsafe extern "C" fn IOHIDManagerCopyDevices(manager: CFTypeRef) -> CFTypeRe
     collections::new_set(
         &handles,
         corefoundation::callbacks::Policy::from_type_callbacks(),
+        false,
     )
 }
 

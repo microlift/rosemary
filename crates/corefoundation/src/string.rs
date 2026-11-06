@@ -581,6 +581,41 @@ pub unsafe fn new_mutable_in(class: &'static Class) -> CFTypeRef {
     object.cast()
 }
 
+/// Build a mutable string that starts out aliasing a caller-supplied buffer of
+/// UTF-16 code units, as `CFStringCreateMutableWithExternalCharactersNoCopy`
+/// does - `chars` is read directly rather than copied in, and `str` is left
+/// without [`OWNED`] so [`release_storage`] never frees someone else's memory.
+///
+/// FIXME (ACCURACY): real CoreFoundation keeps writing into `chars` - up to
+/// `capacity`, or without bound if it is zero - until the buffer is replaced
+/// outright. Every mutation in this file instead takes its own copy the first
+/// time it needs to grow (`set_utf16`'s ordinary path), which stops aliasing
+/// `chars` from then on rather than writing through to it. A caller that only
+/// ever reads the `CFStringRef` back sees the right characters either way;
+/// one that reads `chars` itself after mutating the string will not.
+///
+/// # Safety
+///
+/// `chars` must be null (with `num_chars` zero) or point at `num_chars` live
+/// `UniChar`s that outlive every read of the string before its first mutation.
+pub unsafe fn new_mutable_with_external_characters(
+    chars: *const u16,
+    num_chars: CFIndex,
+) -> CFTypeRef {
+    let object: *mut CFString = unsafe { crate::base::allocate(class()) };
+    if object.is_null() {
+        return std::ptr::null();
+    }
+    let length = if chars.is_null() { 0 } else { num_chars.max(0) };
+    // SAFETY: a fresh `__NSCFString`, not yet visible to anything else.
+    unsafe {
+        (*object).flags = MUTABLE | WIDE;
+        (*object).str = chars.cast();
+        (*object).length = length as i64;
+    }
+    object.cast()
+}
+
 /// Whether `string` may be changed.
 ///
 /// # Safety

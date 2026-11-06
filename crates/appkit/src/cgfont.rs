@@ -486,6 +486,21 @@ pub unsafe extern "C" fn CGFontCopyTableForTag(font: CFTypeRef, tag: u32) -> CFT
     unsafe { coretext::CTFontCopyTable(font, tag, 0) }
 }
 
+/// `CGGlyph CGFontGetGlyphWithGlyphName(CGFontRef, CFStringRef)`: a glyph by
+/// its PostScript name, read out of the face's `post` table (or its CFF
+/// charset, for a CFF-flavored face) by `ttf-parser` - the same lookup
+/// `-glyphWithName:` would do. 0, the `.notdef` glyph, for a name the face
+/// does not have.
+pub unsafe extern "C" fn CGFontGetGlyphWithGlyphName(font: CFTypeRef, name: CFTypeRef) -> u16 {
+    let Some(face) = coretext::loaded(font) else {
+        return 0;
+    };
+    let Some(name) = text(name) else {
+        return 0;
+    };
+    face.face().glyph_index_by_name(&name).map_or(0, |g| g.0)
+}
+
 /// `CFIndex CTFontGetGlyphCount(CTFontRef)`
 pub unsafe extern "C" fn CTFontGetGlyphCount(font: CFTypeRef) -> isize {
     coretext::loaded(font).map_or(0, |face| face.face().number_of_glyphs() as isize)
@@ -633,6 +648,7 @@ exports::exports! {
         "CGFontGetXHeight" => CGFontGetXHeight,
         "CGFontGetGlyphAdvances" => CGFontGetGlyphAdvances,
         "CGFontCopyTableForTag" => CGFontCopyTableForTag,
+        "CGFontGetGlyphWithGlyphName" => CGFontGetGlyphWithGlyphName,
         "CTFontCreateWithPlatformFont" => CTFontCreateWithPlatformFont,
         "CTFontGetPlatformFont" => CTFontGetPlatformFont,
         "CTFontGetGlyphCount" => CTFontGetGlyphCount,
@@ -697,5 +713,64 @@ mod tests {
         let status =
             unsafe { ATSFontGetTable(u32::MAX, 0, 0, 0, std::ptr::null_mut(), &mut length) };
         assert_eq!(status, INVALID_FONT_ACCESS);
+    }
+
+    /// A font built from the first system face found, or a graceful skip - the
+    /// pattern [`a_reference_round_trips_to_its_face`] already uses for a host
+    /// with no fonts installed.
+    fn test_font() -> Option<CFTypeRef> {
+        let face = fonts::all_faces().into_iter().next()?;
+        let name = foundation::string::from_str(&face.postscript);
+        // SAFETY: a string this call made.
+        let font =
+            unsafe { coretext::CTFontCreateWithName(name as CFTypeRef, 12.0, std::ptr::null()) };
+        objc::arc::release(name);
+        (!font.is_null()).then_some(font)
+    }
+
+    #[test]
+    fn a_named_glyph_round_trips_through_the_post_table() {
+        let Some(font) = test_font() else {
+            eprintln!("skipped: no fonts on this host");
+            return;
+        };
+        let loaded = coretext::loaded(font).expect("just built from a real face");
+        // Glyph 0 is always `.notdef`; look past it for a name that tells
+        // apart "found" from "answered the not-found sentinel", since both
+        // happen to be glyph 0.
+        let named = (1..loaded.face().number_of_glyphs()).find_map(|id| {
+            loaded
+                .face()
+                .glyph_name(owned_ttf_parser::GlyphId(id))
+                .map(|name| (id, name.to_string()))
+        });
+        let Some((id, glyph_name)) = named else {
+            eprintln!("skipped: no face here names a glyph past .notdef");
+            // SAFETY: owned by this test.
+            unsafe { corefoundation::api::CFRelease(font) };
+            return;
+        };
+        let name = foundation::string::from_str(&glyph_name);
+        // SAFETY: `name` and `font` are both live.
+        let glyph = unsafe { CGFontGetGlyphWithGlyphName(font, name as CFTypeRef) };
+        objc::arc::release(name);
+        // SAFETY: owned by this test.
+        unsafe { corefoundation::api::CFRelease(font) };
+        assert_eq!(glyph, id);
+    }
+
+    #[test]
+    fn a_name_no_glyph_has_answers_notdef() {
+        let Some(font) = test_font() else {
+            eprintln!("skipped: no fonts on this host");
+            return;
+        };
+        let name = foundation::string::from_str("not-a-real-glyph-name-at-all");
+        // SAFETY: `name` and `font` are both live.
+        let glyph = unsafe { CGFontGetGlyphWithGlyphName(font, name as CFTypeRef) };
+        objc::arc::release(name);
+        // SAFETY: owned by this test.
+        unsafe { corefoundation::api::CFRelease(font) };
+        assert_eq!(glyph, 0);
     }
 }

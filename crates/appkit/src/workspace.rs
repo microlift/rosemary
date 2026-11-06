@@ -10,6 +10,11 @@ pub const WILL_SLEEP: &str = "NSWorkspaceWillSleepNotification";
 pub const DID_WAKE: &str = "NSWorkspaceDidWakeNotification";
 pub const SCREENS_DID_SLEEP: &str = "NSWorkspaceScreensDidSleepNotification";
 pub const SCREENS_DID_WAKE: &str = "NSWorkspaceScreensDidWakeNotification";
+/// Posted by nothing here: there is no removable-volume tracking to notice a
+/// mount or unmount with. Published anyway, for the reason every name in
+/// `crate::NOTIFICATION_NAMES` is.
+pub const DID_MOUNT: &str = "NSWorkspaceDidMountNotification";
+pub const DID_UNMOUNT: &str = "NSWorkspaceDidUnmountNotification";
 
 /// The `NSWorkspaceLaunchConfiguration...` keys, published as data in
 /// `crate::STRING_GLOBALS`.
@@ -17,6 +22,11 @@ pub const LAUNCH_ARGUMENTS: &str = "NSWorkspaceLaunchConfigurationArguments";
 pub const LAUNCH_ENVIRONMENT: &str = "NSWorkspaceLaunchConfigurationEnvironment";
 pub const LAUNCH_APPLE_EVENT: &str = "NSWorkspaceLaunchConfigurationAppleEvent";
 pub const LAUNCH_ARCHITECTURE: &str = "NSWorkspaceLaunchConfigurationArchitecture";
+
+/// `NSWorkspaceRecycleOperation`, a deprecated `-performFileOperation:`
+/// operation type whose value is its own name, like the pasteboard types
+/// `crate::STRING_GLOBALS` publishes the same way.
+pub const RECYCLE_OPERATION: &str = "NSWorkspaceRecycleOperation";
 
 /// What an `NSRunningApplication` for a process this one launched knows about
 /// it, by object address. Anything not listed here is this process.
@@ -170,6 +180,132 @@ unsafe extern "C" fn workspace_running_applications(_receiver: Id, _sel: Sel) ->
         }
     }
     autoreleased_array(&objects)
+}
+
+/// One entry of `-launchedApplications`, or `-activeApplication`'s answer.
+///
+/// Apple's keys: `NSApplicationPath`, `NSApplicationName`,
+/// `NSApplicationBundleIdentifier`, `NSApplicationProcessIdentifier` and the two
+/// halves of the process serial number. A missing name or identifier leaves its
+/// key out, as Apple does for an executable outside a bundle.
+// FIXME (ACCURACY): there are no process serial numbers here; the low half is
+// the pid and the high half zero, which is unique and stable for the process.
+fn application_dictionary(
+    pid: i32,
+    path: Option<&str>,
+    name: Option<Id>,
+    identifier: Option<Id>,
+) -> Id {
+    use corefoundation::collections::{Number, new_number};
+    let key = |text: &str| foundation::string::from_str(text) as corefoundation::base::CFTypeRef;
+    let mut owned = Vec::new();
+    let mut pairs = Vec::new();
+    let mut push = |k: &str, v: corefoundation::base::CFTypeRef, release: bool| {
+        let k = key(k);
+        owned.push(k);
+        if release {
+            owned.push(v);
+        }
+        pairs.push((k, v));
+    };
+    if let Some(path) = path {
+        push(
+            "NSApplicationPath",
+            foundation::string::from_str(path) as _,
+            true,
+        );
+    }
+    if let Some(name) = name.filter(|n| !n.is_null()) {
+        push("NSApplicationName", name as _, false);
+    }
+    if let Some(identifier) = identifier.filter(|i| !i.is_null()) {
+        push("NSApplicationBundleIdentifier", identifier as _, false);
+    }
+    push(
+        "NSApplicationProcessIdentifier",
+        new_number(Number::Integer(pid.into())),
+        true,
+    );
+    push(
+        "NSApplicationProcessSerialNumberHigh",
+        new_number(Number::Integer(0)),
+        true,
+    );
+    push(
+        "NSApplicationProcessSerialNumberLow",
+        new_number(Number::Integer(pid.into())),
+        true,
+    );
+    let dictionary = corefoundation::collections::new_dictionary(
+        &pairs,
+        corefoundation::callbacks::Policy::from_key_callbacks(),
+        corefoundation::callbacks::Policy::from_type_callbacks(),
+        false,
+    );
+    for object in owned {
+        // SAFETY: each was created above and is now held by the dictionary.
+        unsafe { corefoundation::api::CFRelease(object) };
+    }
+    // SAFETY: a fresh CFDictionary, toll-free bridged to NSDictionary.
+    unsafe { corefoundation::api::CFAutorelease(dictionary) as Id }
+}
+
+/// This process's entry, from its main bundle.
+fn current_dictionary() -> Id {
+    let path = foundation::bundle::main()
+        .and_then(|b| prefix::ns::to_guest(&b.root))
+        .map(|p| p.to_string_lossy().into_owned());
+    let me = current();
+    // SAFETY: `me` is an `NSRunningApplication`, which both accessors take.
+    let (name, identifier) = unsafe {
+        (
+            localized_name(me, objc::sel::get("localizedName")),
+            bundle_identifier(me, objc::sel::get("bundleIdentifier")),
+        )
+    };
+    application_dictionary(
+        std::process::id() as i32,
+        path.as_deref(),
+        Some(name),
+        Some(identifier),
+    )
+}
+
+/// `-[NSWorkspace launchedApplications]`: what `-runningApplications` lists, as
+/// the dictionaries this older call answers with.
+unsafe extern "C" fn launched_applications(_receiver: Id, _sel: Sel) -> Id {
+    let mut entries = vec![current_dictionary()];
+    let me = std::process::id() as i32;
+    for application in server::client::applications(None).unwrap_or_default() {
+        if application.pid == me {
+            continue;
+        }
+        let name = application.name.as_deref().map(autoreleased);
+        let identifier = application.identifier.as_deref().map(autoreleased);
+        entries.push(application_dictionary(
+            application.pid,
+            Some(&application.bundle),
+            name,
+            identifier,
+        ));
+    }
+    autoreleased_array(&entries)
+}
+
+/// `-[NSWorkspace activeApplication]`: this process, as `-frontmostApplication`.
+unsafe extern "C" fn active_application(_receiver: Id, _sel: Sel) -> Id {
+    current_dictionary()
+}
+
+/// `-[NSWorkspace mountedLocalVolumePaths]`: the root, the one mount
+/// `getfsstat` reports here too.
+unsafe extern "C" fn mounted_local_volume_paths(_receiver: Id, _sel: Sel) -> Id {
+    autoreleased_array(&[autoreleased("/")])
+}
+
+/// `-[NSWorkspace mountedRemovableMedia]`: none.
+unsafe extern "C" fn mounted_removable_media(_receiver: Id, _sel: Sel) -> Id {
+    autoreleased_array(&[])
 }
 
 fn autoreleased_array(objects: &[Id]) -> Id {
@@ -560,6 +696,10 @@ pub(crate) fn install() {
         "notificationCenter" => notification_center, c"@16@0:8";
         "frontmostApplication" => frontmost_application, c"@16@0:8";
         "runningApplications" => workspace_running_applications, c"@16@0:8";
+        "launchedApplications" => launched_applications, c"@16@0:8";
+        "activeApplication" => active_application, c"@16@0:8";
+        "mountedLocalVolumePaths" => mounted_local_volume_paths, c"@16@0:8";
+        "mountedRemovableMedia" => mounted_removable_media, c"@16@0:8";
         "launchApplicationAtURL:options:configuration:error:" => launch_application,
             c"@48@0:8@16Q24@32^@40";
         "iconForFileType:" => icon_for_file_type, c"@24@0:8@16";
@@ -629,7 +769,12 @@ mod tests {
         let contents = unsafe { corefoundation::url::as_url(file) }.unwrap();
         assert_eq!(
             open_target(contents),
-            Some("file:///tmp/a%20file.txt".to_string())
+            Some(format!(
+                "file://{}",
+                prefix::ns::host_path("/tmp/a file.txt")
+                    .to_string_lossy()
+                    .replace(' ', "%20")
+            ))
         );
         unsafe { corefoundation::api::CFRelease(file) };
     }
@@ -649,7 +794,12 @@ mod tests {
         let contents = unsafe { corefoundation::url::as_url(url as _) }.unwrap();
         assert_eq!(
             open_target(contents),
-            Some("file:///Applications/Some%20App.app/".to_string())
+            Some(format!(
+                "file://{}/",
+                prefix::ns::host_path("/Applications/Some App.app")
+                    .to_string_lossy()
+                    .replace(' ', "%20")
+            ))
         );
         // SAFETY: as above.
         let hidden = unsafe { running_is_hidden(object, objc::sel::get("isHidden")) };
@@ -724,5 +874,29 @@ mod tests {
             array.values,
             vec![current as corefoundation::base::CFTypeRef]
         );
+    }
+
+    #[test]
+    fn launched_applications_describes_this_process_first() {
+        crate::bootstrap();
+        // SAFETY: both take no explicit arguments.
+        let list = unsafe {
+            launched_applications(std::ptr::null_mut(), objc::sel::get("launchedApplications"))
+        };
+        let active = unsafe {
+            active_application(std::ptr::null_mut(), objc::sel::get("activeApplication"))
+        };
+        // SAFETY: the answer is a CFArray of CFDictionaries.
+        let array = unsafe { corefoundation::collections::array(list as *const _) }.unwrap();
+        for dictionary in [array.values[0], active as corefoundation::base::CFTypeRef] {
+            let key = foundation::string::from_str("NSApplicationProcessIdentifier");
+            let value = unsafe { corefoundation::api::CFDictionaryGetValue(dictionary, key as _) };
+            assert!(matches!(
+                unsafe { corefoundation::collections::number(value) },
+                Some(corefoundation::collections::Number::Integer(pid))
+                    if pid == i64::from(std::process::id())
+            ));
+            unsafe { corefoundation::api::CFRelease(key as _) };
+        }
     }
 }

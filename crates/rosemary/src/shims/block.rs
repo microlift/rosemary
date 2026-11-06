@@ -290,6 +290,22 @@ fn dispatch_group_async(
     Ok(())
 }
 
+/// `void dispatch_apply(size_t iterations, dispatch_queue_t, void (^block)(size_t))`
+fn dispatch_apply(
+    symbol: &str,
+    ctx: &mut RegisterContext,
+    mem: &mut dyn GuestMemory,
+    callbacks: &dyn Callbacks,
+) -> Result<()> {
+    let (iterations, queue, block) = (ctx.rdi, ctx.rsi, ctx.rdx);
+    if block == 0 {
+        return Err(bad_pointer(symbol, 0));
+    }
+    substitute_block(symbol, block, mem, callbacks)?;
+    call_block(symbol, host_or_refuse(symbol)?, &[iterations, queue, block]);
+    Ok(())
+}
+
 /// `CFRunLoopObserverRef CFRunLoopObserverCreateWithHandler(CFAllocatorRef allocator,
 /// CFOptionFlags activities, Boolean repeats, CFIndex order, void
 /// (^block)(CFRunLoopObserverRef, CFRunLoopActivity))`
@@ -342,9 +358,10 @@ fn dispatch_data_create(
 }
 
 /// `void nw_path_monitor_set_update_handler(nw_path_monitor_t, block)`, its
-/// cancel-handler twin, and `void nw_path_enumerate_interfaces(nw_path_t,
-/// block)`: an object, then a block that is copied for later or run before
-/// the call returns. A nil block is legal for the two setters.
+/// cancel-handler twin, `void nw_path_enumerate_interfaces(nw_path_t, block)`
+/// and the two dispatch source handler setters: an object, then a block that
+/// is copied for later or run before the call returns. A nil block is legal
+/// for the setters.
 fn object_and_block(
     symbol: &str,
     ctx: &mut RegisterContext,
@@ -399,6 +416,8 @@ pub fn shim_for(name: &str) -> Option<Shim> {
         "dispatch_group_async" => {
             Some(bind!(callback "dispatch_group_async" => dispatch_group_async))
         }
+        "dispatch_apply" => Some(bind!(callback "dispatch_apply" => dispatch_apply)),
+
         "CFRunLoopPerformBlock" => {
             Some(bind!(callback "CFRunLoopPerformBlock" => run_loop_perform_block))
         }

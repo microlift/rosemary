@@ -230,14 +230,15 @@ pub fn drain_main() -> bool {
     };
     let mut ran = false;
     while budget > 0 {
-        let Some(item) = main
-            .state
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .pending
-            .pop_front()
-        else {
-            break;
+        let item = {
+            let mut state = main.state.lock().unwrap_or_else(|e| e.into_inner());
+            if state.suspended > 0 {
+                return ran;
+            }
+            state.pending.pop_front()
+        };
+        let Some(item) = item else {
+            return ran;
         };
         budget -= 1;
         ran = true;
@@ -849,6 +850,10 @@ fn arm(deadline: u64, handle: u64, work: Work) {
     }
     // SAFETY: the queue must outlive the wait, so the timer holds a reference.
     object::retain(handle);
+    push_timer(deadline, handle, work);
+}
+
+fn push_timer(deadline: u64, handle: u64, work: Work) {
     start_timer_thread();
     let timers = timers();
     let mut state = timers.state.lock().unwrap_or_else(|e| e.into_inner());
@@ -1140,6 +1145,29 @@ mod tests {
         };
         std::thread::sleep(std::time::Duration::from_millis(10));
         assert_eq!(counter.load(Ordering::Acquire), 0, "fired early");
+        wait_for(&counter, 1);
+        // SAFETY: giving up the create reference.
+        unsafe { object::release(q) };
+    }
+
+    #[test]
+    fn a_suspended_queue_holds_its_work_until_resumed() {
+        let counter = AtomicU32::new(0);
+        let q = create_serial("suspend test");
+        // SAFETY: a live queue, a host function, and a counter that outlives the wait.
+        unsafe {
+            object::suspend_entry(q);
+            object::suspend_entry(q);
+            async_f(
+                q,
+                &counter as *const _ as u64,
+                bump as *const () as usize as u64,
+            );
+            object::resume_entry(q);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(30));
+        assert_eq!(counter.load(Ordering::Acquire), 0, "ran while suspended");
+        unsafe { object::resume_entry(q) };
         wait_for(&counter, 1);
         // SAFETY: giving up the create reference.
         unsafe { object::release(q) };

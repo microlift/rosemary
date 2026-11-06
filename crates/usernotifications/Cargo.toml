@@ -1,0 +1,12 @@
+[package]
+name = "usernotifications"
+description = "UserNotifications framework with notifications disabled"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+objc.workspace = true
+corefoundation.workspace = true
+foundation.workspace = true
+darwin.workspace = true

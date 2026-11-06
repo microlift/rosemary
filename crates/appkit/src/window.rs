@@ -95,11 +95,21 @@ pub struct Window {
     window_controller: Id,
     /// `-setHidesOnDeactivate:`, kept so a program reads back what it set.
     hides_on_deactivate: usize,
-    /// `-setExcludedFromWindowsMenu:`, likewise; no Windows menu lists windows.
-    excluded_from_windows_menu: usize,
     /// When this window was last ordered front, from [`ORDERED`]: the stacking
     /// order, which creation order is not.
     ordered: u64,
+    /// `-setExcludedFromWindowsMenu:`. Nothing here builds a Windows menu to
+    /// leave the window out of; stored only so a program's own read-back
+    /// agrees with what it set.
+    excluded_from_windows_menu: usize,
+    /// `-isMovableByWindowBackground`.
+    movable_by_background: usize,
+    /// `-setDisplaysWhenScreenProfileChanges:`. Nothing here redraws for a
+    /// profile change SDL never reports; stored for the same reason.
+    displays_when_screen_profile_changes: usize,
+    /// `-undoManager`'s own fallback when the delegate does not answer
+    /// `-windowWillReturnUndoManager:`: made lazily, owned by the window.
+    undo_manager: Id,
     /// The view the content view and the titlebar accessories share, retained,
     /// made when the first accessory is added; null until then. It is what
     /// AppKit's `NSThemeFrame` is to the content view: its superview.
@@ -1663,6 +1673,12 @@ fn remake(receiver: Id, api: Api, want: Presentation) -> bool {
     true
 }
 
+/// [`frame`] for another module of this crate.
+pub(crate) fn frame_of(window: Id) -> NSRect {
+    // SAFETY: a window this crate made; the selector is not read.
+    unsafe { frame(window, std::ptr::null()) }
+}
+
 /// The window's frame, asked of SDL rather than remembered.
 ///
 /// A user can drag or resize a window, and a remembered rectangle would then be
@@ -2138,6 +2154,35 @@ unsafe extern "C" fn set_delegate(receiver: Id, _sel: Sel, value: Id) {
     window_of(receiver).delegate = value;
 }
 
+/// `-[NSWindow undoManager]`: the delegate's, if it implements
+/// `-windowWillReturnUndoManager:`, else a lazy one of the window's own.
+///
+/// The delegate is asked by looking up the method rather than by sending
+/// `-respondsToSelector:` and then the message, matching how this crate
+/// already asks a delegate about `-windowShouldClose:` in `perform_close`.
+unsafe extern "C" fn window_undo_manager(receiver: Id, _sel: Sel) -> Id {
+    let delegate = delegate_of(receiver);
+    let will_return = objc::sel::get("windowWillReturnUndoManager:");
+    if !delegate.is_null() {
+        // SAFETY: a live delegate.
+        let method =
+            (unsafe { objc::object::class_of(delegate) }).and_then(|c| c.method(will_return));
+        if let Some(method) = method {
+            // SAFETY: `-windowWillReturnUndoManager:` is `id (id, SEL, id)`.
+            return unsafe {
+                let f: unsafe extern "C" fn(Id, Sel, Id) -> Id =
+                    std::mem::transmute(method.implementation());
+                f(delegate, will_return, receiver)
+            };
+        }
+    }
+    let window = window_of(receiver);
+    if window.undo_manager.is_null() {
+        window.undo_manager = foundation::undomanager::make();
+    }
+    window.undo_manager
+}
+
 unsafe extern "C" fn set_title(receiver: Id, _sel: Sel, title: Id) {
     let sdl = window_of(receiver).sdl;
     if sdl.is_null() || title.is_null() {
@@ -2340,13 +2385,50 @@ unsafe extern "C" fn order_out(receiver: Id, _sel: Sel, _sender: Id) {
         sdl3::video::hide_window(sdl);
     }
     window_of(receiver).shown = 0;
-    let _ = KEY.compare_exchange(
-        receiver as usize,
-        0,
-        std::sync::atomic::Ordering::AcqRel,
-        std::sync::atomic::Ordering::Acquire,
-    );
+    let was_key = KEY
+        .compare_exchange(
+            receiver as usize,
+            0,
+            std::sync::atomic::Ordering::AcqRel,
+            std::sync::atomic::Ordering::Acquire,
+        )
+        .is_ok();
     crate::event::announce_resign(receiver);
+    if was_key {
+        hand_key_on(receiver);
+    }
+}
+
+/// Make another window key after `leaving`, the key window, left the screen.
+///
+/// AppKit does not leave an active application without a key window: closing a
+/// dialog gives key back to the document under it. A program that ignores the
+/// click that activates a window would otherwise drop the first click after
+/// every dialog.
+///
+/// FIXME (ACCURACY): AppKit keeps the main window apart from the key one and
+/// hands key to it first; this takes the frontmost window that can be main,
+/// else the frontmost that can be key.
+fn hand_key_on(leaving: Id) {
+    let candidates: Vec<Id> = front_to_back()
+        .into_iter()
+        .filter(|&window| {
+            window != leaving
+                && presentation(window_of(window)) == Presentation::Toplevel
+                && crate::event::answers(window, "canBecomeKeyWindow")
+        })
+        .collect();
+    let next = candidates
+        .iter()
+        .copied()
+        .find(|&window| crate::event::answers(window, "canBecomeMainWindow"))
+        .or_else(|| candidates.first().copied());
+    let Some(next) = next else {
+        return;
+    };
+    trace!("{next:p} became key after {leaving:p} left the screen");
+    KEY.store(next as usize, std::sync::atomic::Ordering::Release);
+    crate::event::announce_key(next);
 }
 
 /// `-dealloc`. The content view is told it has no window before it is released,
@@ -2394,6 +2476,10 @@ pub(crate) unsafe extern "C" fn dealloc(receiver: Id, sel: Sel) {
     unsafe { order_out(receiver, sel, std::ptr::null_mut()) };
     objc::arc::destroy_weak(&mut window.first_responder);
     objc::arc::destroy_weak(&mut window.initial_first_responder);
+    objc::arc::release(std::mem::replace(
+        &mut window.undo_manager,
+        std::ptr::null_mut(),
+    ));
     WINDOWS
         .lock()
         .unwrap_or_else(|e| e.into_inner())
@@ -2619,12 +2705,67 @@ unsafe extern "C" fn set_hides_on_deactivate(receiver: Id, _sel: Sel, value: u8)
     window_of(receiver).hides_on_deactivate = value as usize;
 }
 
+// FIXME (ACCURACY): stored and answered, but a drag on the background does
+// not move the window; only the title bar does.
+unsafe extern "C" fn is_movable_by_background(receiver: Id, _sel: Sel) -> u8 {
+    (window_of(receiver).movable_by_background != 0) as u8
+}
+
+unsafe extern "C" fn set_movable_by_background(receiver: Id, _sel: Sel, value: u8) {
+    window_of(receiver).movable_by_background = value as usize;
+}
+
+/// `-nextEventMatchingMask:untilDate:inMode:dequeue:`, which Apple forwards to
+/// `NSApp`: a window's own tracking loop reads the application's queue.
+unsafe extern "C" fn next_event(
+    _receiver: Id,
+    sel: Sel,
+    mask: u64,
+    until: Id,
+    mode: Id,
+    dequeue: u8,
+) -> Id {
+    // SAFETY: the application's method with the same arguments.
+    unsafe {
+        crate::application::next_event(
+            crate::application::shared(),
+            sel,
+            mask,
+            until,
+            mode,
+            dequeue,
+        )
+    }
+}
+
+/// `-nextEventMatchingMask:`: the same, waiting as long as it takes.
+unsafe extern "C" fn next_event_matching(receiver: Id, sel: Sel, mask: u64) -> Id {
+    let future = foundation::timer::date(f64::MAX);
+    // SAFETY: as above, with the default mode.
+    unsafe { next_event(receiver, sel, mask, future, std::ptr::null_mut(), 1) }
+}
+
 unsafe extern "C" fn is_excluded_from_windows_menu(receiver: Id, _sel: Sel) -> u8 {
     (window_of(receiver).excluded_from_windows_menu != 0) as u8
 }
 
 unsafe extern "C" fn set_excluded_from_windows_menu(receiver: Id, _sel: Sel, value: u8) {
     window_of(receiver).excluded_from_windows_menu = value as usize;
+}
+
+unsafe extern "C" fn displays_when_screen_profile_changes(receiver: Id, _sel: Sel) -> u8 {
+    (window_of(receiver).displays_when_screen_profile_changes != 0) as u8
+}
+
+unsafe extern "C" fn set_displays_when_screen_profile_changes(receiver: Id, _sel: Sel, value: u8) {
+    window_of(receiver).displays_when_screen_profile_changes = value as usize;
+}
+
+/// `-currentEvent`, deprecated on `NSWindow` in favour of `NSApp`'s, and
+/// documented to answer the same thing: the event inside the application's
+/// `-sendEvent:`, or nil outside it.
+unsafe extern "C" fn window_current_event(_receiver: Id, _sel: Sel) -> Id {
+    crate::application::current_event_value()
 }
 
 unsafe extern "C" fn is_key_window(receiver: Id, _sel: Sel) -> u8 {
@@ -3783,6 +3924,7 @@ pub(crate) fn install() {
         "windowController" => window_controller, c"@16@0:8";
         "setWindowController:" => set_window_controller, c"v24@0:8@16";
         "setDelegate:" => set_delegate, c"v24@0:8@16";
+        "undoManager" => window_undo_manager, c"@16@0:8";
         "title" => title, c"@16@0:8";
         "setTitle:" => set_title, c"v24@0:8@16";
         "makeKeyAndOrderFront:" => make_key_and_order_front, c"v24@0:8@16";
@@ -3832,6 +3974,13 @@ pub(crate) fn install() {
         "hidesOnDeactivate" => hides_on_deactivate, c"c16@0:8";
         "setExcludedFromWindowsMenu:" => set_excluded_from_windows_menu, c"v20@0:8c16";
         "isExcludedFromWindowsMenu" => is_excluded_from_windows_menu, c"c16@0:8";
+        "isMovableByWindowBackground" => is_movable_by_background, c"c16@0:8";
+        "setMovableByWindowBackground:" => set_movable_by_background, c"v20@0:8c16";
+        "nextEventMatchingMask:untilDate:inMode:dequeue:" => next_event, c"@48@0:8Q16@24@32B40";
+        "nextEventMatchingMask:" => next_event_matching, c"@24@0:8Q16";
+        "setDisplaysWhenScreenProfileChanges:" => set_displays_when_screen_profile_changes, c"v20@0:8c16";
+        "displaysWhenScreenProfileChanges" => displays_when_screen_profile_changes, c"c16@0:8";
+        "currentEvent" => window_current_event, c"@16@0:8";
         "orderBack:" => ignored_object, c"v24@0:8@16";
         "occlusionState" => visible_occlusion, c"Q16@0:8";
         "setToolbar:" => ignored_object, c"v24@0:8@16";
@@ -4066,6 +4215,91 @@ mod tests {
             assert_eq!(shows_toolbar_button(window, get), 1);
         }
         objc::arc::release(window);
+    }
+
+    /// Two more flags with no behaviour behind them: a program's read-back
+    /// must agree with what it set, which is the whole of their contract.
+    #[test]
+    fn a_window_keeps_its_windows_menu_and_profile_flags() {
+        crate::bootstrap();
+        let window =
+            objc::object::create_instance(objc::class::lookup(c"NSWindow").expect("NSWindow"), 0);
+        // SAFETY: each is the accessor its selector declares.
+        unsafe {
+            let (get, set) = (
+                objc::sel::get("isExcludedFromWindowsMenu"),
+                objc::sel::get("setExcludedFromWindowsMenu:"),
+            );
+            assert_eq!(is_excluded_from_windows_menu(window, get), 0);
+            set_excluded_from_windows_menu(window, set, 1);
+            assert_eq!(is_excluded_from_windows_menu(window, get), 1);
+
+            let (get, set) = (
+                objc::sel::get("displaysWhenScreenProfileChanges"),
+                objc::sel::get("setDisplaysWhenScreenProfileChanges:"),
+            );
+            assert_eq!(displays_when_screen_profile_changes(window, get), 0);
+            set_displays_when_screen_profile_changes(window, set, 1);
+            assert_eq!(displays_when_screen_profile_changes(window, get), 1);
+        }
+        objc::arc::release(window);
+    }
+
+    /// `-[NSWindow currentEvent]` is deprecated in favour of `NSApp`'s, and
+    /// Apple's docs say it answers the same thing: non-nil only for the
+    /// duration of the application's own `-sendEvent:`, and the very event
+    /// passing through it.
+    #[test]
+    fn a_windows_current_event_is_the_applications() {
+        crate::bootstrap();
+        let window =
+            objc::object::create_instance(objc::class::lookup(c"NSWindow").expect("NSWindow"), 0);
+        let get = objc::sel::get("currentEvent");
+        // SAFETY: outside any `-sendEvent:`, there is none to answer.
+        unsafe {
+            assert!(window_current_event(window, get).is_null());
+        }
+
+        static SEEN: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        unsafe extern "C" fn record(_receiver: Id, _sel: Sel, _event: Id) {
+            let window = objc::object::create_instance(
+                objc::class::lookup(c"NSWindow").expect("NSWindow"),
+                0,
+            );
+            // SAFETY: `-currentEvent` is `id (id, SEL)`.
+            let seen = unsafe { window_current_event(window, objc::sel::get("currentEvent")) };
+            SEEN.store(seen as usize, std::sync::atomic::Ordering::SeqCst);
+            objc::arc::release(window);
+        }
+        let class = corefoundation::base::register(
+            c"RosemaryTestCurrentEventWindowApplication",
+            objc::class::lookup(c"NSApplication"),
+            crate::application::INSTANCE_SIZE,
+            false,
+        );
+        class.add_method(
+            objc::sel::get("sendEvent:"),
+            record as *const std::ffi::c_void,
+            c"v24@0:8@16",
+        );
+        let app = objc::object::create_instance(class, 0);
+        let event = crate::nsevent::make(crate::nsevent::Fields {
+            kind: crate::nsevent::kind::KEY_DOWN,
+            ..Default::default()
+        });
+        // SAFETY: a live application and the event it is about to send.
+        unsafe { crate::application::send_event_through(app, event) };
+        assert_eq!(
+            SEEN.load(std::sync::atomic::Ordering::SeqCst) as Id,
+            event,
+            "seen while sending"
+        );
+        // SAFETY: outside any `-sendEvent:` again, once it has returned.
+        unsafe {
+            assert!(window_current_event(window, get).is_null());
+        }
+        objc::arc::release(window);
+        objc::arc::release(app);
     }
 
     /// An immovable window refuses the drag, and a window with no SDL window
@@ -5033,5 +5267,143 @@ mod tests {
         objc::arc::release(view);
         assert!(window_of(window).first_responder.is_null());
         objc::arc::destroy_weak(&mut window_of(window).first_responder);
+    }
+
+    /// A window with no delegate - or a delegate that does not implement
+    /// `-windowWillReturnUndoManager:` - falls back to a lazy manager of its
+    /// own, made once and handed back every time after.
+    #[test]
+    fn undo_manager_falls_back_to_a_lazy_one_of_the_windows_own() {
+        crate::bootstrap();
+        let window =
+            objc::object::create_instance(objc::class::lookup(c"NSWindow").expect("NSWindow"), 0);
+        let sel = objc::sel::get("undoManager");
+        let first = unsafe { window_undo_manager(window, sel) };
+        assert!(!first.is_null());
+        let second = unsafe { window_undo_manager(window, sel) };
+        assert_eq!(first, second, "the same instance every time");
+        objc::arc::release(window);
+    }
+
+    /// A delegate that implements `-windowWillReturnUndoManager:` is asked
+    /// instead, and its answer is what the window hands back - not one of
+    /// its own making.
+    #[test]
+    fn undo_manager_asks_a_delegate_that_implements_it() {
+        crate::bootstrap();
+        let window =
+            objc::object::create_instance(objc::class::lookup(c"NSWindow").expect("NSWindow"), 0);
+        let manager = foundation::undomanager::make();
+        unsafe extern "C" fn will_return(_receiver: Id, _sel: Sel, _window: Id) -> Id {
+            MANAGER_FOR_TEST.with(|m| m.get())
+        }
+        thread_local! {
+            static MANAGER_FOR_TEST: std::cell::Cell<Id> = const { std::cell::Cell::new(std::ptr::null_mut()) };
+        }
+        MANAGER_FOR_TEST.with(|m| m.set(manager));
+        let delegate_class = objc::class::allocate_pair(
+            Some(objc::class::lookup(c"NSObject").expect("NSObject")),
+            c"UndoManagerDelegate",
+            0,
+        )
+        .expect("a class of this name is not declared elsewhere");
+        delegate_class.add_method(
+            objc::sel::get("windowWillReturnUndoManager:"),
+            will_return as objc::class::Imp,
+            c"@24@0:8@16",
+        );
+        objc::class::register_pair(delegate_class);
+        let delegate = objc::object::create_instance(delegate_class, 0);
+        unsafe { set_delegate(window, objc::sel::get("setDelegate:"), delegate) };
+
+        let answered = unsafe { window_undo_manager(window, objc::sel::get("undoManager")) };
+        assert_eq!(answered, manager, "the delegate's answer, not a lazy one");
+
+        objc::arc::release(manager);
+        objc::arc::release(delegate);
+        objc::arc::release(window);
+    }
+
+    /// Closing the key window hands key to the window under it that can be
+    /// main, past a borderless one in front; ordering out a window that was
+    /// not key changes nothing.
+    #[test]
+    fn ordering_out_the_key_window_makes_the_one_under_it_key() {
+        if !sdl3::isolated::run_here() {
+            return;
+        }
+        crate::bootstrap();
+        let Some(probe) = sdl3::video::create_window(c"key handoff preflight", 32, 32, 0) else {
+            return;
+        };
+        sdl3::video::destroy_window(probe);
+        static BECAME_KEY: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        unsafe extern "C" fn did_become_key(_receiver: Id, _sel: Sel, notification: Id) {
+            assert!(!notification.is_null());
+            BECAME_KEY.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        let delegate_class =
+            objc::class::allocate_pair(objc::class::lookup(c"NSObject"), c"KeyHandoffDelegate", 0)
+                .unwrap();
+        delegate_class.add_method(
+            objc::sel::get("windowDidBecomeKey:"),
+            did_become_key as objc::class::Imp,
+            c"v24@0:8@16",
+        );
+        objc::class::register_pair(delegate_class);
+        let class = objc::class::lookup(c"NSWindow").unwrap();
+        let make = |mask: usize| {
+            let object = objc::object::create_instance(class, 0);
+            // SAFETY: a fresh window and the initializer's declared arguments.
+            unsafe {
+                init_with_content_rect(
+                    object,
+                    objc::sel::get("initWithContentRect:styleMask:backing:defer:"),
+                    NSRect {
+                        origin: NSPoint { x: 10.0, y: 10.0 },
+                        size: NSSize {
+                            width: 120.0,
+                            height: 90.0,
+                        },
+                    },
+                    mask,
+                    0,
+                    0,
+                )
+            }
+        };
+        let document = make(style::TITLED);
+        let borderless = make(0);
+        let dialog = make(style::TITLED);
+        let other = make(style::TITLED);
+        window_of(document).delegate = objc::object::create_instance(delegate_class, 0);
+        order_front(document, true);
+        order_front(other, true);
+        order_front(borderless, false);
+        order_front(dialog, true);
+        assert_eq!(key_window(), dialog);
+        let order_out_sel = objc::sel::get("orderOut:");
+        // SAFETY: windows this test made; `-orderOut:` is `void (id, SEL, id)`.
+        unsafe { order_out(other, order_out_sel, std::ptr::null_mut()) };
+        assert_eq!(
+            key_window(),
+            dialog,
+            "a window that was not key gave key away"
+        );
+        let before = BECAME_KEY.load(std::sync::atomic::Ordering::Relaxed);
+        // SAFETY: as above.
+        unsafe { order_out(dialog, order_out_sel, std::ptr::null_mut()) };
+        assert_eq!(key_window(), document);
+        assert_eq!(
+            BECAME_KEY.load(std::sync::atomic::Ordering::Relaxed),
+            before + 1,
+            "the new key window was not told"
+        );
+        // SAFETY: as above.
+        unsafe { order_out(document, order_out_sel, std::ptr::null_mut()) };
+        assert!(
+            key_window().is_null(),
+            "a window that cannot be key was made key"
+        );
     }
 }

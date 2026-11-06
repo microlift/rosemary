@@ -1,11 +1,37 @@
 use objc::object::Id;
 use objc::sel::Sel;
 
+mod asset;
+mod capture;
+mod define;
+mod readwrite;
+
+/// Classes this crate registers, beside `AVCaptureDevice` below - every name
+/// here gets its `_OBJC_CLASS_$_` and `_OBJC_METACLASS_$_` data symbols from
+/// [`data_symbols`].
+const CLASSES: &[&std::ffi::CStr] = &[
+    c"AVCaptureDeviceDiscoverySession",
+    c"AVCaptureDeviceInput",
+    c"AVCaptureSession",
+    c"AVCaptureVideoDataOutput",
+    c"AVURLAsset",
+    c"AVMutableComposition",
+    c"AVAssetImageGenerator",
+    c"AVAssetReader",
+    c"AVAssetReaderTrackOutput",
+    c"AVAssetWriter",
+    c"AVAssetWriterInput",
+    c"AVAssetWriterInputPixelBufferAdaptor",
+];
+
 /// Install this crate's classes and methods. Idempotent.
 pub fn bootstrap() {
     static ONCE: std::sync::Once = std::sync::Once::new();
     ONCE.call_once(|| {
         foundation::bootstrap();
+        capture::install();
+        asset::install();
+        readwrite::install();
         let class = corefoundation::base::abstract_class(c"AVCaptureDevice", None);
         let metaclass = class.metaclass();
         metaclass.replace_method(
@@ -169,6 +195,28 @@ const NAMED_STRINGS: &[&str] = &[
     "AVPlayerItemFailedToPlayToEndTimeErrorKey",
     "AVPlayerItemPlaybackStalledNotification",
     "AVURLAssetPreferPreciseDurationAndTimingKey",
+    // Device types: every `AVCaptureDeviceType*` constant's text is its own
+    // name - checked against AVCaptureDevice.h for the two still declared in
+    // the iOS SDK; `AVCaptureDeviceTypeExternal` is macOS-only and not in that
+    // header, but the convention has no exception among the others.
+    "AVCaptureDeviceTypeBuiltInWideAngleCamera",
+    "AVCaptureDeviceTypeExternalUnknown",
+    "AVCaptureDeviceTypeExternal",
+    // Audio settings dictionary keys (AVAudioSettings.h / AVFAudio), and the
+    // error domain - same name-is-value convention.
+    "AVChannelLayoutKey",
+    "AVEncoderBitRateKey",
+    "AVFormatIDKey",
+    "AVLinearPCMBitDepthKey",
+    "AVLinearPCMIsBigEndianKey",
+    "AVLinearPCMIsFloatKey",
+    "AVLinearPCMIsNonInterleaved",
+    "AVNumberOfChannelsKey",
+    "AVSampleRateKey",
+    "AVVideoCodecKey",
+    "AVVideoWidthKey",
+    "AVVideoHeightKey",
+    "AVFoundationErrorDomain",
 ];
 
 /// AVFoundation's string constants whose text differs from their name.
@@ -176,24 +224,42 @@ const STRINGS: &[(&str, &str)] = &[
     ("_AVAudioTimePitchAlgorithmSpectral", "Spectral"),
     ("_AVAudioTimePitchAlgorithmTimeDomain", "TimeDomain"),
     ("_AVAudioTimePitchAlgorithmVarispeed", "Varispeed"),
+    // UTIs, checked against AVFileType.h's doc comments.
+    ("_AVFileTypeMPEG4", "public.mpeg-4"),
+    ("_AVFileTypeQuickTimeMovie", "com.apple.quicktime-movie"),
+    // AVVideoSettings.h: `AVF_EXPORT NSString *const AVVideoCodecH264 /*
+    // @"avc1" */` - the deprecated constant predates `AVVideoCodecType` but
+    // already held that FourCC, not the plain word "H264".
+    ("_AVVideoCodecH264", "avc1"),
 ];
+
+/// The `_OBJC_CLASS_$_` and `_OBJC_METACLASS_$_` data symbols for a registered
+/// class, the way a guest's Mach-O references a class it imports.
+fn class_symbols(name: &std::ffi::CStr) -> [(String, u64); 2] {
+    let class = objc::class::lookup(name)
+        .unwrap_or_else(|| panic!("{} is registered", name.to_string_lossy()));
+    let text = name.to_string_lossy();
+    [
+        (
+            format!("_OBJC_CLASS_$_{text}"),
+            objc::class::ptr(class) as usize as u64,
+        ),
+        (
+            format!("_OBJC_METACLASS_$_{text}"),
+            objc::class::ptr(class.metaclass()) as usize as u64,
+        ),
+    ]
+}
 
 /// The Objective-C class objects and constants exported by AVFoundation.framework.
 pub fn data_symbols() -> Vec<(String, u64)> {
     bootstrap();
-    let class = objc::class::lookup(c"AVCaptureDevice").expect("AVCaptureDevice is registered");
     let mut out = corefoundation::base::named_string_globals(NAMED_STRINGS);
     out.extend(corefoundation::base::string_globals(STRINGS));
-    out.extend([
-        (
-            "_OBJC_CLASS_$_AVCaptureDevice".to_string(),
-            objc::class::ptr(class) as usize as u64,
-        ),
-        (
-            "_OBJC_METACLASS_$_AVCaptureDevice".to_string(),
-            objc::class::ptr(class.metaclass()) as usize as u64,
-        ),
-    ]);
+    out.extend(class_symbols(c"AVCaptureDevice"));
+    for name in CLASSES {
+        out.extend(class_symbols(name));
+    }
     out
 }
 

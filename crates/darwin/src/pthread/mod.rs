@@ -11,6 +11,8 @@ mod sched;
 pub mod sync;
 
 #[cfg(test)]
+mod stress;
+#[cfg(test)]
 pub(crate) mod testing;
 
 pub use attr::{Attributes, HostAttr};
@@ -1681,30 +1683,6 @@ mod tests {
             assert_eq!(sync::cond_init(c.at(), 0), 0);
             assert_eq!(sync::mutex_lock(c.at()), err::EINVAL);
             assert_eq!(sync::cond_destroy(c.at()), 0);
-        }
-    }
-
-    /// Copying an initialised mutex is undefined in POSIX, and the copy sharing the
-    /// original's state is the quiet way to get it wrong: both would appear to lock
-    /// while their address identity no longer agrees.
-    #[test]
-    fn a_copied_mutex_is_refused_rather_than_aliased() {
-        let original = Mutex::zeroed();
-        // SAFETY: a live mutex object.
-        unsafe { assert_eq!(sync::mutex_init(original.at(), 0), 0) };
-
-        let copy = Mutex::copy_of(&original);
-        // SAFETY: a live, correctly sized object holding a byte copy of another's
-        // record - which is exactly what the identity word exists to catch.
-        unsafe {
-            assert_eq!(sync::mutex_lock(copy.at()), err::EINVAL);
-            assert_eq!(
-                sync::mutex_lock(original.at()),
-                0,
-                "the original still works"
-            );
-            assert_eq!(sync::mutex_unlock(original.at()), 0);
-            assert_eq!(sync::mutex_destroy(original.at()), 0);
         }
     }
 

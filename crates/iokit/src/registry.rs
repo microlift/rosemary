@@ -587,6 +587,20 @@ pub unsafe extern "C" fn IORegistryEntryCreateIterator(
     SUCCESS
 }
 
+/// `kern_return_t IORegistryEntryGetChildIterator(entry, plane, io_iterator_t *)`:
+/// an empty iterator, for the same reason [`IORegistryEntryCreateIterator`]'s
+/// is - there are no parent/child links in this registry, only a flat list of
+/// HID devices, and [`IORegistryEntryGetParentEntry`] already answers
+/// `NO_DEVICE` for every one of them.
+pub unsafe extern "C" fn IORegistryEntryGetChildIterator(
+    entry: IoObject,
+    _plane: *const c_char,
+    iterator: *mut IoObject,
+) -> KernReturn {
+    // SAFETY: as `IORegistryEntryCreateIterator`.
+    unsafe { IORegistryEntryCreateIterator(entry, std::ptr::null(), 0, iterator) }
+}
+
 /// `boolean_t IOObjectConformsTo(io_object_t, const io_name_t className)`:
 /// reports HID classes for live controller services.
 pub unsafe extern "C" fn IOObjectConformsTo(object: IoObject, class: *const c_char) -> u32 {
@@ -744,6 +758,7 @@ exports::exports! {
         "IOObjectIsEqualTo" => IOObjectIsEqualTo,
         "IORegistryEntryFromPath" => IORegistryEntryFromPath,
         "IORegistryEntryGetParentEntry" => IORegistryEntryGetParentEntry,
+        "IORegistryEntryGetChildIterator" => IORegistryEntryGetChildIterator,
         "IORegistryEntryGetRegistryEntryID" => IORegistryEntryGetRegistryEntryID,
         "IORegistryEntryCreateCFProperty" => IORegistryEntryCreateCFProperty,
         "IORegistryEntryCreateCFProperties" => IORegistryEntryCreateCFProperties,
@@ -764,5 +779,20 @@ exports::exports! {
         "IODestroyPlugInInterface" => IODestroyPlugInInterface,
         "IORegisterForSystemPower" => IORegisterForSystemPower,
         "IOAllowPowerChange" | "IOCancelPowerChange" => IOAllowPowerChange,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A child iterator always comes back empty and already-ended, since
+    /// nothing in this registry has children to walk.
+    #[test]
+    fn a_child_iterator_is_empty() {
+        let mut iterator = 0xdead_beef;
+        let status = unsafe { IORegistryEntryGetChildIterator(1, std::ptr::null(), &mut iterator) };
+        assert_eq!(status, SUCCESS);
+        assert_eq!(unsafe { IOIteratorNext(iterator) }, 0);
     }
 }

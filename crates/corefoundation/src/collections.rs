@@ -145,6 +145,10 @@ pub struct SetContents {
     values: Vec<CFTypeRef>,
     index: HashIndex,
     pub policy: Policy,
+    /// As [`ArrayContents::mutable`]: a CF-level guard for `CFSetAddValue`, kept
+    /// separate from the Objective-C class (`-addObject:` is only ever bound on
+    /// `NSMutableSet` in the first place).
+    pub mutable: bool,
 }
 
 impl Drop for SetContents {
@@ -161,6 +165,7 @@ impl SetContents {
             values: Vec::new(),
             index: HashIndex::default(),
             policy,
+            mutable: true,
         }
     }
 
@@ -234,8 +239,9 @@ pub fn set_class() -> &'static Class {
 }
 
 /// A set of `values`, keeping the first of any that are equal.
-pub fn new_set(values: &[CFTypeRef], policy: Policy) -> CFTypeRef {
+pub fn new_set(values: &[CFTypeRef], policy: Policy, mutable: bool) -> CFTypeRef {
     let mut contents = SetContents::new(policy);
+    contents.mutable = mutable;
     for value in values {
         contents.insert(*value);
     }

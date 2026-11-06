@@ -1,3 +1,11 @@
+#[path = "glu/mod.rs"]
+mod glu;
+
+#[cfg(not(test))]
+fn open() -> bool {
+    opengl::load_library()
+}
+
 use machish::resolve::{LazyDylib, NativeDylibProvider, Resolved};
 
 /// Built-in frameworks always draw through SDL's GL backend.
@@ -47,7 +55,9 @@ pub fn deny_host_gl(provider: &mut NativeDylibProvider) {
 /// The address a `dlsym` of the C name `name` should answer, for
 /// [`crate::frameworks`].
 pub fn symbol(name: &str) -> Option<u64> {
-    interposed().then(|| opengl::symbol(name)).flatten()
+    interposed()
+        .then(|| glu::symbol(name).or_else(|| opengl::symbol(name)))
+        .flatten()
 }
 
 fn resolve(name: &str) -> Option<Resolved> {
@@ -104,7 +114,7 @@ mod tests {
             // neither may fall through to the host.
             for name in [
                 "CGLDescribePixelFormat",
-                "gluPerspective",
+                "gluNotAFunction",
                 "glDispatchCompute",
             ] {
                 assert!(symbol(name).is_none(), "{name}");

@@ -16,6 +16,8 @@ getrandom.workspace = true
 hashbrown.workspace = true
 static_init.workspace = true
 sdl3.workspace = true
+unicode-normalization.workspace = true
+unicode-general-category.workspace = true
 icu_normalizer.workspace = true
 icu_properties.workspace = true
 

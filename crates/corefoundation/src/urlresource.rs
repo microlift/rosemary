@@ -595,6 +595,53 @@ pub unsafe extern "C" fn CFURLCreateDataAndPropertiesFromResource(
     1
 }
 
+/// `Boolean CFURLWriteDataAndPropertiesToResource(CFURLRef, CFDataRef data,
+/// CFPropertyListRef propertyList, SInt32 *errorCode)`
+///
+/// The deprecated way to write a file - the write half of
+/// [`CFURLCreateDataAndPropertiesFromResource`]. `propertyList` is accepted and
+/// ignored, as the read side answers every property it is asked for with NULL:
+/// this filesystem has no Finder metadata to set alongside the bytes.
+///
+/// # Safety
+///
+/// `url` is null or a `CFURL`; `data` is null or an object this runtime
+/// allocated; `error` is null or writable.
+pub unsafe extern "C" fn CFURLWriteDataAndPropertiesToResource(
+    url: CFTypeRef,
+    data: CFTypeRef,
+    _property_list: CFTypeRef,
+    error: *mut i32,
+) -> Boolean {
+    /// `kCFURLUnknownError`.
+    const UNKNOWN: i32 = -10;
+    let set_error = |code: i32| {
+        if !error.is_null() {
+            // SAFETY: writable, per the caller.
+            unsafe { error.write(code) };
+        }
+    };
+    let Some(path) = (unsafe { crate::url::as_url(url) }).and_then(|u| u.file_path()) else {
+        set_error(UNKNOWN);
+        return 0;
+    };
+    // SAFETY: null or an object this runtime allocated; type-checked.
+    let Some(bytes) = (unsafe { crate::collections::data(data) }) else {
+        set_error(UNKNOWN);
+        return 0;
+    };
+    match std::fs::write(prefix::ns::host_path(&path), bytes.as_slice()) {
+        Ok(()) => {
+            set_error(0);
+            1
+        }
+        Err(_) => {
+            set_error(UNKNOWN);
+            0
+        }
+    }
+}
+
 /// `CFURLRef CFURLCreateWithBytes(CFAllocatorRef, const UInt8 *, CFIndex,
 /// CFStringEncoding, CFURLRef baseURL)`
 ///
@@ -751,6 +798,7 @@ exports::exports! {
         "CFURLCreateFromFileSystemRepresentation" => CFURLCreateFromFileSystemRepresentation,
         "CFURLCreateFromFileSystemRepresentationRelativeToBase" => CFURLCreateFromFileSystemRepresentationRelativeToBase,
         "CFURLCreateDataAndPropertiesFromResource" => CFURLCreateDataAndPropertiesFromResource,
+        "CFURLWriteDataAndPropertiesToResource" => CFURLWriteDataAndPropertiesToResource,
         "CFURLCreateWithBytes" => CFURLCreateWithBytes,
         "CFURLEnumeratorCreateForMountedVolumes" => CFURLEnumeratorCreateForMountedVolumes,
         "CFURLEnumeratorGetNextURL" => CFURLEnumeratorGetNextURL,
@@ -790,6 +838,34 @@ mod tests {
         };
         assert_eq!(at("_kCFURLIsHiddenKey"), at("_NSURLIsHiddenKey"));
         assert_ne!(at("_kCFURLIsHiddenKey"), at("_kCFURLIsPackageKey"));
+    }
+
+    #[test]
+    fn write_data_and_properties_writes_the_bytes() {
+        crate::bootstrap();
+        let dir = std::env::temp_dir().join("rosemary-urlresource-write");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("a directory to write into");
+        let path = dir.join("out.txt");
+        let path_bytes = path.to_string_lossy().into_owned().into_bytes();
+        // SAFETY: a path this test owns, and a buffer this call owns.
+        unsafe {
+            let url = CFURLCreateFromFileSystemRepresentation(
+                std::ptr::null(),
+                path_bytes.as_ptr(),
+                path_bytes.len() as CFIndex,
+                0,
+            );
+            assert!(!url.is_null());
+            let data = crate::api::CFDataCreate(std::ptr::null(), b"hello".as_ptr(), 5);
+            let mut error: i32 = 0;
+            let ok = CFURLWriteDataAndPropertiesToResource(url, data, std::ptr::null(), &mut error);
+            assert_eq!(ok, 1);
+            assert_eq!(error, 0);
+            assert_eq!(std::fs::read(&path).unwrap(), b"hello");
+            crate::api::CFRelease(url);
+            crate::api::CFRelease(data);
+        }
     }
 
     #[test]

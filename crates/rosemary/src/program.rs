@@ -413,6 +413,28 @@ fn is_framework_constant(symbol: &str) -> bool {
         && PREFIXES.iter().any(|p| symbol.starts_with(p))
 }
 
+/// `ROSEMARY_WEAK_DETAIL=1`: name the weak imports left null.
+///
+/// A null weak import is legal, but a program that checks the OS version
+/// rather than the symbol dereferences it anyway, and the fault reads a GOT
+/// slot with no name attached.
+fn announce_null_weak_imports(report: &LinkReport, what: &str) {
+    if std::env::var_os("ROSEMARY_WEAK_DETAIL").is_none_or(|v| v == "0") {
+        return;
+    }
+    for image in &report.images {
+        for m in image.missing.iter().filter(|m| m.weak_import) {
+            eprintln!(
+                "rosemary: {what}: weak import {} from {} in {}, slot {:#x}, left null",
+                m.symbol,
+                m.library.as_deref().unwrap_or("<no library>"),
+                image.name,
+                m.slot_va,
+            );
+        }
+    }
+}
+
 /// Say on stderr which imports went unbound, and return them.
 ///
 /// The alternative is what this replaces. An import nobody satisfied leaves a
@@ -431,6 +453,7 @@ pub fn announce_unbound_imports<'r>(
     report: &'r LinkReport,
     what: &str,
 ) -> Vec<(&'r str, &'r machish::report::MissingSymbol)> {
+    announce_null_weak_imports(report, what);
     let unbound = unbound_imports(report);
     if unbound.is_empty() {
         return unbound;

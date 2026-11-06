@@ -323,6 +323,27 @@ pub unsafe fn parts(object: Id) -> Option<(String, Id)> {
     ))
 }
 
+/// The units and each run's length and attributes dictionary, for Core
+/// Text's typesetter. The attributes are borrowed from the string and must be
+/// retained to outlive a subsequent edit - as [`parts`] already documents for
+/// its own borrowed attributes.
+///
+/// # Safety
+/// `object` is null or an object this runtime allocated.
+#[allow(clippy::type_complexity)]
+pub unsafe fn runs(object: Id) -> Option<(Vec<u16>, Vec<(usize, Id)>)> {
+    let contents = unsafe { contents(object) }?;
+    let state = lock(&contents);
+    Some((
+        state.units(),
+        state
+            .runs
+            .iter()
+            .map(|run| (run.length, run.attributes.0 as Id))
+            .collect(),
+    ))
+}
+
 unsafe extern "C" fn init(receiver: Id, _sel: Sel) -> Id {
     unsafe { crate::boxed::fill(receiver, plain_contents(&[], std::ptr::null_mut())) };
     receiver

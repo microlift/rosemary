@@ -87,13 +87,13 @@ pub(crate) const DEAD: u64 = TAG | 0xDE;
 /// +[BODY]..      ..   body        whatever the kind makes of the rest
 /// ```
 ///
-/// The `identity` word is what catches a guest that copies an initialised object by
-/// value. POSIX does not allow that, and without the check the copy and the original
-/// would share the state the original is excluding callers with.
+/// The `identity` word records where the record was built. All of an object's
+/// state is in its own bytes and every wait is keyed by its own address, so a
+/// byte copy is a second, independent object - which is what it is on Darwin
+/// too, and what a guest that copied one relies on. A copy is adopted on first
+/// touch and noted once, since POSIX does not promise it works.
 ///
-/// `Once`, `MutexAttr` and `CondAttr` are sixteen bytes and have no room for it. None
-/// of the three needs it: an attribute set is read-only settings, and a `pthread_once_t`
-/// copied mid-flight is a guest bug whose worst outcome is running the routine twice.
+/// `Once`, `MutexAttr` and `CondAttr` are sixteen bytes and have no room for it.
 pub struct Record {
     at: u64,
     kind: Kind,
@@ -148,8 +148,7 @@ pub enum State {
     /// A static initializer, not yet turned into an object. The signature says
     /// *which* - a recursive mutex and a plain one are different objects.
     Fresh(u64),
-    /// Not an object of this kind, or one that has been destroyed, or a byte copy
-    /// of one built somewhere else.
+    /// Not an object of this kind, or one that has been destroyed.
     Invalid,
 }
 
@@ -201,10 +200,8 @@ impl Record {
 
     fn classify(&self, signature: u64) -> State {
         if signature == ours(self.kind) {
-            return match self.identity_matches() {
-                true => State::Live,
-                false => State::Invalid,
-            };
+            self.adopt();
+            return State::Live;
         }
         match self.kind.is_static_initializer(signature) {
             true => State::Fresh(signature),
@@ -212,17 +209,18 @@ impl Record {
         }
     }
 
-    /// Whether this record was built at this address.
-    fn identity_matches(&self) -> bool {
+    /// Claim a byte copy of a record built elsewhere for this address.
+    fn adopt(&self) {
         if !self.kind.tracks_identity() {
-            return true;
+            return;
         }
-        let identity = self.word(IDENTITY).load(Ordering::Relaxed);
-        if identity == self.at {
-            return true;
+        let word = self.word(IDENTITY);
+        let identity = word.load(Ordering::Relaxed);
+        if identity != self.at {
+            say_copied(self.kind, self.at, identity);
+            // Racing adopters all store the same value.
+            let _ = word.compare_exchange(identity, self.at, Ordering::Relaxed, Ordering::Relaxed);
         }
-        say_copied(self.kind, self.at, identity);
-        false
     }
 
     /// Whether this record is an initialised object of its kind.
@@ -364,8 +362,7 @@ pub fn destroy_plain(record: &Record) -> i32 {
 
 /// Report that an object was copied after being initialised, once per process.
 ///
-/// The failure this prevents is quiet: copied synchronization state can appear to
-/// work while excluding the wrong set of callers. `EINVAL` alone would not say why.
+/// It works, as on Darwin, but it is outside POSIX and worth knowing about.
 pub(crate) fn say_copied(kind: Kind, at: u64, identity: u64) {
     use std::sync::atomic::AtomicBool;
     static SAID: AtomicBool = AtomicBool::new(false);
@@ -373,7 +370,7 @@ pub(crate) fn say_copied(kind: Kind, at: u64, identity: u64) {
         return;
     }
     let _ = (kind, at, identity);
-    const MESSAGE: &[u8] = b"rosemary: pthread: a copied initialised pthread object was refused\n";
+    const MESSAGE: &[u8] = b"rosemary: pthread: a copied initialised pthread object was adopted\n";
     // SAFETY: a fixed static buffer; `write` is async-signal-safe.
     unsafe { libc::write(libc::STDERR_FILENO, MESSAGE.as_ptr().cast(), MESSAGE.len()) };
 }

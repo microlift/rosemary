@@ -1113,6 +1113,7 @@ unsafe extern "C" fn filtered_set(receiver: Id, _sel: Sel, predicate: Id) -> Id 
         corefoundation::api::CFAutorelease(corefoundation::collections::new_set(
             &kept,
             corefoundation::callbacks::Policy::from_type_callbacks(),
+            false,
         )) as Id
     }
 }

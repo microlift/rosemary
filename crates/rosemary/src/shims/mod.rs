@@ -10,6 +10,9 @@ pub mod atexit;
 /// host, and which implementation the call lands on is decided inside.
 pub mod audiounit;
 pub mod block;
+/// Not gated, for the reason [`cfuuid`] is not: a `CFRange` return is a
+/// calling-convention problem on either host.
+pub mod cfstring;
 /// Not gated: which registry the legacy spellings reach is decided inside, the
 /// same way [`audiounit`]'s is.
 pub mod component;
@@ -103,6 +106,7 @@ fn platform_shim_for(name: &str) -> Option<Shim> {
         .or_else(|| opengl::shim_for(name))
         .or_else(|| coremedia::shim_for(name))
         .or_else(|| cfuuid::shim_for(name))
+        .or_else(|| cfstring::shim_for(name))
         .or_else(|| macos_shim_for(name))
 }
 

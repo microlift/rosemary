@@ -211,12 +211,20 @@ fn arena_slot() -> Option<*mut Class> {
         .then(|| (base + index * CLASS_STRIDE) as *mut Class)
 }
 
+/// `OBJC_MAX_CLASS_SIZE`: what `objc_initializeClassPair` callers allocate for
+/// each of the class and the metaclass, and the promise that a class never
+/// outgrows it.
+pub const MAX_CLASS_SIZE: usize = 32 * size_of::<usize>();
+
+const _: () = assert!(size_of::<Class>() <= MAX_CLASS_SIZE);
+
 impl Class {
     fn new(
         name: CString,
         superclass: *mut Class,
         is_meta: bool,
         instance_size: usize,
+        storage: Option<*mut Class>,
     ) -> &'static Class {
         let class = Class {
             isa: AtomicPtr::new(std::ptr::null_mut()),
@@ -232,6 +240,18 @@ impl Class {
             contents: RwLock::new(Contents::default()),
         };
         let _building = BUILDING.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(slot) = storage {
+            // SAFETY: the caller's `MAX_CLASS_SIZE` bytes, aligned, which it
+            // keeps for as long as the class is in use.
+            unsafe { slot.write(class) };
+            overflow(slot as usize)
+                .write()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert(slot as usize, ());
+            OVERFLOWED.store(true, Ordering::Release);
+            // SAFETY: as above.
+            return unsafe { &*slot };
+        }
         match arena_slot() {
             Some(slot) => {
                 // SAFETY: an unused, aligned slot of a reservation that is never
@@ -688,6 +708,30 @@ pub fn allocate_pair(
     name: &CStr,
     extra: usize,
 ) -> Option<&'static Class> {
+    build_pair(superclass, name, extra, None)
+}
+
+/// [`allocate_pair`] into storage the caller owns: `objc_initializeClassPair`.
+///
+/// # Safety
+///
+/// `class` and `meta` are each [`MAX_CLASS_SIZE`] writable bytes aligned for a
+/// `Class`, and outlive every use of the pair.
+pub unsafe fn initialize_pair(
+    superclass: Option<&'static Class>,
+    name: &CStr,
+    class: *mut Class,
+    meta: *mut Class,
+) -> Option<&'static Class> {
+    build_pair(superclass, name, 0, Some((class, meta)))
+}
+
+fn build_pair(
+    superclass: Option<&'static Class>,
+    name: &CStr,
+    extra: usize,
+    storage: Option<(*mut Class, *mut Class)>,
+) -> Option<&'static Class> {
     let _guard = ALLOCATION.lock().unwrap_or_else(|e| e.into_inner());
     if lookup(name).is_some() {
         return None;
@@ -701,6 +745,7 @@ pub fn allocate_pair(
         superclass.map_or(std::ptr::null_mut(), ptr),
         false,
         instance_start + extra,
+        storage.map(|(class, _)| class),
     );
 
     // The metaclass's superclass is the superclass's metaclass, and a root
@@ -710,7 +755,13 @@ pub fn allocate_pair(
         Some(s) => ptr(s.metaclass()),
         None => ptr(class),
     };
-    let meta = Class::new(name, meta_super, true, size_of::<usize>());
+    let meta = Class::new(
+        name,
+        meta_super,
+        true,
+        size_of::<usize>(),
+        storage.map(|(_, meta)| meta),
+    );
 
     // Every metaclass's `isa` is the *root* metaclass, and the root metaclass's
     // is itself. That is what stops `object_getClass` recursing forever.

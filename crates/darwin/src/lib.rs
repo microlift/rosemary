@@ -97,6 +97,7 @@ pub mod rlimit;
 pub mod rosemary;
 pub mod sched;
 pub mod select;
+pub mod sem;
 pub mod shm;
 pub mod signal;
 pub mod sip;
@@ -107,6 +108,8 @@ pub mod stackprobe;
 pub mod stat;
 pub mod stdio;
 pub mod stdlib;
+#[cfg(not(target_os = "macos"))]
+pub mod strhash;
 pub mod strict;
 pub mod string;
 pub mod strtofp;
@@ -411,6 +414,7 @@ static NONPORTABLE_MODULES: &[exports::Module] = &[
     callback::MODULE,
     rlimit::MODULE,
     shm::MODULE,
+    sem::MODULE,
     oslog::MODULE,
     backtrace::MODULE,
     #[cfg(target_arch = "x86_64")]
@@ -424,6 +428,7 @@ static NONPORTABLE_MODULES: &[exports::Module] = &[
     filesec::MODULE,
     fmtcheck::MODULE,
     langinfo::MODULE,
+    strhash::MODULE,
     #[cfg(target_os = "linux")]
     utmpx::MODULE,
     vis::MODULE,

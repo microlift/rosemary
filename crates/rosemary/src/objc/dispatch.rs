@@ -131,6 +131,17 @@ pub(super) static RUNTIME: &[Runtime] = &[
     // the way back: a property handle is opaque, and the guest only ever hands
     // it to `property_getName` and its neighbours.
     rtc!([0], "class_addProperty", U8, P, P, P, I32),
+    // `BOOL class_addProtocol(Class, Protocol *)`.
+    Runtime {
+        name: "class_addProtocol",
+        types: &[U8, P, P],
+        classes: &[0],
+        class_return: false,
+        callbacks: &[],
+        blocks: &[],
+        protocols: &[1],
+        struct_return: None,
+    },
     // Spelled out rather than built by a macro, as every entry taking a
     // protocol is.
     Runtime {
@@ -184,6 +195,9 @@ pub(super) static RUNTIME: &[Runtime] = &[
     rt!("objc_autoreleasePoolPop", V, P),
     rt!("objc_autoreleasePoolPush", P),
     rtc!([0], "objc_autoreleaseReturnValue", P, P),
+    // `id objc_constructInstance(Class, void *bytes)`: the guest's own zeroed
+    // memory becomes an instance, so only the class crosses.
+    rtc!([0], "objc_constructInstance", P, P, P),
     //
     // These four are the whole of ARC's weak-reference support that SDL3's Cocoa
     // backend imports, and passthrough is right for a reason worth stating: a
@@ -198,6 +212,10 @@ pub(super) static RUNTIME: &[Runtime] = &[
     // a guest may legally weakly reference a class, and a class is the one
     // pointer that means something different on each side.
     rt!("objc_copyClassNamesForImage", P, P, P),
+    // `void objc_copyCppObjectAtomic(void *dest, const void *src,
+    // void (*copyHelper)(void *dest, const void *source))`: the helper is the
+    // guest's C++ copy assignment, called back from inside the runtime.
+    rtb!([2], "objc_copyCppObjectAtomic", V, P, P, P),
     // `void objc_copyStruct(void *dest, const void *src, ptrdiff_t size,
     // BOOL atomic, BOOL hasStrong)` - a synthesized accessor of a struct-typed
     // `atomic` property.
@@ -236,6 +254,10 @@ pub(super) static RUNTIME: &[Runtime] = &[
     // Whatever `objc_storeWeak` put in the table comes back out, so the return
     // is translated for the same reason that call's argument is.
     rtc!([1], "objc_initWeak", P, P, P),
+    // `Class objc_initializeClassPair(Class superclass, const char *name,
+    // Class cls, Class metacls)`. The last two are the guest's raw storage,
+    // not classes yet, so only the superclass and the result are translated.
+    rtc!([0] -> true, "objc_initializeClassPair", P, P, P, P, P),
     // `Class objc_loadClassref(Class *)` resolves a class reference slot, which
     // on Apple's runtime may hold a *stub* class marked by its low bit.
     rtc!([] -> true, "objc_loadClassref", P, P),
