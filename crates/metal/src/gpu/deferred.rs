@@ -62,21 +62,43 @@ impl Batch {
     /// Note that the recording names `image` only to lay it out, behind a
     /// barrier of its own which orders whatever follows. Every other command
     /// on an image is noted with [`Self::touch_subresource`].
-    pub fn name(&mut self, image: vk::Image) {
+    ///
+    /// The layout barrier waits for nothing before it, so an image placed in
+    /// a heap is first ordered after earlier writes to that heap's memory.
+    pub fn name(&mut self, gpu: &Gpu, image: vk::Image, heap: Option<&Placement>) {
         self.images.insert(image);
+        self.touch_heap(gpu, heap);
     }
 
     /// Note that the next command recorded writes one mip level and array
-    /// slice of `image`.
-    pub fn touch_subresource(&mut self, gpu: &Gpu, image: vk::Image, level: u32, slice: u32) {
+    /// slice of `image`, bound into `heap` if it is placed in one.
+    pub fn touch_subresource(
+        &mut self,
+        gpu: &Gpu,
+        image: vk::Image,
+        heap: Option<&Placement>,
+        level: u32,
+        slice: u32,
+    ) {
         self.images.insert(image);
+        self.touch_heap(gpu, heap);
         self.order(gpu, vk::Handle::as_raw(image), Some((level, slice)));
     }
 
-    /// Note that the next command recorded writes `buffer`.
-    pub fn touch_buffer(&mut self, gpu: &Gpu, buffer: vk::Buffer) {
+    /// Note that the next command recorded writes `buffer`, bound into
+    /// `heap` if it is placed in one.
+    pub fn touch_buffer(&mut self, gpu: &Gpu, buffer: vk::Buffer, heap: Option<&Placement>) {
         self.buffers_named.insert(buffer);
+        self.touch_heap(gpu, heap);
         self.order(gpu, vk::Handle::as_raw(buffer), None);
+    }
+
+    /// Resources placed in one heap may alias, and their handles differ, so a
+    /// write into a heap is ordered after every earlier one into it.
+    fn touch_heap(&mut self, gpu: &Gpu, heap: Option<&Placement>) {
+        if let Some(heap) = heap {
+            self.order(gpu, vk::Handle::as_raw(heap.memory), None);
+        }
     }
 
     /// Order a write to `part` of `handle` after an earlier write in this
