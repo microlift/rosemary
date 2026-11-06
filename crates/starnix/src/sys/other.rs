@@ -76,6 +76,10 @@ pub fn audit() -> Audit {
     Audit::default()
 }
 
+pub fn set_name(_name: &std::ffi::CStr) -> io::Result<()> {
+    Err(unsupported())
+}
+
 pub fn memory() -> Memory {
     Memory::default()
 }
