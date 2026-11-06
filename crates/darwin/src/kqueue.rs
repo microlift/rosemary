@@ -2,6 +2,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::ffi::{c_int, c_void};
 use std::sync::atomic::{AtomicI32, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use static_init::dynamic;
 
@@ -1333,6 +1334,20 @@ fn timeout_ms(timeout: *const libc::timespec) -> Result<c_int, c_int> {
     Ok(ms.min(c_int::MAX as i64) as c_int)
 }
 
+/// What is left of a wait until `deadline`, in `poll`'s milliseconds: `-1`
+/// for no deadline.
+fn remaining_ms(deadline: Option<Instant>) -> c_int {
+    let Some(deadline) = deadline else {
+        return -1;
+    };
+    let left = deadline.saturating_duration_since(Instant::now());
+    // Rounded up, as `timeout_ms` does: never back before the deadline.
+    const NANOS_PER_MS: u128 = 1_000_000;
+    left.as_nanos()
+        .div_ceil(NANOS_PER_MS)
+        .min(c_int::MAX as u128) as c_int
+}
+
 /// The descriptors to wait on: the wakeup channel, and every enabled readiness
 /// registration folded together by descriptor.
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
@@ -1449,163 +1464,133 @@ pub unsafe extern "C" fn kevent(
         return out.len() as c_int;
     }
 
-    // Held for the whole wait so no socket closes, and its number is reused,
-    // while `poll` watches it.
-    let ports = {
-        let mut state = state.lock().unwrap_or_else(|e| e.into_inner());
-        let state = &mut *state;
-        if let Err(errno) = sync_ports(&mut state.port_watch, &*state.backend, &state.registrations)
-        {
+    let deadline = match timeout_ms(timeout) {
+        Ok(-1) => None,
+        Ok(ms) => Some(Instant::now() + Duration::from_millis(ms as u64)),
+        Err(errno) => {
             crate::errno::set(crate::errno::to_host(errno));
             return -1;
         }
-        watched_ports(&state.registrations)
     };
-    let triggered = {
-        let state = state.lock().unwrap_or_else(|e| e.into_inner());
-        !state.triggered.is_empty()
-            || signals_pending(&state.registrations)
-            || ports.iter().any(|port| port.ready())
-    };
-    // Something is already waiting, so this is a collection rather than a wait.
-    let wait = match triggered {
-        true => 0,
-        false => match timeout_ms(timeout) {
-            Ok(ms) => ms,
-            Err(errno) => {
+    // A wakeup can find nothing to report (a signal another registration
+    // watches, or one already collected); Darwin returns empty only once the
+    // timeout has run out.
+    loop {
+        // Held for the whole wait so no socket closes, and its number is reused,
+        // while `poll` watches it.
+        let ports = {
+            let mut state = state.lock().unwrap_or_else(|e| e.into_inner());
+            let state = &mut *state;
+            if let Err(errno) =
+                sync_ports(&mut state.port_watch, &*state.backend, &state.registrations)
+            {
                 crate::errno::set(crate::errno::to_host(errno));
                 return -1;
             }
-        },
-    };
-    let ready = {
-        let state = state.lock().unwrap_or_else(|e| e.into_inner());
-        let backend = Arc::clone(&state.backend);
-        let registrations = state.registrations.clone();
-        drop(state);
-        let port_fds: Vec<c_int> = ports.iter().map(|port| port.fd()).collect();
-        // The host queue keeps what one wait leaves unread, so a huge
-        // `nevents` need not size the host buffer.
-        let batch = capacity.min(HOST_WAIT_BATCH);
-        match backend.wait(queue, &registrations, &port_fds, batch, wait) {
-            Ok(ready) => ready,
-            Err(errno) => {
-                crate::errno::set(errno);
-                return -1;
+            watched_ports(&state.registrations)
+        };
+        let triggered = {
+            let state = state.lock().unwrap_or_else(|e| e.into_inner());
+            !state.triggered.is_empty()
+                || signals_pending(&state.registrations)
+                || ports.iter().any(|port| port.ready())
+        };
+        // Something is already waiting, so this is a collection rather than a wait.
+        let wait = match triggered {
+            true => 0,
+            false => remaining_ms(deadline),
+        };
+        let ready = {
+            let state = state.lock().unwrap_or_else(|e| e.into_inner());
+            let backend = Arc::clone(&state.backend);
+            let registrations = state.registrations.clone();
+            drop(state);
+            let port_fds: Vec<c_int> = ports.iter().map(|port| port.fd()).collect();
+            // The host queue keeps what one wait leaves unread, so a huge
+            // `nevents` need not size the host buffer.
+            let batch = capacity.min(HOST_WAIT_BATCH);
+            match backend.wait(queue, &registrations, &port_fds, batch, wait) {
+                Ok(ready) => ready,
+                Err(errno) => {
+                    crate::errno::set(errno);
+                    return -1;
+                }
+            }
+        };
+
+        let mut state = state.lock().unwrap_or_else(|e| e.into_inner());
+        if ready.iter().any(|entry| entry.source == Source::Wake) {
+            state.backend.drain_wake();
+        }
+
+        // The user events first: a program triggers one to be told to stop, and a
+        // busy descriptor must not keep that behind it.
+        while out.len() < capacity {
+            let Some(ident) = state.triggered.pop_front() else {
+                break;
+            };
+            state.triggered_set.remove(&ident);
+            if let Some(registration) = state.registrations.get(&(ident, EVFILT_USER))
+                && registration.enabled
+            {
+                out.push(registration.fired());
             }
         }
-    };
 
-    let mut state = state.lock().unwrap_or_else(|e| e.into_inner());
-    if ready.iter().any(|entry| entry.source == Source::Wake) {
-        state.backend.drain_wake();
-    }
-
-    // The user events first: a program triggers one to be told to stop, and a
-    // busy descriptor must not keep that behind it.
-    while out.len() < capacity {
-        let Some(ident) = state.triggered.pop_front() else {
-            break;
-        };
-        state.triggered_set.remove(&ident);
-        if let Some(registration) = state.registrations.get(&(ident, EVFILT_USER))
-            && registration.enabled
-        {
-            out.push(registration.fired());
-        }
-    }
-
-    let mut signals: Vec<(usize, i16)> = state
-        .registrations
-        .keys()
-        .filter(|key| key.1 == EVFILT_SIGNAL)
-        .copied()
-        .collect();
-    signals.sort_unstable();
-    for key in signals {
-        if out.len() == capacity {
-            break;
-        }
-        let Some(registration) = state.registrations.get_mut(&key) else {
-            continue;
-        };
-        let count = crate::signal::delivered(registration.ident as i32);
-        if !registration.enabled || count <= registration.seen {
-            continue;
-        }
-        let mut event = registration.fired();
-        event.data = (count - registration.seen) as isize;
-        registration.seen = count;
-        out.push(event);
-        let (ident, flags) = (registration.ident, registration.flags);
-        if flags & EV_ONESHOT != 0 {
-            state.registrations.remove(&key);
-            let _ = crate::signal::observe(ident as i32, false);
-            release_signal_waker(&state);
-        } else if flags & EV_DISPATCH != 0 {
-            registration.enabled = false;
-        }
-    }
-
-    let mut machports: Vec<(usize, i16)> = state
-        .registrations
-        .keys()
-        .filter(|key| key.1 == EVFILT_MACHPORT)
-        .copied()
-        .collect();
-    machports.sort_unstable();
-    for key in machports {
-        if out.len() == capacity {
-            break;
-        }
-        let Some(registration) = state.registrations.get_mut(&key) else {
-            continue;
-        };
-        // An `EV_CLEAR` registration fires on an arrival, from the backend.
-        if !registration.enabled || registration.flags & EV_CLEAR != 0 {
-            continue;
-        }
-        // Darwin names the member the message waits on, not the set.
-        let Some(member) = receivers(registration.ident as Name)
-            .into_iter()
-            .find(|(_, port)| port.ready())
-            .map(|(name, _)| name)
-        else {
-            continue;
-        };
-        let mut event = registration.fired();
-        event.data = member as isize;
-        out.push(event);
-        if registration.flags & EV_DISPATCH != 0 {
-            registration.enabled = false;
-        }
-        if registration.flags & EV_ONESHOT != 0 {
-            state.registrations.remove(&key);
-        }
-    }
-
-    let mut ports_changed = false;
-    for entry in &ready {
-        if out.len() == capacity || entry.source != Source::Port {
-            continue;
-        }
-        let Some(port) = state.port_watch.get(&entry.fd).cloned() else {
-            continue;
-        };
-        let mut firing: Vec<((usize, i16), Registration)> = state
+        let mut signals: Vec<(usize, i16)> = state
             .registrations
-            .iter()
-            .filter(|(_, r)| r.filter == EVFILT_MACHPORT && r.enabled && r.flags & EV_CLEAR != 0)
-            .map(|(key, r)| (*key, *r))
+            .keys()
+            .filter(|key| key.1 == EVFILT_SIGNAL)
+            .copied()
             .collect();
-        firing.sort_unstable_by_key(|(key, _)| *key);
-        for (key, registration) in firing {
+        signals.sort_unstable();
+        for key in signals {
             if out.len() == capacity {
                 break;
             }
+            let Some(registration) = state.registrations.get_mut(&key) else {
+                continue;
+            };
+            let count = crate::signal::delivered(registration.ident as i32);
+            if !registration.enabled || count <= registration.seen {
+                continue;
+            }
+            let mut event = registration.fired();
+            event.data = (count - registration.seen) as isize;
+            registration.seen = count;
+            out.push(event);
+            let (ident, flags) = (registration.ident, registration.flags);
+            if flags & EV_ONESHOT != 0 {
+                state.registrations.remove(&key);
+                let _ = crate::signal::observe(ident as i32, false);
+                release_signal_waker(&state);
+            } else if flags & EV_DISPATCH != 0 {
+                registration.enabled = false;
+            }
+        }
+
+        let mut machports: Vec<(usize, i16)> = state
+            .registrations
+            .keys()
+            .filter(|key| key.1 == EVFILT_MACHPORT)
+            .copied()
+            .collect();
+        machports.sort_unstable();
+        for key in machports {
+            if out.len() == capacity {
+                break;
+            }
+            let Some(registration) = state.registrations.get_mut(&key) else {
+                continue;
+            };
+            // An `EV_CLEAR` registration fires on an arrival, from the backend.
+            if !registration.enabled || registration.flags & EV_CLEAR != 0 {
+                continue;
+            }
+            // Darwin names the member the message waits on, not the set.
             let Some(member) = receivers(registration.ident as Name)
                 .into_iter()
-                .find(|(_, member)| Arc::ptr_eq(member, &port))
+                .find(|(_, port)| port.ready())
                 .map(|(name, _)| name)
             else {
                 continue;
@@ -1613,101 +1598,148 @@ pub unsafe extern "C" fn kevent(
             let mut event = registration.fired();
             event.data = member as isize;
             out.push(event);
+            if registration.flags & EV_DISPATCH != 0 {
+                registration.enabled = false;
+            }
             if registration.flags & EV_ONESHOT != 0 {
                 state.registrations.remove(&key);
-                ports_changed = true;
-            } else if registration.flags & EV_DISPATCH != 0 {
-                if let Some(registration) = state.registrations.get_mut(&key) {
-                    registration.enabled = false;
-                }
-                ports_changed = true;
             }
         }
-    }
-    if ports_changed {
-        let state = &mut *state;
-        let _ = sync_ports(&mut state.port_watch, &*state.backend, &state.registrations);
-    }
 
-    for entry in ready {
-        if out.len() == capacity || entry.revents == 0 {
-            continue;
+        let mut ports_changed = false;
+        for entry in &ready {
+            if out.len() == capacity || entry.source != Source::Port {
+                continue;
+            }
+            let Some(port) = state.port_watch.get(&entry.fd).cloned() else {
+                continue;
+            };
+            let mut firing: Vec<((usize, i16), Registration)> = state
+                .registrations
+                .iter()
+                .filter(|(_, r)| {
+                    r.filter == EVFILT_MACHPORT && r.enabled && r.flags & EV_CLEAR != 0
+                })
+                .map(|(key, r)| (*key, *r))
+                .collect();
+            firing.sort_unstable_by_key(|(key, _)| *key);
+            for (key, registration) in firing {
+                if out.len() == capacity {
+                    break;
+                }
+                let Some(member) = receivers(registration.ident as Name)
+                    .into_iter()
+                    .find(|(_, member)| Arc::ptr_eq(member, &port))
+                    .map(|(name, _)| name)
+                else {
+                    continue;
+                };
+                let mut event = registration.fired();
+                event.data = member as isize;
+                out.push(event);
+                if registration.flags & EV_ONESHOT != 0 {
+                    state.registrations.remove(&key);
+                    ports_changed = true;
+                } else if registration.flags & EV_DISPATCH != 0 {
+                    if let Some(registration) = state.registrations.get_mut(&key) {
+                        registration.enabled = false;
+                    }
+                    ports_changed = true;
+                }
+            }
         }
-        // A level entry answers the plain registrations on the descriptor and
-        // an edge entry the `EV_CLEAR` ones, so a hangup the level side keeps
-        // reporting does not re-fire an edge registration.
-        let edge = match entry.source {
-            Source::Level => false,
-            Source::Edge => true,
-            Source::Wake | Source::Port => continue,
-        };
-        let firing: Vec<((usize, i16), Registration)> = state
-            .registrations
-            .iter()
-            .filter(|(_, r)| r.enabled && r.ident == entry.fd as usize && edge_triggered(r) == edge)
-            .map(|(key, r)| (*key, *r))
-            .collect();
-        for (key, registration) in firing {
-            if out.len() == capacity {
-                break;
+        if ports_changed {
+            let state = &mut *state;
+            let _ = sync_ports(&mut state.port_watch, &*state.backend, &state.registrations);
+        }
+
+        for entry in ready {
+            if out.len() == capacity || entry.revents == 0 {
+                continue;
             }
-            let mut event = registration.fired();
-            if registration.filter == EVFILT_SOCK {
-                let now = SelectedBackend::socket_conditions(entry.fd);
-                let reported = now & registration.fflags;
-                if reported as u64 & !registration.seen == 0 {
-                    continue;
+            // A level entry answers the plain registrations on the descriptor and
+            // an edge entry the `EV_CLEAR` ones, so a hangup the level side keeps
+            // reporting does not re-fire an edge registration.
+            let edge = match entry.source {
+                Source::Level => false,
+                Source::Edge => true,
+                Source::Wake | Source::Port => continue,
+            };
+            let firing: Vec<((usize, i16), Registration)> = state
+                .registrations
+                .iter()
+                .filter(|(_, r)| {
+                    r.enabled && r.ident == entry.fd as usize && edge_triggered(r) == edge
+                })
+                .map(|(key, r)| (*key, *r))
+                .collect();
+            for (key, registration) in firing {
+                if out.len() == capacity {
+                    break;
                 }
-                if let Some(registration) = state.registrations.get_mut(&key) {
-                    registration.seen |= reported as u64;
-                }
-                event.fflags = reported;
-                event.data = match now {
-                    now if now & NOTE_DISCONNECTED != 0 => SOCKEV_DISCONNECTED,
-                    now if now & NOTE_CONNECTED != 0 => SOCKEV_CONNECTED,
-                    _ => 0,
-                };
-            } else {
-                let wanted = match registration.filter {
-                    EVFILT_READ => libc::POLLIN,
-                    EVFILT_WRITE => libc::POLLOUT,
-                    _ => continue,
-                };
-                // The three conditions `poll` reports whether or not they were
-                // asked for. A hangup or an error is readiness as far as kqueue
-                // is concerned - the read that follows is what reports it.
-                if entry.revents & (wanted | libc::POLLERR | libc::POLLHUP | libc::POLLNVAL) == 0 {
-                    continue;
-                }
-                if entry.revents & libc::POLLNVAL != 0 {
-                    event.flags |= EV_ERROR;
-                    event.data = crate::errno::from_host(libc::EBADF) as isize;
+                let mut event = registration.fired();
+                if registration.filter == EVFILT_SOCK {
+                    let now = SelectedBackend::socket_conditions(entry.fd);
+                    let reported = now & registration.fflags;
+                    if reported as u64 & !registration.seen == 0 {
+                        continue;
+                    }
+                    if let Some(registration) = state.registrations.get_mut(&key) {
+                        registration.seen |= reported as u64;
+                    }
+                    event.fflags = reported;
+                    event.data = match now {
+                        now if now & NOTE_DISCONNECTED != 0 => SOCKEV_DISCONNECTED,
+                        now if now & NOTE_CONNECTED != 0 => SOCKEV_CONNECTED,
+                        _ => 0,
+                    };
                 } else {
-                    if entry.revents & libc::POLLHUP != 0 {
-                        event.flags |= EV_EOF;
+                    let wanted = match registration.filter {
+                        EVFILT_READ => libc::POLLIN,
+                        EVFILT_WRITE => libc::POLLOUT,
+                        _ => continue,
+                    };
+                    // The three conditions `poll` reports whether or not they were
+                    // asked for. A hangup or an error is readiness as far as kqueue
+                    // is concerned - the read that follows is what reports it.
+                    if entry.revents & (wanted | libc::POLLERR | libc::POLLHUP | libc::POLLNVAL)
+                        == 0
+                    {
+                        continue;
                     }
-                    if registration.filter == EVFILT_READ {
-                        event.data = readable_bytes(entry.fd);
+                    if entry.revents & libc::POLLNVAL != 0 {
+                        event.flags |= EV_ERROR;
+                        event.data = crate::errno::from_host(libc::EBADF) as isize;
+                    } else {
+                        if entry.revents & libc::POLLHUP != 0 {
+                            event.flags |= EV_EOF;
+                        }
+                        if registration.filter == EVFILT_READ {
+                            event.data = readable_bytes(entry.fd);
+                        }
                     }
                 }
-            }
-            out.push(event);
-            // `EV_ONESHOT` deletes the registration once it has fired and
-            // `EV_DISPATCH` disables it until it is enabled again. Both are how
-            // a caller avoids being handed the same readiness on every turn.
-            if registration.flags & EV_ONESHOT != 0 {
-                let before = interest_for::<SelectedBackend>(&state.registrations, entry.fd);
-                state.registrations.remove(&key);
-                let after = interest_for::<SelectedBackend>(&state.registrations, entry.fd);
-                let _ = state.backend.update(entry.fd, before, after);
-            } else if registration.flags & EV_DISPATCH != 0 {
-                let before = interest_for::<SelectedBackend>(&state.registrations, entry.fd);
-                if let Some(registration) = state.registrations.get_mut(&key) {
-                    registration.enabled = false;
+                out.push(event);
+                // `EV_ONESHOT` deletes the registration once it has fired and
+                // `EV_DISPATCH` disables it until it is enabled again. Both are how
+                // a caller avoids being handed the same readiness on every turn.
+                if registration.flags & EV_ONESHOT != 0 {
+                    let before = interest_for::<SelectedBackend>(&state.registrations, entry.fd);
+                    state.registrations.remove(&key);
+                    let after = interest_for::<SelectedBackend>(&state.registrations, entry.fd);
+                    let _ = state.backend.update(entry.fd, before, after);
+                } else if registration.flags & EV_DISPATCH != 0 {
+                    let before = interest_for::<SelectedBackend>(&state.registrations, entry.fd);
+                    if let Some(registration) = state.registrations.get_mut(&key) {
+                        registration.enabled = false;
+                    }
+                    let after = interest_for::<SelectedBackend>(&state.registrations, entry.fd);
+                    let _ = state.backend.update(entry.fd, before, after);
                 }
-                let after = interest_for::<SelectedBackend>(&state.registrations, entry.fd);
-                let _ = state.backend.update(entry.fd, before, after);
             }
+        }
+        if !out.is_empty() || wait == 0 {
+            break;
         }
     }
     // SAFETY: the caller states there is room for `nevents`, and `out` never
@@ -1770,11 +1802,26 @@ mod tests {
         tv_nsec: 0,
     };
 
-    /// A pipe, as the two descriptors a readiness test needs.
+    /// Held while a test starts a child, and by a test that needs to see a
+    /// descriptor's last close: until the child execs it holds a copy of every
+    /// descriptor, close-on-exec or not.
+    static CHILD_START: Mutex<()> = Mutex::new(());
+
+    fn child_start() -> std::sync::MutexGuard<'static, ()> {
+        CHILD_START.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// A pipe, as the two descriptors a readiness test needs. Close-on-exec,
+    /// so a child another test starts does not hold an end open.
     fn pipe() -> (c_int, c_int) {
         let mut ends = [0 as c_int; 2];
-        // SAFETY: a live array of two `int`.
-        assert_eq!(unsafe { libc::pipe(ends.as_mut_ptr()) }, 0);
+        // SAFETY: a live array of two `int`, then the two descriptors it got.
+        unsafe {
+            assert_eq!(libc::pipe(ends.as_mut_ptr()), 0);
+            for end in ends {
+                libc::fcntl(end, libc::F_SETFD, libc::FD_CLOEXEC);
+            }
+        }
         (ends[0], ends[1])
     }
 
@@ -2111,7 +2158,9 @@ mod tests {
             ..Kevent::default()
         };
         assert_eq!(collect(queue, Some(&add)).0, 0);
+        let start = child_start();
         let mut child = std::process::Command::new("true").spawn().expect("true");
+        drop(start);
         child.wait().expect("the child");
         let mut got = [Kevent::default(); 1];
         let timeout = libc::timespec {
@@ -2133,6 +2182,169 @@ mod tests {
         assert!(got[0].data >= 1);
         // SAFETY: this test's own descriptor.
         unsafe { crate::net::descriptor::close(queue) };
+    }
+
+    /// How many stops [`a_signal_event_sees_every_stop_of_a_default_stop_signal`]
+    /// sends.
+    const STOPS: isize = 2;
+
+    /// Marks the process running [`stop_watcher_child`].
+    const STOP_WATCHER: &str = "ROSEMARY_KQUEUE_TEST_STOP_WATCHER";
+
+    /// Where [`stop_watcher_child`] reports: stderr, which the test harness
+    /// leaves alone when nothing fails.
+    const STOP_WATCHER_REPORT: c_int = libc::STDERR_FILENO;
+
+    /// A watched stop signal still stops the process, and the watch survives
+    /// the stop: a job-control shell sees every ^Z, not only the first.
+    #[test]
+    fn a_signal_event_sees_every_stop_of_a_default_stop_signal() {
+        use std::os::fd::{FromRawFd, OwnedFd};
+        use std::os::unix::process::CommandExt;
+        let host =
+            crate::signal::signal_to_host(crate::signal::signum::SIGTSTP).expect("a host signal");
+        let (report_read, report_write) = pipe();
+        let start = child_start();
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "kqueue::tests::stop_watcher_child"])
+            .env(STOP_WATCHER, "1")
+            // SAFETY: the write end, owned from here on.
+            .stderr(unsafe { OwnedFd::from_raw_fd(report_write) })
+            // A group of its own, with this process outside it: the kernel
+            // discards stop signals sent to an orphaned group.
+            .process_group(0)
+            .spawn()
+            .expect("the test binary");
+        drop(start);
+        let pid = child.id() as libc::pid_t;
+        let mut byte = 0u8;
+        let mut status = 0;
+        // SAFETY: this test's own pipe and child.
+        unsafe {
+            assert_eq!(libc::read(report_read, (&raw mut byte).cast(), 1), 1);
+            for _ in 0..STOPS {
+                assert_eq!(libc::kill(pid, host), 0);
+                assert_eq!(libc::waitpid(pid, &mut status, libc::WUNTRACED), pid);
+                assert!(libc::WIFSTOPPED(status));
+                assert_eq!(libc::WSTOPSIG(status), host, "stopped by the signal itself");
+                assert_eq!(libc::kill(pid, libc::SIGCONT), 0);
+                assert_eq!(libc::read(report_read, (&raw mut byte).cast(), 1), 1);
+            }
+            libc::close(report_read);
+        }
+        let status = child.wait().expect("the child");
+        assert_eq!(status.code().map(|code| code as isize), Some(STOPS));
+    }
+
+    /// The watcher for the test above, in a process of its own: it reports
+    /// once ready and once per event, and exits with the number of stops seen.
+    #[test]
+    fn stop_watcher_child() {
+        if std::env::var_os(STOP_WATCHER).is_none() {
+            return;
+        }
+        let report = STOP_WATCHER_REPORT;
+        let queue = kqueue();
+        let add = Kevent {
+            ident: crate::signal::signum::SIGTSTP as usize,
+            filter: EVFILT_SIGNAL,
+            flags: EV_ADD,
+            ..Kevent::default()
+        };
+        let timeout = libc::timespec {
+            tv_sec: 5,
+            tv_nsec: 0,
+        };
+        let mut got = [Kevent::default(); 1];
+        let mut seen = 0;
+        // SAFETY: one change, room for one event, then this process's exit.
+        unsafe {
+            kevent(
+                queue,
+                &raw const add,
+                1,
+                got.as_mut_ptr(),
+                0,
+                &raw const NO_WAIT,
+            );
+            libc::write(report, c"r".as_ptr().cast(), 1);
+            while seen < STOPS {
+                match kevent(
+                    queue,
+                    std::ptr::null(),
+                    0,
+                    got.as_mut_ptr(),
+                    1,
+                    &raw const timeout,
+                ) {
+                    0 => break,
+                    1 => {
+                        seen += got[0].data;
+                        libc::write(report, c"e".as_ptr().cast(), 1);
+                    }
+                    _ => continue,
+                }
+            }
+            libc::_exit(seen as c_int);
+        }
+    }
+
+    /// A wakeup for a signal another queue watches is not an event, and the
+    /// wait goes on until its timeout.
+    #[test]
+    fn a_wait_outlasts_a_signal_another_queue_watches() {
+        // Signals no other test raises in this process, so nothing else
+        // reaches the queue that waits.
+        use crate::signal::signum::{SIGCONT, SIGIO};
+        const WAIT: Duration = Duration::from_millis(300);
+        let watching = |signal: i32| {
+            let queue = kqueue();
+            let add = Kevent {
+                ident: signal as usize,
+                filter: EVFILT_SIGNAL,
+                flags: EV_ADD,
+                ..Kevent::default()
+            };
+            assert_eq!(collect(queue, Some(&add)).0, 0);
+            queue
+        };
+        let waiting = watching(SIGIO);
+        let other = watching(SIGCONT);
+        let host = crate::signal::signal_to_host(SIGCONT).expect("a host signal");
+        let raiser = std::thread::spawn(move || {
+            std::thread::sleep(WAIT / 4);
+            // SAFETY: continuing a running process does nothing.
+            unsafe { libc::raise(host) };
+        });
+        let timeout = libc::timespec {
+            tv_sec: 0,
+            tv_nsec: WAIT.as_nanos() as i64,
+        };
+        let mut got = [Kevent::default(); 1];
+        let started = Instant::now();
+        // SAFETY: no changes, room for one event.
+        let n = unsafe {
+            kevent(
+                waiting,
+                std::ptr::null(),
+                0,
+                got.as_mut_ptr(),
+                1,
+                &raw const timeout,
+            )
+        };
+        raiser.join().unwrap();
+        assert_eq!(n, 0);
+        assert!(
+            started.elapsed() >= WAIT,
+            "returned after {:?}",
+            started.elapsed()
+        );
+        // SAFETY: this test's own descriptors.
+        unsafe {
+            crate::net::descriptor::close(waiting);
+            crate::net::descriptor::close(other);
+        }
     }
 
     /// A filter this module cannot answer is refused, and `EV_RECEIPT` is how
@@ -2395,8 +2607,10 @@ mod tests {
         assert_eq!(got.data, SOCKEV_CONNECTED);
         assert_eq!(collect(queue, None).0, 0, "and only once");
 
+        let start = child_start();
         drop(peer);
         let (n, got) = collect(queue, None);
+        drop(start);
         assert_eq!(n, 1);
         assert_eq!(got.fflags, NOTE_READCLOSED | NOTE_DISCONNECTED);
         assert_eq!(got.data, SOCKEV_DISCONNECTED);
@@ -2455,6 +2669,7 @@ mod tests {
         assert_eq!(collect(queue, None).0, 1, "writable when registered");
         assert_eq!(collect(queue, None).0, 0, "and not again until it changes");
         // SAFETY: this test's own descriptors.
+        let start = child_start();
         unsafe {
             libc::close(read_end);
             assert_eq!(
@@ -2462,6 +2677,7 @@ mod tests {
                 1,
                 "the reader going away is a change"
             );
+            drop(start);
             libc::close(write_end);
             crate::net::descriptor::close(queue);
         }

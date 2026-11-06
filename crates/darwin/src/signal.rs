@@ -705,6 +705,53 @@ fn default_ignored(darwin: i32) -> bool {
     )
 }
 
+/// Signals whose default action is to stop the process.
+fn default_stops(darwin: i32) -> bool {
+    use signum::*;
+    matches!(darwin, SIGTSTP | SIGTTIN | SIGTTOU)
+}
+
+/// Make [`deliver`] the host handler for `host`. Async-signal-safe.
+fn install_deliver(host: c_int) -> c_int {
+    // SAFETY: a zeroed `struct sigaction` is valid on every host.
+    let mut act: libc::sigaction = unsafe { core::mem::zeroed() };
+    act.sa_sigaction = deliver as *const () as libc::sighandler_t;
+    act.sa_flags = libc::SA_SIGINFO | libc::SA_RESTART;
+    // SAFETY: a live structure; no old one is asked for.
+    unsafe { libc::sigaction(host, &act, core::ptr::null_mut()) }
+}
+
+/// Take the default stop action for `host` from inside [`deliver`], and put
+/// [`deliver`] back once the process continues so a watcher sees the next one.
+///
+/// The signal itself is raised, not `SIGSTOP`, so a parent's `waitpid` reports
+/// it and the kernel still discards it for an orphaned process group.
+///
+/// FIXME (ACCURACY): a stop signal arriving between `SIGCONT` and the
+/// reinstall stops the process without reaching a watcher.
+///
+/// # Safety
+///
+/// Called only from [`deliver`] running for `host`.
+unsafe fn replay_stop(host: c_int, slot: usize) {
+    // SAFETY: all async-signal-safe; the set and old mask are live locals.
+    unsafe {
+        libc::signal(host, libc::SIG_DFL);
+        let mut unblock: libc::sigset_t = core::mem::zeroed();
+        libc::sigemptyset(&mut unblock);
+        libc::sigaddset(&mut unblock, host);
+        let mut old: libc::sigset_t = core::mem::zeroed();
+        // Unblocked, the raise is acted on before it returns: the process
+        // stops here and resumes here on SIGCONT.
+        libc::pthread_sigmask(libc::SIG_UNBLOCK, &unblock, &mut old);
+        libc::raise(host);
+        libc::pthread_sigmask(libc::SIG_SETMASK, &old, core::ptr::null_mut());
+    }
+    if observed(slot) {
+        install_deliver(host);
+    }
+}
+
 /// Start (`on`) or stop watching `darwin` for `EVFILT_SIGNAL`, answering with
 /// the host `errno` on failure.
 pub fn observe(darwin: i32, on: bool) -> Result<(), c_int> {
@@ -755,12 +802,7 @@ pub fn observe(darwin: i32, on: bool) -> Result<(), c_int> {
             };
             GUEST_SIGINFO[slot].store(false, Ordering::Release);
             GUEST_HANDLERS[slot].store(handler, Ordering::Release);
-            // SAFETY: as above.
-            let mut act: libc::sigaction = unsafe { core::mem::zeroed() };
-            act.sa_sigaction = deliver as *const () as libc::sighandler_t;
-            act.sa_flags = libc::SA_SIGINFO | libc::SA_RESTART;
-            // SAFETY: two live structures.
-            if unsafe { libc::sigaction(host_signum, &act, core::ptr::null_mut()) } != 0 {
+            if install_deliver(host_signum) != 0 {
                 return Err(crate::errno::get());
             }
         }
@@ -809,13 +851,20 @@ extern "C" fn deliver(host: c_int, info: *mut libc::siginfo_t, context: *mut c_v
         return;
     };
     let slot = darwin as usize;
+    let handler = GUEST_HANDLERS[slot].load(Ordering::Acquire);
+    // Only here because a kqueue watches it: the default action still
+    // applies. A stop is replayed before the watcher is told, which it could
+    // not have read while stopped, so a report means the watch is back.
+    let watched_default = handler == 0 && observed(slot);
+    if watched_default && default_stops(darwin) {
+        // SAFETY: running for `host`.
+        unsafe { replay_stop(host, slot) };
+    }
     DELIVERED[slot].fetch_add(1, Ordering::AcqRel);
     crate::kqueue::signalled();
-    let handler = GUEST_HANDLERS[slot].load(Ordering::Acquire);
     if is_sentinel(handler) {
-        // Only here because a kqueue watches it: the default action still
-        // applies, and is replayed now that the watcher has been told.
-        if handler == 0 && observed(slot) && !default_ignored(darwin) {
+        if watched_default && !default_stops(darwin) && !default_ignored(darwin) {
+            // The process ends, so the handler need not come back.
             // SAFETY: both are async-signal-safe.
             unsafe {
                 libc::signal(host, libc::SIG_DFL);

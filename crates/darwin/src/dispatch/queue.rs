@@ -108,6 +108,10 @@ struct State {
     /// Held by the one worker allowed to run this serial queue's work. Unused for a
     /// concurrent queue, which has no such restriction.
     draining: bool,
+    /// A serial queue is waiting in the pool (or on its target) for a worker. With
+    /// `draining`, this keeps a serial queue in the pool at most once, however much
+    /// work is submitted to it.
+    enqueued: bool,
     /// `dispatch_suspend`s not yet balanced by a resume. Work stays queued.
     suspended: u32,
 }
@@ -135,6 +139,7 @@ fn new(label: &str, concurrent: bool, main: bool) -> u64 {
         state: Mutex::new(State {
             pending: VecDeque::new(),
             draining: false,
+            enqueued: false,
             suspended: 0,
         }),
     });
@@ -287,8 +292,9 @@ struct Pool {
 }
 
 struct PoolState {
-    /// Queues with work to run. A queue may appear more than once; a duplicate
-    /// finds nothing to do and costs one wakeup.
+    /// Queues with work to run. A concurrent queue may appear more than once; a
+    /// duplicate finds nothing to do and costs one wakeup. A serial queue appears
+    /// at most once.
     runnable: VecDeque<u64>,
     idle: usize,
     threads: usize,
@@ -383,46 +389,96 @@ fn worker() {
     }
 }
 
-/// Run at most one item from `handle`, respecting a serial queue's exclusion.
+/// Whether `q` needs handing to the pool now that `state` has work, decided under
+/// the queue's lock so that a submit and the end of a drain cannot both miss it.
+fn claim_schedule(q: &Queue, state: &mut State) -> bool {
+    if state.pending.is_empty() {
+        return false;
+    }
+    if q.concurrent {
+        return true;
+    }
+    // A draining worker takes new work before it lets go, and a suspended queue is
+    // scheduled again by its resume.
+    if state.draining || state.enqueued || state.suspended > 0 {
+        return false;
+    }
+    state.enqueued = true;
+    true
+}
+
+/// How long a worker keeps draining one serial queue before it lets the other
+/// runnable queues have a turn. Our own figure, not libdispatch's.
+const SERIAL_DRAIN_SLICE: std::time::Duration = std::time::Duration::from_millis(10);
+
+/// Run work from `handle`: one item of a concurrent queue, or a serial queue's
+/// items in order until it is empty, suspended or out of its slice.
 fn run_one(handle: u64) {
     // SAFETY: the pool holds a reference, so the queue is live.
     let Some(q) = (unsafe { queue(handle) }) else {
         return;
     };
-    let item = {
-        let mut state = q.state.lock().unwrap_or_else(|e| e.into_inner());
-        // Another worker already owns this serial queue. It re-enqueues when it is
-        // done, so the work is not lost by returning here.
-        if (!q.concurrent && state.draining) || state.suspended > 0 {
+    if q.concurrent {
+        let item = {
+            let mut state = q.state.lock().unwrap_or_else(|e| e.into_inner());
+            if state.suspended > 0 {
+                return;
+            }
+            match state.pending.pop_front() {
+                None => return,
+                Some(item) => item,
+            }
+        };
+        run_item(handle, item);
+        let more = !q
+            .state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .pending
+            .is_empty();
+        if more {
+            schedule(handle);
+        }
+        return;
+    }
+    let deadline = std::time::Instant::now() + SERIAL_DRAIN_SLICE;
+    let mut state = q.state.lock().unwrap_or_else(|e| e.into_inner());
+    state.enqueued = false;
+    if state.draining || state.suspended > 0 {
+        return;
+    }
+    state.draining = true;
+    loop {
+        let Some(item) = state.pending.pop_front() else {
+            state.draining = false;
+            return;
+        };
+        drop(state);
+        run_item(handle, item);
+        state = q.state.lock().unwrap_or_else(|e| e.into_inner());
+        if state.suspended > 0 || state.pending.is_empty() {
+            state.draining = false;
             return;
         }
-        match state.pending.pop_front() {
-            None => return,
-            Some(item) => {
-                if !q.concurrent {
-                    state.draining = true;
-                }
-                item
-            }
+        if std::time::Instant::now() >= deadline {
+            state.draining = false;
+            state.enqueued = true;
+            drop(state);
+            schedule(handle);
+            return;
         }
-    };
+    }
+}
+
+/// Run one item taken off `handle`, with no queue lock held: the work is guest
+/// code and may submit to this queue or block on another.
+fn run_item(handle: u64, item: Item) {
     // A worker thread has no pool of its own, and Apple drains one around each
     // work item; without it whatever the work autoreleases leaks.
     let pool = objc::arc::pool_push();
-    // SAFETY: guest work whose pointers are thunks. No lock is held: the work is
-    // guest code and may submit to this queue or block on another.
+    // SAFETY: guest work whose pointers are thunks.
     run_tracked(handle, || unsafe { item.run() });
     objc::arc::pool_pop(pool);
-    let more = {
-        let mut state = q.state.lock().unwrap_or_else(|e| e.into_inner());
-        if !q.concurrent {
-            state.draining = false;
-        }
-        !state.pending.is_empty()
-    };
-    if more {
-        schedule(handle);
-    }
 }
 
 /// Put `item` on `handle`.
@@ -431,16 +487,16 @@ fn submit(handle: u64, item: Item) {
     let Some(q) = (unsafe { queue(handle) }) else {
         return;
     };
-    q.state
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .pending
-        .push_back(item);
+    let needs_schedule = {
+        let mut state = q.state.lock().unwrap_or_else(|e| e.into_inner());
+        state.pending.push_back(item);
+        !q.main && claim_schedule(q, &mut state)
+    };
     // The main queue is drained by the main thread alone; handing it to the pool
     // would run its work on the wrong thread, which is the one thing it promises.
     if q.main {
         wake_main();
-    } else {
+    } else if needs_schedule {
         schedule(handle);
     }
 }
@@ -486,7 +542,11 @@ pub unsafe extern "C" fn resume(handle: u64) {
             return;
         }
         state.suspended -= 1;
-        state.suspended == 0 && !state.pending.is_empty()
+        if q.main {
+            state.suspended == 0 && !state.pending.is_empty()
+        } else {
+            state.suspended == 0 && claim_schedule(q, &mut state)
+        }
     };
     if runnable {
         if q.main {
@@ -897,6 +957,61 @@ mod tests {
         );
         // SAFETY: giving up the create reference.
         unsafe { object::release(q) };
+    }
+
+    unsafe extern "C" fn block_until_released(context: *mut c_void) {
+        // SAFETY: the test passes a live `(AtomicU32, AtomicU32)`: started, released.
+        let (started, released) = unsafe { &*(context as *const (AtomicU32, AtomicU32)) };
+        started.store(1, Ordering::Release);
+        wait_for(released, 1);
+    }
+
+    /// Work submitted while a serial queue's worker is busy waits for that worker,
+    /// rather than handing the queue to the pool again where it would wake - or
+    /// spawn - another thread that can only find the queue already taken.
+    #[test]
+    fn a_busy_serial_queue_is_not_rescheduled_per_submission() {
+        const BURST: u32 = 1000;
+        let gate = (AtomicU32::new(0), AtomicU32::new(0));
+        let counter = AtomicU32::new(0);
+        // Every time the serial queue is handed on, it lands on its target as one
+        // more pending item, which makes the handoffs countable.
+        let target = create_serial("burst target");
+        // SAFETY: a NUL-terminated label, the serial attribute and a live target.
+        let q = unsafe { queue_create_with_target(c"burst test".as_ptr(), 0, target) };
+        // SAFETY: live queues, host functions, and a gate and counter that outlive
+        // the waits below.
+        unsafe {
+            async_f(
+                q,
+                &gate as *const _ as u64,
+                block_until_released as *const () as usize as u64,
+            );
+            wait_for(&gate.0, 1);
+            for _ in 0..BURST {
+                async_f(
+                    q,
+                    &counter as *const _ as u64,
+                    bump as *const () as usize as u64,
+                );
+            }
+        }
+        // SAFETY: the test holds a reference to `target`.
+        let handoffs = unsafe { queue(target) }.map(|t| {
+            t.state
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .pending
+                .len()
+        });
+        gate.1.store(1, Ordering::Release);
+        wait_for(&counter, BURST);
+        assert_eq!(handoffs, Some(0));
+        // SAFETY: giving up the create references.
+        unsafe {
+            object::release(q);
+            object::release(target);
+        }
     }
 
     /// `dispatch_sync` must not return before the work has run.

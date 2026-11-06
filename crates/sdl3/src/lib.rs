@@ -3,10 +3,12 @@
 use std::ffi::{CStr, CString, c_char, c_int, c_void};
 use std::sync::OnceLock;
 
+pub mod compositor;
 #[cfg(any(test, feature = "test-support"))]
 pub mod isolated;
 pub mod keycodes;
 pub mod mouse;
+pub mod pointer;
 pub mod tray;
 pub mod wayland;
 #[cfg(target_os = "linux")]
@@ -273,7 +275,6 @@ struct Api {
 
     SDL_PollEvent: Option<unsafe extern "C" fn(*mut Event) -> bool>,
     SDL_PeepEvents: Option<unsafe extern "C" fn(*mut Event, c_int, c_int, u32, u32) -> c_int>,
-    SDL_WaitEventTimeout: Option<unsafe extern "C" fn(*mut Event, i32) -> bool>,
     SDL_StartTextInput: Option<unsafe extern "C" fn(Window) -> bool>,
     SDL_StopTextInput: Option<unsafe extern "C" fn(Window) -> bool>,
     SDL_TextInputActive: Option<unsafe extern "C" fn(Window) -> bool>,
@@ -510,7 +511,6 @@ fn api() -> Option<&'static Api> {
             SDL_GetFullscreenDisplayModes,
             SDL_PollEvent,
             SDL_PeepEvents,
-            SDL_WaitEventTimeout,
             SDL_StartTextInput,
             SDL_StopTextInput,
             SDL_TextInputActive,
@@ -698,6 +698,8 @@ pub fn pump() {
         return;
     }
     if let Some(pump) = api().and_then(|a| a.SDL_PumpEvents) {
+        // Dispatching configure and frame events can commit a window.
+        let _commits = crate::compositor::guard();
         // SAFETY: takes nothing, and this is a thread allowed to service the
         // queue.
         unsafe { pump() };
@@ -1681,6 +1683,7 @@ pub mod video {
         pub const RESIZABLE: u64 = 0x0000_0020;
         pub const MINIMIZED: u64 = 0x0000_0040;
         pub const MAXIMIZED: u64 = 0x0000_0080;
+        pub const MOUSE_GRABBED: u64 = 0x0000_0100;
         pub const INPUT_FOCUS: u64 = 0x0000_0200;
         pub const HIGH_PIXEL_DENSITY: u64 = 0x0000_2000;
         pub const ALWAYS_ON_TOP: u64 = 0x0001_0000;
@@ -1990,8 +1993,13 @@ pub mod video {
     pub fn poll() -> Option<Event> {
         let poll = api()?.SDL_PollEvent?;
         let mut raw = super::Event::default();
+        // Polling pumps, and dispatching configure and frame events can
+        // commit a window.
+        let commits = crate::compositor::guard();
         // SAFETY: a writable event of SDL's own size.
-        if !unsafe { poll(&mut raw) } {
+        let polled = unsafe { poll(&mut raw) };
+        drop(commits);
+        if !polled {
             return None;
         }
         Some(translate(&raw))
@@ -2026,14 +2034,24 @@ pub mod video {
 
     /// The next event, waiting up to `milliseconds` for one: for a loop with
     /// nothing to do between events, which [`poll`] would spin.
+    ///
+    /// Polls rather than calling `SDL_WaitEventTimeout`, which would hold
+    /// [`crate::compositor::guard`] - and so every present - for the whole
+    /// wait.
     pub fn wait(milliseconds: i32) -> Option<Event> {
-        let wait = api()?.SDL_WaitEventTimeout?;
-        let mut raw = super::Event::default();
-        // SAFETY: a writable event of SDL's own size.
-        if !unsafe { wait(&mut raw, milliseconds) } {
-            return None;
+        const NAP: std::time::Duration = std::time::Duration::from_millis(2);
+        let deadline = std::time::Instant::now()
+            + std::time::Duration::from_millis(milliseconds.max(0) as u64);
+        loop {
+            if let Some(event) = poll() {
+                return Some(event);
+            }
+            let left = deadline.saturating_duration_since(std::time::Instant::now());
+            if left.is_zero() {
+                return None;
+            }
+            std::thread::sleep(left.min(NAP));
         }
-        Some(translate(&raw))
     }
 
     fn translate(raw: &super::Event) -> Event {
@@ -2185,6 +2203,11 @@ pub mod video {
                 // Also kmsdrm is here because it's awesome
                 set_hint(c"SDL_VIDEO_DRIVER", c"wayland,x11,kmsdrm");
             }
+            // Two warps to the centre with the cursor hidden - a game's mouse
+            // look - would put a window into relative mode behind the
+            // runtime's back. Relative mode is the guest's to ask for, and a
+            // Wayland lock SDL took unasked collides with `crate::pointer`'s.
+            set_hint(HINT_MOUSE_EMULATE_WARP_WITH_RELATIVE, c"0");
             *up = super::init(super::init::VIDEO).is_ok();
             if *up {
                 // This thread now owns the event queue: see [`super::pump`].
@@ -2587,18 +2610,6 @@ pub mod video {
             }
         }
 
-        /// A WSI present and SDL's own show or hide commit the same
-        /// wl_surface from different threads. Under explicit sync a present
-        /// sets its acquire point before it attaches, and an SDL commit in
-        /// between commits that point with no buffer - a protocol error that
-        /// closes the display connection.
-        static SURFACE_COMMITS: Mutex<()> = Mutex::new(());
-
-        /// Hold across a `vkQueuePresentKHR` to a surface of an SDL window.
-        pub fn surface_commit_guard() -> std::sync::MutexGuard<'static, ()> {
-            SURFACE_COMMITS.lock().unwrap_or_else(|e| e.into_inner())
-        }
-
         /// Hold SDL_Window alive while a Metal swapchain and its worker
         /// threads retire. The video thread observes this token at the same
         /// destruction barrier used for asynchronous Vulkan initializers.
@@ -2913,8 +2924,11 @@ pub mod video {
         let drew = body(&described);
         // SAFETY: locked immediately above.
         unsafe { unlock(surface) };
-        // SAFETY: a window this crate created.
-        drew && unsafe { update(window) }
+        drew && {
+            let _commits = crate::compositor::guard();
+            // SAFETY: a window this crate created.
+            unsafe { update(window) }
+        }
     }
 
     /// Native addresses may be recycled after SDL_DestroyWindow. Cache the
@@ -3093,6 +3107,11 @@ pub mod video {
             return None;
         }
         register_live_window(window, None);
+        // Before the first warp: `crate::pointer` needs to know where the
+        // pointer is, and the watch's seats arrive a roundtrip later.
+        if let Some((display, _)) = wayland_surface(window) {
+            crate::wayland::watch(display);
+        }
         Some(window)
     }
 
@@ -3198,8 +3217,7 @@ pub mod video {
                     let Some(f) = api().and_then(|a| a.$entry) else {
                         return false;
                     };
-                    // Showing and hiding commit the window's surface.
-                    let commits = vulkan::surface_commit_guard();
+                    let commits = crate::compositor::guard();
                     // SAFETY: a window this crate created.
                     let done = unsafe { f(window) };
                     drop(commits);
@@ -3220,10 +3238,19 @@ pub mod video {
 
     window_call! {
         raise_window => SDL_RaiseWindow,
-        swap_window => SDL_GL_SwapWindow,
         start_text_input => SDL_StartTextInput,
         stop_text_input => SDL_StopTextInput,
         text_input_active => SDL_TextInputActive,
+    }
+
+    /// `SDL_GL_SwapWindow`: present `window`'s back buffer.
+    pub fn swap_window(window: Window) -> bool {
+        let Some(f) = api().and_then(|a| a.SDL_GL_SwapWindow) else {
+            return false;
+        };
+        let _commits = crate::compositor::guard();
+        // SAFETY: a window this crate created.
+        unsafe { f(window) }
     }
 
     /// Tell the host input method where the active editor and caret are.
@@ -3438,8 +3465,10 @@ pub mod video {
         let Some(f) = api().and_then(|a| a.SDL_SetWindowFullscreen) else {
             return false;
         };
+        let commits = crate::compositor::guard();
         // SAFETY: a window this crate created.
         let done = unsafe { f(window, on) };
+        drop(commits);
         resample_presentation_window(window);
         done
     }
@@ -4818,6 +4847,8 @@ pub mod video {
         let Some(f) = api().and_then(|a| a.SDL_WarpMouseInWindow) else {
             return false;
         };
+        // Without `wp_pointer_warp_v1`, SDL warps through a committed lock.
+        let _commits = crate::compositor::guard();
         // SAFETY: a window from SDL and two coordinates.
         unsafe { f(window, x, y) };
         true
@@ -4942,6 +4973,10 @@ pub mod video {
     /// runtime drawing its own decorations turns it off before video starts.
     pub const HINT_WAYLAND_ALLOW_LIBDECOR: &CStr = c"SDL_VIDEO_WAYLAND_ALLOW_LIBDECOR";
 
+    /// `SDL_HINT_MOUSE_EMULATE_WARP_WITH_RELATIVE`.
+    pub const HINT_MOUSE_EMULATE_WARP_WITH_RELATIVE: &CStr =
+        c"SDL_MOUSE_EMULATE_WARP_WITH_RELATIVE";
+
     /// `SDL_HINT_VIDEO_WAYLAND_PREFER_LIBDECOR`.
     pub const HINT_WAYLAND_PREFER_LIBDECOR: &CStr = c"SDL_VIDEO_WAYLAND_PREFER_LIBDECOR";
 
@@ -4955,6 +4990,8 @@ pub mod video {
         let Some(f) = api().and_then(|a| a.SDL_SetWindowRelativeMouseMode) else {
             return false;
         };
+        // Leaving the mode warps the pointer back to SDL's position.
+        let _commits = crate::compositor::guard();
         // SAFETY: a window from SDL.
         unsafe { f(window, enabled) }
     }

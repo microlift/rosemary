@@ -1,3 +1,4 @@
+use std::cell::UnsafeCell;
 use std::collections::HashSet;
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -18,13 +19,50 @@ struct Notification {
     user_info: Id,
 }
 
+/// A zeroing weak reference to a selector observer.
+///
+/// Since OS X 10.11 a center holds its observers weakly: one that deallocates
+/// without `-removeObserver:` is skipped rather than messaged, so a program
+/// built for 10.11 or later need not remove itself in `-dealloc`.
+pub(crate) struct WeakObserver(Box<UnsafeCell<Id>>);
+
+impl WeakObserver {
+    pub(crate) fn new(observer: Id) -> Self {
+        let slot = Box::new(UnsafeCell::new(std::ptr::null_mut()));
+        objc::arc::init_weak(slot.get(), observer);
+        Self(slot)
+    }
+
+    /// The observer's address, null once it has deallocated. For comparing
+    /// identity only: nothing keeps it alive.
+    pub(crate) fn address(&self) -> Id {
+        // SAFETY: a slot this owns; the runtime only ever stores a word to it.
+        unsafe { *self.0.get() }
+    }
+
+    /// The observer, retained, or null once it has begun deallocating.
+    pub(crate) fn load(&self) -> Id {
+        objc::arc::load_weak_retained(self.0.get())
+    }
+}
+
+impl Drop for WeakObserver {
+    fn drop(&mut self) {
+        objc::arc::destroy_weak(self.0.get());
+    }
+}
+
+// SAFETY: the slot is a heap word the runtime zeroes from whichever thread
+// deallocates the observer; it is never borrowed across threads.
+unsafe impl Send for WeakObserver {}
+
 /// One `-addObserver:selector:name:object:`.
 ///
-/// The observer is *not* retained, which is Apple's rule and the reason
-/// `-removeObserver:` exists at all. A center that retained its observers would
-/// keep every one of them alive forever.
+/// The observer is held weakly - see [`WeakObserver`].
 struct Observer {
-    observer: Id,
+    /// The center registered with; a private one is a separate event bus.
+    center: Id,
+    observer: WeakObserver,
     selector: Sel,
     /// `None` matches any name.
     name: Option<String>,
@@ -77,6 +115,8 @@ static CALLBACK_OBSERVERS: std::sync::Mutex<Vec<CallbackObserver>> =
 /// observer object of the guest's to outlive, so the only thing that can end one
 /// is the token being removed.
 struct BlockObserver {
+    /// The center registered with, as for [`Observer`].
+    center: Id,
     /// What `-addObserverForName:...` returned, and what `-removeObserver:`
     /// will be given back.
     token: Id,
@@ -140,60 +180,95 @@ fn tracing() -> bool {
 }
 
 pub fn post(name: &str, object: Id, user_info: Id) {
+    post_to(default_center_object(), name, object, user_info);
+}
+
+/// Post `name` to the observers of `center`.
+fn post_to(center: Id, name: &str, object: Id, user_info: Id) {
     if tracing() {
         let takers = OBSERVERS
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .iter()
-            .filter(|o| o.name.as_deref().is_none_or(|n| n == name))
-            .filter(|o| o.object.is_null() || o.object == object)
+            .filter(|o| wants(o, center, name, object))
             .count();
-        eprintln!("rosemary: foundation: post {name} object {object:p} to {takers} observer(s)");
+        eprintln!(
+            "rosemary: foundation: post {name} object {object:p} to {takers} observer(s) of \
+             {center:p}"
+        );
     }
-    deliver_to_all(make(name, object, user_info), name, object, user_info);
+    deliver_to_all(
+        center,
+        make(name, object, user_info),
+        name,
+        object,
+        user_info,
+    );
 }
 
 /// Hand `notification`, whose fields are `name`, `object` and `user_info`, to
-/// every kind of observer that asked for it.
-fn deliver_to_all(notification: Id, name: &str, object: Id, user_info: Id) {
+/// every kind of observer of `center` that asked for it.
+fn deliver_to_all(center: Id, notification: Id, name: &str, object: Id, user_info: Id) {
     // Copied out before sending: an observer is entitled to add or remove one
     // from inside its own handler, and holding the lock across the send would
     // deadlock on the first that did.
     let mut removals = REMOVALS.load(Ordering::Acquire);
-    let targets = observers_of(name, object);
+    let targets = observers_of(center, name, object);
     let mut live: Option<HashSet<(Id, Sel)>> = None;
     for (observer, selector) in targets {
-        // The center does not retain its observers, so one removed by an
-        // earlier handler of this same post may already be freed.
+        // One removed by an earlier handler of this same post must not hear it.
         let now = REMOVALS.load(Ordering::Acquire);
         if now != removals {
             removals = now;
-            live = Some(observers_of(name, object).into_iter().collect());
+            live = Some(registered(center, name, object));
         }
-        if live
+        let removed = live
             .as_ref()
-            .is_some_and(|live| !live.contains(&(observer, selector)))
-        {
-            continue;
+            .is_some_and(|live| !live.contains(&(observer, selector)));
+        if !removed {
+            // SAFETY: an observer method is `void (id, SEL, NSNotification *)`
+            // by the contract of `-addObserver:selector:name:object:`, and the
+            // observer is retained for the send.
+            unsafe { send_notification(observer, selector, notification) };
         }
-        // SAFETY: an observer method is `void (id, SEL, NSNotification *)` by
-        // the contract of `-addObserver:selector:name:object:`, and the
-        // observer is still registered, so still live by that same contract.
-        unsafe { send_notification(observer, selector, notification) };
+        objc::arc::release(observer);
     }
-    post_to_blocks(name, object, notification);
-    post_to_callbacks(cf::local_center(), name, object as *const c_void, user_info);
+    post_to_blocks(center, name, object, notification);
+    // The CoreFoundation local center is the default one; a private center has
+    // no CF spelling, so no callback can be registered on it.
+    if center == cf::local_center() {
+        post_to_callbacks(center, name, object as *const c_void, user_info);
+    }
 }
 
-/// The selector observers registered for `name` from `object`.
-fn observers_of(name: &str, object: Id) -> Vec<(Id, Sel)> {
+/// Whether a row of [`OBSERVERS`] wants `name` from `object` on `center`.
+fn wants(o: &Observer, center: Id, name: &str, object: Id) -> bool {
+    o.center == center
+        && o.name.as_deref().is_none_or(|n| n == name)
+        && (o.object.is_null() || o.object == object)
+}
+
+/// The live selector observers registered for `name` from `object`, each
+/// retained, forgetting those that have deallocated.
+fn observers_of(center: Id, name: &str, object: Id) -> Vec<(Id, Sel)> {
+    let mut table = OBSERVERS.lock().unwrap_or_else(|e| e.into_inner());
+    table.retain(|o| !o.observer.address().is_null());
+    table
+        .iter()
+        .filter(|o| wants(o, center, name, object))
+        .map(|o| (o.observer.load(), o.selector))
+        .filter(|(observer, _)| !observer.is_null())
+        .collect()
+}
+
+/// What [`observers_of`] would answer, by identity alone.
+fn registered(center: Id, name: &str, object: Id) -> HashSet<(Id, Sel)> {
     OBSERVERS
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .iter()
-        .filter(|o| o.name.as_deref().is_none_or(|n| n == name))
-        .filter(|o| o.object.is_null() || o.object == object)
-        .map(|o| (o.observer, o.selector))
+        .filter(|o| wants(o, center, name, object))
+        .map(|o| (o.observer.address(), o.selector))
         .collect()
 }
 
@@ -202,11 +277,12 @@ fn observers_of(name: &str, object: Id) -> Vec<(Id, Sel)> {
 /// Each block is copied *under the lock*: a `-removeObserver:` between the scan
 /// and the call would otherwise free a block this is about to invoke, and a
 /// queued delivery outlives the scan by definition.
-pub(crate) fn post_to_blocks(name: &str, object: Id, notification: Id) {
+fn post_to_blocks(center: Id, name: &str, object: Id, notification: Id) {
     let targets: Vec<(usize, Id)> = BLOCK_OBSERVERS
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .iter()
+        .filter(|o| o.center == center)
         .filter(|o| o.name.as_deref().is_none_or(|n| n == name))
         .filter(|o| o.object.is_null() || o.object == object)
         .map(|o| (objc::block::copy(o.block as Id) as usize, o.queue))
@@ -328,27 +404,46 @@ pub(crate) unsafe fn send_notification(observer: Id, selector: Sel, notification
     unsafe { f(observer, selector, notification) };
 }
 
+/// The fields of `notification` when this crate laid it out, or `None` for a
+/// subclass, which may keep them anywhere and answers only to its accessors.
+fn own_fields(notification: Id) -> Option<&'static Notification> {
+    // SAFETY: a live object, whose first word is its class.
+    let class = unsafe { objc::object::class_of(notification) }?;
+    // SAFETY: exactly this crate's class, so its layout is `Notification`.
+    std::ptr::eq(class, notification_class())
+        .then(|| unsafe { &*(notification as *const Notification) })
+}
+
+/// Send `notification` an accessor that is `id (id, SEL)`.
+fn accessor(notification: Id, selector: &str) -> Id {
+    // SAFETY: `-name`, `-object` and `-userInfo` are all `id (id, SEL)`.
+    unsafe {
+        let f: unsafe extern "C" fn(Id, Sel) -> Id = std::mem::transmute(objc::msg::entry());
+        f(notification, objc::sel::get(selector))
+    }
+}
+
 /// A notification's name, object and user info.
 ///
 /// # Safety
 ///
-/// `notification` must be one of this crate's.
+/// `notification` must be a live `NSNotification` or subclass instance.
 pub(crate) unsafe fn name_of(notification: Id) -> Id {
-    unsafe { (*(notification as *const Notification)).name }
+    own_fields(notification).map_or_else(|| accessor(notification, "name"), |n| n.name)
 }
 
 /// # Safety
 ///
 /// As [`name_of`].
 pub(crate) unsafe fn object_of(notification: Id) -> Id {
-    unsafe { (*(notification as *const Notification)).object }
+    own_fields(notification).map_or_else(|| accessor(notification, "object"), |n| n.object)
 }
 
 /// # Safety
 ///
 /// As [`name_of`].
 pub(crate) unsafe fn user_info_of(notification: Id) -> Id {
-    unsafe { (*(notification as *const Notification)).user_info }
+    own_fields(notification).map_or_else(|| accessor(notification, "userInfo"), |n| n.user_info)
 }
 
 unsafe extern "C" fn name(receiver: Id, _sel: Sel) -> Id {
@@ -394,7 +489,7 @@ fn center_of(class: &'static Class) -> Id {
 }
 
 unsafe extern "C" fn add_observer(
-    _receiver: Id,
+    receiver: Id,
     _sel: Sel,
     observer: Id,
     selector: Sel,
@@ -416,7 +511,8 @@ unsafe extern "C" fn add_observer(
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .push(Observer {
-            observer,
+            center: receiver,
+            observer: WeakObserver::new(observer),
             selector,
             name,
             object,
@@ -429,7 +525,7 @@ unsafe extern "C" fn add_observer(
 /// the caller never supplied: `-removeObserver:` takes one argument, so the
 /// registration has to be identifiable by a single value.
 unsafe extern "C" fn add_observer_for_name(
-    _receiver: Id,
+    receiver: Id,
     _sel: Sel,
     name: Id,
     object: Id,
@@ -449,6 +545,7 @@ unsafe extern "C" fn add_observer_for_name(
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .push(BlockObserver {
+            center: receiver,
             token,
             block: copied,
             queue: objc::arc::retain(queue),
@@ -488,17 +585,17 @@ fn drop_block_observers(keep: impl Fn(&BlockObserver) -> bool) {
     }
 }
 
-unsafe extern "C" fn remove_observer(_receiver: Id, _sel: Sel, observer: Id) {
+unsafe extern "C" fn remove_observer(receiver: Id, _sel: Sel, observer: Id) {
     OBSERVERS
         .lock()
         .unwrap_or_else(|e| e.into_inner())
-        .retain(|o| o.observer != observer);
+        .retain(|o| o.center != receiver || o.observer.address() != observer);
     REMOVALS.fetch_add(1, Ordering::Release);
-    drop_block_observers(|o| o.token != observer);
+    drop_block_observers(|o| o.center != receiver || o.token != observer);
 }
 
 unsafe extern "C" fn remove_observer_name(
-    _receiver: Id,
+    receiver: Id,
     _sel: Sel,
     observer: Id,
     name: Id,
@@ -510,38 +607,46 @@ unsafe extern "C" fn remove_observer_name(
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .retain(|o| {
-            o.observer != observer
+            o.center != receiver
+                || o.observer.address() != observer
                 || (name.is_some() && o.name != name)
                 || (!object.is_null() && o.object != object)
         });
     REMOVALS.fetch_add(1, Ordering::Release);
     drop_block_observers(|o| {
-        o.token != observer
+        o.center != receiver
+            || o.token != observer
             || (name.is_some() && o.name != name)
             || (!object.is_null() && o.object != object)
     });
 }
 
-unsafe extern "C" fn post_notification(_receiver: Id, _sel: Sel, notification: Id) {
+unsafe extern "C" fn post_notification(receiver: Id, _sel: Sel, notification: Id) {
     if notification.is_null() {
         return;
     }
-    // SAFETY: a notification this crate made.
-    let n = unsafe { &*(notification as *const Notification) };
-    // SAFETY: its name field is a string.
-    let text = unsafe { text_of(n.name) };
+    // SAFETY: an NSNotification, by the method's prototype.
+    let (name, object, user_info) = unsafe {
+        (
+            name_of(notification),
+            object_of(notification),
+            user_info_of(notification),
+        )
+    };
+    // SAFETY: a notification's name is a string.
+    let text = unsafe { text_of(name) };
     // The caller's own object is what observers receive, not a copy of it.
-    deliver_to_all(notification, &text, n.object, n.user_info);
+    deliver_to_all(receiver, notification, &text, object, user_info);
 }
 
-unsafe extern "C" fn post_name(_receiver: Id, _sel: Sel, name: Id, object: Id) {
+unsafe extern "C" fn post_name(receiver: Id, _sel: Sel, name: Id, object: Id) {
     // SAFETY: null or a string.
     let text = unsafe { text_of(name) };
-    post(&text, object, std::ptr::null_mut());
+    post_to(receiver, &text, object, std::ptr::null_mut());
 }
 
 unsafe extern "C" fn post_name_user_info(
-    _receiver: Id,
+    receiver: Id,
     _sel: Sel,
     name: Id,
     object: Id,
@@ -549,7 +654,7 @@ unsafe extern "C" fn post_name_user_info(
 ) {
     // SAFETY: null or a string.
     let text = unsafe { text_of(name) };
-    post(&text, object, user_info);
+    post_to(receiver, &text, object, user_info);
 }
 
 /// A notification name as text.
@@ -735,10 +840,8 @@ mod tests {
     static SEEN: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
 
     unsafe extern "C" fn record(_receiver: Id, _sel: Sel, notification: Id) {
-        // SAFETY: the poster built it.
-        let n = unsafe { &*(notification as *const Notification) };
-        // SAFETY: its name is a string.
-        let text = unsafe { text_of(n.name) };
+        // SAFETY: a posted notification, whose name is a string.
+        let text = unsafe { text_of(name_of(notification)) };
         SEEN.lock().unwrap_or_else(|e| e.into_inner()).push(text);
     }
 
@@ -756,10 +859,10 @@ mod tests {
 
     unsafe extern "C" fn remove_the_other(_receiver: Id, _sel: Sel, _notification: Id) {
         let other = REMOVED_BY_HANDLER.load(Ordering::SeqCst) as Id;
-        // SAFETY: the center's own method, which ignores its receiver.
+        // SAFETY: `-removeObserver:` is `void (id, SEL, id)`.
         unsafe {
             remove_observer(
-                std::ptr::null_mut(),
+                default_center_object(),
                 objc::sel::get("removeObserver:"),
                 other,
             )
@@ -786,7 +889,8 @@ mod tests {
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .push(Observer {
-                    observer: who,
+                    center: default_center_object(),
+                    observer: WeakObserver::new(who),
                     selector: objc::sel::get(selector),
                     name: Some("RosemaryRemovedMidPost".into()),
                     object: std::ptr::null_mut(),
@@ -805,7 +909,7 @@ mod tests {
         OBSERVERS
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .retain(|o| o.observer != remover);
+            .retain(|o| o.observer.address() != remover);
         assert!(!heard);
     }
 
@@ -816,7 +920,8 @@ mod tests {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .push(Observer {
-                observer: who,
+                center: default_center_object(),
+                observer: WeakObserver::new(who),
                 selector: objc::sel::get("heard:"),
                 name: Some("RosemaryWanted".into()),
                 object: std::ptr::null_mut(),
@@ -857,6 +962,153 @@ mod tests {
         );
     }
 
+    fn send0(receiver: Id, selector: &str) -> Id {
+        // SAFETY: every selector sent here is `id (id, SEL)`.
+        unsafe {
+            let f: unsafe extern "C" fn(Id, Sel) -> Id = std::mem::transmute(objc::msg::entry());
+            f(receiver, objc::sel::get(selector))
+        }
+    }
+
+    /// What each center's observer heard, as `(center, name)`.
+    static BY_CENTER: std::sync::Mutex<Vec<(usize, String)>> = std::sync::Mutex::new(Vec::new());
+
+    unsafe extern "C" fn record_center(receiver: Id, _sel: Sel, notification: Id) {
+        // SAFETY: a posted notification, whose name is a string.
+        let text = unsafe { text_of(name_of(notification)) };
+        // The observer's single ivar word holds the center it registered with.
+        let center = unsafe { *(receiver as *const usize).add(1) };
+        BY_CENTER
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push((center, text));
+    }
+
+    /// Register an observer of `name` on `center` that records into [`BY_CENTER`].
+    fn observe_on(center: Id, name: &str) -> Id {
+        crate::bootstrap();
+        let class = corefoundation::base::register(
+            c"RosemaryTestCenterObserver",
+            None,
+            2 * size_of::<usize>(),
+            false,
+        );
+        methods!(class, {
+            "heard:" => record_center, c"v24@0:8@16";
+        });
+        let who = objc::object::create_instance(class, 0);
+        // SAFETY: the instance has room for one word past its `isa`.
+        unsafe { *(who as *mut usize).add(1) = center as usize };
+        let name = crate::string::from_str(name);
+        // SAFETY: `-addObserver:selector:name:object:` is
+        // `void (id, SEL, id, SEL, id, id)`.
+        unsafe {
+            add_observer(
+                center,
+                objc::sel::get("addObserver:selector:name:object:"),
+                who,
+                objc::sel::get("heard:"),
+                name,
+                std::ptr::null_mut(),
+            )
+        };
+        objc::arc::release(name);
+        who
+    }
+
+    fn post_on(center: Id, name: &str) {
+        let name = crate::string::from_str(name);
+        // SAFETY: `-postNotificationName:object:` is `void (id, SEL, id, id)`.
+        unsafe {
+            post_name(
+                center,
+                objc::sel::get("postNotificationName:object:"),
+                name,
+                std::ptr::null_mut(),
+            )
+        };
+        objc::arc::release(name);
+    }
+
+    fn heard_by(center: Id, name: &str) -> usize {
+        BY_CENTER
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .filter(|(c, n)| *c == center as usize && n == name)
+            .count()
+    }
+
+    /// `[[NSNotificationCenter alloc] init]` is its own event bus: it neither
+    /// hears the default center's posts nor leaks its own to the default's
+    /// observers.
+    #[test]
+    fn a_private_center_does_not_hear_the_default_center() {
+        crate::bootstrap();
+        let class = objc::class::lookup(c"NSNotificationCenter").expect("registered");
+        let private = send0(send0(objc::class::ptr(class) as Id, "alloc"), "init");
+        let default = default_center_object();
+        assert_ne!(private, default);
+
+        const NAME: &str = "RosemaryPrivateCenterEvent";
+        let on_private = observe_on(private, NAME);
+        let on_default = observe_on(default, NAME);
+        post_on(default, NAME);
+        assert_eq!(
+            heard_by(private, NAME),
+            0,
+            "a default post reached a private center"
+        );
+        assert_eq!(heard_by(default, NAME), 1);
+        post_on(private, NAME);
+        assert_eq!(heard_by(private, NAME), 1);
+        assert_eq!(
+            heard_by(default, NAME),
+            1,
+            "a private post reached the default center"
+        );
+
+        for (center, who) in [(private, on_private), (default, on_default)] {
+            // SAFETY: `-removeObserver:` is `void (id, SEL, id)`.
+            unsafe { remove_observer(center, objc::sel::get("removeObserver:"), who) };
+        }
+    }
+
+    unsafe extern "C" fn subclass_name(_receiver: Id, _sel: Sel) -> Id {
+        name_object("RosemarySubclassedNotification") as Id
+    }
+
+    unsafe extern "C" fn subclass_nil(_receiver: Id, _sel: Sel) -> Id {
+        std::ptr::null_mut()
+    }
+
+    /// A subclass of `NSNotification` keeps its state where it likes and
+    /// answers through `-name`, `-object` and `-userInfo`, so posting it must
+    /// ask rather than read this crate's layout.
+    #[test]
+    fn a_notification_subclass_is_posted_under_its_own_name() {
+        crate::bootstrap();
+        let class = corefoundation::base::register(
+            c"RosemaryTestNotificationSubclass",
+            Some(notification_class()),
+            size_of::<usize>(),
+            false,
+        );
+        methods!(class, {
+            "name" => subclass_name, c"@16@0:8";
+            "object" => subclass_nil, c"@16@0:8";
+            "userInfo" => subclass_nil, c"@16@0:8";
+        });
+        let default = default_center_object();
+        let who = observe_on(default, "RosemarySubclassedNotification");
+        let notification = objc::object::create_instance(class, 0);
+        // SAFETY: `-postNotification:` is `void (id, SEL, id)`.
+        unsafe { post_notification(default, objc::sel::get("postNotification:"), notification) };
+        assert_eq!(heard_by(default, "RosemarySubclassedNotification"), 1);
+        // SAFETY: as above.
+        unsafe { remove_observer(default, objc::sel::get("removeObserver:"), who) };
+    }
+
     static HEARD: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
 
     unsafe extern "C" fn record_block(_block: Id, notification: Id) {
@@ -879,7 +1131,7 @@ mod tests {
         // literal whose `invoke` takes itself and one object.
         let token = unsafe {
             add_observer_for_name(
-                std::ptr::null_mut(),
+                default_center_object(),
                 objc::sel::get("addObserverForName:object:queue:usingBlock:"),
                 name,
                 std::ptr::null_mut(),
@@ -920,7 +1172,7 @@ mod tests {
         // SAFETY: `-removeObserver:` is `void (id, SEL, id)`.
         unsafe {
             remove_observer(
-                std::ptr::null_mut(),
+                default_center_object(),
                 objc::sel::get("removeObserver:"),
                 token,
             )
@@ -985,7 +1237,7 @@ mod tests {
         // SAFETY: `-removeObserver:` is `void (id, SEL, id)`.
         unsafe {
             remove_observer(
-                std::ptr::null_mut(),
+                default_center_object(),
                 objc::sel::get("removeObserver:"),
                 token,
             )

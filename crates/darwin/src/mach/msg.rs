@@ -551,15 +551,19 @@ fn next_message(rcv_name: Name, timeout_ms: i32) -> Result<(Datagram, Name), i32
         }
     }
     let fds: Vec<_> = ports.iter().map(|(_, port)| port.fd()).collect();
-    let Some(index) = wire::poll_any(&fds, timeout_ms) else {
-        return Err(MACH_RCV_TIMED_OUT);
-    };
-    let (name, port) = &ports[index];
-    match port.receive(0) {
-        Ok(Some(message)) => Ok((message, *name)),
-        // Another thread receiving on the same set took it first.
-        Ok(None) => Err(MACH_RCV_TIMED_OUT),
-        Err(_) => Err(MACH_RCV_INVALID_NAME),
+    let deadline = wire::Deadline::after(timeout_ms);
+    loop {
+        let Some(index) = wire::poll_any(&fds, deadline.remaining_ms()) else {
+            return Err(MACH_RCV_TIMED_OUT);
+        };
+        let (name, port) = &ports[index];
+        match port.receive(0) {
+            Ok(Some(message)) => return Ok((message, *name)),
+            // Another thread receiving on the same set took it first, or it
+            // was refused; either way the wait goes on.
+            Ok(None) => continue,
+            Err(_) => return Err(MACH_RCV_INVALID_NAME),
+        }
     }
 }
 

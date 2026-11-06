@@ -34,6 +34,8 @@ pub struct Application {
     modal_depth: usize,
     /// What the innermost stopped session answers: `-stopModalWithCode:`'s code.
     modal_code: isize,
+    /// A `termination` state: whether `-terminate:` is waiting on the delegate.
+    termination: usize,
 }
 
 pub const INSTANCE_SIZE: usize = size_of::<Application>();
@@ -682,15 +684,34 @@ unsafe extern "C" fn stop(receiver: Id, _sel: Sel, _sender: Id) {
     corefoundation::runloop::main().stop();
 }
 
+/// `NSApplicationTerminateReply`, what `-applicationShouldTerminate:` answers.
+mod terminate_reply {
+    /// `NSTerminateCancel`: the application keeps running.
+    pub const CANCEL: usize = 0;
+    /// `NSTerminateNow`.
+    pub const NOW: usize = 1;
+    /// `NSTerminateLater`: the answer arrives through
+    /// `-replyToApplicationShouldTerminate:`.
+    pub const LATER: usize = 2;
+}
+
+/// Where a termination request stands, in [`Application::termination`].
+mod termination {
+    /// No `-terminate:` is asking the delegate.
+    pub const IDLE: usize = 0;
+    /// The delegate is deciding; `-replyToApplicationShouldTerminate:` records
+    /// its answer.
+    pub const AWAITING_REPLY: usize = 1;
+    pub const APPROVED: usize = 2;
+    pub const CANCELLED: usize = 3;
+}
+
 /// `-terminate:`.
-///
-/// Apple asks the delegate `applicationShouldTerminate:` first and may be told
-/// to wait. That answer is an enumeration whose "later" arm needs a reply the
-/// program sends back asynchronously, so it is not half-implemented here: the
-/// delegate is asked nothing, and the process ends after the notification. A
-/// program that wanted to veto its own exit gets no chance to, which is worth
-/// saying out loud rather than discovering.
 unsafe extern "C" fn terminate(receiver: Id, _sel: Sel, _sender: Id) {
+    // SAFETY: an application.
+    if !unsafe { should_terminate(receiver) } {
+        return;
+    }
     // SAFETY: an application.
     let delegate = unsafe { (*(receiver as *const Application)).delegate };
     let notification =
@@ -700,6 +721,79 @@ unsafe extern "C" fn terminate(receiver: Id, _sel: Sel, _sender: Id) {
     foundation::notification::post(WILL_TERMINATE, receiver, std::ptr::null_mut());
     darwin::exit::finalize(0);
     std::process::exit(0);
+}
+
+/// Whether `-terminate:` goes ahead, as the delegate's
+/// `-applicationShouldTerminate:` decides; yes when it does not implement one.
+///
+/// An `NSTerminateLater` answer runs the main loop in `NSModalPanelRunLoopMode`,
+/// where a sheet asking to save changes can still be used, until the program
+/// sends `-replyToApplicationShouldTerminate:`. The reply may also come before the
+/// delegate returns, so it is awaited from the moment the delegate is asked.
+/// A `-terminate:` sent while one is already asking is dropped: the first
+/// request's answer decides.
+///
+/// # Safety
+///
+/// `app` must be an application, on the main thread.
+unsafe fn should_terminate(app: Id) -> bool {
+    // SAFETY: an application. Read through the pointer each time because the
+    // delegate and the loop below reenter `-replyToApplicationShouldTerminate:`.
+    let state = unsafe { &raw mut (*(app as *mut Application)).termination };
+    // SAFETY: as above.
+    if unsafe { *state } != termination::IDLE {
+        return false;
+    }
+    // SAFETY: an application.
+    let delegate = unsafe { (*(app as *const Application)).delegate };
+    let sel = objc::sel::get("applicationShouldTerminate:");
+    // SAFETY: null or a live object this runtime allocated.
+    let Some(method) = unsafe { objc::object::class_of(delegate) }.and_then(|c| c.method(sel))
+    else {
+        return true;
+    };
+    // SAFETY: as above.
+    unsafe { *state = termination::AWAITING_REPLY };
+    // SAFETY: the method is `NSApplicationTerminateReply (id, SEL, NSApplication *)`.
+    let reply = unsafe {
+        let f: unsafe extern "C" fn(Id, Sel, Id) -> usize =
+            std::mem::transmute(method.implementation());
+        f(delegate, sel, app)
+    };
+    let proceed = match reply {
+        terminate_reply::CANCEL => false,
+        terminate_reply::NOW => true,
+        terminate_reply::LATER => {
+            loop {
+                // SAFETY: as above.
+                let answer = unsafe { *state };
+                if answer != termination::AWAITING_REPLY {
+                    break answer == termination::APPROVED;
+                }
+                // SAFETY: an application, on the main thread.
+                unsafe { turn(app, MODAL_PANEL_MODE) };
+            }
+        }
+        other => objc::fail!(
+            "-applicationShouldTerminate: answered {other}, not an NSApplicationTerminateReply"
+        ),
+    };
+    // SAFETY: as above.
+    unsafe { *state = termination::IDLE };
+    proceed
+}
+
+/// `-replyToApplicationShouldTerminate:`, the answer an `NSTerminateLater`
+/// promised. Ignored when no `-terminate:` is waiting for one.
+unsafe extern "C" fn reply_to_application_should_terminate(receiver: Id, _sel: Sel, approve: u8) {
+    // SAFETY: an application.
+    let state = unsafe { &mut (*(receiver as *mut Application)).termination };
+    if *state == termination::AWAITING_REPLY {
+        *state = match approve != 0 {
+            true => termination::APPROVED,
+            false => termination::CANCELLED,
+        };
+    }
 }
 
 /// Set by `-[NSWindow close]` and taken by the event pump.
@@ -1317,6 +1411,7 @@ pub(crate) fn install() {
         "run" => run, c"v16@0:8";
         "stop:" => stop, c"v24@0:8@16";
         "terminate:" => terminate, c"v24@0:8@16";
+        "replyToApplicationShouldTerminate:" => reply_to_application_should_terminate, c"v20@0:8c16";
         "activateIgnoringOtherApps:" => activate, c"v20@0:8c16";
         "setActivationPolicy:" => set_activation_policy, c"c24@0:8q16";
         "activationPolicy" => activation_policy_of, c"q16@0:8";
@@ -1422,6 +1517,137 @@ mod tests {
         objc::arc::release(first);
         objc::arc::release(second);
         objc::arc::release(app);
+    }
+
+    /// A delegate of a class `name` whose `-applicationShouldTerminate:` is `imp`,
+    /// set on a fresh application.
+    fn application_with_termination_delegate(name: &std::ffi::CStr, imp: *const c_void) -> Id {
+        crate::bootstrap();
+        let class = corefoundation::base::register(
+            name,
+            objc::class::lookup(c"NSObject"),
+            size_of::<usize>(),
+            false,
+        );
+        class.add_method(
+            objc::sel::get("applicationShouldTerminate:"),
+            imp,
+            c"Q24@0:8@16",
+        );
+        let delegate = objc::object::create_instance(class, 0);
+        let app = objc::object::create_instance(
+            objc::class::lookup(c"NSApplication").expect("NSApplication"),
+            0,
+        );
+        // SAFETY: an application this test made.
+        unsafe { set_delegate(app, objc::sel::get("setDelegate:"), delegate) };
+        app
+    }
+
+    /// `NSTerminateCancel` is how a program keeps its unsaved work: `-terminate:`
+    /// returns and the process carries on.
+    #[test]
+    fn a_cancelled_termination_returns_without_exiting() {
+        static ASKED: AtomicUsize = AtomicUsize::new(0);
+        unsafe extern "C" fn cancel(_receiver: Id, _sel: Sel, _app: Id) -> usize {
+            ASKED.fetch_add(1, Ordering::SeqCst);
+            terminate_reply::CANCEL
+        }
+        let app = application_with_termination_delegate(
+            c"RosemaryTestCancellingTerminationDelegate",
+            cancel as *const c_void,
+        );
+        // SAFETY: `-terminate:` is `void (id, SEL, id)` and `app` is an application.
+        unsafe { terminate(app, objc::sel::get("terminate:"), std::ptr::null_mut()) };
+        assert_eq!(ASKED.load(Ordering::SeqCst), 1);
+    }
+
+    /// `NSTerminateNow` ends the process, with status zero.
+    #[test]
+    fn an_approved_termination_exits_the_process() {
+        // Forked from a single-threaded process so the child cannot inherit a
+        // lock another libtest thread held.
+        if !sdl3::isolated::run_here() {
+            return;
+        }
+        const TERMINATE_RETURNED: i32 = 3;
+        unsafe extern "C" fn now(_receiver: Id, _sel: Sel, _app: Id) -> usize {
+            terminate_reply::NOW
+        }
+        let app = application_with_termination_delegate(
+            c"RosemaryTestApprovingTerminationDelegate",
+            now as *const c_void,
+        );
+        // SAFETY: the child only terminates or exits.
+        let pid = unsafe { libc::fork() };
+        if pid == 0 {
+            // SAFETY: as in the test above.
+            unsafe { terminate(app, objc::sel::get("terminate:"), std::ptr::null_mut()) };
+            // SAFETY: leaves the child without running the harness's handlers.
+            unsafe { libc::_exit(TERMINATE_RETURNED) };
+        }
+        let mut status = 0;
+        // SAFETY: a local for the status.
+        assert_eq!(unsafe { libc::waitpid(pid, &mut status, 0) }, pid);
+        assert!(
+            libc::WIFEXITED(status),
+            "the child did not exit: {status:#x}"
+        );
+        assert_eq!(libc::WEXITSTATUS(status), 0);
+    }
+
+    /// `NSTerminateLater` runs the loop in `NSModalPanelRunLoopMode` until
+    /// `-replyToApplicationShouldTerminate:`, whose answer decides.
+    #[test]
+    fn a_later_termination_waits_in_the_modal_panel_mode_for_its_reply() {
+        if !sdl3::isolated::run_here() {
+            return;
+        }
+        static APP: AtomicUsize = AtomicUsize::new(0);
+        static SOURCE: std::sync::OnceLock<std::sync::Arc<corefoundation::runloop::Source>> =
+            std::sync::OnceLock::new();
+        unsafe extern "C" fn later(_receiver: Id, _sel: Sel, _app: Id) -> usize {
+            SOURCE.get().expect("the reply source").signal();
+            terminate_reply::LATER
+        }
+        unsafe extern "C" fn reply_no(_info: *mut c_void) {
+            let app = APP.load(Ordering::SeqCst) as Id;
+            let sel = objc::sel::get("replyToApplicationShouldTerminate:");
+            // SAFETY: `app` is the test's application.
+            unsafe { reply_to_application_should_terminate(app, sel, 0) };
+        }
+        let app = application_with_termination_delegate(
+            c"RosemaryTestDeferringTerminationDelegate",
+            later as *const c_void,
+        );
+        APP.store(app as usize, Ordering::SeqCst);
+        let source = SOURCE.get_or_init(|| corefoundation::runloop::new_source(Some(reply_no), 0));
+        corefoundation::runloop::main().add_source(source, MODAL_PANEL_MODE);
+
+        // SAFETY: an application, on this test's main thread.
+        assert!(!unsafe { should_terminate(app) });
+        // SAFETY: as above.
+        assert_eq!(
+            unsafe { (*(app as *const Application)).termination },
+            termination::IDLE
+        );
+    }
+
+    /// A reply sent before the delegate returns `NSTerminateLater` is not lost.
+    #[test]
+    fn a_reply_before_the_later_answer_decides_the_termination() {
+        unsafe extern "C" fn reply_then_later(_receiver: Id, _sel: Sel, app: Id) -> usize {
+            let sel = objc::sel::get("replyToApplicationShouldTerminate:");
+            // SAFETY: `app` is the application asking.
+            unsafe { reply_to_application_should_terminate(app, sel, 1) };
+            terminate_reply::LATER
+        }
+        let app = application_with_termination_delegate(
+            c"RosemaryTestEagerTerminationDelegate",
+            reply_then_later as *const c_void,
+        );
+        // SAFETY: an application; the reply is already in, so no loop turns.
+        assert!(unsafe { should_terminate(app) });
     }
 
     /// Tests below temporarily replace the process-wide guest argv.

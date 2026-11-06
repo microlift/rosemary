@@ -7,6 +7,9 @@
 //! `wl_pointer` of a seat gets the seat's events, so a second one on SDL's
 //! display sees the presses SDL keeps to itself. Its events arrive on the
 //! display's default queue, which SDL dispatches while pumping events.
+//!
+//! The same pointers say which surface the pointer is over and where, and can
+//! be warped through a momentary pointer lock (see [`warp_through_lock`]).
 
 use std::ffi::{CStr, c_char, c_int, c_void};
 use std::sync::{Mutex, OnceLock};
@@ -42,6 +45,114 @@ struct Client {
     wl_seat_interface: *const c_void,
     wl_pointer_interface: *const c_void,
 }
+
+/// `struct wl_message`.
+#[repr(C)]
+struct Message {
+    name: *const c_char,
+    signature: *const c_char,
+    types: *const *const Interface,
+}
+
+/// `struct wl_interface`.
+#[repr(C)]
+struct Interface {
+    name: *const c_char,
+    version: c_int,
+    method_count: c_int,
+    methods: *const Message,
+    event_count: c_int,
+    events: *const Message,
+}
+
+#[repr(transparent)]
+struct Types<const N: usize>([*const Interface; N]);
+
+// SAFETY: immutable descriptions pointing only at other statics, the shape
+// wayland-scanner emits as plain C globals.
+unsafe impl Sync for Message {}
+unsafe impl Sync for Interface {}
+unsafe impl<const N: usize> Sync for Types<N> {}
+
+const NO_TYPES: *const *const Interface = std::ptr::null();
+
+/// `zwp_pointer_constraints_v1`. SDL builds its copy with hidden visibility.
+/// Object arguments are untyped: libwayland reads a request's types only to
+/// name a new object in `WAYLAND_DEBUG` output.
+static POINTER_CONSTRAINTS_INTERFACE: Interface = Interface {
+    name: c"zwp_pointer_constraints_v1".as_ptr(),
+    version: 1,
+    method_count: 3,
+    methods: (&raw const POINTER_CONSTRAINTS_REQUESTS).cast(),
+    event_count: 0,
+    events: std::ptr::null(),
+};
+static POINTER_CONSTRAINTS_REQUESTS: [Message; 3] = [
+    Message {
+        name: c"destroy".as_ptr(),
+        signature: c"".as_ptr(),
+        types: NO_TYPES,
+    },
+    Message {
+        name: c"lock_pointer".as_ptr(),
+        signature: c"noo?ou".as_ptr(),
+        types: (&raw const LOCK_POINTER_TYPES).cast(),
+    },
+    Message {
+        name: c"confine_pointer".as_ptr(),
+        signature: c"noo?ou".as_ptr(),
+        types: (&raw const UNTYPED_FIVE).cast(),
+    },
+];
+static LOCK_POINTER_TYPES: Types<5> = Types([
+    &raw const LOCKED_POINTER_INTERFACE,
+    std::ptr::null(),
+    std::ptr::null(),
+    std::ptr::null(),
+    std::ptr::null(),
+]);
+static UNTYPED_FIVE: Types<5> = Types([std::ptr::null(); 5]);
+
+/// `zwp_locked_pointer_v1`. Its events are described so libwayland can
+/// discard the ones that arrive after the proxy is gone.
+static LOCKED_POINTER_INTERFACE: Interface = Interface {
+    name: c"zwp_locked_pointer_v1".as_ptr(),
+    version: 1,
+    method_count: 3,
+    methods: (&raw const LOCKED_POINTER_REQUESTS).cast(),
+    event_count: 2,
+    events: (&raw const LOCKED_POINTER_EVENTS).cast(),
+};
+static LOCKED_POINTER_REQUESTS: [Message; 3] = [
+    Message {
+        name: c"destroy".as_ptr(),
+        signature: c"".as_ptr(),
+        types: NO_TYPES,
+    },
+    Message {
+        name: c"set_cursor_position_hint".as_ptr(),
+        signature: c"ff".as_ptr(),
+        types: (&raw const UNTYPED_PAIR).cast(),
+    },
+    Message {
+        name: c"set_region".as_ptr(),
+        signature: c"?o".as_ptr(),
+        types: (&raw const UNTYPED_PAIR).cast(),
+    },
+];
+static LOCKED_POINTER_EVENTS: [Message; 2] = [
+    Message {
+        name: c"locked".as_ptr(),
+        signature: c"".as_ptr(),
+        types: NO_TYPES,
+    },
+    Message {
+        name: c"unlocked".as_ptr(),
+        signature: c"".as_ptr(),
+        types: NO_TYPES,
+    },
+];
+static UNTYPED_PAIR: Types<2> = Types([std::ptr::null(); 2]);
 
 // SAFETY: function pointers and pointers to libwayland's static interface
 // descriptions.
@@ -105,6 +216,12 @@ fn client() -> Option<&'static Client> {
 const WL_DISPLAY_GET_REGISTRY: u32 = 1;
 const WL_REGISTRY_BIND: u32 = 0;
 const WL_SEAT_GET_POINTER: u32 = 0;
+const WL_SURFACE_COMMIT: u32 = 6;
+const WL_MARSHAL_FLAG_DESTROY: u32 = 1;
+const ZWP_POINTER_CONSTRAINTS_V1_LOCK_POINTER: u32 = 1;
+const ZWP_POINTER_CONSTRAINTS_V1_LIFETIME_ONESHOT: u32 = 1;
+const ZWP_LOCKED_POINTER_V1_DESTROY: u32 = 0;
+const ZWP_LOCKED_POINTER_V1_SET_CURSOR_POSITION_HINT: u32 = 1;
 const WL_SEAT_CAPABILITY_POINTER: u32 = 1;
 const BTN_LEFT: u32 = 0x110;
 const PRESSED: u32 = 1;
@@ -115,6 +232,10 @@ struct State {
     focus: Vec<(usize, usize, f32, f32)>,
     /// Seats already given a pointer.
     seats: Vec<usize>,
+    /// The display's `zwp_pointer_constraints_v1`, once bound.
+    constraints: usize,
+    /// Surfaces a pointer came onto since [`take_entered`] last asked.
+    entered: Vec<usize>,
     events: Vec<PointerEvent>,
 }
 
@@ -156,6 +277,114 @@ pub fn watch(display: *mut c_void) {
             std::ptr::null_mut(),
         );
     }
+}
+
+/// The surfaces a pointer came onto since the last call, each once.
+///
+/// Apart from [`take_events`], which belongs to the titlebar. SDL reports no
+/// entry of its own for a relative-mode window it still counts as the mouse
+/// focus.
+pub fn take_entered() -> Vec<usize> {
+    with_state(|state| std::mem::take(&mut state.entered))
+}
+
+/// Where a pointer is on `surface`, surface-local, or `None` when none is
+/// over it. A locked pointer stays where it was locked, and so does this.
+pub fn pointer_at(surface: *mut c_void) -> Option<(f32, f32)> {
+    with_state(|state| {
+        state
+            .focus
+            .iter()
+            .find(|focus| focus.1 == surface as usize)
+            .map(|focus| (focus.2, focus.3))
+    })
+}
+
+/// Whether the compositor offers `zwp_pointer_constraints_v1`.
+pub fn has_pointer_constraints() -> bool {
+    with_state(|state| state.constraints != 0)
+}
+
+/// Put the pointer at `(x, y)` on `surface`, surface-local, by locking it
+/// with that position as the hint and unlocking it at once.
+///
+/// A compositor applies a lock's hint when an active lock goes, without the
+/// policy it may hold `wp_pointer_warp_v1` to: mutter warps through that only
+/// for a client clicked since the pointer entered it. SDL warps this way too,
+/// but only when the compositor lacks `wp_pointer_warp_v1`.
+///
+/// The caller must have lifted every constraint SDL holds on `surface`: a
+/// second one for the seat is a protocol error, which ends the connection.
+/// False when none of this crate's pointers is over `surface` or the
+/// compositor has no pointer constraints.
+pub fn warp_through_lock(surface: *mut c_void, x: f32, y: f32) -> bool {
+    let Some(client) = client() else {
+        return false;
+    };
+    let (constraints, pointer) = with_state(|state| {
+        let pointer = state
+            .focus
+            .iter()
+            .find(|focus| focus.1 == surface as usize)
+            .map(|focus| focus.0);
+        (state.constraints, pointer)
+    });
+    let (Some(pointer), false) = (pointer, constraints == 0) else {
+        return false;
+    };
+    let (constraints, pointer) = (constraints as Proxy, pointer as Proxy);
+    // The hint is double-buffered surface state, applied by a commit.
+    let _commits = crate::compositor::guard();
+    // SAFETY: live proxies on SDL's display, with each request spelled as the
+    // protocol's generated inline wrapper spells it.
+    unsafe {
+        let lock = (client.wl_proxy_marshal_flags)(
+            constraints,
+            ZWP_POINTER_CONSTRAINTS_V1_LOCK_POINTER,
+            (&raw const LOCKED_POINTER_INTERFACE).cast(),
+            (client.wl_proxy_get_version)(constraints),
+            0,
+            std::ptr::null_mut::<c_void>(),
+            surface,
+            pointer,
+            std::ptr::null_mut::<c_void>(),
+            ZWP_POINTER_CONSTRAINTS_V1_LIFETIME_ONESHOT,
+        );
+        if lock.is_null() {
+            return false;
+        }
+        (client.wl_proxy_marshal_flags)(
+            lock,
+            ZWP_LOCKED_POINTER_V1_SET_CURSOR_POSITION_HINT,
+            std::ptr::null(),
+            (client.wl_proxy_get_version)(lock),
+            0,
+            to_fixed(x),
+            to_fixed(y),
+        );
+        (client.wl_proxy_marshal_flags)(
+            surface,
+            WL_SURFACE_COMMIT,
+            std::ptr::null(),
+            (client.wl_proxy_get_version)(surface),
+            0,
+        );
+        (client.wl_proxy_marshal_flags)(
+            lock,
+            ZWP_LOCKED_POINTER_V1_DESTROY,
+            std::ptr::null(),
+            (client.wl_proxy_get_version)(lock),
+            WL_MARSHAL_FLAG_DESTROY,
+        );
+    }
+    // The compositor need not report the move, and a caller comparing
+    // against the old position would warp again every time it asked.
+    with_state(|state| {
+        if let Some(focus) = state.focus.iter_mut().find(|f| f.0 == pointer as usize) {
+            (focus.2, focus.3) = (x, y);
+        }
+    });
+    true
 }
 
 /// The events seen since the last call, oldest first.
@@ -219,8 +448,16 @@ unsafe extern "C" fn global(
     let Some(client) = client() else {
         return;
     };
+    if interface.is_null() {
+        return;
+    }
     // SAFETY: libwayland passes the interface's NUL-terminated name.
-    if interface.is_null() || unsafe { CStr::from_ptr(interface) } != c"wl_seat" {
+    let interface = unsafe { CStr::from_ptr(interface) };
+    if interface == c"zwp_pointer_constraints_v1" {
+        bind_pointer_constraints(client, registry, name);
+        return;
+    }
+    if interface != c"wl_seat" {
         return;
     }
     // Version 1 has every event this needs and the fewest to listen for.
@@ -247,6 +484,27 @@ unsafe extern "C" fn global(
                 std::ptr::null_mut(),
             );
         }
+    }
+}
+
+fn bind_pointer_constraints(client: &Client, registry: Proxy, name: u32) {
+    let version = 1u32;
+    // SAFETY: `wl_registry_bind` as the header's inline wrapper spells it.
+    let constraints = unsafe {
+        (client.wl_proxy_marshal_flags)(
+            registry,
+            WL_REGISTRY_BIND,
+            (&raw const POINTER_CONSTRAINTS_INTERFACE).cast(),
+            version,
+            0,
+            name,
+            POINTER_CONSTRAINTS_INTERFACE.name,
+            version,
+            std::ptr::null_mut::<c_void>(),
+        )
+    };
+    if !constraints.is_null() {
+        with_state(|state| state.constraints = constraints as usize);
     }
 }
 
@@ -291,6 +549,11 @@ fn fixed(value: i32) -> f32 {
     value as f32 / 256.0
 }
 
+/// `wl_fixed_from_double`.
+fn to_fixed(value: f32) -> i32 {
+    (f64::from(value) * 256.0).round() as i32
+}
+
 fn set_focus(pointer: *mut c_void, surface: usize, x: f32, y: f32) {
     with_state(|state| {
         state.focus.retain(|(p, ..)| *p != pointer as usize);
@@ -310,6 +573,9 @@ unsafe extern "C" fn enter(
 ) {
     set_focus(pointer, surface as usize, fixed(x), fixed(y));
     with_state(|state| {
+        if !state.entered.contains(&(surface as usize)) {
+            state.entered.push(surface as usize);
+        }
         record(
             state,
             PointerEvent::Enter {
@@ -374,4 +640,16 @@ unsafe extern "C" fn axis(
     _axis: u32,
     _value: i32,
 ) {
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_position_hint_is_in_wl_fixed() {
+        assert_eq!(to_fixed(1024.0), 1024 * 256);
+        assert_eq!(to_fixed(531.2), 135_987);
+        assert_eq!(fixed(to_fixed(-3.5)), -3.5);
+    }
 }

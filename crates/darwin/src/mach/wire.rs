@@ -67,8 +67,9 @@ pub fn fresh_address() -> Address {
 
 /// The abstract socket name for `address`, and its length.
 ///
-/// The uid is in the name only so that two users' ports are visibly separate in
-/// `ss -x`; the random address is what actually keeps them apart.
+/// Abstract names have no permissions and are listed in `/proc/net/unix`, so
+/// neither the uid nor the random address keeps another user out; the sender's
+/// credentials are checked on every receive instead (see [`admit`]).
 #[cfg(target_os = "linux")]
 fn sockaddr(address: Address) -> std::io::Result<(libc::sockaddr_un, libc::socklen_t)> {
     named(address, "")
@@ -98,23 +99,26 @@ fn named(address: Address, suffix: &str) -> std::io::Result<(libc::sockaddr_un, 
 
 /// BSD hosts bind a filesystem socket in Rosemary's private runtime directory.
 #[cfg(not(target_os = "linux"))]
-fn socket_path(address: Address) -> std::path::PathBuf {
-    server::location::runtime_directory().join(format!("mach/{address:016x}"))
+fn socket_path(address: Address) -> std::io::Result<std::path::PathBuf> {
+    Ok(server::location::private_runtime_directory("mach")?.join(format!("{address:016x}")))
 }
 
 #[cfg(not(target_os = "linux"))]
-fn senders_path(address: Address) -> std::path::PathBuf {
-    server::location::runtime_directory().join(format!("mach/{address:016x}.senders"))
+fn senders_path(address: Address) -> std::io::Result<std::path::PathBuf> {
+    Ok(
+        server::location::private_runtime_directory("mach")?
+            .join(format!("{address:016x}.senders")),
+    )
 }
 
 #[cfg(not(target_os = "linux"))]
 fn sockaddr(address: Address) -> std::io::Result<(libc::sockaddr_un, libc::socklen_t)> {
-    at_path(socket_path(address))
+    at_path(socket_path(address)?)
 }
 
 #[cfg(not(target_os = "linux"))]
 fn senders_sockaddr(address: Address) -> std::io::Result<(libc::sockaddr_un, libc::socklen_t)> {
-    at_path(senders_path(address))
+    at_path(senders_path(address)?)
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -196,8 +200,10 @@ impl Drop for Receiver {
         }
         #[cfg(not(target_os = "linux"))]
         {
-            let _ = std::fs::remove_file(socket_path(self.address));
-            let _ = std::fs::remove_file(senders_path(self.address));
+            let paths = [socket_path(self.address), senders_path(self.address)];
+            for path in paths.into_iter().flatten() {
+                let _ = std::fs::remove_file(path);
+            }
         }
     }
 }
@@ -205,8 +211,6 @@ impl Drop for Receiver {
 impl Receiver {
     /// Bind a new port. The address it answers on is fresh and unused.
     pub fn bind() -> std::io::Result<Self> {
-        #[cfg(not(target_os = "linux"))]
-        server::location::prepare(&server::location::runtime_directory().join("mach"))?;
         // Retried because two processes can draw the same address, however
         // unlikely - and the failure mode of not retrying is one run receiving
         // another's messages, which no caller could diagnose.
@@ -214,6 +218,12 @@ impl Receiver {
             let address = fresh_address();
             let (addr, len) = sockaddr(address)?;
             let fd = socket()?;
+            #[cfg(target_os = "linux")]
+            if let Err(error) = pass_credentials(fd) {
+                // SAFETY: the descriptor opened above, which nothing else holds.
+                unsafe { libc::close(fd) };
+                return Err(error);
+            }
             // SAFETY: a socket this call just opened, and an address whose
             // length is computed from the name written into it.
             let rc = unsafe { libc::bind(fd, (&raw const addr).cast(), len) };
@@ -330,10 +340,70 @@ impl Receiver {
         if let Some(held) = self.take_held() {
             return Ok(Some(held));
         }
-        if !poll_one(self.fd, timeout_ms) {
-            return Ok(None);
+        // A refused datagram is not the message the caller waits for, so the
+        // wait resumes with whatever time is left.
+        let deadline = Deadline::after(timeout_ms);
+        loop {
+            if !poll_one(self.fd, deadline.remaining_ms()) {
+                return Ok(None);
+            }
+            if let Some(message) = receive_from(self.fd)? {
+                return Ok(Some(message));
+            }
         }
-        receive_from(self.fd)
+    }
+}
+
+/// Have the kernel attach the sender's credentials to every datagram `fd`
+/// receives. Set before `bind`, so nothing can arrive without them; the option
+/// belongs to the socket and so travels with a moved receive right.
+#[cfg(target_os = "linux")]
+fn pass_credentials(fd: c_int) -> std::io::Result<()> {
+    let on: c_int = 1;
+    // SAFETY: an `int` option read from a live local of that size.
+    let rc = unsafe {
+        libc::setsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_PASSCRED,
+            (&raw const on).cast(),
+            core::mem::size_of::<c_int>() as libc::socklen_t,
+        )
+    };
+    match rc {
+        0 => Ok(()),
+        _ => Err(std::io::Error::last_os_error()),
+    }
+}
+
+/// Whether a peer with `uid` may reach this process's ports. Only the same
+/// user: on Linux the names are visible to, and reachable by, everyone.
+#[cfg(target_os = "linux")]
+pub(super) fn same_user(uid: libc::uid_t) -> bool {
+    // SAFETY: `getuid` cannot fail.
+    uid == unsafe { libc::getuid() }
+}
+
+/// When a wait of `timeout_ms` that may be resumed has to end.
+pub struct Deadline(Option<std::time::Instant>);
+
+impl Deadline {
+    /// `timeout_ms` of `-1` never ends.
+    pub fn after(timeout_ms: i32) -> Self {
+        let duration =
+            std::time::Duration::from_millis(u64::try_from(timeout_ms).ok().unwrap_or(0));
+        Deadline((timeout_ms >= 0).then(|| std::time::Instant::now() + duration))
+    }
+
+    /// What is left, in the form `poll` takes.
+    pub fn remaining_ms(&self) -> i32 {
+        match self.0 {
+            None => -1,
+            Some(at) => at
+                .saturating_duration_since(std::time::Instant::now())
+                .as_millis()
+                .min(i32::MAX as u128) as i32,
+        }
     }
 }
 
@@ -496,6 +566,17 @@ fn control_len() -> usize {
     unsafe { libc::CMSG_SPACE((MAX_FDS * core::mem::size_of::<c_int>()) as u32) as usize }
 }
 
+/// Room for the rights and, on Linux, the sender's `SCM_CREDENTIALS`.
+fn receive_control_len() -> usize {
+    #[cfg(target_os = "linux")]
+    // SAFETY: `CMSG_SPACE` is arithmetic on its argument.
+    let credentials =
+        unsafe { libc::CMSG_SPACE(core::mem::size_of::<libc::ucred>() as u32) as usize };
+    #[cfg(not(target_os = "linux"))]
+    let credentials = 0;
+    control_len() + credentials
+}
+
 /// Send `bytes` to `destination`, moving `fds` with it.
 ///
 /// The descriptors are *not* closed here: a caller that moved a right closes its
@@ -565,9 +646,11 @@ pub fn send(destination: Address, bytes: &[u8], fds: &[c_int]) -> std::io::Resul
 }
 
 /// Take one datagram from `fd`, with any descriptors that came with it.
+///
+/// `None` when nothing was waiting or the datagram was refused by [`admit`].
 fn receive_from(fd: c_int) -> std::io::Result<Option<Datagram>> {
     let mut bytes = vec![0u8; MAX_MESSAGE];
-    let mut control = vec![0u8; control_len()];
+    let mut control = vec![0u8; receive_control_len()];
     let mut iov = libc::iovec {
         iov_base: bytes.as_mut_ptr().cast(),
         iov_len: bytes.len(),
@@ -598,23 +681,10 @@ fn receive_from(fd: c_int) -> std::io::Result<Option<Datagram>> {
         }
     };
 
-    let mut fds = Vec::new();
-    // SAFETY: `msg` was just filled in by `recvmsg`, so its control block is a
-    // well-formed sequence of `cmsghdr`.
-    unsafe {
-        let mut cmsg = libc::CMSG_FIRSTHDR(&msg);
-        while !cmsg.is_null() {
-            if (*cmsg).cmsg_level == libc::SOL_SOCKET && (*cmsg).cmsg_type == libc::SCM_RIGHTS {
-                let payload = (*cmsg).cmsg_len as usize - libc::CMSG_LEN(0) as usize;
-                let count = payload / core::mem::size_of::<c_int>();
-                let data = libc::CMSG_DATA(cmsg).cast::<c_int>();
-                for i in 0..count {
-                    fds.push(data.add(i).read_unaligned());
-                }
-            }
-            cmsg = libc::CMSG_NXTHDR(&msg, cmsg);
-        }
-    }
+    // SAFETY: `msg` was just filled in by `recvmsg`.
+    let Some(fds) = (unsafe { admit(&msg) }) else {
+        return Ok(None);
+    };
 
     #[cfg(target_os = "macos")]
     for &fd in &fds {
@@ -628,6 +698,55 @@ fn receive_from(fd: c_int) -> std::io::Result<Option<Datagram>> {
     }
     bytes.truncate(received);
     Ok(Some(Datagram { bytes, fds }))
+}
+
+/// The descriptors in a received control block, or `None` - with every one of
+/// them closed - when the sender may not reach this process's ports.
+///
+/// # Safety
+///
+/// `msg`'s control block is a well-formed sequence of `cmsghdr`, as `recvmsg`
+/// leaves it, and any `SCM_RIGHTS` in it are descriptors this process owns.
+unsafe fn admit(msg: &libc::msghdr) -> Option<Vec<c_int>> {
+    let mut fds = Vec::new();
+    #[cfg(target_os = "linux")]
+    let mut sender = None;
+    // SAFETY: the caller's control block.
+    unsafe {
+        let mut cmsg = libc::CMSG_FIRSTHDR(msg);
+        while !cmsg.is_null() {
+            let payload = (*cmsg).cmsg_len as usize - libc::CMSG_LEN(0) as usize;
+            match ((*cmsg).cmsg_level, (*cmsg).cmsg_type) {
+                (libc::SOL_SOCKET, libc::SCM_RIGHTS) => {
+                    let count = payload / core::mem::size_of::<c_int>();
+                    let data = libc::CMSG_DATA(cmsg).cast::<c_int>();
+                    for i in 0..count {
+                        fds.push(data.add(i).read_unaligned());
+                    }
+                }
+                #[cfg(target_os = "linux")]
+                (libc::SOL_SOCKET, libc::SCM_CREDENTIALS)
+                    if payload >= core::mem::size_of::<libc::ucred>() =>
+                {
+                    let credentials = libc::CMSG_DATA(cmsg).cast::<libc::ucred>();
+                    sender = Some(credentials.read_unaligned().uid);
+                }
+                _ => {}
+            }
+            cmsg = libc::CMSG_NXTHDR(msg, cmsg);
+        }
+    }
+    // Missing credentials are refused too: `SO_PASSCRED` is set before the port
+    // is bound, so only a truncated control block arrives without them.
+    #[cfg(target_os = "linux")]
+    if !sender.is_some_and(same_user) {
+        for fd in fds {
+            // SAFETY: a descriptor that just arrived and was never handed on.
+            unsafe { libc::close(fd) };
+        }
+        return None;
+    }
+    Some(fds)
 }
 
 #[cfg(test)]
@@ -702,5 +821,107 @@ mod tests {
         assert!(port.ready());
         let again = port.receive(0).expect("receive").expect("the held message");
         assert_eq!(again.bytes, b"first");
+    }
+
+    /// A control block as `recvmsg` would leave it: `uid`'s credentials, when
+    /// given, then `fds` as `SCM_RIGHTS`.
+    #[cfg(target_os = "linux")]
+    fn admit_crafted(uid: Option<libc::uid_t>, fds: &[c_int]) -> Option<Vec<c_int>> {
+        let mut control = vec![0u8; receive_control_len()];
+        // SAFETY: as in [`send`].
+        let mut msg: libc::msghdr = unsafe { core::mem::zeroed() };
+        msg.msg_control = control.as_mut_ptr().cast();
+        msg.msg_controllen = control.len() as _;
+        let rights = core::mem::size_of_val(fds);
+        let credentials = core::mem::size_of::<libc::ucred>();
+        // SAFETY: `control` has room for one credentials block and up to
+        // `MAX_FDS` rights; each header is written inside it.
+        unsafe {
+            let mut used = 0;
+            let mut cmsg = libc::CMSG_FIRSTHDR(&msg);
+            if let Some(uid) = uid {
+                (*cmsg).cmsg_level = libc::SOL_SOCKET;
+                (*cmsg).cmsg_type = libc::SCM_CREDENTIALS;
+                (*cmsg).cmsg_len = libc::CMSG_LEN(credentials as u32) as _;
+                let sender = libc::ucred {
+                    pid: libc::getpid(),
+                    uid,
+                    gid: libc::getgid(),
+                };
+                libc::CMSG_DATA(cmsg)
+                    .cast::<libc::ucred>()
+                    .write_unaligned(sender);
+                used += libc::CMSG_SPACE(credentials as u32) as usize;
+                cmsg = libc::CMSG_NXTHDR(&msg, cmsg);
+            }
+            (*cmsg).cmsg_level = libc::SOL_SOCKET;
+            (*cmsg).cmsg_type = libc::SCM_RIGHTS;
+            (*cmsg).cmsg_len = libc::CMSG_LEN(rights as u32) as _;
+            core::ptr::copy_nonoverlapping(fds.as_ptr().cast(), libc::CMSG_DATA(cmsg), rights);
+            used += libc::CMSG_SPACE(rights as u32) as usize;
+            msg.msg_controllen = used as _;
+            admit(&msg)
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn open_descriptor() -> c_int {
+        // SAFETY: a plain socket call with constant arguments.
+        unsafe { libc::socket(libc::AF_UNIX, libc::SOCK_DGRAM | libc::SOCK_CLOEXEC, 0) }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn is_open(fd: c_int) -> bool {
+        // SAFETY: `F_GETFD` only queries the descriptor table.
+        unsafe { libc::fcntl(fd, libc::F_GETFD) >= 0 }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_datagram_from_another_user_is_dropped_with_its_rights() {
+        let fd = open_descriptor();
+        // SAFETY: `getuid` cannot fail.
+        let other = unsafe { libc::getuid() }.wrapping_add(1);
+        assert!(admit_crafted(Some(other), &[fd]).is_none());
+        assert!(!is_open(fd), "the right it carried was closed");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_datagram_without_credentials_is_dropped() {
+        let fd = open_descriptor();
+        assert!(admit_crafted(None, &[fd]).is_none());
+        assert!(!is_open(fd));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_datagram_from_this_user_keeps_its_rights() {
+        let fd = open_descriptor();
+        // SAFETY: `getuid` cannot fail.
+        let admitted = admit_crafted(Some(unsafe { libc::getuid() }), &[fd]);
+        assert_eq!(admitted, Some(vec![fd]));
+        // SAFETY: the descriptor opened above, handed back by `admit`.
+        unsafe { libc::close(fd) };
+    }
+
+    /// The credentials the kernel attaches are what lets a real message in.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_port_receives_credentials_with_every_datagram() {
+        let port = Receiver::bind().expect("bind");
+        let mut on: c_int = 0;
+        let mut len = core::mem::size_of::<c_int>() as libc::socklen_t;
+        // SAFETY: an `int` out-parameter of the length given.
+        let rc = unsafe {
+            libc::getsockopt(
+                port.fd(),
+                libc::SOL_SOCKET,
+                libc::SO_PASSCRED,
+                (&raw mut on).cast(),
+                &mut len,
+            )
+        };
+        assert_eq!((rc, on), (0, 1));
     }
 }
