@@ -21,6 +21,17 @@ struct Entry {
     property_list: usize,
 }
 
+impl Clone for Entry {
+    fn clone(&self) -> Self {
+        objc::arc::retain(self.property_list as Id);
+        Self {
+            ty: self.ty.clone(),
+            data: self.data.clone(),
+            property_list: self.property_list,
+        }
+    }
+}
+
 impl Drop for Entry {
     fn drop(&mut self) {
         objc::arc::release(self.property_list as Id);
@@ -30,8 +41,10 @@ impl Drop for Entry {
 struct Board {
     object: usize,
     change_count: isize,
+    /// The first item's entries, which the declare-and-set API writes to.
     entries: Vec<Entry>,
-    object_strings: Vec<Vec<u8>>,
+    /// Every later item `-writeObjects:` wrote.
+    more_items: Vec<Vec<Entry>>,
 }
 
 #[derive(Default)]
@@ -58,7 +71,7 @@ fn make_board() -> Board {
         object: object as usize,
         change_count: 0,
         entries: Vec::new(),
-        object_strings: Vec::new(),
+        more_items: Vec::new(),
     }
 }
 
@@ -96,7 +109,7 @@ fn sync_system_text(board: &mut Board) {
     objc::arc::release(entry.property_list as Id);
     entry.property_list = 0;
     entry.data = Some(text);
-    board.object_strings.clear();
+    board.more_items.clear();
     board.change_count += 1;
 }
 
@@ -197,7 +210,7 @@ pub(crate) fn put_flavor(name: &[u8], ty: &[u8], bytes: Vec<u8>) {
     objc::arc::release(entry.property_list as Id);
     entry.property_list = 0;
     entry.data = Some(bytes.clone());
-    board.object_strings.clear();
+    board.more_items.clear();
     board.change_count += 1;
     // Out to the desktop as well, so another application can paste it - the same
     // thing `-setData:forType:` does for the same board and the same flavour.
@@ -353,7 +366,7 @@ unsafe extern "C" fn change_count(receiver: Id, _sel: Sel) -> isize {
 
 fn clear(board: &mut Board) -> isize {
     board.entries.clear();
-    board.object_strings.clear();
+    board.more_items.clear();
     board.change_count += 1;
     board.change_count
 }
@@ -424,7 +437,7 @@ unsafe extern "C" fn set_data(receiver: Id, _sel: Sel, data: Id, ty: Id) -> u8 {
     objc::arc::release(entry.property_list as Id);
     entry.property_list = 0;
     entry.data = Some(data);
-    board.object_strings.clear();
+    board.more_items.clear();
     board.change_count += 1;
     if let Some(text) = system_text {
         let _ = sdl3::clipboard::set_text(&text);
@@ -463,7 +476,7 @@ unsafe extern "C" fn set_string(receiver: Id, _sel: Sel, string: Id, ty: Id) -> 
     objc::arc::release(entry.property_list as Id);
     entry.property_list = 0;
     entry.data = Some(value);
-    board.object_strings.clear();
+    board.more_items.clear();
     board.change_count += 1;
     if let Some(text) = system_text {
         let _ = sdl3::clipboard::set_text(&text);
@@ -503,7 +516,7 @@ unsafe extern "C" fn set_property_list(receiver: Id, _sel: Sel, value: Id, ty: I
     objc::arc::release(entry.property_list as Id);
     entry.property_list = objc::arc::retain(value) as usize;
     entry.data = None;
-    board.object_strings.clear();
+    board.more_items.clear();
     board.change_count += 1;
     1
 }
@@ -571,38 +584,89 @@ fn asks_for_strings(classes: Id) -> bool {
     })
 }
 
-/// `-writeObjects:` for the standard object this runtime can serialize.
+/// One `-writeObjects:` argument as the item it becomes on the board.
+fn written_item(object: Id) -> Option<Vec<Entry>> {
+    if is_string(object) {
+        return Some(vec![Entry {
+            ty: STRING.as_bytes().to_vec(),
+            data: Some(type_bytes(object)),
+            property_list: 0,
+        }]);
+    }
+    if !is_item(object) {
+        return None;
+    }
+    // SAFETY: an `NSPasteboardItem`, which this module laid out.
+    let item = unsafe { &*(object as *const Item) };
+    // An item belongs to at most one board; one already written, or read
+    // from a board, cannot be written again.
+    if !item.board.is_null() {
+        return None;
+    }
+    // SAFETY: null or the item's own contents, from `Box::into_raw`.
+    Some(unsafe { item.own.as_ref() }.cloned().unwrap_or_default())
+}
+
+/// `-writeObjects:` for strings and `NSPasteboardItem`s, each one item.
 ///
-/// `NSString` is the common AppKit pasteboard payload.  Other objects need an
-/// `NSPasteboardWriting` implementation; returning `NO` for one is the API's
-/// ordinary way to say it cannot be written, rather than claiming success and
-/// losing its contents.
+/// Other objects need an `NSPasteboardWriting` implementation; returning `NO`
+/// for one is the API's ordinary way to say it cannot be written, rather than
+/// claiming success and losing its contents.
 unsafe extern "C" fn write_objects(receiver: Id, _sel: Sel, objects: Id) -> u8 {
     let Some(objects) = (unsafe { collections::array(objects as CFTypeRef) }) else {
         return 0;
     };
-    if objects.values.is_empty() || !objects.values.iter().all(|object| is_string(*object as Id)) {
+    let objects: Vec<Id> = objects.values.iter().map(|object| *object as Id).collect();
+    let Some(mut items) = objects
+        .iter()
+        .map(|object| written_item(*object))
+        .collect::<Option<Vec<_>>>()
+    else {
+        return 0;
+    };
+    if items.is_empty() {
         return 0;
     }
-    let values: Vec<Vec<u8>> = objects
-        .values
-        .iter()
-        .map(|object| type_bytes(*object as Id))
-        .collect();
     let mut all = boards().lock().unwrap_or_else(|e| e.into_inner());
     let general = is_general(&all, receiver);
-    let system_text = general.then(|| values[0].clone());
     let Some(board) = board_mut(&mut all, receiver) else {
         return 0;
     };
     clear(board);
-    let entry = entry_mut(board, STRING.as_bytes());
-    entry.data = values.first().cloned();
-    board.object_strings = values;
+    board.entries = items.remove(0);
+    board.more_items = items;
+    let change_count = board.change_count;
+    let system_text = general.then(|| {
+        board
+            .entries
+            .iter()
+            .find(|entry| entry.ty == STRING.as_bytes())
+            .and_then(|entry| entry.data.clone())
+            .unwrap_or_default()
+    });
+    drop(all);
+    for (index, object) in objects.into_iter().enumerate() {
+        if is_item(object) {
+            bind_item(object, receiver, change_count, index);
+        }
+    }
     if let Some(text) = system_text {
         let _ = sdl3::clipboard::set_text(&text);
     }
     1
+}
+
+/// The plain text of every item that has some, in item order.
+fn item_strings(board: &Board) -> Vec<Vec<u8>> {
+    std::iter::once(&board.entries)
+        .chain(&board.more_items)
+        .filter_map(|entries| {
+            entries
+                .iter()
+                .find(|entry| entry.ty == STRING.as_bytes())
+                .and_then(|entry| entry.data.clone())
+        })
+        .collect()
 }
 
 unsafe extern "C" fn can_read_objects(receiver: Id, _sel: Sel, classes: Id, _options: Id) -> u8 {
@@ -615,13 +679,7 @@ unsafe extern "C" fn can_read_objects(receiver: Id, _sel: Sel, classes: Id, _opt
     {
         sync_system_text(board);
     }
-    board_mut(&mut all, receiver).is_some_and(|board| {
-        !board.object_strings.is_empty()
-            || board
-                .entries
-                .iter()
-                .any(|entry| entry.ty == STRING.as_bytes() && entry.data.is_some())
-    }) as u8
+    board_mut(&mut all, receiver).is_some_and(|board| !item_strings(board).is_empty()) as u8
 }
 
 unsafe extern "C" fn read_objects(receiver: Id, _sel: Sel, classes: Id, _options: Id) -> Id {
@@ -634,34 +692,25 @@ unsafe extern "C" fn read_objects(receiver: Id, _sel: Sel, classes: Id, _options
     {
         sync_system_text(board);
     }
-    let Some(values) = board_mut(&mut all, receiver).map(|board| {
-        if board.object_strings.is_empty() {
-            board
-                .entries
-                .iter()
-                .find(|entry| entry.ty == STRING.as_bytes())
-                .and_then(|entry| entry.data.clone())
-                .into_iter()
-                .collect()
-        } else {
-            board.object_strings.clone()
-        }
-    }) else {
+    let Some(values) = board_mut(&mut all, receiver).map(|board| item_strings(board)) else {
         return std::ptr::null_mut();
     };
     strings(values)
 }
 
-/// An `NSPasteboardItem` that `-pasteboardItems` handed out.
+/// An `NSPasteboardItem`.
 ///
-/// It reads its board live rather than copying it, and answers nothing once
-/// the board's change count moves on, as an item from a Mac's board does.
+/// One made with `+alloc`/`-init` keeps its own contents until it is written.
+/// A written item, or one `-pasteboardItems` handed out, reads its board live
+/// and answers nothing once the board's change count moves on, as an item on
+/// a Mac's board does.
 #[repr(C)]
 struct Item {
     isa: *const std::ffi::c_void,
     board: Id,
     change_count: isize,
     index: usize,
+    own: *mut Vec<Entry>,
 }
 
 pub const ITEM_INSTANCE_SIZE: usize = size_of::<Item>();
@@ -670,51 +719,56 @@ fn item_class() -> &'static objc::class::Class {
     objc::class::lookup(c"NSPasteboardItem").expect("declared before its methods")
 }
 
-/// The number of items a board holds: one per string `-writeObjects:` wrote,
-/// otherwise one item carrying every declared type.
+fn is_item(object: Id) -> bool {
+    let class = item_class();
+    // SAFETY: null or an object this runtime allocated.
+    unsafe { objc::object::class_of(object) }
+        .is_some_and(|have| have.chain().any(|ancestor| std::ptr::eq(ancestor, class)))
+}
+
+/// Tie an item to its place on a board, dropping any contents of its own.
+fn bind_item(object: Id, board: Id, change_count: isize, index: usize) {
+    // SAFETY: an `NSPasteboardItem`, which this module laid out.
+    let item = unsafe { &mut *(object as *mut Item) };
+    if !item.board.is_null() {
+        return;
+    }
+    item.board = objc::arc::retain(board);
+    item.change_count = change_count;
+    item.index = index;
+    if !item.own.is_null() {
+        // SAFETY: from `Box::into_raw`, owned by the item until now.
+        drop(unsafe { Box::from_raw(item.own) });
+        item.own = std::ptr::null_mut();
+    }
+}
+
+/// The number of items a board holds.
 fn item_count(board: &Board) -> usize {
-    match board.object_strings.len() {
-        0 => usize::from(!board.entries.is_empty()),
-        count => count,
+    if board.entries.is_empty() && board.more_items.is_empty() {
+        0
+    } else {
+        1 + board.more_items.len()
     }
 }
 
-/// One item's flavour, as `(type, data, property list)`.
-type Flavor = (Vec<u8>, Option<Vec<u8>>, Id);
-
-/// The flavours item `index` holds; the first item is the board's entries,
-/// which hold the first written string as well.
-fn item_flavors(board: &Board, index: usize) -> Vec<Flavor> {
-    if index == 0 {
-        return board
-            .entries
-            .iter()
-            .map(|entry| {
-                (
-                    entry.ty.clone(),
-                    entry.data.clone(),
-                    entry.property_list as Id,
-                )
-            })
-            .collect();
+/// Item `index`'s entries; the first item is the board's own entries, which
+/// the declare-and-set API writes to.
+fn item_entries(board: &Board, index: usize) -> &[Entry] {
+    match index {
+        0 => &board.entries,
+        _ => board.more_items.get(index - 1).map_or(&[], Vec::as_slice),
     }
-    board
-        .object_strings
-        .get(index)
-        .map(|value| {
-            vec![(
-                STRING.as_bytes().to_vec(),
-                Some(value.clone()),
-                std::ptr::null_mut(),
-            )]
-        })
-        .unwrap_or_default()
 }
 
-/// The item's flavours, or nothing once its board has changed.
-fn current_flavors(receiver: Id) -> Vec<Flavor> {
+/// The item's entries, or nothing once its board has changed.
+fn current_flavors(receiver: Id) -> Vec<Entry> {
     // SAFETY: an `NSPasteboardItem`, which this module laid out.
     let item = unsafe { &*(receiver as *const Item) };
+    if item.board.is_null() {
+        // SAFETY: null or the item's own contents, from `Box::into_raw`.
+        return unsafe { item.own.as_ref() }.cloned().unwrap_or_default();
+    }
     let mut all = boards().lock().unwrap_or_else(|e| e.into_inner());
     let general = is_general(&all, item.board);
     let Some(board) = board_mut(&mut all, item.board) else {
@@ -726,18 +780,9 @@ fn current_flavors(receiver: Id) -> Vec<Flavor> {
     if board.change_count != item.change_count {
         return Vec::new();
     }
-    let flavors = item_flavors(board, item.index);
-    // Held past the lock, as `-propertyListForType:` on the board does.
-    for (_, _, property_list) in &flavors {
-        objc::arc::retain(*property_list);
-    }
-    flavors
-}
-
-fn release_flavors(flavors: Vec<Flavor>) {
-    for (_, _, property_list) in flavors {
-        objc::arc::release(property_list);
-    }
+    // Cloned, so a property list stays held past the lock, as
+    // `-propertyListForType:` on the board does.
+    item_entries(board, item.index).to_vec()
 }
 
 unsafe extern "C" fn pasteboard_items(receiver: Id, _sel: Sel) -> Id {
@@ -749,18 +794,16 @@ unsafe extern "C" fn pasteboard_items(receiver: Id, _sel: Sel) -> Id {
     if general {
         sync_system_text(board);
     }
-    let items: Vec<CFTypeRef> = (0..item_count(board))
+    let change_count = board.change_count;
+    let count = item_count(board);
+    drop(all);
+    let items: Vec<CFTypeRef> = (0..count)
         .map(|index| {
             let object = objc::object::create_instance(item_class(), 0);
-            // SAFETY: a fresh `NSPasteboardItem`.
-            let item = unsafe { &mut *(object as *mut Item) };
-            item.board = objc::arc::retain(receiver);
-            item.change_count = board.change_count;
-            item.index = index;
+            bind_item(object, receiver, change_count, index);
             object as CFTypeRef
         })
         .collect();
-    drop(all);
     let array = collections::new_array(&items, Policy::from_type_callbacks(), false);
     for item in items {
         objc::arc::release(item as Id);
@@ -774,28 +817,81 @@ unsafe extern "C" fn item_dealloc(receiver: Id, _sel: Sel) {
     let item = unsafe { &mut *(receiver as *mut Item) };
     objc::arc::release(item.board);
     item.board = std::ptr::null_mut();
+    if !item.own.is_null() {
+        // SAFETY: from `Box::into_raw`, owned by the item until `-dealloc`.
+        drop(unsafe { Box::from_raw(item.own) });
+        item.own = std::ptr::null_mut();
+    }
     objc::arc::finalize(receiver);
 }
 
+/// Store one flavour in an item that is not yet on a board; `NO` for one
+/// that is, whose contents are the board's.
+fn set_item_flavor(receiver: Id, ty: Id, data: Option<Vec<u8>>, property_list: Id) -> u8 {
+    // SAFETY: an `NSPasteboardItem`, which this module laid out.
+    let item = unsafe { &mut *(receiver as *mut Item) };
+    if !item.board.is_null() {
+        return 0;
+    }
+    if item.own.is_null() {
+        item.own = Box::into_raw(Box::default());
+    }
+    // SAFETY: from `Box::into_raw`, owned by the item.
+    let own = unsafe { &mut *item.own };
+    let ty = type_bytes(ty);
+    let entry = match own.iter().position(|entry| entry.ty == ty) {
+        Some(at) => &mut own[at],
+        None => {
+            own.push(Entry {
+                ty,
+                data: None,
+                property_list: 0,
+            });
+            own.last_mut().expect("entry just pushed")
+        }
+    };
+    objc::arc::release(entry.property_list as Id);
+    entry.property_list = objc::arc::retain(property_list) as usize;
+    entry.data = data;
+    1
+}
+
+unsafe extern "C" fn item_set_data(receiver: Id, _sel: Sel, data: Id, ty: Id) -> u8 {
+    let Some(data) = (unsafe { collections::data(data as CFTypeRef) }).map(|bytes| bytes.clone())
+    else {
+        return 0;
+    };
+    set_item_flavor(receiver, ty, Some(data), std::ptr::null_mut())
+}
+
+unsafe extern "C" fn item_set_string(receiver: Id, _sel: Sel, string: Id, ty: Id) -> u8 {
+    if string.is_null() {
+        return 0;
+    }
+    set_item_flavor(receiver, ty, Some(type_bytes(string)), std::ptr::null_mut())
+}
+
+unsafe extern "C" fn item_set_property_list(receiver: Id, _sel: Sel, value: Id, ty: Id) -> u8 {
+    if value.is_null() {
+        return 0;
+    }
+    set_item_flavor(receiver, ty, None, value)
+}
+
 unsafe extern "C" fn item_types(receiver: Id, _sel: Sel) -> Id {
-    let flavors = current_flavors(receiver);
-    let types = flavors
-        .iter()
-        .map(|(ty, _, _)| ty.clone())
-        .collect::<Vec<_>>();
-    release_flavors(flavors);
-    strings(types)
+    strings(
+        current_flavors(receiver)
+            .iter()
+            .map(|entry| entry.ty.clone()),
+    )
 }
 
 fn item_data(receiver: Id, ty: Id) -> Option<Vec<u8>> {
     let ty = type_bytes(ty);
-    let flavors = current_flavors(receiver);
-    let data = flavors
+    current_flavors(receiver)
         .iter()
-        .find(|(have, _, _)| *have == ty)
-        .and_then(|(_, data, _)| data.clone());
-    release_flavors(flavors);
-    data
+        .find(|entry| entry.ty == ty)
+        .and_then(|entry| entry.data.clone())
 }
 
 unsafe extern "C" fn item_data_for_type(receiver: Id, _sel: Sel, ty: Id) -> Id {
@@ -817,15 +913,13 @@ unsafe extern "C" fn item_string_for_type(receiver: Id, _sel: Sel, ty: Id) -> Id
 
 unsafe extern "C" fn item_property_list_for_type(receiver: Id, _sel: Sel, ty: Id) -> Id {
     let ty = type_bytes(ty);
-    let mut flavors = current_flavors(receiver);
-    let Some(at) = flavors.iter().position(|(have, _, _)| *have == ty) else {
-        release_flavors(flavors);
-        return std::ptr::null_mut();
-    };
-    let (_, _, property_list) = flavors.swap_remove(at);
-    release_flavors(flavors);
-    // SAFETY: the hold `current_flavors` took, handed to the caller's pool.
-    unsafe { api::CFAutorelease(property_list as CFTypeRef) as Id }
+    current_flavors(receiver)
+        .iter()
+        .find(|entry| entry.ty == ty)
+        .map_or(std::ptr::null_mut(), |entry| {
+            // SAFETY: held by the clone until the caller's pool drains.
+            unsafe { api::CFAutorelease(objc::arc::retain(entry.property_list as Id)) as Id }
+        })
 }
 
 unsafe extern "C" fn item_available_type_from_array(receiver: Id, _sel: Sel, types: Id) -> Id {
@@ -839,11 +933,10 @@ unsafe extern "C" fn item_available_type_from_array(receiver: Id, _sel: Sel, typ
         })
         .unwrap_or_default();
     let flavors = current_flavors(receiver);
-    let found = requested
+    let Some(ty) = requested
         .into_iter()
-        .find(|ty| flavors.iter().any(|(have, _, _)| have == ty));
-    release_flavors(flavors);
-    let Some(ty) = found else {
+        .find(|ty| flavors.iter().any(|entry| entry.ty == *ty))
+    else {
         return std::ptr::null_mut();
     };
     let result = corefoundation::string::from_bytes(&ty, false);
@@ -890,6 +983,9 @@ pub(crate) fn install() {
         "stringForType:" => item_string_for_type, c"@24@0:8@16";
         "propertyListForType:" => item_property_list_for_type, c"@24@0:8@16";
         "availableTypeFromArray:" => item_available_type_from_array, c"@24@0:8@16";
+        "setData:forType:" => item_set_data, c"c32@0:8@16@24";
+        "setString:forType:" => item_set_string, c"c32@0:8@16@24";
+        "setPropertyList:forType:" => item_set_property_list, c"c32@0:8@16@24";
     });
 }
 
@@ -1093,6 +1189,62 @@ mod tests {
                 .expect("array")
                 .values
                 .is_empty()
+        );
+    }
+
+    /// An item made by the program carries all its flavours onto the board,
+    /// and is the board's from then on.
+    #[test]
+    fn written_items_keep_their_flavours_and_become_read_only() {
+        crate::bootstrap();
+        let name = corefoundation::string::from_bytes(b"pasteboard-write-items", false) as Id;
+        let board = unsafe {
+            pasteboard_with_name(
+                std::ptr::null_mut(),
+                objc::sel::get("pasteboardWithName:"),
+                name,
+            )
+        };
+        let text = corefoundation::string::from_bytes(STRING.as_bytes(), false) as Id;
+        let html = corefoundation::string::from_bytes(HTML.as_bytes(), false) as Id;
+        let item = objc::object::create_instance(item_class(), 0);
+        let set_string = objc::sel::get("setString:forType:");
+        let value = corefoundation::string::from_bytes(b"plain", false) as Id;
+        assert_eq!(unsafe { item_set_string(item, set_string, value, text) }, 1);
+        let markup = collections::new_data(b"<b>bold</b>".to_vec()) as Id;
+        assert_eq!(
+            unsafe { item_set_data(item, objc::sel::get("setData:forType:"), markup, html) },
+            1
+        );
+        let second = corefoundation::string::from_bytes(b"second", false);
+        let objects = collections::new_array(
+            &[item as CFTypeRef, second],
+            Policy::from_type_callbacks(),
+            false,
+        ) as Id;
+        assert_eq!(
+            unsafe { write_objects(board, objc::sel::get("writeObjects:"), objects) },
+            1
+        );
+
+        let read = unsafe { data_for_type(board, objc::sel::get("dataForType:"), html) };
+        assert_eq!(
+            unsafe { collections::data(read as CFTypeRef) }.expect("data"),
+            b"<b>bold</b>"
+        );
+        let items = unsafe { pasteboard_items(board, objc::sel::get("pasteboardItems")) };
+        let items = unsafe { collections::array(items as CFTypeRef) }.expect("array");
+        assert_eq!(items.values.len(), 2);
+        assert_eq!(
+            item_string(items.values[1] as Id).as_deref(),
+            Some(&b"second"[..])
+        );
+        assert_eq!(item_string(item).as_deref(), Some(&b"plain"[..]));
+        assert_eq!(unsafe { item_set_string(item, set_string, value, html) }, 0);
+        // Already on a board, so it cannot be written again.
+        assert_eq!(
+            unsafe { write_objects(board, objc::sel::get("writeObjects:"), objects) },
+            0
         );
     }
 }
