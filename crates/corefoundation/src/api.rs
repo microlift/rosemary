@@ -541,13 +541,57 @@ pub unsafe extern "C" fn CFStringGetDoubleValue(value: CFTypeRef) -> f64 {
         return 0.0;
     };
     let bytes = value.utf8();
-    let text = String::from_utf8_lossy(&bytes);
+    scan_double(&String::from_utf8_lossy(&bytes)).unwrap_or(0.0)
+}
+
+/// CF's double scanner: skip whitespace, then take `nan`/`inf` case-insensitively
+/// or the longest prefix that strtod accepts. Without a locale the decimal
+/// separator is always `.`.
+fn scan_double(text: &str) -> Option<f64> {
     let text = text.trim_start();
-    let end = text
-        .char_indices()
-        .position(|(_, ch)| !(ch.is_ascii_digit() || matches!(ch, '+' | '-' | '.' | 'e' | 'E')))
-        .unwrap_or(text.len());
-    text[..end].parse().unwrap_or(0.0)
+    let special = text.get(..3).and_then(|word| {
+        if word.eq_ignore_ascii_case("nan") {
+            Some(f64::NAN)
+        } else if word.eq_ignore_ascii_case("inf") {
+            Some(f64::INFINITY)
+        } else {
+            None
+        }
+    });
+    if special.is_some() {
+        return special;
+    }
+
+    let bytes = text.as_bytes();
+    let digits_from = |start: usize| {
+        start
+            + bytes[start..]
+                .iter()
+                .take_while(|byte| byte.is_ascii_digit())
+                .count()
+    };
+    let sign_from =
+        |start: usize| start + usize::from(matches!(bytes.get(start), Some(b'+' | b'-')));
+
+    let integer_start = sign_from(0);
+    let mut end = digits_from(integer_start);
+    let mut has_digits = end > integer_start;
+    if bytes.get(end) == Some(&b'.') {
+        let fraction_end = digits_from(end + 1);
+        has_digits |= fraction_end > end + 1;
+        end = fraction_end;
+    }
+    if !has_digits {
+        return None;
+    }
+    if matches!(bytes.get(end), Some(b'e' | b'E')) {
+        let exponent_start = sign_from(end + 1);
+        let exponent_end = digits_from(exponent_start);
+        if exponent_end > exponent_start {
+            end = exponent_end;
+        }
+    }
+    text[..end].parse().ok()
 }
 
 /// `CFStringGetMaximumSizeForEncoding`.
@@ -3967,6 +4011,49 @@ mod path_style_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn double_value_reads_the_longest_numeric_prefix() {
+        assert_eq!(scan_double("2.5e"), Some(2.5));
+        assert_eq!(scan_double("1-2"), Some(1.0));
+        assert_eq!(scan_double("2.5e+3x"), Some(2500.0));
+        assert_eq!(scan_double("-.5E-1"), Some(-0.05));
+        assert_eq!(scan_double("7."), Some(7.0));
+        assert_eq!(scan_double("1.2.3"), Some(1.2));
+        assert_eq!(scan_double("0x10"), Some(0.0));
+    }
+
+    #[test]
+    fn double_value_skips_leading_whitespace() {
+        assert_eq!(scan_double(" \t\n42"), Some(42.0));
+    }
+
+    #[test]
+    fn double_value_rejects_text_without_digits() {
+        assert_eq!(scan_double(""), None);
+        assert_eq!(scan_double("."), None);
+        assert_eq!(scan_double("-e5"), None);
+        assert_eq!(scan_double("abc"), None);
+    }
+
+    #[test]
+    fn double_value_reads_nan_and_inf_case_insensitively() {
+        assert!(scan_double("NaN").is_some_and(f64::is_nan));
+        assert_eq!(scan_double("Infinity"), Some(f64::INFINITY));
+        assert_eq!(scan_double("-inf"), None);
+    }
+
+    #[test]
+    fn get_double_value_returns_zero_without_a_number() {
+        // SAFETY: plain calls on live strings built from NUL-terminated literals.
+        unsafe {
+            let string = |text: &core::ffi::CStr| {
+                CFStringCreateWithCString(core::ptr::null(), text.as_ptr(), string::encoding::UTF8)
+            };
+            assert_eq!(CFStringGetDoubleValue(string(c"2.5e")), 2.5);
+            assert_eq!(CFStringGetDoubleValue(string(c"value")), 0.0);
+        }
+    }
 
     #[test]
     fn a_windows_code_page_or_charset_name_names_its_encoding() {
