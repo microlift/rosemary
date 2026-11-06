@@ -102,6 +102,7 @@ api! {
     gtk_widget_get_native: fn(Ptr) -> Ptr;
     gtk_native_get_surface: fn(Ptr) -> Ptr;
     gdk_set_allowed_backends: fn(*const c_char);
+    gdk_gl_context_clear_current: fn();
     gdk_display_manager_get: fn() -> Ptr;
     gdk_display_manager_get_default_display: fn(Ptr) -> Ptr;
     gdk_wayland_surface_get_wl_surface: fn(Ptr) -> Ptr;
