@@ -455,6 +455,9 @@ unsafe extern "C" fn msg_send() {
         "mov     r11, [r10]",
         "test    r11, 1",
         "jnz     8f",
+        // A forgotten or empty entry's class is zero.
+        "test    rax, rax",
+        "jz      8f",
         "cmp     rax, [r10 + 8]",
         "jne     8f",
         "cmp     rsi, [r10 + 16]",
