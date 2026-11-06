@@ -376,6 +376,16 @@ pub fn warp_through_lock(surface: *mut c_void, x: f32, y: f32) -> bool {
             (client.wl_proxy_get_version)(lock),
             WL_MARSHAL_FLAG_DESTROY,
         );
+        // KWin applies the unlock, and with it the hint, on the next commit.
+        // Without this one, that is the commit after the caller locks again
+        // for SDL, and the hint is lost to the new lock.
+        (client.wl_proxy_marshal_flags)(
+            surface,
+            WL_SURFACE_COMMIT,
+            std::ptr::null(),
+            (client.wl_proxy_get_version)(surface),
+            0,
+        );
     }
     // The compositor need not report the move, and a caller comparing
     // against the old position would warp again every time it asked.
