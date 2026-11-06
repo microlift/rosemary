@@ -13295,28 +13295,9 @@ fn an_opengl_window_is_refused_rather_than_converted() {
 /// The tests above build the SDL window themselves, so they cannot see a
 /// mistake in the flags `-initWithContentRect:` chooses - and that is
 /// exactly what once left every real window unable to have a swapchain.
-#[test]
-#[cfg_attr(
-    target_os = "macos",
-    ignore = "Cocoa needs the main thread; use rosemary's Metal guest tests"
-)]
-fn a_layer_on_a_guests_own_window_is_presented_through_a_swapchain() {
-    if isolate_vulkan_graphical_test(
-        "a_layer_on_a_guests_own_window_is_presented_through_a_swapchain",
-    ) {
-        return;
-    }
-    if std::env::var_os("ROSEMARY_TEST_VULKAN").is_none() {
-        return;
-    }
-    let Ok(adapters) = crate::vulkan::adapters() else {
-        return;
-    };
-    let Some(gpu) = adapters.first().and_then(|adapter| adapter.gpu().ok()) else {
-        return;
-    };
-    crate::bootstrap();
-
+/// A borderless `NSWindow` whose content view is backed by a `CAMetalLayer`,
+/// made the way a guest makes one. `None` where the host has no display.
+fn guest_metal_layer() -> Option<(sdl3::Window, objc::object::Id)> {
     let rect = foundation::geometry::NSRect {
         origin: foundation::geometry::NSPoint { x: 0.0, y: 0.0 },
         size: foundation::geometry::NSSize {
@@ -13350,7 +13331,7 @@ fn a_layer_on_a_guests_own_window_is_presented_through_a_swapchain() {
     // SAFETY: a window this test just made.
     let sdl = unsafe { appkit::window::sdl_window(window) };
     if sdl.is_null() {
-        return; // no display on this host
+        return None; // no display on this host
     }
     assert_eq!(
         sdl3::video::window_flags(sdl) & sdl3::video::flags::OPENGL,
@@ -13394,6 +13375,34 @@ fn a_layer_on_a_guests_own_window_is_presented_through_a_swapchain() {
             std::mem::transmute(objc::msg::entry());
         send(view, objc::sel::get("setLayer:"), layer);
     }
+    Some((sdl, layer))
+}
+
+#[test]
+#[cfg_attr(
+    target_os = "macos",
+    ignore = "Cocoa needs the main thread; use rosemary's Metal guest tests"
+)]
+fn a_layer_on_a_guests_own_window_is_presented_through_a_swapchain() {
+    if isolate_vulkan_graphical_test(
+        "a_layer_on_a_guests_own_window_is_presented_through_a_swapchain",
+    ) {
+        return;
+    }
+    if std::env::var_os("ROSEMARY_TEST_VULKAN").is_none() {
+        return;
+    }
+    let Ok(adapters) = crate::vulkan::adapters() else {
+        return;
+    };
+    let Some(gpu) = adapters.first().and_then(|adapter| adapter.gpu().ok()) else {
+        return;
+    };
+    crate::bootstrap();
+
+    let Some((sdl, layer)) = guest_metal_layer() else {
+        return;
+    };
 
     let frame = crate::present::layer_frame(layer)
         .expect("the layer's view is in a window this runtime made");
@@ -13656,6 +13665,77 @@ fn a_layer_on_a_guests_own_window_is_presented_through_a_swapchain() {
         .as_mut()
         .and_then(|all| all.remove(&(sdl as usize)));
     gpu.destroy_image(source);
+}
+
+/// A drawable's presented handlers run once its copy is done and the device's
+/// later work has completed, without another `-nextDrawable` to look. Before,
+/// only that call noticed the copy had finished, two frames later.
+#[test]
+#[cfg_attr(
+    target_os = "macos",
+    ignore = "Cocoa needs the main thread; use rosemary's Metal guest tests"
+)]
+fn presented_handlers_run_without_another_next_drawable() {
+    if isolate_vulkan_graphical_test("presented_handlers_run_without_another_next_drawable") {
+        return;
+    }
+    if std::env::var_os("ROSEMARY_TEST_VULKAN").is_none() {
+        return;
+    }
+    crate::bootstrap();
+    // SAFETY: the entry point a guest uses.
+    let device = unsafe { crate::MTLCreateSystemDefaultDevice() };
+    if device.is_null() {
+        return;
+    }
+    let Some((_, layer)) = guest_metal_layer() else {
+        return;
+    };
+    // SAFETY: each selector below is `id (id, SEL)`, `void (id, SEL)` or
+    // `void (id, SEL, id)` on the object it is sent to.
+    let send_id = |receiver: objc::object::Id, selector: &str| unsafe {
+        let send: unsafe extern "C" fn(objc::object::Id, objc::sel::Sel) -> objc::object::Id =
+            std::mem::transmute(objc::msg::entry());
+        send(receiver, objc::sel::get(selector))
+    };
+    let send_void = |receiver: objc::object::Id, selector: &str| unsafe {
+        let send: unsafe extern "C" fn(objc::object::Id, objc::sel::Sel) =
+            std::mem::transmute(objc::msg::entry());
+        send(receiver, objc::sel::get(selector))
+    };
+    let queue = send_id(device, "newCommandQueue");
+    let drawable = unsafe { crate::present::next_drawable(layer, objc::sel::get("nextDrawable")) };
+    assert!(!drawable.is_null(), "an actual Metal drawable");
+    let command = send_id(queue, "commandBuffer");
+    // SAFETY: `-presentDrawable:` is `void (id, SEL, id)`.
+    unsafe {
+        let send: unsafe extern "C" fn(objc::object::Id, objc::sel::Sel, objc::object::Id) =
+            std::mem::transmute(objc::msg::entry());
+        send(command, objc::sel::get("presentDrawable:"), drawable);
+    }
+    send_void(command, "commit");
+
+    // `-presentedTime` is set as the handlers are handed out.
+    // SAFETY: `-presentedTime` is `double (id, SEL)` on a drawable.
+    let presented = || unsafe {
+        let send: unsafe extern "C" fn(objc::object::Id, objc::sel::Sel) -> f64 =
+            std::mem::transmute(objc::msg::entry());
+        send(drawable, objc::sel::get("presentedTime")) != 0.0
+    };
+    let deadline = Instant::now() + Duration::from_secs(4);
+    while !presented() {
+        assert!(
+            Instant::now() < deadline,
+            "the presented handlers waited for another -nextDrawable"
+        );
+        // Later work: its completion is what tells the device the copy
+        // queued ahead of it is done.
+        let later = send_id(queue, "commandBuffer");
+        send_void(later, "commit");
+        send_void(later, "waitUntilCompleted");
+        sdl3::video::vulkan::service_surface_requests();
+        std::thread::sleep(Duration::from_millis(2));
+    }
 }
 
 #[test]

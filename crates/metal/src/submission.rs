@@ -115,5 +115,7 @@ fn worker(gpu: &'static Gpu) {
         while let Some(submission) = gpu.submissions.pop_signalled(gpu) {
             submission.finish(Ok(()));
         }
+        // A copy queued before the work that just completed is done too.
+        crate::swapchain::retire_copied_on(gpu);
     }
 }
