@@ -437,8 +437,17 @@ pub fn render(fmt: &[u8], args: &mut VarArgs<'_>) -> Result<Vec<u8>> {
             }
             b'f' | b'F' | b'e' | b'E' | b'g' | b'G' => {
                 let v = args.next_fp()?;
-                let (body, neg) = format_float(v, conv, &spec);
-                pad_number(&mut out, body.as_bytes(), neg, &spec, "", None);
+                let body = format_float(v, conv, &spec);
+                // Darwin prints a NaN with no sign at all, and pads neither a
+                // NaN nor an infinity with zeros.
+                let spec = Spec {
+                    plus: spec.plus && !v.is_nan(),
+                    space: spec.space && !v.is_nan(),
+                    zero: spec.zero && v.is_finite(),
+                    ..spec
+                };
+                let negative = v.is_sign_negative() && !v.is_nan();
+                pad_number(&mut out, body.as_bytes(), negative, &spec, "", None);
             }
             // Everything unhandled - `%n` included - comes out verbatim and
             // fetches no argument of its own, so the rest of the format still
@@ -538,21 +547,20 @@ fn digits(mut v: u64, base: u64, upper: bool) -> Vec<u8> {
     out
 }
 
-/// Render a float's magnitude, C-style, returning `(body, negative)`.
-fn format_float(v: f64, conv: u8, spec: &Spec) -> (String, bool) {
+/// Render a float's magnitude, C-style; the sign is the caller's.
+fn format_float(v: f64, conv: u8, spec: &Spec) -> String {
     let upper = conv.is_ascii_uppercase();
-    let neg = v.is_sign_negative();
     let mag = v.abs();
 
     if mag.is_nan() {
-        return (if upper { "NAN".into() } else { "nan".into() }, neg);
+        return if upper { "NAN".into() } else { "nan".into() };
     }
     if mag.is_infinite() {
-        return (if upper { "INF".into() } else { "inf".into() }, neg);
+        return if upper { "INF".into() } else { "inf".into() };
     }
 
     let prec = spec.prec.unwrap_or(6);
-    let body = match conv {
+    match conv {
         b'f' | b'F' => format!("{mag:.prec$}"),
         b'e' | b'E' => exponential(mag, prec, upper),
         _ => {
@@ -560,39 +568,29 @@ fn format_float(v: f64, conv: u8, spec: &Spec) -> (String, bool) {
             // and strips trailing zeros unless `#` was given.
             let p = prec.max(1);
             let exp = decimal_exponent(mag, p);
-            let mut s = if exp < -4 || exp >= p as i32 {
+            let s = if exp < -4 || exp >= p as i32 {
                 exponential(mag, p - 1, upper)
             } else {
                 let decimals = (p as i32 - 1 - exp).max(0) as usize;
                 format!("{mag:.decimals$}")
             };
-            if !spec.hash {
-                s = strip_trailing_zeros(&s);
+            match spec.hash {
+                true => s,
+                false => strip_trailing_zeros(&s),
             }
-            s
         }
-    };
-    (body, neg)
+    }
 }
 
-/// `%e`: C requires at least two exponent digits, Rust's `{:e}` emits the
-/// fewest, so the exponent is rebuilt rather than patched.
+/// `%e`, from Rust's exact `{:e}` digits: C wants a signed exponent of at
+/// least two digits where Rust writes the fewest.
 fn exponential(mag: f64, prec: usize, upper: bool) -> String {
-    let exp = decimal_exponent(mag, prec + 1);
-    let scaled = if mag == 0.0 { 0.0 } else { mag / powi10(exp) };
-    // Rounding the mantissa can carry it to 10.0 (9.99 at precision 1); when it
-    // does, the exponent is one larger and the mantissa is 1.0.
-    let (mantissa, exp) = {
-        let rounded = format!("{scaled:.prec$}");
-        if rounded.starts_with("10") {
-            (format!("{:.prec$}", scaled / 10.0), exp + 1)
-        } else {
-            (rounded, exp)
-        }
-    };
+    let exact = format!("{mag:.prec$e}");
+    let (mantissa, exp) = exact.split_once('e').expect("`{:e}` writes an exponent");
+    let exp: i32 = exp.parse().expect("`{:e}` writes a decimal exponent");
     let e = if upper { 'E' } else { 'e' };
     let sign = if exp < 0 { '-' } else { '+' };
-    format!("{mantissa}{e}{sign}{:02}", exp.abs())
+    format!("{mantissa}{e}{sign}{:02}", exp.unsigned_abs())
 }
 
 /// The base-10 exponent of `mag` rounded to `sig` significant digits.
@@ -605,10 +603,6 @@ fn decimal_exponent(mag: f64, sig: usize) -> i32 {
         .nth(1)
         .and_then(|e| e.parse::<i32>().ok())
         .unwrap_or(0)
-}
-
-fn powi10(exp: i32) -> f64 {
-    10f64.powi(exp)
 }
 
 fn strip_trailing_zeros(s: &str) -> String {

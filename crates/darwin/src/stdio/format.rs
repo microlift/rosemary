@@ -1,8 +1,8 @@
 //! The variadic formatters.
 //!
-//! The printf family renders with the host's formatter, which shares the
-//! guest's calling convention and `va_list`, and writes the result through the
-//! stream. The scanf family reads through the stream itself and converts
+//! The printf family renders with [`crate::sprintf`]'s Darwin rendering,
+//! which shares the guest's calling convention and `va_list`, and writes the
+//! result through the stream. The scanf family reads through the stream itself and converts
 //! numbers with the host's `strto*`.
 
 use std::ffi::{VaList, c_char, c_int, c_long, c_short, c_void};
@@ -11,7 +11,6 @@ use super::backend::{mbrtowc, wcrtomb};
 use super::{EOF, File, Locked, STDINP, STDOUTP, engine};
 
 unsafe extern "C" {
-    fn vasprintf(out: *mut *mut c_char, format: *const c_char, ap: VaList) -> c_int;
     fn vswprintf(out: *mut u32, n: usize, format: *const u32, ap: VaList) -> c_int;
     fn iswspace(wc: u32) -> c_int;
 }
@@ -70,12 +69,12 @@ unsafe fn emit(
     let n = {
         let _locale = InLocale::new(loc);
         // SAFETY: the caller's format and arguments.
-        unsafe { vasprintf(&mut out, format, ap) }
+        unsafe { crate::sprintf::rosemary_vasprintf(&mut out, format, ap) }
     };
     if n < 0 {
         return -1;
     }
-    // SAFETY: the caller's stream and the host's rendering of `n` bytes.
+    // SAFETY: the caller's stream and a rendering of `n` bytes.
     let put = unsafe {
         let _guard = Locked::new(fp);
         engine::orient(fp, -1);

@@ -275,6 +275,38 @@ fn floats() {
 }
 
 #[test]
+fn exponent_digits_are_exact() {
+    for v in [
+        0.1f64,
+        1e23,
+        f64::MAX,
+        f64::MIN_POSITIVE,
+        5e-324,
+        9.995e-5,
+        123_456_789.123_456_79,
+    ] {
+        same("%.16e", &[V::Double(v)]);
+        same("%.17g", &[V::Double(v)]);
+        same("%.0e", &[V::Double(v)]);
+    }
+}
+
+#[test]
+fn a_nan_prints_without_a_sign() {
+    let negative = -f64::NAN;
+    assert_eq!(shimmed("%f", &[V::Double(negative)]), "nan");
+    assert_eq!(shimmed("%G", &[V::Double(negative)]), "NAN");
+    assert_eq!(shimmed("[%+6e]", &[V::Double(f64::NAN)]), "[   nan]");
+    assert_eq!(shimmed("[% f]", &[V::Double(negative)]), "[nan]");
+}
+
+#[test]
+fn non_finite_values_are_not_zero_padded() {
+    same("[%06f]", &[V::Double(f64::NEG_INFINITY)]);
+    assert_eq!(shimmed("[%06f]", &[V::Double(f64::NAN)]), "[   nan]");
+}
+
+#[test]
 fn non_finite_values() {
     for v in [f64::INFINITY, f64::NEG_INFINITY, f64::NAN] {
         same("%f", &[V::Double(v)]);

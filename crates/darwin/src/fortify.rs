@@ -129,6 +129,29 @@ unsafe extern "C" fn strlcat_chk(
 
 unsafe extern "C" {
     fn rosemary_sprintf_chk(s: *mut c_char, flags: c_int, slen: size_t, format: *const c_char, ...);
+    fn rosemary_vsprintf_chk(
+        s: *mut c_char,
+        flags: c_int,
+        slen: size_t,
+        format: *const c_char,
+        ap: std::ffi::VaList,
+    ) -> c_int;
+    fn rosemary_snprintf_chk(
+        s: *mut c_char,
+        maxlen: size_t,
+        flags: c_int,
+        slen: size_t,
+        format: *const c_char,
+        ...
+    ) -> c_int;
+    fn rosemary_vsnprintf_chk(
+        s: *mut c_char,
+        maxlen: size_t,
+        flags: c_int,
+        slen: size_t,
+        format: *const c_char,
+        ap: std::ffi::VaList,
+    ) -> c_int;
 }
 
 exports::exports! {
@@ -137,6 +160,9 @@ exports::exports! {
         "__memmove_chk" => memmove_chk,
         "__memset_chk" => memset_chk,
         "__sprintf_chk" => rosemary_sprintf_chk,
+        "__snprintf_chk" => rosemary_snprintf_chk,
+        "__vsprintf_chk" => rosemary_vsprintf_chk,
+        "__vsnprintf_chk" => rosemary_vsnprintf_chk,
         "__strcat_chk" => strcat_chk,
         "__strcpy_chk" => strcpy_chk,
         "__strlcat_chk" => strlcat_chk,

@@ -1,9 +1,9 @@
 use std::ffi::{VaList, c_char, c_int};
 
+use crate::sprintf::{rosemary_vsnprintf, vasprintf_into_guest};
+
 unsafe extern "C" {
-    fn vsnprintf(buffer: *mut c_char, size: usize, format: *const c_char, ap: VaList) -> c_int;
     fn vsscanf(input: *const c_char, format: *const c_char, ap: VaList) -> c_int;
-    fn vasprintf(out: *mut *mut c_char, format: *const c_char, ap: VaList) -> c_int;
 }
 
 /// `int snprintf_l(char *, size_t, locale_t, const char *, ...)`
@@ -21,7 +21,7 @@ unsafe extern "C" fn snprintf_l(
 ) -> c_int {
     let _switched = crate::xlocale::switch(locale);
     // SAFETY: the caller's buffer, format and arguments.
-    unsafe { vsnprintf(buffer, size, format, args) }
+    unsafe { rosemary_vsnprintf(buffer, size, format, args) }
 }
 
 /// `int sscanf_l(const char *, locale_t, const char *, ...)`
@@ -41,13 +41,7 @@ unsafe extern "C" fn sscanf_l(
 
 /// `int asprintf_l(char **, locale_t, const char *, ...)`
 ///
-/// The result is **moved into the guest's allocator** before it is handed over.
-/// `vasprintf` allocates with this host's `malloc` and the caller frees it with
-/// whichever `free` its own image binds - which is the crossing
-/// [`crate::heap`] describes, and the one that does not fail at the call: the
-/// guest's allocator accepts the foreign pointer, decides which of its pages
-/// owns it from the pointer's own bits, and pushes a live block onto that
-/// page's free list.
+/// The result is in the guest's allocator, as [`vasprintf_into_guest`] says.
 ///
 /// # Safety
 ///
@@ -58,32 +52,9 @@ unsafe extern "C" fn asprintf_l(
     format: *const c_char,
     args: ...
 ) -> c_int {
-    if out.is_null() {
-        return -1;
-    }
-    let mut host: *mut c_char = std::ptr::null_mut();
-    let written = {
-        let _switched = crate::xlocale::switch(locale);
-        // SAFETY: a live `char *` slot, and the caller's format and arguments.
-        unsafe { vasprintf(&raw mut host, format, args) }
-    };
-    if written < 0 || host.is_null() {
-        return -1;
-    }
-    // SAFETY: `vasprintf` NUL-terminates, so the block is `written + 1` bytes.
-    let moved = unsafe { crate::heap::malloc(written as usize + 1) }.cast::<c_char>();
-    if !moved.is_null() {
-        // SAFETY: both blocks hold `written + 1` bytes and do not overlap.
-        unsafe { std::ptr::copy_nonoverlapping(host, moved, written as usize + 1) };
-    }
-    // SAFETY: this host's `malloc` allocated it, inside `vasprintf`.
-    unsafe { libc::free(host.cast()) };
-    if moved.is_null() {
-        return -1;
-    }
-    // SAFETY: the caller states `out` is writable.
-    unsafe { *out = moved };
-    written
+    let _switched = crate::xlocale::switch(locale);
+    // SAFETY: the caller's obligations.
+    unsafe { vasprintf_into_guest(out, format, args) }
 }
 
 exports::exports! {
