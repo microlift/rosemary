@@ -53,7 +53,11 @@ pub fn warp(window: Window, x: f32, y: f32) -> Option<(f32, f32)> {
     let _commits = crate::compositor::guard();
     let lifted = lift_constraints(window, (x, y));
     let warped = wayland::warp_through_lock(surface, x, y);
-    lifted.restore(window);
+    if lifted.restore(window) {
+        // The replacement constraint is pending surface state on KWin too.
+        // Commit it before real motion can escape ahead of the next frame.
+        wayland::commit(surface);
+    }
     warped.then_some(from)
 }
 
@@ -131,7 +135,9 @@ fn lift_constraints(window: Window, to: (f32, f32)) -> Lifted {
 }
 
 impl Lifted {
-    fn restore(self, window: Window) {
+    /// Restore constraints and report whether there were any to restore.
+    fn restore(self, window: Window) -> bool {
+        let had_constraints = self.grabbed || self.rect.is_some() || self.relative;
         if self.grabbed {
             video::set_mouse_grab(window, true);
         }
@@ -141,6 +147,7 @@ impl Lifted {
         if self.relative {
             video::set_relative_mouse_mode(window, true);
         }
+        had_constraints
     }
 }
 
