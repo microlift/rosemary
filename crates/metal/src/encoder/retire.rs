@@ -182,6 +182,9 @@ impl Submission {
     }
 
     pub(crate) fn finish(mut self, result: Result<(), String>) {
+        // The last reference to a retained object or to the command buffer
+        // may run the guest's `dealloc`, which makes guest syscalls.
+        let _darwin = darwin::tls::DarwinThread::enter();
         if let Err(reason) = &result {
             gpu::trace(format!("command buffer completion failed: {reason}"));
         }
@@ -274,6 +277,8 @@ impl Submission {
             // gives away, and `object` is retained by this submission.
             unsafe { crate::completion::deliver(block.into_raw(), object) };
         }
+        // Released before the scope above ends.
+        drop(self);
     }
 }
 
