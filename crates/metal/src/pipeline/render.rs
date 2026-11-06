@@ -37,6 +37,10 @@ const PRIMITIVE_LINE: u64 = 1;
 const PRIMITIVE_LINE_STRIP: u64 = 2;
 const PRIMITIVE_TRIANGLE: u64 = 3;
 
+/// `MTLPrimitiveTopologyClass`.
+const TOPOLOGY_CLASS_POINT: u64 = 1;
+const TOPOLOGY_CLASS_LINE: u64 = 2;
+
 /// `MTLCullMode`.
 const CULL_MODE_FRONT: u64 = 1;
 const CULL_MODE_BACK: u64 = 2;
@@ -231,6 +235,8 @@ pub(crate) struct RenderPipelineDescriptor {
     pub alpha_to_one: bool,
     /// `NO` runs only the vertex function: nothing is rasterized.
     pub rasterization: bool,
+    /// The `MTLPrimitiveTopologyClass` the pipeline draws, or unspecified.
+    pub input_topology: u64,
     /// The `-colorAttachments` collection, made on first use.
     pub color_objects: objc::object::Id,
 }
@@ -454,8 +460,13 @@ impl RenderPipeline {
             // them where a compile is affordable. With the draw state dynamic
             // nearly every draw uses this one variant, so compiling it now
             // keeps the compile out of the frame which first draws with it.
-            let triangles = RenderVariantKey {
-                topology: PRIMITIVE_TRIANGLE,
+            let topology = match descriptor.input_topology {
+                TOPOLOGY_CLASS_POINT => PRIMITIVE_POINT,
+                TOPOLOGY_CLASS_LINE => PRIMITIVE_LINE,
+                _ => PRIMITIVE_TRIANGLE,
+            };
+            let expected = RenderVariantKey {
+                topology,
                 cull_mode: 0,
                 winding: 0,
                 fill_mode: 0,
@@ -464,7 +475,7 @@ impl RenderPipeline {
                 resolve_mask: 0,
                 depth_resolve: None,
             };
-            if let Err(reason) = pipeline.variant(&pipeline.pipeline_key(&triangles)) {
+            if let Err(reason) = pipeline.variant(&pipeline.pipeline_key(&expected)) {
                 gpu::trace(format!("render pipeline creation failed: {reason}"));
             }
         }

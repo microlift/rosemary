@@ -1223,6 +1223,7 @@ fn a_multisampled_depth_attachment_resolves_into_its_destination() {
             alpha_to_coverage: false,
             alpha_to_one: false,
             rasterization: true,
+            input_topology: 0,
             color_objects: std::ptr::null_mut(),
         },
     );
@@ -1398,6 +1399,7 @@ fn a_translated_triangle_draws_on_the_gpu() {
             alpha_to_coverage: false,
             alpha_to_one: false,
             rasterization: true,
+            input_topology: 0,
             color_objects: std::ptr::null_mut(),
         },
     );
@@ -2074,6 +2076,7 @@ fn recording_cost() {
                 alpha_to_coverage: false,
                 alpha_to_one: false,
                 rasterization: true,
+                input_topology: 0,
                 color_objects: std::ptr::null_mut(),
             },
         );
@@ -2208,6 +2211,7 @@ fn resource_draw_pipeline(device: Id) -> Id {
                 alpha_to_coverage: false,
                 alpha_to_one: false,
                 rasterization: true,
+                input_topology: 0,
                 color_objects: std::ptr::null_mut(),
             },
         );
@@ -2712,6 +2716,7 @@ fragment float4 mark(float4 position [[position]], device uint* out [[buffer(0)]
                 alpha_to_coverage: false,
                 alpha_to_one: false,
                 rasterization: true,
+                input_topology: 0,
                 color_objects: std::ptr::null_mut(),
             },
         );
@@ -3227,6 +3232,7 @@ fn covering_draw_with_depth(device: Id, depth_format: u64, z: f32) -> Option<Cov
             alpha_to_coverage: false,
             alpha_to_one: false,
             rasterization: true,
+            input_topology: 0,
             color_objects: std::ptr::null_mut(),
         },
     );
