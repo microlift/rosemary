@@ -226,16 +226,18 @@ impl Encoder {
     /// Begin the Vulkan render pass, ordered after the earlier passes it
     /// conflicts with. Once it has begun, a conflict which arose since ends
     /// it, waits, and continues it.
-    pub(super) fn ensure_pass(&mut self) {
+    ///
+    /// `false` where the pass could not continue, and records nothing more.
+    pub(super) fn ensure_pass(&mut self) -> bool {
         let Some(lazy) = self.lazy.as_ref() else {
-            return;
+            return true;
         };
         let must_flush = self.must_flush(lazy);
         let command = self.command();
         let device = &command.gpu.device;
         if lazy.begun {
             if !must_flush {
-                return;
+                return true;
             }
             // SAFETY: the pass began in this command buffer.
             unsafe { device.cmd_end_render_pass(command.command_buffer) };
@@ -258,10 +260,20 @@ impl Encoder {
             }
             // Load operations aside the pass is the same one, so the
             // framebuffer and every pipeline variant made for it still fit.
-            let pass = command.gpu.render_pass(&key).unwrap_or_else(|reason| {
-                gpu::trace(format!("render pass creation failed: {reason}"));
-                lazy.pass
-            });
+            let pass = match command.gpu.render_pass(&key) {
+                Ok(pass) => pass,
+                Err(reason) => {
+                    // Beginning the original pass again would clear what it
+                    // drew, so the rest of the pass is dropped instead.
+                    gpu::trace(format!(
+                        "render pass continuation creation failed, dropping the rest of the \
+                         pass: {reason}"
+                    ));
+                    self.lazy = None;
+                    self.in_render_pass = false;
+                    return false;
+                }
+            };
             stats::count(Counter::PassSplits);
             let begin = vk::RenderPassBeginInfo::default()
                 .render_pass(pass)
@@ -275,7 +287,7 @@ impl Encoder {
                     vk::SubpassContents::INLINE,
                 )
             };
-            return;
+            return true;
         }
         let rereads = self
             .attachments
@@ -310,6 +322,7 @@ impl Encoder {
                 vk::SubpassContents::INLINE,
             )
         };
+        true
     }
 
     /// End a render pass which began lazily. A pass which drew nothing and
@@ -325,6 +338,7 @@ impl Encoder {
                 stats::count(Counter::EmptyPasses);
                 return false;
             }
+            // Only a split can fail, and this pass has not begun.
             self.ensure_pass();
         }
         let command = self.command();

@@ -909,7 +909,9 @@ impl Encoder {
         ) {
             return None;
         }
-        self.ensure_pass();
+        if !self.ensure_pass() {
+            return None;
+        }
         gpu::milestone("draw");
         stats::count(Counter::Draws);
         Some((device, vk_command))
