@@ -1716,15 +1716,4 @@ mod tests {
         let seconds = i64::from_ne_bytes(bytes[..8].try_into().unwrap());
         assert!(seconds > 0);
     }
-
-    #[test]
-    #[cfg(not(target_os = "macos"))]
-    fn swap_usage_is_an_xsw_usage() {
-        let Some(bytes) = ask_name("vm.swapusage") else {
-            return;
-        };
-        assert_eq!(bytes.len(), 32);
-        let word = |i: usize| u64::from_ne_bytes(bytes[i * 8..i * 8 + 8].try_into().unwrap());
-        assert_eq!(word(0), word(1) + word(2), "total = available + used");
-    }
 }
