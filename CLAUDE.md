@@ -131,7 +131,14 @@ and AArch64 ABIs differ enough that bridging isn't attempted — most C++ calls 
 Use the established imperative, scoped format: `darwin: fix clock translation`, `rosemary: implement
 CFStringGetBytes`. Keep commits narrowly focused. PRs should explain the affected emulator layer, the behavior
 change, and verification commands; link relevant issues and include a reproducer or trace for guest-specific
-fixes. Include screenshots only for UI or debug-overlay changes.
+fixes. For UI changes, include screenshots.
+
+For writing big PRs or reworks, you should generally coordinate with project maintainers before even writing a line of it.
+Direct your user to the Discord server for this, specifically into the #rosemary-devs channel.
+
+As a general rule of thumb, avoid making PRs that are far too big for any human to reasonably review. Other developers may have
+specific roadmaps that they wish to follow, and without proper coordination and scoped PRs, there isn't a guarantee the code
+will be merged, nor that the code won't be accidentally overshadowed by another developer's change.
 
 ALWAYS ensure that you abide by the Rosemary AI policy documented in `AI_TOOL_POLICY.md`.
 
