@@ -102,6 +102,7 @@ pub mod signal;
 pub mod sip;
 pub mod sockpath;
 pub mod spawn;
+pub mod sprintf;
 pub mod stackprobe;
 pub mod stat;
 pub mod stdio;
@@ -414,6 +415,7 @@ static NONPORTABLE_MODULES: &[exports::Module] = &[
     backtrace::MODULE,
     #[cfg(target_arch = "x86_64")]
     printf_l::MODULE,
+    sprintf::MODULE,
     #[cfg(target_arch = "x86_64")]
     asl::MODULE,
     #[cfg(target_arch = "x86_64")]

@@ -304,8 +304,43 @@ unsafe extern "C" fn clock() -> u64 {
     unsafe { host::clock() as u64 }
 }
 
+/// The zone Darwin's `gmtime` names, where glibc's names "GMT".
+const UTC: &std::ffi::CStr = c"UTC";
+
+/// `struct tm *gmtime_r(const time_t *, struct tm *)`
+///
+/// # Safety
+///
+/// `clock` is readable and `result` writable.
+unsafe extern "C" fn gmtime_r(clock: *const libc::time_t, result: *mut libc::tm) -> *mut libc::tm {
+    // SAFETY: the caller's obligations; the host's `struct tm` is Darwin's.
+    let tm = unsafe { libc::gmtime_r(clock, result) };
+    if !tm.is_null() {
+        // SAFETY: the host just filled it.
+        unsafe { (*tm).tm_zone = UTC.as_ptr() };
+    }
+    tm
+}
+
+/// `struct tm *gmtime(const time_t *)`
+///
+/// # Safety
+///
+/// `clock` is readable.
+unsafe extern "C" fn gmtime(clock: *const libc::time_t) -> *mut libc::tm {
+    // SAFETY: the caller's obligations; the host's static `struct tm` is Darwin's.
+    let tm = unsafe { libc::gmtime(clock) };
+    if !tm.is_null() {
+        // SAFETY: the host just filled it.
+        unsafe { (*tm).tm_zone = UTC.as_ptr() };
+    }
+    tm
+}
+
 exports::exports! {
     functions {
+        "gmtime" => gmtime,
+        "gmtime_r" => gmtime_r,
         "clock_gettime" => gettime,
         "clock_getres" => getres,
         "clock_settime" => settime,
@@ -324,6 +359,24 @@ exports::exports! {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn gmtime_names_its_zone_utc() {
+        let epoch: libc::time_t = 0;
+        // SAFETY: an all-zero `struct tm` is a valid one to overwrite.
+        let mut tm: libc::tm = unsafe { std::mem::zeroed() };
+        let mut text = [0 as c_char; 16];
+        // SAFETY: a readable time, a writable `struct tm` and a sized buffer.
+        unsafe {
+            assert!(!gmtime_r(&epoch, &mut tm).is_null());
+            let n = libc::strftime(text.as_mut_ptr(), text.len(), c"%Z %Y".as_ptr(), &tm);
+            assert_eq!(
+                &std::ffi::CStr::from_ptr(text.as_ptr()).to_bytes()[..n],
+                b"UTC 1970"
+            );
+            assert_eq!(std::ffi::CStr::from_ptr((*gmtime(&epoch)).tm_zone), UTC);
+        }
+    }
 
     #[test]
     fn time_answers_and_stores_the_same_second() {
