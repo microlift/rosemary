@@ -652,6 +652,205 @@ unsafe extern "C" fn read_objects(receiver: Id, _sel: Sel, classes: Id, _options
     strings(values)
 }
 
+/// An `NSPasteboardItem` that `-pasteboardItems` handed out.
+///
+/// It reads its board live rather than copying it, and answers nothing once
+/// the board's change count moves on, as an item from a Mac's board does.
+#[repr(C)]
+struct Item {
+    isa: *const std::ffi::c_void,
+    board: Id,
+    change_count: isize,
+    index: usize,
+}
+
+pub const ITEM_INSTANCE_SIZE: usize = size_of::<Item>();
+
+fn item_class() -> &'static objc::class::Class {
+    objc::class::lookup(c"NSPasteboardItem").expect("declared before its methods")
+}
+
+/// The number of items a board holds: one per string `-writeObjects:` wrote,
+/// otherwise one item carrying every declared type.
+fn item_count(board: &Board) -> usize {
+    match board.object_strings.len() {
+        0 => usize::from(!board.entries.is_empty()),
+        count => count,
+    }
+}
+
+/// One item's flavour, as `(type, data, property list)`.
+type Flavor = (Vec<u8>, Option<Vec<u8>>, Id);
+
+/// The flavours item `index` holds; the first item is the board's entries,
+/// which hold the first written string as well.
+fn item_flavors(board: &Board, index: usize) -> Vec<Flavor> {
+    if index == 0 {
+        return board
+            .entries
+            .iter()
+            .map(|entry| {
+                (
+                    entry.ty.clone(),
+                    entry.data.clone(),
+                    entry.property_list as Id,
+                )
+            })
+            .collect();
+    }
+    board
+        .object_strings
+        .get(index)
+        .map(|value| {
+            vec![(
+                STRING.as_bytes().to_vec(),
+                Some(value.clone()),
+                std::ptr::null_mut(),
+            )]
+        })
+        .unwrap_or_default()
+}
+
+/// The item's flavours, or nothing once its board has changed.
+fn current_flavors(receiver: Id) -> Vec<Flavor> {
+    // SAFETY: an `NSPasteboardItem`, which this module laid out.
+    let item = unsafe { &*(receiver as *const Item) };
+    let mut all = boards().lock().unwrap_or_else(|e| e.into_inner());
+    let general = is_general(&all, item.board);
+    let Some(board) = board_mut(&mut all, item.board) else {
+        return Vec::new();
+    };
+    if general {
+        sync_system_text(board);
+    }
+    if board.change_count != item.change_count {
+        return Vec::new();
+    }
+    let flavors = item_flavors(board, item.index);
+    // Held past the lock, as `-propertyListForType:` on the board does.
+    for (_, _, property_list) in &flavors {
+        objc::arc::retain(*property_list);
+    }
+    flavors
+}
+
+fn release_flavors(flavors: Vec<Flavor>) {
+    for (_, _, property_list) in flavors {
+        objc::arc::release(property_list);
+    }
+}
+
+unsafe extern "C" fn pasteboard_items(receiver: Id, _sel: Sel) -> Id {
+    let mut all = boards().lock().unwrap_or_else(|e| e.into_inner());
+    let general = is_general(&all, receiver);
+    let Some(board) = board_mut(&mut all, receiver) else {
+        return std::ptr::null_mut();
+    };
+    if general {
+        sync_system_text(board);
+    }
+    let items: Vec<CFTypeRef> = (0..item_count(board))
+        .map(|index| {
+            let object = objc::object::create_instance(item_class(), 0);
+            // SAFETY: a fresh `NSPasteboardItem`.
+            let item = unsafe { &mut *(object as *mut Item) };
+            item.board = objc::arc::retain(receiver);
+            item.change_count = board.change_count;
+            item.index = index;
+            object as CFTypeRef
+        })
+        .collect();
+    drop(all);
+    let array = collections::new_array(&items, Policy::from_type_callbacks(), false);
+    for item in items {
+        objc::arc::release(item as Id);
+    }
+    // SAFETY: a new Objective-C object.
+    unsafe { api::CFAutorelease(array) as Id }
+}
+
+unsafe extern "C" fn item_dealloc(receiver: Id, _sel: Sel) {
+    // SAFETY: an `NSPasteboardItem`, which this module laid out.
+    let item = unsafe { &mut *(receiver as *mut Item) };
+    objc::arc::release(item.board);
+    item.board = std::ptr::null_mut();
+    objc::arc::finalize(receiver);
+}
+
+unsafe extern "C" fn item_types(receiver: Id, _sel: Sel) -> Id {
+    let flavors = current_flavors(receiver);
+    let types = flavors
+        .iter()
+        .map(|(ty, _, _)| ty.clone())
+        .collect::<Vec<_>>();
+    release_flavors(flavors);
+    strings(types)
+}
+
+fn item_data(receiver: Id, ty: Id) -> Option<Vec<u8>> {
+    let ty = type_bytes(ty);
+    let flavors = current_flavors(receiver);
+    let data = flavors
+        .iter()
+        .find(|(have, _, _)| *have == ty)
+        .and_then(|(_, data, _)| data.clone());
+    release_flavors(flavors);
+    data
+}
+
+unsafe extern "C" fn item_data_for_type(receiver: Id, _sel: Sel, ty: Id) -> Id {
+    let Some(data) = item_data(receiver, ty) else {
+        return std::ptr::null_mut();
+    };
+    // SAFETY: a new data object.
+    unsafe { api::CFAutorelease(collections::new_data(data)) as Id }
+}
+
+unsafe extern "C" fn item_string_for_type(receiver: Id, _sel: Sel, ty: Id) -> Id {
+    let Some(value) = item_data(receiver, ty) else {
+        return std::ptr::null_mut();
+    };
+    let string = corefoundation::string::from_bytes(&value, false);
+    // SAFETY: a new string object.
+    unsafe { api::CFAutorelease(string) as Id }
+}
+
+unsafe extern "C" fn item_property_list_for_type(receiver: Id, _sel: Sel, ty: Id) -> Id {
+    let ty = type_bytes(ty);
+    let mut flavors = current_flavors(receiver);
+    let Some(at) = flavors.iter().position(|(have, _, _)| *have == ty) else {
+        release_flavors(flavors);
+        return std::ptr::null_mut();
+    };
+    let (_, _, property_list) = flavors.swap_remove(at);
+    release_flavors(flavors);
+    // SAFETY: the hold `current_flavors` took, handed to the caller's pool.
+    unsafe { api::CFAutorelease(property_list as CFTypeRef) as Id }
+}
+
+unsafe extern "C" fn item_available_type_from_array(receiver: Id, _sel: Sel, types: Id) -> Id {
+    let requested = unsafe { collections::array(types as CFTypeRef) }
+        .map(|array| {
+            array
+                .values
+                .iter()
+                .map(|value| type_bytes(*value as Id))
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let flavors = current_flavors(receiver);
+    let found = requested
+        .into_iter()
+        .find(|ty| flavors.iter().any(|(have, _, _)| have == ty));
+    release_flavors(flavors);
+    let Some(ty) = found else {
+        return std::ptr::null_mut();
+    };
+    let result = corefoundation::string::from_bytes(&ty, false);
+    // SAFETY: a new string object.
+    unsafe { api::CFAutorelease(result) as Id }
+}
+
 unsafe extern "C" fn release_globally(_receiver: Id, _sel: Sel) {}
 
 pub(crate) fn install() {
@@ -682,6 +881,15 @@ pub(crate) fn install() {
         "canReadObjectForClasses:options:" => can_read_objects, c"c32@0:8@16@24";
         "readObjectsForClasses:options:" => read_objects, c"@32@0:8@16@24";
         "releaseGlobally" => release_globally, c"v16@0:8";
+        "pasteboardItems" => pasteboard_items, c"@16@0:8";
+    });
+    methods!(item_class(), {
+        "dealloc" => item_dealloc, c"v16@0:8";
+        "types" => item_types, c"@16@0:8";
+        "dataForType:" => item_data_for_type, c"@24@0:8@16";
+        "stringForType:" => item_string_for_type, c"@24@0:8@16";
+        "propertyListForType:" => item_property_list_for_type, c"@24@0:8@16";
+        "availableTypeFromArray:" => item_available_type_from_array, c"@24@0:8@16";
     });
 }
 
@@ -829,6 +1037,62 @@ mod tests {
         assert_eq!(
             unsafe { foundation::string::bytes(read.values[0] as Id) },
             b"object"
+        );
+    }
+
+    fn item_string(item: Id) -> Option<Vec<u8>> {
+        let ty = corefoundation::string::from_bytes(STRING.as_bytes(), false) as Id;
+        // SAFETY: `-stringForType:` on an `NSPasteboardItem`.
+        let read = unsafe { item_string_for_type(item, objc::sel::get("stringForType:"), ty) };
+        (!read.is_null()).then(|| unsafe { foundation::string::bytes(read) })
+    }
+
+    /// Each written string is its own item, and an item stops answering once
+    /// its board is cleared.
+    #[test]
+    fn pasteboard_items_split_written_strings_and_go_stale_on_change() {
+        crate::bootstrap();
+        let name = corefoundation::string::from_bytes(b"pasteboard-items-test", false) as Id;
+        let board = unsafe {
+            pasteboard_with_name(
+                std::ptr::null_mut(),
+                objc::sel::get("pasteboardWithName:"),
+                name,
+            )
+        };
+        let sel = objc::sel::get("pasteboardItems");
+        unsafe { clear_contents(board, objc::sel::get("clearContents")) };
+        let empty = unsafe { pasteboard_items(board, sel) };
+        assert!(
+            unsafe { collections::array(empty as CFTypeRef) }
+                .expect("array")
+                .values
+                .is_empty()
+        );
+
+        let first = corefoundation::string::from_bytes(b"first", false);
+        let second = corefoundation::string::from_bytes(b"second", false);
+        let objects =
+            collections::new_array(&[first, second], Policy::from_type_callbacks(), false) as Id;
+        assert_eq!(
+            unsafe { write_objects(board, objc::sel::get("writeObjects:"), objects) },
+            1
+        );
+        let items = unsafe { pasteboard_items(board, sel) };
+        let items = unsafe { collections::array(items as CFTypeRef) }.expect("array");
+        let items: Vec<Id> = items.values.iter().map(|item| *item as Id).collect();
+        assert_eq!(items.len(), 2);
+        assert_eq!(item_string(items[0]).as_deref(), Some(&b"first"[..]));
+        assert_eq!(item_string(items[1]).as_deref(), Some(&b"second"[..]));
+
+        unsafe { clear_contents(board, objc::sel::get("clearContents")) };
+        assert_eq!(item_string(items[0]), None);
+        let types = unsafe { item_types(items[1], objc::sel::get("types")) };
+        assert!(
+            unsafe { collections::array(types as CFTypeRef) }
+                .expect("array")
+                .values
+                .is_empty()
         );
     }
 }

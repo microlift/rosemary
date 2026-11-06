@@ -140,6 +140,11 @@ static HIERARCHY: &[(&str, Option<&str>, usize)] = &[
         crate::opengl::PIXEL_FORMAT_INSTANCE_SIZE,
     ),
     ("NSPasteboard", None, 0),
+    (
+        "NSPasteboardItem",
+        None,
+        crate::pasteboard::ITEM_INSTANCE_SIZE,
+    ),
     ("NSWorkspace", None, 0),
     ("NSRunningApplication", None, 0),
     ("NSAlert", None, crate::alert::INSTANCE_SIZE),
