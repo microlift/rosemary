@@ -65,7 +65,8 @@ mod sends {
     };
 
     pub(super) static TABLE: [Entry; 1 << BITS] = [EMPTY; 1 << BITS];
-    static WRITER: Mutex<()> = Mutex::new(());
+    /// Held by a writer, and `true` while any entry may be filled.
+    static WRITER: Mutex<bool> = Mutex::new(false);
 
     /// The entry the probe reads for `(class, sel)`: the same arithmetic as
     /// its assembly.
@@ -118,10 +119,16 @@ mod sends {
         if !crate::class::is_initialized(class) {
             return;
         }
-        let _writer = WRITER.lock().unwrap_or_else(|e| e.into_inner());
+        // A send which finds the lock taken skips the cache rather than
+        // queue behind it: two hot sends sharing an entry would otherwise
+        // serialize every thread sending either.
+        let Ok(mut filled) = WRITER.try_lock() else {
+            return;
+        };
         if crate::class::generation() != generation {
             return;
         }
+        *filled = true;
         let entry = &TABLE[index(isa, sel as usize)];
         let sequence = entry.sequence.load(Ordering::Relaxed);
         entry.sequence.store(sequence + 1, Ordering::Release);
@@ -132,7 +139,11 @@ mod sends {
     }
 
     pub(super) fn forget() {
-        let _writer = WRITER.lock().unwrap_or_else(|e| e.into_inner());
+        let mut filled = WRITER.lock().unwrap_or_else(|e| e.into_inner());
+        // Classes register methods by the thousand before anything is sent.
+        if !std::mem::take(&mut *filled) {
+            return;
+        }
         for entry in &TABLE {
             let sequence = entry.sequence.load(Ordering::Relaxed);
             entry.sequence.store(sequence + 1, Ordering::Release);
@@ -444,6 +455,9 @@ unsafe extern "C" fn msg_send() {
         // variadic call's vector count and so is saved around the probe.
         "push    rax",
         "mov     rax, [rdi]",
+        // A forgotten or empty entry's class is zero.
+        "test    rax, rax",
+        "jz      8f",
         "mov     r11, rax",
         "shl     r11, 7",
         "xor     r11, rsi",
@@ -455,9 +469,6 @@ unsafe extern "C" fn msg_send() {
         "mov     r11, [r10]",
         "test    r11, 1",
         "jnz     8f",
-        // A forgotten or empty entry's class is zero.
-        "test    rax, rax",
-        "jz      8f",
         "cmp     rax, [r10 + 8]",
         "jne     8f",
         "cmp     rsi, [r10 + 16]",
