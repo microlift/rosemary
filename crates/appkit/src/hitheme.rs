@@ -545,7 +545,7 @@ fn cui_options(options: CFTypeRef) -> Vec<(String, Option_)> {
         return Vec::new();
     };
     dictionary
-        .entries
+        .entries()
         .iter()
         .map(|&(key, value)| {
             // SAFETY: keys and values are CF objects; a non-string reads empty.

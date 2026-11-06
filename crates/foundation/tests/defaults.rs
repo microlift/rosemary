@@ -82,7 +82,7 @@ fn argument_domain_enumerates_protocol_string_and_overrides_defaults() {
         assert!(
             corefoundation::collections::dictionary(persistent.cast())
                 .unwrap()
-                .entries
+                .entries()
                 .is_empty()
         );
     }

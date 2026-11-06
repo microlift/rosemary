@@ -72,7 +72,7 @@ mod tests {
         assert_eq!(list.values.len(), 1);
         let entry = unsafe { corefoundation::collections::dictionary(list.values[0]) }
             .expect("a dictionary");
-        let at = entry.position(key("kCFProxyTypeKey")).expect("a type");
-        assert_eq!(entry.entries[at].1, key("kCFProxyTypeNone"));
+        let kind = entry.get(key("kCFProxyTypeKey")).expect("a type");
+        assert_eq!(kind, key("kCFProxyTypeNone"));
     }
 }

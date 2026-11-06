@@ -66,7 +66,7 @@ fn write(object: CFTypeRef, out: &mut Vec<u8>, options: usize, depth: usize) -> 
             return write_array(&array.values, out, options, depth);
         }
         if let Some(dictionary) = corefoundation::collections::dictionary(object) {
-            return write_dictionary(&dictionary.entries, out, options, depth);
+            return write_dictionary(dictionary.entries(), out, options, depth);
         }
     }
     // SAFETY: a live object.

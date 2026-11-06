@@ -9,6 +9,7 @@ edition = "2024"
 license = "GPL-3.0-only"
 
 [workspace.dependencies]
+hashbrown = { version = "0.17", default-features = false }
 icu_normalizer = { version = "2.3", default-features = false, features = ["compiled_data"] }
 icu_properties = { version = "2.3", default-features = false, features = ["compiled_data"] }
 machish = { path = "crates/machish" }

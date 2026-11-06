@@ -50,23 +50,15 @@ impl Attachments {
 
     fn remove(&mut self, key: CFTypeRef) {
         for dictionary in self.by_mode.iter().flatten() {
-            let contents = contents(*dictionary);
-            if let Some(at) = contents.position(key) {
-                let (key, value) = contents.entries.remove(at);
-                contents.keys.release(key);
-                contents.values.release(value);
-            }
+            contents(*dictionary).discard(key);
         }
     }
 
     fn set(&mut self, key: CFTypeRef, value: CFTypeRef, mode: u32) {
         // A key has one mode at a time; setting it again moves it.
         let other = self.by_mode[1 - index(mode)];
-        if let Some(at) = other.and_then(|d| contents(d).position(key)) {
-            let contents = contents(other.unwrap());
-            let (key, value) = contents.entries.remove(at);
-            contents.keys.release(key);
-            contents.values.release(value);
+        if let Some(other) = other {
+            contents(other).discard(key);
         }
         self.dictionary(mode).set(key, value);
     }
@@ -75,17 +67,13 @@ impl Attachments {
         self.by_mode
             .iter()
             .zip([0, SHOULD_PROPAGATE])
-            .find_map(|(d, mode)| {
-                let contents = contents((*d)?);
-                let at = contents.position(key)?;
-                Some((contents.entries[at].1, mode))
-            })
+            .find_map(|(d, mode)| Some((contents((*d)?).get(key)?, mode)))
     }
 
     /// The dictionary for `mode`, or null when it has nothing in it.
     fn of_mode(&self, mode: u32) -> CFTypeRef {
         self.by_mode[index(mode)]
-            .filter(|d| !contents(*d).entries.is_empty())
+            .filter(|d| !contents(*d).is_empty())
             .unwrap_or(std::ptr::null())
     }
 }
@@ -172,7 +160,7 @@ pub unsafe extern "C" fn CVBufferRemoveAllAttachments(buffer: CFTypeRef) {
     with(buffer, |a| {
         for dictionary in a.by_mode.iter().flatten() {
             let contents = contents(*dictionary);
-            for (key, value) in contents.entries.drain(..) {
+            for (key, value) in contents.take_all() {
                 contents.keys.release(key);
                 contents.values.release(value);
             }
@@ -213,7 +201,7 @@ pub unsafe extern "C" fn CVBufferSetAttachments(
     let Some(source) = (unsafe { corefoundation::collections::dictionary(dictionary) }) else {
         return;
     };
-    let pairs = source.entries.clone();
+    let pairs = source.entries().to_vec();
     with(buffer, |a| {
         for (key, value) in pairs {
             a.set(key, value, mode);
@@ -234,7 +222,7 @@ pub unsafe extern "C" fn CVBufferPropagateAttachments(source: CFTypeRef, destina
         // The values are retained while the source's lock is released, so
         // the source dropping them meanwhile cannot free them.
         contents(dictionary)
-            .entries
+            .entries()
             .iter()
             // SAFETY: live keys and values the dictionary holds.
             .map(|&(k, v)| unsafe {

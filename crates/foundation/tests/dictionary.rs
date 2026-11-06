@@ -89,7 +89,6 @@ fn value(d: Id, key: &str) -> Option<i64> {
 fn count(d: Id) -> usize {
     unsafe { collections::dictionary(d as CFTypeRef) }
         .unwrap()
-        .entries
         .len()
 }
 
@@ -108,6 +107,7 @@ fn dictionaries() {
     removes_objects_for_keys();
     dictionary_with_dictionary_copies_and_respects_receiver();
     queries();
+    many_keys_build_and_look_up_quickly();
 }
 
 fn adds_entries_replacing_existing_values() {
@@ -202,4 +202,40 @@ fn queries() {
         seen += 1;
     }
     assert_eq!(seen, 3);
+}
+
+/// Lookup by hash: with a scan per key, building this many would send
+/// `-isEqual:` over a billion times.
+fn many_keys_build_and_look_up_quickly() {
+    const KEYS: i64 = 50_000;
+    const BUDGET: std::time::Duration = std::time::Duration::from_secs(1);
+    let started = std::time::Instant::now();
+    let d = dictionary(&[], true);
+    for n in 0..KEYS {
+        unsafe { send2(d, "setObject:forKey:", number(n), text(&format!("key {n}"))) };
+    }
+    for n in 0..KEYS {
+        assert_eq!(value(d, &format!("key {n}")), Some(n));
+    }
+    let doomed: Vec<Id> = (0..KEYS)
+        .step_by(2)
+        .map(|n| text(&format!("key {n}")))
+        .collect();
+    unsafe { send1(d, "removeObjectsForKeys:", array_of(&doomed)) };
+    let elapsed = started.elapsed();
+
+    assert_eq!(count(d), (KEYS / 2) as usize);
+    assert_eq!(value(d, "key 0"), None);
+    let mut seen: Vec<i64> = unsafe { collections::dictionary(d as CFTypeRef) }
+        .unwrap()
+        .entries()
+        .iter()
+        .map(|(_, v)| unsafe { collections::number(*v) }.unwrap().as_i64())
+        .collect();
+    seen.sort_unstable();
+    assert!(seen.iter().copied().eq((1..KEYS).step_by(2)));
+    // Debug builds are too slow to say anything about the hash.
+    if !cfg!(debug_assertions) {
+        assert!(elapsed < BUDGET, "took {elapsed:?}");
+    }
 }

@@ -185,7 +185,7 @@ unsafe fn value_at(object: CFTypeRef, depth: usize) -> Option<Value> {
                 .map(Value::Array);
         }
         if let Some(dictionary) = collections::dictionary(object) {
-            let entries = dictionary.entries.clone();
+            let entries = dictionary.entries().to_vec();
             let mut out = std::collections::BTreeMap::new();
             for (key, value) in entries {
                 let Value::String(key) = value_at(key, depth + 1)? else {
@@ -437,7 +437,7 @@ mod tests {
         assert_eq!(format, 100);
         // SAFETY: a dictionary this call returned.
         let dictionary = unsafe { collections::dictionary(list) }.expect("a dictionary");
-        assert_eq!(dictionary.entries.len(), 4);
+        assert_eq!(dictionary.len(), 4);
         assert!(!dictionary.mutable);
         unsafe { api::CFRelease(list) };
         unsafe { api::CFRelease(data) };

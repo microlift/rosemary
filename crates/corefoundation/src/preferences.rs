@@ -576,7 +576,7 @@ pub unsafe extern "C" fn CFPreferencesSetMultiple(
         }
     }
     if let Some(set) = unsafe { crate::collections::dictionary(keys_to_set) } {
-        for (key, value) in set.entries.clone() {
+        for (key, value) in set.entries().to_vec() {
             // SAFETY: a pair from the caller's dictionary and the caller's domain.
             unsafe { CFPreferencesSetAppValue(key, value, application) };
         }

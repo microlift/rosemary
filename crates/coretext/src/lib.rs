@@ -368,7 +368,7 @@ fn merged_attributes(base: CFTypeRef, overrides: CFTypeRef) -> CFTypeRef {
     for object in [base, overrides] {
         // SAFETY: null, or a dictionary a guest received from this runtime.
         if let Some(contents) = unsafe { collections::dictionary(object) } {
-            pairs.extend(contents.entries.iter().copied());
+            pairs.extend(contents.entries().iter().copied());
         }
     }
     new_dictionary(&pairs)
