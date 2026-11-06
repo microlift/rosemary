@@ -1105,7 +1105,7 @@ unsafe extern "C" fn filter_array(receiver: Id, _sel: Sel, predicate: Id) {
 unsafe extern "C" fn filtered_set(receiver: Id, _sel: Sel, predicate: Id) -> Id {
     // SAFETY: a set.
     let values = unsafe { corefoundation::collections::set(receiver as CFTypeRef) }
-        .map(|s| s.values.clone())
+        .map(|s| s.values().to_vec())
         .unwrap_or_default();
     let kept = filtered(&values, predicate);
     // SAFETY: a fresh set follows the convenience-constructor rule.

@@ -209,7 +209,7 @@ unsafe extern "C" fn set_environment(receiver: Id, _sel: Sel, dictionary: Id) {
     task.environment = unsafe { corefoundation::collections::dictionary(dictionary as CFTypeRef) }
         .map(|dictionary| {
             dictionary
-                .entries
+                .entries()
                 .iter()
                 .filter_map(|(key, value)| unsafe {
                     Some((text(*key as Id)?, text(*value as Id)?))

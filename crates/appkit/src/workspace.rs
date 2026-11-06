@@ -441,7 +441,7 @@ unsafe extern "C" fn launch_application(
     if let Some(dictionary) =
         unsafe { corefoundation::collections::dictionary(configuration as *const std::ffi::c_void) }
     {
-        for (key, value) in &dictionary.entries {
+        for (key, value) in dictionary.entries() {
             // SAFETY: the keys are strings.
             match unsafe { text(*key as Id) }.as_str() {
                 LAUNCH_ARGUMENTS => arguments = unsafe { strings_of(*value as Id) },

@@ -544,8 +544,8 @@ pub unsafe extern "C" fn IOSurfaceRemoveValue(surface: CFTypeRef, key: CFTypeRef
 /// `IOSurfaceSetValues`: every pair of `dictionary`, over what is there.
 pub unsafe extern "C" fn IOSurfaceSetValues(surface: CFTypeRef, dictionary: CFTypeRef) {
     // SAFETY: null or a dictionary the caller passed.
-    let Some(pairs) =
-        (unsafe { corefoundation::collections::dictionary(dictionary) }).map(|d| d.entries.clone())
+    let Some(pairs) = (unsafe { corefoundation::collections::dictionary(dictionary) })
+        .map(|d| d.entries().to_vec())
     else {
         return;
     };

@@ -37,7 +37,7 @@ impl Attributes {
     fn snapshot(value: Id) -> Self {
         // SAFETY: the caller supplies a dictionary or nil.
         let pairs = unsafe { collections::dictionary(value.cast()) }
-            .map(|d| d.entries.clone())
+            .map(|d| d.entries().to_vec())
             .unwrap_or_default();
         Self::from_pairs(&pairs)
     }
@@ -46,15 +46,14 @@ impl Attributes {
         // SAFETY: this wrapper owns a dictionary made above.
         unsafe { collections::dictionary(self.0 as CFTypeRef) }
             .expect("attributes dictionary")
-            .entries
-            .clone()
+            .entries()
+            .to_vec()
     }
 
     fn get(&self, key: Id) -> Id {
         // SAFETY: a dictionary owned by this wrapper and the caller's key.
         let d = unsafe { collections::dictionary(self.0 as CFTypeRef) }.unwrap();
-        d.position(key.cast())
-            .map_or(std::ptr::null_mut(), |i| d.entries[i].1 as Id)
+        d.get(key.cast()).map_or(std::ptr::null_mut(), |v| v as Id)
     }
 
     fn adding(&self, other: &Self) -> Self {

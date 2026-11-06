@@ -83,6 +83,7 @@ pub struct Policy {
     pub retain: Option<unsafe extern "C" fn(*const c_void, CFTypeRef) -> CFTypeRef>,
     pub release: Option<unsafe extern "C" fn(*const c_void, CFTypeRef)>,
     pub equal: Option<unsafe extern "C" fn(CFTypeRef, CFTypeRef) -> u8>,
+    pub hash: Option<unsafe extern "C" fn(CFTypeRef) -> usize>,
 }
 
 impl Policy {
@@ -93,24 +94,23 @@ impl Policy {
         retain: None,
         release: None,
         equal: None,
+        hash: None,
     };
 
-    /// The policy `kCFTypeArrayCallBacks` describes: retain, release, and
-    /// compare with `CFEqual`. What a collection built through Foundation gets.
+    /// Retain, release, compare with `CFEqual` and hash with `CFHash`. What a
+    /// collection built through Foundation gets, whose sets and keys use
+    /// `-hash` as much as `-isEqual:`.
     pub fn from_type_callbacks() -> Policy {
-        Policy {
-            retain: TYPE_VALUE_CALLBACKS.retain,
-            release: TYPE_VALUE_CALLBACKS.release,
-            equal: TYPE_VALUE_CALLBACKS.equal,
-        }
+        Policy::from_key_callbacks()
     }
 
-    /// The same for keys, which differ only in also carrying a hash.
+    /// The policy `kCFTypeDictionaryKeyCallBacks` describes.
     pub fn from_key_callbacks() -> Policy {
         Policy {
             retain: TYPE_KEY_CALLBACKS.retain,
             release: TYPE_KEY_CALLBACKS.release,
             equal: TYPE_KEY_CALLBACKS.equal,
+            hash: TYPE_KEY_CALLBACKS.hash,
         }
     }
 
@@ -126,6 +126,7 @@ impl Policy {
             retain: c.retain,
             release: c.release,
             equal: c.equal,
+            hash: None,
         }
     }
 
@@ -141,6 +142,7 @@ impl Policy {
             retain: c.retain,
             release: c.release,
             equal: c.equal,
+            hash: c.hash,
         }
     }
 
@@ -158,10 +160,18 @@ impl Policy {
         }
     }
 
+    /// Identical pointers are equal without asking the callback, as Apple's
+    /// collections do.
     pub fn equal(&self, a: CFTypeRef, b: CFTypeRef) -> bool {
-        match self.equal {
-            Some(f) => unsafe { f(a, b) != 0 },
-            None => a == b,
+        a == b || self.equal.is_some_and(|f| unsafe { f(a, b) != 0 })
+    }
+
+    /// No hash callback means the pointer is the hash, as Apple's does.
+    pub fn hash(&self, value: CFTypeRef) -> usize {
+        match self.hash {
+            // SAFETY: a callback the caller supplied, called as it declared it.
+            Some(f) => unsafe { f(value) },
+            None => value as usize,
         }
     }
 }

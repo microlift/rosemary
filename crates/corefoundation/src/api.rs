@@ -1696,7 +1696,7 @@ pub unsafe extern "C" fn CFSetGetTypeID() -> CFTypeID {
 }
 
 pub unsafe extern "C" fn CFSetGetCount(set: CFTypeRef) -> CFIndex {
-    unsafe { collections::set(set) }.map_or(0, |set| set.values.len() as CFIndex)
+    unsafe { collections::set(set) }.map_or(0, |set| set.len() as CFIndex)
 }
 
 pub unsafe extern "C" fn CFSetGetValues(set: CFTypeRef, values: *mut CFTypeRef) {
@@ -1707,7 +1707,7 @@ pub unsafe extern "C" fn CFSetGetValues(set: CFTypeRef, values: *mut CFTypeRef) 
         return;
     };
     // SAFETY: the caller provides room for CFSetGetCount entries.
-    unsafe { std::ptr::copy_nonoverlapping(set.values.as_ptr(), values, set.values.len()) };
+    unsafe { std::ptr::copy_nonoverlapping(set.values().as_ptr(), values, set.len()) };
 }
 
 pub unsafe extern "C" fn CFSetApplyFunction(
@@ -1719,7 +1719,7 @@ pub unsafe extern "C" fn CFSetApplyFunction(
         return;
     };
     // SAFETY: the caller's obligation. Copy before entering guest code.
-    let Some(values) = (unsafe { collections::set(set) }).map(|set| set.values.clone()) else {
+    let Some(values) = (unsafe { collections::set(set) }).map(|set| set.values().to_vec()) else {
         return;
     };
     for value in values {
@@ -1815,14 +1815,14 @@ pub unsafe extern "C" fn CFDictionaryAddValue(
     let Some(d) = (unsafe { collections::dictionary(dictionary) }) else {
         return;
     };
-    if !d.mutable || d.position(key).is_some() {
+    if !d.mutable || d.get(key).is_some() {
         return;
     }
     d.set(key, value);
 }
 
 pub unsafe extern "C" fn CFDictionaryGetCount(dictionary: CFTypeRef) -> CFIndex {
-    unsafe { collections::dictionary(dictionary) }.map_or(0, |d| d.entries.len() as CFIndex)
+    unsafe { collections::dictionary(dictionary) }.map_or(0, |d| d.len() as CFIndex)
 }
 
 pub type DictionaryApplierFunction = unsafe extern "C" fn(CFTypeRef, CFTypeRef, *mut c_void);
@@ -1838,7 +1838,7 @@ pub unsafe extern "C" fn CFDictionaryApplyFunction(
     // Snapshot before invoking guest code, which may mutate the dictionary.
     // SAFETY: a dictionary or null.
     let Some(entries) = (unsafe { collections::dictionary(dictionary) })
-        .map(|dictionary| dictionary.entries.clone())
+        .map(|dictionary| dictionary.entries().to_vec())
     else {
         return;
     };
@@ -1852,8 +1852,7 @@ pub unsafe extern "C" fn CFDictionaryGetValue(dictionary: CFTypeRef, key: CFType
     let Some(d) = (unsafe { collections::dictionary(dictionary) }) else {
         return std::ptr::null();
     };
-    d.position(key)
-        .map_or(std::ptr::null(), |at| d.entries[at].1)
+    d.get(key).unwrap_or(std::ptr::null())
 }
 
 pub unsafe extern "C" fn CFDictionaryGetValueIfPresent(
@@ -1864,19 +1863,18 @@ pub unsafe extern "C" fn CFDictionaryGetValueIfPresent(
     let Some(d) = (unsafe { collections::dictionary(dictionary) }) else {
         return 0;
     };
-    let Some(at) = d.position(key) else {
+    let Some(found) = d.get(key) else {
         return 0;
     };
     if !value.is_null() {
         // SAFETY: the caller supplies a writable result pointer when non-null.
-        unsafe { *value = d.entries[at].1 };
+        unsafe { *value = found };
     }
     1
 }
 
 pub unsafe extern "C" fn CFDictionaryContainsKey(dictionary: CFTypeRef, key: CFTypeRef) -> Boolean {
-    unsafe { collections::dictionary(dictionary) }.is_some_and(|d| d.position(key).is_some())
-        as Boolean
+    unsafe { collections::dictionary(dictionary) }.is_some_and(|d| d.get(key).is_some()) as Boolean
 }
 
 /// `CFDictionaryGetKeysAndValues`: both sides, in one pass, into the caller's
@@ -1889,7 +1887,7 @@ pub unsafe extern "C" fn CFDictionaryGetKeysAndValues(
     let Some(d) = (unsafe { collections::dictionary(dictionary) }) else {
         return;
     };
-    for (i, (key, value)) in d.entries.iter().enumerate() {
+    for (i, (key, value)) in d.entries().iter().enumerate() {
         // SAFETY: the caller says each non-null array has room for `GetCount`
         // entries, which is what this loop writes.
         unsafe {
@@ -3730,7 +3728,9 @@ pub unsafe extern "C" fn CFDictionaryCreateCopy(
     let Some(d) = (unsafe { collections::dictionary(dictionary) }) else {
         return std::ptr::null();
     };
-    collections::new_dictionary(&d.entries.clone(), d.keys, d.values, false)
+    // A snapshot: the callbacks can run guest code that changes the source.
+    let entries = d.entries().to_vec();
+    collections::new_dictionary(&entries, d.keys, d.values, false)
 }
 
 /// `CFMutableDictionaryRef CFDictionaryCreateMutableCopy(CFAllocatorRef,
@@ -3744,7 +3744,9 @@ pub unsafe extern "C" fn CFDictionaryCreateMutableCopy(
     let Some(d) = (unsafe { collections::dictionary(dictionary) }) else {
         return std::ptr::null();
     };
-    collections::new_dictionary(&d.entries.clone(), d.keys, d.values, true)
+    // A snapshot: the callbacks can run guest code that changes the source.
+    let entries = d.entries().to_vec();
+    collections::new_dictionary(&entries, d.keys, d.values, true)
 }
 
 /// `CFIndex CFDictionaryGetCountOfKey(CFDictionaryRef, const void *key)`
@@ -3757,7 +3759,7 @@ pub unsafe extern "C" fn CFDictionaryGetCountOfKey(
     let Some(d) = (unsafe { collections::dictionary(dictionary) }) else {
         return 0;
     };
-    CFIndex::from(d.position(key).is_some())
+    CFIndex::from(d.get(key).is_some())
 }
 
 /// `UInt8 *CFDataGetMutableBytePtr(CFMutableDataRef)`

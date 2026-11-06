@@ -1,5 +1,7 @@
 use std::sync::OnceLock;
 
+use hashbrown::HashTable;
+
 use objc::class::Class;
 
 use crate::base::{CFIndex, CFTypeRef};
@@ -76,8 +78,72 @@ pub unsafe fn array<'a>(object: CFTypeRef) -> Option<&'a mut ArrayContents> {
 
 //
 
+/// Where each member of a set or key of a dictionary sits in its storage,
+/// found by hash so a lookup asks the equal callback - often an `-isEqual:`
+/// send - only of members that hash alike.
+///
+/// Positions follow the storage's: removal swaps the last entry into the hole,
+/// so enumeration order is insertion order until something is removed. Apple
+/// promises no order at all.
+#[derive(Default)]
+struct HashIndex {
+    table: HashTable<usize>,
+    /// The mixed hash of the entry at each position, so the table can grow
+    /// and an entry move without calling back into guest code.
+    hashes: Vec<u64>,
+}
+
+impl HashIndex {
+    /// Spread a `-hash`, which is often a small integer or an aligned pointer,
+    /// over all 64 bits; the table takes its bucket from the low bits and its
+    /// probe tag from the high ones. This is splitmix64's finalizer.
+    fn mix(hash: usize) -> u64 {
+        const MULTIPLIER_1: u64 = 0xbf58_476d_1ce4_e5b9;
+        const MULTIPLIER_2: u64 = 0x94d0_49bb_1331_11eb;
+        let mut h = hash as u64;
+        h = (h ^ (h >> 30)).wrapping_mul(MULTIPLIER_1);
+        h = (h ^ (h >> 27)).wrapping_mul(MULTIPLIER_2);
+        h ^ (h >> 31)
+    }
+
+    /// The position whose entry `is_match` accepts, among those of `hash`.
+    fn find(&self, hash: u64, mut is_match: impl FnMut(usize) -> bool) -> Option<usize> {
+        self.table
+            .find(hash, |&at| self.hashes[at] == hash && is_match(at))
+            .copied()
+    }
+
+    /// Record an entry just pushed onto the end of the storage.
+    fn push(&mut self, hash: u64) {
+        let at = self.hashes.len();
+        self.hashes.push(hash);
+        let hashes = &self.hashes;
+        self.table.insert_unique(hash, at, |&i| hashes[i]);
+    }
+
+    /// Forget the entry at `at`, the storage having done `swap_remove(at)`.
+    fn swap_remove(&mut self, at: usize) {
+        let last = self.hashes.len() - 1;
+        match self.table.find_entry(self.hashes[at], |&i| i == at) {
+            Ok(entry) => drop(entry.remove()),
+            Err(_) => unreachable!("every position is indexed"),
+        }
+        if at != last {
+            let moved = self.table.find_mut(self.hashes[last], |&i| i == last);
+            *moved.expect("every position is indexed") = at;
+        }
+        self.hashes.swap_remove(at);
+    }
+
+    fn clear(&mut self) {
+        self.table.clear();
+        self.hashes.clear();
+    }
+}
+
 pub struct SetContents {
-    pub values: Vec<CFTypeRef>,
+    values: Vec<CFTypeRef>,
+    index: HashIndex,
     pub policy: Policy,
 }
 
@@ -86,6 +152,72 @@ impl Drop for SetContents {
         for value in self.values.drain(..) {
             self.policy.release(value);
         }
+    }
+}
+
+impl SetContents {
+    pub fn new(policy: Policy) -> SetContents {
+        SetContents {
+            values: Vec::new(),
+            index: HashIndex::default(),
+            policy,
+        }
+    }
+
+    pub fn values(&self) -> &[CFTypeRef] {
+        &self.values
+    }
+
+    pub fn len(&self) -> usize {
+        self.values.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.values.is_empty()
+    }
+
+    fn find(&self, value: CFTypeRef, hash: u64) -> Option<usize> {
+        let policy = self.policy;
+        self.index
+            .find(hash, |at| policy.equal(self.values[at], value))
+    }
+
+    /// The member equal to `value`.
+    pub fn member(&self, value: CFTypeRef) -> Option<CFTypeRef> {
+        let hash = HashIndex::mix(self.policy.hash(value));
+        self.find(value, hash).map(|at| self.values[at])
+    }
+
+    pub fn contains(&self, value: CFTypeRef) -> bool {
+        self.member(value).is_some()
+    }
+
+    /// Add `value`, retained, unless an equal member is already present.
+    /// Whether it was added.
+    pub fn insert(&mut self, value: CFTypeRef) -> bool {
+        let hash = HashIndex::mix(self.policy.hash(value));
+        if self.find(value, hash).is_some() {
+            return false;
+        }
+        let value = self.policy.retain(value);
+        self.values.push(value);
+        self.index.push(hash);
+        true
+    }
+
+    /// Take out the member equal to `value`. The caller owns the reference
+    /// the set held.
+    pub fn remove(&mut self, value: CFTypeRef) -> Option<CFTypeRef> {
+        let hash = HashIndex::mix(self.policy.hash(value));
+        let at = self.find(value, hash)?;
+        self.index.swap_remove(at);
+        Some(self.values.swap_remove(at))
+    }
+
+    /// Take out every member. The caller owns the references the set held.
+    pub fn take_all(&mut self) -> Vec<CFTypeRef> {
+        self.index.clear();
+        std::mem::take(&mut self.values)
     }
 }
 
@@ -101,20 +233,13 @@ pub fn set_class() -> &'static Class {
     unsafe { &*(p as *const Class) }
 }
 
+/// A set of `values`, keeping the first of any that are equal.
 pub fn new_set(values: &[CFTypeRef], policy: Policy) -> CFTypeRef {
-    let mut unique = Vec::with_capacity(values.len());
+    let mut contents = SetContents::new(policy);
     for value in values {
-        if !unique.iter().any(|v| policy.equal(*v, *value)) {
-            unique.push(policy.retain(*value));
-        }
+        contents.insert(*value);
     }
-    make(
-        set_class(),
-        SetContents {
-            values: unique,
-            policy,
-        },
-    )
+    make(set_class(), contents)
 }
 
 /// # Safety
@@ -127,7 +252,8 @@ pub unsafe fn set<'a>(object: CFTypeRef) -> Option<&'a mut SetContents> {
 //
 
 pub struct DictionaryContents {
-    pub entries: Vec<(CFTypeRef, CFTypeRef)>,
+    entries: Vec<(CFTypeRef, CFTypeRef)>,
+    index: HashIndex,
     pub keys: Policy,
     pub values: Policy,
     /// As [`ArrayContents::mutable`].
@@ -144,22 +270,83 @@ impl Drop for DictionaryContents {
 }
 
 impl DictionaryContents {
-    pub fn position(&self, key: CFTypeRef) -> Option<usize> {
-        self.entries
-            .iter()
-            .position(|(k, _)| self.keys.equal(*k, key))
+    pub fn new(keys: Policy, values: Policy, mutable: bool) -> DictionaryContents {
+        DictionaryContents {
+            entries: Vec::new(),
+            index: HashIndex::default(),
+            keys,
+            values,
+            mutable,
+        }
     }
 
-    /// Insert or replace, retaining both as the policies say.
+    pub fn entries(&self) -> &[(CFTypeRef, CFTypeRef)] {
+        &self.entries
+    }
+
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    fn find(&self, key: CFTypeRef, hash: u64) -> Option<usize> {
+        let keys = self.keys;
+        self.index
+            .find(hash, |at| keys.equal(self.entries[at].0, key))
+    }
+
+    /// Where the key equal to `key` sits in [`entries`](Self::entries).
+    pub fn position(&self, key: CFTypeRef) -> Option<usize> {
+        self.find(key, HashIndex::mix(self.keys.hash(key)))
+    }
+
+    /// The value of the key equal to `key`.
+    pub fn get(&self, key: CFTypeRef) -> Option<CFTypeRef> {
+        self.position(key).map(|at| self.entries[at].1)
+    }
+
+    /// Insert or replace, retaining both as the policies say. A replaced value
+    /// keeps the key object already present.
     pub fn set(&mut self, key: CFTypeRef, value: CFTypeRef) {
+        let hash = HashIndex::mix(self.keys.hash(key));
         let value = self.values.retain(value);
-        match self.position(key) {
+        match self.find(key, hash) {
             Some(at) => {
-                self.values.release(self.entries[at].1);
-                self.entries[at].1 = value;
+                let old = std::mem::replace(&mut self.entries[at].1, value);
+                self.values.release(old);
             }
-            None => self.entries.push((self.keys.retain(key), value)),
+            None => {
+                let key = self.keys.retain(key);
+                self.entries.push((key, value));
+                self.index.push(hash);
+            }
         }
+    }
+
+    /// Take out the pair whose key is equal to `key`. The caller owns the
+    /// references the dictionary held.
+    pub fn remove(&mut self, key: CFTypeRef) -> Option<(CFTypeRef, CFTypeRef)> {
+        let at = self.position(key)?;
+        self.index.swap_remove(at);
+        Some(self.entries.swap_remove(at))
+    }
+
+    /// Remove and release the pair whose key is equal to `key`. The pair is out
+    /// of the dictionary before a release can run guest code.
+    pub fn discard(&mut self, key: CFTypeRef) {
+        if let Some((key, value)) = self.remove(key) {
+            self.keys.release(key);
+            self.values.release(value);
+        }
+    }
+
+    /// Take out every pair. The caller owns the references the dictionary held.
+    pub fn take_all(&mut self) -> Vec<(CFTypeRef, CFTypeRef)> {
+        self.index.clear();
+        std::mem::take(&mut self.entries)
     }
 }
 
@@ -181,12 +368,7 @@ pub fn new_dictionary(
     values: Policy,
     mutable: bool,
 ) -> CFTypeRef {
-    let mut contents = DictionaryContents {
-        entries: Vec::with_capacity(pairs.len()),
-        keys,
-        values,
-        mutable,
-    };
+    let mut contents = DictionaryContents::new(keys, values, mutable);
     for (key, value) in pairs {
         contents.set(*key, *value);
     }
@@ -505,4 +687,71 @@ pub unsafe fn data<'a>(object: CFTypeRef) -> Option<&'a mut Vec<u8>> {
 /// A `CFIndex` clamped into a slice index, or `None` for out of range.
 pub fn at(index: CFIndex, len: usize) -> Option<usize> {
     (index >= 0 && (index as usize) < len).then_some(index as usize)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Plain integers posing as pointers, which `Policy::NONE` never reads.
+    fn token(n: usize) -> CFTypeRef {
+        n as CFTypeRef
+    }
+
+    /// Every value hashes alike, so every lookup walks one bucket.
+    unsafe extern "C" fn same_hash(_value: CFTypeRef) -> usize {
+        0
+    }
+
+    unsafe extern "C" fn same_parity(a: CFTypeRef, b: CFTypeRef) -> u8 {
+        (a as usize % 2 == b as usize % 2) as u8
+    }
+
+    #[test]
+    fn dictionary_finds_every_key_left_after_removals() {
+        const KEYS: usize = 1000;
+        let mut d = DictionaryContents::new(Policy::NONE, Policy::NONE, true);
+        for n in 1..=KEYS {
+            d.set(token(n), token(n * 10));
+        }
+        for n in (1..=KEYS).step_by(3) {
+            assert_eq!(d.remove(token(n)), Some((token(n), token(n * 10))));
+        }
+        for n in 1..=KEYS {
+            let expected = (n % 3 != 1).then(|| token(n * 10));
+            assert_eq!(d.get(token(n)), expected, "key {n}");
+        }
+        assert_eq!(d.len(), KEYS - KEYS.div_ceil(3));
+        assert!(
+            d.entries()
+                .iter()
+                .all(|(k, v)| *v == token(*k as usize * 10))
+        );
+    }
+
+    #[test]
+    fn dictionary_replacing_a_value_keeps_one_entry() {
+        let mut d = DictionaryContents::new(Policy::NONE, Policy::NONE, true);
+        d.set(token(1), token(10));
+        d.set(token(1), token(11));
+        assert_eq!(d.entries(), &[(token(1), token(11))]);
+    }
+
+    #[test]
+    fn set_asks_the_equal_callback_of_members_that_hash_alike() {
+        let policy = Policy {
+            equal: Some(same_parity),
+            hash: Some(same_hash),
+            ..Policy::NONE
+        };
+        let mut set = SetContents::new(policy);
+        assert!(set.insert(token(2)));
+        assert!(set.insert(token(3)));
+        assert!(!set.insert(token(4)));
+        assert_eq!(set.member(token(6)), Some(token(2)));
+        assert_eq!(set.remove(token(8)), Some(token(2)));
+        assert_eq!(set.member(token(5)), Some(token(3)));
+        assert_eq!(set.member(token(2)), None);
+        assert_eq!(set.values(), &[token(3)]);
+    }
 }

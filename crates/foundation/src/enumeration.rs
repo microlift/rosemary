@@ -52,7 +52,7 @@ fn array_snapshot(receiver: Id) -> Option<Snapshot> {
 fn set_snapshot(receiver: Id) -> Option<Snapshot> {
     // SAFETY: the receiver of an NSSet method.
     let set = unsafe { collections::set(receiver as CFTypeRef) }?;
-    Some(Snapshot::new(set.values.clone()))
+    Some(Snapshot::new(set.values().to_vec()))
 }
 
 /// Objects held for the length of an enumeration.
@@ -200,7 +200,7 @@ unsafe extern "C" fn indexes_of_objects_passing_test(receiver: Id, sel: Sel, blo
 fn dictionary_snapshot(receiver: Id) -> Option<(Snapshot, Snapshot)> {
     // SAFETY: the receiver of an NSDictionary method.
     let dictionary = unsafe { collections::dictionary(receiver as CFTypeRef) }?;
-    let (keys, values) = dictionary.entries.iter().copied().unzip();
+    let (keys, values) = dictionary.entries().iter().copied().unzip();
     Some((Snapshot::new(keys), Snapshot::new(values)))
 }
 

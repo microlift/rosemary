@@ -897,9 +897,10 @@ unsafe extern "C" fn is_equal(receiver: Id, sel: Sel, other: Id) -> u8 {
 }
 
 unsafe extern "C" fn hash(receiver: Id, _sel: Sel) -> usize {
-    // SAFETY: a number. Equal values hash alike: the value is normalized.
+    // SAFETY: a number. It hashes as an `NSNumber` of its value, which it is
+    // `-isEqual:` to.
     let value = unsafe { value_of(receiver) }.unwrap_or_else(Decimal::nan);
-    value.to_f64().to_bits() as usize
+    crate::collections::number_hash_of(Number::Float(value.to_f64()))
 }
 
 /// The decimal separator a locale writes, `.` for nil or a locale that has
