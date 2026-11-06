@@ -142,23 +142,28 @@ pub fn guest_arch() -> GuestArch {
 /// One key's answer.
 enum Value {
     Str(String),
+    /// A string XNU cuts to fit a short buffer rather than refusing it, as
+    /// `sysctl_io_string` does when its handler passes `trunc`.
+    TruncatingStr(String),
     U32(u32),
     U64(u64),
     Bytes(Vec<u8>),
+    /// `kinfo_proc` records, which `sysctl_prochandle` copies whole while they fit.
+    Records(Vec<u8>),
 }
 
 impl Value {
     /// The bytes `sysctl` copies out, including a string's terminating NUL.
     fn bytes(&self) -> Vec<u8> {
         match self {
-            Value::Str(s) => {
+            Value::Str(s) | Value::TruncatingStr(s) => {
                 let mut v = s.as_bytes().to_vec();
                 v.push(0);
                 v
             }
             Value::U32(n) => n.to_ne_bytes().to_vec(),
             Value::U64(n) => n.to_ne_bytes().to_vec(),
-            Value::Bytes(bytes) => bytes.clone(),
+            Value::Bytes(bytes) | Value::Records(bytes) => bytes.clone(),
         }
     }
 }
@@ -309,7 +314,7 @@ const KEYS: &[Key] = &[
     Key {
         name: "kern.hostname",
         mib: &[CTL_KERN, KERN_HOSTNAME],
-        source: Source::Host(|| Some(Value::Str(hostname()))),
+        source: Source::Host(|| Some(Value::TruncatingStr(hostname()))),
     },
     Key {
         name: "kern.argmax",
@@ -835,10 +840,11 @@ pub(crate) fn memsize() -> u64 {
 
 /// Copy `value` out under the `oldp`/`oldlenp` protocol every `sysctl` key follows.
 ///
-/// A null `oldp` is a size enquiry and succeeds. Too small a buffer gets nothing and
-/// `ENOMEM`, with `*oldlenp` set to the bytes produced, none: XNU's `sysctl_old_user`
-/// refuses a chunk that does not fit before copying any of it, and `userland_sysctl`
-/// reports its cursor, which that refusal did not advance.
+/// A null `oldp` is a size enquiry and succeeds. Too small a buffer fails with
+/// `ENOMEM` and `*oldlenp` set to zero: XNU's `sysctl_old_user` refuses a chunk
+/// that does not fit before copying any of it, and `userland_sysctl` reports its
+/// cursor, which that refusal did not advance. [`Value::Records`] and
+/// [`Value::TruncatingStr`] copy part of the value first, as their XNU handlers do.
 ///
 /// # Safety
 ///
@@ -853,20 +859,39 @@ unsafe fn copy_out(value: &Value, oldp: *mut libc::c_void, oldlenp: *mut libc::s
     // SAFETY: the caller guarantees `oldlenp` is a writable `size_t`.
     let available = unsafe { *oldlenp };
     if oldp.is_null() {
-        unsafe { *oldlenp = bytes.len() };
+        let needed = match value {
+            Value::Records(_) => bytes.len() + KERN_PROCSLOP,
+            _ => bytes.len(),
+        };
+        unsafe { *oldlenp = needed };
         return 0;
     }
-    if available < bytes.len() {
-        unsafe { *oldlenp = 0 };
-        crate::errno::set(libc::ENOMEM);
-        return -1;
+    let (written, reported) = match value {
+        _ if available >= bytes.len() => (bytes.clone(), Some(bytes.len())),
+        Value::TruncatingStr(_) if available != 0 => {
+            let mut cut = bytes[..available - 1].to_vec();
+            cut.push(0);
+            (cut, Some(available))
+        }
+        Value::Records(_) => {
+            let whole = available - available % crate::process::KINFO_PROC_LEN;
+            (bytes[..whole].to_vec(), None)
+        }
+        _ => (Vec::new(), None),
+    };
+    // SAFETY: `oldp` is writable for `available` bytes, and `written` is no longer.
+    unsafe { std::ptr::copy_nonoverlapping(written.as_ptr(), oldp as *mut u8, written.len()) };
+    match reported {
+        Some(len) => {
+            unsafe { *oldlenp = len };
+            0
+        }
+        None => {
+            unsafe { *oldlenp = 0 };
+            crate::errno::set(libc::ENOMEM);
+            -1
+        }
     }
-    // SAFETY: `oldp` is writable for `available` bytes, which is at least `bytes.len()`.
-    unsafe {
-        std::ptr::copy_nonoverlapping(bytes.as_ptr(), oldp as *mut u8, bytes.len());
-        *oldlenp = bytes.len();
-    }
-    0
 }
 
 /// Report a key nothing here answers, under `ROSEMARY_TRACE_SYSCTL`.
@@ -918,7 +943,7 @@ unsafe extern "C" fn sysctl(
         }
         return match answer {
             // SAFETY: the caller's own `oldp`/`oldlenp`.
-            Ok(bytes) => unsafe { copy_out(&Value::Bytes(bytes), oldp, oldlenp) },
+            Ok(value) => unsafe { copy_out(&value, oldp, oldlenp) },
             Err(error) => {
                 crate::errno::set(error);
                 -1
@@ -1031,10 +1056,10 @@ unsafe fn describe_tree(
         }
         [CTL_SYSCTL, SYSCTL_OIDFMT, ref oid @ ..] => own_by_mib(oid)?.value().map(|value| {
             let (kind, format) = match value {
-                Value::Str(_) => (CTLTYPE_STRING, "A"),
+                Value::Str(_) | Value::TruncatingStr(_) => (CTLTYPE_STRING, "A"),
                 Value::U32(_) => (CTLTYPE_INT, "I"),
                 Value::U64(_) => (CTLTYPE_QUAD, "Q"),
-                Value::Bytes(_) => (CTLTYPE_OPAQUE, ""),
+                Value::Bytes(_) | Value::Records(_) => (CTLTYPE_OPAQUE, ""),
             };
             let mut bytes = (kind | CTLFLAG_RD).to_ne_bytes().to_vec();
             bytes.extend_from_slice(format.as_bytes());
@@ -1052,6 +1077,10 @@ const KERN_PROC: i32 = 14;
 const KERN_PROCARGS: i32 = 38;
 const KERN_PROCARGS2: i32 = 49;
 
+/// The headroom `sysctl_prochandle` adds to a `KERN_PROC` size enquiry, for
+/// processes started before the caller asks again.
+const KERN_PROCSLOP: usize = 5 * crate::process::KINFO_PROC_LEN;
+
 /// `sysctl.proc_cputype`, a dynamically numbered key on a Mac; this is the
 /// number this module gives it. A pid follows it in the MIB.
 const SYSCTL_PROC_CPUTYPE: i32 = 101;
@@ -1062,8 +1091,8 @@ const SYSCTL_PROC_CPUTYPE: i32 = 101;
 /// `None` for a key this does not own; `Some(Err(errno))` for one it owns and
 /// refuses - a pid that is not a visible guest is `EINVAL` for the argument
 /// keys, as on a Mac, and an empty list for `KERN_PROC`.
-fn process_value(mib: &[i32]) -> Option<Result<Vec<u8>, i32>> {
-    match *mib {
+fn process_value(mib: &[i32]) -> Option<Result<Value, i32>> {
+    let answer = match *mib {
         [CTL_KERN, KERN_PROC, selector] => {
             Some(crate::process::select(selector, None).ok_or(libc::EINVAL))
         }
@@ -1087,7 +1116,12 @@ fn process_value(mib: &[i32]) -> Option<Result<Vec<u8>, i32>> {
                 .ok_or(libc::ESRCH),
         ),
         _ => None,
-    }
+    };
+    let value = match *mib {
+        [CTL_KERN, KERN_PROC, ..] => Value::Records,
+        _ => Value::Bytes,
+    };
+    answer.map(|answer| answer.map(value))
 }
 
 /// `int sysctlbyname(const char *, void *, size_t *, void *, size_t)`.
@@ -1336,6 +1370,55 @@ mod tests {
         assert_eq!(crate::errno::get(), libc::ENOMEM);
         assert_eq!(len, 0);
         assert_eq!(buf, [0xAA; 2]);
+        crate::errno::set(0);
+    }
+
+    /// `kern.hostname` is cut to fit, still terminated, and succeeds, as XNU's
+    /// handler asks `sysctl_io_string` to.
+    #[test]
+    fn a_short_buffer_gets_a_terminated_prefix_of_the_hostname() {
+        let mut buf = [0xAAu8; 2];
+        let mut len: libc::size_t = buf.len();
+        // SAFETY: `buf` is live for `len` bytes, which is what is passed.
+        let rc = unsafe {
+            sysctlbyname(
+                c"kern.hostname".as_ptr(),
+                buf.as_mut_ptr() as *mut libc::c_void,
+                &mut len,
+                std::ptr::null_mut(),
+                0,
+            )
+        };
+        assert_eq!(rc, 0);
+        assert_eq!(len, buf.len());
+        assert_eq!(buf, [hostname().as_bytes()[0], 0]);
+    }
+
+    /// `sysctl_prochandle` copies the records that fit whole, then fails with a
+    /// length of zero; a size enquiry adds `KERN_PROCSLOP`.
+    #[test]
+    fn a_short_buffer_gets_the_kinfo_procs_that_fit() {
+        let record = crate::process::KINFO_PROC_LEN;
+        let records: Vec<u8> = (1..=3u8).flat_map(|n| vec![n; record]).collect();
+        let value = Value::Records(records.clone());
+
+        let mut len: libc::size_t = 0;
+        // SAFETY: a size enquiry into a live `size_t`.
+        assert_eq!(
+            unsafe { copy_out(&value, std::ptr::null_mut(), &mut len) },
+            0
+        );
+        assert_eq!(len, records.len() + KERN_PROCSLOP);
+
+        let mut buf = vec![0u8; 2 * record + record / 2];
+        let mut len: libc::size_t = buf.len();
+        // SAFETY: `buf` is live for `len` bytes, which is what is passed.
+        let rc = unsafe { copy_out(&value, buf.as_mut_ptr() as *mut libc::c_void, &mut len) };
+        assert_eq!(rc, -1);
+        assert_eq!(crate::errno::get(), libc::ENOMEM);
+        assert_eq!(len, 0);
+        assert_eq!(buf[..2 * record], records[..2 * record]);
+        assert!(buf[2 * record..].iter().all(|&b| b == 0));
         crate::errno::set(0);
     }
 

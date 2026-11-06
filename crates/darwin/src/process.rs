@@ -387,6 +387,9 @@ const _: () = {
     assert!(size_of::<KinfoProc>() == 648);
 };
 
+/// The size of one record [`select`] returns.
+pub(crate) const KINFO_PROC_LEN: usize = size_of::<KinfoProc>();
+
 /// `p_flag` bits.
 const P_CONTROLT: i32 = 0x0000_0002;
 const P_LP64: i32 = 0x0000_0004;
