@@ -1,4 +1,5 @@
 use std::ffi::c_void;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use objc::class::Class;
 use objc::object::Id;
@@ -27,31 +28,53 @@ pub fn type_id(class: &'static Class) -> CFTypeID {
 /// `CFGetTypeID` - and `libYoYoGamepad` does, on every value IOKit hands it -
 /// would otherwise fall through every arm for a string that came from an image
 /// rather than the heap.
-static TYPES: std::sync::Mutex<Vec<usize>> = std::sync::Mutex::new(Vec::new());
+///
+/// Read on every `CFGetTypeID`, from audio and render threads among others, so
+/// readers take no lock: the table only grows, a slot is written before the
+/// count that publishes it, and only registration serializes on a mutex.
+static TYPES: [AtomicUsize; TYPE_CAPACITY] = [const { AtomicUsize::new(0) }; TYPE_CAPACITY];
+static TYPE_COUNT: AtomicUsize = AtomicUsize::new(0);
+static TYPE_WRITER: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// More than every type this tree registers; running out is a registration bug,
+/// not a guest's doing.
+const TYPE_CAPACITY: usize = 256;
 
 fn note_type(class: &'static Class) {
-    TYPES
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .push(objc::class::ptr(class) as usize);
+    let id = type_id(class);
+    let _writer = TYPE_WRITER.lock().unwrap_or_else(|e| e.into_inner());
+    if is_registered_type(id) {
+        return;
+    }
+    let count = TYPE_COUNT.load(Ordering::Relaxed);
+    assert!(
+        count < TYPE_CAPACITY,
+        "more than {TYPE_CAPACITY} CoreFoundation types registered"
+    );
+    TYPES[count].store(id, Ordering::Relaxed);
+    TYPE_COUNT.store(count + 1, Ordering::Release);
+}
+
+fn is_registered_type(id: CFTypeID) -> bool {
+    TYPES[..TYPE_COUNT.load(Ordering::Acquire)]
+        .iter()
+        .any(|slot| slot.load(Ordering::Relaxed) == id)
 }
 
 /// The `CFTypeID` an object of `class` reports: the nearest ancestor that is a
 /// CoreFoundation type, or zero for something that is not one at all.
 pub fn type_id_of(class: &'static Class) -> CFTypeID {
-    let types = TYPES.lock().unwrap_or_else(|e| e.into_inner());
     class
         .chain()
-        .map(|c| objc::class::ptr(c) as usize)
-        .find(|c| types.contains(c))
+        .map(type_id)
+        .find(|&id| is_registered_type(id))
         .unwrap_or(0)
 }
 
 /// The name of the class a `CFTypeID` stands for, or `None` for an ID no
 /// registered type has.
 pub fn type_name(id: CFTypeID) -> Option<&'static str> {
-    let types = TYPES.lock().unwrap_or_else(|e| e.into_inner());
-    if id == 0 || !types.contains(&id) {
+    if id == 0 || !is_registered_type(id) {
         return None;
     }
     // SAFETY: a class this crate noted as a type, which lives for the process.
@@ -308,4 +331,34 @@ pub fn global_cell(name: &str, value: u64) -> u64 {
     let addr = Box::leak(Box::new(value)) as *mut u64 as usize as u64;
     cells.push((name.to_string(), addr));
     addr
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn subclass_reports_its_nearest_registered_type() {
+        let base = register(c"RosemaryTestTypeBase", None, size_of::<usize>(), true);
+        let derived = register(
+            c"RosemaryTestTypeDerived",
+            Some(base),
+            size_of::<usize>(),
+            false,
+        );
+        assert_eq!(type_id_of(derived), type_id(base));
+        assert_eq!(type_name(type_id(base)), Some("RosemaryTestTypeBase"));
+    }
+
+    #[test]
+    fn noting_a_type_twice_registers_it_once() {
+        let class = register(c"RosemaryTestTypeTwice", None, size_of::<usize>(), true);
+        note_type_class(class);
+        let id = type_id(class);
+        let count = TYPES[..TYPE_COUNT.load(Ordering::Acquire)]
+            .iter()
+            .filter(|slot| slot.load(Ordering::Relaxed) == id)
+            .count();
+        assert_eq!(count, 1);
+    }
 }
