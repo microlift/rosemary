@@ -36,6 +36,7 @@ opencl.workspace = true
 opengl.workspace = true
 metal.workspace = true
 videotoolbox.workspace = true
+starnix.workspace = true
 gimli.workspace = true
 sha2.workspace = true
 libc.workspace = true
