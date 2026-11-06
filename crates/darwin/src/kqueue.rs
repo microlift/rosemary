@@ -11,6 +11,44 @@ use static_init::dynamic;
 use crate::mach::space::{self, Name};
 use crate::mach::wire::Receiver;
 
+#[cfg(target_os = "linux")]
+mod sources;
+/// Only Linux has the host objects these filters are built on, so elsewhere
+/// they stay refused.
+#[cfg(not(target_os = "linux"))]
+mod sources {
+    use super::Kevent;
+    use std::ffi::c_int;
+
+    pub(super) const FILTERS: [i16; 0] = [];
+
+    pub(super) enum Source {}
+
+    impl Source {
+        pub(super) fn open(_: &Kevent) -> Result<Self, c_int> {
+            Err(libc::EINVAL)
+        }
+        pub(super) fn touch(&mut self, _: &Kevent) -> Result<Option<Self>, c_int> {
+            match *self {}
+        }
+        pub(super) fn fd(&self) -> c_int {
+            match *self {}
+        }
+        pub(super) fn forced_flags(&self) -> u16 {
+            match *self {}
+        }
+        pub(super) fn collect(&mut self) {
+            match *self {}
+        }
+        pub(super) fn pending(&self) -> bool {
+            match *self {}
+        }
+        pub(super) fn take(&mut self, _: Kevent, _: u16) -> Option<Kevent> {
+            match *self {}
+        }
+    }
+}
+
 /// `struct kevent`, which the guest both fills in and reads back.
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
@@ -35,7 +73,14 @@ const HOST_WAIT_BATCH: usize = 1024;
 
 const EVFILT_READ: i16 = -1;
 const EVFILT_WRITE: i16 = -2;
+/// Answered by `sources`, which only a Linux host has.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+const EVFILT_VNODE: i16 = -4;
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+const EVFILT_PROC: i16 = -5;
 const EVFILT_SIGNAL: i16 = -6;
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+const EVFILT_TIMER: i16 = -7;
 const EVFILT_MACHPORT: i16 = -8;
 const EVFILT_USER: i16 = -10;
 const EVFILT_SOCK: i16 = -13;
@@ -130,6 +175,9 @@ struct Queue<B> {
     /// delivered is one event, not two.
     triggered: VecDeque<usize>,
     triggered_set: HashSet<usize>,
+    /// The host objects behind timer, vnode and process registrations, whose
+    /// descriptors the backend watches through `watch_port`.
+    sources: HashMap<(i16, usize), sources::Source>,
     backend: Arc<B>,
 }
 
@@ -148,6 +196,7 @@ impl<B> Queue<B> {
             port_watch: HashMap::new(),
             triggered: VecDeque::new(),
             triggered_set: HashSet::new(),
+            sources: HashMap::new(),
             backend: Arc::new(backend),
         }
     }
@@ -172,8 +221,8 @@ enum Source {
     Wake,
     Level,
     Edge,
-    /// A Mach receive socket of an `EV_CLEAR` `EVFILT_MACHPORT`, which is never
-    /// one of the guest's descriptors.
+    /// A Mach receive socket of an `EV_CLEAR` `EVFILT_MACHPORT`, or a source's
+    /// host descriptor; never one of the guest's descriptors.
     Port,
 }
 
@@ -197,7 +246,8 @@ trait ReadinessBackend: Sized {
     /// Whether the host can report edges, which `EV_CLEAR` needs.
     const EDGE: bool;
     fn update(&self, fd: c_int, before: Interest, after: Interest) -> Result<(), c_int>;
-    /// Watch, or stop watching, a Mach receive socket for edges.
+    /// Watch, or stop watching, a Mach receive socket or a source's host
+    /// descriptor for edges.
     fn watch_port(&self, fd: c_int, watch: bool) -> Result<(), c_int>;
     /// `ports` are Mach receive sockets that end the wait when readable but
     /// are never reported: `kevent` asks the ports themselves afterwards.
@@ -1129,10 +1179,18 @@ fn drain_fd(queue: c_int) {
 /// `data`, which is a value rather than the `errno` slot, so nothing later
 /// translates it.
 fn apply<B: ReadinessBackend>(state: &mut Queue<B>, change: &Kevent) -> Result<(), c_int> {
-    if !matches!(
-        change.filter,
-        EVFILT_READ | EVFILT_WRITE | EVFILT_USER | EVFILT_SIGNAL | EVFILT_MACHPORT | EVFILT_SOCK
-    ) || (change.filter == EVFILT_SOCK && B::SOCKET_STATE == 0)
+    let sourced = sources::FILTERS.contains(&change.filter);
+    if !sourced
+        && !matches!(
+            change.filter,
+            EVFILT_READ
+                | EVFILT_WRITE
+                | EVFILT_USER
+                | EVFILT_SIGNAL
+                | EVFILT_MACHPORT
+                | EVFILT_SOCK
+        )
+        || (change.filter == EVFILT_SOCK && B::SOCKET_STATE == 0)
     {
         return Err(crate::errno::from_host(libc::EINVAL));
     }
@@ -1143,6 +1201,7 @@ fn apply<B: ReadinessBackend>(state: &mut Queue<B>, change: &Kevent) -> Result<(
             return Err(crate::errno::from_host(libc::ENOENT));
         }
         set_registration(state, key, None)?;
+        drop_source(state, key);
         if change.filter == EVFILT_USER && state.triggered_set.remove(&change.ident) {
             state.triggered.retain(|ident| *ident != change.ident);
         }
@@ -1159,6 +1218,10 @@ fn apply<B: ReadinessBackend>(state: &mut Queue<B>, change: &Kevent) -> Result<(
         && !B::EDGE
     {
         return Err(crate::errno::from_host(libc::EINVAL));
+    }
+
+    if sourced {
+        return apply_source(state, change);
     }
 
     let existing = state.registrations.get(&key).copied();
@@ -1245,6 +1308,88 @@ fn apply<B: ReadinessBackend>(state: &mut Queue<B>, change: &Kevent) -> Result<(
         state.backend.wake();
     }
     Ok(())
+}
+
+/// `apply` for a filter whose registration owns a host object.
+fn apply_source<B: ReadinessBackend>(state: &mut Queue<B>, change: &Kevent) -> Result<(), c_int> {
+    let key = (change.filter, change.ident);
+    let Some(existing) = state.registrations.get(&key).copied() else {
+        if change.flags & EV_ADD == 0 {
+            return Err(crate::errno::from_host(libc::ENOENT));
+        }
+        let source = sources::Source::open(change).map_err(crate::errno::from_host)?;
+        return watch_source(state, change, source);
+    };
+    if change.flags & EV_ADD == 0 {
+        let mut registration = existing;
+        if change.flags & EV_ENABLE != 0 {
+            registration.enabled = true;
+        }
+        if change.flags & EV_DISABLE != 0 {
+            registration.enabled = false;
+        }
+        put(&mut state.registrations, key, Some(registration));
+        return Ok(());
+    }
+    let replacement = match state.sources.get_mut(&key) {
+        Some(source) => source.touch(change).map_err(crate::errno::from_host)?,
+        None => None,
+    };
+    match replacement {
+        Some(source) => watch_source(state, change, source),
+        None => {
+            let forced = state.sources.get(&key).map_or(0, |s| s.forced_flags());
+            put(
+                &mut state.registrations,
+                key,
+                Some(registration(change, forced)),
+            );
+            Ok(())
+        }
+    }
+}
+
+/// What `change` registers, with the `flags` its filter forces on it.
+fn registration(change: &Kevent, forced: u16) -> Registration {
+    Registration {
+        ident: change.ident,
+        filter: change.filter,
+        flags: change.flags | forced,
+        fflags: change.fflags,
+        udata: change.udata,
+        enabled: change.flags & EV_DISABLE == 0,
+        seen: 0,
+    }
+}
+
+/// Register `source` for `change`, replacing and unwatching any source the
+/// registration had.
+fn watch_source<B: ReadinessBackend>(
+    state: &mut Queue<B>,
+    change: &Kevent,
+    source: sources::Source,
+) -> Result<(), c_int> {
+    let key = (change.filter, change.ident);
+    state
+        .backend
+        .watch_port(source.fd(), true)
+        .map_err(crate::errno::from_host)?;
+    let forced = source.forced_flags();
+    drop_source(state, key);
+    state.sources.insert(key, source);
+    put(
+        &mut state.registrations,
+        key,
+        Some(registration(change, forced)),
+    );
+    Ok(())
+}
+
+/// Stop watching, and close, the host object behind `key`'s registration.
+fn drop_source<B: ReadinessBackend>(state: &mut Queue<B>, key: (i16, usize)) {
+    if let Some(source) = state.sources.remove(&key) {
+        let _ = state.backend.watch_port(source.fd(), false);
+    }
 }
 
 /// Store `value` under `key`, or remove the entry for `None`; the previous one.
@@ -1494,9 +1639,11 @@ pub unsafe extern "C" fn kevent(
             watched_ports(&state.registrations)
         };
         let triggered = {
-            let state = state.lock().unwrap_or_else(|e| e.into_inner());
+            let mut state = state.lock().unwrap_or_else(|e| e.into_inner());
+            collect_sources(&mut state);
             !state.triggered.is_empty()
                 || signals_pending(&state.registrations)
+                || sources_pending(&state)
                 || ports.iter().any(|port| port.ready())
         };
         // Something is already waiting, so this is a collection rather than a wait.
@@ -1644,6 +1791,37 @@ pub unsafe extern "C" fn kevent(
             let _ = sync_ports(&mut state.port_watch, &*state.backend, &state.registrations);
         }
 
+        collect_sources(&mut state);
+        let mut sourced: Vec<(i16, usize)> = state.sources.keys().copied().collect();
+        sourced.sort_unstable();
+        for key in sourced {
+            if out.len() == capacity {
+                break;
+            }
+            let Some(registration) = state.registrations.get(&key).copied() else {
+                continue;
+            };
+            if !registration.enabled {
+                continue;
+            }
+            let Some(event) = state
+                .sources
+                .get_mut(&key)
+                .and_then(|source| source.take(registration.fired(), registration.flags))
+            else {
+                continue;
+            };
+            out.push(event);
+            if (registration.flags | event.flags) & EV_ONESHOT != 0 {
+                state.registrations.remove(&key);
+                drop_source(&mut state, key);
+            } else if registration.flags & EV_DISPATCH != 0
+                && let Some(registration) = state.registrations.get_mut(&key)
+            {
+                registration.enabled = false;
+            }
+        }
+
         for entry in ready {
             if out.len() == capacity || entry.revents == 0 {
                 continue;
@@ -1762,6 +1940,24 @@ fn watched_ports(registrations: &Registrations) -> Vec<Arc<Receiver>> {
         .collect()
 }
 
+/// Read what each source's host object has reported since the last look.
+fn collect_sources<B>(state: &mut Queue<B>) {
+    for source in state.sources.values_mut() {
+        source.collect();
+    }
+}
+
+/// Whether an enabled registration's source has an event to report.
+fn sources_pending<B>(state: &Queue<B>) -> bool {
+    state.sources.iter().any(|(key, source)| {
+        source.pending()
+            && state
+                .registrations
+                .get(key)
+                .is_some_and(|registration| registration.enabled)
+    })
+}
+
 /// Whether an enabled signal registration has deliveries it has not reported.
 fn signals_pending(registrations: &Registrations) -> bool {
     of_filter(registrations, EVFILT_SIGNAL)
@@ -1793,7 +1989,7 @@ mod tests {
     /// descriptor, close-on-exec or not.
     static CHILD_START: Mutex<()> = Mutex::new(());
 
-    fn child_start() -> std::sync::MutexGuard<'static, ()> {
+    pub(super) fn child_start() -> std::sync::MutexGuard<'static, ()> {
         CHILD_START.lock().unwrap_or_else(|e| e.into_inner())
     }
 
@@ -2338,10 +2534,10 @@ mod tests {
     #[test]
     fn an_unsupported_filter_is_refused_by_number() {
         let queue = kqueue();
-        const EVFILT_VNODE: i16 = -4;
+        const EVFILT_FS: i16 = -9;
         let add = Kevent {
             ident: 1,
-            filter: EVFILT_VNODE,
+            filter: EVFILT_FS,
             flags: EV_ADD | EV_RECEIPT,
             ..Kevent::default()
         };
