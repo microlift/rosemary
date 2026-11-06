@@ -835,9 +835,10 @@ pub(crate) fn memsize() -> u64 {
 
 /// Copy `value` out under the `oldp`/`oldlenp` protocol every `sysctl` key follows.
 ///
-/// A null `oldp` is a size enquiry and succeeds; too small a buffer reports the size
-/// it would need and fails with `ENOMEM`, which is what BSD's `sysctl_old_user` does
-/// and what a caller sizing a buffer in two passes depends on.
+/// A null `oldp` is a size enquiry and succeeds. Too small a buffer gets nothing and
+/// `ENOMEM`, with `*oldlenp` set to the bytes produced, none: XNU's `sysctl_old_user`
+/// refuses a chunk that does not fit before copying any of it, and `userland_sysctl`
+/// reports its cursor, which that refusal did not advance.
 ///
 /// # Safety
 ///
@@ -856,7 +857,7 @@ unsafe fn copy_out(value: &Value, oldp: *mut libc::c_void, oldlenp: *mut libc::s
         return 0;
     }
     if available < bytes.len() {
-        unsafe { *oldlenp = bytes.len() };
+        unsafe { *oldlenp = 0 };
         crate::errno::set(libc::ENOMEM);
         return -1;
     }
@@ -906,11 +907,15 @@ unsafe extern "C" fn sysctl(
     }
     if let Some(key) = own_by_mib(mib) {
         // SAFETY: the caller's own `oldp`/`oldlenp`.
-        return unsafe { answer(key.value(), oldp, oldlenp) };
+        return unsafe { answer(key.value(), oldp, oldlenp, writes(newp, newlen)) };
     }
     if !passes_through()
         && let Some(answer) = process_value(mib)
     {
+        if writes(newp, newlen) {
+            crate::errno::set(libc::EPERM);
+            return -1;
+        }
         return match answer {
             // SAFETY: the caller's own `oldp`/`oldlenp`.
             Ok(bytes) => unsafe { copy_out(&Value::Bytes(bytes), oldp, oldlenp) },
@@ -939,14 +944,32 @@ unsafe extern "C" fn sysctl(
     -1
 }
 
+/// Whether a call sets a key. XNU's `sysctl_create_user_req` ignores `newp`
+/// when `newlen` is zero.
+fn writes(newp: *mut libc::c_void, newlen: libc::size_t) -> bool {
+    !newp.is_null() && newlen != 0
+}
+
 /// Copy out a key's value, or fail with `ENOENT` for a key that does not exist
-/// here.
+/// here and `EPERM` for an attempt to set one.
+///
+/// FIXME (ACCURACY): every key answered here is read-only. A Mac lets root set
+/// `kern.hostname` and `kern.maxproc`; this refuses root as it refuses everyone.
 ///
 /// # Safety
 ///
 /// As [`copy_out`].
-unsafe fn answer(value: Option<Value>, oldp: *mut libc::c_void, oldlenp: *mut libc::size_t) -> i32 {
+unsafe fn answer(
+    value: Option<Value>,
+    oldp: *mut libc::c_void,
+    oldlenp: *mut libc::size_t,
+    writing: bool,
+) -> i32 {
     match value {
+        Some(_) if writing => {
+            crate::errno::set(libc::EPERM);
+            -1
+        }
         // SAFETY: the caller's own `oldp`/`oldlenp`.
         Some(value) => unsafe { copy_out(&value, oldp, oldlenp) },
         None => {
@@ -987,6 +1010,8 @@ unsafe fn describe_tree(
     newp: *mut libc::c_void,
     newlen: libc::size_t,
 ) -> Option<i32> {
+    // `NAME2OID` takes its question through `newp`; the other nodes are read-only.
+    let writing = writes(newp, newlen) && *mib != [CTL_SYSCTL, SYSCTL_NAME2OID];
     let answer = match *mib {
         [CTL_SYSCTL, SYSCTL_NAME2OID] => {
             if newp.is_null() {
@@ -1019,7 +1044,7 @@ unsafe fn describe_tree(
         _ => return None,
     };
     // SAFETY: the caller's own `oldp`/`oldlenp`.
-    Some(unsafe { self::answer(answer, oldp, oldlenp) })
+    Some(unsafe { self::answer(answer, oldp, oldlenp, writing) })
 }
 
 /// `CTL_KERN` keys that describe processes.
@@ -1086,14 +1111,13 @@ unsafe extern "C" fn sysctlbyname(
     let spelled = key.to_string_lossy();
     if let Some(key) = own_by_name(&spelled) {
         // SAFETY: the caller's own `oldp`/`oldlenp`.
-        return unsafe { answer(key.value(), oldp, oldlenp) };
+        return unsafe { answer(key.value(), oldp, oldlenp, writes(newp, newlen)) };
     }
     #[cfg(target_os = "macos")]
     if passes_through() {
         // SAFETY: the caller's arguments, unchanged.
         return unsafe { libc::sysctlbyname(key.as_ptr(), oldp, oldlenp, newp, newlen) };
     }
-    let _ = (newp, newlen);
     say_unanswered(&format_args!("name {spelled:?}"));
     crate::errno::set(libc::ENOENT);
     -1
@@ -1285,14 +1309,14 @@ mod tests {
         assert_eq!(ask_str(&[CTL_HW, HW_MACHINE]).as_deref(), Some("arm64"));
     }
 
-    /// A caller sizing its buffer in two passes needs the failing first pass to
-    /// report the size it would need, and to have written nothing.
+    /// XNU refuses a value that does not fit before copying any of it, and reports
+    /// the bytes it produced, none.
     ///
     /// Asked of `hw.machine`, which this module answers on both hosts. A key that is
     /// forwarded to a real Darwin `sysctl` is that implementation's to get right, and
     /// its truncation behaviour is not this module's to assert.
     #[test]
-    fn too_small_a_buffer_reports_the_size_it_needs() {
+    fn a_short_buffer_gets_nothing_and_enomem() {
         let _held = lock_guest_arch(GuestArch::X86_64);
         let mib = [CTL_HW, HW_MACHINE];
         let mut buf = [0xAAu8; 2];
@@ -1310,9 +1334,52 @@ mod tests {
         };
         assert_eq!(rc, -1);
         assert_eq!(crate::errno::get(), libc::ENOMEM);
-        assert_eq!(len, "x86_64".len() + 1, "the size it would have needed");
-        assert_eq!(buf, [0xAA; 2], "and nothing was written");
+        assert_eq!(len, 0);
+        assert_eq!(buf, [0xAA; 2]);
         crate::errno::set(0);
+    }
+
+    #[test]
+    fn writing_a_read_only_key_is_eperm() {
+        let name = c"kern.ostype";
+        let mut new = *b"Linux\0";
+        let mut buf = [0xAAu8; 16];
+        let mut len: libc::size_t = buf.len();
+        // SAFETY: `buf` and `new` are live for the lengths passed.
+        let rc = unsafe {
+            sysctlbyname(
+                name.as_ptr(),
+                buf.as_mut_ptr() as *mut libc::c_void,
+                &mut len,
+                new.as_mut_ptr() as *mut libc::c_void,
+                new.len(),
+            )
+        };
+        assert_eq!(rc, -1);
+        assert_eq!(crate::errno::get(), libc::EPERM);
+        assert_eq!(buf, [0xAA; 16], "a refused write reads nothing either");
+        crate::errno::set(0);
+    }
+
+    /// XNU only treats `newp` as a new value when `newlen` is non-zero.
+    #[test]
+    fn a_new_value_of_no_length_is_a_plain_read() {
+        let name = c"kern.ostype";
+        let mut new = 0u8;
+        let mut buf = [0u8; 16];
+        let mut len: libc::size_t = buf.len();
+        // SAFETY: `buf` is live for `len` bytes; `new` is never read.
+        let rc = unsafe {
+            sysctlbyname(
+                name.as_ptr(),
+                buf.as_mut_ptr() as *mut libc::c_void,
+                &mut len,
+                &mut new as *mut u8 as *mut libc::c_void,
+                0,
+            )
+        };
+        assert_eq!(rc, 0);
+        assert_eq!(&buf[..len], b"Darwin\0");
     }
 
     #[test]
