@@ -176,8 +176,24 @@ fn unschedule(object: Id) -> bool {
     true
 }
 
+/// Reschedule only if the interval between calls actually moved. Roblox sets
+/// the same frame rate range from every call of its link, hundreds of times a
+/// second, and a reschedule takes the timer off the loop and makes a new one.
+fn reschedule_if_changed(object: Id, before: f64) {
+    if interval_of(link_of(object)) != before {
+        reschedule(object);
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    static RESCHEDULES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 /// A rate change takes effect on the next call, as it does for Apple's.
 fn reschedule(object: Id) {
+    #[cfg(test)]
+    RESCHEDULES.with(|n| n.set(n.get() + 1));
     // The run loop holds a reference to `object` while scheduled. Retain
     // across the removal so that a link whose only reference is the run
     // loop's is not deallocated before being re-scheduled.
@@ -288,8 +304,9 @@ unsafe extern "C" fn frame_interval(receiver: Id, _sel: Sel) -> isize {
 unsafe extern "C" fn set_frame_interval(receiver: Id, _sel: Sel, value: isize) {
     // Zero or less is not a rate; Apple's keeps the old one.
     if value >= 1 {
+        let before = interval_of(link_of(receiver));
         link_of(receiver).frame_interval = value;
-        reschedule(receiver);
+        reschedule_if_changed(receiver, before);
     }
 }
 
@@ -298,8 +315,9 @@ unsafe extern "C" fn preferred_frames_per_second(receiver: Id, _sel: Sel) -> isi
 }
 
 unsafe extern "C" fn set_preferred_frames_per_second(receiver: Id, _sel: Sel, value: isize) {
+    let before = interval_of(link_of(receiver));
     link_of(receiver).preferred_fps = value.max(0);
-    reschedule(receiver);
+    reschedule_if_changed(receiver, before);
 }
 
 unsafe extern "C" fn preferred_frame_rate_range(receiver: Id, _sel: Sel) -> FrameRateRange {
@@ -314,12 +332,13 @@ unsafe extern "C" fn set_preferred_frame_rate_range(
     range: FrameRateRange,
 ) {
     let link = link_of(receiver);
+    let before = interval_of(link);
     link.range = range;
     let rate = [range.preferred, range.maximum]
         .into_iter()
         .find(|r| r.is_finite() && *r > 0.0);
     link.preferred_fps = rate.map_or(0, |r| r.round() as isize);
-    reschedule(receiver);
+    reschedule_if_changed(receiver, before);
 }
 
 /// `+[UIScreen mainScreen]`.
@@ -531,5 +550,62 @@ mod tests {
 
         assert!(!link_of(link).timer.is_null());
         send(link, "invalidate");
+    }
+
+    /// Roblox sets the same rate from every call of its link. Only a rate
+    /// that moves the interval may rebuild the timer; the same one again
+    /// leaves it, so the loop is not rebuilt hundreds of times a second.
+    #[test]
+    fn setting_the_same_rate_again_keeps_the_timer() {
+        crate::bootstrap();
+        let target_class = corefoundation::base::register(
+            c"DisplayLinkSameRateTarget",
+            None,
+            size_of::<usize>(),
+            false,
+        );
+        let selector = objc::sel::get("tick:");
+        target_class.replace_method(selector, tick as *const c_void, c"v24@0:8@16");
+        let target = unsafe { corefoundation::base::allocate::<usize>(target_class) } as Id;
+        let screen = match crate::screen::screen_object(c"UIScreen", 0) {
+            s if !s.is_null() => s,
+            _ => return,
+        };
+        let make = objc::sel::get("displayLinkWithTarget:selector:");
+        let method = unsafe { objc::object::class_of(screen) }
+            .and_then(|c| c.method(make))
+            .unwrap();
+        let f: unsafe extern "C" fn(Id, Sel, Id, Sel) -> Id =
+            unsafe { std::mem::transmute(method.implementation()) };
+        let link = unsafe { f(screen, make, target, selector) };
+
+        let set_range = objc::sel::get("setPreferredFrameRateRange:");
+        let method = unsafe { objc::object::class_of(link) }
+            .and_then(|c| c.method(set_range))
+            .unwrap();
+        let set: unsafe extern "C" fn(Id, Sel, FrameRateRange) =
+            unsafe { std::mem::transmute(method.implementation()) };
+        // Below any display's refresh, so the interval follows the rate: a rate
+        // above the refresh is clamped to it and would change nothing.
+        let range = |preferred| FrameRateRange {
+            minimum: 10.0,
+            maximum: 30.0,
+            preferred,
+        };
+        let rebuilds = || RESCHEDULES.with(|n| n.get());
+
+        unsafe { set(link, set_range, range(30.0)) };
+        let after_first = rebuilds();
+        unsafe { set(link, set_range, range(30.0)) };
+        unsafe { set(link, set_range, range(30.0)) };
+        assert_eq!(rebuilds(), after_first, "the same rate rebuilt the timer");
+        unsafe { set(link, set_range, range(20.0)) };
+        assert_eq!(
+            rebuilds(),
+            after_first + 1,
+            "a new rate did not rebuild the timer"
+        );
+
+        objc::arc::release(link);
     }
 }
