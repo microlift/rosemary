@@ -1112,8 +1112,10 @@ fn apply<B: ReadinessBackend>(state: &mut Queue<B>, change: &Kevent) -> Result<(
         if registrations.remove(&key).is_none() {
             return Err(crate::errno::from_host(libc::ENOENT));
         }
-        triggered.retain(|ident| *ident != change.ident);
-        triggered_set.remove(&change.ident);
+        if change.filter == EVFILT_USER {
+            triggered.retain(|ident| *ident != change.ident);
+            triggered_set.remove(&change.ident);
+        }
         sync_interest(state, &registrations, change.filter, change.ident)?;
         state.registrations = registrations;
         state.triggered = triggered;
@@ -2955,5 +2957,38 @@ mod tests {
         signal.flags = EV_DELETE;
         assert_eq!(change(queue.0, &signal), 0);
         assert!(!wakes_on_signals(&held));
+    }
+
+    /// A user event and a descriptor share an ident space only by number.
+    #[test]
+    fn deleting_a_descriptor_registration_keeps_a_user_trigger_with_its_number() {
+        let queue = Descriptor(kqueue());
+        let (reader, writer) = pipe();
+        assert_eq!(
+            change(queue.0, &user_event(reader as usize, EV_ADD, 0, 0x7)),
+            0
+        );
+        assert_eq!(
+            change(queue.0, &user_event(reader as usize, 0, NOTE_TRIGGER, 0)),
+            0
+        );
+        let mut read = Kevent {
+            ident: reader as usize,
+            filter: EVFILT_READ,
+            flags: EV_ADD,
+            ..Kevent::default()
+        };
+        assert_eq!(change(queue.0, &read), 0);
+        read.flags = EV_DELETE;
+        assert_eq!(change(queue.0, &read), 0);
+
+        let (n, event) = collect(queue.0, None);
+        assert_eq!(n, 1);
+        assert_eq!((event.filter, event.udata), (EVFILT_USER, 0x7));
+        // SAFETY: this test's pipe.
+        unsafe {
+            libc::close(reader);
+            libc::close(writer);
+        }
     }
 }
