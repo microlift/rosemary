@@ -977,7 +977,9 @@ static NEEDS_DISPLAY_RECTS: std::sync::LazyLock<Mutex<HashMap<usize, NSRect>>> =
 /// The batches [`pump`] is drawing, innermost last, so a view freed by another
 /// view's `-drawRect:` is taken out of them too. A stack because a `-drawRect:`
 /// can run a nested event loop that pumps again. Zero marks a forgotten entry.
-static DRAWING: Mutex<Vec<Vec<usize>>> = Mutex::new(Vec::new());
+/// Each batch carries its own id: a guest exception thrown through a nested
+/// pump skips that pump's pop, and a position would then name another batch.
+static DRAWING: Mutex<Vec<(u64, Vec<usize>)>> = Mutex::new(Vec::new());
 
 /// Distinguish an unavailable GPU presenter from a busy window. The latter
 /// must not force a CPU fallback over content still being presented through
@@ -1941,7 +1943,7 @@ pub(crate) fn forget(view: Id) {
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .retain(|(_, v)| *v != key);
-    for batch in DRAWING.lock().unwrap_or_else(|e| e.into_inner()).iter_mut() {
+    for (_, batch) in DRAWING.lock().unwrap_or_else(|e| e.into_inner()).iter_mut() {
         for entry in batch.iter_mut().filter(|entry| **entry == key) {
             *entry = 0;
         }
@@ -2147,13 +2149,20 @@ pub fn pump() {
     redisplay_moved();
     let pending = std::mem::take(&mut *NEEDS_DISPLAY.lock().unwrap_or_else(|e| e.into_inner()));
     let count = pending.len();
-    let depth = {
-        let mut drawing = DRAWING.lock().unwrap_or_else(|e| e.into_inner());
-        drawing.push(pending);
-        drawing.len() - 1
-    };
+    static NEXT_BATCH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    let batch = NEXT_BATCH.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    DRAWING
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .push((batch, pending));
     for at in 0..count {
-        let view = DRAWING.lock().unwrap_or_else(|e| e.into_inner())[depth][at] as Id;
+        let view = DRAWING
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .find(|(id, _)| *id == batch)
+            .and_then(|(_, views)| views.get(at).copied())
+            .unwrap_or(0) as Id;
         if view.is_null() {
             continue;
         }
@@ -2163,7 +2172,12 @@ pub fn pump() {
             display_view(view);
         }
     }
-    DRAWING.lock().unwrap_or_else(|e| e.into_inner()).pop();
+    // This batch, and any a nested pump left behind when an exception skipped
+    // its own removal.
+    DRAWING
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .retain(|(id, _)| *id < batch);
     damage_animating();
     for window in crate::window::all() {
         if crate::window::is_shown(window) {
@@ -3955,10 +3969,11 @@ fn present_dirty() {
         }
         // The dma-buf overlays are left out of this frame; `shows_dmabufs`
         // now says no, and their views send pixels from the next one.
-        // The guest's own GL context owns this window's surface; see
-        // [`crate::window::draws_with_opengl`]. There is nothing to fall back
-        // to, so the store is left unshown rather than taking the context away.
+        // GL windows cannot use SDL's software surface: it would replace the
+        // guest context. An opaque software UI may still be presented through
+        // that context before the guest starts presenting its own GL frames.
         if crate::window::draws_with_opengl(window) {
+            crate::opengl::present_initial_store(window, store);
             continue;
         }
         let transparent = sdl3::video::window_flags(window) & sdl3::video::flags::TRANSPARENT != 0;
@@ -4692,6 +4707,74 @@ unsafe extern "C" fn context_with_port(
     objc::arc::autorelease(context)
 }
 
+/// `+graphicsContextWithBitmapImageRep:`: a context that draws straight into
+/// the rep's own pixel buffer, which is what a later `-bitmapData` read is
+/// supposed to see.
+///
+/// Only the common 8-bit, four-samples-per-pixel layout is handled: that is
+/// what every rep this runtime's own `NSBitmapImageRep` produces, and what a
+/// guest building one with `-initWithBitmapDataPlanes:...` almost always asks
+/// for. A rep in a different layout draws into nothing, the same refusal
+/// `CGBitmapContextCreate` itself gives a layout it cannot represent, rather
+/// than aliasing memory at the wrong stride.
+///
+/// FIXME (ACCURACY): a grayscale or alpha-only rep (`-samplesPerPixel` 1) is
+/// refused rather than supported; doing that right needs a one-component
+/// `CGColorSpace` this crate has no constructor for.
+unsafe extern "C" fn context_with_bitmap(class: Id, sel: Sel, rep: Id) -> Id {
+    if rep.is_null() {
+        return std::ptr::null_mut();
+    }
+    // SAFETY: `NSBitmapImageRep`'s own public accessors.
+    let (data, width, height, bytes_per_row, samples, bits_per_sample, has_alpha) = unsafe {
+        let ptr_fn: unsafe extern "C" fn(Id, Sel) -> *mut c_void =
+            std::mem::transmute(objc::msg::entry());
+        let int_fn: unsafe extern "C" fn(Id, Sel) -> isize =
+            std::mem::transmute(objc::msg::entry());
+        let bool_fn: unsafe extern "C" fn(Id, Sel) -> u8 = std::mem::transmute(objc::msg::entry());
+        (
+            ptr_fn(rep, objc::sel::get("bitmapData")),
+            int_fn(rep, objc::sel::get("pixelsWide")),
+            int_fn(rep, objc::sel::get("pixelsHigh")),
+            int_fn(rep, objc::sel::get("bytesPerRow")),
+            int_fn(rep, objc::sel::get("samplesPerPixel")),
+            int_fn(rep, objc::sel::get("bitsPerSample")),
+            bool_fn(rep, objc::sel::get("hasAlpha")),
+        )
+    };
+    if data.is_null() || width <= 0 || height <= 0 || bits_per_sample != 8 || samples != 4 {
+        return std::ptr::null_mut();
+    }
+    // `kCGImageAlphaLast` or `kCGImageAlphaNoneSkipLast`, with the default
+    // (non-little) byte order: both keep the bytes in the R, G, B, A order
+    // `-bitmapData` already has them in, which is what `quartz::layout` needs
+    // to draw on them in place rather than through a converted copy.
+    let bitmap_info: u32 = if has_alpha != 0 { 3 } else { 5 };
+    // SAFETY: a fresh colour space, a buffer sized by the rep's own accessors,
+    // and a port this call owns until it is handed to `context_with_port` or
+    // released below - mirroring `layer.rs`'s `-display` around its own
+    // `CGBitmapContextCreate`.
+    unsafe {
+        let space = crate::graphics::CGColorSpaceCreateDeviceRGB();
+        let port = crate::cgcontext::CGBitmapContextCreate(
+            data,
+            width as usize,
+            height as usize,
+            8,
+            bytes_per_row as usize,
+            space,
+            bitmap_info,
+        );
+        crate::graphics::CGColorSpaceRelease(space);
+        if port.is_null() {
+            return std::ptr::null_mut();
+        }
+        let context = context_with_port(class, sel, port, 0);
+        corefoundation::api::CFRelease(port);
+        context
+    }
+}
+
 unsafe extern "C" fn context_dealloc(receiver: Id, _sel: Sel) {
     let port = {
         let mut table = WRAPPED.lock().unwrap_or_else(|e| e.into_inner());
@@ -4770,6 +4853,7 @@ pub(crate) fn install() {
         "setCurrentContext:" => set_current_context, c"v24@0:8@16";
         "graphicsContextWithGraphicsPort:flipped:" => context_with_port, c"@28@0:8^v16c24";
         "graphicsContextWithCGContext:flipped:" => context_with_port, c"@28@0:8^v16c24";
+        "graphicsContextWithBitmapImageRep:" => context_with_bitmap, c"@24@0:8@16";
     });
     methods!(context, {
         "dealloc" => context_dealloc, c"v16@0:8";
@@ -6196,6 +6280,93 @@ mod tests {
                 objc::sel::get("currentContext"),
             )
         }
+    }
+
+    /// `+graphicsContextWithBitmapImageRep:` must draw into the rep's own
+    /// buffer - the one a guest supplied itself, here - not a copy of it,
+    /// since a later `-bitmapData` read is the only way the guest ever sees
+    /// what was drawn.
+    #[test]
+    fn bitmap_image_rep_context_draws_into_the_reps_own_buffer() {
+        crate::bootstrap();
+        let mut buffer = vec![0u8; 16]; // 2x2, RGBA8.
+        let mut planes = [buffer.as_mut_ptr()];
+        let rep_class = objc::class::lookup(c"NSBitmapImageRep").expect("declared");
+        let rep = objc::object::create_instance(rep_class, 0);
+        let init: unsafe extern "C" fn(
+            Id,
+            Sel,
+            *mut *mut u8,
+            isize,
+            isize,
+            isize,
+            isize,
+            u8,
+            u8,
+            Id,
+            usize,
+            isize,
+            isize,
+        ) -> Id = unsafe { std::mem::transmute(objc::msg::entry()) };
+        // SAFETY: the registered designated initialiser's own prototype.
+        let rep = unsafe {
+            init(
+                rep,
+                objc::sel::get(
+                    "initWithBitmapDataPlanes:pixelsWide:pixelsHigh:bitsPerSample:\
+                     samplesPerPixel:hasAlpha:isPlanar:colorSpaceName:bitmapFormat:\
+                     bytesPerRow:bitsPerPixel:",
+                ),
+                planes.as_mut_ptr(),
+                2,
+                2,
+                8,
+                4,
+                1,
+                0,
+                std::ptr::null_mut(),
+                0,
+                8,
+                32,
+            )
+        };
+        assert!(!rep.is_null());
+
+        let context_class = objc::class::lookup(c"NSGraphicsContext").expect("declared");
+        let make_context: unsafe extern "C" fn(Id, Sel, Id) -> Id =
+            unsafe { std::mem::transmute(objc::msg::entry()) };
+        // SAFETY: the registered class method's own prototype.
+        let context = unsafe {
+            make_context(
+                objc::class::ptr(context_class).cast(),
+                objc::sel::get("graphicsContextWithBitmapImageRep:"),
+                rep,
+            )
+        };
+        assert!(!context.is_null());
+
+        let read_port: unsafe extern "C" fn(Id, Sel) -> *const c_void =
+            unsafe { std::mem::transmute(objc::msg::entry()) };
+        // SAFETY: `-CGContext` is `CGContextRef (id, SEL)`.
+        let port = unsafe { read_port(context, objc::sel::get("CGContext")) };
+        assert!(!port.is_null());
+
+        // SAFETY: a live bitmap context over `buffer`, drawn on once.
+        unsafe {
+            crate::cgcontext::CGContextSetRGBFillColor(port, 1.0, 0.0, 0.0, 1.0);
+            crate::cgcontext::CGContextFillRect(
+                port,
+                NSRect {
+                    origin: NSPoint { x: 0.0, y: 0.0 },
+                    size: NSSize {
+                        width: 2.0,
+                        height: 2.0,
+                    },
+                },
+            );
+        }
+
+        assert_eq!(&buffer[0..4], [255, 0, 0, 255]);
     }
 
     #[test]

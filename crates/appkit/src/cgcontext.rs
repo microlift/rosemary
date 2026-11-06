@@ -1219,6 +1219,34 @@ pub unsafe extern "C" fn CGContextShowGlyphsAtPoint(
     }
 }
 
+/// `void CGContextShowGlyphsAtPositions(CGContextRef, const CGGlyph *, const
+/// CGPoint *, size_t)`: unlike the `ShowGlyphs` family above, each position is
+/// absolute in text space rather than an advance from the last, and the call
+/// does not move the text position - Apple's docs describe only the glyphs
+/// being painted, nothing about the current point.
+pub unsafe extern "C" fn CGContextShowGlyphsAtPositions(
+    context: CFTypeRef,
+    glyphs: *const u16,
+    positions: *const NSPoint,
+    count: usize,
+) {
+    if glyphs.is_null() || positions.is_null() || count == 0 {
+        return;
+    }
+    let Some((face, size)) = state_face(context) else {
+        return;
+    };
+    // SAFETY: the caller supplies `count` of each.
+    let (glyphs, positions) = unsafe {
+        (
+            std::slice::from_raw_parts(glyphs, count),
+            std::slice::from_raw_parts(positions, count),
+        )
+    };
+    let positions: Vec<(f64, f64)> = positions.iter().map(|p| (p.x, p.y)).collect();
+    quartz::draw_glyphs(context, &face, size, glyphs, &positions);
+}
+
 /// `CGContextShowText(CGContextRef, const char *, size_t)`, in the font
 /// `CGContextSelectFont` chose.
 ///
@@ -1307,6 +1335,19 @@ pub unsafe extern "C" fn CGAffineTransformMakeTranslation(x: f64, y: f64) -> CGA
     }
 }
 
+/// `CGAffineTransform CGAffineTransformMakeRotation(CGFloat angle)`: `angle`
+/// in radians, positive turning clockwise as Apple documents.
+pub unsafe extern "C" fn CGAffineTransformMakeRotation(angle: f64) -> CGAffineTransform {
+    let (sin, cos) = angle.sin_cos();
+    CGAffineTransform {
+        a: cos,
+        b: sin,
+        c: -sin,
+        d: cos,
+        ..IDENTITY
+    }
+}
+
 pub unsafe extern "C" fn CGAffineTransformConcat(
     first: CGAffineTransform,
     second: CGAffineTransform,
@@ -1359,6 +1400,31 @@ pub unsafe extern "C" fn CGRectApplyAffineTransform(rect: NSRect, t: CGAffineTra
             height: top - bottom,
         },
     }
+}
+
+/// `CGRect CGContextConvertRectToUserSpace(CGContextRef, CGRect)`: the CTM
+/// carries user space to device space, so its inverse carries a device-space
+/// rectangle back.
+pub unsafe extern "C" fn CGContextConvertRectToUserSpace(
+    context: CFTypeRef,
+    rect: NSRect,
+) -> NSRect {
+    // SAFETY: both take a `CGContextRef` and a plain value.
+    unsafe {
+        let inverse = CGAffineTransformInvert(CGContextGetCTM(context));
+        CGRectApplyAffineTransform(rect, inverse)
+    }
+}
+
+/// `CGRect CGContextConvertRectToDeviceSpace(CGContextRef, CGRect)`: the
+/// forward half of [`CGContextConvertRectToUserSpace`] - the CTM already
+/// carries user space to device space, with no inverse needed.
+pub unsafe extern "C" fn CGContextConvertRectToDeviceSpace(
+    context: CFTypeRef,
+    rect: NSRect,
+) -> NSRect {
+    // SAFETY: both take a `CGContextRef` and a plain value.
+    unsafe { CGRectApplyAffineTransform(rect, CGContextGetCTM(context)) }
 }
 
 //
@@ -1588,6 +1654,7 @@ exports::exports! {
         "CGContextShowGlyphsWithAdvances" => CGContextShowGlyphsWithAdvances,
         "CGContextShowGlyphs" => CGContextShowGlyphs,
         "CGContextShowGlyphsAtPoint" => CGContextShowGlyphsAtPoint,
+        "CGContextShowGlyphsAtPositions" => CGContextShowGlyphsAtPositions,
         "CGContextShowText" => CGContextShowText,
         "CGContextShowTextAtPoint" => CGContextShowTextAtPoint,
         "CGContextFlush" | "CGContextSynchronize" | "CGContextEndPage" => ignored_context,
@@ -1596,12 +1663,15 @@ exports::exports! {
         "CGAffineTransformMake" => CGAffineTransformMake,
         "CGAffineTransformMakeScale" => CGAffineTransformMakeScale,
         "CGAffineTransformMakeTranslation" => CGAffineTransformMakeTranslation,
+        "CGAffineTransformMakeRotation" => CGAffineTransformMakeRotation,
         "CGAffineTransformConcat" => CGAffineTransformConcat,
         "CGAffineTransformScale" => CGAffineTransformScale,
         "CGAffineTransformTranslate" => CGAffineTransformTranslate,
         "CGAffineTransformInvert" => CGAffineTransformInvert,
         "CGAffineTransformIsIdentity" => CGAffineTransformIsIdentity,
         "CGRectApplyAffineTransform" => CGRectApplyAffineTransform,
+        "CGContextConvertRectToUserSpace" => CGContextConvertRectToUserSpace,
+        "CGContextConvertRectToDeviceSpace" => CGContextConvertRectToDeviceSpace,
         "CGColorCreate" => CGColorCreate,
         "CGColorCreateGenericRGB" => CGColorCreateGenericRGB,
         "CGColorCreateGenericGray" => CGColorCreateGenericGray,
@@ -1639,6 +1709,106 @@ mod tests {
         NSRect {
             origin: NSPoint { x, y },
             size: NSSize { width, height },
+        }
+    }
+
+    #[test]
+    fn rotation_matches_apples_documented_component_formula() {
+        // A quarter turn clockwise sends (1, 0) to (0, 1).
+        let t = unsafe { CGAffineTransformMakeRotation(std::f64::consts::FRAC_PI_2) };
+        let (x, y) = t.apply(1.0, 0.0);
+        assert!((x).abs() < 1e-9);
+        assert!((y - 1.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn convert_rect_to_user_space_undoes_the_ctm() {
+        crate::bootstrap();
+        // SAFETY: the context stays live until released below.
+        unsafe {
+            let mut pixels = [0u32; 4];
+            let context = CGBitmapContextCreate(
+                pixels.as_mut_ptr().cast(),
+                2,
+                2,
+                8,
+                8,
+                std::ptr::null(),
+                0x2006,
+            );
+            CGContextTranslateCTM(context, 1.0, 1.0);
+            CGContextScaleCTM(context, 2.0, 2.0);
+            // User space maps to device space as `device = 2 * user + 1`.
+            let user = CGContextConvertRectToUserSpace(context, rect(2.0, 2.0, 4.0, 4.0));
+            CGContextRelease(context);
+            assert!((user.origin.x - 0.5).abs() < 1e-9);
+            assert!((user.origin.y - 0.5).abs() < 1e-9);
+            assert!((user.size.width - 2.0).abs() < 1e-9);
+            assert!((user.size.height - 2.0).abs() < 1e-9);
+        }
+    }
+
+    #[test]
+    fn convert_rect_to_device_space_is_user_spaces_inverse() {
+        crate::bootstrap();
+        // SAFETY: the context stays live until released below.
+        unsafe {
+            let mut pixels = [0u32; 4];
+            let context = CGBitmapContextCreate(
+                pixels.as_mut_ptr().cast(),
+                2,
+                2,
+                8,
+                8,
+                std::ptr::null(),
+                0x2006,
+            );
+            CGContextTranslateCTM(context, 1.0, 1.0);
+            CGContextScaleCTM(context, 2.0, 2.0);
+            let original = rect(2.0, 2.0, 4.0, 4.0);
+            let user = CGContextConvertRectToUserSpace(context, original);
+            let device = CGContextConvertRectToDeviceSpace(context, user);
+            CGContextRelease(context);
+            assert!((device.origin.x - original.origin.x).abs() < 1e-9);
+            assert!((device.origin.y - original.origin.y).abs() < 1e-9);
+            assert!((device.size.width - original.size.width).abs() < 1e-9);
+            assert!((device.size.height - original.size.height).abs() < 1e-9);
+        }
+    }
+
+    #[test]
+    fn show_glyphs_at_positions_leaves_the_text_position_untouched() {
+        crate::bootstrap();
+        let Some(face) = crate::fonts::all_faces().into_iter().next() else {
+            eprintln!("skipped: no fonts on this host");
+            return;
+        };
+        let mut pixels = [0u32; 16 * 16];
+        // SAFETY: the context and its font stay live until released below.
+        unsafe {
+            let context = CGBitmapContextCreate(
+                pixels.as_mut_ptr().cast(),
+                16,
+                16,
+                8,
+                64,
+                std::ptr::null(),
+                0x2006,
+            );
+            let name = std::ffi::CString::new(face.postscript).unwrap();
+            CGContextSelectFont(context, name.as_ptr(), 12.0, 0);
+            CGContextSetTextPosition(context, 3.0, 4.0);
+            let glyphs = [0u16, 1u16];
+            let positions = [NSPoint { x: 0.0, y: 0.0 }, NSPoint { x: 5.0, y: 0.0 }];
+            CGContextShowGlyphsAtPositions(
+                context,
+                glyphs.as_ptr(),
+                positions.as_ptr(),
+                glyphs.len(),
+            );
+            let position = CGContextGetTextPosition(context);
+            CGContextRelease(context);
+            assert_eq!((position.x, position.y), (3.0, 4.0));
         }
     }
 

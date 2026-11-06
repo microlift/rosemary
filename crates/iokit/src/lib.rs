@@ -61,6 +61,8 @@ exports::exports! {
         "IOHIDElementGetType" => api::IOHIDElementGetType,
         "IOHIDElementGetLogicalMin" => api::IOHIDElementGetLogicalMin,
         "IOHIDElementGetLogicalMax" => api::IOHIDElementGetLogicalMax,
+        "IOHIDElementGetReportSize" => api::IOHIDElementGetReportSize,
+        "IOHIDElementGetReportCount" => api::IOHIDElementGetReportCount,
         "IOHIDElementGetChildren" => api::IOHIDElementGetChildren,
         "IOHIDElementGetTypeID" => api::IOHIDElementGetTypeID,
         "IOHIDValueGetElement" => api::IOHIDValueGetElement,

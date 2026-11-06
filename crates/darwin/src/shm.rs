@@ -47,7 +47,7 @@ fn to_host_name(name: &CStr) -> Option<CString> {
 /// # Safety
 ///
 /// `name` is null or a NUL-terminated string.
-unsafe fn host_name(name: *const c_char) -> Option<CString> {
+pub(crate) unsafe fn host_name(name: *const c_char) -> Option<CString> {
     if name.is_null() {
         crate::errno::set(libc::EINVAL);
         return None;

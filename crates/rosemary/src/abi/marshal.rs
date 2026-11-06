@@ -349,7 +349,7 @@ fn read_location(
 /// Where the guest's outgoing stack arguments begin, relative to `rsp`.
 ///
 /// Reading the wrong one does not fault.
-fn stack_base() -> u64 {
+pub(crate) fn stack_base() -> u64 {
     match crate::thread::current() {
         Some(state) if state.entered_by_jump() => 8,
         _ => 0,

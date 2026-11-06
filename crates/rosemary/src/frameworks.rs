@@ -223,7 +223,7 @@ static FRAMEWORKS: &[Framework] = &[
         version: 'A',
         umbrellas: &["Carbon"],
         provide: Some(coreservices::provide),
-        data: None,
+        data: Some(coreservices::data_symbols),
         symbol: Some(coreservices::symbol),
         links: Links {
             reexports: &[],
@@ -342,6 +342,30 @@ static FRAMEWORKS: &[Framework] = &[
                 LIBOBJC,
                 LIBSYSTEM,
             ],
+        },
+    },
+    Framework {
+        leaf: "CoreBluetooth",
+        version: 'A',
+        umbrellas: &[],
+        provide: None,
+        data: Some(corebluetooth::data_symbols),
+        symbol: Some(corebluetooth::symbol),
+        links: Links {
+            reexports: &[],
+            dependencies: &[framework!("Foundation"), LIBOBJC, LIBSYSTEM],
+        },
+    },
+    Framework {
+        leaf: "UserNotifications",
+        version: 'A',
+        umbrellas: &[],
+        provide: None,
+        data: Some(usernotifications::data_symbols),
+        symbol: None,
+        links: Links {
+            reexports: &[],
+            dependencies: &[framework!("Foundation"), LIBOBJC, LIBSYSTEM],
         },
     },
     Framework {
@@ -472,6 +496,18 @@ static FRAMEWORKS: &[Framework] = &[
                 LIBOBJC,
                 LIBSYSTEM,
             ],
+        },
+    },
+    Framework {
+        leaf: "Accelerate",
+        version: 'A',
+        umbrellas: &[],
+        provide: Some(accelerate::provide),
+        data: None,
+        symbol: Some(accelerate::symbol),
+        links: Links {
+            reexports: &[],
+            dependencies: &[framework!("Foundation"), LIBOBJC, LIBSYSTEM],
         },
     },
 ];
@@ -659,54 +695,6 @@ const CV_CONSTANTS: &[(&str, &str)] = &[
     ("_kCVPixelBufferPixelFormatTypeKey", "PixelFormatType"),
     ("_kCVPixelBufferWidthKey", "Width"),
     ("_kCVPixelBufferHeightKey", "Height"),
-    ("_kCVPixelBufferMemoryAllocatorKey", "MemoryAllocator"),
-    (
-        "_kCVPixelBufferBytesPerRowAlignmentKey",
-        "BytesPerRowAlignment",
-    ),
-    ("_kCVPixelBufferPlaneAlignmentKey", "PlaneAlignment"),
-    (
-        "_kCVPixelBufferIOSurfacePropertiesKey",
-        "IOSurfaceProperties",
-    ),
-    (
-        "_kCVPixelBufferOpenGLCompatibilityKey",
-        "OpenGLCompatibility",
-    ),
-    ("_kCVPixelBufferMetalCompatibilityKey", "MetalCompatibility"),
-    (
-        "_kCVPixelBufferOpenGLESCompatibilityKey",
-        "OpenGLESCompatibility",
-    ),
-    (
-        "_kCVPixelBufferOpenGLESTextureCacheCompatibilityKey",
-        "OpenGLESTextureCacheCompatibility",
-    ),
-    (
-        "_kCVPixelBufferIOSurfaceCoreAnimationCompatibilityKey",
-        "IOSurfaceCoreAnimationCompatibility",
-    ),
-    (
-        "_kCVPixelBufferIOSurfaceOpenGLFBOCompatibilityKey",
-        "IOSurfaceOpenGLFBOCompatibility",
-    ),
-    (
-        "_kCVPixelBufferIOSurfaceOpenGLESFBOCompatibilityKey",
-        "IOSurfaceOpenGLESFBOCompatibility",
-    ),
-    (
-        "_kCVPixelBufferIOSurfaceOpenGLTextureCompatibilityKey",
-        "IOSurfaceOpenGLTextureCompatibility",
-    ),
-    (
-        "_kCVPixelBufferIOSurfaceOpenGLESTextureCompatibilityKey",
-        "IOSurfaceOpenGLESTextureCompatibility",
-    ),
-    ("_kCVPixelBufferIOSurfacePurgeableKey", "IOSurfacePurgeable"),
-    (
-        "_kCVPixelBufferOpenGLTextureCacheCompatibilityKey",
-        "OpenGLTextureCacheCompatibility",
-    ),
     (
         "_kCVPixelBufferCGBitmapContextCompatibilityKey",
         "CGBitmapContextCompatibility",

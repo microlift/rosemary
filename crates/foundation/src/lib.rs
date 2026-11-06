@@ -13,7 +13,7 @@ pub mod boxed;
 pub mod bundle;
 pub mod calculate;
 mod cf_attributed_string;
-mod characterset;
+pub mod characterset;
 mod constant;
 pub mod cookies;
 pub mod decimal;
@@ -44,8 +44,11 @@ mod uuid;
 pub use corefoundation::plist;
 pub mod pool;
 pub mod processinfo;
+mod propertylistserialization;
 pub mod proxy;
+mod regularexpression;
 pub mod runtime;
+mod scanner;
 mod signature;
 pub mod string;
 pub mod strings;
@@ -54,9 +57,12 @@ pub mod thread;
 pub mod timer;
 mod timezone;
 pub mod unarchiver;
+pub mod undomanager;
 pub mod url;
 mod urlcomponents;
+mod urlcredential;
 pub mod urlsession;
+pub mod uttype;
 pub mod value;
 
 mod collections;
@@ -110,11 +116,18 @@ pub fn bootstrap() {
         filehandle::install();
         task::install();
         appleevent::install();
+        propertylistserialization::install();
+        regularexpression::install();
+        scanner::install();
+        urlcredential::install();
+        uttype::install();
+        undomanager::install();
     });
 }
 
 exports::group! {
     paths,
+    geometry::cf,
     cf_attributed_string,
     /// Bundle and search-path calls are CoreFoundation and Foundation spellings
     /// of questions only this crate can answer - `corefoundation` is underneath
@@ -319,6 +332,13 @@ pub const CLASSES: &[&str] = &[
     "NSAppleEventManager",
     "NSAppleEventDescriptor",
     "NSMethodSignature",
+    "NSCalendar",
+    "NSDateComponents",
+    "NSScanner",
+    "NSURLCredential",
+    "NSRegularExpression",
+    "NSTextCheckingResult",
+    "NSUndoManager",
 ];
 
 // The image-resident number classes are `constant::CLASSES`, published the same
@@ -374,6 +394,10 @@ fn zeroed<T>() -> u64 {
 }
 
 pub const STRING_GLOBALS: &[(&str, &str)] = &[
+    (
+        "_NSThreadWillExitNotification",
+        "NSThreadWillExitNotification",
+    ),
     ("_NSLocalizedDescriptionKey", "NSLocalizedDescription"),
     (
         "_NSLocalizedFailureReasonErrorKey",
@@ -390,6 +414,9 @@ pub const STRING_GLOBALS: &[(&str, &str)] = &[
     ("_NSLocalizedFailureErrorKey", "NSLocalizedFailure"),
     ("_NSHelpAnchorErrorKey", "NSHelpAnchor"),
     ("_NSStringEncodingErrorKey", "NSStringEncodingErrorKey"),
+    // Value type `UTType`, not `NSString` - see `uttype::for_path`. There is
+    // no CoreFoundation twin: `kCFURL...` resource keys predate `UTType`.
+    ("_NSURLContentTypeKey", "NSURLContentTypeKey"),
     ("_NSOSStatusErrorDomain", "NSOSStatusErrorDomain"),
     ("_NSMachErrorDomain", "NSMachErrorDomain"),
     (
@@ -446,6 +473,18 @@ pub const STRING_GLOBALS: &[(&str, &str)] = &[
         "_NSURLVolumeAvailableCapacityForImportantUsageKey",
         "NSURLVolumeAvailableCapacityForImportantUsageKey",
     ),
+    ("_NSURLIsUbiquitousItemKey", "NSURLIsUbiquitousItemKey"),
+    // `-attributesOfItemAtPath:error:` and `-setAttributes:ofItemAtPath:error:`
+    // key their dictionaries by these same four, through
+    // `corefoundation::base::interned_name` - see `filemanager::attribute`.
+    ("_NSFileSize", "NSFileSize"),
+    ("_NSFileCreationDate", "NSFileCreationDate"),
+    ("_NSFileModificationDate", "NSFileModificationDate"),
+    ("_NSFileAppendOnly", "NSFileAppendOnly"),
+    // The old, un-prefixed spelling of `NSCalendarIdentifierGregorian` - same
+    // text, so a guest comparing the two constants gets identity as well as
+    // equality.
+    ("_NSGregorianCalendar", "gregorian"),
     // Apple moved the exception names to CoreFoundation; a guest built
     // against a newer SDK binds them there.
     ("_NSGenericException", "NSGenericException"),
@@ -473,6 +512,14 @@ pub const NOTIFICATION_NAMES: &[&str] = &[
     "NSProcessInfoThermalStateDidChangeNotification",
     "NSProcessInfoPowerStateDidChangeNotification",
     "NSCurrentLocaleDidChangeNotification",
+    undomanager::CHECKPOINT,
+    undomanager::WILL_UNDO_CHANGE,
+    undomanager::DID_UNDO_CHANGE,
+    undomanager::WILL_REDO_CHANGE,
+    undomanager::DID_REDO_CHANGE,
+    undomanager::DID_OPEN_GROUP,
+    undomanager::WILL_CLOSE_GROUP,
+    undomanager::DID_CLOSE_GROUP,
     "NSUserDefaultsDidChangeNotification",
 ];
 

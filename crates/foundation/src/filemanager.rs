@@ -156,9 +156,10 @@ unsafe extern "C" fn create_directory(
     // SAFETY: null or writable.
     unsafe { no_error(error) };
     // SAFETY: an `NSString`, or nil.
-    let Some(path) = (unsafe { path_of(path) }) else {
+    let Ok(guest) = String::from_utf8(unsafe { crate::string::bytes(path) }) else {
         return 0;
     };
+    let path = prefix::ns::creation_host_path(&guest);
     let made = match intermediates != 0 {
         true => std::fs::create_dir_all(&path),
         false => std::fs::create_dir(&path),
@@ -218,6 +219,22 @@ unsafe extern "C" fn move_item(_receiver: Id, _sel: Sel, from: Id, to: Id, error
     };
     // SAFETY: null or writable.
     unsafe { report(error, &to, std::fs::rename(&from, &to)) }
+}
+
+/// Legacy nil-handler form. A handler needs per-item progress/error callbacks,
+/// which this same-filesystem implementation does not yet provide.
+unsafe extern "C" fn move_path(receiver: Id, sel: Sel, from: Id, to: Id, handler: Id) -> u8 {
+    if !handler.is_null() {
+        objc::fail!("-[NSFileManager movePath:toPath:handler:]: non-nil handlers are unsupported");
+    }
+    let Some(destination) = (unsafe { path_of(to) }) else {
+        return 0;
+    };
+    // Unlike POSIX rename, Foundation must not overwrite an existing item.
+    if std::fs::symlink_metadata(&destination).is_ok() {
+        return 0;
+    }
+    unsafe { move_item(receiver, sel, from, to, std::ptr::null_mut()) }
 }
 
 /// Run `with` on the path a file URL names, spelled as the `NSString` the
@@ -534,6 +551,83 @@ unsafe extern "C" fn contents_of_directory(
     unsafe { corefoundation::api::CFAutorelease(array) as Id }
 }
 
+/// `-fileAttributesAtPath:traverseLink:`, the deprecated spelling of
+/// `-attributesOfItemAtPath:error:` with no error to report.
+// FIXME (ACCURACY): a link is always traversed, as `-attributesOfItemAtPath:`
+// here always follows one too.
+unsafe extern "C" fn file_attributes_traverse_link(
+    receiver: Id,
+    sel: Sel,
+    path: Id,
+    _traverse: bool,
+) -> Id {
+    // SAFETY: the same receiver and path, with no error slot.
+    unsafe { attributes_of_item(receiver, sel, path, std::ptr::null_mut()) }
+}
+
+/// `-setAttributes:ofItemAtPath:error:`: the permissions and the modification
+/// date, the two a program sets.
+// FIXME (ACCURACY): ownership, the immutable and append-only flags and the
+// creation date are accepted and left as they are.
+unsafe extern "C" fn set_attributes_of_item(
+    _receiver: Id,
+    _sel: Sel,
+    attributes: Id,
+    path: Id,
+    error: *mut Id,
+) -> u8 {
+    // SAFETY: null or writable.
+    unsafe { no_error(error) };
+    // SAFETY: an `NSString`, or nil.
+    let Some(path) = (unsafe { path_of(path) }) else {
+        return 0;
+    };
+    if attributes.is_null() || std::fs::symlink_metadata(&path).is_err() {
+        return 0;
+    }
+    // SAFETY: a dictionary.
+    let mode = unsafe { attribute(attributes, "NSFilePosixPermissions") };
+    // SAFETY: a number, or nil.
+    if let Some(mode) = unsafe { corefoundation::collections::number(mode as CFTypeRef) } {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::Permissions::from_mode(mode.as_i64() as u32 & 0o7777);
+        if std::fs::set_permissions(&path, mode).is_err() {
+            return 0;
+        }
+    }
+    // SAFETY: a dictionary.
+    let date = unsafe { attribute(attributes, "NSFileModificationDate") };
+    if !date.is_null() {
+        // SAFETY: `-timeIntervalSince1970` is `double (id, SEL)`.
+        let seconds = unsafe {
+            let f: unsafe extern "C" fn(Id, Sel) -> f64 = std::mem::transmute(objc::msg::entry());
+            f(date, objc::sel::get("timeIntervalSince1970"))
+        };
+        let time = match seconds >= 0.0 {
+            true => std::time::UNIX_EPOCH + std::time::Duration::from_secs_f64(seconds),
+            false => std::time::UNIX_EPOCH - std::time::Duration::from_secs_f64(-seconds),
+        };
+        let file = std::fs::File::options().write(true).open(&path);
+        let file = file.or_else(|_| std::fs::File::open(&path));
+        if file.and_then(|f| f.set_modified(time)).is_err() {
+            return 0;
+        }
+    }
+    1
+}
+
+/// `-changeFileAttributes:atPath:`, the deprecated spelling of
+/// `-setAttributes:ofItemAtPath:error:`.
+unsafe extern "C" fn change_file_attributes(
+    receiver: Id,
+    sel: Sel,
+    attributes: Id,
+    path: Id,
+) -> u8 {
+    // SAFETY: the same arguments, with no error slot.
+    unsafe { set_attributes_of_item(receiver, sel, attributes, path, std::ptr::null_mut()) }
+}
+
 /// `-attributesOfItemAtPath:error:`, with the keys a program actually reads.
 ///
 /// Size, type and the two timestamps. A dictionary with only some of an item's
@@ -589,8 +683,11 @@ unsafe extern "C" fn attributes_of_item(_receiver: Id, _sel: Sel, path: Id, erro
     let pairs: Vec<(CFTypeRef, CFTypeRef)> = values
         .iter()
         .map(|(key, value, _)| {
+            // Interned, the same way `_NSFileSize` and friends are published -
+            // see `attribute` below, which reads these dictionaries back with
+            // the identical object rather than a string merely equal to it.
             (
-                corefoundation::string::from_bytes(key.as_bytes(), false),
+                corefoundation::base::interned_name(key) as CFTypeRef,
                 *value,
             )
         })
@@ -700,11 +797,11 @@ fn since_1970(time: std::time::SystemTime) -> f64 {
 ///
 /// `receiver` must be an `NSDictionary`.
 unsafe fn attribute(receiver: Id, key: &str) -> Id {
-    let key = corefoundation::string::from_bytes(key.as_bytes(), false);
+    // Interned, not a one-off: the pool is kept forever, so there is nothing
+    // here to release.
+    let key = corefoundation::base::interned_name(key) as CFTypeRef;
     // SAFETY: a dictionary and a string key.
     let value = unsafe { corefoundation::api::CFDictionaryGetValue(receiver as CFTypeRef, key) };
-    // SAFETY: a string this function made and holds the only reference to.
-    unsafe { corefoundation::api::CFRelease(key) };
     value as Id
 }
 
@@ -1044,6 +1141,7 @@ pub(crate) fn install() {
         "removeItemAtPath:error:" => remove_item, c"B32@0:8@16^@24";
         "copyItemAtPath:toPath:error:" => copy_item, c"B40@0:8@16@24^@32";
         "moveItemAtPath:toPath:error:" => move_item, c"B40@0:8@16@24^@32";
+        "movePath:toPath:handler:" => move_path, c"B40@0:8@16@24@32";
         "contentsOfDirectoryAtPath:error:" => contents_of_directory, c"@32@0:8@16^@24";
         "contentsOfDirectoryAtURL:includingPropertiesForKeys:options:error:"
             => contents_of_directory_at_url, c"@48@0:8@16@24Q32^@40";
@@ -1059,6 +1157,9 @@ pub(crate) fn install() {
             => create_symlink, c"B40@0:8@16@24^@32";
         "linkItemAtPath:toPath:error:" => link_item, c"B40@0:8@16@24^@32";
         "attributesOfItemAtPath:error:" => attributes_of_item, c"@32@0:8@16^@24";
+        "fileAttributesAtPath:traverseLink:" => file_attributes_traverse_link, c"@28@0:8@16B24";
+        "setAttributes:ofItemAtPath:error:" => set_attributes_of_item, c"B40@0:8@16@24^@32";
+        "changeFileAttributes:atPath:" => change_file_attributes, c"B32@0:8@16@24";
         "attributesOfFileSystemForPath:error:" => attributes_of_file_system, c"@32@0:8@16^@24";
         "isWritableFileAtPath:" => is_writable, c"B24@0:8@16";
         "isReadableFileAtPath:" => file_exists, c"B24@0:8@16";
@@ -1096,6 +1197,36 @@ pub(crate) fn install() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn legacy_move_preserves_contents_and_refuses_existing_destination() {
+        let manager = manager();
+        let root =
+            std::env::temp_dir().join(format!("rosemary-legacy-move-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let source = root.join("source");
+        let dest = root.join("destination");
+        std::fs::write(&source, b"source contents").unwrap();
+        std::fs::write(&dest, b"keep destination").unwrap();
+        let from = crate::string::from_str(&source.to_string_lossy());
+        let to = crate::string::from_str(&dest.to_string_lossy());
+        let sel = objc::sel::get("movePath:toPath:handler:");
+        assert_eq!(
+            unsafe { move_path(manager, sel, from, to, std::ptr::null_mut()) },
+            0
+        );
+        assert_eq!(std::fs::read(&dest).unwrap(), b"keep destination");
+        std::fs::remove_file(&dest).unwrap();
+        assert_eq!(
+            unsafe { move_path(manager, sel, from, to, std::ptr::null_mut()) },
+            1
+        );
+        assert!(!source.exists());
+        assert_eq!(std::fs::read(&dest).unwrap(), b"source contents");
+        objc::arc::release(from);
+        objc::arc::release(to);
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn file_system_attributes_report_available_space() {
@@ -1181,6 +1312,33 @@ mod tests {
 
     /// The three the runner uses, on a directory this test makes and removes.
     #[test]
+    fn a_new_directory_uses_the_existing_parent_spelling() {
+        let manager = manager();
+        let root = std::env::temp_dir().join(format!("rosemary-fm-case-{}", std::process::id()));
+        std::fs::create_dir_all(root.join("MixedCase")).unwrap();
+        let path = crate::string::from_str(&root.join("MIXEDCASE/NewChild").to_string_lossy());
+        // SAFETY: a live manager, string, and optional null outputs.
+        unsafe {
+            assert_eq!(
+                create_directory(
+                    manager,
+                    objc::sel::get(
+                        "createDirectoryAtPath:withIntermediateDirectories:attributes:error:"
+                    ),
+                    path,
+                    0,
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                ),
+                1
+            );
+            objc::arc::release(path);
+        }
+        assert!(root.join("MixedCase/NewChild").is_dir());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn a_directory_is_created_seen_and_removed() {
         let manager = manager();
         let root = std::env::temp_dir().join(format!("rosemary-fm-{}", std::process::id()));
@@ -1233,6 +1391,51 @@ mod tests {
                 0
             );
         }
+    }
+
+    #[test]
+    fn changed_attributes_reach_the_file() {
+        use std::os::unix::fs::PermissionsExt;
+        let manager = manager();
+        let file = std::env::temp_dir().join(format!("rosemary-fm-attr-{}", std::process::id()));
+        std::fs::write(&file, b"x").unwrap();
+        let path = crate::string::from_str(&file.to_string_lossy());
+        let mode = corefoundation::collections::new_number(
+            corefoundation::collections::Number::Integer(0o640),
+        );
+        // 2001-01-01T00:00:10Z, ten seconds past the reference date.
+        let date = crate::timer::date(10.0) as CFTypeRef;
+        let pairs = [
+            (
+                corefoundation::base::interned_name("NSFilePosixPermissions") as CFTypeRef,
+                mode,
+            ),
+            (
+                corefoundation::base::interned_name("NSFileModificationDate") as CFTypeRef,
+                date,
+            ),
+        ];
+        let attributes = corefoundation::collections::new_dictionary(
+            &pairs,
+            corefoundation::callbacks::Policy::from_key_callbacks(),
+            corefoundation::callbacks::Policy::from_type_callbacks(),
+            false,
+        );
+        // SAFETY: the prototype `-changeFileAttributes:atPath:` declares.
+        let changed = unsafe {
+            change_file_attributes(
+                manager,
+                objc::sel::get("changeFileAttributes:atPath:"),
+                attributes as Id,
+                path,
+            )
+        };
+        assert_eq!(changed, 1);
+        let metadata = std::fs::metadata(&file).unwrap();
+        assert_eq!(metadata.permissions().mode() & 0o7777, 0o640);
+        let modified = metadata.modified().unwrap();
+        assert_eq!(since_1970(modified), 978_307_210.0);
+        std::fs::remove_file(&file).unwrap();
     }
 
     /// `-contentsAtPath:` and the selectors an app pairs it with.

@@ -93,6 +93,7 @@ pub fn data_symbols() -> Vec<(String, u64)> {
         "MTLStencilDescriptor",
         "MTLRenderPipelineDescriptor",
         "MTLRenderPassDescriptor",
+        "MTLRenderPipelineColorAttachmentDescriptor",
         "MTLCompileOptions",
         "MTLComputePipelineDescriptor",
         "MTLFunctionConstantValues",
@@ -138,4 +139,19 @@ pub use entries::{MODULE, names, provide};
 /// underscore gets the same answer as one that has.
 pub fn symbol(name: &str) -> Option<u64> {
     entries::symbol(name.trim_start_matches('_'))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_render_pipeline_color_attachment_descriptor_binds_its_class_symbol() {
+        let symbols = data_symbols();
+        assert!(
+            symbols
+                .iter()
+                .any(|(name, _)| name == "_OBJC_CLASS_$_MTLRenderPipelineColorAttachmentDescriptor")
+        );
+    }
 }

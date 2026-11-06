@@ -68,14 +68,14 @@ unsafe extern "C" fn set_next_responder(receiver: Id, _sel: Sel, next: Id) {
     }
 }
 
-/// Send an event method on to the next responder: a view's superview, then its
-/// window. A window is the end of the chain here, as it has no window of its own.
+/// The next responder after `receiver`: whatever `-setNextResponder:` set,
+/// else a view's superview, else its window. A window is the end of the
+/// chain here, as it has no window of its own.
 ///
 /// # Safety
 ///
-/// `receiver` is null or an object this runtime allocated, and `sel` is a
-/// `void (id, SEL, NSEvent *)` method.
-pub(crate) unsafe fn forward(receiver: Id, sel: Sel, event: Id) {
+/// `receiver` must be null or an object this runtime allocated.
+unsafe fn next_responder_of(receiver: Id) -> Id {
     // A next responder set with `-setNextResponder:` comes first: a program
     // puts a controller between a view and its superview that way.
     let responds = crate::view::is_view(receiver)
@@ -92,13 +92,24 @@ pub(crate) unsafe fn forward(receiver: Id, sel: Sel, event: Id) {
         false => std::ptr::null_mut(),
     };
     // SAFETY: null or an object this runtime allocated.
-    let next = match set {
+    match set {
         next if !next.is_null() => next,
         _ => match unsafe { crate::view::superview_of(receiver) } {
             next if next.is_null() => unsafe { crate::view::window_of(receiver) },
             next => next,
         },
-    };
+    }
+}
+
+/// Send an event method on to the next responder.
+///
+/// # Safety
+///
+/// `receiver` is null or an object this runtime allocated, and `sel` is a
+/// `void (id, SEL, NSEvent *)` method.
+pub(crate) unsafe fn forward(receiver: Id, sel: Sel, event: Id) {
+    // SAFETY: the caller's obligation.
+    let next = unsafe { next_responder_of(receiver) };
     if next.is_null() {
         return;
     }
@@ -265,6 +276,24 @@ fn command_for(key_code: u16, modifiers: u64) -> Option<&'static str> {
         vk::PAGE_DOWN => "pageDown:",
         _ => return None,
     })
+}
+
+/// `-[NSResponder undoManager]`: ask the next responder - a view's
+/// superview and eventually its window, the same chain `-nextResponder`
+/// walks for an unhandled event - so the window's own override (delegate,
+/// or a lazy manager of its own) is what answers.
+unsafe extern "C" fn responder_undo_manager(receiver: Id, _sel: Sel) -> Id {
+    // SAFETY: the caller's obligation.
+    let next = unsafe { next_responder_of(receiver) };
+    if next.is_null() || next == receiver {
+        return std::ptr::null_mut();
+    }
+    // SAFETY: sent rather than called, so `NSWindow`'s override runs instead
+    // of this same default when `next` is a window.
+    unsafe {
+        let f: unsafe extern "C" fn(Id, Sel) -> Id = std::mem::transmute(objc::msg::entry());
+        f(next, objc::sel::get("undoManager"))
+    }
 }
 
 /// `-[NSResponder interpretKeyEvents:]`: hand key events to the text system.
@@ -457,6 +486,7 @@ pub(crate) fn install() {
         "setMenu:" => set_menu, c"v24@0:8@16";
         "nextResponder" => next_responder, c"@16@0:8";
         "setNextResponder:" => set_next_responder, c"v24@0:8@16";
+        "undoManager" => responder_undo_manager, c"@16@0:8";
         "mouseDown:" => forward_event, c"v24@0:8@16";
         "mouseUp:" => forward_event, c"v24@0:8@16";
         "rightMouseDown:" => forward_event, c"v24@0:8@16";
@@ -789,5 +819,31 @@ mod tests {
                 "{name:?} does not inherit -setMenu:"
             );
         }
+    }
+
+    /// A view with no `-setNextResponder:` link of its own still reaches its
+    /// window's `-undoManager` through the superview-then-window chain
+    /// `-nextResponder` walks for an event.
+    #[test]
+    fn a_view_reaches_its_windows_undo_manager() {
+        crate::bootstrap();
+        let window =
+            objc::object::create_instance(objc::class::lookup(c"NSWindow").expect("NSWindow"), 0);
+        let view = responder(c"NSView");
+        // SAFETY: `view` and `window` are live objects this test allocated.
+        unsafe { crate::view::set_window(view, window) };
+
+        let undo_manager = objc::sel::get("undoManager");
+        // SAFETY: `-undoManager` is `id (id, SEL)`; sent so `NSWindow`'s own
+        // override runs rather than this file's default.
+        let from_window = unsafe {
+            let f: unsafe extern "C" fn(Id, Sel) -> Id = std::mem::transmute(objc::msg::entry());
+            f(window, undo_manager)
+        };
+        let from_view = unsafe { responder_undo_manager(view, undo_manager) };
+        assert!(!from_view.is_null());
+        assert_eq!(from_view, from_window, "the view reaches the window's own");
+
+        objc::arc::release(window);
     }
 }

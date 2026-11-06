@@ -21,6 +21,16 @@ fn main() {
     println!("cargo:rerun-if-changed=.git/HEAD");
 
     println!("cargo::rerun-if-changed=build.rs");
+    println!("cargo::rerun-if-changed=src/glu/sgi");
+    cc::Build::new()
+        .include("src/glu/sgi")
+        .files([
+            "src/glu/sgi/project.c",
+            "src/glu/sgi/quad.c",
+            "src/glu/sgi/mipmap.c",
+        ])
+        .warnings(false)
+        .compile("rosemary_glu");
     println!("cargo:rustc-env=ROSEMARY_BUILD_ID={}", build_id());
 
     if std::env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("freebsd") {

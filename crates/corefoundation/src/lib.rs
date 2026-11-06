@@ -25,12 +25,15 @@ pub mod propertylist;
 pub mod runloop;
 mod send;
 mod socket;
+mod stream;
 pub mod string;
 pub mod sysconfig;
 pub mod timezone;
 pub mod tzif;
+mod unicode;
 pub mod url;
 pub mod urlresource;
+pub mod uti;
 pub mod uuid;
 
 /// Install the classes this crate owns. Idempotent.
@@ -56,6 +59,7 @@ exports::exports! {
         "CFMakeCollectable" => api::CFMakeCollectable,
         "CFGetRetainCount" => api::CFGetRetainCount,
         "CFGetTypeID" => api::CFGetTypeID,
+        "CFGetAllocator" => api::CFGetAllocator,
         "CFCopyDescription" => api::CFCopyDescription,
         "CFShow" => api::CFShow,
         "CFEqual" => api::CFEqual,
@@ -79,6 +83,7 @@ exports::exports! {
         "CFStringGetCString" => api::CFStringGetCString,
         "CFStringGetCStringPtr" => api::CFStringGetCStringPtr,
         "CFStringGetBytes" => api::CFStringGetBytes,
+        "CFStringGetPascalString" => api::CFStringGetPascalString,
         "CFStringCreateExternalRepresentation" => api::CFStringCreateExternalRepresentation,
         "CFStringCompare" => api::CFStringCompare,
         "CFStringHasPrefix" => api::CFStringHasPrefix,
@@ -88,11 +93,21 @@ exports::exports! {
         "CFCopyTypeIDDescription" => api::CFCopyTypeIDDescription,
         "CFStringCompareWithOptions" => api::CFStringCompareWithOptions,
         "CFStringFindWithOptions" => api::CFStringFindWithOptions,
+        // Not in `table.rs`: both return `CFRange` by value, which the generic
+        // ABI table has no way to name. `rosemary::shims::cfstring` is what
+        // actually fields a guest's call; this publishes the address `dlsym`
+        // and the emulated backend's own linker want.
+        "CFStringFind" => api::CFStringFind,
+        "CFStringGetRangeOfComposedCharactersAtIndex" => api::CFStringGetRangeOfComposedCharactersAtIndex,
+        "CFStringCreateArrayBySeparatingStrings" => api::CFStringCreateArrayBySeparatingStrings,
+        "CFStringCreateByCombiningStrings" => api::CFStringCreateByCombiningStrings,
+        "CFStringNormalize" => api::CFStringNormalize,
+        "CFStringCreateMutableWithExternalCharactersNoCopy"
+            => api::CFStringCreateMutableWithExternalCharactersNoCopy,
         "CFStringCreateMutable" => api::CFStringCreateMutable,
         "CFStringCreateMutableCopy" => api::CFStringCreateMutableCopy,
         "CFStringUppercase" => api::CFStringUppercase,
         "CFStringLowercase" => api::CFStringLowercase,
-        "CFStringNormalize" => api::CFStringNormalize,
         "CFStringTransform" => api::CFStringTransform,
         "CFStringGetCharacterAtIndex" => api::CFStringGetCharacterAtIndex,
         "CFStringGetCharacters" => api::CFStringGetCharacters,
@@ -119,6 +134,7 @@ exports::exports! {
         "CFArrayExchangeValuesAtIndices" => api::CFArrayExchangeValuesAtIndices,
         "CFArraySortValues" => api::CFArraySortValues,
         "CFArrayCreateCopy" => api::CFArrayCreateCopy,
+        "CFArrayCreateMutableCopy" => api::CFArrayCreateMutableCopy,
         "CFArrayInsertValueAtIndex" => api::CFArrayInsertValueAtIndex,
         "CFArrayRemoveValueAtIndex" => api::CFArrayRemoveValueAtIndex,
         "CFArrayRemoveAllValues" => api::CFArrayRemoveAllValues,
@@ -126,6 +142,8 @@ exports::exports! {
         "CFSetApplyFunction" => api::CFSetApplyFunction,
         "CFSetGetCount" => api::CFSetGetCount,
         "CFSetGetValues" => api::CFSetGetValues,
+        "CFSetCreateMutable" => api::CFSetCreateMutable,
+        "CFSetAddValue" => api::CFSetAddValue,
         "CFDictionaryGetTypeID" => api::CFDictionaryGetTypeID,
         "CFDictionaryCreate" => api::CFDictionaryCreate,
         "CFDictionaryGetCount" => api::CFDictionaryGetCount,
@@ -136,6 +154,7 @@ exports::exports! {
         "CFDictionaryGetValue" => api::CFDictionaryGetValue,
         "CFDictionaryGetValueIfPresent" => api::CFDictionaryGetValueIfPresent,
         "CFDictionaryContainsKey" => api::CFDictionaryContainsKey,
+        "CFDictionaryContainsValue" => api::CFDictionaryContainsValue,
         "CFDictionaryGetKeysAndValues" => api::CFDictionaryGetKeysAndValues,
         "CFDictionaryCreateMutable" => api::CFDictionaryCreateMutable,
         "CFDictionarySetValue" => api::CFDictionarySetValue,
@@ -206,6 +225,7 @@ exports::exports! {
         "CFRunLoopWakeUp" => api::CFRunLoopWakeUp,
         "CFRunLoopPerformBlock" => api::CFRunLoopPerformBlock,
         "CFRunLoopSourceCreate" => api::CFRunLoopSourceCreate,
+        "CFMachPortCreateRunLoopSource" => api::CFMachPortCreateRunLoopSource,
         "CFRunLoopSourceSignal" => api::CFRunLoopSourceSignal,
         "CFRunLoopSourceInvalidate" => api::CFRunLoopSourceInvalidate,
         "CFRunLoopSourceIsValid" => api::CFRunLoopSourceIsValid,
@@ -235,6 +255,7 @@ exports::exports! {
         "CFStringGetSystemEncoding" => api::CFStringGetSystemEncoding,
         "CFStringConvertWindowsCodepageToEncoding" => api::CFStringConvertWindowsCodepageToEncoding,
         "CFStringConvertIANACharSetNameToEncoding" => api::CFStringConvertIANACharSetNameToEncoding,
+        "CFStringConvertNSStringEncodingToEncoding" => api::CFStringConvertNSStringEncodingToEncoding,
         "CFArrayContainsValue" => api::CFArrayContainsValue,
         "CFArrayAppendArray" => api::CFArrayAppendArray,
         "CFRunLoopRemoveSource" => api::CFRunLoopRemoveSource,
@@ -252,6 +273,7 @@ exports::exports! {
         calendar,
         preferences,
         propertylist,
+        stream,
         diskarbitration,
         fsevents,
         urlresource,

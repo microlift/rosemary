@@ -204,6 +204,7 @@ const F32: T = T::SinglePrecisionFp;
 const F64: T = T::DoublePrecisionFp;
 const P: T = T::Pointer;
 const U8: T = T::UnsignedByte;
+const I8: T = T::SignedByte;
 const I16: T = T::SignedHalfword;
 const U16: T = T::UnsignedHalfword;
 const BOOL: T = U8;
@@ -268,6 +269,18 @@ pub static SIGNATURES: &[FunctionAbi] = &[
     // A queue takes its callback as an ordinary argument, where an
     // `AudioUnit` takes one inside a structure - so `cbsig!` describes it and
     // the thunk is made at the seam.
+    // `ExtAudioFile` wraps linear PCM read/write around WAV and AIFF
+    // containers. `AudioFileTypeID` and `ExtAudioFilePropertyID` are both
+    // `UInt32`, and the one floating-point-free argument list here is the
+    // `SInt64` frame offset `ExtAudioFileSeek` takes.
+    sig!("ExtAudioFileOpenURL", I32, P, P),
+    sig!("ExtAudioFileCreateWithURL", I32, P, U32, P, P, U32, P),
+    sig!("ExtAudioFileDispose", I32, P),
+    sig!("ExtAudioFileGetProperty", I32, P, U32, P, P),
+    sig!("ExtAudioFileSetProperty", I32, P, U32, U32, P),
+    sig!("ExtAudioFileRead", I32, P, P, P),
+    sig!("ExtAudioFileWrite", I32, P, U32, P),
+    sig!("ExtAudioFileSeek", I32, P, I64),
     sig!("AudioQueueAllocateBuffer", I32, P, U32, P),
     sig!("AudioQueueDispose", I32, P, BOOL),
     sig!("AudioQueueEnqueueBuffer", I32, P, P, U32, P),
@@ -396,6 +409,7 @@ pub static SIGNATURES: &[FunctionAbi] = &[
     sig!("CFArrayCreate", P, P, P, I64, P),
     sig!("CFArrayCreateMutable", P, P, I64, P),
     sig!("CFArrayCreateCopy", P, P, P),
+    sig!("CFArrayCreateMutableCopy", P, P, I64, P),
     sig!("CFArrayInsertValueAtIndex", V, P, I64, P),
     sig!("CFArrayRemoveValueAtIndex", V, P, I64),
     sig!("CFArrayRemoveAllValues", V, P),
@@ -487,6 +501,7 @@ pub static SIGNATURES: &[FunctionAbi] = &[
     sig!("CFDictionaryAddValue", V, P, P, P),
     cbsig!([1], "CFDictionaryApplyFunction", V, P, P, P),
     sig!("CFDictionaryContainsKey", BOOL, P, P),
+    sig!("CFDictionaryContainsValue", BOOL, P, P),
     sig!("CFDictionaryGetCount", I64, P),
     sig!("CFDictionaryCreate", P, P, P, P, I64, P, P),
     sig!("CFDictionaryCreateMutable", P, P, I64, P, P),
@@ -498,6 +513,7 @@ pub static SIGNATURES: &[FunctionAbi] = &[
     sig!("CFDictionaryGetValueIfPresent", BOOL, P, P, P),
     sig!("CFDictionarySetValue", V, P, P, P),
     sig!("CFEqual", BOOL, P, P),
+    sig!("CFGetAllocator", P, P),
     sig!("CFGetTypeID", U64, P),
     sig!("CFHTTPAuthenticationCopyMethod", P, P),
     sig!("CFHTTPAuthenticationCopyRealm", P, P),
@@ -517,6 +533,12 @@ pub static SIGNATURES: &[FunctionAbi] = &[
     sig!("CFLocaleCopyCurrent", P),
     sig!("CFLocaleGetIdentifier", P, P),
     sig!("CFLocaleGetValue", P, P, P),
+    sig!(
+        "CFLocaleCreateCanonicalLanguageIdentifierFromString",
+        P,
+        P,
+        P
+    ),
     sig!("CFNetworkCopySystemProxySettings", P),
     //
     // The callback is argument two and the host calls it on whatever thread
@@ -553,6 +575,7 @@ pub static SIGNATURES: &[FunctionAbi] = &[
     // through directly.
     sig!("CFPreferencesCopyAppValue", P, P, P),
     sig!("CFPropertyListCreateWithData", P, P, P, U64, P, P),
+    sig!("CFPropertyListCreateXMLData", P, P, P),
     // `CFPropertyListCreateData(allocator, list, CFPropertyListFormat,
     // CFOptionFlags, CFErrorRef *)`.
     sig!("CFPropertyListCreateData", P, P, P, I64, U64, P),
@@ -590,6 +613,9 @@ pub static SIGNATURES: &[FunctionAbi] = &[
     // - exactly the shape the two independent register counters exist for.
     sig!("CFRunLoopRunInMode", I32, P, F64, U8),
     sig!("CFRunLoopSourceSignal", V, P),
+    sig!("CFMachPortCreateRunLoopSource", P, P, P, I64),
+    sig!("CFStreamCreateBoundPair", V, P, P, P, I64),
+    sig!("CFAttributedStringCreate", P, P, P, P),
     sig!("CFRunLoopSourceInvalidate", V, P),
     sig!("CFRunLoopSourceIsValid", U8, P),
     sig!("CFRunLoopRemoveSource", V, P, P, P),
@@ -634,11 +660,15 @@ pub static SIGNATURES: &[FunctionAbi] = &[
     cbsig!([1], "CFSetApplyFunction", V, P, P, P),
     sig!("CFSetGetCount", I64, P),
     sig!("CFSetGetValues", V, P, P),
+    sig!("CFSetCreateMutable", P, P, I64, P),
+    sig!("CFSetAddValue", V, P, P),
     sig!("CFStringAppendCharacters", V, P, P, I64),
     // `CFComparisonResult` is a `CFIndex`, so a signed doubleword, and
     // `CFStringCompareFlags` is a `CFOptionFlags` - both 64-bit on LP64.
     sig!("CFStringCompare", I64, P, P, U64),
     sig!("CFCopyDescription", P, P),
+    sig!("CFShow", V, P),
+    sig!("CFCharacterSetCreateBitmapRepresentation", P, P, P),
     sig!("CFErrorCopyDescription", P, P),
     sig!("CFErrorGetCode", I64, P),
     sig!("CFMakeCollectable", P, P),
@@ -647,6 +677,18 @@ pub static SIGNATURES: &[FunctionAbi] = &[
     // `Boolean CFStringFindWithOptions(CFStringRef, CFStringRef, CFRange,
     // CFStringCompareFlags, CFRange *)`, with the range flattened.
     sig!("CFStringFindWithOptions", BOOL, P, P, I64, I64, U64, P),
+    sig!("CFStringCreateArrayBySeparatingStrings", P, P, P, P),
+    sig!("CFStringCreateByCombiningStrings", P, P, P, P),
+    sig!("CFStringNormalize", V, P, I64),
+    sig!(
+        "CFStringCreateMutableWithExternalCharactersNoCopy",
+        P,
+        P,
+        P,
+        I64,
+        I64,
+        P
+    ),
     sig!("CFStringConvertEncodingToIANACharSetName", P, U32),
     sig!("CFStringConvertEncodingToNSStringEncoding", U64, U32),
     sig!("CFStringConvertIANACharSetNameToEncoding", U32, P),
@@ -685,6 +727,7 @@ pub static SIGNATURES: &[FunctionAbi] = &[
     sig!("CFTimeZoneGetName", P, P),
     sig!("CFStringGetCString", BOOL, P, P, I64, U32),
     sig!("CFStringGetCStringPtr", P, P, U32),
+    sig!("CFStringGetPascalString", BOOL, P, P, I64, U32),
     sig!("CFStringGetLength", I64, P),
     sig!("CFStringGetIntValue", I32, P),
     sig!("CFStringGetDoubleValue", F64, P),
@@ -728,6 +771,7 @@ pub static SIGNATURES: &[FunctionAbi] = &[
     // are - the two look interchangeable in a header and are not.
     sig!("CFURLCopyFileSystemPath", P, P, I64),
     sig!("CFURLCreateWithBytes", P, P, P, I64, U32, P),
+    sig!("CFURLWriteDataAndPropertiesToResource", BOOL, P, P, P, P),
     sig!(
         "CFURLCreateWithFileSystemPathRelativeToBase",
         P,
@@ -783,6 +827,7 @@ pub static SIGNATURES: &[FunctionAbi] = &[
     sig!("CGColorSpaceCreateDeviceRGB", P),
     sig!("CGColorSpaceCreateDeviceGray", P),
     sig!("CGColorSpaceRelease", V, P),
+    sig!("CGColorSpaceRetain", P, P),
     // `CGFloat` is `double` on both architectures, so the CTM translation is
     // two ordinary vector arguments.
     sig!("CGContextRelease", V, P),
@@ -791,6 +836,9 @@ pub static SIGNATURES: &[FunctionAbi] = &[
     sig!("CGContextSetTextDrawingMode", V, P, I32),
     sig!("CGContextSetGrayFillColor", V, P, F64, F64),
     sig!("CGContextSetShouldSmoothFonts", V, P, BOOL),
+    sig!("CGContextShowGlyphsAtPositions", V, P, P, P, U64),
+    // `CGGlyph` is `unsigned short`.
+    sig!("CGFontGetGlyphWithGlyphName", U16, P, P),
     sig!("CGDisplayBitsPerPixel", U64, U32),
     sig!("CGDisplayCopyAllDisplayModes", P, U32, P),
     sig!("CGDisplayCopyDisplayMode", P, U32),
@@ -837,6 +885,15 @@ pub static SIGNATURES: &[FunctionAbi] = &[
     sig!("CGEventCreate", P, P),
     sig!("CGEventPost", V, U32, P),
     sig!("CGEventSetType", V, P, U32),
+    // `CGEventField` is a plain C enum, four bytes like `CGEventType` above.
+    sig!("CGEventGetDoubleValueField", F64, P, U32),
+    sig!("CGEventGetIntegerValueField", I64, P, U32),
+    sig!("CGEventSetDoubleValueField", V, P, U32, F64),
+    sig!("CGEventSetIntegerValueField", V, P, U32, I64),
+    // `CGEventTimestamp` is `uint64_t`.
+    sig!("CGEventGetTimestamp", U64, P),
+    sig!("CGEventSetTimestamp", V, P, U64),
+    sig!("CGEventTapEnable", V, P, BOOL),
     sig!("CGEventGetType", U32, P),
     // `CGEventCreateKeyboardEvent(CGEventSourceRef, CGKeyCode, bool keyDown)`.
     sig!("CGEventCreateKeyboardEvent", P, P, U16, BOOL),
@@ -844,12 +901,12 @@ pub static SIGNATURES: &[FunctionAbi] = &[
     sig!("CGEventGetFlags", U64, P),
     sig!("CGEventSetFlags", V, P, U64),
     // `CGEventField` is a `uint32_t` enum; the value an `int64_t`.
-    sig!("CGEventGetIntegerValueField", I64, P, U32),
-    sig!("CGEventSetIntegerValueField", V, P, U32, I64),
     // The gamma ramp, read and written.
     sig!("CGGetDisplayTransferByTable", I32, U32, U32, P, P, P, P),
     sig!("CGSetDisplayTransferByTable", I32, U32, U32, P, P, P),
     sig!("CGGetOnlineDisplayList", I32, U32, P, P),
+    // `CGPoint` by value, as `CGDisplayMoveCursorToPoint` above.
+    sig!("CGGetDisplaysWithPoint", I32, F64, F64, U32, P, P),
     // `void CGGetLastMouseDelta(int32_t *dx, int32_t *dy)` - how a game reads
     // relative mouse motion when the cursor is hidden and locked, which is
     // every first-person camera.
@@ -902,6 +959,8 @@ pub static SIGNATURES: &[FunctionAbi] = &[
     // `CGImageAlphaInfo` is a `uint32_t` enum; the index into a source is a
     // `size_t`.
     sig!("CGDataProviderCreateWithData", P, P, P, U64, P),
+    // `off_t size` is a 64-bit signed byte count.
+    sig!("CGDataProviderCreateDirect", P, P, I64, P),
     sig!("CGDataProviderRelease", V, P),
     // `CGImageCreate(size_t width, size_t height, size_t bitsPerComponent,
     // size_t bitsPerPixel, size_t bytesPerRow, CGColorSpaceRef,
@@ -932,6 +991,8 @@ pub static SIGNATURES: &[FunctionAbi] = &[
     sig!("CGImageGetWidth", U64, P),
     sig!("CGImageSourceCreateImageAtIndex", P, P, U64, P),
     sig!("CGImageSourceCreateWithData", P, P, P),
+    sig!("CGImageSourceCreateWithDataProvider", P, P, P),
+    sig!("CGImageSourceCopyPropertiesAtIndex", P, P, U64, P),
     sig!("CGImageSourceCopyTypeIdentifiers", P),
     sig!("CGImageDestinationCopyTypeIdentifiers", P),
     sig!("CGImageDestinationCreateWithData", P, P, P, U64, P),
@@ -941,6 +1002,7 @@ pub static SIGNATURES: &[FunctionAbi] = &[
     sig!("NXGetLocalArchInfo", P),
     sig!("NSDisableScreenUpdates", V),
     sig!("NSEnableScreenUpdates", V),
+    sig!("NSBeep", V),
     sig!("CGSessionCopyCurrentDictionary", P),
     sig!("CGWindowServerCreateServerPort", U32),
     sig!("CGReleaseDisplayFadeReservation", I32, U32),
@@ -950,6 +1012,23 @@ pub static SIGNATURES: &[FunctionAbi] = &[
     sig!("CGWarpMouseCursorPosition", I32, F64, F64),
     sig!("CGSetLocalEventsSuppressionInterval", I32, F64),
     sig!("CGWindowLevelForKey", I32, I32),
+    // QuickDraw's `short` is `int16_t`, and a `Rect *` travels like any other
+    // pointer - the aggregate it points at is never passed or returned by value.
+    sig!("SetRect", V, P, I16, I16, I16, I16),
+    sig!("OffsetRect", V, P, I16, I16),
+    // `CGDirectDisplayID` is `uint32_t`; a `ColorSyncProfileRef` is a pointer
+    // like any other CF type.
+    sig!("ColorSyncProfileCreateWithDisplayID", P, U32),
+    sig!("ColorSyncProfileCreateWithURL", P, P, P),
+    sig!("ColorSyncProfileGetURL", P, P, P),
+    // `PMPrinter`, `PMPrintSession` and `PMPrintSettings` are opaque Carbon
+    // handles, pointer-sized like any other; `OSStatus` is `int32_t` and
+    // `PMResolution` travels by pointer, never by value.
+    sig!("PMSessionGetCurrentPrinter", I32, P, P),
+    sig!("PMPrinterGetPrinterResolutionCount", I32, P, P),
+    sig!("PMPrinterGetIndexedPrinterResolution", I32, P, U32, P),
+    sig!("PMPrinterGetOutputResolution", I32, P, P, P),
+    sig!("PMPrinterSetOutputResolution", I32, P, P, P),
     sig!("CGColorGetConstantColor", P, P),
     sig!("CGColorCreateCopy", P, P),
     sig!("CGColorRelease", V, P),
@@ -1020,6 +1099,7 @@ pub static SIGNATURES: &[FunctionAbi] = &[
     sig!("nw_release", V, P),
     sig!("CVDisplayLinkCreateWithActiveCGDisplays", I32, P),
     sig!("CVDisplayLinkCreateWithCGDisplay", I32, U32, P),
+    sig!("CVDisplayLinkCreateWithCGDisplays", I32, P, I64, P),
     sig!("CVDisplayLinkGetActualOutputVideoRefreshPeriod", F64, P),
     // `CVTime` by value: sixteen bytes, both eightbytes integer, and the two
     // ABIs *agree* - `rax`/`rdx` on one side, `x0`/`x1` on the other.
@@ -1074,6 +1154,7 @@ pub static SIGNATURES: &[FunctionAbi] = &[
     // buffer, hand it to the cache, get a texture name back.
     sig!("CVBufferRelease", V, P),
     sig!("CVBufferRetain", P, P),
+    sig!("CVGetHostClockFrequency", F64),
     sig!("CVOpenGLTextureCacheCreate", I32, P, P, P, P, P, P),
     sig!(
         "CVOpenGLTextureCacheCreateTextureFromImage",
@@ -1233,6 +1314,8 @@ pub static SIGNATURES: &[FunctionAbi] = &[
     sig!("IOHIDElementIsWrapping", BOOL, P),
     sig!("IOHIDElementGetLogicalMax", I64, P),
     sig!("IOHIDElementGetLogicalMin", I64, P),
+    sig!("IOHIDElementGetReportSize", U32, P),
+    sig!("IOHIDElementGetReportCount", U32, P),
     sig!("IOHIDElementGetType", U32, P),
     // A `CFTypeID` is an `unsigned long`, so sixty-four bits, and this takes
     // nothing.
@@ -1307,6 +1390,11 @@ pub static SIGNATURES: &[FunctionAbi] = &[
         P
     ),
     sig!("IOPMAssertionRelease", I32, U32),
+    // `IOPMAssertionLevel` is a `uint32_t`; both of these are the lighter
+    // sibling of `IOPMAssertionCreateWithDescription` above, so they share its
+    // `IOPMAssertionID *` out-parameter and floating-point-free argument list.
+    sig!("IOPMAssertionCreateWithName", I32, P, U32, P, P),
+    sig!("IOPMAssertionDeclareUserActivity", I32, P, U32, P),
     // The sleep/wake notification family is the *other* power API, and it is
     // the one an application registers with in order to be told before the
     // machine sleeps.
@@ -1335,6 +1423,7 @@ pub static SIGNATURES: &[FunctionAbi] = &[
     // point.
     sig!("IORegistryEntryCreateIterator", I32, U32, P, U32, P),
     sig!("IORegistryEntryFromPath", U32, U32, P),
+    sig!("IORegistryEntryGetChildIterator", I32, U32, P, P),
     sig!("IORegistryEntrySearchCFProperty", P, U32, P, P, P, U32),
     sig!("IORegistryEntryGetParentEntry", I32, U32, P, P),
     // `kern_return_t IOServiceAddMatchingNotification(IONotificationPortRef,
@@ -1354,10 +1443,111 @@ pub static SIGNATURES: &[FunctionAbi] = &[
     sig!("IOServiceGetMatchingServices", I32, U32, P, P),
     sig!("IOServiceMatching", P, P),
     sig!("KextManagerCopyLoadedKextInfo", P, P, P),
+    cbsig!([3], "clCreateContext", P, P, U32, P, P, P, P),
+    sig!("clCreateCommandQueue", P, P, P, U64, P),
+    sig!("clCreateBuffer", P, P, U64, U64, P, P),
+    sig!("clCreateProgramWithSource", P, P, U32, P, P, P),
+    cbsig!([4], "clBuildProgram", I32, P, U32, P, P, P, P),
+    sig!("clCreateKernel", P, P, P, P),
+    sig!("clSetKernelArg", I32, P, U32, U64, P),
+    sig!(
+        "clEnqueueMapBuffer",
+        P,
+        P,
+        P,
+        U32,
+        U64,
+        U64,
+        U64,
+        U32,
+        P,
+        P,
+        P
+    ),
+    sig!(
+        "clEnqueueReadBuffer",
+        I32,
+        P,
+        P,
+        U32,
+        U64,
+        U64,
+        P,
+        U32,
+        P,
+        P
+    ),
+    sig!(
+        "clEnqueueWriteBuffer",
+        I32,
+        P,
+        P,
+        U32,
+        U64,
+        U64,
+        P,
+        U32,
+        P,
+        P
+    ),
+    sig!("clEnqueueNDRangeKernel", I32, P, P, U32, P, P, P, U32, P, P),
+    sig!("clEnqueueUnmapMemObject", I32, P, P, P, U32, P, P),
+    sig!("clFinish", I32, P),
+    sig!("clGetCommandQueueInfo", I32, P, U32, U64, P, P),
+    sig!("clGetContextInfo", I32, P, U32, U64, P, P),
+    sig!("clGetKernelWorkGroupInfo", I32, P, P, U32, U64, P, P),
+    sig!("clRetainCommandQueue", I32, P),
+    sig!("clReleaseCommandQueue", I32, P),
+    sig!("clRetainContext", I32, P),
+    sig!("clReleaseContext", I32, P),
+    sig!("clRetainDevice", I32, P),
+    sig!("clReleaseDevice", I32, P),
+    sig!("clReleaseEvent", I32, P),
+    sig!("clRetainKernel", I32, P),
+    sig!("clReleaseKernel", I32, P),
+    sig!("clRetainMemObject", I32, P),
+    sig!("clReleaseMemObject", I32, P),
+    sig!("clReleaseProgram", I32, P),
     sig!("clGetPlatformIDs", I32, U32, P, P),
     sig!("clGetPlatformInfo", I32, P, U32, U64, P, P),
     sig!("clGetDeviceIDs", I32, P, U64, U32, P, P),
     sig!("clGetDeviceInfo", I32, P, U32, U64, P, P),
+    // CBLAS' enums and its `int`s are all `int32_t`; `alpha`/`beta` travel by
+    // value, as the C BLAS wrapper (unlike Fortran BLAS) takes them.
+    sig!(
+        "cblas_sgemm",
+        V,
+        I32,
+        I32,
+        I32,
+        I32,
+        I32,
+        I32,
+        F32,
+        P,
+        I32,
+        P,
+        I32,
+        F32,
+        P,
+        I32
+    ),
+    sig!(
+        "cblas_sgemv",
+        V,
+        I32,
+        I32,
+        I32,
+        I32,
+        F32,
+        P,
+        I32,
+        P,
+        I32,
+        F32,
+        P,
+        I32
+    ),
     sig!("IOServiceNameMatching", P, P),
     sig!("IOObjectConformsTo", U32, U32, P),
     sig!("IOCreatePlugInInterfaceForService", I32, U32, P, P, P, P),
@@ -1395,11 +1585,50 @@ pub static SIGNATURES: &[FunctionAbi] = &[
     sig!("SendEventToEventTarget", I32, P, P),
     // `OSStatus SetSystemUIMode(SystemUIMode, SystemUIOptions)`, two `UInt32`.
     sig!("SetSystemUIMode", I32, U32, U32),
+    // `OSStatus GetEventParameter(EventRef, EventParamName, EventParamType,
+    // EventParamType *, UInt32, UInt32 *, void *)`.
+    sig!("GetEventParameter", I32, P, U32, U32, P, U32, P, P),
+    // `OSStatus SetEventParameter(EventRef, EventParamName, EventParamType,
+    // UInt32, const void *)`.
+    sig!("SetEventParameter", I32, P, U32, U32, U32, P),
+    // `OSStatus CallNextEventHandler(EventHandlerCallRef, EventRef)`.
+    sig!("CallNextEventHandler", I32, P, P),
+    // `Boolean GetColor(Point, ConstStr255Param, const RGBColor *, RGBColor
+    // *)`. `Point` is two `SInt16`s, which is one integer register.
+    sig!("GetColor", U8, U32, P, P, P),
+    sig!("GetCurrentButtonState", U32),
     // `OSErr FSFindFolder(FSVolumeRefNum, OSType, Boolean, FSRef *)`.
     sig!("FSFindFolder", I16, I16, U32, U8, P),
     sig!("GetIconRef", I16, I16, U32, U32, P),
     sig!("ReleaseIconRef", I16, P),
     sig!("LocaleRefFromLocaleString", I32, P, P),
+    // `TextEncoding CreateTextEncoding(TextEncodingBase, TextEncodingVariant,
+    // TextEncodingFormat)` and `Fixed Long2Fix(long)`, both plain integer
+    // arithmetic with no guest memory involved.
+    sig!("CreateTextEncoding", U32, U32, U32, U32),
+    sig!("Long2Fix", I32, I32),
+    // `OSStatus UCConvertCFAbsoluteTimeToUTCDateTime(CFAbsoluteTime,
+    // UTCDateTime *)` and its inverses; `UTCDateTime` goes by pointer.
+    sig!("UCConvertCFAbsoluteTimeToUTCDateTime", I32, F64, P),
+    sig!("UCConvertUTCDateTimeToCFAbsoluteTime", I32, P, P),
+    sig!("UCConvertSecondsToCFAbsoluteTime", I32, U32, P),
+    sig!("UCConvertCFAbsoluteTimeToSeconds", I32, F64, P),
+    // `OSStatus UpgradeScriptInfoToTextEncoding(ScriptCode, LangCode,
+    // RegionCode, ConstStr255Param, TextEncoding *)`.
+    sig!("UpgradeScriptInfoToTextEncoding", I32, I16, I16, I16, P, P),
+    // `OSStatus TECGetTextEncodingFromInternetName(TextEncoding *,
+    // ConstStr255Param)`.
+    sig!("TECGetTextEncodingFromInternetName", I32, P, P),
+    sig!("TECCreateConverter", I32, P, U32, U32),
+    sig!("TECDisposeConverter", I32, P),
+    sig!("TECClearConverterContextInfo", I32, P),
+    // `OSStatus TECConvertText(TECObjectRef, const UInt8 *, ByteCount,
+    // ByteCount *, UInt8 *, ByteCount, ByteCount *)`.
+    sig!("TECConvertText", I32, P, P, U64, P, P, U64, P),
+    // `MDItemRef MDItemCreate(CFAllocatorRef, CFStringRef)` and `CFTypeRef
+    // MDItemCopyAttribute(MDItemRef, CFStringRef)`.
+    sig!("MDItemCreate", P, P, P),
+    sig!("MDItemCopyAttribute", P, P, P),
     sig!("UCCreateCollator", I32, P, U32, U32, P),
     sig!("UCDisposeCollator", I32, P),
     sig!("UCCompareText", I32, P, P, U64, P, U64, P, P),
@@ -1428,8 +1657,49 @@ pub static SIGNATURES: &[FunctionAbi] = &[
     sig!("FSIsAliasFile", I32, P, P, P),
     sig!("FSNewAlias", I32, P, P, P),
     sig!("FSSetCatalogInfo", I32, P, U32, P),
+    // `OSStatus FNNotify(const FSRef *, FNMessage, OptionBits)`.
+    sig!("FNNotify", I32, P, U32, U32),
     sig!("FSGetVolumeInfo", I32, I16, U32, P, U32, P, P, P),
     sig!("FSGetVolumeParms", I32, I16, P, U32),
+    // `OSErr FSCreateFork(const FSRef *, UniCharCount, const UniChar *)` and
+    // `OSErr FSOpenFork(const FSRef *, UniCharCount, const UniChar *, SInt8,
+    // FSIORefNum *)` - `FSIORefNum` is `int` on LP64, not the `SInt16` every
+    // other `FSVolumeRefNum` in this table is.
+    sig!("FSCreateFork", I32, P, U64, P),
+    sig!("FSOpenFork", I32, P, U64, P, I8, P),
+    sig!("FSCloseFork", I32, I32),
+    // `OSErr FSReadFork/FSWriteFork(FSIORefNum, UInt16, SInt64, ByteCount,
+    // void *, ByteCount *)` - `ByteCount` is `unsigned long`, 64 bits here.
+    sig!("FSReadFork", I32, I32, U16, I64, U64, P, P),
+    sig!("FSWriteFork", I32, I32, U16, I64, U64, P, P),
+    sig!("FSGetForkPosition", I32, I32, P),
+    sig!("FSSetForkPosition", I32, I32, U16, I64),
+    sig!("FSGetForkSize", I32, I32, P),
+    sig!("FSSetForkSize", I32, I32, U16, I64),
+    // `OSErr FSGetForkCBInfo(FSIORefNum, FSVolumeRefNum, SInt16 *,
+    // FSIORefNum *, FSForkInfo *, FSRef *, HFSUniStr255 *)`.
+    sig!("FSGetForkCBInfo", I32, I32, I16, P, P, P, P, P),
+    sig!("FSIterateForks", I32, P, P, P, P, P),
+    sig!("FSGetDataForkName", I32, P),
+    // `OSErr FSOpenIterator(const FSRef *, FSIteratorFlags, FSIterator *)`.
+    sig!("FSOpenIterator", I32, P, U32, P),
+    sig!("FSCloseIterator", I32, P),
+    // `OSErr FSGetCatalogInfoBulk(FSIterator, ItemCount, ItemCount *,
+    // Boolean *, FSCatalogInfoBitmap, FSCatalogInfo *, FSRef *, FSSpecPtr,
+    // HFSUniStr255 *)` - `ItemCount` is `unsigned long`, 64 bits here.
+    sig!("FSGetCatalogInfoBulk", I32, P, U64, P, P, U32, P, P, P, P),
+    // `OSErr FSCreateDirectoryUnicode(const FSRef *, UniCharCount, const
+    // UniChar *, FSCatalogInfoBitmap, const FSCatalogInfo *, FSRef *,
+    // FSSpecPtr, UInt32 *)`.
+    sig!("FSCreateDirectoryUnicode", I32, P, U64, P, U32, P, P, P, P),
+    sig!("FSMakeFSRefUnicode", I32, P, U64, P, U32, P),
+    sig!("PBMakeFSRefUnicodeSync", I32, P),
+    sig!("FSRenameUnicode", I32, P, U64, P, U32, P),
+    sig!("FSMoveObject", I32, P, P, P),
+    sig!("FSDeleteObject", I32, P),
+    // `OSStatus FSCopyObjectSync(const FSRef *, const FSRef *, CFStringRef,
+    // FSRef *, OptionBits)`.
+    sig!("FSCopyObjectSync", I32, P, P, P, P, U32),
     sig!("FSPathMoveObjectToTrashSync", I32, P, P, U32),
     sig!("FSFileOperationCreate", P, P),
     sig!("FSFileOperationScheduleWithRunLoop", V, P, P, P),
@@ -1453,6 +1723,98 @@ pub static SIGNATURES: &[FunctionAbi] = &[
     sig!("HLock", V, P),
     sig!("HUnlock", V, P),
     sig!("TickCount", U32),
+    // The Memory Manager's `Ptr`/`Handle` allocator; see
+    // `coreservices::memory`. `Size`/`long` are sixty-four bits on this ABI,
+    // the same as `CFIndex` above.
+    sig!("NewPtr", P, I64),
+    sig!("NewPtrClear", P, I64),
+    sig!("DisposePtr", V, P),
+    sig!("GetPtrSize", I64, P),
+    sig!("SetPtrSize", V, P, I64),
+    sig!("NewHandle", P, I64),
+    sig!("NewHandleClear", P, I64),
+    sig!("DisposeHandle", V, P),
+    sig!("GetHandleSize", I64, P),
+    sig!("SetHandleSize", V, P, I64),
+    sig!("HGetState", I8, P),
+    sig!("PtrAndHand", I16, P, P, I64),
+    sig!("MemError", I16),
+    // Toolbox Utilities' bit tests, the one geographic-location record this
+    // host answers, and Multiprocessing Services' critical regions; see
+    // `coreservices::osutils`.
+    sig!("BitAnd", I64, I64, I64),
+    sig!("BitOr", I64, I64, I64),
+    sig!("BitTst", U8, P, I64),
+    sig!("ReadLocation", V, P),
+    sig!("MPCreateCriticalRegion", I32, P),
+    sig!("MPDeleteCriticalRegion", I32, P),
+    sig!("MPEnterCriticalRegion", I32, P, I32),
+    sig!("MPExitCriticalRegion", I32, P),
+    // The Text Utilities' remaining legacy calls, and the Unicode Converter's
+    // high-level `TextToUnicodeInfo`/`UnicodeToTextInfo` objects, both beside
+    // the `TEC*` converter in `coreservices::textencoding`.
+    sig!("GetTextEncodingBase", U32, U32),
+    sig!("CharacterByteType", I16, P, I16, I16),
+    sig!("NumToString", V, I64, P),
+    sig!("GetScriptManagerVariable", I32, I16),
+    sig!("CreateTextToUnicodeInfo", I32, P, P),
+    sig!("CreateUnicodeToTextInfo", I32, P, P),
+    sig!("DisposeTextToUnicodeInfo", I32, P),
+    sig!("DisposeUnicodeToTextInfo", I32, P),
+    sig!(
+        "ConvertFromTextToUnicode",
+        I32,
+        P,
+        U64,
+        P,
+        U32,
+        U64,
+        P,
+        P,
+        P,
+        U64,
+        P,
+        P,
+        P
+    ),
+    sig!(
+        "ConvertFromUnicodeToText",
+        I32,
+        P,
+        U64,
+        P,
+        U32,
+        U64,
+        P,
+        P,
+        P,
+        U64,
+        P,
+        P,
+        P
+    ),
+    // `UCConvertCFAbsoluteTimeToLongDateTime` and `GetUTCDateTime`, beside
+    // `UCConvertCFAbsoluteTimeToUTCDateTime` in `coreservices::datetime`.
+    sig!("UCConvertCFAbsoluteTimeToLongDateTime", I32, F64, P),
+    sig!("GetUTCDateTime", I32, P, U32),
+    // The Carbon odds and ends `coreservices::events` answers beside its
+    // existing Event Manager stubs: the current thread's event queue, a
+    // flush that never has anything queued to flush, the application's
+    // Mac-encoding fallback, the live keyboard state, and the legacy
+    // keycode-based key translator.
+    sig!("GetCurrentEventQueue", P),
+    sig!("FlushEventsMatchingListFromQueue", I32, P, U64, P),
+    sig!("GetApplicationTextEncoding", U32),
+    sig!("GetKeys", V, P),
+    sig!("KeyTranslate", U32, P, U16, P),
+    // The classic Window Manager calls `coreservices::windows` answers for a
+    // `WindowRef` that can never be valid - this tree has no such concept;
+    // see that module's note.
+    sig!("IsValidWindowPtr", U8, P),
+    sig!("GetWindowPortBounds", P, P, P),
+    sig!("GetWindowProperty", I32, P, U32, U32, U64, P, P),
+    sig!("SetWindowProperty", I32, P, U32, U32, U64, P),
+    sig!("GetDialogWindow", P, P),
     // The two keyboard low-memory globals, both `UInt8 (*)(void)` and both an
     // ordinary function on a 64-bit system: `LMGetKbdType` is what still backs
     // `UCKeyTranslate`'s keyboard-type argument, and `LMGetKbdLast` is the ADB
@@ -1500,6 +1862,15 @@ pub static SIGNATURES: &[FunctionAbi] = &[
     sig!("OSAtomicCompareAndSwapIntBarrier", BOOL, I32, I32, P),
     sig!("OSAtomicCompareAndSwapPtr", BOOL, P, P, P),
     sig!("OSAtomicCompareAndSwapPtrBarrier", BOOL, P, P, P),
+    // Like the `Add` pair, these return the value *after* the change.
+    sig!("OSAtomicDecrement32", I32, P),
+    sig!("OSAtomicDecrement32Barrier", I32, P),
+    sig!("OSAtomicDecrement64", I64, P),
+    sig!("OSAtomicDecrement64Barrier", I64, P),
+    sig!("OSAtomicIncrement32", I32, P),
+    sig!("OSAtomicIncrement32Barrier", I32, P),
+    sig!("OSAtomicIncrement64", I64, P),
+    sig!("OSAtomicIncrement64Barrier", I64, P),
     sig!("OSMemoryBarrier", V),
     // `OSSpinLock` is a bare `int32_t` the guest allocates itself, and the
     // host's implementation operates on it in place - the same arrangement as
@@ -1916,6 +2287,7 @@ pub static SIGNATURES: &[FunctionAbi] = &[
     // back - nothing about the object crosses.
     sig!("difftime", F64, I64, I64),
     sig!("dirname", P, P),
+    sig!("dispatch_activate", V, P),
     sig!("dirname_r", P, P, P),
     sig!("dispatch_get_context", P, P),
     sig!("dispatch_get_global_queue", P, I64, U64),
@@ -1945,8 +2317,8 @@ pub static SIGNATURES: &[FunctionAbi] = &[
     cbsig!([1], "dispatch_source_set_cancel_handler_f", V, P, P),
     cbsig!([1], "dispatch_source_set_event_handler_f", V, P, P),
     sig!("dispatch_source_set_timer", V, P, U64, U64, U64),
-    sig!("dispatch_suspend", V, P),
     sig!("dispatch_source_testcancel", I64, P),
+    sig!("dispatch_suspend", V, P),
     // `dispatch_time(dispatch_time_t base, int64_t delta)` - the base is an
     // opaque absolute time and the delta is signed nanoseconds, which is why
     // the two arguments are not the same type despite both being doublewords.
@@ -2765,6 +3137,36 @@ pub static SIGNATURES: &[FunctionAbi] = &[
     // Frees what `glob` allocated, and must be the shim's own: the host's would
     // read `gl_pathv` out of a Darwin `glob_t` at the wrong offset.
     sig!("globfree", V, P),
+    sig!("gluBuild1DMipmaps", I32, U32, I32, I32, U32, U32, P),
+    sig!("gluBuild2DMipmaps", I32, U32, I32, I32, I32, U32, U32, P),
+    sig!("gluCheckExtension", U8, P, P),
+    sig!("gluCylinder", V, P, F64, F64, F64, I32, I32),
+    sig!("gluDeleteQuadric", V, P),
+    sig!("gluDisk", V, P, F64, F64, I32, I32),
+    sig!("gluNewQuadric", P),
+    sig!("gluPartialDisk", V, P, F64, F64, I32, I32, F64, F64),
+    sig!("gluPerspective", V, F64, F64, F64, F64),
+    sig!("gluPickMatrix", V, F64, F64, F64, F64, P),
+    sig!("gluProject", I32, F64, F64, F64, P, P, P, P, P, P),
+    sig!("gluQuadricDrawStyle", V, P, U32),
+    sig!("gluQuadricNormals", V, P, U32),
+    sig!("gluQuadricOrientation", V, P, U32),
+    sig!("gluQuadricTexture", V, P, U8),
+    sig!(
+        "gluScaleImage",
+        I32,
+        U32,
+        I32,
+        I32,
+        U32,
+        P,
+        I32,
+        I32,
+        U32,
+        P
+    ),
+    sig!("gluSphere", V, P, F64, I32, I32),
+    sig!("gluUnProject", I32, F64, F64, F64, P, P, P, P, P, P),
     sig!("gluOrtho2D", V, F64, F64, F64, F64),
     sig!("gmtime", P, P),
     sig!("gmtime_r", P, P, P),
@@ -3309,6 +3711,9 @@ pub static SIGNATURES: &[FunctionAbi] = &[
     sig!("pselect", I32, I32, P, P, P, P, P),
     // The named-semaphore surface. `sem_open` is `open`'s shape exactly.
     sig!("sem_close", I32, P),
+    sig!("sem_destroy", I32, P),
+    sig!("sem_getvalue", I32, P, P),
+    sig!("sem_init", I32, P, I32, U32),
     sig!("sem_open", P, P, I32, U32, U32),
     sig!("sem_post", I32, P),
     sig!("sem_trywait", I32, P),
@@ -3715,6 +4120,7 @@ pub static SIGNATURES: &[FunctionAbi] = &[
     sig!("CMFormatDescriptionGetExtension", P, P, P),
     sig!("CMFormatDescriptionGetExtensions", P, P),
     sig!("CMFormatDescriptionGetMediaSubType", U32, P),
+    sig!("CMAudioFormatDescriptionGetStreamBasicDescription", P, P),
     sig!("CMFormatDescriptionGetMediaType", U32, P),
     sig!("CMFormatDescriptionGetTypeID", U64),
     // Twelve parameters, four past AAPCS64's eighth, and the fourth is guest
@@ -3930,6 +4336,31 @@ pub static SIGNATURES: &[FunctionAbi] = &[
     sig!("CTFontCreateCopyWithAttributes", P, P, F64, P, P),
     sig!("CTFontCreateWithGraphicsFont", P, P, F64, P, P),
     sig!("CTGetCoreTextVersion", U32),
+    sig!("CTFontCopyAvailableTables", P, P, U32),
+    sig!("CTFontCopyCharacterSet", P, P),
+    sig!("CTFontCopyFullName", P, P),
+    sig!("CTFontCopyLocalizedName", P, P, P, P),
+    sig!("CTFontCopyVariation", P, P),
+    sig!("CTFontCreateCopyWithSymbolicTraits", P, P, F64, P, U32, U32),
+    // `CFRange` by value, flattened to its two `CFIndex` fields.
+    sig!("CTFontCreateForString", P, P, P, I64, I64),
+    sig!("CTFontCollectionCreateFromAvailableFonts", P, P),
+    sig!("CTFontCollectionCreateMatchingFontDescriptors", P, P),
+    sig!("CTFontManagerCopyAvailablePostScriptNames", P),
+    sig!("CTFontManagerRegisterFontsForURL", BOOL, P, U32, P),
+    sig!("CTFontManagerUnregisterFontsForURL", BOOL, P, U32, P),
+    sig!("CTTypesetterCreateWithAttributedString", P, P),
+    // `CFRange` by value again, flattened.
+    sig!("CTTypesetterCreateLine", P, P, I64, I64),
+    sig!("CTTypesetterSuggestLineBreak", I64, P, I64, F64),
+    sig!("CTLineGetGlyphRuns", P, P),
+    sig!("CTRunGetGlyphCount", I64, P),
+    // `CFRange` by value, flattened; the fourth argument is the output buffer.
+    sig!("CTRunGetGlyphs", V, P, I64, I64, P),
+    sig!("CTRunGetPositions", V, P, I64, I64, P),
+    sig!("CTRunGetAdvances", V, P, I64, I64, P),
+    sig!("CTRunGetStringIndices", V, P, I64, I64, P),
+    sig!("CTRunGetAttributes", P, P),
     sig!("NSColorSpaceFromDepth", P, I32),
     sig!("NSBestDepth", I32, P, I64, I64, BOOL, P),
     sig!("CGEventSourceKeyState", BOOL, I32, U16),
@@ -4254,6 +4685,17 @@ pub static REFUSED: &[(&str, &str)] = &[
     // than a doubleword to describe that with. Implemented all the same - the
     // native backend calls it directly, with no marshaller in the way.
     ("CFUUIDGetUUIDBytes", AGGREGATE),
+    // `CFRange CFStringFind(...)` and `CFRange
+    // CFStringGetRangeOfComposedCharactersAtIndex(...)`: as `CFUUIDGetUUIDBytes`
+    // above - see `crates/rosemary/src/shims/cfstring.rs`.
+    ("CFStringFind", AGGREGATE),
+    // Nine doubles: the ninth is past the last vector register, on the stack,
+    // where the marshaller places none. `shims::opengl` reads it there.
+    (
+        "gluLookAt",
+        "passes a ninth double on the stack, past the vector registers the marshaller fills",
+    ),
+    ("CFStringGetRangeOfComposedCharactersAtIndex", AGGREGATE),
     // Seventeen parameters: an allocator and the sixteen bytes of a UUID.
     (
         "CFUUIDGetConstantUUIDWithBytes",
@@ -4266,11 +4708,22 @@ pub static REFUSED: &[(&str, &str)] = &[
     ("CFGregorianDateGetAbsoluteTime", AGGREGATE),
     ("CGRectContainsPoint", AGGREGATE),
     ("CGRectInset", AGGREGATE),
+    ("CGRectIntersection", AGGREGATE),
+    ("CGContextConvertRectToUserSpace", AGGREGATE),
+    ("CGContextConvertRectToDeviceSpace", AGGREGATE),
+    ("CGDisplayCreateImageForRect", AGGREGATE),
     ("NSMouseInRect", AGGREGATE),
     ("NSRectFill", AGGREGATE),
+    ("NSEqualSizes", AGGREGATE),
+    ("NSIntersectsRect", AGGREGATE),
+    ("NSContainsRect", AGGREGATE),
     ("NSDrawNinePartImage", AGGREGATE),
     ("CTFontGetBoundingBox", AGGREGATE),
     ("CTFontGetBoundingRectsForGlyphs", AGGREGATE),
+    // `CFRange CTRunGetStringRange(CTRunRef)`: sixteen bytes in two integer
+    // registers, as `CFUUIDGetUUIDBytes` above - implemented all the same,
+    // the native backend calls it directly.
+    ("CTRunGetStringRange", AGGREGATE),
     // `NSApp` is data like the rest of this block, and the least obvious of
     // them.
     ("NSApp", DATA),
@@ -4472,6 +4925,15 @@ pub static REFUSED: &[(&str, &str)] = &[
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn opencl_notifications_are_guest_callbacks() {
+        for (name, callback) in [("clCreateContext", 3), ("clBuildProgram", 4)] {
+            let abi = SIGNATURES.iter().find(|abi| abi.name == name).unwrap();
+            assert_eq!(abi.callbacks, &[callback]);
+            assert_eq!(abi.types.len(), 7);
+        }
+    }
 
     /// Every signature in the table can actually be called.
     #[test]

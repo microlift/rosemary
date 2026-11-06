@@ -83,6 +83,8 @@ rosemary server --stop         # ask this prefix's server to exit
 | `ROSEMARY_SYSCALL_INTERPOSE` | `0` | (native mode, x86-64 Linux with glibc) Set to `1` to trap the raw `syscall` instructions guest code makes itself, rather than through a libc function, before they reach the host kernel under Darwin's numbering. Uses the kernel's syscall user dispatch (Linux 5.11 or later). A trapped call currently fails with `ENOSYS`. Experimental and off by default: host code that makes raw syscalls outside libc while a guest thread is running can be trapped by mistake, until Rosemary switches the trap off at every guest-to-host boundary. Elsewhere, and in emulated mode, it has no effect. |
 | `ROSEMARY_SYSCALL_TRACE` | unset | (native mode, x86-64 Linux with glibc) The mode for which to trace system calls in. `unknown` logs only unknown syscalls, `all` logs every system call made. |
 | `ROSEMARY_UNBOUND_DETAIL` | `40` | How many unbound imports are named one by one before the rest are only counted. Set to `all` for the whole list. A large application has hundreds, so the default keeps the interesting output - what comes *after* the list - on screen; raise it when a fault at address zero has to be matched against a symbol. |
+| `ROSEMARY_STORE_OUT` | unset | A directory to write what each window shows as binary PPM files, at most once a second per window: `store-<window>.ppm` for a window AppKit draws, `gl-<window>.ppm` for one the program draws with OpenGL, read back just before the swap. For seeing a headless or remote run. |
+| `ROSEMARY_WEAK_DETAIL` | `0` | Name every weak import that nothing satisfied and was left null, with its slot. A program that decides by OS version rather than by testing the symbol dereferences such a slot anyway, and the fault alone does not say which symbol it was. |
 | `ROSEMARY_NO_FOREIGN` | `0` | (macOS only - unsafe) Assume that we have reimplemented every framework this app asks of us, disabling foreign Objective-C support in the reimplementations for a slight performance boost. Assumed to be always on with non-macOS systems, since there are no native Objective C frameworks to conflict with. |
 | `ROSEMARY_STEAM` | `1` | Bridge a guest's Steamworks calls to the host's own Steam client, and publish the Mach service `libsteam_api` asks where Steam is. Set to `0` to turn both off, so that a guest asking for Steam is told there is none. Has no effect unless a generated `steamclient.dylib` exists. |
 | `ROSEMARY_STEAM_CLIENT` | (found) | The generated guest-facing `steamclient.dylib`. Looked for beside the `rosemary` binary, and then in `tools/steamclient/generated/` above it, which is where a checkout leaves it. |
@@ -242,5 +244,11 @@ contexts GL 2.1 with GLSL 1.20, and both list only the extensions a Mac lists
 for that profile and the driver also has. `ROSEMARY_GL_HOST_FEATURES=1` offers
 the driver's own version, extensions and functions instead.
 
-The built-in GLU surface provides `gluOrtho2D` through the driver's `glOrtho`;
-other GLU functions are unbound. No host GLU library is required.
+Built-in GLU provides orthographic, perspective,
+look-at and picking matrices, projection/unprojection, extension-string queries,
+quadrics (spheres, cylinders and full/partial disks), image scaling and 1D/2D
+mipmap construction. The SGI/Mesa algorithms are compiled into Rosemary; GL calls
+use SDL's driver, including pixel-store state for the box-filter image scaler.
+Quadric drawing and matrix operations require a legacy OpenGL context. Other GLU
+functions remain unsupported. No host GLU library is required. Driver capabilities
+still determine available profiles and extensions.

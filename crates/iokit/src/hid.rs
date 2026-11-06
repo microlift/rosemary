@@ -76,6 +76,30 @@ pub struct Element {
     pub source: Source,
 }
 
+impl Element {
+    /// Bits this element occupies in one report: 16 for an axis (packed as
+    /// `i16` by [`Device::input_report`]), 8 for a hat (one byte), 1 for a
+    /// button, 0 for a collection, which carries no value of its own.
+    pub fn report_size_bits(&self) -> u32 {
+        match self.source {
+            Source::Axis(_) | Source::GamepadAxis(_, _) => 16,
+            Source::Hat(_) => 8,
+            Source::Button(_) | Source::GamepadButton(_) => 1,
+            Source::Collection => 0,
+        }
+    }
+
+    /// How many `report_size_bits()`-wide fields this element has in one
+    /// report. Every element here reports a single value rather than an
+    /// array, so this is one wherever there is a value at all.
+    pub fn report_count(&self) -> u32 {
+        match self.source {
+            Source::Collection => 0,
+            _ => 1,
+        }
+    }
+}
+
 /// Axes a HID gamepad reports, in the order SDL numbers them.
 const AXIS_USAGES: &[u32] = &[
     usage::X,
@@ -926,6 +950,44 @@ fn describe_gamepad(reported_buttons: i32) -> Vec<Element> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn element(source: Source) -> Element {
+        Element {
+            cookie: 0,
+            kind: 0,
+            page: 0,
+            usage: 0,
+            logical_min: 0,
+            logical_max: 0,
+            source,
+        }
+    }
+
+    #[test]
+    fn report_size_and_count_match_what_input_report_packs() {
+        // An axis is a little-endian `i16`, a hat one byte, a button one bit -
+        // the exact widths `Device::input_report` writes.
+        assert_eq!(element(Source::Axis(0)).report_size_bits(), 16);
+        assert_eq!(
+            element(Source::GamepadAxis(0, false)).report_size_bits(),
+            16
+        );
+        assert_eq!(element(Source::Hat(0)).report_size_bits(), 8);
+        assert_eq!(element(Source::Button(0)).report_size_bits(), 1);
+        assert_eq!(element(Source::GamepadButton(0)).report_size_bits(), 1);
+        // The root collection has no value, so it has no size and no count.
+        assert_eq!(element(Source::Collection).report_size_bits(), 0);
+        assert_eq!(element(Source::Collection).report_count(), 0);
+        for source in [
+            Source::Axis(0),
+            Source::Button(0),
+            Source::Hat(0),
+            Source::GamepadAxis(0, false),
+            Source::GamepadButton(0),
+        ] {
+            assert_eq!(element(source).report_count(), 1);
+        }
+    }
 
     #[test]
     fn raw_reports_follow_descriptor_numbering_and_stop_on_read_failure() {

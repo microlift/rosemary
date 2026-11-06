@@ -142,6 +142,31 @@ pub unsafe extern "C" fn CVDisplayLinkCreateWithActiveCGDisplays(out: *mut *mut 
     unsafe { CVDisplayLinkCreateWithCGDisplay(0, out) }
 }
 
+/// `CVReturn CVDisplayLinkCreateWithCGDisplays(const CGDirectDisplayID *displayArray,
+/// CFIndex count, CVDisplayLinkRef *displayLinkOut)`.
+///
+/// Also one display link, on this runtime's one window: the period comes from
+/// the first display of the set, and the rest of the work is
+/// [`CVDisplayLinkCreateWithCGDisplay`]'s.
+///
+/// # Safety
+///
+/// `display_array` must be readable for at least `count` `u32`s when `count`
+/// is positive; `out` as [`CVDisplayLinkCreateWithCGDisplay`].
+pub unsafe extern "C" fn CVDisplayLinkCreateWithCGDisplays(
+    display_array: *const u32,
+    count: i64,
+    out: *mut *mut c_void,
+) -> i32 {
+    if display_array.is_null() || count <= 0 {
+        return INVALID_ARGUMENT;
+    }
+    // SAFETY: the caller's array, at least `count` long by the function's own
+    // contract, so its first element is there to read.
+    let display = unsafe { *display_array };
+    unsafe { CVDisplayLinkCreateWithCGDisplay(display, out) }
+}
+
 /// # Safety
 ///
 /// `callback` must be a host-callable function of the display link's prototype -
@@ -308,9 +333,24 @@ pub unsafe extern "C" fn CVDisplayLinkIsRunning(handle: *mut c_void) -> u8 {
     }) as u8
 }
 
-/// One turn of the link: build the two timestamps and call the guest.
+/// `Float64 CVGetHostClockFrequency(void)`.
 ///
-/// `info` is the link's handle, which is how one function serves them all.
+/// The frequency of the clock a `CVGetCurrentHostTime` here would read: the
+/// same nanosecond `CLOCK_MONOTONIC` tick `mach_absolute_time` uses, where
+/// `mach_timebase_info`'s `numer`/`denom` are both one because a tick already
+/// *is* a nanosecond on this host (see `darwin::mach`). A guest dividing that
+/// clock's ticks by this answer gets seconds, which is the only thing either
+/// function promises.
+pub unsafe extern "C" fn CVGetHostClockFrequency() -> f64 {
+    1e9
+}
+
+// The shared CF-backed pixel buffer owns storage, attachments and callbacks.
+pub use pixel_buffer::{
+    CVBufferRelease, CVBufferRetain, CVPixelBufferCreateWithBytes, CVPixelBufferLockBaseAddress,
+    CVPixelBufferRelease, CVPixelBufferUnlockBaseAddress,
+};
+
 unsafe extern "C" fn fire(_timer: *const c_void, info: *mut c_void) {
     let Some(link) = link_for(info) else {
         return;
@@ -353,6 +393,8 @@ exports::exports! {
     functions {
         "CVDisplayLinkCreateWithCGDisplay" => CVDisplayLinkCreateWithCGDisplay,
         "CVDisplayLinkCreateWithActiveCGDisplays" => CVDisplayLinkCreateWithActiveCGDisplays,
+        "CVDisplayLinkCreateWithCGDisplays" => CVDisplayLinkCreateWithCGDisplays,
+        "CVGetHostClockFrequency" => CVGetHostClockFrequency,
         "CVDisplayLinkSetOutputCallback" => CVDisplayLinkSetOutputCallback,
         "CVDisplayLinkSetCurrentCGDisplay" => CVDisplayLinkSetCurrentCGDisplay,
         "CVDisplayLinkSetCurrentCGDisplayFromOpenGLContext" => CVDisplayLinkSetCurrentCGDisplayFromOpenGLContext,
@@ -526,5 +568,51 @@ mod tests {
                 INVALID_ARGUMENT
             );
         }
+    }
+
+    /// `CVDisplayLinkCreateWithCGDisplays` reads the first display of the set
+    /// and otherwise behaves as the single-display spelling.
+    #[test]
+    fn create_with_cg_displays_uses_the_first_display() {
+        let displays = [0u32, 99];
+        let mut handle = std::ptr::null_mut();
+        // SAFETY: a two-element array and a writable slot.
+        unsafe {
+            assert_eq!(
+                CVDisplayLinkCreateWithCGDisplays(displays.as_ptr(), 2, &mut handle),
+                SUCCESS
+            );
+        }
+        assert!(!handle.is_null());
+        // SAFETY: `handle` was just created above.
+        unsafe {
+            assert!(CVDisplayLinkGetActualOutputVideoRefreshPeriod(handle) > 0.0);
+            CVDisplayLinkRelease(handle);
+        }
+    }
+
+    #[test]
+    fn create_with_cg_displays_refuses_a_bad_count_or_null_array() {
+        let mut handle = std::ptr::null_mut();
+        // SAFETY: refused before either pointer is read.
+        unsafe {
+            assert_eq!(
+                CVDisplayLinkCreateWithCGDisplays(std::ptr::null(), 1, &mut handle),
+                INVALID_ARGUMENT
+            );
+            let displays = [0u32];
+            assert_eq!(
+                CVDisplayLinkCreateWithCGDisplays(displays.as_ptr(), 0, &mut handle),
+                INVALID_ARGUMENT
+            );
+        }
+    }
+
+    /// Unity's frame cap and any other caller dividing by this expects a
+    /// nanosecond tick, the same one `mach_absolute_time` reports.
+    #[test]
+    fn host_clock_frequency_is_a_nanosecond_tick() {
+        // SAFETY: no arguments, nothing to read.
+        assert_eq!(unsafe { CVGetHostClockFrequency() }, 1e9);
     }
 }

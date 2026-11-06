@@ -254,6 +254,179 @@ pub(crate) unsafe fn unbox_bytes(value: Id) -> Option<Vec<u8>> {
     unsafe { boxed(value) }.map(|b| b.bytes.clone())
 }
 
+/// The plain C functions `NSGeometry.h` declares, as opposed to `NSValue`'s
+/// boxing above.
+///
+/// Standardized the way [`CGRect`]'s own comparisons are (see
+/// `rosemary::shims::coregraphics::rect_equal`): a rectangle with a negative
+/// width or height is treated as the positive one it describes, which is what
+/// `CGRectContainsRect` and `CGRectIntersectsRect` do and `NSRect`/`CGRect` are
+/// the same layout.
+///
+/// [`CGRect`]: crate::geometry::NSRect
+pub mod cf {
+    #![allow(non_snake_case)]
+
+    use super::{NSRect, NSSize};
+
+    /// `aRect`, with a non-negative size and the origin moved to match.
+    fn standardized(r: NSRect) -> NSRect {
+        let (x, width) = if r.size.width < 0.0 {
+            (r.origin.x + r.size.width, -r.size.width)
+        } else {
+            (r.origin.x, r.size.width)
+        };
+        let (y, height) = if r.size.height < 0.0 {
+            (r.origin.y + r.size.height, -r.size.height)
+        } else {
+            (r.origin.y, r.size.height)
+        };
+        NSRect {
+            origin: super::NSPoint { x, y },
+            size: NSSize { width, height },
+        }
+    }
+
+    /// `BOOL NSEqualSizes(NSSize, NSSize)`.
+    pub unsafe extern "C" fn NSEqualSizes(a: NSSize, b: NSSize) -> u8 {
+        u8::from(a.width == b.width && a.height == b.height)
+    }
+
+    /// `BOOL NSIntersectsRect(NSRect, NSRect)`: whether the two have a
+    /// non-empty intersection. An empty rectangle (standardized width or height
+    /// of zero) intersects nothing, itself included.
+    pub unsafe extern "C" fn NSIntersectsRect(a: NSRect, b: NSRect) -> u8 {
+        let a = standardized(a);
+        let b = standardized(b);
+        if a.size.width <= 0.0
+            || a.size.height <= 0.0
+            || b.size.width <= 0.0
+            || b.size.height <= 0.0
+        {
+            return 0;
+        }
+        let x = a.origin.x < b.origin.x + b.size.width && b.origin.x < a.origin.x + a.size.width;
+        let y = a.origin.y < b.origin.y + b.size.height && b.origin.y < a.origin.y + a.size.height;
+        u8::from(x && y)
+    }
+
+    /// `BOOL NSContainsRect(NSRect aRect, NSRect bRect)`: whether `bRect` lies
+    /// entirely within `aRect`. An empty `bRect` is contained by nothing, which
+    /// is Apple's own documented exception.
+    pub unsafe extern "C" fn NSContainsRect(a: NSRect, b: NSRect) -> u8 {
+        let a = standardized(a);
+        let b = standardized(b);
+        if b.size.width <= 0.0 || b.size.height <= 0.0 {
+            return 0;
+        }
+        u8::from(
+            a.origin.x <= b.origin.x
+                && a.origin.y <= b.origin.y
+                && b.origin.x + b.size.width <= a.origin.x + a.size.width
+                && b.origin.y + b.size.height <= a.origin.y + a.size.height,
+        )
+    }
+
+    // No `table.rs` entries: every entry point here takes or returns an
+    // aggregate by value, which the generic ABI table has no way to name - see
+    // `rosemary::shims::appkit` for the register-level shims that actually
+    // field these calls. This `exports!` only publishes the address a `dlsym`
+    // or the emulated backend's own linker wants.
+    exports::exports! {
+        functions {
+            "NSEqualSizes" => NSEqualSizes,
+            "NSIntersectsRect" => NSIntersectsRect,
+            "NSContainsRect" => NSContainsRect,
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::super::NSPoint;
+        use super::*;
+
+        fn rect(x: f64, y: f64, w: f64, h: f64) -> NSRect {
+            NSRect {
+                origin: NSPoint { x, y },
+                size: NSSize {
+                    width: w,
+                    height: h,
+                },
+            }
+        }
+
+        #[test]
+        fn equal_sizes_compares_both_members() {
+            let a = NSSize {
+                width: 1.0,
+                height: 2.0,
+            };
+            assert_eq!(unsafe { NSEqualSizes(a, a) }, 1);
+            assert_eq!(
+                unsafe {
+                    NSEqualSizes(
+                        a,
+                        NSSize {
+                            width: 1.0,
+                            height: 3.0,
+                        },
+                    )
+                },
+                0
+            );
+        }
+
+        #[test]
+        fn contains_rect_requires_every_edge_inside() {
+            let outer = rect(0.0, 0.0, 10.0, 10.0);
+            assert_eq!(
+                unsafe { NSContainsRect(outer, rect(1.0, 1.0, 5.0, 5.0)) },
+                1
+            );
+            assert_eq!(
+                unsafe { NSContainsRect(outer, rect(1.0, 1.0, 20.0, 5.0)) },
+                0
+            );
+            assert_eq!(
+                unsafe { NSContainsRect(outer, rect(-1.0, 1.0, 5.0, 5.0)) },
+                0
+            );
+        }
+
+        #[test]
+        fn contains_rect_rejects_an_empty_inner_rect() {
+            let outer = rect(0.0, 0.0, 10.0, 10.0);
+            assert_eq!(
+                unsafe { NSContainsRect(outer, rect(1.0, 1.0, 0.0, 5.0)) },
+                0
+            );
+        }
+
+        #[test]
+        fn intersects_rect_is_false_for_disjoint_or_empty_rects() {
+            let a = rect(0.0, 0.0, 10.0, 10.0);
+            assert_eq!(
+                unsafe { NSIntersectsRect(a, rect(5.0, 5.0, 10.0, 10.0)) },
+                1
+            );
+            assert_eq!(
+                unsafe { NSIntersectsRect(a, rect(20.0, 20.0, 10.0, 10.0)) },
+                0
+            );
+            assert_eq!(unsafe { NSIntersectsRect(a, rect(5.0, 5.0, 0.0, 10.0)) }, 0);
+        }
+
+        #[test]
+        fn a_negative_size_is_standardized_first() {
+            // `{origin: (10, 10), size: (-5, -5)}` describes the same square as
+            // `{origin: (5, 5), size: (5, 5)}`.
+            let negative = rect(10.0, 10.0, -5.0, -5.0);
+            let positive = rect(5.0, 5.0, 5.0, 5.0);
+            assert_eq!(unsafe { NSContainsRect(positive, negative) }, 1);
+        }
+    }
+}
+
 pub(crate) fn install() {
     // Register the storage-bearing class before `value::install` adds the
     // pointer-value constructor. A class's size is fixed at registration, so a

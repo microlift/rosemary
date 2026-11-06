@@ -407,6 +407,7 @@ mod tests {
             "dispatch_async",
             "dispatch_semaphore_wait",
             "dispatch_queue_create",
+            "dispatch_source_create",
             // The directory family, denied by name so the host's `struct
             // dirent` never becomes the guest's.
             "readdir",

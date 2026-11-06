@@ -58,8 +58,8 @@ int main(int argc, char **argv) {
     CHECK(dlsym(framework, "gluOrtho2D") == (void *)gluOrtho2D);
     CHECK(dlsym(framework, "glGetString") == (void *)glGetString);
     CHECK(dlsym(framework, "CGLChoosePixelFormat") == (void *)CGLChoosePixelFormat);
-    CHECK(dlsym(framework, "gluPerspective") == NULL);
-    CHECK(dlsym(RTLD_DEFAULT, "gluPerspective") == NULL);
+    CHECK(dlsym(framework, "gluPerspective") == (void *)gluPerspective);
+    CHECK(dlsym(RTLD_DEFAULT, "gluPerspective") == (void *)gluPerspective);
     // GL 4.3, which a Mac's framework does not export.
     CHECK(dlsym(framework, "glDispatchCompute") == NULL);
     CHECK(dlsym(RTLD_DEFAULT, "glDispatchCompute") == NULL);

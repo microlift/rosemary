@@ -201,6 +201,64 @@ fn gcd(mut a: u64, mut b: u64) -> u64 {
     a
 }
 
+/// Convert seconds at the preferred scale, reducing it on overflow and marking rounding.
+pub extern "C" fn CMTimeMakeWithSeconds(seconds: f64, preferred_timescale: i32) -> CMTime {
+    if preferred_timescale <= 0 {
+        return CMTime {
+            value: 0,
+            timescale: 0,
+            flags: 0,
+            epoch: 0,
+        };
+    }
+    if seconds.is_nan() {
+        return CMTime {
+            value: 0,
+            timescale: 0,
+            flags: VALID | INDEFINITE,
+            epoch: 0,
+        };
+    }
+    let infinity = |seconds: f64| CMTime {
+        value: 0,
+        timescale: 0,
+        flags: VALID
+            | if seconds > 0.0 {
+                POSITIVE_INFINITY
+            } else {
+                NEGATIVE_INFINITY
+            },
+        epoch: 0,
+    };
+    if seconds.is_infinite() {
+        return infinity(seconds);
+    }
+    let mut timescale = preferred_timescale;
+    loop {
+        let scaled = seconds * f64::from(timescale);
+        // `i64::MAX as f64` rounds up to 2^63, which is exactly the point
+        // past which the `as i64` cast below would saturate instead of
+        // giving back a value this timescale actually represents.
+        if scaled.abs() < i64::MAX as f64 {
+            let value = scaled.round() as i64;
+            let mut flags = VALID;
+            if value as f64 / f64::from(timescale) != seconds {
+                flags |= HAS_BEEN_ROUNDED;
+            }
+            return CMTime {
+                value,
+                timescale,
+                flags,
+                epoch: 0,
+            };
+        }
+        if timescale == 1 {
+            return infinity(seconds);
+        }
+        timescale = (timescale / 2).max(1);
+    }
+}
+
 pub extern "C" fn CMTimeMake(value: i64, timescale: i32) -> CMTime {
     if timescale <= 0 {
         return CMTime::INVALID;
@@ -232,6 +290,53 @@ pub extern "C" fn CMTimeGetSeconds(time: CMTime) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    /// The ordinary, exact case: no rounding, no overflow.
+    #[test]
+    fn make_with_seconds_is_exact_when_it_can_be() {
+        let time = CMTimeMakeWithSeconds(1.5, 10);
+        assert_eq!(time.value, 15);
+        assert_eq!(time.timescale, 10);
+        assert_eq!(time.flags & VALID, VALID);
+        assert_eq!(time.flags & HAS_BEEN_ROUNDED, 0, "1.5 at /10 is exact");
+        assert_eq!(CMTimeGetSeconds(time), 1.5);
+    }
+
+    /// A timescale that cannot represent the seconds exactly is rounded, and
+    /// marked so.
+    #[test]
+    fn make_with_seconds_marks_rounding() {
+        let time = CMTimeMakeWithSeconds(1.0 / 3.0, 10);
+        assert_eq!(time.value, 3);
+        assert_eq!(time.flags & HAS_BEEN_ROUNDED, HAS_BEEN_ROUNDED);
+    }
+
+    /// `preferredTimescale <= 0` is invalid, per `CMTime.h`'s own discussion.
+    #[test]
+    fn make_with_seconds_rejects_a_non_positive_timescale() {
+        assert_eq!(CMTimeMakeWithSeconds(1.0, 0).flags & VALID, 0);
+        assert_eq!(CMTimeMakeWithSeconds(1.0, -1).flags & VALID, 0);
+    }
+
+    /// An overflowing timescale is halved until it fits, and the result is
+    /// still seconds when it does.
+    #[test]
+    fn make_with_seconds_halves_an_overflowing_timescale() {
+        let time = CMTimeMakeWithSeconds(1e14, 600_000);
+        assert_ne!(time.timescale, 600_000, "the timescale had to give way");
+        assert!(time.timescale >= 1);
+        assert_eq!(time.flags & POSITIVE_INFINITY, 0);
+        assert!((CMTimeGetSeconds(time) - 1e14).abs() / 1e14 < 1e-9);
+    }
+
+    /// Past the point where even a timescale of one overflows, the answer is
+    /// a signed infinity instead of a saturated, wrong number.
+    #[test]
+    fn make_with_seconds_overflow_is_infinity() {
+        let positive = CMTimeMakeWithSeconds(1e300, 1_000_000);
+        assert_eq!(positive.flags & POSITIVE_INFINITY, POSITIVE_INFINITY);
+        let negative = CMTimeMakeWithSeconds(-1e300, 1_000_000);
+        assert_eq!(negative.flags & NEGATIVE_INFINITY, NEGATIVE_INFINITY);
+    }
 
     #[test]
     fn exact_time_math_preserves_order_epoch_and_rejects_overflow() {
@@ -618,6 +723,7 @@ mod tests {
 exports::exports! {
     functions {
         "CMTimeMake" => CMTimeMake,
+        "CMTimeMakeWithSeconds" => CMTimeMakeWithSeconds,
         "CMTimeGetSeconds" => CMTimeGetSeconds,
     }
 }

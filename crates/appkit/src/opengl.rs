@@ -71,6 +71,8 @@ struct Cell {
 /// contention because SDL has no portable sibling-context creation API.
 #[derive(Default)]
 struct Shared {
+    /// Once the guest presents GL content, it owns presentation.
+    presented: bool,
     /// The thread the SDL context itself is current on, while one holds it.
     owner: Option<std::thread::ThreadId>,
     /// Whether another thread is waiting for the holder to give it up.
@@ -692,6 +694,12 @@ unsafe extern "C" fn set_open_gl_context(receiver: Id, _sel: Sel, context: Id) {
 /// only on `-setView:` is nil at the moment it is first used.
 unsafe extern "C" fn set_view(receiver: Id, _sel: Sel, view: Id) {
     let context = context_of(receiver);
+    if gl_debug() {
+        eprintln!(
+            "rosemary: gl: {receiver:p} setView: {view:p} (was {:p})",
+            context.view
+        );
+    }
     objc::arc::release(context.view);
     context.view = objc::arc::retain(view);
 }
@@ -707,29 +715,12 @@ unsafe extern "C" fn clear_drawable(receiver: Id, _sel: Sel) {
     context.view = std::ptr::null_mut();
 }
 
-/// The window a context should draw into: its view's, or - before it has one -
-/// whichever window the program has made.
-///
-/// SDL needs a window to *create* a context against, and AppKit does not. The
-/// window is not part of the context on either side, though: `SDL_GL_MakeCurrent`
-/// takes it again on every call, so binding a context made against one window to
-/// another later is what the API is for rather than a workaround.
-/// The `NSWindow` a context draws into, which is the one its view is in and
-/// otherwise the program's current window.
+/// Only an explicitly attached view supplies a context's drawable.
+/// A context used for offscreen work must not commandeer another application
+/// window. `ensure` uses a hidden holding window until a view is attached.
 fn drawable_window(context: &Context) -> Id {
-    // SAFETY: the view is null or an object this runtime allocated.
-    let window = unsafe { crate::view::window_of(context.view) };
-    // SAFETY: null or a window this crate made.
-    if !unsafe { crate::window::sdl_window(window) }.is_null() {
-        return window;
-    }
-    match crate::window::key_window().is_null() {
-        false => crate::window::key_window(),
-        true => crate::window::all()
-            .last()
-            .copied()
-            .unwrap_or(std::ptr::null_mut()),
-    }
+    // SAFETY: the retained view is null or an object this runtime allocated.
+    unsafe { crate::view::window_of(context.view) }
 }
 
 fn drawable(context: &Context) -> sdl3::Window {
@@ -2041,11 +2032,53 @@ pub fn present_single_buffered() {
     unsafe { flush_buffer(receiver, objc::sel::register(c"flushBuffer")) };
 }
 
+/// An OpenGL view may draw its initial interface through Core Graphics.
+/// Present that opaque backing through the already-current GL context until
+/// the guest begins presenting GL frames. Never steal a drawable from another
+/// thread or use SDL's software surface, which replaces the current context.
+pub(crate) fn present_initial_store(window: sdl3::Window, store: &crate::backing::Store) -> bool {
+    let receiver = CURRENT.get();
+    if receiver.is_null() || sdl3::video::gl_current_window() != window {
+        return false;
+    }
+    let shared = shared_of(context_of(receiver));
+    let state = shared.state.lock().unwrap_or_else(|e| e.into_inner());
+    if state.presented
+        || store
+            .pixels
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .any(|pixel| pixel[3] != 255)
+    {
+        return false;
+    }
+    if !chrome_blit::draw_store(window, store) {
+        return false;
+    }
+    chrome_blit::draw(window);
+    dump_back_buffer(window);
+    sdl3::video::swap_window(window);
+    true
+}
+
 /// `-flushBuffer`: the swap that puts a frame on the screen.
 unsafe extern "C" fn flush_buffer(receiver: Id, _sel: Sel) {
     restore_current_drawable(receiver);
     let window = drawable(context_of(receiver));
+    if gl_debug() {
+        eprintln!(
+            "rosemary: gl: {receiver:p} flushBuffer: view {:p}, window {window:p}, current {:p}",
+            context_of(receiver).view,
+            sdl3::video::gl_current_window()
+        );
+    }
     if !window.is_null() {
+        shared_of(context_of(receiver))
+            .state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .presented = true;
         // A fullscreen resize may happen while the context remains current.
         // Preserve explicit guest viewports; update only an auto-fitted one.
         if CURRENT.get() == receiver && sdl3::video::gl_current_window() == window {
@@ -2059,8 +2092,95 @@ unsafe extern "C" fn flush_buffer(receiver: Id, _sel: Sel) {
         if sdl3::video::gl_current_window() == window {
             chrome_blit::mask_outside_logical_frame(drawable_window(context_of(receiver)), window);
         }
+        if sdl3::video::gl_current_window() == window {
+            dump_back_buffer(window);
+        }
         sdl3::video::swap_window(window);
     }
+}
+
+/// With `ROSEMARY_STORE_OUT` set, write what a GL window is about to show to
+/// `gl-<window>.ppm` there, at most once a second: the backing-store dump
+/// cannot see a window the guest draws with GL itself.
+fn dump_back_buffer(window: sdl3::Window) {
+    use std::sync::Mutex;
+    use std::time::{Duration, Instant};
+    static LAST: Mutex<Vec<(usize, Instant)>> = Mutex::new(Vec::new());
+
+    let Some(directory) = std::env::var_os("ROSEMARY_STORE_OUT") else {
+        return;
+    };
+    {
+        let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());
+        match last.iter_mut().find(|(key, _)| *key == window as usize) {
+            Some((_, at)) if at.elapsed() < Duration::from_secs(1) => return,
+            Some((_, at)) => *at = Instant::now(),
+            None => last.push((window as usize, Instant::now())),
+        }
+    }
+    let Some((width, height)) = sdl3::video::window_size_in_pixels(window) else {
+        return;
+    };
+    if width <= 0 || height <= 0 {
+        return;
+    }
+    let proc = |name: &std::ffi::CStr| sdl3::video::gl_proc_address(name);
+    let (Some(get), Some(bind), Some(read_buffer), Some(store), Some(read)) = (
+        proc(c"glGetIntegerv"),
+        proc(c"glBindFramebuffer"),
+        proc(c"glReadBuffer"),
+        proc(c"glPixelStorei"),
+        proc(c"glReadPixels"),
+    ) else {
+        return;
+    };
+    const READ_FRAMEBUFFER: u32 = 0x8CA8;
+    const READ_FRAMEBUFFER_BINDING: u32 = 0x8CAA;
+    const READ_BUFFER: u32 = 0x0C02;
+    const PACK_ALIGNMENT: u32 = 0x0D05;
+    const PIXEL_PACK_BUFFER: u32 = 0x88EB;
+    const PIXEL_PACK_BUFFER_BINDING: u32 = 0x88ED;
+    const BACK: u32 = 0x0405;
+    let mut pixels = vec![0_u8; width as usize * height as usize * 4];
+    // SAFETY: GL entry points of the current context, called with their C
+    // signatures; the guest's read state is put back as it was.
+    unsafe {
+        let get: unsafe extern "C" fn(u32, *mut i32) = std::mem::transmute(get);
+        let bind: unsafe extern "C" fn(u32, u32) = std::mem::transmute(bind);
+        let read_buffer: unsafe extern "C" fn(u32) = std::mem::transmute(read_buffer);
+        let store: unsafe extern "C" fn(u32, i32) = std::mem::transmute(store);
+        let read: unsafe extern "C" fn(i32, i32, i32, i32, u32, u32, *mut u8) =
+            std::mem::transmute(read);
+        let bind_buffer: Option<unsafe extern "C" fn(u32, u32)> =
+            proc(c"glBindBuffer").map(|f| std::mem::transmute(f));
+        let (mut framebuffer, mut buffer, mut alignment, mut pack) = (0, 0, 4, 0);
+        get(READ_FRAMEBUFFER_BINDING, &mut framebuffer);
+        get(READ_BUFFER, &mut buffer);
+        get(PACK_ALIGNMENT, &mut alignment);
+        get(PIXEL_PACK_BUFFER_BINDING, &mut pack);
+        bind(READ_FRAMEBUFFER, 0);
+        read_buffer(BACK);
+        store(PACK_ALIGNMENT, 1);
+        if let Some(bind_buffer) = bind_buffer {
+            bind_buffer(PIXEL_PACK_BUFFER, 0);
+        }
+        read(0, 0, width, height, 0x1908, 0x1401, pixels.as_mut_ptr()); // RGBA, UNSIGNED_BYTE
+        if let Some(bind_buffer) = bind_buffer {
+            bind_buffer(PIXEL_PACK_BUFFER, pack as u32);
+        }
+        store(PACK_ALIGNMENT, alignment);
+        bind(READ_FRAMEBUFFER, framebuffer as u32);
+        read_buffer(buffer as u32);
+    }
+    let mut out = format!("P6\n{width} {height}\n255\n").into_bytes();
+    // GL's rows run bottom to top.
+    for row in pixels.chunks_exact(width as usize * 4).rev() {
+        for texel in row.as_chunks::<4>().0 {
+            out.extend_from_slice(&texel[..3]);
+        }
+    }
+    let name = format!("gl-{:x}.ppm", window as usize);
+    let _ = std::fs::write(std::path::Path::new(&directory).join(name), out);
 }
 
 #[inline(always)]
@@ -2306,6 +2426,7 @@ mod chrome_blit {
     /// between contexts, so each thread's context has its own.
     struct Cached {
         context: usize,
+        backing: bool,
         texture: u32,
         framebuffer: u32,
         size: (u32, u32),
@@ -2614,7 +2735,16 @@ mod chrome_blit {
                 seal(gl, width, height, top, radius);
             }
             if let Some(chrome) = &chrome {
-                blit(gl, context as usize, chrome, height);
+                blit(
+                    gl,
+                    context as usize,
+                    chrome.width,
+                    chrome.height,
+                    &chrome.pixels,
+                    chrome.generation,
+                    height,
+                    false,
+                );
             }
         }
     }
@@ -2684,7 +2814,44 @@ mod chrome_blit {
         }
     }
 
-    unsafe fn blit(gl: &Gl, context: usize, chrome: &crate::decor::Pixels, window_height: i32) {
+    pub(super) fn draw_store(window: sdl3::Window, store: &crate::backing::Store) -> bool {
+        let context = sdl3::video::gl_current_context();
+        if context.is_null()
+            || sdl3::video::window_size_in_pixels(window)
+                != Some((store.width as i32, store.height as i32))
+        {
+            return false;
+        }
+        static GL: std::sync::OnceLock<Option<Gl>> = std::sync::OnceLock::new();
+        let Some(gl) = GL.get_or_init(Gl::load) else {
+            return false;
+        };
+        // SAFETY: a current context and complete BGRA image retained for the upload.
+        unsafe {
+            blit(
+                gl,
+                context as usize,
+                store.width,
+                store.height,
+                &store.pixels,
+                store.generation(),
+                store.height as i32,
+                true,
+            )
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn blit(
+        gl: &Gl,
+        context: usize,
+        width: u32,
+        height: u32,
+        pixels: &[u8],
+        generation: u64,
+        window_height: i32,
+        backing: bool,
+    ) -> bool {
         let get = |name| {
             let mut value = 0;
             // SAFETY: a single-valued query into a local.
@@ -2707,7 +2874,10 @@ mod chrome_blit {
 
         let ready = CACHED.with(|cached| {
             let mut cached = cached.borrow_mut();
-            let at = match cached.iter().position(|c| c.context == context) {
+            let at = match cached
+                .iter()
+                .position(|c| c.context == context && c.backing == backing)
+            {
                 Some(at) => at,
                 None => {
                     let (mut texture, mut framebuffer) = (0, 0);
@@ -2718,6 +2888,7 @@ mod chrome_blit {
                     }
                     cached.push(Cached {
                         context,
+                        backing,
                         texture,
                         framebuffer,
                         size: (0, 0),
@@ -2732,7 +2903,7 @@ mod chrome_blit {
             unsafe {
                 (gl.BindTexture)(TEXTURE_2D, entry.texture);
                 (gl.BindFramebuffer)(READ_FRAMEBUFFER, entry.framebuffer);
-                if entry.generation != chrome.generation {
+                if entry.generation != generation || entry.size != (width, height) {
                     (gl.BindBuffer)(PIXEL_UNPACK_BUFFER, 0);
                     (gl.PixelStorei)(UNPACK_ALIGNMENT, 4);
                     (gl.PixelStorei)(UNPACK_ROW_LENGTH, 0);
@@ -2744,14 +2915,14 @@ mod chrome_blit {
                         TEXTURE_2D,
                         0,
                         RGBA8,
-                        chrome.width as i32,
-                        chrome.height as i32,
+                        width as i32,
+                        height as i32,
                         0,
                         BGRA,
                         UNSIGNED_BYTE,
-                        chrome.pixels.as_ptr().cast(),
+                        pixels.as_ptr().cast(),
                     );
-                    if entry.size != (chrome.width, chrome.height) {
+                    if entry.size != (width, height) {
                         (gl.FramebufferTexture2D)(
                             READ_FRAMEBUFFER,
                             COLOR_ATTACHMENT0,
@@ -2759,9 +2930,9 @@ mod chrome_blit {
                             entry.texture,
                             0,
                         );
-                        entry.size = (chrome.width, chrome.height);
+                        entry.size = (width, height);
                     }
-                    entry.generation = chrome.generation;
+                    entry.generation = generation;
                 }
                 (gl.CheckFramebufferStatus)(READ_FRAMEBUFFER) == FRAMEBUFFER_COMPLETE
             }
@@ -2773,7 +2944,7 @@ mod chrome_blit {
                 (gl.BindFramebuffer)(DRAW_FRAMEBUFFER, 0);
                 (gl.Disable)(SCISSOR_TEST);
                 (gl.Disable)(FRAMEBUFFER_SRGB);
-                let (width, height) = (chrome.width as i32, chrome.height as i32);
+                let (width, height) = (width as i32, height as i32);
                 // The store's first row is the top; GL's is the bottom, so the
                 // destination runs downwards to flip it.
                 (gl.BlitFramebuffer)(
@@ -2804,6 +2975,7 @@ mod chrome_blit {
             (gl.BindFramebuffer)(READ_FRAMEBUFFER, read as u32);
             (gl.BindFramebuffer)(DRAW_FRAMEBUFFER, draw as u32);
         }
+        ready
     }
     #[cfg(test)]
     mod viewport_tests {
@@ -2855,6 +3027,83 @@ mod tests {
     fn test_context() -> Id {
         crate::bootstrap();
         objc::object::create_instance(objc::class::lookup(c"NSOpenGLContext").unwrap(), 0)
+    }
+
+    #[test]
+    fn an_unattached_context_does_not_claim_an_existing_window() {
+        let receiver = test_context();
+        let window = objc::object::create_instance(objc::class::lookup(c"NSWindow").unwrap(), 0);
+        let rect = NSRect {
+            origin: foundation::geometry::NSPoint { x: 0.0, y: 0.0 },
+            size: foundation::geometry::NSSize {
+                width: 64.0,
+                height: 64.0,
+            },
+        };
+        // SAFETY: fresh AppKit objects owned by this test.
+        unsafe {
+            assert!(crate::window::init_with_content_rect_for_tests(
+                window, rect
+            ));
+            assert!(drawable_window(context_of(receiver)).is_null());
+            let view = objc::object::create_instance(objc::class::lookup(c"NSView").unwrap(), 0);
+            set_view(receiver, objc::sel::get("setView:"), view);
+            assert!(drawable_window(context_of(receiver)).is_null());
+            crate::view::set_window(view, window);
+            assert_eq!(drawable_window(context_of(receiver)), window);
+            clear_drawable(receiver, objc::sel::get("clearDrawable"));
+            assert!(drawable_window(context_of(receiver)).is_null());
+            assert!(!crate::window::draws_with_opengl(
+                crate::window::sdl_window(window)
+            ));
+            crate::view::set_window(view, std::ptr::null_mut());
+            objc::arc::release(view);
+            objc::arc::release(receiver);
+            objc::arc::release(window);
+        }
+    }
+
+    #[test]
+    fn software_backing_reaches_the_gl_framebuffer_and_preserves_unpack_state() {
+        crate::bootstrap();
+        let window = sdl3::video::create_window(
+            c"backing GL test",
+            2,
+            2,
+            sdl3::video::flags::OPENGL | sdl3::video::flags::HIDDEN,
+        )
+        .expect("GL window");
+        let native = sdl3::video::gl_create_context(window).expect("GL context");
+        assert!(sdl3::video::gl_make_current(window, native));
+        let mut store = crate::backing::Store::for_tests(2, 2);
+        store.pixels = vec![
+            0, 0, 255, 255, 0, 0, 255, 255, 255, 0, 0, 255, 255, 0, 0, 255,
+        ];
+        // SAFETY: entry points from the current GL context, with their GL prototypes.
+        unsafe {
+            let pixel_store: unsafe extern "C" fn(u32, i32) =
+                std::mem::transmute(sdl3::video::gl_proc_address(c"glPixelStorei").unwrap());
+            let get: unsafe extern "C" fn(u32, *mut i32) =
+                std::mem::transmute(sdl3::video::gl_proc_address(c"glGetIntegerv").unwrap());
+            let read: unsafe extern "C" fn(i32, i32, i32, i32, u32, u32, *mut c_void) =
+                std::mem::transmute(sdl3::video::gl_proc_address(c"glReadPixels").unwrap());
+            pixel_store(0x0CF2, 7); // GL_UNPACK_ROW_LENGTH
+            assert!(chrome_blit::draw_store(window, &store));
+            let mut row_length = 0;
+            get(0x0CF2, &mut row_length);
+            assert_eq!(row_length, 7);
+            let mut pixels = [0u8; 16];
+            read(0, 0, 2, 2, 0x1908, 0x1401, pixels.as_mut_ptr().cast());
+            assert_eq!(&pixels[..4], &[0, 0, 255, 255]); // GL's bottom row
+            assert_eq!(&pixels[8..12], &[255, 0, 0, 255]);
+            pixel_store(0x0CF2, 0);
+        }
+        assert!(sdl3::video::gl_make_current(
+            std::ptr::null_mut(),
+            std::ptr::null_mut()
+        ));
+        sdl3::video::gl_destroy_context(native);
+        sdl3::video::destroy_window(window);
     }
 
     #[test]

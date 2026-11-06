@@ -303,6 +303,15 @@ pub unsafe extern "C" fn CFGetTypeID(object: CFTypeRef) -> CFTypeID {
     unsafe { crate::base::class_of(object) }.map_or(0, crate::base::type_id_of)
 }
 
+/// `CFAllocatorRef CFGetAllocator(CFTypeRef)`.
+///
+/// As [`CFAllocatorGetDefault`]: every object here was made with the one
+/// allocator this runtime has, whatever `cf` is, so its answer does not
+/// depend on `cf` at all.
+pub unsafe extern "C" fn CFGetAllocator(_cf: CFTypeRef) -> CFAllocatorRef {
+    std::ptr::null()
+}
+
 /// `void CFShow(CFTypeRef)`: the object's description on stderr, or `(null)`.
 pub unsafe extern "C" fn CFShow(object: CFTypeRef) {
     // SAFETY: as `CFCopyDescription`'s caller states.
@@ -825,6 +834,51 @@ pub unsafe extern "C" fn CFStringGetBytes(
     (moved.saturating_sub(prefix) / per_character) as CFIndex
 }
 
+/// `Boolean CFStringGetPascalString(CFStringRef, StringPtr buffer, CFIndex
+/// bufferSize, CFStringEncoding)`: a Pascal string's leading length byte,
+/// followed by that many bytes of text - through [`CFStringGetBytes`] for the
+/// conversion, so the two agree on every encoding. `false`, having written
+/// nothing, when the whole string does not fit in `bufferSize - 1` bytes or
+/// would need more than 255 of them, which is the most a length byte can say.
+///
+/// # Safety
+///
+/// `buffer` is null, or writable for `buffer_size` bytes.
+pub unsafe extern "C" fn CFStringGetPascalString(
+    s: CFTypeRef,
+    buffer: *mut u8,
+    buffer_size: CFIndex,
+    encoding: u32,
+) -> Boolean {
+    if buffer.is_null() || buffer_size < 1 {
+        return 0;
+    }
+    let length = unsafe { CFStringGetLength(s) };
+    let capacity = (buffer_size - 1).min(0xff);
+    let mut used: CFIndex = 0;
+    // SAFETY: `buffer` holds `buffer_size` bytes, so `buffer.add(1)` holds at
+    // least `capacity` of them.
+    let converted = unsafe {
+        CFStringGetBytes(
+            s,
+            0,
+            length,
+            encoding,
+            0,
+            0,
+            buffer.add(1),
+            capacity,
+            &mut used,
+        )
+    };
+    if converted != length || used > 0xff {
+        return 0;
+    }
+    // SAFETY: `buffer_size >= 1`, checked above.
+    unsafe { *buffer = used as u8 };
+    1
+}
+
 /// `CFStringGetBytes` for UTF-8 and the one-byte encodings: the range is in
 /// characters, as every range is, and each is converted whole - a buffer that
 /// runs out, or a character the encoding lacks with no loss byte to stand in,
@@ -1039,6 +1093,28 @@ pub unsafe extern "C" fn CFStringCreateMutableCopy(
         return std::ptr::null();
     };
     string::new_mutable_copy(s)
+}
+
+/// `CFMutableStringRef CFStringCreateMutableWithExternalCharactersNoCopy(
+/// CFAllocatorRef alloc, UniChar *chars, CFIndex numChars, CFIndex
+/// capacityMaxLength, CFAllocatorRef externalCharactersAllocator)`.
+///
+/// The two allocators and `capacityMaxLength` are unused - see
+/// [`string::new_mutable_with_external_characters`] for why that matters only
+/// to a caller that keeps reading `chars` after mutating the string.
+///
+/// # Safety
+///
+/// `chars` must be null (with `num_chars` zero) or point at `num_chars` live
+/// `UniChar`s.
+pub unsafe extern "C" fn CFStringCreateMutableWithExternalCharactersNoCopy(
+    _allocator: CFAllocatorRef,
+    chars: *const u16,
+    num_chars: CFIndex,
+    _capacity_max_length: CFIndex,
+    _external_characters_allocator: CFAllocatorRef,
+) -> CFTypeRef {
+    unsafe { string::new_mutable_with_external_characters(chars, num_chars) }
 }
 
 /// Add to a mutable string in the representation it already has.
@@ -1543,6 +1619,194 @@ pub unsafe extern "C" fn CFStringCompareWithOptions(
     }
 }
 
+/// `CFRange CFStringFind(CFStringRef theString, CFStringRef stringToFind,
+/// CFStringCompareFlags compareOptions)`.
+///
+/// `CFRange` is sixteen bytes of two `CFIndex`, which SysV AMD64 returns in
+/// `rax`/`rdx` - see `rosemary::shims::cfstring`, which is what actually fields
+/// a guest's call to this: the generic ABI table has no way to name a struct
+/// return, so this entry point only serves `dlsym` and the emulated backend's
+/// own linker.
+pub unsafe extern "C" fn CFStringFind(
+    searched: CFTypeRef,
+    needle: CFTypeRef,
+    options: u64,
+) -> CFRange {
+    // SAFETY: live strings or null.
+    let Some(searched) = (unsafe { string::as_string(searched) }) else {
+        return CFRange {
+            location: 0,
+            length: 0,
+        };
+    };
+    let length = searched.length();
+    let mut result = CFRange {
+        location: 0,
+        length: 0,
+    };
+    let found = unsafe {
+        CFStringFindWithOptions(
+            searched as *const _ as CFTypeRef,
+            needle,
+            0,
+            length,
+            options,
+            &mut result,
+        )
+    };
+    match found {
+        0 => CFRange {
+            location: NOT_FOUND,
+            length: 0,
+        },
+        _ => result,
+    }
+}
+
+/// `NSNotFound`/`kCFNotFound`'s value: `NSIntegerMax`.
+const NOT_FOUND: CFIndex = isize::MAX;
+
+/// `CFRange CFStringGetRangeOfComposedCharactersAtIndex(CFStringRef, CFIndex)`:
+/// the grapheme cluster containing `index`, widened from it to cover every
+/// following UTF-16 low surrogate and combining mark.
+///
+/// FIXME (ACCURACY): this covers surrogate pairs and Unicode combining marks
+/// (general categories Mn, Mc, Me), which is every composed character a BMP-era
+/// app actually produces. It does not extend over a ZWJ emoji sequence or a
+/// regional-indicator flag pair, each of which Apple's own grapheme-cluster
+/// algorithm also treats as one composed character.
+///
+/// See [`CFStringFind`] for why this returns through
+/// `rosemary::shims::cfstring` rather than this entry point directly.
+pub unsafe extern "C" fn CFStringGetRangeOfComposedCharactersAtIndex(
+    string: CFTypeRef,
+    index: CFIndex,
+) -> CFRange {
+    let Some(s) = (unsafe { string::as_string(string) }) else {
+        return CFRange {
+            location: 0,
+            length: 0,
+        };
+    };
+    let units = s.utf16();
+    let len = units.len();
+    if index < 0 || index as usize >= len {
+        return CFRange {
+            location: index.max(0),
+            length: 0,
+        };
+    }
+    let mut start = index as usize;
+    // A low surrogate's cluster starts at the high surrogate before it.
+    if (0xDC00..=0xDFFF).contains(&units[start])
+        && start > 0
+        && (0xD800..=0xDBFF).contains(&units[start - 1])
+    {
+        start -= 1;
+    }
+    let mut end = start + 1;
+    // A high surrogate's cluster includes its low surrogate.
+    if (0xD800..=0xDBFF).contains(&units[start])
+        && end < len
+        && (0xDC00..=0xDFFF).contains(&units[end])
+    {
+        end += 1;
+    }
+    // Every combining mark that follows extends the same cluster.
+    while end < len {
+        let Some(c) = char::decode_utf16(units[end..].iter().copied())
+            .next()
+            .and_then(|r| r.ok())
+        else {
+            break;
+        };
+        if !crate::unicode::is_combining_mark(c) {
+            break;
+        }
+        end += c.len_utf16();
+    }
+    CFRange {
+        location: start as CFIndex,
+        length: (end - start) as CFIndex,
+    }
+}
+
+/// `CFArrayRef CFStringCreateArrayBySeparatingStrings(CFAllocatorRef,
+/// CFStringRef, CFStringRef separatorString)`: every piece between consecutive,
+/// non-overlapping occurrences of the separator, empty pieces included - the
+/// same shape `-componentsSeparatedByString:` splits a string into.
+pub unsafe extern "C" fn CFStringCreateArrayBySeparatingStrings(
+    _allocator: CFAllocatorRef,
+    string: CFTypeRef,
+    separator: CFTypeRef,
+) -> CFTypeRef {
+    let (Some(s), Some(sep)) = (unsafe { string::as_string(string) }, unsafe {
+        string::as_string(separator)
+    }) else {
+        return std::ptr::null();
+    };
+    let haystack = s.utf16();
+    let needle = sep.utf16();
+    let mut pieces: Vec<Vec<u16>> = Vec::new();
+    if needle.is_empty() {
+        pieces.push(haystack);
+    } else {
+        let mut rest = haystack.as_slice();
+        loop {
+            match rest
+                .windows(needle.len())
+                .position(|window| window == needle.as_slice())
+            {
+                Some(at) => {
+                    pieces.push(rest[..at].to_vec());
+                    rest = &rest[at + needle.len()..];
+                }
+                None => {
+                    pieces.push(rest.to_vec());
+                    break;
+                }
+            }
+        }
+    }
+    let values: Vec<CFTypeRef> = pieces
+        .iter()
+        .map(|units| string::from_utf16(units))
+        .collect();
+    let array = collections::new_array(&values, Policy::from_type_callbacks(), false);
+    for value in values {
+        // SAFETY: a string this call made and the array has retained.
+        unsafe { CFRelease(value) };
+    }
+    array
+}
+
+/// `CFStringRef CFStringCreateByCombiningStrings(CFAllocatorRef, CFArrayRef
+/// theArray, CFStringRef separatorString)`: the reverse of
+/// [`CFStringCreateArrayBySeparatingStrings`] - every element's text, joined
+/// by the separator. A non-string element contributes nothing, the same way a
+/// nil element would crash `-componentsJoinedByString:` rather than have a
+/// defined answer to match.
+pub unsafe extern "C" fn CFStringCreateByCombiningStrings(
+    _allocator: CFAllocatorRef,
+    array: CFTypeRef,
+    separator: CFTypeRef,
+) -> CFTypeRef {
+    let Some(a) = (unsafe { collections::array(array) }) else {
+        return std::ptr::null();
+    };
+    let sep = unsafe { string::as_string(separator) }.map_or(Vec::new(), |s| s.utf16());
+    let mut units: Vec<u16> = Vec::new();
+    for (at, value) in a.values.iter().enumerate() {
+        if at > 0 {
+            units.extend_from_slice(&sep);
+        }
+        if let Some(piece) = unsafe { string::as_string(*value) } {
+            units.extend(piece.utf16());
+        }
+    }
+    string::from_utf16(&units)
+}
+
 //
 
 use crate::callbacks::{KeyCallBacks, Policy, ValueCallBacks};
@@ -1772,6 +2036,37 @@ pub unsafe extern "C" fn CFSetApplyFunction(
     }
 }
 
+/// `CFMutableSetRef CFSetCreateMutable(CFAllocatorRef, CFIndex capacity,
+/// const CFSetCallBacks *)`. The capacity is a hint, as [`CFArrayCreateMutable`]'s
+/// is, and `CFSetCallBacks` is laid out exactly as [`KeyCallBacks`] - see
+/// `corefoundation::lib::data_symbols`'s note on `kCFTypeSetCallBacks`.
+///
+/// # Safety
+///
+/// `callbacks` is null or a live `CFSetCallBacks`.
+pub unsafe extern "C" fn CFSetCreateMutable(
+    _allocator: CFAllocatorRef,
+    _capacity: CFIndex,
+    callbacks: *const KeyCallBacks,
+) -> CFTypeRef {
+    // SAFETY: null, or a live callbacks structure.
+    collections::new_set(&[], unsafe { Policy::from_key(callbacks) }, true)
+}
+
+/// `void CFSetAddValue(CFMutableSetRef, const void *value)`: keeps the set's
+/// contents unique under its own equality callback, as `-[NSMutableSet
+/// addObject:]` does - see `foundation::collections::set_add_object`, which
+/// this mirrors at the CF layer.
+pub unsafe extern "C" fn CFSetAddValue(set: CFTypeRef, value: CFTypeRef) {
+    let Some(set) = (unsafe { collections::set(set) }) else {
+        return;
+    };
+    if !set.mutable {
+        return;
+    }
+    set.insert(value);
+}
+
 //
 
 pub unsafe extern "C" fn CFDictionaryGetTypeID() -> CFTypeID {
@@ -1919,6 +2214,17 @@ pub unsafe extern "C" fn CFDictionaryGetValueIfPresent(
 
 pub unsafe extern "C" fn CFDictionaryContainsKey(dictionary: CFTypeRef, key: CFTypeRef) -> Boolean {
     unsafe { collections::dictionary(dictionary) }.is_some_and(|d| d.get(key).is_some()) as Boolean
+}
+
+/// `Boolean CFDictionaryContainsValue(CFDictionaryRef, const void *value)`:
+/// whether any entry's value equals `value` under the dictionary's own value
+/// callback - a linear scan, as Apple's own is documented to be.
+pub unsafe extern "C" fn CFDictionaryContainsValue(
+    dictionary: CFTypeRef,
+    value: CFTypeRef,
+) -> Boolean {
+    unsafe { collections::dictionary(dictionary) }
+        .is_some_and(|d| d.entries().iter().any(|(_, v)| d.values.equal(*v, value))) as Boolean
 }
 
 /// `CFDictionaryGetKeysAndValues`: both sides, in one pass, into the caller's
@@ -2241,28 +2547,64 @@ pub unsafe extern "C" fn CFStringConvertWindowsCodepageToEncoding(codepage: u32)
         .map_or(INVALID_ENCODING, |(_, _, encoding)| *encoding)
 }
 
-/// `CFStringEncoding CFStringConvertIANACharSetNameToEncoding(CFStringRef)`.
+/// The encoding IANA's charset `name` means, matched the way
+/// [`CFStringConvertIANACharSetNameToEncoding`] matches a `CFStringRef`'s
+/// text - factored out so a caller with a plain `&str` (a Pascal string
+/// decoded elsewhere, say) does not have to build a `CFString` just to ask.
 ///
 /// Names compare without regard to case, as charset names do.
-pub unsafe extern "C" fn CFStringConvertIANACharSetNameToEncoding(name: CFTypeRef) -> u32 {
-    let Some(name) = (unsafe { string::as_string(name) }) else {
-        return INVALID_ENCODING;
-    };
-    let name = String::from_utf8_lossy(&name.utf8()).to_ascii_lowercase();
+pub fn encoding_for_charset_name(name: &str) -> Option<u32> {
+    let name = name.to_ascii_lowercase();
     let name = match name.as_str() {
         "utf8" => "utf-8",
         "ascii" => "us-ascii",
         "latin1" | "iso_8859-1" => "iso-8859-1",
         "cp1252" => "windows-1252",
         "sjis" | "x-sjis" => "shift_jis",
-        "utf-16" => return string::encoding::UTF16,
-        "utf-32" => return string::encoding::UTF32,
+        "utf-16" => return Some(string::encoding::UTF16),
+        "utf-32" => return Some(string::encoding::UTF32),
         other => other,
     };
     NAMED_ENCODINGS
         .iter()
         .find(|(_, iana, _)| *iana == name)
-        .map_or(INVALID_ENCODING, |(_, _, encoding)| *encoding)
+        .map(|(_, _, encoding)| *encoding)
+}
+
+/// `CFStringEncoding CFStringConvertIANACharSetNameToEncoding(CFStringRef)`.
+pub unsafe extern "C" fn CFStringConvertIANACharSetNameToEncoding(name: CFTypeRef) -> u32 {
+    let Some(name) = (unsafe { string::as_string(name) }) else {
+        return INVALID_ENCODING;
+    };
+    let name = String::from_utf8_lossy(&name.utf8()).into_owned();
+    encoding_for_charset_name(&name).unwrap_or(INVALID_ENCODING)
+}
+
+/// `CFStringEncoding CFStringConvertNSStringEncodingToEncoding(unsigned long
+/// nsEncoding)`.
+///
+/// `NSStringEncoding` numbers its encodings separately from
+/// `CFStringEncoding`; this is the table Apple's own conversion uses.
+/// `foundation::string::cf_encoding` carries its own copy of the same
+/// numbers - `corefoundation` cannot depend on `foundation` to share this one,
+/// and that copy answers UTF-8 for anything unrecognized rather than this
+/// function's documented [`INVALID_ENCODING`], which suits Foundation's own
+/// decoding calls better than it would suit a guest asking this directly.
+pub unsafe extern "C" fn CFStringConvertNSStringEncodingToEncoding(ns: u64) -> u32 {
+    match ns {
+        1 => string::encoding::ASCII,
+        4 => string::encoding::UTF8,
+        5 => string::encoding::ISO_LATIN_1,
+        10 => string::encoding::UTF16,
+        12 => string::encoding::WINDOWS_LATIN1,
+        30 => string::encoding::MAC_ROMAN,
+        0x9000_0100 => string::encoding::UTF16_BE,
+        0x9400_0100 => string::encoding::UTF16_LE,
+        0x8c00_0100 => string::encoding::UTF32,
+        0x9800_0100 => string::encoding::UTF32_BE,
+        0x9c00_0100 => string::encoding::UTF32_LE,
+        _ => INVALID_ENCODING,
+    }
 }
 
 /// `Boolean CFArrayContainsValue(CFArrayRef, CFRange, const void *)`, with the
@@ -3211,6 +3553,21 @@ pub unsafe extern "C" fn CFRunLoopSourceCreate(
     leak(runloop::new_source(context.perform, context.info as usize))
 }
 
+/// `CFRunLoopSourceRef CFMachPortCreateRunLoopSource(CFAllocatorRef,
+/// CFMachPortRef port, CFIndex order)`.
+///
+/// FIXME (ACCURACY): this runtime has no Mach, so - exactly as
+/// `iokit::registry::IONotificationPortGetRunLoopSource`'s source is - the one
+/// this returns has nothing behind it: `port` is never dereferenced, and no
+/// message for it ever arrives to signal the source.
+pub unsafe extern "C" fn CFMachPortCreateRunLoopSource(
+    _allocator: CFAllocatorRef,
+    _port: CFTypeRef,
+    _order: CFIndex,
+) -> CFTypeRef {
+    leak(runloop::new_source(None, 0))
+}
+
 /// `CFRunLoopObserverRef CFRunLoopObserverCreate(CFAllocatorRef,
 /// CFOptionFlags activities, Boolean repeats, CFIndex order,
 /// CFRunLoopObserverCallBack, CFRunLoopObserverContext *)`
@@ -3718,6 +4075,20 @@ pub unsafe extern "C" fn CFArrayCreateCopy(
     collections::new_array(&a.values.clone(), a.policy, false)
 }
 
+/// `CFMutableArrayRef CFArrayCreateMutableCopy(CFAllocatorRef, CFIndex
+/// capacity, CFArrayRef)`, whose capacity is a hint the same way
+/// [`CFArrayCreateMutable`]'s is.
+pub unsafe extern "C" fn CFArrayCreateMutableCopy(
+    _allocator: CFAllocatorRef,
+    _capacity: CFIndex,
+    array: CFTypeRef,
+) -> CFTypeRef {
+    let Some(a) = (unsafe { collections::array(array) }) else {
+        return std::ptr::null();
+    };
+    collections::new_array(&a.values.clone(), a.policy, true)
+}
+
 pub unsafe extern "C" fn CFArrayInsertValueAtIndex(
     array: CFTypeRef,
     index: CFIndex,
@@ -4152,6 +4523,229 @@ mod tests {
     fn a_non_data_has_no_bytes() {
         // SAFETY: null is the documented "not an object" case.
         assert!(unsafe { CFDataGetBytePtr(std::ptr::null()) }.is_null());
+    }
+
+    #[test]
+    fn set_create_mutable_add_value_and_dictionary_contains_value() {
+        // SAFETY: plain calls over objects this crate made.
+        unsafe {
+            let set = CFSetCreateMutable(std::ptr::null(), 0, std::ptr::null());
+            let a = string::from_bytes(b"a", false);
+            let b = string::from_bytes(b"b", false);
+            CFSetAddValue(set, a);
+            CFSetAddValue(set, a); // a duplicate add changes nothing
+            CFSetAddValue(set, b);
+            assert_eq!(CFSetGetCount(set), 2);
+            CFRelease(set);
+            CFRelease(a);
+            CFRelease(b);
+
+            // Null callbacks mean pointer equality - Apple's own documented
+            // behavior for `CFDictionaryCreate` - so the "found" probe below
+            // has to be the very value that went in, not merely one equal to
+            // it.
+            let keys = [string::from_bytes(b"k".as_slice(), false)];
+            let values = [string::from_bytes(b"v".as_slice(), false)];
+            let dict = CFDictionaryCreate(
+                std::ptr::null(),
+                keys.as_ptr(),
+                values.as_ptr(),
+                1,
+                std::ptr::null(),
+                std::ptr::null(),
+            );
+            assert_eq!(CFDictionaryContainsValue(dict, values[0]), 1);
+            let other = string::from_bytes(b"v", false);
+            assert_eq!(CFDictionaryContainsValue(dict, other), 0);
+            CFRelease(dict);
+            CFRelease(keys[0]);
+            CFRelease(values[0]);
+            CFRelease(other);
+        }
+    }
+
+    #[test]
+    fn an_immutable_set_refuses_cf_set_add_value() {
+        // SAFETY: plain calls.
+        unsafe {
+            let set = collections::new_set(&[], Policy::from_type_callbacks(), false);
+            let a = string::from_bytes(b"a", false);
+            CFSetAddValue(set, a);
+            assert_eq!(
+                CFSetGetCount(set),
+                0,
+                "CFSetAddValue must not mutate an immutable set"
+            );
+            CFRelease(set);
+            CFRelease(a);
+        }
+    }
+
+    #[test]
+    fn string_find_locates_a_substring_by_utf16_unit() {
+        // SAFETY: plain calls over fresh strings.
+        unsafe {
+            let haystack = string::from_bytes(b"hello world", false);
+            let needle = string::from_bytes(b"world", false);
+            let range = CFStringFind(haystack, needle, 0);
+            assert_eq!(range.location, 6);
+            assert_eq!(range.length, 5);
+
+            let missing = string::from_bytes(b"xyz", false);
+            let not_found = CFStringFind(haystack, missing, 0);
+            assert_eq!(not_found.location, NOT_FOUND);
+            CFRelease(haystack);
+            CFRelease(needle);
+            CFRelease(missing);
+        }
+    }
+
+    #[test]
+    fn range_of_composed_characters_widens_over_a_combining_mark() {
+        // SAFETY: a fresh string; "e" followed by U+0301 COMBINING ACUTE ACCENT.
+        unsafe {
+            let text = string::from_utf16(&[u16::from(b'e'), 0x0301]);
+            let range = CFStringGetRangeOfComposedCharactersAtIndex(text, 0);
+            assert_eq!(range.location, 0);
+            assert_eq!(range.length, 2);
+            CFRelease(text);
+        }
+    }
+
+    #[test]
+    fn create_array_by_separating_strings_keeps_empty_pieces() {
+        // SAFETY: plain calls.
+        unsafe {
+            let text = string::from_bytes(b"a,,b", false);
+            let comma = string::from_bytes(b",", false);
+            let array = CFStringCreateArrayBySeparatingStrings(std::ptr::null(), text, comma);
+            assert_eq!(collections::array(array).unwrap().values.len(), 3);
+            CFRelease(text);
+            CFRelease(comma);
+            CFRelease(array);
+        }
+    }
+
+    #[test]
+    fn normalize_composes_a_combining_mark_under_nfc() {
+        // SAFETY: a fresh mutable string.
+        unsafe {
+            let text = string::new_mutable();
+            string::set_utf16(text, &[u16::from(b'e'), 0x0301]);
+            // `kCFStringNormalizationFormC` is 2.
+            CFStringNormalize(text, 2);
+            let normalized = string::as_string(text).unwrap().utf16();
+            assert_eq!(normalized, [0x00e9], "e + U+0301 composes to U+00E9 (é)");
+            CFRelease(text);
+        }
+    }
+
+    #[test]
+    fn mutable_string_with_external_characters_aliases_the_buffer() {
+        // SAFETY: `buffer` outlives every read below.
+        unsafe {
+            let buffer = [u16::from(b'h'), u16::from(b'i')];
+            let text = CFStringCreateMutableWithExternalCharactersNoCopy(
+                std::ptr::null(),
+                buffer.as_ptr(),
+                2,
+                0,
+                std::ptr::null(),
+            );
+            assert_eq!(CFStringGetLength(text), 2);
+            assert!(string::is_mutable(text));
+            CFRelease(text);
+        }
+    }
+
+    #[test]
+    fn every_object_answers_the_one_allocator_this_runtime_has() {
+        // SAFETY: a fresh string, and the null allocator is a valid argument.
+        unsafe {
+            let text = string::from_bytes(b"hi", false);
+            assert!(CFGetAllocator(text).is_null());
+            assert!(CFGetAllocator(std::ptr::null()).is_null());
+            CFRelease(text);
+        }
+    }
+
+    #[test]
+    fn a_mutable_copy_of_an_array_grows_on_its_own() {
+        // SAFETY: plain calls on objects this test made.
+        unsafe {
+            let value = string::from_bytes(b"x", false);
+            let original = CFArrayCreate(std::ptr::null(), &value, 1, std::ptr::null());
+            let copy = CFArrayCreateMutableCopy(std::ptr::null(), 0, original);
+            assert_eq!(CFArrayGetCount(copy), 1);
+            CFArrayAppendValue(copy, value);
+            assert_eq!(CFArrayGetCount(copy), 2, "the copy is mutable");
+            assert_eq!(CFArrayGetCount(original), 1, "the original is untouched");
+            CFRelease(value);
+            CFRelease(original);
+            CFRelease(copy);
+        }
+    }
+
+    #[test]
+    fn combining_strings_undoes_separating_them() {
+        // SAFETY: plain calls.
+        unsafe {
+            let text = string::from_bytes(b"a,,b", false);
+            let comma = string::from_bytes(b",", false);
+            let array = CFStringCreateArrayBySeparatingStrings(std::ptr::null(), text, comma);
+            let joined = CFStringCreateByCombiningStrings(std::ptr::null(), array, comma);
+            assert_eq!(string::as_string(joined).unwrap().utf8(), b"a,,b");
+            CFRelease(text);
+            CFRelease(comma);
+            CFRelease(array);
+            CFRelease(joined);
+        }
+    }
+
+    #[test]
+    fn pascal_string_reads_back_its_length_byte_and_text() {
+        // SAFETY: `buffer` covers every write below.
+        unsafe {
+            let text = string::from_bytes(b"hi", false);
+            let mut buffer = [0u8; 8];
+            assert_eq!(
+                CFStringGetPascalString(
+                    text,
+                    buffer.as_mut_ptr(),
+                    buffer.len() as CFIndex,
+                    string::encoding::UTF8,
+                ),
+                1
+            );
+            assert_eq!(buffer[0], 2);
+            assert_eq!(&buffer[1..3], b"hi");
+            // Too small even for the length byte and one character.
+            let mut tiny = [0u8; 1];
+            assert_eq!(
+                CFStringGetPascalString(text, tiny.as_mut_ptr(), 1, string::encoding::UTF8),
+                0
+            );
+            CFRelease(text);
+        }
+    }
+
+    #[test]
+    fn ns_string_encoding_converts_the_common_cases_and_refuses_the_rest() {
+        // SAFETY: plain calls, no objects involved.
+        unsafe {
+            assert_eq!(
+                CFStringConvertNSStringEncodingToEncoding(4),
+                string::encoding::UTF8
+            );
+            assert_eq!(
+                CFStringConvertNSStringEncodingToEncoding(1),
+                string::encoding::ASCII
+            );
+            assert_eq!(
+                CFStringConvertNSStringEncodingToEncoding(0xffff),
+                INVALID_ENCODING
+            );
+        }
     }
 }
 

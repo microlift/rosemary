@@ -2397,6 +2397,10 @@ unsafe fn hit(view: Id, point: NSPoint, depth: usize) -> Id {
 /// The inherited `NSView` hit-test behavior, without redispatching an override
 /// on `view`. This distinction matters when that override calls `super`.
 unsafe fn hit_base(view: Id, point: NSPoint, depth: usize) -> Id {
+    // AppKit's `-hitTest:` ignores a hidden view and everything under it.
+    if view_of(view).hidden != 0 {
+        return std::ptr::null_mut();
+    }
     let frame = view_of(view).frame;
     let superview = view_of(view).superview;
     if !crate::geometry::mouse_in_rect(point, frame, is_flipped(superview)) {
@@ -3250,6 +3254,11 @@ fn detach_from_superview(receiver: Id) {
     if let Some(array) = unsafe { corefoundation::collections::array(list as *const c_void) } {
         let before = array.values.len();
         array.values.retain(|v| *v != receiver as *const c_void);
+        if array.values.len() < before {
+            // AppKit's removed view lives until the pool drains, and programs
+            // message it right after removing it: hide it, re-add it.
+            objc::arc::autorelease(objc::arc::retain(receiver));
+        }
         // The list retained the view once per `-addSubview:`, which now moves
         // out of a single entry at most; last, as it may free the receiver.
         for _ in array.values.len()..before {
@@ -3290,6 +3299,7 @@ unsafe extern "C" fn dealloc(receiver: Id, _sel: Sel) {
     unsafe { crate::layer::set_view(layer, std::ptr::null_mut()) };
     objc::arc::release(layer);
     crate::cursor::discard_rects(receiver);
+    discard_tool_tips(receiver);
     objc::arc::finalize(receiver);
 }
 
@@ -3327,6 +3337,83 @@ unsafe extern "C" fn remove_tracking_area(receiver: Id, _sel: Sel, area: Id) {
     if let Some(array) = unsafe { corefoundation::collections::array(list as *const c_void) } {
         array.values.retain(|v| *v != area as *const c_void);
     }
+}
+
+/// One `-addToolTipRect:owner:userData:`, kept until removed, replaced by
+/// nothing - there is no "replaced" here, each call adds another - or the
+/// view that added it is freed.
+///
+/// Nothing here shows a tooltip, since nothing here tracks the pointer idly
+/// enough to decide when one would appear; a program's own read of
+/// `-view:stringForToolTip:point:userData:` is not something this runtime
+/// calls. The bookkeeping is kept anyway because a program that calls
+/// `-removeToolTip:` with the tag `-addToolTipRect:...` gave it expects that
+/// tag to mean something, and because a tag outliving the view it was added
+/// to would be a leak with no `-dealloc` to end it.
+/// `rect`, `owner` and `data` are not read back by anything yet - nothing
+/// here decides when to show a tooltip, so nothing consults where one would
+/// apply or who answers its string - but they are kept, not dropped, because
+/// showing one is the only reason `-addToolTipRect:owner:userData:` exists
+/// and a future implementation of that should not have to re-plumb them in.
+#[allow(dead_code)]
+struct ToolTip {
+    view: usize,
+    tag: isize,
+    rect: NSRect,
+    /// Weak: Apple's docs say "the view maintains a weak reference to
+    /// owner", so this is a raw address, not a retained reference.
+    owner: usize,
+    /// `userData`, kept as an address rather than the pointer itself so this
+    /// table stays `Sync`; nothing here ever dereferences it.
+    data: usize,
+}
+
+static TOOL_TIPS: std::sync::Mutex<Vec<ToolTip>> = std::sync::Mutex::new(Vec::new());
+static NEXT_TOOL_TIP_TAG: std::sync::atomic::AtomicIsize = std::sync::atomic::AtomicIsize::new(1);
+
+/// `-addToolTipRect:owner:userData:`.
+unsafe extern "C" fn add_tool_tip(
+    receiver: Id,
+    _sel: Sel,
+    rect: NSRect,
+    owner: Id,
+    data: *mut c_void,
+) -> isize {
+    let tag = NEXT_TOOL_TIP_TAG.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    TOOL_TIPS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .push(ToolTip {
+            view: receiver as usize,
+            tag,
+            rect,
+            owner: owner as usize,
+            data: data as usize,
+        });
+    tag
+}
+
+/// `-removeToolTip:`, the tag `-addToolTipRect:owner:userData:` answered.
+unsafe extern "C" fn remove_tool_tip(receiver: Id, _sel: Sel, tag: isize) {
+    TOOL_TIPS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .retain(|tip| !(tip.view == receiver as usize && tip.tag == tag));
+}
+
+unsafe extern "C" fn remove_all_tool_tips(receiver: Id, _sel: Sel) {
+    TOOL_TIPS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .retain(|tip| tip.view != receiver as usize);
+}
+
+/// Drop a dying view's own tooltips, from `-dealloc`.
+fn discard_tool_tips(view: Id) {
+    TOOL_TIPS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .retain(|tip| tip.view != view as usize);
 }
 
 /// `-addTrackingRect:owner:userData:assumeInside:`, the API tracking areas
@@ -3439,6 +3526,10 @@ pub(crate) fn is_default_accepts_first_responder(imp: objc::class::Imp) -> bool 
 /// view with no `-drawRect:` of its own draws nothing, which is what an empty
 /// view does.
 unsafe extern "C" fn display(receiver: Id, _sel: Sel) {
+    crate::backing::display_view(receiver);
+}
+
+unsafe extern "C" fn display_rect(receiver: Id, _sel: Sel, _rect: NSRect) {
     crate::backing::display_view(receiver);
 }
 
@@ -3625,6 +3716,14 @@ pub(crate) fn install() {
         "isHiddenOrHasHiddenAncestor" => is_hidden_or_has_hidden_ancestor_method, c"c16@0:8";
         "display" => display, c"v16@0:8";
         "displayIfNeeded" => display, c"v16@0:8";
+        // Opacity only decides which ancestor starts drawing; this tree always
+        // redraws the view itself.
+        "displayIgnoringOpacity" => display, c"v16@0:8";
+        "displayIfNeededIgnoringOpacity" => display, c"v16@0:8";
+        // FIXME (ACCURACY): the whole view is redrawn, not only the rectangle.
+        "displayRect:" => display_rect, c"v48@0:8{CGRect={CGPoint=dd}{CGSize=dd}}16";
+        "displayRectIgnoringOpacity:" => display_rect, c"v48@0:8{CGRect={CGPoint=dd}{CGSize=dd}}16";
+        "displayIfNeededInRect:" => display_rect, c"v48@0:8{CGRect={CGPoint=dd}{CGSize=dd}}16";
         "drawRect:" => draw_rect, c"v48@0:8{CGRect={CGPoint=dd}{CGSize=dd}}16";
         "setNeedsDisplay:" => set_needs_display, c"v20@0:8c16";
         "setNeedsDisplay" => mark_needs_display, c"v16@0:8";
@@ -3662,6 +3761,10 @@ pub(crate) fn install() {
         "addTrackingRect:owner:userData:assumeInside:" => add_tracking_rect,
             c"q68@0:8{CGRect={CGPoint=dd}{CGSize=dd}}16@48^v56c64";
         "removeTrackingRect:" => remove_tracking_rect, c"v24@0:8q16";
+        "addToolTipRect:owner:userData:" => add_tool_tip,
+            c"q64@0:8{CGRect={CGPoint=dd}{CGSize=dd}}16@48^v56";
+        "removeToolTip:" => remove_tool_tip, c"v24@0:8q16";
+        "removeAllToolTips" => remove_all_tool_tips, c"v16@0:8";
         "animator" => animator, c"@16@0:8";
         "setPostsFrameChangedNotifications:" => set_posts_frame_changed, c"v20@0:8c16";
         "setPostsBoundsChangedNotifications:" => set_posts_bounds_changed, c"v20@0:8c16";
@@ -3749,6 +3852,55 @@ mod tests {
         objc::arc::release(superview);
     }
 
+    /// `-addToolTipRect:owner:userData:` hands back a tag `-removeToolTip:`
+    /// and `-removeAllToolTips` can act on, each view's own and no other's.
+    #[test]
+    fn tool_tip_tags_are_removed_one_at_a_time_or_all_at_once() {
+        let a = view(rect(0.0, 0.0, 10.0, 10.0));
+        let b = view(rect(0.0, 0.0, 10.0, 10.0));
+        let add = objc::sel::get("addToolTipRect:owner:userData:");
+        // SAFETY: each call is `-addToolTipRect:owner:userData:`'s own
+        // prototype, with an owner that need not be a real object - it is
+        // kept only as an address, never sent to.
+        let (first, second, _third) = unsafe {
+            (
+                add_tool_tip(a, add, rect(0.0, 0.0, 1.0, 1.0), a, std::ptr::null_mut()),
+                add_tool_tip(a, add, rect(1.0, 0.0, 1.0, 1.0), a, std::ptr::null_mut()),
+                add_tool_tip(b, add, rect(0.0, 0.0, 1.0, 1.0), b, std::ptr::null_mut()),
+            )
+        };
+        assert_ne!(first, second);
+        let count_for = |which: Id| {
+            TOOL_TIPS
+                .lock()
+                .expect("no panic")
+                .iter()
+                .filter(|tip| tip.view == which as usize)
+                .count()
+        };
+        assert_eq!(count_for(a), 2);
+        assert_eq!(count_for(b), 1);
+
+        // SAFETY: `-removeToolTip:` is `void (id, SEL, NSInteger)`.
+        unsafe { remove_tool_tip(a, objc::sel::get("removeToolTip:"), first) };
+        assert_eq!(count_for(a), 1);
+        assert_eq!(count_for(b), 1, "b's tag is untouched by a's removal");
+
+        // SAFETY: `-removeAllToolTips` is `void (id, SEL)`.
+        unsafe { remove_all_tool_tips(a, objc::sel::get("removeAllToolTips")) };
+        assert_eq!(count_for(a), 0);
+        assert_eq!(count_for(b), 1, "b keeps its own tooltip");
+
+        objc::arc::release(a);
+        objc::arc::release(b);
+        assert_eq!(count_for(a), 0);
+        assert_eq!(
+            count_for(b),
+            0,
+            "-dealloc discards what -removeAllToolTips missed"
+        );
+    }
+
     #[test]
     fn a_freed_superview_leaves_its_retained_subview_detached() {
         let (superview, subview) = tree(rect(0.0, 0.0, 10.0, 10.0), rect(0.0, 0.0, 5.0, 5.0), 0);
@@ -3795,11 +3947,14 @@ mod tests {
     fn moving_a_subview_takes_it_out_of_its_old_superview() {
         let (first, subview) = tree(rect(0.0, 0.0, 10.0, 10.0), rect(0.0, 0.0, 5.0, 5.0), 0);
         let second = view(rect(0.0, 0.0, 10.0, 10.0));
+        let pool = objc::arc::pool_push();
         // SAFETY: `-addSubview:` is `void (id, SEL, id)`.
         unsafe { add_subview(second, objc::sel::get("addSubview:"), subview) };
         assert_eq!(view_of(subview).superview, second);
         assert!(children(first).is_empty());
         assert_eq!(children(second), vec![subview]);
+        // Removal keeps the view alive until the current autorelease pool drains.
+        objc::arc::pool_pop(pool);
         assert_eq!(objc::arc::retain_count(subview), 2);
     }
 
@@ -4030,6 +4185,37 @@ mod tests {
         };
         set_frame_of(superview, rect(0.0, 0.0, 200.0, 200.0));
         assert_eq!(view_of(subview).frame, rect(0.0, 0.0, 100.0, 100.0));
+    }
+
+    #[test]
+    fn a_removed_view_lives_until_the_pool_drains() {
+        let (_superview, subview) = tree(rect(0.0, 0.0, 10.0, 10.0), rect(0.0, 0.0, 5.0, 5.0), 0);
+        let pool = objc::arc::pool_push();
+        // SAFETY: a live view; the tree's only reference is the superview's.
+        unsafe {
+            objc::arc::release(subview);
+            remove_from_superview(subview, objc::sel::get("removeFromSuperview"));
+            // Still a view: the removal's release waits for the pool.
+            set_hidden(subview, objc::sel::get("setHidden:"), 1);
+            assert_ne!(view_of(subview).hidden, 0);
+        }
+        objc::arc::pool_pop(pool);
+    }
+
+    #[test]
+    fn a_hidden_subview_is_not_hit() {
+        let (superview, top) = tree(
+            rect(0.0, 0.0, 100.0, 100.0),
+            rect(0.0, 0.0, 100.0, 100.0),
+            0,
+        );
+        let point = NSPoint { x: 5.0, y: 5.0 };
+        // SAFETY: live views; `-setHidden:` is `void (id, SEL, BOOL)`.
+        unsafe {
+            assert_eq!(hit_test(superview, point), top);
+            set_hidden(top, objc::sel::get("setHidden:"), 1);
+            assert_eq!(hit_test(superview, point), superview);
+        }
     }
 
     static OVERRIDE_RAN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);

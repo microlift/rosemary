@@ -5,6 +5,48 @@ use crate::define::{class_methods, methods};
 
 static SHARED: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
 
+/// The negative AppKit traits request removal rather than describing a face.
+unsafe extern "C" fn convert_font_to_have_trait(
+    _receiver: Id,
+    _sel: Sel,
+    font: Id,
+    traits: usize,
+) -> Id {
+    const SUPPORTED: usize = 1 | 2 | 4 | 0x400 | 0x1000000;
+    if traits & !SUPPORTED != 0 || traits == 0 || font.is_null() {
+        return font;
+    }
+    let mut mask = (traits & 3) as u32;
+    let mut value = mask;
+    if traits & 0x400 != 0 {
+        mask |= 1 << 10;
+        value |= 1 << 10;
+    }
+    if traits & 4 != 0 {
+        mask |= 2;
+        value &= !2;
+    }
+    if traits & 0x1000000 != 0 {
+        mask |= 1;
+        value &= !1;
+    }
+    // SAFETY: NSFont is the Core Text font, and size zero preserves its size.
+    let converted = unsafe {
+        coretext::CTFontCreateCopyWithSymbolicTraits(font as _, 0.0, std::ptr::null(), value, mask)
+    };
+    if converted.is_null() {
+        font
+    } else {
+        // Core Text may find a nearest face for traits it cannot satisfy.
+        if unsafe { coretext::CTFontGetSymbolicTraits(converted) } & mask != value {
+            unsafe { corefoundation::api::CFRelease(converted) };
+            return font;
+        }
+        // SAFETY: the copy is a new owned font.
+        unsafe { autorelease(converted) }
+    }
+}
+
 /// `+[NSFontManager sharedFontManager]`.
 unsafe extern "C" fn shared_font_manager(class: Id, _sel: Sel) -> Id {
     *SHARED.get_or_init(|| {
@@ -166,6 +208,18 @@ unsafe extern "C" fn tool_tips_font_of_size(_class: Id, _sel: Sel, size: f64) ->
     ui_font(size, 11.0)
 }
 
+/// `+titleBarFontOfSize:` and `+paletteFontOfSize:`, a window's and a utility
+/// panel's title.
+// FIXME (ACCURACY): macOS answers the emphasized (bold) system font for both;
+// this answers the regular one, like `+boldSystemFontOfSize:` here.
+unsafe extern "C" fn title_bar_font_of_size(_class: Id, _sel: Sel, size: f64) -> Id {
+    ui_font(size, 13.0)
+}
+
+unsafe extern "C" fn palette_font_of_size(_class: Id, _sel: Sel, size: f64) -> Id {
+    ui_font(size, 11.0)
+}
+
 /// `-[NSFont fontDescriptor]`. A font here is its own attribute dictionary,
 /// which is what a `CTFontDescriptor` is too.
 unsafe extern "C" fn font_descriptor(receiver: Id, _sel: Sel) -> Id {
@@ -176,6 +230,21 @@ unsafe extern "C" fn font_descriptor(receiver: Id, _sel: Sel) -> Id {
 unsafe extern "C" fn symbolic_traits(receiver: Id, _sel: Sel) -> u32 {
     // SAFETY: a font or descriptor dictionary this runtime made.
     unsafe { coretext::CTFontGetSymbolicTraits(receiver as *const _) }
+}
+
+/// `-[NSFontDescriptor fontDescriptorWithDesign:]`.
+unsafe extern "C" fn font_descriptor_with_design(receiver: Id, _sel: Sel, design: Id) -> Id {
+    if design.is_null() {
+        return std::ptr::null_mut();
+    }
+    // SAFETY: `design` is an NSString, by this selector's declared type.
+    let bytes = unsafe { foundation::string::bytes(design) };
+    let Ok(text) = std::str::from_utf8(&bytes) else {
+        return std::ptr::null_mut();
+    };
+    let result = coretext::font_descriptor_with_design(receiver as *const _, text);
+    // SAFETY: null, or an object this call just produced a reference to.
+    unsafe { autorelease(result as *const _) }
 }
 
 /// `-[NSFontManager availableFontFamilies]`: every family the face database
@@ -382,6 +451,10 @@ pub(crate) fn install() {
     methods!(dictionary, {
         "familyName" => font_family_name, c"@16@0:8";
         "fontName" => font_name, c"@16@0:8";
+        // `-[NSFontDescriptor postscriptName]`; a descriptor here is the same
+        // dictionary a font is.
+        "postscriptName" => font_name, c"@16@0:8";
+        "fontAttributes" => font_descriptor, c"@16@0:8";
         "displayName" => font_family_name, c"@16@0:8";
         "pointSize" => font_point_size, c"d16@0:8";
         "ascender" => ascender, c"d16@0:8";
@@ -395,6 +468,7 @@ pub(crate) fn install() {
         "fontDescriptorByAddingAttributes:" => descriptor_adding, c"@24@0:8@16";
         "fontDescriptor" => font_descriptor, c"@16@0:8";
         "symbolicTraits" => symbolic_traits, c"I16@0:8";
+        "fontDescriptorWithDesign:" => font_descriptor_with_design, c"@24@0:8@16";
     });
 
     let class = objc::class::lookup(c"NSFont").expect("declared before its methods");
@@ -416,6 +490,8 @@ pub(crate) fn install() {
         "controlContentFontOfSize:" => control_content_font_of_size, c"@24@0:8d16";
         "menuBarFontOfSize:" => menu_bar_font_of_size, c"@24@0:8d16";
         "toolTipsFontOfSize:" => tool_tips_font_of_size, c"@24@0:8d16";
+        "titleBarFontOfSize:" => title_bar_font_of_size, c"@24@0:8d16";
+        "paletteFontOfSize:" => palette_font_of_size, c"@24@0:8d16";
     });
 
     let descriptor = objc::class::lookup(c"NSFontDescriptor").expect("declared before its methods");
@@ -428,6 +504,7 @@ pub(crate) fn install() {
         "sharedFontManager" => shared_font_manager, c"@16@0:8";
     });
     methods!(class, {
+        "convertFont:toHaveTrait:" => convert_font_to_have_trait, c"@32@0:8@16Q24";
         "localizedNameForFamily:face:" => localized_name, c"@32@0:8@16@24";
         "setFontMenu:" => set_font_menu, c"v24@0:8@16";
         "fontMenu:" => font_menu, c"@20@0:8c16";
@@ -453,6 +530,39 @@ unsafe extern "C" fn set_selected_font(receiver: Id, _sel: Sel, font: Id, multip
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn font_conversion_adds_and_removes_bold_without_changing_size() {
+        crate::bootstrap();
+        let faces = crate::fonts::all_faces();
+        let regular = faces
+            .iter()
+            .find(|face| {
+                !face.italic
+                    && face.weight == 400
+                    && faces.iter().any(|other| {
+                        other.family == face.family && !other.italic && other.weight >= 600
+                    })
+            })
+            .expect("a family with regular and bold faces");
+        let name = foundation::string::from_str(&regular.postscript);
+        // SAFETY: live font objects and the registered selector's arguments.
+        unsafe {
+            let pool = objc::arc::pool_push();
+            let font = font_with_name(std::ptr::null_mut(), std::ptr::null(), name, 17.0);
+            let bold = convert_font_to_have_trait(std::ptr::null_mut(), std::ptr::null(), font, 2);
+            assert_ne!(coretext::CTFontGetSymbolicTraits(bold as _) & 2, 0);
+            assert_eq!(coretext::CTFontGetSize(bold as _), 17.0);
+            let plain = convert_font_to_have_trait(std::ptr::null_mut(), std::ptr::null(), bold, 4);
+            assert_eq!(coretext::CTFontGetSymbolicTraits(plain as _) & 2, 0);
+            assert_eq!(
+                convert_font_to_have_trait(std::ptr::null_mut(), std::ptr::null(), font, 0x8000),
+                font
+            );
+            objc::arc::pool_pop(pool);
+        }
+        objc::arc::release(name);
+    }
 
     #[test]
     fn shared_font_manager_is_stable() {

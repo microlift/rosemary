@@ -64,6 +64,10 @@ fn read_lock(record: &Record, try_only: bool) -> i32 {
     loop {
         let seen = record.u32(STATE).load(Ordering::Relaxed);
         if seen & WRITE_LOCKED != 0 {
+            // Darwin checks the owner before it looks at `try_only`.
+            if record.u64(WRITER).load(Ordering::Relaxed) == super::id() as u64 {
+                return err::EDEADLK;
+            }
             if try_only {
                 return err::EBUSY;
             }
@@ -90,10 +94,7 @@ fn write_lock(record: &Record, try_only: bool) -> i32 {
         let seen = record.u32(STATE).load(Ordering::Relaxed);
         if seen != 0 {
             if seen & WRITE_LOCKED != 0 && record.u64(WRITER).load(Ordering::Relaxed) == self_id {
-                return match try_only {
-                    true => err::EBUSY,
-                    false => err::EDEADLK,
-                };
+                return err::EDEADLK;
             }
             if try_only {
                 return err::EBUSY;
@@ -350,6 +351,22 @@ mod tests {
             assert_eq!(rwlock_destroy(lock.at()), err::EBUSY, "still held");
             assert_eq!(rwlock_unlock(lock.at()), 0);
             assert_eq!(rwlock_destroy(lock.at()), 0);
+        }
+    }
+
+    /// Darwin refuses any lock, tried or not, from the thread holding the write
+    /// lock rather than letting it deadlock against itself.
+    #[test]
+    fn a_writer_asking_to_read_is_told_it_would_deadlock() {
+        let lock = RwLock::statically_initialised(object::sig::RWLOCK_INIT);
+        unsafe {
+            assert_eq!(rwlock_wrlock(lock.at()), 0);
+            assert_eq!(rwlock_rdlock(lock.at()), err::EDEADLK);
+            assert_eq!(rwlock_tryrdlock(lock.at()), err::EDEADLK);
+            assert_eq!(rwlock_trywrlock(lock.at()), err::EDEADLK);
+            assert_eq!(rwlock_unlock(lock.at()), 0);
+            assert_eq!(rwlock_rdlock(lock.at()), 0);
+            assert_eq!(rwlock_unlock(lock.at()), 0);
         }
     }
 }

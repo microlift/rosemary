@@ -18,6 +18,11 @@ mod profile;
 
 use names::Library;
 
+/// Load the same driver used by SDL contexts and built-in GLU callbacks.
+pub fn load_library() -> bool {
+    driver::open()
+}
+
 /// The paths a guest names the framework by: the install names an
 /// `LC_LOAD_DYLIB` records, and the spellings a `dlopen` uses.
 pub const INSTALL_PATHS: &[&str] = &[

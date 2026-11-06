@@ -17,6 +17,41 @@ struct ColorSpace {
 /// `CGDataProviderReleaseDataCallback`.
 type ReleaseData = Option<unsafe extern "C" fn(*mut c_void, *const c_void, usize)>;
 
+/// `CGDataProviderGetBytePointerCallback`.
+type GetBytePointer = Option<unsafe extern "C" fn(*mut c_void) -> *const c_void>;
+/// `CGDataProviderReleaseBytePointerCallback`.
+type ReleaseBytePointer = Option<unsafe extern "C" fn(*mut c_void, *const c_void)>;
+/// `CGDataProviderGetBytesAtPositionCallback`: `off_t` is 64-bit on both
+/// architectures.
+type GetBytesAtPosition =
+    Option<unsafe extern "C" fn(*mut c_void, *mut c_void, i64, usize) -> usize>;
+/// `CGDataProviderReleaseInfoCallback`.
+type ReleaseInfo = Option<unsafe extern "C" fn(*mut c_void)>;
+
+/// `CGDataProviderDirectCallbacks`: part of the guest-facing ABI, laid out
+/// exactly as the real struct a caller fills in and passes by pointer.
+#[repr(C)]
+pub struct DirectCallbacks {
+    pub _version: u32,
+    pub get_byte_pointer: GetBytePointer,
+    pub release_byte_pointer: ReleaseBytePointer,
+    pub get_bytes_at_position: GetBytesAtPosition,
+    pub release_info: ReleaseInfo,
+}
+
+/// What a direct provider's dealloc calls beyond freeing the object itself -
+/// set only for one `CGDataProviderCreateDirect` made, never for
+/// [`CGDataProviderCreateWithData`]'s.
+struct DirectRelease {
+    release_byte_pointer: ReleaseBytePointer,
+    release_info: ReleaseInfo,
+    /// Whether `DataProvider::data` is this module's own copy (made when the
+    /// caller gave only `getBytesAtPosition`) rather than the pointer
+    /// `getBytePointer` handed back - the first is freed as a `Box<[u8]>`,
+    /// the second through `release_byte_pointer`.
+    owned_copy: bool,
+}
+
 #[repr(C)]
 struct DataProvider {
     isa: *const c_void,
@@ -24,6 +59,7 @@ struct DataProvider {
     data: *const u8,
     size: usize,
     release: ReleaseData,
+    direct: Option<DirectRelease>,
 }
 
 /// A `CGImage` over the bytes of a data provider, which it retains.
@@ -90,8 +126,30 @@ unsafe extern "C" fn provider_dealloc(receiver: objc::object::Id, _sel: objc::se
     // SAFETY: `-dealloc` of a `__CGDataProvider`, whose body is `DataProvider`.
     unsafe {
         let provider = &mut *(receiver as *mut DataProvider);
-        if let Some(release) = provider.release.take() {
-            release(provider.info, provider.data.cast(), provider.size);
+        match provider.direct.take() {
+            Some(direct) => {
+                if direct.owned_copy {
+                    if !provider.data.is_null() {
+                        // SAFETY: `CGDataProviderCreateDirect` leaked exactly
+                        // this many bytes into `data` for this `owned_copy`.
+                        let bytes: *mut [u8] = std::ptr::slice_from_raw_parts_mut(
+                            provider.data as *mut u8,
+                            provider.size,
+                        );
+                        drop(Box::from_raw(bytes));
+                    }
+                } else if let Some(release_byte_pointer) = direct.release_byte_pointer {
+                    release_byte_pointer(provider.info, provider.data.cast());
+                }
+                if let Some(release_info) = direct.release_info {
+                    release_info(provider.info);
+                }
+            }
+            None => {
+                if let Some(release) = provider.release.take() {
+                    release(provider.info, provider.data.cast(), provider.size);
+                }
+            }
         }
         objc::arc::finalize(receiver);
     }
@@ -210,19 +268,107 @@ pub unsafe extern "C" fn CGImageSourceCreateImageAtIndex(
     {
         return std::ptr::null();
     }
-    // SAFETY: checked above to be an `ImageSource` with a retained CFData.
+    // SAFETY: checked above to be an `ImageSource` with a retained source.
     let data = unsafe { (*(source as *const ImageSource)).data };
-    let length = unsafe { corefoundation::api::CFDataGetLength(data) };
-    let Ok(length) = usize::try_from(length) else {
-        return std::ptr::null();
-    };
-    let bytes = unsafe { corefoundation::api::CFDataGetBytePtr(data) };
-    if bytes.is_null() {
+    source_bytes(data)
+        .and_then(crate::raster::decode)
+        .map_or(std::ptr::null(), image_from_bitmap)
+}
+
+/// Makes an ImageIO source over an already-decoded data provider, such as a
+/// `CGDataProvider` a guest built from its own in-memory bytes.
+pub unsafe extern "C" fn CGImageSourceCreateWithDataProvider(
+    provider: CFTypeRef,
+    _options: CFTypeRef,
+) -> CFTypeRef {
+    if provider_bytes(provider).is_none() {
         return std::ptr::null();
     }
+    let class = objc::class::lookup(c"__CGImageSource").expect("installed during bootstrap");
+    // SAFETY: `ImageSource` is the registered class layout and `provider` was
+    // checked above to be one of this runtime's data providers.
+    let source = unsafe { corefoundation::base::allocate::<ImageSource>(class) };
+    unsafe {
+        (*source).data = corefoundation::api::CFRetain(provider);
+    }
+    source as CFTypeRef
+}
+
+/// The encoded bytes behind a source, whether it was made over a `CFData` or
+/// a `CGDataProvider`.
+fn source_bytes(data: CFTypeRef) -> Option<&'static [u8]> {
+    if let Some(bytes) = provider_bytes(data) {
+        return Some(bytes);
+    }
+    let bytes = unsafe { corefoundation::api::CFDataGetBytePtr(data) };
+    if bytes.is_null() {
+        return None;
+    }
+    let length = unsafe { corefoundation::api::CFDataGetLength(data) };
+    let length = usize::try_from(length).ok()?;
     // SAFETY: the CFData owns at least `length` readable bytes.
-    let encoded = unsafe { std::slice::from_raw_parts(bytes, length) };
-    crate::raster::decode(encoded).map_or(std::ptr::null(), image_from_bitmap)
+    Some(unsafe { std::slice::from_raw_parts(bytes, length) })
+}
+
+/// `CFDictionaryRef CGImageSourceCopyPropertiesAtIndex(CGImageSourceRef,
+/// size_t, CFDictionaryRef)`.
+///
+/// FIXME (ACCURACY): decoding does not keep the source format's metadata, so
+/// `HasAlpha` reports whether the decoded buffer has a transparent pixel
+/// rather than the format's alpha capability, and `Orientation` is always
+/// "up" because EXIF orientation is not parsed.
+pub unsafe extern "C" fn CGImageSourceCopyPropertiesAtIndex(
+    source: CFTypeRef,
+    index: usize,
+    _options: CFTypeRef,
+) -> CFTypeRef {
+    let class = objc::class::lookup(c"__CGImageSource").expect("installed during bootstrap");
+    // SAFETY: null or an object supplied by the guest.
+    if index != 0 || source.is_null() || !unsafe { corefoundation::base::is_kind_of(source, class) }
+    {
+        return std::ptr::null();
+    }
+    // SAFETY: checked above to be an `ImageSource`.
+    let data = unsafe { (*(source as *const ImageSource)).data };
+    let Some(bitmap) = source_bytes(data).and_then(crate::raster::decode) else {
+        return std::ptr::null();
+    };
+    let has_alpha = bitmap.pixels.as_chunks::<4>().0.iter().any(|p| p[3] != 255);
+    let width = corefoundation::collections::new_number(
+        corefoundation::collections::Number::Integer(bitmap.width.into()),
+    );
+    let height = corefoundation::collections::new_number(
+        corefoundation::collections::Number::Integer(bitmap.height.into()),
+    );
+    let orientation =
+        corefoundation::collections::new_number(corefoundation::collections::Number::Integer(1));
+    let properties = corefoundation::collections::new_dictionary(
+        &[
+            (property_key("PixelWidth"), width),
+            (property_key("PixelHeight"), height),
+            (
+                property_key("HasAlpha"),
+                corefoundation::collections::boolean(has_alpha),
+            ),
+            (property_key("Orientation"), orientation),
+        ],
+        corefoundation::callbacks::Policy::from_type_callbacks(),
+        corefoundation::callbacks::Policy::from_type_callbacks(),
+        false,
+    );
+    // SAFETY: fresh numbers this call made; `new_dictionary` retained its own.
+    unsafe {
+        corefoundation::api::CFRelease(width);
+        corefoundation::api::CFRelease(height);
+        corefoundation::api::CFRelease(orientation);
+    }
+    properties
+}
+
+/// The canonical, immortal `kCGImageProperty...` key named `name`, matching
+/// the one published as a data symbol in `crate::STRING_GLOBALS`.
+fn property_key(name: &'static str) -> CFTypeRef {
+    corefoundation::base::interned_name(name) as usize as CFTypeRef
 }
 
 /// The bytes a data provider of this runtime's serves, or `None` for anything
@@ -259,6 +405,66 @@ pub unsafe extern "C" fn CGDataProviderCreateWithData(
         (*provider).data = data.cast();
         (*provider).size = size;
         (*provider).release = release;
+        (*provider).direct = None;
+    }
+    provider as CFTypeRef
+}
+
+/// `CGDataProviderRef CGDataProviderCreateDirect(void *info, off_t size,
+/// const CGDataProviderDirectCallbacks *callbacks)`.
+///
+/// Read once, right here, through whichever callback the caller gave:
+/// `getBytePointer`, if present, kept live until release as its own contract
+/// allows - or else `getBytesAtPosition`, copied into a buffer this module
+/// owns. Either way the result is an ordinary [`DataProvider`] every other
+/// consumer in this file already knows how to read, through [`provider_bytes`].
+///
+/// # Safety
+///
+/// `callbacks` is null or points at a live `CGDataProviderDirectCallbacks`,
+/// and its callbacks, when present, are valid to call with `info`.
+pub unsafe extern "C" fn CGDataProviderCreateDirect(
+    info: *mut c_void,
+    size: i64,
+    callbacks: *const DirectCallbacks,
+) -> CFTypeRef {
+    if callbacks.is_null() || size < 0 {
+        return std::ptr::null();
+    }
+    let size = size as usize;
+    // SAFETY: checked non-null above; the rest is the caller's obligation.
+    let callbacks = unsafe { &*callbacks };
+    let (data, owned_copy) = if let Some(get_byte_pointer) = callbacks.get_byte_pointer {
+        // SAFETY: a guest-supplied callback, called with the `info` it gave.
+        let pointer = unsafe { get_byte_pointer(info) }.cast::<u8>();
+        if pointer.is_null() {
+            return std::ptr::null();
+        }
+        (pointer, false)
+    } else if let Some(get_bytes_at_position) = callbacks.get_bytes_at_position {
+        // Zero-filled already, so a short copy leaves an honest tail rather
+        // than whatever the allocator's memory used to hold.
+        let mut buffer = vec![0u8; size].into_boxed_slice();
+        // SAFETY: `buffer` covers `size` bytes, which is what is asked for.
+        unsafe { get_bytes_at_position(info, buffer.as_mut_ptr().cast(), 0, size) };
+        (Box::into_raw(buffer) as *const u8, true)
+    } else {
+        return std::ptr::null();
+    };
+    let class = objc::class::lookup(c"__CGDataProvider").expect("installed during bootstrap");
+    // SAFETY: `DataProvider` is the registered class layout.
+    let provider = unsafe { corefoundation::base::allocate::<DataProvider>(class) };
+    // SAFETY: a fresh allocation; `data` covers `size` bytes either way above.
+    unsafe {
+        (*provider).info = info;
+        (*provider).data = data;
+        (*provider).size = size;
+        (*provider).release = None;
+        (*provider).direct = Some(DirectRelease {
+            release_byte_pointer: callbacks.release_byte_pointer,
+            release_info: callbacks.release_info,
+            owned_copy,
+        });
     }
     provider as CFTypeRef
 }
@@ -783,6 +989,13 @@ pub unsafe extern "C" fn CGColorSpaceRelease(space: CFTypeRef) {
     }
 }
 
+pub unsafe extern "C" fn CGColorSpaceRetain(space: CFTypeRef) -> CFTypeRef {
+    if space.is_null() {
+        return space;
+    }
+    unsafe { corefoundation::api::CFRetain(space) }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -817,6 +1030,52 @@ mod tests {
             assert_eq!((CGImageGetWidth(image), CGImageGetHeight(image)), (1, 1));
             assert!(!CGImageGetColorSpace(image).is_null());
             CGImageRelease(image);
+            corefoundation::api::CFRelease(source);
+        }
+    }
+
+    #[test]
+    fn a_source_over_a_data_provider_reports_its_properties() {
+        crate::bootstrap();
+        // The same one-pixel, opaque BMP as above, reached through a data
+        // provider rather than a `CFData`.
+        let mut bmp = [0u8; 58];
+        bmp[0..2].copy_from_slice(b"BM");
+        bmp[2..6].copy_from_slice(&58u32.to_le_bytes());
+        bmp[10..14].copy_from_slice(&54u32.to_le_bytes());
+        bmp[14..18].copy_from_slice(&40u32.to_le_bytes());
+        bmp[18..22].copy_from_slice(&1u32.to_le_bytes());
+        bmp[22..26].copy_from_slice(&1u32.to_le_bytes());
+        bmp[26..28].copy_from_slice(&1u16.to_le_bytes());
+        bmp[28..30].copy_from_slice(&24u16.to_le_bytes());
+        bmp[54..58].copy_from_slice(&[0, 0, 255, 0]);
+        // SAFETY: every object remains live until its matching release.
+        unsafe {
+            let provider = CGDataProviderCreateWithData(
+                std::ptr::null_mut(),
+                bmp.as_ptr().cast(),
+                bmp.len(),
+                None,
+            );
+            let source = CGImageSourceCreateWithDataProvider(provider, std::ptr::null());
+            CGDataProviderRelease(provider);
+            assert!(!source.is_null());
+            let properties = CGImageSourceCopyPropertiesAtIndex(source, 0, std::ptr::null());
+            assert!(!properties.is_null());
+            let number_at = |key: &'static str| -> i64 {
+                let value =
+                    corefoundation::api::CFDictionaryGetValue(properties, property_key(key));
+                let mut out = 0i64;
+                corefoundation::api::CFNumberGetValue(
+                    value,
+                    corefoundation::collections::number_type::SINT64,
+                    (&raw mut out).cast(),
+                );
+                out
+            };
+            assert_eq!(number_at("PixelWidth"), 1);
+            assert_eq!(number_at("PixelHeight"), 1);
+            corefoundation::api::CFRelease(properties);
             corefoundation::api::CFRelease(source);
         }
     }
@@ -862,6 +1121,95 @@ mod tests {
             assert_eq!(RELEASED.load(std::sync::atomic::Ordering::SeqCst), 0);
             CGImageRelease(copy);
             assert_eq!(RELEASED.load(std::sync::atomic::Ordering::SeqCst), 8);
+        }
+    }
+
+    #[test]
+    fn direct_provider_reads_through_get_byte_pointer() {
+        crate::bootstrap();
+        static BYTES: [u8; 4] = [1, 2, 3, 4];
+        static BYTE_POINTER_RELEASED: std::sync::atomic::AtomicBool =
+            std::sync::atomic::AtomicBool::new(false);
+        static INFO_RELEASED: std::sync::atomic::AtomicBool =
+            std::sync::atomic::AtomicBool::new(false);
+        unsafe extern "C" fn get_byte_pointer(_info: *mut c_void) -> *const c_void {
+            BYTES.as_ptr().cast()
+        }
+        unsafe extern "C" fn release_byte_pointer(_info: *mut c_void, pointer: *const c_void) {
+            assert_eq!(pointer, BYTES.as_ptr().cast());
+            BYTE_POINTER_RELEASED.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+        unsafe extern "C" fn release_info(_info: *mut c_void) {
+            INFO_RELEASED.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+        let callbacks = DirectCallbacks {
+            _version: 0,
+            get_byte_pointer: Some(get_byte_pointer),
+            release_byte_pointer: Some(release_byte_pointer),
+            get_bytes_at_position: None,
+            release_info: Some(release_info),
+        };
+        // SAFETY: `callbacks` is live for the call, and the provider is
+        // released before the test returns.
+        unsafe {
+            let provider =
+                CGDataProviderCreateDirect(std::ptr::null_mut(), BYTES.len() as i64, &callbacks);
+            assert!(!provider.is_null());
+            assert_eq!(provider_bytes(provider), Some(&BYTES[..]));
+            CGDataProviderRelease(provider);
+        }
+        assert!(BYTE_POINTER_RELEASED.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(INFO_RELEASED.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    #[test]
+    fn direct_provider_without_a_byte_pointer_copies_through_get_bytes_at_position() {
+        crate::bootstrap();
+        unsafe extern "C" fn get_bytes_at_position(
+            _info: *mut c_void,
+            buffer: *mut c_void,
+            position: i64,
+            count: usize,
+        ) -> usize {
+            assert_eq!(position, 0);
+            let source = [9u8, 8, 7];
+            let copied = count.min(source.len());
+            // SAFETY: the caller's buffer covers `count` bytes.
+            unsafe { std::ptr::copy_nonoverlapping(source.as_ptr(), buffer.cast(), copied) };
+            copied
+        }
+        let callbacks = DirectCallbacks {
+            _version: 0,
+            get_byte_pointer: None,
+            release_byte_pointer: None,
+            get_bytes_at_position: Some(get_bytes_at_position),
+            release_info: None,
+        };
+        // SAFETY: `callbacks` is live for the call, and the provider is
+        // released before the test returns.
+        unsafe {
+            let provider = CGDataProviderCreateDirect(std::ptr::null_mut(), 3, &callbacks);
+            assert!(!provider.is_null());
+            assert_eq!(provider_bytes(provider), Some(&[9u8, 8, 7][..]));
+            CGDataProviderRelease(provider);
+        }
+    }
+
+    #[test]
+    fn direct_provider_refuses_callbacks_with_no_reader() {
+        let callbacks = DirectCallbacks {
+            _version: 0,
+            get_byte_pointer: None,
+            release_byte_pointer: None,
+            get_bytes_at_position: None,
+            release_info: None,
+        };
+        // SAFETY: `callbacks` is live for the call, and null is a valid one.
+        unsafe {
+            assert!(CGDataProviderCreateDirect(std::ptr::null_mut(), 0, &callbacks).is_null());
+            assert!(
+                CGDataProviderCreateDirect(std::ptr::null_mut(), 0, std::ptr::null()).is_null()
+            );
         }
     }
 }

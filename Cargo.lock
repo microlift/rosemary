@@ -9,6 +9,13 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b2187590a23ab1e3df8681afdf0987c48504d80291f002fcdb651f0ef5e25169"
 
 [[package]]
+name = "accelerate"
+version = "0.5.0"
+dependencies = [
+ "exports",
+]
+
+[[package]]
 name = "addr2line"
 version = "0.25.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -182,7 +189,10 @@ name = "applicationservices"
 version = "0.5.0"
 dependencies = [
  "appkit",
+ "corefoundation",
  "exports",
+ "foundation",
+ "objc",
 ]
 
 [[package]]
@@ -238,8 +248,10 @@ name = "audiotoolbox"
 version = "0.5.0"
 dependencies = [
  "coreaudio",
+ "corefoundation",
  "darwin",
  "exports",
+ "prefix",
  "sdl3",
 ]
 
@@ -624,6 +636,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "corebluetooth"
+version = "0.5.0"
+dependencies = [
+ "corefoundation",
+ "darwin",
+ "foundation",
+ "objc",
+]
+
+[[package]]
 name = "corefoundation"
 version = "0.5.0"
 dependencies = [
@@ -639,6 +661,8 @@ dependencies = [
  "sdl3",
  "starnix",
  "static_init",
+ "unicode-general-category",
+ "unicode-normalization",
 ]
 
 [[package]]
@@ -654,6 +678,7 @@ dependencies = [
 name = "coreservices"
 version = "0.5.0"
 dependencies = [
+ "appkit",
  "corefoundation",
  "darwin",
  "exports",
@@ -661,6 +686,7 @@ dependencies = [
  "libc",
  "objc",
  "prefix",
+ "sdl3",
 ]
 
 [[package]]
@@ -671,6 +697,7 @@ dependencies = [
  "corefoundation",
  "exports",
  "foundation",
+ "objc",
  "owned_ttf_parser",
  "prefix",
 ]
@@ -2252,6 +2279,7 @@ name = "opencl"
 version = "0.5.0"
 dependencies = [
  "exports",
+ "libc",
 ]
 
 [[package]]
@@ -2643,13 +2671,16 @@ dependencies = [
 name = "rosemary"
 version = "0.5.0"
 dependencies = [
+ "accelerate",
  "appkit",
  "applicationservices",
  "audiotoolbox",
  "avfoundation",
+ "cc",
  "clap",
  "contacts",
  "coreaudio",
+ "corebluetooth",
  "corefoundation",
  "coremedia",
  "coreservices",
@@ -2679,6 +2710,7 @@ dependencies = [
  "server",
  "sha2 0.11.0",
  "static_init",
+ "usernotifications",
  "videotoolbox",
  "webkit",
 ]
@@ -3404,6 +3436,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d8d00a78170970967fdb83f9d49b92f959ab2bb829186b113e4f4604ad98e180"
 
 [[package]]
+name = "unicode-normalization"
+version = "0.1.26"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "75cd3fb03d5288b3ba9a1ee103ac7e9cbb59f0b03d64f8ddfcc04dd42758a85d"
+dependencies = [
+ "tinyvec",
+]
+
+[[package]]
 name = "untrusted"
 version = "0.9.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3450,6 +3491,16 @@ dependencies = [
  "idna",
  "percent-encoding",
  "serde",
+]
+
+[[package]]
+name = "usernotifications"
+version = "0.5.0"
+dependencies = [
+ "corefoundation",
+ "darwin",
+ "foundation",
+ "objc",
 ]
 
 [[package]]

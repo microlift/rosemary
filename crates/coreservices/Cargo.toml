@@ -13,6 +13,8 @@ darwin.workspace = true
 libc.workspace = true
 foundation.workspace = true
 prefix.workspace = true
+sdl3.workspace = true
+appkit.workspace = true
 
 [lints]
 workspace = true

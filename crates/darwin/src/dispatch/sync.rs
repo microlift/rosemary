@@ -247,6 +247,17 @@ pub unsafe extern "C" fn apply_f(iterations: usize, _queue: u64, context: u64, w
     }
 }
 
+/// `void dispatch_apply(size_t iterations, dispatch_queue_t, void (^block)(size_t))`.
+///
+/// The block form of [`apply_f`], run the same way and for the same reason. No
+/// copy: every iteration has run before this returns.
+pub unsafe extern "C" fn apply(iterations: usize, _queue: u64, block: u64) {
+    for index in 0..iterations {
+        // SAFETY: the guest's block, whose invoke takes the iteration index.
+        unsafe { super::block::invoke_with_index(block, index) };
+    }
+}
+
 /// `void dispatch_group_async(dispatch_group_t, dispatch_queue_t, dispatch_block_t)`.
 ///
 /// The block is copied, as `dispatch_async` copies one, and run through the
@@ -406,6 +417,32 @@ mod tests {
         unsafe { &*(context as *const AtomicU32) }.fetch_add(1, Ordering::AcqRel);
     }
 
+    #[test]
+    fn apply_hands_every_index_to_the_block_in_order() {
+        static SEEN: std::sync::Mutex<Vec<usize>> = std::sync::Mutex::new(Vec::new());
+        extern "C" fn body(_block: u64, index: usize) {
+            SEEN.lock().unwrap().push(index);
+        }
+        #[repr(C)]
+        struct Literal {
+            isa: u64,
+            flags: u32,
+            reserved: u32,
+            invoke: u64,
+            descriptor: u64,
+        }
+        let literal = Literal {
+            isa: 0,
+            flags: 0,
+            reserved: 0,
+            invoke: body as *const () as usize as u64,
+            descriptor: 0,
+        };
+        // SAFETY: a live literal whose invoke takes the block and an index.
+        unsafe { apply(4, 0, &literal as *const Literal as u64) };
+        assert_eq!(*SEEN.lock().unwrap(), [0, 1, 2, 3]);
+    }
+
     fn wait_for(counter: &AtomicU32, what: &str) {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
         while counter.load(Ordering::Acquire) == 0 {
@@ -554,6 +591,46 @@ mod tests {
             for waiter in waiters {
                 waiter.join().expect("the waiter finishes");
             }
+            object::release(s);
+        }
+    }
+
+    /// Producers signal and consumers wait, some with short deadlines that
+    /// expire and put their count back: every signal is taken exactly once.
+    #[test]
+    fn signals_and_waits_balance_with_timeouts_in_the_mix() {
+        const PAIRS: u64 = 4;
+        const EACH: u64 = 5_000;
+        let s = unsafe { semaphore_create(0) };
+        let taken = std::sync::Arc::new(AtomicU32::new(0));
+        let mut threads = Vec::new();
+        for which in 0..PAIRS {
+            threads.push(std::thread::spawn(move || {
+                for _ in 0..EACH {
+                    unsafe { semaphore_signal(s) };
+                }
+            }));
+            let taken = std::sync::Arc::clone(&taken);
+            threads.push(std::thread::spawn(move || {
+                let mut got = 0;
+                while got < EACH {
+                    let deadline = match which % 2 {
+                        0 => time::FOREVER,
+                        _ => unsafe { time::time(time::NOW, 20_000) },
+                    };
+                    if unsafe { semaphore_wait(s, deadline) } == 0 {
+                        got += 1;
+                        taken.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+            }));
+        }
+        for t in threads {
+            t.join().expect("a producer or consumer");
+        }
+        assert_eq!(taken.load(Ordering::Relaxed) as u64, PAIRS * EACH);
+        unsafe {
+            assert_eq!(semaphore_wait(s, time::NOW), 1, "nothing left over");
             object::release(s);
         }
     }

@@ -44,6 +44,11 @@ static HIERARCHY: &[(&str, Option<&str>, usize)] = &[
     ("CAPropertyAnimation", Some("CAAnimation"), 0),
     ("CABasicAnimation", Some("CAPropertyAnimation"), 0),
     ("CAMediaTimingFunction", None, 0),
+    // Core Image's image value type. Nothing here runs a filter graph, but the
+    // class must exist for a guest that merely passes `CIImage` objects
+    // through, such as handing a decoded bitmap to a framework that expects
+    // one.
+    ("CIImage", None, 0),
     ("NSControl", Some("NSView"), 0),
     ("NSButton", Some("NSControl"), 0),
     ("NSPopUpButton", Some("NSButton"), 0),
@@ -159,6 +164,21 @@ static HIERARCHY: &[(&str, Option<&str>, usize)] = &[
         None,
         crate::cursor::TRACKING_AREA_INSTANCE_SIZE,
     ),
+    ("NSDocument", None, crate::document::INSTANCE_SIZE),
+    (
+        "NSDocumentController",
+        None,
+        crate::document::CONTROLLER_INSTANCE_SIZE,
+    ),
+    ("NSPrintInfo", None, crate::printing::INFO_INSTANCE_SIZE),
+    (
+        "NSPrintOperation",
+        None,
+        crate::printing::OPERATION_INSTANCE_SIZE,
+    ),
+    ("NSPrintPanel", None, crate::printing::PANEL_INSTANCE_SIZE),
+    ("NSInputManager", None, 0),
+    ("NSFilePromiseReceiver", None, 0),
 ];
 
 pub fn install() {

@@ -105,6 +105,20 @@ fn time_make(symbol: &str, ctx: &mut RegisterContext, mem: &mut dyn GuestMemory)
     return_time(symbol, ctx, mem, time)
 }
 
+/// `CMTime CMTimeMakeWithSeconds(Float64 seconds, int32_t preferredTimescale)`.
+/// The hidden SysV result pointer occupies rdi; the integer is in rsi while
+/// the floating-point input remains in xmm0.
+fn time_make_with_seconds(
+    symbol: &str,
+    ctx: &mut RegisterContext,
+    mem: &mut dyn GuestMemory,
+) -> Result<()> {
+    // SAFETY: the declaration from CMTime.h.
+    let f = unsafe { entry::<extern "C" fn(f64, i32) -> CmTime>(symbol)? };
+    let time = f(f64::from_bits(ctx.xmm[0][0]), ctx.rsi as i32);
+    return_time(symbol, ctx, mem, time)
+}
+
 /// `Float64 CMTimeGetSeconds(CMTime time)`
 ///
 /// Forwarded rather than divided: the flags make it more than a division.
@@ -310,6 +324,7 @@ pub type Shim = super::coregraphics::Shim;
 pub fn shim_for(name: &str) -> Option<Shim> {
     Some(match name {
         "CMTimeMake" => bind!("CMTimeMake" => time_make),
+        "CMTimeMakeWithSeconds" => bind!("CMTimeMakeWithSeconds" => time_make_with_seconds),
         "CMTimeGetSeconds" => bind!("CMTimeGetSeconds" => time_get_seconds),
         "CMSampleBufferGetPresentationTimeStamp" => {
             bind!("CMSampleBufferGetPresentationTimeStamp" => presentation_time_stamp)
@@ -346,6 +361,35 @@ pub fn callback_shim_for(name: &str) -> Option<crate::signal::Shim> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn seconds_constructor_reads_mixed_registers_and_writes_the_hidden_result() {
+        struct Memory([u8; 32]);
+        impl GuestMemory for Memory {
+            fn read(&self, va: u64, out: &mut [u8]) -> core::result::Result<(), machish::Error> {
+                out.copy_from_slice(&self.0[va as usize..va as usize + out.len()]);
+                Ok(())
+            }
+            fn write(&mut self, va: u64, data: &[u8]) -> core::result::Result<(), machish::Error> {
+                self.0[va as usize..va as usize + data.len()].copy_from_slice(data);
+                Ok(())
+            }
+        }
+        let mut ctx = RegisterContext::new();
+        ctx.rdi = 8;
+        ctx.rsi = 600;
+        ctx.rdx = 19; // A wrong shifted integer argument must not pass.
+        ctx.xmm[0][0] = 1.5f64.to_bits();
+        let mut mem = Memory([0; 32]);
+        assert!(shim_for("CMTimeMakeWithSeconds").is_some());
+        time_make_with_seconds("CMTimeMakeWithSeconds", &mut ctx, &mut mem).unwrap();
+        let time = CmTime::read(&mut mem, 8, "test").unwrap();
+        assert_eq!(time.value, 900);
+        assert_eq!(time.timescale, 600);
+        assert_eq!(time.flags, 1);
+        assert_eq!(time.epoch, 0);
+        assert_eq!(ctx.rax, 8);
+    }
 
     /// The layout claim every function here rests on, which a wrong answer would
     /// violate silently.

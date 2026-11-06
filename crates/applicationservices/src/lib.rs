@@ -1,3 +1,7 @@
+mod colorsync;
+mod printing;
+mod quickdraw;
+
 #[repr(i32)]
 enum CGWindowLevelKey {
     _BaseWindow = 0,
@@ -31,4 +35,5 @@ exports::exports! {
         "UAZoomChangeFocus" => UAZoomChangeFocus,
         "CGWindowLevelForKey" => CGWindowLevelForKey,
     }
+    groups { colorsync, printing, quickdraw }
 }

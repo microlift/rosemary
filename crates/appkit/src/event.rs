@@ -5,12 +5,33 @@ use sdl3::keycodes::{keymod, scancode};
 use crate::nsevent::{self, Fields, kind};
 use crate::window;
 
+thread_local! {
+    static DEPTH: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+/// How deep pumps may nest. A guest callback run by the pump - a web view's
+/// delegate, a view drawing - may turn the run loop and wait for the pump to
+/// deliver what it waits for, as it can on a Mac; the limit only stops a
+/// runaway chain of such waits.
+const MAX_DEPTH: u32 = 8;
+
 /// Drain SDL's queue once, delivering what this tree can deliver.
 ///
 /// `app` is the application, which is the object a window notification is posted
 /// about when the event names no window this crate made.
 pub fn pump(app: Id) {
     let _ = app;
+    if DEPTH.with(|depth| depth.get()) >= MAX_DEPTH {
+        return;
+    }
+    DEPTH.with(|depth| depth.set(depth.get() + 1));
+    struct Done;
+    impl Drop for Done {
+        fn drop(&mut self) {
+            DEPTH.with(|depth| depth.set(depth.get() - 1));
+        }
+    }
+    let _done = Done;
     // Before anything else: a thread waiting for a GL context this one holds is
     // a thread that is not drawing, and reaching here is what says this one has
     // finished with it. See `opengl::release_for_other_threads`.
@@ -32,6 +53,35 @@ pub fn pump(app: Id) {
     }
     crate::application::check_last_window_closed();
     crate::backing::pump();
+}
+
+/// The main run loop's window-system source, in the common modes.
+///
+/// Apple's main run loop services the window server and WebKit's IPC however
+/// the loop is being run, so a program that waits for a web view by turning
+/// `-[NSRunLoop runMode:beforeDate:]` itself still hears back. Here the pump is
+/// what does that work, and this source is how the loop gets to it: signalled
+/// from the thread with news, it runs the pump and counts as the input source
+/// that ends the program's `-runMode:beforeDate:`.
+fn window_system_source() -> &'static std::sync::Arc<corefoundation::runloop::Source> {
+    static SOURCE: std::sync::OnceLock<std::sync::Arc<corefoundation::runloop::Source>> =
+        std::sync::OnceLock::new();
+    SOURCE.get_or_init(|| {
+        let source = corefoundation::runloop::new_source(Some(window_system_fired), 0);
+        corefoundation::runloop::main().add_source(&source, corefoundation::runloop::COMMON_MODES);
+        source
+    })
+}
+
+unsafe extern "C" fn window_system_fired(_info: *mut std::ffi::c_void) {
+    pump(crate::application::shared());
+}
+
+/// Have the main thread run the pump on its next turn of the run loop,
+/// whichever mode and whoever is running it. Callable from any thread.
+pub fn wake_window_system() {
+    window_system_source().signal();
+    corefoundation::runloop::main().wake();
 }
 
 /// Service SDL surface work and publication on the video thread. Both the
@@ -1600,7 +1650,7 @@ fn post(id: u32, name: &str) {
 /// without resigning in between.
 static ANNOUNCED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
-fn answers(object: Id, selector: &str) -> bool {
+pub(crate) fn answers(object: Id, selector: &str) -> bool {
     // SAFETY: a window this crate made; both selectors are `BOOL (id, SEL)`,
     // sent so a subclass's override decides.
     unsafe {

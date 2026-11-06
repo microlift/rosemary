@@ -363,6 +363,24 @@ pub unsafe extern "C" fn CFPropertyListCreateWithData(
     }
 }
 
+/// `CFDataRef CFPropertyListCreateXMLData(CFAllocatorRef, CFPropertyListRef
+/// propertyList)`: the deprecated spelling of writing one out, kept for the
+/// programs that still import it. See `CFPropertyListCreateData` for the
+/// format-selecting API.
+///
+/// # Safety
+///
+/// `property_list` is null or an object this runtime allocated.
+pub unsafe extern "C" fn CFPropertyListCreateXMLData(
+    _allocator: CFAllocatorRef,
+    property_list: CFTypeRef,
+) -> CFTypeRef {
+    let Some(value) = (unsafe { value_of(property_list) }) else {
+        return std::ptr::null();
+    };
+    collections::new_data(crate::plist::write_xml(&value))
+}
+
 /// `CFDataRef CFPropertyListCreateData(CFAllocatorRef, CFPropertyListRef,
 /// CFPropertyListFormat, CFOptionFlags, CFErrorRef *error)`
 ///
@@ -409,6 +427,7 @@ exports::exports! {
         "CFPropertyListCreateData" => CFPropertyListCreateData,
         "CFPropertyListCreateWithData" => CFPropertyListCreateWithData,
         "CFPropertyListCreateFromXMLData" => CFPropertyListCreateFromXMLData,
+        "CFPropertyListCreateXMLData" => CFPropertyListCreateXMLData,
     }
 }
 
@@ -441,6 +460,48 @@ mod tests {
         assert!(!dictionary.mutable);
         unsafe { api::CFRelease(list) };
         unsafe { api::CFRelease(data) };
+    }
+
+    #[test]
+    fn create_xml_data_round_trips_through_create_with_data() {
+        let data = collections::new_data(XML.to_vec());
+        let mut error: CFTypeRef = std::ptr::null();
+        // SAFETY: an object made above.
+        let list = unsafe {
+            CFPropertyListCreateWithData(
+                std::ptr::null(),
+                data,
+                0,
+                std::ptr::null_mut(),
+                &mut error,
+            )
+        };
+        assert!(!list.is_null());
+        // SAFETY: a plist-shaped object this call just built.
+        let written = unsafe { CFPropertyListCreateXMLData(std::ptr::null(), list) };
+        assert!(!written.is_null());
+        let bytes = unsafe { collections::data(written) }
+            .expect("a CFData")
+            .clone();
+        let mut round_trip_format: CFIndex = 0;
+        let mut round_trip_error: CFTypeRef = std::ptr::null();
+        let round_tripped = unsafe {
+            CFPropertyListCreateWithData(
+                std::ptr::null(),
+                collections::new_data(bytes),
+                0,
+                &mut round_trip_format,
+                &mut round_trip_error,
+            )
+        };
+        assert!(!round_tripped.is_null() && round_trip_error.is_null());
+        assert_eq!(round_trip_format, 100, "XML, like the original");
+        unsafe {
+            api::CFRelease(list);
+            api::CFRelease(data);
+            api::CFRelease(written);
+            api::CFRelease(round_tripped);
+        }
     }
 
     #[test]

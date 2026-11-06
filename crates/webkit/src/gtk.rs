@@ -102,6 +102,7 @@ api! {
     gtk_widget_get_native: fn(Ptr) -> Ptr;
     gtk_native_get_surface: fn(Ptr) -> Ptr;
     gdk_set_allowed_backends: fn(*const c_char);
+    gdk_gl_context_clear_current: fn();
     gdk_display_manager_get: fn() -> Ptr;
     gdk_display_manager_get_default_display: fn(Ptr) -> Ptr;
     gdk_wayland_surface_get_wl_surface: fn(Ptr) -> Ptr;
@@ -127,7 +128,10 @@ api! {
     webkit_settings_set_allow_file_access_from_file_urls: fn(Ptr, c_int);
     webkit_settings_set_allow_universal_access_from_file_urls: fn(Ptr, c_int);
     webkit_settings_set_enable_write_console_messages_to_stdout: fn(Ptr, c_int);
-    webkit_web_view_load_uri: fn(Ptr, *const c_char);
+    webkit_web_view_load_request: fn(Ptr, Ptr);
+    webkit_uri_request_new: fn(*const c_char) -> Ptr;
+    webkit_uri_request_get_http_headers: fn(Ptr) -> Ptr;
+    soup_message_headers_replace: fn(Ptr, *const c_char, *const c_char);
     webkit_web_view_load_html: fn(Ptr, *const c_char, *const c_char);
     webkit_web_view_reload: fn(Ptr);
     webkit_web_view_get_title: fn(Ptr) -> *const c_char;

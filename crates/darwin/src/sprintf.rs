@@ -177,9 +177,16 @@ mod tests {
 
     fn render_double(format: &CStr, value: f64) -> String {
         let mut buffer = [0 as c_char; 64];
-        // SAFETY: a buffer this test sized, and one double for one conversion.
+        // SAFETY: a buffer this test sized; the formats use one double and
+        // optionally one trailing integer. Unused variadic arguments are allowed.
         let n = unsafe {
-            published_snprintf()(buffer.as_mut_ptr(), buffer.len(), format.as_ptr(), value)
+            published_snprintf()(
+                buffer.as_mut_ptr(),
+                buffer.len(),
+                format.as_ptr(),
+                value,
+                0i32,
+            )
         };
         // SAFETY: `snprintf` terminated it.
         let text = unsafe { CStr::from_ptr(buffer.as_ptr()) };

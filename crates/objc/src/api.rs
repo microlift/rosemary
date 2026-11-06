@@ -110,6 +110,35 @@ pub unsafe extern "C" fn objc_allocateClassPair(
     as_ptr(crate::class::allocate_pair(superclass, name, extra))
 }
 
+/// `Class objc_initializeClassPair(Class superclass, const char *name, Class cls,
+/// Class metacls)`: `objc_allocateClassPair` into storage the caller provides,
+/// `OBJC_MAX_CLASS_SIZE` bytes each, which is what the returned class is.
+///
+/// Nil, as on Darwin, when the name is taken or the superclass is still under
+/// construction - and for storage that is null or misaligned, which Darwin
+/// would crash on.
+pub unsafe extern "C" fn objc_initializeClassPair(
+    superclass: *const c_void,
+    name: *const c_char,
+    cls: *mut c_void,
+    metacls: *mut c_void,
+) -> *mut c_void {
+    let Some(name) = (unsafe { cstr(name) }) else {
+        return std::ptr::null_mut();
+    };
+    let aligned = |p: *mut c_void| !p.is_null() && p.cast::<Class>().is_aligned();
+    if !aligned(cls) || !aligned(metacls) || cls == metacls {
+        return std::ptr::null_mut();
+    }
+    // SAFETY: as above. Null is a root class.
+    let superclass = unsafe { class(superclass) };
+    if superclass.is_some_and(|s| !s.is_registered()) {
+        return std::ptr::null_mut();
+    }
+    // SAFETY: the caller's storage, as the header requires it to be.
+    as_ptr(unsafe { crate::class::initialize_pair(superclass, name, cls.cast(), metacls.cast()) })
+}
+
 pub unsafe extern "C" fn objc_registerClassPair(cls: *const c_void) {
     if let Some(cls) = unsafe { class(cls) } {
         crate::class::register_pair(cls);
@@ -1577,6 +1606,71 @@ mod introspection {
             assert!(protocol_conformsToProtocol(derived_ptr, base_ptr));
             assert!(!protocol_conformsToProtocol(base_ptr, derived_ptr));
             assert!(!protocol_isEqual(derived_ptr, base_ptr));
+        }
+    }
+}
+
+#[cfg(test)]
+mod initialized_pair_tests {
+    use super::*;
+    fn class_storage() -> *mut c_void {
+        let words = vec![0usize; crate::class::MAX_CLASS_SIZE / size_of::<usize>()];
+        Box::leak(words.into_boxed_slice()).as_mut_ptr().cast()
+    }
+
+    #[test]
+    fn an_initialized_class_pair_lives_in_the_callers_storage() {
+        crate::bootstrap();
+        let nsobject = crate::class::ptr(crate::class::lookup(c"NSObject").unwrap());
+        let (cls, meta) = (class_storage(), class_storage());
+        unsafe {
+            let made = objc_initializeClassPair(
+                nsobject.cast(),
+                c"InPlaceInitialized".as_ptr(),
+                cls,
+                meta,
+            );
+            assert_eq!(made, cls, "the class is the storage it was given");
+            assert!(crate::class::is_known(cls.cast()));
+            assert_eq!(object_getClass(cls.cast()), meta);
+            assert_eq!(class_getSuperclass(cls), nsobject.cast());
+            objc_registerClassPair(cls);
+            assert_eq!(objc_getClass(c"InPlaceInitialized".as_ptr()), cls);
+            let instance = class_createInstance(cls, 0);
+            assert_eq!(object_getClass(instance.cast()), cls);
+        }
+    }
+
+    #[test]
+    fn an_initialized_class_pair_is_refused_where_darwin_refuses_it() {
+        crate::bootstrap();
+        let nsobject = crate::class::ptr(crate::class::lookup(c"NSObject").unwrap());
+        unsafe {
+            // The name is taken.
+            let taken = objc_initializeClassPair(
+                nsobject.cast(),
+                c"NSObject".as_ptr(),
+                class_storage(),
+                class_storage(),
+            );
+            assert!(taken.is_null());
+            // The superclass is still being built.
+            let building = objc_allocateClassPair(nsobject.cast(), c"StillBuilding".as_ptr(), 0);
+            let under = objc_initializeClassPair(
+                building,
+                c"OnAnUnfinishedBase".as_ptr(),
+                class_storage(),
+                class_storage(),
+            );
+            assert!(under.is_null());
+            // No storage.
+            let none = objc_initializeClassPair(
+                nsobject.cast(),
+                c"NoStorage".as_ptr(),
+                std::ptr::null_mut(),
+                class_storage(),
+            );
+            assert!(none.is_null());
         }
     }
 }

@@ -238,6 +238,12 @@ pub fn existing_host_path(guest: &str) -> PathBuf {
     }
 }
 
+/// A creation destination with existing ancestors spelled as on the host.
+/// Missing components retain the guest's spelling and are not created here.
+pub fn creation_host_path(guest: &str) -> PathBuf {
+    case::for_creation(&host_path(guest))
+}
+
 /// The guest spelling of a host path.
 ///
 /// `None` means no mount reaches it, and the caller must report the failure it

@@ -1,4 +1,5 @@
-use std::sync::OnceLock;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use objc::class::Class;
 use objc::object::Id;
@@ -7,7 +8,7 @@ use objc::sel::Sel;
 use corefoundation::base::CFTypeRef;
 
 use crate::block;
-use crate::boxed::{Body, contents, make, register};
+use crate::boxed::{Body, contents, fill, make, register};
 use crate::define::{class_methods, methods};
 
 /// How long a request waits when nothing said otherwise. Apple's default.
@@ -161,6 +162,24 @@ pub fn http_response(url: &str, status: u16, headers: Vec<(String, String)>) -> 
             headers,
         },
     ))
+}
+
+/// `-initWithURL:`. `NSURLRequest` itself had never answered it here, which
+/// left the mutable subclass with nothing to inherit either - unlike `-URL`
+/// and the rest of the accessors below, every one of which is on the
+/// immutable class for exactly that reason.
+unsafe extern "C" fn init_with_url(receiver: Id, _sel: Sel, url: Id) -> Id {
+    // SAFETY: an `NSURL`, or nil.
+    let Some(text) = (unsafe { crate::url::text_of(url) }) else {
+        return std::ptr::null_mut();
+    };
+    // `+alloc` leaves `receiver` with no contents yet - `make` is what
+    // `+requestWithURL:` uses instead - so this `-init` is where they are
+    // made, which is `fill`'s case rather than `request_of`'s.
+    // SAFETY: `receiver` is an instance of the class this module registered
+    // for `Request`.
+    unsafe { crate::boxed::fill(receiver, Request::new(text, DEFAULT_TIMEOUT_SECONDS)) };
+    receiver
 }
 
 unsafe extern "C" fn set_url(receiver: Id, _sel: Sel, url: Id) {
@@ -472,23 +491,46 @@ fn perform(request: &Request) -> Result<(Response, Vec<u8>), String> {
     let built = builder
         .body(())
         .map_err(|e| format!("the request could not be built: {e}"))?;
-    let (mut parts, ()) = built.into_parts();
-    parts.extensions.insert(
-        ureq::config::Config::builder()
-            .timeout_global(Some(timeout))
-            .build(),
-    );
+    let (parts, ()) = built.into_parts();
     // A body is sent for every method that has one; `SendBody::none()` is what
     // makes a GET a GET rather than a POST with nothing in it.
     let body = match request.body.is_empty() {
         true => ureq::SendBody::none(),
         false => ureq::SendBody::from_owned_reader(std::io::Cursor::new(request.body.clone())),
     };
-    let mut response = agent()
-        .run(ureq::http::Request::from_parts(parts, body))
-        .map_err(|e| e.to_string())?;
+    let configured = agent()
+        .configure_request(ureq::http::Request::from_parts(parts, body))
+        .timeout_global(Some(timeout))
+        .build();
+    let tracing = std::env::var_os("ROSEMARY_HTTP_STATUS").is_some();
+    if tracing {
+        eprintln!("rosemary: http-status: started");
+    }
+    let mut response = agent().run(configured).map_err(|e| {
+        if tracing {
+            let category = match &e {
+                ureq::Error::Timeout(_) => "timeout",
+                ureq::Error::HostNotFound => "dns",
+                ureq::Error::Io(_) => "io",
+                ureq::Error::Tls(_) | ureq::Error::Rustls(_) => "tls",
+                ureq::Error::StatusCode(_) => "http",
+                ureq::Error::RedirectFailed | ureq::Error::TooManyRedirects => "redirect",
+                _ => "transport",
+            };
+            eprintln!("rosemary: http-status: error={category}");
+        }
+        e.to_string()
+    })?;
 
     let status = response.status().as_u16();
+    if tracing {
+        eprintln!("rosemary: http-status: response={status}");
+    }
+    // Where the content actually came from, which differs from `request.url`
+    // once a redirect has been followed - `-URL` on the response object this
+    // becomes is documented to say where it ended up, not where it was asked
+    // for, and `NSURLConnection`'s redirect delegate method compares the two.
+    let url = ureq::ResponseExt::get_uri(&response).to_string();
     let headers = response
         .headers()
         .iter()
@@ -509,7 +551,7 @@ fn perform(request: &Request) -> Result<(Response, Vec<u8>), String> {
         .map_err(|e| format!("the response body could not be read: {e}"))?;
     Ok((
         Response {
-            url: request.url.clone(),
+            url,
             status,
             headers,
         },
@@ -916,8 +958,7 @@ fn download_task(receiver: Id, request: Id, completion: Id) -> Id {
 
 //
 
-/// `+[NSURLConnection sendSynchronousRequest:returningResponse:error:]`, which
-/// is the whole of `NSURLConnection` a program still uses.
+/// `+[NSURLConnection sendSynchronousRequest:returningResponse:error:]`.
 unsafe extern "C" fn send_synchronous_request(
     _class: Id,
     _sel: Sel,
@@ -943,6 +984,619 @@ unsafe extern "C" fn send_synchronous_request(
         }
     }
     data
+}
+
+//
+
+/// A `NSURLConnection`: the request it runs, and who hears about it.
+struct Connection {
+    request: Request,
+    /// Retained from `-init...` until `-start` hands ownership to the worker
+    /// thread (zeroed there) - Apple documents the connection retaining its
+    /// delegate until it finishes, fails, or is canceled, and this is that
+    /// retain's whole lifetime split across the two places that end it.
+    delegate: usize,
+    /// A retained `NSOperationQueue`, or 0 for the default described at
+    /// [`deliver`]. Set by `-setDelegateQueue:`.
+    delegate_queue: usize,
+    started: bool,
+    cancelled: AtomicBool,
+    delivery: Arc<ConnectionDelivery>,
+}
+
+#[derive(Default)]
+struct ConnectionDelivery {
+    source: OnceLock<Arc<corefoundation::runloop::Source>>,
+    loops: Mutex<Vec<(Arc<corefoundation::runloop::RunLoop>, String)>>,
+    pending: Mutex<Option<Box<dyn FnOnce() + Send>>>,
+    explicitly_scheduled: AtomicBool,
+}
+
+impl ConnectionDelivery {
+    fn schedule(
+        &self,
+        receiver: Id,
+        run_loop: Arc<corefoundation::runloop::RunLoop>,
+        mode: String,
+    ) {
+        let source = self.source.get_or_init(|| {
+            corefoundation::runloop::new_source(Some(run_connection_delivery), receiver as usize)
+        });
+        let mut loops = self.loops.lock().unwrap();
+        if !loops
+            .iter()
+            .any(|(l, m)| Arc::ptr_eq(l, &run_loop) && *m == mode)
+        {
+            run_loop.add_source(source, &mode);
+            loops.push((run_loop, mode));
+        }
+        if self.pending.lock().unwrap().is_some() {
+            source.signal();
+            for (run_loop, _) in loops.iter() {
+                run_loop.wake();
+            }
+        }
+    }
+}
+
+unsafe extern "C" fn run_connection_delivery(context: *mut std::ffi::c_void) {
+    // The pending callback retains the connection until it has run.
+    let Some(connection) = (unsafe { connection_of(context) }) else {
+        return;
+    };
+    let delivery = connection.delivery.clone();
+    let work = delivery.pending.lock().unwrap().take();
+    if let Some(work) = work {
+        if let Some(source) = delivery.source.get() {
+            source.invalidate();
+            for (run_loop, mode) in delivery.loops.lock().unwrap().drain(..) {
+                run_loop.remove_source(source, &mode);
+            }
+        }
+        let pool = objc::arc::pool_push();
+        work();
+        objc::arc::pool_pop(pool);
+    }
+}
+
+impl Drop for Connection {
+    fn drop(&mut self) {
+        if let Some(source) = self.delivery.source.get() {
+            source.invalidate();
+            for (run_loop, mode) in self.delivery.loops.lock().unwrap().iter() {
+                run_loop.remove_source(source, mode);
+            }
+        }
+        // Null once `-start` has taken them for the worker thread to release,
+        // so this is only live for a connection that never ran.
+        objc::arc::release(self.delegate as Id);
+        objc::arc::release(self.delegate_queue as Id);
+    }
+}
+
+// SAFETY: every field is a plain value or an object referenced by its address
+// alone; the worker thread this module spawns reaches them only through a
+// retained id, the way `Task` above already does.
+unsafe impl Send for Connection {}
+
+fn connection_class() -> &'static Class {
+    register::<Connection>(c"NSURLConnection", None)
+}
+
+/// # Safety
+///
+/// `receiver` must be null or an object this runtime allocated.
+unsafe fn connection_of<'a>(receiver: Id) -> Option<&'a mut Connection> {
+    unsafe { contents(receiver, connection_class()) }
+}
+
+fn connection_contents(request: &Request, delegate: Id) -> Connection {
+    Connection {
+        request: request.clone(),
+        delegate: objc::arc::retain(delegate) as usize,
+        delegate_queue: 0,
+        started: false,
+        cancelled: AtomicBool::new(false),
+        delivery: Arc::new(ConnectionDelivery::default()),
+    }
+}
+
+unsafe extern "C" fn connection_with_request_delegate(
+    _class: Id,
+    _sel: Sel,
+    request: Id,
+    delegate: Id,
+) -> Id {
+    // SAFETY: a request this module made, or nil.
+    let Some(request) = (unsafe { request_of(request) }) else {
+        return std::ptr::null_mut();
+    };
+    let connection = make(connection_class(), connection_contents(request, delegate));
+    if !connection.is_null() {
+        // `+connectionWithRequest:delegate:` schedules and starts at once,
+        // unlike the `startImmediately:NO` form of `-init`.
+        unsafe { start(connection, objc::sel::get("start")) };
+    }
+    objc::arc::autorelease(connection)
+}
+
+unsafe extern "C" fn init_with_request_delegate(
+    receiver: Id,
+    _sel: Sel,
+    request: Id,
+    delegate: Id,
+) -> Id {
+    unsafe {
+        init_with_request_delegate_start_immediately(
+            receiver,
+            objc::sel::get("initWithRequest:delegate:startImmediately:"),
+            request,
+            delegate,
+            1,
+        )
+    }
+}
+
+unsafe extern "C" fn init_with_request_delegate_start_immediately(
+    receiver: Id,
+    _sel: Sel,
+    request: Id,
+    delegate: Id,
+    start_immediately: i8,
+) -> Id {
+    // SAFETY: a request this module made, or nil.
+    let Some(request) = (unsafe { request_of(request) }) else {
+        return std::ptr::null_mut();
+    };
+    // SAFETY: `receiver` was just `+alloc`'d, and this is this class's `-init`.
+    unsafe { fill(receiver, connection_contents(request, delegate)) };
+    if start_immediately != 0 {
+        unsafe { start(receiver, objc::sel::get("start")) };
+    }
+    receiver
+}
+
+/// `-start`: hand the request to a worker thread, which reports back through
+/// [`deliver`] once it has an answer.
+///
+/// A thread of its own, like `NSURLSessionTask`'s `-resume` above: the caller
+/// of an asynchronous API is entitled to its thread back immediately.
+unsafe extern "C" fn start(receiver: Id, _sel: Sel) {
+    // SAFETY: the receiver is a connection this module made.
+    let Some(connection) = (unsafe { connection_of(receiver) }) else {
+        return;
+    };
+    if connection.started {
+        return;
+    }
+    connection.started = true;
+    if connection.delegate_queue == 0
+        && !connection
+            .delivery
+            .explicitly_scheduled
+            .load(Ordering::Acquire)
+    {
+        connection.delivery.schedule(
+            receiver,
+            corefoundation::runloop::current(),
+            corefoundation::runloop::DEFAULT_MODE.to_owned(),
+        );
+    }
+    let delegate = std::mem::replace(&mut connection.delegate, 0);
+    let delegate_queue = std::mem::replace(&mut connection.delegate_queue, 0);
+    if connection.cancelled.load(Ordering::Acquire) {
+        // Canceled before it ever ran: no delegate message is owed, so the
+        // reference `-init` took is this call's to let go of.
+        objc::arc::release(delegate as Id);
+        objc::arc::release(delegate_queue as Id);
+        return;
+    }
+    let request = connection.request.clone();
+    let connection_id = objc::arc::retain(receiver) as usize;
+    std::thread::spawn(move || {
+        let pool = objc::arc::pool_push();
+        run_connection(connection_id, delegate, delegate_queue, request);
+        objc::arc::pool_pop(pool);
+        objc::arc::release(connection_id as Id);
+    });
+}
+
+/// `-cancel`, which - like `NSURLSessionTask`'s above - cannot interrupt a
+/// transfer already under way: the worker thread notices this flag once the
+/// transfer ends, and reports nothing rather than finishing it off with a
+/// delegate message of its own invention.
+unsafe extern "C" fn cancel_connection(receiver: Id, _sel: Sel) {
+    // SAFETY: the receiver is a connection this module made.
+    if let Some(connection) = unsafe { connection_of(receiver) } {
+        connection.cancelled.store(true, Ordering::Release);
+    }
+}
+
+unsafe extern "C" fn schedule_in_run_loop(receiver: Id, _sel: Sel, run_loop: Id, mode: Id) {
+    let Some(connection) = (unsafe { connection_of(receiver) }) else {
+        return;
+    };
+    let Some(run_loop) = crate::timer::run_loop_of(run_loop) else {
+        return;
+    };
+    connection
+        .delivery
+        .explicitly_scheduled
+        .store(true, Ordering::Release);
+    connection
+        .delivery
+        .schedule(receiver, run_loop, crate::timer::mode_name(mode));
+}
+
+unsafe extern "C" fn unschedule_from_run_loop(receiver: Id, _sel: Sel, run_loop: Id, mode: Id) {
+    let Some(connection) = (unsafe { connection_of(receiver) }) else {
+        return;
+    };
+    let Some(run_loop) = crate::timer::run_loop_of(run_loop) else {
+        return;
+    };
+    let mode = crate::timer::mode_name(mode);
+    let delivery = &connection.delivery;
+    delivery.explicitly_scheduled.store(true, Ordering::Release);
+    let mut loops = delivery.loops.lock().unwrap();
+    if let Some(source) = delivery.source.get() {
+        run_loop.remove_source(source, &mode);
+    }
+    loops.retain(|(l, m)| !(Arc::ptr_eq(l, &run_loop) && *m == mode));
+}
+
+unsafe extern "C" fn set_delegate_queue(receiver: Id, _sel: Sel, queue: Id) {
+    // SAFETY: the receiver is a connection this module made.
+    let Some(connection) = (unsafe { connection_of(receiver) }) else {
+        return;
+    };
+    let old = std::mem::replace(
+        &mut connection.delegate_queue,
+        objc::arc::retain(queue) as usize,
+    );
+    objc::arc::release(old as Id);
+}
+
+/// `-originalRequest` and `-currentRequest`, answered the same way.
+///
+/// FIXME (ACCURACY): a real connection's `-currentRequest` reflects whatever
+/// `-connection:willSendRequest:redirectResponse:` returned for the latest
+/// hop; this always answers the request the connection started with, which is
+/// what `-originalRequest` is supposed to mean.
+unsafe extern "C" fn connection_current_request(receiver: Id, _sel: Sel) -> Id {
+    // SAFETY: the receiver is a connection this module made.
+    let Some(connection) = (unsafe { connection_of(receiver) }) else {
+        return std::ptr::null_mut();
+    };
+    objc::arc::autorelease(make(immutable_request_class(), connection.request.clone()))
+}
+
+/// `+[NSURLConnection sendAsynchronousRequest:queue:completionHandler:]`.
+unsafe extern "C" fn send_asynchronous_request(
+    _class: Id,
+    _sel: Sel,
+    request: Id,
+    queue: Id,
+    completion: Id,
+) {
+    // SAFETY: a request this module made, or nil.
+    let Some(request) = (unsafe { request_of(request) }) else {
+        return;
+    };
+    let request = request.clone();
+    let completion = objc::block::copy(completion) as usize;
+    let queue_id = objc::arc::retain(queue) as usize;
+    std::thread::spawn(move || {
+        let pool = objc::arc::pool_push();
+        // Carried as `usize`, like every other object a worker thread here
+        // hands to `deliver`'s closure: a raw `Id` is a pointer, and a pointer
+        // is not `Send`, even though everything it points to already is.
+        let (data, response, error) = retained_objects(perform(&request));
+        let (data, response, error) = (data as usize, response as usize, error as usize);
+        objc::arc::pool_pop(pool);
+        deliver(queue_id as Id, move || {
+            let (data, response, error) = (data as Id, response as Id, error as Id);
+            // SAFETY: the block was retained above; its shape is
+            // `void (^)(NSURLResponse *, NSData *, NSError *)` - the response
+            // and the data swap places from `NSURLSession`'s handler.
+            unsafe { call_completion(completion as Id, response, data, error) };
+            objc::arc::release(response);
+            objc::arc::release(data);
+            objc::arc::release(error);
+            objc::block::release(completion as Id);
+            objc::arc::release(queue_id as Id);
+        });
+    });
+}
+
+/// Like [`objects`], but at +1 rather than autoreleased: for a result that is
+/// about to cross to another thread before anything runs there, where this
+/// thread's own pool would otherwise free it first.
+fn retained_objects(result: Result<(Response, Vec<u8>), String>) -> (Id, Id, Id) {
+    match result {
+        Ok((response, bytes)) => {
+            let data = corefoundation::collections::new_data(bytes) as Id;
+            let response = make(response_class(), response);
+            (data, response, std::ptr::null_mut())
+        }
+        Err(message) => {
+            // `crate::error::make` autoreleases; retained here so the error
+            // outlives this thread's pool instead of the pool outliving it.
+            let error = crate::error::make(
+                crate::error::NSURL_ERROR_DOMAIN,
+                crate::error::NSURL_ERROR_UNKNOWN,
+                &message,
+            );
+            (
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                objc::arc::retain(error),
+            )
+        }
+    }
+}
+
+/// Run `request` and report the outcome to `delegate`, unless `-cancel` beat
+/// it there. The worker thread's whole job after `-start`.
+fn run_connection(connection_id: usize, delegate: usize, delegate_queue: usize, request: Request) {
+    let result = perform(&request);
+    // SAFETY: `connection_id` is retained for the life of this call by `-start`.
+    let canceled = unsafe { connection_of(connection_id as Id) }
+        .is_some_and(|c| c.cancelled.load(Ordering::Acquire));
+    if canceled {
+        // Apple sends no further delegate messages once a connection is
+        // canceled. The transfer already ran to completion - it cannot be
+        // interrupted once started - but nothing is said about how.
+        objc::arc::release(delegate as Id);
+        objc::arc::release(delegate_queue as Id);
+        return;
+    }
+    match result {
+        Ok((response, bytes)) => deliver_success(
+            connection_id,
+            delegate,
+            delegate_queue,
+            &request,
+            response,
+            bytes,
+        ),
+        Err(message) => deliver_failure(connection_id, delegate, delegate_queue, message),
+    }
+}
+
+/// Report a completed transfer to the delegate: the redirect it followed, if
+/// any, then the response, the body, and that loading finished.
+fn deliver_success(
+    connection_id: usize,
+    delegate: usize,
+    delegate_queue: usize,
+    request: &Request,
+    response: Response,
+    bytes: Vec<u8>,
+) {
+    // FIXME (ACCURACY): Apple calls `-connection:willSendRequest:redirectResponse:`
+    // once per hop, before following it, with that hop's own 3xx response, and
+    // either request may rewrite the next one or cancel the connection outright.
+    // This transport follows redirects itself, so by the time this runs the
+    // transfer is already over: only the final URL survived, there is no
+    // intermediate response to show, and nothing the delegate returns can
+    // change what already happened. What follows reports one redirect, from
+    // the original URL straight to the final one, with the final response
+    // standing in for the discarded 3xx, and ignores the delegate's answer.
+    let redirected = response.url != request.url;
+    // Carried as `usize` across the closure below, like everywhere else a
+    // worker thread here hands an object to `deliver`: a raw `Id` is a
+    // pointer, and a pointer is not `Send`, even though what it points to
+    // already is.
+    let redirect_request = redirected.then(|| {
+        let mut redirected_request = request.clone();
+        redirected_request.url = response.url.clone();
+        make(immutable_request_class(), redirected_request) as usize
+    });
+    let has_body = !bytes.is_empty();
+    let response_object = make(response_class(), response) as usize;
+    let data_object = corefoundation::collections::new_data(bytes) as usize;
+    let connection = objc::arc::retain(connection_id as Id) as usize;
+
+    deliver_connection(connection_id, delegate_queue as Id, move || {
+        let connection = connection as Id;
+        let delegate = delegate as Id;
+        let response_object = response_object as Id;
+        let data_object = data_object as Id;
+        // SAFETY: every object handed to a delegate method below was built
+        // for exactly this call, and each helper releases what it is given.
+        unsafe {
+            if let Some(redirect_request) = redirect_request {
+                send_will_send_request(
+                    delegate,
+                    connection,
+                    redirect_request as Id,
+                    objc::arc::retain(response_object),
+                );
+            }
+            send_connection_arg(
+                delegate,
+                objc::sel::get("connection:didReceiveResponse:"),
+                connection,
+                response_object,
+            );
+            if has_body {
+                // FIXME (ACCURACY): the whole body is read before any of it
+                // is delivered (see `perform`), so this one call stands in
+                // for the several a real streaming transfer would make.
+                send_connection_arg(
+                    delegate,
+                    objc::sel::get("connection:didReceiveData:"),
+                    connection,
+                    data_object,
+                );
+            } else {
+                objc::arc::release(data_object);
+            }
+            send_connection_only(
+                delegate,
+                objc::sel::get("connectionDidFinishLoading:"),
+                connection,
+            );
+        }
+        objc::arc::release(delegate);
+        objc::arc::release(delegate_queue as Id);
+        objc::arc::release(connection);
+    });
+}
+
+fn deliver_failure(connection_id: usize, delegate: usize, delegate_queue: usize, message: String) {
+    // `crate::error::make` autoreleases; retained here for the same reason as
+    // in `retained_objects`, and carried as `usize` for the same reason as in
+    // `deliver_success`.
+    let error = objc::arc::retain(crate::error::make(
+        crate::error::NSURL_ERROR_DOMAIN,
+        crate::error::NSURL_ERROR_UNKNOWN,
+        &message,
+    )) as usize;
+    let connection = objc::arc::retain(connection_id as Id) as usize;
+
+    deliver_connection(connection_id, delegate_queue as Id, move || {
+        let connection = connection as Id;
+        let delegate = delegate as Id;
+        let error = error as Id;
+        // SAFETY: `error` was built for exactly this call.
+        unsafe {
+            send_connection_arg(
+                delegate,
+                objc::sel::get("connection:didFailWithError:"),
+                connection,
+                error,
+            );
+        }
+        objc::arc::release(delegate);
+        objc::arc::release(delegate_queue as Id);
+        objc::arc::release(connection);
+    });
+}
+
+/// Run `work` on the connection's run loop, or on `delegate_queue` if one was
+/// set with `-setDelegateQueue:`.
+///
+/// A source wakes exactly the scheduled loops and is serviced only in their
+/// requested modes, including private modes used by synchronous callers.
+fn deliver_connection(
+    connection_id: usize,
+    delegate_queue: Id,
+    work: impl FnOnce() + Send + 'static,
+) {
+    if !delegate_queue.is_null() {
+        deliver(delegate_queue, work);
+        return;
+    }
+    // The worker and the callback each hold a connection reference.
+    let delivery = unsafe { connection_of(connection_id as Id) }
+        .unwrap()
+        .delivery
+        .clone();
+    *delivery.pending.lock().unwrap() = Some(Box::new(work));
+    if let Some(source) = delivery.source.get() {
+        source.signal();
+    }
+    for (run_loop, _) in delivery.loops.lock().unwrap().iter() {
+        run_loop.wake();
+    }
+}
+
+fn deliver(delegate_queue: Id, work: impl FnOnce() + Send + 'static) {
+    if !delegate_queue.is_null() {
+        let operation = crate::operation::with_work(work);
+        crate::operation::add_to_queue(delegate_queue, operation);
+        return;
+    }
+    let boxed: Box<dyn FnOnce() + Send> = Box::new(work);
+    let context = Box::into_raw(Box::new(boxed)) as u64;
+    let function = run_boxed as *const () as u64;
+    // SAFETY: `context` is a box this call made, consumed exactly once by
+    // `run_boxed` when the main queue runs it.
+    unsafe {
+        darwin::dispatch::queue::async_f(darwin::dispatch::queue::main_queue(), context, function)
+    };
+}
+
+/// `dispatch_function_t` for whatever [`deliver`] boxed.
+unsafe extern "C" fn run_boxed(context: *mut std::ffi::c_void) {
+    // SAFETY: a box `deliver` made, consumed exactly once.
+    let work = unsafe { Box::from_raw(context.cast::<Box<dyn FnOnce() + Send>>()) };
+    work();
+}
+
+/// The delegate's implementation of `sel`, if it has one - this module's
+/// `-respondsToSelector:` check for every optional delegate method below.
+///
+/// # Safety
+///
+/// `delegate` must be null or a live object.
+unsafe fn delegate_method(delegate: Id, sel: Sel) -> Option<&'static objc::class::Method> {
+    if delegate.is_null() {
+        return None;
+    }
+    unsafe { objc::object::class_of(delegate) }.and_then(|c| c.method(sel))
+}
+
+/// Send `connection:<verb>:` with one more argument, if the delegate
+/// implements `sel`. `argument` is consumed either way: released once sent,
+/// or released here if there was nowhere to send it.
+///
+/// # Safety
+///
+/// `delegate` and `connection` must be null or live objects, and `sel`'s
+/// method, if any, must be `void (id, SEL, id, id)`.
+unsafe fn send_connection_arg(delegate: Id, sel: Sel, connection: Id, argument: Id) {
+    if let Some(method) = unsafe { delegate_method(delegate, sel) } {
+        // SAFETY: the caller's guarantee.
+        unsafe {
+            let f: unsafe extern "C" fn(Id, Sel, Id, Id) =
+                std::mem::transmute(method.implementation());
+            f(delegate, sel, connection, argument);
+        }
+    }
+    objc::arc::release(argument);
+}
+
+/// `connectionDidFinishLoading:`, whose one argument is the connection itself
+/// rather than something built for this call - so there is nothing to release
+/// afterward, unlike [`send_connection_arg`].
+///
+/// # Safety
+///
+/// `delegate` and `connection` must be null or live objects, and `sel`'s
+/// method, if any, must be `void (id, SEL, id)`.
+unsafe fn send_connection_only(delegate: Id, sel: Sel, connection: Id) {
+    if let Some(method) = unsafe { delegate_method(delegate, sel) } {
+        // SAFETY: the caller's guarantee.
+        unsafe {
+            let f: unsafe extern "C" fn(Id, Sel, Id) = std::mem::transmute(method.implementation());
+            f(delegate, sel, connection);
+        }
+    }
+}
+
+/// `connection:willSendRequest:redirectResponse:`. Both arguments are
+/// consumed, and the delegate's answer is ignored - see the FIXME in
+/// [`deliver_success`], the only caller.
+///
+/// # Safety
+///
+/// As [`send_connection_arg`], but the method returns an `id` this call never
+/// reads and takes one argument more.
+unsafe fn send_will_send_request(delegate: Id, connection: Id, request: Id, redirect_response: Id) {
+    let sel = objc::sel::get("connection:willSendRequest:redirectResponse:");
+    if let Some(method) = unsafe { delegate_method(delegate, sel) } {
+        // SAFETY: the caller's guarantee.
+        unsafe {
+            let f: unsafe extern "C" fn(Id, Sel, Id, Id, Id) -> Id =
+                std::mem::transmute(method.implementation());
+            let _ = f(delegate, sel, connection, request, redirect_response);
+        }
+    }
+    objc::arc::release(request);
+    objc::arc::release(redirect_response);
 }
 
 //
@@ -992,6 +1646,7 @@ pub(crate) fn install() {
         "requestWithURL:cachePolicy:timeoutInterval:" => request_with_url_policy_timeout, c"@40@0:8@16Q24d32";
     });
     methods!(immutable, {
+        "initWithURL:" => init_with_url, c"@24@0:8@16";
         "URL" => request_url, c"@16@0:8";
         "HTTPMethod" => http_method, c"@16@0:8";
         "HTTPBody" => http_body, c"@16@0:8";
@@ -1054,17 +1709,174 @@ pub(crate) fn install() {
         "finishTasksAndInvalidate" => invalidate_session, c"v16@0:8";
     });
 
-    let connection = corefoundation::base::abstract_class(c"NSURLConnection", None);
+    let connection = connection_class();
     class_methods!(connection, {
         "sendSynchronousRequest:returningResponse:error:" => send_synchronous_request, c"@40@0:8@16^@24^@32";
+        "connectionWithRequest:delegate:" => connection_with_request_delegate, c"@32@0:8@16@24";
+        // `@?` for the handler, like the session methods above.
+        "sendAsynchronousRequest:queue:completionHandler:" => send_asynchronous_request, c"v40@0:8@16@24@?32";
     });
-
+    methods!(connection, {
+        "initWithRequest:delegate:" => init_with_request_delegate, c"@32@0:8@16@24";
+        "initWithRequest:delegate:startImmediately:"
+            => init_with_request_delegate_start_immediately, c"@40@0:8@16@24c32";
+        "start" => start, c"v16@0:8";
+        "cancel" => cancel_connection, c"v16@0:8";
+        "scheduleInRunLoop:forMode:" => schedule_in_run_loop, c"v32@0:8@16@24";
+        "unscheduleFromRunLoop:forMode:" => unschedule_from_run_loop, c"v32@0:8@16@24";
+        "setDelegateQueue:" => set_delegate_queue, c"v24@0:8@16";
+        "originalRequest" => connection_current_request, c"@16@0:8";
+        "currentRequest" => connection_current_request, c"@16@0:8";
+    });
+    // `-connection:canAuthenticateAgainstProtectionSpace:` and
+    // `-connection:willSendRequestForAuthenticationChallenge:` are
+    // intentionally unimplemented: nothing in `perform` intercepts an auth
+    // challenge, so there is no cheap way to hand one to a delegate - this
+    // tree does whatever the transport does on its own, same as a plain
+    // `NSURLSession` request.
     crate::error::install();
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    static CUSTOM_FINISHED: AtomicBool = AtomicBool::new(false);
+    static CUSTOM_THREAD: Mutex<Option<std::thread::ThreadId>> = Mutex::new(None);
+
+    unsafe extern "C" fn custom_finished(_delegate: Id, _sel: Sel, _connection: Id) {
+        *CUSTOM_THREAD.lock().unwrap() = Some(std::thread::current().id());
+        CUSTOM_FINISHED.store(true, Ordering::SeqCst);
+    }
+
+    #[test]
+    fn a_connection_waits_for_its_scheduled_run_loop_mode() {
+        crate::bootstrap();
+        CUSTOM_FINISHED.store(false, Ordering::SeqCst);
+        let class = corefoundation::base::register(
+            c"RosemaryTestCustomModeDelegate",
+            None,
+            std::mem::size_of::<usize>(),
+            false,
+        );
+        methods!(class, {
+            "connectionDidFinishLoading:" => custom_finished, c"v24@0:8@16";
+        });
+        let delegate = objc::object::create_instance(class, 0);
+        let request = request_object(local_server(
+            "HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        ));
+        let connection = objc::object::create_instance(connection_class(), 0);
+        let mode = crate::string::from_str("ConnectionPrivateMode");
+        let run_loop_class = objc::class::lookup(c"NSRunLoop").unwrap();
+        // SAFETY: registered class method and live objects for each selector.
+        unsafe {
+            let send: unsafe extern "C" fn(Id, Sel) -> Id = std::mem::transmute(objc::msg::entry());
+            let run_loop = send(
+                objc::class::ptr(run_loop_class).cast(),
+                objc::sel::get("currentRunLoop"),
+            );
+            init_with_request_delegate_start_immediately(
+                connection,
+                std::ptr::null(),
+                request,
+                delegate,
+                0,
+            );
+            schedule_in_run_loop(connection, std::ptr::null(), run_loop, mode);
+            start(connection, std::ptr::null());
+            let delivery = connection_of(connection).unwrap().delivery.clone();
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            while delivery.pending.lock().unwrap().is_none() && std::time::Instant::now() < deadline
+            {
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            assert!(
+                delivery.pending.lock().unwrap().is_some(),
+                "local response never arrived"
+            );
+            darwin::dispatch::queue::drain_main();
+            let loop_ = corefoundation::runloop::current();
+            loop_.run_in_mode(corefoundation::runloop::DEFAULT_MODE, 0.0, true);
+            assert!(!CUSTOM_FINISHED.load(Ordering::SeqCst));
+            unschedule_from_run_loop(connection, std::ptr::null(), run_loop, mode);
+            loop_.run_in_mode("ConnectionPrivateMode", 0.0, true);
+            assert!(!CUSTOM_FINISHED.load(Ordering::SeqCst));
+            schedule_in_run_loop(connection, std::ptr::null(), run_loop, mode);
+            loop_.run_in_mode("ConnectionPrivateMode", 0.1, true);
+            assert!(CUSTOM_FINISHED.load(Ordering::SeqCst));
+            assert_eq!(
+                *CUSTOM_THREAD.lock().unwrap(),
+                Some(std::thread::current().id())
+            );
+        }
+        for object in [mode, connection, request, delegate] {
+            objc::arc::release(object);
+        }
+    }
+
+    /// `-initWithURL:` configures the receiver it is sent to, on either the
+    /// immutable class or the mutable one that inherits the method from it.
+    #[test]
+    fn init_with_url_configures_the_request_on_either_class() {
+        crate::bootstrap();
+        for class_name in [c"NSURLRequest", c"NSMutableURLRequest"] {
+            let class = objc::class::lookup(class_name).expect("declared");
+            let object = objc::object::create_instance(class, 0);
+            let url = corefoundation::url::new("https://example.com/path");
+            // SAFETY: `-initWithURL:` is `id (id, SEL, id)`.
+            let request =
+                unsafe { init_with_url(object, objc::sel::get("initWithURL:"), url as Id) };
+            assert!(!request.is_null(), "{class_name:?}");
+            // SAFETY: `init_with_url` just handed back a request this module made.
+            let parts = unsafe { request_parts(request) }.expect("a request this module made");
+            assert_eq!(parts.url, "https://example.com/path");
+            assert_eq!(parts.method, "GET");
+            objc::arc::release(request);
+            // SAFETY: a URL this test just made.
+            unsafe { corefoundation::api::CFRelease(url) };
+        }
+    }
+
+    /// A URL `-initWithURL:` cannot make sense of answers nil, as every other
+    /// request constructor in this module does for the same input.
+    #[test]
+    fn init_with_url_of_a_bad_url_answers_nil() {
+        crate::bootstrap();
+        let class = objc::class::lookup(c"NSURLRequest").expect("declared");
+        let object = objc::object::create_instance(class, 0);
+        // SAFETY: `-initWithURL:` is `id (id, SEL, id)`.
+        let request =
+            unsafe { init_with_url(object, objc::sel::get("initWithURL:"), std::ptr::null_mut()) };
+        assert!(request.is_null());
+    }
+
+    // The peer accepts but deliberately sends no response before the deadline.
+    #[test]
+    fn a_request_timeout_is_applied_to_the_transport() {
+        use std::io::Read;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(std::time::Duration::from_secs(2)))
+                .unwrap();
+            let mut buffer = [0u8; 1024];
+            let _ = stream.read(&mut buffer);
+            std::thread::sleep(std::time::Duration::from_secs(1));
+        });
+        let request = Request::new(format!("http://{address}/"), 0.1);
+        let started = std::time::Instant::now();
+        let result = perform(&request);
+        let elapsed = started.elapsed();
+        server.join().unwrap();
+        assert!(result.is_err());
+        assert!(
+            elapsed < std::time::Duration::from_millis(750),
+            "request ignored its timeout: {elapsed:?}"
+        );
+    }
 
     /// A request built the way a guest builds one, run the way
     /// `+sendSynchronousRequest:` runs it. Against a real server, because what
@@ -1144,5 +1956,480 @@ mod tests {
             f(error, sel)
         };
         assert_eq!(code, crate::error::NSURL_ERROR_UNKNOWN);
+    }
+
+    //
+    // `NSURLConnection`, against a local, canned server rather than the
+    // network: these exercise the delegate machinery itself, which a real
+    // host's status code or body does nothing to test.
+    //
+
+    /// A one-shot HTTP server on localhost: it answers the first connection it
+    /// gets with `response`, verbatim, and does nothing else.
+    fn local_server(response: &str) -> String {
+        local_server_sequence(vec![response.to_string()])
+    }
+
+    /// Like `local_server`, but for a test that needs more than one request
+    /// answered - a redirect, say. Each connection in turn gets the next
+    /// response; a request past the end of `responses` gets none.
+    fn local_server_sequence(responses: Vec<String>) -> String {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("a local port");
+        let addr = listener.local_addr().expect("a bound address");
+        std::thread::spawn(move || {
+            for response in responses {
+                let Ok((mut stream, _)) = listener.accept() else {
+                    return;
+                };
+                let mut buf = [0u8; 4096];
+                let _ = stream.read(&mut buf);
+                let _ = stream.write_all(response.as_bytes());
+            }
+        });
+        format!("http://{addr}/")
+    }
+
+    /// A server whose first connection is told to redirect to its second -
+    /// the one case `local_server_sequence` cannot build ahead of time, since
+    /// the redirect target names a port nothing picks until the listener binds.
+    fn redirect_server(final_body: &str) -> String {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("a local port");
+        let addr = listener.local_addr().expect("a bound address");
+        let responses = vec![
+            format!(
+                "HTTP/1.1 302 Found\r\nLocation: http://{addr}/final\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+            ),
+            format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{final_body}",
+                final_body.len()
+            ),
+        ];
+        std::thread::spawn(move || {
+            for response in responses {
+                let Ok((mut stream, _)) = listener.accept() else {
+                    return;
+                };
+                let mut buf = [0u8; 4096];
+                let _ = stream.read(&mut buf);
+                let _ = stream.write_all(response.as_bytes());
+            }
+        });
+        format!("http://{addr}/start")
+    }
+
+    /// Turn the main dispatch queue and loop until `done` is true or the
+    /// budget runs out - what a test waits on instead of the real run loop's
+    /// own idle sleep, since nothing here drives that loop on its own.
+    fn pump_until(done: &std::sync::atomic::AtomicBool) -> bool {
+        for _ in 0..500 {
+            if done.load(Ordering::SeqCst) {
+                return true;
+            }
+            darwin::dispatch::queue::drain_main();
+            corefoundation::runloop::current().run_in_mode(
+                corefoundation::runloop::DEFAULT_MODE,
+                0.0,
+                true,
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        false
+    }
+
+    /// A request built the way `perform`'s own tests build one, for a
+    /// connection test that needs an `NSURLRequest` object rather than the
+    /// plain `Request` those use.
+    fn request_object(url: String) -> Id {
+        make(request_class(), Request::new(url, 5.0))
+    }
+
+    /// An `NSOperationQueue`, for the tests that check delegate-queue
+    /// delivery. Built by sending `-init` rather than calling `queue_init`
+    /// directly, since that function belongs to `operation` and is not this
+    /// module's to call.
+    fn new_operation_queue() -> Id {
+        let class = objc::class::lookup(c"NSOperationQueue").expect("registered by `operation`");
+        let object = objc::object::create_instance(class, 0);
+        let sel = objc::sel::get("init");
+        // SAFETY: `-init` is `id (id, SEL)`, sent to a fresh instance.
+        unsafe {
+            let method = objc::object::class_of(object)
+                .and_then(|c| c.method(sel))
+                .expect("NSOperationQueue answers -init");
+            let f: unsafe extern "C" fn(Id, Sel) -> Id =
+                std::mem::transmute(method.implementation());
+            f(object, sel)
+        }
+    }
+
+    static HAPPY_STATUS: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(-1);
+    static HAPPY_BODY: std::sync::Mutex<Vec<u8>> = std::sync::Mutex::new(Vec::new());
+    static HAPPY_FINISHED: AtomicBool = AtomicBool::new(false);
+
+    unsafe extern "C" fn happy_did_receive_response(
+        _delegate: Id,
+        _sel: Sel,
+        _connection: Id,
+        response: Id,
+    ) {
+        // SAFETY: an `NSHTTPURLResponse` this module made.
+        if let Some(response) = unsafe { response_of(response) } {
+            HAPPY_STATUS.store(response.status as i64, Ordering::SeqCst);
+        }
+    }
+
+    unsafe extern "C" fn happy_did_receive_data(
+        _delegate: Id,
+        _sel: Sel,
+        _connection: Id,
+        data: Id,
+    ) {
+        // SAFETY: an `NSData` this module made.
+        if let Some(bytes) = unsafe { corefoundation::collections::data(data as CFTypeRef) } {
+            HAPPY_BODY
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .extend(bytes.clone());
+        }
+    }
+
+    unsafe extern "C" fn happy_finished(_delegate: Id, _sel: Sel, _connection: Id) {
+        HAPPY_FINISHED.store(true, Ordering::SeqCst);
+    }
+
+    /// `-initWithRequest:delegate:` starts at once, and the delegate hears the
+    /// response, the body, and the finish, in that order - against a server
+    /// this test controls rather than the network.
+    #[test]
+    fn a_delegate_based_connection_gets_the_response_body_and_finish() {
+        crate::bootstrap();
+        HAPPY_STATUS.store(-1, Ordering::SeqCst);
+        HAPPY_BODY.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        HAPPY_FINISHED.store(false, Ordering::SeqCst);
+
+        let class = corefoundation::base::register(
+            c"RosemaryTestConnectionHappyDelegate",
+            None,
+            std::mem::size_of::<usize>(),
+            false,
+        );
+        methods!(class, {
+            "connection:didReceiveResponse:" => happy_did_receive_response, c"v32@0:8@16@24";
+            "connection:didReceiveData:" => happy_did_receive_data, c"v32@0:8@16@24";
+            "connectionDidFinishLoading:" => happy_finished, c"v24@0:8@16";
+        });
+        let delegate = objc::object::create_instance(class, 0);
+        let url =
+            local_server("HTTP/1.1 200 OK\r\nContent-Length: 5\r\nConnection: close\r\n\r\nhello");
+        let request = request_object(url);
+        let connection = objc::object::create_instance(connection_class(), 0);
+        // SAFETY: a fresh connection instance, and a request this module made.
+        unsafe {
+            init_with_request_delegate(
+                connection,
+                objc::sel::get("initWithRequest:delegate:"),
+                request,
+                delegate,
+            );
+        }
+
+        assert!(
+            pump_until(&HAPPY_FINISHED),
+            "the delegate never heard the connection finish"
+        );
+        assert_eq!(HAPPY_STATUS.load(Ordering::SeqCst), 200);
+        assert_eq!(
+            &*HAPPY_BODY.lock().unwrap_or_else(|e| e.into_inner()),
+            b"hello"
+        );
+
+        objc::arc::release(delegate);
+        objc::arc::release(request);
+        objc::arc::release(connection);
+    }
+
+    static REDIRECT_SEEN: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+    static REDIRECT_FINISHED: AtomicBool = AtomicBool::new(false);
+
+    unsafe extern "C" fn redirect_will_send_request(
+        _delegate: Id,
+        _sel: Sel,
+        _connection: Id,
+        request: Id,
+        _redirect_response: Id,
+    ) -> Id {
+        // SAFETY: a request this module made.
+        if let Some(r) = unsafe { request_of(request) } {
+            REDIRECT_SEEN
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push(r.url.clone());
+        }
+        request
+    }
+
+    unsafe extern "C" fn redirect_finished(_delegate: Id, _sel: Sel, _connection: Id) {
+        REDIRECT_FINISHED.store(true, Ordering::SeqCst);
+    }
+
+    /// A connection that gets redirected reports it once, with the final URL -
+    /// see the FIXME on `deliver_success` for what this does not claim: the
+    /// real, per-hop version of this callback.
+    #[test]
+    fn a_redirected_connection_reports_the_final_url_once() {
+        crate::bootstrap();
+        REDIRECT_SEEN
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
+        REDIRECT_FINISHED.store(false, Ordering::SeqCst);
+
+        let class = corefoundation::base::register(
+            c"RosemaryTestConnectionRedirectDelegate",
+            None,
+            std::mem::size_of::<usize>(),
+            false,
+        );
+        methods!(class, {
+            "connection:willSendRequest:redirectResponse:" => redirect_will_send_request, c"@40@0:8@16@24@32";
+            "connectionDidFinishLoading:" => redirect_finished, c"v24@0:8@16";
+        });
+        let delegate = objc::object::create_instance(class, 0);
+        let url = redirect_server("done");
+        let request = request_object(url);
+        let connection = objc::object::create_instance(connection_class(), 0);
+        // SAFETY: a fresh connection instance, and a request this module made.
+        unsafe {
+            init_with_request_delegate(
+                connection,
+                objc::sel::get("initWithRequest:delegate:"),
+                request,
+                delegate,
+            );
+        }
+
+        assert!(
+            pump_until(&REDIRECT_FINISHED),
+            "the delegate never heard the connection finish"
+        );
+        let seen = REDIRECT_SEEN.lock().unwrap_or_else(|e| e.into_inner());
+        assert_eq!(
+            seen.len(),
+            1,
+            "exactly one redirect should be reported: {seen:?}"
+        );
+        assert!(
+            seen[0].ends_with("/final"),
+            "the delegate saw the final URL: {seen:?}"
+        );
+        drop(seen);
+
+        objc::arc::release(delegate);
+        objc::arc::release(request);
+        objc::arc::release(connection);
+    }
+
+    static FAILURE_CODE: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
+    static FAILURE_SEEN: AtomicBool = AtomicBool::new(false);
+
+    unsafe extern "C" fn failure_did_fail(_delegate: Id, _sel: Sel, _connection: Id, error: Id) {
+        let sel = objc::sel::get("code");
+        // SAFETY: an `NSError` this module made.
+        if let Some(method) = unsafe { objc::object::class_of(error) }.and_then(|c| c.method(sel)) {
+            let code: i64 = unsafe {
+                let f: unsafe extern "C" fn(Id, Sel) -> i64 =
+                    std::mem::transmute(method.implementation());
+                f(error, sel)
+            };
+            FAILURE_CODE.store(code, Ordering::SeqCst);
+        }
+        FAILURE_SEEN.store(true, Ordering::SeqCst);
+    }
+
+    /// Nothing listening on a loopback port fails the way a bad host does -
+    /// immediately, and without needing a real network to prove it - and the
+    /// delegate hears about it as an `NSError`.
+    #[test]
+    fn a_connection_failure_reaches_the_delegate_as_an_error() {
+        crate::bootstrap();
+        FAILURE_CODE.store(0, Ordering::SeqCst);
+        FAILURE_SEEN.store(false, Ordering::SeqCst);
+
+        let class = corefoundation::base::register(
+            c"RosemaryTestConnectionFailureDelegate",
+            None,
+            std::mem::size_of::<usize>(),
+            false,
+        );
+        methods!(class, {
+            "connection:didFailWithError:" => failure_did_fail, c"v32@0:8@16@24";
+        });
+        let delegate = objc::object::create_instance(class, 0);
+        let request = request_object("http://127.0.0.1:1/".to_string());
+        let connection = objc::object::create_instance(connection_class(), 0);
+        // SAFETY: a fresh connection instance, and a request this module made.
+        unsafe {
+            init_with_request_delegate(
+                connection,
+                objc::sel::get("initWithRequest:delegate:"),
+                request,
+                delegate,
+            );
+        }
+
+        assert!(
+            pump_until(&FAILURE_SEEN),
+            "the delegate never heard about the failure"
+        );
+        assert_eq!(
+            FAILURE_CODE.load(Ordering::SeqCst),
+            crate::error::NSURL_ERROR_UNKNOWN
+        );
+
+        objc::arc::release(delegate);
+        objc::arc::release(request);
+        objc::arc::release(connection);
+    }
+
+    static CANCELED_CALLS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+    unsafe extern "C" fn canceled_any_call(_delegate: Id, _sel: Sel, _connection: Id, _arg: Id) {
+        CANCELED_CALLS.fetch_add(1, Ordering::SeqCst);
+    }
+
+    unsafe extern "C" fn canceled_finished(_delegate: Id, _sel: Sel, _connection: Id) {
+        CANCELED_CALLS.fetch_add(1, Ordering::SeqCst);
+    }
+
+    /// `-cancel`, sent right after `-start`, beats a response that is still
+    /// on its way - the transfer finishes (this transport cannot interrupt
+    /// it), but the delegate is told nothing at all about how.
+    #[test]
+    fn a_canceled_connection_sends_no_delegate_messages() {
+        crate::bootstrap();
+        CANCELED_CALLS.store(0, Ordering::SeqCst);
+
+        let class = corefoundation::base::register(
+            c"RosemaryTestConnectionCanceledDelegate",
+            None,
+            std::mem::size_of::<usize>(),
+            false,
+        );
+        methods!(class, {
+            "connection:didReceiveResponse:" => canceled_any_call, c"v32@0:8@16@24";
+            "connection:didReceiveData:" => canceled_any_call, c"v32@0:8@16@24";
+            "connection:didFailWithError:" => canceled_any_call, c"v32@0:8@16@24";
+            "connectionDidFinishLoading:" => canceled_finished, c"v24@0:8@16";
+        });
+        let delegate = objc::object::create_instance(class, 0);
+
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("a local port");
+        let addr = listener.local_addr().expect("a bound address");
+        std::thread::spawn(move || {
+            // Answered, but only after `-cancel` has had time to run - proving
+            // this is about a message withheld, not a request too slow to
+            // finish at all.
+            let Ok((mut stream, _)) = listener.accept() else {
+                return;
+            };
+            let mut buf = [0u8; 4096];
+            let _ = stream.set_read_timeout(Some(std::time::Duration::from_millis(50)));
+            let _ = stream.read(&mut buf);
+            std::thread::sleep(std::time::Duration::from_millis(300));
+            let _ = stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok");
+        });
+
+        let request = request_object(format!("http://{addr}/"));
+        let connection = objc::object::create_instance(connection_class(), 0);
+        // SAFETY: a fresh connection instance, and a request this module made.
+        unsafe {
+            init_with_request_delegate(
+                connection,
+                objc::sel::get("initWithRequest:delegate:"),
+                request,
+                delegate,
+            );
+            cancel_connection(connection, objc::sel::get("cancel"));
+        }
+
+        // Long enough for the server's reply and this runtime's own delivery
+        // to have arrived, if either were going to.
+        for _ in 0..60 {
+            darwin::dispatch::queue::drain_main();
+            corefoundation::runloop::current().run_in_mode(
+                corefoundation::runloop::DEFAULT_MODE,
+                0.0,
+                true,
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert_eq!(
+            CANCELED_CALLS.load(Ordering::SeqCst),
+            0,
+            "a canceled connection told its delegate something"
+        );
+
+        objc::arc::release(delegate);
+        objc::arc::release(request);
+        objc::arc::release(connection);
+    }
+
+    static ASYNC_SEEN: std::sync::Mutex<Option<(i64, Vec<u8>, bool)>> = std::sync::Mutex::new(None);
+    static ASYNC_CALLED: AtomicBool = AtomicBool::new(false);
+
+    /// `void (^)(NSURLResponse *, NSData *, NSError *)` - response first, the
+    /// opposite order from `NSURLSession`'s handler.
+    unsafe extern "C" fn async_handler(_block: Id, response: Id, data: Id, error: Id) {
+        // SAFETY: a response and data this module made, or nil.
+        let status = unsafe { response_of(response) }.map_or(-1, |r| r.status as i64);
+        let bytes = unsafe { corefoundation::collections::data(data as CFTypeRef) }
+            .cloned()
+            .unwrap_or_default();
+        *ASYNC_SEEN.lock().unwrap_or_else(|e| e.into_inner()) =
+            Some((status, bytes, error.is_null()));
+        ASYNC_CALLED.store(true, Ordering::SeqCst);
+    }
+
+    /// `+sendAsynchronousRequest:queue:completionHandler:` runs the handler on
+    /// the queue it was given, with the response, the body, and a nil error.
+    #[test]
+    fn send_asynchronous_request_calls_the_handler_on_its_queue() {
+        crate::bootstrap();
+        *ASYNC_SEEN.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        ASYNC_CALLED.store(false, Ordering::SeqCst);
+
+        let url =
+            local_server("HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok");
+        let request = request_object(url);
+        let block = crate::block::fake::block(async_handler as *const std::ffi::c_void);
+        let queue = new_operation_queue();
+        // SAFETY: the prototype is this class method's, and `block` outlives
+        // the call - it is a global block, so nothing here ever copies it.
+        unsafe {
+            send_asynchronous_request(
+                std::ptr::null_mut(),
+                objc::sel::get("sendAsynchronousRequest:queue:completionHandler:"),
+                request,
+                queue,
+                block.id(),
+            );
+        }
+
+        assert!(pump_until(&ASYNC_CALLED), "the handler never ran");
+        let seen = ASYNC_SEEN
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take()
+            .expect("the handler ran");
+        assert_eq!(seen.0, 200);
+        assert_eq!(seen.1, b"ok");
+        assert!(seen.2, "no error on success");
+
+        objc::arc::release(request);
+        objc::arc::release(queue);
     }
 }

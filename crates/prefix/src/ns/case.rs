@@ -2,6 +2,35 @@ use std::ffi::{CStr, CString};
 use std::os::unix::ffi::OsStringExt;
 use std::path::{Path, PathBuf};
 
+/// Resolve existing ancestors while preserving the spelling of a new suffix.
+pub(crate) fn for_creation(path: &Path) -> PathBuf {
+    use std::os::unix::ffi::OsStrExt;
+    let _errno = starnix::errno::Held::now();
+    let mut ancestor = path;
+    let mut suffix = Vec::new();
+    loop {
+        if ancestor.symlink_metadata().is_ok() {
+            break;
+        }
+        if let Some(found) = CString::new(ancestor.as_os_str().as_bytes())
+            .ok()
+            .and_then(|name| insensitive(&name))
+        {
+            let mut resolved = PathBuf::from(std::ffi::OsStr::from_bytes(found.as_bytes()));
+            for part in suffix.iter().rev() {
+                resolved.push(part);
+            }
+            return resolved;
+        }
+        let (Some(name), Some(parent)) = (ancestor.file_name(), ancestor.parent()) else {
+            break;
+        };
+        suffix.push(name);
+        ancestor = parent;
+    }
+    path.to_path_buf()
+}
+
 /// `path`, spelled the way the filesystem spells it, or `None` if no
 /// case-insensitive reading of it exists either.
 ///
@@ -161,6 +190,28 @@ mod tests {
         )
         .unwrap();
         assert_eq!(insensitive(&exact), None);
+    }
+
+    #[test]
+    fn creation_uses_existing_parent_case_and_keeps_new_names() {
+        let scratch = scratch("create");
+        let wanted = scratch.0.join("contents/NewDirectory/Child");
+        let resolved = for_creation(&wanted);
+        std::fs::create_dir_all(&resolved).unwrap();
+        assert!(scratch.0.join("Contents/NewDirectory/Child").is_dir());
+    }
+
+    #[test]
+    fn creation_does_not_create_missing_parents_or_choose_ambiguous_names() {
+        let scratch = scratch("create-ambiguous");
+        let missing = for_creation(&scratch.0.join("contents/Missing/Child"));
+        assert!(std::fs::create_dir(&missing).is_err());
+        if scratch.0.join("contents").exists() {
+            return; // A case-insensitive volume cannot hold an ambiguous pair.
+        }
+        std::fs::create_dir(scratch.0.join("CONTENTS")).unwrap();
+        let wanted = scratch.0.join("contents/NewDirectory");
+        assert_eq!(for_creation(&wanted), wanted);
     }
 
     #[test]

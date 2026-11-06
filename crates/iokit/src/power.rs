@@ -77,11 +77,7 @@ pub unsafe extern "C" fn IOPMAssertionCreateWithDescription(
     _timeout_action: CFTypeRef,
     assertion: *mut u32,
 ) -> i32 {
-    if !assertion.is_null() {
-        let id = NEXT_ASSERTION.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        // SAFETY: an out parameter the caller sized.
-        unsafe { assertion.write(id) };
-    }
+    new_assertion(assertion);
     0
 }
 
@@ -90,14 +86,120 @@ pub unsafe extern "C" fn IOPMAssertionRelease(_assertion: u32) -> i32 {
     0
 }
 
+/// A fresh, distinct assertion id, written through `out` when it is non-null.
+fn new_assertion(out: *mut u32) {
+    if !out.is_null() {
+        let id = NEXT_ASSERTION.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        // SAFETY: an out parameter the caller sized.
+        unsafe { out.write(id) };
+    }
+}
+
+/// `IOReturn IOPMAssertionCreateWithName(CFStringRef type, IOPMAssertionLevel
+/// level, CFStringRef name, IOPMAssertionID *)`.
+///
+/// As [`IOPMAssertionCreateWithDescription`]: granted, not enforced, and the
+/// level is not consulted because nothing here ever checks an assertion's
+/// state - there is no idle timer for one to hold off.
+pub unsafe extern "C" fn IOPMAssertionCreateWithName(
+    _kind: CFTypeRef,
+    _level: u32,
+    _name: CFTypeRef,
+    assertion: *mut u32,
+) -> i32 {
+    new_assertion(assertion);
+    0
+}
+
+/// `IOReturn IOPMAssertionDeclareUserActivity(CFStringRef name,
+/// IOPMUserActiveType type, IOPMAssertionID *)`.
+///
+/// A one-shot assertion id and nothing else: the activity it declares would
+/// reset this host's idle timer, and nothing here lets a guest's idleness
+/// dim or sleep the display in the first place.
+pub unsafe extern "C" fn IOPMAssertionDeclareUserActivity(
+    _name: CFTypeRef,
+    _kind: u32,
+    assertion: *mut u32,
+) -> i32 {
+    new_assertion(assertion);
+    0
+}
+
 exports::exports! {
     functions {
         "IOPMAssertionCreateWithDescription" => IOPMAssertionCreateWithDescription,
+        "IOPMAssertionCreateWithName" => IOPMAssertionCreateWithName,
+        "IOPMAssertionDeclareUserActivity" => IOPMAssertionDeclareUserActivity,
         "IOPMAssertionRelease" => IOPMAssertionRelease,
         "IOPSCopyPowerSourcesInfo" => IOPSCopyPowerSourcesInfo,
         "IOPSCopyPowerSourcesList" => IOPSCopyPowerSourcesList,
         "IOPSGetPowerSourceDescription" => IOPSGetPowerSourceDescription,
         "IOPSCopyExternalPowerAdapterDetails" => IOPSCopyExternalPowerAdapterDetails,
         "IOPSNotificationCreateRunLoopSource" => IOPSNotificationCreateRunLoopSource,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Every assertion a guest creates gets a distinct id, whichever call
+    /// made it - so a release names the one it is given back.
+    #[test]
+    fn assertions_from_either_entry_point_get_distinct_ids() {
+        let mut a = 0u32;
+        let mut b = 0u32;
+        let mut c = 0u32;
+        unsafe {
+            assert_eq!(
+                IOPMAssertionCreateWithName(std::ptr::null(), 255, std::ptr::null(), &mut a),
+                0
+            );
+            assert_eq!(
+                IOPMAssertionDeclareUserActivity(std::ptr::null(), 1, &mut b),
+                0
+            );
+            assert_eq!(
+                IOPMAssertionCreateWithDescription(
+                    std::ptr::null(),
+                    std::ptr::null(),
+                    std::ptr::null(),
+                    std::ptr::null(),
+                    std::ptr::null(),
+                    0.0,
+                    std::ptr::null(),
+                    &mut c,
+                ),
+                0
+            );
+        }
+        assert_ne!(a, 0);
+        assert_ne!(b, 0);
+        assert_ne!(c, 0);
+        assert_ne!(a, b);
+        assert_ne!(b, c);
+        assert_ne!(a, c);
+    }
+
+    /// A null out-parameter is accepted, as a caller that only wants to know
+    /// whether the call succeeded is entitled to pass one.
+    #[test]
+    fn a_null_assertion_slot_does_not_crash() {
+        unsafe {
+            assert_eq!(
+                IOPMAssertionCreateWithName(
+                    std::ptr::null(),
+                    255,
+                    std::ptr::null(),
+                    std::ptr::null_mut()
+                ),
+                0
+            );
+            assert_eq!(
+                IOPMAssertionDeclareUserActivity(std::ptr::null(), 1, std::ptr::null_mut()),
+                0
+            );
+        }
     }
 }

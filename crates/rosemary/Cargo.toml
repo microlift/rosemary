@@ -26,6 +26,8 @@ iosurface.workspace = true
 coretext.workspace = true
 coreaudio.workspace = true
 contacts.workspace = true
+corebluetooth.workspace = true
+usernotifications.workspace = true
 avfoundation.workspace = true
 security.workspace = true
 gamecontroller.workspace = true
@@ -33,6 +35,7 @@ webkit.workspace = true
 forcefeedback.workspace = true
 network.workspace = true
 opencl.workspace = true
+accelerate.workspace = true
 opengl.workspace = true
 metal.workspace = true
 videotoolbox.workspace = true
@@ -55,5 +58,7 @@ mimalloc = { version = "0.1.52", features = ["override"] }
 libc.workspace = true
 darwin.workspace = true
 
+[build-dependencies]
+cc = "1.0"
 [lints]
 workspace = true
