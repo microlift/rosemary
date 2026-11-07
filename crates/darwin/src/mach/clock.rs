@@ -83,6 +83,64 @@ pub unsafe extern "C" fn clock_get_time(clock: Name, out: *mut MachTimespec) -> 
     KERN_SUCCESS
 }
 
+/// Why [`sleep_until`] came back before its deadline.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Woken {
+    /// A signal arrived.
+    Interrupted,
+    /// The host refused the clock or the deadline.
+    Failed,
+}
+
+/// Sleep on the host clock `clock` until it reads `deadline`.
+pub fn sleep_until(clock: libc::clockid_t, deadline: &libc::timespec) -> Result<(), Woken> {
+    #[cfg(not(target_os = "macos"))]
+    {
+        // SAFETY: `deadline` is a live `timespec`; the remainder is unused for
+        // an absolute sleep.
+        let rc = unsafe {
+            libc::clock_nanosleep(clock, libc::TIMER_ABSTIME, deadline, core::ptr::null_mut())
+        };
+        match rc {
+            0 => Ok(()),
+            libc::EINTR => Err(Woken::Interrupted),
+            _ => Err(Woken::Failed),
+        }
+    }
+    // macOS has no `clock_nanosleep`; sleep the relative gap and recheck.
+    #[cfg(target_os = "macos")]
+    loop {
+        let mut now = libc::timespec {
+            tv_sec: 0,
+            tv_nsec: 0,
+        };
+        // SAFETY: `clock_gettime` writes the `timespec` it is given and nothing else.
+        if unsafe { crate::syscall::clock_gettime(clock, &mut now) } != 0 {
+            return Err(Woken::Failed);
+        }
+        let mut gap_sec = deadline.tv_sec - now.tv_sec;
+        let mut gap_nsec = deadline.tv_nsec - now.tv_nsec;
+        if gap_nsec < 0 {
+            gap_nsec += 1_000_000_000;
+            gap_sec -= 1;
+        }
+        if gap_sec < 0 {
+            return Ok(());
+        }
+        let gap = libc::timespec {
+            tv_sec: gap_sec,
+            tv_nsec: gap_nsec,
+        };
+        // SAFETY: `gap` is a live local; the remainder is unused since we recompute.
+        if unsafe { libc::nanosleep(&gap, core::ptr::null_mut()) } != 0 {
+            return match starnix::errno::get() {
+                libc::EINTR => Err(Woken::Interrupted),
+                _ => Err(Woken::Failed),
+            };
+        }
+    }
+}
+
 /// `sleep_type_t` values from `<mach/clock_types.h>`.
 const TIME_ABSOLUTE: i32 = 0;
 const TIME_RELATIVE: i32 = 1;
@@ -137,48 +195,11 @@ pub unsafe extern "C" fn clock_sleep(
             deadline.tv_sec = deadline.tv_sec.saturating_add(1);
         }
     }
-    #[cfg(not(target_os = "macos"))]
     loop {
-        // SAFETY: `deadline` is a live local; the remainder is unused for an
-        // absolute sleep.
-        let rc = unsafe {
-            libc::clock_nanosleep(host, libc::TIMER_ABSTIME, &deadline, core::ptr::null_mut())
-        };
-        match rc {
-            0 => break,
-            libc::EINTR => {}
-            _ => return KERN_FAILURE,
-        }
-    }
-    // macOS has no `clock_nanosleep`; sleep the relative gap and recheck.
-    #[cfg(target_os = "macos")]
-    loop {
-        let mut now = libc::timespec {
-            tv_sec: 0,
-            tv_nsec: 0,
-        };
-        // SAFETY: `clock_gettime` writes the `timespec` it is given and nothing else.
-        if unsafe { crate::syscall::clock_gettime(host, &mut now) } != 0 {
-            return KERN_FAILURE;
-        }
-        let mut gap_sec = deadline.tv_sec - now.tv_sec;
-        let mut gap_nsec = deadline.tv_nsec - now.tv_nsec;
-        if gap_nsec < 0 {
-            gap_nsec += 1_000_000_000;
-            gap_sec -= 1;
-        }
-        if gap_sec < 0 {
-            break;
-        }
-        let gap = libc::timespec {
-            tv_sec: gap_sec,
-            tv_nsec: gap_nsec,
-        };
-        // SAFETY: `gap` is a live local; the remainder is unused since we recompute.
-        if unsafe { libc::nanosleep(&gap, core::ptr::null_mut()) } != 0
-            && starnix::errno::get() != libc::EINTR
-        {
-            return KERN_FAILURE;
+        match sleep_until(host, &deadline) {
+            Ok(()) => break,
+            Err(Woken::Interrupted) => {}
+            Err(_) => return KERN_FAILURE,
         }
     }
     if !remaining.is_null() {

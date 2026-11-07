@@ -2908,6 +2908,7 @@ pub static SIGNATURES: &[FunctionAbi] = &[
     sig!("lstat", I32, P, P),
     sig!("lutimes", I32, P, P),
     sig!("mach_absolute_time", U64),
+    sig!("mach_wait_until", I32, U64),
     sig!("mach_host_self", U32),
     // The three Mach IPC calls `libsteam_api.dylib` makes to talk to the Steam
     // client. They need no translation at all.
@@ -3366,6 +3367,8 @@ pub static SIGNATURES: &[FunctionAbi] = &[
     sig!("setgid", I32, U32),
     sig!("setregid", I32, U32, U32),
     sig!("setreuid", I32, U32, U32),
+    sig!("setruid", I32, U32),
+    sig!("setrgid", I32, U32),
     sig!("setgrent", V),
     sig!("setgroups", I32, I32, P),
     sig!("sethostid", V, I64),
@@ -3458,6 +3461,7 @@ pub static SIGNATURES: &[FunctionAbi] = &[
     sig!("strcpy", P, P, P),
     sig!("strcspn", U64, P, P),
     sig!("strdup", P, P),
+    sig!("crypt", P, P, P),
     sig!("strerror", P, I32),
     sig!("strerror_r", I32, I32, P, U64),
     sig!("strftime", U64, P, U64, P, P),

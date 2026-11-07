@@ -44,6 +44,23 @@ unsafe extern "C" fn absolute_time() -> u64 {
     nanoseconds(libc::CLOCK_MONOTONIC)
 }
 
+/// `kern_return_t mach_wait_until(uint64_t deadline)`: sleep until
+/// `mach_absolute_time` reaches `deadline`. A signal ends the wait early with
+/// `KERN_ABORTED`, as xnu's abort-safe wait does.
+pub unsafe extern "C" fn wait_until(deadline: u64) -> i32 {
+    const NANOS_PER_SEC: u64 = 1_000_000_000;
+    crate::idle::reached(crate::idle::Idle::Wait);
+    let deadline = libc::timespec {
+        tv_sec: (deadline / NANOS_PER_SEC).min(libc::time_t::MAX as u64) as libc::time_t,
+        tv_nsec: (deadline % NANOS_PER_SEC) as _,
+    };
+    match clock::sleep_until(libc::CLOCK_MONOTONIC, &deadline) {
+        Ok(()) => kern::KERN_SUCCESS,
+        Err(clock::Woken::Interrupted) => kern::KERN_ABORTED,
+        Err(clock::Woken::Failed) => kern::KERN_FAILURE,
+    }
+}
+
 /// Ticks including time the machine spent asleep.
 ///
 /// `CLOCK_BOOTTIME` where there is one; `CLOCK_MONOTONIC` otherwise, which
@@ -88,6 +105,7 @@ exports::exports! {
         "mach_absolute_time" => absolute_time,
         "mach_continuous_time" => continuous_time,
         "mach_timebase_info" => timebase_info,
+        "mach_wait_until" => wait_until,
         "CACurrentMediaTime" => current_media_time,
 
         "mach_error" => kern::mach_error,
@@ -237,6 +255,18 @@ fn vm_page_shift() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn wait_until_sleeps_to_an_absolute_deadline() {
+        const WAIT: u64 = 20_000_000;
+        // SAFETY: none of these touches memory.
+        unsafe {
+            assert_eq!(wait_until(0), kern::KERN_SUCCESS, "a past deadline");
+            let deadline = absolute_time() + WAIT;
+            assert_eq!(wait_until(deadline), kern::KERN_SUCCESS);
+            assert!(absolute_time() >= deadline);
+        }
+    }
 
     #[test]
     fn the_clock_moves_forward_and_the_timebase_is_nanoseconds() {
