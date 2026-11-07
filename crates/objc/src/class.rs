@@ -552,6 +552,16 @@ impl Class {
 
     /// Append an ivar. Only before registration, and never on a metaclass.
     pub fn add_ivar(&self, name: &CStr, size: usize, alignment: u8, types: &CStr) -> bool {
+        // `alignment` is log2, as `class_addIvar` documents. Apple caps it too.
+        let align = 1usize << alignment.min(15);
+        let start = self.data().instance_size.load(Ordering::Acquire);
+        self.place_ivar(name, start.next_multiple_of(align), size, types)
+    }
+
+    /// Install an ivar at `offset` - for a compiled class, where the compiler
+    /// put it, moved by [`ivar_slide`]. The instance grows to hold it. Only
+    /// before registration, and never on a metaclass.
+    pub fn place_ivar(&self, name: &CStr, offset: usize, size: usize, types: &CStr) -> bool {
         if self.is_registered() || self.data().is_meta {
             return false;
         }
@@ -563,10 +573,6 @@ impl Class {
         if contents.ivars.iter().any(|i| i.name.as_c_str() == name) {
             return false;
         }
-        // `alignment` is log2, as `class_addIvar` documents. Apple caps it too.
-        let align = 1usize << alignment.min(15);
-        let start = self.data().instance_size.load(Ordering::Acquire);
-        let offset = start.next_multiple_of(align);
         let ivar: &'static Ivar = Box::leak(Box::new(Ivar {
             name: CString::from(name),
             offset,
@@ -577,7 +583,18 @@ impl Class {
         contents.ivars.push(ivar);
         self.data()
             .instance_size
-            .store(offset + size, Ordering::Release);
+            .fetch_max(offset + size, Ordering::AcqRel);
+        true
+    }
+
+    /// Set the instance size a compiled class declares, moved by
+    /// [`ivar_slide`]. Only before registration, and never smaller than the
+    /// ivars already placed.
+    pub fn set_instance_size(&self, size: usize) -> bool {
+        if self.is_registered() {
+            return false;
+        }
+        self.data().instance_size.fetch_max(size, Ordering::AcqRel);
         true
     }
 
@@ -987,6 +1004,17 @@ unsafe fn pair(
     Some(class)
 }
 
+/// How far a compiled class's ivars move, as Apple's `moveIvars` does it: not
+/// at all unless the superclass's instances end past `instance_start`, where
+/// the compiler began this class's ivars, and then by that overlap rounded up
+/// to the strictest ivar alignment so every ivar stays aligned.
+pub fn ivar_slide(superclass_size: usize, instance_start: usize, max_alignment: usize) -> usize {
+    match superclass_size.checked_sub(instance_start) {
+        Some(overlap) if overlap > 0 => overlap.next_multiple_of(max_alignment.max(1)),
+        _ => 0,
+    }
+}
+
 /// Reparent `class`, and its metaclass with it, returning the old superclass.
 ///
 /// Apple's has been deprecated since the runtime it shipped in. Swift still
@@ -1212,6 +1240,29 @@ mod tests {
         let (_, _, class) = adopt_under_nsobject(c"RosemaryAdoptedSwiftClass", bits);
         assert_eq!(class.bits() & FAST_IS_SWIFT_STABLE, FAST_IS_SWIFT_STABLE);
         assert_eq!(class.name_str(), "RosemaryAdoptedSwiftClass");
+    }
+
+    #[test]
+    fn ivars_slide_only_past_a_superclass_that_outgrew_them() {
+        const WORD: usize = size_of::<usize>();
+        assert_eq!(ivar_slide(2 * WORD, 2 * WORD, WORD), 0);
+        assert_eq!(ivar_slide(WORD, 2 * WORD, WORD), 0);
+        assert_eq!(ivar_slide(2 * WORD + 4, 2 * WORD, WORD), WORD);
+        assert_eq!(ivar_slide(2 * WORD + 4, 2 * WORD, 4), 4);
+    }
+
+    #[test]
+    fn a_root_class_declaring_isa_keeps_its_compiled_layout() {
+        const WORD: usize = size_of::<usize>();
+        let root = allocate_pair(None, c"RosemaryCompiledRoot", 0).expect("unused");
+        assert!(root.place_ivar(c"isa", 0, WORD, c"#"));
+        assert!(root.place_ivar(c"refCounts", WORD, WORD, c"Q"));
+        assert!(root.set_instance_size(2 * WORD));
+        register_pair(root);
+
+        assert_eq!(root.ivar(c"isa").unwrap().offset(), 0);
+        assert_eq!(root.ivar(c"refCounts").unwrap().offset(), WORD as isize);
+        assert_eq!(root.instance_size(), 2 * WORD);
     }
 
     #[test]

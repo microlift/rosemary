@@ -510,7 +510,7 @@ fn register_class(
 
     // Ivars, before registration: the runtime lays the class out at
     // `objc_registerClassPair` and will not take one afterwards.
-    let mut ivars = 0;
+    let mut named = Vec::with_capacity(class.ro.ivars.len());
     for ivar in &class.ro.ivars {
         let (Some(n), Some(t)) = (host::c_string(&ivar.name), host::c_string(&ivar.types)) else {
             rt.refusals.push(Refusal::UnrepresentableName {
@@ -521,27 +521,55 @@ fn register_class(
             unsafe { host::objc_disposeClassPair(cls) };
             return None;
         };
-        // `alignment` is already a log2 in the guest's `ivar_t`, which is what
-        // `class_addIvar` wants.
-        // SAFETY: strings outlive the call; `cls` is unregistered.
-        let ok = unsafe {
-            host::class_addIvar(
-                cls,
-                n.as_ptr(),
-                ivar.size as usize,
-                ivar.alignment.min(15) as u8,
-                t.as_ptr(),
-            )
-        };
-        if !ok {
-            rt.refusals.push(Refusal::IvarRejected {
-                name,
-                ivar: ivar.name.clone(),
-            });
-            unsafe { host::objc_disposeClassPair(cls) };
-            return None;
+        named.push((ivar, n, t));
+    }
+    let ivars = named.len();
+    let rejected = match host::adopts_guest_classes() {
+        // An ivar with no offset variable is padding the compiler named; libobjc
+        // never moves it, and no code can find it to read.
+        true => {
+            let compiled: Vec<host::CompiledIvar> = named
+                .iter()
+                .filter(|(ivar, ..)| ivar.offset_va != 0)
+                .map(|(ivar, n, t)| host::CompiledIvar {
+                    name: n,
+                    types: t,
+                    offset: ivar.offset as usize,
+                    size: ivar.size as usize,
+                    alignment: 1 << ivar_alignment_log2(ivar.alignment),
+                })
+                .collect();
+            // SAFETY: `cls` was just adopted and is unregistered.
+            unsafe {
+                host::place_guest_ivars(
+                    cls,
+                    class.ro.instance_start as usize,
+                    class.ro.instance_size as usize,
+                    &compiled,
+                )
+            }
+            .err()
+            .map(|n| n.to_string_lossy().into_owned())
         }
-        ivars += 1;
+        // SAFETY: strings outlive the call; `cls` is unregistered.
+        false => named.iter().find_map(|(ivar, n, t)| {
+            let ok = unsafe {
+                host::class_addIvar(
+                    cls,
+                    n.as_ptr(),
+                    ivar.size as usize,
+                    ivar_alignment_log2(ivar.alignment),
+                    t.as_ptr(),
+                )
+            };
+            (!ok).then(|| ivar.name.clone())
+        }),
+    };
+    if let Some(ivar) = rejected {
+        rt.refusals.push(Refusal::IvarRejected { name, ivar });
+        // SAFETY: as above - still unregistered.
+        unsafe { host::objc_disposeClassPair(cls) };
+        return None;
     }
 
     // Protocols the class adopts.
@@ -645,6 +673,20 @@ fn register_class(
         });
     chain.remove(&class.va);
     Some(host_va)
+}
+
+/// `ivar_t::alignment_raw`'s spelling of "pointer-aligned", as libobjc reads it.
+const IVAR_ALIGNMENT_WORD: u32 = u32::MAX;
+/// log2 of the guest's pointer size.
+const GUEST_WORD_LOG2: u8 = 3;
+
+/// An `ivar_t`'s alignment as the log2 `class_addIvar` takes. Apple caps it
+/// at 15 too.
+fn ivar_alignment_log2(raw: u32) -> u8 {
+    match raw {
+        IVAR_ALIGNMENT_WORD => GUEST_WORD_LOG2,
+        raw => raw.min(15) as u8,
+    }
 }
 
 /// Install one guest method on `target`.

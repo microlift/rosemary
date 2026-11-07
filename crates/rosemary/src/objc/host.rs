@@ -173,6 +173,51 @@ pub unsafe fn allocate_guest_class_pair(
     }
 }
 
+/// Whether [`allocate_guest_class_pair`] adopts the guest's own headers, so a
+/// class keeps the ivar layout it was compiled with: see [`place_guest_ivars`].
+pub fn adopts_guest_classes() -> bool {
+    backend() == Backend::Builtin
+}
+
+/// One ivar of a compiled class, where the compiler put it.
+pub struct CompiledIvar<'a> {
+    pub name: &'a std::ffi::CStr,
+    pub types: &'a std::ffi::CStr,
+    pub offset: usize,
+    pub size: usize,
+    /// In bytes.
+    pub alignment: usize,
+}
+
+/// Lay out an adopted class's ivars as libobjc realizes a compiled class: at
+/// their compiled offsets, moved past the superclass only if it outgrew
+/// `instance_start`. `None` if an ivar is refused, naming it.
+///
+/// # Safety
+///
+/// `cls` is a pair [`allocate_guest_class_pair`] adopted and has not
+/// registered, under [`adopts_guest_classes`].
+pub unsafe fn place_guest_ivars<'a>(
+    cls: Class,
+    instance_start: usize,
+    instance_size: usize,
+    ivars: &[CompiledIvar<'a>],
+) -> Result<(), &'a std::ffi::CStr> {
+    // SAFETY: the caller's obligation.
+    let class = unsafe { builtin::class::from_ptr(cls as *const builtin::class::Class) }
+        .expect("an adopted class");
+    let superclass_size = class.superclass().map_or(0, |s| s.instance_size());
+    let max_alignment = ivars.iter().map(|i| i.alignment).max().unwrap_or(1);
+    let slide = builtin::class::ivar_slide(superclass_size, instance_start, max_alignment);
+    for ivar in ivars {
+        if !class.place_ivar(ivar.name, ivar.offset + slide, ivar.size, ivar.types) {
+            return Err(ivar.name);
+        }
+    }
+    class.set_instance_size(instance_size + slide);
+    Ok(())
+}
+
 /// Whether the guest-memory address `va` is a class the selected runtime
 /// realized: one [`allocate_guest_class_pair`] adopted. Never under `native`,
 /// which adopts nothing.
