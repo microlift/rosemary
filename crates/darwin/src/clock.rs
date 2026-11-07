@@ -1,7 +1,10 @@
 #![cfg_attr(target_os = "macos", allow(dead_code))]
 
 use std::ffi::c_char;
+use std::ffi::c_int;
 use std::ffi::c_void;
+
+use crate::translation::DarwinTranslation;
 
 /// Darwin's 64-bit `struct timeval` from `<sys/_types/_timeval.h>`.
 ///
@@ -304,22 +307,138 @@ unsafe extern "C" fn clock() -> u64 {
     unsafe { host::clock() as u64 }
 }
 
+/// Use this type to decorate a mutable pointer (ie from a header)
+/// that doesn't actually have safe mutability, but you want to convey
+/// what the source code specifies.
+#[repr(transparent)]
+#[derive(Clone, Copy)]
+struct Immutable<T> {
+    val: T,
+}
+
+impl<T> Immutable<T> {
+    pub const fn new(val: T) -> Self {
+        Self { val }
+    }
+
+    pub const fn get(&self) -> &T {
+        &self.val
+    }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub(crate) struct Tm {
+    sec: c_int,
+    min: c_int,
+    hour: c_int,
+    mday: c_int,
+    mon: c_int,
+    year: c_int,
+    wday: c_int,
+    yday: c_int,
+    isdst: c_int,
+    gmtoff: i64,
+    /// `char *` in the SDK, but it names a string the guest must not write.
+    zone: Immutable<*mut c_char>,
+}
+
+impl Tm {
+    const ZERO: Tm = Tm {
+        sec: 0,
+        min: 0,
+        hour: 0,
+        mday: 0,
+        mon: 0,
+        year: 0,
+        wday: 0,
+        yday: 0,
+        isdst: 0,
+        zone: Immutable::new(core::ptr::null_mut()),
+        gmtoff: 0,
+    };
+}
+
+impl DarwinTranslation<libc::tm> for Tm {
+    fn to_host(&self) -> libc::tm {
+        libc::tm {
+            tm_sec: self.sec,
+            tm_min: self.min,
+            tm_hour: self.hour,
+            tm_mday: self.mday,
+            tm_mon: self.mon,
+            tm_year: self.year,
+            tm_wday: self.wday,
+            tm_yday: self.yday,
+            tm_isdst: self.isdst,
+            tm_gmtoff: self.gmtoff as _,
+            tm_zone: *self.zone.get() as _,
+        }
+    }
+
+    fn from_host(host: &libc::tm) -> Self {
+        Self {
+            sec: host.tm_sec,
+            min: host.tm_min,
+            hour: host.tm_hour,
+            mday: host.tm_mday,
+            mon: host.tm_mon,
+            year: host.tm_year,
+            wday: host.tm_wday,
+            yday: host.tm_yday,
+            isdst: host.tm_isdst,
+            gmtoff: host.tm_gmtoff as i64,
+            zone: Immutable::new(host.tm_zone as *mut c_char),
+        }
+    }
+}
+
+const _: () = {
+    assert!(size_of::<Tm>() == 56);
+    assert!(std::mem::offset_of!(Tm, gmtoff) == 40);
+    assert!(std::mem::offset_of!(Tm, zone) == 48);
+};
+
 /// The zone Darwin's `gmtime` names, where glibc's names "GMT".
 const UTC: &std::ffi::CStr = c"UTC";
+
+/// The broken-down UTC time of `*clock`, with Darwin's zone name.
+///
+/// # Safety
+///
+/// `clock` is readable.
+unsafe fn utc(clock: *const libc::time_t) -> Option<Tm> {
+    // SAFETY: an all-zero `struct tm` is a valid one to overwrite.
+    let mut host: libc::tm = unsafe { core::mem::zeroed() };
+    // SAFETY: the caller's obligation for `clock`; `host` is a live local.
+    if unsafe { libc::gmtime_r(clock, &mut host) }.is_null() {
+        return None;
+    }
+    Some(Tm {
+        zone: Immutable::new(UTC.as_ptr().cast_mut()),
+        ..Tm::from_host(&host)
+    })
+}
 
 /// `struct tm *gmtime_r(const time_t *, struct tm *)`
 ///
 /// # Safety
 ///
-/// `clock` is readable and `result` writable.
-unsafe extern "C" fn gmtime_r(clock: *const libc::time_t, result: *mut libc::tm) -> *mut libc::tm {
-    // SAFETY: the caller's obligations; the host's `struct tm` is Darwin's.
-    let tm = unsafe { libc::gmtime_r(clock, result) };
-    if !tm.is_null() {
-        // SAFETY: the host just filled it.
-        unsafe { (*tm).tm_zone = UTC.as_ptr() };
-    }
-    tm
+/// `clock` is readable and `result` writable for one Darwin `struct tm`.
+unsafe extern "C" fn gmtime_r(clock: *const libc::time_t, result: *mut Tm) -> *mut Tm {
+    // SAFETY: the caller's obligation for `clock`.
+    let Some(tm) = (unsafe { utc(clock) }) else {
+        return core::ptr::null_mut();
+    };
+    // SAFETY: the caller's obligation; guest memory need not be Rust-aligned.
+    unsafe { result.write_unaligned(tm) };
+    result
+}
+
+// Darwin keeps `gmtime`'s result per thread rather than in one static shared
+// with the host's own `gmtime` and `localtime`.
+thread_local! {
+    static GMTIME: core::cell::UnsafeCell<Tm> = const { core::cell::UnsafeCell::new(Tm::ZERO) };
 }
 
 /// `struct tm *gmtime(const time_t *)`
@@ -327,14 +446,15 @@ unsafe extern "C" fn gmtime_r(clock: *const libc::time_t, result: *mut libc::tm)
 /// # Safety
 ///
 /// `clock` is readable.
-unsafe extern "C" fn gmtime(clock: *const libc::time_t) -> *mut libc::tm {
-    // SAFETY: the caller's obligations; the host's static `struct tm` is Darwin's.
-    let tm = unsafe { libc::gmtime(clock) };
-    if !tm.is_null() {
-        // SAFETY: the host just filled it.
-        unsafe { (*tm).tm_zone = UTC.as_ptr() };
-    }
-    tm
+unsafe extern "C" fn gmtime(clock: *const libc::time_t) -> *mut Tm {
+    // SAFETY: the caller's obligation for `clock`.
+    let Some(tm) = (unsafe { utc(clock) }) else {
+        return core::ptr::null_mut();
+    };
+    let slot = GMTIME.with(core::cell::UnsafeCell::get);
+    // SAFETY: this thread's own buffer, which lives as long as the thread.
+    unsafe { slot.write(tm) };
+    slot
 }
 
 exports::exports! {
@@ -363,19 +483,47 @@ mod tests {
     #[test]
     fn gmtime_names_its_zone_utc() {
         let epoch: libc::time_t = 0;
-        // SAFETY: an all-zero `struct tm` is a valid one to overwrite.
-        let mut tm: libc::tm = unsafe { std::mem::zeroed() };
+        let mut tm = Tm::ZERO;
         let mut text = [0 as c_char; 16];
         // SAFETY: a readable time, a writable `struct tm` and a sized buffer.
         unsafe {
             assert!(!gmtime_r(&epoch, &mut tm).is_null());
-            let n = libc::strftime(text.as_mut_ptr(), text.len(), c"%Z %Y".as_ptr(), &tm);
+            let host = tm.to_host();
+            let n = libc::strftime(text.as_mut_ptr(), text.len(), c"%Z %Y".as_ptr(), &host);
             assert_eq!(
                 &std::ffi::CStr::from_ptr(text.as_ptr()).to_bytes()[..n],
                 b"UTC 1970"
             );
-            assert_eq!(std::ffi::CStr::from_ptr((*gmtime(&epoch)).tm_zone), UTC);
+            let zone = *(*gmtime(&epoch)).zone.get();
+            assert_eq!(std::ffi::CStr::from_ptr(zone), UTC);
         }
+    }
+
+    #[test]
+    fn gmtime_leaves_the_host_static_alone() {
+        let epoch: libc::time_t = 0;
+        // SAFETY: a readable time; the host's static is only read here.
+        unsafe {
+            let host = libc::gmtime(&epoch);
+            let zone = (*host).tm_zone;
+            let guest = gmtime(&epoch);
+            assert_ne!(guest as usize, host as usize);
+            assert_eq!((*host).tm_zone, zone);
+        }
+    }
+
+    #[test]
+    fn gmtime_keeps_a_buffer_per_thread() {
+        let epoch: libc::time_t = 0;
+        // SAFETY: a readable time.
+        let here = unsafe { gmtime(&epoch) } as usize;
+        // SAFETY: a readable time.
+        let there = std::thread::spawn(move || unsafe { (*gmtime(&86_400)).yday })
+            .join()
+            .expect("the thread");
+        assert_eq!(there, 1);
+        // SAFETY: this thread's buffer is still live.
+        assert_eq!(unsafe { (*(here as *const Tm)).yday }, 0);
     }
 
     #[test]
