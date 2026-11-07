@@ -192,9 +192,21 @@ fn prepare_environment(layout: &Layout, conf: &Conf, exe: &Path, mode: Mode) {
         env::set_var(SELECTED_VAR, mode.name());
         env::set_var(EXE_VAR, exe);
         env::set_var(ROOT_VAR, &layout.root);
+        let places = Placeholders {
+            root: layout.root.as_os_str(),
+            cache: cache_dir(),
+        };
         for (name, value) in &conf.default_env {
-            if env::var_os(name).is_none() {
-                env::set_var(name, expand(value, &layout.root));
+            if env::var_os(name).is_none()
+                && let Some(value) = expand(value, &places)
+            {
+                env::set_var(name, value);
+            }
+        }
+        for (name, value) in &conf.env {
+            match expand(value, &places) {
+                Some(value) => env::set_var(name, value),
+                None => env::remove_var(name),
             }
         }
         for (name, candidates) in &conf.default_path {
@@ -254,17 +266,45 @@ fn first_existing(candidates: &[String]) -> Option<&str> {
         .find(|candidate| Path::new(candidate).exists())
 }
 
-fn expand(value: &str, root: &Path) -> OsString {
-    let root = root.as_os_str().as_bytes();
+/// What `@ROOT@` and `@CACHE@` in `bundle.conf` stand for.
+struct Placeholders<'a> {
+    root: &'a OsStr,
+    cache: Option<PathBuf>,
+}
+
+/// `value` with its placeholders filled in, or `None` if it needs one that
+/// has no value here.
+fn expand(value: &str, places: &Placeholders) -> Option<OsString> {
+    let tokens: [(&[u8], Option<&OsStr>); 2] = [
+        (b"@ROOT@", Some(places.root)),
+        (b"@CACHE@", places.cache.as_deref().map(Path::as_os_str)),
+    ];
     let mut out = Vec::new();
     let mut rest = value.as_bytes();
-    while let Some(at) = rest.windows(6).position(|window| window == b"@ROOT@") {
-        out.extend_from_slice(&rest[..at]);
-        out.extend_from_slice(root);
-        rest = &rest[at + 6..];
+    'scan: while !rest.is_empty() {
+        for (token, replacement) in tokens {
+            if let Some(after) = rest.strip_prefix(token) {
+                out.extend_from_slice(replacement?.as_bytes());
+                rest = after;
+                continue 'scan;
+            }
+        }
+        out.push(rest[0]);
+        rest = &rest[1..];
     }
-    out.extend_from_slice(rest);
-    OsString::from_vec(out)
+    Some(OsString::from_vec(out))
+}
+
+/// The XDG cache directory: `$XDG_CACHE_HOME`, else `~/.cache`.
+fn cache_dir() -> Option<PathBuf> {
+    let absolute = |dir: OsString| Some(PathBuf::from(dir)).filter(|dir| dir.is_absolute());
+    env::var_os("XDG_CACHE_HOME")
+        .and_then(absolute)
+        .or_else(|| {
+            env::var_os("HOME")
+                .and_then(absolute)
+                .map(|home| home.join(".cache"))
+        })
 }
 
 /// NixOS and NixGL search dirs
@@ -408,10 +448,28 @@ mod tests {
 
     #[test]
     fn expands_the_root_everywhere_it_appears() {
+        let places = Placeholders {
+            root: OsStr::new("/r"),
+            cache: None,
+        };
         assert_eq!(
-            expand("@ROOT@/a:@ROOT@/b", Path::new("/r")),
-            OsString::from("/r/a:/r/b")
+            expand("@ROOT@/a:@ROOT@/b", &places),
+            Some(OsString::from("/r/a:/r/b"))
         );
-        assert_eq!(expand("plain", Path::new("/r")), OsString::from("plain"));
+        assert_eq!(expand("plain", &places), Some(OsString::from("plain")));
+    }
+
+    #[test]
+    fn a_value_needing_an_unknown_cache_directory_is_not_set() {
+        let mut places = Placeholders {
+            root: OsStr::new("/r"),
+            cache: None,
+        };
+        assert_eq!(expand("@CACHE@/x", &places), None);
+        places.cache = Some(PathBuf::from("/c"));
+        assert_eq!(
+            expand("@CACHE@/x:@ROOT@", &places),
+            Some(OsString::from("/c/x:/r"))
+        );
     }
 }

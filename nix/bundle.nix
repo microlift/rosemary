@@ -9,6 +9,7 @@
 , xkeyboard-config
 , bubblewrap
 , xdg-dbus-proxy
+, gst_all_1
 , rosemary
 , fhs
 , nixpkgsInfo ? null
@@ -71,7 +72,43 @@ let
     };
   };
 
-  webkitExtras = lib.optionals withWebkit [ relocate glib-networking bubblewrap xdg-dbus-proxy ];
+  # WebKitGTK plays media through GStreamer and builds its pipelines from
+  # elements it finds by name; without autoaudiosink and friends the web
+  # process dies on the first page. The bundled GStreamer cannot use the
+  # host's plugins (other versions, maybe another glibc), so a playback set
+  # ships with it: what WebKit names, plus the demuxers, parsers and decoders
+  # its decodebins pick for the codecs browsers are offered.
+  gstPlugins = with gst_all_1; [
+    { package = gstreamer.out; names = [ "coreelements" ]; }
+    {
+      package = gst-plugins-base;
+      names = [
+        "app" "audioconvert" "audiomixer" "audioresample" "gio" "ogg" "opengl" "opus"
+        "overlaycomposition" "pbtypes" "playback" "rawparse" "subparse" "theora"
+        "typefindfunctions" "videoconvertscale" "videorate" "volume" "vorbis"
+      ];
+    }
+    {
+      package = gst-plugins-good;
+      names = [
+        "adaptivedemux2" "alpha" "apetag" "audiofx" "audioparsers" "autodetect"
+        "deinterlace" "flac" "icydemux" "id3demux" "interleave" "isomp4" "matroska"
+        "mpg123" "pulseaudio" "vpx" "wavparse"
+      ];
+    }
+    {
+      package = gst-plugins-bad;
+      names = [
+        "autoconvert" "closedcaption" "codecalpha" "debugutilsbad" "interlace"
+        "opusparse" "subenc" "videoparsersbad"
+      ];
+    }
+    # H.264, H.265 and AAC, which nothing above decodes.
+    { package = gst-libav; names = [ "libav" ]; }
+  ];
+  gstPackages = with gst_all_1; [ gstreamer gst-plugins-base gst-plugins-good gst-plugins-bad gst-libav ];
+
+  webkitExtras = lib.optionals withWebkit ([ relocate glib-networking bubblewrap xdg-dbus-proxy ] ++ gstPackages);
   providers = runtimeLibs ++ [ gccLib ] ++ webkitExtras;
 
   policy = import ./bundle/policy.nix { inherit withWebkit; };
@@ -112,7 +149,11 @@ let
         path = "${webkit}/lib/webkitgtk-6.0/injected-bundle/libwebkitgtkinjectedbundle.so";
         dest = "lib/webkitgtk-6.0/injected-bundle";
       }
-    ];
+    ] ++ lib.concatMap
+      ({ package, names }: map
+        (name: { path = "${package}/lib/gstreamer-1.0/libgst${name}.so"; dest = "lib/gstreamer-1.0"; })
+        names)
+      gstPlugins;
     executables = map (path: { inherit path; dest = "libexec/webkitgtk-6.0"; }) [
       "${webkitHelpers}/WebKitWebProcess"
       "${webkitHelpers}/WebKitNetworkProcess"
@@ -128,6 +169,15 @@ let
     conf = [
       "default_env.GIO_EXTRA_MODULES=@ROOT@/lib/gio/modules"
       "default_env.WEBKIT_INJECTED_BUNDLE_PATH=@ROOT@/lib/webkitgtk-6.0/injected-bundle"
+      # Only the bundle's plugins: a host plugin path would load plugins built
+      # against another GStreamer. Scanned in process, as the scanner helper
+      # is a store path, into a registry of its own so the host's GStreamer
+      # and this one do not keep rewriting each other's. WebKit's sandbox
+      # binds GST_REGISTRY and this directory, not GST_REGISTRY_1_0.
+      "env.GST_PLUGIN_SYSTEM_PATH_1_0=@ROOT@/lib/gstreamer-1.0"
+      "env.GST_PLUGIN_PATH_1_0="
+      "env.GST_REGISTRY_FORK=no"
+      "env.GST_REGISTRY=@CACHE@/gstreamer-1.0/rosemary-registry.bin"
       # libxkbcommon's built-in data directory is a store path.
       "default_env.XKB_CONFIG_ROOT=@ROOT@/share/X11/xkb"
       # The bundled fontconfig and GnuTLS look for their configuration in the
