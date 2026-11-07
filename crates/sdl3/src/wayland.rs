@@ -305,6 +305,24 @@ pub fn has_pointer_constraints() -> bool {
     with_state(|state| state.constraints != 0)
 }
 
+/// Commit pending state on a live SDL surface, ordered against presentation.
+pub(crate) fn commit(surface: *mut c_void) {
+    let Some(client) = client() else {
+        return;
+    };
+    let _commits = crate::compositor::guard();
+    // SAFETY: the caller owns the live surface and this is wl_surface.commit.
+    unsafe {
+        (client.wl_proxy_marshal_flags)(
+            surface,
+            WL_SURFACE_COMMIT,
+            std::ptr::null(),
+            (client.wl_proxy_get_version)(surface),
+            0,
+        );
+    }
+}
+
 /// Put the pointer at `(x, y)` on `surface`, surface-local, by locking it
 /// with that position as the hint and unlocking it at once.
 ///
@@ -362,13 +380,7 @@ pub fn warp_through_lock(surface: *mut c_void, x: f32, y: f32) -> bool {
             to_fixed(x),
             to_fixed(y),
         );
-        (client.wl_proxy_marshal_flags)(
-            surface,
-            WL_SURFACE_COMMIT,
-            std::ptr::null(),
-            (client.wl_proxy_get_version)(surface),
-            0,
-        );
+        commit(surface);
         (client.wl_proxy_marshal_flags)(
             lock,
             ZWP_LOCKED_POINTER_V1_DESTROY,
@@ -379,13 +391,7 @@ pub fn warp_through_lock(surface: *mut c_void, x: f32, y: f32) -> bool {
         // KWin applies the unlock, and with it the hint, on the next commit.
         // Without this one, that is the commit after the caller locks again
         // for SDL, and the hint is lost to the new lock.
-        (client.wl_proxy_marshal_flags)(
-            surface,
-            WL_SURFACE_COMMIT,
-            std::ptr::null(),
-            (client.wl_proxy_get_version)(surface),
-            0,
-        );
+        commit(surface);
     }
     // The compositor need not report the move, and a caller comparing
     // against the old position would warp again every time it asked.
