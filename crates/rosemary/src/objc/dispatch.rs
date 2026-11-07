@@ -148,6 +148,7 @@ pub(super) static RUNTIME: &[Runtime] = &[
         protocols: &[1],
         struct_return: None,
     },
+    rtc!([0], "class_copyIvarList", P, P, P),
     rtc!([0], "class_copyPropertyList", P, P, P),
     rtc!([0] -> true, "class_createInstance", P, P, U64),
     rtc!([0], "class_getClassMethod", P, P, P),
@@ -157,6 +158,7 @@ pub(super) static RUNTIME: &[Runtime] = &[
     // The compiler-emitted ARC layout bitmap for a class's strong ivars. This
     // runtime does not model one; see `BUILTIN_GAPS`.
     rtc!([0], "class_getIvarLayout", P, P),
+    rtc!([0], "class_getMethodImplementation", P, P, P),
     rtc!([0], "class_getName", P, P),
     rtc!([0], "class_getProperty", P, P, P),
     rtc!([0] -> true, "class_getSuperclass", P, P),
@@ -190,6 +192,7 @@ pub(super) static RUNTIME: &[Runtime] = &[
     rt!("objc_autoreleasePoolPop", V, P),
     rt!("objc_autoreleasePoolPush", P),
     rtc!([0], "objc_autoreleaseReturnValue", P, P),
+    rtc!([0], "objc_constructInstance", P, P, P),
     //
     // These four are the whole of ARC's weak-reference support that SDL3's Cocoa
     // backend imports, and passthrough is right for a reason worth stating: a
@@ -210,6 +213,7 @@ pub(super) static RUNTIME: &[Runtime] = &[
     rt!("objc_copyStruct", V, P, P, I64, U8, U8),
     rt!("objc_copyWeak", V, P, P),
     rt!("objc_destroyWeak", V, P),
+    rt!("objc_destructInstance", P, P),
     // The hook the compiler emits inside every `for (x in collection)` loop, to
     // be called when the collection changed underneath it.
     rt!("objc_enumerationMutation", V, P),
@@ -301,6 +305,7 @@ pub(super) static RUNTIME: &[Runtime] = &[
     rt!("objc_terminate", V),
     // The `__unsafe_unretained` end of the autoreleased-return-value handshake.
     rtc!([0], "objc_unsafeClaimAutoreleasedReturnValue", P, P),
+    rt!("object_dispose", P, P),
     rtc!([0] -> true, "object_getClass", P, P),
     rtc!([0], "object_getClassName", P, P),
     rt!("object_getIndexedIvars", P, P),
@@ -311,6 +316,16 @@ pub(super) static RUNTIME: &[Runtime] = &[
     rt!("property_copyAttributeList", P, P, P),
     rt!("property_getAttributes", P, P),
     rt!("property_getName", P, P),
+    Runtime {
+        name: "protocol_conformsToProtocol",
+        types: &[U8, P, P],
+        classes: &[],
+        class_return: false,
+        callbacks: &[],
+        blocks: &[],
+        protocols: &[0, 1],
+        struct_return: None,
+    },
     //
     // `struct objc_method_description protocol_getMethodDescription(Protocol *,
     // SEL, BOOL isRequiredMethod, BOOL isInstanceMethod)` - two pointers, `{SEL
