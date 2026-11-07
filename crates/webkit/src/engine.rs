@@ -201,7 +201,24 @@ fn pump() {
         item();
     }
     crate::web_view::tick(engine);
+    restore_guest_gl(engine.api);
     objc::arc::pool_pop(pool);
+}
+
+/// GTK and the embedded compositor bind EGL directly, bypassing SDL's TLS.
+/// Clear both libraries' bookkeeping before restoring the guest's binding;
+/// otherwise SDL may skip the native bind because its cached pointers match.
+fn restore_guest_gl(api: &Api) {
+    let context = sdl3::video::gl_current_context();
+    let window = sdl3::video::gl_current_window();
+    // SAFETY: called on GTK's thread after its rendering work has returned.
+    unsafe { (api.gdk_gl_context_clear_current)() };
+    if !context.is_null() {
+        sdl3::video::gl_make_current(std::ptr::null_mut(), std::ptr::null_mut());
+        if !sdl3::video::gl_make_current(window, context) {
+            warn_once("could not restore the guest OpenGL context after web rendering");
+        }
+    }
 }
 
 /// A guest block kept past the call that passed it.
@@ -344,5 +361,64 @@ pub fn unref(api: &Api, object: usize) {
     if object != 0 {
         // SAFETY: a reference the caller owns.
         unsafe { (api.g_object_unref)(object as Ptr) };
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod gl_tests {
+    use super::*;
+
+    #[test]
+    #[ignore = "requires a host EGL driver and WebKitGTK"]
+    fn web_rendering_restores_native_gl_even_when_sdl_cached_state_matches() {
+        appkit::bootstrap();
+        let api = gtk::api().expect("WebKitGTK");
+        let window = sdl3::video::create_window(
+            c"GL restoration test",
+            2,
+            2,
+            sdl3::video::flags::OPENGL | sdl3::video::flags::HIDDEN,
+        )
+        .expect("GL window");
+        let guest = sdl3::video::gl_create_context(window).expect("guest context");
+        let foreign = sdl3::video::gl_create_context(window).expect("foreign context");
+        assert!(sdl3::video::egl::backs(foreign), "test needs EGL");
+        assert!(sdl3::video::gl_make_current(window, guest));
+        let symbol = |name: &std::ffi::CStr| {
+            // SAFETY: a static symbol name in the EGL driver already loaded by SDL.
+            let address = unsafe { libc::dlsym(libc::RTLD_DEFAULT, name.as_ptr()) };
+            assert!(!address.is_null(), "missing {name:?}");
+            address
+        };
+        // SAFETY: checked EGL entry points, with their declared prototypes.
+        unsafe {
+            let current_display: unsafe extern "C" fn() -> Ptr = std::mem::transmute(libc::dlsym(
+                libc::RTLD_DEFAULT,
+                c"eglGetCurrentDisplay".as_ptr(),
+            ));
+            let current_surface: unsafe extern "C" fn(u32) -> Ptr =
+                std::mem::transmute(symbol(c"eglGetCurrentSurface"));
+            let make_current: unsafe extern "C" fn(Ptr, Ptr, Ptr, Ptr) -> u32 =
+                std::mem::transmute(symbol(c"eglMakeCurrent"));
+            assert_ne!(
+                make_current(
+                    current_display(),
+                    current_surface(0x3059),
+                    current_surface(0x305A),
+                    foreign
+                ),
+                0
+            );
+        }
+        assert_eq!(sdl3::video::gl_current_context(), guest);
+        assert!(sdl3::video::egl::backs(foreign));
+        restore_guest_gl(api);
+        assert_eq!(sdl3::video::gl_current_context(), guest);
+        assert_eq!(sdl3::video::gl_current_window(), window);
+        assert!(sdl3::video::egl::backs(guest));
+        sdl3::video::gl_make_current(std::ptr::null_mut(), std::ptr::null_mut());
+        sdl3::video::gl_destroy_context(foreign);
+        sdl3::video::gl_destroy_context(guest);
+        sdl3::video::destroy_window(window);
     }
 }
