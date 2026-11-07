@@ -1067,7 +1067,7 @@ fn send(
     // A receiver in guest memory is not automatically broken.
     if vm.program.is_guest_address(host_receiver) {
         let isa = vm.objc_host_class((mem as &dyn GuestMemory).read_u64(host_receiver, symbol)?);
-        if isa == 0 || vm.program.is_guest_address(isa) {
+        if isa == 0 || (vm.program.is_guest_address(isa) && !host::is_adopted_class(isa)) {
             return Err(AbiError::Refused {
                 symbol: symbol.to_string(),
                 reason: "the receiver is a guest address whose class the runtime never realized",

@@ -485,7 +485,15 @@ fn register_class(
 
     // SAFETY: `c_name` is NUL-terminated and outlives the call; `superclass` is
     // either null, a `Class` the host runtime gave us, or one it created above.
-    let cls = unsafe { host::objc_allocateClassPair(superclass, c_name.as_ptr(), 0) };
+    // The headers are the guest's `__objc_data`, mapped writable for good.
+    let cls = unsafe {
+        host::allocate_guest_class_pair(
+            class.va,
+            class.meta.as_ref().map(|m| m.va),
+            superclass,
+            c_name.as_ptr(),
+        )
+    };
     if cls.is_null() {
         // The runtime declines exactly one thing here, and it is worth telling
         // apart: a name already in use. A guest defining `NSString` is a
@@ -868,7 +876,9 @@ fn patch_ivar_offsets(
 /// it - a send is intercepted, and `dispatch` translates the receiver on the way
 /// through - but a native image reaches `objc_msgSend` directly, so a classref
 /// still holding the guest's own `objc_class` is a message to a structure this
-/// runtime never made.
+/// runtime never made. Under `builtin` a class is adopted where the guest's
+/// image put it, so only protocol references change.
+///
 /// `report` is which images to walk, and is not always `r`'s own: an image the
 /// guest `dlopen`ed has a report of its own, and its references need this pass as
 /// much as the executable's did.
@@ -887,7 +897,8 @@ pub(crate) fn rewrite_refs(
             .iter()
             .flat_map(|c| core::iter::once(c.va).chain(c.meta.as_ref().map(|m| m.va)));
         for va in declared {
-            if let Some(host) = rt.host_class(va) {
+            // An adopted class is already where the code names it.
+            if let Some(host) = rt.host_class(va).filter(|&host| host != va) {
                 host::alias_class(va, host);
             }
         }

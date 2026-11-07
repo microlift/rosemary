@@ -137,6 +137,52 @@ pub fn deny_foreign_classes(provider: &mut machish::resolve::NativeDylibProvider
     }
 }
 
+/// `objc_allocateClassPair`, for the guest's compiled `objc_class` at `guest`
+/// and its metaclass at `guest_meta`.
+///
+/// Under `builtin` the guest's own headers become the pair, as libobjc
+/// realizes an image's classes where the image put them, so the address the
+/// guest has is the class. Apple's runtime adopts only images dyld maps, which
+/// a guest image is not, so under `native` the pair is a new one.
+///
+/// # Safety
+///
+/// `guest` and `guest_meta` are writable `objc_class` headers in a mapped image,
+/// written by nothing else from here on; the rest as `objc_allocateClassPair`.
+pub unsafe fn allocate_guest_class_pair(
+    guest: u64,
+    guest_meta: Option<u64>,
+    superclass: Class,
+    name: *const c_char,
+) -> Class {
+    match backend() {
+        Backend::Native => unsafe { objc_allocateClassPair(superclass, name, 0) },
+        Backend::Builtin => {
+            // SAFETY: the caller's obligations, which are `adopt_pair`'s; a
+            // superclass is null or a class this runtime made or adopted.
+            let class = unsafe {
+                builtin::class::adopt_pair(
+                    guest as usize as *mut builtin::class::Class,
+                    guest_meta.map(|m| m as usize as *mut builtin::class::Class),
+                    builtin::class::from_ptr(superclass as *const builtin::class::Class),
+                    std::ffi::CStr::from_ptr(name),
+                )
+            };
+            class.map_or(std::ptr::null_mut(), |c| builtin::class::ptr(c).cast())
+        }
+    }
+}
+
+/// Whether the guest-memory address `va` is a class the selected runtime
+/// realized: one [`allocate_guest_class_pair`] adopted. Never under `native`,
+/// which adopts nothing.
+pub fn is_adopted_class(va: u64) -> bool {
+    match backend() {
+        Backend::Native => false,
+        Backend::Builtin => builtin::class::is_known(va as usize as *const builtin::class::Class),
+    }
+}
+
 /// The host's own libobjc, reached by `dlsym`.
 ///
 /// Empty off macOS, where [`backend`] never selects it.
