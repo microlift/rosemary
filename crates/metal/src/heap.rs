@@ -79,7 +79,7 @@ pub struct Heap {
 
 impl Heap {
     /// The Vulkan memory type index every block is allocated from.
-    pub fn memory_type(&self) -> u32 {
+    pub fn memory_type(&self) -> u64 {
         self.memory_type
     }
 
