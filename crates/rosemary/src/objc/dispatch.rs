@@ -107,6 +107,7 @@ const P: T = T::Pointer;
 
 /// The runtime surface a guest reaches, **sorted by name**.
 pub(super) static RUNTIME: &[Runtime] = &[
+    rtc!([0], "_objc_rootAutorelease", P, P),
     //
     // The other direction of [`crate::objc::register`]. That pass replays the
     // classes a guest *declared* in its `__objc_data`; these three are a guest

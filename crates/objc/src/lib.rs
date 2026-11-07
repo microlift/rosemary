@@ -139,6 +139,7 @@ exports::exports! {
         "objc_retain" => api::objc_retain,
         "objc_release" => api::objc_release,
         "objc_autorelease" => api::objc_autorelease,
+        "_objc_rootAutorelease" => api::_objc_rootAutorelease,
         "objc_autoreleasePoolPush" => api::objc_autoreleasePoolPush,
         "objc_autoreleasePoolPop" => api::objc_autoreleasePoolPop,
         "objc_autoreleaseReturnValue" => api::objc_autoreleaseReturnValue,

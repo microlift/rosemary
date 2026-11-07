@@ -1058,6 +1058,12 @@ pub unsafe extern "C" fn objc_autorelease(object: Id) -> Id {
     crate::arc::autorelease(object)
 }
 
+/// `id _objc_rootAutorelease(id)`: what `-[NSObject autorelease]` does, for a
+/// root class of another runtime's that implements its own. Never sends.
+pub unsafe extern "C" fn _objc_rootAutorelease(object: Id) -> Id {
+    crate::arc::autorelease(object)
+}
+
 pub unsafe extern "C" fn objc_autoreleasePoolPush() -> *mut c_void {
     crate::arc::pool_push()
 }
