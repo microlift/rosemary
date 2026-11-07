@@ -97,6 +97,8 @@ pub(super) unsafe extern "C" fn copy_buffer_to_buffer(
             ),
         );
     }
+    mark_buffer_touched(source);
+    mark_buffer_touched(destination);
     // Destination first: a copy within one buffer imports it, so the source
     // is then read on the device rather than snapshotted.
     let (to, destination_offset) = to.device_range(destination_offset, size);
@@ -219,6 +221,8 @@ pub(super) unsafe extern "C" fn copy_buffer_to_texture_options(
             ),
         );
     }
+    mark_buffer_touched(source);
+    mark_texture_touched(destination);
     let (buffer, source_offset) = command.copy_source(source, source_offset, total);
     let region = vk::BufferImageCopy::default()
         .buffer_offset(source_offset)
@@ -343,6 +347,8 @@ pub(super) unsafe extern "C" fn copy_texture_to_buffer_options(
             ),
         );
     }
+    mark_texture_touched(source);
+    mark_buffer_touched(destination);
     let (buffer, destination_offset) = to.device_range(destination_offset, total);
     let region = vk::BufferImageCopy::default()
         .buffer_offset(destination_offset)
@@ -436,6 +442,8 @@ pub(super) unsafe extern "C" fn copy_texture_to_texture(
             return refuse("copyFromTexture:toTexture:", reason);
         }
     };
+    mark_texture_touched(source);
+    mark_texture_touched(destination);
     let region = vk::ImageCopy::default()
         .src_subresource(vk::ImageSubresourceLayers {
             aspect_mask: from.image.aspect,
@@ -494,6 +502,7 @@ pub(super) unsafe extern "C" fn generate_mipmaps(receiver: Id, _sel: Sel, textur
     if image.is_texture_buffer() {
         return gpu::trace("generateMipmapsForTexture: of a texture buffer, which has no image");
     }
+    mark_texture_touched(texture);
     let device = &command.gpu.device;
     let vk_command = command.command_buffer;
     let mut width = image.image.width as i32;

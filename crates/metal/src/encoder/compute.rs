@@ -63,6 +63,7 @@ pub(super) unsafe extern "C" fn dispatch_threadgroups(
     }
     gpu::milestone("compute dispatch");
     stats::count(Counter::Dispatches);
+    encoder.count_async_compute_eligibility();
     let command = encoder.command();
     // SAFETY: recording into this command buffer.
     let label = state.profile_label.as_ref().map(|label| {

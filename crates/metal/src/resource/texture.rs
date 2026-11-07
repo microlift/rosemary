@@ -16,6 +16,11 @@ pub(crate) struct Texture {
     /// retained; null for a texture with an image.
     pub texel_view: vk::BufferView,
     buffer: Id,
+    /// Set once a render pass or blit encoder has ever bound this texture
+    /// (or, for a view, the texture it sees into); never cleared. Research
+    /// for whether a compute dispatch could safely run on a queue of its
+    /// own - see `encoder::async_compute_research` - not yet acted on.
+    pub touched_outside_compute: std::sync::atomic::AtomicBool,
 }
 
 impl Texture {
@@ -201,6 +206,7 @@ pub(crate) fn new_texture_in(
             attachment_views: Vec::new(),
             texel_view: vk::BufferView::null(),
             buffer: std::ptr::null_mut(),
+            touched_outside_compute: std::sync::atomic::AtomicBool::new(false),
         },
     );
     if !texture.is_null() {
@@ -263,6 +269,7 @@ pub(crate) fn drawable_texture(gpu: &'static Gpu, image: GpuImage, pixel_format:
             attachment_views: Vec::new(),
             texel_view: vk::BufferView::null(),
             buffer: std::ptr::null_mut(),
+            touched_outside_compute: std::sync::atomic::AtomicBool::new(false),
         },
     )
 }
@@ -981,6 +988,7 @@ fn texture_view(
             attachment_views: Vec::new(),
             texel_view: vk::BufferView::null(),
             buffer: std::ptr::null_mut(),
+            touched_outside_compute: std::sync::atomic::AtomicBool::new(false),
         },
     )
 }
@@ -1079,6 +1087,7 @@ pub(super) unsafe extern "C" fn buffer_new_texture(
             attachment_views: Vec::new(),
             texel_view,
             buffer: objc::arc::retain(receiver),
+            touched_outside_compute: std::sync::atomic::AtomicBool::new(false),
         },
     )
 }

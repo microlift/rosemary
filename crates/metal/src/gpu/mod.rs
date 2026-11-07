@@ -128,6 +128,11 @@ pub struct Gpu {
     /// The blocks `MTLStorageModePrivate` buffers are cut out of: device
     /// memory, never mapped.
     private_buffers: OnceLock<Heap>,
+    /// The blocks ordinary (non-placement) private images are cut out of,
+    /// parallel to `private_buffers`. `None` where no memory type admits the
+    /// representative texture used to size it, so every image then falls
+    /// back to a dedicated allocation, as before this existed.
+    private_images: OnceLock<Option<Heap>>,
     /// Two-timestamp query pools, one per command buffer in flight, kept for
     /// reuse by command-buffer timing and the optional statistics.
     timestamp_pools: Mutex<Vec<vk::QueryPool>>,
@@ -261,11 +266,16 @@ struct ContextBudget {
 
 impl ContextBudget {
     fn new() -> Self {
+        // A scene with several passes queued ahead of completion (shadow,
+        // main, post-process, UI, ...) has been observed pegging a default
+        // of 64, and then pegging 128 again at its heaviest moment, each
+        // time blocking the recording thread on `ContextPressure` waits;
+        // 256 gives headroom above the peak actually observed so far.
         let limit = std::env::var("ROSEMARY_METAL_MAX_COMMAND_BUFFERS")
             .ok()
             .and_then(|value| value.parse().ok())
             .filter(|limit| *limit > 0)
-            .unwrap_or(64);
+            .unwrap_or(256);
         Self {
             used: Mutex::new(0),
             available: std::sync::Condvar::new(),
@@ -277,11 +287,30 @@ impl ContextBudget {
 /// How many retired objects of each kind are kept for reuse. Enough for the
 /// command buffers of a few frames in flight; a burst beyond it is destroyed
 /// rather than held for the rest of the run.
+///
+/// Primary command contexts are the exception: [`ContextBudget::limit`]
+/// already bounds how many may be in flight at once, so their recycle pool
+/// tracks that limit instead - keeping fewer recycled than the budget allows
+/// in flight would rebuild a command pool, buffer and fence from scratch
+/// every frame for whichever ones land past this ceiling.
 const RECYCLED: usize = 32;
 
 /// The size of one chunk `-setBytes:` copies are cut from. Metal limits one
 /// copy to four kilobytes, so a chunk holds a frame's worth of them.
 pub const UPLOAD_CHUNK: u64 = 256 << 10;
+
+/// How many upload chunks stay recycled rather than freed.
+///
+/// `-setBytes:` and every `-replaceRegion:` under [`UPLOAD_CHUNK`] draw from
+/// this one pool - see `gpu::deferred`, whose own comment says a game
+/// streaming its world in fills hundreds of mip levels a frame. `RECYCLED`
+/// is sized for command and descriptor pools reused a few frames at a time;
+/// a burst of small texture copies competing with that ceiling forced every
+/// chunk past the sixteenth into a fresh `vkCreateBuffer`/`vkAllocateMemory`
+/// for the rest of the burst, torn down again once it retired. The ceiling
+/// here matches [`STAGING_POOL_BYTES`], so the two pools together bound
+/// recycled staging memory by one consistent budget.
+const UPLOAD_CHUNKS_RECYCLED: usize = (STAGING_POOL_BYTES / UPLOAD_CHUNK) as usize;
 
 /// The most staging memory a device keeps for reuse between transfers too
 /// large for an upload chunk.
@@ -816,6 +845,7 @@ impl Gpu {
             fail_immediate_wait_after_submit: AtomicBool::new(false),
             buffers: OnceLock::new(),
             private_buffers: OnceLock::new(),
+            private_images: OnceLock::new(),
             timestamp_pools: Mutex::new(Vec::new()),
             timestamp_period: properties.limits.timestamp_period,
             timestamp_valid_bits: families[queue_family as usize].timestamp_valid_bits,
@@ -903,8 +933,15 @@ unsafe impl Send for GpuBuffer {}
 
 pub struct GpuImage {
     pub image: vk::Image,
+    /// Device memory of its own: made only where `heap`'s memory type does
+    /// not admit this image, which an ordinary colour or depth format on a
+    /// device with one device-local type never does.
     pub memory: Option<vk::DeviceMemory>,
-    /// The placement heap memory it is bound into, instead of `memory`.
+    /// The shared private-image heap's range this is cut from, instead of
+    /// `memory`.
+    pub heap: Option<Allocation>,
+    /// The placement heap memory it is bound into, instead of `memory` or
+    /// `heap`.
     pub placement: Option<Arc<Placement>>,
     pub view: vk::ImageView,
     pub format: vk::Format,
@@ -1049,6 +1086,7 @@ impl GpuImage {
         Self {
             image: vk::Image::null(),
             memory: None,
+            heap: None,
             placement: None,
             view: vk::ImageView::null(),
             format: vk::Format::UNDEFINED,
