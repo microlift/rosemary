@@ -487,6 +487,58 @@ unsafe extern "C" fn availability_version_check(count: u32, versions: *const Bui
         .all(|entry| entry.version <= running) as u8
 }
 
+/// compiler-rt's `ConstructVersion`: the packing `dyld_build_version_t` uses,
+/// each part masked to its field.
+fn packed_version(major: u32, minor: u32, subminor: u32) -> u32 {
+    ((major & 0xffff) << 16) | ((minor & 0xff) << 8) | (subminor & 0xff)
+}
+
+/// `int32_t __isPlatformVersionAtLeast(uint32_t platform, uint32_t major,
+/// uint32_t minor, uint32_t subminor)`: what `@available` compiles to since
+/// clang 15, from compiler-rt.
+extern "C" fn is_platform_version_at_least(
+    platform: u32,
+    major: u32,
+    minor: u32,
+    subminor: u32,
+) -> i32 {
+    let wanted = [BuildVersion {
+        platform,
+        version: packed_version(major, minor, subminor),
+    }];
+    // SAFETY: a local array of one entry.
+    i32::from(unsafe { availability_version_check(1, wanted.as_ptr()) })
+}
+
+/// `int32_t __isPlatformOrVariantPlatformVersionAtLeast(uint32_t platform,
+/// uint32_t major, uint32_t minor, uint32_t subminor, uint32_t platform2,
+/// uint32_t major2, uint32_t minor2, uint32_t subminor2)`: the zippered
+/// spelling, one requirement for macOS and one for Mac Catalyst.
+#[allow(clippy::too_many_arguments)]
+extern "C" fn is_platform_or_variant_platform_version_at_least(
+    platform: u32,
+    major: u32,
+    minor: u32,
+    subminor: u32,
+    platform2: u32,
+    major2: u32,
+    minor2: u32,
+    subminor2: u32,
+) -> i32 {
+    let wanted = [
+        BuildVersion {
+            platform,
+            version: packed_version(major, minor, subminor),
+        },
+        BuildVersion {
+            platform: platform2,
+            version: packed_version(major2, minor2, subminor2),
+        },
+    ];
+    // SAFETY: a local array of two entries.
+    i32::from(unsafe { availability_version_check(2, wanted.as_ptr()) })
+}
+
 // Not the same list on both hosts: `sysconf`'s names are Darwin's already on a
 // Mac.
 /// Darwin's `NXArchInfo`.
@@ -564,6 +616,8 @@ exports::exports! {
         "compat_mode" => compat_mode,
         "Gestalt" => gestalt,
         "_availability_version_check" => availability_version_check,
+        "__isPlatformVersionAtLeast" => is_platform_version_at_least,
+        "__isPlatformOrVariantPlatformVersionAtLeast" => is_platform_or_variant_platform_version_at_least,
         "sysconf" => sysconf,
         "getrusage" => getrusage,
         "pathconf" => pathconf,
@@ -619,6 +673,28 @@ mod tests {
         assert_eq!(system_version_bcd(10, 10, 0), 0x1090);
         assert_eq!(system_version_bcd(10, 6, 8), 0x1068);
         assert!(system_version_bcd(26, 0, 0) >= 0x1050);
+    }
+
+    #[test]
+    fn platform_version_at_least_compares_against_the_running_macos() {
+        assert_eq!(is_platform_version_at_least(PLATFORM_MACOS, 10, 9, 0), 1);
+        assert_eq!(is_platform_version_at_least(PLATFORM_MACOS, 999, 0, 0), 0);
+        // `PLATFORM_IOS` says nothing about this system.
+        assert_eq!(is_platform_version_at_least(2, 999, 0, 0), 1);
+        // `PLATFORM_MACCATALYST`, the variant a zippered binary also names.
+        assert_eq!(
+            is_platform_or_variant_platform_version_at_least(
+                PLATFORM_MACOS,
+                10,
+                9,
+                0,
+                6,
+                999,
+                0,
+                0
+            ),
+            1
+        );
     }
 
     #[test]

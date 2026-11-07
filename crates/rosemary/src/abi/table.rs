@@ -1714,6 +1714,20 @@ pub static SIGNATURES: &[FunctionAbi] = &[
     // What `@available` / `__builtin_available` compiles to: `bool
     // _availability_version_check(uint32_t count, dyld_build_version_t *)`.
     sig!("_availability_version_check", BOOL, U32, P),
+    // Its compiler-rt wrappers, which newer clangs emit for `@available`.
+    sig!("__isPlatformVersionAtLeast", I32, U32, U32, U32, U32),
+    sig!(
+        "__isPlatformOrVariantPlatformVersionAtLeast",
+        I32,
+        U32,
+        U32,
+        U32,
+        U32,
+        U32,
+        U32,
+        U32,
+        U32
+    ),
     // Served by [`crate::dyld::entry`] under both backends.
     sig!("_dyld_image_count", U32),
     sig!("_dyld_get_image_header", P, U32),
