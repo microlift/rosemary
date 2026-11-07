@@ -48,8 +48,8 @@ const PROPERTY_SIZE: u64 = 16;
 /// that way. They are not part of the address.
 const FAST_DATA_MASK: Word = 0x0000_7fff_ffff_fff8;
 
-/// `bits` low-bit markers. A class with either set is Swift, and what `bits`
-/// addresses is Swift metadata rather than a `class_ro_t`.
+/// `bits` low-bit markers. A class with either set is Swift: the header is the
+/// start of Swift's class metadata, and `bits` still addresses a `class_ro_t`.
 const FAST_IS_SWIFT_LEGACY: Word = 1 << 0;
 const FAST_IS_SWIFT_STABLE: Word = 1 << 1;
 
@@ -66,6 +66,9 @@ const ENTSIZE_MASK: u32 = 0x0000_fffc;
 pub const RO_META: u32 = 1 << 0;
 /// `class_ro_t::flags` bit marking a root class.
 pub const RO_ROOT: u32 = 1 << 1;
+/// `class_ro_t::flags` bit marking a Swift class whose metadata Swift must
+/// finish at run time, through an initializer stored after the `class_ro_t`.
+pub const RO_HAS_SWIFT_INITIALIZER: u32 = 1 << 6;
 
 /// Image-info flag saying `category_t` carries a class-properties field.
 ///
@@ -175,6 +178,9 @@ impl ClassRo {
     pub fn is_root(&self) -> bool {
         self.flags & RO_ROOT != 0
     }
+    pub fn has_swift_initializer(&self) -> bool {
+        self.flags & RO_HAS_SWIFT_INITIALIZER != 0
+    }
 }
 
 /// A class as `__objc_classlist` points at it.
@@ -201,9 +207,9 @@ pub struct ObjcClass {
 impl ObjcClass {
     /// Whether `bits` carries one of the two Swift markers.
     ///
-    /// A Swift class's `bits` does not point at a `class_ro_t` at all, so a
-    /// consumer that realizes classes must ask this before believing
-    /// [`ro`](ObjcClass::ro).
+    /// Such a class's [`ro`](ObjcClass::ro) is real, but Swift's own metadata
+    /// follows the header, so a consumer must keep the class where it is
+    /// rather than copy it.
     pub fn is_swift(&self) -> bool {
         self.bits & (FAST_IS_SWIFT_LEGACY | FAST_IS_SWIFT_STABLE) != 0
     }

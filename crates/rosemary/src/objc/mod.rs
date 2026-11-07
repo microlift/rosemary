@@ -85,9 +85,13 @@ pub enum Refusal {
         method: String,
         reason: &'static str,
     },
-    /// A Swift class, identified by the low bits of its `bits` word. Its
-    /// metadata is not an `objc_class`.
+    /// A Swift class, identified by the low bits of its `bits` word, under a
+    /// runtime that copies classes: Swift dispatches through the class itself,
+    /// so a copy is not the class.
     SwiftClass { name: String },
+    /// A Swift class whose metadata Swift finishes at run time, which
+    /// realizing it from the image alone would skip.
+    SwiftClassNeedsInitializer { name: String },
     /// A category on a class that is neither the host's nor one registered
     /// here.
     CategoryTargetMissing { name: String, class: u64 },
@@ -441,10 +445,14 @@ fn register_class(
 
     let name = class.ro.name.clone();
 
-    // A Swift class's `bits` carries one of the two Swift markers, and what it
-    // points at is Swift metadata rather than a `class_ro_t`.
-    if class.is_swift() {
+    // A Swift class's header begins Swift's own metadata, so only a runtime
+    // that adopts the header in place can have it.
+    if class.is_swift() && !host::adopts_guest_classes() {
         rt.refusals.push(Refusal::SwiftClass { name });
+        return None;
+    }
+    if class.ro.has_swift_initializer() {
+        rt.refusals.push(Refusal::SwiftClassNeedsInitializer { name });
         return None;
     }
 
@@ -905,6 +913,11 @@ fn patch_ivar_offsets(
         let Ok(offset) = u32::try_from(offset) else {
             continue;
         };
+        // Written only when it moved, as libobjc does: Swift keeps a fixed
+        // layout's offsets in read-only memory.
+        if offset == ivar.offset {
+            continue;
+        }
         view.write(ivar.offset_va, &offset.to_le_bytes())
             .map_err(|_| memory_error(ivar.offset_va))?;
         rt.stats.offsets_patched += 1;
