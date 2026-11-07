@@ -12,8 +12,13 @@ pub struct Conf {
     /// whose glibc defines at least this can run the bundle's libraries.
     pub required_glibc: Option<Version>,
     /// Variables to set unless the caller already did, as `(name, value)`
-    /// with `@ROOT@` standing for the bundle root.
+    /// with `@ROOT@` standing for the bundle root and `@CACHE@` for the
+    /// user's cache directory.
     pub default_env: Vec<(String, String)>,
+    /// Variables to set whatever the caller had, written like `default_env`:
+    /// `env.NAME=value`. For settings where a host value would point bundled
+    /// code at host files built against other versions of its libraries.
+    pub env: Vec<(String, String)>,
     /// Variables to set, unless the caller already did, to the first of
     /// several host files that exists: `default_path.NAME=/a|/b`. For
     /// configuration each distribution keeps in its own place.
@@ -39,6 +44,8 @@ impl Conf {
                 conf.required_glibc = Version::parse(value);
             } else if let Some(name) = key.strip_prefix("default_env.") {
                 conf.default_env.push((name.to_string(), value.to_string()));
+            } else if let Some(name) = key.strip_prefix("env.") {
+                conf.env.push((name.to_string(), value.to_string()));
             } else if let Some(name) = key.strip_prefix("default_path.") {
                 let candidates = value.split('|').map(str::trim).filter(|c| !c.is_empty());
                 conf.default_path
@@ -62,6 +69,19 @@ mod tests {
             conf.default_env,
             [("A".to_string(), "@ROOT@/x".to_string())]
         );
+    }
+
+    #[test]
+    fn reads_forced_variables_including_empty_ones() {
+        let conf = Conf::parse("env.A=@ROOT@/x\nenv.B=\n");
+        assert_eq!(
+            conf.env,
+            [
+                ("A".to_string(), "@ROOT@/x".to_string()),
+                ("B".to_string(), String::new())
+            ]
+        );
+        assert!(conf.default_env.is_empty());
     }
 
     #[test]

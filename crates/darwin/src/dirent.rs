@@ -494,6 +494,142 @@ pub unsafe extern "C" fn alphasort(a: *const *const Dirent, b: *const *const Dir
     unsafe { libc::strcoll((**a).name.as_ptr(), (**b).name.as_ptr()) }
 }
 
+/// Where `__getdirentries64` stands in a directory's mount points, by the
+/// descriptor it reads. Keyed by the directory's identity too, so a descriptor
+/// number reused for another directory starts afresh.
+#[cfg(target_os = "linux")]
+static BLOCK_SHOWN: Mutex<Option<HashMap<c_int, ((u64, u64), usize)>>> = Mutex::new(None);
+
+/// xnu's `DIRENT64_LEN`: a record holds the used name bytes and its NUL, and is
+/// padded to an 8-byte boundary.
+#[cfg(target_os = "linux")]
+fn block_record_len(namlen: usize) -> usize {
+    const MAXPATHLEN: usize = 1024;
+    (size_of::<Dirent>() + namlen - (MAXPATHLEN - 1)).next_multiple_of(8)
+}
+
+/// Append `entry` to the block at `out`, or `false` if it would not fit.
+#[cfg(target_os = "linux")]
+fn push_block_record(out: &mut [u8], written: &mut usize, entry: &Dirent) -> bool {
+    let namlen = entry.namlen as usize;
+    let len = block_record_len(namlen);
+    let Some(record) = out.get_mut(*written..*written + len) else {
+        return false;
+    };
+    record.fill(0);
+    record[0..8].copy_from_slice(&entry.ino.to_ne_bytes());
+    record[8..16].copy_from_slice(&entry.seekoff.to_ne_bytes());
+    record[16..18].copy_from_slice(&(len as u16).to_ne_bytes());
+    record[18..20].copy_from_slice(&(namlen as u16).to_ne_bytes());
+    record[20] = entry.kind;
+    for (to, from) in record[21..21 + namlen].iter_mut().zip(&entry.name) {
+        *to = *from as u8;
+    }
+    *written += len;
+    true
+}
+
+/// `ssize_t __getdirentries64(int fd, void *buf, size_t bufsize, off_t *basep)`
+///
+/// Darwin's directory block: the host's `getdents64` records, re-packed into
+/// Darwin's layout, then the mount points the namespace adds to the directory.
+/// A record that does not fit is left for the next call by seeking back to it.
+///
+/// # Safety
+///
+/// `buf` is writable for `size` bytes and `base` is null or writable.
+#[cfg(target_os = "linux")]
+pub unsafe extern "C" fn getdirentries64(
+    fd: c_int,
+    buf: *mut u8,
+    size: usize,
+    base: *mut i64,
+) -> isize {
+    /// `struct linux_dirent64`'s field offsets.
+    const HOST_OFF: usize = 8;
+    const HOST_RECLEN: usize = 16;
+    const HOST_TYPE: usize = 18;
+    const HOST_NAME: usize = 19;
+
+    let mut stat: libc::stat = unsafe { std::mem::zeroed() };
+    // SAFETY: a writable buffer.
+    if unsafe { libc::fstat(fd, &mut stat) } != 0 {
+        return -1;
+    }
+    let identity = (stat.st_dev, stat.st_ino);
+    // SAFETY: the caller's descriptor.
+    let start = unsafe { libc::lseek(fd, 0, libc::SEEK_CUR) };
+    if start < 0 {
+        return -1;
+    }
+    let mut host = vec![0u8; size];
+    // SAFETY: a writable buffer of the stated length.
+    let read = unsafe { libc::syscall(libc::SYS_getdents64, fd, host.as_mut_ptr(), host.len()) };
+    if read < 0 {
+        return -1;
+    }
+    // SAFETY: the caller's guarantee.
+    let out = unsafe { std::slice::from_raw_parts_mut(buf, size) };
+    let listing = prefix::ns::listing(identity.0, identity.1);
+    let mut written = 0;
+    let mut offset = 0;
+    let mut resume = start;
+    while offset < read as usize {
+        let record = &host[offset..];
+        let word = |at: usize| u64::from_ne_bytes(record[at..at + 8].try_into().unwrap());
+        let reclen = u16::from_ne_bytes([record[HOST_RECLEN], record[HOST_RECLEN + 1]]) as usize;
+        let name =
+            CStr::from_bytes_until_nul(&record[HOST_NAME..reclen]).map_or(&[][..], CStr::to_bytes);
+        let next = word(HOST_OFF);
+        if !listing.as_ref().is_some_and(|l| l.hides(name)) {
+            let mut entry = Dirent {
+                ino: word(0),
+                seekoff: next,
+                kind: record[HOST_TYPE],
+                namlen: name.len() as u16,
+                ..Dirent::default()
+            };
+            for (to, from) in entry.name.iter_mut().zip(name) {
+                *to = *from as c_char;
+            }
+            if !push_block_record(out, &mut written, &entry) {
+                if written == 0 {
+                    crate::errno::set(libc::EINVAL);
+                }
+                // SAFETY: the caller's descriptor, at a position it reported.
+                unsafe { libc::lseek(fd, resume, libc::SEEK_SET) };
+                break;
+            }
+        }
+        offset += reclen;
+        resume = next as i64;
+    }
+    // Rewinding to the start of the directory shows its mount points again.
+    let mut shown = BLOCK_SHOWN.lock().unwrap_or_else(|e| e.into_inner());
+    let shown = shown.get_or_insert_with(HashMap::new);
+    let state = shown.entry(fd).or_insert((identity, 0));
+    if state.0 != identity || start == 0 {
+        *state = (identity, 0);
+    }
+    if read == 0 {
+        let from = state.1;
+        for point in listing.iter().flat_map(|l| &l.shown()[from..]) {
+            if !push_block_record(out, &mut written, &self::shown(point)) {
+                break;
+            }
+            state.1 += 1;
+        }
+    }
+    if written == 0 && read > 0 {
+        return -1;
+    }
+    if !base.is_null() {
+        // SAFETY: the caller's guarantee.
+        unsafe { base.write_unaligned(start) };
+    }
+    written as isize
+}
+
 /// `getdirentries` is **not** here, and stays denied.
 ///
 /// It hands back the kernel's raw directory block for the caller to walk with
@@ -512,6 +648,8 @@ exports::exports! {
         "closedir" => closedir,
         "scandir" => scandir,
         "alphasort" => alphasort,
+        #[cfg(target_os = "linux")]
+        "__getdirentries64" => getdirentries64,
     }
 }
 
@@ -524,6 +662,64 @@ mod tests {
     fn c_path(path: &std::path::Path) -> std::ffi::CString {
         use std::os::unix::ffi::OsStrExt;
         std::ffi::CString::new(path.as_os_str().as_bytes()).expect("a path with no NUL")
+    }
+
+    /// The names in a Darwin directory block, walked by `d_reclen`.
+    #[cfg(target_os = "linux")]
+    fn block_names(block: &[u8]) -> Vec<String> {
+        let mut names = Vec::new();
+        let mut at = 0;
+        while at < block.len() {
+            let reclen = u16::from_ne_bytes([block[at + 16], block[at + 17]]) as usize;
+            let namlen = u16::from_ne_bytes([block[at + 18], block[at + 19]]) as usize;
+            assert_eq!(reclen % 8, 0);
+            names.push(String::from_utf8(block[at + 21..at + 21 + namlen].to_vec()).unwrap());
+            at += reclen;
+        }
+        names
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn getdirentries64_resumes_where_a_full_block_stopped() {
+        use std::os::fd::AsRawFd;
+        let dir =
+            std::env::temp_dir().join(format!("rosemary-getdirentries-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let made: Vec<String> = (0..20).map(|i| format!("entry-{i:02}")).collect();
+        for name in &made {
+            std::fs::write(dir.join(name), b"").unwrap();
+        }
+        let handle = std::fs::File::open(&dir).unwrap();
+        // Room for a few records at a time, so every call stops early.
+        let mut buffer = [0u8; 128];
+        let mut base = -1i64;
+        let mut seen = Vec::new();
+        loop {
+            // SAFETY: a directory descriptor and a writable buffer and base.
+            let n = unsafe {
+                getdirentries64(
+                    handle.as_raw_fd(),
+                    buffer.as_mut_ptr(),
+                    buffer.len(),
+                    &mut base,
+                )
+            };
+            assert!(
+                n >= 0,
+                "getdirentries64: {}",
+                std::io::Error::last_os_error()
+            );
+            if n == 0 {
+                break;
+            }
+            seen.extend(block_names(&buffer[..n as usize]));
+        }
+        seen.retain(|name| name != "." && name != "..");
+        seen.sort();
+        assert_eq!(seen, made);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// A legacy entry carries the name and type at its own offsets.

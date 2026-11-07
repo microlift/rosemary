@@ -174,6 +174,12 @@ pub extern "C" fn setreuid(ruid: u32, euid: u32) -> c_int {
     apply(Change::SetReuid(ruid, euid))
 }
 
+/// `int setruid(uid_t)`: 4.3BSD's, which Darwin's libc keeps as `setreuid`
+/// leaving the effective id alone.
+pub extern "C" fn setruid(ruid: u32) -> c_int {
+    setreuid(ruid, server::credentials::UNCHANGED)
+}
+
 /// `int setgid(gid_t)`
 pub extern "C" fn setgid(gid: u32) -> c_int {
     apply(Change::SetGid(gid))
@@ -187,6 +193,12 @@ pub extern "C" fn setegid(gid: u32) -> c_int {
 /// `int setregid(gid_t, gid_t)`
 pub extern "C" fn setregid(rgid: u32, egid: u32) -> c_int {
     apply(Change::SetRegid(rgid, egid))
+}
+
+/// `int setrgid(gid_t)`: `setregid` leaving the effective id alone, as
+/// `setruid` is.
+pub extern "C" fn setrgid(rgid: u32) -> c_int {
+    setregid(rgid, server::credentials::UNCHANGED)
 }
 
 /// `int getgroups(int gidsetsize, gid_t grouplist[])`
@@ -257,9 +269,11 @@ exports::exports! {
         "setuid" => setuid,
         "seteuid" => seteuid,
         "setreuid" => setreuid,
+        "setruid" => setruid,
         "setgid" => setgid,
         "setegid" => setegid,
         "setregid" => setregid,
+        "setrgid" => setrgid,
         "getgroups" => getgroups,
         "setgroups" => setgroups,
         "initgroups" => initgroups,
@@ -295,6 +309,8 @@ mod tests {
         assert_eq!(seteuid(host), 0, "a set-id program may drop privilege");
         assert_eq!(geteuid(), host);
         assert_eq!(seteuid(0), 0, "and take it back, from the saved id");
+        assert_eq!(setruid(host), 0, "the real id alone");
+        assert_eq!((getuid(), geteuid()), (host, 0));
         assert_eq!(setuid(0), 0);
         assert_eq!((getuid(), geteuid()), (0, 0));
 

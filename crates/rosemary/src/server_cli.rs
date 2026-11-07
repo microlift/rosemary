@@ -5,7 +5,8 @@
 //! has to start it by hand; the subcommand exists for that launch, and for a
 //! person who wants to run one in the foreground or stop one.
 
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
+use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::Duration;
@@ -103,8 +104,21 @@ fn init_for(directory: &Path) -> Option<server::daemon::Init> {
         args: vec!["run".into(), LAUNCHD.into()],
         current_dir: prefix::ns::host_path("/"),
         console: Some(prefix.console()),
-        ready: Some(prefix::ns::host_path(LAUNCHD_SOCKET)),
+        ready: Some(launchd_socket()),
     })
+}
+
+/// The host address launchd's control socket answers at: the short alias its
+/// `bind` went through when a deep prefix (a Flatpak's `~/.var/app/...`)
+/// pushes the file's own path past `sun_path`, which no `connect` can use.
+fn launchd_socket() -> PathBuf {
+    darwin::sockpath::to_host(LAUNCHD_SOCKET.as_bytes())
+        .ok()
+        .and_then(|host| {
+            let path = std::ffi::CStr::from_bytes_until_nul(&host.bytes).ok()?;
+            Some(PathBuf::from(OsStr::from_bytes(path.to_bytes())))
+        })
+        .unwrap_or_else(|| prefix::ns::host_path(LAUNCHD_SOCKET))
 }
 
 /// How long a server outlives its last guest, from `ROSEMARY_SERVER_LINGER`.

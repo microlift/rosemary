@@ -2419,6 +2419,7 @@ version = "0.5.0"
 dependencies = [
  "flate2",
  "libc",
+ "rustls-pki-types",
  "sha2 0.11.0",
  "starnix",
  "static_init",
@@ -2833,6 +2834,7 @@ dependencies = [
  "getrandom 0.3.4",
  "machish",
  "objc",
+ "prefix",
  "rustls-pki-types",
  "rustls-webpki",
  "webpki-roots",

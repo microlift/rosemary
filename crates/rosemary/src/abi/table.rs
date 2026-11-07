@@ -1657,6 +1657,8 @@ pub static SIGNATURES: &[FunctionAbi] = &[
     sig!("___mb_cur_max", I32),
     // Private libSystem collation lookups that Apple's bash declares itself.
     sig!("__collate_lookup", V, P, P, P, P),
+    // `<sys/dirent.h>`'s private block read, which Zig's directory iterator calls.
+    sig!("__getdirentries64", I64, I32, P, U64, P),
     sig!("__collate_lookup_l", V, P, P, P, P, P),
     sig!("___tolower_l", I32, I32, P),
     sig!("___toupper_l", I32, I32, P),
@@ -2123,6 +2125,7 @@ pub static SIGNATURES: &[FunctionAbi] = &[
     sig!("fts_set", I32, P, P, I32),
     cbsig!([1, 2, 3, 4], "funopen", P, P, P, P, P, P),
     sig!("funlockfile", V, P),
+    sig!("futimens", I32, I32, P),
     sig!("futimes", I32, I32, P),
     sig!("fwrite", U64, P, U64, U64, P),
     sig!("gai_strerror", P, I32),
@@ -2908,6 +2911,7 @@ pub static SIGNATURES: &[FunctionAbi] = &[
     sig!("lstat", I32, P, P),
     sig!("lutimes", I32, P, P),
     sig!("mach_absolute_time", U64),
+    sig!("mach_wait_until", I32, U64),
     sig!("mach_host_self", U32),
     // The three Mach IPC calls `libsteam_api.dylib` makes to talk to the Steam
     // client. They need no translation at all.
@@ -3290,6 +3294,7 @@ pub static SIGNATURES: &[FunctionAbi] = &[
     sig!("readdir_r", I32, P, P, P),
     sig!("readlink", I64, P, P, U64),
     sig!("readlinkat", I64, I32, P, P, U64),
+    sig!("readlinkat", I64, I32, P, P, U64),
     sig!("readv", I64, I32, P, I32),
     sig!("reboot", I32, I32),
     sig!("realloc", P, P, U64),
@@ -3307,6 +3312,7 @@ pub static SIGNATURES: &[FunctionAbi] = &[
     sig!("recvmsg", I64, I32, P, I32),
     sig!("remove", I32, P),
     sig!("rename", I32, P, P),
+    sig!("renameat", I32, I32, P, I32, P),
     // Rosemary's own extension API, exported only when
     // `ROSEMARY_EXPOSE_LIBSYSTEM_EXTENSIONS` is set. The trampoline's tail is
     // `argcount` word-sized integers.
@@ -3366,6 +3372,8 @@ pub static SIGNATURES: &[FunctionAbi] = &[
     sig!("setgid", I32, U32),
     sig!("setregid", I32, U32, U32),
     sig!("setreuid", I32, U32, U32),
+    sig!("setruid", I32, U32),
+    sig!("setrgid", I32, U32),
     sig!("setgrent", V),
     sig!("setgroups", I32, I32, P),
     sig!("sethostid", V, I64),
@@ -3458,6 +3466,7 @@ pub static SIGNATURES: &[FunctionAbi] = &[
     sig!("strcpy", P, P, P),
     sig!("strcspn", U64, P, P),
     sig!("strdup", P, P),
+    sig!("crypt", P, P, P),
     sig!("strerror", P, I32),
     sig!("strerror_r", I32, I32, P, U64),
     sig!("strftime", U64, P, U64, P, P),
@@ -3516,6 +3525,7 @@ pub static SIGNATURES: &[FunctionAbi] = &[
     sig!("strxfrm_l", U64, P, P, U64, P),
     sig!("swab", V, P, P, I64),
     sig!("symlink", I32, P, P),
+    sig!("symlinkat", I32, P, I32, P),
     sig!("sync", V),
     sig!("sysconf", I64, I32),
     sig!("sysctl", I32, P, U32, P, P, P, U64),
@@ -3602,6 +3612,7 @@ pub static SIGNATURES: &[FunctionAbi] = &[
     sig!("user_from_uid", P, U32, I32),
     sig!("usleep", I32, U32),
     sig!("utime", I32, P, P),
+    sig!("utimensat", I32, I32, P, P, I32),
     sig!("utimes", I32, P, P),
     sig!("uuid_unparse_upper", V, P, P),
     //
@@ -4199,6 +4210,7 @@ pub static SIGNATURES: &[FunctionAbi] = &[
     sig!("lchown", I32, P, U32, U32),
     sig!("fchmodat", I32, I32, P, U16, I32),
     sig!("link", I32, P, P),
+    sig!("linkat", I32, I32, P, I32, P, I32),
     sig!("dirfd", I32, P),
     sig!("fsctl", I32, P, U64, P, U32),
     sig!("ffsctl", I32, I32, U64, P, U32),

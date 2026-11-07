@@ -2208,6 +2208,9 @@ pub mod video {
             // runtime's back. Relative mode is the guest's to ask for, and a
             // Wayland lock SDL took unasked collides with `crate::pointer`'s.
             set_hint(HINT_MOUSE_EMULATE_WARP_WITH_RELATIVE, c"0");
+            // SDL inhibits the screensaver while video is up; macOS apps
+            // only do so by asserting power assertions themselves.
+            set_hint(HINT_ALLOW_SCREENSAVER, c"1");
             *up = super::init(super::init::VIDEO).is_ok();
             if *up {
                 // This thread now owns the event queue: see [`super::pump`].
@@ -4972,6 +4975,9 @@ pub mod video {
     /// GTK 3, which cannot share a process with the GTK 4 WebKit uses, so a
     /// runtime drawing its own decorations turns it off before video starts.
     pub const HINT_WAYLAND_ALLOW_LIBDECOR: &CStr = c"SDL_VIDEO_WAYLAND_ALLOW_LIBDECOR";
+
+    /// `SDL_HINT_VIDEO_ALLOW_SCREENSAVER`.
+    pub const HINT_ALLOW_SCREENSAVER: &CStr = c"SDL_VIDEO_ALLOW_SCREENSAVER";
 
     /// `SDL_HINT_MOUSE_EMULATE_WARP_WITH_RELATIVE`.
     pub const HINT_MOUSE_EMULATE_WARP_WITH_RELATIVE: &CStr =

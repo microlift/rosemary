@@ -134,6 +134,7 @@ fn handle_mach_syscall(number: u32, args: [u64; 6]) -> Result<u64, i32> {
         numbers::mach::task_name_for_pid | numbers::mach::task_for_pid => {
             Ok(unsafe { mach::tasks::task_for_pid(args[0] as _, args[1] as _, args[2] as _) } as _)
         }
+        numbers::mach::mach_wait_until_trap => Ok(unsafe { mach::wait_until(args[0]) } as _),
         _ => Err(DARWIN_ENOSYS),
     }
 }

@@ -42,6 +42,7 @@ pub mod commpage;
 pub mod compat;
 pub mod cpu;
 pub mod credentials;
+pub mod crypt;
 pub mod data;
 pub mod dirent;
 pub mod dispatch;
@@ -383,6 +384,7 @@ static SHARED_MODULES: &[exports::Module] = &[
     attrlist::MODULE,
     process::MODULE,
     credentials::MODULE,
+    crypt::MODULE,
     pam::MODULE,
     sip::MODULE,
     dispatch::MODULE,

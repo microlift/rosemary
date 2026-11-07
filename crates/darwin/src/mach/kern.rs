@@ -10,6 +10,7 @@ pub const KERN_RESOURCE_SHORTAGE: i32 = 6;
 pub const KERN_NOT_RECEIVER: i32 = 7;
 pub const KERN_MEMORY_FAILURE: i32 = 9;
 pub const KERN_MEMORY_ERROR: i32 = 10;
+pub const KERN_ABORTED: i32 = 14;
 pub const KERN_INVALID_NAME: i32 = 15;
 pub const KERN_INVALID_TASK: i32 = 16;
 pub const KERN_INVALID_HOST: i32 = 22;

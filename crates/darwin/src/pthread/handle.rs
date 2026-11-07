@@ -75,6 +75,13 @@ mod imp {
         maps.by_guest.get(&guest).copied().unwrap_or(guest)
     }
 
+    /// Calls `f` with every block issued so far, live thread or not, while no new
+    /// block can be issued.
+    pub fn for_each_block(mut f: impl FnMut(u64)) {
+        let maps = MAPS.lock().unwrap_or_else(|e| e.into_inner());
+        maps.by_guest.keys().for_each(|&guest| f(guest));
+    }
+
     /// The calling thread's block.
     pub fn current() -> u64 {
         let cached = SELF.with(Cell::get);
@@ -98,7 +105,7 @@ mod imp {
 }
 
 #[cfg(not(target_os = "macos"))]
-pub use imp::{SIZE, TSD_OFFSET};
+pub use imp::{SIZE, TSD_OFFSET, for_each_block};
 
 #[cfg(target_os = "macos")]
 mod imp {

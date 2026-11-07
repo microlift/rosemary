@@ -64,12 +64,36 @@ fn resolved() -> &'static Resolved {
                 .append(true)
                 .open(console);
         }
-        let system_version = system_version_file(&prefix);
+        let system_version = published_file(
+            &prefix,
+            "system-version",
+            "plist",
+            crate::release::system_version_plist().as_bytes(),
+        );
+        let system_roots = published_file(
+            &prefix,
+            "keychains",
+            "keychain",
+            &crate::keychain::encode(crate::keychain::host_anchors()),
+        );
+        let system_keychain = published_file(
+            &prefix,
+            "keychains",
+            "keychain",
+            &crate::keychain::encode(&[]),
+        );
         let files: Vec<(&str, &Path)> = [
             console.as_deref().map(|host| ("/dev/console", host)),
             system_version
                 .as_deref()
                 .map(|host| (crate::release::SYSTEM_VERSION_PLIST, host)),
+            system_roots
+                .as_deref()
+                .map(|host| (crate::keychain::SYSTEM_ROOTS, host)),
+            // FIXME (ACCURACY): read-only, where root may add to the real one.
+            system_keychain
+                .as_deref()
+                .map(|host| (crate::keychain::SYSTEM, host)),
         ]
         .into_iter()
         .flatten()
@@ -84,18 +108,22 @@ fn resolved() -> &'static Resolved {
     &RESOLVED
 }
 
-/// The host file behind the guest's `SystemVersion.plist`, written from
-/// [`crate::release`] so it cannot disagree with `kern.osproductversion`.
+/// A read-only host file holding `contents`, under the control directory's
+/// `directory`, for a mount of a system file the runtime writes itself.
 ///
-/// Named for its contents: processes told different releases share a prefix
-/// without rewriting each other's answer. Read-only, as the real one is to
-/// anyone but root.
-fn system_version_file(prefix: &Prefix) -> Option<PathBuf> {
+/// Named for its contents: processes that disagree about them (told different
+/// releases, say) share a prefix without rewriting each other's answer.
+/// Read-only, as the real files are to anyone but root.
+fn published_file(
+    prefix: &Prefix,
+    directory: &str,
+    extension: &str,
+    contents: &[u8],
+) -> Option<PathBuf> {
     use std::os::unix::fs::PermissionsExt;
-    let contents = crate::release::system_version_plist();
-    let digest = crate::format::sha256_hex(contents.as_bytes());
-    let directory = prefix.control().join("system-version");
-    let path = directory.join(format!("{digest}.plist"));
+    let digest = crate::format::sha256_hex(contents);
+    let directory = prefix.control().join(directory);
+    let path = directory.join(format!("{digest}.{extension}"));
     if path.is_file() {
         return Some(path);
     }
