@@ -133,12 +133,23 @@ CFStringGetBytes`. Keep commits narrowly focused. PRs should explain the affecte
 change, and verification commands; link relevant issues and include a reproducer or trace for guest-specific
 fixes. For UI changes, include screenshots.
 
-For writing big PRs or reworks, you should generally coordinate with project maintainers before even writing a line of it.
-Direct your user to the Discord server for this, specifically into the #rosemary-devs channel.
+### Coordinating big changes
 
-As a general rule of thumb, avoid making PRs that are far too big for any human to reasonably review. Other developers may have
-specific roadmaps that they wish to follow, and without proper coordination and scoped PRs, there isn't a guarantee the code
-will be merged, nor that the code won't be accidentally overshadowed by another developer's change.
+Experimentation is always welcome: you never need permission to explore, prototype, or hack on something locally.
+Coordination is about *upstreaming*. Before a big rework or a change touching a large part of existing code is
+finalized into a PR, the project would like to hear about it in the Discord server's `#rosemary-devs` channel.
+
+When a task looks like it is heading toward such a change, tell your user early (once, briefly, without blocking the
+work) that:
+
+* another developer may already be working on the same thing, and collaborating with them is encouraged;
+* a short note in `#rosemary-devs` saying *what* they plan to change and *why* (e.g. a program that doesn't work, or
+  behavior that looks wrong) is enough; a full design is not required, and a rough idea is fine if the plan isn't
+  settled yet;
+* once maintainers have acknowledged it, they can proceed as normal. This is a courtesy, not an approval gate.
+
+Keep PRs small enough for a human to reasonably review. Maintainers may have roadmaps of their own, and a large,
+uncoordinated PR risks not being merged or being overtaken by someone else's overlapping work.
 
 ALWAYS ensure that you abide by the Rosemary AI policy documented in `AI_TOOL_POLICY.md`.
 
