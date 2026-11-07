@@ -76,7 +76,7 @@ impl Key {
         imp::init_static(self.0, destructor)
     }
 
-    /// Give the key back. Threads' values for it are not destructed.
+    /// Give the key back. Threads' values for it are cleared, not destructed.
     pub fn delete(self) -> i32 {
         imp::delete(self.0)
     }
@@ -148,7 +148,7 @@ mod imp {
     target_arch = "x86_64"
 ))]
 mod imp {
-    use core::sync::atomic::{AtomicUsize, Ordering};
+    use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
     use super::*;
 
@@ -200,13 +200,25 @@ mod imp {
             .ok_or(err::EAGAIN)
     }
 
+    /// As libpthread, clears the key's slot in every thread. Programs rely on it:
+    /// Feral's thread-locals free their per-thread table and delete its key without
+    /// clearing the value, then read the key again.
     pub fn delete(key: u32) -> i32 {
-        // libpthread also clears the slot in every live thread. This allocator has
-        // no list of threads, so a reused key can surface a value set under the old
-        // one - which POSIX leaves to the program to avoid.
-        match word(key) {
-            Some(w) if w.swap(FREE, Ordering::AcqRel) != FREE => 0,
-            _ => err::EINVAL,
+        let Some(w) = word(key).filter(|w| w.load(Ordering::Acquire) != FREE) else {
+            return err::EINVAL;
+        };
+        // Cleared before the key is freed, so `create` never hands out a number
+        // with stale values behind it.
+        crate::pthread::handle::for_each_block(|block| {
+            let offset = crate::pthread::handle::TSD_OFFSET + key as usize * 8;
+            let slot = (block as usize + offset) as *mut u64;
+            // SAFETY: every block is a leaked `pthread_t` holding `END` slots from
+            // `TSD_OFFSET`; another thread may be reading its own slot at the same time.
+            unsafe { AtomicU64::from_ptr(slot).store(0, Ordering::Release) };
+        });
+        match w.swap(FREE, Ordering::AcqRel) != FREE {
+            true => 0,
+            false => err::EINVAL,
         }
     }
 
@@ -350,6 +362,29 @@ mod tests {
         // SAFETY: `key < END`, inside this thread's array.
         assert_eq!(unsafe { *base.add(key.index() as usize) }, 0x5eed);
         key.delete();
+    }
+
+    #[test]
+    fn deleting_a_key_clears_every_thread_s_value() {
+        let key = Key::create(None).unwrap();
+        key.set(0x10 as *mut c_void);
+        let (set, was_set) = std::sync::mpsc::channel::<()>();
+        let (deleted, wait) = std::sync::mpsc::channel::<()>();
+        let theirs = std::thread::spawn(move || {
+            key.set(0x20 as *mut c_void);
+            set.send(()).unwrap();
+            wait.recv().unwrap();
+            key.get() as usize
+        });
+        was_set.recv().unwrap();
+        assert_eq!(key.delete(), 0);
+        deleted.send(()).unwrap();
+        assert_eq!(key.get() as usize, 0, "this thread's value is cleared");
+        assert_eq!(
+            theirs.join().unwrap(),
+            0,
+            "the other thread's value is cleared"
+        );
     }
 
     #[test]
