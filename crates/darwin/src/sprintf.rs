@@ -64,7 +64,7 @@ pub(crate) unsafe fn vasprintf_into_guest(
 /// # Safety
 ///
 /// `buffer` holds the rendering, and the arguments match `format`.
-unsafe extern "C" fn sprintf(buffer: *mut c_char, format: *const c_char, args: ...) -> c_int {
+pub unsafe extern "C" fn sprintf(buffer: *mut c_char, format: *const c_char, args: ...) -> c_int {
     // SAFETY: the caller's obligations.
     unsafe { rosemary_vsprintf(buffer, format, args) }
 }
@@ -74,7 +74,7 @@ unsafe extern "C" fn sprintf(buffer: *mut c_char, format: *const c_char, args: .
 /// # Safety
 ///
 /// As [`sprintf`].
-unsafe extern "C" fn vsprintf(buffer: *mut c_char, format: *const c_char, ap: VaList) -> c_int {
+pub unsafe extern "C" fn vsprintf(buffer: *mut c_char, format: *const c_char, ap: VaList) -> c_int {
     // SAFETY: the caller's obligations.
     unsafe { rosemary_vsprintf(buffer, format, ap) }
 }
@@ -84,7 +84,7 @@ unsafe extern "C" fn vsprintf(buffer: *mut c_char, format: *const c_char, ap: Va
 /// # Safety
 ///
 /// `buffer` holds `size` bytes, and the arguments match `format`.
-unsafe extern "C" fn snprintf(
+pub unsafe extern "C" fn snprintf(
     buffer: *mut c_char,
     size: usize,
     format: *const c_char,
@@ -99,7 +99,7 @@ unsafe extern "C" fn snprintf(
 /// # Safety
 ///
 /// As [`snprintf`].
-unsafe extern "C" fn vsnprintf(
+pub unsafe extern "C" fn vsnprintf(
     buffer: *mut c_char,
     size: usize,
     format: *const c_char,

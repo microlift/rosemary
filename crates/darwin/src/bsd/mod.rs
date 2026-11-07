@@ -3,8 +3,8 @@
 
 use std::ffi::{CStr, c_char, c_int};
 
-mod posix;
-pub use posix::*;
+pub mod posix;
+pub mod process;
 
 /// `bool _dyld_func_lookup(const char *name, void **address)`
 ///
@@ -39,4 +39,11 @@ pub unsafe extern "C" fn dyld_func_lookup(name: *const c_char, address: *mut *co
 pub extern "C" fn dyld_lazy_bind_helper() {
     eprintln!("rosemary: lazy binding helper reached; imports are bound eagerly");
     std::process::abort();
+}
+
+exports::exports! {
+    groups {
+        posix,
+        process
+    }
 }
