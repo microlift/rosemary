@@ -150,7 +150,7 @@ impl Gpu {
                 .reset_command_pool(context.pool, vk::CommandPoolResetFlags::empty())
         };
         let mut contexts = self.contexts.lock().expect("command contexts");
-        if reset.is_ok() && contexts.len() < RECYCLED {
+        if reset.is_ok() && contexts.len() < self.context_budget.limit {
             contexts.push(context);
             return;
         }
@@ -332,7 +332,7 @@ impl Gpu {
     /// Hand back an upload chunk no pending submission still reads.
     pub fn release_upload_chunk(&self, chunk: GpuBuffer) {
         let mut chunks = self.upload_chunks.lock().expect("upload chunks");
-        if chunks.len() < RECYCLED / 2 {
+        if chunks.len() < UPLOAD_CHUNKS_RECYCLED {
             chunks.push(chunk);
             return;
         }

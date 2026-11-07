@@ -261,11 +261,16 @@ struct ContextBudget {
 
 impl ContextBudget {
     fn new() -> Self {
+        // A scene with several passes queued ahead of completion (shadow,
+        // main, post-process, UI, ...) has been observed pegging a default
+        // of 64, and then pegging 128 again at its heaviest moment, each
+        // time blocking the recording thread on `ContextPressure` waits;
+        // 256 gives headroom above the peak actually observed so far.
         let limit = std::env::var("ROSEMARY_METAL_MAX_COMMAND_BUFFERS")
             .ok()
             .and_then(|value| value.parse().ok())
             .filter(|limit| *limit > 0)
-            .unwrap_or(64);
+            .unwrap_or(256);
         Self {
             used: Mutex::new(0),
             available: std::sync::Condvar::new(),
@@ -277,11 +282,30 @@ impl ContextBudget {
 /// How many retired objects of each kind are kept for reuse. Enough for the
 /// command buffers of a few frames in flight; a burst beyond it is destroyed
 /// rather than held for the rest of the run.
+///
+/// Primary command contexts are the exception: [`ContextBudget::limit`]
+/// already bounds how many may be in flight at once, so their recycle pool
+/// tracks that limit instead - keeping fewer recycled than the budget allows
+/// in flight would rebuild a command pool, buffer and fence from scratch
+/// every frame for whichever ones land past this ceiling.
 const RECYCLED: usize = 32;
 
 /// The size of one chunk `-setBytes:` copies are cut from. Metal limits one
 /// copy to four kilobytes, so a chunk holds a frame's worth of them.
 pub const UPLOAD_CHUNK: u64 = 256 << 10;
+
+/// How many upload chunks stay recycled rather than freed.
+///
+/// `-setBytes:` and every `-replaceRegion:` under [`UPLOAD_CHUNK`] draw from
+/// this one pool - see `gpu::deferred`, whose own comment says a game
+/// streaming its world in fills hundreds of mip levels a frame. `RECYCLED`
+/// is sized for command and descriptor pools reused a few frames at a time;
+/// a burst of small texture copies competing with that ceiling forced every
+/// chunk past the sixteenth into a fresh `vkCreateBuffer`/`vkAllocateMemory`
+/// for the rest of the burst, torn down again once it retired. The ceiling
+/// here matches [`STAGING_POOL_BYTES`], so the two pools together bound
+/// recycled staging memory by one consistent budget.
+const UPLOAD_CHUNKS_RECYCLED: usize = (STAGING_POOL_BYTES / UPLOAD_CHUNK) as usize;
 
 /// The most staging memory a device keeps for reuse between transfers too
 /// large for an upload chunk.
