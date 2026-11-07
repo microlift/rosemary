@@ -48,6 +48,8 @@ struct View {
     modifier_flags: u64,
     /// The cursor the page asks for, by its CSS name.
     cursor: Option<&'static str>,
+    /// `-customUserAgent`, which replaces the configuration's agent.
+    custom_user_agent: Option<String>,
 }
 
 #[derive(Clone, PartialEq)]
@@ -841,6 +843,62 @@ unsafe fn user_agent(configuration: Id) -> String {
     agent
 }
 
+/// Send `agent` from the view's `WebKitWebView`, and show it to page scripts.
+///
+/// # Safety
+///
+/// `configuration` must be the view's configuration.
+unsafe fn apply_user_agent(engine: &Engine, gtk: Ptr, configuration: Id, agent: &str) {
+    let header = header_user_agent(agent);
+    let controller = unsafe { configuration::controller_of(configuration) };
+    // SAFETY: the view's content controller.
+    unsafe {
+        configuration::set_page_user_agent(
+            controller,
+            engine,
+            (header != agent).then(|| agent.to_string()),
+        )
+    };
+    let header = gtk::c_string(&header);
+    // SAFETY: the view's own settings, and a string they copy.
+    unsafe {
+        let settings = (engine.api.webkit_web_view_get_settings)(gtk);
+        (engine.api.webkit_settings_set_user_agent)(settings, header.as_ptr());
+    }
+}
+
+/// `-customUserAgent`: nil until one is set, as Apple's.
+unsafe extern "C" fn custom_user_agent(receiver: Id, _sel: Sel) -> Id {
+    match with_object(receiver, |v| v.custom_user_agent.clone()).flatten() {
+        Some(agent) => objc::arc::autorelease(foundation::string::from_str(&agent)),
+        None => std::ptr::null_mut(),
+    }
+}
+
+/// `-setCustomUserAgent:`: the agent sent from now on; nil or empty goes
+/// back to the configuration's.
+unsafe extern "C" fn set_custom_user_agent(receiver: Id, _sel: Sel, agent: Id) {
+    let agent = (!agent.is_null())
+        .then(|| engine::text_of(agent))
+        .filter(|a| !a.is_empty());
+    let Some(configuration) = with_object(receiver, |v| {
+        v.custom_user_agent = agent.clone();
+        v.configuration as Id
+    }) else {
+        return;
+    };
+    let Some((engine, gtk)) = gtk_of(receiver) else {
+        return;
+    };
+    // SAFETY: the view's configuration.
+    let agent = agent.unwrap_or_else(|| unsafe { user_agent(configuration) });
+    if engine::tracing() {
+        eprintln!("rosemary: webkit: custom user agent {agent}");
+    }
+    // SAFETY: as above.
+    unsafe { apply_user_agent(engine, gtk, configuration, &agent) };
+}
+
 /// `agent` as WebKitGTK accepts it for the `User-Agent` header.
 ///
 /// WebKitGTK refuses a user agent that is not a list of `product/version`
@@ -893,7 +951,9 @@ unsafe fn make_gtk_view(engine: &Engine, configuration: Id, id: usize) -> Ptr {
     }
     // SAFETY: the new widget is floating until something sinks it; this owns it.
     unsafe { (api.g_object_ref_sink)(gtk) };
-    let agent = unsafe { user_agent(configuration) };
+    // A custom agent set before the widget existed is the one to send.
+    let custom = with_view(id, |v| v.custom_user_agent.clone()).flatten();
+    let agent = custom.unwrap_or_else(|| unsafe { user_agent(configuration) });
     if engine::tracing() {
         eprintln!("rosemary: webkit: user agent {agent}");
     }
@@ -1091,6 +1151,7 @@ unsafe extern "C" fn init_with_frame_configuration(
             draws_background: true,
             modifier_flags: 0,
             cursor: None,
+            custom_user_agent: None,
         })
     });
     receiver
@@ -1402,7 +1463,7 @@ fn trace_page(engine: &Engine, id: usize, gtk: Ptr) {
         };
         eprintln!("rosemary: webkit: view {}: page {text}", data as usize);
     }
-    let script = c"JSON.stringify({ url: location.href.slice(0, 80), state: document.readyState, visibility: document.visibilityState, focus: document.hasFocus(), active: document.activeElement ? document.activeElement.outerHTML.slice(0, 80) : null })";
+    let script = c"JSON.stringify({ url: location.href.slice(0, 80), state: document.readyState, agent: navigator.userAgent, visibility: document.visibilityState, focus: document.hasFocus(), active: document.activeElement ? document.activeElement.outerHTML.slice(0, 80) : null })";
     // SAFETY: the view's widget and a script it copies.
     unsafe {
         (engine.api.webkit_web_view_evaluate_javascript)(
@@ -1481,14 +1542,55 @@ unsafe extern "C" fn load_request(receiver: Id, _sel: Sel, request: Id) -> Id {
     let Some((engine, gtk)) = gtk_of(receiver) else {
         return std::ptr::null_mut();
     };
-    if method != "GET" || !headers.is_empty() {
-        engine::warn_once("a request's method and headers are not sent; it is loaded as a GET");
+    if method != "GET" {
+        engine::warn_once("a request's method is not sent; it is loaded as a GET");
     }
     let navigation = start_navigation(receiver);
     let url = gtk::c_string(&host_url(&url));
-    // SAFETY: the view's widget and a string it copies.
-    unsafe { (engine.api.webkit_web_view_load_uri)(gtk, url.as_ptr()) };
+    // SAFETY: the request copies the URI and owns its borrowed headers.
+    unsafe {
+        let request = (engine.api.webkit_uri_request_new)(url.as_ptr());
+        let fields = (engine.api.webkit_uri_request_get_http_headers)(request);
+        if !fields.is_null() {
+            for (name, value) in &headers {
+                let name = gtk::c_string(name);
+                let value = gtk::c_string(value);
+                (engine.api.soup_message_headers_replace)(fields, name.as_ptr(), value.as_ptr());
+            }
+        }
+        (engine.api.webkit_web_view_load_request)(gtk, request);
+        (engine.api.g_object_unref)(request);
+    }
     navigation
+}
+
+/// GTK keeps its default file-origin restrictions. Per-directory grants for
+/// script-initiated file reads are not modeled; do not enable unrestricted
+/// file access to approximate Apple's scoped read permission.
+unsafe extern "C" fn load_file_url(receiver: Id, sel: Sel, url: Id, access: Id) -> Id {
+    let path = |object: Id| unsafe {
+        corefoundation::url::as_url(object as _).and_then(|u| u.file_path())
+    };
+    let (Some(file), Some(root)) = (path(url), path(access)) else {
+        return std::ptr::null_mut();
+    };
+    let file = prefix::ns::existing_host_path(&file);
+    let root = prefix::ns::existing_host_path(&root);
+    if !file_within_access(&file, &root) {
+        return std::ptr::null_mut();
+    }
+    let Some(text) = (unsafe { foundation::url::text_of(url) }) else {
+        return std::ptr::null_mut();
+    };
+    let request = foundation::urlsession::request_for(&text);
+    unsafe { load_request(receiver, sel, request) }
+}
+
+fn file_within_access(file: &std::path::Path, root: &std::path::Path) -> bool {
+    let (Ok(file), Ok(root)) = (file.canonicalize(), root.canonicalize()) else {
+        return false;
+    };
+    file.is_file() && (file == root || (root.is_dir() && file.starts_with(root)))
 }
 
 unsafe extern "C" fn can_go_back(receiver: Id, _sel: Sel) -> u8 {
@@ -1539,6 +1641,18 @@ fn start_navigation(receiver: Id) -> Id {
     });
     objc::arc::release(old.unwrap_or_default() as Id);
     navigation
+}
+
+unsafe extern "C" fn stop_loading_action(receiver: Id, sel: Sel, _sender: Id) {
+    unsafe { stop_loading(receiver, sel) };
+}
+
+unsafe extern "C" fn go_back_action(receiver: Id, sel: Sel, _sender: Id) {
+    unsafe { go_back(receiver, sel) };
+}
+
+unsafe extern "C" fn go_forward_action(receiver: Id, sel: Sel, _sender: Id) {
+    unsafe { go_forward(receiver, sel) };
 }
 
 unsafe extern "C" fn stop_loading(receiver: Id, _sel: Sel) {
@@ -1730,6 +1844,14 @@ fn mouse(receiver: Id, event: Id, pressed: bool, button: usize) {
                 send!(window, "makeFirstResponder:", receiver => Id; u8);
             }
         }
+    }
+    if engine::tracing() {
+        eprintln!(
+            "rosemary: webkit: view {:?}: button {button} {} at {:?}",
+            with_object(receiver, |v| (v.id, v.surface)),
+            if pressed { "down" } else { "up" },
+            page_point(receiver, event)
+        );
     }
     if let Some(engine) = pointer_to(receiver, event) {
         engine.compositor.send(Command::Button {
@@ -1941,13 +2063,20 @@ pub fn install() {
         "UIDelegate" => ui_delegate, c"@16@0:8";
         "setUIDelegate:" => set_ui_delegate, c"v24@0:8@16";
         "loadRequest:" => load_request, c"@24@0:8@16";
+        "loadFileURL:allowingReadAccessToURL:" => load_file_url, c"@32@0:8@16@24";
         "stopLoading" => stop_loading, c"v16@0:8";
         "canGoBack" => can_go_back, c"c16@0:8";
         "canGoForward" => can_go_forward, c"c16@0:8";
         "goBack" => go_back, c"@16@0:8";
         "goForward" => go_forward, c"@16@0:8";
+        // The `IBAction` spellings, which take a sender and return nothing.
+        "stopLoading:" => stop_loading_action, c"v24@0:8@16";
+        "goBack:" => go_back_action, c"v24@0:8@16";
+        "goForward:" => go_forward_action, c"v24@0:8@16";
         "URL" => url, c"@16@0:8";
         "evaluateJavaScript:completionHandler:" => evaluate_javascript, c"v32@0:8@16@?24";
+        "customUserAgent" => custom_user_agent, c"@16@0:8";
+        "setCustomUserAgent:" => set_custom_user_agent, c"v24@0:8@16";
         "setValue:forKey:" => set_value_for_key, c"v32@0:8@16@24";
         "acceptsFirstResponder" => yes, c"c16@0:8";
         "becomeFirstResponder" => become_first_responder, c"c16@0:8";
@@ -2014,6 +2143,106 @@ pub fn install() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn local_file_access_checks_containment_and_symlinks() {
+        let root = std::env::temp_dir().join(format!("rosemary-web-file-{}", std::process::id()));
+        let allowed = root.join("allowed");
+        std::fs::create_dir_all(&allowed).unwrap();
+        let file = allowed.join("index.html");
+        let outside = root.join("outside.html");
+        std::fs::write(&file, "<html></html>").unwrap();
+        std::fs::write(&outside, "outside").unwrap();
+        assert!(file_within_access(&file, &file));
+        assert!(file_within_access(&file, &allowed));
+        assert!(!file_within_access(&outside, &allowed));
+        assert!(!file_within_access(&allowed, &allowed));
+        #[cfg(unix)]
+        {
+            let link = allowed.join("escape.html");
+            std::os::unix::fs::symlink(&outside, &link).unwrap();
+            assert!(!file_within_access(&link, &allowed));
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    #[ignore = "requires WebKitGTK and a private compositor; run alone"]
+    fn load_request_sends_custom_headers_to_http_server() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        use std::time::{Duration, Instant};
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        crate::bootstrap();
+        let engine = engine::get().expect("WebKitGTK must start");
+        // SAFETY: registered classes and selectors have these prototypes.
+        unsafe {
+            let class = objc::class::lookup(c"WKWebView").unwrap();
+            let configuration = send!(
+                objc::class::ptr(objc::class::lookup(c"WKWebViewConfiguration").unwrap()) as Id,
+                "new"; Id
+            );
+            let frame = foundation::geometry::NSRect {
+                origin: foundation::geometry::NSPoint { x: 0.0, y: 0.0 },
+                size: foundation::geometry::NSSize {
+                    width: 320.0,
+                    height: 240.0,
+                },
+            };
+            let view = objc::object::create_instance(class, 0);
+            let view = send!(view, "initWithFrame:configuration:",
+                frame => foundation::geometry::NSRect, configuration => Id; Id);
+            let request = foundation::urlsession::request_for(&format!(
+                "http://{}/header-check",
+                listener.local_addr().unwrap()
+            ));
+            send!(request, "setValue:forHTTPHeaderField:",
+                engine::string("preserved-value") => Id,
+                engine::string("X-Rosemary-Test") => Id; ());
+            assert!(!load_request(view, objc::sel::get("loadRequest:"), request).is_null());
+            let deadline = Instant::now() + Duration::from_secs(15);
+            let mut socket = loop {
+                while (engine.api.g_main_context_iteration)(std::ptr::null_mut(), 0) != 0 {}
+                match listener.accept() {
+                    Ok((socket, _)) => break socket,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+                    Err(error) => panic!("accept: {error}"),
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "request did not reach local server"
+                );
+                std::thread::sleep(Duration::from_millis(10));
+            };
+            socket.set_nonblocking(true).unwrap();
+            let mut received = Vec::new();
+            let mut buffer = [0; 1024];
+            while !received.windows(4).any(|bytes| bytes == b"\r\n\r\n") {
+                while (engine.api.g_main_context_iteration)(std::ptr::null_mut(), 0) != 0 {}
+                match socket.read(&mut buffer) {
+                    Ok(0) => panic!("HTTP connection closed before headers"),
+                    Ok(count) => received.extend_from_slice(&buffer[..count]),
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        assert!(Instant::now() < deadline, "HTTP headers were not received");
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(error) => panic!("read: {error}"),
+                }
+            }
+            socket
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok")
+                .unwrap();
+            let received = String::from_utf8(received).unwrap();
+            assert!(received.starts_with("GET /header-check HTTP/1.1\r\n"));
+            assert!(
+                received
+                    .to_ascii_lowercase()
+                    .contains("\r\nx-rosemary-test: preserved-value\r\n")
+            );
+        }
+    }
 
     #[test]
     fn a_security_origin_is_the_scheme_host_and_explicit_port() {
