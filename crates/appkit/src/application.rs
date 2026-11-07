@@ -538,17 +538,67 @@ unsafe fn turn_in_pool(receiver: Id, mode: &str) {
     // one the platform has not been told to show: on macOS SDL's Cocoa backend
     // needs its events drained for the window to appear at all, so this is not
     // only about delivering input.
-    crate::event::pump(receiver);
+    let delivered = crate::event::pump(receiver);
     // `-postEvent:atStart:` is used by Cocoa backends to wake work that must run
     // through their `-sendEvent:` override. Dispatch through the receiver rather
     // than calling this class's implementation directly so a principal
     // `NSApplication` subclass sees the event.
-    unsafe { dispatch_posted_events(receiver) };
-    unsafe { service_run_loop(mode, 0.002) };
+    let dispatched = unsafe { dispatch_posted_events(receiver) };
+    let seconds = idle_slice(mode, delivered || dispatched);
+    let handled = unsafe { service_run_loop(mode, seconds) };
+    if handled {
+        IDLE_STREAK.store(0, Ordering::Relaxed);
+    }
+}
+
+/// How long a turn in `mode` may let its run loop slice grow to once it has
+/// found nothing to do several times running, so a window that is only being
+/// looked at settles near zero CPU instead of polling at the base rate
+/// forever. Doubles like a starved presenter already backs off - see
+/// `metal`'s `deferred_retry_delay` - capped well under a frame so an actual
+/// display link is never the one left waiting.
+const IDLE_RUN_LOOP_SLICE_MS: [u64; 4] = [2, 4, 8, 16];
+
+/// Turns of the default mode in a row that delivered no window-system event,
+/// sent no posted event and had no run loop source or timer handled. Read and
+/// written only from the main thread, which is the only one that ever turns
+/// the loop.
+static IDLE_STREAK: AtomicUsize = AtomicUsize::new(0);
+
+/// The slice [`turn_in_pool`] and [`next_event`] hand their run loop a turn
+/// that found `had_work` nothing to do.
+///
+/// Modal and tracking modes never back off: `-runModalSession:` and Cocoa's
+/// event-tracking loop both rely on being polled at the base rate while they
+/// are up, for a drag or a key repeat that SDL only ever reports by being
+/// asked again. Genuine wake-ups - a timer, a dispatched block, WebKit's
+/// compositor, a posted event - all signal the run loop's own condition
+/// variable directly (see `corefoundation::runloop::RunLoop::wake`) and so
+/// are never delayed by this; what grows is only how often an idle default
+/// mode polls SDL for a window-system event nothing integrates that way.
+fn idle_slice(mode: &str, had_work: bool) -> f64 {
+    if mode != corefoundation::runloop::DEFAULT_MODE {
+        return 0.002;
+    }
+    let streak = if had_work {
+        IDLE_STREAK.store(0, Ordering::Relaxed);
+        0
+    } else {
+        IDLE_STREAK.fetch_add(1, Ordering::Relaxed)
+    };
+    idle_run_loop_slice(streak)
+}
+
+/// The pure lookup [`idle_slice`] hands its streak: the base rate the first
+/// time round, doubling up to the table's cap - see [`IDLE_RUN_LOOP_SLICE_MS`].
+fn idle_run_loop_slice(streak: usize) -> f64 {
+    let index = streak.min(IDLE_RUN_LOOP_SLICE_MS.len() - 1);
+    IDLE_RUN_LOOP_SLICE_MS[index] as f64 / 1000.0
 }
 
 /// Run the main run loop in `mode` for `seconds`, which also drains the main
-/// queue in the common modes.
+/// queue in the common modes. Answers whether a source was handled, which
+/// counts as real work for [`idle_slice`].
 ///
 /// The slice is short because the run loop's timers are what drive a frame -
 /// see `corevideo` - and the window system is pumped between slices, not by the
@@ -557,7 +607,7 @@ unsafe fn turn_in_pool(receiver: Id, mode: &str) {
 /// # Safety
 ///
 /// Called on the main thread, from a place a run loop callback may reenter.
-unsafe fn service_run_loop(mode: &str, seconds: f64) {
+unsafe fn service_run_loop(mode: &str, seconds: f64) -> bool {
     // Returning after a source lets an event posted from another thread be sent
     // now rather than when the slice ends - see `POSTED_SOURCE`.
     let result = corefoundation::runloop::main().run_in_mode(mode, seconds, true);
@@ -567,6 +617,7 @@ unsafe fn service_run_loop(mode: &str, seconds: f64) {
         // hundred per cent for a window that is only being looked at.
         std::thread::sleep(std::time::Duration::from_millis(1));
     }
+    result == corefoundation::runloop::result::HANDLED_SOURCE
 }
 
 /// Seconds until a deadline, or zero for a date this runtime cannot read.
@@ -657,23 +708,29 @@ unsafe extern "C" fn next_event(
     dequeue: u8,
 ) -> Id {
     register_common_modes();
-    crate::event::pump(receiver);
+    let delivered = crate::event::pump(receiver);
     let event = queued_event(mask, dequeue != 0);
     if !event.is_null() {
+        IDLE_STREAK.store(0, Ordering::Relaxed);
         return event;
     }
     // Apple runs the run loop in `mode` until an event arrives or the deadline
     // passes, and a toolkit waiting in here - Qt in a modal session does - relies
     // on its timers and sources firing meanwhile. Window-system input does not
-    // wake the loop here, so the wait is a short slice and the caller asks again.
+    // wake the loop here, so the wait is a short slice, growing while the
+    // default mode keeps finding nothing to do - see `idle_slice` - and the
+    // caller asks again.
     let mode = match mode.is_null() {
         true => corefoundation::runloop::DEFAULT_MODE.to_string(),
         // SAFETY: a mode is a string object.
         false => String::from_utf8_lossy(&unsafe { foundation::string::bytes(mode) }).into_owned(),
     };
-    let seconds = wait_interval(until).min(0.002);
+    let seconds = wait_interval(until).min(idle_slice(&mode, delivered));
     // SAFETY: the main thread's event call, where Apple runs the loop too.
-    unsafe { service_run_loop(&mode, seconds) };
+    let handled = unsafe { service_run_loop(&mode, seconds) };
+    if handled {
+        IDLE_STREAK.store(0, Ordering::Relaxed);
+    }
     queued_event(mask, dequeue != 0)
 }
 
@@ -1067,15 +1124,18 @@ pub(crate) fn enqueue_input(event: Id) {
 }
 
 /// Send every queued event through the application's dynamic `-sendEvent:`.
+/// True if there was at least one, which counts as real work for
+/// [`idle_slice`].
 ///
 /// # Safety
 ///
 /// `receiver` is a live application.
-unsafe fn dispatch_posted_events(receiver: Id) {
+unsafe fn dispatch_posted_events(receiver: Id) -> bool {
     // Taken as one batch, with the lock released before any is sent: a
     // `-sendEvent:` override that posts another event must not find the queue
     // locked, and what it posts is for the next turn, not this one.
     let batch = std::mem::take(&mut *posted_events());
+    let dispatched = !batch.is_empty();
     for event in batch {
         let event = event as Id;
         crate::event::handing_out(event);
@@ -1083,6 +1143,7 @@ unsafe fn dispatch_posted_events(receiver: Id) {
         unsafe { send_event_through(receiver, event) };
         objc::arc::release(event);
     }
+    dispatched
 }
 
 /// Send `event` through the application's dynamic `-sendEvent:`, so a
@@ -1476,6 +1537,30 @@ pub(crate) fn install() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A default-mode turn that keeps finding nothing to do backs off past
+    /// the base poll rate instead of staying there forever - the busy loop
+    /// `idle_slice` exists to avoid - then caps rather than growing past a
+    /// frame.
+    #[test]
+    fn idle_run_loop_slice_backs_off_then_caps() {
+        assert_eq!(idle_run_loop_slice(0), 0.002);
+        assert_eq!(idle_run_loop_slice(1), 0.004);
+        assert_eq!(idle_run_loop_slice(2), 0.008);
+        assert_eq!(idle_run_loop_slice(3), 0.016);
+        assert_eq!(idle_run_loop_slice(4), 0.016, "capped, not still growing");
+        assert_eq!(idle_run_loop_slice(1_000_000), 0.016);
+    }
+
+    /// A modal or tracking mode never backs off: `-runModalSession:` and a
+    /// mouse-tracking loop both rely on being polled at the base rate for as
+    /// long as they are up, since SDL only ever reports the drag or key
+    /// repeat driving them by being asked again.
+    #[test]
+    fn a_non_default_mode_never_backs_off() {
+        assert_eq!(idle_slice(MODAL_PANEL_MODE, false), 0.002);
+        assert_eq!(idle_slice("NSEventTrackingRunLoopMode", false), 0.002);
+    }
 
     /// No window has the number zero or a number nothing was given, and
     /// asking for one is nil rather than the first window.

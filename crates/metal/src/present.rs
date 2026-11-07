@@ -241,7 +241,7 @@ pub(crate) unsafe extern "C" fn next_drawable(receiver: Id, _sel: Sel) -> Id {
         &CACHE,
         cache,
         matches,
-        || crate::swapchain::wait_copied(RECLAIM_POLL),
+        crate::swapchain::wait_copied,
         RECLAIM_POLL,
     ) else {
         return std::ptr::null_mut();
@@ -255,18 +255,26 @@ pub(crate) unsafe extern "C" fn next_drawable(receiver: Id, _sel: Sel) -> Id {
 /// Mark a slot of the ring `matches` picks out vended, waiting for one while
 /// the ring is full, and hand it back with the lock still held. `None` once
 /// the ring has been retired. `retire` returns presented drawables whose
-/// copies are done, saying whether there was a copy to retire or wait for.
+/// copies are done, saying whether there was a copy to retire or wait for; it
+/// is given the same backoff `vend` is about to wait with, so a copy wait
+/// never polls tighter than the ring's own.
 fn vend<'a>(
     pair: &'a DrawableCache,
     mut cache: std::sync::MutexGuard<'a, Vec<Cached>>,
     matches: impl Fn(&Cached) -> bool,
-    mut retire: impl FnMut() -> bool,
+    mut retire: impl FnMut(std::time::Duration) -> bool,
     poll: std::time::Duration,
 ) -> Option<(std::sync::MutexGuard<'a, Vec<Cached>>, usize)> {
     // Whether the swapchain had no copy left to retire or wait for, so that
     // only another thread can free a slot. Not on the first pass: a copy may
     // have finished, or still be running, since the caller last retired.
     let mut idle = false;
+    // Passes in a row that neither found a slot nor retired a copy: a ring
+    // nobody is draining - a layer that is not actually being presented, as
+    // one behind a login dialog or never shown at all can be - backs off
+    // instead of polling at `poll` forever, the way a starved presenter
+    // already does; see `deferred_retry_delay`.
+    let mut starved: u32 = 0;
     loop {
         // Every pass checks the ring under the lock it may then wait with, so
         // a slot returned while the lock was given up is found here rather
@@ -286,15 +294,25 @@ fn vend<'a>(
             return Some((cache, drawable));
         }
         crate::stats::count(crate::stats::Counter::DrawablePressure);
+        let delay = match starved {
+            0 => poll,
+            streak => deferred_retry_delay(streak - 1),
+        };
         if idle {
             // Timed, because a guest dropping a drawable it never presented
             // does not signal the condition variable.
-            cache = pair.1.wait_timeout(cache, poll).expect("drawable cache").0;
+            cache = pair.1.wait_timeout(cache, delay).expect("drawable cache").0;
         }
         // A presented drawable whose copy is done comes back through the
         // swapchain, which locks the cache to return it.
         drop(cache);
-        idle = !retire();
+        let retired = retire(delay);
+        idle = !retired;
+        starved = if retired {
+            0
+        } else {
+            starved.saturating_add(1)
+        };
         cache = pair.0.lock().expect("drawable cache");
     }
 }
@@ -3276,7 +3294,7 @@ mod drawable_pool_tests {
             &pair,
             pair.0.lock().unwrap(),
             ring_of_layer_7,
-            || {
+            |_delay| {
                 retirements += 1;
                 finish_copy(&pair);
                 false
@@ -3297,7 +3315,7 @@ mod drawable_pool_tests {
             &pair,
             pair.0.lock().unwrap(),
             ring_of_layer_7,
-            || {
+            |_delay| {
                 retirements += 1;
                 if retirements == 2 {
                     finish_copy(&pair);
@@ -3319,7 +3337,7 @@ mod drawable_pool_tests {
             let guard = pair.0.lock().unwrap();
             // Blocks on the lock until the vend below waits and gives it up.
             scope.spawn(|| finish_copy(&pair));
-            let vended = vend(&pair, guard, ring_of_layer_7, || false, NEVER);
+            let vended = vend(&pair, guard, ring_of_layer_7, |_delay| false, NEVER);
             assert_eq!(vended.map(|(_, drawable)| drawable), Some(1));
         });
         assert!(started.elapsed() < NEVER / 2);
@@ -3332,13 +3350,53 @@ mod drawable_pool_tests {
             &pair,
             pair.0.lock().unwrap(),
             ring_of_layer_7,
-            || {
+            |_delay| {
                 pair.0.lock().unwrap()[0].stale = true;
                 true
             },
             NEVER,
         );
         assert!(vended.is_none());
+    }
+
+    /// A ring nobody ever drains - a layer behind a login dialog that is
+    /// never actually presented, say - backs off the way a starved
+    /// presenter already does (`deferred_retry_delay`) instead of polling
+    /// at the base rate forever: see the hang this reproduced, headless,
+    /// in `crates/metal/src/present.rs`'s `next_drawable`.
+    #[test]
+    fn a_permanently_starved_ring_backs_off_instead_of_polling_at_the_base_rate() {
+        let pair = full_ring();
+        let mut delays = Vec::new();
+        let vended = vend(
+            &pair,
+            pair.0.lock().unwrap(),
+            ring_of_layer_7,
+            |delay| {
+                delays.push(delay);
+                if delays.len() >= 6 {
+                    // End the run the way a real guest retiring the layer
+                    // would: nothing was ever going to free a slot.
+                    pair.0.lock().unwrap()[0].stale = true;
+                }
+                false
+            },
+            RECLAIM_POLL,
+        );
+        assert!(vended.is_none(), "the ring never had a slot to vend");
+        use std::time::Duration;
+        assert_eq!(
+            delays,
+            [
+                RECLAIM_POLL,
+                Duration::from_millis(16),
+                Duration::from_millis(32),
+                Duration::from_millis(64),
+                Duration::from_millis(128),
+                Duration::from_millis(250),
+            ],
+            "polling should escalate past the base rate and then cap, not repeat it forever"
+        );
     }
 }
 
