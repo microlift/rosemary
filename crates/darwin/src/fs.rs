@@ -54,6 +54,19 @@ fn with_pair(
     ask(found.as_ptr(), to_host.as_ptr())
 }
 
+/// [`with_fallback`] for a path [`host`] or [`host_at`] already translated,
+/// which translating again would root a second time.
+fn with_host_fallback<T>(host: &CStr, mut ask: impl FnMut(*const c_char) -> (T, bool)) -> T {
+    let (result, ok) = ask(host.as_ptr());
+    if ok || crate::errno::get() != libc::ENOENT {
+        return result;
+    }
+    let Some(found) = prefix::ns::fold(host) else {
+        return result;
+    };
+    ask(found.as_ptr()).0
+}
+
 /// `int chdir(const char *)`
 ///
 /// # Safety
@@ -268,6 +281,44 @@ pub unsafe extern "C" fn chmod(path: *const c_char, mode: libc::mode_t) -> c_int
             return (-1, false);
         }
         let rc = unsafe { libc::chmod(path, mode) };
+        (rc, rc == 0)
+    })
+}
+
+/// `int fchmodat(int fd, const char *path, mode_t mode, int flag)`
+///
+/// Darwin spells `AT_FDCWD` and `AT_SYMLINK_NOFOLLOW` its own way; any other
+/// flag is refused.
+///
+/// # Safety
+///
+/// `path` is a NUL-terminated string and `dirfd` a directory descriptor or
+/// Darwin's `AT_FDCWD`.
+pub unsafe extern "C" fn fchmodat(
+    dirfd: c_int,
+    path: *const c_char,
+    mode: libc::mode_t,
+    flag: c_int,
+) -> c_int {
+    const DARWIN_AT_SYMLINK_NOFOLLOW: c_int = 0x20;
+    if flag & !DARWIN_AT_SYMLINK_NOFOLLOW != 0 {
+        crate::errno::set(libc::EINVAL);
+        return -1;
+    }
+    let host_flag = if flag & DARWIN_AT_SYMLINK_NOFOLLOW != 0 {
+        libc::AT_SYMLINK_NOFOLLOW
+    } else {
+        0
+    };
+    let dirfd = match dirfd {
+        crate::stat::DARWIN_AT_FDCWD => libc::AT_FDCWD,
+        fd => fd,
+    };
+    crate::stat::with_fallback_at(dirfd, path, |path| {
+        if !crate::stat::may_write_at(dirfd, path) {
+            return (-1, false);
+        }
+        let rc = unsafe { libc::fchmodat(dirfd, path, mode, host_flag) };
         (rc, rc == 0)
     })
 }
@@ -521,6 +572,57 @@ pub unsafe extern "C" fn link(from: *const c_char, to: *const c_char) -> c_int {
     })
 }
 
+/// `int linkat(int, const char *, int, const char *, int flag)`
+///
+/// Darwin spells `AT_FDCWD` and `AT_SYMLINK_FOLLOW` its own way; any other
+/// flag is refused.
+///
+/// # Safety
+///
+/// Both paths are NUL-terminated strings.
+pub unsafe extern "C" fn linkat(
+    from_dirfd: c_int,
+    from: *const c_char,
+    to_dirfd: c_int,
+    to: *const c_char,
+    flag: c_int,
+) -> c_int {
+    const DARWIN_AT_SYMLINK_FOLLOW: c_int = 0x40;
+    if flag & !DARWIN_AT_SYMLINK_FOLLOW != 0 {
+        crate::errno::set(libc::EINVAL);
+        return -1;
+    }
+    let host_flag = if flag & DARWIN_AT_SYMLINK_FOLLOW != 0 {
+        libc::AT_SYMLINK_FOLLOW
+    } else {
+        0
+    };
+    let dirfd = |fd| match fd {
+        crate::stat::DARWIN_AT_FDCWD => libc::AT_FDCWD,
+        fd => fd,
+    };
+    let (Some(from), Some(to)) = (
+        host_at(dirfd(from_dirfd), from),
+        host_at(dirfd(to_dirfd), to),
+    ) else {
+        crate::errno::set(libc::EFAULT);
+        return -1;
+    };
+    if !may_write(to.as_ptr()) {
+        return -1;
+    }
+    // SAFETY: two NUL-terminated host paths.
+    unsafe {
+        libc::linkat(
+            libc::AT_FDCWD,
+            from.as_ptr(),
+            libc::AT_FDCWD,
+            to.as_ptr(),
+            host_flag,
+        )
+    }
+}
+
 /// `int clonefileat(int, const char *, int, const char *, int)`
 ///
 /// This host does not expose Darwin's copy-on-write operation, so files and
@@ -566,7 +668,7 @@ pub unsafe extern "C" fn clonefileat(
         return -1;
     };
     let mut from_resolved = from.clone();
-    let from_path = crate::stat::with_fallback_at(libc::AT_FDCWD, from.as_ptr(), |path| {
+    let from_path = with_host_fallback(&from, |path| {
         from_resolved = unsafe { CStr::from_ptr(path) }.to_owned();
         let source = unsafe { CStr::from_ptr(path) };
         let source = Path::new(std::ffi::OsStr::from_bytes(source.to_bytes()));
@@ -586,8 +688,8 @@ pub unsafe extern "C" fn clonefileat(
         return -1;
     }
     let from_path = Path::new(std::ffi::OsStr::from_bytes(from_resolved.to_bytes()));
-    crate::stat::with_fallback_at(libc::AT_FDCWD, to.as_ptr(), |destination| {
-        if !crate::stat::may_write_at(libc::AT_FDCWD, destination) {
+    with_host_fallback(&to, |destination| {
+        if !may_write(destination) {
             return (-1, true);
         }
         let destination = Path::new(std::ffi::OsStr::from_bytes(
@@ -681,6 +783,20 @@ pub unsafe extern "C" fn renameatx_np(
     }
 }
 
+/// `int renameat(int, const char *, int, const char *)`
+///
+/// # Safety
+///
+/// Both paths are NUL-terminated strings.
+pub unsafe extern "C" fn renameat(
+    from_dirfd: c_int,
+    from: *const c_char,
+    to_dirfd: c_int,
+    to: *const c_char,
+) -> c_int {
+    unsafe { renameatx_np(from_dirfd, from, to_dirfd, to, 0) }
+}
+
 /// `int rename(const char *, const char *)`
 ///
 /// # Safety
@@ -709,6 +825,33 @@ pub unsafe extern "C" fn rename(from: *const c_char, to: *const c_char) -> c_int
 /// Both arguments are NUL-terminated strings.
 pub unsafe extern "C" fn symlink(target: *const c_char, link: *const c_char) -> c_int {
     let (Some(target), Some(link)) = (host(target), host(link)) else {
+        crate::errno::set(libc::EFAULT);
+        return -1;
+    };
+    if !may_write(link.as_ptr()) {
+        return -1;
+    }
+    // SAFETY: two NUL-terminated paths.
+    unsafe { libc::symlink(target.as_ptr(), link.as_ptr()) }
+}
+
+/// `int symlinkat(const char *target, int fd, const char *link)`
+///
+/// The target is translated as [`symlink`]'s is.
+///
+/// # Safety
+///
+/// Both paths are NUL-terminated strings.
+pub unsafe extern "C" fn symlinkat(
+    target: *const c_char,
+    dirfd: c_int,
+    link: *const c_char,
+) -> c_int {
+    let dirfd = match dirfd {
+        crate::stat::DARWIN_AT_FDCWD => libc::AT_FDCWD,
+        fd => fd,
+    };
+    let (Some(target), Some(link)) = (host(target), host_at(dirfd, link)) else {
         crate::errno::set(libc::EFAULT);
         return -1;
     };
@@ -1066,6 +1209,7 @@ exports::exports! {
         "mkdir" => mkdir,
         "mkdirat" => mkdirat,
         "chmod" => chmod,
+        "fchmodat" => fchmodat,
         "chown" => chown,
         "lchown" => lchown,
         "fchown" => fchown,
@@ -1076,11 +1220,14 @@ exports::exports! {
         "truncate" => truncate,
         "lseek" => lseek,
         "link" => link,
+        "linkat" => linkat,
         "clonefileat" => clonefileat,
         "clonefile" => clonefile,
         "renameatx_np" => renameatx_np,
         "rename" => rename,
+        "renameat" => renameat,
         "symlink" => symlink,
+        "symlinkat" => symlinkat,
         "mkstemp" => mkstemp,
         "mkdtemp" => mkdtemp,
         "mkdtempat_np" => mkdtempat_np,
@@ -1192,6 +1339,84 @@ mod tests {
         let rc = unsafe { mkdirat(crate::stat::DARWIN_AT_FDCWD, path.as_ptr(), 0o755) };
         assert_eq!(rc, 0, "mkdirat: {}", std::io::Error::last_os_error());
         assert!(scratch.0.join("made").is_dir());
+    }
+
+    #[test]
+    fn renameat_moves_a_file_named_against_darwin_at_fdcwd() {
+        let scratch = Scratch::new("renameat-cwd");
+        std::fs::write(scratch.0.join("from"), b"x").expect("a file");
+        let (from, to) = (scratch.c_path("from"), scratch.c_path("to"));
+        let here = crate::stat::DARWIN_AT_FDCWD;
+        // SAFETY: two NUL-terminated paths and Darwin's AT_FDCWD.
+        let rc = unsafe { renameat(here, from.as_ptr(), here, to.as_ptr()) };
+        assert_eq!(rc, 0, "renameat: {}", std::io::Error::last_os_error());
+        assert_eq!(std::fs::read(scratch.0.join("to")).unwrap(), b"x");
+    }
+
+    #[test]
+    fn linkat_follows_a_symlink_only_when_asked() {
+        const DARWIN_AT_SYMLINK_FOLLOW: c_int = 0x40;
+        let scratch = Scratch::new("linkat-follow");
+        std::fs::write(scratch.0.join("file"), b"x").expect("a file");
+        std::os::unix::fs::symlink("file", scratch.0.join("link")).expect("a symlink");
+        let dir = scratch.open(".");
+        let fd = dir.as_raw_fd();
+        // SAFETY: a live directory descriptor and NUL-terminated relative paths.
+        unsafe {
+            assert_eq!(linkat(fd, c"link".as_ptr(), fd, c"same".as_ptr(), 0), 0);
+            let flag = DARWIN_AT_SYMLINK_FOLLOW;
+            assert_eq!(linkat(fd, c"link".as_ptr(), fd, c"hard".as_ptr(), flag), 0);
+            assert_eq!(linkat(fd, c"link".as_ptr(), fd, c"bad".as_ptr(), 0x100), -1);
+        }
+        assert_eq!(crate::errno::get(), libc::EINVAL);
+        let kind = |name| std::fs::symlink_metadata(scratch.0.join(name)).unwrap();
+        assert!(kind("same").file_type().is_symlink());
+        assert!(kind("hard").file_type().is_file());
+    }
+
+    #[test]
+    fn symlinkat_and_readlinkat_resolve_against_their_descriptor() {
+        let scratch = Scratch::new("symlinkat");
+        let dir = scratch.open(".");
+        let mut target = [0 as c_char; 16];
+        // SAFETY: a live directory descriptor, NUL-terminated paths and a
+        // buffer of the stated size.
+        let read = unsafe {
+            assert_eq!(
+                symlinkat(c"there".as_ptr(), dir.as_raw_fd(), c"link".as_ptr()),
+                0
+            );
+            crate::stat::readlinkat(
+                dir.as_raw_fd(),
+                c"link".as_ptr(),
+                target.as_mut_ptr(),
+                target.len(),
+            )
+        };
+        assert_eq!(read, 5);
+        assert_eq!(
+            std::fs::read_link(scratch.0.join("link")).unwrap(),
+            Path::new("there")
+        );
+    }
+
+    #[test]
+    fn fchmodat_translates_darwin_at_fdcwd_and_refuses_unknown_flags() {
+        let scratch = Scratch::new("fchmodat");
+        std::fs::write(scratch.0.join("file"), b"x").expect("a file");
+        let path = scratch.c_path("file");
+        let here = crate::stat::DARWIN_AT_FDCWD;
+        // SAFETY: a NUL-terminated path and Darwin's AT_FDCWD.
+        unsafe {
+            assert_eq!(fchmodat(here, path.as_ptr(), 0o600, 0), 0);
+            assert_eq!(fchmodat(here, path.as_ptr(), 0o644, 0x100), -1);
+        }
+        assert_eq!(crate::errno::get(), libc::EINVAL);
+        let mode = std::fs::metadata(scratch.0.join("file"))
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o600);
     }
 
     #[test]

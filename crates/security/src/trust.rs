@@ -177,34 +177,10 @@ pub unsafe extern "C" fn SecCertificateCreateWithData(
     new(Payload::Certificate(bytes))
 }
 
-/// The host's root certificates, DER-encoded, read once.
-///
-/// From the bundle the host's own TLS libraries trust, so a program running
-/// its own stack trusts the same servers the rest of the machine does.
-/// `SSL_CERT_FILE` first, as OpenSSL reads it, then where Debian, Fedora,
-/// NixOS and the BSDs keep theirs.
+/// The host's root certificates, the same set the guest's
+/// `SystemRootCertificates.keychain` holds.
 fn host_anchors() -> &'static [Vec<u8>] {
-    static ANCHORS: std::sync::OnceLock<Vec<Vec<u8>>> = std::sync::OnceLock::new();
-    ANCHORS.get_or_init(|| {
-        use rustls_pki_types::pem::PemObject;
-        const BUNDLES: &[&str] = &[
-            "/etc/ssl/certs/ca-certificates.crt",
-            "/etc/pki/tls/certs/ca-bundle.crt",
-            "/etc/ssl/ca-bundle.pem",
-            "/etc/ssl/cert.pem",
-            "/usr/local/share/certs/ca-root-nss.crt",
-        ];
-        let named = std::env::var_os("SSL_CERT_FILE").map(std::path::PathBuf::from);
-        let pem = named
-            .into_iter()
-            .chain(BUNDLES.iter().map(std::path::PathBuf::from))
-            .find_map(|path| std::fs::read(path).ok())
-            .unwrap_or_default();
-        CertificateDer::pem_slice_iter(&pem)
-            .filter_map(Result::ok)
-            .map(|der| der.to_vec())
-            .collect()
-    })
+    prefix::keychain::host_anchors()
 }
 
 /// `OSStatus SecTrustCopyAnchorCertificates(CFArrayRef *anchors)`.

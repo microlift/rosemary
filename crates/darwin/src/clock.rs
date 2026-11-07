@@ -124,6 +124,82 @@ unsafe extern "C" fn lutimes(path: *const c_char, times: *const Timeval) -> i32 
     })
 }
 
+/// Darwin's `UTIME_NOW` and `UTIME_OMIT` from `<sys/stat.h>`; Linux spells
+/// them `(1 << 30) - 1` and `(1 << 30) - 2`.
+const DARWIN_UTIME_NOW: i64 = -1;
+const DARWIN_UTIME_OMIT: i64 = -2;
+
+/// Darwin's `AT_SYMLINK_NOFOLLOW`.
+const DARWIN_AT_SYMLINK_NOFOLLOW: c_int = 0x20;
+
+/// Convert the two guest timespecs into host-owned storage, translating the
+/// `UTIME_NOW` and `UTIME_OMIT` markers. Null keeps meaning "now" for both.
+unsafe fn timespecs(times: *const crate::stat::Timespec) -> Option<[libc::timespec; 2]> {
+    let host = |time: crate::stat::Timespec| {
+        let nsec = match time.nsec {
+            DARWIN_UTIME_NOW => libc::UTIME_NOW,
+            DARWIN_UTIME_OMIT => libc::UTIME_OMIT,
+            nsec => nsec,
+        };
+        libc::timespec {
+            tv_sec: time.sec,
+            tv_nsec: nsec,
+        }
+    };
+    (!times.is_null()).then(|| unsafe {
+        [
+            host(times.read_unaligned()),
+            host(times.add(1).read_unaligned()),
+        ]
+    })
+}
+
+/// `int utimensat(int fd, const char *path, const struct timespec[2], int flag)`
+///
+/// # Safety
+///
+/// `path` is a NUL-terminated string, `times` is null or two readable
+/// timespecs, and `dirfd` a directory descriptor or Darwin's `AT_FDCWD`.
+unsafe extern "C" fn utimensat(
+    dirfd: c_int,
+    path: *const c_char,
+    times: *const crate::stat::Timespec,
+    flag: c_int,
+) -> i32 {
+    if flag & !DARWIN_AT_SYMLINK_NOFOLLOW != 0 {
+        crate::errno::set(libc::EINVAL);
+        return -1;
+    }
+    let host_flag = if flag & DARWIN_AT_SYMLINK_NOFOLLOW != 0 {
+        libc::AT_SYMLINK_NOFOLLOW
+    } else {
+        0
+    };
+    let dirfd = match dirfd {
+        crate::stat::DARWIN_AT_FDCWD => libc::AT_FDCWD,
+        fd => fd,
+    };
+    let host = unsafe { timespecs(times) };
+    let times = host.as_ref().map_or(core::ptr::null(), |v| v.as_ptr());
+    crate::stat::with_fallback_at(dirfd, path, |path| {
+        if !crate::stat::may_write_at(dirfd, path) {
+            return (-1, false);
+        }
+        let rc = unsafe { libc::utimensat(dirfd, path, times, host_flag) };
+        (rc, rc == 0)
+    })
+}
+
+/// `int futimens(int fd, const struct timespec[2])`
+///
+/// # Safety
+///
+/// `times` is null or two readable timespecs.
+unsafe extern "C" fn futimens(fd: c_int, times: *const crate::stat::Timespec) -> i32 {
+    let host = unsafe { timespecs(times) };
+    unsafe { libc::futimens(fd, host.as_ref().map_or(core::ptr::null(), |v| v.as_ptr())) }
+}
+
 /// `int utime(const char *, const struct utimbuf *)`. Both `time_t` fields have
 /// the same layout on Darwin and this host; only the path needs translating.
 unsafe extern "C" fn utime(path: *const c_char, times: *const libc::utimbuf) -> i32 {
@@ -472,6 +548,8 @@ exports::exports! {
         "utimes" => utimes,
         "futimes" => futimes,
         "lutimes" => lutimes,
+        "utimensat" => utimensat,
+        "futimens" => futimens,
         "settimeofday" => settimeofday,
     }
 }
@@ -479,6 +557,73 @@ exports::exports! {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn scratch(test: &str) -> std::path::PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("rosemary-clock-{test}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("a temporary directory");
+        dir
+    }
+
+    fn c_path(path: &std::path::Path) -> std::ffi::CString {
+        use std::os::unix::ffi::OsStrExt;
+        std::ffi::CString::new(path.as_os_str().as_bytes()).expect("no NUL")
+    }
+
+    fn mtime(path: &std::path::Path) -> i64 {
+        use std::os::unix::fs::MetadataExt;
+        std::fs::symlink_metadata(path).expect("a file").mtime()
+    }
+
+    #[test]
+    fn utimensat_sets_a_symlinks_own_time_with_darwins_nofollow() {
+        let dir = scratch("utimensat-nofollow");
+        // The target does not exist, as `tar` restores a link before its file.
+        std::os::unix::fs::symlink("missing", dir.join("link")).expect("a symlink");
+        let link = c_path(&dir.join("link"));
+        let at = crate::stat::Timespec {
+            sec: 1_000_000,
+            nsec: 0,
+        };
+        let times = [at, at];
+        // SAFETY: a NUL-terminated path and two timespecs.
+        let rc = unsafe {
+            utimensat(
+                crate::stat::DARWIN_AT_FDCWD,
+                link.as_ptr(),
+                times.as_ptr(),
+                DARWIN_AT_SYMLINK_NOFOLLOW,
+            )
+        };
+        assert_eq!(rc, 0, "utimensat: {}", std::io::Error::last_os_error());
+        assert_eq!(mtime(&dir.join("link")), 1_000_000);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn futimens_leaves_an_omitted_time_alone() {
+        let dir = scratch("futimens-omit");
+        let path = dir.join("file");
+        std::fs::write(&path, b"x").expect("a file");
+        let file = std::fs::File::open(&path).expect("an open file");
+        let set = crate::stat::Timespec {
+            sec: 2_000_000,
+            nsec: 0,
+        };
+        let omit = crate::stat::Timespec {
+            sec: 0,
+            nsec: DARWIN_UTIME_OMIT,
+        };
+        use std::os::fd::AsRawFd;
+        // SAFETY: a live descriptor and two timespecs.
+        unsafe {
+            assert_eq!(futimens(file.as_raw_fd(), [set, set].as_ptr()), 0);
+            assert_eq!(futimens(file.as_raw_fd(), [set, omit].as_ptr()), 0);
+        }
+        assert_eq!(mtime(&path), 2_000_000);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn gmtime_names_its_zone_utc() {

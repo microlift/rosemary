@@ -3,6 +3,7 @@ pub mod cache;
 pub mod digest;
 pub mod fetch;
 pub mod format;
+pub mod keychain;
 pub mod layout;
 pub mod ns;
 pub mod ownership;

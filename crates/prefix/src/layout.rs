@@ -14,10 +14,14 @@ pub const DRIVE: &str = "root";
 const DIRECTORIES: &[&str] = &[
     "/Applications",
     "/Library",
+    // Where `System.keychain` is mounted; see `ns`.
+    "/Library/Keychains",
     "/System",
     "/System/Library",
     // Where `SystemVersion.plist` is mounted; see `ns`.
     "/System/Library/CoreServices",
+    // Where `SystemRootCertificates.keychain` is mounted; see `ns`.
+    "/System/Library/Keychains",
     "/usr",
     "/usr/lib",
     "/private",
