@@ -128,6 +128,11 @@ pub struct Gpu {
     /// The blocks `MTLStorageModePrivate` buffers are cut out of: device
     /// memory, never mapped.
     private_buffers: OnceLock<Heap>,
+    /// The blocks ordinary (non-placement) private images are cut out of,
+    /// parallel to `private_buffers`. `None` where no memory type admits the
+    /// representative texture used to size it, so every image then falls
+    /// back to a dedicated allocation, as before this existed.
+    private_images: OnceLock<Option<Heap>>,
     /// Two-timestamp query pools, one per command buffer in flight, kept for
     /// reuse by command-buffer timing and the optional statistics.
     timestamp_pools: Mutex<Vec<vk::QueryPool>>,
@@ -840,6 +845,7 @@ impl Gpu {
             fail_immediate_wait_after_submit: AtomicBool::new(false),
             buffers: OnceLock::new(),
             private_buffers: OnceLock::new(),
+            private_images: OnceLock::new(),
             timestamp_pools: Mutex::new(Vec::new()),
             timestamp_period: properties.limits.timestamp_period,
             timestamp_valid_bits: families[queue_family as usize].timestamp_valid_bits,
@@ -927,8 +933,15 @@ unsafe impl Send for GpuBuffer {}
 
 pub struct GpuImage {
     pub image: vk::Image,
+    /// Device memory of its own: made only where `heap`'s memory type does
+    /// not admit this image, which an ordinary colour or depth format on a
+    /// device with one device-local type never does.
     pub memory: Option<vk::DeviceMemory>,
-    /// The placement heap memory it is bound into, instead of `memory`.
+    /// The shared private-image heap's range this is cut from, instead of
+    /// `memory`.
+    pub heap: Option<Allocation>,
+    /// The placement heap memory it is bound into, instead of `memory` or
+    /// `heap`.
     pub placement: Option<Arc<Placement>>,
     pub view: vk::ImageView,
     pub format: vk::Format,
@@ -1073,6 +1086,7 @@ impl GpuImage {
         Self {
             image: vk::Image::null(),
             memory: None,
+            heap: None,
             placement: None,
             view: vk::ImageView::null(),
             format: vk::Format::UNDEFINED,

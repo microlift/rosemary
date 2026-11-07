@@ -229,19 +229,25 @@ impl Gpu {
     pub fn heap_report(&self) -> Option<String> {
         let shared = self.buffers.get().map_or((0, 0, 0), Heap::usage);
         let private = self.private_buffers.get().map_or((0, 0, 0), Heap::usage);
+        let images = self
+            .private_images
+            .get()
+            .and_then(Option::as_ref)
+            .map_or((0, 0, 0), Heap::usage);
         let imported = self
             .host_imported
             .load(std::sync::atomic::Ordering::Relaxed);
-        if shared.0 + private.0 == 0 && imported == 0 {
+        if shared.0 + private.0 + images.0 == 0 && imported == 0 {
             return None;
         }
         let usage = |(blocks, bytes, free): (usize, u64, u64)| {
             format!("{blocks}/{}MiB/{}MiB", bytes >> 20, free >> 20)
         };
         Some(format!(
-            "shared_heap(blocks/held/free)={} private_heap={} host_imported={}MiB",
+            "shared_heap(blocks/held/free)={} private_heap={} private_image_heap={} host_imported={}MiB",
             usage(shared),
             usage(private),
+            usage(images),
             imported >> 20,
         ))
     }
@@ -284,6 +290,32 @@ impl Gpu {
             .or_else(|| self.memory_type(bits, vk::MemoryPropertyFlags::empty()))
             .ok_or("no Vulkan memory type admits a private buffer")?;
         Ok(self.private_buffers.get_or_init(|| Heap::new(index, false)))
+    }
+
+    /// The heap ordinary private images are cut from, parallel to
+    /// `private_buffer_heap`. Built from the first image asked for and kept
+    /// for every later one: an ordinary colour or depth texture reports the
+    /// same admissible memory types as any other on a device with a single
+    /// device-local type, which is the usual case. A later image whose bits
+    /// the cached type does not admit - never seen on ordinary hardware, but
+    /// not a guarantee this device gives - falls back to its own allocation
+    /// instead of being bound into memory it cannot live in.
+    fn private_image_heap(&self, bits: u32) -> Option<&Heap> {
+        let heap = self.private_images.get_or_init(|| {
+            let local = vk::MemoryPropertyFlags::DEVICE_LOCAL;
+            let index = (0..self.memory.memory_type_count)
+                .find(|index| {
+                    let flags = self.memory.memory_types[*index as usize].property_flags;
+                    bits & (1 << index) != 0
+                        && flags.contains(local)
+                        && !flags.contains(vk::MemoryPropertyFlags::HOST_VISIBLE)
+                })
+                .or_else(|| self.memory_type(bits, local))
+                .or_else(|| self.memory_type(bits, vk::MemoryPropertyFlags::empty()));
+            index.map(|index| Heap::new(index, false))
+        });
+        heap.as_ref()
+            .filter(|heap| bits & (1 << heap.memory_type()) != 0)
     }
 
     pub fn create_image(&self, description: &ImageDescription) -> Result<GpuImage, String> {
@@ -404,23 +436,44 @@ impl Gpu {
         });
         // SAFETY: the image was just created by this device.
         let requirements = unsafe { self.device.get_image_memory_requirements(*image) };
-        let (memory, placement) = match placed {
-            None => {
-                let memory = self.allocate(
-                    requirements,
-                    vk::MemoryPropertyFlags::DEVICE_LOCAL,
-                    vk::MemoryPropertyFlags::empty(),
-                )?;
-                let memory = Guard::new(memory, |memory| {
-                    // SAFETY: memory of this device's, bound to nothing which
-                    // survives.
-                    unsafe { self.device.free_memory(memory, None) };
-                });
-                // SAFETY: fresh, unbound image and memory from this device.
-                unsafe { self.device.bind_image_memory(*image, *memory, 0) }
+        let (memory, heap_allocation, placement) = match placed {
+            None => match self.private_image_heap(requirements.memory_type_bits) {
+                Some(heap) => {
+                    let allocation =
+                        heap.allocate(&self.device, requirements.size, requirements.alignment)?;
+                    let allocation = Guard::new(allocation, |allocation| {
+                        heap.free(&self.device, allocation);
+                    });
+                    // SAFETY: a fresh, unbound image and a range of the
+                    // heap's memory nothing else holds.
+                    unsafe {
+                        self.device.bind_image_memory(
+                            *image,
+                            allocation.memory,
+                            allocation.offset(),
+                        )
+                    }
                     .map_err(|error| format!("vkBindImageMemory failed with {error:?}"))?;
-                (Some(memory), None)
-            }
+                    (None, Some(allocation.take()), None)
+                }
+                None => {
+                    let memory = self.allocate(
+                        requirements,
+                        vk::MemoryPropertyFlags::DEVICE_LOCAL,
+                        vk::MemoryPropertyFlags::empty(),
+                    )?;
+                    let memory = Guard::new(memory, |memory| {
+                        // SAFETY: memory of this device's, bound to nothing
+                        // which survives.
+                        unsafe { self.device.free_memory(memory, None) };
+                    });
+                    // SAFETY: fresh, unbound image and memory from this
+                    // device.
+                    unsafe { self.device.bind_image_memory(*image, *memory, 0) }
+                        .map_err(|error| format!("vkBindImageMemory failed with {error:?}"))?;
+                    (Some(memory.take()), None, None)
+                }
+            },
             Some((placement, offset)) => {
                 placement.admits(&requirements, offset)?;
                 // SAFETY: a fresh, unbound image, and a range of the heap's
@@ -430,7 +483,7 @@ impl Gpu {
                         .bind_image_memory(*image, placement.memory, offset)
                 }
                 .map_err(|error| format!("vkBindImageMemory failed with {error:?}"))?;
-                (None, Some(placement))
+                (None, None, Some(placement))
             }
         };
         let aspect = aspect_of(description.format);
@@ -478,7 +531,8 @@ impl Gpu {
         let view = view.take();
         Ok(GpuImage {
             image: image.take(),
-            memory: memory.map(Guard::take),
+            memory,
+            heap: heap_allocation,
             placement,
             view,
             format: description.format,
@@ -561,6 +615,7 @@ impl Gpu {
         Ok(GpuImage {
             image: source.image,
             memory: None,
+            heap: None,
             placement: None,
             view,
             format,
@@ -640,6 +695,13 @@ impl Gpu {
             }
         }
         // Only now that the image is gone may its heap's memory go.
+        if let Some(allocation) = image.heap {
+            // The field is populated only by `create_image_in`'s heap path,
+            // which first had to get this same heap out of `private_images`.
+            if let Some(heap) = self.private_images.get().and_then(Option::as_ref) {
+                heap.free(&self.device, allocation);
+            }
+        }
         drop(image.placement);
     }
 
