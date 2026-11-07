@@ -749,6 +749,31 @@ pub fn allocate_pair(
     Some(class)
 }
 
+/// Reparent `class`, and its metaclass with it, returning the old superclass.
+///
+/// Apple's has been deprecated since the runtime it shipped in. Swift still
+/// calls it, to slot its own `NSArray`-shaped bases under Foundation's once
+/// Foundation is loaded.
+pub fn set_superclass(
+    class: &'static Class,
+    superclass: Option<&'static Class>,
+) -> Option<&'static Class> {
+    let _guard = ALLOCATION.lock().unwrap_or_else(|e| e.into_inner());
+    let previous = class.superclass();
+    // As at allocation: a root's metaclass inherits from the root itself.
+    let meta_super = superclass.map_or(ptr(class), |s| ptr(s.metaclass()));
+    class.superclass.store(
+        superclass.map_or(std::ptr::null_mut(), ptr),
+        Ordering::Release,
+    );
+    class
+        .metaclass()
+        .superclass
+        .store(meta_super, Ordering::Release);
+    bump_generation();
+    previous
+}
+
 /// The metaclass at the top of `class`'s chain.
 fn root_metaclass(class: &'static Class) -> &'static Class {
     let mut root = class;

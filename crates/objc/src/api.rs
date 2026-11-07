@@ -473,6 +473,19 @@ pub unsafe extern "C" fn class_getImageName(_cls: *const c_void) -> *const c_cha
     std::ptr::null()
 }
 
+/// `Class class_setSuperclass(Class cls, Class newSuper)`
+pub unsafe extern "C" fn class_setSuperclass(
+    cls: *const c_void,
+    new_superclass: *const c_void,
+) -> *mut c_void {
+    let Some(cls) = (unsafe { class(cls) }) else {
+        return std::ptr::null_mut();
+    };
+    // SAFETY: as above. Null makes the class a root.
+    let superclass = unsafe { class(new_superclass) };
+    as_ptr(crate::class::set_superclass(cls, superclass))
+}
+
 /// FIXME (ACCURACY): no image is listed, for the reason
 /// [`class_getImageName`] gives.
 pub unsafe extern "C" fn objc_copyImageNames(out_count: *mut u32) -> *mut *const c_char {

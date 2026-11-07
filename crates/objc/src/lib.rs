@@ -55,6 +55,7 @@ exports::exports! {
         "objc_disposeClassPair" => api::objc_disposeClassPair,
         "class_getName" => api::class_getName,
         "class_getSuperclass" => api::class_getSuperclass,
+        "class_setSuperclass" => api::class_setSuperclass,
         "class_isMetaClass" => api::class_isMetaClass,
         "class_getInstanceSize" => api::class_getInstanceSize,
         "class_addMethod" => api::class_addMethod,

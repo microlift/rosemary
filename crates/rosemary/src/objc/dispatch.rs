@@ -161,6 +161,7 @@ pub(super) static RUNTIME: &[Runtime] = &[
     rtcb!([0], [2], "class_replaceMethod", P, P, P, P, P),
     rtc!([0], "class_replaceProperty", V, P, P, P, I32),
     rtc!([0], "class_respondsToSelector", U8, P, P),
+    rtc!([0, 1] -> true, "class_setSuperclass", P, P, P),
     //
     // A guest that reads an ivar through `object_getIvar` rather than through a
     // compiled displacement is asking the *host* runtime where the ivar is, and
