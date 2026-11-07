@@ -102,6 +102,15 @@ pub fn default_hooks() -> Vec<(&'static str, u64)> {
     }
 }
 
+/// Have the builtin runtime's `objc_readClassPair` and
+/// `_objc_realizeClassFromSwift` call `realize`. Nothing under `native`, whose
+/// libobjc realizes such classes itself.
+pub fn set_compiled_class_realizer(realize: builtin::api::CompiledClassRealizer) {
+    if backend() == Backend::Builtin {
+        builtin::api::set_compiled_class_realizer(realize);
+    }
+}
+
 /// The `_NSConcrete*Block` values, which are data and which a block literal in
 /// the guest's image names directly.
 ///
@@ -228,13 +237,30 @@ pub unsafe fn place_guest_ivars<'a>(
     Ok(())
 }
 
-/// Whether the guest-memory address `va` is a class the selected runtime
-/// realized: one [`allocate_guest_class_pair`] adopted. Never under `native`,
-/// which adopts nothing.
-pub fn is_adopted_class(va: u64) -> bool {
+/// Whether `va` is a class the selected runtime has, or `None` where it cannot
+/// say: Apple's runtime offers no check that is safe on an arbitrary pointer.
+pub fn knows_class(va: u64) -> Option<bool> {
+    match backend() {
+        Backend::Native => None,
+        Backend::Builtin => Some(builtin::class::is_known(
+            va as usize as *const builtin::class::Class,
+        )),
+    }
+}
+
+/// Whether the guest-memory address `va`, the `isa` of `object`, is a class
+/// the selected runtime has adopted - realizing it now if it is a compiled
+/// class Swift has not finished, as a message to it would. Never under
+/// `native`, which adopts nothing.
+pub fn is_adopted_class(va: u64, object: u64) -> bool {
     match backend() {
         Backend::Native => false,
-        Backend::Builtin => builtin::class::is_known(va as usize as *const builtin::class::Class),
+        Backend::Builtin => {
+            let class = va as usize as *const builtin::class::Class;
+            builtin::class::is_known(class)
+                || builtin::class::realize(class, object as usize as *const std::ffi::c_void)
+                    .is_some()
+        }
     }
 }
 

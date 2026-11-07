@@ -126,6 +126,9 @@ struct ClassData {
     contents: RwLock<Contents>,
     /// For an adopted class, the header the compiler emitted.
     compiled: Option<Compiled>,
+    /// For a class whose `class_ro_t` names none, what the lazy class namer
+    /// answered when first asked.
+    lazy_name: OnceLock<CString>,
 }
 
 /// The header words of a compiled `objc_class` before [`adopt_pair`] took
@@ -316,6 +319,7 @@ impl Class {
             version: AtomicI32::new(if is_meta { 7 } else { 0 }),
             contents: RwLock::new(Contents::default()),
             compiled: None,
+            lazy_name: OnceLock::new(),
         };
         match at {
             // SAFETY: the caller's obligation.
@@ -408,11 +412,28 @@ impl Class {
     }
 
     pub fn name(&self) -> *const c_char {
-        self.data().name.as_ptr()
+        self.name_c().as_ptr()
     }
 
     pub fn name_str(&self) -> &str {
-        self.data().name.to_str().unwrap_or("<non-utf8 class name>")
+        self.name_c().to_str().unwrap_or("<non-utf8 class name>")
+    }
+
+    /// The name, which a class Swift built at run time - a generic class -
+    /// gets from the lazy class namer on first ask, as Apple's `mangledName`
+    /// does. A metaclass is named as its class.
+    fn name_c(&self) -> &CStr {
+        let data = self.data();
+        if !data.name.is_empty() {
+            return &data.name;
+        }
+        let instances = data.instances.load(Ordering::Acquire);
+        if data.is_meta && !instances.is_null() {
+            // SAFETY: a leaked or adopted class, set when the pair was made.
+            return unsafe { &*instances }.name_c();
+        }
+        data.lazy_name
+            .get_or_init(|| crate::api::lazy_class_name(self))
     }
 
     pub fn is_meta(&self) -> bool {
@@ -963,7 +984,8 @@ unsafe fn pair(
     at: Option<(*mut Class, Option<*mut Class>)>,
 ) -> Option<&'static Class> {
     let _guard = ALLOCATION.lock().unwrap_or_else(|e| e.into_inner());
-    if lookup(name).is_some() {
+    // A class with no name yet takes none from another.
+    if !name.is_empty() && lookup(name).is_some() {
         return None;
     }
     let name = CString::from(name);
@@ -1072,9 +1094,13 @@ pub fn register_pair(class: &'static Class) {
         .data()
         .registered
         .store(1, Ordering::Release);
-    with_classes(|classes| {
-        classes.insert(class.name_str().to_string(), class);
-    });
+    // A class named only lazily is found by its address, as Apple's is.
+    let name = &class.data().name;
+    if !name.is_empty() {
+        with_classes(|classes| {
+            classes.insert(name.to_string_lossy().into_owned(), class);
+        });
+    }
 }
 
 /// Forget a class pair that was allocated and never registered.
@@ -1085,7 +1111,7 @@ pub fn dispose_pair(class: &'static Class) {
             class.name_str()
         );
     }
-    if class.is_registered() {
+    if class.is_registered() && !class.data().name.is_empty() {
         with_classes(|classes| {
             classes.remove(class.name_str());
         });
@@ -1116,18 +1142,44 @@ pub fn ptr(class: &'static Class) -> *mut Class {
 
 /// The class a raw pointer names.
 ///
+/// A compiled class nothing has realized yet, such as one Swift finishes on
+/// first use, is realized now, as libobjc does on a class's first message;
+/// anything else this runtime does not have is no class.
+///
 /// # Safety
 ///
-/// `p` must be null or a pointer this crate produced.
+/// `p` must be null or a class pointer.
 pub unsafe fn from_ptr(p: *const Class) -> Option<&'static Class> {
     if p.is_null() {
         return None;
     }
-    if crate::debug::enabled() && !is_known(p) {
-        crate::fail!("objc debug: invalid class handle {p:p}");
+    if is_known(p) {
+        // SAFETY: a class this runtime built or adopted.
+        return Some(unsafe { &*p });
     }
-    // SAFETY: the caller's obligation, strengthened by the debug registry.
-    Some(unsafe { &*p })
+    match realize(p, std::ptr::null()) {
+        Some(class) => Some(class),
+        None if crate::debug::enabled() => crate::fail!("objc debug: invalid class handle {p:p}"),
+        None => None,
+    }
+}
+
+/// Realize the class at `class`, first touched as the `isa` of `object`, if
+/// there is one: a compiled metaclass is realized with its class, which only
+/// such an object can name. `None` for anything that is not a compiled class
+/// waiting.
+pub fn realize(class: *const Class, object: *const c_void) -> Option<&'static Class> {
+    if class.is_null() {
+        return None;
+    }
+    let realized = crate::api::realize_compiled_class(
+        class as *mut c_void,
+        crate::api::Realize::FirstTouch {
+            object: object as *mut c_void,
+        },
+    );
+    // SAFETY: a class this runtime adopted or built.
+    is_known(realized as *const Class).then(|| unsafe { &*(realized as *const Class) })
 }
 
 /// The `IMP` `sel` resolves to on `class`, or null.
@@ -1270,6 +1322,95 @@ mod tests {
         assert_eq!(root.ivar(c"isa").unwrap().offset(), 0);
         assert_eq!(root.ivar(c"refCounts").unwrap().offset(), WORD as isize);
         assert_eq!(root.instance_size(), 2 * WORD);
+    }
+
+    /// A compiled class's `class_ro_t`, as far as realization reads one: its
+    /// flags word.
+    fn compiled_ro(flags: u32) -> usize {
+        Box::into_raw(Box::new(flags)) as usize
+    }
+
+    /// Names for the classes [`adopt_compiled`] is handed, by header.
+    static COMPILED_NAMES: Mutex<Vec<(usize, &'static CStr)>> = Mutex::new(Vec::new());
+    /// The compiled metaclasses the tests made.
+    static COMPILED_METAS: Mutex<Vec<usize>> = Mutex::new(Vec::new());
+
+    /// `class_ro_t::flags` bit marking a metaclass.
+    const RO_META: u32 = 1 << 0;
+
+    /// The embedder's realizer, for the tests: adopt any compiled class the
+    /// tests named under `NSObject`, and realize a metaclass as the object it
+    /// was met through.
+    fn adopt_compiled(cls: *mut c_void, how: crate::api::Realize) -> *mut c_void {
+        let header = cls as *mut Class;
+        let named = |p: *mut c_void| {
+            COMPILED_NAMES
+                .lock()
+                .unwrap()
+                .iter()
+                .find_map(|&(h, name)| (h == p as usize).then_some(name))
+        };
+        if COMPILED_METAS.lock().unwrap().contains(&(cls as usize)) {
+            let crate::api::Realize::FirstTouch { object } = how else {
+                return std::ptr::null_mut();
+            };
+            if named(object).is_none() {
+                return std::ptr::null_mut();
+            }
+            let first_touch = crate::api::Realize::FirstTouch {
+                object: std::ptr::null_mut(),
+            };
+            adopt_compiled(object, first_touch);
+            return match is_known(header) {
+                true => cls,
+                false => std::ptr::null_mut(),
+            };
+        }
+        let Some(name) = named(cls) else {
+            return std::ptr::null_mut();
+        };
+        let nsobject = lookup(c"NSObject");
+        // SAFETY: as above; nothing else writes the header.
+        let meta = unsafe { (*header).isa.load(Ordering::Acquire) };
+        let Some(class) = (unsafe { adopt_pair(header, Some(meta), nsobject, name) }) else {
+            return std::ptr::null_mut();
+        };
+        register_pair(class);
+        ptr(class).cast()
+    }
+
+    /// A compiled class pair nothing has realized, named `name`.
+    fn waiting_pair(name: &'static CStr) -> (*mut Class, *mut Class) {
+        crate::bootstrap();
+        crate::api::set_compiled_class_realizer(adopt_compiled);
+        let meta = compiled_header(compiled_ro(RO_META));
+        let class = compiled_header(compiled_ro(0));
+        // SAFETY: a leaked header nothing else holds.
+        unsafe { (*class).isa.store(meta, Ordering::Release) };
+        COMPILED_NAMES.lock().unwrap().push((class as usize, name));
+        COMPILED_METAS.lock().unwrap().push(meta as usize);
+        (class, meta)
+    }
+
+    #[test]
+    fn a_compiled_class_is_realized_on_first_touch() {
+        let (class, meta) = waiting_pair(c"RosemaryRealizedOnTouch");
+        assert!(!is_known(class));
+        // SAFETY: a compiled header.
+        let realized = unsafe { from_ptr(class) }.expect("realized");
+        assert!(std::ptr::eq(realized, class));
+        assert!(std::ptr::eq(realized.metaclass(), meta));
+        assert!(lookup(c"RosemaryRealizedOnTouch").is_some());
+    }
+
+    #[test]
+    fn an_object_whose_isa_is_a_waiting_metaclass_realizes_as_its_class() {
+        let (class, meta) = waiting_pair(c"RosemaryRealizedThroughMeta");
+        // A class is an object whose `isa` is its metaclass.
+        // SAFETY: a compiled header, readable as an object.
+        let found = unsafe { crate::object::class_of(class.cast()) }.expect("realized");
+        assert!(std::ptr::eq(found, meta));
+        assert!(is_known(class));
     }
 
     #[test]

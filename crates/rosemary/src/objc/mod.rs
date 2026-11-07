@@ -89,9 +89,6 @@ pub enum Refusal {
     /// runtime that copies classes: Swift dispatches through the class itself,
     /// so a copy is not the class.
     SwiftClass { name: String },
-    /// A Swift class whose metadata Swift finishes at run time, which
-    /// realizing it from the image alone would skip.
-    SwiftClassNeedsInitializer { name: String },
     /// A category on a class that is neither the host's nor one registered
     /// here.
     CategoryTargetMissing { name: String, class: u64 },
@@ -300,7 +297,7 @@ fn register_images(
     for image in images {
         for c in &image.classes {
             let mut chain = HashSet::new();
-            register_class(r, rt, &by_va, c, &mut chain);
+            register_class(r, rt, &by_va, c, &mut chain, Origin::Image);
         }
     }
 
@@ -425,6 +422,14 @@ fn memory_error(addr: u64) -> VmError {
     })
 }
 
+/// Who is asking for a class: the loader, for one an image declares, or the
+/// guest at run time, for one Swift has built or finished.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Origin {
+    Image,
+    Runtime,
+}
+
 /// Create one class, registering its superclass first if that is also a guest's.
 fn register_class(
     r: &dyn Realizer,
@@ -432,6 +437,7 @@ fn register_class(
     by_va: &HashMap<u64, &ObjcClass>,
     class: &ObjcClass,
     chain: &mut HashSet<u64>,
+    origin: Origin,
 ) -> Option<u64> {
     if let Some(&already) = rt.to_host.get(&class.va) {
         return Some(already);
@@ -451,8 +457,10 @@ fn register_class(
         rt.refusals.push(Refusal::SwiftClass { name });
         return None;
     }
-    if class.ro.has_swift_initializer() {
-        rt.refusals.push(Refusal::SwiftClassNeedsInitializer { name });
+    // Incomplete until Swift's initializer has run: realized when Swift hands
+    // it over, or on its first message, as libobjc does.
+    if class.ro.has_swift_initializer() && origin == Origin::Image {
+        chain.remove(&class.va);
         return None;
     }
 
@@ -468,7 +476,7 @@ fn register_class(
     } else if let Some(&host_super) = rt.to_host.get(&class.superclass) {
         host_super as host::Class
     } else if let Some(guest_super) = by_va.get(&class.superclass).copied() {
-        match register_class(r, rt, by_va, guest_super, chain) {
+        match register_class(r, rt, by_va, guest_super, chain, origin) {
             Some(c) => c as host::Class,
             None => {
                 rt.refusals.push(Refusal::SuperclassMissing {
@@ -478,7 +486,7 @@ fn register_class(
                 return None;
             }
         }
-    } else if class.superclass != 0 && !r.is_guest_address(class.superclass) {
+    } else if class.superclass != 0 && runtime_has_class(r, class.superclass) {
         // A host class, resolved by the ordinary native passthrough. This is
         // the common case: `Greeter : NSObject` binds `_OBJC_CLASS_$_NSObject`
         // to the host's own, which is exactly the class we want to derive from.
@@ -697,6 +705,143 @@ fn ivar_alignment_log2(raw: u32) -> u8 {
     }
 }
 
+/// Whether `va` is a class the runtime already has, though this pass did not
+/// register it: the host's own, or one adopted earlier. A runtime that cannot
+/// say is trusted for anything outside the guest's images.
+fn runtime_has_class(r: &dyn Realizer, va: u64) -> bool {
+    host::knows_class(va).unwrap_or_else(|| !r.is_guest_address(va))
+}
+
+/// Adopt the compiled class pair `class` that is handed over at run time -
+/// one Swift built, as a generic class, or has just finished - as the loader
+/// adopts one an image declares. Its refusals land in `rt`.
+fn realize_runtime_class(
+    r: &dyn Realizer,
+    rt: &mut ObjcRuntime,
+    class: &ObjcClass,
+) -> Result<Option<u64>, VmError> {
+    let realized = register_class(
+        r,
+        rt,
+        &HashMap::new(),
+        class,
+        &mut HashSet::new(),
+        Origin::Runtime,
+    );
+    if realized.is_some() {
+        patch_ivar_offsets(r, rt, class)?;
+    }
+    Ok(realized)
+}
+
+/// What the builtin runtime calls to realize a compiled class it does not
+/// have - handed over by `objc_readClassPair` or `_objc_realizeClassFromSwift`,
+/// or met on first touch - against the running backend. Null for a class that
+/// could not be adopted, with the reason on stderr once per class.
+pub(crate) fn realize_compiled_class(
+    cls: *mut std::ffi::c_void,
+    how: ::objc::api::Realize,
+) -> *mut std::ffi::c_void {
+    use ::objc::api::Realize;
+    thread_local! {
+        /// Classes whose Swift initializer this thread is running, which
+        /// hands each back to be adopted rather than initialized again.
+        static INITIALIZING: std::cell::RefCell<Vec<u64>> = const { std::cell::RefCell::new(Vec::new()) };
+    }
+    let va = cls as u64;
+    let none = std::ptr::null_mut();
+    if host::knows_class(va) == Some(true) {
+        return cls;
+    }
+    let Some(exec) = crate::exec::active() else {
+        return none;
+    };
+    let r = exec.objc_realizer();
+    // First touch is asked of whatever an object's first word holds. libobjc
+    // realizes then only a class in a loaded image's data, and the only ones
+    // there the loader did not already offer are Swift's.
+    let first_touch = matches!(how, Realize::FirstTouch { .. });
+    if first_touch && !r.is_guest_address(va) {
+        return none;
+    }
+    let decoded = {
+        let memory = r.memory();
+        machish::extensions::objc::decode_class(&*memory, va)
+    };
+    let class = match decoded {
+        Ok(Some(class)) => class,
+        _ if first_touch => return none,
+        Ok(None) => return report_unrealized(va, &"its `bits` address no `class_ro_t`"),
+        Err(e) => return report_unrealized(va, &e),
+    };
+    if class.ro.is_meta() {
+        // Realized with its class, which only an object met through it names.
+        let Realize::FirstTouch { object } = how else {
+            return none;
+        };
+        if object.is_null() || !r.is_guest_address(object as u64) {
+            return none;
+        }
+        realize_compiled_class(object, Realize::FirstTouch { object: none });
+        return match host::knows_class(va) {
+            Some(true) => cls,
+            _ => none,
+        };
+    }
+    if first_touch && !class.is_swift() {
+        return none;
+    }
+
+    // libobjc's `realizeClassMaybeSwift`: Swift's initializer finishes the
+    // metadata and hands the class back through `_objc_realizeClassFromSwift`.
+    let initializer = class.ro.swift_initializer;
+    if initializer != 0 && !INITIALIZING.with(|i| i.borrow().contains(&va)) {
+        INITIALIZING.with(|i| i.borrow_mut().push(va));
+        // `Class (*)(Class cls, void *arg)`.
+        let finished = r.call(initializer, &[va, 0]);
+        INITIALIZING.with(|i| i.borrow_mut().retain(|&c| c != va));
+        return match finished {
+            Ok(class) => class as *mut std::ffi::c_void,
+            Err(e) => report_unrealized(va, &e),
+        };
+    }
+
+    // One at a time: two threads realizing one class would adopt it twice.
+    static REALIZING: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _guard = REALIZING.lock().unwrap_or_else(|e| e.into_inner());
+    if host::knows_class(va) == Some(true) {
+        return cls;
+    }
+    // FIXME (ACCURACY): libobjc remaps references to `previously`, the address
+    // Swift moved the class from, onto `cls`; here they keep the old address.
+    let mut rt = ObjcRuntime::default();
+    match realize_runtime_class(r, &mut rt, &class) {
+        Ok(Some(class)) => class as *mut std::ffi::c_void,
+        Ok(None) => {
+            let reasons: Vec<String> = rt.refusals().iter().map(|r| format!("{r:?}")).collect();
+            report_unrealized(va, &reasons.join("; "))
+        }
+        Err(e) => report_unrealized(va, &e),
+    }
+}
+
+/// Say once why the class at `va` could not be realized, and answer null.
+fn report_unrealized(va: u64, why: &dyn std::fmt::Display) -> *mut std::ffi::c_void {
+    static REPORTED: std::sync::Mutex<Vec<u64>> = std::sync::Mutex::new(Vec::new());
+    let mut reported = REPORTED.lock().unwrap_or_else(|e| e.into_inner());
+    if !reported.contains(&va) {
+        reported.push(va);
+        eprintln!("rosemary: objc: realizing the class at {va:#x}: {why}");
+    }
+    std::ptr::null_mut()
+}
+
+impl machish::extensions::objc::ObjcMemory for dyn GuestMemory + '_ {
+    fn read(&self, addr: u64, out: &mut [u8]) -> machish::Result<()> {
+        GuestMemory::read(self, addr, out)
+    }
+}
+
 /// Install one guest method on `target`.
 fn add_method(
     r: &dyn Realizer,
@@ -803,7 +948,7 @@ fn register_protocol(rt: &mut ObjcRuntime, p: &ObjcProtocol) {
 fn register_category(r: &dyn Realizer, rt: &mut ObjcRuntime, cat: &ObjcCategory) {
     let target = if let Some(&registered) = rt.to_host.get(&cat.class) {
         registered as host::Class
-    } else if cat.class != 0 && !r.is_guest_address(cat.class) {
+    } else if cat.class != 0 && runtime_has_class(r, cat.class) {
         cat.class as host::Class
     } else {
         rt.refusals.push(Refusal::CategoryTargetMissing {

@@ -144,6 +144,7 @@ exports::exports! {
         "objc_setHook_getImageName" => api::objc_setHook_getImageName,
         "objc_setHook_lazyClassNamer" => api::objc_setHook_lazyClassNamer,
         "_objc_realizeClassFromSwift" => api::_objc_realizeClassFromSwift,
+        "objc_readClassPair" => api::objc_readClassPair,
         "objc_autoreleasePoolPush" => api::objc_autoreleasePoolPush,
         "objc_autoreleasePoolPop" => api::objc_autoreleasePoolPop,
         "objc_autoreleaseReturnValue" => api::objc_autoreleaseReturnValue,

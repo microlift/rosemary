@@ -545,9 +545,8 @@ pub(crate) fn class_from_hook(name: &CStr) -> Option<&'static Class> {
     // `Class`, as its type says.
     let answered = unsafe { hook(name.as_ptr(), &mut found) };
     ASKING.with(|asking| asking.borrow_mut().pop());
-    // FIXME (ACCURACY): Swift realizes a class it instantiates at run time
-    // through `_objc_realizeClassFromSwift`, which does not adopt it yet, so
-    // such a class is not answered.
+    // Swift realizes what it answers before answering, so anything else is
+    // not a class.
     (answered && crate::class::is_known(found as *const Class))
         // SAFETY: a class this runtime adopted or built.
         .then(|| unsafe { &*(found as *const Class) })
@@ -572,6 +571,20 @@ unsafe extern "C" fn default_get_image_name(_cls: *const c_void, out: *mut *cons
         unsafe { *out = std::ptr::null() };
     }
     false
+}
+
+/// The name the lazy class namer chain gives `class`, empty if none does.
+pub(crate) fn lazy_class_name(class: &Class) -> CString {
+    let hook = *LAZY_CLASS_NAMER_HOOK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    // SAFETY: an installed hook, given a class.
+    let name = unsafe { hook(std::ptr::from_ref(class).cast()) };
+    match name.is_null() {
+        true => CString::default(),
+        // SAFETY: a namer answers a NUL-terminated name it keeps.
+        false => unsafe { CStr::from_ptr(name) }.into(),
+    }
 }
 
 /// The first hook in the chain: no class here has a lazy name.
@@ -617,18 +630,65 @@ pub unsafe extern "C" fn objc_setHook_lazyClassNamer(
     unsafe { set_hook(&LAZY_CLASS_NAMER_HOOK, new, out_old) }
 }
 
+/// How a compiled class reaches [`CompiledClassRealizer`].
+#[derive(Clone, Copy, Debug)]
+pub enum Realize {
+    /// Handed over by `objc_readClassPair` or `_objc_realizeClassFromSwift`,
+    /// whose `previously` this is.
+    HandedOver { previously: *mut c_void },
+    /// Met as the `isa` of `object` (null when not met through an object) and
+    /// not a class this runtime has. Asked of anything an object's first word
+    /// holds, so a realizer declines quietly what is not a compiled class
+    /// waiting; a metaclass is realized as `object`, its class.
+    FirstTouch { object: *mut c_void },
+}
+
+/// Adopts a compiled class pair this runtime does not have yet - one Swift
+/// built or finished - and answers the class, or null if it could not be. See
+/// [`set_compiled_class_realizer`].
+pub type CompiledClassRealizer = fn(cls: *mut c_void, how: Realize) -> *mut c_void;
+
+static COMPILED_CLASS_REALIZER: std::sync::OnceLock<CompiledClassRealizer> =
+    std::sync::OnceLock::new();
+
+/// Install what [`objc_readClassPair`] and [`_objc_realizeClassFromSwift`]
+/// call. The embedder's: it is the one that can read the class's methods out
+/// of the image that defines them and make them callable. Only the first
+/// install takes.
+pub fn set_compiled_class_realizer(realizer: CompiledClassRealizer) {
+    COMPILED_CLASS_REALIZER.get_or_init(|| realizer);
+}
+
+pub(crate) fn realize_compiled_class(cls: *mut c_void, how: Realize) -> *mut c_void {
+    if cls.is_null() || crate::class::is_known(cls as *const Class) {
+        return cls;
+    }
+    match COMPILED_CLASS_REALIZER.get() {
+        Some(realize) => realize(cls, how),
+        None => std::ptr::null_mut(),
+    }
+}
+
 /// `Class _objc_realizeClassFromSwift(Class cls, void *previously)`: Swift
-/// asks the runtime to adopt a class whose metadata it built at run time.
-///
-/// FIXME (ACCURACY): the class is left as Swift metadata only, as the classes
-/// a Swift image declares are. Swift code that never treats it as an
-/// Objective-C class is unaffected; a message sent to one of its instances
-/// is not.
+/// asks the runtime to adopt a class it has just finished, or one it built and
+/// moved from `previously`. A class already adopted is answered as it is.
 pub unsafe extern "C" fn _objc_realizeClassFromSwift(
     cls: *mut c_void,
-    _previously: *mut c_void,
+    previously: *mut c_void,
 ) -> *mut c_void {
-    cls
+    realize_compiled_class(cls, Realize::HandedOver { previously })
+}
+
+/// `Class objc_readClassPair(Class cls, const struct objc_image_info *info)`:
+/// adopt a class pair laid out as a compiler would, which is how Swift hands
+/// over a generic class it has instantiated.
+pub unsafe extern "C" fn objc_readClassPair(cls: *mut c_void, _info: *const c_void) -> *mut c_void {
+    realize_compiled_class(
+        cls,
+        Realize::HandedOver {
+            previously: std::ptr::null_mut(),
+        },
+    )
 }
 
 /// FIXME (ACCURACY): no image is listed, for the reason
@@ -1834,6 +1894,35 @@ mod swift_hooks {
         // SAFETY: a NUL-terminated literal.
         assert!(unsafe { objc_getClass(c"RosemaryHook.Recursive".as_ptr()) }.is_null());
         assert_eq!(RECURSIVE_ASKS.load(Ordering::Acquire), 1);
+    }
+
+    static LAZILY_NAMED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    static PREVIOUS_NAMER: OnceLock<LazyClassNamerHook> = OnceLock::new();
+
+    unsafe extern "C" fn namer(cls: *const c_void) -> *const c_char {
+        if cls as usize == LAZILY_NAMED.load(Ordering::Acquire) {
+            return c"RosemaryLazilyNamed".as_ptr();
+        }
+        unsafe { PREVIOUS_NAMER.get().unwrap()(cls) }
+    }
+
+    #[test]
+    fn a_class_without_a_name_is_named_by_the_lazy_namer() {
+        install();
+        let nsobject = crate::class::lookup(c"NSObject");
+        let class = crate::class::allocate_pair(nsobject, c"", 0).expect("a nameless pair");
+        crate::class::register_pair(class);
+        LAZILY_NAMED.store(crate::class::ptr(class) as usize, Ordering::Release);
+        unsafe {
+            let mut old: LazyClassNamerHook = default_lazy_class_namer;
+            objc_setHook_lazyClassNamer(namer, &mut old);
+            PREVIOUS_NAMER.set(old).ok();
+        }
+        // SAFETY: a registered class.
+        let name = unsafe { CStr::from_ptr(class_getName(crate::class::ptr(class).cast())) };
+        assert_eq!(name, c"RosemaryLazilyNamed");
+        // Found by its address only, as Apple's is.
+        assert!(crate::class::lookup(c"RosemaryLazilyNamed").is_none());
     }
 
     #[test]

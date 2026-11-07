@@ -263,10 +263,8 @@ pub(super) static RUNTIME: &[Runtime] = &[
     rtc!([0], "objc_opt_new", P, P),
     rtc!([0], "objc_opt_respondsToSelector", U8, P, P),
     rtc!([0], "objc_opt_self", P, P),
-    // `Class objc_readClassPair(Class, const struct objc_image_info *)` and
-    // `const char **objc_copyClassNamesForImage(const char *, unsigned *)` are
-    // both about *images*, which this runtime's classes do not belong to. See
-    // `BUILTIN_GAPS`.
+    // `Class objc_readClassPair(Class, const struct objc_image_info *)`: how
+    // Swift hands over a generic class it has instantiated.
     rtc!([0] -> true, "objc_readClassPair", P, P, P),
     rtc!([0], "objc_registerClassPair", V, P),
     rtc!([0], "objc_release", V, P),
@@ -652,6 +650,7 @@ pub fn provider() -> SyntheticDylib {
     for (name, addr) in super::host::default_hooks() {
         crate::dyld::describe_host_function(addr, name);
     }
+    super::host::set_compiled_class_realizer(super::realize_compiled_class);
     // Null on purpose under either runtime: Apple's libobjc exports these as
     // absolute zeros too.
     for name in ::objc::null_data() {
@@ -1074,7 +1073,9 @@ fn send(
     // A receiver in guest memory is not automatically broken.
     if vm.program.is_guest_address(host_receiver) {
         let isa = vm.objc_host_class((mem as &dyn GuestMemory).read_u64(host_receiver, symbol)?);
-        if isa == 0 || (vm.program.is_guest_address(isa) && !host::is_adopted_class(isa)) {
+        if isa == 0
+            || (vm.program.is_guest_address(isa) && !host::is_adopted_class(isa, host_receiver))
+        {
             return Err(AbiError::Refused {
                 symbol: symbol.to_string(),
                 reason: "the receiver is a guest address whose class the runtime never realized",
@@ -1807,13 +1808,7 @@ mod tests {
     /// A named list rather than a silence: each of these is a guest that stops
     /// with "unsatisfied import" under `ROSEMARY_OBJC=builtin`, and the name is
     /// the whole of the work queue.
-    const BUILTIN_GAPS: &[&str] = &[
-        // A class here belongs to the runtime rather than to the file it was
-        // declared in, so there is nothing to read a compiler-laid-out
-        // `objc_class` out of - that pass is `crate::objc::register`, and it runs
-        // at load time from the link transcript rather than on a guest's say-so.
-        "objc_readClassPair",
-    ];
+    const BUILTIN_GAPS: &[&str] = &[];
 
     #[test]
     fn the_selected_runtime_really_exports_what_this_module_forwards_to() {

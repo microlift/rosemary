@@ -334,6 +334,10 @@ impl Execution for Native {
         self.realize_loaded(report)
     }
 
+    fn objc_realizer(&self) -> &dyn crate::objc::Realizer {
+        self
+    }
+
     fn run_loaded_load_methods(&self, report: &LinkReport) -> Result<usize, VmError> {
         match crate::objc::published() {
             Some(rt) => crate::objc::call_loaded_load_methods(self, rt, report),

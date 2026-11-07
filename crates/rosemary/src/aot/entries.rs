@@ -180,6 +180,7 @@ mod tests {
             ivars: Vec::new(),
             properties: Vec::new(),
             protocols: Vec::new(),
+            swift_initializer: 0,
         }
     }
 

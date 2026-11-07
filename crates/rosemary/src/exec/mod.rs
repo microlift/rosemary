@@ -75,6 +75,10 @@ pub trait Execution: Sync {
     /// guest code: it must run after the registration pass has finished and
     /// outside whatever lock that pass holds.
     fn run_loaded_load_methods(&self, report: &LinkReport) -> Result<usize, VmError>;
+
+    /// What realizes a class against this backend: reads guest memory and
+    /// makes guest methods callable by the runtime.
+    fn objc_realizer(&self) -> &dyn crate::objc::Realizer;
 }
 
 /// Which backend runs a program.
