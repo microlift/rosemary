@@ -1734,6 +1734,38 @@ unsafe extern "C" fn window_number_at_point(
     0
 }
 
+/// The window under a screen point the pointer is at, its events reported
+/// against `reporting`: the frontmost shown window whose frame holds it, or
+/// null.
+///
+/// Wayland's toplevels sit in the virtual desktop `placed_origin` describes,
+/// which says nothing of how they overlap on the real one; there the window
+/// whose surface the pointer is reported in is known to be under it.
+pub(crate) fn window_at_screen_point(reporting: Id, point: NSPoint) -> Id {
+    let sel = objc::sel::get("frame");
+    // SAFETY: `-frame` is this module's own, sent to a window of this crate's.
+    let holds = |window: Id| crate::geometry::contains(unsafe { frame(window, sel) }, point);
+    if sdl3::video::is_wayland() && is_shown(reporting) && holds(reporting) {
+        return reporting;
+    }
+    front_to_back()
+        .into_iter()
+        .find(|window| holds(*window))
+        .unwrap_or(std::ptr::null_mut())
+}
+
+/// A point in a window's base coordinates, in screen coordinates.
+pub(crate) fn to_screen(window: Id, point: NSPoint) -> NSPoint {
+    // SAFETY: a window of this crate's, with the selector the method is for.
+    unsafe { convert_base_to_screen(window, objc::sel::get("frame"), point) }
+}
+
+/// The inverse of [`to_screen`].
+pub(crate) fn from_screen(window: Id, point: NSPoint) -> NSPoint {
+    // SAFETY: as above.
+    unsafe { convert_screen_to_base(window, objc::sel::get("frame"), point) }
+}
+
 /// `-sendEvent:`, the default routing.
 unsafe extern "C" fn send_event(receiver: Id, _sel: Sel, event: Id) {
     crate::event::route(receiver, event);
@@ -2357,6 +2389,7 @@ unsafe extern "C" fn order_out(receiver: Id, _sel: Sel, _sender: Id) {
 /// be keyed by it, and that table is not this crate's to clear.
 pub(crate) unsafe extern "C" fn dealloc(receiver: Id, sel: Sel) {
     crate::event::forget_announced(receiver);
+    crate::dragging::forget(receiver);
     crate::sheet::forget(receiver);
     children()
         .lock()
@@ -3862,10 +3895,6 @@ pub(crate) fn install() {
         "setAnimationBehavior:" => ignored_integer, c"v24@0:8q16";
         "setHasShadow:" => ignored_flag, c"v20@0:8c16";
         "setOneShot:" => ignored_flag, c"v20@0:8c16";
-        // Drag-and-drop from the host is not delivered; accepting the registration
-        // keeps SDL's window setup from failing on it.
-        "registerForDraggedTypes:" => ignored_object, c"v24@0:8@16";
-        "unregisterDraggedTypes" => ignored, c"v16@0:8";
         // The window is always presented in the host's colour space; SDL 1.2 sets sRGB.
         "setColorSpace:" => ignored_object, c"v24@0:8@16";
         // No shadow is drawn, so there is none to recompute.
