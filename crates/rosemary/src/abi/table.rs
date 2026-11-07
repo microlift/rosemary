@@ -1737,6 +1737,7 @@ pub static SIGNATURES: &[FunctionAbi] = &[
     sig!("_NSGetMachExecuteHeader", P),
     sig!("_dyld_get_image_vmaddr_slide", U64, U32),
     sig!("_dyld_image_containing_address", P, P),
+    sig!("dyld_image_path_containing_address", P, P),
     cbsig!([0], "_dyld_register_func_for_add_image", V, P),
     cbsig!([0], "_dyld_register_func_for_remove_image", V, P),
     sig!("_dyld_get_image_name", P, U32),

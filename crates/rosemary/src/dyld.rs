@@ -11,7 +11,7 @@ use machish::image::MachObject;
 use machish::install_name::PathContext;
 use machish::loader::Loader;
 use machish::memory::{MmapSpace, Regions};
-use machish::report::LinkReport;
+use machish::report::{ImageReport, LinkReport};
 use machish::resolve::SyntheticDylib;
 use machish::spec::MachSpec;
 use machish::spec::arch::X86_64;
@@ -94,6 +94,8 @@ static EXECUTABLE: Mutex<Option<(String, u64)>> = Mutex::new(None);
 struct MappedImage {
     /// The install name or path the link knew it by, as [`LinkedImage::name`].
     name: String,
+    /// Where the image was read from, as [`ImageReport::path`].
+    path: String,
     /// The mapped `mach_header`, which is what dyld calls an image's base.
     header: u64,
     slide: u64,
@@ -318,6 +320,7 @@ pub fn register_mapped_images(report: &LinkReport) {
         .iter()
         .map(|i| MappedImage {
             name: i.name.clone(),
+            path: i.path.clone(),
             header: i.base,
             slide: i.slide,
             segments: i
@@ -2242,28 +2245,30 @@ fn unwind_sections_of(addr: u64) -> Option<[u8; 40]> {
 
 /// `(mach_header VA, slide)` for the guest image containing `va`.
 fn guest_image_at(va: u64) -> Option<(u64, u64)> {
-    fn containing(report: &LinkReport, va: u64) -> Option<(u64, u64)> {
-        report
-            .images
-            .iter()
-            .find(|i| {
-                i.segments
-                    .iter()
-                    .any(|s| va >= s.vmaddr && va < s.vmaddr.wrapping_add(s.vmsize))
-            })
-            .map(|i| (i.base, i.slide))
+    with_guest_image_at(va, |header, slide, _| (header, slide))
+}
+
+/// `f(mach_header VA, slide, host path)` for the guest image containing `va`.
+fn with_guest_image_at<R>(va: u64, f: impl FnOnce(u64, u64, &str) -> R) -> Option<R> {
+    fn containing(report: &LinkReport, va: u64) -> Option<&ImageReport> {
+        report.images.iter().find(|i| {
+            i.segments
+                .iter()
+                .any(|s| va >= s.vmaddr && va < s.vmaddr.wrapping_add(s.vmsize))
+        })
     }
     if let Some(found) = find(|i| containing(&i.report, va)) {
-        return Some(found);
+        return Some(f(found.base, found.slide, &found.path));
     }
     if let Some(found) = MAPPED.get().and_then(|images| {
         images
             .iter()
             .find(|i| i.segments.iter().any(|(lo, hi)| va >= *lo && va < *hi))
     }) {
-        return Some((found.header, found.slide));
+        return Some(f(found.header, found.slide, &found.path));
     }
-    containing(&crate::thunk::current()?.program.report, va)
+    let vm = crate::thunk::current()?;
+    containing(&vm.program.report, va).map(|i| f(i.base, i.slide, &i.path))
 }
 
 /// `(unslid addr, size)` of a section in the guest image at `header`.
@@ -2594,6 +2599,11 @@ pub(crate) mod entry {
     /// `const struct mach_header *_dyld_image_containing_address(const void *)`
     pub extern "C" fn dyld_image_containing_address(va: u64) -> u64 {
         super::guest_image_at(va).map_or(0, |(header, _)| header)
+    }
+
+    /// `const char *dyld_image_path_containing_address(const void *)`
+    pub extern "C" fn dyld_image_path_containing_address(va: u64) -> u64 {
+        super::with_guest_image_at(va, |_, _, path| super::path_cstr(path)).unwrap_or(0)
     }
 
     /// `void _dyld_register_func_for_add_image(void (*)(const struct mach_header *,
@@ -3144,7 +3154,7 @@ pub(crate) mod entry {
 }
 
 /// Every name [`provider`] defines, and the function it binds to.
-fn entries() -> [(&'static str, *const ()); 25] {
+fn entries() -> [(&'static str, *const ()); 26] {
     [
         ("_NSAddImage", entry::ns_add_image as *const ()),
         (
@@ -3189,6 +3199,10 @@ fn entries() -> [(&'static str, *const ()); 25] {
         (
             "__dyld_image_containing_address",
             entry::dyld_image_containing_address as *const (),
+        ),
+        (
+            "_dyld_image_path_containing_address",
+            entry::dyld_image_path_containing_address as *const (),
         ),
         (
             "__dyld_register_func_for_add_image",
