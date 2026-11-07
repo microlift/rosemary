@@ -728,9 +728,16 @@ impl Gpu {
         let mut key = bindings.to_vec();
         key.sort_unstable();
         key.dedup();
-        let mut cache = self.layouts.lock().expect("descriptor layout cache");
         let key = (key, stages, push);
-        if let Some(layout) = cache.get(&key) {
+        // Looked up without the lock held across the compile below: a cache
+        // miss on one thread must not block every other thread's cache hit,
+        // the same reasoning as `RenderPipeline::variant`.
+        if let Some(layout) = self
+            .layouts
+            .lock()
+            .expect("descriptor layout cache")
+            .get(&key)
+        {
             return Ok(*layout);
         }
         let entries = key
@@ -752,11 +759,22 @@ impl Gpu {
         let info = vk::DescriptorSetLayoutCreateInfo::default()
             .flags(flags)
             .bindings(&entries);
-        // SAFETY: the bindings live across the call.
-        let layout = unsafe { self.device.create_descriptor_set_layout(&info, None) }
-            .map_err(|error| format!("vkCreateDescriptorSetLayout failed with {error:?}"))?;
-        cache.insert(key, layout);
-        Ok(layout)
+        let layout = crate::stats::timed(crate::stats::Counter::DescriptorLayoutMicros, || {
+            // SAFETY: the bindings live across the call.
+            unsafe { self.device.create_descriptor_set_layout(&info, None) }
+                .map_err(|error| format!("vkCreateDescriptorSetLayout failed with {error:?}"))
+        })?;
+        crate::stats::count(crate::stats::Counter::DescriptorLayoutsCreated);
+        let mut cache = self.layouts.lock().expect("descriptor layout cache");
+        match cache.entry(key) {
+            std::collections::hash_map::Entry::Occupied(made) => {
+                // Another thread made it first; this one was never recorded.
+                // SAFETY: a layout of this device's which nothing refers to.
+                unsafe { self.device.destroy_descriptor_set_layout(layout, None) };
+                Ok(*made.get())
+            }
+            std::collections::hash_map::Entry::Vacant(slot) => Ok(*slot.insert(layout)),
+        }
     }
 
     /// Every attachment is used in `GENERAL` layout.
@@ -773,8 +791,15 @@ impl Gpu {
     /// because each of the twenty-five passes in a frame then decompresses its
     /// attachments on the way out.
     pub fn render_pass(&self, key: &RenderPassKey) -> Result<vk::RenderPass, String> {
-        let mut cache = self.render_passes.lock().expect("render pass cache");
-        if let Some(pass) = cache.get(key) {
+        // Looked up without the lock held across the slow path below: a
+        // cache miss on one thread must not block every other thread's
+        // cache hit, the same reasoning as `RenderPipeline::variant`.
+        if let Some(pass) = self
+            .render_passes
+            .lock()
+            .expect("render pass cache")
+            .get(key)
+        {
             return Ok(*pass);
         }
         let mut attachments = Vec::new();
@@ -869,36 +894,47 @@ impl Gpu {
             );
             (resolve, reference)
         });
-        let pass = match depth_resolve {
-            Some((resolve, reference)) => self.create_depth_resolving_pass(
-                &attachments,
-                &colors,
-                &resolves,
-                depth,
-                resolve,
-                reference,
-            )?,
-            None => {
-                let mut subpass = vk::SubpassDescription::default()
-                    .pipeline_bind_point(vk::PipelineBindPoint::GRAPHICS)
-                    .color_attachments(&colors);
-                if !resolves.is_empty() {
-                    subpass = subpass.resolve_attachments(&resolves);
+        let pass = crate::stats::timed(crate::stats::Counter::RenderPassMicros, || {
+            match depth_resolve {
+                Some((resolve, reference)) => self.create_depth_resolving_pass(
+                    &attachments,
+                    &colors,
+                    &resolves,
+                    depth,
+                    resolve,
+                    reference,
+                ),
+                None => {
+                    let mut subpass = vk::SubpassDescription::default()
+                        .pipeline_bind_point(vk::PipelineBindPoint::GRAPHICS)
+                        .color_attachments(&colors);
+                    if !resolves.is_empty() {
+                        subpass = subpass.resolve_attachments(&resolves);
+                    }
+                    if let Some(depth) = &depth {
+                        subpass = subpass.depth_stencil_attachment(depth);
+                    }
+                    let subpasses = [subpass];
+                    let info = vk::RenderPassCreateInfo::default()
+                        .attachments(&attachments)
+                        .subpasses(&subpasses);
+                    // SAFETY: every borrowed slice lives across the call.
+                    unsafe { self.device.create_render_pass(&info, None) }
+                        .map_err(|error| format!("vkCreateRenderPass failed with {error:?}"))
                 }
-                if let Some(depth) = &depth {
-                    subpass = subpass.depth_stencil_attachment(depth);
-                }
-                let subpasses = [subpass];
-                let info = vk::RenderPassCreateInfo::default()
-                    .attachments(&attachments)
-                    .subpasses(&subpasses);
-                // SAFETY: every borrowed slice lives across the call.
-                unsafe { self.device.create_render_pass(&info, None) }
-                    .map_err(|error| format!("vkCreateRenderPass failed with {error:?}"))?
             }
-        };
-        cache.insert(key.clone(), pass);
-        Ok(pass)
+        })?;
+        crate::stats::count(crate::stats::Counter::RenderPassesCreated);
+        let mut cache = self.render_passes.lock().expect("render pass cache");
+        match cache.entry(key.clone()) {
+            std::collections::hash_map::Entry::Occupied(made) => {
+                // Another thread made it first; this one was never recorded.
+                // SAFETY: a render pass of this device's which nothing refers to.
+                unsafe { self.device.destroy_render_pass(pass, None) };
+                Ok(*made.get())
+            }
+            std::collections::hash_map::Entry::Vacant(slot) => Ok(*slot.insert(pass)),
+        }
     }
 
     /// The same subpass through `vkCreateRenderPass2`, which is the only form
