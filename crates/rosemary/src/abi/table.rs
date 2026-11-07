@@ -3175,6 +3175,7 @@ pub static SIGNATURES: &[FunctionAbi] = &[
     sig!("pthread_join", I32, U64, P),
     // The destructor is guest code, called by libpthread on thread teardown.
     cbsig!([1], "pthread_key_create", I32, P, P),
+    cbsig!([1], "pthread_key_init_np", I32, I32, P),
     sig!("pthread_key_delete", I32, U64),
     // Signals a *host* thread, which is what a guest thread is here, so the
     // disposition it reaches is the one `shims::signal` installed.
