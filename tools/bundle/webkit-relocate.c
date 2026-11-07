@@ -210,6 +210,69 @@ fail:
     return -1;
 }
 
+static int in_etc(const char *path)
+{
+    return strncmp(path, "/etc", 4) == 0 && (path[4] == 0 || path[4] == '/');
+}
+
+/*
+ * Follows `path` one component at a time to the first symlink that leads out
+ * of /etc: `link` gets its target as written (made absolute), `real` what that
+ * resolves to. WebKit binds /etc into the sandbox wholesale, so links inside
+ * it still work there, but one that leaves it can land on something the
+ * sandbox lacks: Steam's FHS runtime links /etc/fonts to /.host-etc/fonts.
+ * Returns 0 if no link leaves /etc.
+ */
+static int leaves_etc(const char *path, char link[PATH_MAX], char real[PATH_MAX])
+{
+    char at[PATH_MAX] = "", rest[PATH_MAX], target[PATH_MAX], next[PATH_MAX];
+    if (strlen(path) >= PATH_MAX)
+        return 0;
+    strcpy(rest, path);
+    for (int hops = 0; hops < 40;) {
+        const char *name = rest + strspn(rest, "/");
+        size_t n = strcspn(name, "/");
+        if (n == 0)
+            return 0;
+        const char *after = name + n;
+        size_t len = strlen(at);
+        if (n == 2 && name[0] == '.' && name[1] == '.') {
+            char *slash = strrchr(at, '/');
+            if (slash)
+                *slash = 0;
+        } else if (!(n == 1 && name[0] == '.')) {
+            if (len + 1 + n >= PATH_MAX)
+                return 0;
+            at[len] = '/';
+            memcpy(at + len + 1, name, n);
+            at[len + 1 + n] = 0;
+            ssize_t t = readlink(at, target, sizeof target - 1);
+            if (t >= 0) {
+                target[t] = 0;
+                hops++;
+                at[len] = 0;
+                /* `at` is now the link's directory; "" is the root. */
+                if (target[0] == '/')
+                    strcpy(next, target);
+                else if (!join(next, at, target))
+                    return 0;
+                if (!in_etc(next)) {
+                    strcpy(link, next);
+                    return realpath(next, real) != NULL;
+                }
+                if (strlen(next) + strlen(after) >= PATH_MAX)
+                    return 0;
+                strcat(next, after);
+                strcpy(rest, next);
+                at[0] = 0;
+                continue;
+            }
+        }
+        memmove(rest, after, strlen(after) + 1);
+    }
+    return 0;
+}
+
 static const char *host_library_path(void)
 {
     return getenv("ROSEMARY_HOST_LD_LIBRARY_PATH");
@@ -266,6 +329,12 @@ static int rewrite_bwrap_args(int fd, int command_from_host)
             goto fail_out;
     }
     if (push(&out, "--ro-bind", 0) || push(&out, self.root, 0) || push(&out, self.root, 0))
+        goto fail_out;
+    /* The launcher points the bundled fontconfig at /etc/fonts; without it
+     * the web process finds no font and aborts. */
+    char fonts_link[PATH_MAX], fonts_real[PATH_MAX];
+    if (leaves_etc("/etc/fonts", fonts_link, fonts_real)
+        && (push(&out, "--ro-bind-try", 0) || push(&out, fonts_real, 0) || push(&out, fonts_link, 0)))
         goto fail_out;
 
     int memfd = memfd_create("bwrap", MFD_CLOEXEC);
