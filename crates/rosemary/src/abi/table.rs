@@ -3066,6 +3066,7 @@ pub static SIGNATURES: &[FunctionAbi] = &[
     sig!("nanosleep", I32, P, P),
     sig!("nearbyintf", F32, F32),
     sig!("newlocale", P, I32, P, P),
+    sig!("uselocale", P, P),
     sig!("nextafter", F64, F64, F64),
     sig!("nl_langinfo", P, I32),
     sig!("nl_langinfo_l", P, I32, P),
