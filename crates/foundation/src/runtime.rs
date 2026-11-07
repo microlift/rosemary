@@ -199,7 +199,7 @@ unsafe extern "C" fn NSClassFromString(name: Id) -> *const std::ffi::c_void {
     let Ok(name) = std::ffi::CString::new(name) else {
         return std::ptr::null();
     };
-    objc::class::lookup(&name)
+    objc::class::look_up(&name)
         .map(|class| class as *const objc::class::Class as *const std::ffi::c_void)
         .unwrap_or(std::ptr::null())
 }

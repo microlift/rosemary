@@ -217,6 +217,7 @@ pub static SIGNATURES: &[FunctionAbi] = &[
     sig!("rosemary_steamclient_dispatch", I32, U32, P),
     sig!("getsegbyname", P, P),
     sig!("getsectbyname", P, P, P),
+    sig!("getsectiondata", P, P, P, P, P),
     sig!("get_etext", U64),
     sig!("get_end", U64),
     // OpenAL 1.1. Its scalar typedefs are fixed-width even on Darwin.
@@ -1714,16 +1715,40 @@ pub static SIGNATURES: &[FunctionAbi] = &[
     // What `@available` / `__builtin_available` compiles to: `bool
     // _availability_version_check(uint32_t count, dyld_build_version_t *)`.
     sig!("_availability_version_check", BOOL, U32, P),
+    // `dyld_build_version_t` is two words, packed into one register.
+    sig!("dyld_program_sdk_at_least", BOOL, U64),
+    // Its compiler-rt wrappers, which newer clangs emit for `@available`.
+    sig!("__isPlatformVersionAtLeast", I32, U32, U32, U32, U32),
+    sig!(
+        "__isPlatformOrVariantPlatformVersionAtLeast",
+        I32,
+        U32,
+        U32,
+        U32,
+        U32,
+        U32,
+        U32,
+        U32,
+        U32
+    ),
     // Served by [`crate::dyld::entry`] under both backends.
     sig!("_dyld_image_count", U32),
     sig!("_dyld_get_image_header", P, U32),
     sig!("_NSGetMachExecuteHeader", P),
     sig!("_dyld_get_image_vmaddr_slide", U64, U32),
     sig!("_dyld_image_containing_address", P, P),
+    sig!("dyld_image_path_containing_address", P, P),
+    sig!("dyld_shared_cache_some_image_overridden", BOOL),
+    sig!("_dyld_get_shared_cache_range", P, P),
+    sig!("_dyld_is_preoptimized_objc_image_loaded", BOOL, U16),
+    sig!("_dyld_get_swift_prespecialized_data", P),
+    sig!("_dyld_find_pointer_hash_table_entry", P, P, P, U64, P),
     cbsig!([0], "_dyld_register_func_for_add_image", V, P),
     cbsig!([0], "_dyld_register_func_for_remove_image", V, P),
     sig!("_dyld_get_image_name", P, U32),
     sig!("_dyld_find_unwind_sections", BOOL, P, P),
+    // libobjc's, but answered from the image list. See [`crate::dyld::entry`].
+    cbsig!([0], "objc_addLoadImageFunc", V, P),
     // Initializers run inside `NSAddImage`, as inside `dlopen`.
     rsig!("NSAddImage", P, P, U32),
     sig!("NSAddressOfSymbol", P, P),
@@ -1744,6 +1769,11 @@ pub static SIGNATURES: &[FunctionAbi] = &[
     // `void *tlv_allocate(tlv_descriptor *)`: the slow path of this runtime's
     // guest-code `tlv_get_addr`. See `crate::tls`.
     sig!("rosemary_tlv_allocate", P, P),
+    // The builtin objc runtime's default `objc_setHook_*` hooks, which a guest
+    // calls as the hook it replaced. See `objc::default_hooks`.
+    sig!("rosemary_objc_default_getClass_hook", U8, P, P),
+    sig!("rosemary_objc_default_getImageName_hook", U8, P, P),
+    sig!("rosemary_objc_default_lazyClassNamer_hook", P, P),
     sig!("abort", V),
     sig!("abs", I32, I32),
     sig!("accept", I32, I32, P, P),
@@ -3036,6 +3066,7 @@ pub static SIGNATURES: &[FunctionAbi] = &[
     sig!("nanosleep", I32, P, P),
     sig!("nearbyintf", F32, F32),
     sig!("newlocale", P, I32, P, P),
+    sig!("uselocale", P, P),
     sig!("nextafter", F64, F64, F64),
     sig!("nl_langinfo", P, I32),
     sig!("nl_langinfo_l", P, I32, P),
@@ -3175,6 +3206,7 @@ pub static SIGNATURES: &[FunctionAbi] = &[
     sig!("pthread_join", I32, U64, P),
     // The destructor is guest code, called by libpthread on thread teardown.
     cbsig!([1], "pthread_key_create", I32, P, P),
+    cbsig!([1], "pthread_key_init_np", I32, I32, P),
     sig!("pthread_key_delete", I32, U64),
     // Signals a *host* thread, which is what a guest thread is here, so the
     // disposition it reaches is the one `shims::signal` installed.

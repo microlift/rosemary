@@ -92,6 +92,25 @@ pub fn class_data() -> Vec<(String, u64)> {
     }
 }
 
+/// The hooks each `objc_setHook_*` chain starts with, which a setter hands
+/// back to the guest as the hook replaced. Empty under `native`, whose
+/// defaults are the host libobjc's own.
+pub fn default_hooks() -> Vec<(&'static str, u64)> {
+    match backend() {
+        Backend::Native => Vec::new(),
+        Backend::Builtin => builtin::default_hooks().to_vec(),
+    }
+}
+
+/// Have the builtin runtime's `objc_readClassPair` and
+/// `_objc_realizeClassFromSwift` call `realize`. Nothing under `native`, whose
+/// libobjc realizes such classes itself.
+pub fn set_compiled_class_realizer(realize: builtin::api::CompiledClassRealizer) {
+    if backend() == Backend::Builtin {
+        builtin::api::set_compiled_class_realizer(realize);
+    }
+}
+
 /// The `_NSConcrete*Block` values, which are data and which a block literal in
 /// the guest's image names directly.
 ///
@@ -134,6 +153,114 @@ pub fn deny_foreign_classes(provider: &mut machish::resolve::NativeDylibProvider
     }
     for prefix in ["_OBJC_CLASS_$_", "_OBJC_METACLASS_$_", "_OBJC_EHTYPE_$_"] {
         provider.deny_prefix(prefix);
+    }
+}
+
+/// `objc_allocateClassPair`, for the guest's compiled `objc_class` at `guest`
+/// and its metaclass at `guest_meta`.
+///
+/// Under `builtin` the guest's own headers become the pair, as libobjc
+/// realizes an image's classes where the image put them, so the address the
+/// guest has is the class. Apple's runtime adopts only images dyld maps, which
+/// a guest image is not, so under `native` the pair is a new one.
+///
+/// # Safety
+///
+/// `guest` and `guest_meta` are writable `objc_class` headers in a mapped image,
+/// written by nothing else from here on; the rest as `objc_allocateClassPair`.
+pub unsafe fn allocate_guest_class_pair(
+    guest: u64,
+    guest_meta: Option<u64>,
+    superclass: Class,
+    name: *const c_char,
+) -> Class {
+    match backend() {
+        Backend::Native => unsafe { objc_allocateClassPair(superclass, name, 0) },
+        Backend::Builtin => {
+            // SAFETY: the caller's obligations, which are `adopt_pair`'s; a
+            // superclass is null or a class this runtime made or adopted.
+            let class = unsafe {
+                builtin::class::adopt_pair(
+                    guest as usize as *mut builtin::class::Class,
+                    guest_meta.map(|m| m as usize as *mut builtin::class::Class),
+                    builtin::class::from_ptr(superclass as *const builtin::class::Class),
+                    std::ffi::CStr::from_ptr(name),
+                )
+            };
+            class.map_or(std::ptr::null_mut(), |c| builtin::class::ptr(c).cast())
+        }
+    }
+}
+
+/// Whether [`allocate_guest_class_pair`] adopts the guest's own headers, so a
+/// class keeps the ivar layout it was compiled with: see [`place_guest_ivars`].
+pub fn adopts_guest_classes() -> bool {
+    backend() == Backend::Builtin
+}
+
+/// One ivar of a compiled class, where the compiler put it.
+pub struct CompiledIvar<'a> {
+    pub name: &'a std::ffi::CStr,
+    pub types: &'a std::ffi::CStr,
+    pub offset: usize,
+    pub size: usize,
+    /// In bytes.
+    pub alignment: usize,
+}
+
+/// Lay out an adopted class's ivars as libobjc realizes a compiled class: at
+/// their compiled offsets, moved past the superclass only if it outgrew
+/// `instance_start`. `None` if an ivar is refused, naming it.
+///
+/// # Safety
+///
+/// `cls` is a pair [`allocate_guest_class_pair`] adopted and has not
+/// registered, under [`adopts_guest_classes`].
+pub unsafe fn place_guest_ivars<'a>(
+    cls: Class,
+    instance_start: usize,
+    instance_size: usize,
+    ivars: &[CompiledIvar<'a>],
+) -> Result<(), &'a std::ffi::CStr> {
+    // SAFETY: the caller's obligation.
+    let class = unsafe { builtin::class::from_ptr(cls as *const builtin::class::Class) }
+        .expect("an adopted class");
+    let superclass_size = class.superclass().map_or(0, |s| s.instance_size());
+    let max_alignment = ivars.iter().map(|i| i.alignment).max().unwrap_or(1);
+    let slide = builtin::class::ivar_slide(superclass_size, instance_start, max_alignment);
+    for ivar in ivars {
+        if !class.place_ivar(ivar.name, ivar.offset + slide, ivar.size, ivar.types) {
+            return Err(ivar.name);
+        }
+    }
+    class.set_instance_size(instance_size + slide);
+    Ok(())
+}
+
+/// Whether `va` is a class the selected runtime has, or `None` where it cannot
+/// say: Apple's runtime offers no check that is safe on an arbitrary pointer.
+pub fn knows_class(va: u64) -> Option<bool> {
+    match backend() {
+        Backend::Native => None,
+        Backend::Builtin => Some(builtin::class::is_known(
+            va as usize as *const builtin::class::Class,
+        )),
+    }
+}
+
+/// Whether the guest-memory address `va`, the `isa` of `object`, is a class
+/// the selected runtime has adopted - realizing it now if it is a compiled
+/// class Swift has not finished, as a message to it would. Never under
+/// `native`, which adopts nothing.
+pub fn is_adopted_class(va: u64, object: u64) -> bool {
+    match backend() {
+        Backend::Native => false,
+        Backend::Builtin => {
+            let class = va as usize as *const builtin::class::Class;
+            builtin::class::is_known(class)
+                || builtin::class::realize(class, object as usize as *const std::ffi::c_void)
+                    .is_some()
+        }
     }
 }
 

@@ -352,6 +352,16 @@ pub fn regions(pid: i32) -> io::Result<Vec<Region>> {
     }
 }
 
+pub fn set_name(name: &std::ffi::CStr) -> io::Result<()> {
+    // `/proc/self` is the thread group leader whichever thread asks, where
+    // `PR_SET_NAME` would rename only the caller.
+    use std::io::Write;
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open("/proc/self/comm")?
+        .write_all(name.to_bytes())
+}
+
 pub fn audit() -> Audit {
     /// Unset, in both `loginuid` and `sessionid`.
     const UNSET: u32 = u32::MAX;

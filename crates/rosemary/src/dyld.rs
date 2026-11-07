@@ -11,7 +11,7 @@ use machish::image::MachObject;
 use machish::install_name::PathContext;
 use machish::loader::Loader;
 use machish::memory::{MmapSpace, Regions};
-use machish::report::LinkReport;
+use machish::report::{ImageReport, LinkReport};
 use machish::resolve::SyntheticDylib;
 use machish::spec::MachSpec;
 use machish::spec::arch::X86_64;
@@ -94,6 +94,8 @@ static EXECUTABLE: Mutex<Option<(String, u64)>> = Mutex::new(None);
 struct MappedImage {
     /// The install name or path the link knew it by, as [`LinkedImage::name`].
     name: String,
+    /// Where the image was read from, as [`ImageReport::path`].
+    path: String,
     /// The mapped `mach_header`, which is what dyld calls an image's base.
     header: u64,
     slide: u64,
@@ -318,6 +320,7 @@ pub fn register_mapped_images(report: &LinkReport) {
         .iter()
         .map(|i| MappedImage {
             name: i.name.clone(),
+            path: i.path.clone(),
             header: i.base,
             slide: i.slide,
             segments: i
@@ -1033,6 +1036,11 @@ fn open_with<S: MachSpec + 'static>(
     // Every `_dyld_register_func_for_add_image` callback, before this image's
     // own code runs. See [`announce`].
     announce(leaked.handle, leaked.slide);
+    // And every `objc_addLoadImageFunc` one, which libobjc calls as it maps an
+    // image - before `+load`.
+    for image in &leaked.report.images {
+        announce_objc(image.base);
+    }
 
     // Now the image's own code, in dyld's order.
     if let Some(exec) = exec {
@@ -2061,6 +2069,13 @@ fn native_handle(handle: u64) -> Option<String> {
         .map(|(_, path)| path.clone())
 }
 
+/// Make the host function at `addr` callable by guest code that holds its
+/// address without having imported it, under `name`'s signature: one the
+/// runtime hands back through an out-parameter, as `objc_setHook_*` does.
+pub(crate) fn describe_host_function(addr: u64, name: &str) {
+    remember_native_symbol(addr, name, None);
+}
+
 /// Record a host address handed to the guest by `dlsym`, so it can be called.
 fn remember_native_symbol(addr: u64, name: &str, library: Option<String>) -> u64 {
     let mut map = NATIVE_SYMBOLS.lock().unwrap_or_else(|e| e.into_inner());
@@ -2133,6 +2148,52 @@ static ADD_IMAGE: Mutex<Vec<u64>> = Mutex::new(Vec::new());
 /// The `remove image` callbacks, likewise. libunwind's is one: it purges its
 /// cache of an unloaded image's frames.
 static REMOVE_IMAGE: Mutex<Vec<u64>> = Mutex::new(Vec::new());
+
+/// The `objc_addLoadImageFunc` callbacks, as native-callable addresses.
+static LOAD_IMAGE: Mutex<Vec<u64>> = Mutex::new(Vec::new());
+
+/// Whether the image at `header` has Objective-C metadata, which is what
+/// libobjc keeps an image for and so what its load-image callbacks hear about.
+fn has_objc(header: u64) -> bool {
+    [b"__DATA".as_slice(), b"__DATA_CONST", b"__DATA_DIRTY"]
+        .into_iter()
+        .any(|segment| load_command_in(header, segment, Some(b"__objc_imageinfo")) != 0)
+        || load_command_in(header, b"__OBJC", Some(b"__image_info")) != 0
+}
+
+/// Tell one `objc_func_loadImage` about one image.
+fn notify_objc(thunk: u64, header: u64) {
+    // SAFETY: `thunk` is native code taking a `mach_header *` - the guest's own
+    // function, or a [`crate::thunk`] standing for it.
+    let f: extern "C" fn(u64) = unsafe { std::mem::transmute::<u64, _>(thunk) };
+    f(header);
+}
+
+/// Announce `header` to every load-image callback, if libobjc would.
+fn announce_objc(header: u64) {
+    if header == 0 || !has_objc(header) {
+        return;
+    }
+    let callbacks = LOAD_IMAGE.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    for thunk in callbacks {
+        notify_objc(thunk, header);
+    }
+}
+
+/// The header of every guest image mapped so far: the program, what it was
+/// linked against, and everything `dlopen` mapped since.
+fn every_header() -> Vec<u64> {
+    let mut headers: Vec<u64> = match MAPPED.get() {
+        Some(images) => images.iter().map(|i| i.header).collect(),
+        None => crate::thunk::current()
+            .map(|vm| vm.program.report.images.iter().map(|i| i.base).collect())
+            .unwrap_or_default(),
+    };
+    for image in snapshot() {
+        headers.extend(image.report.images.iter().map(|i| i.base));
+    }
+    headers
+}
 
 /// Tell one callback about one image.
 ///
@@ -2242,28 +2303,30 @@ fn unwind_sections_of(addr: u64) -> Option<[u8; 40]> {
 
 /// `(mach_header VA, slide)` for the guest image containing `va`.
 fn guest_image_at(va: u64) -> Option<(u64, u64)> {
-    fn containing(report: &LinkReport, va: u64) -> Option<(u64, u64)> {
-        report
-            .images
-            .iter()
-            .find(|i| {
-                i.segments
-                    .iter()
-                    .any(|s| va >= s.vmaddr && va < s.vmaddr.wrapping_add(s.vmsize))
-            })
-            .map(|i| (i.base, i.slide))
+    with_guest_image_at(va, |header, slide, _| (header, slide))
+}
+
+/// `f(mach_header VA, slide, host path)` for the guest image containing `va`.
+fn with_guest_image_at<R>(va: u64, f: impl FnOnce(u64, u64, &str) -> R) -> Option<R> {
+    fn containing(report: &LinkReport, va: u64) -> Option<&ImageReport> {
+        report.images.iter().find(|i| {
+            i.segments
+                .iter()
+                .any(|s| va >= s.vmaddr && va < s.vmaddr.wrapping_add(s.vmsize))
+        })
     }
     if let Some(found) = find(|i| containing(&i.report, va)) {
-        return Some(found);
+        return Some(f(found.base, found.slide, &found.path));
     }
     if let Some(found) = MAPPED.get().and_then(|images| {
         images
             .iter()
             .find(|i| i.segments.iter().any(|(lo, hi)| va >= *lo && va < *hi))
     }) {
-        return Some((found.header, found.slide));
+        return Some(f(found.header, found.slide, &found.path));
     }
-    containing(&crate::thunk::current()?.program.report, va)
+    let vm = crate::thunk::current()?;
+    containing(&vm.program.report, va).map(|i| f(i.base, i.slide, &i.path))
 }
 
 /// `(unslid addr, size)` of a section in the guest image at `header`.
@@ -2596,6 +2659,56 @@ pub(crate) mod entry {
         super::guest_image_at(va).map_or(0, |(header, _)| header)
     }
 
+    /// `const char *dyld_image_path_containing_address(const void *)`
+    pub extern "C" fn dyld_image_path_containing_address(va: u64) -> u64 {
+        super::with_guest_image_at(va, |_, _, path| super::path_cstr(path)).unwrap_or(0)
+    }
+
+    // The shared cache's half of dyld's private interface. There is no shared
+    // cache: every image is loaded from its own file.
+
+    /// `bool dyld_shared_cache_some_image_overridden(void)`
+    pub extern "C" fn dyld_shared_cache_some_image_overridden() -> bool {
+        false
+    }
+
+    /// `const void *_dyld_get_shared_cache_range(size_t *length)`
+    ///
+    /// # Safety
+    ///
+    /// `length` is null or writable.
+    pub unsafe extern "C" fn dyld_get_shared_cache_range(length: *mut u64) -> u64 {
+        if !length.is_null() {
+            // SAFETY: the caller's writable word.
+            unsafe { length.write_unaligned(0) };
+        }
+        0
+    }
+
+    /// `bool _dyld_is_preoptimized_objc_image_loaded(uint16_t imageID)`: an
+    /// image ID numbers an image in the shared cache's Objective-C tables.
+    pub extern "C" fn dyld_is_preoptimized_objc_image_loaded(_image: u16) -> bool {
+        false
+    }
+
+    /// `const void *_dyld_get_swift_prespecialized_data(void)`: the shared
+    /// cache's table of prebuilt generic metadata.
+    pub extern "C" fn dyld_get_swift_prespecialized_data() -> u64 {
+        0
+    }
+
+    /// `const void *_dyld_find_pointer_hash_table_entry(const void *table,
+    /// const void *key1, size_t restKeysCount, const void **restKeys)`: a
+    /// lookup in a shared cache table, which nothing here can have handed out.
+    pub extern "C" fn dyld_find_pointer_hash_table_entry(
+        _table: u64,
+        _key: u64,
+        _rest_count: u64,
+        _rest: u64,
+    ) -> u64 {
+        0
+    }
+
     /// `void _dyld_register_func_for_add_image(void (*)(const struct mach_header *,
     /// intptr_t))`
     ///
@@ -2623,6 +2736,27 @@ pub(crate) mod entry {
         already.extend(super::snapshot().iter().map(|i| (i.handle, i.slide)));
         for (header, slide) in already {
             super::notify(f, header, slide);
+        }
+    }
+
+    /// `void objc_addLoadImageFunc(void (*)(const struct mach_header *))`
+    ///
+    /// libobjc's, served here because it is about images: `f` hears about
+    /// every image with Objective-C metadata, those already loaded first.
+    /// Swift finds its type and conformance records this way.
+    pub extern "C" fn objc_add_load_image_func(f: u64) {
+        if f == 0 {
+            return;
+        }
+        // Registered first, as `dyld_register_func_for_add_image` is.
+        super::LOAD_IMAGE
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(f);
+        for header in super::every_header() {
+            if super::has_objc(header) {
+                super::notify_objc(f, header);
+            }
         }
     }
 
@@ -2722,6 +2856,45 @@ pub(crate) mod entry {
         // SAFETY: the caller states both are NUL-terminated.
         let (segment, section) = unsafe { (CStr::from_ptr(segment), CStr::from_ptr(section)) };
         super::load_command_in(header, segment.to_bytes(), Some(section.to_bytes()))
+    }
+
+    /// `uint8_t *getsectiondata(const struct mach_header_64 *, const char
+    /// *segname, const char *sectname, unsigned long *size)`: a section's
+    /// contents, slid by how far `header` is from its `__TEXT`.
+    ///
+    /// # Safety
+    ///
+    /// `header` is a mapped image's header, both names are NUL-terminated, and
+    /// `size` is writable.
+    pub unsafe extern "C" fn getsectiondata(
+        header: u64,
+        segment: *const c_char,
+        section: *const c_char,
+        size: *mut u64,
+    ) -> u64 {
+        if segment.is_null() || section.is_null() || size.is_null() {
+            return 0;
+        }
+        let text = super::load_command_in(header, b"__TEXT", None) as *const u8;
+        // SAFETY: the caller states both are NUL-terminated.
+        let (segment, section) = unsafe { (CStr::from_ptr(segment), CStr::from_ptr(section)) };
+        let record = super::load_command_in(header, segment.to_bytes(), Some(section.to_bytes()))
+            as *const u8;
+        if text.is_null() || record.is_null() {
+            return 0;
+        }
+        // SAFETY: a `segment_command_64` and a `section_64` inside the mapped
+        // header: `vmaddr` is the segment's word at 24, `addr` and `size` the
+        // section's at 32 and 40.
+        unsafe {
+            let slide = header.wrapping_sub(text.add(24).cast::<u64>().read_unaligned());
+            size.write_unaligned(record.add(40).cast::<u64>().read_unaligned());
+            record
+                .add(32)
+                .cast::<u64>()
+                .read_unaligned()
+                .wrapping_add(slide)
+        }
     }
 
     /// `unsigned long get_etext(void)`: the end of the main image's
@@ -3105,7 +3278,7 @@ pub(crate) mod entry {
 }
 
 /// Every name [`provider`] defines, and the function it binds to.
-fn entries() -> [(&'static str, *const ()); 24] {
+fn entries() -> [(&'static str, *const ()); 32] {
     [
         ("_NSAddImage", entry::ns_add_image as *const ()),
         (
@@ -3152,8 +3325,36 @@ fn entries() -> [(&'static str, *const ()); 24] {
             entry::dyld_image_containing_address as *const (),
         ),
         (
+            "_dyld_image_path_containing_address",
+            entry::dyld_image_path_containing_address as *const (),
+        ),
+        (
+            "_dyld_shared_cache_some_image_overridden",
+            entry::dyld_shared_cache_some_image_overridden as *const (),
+        ),
+        (
+            "__dyld_get_shared_cache_range",
+            entry::dyld_get_shared_cache_range as *const (),
+        ),
+        (
+            "__dyld_is_preoptimized_objc_image_loaded",
+            entry::dyld_is_preoptimized_objc_image_loaded as *const (),
+        ),
+        (
+            "__dyld_get_swift_prespecialized_data",
+            entry::dyld_get_swift_prespecialized_data as *const (),
+        ),
+        (
+            "__dyld_find_pointer_hash_table_entry",
+            entry::dyld_find_pointer_hash_table_entry as *const (),
+        ),
+        (
             "__dyld_register_func_for_add_image",
             entry::dyld_register_func_for_add_image as *const (),
+        ),
+        (
+            "_objc_addLoadImageFunc",
+            entry::objc_add_load_image_func as *const (),
         ),
         (
             "__dyld_register_func_for_remove_image",
@@ -3165,6 +3366,7 @@ fn entries() -> [(&'static str, *const ()); 24] {
             "_getsectbynamefromheader_64",
             entry::getsectbynamefromheader_64 as *const (),
         ),
+        ("_getsectiondata", entry::getsectiondata as *const ()),
         ("_get_etext", entry::get_etext as *const ()),
         ("_get_end", entry::get_end as *const ()),
     ]

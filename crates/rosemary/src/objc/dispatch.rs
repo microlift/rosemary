@@ -107,6 +107,11 @@ const P: T = T::Pointer;
 
 /// The runtime surface a guest reaches, **sorted by name**.
 pub(super) static RUNTIME: &[Runtime] = &[
+    // What a Swift runtime asks of this one. A Swift class's metadata stays the
+    // guest's, so the class handed to `_objc_realizeClassFromSwift` crosses
+    // untranslated.
+    rt!("_objc_realizeClassFromSwift", P, P, P),
+    rtc!([0], "_objc_rootAutorelease", P, P),
     //
     // The other direction of [`crate::objc::register`]. That pass replays the
     // classes a guest *declared* in its `__objc_data`; these three are a guest
@@ -143,15 +148,20 @@ pub(super) static RUNTIME: &[Runtime] = &[
         protocols: &[1],
         struct_return: None,
     },
+    rtc!([0], "class_copyIvarList", P, P, P),
     rtc!([0], "class_copyPropertyList", P, P, P),
     rtc!([0] -> true, "class_createInstance", P, P, U64),
     rtc!([0], "class_getClassMethod", P, P, P),
+    // `const char *class_getImageName(Class)`: answered by the image-name hook
+    // Swift installs, for its own classes.
+    rtc!([0], "class_getImageName", P, P),
     rtc!([0], "class_getInstanceMethod", P, P, P),
     rtc!([0], "class_getInstanceSize", U64, P),
     rtc!([0], "class_getInstanceVariable", P, P, P),
     // The compiler-emitted ARC layout bitmap for a class's strong ivars. This
     // runtime does not model one; see `BUILTIN_GAPS`.
     rtc!([0], "class_getIvarLayout", P, P),
+    rtc!([0], "class_getMethodImplementation", P, P, P),
     rtc!([0], "class_getName", P, P),
     rtc!([0], "class_getProperty", P, P, P),
     rtc!([0] -> true, "class_getSuperclass", P, P),
@@ -161,6 +171,7 @@ pub(super) static RUNTIME: &[Runtime] = &[
     rtcb!([0], [2], "class_replaceMethod", P, P, P, P, P),
     rtc!([0], "class_replaceProperty", V, P, P, P, I32),
     rtc!([0], "class_respondsToSelector", U8, P, P),
+    rtc!([0, 1] -> true, "class_setSuperclass", P, P, P),
     //
     // A guest that reads an ivar through `object_getIvar` rather than through a
     // compiled displacement is asking the *host* runtime where the ivar is, and
@@ -184,6 +195,7 @@ pub(super) static RUNTIME: &[Runtime] = &[
     rt!("objc_autoreleasePoolPop", V, P),
     rt!("objc_autoreleasePoolPush", P),
     rtc!([0], "objc_autoreleaseReturnValue", P, P),
+    rtc!([0], "objc_constructInstance", P, P, P),
     //
     // These four are the whole of ARC's weak-reference support that SDL3's Cocoa
     // backend imports, and passthrough is right for a reason worth stating: a
@@ -204,6 +216,7 @@ pub(super) static RUNTIME: &[Runtime] = &[
     rt!("objc_copyStruct", V, P, P, I64, U8, U8),
     rt!("objc_copyWeak", V, P, P),
     rt!("objc_destroyWeak", V, P),
+    rt!("objc_destructInstance", P, P),
     // The hook the compiler emits inside every `for (x in collection)` loop, to
     // be called when the collection changed underneath it.
     rt!("objc_enumerationMutation", V, P),
@@ -250,10 +263,8 @@ pub(super) static RUNTIME: &[Runtime] = &[
     rtc!([0], "objc_opt_new", P, P),
     rtc!([0], "objc_opt_respondsToSelector", U8, P, P),
     rtc!([0], "objc_opt_self", P, P),
-    // `Class objc_readClassPair(Class, const struct objc_image_info *)` and
-    // `const char **objc_copyClassNamesForImage(const char *, unsigned *)` are
-    // both about *images*, which this runtime's classes do not belong to. See
-    // `BUILTIN_GAPS`.
+    // `Class objc_readClassPair(Class, const struct objc_image_info *)`: how
+    // Swift hands over a generic class it has instantiated.
     rtc!([0] -> true, "objc_readClassPair", P, P, P),
     rtc!([0], "objc_registerClassPair", V, P),
     rtc!([0], "objc_release", V, P),
@@ -273,6 +284,11 @@ pub(super) static RUNTIME: &[Runtime] = &[
         protocols: &[],
         struct_return: None,
     },
+    // The hook a setter writes back is guest-callable: a thunk, or a default
+    // `host::default_hooks` describes.
+    rtb!([0], "objc_setHook_getClass", V, P, P),
+    rtb!([0], "objc_setHook_getImageName", V, P, P),
+    rtb!([0], "objc_setHook_lazyClassNamer", V, P, P),
     // See the note on `objc_getProperty` for why the argument order is not the
     // same in the general entry point as in the four specialized ones.
     rtc!([0, 3], "objc_setProperty", V, P, P, I64, P, U8, U8),
@@ -291,6 +307,7 @@ pub(super) static RUNTIME: &[Runtime] = &[
     rt!("objc_terminate", V),
     // The `__unsafe_unretained` end of the autoreleased-return-value handshake.
     rtc!([0], "objc_unsafeClaimAutoreleasedReturnValue", P, P),
+    rt!("object_dispose", P, P),
     rtc!([0] -> true, "object_getClass", P, P),
     rtc!([0], "object_getClassName", P, P),
     rt!("object_getIndexedIvars", P, P),
@@ -301,6 +318,16 @@ pub(super) static RUNTIME: &[Runtime] = &[
     rt!("property_copyAttributeList", P, P, P),
     rt!("property_getAttributes", P, P),
     rt!("property_getName", P, P),
+    Runtime {
+        name: "protocol_conformsToProtocol",
+        types: &[U8, P, P],
+        classes: &[],
+        class_return: false,
+        callbacks: &[],
+        blocks: &[],
+        protocols: &[0, 1],
+        struct_return: None,
+    },
     //
     // `struct objc_method_description protocol_getMethodDescription(Protocol *,
     // SEL, BOOL isRequiredMethod, BOOL isInstanceMethod)` - two pointers, `{SEL
@@ -620,6 +647,10 @@ pub fn provider() -> SyntheticDylib {
     for (name, addr) in super::host::block_data() {
         lib.define_data(&name, addr);
     }
+    for (name, addr) in super::host::default_hooks() {
+        crate::dyld::describe_host_function(addr, name);
+    }
+    super::host::set_compiled_class_realizer(super::realize_compiled_class);
     // Null on purpose under either runtime: Apple's libobjc exports these as
     // absolute zeros too.
     for name in ::objc::null_data() {
@@ -1042,7 +1073,9 @@ fn send(
     // A receiver in guest memory is not automatically broken.
     if vm.program.is_guest_address(host_receiver) {
         let isa = vm.objc_host_class((mem as &dyn GuestMemory).read_u64(host_receiver, symbol)?);
-        if isa == 0 || vm.program.is_guest_address(isa) {
+        if isa == 0
+            || (vm.program.is_guest_address(isa) && !host::is_adopted_class(isa, host_receiver))
+        {
             return Err(AbiError::Refused {
                 symbol: symbol.to_string(),
                 reason: "the receiver is a guest address whose class the runtime never realized",
@@ -1775,13 +1808,7 @@ mod tests {
     /// A named list rather than a silence: each of these is a guest that stops
     /// with "unsatisfied import" under `ROSEMARY_OBJC=builtin`, and the name is
     /// the whole of the work queue.
-    const BUILTIN_GAPS: &[&str] = &[
-        // A class here belongs to the runtime rather than to the file it was
-        // declared in, so there is nothing to read a compiler-laid-out
-        // `objc_class` out of - that pass is `crate::objc::register`, and it runs
-        // at load time from the link transcript rather than on a guest's say-so.
-        "objc_readClassPair",
-    ];
+    const BUILTIN_GAPS: &[&str] = &[];
 
     #[test]
     fn the_selected_runtime_really_exports_what_this_module_forwards_to() {

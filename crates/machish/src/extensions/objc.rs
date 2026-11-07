@@ -48,8 +48,8 @@ const PROPERTY_SIZE: u64 = 16;
 /// that way. They are not part of the address.
 const FAST_DATA_MASK: Word = 0x0000_7fff_ffff_fff8;
 
-/// `bits` low-bit markers. A class with either set is Swift, and what `bits`
-/// addresses is Swift metadata rather than a `class_ro_t`.
+/// `bits` low-bit markers. A class with either set is Swift: the header is the
+/// start of Swift's class metadata, and `bits` still addresses a `class_ro_t`.
 const FAST_IS_SWIFT_LEGACY: Word = 1 << 0;
 const FAST_IS_SWIFT_STABLE: Word = 1 << 1;
 
@@ -66,6 +66,9 @@ const ENTSIZE_MASK: u32 = 0x0000_fffc;
 pub const RO_META: u32 = 1 << 0;
 /// `class_ro_t::flags` bit marking a root class.
 pub const RO_ROOT: u32 = 1 << 1;
+/// `class_ro_t::flags` bit marking a Swift class whose metadata Swift must
+/// finish at run time, through an initializer stored after the `class_ro_t`.
+pub const RO_HAS_SWIFT_INITIALIZER: u32 = 1 << 6;
 
 /// Image-info flag saying `category_t` carries a class-properties field.
 ///
@@ -166,6 +169,9 @@ pub struct ClassRo {
     pub properties: Vec<ObjcProperty>,
     /// Addresses of the `protocol_t`s this class conforms to.
     pub protocols: Vec<Word>,
+    /// The function Swift finishes this class's metadata with, stored after
+    /// the `class_ro_t` when [`RO_HAS_SWIFT_INITIALIZER`] is set; zero otherwise.
+    pub swift_initializer: Word,
 }
 
 impl ClassRo {
@@ -174,6 +180,9 @@ impl ClassRo {
     }
     pub fn is_root(&self) -> bool {
         self.flags & RO_ROOT != 0
+    }
+    pub fn has_swift_initializer(&self) -> bool {
+        self.flags & RO_HAS_SWIFT_INITIALIZER != 0
     }
 }
 
@@ -201,9 +210,9 @@ pub struct ObjcClass {
 impl ObjcClass {
     /// Whether `bits` carries one of the two Swift markers.
     ///
-    /// A Swift class's `bits` does not point at a `class_ro_t` at all, so a
-    /// consumer that realizes classes must ask this before believing
-    /// [`ro`](ObjcClass::ro).
+    /// Such a class's [`ro`](ObjcClass::ro) is real, but Swift's own metadata
+    /// follows the header, so a consumer must keep the class where it is
+    /// rather than copy it.
     pub fn is_swift(&self) -> bool {
         self.bits & (FAST_IS_SWIFT_LEGACY | FAST_IS_SWIFT_STABLE) != 0
     }
@@ -334,6 +343,17 @@ impl<S: MachSpec> Extension<S> for ObjcExtension {
     }
 }
 
+/// Memory Objective-C metadata can be read from.
+pub trait ObjcMemory {
+    fn read(&self, addr: Word, out: &mut [u8]) -> Result<()>;
+}
+
+impl<T: AddressSpace + ?Sized> ObjcMemory for T {
+    fn read(&self, addr: Word, out: &mut [u8]) -> Result<()> {
+        AddressSpace::read(self, addr, out)
+    }
+}
+
 /// Decode one image's Objective-C metadata, reading through `mem` post-binding.
 pub fn decode<S: MachSpec>(
     obj: &MachObject<'_, S>,
@@ -349,14 +369,29 @@ pub fn decode<S: MachSpec>(
     cx.run()
 }
 
+/// Decode the class whose `objc_class` is at `va`, wherever it and what it
+/// points at lie: a class a runtime built, as Swift builds a generic class's
+/// metadata, rather than one an image declares. `None` if `va` is null or its
+/// `bits` lead nowhere.
+pub fn decode_class<M: ObjcMemory + ?Sized>(mem: &M, va: Word) -> Result<Option<ObjcClass>> {
+    let mut cx = Cx {
+        obj: Img::anywhere(),
+        mem,
+        slide: 0,
+        refusals: Vec::new(),
+    };
+    cx.class(va)
+}
+
 /// This image's sections, by name and extent.
 ///
 /// Copied out rather than borrowed so `Cx` does not carry the object's lifetime
 /// into every helper - the decode is a few hundred reads against memory, and a
 /// section table is a few dozen entries.
 struct Img {
-    /// `(name, unslid addr, size)`, zero-sized sections dropped.
-    sections: Vec<(String, Word, Word)>,
+    /// `(name, unslid addr, size)`, zero-sized sections dropped. `None` for
+    /// metadata that is no image's, where any address is its own.
+    sections: Option<Vec<(String, Word, Word)>>,
 }
 
 impl Img {
@@ -367,25 +402,33 @@ impl Img {
             .filter(|s| s.size > 0)
             .map(|s| (String::from(s.sect_name), s.addr, s.size))
             .collect();
-        Img { sections }
+        Img {
+            sections: Some(sections),
+        }
+    }
+
+    fn anywhere() -> Self {
+        Img { sections: None }
     }
 
     /// Whether an *unslid* address lies in one of this image's sections.
     fn contains(&self, unslid: Word) -> bool {
-        self.sections
-            .iter()
-            .any(|&(_, addr, size)| unslid >= addr && unslid < addr.wrapping_add(size))
+        self.sections.as_ref().is_none_or(|sections| {
+            sections
+                .iter()
+                .any(|&(_, addr, size)| unslid >= addr && unslid < addr.wrapping_add(size))
+        })
     }
 }
 
-struct Cx<'m> {
+struct Cx<'m, M: ObjcMemory + ?Sized = dyn AddressSpace> {
     obj: Img,
-    mem: &'m dyn AddressSpace,
+    mem: &'m M,
     slide: Word,
     refusals: Vec<ObjcRefusal>,
 }
 
-impl Cx<'_> {
+impl<M: ObjcMemory + ?Sized> Cx<'_, M> {
     fn run(mut self) -> Result<ObjcImage> {
         // Ordering matters only for `image_info`, which decides how wide a
         // `category_t` is.
@@ -524,6 +567,7 @@ impl Cx<'_> {
         self.obj
             .sections
             .iter()
+            .flatten()
             .filter(|(n, _, _)| n == name)
             .map(|&(_, addr, size)| (addr.wrapping_add(self.slide), (size / 8) as usize))
             .collect()
@@ -724,9 +768,10 @@ impl Cx<'_> {
     }
 
     fn class_ro(&mut self, at: Word) -> Result<ClassRo> {
+        let flags = self.u32_at(at)?;
         Ok(ClassRo {
             va: at,
-            flags: self.u32_at(at)?,
+            flags,
             instance_start: self.u32_at(at.wrapping_add(4))?,
             instance_size: self.u32_at(at.wrapping_add(8))?,
             // +12 reserved, +16 ivarLayout
@@ -736,6 +781,10 @@ impl Cx<'_> {
             ivars: self.ivars(at.wrapping_add(48))?,
             // +56 weakIvarLayout
             properties: self.properties(at.wrapping_add(64))?,
+            swift_initializer: match flags & RO_HAS_SWIFT_INITIALIZER {
+                0 => 0,
+                _ => self.word_at(at.wrapping_add(CLASS_RO_SIZE))?,
+            },
         })
     }
 
@@ -763,7 +812,8 @@ impl Cx<'_> {
         };
         let bits = self.word_at(va.wrapping_add(CLASS_BITS_OFF))?;
         let isa = self.word_at(va)?;
-        let meta = match self.local(va, isa) {
+        // A metaclass's `isa` is the root metaclass, not a metaclass of its own.
+        let meta = match self.local(va, isa).filter(|_| !ro.is_meta()) {
             Some(m) => self.class_ro_of(m)?.map(|ro| ObjcMetaclass {
                 va: m,
                 isa: self.word_at(m).unwrap_or(0),
@@ -824,3 +874,74 @@ const _: () = {
     assert!(CLASS_BITS_OFF + 8 == CLASS_SIZE);
     assert!(CLASS_RO_SIZE == 16 + 7 * 8);
 };
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Where the flat memory below starts, an address no image would claim.
+    const BASE: Word = 0x7000_0000;
+    const CLASS: Word = BASE;
+    const META: Word = BASE + 0x40;
+    const RO: Word = BASE + 0x80;
+    const META_RO: Word = BASE + 0x100;
+    const NAME: Word = BASE + 0x180;
+    const INITIALIZER: Word = 0x1234_5678;
+
+    /// A flat byte array at [`BASE`].
+    struct Flat(Vec<u8>);
+
+    impl ObjcMemory for Flat {
+        fn read(&self, addr: Word, out: &mut [u8]) -> Result<()> {
+            let start = addr.wrapping_sub(BASE) as usize;
+            let src = self.0.get(start..start.wrapping_add(out.len())).ok_or(Error::OutOfBounds {
+                addr,
+                len: out.len(),
+            })?;
+            out.copy_from_slice(src);
+            Ok(())
+        }
+    }
+
+    impl Flat {
+        fn word(&mut self, at: Word, value: Word) {
+            let at = (at - BASE) as usize;
+            self.0[at..at + 8].copy_from_slice(&value.to_le_bytes());
+        }
+        fn u32(&mut self, at: Word, value: u32) {
+            let at = (at - BASE) as usize;
+            self.0[at..at + 4].copy_from_slice(&value.to_le_bytes());
+        }
+    }
+
+    /// A class pair as Swift builds one at run time: on the heap, Swift's
+    /// marker in `bits`, and its initializer after the `class_ro_t`.
+    fn run_time_class() -> Flat {
+        let mut m = Flat(alloc::vec![0; 0x200]);
+        m.word(CLASS, META);
+        m.word(CLASS + CLASS_BITS_OFF, RO | FAST_IS_SWIFT_STABLE);
+        m.word(META + CLASS_BITS_OFF, META_RO);
+        m.u32(RO, RO_HAS_SWIFT_INITIALIZER);
+        m.word(RO + 24, NAME);
+        m.word(RO + CLASS_RO_SIZE, INITIALIZER);
+        m.u32(META_RO, RO_META);
+        m.0[(NAME - BASE) as usize..][..6].copy_from_slice(b"Built\0");
+        m
+    }
+
+    #[test]
+    fn decodes_a_class_no_image_declares() {
+        let class = decode_class(&run_time_class(), CLASS).unwrap().unwrap();
+        assert_eq!(class.ro.name, "Built");
+        assert!(class.is_swift());
+        assert_eq!(class.ro.swift_initializer, INITIALIZER);
+        assert_eq!(class.meta.map(|m| m.va), Some(META));
+    }
+
+    #[test]
+    fn a_metaclass_decodes_without_a_metaclass_of_its_own() {
+        let meta = decode_class(&run_time_class(), META).unwrap().unwrap();
+        assert!(meta.ro.is_meta());
+        assert!(meta.meta.is_none());
+    }
+}

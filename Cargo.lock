@@ -2678,6 +2678,7 @@ dependencies = [
  "security",
  "server",
  "sha2 0.11.0",
+ "starnix",
  "static_init",
  "videotoolbox",
  "webkit",

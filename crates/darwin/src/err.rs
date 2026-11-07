@@ -103,7 +103,7 @@ pub unsafe extern "C" fn warnx(format: *const c_char, args: ...) {
 pub unsafe extern "C" fn verrc(eval: c_int, code: c_int, format: *const c_char, ap: VaList) -> ! {
     // SAFETY: the caller's obligations.
     unsafe { report(Some(code), format, ap) };
-    crate::bsd::exit(eval)
+    crate::bsd::posix::exit(eval)
 }
 
 /// `void verr(int eval, const char *fmt, va_list ap)`
@@ -115,7 +115,7 @@ pub unsafe extern "C" fn verr(eval: c_int, format: *const c_char, ap: VaList) ->
     let code = crate::errno::guest_errno();
     // SAFETY: the caller's obligations.
     unsafe { report(Some(code), format, ap) };
-    crate::bsd::exit(eval)
+    crate::bsd::posix::exit(eval)
 }
 
 /// `void verrx(int eval, const char *fmt, va_list ap)`
@@ -126,7 +126,7 @@ pub unsafe extern "C" fn verr(eval: c_int, format: *const c_char, ap: VaList) ->
 pub unsafe extern "C" fn verrx(eval: c_int, format: *const c_char, ap: VaList) -> ! {
     // SAFETY: the caller's obligations.
     unsafe { report(None, format, ap) };
-    crate::bsd::exit(eval)
+    crate::bsd::posix::exit(eval)
 }
 
 /// `void errc(int eval, int code, const char *fmt, ...)`
@@ -137,7 +137,7 @@ pub unsafe extern "C" fn verrx(eval: c_int, format: *const c_char, ap: VaList) -
 pub unsafe extern "C" fn errc(eval: c_int, code: c_int, format: *const c_char, args: ...) -> ! {
     // SAFETY: the caller's obligations.
     unsafe { report(Some(code), format, args) };
-    crate::bsd::exit(eval)
+    crate::bsd::posix::exit(eval)
 }
 
 /// `void err(int eval, const char *fmt, ...)`
@@ -149,7 +149,7 @@ pub unsafe extern "C" fn err(eval: c_int, format: *const c_char, args: ...) -> !
     let code = crate::errno::guest_errno();
     // SAFETY: the caller's obligations.
     unsafe { report(Some(code), format, args) };
-    crate::bsd::exit(eval)
+    crate::bsd::posix::exit(eval)
 }
 
 /// `void errx(int eval, const char *fmt, ...)`
@@ -160,7 +160,7 @@ pub unsafe extern "C" fn err(eval: c_int, format: *const c_char, args: ...) -> !
 pub unsafe extern "C" fn errx(eval: c_int, format: *const c_char, args: ...) -> ! {
     // SAFETY: the caller's obligations.
     unsafe { report(None, format, args) };
-    crate::bsd::exit(eval)
+    crate::bsd::posix::exit(eval)
 }
 
 exports::exports! {

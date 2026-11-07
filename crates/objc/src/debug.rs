@@ -232,7 +232,8 @@ fn validate_enabled(object: Id, operation: &str) {
     // External guest allocations are accepted only when their first word
     // identifies a class belonging to this runtime.
     let isa = unsafe { *(object as *const *const Class) };
-    if !crate::class::is_known(isa) {
+    // A compiled class Swift has not finished is realized on first touch.
+    if !crate::class::is_known(isa) && crate::class::realize(isa, object.cast()).is_none() {
         violation(operation, object, "object has an invalid isa");
     }
 }

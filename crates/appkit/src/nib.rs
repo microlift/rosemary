@@ -229,7 +229,7 @@ fn implemented(name: &str) -> bool {
     !crate::classes::is_placeholder(name)
         && std::ffi::CString::new(name)
             .ok()
-            .and_then(|n| objc::class::lookup(&n))
+            .and_then(|n| objc::class::look_up(&n))
             .is_some()
 }
 
@@ -592,7 +592,7 @@ impl Builder<'_> {
             .then(|| {
                 std::ffi::CString::new(name)
                     .ok()
-                    .and_then(|n| objc::class::lookup(&n))
+                    .and_then(|n| objc::class::look_up(&n))
             })
             .flatten();
         let Some(class) = known else {

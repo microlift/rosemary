@@ -408,6 +408,12 @@ pub fn audit() -> Audit {
     Audit::default()
 }
 
+// `p_comm` is copied from the executable at `exec` and nothing changes it
+// after.
+pub fn set_name(_name: &CStr) -> io::Result<()> {
+    Err(io::ErrorKind::Unsupported.into())
+}
+
 fn host() -> libc::mach_port_t {
     static HOST: OnceLock<libc::mach_port_t> = OnceLock::new();
     // SAFETY: no preconditions; the right is kept for the process's life.

@@ -963,6 +963,24 @@ pub unsafe extern "C" fn key_create(
     }
 }
 
+/// `int pthread_key_init_np(int key, void (*destructor)(void *))`
+///
+/// Gives a static key, which a framework claims by number rather than
+/// creating, its destructor. Swift's runtime keeps its thread state in these.
+///
+/// # Safety
+///
+/// `destructor` is null or a function this process can call.
+pub unsafe extern "C" fn key_init_np(
+    key: i32,
+    destructor: Option<unsafe extern "C" fn(*mut core::ffi::c_void)>,
+) -> i32 {
+    match u32::try_from(key) {
+        Ok(key) => crate::tls::key::Key::from_index(key).init_static(destructor),
+        Err(_) => err::EINVAL,
+    }
+}
+
 /// `int pthread_join(pthread_t, void **)`
 ///
 /// Wrapped for its *result*: the arguments and the handle agree on both
@@ -1221,6 +1239,7 @@ exports::exports! {
         "pthread_rwlockattr_getpshared" => rwlockattr_getpshared,
 
         "pthread_key_create" => key_create,
+        "pthread_key_init_np" => key_init_np,
         "pthread_once" => sync::once_entry,
         "pthread_key_delete" => key_delete,
         "pthread_getspecific" => getspecific,

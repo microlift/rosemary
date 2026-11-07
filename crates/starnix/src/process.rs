@@ -246,6 +246,15 @@ pub fn audit() -> Audit {
     sys::audit()
 }
 
+/// Renames this process as the host's process listings show it.
+///
+/// The host keeps as much of `name` as it has room for: 15 bytes on Linux,
+/// where the process's name is its main thread's, so that thread is renamed
+/// too. Hosts that fix the name at `exec` refuse with `Unsupported`.
+pub fn set_name(name: &std::ffi::CStr) -> io::Result<()> {
+    sys::set_name(name)
+}
+
 /// A file by the host's device and inode for it, as `stat` gives them.
 pub type FileId = (u64, u64);
 
@@ -377,6 +386,27 @@ mod tests {
         // threads that way, outlives any test.
         assert!(threads.iter().any(|thread| has_thread(thread.tid)));
         assert!(!has_thread(i32::MAX));
+    }
+
+    #[test]
+    fn renaming_this_process_renames_its_main_thread() {
+        let main_name = || {
+            threads(me())
+                .unwrap()
+                .into_iter()
+                .find(|thread| thread.tid == me())
+                .map(|thread| thread.name)
+        };
+        let before = main_name();
+        let renamed = set_name(c"starnix-renamed-process");
+        if cfg!(target_os = "linux") {
+            renamed.unwrap();
+            // Linux keeps the first 15 bytes.
+            assert_eq!(main_name().as_deref(), Some("starnix-renamed"));
+            set_name(&std::ffi::CString::new(before.unwrap()).unwrap()).unwrap();
+        } else {
+            assert_eq!(renamed.unwrap_err().kind(), io::ErrorKind::Unsupported);
+        }
     }
 
     #[test]

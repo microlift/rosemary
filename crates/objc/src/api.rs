@@ -1,7 +1,7 @@
 // The C spellings are the interface; renaming them would only hide it.
 #![allow(non_snake_case)]
 
-use std::ffi::{CStr, c_char, c_void};
+use std::ffi::{CStr, CString, c_char, c_void};
 
 use crate::class::{Class, Imp, Ivar, Method};
 use crate::object::Id;
@@ -69,13 +69,13 @@ pub unsafe extern "C" fn sel_isEqual(a: Sel, b: Sel) -> bool {
 }
 
 pub unsafe extern "C" fn objc_getClass(name: *const c_char) -> *mut c_void {
-    as_ptr(unsafe { cstr(name) }.and_then(crate::class::lookup))
+    as_ptr(unsafe { cstr(name) }.and_then(crate::class::look_up))
 }
 
 /// The same as [`objc_getClass`] here.
 ///
-/// Apple's two differ in whether the class handler runs, and this runtime has no
-/// class handler: nothing here loads a class on demand.
+/// Apple's two differ in whether the deprecated class handler runs, and this
+/// runtime has none; both ask the `getClass` hook.
 pub unsafe extern "C" fn objc_lookUpClass(name: *const c_char) -> *mut c_void {
     unsafe { objc_getClass(name) }
 }
@@ -92,7 +92,7 @@ pub unsafe extern "C" fn objc_getRequiredClass(name: *const c_char) -> *mut c_vo
 pub unsafe extern "C" fn objc_getMetaClass(name: *const c_char) -> *mut c_void {
     as_ptr(
         unsafe { cstr(name) }
-            .and_then(crate::class::lookup)
+            .and_then(crate::class::look_up)
             .map(|c| c.metaclass()),
     )
 }
@@ -467,14 +467,232 @@ pub unsafe extern "C" fn class_setWeakIvarLayout(cls: *const c_void, layout: *co
     }
 }
 
-/// FIXME (ACCURACY): classes are not tracked by the image that declared them,
-/// so every class answers null, which Apple reserves for one made at run time.
-pub unsafe extern "C" fn class_getImageName(_cls: *const c_void) -> *const c_char {
+/// The `getImageName` hook chain's answer, which Swift gives for its own
+/// classes; see [`default_get_image_name`] for the rest.
+pub unsafe extern "C" fn class_getImageName(cls: *const c_void) -> *const c_char {
+    if cls.is_null() {
+        return std::ptr::null();
+    }
+    let hook = *GET_IMAGE_NAME_HOOK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let mut name = std::ptr::null();
+    // SAFETY: an installed hook, given a class and a writable `const char *`.
+    match unsafe { hook(cls, &mut name) } {
+        true => name,
+        false => std::ptr::null(),
+    }
+}
+
+/// `Class class_setSuperclass(Class cls, Class newSuper)`
+pub unsafe extern "C" fn class_setSuperclass(
+    cls: *const c_void,
+    new_superclass: *const c_void,
+) -> *mut c_void {
+    let Some(cls) = (unsafe { class(cls) }) else {
+        return std::ptr::null_mut();
+    };
+    // SAFETY: as above. Null makes the class a root.
+    let superclass = unsafe { class(new_superclass) };
+    as_ptr(crate::class::set_superclass(cls, superclass))
+}
+
+// The hooks a Swift runtime installs, so the Objective-C runtime can ask it
+// about Swift classes. Each setter hands back the hook it replaced, which the
+// new one calls for a class it does not know.
+
+/// `BOOL (*objc_hook_getClass)(const char *name, Class *outClass)`
+pub type GetClassHook = unsafe extern "C" fn(*const c_char, *mut *mut c_void) -> bool;
+/// `BOOL (*objc_hook_getImageName)(Class cls, const char **outImageName)`
+pub type GetImageNameHook = unsafe extern "C" fn(*const c_void, *mut *const c_char) -> bool;
+/// `const char *(*objc_hook_lazyClassNamer)(Class cls)`
+pub type LazyClassNamerHook = unsafe extern "C" fn(*const c_void) -> *const c_char;
+
+/// Each chain's first hook, as the one pointer both the chain and
+/// [`crate::default_hooks`] read: a function's address is not unique once
+/// ThinLTO has copied it into another codegen unit.
+pub(crate) static DEFAULT_GET_CLASS_HOOK: GetClassHook = default_get_class;
+pub(crate) static DEFAULT_GET_IMAGE_NAME_HOOK: GetImageNameHook = default_get_image_name;
+pub(crate) static DEFAULT_LAZY_CLASS_NAMER_HOOK: LazyClassNamerHook = default_lazy_class_namer;
+
+static GET_CLASS_HOOK: std::sync::Mutex<GetClassHook> =
+    std::sync::Mutex::new(DEFAULT_GET_CLASS_HOOK);
+static GET_IMAGE_NAME_HOOK: std::sync::Mutex<GetImageNameHook> =
+    std::sync::Mutex::new(DEFAULT_GET_IMAGE_NAME_HOOK);
+static LAZY_CLASS_NAMER_HOOK: std::sync::Mutex<LazyClassNamerHook> =
+    std::sync::Mutex::new(DEFAULT_LAZY_CLASS_NAMER_HOOK);
+/// Whether anything replaced the `getClass` hook, so a lookup that misses
+/// skips the chain when only the default would answer.
+static GET_CLASS_HOOKED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// The class the `getClass` hook chain answers for `name`, as Apple's
+/// `look_up_class` asks after a miss: Swift's hook finds a Swift class by its
+/// mangled or `Module.Class` name. Not asked again for a name this thread is
+/// already asking about, since the hook may look it up itself.
+pub(crate) fn class_from_hook(name: &CStr) -> Option<&'static Class> {
+    thread_local! {
+        static ASKING: std::cell::RefCell<Vec<CString>> = const { std::cell::RefCell::new(Vec::new()) };
+    }
+    if !GET_CLASS_HOOKED.load(std::sync::atomic::Ordering::Acquire)
+        || ASKING.with(|asking| asking.borrow().iter().any(|n| n.as_c_str() == name))
+    {
+        return None;
+    }
+    let hook = *GET_CLASS_HOOK.lock().unwrap_or_else(|e| e.into_inner());
+    ASKING.with(|asking| asking.borrow_mut().push(CString::from(name)));
+    let mut found = std::ptr::null_mut();
+    // SAFETY: an installed hook, given a NUL-terminated name and a writable
+    // `Class`, as its type says.
+    let answered = unsafe { hook(name.as_ptr(), &mut found) };
+    ASKING.with(|asking| asking.borrow_mut().pop());
+    // Swift realizes what it answers before answering, so anything else is
+    // not a class.
+    (answered && crate::class::is_known(found as *const Class))
+        // SAFETY: a class this runtime adopted or built.
+        .then(|| unsafe { &*(found as *const Class) })
+}
+
+/// The first hook in the chain: a class nobody else found does not exist.
+unsafe extern "C" fn default_get_class(name: *const c_char, out: *mut *mut c_void) -> bool {
+    let _ = name;
+    if !out.is_null() {
+        // SAFETY: the caller's writable `Class`.
+        unsafe { *out = std::ptr::null_mut() };
+    }
+    false
+}
+
+/// The first hook in the chain: this runtime's own answer, which is none.
+///
+/// FIXME (ACCURACY): classes are not tracked by the image that declared them.
+unsafe extern "C" fn default_get_image_name(_cls: *const c_void, out: *mut *const c_char) -> bool {
+    if !out.is_null() {
+        // SAFETY: the caller's writable `const char *`.
+        unsafe { *out = std::ptr::null() };
+    }
+    false
+}
+
+/// The name the lazy class namer chain gives `class`, empty if none does.
+pub(crate) fn lazy_class_name(class: &Class) -> CString {
+    let hook = *LAZY_CLASS_NAMER_HOOK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    // SAFETY: an installed hook, given a class.
+    let name = unsafe { hook(std::ptr::from_ref(class).cast()) };
+    match name.is_null() {
+        true => CString::default(),
+        // SAFETY: a namer answers a NUL-terminated name it keeps.
+        false => unsafe { CStr::from_ptr(name) }.into(),
+    }
+}
+
+/// The first hook in the chain: no class here has a lazy name.
+unsafe extern "C" fn default_lazy_class_namer(_cls: *const c_void) -> *const c_char {
     std::ptr::null()
 }
 
+/// Install `new` in `hook`, writing the one it replaces to `out_old` first so
+/// that `new` can already call it.
+///
+/// # Safety
+///
+/// `out_old` is writable.
+unsafe fn set_hook<F: Copy>(hook: &std::sync::Mutex<F>, new: F, out_old: *mut F) {
+    let mut current = hook.lock().unwrap_or_else(|e| e.into_inner());
+    // SAFETY: the caller's obligation.
+    unsafe { out_old.write(*current) };
+    *current = new;
+}
+
+/// `void objc_setHook_getClass(objc_hook_getClass newValue, objc_hook_getClass
+/// *outOldValue)`
+pub unsafe extern "C" fn objc_setHook_getClass(new: GetClassHook, out_old: *mut GetClassHook) {
+    unsafe { set_hook(&GET_CLASS_HOOK, new, out_old) };
+    GET_CLASS_HOOKED.store(true, std::sync::atomic::Ordering::Release);
+}
+
+/// `void objc_setHook_getImageName(objc_hook_getImageName newValue,
+/// objc_hook_getImageName *outOldValue)`
+pub unsafe extern "C" fn objc_setHook_getImageName(
+    new: GetImageNameHook,
+    out_old: *mut GetImageNameHook,
+) {
+    unsafe { set_hook(&GET_IMAGE_NAME_HOOK, new, out_old) }
+}
+
+/// `void objc_setHook_lazyClassNamer(objc_hook_lazyClassNamer newValue,
+/// objc_hook_lazyClassNamer *oldOutValue)`
+pub unsafe extern "C" fn objc_setHook_lazyClassNamer(
+    new: LazyClassNamerHook,
+    out_old: *mut LazyClassNamerHook,
+) {
+    unsafe { set_hook(&LAZY_CLASS_NAMER_HOOK, new, out_old) }
+}
+
+/// How a compiled class reaches [`CompiledClassRealizer`].
+#[derive(Clone, Copy, Debug)]
+pub enum Realize {
+    /// Handed over by `objc_readClassPair` or `_objc_realizeClassFromSwift`,
+    /// whose `previously` this is.
+    HandedOver { previously: *mut c_void },
+    /// Met as the `isa` of `object` (null when not met through an object) and
+    /// not a class this runtime has. Asked of anything an object's first word
+    /// holds, so a realizer declines quietly what is not a compiled class
+    /// waiting; a metaclass is realized as `object`, its class.
+    FirstTouch { object: *mut c_void },
+}
+
+/// Adopts a compiled class pair this runtime does not have yet - one Swift
+/// built or finished - and answers the class, or null if it could not be. See
+/// [`set_compiled_class_realizer`].
+pub type CompiledClassRealizer = fn(cls: *mut c_void, how: Realize) -> *mut c_void;
+
+static COMPILED_CLASS_REALIZER: std::sync::OnceLock<CompiledClassRealizer> =
+    std::sync::OnceLock::new();
+
+/// Install what [`objc_readClassPair`] and [`_objc_realizeClassFromSwift`]
+/// call. The embedder's: it is the one that can read the class's methods out
+/// of the image that defines them and make them callable. Only the first
+/// install takes.
+pub fn set_compiled_class_realizer(realizer: CompiledClassRealizer) {
+    COMPILED_CLASS_REALIZER.get_or_init(|| realizer);
+}
+
+pub(crate) fn realize_compiled_class(cls: *mut c_void, how: Realize) -> *mut c_void {
+    if cls.is_null() || crate::class::is_known(cls as *const Class) {
+        return cls;
+    }
+    match COMPILED_CLASS_REALIZER.get() {
+        Some(realize) => realize(cls, how),
+        None => std::ptr::null_mut(),
+    }
+}
+
+/// `Class _objc_realizeClassFromSwift(Class cls, void *previously)`: Swift
+/// asks the runtime to adopt a class it has just finished, or one it built and
+/// moved from `previously`. A class already adopted is answered as it is.
+pub unsafe extern "C" fn _objc_realizeClassFromSwift(
+    cls: *mut c_void,
+    previously: *mut c_void,
+) -> *mut c_void {
+    realize_compiled_class(cls, Realize::HandedOver { previously })
+}
+
+/// `Class objc_readClassPair(Class cls, const struct objc_image_info *info)`:
+/// adopt a class pair laid out as a compiler would, which is how Swift hands
+/// over a generic class it has instantiated.
+pub unsafe extern "C" fn objc_readClassPair(cls: *mut c_void, _info: *const c_void) -> *mut c_void {
+    realize_compiled_class(
+        cls,
+        Realize::HandedOver {
+            previously: std::ptr::null_mut(),
+        },
+    )
+}
+
 /// FIXME (ACCURACY): no image is listed, for the reason
-/// [`class_getImageName`] gives.
+/// [`default_get_image_name`] gives.
 pub unsafe extern "C" fn objc_copyImageNames(out_count: *mut u32) -> *mut *const c_char {
     unsafe { copied_handles(Vec::new(), out_count) }.cast()
 }
@@ -1045,6 +1263,12 @@ pub unsafe extern "C" fn objc_autorelease(object: Id) -> Id {
     crate::arc::autorelease(object)
 }
 
+/// `id _objc_rootAutorelease(id)`: what `-[NSObject autorelease]` does, for a
+/// root class of another runtime's that implements its own. Never sends.
+pub unsafe extern "C" fn _objc_rootAutorelease(object: Id) -> Id {
+    crate::arc::autorelease(object)
+}
+
 pub unsafe extern "C" fn objc_autoreleasePoolPush() -> *mut c_void {
     crate::arc::pool_push()
 }
@@ -1578,5 +1802,137 @@ mod introspection {
             assert!(!protocol_conformsToProtocol(base_ptr, derived_ptr));
             assert!(!protocol_isEqual(derived_ptr, base_ptr));
         }
+    }
+}
+
+#[cfg(test)]
+mod swift_hooks {
+    use super::*;
+    use std::sync::OnceLock;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    static PREVIOUS_GET_CLASS: OnceLock<GetClassHook> = OnceLock::new();
+    static PREVIOUS_IMAGE_NAME: OnceLock<GetImageNameHook> = OnceLock::new();
+    static RECURSIVE_ASKS: AtomicUsize = AtomicUsize::new(0);
+    /// Not a class: what a broken hook might hand back.
+    static NOT_A_CLASS: [usize; 5] = [0; 5];
+
+    /// Answers a few `Module.Class` names the way Swift's hook does, passing
+    /// every other name down the chain.
+    unsafe extern "C" fn get_class(name: *const c_char, out: *mut *mut c_void) -> bool {
+        // SAFETY: the runtime passes a NUL-terminated name.
+        let answer = match unsafe { CStr::from_ptr(name) }.to_bytes() {
+            b"RosemaryHook.Found" => crate::class::lookup(c"NSObject").map(crate::class::ptr),
+            b"RosemaryHook.NotAClass" => Some(NOT_A_CLASS.as_ptr() as *mut Class),
+            b"RosemaryHook.Recursive" => {
+                RECURSIVE_ASKS.fetch_add(1, Ordering::AcqRel);
+                // SAFETY: the same name, which the runtime must not ask about again.
+                let again = unsafe { objc_getClass(name) };
+                assert!(again.is_null());
+                None
+            }
+            _ => return unsafe { PREVIOUS_GET_CLASS.get().unwrap()(name, out) },
+        };
+        // SAFETY: the caller's writable `Class`.
+        unsafe { *out = answer.map_or(std::ptr::null_mut(), |c| c.cast()) };
+        answer.is_some()
+    }
+
+    unsafe extern "C" fn image_name(cls: *const c_void, out: *mut *const c_char) -> bool {
+        let nsobject = crate::class::lookup(c"NSObject").map(crate::class::ptr);
+        if nsobject.is_some_and(|n| n as *const c_void == cls) {
+            // SAFETY: the caller's writable `const char *`.
+            unsafe { *out = c"/usr/lib/libobjc.A.dylib".as_ptr() };
+            return true;
+        }
+        unsafe { PREVIOUS_IMAGE_NAME.get().unwrap()(cls, out) }
+    }
+
+    fn install() {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        crate::bootstrap();
+        ONCE.call_once(|| unsafe {
+            let mut old_class: GetClassHook = default_get_class;
+            objc_setHook_getClass(get_class, &mut old_class);
+            PREVIOUS_GET_CLASS.set(old_class).ok();
+            let mut old_image: GetImageNameHook = default_get_image_name;
+            objc_setHook_getImageName(image_name, &mut old_image);
+            PREVIOUS_IMAGE_NAME.set(old_image).ok();
+        });
+    }
+
+    #[test]
+    fn a_lookup_miss_is_answered_by_the_get_class_hook() {
+        install();
+        let nsobject = crate::class::lookup(c"NSObject")
+            .map(crate::class::ptr)
+            .unwrap();
+        // SAFETY: NUL-terminated literals.
+        unsafe {
+            assert_eq!(
+                objc_getClass(c"RosemaryHook.Found".as_ptr()),
+                nsobject.cast()
+            );
+            assert_eq!(
+                objc_lookUpClass(c"RosemaryHook.Found".as_ptr()),
+                nsobject.cast()
+            );
+            assert!(objc_getClass(c"RosemaryHook.Missing".as_ptr()).is_null());
+        }
+    }
+
+    #[test]
+    fn a_hook_answer_that_is_not_a_class_is_not_returned() {
+        install();
+        // SAFETY: a NUL-terminated literal.
+        assert!(unsafe { objc_getClass(c"RosemaryHook.NotAClass".as_ptr()) }.is_null());
+    }
+
+    #[test]
+    fn a_hook_looking_up_its_own_name_is_not_asked_again() {
+        install();
+        // SAFETY: a NUL-terminated literal.
+        assert!(unsafe { objc_getClass(c"RosemaryHook.Recursive".as_ptr()) }.is_null());
+        assert_eq!(RECURSIVE_ASKS.load(Ordering::Acquire), 1);
+    }
+
+    static LAZILY_NAMED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    static PREVIOUS_NAMER: OnceLock<LazyClassNamerHook> = OnceLock::new();
+
+    unsafe extern "C" fn namer(cls: *const c_void) -> *const c_char {
+        if cls as usize == LAZILY_NAMED.load(Ordering::Acquire) {
+            return c"RosemaryLazilyNamed".as_ptr();
+        }
+        unsafe { PREVIOUS_NAMER.get().unwrap()(cls) }
+    }
+
+    #[test]
+    fn a_class_without_a_name_is_named_by_the_lazy_namer() {
+        install();
+        let nsobject = crate::class::lookup(c"NSObject");
+        let class = crate::class::allocate_pair(nsobject, c"", 0).expect("a nameless pair");
+        crate::class::register_pair(class);
+        LAZILY_NAMED.store(crate::class::ptr(class) as usize, Ordering::Release);
+        unsafe {
+            let mut old: LazyClassNamerHook = default_lazy_class_namer;
+            objc_setHook_lazyClassNamer(namer, &mut old);
+            PREVIOUS_NAMER.set(old).ok();
+        }
+        // SAFETY: a registered class.
+        let name = unsafe { CStr::from_ptr(class_getName(crate::class::ptr(class).cast())) };
+        assert_eq!(name, c"RosemaryLazilyNamed");
+        // Found by its address only, as Apple's is.
+        assert!(crate::class::lookup(c"RosemaryLazilyNamed").is_none());
+    }
+
+    #[test]
+    fn class_get_image_name_is_the_hooks_answer() {
+        install();
+        let nsobject = crate::class::lookup(c"NSObject")
+            .map(crate::class::ptr)
+            .unwrap();
+        // SAFETY: a registered class.
+        let name = unsafe { class_getImageName(nsobject.cast()) };
+        assert_eq!(unsafe { CStr::from_ptr(name) }, c"/usr/lib/libobjc.A.dylib");
     }
 }

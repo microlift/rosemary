@@ -10,7 +10,7 @@
 //! all answers `None` for it.
 //!
 //! * [`process`] - another process's record, usage and threads, and this
-//!   process's own descriptors, mappings and audit ids.
+//!   process's own descriptors, mappings, audit ids and name.
 //! * [`system`] - the machine: memory, CPU ticks, cores, the CPU's name.
 //! * [`socket`] - who is on the other end of a Unix socket.
 //! * [`net`] - network interfaces, their link types, and the route out.

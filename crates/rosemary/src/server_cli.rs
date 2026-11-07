@@ -172,6 +172,9 @@ pub fn command(mut args: impl Iterator<Item = OsString>) -> ExitCode {
         directory,
         linger: linger(),
     };
+    if let Err(e) = starnix::process::set_name(c"Rosemary Server") {
+        eprintln!("could not set the process server name: {e}");
+    }
     match server::daemon::run(&options) {
         Ok(server::daemon::Outcome::Finished) => ExitCode::SUCCESS,
         // Somebody else won the race to start one, which is what was wanted.

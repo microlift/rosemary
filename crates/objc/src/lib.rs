@@ -55,6 +55,7 @@ exports::exports! {
         "objc_disposeClassPair" => api::objc_disposeClassPair,
         "class_getName" => api::class_getName,
         "class_getSuperclass" => api::class_getSuperclass,
+        "class_setSuperclass" => api::class_setSuperclass,
         "class_isMetaClass" => api::class_isMetaClass,
         "class_getInstanceSize" => api::class_getInstanceSize,
         "class_addMethod" => api::class_addMethod,
@@ -138,6 +139,12 @@ exports::exports! {
         "objc_retain" => api::objc_retain,
         "objc_release" => api::objc_release,
         "objc_autorelease" => api::objc_autorelease,
+        "_objc_rootAutorelease" => api::_objc_rootAutorelease,
+        "objc_setHook_getClass" => api::objc_setHook_getClass,
+        "objc_setHook_getImageName" => api::objc_setHook_getImageName,
+        "objc_setHook_lazyClassNamer" => api::objc_setHook_lazyClassNamer,
+        "_objc_realizeClassFromSwift" => api::_objc_realizeClassFromSwift,
+        "objc_readClassPair" => api::objc_readClassPair,
         "objc_autoreleasePoolPush" => api::objc_autoreleasePoolPush,
         "objc_autoreleasePoolPop" => api::objc_autoreleasePoolPop,
         "objc_autoreleaseReturnValue" => api::objc_autoreleaseReturnValue,
@@ -228,6 +235,26 @@ static EMPTY_CACHE: ObjcCache = ObjcCache {
 ///
 /// One, and it is the one the system's libobjc owns too.
 pub const ROOT_CLASSES: &[&str] = &["NSObject"];
+
+/// The hooks each `objc_setHook_*` chain starts with, by the private name a
+/// guest that is handed one as the hook it replaced calls it through. Two may
+/// share an address, folded as identical code; their signatures agree.
+pub fn default_hooks() -> [(&'static str, u64); 3] {
+    [
+        (
+            "rosemary_objc_default_getClass_hook",
+            api::DEFAULT_GET_CLASS_HOOK as *const () as u64,
+        ),
+        (
+            "rosemary_objc_default_getImageName_hook",
+            api::DEFAULT_GET_IMAGE_NAME_HOOK as *const () as u64,
+        ),
+        (
+            "rosemary_objc_default_lazyClassNamer_hook",
+            api::DEFAULT_LAZY_CLASS_NAMER_HOOK as *const () as u64,
+        ),
+    ]
+}
 
 /// The class objects this runtime exports as *data*.
 ///

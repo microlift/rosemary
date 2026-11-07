@@ -266,6 +266,12 @@ pub fn audit() -> Audit {
     Audit::default()
 }
 
+// `p_comm` is copied from the executable at `exec` and nothing changes it
+// after; `setproctitle` rewrites the arguments, not the name.
+pub fn set_name(_name: &CStr) -> io::Result<()> {
+    Err(io::ErrorKind::Unsupported.into())
+}
+
 pub fn memory() -> Memory {
     let pages = |name: &CStr| sysctl::by_name::<u32>(name).unwrap_or(0) as u64 * page_size();
     Memory {

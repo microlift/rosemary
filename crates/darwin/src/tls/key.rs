@@ -27,6 +27,10 @@ pub type Destructor = unsafe extern "C" fn(*mut c_void);
 /// slots and the static keys frameworks claim by number.
 pub const FIRST_DYNAMIC: u32 = 256;
 
+/// The first static key, `__TSD_RESERVED_MAX + 1`: libpthread's own slots are
+/// below it.
+pub const FIRST_STATIC: u32 = 10;
+
 /// One past the last key: `FIRST_DYNAMIC + PTHREAD_KEYS_MAX`.
 pub const END: u32 = 768;
 
@@ -66,6 +70,12 @@ impl Key {
         self.0
     }
 
+    /// `pthread_key_init_np`: give a static key, one a framework claims by
+    /// number, its destructor.
+    pub fn init_static(self, destructor: Option<Destructor>) -> i32 {
+        imp::init_static(self.0, destructor)
+    }
+
     /// Give the key back. Threads' values for it are not destructed.
     pub fn delete(self) -> i32 {
         imp::delete(self.0)
@@ -98,6 +108,23 @@ mod imp {
             0 => Ok(key as u32),
             rc => Err(err::from_host(rc)),
         }
+    }
+
+    #[cfg(target_os = "macos")]
+    pub fn init_static(key: u32, destructor: Option<Destructor>) -> i32 {
+        unsafe extern "C" {
+            fn pthread_key_init_np(key: libc::c_int, destructor: Option<Destructor>)
+            -> libc::c_int;
+        }
+        // SAFETY: the host validates the key; the destructor is the caller's.
+        unsafe { pthread_key_init_np(key as libc::c_int, destructor) }
+    }
+
+    /// No static key here can be read off a thread pointer, which is the only
+    /// reason a framework claims one by number.
+    #[cfg(not(target_os = "macos"))]
+    pub fn init_static(_key: u32, _destructor: Option<Destructor>) -> i32 {
+        err::ENOTSUP
     }
 
     pub fn delete(key: u32) -> i32 {
@@ -136,9 +163,29 @@ mod imp {
     static KEYS: [AtomicUsize; (END - FIRST_DYNAMIC) as usize] =
         [const { AtomicUsize::new(FREE) }; (END - FIRST_DYNAMIC) as usize];
 
+    /// The static keys' destructors, in the same encoding. A static key is
+    /// never held or freed: it exists by number.
+    static STATIC_KEYS: [AtomicUsize; (FIRST_DYNAMIC - FIRST_STATIC) as usize] =
+        [const { AtomicUsize::new(FREE) }; (FIRST_DYNAMIC - FIRST_STATIC) as usize];
+
     fn word(key: u32) -> Option<&'static AtomicUsize> {
         key.checked_sub(FIRST_DYNAMIC)
             .and_then(|i| KEYS.get(i as usize))
+    }
+
+    fn static_word(key: u32) -> Option<&'static AtomicUsize> {
+        key.checked_sub(FIRST_STATIC)
+            .and_then(|i| STATIC_KEYS.get(i as usize))
+    }
+
+    pub fn init_static(key: u32, destructor: Option<Destructor>) -> i32 {
+        match static_word(key) {
+            Some(w) => {
+                w.store(destructor.map_or(FREE, |d| d as usize), Ordering::Release);
+                0
+            }
+            None => err::EINVAL,
+        }
     }
 
     pub fn create(destructor: Option<Destructor>) -> Result<u32, i32> {
@@ -194,16 +241,32 @@ mod imp {
     ///
     /// In key order, each value cleared before its destructor sees it, and again
     /// for as many passes as a destructor keeps setting values - up to
-    /// [`DESTRUCTOR_ITERATIONS`].
+    /// [`DESTRUCTOR_ITERATIONS`]. The dynamic keys go first, then the static
+    /// ones, so a framework's static state outlives what the program built on it.
     ///
     /// # Safety
     ///
     /// `slots` is the calling thread's own array, installed as its
     /// [`crate::tls::tsd_base`] for the duration.
     pub(crate) unsafe fn run_destructors(slots: *mut u64) {
+        // SAFETY: the caller's guarantee, passed on.
+        unsafe {
+            run_pass(slots, FIRST_DYNAMIC..END, word);
+            run_pass(slots, FIRST_STATIC..FIRST_DYNAMIC, static_word);
+        }
+    }
+
+    /// # Safety
+    ///
+    /// As [`run_destructors`].
+    unsafe fn run_pass(
+        slots: *mut u64,
+        keys: core::ops::Range<u32>,
+        word: fn(u32) -> Option<&'static AtomicUsize>,
+    ) {
         for _ in 0..DESTRUCTOR_ITERATIONS {
             let mut ran = false;
-            for key in FIRST_DYNAMIC..END {
+            for key in keys.clone() {
                 let Some(w) = word(key) else { continue };
                 let destructor = w.load(Ordering::Acquire);
                 if destructor == FREE || destructor == HELD {
@@ -323,6 +386,32 @@ mod tests {
         .unwrap();
         assert_eq!(CALLS.load(Ordering::SeqCst), 2);
         key.delete();
+    }
+
+    #[test]
+    #[cfg(all(
+        any(target_os = "linux", target_os = "freebsd"),
+        target_arch = "x86_64"
+    ))]
+    fn a_static_key_destructor_runs_at_thread_exit() {
+        static SEEN: AtomicUsize = AtomicUsize::new(0);
+        unsafe extern "C" fn record(value: *mut c_void) {
+            SEEN.fetch_add(value as usize, Ordering::SeqCst);
+        }
+        // Swift's first framework key, `__PTK_FRAMEWORK_SWIFT_KEY0`.
+        let key = Key::from_index(100);
+        assert_eq!(key.init_static(Some(record)), 0);
+        std::thread::spawn(move || {
+            key.set(5 as *mut c_void);
+        })
+        .join()
+        .unwrap();
+        assert_eq!(SEEN.load(Ordering::SeqCst), 5);
+        assert_eq!(key.init_static(None), 0);
+        assert_eq!(
+            Key::from_index(FIRST_DYNAMIC).init_static(None),
+            err::EINVAL
+        );
     }
 
     #[test]
