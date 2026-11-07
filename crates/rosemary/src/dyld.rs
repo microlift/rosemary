@@ -2606,6 +2606,51 @@ pub(crate) mod entry {
         super::with_guest_image_at(va, |_, _, path| super::path_cstr(path)).unwrap_or(0)
     }
 
+    // The shared cache's half of dyld's private interface. There is no shared
+    // cache: every image is loaded from its own file.
+
+    /// `bool dyld_shared_cache_some_image_overridden(void)`
+    pub extern "C" fn dyld_shared_cache_some_image_overridden() -> bool {
+        false
+    }
+
+    /// `const void *_dyld_get_shared_cache_range(size_t *length)`
+    ///
+    /// # Safety
+    ///
+    /// `length` is null or writable.
+    pub unsafe extern "C" fn dyld_get_shared_cache_range(length: *mut u64) -> u64 {
+        if !length.is_null() {
+            // SAFETY: the caller's writable word.
+            unsafe { length.write_unaligned(0) };
+        }
+        0
+    }
+
+    /// `bool _dyld_is_preoptimized_objc_image_loaded(uint16_t imageID)`: an
+    /// image ID numbers an image in the shared cache's Objective-C tables.
+    pub extern "C" fn dyld_is_preoptimized_objc_image_loaded(_image: u16) -> bool {
+        false
+    }
+
+    /// `const void *_dyld_get_swift_prespecialized_data(void)`: the shared
+    /// cache's table of prebuilt generic metadata.
+    pub extern "C" fn dyld_get_swift_prespecialized_data() -> u64 {
+        0
+    }
+
+    /// `const void *_dyld_find_pointer_hash_table_entry(const void *table,
+    /// const void *key1, size_t restKeysCount, const void **restKeys)`: a
+    /// lookup in a shared cache table, which nothing here can have handed out.
+    pub extern "C" fn dyld_find_pointer_hash_table_entry(
+        _table: u64,
+        _key: u64,
+        _rest_count: u64,
+        _rest: u64,
+    ) -> u64 {
+        0
+    }
+
     /// `void _dyld_register_func_for_add_image(void (*)(const struct mach_header *,
     /// intptr_t))`
     ///
@@ -3154,7 +3199,7 @@ pub(crate) mod entry {
 }
 
 /// Every name [`provider`] defines, and the function it binds to.
-fn entries() -> [(&'static str, *const ()); 26] {
+fn entries() -> [(&'static str, *const ()); 31] {
     [
         ("_NSAddImage", entry::ns_add_image as *const ()),
         (
@@ -3203,6 +3248,26 @@ fn entries() -> [(&'static str, *const ()); 26] {
         (
             "_dyld_image_path_containing_address",
             entry::dyld_image_path_containing_address as *const (),
+        ),
+        (
+            "_dyld_shared_cache_some_image_overridden",
+            entry::dyld_shared_cache_some_image_overridden as *const (),
+        ),
+        (
+            "__dyld_get_shared_cache_range",
+            entry::dyld_get_shared_cache_range as *const (),
+        ),
+        (
+            "__dyld_is_preoptimized_objc_image_loaded",
+            entry::dyld_is_preoptimized_objc_image_loaded as *const (),
+        ),
+        (
+            "__dyld_get_swift_prespecialized_data",
+            entry::dyld_get_swift_prespecialized_data as *const (),
+        ),
+        (
+            "__dyld_find_pointer_hash_table_entry",
+            entry::dyld_find_pointer_hash_table_entry as *const (),
         ),
         (
             "__dyld_register_func_for_add_image",
