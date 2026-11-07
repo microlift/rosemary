@@ -1,6 +1,7 @@
 use std::ffi::c_void;
 use std::sync::{Arc, Mutex};
 
+use crate::aac::{self, AacDecoder};
 use crate::render::{AudioBufferList, MAX_BUFFERS};
 use crate::status::{PARAM_ERROR, SUCCESS};
 use crate::stream::{Format, sdl_spec};
@@ -29,13 +30,42 @@ mod property {
     pub const CALCULATE_OUTPUT_BUFFER_SIZE: u32 = fourcc(b"cobs");
     /// `kAudioConverterSampleRateConverterQuality`, which SDL has no dial for.
     pub const SAMPLE_RATE_CONVERTER_QUALITY: u32 = fourcc(b"srcq");
+    /// `kAudioConverterPropertyMaximumInputPacketSize`.
+    pub const MAXIMUM_INPUT_PACKET_SIZE: u32 = fourcc(b"xips");
+    /// `kAudioConverterDecompressionMagicCookie`.
+    pub const DECOMPRESSION_MAGIC_COOKIE: u32 = fourcc(b"dmgc");
 }
+
+/// `AudioStreamPacketDescription`: where one compressed packet falls inside
+/// the buffer an `AudioConverterComplexInputDataProc` returned.
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct PacketDescription {
+    start_offset: i64,
+    #[allow(dead_code)]
+    variable_frames_in_packet: u32,
+    data_byte_size: u32,
+}
+
+const _: () = assert!(size_of::<PacketDescription>() == 16);
 
 struct Converter {
     source: Format,
     destination: Format,
-    /// SDL's converting stream, attached to no device.
+    /// SDL's converting stream, attached to no device. For a compressed
+    /// source this starts null: the spec it converts *from* is the AAC
+    /// decoder's own output, not known until something has decoded, so the
+    /// stream is made lazily on the first frame rather than guessed at here.
     stream: sdl3::AudioStream,
+    /// Set for a compressed source; `None` for PCM-to-PCM, which SDL alone
+    /// handles.
+    aac: Option<Box<AacDecoder>>,
+    /// The `(rate, channels)` `stream` now converts from, for a compressed
+    /// source: the decoder's, which can change at a frame boundary.
+    decoded: Option<(u32, u32)>,
+    /// The magic cookie last given through `kAudioConverterDecompressionMagicCookie`,
+    /// kept only so `AudioConverterGetProperty` can hand the same bytes back.
+    cookie: Vec<u8>,
     /// The bytes the input callback last handed over, kept alive until the next
     /// call: Apple's contract lets a caller point `mData` at storage it reuses
     /// only after the *next* invocation, and SDL has already copied by then.
@@ -81,19 +111,57 @@ pub unsafe extern "C" fn AudioConverterNew(
         return PARAM_ERROR;
     }
     let (source, destination) = unsafe { (*source, *destination) };
-    let (Some(from), Some(to)) = (sdl_spec(&source), sdl_spec(&destination)) else {
-        return FORMAT_NOT_SUPPORTED;
+    let converter = if aac::is_aac(source.format_id) {
+        // The destination must still be something SDL can produce; only the
+        // *source* side is decoded through FFmpeg rather than SDL.
+        if sdl_spec(&destination).is_none() {
+            return FORMAT_NOT_SUPPORTED;
+        }
+        let Ok(mut decoder) = AacDecoder::new() else {
+            return FORMAT_NOT_SUPPORTED;
+        };
+        // Apple's decoder starts from the description alone, and Roblox never
+        // sets a magic cookie on its converter: open from the description
+        // now, and let a cookie set later reopen it. A description that does
+        // not say enough is left for a cookie to complete.
+        if let Some(asc) = aac::asc_for_description(
+            source.format_id,
+            source.sample_rate,
+            source.channels_per_frame,
+            source.frames_per_packet,
+        ) && decoder.set_extradata(&asc).is_err()
+        {
+            return FORMAT_NOT_SUPPORTED;
+        }
+        Converter {
+            source,
+            destination,
+            stream: std::ptr::null_mut(),
+            aac: Some(Box::new(decoder)),
+            decoded: None,
+            cookie: Vec::new(),
+            held: Vec::new(),
+            scratch: Vec::new(),
+        }
+    } else {
+        let (Some(from), Some(to)) = (sdl_spec(&source), sdl_spec(&destination)) else {
+            return FORMAT_NOT_SUPPORTED;
+        };
+        let Some(stream) = sdl3::audio::create_converter(from, to) else {
+            return UNSPECIFIED;
+        };
+        Converter {
+            source,
+            destination,
+            stream,
+            aac: None,
+            decoded: None,
+            cookie: Vec::new(),
+            held: Vec::new(),
+            scratch: Vec::new(),
+        }
     };
-    let Some(stream) = sdl3::audio::create_converter(from, to) else {
-        return UNSPECIFIED;
-    };
-    let converter = Arc::new(Mutex::new(Converter {
-        source,
-        destination,
-        stream,
-        held: Vec::new(),
-        scratch: Vec::new(),
-    }));
+    let converter = Arc::new(Mutex::new(converter));
     let handle = Arc::as_ptr(&converter) as *mut c_void;
     CONVERTERS
         .lock()
@@ -107,9 +175,10 @@ pub unsafe extern "C" fn AudioConverterNew(
 /// *, AudioConverterRef *)`
 ///
 /// The class list names *which codec implementation* to use - hardware or
-/// software - and there is one converter here either way, so it is ignored
-/// rather than refused: a caller asking for the software AAC decoder and
-/// getting linear PCM conversion is refused by the formats, one line down.
+/// software - and there is one implementation here either way (FFmpeg's
+/// software `aac` decoder, for a compressed source), so it is ignored
+/// rather than refused: a format this cannot convert at all is refused by
+/// [`AudioConverterNew`] on its own account, one line down.
 ///
 /// # Safety
 ///
@@ -152,8 +221,13 @@ pub unsafe extern "C" fn AudioConverterReset(handle: *mut c_void) -> i32 {
         return PARAM_ERROR;
     };
     let mut converter = converter.lock().unwrap_or_else(|e| e.into_inner());
-    // SAFETY: a stream this crate made.
-    unsafe { sdl3::audio::clear(converter.stream) };
+    if let Some(aac) = converter.aac.as_deref_mut() {
+        aac.flush();
+    }
+    if !converter.stream.is_null() {
+        // SAFETY: a stream this crate made.
+        unsafe { sdl3::audio::clear(converter.stream) };
+    }
     converter.held.clear();
     SUCCESS
 }
@@ -165,11 +239,26 @@ fn property(converter: &Converter, id: u32) -> Option<Vec<u8>> {
     Some(match id {
         property::CURRENT_INPUT_FORMAT => bytes(as_bytes(&converter.source)),
         property::CURRENT_OUTPUT_FORMAT => bytes(as_bytes(&converter.destination)),
-        // One packet is one frame for linear PCM, which is the only thing this
-        // converter takes.
+        // One packet is one frame for linear PCM, which is the only thing a
+        // PCM-to-PCM converter's destination ever is.
         property::MAXIMUM_OUTPUT_PACKET_SIZE => {
             bytes(as_bytes(&converter.destination.bytes_per_packet))
         }
+        // For a compressed source, ISO/IEC 14496-3's bound on one AAC raw
+        // data block: 6144 bits (768 bytes) per channel. PCM has no larger
+        // packet than one frame either way, so the same answer serves both.
+        property::MAXIMUM_INPUT_PACKET_SIZE => {
+            let channels = converter.source.channels_per_frame.max(1);
+            let size = match converter.aac.is_some() {
+                true => 768 * channels,
+                false => converter.source.bytes_per_packet,
+            };
+            bytes(as_bytes(&size))
+        }
+        // Readable (as empty) as soon as the converter exists, not only
+        // after a cookie has been set: a caller may probe the property
+        // before deciding whether it has one to give.
+        property::DECOMPRESSION_MAGIC_COOKIE if converter.aac.is_some() => converter.cookie.clone(),
         _ => return None,
     })
 }
@@ -236,9 +325,13 @@ pub unsafe extern "C" fn AudioConverterGetPropertyInfo(
         unsafe { *size = found.as_ref().map_or(0, |b| b.len() as u32) };
     }
     if !writable.is_null() {
-        // Nothing here is settable after the converter is made: the formats
-        // were fixed when SDL's stream was created.
-        unsafe { *writable = 0 };
+        // Nothing here is settable after the converter is made except the
+        // decompression magic cookie of a compressed source, which Apple's
+        // own converter lets a caller replace mid-stream too.
+        unsafe {
+            *writable =
+                u8::from(id == property::DECOMPRESSION_MAGIC_COOKIE && converter.aac.is_some())
+        };
     }
     match found.is_some() {
         true => SUCCESS,
@@ -251,22 +344,46 @@ pub unsafe extern "C" fn AudioConverterGetPropertyInfo(
 ///
 /// The quality dials are accepted and dropped, because SDL's resampler has one
 /// quality and a caller that asked for a better one is not owed an error - it
-/// gets conversion either way. Everything else is refused rather than silently
-/// ignored: a channel map or a priming setting that did nothing would change
-/// what comes out.
+/// gets conversion either way. The decompression magic cookie is the one
+/// property that actually changes what this converter can do (it is what
+/// lets a compressed source decode at all). Everything else is refused
+/// rather than silently ignored: a channel map or a priming setting that
+/// did nothing would change what comes out.
+///
+/// # Safety
+///
+/// `data` must be null or readable for `size` bytes.
 pub unsafe extern "C" fn AudioConverterSetProperty(
     handle: *mut c_void,
     id: u32,
-    _size: u32,
-    _data: *const c_void,
+    size: u32,
+    data: *const c_void,
 ) -> i32 {
-    if converter_for(handle).is_none() {
+    let Some(converter) = converter_for(handle) else {
         return PARAM_ERROR;
-    }
+    };
     match id {
         property::SAMPLE_RATE_CONVERTER_QUALITY
         | property::CALCULATE_INPUT_BUFFER_SIZE
         | property::CALCULATE_OUTPUT_BUFFER_SIZE => SUCCESS,
+        property::DECOMPRESSION_MAGIC_COOKIE => {
+            let mut converter = converter.lock().unwrap_or_else(|e| e.into_inner());
+            let Some(aac) = converter.aac.as_deref_mut() else {
+                return PROPERTY_NOT_SUPPORTED;
+            };
+            if data.is_null() || size == 0 {
+                return PARAM_ERROR;
+            }
+            // SAFETY: the caller says `data` is readable for `size` bytes.
+            let cookie = unsafe { std::slice::from_raw_parts(data.cast::<u8>(), size as usize) };
+            match aac.set_extradata(cookie) {
+                Ok(()) => {
+                    converter.cookie = cookie.to_vec();
+                    SUCCESS
+                }
+                Err(_) => FORMAT_NOT_SUPPORTED,
+            }
+        }
         _ => PROPERTY_NOT_SUPPORTED,
     }
 }
@@ -354,10 +471,21 @@ pub unsafe extern "C" fn AudioConverterFillComplexBuffer(
 
     let mut produced = 0usize;
     while produced < converter.scratch.len() {
-        // SAFETY: a stream this crate made.
-        if unsafe { sdl3::audio::available(converter.stream) } == 0
-            && !feed(&mut converter, input, input_data)
-        {
+        // A compressed source has no stream yet until the first frame comes
+        // out of FFmpeg and says what spec it converts from - `feed` makes
+        // it then. Until that happens `sdl3::audio::available` has nothing
+        // live to ask.
+        let available = match converter.stream.is_null() {
+            true => 0,
+            // SAFETY: a stream this crate made.
+            false => unsafe { sdl3::audio::available(converter.stream) },
+        };
+        if available == 0 && !feed(&mut converter, input, input_data) {
+            break;
+        }
+        if converter.stream.is_null() {
+            // Nothing has decoded yet and the input is exhausted: there is
+            // no stream to pull from and nothing more `feed` can do.
             break;
         }
         let taken =
@@ -419,12 +547,178 @@ fn unweave(from: &[u8], into: &mut [u8], plane: usize, plane_frame: usize, strea
     }
 }
 
-/// Ask the caller's input procedure for more, and give it to SDL.
+/// Ask the caller's input procedure for more, and give it to SDL - directly,
+/// for a PCM source, or through FFmpeg first for a compressed one.
 ///
-/// `false` when it supplies nothing, which is end of stream: SDL is flushed so
-/// the resampler hands back its tail rather than holding samples for input that
-/// is never coming.
+/// `false` when the source has nothing more, which is end of stream.
 fn feed(converter: &mut Converter, input: InputProc, input_data: *mut c_void) -> bool {
+    match converter.aac.is_some() {
+        true => feed_aac(converter, input, input_data),
+        false => feed_pcm(converter, input, input_data),
+    }
+}
+
+/// Points the SDL stream at the AAC decoder's output for one frame (always
+/// interleaved `f32`, at the frame's rate and channel count): made on the
+/// first frame, and re-pointed when a later frame differs, which SDL applies
+/// to data put from then on only. `false` for a spec SDL cannot convert.
+fn ensure_decoded_stream(converter: &mut Converter, rate: u32, channels: u32) -> bool {
+    if converter.decoded == Some((rate, channels)) && !converter.stream.is_null() {
+        return true;
+    }
+    let (Ok(freq), Ok(channels_i32)) = (i32::try_from(rate), i32::try_from(channels)) else {
+        return false;
+    };
+    let from = sdl3::AudioSpec {
+        format: sdl3::audio::format::F32,
+        channels: channels_i32,
+        freq,
+    };
+    let Some(to) = sdl_spec(&converter.destination) else {
+        return false;
+    };
+    let made = match converter.stream.is_null() {
+        true => match sdl3::audio::create_converter(from, to) {
+            Some(stream) => {
+                converter.stream = stream;
+                true
+            }
+            None => false,
+        },
+        // SAFETY: a stream this crate made.
+        false => unsafe { sdl3::audio::set_format(converter.stream, from, to) },
+    };
+    if made {
+        converter.decoded = Some((rate, channels));
+    }
+    made
+}
+
+/// `f32` samples as the native-endian bytes SDL's stream takes.
+fn f32_bytes(samples: &[f32]) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(samples.len() * 4);
+    for sample in samples {
+        bytes.extend_from_slice(&sample.to_ne_bytes());
+    }
+    bytes
+}
+
+/// Moves every frame FFmpeg has ready now into the SDL stream, one frame at
+/// a time so each goes in under its own spec.
+fn drain_decoded(converter: &mut Converter) {
+    loop {
+        let mut samples = Vec::new();
+        let Some(aac) = converter.aac.as_deref_mut() else {
+            return;
+        };
+        let Ok(Some((rate, channels))) = aac.receive_interleaved(&mut samples) else {
+            return;
+        };
+        if !ensure_decoded_stream(converter, rate, channels) {
+            // Dropped, not converted as if it were some other spec.
+            continue;
+        }
+        let bytes = f32_bytes(&samples);
+        // SAFETY: a stream this crate made (or just made, above).
+        unsafe { sdl3::audio::put(converter.stream, &bytes) };
+    }
+}
+
+/// [`feed`] for a compressed source: pulls AAC packets from the caller's
+/// input procedure and decodes each through FFmpeg into the SDL stream
+/// that brings it to the destination format.
+///
+/// `AudioStreamPacketDescription`s are read when the procedure supplies
+/// them, which is how a real CoreAudio caller marks where each packet
+/// starts in a buffer it may have concatenated several into. A procedure
+/// that supplies none is read as one packet, the one shape this can still
+/// make sense of without them.
+///
+/// Each packet is drained before the next is sent: FFmpeg holds only one
+/// unsent packet, and refuses (`EAGAIN`) a third before a receive.
+fn feed_aac(converter: &mut Converter, input: InputProc, input_data: *mut c_void) -> bool {
+    let mut wanted = 32u32;
+    let mut list = AudioBufferList {
+        count: 1,
+        buffers: [crate::render::AudioBuffer {
+            channels: converter.source.channels_per_frame,
+            byte_size: 0,
+            data: std::ptr::null_mut(),
+        }; MAX_BUFFERS],
+    };
+    let mut descriptions: *mut c_void = std::ptr::null_mut();
+    // SAFETY: `input` is a host-callable pointer this runtime was handed for
+    // the guest's procedure, and every structure outlives the call.
+    let status = unsafe {
+        input(
+            input_data,
+            &mut wanted,
+            &mut list,
+            &mut descriptions,
+            input_data,
+        )
+    };
+    if status != SUCCESS {
+        // Apple's contract: an error with no packets is "nothing more for
+        // now", not end of stream - Roblox's procedure answers that way
+        // after every packet. Nothing is flushed, so the resampler's tail
+        // stays queued for the packets still to come.
+        return false;
+    }
+    if list.count == 0 || wanted == 0 || list.buffers[0].data.is_null() {
+        // End of stream: the resampler hands back its tail now.
+        if !converter.stream.is_null() {
+            // SAFETY: a stream this crate made.
+            unsafe { sdl3::audio::flush(converter.stream) };
+        }
+        return false;
+    }
+
+    let buffer = list.buffers[0];
+    // SAFETY: the guest's procedure says this buffer holds `mDataByteSize`
+    // readable bytes.
+    let data =
+        unsafe { std::slice::from_raw_parts(buffer.data.cast::<u8>(), buffer.byte_size as usize) };
+    let packets: &[PacketDescription] = if descriptions.is_null() {
+        &[]
+    } else {
+        // SAFETY: the guest's procedure set this to its own array of
+        // `wanted` descriptions, which it owns until the next call - read
+        // before this one returns, as every other borrow from `list` is.
+        unsafe {
+            std::slice::from_raw_parts(descriptions.cast::<PacketDescription>(), wanted as usize)
+        }
+    };
+    let whole = [PacketDescription {
+        start_offset: 0,
+        variable_frames_in_packet: 0,
+        data_byte_size: buffer.byte_size,
+    }];
+    let packets = match packets {
+        [] => &whole[..],
+        some => some,
+    };
+    for description in packets {
+        let start = usize::try_from(description.start_offset).unwrap_or(usize::MAX);
+        let end = start.saturating_add(description.data_byte_size as usize);
+        let Some(packet) = data.get(start..end) else {
+            // A description outside the buffer it describes: the caller's
+            // data is wrong, and nothing after it can be trusted either.
+            return false;
+        };
+        let Some(aac) = converter.aac.as_deref_mut() else {
+            return false;
+        };
+        // A packet FFmpeg cannot decode is skipped, as a decoder conceals a
+        // damaged access unit; it is not the end of the stream. Drained
+        // either way, so nothing is left in front of the next packet.
+        let _ = aac.send(packet);
+        drain_decoded(converter);
+    }
+    true
+}
+
+fn feed_pcm(converter: &mut Converter, input: InputProc, input_data: *mut c_void) -> bool {
     let mut wanted = 4096u32;
     let mut list = AudioBufferList {
         count: 1,
@@ -510,22 +804,70 @@ mod tests {
         }
     }
 
-    /// A format SDL cannot name is refused at creation rather than accepted and
-    /// then silently producing nothing.
+    /// A compressed format neither SDL nor the AAC path knows is refused at
+    /// creation rather than accepted and then silently producing nothing.
     #[test]
-    fn a_compressed_format_is_refused() {
+    fn an_unrelated_compressed_format_is_refused() {
         let mut handle = std::ptr::null_mut();
-        let aac = Format {
-            format_id: fourcc(b"aac "),
+        let alac = Format {
+            format_id: fourcc(b"alac"),
             ..format(44100.0, 2)
         };
         let pcm = format(48000.0, 2);
         // SAFETY: two live descriptions and a writable slot.
         assert_eq!(
-            unsafe { AudioConverterNew(&aac, &pcm, &mut handle) },
+            unsafe { AudioConverterNew(&alac, &pcm, &mut handle) },
             FORMAT_NOT_SUPPORTED
         );
         assert!(handle.is_null());
+    }
+
+    /// An AAC source still needs a destination this crate can actually
+    /// produce - the FFmpeg decoder only replaces the *source* side of the
+    /// conversion, not SDL's part of it.
+    #[test]
+    fn an_aac_source_still_needs_a_destination_sdl_can_produce() {
+        let mut handle = std::ptr::null_mut();
+        let aac = Format {
+            format_id: fourcc(b"aac "),
+            ..format(44100.0, 2)
+        };
+        let unsupported_destination = Format {
+            format_id: fourcc(b"alac"),
+            ..format(44100.0, 2)
+        };
+        // SAFETY: two live descriptions and a writable slot.
+        assert_eq!(
+            unsafe { AudioConverterNew(&aac, &unsupported_destination, &mut handle) },
+            FORMAT_NOT_SUPPORTED
+        );
+        assert!(handle.is_null());
+    }
+
+    /// With a destination SDL can produce, an AAC source either makes a
+    /// converter (FFmpeg's software `aac` decoder is on this host) or is
+    /// refused exactly as it would have been before this backend existed
+    /// (it is not) - never anything else, and never a handle alongside a
+    /// failing status.
+    #[test]
+    fn an_aac_source_is_accepted_or_refused_outright_never_half_made() {
+        let mut handle = std::ptr::null_mut();
+        let aac = Format {
+            format_id: fourcc(b"aac "),
+            ..format(44100.0, 2)
+        };
+        let pcm = format(44100.0, 2);
+        // SAFETY: two live descriptions and a writable slot.
+        let status = unsafe { AudioConverterNew(&aac, &pcm, &mut handle) };
+        match status {
+            SUCCESS => {
+                assert!(!handle.is_null());
+                // SAFETY: a converter this call just made.
+                assert_eq!(unsafe { AudioConverterDispose(handle) }, SUCCESS);
+            }
+            FORMAT_NOT_SUPPORTED => assert!(handle.is_null(), "no FFmpeg on this host"),
+            other => panic!("unexpected status {other}"),
+        }
     }
 
     /// Two planar channels become one interleaved stream and come back out of
@@ -552,6 +894,91 @@ mod tests {
         let mut half = [b'.'; 8];
         unweave(b"L0R0L1R1", &mut half, 0, 2, 4);
         assert_eq!(&half, b"L0L1....");
+    }
+
+    /// The decompression magic cookie round-trips through Set/Get once an
+    /// AAC converter exists, is reported as settable (unlike everything
+    /// else here) and readable-but-empty before one is given, and is
+    /// refused outright on a PCM-to-PCM converter, which never has one.
+    #[test]
+    fn the_decompression_magic_cookie_round_trips_on_an_aac_converter() {
+        let mut handle = std::ptr::null_mut();
+        let aac = Format {
+            format_id: fourcc(b"aac "),
+            ..format(44100.0, 2)
+        };
+        let pcm = format(44100.0, 2);
+        // SAFETY: two live descriptions and a writable slot.
+        let status = unsafe { AudioConverterNew(&aac, &pcm, &mut handle) };
+        if status != SUCCESS {
+            return; // No FFmpeg on this host; covered by the creation test.
+        }
+        let mut writable = 0u8;
+        let mut size = 0u32;
+        // SAFETY: a converter this call just made, and writable out-params.
+        unsafe {
+            assert_eq!(
+                AudioConverterGetPropertyInfo(
+                    handle,
+                    property::DECOMPRESSION_MAGIC_COOKIE,
+                    &mut size,
+                    &mut writable
+                ),
+                SUCCESS
+            );
+            assert_eq!(size, 0, "nothing set yet");
+            assert_eq!(writable, 1);
+        }
+        let cookie = [0x12u8, 0x10]; // a plain AAC LC AudioSpecificConfig.
+        // SAFETY: as above, and a live cookie buffer.
+        unsafe {
+            assert_eq!(
+                AudioConverterSetProperty(
+                    handle,
+                    property::DECOMPRESSION_MAGIC_COOKIE,
+                    cookie.len() as u32,
+                    cookie.as_ptr().cast(),
+                ),
+                SUCCESS
+            );
+        }
+        let mut back = [0u8; 2];
+        let mut back_size = back.len() as u32;
+        // SAFETY: as above.
+        unsafe {
+            assert_eq!(
+                AudioConverterGetProperty(
+                    handle,
+                    property::DECOMPRESSION_MAGIC_COOKIE,
+                    &mut back_size,
+                    back.as_mut_ptr().cast(),
+                ),
+                SUCCESS
+            );
+        }
+        assert_eq!(back, cookie);
+        // SAFETY: the same converter.
+        unsafe { assert_eq!(AudioConverterDispose(handle), SUCCESS) };
+
+        // A PCM-to-PCM converter never has one.
+        let mut pcm_handle = std::ptr::null_mut();
+        let left = format(44100.0, 2);
+        let right = format(48000.0, 2);
+        // SAFETY: two live descriptions and a writable slot.
+        unsafe { AudioConverterNew(&left, &right, &mut pcm_handle) };
+        assert_eq!(
+            unsafe {
+                AudioConverterSetProperty(
+                    pcm_handle,
+                    property::DECOMPRESSION_MAGIC_COOKIE,
+                    cookie.len() as u32,
+                    cookie.as_ptr().cast(),
+                )
+            },
+            PROPERTY_NOT_SUPPORTED
+        );
+        // SAFETY: the converter just made.
+        unsafe { AudioConverterDispose(pcm_handle) };
     }
 
     /// A handle this crate did not make is a parameter error rather than a
