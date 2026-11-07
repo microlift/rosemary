@@ -1747,6 +1747,8 @@ pub static SIGNATURES: &[FunctionAbi] = &[
     cbsig!([0], "_dyld_register_func_for_remove_image", V, P),
     sig!("_dyld_get_image_name", P, U32),
     sig!("_dyld_find_unwind_sections", BOOL, P, P),
+    // libobjc's, but answered from the image list. See [`crate::dyld::entry`].
+    cbsig!([0], "objc_addLoadImageFunc", V, P),
     // Initializers run inside `NSAddImage`, as inside `dlopen`.
     rsig!("NSAddImage", P, P, U32),
     sig!("NSAddressOfSymbol", P, P),

@@ -1036,6 +1036,11 @@ fn open_with<S: MachSpec + 'static>(
     // Every `_dyld_register_func_for_add_image` callback, before this image's
     // own code runs. See [`announce`].
     announce(leaked.handle, leaked.slide);
+    // And every `objc_addLoadImageFunc` one, which libobjc calls as it maps an
+    // image - before `+load`.
+    for image in &leaked.report.images {
+        announce_objc(image.base);
+    }
 
     // Now the image's own code, in dyld's order.
     if let Some(exec) = exec {
@@ -2137,6 +2142,52 @@ static ADD_IMAGE: Mutex<Vec<u64>> = Mutex::new(Vec::new());
 /// cache of an unloaded image's frames.
 static REMOVE_IMAGE: Mutex<Vec<u64>> = Mutex::new(Vec::new());
 
+/// The `objc_addLoadImageFunc` callbacks, as native-callable addresses.
+static LOAD_IMAGE: Mutex<Vec<u64>> = Mutex::new(Vec::new());
+
+/// Whether the image at `header` has Objective-C metadata, which is what
+/// libobjc keeps an image for and so what its load-image callbacks hear about.
+fn has_objc(header: u64) -> bool {
+    [b"__DATA".as_slice(), b"__DATA_CONST", b"__DATA_DIRTY"]
+        .into_iter()
+        .any(|segment| load_command_in(header, segment, Some(b"__objc_imageinfo")) != 0)
+        || load_command_in(header, b"__OBJC", Some(b"__image_info")) != 0
+}
+
+/// Tell one `objc_func_loadImage` about one image.
+fn notify_objc(thunk: u64, header: u64) {
+    // SAFETY: `thunk` is native code taking a `mach_header *` - the guest's own
+    // function, or a [`crate::thunk`] standing for it.
+    let f: extern "C" fn(u64) = unsafe { std::mem::transmute::<u64, _>(thunk) };
+    f(header);
+}
+
+/// Announce `header` to every load-image callback, if libobjc would.
+fn announce_objc(header: u64) {
+    if header == 0 || !has_objc(header) {
+        return;
+    }
+    let callbacks = LOAD_IMAGE.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    for thunk in callbacks {
+        notify_objc(thunk, header);
+    }
+}
+
+/// The header of every guest image mapped so far: the program, what it was
+/// linked against, and everything `dlopen` mapped since.
+fn every_header() -> Vec<u64> {
+    let mut headers: Vec<u64> = match MAPPED.get() {
+        Some(images) => images.iter().map(|i| i.header).collect(),
+        None => crate::thunk::current()
+            .map(|vm| vm.program.report.images.iter().map(|i| i.base).collect())
+            .unwrap_or_default(),
+    };
+    for image in snapshot() {
+        headers.extend(image.report.images.iter().map(|i| i.base));
+    }
+    headers
+}
+
 /// Tell one callback about one image.
 ///
 /// The two arguments are dyld's: the image's `mach_header` and its slide.
@@ -2681,6 +2732,27 @@ pub(crate) mod entry {
         }
     }
 
+    /// `void objc_addLoadImageFunc(void (*)(const struct mach_header *))`
+    ///
+    /// libobjc's, served here because it is about images: `f` hears about
+    /// every image with Objective-C metadata, those already loaded first.
+    /// Swift finds its type and conformance records this way.
+    pub extern "C" fn objc_add_load_image_func(f: u64) {
+        if f == 0 {
+            return;
+        }
+        // Registered first, as `dyld_register_func_for_add_image` is.
+        super::LOAD_IMAGE
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(f);
+        for header in super::every_header() {
+            if super::has_objc(header) {
+                super::notify_objc(f, header);
+            }
+        }
+    }
+
     /// `void _dyld_register_func_for_remove_image(void (*)(const struct
     /// mach_header *, intptr_t))`. Called for each image `dlclose` unloads.
     pub extern "C" fn dyld_register_func_for_remove_image(f: u64) {
@@ -3199,7 +3271,7 @@ pub(crate) mod entry {
 }
 
 /// Every name [`provider`] defines, and the function it binds to.
-fn entries() -> [(&'static str, *const ()); 31] {
+fn entries() -> [(&'static str, *const ()); 32] {
     [
         ("_NSAddImage", entry::ns_add_image as *const ()),
         (
@@ -3272,6 +3344,10 @@ fn entries() -> [(&'static str, *const ()); 31] {
         (
             "__dyld_register_func_for_add_image",
             entry::dyld_register_func_for_add_image as *const (),
+        ),
+        (
+            "_objc_addLoadImageFunc",
+            entry::objc_add_load_image_func as *const (),
         ),
         (
             "__dyld_register_func_for_remove_image",
