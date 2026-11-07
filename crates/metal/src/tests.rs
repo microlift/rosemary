@@ -395,6 +395,72 @@ fn a_translated_kernel_runs_on_the_gpu() {
     }
 }
 
+/// Research for whether a compute dispatch could safely run on a Vulkan
+/// queue of its own (see `encoder::async_compute_research`): a buffer a
+/// blit encoder has ever touched is never counted eligible again, even
+/// after it is rebound to a compute-only buffer in the same slot, which
+/// must still count the dispatch which bound only that one.
+#[test]
+fn async_compute_eligibility_follows_whether_a_buffer_ever_left_compute() {
+    isolate_metal_fixture!();
+    let Some(device) = gpu_device() else {
+        return;
+    };
+    let library = source_library(device, TEST_KERNEL);
+    // SAFETY: objects this test made, sent the selectors they implement.
+    unsafe {
+        let function = new_function_with_name(
+            library,
+            std::ptr::null(),
+            foundation::string::from_str("clear"),
+        );
+        let mut error = std::ptr::null_mut();
+        let pipeline = new_compute_pipeline(device, std::ptr::null(), function, &mut error);
+        assert!(!pipeline.is_null());
+        let (touched, untouched, scratch) = (
+            new_buffer(device, std::ptr::null(), 16, 0),
+            new_buffer(device, std::ptr::null(), 16, 0),
+            new_buffer(device, std::ptr::null(), 16, 0),
+        );
+        let queue = new_command_queue(device, std::ptr::null());
+
+        // A blit leaves `touched` permanently ineligible.
+        let command = send(queue, "commandBuffer");
+        let blit = send(command, "blitCommandEncoder");
+        copy_buffer(blit, touched, scratch, 16);
+        send_void(blit, "endEncoding");
+        send_void(command, "commit");
+        send_void(command, "waitUntilCompleted");
+
+        let before_ineligible =
+            encoder::TEST_ASYNC_COMPUTE_INELIGIBLE.load(std::sync::atomic::Ordering::Relaxed);
+        let before_eligible =
+            encoder::TEST_ASYNC_COMPUTE_ELIGIBLE.load(std::sync::atomic::Ordering::Relaxed);
+
+        let command = send(queue, "commandBuffer");
+        let compute = send(command, "computeCommandEncoder");
+        send_with_object(compute, "setComputePipelineState:", pipeline);
+        set_buffer_at(compute, touched, 0, 0);
+        dispatch(compute, 1);
+        set_buffer_at(compute, untouched, 0, 0);
+        dispatch(compute, 1);
+        send_void(compute, "endEncoding");
+        send_void(command, "commit");
+        send_void(command, "waitUntilCompleted");
+
+        assert_eq!(
+            encoder::TEST_ASYNC_COMPUTE_INELIGIBLE.load(std::sync::atomic::Ordering::Relaxed),
+            before_ineligible + 1,
+            "the dispatch which bound the blitted buffer must count as ineligible"
+        );
+        assert_eq!(
+            encoder::TEST_ASYNC_COMPUTE_ELIGIBLE.load(std::sync::atomic::Ordering::Relaxed),
+            before_eligible + 1,
+            "the dispatch which never bound anything outside compute must count as eligible"
+        );
+    }
+}
+
 /// An encoder reuses the descriptor set it last wrote while the bindings a
 /// dispatch needs are unchanged, so a rebind between dispatches must still
 /// reach the shader - including a rebind back to a buffer whose set was

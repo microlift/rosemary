@@ -34,6 +34,9 @@ pub(super) unsafe extern "C" fn set_buffer<const STAGE: usize>(
 ) {
     // SAFETY: an encoder of this crate's.
     let encoder = unsafe { object::body::<Encoder>(receiver) };
+    if STAGE != COMPUTE {
+        mark_buffer_touched(buffer);
+    }
     let Some(slot) = encoder.buffers[STAGE].get_mut(index as usize) else {
         // Metal retains what an encoder binds, and a guest is entitled to
         // release its own reference the moment the call returns. The command
@@ -134,6 +137,9 @@ pub(super) unsafe extern "C" fn set_texture<const STAGE: usize>(
 ) {
     // SAFETY: an encoder of this crate's.
     let encoder = unsafe { object::body::<Encoder>(receiver) };
+    if STAGE != COMPUTE {
+        mark_texture_touched(texture);
+    }
     if let Some(slot) = encoder.textures[STAGE].get_mut(index as usize) {
         // Retained when it was bound here before.
         if *slot == texture {

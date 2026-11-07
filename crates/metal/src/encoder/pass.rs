@@ -708,6 +708,7 @@ pub(crate) fn begin_render_pass(
             .push((image.image, gpu::aspect_of(image.format)));
         // Memory another resource may share is not ordered by its image.
         encoder.writes_elsewhere |= hazards::tracked_image(texture).is_none();
+        mark_texture_touched(texture);
         command.retain(texture);
     }
     // Sub-encoders record into command buffers of their own, query results

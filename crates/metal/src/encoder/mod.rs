@@ -1,3 +1,4 @@
+mod async_compute_research;
 mod bind;
 mod blit;
 mod command_buffer;
@@ -12,6 +13,7 @@ mod retire;
 mod state;
 mod visibility;
 
+use async_compute_research::*;
 use bind::*;
 use blit::*;
 use command_buffer::*;
@@ -28,6 +30,10 @@ use visibility::*;
 
 use objc::address::AddressSet;
 
+#[cfg(test)]
+pub(crate) use async_compute_research::{
+    TEST_ASYNC_COMPUTE_ELIGIBLE, TEST_ASYNC_COMPUTE_INELIGIBLE,
+};
 pub(crate) use pass::RenderPassDescriptor;
 pub(crate) use queue::new_command_queue;
 pub(crate) use retire::Submission;

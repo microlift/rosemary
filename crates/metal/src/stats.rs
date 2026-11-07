@@ -33,6 +33,8 @@ counters!(
     RenderPassMicros = "render_pass_micros",
     DescriptorLayoutsCreated = "descriptor_layouts_created",
     DescriptorLayoutMicros = "descriptor_layout_micros",
+    AsyncComputeEligible = "async_compute_eligible",
+    AsyncComputeIneligible = "async_compute_ineligible",
     SubmitMicros = "submit_micros",
     SubmitLockMicros = "submit_lock_micros",
     SubmitFlushMicros = "submit_flush_micros",

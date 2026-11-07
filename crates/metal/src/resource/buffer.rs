@@ -74,6 +74,7 @@ pub(crate) fn wrap_buffer(
             inner,
             options,
             host,
+            touched_outside_compute: std::sync::atomic::AtomicBool::new(false),
         },
     )
 }

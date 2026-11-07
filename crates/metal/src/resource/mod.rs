@@ -44,6 +44,11 @@ pub(crate) struct Buffer {
     pub inner: GpuBuffer,
     pub options: u64,
     host: Option<gpu::HostPages>,
+    /// Set once a render pass or blit encoder has ever bound this buffer;
+    /// never cleared. Research for whether a compute dispatch could safely
+    /// run on a queue of its own - see `encoder::async_compute_research` -
+    /// not yet acted on.
+    pub touched_outside_compute: std::sync::atomic::AtomicBool,
 }
 
 impl Default for SamplerDescriptor {
