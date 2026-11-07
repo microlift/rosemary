@@ -77,15 +77,38 @@ struct Contents {
     weak_ivar_layout: Option<&'static CStr>,
 }
 
-/// A class.
+/// `class_data_bits_t` flags Apple keeps in the low bits of [`Class::bits`].
 ///
-/// `#[repr(C)]` for the first two fields only: an object's `isa` and a class's
-/// `superclass` are read by hand often enough that their offsets are ABI.
+/// Swift reads the two Swift markers off every class it meets, ours included,
+/// to tell its own metadata from a plain Objective-C class.
+pub const FAST_IS_SWIFT_LEGACY: usize = 1 << 0;
+pub const FAST_IS_SWIFT_STABLE: usize = 1 << 1;
+pub const FAST_HAS_DEFAULT_RR: usize = 1 << 2;
+
+/// The pointer half of [`Class::bits`].
+///
+/// Not Apple's `FAST_DATA_MASK`, which also clears the high bits Apple's
+/// address space never uses: a Linux host's user addresses can reach bit 47.
+const FAST_DATA_MASK: usize = !(FAST_IS_SWIFT_LEGACY | FAST_IS_SWIFT_STABLE | FAST_HAS_DEFAULT_RR);
+
+/// A class: Apple's `objc_class` header, whose `bits` lead to the rest.
+///
+/// Apple's layout because Swift class metadata begins with this header and
+/// carries Swift's own fields right after it, and Swift reads the header of
+/// any class it is handed. Nothing may be added past `bits`.
 #[repr(C)]
 pub struct Class {
     /// The metaclass. A class is an object, and this is its `isa`.
     isa: AtomicPtr<Class>,
     superclass: AtomicPtr<Class>,
+    /// Apple's method cache. Never used here; it holds `bits` at Apple's offset.
+    cache: [AtomicUsize; 2],
+    /// The class's [`ClassData`], with the `FAST_*` flags in the low bits.
+    bits: AtomicUsize,
+}
+
+/// Everything about a class past its header: Apple's `class_rw_t`.
+struct ClassData {
     name: CString,
     /// Bytes an instance occupies, `isa` included. Grows as ivars are added, and
     /// is fixed at registration.
@@ -104,9 +127,18 @@ pub struct Class {
 }
 
 // SAFETY: every field is either immutable after construction or behind a lock or
-// an atomic. The raw pointers are to leaked `Class`es, which outlive the process.
+// an atomic. The raw pointers are to leaked `Class`es and `ClassData`s, which
+// outlive the process.
 unsafe impl Sync for Class {}
 unsafe impl Send for Class {}
+
+/// A class this runtime built: the header with its data beside it, so one
+/// allocation holds both.
+#[repr(C)]
+struct Built {
+    class: Class,
+    data: ClassData,
+}
 
 /// Bumped whenever a method resolution anywhere could have changed.
 ///
@@ -161,7 +193,7 @@ fn method_slot(class: usize, sel: usize) -> usize {
 /// a send already knows its receiver is the guest's, and [`is_known`] is for the
 /// entry points a *host* object can reach - `CFRelease` on a `CGEventRef`, say.
 const CLASS_CAPACITY: usize = 1 << 16;
-const CLASS_STRIDE: usize = size_of::<Class>();
+const CLASS_STRIDE: usize = size_of::<Built>();
 const NO_ARENA: usize = usize::MAX;
 
 static ARENA: AtomicUsize = AtomicUsize::new(0);
@@ -196,7 +228,7 @@ pub fn is_known(p: *const Class) -> bool {
             .contains_key(&(p as usize))
 }
 
-fn arena_slot() -> Option<*mut Class> {
+fn arena_slot() -> Option<*mut Built> {
     if ARENA.load(Ordering::Relaxed) == 0 {
         let mapped = starnix::memory::anonymous(
             CLASS_CAPACITY * CLASS_STRIDE,
@@ -211,7 +243,17 @@ fn arena_slot() -> Option<*mut Class> {
     let base = ARENA.load(Ordering::Relaxed);
     let index = BUILT.load(Ordering::Relaxed);
     (base != NO_ARENA && index < CLASS_CAPACITY)
-        .then(|| (base + index * CLASS_STRIDE) as *mut Class)
+        .then(|| (base + index * CLASS_STRIDE) as *mut Built)
+}
+
+impl Built {
+    /// Point the header's `bits` at the data beside it. No flags: a class this
+    /// runtime built is never Swift's.
+    fn link_data(&'static self) {
+        let data = std::ptr::from_ref(&self.data) as usize;
+        debug_assert_eq!(data & !FAST_DATA_MASK, 0, "ClassData is word-aligned");
+        self.class.bits.store(data, Ordering::Release);
+    }
 }
 
 impl Class {
@@ -221,31 +263,42 @@ impl Class {
         is_meta: bool,
         instance_size: usize,
     ) -> &'static Class {
-        let class = Class {
-            isa: AtomicPtr::new(std::ptr::null_mut()),
-            superclass: AtomicPtr::new(superclass),
-            name,
-            instance_size: AtomicUsize::new(instance_size),
-            is_meta,
-            registered: AtomicUsize::new(0),
-            initialized: AtomicBool::new(false),
-            instances: AtomicPtr::new(std::ptr::null_mut()),
-            // What Apple's runtime starts a class at when it realizes one.
-            version: AtomicI32::new(if is_meta { 7 } else { 0 }),
-            contents: RwLock::new(Contents::default()),
+        let built = Built {
+            class: Class {
+                isa: AtomicPtr::new(std::ptr::null_mut()),
+                superclass: AtomicPtr::new(superclass),
+                cache: [AtomicUsize::new(0), AtomicUsize::new(0)],
+                // Pointed at `data` once `built` has its final address.
+                bits: AtomicUsize::new(0),
+            },
+            data: ClassData {
+                name,
+                instance_size: AtomicUsize::new(instance_size),
+                is_meta,
+                registered: AtomicUsize::new(0),
+                initialized: AtomicBool::new(false),
+                instances: AtomicPtr::new(std::ptr::null_mut()),
+                // What Apple's runtime starts a class at when it realizes one.
+                version: AtomicI32::new(if is_meta { 7 } else { 0 }),
+                contents: RwLock::new(Contents::default()),
+            },
         };
         let _building = BUILDING.lock().unwrap_or_else(|e| e.into_inner());
         match arena_slot() {
             Some(slot) => {
                 // SAFETY: an unused, aligned slot of a reservation that is never
                 // unmapped, published only once written.
-                unsafe { slot.write(class) };
-                BUILT.fetch_add(1, Ordering::Release);
+                unsafe { slot.write(built) };
                 // SAFETY: as above.
-                unsafe { &*slot }
+                let built: &'static Built = unsafe { &*slot };
+                built.link_data();
+                BUILT.fetch_add(1, Ordering::Release);
+                &built.class
             }
             None => {
-                let class: &'static Class = Box::leak(Box::new(class));
+                let built: &'static Built = Box::leak(Box::new(built));
+                built.link_data();
+                let class = &built.class;
                 overflow(std::ptr::from_ref(class) as usize)
                     .write()
                     .unwrap_or_else(|e| e.into_inner())
@@ -256,20 +309,34 @@ impl Class {
         }
     }
 
+    /// The [`ClassData`] `bits` points at.
+    #[inline]
+    fn data(&self) -> &ClassData {
+        let bits = self.bits.load(Ordering::Acquire);
+        // SAFETY: every `Class` this runtime hands out has had `bits` pointed
+        // at a leaked `ClassData` before it was published, and never cleared.
+        unsafe { &*((bits & FAST_DATA_MASK) as *const ClassData) }
+    }
+
+    /// The raw `class_data_bits_t`, flags included.
+    pub fn bits(&self) -> usize {
+        self.bits.load(Ordering::Acquire)
+    }
+
     pub fn name(&self) -> *const c_char {
-        self.name.as_ptr()
+        self.data().name.as_ptr()
     }
 
     pub fn name_str(&self) -> &str {
-        self.name.to_str().unwrap_or("<non-utf8 class name>")
+        self.data().name.to_str().unwrap_or("<non-utf8 class name>")
     }
 
     pub fn is_meta(&self) -> bool {
-        self.is_meta
+        self.data().is_meta
     }
 
     pub fn is_registered(&self) -> bool {
-        self.registered.load(Ordering::Acquire) != 0
+        self.data().registered.load(Ordering::Acquire) != 0
     }
 
     pub fn superclass(&self) -> Option<&'static Class> {
@@ -287,7 +354,7 @@ impl Class {
     }
 
     pub fn instance_size(&self) -> usize {
-        self.instance_size.load(Ordering::Acquire)
+        self.data().instance_size.load(Ordering::Acquire)
     }
 
     /// This class and every superclass, nearest first.
@@ -303,7 +370,8 @@ impl Class {
     /// The method this class itself declares for `sel`, ignoring superclasses.
     pub fn own_method(&self, sel: Sel) -> Option<&'static Method> {
         crate::sel::validate(sel);
-        self.contents
+        self.data()
+            .contents
             .read()
             .unwrap_or_else(|e| e.into_inner())
             .methods
@@ -316,7 +384,8 @@ impl Class {
     /// For a caller checking a whole class table at once - the encoding guard in
     /// `rosemary` - rather than for dispatch, which asks by selector.
     pub fn own_methods(&'static self) -> Vec<&'static Method> {
-        self.contents
+        self.data()
+            .contents
             .read()
             .unwrap_or_else(|e| e.into_inner())
             .methods
@@ -360,7 +429,11 @@ impl Class {
                 self.name_str()
             );
         }
-        let mut contents = self.contents.write().unwrap_or_else(|e| e.into_inner());
+        let mut contents = self
+            .data()
+            .contents
+            .write()
+            .unwrap_or_else(|e| e.into_inner());
         if contents.methods.contains_key(&(sel as usize)) {
             return false;
         }
@@ -395,16 +468,20 @@ impl Class {
 
     /// Append an ivar. Only before registration, and never on a metaclass.
     pub fn add_ivar(&self, name: &CStr, size: usize, alignment: u8, types: &CStr) -> bool {
-        if self.is_registered() || self.is_meta {
+        if self.is_registered() || self.data().is_meta {
             return false;
         }
-        let mut contents = self.contents.write().unwrap_or_else(|e| e.into_inner());
+        let mut contents = self
+            .data()
+            .contents
+            .write()
+            .unwrap_or_else(|e| e.into_inner());
         if contents.ivars.iter().any(|i| i.name.as_c_str() == name) {
             return false;
         }
         // `alignment` is log2, as `class_addIvar` documents. Apple caps it too.
         let align = 1usize << alignment.min(15);
-        let start = self.instance_size.load(Ordering::Acquire);
+        let start = self.data().instance_size.load(Ordering::Acquire);
         let offset = start.next_multiple_of(align);
         let ivar: &'static Ivar = Box::leak(Box::new(Ivar {
             name: CString::from(name),
@@ -414,13 +491,16 @@ impl Class {
         }));
         crate::debug::note_handle(ivar, "ivar");
         contents.ivars.push(ivar);
-        self.instance_size.store(offset + size, Ordering::Release);
+        self.data()
+            .instance_size
+            .store(offset + size, Ordering::Release);
         true
     }
 
     /// The ivars this class declares itself, in the order they were added.
     pub fn own_ivars(&self) -> Vec<&'static Ivar> {
-        self.contents
+        self.data()
+            .contents
             .read()
             .unwrap_or_else(|e| e.into_inner())
             .ivars
@@ -428,16 +508,20 @@ impl Class {
     }
 
     pub fn version(&self) -> i32 {
-        self.version.load(Ordering::Acquire)
+        self.data().version.load(Ordering::Acquire)
     }
 
     pub fn set_version(&self, version: i32) {
-        self.version.store(version, Ordering::Release);
+        self.data().version.store(version, Ordering::Release);
     }
 
     /// The strong (`weak` false) or weak ivar layout, if one was set.
     pub fn ivar_layout(&self, weak: bool) -> Option<&'static CStr> {
-        let contents = self.contents.read().unwrap_or_else(|e| e.into_inner());
+        let contents = self
+            .data()
+            .contents
+            .read()
+            .unwrap_or_else(|e| e.into_inner());
         match weak {
             true => contents.weak_ivar_layout,
             false => contents.ivar_layout,
@@ -451,7 +535,11 @@ impl Class {
             return false;
         }
         let layout = layout.map(|l| &*Box::leak(CString::from(l).into_boxed_c_str()));
-        let mut contents = self.contents.write().unwrap_or_else(|e| e.into_inner());
+        let mut contents = self
+            .data()
+            .contents
+            .write()
+            .unwrap_or_else(|e| e.into_inner());
         match weak {
             true => contents.weak_ivar_layout = layout,
             false => contents.ivar_layout = layout,
@@ -462,7 +550,8 @@ impl Class {
     /// The ivar this class or a superclass declares under `name`.
     pub fn ivar(&'static self, name: &CStr) -> Option<&'static Ivar> {
         self.chain().find_map(|c| {
-            c.contents
+            c.data()
+                .contents
                 .read()
                 .unwrap_or_else(|e| e.into_inner())
                 .ivars
@@ -476,6 +565,7 @@ impl Class {
     pub fn contains_ivar(&'static self, ivar: *const Ivar) -> bool {
         self.chain().any(|class| {
             class
+                .data()
                 .contents
                 .read()
                 .unwrap_or_else(|e| e.into_inner())
@@ -493,7 +583,11 @@ impl Class {
     /// entries would make `class_copyPropertyList` report a property twice and
     /// `class_getProperty` answer with whichever came first.
     pub fn set_property(&self, name: &CStr, attributes: &CStr) {
-        let mut contents = self.contents.write().unwrap_or_else(|e| e.into_inner());
+        let mut contents = self
+            .data()
+            .contents
+            .write()
+            .unwrap_or_else(|e| e.into_inner());
         let property = crate::property::make(name, attributes);
         match contents.properties.iter().position(|p| p.name_c() == name) {
             Some(at) => contents.properties[at] = property,
@@ -504,7 +598,8 @@ impl Class {
     /// The properties this class declares, not counting a superclass's - which
     /// is what `class_copyPropertyList` answers.
     pub fn properties(&self) -> Vec<&'static crate::property::Property> {
-        self.contents
+        self.data()
+            .contents
             .read()
             .unwrap_or_else(|e| e.into_inner())
             .properties
@@ -514,7 +609,8 @@ impl Class {
     /// The property this class or a superclass declares under `name`.
     pub fn property(&'static self, name: &CStr) -> Option<&'static crate::property::Property> {
         self.chain().find_map(|c| {
-            c.contents
+            c.data()
+                .contents
                 .read()
                 .unwrap_or_else(|e| e.into_inner())
                 .properties
@@ -525,7 +621,11 @@ impl Class {
     }
 
     pub fn add_protocol(&self, protocol: &'static crate::protocol::Protocol) -> bool {
-        let mut contents = self.contents.write().unwrap_or_else(|e| e.into_inner());
+        let mut contents = self
+            .data()
+            .contents
+            .write()
+            .unwrap_or_else(|e| e.into_inner());
         if contents
             .protocols
             .iter()
@@ -539,7 +639,8 @@ impl Class {
 
     /// The protocols this class adopts itself, in the order it adopted them.
     pub fn own_protocols(&self) -> Vec<&'static crate::protocol::Protocol> {
-        self.contents
+        self.data()
+            .contents
             .read()
             .unwrap_or_else(|e| e.into_inner())
             .protocols
@@ -549,7 +650,8 @@ impl Class {
     /// Whether this class or a superclass adopts `protocol`.
     pub fn conforms_to(&'static self, protocol: &crate::protocol::Protocol) -> bool {
         self.chain().any(|c| {
-            c.contents
+            c.data()
+                .contents
                 .read()
                 .unwrap_or_else(|e| e.into_inner())
                 .protocols
@@ -577,21 +679,22 @@ static INITIALIZED: std::sync::Condvar = std::sync::Condvar::new();
 pub(crate) fn is_initialized(class: &'static Class) -> bool {
     match class.is_meta() {
         true => {
-            let instances = class.instances.load(Ordering::Acquire);
+            let instances = class.data().instances.load(Ordering::Acquire);
             // SAFETY: a leaked class, set when the pair was allocated.
             !instances.is_null()
                 && unsafe { &*(instances as *const Class) }
+                    .data()
                     .initialized
                     .load(Ordering::Acquire)
         }
-        false => class.initialized.load(Ordering::Acquire),
+        false => class.data().initialized.load(Ordering::Acquire),
     }
 }
 
 #[inline]
 pub fn ensure_initialized(class: &'static Class) {
     // Every message send asks, and the answer is nearly always yes.
-    if !class.initialized.load(Ordering::Acquire) {
+    if !class.data().initialized.load(Ordering::Acquire) {
         initialize(class);
     }
 }
@@ -600,7 +703,7 @@ pub fn ensure_initialized(class: &'static Class) {
 fn initialize(class: &'static Class) {
     let class = match class.is_meta() {
         true => {
-            let instances = class.instances.load(Ordering::Acquire);
+            let instances = class.data().instances.load(Ordering::Acquire);
             match instances.is_null() {
                 true => return,
                 // SAFETY: a leaked class, set when the pair was allocated.
@@ -609,7 +712,7 @@ fn initialize(class: &'static Class) {
         }
         false => class,
     };
-    if class.initialized.load(Ordering::Acquire) || !class.is_registered() {
+    if class.data().initialized.load(Ordering::Acquire) || !class.is_registered() {
         return;
     }
     if let Some(superclass) = class.superclass() {
@@ -620,7 +723,7 @@ fn initialize(class: &'static Class) {
     {
         let mut running = INITIALIZING.lock().unwrap_or_else(|e| e.into_inner());
         loop {
-            if class.initialized.load(Ordering::Acquire) {
+            if class.data().initialized.load(Ordering::Acquire) {
                 return;
             }
             match running.iter().find(|(c, _)| *c == address) {
@@ -644,7 +747,7 @@ fn initialize(class: &'static Class) {
             f(ptr(class), sel);
         }
     }
-    class.initialized.store(true, Ordering::Release);
+    class.data().initialized.store(true, Ordering::Release);
     INITIALIZING
         .lock()
         .unwrap_or_else(|e| e.into_inner())
@@ -665,7 +768,7 @@ pub fn lookup(name: &CStr) -> Option<&'static Class> {
     if at == address
         && cached_generation == generation
         && let Some(class) = cached
-        && class.name.as_c_str() == name
+        && class.data().name.as_c_str() == name
     {
         return Some(class);
     }
@@ -744,7 +847,7 @@ pub fn allocate_pair(
         None => meta,
     };
     meta.isa.store(ptr(root_meta), Ordering::Release);
-    meta.instances.store(ptr(class), Ordering::Release);
+    meta.data().instances.store(ptr(class), Ordering::Release);
     class.isa.store(ptr(meta), Ordering::Release);
     Some(class)
 }
@@ -791,10 +894,14 @@ pub fn register_pair(class: &'static Class) {
             class.name_str()
         );
     }
-    if class.registered.swap(1, Ordering::AcqRel) != 0 {
+    if class.data().registered.swap(1, Ordering::AcqRel) != 0 {
         return;
     }
-    class.metaclass().registered.store(1, Ordering::Release);
+    class
+        .metaclass()
+        .data()
+        .registered
+        .store(1, Ordering::Release);
     with_classes(|classes| {
         classes.insert(class.name_str().to_string(), class);
     });
@@ -877,4 +984,36 @@ pub fn os_object_class() -> &'static Class {
         register_pair(class);
         class
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Apple's `objc_class`: `isa`, `superclass`, `cache` (two words), `bits`.
+    const OBJC_CLASS_BITS_OFFSET: usize = 4 * size_of::<usize>();
+    const OBJC_CLASS_SIZE: usize = 5 * size_of::<usize>();
+
+    #[test]
+    fn class_header_has_apples_objc_class_layout() {
+        assert_eq!(std::mem::offset_of!(Class, isa), 0);
+        assert_eq!(std::mem::offset_of!(Class, superclass), size_of::<usize>());
+        assert_eq!(std::mem::offset_of!(Class, bits), OBJC_CLASS_BITS_OFFSET);
+        assert_eq!(size_of::<Class>(), OBJC_CLASS_SIZE);
+    }
+
+    #[test]
+    fn a_built_class_does_not_read_as_swift_metadata() {
+        crate::bootstrap();
+        let nsobject = lookup(c"NSObject").expect("NSObject");
+        // An odd instance size used to land where Swift reads the flags.
+        let class = allocate_pair(Some(nsobject), c"RosemaryOddSizedClass", 1).expect("unused");
+        register_pair(class);
+        for c in [nsobject, class, class.metaclass()] {
+            let bits = c.bits();
+            assert_eq!(bits & (FAST_IS_SWIFT_LEGACY | FAST_IS_SWIFT_STABLE), 0);
+            assert_ne!(bits & FAST_DATA_MASK, 0);
+        }
+        assert_eq!(class.instance_size(), nsobject.instance_size() + 1);
+    }
 }
