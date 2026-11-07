@@ -107,6 +107,10 @@ const P: T = T::Pointer;
 
 /// The runtime surface a guest reaches, **sorted by name**.
 pub(super) static RUNTIME: &[Runtime] = &[
+    // What a Swift runtime asks of this one. A Swift class's metadata stays the
+    // guest's, so the class handed to `_objc_realizeClassFromSwift` crosses
+    // untranslated.
+    rt!("_objc_realizeClassFromSwift", P, P, P),
     rtc!([0], "_objc_rootAutorelease", P, P),
     //
     // The other direction of [`crate::objc::register`]. That pass replays the
@@ -275,6 +279,10 @@ pub(super) static RUNTIME: &[Runtime] = &[
         protocols: &[],
         struct_return: None,
     },
+    // The hooks are installed and never called; see `objc::api`.
+    rtb!([0], "objc_setHook_getClass", V, P, P),
+    rtb!([0], "objc_setHook_getImageName", V, P, P),
+    rtb!([0], "objc_setHook_lazyClassNamer", V, P, P),
     // See the note on `objc_getProperty` for why the argument order is not the
     // same in the general entry point as in the four specialized ones.
     rtc!([0, 3], "objc_setProperty", V, P, P, I64, P, U8, U8),

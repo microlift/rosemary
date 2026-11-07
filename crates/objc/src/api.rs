@@ -486,6 +486,102 @@ pub unsafe extern "C" fn class_setSuperclass(
     as_ptr(crate::class::set_superclass(cls, superclass))
 }
 
+// The hooks a Swift runtime installs, so the Objective-C runtime can ask it
+// about Swift classes. Kept, so each setter hands back the hook it replaced,
+// and never called: every hook reads its class with Apple's `objc_class`
+// layout, and no class here has that layout. A Swift class cannot be one of
+// this runtime's (see `rosemary`'s `objc::Refusal::SwiftClass`), so the hooks
+// have nothing to answer about.
+
+/// `BOOL (*objc_hook_getClass)(const char *name, Class *outClass)`
+pub type GetClassHook = unsafe extern "C" fn(*const c_char, *mut *mut c_void) -> bool;
+/// `BOOL (*objc_hook_getImageName)(Class cls, const char **outImageName)`
+pub type GetImageNameHook = unsafe extern "C" fn(*const c_void, *mut *const c_char) -> bool;
+/// `const char *(*objc_hook_lazyClassNamer)(Class cls)`
+pub type LazyClassNamerHook = unsafe extern "C" fn(*const c_void) -> *const c_char;
+
+static GET_CLASS_HOOK: std::sync::Mutex<GetClassHook> = std::sync::Mutex::new(default_get_class);
+static GET_IMAGE_NAME_HOOK: std::sync::Mutex<GetImageNameHook> =
+    std::sync::Mutex::new(default_get_image_name);
+static LAZY_CLASS_NAMER_HOOK: std::sync::Mutex<LazyClassNamerHook> =
+    std::sync::Mutex::new(default_lazy_class_namer);
+
+/// The first hook in the chain: a class nobody else found does not exist.
+unsafe extern "C" fn default_get_class(name: *const c_char, out: *mut *mut c_void) -> bool {
+    let _ = name;
+    if !out.is_null() {
+        // SAFETY: the caller's writable `Class`.
+        unsafe { *out = std::ptr::null_mut() };
+    }
+    false
+}
+
+/// The first hook in the chain: [`class_getImageName`]'s own answer.
+unsafe extern "C" fn default_get_image_name(cls: *const c_void, out: *mut *const c_char) -> bool {
+    let name = unsafe { class_getImageName(cls) };
+    if !out.is_null() {
+        // SAFETY: the caller's writable `const char *`.
+        unsafe { *out = name };
+    }
+    !name.is_null()
+}
+
+/// The first hook in the chain: no class here has a lazy name.
+unsafe extern "C" fn default_lazy_class_namer(_cls: *const c_void) -> *const c_char {
+    std::ptr::null()
+}
+
+/// Install `new` in `hook`, writing the one it replaces to `out_old` first so
+/// that `new` can already call it.
+///
+/// # Safety
+///
+/// `out_old` is writable.
+unsafe fn set_hook<F: Copy>(hook: &std::sync::Mutex<F>, new: F, out_old: *mut F) {
+    let mut current = hook.lock().unwrap_or_else(|e| e.into_inner());
+    // SAFETY: the caller's obligation.
+    unsafe { out_old.write(*current) };
+    *current = new;
+}
+
+/// `void objc_setHook_getClass(objc_hook_getClass newValue, objc_hook_getClass
+/// *outOldValue)`
+pub unsafe extern "C" fn objc_setHook_getClass(new: GetClassHook, out_old: *mut GetClassHook) {
+    unsafe { set_hook(&GET_CLASS_HOOK, new, out_old) }
+}
+
+/// `void objc_setHook_getImageName(objc_hook_getImageName newValue,
+/// objc_hook_getImageName *outOldValue)`
+pub unsafe extern "C" fn objc_setHook_getImageName(
+    new: GetImageNameHook,
+    out_old: *mut GetImageNameHook,
+) {
+    unsafe { set_hook(&GET_IMAGE_NAME_HOOK, new, out_old) }
+}
+
+/// `void objc_setHook_lazyClassNamer(objc_hook_lazyClassNamer newValue,
+/// objc_hook_lazyClassNamer *oldOutValue)`
+pub unsafe extern "C" fn objc_setHook_lazyClassNamer(
+    new: LazyClassNamerHook,
+    out_old: *mut LazyClassNamerHook,
+) {
+    unsafe { set_hook(&LAZY_CLASS_NAMER_HOOK, new, out_old) }
+}
+
+/// `Class _objc_realizeClassFromSwift(Class cls, void *previously)`: Swift
+/// asks the runtime to adopt a class whose metadata it built at run time.
+///
+/// FIXME (ACCURACY): the class is left as Swift metadata only, as the classes
+/// a Swift image declares are. Swift code that never treats it as an
+/// Objective-C class is unaffected; a message sent to one of its instances
+/// is not.
+pub unsafe extern "C" fn _objc_realizeClassFromSwift(
+    cls: *mut c_void,
+    _previously: *mut c_void,
+) -> *mut c_void {
+    cls
+}
+
 /// FIXME (ACCURACY): no image is listed, for the reason
 /// [`class_getImageName`] gives.
 pub unsafe extern "C" fn objc_copyImageNames(out_count: *mut u32) -> *mut *const c_char {
