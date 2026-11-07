@@ -3860,7 +3860,10 @@ pub static SIGNATURES: &[FunctionAbi] = &[
         U64,
         P
     ),
+    sig!("CVMetalTextureCacheFlush", V, P, U64),
+    sig!("CVMetalTextureCacheGetTypeID", U64),
     sig!("CVMetalTextureGetTexture", P, P),
+    sig!("CVMetalTextureGetTypeID", U64),
     sig!("CVPixelBufferCreate", I32, P, U64, U64, U32, P, P),
     sig!("CVPixelBufferGetBaseAddressOfPlane", P, P, U64),
     sig!("CVPixelBufferGetBytesPerRowOfPlane", U64, P, U64),
@@ -3895,8 +3898,11 @@ pub static SIGNATURES: &[FunctionAbi] = &[
         P,
         P
     ),
-    sig!("VTDecompressionSessionDecodeFrame", I32, P, P, U32, P, P),
-    sig!("VTDecompressionSessionFinishDelayedFrames", I32, P),
+    // Both deliver frames by calling the output callback the session was
+    // created with.
+    rsig!("VTDecompressionSessionDecodeFrame", I32, P, P, U32, P, P),
+    rsig!("VTDecompressionSessionFinishDelayedFrames", I32, P),
+    sig!("VTDecompressionSessionGetTypeID", U64),
     sig!("VTDecompressionSessionInvalidate", V, P),
     sig!("VTDecompressionSessionWaitForAsynchronousFrames", I32, P),
     sig!("VTIsHardwareDecodeSupported", BOOL, U32),

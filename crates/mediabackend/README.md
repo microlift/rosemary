@@ -1,9 +1,10 @@
 # Media backend foundation
 
 Host-neutral compressed-video decoding interface for Rosemary. This crate is
-independent of VideoToolbox, CoreMedia, CoreVideo, Metal, and the old FFmpeg
-backend. It introduces an **optional** GStreamer H.264 proof with CPU-mappable
-NV12, I420 and BGRA outputs.
+independent of VideoToolbox, CoreMedia, CoreVideo and Metal. It has two
+implementations: FFmpeg 8 over a hardware API (`ffmpeg`, always built, loaded
+with `dlopen` at run time), and an **optional** GStreamer H.264 proof with
+CPU-mappable NV12, I420 and BGRA outputs.
 
 ## Boundary
 
@@ -75,6 +76,25 @@ NV12, I420 and BGRA outputs.
   fatal bus errors before declaring successful completion. No Apple framework
   API is implemented in this crate.
 
+## FFmpeg hardware backends
+
+`ffmpeg::{VULKAN, VAAPI, CUDA}` drive FFmpeg's `h264` decoder through one
+hardware device API each. Nothing links FFmpeg: `libavcodec.so.62` and
+`libavutil.so.60` are opened on first use, and a host without them, or with
+another major version, only loses these backends. Each backend opens its
+device once per process and decodes a six-picture High-profile probe clip
+(`src/ffmpeg/probe.h264`) before it is used; VA-API tries every render node
+under `/dev/dri/by-path`, Vulkan FFmpeg's default device and then each device
+by index. FFmpeg's software fallback is refused: a backend that cannot decode
+on its hardware fails instead of decoding on the CPU.
+
+The decoder takes `avcC` samples (`h264_avcc`, as the GStreamer backend does)
+and is synchronous: whatever a submitted sample lets FFmpeg output is ready to
+`pull` when `submit` returns. Sample identity rides in the packet timestamp,
+which FFmpeg carries through reordering. A sample still pending when 32 later
+ones are is reported dropped, as is anything FFmpeg still holds at end of
+stream. Frames are copied from the device into one packed NV12 buffer, cropped.
+
 ## Build and test
 
 Normal Rosemary builds do **not** link GStreamer. The opt-in `gstreamer`
@@ -82,7 +102,7 @@ feature requires GStreamer >= 1.28 development libraries, plus runtime plugins
 `coreelements`, `app`, `videoparsersbad`, `libav`, `videoconvertscale`.
 
 ```bash
-cargo test -p mediabackend
+cargo test -p mediabackend    # FFmpeg tests skip a backend this host lacks
 cargo test -p mediabackend --features gstreamer
 cargo run --release -p mediabackend --features gstreamer --example h264_stream -- clip.h264 1
 ```

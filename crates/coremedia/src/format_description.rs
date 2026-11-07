@@ -360,6 +360,61 @@ pub unsafe extern "C" fn CMVideoFormatDescriptionCreateFromH264ParameterSets(
     SUCCESS
 }
 
+/// `OSStatus CMVideoFormatDescriptionCreate(CFAllocatorRef allocator,
+/// CMVideoCodecType codecType, int32_t width, int32_t height, CFDictionaryRef
+/// extensions, CMFormatDescriptionRef *formatDescriptionOut)`
+///
+/// The extensions are copied as given.
+///
+/// FIXME (ACCURACY): an `avcC` atom in `extensions` is not read back into
+/// H.264 parameter sets the way the parameter-set constructor's output is;
+/// a description made here has none, so a decoder session opened from it
+/// finds no decoder for AVC1 content. Tests exercise only that case so far.
+///
+/// # Safety
+///
+/// `extensions` is null or a dictionary, and `out` is writable.
+pub unsafe extern "C" fn CMVideoFormatDescriptionCreate(
+    _allocator: CFAllocatorRef,
+    codec: u32,
+    width: i32,
+    height: i32,
+    extensions: CFTypeRef,
+    out: *mut CFTypeRef,
+) -> i32 {
+    if out.is_null() {
+        return INVALID_PARAMETER;
+    }
+    let extensions = match extensions.is_null() {
+        true => dictionary(Vec::new()),
+        // SAFETY: the caller's object, checked to be a dictionary first.
+        false => unsafe {
+            if collections::dictionary(extensions).is_none() {
+                return INVALID_PARAMETER;
+            }
+            corefoundation::api::CFDictionaryCreateCopy(std::ptr::null(), extensions)
+        },
+    };
+    if extensions.is_null() {
+        return ALLOCATION_FAILED;
+    }
+    let state = State {
+        media_type: VIDEO,
+        subtype: codec,
+        dimensions: Dimensions { width, height },
+        extensions,
+        parameter_sets: Vec::new(),
+        nal_length: 0,
+    };
+    let description = corefoundation::boxed::make(class(), state);
+    if description.is_null() {
+        return ALLOCATION_FAILED;
+    }
+    // SAFETY: the caller's obligation.
+    unsafe { *out = description };
+    SUCCESS
+}
+
 /// `OSStatus CMVideoFormatDescriptionGetH264ParameterSetAtIndex(
 /// CMFormatDescriptionRef videoDesc, size_t parameterSetIndex, const uint8_t
 /// **parameterSetPointerOut, size_t *parameterSetSizeOut, size_t

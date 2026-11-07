@@ -10,6 +10,7 @@ default = []
 gstreamer = ["dep:gst", "dep:gst_app", "dep:gst_video"]
 
 [dependencies]
+ffmpeg.workspace = true
 gst = { package = "gstreamer", version = "0.25", optional = true }
 # AppSink::current_level_buffers, the output backpressure check, is 1.28 API.
 gst_app = { package = "gstreamer-app", version = "0.25", features = ["v1_28"], optional = true }
