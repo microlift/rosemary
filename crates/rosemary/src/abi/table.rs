@@ -1714,6 +1714,8 @@ pub static SIGNATURES: &[FunctionAbi] = &[
     // What `@available` / `__builtin_available` compiles to: `bool
     // _availability_version_check(uint32_t count, dyld_build_version_t *)`.
     sig!("_availability_version_check", BOOL, U32, P),
+    // `dyld_build_version_t` is two words, packed into one register.
+    sig!("dyld_program_sdk_at_least", BOOL, U64),
     // Its compiler-rt wrappers, which newer clangs emit for `@available`.
     sig!("__isPlatformVersionAtLeast", I32, U32, U32, U32, U32),
     sig!(

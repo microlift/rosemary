@@ -487,6 +487,70 @@ unsafe extern "C" fn availability_version_check(count: u32, versions: *const Bui
         .all(|entry| entry.version <= running) as u8
 }
 
+/// `dyld_build_version_t.platform` for a version set: a date standing for the
+/// releases every platform shipped then.
+const VERSION_SET: u32 = 0xffff_ffff;
+
+/// Version sets, `year << 16 | month << 8 | day`, and the macOS release in
+/// each, `xxxx.yy.zz` in nibbles. Sorted; both columns increase together.
+const MACOS_VERSION_SETS: &[(u32, u32)] = &[
+    (0x07df_0901, 0x000a_0b00), // fall 2015: 10.11
+    (0x07e0_0301, 0x000a_0b04), // spring 2016: 10.11.4
+    (0x07e0_0901, 0x000a_0c00), // fall 2016: 10.12
+    (0x07e1_0301, 0x000a_0c04), // spring 2017: 10.12.4
+    (0x07e1_0901, 0x000a_0d00), // fall 2017: 10.13
+    (0x07e2_0301, 0x000a_0d04), // spring 2018: 10.13.4
+    (0x07e2_0901, 0x000a_0e00), // fall 2018: 10.14
+    (0x07e3_0301, 0x000a_0e04), // spring 2019: 10.14.4
+    (0x07e3_0901, 0x000a_0f00), // fall 2019: 10.15
+    (0x07e4_0301, 0x000a_0f04), // spring 2020: 10.15.4
+    (0x07e4_0901, 0x000b_0000), // fall 2020: 11.0
+    (0x07e5_0301, 0x000b_0300), // spring 2021: 11.3
+    (0x07e5_0901, 0x000c_0000), // fall 2021: 12.0
+    (0x07e6_0301, 0x000c_0300), // spring 2022: 12.3
+    (0x07e6_0901, 0x000d_0000), // fall 2022: 13.0
+    (0x07e7_0301, 0x000d_0300), // spring 2023: 13.3
+    (0x07e7_0901, 0x000e_0000), // fall 2023: 14.0
+    (0x07e8_0301, 0x000e_0400), // spring 2024: 14.4
+    (0x07e8_0901, 0x000f_0000), // fall 2024: 15.0
+    (0x07e9_0301, 0x000f_0400), // spring 2025: 15.4
+    (0x07e9_0901, 0x001a_0000), // fall 2025: 26.0
+];
+
+/// `bool dyld_program_sdk_at_least(dyld_build_version_t)`: whether the main
+/// program was linked against at least `version`'s SDK, which is how a library
+/// keeps old behavior for programs built before it changed.
+///
+/// The two words of the struct arrive packed in one register, platform low.
+extern "C" fn program_sdk_at_least(version: u64) -> bool {
+    let (platform, version) = (version as u32, (version >> 32) as u32);
+    let Some(sdk) = crate::images::program_sdk() else {
+        return false;
+    };
+    match platform {
+        PLATFORM_MACOS => sdk >= version,
+        VERSION_SET => sdk_at_least_set(sdk, version),
+        // A macOS program was not linked against another platform's SDK.
+        _ => false,
+    }
+}
+
+/// Whether a macOS SDK is at least a version set's release. A set not in
+/// [`MACOS_VERSION_SETS`] still lies between two that are, which settles it
+/// unless `sdk` lies between their releases too.
+fn sdk_at_least_set(sdk: u32, set: u32) -> bool {
+    let below = MACOS_VERSION_SETS.iter().rev().find(|(s, _)| *s <= set);
+    let above = MACOS_VERSION_SETS.iter().find(|(s, _)| *s >= set);
+    match (below, above) {
+        (Some(&(s, macos)), _) if s == set => sdk >= macos,
+        (_, Some(&(_, macos))) if sdk >= macos => true,
+        // FIXME (ACCURACY): otherwise a set this table does not name, and an
+        // SDK between the releases on either side of it (or past the table's
+        // end). Answered as the older SDK would be.
+        _ => false,
+    }
+}
+
 /// compiler-rt's `ConstructVersion`: the packing `dyld_build_version_t` uses,
 /// each part masked to its field.
 fn packed_version(major: u32, minor: u32, subminor: u32) -> u32 {
@@ -617,6 +681,7 @@ exports::exports! {
         "Gestalt" => gestalt,
         "_availability_version_check" => availability_version_check,
         "__isPlatformVersionAtLeast" => is_platform_version_at_least,
+        "dyld_program_sdk_at_least" => program_sdk_at_least,
         "__isPlatformOrVariantPlatformVersionAtLeast" => is_platform_or_variant_platform_version_at_least,
         "sysconf" => sysconf,
         "getrusage" => getrusage,
@@ -695,6 +760,18 @@ mod tests {
             ),
             1
         );
+    }
+
+    #[test]
+    fn a_version_set_is_compared_as_its_macos_release() {
+        // 13.4, between spring 2023 (13.3) and fall 2023 (14.0).
+        let sdk = 0x000d_0400;
+        assert!(sdk_at_least_set(sdk, 0x07e5_0301));
+        assert!(sdk_at_least_set(sdk, 0x07e7_0301));
+        assert!(!sdk_at_least_set(sdk, 0x07e7_0901));
+        // A set between two named ones, settled by an SDK newer than both.
+        assert!(sdk_at_least_set(0x001b_0200, 0x07e8_0000));
+        assert!(!sdk_at_least_set(0x000a_0e00, 0x07e8_0000));
     }
 
     #[test]
