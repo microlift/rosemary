@@ -2241,28 +2241,37 @@ pub unsafe extern "C" fn CFStringConvertWindowsCodepageToEncoding(codepage: u32)
         .map_or(INVALID_ENCODING, |(_, _, encoding)| *encoding)
 }
 
-/// `CFStringEncoding CFStringConvertIANACharSetNameToEncoding(CFStringRef)`.
+/// The encoding IANA's charset `name` means, matched the way
+/// [`CFStringConvertIANACharSetNameToEncoding`] matches a `CFStringRef`'s
+/// text - factored out so a caller with a plain `&str` (a Pascal string
+/// decoded elsewhere, say) does not have to build a `CFString` just to ask.
 ///
 /// Names compare without regard to case, as charset names do.
-pub unsafe extern "C" fn CFStringConvertIANACharSetNameToEncoding(name: CFTypeRef) -> u32 {
-    let Some(name) = (unsafe { string::as_string(name) }) else {
-        return INVALID_ENCODING;
-    };
-    let name = String::from_utf8_lossy(&name.utf8()).to_ascii_lowercase();
+pub fn encoding_for_charset_name(name: &str) -> Option<u32> {
+    let name = name.to_ascii_lowercase();
     let name = match name.as_str() {
         "utf8" => "utf-8",
         "ascii" => "us-ascii",
         "latin1" | "iso_8859-1" => "iso-8859-1",
         "cp1252" => "windows-1252",
         "sjis" | "x-sjis" => "shift_jis",
-        "utf-16" => return string::encoding::UTF16,
-        "utf-32" => return string::encoding::UTF32,
+        "utf-16" => return Some(string::encoding::UTF16),
+        "utf-32" => return Some(string::encoding::UTF32),
         other => other,
     };
     NAMED_ENCODINGS
         .iter()
         .find(|(_, iana, _)| *iana == name)
-        .map_or(INVALID_ENCODING, |(_, _, encoding)| *encoding)
+        .map(|(_, _, encoding)| *encoding)
+}
+
+/// `CFStringEncoding CFStringConvertIANACharSetNameToEncoding(CFStringRef)`.
+pub unsafe extern "C" fn CFStringConvertIANACharSetNameToEncoding(name: CFTypeRef) -> u32 {
+    let Some(name) = (unsafe { string::as_string(name) }) else {
+        return INVALID_ENCODING;
+    };
+    let name = String::from_utf8_lossy(&name.utf8()).into_owned();
+    encoding_for_charset_name(&name).unwrap_or(INVALID_ENCODING)
 }
 
 /// `Boolean CFArrayContainsValue(CFArrayRef, CFRange, const void *)`, with the
