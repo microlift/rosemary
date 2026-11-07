@@ -217,6 +217,7 @@ pub static SIGNATURES: &[FunctionAbi] = &[
     sig!("rosemary_steamclient_dispatch", I32, U32, P),
     sig!("getsegbyname", P, P),
     sig!("getsectbyname", P, P, P),
+    sig!("getsectiondata", P, P, P, P, P),
     sig!("get_etext", U64),
     sig!("get_end", U64),
     // OpenAL 1.1. Its scalar typedefs are fixed-width even on Darwin.

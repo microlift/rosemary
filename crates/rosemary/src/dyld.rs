@@ -2724,6 +2724,45 @@ pub(crate) mod entry {
         super::load_command_in(header, segment.to_bytes(), Some(section.to_bytes()))
     }
 
+    /// `uint8_t *getsectiondata(const struct mach_header_64 *, const char
+    /// *segname, const char *sectname, unsigned long *size)`: a section's
+    /// contents, slid by how far `header` is from its `__TEXT`.
+    ///
+    /// # Safety
+    ///
+    /// `header` is a mapped image's header, both names are NUL-terminated, and
+    /// `size` is writable.
+    pub unsafe extern "C" fn getsectiondata(
+        header: u64,
+        segment: *const c_char,
+        section: *const c_char,
+        size: *mut u64,
+    ) -> u64 {
+        if segment.is_null() || section.is_null() || size.is_null() {
+            return 0;
+        }
+        let text = super::load_command_in(header, b"__TEXT", None) as *const u8;
+        // SAFETY: the caller states both are NUL-terminated.
+        let (segment, section) = unsafe { (CStr::from_ptr(segment), CStr::from_ptr(section)) };
+        let record = super::load_command_in(header, segment.to_bytes(), Some(section.to_bytes()))
+            as *const u8;
+        if text.is_null() || record.is_null() {
+            return 0;
+        }
+        // SAFETY: a `segment_command_64` and a `section_64` inside the mapped
+        // header: `vmaddr` is the segment's word at 24, `addr` and `size` the
+        // section's at 32 and 40.
+        unsafe {
+            let slide = header.wrapping_sub(text.add(24).cast::<u64>().read_unaligned());
+            size.write_unaligned(record.add(40).cast::<u64>().read_unaligned());
+            record
+                .add(32)
+                .cast::<u64>()
+                .read_unaligned()
+                .wrapping_add(slide)
+        }
+    }
+
     /// `unsigned long get_etext(void)`: the end of the main image's
     /// `__TEXT,__text`, slid - which is where its writable data starts as far
     /// as a collector registering roots is concerned.
@@ -3105,7 +3144,7 @@ pub(crate) mod entry {
 }
 
 /// Every name [`provider`] defines, and the function it binds to.
-fn entries() -> [(&'static str, *const ()); 24] {
+fn entries() -> [(&'static str, *const ()); 25] {
     [
         ("_NSAddImage", entry::ns_add_image as *const ()),
         (
@@ -3165,6 +3204,7 @@ fn entries() -> [(&'static str, *const ()); 24] {
             "_getsectbynamefromheader_64",
             entry::getsectbynamefromheader_64 as *const (),
         ),
+        ("_getsectiondata", entry::getsectiondata as *const ()),
         ("_get_etext", entry::get_etext as *const ()),
         ("_get_end", entry::get_end as *const ()),
     ]
