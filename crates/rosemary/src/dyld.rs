@@ -2069,6 +2069,13 @@ fn native_handle(handle: u64) -> Option<String> {
         .map(|(_, path)| path.clone())
 }
 
+/// Make the host function at `addr` callable by guest code that holds its
+/// address without having imported it, under `name`'s signature: one the
+/// runtime hands back through an out-parameter, as `objc_setHook_*` does.
+pub(crate) fn describe_host_function(addr: u64, name: &str) {
+    remember_native_symbol(addr, name, None);
+}
+
 /// Record a host address handed to the guest by `dlsym`, so it can be called.
 fn remember_native_symbol(addr: u64, name: &str, library: Option<String>) -> u64 {
     let mut map = NATIVE_SYMBOLS.lock().unwrap_or_else(|e| e.into_inner());

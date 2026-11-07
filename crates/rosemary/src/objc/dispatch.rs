@@ -152,6 +152,9 @@ pub(super) static RUNTIME: &[Runtime] = &[
     rtc!([0], "class_copyPropertyList", P, P, P),
     rtc!([0] -> true, "class_createInstance", P, P, U64),
     rtc!([0], "class_getClassMethod", P, P, P),
+    // `const char *class_getImageName(Class)`: answered by the image-name hook
+    // Swift installs, for its own classes.
+    rtc!([0], "class_getImageName", P, P),
     rtc!([0], "class_getInstanceMethod", P, P, P),
     rtc!([0], "class_getInstanceSize", U64, P),
     rtc!([0], "class_getInstanceVariable", P, P, P),
@@ -283,7 +286,8 @@ pub(super) static RUNTIME: &[Runtime] = &[
         protocols: &[],
         struct_return: None,
     },
-    // The hooks are installed and never called; see `objc::api`.
+    // The hook a setter writes back is guest-callable: a thunk, or a default
+    // `host::default_hooks` describes.
     rtb!([0], "objc_setHook_getClass", V, P, P),
     rtb!([0], "objc_setHook_getImageName", V, P, P),
     rtb!([0], "objc_setHook_lazyClassNamer", V, P, P),
@@ -644,6 +648,9 @@ pub fn provider() -> SyntheticDylib {
     }
     for (name, addr) in super::host::block_data() {
         lib.define_data(&name, addr);
+    }
+    for (name, addr) in super::host::default_hooks() {
+        crate::dyld::describe_host_function(addr, name);
     }
     // Null on purpose under either runtime: Apple's libobjc exports these as
     // absolute zeros too.

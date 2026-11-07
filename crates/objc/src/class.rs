@@ -882,6 +882,13 @@ pub fn lookup(name: &CStr) -> Option<&'static Class> {
     Some(class)
 }
 
+/// A class by name as the C API looks one up: [`lookup`], then the
+/// `getClass` hook Swift installs, which finds a Swift class by the name its
+/// image does not register it under.
+pub fn look_up(name: &CStr) -> Option<&'static Class> {
+    lookup(name).or_else(|| crate::api::class_from_hook(name))
+}
+
 static NAMED: AtomicUsize = AtomicUsize::new(1);
 
 const LOOKUP_SLOTS: usize = 128;

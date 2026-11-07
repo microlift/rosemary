@@ -92,6 +92,16 @@ pub fn class_data() -> Vec<(String, u64)> {
     }
 }
 
+/// The hooks each `objc_setHook_*` chain starts with, which a setter hands
+/// back to the guest as the hook replaced. Empty under `native`, whose
+/// defaults are the host libobjc's own.
+pub fn default_hooks() -> Vec<(&'static str, u64)> {
+    match backend() {
+        Backend::Native => Vec::new(),
+        Backend::Builtin => builtin::default_hooks().to_vec(),
+    }
+}
+
 /// The `_NSConcrete*Block` values, which are data and which a block literal in
 /// the guest's image names directly.
 ///

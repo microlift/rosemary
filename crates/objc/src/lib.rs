@@ -235,6 +235,26 @@ static EMPTY_CACHE: ObjcCache = ObjcCache {
 /// One, and it is the one the system's libobjc owns too.
 pub const ROOT_CLASSES: &[&str] = &["NSObject"];
 
+/// The hooks each `objc_setHook_*` chain starts with, by the private name a
+/// guest that is handed one as the hook it replaced calls it through. Two may
+/// share an address, folded as identical code; their signatures agree.
+pub fn default_hooks() -> [(&'static str, u64); 3] {
+    [
+        (
+            "rosemary_objc_default_getClass_hook",
+            api::DEFAULT_GET_CLASS_HOOK as *const () as u64,
+        ),
+        (
+            "rosemary_objc_default_getImageName_hook",
+            api::DEFAULT_GET_IMAGE_NAME_HOOK as *const () as u64,
+        ),
+        (
+            "rosemary_objc_default_lazyClassNamer_hook",
+            api::DEFAULT_LAZY_CLASS_NAMER_HOOK as *const () as u64,
+        ),
+    ]
+}
+
 /// The class objects this runtime exports as *data*.
 ///
 /// A guest's `Greeter : NSObject` binds `_OBJC_CLASS_$_NSObject` and stores the

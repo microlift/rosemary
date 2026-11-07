@@ -1769,6 +1769,11 @@ pub static SIGNATURES: &[FunctionAbi] = &[
     // `void *tlv_allocate(tlv_descriptor *)`: the slow path of this runtime's
     // guest-code `tlv_get_addr`. See `crate::tls`.
     sig!("rosemary_tlv_allocate", P, P),
+    // The builtin objc runtime's default `objc_setHook_*` hooks, which a guest
+    // calls as the hook it replaced. See `objc::default_hooks`.
+    sig!("rosemary_objc_default_getClass_hook", U8, P, P),
+    sig!("rosemary_objc_default_getImageName_hook", U8, P, P),
+    sig!("rosemary_objc_default_lazyClassNamer_hook", P, P),
     sig!("abort", V),
     sig!("abs", I32, I32),
     sig!("accept", I32, I32, P, P),
