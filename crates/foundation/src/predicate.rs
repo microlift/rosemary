@@ -613,7 +613,7 @@ fn fold(text: &str, comparison: &Comparison) -> String {
 /// Only the latest `*` is ever retried, which is enough because a later one
 /// can absorb anything an earlier one would have: the walk is `O(text *
 /// pattern)` rather than exponential in the number of stars.
-fn like(text: &[char], pattern: &[char]) -> bool {
+pub(crate) fn like(text: &[char], pattern: &[char]) -> bool {
     let (mut t, mut p) = (0, 0);
     // Where the pattern resumes after the latest `*`, and the text position
     // that `*` has absorbed up to.

@@ -1251,6 +1251,31 @@ unsafe extern "C" fn case_insensitive_compare(receiver: Id, _sel: Sel, other: Id
     ordering(a.cmp(&b))
 }
 
+/// `-isLike:` and `-isCaseSensitiveLike:`: whether the receiver matches
+/// `pattern`'s `*` and `?` wildcards, as `LIKE` in a predicate does.
+unsafe extern "C" fn is_like(receiver: Id, _sel: Sel, pattern: Id) -> bool {
+    // SAFETY: the caller's two strings, or nil.
+    let (text, pattern) = unsafe { (bytes(receiver), bytes(pattern)) };
+    like_text(
+        &String::from_utf8_lossy(&text),
+        &String::from_utf8_lossy(&pattern),
+    )
+}
+
+/// `-isCaseInsensitiveLike:`: `-isLike:` with both sides case folded.
+unsafe extern "C" fn is_case_insensitive_like(receiver: Id, _sel: Sel, pattern: Id) -> bool {
+    // SAFETY: the caller's two strings, or nil.
+    let (text, pattern) = unsafe { folded(receiver, pattern) };
+    like_text(&text, &pattern)
+}
+
+fn like_text(text: &str, pattern: &str) -> bool {
+    crate::predicate::like(
+        &text.chars().collect::<Vec<_>>(),
+        &pattern.chars().collect::<Vec<_>>(),
+    )
+}
+
 /// `-localizedCompare:`: case folded first, as a collation's primary
 /// strength is, and lowercase before uppercase between strings that differ
 /// only in case, which is the root collation's tie-break.
@@ -1724,6 +1749,9 @@ pub(crate) fn install() {
         "caseInsensitiveCompare:" => case_insensitive_compare, c"q24@0:8@16";
         "localizedCaseInsensitiveCompare:" => case_insensitive_compare, c"q24@0:8@16";
         "localizedCompare:" => localized_compare, c"q24@0:8@16";
+        "isLike:" => is_like, c"B24@0:8@16";
+        "isCaseSensitiveLike:" => is_like, c"B24@0:8@16";
+        "isCaseInsensitiveLike:" => is_case_insensitive_like, c"B24@0:8@16";
         "intValue" => int_value, c"i16@0:8";
         "integerValue" => integer_value, c"q16@0:8";
         "longLongValue" => integer_value, c"q16@0:8";
@@ -1810,6 +1838,34 @@ pub(crate) fn install() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `-isLike:` matches case exactly, as `-isCaseSensitiveLike:` does;
+    /// `-isCaseInsensitiveLike:` folds case first.
+    #[test]
+    fn like_matches_wildcards_with_the_selected_case_rule() {
+        crate::bootstrap();
+        let text = from_str("Rosemary.app");
+        let like = |sel: &str, pattern: &str| {
+            let pattern = from_str(pattern);
+            // SAFETY: two strings and the method's own prototype.
+            let found = unsafe {
+                match sel {
+                    "isCaseInsensitiveLike:" => {
+                        is_case_insensitive_like(text, objc::sel::get(sel), pattern)
+                    }
+                    _ => is_like(text, objc::sel::get(sel), pattern),
+                }
+            };
+            objc::arc::release(pattern);
+            found
+        };
+        assert!(like("isLike:", "Rose*.?pp"));
+        assert!(!like("isLike:", "rose*"));
+        assert!(!like("isCaseSensitiveLike:", "ROSEMARY.APP"));
+        assert!(like("isCaseInsensitiveLike:", "ROSE*.APP"));
+        assert!(!like("isCaseInsensitiveLike:", "rose?.app"));
+        objc::arc::release(text);
+    }
 
     #[test]
     fn joins_path_components_as_apple_does() {
