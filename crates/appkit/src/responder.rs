@@ -468,6 +468,7 @@ pub(crate) fn install() {
         "rightMouseDragged:" => forward_event, c"v24@0:8@16";
         "otherMouseDragged:" => forward_event, c"v24@0:8@16";
         "scrollWheel:" => forward_event, c"v24@0:8@16";
+        "magnifyWithEvent:" => forward_event, c"v24@0:8@16";
         "keyDown:" => forward_event, c"v24@0:8@16";
         "keyUp:" => forward_event, c"v24@0:8@16";
         "flagsChanged:" => forward_event, c"v24@0:8@16";
@@ -569,6 +570,7 @@ mod tests {
             "rightMouseDragged:",
             "otherMouseDragged:",
             "scrollWheel:",
+            "magnifyWithEvent:",
         ] {
             let sel = objc::sel::get(name);
             let owned = responder.method(sel).expect("declared on NSResponder");

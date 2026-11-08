@@ -1763,6 +1763,9 @@ pub mod video {
         pub const MOUSE_BUTTON_DOWN: u32 = 0x401;
         pub const MOUSE_BUTTON_UP: u32 = 0x402;
         pub const MOUSE_WHEEL: u32 = 0x403;
+        pub const PINCH_BEGIN: u32 = 0x710;
+        pub const PINCH_UPDATE: u32 = 0x711;
+        pub const PINCH_END: u32 = 0x712;
     }
 
     /// `SDL_WindowEvent`, whose head every other event shares.
@@ -1841,6 +1844,16 @@ pub mod video {
 
     #[repr(C)]
     #[derive(Clone, Copy)]
+    struct PinchFingerEvent {
+        kind: u32,
+        reserved: u32,
+        timestamp: u64,
+        scale: f32,
+        window: u32,
+    }
+
+    #[repr(C)]
+    #[derive(Clone, Copy)]
     struct TextInputEvent {
         kind: u32,
         reserved: u32,
@@ -1878,7 +1891,17 @@ pub mod video {
         // `SDL_MouseWheelEvent` grew `integer_x`/`integer_y` in 3.2.12, which is
         // why this one is shorter than SDL's: the head is what is read.
         assert!(std::mem::offset_of!(MouseWheelEvent, y) == 0x1c);
+        assert!(std::mem::offset_of!(PinchFingerEvent, scale) == 0x10);
+        assert!(std::mem::offset_of!(PinchFingerEvent, window) == 0x14);
+        assert!(size_of::<PinchFingerEvent>() == 0x18);
     };
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum PinchPhase {
+        Began,
+        Changed,
+        Ended,
+    }
 
     /// One event, decoded.
     ///
@@ -1968,6 +1991,12 @@ pub mod video {
             window: u32,
             x: f32,
             y: f32,
+        },
+        Pinch {
+            window: u32,
+            /// Incremental factor: greater than one zooms in. Unused at the boundaries.
+            scale: f32,
+            phase: PinchPhase,
         },
         /// One SDL delivers that nothing here acts on, kept so a caller can see
         /// that the queue moved.
@@ -2188,8 +2217,108 @@ pub mod video {
                         y: e.y,
                     }
                 }
+                event_type::PINCH_BEGIN | event_type::PINCH_UPDATE | event_type::PINCH_END => {
+                    let e: PinchFingerEvent = decode(&raw);
+                    let phase = match tag {
+                        event_type::PINCH_BEGIN => PinchPhase::Began,
+                        event_type::PINCH_UPDATE => PinchPhase::Changed,
+                        _ => PinchPhase::Ended,
+                    };
+                    // SDL 3.4's Wayland and X11 backends forward cumulative
+                    // native scales; Cocoa and the mobile backends send deltas.
+                    let scale = if is_wayland() || is_x11() {
+                        PINCH_SCALES.with_borrow_mut(|scales| {
+                            let previous = scales.entry(e.window).or_insert(1.0);
+                            let delta = incremental_pinch_scale(previous, phase, e.scale);
+                            if phase == PinchPhase::Ended {
+                                scales.remove(&e.window);
+                            }
+                            delta
+                        })
+                    } else {
+                        e.scale
+                    };
+                    Event::Pinch {
+                        window: e.window,
+                        scale,
+                        phase,
+                    }
+                }
                 other => Event::Other(other),
             }
+        }
+    }
+
+    thread_local! {
+        static PINCH_SCALES: std::cell::RefCell<std::collections::HashMap<u32, f32>> =
+            std::cell::RefCell::new(std::collections::HashMap::new());
+    }
+
+    fn incremental_pinch_scale(previous: &mut f32, phase: PinchPhase, scale: f32) -> f32 {
+        match phase {
+            PinchPhase::Began | PinchPhase::Ended => {
+                *previous = 1.0;
+                scale
+            }
+            PinchPhase::Changed if scale.is_finite() && scale > 0.0 => {
+                let delta = scale / *previous;
+                *previous = scale;
+                delta
+            }
+            PinchPhase::Changed => scale,
+        }
+    }
+
+    #[cfg(test)]
+    #[test]
+    fn cumulative_pinch_scales_report_only_each_updates_change() {
+        let mut previous = 1.0;
+        incremental_pinch_scale(&mut previous, PinchPhase::Began, 0.0);
+        for (scale, expected) in [(1.25, 1.25), (1.5, 1.2), (1.5, 1.0), (0.75, 0.5)] {
+            assert_eq!(
+                incremental_pinch_scale(&mut previous, PinchPhase::Changed, scale),
+                expected
+            );
+        }
+        incremental_pinch_scale(&mut previous, PinchPhase::Changed, f32::NAN);
+        incremental_pinch_scale(&mut previous, PinchPhase::Changed, 0.0);
+        assert_eq!(
+            incremental_pinch_scale(&mut previous, PinchPhase::Changed, 0.75),
+            1.0
+        );
+        incremental_pinch_scale(&mut previous, PinchPhase::Ended, 0.0);
+        incremental_pinch_scale(&mut previous, PinchPhase::Began, 0.0);
+        assert_eq!(
+            incremental_pinch_scale(&mut previous, PinchPhase::Changed, 1.25),
+            1.25
+        );
+    }
+
+    #[cfg(test)]
+    #[test]
+    fn pinch_events_preserve_the_window_scale_and_phase() {
+        if !crate::isolated::run_here_with_dummy_video() {
+            return;
+        }
+        assert!(init_video());
+        for (tag, scale, phase) in [
+            (0x710_u32, 0.0_f32, PinchPhase::Began),
+            (0x711, 1.25, PinchPhase::Changed),
+            (0x711, 0.75, PinchPhase::Changed),
+            (0x712, 0.0, PinchPhase::Ended),
+        ] {
+            let mut raw = super::Event::default();
+            raw.bytes[0..4].copy_from_slice(&tag.to_ne_bytes());
+            raw.bytes[16..20].copy_from_slice(&scale.to_ne_bytes());
+            raw.bytes[20..24].copy_from_slice(&42_u32.to_ne_bytes());
+            assert_eq!(
+                translate(&raw),
+                Event::Pinch {
+                    window: 42,
+                    scale,
+                    phase
+                }
+            );
         }
     }
 
