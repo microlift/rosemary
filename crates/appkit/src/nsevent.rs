@@ -527,6 +527,28 @@ fn typed_characters(key_code: u16, flags: u64) -> String {
     typed
 }
 
+/// `-charactersByApplyingModifiers:`: what this key event's key would type
+/// with `modifiers` held instead of the ones it was pressed with.
+///
+/// FIXME (ACCURACY): AppKit raises `NSInternalInconsistencyException` for a
+/// non-key event; this answers nil.
+unsafe extern "C" fn characters_by_applying_modifiers(
+    receiver: Id,
+    _sel: Sel,
+    modifiers: u64,
+) -> Id {
+    // SAFETY: null or a live object this runtime allocated.
+    match unsafe { event_of(receiver) } {
+        Some(event) if matches!(event.kind, kind::KEY_DOWN | kind::KEY_UP) => {
+            objc::arc::autorelease(foundation::string::from_str(&typed_characters(
+                event.key_code,
+                modifiers,
+            )))
+        }
+        _ => std::ptr::null_mut(),
+    }
+}
+
 /// `+eventWithCGEvent:`.
 unsafe extern "C" fn event_with_cg_event(_class: Id, _sel: Sel, cg: *const c_void) -> Id {
     let Some((kind, flags, key_code, location)) = crate::cgevent::parts(cg as _) else {
@@ -575,6 +597,7 @@ pub(crate) fn install() {
         "scrollingDeltaY" => delta_y, c"d16@0:8";
         "characters" => characters, c"@16@0:8";
         "charactersIgnoringModifiers" => characters, c"@16@0:8";
+        "charactersByApplyingModifiers:" => characters_by_applying_modifiers, c"@24@0:8Q16";
         "window" => window, c"@16@0:8";
         "isARepeat" => is_a_repeat, c"c16@0:8";
         "phase" => phase, c"Q16@0:8";
@@ -627,6 +650,39 @@ mod tests {
                 NSPoint { x: 3.0, y: 4.0 }
             );
         }
+    }
+
+    /// Shift and Option change what a key types; Command does not, and a
+    /// non-key event has no characters to recompute.
+    #[test]
+    fn applying_modifiers_retypes_the_key() {
+        use crate::keymap::flags;
+        crate::bootstrap();
+        const ANSI_A: u16 = 0x00;
+        let key = make(Fields {
+            kind: kind::KEY_DOWN,
+            key_code: ANSI_A,
+            ..Fields::default()
+        });
+        let typed = |event: Id, modifiers: u64| {
+            // SAFETY: the method's own prototype on a live event.
+            let text = unsafe {
+                characters_by_applying_modifiers(
+                    event,
+                    objc::sel::get("charactersByApplyingModifiers:"),
+                    modifiers,
+                )
+            };
+            (!text.is_null()).then(|| {
+                // SAFETY: an `NSString` the method made.
+                String::from_utf8_lossy(&unsafe { foundation::string::bytes(text) }).into_owned()
+            })
+        };
+        assert_eq!(typed(key, 0).as_deref(), Some("a"));
+        assert_eq!(typed(key, flags::SHIFT).as_deref(), Some("A"));
+        assert_eq!(typed(key, flags::COMMAND).as_deref(), Some("a"));
+        assert_eq!(typed(key, flags::OPTION).as_deref(), Some("\u{e5}"));
+        assert_eq!(typed(make(Fields::default()), flags::SHIFT), None);
     }
 
     /// A key down's host text is typed once, by whichever responder takes it
