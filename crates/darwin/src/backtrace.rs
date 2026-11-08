@@ -1,7 +1,9 @@
-#![cfg(not(target_os = "macos"))]
-
-use std::ffi::{CStr, CString, c_char, c_int, c_void};
-use std::ptr;
+use std::ffi::{CStr, CString, c_void};
+#[cfg(not(target_os = "macos"))]
+use std::{
+    ffi::{c_char, c_int},
+    ptr,
+};
 
 /// The widest count a guest can ask for, in frames.
 ///
@@ -10,6 +12,7 @@ use std::ptr;
 /// multi-gigabyte allocation in [`backtrace_symbols`].
 const MAX_FRAMES: usize = 1 << 16;
 
+#[cfg(not(target_os = "macos"))]
 #[inline(never)]
 pub unsafe extern "C" fn backtrace(array: *mut *mut c_void, size: c_int) -> c_int {
     if array.is_null() || size <= 0 {
@@ -23,6 +26,7 @@ pub unsafe extern "C" fn backtrace(array: *mut *mut c_void, size: c_int) -> c_in
     count as c_int
 }
 
+#[cfg(not(target_os = "macos"))]
 pub unsafe extern "C" fn backtrace_symbols(
     array: *const *mut c_void,
     size: c_int,
@@ -61,6 +65,7 @@ pub unsafe extern "C" fn backtrace_symbols(
     entries
 }
 
+#[cfg(not(target_os = "macos"))]
 pub unsafe extern "C" fn backtrace_symbols_fd(array: *const *mut c_void, size: c_int, fd: c_int) {
     if array.is_null() || size <= 0 {
         return;
@@ -73,6 +78,22 @@ pub unsafe extern "C" fn backtrace_symbols_fd(array: *const *mut c_void, size: c
         bytes.push(b'\n');
         write_all(fd, &bytes);
     }
+}
+
+/// The calling thread's return addresses, innermost first, from the caller of
+/// `marker` outwards. See [`walk`] for what `marker` is.
+pub fn return_addresses(marker: usize) -> Vec<usize> {
+    walk(marker, MAX_FRAMES)
+        .into_iter()
+        .map(|frame| frame as usize)
+        .collect()
+}
+
+/// The `backtrace_symbols` line for frame `index`, at `address`.
+pub fn symbol_line(index: usize, address: usize) -> String {
+    describe(index, address as *mut c_void)
+        .to_string_lossy()
+        .into_owned()
 }
 
 /// Walk the calling thread's stack, dropping the frames this crate's own
@@ -179,6 +200,7 @@ fn dl_info(addr: *mut c_void) -> Option<libc::Dl_info> {
     (ok != 0).then_some(info)
 }
 
+#[cfg(not(target_os = "macos"))]
 /// `write` until the whole buffer is out, which is what a caller printing a
 /// crash trace to a pipe needs and what a bare `write` does not promise.
 fn write_all(fd: c_int, mut bytes: &[u8]) {
@@ -195,6 +217,7 @@ fn write_all(fd: c_int, mut bytes: &[u8]) {
     }
 }
 
+#[cfg(not(target_os = "macos"))]
 exports::exports! {
     functions {
         "backtrace" => backtrace,

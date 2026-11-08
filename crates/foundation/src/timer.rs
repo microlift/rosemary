@@ -392,70 +392,6 @@ unsafe extern "C" fn cancel_previous_performs_matching(
     });
 }
 
-/// The state owned by a `-performSelectorOnMainThread:...` queue entry.
-///
-/// Both objects are retained before the entry is submitted. This is necessary
-/// even for the synchronous case: another thread can release either object
-/// while the caller is waiting for the main thread to run it.
-struct MainThreadPerform {
-    receiver: Id,
-    selector: Sel,
-    object: Id,
-}
-
-/// Invoke one main-thread selector and release the queue entry's ownership.
-///
-/// # Safety
-///
-/// `context` must be a `Box<MainThreadPerform>` made by
-/// [`perform_on_main_thread`] and consumed exactly once.
-unsafe extern "C" fn run_main_thread_perform(context: *mut c_void) {
-    let perform = unsafe { Box::from_raw(context.cast::<MainThreadPerform>()) };
-    // Resolve here, on the main thread. Besides matching normal message
-    // delivery, this lets a method installed after submission be the one run.
-    let Some(method) = (unsafe { objc::object::class_of(perform.receiver) })
-        .and_then(|class| class.method(perform.selector))
-    else {
-        objc::fail!(
-            "-performSelectorOnMainThread:withObject:waitUntilDone: target does not respond to selector"
-        );
-    };
-    // SAFETY: this API requires a selector whose method takes one object.
-    let function: unsafe extern "C" fn(Id, Sel, Id) =
-        unsafe { std::mem::transmute(method.implementation()) };
-    // SAFETY: the retained receiver and argument are live for this call.
-    unsafe { function(perform.receiver, perform.selector, perform.object) };
-    objc::arc::release(perform.object);
-    objc::arc::release(perform.receiver);
-}
-
-unsafe extern "C" fn perform_on_main_thread(
-    receiver: Id,
-    _sel: Sel,
-    selector: Sel,
-    object: Id,
-    wait: i8,
-) {
-    let perform = Box::new(MainThreadPerform {
-        receiver: objc::arc::retain(receiver),
-        selector,
-        object: objc::arc::retain(object),
-    });
-    let context = Box::into_raw(perform) as u64;
-    let function = run_main_thread_perform as *const () as u64;
-    let main = darwin::dispatch::queue::main_queue();
-    // SAFETY: the boxed context is consumed exactly once by the function. A
-    // synchronous submission returns only after that has happened; an
-    // asynchronous one transfers ownership to the queue.
-    unsafe {
-        if wait != 0 {
-            darwin::dispatch::queue::sync_f(main, context, function);
-        } else {
-            darwin::dispatch::queue::async_f(main, context, function);
-        }
-    }
-}
-
 unsafe extern "C" fn invalidate(receiver: Id, _sel: Sel) {
     let timer = timer_of(receiver);
     if timer.timer.is_null() {
@@ -567,8 +503,6 @@ pub(crate) fn install() {
     methods!(nsobject, {
         "performSelector:withObject:afterDelay:" => perform_after_delay,
             c"v40@0:8:16@24d32";
-        "performSelectorOnMainThread:withObject:waitUntilDone:" => perform_on_main_thread,
-            c"v40@0:8:16@24c32";
     });
     class_methods!(nsobject, {
         "cancelPreviousPerformRequestsWithTarget:" => cancel_previous_performs, c"v24@0:8@16";
@@ -667,7 +601,6 @@ mod tests {
 
     static REPEATED: AtomicUsize = AtomicUsize::new(0);
     static ONCE: AtomicUsize = AtomicUsize::new(0);
-    static MAIN_THREAD_ARGUMENT: AtomicUsize = AtomicUsize::new(0);
 
     unsafe extern "C" fn repeated(_receiver: Id, _sel: Sel, _timer: Id) {
         REPEATED.fetch_add(1, Ordering::SeqCst);
@@ -688,10 +621,6 @@ mod tests {
         CANCEL_ALL.fetch_add(1, Ordering::SeqCst);
     }
 
-    unsafe extern "C" fn performed_on_main(_receiver: Id, _sel: Sel, object: Id) {
-        MAIN_THREAD_ARGUMENT.store(object as usize, Ordering::SeqCst);
-    }
-
     /// A target of this test's own.
     ///
     /// Two, one per test, because the tests share a process *and* the one run
@@ -704,33 +633,6 @@ mod tests {
             "tick:" => imp, c"v24@0:8@16";
         });
         objc::object::create_instance(class, 0)
-    }
-
-    /// A deferred main-thread perform owns its target and argument until the
-    /// main queue delivers the selector.
-    #[test]
-    fn a_selector_is_deferred_to_the_main_queue() {
-        let receiver = target(c"RosemaryTestMainThreadPerformTarget", performed_on_main);
-        let object = target(c"RosemaryTestMainThreadPerformObject", once);
-        let expected = object as usize;
-        MAIN_THREAD_ARGUMENT.store(0, Ordering::SeqCst);
-
-        // SAFETY: both objects are live and `tick:` takes one object.
-        unsafe {
-            perform_on_main_thread(
-                receiver,
-                objc::sel::get("performSelectorOnMainThread:withObject:waitUntilDone:"),
-                objc::sel::get("tick:"),
-                object,
-                0,
-            );
-        }
-        assert_eq!(MAIN_THREAD_ARGUMENT.load(Ordering::SeqCst), 0);
-        objc::arc::release(receiver);
-        objc::arc::release(object);
-
-        darwin::dispatch::queue::drain_main();
-        assert_eq!(MAIN_THREAD_ARGUMENT.load(Ordering::SeqCst), expected);
     }
 
     /// A scheduled repeating timer fires from the run loop, and stops when it is

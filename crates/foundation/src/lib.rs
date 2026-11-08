@@ -248,7 +248,7 @@ pub fn class_data() -> Vec<(String, u64)> {
 /// Only classes a guest in this tree has been seen to subclass. AppKit's -
 /// `NSView`, `NSWindow`, `NSApplication` - belong to AppKit and arrive with it.
 fn declare_abstract() {
-    for name in [c"NSFormatter", c"NSThread", c"NSLock", c"NSRecursiveLock"] {
+    for name in [c"NSFormatter", c"NSLock", c"NSRecursiveLock"] {
         corefoundation::base::abstract_class(name, None);
     }
 }
@@ -474,6 +474,9 @@ pub const NOTIFICATION_NAMES: &[&str] = &[
     "NSProcessInfoPowerStateDidChangeNotification",
     "NSCurrentLocaleDidChangeNotification",
     "NSUserDefaultsDidChangeNotification",
+    thread::WILL_BECOME_MULTI_THREADED,
+    thread::DID_BECOME_SINGLE_THREADED,
+    thread::WILL_EXIT,
 ];
 
 #[cfg(test)]
