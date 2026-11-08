@@ -293,6 +293,96 @@ unsafe extern "C" fn copy_item_at_url(
     }
 }
 
+/// The user's trash, `~/.Trash`, as a guest path.
+fn trash_directory() -> String {
+    format!("{}/.Trash", crate::home_directory())
+}
+
+/// A name for `name` that nothing in `directory` has yet: `name` itself, else
+/// `stem 2.ext`, `stem 3.ext`, and so on.
+///
+/// FIXME (ACCURACY): Finder names a colliding item after the time it was
+/// trashed rather than with a counter.
+fn free_name(directory: &std::path::Path, name: &str) -> String {
+    let taken = |candidate: &str| std::fs::symlink_metadata(directory.join(candidate)).is_ok();
+    if !taken(name) {
+        return name.to_string();
+    }
+    let path = std::path::Path::new(name);
+    let stem = path
+        .file_stem()
+        .map_or(name, |s| s.to_str().unwrap_or(name));
+    let extension = path.extension().and_then(|e| e.to_str());
+    (2u64..)
+        .map(|n| match extension {
+            Some(extension) => format!("{stem} {n}.{extension}"),
+            None => format!("{stem} {n}"),
+        })
+        .find(|candidate| !taken(candidate))
+        .expect("an unbounded counter finds a free name")
+}
+
+/// `-trashItemAtURL:resultingItemURL:error:`: move the item into `~/.Trash`
+/// and hand back where it landed.
+///
+/// FIXME (ACCURACY): items on another volume fail with a cross-device error
+/// rather than going to that volume's `/.Trashes/<uid>`.
+unsafe extern "C" fn trash_item_at_url(
+    _receiver: Id,
+    _sel: Sel,
+    url: Id,
+    resulting: *mut Id,
+    error: *mut Id,
+) -> u8 {
+    // SAFETY: null or writable.
+    unsafe { no_error(error) };
+    if !resulting.is_null() {
+        // SAFETY: non-null, and writable by the caller's obligation.
+        unsafe { *resulting = std::ptr::null_mut() };
+    }
+    // SAFETY: an `NSURL`, or nil.
+    let Some(guest) =
+        (unsafe { corefoundation::url::as_url(url as CFTypeRef) }).and_then(|u| u.file_path())
+    else {
+        return 0;
+    };
+    let Some(name) = std::path::Path::new(&guest)
+        .file_name()
+        .and_then(|n| n.to_str())
+    else {
+        return 0;
+    };
+    let from = prefix::ns::existing_host_path(&guest);
+    let is_directory = match std::fs::symlink_metadata(&from) {
+        Ok(metadata) => metadata.is_dir(),
+        // SAFETY: null or writable.
+        Err(cause) => return unsafe { report(error, &from, Err(cause)) },
+    };
+    let guest_trash = trash_directory();
+    let trash = prefix::ns::host_path(&guest_trash);
+    // Owner-only, as macOS creates it: the trash holds whatever the user threw
+    // away, including things other users could not read in place.
+    let made =
+        std::os::unix::fs::DirBuilderExt::mode(std::fs::DirBuilder::new().recursive(true), 0o700)
+            .create(&trash);
+    if made.is_err() {
+        // SAFETY: null or writable.
+        return unsafe { report(error, &trash, made) };
+    }
+    let name = free_name(&trash, name);
+    // SAFETY: null or writable.
+    if unsafe { report(error, &from, std::fs::rename(&from, trash.join(&name))) } == 0 {
+        return 0;
+    }
+    if !resulting.is_null() {
+        let landed =
+            corefoundation::url::new_file_url(&format!("{guest_trash}/{name}"), is_directory);
+        // SAFETY: a URL this call just made; the slot is writable.
+        unsafe { *resulting = corefoundation::api::CFAutorelease(landed) as Id };
+    }
+    1
+}
+
 /// The `NSURLRelationship` between a directory and an item, using Apple's
 /// declaration order: contains, same, other.
 fn url_relationship(directory: &str, item: &str) -> isize {
@@ -1072,6 +1162,8 @@ pub(crate) fn install() {
         "removeItemAtURL:error:" => remove_item_at_url, c"B32@0:8@16^@24";
         "moveItemAtURL:toURL:error:" => move_item_at_url, c"B40@0:8@16@24^@32";
         "copyItemAtURL:toURL:error:" => copy_item_at_url, c"B40@0:8@16@24^@32";
+        "trashItemAtURL:resultingItemURL:error:"
+            => trash_item_at_url, c"B40@0:8@16^@24^@32";
         "URLsForDirectory:inDomains:" => urls_for_directory, c"@32@0:8Q16Q24";
         "URLForDirectory:inDomain:appropriateForURL:create:error:"
             => url_for_directory, c"@52@0:8Q16Q24@32c40^@44";
@@ -1308,5 +1400,17 @@ mod tests {
     #[test]
     fn the_default_manager_is_one_object() {
         assert_eq!(manager(), manager());
+    }
+
+    #[test]
+    fn trash_names_avoid_items_already_trashed() {
+        let trash = std::env::temp_dir().join(format!("rosemary-trash-{}", std::process::id()));
+        std::fs::create_dir_all(&trash).unwrap();
+        assert_eq!(free_name(&trash, "notes.txt"), "notes.txt");
+        std::fs::write(trash.join("notes.txt"), b"").unwrap();
+        assert_eq!(free_name(&trash, "notes.txt"), "notes 2.txt");
+        std::fs::create_dir(trash.join("folder")).unwrap();
+        assert_eq!(free_name(&trash, "folder"), "folder 2");
+        std::fs::remove_dir_all(&trash).unwrap();
     }
 }
