@@ -166,7 +166,8 @@ pub struct Gpu {
     secondaries: Mutex<Vec<SecondaryContext>>,
     context_budget: ContextBudget,
     descriptor_pools: Mutex<Vec<vk::DescriptorPool>>,
-    upload_chunks: Mutex<Vec<GpuBuffer>>,
+    /// Each with when it was handed back, as for `staging_buffers`.
+    upload_chunks: Mutex<Vec<(GpuBuffer, std::time::Instant)>>,
     /// Larger host-visible buffers for texture uploads and readbacks.
     /// Each with when it was handed back, so idle ones can be freed.
     staging_buffers: Mutex<Vec<(GpuBuffer, std::time::Instant)>>,
@@ -278,6 +279,19 @@ impl ContextBudget {
             available: std::sync::Condvar::new(),
             limit,
         }
+    }
+
+    /// How many retired command contexts are kept for reuse. A larger budget
+    /// lets more command buffers retire together, and each one past this is
+    /// rebuilt from scratch on the next acquire.
+    fn recycled_contexts(&self) -> usize {
+        self.limit.div_ceil(2)
+    }
+
+    /// How many upload chunks are kept for reuse, in proportion to the
+    /// command buffers whose `-setBytes:` copies they hold.
+    fn recycled_upload_chunks(&self) -> usize {
+        self.limit.div_ceil(4)
     }
 }
 

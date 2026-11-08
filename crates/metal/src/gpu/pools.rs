@@ -150,7 +150,7 @@ impl Gpu {
                 .reset_command_pool(context.pool, vk::CommandPoolResetFlags::empty())
         };
         let mut contexts = self.contexts.lock().expect("command contexts");
-        if reset.is_ok() && contexts.len() < RECYCLED {
+        if reset.is_ok() && contexts.len() < self.context_budget.recycled_contexts() {
             contexts.push(context);
             return;
         }
@@ -282,7 +282,7 @@ impl Gpu {
     /// Not zeroed: a descriptor or copy only ever covers bytes an upload
     /// wrote, and a recycled chunk holds earlier uploads anyway.
     pub fn acquire_upload_chunk(&self) -> Result<GpuBuffer, String> {
-        if let Some(chunk) = self.upload_chunks.lock().expect("upload chunks").pop() {
+        if let Some((chunk, _)) = self.upload_chunks.lock().expect("upload chunks").pop() {
             return Ok(chunk);
         }
         self.create_staging_buffer(UPLOAD_CHUNK)
@@ -322,9 +322,14 @@ impl Gpu {
             .for_each(|buffer| self.destroy_buffer(buffer));
     }
 
-    /// Free the pooled staging buffers left unused for [`STAGING_IDLE`].
+    /// Free the pooled staging buffers and upload chunks left unused for
+    /// [`STAGING_IDLE`].
     pub(super) fn trim_staging_buffers(&self) {
-        let idle = take_idle_staging(&mut self.staging_buffers.lock().expect("staging buffers"));
+        let mut idle =
+            take_idle_staging(&mut self.staging_buffers.lock().expect("staging buffers"));
+        idle.extend(take_idle_staging(
+            &mut self.upload_chunks.lock().expect("upload chunks"),
+        ));
         idle.into_iter()
             .for_each(|buffer| self.destroy_buffer(buffer));
     }
@@ -332,8 +337,8 @@ impl Gpu {
     /// Hand back an upload chunk no pending submission still reads.
     pub fn release_upload_chunk(&self, chunk: GpuBuffer) {
         let mut chunks = self.upload_chunks.lock().expect("upload chunks");
-        if chunks.len() < RECYCLED / 2 {
-            chunks.push(chunk);
+        if chunks.len() < self.context_budget.recycled_upload_chunks() {
+            chunks.push((chunk, std::time::Instant::now()));
             return;
         }
         drop(chunks);
