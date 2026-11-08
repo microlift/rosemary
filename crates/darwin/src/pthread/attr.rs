@@ -254,6 +254,22 @@ impl Drop for HostAttr {
     }
 }
 
+/// Darwin's default thread stack, which a guest reading back a size it never set
+/// must be told.
+pub const DEFAULT_STACK_SIZE: usize = 512 * 1024;
+
+/// The smallest stack `pthread_attr_setstacksize` takes.
+pub const STACK_MIN: usize = 16 * 1024;
+
+/// The page a stack size is a multiple of, and the default guard, as Darwin
+/// reports them.
+const PAGE_SIZE: usize = 4096;
+
+/// Whether `pthread_attr_setstacksize` accepts `size`.
+pub fn valid_stack_size(size: usize) -> bool {
+    size >= STACK_MIN && size.is_multiple_of(PAGE_SIZE)
+}
+
 pub mod imp {
     use super::*;
     use crate::pthread::object::ours;
@@ -369,7 +385,7 @@ pub mod imp {
         }
     }
     setter!(attr_setstacksize, slot::STACK_SIZE, |v| {
-        v >= 16 * 1024 && v.is_multiple_of(DEFAULT_GUARD)
+        usize::try_from(v).is_ok_and(super::valid_stack_size)
     });
     setter!(attr_setstackaddr, slot::STACK_TOP, |v| {
         v != 0 && v.is_multiple_of(DEFAULT_GUARD)
@@ -590,11 +606,8 @@ pub mod imp {
         0
     }
 
-    /// Darwin's default thread stack, which a guest reading back a size it never set
-    /// must be told.
-    const DEFAULT_STACK: u64 = 512 * 1024;
-    /// And its default guard, one page as Darwin reports it.
-    const DEFAULT_GUARD: u64 = 4096;
+    const DEFAULT_STACK: u64 = super::DEFAULT_STACK_SIZE as u64;
+    const DEFAULT_GUARD: u64 = super::PAGE_SIZE as u64;
 }
 
 #[cfg(test)]
