@@ -8,6 +8,10 @@ Rosemary supports a variety of distributions and installation methods. This docu
 
 See Butter's installation page for further documentation.
 
+## AppImage
+
+Rosemary distributes portable AppImages on its [releases](https://github.com/microlift/rosemary/releases) page. Simply download the .appimage bundle for your selected version and run it. It should work across most glibc distributions. Rosemary bundles its own versions of most dependencies that are necessary, so no additional setup is required - it should be almost entirely self contained, save for GPU drivers which are provided by the host.
+
 ## As a Steam Compatibility Tool
 
 Rosemary has official releases as a Steam compatibility tool, similar to Proton GE. Installing Rosemary this way allows running macOS Steam games in your native Linux Steam client with no further setup, and without a macOS Steam installation in the prefix.
