@@ -2107,8 +2107,7 @@ dependencies = [
 [[package]]
 name = "mmapio"
 version = "0.9.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0204e2cac68f5b2e35b7ec8cb5d906f6e58e78dad8066a30b6ee54da99bb03dd"
+source = "git+https://github.com/microlift/mmapio#63737181a5d41923a8c8d9a837f1460c102c0ada"
 dependencies = [
  "libc",
  "winapi",

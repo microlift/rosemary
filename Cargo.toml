@@ -80,6 +80,8 @@ libffi = "5.2.0"
 # libmalloc's guarantees. See third_party/libmimalloc-sys/ROSEMARY.md.
 [patch.crates-io]
 libmimalloc-sys = { path = "third_party/libmimalloc-sys" }
+# rust-fontconfig's mmapio, ported to FreeBSD (no MAP_LOCKED there).
+mmapio = { git = "https://github.com/microlift/mmapio" }
 
 [profile.fullnative]
 inherits = "release"
