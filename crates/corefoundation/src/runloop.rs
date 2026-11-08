@@ -20,6 +20,9 @@ pub struct Source {
     signalled: AtomicBool,
     perform: Option<Perform>,
     info: usize,
+    /// Whether the calling thread may run the callback, asked with `info`; any
+    /// thread may when unset.
+    affinity: Option<fn(usize) -> bool>,
     /// Set when the source is invalidated, after which the loop drops it.
     valid: AtomicBool,
 }
@@ -52,6 +55,9 @@ impl Source {
     /// Apple's loop: a thread that parks in its loop and is woken that way
     /// relies on the run returning.
     fn fire(&self) -> bool {
+        if self.affinity.is_some_and(|runs_here| !runs_here(self.info)) {
+            return false;
+        }
         if !self.signalled.swap(false, Ordering::AcqRel) || !self.is_valid() {
             return false;
         }
@@ -314,6 +320,12 @@ impl RunLoop {
             .unwrap_or_else(|e| e.into_inner())
             .last()
             .cloned()
+    }
+
+    /// Whether an item added under `requested` - a mode, or the common-modes
+    /// alias - runs when the loop is in `mode`.
+    pub fn includes(&self, requested: &str, mode: &str) -> bool {
+        self.names(requested).iter().any(|name| name == mode)
     }
 
     /// The modes a name refers to: itself, or the common set for the alias.
@@ -710,10 +722,31 @@ pub fn new_observer(
 
 /// Build a version-0 source.
 pub fn new_source(perform: Option<Perform>, info: usize) -> Arc<Source> {
+    make_source(perform, info, None)
+}
+
+/// Build a version-0 source that fires only on a thread `affinity` accepts,
+/// staying signalled until one runs its loop.
+///
+/// For work that belongs to one thread, on a loop more than one thread may run.
+pub fn new_source_with_affinity(
+    perform: Perform,
+    info: usize,
+    affinity: fn(usize) -> bool,
+) -> Arc<Source> {
+    make_source(Some(perform), info, Some(affinity))
+}
+
+fn make_source(
+    perform: Option<Perform>,
+    info: usize,
+    affinity: Option<fn(usize) -> bool>,
+) -> Arc<Source> {
     let source = Arc::new(Source {
         signalled: AtomicBool::new(false),
         perform,
         info,
+        affinity,
         valid: AtomicBool::new(true),
     });
     note(Arc::as_ptr(&source));
