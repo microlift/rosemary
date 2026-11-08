@@ -128,6 +128,13 @@ pub struct Gpu {
     /// The blocks `MTLStorageModePrivate` buffers are cut out of: device
     /// memory, never mapped.
     private_buffers: OnceLock<Heap>,
+    /// The blocks ordinary textures are cut out of, one heap per memory
+    /// type: textures disagree on which types admit them, and none is
+    /// linear, so none needs `bufferImageGranularity` from a neighbour.
+    private_images: [OnceLock<Heap>; vk::MAX_MEMORY_TYPES],
+    /// Zeros a reused heap range is copied from where a texture cannot be
+    /// cleared: see `Gpu::zero_image`. Never written after it is made.
+    zeros: OnceLock<vk::Buffer>,
     /// Two-timestamp query pools, one per command buffer in flight, kept for
     /// reuse by command-buffer timing and the optional statistics.
     timestamp_pools: Mutex<Vec<vk::QueryPool>>,
@@ -286,6 +293,10 @@ pub const UPLOAD_CHUNK: u64 = 256 << 10;
 /// The most staging memory a device keeps for reuse between transfers too
 /// large for an upload chunk.
 const STAGING_POOL_BYTES: u64 = 64 << 20;
+
+/// The size of the zero-filled buffer textures that cannot be cleared are
+/// copied from, a band at a time.
+const ZERO_SOURCE: u64 = 1 << 20;
 
 /// How long a pooled staging buffer may sit unused before it is freed, so a
 /// burst of large transfers does not keep its memory for good.
@@ -816,6 +827,8 @@ impl Gpu {
             fail_immediate_wait_after_submit: AtomicBool::new(false),
             buffers: OnceLock::new(),
             private_buffers: OnceLock::new(),
+            private_images: std::array::from_fn(|_| OnceLock::new()),
+            zeros: OnceLock::new(),
             timestamp_pools: Mutex::new(Vec::new()),
             timestamp_period: properties.limits.timestamp_period,
             timestamp_valid_bits: families[queue_family as usize].timestamp_valid_bits,
@@ -904,6 +917,9 @@ unsafe impl Send for GpuBuffer {}
 pub struct GpuImage {
     pub image: vk::Image,
     pub memory: Option<vk::DeviceMemory>,
+    /// The private-image heap range it is bound into, and that heap's memory
+    /// type, instead of `memory`.
+    pub heap: Option<(u32, Allocation)>,
     /// The placement heap memory it is bound into, instead of `memory`.
     pub placement: Option<Arc<Placement>>,
     pub view: vk::ImageView,
@@ -1049,6 +1065,7 @@ impl GpuImage {
         Self {
             image: vk::Image::null(),
             memory: None,
+            heap: None,
             placement: None,
             view: vk::ImageView::null(),
             format: vk::Format::UNDEFINED,

@@ -34,24 +34,20 @@ impl Gpu {
         })
     }
 
-    /// Allocate memory for `requirements`, preferring `wanted` and falling back
-    /// to `accepted` when the device has no such heap.
-    fn allocate(
-        &self,
-        requirements: vk::MemoryRequirements,
-        wanted: vk::MemoryPropertyFlags,
-        accepted: vk::MemoryPropertyFlags,
-    ) -> Result<vk::DeviceMemory, String> {
-        let index = self
-            .memory_type(requirements.memory_type_bits, wanted)
-            .or_else(|| self.memory_type(requirements.memory_type_bits, accepted))
-            .ok_or("no Vulkan memory type satisfies the allocation")?;
-        let info = vk::MemoryAllocateInfo::default()
-            .allocation_size(requirements.size)
-            .memory_type_index(index);
-        // SAFETY: a well-formed allocation on this live device.
-        unsafe { self.device.allocate_memory(&info, None) }
-            .map_err(|error| format!("vkAllocateMemory failed with {error:?}"))
+    /// Device-local memory the host cannot see where there is some, which on
+    /// a discrete adapter is video memory rather than the small mappable
+    /// window into it; otherwise any device-local type, otherwise any.
+    fn private_memory_type(&self, bits: u32) -> Option<u32> {
+        let local = vk::MemoryPropertyFlags::DEVICE_LOCAL;
+        (0..self.memory.memory_type_count)
+            .find(|index| {
+                let flags = self.memory.memory_types[*index as usize].property_flags;
+                bits & (1 << index) != 0
+                    && flags.contains(local)
+                    && !flags.contains(vk::MemoryPropertyFlags::HOST_VISIBLE)
+            })
+            .or_else(|| self.memory_type(bits, local))
+            .or_else(|| self.memory_type(bits, vk::MemoryPropertyFlags::empty()))
     }
 
     /// A Metal buffer: host visible so `-contents` can hand the guest a
@@ -229,19 +225,28 @@ impl Gpu {
     pub fn heap_report(&self) -> Option<String> {
         let shared = self.buffers.get().map_or((0, 0, 0), Heap::usage);
         let private = self.private_buffers.get().map_or((0, 0, 0), Heap::usage);
+        let images = self
+            .private_images
+            .iter()
+            .filter_map(OnceLock::get)
+            .map(Heap::usage)
+            .fold((0, 0, 0), |sum, usage| {
+                (sum.0 + usage.0, sum.1 + usage.1, sum.2 + usage.2)
+            });
         let imported = self
             .host_imported
             .load(std::sync::atomic::Ordering::Relaxed);
-        if shared.0 + private.0 == 0 && imported == 0 {
+        if shared.0 + private.0 + images.0 == 0 && imported == 0 {
             return None;
         }
         let usage = |(blocks, bytes, free): (usize, u64, u64)| {
             format!("{blocks}/{}MiB/{}MiB", bytes >> 20, free >> 20)
         };
         Some(format!(
-            "shared_heap(blocks/held/free)={} private_heap={} host_imported={}MiB",
+            "shared_heap(blocks/held/free)={} private_heap={} image_heap={} host_imported={}MiB",
             usage(shared),
             usage(private),
+            usage(images),
             imported >> 20,
         ))
     }
@@ -263,27 +268,147 @@ impl Gpu {
         Ok(self.buffers.get_or_init(|| Heap::new(index, true)))
     }
 
-    /// The heap private buffers are cut from: device-local memory, preferring
-    /// a type the host cannot see, which on a discrete adapter is video
-    /// memory rather than the small mappable window into it. Where there is
-    /// none - a device with no device-local type admitting buffers - private
-    /// buffers share the ordinary heap's memory type, unmapped.
+    /// The heap private buffers are cut from, of `private_memory_type`.
+    /// Every buffer reports the same admissible types, so one heap serves.
     fn private_buffer_heap(&self, bits: u32) -> Result<&Heap, String> {
         if let Some(heap) = self.private_buffers.get() {
             return Ok(heap);
         }
-        let local = vk::MemoryPropertyFlags::DEVICE_LOCAL;
-        let index = (0..self.memory.memory_type_count)
-            .find(|index| {
-                let flags = self.memory.memory_types[*index as usize].property_flags;
-                bits & (1 << index) != 0
-                    && flags.contains(local)
-                    && !flags.contains(vk::MemoryPropertyFlags::HOST_VISIBLE)
-            })
-            .or_else(|| self.memory_type(bits, local))
-            .or_else(|| self.memory_type(bits, vk::MemoryPropertyFlags::empty()))
+        let index = self
+            .private_memory_type(bits)
             .ok_or("no Vulkan memory type admits a private buffer")?;
         Ok(self.private_buffers.get_or_init(|| Heap::new(index, false)))
+    }
+
+    /// What `image` needs, and whether the driver prefers or requires it to
+    /// have memory of its own.
+    fn image_memory_requirements(&self, image: vk::Image) -> (vk::MemoryRequirements, bool) {
+        let mut dedicated = vk::MemoryDedicatedRequirements::default();
+        let mut requirements = vk::MemoryRequirements2::default().push_next(&mut dedicated);
+        let info = vk::ImageMemoryRequirementsInfo2::default().image(image);
+        // SAFETY: an image of this device's, and a well-formed query chain.
+        unsafe {
+            self.device
+                .get_image_memory_requirements2(&info, &mut requirements)
+        };
+        let requirements = requirements.memory_requirements;
+        let dedicated = dedicated.prefers_dedicated_allocation == vk::TRUE
+            || dedicated.requires_dedicated_allocation == vk::TRUE;
+        (requirements, dedicated)
+    }
+
+    /// Bind a fresh image into a range of the private-image heap, or into
+    /// memory of its own where the driver asks for that or the heap cannot
+    /// grow.
+    fn bind_private_image(
+        &self,
+        image: vk::Image,
+        requirements: &vk::MemoryRequirements,
+        dedicated: bool,
+    ) -> Result<(Option<vk::DeviceMemory>, Option<(u32, Allocation)>), String> {
+        let memory_type = self
+            .private_memory_type(requirements.memory_type_bits)
+            .ok_or("no Vulkan memory type admits the texture")?;
+        let heap = &self.private_images[memory_type as usize];
+        let heap = heap.get_or_init(|| Heap::new(memory_type, false));
+        // A heap which cannot allocate another block may still leave room
+        // for an allocation of exactly this image's size.
+        let pooled = match dedicated {
+            true => None,
+            false => heap
+                .allocate(&self.device, requirements.size, requirements.alignment)
+                .ok(),
+        };
+        if let Some(allocation) = pooled {
+            let allocation = Guard::new(allocation, |allocation| {
+                heap.free(&self.device, allocation);
+            });
+            // SAFETY: a fresh, unbound image and a range nothing else holds.
+            unsafe {
+                self.device
+                    .bind_image_memory(image, allocation.memory, allocation.offset())
+            }
+            .map_err(|error| format!("vkBindImageMemory failed with {error:?}"))?;
+            return Ok((None, Some((memory_type, allocation.take()))));
+        }
+        let mut dedicated = vk::MemoryDedicatedAllocateInfo::default().image(image);
+        let info = vk::MemoryAllocateInfo::default()
+            .allocation_size(requirements.size)
+            .memory_type_index(memory_type)
+            .push_next(&mut dedicated);
+        // SAFETY: a well-formed allocation on this live device, dedicated to
+        // an image of its own.
+        let memory = unsafe { self.device.allocate_memory(&info, None) }
+            .map_err(|error| format!("vkAllocateMemory failed with {error:?}"))?;
+        let memory = Guard::new(memory, |memory| {
+            // SAFETY: memory of this device's, bound to nothing which survives.
+            unsafe { self.device.free_memory(memory, None) };
+        });
+        // SAFETY: fresh, unbound image and memory from this device.
+        unsafe { self.device.bind_image_memory(image, *memory, 0) }
+            .map_err(|error| format!("vkBindImageMemory failed with {error:?}"))?;
+        Ok((Some(memory.take()), None))
+    }
+
+    /// The buffer of zeros `zero_image` copies from.
+    fn zero_source(&self) -> Result<vk::Buffer, String> {
+        if let Some(buffer) = self.zeros.get() {
+            return Ok(*buffer);
+        }
+        let made = self.create_buffer(ZERO_SOURCE)?;
+        let kept = *self.zeros.get_or_init(|| made.buffer);
+        if kept != made.buffer {
+            self.destroy_buffer(made);
+        }
+        Ok(kept)
+    }
+
+    /// Record zeroing every texel of `image`, as fresh memory would read. It
+    /// must already be in `GENERAL`.
+    fn zero_image(
+        &self,
+        batch: &mut super::deferred::Batch,
+        image: vk::Image,
+        description: &ImageDescription,
+        range: vk::ImageSubresourceRange,
+        zeros: Option<vk::Buffer>,
+    ) {
+        batch.touch_image(self, image);
+        let command_buffer = batch.command_buffer();
+        let layout = vk::ImageLayout::GENERAL;
+        if range
+            .aspect_mask
+            .intersects(vk::ImageAspectFlags::DEPTH | vk::ImageAspectFlags::STENCIL)
+        {
+            let value = vk::ClearDepthStencilValue::default();
+            // SAFETY: the batch is recording, and the image is this device's.
+            unsafe {
+                self.device.cmd_clear_depth_stencil_image(
+                    command_buffer,
+                    image,
+                    layout,
+                    &value,
+                    &[range],
+                )
+            };
+            return;
+        }
+        // Vulkan cannot clear a block-compressed image, so it is copied over.
+        let Some(zeros) = zeros else {
+            let value = vk::ClearColorValue::default();
+            // SAFETY: as above.
+            unsafe {
+                self.device
+                    .cmd_clear_color_image(command_buffer, image, layout, &value, &[range])
+            };
+            return;
+        };
+        let regions = zeroing_copies(description, ZERO_SOURCE);
+        // SAFETY: as above; every region reads within the zero source.
+        unsafe {
+            self.device
+                .cmd_copy_buffer_to_image(command_buffer, zeros, image, layout, &regions)
+        };
     }
 
     pub fn create_image(&self, description: &ImageDescription) -> Result<GpuImage, String> {
@@ -402,23 +527,23 @@ impl Gpu {
             // SAFETY: an image of this device's, referred to by nothing.
             unsafe { self.device.destroy_image(image, None) };
         });
-        // SAFETY: the image was just created by this device.
-        let requirements = unsafe { self.device.get_image_memory_requirements(*image) };
+        let (requirements, dedicated) = self.image_memory_requirements(*image);
         let (memory, placement) = match placed {
             None => {
-                let memory = self.allocate(
-                    requirements,
-                    vk::MemoryPropertyFlags::DEVICE_LOCAL,
-                    vk::MemoryPropertyFlags::empty(),
-                )?;
-                let memory = Guard::new(memory, |memory| {
-                    // SAFETY: memory of this device's, bound to nothing which
-                    // survives.
-                    unsafe { self.device.free_memory(memory, None) };
+                let memory = self.bind_private_image(*image, &requirements, dedicated)?;
+                let memory = Guard::new(memory, |(memory, heap)| {
+                    if let Some(memory) = memory {
+                        // SAFETY: memory of this device's, bound to nothing
+                        // which survives.
+                        unsafe { self.device.free_memory(memory, None) };
+                    }
+                    if let Some((memory_type, allocation)) = heap {
+                        self.private_images[memory_type as usize]
+                            .get()
+                            .expect("the heap the range came from")
+                            .free(&self.device, allocation);
+                    }
                 });
-                // SAFETY: fresh, unbound image and memory from this device.
-                unsafe { self.device.bind_image_memory(*image, *memory, 0) }
-                    .map_err(|error| format!("vkBindImageMemory failed with {error:?}"))?;
                 (Some(memory), None)
             }
             Some((placement, offset)) => {
@@ -436,6 +561,15 @@ impl Gpu {
         let aspect = aspect_of(description.format);
         let levels = description.levels.max(1);
         let layers = description.layers.max(1);
+        // Metal's new textures read as zeros; a reused heap range does not.
+        let reused = memory
+            .as_ref()
+            .and_then(|memory| memory.1)
+            .is_some_and(|(_, allocation)| !allocation.pristine);
+        let zeros = match reused && block_extent(description.format) != (1, 1) {
+            true => Some(self.zero_source()?),
+            false => None,
+        };
         let view = self.create_view(*image, description, usage)?;
         let view = Guard::new(view, |view| {
             // SAFETY: a view of this device's which nothing has used.
@@ -446,19 +580,20 @@ impl Gpu {
         // batch then names the image.
         self.defer(|gpu, batch| {
             batch.name(gpu, *image, placement.as_deref());
+            let range = vk::ImageSubresourceRange {
+                aspect_mask: aspect,
+                base_mip_level: 0,
+                level_count: levels,
+                base_array_layer: 0,
+                layer_count: layers,
+            };
             let barrier = vk::ImageMemoryBarrier::default()
                 .old_layout(vk::ImageLayout::UNDEFINED)
                 .new_layout(vk::ImageLayout::GENERAL)
                 .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
                 .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
                 .image(*image)
-                .subresource_range(vk::ImageSubresourceRange {
-                    aspect_mask: aspect,
-                    base_mip_level: 0,
-                    level_count: levels,
-                    base_array_layer: 0,
-                    layer_count: layers,
-                })
+                .subresource_range(range)
                 .dst_access_mask(vk::AccessFlags::MEMORY_READ | vk::AccessFlags::MEMORY_WRITE);
             // SAFETY: recording into the batch's command buffer, which the
             // batch lock gives this thread alone.
@@ -473,12 +608,17 @@ impl Gpu {
                     &[barrier],
                 )
             };
+            if reused {
+                gpu.zero_image(batch, *image, description, range, zeros);
+            }
             Ok(())
         })?;
         let view = view.take();
+        let (memory, heap) = memory.map_or((None, None), Guard::take);
         Ok(GpuImage {
             image: image.take(),
-            memory: memory.map(Guard::take),
+            memory,
+            heap,
             placement,
             view,
             format: description.format,
@@ -561,6 +701,7 @@ impl Gpu {
         Ok(GpuImage {
             image: source.image,
             memory: None,
+            heap: None,
             placement: None,
             view,
             format,
@@ -582,6 +723,7 @@ impl Gpu {
         let image = GpuImage {
             image: vk::Image::null(),
             memory: None,
+            heap: None,
             placement: None,
             ..image
         };
@@ -639,6 +781,11 @@ impl Gpu {
                 self.device.free_memory(memory, None);
             }
         }
+        if let Some((memory_type, allocation)) = image.heap
+            && let Some(heap) = self.private_images[memory_type as usize].get()
+        {
+            heap.free(&self.device, allocation);
+        }
         // Only now that the image is gone may its heap's memory go.
         drop(image.placement);
     }
@@ -666,9 +813,15 @@ impl Gpu {
         let mut key = bindings.to_vec();
         key.sort_unstable();
         key.dedup();
-        let mut cache = self.layouts.lock().expect("descriptor layout cache");
         let key = (key, stages, push);
-        if let Some(layout) = cache.get(&key) {
+        // Not held across creation, so a miss cannot block other threads'
+        // hits; see `RenderPipeline::variant`.
+        if let Some(layout) = self
+            .layouts
+            .lock()
+            .expect("descriptor layout cache")
+            .get(&key)
+        {
             return Ok(*layout);
         }
         let entries = key
@@ -690,11 +843,22 @@ impl Gpu {
         let info = vk::DescriptorSetLayoutCreateInfo::default()
             .flags(flags)
             .bindings(&entries);
-        // SAFETY: the bindings live across the call.
-        let layout = unsafe { self.device.create_descriptor_set_layout(&info, None) }
-            .map_err(|error| format!("vkCreateDescriptorSetLayout failed with {error:?}"))?;
-        cache.insert(key, layout);
-        Ok(layout)
+        let layout = crate::stats::timed(crate::stats::Counter::DescriptorLayoutMicros, || {
+            // SAFETY: the bindings live across the call.
+            unsafe { self.device.create_descriptor_set_layout(&info, None) }
+                .map_err(|error| format!("vkCreateDescriptorSetLayout failed with {error:?}"))
+        })?;
+        crate::stats::count(crate::stats::Counter::DescriptorLayoutsCreated);
+        let mut cache = self.layouts.lock().expect("descriptor layout cache");
+        match cache.entry(key) {
+            std::collections::hash_map::Entry::Occupied(made) => {
+                // Another thread made it first; this one was never recorded.
+                // SAFETY: a layout of this device's which nothing refers to.
+                unsafe { self.device.destroy_descriptor_set_layout(layout, None) };
+                Ok(*made.get())
+            }
+            std::collections::hash_map::Entry::Vacant(slot) => Ok(*slot.insert(layout)),
+        }
     }
 
     /// Every attachment is used in `GENERAL` layout.
@@ -711,8 +875,14 @@ impl Gpu {
     /// because each of the twenty-five passes in a frame then decompresses its
     /// attachments on the way out.
     pub fn render_pass(&self, key: &RenderPassKey) -> Result<vk::RenderPass, String> {
-        let mut cache = self.render_passes.lock().expect("render pass cache");
-        if let Some(pass) = cache.get(key) {
+        // Not held across creation, so a miss cannot block other threads'
+        // hits; see `RenderPipeline::variant`.
+        if let Some(pass) = self
+            .render_passes
+            .lock()
+            .expect("render pass cache")
+            .get(key)
+        {
             return Ok(*pass);
         }
         let mut attachments = Vec::new();
@@ -807,36 +977,47 @@ impl Gpu {
             );
             (resolve, reference)
         });
-        let pass = match depth_resolve {
-            Some((resolve, reference)) => self.create_depth_resolving_pass(
-                &attachments,
-                &colors,
-                &resolves,
-                depth,
-                resolve,
-                reference,
-            )?,
-            None => {
-                let mut subpass = vk::SubpassDescription::default()
-                    .pipeline_bind_point(vk::PipelineBindPoint::GRAPHICS)
-                    .color_attachments(&colors);
-                if !resolves.is_empty() {
-                    subpass = subpass.resolve_attachments(&resolves);
+        let pass = crate::stats::timed(crate::stats::Counter::RenderPassMicros, || {
+            match depth_resolve {
+                Some((resolve, reference)) => self.create_depth_resolving_pass(
+                    &attachments,
+                    &colors,
+                    &resolves,
+                    depth,
+                    resolve,
+                    reference,
+                ),
+                None => {
+                    let mut subpass = vk::SubpassDescription::default()
+                        .pipeline_bind_point(vk::PipelineBindPoint::GRAPHICS)
+                        .color_attachments(&colors);
+                    if !resolves.is_empty() {
+                        subpass = subpass.resolve_attachments(&resolves);
+                    }
+                    if let Some(depth) = &depth {
+                        subpass = subpass.depth_stencil_attachment(depth);
+                    }
+                    let subpasses = [subpass];
+                    let info = vk::RenderPassCreateInfo::default()
+                        .attachments(&attachments)
+                        .subpasses(&subpasses);
+                    // SAFETY: every borrowed slice lives across the call.
+                    unsafe { self.device.create_render_pass(&info, None) }
+                        .map_err(|error| format!("vkCreateRenderPass failed with {error:?}"))
                 }
-                if let Some(depth) = &depth {
-                    subpass = subpass.depth_stencil_attachment(depth);
-                }
-                let subpasses = [subpass];
-                let info = vk::RenderPassCreateInfo::default()
-                    .attachments(&attachments)
-                    .subpasses(&subpasses);
-                // SAFETY: every borrowed slice lives across the call.
-                unsafe { self.device.create_render_pass(&info, None) }
-                    .map_err(|error| format!("vkCreateRenderPass failed with {error:?}"))?
             }
-        };
-        cache.insert(key.clone(), pass);
-        Ok(pass)
+        })?;
+        crate::stats::count(crate::stats::Counter::RenderPassesCreated);
+        let mut cache = self.render_passes.lock().expect("render pass cache");
+        match cache.entry(key.clone()) {
+            std::collections::hash_map::Entry::Occupied(made) => {
+                // Another thread made it first; this one was never recorded.
+                // SAFETY: a render pass of this device's which nothing refers to.
+                unsafe { self.device.destroy_render_pass(pass, None) };
+                Ok(*made.get())
+            }
+            std::collections::hash_map::Entry::Vacant(slot) => Ok(*slot.insert(pass)),
+        }
     }
 
     /// The same subpass through `vkCreateRenderPass2`, which is the only form
@@ -914,6 +1095,49 @@ impl Gpu {
 }
 
 /// One attachment description in the form `vkCreateRenderPass2` takes.
+/// Copies of `source` zero bytes over every texel of a block-compressed
+/// image, a band of block rows at a time, every one reading from offset 0.
+fn zeroing_copies(description: &ImageDescription, source: u64) -> Vec<vk::BufferImageCopy> {
+    let (block_width, block_height) = block_extent(description.format);
+    let block_bytes = u64::from(texel_size(description.format));
+    let mut copies = Vec::new();
+    for level in 0..description.levels.max(1) {
+        let width = (description.width >> level).max(1);
+        let height = (description.height >> level).max(1);
+        let depth = (description.depth >> level).max(1);
+        let row_bytes = u64::from(width.div_ceil(block_width)) * block_bytes;
+        let band = (source / row_bytes).max(1) as u32 * block_height;
+        for layer in 0..description.layers.max(1) {
+            for z in 0..depth {
+                for y in (0..height).step_by(band as usize) {
+                    copies.push(vk::BufferImageCopy {
+                        buffer_offset: 0,
+                        buffer_row_length: 0,
+                        buffer_image_height: 0,
+                        image_subresource: vk::ImageSubresourceLayers {
+                            aspect_mask: vk::ImageAspectFlags::COLOR,
+                            mip_level: level,
+                            base_array_layer: layer,
+                            layer_count: 1,
+                        },
+                        image_offset: vk::Offset3D {
+                            x: 0,
+                            y: y as i32,
+                            z: z as i32,
+                        },
+                        image_extent: vk::Extent3D {
+                            width,
+                            height: band.min(height - y),
+                            depth: 1,
+                        },
+                    });
+                }
+            }
+        }
+    }
+    copies
+}
+
 fn description2(description: &vk::AttachmentDescription) -> vk::AttachmentDescription2<'static> {
     vk::AttachmentDescription2::default()
         .flags(description.flags)
@@ -959,5 +1183,51 @@ fn single_aspect(aspect: vk::ImageAspectFlags) -> vk::ImageAspectFlags {
         vk::ImageAspectFlags::DEPTH
     } else {
         aspect
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn zeroing_copies_cover_every_texel_within_the_source() {
+        const SOURCE: u64 = 64 << 10;
+        let description = ImageDescription {
+            image_type: vk::ImageType::TYPE_2D,
+            view_type: vk::ImageViewType::TYPE_2D_ARRAY,
+            format: vk::Format::BC7_UNORM_BLOCK,
+            width: 1030,
+            height: 2050,
+            depth: 1,
+            levels: 12,
+            layers: 2,
+            samples: 1,
+            usage: 0,
+            cube: false,
+            components: vk::ComponentMapping::default(),
+        };
+        let copies = zeroing_copies(&description, SOURCE);
+        for level in 0..description.levels {
+            let width = (description.width >> level).max(1);
+            let height = (description.height >> level).max(1);
+            for layer in 0..description.layers {
+                let mut covered = 0;
+                for copy in copies.iter().filter(|copy| {
+                    copy.image_subresource.mip_level == level
+                        && copy.image_subresource.base_array_layer == layer
+                }) {
+                    let extent = copy.image_extent;
+                    assert_eq!(extent.width, width);
+                    assert_eq!(copy.image_offset.y as u32, covered, "bands are contiguous");
+                    let bytes = u64::from(extent.width.div_ceil(4))
+                        * u64::from(extent.height.div_ceil(4))
+                        * 16;
+                    assert!(bytes <= SOURCE, "level {level} reads past the source");
+                    covered += extent.height;
+                }
+                assert_eq!(covered, height, "level {level}, layer {layer}");
+            }
+        }
     }
 }

@@ -1836,8 +1836,8 @@ unsafe fn send_number_result(receiver: Id, selector: &str) -> u64 {
 
 /// # Safety
 ///
-/// `texture` must be an `RosemaryMTLTexture` of four bytes a texel, and
-/// `bytes` must cover the region at `bytes_per_row`.
+/// `texture` must be an `RosemaryMTLTexture`, and `bytes` must cover the
+/// region at `bytes_per_row`.
 unsafe fn replace_region(texture: Id, region: [u64; 4], bytes: &[u8], bytes_per_row: u64) {
     #[repr(C)]
     struct Region {
@@ -4790,6 +4790,74 @@ fn a_new_buffer_reads_zero_over_a_range_bytes_were_written_to() {
             }
             objc::arc::release(read_back);
         }
+    }
+}
+
+/// A texture cut from a heap range an earlier texture used must read as
+/// zeros, as fresh memory does, including formats Vulkan cannot clear.
+#[test]
+fn a_new_texture_reads_zero_over_a_range_texels_were_written_to() {
+    isolate_metal_fixture!();
+    let Some(device) = gpu_device() else {
+        return;
+    };
+    const SIZE: u64 = 64;
+    const ROUNDS: usize = 4;
+    const RGBA8_UNORM: u64 = 70;
+    const BC1_RGBA: u64 = 130;
+    let gpu = gpu_of(device).expect("a Vulkan device");
+    for (format, row_bytes) in [(RGBA8_UNORM, SIZE * 4), (BC1_RGBA, SIZE / 4 * 8)] {
+        let rows = match format {
+            BC1_RGBA => SIZE / 4,
+            _ => SIZE,
+        };
+        let length = (row_bytes * rows) as usize;
+        let make = || {
+            let texture = resource::new_texture(
+                gpu,
+                resource::TextureDescriptor {
+                    texture_type: 2,
+                    pixel_format: format,
+                    width: SIZE,
+                    height: SIZE,
+                    depth: 1,
+                    mipmap_level_count: 1,
+                    sample_count: 1,
+                    array_length: 1,
+                    storage_mode: 0,
+                    usage: gpu::USAGE_SHADER_READ,
+                },
+            );
+            assert!(!texture.is_null());
+            texture
+        };
+        let mut reused = false;
+        for round in 0..ROUNDS {
+            let dirty = make();
+            let bytes = vec![0xAB_u8; length];
+            let mut read = vec![0_u8; length];
+            // SAFETY: a texture this test made, and bytes covering it.
+            unsafe {
+                replace_region(dirty, [0, 0, SIZE, SIZE], &bytes, row_bytes);
+                get_bytes(dirty, [0, 0, SIZE, SIZE], &mut read, row_bytes);
+            }
+            assert!(read == bytes, "format {format}, round {round}");
+            objc::arc::release(dirty);
+            let clean = make();
+            // SAFETY: a texture this test made.
+            let image = unsafe { &object::body::<resource::Texture>(clean).image };
+            reused |= image
+                .heap
+                .is_some_and(|(_, allocation)| !allocation.pristine);
+            // SAFETY: as above.
+            unsafe { get_bytes(clean, [0, 0, SIZE, SIZE], &mut read, row_bytes) };
+            assert!(
+                read.iter().all(|byte| *byte == 0),
+                "format {format}, round {round}"
+            );
+            objc::arc::release(clean);
+        }
+        assert!(reused, "format {format} never landed on a reused range");
     }
 }
 

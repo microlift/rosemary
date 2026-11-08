@@ -85,6 +85,13 @@ impl Batch {
         self.order(gpu, vk::Handle::as_raw(image), Some((level, slice)));
     }
 
+    /// Note that the next command recorded writes all of `image`, which is
+    /// in memory of its own or a range of a private-image heap.
+    pub fn touch_image(&mut self, gpu: &Gpu, image: vk::Image) {
+        self.images.insert(image);
+        self.order(gpu, vk::Handle::as_raw(image), None);
+    }
+
     /// Note that the next command recorded writes `buffer`, bound into
     /// `heap` if it is placed in one.
     pub fn touch_buffer(&mut self, gpu: &Gpu, buffer: vk::Buffer, heap: Option<&Placement>) {
