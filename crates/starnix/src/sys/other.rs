@@ -28,8 +28,7 @@ use crate::system::{CpuTicks, Memory, Swap};
 
 fn exists(pid: i32) -> bool {
     // SAFETY: signal zero only checks that the pid can be signalled.
-    unsafe { libc::kill(pid, 0) == 0 }
-    || io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+    unsafe { libc::kill(pid, 0) == 0 } || io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
 }
 
 fn unsupported() -> io::Error {
