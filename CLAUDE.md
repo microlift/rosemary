@@ -115,7 +115,7 @@ and AArch64 ABIs differ enough that bridging isn't attempted — most C++ calls 
 * For calling guest code, use `darwin::call_as_darwin!`; this macro will be a necessity when Rosemary moves over to a more isolated
   guest/host execution context; think of how WINE does it, they have calls that you use to call into PE code from the Unix (host) side,
   and calls from the PE side to call into the host for DLLs implemented fully in PE. Also make sure that the Darwin thread context is initialized
-  beforehand - in the future, this macro may also initialize the thread context for you if it is not already done.
+  beforehand — in the future, this macro may also initialize the thread context for you if it is not already done.
 
 ## Testing conventions
 
