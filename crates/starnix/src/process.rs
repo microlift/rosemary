@@ -169,6 +169,8 @@ pub struct Audit {
 }
 
 /// This process's pid.
+#[inline]
+#[must_use]
 pub fn me() -> i32 {
     rustix::process::getpid().as_raw_pid()
 }
