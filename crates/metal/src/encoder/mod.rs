@@ -10,6 +10,7 @@ mod queue;
 mod render;
 mod retire;
 mod state;
+mod target;
 mod visibility;
 
 use bind::*;
@@ -24,6 +25,7 @@ use queue::*;
 use render::*;
 use retire::*;
 use state::*;
+use target::*;
 use visibility::*;
 
 use objc::address::AddressSet;
@@ -323,9 +325,9 @@ pub(crate) struct Encoder {
     /// Whether this is a parallel render sub-encoder, which records into a
     /// secondary command buffer inside a pass its parallel encoder began.
     sub_encoder: bool,
-    /// The render pass, framebuffer and area of the pass a parallel encoder
-    /// began, which its sub-encoders' command buffers inherit.
-    inheritance: Option<(vk::RenderPass, vk::Framebuffer, vk::Rect2D)>,
+    /// The pass a parallel encoder began and its area, which its
+    /// sub-encoders' command buffers inherit.
+    inheritance: Option<(Inheritance, vk::Rect2D)>,
     /// Which colour attachments of the pass being recorded are resolved, for
     /// the pipeline variant a draw needs. See [`RenderVariantKey`].
     resolve_mask: u32,

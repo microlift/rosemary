@@ -1142,9 +1142,20 @@ unsafe fn element_at(receiver: Id, index: u64) -> Id {
 #[test]
 fn a_multisampled_depth_attachment_resolves_into_its_destination() {
     isolate_metal_fixture!();
-    let Some(device) = gpu_device() else {
-        return;
-    };
+    if let Some(device) = gpu_device() {
+        check_depth_resolve(device);
+    }
+}
+
+#[test]
+fn a_multisampled_depth_attachment_resolves_without_dynamic_rendering() {
+    isolate_metal_fixture!();
+    if let Some(device) = gpu_device_without_dynamic_rendering() {
+        check_depth_resolve(device);
+    }
+}
+
+fn check_depth_resolve(device: Id) {
     let gpu = gpu_of(device).expect("a Vulkan device");
     const SAMPLES: u64 = 4;
     const SIZE: u64 = 8;
@@ -1334,6 +1345,12 @@ fn a_multisampled_depth_attachment_resolves_into_its_destination() {
             (depth - 0.5).abs() < 1.0e-5,
             "the depth resolve wrote {depth}, not the drawn 0.5"
         );
+        if gpu.dynamic_rendering {
+            // The resolve is the pass's, not the pipeline's: the draw used
+            // the pipeline compiled when the state was made.
+            let state = object::body::<pipeline::RenderPipeline>(state);
+            assert_eq!(state.variant_count(), 1);
+        }
     }
 }
 
@@ -3004,9 +3021,20 @@ fn passes_sharing_nothing_record_no_barrier_between_them() {
 #[test]
 fn a_texture_bound_after_drawing_began_waits_for_the_pass_which_drew_it() {
     isolate_metal_fixture!();
-    let Some(device) = gpu_device() else {
-        return;
-    };
+    if let Some(device) = gpu_device() {
+        check_split_pass_sees_earlier_pass(device);
+    }
+}
+
+#[test]
+fn a_split_render_pass_continues_without_dynamic_rendering() {
+    isolate_metal_fixture!();
+    if let Some(device) = gpu_device_without_dynamic_rendering() {
+        check_split_pass_sees_earlier_pass(device);
+    }
+}
+
+fn check_split_pass_sees_earlier_pass(device: Id) {
     let fixture = SamplingDraw::new(device);
     let red = fixture.filled(RED);
     let (drawn, target) = (fixture.target(), fixture.target());
@@ -3513,9 +3541,20 @@ fn an_accumulating_pass_adds_to_the_held_result() {
 #[test]
 fn parallel_sub_encoders_add_into_one_result() {
     isolate_metal_fixture!();
-    let Some(device) = gpu_device() else {
-        return;
-    };
+    if let Some(device) = gpu_device() {
+        check_parallel_sub_encoders(device);
+    }
+}
+
+#[test]
+fn parallel_sub_encoders_inherit_a_render_pass_without_dynamic_rendering() {
+    isolate_metal_fixture!();
+    if let Some(device) = gpu_device_without_dynamic_rendering() {
+        check_parallel_sub_encoders(device);
+    }
+}
+
+fn check_parallel_sub_encoders(device: Id) {
     let Some(fixture) = covering_draw(device) else {
         return;
     };
@@ -4315,6 +4354,16 @@ fn gpu_device_without_push_descriptors() -> Option<Id> {
     gpu::TEST_WITHOUT_PUSH_DESCRIPTORS.store(true, Ordering::Release);
     let device = gpu_device()?;
     assert_eq!(gpu_of(device).expect("a GPU").max_push_descriptors, 0);
+    Some(device)
+}
+
+/// A device which begins passes through render passes, as one without
+/// dynamic rendering does.
+fn gpu_device_without_dynamic_rendering() -> Option<Id> {
+    gpu::TEST_WITHOUT_DYNAMIC_RENDERING.store(true, Ordering::Release);
+    let device = gpu_device()?;
+    let gpu = gpu_of(device).expect("a GPU");
+    assert!(!gpu.dynamic_rendering);
     Some(device)
 }
 

@@ -401,7 +401,7 @@ impl RenderPipeline {
         } else {
             None
         };
-        let key = RenderPassKey {
+        let pass = RenderPassKey {
             color_resolves: vec![None; color_formats.len()],
             depth_resolve: None,
             colors: color_formats,
@@ -418,7 +418,9 @@ impl RenderPipeline {
             )),
             samples,
         };
-        gpu.render_pass(&key)?;
+        if !gpu.dynamic_rendering {
+            gpu.render_pass(&pass)?;
+        }
 
         let mut resources = vertex.resources.clone();
         resources.extend(fragment.resources.iter().cloned());
@@ -451,7 +453,7 @@ impl RenderPipeline {
             alpha_to_coverage: descriptor.alpha_to_coverage,
             alpha_to_one: descriptor.alpha_to_one,
             rasterization: descriptor.rasterization,
-            pass: key,
+            pass,
             variants: Mutex::new(Default::default()),
             profile_label: crate::profile::pipeline_label(&[vertex, fragment]),
         };
@@ -494,19 +496,22 @@ impl RenderPipeline {
         {
             return Ok(*pipeline);
         }
-        let mut shape = self.pass.clone();
-        for (index, resolve) in shape.color_resolves.iter_mut().enumerate() {
-            if key.resolve_mask & (1 << index) != 0 {
-                *resolve = Some(self.pass.colors[index].0);
-            }
-        }
-        // The resolve destination has the attachment's format, which the
-        // pipeline declared; the modes come from the pass being recorded.
-        shape.depth_resolve = match (key.depth_resolve, shape.depth) {
-            (Some(resolve), Some((format, _, _))) => Some(DepthResolve { format, ..resolve }),
-            _ => None,
+        let pass = if self.gpu.dynamic_rendering {
+            vk::RenderPass::null()
+        } else {
+            self.render_pass(key)?
         };
-        let pass = self.gpu.render_pass(&shape)?;
+        let color_formats = self
+            .pass
+            .colors
+            .iter()
+            .map(|color| color.0)
+            .collect::<Vec<_>>();
+        let (depth_format, stencil_format) = self.pass.depth_stencil_formats();
+        let mut rendering = vk::PipelineRenderingCreateInfo::default()
+            .color_attachment_formats(&color_formats)
+            .depth_attachment_format(depth_format)
+            .stencil_attachment_format(stencil_format);
         let stages = [
             vk::PipelineShaderStageCreateInfo::default()
                 .stage(vk::ShaderStageFlags::VERTEX)
@@ -592,7 +597,7 @@ impl RenderPipeline {
             ]);
         }
         let dynamic = vk::PipelineDynamicStateCreateInfo::default().dynamic_states(&dynamic_states);
-        let info = vk::GraphicsPipelineCreateInfo::default()
+        let mut info = vk::GraphicsPipelineCreateInfo::default()
             .stages(&stages)
             .vertex_input_state(&vertex_input)
             .input_assembly_state(&assembly)
@@ -605,6 +610,9 @@ impl RenderPipeline {
             .layout(self.layouts.pipeline)
             .render_pass(pass)
             .subpass(0);
+        if self.gpu.dynamic_rendering {
+            info = info.push_next(&mut rendering);
+        }
         // SAFETY: every borrowed structure lives across the call.
         let pipeline = crate::stats::pipeline(|| unsafe {
             self.gpu
@@ -625,24 +633,44 @@ impl RenderPipeline {
         }
     }
 
-    /// The key of the Vulkan pipeline a draw under `key` uses. Where the
-    /// device sets culling, winding, depth and stencil state and the exact
-    /// topology per draw, every combination of them shares one pipeline.
-    pub fn pipeline_key(&self, key: &RenderVariantKey) -> RenderVariantKey {
-        if !self.gpu.dynamic_render_state {
-            return *key;
+    /// The render pass a pipeline drawn under `key` is made against, where
+    /// the device has no dynamic rendering.
+    fn render_pass(&self, key: &RenderVariantKey) -> Result<vk::RenderPass, String> {
+        let mut shape = self.pass.clone();
+        for (index, resolve) in shape.color_resolves.iter_mut().enumerate() {
+            if key.resolve_mask & (1 << index) != 0 {
+                *resolve = Some(self.pass.colors[index].0);
+            }
         }
-        RenderVariantKey {
-            topology: match key.topology {
+        // The resolve destination has the attachment's format, which the
+        // pipeline declared; the modes come from the pass being recorded.
+        shape.depth_resolve = match (key.depth_resolve, shape.depth) {
+            (Some(resolve), Some((format, _, _))) => Some(DepthResolve { format, ..resolve }),
+            _ => None,
+        };
+        self.gpu.render_pass(&shape)
+    }
+
+    /// The key of the Vulkan pipeline a draw under `key` uses. State the
+    /// device sets per draw, or takes from the pass as it begins, is left
+    /// out, so draws differing only in it share one pipeline.
+    pub fn pipeline_key(&self, key: &RenderVariantKey) -> RenderVariantKey {
+        let mut shared = *key;
+        if self.gpu.dynamic_render_state {
+            shared.topology = match key.topology {
                 PRIMITIVE_POINT => PRIMITIVE_POINT,
                 PRIMITIVE_LINE | PRIMITIVE_LINE_STRIP => PRIMITIVE_LINE,
                 _ => PRIMITIVE_TRIANGLE,
-            },
-            cull_mode: 0,
-            winding: 0,
-            depth: DepthStencilKey::default(),
-            ..*key
+            };
+            shared.cull_mode = 0;
+            shared.winding = 0;
+            shared.depth = DepthStencilKey::default();
         }
+        if self.gpu.dynamic_rendering {
+            shared.resolve_mask = 0;
+            shared.depth_resolve = None;
+        }
+        shared
     }
 
     /// The state a draw under `key` sets per draw on a device which can.

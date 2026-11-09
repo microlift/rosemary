@@ -106,13 +106,8 @@ pub(super) unsafe extern "C" fn end_encoding(receiver: Id, _sel: Sel) {
         if encoder.lazy.is_some() {
             recorded = encoder.end_lazy_pass();
         } else {
-            // SAFETY: a render pass began when the encoder was made.
-            unsafe {
-                command
-                    .gpu
-                    .device
-                    .cmd_end_render_pass(command.command_buffer)
-            };
+            // A pass began when the encoder was made.
+            end_pass(command.gpu, command.command_buffer);
         }
         encoder.in_render_pass = false;
         visibility::resolve(encoder);

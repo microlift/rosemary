@@ -81,6 +81,33 @@ pub fn is_srgb(format: vk::Format) -> bool {
     )
 }
 
+/// Whether a colour format holds integers, which a resolve cannot average.
+pub fn is_integer(format: vk::Format) -> bool {
+    use vk::Format as F;
+    matches!(
+        format,
+        F::R8_UINT
+            | F::R8_SINT
+            | F::R16_UINT
+            | F::R16_SINT
+            | F::R8G8_UINT
+            | F::R8G8_SINT
+            | F::R32_UINT
+            | F::R32_SINT
+            | F::R16G16_UINT
+            | F::R16G16_SINT
+            | F::R8G8B8A8_UINT
+            | F::R8G8B8A8_SINT
+            | F::A2B10G10R10_UINT_PACK32
+            | F::R32G32_UINT
+            | F::R32G32_SINT
+            | F::R16G16B16A16_UINT
+            | F::R16G16B16A16_SINT
+            | F::R32G32B32A32_UINT
+            | F::R32G32B32A32_SINT
+    )
+}
+
 /// The view swizzle that makes `pixel_format(metal)` read as Metal's format.
 ///
 /// `A8Unorm` is stored as `R8_UNORM`, and Metal samples it as `(0, 0, 0, a)`:
