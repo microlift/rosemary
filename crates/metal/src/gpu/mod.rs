@@ -54,6 +54,7 @@ struct DeviceCapabilities {
     host_query_reset: bool,
     timeline_semaphores: bool,
     dynamic_rendering: bool,
+    dynamic_raster: bool,
 }
 
 /// What `VK_KHR_depth_stencil_resolve` - core in Vulkan 1.2 - can do on this
@@ -158,6 +159,9 @@ pub struct Gpu {
     /// pass and framebuffer, so a pipeline is independent of the pass's load,
     /// store and resolve actions.
     pub(crate) dynamic_rendering: bool,
+    /// `VK_EXT_extended_dynamic_state3`'s polygon mode and depth clamp, where
+    /// the device has both: fill and depth clip mode are then set per draw too.
+    pub(crate) dynamic_raster: Option<ash::ext::extended_dynamic_state3::Device>,
     host_query_reset: bool,
     /// Whether the device has timeline semaphores, which `MTLEvent`s are.
     pub(crate) timeline_semaphores: bool,
@@ -326,8 +330,9 @@ const STAGING_IDLE: std::time::Duration = std::time::Duration::from_secs(2);
 #[cfg(test)]
 pub(crate) static TEST_WITHOUT_PUSH_DESCRIPTORS: AtomicBool = AtomicBool::new(false);
 
-/// Makes the next device begin passes through render passes, so the paths
-/// for devices without dynamic rendering are tested on one which has it.
+/// Makes the next device begin passes through render passes and keep fill
+/// and depth clip mode in its pipelines, so the paths for devices without
+/// dynamic rendering are tested on one which has it.
 #[cfg(test)]
 pub(crate) static TEST_WITHOUT_DYNAMIC_RENDERING: AtomicBool = AtomicBool::new(false);
 
@@ -372,6 +377,11 @@ fn create_device(
     let mut v13 = vk::PhysicalDeviceVulkan13Features {
         shader_demote_to_helper_invocation: target.demote_to_helper_invocation.into(),
         dynamic_rendering: capabilities.dynamic_rendering.into(),
+        ..Default::default()
+    };
+    let mut dynamic_raster = vk::PhysicalDeviceExtendedDynamicState3FeaturesEXT {
+        extended_dynamic_state3_polygon_mode: vk::TRUE,
+        extended_dynamic_state3_depth_clamp_enable: vk::TRUE,
         ..Default::default()
     };
     let mut storage16 = vk::PhysicalDevice16BitStorageFeatures {
@@ -466,6 +476,9 @@ fn create_device(
     }
     if capabilities.swapchain_maintenance1 {
         create_info = create_info.push_next(&mut swapchain_maintenance1);
+    }
+    if capabilities.dynamic_raster {
+        create_info = create_info.push_next(&mut dynamic_raster);
     }
     // SAFETY: all feature structures and borrowed create-info data live
     // across the call, and every enabled bit came from the adapter query.
@@ -767,8 +780,8 @@ impl Gpu {
         if host_import {
             enabled.push(ash::ext::external_memory_host::NAME.as_ptr());
         }
-        // Core in Vulkan 1.3, as are the dynamic draw states, but with a
-        // feature bit of its own.
+        // Both are core in Vulkan 1.3, as are the other dynamic draw states;
+        // dynamic rendering alone has a feature bit.
         let dynamic_rendering = target.vulkan_version >= (1, 3) && {
             let mut v13 = vk::PhysicalDeviceVulkan13Features::default();
             let mut features = vk::PhysicalDeviceFeatures2::default().push_next(&mut v13);
@@ -780,6 +793,22 @@ impl Gpu {
         #[cfg(test)]
         let dynamic_rendering = dynamic_rendering
             && !TEST_WITHOUT_DYNAMIC_RENDERING.load(std::sync::atomic::Ordering::Acquire);
+        let dynamic_raster =
+            target.vulkan_version >= (1, 3) && has(ash::ext::extended_dynamic_state3::NAME) && {
+                let mut state3 = vk::PhysicalDeviceExtendedDynamicState3FeaturesEXT::default();
+                let mut features = vk::PhysicalDeviceFeatures2::default().push_next(&mut state3);
+                // SAFETY: the extension is advertised and both structures
+                // live across the query.
+                unsafe { instance.get_physical_device_features2(physical, &mut features) };
+                state3.extended_dynamic_state3_polygon_mode == vk::TRUE
+                    && state3.extended_dynamic_state3_depth_clamp_enable == vk::TRUE
+            };
+        #[cfg(test)]
+        let dynamic_raster = dynamic_raster
+            && !TEST_WITHOUT_DYNAMIC_RENDERING.load(std::sync::atomic::Ordering::Acquire);
+        if dynamic_raster {
+            enabled.push(ash::ext::extended_dynamic_state3::NAME.as_ptr());
+        }
         let calibration = clock::Calibration::extension(entry, instance, physical, has);
         if let Some(name) = calibration {
             enabled.push(name.as_ptr());
@@ -817,6 +846,7 @@ impl Gpu {
                 host_query_reset,
                 timeline_semaphores,
                 dynamic_rendering,
+                dynamic_raster,
             },
         )?;
         // SAFETY: the family was requested above with one queue.
@@ -838,6 +868,8 @@ impl Gpu {
             render_node,
         });
         let calibration = calibration.map(|name| clock::Calibration::new(instance, &device, name));
+        let dynamic_raster = dynamic_raster
+            .then(|| ash::ext::extended_dynamic_state3::Device::new(instance, &device));
         let host_import = host_import
             .then(|| host::HostImport::new(instance, physical, &device))
             .flatten();
@@ -899,6 +931,7 @@ impl Gpu {
             alpha_to_one: features.alpha_to_one == vk::TRUE,
             dynamic_render_state: target.vulkan_version >= (1, 3),
             dynamic_rendering,
+            dynamic_raster,
             host_query_reset,
             timeline_semaphores,
             contexts: Mutex::new(Vec::new()),

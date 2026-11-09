@@ -3186,6 +3186,61 @@ fn culling_and_winding_change_without_another_pipeline() {
     }
 }
 
+/// Fill and depth clip mode are set per draw where the device can: wireframe
+/// leaves the middle of the triangle undrawn, clamping changes nothing for a
+/// triangle inside the depth range, and neither compiles another pipeline.
+#[test]
+fn fill_and_depth_clip_modes_change_without_another_pipeline() {
+    isolate_metal_fixture!();
+    if let Some(device) = gpu_device() {
+        check_fill_and_depth_clip_modes(device);
+    }
+}
+
+#[test]
+fn fill_and_depth_clip_modes_draw_without_dynamic_rendering() {
+    isolate_metal_fixture!();
+    if let Some(device) = gpu_device_without_dynamic_rendering() {
+        check_fill_and_depth_clip_modes(device);
+    }
+}
+
+fn check_fill_and_depth_clip_modes(device: Id) {
+    const FILL: u64 = 0;
+    const LINES: u64 = 1;
+    const CLIP: u64 = 0;
+    const CLAMP: u64 = 1;
+    let fixture = SamplingDraw::new(device);
+    let blue = fixture.filled(BLUE);
+    let cases = [(FILL, CLIP), (LINES, CLIP), (FILL, CLAMP)];
+    let targets: Vec<Id> = cases.iter().map(|_| fixture.target()).collect();
+    // SAFETY: objects this test made, sent the selectors they implement.
+    unsafe {
+        let command = send(fixture.queue, "commandBuffer");
+        for (&(fill, clip), &target) in cases.iter().zip(&targets) {
+            let pass = render_encoder(command, single_target_pass(target, LOAD_CLEAR, RED));
+            fixture.prepare(pass, blue);
+            send_number(pass, "setTriangleFillMode:", fill);
+            send_number(pass, "setDepthClipMode:", clip);
+            draw(pass, 3);
+            send_void(pass, "endEncoding");
+        }
+        let pixels = fixture.read(command, &targets);
+        let middle = (HAZARD_SIZE / 2 * HAZARD_SIZE + HAZARD_SIZE / 2) as usize;
+        assert_all(&pixels[0], BLUE_PIXEL, "filled");
+        assert_eq!(pixels[1][middle], RED_PIXEL, "inside a wireframe triangle");
+        assert_all(&pixels[2], BLUE_PIXEL, "clamped");
+        if gpu_of(device)
+            .expect("a Vulkan device")
+            .dynamic_raster
+            .is_some()
+        {
+            let state = object::body::<crate::pipeline::RenderPipeline>(fixture.state);
+            assert_eq!(state.variant_count(), 1);
+        }
+    }
+}
+
 const MTL_PIXEL_FORMAT_DEPTH32_FLOAT: u64 = 252;
 const MTL_STORAGE_MODE_PRIVATE: u64 = 2;
 const MTL_COMPARE_FUNCTION_LESS_EQUAL: u64 = 3;
@@ -4357,13 +4412,13 @@ fn gpu_device_without_push_descriptors() -> Option<Id> {
     Some(device)
 }
 
-/// A device which begins passes through render passes, as one without
-/// dynamic rendering does.
+/// A device which begins passes through render passes and compiles fill and
+/// depth clip mode into its pipelines, as one without dynamic rendering does.
 fn gpu_device_without_dynamic_rendering() -> Option<Id> {
     gpu::TEST_WITHOUT_DYNAMIC_RENDERING.store(true, Ordering::Release);
     let device = gpu_device()?;
     let gpu = gpu_of(device).expect("a GPU");
-    assert!(!gpu.dynamic_rendering);
+    assert!(!gpu.dynamic_rendering && gpu.dynamic_raster.is_none());
     Some(device)
 }
 

@@ -871,7 +871,7 @@ impl Encoder {
         let device = &command.gpu.device;
         let vk_command = command.command_buffer;
         if command.gpu.dynamic_render_state && self.render_dynamic != Some(wanted) {
-            wanted.record(device, vk_command, self.render_dynamic.as_ref());
+            wanted.record(command.gpu, vk_command, self.render_dynamic.as_ref());
             self.render_dynamic = Some(wanted);
         }
 

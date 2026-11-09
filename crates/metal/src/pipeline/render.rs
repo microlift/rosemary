@@ -48,6 +48,9 @@ const CULL_MODE_BACK: u64 = 2;
 /// `MTLWinding`.
 const WINDING_COUNTER_CLOCKWISE: u64 = 1;
 
+/// `MTLTriangleFillMode`.
+const TRIANGLE_FILL_MODE_LINES: u64 = 1;
+
 /// One face's stencil test as Vulkan takes it: the fail, pass and depth-fail
 /// operations, the comparison, and the compare and write masks.
 #[derive(Clone, Copy, Eq, PartialEq)]
@@ -92,6 +95,13 @@ fn cull_mode(metal: u64) -> vk::CullModeFlags {
     }
 }
 
+fn polygon_mode(metal: u64) -> vk::PolygonMode {
+    match metal {
+        TRIANGLE_FILL_MODE_LINES => vk::PolygonMode::LINE,
+        _ => vk::PolygonMode::FILL,
+    }
+}
+
 /// Metal's window origin is upper-left and Vulkan's is too once the viewport
 /// is flipped, so a Metal clockwise front face is a Vulkan clockwise one.
 fn front_face(metal: u64) -> vk::FrontFace {
@@ -116,17 +126,16 @@ pub(crate) struct RenderDynamicState {
     stencil_test: bool,
     front: StencilFace,
     back: StencilFace,
+    /// Set per draw only where the device has them dynamic as well.
+    polygon_mode: vk::PolygonMode,
+    depth_clamp: bool,
 }
 
 impl RenderDynamicState {
     /// Record what differs from `previous`, everything where nothing is known
     /// to have been recorded.
-    pub fn record(
-        &self,
-        device: &ash::Device,
-        command_buffer: vk::CommandBuffer,
-        previous: Option<&Self>,
-    ) {
+    pub fn record(&self, gpu: &Gpu, command_buffer: vk::CommandBuffer, previous: Option<&Self>) {
+        let device = &gpu.device;
         // Whether `field` differs from what was last recorded.
         let differs = |field: fn(&Self) -> u64| {
             previous.is_none_or(|previous| field(previous) != field(self))
@@ -185,6 +194,14 @@ impl RenderDynamicState {
                 }
                 if previous.is_none_or(|previous| previous.write_mask != face.write_mask) {
                     device.cmd_set_stencil_write_mask(command_buffer, flags, face.write_mask);
+                }
+            }
+            if let Some(raster) = &gpu.dynamic_raster {
+                if differs(|state| state.polygon_mode.as_raw() as u64) {
+                    raster.cmd_set_polygon_mode(command_buffer, self.polygon_mode);
+                }
+                if differs(|state| u64::from(state.depth_clamp)) {
+                    raster.cmd_set_depth_clamp_enable(command_buffer, self.depth_clamp);
                 }
             }
         }
@@ -536,12 +553,8 @@ impl RenderPipeline {
             .viewport_count(1)
             .scissor_count(1);
         let raster = vk::PipelineRasterizationStateCreateInfo::default()
-            // MTLDepthClipModeClamp is 1.
             .depth_clamp_enable(key.depth_clip == MTL_DEPTH_CLIP_MODE_CLAMP)
-            .polygon_mode(match key.fill_mode {
-                1 => vk::PolygonMode::LINE,
-                _ => vk::PolygonMode::FILL,
-            })
+            .polygon_mode(polygon_mode(key.fill_mode))
             .cull_mode(cull_mode(key.cull_mode))
             .front_face(front_face(key.winding))
             .depth_bias_enable(true)
@@ -594,6 +607,12 @@ impl RenderPipeline {
                 vk::DynamicState::STENCIL_OP,
                 vk::DynamicState::STENCIL_COMPARE_MASK,
                 vk::DynamicState::STENCIL_WRITE_MASK,
+            ]);
+        }
+        if self.gpu.dynamic_raster.is_some() {
+            dynamic_states.extend([
+                vk::DynamicState::POLYGON_MODE_EXT,
+                vk::DynamicState::DEPTH_CLAMP_ENABLE_EXT,
             ]);
         }
         let dynamic = vk::PipelineDynamicStateCreateInfo::default().dynamic_states(&dynamic_states);
@@ -666,6 +685,10 @@ impl RenderPipeline {
             shared.winding = 0;
             shared.depth = DepthStencilKey::default();
         }
+        if self.gpu.dynamic_raster.is_some() {
+            shared.fill_mode = 0;
+            shared.depth_clip = 0;
+        }
         if self.gpu.dynamic_rendering {
             shared.resolve_mask = 0;
             shared.depth_resolve = None;
@@ -689,6 +712,8 @@ impl RenderPipeline {
             stencil_test: has_depth && key.depth.stencil,
             front: StencilFace::of(&key.depth.front),
             back: StencilFace::of(&key.depth.back),
+            polygon_mode: polygon_mode(key.fill_mode),
+            depth_clamp: key.depth_clip == MTL_DEPTH_CLIP_MODE_CLAMP,
         }
     }
 
