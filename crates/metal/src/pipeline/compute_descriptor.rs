@@ -76,14 +76,19 @@ pub(crate) unsafe extern "C" fn new_with_descriptor(
         // SAFETY: the guest passed a writable pointer.
         unsafe { *reflection = std::ptr::null_mut() };
     }
-    let function = if object::is_kind(descriptor, c"MTLComputePipelineDescriptor") {
+    let function = descriptor_function(descriptor);
+    // SAFETY: the same call with the descriptor's function.
+    unsafe { crate::device::new_compute_pipeline(device, sel, function, error) }
+}
+
+/// The function a compute pipeline descriptor names, or nil.
+pub(crate) fn descriptor_function(descriptor: Id) -> Id {
+    if object::is_kind(descriptor, c"MTLComputePipelineDescriptor") {
         // SAFETY: a descriptor of this crate's.
         unsafe { object::body::<ComputeDescriptor>(descriptor) }.function
     } else {
         std::ptr::null_mut()
-    };
-    // SAFETY: the same call with the descriptor's function.
-    unsafe { crate::device::new_compute_pipeline(device, sel, function, error) }
+    }
 }
 
 /// `-newComputePipelineStateWithFunction:options:reflection:error:`.

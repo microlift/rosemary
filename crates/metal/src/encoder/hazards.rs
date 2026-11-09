@@ -58,11 +58,8 @@ impl Hazards {
 
 /// A render pass whose Vulkan pass begins at its first draw.
 pub(super) struct LazyPass {
-    pub key: RenderPassKey,
-    pub pass: vk::RenderPass,
-    pub framebuffer: vk::Framebuffer,
+    pub target: PassTarget,
     pub area: vk::Rect2D,
-    pub clears: Vec<vk::ClearValue>,
     /// Whether the Vulkan pass has begun.
     pub begun: bool,
     /// Whether the pass changes its attachments with nothing drawn: a clear
@@ -234,13 +231,11 @@ impl Encoder {
         };
         let must_flush = self.must_flush(lazy);
         let command = self.command();
-        let device = &command.gpu.device;
         if lazy.begun {
             if !must_flush {
                 return true;
             }
-            // SAFETY: the pass began in this command buffer.
-            unsafe { device.cmd_end_render_pass(command.command_buffer) };
+            end_pass(command.gpu, command.command_buffer);
             // What the pass drew so far is what its continuation loads.
             for &(image, aspect) in &self.attachments {
                 command.hazards.note_written(image, aspect);
@@ -248,20 +243,11 @@ impl Encoder {
             command.flush_hazards();
             let lazy = self.lazy.as_mut().expect("a lazy pass");
             lazy.read_hazard = false;
-            let mut key = lazy.key.clone();
-            for color in &mut key.colors {
-                color.1 = vk::AttachmentLoadOp::LOAD;
-            }
-            if let Some(depth) = &mut key.depth {
-                depth.1 = vk::AttachmentLoadOp::LOAD;
-            }
-            if let Some(stencil) = &mut key.stencil {
-                stencil.0 = vk::AttachmentLoadOp::LOAD;
-            }
-            // Load operations aside the pass is the same one, so the
-            // framebuffer and every pipeline variant made for it still fit.
-            let pass = match command.gpu.render_pass(&key) {
-                Ok(pass) => pass,
+            let resumed = lazy
+                .target
+                .resume(command.gpu, command.command_buffer, lazy.area);
+            match resumed {
+                Ok(()) => stats::count(Counter::PassSplits),
                 Err(reason) => {
                     // Beginning the original pass again would clear what it
                     // drew, so the rest of the pass is dropped instead.
@@ -273,20 +259,7 @@ impl Encoder {
                     self.in_render_pass = false;
                     return false;
                 }
-            };
-            stats::count(Counter::PassSplits);
-            let begin = vk::RenderPassBeginInfo::default()
-                .render_pass(pass)
-                .framebuffer(lazy.framebuffer)
-                .render_area(lazy.area);
-            // SAFETY: recording into this command buffer, outside a pass.
-            unsafe {
-                device.cmd_begin_render_pass(
-                    command.command_buffer,
-                    &begin,
-                    vk::SubpassContents::INLINE,
-                )
-            };
+            }
             return true;
         }
         let rereads = self
@@ -309,19 +282,8 @@ impl Encoder {
         let lazy = self.lazy.as_mut().expect("a lazy pass");
         lazy.read_hazard = false;
         lazy.begun = true;
-        let begin = vk::RenderPassBeginInfo::default()
-            .render_pass(lazy.pass)
-            .framebuffer(lazy.framebuffer)
-            .render_area(lazy.area)
-            .clear_values(&lazy.clears);
-        // SAFETY: recording into this command buffer, outside a pass.
-        unsafe {
-            device.cmd_begin_render_pass(
-                command.command_buffer,
-                &begin,
-                vk::SubpassContents::INLINE,
-            )
-        };
+        lazy.target
+            .begin(command.gpu, command.command_buffer, lazy.area, false);
         true
     }
 
@@ -342,13 +304,7 @@ impl Encoder {
             self.ensure_pass();
         }
         let command = self.command();
-        // SAFETY: the pass began in this command buffer.
-        unsafe {
-            command
-                .gpu
-                .device
-                .cmd_end_render_pass(command.command_buffer)
-        };
+        end_pass(command.gpu, command.command_buffer);
         true
     }
 

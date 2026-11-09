@@ -48,6 +48,9 @@ const CULL_MODE_BACK: u64 = 2;
 /// `MTLWinding`.
 const WINDING_COUNTER_CLOCKWISE: u64 = 1;
 
+/// `MTLTriangleFillMode`.
+const TRIANGLE_FILL_MODE_LINES: u64 = 1;
+
 /// One face's stencil test as Vulkan takes it: the fail, pass and depth-fail
 /// operations, the comparison, and the compare and write masks.
 #[derive(Clone, Copy, Eq, PartialEq)]
@@ -92,6 +95,13 @@ fn cull_mode(metal: u64) -> vk::CullModeFlags {
     }
 }
 
+fn polygon_mode(metal: u64) -> vk::PolygonMode {
+    match metal {
+        TRIANGLE_FILL_MODE_LINES => vk::PolygonMode::LINE,
+        _ => vk::PolygonMode::FILL,
+    }
+}
+
 /// Metal's window origin is upper-left and Vulkan's is too once the viewport
 /// is flipped, so a Metal clockwise front face is a Vulkan clockwise one.
 fn front_face(metal: u64) -> vk::FrontFace {
@@ -116,17 +126,16 @@ pub(crate) struct RenderDynamicState {
     stencil_test: bool,
     front: StencilFace,
     back: StencilFace,
+    /// Set per draw only where the device has them dynamic as well.
+    polygon_mode: vk::PolygonMode,
+    depth_clamp: bool,
 }
 
 impl RenderDynamicState {
     /// Record what differs from `previous`, everything where nothing is known
     /// to have been recorded.
-    pub fn record(
-        &self,
-        device: &ash::Device,
-        command_buffer: vk::CommandBuffer,
-        previous: Option<&Self>,
-    ) {
+    pub fn record(&self, gpu: &Gpu, command_buffer: vk::CommandBuffer, previous: Option<&Self>) {
+        let device = &gpu.device;
         // Whether `field` differs from what was last recorded.
         let differs = |field: fn(&Self) -> u64| {
             previous.is_none_or(|previous| field(previous) != field(self))
@@ -185,6 +194,14 @@ impl RenderDynamicState {
                 }
                 if previous.is_none_or(|previous| previous.write_mask != face.write_mask) {
                     device.cmd_set_stencil_write_mask(command_buffer, flags, face.write_mask);
+                }
+            }
+            if let Some(raster) = &gpu.dynamic_raster {
+                if differs(|state| state.polygon_mode.as_raw() as u64) {
+                    raster.cmd_set_polygon_mode(command_buffer, self.polygon_mode);
+                }
+                if differs(|state| u64::from(state.depth_clamp)) {
+                    raster.cmd_set_depth_clamp_enable(command_buffer, self.depth_clamp);
                 }
             }
         }
@@ -401,7 +418,7 @@ impl RenderPipeline {
         } else {
             None
         };
-        let key = RenderPassKey {
+        let pass = RenderPassKey {
             color_resolves: vec![None; color_formats.len()],
             depth_resolve: None,
             colors: color_formats,
@@ -418,7 +435,9 @@ impl RenderPipeline {
             )),
             samples,
         };
-        gpu.render_pass(&key)?;
+        if !gpu.dynamic_rendering {
+            gpu.render_pass(&pass)?;
+        }
 
         let mut resources = vertex.resources.clone();
         resources.extend(fragment.resources.iter().cloned());
@@ -451,7 +470,7 @@ impl RenderPipeline {
             alpha_to_coverage: descriptor.alpha_to_coverage,
             alpha_to_one: descriptor.alpha_to_one,
             rasterization: descriptor.rasterization,
-            pass: key,
+            pass,
             variants: Mutex::new(Default::default()),
             profile_label: crate::profile::pipeline_label(&[vertex, fragment]),
         };
@@ -494,19 +513,22 @@ impl RenderPipeline {
         {
             return Ok(*pipeline);
         }
-        let mut shape = self.pass.clone();
-        for (index, resolve) in shape.color_resolves.iter_mut().enumerate() {
-            if key.resolve_mask & (1 << index) != 0 {
-                *resolve = Some(self.pass.colors[index].0);
-            }
-        }
-        // The resolve destination has the attachment's format, which the
-        // pipeline declared; the modes come from the pass being recorded.
-        shape.depth_resolve = match (key.depth_resolve, shape.depth) {
-            (Some(resolve), Some((format, _, _))) => Some(DepthResolve { format, ..resolve }),
-            _ => None,
+        let pass = if self.gpu.dynamic_rendering {
+            vk::RenderPass::null()
+        } else {
+            self.render_pass(key)?
         };
-        let pass = self.gpu.render_pass(&shape)?;
+        let color_formats = self
+            .pass
+            .colors
+            .iter()
+            .map(|color| color.0)
+            .collect::<Vec<_>>();
+        let (depth_format, stencil_format) = self.pass.depth_stencil_formats();
+        let mut rendering = vk::PipelineRenderingCreateInfo::default()
+            .color_attachment_formats(&color_formats)
+            .depth_attachment_format(depth_format)
+            .stencil_attachment_format(stencil_format);
         let stages = [
             vk::PipelineShaderStageCreateInfo::default()
                 .stage(vk::ShaderStageFlags::VERTEX)
@@ -531,12 +553,8 @@ impl RenderPipeline {
             .viewport_count(1)
             .scissor_count(1);
         let raster = vk::PipelineRasterizationStateCreateInfo::default()
-            // MTLDepthClipModeClamp is 1.
             .depth_clamp_enable(key.depth_clip == MTL_DEPTH_CLIP_MODE_CLAMP)
-            .polygon_mode(match key.fill_mode {
-                1 => vk::PolygonMode::LINE,
-                _ => vk::PolygonMode::FILL,
-            })
+            .polygon_mode(polygon_mode(key.fill_mode))
             .cull_mode(cull_mode(key.cull_mode))
             .front_face(front_face(key.winding))
             .depth_bias_enable(true)
@@ -591,8 +609,14 @@ impl RenderPipeline {
                 vk::DynamicState::STENCIL_WRITE_MASK,
             ]);
         }
+        if self.gpu.dynamic_raster.is_some() {
+            dynamic_states.extend([
+                vk::DynamicState::POLYGON_MODE_EXT,
+                vk::DynamicState::DEPTH_CLAMP_ENABLE_EXT,
+            ]);
+        }
         let dynamic = vk::PipelineDynamicStateCreateInfo::default().dynamic_states(&dynamic_states);
-        let info = vk::GraphicsPipelineCreateInfo::default()
+        let mut info = vk::GraphicsPipelineCreateInfo::default()
             .stages(&stages)
             .vertex_input_state(&vertex_input)
             .input_assembly_state(&assembly)
@@ -605,6 +629,9 @@ impl RenderPipeline {
             .layout(self.layouts.pipeline)
             .render_pass(pass)
             .subpass(0);
+        if self.gpu.dynamic_rendering {
+            info = info.push_next(&mut rendering);
+        }
         // SAFETY: every borrowed structure lives across the call.
         let pipeline = crate::stats::pipeline(|| unsafe {
             self.gpu
@@ -625,24 +652,48 @@ impl RenderPipeline {
         }
     }
 
-    /// The key of the Vulkan pipeline a draw under `key` uses. Where the
-    /// device sets culling, winding, depth and stencil state and the exact
-    /// topology per draw, every combination of them shares one pipeline.
-    pub fn pipeline_key(&self, key: &RenderVariantKey) -> RenderVariantKey {
-        if !self.gpu.dynamic_render_state {
-            return *key;
+    /// The render pass a pipeline drawn under `key` is made against, where
+    /// the device has no dynamic rendering.
+    fn render_pass(&self, key: &RenderVariantKey) -> Result<vk::RenderPass, String> {
+        let mut shape = self.pass.clone();
+        for (index, resolve) in shape.color_resolves.iter_mut().enumerate() {
+            if key.resolve_mask & (1 << index) != 0 {
+                *resolve = Some(self.pass.colors[index].0);
+            }
         }
-        RenderVariantKey {
-            topology: match key.topology {
+        // The resolve destination has the attachment's format, which the
+        // pipeline declared; the modes come from the pass being recorded.
+        shape.depth_resolve = match (key.depth_resolve, shape.depth) {
+            (Some(resolve), Some((format, _, _))) => Some(DepthResolve { format, ..resolve }),
+            _ => None,
+        };
+        self.gpu.render_pass(&shape)
+    }
+
+    /// The key of the Vulkan pipeline a draw under `key` uses. State the
+    /// device sets per draw, or takes from the pass as it begins, is left
+    /// out, so draws differing only in it share one pipeline.
+    pub fn pipeline_key(&self, key: &RenderVariantKey) -> RenderVariantKey {
+        let mut shared = *key;
+        if self.gpu.dynamic_render_state {
+            shared.topology = match key.topology {
                 PRIMITIVE_POINT => PRIMITIVE_POINT,
                 PRIMITIVE_LINE | PRIMITIVE_LINE_STRIP => PRIMITIVE_LINE,
                 _ => PRIMITIVE_TRIANGLE,
-            },
-            cull_mode: 0,
-            winding: 0,
-            depth: DepthStencilKey::default(),
-            ..*key
+            };
+            shared.cull_mode = 0;
+            shared.winding = 0;
+            shared.depth = DepthStencilKey::default();
         }
+        if self.gpu.dynamic_raster.is_some() {
+            shared.fill_mode = 0;
+            shared.depth_clip = 0;
+        }
+        if self.gpu.dynamic_rendering {
+            shared.resolve_mask = 0;
+            shared.depth_resolve = None;
+        }
+        shared
     }
 
     /// The state a draw under `key` sets per draw on a device which can.
@@ -661,6 +712,8 @@ impl RenderPipeline {
             stencil_test: has_depth && key.depth.stencil,
             front: StencilFace::of(&key.depth.front),
             back: StencilFace::of(&key.depth.back),
+            polygon_mode: polygon_mode(key.fill_mode),
+            depth_clamp: key.depth_clip == MTL_DEPTH_CLIP_MODE_CLAMP,
         }
     }
 

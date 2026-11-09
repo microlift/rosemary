@@ -346,17 +346,16 @@ fn depth_resolve(
     })
 }
 
-/// Begin the Vulkan render pass one `MTLRenderPassDescriptor` describes.
 /// What one `MTLRenderPassDescriptor`'s attachments amount to in Vulkan.
 struct Attachments {
     key: RenderPassKey,
-    /// Attachment views, resolve views appended after the depth one.
+    /// Attachment views: colours, then depth/stencil.
     views: Vec<vk::ImageView>,
+    /// The views of the colours which resolve, in order.
     resolve_views: Vec<vk::ImageView>,
     /// Which colour attachments resolve, as a bitmask over render targets.
     resolve_mask: u32,
-    /// The view the depth/stencil attachment resolves into, which the render
-    /// pass declares after the colour resolves.
+    /// The view the depth/stencil attachment resolves into.
     depth_resolve_view: Option<vk::ImageView>,
     /// Copies Metal's `MTLStoreActionStoreAndMultisampleResolve` implies.
     copies: Vec<PendingCopy>,
@@ -670,7 +669,7 @@ pub(crate) fn begin_render_pass(
 
     let Attachments {
         key,
-        mut views,
+        views,
         resolve_views,
         resolve_mask,
         depth_resolve_view,
@@ -685,21 +684,19 @@ pub(crate) fn begin_render_pass(
         gpu::trace("renderCommandEncoderWithDescriptor: has no attachments");
         return;
     }
-    // The render pass declares the colour resolve attachments after the depth
-    // one, and the depth resolve after those.
-    views.extend(resolve_views);
-    views.extend(depth_resolve_view);
     let width = width.max(1);
     let height = height.max(1);
-
-    let pass = match gpu.render_pass(&key) {
-        Ok(pass) => pass,
-        Err(reason) => return gpu::trace(format!("render pass creation failed: {reason}")),
+    let attachment_views = AttachmentViews {
+        views,
+        resolve_views,
+        depth_resolve_view,
+        clears,
     };
-    let framebuffer = match gpu.create_framebuffer(pass, &views, width, height, 1) {
-        Ok(framebuffer) => framebuffer,
-        Err(reason) => return gpu::trace(format!("framebuffer creation failed: {reason}")),
+    let target = match PassTarget::new(gpu, &key, attachment_views, width, height) {
+        Ok(target) => target,
+        Err(reason) => return gpu::trace(reason),
     };
+    command.framebuffers.extend(target.framebuffer());
     for texture in textures {
         // SAFETY: only textures of this crate's are attached.
         let image = &unsafe { object::body::<Texture>(texture) }.image;
@@ -717,7 +714,6 @@ pub(crate) fn begin_render_pass(
         secondary || !descriptor.visibility_result_buffer.is_null() || !copies.is_empty();
     encoder.visibility = VisibilityTarget::of(descriptor);
     command.retain(descriptor.visibility_result_buffer);
-    command.framebuffers.push(framebuffer);
     let area = vk::Rect2D {
         offset: vk::Offset2D { x: 0, y: 0 },
         extent: vk::Extent2D { width, height },
@@ -745,11 +741,8 @@ pub(crate) fn begin_render_pass(
             || key.depth_resolve.is_some()
             || !copies.is_empty();
         encoder.lazy = Some(LazyPass {
-            key,
-            pass,
-            framebuffer,
+            target,
             area,
-            clears,
             begun: false,
             works_undrawn,
             reads: Vec::new(),
@@ -769,23 +762,9 @@ pub(crate) fn begin_render_pass(
             }
         }
     }
-    let begin = vk::RenderPassBeginInfo::default()
-        .render_pass(pass)
-        .framebuffer(framebuffer)
-        .render_area(area)
-        .clear_values(&clears);
-    let contents = if secondary {
-        vk::SubpassContents::SECONDARY_COMMAND_BUFFERS
-    } else {
-        vk::SubpassContents::INLINE
-    };
-    // SAFETY: recording into this command buffer.
-    unsafe {
-        gpu.device
-            .cmd_begin_render_pass(command.command_buffer, &begin, contents)
-    };
+    target.begin(gpu, command.command_buffer, area, secondary);
     if secondary {
-        encoder.inheritance = Some((pass, framebuffer, area));
+        encoder.inheritance = Some((target.inheritance(&key), area));
     } else {
         record_pass_defaults(
             &gpu.device,
