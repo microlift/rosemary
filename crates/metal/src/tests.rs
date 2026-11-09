@@ -183,6 +183,40 @@ fn texture_descriptor_copies_preserve_settings_and_are_independent() {
     }
 }
 
+#[test]
+fn texture_descriptor_copies_report_native_zone_argument() {
+    isolate_metal_fixture!();
+    bootstrap();
+    let class = objc::class::lookup(c"MTLTextureDescriptor").expect("registered");
+    let copy_sel = objc::sel::get("copyWithZone:");
+    let registered = class.method(copy_sel).expect("registered");
+    // SAFETY: the registered method and objects created by this test.
+    unsafe {
+        let types = objc::api::method_getTypeEncoding(std::ptr::from_ref(registered).cast());
+        // Captured from macOS 15.6.1, Metal.framework 368.52.
+        assert_eq!(std::ffi::CStr::from_ptr(types), c"@24@0:8^{_NSZone=}16");
+        let pool = objc::arc::pool_push();
+        let descriptor = send(send(objc::class::ptr(class) as Id, "alloc"), "init");
+        let (signature, sel) = method::<unsafe extern "C" fn(Id, Sel, Sel) -> Id>(
+            descriptor,
+            "methodSignatureForSelector:",
+        );
+        let signature = signature(descriptor, sel, copy_sel);
+        assert!(!signature.is_null());
+        assert_eq!(send_number_result(signature, "numberOfArguments"), 3);
+        let (argument, sel) = method::<unsafe extern "C" fn(Id, Sel, u64) -> *const std::ffi::c_char>(
+            signature,
+            "getArgumentTypeAtIndex:",
+        );
+        assert_eq!(
+            std::ffi::CStr::from_ptr(argument(signature, sel, 2)),
+            c"^{_NSZone=}"
+        );
+        objc::arc::release(descriptor);
+        objc::arc::pool_pop(pool);
+    }
+}
+
 /// A device which answers "no" to every family and feature set reads as
 /// unusable: a game asks before it decides which renderer to run.
 #[test]
