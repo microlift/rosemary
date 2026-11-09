@@ -180,3 +180,63 @@ fn native_macos_unresolved_rtld_next_uses_host_error_contract() {
     );
     assert_eq!(rosemary.stdout, apple.stdout);
 }
+
+// Host `dlsym` interposition is an existing Rosemary provider behavior, not
+// necessarily the same as Apple loading this standalone executable directly.
+// Check that this fix does not override the selected host implementation.
+const HOST_DLSYM_INTERPOSER: &str = r#"
+#include <dlfcn.h>
+#include <string.h>
+void *dlsym(void *handle, const char *name) {
+    (void)handle;
+    return name && strcmp(name, "rosemary_dlsym_guard_sentinel") == 0
+        ? (void *)0x12345678 : NULL;
+}
+"#;
+
+const HOST_DLSYM_INTERPOSER_MAIN: &str = r#"
+#include <dlfcn.h>
+#include <stdio.h>
+int main(void) {
+    if (dlsym(RTLD_DEFAULT, "rosemary_dlsym_guard_sentinel") != (void *)0x12345678)
+        return 40;
+    puts("existing host dlsym interposition preserved");
+    return 0;
+}
+"#;
+
+#[test]
+fn native_macos_host_dlsym_interposer_is_not_overridden() {
+    let interposer = common::build_native_with(
+        "librosemary_dlsym_guard_interposer.dylib",
+        HOST_DLSYM_INTERPOSER,
+        &["-arch", "arm64", "-dynamiclib"],
+    )
+    .expect("compile host dlsym interposer");
+    let guest = common::build_native_with(
+        "objc_native_dlsym_interpose_guard",
+        HOST_DLSYM_INTERPOSER_MAIN,
+        &["-arch", "arm64"],
+    )
+    .expect("compile guest dlsym interposition fixture");
+    let rosemary = common::driver_command()
+        .env("ROSEMARY_PREFIX", "off")
+        .env("ROSEMARY_LIBC", "native")
+        .env("ROSEMARY_OBJC", "native")
+        .env("DYLD_INSERT_LIBRARIES", &interposer)
+        .args(["run", "--native"])
+        .arg(&guest)
+        .output()
+        .expect("run guest with host dlsym interposer");
+    assert!(
+        rosemary.status.success(),
+        "Rosemary: {:?}, stdout {} stderr {}",
+        rosemary.status,
+        String::from_utf8_lossy(&rosemary.stdout),
+        String::from_utf8_lossy(&rosemary.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&rosemary.stdout),
+        "existing host dlsym interposition preserved\n"
+    );
+}
