@@ -124,6 +124,99 @@ fn device_registers_the_metal_object_graph() {
     }
 }
 
+#[test]
+fn texture_descriptor_copies_preserve_settings_and_are_independent() {
+    isolate_metal_fixture!();
+    bootstrap();
+    let class = objc::class::lookup(c"MTLTextureDescriptor").expect("registered");
+    let fields = [
+        ("textureType", "setTextureType:", MTL_TEXTURE_TYPE_CUBE),
+        (
+            "pixelFormat",
+            "setPixelFormat:",
+            MTL_PIXEL_FORMAT_RGBA8_UNORM,
+        ),
+        ("width", "setWidth:", 64),
+        ("height", "setHeight:", 32),
+        ("depth", "setDepth:", 2),
+        ("mipmapLevelCount", "setMipmapLevelCount:", 3),
+        ("sampleCount", "setSampleCount:", 4),
+        ("arrayLength", "setArrayLength:", 6),
+        ("storageMode", "setStorageMode:", MTL_STORAGE_MODE_MANAGED),
+        (
+            "usage",
+            "setUsage:",
+            gpu::USAGE_SHADER_READ | gpu::USAGE_RENDER_TARGET,
+        ),
+    ];
+    // SAFETY: objects this test owns, sent their registered selectors.
+    unsafe {
+        let original = send(send(objc::class::ptr(class) as Id, "alloc"), "init");
+        for &(_, setter, value) in &fields {
+            send_number(original, setter, value);
+        }
+        let (copy_with_zone, sel) = method::<
+            unsafe extern "C" fn(Id, Sel, *mut std::ffi::c_void) -> Id,
+        >(original, "copyWithZone:");
+        let copies = [
+            copy_with_zone(original, sel, std::ptr::null_mut()),
+            send(original, "copy"),
+        ];
+        assert_ne!(copies[0], copies[1]);
+        for &copy in &copies {
+            assert!(!copy.is_null());
+            assert_ne!(copy, original);
+            assert_eq!(send_number_result(copy, "retainCount"), 1);
+            for &(getter, _, value) in &fields {
+                assert_eq!(send_number_result(copy, getter), value, "{getter}");
+            }
+        }
+        send_number(original, "setWidth:", 128);
+        send_number(copies[0], "setHeight:", 16);
+        assert_eq!(send_number_result(original, "height"), 32);
+        assert_eq!(send_number_result(copies[1], "height"), 32);
+        objc::arc::release(original);
+        for copy in copies {
+            assert_eq!(send_number_result(copy, "width"), 64);
+            objc::arc::release(copy);
+        }
+    }
+}
+
+#[test]
+fn texture_descriptor_copies_report_native_zone_argument() {
+    isolate_metal_fixture!();
+    bootstrap();
+    let class = objc::class::lookup(c"MTLTextureDescriptor").expect("registered");
+    let copy_sel = objc::sel::get("copyWithZone:");
+    let registered = class.method(copy_sel).expect("registered");
+    // SAFETY: the registered method and objects created by this test.
+    unsafe {
+        let types = objc::api::method_getTypeEncoding(std::ptr::from_ref(registered).cast());
+        // Captured from macOS 15.6.1, Metal.framework 368.52.
+        assert_eq!(std::ffi::CStr::from_ptr(types), c"@24@0:8^{_NSZone=}16");
+        let pool = objc::arc::pool_push();
+        let descriptor = send(send(objc::class::ptr(class) as Id, "alloc"), "init");
+        let (signature, sel) = method::<unsafe extern "C" fn(Id, Sel, Sel) -> Id>(
+            descriptor,
+            "methodSignatureForSelector:",
+        );
+        let signature = signature(descriptor, sel, copy_sel);
+        assert!(!signature.is_null());
+        assert_eq!(send_number_result(signature, "numberOfArguments"), 3);
+        let (argument, sel) = method::<unsafe extern "C" fn(Id, Sel, u64) -> *const std::ffi::c_char>(
+            signature,
+            "getArgumentTypeAtIndex:",
+        );
+        assert_eq!(
+            std::ffi::CStr::from_ptr(argument(signature, sel, 2)),
+            c"^{_NSZone=}"
+        );
+        objc::arc::release(descriptor);
+        objc::arc::pool_pop(pool);
+    }
+}
+
 /// A device which answers "no" to every family and feature set reads as
 /// unusable: a game asks before it decides which renderer to run.
 #[test]

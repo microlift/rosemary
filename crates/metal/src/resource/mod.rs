@@ -107,6 +107,7 @@ pub(crate) fn install() {
     let texture = object::register::<Texture>(c"RosemaryMTLTexture");
     methods!(descriptor, {
         "init" => descriptor_init, c"@16@0:8";
+        "copyWithZone:" => descriptor_copy, c"@24@0:8^{_NSZone=}16";
         "resourceOptions" => texture::descriptor_resource_options, c"Q16@0:8";
         "setResourceOptions:" => texture::set_descriptor_resource_options, c"v24@0:8Q16";
         "cpuCacheMode" => crate::zero, c"Q16@0:8";

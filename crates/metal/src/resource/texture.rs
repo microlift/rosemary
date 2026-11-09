@@ -327,6 +327,17 @@ pub(super) unsafe extern "C" fn descriptor_init(receiver: Id, _sel: Sel) -> Id {
     receiver
 }
 
+pub(super) unsafe extern "C" fn descriptor_copy(
+    receiver: Id,
+    _sel: Sel,
+    _zone: *mut std::ffi::c_void,
+) -> Id {
+    // SAFETY: a texture descriptor of this crate's, containing only values.
+    let descriptor = *unsafe { object::body::<TextureDescriptor>(receiver) };
+    // FIXME (ACCURACY): Copies always use the base class and bypass subclass initializers.
+    object::make(c"MTLTextureDescriptor", descriptor)
+}
+
 /// The level count `mipmapped:YES` asks for: the full chain down to 1x1.
 fn full_chain(width: u64, height: u64) -> u64 {
     u64::from(64 - width.max(height).max(1).leading_zeros())
