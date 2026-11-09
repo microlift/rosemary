@@ -1,6 +1,7 @@
 mod compute;
 mod compute_descriptor;
 pub(crate) use compute_descriptor::{
+    descriptor_function as compute_descriptor_function,
     new_with_descriptor as new_compute_pipeline_with_descriptor,
     new_with_function_reflection as new_compute_pipeline_with_reflection,
 };
@@ -22,6 +23,7 @@ use objc::object::Id;
 use objc::sel::Sel;
 
 use compute::*;
+pub(crate) use descriptor::copy_render_pipeline_descriptor;
 use descriptor::*;
 use enums::*;
 use render::render_pipeline_dealloc;

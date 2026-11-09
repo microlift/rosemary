@@ -125,6 +125,33 @@ unsafe fn release_descriptor_objects(receiver: Id) {
     }
 }
 
+/// A new descriptor with the values `source` has now, owned by the caller,
+/// for work which reads it after its maker may have changed it.
+///
+/// # Safety
+///
+/// `source` must be a `MTLRenderPipelineDescriptor` of this crate's.
+pub(crate) unsafe fn copy_render_pipeline_descriptor(source: Id) -> Id {
+    // SAFETY: the caller's contract.
+    let source = unsafe { object::body::<RenderPipelineDescriptor>(source) };
+    let vertex_descriptor = if source.vertex_descriptor.is_null() {
+        std::ptr::null_mut()
+    } else {
+        // SAFETY: a descriptor only holds a vertex descriptor of this crate's.
+        unsafe { crate::resource::copy_vertex_descriptor(source.vertex_descriptor) }
+    };
+    object::make(
+        c"MTLRenderPipelineDescriptor",
+        RenderPipelineDescriptor {
+            vertex_function: objc::arc::retain(source.vertex_function),
+            fragment_function: objc::arc::retain(source.fragment_function),
+            vertex_descriptor,
+            color_objects: std::ptr::null_mut(),
+            ..*source
+        },
+    )
+}
+
 /// `-[MTLRenderPipelineDescriptor dealloc]`.
 pub(super) unsafe extern "C" fn descriptor_dealloc(receiver: Id, _sel: Sel) {
     // SAFETY: a render pipeline descriptor of this crate's.

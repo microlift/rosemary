@@ -1354,6 +1354,161 @@ fn check_depth_resolve(device: Id) {
     }
 }
 
+/// A render pipeline descriptor drawing `triangle_library`'s triangle into
+/// one BGRA8 target, owned by the caller.
+fn triangle_pipeline_descriptor(device: Id) -> Id {
+    let library = retain_library(device, triangle_library(), None, vec![0, 0], None);
+    // SAFETY: a library this test made.
+    let (vertex, fragment) = unsafe {
+        (
+            new_function_with_name(
+                library,
+                std::ptr::null(),
+                foundation::string::from_str("triangle_vertex"),
+            ),
+            new_function_with_name(
+                library,
+                std::ptr::null(),
+                foundation::string::from_str("triangle_fragment"),
+            ),
+        )
+    };
+    let vertex_descriptor = object::make(
+        c"MTLVertexDescriptor",
+        resource::VertexDescriptor {
+            layouts: [resource::VertexLayout::default(); resource::VERTEX_SLOTS],
+            attributes: [resource::VertexAttribute::default(); resource::VERTEX_SLOTS],
+            layout_objects: std::ptr::null_mut(),
+            attribute_objects: std::ptr::null_mut(),
+        },
+    );
+    // SAFETY: objects this test made, sent the selectors they implement.
+    unsafe {
+        send_number(
+            element_at(send(vertex_descriptor, "layouts"), 0),
+            "setStride:",
+            16,
+        );
+        let attribute = element_at(send(vertex_descriptor, "attributes"), 0);
+        send_number(attribute, "setFormat:", 31); // MTLVertexFormatFloat4
+        send_number(attribute, "setBufferIndex:", 0);
+    }
+    let descriptor = object::make(
+        c"MTLRenderPipelineDescriptor",
+        pipeline::RenderPipelineDescriptor {
+            vertex_function: vertex,
+            fragment_function: fragment,
+            vertex_descriptor,
+            colors: [pipeline::ColorAttachment::fresh(); pipeline::COLOR_ATTACHMENTS],
+            depth_format: 0,
+            stencil_format: 0,
+            sample_count: 1,
+            alpha_to_coverage: false,
+            alpha_to_one: false,
+            rasterization: true,
+            input_topology: 0,
+            color_objects: std::ptr::null_mut(),
+        },
+    );
+    // SAFETY: a descriptor this test made.
+    unsafe {
+        send_number(
+            element_at(send(descriptor, "colorAttachments"), 0),
+            "setPixelFormat:",
+            BGRA8,
+        );
+    }
+    descriptor
+}
+
+/// A global block whose `invoke` is `imp`: copying one is a no-op, so a
+/// test needs no copy or dispose helpers.
+#[repr(C)]
+struct GlobalBlock {
+    isa: *const std::ffi::c_void,
+    flags: i32,
+    reserved: i32,
+    invoke: *const std::ffi::c_void,
+    descriptor: *const [u64; 2],
+}
+
+/// `Block_descriptor_1`: reserved, then the block's size.
+static GLOBAL_BLOCK_DESCRIPTOR: [u64; 2] = [0, size_of::<GlobalBlock>() as u64];
+
+impl GlobalBlock {
+    fn new(imp: *const std::ffi::c_void) -> Box<Self> {
+        let isa = objc::class::lookup(c"__NSGlobalBlock__")
+            .map(|class| objc::class::ptr(class) as *const std::ffi::c_void)
+            .expect("registered by `objc::block`");
+        Box::new(Self {
+            isa,
+            // BLOCK_IS_GLOBAL.
+            flags: 1 << 28,
+            reserved: 0,
+            invoke: imp,
+            descriptor: &GLOBAL_BLOCK_DESCRIPTOR,
+        })
+    }
+
+    fn id(&self) -> Id {
+        self as *const Self as Id
+    }
+}
+
+/// What a creation handler was handed, retained, and the thread it ran on.
+static CREATED: Mutex<Option<(usize, bool, std::thread::ThreadId)>> = Mutex::new(None);
+static CREATED_READY: std::sync::Condvar = std::sync::Condvar::new();
+
+unsafe extern "C" fn record_creation(_block: Id, object: Id, error: Id) {
+    *CREATED.lock().expect("creation record") = Some((
+        objc::arc::retain(object) as usize,
+        error.is_null(),
+        std::thread::current().id(),
+    ));
+    CREATED_READY.notify_all();
+}
+
+/// `newRenderPipelineStateWithDescriptor:completionHandler:` compiles on
+/// another thread, from the descriptor as it was when the call was made.
+#[test]
+fn an_asynchronous_render_pipeline_compiles_off_the_calling_thread() {
+    isolate_metal_fixture!();
+    let Some(device) = gpu_device() else {
+        return;
+    };
+    let descriptor = triangle_pipeline_descriptor(device);
+    let block = GlobalBlock::new(record_creation as *const std::ffi::c_void);
+    // SAFETY: a device, descriptor and handler this test made.
+    unsafe {
+        compile::new_render_pipeline(device, std::ptr::null(), descriptor, block.id());
+        // Three samples is no sample count: compiled from the live
+        // descriptor, the pipeline would fail.
+        send_number(descriptor, "setSampleCount:", 3);
+    }
+    let (created, _) = CREATED_READY
+        .wait_timeout_while(
+            CREATED.lock().expect("creation record"),
+            std::time::Duration::from_secs(60),
+            |created| created.is_none(),
+        )
+        .expect("creation record");
+    let (state, no_error, thread) = created.expect("the handler ran");
+    assert!(state != 0 && no_error, "the pipeline was not made");
+    assert_ne!(thread, std::thread::current().id());
+    if gpu_of(device)
+        .expect("a Vulkan device")
+        .dynamic_render_state
+    {
+        // SAFETY: the render pipeline state the handler was given.
+        let state = unsafe { object::body::<pipeline::RenderPipeline>(state as Id) };
+        assert_eq!(
+            state.variant_count(),
+            1,
+            "compiled before it was handed over"
+        );
+    }
+}
+
 /// The whole render path on a real device: a translated vertex/fragment pair,
 /// a render pipeline, a render pass with a clear, one draw, and a blit which
 /// reads the result back.
