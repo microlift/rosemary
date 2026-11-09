@@ -334,6 +334,7 @@ pub(super) unsafe extern "C" fn descriptor_copy(
 ) -> Id {
     // SAFETY: a texture descriptor of this crate's, containing only values.
     let descriptor = *unsafe { object::body::<TextureDescriptor>(receiver) };
+    // FIXME (ACCURACY): Copies always use the base class and bypass subclass initializers.
     object::make(c"MTLTextureDescriptor", descriptor)
 }
 
