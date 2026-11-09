@@ -405,6 +405,7 @@ pub static SIGNATURES: &[FunctionAbi] = &[
     sig!("CFArrayGetCount", I64, P),
     sig!("CFArrayGetTypeID", U64),
     sig!("CFArrayGetValueAtIndex", P, P, I64),
+    sig!("CFArrayGetValues", V, P, I64, I64, P),
     // The bundle these answer for is the *guest's*, because
     // [`crate::bundle`]'s re-exec made the running executable the guest's own -
     // so `CFBundleCopyExecutableURL(CFBundleGetMainBundle())` names a path
@@ -4550,6 +4551,7 @@ mod tests {
         // these declare more arguments than the prototype has, deliberately.
         const SPLIT_AGGREGATES: &[&str] = &[
             "CFArrayApplyFunction",
+            "CFArrayGetValues",
             "CFArraySortValues",
             "CFDataDeleteBytes",
             "CFDataReplaceBytes",
