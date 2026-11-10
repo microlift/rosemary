@@ -200,6 +200,9 @@ impl Layout {
         let absolute = root.canonicalize().ok();
         let root = absolute.as_deref().unwrap_or(root);
         let contents = root.join("Contents");
+        if !contents.is_dir() {
+            return Self::framework(root);
+        }
         let info_path = contents.join("Info.plist");
         // CFBundle takes a bundle with no `Info.plist` at all, as an empty
         // dictionary: plug-in `.bundle`s built outside Xcode are often only
@@ -226,6 +229,30 @@ impl Layout {
             plugins: plugins_of(&contents),
             executable,
             contents,
+            info,
+        })
+    }
+
+    /// A bundle in framework layout: no `Contents`, `Resources/Info.plist` at
+    /// the top level and the executable beside it. A `.framework` is one through
+    /// its `Versions/Current` links, and `Versions/<x>` is one itself.
+    fn framework(root: &Path) -> Option<Layout> {
+        let resources = root.join("Resources");
+        let info = plist::parse(&std::fs::read(resources.join("Info.plist")).ok()?).ok()?;
+        let executable = ["CFBundleExecutable", "NSExecutable"]
+            .iter()
+            .find_map(|key| info.get(key)?.as_str().filter(|name| !name.is_empty()))
+            .map(std::ffi::OsStr::new)
+            .or_else(|| root.file_stem())
+            .map(|name| root.join(name))
+            .unwrap_or_default();
+        Some(Layout {
+            root: root.to_path_buf(),
+            contents: root.to_path_buf(),
+            resources,
+            frameworks: root.join("Frameworks"),
+            plugins: root.join("PlugIns"),
+            executable,
             info,
         })
     }
@@ -1154,6 +1181,36 @@ mod tests {
         assert!(layout.main_nib().is_some(), "the nib is in English.lproj");
         assert!(layout.resource("nothing", "txt").is_none());
         assert_eq!(layout.localization_names(), ["English"]);
+    }
+
+    #[test]
+    fn a_framework_version_directory_is_a_bundle_at_its_own_path() {
+        let root = std::env::temp_dir().join("rosemary-bundle-framework");
+        let _ = std::fs::remove_dir_all(&root);
+        let version = root.join("Thing.framework/Versions/1.0");
+        std::fs::create_dir_all(version.join("Resources")).unwrap();
+        std::fs::write(version.join("Resources/Info.plist"), INFO).unwrap();
+        std::fs::write(version.join("Thing"), b"").unwrap();
+        std::os::unix::fs::symlink("1.0", root.join("Thing.framework/Versions/Current")).unwrap();
+        std::os::unix::fs::symlink(
+            "Versions/Current/Resources",
+            root.join("Thing.framework/Resources"),
+        )
+        .unwrap();
+
+        let layout = Layout::at(&version).expect("a bundle");
+        assert_eq!(layout.root, version.canonicalize().unwrap());
+        assert_eq!(layout.executable, layout.root.join("Thing"));
+        assert_eq!(layout.identifier(), Some("com.example.thing"));
+        assert!(layout.resource("Info", "plist").is_some());
+
+        let framework = Layout::at(&root.join("Thing.framework")).expect("a bundle");
+        assert_eq!(framework.root.file_name().unwrap(), "Thing.framework");
+        assert_eq!(framework.identifier(), Some("com.example.thing"));
+        assert!(
+            Layout::at(&root).is_none(),
+            "a plain directory is no bundle"
+        );
     }
 
     #[test]
