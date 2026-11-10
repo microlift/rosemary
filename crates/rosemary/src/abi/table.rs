@@ -1581,6 +1581,10 @@ pub static SIGNATURES: &[FunctionAbi] = &[
     sig!("SecCodeCheckValidity", I32, P, U32, P),
     sig!("SecStaticCodeCheckValidity", I32, P, U32, P),
     sig!("SecStaticCodeCheckValidityWithErrors", I32, P, U64, P, P),
+    sig!("SecTaskCreateFromSelf", P, P),
+    sig!("SecTaskCopyValueForEntitlement", P, P, P, P),
+    sig!("SecTaskCopySigningIdentifier", P, P, P),
+    sig!("SecTaskGetCodeSignStatus", U32, P),
     //
     // SDL3 asks the current layout for its Unicode key-layout data so it can
     // translate a virtual key code into characters.
@@ -2213,6 +2217,7 @@ pub static SIGNATURES: &[FunctionAbi] = &[
     // `int getattrlistbulk(int, struct attrlist *, void *, size_t, uint64_t)`
     sig!("getattrlistbulk", I32, I32, P, P, U64, U64),
     sig!("csops", I32, I32, U32, P, U64),
+    sig!("__mac_syscall", I32, P, I32, P),
     //
     // `GLenum`, `GLuint` and `GLbitfield` are `unsigned int`, `GLint` and `GLsizei`
     // are `int`, `GLfloat` is `float`, `GLclampd` is `double`, `GLboolean` is
@@ -3404,6 +3409,7 @@ pub static SIGNATURES: &[FunctionAbi] = &[
     sig!("audit_submit", I32, I16, U32, U8, I32, P),
     // System Integrity Protection, which `darwin::sip` says is off.
     sig!("csr_check", I32, U32),
+    sig!("csr_get_active_config", I32, P),
     sig!("rootless_restricted_environment", I32),
     sig!("rootless_check_trusted_fd", I32, I32),
     // OpenPAM, `darwin::pam`. The conversation function arrives inside a
