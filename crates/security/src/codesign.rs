@@ -25,8 +25,15 @@ const REQ_FAILED: OSStatus = -67050;
 const CSMAGIC_EMBEDDED_SIGNATURE: u32 = 0xfade_0cc0;
 /// `CSMAGIC_EMBEDDED_ENTITLEMENTS`: the XML entitlements blob.
 const CSMAGIC_EMBEDDED_ENTITLEMENTS: u32 = 0xfade_7171;
+/// `CSMAGIC_CODEDIRECTORY`.
+const CSMAGIC_CODEDIRECTORY: u32 = 0xfade_0c02;
+/// `CSSLOT_CODEDIRECTORY`.
+const CSSLOT_CODEDIRECTORY: u32 = 0;
 /// `CSSLOT_ENTITLEMENTS`.
 const CSSLOT_ENTITLEMENTS: u32 = 5;
+/// Where `CS_CodeDirectory.identOffset` sits: after `magic`, `length`,
+/// `version`, `flags` and `hashOffset`.
+const CODEDIRECTORY_IDENT_OFFSET: usize = 20;
 
 /// A `SecCodeRef` or a `SecRequirementRef`.
 ///
@@ -314,20 +321,40 @@ unsafe fn required_entitlement(requirement: CFTypeRef) -> Option<String> {
 /// The entitlements the guest's slice of `bytes` is signed with, or `None` for
 /// an image with no signature. A signature without an entitlements blob holds
 /// none, which is an empty dictionary rather than an unsigned image.
-fn entitlements(bytes: &[u8]) -> Option<corefoundation::plist::Value> {
+pub(crate) fn entitlements(bytes: &[u8]) -> Option<corefoundation::plist::Value> {
+    let blob = blob_in_slot(superblob(bytes)?, CSSLOT_ENTITLEMENTS);
+    let Some(blob) = blob else {
+        return Some(corefoundation::plist::Value::Dictionary(Default::default()));
+    };
+    (be32(blob, 0)? == CSMAGIC_EMBEDDED_ENTITLEMENTS).then_some(())?;
+    corefoundation::plist::parse(blob.get(8..)?).ok()
+}
+
+/// The identifier the guest's slice of `bytes` is signed as, or `None` for an
+/// image with no signature.
+pub(crate) fn signing_identifier(bytes: &[u8]) -> Option<String> {
+    identifier_in(superblob(bytes)?)
+}
+
+fn identifier_in(superblob: &[u8]) -> Option<String> {
+    let directory = blob_in_slot(superblob, CSSLOT_CODEDIRECTORY)?;
+    if be32(directory, 0)? != CSMAGIC_CODEDIRECTORY {
+        return None;
+    }
+    let start = be32(directory, CODEDIRECTORY_IDENT_OFFSET)? as usize;
+    let name = std::ffi::CStr::from_bytes_until_nul(directory.get(start..)?).ok()?;
+    name.to_str().ok().map(str::to_owned)
+}
+
+/// The `CS_SuperBlob` of the guest's slice of `bytes`, if it is signed.
+fn superblob(bytes: &[u8]) -> Option<&[u8]> {
     let signature = match darwin::sysctl::guest_arch() {
         darwin::sysctl::GuestArch::X86_64 => signature_of(bytes, machish::spec::arch::X86_64),
         darwin::sysctl::GuestArch::Arm64 => signature_of(bytes, machish::spec::arch::Arm64),
     };
     let (image, data) = signature?;
     let start = data.dataoff as usize;
-    let superblob = image.get(start..start.checked_add(data.datasize as usize)?)?;
-    let blob = blob_in_slot(superblob, CSSLOT_ENTITLEMENTS);
-    let Some(blob) = blob else {
-        return Some(corefoundation::plist::Value::Dictionary(Default::default()));
-    };
-    (be32(blob, 0)? == CSMAGIC_EMBEDDED_ENTITLEMENTS).then_some(())?;
-    corefoundation::plist::parse(blob.get(8..)?).ok()
+    image.get(start..start.checked_add(data.datasize as usize)?)
 }
 
 /// The thin image for `spec` and its `LC_CODE_SIGNATURE`, if it has one.
@@ -423,14 +450,33 @@ mod tests {
         let mut blob = CSMAGIC_EMBEDDED_ENTITLEMENTS.to_be_bytes().to_vec();
         blob.extend_from_slice(&(8 + entitlements.len() as u32).to_be_bytes());
         blob.extend_from_slice(entitlements);
+        single_slot_superblob(CSSLOT_ENTITLEMENTS, &blob)
+    }
+
+    fn single_slot_superblob(slot: u32, blob: &[u8]) -> Vec<u8> {
         let offset = 12 + 8;
         let mut superblob = CSMAGIC_EMBEDDED_SIGNATURE.to_be_bytes().to_vec();
         superblob.extend_from_slice(&((offset + blob.len()) as u32).to_be_bytes());
         superblob.extend_from_slice(&1u32.to_be_bytes());
-        superblob.extend_from_slice(&CSSLOT_ENTITLEMENTS.to_be_bytes());
+        superblob.extend_from_slice(&slot.to_be_bytes());
         superblob.extend_from_slice(&(offset as u32).to_be_bytes());
-        superblob.extend_from_slice(&blob);
+        superblob.extend_from_slice(blob);
         superblob
+    }
+
+    #[test]
+    fn reads_the_signing_identifier_from_the_code_directory() {
+        let name = b"io.example.app\0";
+        let header = CODEDIRECTORY_IDENT_OFFSET + 4;
+        let mut directory = CSMAGIC_CODEDIRECTORY.to_be_bytes().to_vec();
+        directory.extend_from_slice(&((header + name.len()) as u32).to_be_bytes());
+        directory.resize(CODEDIRECTORY_IDENT_OFFSET, 0);
+        directory.extend_from_slice(&(header as u32).to_be_bytes());
+        directory.extend_from_slice(name);
+        let superblob = single_slot_superblob(CSSLOT_CODEDIRECTORY, &directory);
+        assert_eq!(identifier_in(&superblob).as_deref(), Some("io.example.app"));
+        let unsigned = single_slot_superblob(CSSLOT_ENTITLEMENTS, &directory);
+        assert_eq!(identifier_in(&unsigned), None);
     }
 
     #[test]

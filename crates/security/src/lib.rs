@@ -1,10 +1,12 @@
 pub mod codesign;
 pub mod keychain;
+pub mod task;
 pub mod trust;
 
 exports::group! {
     codesign,
     keychain,
+    task,
     trust,
 }
 
