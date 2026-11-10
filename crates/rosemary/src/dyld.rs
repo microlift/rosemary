@@ -1988,6 +1988,113 @@ unsafe extern "C" fn native_libc_dlsym(
     selected_native_symbol(found as usize as u64, name) as usize as *mut libc::c_void
 }
 
+// Native guest code is not registered with the host dyld. Try Rosemary's
+// existing caller-scoped resolver for RTLD_NEXT, then leave every other case
+// to Apple's own dlsym with the original return address intact.
+#[cfg(target_os = "macos")]
+unsafe extern "C" fn native_guest_dlsym_next(
+    _handle: *mut libc::c_void,
+    name: *const libc::c_char,
+    caller: u64,
+) -> *mut libc::c_void {
+    if name.is_null() {
+        return std::ptr::null_mut();
+    }
+    let Some(scope) = Scope::containing(caller) else {
+        return std::ptr::null_mut();
+    };
+    let Ok(name) = unsafe { std::ffi::CStr::from_ptr(name) }.to_str() else {
+        return std::ptr::null_mut();
+    };
+    let Some(found) = lookup_from(RTLD_NEXT, name, Some(scope)) else {
+        return std::ptr::null_mut();
+    };
+    // Successful dlsym must not expose an earlier host lookup failure.
+    unsafe { libc::dlerror() };
+    found as usize as *mut libc::c_void
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[unsafe(naked)]
+unsafe extern "C" fn native_guest_dlsym(
+    _handle: *mut libc::c_void,
+    _name: *const libc::c_char,
+) -> *mut libc::c_void {
+    core::arch::naked_asm!(
+        "cmn x0, #1", // Only RTLD_NEXT needs guest scope.
+        "b.eq 2f",
+        "b {host}",
+        "2:",
+        "stp x29, x30, [sp, #-32]!", // Preserve the guest caller's LR.
+        "stp x0, x1, [sp, #16]",
+        "mov x2, x30",
+        "bl {try_guest}",
+        "cbz x0, 3f",
+        "ldp x29, x30, [sp], #32",
+        "ret",
+        "3:",
+        "ldp x0, x1, [sp, #16]",
+        "ldp x29, x30, [sp], #32",
+        "b {host}",                   // Apple's dlsym sees the original LR.
+        try_guest = sym native_guest_dlsym_next,
+        host = sym libc::dlsym,
+    );
+}
+
+#[cfg(all(target_os = "macos", target_arch = "x86_64"))]
+#[unsafe(naked)]
+unsafe extern "C" fn native_guest_dlsym(
+    _handle: *mut libc::c_void,
+    _name: *const libc::c_char,
+) -> *mut libc::c_void {
+    core::arch::naked_asm!(
+        "cmp rdi, -1", // Only RTLD_NEXT needs guest scope.
+        "je 2f",
+        "jmp {host}",
+        "2:",
+        "sub rsp, 24", // Align stack; preserve C arguments.
+        "mov [rsp], rdi",
+        "mov [rsp + 8], rsi",
+        "mov rdx, [rsp + 24]",       // Guest return address.
+        "call {try_guest}",
+        "test rax, rax",
+        "jz 3f",
+        "add rsp, 24",
+        "ret",
+        "3:",
+        "mov rdi, [rsp]",
+        "mov rsi, [rsp + 8]",
+        "add rsp, 24",
+        "jmp {host}",                // Original return address stays on stack.
+        try_guest = sym native_guest_dlsym_next,
+        host = sym libc::dlsym,
+    );
+}
+
+// Do not replace a host-inserted `dlsym` interposer with Rosemary's bridge.
+#[cfg(target_os = "macos")]
+fn native_host_dlsym_is_apple() -> bool {
+    let address = unsafe { libc::dlsym(libc::RTLD_DEFAULT, c"dlsym".as_ptr()) };
+    if address.is_null() {
+        return false;
+    }
+    let mut info = std::mem::MaybeUninit::<libc::Dl_info>::uninit();
+    if unsafe { libc::dladdr(address, info.as_mut_ptr()) } == 0 {
+        return false;
+    }
+    let info = unsafe { info.assume_init() };
+    if info.dli_fname.is_null() || info.dli_sname.is_null() {
+        return false;
+    }
+    let (path, symbol) = unsafe {
+        (
+            std::ffi::CStr::from_ptr(info.dli_fname),
+            std::ffi::CStr::from_ptr(info.dli_sname),
+        )
+    };
+    path.to_bytes() == b"/usr/lib/system/libdyld.dylib" && symbol.to_bytes() == b"dlsym"
+}
+
 pub fn native_libc_provider() -> SyntheticDylib {
     #[allow(unused_mut)]
     let mut lib = SyntheticDylib::new("<rosemary native libc lookup>");
@@ -1995,6 +2102,9 @@ pub fn native_libc_provider() -> SyntheticDylib {
     if darwin::libc_backend::using_builtin() {
         lib.flat(true)
             .define_fn("_dlsym", native_libc_dlsym as *const ());
+    } else if native_host_dlsym_is_apple() {
+        lib.flat(true)
+            .define_fn("_dlsym", native_guest_dlsym as *const ());
     }
     lib
 }
