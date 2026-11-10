@@ -317,7 +317,8 @@ pub unsafe extern "C" fn sigsetjmp(_env: *mut c_void, _savemask: c_int) -> c_int
     core::arch::naked_asm!("b {}", sym __sigsetjmp);
 }
 
-const CS_OPS_STATUS: u32 = 0;
+/// `CS_OPS_STATUS`: the code-signing flags word.
+pub const CS_OPS_STATUS: u32 = 0;
 
 /// `int csops(pid_t, unsigned int ops, void *useraddr, size_t usersize)`
 ///
@@ -354,6 +355,16 @@ pub unsafe extern "C" fn csops(
     0
 }
 
+/// `int __mac_syscall(const char *policy, int call, void *arg)`
+///
+/// Every MAC policy module is a kernel extension, and this host loads none, so
+/// each policy is unregistered - what a Mac reports for a name it does not
+/// know. Chromium asks AMFI for its boot-arg status and records the failure.
+pub extern "C" fn mac_syscall(_policy: *const c_char, _call: c_int, _arg: *mut c_void) -> c_int {
+    crate::errno::set_guest(crate::errno::DARWIN_ENOPOLICY);
+    -1
+}
+
 /// `void _cthread_init(void)`
 ///
 /// libSystem's start-up hook for the Mach cthreads package, which `pthread`
@@ -386,6 +397,7 @@ exports::exports! {
         #[cfg(target_os = "linux")]
         "sigsetjmp" => sigsetjmp,
         "csops" => csops,
+        "__mac_syscall" => mac_syscall,
         "_cthread_init" => cthread_init,
         "__keymgr_dwarf2_register_sections" => keymgr_dwarf2_register_sections,
         "__atomic_load" => atomic_load,
@@ -462,6 +474,15 @@ mod tests {
         assert_eq!((rc, flags), (0, 0));
         let rc = unsafe { csops(0, 99, (&raw mut flags).cast(), 4) };
         assert_eq!(rc, -1);
+    }
+
+    #[test]
+    fn a_mac_policy_call_finds_no_policy() {
+        let mut status = 0_u64;
+        let rc = mac_syscall(c"AMFI".as_ptr(), 0x60, (&raw mut status).cast());
+        assert_eq!(rc, -1);
+        assert_eq!(crate::errno::guest_errno(), crate::errno::DARWIN_ENOPOLICY);
+        assert_eq!(status, 0);
     }
 
     #[test]

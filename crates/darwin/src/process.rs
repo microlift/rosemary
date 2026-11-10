@@ -109,7 +109,7 @@ pub fn check_in(path: &str, argv: Vec<Vec<u8>>) {
 }
 
 /// This process, described without the server.
-fn me() -> Option<Process> {
+pub fn me() -> Option<Process> {
     let _host = crate::syscall::ScopedHostSyscallContext::new();
     let host = starnix::process::process(host_self())?;
     let (path, argv) = match ME.get() {

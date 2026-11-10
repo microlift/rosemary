@@ -42,8 +42,9 @@ const VM_INHERIT_NONE: u32 = 2;
 const VM_BEHAVIOR_DEFAULT: i32 = 0;
 
 /// `struct vm_region_basic_info_64`, whose layout is ABI: the guest declared
-/// one on its stack and reads the fields back by name.
-#[repr(C)]
+/// one on its stack and reads the fields back by name. Packed to four bytes, as
+/// `<mach/vm_region.h>` packs all of its structures.
+#[repr(C, packed(4))]
 #[derive(Clone, Copy, Default)]
 struct BasicInfo64 {
     protection: i32,
@@ -59,7 +60,7 @@ struct BasicInfo64 {
 const _: () = {
     // `VM_REGION_BASIC_INFO_COUNT_64` is this size in 32-bit words, and a
     // caller passes it in as the capacity of its buffer.
-    assert!(size_of::<BasicInfo64>() == 40);
+    assert!(size_of::<BasicInfo64>() == 36);
 };
 
 /// `struct vm_region_top_info`. Resident page counts are not tracked and read
@@ -1136,7 +1137,8 @@ mod tests {
         let mut address = page.as_ptr() as u64;
         let mut size = 0_u64;
         let mut info = [0_u32; 16];
-        let mut count = (size_of::<BasicInfo64>() / size_of::<u32>()) as u32;
+        // `VM_REGION_BASIC_INFO_COUNT_64` as a Darwin caller compiles it.
+        let mut count = 9;
         let mut object = 1_u32;
         // SAFETY: writable out-parameters, and a buffer whose capacity is what
         // `count` says.
@@ -1152,6 +1154,7 @@ mod tests {
             )
         };
         assert_eq!(status, KERN_SUCCESS);
+        assert_eq!(count, 9);
         assert!(address <= page.as_ptr() as u64);
         assert!(address + size > page.as_ptr() as u64);
         assert_eq!(object, MACH_PORT_NULL);
