@@ -376,29 +376,18 @@ impl RenderPipeline {
             }
         }
 
-        // FIXME (ACCURACY): the colour list stops at the first render-target
-        // index with no format, matching the way a render pass closes a gap
-        // up rather than keeping it. A pipeline which declares targets 0 and 2
-        // therefore loses target 2. See the MRT gap in the known gaps.
-        if descriptor
-            .colors
-            .iter()
-            .skip_while(|color| color.pixel_format != 0)
-            .any(|color| color.pixel_format != 0)
-        {
-            gpu::trace_once(
-                "a render pipeline leaves a gap in its colour attachments, which this runtime \
-                 closes up: the targets after the gap are dropped",
-            );
-        }
         let colors = descriptor
             .colors
             .iter()
-            .take_while(|color| color.pixel_format != 0)
-            .copied()
-            .collect::<Vec<_>>();
+            .rposition(|color| color.pixel_format != 0)
+            .map_or_else(Vec::new, |last| descriptor.colors[..=last].to_vec());
         let mut color_formats = Vec::new();
+        let mut color_slots = Vec::with_capacity(colors.len());
         for color in &colors {
+            if color.pixel_format == 0 {
+                color_slots.push(None);
+                continue;
+            }
             let format = gpu::pixel_format(color.pixel_format);
             if format == vk::Format::UNDEFINED {
                 return Err(format!(
@@ -406,6 +395,7 @@ impl RenderPipeline {
                     color.pixel_format
                 ));
             }
+            color_slots.push(Some(color_formats.len() as u32));
             color_formats.push((
                 format,
                 vk::AttachmentLoadOp::DONT_CARE,
@@ -425,6 +415,7 @@ impl RenderPipeline {
             color_resolves: vec![None; color_formats.len()],
             depth_resolve: None,
             colors: color_formats,
+            color_slots,
             depth: attachment_depth.map(|format| {
                 (
                     format,
@@ -524,9 +515,13 @@ impl RenderPipeline {
         };
         let color_formats = self
             .pass
-            .colors
+            .color_slots
             .iter()
-            .map(|color| color.0)
+            .map(|slot| {
+                slot.map_or(vk::Format::UNDEFINED, |index| {
+                    self.pass.colors[index as usize].0
+                })
+            })
             .collect::<Vec<_>>();
         let (depth_format, stencil_format) = self.pass.depth_stencil_formats();
         let mut rendering = vk::PipelineRenderingCreateInfo::default()

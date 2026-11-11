@@ -524,11 +524,12 @@ fn mirror_clamp_support(core_feature: bool, extension: bool) -> (bool, bool) {
 /// descriptor.
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub struct RenderPassKey {
-    /// The pass's colour attachments, packed. See the MRT gap in
-    /// [the known gaps](../../../../docs/metal.md): an unattached render-target
-    /// index closes up rather than becoming a `VK_ATTACHMENT_UNUSED`
-    /// reference, so a pass which skips an index misroutes the ones after it.
+    /// The pass's actual colour attachment descriptions, packed for the
+    /// framebuffer and Vulkan attachment table.
     pub colors: Vec<(vk::Format, vk::AttachmentLoadOp, vk::AttachmentStoreOp)>,
+    /// Metal render-target index to packed attachment index. A gap becomes
+    /// `VK_ATTACHMENT_UNUSED` in a render pass or a null dynamic attachment.
+    pub color_slots: Vec<Option<u32>>,
     /// The single-sample attachment each colour is resolved into, where the
     /// Metal store action asks for a resolve, and `None` where it does not.
     /// One entry per colour, because Vulkan's resolve list is positional.

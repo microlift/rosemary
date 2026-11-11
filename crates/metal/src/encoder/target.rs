@@ -98,7 +98,7 @@ impl PassTarget {
             });
         }
         let mut resolve_views = resolve_views.into_iter();
-        let colors = key
+        let packed_colors = key
             .colors
             .iter()
             .zip(&key.color_resolves)
@@ -127,6 +127,21 @@ impl PassTarget {
                 }
             })
             .collect::<Vec<_>>();
+        let colors = key
+            .color_slots
+            .iter()
+            .map(|slot| match slot {
+                Some(index) => packed_colors[*index as usize],
+                None => RenderingAttachment {
+                    view: vk::ImageView::null(),
+                    load: vk::AttachmentLoadOp::DONT_CARE,
+                    store: vk::AttachmentStoreOp::DONT_CARE,
+                    clear: vk::ClearValue::default(),
+                    resolve_mode: vk::ResolveModeFlags::NONE,
+                    resolve_view: vk::ImageView::null(),
+                },
+            })
+            .collect();
         let (depth_format, stencil_format) = key.depth_stencil_formats();
         let depth_stencil = key.depth.map(|(_, load, store)| {
             let index = key.colors.len();
@@ -310,7 +325,13 @@ impl PassTarget {
             Self::Rendering { .. } => {
                 let (depth, stencil) = key.depth_stencil_formats();
                 Inheritance::Rendering {
-                    colors: key.colors.iter().map(|color| color.0).collect(),
+                    colors: key
+                        .color_slots
+                        .iter()
+                        .map(|slot| {
+                            slot.map_or(vk::Format::UNDEFINED, |index| key.colors[index as usize].0)
+                        })
+                        .collect(),
                     depth,
                     stencil,
                     samples: key.samples,

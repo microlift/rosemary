@@ -402,6 +402,7 @@ fn samples(key: &mut RenderPassKey, count: vk::SampleCountFlags, first: bool) {
 fn gather_attachments(gpu: &Gpu, descriptor: &RenderPassDescriptor) -> Attachments {
     let mut key = RenderPassKey {
         colors: Vec::new(),
+        color_slots: Vec::new(),
         color_resolves: Vec::new(),
         depth: None,
         stencil: None,
@@ -422,23 +423,16 @@ fn gather_attachments(gpu: &Gpu, descriptor: &RenderPassDescriptor) -> Attachmen
     // formats a string.
     let capturing = crate::capture::enabled();
 
-    // FIXME (ACCURACY): a render-target index with no texture closes up rather
-    // than staying a gap, so a pass which attaches targets 0 and 2 describes
-    // two attachments and the fragment shader's `[[color(2)]]` lands on the
-    // second of them. Representing the gap needs a `VK_ATTACHMENT_UNUSED`
-    // reference here and the matching hole in the pipeline's colour list.
     let last_color = descriptor
         .colors
         .iter()
         .rposition(|color| !color.texture.is_null());
     for (index, color) in descriptor.colors.iter().enumerate() {
+        if last_color.is_none_or(|last| index > last) {
+            break;
+        }
         if color.texture.is_null() {
-            if last_color.is_some_and(|last| index < last) {
-                gpu::trace_once(
-                    "a render pass leaves a gap in its colour attachments, which this runtime \
-                     closes up: the targets after the gap are misrouted",
-                );
-            }
+            key.color_slots.push(None);
             continue;
         }
         // SAFETY: only a texture of this crate's is attached.
@@ -454,6 +448,8 @@ fn gather_attachments(gpu: &Gpu, descriptor: &RenderPassDescriptor) -> Attachmen
         let source_image = texture.image.image;
         let multisampled = texture.image.samples != vk::SampleCountFlags::TYPE_1;
         let resolve = resolve_attachment(color, format);
+        let packed_index = key.colors.len();
+        key.color_slots.push(Some(packed_index as u32));
         // A subpass resolve is the answer only for a multisampled attachment.
         // Where the attachment has one sample the same store action means a
         // plain copy, which is recorded once the pass has ended.
@@ -465,7 +461,7 @@ fn gather_attachments(gpu: &Gpu, descriptor: &RenderPassDescriptor) -> Attachmen
         if let Some(target) = &resolve {
             textures.push(color.resolve_texture);
             if multisampled {
-                resolve_mask |= 1 << (key.colors.len() - 1);
+                resolve_mask |= 1 << packed_index;
                 resolve_views.push(target.view);
             } else {
                 copies.push(PendingCopy {
@@ -491,7 +487,7 @@ fn gather_attachments(gpu: &Gpu, descriptor: &RenderPassDescriptor) -> Attachmen
                 height: level_extent(base_height, level),
                 format,
                 samples: texture.image.samples,
-                role: format!("c{}", key.colors.len() - 1),
+                role: format!("c{index}"),
             });
         }
         if let Some(target) = resolve.as_ref().filter(|_| capturing) {
@@ -504,7 +500,7 @@ fn gather_attachments(gpu: &Gpu, descriptor: &RenderPassDescriptor) -> Attachmen
                 height: level_extent(base_height, level),
                 format: target.format,
                 samples: vk::SampleCountFlags::TYPE_1,
-                role: format!("r{}", key.colors.len() - 1),
+                role: format!("r{index}"),
             });
         }
         clears.push(vk::ClearValue {

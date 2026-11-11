@@ -886,9 +886,9 @@ impl Gpu {
             return Ok(*pass);
         }
         let mut attachments = Vec::new();
-        let mut colors = Vec::new();
+        let mut packed_colors = Vec::new();
         for (format, load, store) in &key.colors {
-            colors.push(
+            packed_colors.push(
                 vk::AttachmentReference::default()
                     .attachment(attachments.len() as u32)
                     .layout(vk::ImageLayout::GENERAL),
@@ -905,6 +905,14 @@ impl Gpu {
                     .final_layout(vk::ImageLayout::GENERAL),
             );
         }
+        let colors = key
+            .color_slots
+            .iter()
+            .map(|slot| match slot {
+                Some(index) => packed_colors[*index as usize],
+                None => vk::AttachmentReference::default().attachment(vk::ATTACHMENT_UNUSED),
+            })
+            .collect::<Vec<_>>();
         let depth = key.depth.map(|(format, load, store)| {
             let (stencil_load, stencil_store) = key.stencil.unwrap_or((
                 vk::AttachmentLoadOp::DONT_CARE,
@@ -931,15 +939,15 @@ impl Gpu {
         // subpass names positionally, so a colour without a resolve still needs
         // an entry. The resolve attachments follow the depth one, which is the
         // order `begin_render_pass` builds the framebuffer's views in.
-        let mut resolves = Vec::new();
+        let mut packed_resolves = Vec::new();
         if key.color_resolves.iter().any(Option::is_some) {
             for format in &key.color_resolves {
                 let Some(format) = format else {
-                    resolves
+                    packed_resolves
                         .push(vk::AttachmentReference::default().attachment(vk::ATTACHMENT_UNUSED));
                     continue;
                 };
-                resolves.push(
+                packed_resolves.push(
                     vk::AttachmentReference::default()
                         .attachment(attachments.len() as u32)
                         .layout(vk::ImageLayout::GENERAL),
@@ -957,6 +965,17 @@ impl Gpu {
                 );
             }
         }
+        let resolves = if packed_resolves.is_empty() {
+            Vec::new()
+        } else {
+            key.color_slots
+                .iter()
+                .map(|slot| match slot {
+                    Some(index) => packed_resolves[*index as usize],
+                    None => vk::AttachmentReference::default().attachment(vk::ATTACHMENT_UNUSED),
+                })
+                .collect::<Vec<_>>()
+        };
         // Vulkan's depth/stencil resolve destination is one further
         // attachment, after the colour resolves, and the subpass names it
         // through an extension structure `vkCreateRenderPass` cannot carry.

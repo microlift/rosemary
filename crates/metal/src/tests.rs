@@ -1408,6 +1408,143 @@ unsafe fn element_at(receiver: Id, index: u64) -> Id {
     unsafe { call(receiver, sel, index) }
 }
 
+const MRT_GAP_SOURCE: &str = "#include <metal_stdlib>
+    using namespace metal;
+    struct VOut { float4 position [[position]]; };
+    struct FOut { float4 zero [[color(0)]]; float4 two [[color(2)]]; };
+    vertex VOut mrt_vertex(uint id [[vertex_id]]) {
+        VOut out = {};
+        float2 position = id == 0u ? float2(-1.0, -1.0) :
+            (id == 1u ? float2(3.0, -1.0) : float2(-1.0, 3.0));
+        out.position = float4(position, 0.0, 1.0);
+        return out;
+    }
+    fragment FOut mrt_fragment() {
+        FOut out = { float4(1.0, 0.0, 0.0, 1.0), float4(0.0, 1.0, 0.0, 1.0) };
+        return out;
+    }";
+
+#[test]
+fn a_render_target_gap_preserves_fragment_output_locations() {
+    isolate_metal_fixture!();
+    if let Some(device) = gpu_device() {
+        check_render_target_gap(device);
+    }
+}
+
+#[test]
+fn a_render_target_gap_is_preserved_without_dynamic_rendering() {
+    isolate_metal_fixture!();
+    if let Some(device) = gpu_device_without_dynamic_rendering() {
+        check_render_target_gap(device);
+    }
+}
+
+fn check_render_target_gap(device: Id) {
+    const SIZE: u64 = 8;
+    const RGBA8: u64 = 70;
+    let gpu = gpu_of(device).expect("a Vulkan device");
+    let library = source_library(device, MRT_GAP_SOURCE);
+    assert!(!library.is_null());
+    // SAFETY: live source-library functions.
+    let (vertex, fragment) = unsafe {
+        (
+            new_function_with_name(
+                library,
+                std::ptr::null(),
+                foundation::string::from_str("mrt_vertex"),
+            ),
+            new_function_with_name(
+                library,
+                std::ptr::null(),
+                foundation::string::from_str("mrt_fragment"),
+            ),
+        )
+    };
+    assert!(!vertex.is_null() && !fragment.is_null());
+    let descriptor = object::make(
+        c"MTLRenderPipelineDescriptor",
+        pipeline::RenderPipelineDescriptor {
+            vertex_buffers: std::ptr::null_mut(),
+            fragment_buffers: std::ptr::null_mut(),
+            vertex_function: vertex,
+            fragment_function: fragment,
+            vertex_descriptor: std::ptr::null_mut(),
+            colors: [pipeline::ColorAttachment::fresh(); pipeline::COLOR_ATTACHMENTS],
+            depth_format: 0,
+            stencil_format: 0,
+            sample_count: 1,
+            alpha_to_coverage: false,
+            alpha_to_one: false,
+            rasterization: true,
+            input_topology: 0,
+            color_objects: std::ptr::null_mut(),
+        },
+    );
+    // SAFETY: a live pipeline descriptor and attachment collection.
+    unsafe {
+        let colors = send(descriptor, "colorAttachments");
+        send_number(element_at(colors, 0), "setPixelFormat:", RGBA8);
+        send_number(element_at(colors, 2), "setPixelFormat:", RGBA8);
+    }
+    let mut error = std::ptr::null_mut();
+    // SAFETY: live device and descriptor.
+    let state = unsafe { new_render_pipeline(device, std::ptr::null(), descriptor, &mut error) };
+    assert!(!state.is_null() && error.is_null());
+    let texture = || {
+        resource::new_texture(
+            gpu,
+            resource::TextureDescriptor {
+                texture_type: 2,
+                pixel_format: RGBA8,
+                width: SIZE,
+                height: SIZE,
+                depth: 1,
+                mipmap_level_count: 1,
+                sample_count: 1,
+                array_length: 1,
+                storage_mode: 2,
+                usage: gpu::USAGE_RENDER_TARGET,
+            },
+        )
+    };
+    let (zero, two) = (texture(), texture());
+    assert!(!zero.is_null() && !two.is_null());
+    let pass = object::make(
+        c"MTLRenderPassDescriptor",
+        encoder::RenderPassDescriptor::default(),
+    );
+    // SAFETY: live pass attachment descriptors and textures.
+    unsafe {
+        let colors = send(pass, "colorAttachments");
+        for (index, texture) in [(0, zero), (2, two)] {
+            let attachment = element_at(colors, index);
+            send_with_object(attachment, "setTexture:", texture);
+            send_number(attachment, "setLoadAction:", 2);
+            send_number(attachment, "setStoreAction:", 1);
+        }
+        let queue = new_command_queue(device, std::ptr::null());
+        let command = send(queue, "commandBuffer");
+        let render = render_encoder(command, pass);
+        assert!(!render.is_null());
+        send_with_object(render, "setRenderPipelineState:", state);
+        draw(render, 3);
+        send_void(render, "endEncoding");
+        send_void(command, "commit");
+        send_void(command, "waitUntilCompleted");
+    }
+    let mut zero_bytes = [0u8; (SIZE * SIZE * 4) as usize];
+    let mut two_bytes = [0u8; (SIZE * SIZE * 4) as usize];
+    // SAFETY: each output buffer covers the complete texture region.
+    unsafe {
+        get_bytes(zero, [0, 0, SIZE, SIZE], &mut zero_bytes, SIZE * 4);
+        get_bytes(two, [0, 0, SIZE, SIZE], &mut two_bytes, SIZE * 4);
+    }
+    let middle = ((SIZE / 2 * SIZE + SIZE / 2) * 4) as usize;
+    assert_eq!(&zero_bytes[middle..middle + 4], &[255, 0, 0, 255]);
+    assert_eq!(&two_bytes[middle..middle + 4], &[0, 255, 0, 255]);
+}
+
 /// A multisampled depth attachment resolved into a one-sample texture, which
 /// is what `VK_KHR_depth_stencil_resolve` adds. The pass clears depth to one,
 /// draws a triangle covering every sample at a depth of a half, and the
