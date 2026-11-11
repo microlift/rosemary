@@ -814,6 +814,16 @@ impl<'c, 'p> Lowerer<'c, 'p> {
                 let lvalue = self.local_lvalue(ty);
                 if let Some(init) = init {
                     match (&init.kind, ty) {
+                        (
+                            ExprKind::InitList(items),
+                            Ty::Scalar(_) | Ty::Vector(..) | Ty::Matrix { .. },
+                        ) if items.is_empty() => {
+                            let value = Value {
+                                op: self.zero(ty, *line)?,
+                                ty: ty.clone(),
+                            };
+                            self.store(&lvalue, value, *line)?;
+                        }
                         (ExprKind::InitList(items), Ty::Array(element, count)) => {
                             if items.len() > *count as usize {
                                 return Err(syntax_error(*line, "too many initializers"));
