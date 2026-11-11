@@ -159,6 +159,9 @@ fn render_pass_attachment_descriptors_keep_native_defaults_after_reset() {
         assign(colors, sel, std::ptr::null_mut(), 0);
         send_with_object(pass, "setDepthAttachment:", std::ptr::null_mut());
         send_with_object(pass, "setStencilAttachment:", std::ptr::null_mut());
+        let color = element_at(colors, 0);
+        let depth = send(pass, "depthAttachment");
+        let stencil = send(pass, "stencilAttachment");
         for (attachment, load, store) in [(color, 0, 1), (depth, 2, 0), (stencil, 2, 0)] {
             assert_eq!(send_number_result(attachment, "loadAction"), load);
             assert_eq!(send_number_result(attachment, "storeAction"), store);

@@ -16,6 +16,25 @@ const INVERT: &str = include_str!("fixtures/kernel_invert_word.ll");
 const LOOP: &str = include_str!("fixtures/kernel_bounded_loop_word.ll");
 
 #[test]
+fn source_msl_empty_numeric_initializers_produce_zero_values() {
+    for (ty, expression) in [
+        ("float", "float4(value)"),
+        ("float4", "value"),
+        ("float3x2", "float4(value[0] + value[1], value[2])"),
+    ] {
+        let source = |initializer: &str| {
+            format!(
+                "fragment float4 initialized() {{ {ty} value = {initializer}; return {expression}; }}"
+            )
+        };
+        let target = TargetProfile::vulkan_1_3();
+        let expected = translate_msl(&source(&format!("{ty}(0.0)")), &target).unwrap();
+        let actual = translate_msl(&source("{}"), &target).unwrap();
+        assert_eq!(actual.entries[0].words, expected.entries[0].words, "{ty}");
+    }
+}
+
+#[test]
 fn source_msl_gather_preserves_the_selected_component() {
     for (name, expected) in [("x", 0), ("y", 1), ("z", 2), ("w", 3)] {
         let source = format!(
