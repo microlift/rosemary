@@ -1192,33 +1192,110 @@ fn log_route(window: Id, event: Id, kind: u64) {
     ));
 }
 
+/// A button that is down: the window it was pressed in and the view, retained,
+/// that took the press.
+#[derive(Clone, Copy)]
+struct Press {
+    window: Id,
+    view: Id,
+}
+
+/// The buttons AppKit tells apart by event type.
+#[derive(Clone, Copy)]
+enum Button {
+    Left,
+    Right,
+    Other,
+}
+
+/// Where in a press an event is.
+enum Stage {
+    Down,
+    Dragged,
+    Up,
+}
+
+fn press_stage(kind: u64) -> Option<(Button, Stage)> {
+    Some(match kind {
+        kind::LEFT_MOUSE_DOWN => (Button::Left, Stage::Down),
+        kind::LEFT_MOUSE_DRAGGED => (Button::Left, Stage::Dragged),
+        kind::LEFT_MOUSE_UP => (Button::Left, Stage::Up),
+        kind::RIGHT_MOUSE_DOWN => (Button::Right, Stage::Down),
+        kind::RIGHT_MOUSE_DRAGGED => (Button::Right, Stage::Dragged),
+        kind::RIGHT_MOUSE_UP => (Button::Right, Stage::Up),
+        kind::OTHER_MOUSE_DOWN => (Button::Other, Stage::Down),
+        kind::OTHER_MOUSE_DRAGGED => (Button::Other, Stage::Dragged),
+        kind::OTHER_MOUSE_UP => (Button::Other, Stage::Up),
+        _ => return None,
+    })
+}
+
 thread_local! {
-    /// The view the last left press landed on, retained until the next one,
-    /// and whether the button is still down.
-    static LEFT_PRESS: std::cell::Cell<(Id, bool)> =
-        const { std::cell::Cell::new((std::ptr::null_mut(), false)) };
+    static PRESSES: std::cell::Cell<[Option<Press>; 3]> =
+        const { std::cell::Cell::new([None; 3]) };
+}
+
+/// Swap the press of `button` for `press`, returning the one it had.
+fn replace_press(button: Button, press: Option<Press>) -> Option<Press> {
+    let mut presses = PRESSES.get();
+    let old = std::mem::replace(&mut presses[button as usize], press);
+    PRESSES.set(presses);
+    old
+}
+
+/// Where a positional event goes, and the press it ends, whose view is kept
+/// alive until the event has been delivered.
+struct Target {
+    view: Id,
+    ended: Option<Id>,
+}
+
+impl Target {
+    fn to(view: Id) -> Self {
+        Self { view, ended: None }
+    }
+}
+
+impl Drop for Target {
+    fn drop(&mut self) {
+        if let Some(view) = self.ended {
+            objc::arc::release(view);
+        }
+    }
 }
 
 /// Which view a positional event of `kind` goes to, given the one under it.
 ///
 /// AppKit sends the drags and the release of a press to the view that took the
-/// press, wherever the pointer goes; Qt never ends a drag whose view did not
-/// hear the release.
-// shortcut: left button only, extend if a guest drags with another button.
-fn pressed_view(kind: u64, under_pointer: Id) -> Id {
-    let (pressed, held) = LEFT_PRESS.get();
-    match kind {
-        kind::LEFT_MOUSE_DOWN => {
-            LEFT_PRESS.set((objc::arc::retain(under_pointer), true));
-            objc::arc::release(pressed);
-            under_pointer
+/// press, wherever the pointer goes. An event routed through another window
+/// is located in that window, so it goes to the view under it there instead.
+fn pressed_view(window: Id, kind: u64, under_pointer: Id) -> Target {
+    let Some((button, stage)) = press_stage(kind) else {
+        return Target::to(under_pointer);
+    };
+    let in_window = |press: Press| match press.window == window {
+        true => press.view,
+        false => under_pointer,
+    };
+    match stage {
+        Stage::Down => {
+            let view = objc::arc::retain(under_pointer);
+            // A release a guest's own tracking loop took never reached here.
+            if let Some(stale) = replace_press(button, Some(Press { window, view })) {
+                objc::arc::release(stale.view);
+            }
+            Target::to(under_pointer)
         }
-        kind::LEFT_MOUSE_DRAGGED if held => pressed,
-        kind::LEFT_MOUSE_UP if held => {
-            LEFT_PRESS.set((pressed, false));
-            pressed
+        Stage::Dragged => {
+            Target::to(PRESSES.get()[button as usize].map_or(under_pointer, in_window))
         }
-        _ => under_pointer,
+        Stage::Up => match replace_press(button, None) {
+            Some(press) => Target {
+                view: in_window(press),
+                ended: Some(press.view),
+            },
+            None => Target::to(under_pointer),
+        },
     }
 }
 
@@ -1256,13 +1333,14 @@ pub fn route(window: Id, event: Id) {
         }
         return;
     }
-    let start = match positional(kind) {
+    let target = match positional(kind) {
         // SAFETY: null or the content view, which this crate made.
-        true => pressed_view(kind, unsafe {
+        true => pressed_view(window, kind, unsafe {
             crate::view::hit_test(window::content_view_of(window), nsevent::location_of(event))
         }),
-        false => responder_of(window),
+        false => Target::to(responder_of(window)),
     };
+    let start = target.view;
     if kind == kind::LEFT_MOUSE_DOWN {
         focus_clicked(window, start);
     }
@@ -1815,13 +1893,175 @@ mod tests {
         let class = objc::class::lookup(c"NSView").expect("NSView");
         let pressed = objc::object::create_instance(class, 0);
         let other = objc::object::create_instance(class, 0);
+        let window = objc::object::create_instance(objc::class::lookup(c"NSWindow").unwrap(), 0);
 
-        assert_eq!(pressed_view(kind::LEFT_MOUSE_DOWN, pressed), pressed);
-        assert_eq!(pressed_view(kind::LEFT_MOUSE_DRAGGED, other), pressed);
-        assert_eq!(pressed_view(kind::LEFT_MOUSE_UP, other), pressed);
+        assert_eq!(
+            pressed_view(window, kind::LEFT_MOUSE_DOWN, pressed).view,
+            pressed
+        );
+        assert_eq!(
+            pressed_view(window, kind::LEFT_MOUSE_DRAGGED, other).view,
+            pressed
+        );
+        assert_eq!(
+            pressed_view(window, kind::LEFT_MOUSE_UP, other).view,
+            pressed
+        );
 
-        assert_eq!(pressed_view(kind::LEFT_MOUSE_DRAGGED, other), other);
-        assert_eq!(pressed_view(kind::LEFT_MOUSE_UP, other), other);
+        assert_eq!(
+            pressed_view(window, kind::LEFT_MOUSE_DRAGGED, other).view,
+            other
+        );
+        assert_eq!(pressed_view(window, kind::LEFT_MOUSE_UP, other).view, other);
+    }
+
+    #[test]
+    fn a_press_does_not_follow_the_pointer_into_another_window() {
+        crate::bootstrap();
+        let view_class = objc::class::lookup(c"NSView").expect("NSView");
+        let window_class = objc::class::lookup(c"NSWindow").expect("NSWindow");
+        let pressed = objc::object::create_instance(view_class, 0);
+        let other = objc::object::create_instance(view_class, 0);
+        let first = objc::object::create_instance(window_class, 0);
+        let second = objc::object::create_instance(window_class, 0);
+
+        pressed_view(first, kind::LEFT_MOUSE_DOWN, pressed);
+        assert_eq!(
+            pressed_view(second, kind::LEFT_MOUSE_DRAGGED, other).view,
+            other
+        );
+        assert_eq!(
+            pressed_view(first, kind::LEFT_MOUSE_DRAGGED, other).view,
+            pressed
+        );
+        assert_eq!(pressed_view(second, kind::LEFT_MOUSE_UP, other).view, other);
+        assert_eq!(
+            pressed_view(first, kind::LEFT_MOUSE_DRAGGED, other).view,
+            other
+        );
+    }
+
+    #[test]
+    fn each_button_keeps_its_own_pressed_view() {
+        crate::bootstrap();
+        let class = objc::class::lookup(c"NSView").expect("NSView");
+        let left = objc::object::create_instance(class, 0);
+        let right = objc::object::create_instance(class, 0);
+        let other = objc::object::create_instance(class, 0);
+        let window = objc::object::create_instance(objc::class::lookup(c"NSWindow").unwrap(), 0);
+
+        pressed_view(window, kind::LEFT_MOUSE_DOWN, left);
+        pressed_view(window, kind::RIGHT_MOUSE_DOWN, right);
+        assert_eq!(
+            pressed_view(window, kind::OTHER_MOUSE_DRAGGED, other).view,
+            other
+        );
+        assert_eq!(
+            pressed_view(window, kind::RIGHT_MOUSE_DRAGGED, other).view,
+            right
+        );
+        assert_eq!(
+            pressed_view(window, kind::LEFT_MOUSE_DRAGGED, other).view,
+            left
+        );
+        assert_eq!(
+            pressed_view(window, kind::RIGHT_MOUSE_UP, other).view,
+            right
+        );
+        assert_eq!(pressed_view(window, kind::LEFT_MOUSE_UP, other).view, left);
+    }
+
+    #[test]
+    fn route_sends_a_press_and_its_release_to_the_pressed_view() {
+        if !sdl3::isolated::run_here_with_dummy_video() {
+            return;
+        }
+        use foundation::geometry::{NSRect, NSSize};
+        use objc::sel::Sel;
+        static SEEN: std::sync::Mutex<Vec<(usize, u64)>> = std::sync::Mutex::new(Vec::new());
+
+        unsafe extern "C" fn record(receiver: Id, _sel: Sel, event: Id) {
+            SEEN.lock()
+                .unwrap()
+                .push((receiver as usize, nsevent::kind_of(event)));
+        }
+
+        crate::bootstrap();
+        let size = NSSize {
+            width: 200.0,
+            height: 100.0,
+        };
+        let window = objc::object::create_instance(objc::class::lookup(c"NSWindow").unwrap(), 0);
+        // SAFETY: a fresh window, backed by SDL's dummy video driver.
+        assert!(unsafe {
+            window::init_with_content_rect_for_tests(
+                window,
+                NSRect {
+                    origin: NSPoint::default(),
+                    size,
+                },
+            )
+        });
+        let class = objc::class::allocate_pair(objc::class::lookup(c"NSView"), c"PressRecorder", 0)
+            .unwrap();
+        for selector in ["mouseDown:", "mouseDragged:", "mouseUp:"] {
+            class.add_method(
+                objc::sel::get(selector),
+                record as objc::class::Imp,
+                c"v24@0:8@16",
+            );
+        }
+        objc::class::register_pair(class);
+        let half = NSSize {
+            width: size.width / 2.0,
+            ..size
+        };
+        let left = objc::object::create_instance(class, 0);
+        let right = objc::object::create_instance(class, 0);
+        // SAFETY: views this test allocated and NSView's declared signatures.
+        unsafe {
+            let add: unsafe extern "C" fn(Id, Sel, Id) = std::mem::transmute(objc::msg::entry());
+            for (view, x) in [(left, 0.0), (right, half.width)] {
+                let frame = NSRect {
+                    origin: NSPoint { x, y: 0.0 },
+                    size: half,
+                };
+                crate::view::init_with_frame(view, objc::sel::get("initWithFrame:"), frame);
+                add(
+                    window::content_view_of(window),
+                    objc::sel::get("addSubview:"),
+                    view,
+                );
+            }
+        }
+        let over_left = NSPoint { x: 50.0, y: 50.0 };
+        let over_right = NSPoint { x: 150.0, y: 50.0 };
+        for (kind, location) in [
+            (kind::LEFT_MOUSE_DOWN, over_left),
+            (kind::LEFT_MOUSE_DRAGGED, over_right),
+            (kind::LEFT_MOUSE_UP, over_right),
+            (kind::LEFT_MOUSE_DOWN, over_right),
+        ] {
+            let event = nsevent::make(Fields {
+                kind,
+                location,
+                window,
+                ..Default::default()
+            });
+            route(window, event);
+        }
+        assert_eq!(
+            *SEEN.lock().unwrap(),
+            [
+                (left as usize, kind::LEFT_MOUSE_DOWN),
+                (left as usize, kind::LEFT_MOUSE_DRAGGED),
+                (left as usize, kind::LEFT_MOUSE_UP),
+                (right as usize, kind::LEFT_MOUSE_DOWN),
+            ]
+        );
+        objc::arc::release(left);
+        objc::arc::release(right);
+        objc::arc::release(window);
     }
 
     #[test]
