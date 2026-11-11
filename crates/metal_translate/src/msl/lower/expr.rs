@@ -1443,7 +1443,7 @@ impl Lowerer<'_, '_> {
         for (position, (field, value)) in fields.iter().zip(values).enumerate() {
             let value = match value {
                 Some(value) => self.pack(value, &field.ty),
-                None => self.zero(&field.ty, line)?,
+                None => self.context.zero(&field.ty, line)?,
             };
             op = self.emit(
                 ir.clone(),
@@ -1455,33 +1455,6 @@ impl Lowerer<'_, '_> {
             );
         }
         Ok(Value { op, ty: ty.clone() })
-    }
-
-    pub(super) fn zero(&mut self, ty: &Ty, line: usize) -> Result<Operand> {
-        match ty {
-            Ty::Scalar(scalar) => Ok(number_operand(*scalar, Number::Int(0))),
-            Ty::Vector(scalar, lanes) => Ok(self.constant_of(*scalar, *lanes, Number::Int(0))),
-            Ty::Matrix { .. } => Ok(self.construct_matrix(ty, &[], line)?.op),
-            Ty::ByteBool => Ok(number_operand(Scalar::UCHAR, Number::Int(0))),
-            Ty::Packed(scalar, lanes) => {
-                let element = self.zero(&Ty::Scalar(*scalar), line)?;
-                Ok(Operand::Composite {
-                    ty: self.context.ir(ty),
-                    elements: vec![element; usize::from(*lanes)],
-                })
-            }
-            Ty::Array(element, count) => {
-                let element = self.zero(element, line)?;
-                Ok(Operand::Composite {
-                    ty: self.context.ir(ty),
-                    elements: vec![element; *count as usize],
-                })
-            }
-            _ => Err(syntax_error(
-                line,
-                "a field left out of a compound literal must be numeric",
-            )),
-        }
     }
 }
 
