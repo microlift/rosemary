@@ -2397,6 +2397,9 @@ unsafe fn hit(view: Id, point: NSPoint, depth: usize) -> Id {
 /// The inherited `NSView` hit-test behavior, without redispatching an override
 /// on `view`. This distinction matters when that override calls `super`.
 unsafe fn hit_base(view: Id, point: NSPoint, depth: usize) -> Id {
+    if view_of(view).hidden != 0 {
+        return std::ptr::null_mut();
+    }
     let frame = view_of(view).frame;
     let superview = view_of(view).superview;
     if !crate::geometry::mouse_in_rect(point, frame, is_flipped(superview)) {
@@ -3746,6 +3749,16 @@ mod tests {
             set_alpha_value(subview, set, 0.5);
         }
         assert_eq!(effective_alpha(subview), 0.25);
+        objc::arc::release(superview);
+    }
+
+    #[test]
+    fn a_hidden_subview_takes_no_clicks() {
+        let (superview, subview) = tree(rect(0.0, 0.0, 10.0, 10.0), rect(0.0, 0.0, 5.0, 5.0), 0);
+        let point = NSPoint { x: 2.0, y: 2.0 };
+        assert_eq!(unsafe { hit_test(superview, point) }, subview);
+        view_of(subview).hidden = 1;
+        assert_eq!(unsafe { hit_test(superview, point) }, superview);
         objc::arc::release(superview);
     }
 
