@@ -105,6 +105,14 @@ fn exported_attachment_descriptors_can_be_created_with_native_defaults() {
             "MTLRenderPassColorAttachmentDescriptor",
             [("loadAction", 0), ("storeAction", 1), ("level", 0)],
         ),
+        (
+            "MTLRenderPassDepthAttachmentDescriptor",
+            [("loadAction", 2), ("storeAction", 0), ("level", 0)],
+        ),
+        (
+            "MTLRenderPassStencilAttachmentDescriptor",
+            [("loadAction", 2), ("storeAction", 0), ("level", 0)],
+        ),
     ] {
         let symbol = format!("_OBJC_CLASS_$_{name}");
         let address = symbols
