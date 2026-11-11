@@ -114,8 +114,8 @@ impl Lowerer<'_, '_> {
         args: &[Expr],
         line: usize,
     ) -> Result<Value> {
-        if let Some(function) = self.helper(name, args.len(), line)? {
-            return self.inline_call(function, args, line);
+        if let Some(value) = self.call_helper(name, args, line)? {
+            return Ok(value);
         }
         if let Some(op) = atomic_op(name) {
             return self.atomic(name, op, args, line);
