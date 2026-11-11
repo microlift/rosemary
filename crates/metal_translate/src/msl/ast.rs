@@ -310,7 +310,8 @@ pub(super) struct FunctionDef {
 pub(super) struct Global {
     pub name: String,
     pub ty: Ty,
-    pub init: Expr,
+    pub init: Option<Expr>,
+    pub function_constant: Option<Expr>,
     pub line: usize,
 }
 

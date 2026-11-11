@@ -305,6 +305,7 @@ fn run_initializer(
     };
     let mut previous = None;
     let mut known: HashMap<ValueId, Operand> = HashMap::new();
+    let mut locals: HashMap<ValueId, Operand> = HashMap::new();
     let resolve = |known: &HashMap<ValueId, Operand>, operand: &Operand| match operand {
         Operand::Value(value) => known.get(value).cloned().unwrap_or_else(|| operand.clone()),
         other => other.clone(),
@@ -334,6 +335,50 @@ fn run_initializer(
                 *operand = resolve(&known, operand);
             }
             match &kind {
+                InstructionKind::LocalVariable { ty } => {
+                    let result = instruction
+                        .result
+                        .ok_or_else(|| fail("declares a local without a result".to_owned()))?;
+                    locals.insert(result, Operand::Undef(ty.clone()));
+                }
+                InstructionKind::BufferAddress { pointer, indices }
+                    if matches!(indices.as_slice(), [Operand::Integer { value: 0, .. }]) =>
+                {
+                    let result = instruction
+                        .result
+                        .ok_or_else(|| fail("forms an address without a result".to_owned()))?;
+                    if operand_type(function, pointer).as_ref()
+                        != function.values.get(result.0 as usize)
+                    {
+                        return Err(fail("changes a pointer's type".to_owned()));
+                    }
+                    known.insert(result, pointer.clone());
+                }
+                InstructionKind::Load {
+                    pointer: Operand::Value(local),
+                } if locals.contains_key(local) => {
+                    let result = instruction
+                        .result
+                        .ok_or_else(|| fail("loads into nothing".to_owned()))?;
+                    let value = locals[local].clone();
+                    if operand_type(function, &value).as_ref()
+                        != function.values.get(result.0 as usize)
+                    {
+                        return Err(fail("reads part of a local".to_owned()));
+                    }
+                    known.insert(result, value);
+                }
+                InstructionKind::Store {
+                    pointer: Operand::Value(local),
+                    value,
+                } if locals.contains_key(local) => {
+                    if matches!(value, Operand::Value(_))
+                        || operand_type(function, value) != operand_type(function, &locals[local])
+                    {
+                        return Err(fail("stores a local value it could not compute".to_owned()));
+                    }
+                    locals.insert(*local, value.clone());
+                }
                 InstructionKind::Load {
                     pointer: Operand::Global { index, .. },
                 } => {

@@ -53,13 +53,21 @@ struct Device {
     gpu: Option<&'static Gpu>,
 }
 
+enum LibraryInput {
+    Air {
+        modules: Vec<Vec<u8>>,
+        entry_modules: Vec<usize>,
+    },
+    Msl {
+        source: String,
+        macros: Vec<(String, String)>,
+    },
+}
+
 struct Library {
     translated: metal_translate::TranslatedLibrary,
-    /// The AIR modules the library was made from, kept only where one declares
-    /// function constants: each set of values translates its owning module.
-    air: Option<Vec<Vec<u8>>>,
-    /// Owning AIR module for each translated entry point.
-    entry_modules: Vec<usize>,
+    /// Retained only when function constants can require another translation.
+    input: Option<LibraryInput>,
     /// The profile of the device which made the library.
     target: Option<&'static metal_translate::TargetProfile>,
     /// The device which made the library. Devices live as long as the

@@ -545,20 +545,44 @@ impl Parser<'_> {
             ));
         }
         let ty = self.array_suffix(ty)?;
-        self.expect("=")?;
-        let init = self.initializer()?;
+        let mut function_constant = None;
+        for attribute in self.attributes()? {
+            match (attribute.name.as_str(), attribute.args.as_slice()) {
+                ("function_constant", [index]) if function_constant.is_none() => {
+                    function_constant = Some(index.clone());
+                }
+                ("maybe_unused", []) => {}
+                _ => {
+                    return Err(syntax_error(
+                        attribute.line,
+                        format!("unsupported global attribute [[{}]]", attribute.name),
+                    ));
+                }
+            }
+        }
+        let init = if function_constant.is_some() && !self.is_punct("=") {
+            None
+        } else {
+            self.expect("=")?;
+            Some(self.initializer()?)
+        };
         self.expect(";")?;
         // `T name[] = {...}` takes its length from the initializer.
-        let ty = match (ty, &init.kind) {
-            (Ty::Array(element, 0), ExprKind::InitList(items)) => {
-                Ty::Array(element, items.len() as u32)
-            }
+        let ty = match (ty, &init) {
+            (
+                Ty::Array(element, 0),
+                Some(Expr {
+                    kind: ExprKind::InitList(items),
+                    ..
+                }),
+            ) => Ty::Array(element, items.len() as u32),
             (ty, _) => ty,
         };
         self.program.globals.push(Global {
             name,
             ty,
             init,
+            function_constant,
             line,
         });
         Ok(())
