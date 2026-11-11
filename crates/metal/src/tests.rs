@@ -290,6 +290,77 @@ fn texture_descriptor_copies_preserve_settings_and_are_independent() {
     }
 }
 
+static TEXTURE_COPY_INIT_CALLS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+#[repr(C)]
+struct TextureCopySuper {
+    receiver: Id,
+    class: *const objc::class::Class,
+}
+
+unsafe extern "C" fn texture_copy_probe_init(receiver: Id, sel: objc::sel::Sel) -> Id {
+    TEXTURE_COPY_INIT_CALLS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    let class = unsafe { objc::object::class_of(receiver) }.expect("probe class");
+    let sup = TextureCopySuper {
+        receiver,
+        class: objc::class::ptr(class),
+    };
+    let send: unsafe extern "C" fn(*const TextureCopySuper, objc::sel::Sel) -> Id =
+        unsafe { std::mem::transmute(objc::msg::entry_super2()) };
+    unsafe { darwin::call_as_darwin!(send(&sup, sel)) }
+}
+
+#[test]
+fn texture_descriptor_copy_uses_the_dynamic_class_and_initializer() {
+    isolate_metal_fixture!();
+    bootstrap();
+    // SAFETY: a fresh subclass and objects this test owns.
+    unsafe {
+        let base = objc::class::ptr(objc::class::lookup(c"MTLTextureDescriptor").unwrap());
+        let subclass = objc::api::objc_allocateClassPair(
+            base.cast(),
+            c"RosemaryTextureDescriptorCopyProbe".as_ptr(),
+            0,
+        );
+        assert!(!subclass.is_null());
+        let class = objc::class::from_ptr(subclass.cast()).expect("allocated class");
+        class.replace_method(
+            objc::sel::get("init"),
+            texture_copy_probe_init as *const std::ffi::c_void,
+            c"@16@0:8",
+        );
+        objc::api::objc_registerClassPair(subclass);
+
+        TEXTURE_COPY_INIT_CALLS.store(0, std::sync::atomic::Ordering::SeqCst);
+        let original = send(subclass as Id, "new");
+        assert_eq!(
+            TEXTURE_COPY_INIT_CALLS.load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
+        send_number(original, "setWidth:", 73);
+        let (copy, sel) = method::<
+            unsafe extern "C" fn(Id, objc::sel::Sel, *mut std::ffi::c_void) -> Id,
+        >(original, "copyWithZone:");
+        let copied = copy(
+            original,
+            sel,
+            std::ptr::NonNull::<std::ffi::c_void>::dangling().as_ptr(),
+        );
+        assert!(!copied.is_null());
+        assert_eq!(objc::api::object_getClass(copied), subclass);
+        assert_eq!(
+            TEXTURE_COPY_INIT_CALLS.load(std::sync::atomic::Ordering::SeqCst),
+            2
+        );
+        assert_eq!(send_number_result(copied, "width"), 73);
+        send_number(original, "setWidth:", 91);
+        assert_eq!(send_number_result(copied, "width"), 73);
+        objc::arc::release(original);
+        objc::arc::release(copied);
+    }
+}
+
 #[test]
 fn texture_descriptor_copies_report_native_zone_argument() {
     isolate_metal_fixture!();

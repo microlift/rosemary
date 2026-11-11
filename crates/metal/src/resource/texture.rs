@@ -340,12 +340,29 @@ pub(super) unsafe extern "C" fn descriptor_init(receiver: Id, _sel: Sel) -> Id {
 pub(super) unsafe extern "C" fn descriptor_copy(
     receiver: Id,
     _sel: Sel,
-    _zone: *mut std::ffi::c_void,
+    zone: *mut std::ffi::c_void,
 ) -> Id {
     // SAFETY: a texture descriptor of this crate's, containing only values.
     let descriptor = *unsafe { object::body::<TextureDescriptor>(receiver) };
-    // FIXME (ACCURACY): Copies always use the base class and bypass subclass initializers.
-    object::make(c"MTLTextureDescriptor", descriptor)
+    let Some(class) = (unsafe { objc::object::class_of(receiver) }) else {
+        return std::ptr::null_mut();
+    };
+    let allocate: unsafe extern "C" fn(Id, Sel, *mut std::ffi::c_void) -> Id =
+        unsafe { std::mem::transmute(objc::msg::entry()) };
+    let copied = unsafe {
+        darwin::call_as_darwin!(allocate(
+            objc::class::ptr(class) as Id,
+            objc::sel::get("allocWithZone:"),
+            zone
+        ))
+    };
+    let initialize: unsafe extern "C" fn(Id, Sel) -> Id =
+        unsafe { std::mem::transmute(objc::msg::entry()) };
+    let copied = unsafe { darwin::call_as_darwin!(initialize(copied, objc::sel::get("init"))) };
+    if !copied.is_null() {
+        *unsafe { object::body::<TextureDescriptor>(copied) } = descriptor;
+    }
+    copied
 }
 
 /// The level count `mipmapped:YES` asks for: the full chain down to 1x1.
