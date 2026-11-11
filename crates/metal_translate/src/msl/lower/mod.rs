@@ -122,7 +122,7 @@ impl<'p> Context<'p> {
             },
             // Only a template's own body names one, and every use there is
             // resolved first; an unresolved one has no IR form.
-            Ty::Param(_) => Type::Void,
+            Ty::Param(_) | Ty::ArrayParam(..) => Type::Void,
             Ty::ByteBool => scalar_ir(Scalar::UCHAR),
             // Packed lanes are an array of them in memory.
             Ty::Packed(scalar, lanes) => Type::Array {

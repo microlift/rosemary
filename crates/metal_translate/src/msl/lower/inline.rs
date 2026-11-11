@@ -13,10 +13,16 @@ pub(super) struct Frame {
     exit: BlockId,
     /// A function template's type parameters, as this call binds them.
     types: HashMap<String, Ty>,
+    values: HashMap<String, u32>,
 }
 
 /// `ty` with each template parameter in `types` replaced by its binding.
-fn substitute(ty: &Ty, types: &HashMap<String, Ty>, line: usize) -> Result<Ty> {
+fn substitute(
+    ty: &Ty,
+    types: &HashMap<String, Ty>,
+    values: &HashMap<String, u32>,
+    line: usize,
+) -> Result<Ty> {
     Ok(match ty {
         Ty::Param(name) => types.get(name).cloned().ok_or_else(|| {
             syntax_error(
@@ -24,14 +30,31 @@ fn substitute(ty: &Ty, types: &HashMap<String, Ty>, line: usize) -> Result<Ty> {
                 format!("template parameter {name} is not deduced from the call"),
             )
         })?,
-        Ty::Array(element, count) => Ty::Array(Box::new(substitute(element, types, line)?), *count),
+        Ty::Array(element, count) => {
+            Ty::Array(Box::new(substitute(element, types, values, line)?), *count)
+        }
+        Ty::ArrayParam(element, name) => Ty::Array(
+            Box::new(substitute(element, types, values, line)?),
+            *values.get(name).ok_or_else(|| {
+                syntax_error(
+                    line,
+                    format!("array bound {name} is not deduced from the call"),
+                )
+            })?,
+        ),
         ty => ty.clone(),
     })
 }
 
 /// Bind the template parameters `declared` names from the type an argument
 /// has, as C++ deduces them.
-fn deduce(declared: &Ty, actual: &Ty, types: &mut HashMap<String, Ty>, line: usize) -> Result<()> {
+fn deduce(
+    declared: &Ty,
+    actual: &Ty,
+    types: &mut HashMap<String, Ty>,
+    values: &mut HashMap<String, u32>,
+    line: usize,
+) -> Result<()> {
     match (declared, actual) {
         (Ty::Param(name), actual) => match types.get(name) {
             Some(bound) if bound != actual => Err(syntax_error(
@@ -48,7 +71,19 @@ fn deduce(declared: &Ty, actual: &Ty, types: &mut HashMap<String, Ty>, line: usi
                 Ok(())
             }
         },
-        (Ty::Array(declared, _), Ty::Array(actual, _)) => deduce(declared, actual, types, line),
+        (Ty::Array(declared, _), Ty::Array(actual, _)) => {
+            deduce(declared, actual, types, values, line)
+        }
+        (Ty::ArrayParam(declared, name), Ty::Array(actual, count)) => {
+            if values.get(name).is_some_and(|bound| bound != count) {
+                return Err(syntax_error(
+                    line,
+                    format!("array bound {name} is deduced with conflicting lengths"),
+                ));
+            }
+            values.insert(name.clone(), *count);
+            deduce(declared, actual, types, values, line)
+        }
         _ => Ok(()),
     }
 }
@@ -205,12 +240,34 @@ impl<'p> Lowerer<'_, 'p> {
         // replaces it.
         let mut scope = HashMap::new();
         let mut types = HashMap::new();
+        let mut values = HashMap::new();
         for (param, arg) in function.params.iter().zip(args) {
-            let binding = self.argument(param, arg, &mut types)?;
+            let binding = self.argument(param, arg, &mut types, &mut values)?;
             scope.insert(param.name.clone(), binding);
         }
+        for (name, scalar) in &function.value_params {
+            let value = *values.get(name).ok_or_else(|| {
+                syntax_error(
+                    line,
+                    format!("template value {name} is not deduced from the call"),
+                )
+            })?;
+            if *scalar == Scalar::INT && value > i32::MAX as u32 {
+                return Err(syntax_error(
+                    line,
+                    format!("array bound {name} does not fit in int"),
+                ));
+            }
+            scope.insert(
+                name.clone(),
+                Binding::Value(Value {
+                    op: number_operand(*scalar, Number::Int(i64::from(value))),
+                    ty: Ty::Scalar(*scalar),
+                }),
+            );
+        }
         let exit = self.new_block("return");
-        let result = match substitute(&function.ret, &types, line)? {
+        let result = match substitute(&function.ret, &types, &values, line)? {
             Ty::Void => None,
             ty => Some((self.local_lvalue(&ty), ty)),
         };
@@ -219,6 +276,7 @@ impl<'p> Lowerer<'_, 'p> {
             result: result.clone(),
             exit,
             types,
+            values,
         });
         let scopes = std::mem::replace(&mut self.scopes, vec![scope]);
         let loops = std::mem::take(&mut self.loops);
@@ -245,6 +303,7 @@ impl<'p> Lowerer<'_, 'p> {
         param: &Param,
         arg: &Expr,
         types: &mut HashMap<String, Ty>,
+        values: &mut HashMap<String, u32>,
     ) -> Result<Binding> {
         let line = arg.line;
         match (param.indirection, &param.ty) {
@@ -253,8 +312,8 @@ impl<'p> Lowerer<'_, 'p> {
             }
             (Indirection::Value, declared) => {
                 let value = self.rvalue(arg)?;
-                deduce(declared, &value.ty, types, line)?;
-                let ty = &substitute(declared, types, line)?;
+                deduce(declared, &value.ty, types, values, line)?;
+                let ty = &substitute(declared, types, values, line)?;
                 let value = self.convert(value, ty, line)?;
                 let lvalue = self.local_lvalue(ty);
                 self.store(&lvalue, value, line)?;
@@ -268,9 +327,9 @@ impl<'p> Lowerer<'_, 'p> {
                         format!("{} is passed something not in memory", param.name),
                     )
                 })?;
-                deduce(declared, &lvalue.ty(), types, line)?;
-                let ty = &substitute(declared, types, line)?;
-                if &lvalue.ty() != ty {
+                deduce(declared, &lvalue.ty(), types, values, line)?;
+                let ty = &substitute(declared, types, values, line)?;
+                if lvalue.ty() != ty.in_memory().unpacked() {
                     return Err(syntax_error(
                         line,
                         format!(
@@ -302,8 +361,8 @@ impl<'p> Lowerer<'_, 'p> {
                     ));
                 }
                 let element = pointer.element().unpacked();
-                deduce(declared, &element, types, line)?;
-                let ty = substitute(declared, types, line)?;
+                deduce(declared, &element, types, values, line)?;
+                let ty = substitute(declared, types, values, line)?;
                 if ty.in_memory() != *pointer.element() {
                     return Err(syntax_error(
                         line,
@@ -359,7 +418,7 @@ impl Lowerer<'_, '_> {
     /// being inlined bound.
     pub(super) fn resolve(&self, ty: &Ty, line: usize) -> Result<Ty> {
         match self.frames.last() {
-            Some(frame) => substitute(ty, &frame.types, line),
+            Some(frame) => substitute(ty, &frame.types, &frame.values, line),
             None => Ok(ty.clone()),
         }
     }

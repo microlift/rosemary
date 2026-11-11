@@ -63,6 +63,8 @@ pub(super) enum Ty {
         rows: u8,
     },
     Array(Box<Ty>, u32),
+    /// An array bound deduced from a function template's argument.
+    ArrayParam(Box<Ty>, String),
     /// An index into [`Program::structs`].
     Struct(usize),
     Texture(TextureType),
@@ -101,6 +103,9 @@ impl Ty {
         match self {
             Ty::Scalar(Scalar::Bool) => Ty::ByteBool,
             Ty::Array(element, count) => Ty::Array(Box::new(element.in_memory()), *count),
+            Ty::ArrayParam(element, name) => {
+                Ty::ArrayParam(Box::new(element.in_memory()), name.clone())
+            }
             ty => ty.clone(),
         }
     }
@@ -298,6 +303,7 @@ pub(super) struct Param {
 pub(super) struct FunctionDef {
     pub stage: Option<Stage>,
     pub early_fragment_tests: bool,
+    pub value_params: Vec<(String, Scalar)>,
     pub ret: Ty,
     pub name: String,
     pub params: Vec<Param>,
