@@ -1192,9 +1192,16 @@ fn log_route(window: Id, event: Id, kind: u64) {
     ));
 }
 
+/// A button that is down: the window it was pressed in and the view, retained,
+/// that took the press.
+#[derive(Clone, Copy)]
+struct Press {
+    window: Id,
+    view: Id,
+}
+
 thread_local! {
-    /// The view the left button was pressed on, retained while it is down.
-    static LEFT_PRESS: std::cell::Cell<Option<Id>> = const { std::cell::Cell::new(None) };
+    static LEFT_PRESS: std::cell::Cell<Option<Press>> = const { std::cell::Cell::new(None) };
 }
 
 /// Where a positional event goes, and the press it ends, whose view is kept
@@ -1221,23 +1228,29 @@ impl Drop for Target {
 /// Which view a positional event of `kind` goes to, given the one under it.
 ///
 /// AppKit sends the drags and the release of a press to the view that took the
-/// press, wherever the pointer goes.
+/// press, wherever the pointer goes. An event routed through another window
+/// is located in that window, so it goes to the view under it there instead.
 // FIXME (ACCURACY): left button only; right and other drags go to the view
 // under the pointer.
-fn pressed_view(kind: u64, under_pointer: Id) -> Target {
+fn pressed_view(window: Id, kind: u64, under_pointer: Id) -> Target {
+    let in_window = |press: Press| match press.window == window {
+        true => press.view,
+        false => under_pointer,
+    };
     match kind {
         kind::LEFT_MOUSE_DOWN => {
+            let view = objc::arc::retain(under_pointer);
             // A release a guest's own tracking loop took never reached here.
-            if let Some(stale) = LEFT_PRESS.replace(Some(objc::arc::retain(under_pointer))) {
-                objc::arc::release(stale);
+            if let Some(stale) = LEFT_PRESS.replace(Some(Press { window, view })) {
+                objc::arc::release(stale.view);
             }
             Target::to(under_pointer)
         }
-        kind::LEFT_MOUSE_DRAGGED => Target::to(LEFT_PRESS.get().unwrap_or(under_pointer)),
+        kind::LEFT_MOUSE_DRAGGED => Target::to(LEFT_PRESS.get().map_or(under_pointer, in_window)),
         kind::LEFT_MOUSE_UP => match LEFT_PRESS.take() {
-            Some(view) => Target {
-                view,
-                ended: Some(view),
+            Some(press) => Target {
+                view: in_window(press),
+                ended: Some(press.view),
             },
             None => Target::to(under_pointer),
         },
@@ -1281,7 +1294,7 @@ pub fn route(window: Id, event: Id) {
     }
     let target = match positional(kind) {
         // SAFETY: null or the content view, which this crate made.
-        true => pressed_view(kind, unsafe {
+        true => pressed_view(window, kind, unsafe {
             crate::view::hit_test(window::content_view_of(window), nsevent::location_of(event))
         }),
         false => Target::to(responder_of(window)),
@@ -1839,13 +1852,52 @@ mod tests {
         let class = objc::class::lookup(c"NSView").expect("NSView");
         let pressed = objc::object::create_instance(class, 0);
         let other = objc::object::create_instance(class, 0);
+        let window = objc::object::create_instance(objc::class::lookup(c"NSWindow").unwrap(), 0);
 
-        assert_eq!(pressed_view(kind::LEFT_MOUSE_DOWN, pressed).view, pressed);
-        assert_eq!(pressed_view(kind::LEFT_MOUSE_DRAGGED, other).view, pressed);
-        assert_eq!(pressed_view(kind::LEFT_MOUSE_UP, other).view, pressed);
+        assert_eq!(
+            pressed_view(window, kind::LEFT_MOUSE_DOWN, pressed).view,
+            pressed
+        );
+        assert_eq!(
+            pressed_view(window, kind::LEFT_MOUSE_DRAGGED, other).view,
+            pressed
+        );
+        assert_eq!(
+            pressed_view(window, kind::LEFT_MOUSE_UP, other).view,
+            pressed
+        );
 
-        assert_eq!(pressed_view(kind::LEFT_MOUSE_DRAGGED, other).view, other);
-        assert_eq!(pressed_view(kind::LEFT_MOUSE_UP, other).view, other);
+        assert_eq!(
+            pressed_view(window, kind::LEFT_MOUSE_DRAGGED, other).view,
+            other
+        );
+        assert_eq!(pressed_view(window, kind::LEFT_MOUSE_UP, other).view, other);
+    }
+
+    #[test]
+    fn a_press_does_not_follow_the_pointer_into_another_window() {
+        crate::bootstrap();
+        let view_class = objc::class::lookup(c"NSView").expect("NSView");
+        let window_class = objc::class::lookup(c"NSWindow").expect("NSWindow");
+        let pressed = objc::object::create_instance(view_class, 0);
+        let other = objc::object::create_instance(view_class, 0);
+        let first = objc::object::create_instance(window_class, 0);
+        let second = objc::object::create_instance(window_class, 0);
+
+        pressed_view(first, kind::LEFT_MOUSE_DOWN, pressed);
+        assert_eq!(
+            pressed_view(second, kind::LEFT_MOUSE_DRAGGED, other).view,
+            other
+        );
+        assert_eq!(
+            pressed_view(first, kind::LEFT_MOUSE_DRAGGED, other).view,
+            pressed
+        );
+        assert_eq!(pressed_view(second, kind::LEFT_MOUSE_UP, other).view, other);
+        assert_eq!(
+            pressed_view(first, kind::LEFT_MOUSE_DRAGGED, other).view,
+            other
+        );
     }
 
     #[test]
