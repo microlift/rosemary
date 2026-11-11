@@ -16,6 +16,30 @@ const INVERT: &str = include_str!("fixtures/kernel_invert_word.ll");
 const LOOP: &str = include_str!("fixtures/kernel_bounded_loop_word.ll");
 
 #[test]
+fn source_msl_empty_global_initializers_preserve_zero_values() {
+    let source = "constant uint2 coordinates = {};
+        constant float3x2 matrix = {};
+        fragment float4 zeros() { return float4(coordinates, matrix[2]); }";
+    let ir = parse_msl(source).unwrap();
+    assert_eq!(ir.globals.len(), 2);
+    let Operand::Composite { elements, .. } = ir.globals[0].initializer.as_ref().unwrap() else {
+        panic!("constant coordinates are a vector");
+    };
+    assert_eq!(elements, &[Operand::u32(0), Operand::u32(0)]);
+    let Operand::Composite { elements, .. } = ir.globals[1].initializer.as_ref().unwrap() else {
+        panic!("constant matrix has columns");
+    };
+    assert_eq!(elements.len(), 3);
+    for column in elements {
+        let Operand::Composite { elements, .. } = column else {
+            panic!("a column is a vector");
+        };
+        assert_eq!(elements, &[Operand::f32(0.0), Operand::f32(0.0)]);
+    }
+    translate_msl(source, &TargetProfile::vulkan_1_3()).unwrap();
+}
+
+#[test]
 fn source_msl_early_fragment_tests_become_an_execution_mode() {
     for early in [false, true] {
         let attribute = if early {
