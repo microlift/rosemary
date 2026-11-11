@@ -826,11 +826,24 @@ impl Lowerer<'_, '_> {
                 ExprKind::Call { name, .. } if name == "min_lod_clamp" => {
                     return Err(syntax_error(line, "min_lod_clamp is not supported"));
                 }
-                ExprKind::Ident(name) if gather && name.starts_with("component") => {
-                    return Err(syntax_error(line, "a gather component is not supported"));
+                ExprKind::Ident(name) if gather && name.starts_with("component::") => {
+                    if component.is_some() {
+                        return Err(syntax_error(line, "a gather takes one component"));
+                    }
+                    component = Some(match name.as_str() {
+                        "component::x" => 0,
+                        "component::y" => 1,
+                        "component::z" => 2,
+                        "component::w" => 3,
+                        _ => return Err(syntax_error(line, "an unknown gather component")),
+                    });
                 }
                 _ if gather && component.is_none() && offset.is_some() => {
-                    component = Some(self.context.const_index(arg)?);
+                    let index = self.context.const_index(arg)?;
+                    if index > 3 {
+                        return Err(syntax_error(line, "a gather component is out of range"));
+                    }
+                    component = Some(index);
                 }
                 _ => {
                     let value = self.rvalue(arg)?;

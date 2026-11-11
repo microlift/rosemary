@@ -15,6 +15,64 @@ const COPY: &str = include_str!("fixtures/kernel_copy_word.ll");
 const INVERT: &str = include_str!("fixtures/kernel_invert_word.ll");
 const LOOP: &str = include_str!("fixtures/kernel_bounded_loop_word.ll");
 
+#[test]
+fn source_msl_gather_preserves_the_selected_component() {
+    for (name, expected) in [("x", 0), ("y", 1), ("z", 2), ("w", 3)] {
+        let source = format!(
+            "fragment float4 sample_channel(texture2d<float> tex [[texture(0)]],
+                sampler s [[sampler(0)]], float4 position [[position]]) {{
+                return tex.gather(s, position.xy, int2(1, 0), metal::component::{name});
+            }}"
+        );
+        let module = parse_msl(&source).unwrap();
+        let channels: Vec<_> = module.functions[0]
+            .blocks
+            .iter()
+            .flat_map(|block| &block.instructions)
+            .filter_map(|instruction| match instruction.kind {
+                InstructionKind::TextureSample { gather, .. } => gather,
+                _ => None,
+            })
+            .collect();
+        assert_eq!(channels, [expected]);
+        let target = TargetProfile {
+            shader_image_gather_extended: true,
+            ..TargetProfile::vulkan_1_3()
+        };
+        let library = translate_msl(&source, &target).unwrap();
+        let spirv = rspirv::dr::load_words(&library.entries[0].words).unwrap();
+        let gather = spirv
+            .all_inst_iter()
+            .find(|inst| inst.class.opcode == Op::ImageGather)
+            .expect("the gather remains a gather in SPIR-V");
+        let rspirv::dr::Operand::IdRef(component) = gather.operands[2] else {
+            panic!("gather component is an ID");
+        };
+        let constant = spirv
+            .types_global_values
+            .iter()
+            .find(|inst| inst.result_id == Some(component))
+            .unwrap();
+        assert_eq!(
+            constant.operands,
+            [rspirv::dr::Operand::LiteralBit32(expected)]
+        );
+    }
+}
+
+#[test]
+fn source_msl_gather_rejects_invalid_components() {
+    for component in ["component::q", "4", "-1"] {
+        let source = format!(
+            "fragment float4 sample_channel(texture2d<float> tex [[texture(0)]],
+                sampler s [[sampler(0)]], float4 position [[position]]) {{
+                return tex.gather(s, position.xy, int2(0), {component});
+            }}"
+        );
+        assert!(parse_msl(&source).is_err(), "accepted {component}");
+    }
+}
+
 fn store_bitcode() -> Vec<u8> {
     let encoded = include_str!("fixtures/kernel_store_const.bc.hex")
         .trim()
