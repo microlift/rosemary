@@ -1882,6 +1882,127 @@ unsafe extern "C" fn record_creation(_block: Id, object: Id, error: Id) {
     CREATED_READY.notify_all();
 }
 
+static EVENT_NOTIFICATION: Mutex<Option<(usize, u64)>> = Mutex::new(None);
+static EVENT_NOTIFICATION_READY: std::sync::Condvar = std::sync::Condvar::new();
+static MULTI_EVENT_NOTIFICATIONS: Mutex<Vec<(usize, u64)>> = Mutex::new(Vec::new());
+static MULTI_EVENT_NOTIFICATIONS_READY: std::sync::Condvar = std::sync::Condvar::new();
+
+unsafe extern "C" fn record_event_notification(_block: Id, event: Id, value: u64) {
+    *EVENT_NOTIFICATION.lock().expect("event notification") = Some((event as usize, value));
+    EVENT_NOTIFICATION_READY.notify_all();
+}
+
+unsafe extern "C" fn record_multi_event_notification(_block: Id, event: Id, value: u64) {
+    MULTI_EVENT_NOTIFICATIONS
+        .lock()
+        .expect("event notifications")
+        .push((event as usize, value));
+    MULTI_EVENT_NOTIFICATIONS_READY.notify_all();
+}
+
+#[test]
+fn a_shared_event_notification_runs_on_its_listener() {
+    isolate_metal_fixture!();
+    let Some(device) = gpu_device() else {
+        return;
+    };
+    *EVENT_NOTIFICATION.lock().expect("event notification") = None;
+    let block = GlobalBlock::new(record_event_notification as *const std::ffi::c_void);
+    // SAFETY: live Metal objects and a global notification block.
+    unsafe {
+        let event = send(device, "newSharedEvent");
+        let listener = send(
+            objc::class::ptr(objc::class::lookup(c"MTLSharedEventListener").unwrap()) as Id,
+            "new",
+        );
+        let (notify, sel) = method::<unsafe extern "C" fn(Id, Sel, Id, u64, Id)>(
+            event,
+            "notifyListener:atValue:block:",
+        );
+        notify(event, sel, listener, 7, block.id());
+        let (signal, sel) =
+            method::<unsafe extern "C" fn(Id, Sel, u64)>(event, "setSignaledValue:");
+        signal(event, sel, 7);
+        let (notified, timeout) = EVENT_NOTIFICATION_READY
+            .wait_timeout_while(
+                EVENT_NOTIFICATION.lock().expect("event notification"),
+                std::time::Duration::from_secs(5),
+                |notification| notification.is_none(),
+            )
+            .expect("event notification");
+        assert!(!timeout.timed_out(), "the notification did not run");
+        assert_eq!(*notified, Some((event as usize, 7)));
+        objc::arc::release(listener);
+        objc::arc::release(event);
+    }
+}
+
+#[test]
+fn shared_event_notifications_are_watched_per_device() {
+    isolate_metal_fixture!();
+    let Some(first_device) = gpu_device() else {
+        return;
+    };
+    let Some(second_gpu) = vulkan::duplicate_first_gpu() else {
+        return;
+    };
+    let first = unsafe { object::body_ref::<Device>(first_device) };
+    let second_device = object::make(
+        c"RosemaryMTLDevice",
+        Device {
+            ordinal: first.ordinal + 1,
+            name: foundation::string::from_str("Second Test Device"),
+            recommended_working_set: first.recommended_working_set,
+            target: first.target,
+            gpu: Some(second_gpu),
+        },
+    );
+    MULTI_EVENT_NOTIFICATIONS
+        .lock()
+        .expect("event notifications")
+        .clear();
+    let block = GlobalBlock::new(record_multi_event_notification as *const std::ffi::c_void);
+    // SAFETY: two live Metal devices, events, a listener and global block.
+    unsafe {
+        let events = [
+            send(first_device, "newSharedEvent"),
+            send(second_device, "newSharedEvent"),
+        ];
+        assert!(events.iter().all(|event| !event.is_null()));
+        let listener = send(
+            objc::class::ptr(objc::class::lookup(c"MTLSharedEventListener").unwrap()) as Id,
+            "new",
+        );
+        for (index, event) in events.into_iter().enumerate() {
+            let value = index as u64 + 3;
+            let (notify, sel) = method::<unsafe extern "C" fn(Id, Sel, Id, u64, Id)>(
+                event,
+                "notifyListener:atValue:block:",
+            );
+            notify(event, sel, listener, value, block.id());
+            let (signal, sel) =
+                method::<unsafe extern "C" fn(Id, Sel, u64)>(event, "setSignaledValue:");
+            signal(event, sel, value);
+        }
+        let (notifications, timeout) = MULTI_EVENT_NOTIFICATIONS_READY
+            .wait_timeout_while(
+                MULTI_EVENT_NOTIFICATIONS
+                    .lock()
+                    .expect("event notifications"),
+                std::time::Duration::from_secs(5),
+                |notifications| notifications.len() != 2,
+            )
+            .expect("event notifications");
+        assert!(!timeout.timed_out(), "both devices did not notify");
+        for (index, event) in events.into_iter().enumerate() {
+            assert!(notifications.contains(&(event as usize, index as u64 + 3)));
+            objc::arc::release(event);
+        }
+        objc::arc::release(listener);
+        objc::arc::release(second_device);
+    }
+}
+
 /// `newRenderPipelineStateWithDescriptor:completionHandler:` compiles on
 /// another thread, from the descriptor as it was when the call was made.
 #[test]

@@ -6,7 +6,7 @@
 //! can call a block once it reaches a value, which one worker thread watches
 //! for on behalf of every listener.
 
-use std::sync::{Arc, Mutex, Once, atomic::AtomicU64};
+use std::sync::{Arc, Mutex, atomic::AtomicU64};
 
 use ash::vk;
 
@@ -184,10 +184,10 @@ struct Watch {
     wake: vk::Semaphore,
     woken: u64,
     pending: Vec<Notification>,
+    worker: bool,
 }
 
-static WATCH: Mutex<Option<Watch>> = Mutex::new(None);
-static WORKER: Once = Once::new();
+static WATCHES: Mutex<Vec<Watch>> = Mutex::new(Vec::new());
 
 /// `-notifyListener:atValue:block:`.
 unsafe extern "C" fn notify_listener(receiver: Id, _sel: Sel, listener: Id, value: u64, block: Id) {
@@ -210,10 +210,14 @@ unsafe extern "C" fn notify_listener(receiver: Id, _sel: Sel, listener: Id, valu
         block: block as usize,
         queue,
     };
-    let mut watch = WATCH.lock().expect("event notifications");
-    let watch = match &mut *watch {
-        Some(watch) => watch,
-        slot => {
+    let gpu_address = event.gpu as *const Gpu as usize;
+    let mut watches = WATCHES.lock().expect("event notifications");
+    let position = watches
+        .iter()
+        .position(|watch| std::ptr::eq(watch.gpu, event.gpu));
+    let position = match position {
+        Some(position) => position,
+        None => {
             let mut kind = vk::SemaphoreTypeCreateInfo::default()
                 .semaphore_type(vk::SemaphoreType::TIMELINE)
                 .initial_value(0);
@@ -225,22 +229,17 @@ unsafe extern "C" fn notify_listener(receiver: Id, _sel: Sel, listener: Id, valu
                 unsafe { deliver_never(notification) };
                 return;
             };
-            slot.insert(Watch {
+            watches.push(Watch {
                 gpu: event.gpu,
                 wake,
                 woken: 0,
                 pending: Vec::new(),
-            })
+                worker: false,
+            });
+            watches.len() - 1
         }
     };
-    if !std::ptr::eq(watch.gpu, event.gpu) {
-        // FIXME (ACCURACY): one worker watches one device; a second device's
-        // events never notify.
-        gpu::trace("MTLSharedEvent notifications are watched on one device only");
-        // SAFETY: as above.
-        unsafe { deliver_never(notification) };
-        return;
-    }
+    let watch = &mut watches[position];
     watch.pending.push(notification);
     watch.woken += 1;
     let info = vk::SemaphoreSignalInfo::default()
@@ -251,16 +250,29 @@ unsafe extern "C" fn notify_listener(receiver: Id, _sel: Sel, listener: Id, valu
     if let Err(error) = unsafe { watch.gpu.device.signal_semaphore(&info) } {
         gpu::trace(format!("vkSignalSemaphore failed with {error:?}"));
     }
-    WORKER.call_once(|| {
-        // Detached deliberately, like the completion worker.
-        std::thread::Builder::new()
-            .name("metal:events".to_string())
-            .spawn(|| {
+    let start_worker = !watch.worker;
+    watch.worker = true;
+    drop(watches);
+    if start_worker
+        && let Err(error) = std::thread::Builder::new()
+            .name(format!("metal:events:{gpu_address:x}"))
+            .spawn(move || {
                 crate::enter_darwin_thread();
-                watch_events()
+                watch_events(gpu_address)
             })
-            .expect("a thread for MTLSharedEvent notifications");
-    });
+    {
+        if let Some(watch) = WATCHES
+            .lock()
+            .expect("event notifications")
+            .iter_mut()
+            .find(|watch| watch.gpu as *const Gpu as usize == gpu_address)
+        {
+            watch.worker = false;
+        }
+        gpu::trace(format!(
+            "MTLSharedEvent notification worker could not start: {error}"
+        ));
+    }
 }
 
 /// Drop a notification which will never be delivered.
@@ -276,11 +288,14 @@ unsafe fn deliver_never(notification: Notification) {
     unsafe { darwin::dispatch::object::release(notification.queue) };
 }
 
-fn watch_events() {
+fn watch_events(gpu_address: usize) {
     loop {
         let (gpu, semaphores, values) = {
-            let watch = WATCH.lock().expect("event notifications");
-            let watch = watch.as_ref().expect("a notification was registered");
+            let watches = WATCHES.lock().expect("event notifications");
+            let watch = watches
+                .iter()
+                .find(|watch| watch.gpu as *const Gpu as usize == gpu_address)
+                .expect("a notification watch was registered");
             let mut semaphores = vec![watch.wake];
             let mut values = vec![watch.woken + 1];
             for notification in &watch.pending {
@@ -299,11 +314,22 @@ fn watch_events() {
             gpu::trace(format!(
                 "vkWaitSemaphores for MTLSharedEvent notifications failed with {error:?}"
             ));
+            if let Some(watch) = WATCHES
+                .lock()
+                .expect("event notifications")
+                .iter_mut()
+                .find(|watch| watch.gpu as *const Gpu as usize == gpu_address)
+            {
+                watch.worker = false;
+            }
             return;
         }
         let reached = {
-            let mut watch = WATCH.lock().expect("event notifications");
-            let watch = watch.as_mut().expect("a notification was registered");
+            let mut watches = WATCHES.lock().expect("event notifications");
+            let watch = watches
+                .iter_mut()
+                .find(|watch| watch.gpu as *const Gpu as usize == gpu_address)
+                .expect("a notification watch was registered");
             let (reached, waiting) =
                 std::mem::take(&mut watch.pending)
                     .into_iter()

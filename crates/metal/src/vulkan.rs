@@ -88,6 +88,22 @@ pub fn adapters() -> Result<&'static [Adapter], &'static str> {
     }
 }
 
+/// A second logical device over the first test adapter, for cross-device
+/// ownership tests. Leaked because every production GPU is process-lifetime.
+#[cfg(test)]
+pub fn duplicate_first_gpu() -> Option<&'static Gpu> {
+    let state = STATE.get_or_init(initialize).as_ref().ok()?;
+    let adapter = state.adapters.first()?;
+    Gpu::create(
+        &state.entry,
+        &state.instance,
+        vk::PhysicalDevice::from_raw(adapter.handle as u64),
+        &adapter.target,
+    )
+    .ok()
+    .map(|gpu| &*Box::leak(Box::new(gpu)))
+}
+
 fn initialize() -> Result<State, String> {
     let (entry, library) = load_entry()?;
     // A loader predating Vulkan 1.1 returns `None`; this runtime's descriptor
