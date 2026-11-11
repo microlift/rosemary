@@ -1,3 +1,4 @@
+mod buffer_descriptor;
 mod compute;
 mod compute_descriptor;
 pub(crate) use compute_descriptor::{
@@ -327,6 +328,7 @@ unsafe extern "C" fn set_compile_language_version(receiver: Id, _sel: Sel, value
 }
 
 pub(crate) fn install() {
+    buffer_descriptor::install();
     compute_descriptor::install();
     let descriptor = object::register::<RenderPipelineDescriptor>(c"MTLRenderPipelineDescriptor");
     let color = object::register::<ColorElement>(c"RosemaryMTLColorAttachmentDescriptor");
@@ -358,6 +360,8 @@ pub(crate) fn install() {
         "vertexDescriptor" => descriptor_object, c"@16@0:8";
         "vertexFunction" => descriptor_object, c"@16@0:8";
         "fragmentFunction" => descriptor_object, c"@16@0:8";
+        "vertexBuffers" => descriptor_buffers, c"@16@0:8";
+        "fragmentBuffers" => descriptor_buffers, c"@16@0:8";
         "depthAttachmentPixelFormat" => descriptor_number, c"Q16@0:8";
         "stencilAttachmentPixelFormat" => descriptor_number, c"Q16@0:8";
         "sampleCount" => descriptor_number, c"Q16@0:8";
@@ -370,7 +374,7 @@ pub(crate) fn install() {
         "colorAttachments" => color_attachments, c"@16@0:8";
         "dealloc" => descriptor_dealloc, c"v16@0:8";
         "setLabel:" => crate::no_op, c"v24@0:8@16";
-        "reset" => descriptor_init, c"@16@0:8";
+        "reset" => descriptor_reset, c"v16@0:8";
     });
     for selector in [
         "setVertexFunction:",

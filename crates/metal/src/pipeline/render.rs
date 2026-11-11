@@ -241,6 +241,8 @@ impl ColorAttachment {
 pub(crate) const COLOR_ATTACHMENTS: usize = 8;
 
 pub(crate) struct RenderPipelineDescriptor {
+    pub vertex_buffers: Id,
+    pub fragment_buffers: Id,
     pub vertex_function: objc::object::Id,
     pub fragment_function: objc::object::Id,
     pub vertex_descriptor: objc::object::Id,

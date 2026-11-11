@@ -23,6 +23,7 @@ macro_rules! isolate_metal_fixture {
 
 mod control_flow;
 mod geometry;
+mod pipeline_buffers;
 mod source_constants;
 
 fn device_for_tests() -> Id {
@@ -1421,6 +1422,8 @@ fn check_depth_resolve(device: Id) {
     let descriptor = object::make(
         c"MTLRenderPipelineDescriptor",
         pipeline::RenderPipelineDescriptor {
+            vertex_buffers: std::ptr::null_mut(),
+            fragment_buffers: std::ptr::null_mut(),
             vertex_function: vertex,
             fragment_function: fragment,
             vertex_descriptor,
@@ -1593,6 +1596,8 @@ fn triangle_pipeline_descriptor(device: Id) -> Id {
     let descriptor = object::make(
         c"MTLRenderPipelineDescriptor",
         pipeline::RenderPipelineDescriptor {
+            vertex_buffers: std::ptr::null_mut(),
+            fragment_buffers: std::ptr::null_mut(),
             vertex_function: vertex,
             fragment_function: fragment,
             vertex_descriptor,
@@ -1758,6 +1763,8 @@ fn a_translated_triangle_draws_on_the_gpu() {
     let descriptor = object::make(
         c"MTLRenderPipelineDescriptor",
         pipeline::RenderPipelineDescriptor {
+            vertex_buffers: std::ptr::null_mut(),
+            fragment_buffers: std::ptr::null_mut(),
             vertex_function: vertex,
             fragment_function: fragment,
             vertex_descriptor,
@@ -2435,6 +2442,8 @@ fn recording_cost() {
         let descriptor = object::make(
             c"MTLRenderPipelineDescriptor",
             pipeline::RenderPipelineDescriptor {
+                vertex_buffers: std::ptr::null_mut(),
+                fragment_buffers: std::ptr::null_mut(),
                 vertex_function: vertex,
                 fragment_function: fragment,
                 vertex_descriptor,
@@ -2570,6 +2579,8 @@ fn resource_draw_pipeline(device: Id) -> Id {
         let descriptor = object::make(
             c"MTLRenderPipelineDescriptor",
             pipeline::RenderPipelineDescriptor {
+                vertex_buffers: std::ptr::null_mut(),
+                fragment_buffers: std::ptr::null_mut(),
                 vertex_function: vertex,
                 fragment_function: fragment,
                 vertex_descriptor,
@@ -3075,6 +3086,8 @@ fragment float4 mark(float4 position [[position]], device uint* out [[buffer(0)]
         let descriptor = object::make(
             c"MTLRenderPipelineDescriptor",
             pipeline::RenderPipelineDescriptor {
+                vertex_buffers: std::ptr::null_mut(),
+                fragment_buffers: std::ptr::null_mut(),
                 vertex_function: vertex,
                 fragment_function: fragment,
                 vertex_descriptor,
@@ -3657,6 +3670,8 @@ fn covering_draw_with_depth(device: Id, depth_format: u64, z: f32) -> Option<Cov
     let descriptor = object::make(
         c"MTLRenderPipelineDescriptor",
         pipeline::RenderPipelineDescriptor {
+            vertex_buffers: std::ptr::null_mut(),
+            fragment_buffers: std::ptr::null_mut(),
             vertex_function: vertex,
             fragment_function: fragment,
             vertex_descriptor,

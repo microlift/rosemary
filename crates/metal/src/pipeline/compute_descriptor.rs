@@ -8,6 +8,7 @@ use crate::object::{self, methods};
 pub(crate) struct ComputeDescriptor {
     function: Id,
     stage_input: Id,
+    buffers: Id,
 }
 
 unsafe extern "C" fn init(receiver: Id, _sel: Sel) -> Id {
@@ -16,6 +17,7 @@ unsafe extern "C" fn init(receiver: Id, _sel: Sel) -> Id {
         object::init(
             receiver,
             ComputeDescriptor {
+                buffers: super::buffer_descriptor::new_array(),
                 function: std::ptr::null_mut(),
                 stage_input: std::ptr::null_mut(),
             },
@@ -27,6 +29,10 @@ unsafe extern "C" fn init(receiver: Id, _sel: Sel) -> Id {
 unsafe extern "C" fn dealloc(receiver: Id, _sel: Sel) {
     // SAFETY: a descriptor `-init` established.
     let descriptor = unsafe { object::body::<ComputeDescriptor>(receiver) };
+    objc::arc::release(std::mem::replace(
+        &mut descriptor.buffers,
+        std::ptr::null_mut(),
+    ));
     objc::arc::release(std::mem::replace(
         &mut descriptor.function,
         std::ptr::null_mut(),
@@ -40,12 +46,19 @@ unsafe extern "C" fn dealloc(receiver: Id, _sel: Sel) {
 
 unsafe extern "C" fn object_value(receiver: Id, sel: Sel) -> Id {
     // SAFETY: a descriptor of this crate's.
-    let descriptor = unsafe { object::body::<ComputeDescriptor>(receiver) };
+    let descriptor = unsafe { object::body_ref::<ComputeDescriptor>(receiver) };
     // SAFETY: a selector the runtime owns.
     match unsafe { std::ffi::CStr::from_ptr(sel) }.to_bytes() {
         b"computeFunction" => descriptor.function,
+        b"buffers" => descriptor.buffers,
         _ => descriptor.stage_input,
     }
+}
+
+unsafe extern "C" fn reset(receiver: Id, _sel: Sel) {
+    // macOS 15 resets the buffer entries without clearing function or stage input.
+    let descriptor = unsafe { object::body_ref::<ComputeDescriptor>(receiver) };
+    unsafe { super::buffer_descriptor::reset(descriptor.buffers) };
 }
 
 unsafe extern "C" fn set_object_value(receiver: Id, sel: Sel, value: Id) {
@@ -112,9 +125,10 @@ pub(super) fn install() {
     let class = object::register::<ComputeDescriptor>(c"MTLComputePipelineDescriptor");
     methods!(class, {
         "init" => init, c"@16@0:8";
-        "reset" => init, c"@16@0:8";
+        "reset" => reset, c"v16@0:8";
         "dealloc" => dealloc, c"v16@0:8";
         "computeFunction" => object_value, c"@16@0:8";
+        "buffers" => object_value, c"@16@0:8";
         "setComputeFunction:" => set_object_value, c"v24@0:8@16";
         "stageInputDescriptor" => object_value, c"@16@0:8";
         "setStageInputDescriptor:" => set_object_value, c"v24@0:8@16";
