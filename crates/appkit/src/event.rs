@@ -1645,7 +1645,7 @@ fn post(id: u32, name: &str) {
 /// without resigning in between.
 static ANNOUNCED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
-fn answers(object: Id, selector: &str) -> bool {
+pub(crate) fn answers(object: Id, selector: &str) -> bool {
     // SAFETY: a window this crate made; both selectors are `BOOL (id, SEL)`,
     // sent so a subclass's override decides.
     unsafe {

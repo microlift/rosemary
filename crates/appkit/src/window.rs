@@ -2250,6 +2250,30 @@ unsafe extern "C" fn make_key_and_order_front(receiver: Id, _sel: Sel, _sender: 
     order_front(receiver, true);
 }
 
+/// `-orderFront:`: AppKit does not change the key window for this. A window's
+/// first ordering still takes key here, as it always has; reordering one that
+/// is already on screen must not.
+unsafe extern "C" fn order_front_selector(receiver: Id, _sel: Sel, _sender: Id) {
+    order_front(receiver, window_of(receiver).shown == 0);
+}
+
+/// `-makeKeyWindow`: `-orderFront:` no longer does this for a window already on
+/// screen, so a toolkit that activates one with the pair needs it done here.
+unsafe extern "C" fn make_key_window(receiver: Id, _sel: Sel) {
+    let window = window_of(receiver);
+    if window.sdl.is_null()
+        || window.shown == 0
+        || presentation(window) != Presentation::Toplevel
+        || key_window() == receiver
+        || !crate::event::answers(receiver, "canBecomeKeyWindow")
+    {
+        return;
+    }
+    KEY.store(receiver as usize, std::sync::atomic::Ordering::Release);
+    crate::event::announce_key(receiver);
+    sdl3::video::raise_window(window.sdl);
+}
+
 unsafe extern "C" fn order_front_regardless(receiver: Id, _sel: Sel) {
     order_front(receiver, false);
 }
@@ -2295,7 +2319,11 @@ fn order_front(receiver: Id, make_key: bool) {
     if want == Presentation::Toplevel {
         // A popup cannot be raised - it is already above its parent, and SDL
         // refuses - and asking would only log a failure.
-        sdl3::video::raise_window(sdl);
+        if make_key {
+            sdl3::video::raise_window(sdl);
+        } else {
+            sdl3::video::raise_window_keeping_focus(sdl);
+        }
     }
     window_of(receiver).shown = 1;
     window_of(receiver).ordered = ORDERED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
@@ -2324,7 +2352,7 @@ unsafe extern "C" fn set_is_visible(receiver: Id, _sel: Sel, visible: u8) {
     match visible {
         0 => unsafe { order_out(receiver, objc::sel::get("orderOut:"), std::ptr::null_mut()) },
         _ => unsafe {
-            make_key_and_order_front(
+            order_front_selector(
                 receiver,
                 objc::sel::get("orderFront:"),
                 std::ptr::null_mut(),
@@ -3786,13 +3814,13 @@ pub(crate) fn install() {
         "title" => title, c"@16@0:8";
         "setTitle:" => set_title, c"v24@0:8@16";
         "makeKeyAndOrderFront:" => make_key_and_order_front, c"v24@0:8@16";
-        "makeKeyWindow" => ignored, c"v16@0:8";
+        "makeKeyWindow" => make_key_window, c"v16@0:8";
         "makeMainWindow" => ignored, c"v16@0:8";
         // Private. The number is SDL's window id and cannot be reassigned;
         // Gecko sets -1 then the old number back to reset a reshown popup in
         // the window server's cache, which this runtime has no counterpart of.
         "_setWindowNumber:" => ignored_integer, c"v24@0:8q16";
-        "orderFront:" => make_key_and_order_front, c"v24@0:8@16";
+        "orderFront:" => order_front_selector, c"v24@0:8@16";
         "orderFrontRegardless" => order_front_regardless, c"v16@0:8";
         "orderOut:" => order_out, c"v24@0:8@16";
         "close" => close, c"v16@0:8";
@@ -4016,6 +4044,57 @@ mod tests {
     /// A window with no SDL window behind it still records its alpha: the
     /// property reads back what the program set, whether or not the host
     /// composites it.
+    fn titled_window() -> Id {
+        crate::bootstrap();
+        let rect = NSRect {
+            origin: NSPoint { x: 20.0, y: 20.0 },
+            size: NSSize {
+                width: 180.0,
+                height: 120.0,
+            },
+        };
+        let object =
+            objc::object::create_instance(objc::class::lookup(c"NSWindow").expect("NSWindow"), 0);
+        unsafe {
+            init_with_content_rect(
+                object,
+                objc::sel::get("initWithContentRect:styleMask:backing:defer:"),
+                rect,
+                style::TITLED,
+                0,
+                0,
+            )
+        }
+    }
+
+    #[test]
+    fn order_front_keeps_key_on_a_shown_window_and_make_key_window_moves_it() {
+        if !sdl3::isolated::run_here_with_dummy_video() {
+            return;
+        }
+        let first = titled_window();
+        let second = titled_window();
+        let order = objc::sel::get("orderFront:");
+        unsafe {
+            order_front_selector(first, order, std::ptr::null_mut());
+            order_front_selector(second, order, std::ptr::null_mut());
+            assert_eq!(key_window(), second);
+
+            order_front_selector(first, order, std::ptr::null_mut());
+            assert_eq!(key_window(), second);
+
+            set_is_visible(first, objc::sel::get("setIsVisible:"), 1);
+            assert_eq!(key_window(), second);
+
+            make_key_window(first, objc::sel::get("makeKeyWindow"));
+            assert_eq!(key_window(), first);
+
+            window_of(second).style_mask = 0;
+            make_key_window(second, objc::sel::get("makeKeyWindow"));
+            assert_eq!(key_window(), first);
+        }
+    }
+
     #[test]
     fn a_window_reports_the_alpha_it_was_set() {
         crate::bootstrap();

@@ -5105,6 +5105,17 @@ pub mod video {
     /// runtime drawing its own decorations turns it off before video starts.
     pub const HINT_WAYLAND_ALLOW_LIBDECOR: &CStr = c"SDL_VIDEO_WAYLAND_ALLOW_LIBDECOR";
 
+    /// `SDL_HINT_WINDOW_ACTIVATE_WHEN_RAISED`.
+    pub const HINT_ACTIVATE_WHEN_RAISED: &CStr = c"SDL_WINDOW_ACTIVATE_WHEN_RAISED";
+
+    /// Raise `window` without moving input focus to it, which is all
+    /// `-orderFront:` does on a Mac.
+    pub fn raise_window_keeping_focus(window: Window) {
+        set_hint(HINT_ACTIVATE_WHEN_RAISED, c"0");
+        raise_window(window);
+        set_hint(HINT_ACTIVATE_WHEN_RAISED, c"1");
+    }
+
     /// `SDL_HINT_VIDEO_ALLOW_SCREENSAVER`.
     pub const HINT_ALLOW_SCREENSAVER: &CStr = c"SDL_VIDEO_ALLOW_SCREENSAVER";
 
