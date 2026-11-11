@@ -1972,6 +1972,99 @@ mod tests {
     }
 
     #[test]
+    fn route_sends_a_press_and_its_release_to_the_pressed_view() {
+        if !sdl3::isolated::run_here_with_dummy_video() {
+            return;
+        }
+        use foundation::geometry::{NSRect, NSSize};
+        use objc::sel::Sel;
+        static SEEN: std::sync::Mutex<Vec<(usize, u64)>> = std::sync::Mutex::new(Vec::new());
+
+        unsafe extern "C" fn record(receiver: Id, _sel: Sel, event: Id) {
+            SEEN.lock()
+                .unwrap()
+                .push((receiver as usize, nsevent::kind_of(event)));
+        }
+
+        crate::bootstrap();
+        let size = NSSize {
+            width: 200.0,
+            height: 100.0,
+        };
+        let window = objc::object::create_instance(objc::class::lookup(c"NSWindow").unwrap(), 0);
+        // SAFETY: a fresh window, backed by SDL's dummy video driver.
+        assert!(unsafe {
+            window::init_with_content_rect_for_tests(
+                window,
+                NSRect {
+                    origin: NSPoint::default(),
+                    size,
+                },
+            )
+        });
+        let class = objc::class::allocate_pair(objc::class::lookup(c"NSView"), c"PressRecorder", 0)
+            .unwrap();
+        for selector in ["mouseDown:", "mouseDragged:", "mouseUp:"] {
+            class.add_method(
+                objc::sel::get(selector),
+                record as objc::class::Imp,
+                c"v24@0:8@16",
+            );
+        }
+        objc::class::register_pair(class);
+        let half = NSSize {
+            width: size.width / 2.0,
+            ..size
+        };
+        let left = objc::object::create_instance(class, 0);
+        let right = objc::object::create_instance(class, 0);
+        // SAFETY: views this test allocated and NSView's declared signatures.
+        unsafe {
+            let add: unsafe extern "C" fn(Id, Sel, Id) = std::mem::transmute(objc::msg::entry());
+            for (view, x) in [(left, 0.0), (right, half.width)] {
+                let frame = NSRect {
+                    origin: NSPoint { x, y: 0.0 },
+                    size: half,
+                };
+                crate::view::init_with_frame(view, objc::sel::get("initWithFrame:"), frame);
+                add(
+                    window::content_view_of(window),
+                    objc::sel::get("addSubview:"),
+                    view,
+                );
+            }
+        }
+        let over_left = NSPoint { x: 50.0, y: 50.0 };
+        let over_right = NSPoint { x: 150.0, y: 50.0 };
+        for (kind, location) in [
+            (kind::LEFT_MOUSE_DOWN, over_left),
+            (kind::LEFT_MOUSE_DRAGGED, over_right),
+            (kind::LEFT_MOUSE_UP, over_right),
+            (kind::LEFT_MOUSE_DOWN, over_right),
+        ] {
+            let event = nsevent::make(Fields {
+                kind,
+                location,
+                window,
+                ..Default::default()
+            });
+            route(window, event);
+        }
+        assert_eq!(
+            *SEEN.lock().unwrap(),
+            [
+                (left as usize, kind::LEFT_MOUSE_DOWN),
+                (left as usize, kind::LEFT_MOUSE_DRAGGED),
+                (left as usize, kind::LEFT_MOUSE_UP),
+                (right as usize, kind::LEFT_MOUSE_DOWN),
+            ]
+        );
+        objc::arc::release(left);
+        objc::arc::release(right);
+        objc::arc::release(window);
+    }
+
+    #[test]
     fn pinch_gestures_reach_the_view_under_the_pointer_with_magnification_and_phases() {
         if !sdl3::isolated::run_here_with_dummy_video() {
             return;
