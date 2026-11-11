@@ -1200,8 +1200,47 @@ struct Press {
     view: Id,
 }
 
+/// The buttons AppKit tells apart by event type.
+#[derive(Clone, Copy)]
+enum Button {
+    Left,
+    Right,
+    Other,
+}
+
+/// Where in a press an event is.
+enum Stage {
+    Down,
+    Dragged,
+    Up,
+}
+
+fn press_stage(kind: u64) -> Option<(Button, Stage)> {
+    Some(match kind {
+        kind::LEFT_MOUSE_DOWN => (Button::Left, Stage::Down),
+        kind::LEFT_MOUSE_DRAGGED => (Button::Left, Stage::Dragged),
+        kind::LEFT_MOUSE_UP => (Button::Left, Stage::Up),
+        kind::RIGHT_MOUSE_DOWN => (Button::Right, Stage::Down),
+        kind::RIGHT_MOUSE_DRAGGED => (Button::Right, Stage::Dragged),
+        kind::RIGHT_MOUSE_UP => (Button::Right, Stage::Up),
+        kind::OTHER_MOUSE_DOWN => (Button::Other, Stage::Down),
+        kind::OTHER_MOUSE_DRAGGED => (Button::Other, Stage::Dragged),
+        kind::OTHER_MOUSE_UP => (Button::Other, Stage::Up),
+        _ => return None,
+    })
+}
+
 thread_local! {
-    static LEFT_PRESS: std::cell::Cell<Option<Press>> = const { std::cell::Cell::new(None) };
+    static PRESSES: std::cell::Cell<[Option<Press>; 3]> =
+        const { std::cell::Cell::new([None; 3]) };
+}
+
+/// Swap the press of `button` for `press`, returning the one it had.
+fn replace_press(button: Button, press: Option<Press>) -> Option<Press> {
+    let mut presses = PRESSES.get();
+    let old = std::mem::replace(&mut presses[button as usize], press);
+    PRESSES.set(presses);
+    old
 }
 
 /// Where a positional event goes, and the press it ends, whose view is kept
@@ -1230,31 +1269,33 @@ impl Drop for Target {
 /// AppKit sends the drags and the release of a press to the view that took the
 /// press, wherever the pointer goes. An event routed through another window
 /// is located in that window, so it goes to the view under it there instead.
-// FIXME (ACCURACY): left button only; right and other drags go to the view
-// under the pointer.
 fn pressed_view(window: Id, kind: u64, under_pointer: Id) -> Target {
+    let Some((button, stage)) = press_stage(kind) else {
+        return Target::to(under_pointer);
+    };
     let in_window = |press: Press| match press.window == window {
         true => press.view,
         false => under_pointer,
     };
-    match kind {
-        kind::LEFT_MOUSE_DOWN => {
+    match stage {
+        Stage::Down => {
             let view = objc::arc::retain(under_pointer);
             // A release a guest's own tracking loop took never reached here.
-            if let Some(stale) = LEFT_PRESS.replace(Some(Press { window, view })) {
+            if let Some(stale) = replace_press(button, Some(Press { window, view })) {
                 objc::arc::release(stale.view);
             }
             Target::to(under_pointer)
         }
-        kind::LEFT_MOUSE_DRAGGED => Target::to(LEFT_PRESS.get().map_or(under_pointer, in_window)),
-        kind::LEFT_MOUSE_UP => match LEFT_PRESS.take() {
+        Stage::Dragged => {
+            Target::to(PRESSES.get()[button as usize].map_or(under_pointer, in_window))
+        }
+        Stage::Up => match replace_press(button, None) {
             Some(press) => Target {
                 view: in_window(press),
                 ended: Some(press.view),
             },
             None => Target::to(under_pointer),
         },
-        _ => Target::to(under_pointer),
     }
 }
 
@@ -1898,6 +1939,36 @@ mod tests {
             pressed_view(first, kind::LEFT_MOUSE_DRAGGED, other).view,
             other
         );
+    }
+
+    #[test]
+    fn each_button_keeps_its_own_pressed_view() {
+        crate::bootstrap();
+        let class = objc::class::lookup(c"NSView").expect("NSView");
+        let left = objc::object::create_instance(class, 0);
+        let right = objc::object::create_instance(class, 0);
+        let other = objc::object::create_instance(class, 0);
+        let window = objc::object::create_instance(objc::class::lookup(c"NSWindow").unwrap(), 0);
+
+        pressed_view(window, kind::LEFT_MOUSE_DOWN, left);
+        pressed_view(window, kind::RIGHT_MOUSE_DOWN, right);
+        assert_eq!(
+            pressed_view(window, kind::OTHER_MOUSE_DRAGGED, other).view,
+            other
+        );
+        assert_eq!(
+            pressed_view(window, kind::RIGHT_MOUSE_DRAGGED, other).view,
+            right
+        );
+        assert_eq!(
+            pressed_view(window, kind::LEFT_MOUSE_DRAGGED, other).view,
+            left
+        );
+        assert_eq!(
+            pressed_view(window, kind::RIGHT_MOUSE_UP, other).view,
+            right
+        );
+        assert_eq!(pressed_view(window, kind::LEFT_MOUSE_UP, other).view, left);
     }
 
     #[test]
