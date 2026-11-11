@@ -1193,32 +1193,55 @@ fn log_route(window: Id, event: Id, kind: u64) {
 }
 
 thread_local! {
-    /// The view the last left press landed on, retained until the next one,
-    /// and whether the button is still down.
-    static LEFT_PRESS: std::cell::Cell<(Id, bool)> =
-        const { std::cell::Cell::new((std::ptr::null_mut(), false)) };
+    /// The view the left button was pressed on, retained while it is down.
+    static LEFT_PRESS: std::cell::Cell<Option<Id>> = const { std::cell::Cell::new(None) };
+}
+
+/// Where a positional event goes, and the press it ends, whose view is kept
+/// alive until the event has been delivered.
+struct Target {
+    view: Id,
+    ended: Option<Id>,
+}
+
+impl Target {
+    fn to(view: Id) -> Self {
+        Self { view, ended: None }
+    }
+}
+
+impl Drop for Target {
+    fn drop(&mut self) {
+        if let Some(view) = self.ended {
+            objc::arc::release(view);
+        }
+    }
 }
 
 /// Which view a positional event of `kind` goes to, given the one under it.
 ///
 /// AppKit sends the drags and the release of a press to the view that took the
-/// press, wherever the pointer goes; Qt never ends a drag whose view did not
-/// hear the release.
-// shortcut: left button only, extend if a guest drags with another button.
-fn pressed_view(kind: u64, under_pointer: Id) -> Id {
-    let (pressed, held) = LEFT_PRESS.get();
+/// press, wherever the pointer goes.
+// FIXME (ACCURACY): left button only; right and other drags go to the view
+// under the pointer.
+fn pressed_view(kind: u64, under_pointer: Id) -> Target {
     match kind {
         kind::LEFT_MOUSE_DOWN => {
-            LEFT_PRESS.set((objc::arc::retain(under_pointer), true));
-            objc::arc::release(pressed);
-            under_pointer
+            // A release a guest's own tracking loop took never reached here.
+            if let Some(stale) = LEFT_PRESS.replace(Some(objc::arc::retain(under_pointer))) {
+                objc::arc::release(stale);
+            }
+            Target::to(under_pointer)
         }
-        kind::LEFT_MOUSE_DRAGGED if held => pressed,
-        kind::LEFT_MOUSE_UP if held => {
-            LEFT_PRESS.set((pressed, false));
-            pressed
-        }
-        _ => under_pointer,
+        kind::LEFT_MOUSE_DRAGGED => Target::to(LEFT_PRESS.get().unwrap_or(under_pointer)),
+        kind::LEFT_MOUSE_UP => match LEFT_PRESS.take() {
+            Some(view) => Target {
+                view,
+                ended: Some(view),
+            },
+            None => Target::to(under_pointer),
+        },
+        _ => Target::to(under_pointer),
     }
 }
 
@@ -1256,13 +1279,14 @@ pub fn route(window: Id, event: Id) {
         }
         return;
     }
-    let start = match positional(kind) {
+    let target = match positional(kind) {
         // SAFETY: null or the content view, which this crate made.
         true => pressed_view(kind, unsafe {
             crate::view::hit_test(window::content_view_of(window), nsevent::location_of(event))
         }),
-        false => responder_of(window),
+        false => Target::to(responder_of(window)),
     };
+    let start = target.view;
     if kind == kind::LEFT_MOUSE_DOWN {
         focus_clicked(window, start);
     }
@@ -1816,12 +1840,12 @@ mod tests {
         let pressed = objc::object::create_instance(class, 0);
         let other = objc::object::create_instance(class, 0);
 
-        assert_eq!(pressed_view(kind::LEFT_MOUSE_DOWN, pressed), pressed);
-        assert_eq!(pressed_view(kind::LEFT_MOUSE_DRAGGED, other), pressed);
-        assert_eq!(pressed_view(kind::LEFT_MOUSE_UP, other), pressed);
+        assert_eq!(pressed_view(kind::LEFT_MOUSE_DOWN, pressed).view, pressed);
+        assert_eq!(pressed_view(kind::LEFT_MOUSE_DRAGGED, other).view, pressed);
+        assert_eq!(pressed_view(kind::LEFT_MOUSE_UP, other).view, pressed);
 
-        assert_eq!(pressed_view(kind::LEFT_MOUSE_DRAGGED, other), other);
-        assert_eq!(pressed_view(kind::LEFT_MOUSE_UP, other), other);
+        assert_eq!(pressed_view(kind::LEFT_MOUSE_DRAGGED, other).view, other);
+        assert_eq!(pressed_view(kind::LEFT_MOUSE_UP, other).view, other);
     }
 
     #[test]
