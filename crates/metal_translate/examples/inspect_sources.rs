@@ -15,6 +15,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         shader_int8: true,
         shader_int16: true,
         shader_float16: true,
+        shader_image_gather_extended: true,
         storage_buffer8_bit_access: true,
         storage_buffer16_bit_access: true,
         shader_storage_image_write_without_format: true,

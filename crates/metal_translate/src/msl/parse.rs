@@ -1536,6 +1536,12 @@ impl Parser<'_> {
                 // `metal::` and `access::` qualify names this frontend knows
                 // unqualified.
                 if self.eat("::") {
+                    if word == "component" {
+                        return Ok(Expr {
+                            kind: ExprKind::Ident(format!("component::{}", self.ident()?)),
+                            line,
+                        });
+                    }
                     return self.primary();
                 }
                 if word == "reinterpret_cast" && self.is_punct("<") {
