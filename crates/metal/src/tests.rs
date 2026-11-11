@@ -81,6 +81,93 @@ fn every_export_resolves_with_both_spellings() {
 }
 
 #[test]
+fn exported_attachment_descriptors_can_be_created_with_native_defaults() {
+    isolate_metal_fixture!();
+    let symbols = data_symbols();
+    for (name, properties) in [
+        (
+            "MTLVertexAttributeDescriptor",
+            [("format", 0), ("offset", 0), ("bufferIndex", 0)],
+        ),
+        (
+            "MTLVertexBufferLayoutDescriptor",
+            [("stride", 0), ("stepFunction", 1), ("stepRate", 1)],
+        ),
+        (
+            "MTLRenderPipelineColorAttachmentDescriptor",
+            [
+                ("pixelFormat", 0),
+                ("sourceRGBBlendFactor", 1),
+                ("writeMask", 15),
+            ],
+        ),
+        (
+            "MTLRenderPassColorAttachmentDescriptor",
+            [("loadAction", 0), ("storeAction", 1), ("level", 0)],
+        ),
+    ] {
+        let symbol = format!("_OBJC_CLASS_$_{name}");
+        let address = symbols
+            .iter()
+            .find(|(name, _)| name == &symbol)
+            .expect("exported class")
+            .1;
+        // SAFETY: the exported class and its registered scalar properties.
+        unsafe {
+            let descriptor = send(address as Id, "new");
+            assert!(!descriptor.is_null());
+            for (getter, expected) in properties {
+                assert_eq!(
+                    send_number_result(descriptor, getter),
+                    expected,
+                    "{name}.{getter}"
+                );
+            }
+            objc::arc::release(descriptor);
+        }
+    }
+}
+
+#[test]
+fn render_pass_attachment_descriptors_keep_native_defaults_after_reset() {
+    isolate_metal_fixture!();
+    bootstrap();
+    let class = objc::class::lookup(c"MTLRenderPassDescriptor").unwrap();
+    // SAFETY: owned descriptor and its live attachment objects.
+    unsafe {
+        let pass = send(objc::class::ptr(class) as Id, "new");
+        let colors = send(pass, "colorAttachments");
+        let color = element_at(colors, 0);
+        let depth = send(pass, "depthAttachment");
+        let stencil = send(pass, "stencilAttachment");
+        for attachment in [color, depth, stencil] {
+            send_number(attachment, "setLoadAction:", 1);
+            send_number(attachment, "setStoreAction:", 2);
+        }
+        let (assign, sel) = method::<unsafe extern "C" fn(Id, Sel, Id, u64)>(
+            colors,
+            "setObject:atIndexedSubscript:",
+        );
+        assign(colors, sel, std::ptr::null_mut(), 0);
+        send_with_object(pass, "setDepthAttachment:", std::ptr::null_mut());
+        send_with_object(pass, "setStencilAttachment:", std::ptr::null_mut());
+        for (attachment, load, store) in [(color, 0, 1), (depth, 2, 0), (stencil, 2, 0)] {
+            assert_eq!(send_number_result(attachment, "loadAction"), load);
+            assert_eq!(send_number_result(attachment, "storeAction"), store);
+        }
+        let (clear_color, sel) =
+            method::<unsafe extern "C" fn(Id, Sel) -> encoder::ClearColor>(color, "clearColor");
+        let clear = clear_color(color, sel);
+        assert_eq!(
+            [clear.red, clear.green, clear.blue, clear.alpha],
+            [0.0, 0.0, 0.0, 1.0]
+        );
+        assert_eq!(send_double(depth, "clearDepth"), 1.0);
+        objc::arc::release(pass);
+    }
+}
+
+#[test]
 fn device_registers_the_metal_object_graph() {
     isolate_metal_fixture!();
     bootstrap();

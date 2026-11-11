@@ -919,7 +919,7 @@ impl AttachmentElement {
         Self {
             owner,
             slot,
-            local: AttachmentDescriptor::default(),
+            local: slot.defaults(),
         }
     }
 }
@@ -935,6 +935,24 @@ pub(crate) enum AttachmentSlot {
     Color(usize),
     Depth,
     Stencil,
+}
+
+impl AttachmentSlot {
+    pub(super) fn defaults(self) -> AttachmentDescriptor {
+        const MTL_LOAD_ACTION_DONT_CARE: u64 = 0;
+        const MTL_LOAD_ACTION_CLEAR: u64 = 2;
+        const MTL_STORE_ACTION_DONT_CARE: u64 = 0;
+        const MTL_STORE_ACTION_STORE: u64 = 1;
+        let (load_action, store_action) = match self {
+            Self::Color(_) => (MTL_LOAD_ACTION_DONT_CARE, MTL_STORE_ACTION_STORE),
+            Self::Depth | Self::Stencil => (MTL_LOAD_ACTION_CLEAR, MTL_STORE_ACTION_DONT_CARE),
+        };
+        AttachmentDescriptor {
+            load_action,
+            store_action,
+            ..AttachmentDescriptor::default()
+        }
+    }
 }
 
 /// The attachment one element names: its descriptor's, or its own.
@@ -979,7 +997,7 @@ pub(super) unsafe extern "C" fn pass_color_attachments(receiver: Id, _sel: Sel) 
             },
             assign: |element, source| {
                 if let Some(destination) = attachment_of(element) {
-                    assign_attachment(destination, source);
+                    assign_attachment(destination, source, AttachmentSlot::Color(0));
                 }
             },
         },
@@ -1101,11 +1119,15 @@ pub(super) const ATTACHMENT_CLASSES: [&std::ffi::CStr; 5] = [
 
 /// Copy `source`'s attachment, or the defaults where it is nil, over
 /// `destination`, which keeps its own references to the textures.
-pub(super) fn assign_attachment(destination: &mut AttachmentDescriptor, source: Id) {
+pub(super) fn assign_attachment(
+    destination: &mut AttachmentDescriptor,
+    source: Id,
+    slot: AttachmentSlot,
+) {
     let value = if is_attachment(source) {
-        attachment_of(source).map_or_else(AttachmentDescriptor::default, |a| *a)
+        attachment_of(source).map_or_else(|| slot.defaults(), |a| *a)
     } else {
-        AttachmentDescriptor::default()
+        slot.defaults()
     };
     objc::arc::retain(value.texture);
     objc::arc::retain(value.resolve_texture);
@@ -1127,18 +1149,25 @@ pub(super) unsafe extern "C" fn set_pass_single_attachment(receiver: Id, sel: Se
             &mut descriptor.stencil
         },
         value,
+        if depth {
+            AttachmentSlot::Depth
+        } else {
+            AttachmentSlot::Stencil
+        },
     );
 }
 
 /// `-init` of a standalone attachment descriptor.
 pub(super) unsafe extern "C" fn attachment_init(receiver: Id, _sel: Sel) -> Id {
-    // SAFETY: a freshly allocated element; its body is not yet established.
-    unsafe {
-        object::init(
-            receiver,
-            AttachmentElement::new(std::ptr::null_mut(), AttachmentSlot::Color(0)),
-        )
+    let slot = if object::is_kind(receiver, c"MTLRenderPassDepthAttachmentDescriptor") {
+        AttachmentSlot::Depth
+    } else if object::is_kind(receiver, c"MTLRenderPassStencilAttachmentDescriptor") {
+        AttachmentSlot::Stencil
+    } else {
+        AttachmentSlot::Color(0)
     };
+    // SAFETY: a freshly allocated element; its body is not yet established.
+    unsafe { object::init(receiver, AttachmentElement::new(std::ptr::null_mut(), slot)) };
     receiver
 }
 

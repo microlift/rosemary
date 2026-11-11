@@ -620,7 +620,7 @@ impl Default for AttachmentDescriptor {
             slice: 0,
             load_action: 0,
             store_action: 0,
-            clear_color: [0.0; 4],
+            clear_color: [0.0, 0.0, 0.0, 1.0],
             clear_depth: 1.0,
             clear_stencil: 0,
             resolve_texture: std::ptr::null_mut(),
@@ -634,9 +634,9 @@ impl Default for AttachmentDescriptor {
 impl Default for RenderPassDescriptor {
     fn default() -> Self {
         Self {
-            colors: [AttachmentDescriptor::default(); RENDER_TARGETS],
-            depth: AttachmentDescriptor::default(),
-            stencil: AttachmentDescriptor::default(),
+            colors: [AttachmentSlot::Color(0).defaults(); RENDER_TARGETS],
+            depth: AttachmentSlot::Depth.defaults(),
+            stencil: AttachmentSlot::Stencil.defaults(),
             color_objects: std::ptr::null_mut(),
             depth_object: std::ptr::null_mut(),
             stencil_object: std::ptr::null_mut(),
