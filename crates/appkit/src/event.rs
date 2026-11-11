@@ -1192,6 +1192,36 @@ fn log_route(window: Id, event: Id, kind: u64) {
     ));
 }
 
+thread_local! {
+    /// The view the last left press landed on, retained until the next one,
+    /// and whether the button is still down.
+    static LEFT_PRESS: std::cell::Cell<(Id, bool)> =
+        const { std::cell::Cell::new((std::ptr::null_mut(), false)) };
+}
+
+/// Which view a positional event of `kind` goes to, given the one under it.
+///
+/// AppKit sends the drags and the release of a press to the view that took the
+/// press, wherever the pointer goes; Qt never ends a drag whose view did not
+/// hear the release.
+// shortcut: left button only, extend if a guest drags with another button.
+fn pressed_view(kind: u64, under_pointer: Id) -> Id {
+    let (pressed, held) = LEFT_PRESS.get();
+    match kind {
+        kind::LEFT_MOUSE_DOWN => {
+            LEFT_PRESS.set((objc::arc::retain(under_pointer), true));
+            objc::arc::release(pressed);
+            under_pointer
+        }
+        kind::LEFT_MOUSE_DRAGGED if held => pressed,
+        kind::LEFT_MOUSE_UP if held => {
+            LEFT_PRESS.set((pressed, false));
+            pressed
+        }
+        _ => under_pointer,
+    }
+}
+
 pub fn route(window: Id, event: Id) {
     let kind = nsevent::kind_of(event);
     log_route(window, event, kind);
@@ -1228,9 +1258,9 @@ pub fn route(window: Id, event: Id) {
     }
     let start = match positional(kind) {
         // SAFETY: null or the content view, which this crate made.
-        true => unsafe {
+        true => pressed_view(kind, unsafe {
             crate::view::hit_test(window::content_view_of(window), nsevent::location_of(event))
-        },
+        }),
         false => responder_of(window),
     };
     if kind == kind::LEFT_MOUSE_DOWN {
@@ -1778,6 +1808,21 @@ fn delegate_selector(name: &str) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_press_keeps_its_drags_and_release_wherever_the_pointer_goes() {
+        crate::bootstrap();
+        let class = objc::class::lookup(c"NSView").expect("NSView");
+        let pressed = objc::object::create_instance(class, 0);
+        let other = objc::object::create_instance(class, 0);
+
+        assert_eq!(pressed_view(kind::LEFT_MOUSE_DOWN, pressed), pressed);
+        assert_eq!(pressed_view(kind::LEFT_MOUSE_DRAGGED, other), pressed);
+        assert_eq!(pressed_view(kind::LEFT_MOUSE_UP, other), pressed);
+
+        assert_eq!(pressed_view(kind::LEFT_MOUSE_DRAGGED, other), other);
+        assert_eq!(pressed_view(kind::LEFT_MOUSE_UP, other), other);
+    }
 
     #[test]
     fn pinch_gestures_reach_the_view_under_the_pointer_with_magnification_and_phases() {
