@@ -16,6 +16,49 @@ const INVERT: &str = include_str!("fixtures/kernel_invert_word.ll");
 const LOOP: &str = include_str!("fixtures/kernel_bounded_loop_word.ll");
 
 #[test]
+fn source_msl_early_fragment_tests_become_an_execution_mode() {
+    for early in [false, true] {
+        let attribute = if early {
+            "[[early_fragment_tests]]"
+        } else {
+            ""
+        };
+        let source = format!("{attribute} fragment float4 color() {{ return float4(1.0); }}");
+        let ir = parse_msl(&source).unwrap();
+        assert_eq!(ir.entries[0].early_fragment_tests, early);
+        let library = translate_msl(&source, &TargetProfile::vulkan_1_3()).unwrap();
+        let spirv = rspirv::dr::load_words(&library.entries[0].words).unwrap();
+        assert_eq!(
+            spirv
+                .execution_modes
+                .iter()
+                .any(
+                    |mode| mode.operands.contains(&rspirv::dr::Operand::ExecutionMode(
+                        rspirv::spirv::ExecutionMode::EarlyFragmentTests
+                    ))
+                ),
+            early
+        );
+    }
+}
+
+#[test]
+fn source_msl_rejects_early_tests_on_other_stages_and_depth_outputs() {
+    for source in [
+        "[[early_fragment_tests]] kernel void work() {}",
+        "[[early_fragment_tests]] vertex float4 position() { return float4(0.0); }",
+        "[[early_fragment_tests(1)]] fragment float4 color() { return float4(0.0); }",
+        "struct Output { float depth [[depth(any)]]; };
+         [[early_fragment_tests]] fragment Output depth() { Output result = {}; return result; }",
+    ] {
+        assert!(parse_msl(source).is_err(), "accepted {source}");
+    }
+    let mut ir = parse_msl("kernel void work() {}").unwrap();
+    ir.entries[0].early_fragment_tests = true;
+    assert!(ir.verify().is_err());
+}
+
+#[test]
 fn source_msl_empty_numeric_initializers_produce_zero_values() {
     for (ty, expression) in [
         ("float", "float4(value)"),
@@ -1144,6 +1187,7 @@ fn emits_a_writable_3d_texture_descriptor_in_its_metal_namespace() {
             }],
         }],
         entries: vec![EntryPoint {
+            early_fragment_tests: false,
             function: 0,
             stage: Stage::Kernel,
             resources: vec![Resource {
@@ -1236,6 +1280,7 @@ fn emits_structured_merges_for_a_loop_containing_a_conditional() {
         globals: Vec::new(),
         functions: vec![function],
         entries: vec![EntryPoint {
+            early_fragment_tests: false,
             function: 0,
             stage: Stage::Fragment,
             resources: Vec::new(),
@@ -1315,6 +1360,7 @@ fn gives_each_short_circuit_selection_its_own_merge() {
         globals: Vec::new(),
         functions: vec![function],
         entries: vec![EntryPoint {
+            early_fragment_tests: false,
             function: 0,
             stage: Stage::Fragment,
             resources: Vec::new(),
@@ -1374,6 +1420,7 @@ fn routes_several_returns_through_one_exit_block() {
             ],
         }],
         entries: vec![EntryPoint {
+            early_fragment_tests: false,
             function: 0,
             stage: Stage::Fragment,
             resources: Vec::new(),
@@ -1491,6 +1538,7 @@ fn a_module_constant_table_becomes_a_private_variable() {
             }],
         }],
         entries: vec![EntryPoint {
+            early_fragment_tests: false,
             function: 0,
             stage: Stage::Kernel,
             resources: vec![Resource {
@@ -1616,6 +1664,7 @@ fn a_local_variable_is_declared_in_the_entry_block() {
             ],
         }],
         entries: vec![EntryPoint {
+            early_fragment_tests: false,
             function: 0,
             stage: Stage::Kernel,
             resources: vec![Resource {
@@ -1686,6 +1735,7 @@ fn buffer_kernel(values: Vec<Type>, instructions: Vec<Instruction>) -> Module {
             }],
         }],
         entries: vec![EntryPoint {
+            early_fragment_tests: false,
             function: 0,
             stage: Stage::Kernel,
             resources: vec![Resource {
@@ -1731,6 +1781,7 @@ fn typed_buffer_kernel(element: Type, values: Vec<Type>, instructions: Vec<Instr
             }],
         }],
         entries: vec![EntryPoint {
+            early_fragment_tests: false,
             function: 0,
             stage: Stage::Kernel,
             resources: vec![Resource {
@@ -2108,6 +2159,7 @@ fn a_constant_address_space_pointer_phi_keeps_its_buffer_storage_class() {
             ],
         }],
         entries: vec![EntryPoint {
+            early_fragment_tests: false,
             function: 0,
             stage: Stage::Kernel,
             resources: vec![Resource {
@@ -2158,6 +2210,7 @@ fn fragment_demote_is_negotiated_and_fully_reflected() {
             }],
         }],
         entries: vec![EntryPoint {
+            early_fragment_tests: false,
             function: 0,
             stage: Stage::Fragment,
             resources: Vec::new(),
@@ -2285,6 +2338,7 @@ fn a_signed_texture_is_read_through_a_signed_image_type() {
             }],
         }],
         entries: vec![EntryPoint {
+            early_fragment_tests: false,
             function: 0,
             stage: Stage::Kernel,
             resources: vec![Resource {
@@ -2351,6 +2405,7 @@ fn a_signed_vertex_attribute_is_declared_signed() {
             }],
         }],
         entries: vec![EntryPoint {
+            early_fragment_tests: false,
             function: 0,
             stage: Stage::Vertex,
             resources: Vec::new(),
@@ -2501,6 +2556,7 @@ fn sample_with_offset(offset: Operand) -> (rspirv::dr::Module, Vec<rspirv::dr::O
             }],
         }],
         entries: vec![EntryPoint {
+            early_fragment_tests: false,
             function: 0,
             stage: Stage::Kernel,
             resources: vec![

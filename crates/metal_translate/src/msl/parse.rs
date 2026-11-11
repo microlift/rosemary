@@ -433,14 +433,17 @@ impl Parser<'_> {
     /// A global variable or a function definition.
     fn top_level(&mut self) -> Result<()> {
         let line = self.line();
-        // Function attributes such as `[[early_fragment_tests]]` precede the
-        // stage; none of them changes what this frontend emits but one.
         let leading = self.attributes()?;
-        if let Some(attribute) = leading.first() {
-            return Err(syntax_error(
-                attribute.line,
-                format!("unsupported function attribute [[{}]]", attribute.name),
-            ));
+        let mut early_fragment_tests = false;
+        for attribute in &leading {
+            if attribute.name == "early_fragment_tests" && attribute.args.is_empty() {
+                early_fragment_tests = true;
+            } else {
+                return Err(syntax_error(
+                    attribute.line,
+                    format!("unsupported function attribute [[{}]]", attribute.name),
+                ));
+            }
         }
         let stage = if self.eat_word("vertex") {
             Some(Stage::Vertex)
@@ -451,6 +454,12 @@ impl Parser<'_> {
         } else {
             None
         };
+        if early_fragment_tests && stage != Some(Stage::Fragment) {
+            return Err(syntax_error(
+                line,
+                "early_fragment_tests requires a fragment function",
+            ));
+        }
         let space = self.skip_qualifiers();
         self.inlining_attributes()?;
         let space = self.skip_qualifiers().or(space);
@@ -514,6 +523,7 @@ impl Parser<'_> {
             }
             self.program.functions.push(FunctionDef {
                 stage,
+                early_fragment_tests,
                 ret: ty,
                 name,
                 params,

@@ -372,6 +372,8 @@ pub struct StageOutput {
 pub struct EntryPoint {
     pub function: usize,
     pub stage: Stage,
+    /// Test depth and stencil before executing a fragment function.
+    pub early_fragment_tests: bool,
     pub resources: Vec<Resource>,
     pub inputs: Vec<StageInput>,
     pub outputs: Vec<StageOutput>,
@@ -906,6 +908,24 @@ impl Module {
     pub fn verify(&self) -> Result<(), TranslateError> {
         let mut diagnostics = Vec::new();
         for entry in &self.entries {
+            if entry.early_fragment_tests {
+                if entry.stage != Stage::Fragment {
+                    diagnostics.push(Diagnostic::new(
+                        Phase::IrVerification,
+                        "early fragment tests require a fragment entry point",
+                    ));
+                }
+                if entry
+                    .outputs
+                    .iter()
+                    .any(|output| output.binding == StageBinding::Builtin(Builtin::Depth))
+                {
+                    diagnostics.push(Diagnostic::new(
+                        Phase::IrVerification,
+                        "an entry point with early fragment tests cannot write depth",
+                    ));
+                }
+            }
             let Some(function) = self.functions.get(entry.function) else {
                 diagnostics.push(Diagnostic::new(
                     Phase::IrVerification,

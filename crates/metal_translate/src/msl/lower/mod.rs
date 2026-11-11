@@ -1252,6 +1252,7 @@ impl<'c, 'p> Lowerer<'c, 'p> {
         lowerer.globals_base = globals.len() as u32;
         let mut parameters = Vec::new();
         let mut entry = EntryPoint {
+            early_fragment_tests: function.early_fragment_tests,
             function: index,
             stage,
             resources: Vec::new(),

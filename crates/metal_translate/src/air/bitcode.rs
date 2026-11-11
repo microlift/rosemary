@@ -172,6 +172,7 @@ pub(super) fn parse_minimal_store_bitcode(bitcode: &Bitcode) -> Result<Module, T
         functions: vec![function],
         globals: Vec::new(),
         entries: vec![EntryPoint {
+            early_fragment_tests: false,
             function: 0,
             stage: Stage::Kernel,
             resources: vec![Resource {
@@ -316,6 +317,7 @@ fn parse_packed_air(
         functions: vec![function],
         globals,
         entries: vec![EntryPoint {
+            early_fragment_tests: false,
             function: 0,
             stage,
             resources,
