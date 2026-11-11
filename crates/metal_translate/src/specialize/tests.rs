@@ -186,6 +186,7 @@ fn fog_module() -> Module {
     let module = Module {
         functions: vec![kernel],
         entries: vec![EntryPoint {
+            early_fragment_tests: false,
             function: 0,
             stage: Stage::Kernel,
             resources: Vec::new(),

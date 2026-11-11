@@ -297,6 +297,7 @@ pub(super) struct Param {
 #[derive(Clone, Debug)]
 pub(super) struct FunctionDef {
     pub stage: Option<Stage>,
+    pub early_fragment_tests: bool,
     pub ret: Ty,
     pub name: String,
     pub params: Vec<Param>,

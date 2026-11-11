@@ -1259,6 +1259,7 @@ fn triangle_library() -> metal_translate::TranslatedLibrary {
         globals: Vec::new(),
         entries: vec![
             ir::EntryPoint {
+                early_fragment_tests: false,
                 function: 0,
                 stage: ir::Stage::Vertex,
                 resources: Vec::new(),
@@ -1279,6 +1280,7 @@ fn triangle_library() -> metal_translate::TranslatedLibrary {
                 }],
             },
             ir::EntryPoint {
+                early_fragment_tests: false,
                 function: 1,
                 stage: ir::Stage::Fragment,
                 resources: Vec::new(),

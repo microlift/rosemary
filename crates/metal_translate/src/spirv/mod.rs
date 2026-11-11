@@ -428,6 +428,11 @@ fn emit_entry(
                 .execution_mode(function_id, ExecutionMode::LocalSize, [1, 1, 1])
         }
         Stage::Fragment => {
+            if entry.early_fragment_tests {
+                emitter
+                    .builder
+                    .execution_mode(function_id, ExecutionMode::EarlyFragmentTests, []);
+            }
             emitter
                 .builder
                 .execution_mode(function_id, ExecutionMode::OriginUpperLeft, [])

@@ -131,6 +131,7 @@ pub(super) fn parse_text(text: &str) -> Result<Module, TranslateError> {
         functions: vec![function],
         globals: Vec::new(),
         entries: vec![EntryPoint {
+            early_fragment_tests: false,
             function: 0,
             stage: Stage::Kernel,
             resources,
