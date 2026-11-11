@@ -16,6 +16,58 @@ const INVERT: &str = include_str!("fixtures/kernel_invert_word.ll");
 const LOOP: &str = include_str!("fixtures/kernel_bounded_loop_word.ll");
 
 #[test]
+fn source_msl_overloads_preserve_reference_updates_and_single_argument_evaluation() {
+    let source = "float pick(thread float& value) { value += 1.0; return value; }
+        float4 pick(thread float4& value) { value += float4(2.0); return value; }
+        fragment float4 probe() {
+            float values[2] = { 1.0, 7.0 };
+            int index = 0;
+            float4 vector = float4(3.0);
+            float scalar = pick(values[index++]);
+            return float4(scalar, float(index), pick(vector).x, values[0]);
+        }";
+    let explicit = source
+        .replace("float pick(", "float pick_scalar(")
+        .replace("float4 pick(", "float4 pick_vector(")
+        .replace("pick(values", "pick_scalar(values")
+        .replace("pick(vector)", "pick_vector(vector)");
+    let target = TargetProfile::vulkan_1_3();
+    let expected = translate_msl(&explicit, &target).unwrap();
+    let actual = translate_msl(source, &target).unwrap();
+    assert_eq!(actual.entries[0].words, expected.entries[0].words);
+}
+
+#[test]
+fn source_msl_value_overloads_use_exact_types_and_reject_unranked_conversions() {
+    let functions = "int choose(int value) { return value + 1; }
+        float choose(float value) { return value + 2.0; }";
+    let source = format!(
+        "{functions}
+        fragment float4 probe() {{ return float4(choose(3), choose(3.0), 0.0, 1.0); }}"
+    );
+    let explicit = source
+        .replace("int choose(", "int choose_int(")
+        .replace("float choose(", "float choose_float(")
+        .replace("choose(3)", "choose_int(3)")
+        .replace("choose(3.0)", "choose_float(3.0)");
+    let target = TargetProfile::vulkan_1_3();
+    assert_eq!(
+        translate_msl(&source, &target).unwrap().entries[0].words,
+        translate_msl(&explicit, &target).unwrap().entries[0].words
+    );
+    let unsupported = format!(
+        "{functions}
+        fragment float4 probe() {{ return float4(choose(true)); }}"
+    );
+    assert!(
+        parse_msl(&unsupported)
+            .unwrap_err()
+            .to_string()
+            .contains("conversion ranking")
+    );
+}
+
+#[test]
 fn source_msl_empty_global_initializers_preserve_zero_values() {
     let source = "constant uint2 coordinates = {};
         constant float3x2 matrix = {};

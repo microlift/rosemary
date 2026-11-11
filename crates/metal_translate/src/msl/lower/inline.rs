@@ -54,13 +54,13 @@ fn deduce(declared: &Ty, actual: &Ty, types: &mut HashMap<String, Ty>, line: usi
 }
 
 impl<'p> Lowerer<'_, 'p> {
-    /// The library function a call names, if it names one.
-    pub(super) fn helper(
-        &self,
+    /// Inline a library helper, selecting an exact parameter-type match.
+    pub(super) fn call_helper(
+        &mut self,
         name: &str,
-        args: usize,
+        args: &[Expr],
         line: usize,
-    ) -> Result<Option<&'p FunctionDef>> {
+    ) -> Result<Option<Value>> {
         let named: Vec<&'p FunctionDef> = self
             .context
             .program
@@ -84,21 +84,102 @@ impl<'p> Lowerer<'_, 'p> {
             }
             return Ok(None);
         }
-        // Overloads are told apart by how many arguments they take.
-        let mut fitting = named
-            .iter()
-            .filter(|function| function.params.len() == args);
-        match (fitting.next(), fitting.next()) {
-            (Some(function), None) => Ok(Some(function)),
-            (Some(_), Some(_)) => Err(syntax_error(
+        let fitting: Vec<_> = named
+            .into_iter()
+            .filter(|function| function.params.len() == args.len())
+            .collect();
+        let Some(first) = fitting.first() else {
+            return Err(syntax_error(
                 line,
-                format!("{name} has overloads taking {args} arguments, which are not told apart"),
-            )),
-            (None, _) => Err(syntax_error(
-                line,
-                format!("no {name} takes {args} arguments"),
-            )),
+                format!("no {name} takes {} arguments", args.len()),
+            ));
+        };
+        if fitting.len() == 1 {
+            return self.inline_call(first, args, line).map(Some);
         }
+        if fitting.iter().any(|function| {
+            function
+                .params
+                .iter()
+                .zip(&first.params)
+                .any(|(param, first)| param.indirection != first.indirection)
+        }) {
+            return Err(syntax_error(
+                line,
+                format!("{name} overloads with different parameter indirection are not supported"),
+            ));
+        }
+        // Preserve reference identity and evaluate effectful argument indices once.
+        let bindings = first
+            .params
+            .iter()
+            .zip(args)
+            .map(|(param, arg)| {
+                Ok(match param.indirection {
+                    Indirection::Value => Binding::Value(self.rvalue(arg)?),
+                    Indirection::Reference => {
+                        Binding::LValue(self.lvalue(arg)?.ok_or_else(|| {
+                            syntax_error(arg.line, "a reference argument is not in memory")
+                        })?)
+                    }
+                    Indirection::Pointer => {
+                        Binding::Pointer(self.pointer(arg)?.ok_or_else(|| {
+                            syntax_error(arg.line, "a pointer argument is not a buffer pointer")
+                        })?)
+                    }
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let mut exact = fitting.iter().filter(|function| {
+            function
+                .params
+                .iter()
+                .zip(&bindings)
+                .all(|(param, binding)| {
+                    let (actual, space) = match binding {
+                        Binding::Value(value) => (value.ty.clone(), None),
+                        Binding::LValue(place) => (place.ty(), place.space()),
+                        Binding::Pointer(pointer) => {
+                            (pointer.element().unpacked(), Some(pointer.space()))
+                        }
+                    };
+                    param.ty == actual
+                        && param
+                            .space
+                            .is_none_or(|expected| Some(address_space(expected)) == space)
+                })
+        });
+        let function = match (exact.next(), exact.next()) {
+            (Some(function), None) => *function,
+            (None, _) => {
+                return Err(syntax_error(
+                    line,
+                    format!("{name} has no exact overload; conversion ranking is not supported"),
+                ));
+            }
+            _ => {
+                return Err(syntax_error(
+                    line,
+                    format!("{name} has ambiguous overloads"),
+                ));
+            }
+        };
+        self.scopes.push(HashMap::new());
+        let prepared = bindings
+            .into_iter()
+            .enumerate()
+            .map(|(index, binding)| {
+                let name = format!(" overload_arg{index}");
+                self.bind(&name, binding);
+                Expr {
+                    kind: ExprKind::Ident(name),
+                    line,
+                }
+            })
+            .collect::<Vec<_>>();
+        let result = self.inline_call(function, &prepared, line);
+        self.scopes.pop();
+        result.map(Some)
     }
 
     /// Inline one call of `function`.
