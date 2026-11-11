@@ -81,20 +81,33 @@ pub(super) fn level_extent(base: u32, level: u32) -> u32 {
     (base >> level.min(31)).max(1)
 }
 
+// `MTLLoadAction`.
+const MTL_LOAD_ACTION_DONT_CARE: u64 = 0;
+const MTL_LOAD_ACTION_LOAD: u64 = 1;
+const MTL_LOAD_ACTION_CLEAR: u64 = 2;
+
+// `MTLStoreAction`.
+const MTL_STORE_ACTION_DONT_CARE: u64 = 0;
+const MTL_STORE_ACTION_STORE: u64 = 1;
+const MTL_STORE_ACTION_MULTISAMPLE_RESOLVE: u64 = 2;
+const MTL_STORE_ACTION_STORE_AND_MULTISAMPLE_RESOLVE: u64 = 3;
+
 // FIXME (ACCURACY): DONT_CARE semantics probably follow the same rule for loads as they
 // do for stores that caused us lots of problems. TODO: should we just remove DONT_CARE here?
 pub(super) fn load_op(metal: u64) -> vk::AttachmentLoadOp {
     match metal {
-        1 => vk::AttachmentLoadOp::LOAD,
-        2 => vk::AttachmentLoadOp::CLEAR,
+        MTL_LOAD_ACTION_LOAD => vk::AttachmentLoadOp::LOAD,
+        MTL_LOAD_ACTION_CLEAR => vk::AttachmentLoadOp::CLEAR,
         _ => vk::AttachmentLoadOp::DONT_CARE,
     }
 }
 
-/// Whether an `MTLStoreAction` asks for a multisample resolve:
-/// `MultisampleResolve` is 2 and `StoreAndMultisampleResolve` is 3.
+/// Whether an `MTLStoreAction` asks for a multisample resolve.
 pub(super) fn resolves(metal: u64) -> bool {
-    metal == 2 || metal == 3
+    matches!(
+        metal,
+        MTL_STORE_ACTION_MULTISAMPLE_RESOLVE | MTL_STORE_ACTION_STORE_AND_MULTISAMPLE_RESOLVE
+    )
 }
 
 /// What becomes of the attachment the pass rendered into: always `STORE`,
@@ -938,19 +951,36 @@ pub(crate) enum AttachmentSlot {
 }
 
 impl AttachmentSlot {
+    /// A fresh attachment of this slot: Metal's defaults differ between a
+    /// colour attachment and a depth or stencil one.
     pub(super) fn defaults(self) -> AttachmentDescriptor {
-        const MTL_LOAD_ACTION_DONT_CARE: u64 = 0;
-        const MTL_LOAD_ACTION_CLEAR: u64 = 2;
-        const MTL_STORE_ACTION_DONT_CARE: u64 = 0;
-        const MTL_STORE_ACTION_STORE: u64 = 1;
         let (load_action, store_action) = match self {
             Self::Color(_) => (MTL_LOAD_ACTION_DONT_CARE, MTL_STORE_ACTION_STORE),
             Self::Depth | Self::Stencil => (MTL_LOAD_ACTION_CLEAR, MTL_STORE_ACTION_DONT_CARE),
         };
         AttachmentDescriptor {
+            texture: std::ptr::null_mut(),
+            level: 0,
+            slice: 0,
             load_action,
             store_action,
-            ..AttachmentDescriptor::default()
+            clear_color: [0.0, 0.0, 0.0, 1.0],
+            clear_depth: 1.0,
+            clear_stencil: 0,
+            resolve_texture: std::ptr::null_mut(),
+            resolve_level: 0,
+            resolve_slice: 0,
+            resolve_filter: 0,
+        }
+    }
+}
+
+impl RenderPassDescriptor {
+    fn attachment(&mut self, slot: AttachmentSlot) -> &mut AttachmentDescriptor {
+        match slot {
+            AttachmentSlot::Color(index) => &mut self.colors[index],
+            AttachmentSlot::Depth => &mut self.depth,
+            AttachmentSlot::Stencil => &mut self.stencil,
         }
     }
 }
@@ -965,11 +995,7 @@ pub(super) fn attachment_of<'a>(element: Id) -> Option<&'a mut AttachmentDescrip
     // SAFETY: the element holds the descriptor which made it, which orphans
     // every element it vended before it goes.
     let descriptor = unsafe { object::body::<RenderPassDescriptor>(element.owner) };
-    Some(match element.slot {
-        AttachmentSlot::Color(index) => &mut descriptor.colors[index],
-        AttachmentSlot::Depth => &mut descriptor.depth,
-        AttachmentSlot::Stencil => &mut descriptor.stencil,
-    })
+    Some(descriptor.attachment(element.slot))
 }
 
 pub(super) unsafe extern "C" fn pass_color_attachments(receiver: Id, _sel: Sel) -> Id {
@@ -996,8 +1022,10 @@ pub(super) unsafe extern "C" fn pass_color_attachments(receiver: Id, _sel: Sel) 
                 crate::resource::orphan_element::<AttachmentElement>(element)
             },
             assign: |element, source| {
+                // SAFETY: an attachment element of this crate's.
+                let slot = unsafe { object::body::<AttachmentElement>(element) }.slot;
                 if let Some(destination) = attachment_of(element) {
-                    assign_attachment(destination, source, AttachmentSlot::Color(0));
+                    assign_attachment(destination, source, slot);
                 }
             },
         },
@@ -1141,20 +1169,11 @@ pub(super) unsafe extern "C" fn set_pass_single_attachment(receiver: Id, sel: Se
     // SAFETY: a render pass descriptor of this crate's.
     let descriptor = unsafe { object::body::<RenderPassDescriptor>(receiver) };
     // SAFETY: a selector the runtime owns.
-    let depth = unsafe { std::ffi::CStr::from_ptr(sel) }.to_bytes() == b"setDepthAttachment:";
-    assign_attachment(
-        if depth {
-            &mut descriptor.depth
-        } else {
-            &mut descriptor.stencil
-        },
-        value,
-        if depth {
-            AttachmentSlot::Depth
-        } else {
-            AttachmentSlot::Stencil
-        },
-    );
+    let slot = match unsafe { std::ffi::CStr::from_ptr(sel) }.to_bytes() {
+        b"setDepthAttachment:" => AttachmentSlot::Depth,
+        _ => AttachmentSlot::Stencil,
+    };
+    assign_attachment(descriptor.attachment(slot), value, slot);
 }
 
 /// `-init` of a standalone attachment descriptor.

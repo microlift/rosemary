@@ -612,25 +612,6 @@ impl Encoder {}
 
 impl Encoder {}
 
-impl Default for AttachmentDescriptor {
-    fn default() -> Self {
-        Self {
-            texture: std::ptr::null_mut(),
-            level: 0,
-            slice: 0,
-            load_action: 0,
-            store_action: 0,
-            clear_color: [0.0, 0.0, 0.0, 1.0],
-            clear_depth: 1.0,
-            clear_stencil: 0,
-            resolve_texture: std::ptr::null_mut(),
-            resolve_level: 0,
-            resolve_slice: 0,
-            resolve_filter: 0,
-        }
-    }
-}
-
 impl Default for RenderPassDescriptor {
     fn default() -> Self {
         Self {
