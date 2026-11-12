@@ -389,22 +389,24 @@ pub unsafe fn dictionary<'a>(object: CFTypeRef) -> Option<&'a mut DictionaryCont
 /// The values are Apple's and are part of the interface: a guest passes one in
 /// and reads one back out.
 pub mod number_type {
-    pub const SINT8: i32 = 1;
-    pub const SINT16: i32 = 2;
-    pub const SINT32: i32 = 3;
-    pub const SINT64: i32 = 4;
-    pub const FLOAT32: i32 = 5;
-    pub const FLOAT64: i32 = 6;
-    pub const CHAR: i32 = 7;
-    pub const SHORT: i32 = 8;
-    pub const INT: i32 = 9;
-    pub const LONG: i32 = 10;
-    pub const LONG_LONG: i32 = 11;
-    pub const FLOAT: i32 = 12;
-    pub const DOUBLE: i32 = 13;
-    pub const CFINDEX: i32 = 14;
-    pub const NSINTEGER: i32 = 15;
-    pub const CGFLOAT: i32 = 16;
+    use crate::base::CFIndex;
+
+    pub const SINT8: CFIndex = 1;
+    pub const SINT16: CFIndex = 2;
+    pub const SINT32: CFIndex = 3;
+    pub const SINT64: CFIndex = 4;
+    pub const FLOAT32: CFIndex = 5;
+    pub const FLOAT64: CFIndex = 6;
+    pub const CHAR: CFIndex = 7;
+    pub const SHORT: CFIndex = 8;
+    pub const INT: CFIndex = 9;
+    pub const LONG: CFIndex = 10;
+    pub const LONG_LONG: CFIndex = 11;
+    pub const FLOAT: CFIndex = 12;
+    pub const DOUBLE: CFIndex = 13;
+    pub const CFINDEX: CFIndex = 14;
+    pub const NSINTEGER: CFIndex = 15;
+    pub const CGFLOAT: CFIndex = 16;
 }
 
 /// A number, held as whichever of the two things it is.
@@ -445,11 +447,11 @@ impl Number {
 /// switching on it sees the six storage types and never the C names.
 struct NumberBody {
     value: Number,
-    kind: i32,
+    kind: CFIndex,
 }
 
 /// The canonical `CFNumberType` for a type a number can be created with.
-pub fn canonical_number_type(kind: i32) -> Option<i32> {
+pub fn canonical_number_type(kind: CFIndex) -> Option<CFIndex> {
     use number_type as t;
     Some(match number_shape(kind)? {
         (1, false) => t::SINT8,
@@ -462,7 +464,7 @@ pub fn canonical_number_type(kind: i32) -> Option<i32> {
 }
 
 /// How wide `type` is, and whether it is floating point.
-pub fn number_shape(kind: i32) -> Option<(usize, bool)> {
+pub fn number_shape(kind: CFIndex) -> Option<(usize, bool)> {
     use number_type as t;
     Some(match kind {
         t::SINT8 | t::CHAR => (1, false),
@@ -498,7 +500,7 @@ pub fn new_number(value: Number) -> CFTypeRef {
 
 /// A number that reports `kind`, canonicalised; an unknown `kind` reports the
 /// widest type of the value's kind.
-pub fn new_number_of_type(value: Number, kind: i32) -> CFTypeRef {
+pub fn new_number_of_type(value: Number, kind: CFIndex) -> CFTypeRef {
     let kind = canonical_number_type(kind).unwrap_or(match value {
         Number::Integer(_) => number_type::SINT64,
         Number::Float(_) => number_type::FLOAT64,
@@ -588,7 +590,7 @@ struct ConstantFloat {
 
 /// The canonical type of an integer `-objCType`: an unsigned type is stored in
 /// the next wider signed one, as `+numberWithUnsignedInt:` is.
-fn integer_encoding_type(encoding: u8) -> i32 {
+fn integer_encoding_type(encoding: u8) -> CFIndex {
     use number_type as t;
     match encoding {
         b'c' | b'B' => t::SINT8,
@@ -603,7 +605,7 @@ fn integer_encoding_type(encoding: u8) -> i32 {
 /// # Safety
 ///
 /// `object` must be null or an object this runtime allocated or bound.
-unsafe fn constant_number(object: CFTypeRef) -> Option<(Number, i32)> {
+unsafe fn constant_number(object: CFTypeRef) -> Option<(Number, CFIndex)> {
     let class = unsafe { crate::base::class_of(object) }?;
     let is = |name: &std::ffi::CStr| {
         objc::class::lookup(name).is_some_and(|k| class.chain().any(|c| std::ptr::eq(c, k)))
@@ -636,7 +638,7 @@ unsafe fn constant_number(object: CFTypeRef) -> Option<(Number, i32)> {
 /// # Safety
 ///
 /// `object` must be null or an object this runtime allocated or bound.
-pub unsafe fn number_value(object: CFTypeRef) -> Option<(Number, i32)> {
+pub unsafe fn number_value(object: CFTypeRef) -> Option<(Number, CFIndex)> {
     match unsafe { number_body(object) } {
         Some(body) => Some((body.value, body.kind)),
         None => unsafe { constant_number(object) },
@@ -657,7 +659,7 @@ pub unsafe fn number(object: CFTypeRef) -> Option<Number> {
 /// # Safety
 ///
 /// As [`number_value`].
-pub unsafe fn number_type(object: CFTypeRef) -> Option<i32> {
+pub unsafe fn number_type(object: CFTypeRef) -> Option<CFIndex> {
     unsafe { number_value(object) }.map(|(_, kind)| kind)
 }
 

@@ -378,7 +378,7 @@ pub unsafe extern "C" fn CFPropertyListCreateData(
     _allocator: CFAllocatorRef,
     list: CFTypeRef,
     format: CFIndex,
-    _options: u64,
+    _options: usize,
     error: *mut CFTypeRef,
 ) -> CFTypeRef {
     if !error.is_null() {

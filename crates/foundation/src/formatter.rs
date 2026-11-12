@@ -1150,7 +1150,7 @@ pub mod cf {
     unsafe extern "C" fn CFNumberFormatterCreateStringWithValue(
         _allocator: CFTypeRef,
         formatter: CFTypeRef,
-        kind: i32,
+        kind: corefoundation::base::CFIndex,
         value: *const std::ffi::c_void,
     ) -> CFTypeRef {
         let Some(format) =

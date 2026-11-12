@@ -45,7 +45,7 @@ unsafe extern "C" fn data_with(
             std::ptr::null(),
             list as CFTypeRef,
             format as CFIndex,
-            options as u64,
+            options,
             &mut failure,
         )
     };

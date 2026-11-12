@@ -1959,7 +1959,7 @@ pub unsafe extern "C" fn CFBooleanGetValue(value: CFTypeRef) -> Boolean {
 
 pub unsafe extern "C" fn CFNumberCreate(
     _allocator: CFAllocatorRef,
-    kind: i32,
+    kind: CFIndex,
     value: *const c_void,
 ) -> CFTypeRef {
     let (Some((width, is_float)), false) = (collections::number_shape(kind), value.is_null())
@@ -1992,7 +1992,7 @@ pub unsafe extern "C" fn CFNumberCreate(
 /// is the only behaviour that makes a working program keep working.
 pub unsafe extern "C" fn CFNumberGetValue(
     number: CFTypeRef,
-    kind: i32,
+    kind: CFIndex,
     out: *mut c_void,
 ) -> Boolean {
     let (Some(n), Some((width, is_float)), false) = (
@@ -2033,7 +2033,7 @@ pub unsafe extern "C" fn CFNumberIsFloatType(number: CFTypeRef) -> Boolean {
 ///
 /// Zero, which is no type, for anything that is not a number.
 pub unsafe extern "C" fn CFNumberGetType(number: CFTypeRef) -> CFIndex {
-    unsafe { collections::number_type(number) }.map_or(0, |kind| kind as CFIndex)
+    unsafe { collections::number_type(number) }.unwrap_or(0)
 }
 
 /// The width of the number's canonical type.
