@@ -68,6 +68,35 @@ fn source_msl_value_overloads_use_exact_types_and_reject_unranked_conversions() 
 }
 
 #[test]
+fn source_msl_pointer_overloads_match_packed_and_bool_pointees() {
+    let source = "float first(device packed_float3* values) { return values[0].y; }
+        float first(device float* values) { return values[0]; }
+        float first(device bool* values) { return values[0] ? 1.0 : 0.0; }
+        kernel void probe(device packed_float3* packed [[buffer(0)]],
+            device bool* flags [[buffer(1)]], device float* out [[buffer(2)]]) {
+            out[0] = first(packed);
+            out[1] = first(flags);
+            out[2] = first(out);
+        }";
+    let explicit = source
+        .replace(
+            "float first(device packed",
+            "float first_packed(device packed",
+        )
+        .replace("float first(device bool", "float first_bool(device bool")
+        .replace("first(packed)", "first_packed(packed)")
+        .replace("first(flags)", "first_bool(flags)");
+    let target = TargetProfile {
+        storage_buffer8_bit_access: true,
+        ..TargetProfile::vulkan_1_3()
+    };
+    assert_eq!(
+        translate_msl(source, &target).unwrap().entries[0].words,
+        translate_msl(&explicit, &target).unwrap().entries[0].words
+    );
+}
+
+#[test]
 fn source_msl_empty_global_initializers_preserve_zero_values() {
     let source = "constant uint2 coordinates = {};
         constant float3x2 matrix = {};

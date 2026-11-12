@@ -136,14 +136,16 @@ impl<'p> Lowerer<'_, 'p> {
                 .iter()
                 .zip(&bindings)
                 .all(|(param, binding)| {
-                    let (actual, space) = match binding {
-                        Binding::Value(value) => (value.ty.clone(), None),
-                        Binding::LValue(place) => (place.ty(), place.space()),
-                        Binding::Pointer(pointer) => {
-                            (pointer.element().unpacked(), Some(pointer.space()))
-                        }
+                    let (same_type, space) = match binding {
+                        Binding::Value(value) => (param.ty == value.ty, None),
+                        Binding::LValue(place) => (param.ty == place.ty(), place.space()),
+                        // Pointees compare as memory holds them, as `argument` does.
+                        Binding::Pointer(pointer) => (
+                            param.ty.in_memory() == *pointer.element(),
+                            Some(pointer.space()),
+                        ),
                     };
-                    param.ty == actual
+                    same_type
                         && param
                             .space
                             .is_none_or(|expected| Some(address_space(expected)) == space)
