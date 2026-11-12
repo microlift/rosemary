@@ -971,9 +971,15 @@ mod tests {
             );
             assert_eq!((got, value[0]), (1, b'7'));
 
-            let mut names = [0u8; 64];
+            // The host may hold attributes of its own, such as macOS's provenance.
+            let mut names = [0u8; 256];
             let listed = flistxattr(fd, names.as_mut_ptr().cast(), names.len(), 0);
-            assert_eq!(&names[..listed as usize], b"com.example.tag\0");
+            assert!(listed > 0);
+            assert!(
+                names[..listed as usize]
+                    .split_inclusive(|&byte| byte == 0)
+                    .any(|listed| listed == b"com.example.tag\0")
+            );
 
             assert_eq!(fremovexattr(fd, name.as_ptr(), 0), 0);
             assert_eq!(

@@ -1115,15 +1115,20 @@ mod tests {
     use crate::mach::info::page_size;
     use crate::mach::space::{HOST_SELF, TASK_SELF};
 
+    /// Two host pages, which on a 16 KiB-page host is more than two 4 KiB ones.
+    fn mapped_len() -> u64 {
+        2 * page_size()
+    }
+
     fn map(prot: i32) -> u64 {
         let mut address = 0_u64;
         // SAFETY: a writable out-parameter.
         assert_eq!(
-            unsafe { vm_allocate(TASK_SELF, &mut address, 2 * 4096, VM_FLAGS_ANYWHERE) },
+            unsafe { vm_allocate(TASK_SELF, &mut address, mapped_len(), VM_FLAGS_ANYWHERE) },
             KERN_SUCCESS
         );
         assert_eq!(
-            unsafe { vm_protect(TASK_SELF, address, 2 * 4096, 0, prot) },
+            unsafe { vm_protect(TASK_SELF, address, mapped_len(), 0, prot) },
             KERN_SUCCESS
         );
         address
@@ -1264,7 +1269,7 @@ mod tests {
             marker
         );
         assert_eq!(unsafe { vm_deallocate(TASK_SELF, data, 8) }, KERN_SUCCESS);
-        unsafe { vm_deallocate(TASK_SELF, from, 2 * 4096) };
+        unsafe { vm_deallocate(TASK_SELF, from, mapped_len()) };
     }
 
     /// A read of a hole is an invalid address, and of an unreadable page a
@@ -1281,7 +1286,7 @@ mod tests {
             unsafe { vm_read(TASK_SELF, base + 4000, 200, &mut data, &mut count) },
             KERN_PROTECTION_FAILURE
         );
-        unsafe { vm_deallocate(TASK_SELF, base, 2 * 4096) };
+        unsafe { vm_deallocate(TASK_SELF, base, mapped_len()) };
         // The first page is never mapped, so no other test can be there.
         let mut into = [0_u8; 4];
         assert_eq!(
@@ -1320,7 +1325,7 @@ mod tests {
             vm_write(TASK_SELF, base + 10, data.as_ptr() as u64, 7),
             KERN_PROTECTION_FAILURE
         );
-        unsafe { vm_deallocate(TASK_SELF, base, 2 * 4096) };
+        unsafe { vm_deallocate(TASK_SELF, base, mapped_len()) };
         assert_eq!(
             vm_write(TASK_SELF, 16, data.as_ptr() as u64, 7),
             KERN_INVALID_ADDRESS
@@ -1491,7 +1496,7 @@ mod tests {
         unsafe {
             *((source + 5) as *mut u8) = 9;
             assert_eq!(*((copy + 5) as *const u8), 7);
-            vm_deallocate(TASK_SELF, source, 2 * 4096);
+            vm_deallocate(TASK_SELF, source, mapped_len());
             vm_deallocate(TASK_SELF, copy, 2 * 4096);
         }
     }
@@ -1515,7 +1520,7 @@ mod tests {
             assert_eq!(*((data + 1) as *const u8), 0);
             vm_deallocate(TASK_SELF, legacy, page);
             vm_deallocate(TASK_SELF, data - (page - 1), 2 * page);
-            vm_deallocate(TASK_SELF, source, 2 * 4096);
+            vm_deallocate(TASK_SELF, source, mapped_len());
         }
     }
 
@@ -1574,7 +1579,7 @@ mod tests {
     fn a_shared_remap_of_private_memory_is_refused() {
         let source = map(VM_PROT_READ | VM_PROT_WRITE);
         assert_eq!(remap(source, 4096, 0, 0), Err(KERN_INVALID_ARGUMENT));
-        unsafe { vm_deallocate(TASK_SELF, source, 2 * 4096) };
+        unsafe { vm_deallocate(TASK_SELF, source, mapped_len()) };
     }
 
     #[test]

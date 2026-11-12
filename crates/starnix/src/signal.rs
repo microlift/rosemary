@@ -118,6 +118,10 @@ pub unsafe fn info(raw: *const libc::siginfo_t) -> Info {
                 info.uid = raw.si_uid();
                 info.status = raw.si_status();
             }
+            Kernel if sys::signal::KERNEL_CODE_HAS_SENDER => {
+                info.pid = raw.si_pid();
+                info.uid = raw.si_uid();
+            }
             Kernel => {}
             _ if is_fault(raw.si_signo) => info.addr = raw.si_addr() as usize,
             _ => {}
@@ -327,7 +331,8 @@ mod tests {
         let (info, pc) = SEEN.lock().unwrap().take().expect("the handler ran");
         assert_eq!(info.signo, libc::SIGUSR2);
         assert!(
-            matches!(info.code, Code::User | Code::Thread),
+            matches!(info.code, Code::User | Code::Thread)
+                || (sys::signal::KERNEL_CODE_HAS_SENDER && info.code == Code::Kernel),
             "{:?}",
             info.code
         );

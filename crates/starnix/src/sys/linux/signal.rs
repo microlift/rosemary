@@ -4,6 +4,8 @@ use crate::signal::{Code, Context};
 
 pub const SIGEMT: Option<c_int> = None;
 pub const SIGINFO: Option<c_int> = None;
+/// `si_pid`/`si_uid` overlap other members for a kernel-sent signal.
+pub const KERNEL_CODE_HAS_SENDER: bool = false;
 
 const ILL: [Code; 8] = [
     Code::IllegalOpcode,

@@ -294,6 +294,7 @@ mod tests {
     /// `AF_INET6` is a family this host also has, meaning something else.
     #[test]
     fn af_inet6_is_not_the_hosts_number() {
+        #[cfg(target_os = "linux")]
         assert_ne!(family::INET6, libc::AF_INET6);
         assert_eq!(family_to_host(family::INET6), Some(libc::AF_INET6));
     }

@@ -4186,12 +4186,15 @@ mod no_copy_tests {
     /// `bytes` in a fresh `malloc` block.
     fn malloc_copy(bytes: &[u8]) -> *mut u8 {
         // SAFETY: a block of the right size, filled before it is handed out.
-        unsafe {
+        let block = unsafe {
             let block = libc::malloc(bytes.len()).cast::<u8>();
             assert!(!block.is_null());
             std::ptr::copy_nonoverlapping(bytes.as_ptr(), block, bytes.len());
             block
-        }
+        };
+        // A reused address was freed as some earlier block, not as this one.
+        FREED.lock().unwrap().retain(|&freed| freed != block as usize);
+        block
     }
 
     /// Run `body` with `recording_free` as the guest's `free`.

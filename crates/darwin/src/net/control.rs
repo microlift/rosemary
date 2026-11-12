@@ -198,7 +198,7 @@ fn message_from_host(level: i32, kind: i32, payload: &[u8]) -> Option<Message> {
                 payload: darwin,
             })
         }
-        (libc::IPPROTO_IP, libc::IP_TOS) if payload.len() == 1 => Some(Message {
+        (libc::IPPROTO_IP, host::IP_TOS_MESSAGE) if payload.len() == 1 => Some(Message {
             level,
             // Darwin receives IP_RECVTOS, not the IP_TOS used on send.
             kind: DARWIN_IP_RECVTOS,
@@ -342,12 +342,13 @@ mod tests {
 
     #[test]
     fn quic_control_messages_preserve_payloads_and_translate_types() {
-        for (level, send_kind, recv_kind, host_kind, payload) in [
+        for (level, send_kind, recv_kind, host_kind, host_recv_kind, payload) in [
             (
                 libc::IPPROTO_IP,
                 DARWIN_IP_TOS,
                 DARWIN_IP_RECVTOS,
                 libc::IP_TOS,
+                host::IP_TOS_MESSAGE,
                 vec![3],
             ),
             // Not on every host; see `to_host`.
@@ -356,6 +357,7 @@ mod tests {
                 DARWIN_IP_PKTINFO,
                 DARWIN_IP_PKTINFO,
                 host::IP_PKTINFO.unwrap_or(-1),
+                host::IP_PKTINFO.unwrap_or(-1),
                 vec![1, 0, 0, 0, 127, 0, 0, 1, 127, 0, 0, 2],
             ),
             (
@@ -363,12 +365,14 @@ mod tests {
                 DARWIN_IPV6_TCLASS,
                 DARWIN_IPV6_TCLASS,
                 libc::IPV6_TCLASS,
+                libc::IPV6_TCLASS,
                 3i32.to_ne_bytes().to_vec(),
             ),
             (
                 libc::IPPROTO_IPV6,
                 DARWIN_IPV6_PKTINFO,
                 DARWIN_IPV6_PKTINFO,
+                libc::IPV6_PKTINFO,
                 libc::IPV6_PKTINFO,
                 (0..20).collect(),
             ),
@@ -383,14 +387,14 @@ mod tests {
             assert_eq!((header.cmsg_level, header.cmsg_type), (level, host_kind));
             let data = unsafe { libc::CMSG_LEN(0) } as usize;
             assert_eq!(&host[data..data + payload.len()], payload);
-            let received = message_from_host(level, host_kind, &payload).unwrap();
+            let received = message_from_host(level, host_recv_kind, &payload).unwrap();
             assert_eq!((received.level, received.kind), (level, recv_kind));
             assert_eq!(received.payload, payload);
 
             let short = guest_message(level, send_kind, &[]);
             // SAFETY: short is a complete header with an empty payload.
             assert!(unsafe { to_host(short.as_ptr().cast(), short.len() as u32) }.is_err());
-            assert!(message_from_host(level, host_kind, &[]).is_none());
+            assert!(message_from_host(level, host_recv_kind, &[]).is_none());
         }
     }
 

@@ -1894,6 +1894,8 @@ mod tests {
         }
         let (info, mcsize, pc, mask) = SEEN.lock().unwrap().take().expect("the handler ran");
         assert_eq!(info.signo, signum::SIGURG);
+        // XNU reports a `kill` with code 0, which a native process also sees.
+        #[cfg(not(target_os = "macos"))]
         assert_eq!(info.code, 0x10001, "SI_USER");
         assert_eq!(info.pid, crate::process::host_self());
         assert_eq!(mcsize, size_of::<Mcontext>() as u64);
@@ -1963,6 +1965,8 @@ mod tests {
         assert_eq!(value, 0x5afe);
         let seen = FAULTED_AT.load(Ordering::SeqCst);
         assert_eq!(seen & 0xffff_ffff_ffff, 0x18, "si_addr");
+        // `0x18` is inside macOS's inaccessible `__PAGEZERO`, not unmapped.
+        #[cfg(not(target_os = "macos"))]
         assert_eq!(seen >> 48, 1, "SEGV_MAPERR");
     }
 }

@@ -1046,13 +1046,20 @@ pub unsafe extern "C" fn disconnectx(fd: i32, aid: u32, _cid: u32) -> i32 {
     let mut unspecified: libc::sockaddr = unsafe { std::mem::zeroed() };
     unspecified.sa_family = libc::AF_UNSPEC as libc::sa_family_t;
     // SAFETY: an address this function owns, at its own length.
-    unsafe {
+    let rc = unsafe {
         libc::connect(
             fd,
             &raw const unspecified,
             size_of_val(&unspecified) as libc::socklen_t,
         )
-    }
+    };
+    // BSD kernels dissolve the association and still refuse the family.
+    let dissolved = rc < 0
+        && crate::errno::get() == libc::EAFNOSUPPORT
+        // SAFETY: a local to receive the address.
+        && unsafe { libc::getpeername(fd, (&raw mut peer).cast(), &raw mut len) } < 0
+        && crate::errno::get() == libc::ENOTCONN;
+    if dissolved { 0 } else { rc }
 }
 
 /// The host address family and `SOCK_*` type of socket `fd`, or `None` with
@@ -1203,15 +1210,18 @@ mod tests {
     /// not to wait at all, and `MSG_EOR` asks about truncated control data.
     #[test]
     fn the_message_flags_are_translated_rather_than_passed_through() {
+        #[cfg(target_os = "linux")]
         assert_eq!(msg::WAITALL, libc::MSG_DONTWAIT);
         assert_eq!(flags_to_host(msg::WAITALL), libc::MSG_WAITALL);
+        #[cfg(target_os = "linux")]
         assert_eq!(msg::EOR, libc::MSG_CTRUNC);
         assert_eq!(flags_to_host(msg::EOR), libc::MSG_EOR);
     }
 
     #[test]
     fn every_shared_message_flag_round_trips() {
-        for (darwin, _) in FLAGS {
+        // macOS has no `MSG_NOSIGNAL`; a socket option stands in for it.
+        for (darwin, _) in FLAGS.iter().filter(|(_, host)| *host != 0) {
             assert_eq!(flags_from_host(flags_to_host(*darwin)), *darwin);
         }
     }
@@ -1222,6 +1232,7 @@ mod tests {
     /// below checks end to end.
     #[test]
     fn msg_eof_is_not_handed_to_this_host_as_a_flag() {
+        #[cfg(target_os = "linux")]
         assert_eq!(msg::EOF, libc::MSG_WAITALL, "the collision being avoided");
         assert_eq!(flags_to_host(msg::EOF), 0);
     }
@@ -1470,9 +1481,6 @@ mod tests {
     #[test]
     fn a_write_to_a_closed_peer_reports_epipe_when_the_guest_asked_it_to() {
         let (ours, theirs) = pair();
-        // SAFETY: the other end, which this test is finished with.
-        unsafe { libc::close(theirs) };
-
         let on = 1i32;
         // SAFETY: one readable `int`, and the length says four. `0xffff` is
         // Darwin's `SOL_SOCKET` and `0x1022` its `SO_NOSIGPIPE`.
@@ -1480,6 +1488,9 @@ mod tests {
             crate::net::sockopt::setsockopt(ours, 0xffff, 0x1022, (&raw const on).cast(), 4)
         };
         assert_eq!(rc, 0);
+        // Closed after: macOS refuses socket options once the peer is gone.
+        // SAFETY: the other end, which this test is finished with.
+        unsafe { libc::close(theirs) };
 
         // SAFETY: five readable bytes, and the length says five.
         let wrote = unsafe { write(ours, c"hello".as_ptr().cast(), 5) };
@@ -1706,6 +1717,7 @@ mod tests {
     /// The layout claim this module rests on: a guest's `struct msghdr` is
     /// forty-eight bytes and the host's is not, so it is a value to convert.
     #[test]
+    #[cfg(target_os = "linux")]
     fn the_guests_msghdr_is_not_the_hosts() {
         assert_eq!(core::mem::size_of::<MsgHdr>(), 48);
         assert!(

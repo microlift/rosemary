@@ -14,6 +14,8 @@ mod linux {
     pub const IP_RECVOPTS: i32 = 6;
     pub const IP_PKTINFO: Option<i32> = Some(libc::IP_PKTINFO);
     pub const IP_RECVTOS: i32 = libc::IP_RECVTOS;
+    /// A received TOS arrives under the send-side name.
+    pub const IP_TOS_MESSAGE: i32 = libc::IP_TOS;
     pub const IPV6_JOIN_GROUP: i32 = libc::IPV6_ADD_MEMBERSHIP;
     pub const IPV6_LEAVE_GROUP: i32 = libc::IPV6_DROP_MEMBERSHIP;
     /// `TCP_CORK` holds a partial segment until cleared, where Darwin's
@@ -42,6 +44,7 @@ mod freebsd {
     /// rather than aimed at something that answers in a different shape.
     pub const IP_PKTINFO: Option<i32> = None;
     pub const IP_RECVTOS: i32 = libc::IP_RECVTOS;
+    pub const IP_TOS_MESSAGE: i32 = libc::IP_RECVTOS;
     pub const IPV6_JOIN_GROUP: i32 = libc::IPV6_JOIN_GROUP;
     pub const IPV6_LEAVE_GROUP: i32 = libc::IPV6_LEAVE_GROUP;
     /// Darwin's own `TCP_NOPUSH`, with Darwin's own advisory meaning.
@@ -66,6 +69,7 @@ mod macos {
     pub const IP_RECVOPTS: i32 = 5;
     pub const IP_PKTINFO: Option<i32> = Some(26);
     pub const IP_RECVTOS: i32 = 27;
+    pub const IP_TOS_MESSAGE: i32 = IP_RECVTOS;
     pub const IPV6_JOIN_GROUP: i32 = 12;
     pub const IPV6_LEAVE_GROUP: i32 = 13;
     pub const TCP_NOPUSH: i32 = 0x04;

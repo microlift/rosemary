@@ -4,6 +4,8 @@ use crate::signal::{Code, Context};
 
 pub const SIGEMT: Option<c_int> = Some(libc::SIGEMT);
 pub const SIGINFO: Option<c_int> = Some(libc::SIGINFO);
+/// XNU reports `kill` with code 0 and still names the sender.
+pub const KERNEL_CODE_HAS_SENDER: bool = true;
 
 // `<sys/signal.h>`; the `libc` crate does not carry these for Apple targets.
 const SI_USER: c_int = 0x10001;

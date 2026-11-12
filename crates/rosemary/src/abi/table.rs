@@ -3299,7 +3299,6 @@ pub static SIGNATURES: &[FunctionAbi] = &[
     sig!("readdir_r", I32, P, P, P),
     sig!("readlink", I64, P, P, U64),
     sig!("readlinkat", I64, I32, P, P, U64),
-    sig!("readlinkat", I64, I32, P, P, U64),
     sig!("readv", I64, I32, P, I32),
     sig!("reboot", I32, I32),
     sig!("realloc", P, P, U64),

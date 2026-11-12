@@ -1231,6 +1231,7 @@ mod tests {
     fn darwin_locale_categories_are_translated() {
         assert_eq!(host_category(category::ALL), Some(libc::LC_ALL));
         assert_eq!(host_category(category::NUMERIC), Some(libc::LC_NUMERIC));
+        #[cfg(target_os = "linux")]
         assert_ne!(category::NUMERIC, libc::LC_NUMERIC);
         assert_eq!(host_category(99), None);
 

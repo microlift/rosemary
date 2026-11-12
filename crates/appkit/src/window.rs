@@ -4068,6 +4068,10 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(
+        target_os = "macos",
+        ignore = "SDL's Cocoa video needs the main thread, which libtest gives no test"
+    )]
     fn order_front_keeps_key_on_a_shown_window_and_make_key_window_moves_it() {
         if !sdl3::isolated::run_here_with_dummy_video() {
             return;
@@ -4699,6 +4703,10 @@ mod tests {
     /// Parent remake must observe a binding still between native make-current
     /// and its publication to the cross-thread drawable registry.
     #[test]
+    #[cfg_attr(
+        target_os = "macos",
+        ignore = "SDL's Cocoa video needs the main thread, which libtest gives no test"
+    )]
     fn gl_popup_rehome_waits_for_inflight_native_binding() {
         if !sdl3::isolated::run_here() {
             return;
@@ -4842,6 +4850,10 @@ mod tests {
     /// the SDL event thread. The owning thread repairs its binding at the
     /// first AppKit GL boundary, with no guest makeCurrentContext call.
     #[test]
+    #[cfg_attr(
+        target_os = "macos",
+        ignore = "SDL's Cocoa video needs the main thread, which libtest gives no test"
+    )]
     fn gl_popup_rehome_restores_render_thread_before_flush() {
         if !sdl3::isolated::run_here() {
             return;

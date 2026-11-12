@@ -4379,7 +4379,8 @@ mod tests {
                     spec: Spec {
                         key_path: "bounds.size.width".into(),
                         from: Some(0.0),
-                        to: Some(2.0),
+                        // Two points wide halfway, clear of a pixel-rounding edge.
+                        to: Some(4.0),
                         duration: 10.0,
                         ..Spec::default()
                     },
@@ -4991,6 +4992,10 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(
+        target_os = "macos",
+        ignore = "SDL's Cocoa video needs the main thread, which libtest gives no test"
+    )]
     fn iosurface_poll_tracks_only_owner_view_through_reparent_and_many_idle_pumps() {
         if !sdl3::isolated::run_here() {
             return;

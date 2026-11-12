@@ -900,6 +900,7 @@ mod tests {
 
     #[test]
     fn the_level_is_translated_rather_than_passed_through() {
+        #[cfg(target_os = "linux")]
         assert_ne!(SOL_SOCKET, libc::SOL_SOCKET);
         assert_eq!(
             option_to_host(SOL_SOCKET, so::REUSEADDR),
@@ -910,6 +911,7 @@ mod tests {
     /// Darwin's `SO_REUSEADDR` is this host's `SO_ERROR` - a real option, so
     /// passing it through succeeds and reads or writes something else.
     #[test]
+    #[cfg(target_os = "linux")]
     fn a_boolean_option_is_not_the_option_the_guest_named() {
         assert_eq!(so::REUSEADDR, libc::SO_ERROR);
         assert_eq!(so::KEEPALIVE, libc::SO_RCVBUF, "Darwin's SO_KEEPALIVE");
@@ -934,6 +936,7 @@ mod tests {
             option_to_host(IPPROTO_IPV6, ipv6::UNICAST_HOPS),
             Some((IPPROTO_IPV6, libc::IPV6_UNICAST_HOPS))
         );
+        #[cfg(target_os = "linux")]
         assert_ne!(
             ipv6::UNICAST_HOPS,
             libc::IPV6_UNICAST_HOPS,

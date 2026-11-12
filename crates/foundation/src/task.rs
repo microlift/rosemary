@@ -542,6 +542,7 @@ mod tests {
         unsafe { init(task, objc::sel::get("init")) }
     }
 
+    #[cfg(not(target_os = "macos"))]
     fn strings(values: &[&str]) -> Id {
         let strings: Vec<Id> = values.iter().map(|v| crate::string::from_str(v)).collect();
         let refs: Vec<CFTypeRef> = strings.iter().map(|s| *s as CFTypeRef).collect();
@@ -554,7 +555,10 @@ mod tests {
         array as Id
     }
 
+    /// Not on macOS, where `/bin/sh` is a Mach-O and so runs under the
+    /// runtime, which a unit-test binary is not; `tests/spawn.rs` covers that.
     #[test]
+    #[cfg(not(target_os = "macos"))]
     fn a_task_reports_its_output_and_exit_code() {
         let pool = objc::arc::pool_push();
         let task = new_task();

@@ -301,6 +301,14 @@ unsafe fn getpath(fd: libc::c_int, out: *mut libc::c_char) -> libc::c_int {
     0
 }
 
+/// State this crate keeps per descriptor follows a successful `F_DUPFD*` copy.
+fn duplicated(fd: libc::c_int, command: libc::c_int, rc: libc::c_int) {
+    if rc >= 0 && matches!(command, cmd::F_DUPFD | cmd::F_DUPFD_CLOEXEC) {
+        crate::net::sockopt::inherit_sigpipe_suppression(fd, rc);
+        crate::kqueue::duplicate(fd, rc);
+    }
+}
+
 #[cfg(target_os = "macos")]
 pub mod entry {
     pub unsafe extern "C" fn fcntl(
@@ -311,7 +319,9 @@ pub mod entry {
         if command == super::cmd::F_GETPATH {
             return unsafe { super::getpath(fd, arg as *mut libc::c_char) };
         }
-        unsafe { libc::fcntl(fd, command, arg) }
+        let rc = unsafe { libc::fcntl(fd, command, arg) };
+        super::duplicated(fd, command, rc);
+        rc
     }
 
     exports::exports! {
@@ -370,10 +380,7 @@ pub mod entry {
         };
         // SAFETY: the caller's obligation, above.
         let rc = unsafe { libc::fcntl(fd, host_command, arg) };
-        if rc >= 0 && matches!(command, cmd::F_DUPFD | cmd::F_DUPFD_CLOEXEC) {
-            crate::net::sockopt::inherit_sigpipe_suppression(fd, rc);
-            crate::kqueue::duplicate(fd, rc);
-        }
+        super::duplicated(fd, command, rc);
         match command == cmd::F_GETFL && rc >= 0 {
             true => flags_to_guest(rc),
             false => rc,

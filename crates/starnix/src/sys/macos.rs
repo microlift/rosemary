@@ -244,6 +244,11 @@ pub fn process(pid: i32) -> Option<Process> {
     })
 }
 
+// `<mach/vm_region.h>`; `SM_EMPTY` (3) is untouched private memory.
+const SM_SHARED: u32 = 4;
+const SM_TRUESHARED: u32 = 5;
+const SM_SHARED_ALIASED: u32 = 7;
+
 /// `pid`'s mappings, walked one `PROC_PIDREGIONINFO` at a time.
 fn regions_of(pid: i32) -> Vec<Region> {
     let mut regions = Vec::new();
@@ -252,8 +257,10 @@ fn regions_of(pid: i32) -> Vec<Region> {
         if info.size == 0 {
             break;
         }
-        // `SM_SHARED`, `SM_TRUESHARED`, `SM_SHARED_ALIASED`.
-        let shared = matches!(info.share_mode, 3 | 5 | 7);
+        let shared = matches!(
+            info.share_mode,
+            SM_SHARED | SM_TRUESHARED | SM_SHARED_ALIASED
+        );
         regions.push(Region {
             start: info.address,
             end: info.address + info.size,

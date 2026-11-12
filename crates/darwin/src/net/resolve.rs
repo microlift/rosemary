@@ -531,6 +531,7 @@ mod tests {
     fn the_hint_flags_are_translated_rather_than_passed_through() {
         assert_eq!(hints_to_host(0x0800), libc::AI_V4MAPPED);
         assert_eq!(hints_to_host(0x0100), libc::AI_ALL);
+        #[cfg(target_os = "linux")]
         assert_ne!(0x0800, libc::AI_V4MAPPED);
     }
 
@@ -540,6 +541,7 @@ mod tests {
     fn the_error_codes_are_translated_in_both_directions() {
         assert_eq!(error_from_host(libc::EAI_NONAME), 8);
         assert_eq!(error_to_host(8), libc::EAI_NONAME);
+        #[cfg(target_os = "linux")]
         assert!(libc::EAI_NONAME < 0);
     }
 
@@ -552,6 +554,7 @@ mod tests {
         assert_eq!(name_flags_to_host(0x02), libc::NI_NUMERICHOST);
         assert_eq!(name_flags_to_host(0x04), libc::NI_NAMEREQD);
         assert_eq!(name_flags_to_host(0x08), libc::NI_NUMERICSERV);
+        #[cfg(target_os = "linux")]
         assert_eq!(0x01, libc::NI_NUMERICHOST, "the collision being avoided");
         assert_eq!(
             name_flags_to_host(0x10),

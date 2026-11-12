@@ -1972,6 +1972,10 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(
+        target_os = "macos",
+        ignore = "SDL's Cocoa video needs the main thread, which libtest gives no test"
+    )]
     fn route_sends_a_press_and_its_release_to_the_pressed_view() {
         if !sdl3::isolated::run_here_with_dummy_video() {
             return;
@@ -2065,6 +2069,10 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(
+        target_os = "macos",
+        ignore = "SDL's Cocoa video needs the main thread, which libtest gives no test"
+    )]
     fn pinch_gestures_reach_the_view_under_the_pointer_with_magnification_and_phases() {
         if !sdl3::isolated::run_here_with_dummy_video() {
             return;
@@ -2343,6 +2351,10 @@ mod modal_presentation_tests {
     }
 
     #[test]
+    #[cfg_attr(
+        target_os = "macos",
+        ignore = "SDL's Cocoa video needs the main thread, which libtest gives no test"
+    )]
     fn modal_dialog_keeps_presentation_serviced_without_running_guest_pump_hooks() {
         // Rust libtest may schedule graphical cases on different OS threads.
         // SDL attaches video ownership to the first thread in the process,

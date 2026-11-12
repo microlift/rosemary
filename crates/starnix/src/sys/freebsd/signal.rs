@@ -4,6 +4,8 @@ use crate::signal::{Code, Context};
 
 pub const SIGEMT: Option<c_int> = Some(libc::SIGEMT);
 pub const SIGINFO: Option<c_int> = Some(libc::SIGINFO);
+/// FreeBSD reports `kill` as `SI_USER`, so code 0 has no sender.
+pub const KERNEL_CODE_HAS_SENDER: bool = false;
 
 // `<sys/signal.h>`; the `libc` crate does not carry these for FreeBSD.
 const SI_NOINFO: c_int = 0;

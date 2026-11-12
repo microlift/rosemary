@@ -634,12 +634,26 @@ mod tests {
     fn an_unmapped_mapping_is_no_longer_shareable() {
         let entry = named(page(), RW);
         let mapped = map(entry, 0, page(), 0, RW).unwrap();
-        // SAFETY: the mapping just made.
-        unsafe { libc::munmap(mapped as *mut c_void, page() as usize) };
+        // Replaced in place rather than unmapped, so a concurrent test cannot
+        // put a shared mapping of its own there before the check.
+        // SAFETY: the mapping just made, which nothing else uses.
+        let replaced = unsafe {
+            libc::mmap(
+                mapped as *mut c_void,
+                page() as usize,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE | libc::MAP_ANON | libc::MAP_FIXED,
+                -1,
+                0,
+            )
+        };
+        assert_eq!(replaced as u64, mapped);
         assert_eq!(
             entry_on(mapped, page(), RW, MACH_PORT_NULL),
             Err(KERN_INVALID_ARGUMENT)
         );
+        // SAFETY: the private mapping above.
+        unsafe { libc::munmap(replaced, page() as usize) };
     }
 
     #[test]

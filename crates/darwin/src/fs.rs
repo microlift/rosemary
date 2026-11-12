@@ -144,8 +144,16 @@ pub unsafe extern "C" fn unlink(path: *const c_char) -> c_int {
             return (-1, false);
         }
         let rc = unsafe { libc::unlink(path) };
-        (rc, rc == 0)
+        (unlinked_as_darwin(rc), rc == 0)
     })
+}
+
+/// Darwin refuses to unlink a directory with `EPERM`, where Linux says `EISDIR`.
+fn unlinked_as_darwin(rc: c_int) -> c_int {
+    if rc < 0 && crate::errno::get() == libc::EISDIR {
+        crate::errno::set(libc::EPERM);
+    }
+    rc
 }
 
 /// `int rmdir(const char *)`
@@ -214,7 +222,7 @@ pub unsafe extern "C" fn unlinkat(dirfd: c_int, path: *const c_char, flag: c_int
             0 => unsafe { libc::unlinkat(dirfd, path, host_flag) },
             _ => unsafe { crate::stat::beneath::unlinkat(dirfd, path, host_flag) },
         };
-        (rc, rc == 0)
+        (unlinked_as_darwin(rc), rc == 0)
     })
 }
 
@@ -1472,7 +1480,7 @@ mod tests {
         // SAFETY: a NUL-terminated path and Darwin's AT_FDCWD.
         unsafe {
             assert_eq!(unlinkat(crate::stat::DARWIN_AT_FDCWD, path.as_ptr(), 0), -1);
-            assert_eq!(crate::errno::get(), libc::EISDIR);
+            assert_eq!(crate::errno::get(), libc::EPERM, "Darwin's answer for a directory");
             let flag = DARWIN_AT_REMOVEDIR;
             assert_eq!(
                 unlinkat(crate::stat::DARWIN_AT_FDCWD, path.as_ptr(), flag),

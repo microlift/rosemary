@@ -668,8 +668,16 @@ pub extern "C" fn jit_write_protect_np(enabled: i32) {
     let _ = enabled;
 }
 
+/// Non-zero on the thread that ran `main`.
+#[cfg(target_os = "macos")]
+pub unsafe extern "C" fn main_np() -> i32 {
+    // SAFETY: no arguments; answers about the calling thread.
+    unsafe { libc::pthread_main_np() }
+}
+
 /// Non-zero on the thread that ran `main`. Answered by comparing thread ids rather
 /// than by asking libpthread, which has no such call here.
+#[cfg(not(target_os = "macos"))]
 pub unsafe extern "C" fn main_np() -> i32 {
     use static_init::dynamic;
 
