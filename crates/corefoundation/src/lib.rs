@@ -212,7 +212,6 @@ exports::exports! {
         "CFArrayAppendArray" => api::CFArrayAppendArray,
         "CFRunLoopRemoveSource" => api::CFRunLoopRemoveSource,
         "CFRunLoopContainsSource" => api::CFRunLoopContainsSource,
-        "CFAbsoluteTimeGetCurrent" => api::CFAbsoluteTimeGetCurrent,
         "CFRunLoopTimerCreate" => api::CFRunLoopTimerCreate,
         "CFRunLoopTimerGetContext" => api::CFRunLoopTimerGetContext,
         "CFRunLoopAddTimer" => api::CFRunLoopAddTimer,

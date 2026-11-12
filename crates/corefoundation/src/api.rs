@@ -3389,7 +3389,10 @@ fn absolute_time() -> f64 {
         .unwrap_or(0.0)
 }
 
-pub unsafe extern "C" fn CFAbsoluteTimeGetCurrent() -> f64 {
+pub type CFTimeInterval = f64;
+pub type CFAbsoluteTime = CFTimeInterval;
+
+pub unsafe extern "C" fn CFAbsoluteTimeGetCurrent() -> CFAbsoluteTime {
     absolute_time()
 }
 

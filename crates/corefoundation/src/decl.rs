@@ -1,6 +1,6 @@
 #![allow(non_upper_case_globals)]
 
-use exports::decl::{Api, ConstPtr, Fragment, Long, Ptr, UChar, UInt, ULong, UShort, Void};
+use exports::decl::{Api, ConstPtr, Double, Fragment, Long, Ptr, UChar, UInt, ULong, UShort, Void};
 
 use crate::collections::number_type;
 use crate::string::encoding;
@@ -36,6 +36,10 @@ exports::c_types! {
     "CoreFoundation/CFData.h" {
         opaque CFDataRef = const __CFData;
         opaque CFMutableDataRef = __CFData;
+    }
+    "CoreFoundation/CFDate.h" {
+        typedef CFTimeInterval = Double;
+        typedef CFAbsoluteTime = CFTimeInterval;
     }
     "CoreFoundation/CFError.h" {
         opaque CFErrorRef = __CFError;
@@ -132,6 +136,9 @@ exports::c_functions! {
         ) -> CFDataRef = api::CFDataCreate;
         fn CFDataGetLength(theData: CFDataRef) -> CFIndex = api::CFDataGetLength;
         fn CFDataGetBytePtr(theData: CFDataRef) -> ConstPtr<UInt8> = api::CFDataGetBytePtr;
+    }
+    "CoreFoundation/CFDate.h" {
+        fn CFAbsoluteTimeGetCurrent() -> CFAbsoluteTime = api::CFAbsoluteTimeGetCurrent;
     }
     "CoreFoundation/CFArray.h" {
         fn CFArrayGetTypeID() -> CFTypeID = api::CFArrayGetTypeID;
