@@ -1,10 +1,3 @@
-//! CoreFoundation's API as C declares it, for the generated SDK headers.
-//!
-//! Only what is declared here reaches a header, and every declaration is
-//! checked against the function that implements it. A function exported but
-//! not declared can still be bound by a program that brings its own
-//! prototype; it is not part of the API a program is compiled against.
-
 #![allow(non_upper_case_globals)]
 
 use exports::decl::{Api, ConstPtr, Fragment, Long, Ptr, UChar, UInt, ULong, UShort, Void};
