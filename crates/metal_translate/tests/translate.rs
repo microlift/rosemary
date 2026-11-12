@@ -211,6 +211,25 @@ fn source_msl_gather_rejects_invalid_components() {
     }
 }
 
+#[test]
+fn source_msl_depth_gather_rejects_a_component() {
+    let gather = |args: &str| {
+        format!(
+            "fragment float4 gather_depth(depth2d<float> depth [[texture(0)]],
+                sampler s [[sampler(0)]], float4 position [[position]]) {{
+                return depth.gather(s, position.xy{args});
+            }}"
+        )
+    };
+    parse_msl(&gather(", int2(0)")).unwrap();
+    for component in ["component::y", "1"] {
+        let error = parse_msl(&gather(&format!(", int2(0), {component}")))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("has no component"), "{component}: {error}");
+    }
+}
+
 fn store_bitcode() -> Vec<u8> {
     let encoded = include_str!("fixtures/kernel_store_const.bc.hex")
         .trim()

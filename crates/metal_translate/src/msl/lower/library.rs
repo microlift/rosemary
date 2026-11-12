@@ -827,6 +827,12 @@ impl Lowerer<'_, '_> {
                     return Err(syntax_error(line, "min_lod_clamp is not supported"));
                 }
                 ExprKind::Ident(name) if gather && name.starts_with("component::") => {
+                    if texture_type.depth {
+                        return Err(syntax_error(
+                            line,
+                            "a depth texture gather has no component",
+                        ));
+                    }
                     if component.is_some() {
                         return Err(syntax_error(line, "a gather takes one component"));
                     }
@@ -839,6 +845,12 @@ impl Lowerer<'_, '_> {
                     });
                 }
                 _ if gather && component.is_none() && offset.is_some() => {
+                    if texture_type.depth {
+                        return Err(syntax_error(
+                            line,
+                            "a depth texture gather has no component",
+                        ));
+                    }
                     let index = self.context.const_index(arg)?;
                     if index > 3 {
                         return Err(syntax_error(line, "a gather component is out of range"));
