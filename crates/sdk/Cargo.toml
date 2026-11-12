@@ -1,0 +1,13 @@
+[package]
+name = "sdk"
+description = "Generates the headers and link stubs Darwin programs are built against."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+exports.workspace = true
+corefoundation = { path = "../corefoundation" }
+
+[lints]
+workspace = true
