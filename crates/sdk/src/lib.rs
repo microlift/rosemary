@@ -31,7 +31,7 @@ impl Framework {
                 .strip_prefix(&format!("{name}/"))
                 .unwrap_or(&include)
                 .to_string();
-            out.insert(root.join("Headers").join(file), text);
+            out.insert(root.join(file), text);
         }
         let stub = stub(self.install_name, self.version, &self.symbols);
         out.insert(root.join(format!("{name}.tbd")), stub);
