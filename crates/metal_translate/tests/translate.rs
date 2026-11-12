@@ -212,6 +212,23 @@ fn source_msl_gather_rejects_invalid_components() {
 }
 
 #[test]
+fn source_msl_gather_requires_the_component_after_the_offset() {
+    for args in [
+        "component::y",
+        "component::y, int2(1, 0)",
+        "int2(0), component::y, int2(1, 0)",
+    ] {
+        let source = format!(
+            "fragment float4 sample_channel(texture2d<float> tex [[texture(0)]],
+                sampler s [[sampler(0)]], float4 position [[position]]) {{
+                return tex.gather(s, position.xy, {args});
+            }}"
+        );
+        assert!(parse_msl(&source).is_err(), "accepted gather({args})");
+    }
+}
+
+#[test]
 fn source_msl_depth_gather_rejects_a_component() {
     let gather = |args: &str| {
         format!(

@@ -836,6 +836,14 @@ impl Lowerer<'_, '_> {
                     if component.is_some() {
                         return Err(syntax_error(line, "a gather takes one component"));
                     }
+                    // The offset parameter precedes the component and has no
+                    // conversion from it.
+                    if offset.is_none() {
+                        return Err(syntax_error(
+                            line,
+                            "a gather component must follow an offset",
+                        ));
+                    }
                     component = Some(match name.as_str() {
                         "component::x" => 0,
                         "component::y" => 1,
@@ -858,6 +866,9 @@ impl Lowerer<'_, '_> {
                     component = Some(index);
                 }
                 _ => {
+                    if offset.is_some() {
+                        return Err(syntax_error(line, "a sampling call takes one offset"));
+                    }
                     let value = self.rvalue(arg)?;
                     let lanes = value.ty.lanes().unwrap_or(0);
                     let value = self.convert(value, &Ty::of(Scalar::INT, lanes), line)?;
