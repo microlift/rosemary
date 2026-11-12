@@ -203,18 +203,18 @@ unsafe extern "C" fn interpret(ctx: *mut RegisterContext, instructions: u64) {
     publish_rsp(state, ctx);
     // `AssertUnwindSafe` for the reason `caught` gives: a panic here is a bug in
     // this runtime, and one worth reporting rather than aborting on.
-    let at = ctx.rip;
     let done = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         crate::interp::run(ctx, vm.view(), instructions)
     }));
     match done {
         Ok(Ok(())) => {}
         Ok(Err(err)) => abort(vm, ctx, err),
+        // The PC advances per finished instruction, so it names the one that panicked.
         Err(payload) => abort(
             vm,
             ctx,
             crate::vm::VmError::Interpret {
-                pc: at,
+                pc: ctx.rip,
                 what: format!("the runtime panicked: {}", panic_message(&*payload)),
             },
         ),

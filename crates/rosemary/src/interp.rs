@@ -139,6 +139,36 @@ mod tests {
     }
 
     #[test]
+    fn a_run_is_performed_in_order_up_to_a_refused_instruction() {
+        let mut cell = Aligned(0);
+        // Two `lock cmpxchg16b [rdi]`, then a `ud0` this module has no case for.
+        let mem = Bytes {
+            at: 0x1000,
+            bytes: vec![
+                0xF0, 0x48, 0x0F, 0xC7, 0x0F, 0xF0, 0x48, 0x0F, 0xC7, 0x0F, 0x0F, 0xFF, 0xC0,
+            ],
+        };
+        let mut ctx = RegisterContext::new();
+        ctx.rip = 0x1000;
+        ctx.rdi = &mut cell.0 as *mut u128 as u64;
+        ctx.rbx = 7;
+        ctx.rcx = 9;
+
+        let err = run(&mut ctx, &mem, 3).expect_err("no case for the third");
+        let VmError::Interpret { pc, .. } = err else {
+            panic!("wrong error: {err}");
+        };
+        assert_eq!(pc, 0x100A);
+        assert_eq!(ctx.rip, 0x100A, "the PC stops at the refused instruction");
+        assert_eq!(cell.0, u128::from(7u64) | (u128::from(9u64) << 64));
+        assert_eq!(
+            (ctx.zf, ctx.rax, ctx.rdx),
+            (0, 7, 9),
+            "the second swap saw what the first one stored"
+        );
+    }
+
+    #[test]
     fn an_instruction_the_host_does_not_perform_is_named() {
         // `ud0`, which decodes and which this module has no case for.
         let mem = Bytes {
