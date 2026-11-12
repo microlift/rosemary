@@ -406,7 +406,6 @@ pub unsafe extern "C" fn CFPropertyListCreateData(
 
 exports::exports! {
     functions {
-        "CFPropertyListCreateData" => CFPropertyListCreateData,
         "CFPropertyListCreateWithData" => CFPropertyListCreateWithData,
         "CFPropertyListCreateFromXMLData" => CFPropertyListCreateFromXMLData,
     }

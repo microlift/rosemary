@@ -79,9 +79,13 @@ pub struct Param {
 #[derive(Debug)]
 pub struct Function {
     pub name: &'static str,
+    /// The Mach-O spelling of `name`.
+    pub symbol: &'static str,
     pub header: &'static str,
     pub returns: Option<&'static Type>,
     pub params: &'static [Param],
+    /// The implementation, once coerced to the declared signature.
+    pub address: *const (),
 }
 
 /// An exported variable. Every one a framework here exports is `const`.
@@ -301,11 +305,16 @@ macro_rules! c_types {
     };
 }
 
-/// Declare functions, grouped by header, as `FUNCTIONS`.
+/// Declare functions, grouped by header, as `FUNCTIONS`, and export them.
 ///
 /// Each names the function that implements it, which must coerce to the
 /// signature the declaration spells: a declaration taking a `CFIndex` for a
 /// function taking an `i32` does not compile.
+///
+/// The declaration is also the export row: this generates the same `MODULE`
+/// an [`exports!`](crate::exports) does, for the module above to list in its
+/// `groups`, so a declared function is never also listed in a `functions`
+/// section that could name a different implementation.
 #[macro_export]
 macro_rules! c_functions {
     ($($header:literal {
@@ -315,20 +324,48 @@ macro_rules! c_functions {
         pub const FUNCTIONS: &[$crate::decl::Function] = &[
             $($($crate::decl::Function {
                 name: stringify!($name),
+                symbol: concat!("_", stringify!($name)),
                 header: $header,
                 returns: $crate::c_types!(@returns $($ret)?),
                 params: &[$($crate::decl::Param {
                     name: stringify!($param),
                     ty: <$pty as $crate::decl::CType>::TYPE,
                 }),*],
+                address: {
+                    let imp: unsafe extern "C" fn($(<$pty as $crate::decl::CType>::Rust),*)
+                        $(-> <$ret as $crate::decl::CType>::Rust)? = $imp;
+                    imp as *const ()
+                },
             },)*)*
         ];
 
-        const _: () = {
-            $($({
-                let _: unsafe extern "C" fn($(<$pty as $crate::decl::CType>::Rust),*)
-                    $(-> <$ret as $crate::decl::CType>::Rust)? = $imp;
-            })*)*
+        /// Every bare C name [`symbol`] answers.
+        pub fn names() -> $crate::Names {
+            FUNCTIONS.iter().map(|f| f.name).collect()
+        }
+
+        /// The address a guest asking for the bare C name `name` should get.
+        pub fn symbol(name: &str) -> Option<u64> {
+            FUNCTIONS
+                .iter()
+                .find(|f| f.name == name)
+                .map(|f| $crate::address(f.address))
+        }
+
+        /// Publish every function declared here into `out`.
+        pub fn provide(out: &mut dyn $crate::Exports) {
+            for f in FUNCTIONS {
+                out.function(f.symbol, $crate::address(f.address));
+            }
+        }
+
+        /// This module as a row, for the table above it.
+        pub const MODULE: $crate::Module = $crate::Module {
+            path: module_path!(),
+            names,
+            symbol,
+            null_data: $crate::Names::new,
+            provide,
         };
     };
 }

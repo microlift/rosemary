@@ -47,8 +47,20 @@ mod other {
     }
 }
 
+/// A module whose functions are C declarations rather than export rows.
+mod declared {
+    use super::one;
+    use crate::decl::UInt;
+
+    crate::c_functions! {
+        "Declared/Declared.h" {
+            fn declared_one() -> UInt = one;
+        }
+    }
+}
+
 mod group {
-    crate::group! { super::leaf, super::other }
+    crate::group! { super::leaf, super::other, super::declared }
 }
 
 #[test]
@@ -201,6 +213,15 @@ fn a_published_address_is_the_one_symbol_answers() {
         let bare = mach_o.strip_prefix('_').expect("the Mach-O underscore");
         assert_eq!(group::symbol(bare), Some(*address), "{mach_o}");
     }
+}
+
+#[test]
+fn a_declaration_is_its_own_export_row() {
+    let mut out = Recording::default();
+    declared::provide(&mut out);
+    let address = declared::symbol("declared_one").expect("answered by name");
+    assert_eq!(out.functions, [("_declared_one".into(), address)]);
+    assert_eq!(declared::names(), ["declared_one"]);
 }
 
 #[test]
