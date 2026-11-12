@@ -4,6 +4,7 @@ extern crate alloc;
 
 use alloc::vec::Vec;
 
+pub mod decl;
 mod sink;
 
 /// The bare C names a module answers.
