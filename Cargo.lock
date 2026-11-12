@@ -713,8 +713,8 @@ dependencies = [
 
 [[package]]
 name = "cranelift"
-version = "0.138.0-dev"
-source = "git+https://github.com/microlift/wasmtime?branch=microlift_experimental#9240a7cd1dc8ee60898794339e71f56301ec2baf"
+version = "0.139.0-dev"
+source = "git+https://github.com/microlift/wasmtime?branch=microlift_experimental#bece73ba75aced5e0f8b52ba7a9773f5134cbffd"
 dependencies = [
  "cranelift-codegen",
  "cranelift-frontend",
@@ -723,24 +723,24 @@ dependencies = [
 
 [[package]]
 name = "cranelift-assembler-x64"
-version = "0.138.0-dev"
-source = "git+https://github.com/microlift/wasmtime?branch=microlift_experimental#9240a7cd1dc8ee60898794339e71f56301ec2baf"
+version = "0.139.0-dev"
+source = "git+https://github.com/microlift/wasmtime?branch=microlift_experimental#bece73ba75aced5e0f8b52ba7a9773f5134cbffd"
 dependencies = [
  "cranelift-assembler-x64-meta",
 ]
 
 [[package]]
 name = "cranelift-assembler-x64-meta"
-version = "0.138.0-dev"
-source = "git+https://github.com/microlift/wasmtime?branch=microlift_experimental#9240a7cd1dc8ee60898794339e71f56301ec2baf"
+version = "0.139.0-dev"
+source = "git+https://github.com/microlift/wasmtime?branch=microlift_experimental#bece73ba75aced5e0f8b52ba7a9773f5134cbffd"
 dependencies = [
  "cranelift-srcgen",
 ]
 
 [[package]]
 name = "cranelift-bforest"
-version = "0.138.0-dev"
-source = "git+https://github.com/microlift/wasmtime?branch=microlift_experimental#9240a7cd1dc8ee60898794339e71f56301ec2baf"
+version = "0.139.0-dev"
+source = "git+https://github.com/microlift/wasmtime?branch=microlift_experimental#bece73ba75aced5e0f8b52ba7a9773f5134cbffd"
 dependencies = [
  "cranelift-entity",
  "wasmtime-internal-core",
@@ -748,16 +748,16 @@ dependencies = [
 
 [[package]]
 name = "cranelift-bitset"
-version = "0.138.0-dev"
-source = "git+https://github.com/microlift/wasmtime?branch=microlift_experimental#9240a7cd1dc8ee60898794339e71f56301ec2baf"
+version = "0.139.0-dev"
+source = "git+https://github.com/microlift/wasmtime?branch=microlift_experimental#bece73ba75aced5e0f8b52ba7a9773f5134cbffd"
 dependencies = [
  "wasmtime-internal-core",
 ]
 
 [[package]]
 name = "cranelift-codegen"
-version = "0.138.0-dev"
-source = "git+https://github.com/microlift/wasmtime?branch=microlift_experimental#9240a7cd1dc8ee60898794339e71f56301ec2baf"
+version = "0.139.0-dev"
+source = "git+https://github.com/microlift/wasmtime?branch=microlift_experimental#bece73ba75aced5e0f8b52ba7a9773f5134cbffd"
 dependencies = [
  "bumpalo",
  "cranelift-assembler-x64",
@@ -782,8 +782,8 @@ dependencies = [
 
 [[package]]
 name = "cranelift-codegen-meta"
-version = "0.138.0-dev"
-source = "git+https://github.com/microlift/wasmtime?branch=microlift_experimental#9240a7cd1dc8ee60898794339e71f56301ec2baf"
+version = "0.139.0-dev"
+source = "git+https://github.com/microlift/wasmtime?branch=microlift_experimental#bece73ba75aced5e0f8b52ba7a9773f5134cbffd"
 dependencies = [
  "cranelift-assembler-x64-meta",
  "cranelift-codegen-shared",
@@ -793,21 +793,21 @@ dependencies = [
 
 [[package]]
 name = "cranelift-codegen-shared"
-version = "0.138.0-dev"
-source = "git+https://github.com/microlift/wasmtime?branch=microlift_experimental#9240a7cd1dc8ee60898794339e71f56301ec2baf"
+version = "0.139.0-dev"
+source = "git+https://github.com/microlift/wasmtime?branch=microlift_experimental#bece73ba75aced5e0f8b52ba7a9773f5134cbffd"
 
 [[package]]
 name = "cranelift-control"
-version = "0.138.0-dev"
-source = "git+https://github.com/microlift/wasmtime?branch=microlift_experimental#9240a7cd1dc8ee60898794339e71f56301ec2baf"
+version = "0.139.0-dev"
+source = "git+https://github.com/microlift/wasmtime?branch=microlift_experimental#bece73ba75aced5e0f8b52ba7a9773f5134cbffd"
 dependencies = [
  "arbitrary",
 ]
 
 [[package]]
 name = "cranelift-entity"
-version = "0.138.0-dev"
-source = "git+https://github.com/microlift/wasmtime?branch=microlift_experimental#9240a7cd1dc8ee60898794339e71f56301ec2baf"
+version = "0.139.0-dev"
+source = "git+https://github.com/microlift/wasmtime?branch=microlift_experimental#bece73ba75aced5e0f8b52ba7a9773f5134cbffd"
 dependencies = [
  "cranelift-bitset",
  "wasmtime-internal-core",
@@ -815,8 +815,8 @@ dependencies = [
 
 [[package]]
 name = "cranelift-frontend"
-version = "0.138.0-dev"
-source = "git+https://github.com/microlift/wasmtime?branch=microlift_experimental#9240a7cd1dc8ee60898794339e71f56301ec2baf"
+version = "0.139.0-dev"
+source = "git+https://github.com/microlift/wasmtime?branch=microlift_experimental#bece73ba75aced5e0f8b52ba7a9773f5134cbffd"
 dependencies = [
  "cranelift-codegen",
  "hashbrown 0.17.1",
@@ -827,13 +827,13 @@ dependencies = [
 
 [[package]]
 name = "cranelift-isle"
-version = "0.138.0-dev"
-source = "git+https://github.com/microlift/wasmtime?branch=microlift_experimental#9240a7cd1dc8ee60898794339e71f56301ec2baf"
+version = "0.139.0-dev"
+source = "git+https://github.com/microlift/wasmtime?branch=microlift_experimental#bece73ba75aced5e0f8b52ba7a9773f5134cbffd"
 
 [[package]]
 name = "cranelift-jit"
-version = "0.138.0-dev"
-source = "git+https://github.com/microlift/wasmtime?branch=microlift_experimental#9240a7cd1dc8ee60898794339e71f56301ec2baf"
+version = "0.139.0-dev"
+source = "git+https://github.com/microlift/wasmtime?branch=microlift_experimental#bece73ba75aced5e0f8b52ba7a9773f5134cbffd"
 dependencies = [
  "anyhow",
  "cranelift-codegen",
@@ -852,8 +852,8 @@ dependencies = [
 
 [[package]]
 name = "cranelift-module"
-version = "0.138.0-dev"
-source = "git+https://github.com/microlift/wasmtime?branch=microlift_experimental#9240a7cd1dc8ee60898794339e71f56301ec2baf"
+version = "0.139.0-dev"
+source = "git+https://github.com/microlift/wasmtime?branch=microlift_experimental#bece73ba75aced5e0f8b52ba7a9773f5134cbffd"
 dependencies = [
  "anyhow",
  "cranelift-codegen",
@@ -863,8 +863,8 @@ dependencies = [
 
 [[package]]
 name = "cranelift-native"
-version = "0.138.0-dev"
-source = "git+https://github.com/microlift/wasmtime?branch=microlift_experimental#9240a7cd1dc8ee60898794339e71f56301ec2baf"
+version = "0.139.0-dev"
+source = "git+https://github.com/microlift/wasmtime?branch=microlift_experimental#bece73ba75aced5e0f8b52ba7a9773f5134cbffd"
 dependencies = [
  "cranelift-codegen",
  "libc",
@@ -874,8 +874,8 @@ dependencies = [
 
 [[package]]
 name = "cranelift-object"
-version = "0.138.0-dev"
-source = "git+https://github.com/microlift/wasmtime?branch=microlift_experimental#9240a7cd1dc8ee60898794339e71f56301ec2baf"
+version = "0.139.0-dev"
+source = "git+https://github.com/microlift/wasmtime?branch=microlift_experimental#bece73ba75aced5e0f8b52ba7a9773f5134cbffd"
 dependencies = [
  "anyhow",
  "cranelift-codegen",
@@ -889,8 +889,8 @@ dependencies = [
 
 [[package]]
 name = "cranelift-srcgen"
-version = "0.138.0-dev"
-source = "git+https://github.com/microlift/wasmtime?branch=microlift_experimental#9240a7cd1dc8ee60898794339e71f56301ec2baf"
+version = "0.139.0-dev"
+source = "git+https://github.com/microlift/wasmtime?branch=microlift_experimental#bece73ba75aced5e0f8b52ba7a9773f5134cbffd"
 
 [[package]]
 name = "crc32fast"
@@ -2066,7 +2066,7 @@ dependencies = [
 [[package]]
 name = "microlift"
 version = "0.1.0"
-source = "git+https://github.com/microlift/microlift#d6d2695d3eae024acfade6c593f5b769fb1c2192"
+source = "git+https://github.com/microlift/microlift?rev=1e8f4cfdb21e3a691e3351cb1f5d4859481d1708#1e8f4cfdb21e3a691e3351cb1f5d4859481d1708"
 dependencies = [
  "capstone",
  "cranelift",
@@ -3518,8 +3518,8 @@ dependencies = [
 
 [[package]]
 name = "wasmtime-internal-core"
-version = "51.0.0-dev"
-source = "git+https://github.com/microlift/wasmtime?branch=microlift_experimental#9240a7cd1dc8ee60898794339e71f56301ec2baf"
+version = "52.0.0-dev"
+source = "git+https://github.com/microlift/wasmtime?branch=microlift_experimental#bece73ba75aced5e0f8b52ba7a9773f5134cbffd"
 dependencies = [
  "hashbrown 0.17.1",
  "libm",
@@ -3527,8 +3527,8 @@ dependencies = [
 
 [[package]]
 name = "wasmtime-internal-jit-icache-coherence"
-version = "51.0.0-dev"
-source = "git+https://github.com/microlift/wasmtime?branch=microlift_experimental#9240a7cd1dc8ee60898794339e71f56301ec2baf"
+version = "52.0.0-dev"
+source = "git+https://github.com/microlift/wasmtime?branch=microlift_experimental#bece73ba75aced5e0f8b52ba7a9773f5134cbffd"
 dependencies = [
  "libc",
  "wasmtime-internal-core",
