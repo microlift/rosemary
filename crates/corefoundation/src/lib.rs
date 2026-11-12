@@ -13,6 +13,7 @@ pub mod boxed;
 pub mod calendar;
 pub mod callbacks;
 pub mod collections;
+pub mod decl;
 mod diskarbitration;
 pub mod eightbit;
 /// Only on Darwin: nowhere else is there another CoreFoundation to meet.

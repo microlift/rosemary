@@ -16,7 +16,7 @@ mod mutability {
 }
 
 /// `CFPropertyListFormat`, as `*format` reports it.
-mod format {
+pub(crate) mod format {
     pub const XML_V1_0: i64 = 100;
     pub const BINARY_V1_0: i64 = 200;
 }
