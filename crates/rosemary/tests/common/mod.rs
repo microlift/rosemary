@@ -736,6 +736,12 @@ int main(void) {
        standing in for its format - including `%@`, which is a message. */
     printf("format %s\n",
            [[NSString stringWithFormat:@"%d/%@/%.2f/%%", 42, @"x", 1.5] UTF8String]);
+    /* Nil-terminated lists, which need not exist as methods on the host. */
+    NSArray *list = [NSArray arrayWithObjects:@"a", @"b", @"c", nil];
+    printf("list %lu %s\n", (unsigned long)[list count], [[list objectAtIndex:2] UTF8String]);
+    NSDictionary *pairs =
+        [NSDictionary dictionaryWithObjectsAndKeys:@"one", @"1", @"two", @"2", nil];
+    printf("pairs %lu %s\n", (unsigned long)[pairs count], [[pairs objectForKey:@"2"] UTF8String]);
     @synchronized (d) { printf("synchronized\n"); }
     @autoreleasepool { printf("pool\n"); }
     return 0;

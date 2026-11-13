@@ -1109,7 +1109,7 @@ fn send(
             class_of(host_receiver),
             match plan.to {
                 Target::Guest(_) => "guest",
-                Target::Host { .. } => "host",
+                Target::Host { .. } | Target::CountedList(_) => "host",
             },
             arg_reg(ctx, base + 2),
             arg_reg(ctx, base + 3),
@@ -1125,6 +1125,20 @@ fn send(
         Target::Guest(guest_imp) => {
             set_arg_reg(ctx, base, receiver);
             return transfer(symbol, ctx, mem, *guest_imp);
+        }
+        Target::CountedList(list) => {
+            return send_object_list(
+                vm,
+                symbol,
+                list,
+                None,
+                send,
+                class,
+                host_receiver,
+                base,
+                ctx,
+                mem,
+            );
         }
         Target::Host {
             imp,
@@ -1147,7 +1161,7 @@ fn send(
                 vm,
                 symbol,
                 list,
-                signature,
+                Some(signature),
                 send,
                 class,
                 host_receiver,
@@ -1231,6 +1245,10 @@ enum Target {
     /// different guest function, and a new thunk is a fresh address in the arena rather
     /// than one already installed as an `IMP`.
     Guest(u64),
+    /// A nil-terminated list the class has no variadic method for, sent as its
+    /// counted twin: a runtime whose Foundation cannot define a C-variadic
+    /// method still has the counted one.
+    CountedList(&'static ObjectList),
     /// A host `IMP`, and everything the marshaller needs in front of it.
     Host {
         imp: u64,
@@ -1287,12 +1305,30 @@ fn plan_for(symbol: &str, vm: &Vm, class: host::Class, sel: u64) -> Result<&'sta
     // when the receiver is a class, so this answers for both.
     //
     let method = unsafe { host::class_getInstanceMethod(class, sel as host::Sel) };
-    if method.is_null() {
-        return Err(unrecognised(symbol, class, sel));
-    }
-    // SAFETY: `method` is a `Method` the runtime just returned for `class`.
+    let to = match method.is_null() {
+        true => match object_list(sel) {
+            Some(list) => Target::CountedList(list),
+            None => return Err(unrecognised(symbol, class, sel)),
+        },
+        false => plan_method(symbol, vm, sel, method)?,
+    };
+    let plan = Plan { probe, to };
+    // Leaked rather than reference-counted: a plan is read on every send and
+    // there is one per method a program actually messages, plus one more each
+    // time a method is swizzled underneath it.
+    let plan: &'static Plan = Box::leak(Box::new(plan));
+    plans()
+        .write()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(key, plan);
+    Ok(plan)
+}
+
+/// Where a method the class does define sends the message.
+fn plan_method(symbol: &str, vm: &Vm, sel: u64, method: host::Method) -> Result<Target> {
+    // SAFETY: `method` is a `Method` the runtime just returned for the class.
     let imp = unsafe { host::method_getImplementation(method) } as u64;
-    let to = match vm.guest_behind_thunk(imp) {
+    Ok(match vm.guest_behind_thunk(imp) {
         Some(guest_imp) => Target::Guest(guest_imp),
         None => {
             let signature = signature_of(symbol, method)?;
@@ -1311,17 +1347,7 @@ fn plan_for(symbol: &str, vm: &Vm, class: host::Class, sel: u64) -> Result<&'sta
                 signature,
             }
         }
-    };
-    let plan = Plan { probe, to };
-    // Leaked rather than reference-counted: a plan is read on every send and
-    // there is one per method a program actually messages, plus one more each
-    // time a method is swizzled underneath it.
-    let plan: &'static Plan = Box::leak(Box::new(plan));
-    plans()
-        .write()
-        .unwrap_or_else(|e| e.into_inner())
-        .insert(key, plan);
-    Ok(plan)
+    })
 }
 
 /// Whether `ROSEMARY_TRACE_MSG` asked for this selector, and its name.
@@ -1543,7 +1569,7 @@ fn send_object_list(
     vm: &Vm,
     symbol: &str,
     list: &ObjectList,
-    signature: &Signature,
+    signature: Option<&Signature>,
     send: Send,
     class: host::Class,
     host_receiver: u64,
@@ -1562,14 +1588,17 @@ fn send_object_list(
         return refuse("sent through the struct-return trampoline, which returns an object".into());
     }
     // `self`, `_cmd`, `firstObject`, each integer-class - which is what makes
-    // the register the list starts in computable at all.
-    let params = &signature.shapes[1..];
-    if params.len() != 3 || !params.iter().all(|s| s.scalar() == Some(T::Pointer)) {
-        return refuse(format!(
-            "expected a receiver, a selector and one named object, and the method's \
-             encoding describes {} named parameter(s)",
-            params.len().saturating_sub(2)
-        ));
+    // the register the list starts in computable at all. With no method to
+    // describe it, the shape is Foundation's declaration of the selector.
+    if let Some(signature) = signature {
+        let params = &signature.shapes[1..];
+        if params.len() != 3 || !params.iter().all(|s| s.scalar() == Some(T::Pointer)) {
+            return refuse(format!(
+                "expected a receiver, a selector and one named object, and the method's \
+                 encoding describes {} named parameter(s)",
+                params.len().saturating_sub(2)
+            ));
+        }
     }
 
     // Walk it. `firstObject` is at the last named register; the ellipsis
