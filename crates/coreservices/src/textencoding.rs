@@ -13,7 +13,11 @@ use corefoundation::string::encoding;
 type OSStatus = i32;
 
 const NO_ERR: OSStatus = 0;
-/// `paramErr`.
+const UNSUPPORTED_ENCODING: OSStatus = -8738;
+const MALFORMED_INPUT: OSStatus = -8739;
+const NO_CONVERSION_PATH: OSStatus = -8749;
+const PARTIAL_CHAR: OSStatus = -8753;
+const UNMAPPABLE: OSStatus = -8754;
 const PARAM_ERR: OSStatus = -50;
 /// `kTECOutputBufferFullStatus`: there was more to convert than `outputBuffer`
 /// could hold, and what fits has been written.
@@ -29,7 +33,7 @@ pub unsafe extern "C" fn CreateTextEncoding(base: u32, variant: u32, format: u32
 }
 
 fn create_text_encoding(base: u32, variant: u32, format: u32) -> u32 {
-    (base & 0xffff) | ((variant & 0xff) << 16) | ((format & 0x3f) << 26)
+    (base & 0xffff) | ((variant & 0x3ff) << 16) | ((format & 0x3f) << 26)
 }
 
 /// `Fixed Long2Fix(long)`.
@@ -62,7 +66,7 @@ pub unsafe extern "C" fn Long2Fix(the_long: i32) -> i32 {
 /// `text_encoding` is null or writable for a `TextEncoding`.
 pub unsafe extern "C" fn UpgradeScriptInfoToTextEncoding(
     script_code: i16,
-    _lang_code: i16,
+    lang_code: i16,
     _region_code: i16,
     _script_name: *const u8,
     text_encoding: *mut u32,
@@ -70,12 +74,16 @@ pub unsafe extern "C" fn UpgradeScriptInfoToTextEncoding(
     if text_encoding.is_null() {
         return PARAM_ERR;
     }
-    let Ok(base) = u16::try_from(script_code) else {
-        return PARAM_ERR;
+    let base: u16 = match script_code {
+        -1 | -2 => 0, // system and current script on this English US system
+        -128 => match lang_code {
+            11 => 1, // langJapanese
+            -128 | 0 => 0,
+            _ => return UNSUPPORTED_ENCODING,
+        },
+        0..=32 => script_code as u16,
+        _ => return PARAM_ERR,
     };
-    if base > 32 {
-        return PARAM_ERR;
-    }
     // SAFETY: checked non-null above.
     unsafe { *text_encoding = create_text_encoding(u32::from(base), 0, 0) };
     NO_ERR
@@ -125,7 +133,7 @@ pub unsafe extern "C" fn TECGetTextEncodingFromInternetName(
         return PARAM_ERR;
     };
     let Some(found) = corefoundation::api::encoding_for_charset_name(&name) else {
-        return PARAM_ERR;
+        return UNSUPPORTED_ENCODING;
     };
     // SAFETY: checked non-null above.
     unsafe { *text_encoding = found };
@@ -133,13 +141,24 @@ pub unsafe extern "C" fn TECGetTextEncodingFromInternetName(
 }
 
 /// A live `TECObjectRef`: the two encodings a conversion moves between.
-///
-/// Stateless on purpose - nothing this tree converts needs a shift-state
-/// carried across calls - so [`TECClearConverterContextInfo`] has nothing to
-/// clear and every call to [`TECConvertText`] starts fresh.
 struct Converter {
     input: u32,
     output: u32,
+    // Once a BOM has selected the order, continuation buffers retain it.
+    order: std::sync::Mutex<Option<u32>>,
+}
+
+fn supported(code: u32) -> Option<u32> {
+    let code = if code & 0xff00 == 0x0100 {
+        (code & 0xfc00_0000) | 0x0100
+    } else {
+        code
+    };
+    (code == encoding::UTF8
+        || corefoundation::eightbit::is_table(code)
+        || corefoundation::string::is_utf16(code)
+        || corefoundation::string::is_utf32(code))
+    .then_some(code)
 }
 
 /// `OSStatus TECCreateConverter(TECObjectRef *tec, TextEncoding
@@ -156,9 +175,16 @@ pub unsafe extern "C" fn TECCreateConverter(
     if tec.is_null() {
         return PARAM_ERR;
     }
+    unsafe { *tec = std::ptr::null_mut() };
+    let (Some(input_encoding), Some(output_encoding)) =
+        (supported(input_encoding), supported(output_encoding))
+    else {
+        return NO_CONVERSION_PATH;
+    };
     let converter = Box::into_raw(Box::new(Converter {
         input: input_encoding,
         output: output_encoding,
+        order: Default::default(),
     }));
     // SAFETY: checked non-null above.
     unsafe { *tec = converter.cast() };
@@ -182,113 +208,110 @@ pub unsafe extern "C" fn TECDisposeConverter(tec: *mut c_void) -> OSStatus {
 
 /// `OSStatus TECClearConverterContextInfo(TECObjectRef tec)`
 ///
-/// There is no shift state here to clear - see [`Converter`] - so this only
-/// validates that `tec` is one.
+/// Start the next stream with its original encoding and BOM detection.
 ///
 /// # Safety
 ///
 /// `tec` is null or live.
 pub unsafe extern "C" fn TECClearConverterContextInfo(tec: *mut c_void) -> OSStatus {
-    match tec.is_null() {
-        true => PARAM_ERR,
-        false => NO_ERR,
+    if tec.is_null() {
+        return PARAM_ERR;
     }
+    *unsafe { &*tec.cast::<Converter>() }.order.lock().unwrap() = None;
+    NO_ERR
 }
 
-/// The character at the start of `bytes` under `code`, and how many bytes of
-/// `bytes` it took - or `None` for an empty, truncated or malformed lead.
-///
-/// UTF-8 is checked before the generic eight-bit case below even though
-/// `eightbit::is_table` also answers true for it: that table is one byte per
-/// character, which is only UTF-8's answer for the half of it that is ASCII.
-fn decode_one(bytes: &[u8], code: u32) -> Option<(char, usize)> {
+fn decode_one(bytes: &[u8], code: u32) -> Result<(char, usize), OSStatus> {
     if code == encoding::UTF8 {
-        return (1..=bytes.len().min(4)).find_map(|n| {
-            std::str::from_utf8(&bytes[..n])
-                .ok()
-                .and_then(|s| s.chars().next())
-                .map(|c| (c, n))
-        });
-    }
-    if corefoundation::eightbit::is_table(code) {
-        let byte = *bytes.first()?;
-        let unit = corefoundation::eightbit::decode(byte, code)?;
-        return char::from_u32(u32::from(unit)).map(|c| (c, 1));
-    }
-    match code {
-        encoding::UTF16 | encoding::UTF16_BE | encoding::UTF16_LE => {
-            let read = |at: &[u8]| -> Option<u16> {
-                let pair = <[u8; 2]>::try_from(at.get(..2)?).ok()?;
-                Some(match code == encoding::UTF16_BE {
-                    true => u16::from_be_bytes(pair),
-                    // Order-unspecified `UTF16` is taken as host order, as a
-                    // stream with no byte-order mark is.
-                    false => u16::from_le_bytes(pair),
-                })
-            };
-            let high = read(bytes)?;
-            if !(0xd800..=0xdbff).contains(&high) {
-                return char::from_u32(u32::from(high)).map(|c| (c, 2));
+        let width = match bytes[0] {
+            0..=0x7f => 1,
+            0xc2..=0xdf => 2,
+            0xe0..=0xef => 3,
+            0xf0..=0xf4 => 4,
+            _ => return Err(MALFORMED_INPUT),
+        };
+        let text = std::str::from_utf8(&bytes[..bytes.len().min(width)]).map_err(|e| {
+            if e.error_len().is_none() {
+                PARTIAL_CHAR
+            } else {
+                MALFORMED_INPUT
             }
-            let low = read(bytes.get(2..)?)?;
-            if !(0xdc00..=0xdfff).contains(&low) {
-                return None;
-            }
-            let scalar = 0x1_0000 + ((u32::from(high) - 0xd800) << 10) + (u32::from(low) - 0xdc00);
-            char::from_u32(scalar).map(|c| (c, 4))
-        }
-        encoding::UTF32 | encoding::UTF32_BE | encoding::UTF32_LE => {
-            let quad = <[u8; 4]>::try_from(bytes.get(..4)?).ok()?;
-            let scalar = match code == encoding::UTF32_BE {
-                true => u32::from_be_bytes(quad),
-                false => u32::from_le_bytes(quad),
-            };
-            char::from_u32(scalar).map(|c| (c, 4))
-        }
-        _ => None,
+        })?;
+        return Ok((text.chars().next().unwrap(), width));
     }
+    if corefoundation::string::is_utf16(code) {
+        let read = |at: usize| -> Result<u16, OSStatus> {
+            let pair: [u8; 2] = bytes
+                .get(at..at + 2)
+                .ok_or(PARTIAL_CHAR)?
+                .try_into()
+                .unwrap();
+            Ok(if code == encoding::UTF16_BE {
+                u16::from_be_bytes(pair)
+            } else {
+                u16::from_le_bytes(pair)
+            })
+        };
+        let high = read(0)?;
+        if (0xd800..=0xdbff).contains(&high) {
+            let low = read(2)?;
+            let ch = char::decode_utf16([high, low])
+                .next()
+                .unwrap()
+                .map_err(|_| MALFORMED_INPUT)?;
+            return Ok((ch, 4));
+        }
+        return char::from_u32(high.into())
+            .map(|ch| (ch, 2))
+            .ok_or(MALFORMED_INPUT);
+    }
+    if corefoundation::string::is_utf32(code) {
+        let quad = bytes.get(..4).ok_or(PARTIAL_CHAR)?.try_into().unwrap();
+        let value = if code == encoding::UTF32_BE {
+            u32::from_be_bytes(quad)
+        } else {
+            u32::from_le_bytes(quad)
+        };
+        return char::from_u32(value)
+            .map(|ch| (ch, 4))
+            .ok_or(MALFORMED_INPUT);
+    }
+    corefoundation::eightbit::decode(bytes[0], code)
+        .and_then(|u| char::from_u32(u.into()))
+        .map(|ch| (ch, 1))
+        .ok_or(MALFORMED_INPUT)
 }
 
 /// `ch` as bytes under `code`.
-///
-/// FIXME (ACCURACY): a character `code` has no byte for - any non-Latin
-/// character in an eight-bit encoding - is substituted with `?` rather than
-/// failing the conversion with `kTECUnmappableElementErr`, which is what Apple
-/// does unless the caller opted into fallback substitution. Substituting keeps
-/// every call making progress; a caller that needs to know a character was
-/// lost is the one case this approximates.
-fn encode_one(ch: char, code: u32) -> Vec<u8> {
-    // UTF-8 before the generic eight-bit case, for the reason `decode_one`
-    // checks it first.
+fn encode_one(ch: char, code: u32) -> Result<Vec<u8>, OSStatus> {
     if code == encoding::UTF8 {
-        return ch.to_string().into_bytes();
+        return Ok(ch.to_string().into_bytes());
     }
     if corefoundation::eightbit::is_table(code) {
         let unit = u16::try_from(ch as u32).ok();
         let byte = unit.and_then(|u| corefoundation::eightbit::encode(u, code));
-        return vec![byte.unwrap_or(b'?')];
+        return byte.map(|b| vec![b]).ok_or(UNMAPPABLE);
     }
     match code {
         encoding::UTF16 | encoding::UTF16_BE | encoding::UTF16_LE => {
             let mut units = [0_u16; 2];
-            ch.encode_utf16(&mut units)
+            Ok(ch
+                .encode_utf16(&mut units)
                 .iter()
                 .flat_map(|unit| match code == encoding::UTF16_BE {
                     true => unit.to_be_bytes(),
                     false => unit.to_le_bytes(),
                 })
-                .collect()
+                .collect())
         }
         encoding::UTF32 | encoding::UTF32_BE | encoding::UTF32_LE => {
             let scalar = ch as u32;
-            match code == encoding::UTF32_BE {
+            Ok(match code == encoding::UTF32_BE {
                 true => scalar.to_be_bytes().to_vec(),
                 false => scalar.to_le_bytes().to_vec(),
-            }
+            })
         }
-        // Anything this tree does not otherwise recognize converts as UTF-8,
-        // which is at least never a lossier answer than refusing outright.
-        _ => ch.to_string().into_bytes(),
+        _ => Err(NO_CONVERSION_PATH),
     }
 }
 
@@ -305,22 +328,35 @@ fn encode_one(ch: char, code: u32) -> Vec<u8> {
 /// `output_buffer` is null or writable for `output_buffer_length` bytes.
 unsafe fn convert_core(
     input: &[u8],
-    input_code: u32,
-    output_code: u32,
+    converter: &Converter,
     output_buffer: *mut u8,
     output_buffer_length: usize,
 ) -> (OSStatus, usize, usize) {
     let mut status = NO_ERR;
-    let mut consumed = 0_usize;
+    let mut order = converter.order.lock().unwrap();
+    let (input_code, mut consumed) = match *order {
+        Some(code) => (code, 0),
+        None => corefoundation::string::stream_encoding(input, converter.input),
+    };
+    let min_width = match converter.input {
+        encoding::UTF16 => 2,
+        encoding::UTF32 => 4,
+        _ => 1,
+    };
+    if input.len() >= min_width {
+        *order = Some(input_code);
+    }
+    let (output_code, _) = corefoundation::string::stream_encoding(&[], converter.output);
     let mut produced = 0_usize;
     while consumed < input.len() {
-        let Some((ch, used)) = decode_one(&input[consumed..], input_code) else {
-            // A lead byte or unit this encoding does not have: nothing further
-            // in the buffer can be trusted either, so the conversion stops
-            // here rather than skip or guess at a resync point.
-            break;
+        let (ch, used) = match decode_one(&input[consumed..], input_code) {
+            Ok(pair) => pair,
+            Err(err) => return (err, consumed, produced),
         };
-        let bytes = encode_one(ch, output_code);
+        let bytes = match encode_one(ch, output_code) {
+            Ok(bytes) => bytes,
+            Err(err) => return (err, consumed, produced),
+        };
         if produced + bytes.len() > output_buffer_length {
             status = OUTPUT_BUFFER_FULL;
             break;
@@ -379,8 +415,7 @@ pub unsafe extern "C" fn TECConvertText(
     let (status, consumed, produced) = unsafe {
         convert_core(
             input,
-            converter.input,
-            converter.output,
+            converter,
             output_buffer,
             output_buffer_length as usize,
         )
@@ -453,11 +488,11 @@ const SM_SYS_SCRIPT: i16 = 18;
 /// `smRegionCode`: the current region code.
 const SM_REGION_CODE: i16 = 40;
 /// `smRoman`, the value both a script code and `smSysScript`'s answer share.
-const SM_ROMAN: i32 = 0;
+const SM_ROMAN: i64 = 0;
 /// `verUS`, the region code an English US system answers.
-const VER_US: i32 = 0;
+const VER_US: i64 = 0;
 /// `smBadVerb`: a selector this tree does not answer.
-const SM_BAD_VERB: i32 = -1;
+const SM_BAD_VERB: i64 = -1;
 
 /// `long GetScriptManagerVariable(short selector)`.
 ///
@@ -466,25 +501,12 @@ const SM_BAD_VERB: i32 = -1;
 /// every other selector is Script Manager bookkeeping this tree never had, so
 /// [`SM_BAD_VERB`] says the verb is not one of these two rather than guessing
 /// at a classic global that was never allocated.
-pub unsafe extern "C" fn GetScriptManagerVariable(selector: i16) -> i32 {
+pub unsafe extern "C" fn GetScriptManagerVariable(selector: i16) -> i64 {
     match selector {
         SM_SYS_SCRIPT => SM_ROMAN,
         SM_REGION_CODE => VER_US,
         _ => SM_BAD_VERB,
     }
-}
-
-/// A live `TextToUnicodeInfo`/`UnicodeToTextInfo`: the one non-Unicode
-/// encoding a conversion moves to or from. The Unicode side is always treated
-/// as plain `UniChar` (host-order UTF-16), which is what every caller of these
-/// high-level calls hands in or expects back regardless of the `unicodeEncoding`
-/// field a `UnicodeMapping` also carries.
-///
-/// FIXME (ACCURACY): a `unicodeEncoding` naming a byte-order or format variant
-/// other than native UTF-16 is not honored - nothing in this tree's own text
-/// ever needs one.
-struct LegacyInfo {
-    other: u32,
 }
 
 /// `UnicodeMapping { TextEncoding unicodeEncoding; TextEncoding otherEncoding;
@@ -497,22 +519,41 @@ pub struct UnicodeMapping {
 }
 
 /// The body of [`CreateTextToUnicodeInfo`] and [`CreateUnicodeToTextInfo`]:
-/// identical, since both opaque types hold the same one field.
+/// The Unicode buffer consists of native-order UniChar values.
 ///
 /// # Safety
 ///
 /// `mapping` is null or readable for a `UnicodeMapping`; `out` is null or
 /// writable for a pointer.
-unsafe fn create_legacy_info(mapping: *const UnicodeMapping, out: *mut *mut c_void) -> OSStatus {
+unsafe fn create_legacy_info(
+    mapping: *const UnicodeMapping,
+    out: *mut *mut c_void,
+    to_unicode: bool,
+) -> OSStatus {
     if mapping.is_null() || out.is_null() {
         return PARAM_ERR;
     }
     // SAFETY: the caller's contract.
-    let other = unsafe { (*mapping).other_encoding };
-    let info = Box::into_raw(Box::new(LegacyInfo { other }));
-    // SAFETY: checked non-null above.
-    unsafe { *out = info.cast() };
-    NO_ERR
+    let mapping = unsafe { &*mapping };
+    let other = mapping.other_encoding;
+    let native = if cfg!(target_endian = "little") {
+        encoding::UTF16_LE
+    } else {
+        encoding::UTF16_BE
+    };
+    match supported(mapping.unicode_encoding) {
+        Some(code) if code == encoding::UTF16 || code == native => (),
+        _ => {
+            unsafe { *out = std::ptr::null_mut() };
+            return NO_CONVERSION_PATH;
+        }
+    }
+    let (input, output) = if to_unicode {
+        (other, native)
+    } else {
+        (native, other)
+    };
+    unsafe { TECCreateConverter(out, input, output) }
 }
 
 /// `OSStatus CreateTextToUnicodeInfo(ConstUnicodeMappingPtr iUnicodeMapping,
@@ -525,7 +566,7 @@ pub unsafe extern "C" fn CreateTextToUnicodeInfo(
     mapping: *const UnicodeMapping,
     out: *mut *mut c_void,
 ) -> OSStatus {
-    unsafe { create_legacy_info(mapping, out) }
+    unsafe { create_legacy_info(mapping, out, true) }
 }
 
 /// `OSStatus CreateUnicodeToTextInfo(ConstUnicodeMappingPtr iUnicodeMapping,
@@ -538,7 +579,7 @@ pub unsafe extern "C" fn CreateUnicodeToTextInfo(
     mapping: *const UnicodeMapping,
     out: *mut *mut c_void,
 ) -> OSStatus {
-    unsafe { create_legacy_info(mapping, out) }
+    unsafe { create_legacy_info(mapping, out, false) }
 }
 
 /// The body of [`DisposeTextToUnicodeInfo`] and [`DisposeUnicodeToTextInfo`]:
@@ -548,7 +589,7 @@ pub unsafe extern "C" fn CreateUnicodeToTextInfo(
 ///
 /// # Safety
 ///
-/// `info` is null or a writable pointer to a live [`LegacyInfo`] this module
+/// `info` is null or a writable pointer to a live [`Converter`] this module
 /// made, not yet disposed.
 unsafe fn dispose_legacy_info(info: *mut *mut c_void) -> OSStatus {
     if info.is_null() {
@@ -557,8 +598,8 @@ unsafe fn dispose_legacy_info(info: *mut *mut c_void) -> OSStatus {
     // SAFETY: the caller's contract.
     let ptr = unsafe { *info };
     if !ptr.is_null() {
-        // SAFETY: a `LegacyInfo` this module boxed, not yet freed.
-        drop(unsafe { Box::from_raw(ptr.cast::<LegacyInfo>()) });
+        // SAFETY: a `Converter` this module boxed, not yet freed.
+        drop(unsafe { Box::from_raw(ptr.cast::<Converter>()) });
     }
     // SAFETY: checked non-null above.
     unsafe { *info = std::ptr::null_mut() };
@@ -618,8 +659,8 @@ pub unsafe extern "C" fn ConvertFromTextToUnicode(
     if info.is_null() {
         return PARAM_ERR;
     }
-    // SAFETY: a `LegacyInfo` this module made.
-    let other = unsafe { (*info.cast::<LegacyInfo>()).other };
+    // SAFETY: a `Converter` this module made.
+    let converter = unsafe { &*info.cast::<Converter>() };
     let input = match source.is_null() {
         true => &[][..],
         // SAFETY: the caller's contract.
@@ -629,8 +670,7 @@ pub unsafe extern "C" fn ConvertFromTextToUnicode(
     let (status, consumed, produced) = unsafe {
         convert_core(
             input,
-            other,
-            encoding::UTF16,
+            converter,
             unicode_str.cast(),
             output_buf_len as usize,
         )
@@ -682,8 +722,8 @@ pub unsafe extern "C" fn ConvertFromUnicodeToText(
     if info.is_null() {
         return PARAM_ERR;
     }
-    // SAFETY: a `LegacyInfo` this module made.
-    let other = unsafe { (*info.cast::<LegacyInfo>()).other };
+    // SAFETY: a `Converter` this module made.
+    let converter = unsafe { &*info.cast::<Converter>() };
     let input = match unicode_str.is_null() {
         true => &[][..],
         // SAFETY: the caller's contract; read as bytes, since `unicode_len` is
@@ -693,15 +733,8 @@ pub unsafe extern "C" fn ConvertFromUnicodeToText(
         },
     };
     // SAFETY: the caller's contract on `output_str`/`output_buf_len`.
-    let (status, consumed, produced) = unsafe {
-        convert_core(
-            input,
-            encoding::UTF16,
-            other,
-            output_str,
-            output_buf_len as usize,
-        )
-    };
+    let (status, consumed, produced) =
+        unsafe { convert_core(input, converter, output_str, output_buf_len as usize) };
     if !out_offset_count.is_null() {
         // SAFETY: the caller's contract.
         unsafe { *out_offset_count = 0 };
@@ -744,6 +777,127 @@ mod tests {
 
     /// The three pieces land where the bits of every encoding this tree
     /// already answers put them - see `corefoundation::string::encoding`.
+    #[test]
+    fn unsupported_paths_are_rejected_in_both_directions() {
+        for (input, output) in [(1, encoding::UTF8), (encoding::UTF16, 0x0a01)] {
+            let mut handle = std::ptr::null_mut();
+            assert_eq!(
+                unsafe { TECCreateConverter(&mut handle, input, output) },
+                NO_CONVERSION_PATH
+            );
+            assert!(handle.is_null());
+        }
+        let mapping = UnicodeMapping {
+            unicode_encoding: encoding::UTF16,
+            other_encoding: 1,
+            mapping_version: -1,
+        };
+        let mut handle = std::ptr::null_mut();
+        assert_eq!(
+            unsafe { CreateUnicodeToTextInfo(&mapping, &mut handle) },
+            NO_CONVERSION_PATH
+        );
+        assert_eq!(
+            unsafe { CreateTextToUnicodeInfo(&mapping, &mut handle) },
+            NO_CONVERSION_PATH
+        );
+    }
+
+    #[test]
+    fn malformed_and_partial_input_leave_exact_retry_offsets() {
+        let mut tec = std::ptr::null_mut();
+        let versioned = create_text_encoding(0x0106, 0x300, 2);
+        assert_eq!(versioned, 0x0b00_0106);
+        unsafe {
+            assert_eq!(
+                TECCreateConverter(&mut tec, versioned, encoding::UTF8),
+                NO_ERR
+            );
+            for (input, status) in [
+                (&b"A\xe2\x82"[..], PARTIAL_CHAR),
+                (&b"A\xe2X"[..], MALFORMED_INPUT),
+            ] {
+                let mut output = [0; 8];
+                let (mut read, mut written) = (0, 0);
+                assert_eq!(
+                    TECConvertText(
+                        tec,
+                        input.as_ptr(),
+                        input.len() as u64,
+                        &mut read,
+                        output.as_mut_ptr(),
+                        8,
+                        &mut written
+                    ),
+                    status
+                );
+                assert_eq!((read, written, output[0]), (1, 1, b'A'));
+            }
+            TECDisposeConverter(tec);
+        }
+    }
+
+    #[test]
+    fn bom_selects_order_across_buffers_and_clear_starts_a_new_stream() {
+        for (code, width) in [(encoding::UTF16, 2), (encoding::UTF32, 4)] {
+            let mut tec = std::ptr::null_mut();
+            unsafe {
+                assert_eq!(TECCreateConverter(&mut tec, code, encoding::UTF8), NO_ERR);
+                let mut output = [0; 8];
+                let (mut read, mut written) = (0, 0);
+                let mut feed = |bytes: &[u8]| {
+                    let status = TECConvertText(
+                        tec,
+                        bytes.as_ptr(),
+                        bytes.len() as u64,
+                        &mut read,
+                        output.as_mut_ptr(),
+                        8,
+                        &mut written,
+                    );
+                    (status, read, output[..written as usize].to_vec())
+                };
+                let mark = &0xfeffu32.to_be_bytes()[4 - width..];
+                assert_eq!(feed(&mark[..1]), (PARTIAL_CHAR, 0, vec![]));
+                assert_eq!(feed(mark), (NO_ERR, width as u64, vec![]));
+                assert_eq!(
+                    feed(&65u32.to_be_bytes()[4 - width..]),
+                    (NO_ERR, width as u64, vec![65])
+                );
+                TECClearConverterContextInfo(tec);
+                assert_eq!(
+                    feed(&0xfeffu32.to_le_bytes()[..width]),
+                    (NO_ERR, width as u64, vec![])
+                );
+                assert_eq!(
+                    feed(&66u32.to_le_bytes()[..width]),
+                    (NO_ERR, width as u64, vec![66])
+                );
+                TECDisposeConverter(tec);
+            }
+        }
+    }
+
+    #[test]
+    fn script_sentinels_select_the_system_or_language_script() {
+        for (script, language, expected) in [(-1, -128, 0), (-2, -128, 0), (-128, 11, 1)] {
+            let mut code = u32::MAX;
+            assert_eq!(
+                unsafe {
+                    UpgradeScriptInfoToTextEncoding(
+                        script,
+                        language,
+                        -128,
+                        std::ptr::null(),
+                        &mut code,
+                    )
+                },
+                NO_ERR
+            );
+            assert_eq!(code, expected);
+        }
+    }
+
     #[test]
     fn create_text_encoding_matches_the_known_constants() {
         assert_eq!(create_text_encoding(0, 0, 0), encoding::MAC_ROMAN);
@@ -833,7 +987,7 @@ mod tests {
         let mut out = 0_u32;
         // SAFETY: as above.
         let status = unsafe { TECGetTextEncodingFromInternetName(&mut out, name.as_ptr()) };
-        assert_eq!(status, PARAM_ERR);
+        assert_eq!(status, UNSUPPORTED_ENCODING);
     }
 
     /// ASCII text round-trips unchanged between any two of this tree's

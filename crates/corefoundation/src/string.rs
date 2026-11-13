@@ -66,51 +66,49 @@ fn is_eight_bit(encoding: u32) -> bool {
     )
 }
 
-fn is_utf16(encoding: u32) -> bool {
+pub fn is_utf16(encoding: u32) -> bool {
     matches!(
         encoding,
         encoding::UTF16 | encoding::UTF16_BE | encoding::UTF16_LE
     )
 }
 
-fn is_utf32(encoding: u32) -> bool {
+pub fn is_utf32(encoding: u32) -> bool {
     matches!(
         encoding,
         encoding::UTF32 | encoding::UTF32_BE | encoding::UTF32_LE
     )
 }
 
-/// Split `bytes` into `N`-byte units in `encoding`'s order. The order-less
-/// encodings honour a leading byte-order mark and drop it, and are host order
-/// without one; an explicit order keeps a leading U+FEFF as a character.
-fn units<const N: usize>(bytes: &[u8], encoding: u32, big: u32, little: u32) -> Vec<[u8; N]> {
-    let mut chunks = bytes
-        .chunks_exact(N)
-        .map(|c| <[u8; N]>::try_from(c).unwrap());
-    let mut big_endian = encoding == big;
-    let mut first = None;
-    if encoding != big && encoding != little {
-        big_endian = cfg!(target_endian = "big");
-        if let Some(head) = chunks.next() {
-            let mut mark = [0u8; N];
-            mark[N - 2] = 0xFE;
-            mark[N - 1] = 0xFF;
-            let mut reversed = mark;
-            reversed.reverse();
-            if head == mark {
-                big_endian = true;
-            } else if head == reversed {
-                big_endian = false;
-            } else {
-                first = Some(head);
-            }
-        }
+/// Resolve a stream's byte order and the number of BOM bytes consumed.
+pub fn stream_encoding(bytes: &[u8], code: u32) -> (u32, usize) {
+    use encoding::*;
+    match code {
+        UTF16 => match bytes {
+            [0xfe, 0xff, ..] => (UTF16_BE, 2),
+            [0xff, 0xfe, ..] => (UTF16_LE, 2),
+            _ if cfg!(target_endian = "big") => (UTF16_BE, 0),
+            _ => (UTF16_LE, 0),
+        },
+        UTF32 => match bytes {
+            [0, 0, 0xfe, 0xff, ..] => (UTF32_BE, 4),
+            [0xff, 0xfe, 0, 0, ..] => (UTF32_LE, 4),
+            _ if cfg!(target_endian = "big") => (UTF32_BE, 0),
+            _ => (UTF32_LE, 0),
+        },
+        _ => (code, 0),
     }
-    first
-        .into_iter()
-        .chain(chunks)
+}
+
+fn units<const N: usize>(bytes: &[u8], encoding: u32, big: u32) -> Vec<[u8; N]> {
+    let (order, skip) = stream_encoding(bytes, encoding);
+    bytes[skip..]
+        .as_chunks::<N>()
+        .0
+        .iter()
+        .copied()
         .map(|mut unit| {
-            if big_endian == cfg!(target_endian = "little") {
+            if (order == big) == cfg!(target_endian = "little") {
                 unit.reverse();
             }
             unit
@@ -639,7 +637,7 @@ pub fn from_encoded(bytes: &[u8], encoding: u32) -> CFTypeRef {
         };
     }
     if is_utf16(encoding) {
-        let units: Vec<u16> = units::<2>(bytes, encoding, encoding::UTF16_BE, encoding::UTF16_LE)
+        let units: Vec<u16> = units::<2>(bytes, encoding, encoding::UTF16_BE)
             .into_iter()
             .map(u16::from_ne_bytes)
             .collect();
@@ -647,7 +645,7 @@ pub fn from_encoded(bytes: &[u8], encoding: u32) -> CFTypeRef {
     }
     if is_utf32(encoding) {
         let mut wide = Vec::with_capacity(bytes.len() / 4);
-        for unit in units::<4>(bytes, encoding, encoding::UTF32_BE, encoding::UTF32_LE) {
+        for unit in units::<4>(bytes, encoding, encoding::UTF32_BE) {
             let Some(ch) = char::from_u32(u32::from_ne_bytes(unit)) else {
                 return std::ptr::null();
             };

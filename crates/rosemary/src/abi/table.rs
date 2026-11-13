@@ -1476,7 +1476,7 @@ pub static SIGNATURES: &[FunctionAbi] = &[
     sig!("GetTextEncodingBase", U32, U32),
     sig!("CharacterByteType", I16, P, I16, I16),
     sig!("NumToString", V, I64, P),
-    sig!("GetScriptManagerVariable", I32, I16),
+    sig!("GetScriptManagerVariable", I64, I16),
     sig!("CreateTextToUnicodeInfo", I32, P, P),
     sig!("CreateUnicodeToTextInfo", I32, P, P),
     sig!("DisposeTextToUnicodeInfo", I32, P),
