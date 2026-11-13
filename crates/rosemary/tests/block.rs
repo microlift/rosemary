@@ -29,6 +29,23 @@ fn a_guest_copies_a_block_and_it_still_works() {
     assert!(out.contains("global ran\n"), "stdout: {out}\nstderr: {err}");
 }
 
+#[test]
+fn copying_a_block_copies_the_blocks_it_captured() {
+    let Some(path) = common::block_fixture() else {
+        skip!("cannot build x86_64 fixtures")
+    };
+    let (status, out, err) = run_builtin(&path);
+    assert_eq!(status, Some(0), "stdout: {out}\nstderr: {err}");
+    assert!(
+        out.contains("nested 7\n"),
+        "the captured block did not survive the copy: {out}\nstderr: {err}"
+    );
+    assert!(
+        out.contains("held 9\n"),
+        "the __block block variable did not survive the copy: {out}\nstderr: {err}"
+    );
+}
+
 /// And it agrees with the same program built for the host, which is the only
 /// specification of libclosure worth having.
 #[test]

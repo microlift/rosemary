@@ -20,6 +20,26 @@ const COPY_OFFSET: u64 = 16;
 const DISPOSE_OFFSET: u64 = 24;
 /// `BLOCK_HAS_COPY_DISPOSE`: the descriptor carries the two helper pointers.
 const BLOCK_HAS_COPY_DISPOSE: u32 = 1 << 25;
+/// Byte offsets in a `Block_byref`: `isa`, `forwarding`, then `flags` and
+/// `size`, then the `keep` and `destroy` helpers when the flags say so.
+const BYREF_FLAGS_OFFSET: u64 = 16;
+const BYREF_KEEP_OFFSET: u64 = 24;
+const BYREF_DESTROY_OFFSET: u64 = 32;
+/// `BLOCK_BYREF_HAS_COPY_DISPOSE`: the byref carries `keep` and `destroy`.
+const BLOCK_BYREF_HAS_COPY_DISPOSE: u32 = 1 << 25;
+/// `_Block_object_assign`'s field kinds, from libclosure's `Block_private.h`.
+const BLOCK_FIELD_IS_OBJECT: u32 = 3;
+const BLOCK_FIELD_IS_BLOCK: u32 = 7;
+const BLOCK_FIELD_IS_BYREF: u32 = 8;
+const BLOCK_FIELD_IS_WEAK: u32 = 16;
+const BLOCK_BYREF_CALLER: u32 = 128;
+/// A `__weak __block` variable, which is still copied with its helpers.
+const BLOCK_FIELD_IS_WEAK_BYREF: u32 = BLOCK_FIELD_IS_BYREF | BLOCK_FIELD_IS_WEAK;
+const BLOCK_FIELD_MASK: u32 = BLOCK_FIELD_IS_OBJECT
+    | BLOCK_FIELD_IS_BLOCK
+    | BLOCK_FIELD_IS_BYREF
+    | BLOCK_FIELD_IS_WEAK
+    | BLOCK_BYREF_CALLER;
 
 /// Replace every guest code pointer reachable from the block at `block` with a thunk,
 /// in place.
@@ -257,6 +277,58 @@ fn block_copy(
     Ok(())
 }
 
+/// Replace a `__block` variable's `keep` and `destroy` helpers with thunks, in
+/// place.
+fn substitute_byref(
+    symbol: &str,
+    byref: u64,
+    mem: &mut dyn GuestMemory,
+    callbacks: &dyn Callbacks,
+) -> Result<()> {
+    let flags = read_u32(symbol, mem, byref.wrapping_add(BYREF_FLAGS_OFFSET))?;
+    if flags & BLOCK_BYREF_HAS_COPY_DISPOSE == 0 {
+        return Ok(());
+    }
+    for offset in [BYREF_KEEP_OFFSET, BYREF_DESTROY_OFFSET] {
+        substitute_pointer(symbol, byref.wrapping_add(offset), mem, callbacks)?;
+    }
+    Ok(())
+}
+
+/// `void _Block_object_assign(void *destination, const void *object, int flags)`
+///
+/// A guest copy helper hands the host the blocks and `__block` variables its
+/// block captured, and copying those runs *their* helpers, which no other
+/// boundary has thunked.
+fn block_object_assign(
+    symbol: &str,
+    ctx: &mut RegisterContext,
+    mem: &mut dyn GuestMemory,
+    callbacks: &dyn Callbacks,
+) -> Result<()> {
+    let (destination, object, flags) = (ctx.rdi, ctx.rsi, ctx.rdx as u32);
+    if object != 0 {
+        match flags & BLOCK_FIELD_MASK {
+            BLOCK_FIELD_IS_BLOCK => substitute_block(symbol, object, mem, callbacks)?,
+            BLOCK_FIELD_IS_BYREF | BLOCK_FIELD_IS_WEAK_BYREF => {
+                substitute_byref(symbol, object, mem, callbacks)?
+            }
+            // An object, or a field a byref's own helper assigns: no helper runs.
+            _ => {}
+        }
+    }
+    // The selected runtime's, for [`block_copy`]'s reason.
+    let host = crate::objc::host::symbol(symbol).ok_or_else(|| AbiError::NoShim {
+        symbol: symbol.to_string(),
+    })?;
+    // SAFETY: `host` is a `_Block_object_assign`, two pointers and an `int`
+    // in, nothing out; any helper it runs is a thunk by the lines above.
+    let f: extern "C" fn(u64, u64, i32) =
+        unsafe { core::mem::transmute::<u64, extern "C" fn(u64, u64, i32)>(host) };
+    f(destination, object, flags as i32);
+    Ok(())
+}
+
 /// `void dispatch_group_notify(dispatch_group_t group, dispatch_queue_t queue,
 /// dispatch_block_t block)`
 fn dispatch_group_notify(
@@ -424,6 +496,9 @@ pub fn shim_for(name: &str) -> Option<Shim> {
         // Both spellings.
         "_Block_copy" => Some(bind!(callback "_Block_copy" => block_copy)),
         "Block_copy" => Some(bind!(callback "Block_copy" => block_copy)),
+        "_Block_object_assign" => {
+            Some(bind!(callback "_Block_object_assign" => block_object_assign))
+        }
         _ => None,
     }
 }

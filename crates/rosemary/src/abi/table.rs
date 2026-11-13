@@ -1628,7 +1628,8 @@ pub static SIGNATURES: &[FunctionAbi] = &[
     sig!("UTTypeCopyPreferredTagWithClass", P, P, P),
     sig!("UTTypeCreatePreferredIdentifierForTag", P, P, P, P),
     //
-    // `_Block_copy` is **shimmed** - see [`crate::shims::block::block_copy`].
+    // `_Block_copy` and `_Block_object_assign` are **shimmed** - see
+    // [`crate::shims::block`].
     // The signature stays for [`longjmp`]'s reason: it is what stops the site
     // being promoted to an inlined fast import and what names it at an exit.
     sig!("_Block_copy", P, P),
