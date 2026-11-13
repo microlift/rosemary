@@ -326,6 +326,20 @@ impl Scene {
         })
     }
 
+    /// Everywhere [`Scene::window_at`] finds a window, as rectangles in no
+    /// order that means anything: the pointer is nobody's anywhere else.
+    pub(crate) fn pointer_region(&self) -> Vec<Rect> {
+        let mut region: Vec<Rect> = self
+            .windows
+            .iter()
+            .filter(|window| self.visible(window) && window.takes_pointer())
+            .map(|window| window.frame.intersection(self.bounds()))
+            .filter(|frame| !frame.is_empty())
+            .collect();
+        region.sort_by_key(|frame| (frame.x, frame.y, frame.w, frame.h));
+        region
+    }
+
     pub(crate) fn frame(&self, id: WindowId) -> Option<Rect> {
         self.window(id).map(|window| window.frame)
     }
@@ -850,6 +864,22 @@ mod tests {
     fn click(scene: &mut Scene, at: (f32, f32), hit: HitTestResult) {
         scene.pointer_moved(at.0, at.1, 0.0, 0.0);
         scene.button(LEFT_BUTTON, true, 1, hit);
+    }
+
+    #[test]
+    fn the_pointer_region_is_the_shown_windows_inside_the_desktop() {
+        let mut scene = scene();
+        add(&mut scene, 1, (700, 550));
+        add(&mut scene, 2, (10, 20));
+        add(&mut scene, 3, (300, 300));
+        scene.hide(3);
+        scene.add(4, Some(2), flags::TOOLTIP | flags::HIDDEN, (5, 5), (50, 20));
+        scene.show(4);
+        let rect = |x, y, w, h| Rect { x, y, w, h };
+        assert_eq!(
+            scene.pointer_region(),
+            [rect(10, 20, 200, 100), rect(700, 550, 100, 50)]
+        );
     }
 
     #[test]

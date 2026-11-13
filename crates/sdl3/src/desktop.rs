@@ -1,5 +1,7 @@
 //! The virtual desktop: every window a program makes, drawn into one host
-//! window that stands for the screen.
+//! window that stands for the screen. Between the windows the host window is
+//! clear and takes no input, where the host can be told so, and what the
+//! host has behind it is seen and used as ever.
 //!
 //! A Mac program places its windows itself, in one coordinate space shared
 //! with every other window, and reads the pointer in that space. A window
@@ -105,6 +107,11 @@ struct Desktop {
     confined: Option<(WindowId, Rect)>,
     grabbed: Option<WindowId>,
     host_confined: Option<Rect>,
+    /// Whether the host shows its own desktop between the windows and takes
+    /// the clicks made there, and the region it was last told to leave to
+    /// this one.
+    see_through: bool,
+    input: Option<Vec<Rect>>,
 }
 
 static DESKTOP: Mutex<Option<Desktop>> = Mutex::new(None);
@@ -236,7 +243,13 @@ fn start() -> bool {
     let (Some(extent), Some((width, height))) = (extent(), size()) else {
         return false;
     };
+    // A desktop that takes the clicks made between its windows has to be
+    // seen, so it is clear only where the host can be told not to.
+    let see_through = video::has_window_input_regions();
     let mut host_flags = flags::HIGH_PIXEL_DENSITY;
+    if see_through {
+        host_flags |= flags::TRANSPARENT;
+    }
     if extent == Extent::Fullscreen {
         host_flags |= flags::FULLSCREEN;
     }
@@ -257,6 +270,8 @@ fn start() -> bool {
         confined: None,
         grabbed: None,
         host_confined: None,
+        see_through,
+        input: None,
     };
     desktop.damage_all();
     *lock() = Some(desktop);
@@ -535,6 +550,7 @@ where
 struct Frame {
     host: Window,
     damage: Rect,
+    background: [u8; 4],
     /// Back to front: the window, its picture, where it goes and how.
     layers: Vec<(WindowId, Buffer, (i32, i32), bool, f32)>,
 }
@@ -576,6 +592,10 @@ fn take_frame(desktop: &mut Desktop) -> Option<Frame> {
     Some(Frame {
         host: desktop.host as Window,
         damage,
+        background: match desktop.see_through {
+            true => compose::CLEAR,
+            false => compose::BACKGROUND,
+        },
         layers,
     })
 }
@@ -587,6 +607,7 @@ pub fn present() {
         return;
     }
     sync_host_pointer();
+    sync_input_region();
     let Some(frame) = lock().as_mut().and_then(take_frame) else {
         return;
     };
@@ -628,7 +649,7 @@ pub fn present() {
             width: surface.width,
             height: surface.height,
         };
-        compose::compose(&mut target, &layers, damage);
+        compose::compose(&mut target, frame.background, &layers, damage);
         true
     });
     let mut guard = lock();
@@ -643,6 +664,28 @@ pub fn present() {
         {
             surface.buffer = buffer;
         }
+    }
+}
+
+/// Leave the host everything between the windows now showing: a click there
+/// is for whatever it has behind the desktop.
+fn sync_input_region() {
+    let wanted = lock().as_ref().and_then(|desktop| {
+        // While a button is held the host sends the pointer here wherever it
+        // goes, so a window being dragged is followed once it is let go.
+        if !desktop.see_through || desktop.scene.buttons() != 0 {
+            return None;
+        }
+        let region = desktop.scene.pointer_region();
+        (desktop.input.as_ref() != Some(&region)).then_some((desktop.host as Window, region))
+    });
+    let Some((host, region)) = wanted else {
+        return;
+    };
+    if video::set_window_input_region(host, &region)
+        && let Some(desktop) = lock().as_mut()
+    {
+        desktop.input = Some(region);
     }
 }
 

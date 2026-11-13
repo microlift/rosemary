@@ -8,9 +8,14 @@
 use crate::Rect;
 
 const BYTES_PER_PIXEL: usize = 4;
+const ALPHA: usize = 3;
 const OPAQUE: u32 = 255;
 
-/// What shows where no window is: opaque mid grey, in blue, green, red, alpha.
+/// What shows where no window is, in blue, green, red, alpha: nothing, so
+/// that the host's own desktop shows there.
+pub(crate) const CLEAR: [u8; BYTES_PER_PIXEL] = [0; BYTES_PER_PIXEL];
+
+/// The same for a host window that cannot be seen through: opaque mid grey.
 pub(crate) const BACKGROUND: [u8; BYTES_PER_PIXEL] = [0x80, 0x80, 0x80, 0xff];
 
 /// One window's picture.
@@ -71,8 +76,13 @@ fn scaled(a: u32, b: u32) -> u32 {
     (a * b + OPAQUE / 2) / OPAQUE
 }
 
-/// Redraw `damage` of `target`: the background, then `layers` back to front.
-pub(crate) fn compose(target: &mut Target, layers: &[Layer], damage: Rect) {
+/// Redraw `damage` of `target`: `background`, then `layers` back to front.
+pub(crate) fn compose(
+    target: &mut Target,
+    background: [u8; BYTES_PER_PIXEL],
+    layers: &[Layer],
+    damage: Rect,
+) {
     let damage = damage.intersection(Rect {
         x: 0,
         y: 0,
@@ -89,7 +99,7 @@ pub(crate) fn compose(target: &mut Target, layers: &[Layer], damage: Rect) {
             .as_chunks_mut::<BYTES_PER_PIXEL>()
             .0
         {
-            *pixel = BACKGROUND;
+            *pixel = background;
         }
     }
     for layer in layers {
@@ -112,6 +122,9 @@ pub(crate) fn compose(target: &mut Target, layers: &[Layer], damage: Rect) {
             let destination = &mut target.pixels[to..to + bytes];
             if !layer.alpha && opacity == OPAQUE {
                 destination.copy_from_slice(source);
+                for pixel in destination.as_chunks_mut::<BYTES_PER_PIXEL>().0 {
+                    pixel[ALPHA] = OPAQUE as u8;
+                }
                 continue;
             }
             let pixels = source
@@ -120,10 +133,11 @@ pub(crate) fn compose(target: &mut Target, layers: &[Layer], damage: Rect) {
                 .iter()
                 .zip(destination.as_chunks_mut::<BYTES_PER_PIXEL>().0);
             for (source, destination) in pixels {
-                let coverage = match layer.alpha {
-                    true => scaled(u32::from(source[3]), opacity),
-                    false => opacity,
-                };
+                let mut source = *source;
+                if !layer.alpha {
+                    source[ALPHA] = OPAQUE as u8;
+                }
+                let coverage = scaled(u32::from(source[ALPHA]), opacity);
                 for channel in 0..BYTES_PER_PIXEL {
                     let over = scaled(u32::from(source[channel]), opacity);
                     let under = scaled(u32::from(destination[channel]), OPAQUE - coverage);
@@ -150,6 +164,10 @@ mod tests {
     }
 
     fn draw(layers: &[Layer], damage: Rect) -> Vec<[u8; 4]> {
+        draw_over(BACKGROUND, layers, damage)
+    }
+
+    fn draw_over(background: [u8; 4], layers: &[Layer], damage: Rect) -> Vec<[u8; 4]> {
         // A pitch wider than the row, as SDL's may be.
         let (width, height, pitch) = (4, 2, 20);
         let mut pixels = vec![0; pitch * height as usize];
@@ -160,6 +178,7 @@ mod tests {
                 width,
                 height,
             },
+            background,
             layers,
             damage,
         );
@@ -240,7 +259,25 @@ mod tests {
             opacity: 1.0,
         };
         assert_eq!(draw(&[layer(true)], WHOLE)[0], BACKGROUND);
-        assert_eq!(draw(&[layer(false)], WHOLE)[0], [0; 4]);
+        assert_eq!(draw(&[layer(false)], WHOLE)[0], [0, 0, 0, 0xff]);
+    }
+
+    #[test]
+    fn a_clear_background_stays_clear_between_windows_and_under_their_alpha() {
+        let (red, clear) = (filled(1, 1, RED), filled(1, 1, [0; 4]));
+        let layer = |buffer, x, alpha| Layer {
+            buffer,
+            x,
+            y: 0,
+            alpha,
+            opacity: 1.0,
+        };
+        let drawn = draw_over(
+            CLEAR,
+            &[layer(&red, 0, false), layer(&clear, 1, true)],
+            WHOLE,
+        );
+        assert_eq!(drawn[..3], [RED, CLEAR, CLEAR]);
     }
 
     #[test]

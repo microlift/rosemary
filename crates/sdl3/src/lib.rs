@@ -280,6 +280,7 @@ struct Api {
     SDL_GetWindowFromID: Option<unsafe extern "C" fn(u32) -> Window>,
     SDL_GetWindowFlags: Option<unsafe extern "C" fn(Window) -> u64>,
     SDL_SetWindowIcon: Option<unsafe extern "C" fn(Window, *mut c_void) -> bool>,
+    SDL_SetWindowShape: Option<unsafe extern "C" fn(Window, *mut c_void) -> bool>,
     SDL_CreateSurfaceFrom:
         Option<unsafe extern "C" fn(c_int, c_int, u32, *mut c_void, c_int) -> *mut c_void>,
     SDL_DestroySurface: Option<unsafe extern "C" fn(*mut c_void)>,
@@ -530,6 +531,7 @@ fn api() -> Option<&'static Api> {
             SDL_GetWindowFromID,
             SDL_GetWindowFlags,
             SDL_SetWindowIcon,
+            SDL_SetWindowShape,
             SDL_CreateSurfaceFrom,
             SDL_DestroySurface,
             SDL_GetWindowSurface,
@@ -3660,6 +3662,84 @@ pub mod video {
         // SAFETY: a window this crate created and a surface just made.
         let ok = unsafe { set(window, surface) };
         // SAFETY: as above; SDL has taken its own copy by now.
+        unsafe { destroy(surface) };
+        ok
+    }
+
+    /// Whether [`set_window_input_region`] can do what it says on this host.
+    pub(crate) fn has_window_input_regions() -> bool {
+        match host_is_wayland() {
+            // SDL divides window coordinates by a scale it does not publish.
+            true => !crate::pointer::scales_to_display(),
+            false => host_is_x11(),
+        }
+    }
+
+    /// Take pointer input on `window` only inside `rects`, in its
+    /// coordinates: what lands anywhere else goes to whatever the host has
+    /// under the window. The window must have been made
+    /// [`flags::TRANSPARENT`].
+    ///
+    /// False when it was not done, which on Wayland includes the time before
+    /// the first turn of the event pump.
+    pub(crate) fn set_window_input_region(window: Window, rects: &[Rect]) -> bool {
+        // SDL shapes no Wayland window, so there the surface is asked.
+        if !has_window_input_regions() {
+            return false;
+        }
+        if host_is_wayland() {
+            return wayland_surface(window)
+                .is_some_and(|(_, surface)| crate::wayland::set_input_region(surface, rects));
+        }
+        let Some((width, height)) = window_size(window).filter(|(w, h)| *w > 0 && *h > 0) else {
+            return false;
+        };
+        let Some(api) = api() else {
+            return false;
+        };
+        let (Some(create), Some(set), Some(destroy)) = (
+            api.SDL_CreateSurfaceFrom,
+            api.SDL_SetWindowShape,
+            api.SDL_DestroySurface,
+        ) else {
+            return false;
+        };
+        // SDL takes input wherever the shape is not fully transparent.
+        const BYTES_PER_PIXEL: usize = 4;
+        const TAKEN: u8 = 0xff;
+        let pitch = width as usize * BYTES_PER_PIXEL;
+        let mut pixels = vec![0u8; pitch * height as usize];
+        let whole = Rect {
+            x: 0,
+            y: 0,
+            w: width,
+            h: height,
+        };
+        let inside = rects.iter().map(|rect| rect.intersection(whole));
+        for rect in inside.filter(|rect| !rect.is_empty()) {
+            for row in rect.y..rect.y + rect.h {
+                let start = row as usize * pitch + rect.x as usize * BYTES_PER_PIXEL;
+                pixels[start..start + rect.w as usize * BYTES_PER_PIXEL].fill(TAKEN);
+            }
+        }
+        // SAFETY: the buffer is `pitch * height` bytes, as the format and
+        // pitch say, and outlives the surface, which borrows it.
+        let surface = unsafe {
+            create(
+                width,
+                height,
+                pixel_format::ARGB8888,
+                pixels.as_mut_ptr().cast(),
+                pitch as c_int,
+            )
+        };
+        if surface.is_null() {
+            return false;
+        }
+        // SAFETY: a window this crate created and a surface just made, of
+        // which SDL takes its own copy.
+        let ok = unsafe { set(window, surface) };
+        // SAFETY: as above.
         unsafe { destroy(surface) };
         ok
     }
