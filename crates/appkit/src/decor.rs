@@ -85,7 +85,18 @@ pub fn config() -> Config {
     #[dynamic]
     static CONFIG: Config = {
         let read = |name| std::env::var(name).ok();
-        Config::parse(read(DECORATIONS_ENV).as_deref(), read(MENU_ENV).as_deref())
+        let config = Config::parse(read(DECORATIONS_ENV).as_deref(), read(MENU_ENV).as_deref());
+        match config.decorations == Decorations::Server && sdl3::desktop::active() {
+            // No window manager decorates a window on the virtual desktop.
+            true => {
+                eprintln!(
+                    "rosemary: appkit: {DECORATIONS_ENV}=server has no effect on the virtual \
+                     desktop; using client"
+                );
+                Config::parse(None, read(MENU_ENV).as_deref())
+            }
+            false => config,
+        }
     };
     *CONFIG
 }
@@ -345,8 +356,8 @@ fn zoom(sdl: sdl3::Window) {
 pub(crate) fn hit_test_pressed(id: u32) {
     use std::time::Instant;
     static START: OnceLock<Instant> = OnceLock::new();
-    // FIXME: only wayland supports this for now
-    if !sdl3::video::is_wayland() {
+    // FIXME: only wayland and the virtual desktop support this for now
+    if !sdl3::video::is_wayland() && !sdl3::desktop::active() {
         return;
     }
     let window = crate::event::object_for(id);
