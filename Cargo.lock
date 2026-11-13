@@ -2066,7 +2066,7 @@ dependencies = [
 [[package]]
 name = "microlift"
 version = "0.1.0"
-source = "git+https://github.com/microlift/microlift?rev=1e8f4cfdb21e3a691e3351cb1f5d4859481d1708#1e8f4cfdb21e3a691e3351cb1f5d4859481d1708"
+source = "git+https://github.com/microlift/microlift?rev=da2b3780cfbfadd6e9aade2ab6f47e4549837778#da2b3780cfbfadd6e9aade2ab6f47e4549837778"
 dependencies = [
  "capstone",
  "cranelift",
@@ -2078,9 +2078,12 @@ dependencies = [
  "cranelift-object",
  "function_traits",
  "iced-x86",
+ "libc",
  "object 0.36.7",
+ "sha2 0.11.0",
  "target-lexicon",
  "thiserror 1.0.69",
+ "wasmtime-internal-jit-icache-coherence",
  "yaxpeax-arch",
  "yaxpeax-arm",
 ]

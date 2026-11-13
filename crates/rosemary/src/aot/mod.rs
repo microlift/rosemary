@@ -1,9 +1,11 @@
 //! The on-disk cache of guest code compiled ahead of time. See `docs/aot.md`.
 //!
-//! One immutable file per guest image, named by the image's SHA-256 under
-//! `<base>/<build-id>/<machine>/<config>/`. A file is only ever replaced whole, by a
-//! rename, so a reader never needs a lock; the `.lock` sidecar only keeps two
-//! processes from compiling the same image at once.
+//! Immutable files per guest image, named by the image's SHA-256 under
+//! `<base>/<build-id>/<machine>/<config>/`: part 0 holds what start-up needs, later
+//! parts everything else. Each is a Microlift image, mapped and run in place, whose
+//! regions are published one at a time as the run first reaches them. A file is only
+//! ever replaced whole, by a rename, so a reader never needs a lock; the `.lock`
+//! sidecar only keeps two processes from compiling the same image at once.
 
 pub mod build;
 pub mod entries;
@@ -15,9 +17,13 @@ pub mod store;
 
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
-use std::sync::LazyLock;
+use std::sync::{LazyLock, RwLock, RwLockWriteGuard};
 
+use microlift::core::LifterConfig;
 use microlift::core::fingerprint::StableHasher;
+use microlift::runtime::image::{LoadedRegion, MappedImage};
+
+use crate::cache::Tier;
 
 /// Where the cache lives; `0`, `off` or empty disables it.
 pub const CACHE_ENV: &str = "ROSEMARY_AOT_CACHE";
@@ -25,7 +31,7 @@ pub const CACHE_ENV: &str = "ROSEMARY_AOT_CACHE";
 pub const KEEP_ENV: &str = "ROSEMARY_AOT_CACHE_KEEP";
 
 /// Bumped when what Rosemary stores beside Microlift's image changes meaning.
-const FORMAT_VERSION: u32 = 3;
+const FORMAT_VERSION: u32 = 4;
 
 /// Extension of a cached image.
 const IMAGE_EXTENSION: &str = "rmc";
@@ -39,7 +45,7 @@ pub fn build_id() -> String {
     format!(
         "{}-{}-{FORMAT_VERSION}",
         env!("ROSEMARY_BUILD_ID"),
-        microlift::image::FORMAT_VERSION
+        microlift::image::file::FORMAT_VERSION
     )
 }
 
@@ -63,8 +69,8 @@ pub fn config() -> &'static str {
         let mut hasher = StableHasher::new();
         let lifter = crate::program::lifter_config_base().codegen_fingerprint();
         hasher.str(&format!("{lifter:016x}"));
-        if let Ok(backend) = crate::jit::backend() {
-            let isa = microlift::backend::isa_fingerprint(backend.isa());
+        if let Ok(isa) = crate::jit::region_isa(Tier::Final) {
+            let isa = microlift::backend::isa_fingerprint(isa);
             hasher.str(&format!("{isa:016x}"));
         }
         hasher.str(&crate::jit::knobs());
@@ -125,8 +131,15 @@ impl Layout {
         self.base.join(build_id()).join(machine()).join(config())
     }
 
+    /// Part 0 of image `id`'s cache: what start-up needs, and the file whose
+    /// presence says the image has a cache.
     pub fn image(&self, id: &ImageId) -> PathBuf {
-        self.directory().join(format!("{id}.{IMAGE_EXTENSION}"))
+        self.part(id, 0)
+    }
+
+    /// Part `n` of image `id`'s cache.
+    pub fn part(&self, id: &ImageId, n: u32) -> PathBuf {
+        self.directory().join(format!("{id}.{n}.{IMAGE_EXTENSION}"))
     }
 
     pub fn profile(&self, id: &ImageId) -> PathBuf {
@@ -169,61 +182,135 @@ impl std::fmt::Display for LoadError {
     }
 }
 
-/// The cached regions of image `id`, which this run placed at `slide`, keeping only
-/// those `config` can still use; `Ok(None)` when nothing is cached.
-pub fn load(
+/// Taken to read by every [`Cached::map_code`] and to write across a fork, so a fork
+/// waits for a mapping in progress rather than leave the child a part whose mapping
+/// lock is held for ever. See [`crate::fork`].
+static MAPPING: RwLock<()> = RwLock::new(());
+
+/// No mapping runs from here until the hold is dropped.
+pub(crate) fn hold_for_fork() -> RwLockWriteGuard<'static, ()> {
+    MAPPING.write().unwrap_or_else(|e| e.into_inner())
+}
+
+/// One cache file of an image, mapped for this run. Its regions are published one at
+/// a time, as the run first reaches each.
+pub struct Cached {
+    image: MappedImage,
+    pub tier: Tier,
+    /// Part 0: what earlier runs executed and what start-up needs.
+    pub hot: bool,
+    /// Run-time minus lift-time address of the image's code.
+    moved: u64,
+    /// One bit per region, set once it has been looked at: a region is published at
+    /// most once, and never again after a write to its code retired it.
+    claimed: Vec<std::sync::atomic::AtomicU64>,
+}
+
+impl Cached {
+    /// The region that can be entered at `pc`, unless it was looked at before or its
+    /// code is not mapped yet.
+    pub fn claim(&self, pc: u64) -> Option<u32> {
+        use std::sync::atomic::Ordering;
+        if !self.image.code_mapped() {
+            return None;
+        }
+        let index = self.image.lookup(pc)?;
+        let bit = 1u64 << (index % 64);
+        let word = &self.claimed[index as usize / 64];
+        (word.fetch_or(bit, Ordering::AcqRel) & bit == 0).then_some(index)
+    }
+
+    /// Region `index`, or `None` where `config` may not run it or its code is not
+    /// mapped yet.
+    pub fn region(&self, config: &LifterConfig, index: u32) -> Option<LoadedRegion> {
+        let region = self.image.region(index).ok()??;
+        usable(config, &region, self.moved).then_some(region)
+    }
+
+    /// Maps the code; see [`MappedImage::map_code`] for why that is apart.
+    pub fn map_code(&self) -> Result<(), LoadError> {
+        let _mapping = MAPPING.read().unwrap_or_else(|e| e.into_inner());
+        self.image.map_code().map(drop).map_err(LoadError::Image)
+    }
+
+    pub fn code_mapped(&self) -> bool {
+        self.image.code_mapped()
+    }
+
+    /// Whether the code runs from the file's own pages.
+    pub fn in_place(&self) -> bool {
+        self.image.in_place()
+    }
+
+    pub fn region_count(&self) -> u32 {
+        self.image.region_count()
+    }
+}
+
+/// What part 0 of image `id`'s cache says about itself, or `None` without a readable one.
+pub fn embedded(layout: &Layout, id: &ImageId) -> Option<file::Embedded> {
+    let mapped = store::map(&layout.image(id)).ok()??;
+    let view = microlift::image::file::View::parse(&mapped).ok()?;
+    file::Embedded::decode(view.user()).ok()
+}
+
+/// Every cache file of image `id`, which this run mapped at `slide`, mapped for
+/// reading and bound for `config`; empty when nothing is cached. No code is mapped
+/// yet: see [`Cached::map_code`].
+pub fn open(
     layout: &Layout,
     id: &ImageId,
-    config: &microlift::core::LifterConfig,
+    config: &LifterConfig,
     slide: u64,
-) -> Result<Option<Vec<microlift::runtime::image::LoadedRegion>>, LoadError> {
-    let Some(mapped) = store::map(&layout.image(id)).map_err(LoadError::Io)? else {
-        return Ok(None);
-    };
-    let file = file::CacheFile::decode(&mapped).map_err(LoadError::File)?;
-    let backend = crate::jit::backend().map_err(LoadError::Image)?;
-    let isa = microlift::backend::isa_fingerprint(backend.isa());
-    let fingerprint = config.codegen_fingerprint();
-    if file
-        .chunks
-        .iter()
-        .any(|chunk| chunk.isa_fingerprint != isa || chunk.config_fingerprint != fingerprint)
+) -> Result<Vec<Cached>, LoadError> {
+    let mut parts = Vec::new();
+    for n in 0.. {
+        let file = match std::fs::File::open(layout.part(id, n)) {
+            Ok(file) => file,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => break,
+            Err(e) => return Err(LoadError::Io(e)),
+        };
+        parts.push(open_part(&file, n == 0, config, slide)?);
+    }
+    Ok(parts)
+}
+
+fn open_part(
+    file: &std::fs::File,
+    hot: bool,
+    config: &LifterConfig,
+    slide: u64,
+) -> Result<Cached, LoadError> {
+    let mut image = MappedImage::open(file).map_err(LoadError::Image)?;
+    let embedded = file::Embedded::decode(image.user()).map_err(LoadError::File)?;
+    let isa = crate::jit::region_isa(embedded.tier).map_err(LoadError::Image)?;
+    let header = image.header();
+    if header.isa_fingerprint != microlift::backend::isa_fingerprint(isa)
+        || header.config_fingerprint != config.codegen_fingerprint()
     {
         return Err(LoadError::Stale);
     }
-    let moved = slide.wrapping_sub(file.lift_slide);
+    let moved = slide.wrapping_sub(embedded.lift_slide);
     let mut resolver = resolve::Resolver::new(config, moved);
-    resolver.learn(
-        config,
-        file.chunks
-            .iter()
-            .flat_map(|chunk| &chunk.regions)
-            .flat_map(|region| &region.import_decisions),
-    );
-    let mut regions = Vec::new();
-    for chunk in &file.chunks {
-        let loaded =
-            microlift::runtime::image::load_image(chunk, &resolver).map_err(LoadError::Image)?;
-        regions.extend(
-            loaded
-                .into_iter()
-                .filter(|region| usable(config, region, moved)),
-        );
-    }
-    Ok(Some(regions))
+    resolver.learn(config, image.sites());
+    image.bind(&resolver).map_err(LoadError::Image)?;
+    let words = (image.region_count() as usize).div_ceil(64);
+    Ok(Cached {
+        image,
+        tier: embedded.tier,
+        hot,
+        moved,
+        claimed: (0..words).map(|_| Default::default()).collect(),
+    })
 }
 
-/// Whether a loaded region may run in this process.
+/// Whether a published region may run in this process.
 ///
 /// Guest addresses in code are relocated, but a value the lift read out of a
 /// read-only segment and folded in is not: a rebased pointer there differs with
 /// the slide. So a region that read anything outside its own bytes is used only
 /// at the slide it was lifted at.
-fn usable(
-    config: &microlift::core::LifterConfig,
-    region: &microlift::runtime::image::LoadedRegion,
-    moved: u64,
-) -> bool {
+fn usable(config: &LifterConfig, region: &LoadedRegion, moved: u64) -> bool {
     (moved == 0 || region.translation.data_dependencies.is_empty())
         && resolve::decisions_hold(config, &region.import_decisions)
 }
@@ -306,7 +393,7 @@ mod tests {
         assert_eq!(parts[0], build_id().as_str());
         assert_eq!(parts[1], machine());
         assert_eq!(parts[2], config());
-        assert_eq!(parts[3].to_str().unwrap(), format!("{id}.rmc"));
+        assert_eq!(parts[3].to_str().unwrap(), format!("{id}.0.rmc"));
     }
 
     #[test]

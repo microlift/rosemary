@@ -671,6 +671,17 @@ pub fn set_executable_path(path: &str, slide: u64) {
     *EXECUTABLE.lock().unwrap_or_else(|e| e.into_inner()) = Some((absolute, slide));
 }
 
+/// Whether `path` is the main executable's file, by whatever spelling.
+fn names_main_executable(path: &str) -> bool {
+    let Some(executable) = executable_host_path() else {
+        return false;
+    };
+    let canonical = |path: &str| std::fs::canonicalize(path).ok();
+    resolve_path(path)
+        .and_then(|resolved| canonical(&resolved))
+        .is_some_and(|resolved| canonical(&executable) == Some(resolved))
+}
+
 /// The path presented to guest process-introspection calls.
 pub fn executable_path() -> Option<String> {
     EXECUTABLE
@@ -1442,6 +1453,7 @@ fn run_initializers(image: &'static Image) -> std::result::Result<(), String> {
         .rev()
         .flat_map(|i| i.initializers.iter().copied())
         .collect();
+    exec.expect_calls(&initializers);
     for init in initializers {
         exec.call(init, &[argc, argv, envp, apple])
             .map_err(|e| format!("initializer at {init:#x}: {e}"))?;
@@ -3059,6 +3071,16 @@ pub(crate) mod entry {
             .into_owned();
         if crate::shims::vmmap::tracing() {
             eprintln!("rosemary: dlopen({path:?}, flags {mode:#x})");
+        }
+        // dyld hands back the main executable's own handle for its path, as for a
+        // null one, rather than loading a second copy with statics of its own.
+        if super::names_main_executable(&path) {
+            super::clear_error();
+            let handle = match first_only {
+                true => super::RTLD_MAIN_ONLY,
+                false => super::global_handle(),
+            };
+            return handle as usize as *mut c_void;
         }
         let handle = match super::open(&path) {
             Ok(handle) => {

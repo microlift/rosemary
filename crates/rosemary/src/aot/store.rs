@@ -47,6 +47,11 @@ impl AtomicFile {
         })
     }
 
+    /// Another handle on the file being written, sharing its position.
+    pub fn handle(&self) -> std::io::Result<File> {
+        self.file.try_clone()
+    }
+
     pub fn commit(mut self) -> std::io::Result<()> {
         self.file.sync_all()?;
         std::fs::rename(&self.temporary, &self.path)?;
@@ -79,6 +84,25 @@ impl Drop for AtomicFile {
             let _ = std::fs::remove_file(&self.temporary);
         }
     }
+}
+
+/// A file in `directory` for scratch space, removed already: it lives as long as
+/// the handle.
+pub fn scratch(directory: &Path) -> std::io::Result<File> {
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    std::fs::create_dir_all(directory)?;
+    let path = directory.join(format!(
+        ".{}.{}.scratch",
+        std::process::id(),
+        COUNTER.fetch_add(1, Ordering::Relaxed)
+    ));
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create_new(true)
+        .open(&path)?;
+    std::fs::remove_file(&path)?;
+    Ok(file)
 }
 
 /// A cache file mapped read-only. A rename over it later leaves this mapping intact.

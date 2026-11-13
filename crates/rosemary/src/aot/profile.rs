@@ -48,6 +48,20 @@ static LOGS: LazyLock<Mutex<HashMap<ImageId, Option<File>>>> = LazyLock::new(Mut
 /// Image ids by file, hashed once per process.
 static IDS: LazyLock<Mutex<HashMap<String, Option<ImageId>>>> = LazyLock::new(Mutex::default);
 
+/// The image ids and open logs, held across a fork: every guest thread's miss takes
+/// them. See [`crate::fork`].
+pub(crate) struct ForkHold(
+    #[allow(dead_code)] std::sync::MutexGuard<'static, HashMap<String, Option<ImageId>>>,
+    #[allow(dead_code)] std::sync::MutexGuard<'static, HashMap<ImageId, Option<File>>>,
+);
+
+pub(crate) fn hold_for_fork() -> ForkHold {
+    ForkHold(
+        IDS.lock().unwrap_or_else(|e| e.into_inner()),
+        LOGS.lock().unwrap_or_else(|e| e.into_inner()),
+    )
+}
+
 /// The id of the image file at `path`, hashed once per process.
 pub fn image_id(path: &str) -> Option<ImageId> {
     let mut ids = IDS.lock().unwrap_or_else(|e| e.into_inner());
@@ -146,9 +160,68 @@ pub fn read(path: &Path) -> std::io::Result<Vec<u64>> {
         .collect())
 }
 
+/// How many distinct addresses a log holds. Not its length: a run logs again what it
+/// must JIT every time, such as a region unusable at this run's slide, so the raw
+/// count grows with nothing new to build.
+pub fn distinct(path: &Path) -> u64 {
+    read(path).map_or(0, |logged| {
+        logged.into_iter().collect::<HashSet<_>>().len() as u64
+    })
+}
+
+/// Every address a log holds, each once, in the order first logged; the log is
+/// rewritten so when it held repeats. Runs log every address they compile, so a log
+/// read by builds and never compacted grows by a run's worth each run.
+///
+/// A record another process appends while the log is rewritten may be lost, which
+/// costs a later run one JIT compile.
+pub fn compact(path: &Path) -> std::io::Result<Vec<u64>> {
+    let logged = read(path)?;
+    let mut seen = HashSet::with_capacity(logged.len());
+    let unique: Vec<u64> = logged.iter().copied().filter(|&a| seen.insert(a)).collect();
+    if unique.len() < logged.len() {
+        let bytes: Vec<u8> = unique.iter().flat_map(|a| a.to_le_bytes()).collect();
+        // Rewritten in place rather than renamed over: a running process appends
+        // through the handle it opened, which a rename would leave on an unlinked file.
+        let mut file = std::fs::OpenOptions::new().append(true).open(path)?;
+        file.set_len(0)?;
+        file.write_all(&bytes)?;
+    }
+    Ok(unique)
+}
+
+/// Whether a log of `now` distinct addresses has grown enough past the `built` a cache
+/// was built from to be worth building again.
+pub fn grown(built: u64, now: u64) -> bool {
+    const MIN_GROWTH: u64 = 4096;
+    now > built + (built / 8).max(MIN_GROWTH)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn compacting_keeps_the_first_of_each_address_in_order() {
+        let dir = std::env::temp_dir().join(format!("rosemary-aot-compact-{}", std::process::id()));
+        let path = dir.join("p.log");
+        let mut log = open(&path).unwrap();
+        for address in [0x3000, 0x1000, 0x3000, 0x2000, 0x1000] {
+            append(&mut log, address).unwrap();
+        }
+        assert_eq!(compact(&path).unwrap(), [0x3000, 0x1000, 0x2000]);
+        assert_eq!(read(&path).unwrap(), [0x3000, 0x1000, 0x2000]);
+        assert_eq!(distinct(&path), 3);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_log_has_grown_once_it_gains_an_eighth_or_enough_records() {
+        assert!(!grown(0, 4096));
+        assert!(grown(0, 4097));
+        assert!(!grown(80_000, 90_000));
+        assert!(grown(80_000, 90_001));
+    }
 
     #[test]
     fn appended_addresses_read_back_in_order() {

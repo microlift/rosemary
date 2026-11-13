@@ -21,8 +21,11 @@ Binaries and apps installed in the prefix take priority over host filesystem pat
 ## Compiling ahead of time
 
 The `emulated` backend keeps an on-disk cache of x86-64 code compiled ahead of time
-(see `docs/aot.md`). A run that finds an image of its program uncached starts a
-build of it in the background, at the lowest priority, and does not wait for it.
+(see `docs/aot.md`). Cached code runs straight from the cache files' own pages, so it
+takes no memory of the process's own, and a region is published only when the run
+first reaches it. A run that finds an image of its program uncached, or that earlier
+runs have since compiled much uncached code for, starts a build in the background, at
+the lowest priority (in the background band on macOS), and does not wait for it.
 To build or rebuild the cache yourself, which also takes in the code earlier runs
 had to compile on the fly:
 
@@ -31,9 +34,14 @@ rosemary aot /some/app.app
 rosemary aot --deadline 300 --threads 4 /some/app.app/Contents/MacOS/App
 ```
 
-`--deadline` stops starting work after that many seconds and writes what finished,
-most important code first; `--only-missing` leaves images that already have a cache
-file alone.
+What earlier runs executed and what start-up needs is compiled first, into a file of
+its own that is usable as soon as it is written; everything else follows, compiled
+cheaply (a run recompiles what it actually uses, as it does its own code).
+`--deadline` stops starting work after that many seconds and writes what finished;
+`--hot-only` compiles only that first part; `--only-missing` leaves images that
+already have a cache file alone; `--refresh` builds images with no cache file and
+rebuilds the first part of those whose runs have outgrown it, which is what a
+background build does.
 
 ## Entering a shell
 
@@ -76,6 +84,8 @@ rosemary server --stop         # ask this prefix's server to exit
 | `ROSEMARY_DEAD_FLAGS` | `0` | Enable Microlift's dead flag elimination pass. Improves performance in some applications, but not by a wide enough margin. **May have semantic accuracy bugs, use with extreme caution**. |
 | `ROSEMARY_TSO` | `1` (non-x86 hosts), `0` (x86 hosts) | Fence guest memory accesses so an AArch64 host keeps x86's total store order. Without it, lock-free guest code that publishes data with plain stores (Mono's class setup, for one) can see another thread's writes out of order; Subnautica aborts in Mono on `ac->rank` while loading the world. Costs a `dmb` on most guest memory accesses. |
 | `ROSEMARY_CALL_RETURN` | `0` | Enable Microlift native call return support. Can improve performance in some applications - disabled by default as measurements were inconclusive and it is additional, complex code surface. |
+| `ROSEMARY_NO_JIT_TIERS` | `0` | (emulated) Compile every region at its final optimisation level from the start. By default a region is first compiled cheaply (Cranelift's `opt_level=none` and single-pass register allocation, about twice as fast to compile and half as fast to run), and worker threads recompile it at the final level and swap the new code in. Start-up is mostly compiling code that runs a handful of times, so tiering roughly halves it, and the code still running after start-up ends up as fast as before. A loop that never leaves the region it entered keeps the cheap code until it does. |
+| `ROSEMARY_LIFT_AHEAD` | `4` | (emulated) How many static hops ahead of the code a guest is running worker threads compile regions: the constant branch and call targets of each region translated, then theirs, and so on. Lets a thread running cold code find its next region compiled instead of compiling one region after another itself. `0` turns it off. Initializers are compiled ahead in the order they run, whatever this says. |
 | `ROSEMARY_LINK_ROWS` | `65536` | Rows in each guest thread's block-link table, rounded up to a power of two (at least 256). A row lets translated code continue straight into the next region instead of exiting to the run loop, so a working set larger than the table shows up as `window miss(es)` and `indirect call` / `ret out of region` exits under `ROSEMARY_STATS`. 32 bytes a row, committed only where rows are written. |
 | `ROSEMARY_LINK_WAYS` | `4` | How many rows of the block-link table one guest address may occupy: `1`, `2` or `4`. Fewer ways let hot addresses that share a row evict each other on every transfer, which Mono's densely packed JIT code does as soon as ASLR overlaps it with another image modulo the table's span. Measure with `tools/unitybench`. |
 | `ROSEMARY_STRICT_IMPORTS` | `0` | Refuse to run a program that has unbound imports, rather than announcing them on stderr and running anyway. Unbound imports are always announced; this only decides whether they are fatal. |
@@ -95,7 +105,7 @@ rosemary server --stop         # ask this prefix's server to exit
 | `ROSEMARY_PREFIX_HOME` | `prefix` | Where the guest's home directory is. `prefix` keeps it inside the prefix, so a prefix is one directory to copy, archive or delete. `host` mounts the guest's `/Users/<name>` onto the real `$HOME` instead, for a user who would rather keep one set of documents than two. |
 | `ROSEMARY_PREFIX_SETUP` | `ask` | What to do when a prefix needs its Darwin base and it is not cached. `ask` asks - a dialog under `rosemary run` when there is a display, then the terminal - and declines when there is nobody to ask. `download` fetches it without asking. `fail` never downloads. The base is verified against hashes compiled into Rosemary whichever route it takes. |
 | `ROSEMARY_AOT_CACHE` | `$XDG_CACHE_HOME/rosemary/aot` | Where code compiled ahead of time is cached, and where each run logs the image code it had to JIT (`profile/`). Falls back to `$HOME/.cache/rosemary/aot`; `0`, `off` or empty disables both. See `docs/aot.md`. |
-| `ROSEMARY_AOT_BACKGROUND` | on | `0` or `off` stops a run from starting `rosemary aot` in the background when an image of its program has no cache file. |
+| `ROSEMARY_AOT_BACKGROUND` | on | `0` or `off` stops a run from starting `rosemary aot` in the background when an image of its program has no cache file, or one built before runs compiled much uncached code. |
 | `ROSEMARY_AOT_CACHE_KEEP` | unset | Keep the AOT caches of other Rosemary builds instead of removing them when this build stores one, for bisecting between two builds. |
 | `ROSEMARY_ROOTFS_CACHE` | `$XDG_CACHE_HOME/rosemary/rootfs` | Where verified Darwin bases are cached, shared by every prefix. Falls back to `$HOME/.cache/rosemary/rootfs`. |
 | `ROSEMARY_ENVIRON` | unset | (builtin libc) Variables the guest starts with, one `NAME=VALUE` per line. A line that is a bare `NAME` copies the host's value, if it has one. Nothing else of the host's environment reaches the guest: it gets only `HOME`, `USER`, `LOGNAME`, `SHELL`, `PATH`, `TMPDIR` and `PWD` with its own values, plus the host's `TERM` and `COLORTERM`, and `LANG` and `LC_*` unless the guest is an application bundle (an app launched from the Finder has no locale variables; a bare `LANG` line still copies it). This keeps a Darwin program from following host settings such as `DISPLAY` or `QT_PLUGIN_PATH`. Example: `ROSEMARY_ENVIRON=$'FOO=bar\nDISPLAY'`. |

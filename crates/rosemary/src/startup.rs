@@ -13,6 +13,7 @@ pub fn run_initializers(exec: &dyn Execution) -> Result<usize, VmError> {
         .rev()
         .flat_map(|image| image.initializers.iter().copied())
         .collect();
+    exec.expect_calls(&initializers);
     for init in initializers {
         exec.call(init, &[argc, argv, envp, apple])?;
         ran += 1;

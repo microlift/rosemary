@@ -1,6 +1,6 @@
-use std::collections::HashMap;
-use std::sync::atomic::{AtomicPtr, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, RwLock};
+use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Condvar, Mutex, RwLock};
 
 use machish::memory::Regions;
 
@@ -77,6 +77,10 @@ struct Slot {
     pc: AtomicU64,
     translation: AtomicPtr<Translation>,
 }
+
+/// The most of [`EntryIndex`]'s slots that may hold an address, as a fraction.
+/// Linear probing stays short well past half full.
+const MAX_LOAD: (usize, usize) = (7, 10);
 
 /// A slot nothing has been written to. No guest address is `u64::MAX`.
 const EMPTY: u64 = u64::MAX;
@@ -199,15 +203,15 @@ impl EntryIndex {
         }
     }
 
-    /// Keep the table under half full, so a probe of a missing address always reaches
-    /// an empty slot rather than running the whole array.
+    /// Keep the table at most [`MAX_LOAD`] full, so a probe of a missing address
+    /// reaches an empty slot after a few steps rather than running the whole array.
     fn grow_for(&self, extra: usize) {
         let table = self.table();
         let wanted = self.live.load(Ordering::Relaxed) + extra;
-        if wanted * 2 <= table.slots.len() {
+        if wanted * MAX_LOAD.1 <= table.slots.len() * MAX_LOAD.0 {
             return;
         }
-        let bigger = Table::empty(wanted * 4);
+        let bigger = Table::empty(wanted * 2);
         // Rehashed out of the old table rather than rebuilt from the regions: an
         // address is never removed from it, only nulled, so the old table is exactly
         // the set to keep.
@@ -217,8 +221,9 @@ impl EntryIndex {
                 bigger.put(pc, slot.translation.load(Ordering::Relaxed));
             }
         }
-        // The displaced table is leaked. Capacity quadruples, so everything ever
-        // leaked together is a third of the live table.
+        // The displaced table is leaked. Capacity doubles, so everything ever leaked
+        // together is no larger than the live table: a large program publishes
+        // millions of addresses, and quadrupling held four times what it used.
         self.table.store(Box::into_raw(bigger), Ordering::Release);
     }
 }
@@ -248,13 +253,98 @@ pub struct CodeCache {
     /// answered after that many. See `len`.
     inserts: AtomicU64,
     counted: std::sync::Mutex<(u64, usize)>,
-    /// Images whose cached code has been looked for, by path: each is looked for
-    /// once, at its first miss.
-    adopted: std::sync::Mutex<std::collections::HashSet<String>>,
+    /// Image mappings whose cached code has been looked for, by path and slide: each
+    /// is looked for once, at its first miss, and a miss meanwhile waits for it. An
+    /// image a program maps twice is two mappings, each with code bound to its slide.
+    adopted: std::sync::Mutex<HashMap<(String, u64), Arc<std::sync::OnceLock<()>>>>,
+    /// The cache files of those images, mapped; their regions are published as the
+    /// run first reaches them.
+    cached: RwLock<Vec<Arc<crate::aot::Cached>>>,
     /// Everything microlift needs to know before it lifts anything: the registered
     /// import addresses and the read-only segment hints. Immutable, so a lift reads it
     /// without taking anything.
     config: LifterConfig,
+    /// Addresses a thread is lifting right now. A second thread that misses on one
+    /// waits for that lift instead of compiling the region again, which is what lets
+    /// a lift started ahead of time on a worker shorten the wait of the thread that
+    /// needs it.
+    in_flight: Mutex<HashMap<u64, Arc<InFlight>>>,
+    /// Whether lifts start at [`Tier::Provisional`]. Only once there are workers to
+    /// replace them: a cache nobody upgrades would keep slow code forever.
+    tiered: AtomicBool,
+}
+
+/// A [`CodeCache`]'s locks, held across a fork.
+pub(crate) struct ForkHold {
+    adopted: std::sync::MutexGuard<'static, HashMap<(String, u64), Arc<std::sync::OnceLock<()>>>>,
+    cached: std::sync::RwLockWriteGuard<'static, Vec<Arc<crate::aot::Cached>>>,
+    counted: std::sync::MutexGuard<'static, (u64, usize)>,
+    published: std::sync::RwLockWriteGuard<'static, Published>,
+    in_flight: std::sync::MutexGuard<'static, HashMap<u64, Arc<InFlight>>>,
+    tiered: &'static AtomicBool,
+}
+
+impl ForkHold {
+    /// In the child, a lift or an adoption another thread had started will never
+    /// finish: the thread was not forked. Forgetting it lets the child do it itself.
+    /// Nor will the child have workers to upgrade provisional code.
+    pub(crate) fn release(mut self, in_child: bool) {
+        if in_child {
+            self.in_flight.clear();
+            self.adopted.retain(|_, once| once.get().is_some());
+            self.tiered.store(false, Ordering::Relaxed);
+        }
+        let ForkHold {
+            adopted,
+            cached,
+            counted,
+            published,
+            in_flight,
+            tiered: _,
+        } = self;
+        drop((in_flight, published, counted, cached, adopted));
+    }
+}
+
+/// One lift in progress, which other threads can wait on.
+#[derive(Default)]
+struct InFlight {
+    done: Mutex<bool>,
+    finished: Condvar,
+}
+
+impl InFlight {
+    fn wait(&self) {
+        let mut done = self.done.lock().unwrap_or_else(|e| e.into_inner());
+        while !*done {
+            done = self.finished.wait(done).unwrap_or_else(|e| e.into_inner());
+        }
+    }
+}
+
+/// A claim on lifting one address, released however the lift ends.
+struct Claim<'a> {
+    cache: &'a CodeCache,
+    pc: u64,
+    lift: Arc<InFlight>,
+}
+
+impl Drop for Claim<'_> {
+    fn drop(&mut self) {
+        self.cache
+            .in_flight
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&self.pc);
+        *self.lift.done.lock().unwrap_or_else(|e| e.into_inner()) = true;
+        self.lift.finished.notify_all();
+    }
+}
+
+/// How a lift of an address can proceed: by this thread, or after another's.
+enum Turn<'a> {
+    Lift(Claim<'a>),
+    Wait(Arc<InFlight>),
 }
 
 /// Reads image code at `va`, from the program or an image the guest `dlopen`ed.
@@ -295,6 +385,19 @@ struct Published {
     /// The bytes each translation of guest-generated code was lifted from, by host
     /// page: what a drain compares a written page against. See [`crate::smc`].
     snapshots: HashMap<u64, Vec<(Arc<Translation>, Arc<crate::smc::Snapshot>)>>,
+    /// Addresses whose published translation is [`Tier::Provisional`], waiting for
+    /// [`CodeCache::upgrade`].
+    provisional: HashSet<u64>,
+}
+
+/// How hard the JIT works on a region. See [`crate::jit::tiered`].
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Tier {
+    /// Cheap to compile, slow to run: a region's first translation, until a worker
+    /// replaces it.
+    Provisional,
+    /// The level this run asked for.
+    Final,
 }
 
 /// How many times a lift of generated code is retried when its bytes change before
@@ -321,12 +424,16 @@ impl CodeCache {
                 cache: microlift::runtime::CodeCache::new(),
                 retained: Vec::new(),
                 snapshots: HashMap::new(),
+                provisional: HashSet::new(),
             }),
             index: EntryIndex::new(),
             inserts: AtomicU64::new(0),
             counted: std::sync::Mutex::new((0, 0)),
             adopted: std::sync::Mutex::default(),
+            cached: RwLock::default(),
             config,
+            in_flight: Mutex::default(),
+            tiered: AtomicBool::new(false),
         }
     }
 
@@ -385,21 +492,153 @@ impl CodeCache {
         program: &Program<M>,
         pc: u64,
     ) -> Result<Arc<Translation>, VmError> {
+        self.get_or_lift_fresh(program, pc)
+            .map(|(translation, _)| translation)
+    }
+
+    /// [`get_or_lift`](Self::get_or_lift), and whether this call is the one that
+    /// lifted it.
+    pub fn get_or_lift_fresh<M: Regions>(
+        &self,
+        program: &Program<M>,
+        pc: u64,
+    ) -> Result<(Arc<Translation>, bool), VmError> {
         if let Some(hit) = self.lookup(pc) {
+            return Ok((hit, false));
+        }
+        self.adopt_cached(program, pc);
+        loop {
+            match self.turn(pc) {
+                Turn::Lift(claim) => {
+                    return self
+                        .lift_claimed(program, &claim)
+                        .map(|translation| (translation, true));
+                }
+                Turn::Wait(lift) => {
+                    lift.wait();
+                    if let Some(hit) = self.lookup(pc) {
+                        return Ok((hit, false));
+                    }
+                    // The other lift failed. Lifting again reports the failure here.
+                }
+            }
+        }
+    }
+
+    /// Lift `pc` ahead of its first use, unless it is translated or being translated
+    /// already. Returns the translation only when this call made it.
+    pub fn lift_ahead<M: Regions>(
+        &self,
+        program: &Program<M>,
+        pc: u64,
+    ) -> Option<Arc<Translation>> {
+        if self.lookup(pc).is_some() {
+            return None;
+        }
+        self.adopt_cached(program, pc);
+        match self.turn(pc) {
+            Turn::Lift(claim) => self.lift_claimed(program, &claim).ok(),
+            Turn::Wait(_) => None,
+        }
+    }
+
+    /// Whether `pc` is translated, without taking a lock.
+    pub fn is_translated(&self, pc: u64) -> bool {
+        self.index.get(pc).is_some()
+    }
+
+    /// Whether `pc` is translated, or a thread is translating it.
+    pub fn has_or_lifting(&self, pc: u64) -> bool {
+        self.index.get(pc).is_some()
+            || self
+                .in_flight
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .contains_key(&pc)
+    }
+
+    /// Claim the lift of `pc`, or the lift another thread claimed first.
+    fn turn(&self, pc: u64) -> Turn<'_> {
+        let mut in_flight = self.in_flight.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(lift) = in_flight.get(&pc) {
+            return Turn::Wait(Arc::clone(lift));
+        }
+        let lift = Arc::new(InFlight::default());
+        in_flight.insert(pc, Arc::clone(&lift));
+        Turn::Lift(Claim {
+            cache: self,
+            pc,
+            lift,
+        })
+    }
+
+    fn lift_claimed<M: Regions>(
+        &self,
+        program: &Program<M>,
+        claim: &Claim<'_>,
+    ) -> Result<Arc<Translation>, VmError> {
+        // A lift that finished between the miss and the claim.
+        if let Some(hit) = self.lookup(claim.pc) {
             return Ok(hit);
         }
-        if self.adopt_cached(program, pc)
-            && let Some(hit) = self.lookup(pc)
-        {
-            return Ok(hit);
+        if let Some(cached) = self.publish_cached(program, claim.pc) {
+            return Ok(cached);
         }
-        crate::aot::profile::note_miss(program, pc);
+        // Recorded for the AOT profile, lifted ahead or not: code the JIT compiles is
+        // code a later run's cache can hold instead.
+        crate::aot::profile::note_miss(program, claim.pc);
+        let tier = match self.tiered.load(Ordering::Relaxed) {
+            true => Tier::Provisional,
+            false => Tier::Final,
+        };
         let mut attempt = 0;
         loop {
-            match self.lift_and_publish(program, pc, attempt == STALE_RETRIES)? {
+            match self.lift_and_publish(program, claim.pc, attempt >= STALE_RETRIES, tier)? {
                 Some(translation) => return Ok(translation),
-                None => attempt += 1,
+                None => match self.lookup(claim.pc) {
+                    Some(hit) => return Ok(hit),
+                    None => attempt += 1,
+                },
             }
+        }
+    }
+
+    /// Start lifting at [`Tier::Provisional`], now that something will call
+    /// [`upgrade`](Self::upgrade). Off unless [`crate::jit::tiered`].
+    pub fn start_tiering(&self) {
+        self.tiered.store(crate::jit::tiered(), Ordering::Relaxed);
+    }
+
+    /// Whether the translation at `pc` is still [`Tier::Provisional`].
+    pub fn is_provisional(&self, pc: u64) -> bool {
+        self.read().provisional.contains(&pc)
+    }
+
+    /// Replace the [`Tier::Provisional`] translation lifted for `pc` with a
+    /// [`Tier::Final`] one. Nothing happens if `pc` has none, or loses it while this
+    /// compiles.
+    ///
+    /// The replacement takes over every link cell that named the old translation, and
+    /// each thread drops the rows it published for it the next time it looks one up, as
+    /// it would for code a write retired. The old code stays mapped, so a thread still
+    /// inside it finishes there.
+    pub fn upgrade<M: Regions>(&self, program: &Program<M>, pc: u64) {
+        if !self.is_provisional(pc) {
+            return;
+        }
+        let _ = self.lift_and_publish(program, pc, true, Tier::Final);
+    }
+
+    /// Every lock this cache takes, held by the thread about to fork, in the order the
+    /// rest of the cache takes them; see [`crate::fork`].
+    pub(crate) fn hold_for_fork(&'static self) -> ForkHold {
+        ForkHold {
+            adopted: self.adopted.lock().unwrap_or_else(|e| e.into_inner()),
+            cached: self.cached.write().unwrap_or_else(|e| e.into_inner()),
+            counted: self.counted.lock().unwrap_or_else(|e| e.into_inner()),
+            published: self.write(),
+            in_flight: self.in_flight.lock().unwrap_or_else(|e| e.into_inner()),
+            tiered: &self.tiered,
         }
     }
 
@@ -408,28 +647,40 @@ impl CodeCache {
         &self.config
     }
 
-    /// Publish the cached code of the image holding `pc`, the first time one of its
-    /// addresses misses. Returns whether anything was published.
-    fn adopt_cached<M: Regions>(&self, program: &Program<M>, pc: u64) -> bool {
+    /// Map the cache files of the image holding `pc`, the first time one of its
+    /// addresses misses. A thread that misses in an image another is adopting waits
+    /// for it: what it would compile meanwhile is likely in the cache.
+    fn adopt_cached<M: Regions>(&self, program: &Program<M>, pc: u64) {
         let Some(layout) = crate::aot::Layout::current() else {
-            return false;
+            return;
         };
         let Some((path, slide)) = program.code_image(pc) else {
-            return false;
+            return;
         };
-        let first = self
-            .adopted
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .insert(path.clone());
-        if !first {
-            return false;
-        }
-        let Ok(bytes) = std::fs::read(&path) else {
-            return false;
+        let once = {
+            let mut adopted = self.adopted.lock().unwrap_or_else(|e| e.into_inner());
+            Arc::clone(
+                adopted
+                    .entry((path.clone(), slide))
+                    .or_insert_with(|| Arc::new(std::sync::OnceLock::new())),
+            )
+        };
+        once.get_or_init(|| self.adopt_image(layout, program, pc, &path, slide));
+    }
+
+    fn adopt_image<M: Regions>(
+        &self,
+        layout: &'static crate::aot::Layout,
+        program: &Program<M>,
+        pc: u64,
+        path: &str,
+        slide: u64,
+    ) {
+        let Ok(bytes) = std::fs::read(path) else {
+            return;
         };
         let id = crate::aot::ImageId::of(&bytes);
-        crate::aot::profile::remember_id(&path, id);
+        crate::aot::profile::remember_id(path, id);
         // Linked with the program, or brought in by a `dlopen`.
         let matches = match program.report.images.iter().find(|r| r.path == path) {
             Some(report) => crate::aot::matches_file(&program.memory, report, &bytes),
@@ -442,78 +693,147 @@ impl CodeCache {
                 })
             }),
         };
+        drop(bytes);
         let tracing = crate::shims::vmmap::tracing();
         if !matches {
             if tracing {
                 eprintln!("rosemary: aot: {path}: the code loaded is not the code in its file");
             }
-            return false;
+            return;
         }
-        let regions = match crate::aot::load(layout, &id, &self.config, slide) {
-            Ok(Some(regions)) => regions,
-            Ok(None) => {
-                if tracing {
-                    eprintln!(
-                        "rosemary: aot: {path}: nothing cached at {}",
-                        layout.image(&id).display()
-                    );
+        let parts: Vec<Arc<crate::aot::Cached>> =
+            match crate::aot::open(layout, &id, &self.config, slide) {
+                Ok(parts) => parts.into_iter().map(Arc::new).collect(),
+                Err(e) => {
+                    eprintln!("rosemary: aot: {path}: the cached code was not used: {e}");
+                    return;
                 }
-                return false;
-            }
-            Err(e) => {
-                eprintln!("rosemary: aot: {path}: the cached code was not used: {e}");
-                return false;
-            }
+            };
+        let Some((hot, cold)) = parts.split_first() else {
+            return;
         };
+        // What start-up needs is mapped now, however long that takes, since the JIT
+        // would take far longer; the rest on a thread of its own, the JIT standing in
+        // for it until it is ready.
+        if let Err(e) = hot.map_code() {
+            eprintln!("rosemary: aot: {path}: the cached code was not used: {e}");
+            return;
+        }
         if tracing {
-            eprintln!("rosemary: aot: {path}: {} cached region(s)", regions.len());
+            let regions: u32 = parts.iter().map(|part| part.region_count()).sum();
+            eprintln!(
+                "rosemary: aot: {path}: {regions} region(s) in {} file(s){}",
+                parts.len(),
+                if hot.in_place() {
+                    ", mapped in place"
+                } else {
+                    ", copied"
+                }
+            );
+        }
+        let cold: Vec<Arc<crate::aot::Cached>> = cold.iter().map(Arc::clone).collect();
+        self.cached
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .extend(parts);
+        if crate::fork::in_child() {
+            // No thread of this runtime's own in a fork's child; see `crate::fork`.
+            cold.iter().for_each(|part| drop(part.map_code()));
+        } else if !cold.is_empty() {
+            let mapped = std::thread::Builder::new()
+                .name("rosemary-aot-map".into())
+                .spawn(move || {
+                    for part in cold {
+                        let _ = part.map_code();
+                    }
+                });
+            if let Err(e) = mapped {
+                eprintln!("rosemary: aot: could not map cached code in the background: {e}");
+            }
+        }
+    }
+
+    /// Publish the cached region that can be entered at `pc`, if a cache file has one
+    /// this process may run and it was never published before.
+    fn publish_cached<M: Regions>(
+        &self,
+        program: &Program<M>,
+        pc: u64,
+    ) -> Option<Arc<Translation>> {
+        let tiered = self.tiered.load(Ordering::Relaxed);
+        let cached = self.cached.read().unwrap_or_else(|e| e.into_inner());
+        let (part, region) = cached
+            .iter()
+            // Provisional code runs only where something will upgrade it.
+            .filter(|part| part.tier == Tier::Final || tiered)
+            .find_map(|part| {
+                // The thread mapping cold parts in the background was not forked.
+                if crate::fork::in_child() && !part.code_mapped() {
+                    let _ = part.map_code();
+                }
+                let index = part.claim(pc)?;
+                Some((part, part.region(&self.config, index)?))
+            })?;
+        let cold = !part.hot;
+        let translation = region.translation;
+        let start = translation.covered.iter().map(|r| r.start).min()?;
+        let end = translation.covered.iter().map(|r| r.end).max()?;
+        crate::fault::placed(
+            translation.entry as usize as u64,
+            translation.link_target as usize as u64,
+            start,
+            end,
+            region.lift_base,
+            &region.map,
+        );
+        if crate::lldb::enabled() {
+            let mut guest_bytes = vec![0u8; (end - start) as usize];
+            if read_image_code(program, start, &mut guest_bytes) {
+                crate::lldb::register(
+                    translation.link_target as usize as u64,
+                    start,
+                    end,
+                    &program.locate(start).unwrap_or_default(),
+                    &guest_bytes,
+                    &region.map,
+                );
+            }
+        }
+        crate::stats::record_cached(region.code_len);
+        if crate::shims::vmmap::tracing() {
+            eprintln!("rosemary: aot: published {pc:#x}");
+        }
+        let provisional = part.tier == Tier::Provisional;
+        drop(cached);
+        if cold {
+            // Code that ran is what the next build compiles first and fully; code the
+            // first part already holds is not logged, so the log stops growing once
+            // the cache holds what runs.
+            crate::aot::profile::note_miss(program, pc);
         }
         let mut published = self.write();
-        let any = !regions.is_empty();
-        for region in regions {
-            let translation = region.translation;
-            let start = translation.covered.iter().map(|r| r.start).min();
-            let end = translation.covered.iter().map(|r| r.end).max();
-            let (Some(start), Some(end)) = (start, end) else {
-                continue;
-            };
-            crate::fault::placed(
-                translation.entry as usize as u64,
-                translation.link_target as usize as u64,
-                start,
-                end,
-                region.lift_base,
-                &region.map,
-            );
-            if crate::lldb::enabled() {
-                let mut guest_bytes = vec![0u8; (end - start) as usize];
-                if read_image_code(program, start, &mut guest_bytes) {
-                    crate::lldb::register(
-                        translation.link_target as usize as u64,
-                        start,
-                        end,
-                        &program.locate(start).unwrap_or_default(),
-                        &guest_bytes,
-                        &region.map,
-                    );
-                }
-            }
-            let translation = published.cache.insert(translation);
-            published.retained.push(Arc::clone(&translation));
-            self.inserts.fetch_add(1, Ordering::Release);
-            self.index
-                .publish(&translation.resume_points, Arc::as_ptr(&translation));
+        let translation = published.cache.insert(translation);
+        published.retained.push(Arc::clone(&translation));
+        if provisional {
+            published.provisional.insert(pc);
         }
-        any
+        self.inserts.fetch_add(1, Ordering::Release);
+        self.index
+            .publish(&translation.resume_points, Arc::as_ptr(&translation));
+        Some(translation)
     }
 
     /// One lift of `pc`, published - or `None` when the guest rewrote the bytes it
     /// was made from before it could be, and `last` is not set.
+    ///
+    /// Lifting at [`Tier::Final`] an address whose translation is provisional replaces
+    /// it; see [`upgrade`](Self::upgrade).
     fn lift_and_publish<M: Regions>(
         &self,
         program: &Program<M>,
         pc: u64,
         last: bool,
+        tier: Tier,
     ) -> Result<Option<Arc<Translation>>, VmError> {
         let selecting = crate::stats::enabled().then(std::time::Instant::now);
         // A region always begins at the address it was made for, so its cache
@@ -525,6 +845,13 @@ impl CodeCache {
             crate::stats::record_select(selecting.elapsed());
         }
         let start = region.range.start;
+        let generated = crate::shims::vmmap::contains(start);
+        // Code the guest wrote is never upgraded: a write may retire it at any time,
+        // and its replacement is lifted from bytes nobody compared.
+        let tier = match generated {
+            true => Tier::Final,
+            false => tier,
+        };
 
         // How long one region took to compile, when tracing. Not curiosity. A
         // big region is not slow in proportion to its size.
@@ -538,7 +865,7 @@ impl CodeCache {
         declared.dedup();
 
         // A region that will not compile is refused outright.
-        let compiled = match compile_region(&self.config, &bytes, &region, &declared) {
+        let compiled = match compile_region(&self.config, &bytes, &region, &declared, tier) {
             Ok(compiled) => compiled,
             Err(source) => {
                 crate::stats::record_refused();
@@ -600,14 +927,14 @@ impl CodeCache {
 
         // Lifted at run-time addresses with a zero slide, so the address a region was
         // lifted for is the address it runs at, and the image base is the region's own start.
-        let translation = Translation::from_compiled(
+        let translation = Translation::from_owned(
             compiled.region,
             start,
             compiled.resume_points,
             compiled.covered,
             compiled.data_dependencies,
             compiled.link_sites,
-            compiled.backend,
+            microlift::runtime::jit::JitRegion::owner(),
         );
         debug_assert!(
             translation.covers(pc),
@@ -615,11 +942,16 @@ impl CodeCache {
              it was lifted for"
         );
 
-        let generated = crate::shims::vmmap::contains(start);
-
         // Two threads that missed on the same address both compiled it. The loser is
         // displaced from microlift's map but not dropped - see [`Published::retained`].
         let mut published = self.write();
+        let replacing = tier == Tier::Final && published.provisional.remove(&pc);
+        if tier == Tier::Final && !replacing && published.cache.peek(pc).is_some() {
+            // Published while this compiled - by an upgrade, or by a region that can
+            // also be entered here - and what is published stays.
+            published.retained.push(Arc::new(translation));
+            return Ok(None);
+        }
         let snapshot = match generated {
             false => None,
             true => {
@@ -644,10 +976,18 @@ impl CodeCache {
         // *elsewhere* that has been waiting for one of these resume points.
         let translation = published.cache.insert(translation);
         published.retained.push(Arc::clone(&translation));
+        if tier == Tier::Provisional {
+            published.provisional.insert(pc);
+        }
         // What makes `len`'s memo stale, bumped under the same lock the insert took.
         self.inserts.fetch_add(1, Ordering::Release);
         self.index
             .publish(&translation.resume_points, Arc::as_ptr(&translation));
+        if replacing {
+            // After the index answers with the replacement: a thread that caught up
+            // before then would relink the old code and never be told again.
+            crate::smc::retire(&translation.resume_points);
+        }
         if let Some(snapshot) = snapshot {
             let snapshot = Arc::new(snapshot);
             let mut pages: Vec<u64> = snapshot.pages().collect();
@@ -770,6 +1110,7 @@ fn compile_region(
     bytes: &[u8],
     region: &crate::region::Region,
     declared: &[u64],
+    tier: Tier,
 ) -> microlift::Result<Compiled> {
     let clock = crate::stats::enabled().then(std::time::Instant::now);
     crate::stats::record_extent(region.range.start, region.range.end);
@@ -784,18 +1125,12 @@ fn compile_region(
     config.block_ranges = region.blocks.clone();
 
     let lifted = lift_to_code::<X86_64>(bytes, region.range.start, config)?;
-    // Cloned out before the lift is consumed: these four are what the shared cache
-    // needs to publish, invalidate and link this translation, and
-    // `compile_lifted_region` takes the `LiftedCode` by value. `Translation::compile`
-    // does exactly this and is not used here only because it discards the source map
-    // that [`crate::fault`] and [`crate::lldb`] are handed below.
-    let resume_points = lifted.resume_points.clone();
-    let covered = lifted.covered.clone();
-    let data_dependencies = lifted.data_dependencies.clone();
-    let link_sites = lifted.link_sites.clone();
     let lift_took = clock.map(|c| c.elapsed());
-    let mut backend = crate::jit::backend()?;
-    let (compiled_region, map) = backend.compile_lifted_region(lifted)?;
+    let compiled = {
+        // Compiling runs on a guest thread, whose `errno` is the guest's.
+        let _errno = crate::thread::Errno::now();
+        crate::jit::region_compiler(tier)?.compile(lifted)?
+    };
     if let (Some(clock), Some(lift)) = (clock, lift_took) {
         crate::stats::record_lift(
             region.instructions(),
@@ -804,24 +1139,23 @@ fn compile_region(
             clock.elapsed() - lift,
         );
     }
+    crate::stats::record_code(compiled.code_len);
     Ok(Compiled {
-        backend,
-        region: compiled_region,
-        map,
+        region: compiled.region,
+        map: compiled.map,
         guest_bytes: crate::lldb::enabled()
             .then(|| bytes.to_vec())
             .unwrap_or_default(),
-        resume_points,
-        covered,
-        data_dependencies,
-        link_sites,
+        resume_points: compiled.resume_points,
+        covered: compiled.covered,
+        data_dependencies: compiled.data_dependencies,
+        link_sites: compiled.link_sites,
     })
 }
 
 /// One region through the lifter and the compiler, with everything about it that
 /// only the lift knows.
 struct Compiled {
-    backend: microlift::backend::CraneliftBackend,
     /// The two entry points and this region's link-cell array.
     region: microlift::backend::CompiledRegion,
     /// Host offset -> guest instruction, so a fault inside this code can name

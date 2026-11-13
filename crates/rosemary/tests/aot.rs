@@ -55,6 +55,14 @@ fn adopted(stderr: &str) -> usize {
         .sum()
 }
 
+/// How many regions a traced run published from the cache.
+fn published(stderr: &str) -> usize {
+    stderr
+        .lines()
+        .filter(|line| line.starts_with("rosemary: aot: published "))
+        .count()
+}
+
 #[test]
 fn a_program_compiled_ahead_of_time_runs_from_its_cache() {
     let Some(path) = common::build_x86_64("aot-link", common::LINK_C, &[]) else {
@@ -72,10 +80,14 @@ fn a_program_compiled_ahead_of_time_runs_from_its_cache() {
         "{report}{}",
         String::from_utf8_lossy(&built.stderr)
     );
-    assert_eq!(
-        cache_files(&dir).len(),
-        1,
-        "one file for the one guest image"
+    let files = cache_files(&dir);
+    let image = |file: &PathBuf| {
+        let name = file.file_name().unwrap().to_string_lossy().into_owned();
+        name.split('.').next().unwrap().to_owned()
+    };
+    assert!(
+        !files.is_empty() && files.iter().all(|file| image(file) == image(&files[0])),
+        "files for the one guest image: {files:?}"
     );
     let cached_regions: usize = report
         .split(": ")
@@ -90,6 +102,7 @@ fn a_program_compiled_ahead_of_time_runs_from_its_cache() {
     assert_eq!(cached.stdout, plain.stdout);
     // The fixture folds in no data, so every region runs wherever the image lands.
     assert_eq!(adopted(&stderr), cached_regions, "{stderr}");
+    assert!(published(&stderr) > 0, "{stderr}");
 }
 
 #[test]
@@ -160,4 +173,5 @@ fn an_image_a_run_dlopened_is_compiled_and_runs_from_its_cache() {
             .is_some_and(|regions| regions > 0)),
         "{stderr}"
     );
+    assert!(published(&stderr) > 0, "{stderr}");
 }
