@@ -163,7 +163,7 @@ fn of_filter(registrations: &Registrations, filter: i16) -> impl Iterator<Item =
         .map(|(_, registration)| registration)
 }
 
-struct Queue<B> {
+struct Queue<B: ReadinessBackend> {
     registrations: Registrations,
     /// The Mach receive sockets the backend watches for `EV_CLEAR`
     /// `EVFILT_MACHPORT` registrations, by descriptor. Holding the receiver
@@ -181,15 +181,15 @@ struct Queue<B> {
     backend: Arc<B>,
 }
 
-impl<B> Drop for Queue<B> {
+impl<B: ReadinessBackend> Drop for Queue<B> {
     fn drop(&mut self) {
         for registration in of_filter(&self.registrations, EVFILT_SIGNAL) {
-            let _ = crate::signal::observe(registration.ident as i32, false);
+            let _ = self.backend.watch_signal(registration.ident as i32, false);
         }
     }
 }
 
-impl<B> Queue<B> {
+impl<B: ReadinessBackend> Queue<B> {
     fn new(backend: B) -> Self {
         Self {
             registrations: Registrations::new(),
@@ -264,6 +264,24 @@ trait ReadinessBackend: Sized {
     /// The `NOTE_*` conditions that hold on socket `fd` now.
     fn socket_conditions(_: c_int) -> u32 {
         0
+    }
+    /// Start or stop watching Darwin signal `darwin`. Errors are host `errno`s.
+    ///
+    /// FIXME (ACCURACY): rebuilt from the signal handler, so a signal blocked
+    /// in every thread is not seen until it is unblocked. Darwin reports it
+    /// when it is generated and leaves it pending.
+    fn watch_signal(&self, darwin: i32, watch: bool) -> Result<(), c_int> {
+        match watch {
+            true => {
+                register_waker(self.wake_descriptor())?;
+                crate::signal::observe(darwin, true)
+            }
+            false => crate::signal::observe(darwin, false),
+        }
+    }
+    /// How many times `darwin` has been generated while watched.
+    fn signals(&self, darwin: i32) -> u64 {
+        crate::signal::delivered(darwin)
     }
 }
 
@@ -746,6 +764,8 @@ struct KqueueBackend {
     /// queue with a plain `write` through `WAKER_FDS`.
     wake_read: c_int,
     wake_write: c_int,
+    /// What the host's `EVFILT_SIGNAL` has reported, per Darwin signal.
+    generated: [std::sync::atomic::AtomicU64; 32],
 }
 
 #[cfg(target_os = "macos")]
@@ -769,6 +789,7 @@ impl KqueueBackend {
     const LEVEL_TOKEN: usize = 0;
     const EDGE_TOKEN: usize = 1;
     const PORT_TOKEN: usize = 2;
+    const SIGNAL_TOKEN: usize = 3;
 
     fn change(&self, fd: c_int, filter: i16, flags: u16, token: usize) -> Result<(), c_int> {
         let change = libc::kevent {
@@ -830,6 +851,7 @@ impl ReadinessBackend for KqueueBackend {
             kqueue,
             wake_read: ends[0],
             wake_write: ends[1],
+            generated: [const { std::sync::atomic::AtomicU64::new(0) }; 32],
         };
         let wake = libc::kevent {
             ident: backend.wake_read as usize,
@@ -939,6 +961,23 @@ impl ReadinessBackend for KqueueBackend {
         }
     }
 
+    /// The host's own `EVFILT_SIGNAL`, which fires as Darwin's does: when a
+    /// signal is sent to the process, whether it is blocked or ignored.
+    fn watch_signal(&self, darwin: i32, watch: bool) -> Result<(), c_int> {
+        let host = crate::signal::signal_to_host(darwin).ok_or(libc::EINVAL)?;
+        match watch {
+            true => self.change(host, libc::EVFILT_SIGNAL, libc::EV_ADD, Self::SIGNAL_TOKEN),
+            false => match self.change(host, libc::EVFILT_SIGNAL, libc::EV_DELETE, 0) {
+                Err(libc::ENOENT) => Ok(()),
+                other => other,
+            },
+        }
+    }
+
+    fn signals(&self, darwin: i32) -> u64 {
+        self.generated[darwin as usize & 31].load(Ordering::Acquire)
+    }
+
     fn wait(
         &self,
         queue: c_int,
@@ -1004,6 +1043,13 @@ impl ReadinessBackend for KqueueBackend {
         // registration on a descriptor against one entry, so fold them.
         let mut result: Vec<Ready> = Vec::new();
         for event in events.iter().take(count as usize) {
+            if event.udata as usize == Self::SIGNAL_TOKEN {
+                if let Some(darwin) = crate::signal::signal_from_host(event.ident as c_int) {
+                    self.generated[darwin as usize & 31]
+                        .fetch_add(event.data as u64, Ordering::AcqRel);
+                }
+                continue;
+            }
             let source = match event.udata as usize {
                 Self::WAKE_TOKEN => Source::Wake,
                 Self::EDGE_TOKEN => Source::Edge,
@@ -1206,7 +1252,7 @@ fn apply<B: ReadinessBackend>(state: &mut Queue<B>, change: &Kevent) -> Result<(
             state.triggered.retain(|ident| *ident != change.ident);
         }
         if change.filter == EVFILT_SIGNAL {
-            let _ = crate::signal::observe(change.ident as i32, false);
+            let _ = state.backend.watch_signal(change.ident as i32, false);
             release_signal_waker(state);
         }
         return Ok(());
@@ -1236,10 +1282,11 @@ fn apply<B: ReadinessBackend>(state: &mut Queue<B>, change: &Kevent) -> Result<(
             seen = match existing {
                 Some(existing) => existing.seen,
                 None => {
-                    register_waker(state.backend.wake_descriptor())
+                    state
+                        .backend
+                        .watch_signal(darwin, true)
                         .map_err(crate::errno::from_host)?;
-                    crate::signal::observe(darwin, true).map_err(crate::errno::from_host)?;
-                    crate::signal::delivered(darwin)
+                    state.backend.signals(darwin)
                 }
             };
         } else if change.filter == EVFILT_MACHPORT {
@@ -1642,7 +1689,7 @@ pub unsafe extern "C" fn kevent(
             let mut state = state.lock().unwrap_or_else(|e| e.into_inner());
             collect_sources(&mut state);
             !state.triggered.is_empty()
-                || signals_pending(&state.registrations)
+                || signals_pending(&state)
                 || sources_pending(&state)
                 || ports.iter().any(|port| port.ready())
         };
@@ -1694,10 +1741,10 @@ pub unsafe extern "C" fn kevent(
             if out.len() == capacity {
                 break;
             }
+            let count = state.backend.signals(key.1 as i32);
             let Some(registration) = state.registrations.get_mut(&key) else {
                 continue;
             };
-            let count = crate::signal::delivered(registration.ident as i32);
             if !registration.enabled || count <= registration.seen {
                 continue;
             }
@@ -1708,7 +1755,7 @@ pub unsafe extern "C" fn kevent(
             let (ident, flags) = (registration.ident, registration.flags);
             if flags & EV_ONESHOT != 0 {
                 state.registrations.remove(&key);
-                let _ = crate::signal::observe(ident as i32, false);
+                let _ = state.backend.watch_signal(ident as i32, false);
                 release_signal_waker(&state);
             } else if flags & EV_DISPATCH != 0 {
                 registration.enabled = false;
@@ -1941,14 +1988,14 @@ fn watched_ports(registrations: &Registrations) -> Vec<Arc<Receiver>> {
 }
 
 /// Read what each source's host object has reported since the last look.
-fn collect_sources<B>(state: &mut Queue<B>) {
+fn collect_sources<B: ReadinessBackend>(state: &mut Queue<B>) {
     for source in state.sources.values_mut() {
         source.collect();
     }
 }
 
 /// Whether an enabled registration's source has an event to report.
-fn sources_pending<B>(state: &Queue<B>) -> bool {
+fn sources_pending<B: ReadinessBackend>(state: &Queue<B>) -> bool {
     state.sources.iter().any(|(key, source)| {
         source.pending()
             && state
@@ -1959,9 +2006,9 @@ fn sources_pending<B>(state: &Queue<B>) -> bool {
 }
 
 /// Whether an enabled signal registration has deliveries it has not reported.
-fn signals_pending(registrations: &Registrations) -> bool {
-    of_filter(registrations, EVFILT_SIGNAL)
-        .any(|r| r.enabled && crate::signal::delivered(r.ident as i32) > r.seen)
+fn signals_pending<B: ReadinessBackend>(state: &Queue<B>) -> bool {
+    of_filter(&state.registrations, EVFILT_SIGNAL)
+        .any(|r| r.enabled && state.backend.signals(r.ident as i32) > r.seen)
 }
 
 /// `kevent64` and the filters `poll` cannot answer; see the module note.
@@ -2284,8 +2331,8 @@ mod tests {
         let host = crate::signal::signal_to_host(SIGWINCH).expect("a host signal");
         // SAFETY: a signal this process takes by default as a no-op.
         unsafe {
-            libc::raise(host);
-            libc::raise(host);
+            libc::kill(libc::getpid(), host);
+            libc::kill(libc::getpid(), host);
         }
         let (n, event) = collect(queue, None);
         assert_eq!(n, 1);
@@ -2315,17 +2362,99 @@ mod tests {
         };
         assert_eq!(collect(queue, Some(&change)).0, 0);
         // SAFETY: ignored, so this returns.
-        unsafe { libc::raise(host) };
+        unsafe { libc::kill(libc::getpid(), host) };
         let (n, event) = collect(queue, None);
         assert_eq!((n, event.data), (1, 1));
 
         change.flags = EV_DELETE;
         assert_eq!(collect(queue, Some(&change)).0, 0);
         // SAFETY: the disposition is SIG_IGN again, or this kills the test.
-        unsafe { libc::raise(host) };
+        unsafe { libc::kill(libc::getpid(), host) };
         assert_eq!(collect(queue, None).0, 0);
         // SAFETY: this test's own descriptor.
         unsafe { crate::net::descriptor::close(queue) };
+    }
+
+    const BLOCKED_WATCHER: &str = "ROSEMARY_KQUEUE_TEST_BLOCKED_WATCHER";
+    const BLOCKED_WATCHER_REPORT: c_int = libc::STDERR_FILENO;
+
+    /// launchd blocks the signals it watches. Darwin reports one when it is
+    /// generated, rather than once it is unblocked.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_signal_event_reports_a_signal_blocked_in_every_thread() {
+        use std::os::fd::{FromRawFd, OwnedFd};
+        use std::os::unix::process::CommandExt;
+        let host =
+            crate::signal::signal_to_host(crate::signal::signum::SIGHUP).expect("a host signal");
+        let (report_read, report_write) = pipe();
+        let start = child_start();
+        let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+        command
+            .args(["--exact", "kqueue::tests::blocked_watcher_child"])
+            .env(BLOCKED_WATCHER, "1")
+            // SAFETY: the write end, owned from here on.
+            .stderr(unsafe { OwnedFd::from_raw_fd(report_write) });
+        // SAFETY: async-signal-safe calls on a local set. Inherited across
+        // `exec`, so every thread of the child has it blocked.
+        unsafe {
+            command.pre_exec(move || {
+                let mut blocked: libc::sigset_t = std::mem::zeroed();
+                libc::sigemptyset(&mut blocked);
+                libc::sigaddset(&mut blocked, host);
+                libc::pthread_sigmask(libc::SIG_BLOCK, &blocked, std::ptr::null_mut());
+                Ok(())
+            })
+        };
+        let mut child = command.spawn().expect("the test binary");
+        drop(start);
+        let mut byte = 0u8;
+        // SAFETY: this test's own pipe and child.
+        unsafe {
+            assert_eq!(libc::read(report_read, (&raw mut byte).cast(), 1), 1);
+            assert_eq!(libc::kill(child.id() as libc::pid_t, host), 0);
+            libc::close(report_read);
+        }
+        let status = child.wait().expect("the child");
+        assert_eq!(status.code(), Some(0), "reported, and not delivered");
+    }
+
+    /// The watcher for the test above. It exits 0 once the signal is reported.
+    /// Blocked, the signal is never delivered: delivered, it would end the
+    /// process before then.
+    #[test]
+    fn blocked_watcher_child() {
+        if std::env::var_os(BLOCKED_WATCHER).is_none() {
+            return;
+        }
+        use crate::signal::signum::SIGHUP;
+        let queue = kqueue();
+        let add = Kevent {
+            ident: SIGHUP as usize,
+            filter: EVFILT_SIGNAL,
+            flags: EV_ADD,
+            ..Kevent::default()
+        };
+        assert_eq!(collect(queue, Some(&add)).0, 0);
+        let timeout = libc::timespec {
+            tv_sec: 5,
+            tv_nsec: 0,
+        };
+        let mut got = [Kevent::default(); 1];
+        // SAFETY: no changes, room for one event, then this process's exit.
+        unsafe {
+            libc::write(BLOCKED_WATCHER_REPORT, c"r".as_ptr().cast(), 1);
+            let n = kevent(
+                queue,
+                std::ptr::null(),
+                0,
+                got.as_mut_ptr(),
+                1,
+                &raw const timeout,
+            );
+            let reported = n == 1 && got[0].ident == SIGHUP as usize && got[0].data == 1;
+            libc::_exit(!reported as c_int);
+        }
     }
 
     /// `SIGCHLD`, which is what `opend` watches: a child exiting is reported.
@@ -2496,7 +2625,7 @@ mod tests {
         let raiser = std::thread::spawn(move || {
             std::thread::sleep(WAIT / 4);
             // SAFETY: continuing a running process does nothing.
-            unsafe { libc::raise(host) };
+            unsafe { libc::kill(libc::getpid(), host) };
         });
         let timeout = libc::timespec {
             tv_sec: 0,
@@ -3110,7 +3239,8 @@ mod tests {
         let copied = Descriptor(unsafe { crate::net::descriptor::dup(queue.0) });
         drop(queue);
 
-        assert!(wakes_on_signals(&held));
+        // A host that reports signals itself never wakes a queue from a handler.
+        assert_eq!(wakes_on_signals(&held), !cfg!(target_os = "macos"));
         assert_eq!(change(copied.0, &user_event(0, 0, NOTE_TRIGGER, 0)), 0);
         let (n, event) = collect(copied.0, None);
         assert_eq!(n, 1);
@@ -3121,6 +3251,8 @@ mod tests {
         assert_eq!(Arc::strong_count(&held), 1);
     }
 
+    // A host that reports signals itself never wakes a queue from a handler.
+    #[cfg(not(target_os = "macos"))]
     #[test]
     fn deleting_the_last_signal_registration_stops_signal_wakeups() {
         let queue = Descriptor(kqueue());
