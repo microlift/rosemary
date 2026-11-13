@@ -2285,6 +2285,7 @@ fn order_front(receiver: Id, make_key: bool) {
     if window.sdl.is_null() {
         return;
     }
+    let already_shown = window.shown != 0;
     let want = presentation(window);
     trace!(
         "{receiver:p} ordered front as {want:?}: style {:#x} level {}",
@@ -2294,9 +2295,9 @@ fn order_front(receiver: Id, make_key: bool) {
     // window its style mask and its level after making it, and reuses one
     // window as a dialog, then as a tooltip. A popup's parent has to be on the
     // screen, so a popup with nothing to hang off stays a toplevel.
-    if want != presentation_of_sdl(window.sdl)
-        && !(want != Presentation::Toplevel && popup_parent(receiver).is_null())
-    {
+    let remade = want != presentation_of_sdl(window.sdl)
+        && !(want != Presentation::Toplevel && popup_parent(receiver).is_null());
+    if remade {
         let api = match draws_with_opengl(window.sdl) {
             true => Api::OpenGl,
             false => Api::Undecided,
@@ -2308,9 +2309,10 @@ fn order_front(receiver: Id, make_key: bool) {
     apply_style(receiver);
     // The frame again, now that the window is the kind it is going to be: a
     // popup made a moment ago was placed against whatever its parent's position
-    // was then, and a toplevel remade as a popup was never placed at all.
+    // was then, and a toplevel remade as a popup was never placed at all. A
+    // window already on screen stays where it is.
     let (x, y, width, height) = crate::geometry::rect_to_sdl(window.requested);
-    if width > 0 && height > 0 {
+    if width > 0 && height > 0 && (remade || !already_shown) {
         let (local_x, local_y) = local_position(sdl, x, y);
         sdl3::video::set_window_size(sdl, width.max(1), height.max(1));
         sdl3::video::set_window_position(sdl, local_x, local_y);
@@ -4154,6 +4156,41 @@ mod tests {
     /// An immovable window refuses the drag, and a window with no SDL window
     /// behind it starts none - neither may leave a session the pump would then
     /// carry on against nothing.
+    #[test]
+    fn reordering_a_shown_window_leaves_it_where_it_is() {
+        if !sdl3::isolated::run_here_with_dummy_video() {
+            return;
+        }
+        crate::bootstrap();
+        let rect = NSRect {
+            origin: NSPoint { x: 20.0, y: 20.0 },
+            size: NSSize {
+                width: 180.0,
+                height: 120.0,
+            },
+        };
+        let object =
+            objc::object::create_instance(objc::class::lookup(c"NSWindow").expect("NSWindow"), 0);
+        let object = unsafe {
+            init_with_content_rect(
+                object,
+                objc::sel::get("initWithContentRect:styleMask:backing:defer:"),
+                rect,
+                style::TITLED,
+                0,
+                0,
+            )
+        };
+        order_front(object, false);
+        let sdl = unsafe { sdl_window(object) };
+        assert!(sdl3::video::set_window_position(sdl, 300, 200));
+        assert_eq!(sdl3::video::window_position(sdl), Some((300, 200)));
+
+        order_front(object, false);
+
+        assert_eq!(sdl3::video::window_position(sdl), Some((300, 200)));
+    }
+
     #[test]
     fn a_drag_needs_a_movable_window() {
         crate::bootstrap();
