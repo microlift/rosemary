@@ -20,13 +20,13 @@ pub fn run_here() -> bool {
 /// desktop clipboard. SDL's dummy video backend keeps clipboard contents local
 /// to the subprocess; parallel text tests cannot overwrite each other's data.
 pub fn run_here_with_dummy_video() -> bool {
-    run_here_with(&[("SDL_VIDEODRIVER", "dummy")])
+    run_here_with(&[("SDL_VIDEO_DRIVER", "dummy")])
 }
 
 /// As [`run_here_with_dummy_video`], with every window made on a virtual
 /// desktop of `extent`, which is a value of `ROSEMARY_DESKTOP`.
 pub fn run_here_on_dummy_desktop(extent: &str) -> bool {
-    run_here_with(&[("SDL_VIDEODRIVER", "dummy"), (crate::desktop::ENV, extent)])
+    run_here_with(&[("SDL_VIDEO_DRIVER", "dummy"), (crate::desktop::ENV, extent)])
 }
 
 fn run_here_with(environment: &[(&str, &str)]) -> bool {
