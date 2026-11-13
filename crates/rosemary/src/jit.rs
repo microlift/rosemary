@@ -764,16 +764,6 @@ pub fn backend() -> microlift::Result<CraneliftBackend> {
     CraneliftBackend::with_flags(flags(), isa_settings())
 }
 
-/// A JIT backend for a region's first, provisional translation under [`tiered`]
-/// compilation. The ISA is [`backend`]'s, so the two tiers differ only in how
-/// hard Cranelift works.
-pub fn provisional_backend() -> microlift::Result<CraneliftBackend> {
-    #[dynamic]
-    static FLAGS: settings::Flags = OptLevel::Fast.flags();
-    let _errno = crate::thread::Errno::now();
-    CraneliftBackend::with_flags(FLAGS.clone(), isa_settings())
-}
-
 /// The compiler for guest regions at `tier`: position-independent code placed in
 /// the arena every region shares. Built once per tier, since building an ISA
 /// detects the host's features.

@@ -281,14 +281,18 @@ pub(crate) struct ForkHold {
     counted: std::sync::MutexGuard<'static, (u64, usize)>,
     published: std::sync::RwLockWriteGuard<'static, Published>,
     in_flight: std::sync::MutexGuard<'static, HashMap<u64, Arc<InFlight>>>,
+    tiered: &'static AtomicBool,
 }
 
 impl ForkHold {
-    /// In the child, a lift another thread had claimed will never finish: the thread
-    /// was not forked. Forgetting the claim lets the child lift it itself.
+    /// In the child, a lift or an adoption another thread had started will never
+    /// finish: the thread was not forked. Forgetting it lets the child do it itself.
+    /// Nor will the child have workers to upgrade provisional code.
     pub(crate) fn release(mut self, in_child: bool) {
         if in_child {
             self.in_flight.clear();
+            self.adopted.retain(|_, once| once.get().is_some());
+            self.tiered.store(false, Ordering::Relaxed);
         }
         let ForkHold {
             adopted,
@@ -296,6 +300,7 @@ impl ForkHold {
             counted,
             published,
             in_flight,
+            tiered: _,
         } = self;
         drop((in_flight, published, counted, cached, adopted));
     }
@@ -537,6 +542,11 @@ impl CodeCache {
         }
     }
 
+    /// Whether `pc` is translated, without taking a lock.
+    pub fn is_translated(&self, pc: u64) -> bool {
+        self.index.get(pc).is_some()
+    }
+
     /// Whether `pc` is translated, or a thread is translating it.
     pub fn has_or_lifting(&self, pc: u64) -> bool {
         self.index.get(pc).is_some()
@@ -583,7 +593,7 @@ impl CodeCache {
         };
         let mut attempt = 0;
         loop {
-            match self.lift_and_publish(program, claim.pc, attempt == STALE_RETRIES, tier)? {
+            match self.lift_and_publish(program, claim.pc, attempt >= STALE_RETRIES, tier)? {
                 Some(translation) => return Ok(translation),
                 None => match self.lookup(claim.pc) {
                     Some(hit) => return Ok(hit),
@@ -628,6 +638,7 @@ impl CodeCache {
             counted: self.counted.lock().unwrap_or_else(|e| e.into_inner()),
             published: self.write(),
             in_flight: self.in_flight.lock().unwrap_or_else(|e| e.into_inner()),
+            tiered: &self.tiered,
         }
     }
 
@@ -691,7 +702,7 @@ impl CodeCache {
             return;
         }
         let parts: Vec<Arc<crate::aot::Cached>> =
-            match crate::aot::open(layout, &id, &self.config, path, slide) {
+            match crate::aot::open(layout, &id, &self.config, slide) {
                 Ok(parts) => parts.into_iter().map(Arc::new).collect(),
                 Err(e) => {
                     eprintln!("rosemary: aot: {path}: the cached code was not used: {e}");
@@ -749,11 +760,20 @@ impl CodeCache {
         program: &Program<M>,
         pc: u64,
     ) -> Option<Arc<Translation>> {
+        let tiered = self.tiered.load(Ordering::Relaxed);
         let cached = self.cached.read().unwrap_or_else(|e| e.into_inner());
-        let (part, region) = cached.iter().find_map(|part| {
-            let index = part.claim(pc)?;
-            Some((part, part.region(&self.config, index)?))
-        })?;
+        let (part, region) = cached
+            .iter()
+            // Provisional code runs only where something will upgrade it.
+            .filter(|part| part.tier == Tier::Final || tiered)
+            .find_map(|part| {
+                // The thread mapping cold parts in the background was not forked.
+                if crate::fork::in_child() && !part.code_mapped() {
+                    let _ = part.map_code();
+                }
+                let index = part.claim(pc)?;
+                Some((part, part.region(&self.config, index)?))
+            })?;
         let cold = !part.hot;
         let translation = region.translation;
         let start = translation.covered.iter().map(|r| r.start).min()?;
@@ -783,7 +803,7 @@ impl CodeCache {
         if crate::shims::vmmap::tracing() {
             eprintln!("rosemary: aot: published {pc:#x}");
         }
-        let provisional = part.tier == Tier::Provisional && self.tiered.load(Ordering::Relaxed);
+        let provisional = part.tier == Tier::Provisional;
         drop(cached);
         if cold {
             // Code that ran is what the next build compiles first and fully; code the

@@ -27,6 +27,8 @@ struct Held {
     prelift: crate::prelift::ForkHold,
     cache: Option<crate::cache::ForkHold>,
     fault: crate::fault::ForkHold,
+    mapping: std::sync::RwLockWriteGuard<'static, ()>,
+    profile: crate::aot::profile::ForkHold,
 }
 
 thread_local! {
@@ -38,11 +40,15 @@ extern "C" fn before_fork() {
     let prelift = crate::prelift::hold_for_fork();
     let cache = crate::thunk::published().map(|vm| vm.hold_cache_for_fork());
     let fault = crate::fault::hold_for_fork();
+    let mapping = crate::aot::hold_for_fork();
+    let profile = crate::aot::profile::hold_for_fork();
     HELD.with(|held| {
         *held.borrow_mut() = Some(Held {
             prelift,
             cache,
             fault,
+            mapping,
+            profile,
         })
     });
 }
@@ -51,6 +57,8 @@ fn release(in_child: bool) {
     let Some(held) = HELD.with(|held| held.borrow_mut().take()) else {
         return;
     };
+    drop(held.profile);
+    drop(held.mapping);
     drop(held.fault);
     if let Some(cache) = held.cache {
         cache.release(in_child);

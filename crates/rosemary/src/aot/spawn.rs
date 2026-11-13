@@ -40,9 +40,10 @@ fn enabled() -> bool {
 fn stale(layout: &Layout, id: &super::ImageId) -> bool {
     match super::embedded(layout, id) {
         None => true,
-        Some(built) => {
-            super::profile::grown(built.profiled, super::profile::records(&layout.profile(id)))
-        }
+        Some(built) => super::profile::grown(
+            built.profiled,
+            super::profile::distinct(&layout.profile(id)),
+        ),
     }
 }
 

@@ -17,7 +17,7 @@ pub mod store;
 
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
-use std::sync::LazyLock;
+use std::sync::{LazyLock, RwLock, RwLockWriteGuard};
 
 use microlift::core::LifterConfig;
 use microlift::core::fingerprint::StableHasher;
@@ -182,13 +182,20 @@ impl std::fmt::Display for LoadError {
     }
 }
 
+/// Taken to read by every [`Cached::map_code`] and to write across a fork, so a fork
+/// waits for a mapping in progress rather than leave the child a part whose mapping
+/// lock is held for ever. See [`crate::fork`].
+static MAPPING: RwLock<()> = RwLock::new(());
+
+/// No mapping runs from here until the hold is dropped.
+pub(crate) fn hold_for_fork() -> RwLockWriteGuard<'static, ()> {
+    MAPPING.write().unwrap_or_else(|e| e.into_inner())
+}
+
 /// One cache file of an image, mapped for this run. Its regions are published one at
 /// a time, as the run first reaches each.
 pub struct Cached {
     image: MappedImage,
-    /// The image mapping this was bound for: its file and run-time slide.
-    path: String,
-    slide: u64,
     pub tier: Tier,
     /// Part 0: what earlier runs executed and what start-up needs.
     pub hot: bool,
@@ -200,11 +207,6 @@ pub struct Cached {
 }
 
 impl Cached {
-    /// Whether this was bound for the mapping of `path` at `slide`.
-    pub fn maps(&self, path: &str, slide: u64) -> bool {
-        self.slide == slide && self.path == path
-    }
-
     /// The region that can be entered at `pc`, unless it was looked at before or its
     /// code is not mapped yet.
     pub fn claim(&self, pc: u64) -> Option<u32> {
@@ -227,6 +229,7 @@ impl Cached {
 
     /// Maps the code; see [`MappedImage::map_code`] for why that is apart.
     pub fn map_code(&self) -> Result<(), LoadError> {
+        let _mapping = MAPPING.read().unwrap_or_else(|e| e.into_inner());
         self.image.map_code().map(drop).map_err(LoadError::Image)
     }
 
@@ -251,14 +254,13 @@ pub fn embedded(layout: &Layout, id: &ImageId) -> Option<file::Embedded> {
     file::Embedded::decode(view.user()).ok()
 }
 
-/// Every cache file of image `id`, which this run mapped from `path` at `slide`, mapped for
+/// Every cache file of image `id`, which this run mapped at `slide`, mapped for
 /// reading and bound for `config`; empty when nothing is cached. No code is mapped
 /// yet: see [`Cached::map_code`].
 pub fn open(
     layout: &Layout,
     id: &ImageId,
     config: &LifterConfig,
-    path: &str,
     slide: u64,
 ) -> Result<Vec<Cached>, LoadError> {
     let mut parts = Vec::new();
@@ -268,7 +270,7 @@ pub fn open(
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => break,
             Err(e) => return Err(LoadError::Io(e)),
         };
-        parts.push(open_part(&file, n == 0, config, path, slide)?);
+        parts.push(open_part(&file, n == 0, config, slide)?);
     }
     Ok(parts)
 }
@@ -277,7 +279,6 @@ fn open_part(
     file: &std::fs::File,
     hot: bool,
     config: &LifterConfig,
-    path: &str,
     slide: u64,
 ) -> Result<Cached, LoadError> {
     let mut image = MappedImage::open(file).map_err(LoadError::Image)?;
@@ -296,8 +297,6 @@ fn open_part(
     let words = (image.region_count() as usize).div_ceil(64);
     Ok(Cached {
         image,
-        path: path.to_owned(),
-        slide,
         tier: embedded.tier,
         hot,
         moved,

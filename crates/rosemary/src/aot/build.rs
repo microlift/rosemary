@@ -15,7 +15,7 @@
 //! A build stopped by its deadline commits every part it started.
 
 use std::collections::{HashSet, VecDeque};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 use std::sync::{Condvar, Mutex};
 use std::time::Instant;
 
@@ -140,6 +140,9 @@ struct Job<'a> {
     profiled: u64,
     /// Part 0, then the cold parts.
     streams: [Mutex<Stream>; 2],
+    /// The number the next part opened takes, past the one reserved for part 0:
+    /// shared, so a stream that rolls over never takes another's number.
+    next_part: AtomicU32,
     hot_left: AtomicUsize,
     regions: AtomicUsize,
     /// Regions that would not lift or compile, or that consulted an import only
@@ -151,8 +154,9 @@ struct Job<'a> {
 /// One sequence of parts being written.
 struct Stream {
     tier: Tier,
-    /// The number the next part opened takes.
-    next: u32,
+    /// The number reserved for the first part this stream opens; later ones take
+    /// [`Job::next_part`].
+    first: Option<u32>,
     open: Option<OpenPart>,
     /// Parts committed.
     written: u32,
@@ -166,10 +170,10 @@ struct OpenPart {
 }
 
 impl Stream {
-    fn new(tier: Tier, first: u32) -> Self {
+    fn new(tier: Tier, first: Option<u32>) -> Self {
         Stream {
             tier,
-            next: first,
+            first,
             open: None,
             written: 0,
             error: None,
@@ -191,11 +195,12 @@ impl Job<'_> {
             return false;
         }
         if stream.open.is_none() {
-            match self.open_part(&stream, fingerprint) {
-                Ok(part) => {
-                    stream.open = Some(part);
-                    stream.next += 1;
-                }
+            let number = stream
+                .first
+                .take()
+                .unwrap_or_else(|| self.next_part.fetch_add(1, Ordering::Relaxed));
+            match self.open_part(stream.tier, number, fingerprint) {
+                Ok(part) => stream.open = Some(part),
                 Err(e) => {
                     stream.error = Some(e);
                     return false;
@@ -217,10 +222,10 @@ impl Job<'_> {
         true
     }
 
-    fn open_part(&self, stream: &Stream, fingerprint: u64) -> Result<OpenPart, String> {
-        let path = self.layout.part(&self.id, stream.next);
+    fn open_part(&self, tier: Tier, number: u32, fingerprint: u64) -> Result<OpenPart, String> {
+        let path = self.layout.part(&self.id, number);
         let directory = path.parent().expect("cache files have a directory");
-        let isa = crate::jit::region_isa(stream.tier).map_err(|e| e.to_string())?;
+        let isa = crate::jit::region_isa(tier).map_err(|e| e.to_string())?;
         let file = AtomicFile::create(&path).map_err(|e| e.to_string())?;
         let writer = microlift::image::file::Writer::new(
             file.handle().map_err(|e| e.to_string())?,
@@ -232,7 +237,7 @@ impl Job<'_> {
         Ok(OpenPart {
             file,
             writer,
-            number: stream.next,
+            number,
         })
     }
 
@@ -290,7 +295,7 @@ impl Job<'_> {
                 && regions + refused == self.plan.len()
                 && error.is_none()
             {
-                for n in stream.next.. {
+                for n in self.next_part.load(Ordering::Relaxed).. {
                     let stale = self.layout.part(&self.id, n);
                     if std::fs::remove_file(&stale).is_err() {
                         break;
@@ -347,7 +352,7 @@ fn prepare<'a>(
     {
         if !super::profile::grown(
             built.profiled,
-            super::profile::records(&layout.profile(&id)),
+            super::profile::distinct(&layout.profile(&id)),
         ) {
             return Err(Outcome::Skipped("up to date"));
         }
@@ -386,9 +391,10 @@ fn prepare<'a>(
         hot_left: AtomicUsize::new(hot),
         plan,
         streams: [
-            Mutex::new(Stream::new(Tier::Final, 0)),
-            Mutex::new(Stream::new(cold_tier, 1)),
+            Mutex::new(Stream::new(Tier::Final, Some(0))),
+            Mutex::new(Stream::new(cold_tier, None)),
         ],
+        next_part: AtomicU32::new(1),
         regions: AtomicUsize::new(0),
         refused: AtomicUsize::new(0),
         _lock: lock,

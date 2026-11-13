@@ -48,6 +48,20 @@ static LOGS: LazyLock<Mutex<HashMap<ImageId, Option<File>>>> = LazyLock::new(Mut
 /// Image ids by file, hashed once per process.
 static IDS: LazyLock<Mutex<HashMap<String, Option<ImageId>>>> = LazyLock::new(Mutex::default);
 
+/// The image ids and open logs, held across a fork: every guest thread's miss takes
+/// them. See [`crate::fork`].
+pub(crate) struct ForkHold(
+    #[allow(dead_code)] std::sync::MutexGuard<'static, HashMap<String, Option<ImageId>>>,
+    #[allow(dead_code)] std::sync::MutexGuard<'static, HashMap<ImageId, Option<File>>>,
+);
+
+pub(crate) fn hold_for_fork() -> ForkHold {
+    ForkHold(
+        IDS.lock().unwrap_or_else(|e| e.into_inner()),
+        LOGS.lock().unwrap_or_else(|e| e.into_inner()),
+    )
+}
+
 /// The id of the image file at `path`, hashed once per process.
 pub fn image_id(path: &str) -> Option<ImageId> {
     let mut ids = IDS.lock().unwrap_or_else(|e| e.into_inner());
@@ -146,9 +160,13 @@ pub fn read(path: &Path) -> std::io::Result<Vec<u64>> {
         .collect())
 }
 
-/// How many records a log holds, torn final record aside.
-pub fn records(path: &Path) -> u64 {
-    std::fs::metadata(path).map_or(0, |m| m.len() / RECORD as u64)
+/// How many distinct addresses a log holds. Not its length: a run logs again what it
+/// must JIT every time, such as a region unusable at this run's slide, so the raw
+/// count grows with nothing new to build.
+pub fn distinct(path: &Path) -> u64 {
+    read(path).map_or(0, |logged| {
+        logged.into_iter().collect::<HashSet<_>>().len() as u64
+    })
 }
 
 /// Every address a log holds, each once, in the order first logged; the log is
@@ -163,13 +181,17 @@ pub fn compact(path: &Path) -> std::io::Result<Vec<u64>> {
     let unique: Vec<u64> = logged.iter().copied().filter(|&a| seen.insert(a)).collect();
     if unique.len() < logged.len() {
         let bytes: Vec<u8> = unique.iter().flat_map(|a| a.to_le_bytes()).collect();
-        super::store::write_atomic(path, &bytes)?;
+        // Rewritten in place rather than renamed over: a running process appends
+        // through the handle it opened, which a rename would leave on an unlinked file.
+        let mut file = std::fs::OpenOptions::new().append(true).open(path)?;
+        file.set_len(0)?;
+        file.write_all(&bytes)?;
     }
     Ok(unique)
 }
 
-/// Whether a log of `now` records has grown enough past the `built` a cache was
-/// built from to be worth building again.
+/// Whether a log of `now` distinct addresses has grown enough past the `built` a cache
+/// was built from to be worth building again.
 pub fn grown(built: u64, now: u64) -> bool {
     const MIN_GROWTH: u64 = 4096;
     now > built + (built / 8).max(MIN_GROWTH)
@@ -189,7 +211,7 @@ mod tests {
         }
         assert_eq!(compact(&path).unwrap(), [0x3000, 0x1000, 0x2000]);
         assert_eq!(read(&path).unwrap(), [0x3000, 0x1000, 0x2000]);
-        assert_eq!(records(&path), 3);
+        assert_eq!(distinct(&path), 3);
         std::fs::remove_dir_all(dir).unwrap();
     }
 

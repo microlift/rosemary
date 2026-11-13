@@ -188,12 +188,14 @@ pub fn ahead(vm: &'static Vm, targets: impl IntoIterator<Item = u64>, depth: usi
 /// were only lifted ahead.
 pub fn upgrade(vm: &'static Vm, va: u64, ran: bool) {
     let mut queue = QUEUE.lock().unwrap_or_else(|e| e.into_inner());
-    queue.upgrades[usize::from(!ran)].push_back(va);
-    // Without a worker the provisional code simply stays.
-    if spawn_workers(&mut queue, vm) {
-        drop(queue);
-        READY.notify_one();
+    // Without a worker the provisional code simply stays, and nothing is queued
+    // that no one would take.
+    if !spawn_workers(&mut queue, vm) {
+        return;
     }
+    queue.upgrades[usize::from(!ran)].push_back(va);
+    drop(queue);
+    READY.notify_one();
 }
 
 fn push(vm: &'static Vm, targets: impl IntoIterator<Item = u64>, depth: usize) {

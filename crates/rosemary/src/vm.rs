@@ -1474,7 +1474,8 @@ impl Vm {
             .iter()
             .filter(|site| site.kind == microlift::core::link::LinkSiteKind::StaticEdge)
             .map(|site| site.target)
-            .filter(|&target| !self.cache.has_or_lifting(target));
+            // Lock-free: a worker's `lift_ahead` checks again, claims included.
+            .filter(|&target| !self.cache.is_translated(target));
         crate::prelift::ahead(vm, targets, depth);
     }
 
