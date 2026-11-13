@@ -13,7 +13,11 @@ use static_init::dynamic;
 /// 1024          33.7s     1.1s        6769
 ///  512          15.2s     0.3s        6839
 /// ```
-const MAX_REGION_INSTRUCTIONS: usize = 1024;
+///
+/// Roblox reaches its first frame 8% sooner at 256 than at 1024, and the steady-state
+/// loops measured (`tools/unitybench` among them) run no slower: a region boundary is
+/// a link cell, and a smaller region is a smaller compile for a worker to finish.
+const MAX_REGION_INSTRUCTIONS: usize = 256;
 
 /// How far forward a branch may point and still be followed.
 const MAX_FORWARD_BRANCH_DIST: u64 = 4 * 4096;
