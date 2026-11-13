@@ -1234,32 +1234,57 @@ unsafe extern "C" fn field_text_did_change(receiver: Id, _sel: Sel, _notificatio
     }
 }
 
+/// `NSStringDrawingOptions`: lay the text out as lines wrapped at the
+/// limit's width, measured from the first line's top, rather than as one line
+/// measured from its baseline.
+const NS_STRING_DRAWING_USES_LINE_FRAGMENT_ORIGIN: usize = 1 << 0;
+
+/// `-[NSString boundingRectWithSize:options:attributes:]`.
 unsafe extern "C" fn string_bounding_rect(
     receiver: Id,
     _sel: Sel,
     limit: NSSize,
-    _options: usize,
-    _attributes: Id,
+    options: usize,
+    attributes: Id,
 ) -> NSRect {
+    let Some(style) = TextStyle::of(attributes) else {
+        return NSRect::default();
+    };
     // SAFETY: the receiver is an NSString.
-    let text =
-        String::from_utf8_lossy(&unsafe { foundation::string::bytes(receiver) }).into_owned();
-    let character_width = 13.0 * 0.55;
-    let columns = (limit.width / character_width).floor().max(1.0) as usize;
-    let mut lines = 0usize;
-    let mut widest = 0usize;
-    for line in text.split('\n') {
-        let count = line.chars().count();
-        lines += count.max(1).div_ceil(columns);
-        widest = widest.max(count.min(columns));
-    }
-    NSRect {
-        origin: NSPoint { x: 0.0, y: 0.0 },
-        size: NSSize {
-            width: (widest as f64 * character_width).min(limit.width),
-            height: (lines as f64 * 16.0).min(limit.height),
-        },
-    }
+    style.bounding_rect(&unsafe { text_of(receiver) }, limit, options)
+}
+
+/// `-[NSString boundingRectWithSize:options:attributes:context:]`.
+///
+/// FIXME (ACCURACY): the context's minimum scale factor is not applied, and
+/// its actual scale factor and total bounds are not written back.
+unsafe extern "C" fn string_bounding_rect_in_context(
+    receiver: Id,
+    sel: Sel,
+    limit: NSSize,
+    options: usize,
+    attributes: Id,
+    _context: Id,
+) -> NSRect {
+    // SAFETY: the caller's obligations.
+    unsafe { string_bounding_rect(receiver, sel, limit, options, attributes) }
+}
+
+/// `-[NSAttributedString boundingRectWithSize:options:]`.
+unsafe extern "C" fn attributed_bounding_rect(
+    receiver: Id,
+    _sel: Sel,
+    limit: NSSize,
+    options: usize,
+) -> NSRect {
+    // SAFETY: an attributed string.
+    let Some((text, attributes)) = (unsafe { foundation::attributed_string::parts(receiver) })
+    else {
+        return NSRect::default();
+    };
+    TextStyle::of(attributes).map_or(NSRect::default(), |style| {
+        style.bounding_rect(&text, limit, options)
+    })
 }
 
 /// The attributes text is drawn with, read from an attributes dictionary.
@@ -1323,6 +1348,38 @@ impl TextStyle {
         NSSize {
             width: f64::from(width.ceil()),
             height: f64::from(self.line_height() * text.split('\n').count() as f32),
+        }
+    }
+
+    /// The rectangle `text` occupies when laid out within `limit` as
+    /// `options` asks: wrapped at its width from the top of the first line,
+    /// or as a single line around its baseline.
+    fn bounding_rect(&self, text: &str, limit: NSSize, options: usize) -> NSRect {
+        if options & NS_STRING_DRAWING_USES_LINE_FRAGMENT_ORIGIN == 0 {
+            let (ascent, descent) = self.font.metrics(self.size);
+            let line = text.replace('\n', " ");
+            return NSRect {
+                origin: NSPoint {
+                    x: 0.0,
+                    y: -f64::from(descent),
+                },
+                size: NSSize {
+                    width: f64::from(self.font.measure(&line, self.size)),
+                    height: f64::from(ascent + descent),
+                },
+            };
+        }
+        let lines = self.font.wrap(text, self.size, limit.width as f32);
+        let width = lines
+            .iter()
+            .map(|line| self.font.measure(line, self.size))
+            .fold(0.0f32, f32::max);
+        NSRect {
+            origin: NSPoint::default(),
+            size: NSSize {
+                width: f64::from(width),
+                height: f64::from(self.line_height() * lines.len() as f32),
+            },
         }
     }
 
@@ -1525,6 +1582,10 @@ pub(crate) fn install() {
         "sizeWithAttributes:" => string_size_with_attributes, c"{CGSize=dd}24@0:8@16";
         "drawInRect:withAttributes:" => string_draw_in_rect, c"v56@0:8{CGRect={CGPoint=dd}{CGSize=dd}}16@48";
         "drawAtPoint:withAttributes:" => string_draw_at_point, c"v40@0:8{CGPoint=dd}16@32";
+        "boundingRectWithSize:options:attributes:" => string_bounding_rect,
+            c"{CGRect={CGPoint=dd}{CGSize=dd}}48@0:8{CGSize=dd}16Q32@40";
+        "boundingRectWithSize:options:attributes:context:" => string_bounding_rect_in_context,
+            c"{CGRect={CGPoint=dd}{CGSize=dd}}56@0:8{CGSize=dd}16Q32@40@48";
     });
     // Foundation keeps the text and attributes; drawing them is AppKit's.
     let attributed = objc::class::lookup(c"NSAttributedString").expect("Foundation registered it");
@@ -1532,8 +1593,8 @@ pub(crate) fn install() {
         "size" => attributed_size, c"{CGSize=dd}16@0:8";
         "drawInRect:" => attributed_draw_in_rect, c"v48@0:8{CGRect={CGPoint=dd}{CGSize=dd}}16";
         "drawAtPoint:" => attributed_draw_at_point, c"v32@0:8{CGPoint=dd}16";
-        "boundingRectWithSize:options:attributes:" => string_bounding_rect,
-            c"{CGRect={CGPoint=dd}{CGSize=dd}}48@0:8{CGSize=dd}16Q32@40";
+        "boundingRectWithSize:options:" => attributed_bounding_rect,
+            c"{CGRect={CGPoint=dd}{CGSize=dd}}40@0:8{CGSize=dd}16Q32";
     });
     let text = objc::class::lookup(c"NSText").expect("declared before its methods");
     methods!(text, {
