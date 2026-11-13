@@ -841,25 +841,85 @@ pub unsafe extern "C" fn fstatat(
 /// archive extraction (`unzip`) relies on it, so it is kept rather than dropped.
 pub(crate) mod beneath {
     use super::Stat;
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     use super::{Found, as_seen};
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    use std::ffi::CStr;
     #[cfg(target_os = "linux")]
-    use std::ffi::{CStr, CString};
+    use std::ffi::CString;
     use std::ffi::{c_char, c_int};
+
+    /// Darwin's `AT_RESOLVE_BENEATH` and `O_RESOLVE_BENEATH`.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    const AT_RESOLVE_BENEATH: c_int = 0x2000;
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    const O_RESOLVE_BENEATH: c_int = 0x1000;
 
     /// The `AT_` flag where the host can honour it, and no bits elsewhere, so
     /// the caller's check refuses it by `EINVAL` there.
-    #[cfg(target_os = "linux")]
-    pub const SUPPORTED: c_int = 0x2000;
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    pub const SUPPORTED: c_int = AT_RESOLVE_BENEATH;
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     pub const SUPPORTED: c_int = 0;
 
     /// `O_RESOLVE_BENEATH`, likewise: elsewhere it stays an unknown bit that
     /// `open` refuses by name.
-    #[cfg(target_os = "linux")]
-    pub const O_SUPPORTED: c_int = 0x1000;
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    pub const O_SUPPORTED: c_int = O_RESOLVE_BENEATH;
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     pub const O_SUPPORTED: c_int = 0;
+
+    /// `openat` beneath `dirfd` with host `flags`, by the host's own flag.
+    ///
+    /// # Safety
+    ///
+    /// `path` is a NUL-terminated host path.
+    #[cfg(target_os = "macos")]
+    pub unsafe fn open(dirfd: c_int, path: *const c_char, flags: c_int, mode: c_int) -> c_int {
+        // SAFETY: the caller's path; `mode` is read only under `O_CREAT`.
+        unsafe { libc::openat(dirfd, path, flags | O_RESOLVE_BENEATH, mode) }
+    }
+
+    /// `fstatat` beneath `dirfd`, by the host's own flag.
+    ///
+    /// # Safety
+    ///
+    /// `path` is a NUL-terminated host path and `out` is null or a writable
+    /// Darwin `struct stat`.
+    #[cfg(target_os = "macos")]
+    pub unsafe fn fstatat(
+        dirfd: c_int,
+        path: *const c_char,
+        out: *mut Stat,
+        nofollow: bool,
+    ) -> c_int {
+        let nofollow_flag = if nofollow {
+            libc::AT_SYMLINK_NOFOLLOW
+        } else {
+            0
+        };
+        let mut host: libc::stat = unsafe { std::mem::zeroed() };
+        // SAFETY: the caller's path and a live `stat`.
+        let rc =
+            unsafe { libc::fstatat(dirfd, path, &mut host, AT_RESOLVE_BENEATH | nofollow_flag) };
+        if rc == 0 && !out.is_null() {
+            // SAFETY: the caller states `out` is writable, and `path` was
+            // found beneath `dirfd`.
+            unsafe { *out = as_seen(&host, Found::At(dirfd, CStr::from_ptr(path), !nofollow)) };
+        }
+        rc
+    }
+
+    /// `unlinkat` beneath `dirfd`, by the host's own flag.
+    ///
+    /// # Safety
+    ///
+    /// `path` is a NUL-terminated host path.
+    #[cfg(target_os = "macos")]
+    pub unsafe fn unlinkat(dirfd: c_int, path: *const c_char, flags: c_int) -> c_int {
+        // SAFETY: the caller's path.
+        unsafe { libc::unlinkat(dirfd, path, flags | AT_RESOLVE_BENEATH) }
+    }
 
     /// `openat2` beneath `dirfd` with host `flags`.
     ///
@@ -887,7 +947,7 @@ pub(crate) mod beneath {
         fd as c_int
     }
 
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     pub unsafe fn open(_: c_int, _: *const c_char, _: c_int, _: c_int) -> c_int {
         unreachable!("O_SUPPORTED is zero here, so nothing asks for it")
     }
@@ -932,7 +992,7 @@ pub(crate) mod beneath {
         rc
     }
 
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     pub unsafe fn fstatat(_: c_int, _: *const c_char, _: *mut Stat, _: bool) -> c_int {
         unreachable!("SUPPORTED is zero here, so nothing asks for it")
     }
@@ -986,7 +1046,7 @@ pub(crate) mod beneath {
         rc
     }
 
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     pub unsafe fn unlinkat(_: c_int, _: *const c_char, _: c_int) -> c_int {
         unreachable!("SUPPORTED is zero here, so nothing asks for it")
     }
@@ -1527,7 +1587,7 @@ mod tests {
 
     /// `unzip` looks up and opens every path it extracts beneath its target
     /// directory this way, and refuses to extract when the lookup fails.
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
     fn resolve_beneath_finds_what_is_inside_and_refuses_what_is_not() {
         const AT_RESOLVE_BENEATH: c_int = 0x2000;
