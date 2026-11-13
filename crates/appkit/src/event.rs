@@ -30,6 +30,9 @@ pub fn pump(app: Id) {
     for hook in hooks {
         hook();
     }
+    // A session `-beginDraggingSessionWithItems:` started runs here, in the
+    // event loop, after the call that started it has returned.
+    crate::dragging::run_pending();
     crate::application::check_last_window_closed();
     crate::backing::pump();
 }
@@ -690,6 +693,7 @@ pub(crate) fn deliver_past_modal(event: sdl3::video::Event) {
                 // guest capture; otherwise later motion could leak past the edge.
                 if !down {
                     capture_mouse_button(id, button, false, false);
+                    crate::dragging::release_unreported(crate::button::number(button));
                 }
                 return;
             }
