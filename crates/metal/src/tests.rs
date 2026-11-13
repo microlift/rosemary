@@ -21,6 +21,8 @@ macro_rules! isolate_metal_fixture {
     };
 }
 
+mod source_constants;
+
 fn device_for_tests() -> Id {
     bootstrap();
     let target = Box::leak(Box::new(metal_translate::TargetProfile::vulkan_1_3()));

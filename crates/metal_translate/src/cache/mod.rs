@@ -154,6 +154,23 @@ pub fn translate_msl_cached_with_macros(
     target: &TargetProfile,
     passes: &PassPipeline,
 ) -> Result<TranslatedLibrary, TranslateError> {
+    translate_msl_specialized_cached(
+        source,
+        macros,
+        target,
+        passes,
+        &FunctionConstantValues::new(),
+    )
+}
+
+/// Cache source specialization using both macro definitions and constant values.
+pub fn translate_msl_specialized_cached(
+    source: &str,
+    macros: &[(String, String)],
+    target: &TargetProfile,
+    passes: &PassPipeline,
+    constants: &FunctionConstantValues,
+) -> Result<TranslatedLibrary, TranslateError> {
     let mut bytes = Vec::new();
     for (name, value) in macros {
         for text in [name, value] {
@@ -166,14 +183,9 @@ pub fn translate_msl_cached_with_macros(
         bytes.extend_from_slice(b"\0macros\0");
     }
     bytes.extend_from_slice(source.as_bytes());
-    cached(
-        Frontend::Msl,
-        &bytes,
-        target,
-        passes,
-        &FunctionConstantValues::new(),
-        || crate::translate_msl_with_macros(source, macros, target, passes),
-    )
+    cached(Frontend::Msl, &bytes, target, passes, constants, || {
+        crate::translate_msl_specialized(source, macros, target, passes, constants)
+    })
 }
 
 fn cached(

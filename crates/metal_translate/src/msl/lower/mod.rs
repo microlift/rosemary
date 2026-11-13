@@ -7,6 +7,7 @@
 //! Vulkan function variable may not.
 
 mod expr;
+mod globals;
 mod inline;
 mod library;
 mod matrix;
@@ -102,20 +103,7 @@ impl<'p> Context<'p> {
             let layout = context.layout_struct(index)?;
             context.layouts.push(layout);
         }
-        for global in &program.globals {
-            let initializer = context.constant(&global.init, &global.ty, global.line)?;
-            let index = module.globals.len() as u32;
-            module.globals.push(GlobalVariable {
-                name: global.name.clone(),
-                space: AddressSpace::Constant,
-                ty: context.ir(&global.ty),
-                initializer: Some(initializer),
-                function_constant: None,
-            });
-            context
-                .globals
-                .insert(global.name.clone(), (index, global.ty.clone()));
-        }
+        context.lower_globals(module)?;
         Ok(context)
     }
 
@@ -134,7 +122,7 @@ impl<'p> Context<'p> {
             },
             // Only a template's own body names one, and every use there is
             // resolved first; an unresolved one has no IR form.
-            Ty::Param(_) => Type::Void,
+            Ty::Param(_) | Ty::ArrayParam(..) => Type::Void,
             Ty::ByteBool => scalar_ir(Scalar::UCHAR),
             // Packed lanes are an array of them in memory.
             Ty::Packed(scalar, lanes) => Type::Array {
@@ -370,7 +358,7 @@ impl<'p> Context<'p> {
                 let Number::Int(index) = self.const_number(index)? else {
                     return None;
                 };
-                let ExprKind::InitList(items) = &global.init.kind else {
+                let ExprKind::InitList(items) = &global.init.as_ref()?.kind else {
                     return None;
                 };
                 self.const_number(items.get(usize::try_from(index).ok()?)?)?

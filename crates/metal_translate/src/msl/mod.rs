@@ -6,6 +6,9 @@ mod lower;
 mod parse;
 mod preprocess;
 mod types;
+mod validate;
+
+pub(crate) use validate::validate_specialized;
 
 use std::collections::HashMap;
 

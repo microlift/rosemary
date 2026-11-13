@@ -143,15 +143,17 @@ pub(super) fn retain_library(
         return std::ptr::null_mut();
     }
     // Only a library with function constants is ever translated again.
-    let air = air
+    let input = air
         .filter(|_| !translated.function_constants.is_empty())
-        .map(|modules| modules.into_iter().map(<[u8]>::to_vec).collect());
+        .map(|modules| LibraryInput::Air {
+            modules: modules.into_iter().map(<[u8]>::to_vec).collect(),
+            entry_modules,
+        });
     let library = object::make(
         c"RosemaryMTLLibrary",
         Library {
             translated,
-            air,
-            entry_modules,
+            input,
             target,
             device,
         },
@@ -235,6 +237,7 @@ pub(super) unsafe fn library_from_source(
     };
     report_source_library(source);
     dump_source_library(source);
+    // FIXME (ACCURACY): required constants reject the source library instead of leaving a template.
     let translated = match metal_translate::translate_msl_cached_with_macros(
         source,
         macros,
@@ -248,6 +251,14 @@ pub(super) unsafe fn library_from_source(
     let library = retain_library(receiver, translated, None, entry_modules, Some(target));
     if library.is_null() {
         return fail_library(error, "could not allocate MTL source library");
+    }
+    // SAFETY: the new library has not been published to the caller.
+    let contents = unsafe { object::body::<Library>(library) };
+    if !contents.translated.function_constants.is_empty() {
+        contents.input = Some(LibraryInput::Msl {
+            source: source.to_owned(),
+            macros: macros.to_vec(),
+        });
     }
     if crate::profile::enabled() {
         let hash = fnv1a64(source.as_bytes());
@@ -376,21 +387,36 @@ pub(super) unsafe fn function_with_constants(
     };
     // A library which declares no function constants has nothing to
     // specialize: Metal ignores the values, and so does this.
-    let specialized = match (&library.air, library.target) {
-        (Some(modules), Some(target)) => {
-            let Some(air) = library
-                .entry_modules
-                .get(entry)
-                .and_then(|module| modules.get(*module))
-            else {
-                return fail_library(error, "the function has no owning AIR module");
+    let specialized = match (&library.input, library.target) {
+        (Some(input), Some(target)) => {
+            let translated = match input {
+                LibraryInput::Air {
+                    modules,
+                    entry_modules,
+                } => {
+                    let Some(air) = entry_modules
+                        .get(entry)
+                        .and_then(|module| modules.get(*module))
+                    else {
+                        return fail_library(error, "the function has no owning AIR module");
+                    };
+                    metal_translate::translate_specialized_cached(
+                        metal_translate::AirInput::Bitcode(air),
+                        target,
+                        metal_translate::PassPipeline::from_env(),
+                        &values,
+                    )
+                }
+                LibraryInput::Msl { source, macros } => {
+                    metal_translate::translate_msl_specialized_cached(
+                        source,
+                        macros,
+                        target,
+                        metal_translate::PassPipeline::from_env(),
+                        &values,
+                    )
+                }
             };
-            let translated = metal_translate::translate_specialized_cached(
-                metal_translate::AirInput::Bitcode(air),
-                target,
-                metal_translate::PassPipeline::from_env(),
-                &values,
-            );
             match translated {
                 Ok(mut translated) => {
                     let Some(position) = translated

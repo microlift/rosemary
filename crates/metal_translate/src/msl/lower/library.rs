@@ -117,6 +117,9 @@ impl Lowerer<'_, '_> {
         if let Some(value) = self.call_helper(name, args, line)? {
             return Ok(value);
         }
+        if name == "is_function_constant_defined" {
+            return self.function_constant_defined(args, line);
+        }
         if let Some(op) = atomic_op(name) {
             return self.atomic(name, op, args, line);
         }
