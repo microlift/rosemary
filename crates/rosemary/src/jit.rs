@@ -41,8 +41,10 @@ pub const HOST_FRAME_DEPTH_ENV: &str = "ROSEMARY_HOST_FRAME_DEPTH";
 /// Replaces the pinned register set: a comma-separated list of x86-64 register
 /// names, e.g. `ROSEMARY_PINNED_REGS=rsp,rax,rdi,rsi,rbp`.
 pub const PINNED_REGS_ENV: &str = "ROSEMARY_PINNED_REGS";
+/// Turns [`tiered`] compilation off.
+pub const NO_JIT_TIERS_ENV: &str = "ROSEMARY_NO_JIT_TIERS";
 /// Which register allocator Cranelift runs: `backtracking` or `single_pass`.
-/// See [`regalloc_algorithm`].
+/// See [`OptLevel::regalloc`].
 pub const REGALLOC_ENV: &str = "ROSEMARY_REGALLOC";
 
 /// What to ask of the JIT.
@@ -52,6 +54,13 @@ pub enum OptLevel {
     ///
     /// Slowest by a wide margin. It is here as a bisection tool.
     None,
+    /// `fast` - Cranelift's `opt_level=none` and single-pass register allocation,
+    /// plus host-specific choices.
+    ///
+    /// Compiles about twice as fast as `all`, for code that runs about half as fast.
+    /// Every region starts here when [`tiered`] compilation is on, and the regions
+    /// worth it are recompiled at the level asked for.
+    Fast,
     /// `speed` - Cranelift's `opt_level=speed`.
     Speed,
     /// `all` - `speed`, plus host-specific choices. The default.
@@ -64,6 +73,7 @@ impl OptLevel {
     pub fn parse(value: &str) -> Option<Self> {
         match value.trim().to_ascii_lowercase().as_str() {
             "none" => Some(OptLevel::None),
+            "fast" => Some(OptLevel::Fast),
             "speed" => Some(OptLevel::Speed),
             "all" => Some(OptLevel::All),
             _ => None,
@@ -74,6 +84,7 @@ impl OptLevel {
     pub fn as_str(self) -> &'static str {
         match self {
             OptLevel::None => "none",
+            OptLevel::Fast => "fast",
             OptLevel::Speed => "speed",
             OptLevel::All => "all",
         }
@@ -84,14 +95,28 @@ impl OptLevel {
     /// `All` deliberately maps to `speed` and not `speed_and_size`.
     fn cranelift_opt_level(self) -> &'static str {
         match self {
-            OptLevel::None => "none",
+            OptLevel::None | OptLevel::Fast => "none",
             OptLevel::Speed | OptLevel::All => "speed",
         }
     }
 
     /// Whether host-specific lift decisions are allowed at this level.
     pub fn host_specific(self) -> bool {
-        matches!(self, OptLevel::All)
+        matches!(self, OptLevel::Fast | OptLevel::All)
+    }
+
+    /// The register allocator this level runs, unless `ROSEMARY_REGALLOC` names
+    /// one. `None` leaves Cranelift's own default, which is the point of `none`.
+    ///
+    /// `single_pass` only pairs with an unoptimised function: after the mid-end has
+    /// merged and hoisted values, their live ranges are long enough that it spills
+    /// most of them, and measured code ran half as fast as at `all`.
+    fn regalloc(self) -> Option<&'static str> {
+        match self {
+            OptLevel::None => None,
+            OptLevel::Fast => Some(regalloc_override().unwrap_or("single_pass")),
+            OptLevel::Speed | OptLevel::All => Some(regalloc_override().unwrap_or("backtracking")),
+        }
     }
 
     /// The Cranelift flags to build a backend with.
@@ -126,17 +151,16 @@ impl OptLevel {
         builder
             .set("preserve_frame_pointers", "true")
             .expect("cranelift accepts its own preserve_frame_pointers values");
-        match self {
-            OptLevel::Speed | OptLevel::All => {
-                builder
-                    .set("enable_alias_analysis", "true")
-                    .expect("couldn't enable alias analysis");
-                builder
-                    .set("regalloc_algorithm", regalloc_algorithm())
-                    .expect("couldn't set the regalloc algorithm");
-            }
-            OptLevel::None => {}
-        };
+        if matches!(self, OptLevel::Speed | OptLevel::All) {
+            builder
+                .set("enable_alias_analysis", "true")
+                .expect("couldn't enable alias analysis");
+        }
+        if let Some(algorithm) = self.regalloc() {
+            builder
+                .set("regalloc_algorithm", algorithm)
+                .expect("couldn't set the regalloc algorithm");
+        }
         settings::Flags::new(builder)
     }
 
@@ -145,7 +169,7 @@ impl OptLevel {
         match self {
             OptLevel::None => TUNABLE_FEATURES.iter().map(|&f| (f, "false")).collect(),
             OptLevel::Speed => Vec::new(),
-            OptLevel::All => host_features(),
+            OptLevel::Fast | OptLevel::All => host_features(),
         }
     }
 }
@@ -228,9 +252,9 @@ fn host_features() -> Vec<(&'static str, &'static str)> {
     }
 }
 
-/// Which register allocator Cranelift runs, at `speed` and above.
+/// The register allocator `ROSEMARY_REGALLOC` asks for, if it names one.
 ///
-/// `backtracking` (the default) splits live ranges and produces better code;
+/// `backtracking` splits live ranges and produces better code;
 /// `single_pass` produces more spills and moves but is far cheaper to run. The
 /// difference is not academic here: on a Subnautica profile, regalloc2's
 /// backtracking allocator was around 18% of the whole runtime's time during the
@@ -240,19 +264,19 @@ fn host_features() -> Vec<(&'static str, &'static str)> {
 /// A knob rather than a decision, because the two ends of that trade are the load
 /// time and the frame rate and only a measurement says which one a given program
 /// is short of.
-fn regalloc_algorithm() -> &'static str {
+fn regalloc_override() -> Option<&'static str> {
     #[dynamic]
-    static ALGORITHM: &'static str = match std::env::var(REGALLOC_ENV) {
-        Err(_) => "backtracking",
+    static ALGORITHM: Option<&'static str> = match std::env::var(REGALLOC_ENV) {
+        Err(_) => None,
         Ok(value) => match value.trim() {
-            "backtracking" => "backtracking",
-            "single_pass" => "single_pass",
+            "backtracking" => Some("backtracking"),
+            "single_pass" => Some("single_pass"),
             other => {
                 eprintln!(
                     "rosemary: {REGALLOC_ENV}={other:?} is not one of backtracking, \
-                     single_pass; using backtracking"
+                     single_pass; using the level's own"
                 );
-                "backtracking"
+                None
             }
         },
     };
@@ -268,7 +292,7 @@ pub fn opt_level() -> OptLevel {
             // Not fatal, but not silent either: a typo'd level that quietly
             // fell back would look like the level had no effect.
             eprintln!(
-                "rosemary: {OPT_ENV}={value:?} is not one of none, speed, all; using {}",
+                "rosemary: {OPT_ENV}={value:?} is not one of none, fast, speed, all; using {}",
                 OptLevel::default().as_str()
             );
             OptLevel::default()
@@ -682,8 +706,22 @@ pub fn knobs() -> String {
         link_publish(),
         host_call_frames(),
         pinned_link_abi(),
-        regalloc_algorithm(),
+        opt_level().regalloc().unwrap_or("default"),
     )
+}
+
+/// Whether regions are compiled at [`OptLevel::Fast`] first and recompiled at
+/// [`opt_level`] on a worker, rather than compiled at `opt_level` from the start.
+///
+/// A cold start waits on the JIT: Roblox spends nearly nine tenths of its main
+/// thread's start-up compiling at `all`, a third of that in regalloc2's backtracking
+/// allocator, and most regions it compiles run a handful of times. Only a level that
+/// optimises has anything to gain, so `fast` and `none` are never tiered.
+pub fn tiered() -> bool {
+    #[dynamic]
+    static TIERED: bool = matches!(opt_level(), OptLevel::Speed | OptLevel::All)
+        && boolean_env(NO_JIT_TIERS_ENV, false, "tiered compilation stays on");
+    *TIERED
 }
 
 /// The Cranelift flags every backend in this process is built with.
@@ -710,6 +748,16 @@ pub fn isa_settings() -> &'static [(&'static str, &'static str)] {
 pub fn backend() -> microlift::Result<CraneliftBackend> {
     let _errno = crate::thread::Errno::now();
     CraneliftBackend::with_flags(flags(), isa_settings())
+}
+
+/// A JIT backend for a region's first, provisional translation under [`tiered`]
+/// compilation. The ISA is [`backend`]'s, so the two tiers differ only in how
+/// hard Cranelift works.
+pub fn provisional_backend() -> microlift::Result<CraneliftBackend> {
+    #[dynamic]
+    static FLAGS: settings::Flags = OptLevel::Fast.flags();
+    let _errno = crate::thread::Errno::now();
+    CraneliftBackend::with_flags(FLAGS.clone(), isa_settings())
 }
 
 /// Every ISA setting the JIT's ISA resolved to, host CPU detection included.
@@ -750,13 +798,15 @@ mod tests {
         assert_eq!(OptLevel::parse("none"), Some(OptLevel::None));
         assert_eq!(OptLevel::parse("speed"), Some(OptLevel::Speed));
         assert_eq!(OptLevel::parse(" ALL\n"), Some(OptLevel::All));
-        assert_eq!(OptLevel::parse("fast"), None);
+        assert_eq!(OptLevel::parse("Fast"), Some(OptLevel::Fast));
+        assert_eq!(OptLevel::parse("fastest"), None);
         assert_eq!(OptLevel::parse(""), None);
     }
 
     #[test]
-    fn all_is_the_default_and_the_only_host_specific_level() {
+    fn all_is_the_default_and_fast_is_as_host_specific() {
         assert_eq!(OptLevel::default(), OptLevel::All);
+        assert!(OptLevel::Fast.host_specific());
         assert!(OptLevel::All.host_specific());
         assert!(!OptLevel::Speed.host_specific());
         assert!(!OptLevel::None.host_specific());
@@ -767,6 +817,7 @@ mod tests {
     #[test]
     fn levels_reach_cranelift_as_opt_level() {
         assert!(OptLevel::None.flags().opt_level() == settings::OptLevel::None);
+        assert!(OptLevel::Fast.flags().opt_level() == settings::OptLevel::None);
         assert!(OptLevel::Speed.flags().opt_level() == settings::OptLevel::Speed);
         assert!(OptLevel::All.flags().opt_level() == settings::OptLevel::Speed);
     }
@@ -777,7 +828,12 @@ mod tests {
     /// one it would be worst to stop checking.
     #[test]
     fn the_verifier_is_the_same_answer_at_every_level() {
-        for level in [OptLevel::None, OptLevel::Speed, OptLevel::All] {
+        for level in [
+            OptLevel::None,
+            OptLevel::Fast,
+            OptLevel::Speed,
+            OptLevel::All,
+        ] {
             assert_eq!(
                 level.flags().enable_verifier(),
                 verify(),
@@ -803,7 +859,12 @@ mod tests {
     /// combination fails at `finish()` rather than at `set()`.
     #[test]
     fn every_level_builds_a_backend() {
-        for level in [OptLevel::None, OptLevel::Speed, OptLevel::All] {
+        for level in [
+            OptLevel::None,
+            OptLevel::Fast,
+            OptLevel::Speed,
+            OptLevel::All,
+        ] {
             assert!(
                 CraneliftBackend::with_flags(level.flags(), &level.isa_settings()).is_ok(),
                 "{} did not build a backend",
@@ -812,8 +873,8 @@ mod tests {
         }
     }
 
-    /// The three levels are three different statements about the host, not one
-    /// statement at three volumes.
+    /// The levels are different statements about the host, not one statement at
+    /// several volumes.
     #[test]
     fn levels_differ_in_what_they_say_about_the_host() {
         // `none` pins the baseline: every tunable named, all off.
@@ -837,6 +898,22 @@ mod tests {
             host.iter()
                 .all(|&(_, value)| value == "true" || value == "false")
         );
+
+        // `fast` says what `all` says: the tiers of one run share an ISA.
+        assert_eq!(OptLevel::Fast.isa_settings(), host);
+    }
+
+    #[test]
+    fn fast_trades_the_optimiser_for_the_single_pass_allocator() {
+        let flags = OptLevel::Fast.flags();
+        assert!(flags.opt_level() == settings::OptLevel::None);
+        if regalloc_override().is_none() {
+            assert!(flags.regalloc_algorithm() == settings::RegallocAlgorithm::SinglePass);
+            assert!(
+                OptLevel::All.flags().regalloc_algorithm()
+                    == settings::RegallocAlgorithm::Backtracking
+            );
+        }
     }
 
     /// The knobs that are ABI or correctness decisions stay out of the tuning,

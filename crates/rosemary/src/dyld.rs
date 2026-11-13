@@ -1442,6 +1442,7 @@ fn run_initializers(image: &'static Image) -> std::result::Result<(), String> {
         .rev()
         .flat_map(|i| i.initializers.iter().copied())
         .collect();
+    exec.expect_calls(&initializers);
     for init in initializers {
         exec.call(init, &[argc, argv, envp, apple])
             .map_err(|e| format!("initializer at {init:#x}: {e}"))?;

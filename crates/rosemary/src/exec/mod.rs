@@ -46,6 +46,10 @@ pub trait Execution: Sync {
     /// Call a function in the program with up to six integer arguments.
     fn call(&self, entry: u64, args: &[u64]) -> Result<u64, VmError>;
 
+    /// Functions about to be called through [`call`](Self::call), in the order they
+    /// will be: a backend that compiles may start on them now. Nothing by default.
+    fn expect_calls(&self, _entries: &[u64]) {}
+
     /// Whatever this backend must do after the fault reporter and before the
     /// first initializer.
     fn prepare(&self) -> Result<(), VmError>;

@@ -965,7 +965,14 @@ impl Vm {
                         Some(hit) => hit,
                         None => self
                             .cache
-                            .get_or_lift(&self.program, pc)
+                            .get_or_lift_fresh(&self.program, pc)
+                            .map(|(lifted, fresh)| {
+                                if fresh {
+                                    self.lift_successors(&lifted, 1);
+                                    self.queue_upgrade(pc, true);
+                                }
+                                lifted
+                            })
                             .map_err(|e| match e {
                                 VmError::NoCode { pc, from: None } => VmError::NoCode {
                                     pc,
@@ -1339,8 +1346,8 @@ impl Vm {
         Err(VmError::UnknownIndirectCall { callee, resume })
     }
 
-    /// A native arm64 address that re-enters the guest at `guest_va`, whose code
-    /// is lifted now.
+    /// A native arm64 address that re-enters the guest at `guest_va`, whose code a
+    /// worker lifts ahead of its first call.
     ///
     /// The generic trampoline forwards six integer and eight floating-point registers
     /// because a bare function pointer says nothing about its own shape.
@@ -1350,8 +1357,9 @@ impl Vm {
         signature: crate::thunk::ThunkSignature,
     ) -> Result<u64, VmError> {
         let host = self.typed_thunk(guest_va, signature)?;
-        // Handing the pointer out is the demand signal.
-        self.lift_now(guest_va);
+        // Handing the pointer out is a hint, not a call: the callback may run much
+        // later or never (a destructor `__cxa_atexit` holds until exit).
+        self.lift_hinted(guest_va);
         Ok(host)
     }
 
@@ -1384,8 +1392,8 @@ impl Vm {
 
     pub fn thunk_for(&self, guest_va: u64) -> Result<u64, VmError> {
         let host = self.thunk(guest_va)?;
-        // Translate the callback now, while translating is possible.
-        self.lift_now(guest_va);
+        // As for typed thunks: a hint, which a worker acts on.
+        self.lift_hinted(guest_va);
         Ok(host)
     }
 
@@ -1402,16 +1410,100 @@ impl Vm {
     /// Lift the code at `guest_va` if it is not already, ignoring a failure: the
     /// call that reaches it reports the same failure where it can be raised.
     pub(crate) fn lift_now(&self, guest_va: u64) {
-        let _ = self.cache.get_or_lift(&self.program, guest_va);
+        if let Ok((_, true)) = self.cache.get_or_lift_fresh(&self.program, guest_va) {
+            self.queue_upgrade(guest_va, false);
+        }
+    }
+
+    /// Recompile the code lifted for `guest_va` at the run's own level, on a worker,
+    /// if it was lifted provisionally. See [`crate::jit::tiered`].
+    fn queue_upgrade(&self, guest_va: u64, ran: bool) {
+        if let Some(vm) = self.as_published()
+            && self.cache.is_provisional(guest_va)
+        {
+            crate::prelift::upgrade(vm, guest_va, ran);
+        }
+    }
+
+    /// Replace the provisional translation lifted for `guest_va`, if there is one,
+    /// with one compiled at the run's own level. What a worker does for
+    /// [`queue_upgrade`](Self::queue_upgrade).
+    pub fn upgrade(&self, guest_va: u64) {
+        self.cache.upgrade(&self.program, guest_va);
+    }
+
+    /// Whether the translation lifted for `guest_va` is still provisional.
+    pub fn is_provisional(&self, guest_va: u64) -> bool {
+        self.cache.is_provisional(guest_va)
+    }
+
+    /// Lift provisionally from now on, when [`crate::jit::tiered`] says to. Publishing
+    /// the VM does this, since that is what gives upgrades a worker to run on.
+    pub fn start_tiering(&self) {
+        self.cache.start_tiering();
+    }
+
+    /// Lift the code at `guest_va`, `depth` hops from code that ran, unless it is
+    /// translated or being translated already. Called by [`crate::prelift`]'s workers.
+    pub(crate) fn lift_ahead(&self, guest_va: u64, depth: usize) {
+        if self.cache.has_or_lifting(guest_va) || !self.lifts_ahead_at(guest_va) {
+            return;
+        }
+        if let Some(lifted) = self.cache.lift_ahead(&self.program, guest_va) {
+            self.lift_successors(&lifted, depth + 1);
+            self.queue_upgrade(guest_va, false);
+        }
+    }
+
+    /// Queue the constant targets `lifted` can leave for, `depth` hops from code
+    /// that ran, to be lifted ahead on workers.
+    fn lift_successors(&self, lifted: &crate::cache::Translation, depth: usize) {
+        let Some(vm) = self.as_published() else {
+            return;
+        };
+        if depth > crate::prelift::ahead_depth() {
+            return;
+        }
+        let targets = lifted
+            .link_sites
+            .iter()
+            .filter(|site| site.kind == microlift::core::link::LinkSiteKind::StaticEdge)
+            .map(|site| site.target)
+            .filter(|&target| !self.cache.has_or_lifting(target));
+        crate::prelift::ahead(vm, targets, depth);
+    }
+
+    /// Whether `guest_va` is image code a lift ahead may translate: never an import,
+    /// which the run loop services rather than lifts, and never code the guest
+    /// wrote, which may not be finished.
+    fn lifts_ahead_at(&self, guest_va: u64) -> bool {
+        self.program.code_image(guest_va).is_some()
+            && !crate::shims::vmmap::contains(guest_va)
+            && self.program.import_at(guest_va).is_none()
+            && self.program.import_by_target(guest_va).is_none()
+    }
+
+    /// Lift the code at `guest_va` on a worker, as a lift ahead of one hop, or not at
+    /// all if this VM is not the process's published one: its first call lifts it.
+    fn lift_hinted(&self, guest_va: u64) {
+        if let Some(vm) = self.as_published() {
+            crate::prelift::ahead(vm, std::iter::once(guest_va), 1);
+        }
     }
 
     /// Lift the code at `guest_va` on a worker, or now if this VM is not the
     /// process's published one and so cannot be handed to another thread.
     fn lift_soon(&self, guest_va: u64) {
-        match crate::thunk::published() {
-            Some(vm) if std::ptr::eq(vm, self) => crate::prelift::queue(vm, guest_va),
-            _ => self.lift_now(guest_va),
+        match self.as_published() {
+            Some(vm) => crate::prelift::expect(vm, [guest_va]),
+            None => self.lift_now(guest_va),
         }
+    }
+
+    /// This VM, if it is the process's published one: only that one can be handed to
+    /// [`crate::prelift`]'s workers.
+    fn as_published(&self) -> Option<&'static Vm> {
+        crate::thunk::published().filter(|vm| std::ptr::eq(*vm, self))
     }
 
     /// How many host thunks exist, including typed variants of one guest address.
@@ -1543,6 +1635,12 @@ impl crate::exec::Execution for Vm {
         report: &machish::report::LinkReport,
     ) -> Result<usize, VmError> {
         Vm::run_loaded_load_methods(self, report)
+    }
+
+    fn expect_calls(&self, entries: &[u64]) {
+        if let Some(vm) = self.as_published() {
+            crate::prelift::expect(vm, entries.iter().copied());
+        }
     }
 
     fn prepare(&self) -> Result<(), VmError> {

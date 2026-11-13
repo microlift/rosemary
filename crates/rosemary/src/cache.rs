@@ -1,6 +1,6 @@
-use std::collections::HashMap;
-use std::sync::atomic::{AtomicPtr, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, RwLock};
+use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Condvar, Mutex, RwLock};
 
 use machish::memory::Regions;
 
@@ -255,6 +255,55 @@ pub struct CodeCache {
     /// import addresses and the read-only segment hints. Immutable, so a lift reads it
     /// without taking anything.
     config: LifterConfig,
+    /// Addresses a thread is lifting right now. A second thread that misses on one
+    /// waits for that lift instead of compiling the region again, which is what lets
+    /// a lift started ahead of time on a worker shorten the wait of the thread that
+    /// needs it.
+    in_flight: Mutex<HashMap<u64, Arc<InFlight>>>,
+    /// Whether lifts start at [`Tier::Provisional`]. Only once there are workers to
+    /// replace them: a cache nobody upgrades would keep slow code forever.
+    tiered: AtomicBool,
+}
+
+/// One lift in progress, which other threads can wait on.
+#[derive(Default)]
+struct InFlight {
+    done: Mutex<bool>,
+    finished: Condvar,
+}
+
+impl InFlight {
+    fn wait(&self) {
+        let mut done = self.done.lock().unwrap_or_else(|e| e.into_inner());
+        while !*done {
+            done = self.finished.wait(done).unwrap_or_else(|e| e.into_inner());
+        }
+    }
+}
+
+/// A claim on lifting one address, released however the lift ends.
+struct Claim<'a> {
+    cache: &'a CodeCache,
+    pc: u64,
+    lift: Arc<InFlight>,
+}
+
+impl Drop for Claim<'_> {
+    fn drop(&mut self) {
+        self.cache
+            .in_flight
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&self.pc);
+        *self.lift.done.lock().unwrap_or_else(|e| e.into_inner()) = true;
+        self.lift.finished.notify_all();
+    }
+}
+
+/// How a lift of an address can proceed: by this thread, or after another's.
+enum Turn<'a> {
+    Lift(Claim<'a>),
+    Wait(Arc<InFlight>),
 }
 
 /// Reads image code at `va`, from the program or an image the guest `dlopen`ed.
@@ -295,6 +344,19 @@ struct Published {
     /// The bytes each translation of guest-generated code was lifted from, by host
     /// page: what a drain compares a written page against. See [`crate::smc`].
     snapshots: HashMap<u64, Vec<(Arc<Translation>, Arc<crate::smc::Snapshot>)>>,
+    /// Addresses whose published translation is [`Tier::Provisional`], waiting for
+    /// [`CodeCache::upgrade`].
+    provisional: HashSet<u64>,
+}
+
+/// How hard the JIT works on a region. See [`crate::jit::tiered`].
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Tier {
+    /// Cheap to compile, slow to run: a region's first translation, until a worker
+    /// replaces it.
+    Provisional,
+    /// The level this run asked for.
+    Final,
 }
 
 /// How many times a lift of generated code is retried when its bytes change before
@@ -321,12 +383,15 @@ impl CodeCache {
                 cache: microlift::runtime::CodeCache::new(),
                 retained: Vec::new(),
                 snapshots: HashMap::new(),
+                provisional: HashSet::new(),
             }),
             index: EntryIndex::new(),
             inserts: AtomicU64::new(0),
             counted: std::sync::Mutex::new((0, 0)),
             adopted: std::sync::Mutex::default(),
             config,
+            in_flight: Mutex::default(),
+            tiered: AtomicBool::new(false),
         }
     }
 
@@ -385,22 +450,141 @@ impl CodeCache {
         program: &Program<M>,
         pc: u64,
     ) -> Result<Arc<Translation>, VmError> {
+        self.get_or_lift_fresh(program, pc)
+            .map(|(translation, _)| translation)
+    }
+
+    /// [`get_or_lift`](Self::get_or_lift), and whether this call is the one that
+    /// lifted it.
+    pub fn get_or_lift_fresh<M: Regions>(
+        &self,
+        program: &Program<M>,
+        pc: u64,
+    ) -> Result<(Arc<Translation>, bool), VmError> {
         if let Some(hit) = self.lookup(pc) {
-            return Ok(hit);
+            return Ok((hit, false));
         }
         if self.adopt_cached(program, pc)
             && let Some(hit) = self.lookup(pc)
         {
-            return Ok(hit);
+            return Ok((hit, false));
         }
         crate::aot::profile::note_miss(program, pc);
-        let mut attempt = 0;
         loop {
-            match self.lift_and_publish(program, pc, attempt == STALE_RETRIES)? {
-                Some(translation) => return Ok(translation),
-                None => attempt += 1,
+            match self.turn(pc) {
+                Turn::Lift(claim) => {
+                    return self
+                        .lift_claimed(program, &claim)
+                        .map(|translation| (translation, true));
+                }
+                Turn::Wait(lift) => {
+                    lift.wait();
+                    if let Some(hit) = self.lookup(pc) {
+                        return Ok((hit, false));
+                    }
+                    // The other lift failed. Lifting again reports the failure here.
+                }
             }
         }
+    }
+
+    /// Lift `pc` ahead of its first use, unless it is translated or being translated
+    /// already. Returns the translation only when this call made it.
+    ///
+    /// Recorded in the AOT profile as a miss is: code lifted ahead is code a later
+    /// run's cache can hold instead.
+    pub fn lift_ahead<M: Regions>(
+        &self,
+        program: &Program<M>,
+        pc: u64,
+    ) -> Option<Arc<Translation>> {
+        if self.lookup(pc).is_some() {
+            return None;
+        }
+        if self.adopt_cached(program, pc) && self.lookup(pc).is_some() {
+            return None;
+        }
+        crate::aot::profile::note_miss(program, pc);
+        match self.turn(pc) {
+            Turn::Lift(claim) => self.lift_claimed(program, &claim).ok(),
+            Turn::Wait(_) => None,
+        }
+    }
+
+    /// Whether `pc` is translated, or a thread is translating it.
+    pub fn has_or_lifting(&self, pc: u64) -> bool {
+        self.index.get(pc).is_some()
+            || self
+                .in_flight
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .contains_key(&pc)
+    }
+
+    /// Claim the lift of `pc`, or the lift another thread claimed first.
+    fn turn(&self, pc: u64) -> Turn<'_> {
+        let mut in_flight = self.in_flight.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(lift) = in_flight.get(&pc) {
+            return Turn::Wait(Arc::clone(lift));
+        }
+        let lift = Arc::new(InFlight::default());
+        in_flight.insert(pc, Arc::clone(&lift));
+        Turn::Lift(Claim {
+            cache: self,
+            pc,
+            lift,
+        })
+    }
+
+    fn lift_claimed<M: Regions>(
+        &self,
+        program: &Program<M>,
+        claim: &Claim<'_>,
+    ) -> Result<Arc<Translation>, VmError> {
+        // A lift that finished between the miss and the claim.
+        if let Some(hit) = self.lookup(claim.pc) {
+            return Ok(hit);
+        }
+        let tier = match self.tiered.load(Ordering::Relaxed) {
+            true => Tier::Provisional,
+            false => Tier::Final,
+        };
+        let mut attempt = 0;
+        loop {
+            match self.lift_and_publish(program, claim.pc, attempt == STALE_RETRIES, tier)? {
+                Some(translation) => return Ok(translation),
+                None => match self.lookup(claim.pc) {
+                    Some(hit) => return Ok(hit),
+                    None => attempt += 1,
+                },
+            }
+        }
+    }
+
+    /// Start lifting at [`Tier::Provisional`], now that something will call
+    /// [`upgrade`](Self::upgrade). Off unless [`crate::jit::tiered`].
+    pub fn start_tiering(&self) {
+        self.tiered.store(crate::jit::tiered(), Ordering::Relaxed);
+    }
+
+    /// Whether the translation at `pc` is still [`Tier::Provisional`].
+    pub fn is_provisional(&self, pc: u64) -> bool {
+        self.read().provisional.contains(&pc)
+    }
+
+    /// Replace the [`Tier::Provisional`] translation lifted for `pc` with a
+    /// [`Tier::Final`] one. Nothing happens if `pc` has none, or loses it while this
+    /// compiles.
+    ///
+    /// The replacement takes over every link cell that named the old translation, and
+    /// each thread drops the rows it published for it the next time it looks one up, as
+    /// it would for code a write retired. The old code stays mapped, so a thread still
+    /// inside it finishes there.
+    pub fn upgrade<M: Regions>(&self, program: &Program<M>, pc: u64) {
+        if !self.is_provisional(pc) {
+            return;
+        }
+        let _ = self.lift_and_publish(program, pc, true, Tier::Final);
     }
 
     /// The lifter config every region of this cache is lifted under.
@@ -509,11 +693,15 @@ impl CodeCache {
 
     /// One lift of `pc`, published - or `None` when the guest rewrote the bytes it
     /// was made from before it could be, and `last` is not set.
+    ///
+    /// Lifting at [`Tier::Final`] an address whose translation is provisional replaces
+    /// it; see [`upgrade`](Self::upgrade).
     fn lift_and_publish<M: Regions>(
         &self,
         program: &Program<M>,
         pc: u64,
         last: bool,
+        tier: Tier,
     ) -> Result<Option<Arc<Translation>>, VmError> {
         let selecting = crate::stats::enabled().then(std::time::Instant::now);
         // A region always begins at the address it was made for, so its cache
@@ -525,6 +713,13 @@ impl CodeCache {
             crate::stats::record_select(selecting.elapsed());
         }
         let start = region.range.start;
+        let generated = crate::shims::vmmap::contains(start);
+        // Code the guest wrote is never upgraded: a write may retire it at any time,
+        // and its replacement is lifted from bytes nobody compared.
+        let tier = match generated {
+            true => Tier::Final,
+            false => tier,
+        };
 
         // How long one region took to compile, when tracing. Not curiosity. A
         // big region is not slow in proportion to its size.
@@ -538,7 +733,7 @@ impl CodeCache {
         declared.dedup();
 
         // A region that will not compile is refused outright.
-        let compiled = match compile_region(&self.config, &bytes, &region, &declared) {
+        let compiled = match compile_region(&self.config, &bytes, &region, &declared, tier) {
             Ok(compiled) => compiled,
             Err(source) => {
                 crate::stats::record_refused();
@@ -615,11 +810,16 @@ impl CodeCache {
              it was lifted for"
         );
 
-        let generated = crate::shims::vmmap::contains(start);
-
         // Two threads that missed on the same address both compiled it. The loser is
         // displaced from microlift's map but not dropped - see [`Published::retained`].
         let mut published = self.write();
+        let replacing = tier == Tier::Final && published.provisional.remove(&pc);
+        if tier == Tier::Final && !replacing && published.cache.peek(pc).is_some() {
+            // Published while this compiled - by an upgrade, or by a region that can
+            // also be entered here - and what is published stays.
+            published.retained.push(Arc::new(translation));
+            return Ok(None);
+        }
         let snapshot = match generated {
             false => None,
             true => {
@@ -644,10 +844,18 @@ impl CodeCache {
         // *elsewhere* that has been waiting for one of these resume points.
         let translation = published.cache.insert(translation);
         published.retained.push(Arc::clone(&translation));
+        if tier == Tier::Provisional {
+            published.provisional.insert(pc);
+        }
         // What makes `len`'s memo stale, bumped under the same lock the insert took.
         self.inserts.fetch_add(1, Ordering::Release);
         self.index
             .publish(&translation.resume_points, Arc::as_ptr(&translation));
+        if replacing {
+            // After the index answers with the replacement: a thread that caught up
+            // before then would relink the old code and never be told again.
+            crate::smc::retire(&translation.resume_points);
+        }
         if let Some(snapshot) = snapshot {
             let snapshot = Arc::new(snapshot);
             let mut pages: Vec<u64> = snapshot.pages().collect();
@@ -770,6 +978,7 @@ fn compile_region(
     bytes: &[u8],
     region: &crate::region::Region,
     declared: &[u64],
+    tier: Tier,
 ) -> microlift::Result<Compiled> {
     let clock = crate::stats::enabled().then(std::time::Instant::now);
     crate::stats::record_extent(region.range.start, region.range.end);
@@ -794,7 +1003,10 @@ fn compile_region(
     let data_dependencies = lifted.data_dependencies.clone();
     let link_sites = lifted.link_sites.clone();
     let lift_took = clock.map(|c| c.elapsed());
-    let mut backend = crate::jit::backend()?;
+    let mut backend = match tier {
+        Tier::Provisional => crate::jit::provisional_backend()?,
+        Tier::Final => crate::jit::backend()?,
+    };
     let (compiled_region, map) = backend.compile_lifted_region(lifted)?;
     if let (Some(clock), Some(lift)) = (clock, lift_took) {
         crate::stats::record_lift(

@@ -115,6 +115,41 @@ fn a_thunk_is_a_native_function_the_host_can_call() {
 }
 
 #[test]
+fn an_upgraded_region_runs_as_the_provisional_one_did() {
+    let Some(path) = common::hello() else {
+        skip!("cannot build x86_64 fixtures")
+    };
+    if !rosemary::jit::tiered() {
+        skip!("tiered compilation is off in this environment")
+    }
+    let vm = vm_for(&path);
+    vm.start_tiering();
+    let entry = vm.program.entry().expect("an entry point");
+    let (argc, argv, envp, apple) = vm.main_args();
+
+    assert_eq!(
+        vm.call(entry, &[argc, argv, envp, apple])
+            .expect("main runs"),
+        1
+    );
+    assert!(vm.is_provisional(entry), "a first lift is provisional");
+    let regions = vm.translated();
+
+    vm.upgrade(entry);
+    assert!(!vm.is_provisional(entry), "the upgrade replaced it");
+    assert_eq!(
+        vm.translated(),
+        regions,
+        "a replacement, not a second region"
+    );
+    assert_eq!(
+        vm.call(entry, &[argc, argv, envp, apple])
+            .expect("main runs again"),
+        1
+    );
+}
+
+#[test]
 fn the_guest_stack_is_readable_guest_memory() {
     // Shims bounds-check the pointers they are handed, and a `char buf[64]` is
     // on the stack - so a stack that is not part of the guest's memory would
