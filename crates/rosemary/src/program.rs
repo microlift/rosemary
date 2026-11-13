@@ -782,7 +782,7 @@ impl<M: Regions> Program<M> {
         // Mac, and a guest reading `arm64` there goes looking for code paths it does
         // not have. See [`darwin::sysctl`].
         darwin::sysctl::set_guest_arch(darwin::sysctl::GuestArch::X86_64);
-        darwin::sysctl::set_is_translated(true);
+        darwin::sysctl::set_is_translated(darwin::sysctl::translation_reported());
 
         let mut loader = Loader::new(X86_64);
         loader.insert_libraries(crate::dyld::inserted_libraries(bytes, X86_64));

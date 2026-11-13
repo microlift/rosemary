@@ -112,6 +112,26 @@ pub fn is_translated() -> bool {
     IS_TRANSLATED.load(Ordering::SeqCst)
 }
 
+/// Set to `0` to show a translated guest no sign of Rosetta: no
+/// `sysctl.proc_translated`, commpage bit or `P_TRANSLATED`. A program that
+/// picks its download by architecture then picks the x86-64 one.
+pub const PROC_TRANSLATED_VAR: &str = "ROSEMARY_PROC_TRANSLATED";
+
+/// Whether a translated guest is told it is translated, from
+/// [`PROC_TRANSLATED_VAR`].
+pub fn translation_reported() -> bool {
+    reports_translation(std::env::var_os(PROC_TRANSLATED_VAR).as_deref())
+}
+
+fn reports_translation(value: Option<&std::ffi::OsStr>) -> bool {
+    !value.is_some_and(|value| {
+        matches!(
+            value.to_string_lossy().trim().to_ascii_lowercase().as_str(),
+            "0" | "false" | "no" | "off"
+        )
+    })
+}
+
 /// `sysctl.proc_translated`, or `None` where macOS has no such key.
 ///
 /// Only Apple silicon has Rosetta, so an Intel Mac answers `ENOENT`; a program
@@ -1492,6 +1512,17 @@ mod tests {
         let rc = unsafe { sysctlnametomib(name.as_ptr(), mib.as_mut_ptr(), &mut len) };
         assert_eq!(rc, 0);
         assert_eq!(&mib[..len], &[CTL_HW, HW_MACHINE]);
+    }
+
+    #[test]
+    fn translation_is_reported_unless_turned_off() {
+        let reports = |value: Option<&str>| reports_translation(value.map(std::ffi::OsStr::new));
+        assert!(reports(None));
+        assert!(reports(Some("1")));
+        assert!(reports(Some("")));
+        for off in ["0", "false", "no", "OFF"] {
+            assert!(!reports(Some(off)), "{off} should turn it off");
+        }
     }
 
     #[test]
