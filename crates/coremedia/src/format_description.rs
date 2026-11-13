@@ -138,6 +138,9 @@ struct State {
     /// `CMVideoFormatDescriptionGetH264ParameterSetAtIndex` indexes.
     parameter_sets: Vec<Vec<u8>>,
     nal_length: i32,
+    /// Whether the extensions were made from the parameter sets, so that
+    /// comparing those compares the extensions too.
+    derived: bool,
 }
 
 impl Drop for State {
@@ -350,6 +353,7 @@ pub unsafe extern "C" fn CMVideoFormatDescriptionCreateFromH264ParameterSets(
         extensions,
         parameter_sets: sequence.into_iter().chain(picture).collect(),
         nal_length,
+        derived: true,
     };
     let description = corefoundation::boxed::make(class(), state);
     if description.is_null() {
@@ -358,6 +362,155 @@ pub unsafe extern "C" fn CMVideoFormatDescriptionCreateFromH264ParameterSets(
     // SAFETY: the caller's obligation.
     unsafe { *out = description };
     SUCCESS
+}
+
+/// The NAL unit length and the parameter sets, sequence sets first, of an
+/// `AVCDecoderConfigurationRecord` (ISO/IEC 14496-15 5.3.3.1).
+fn parse_avcc(record: &[u8]) -> Option<(i32, Sets)> {
+    const HEADER: usize = 5;
+    const LENGTH_SIZE_MASK: u8 = 0x03;
+    const SPS_COUNT_MASK: u8 = 0x1f;
+    let header = record.get(..HEADER + 1)?;
+    let nal_length = i32::from(header[4] & LENGTH_SIZE_MASK) + 1;
+    let mut rest = &record[HEADER + 1..];
+    let mut sets = Vec::new();
+    let mut read = |count: usize, rest: &mut &[u8]| -> Option<()> {
+        for _ in 0..count {
+            let (size, after) = rest.split_at_checked(2)?;
+            let size = usize::from(u16::from_be_bytes([size[0], size[1]]));
+            let (set, after) = after.split_at_checked(size)?;
+            sets.push(set.to_vec());
+            *rest = after;
+        }
+        Some(())
+    };
+    read(usize::from(header[5] & SPS_COUNT_MASK), &mut rest)?;
+    let (&pictures, mut after) = rest.split_first()?;
+    read(usize::from(pictures), &mut after)?;
+    Some((nal_length, sets))
+}
+
+/// The `avcC` atom in a description's extensions, if it has one.
+fn avcc_atom(extensions: CFTypeRef) -> Option<(i32, Sets)> {
+    // SAFETY: our own dictionary of the caller's values, each checked to be
+    // what it should be before it is read.
+    unsafe {
+        let atoms = corefoundation::api::CFDictionaryGetValue(
+            extensions,
+            key("SampleDescriptionExtensionAtoms"),
+        );
+        collections::dictionary(atoms)?;
+        let avcc = corefoundation::api::CFDictionaryGetValue(atoms, key("avcC"));
+        parse_avcc(collections::data(avcc)?)
+    }
+}
+
+/// `OSStatus CMVideoFormatDescriptionCreate(CFAllocatorRef allocator,
+/// CMVideoCodecType codecType, int32_t width, int32_t height, CFDictionaryRef
+/// extensions, CMVideoFormatDescriptionRef *formatDescriptionOut)`
+///
+/// The extensions are copied. An H.264 description whose extensions carry an
+/// `avcC` atom hands its parameter sets back as one made from them does.
+///
+/// # Safety
+///
+/// `extensions` is null or a dictionary, and `out` is writable.
+pub unsafe extern "C" fn CMVideoFormatDescriptionCreate(
+    _allocator: CFAllocatorRef,
+    codec: u32,
+    width: i32,
+    height: i32,
+    extensions: CFTypeRef,
+    out: *mut CFTypeRef,
+) -> i32 {
+    if out.is_null() {
+        return INVALID_PARAMETER;
+    }
+    let extensions = match extensions.is_null() {
+        true => dictionary(Vec::new()),
+        // SAFETY: the caller's object, checked to be a dictionary first.
+        false => unsafe {
+            if collections::dictionary(extensions).is_none() {
+                return INVALID_PARAMETER;
+            }
+            corefoundation::api::CFDictionaryCreateCopy(std::ptr::null(), extensions)
+        },
+    };
+    if extensions.is_null() {
+        return ALLOCATION_FAILED;
+    }
+    let (nal_length, parameter_sets) = match codec {
+        AVC1 => avcc_atom(extensions).unwrap_or_default(),
+        _ => Default::default(),
+    };
+    let state = State {
+        media_type: VIDEO,
+        subtype: codec,
+        dimensions: Dimensions { width, height },
+        extensions,
+        parameter_sets,
+        nal_length,
+        derived: false,
+    };
+    let description = corefoundation::boxed::make(class(), state);
+    if description.is_null() {
+        return ALLOCATION_FAILED;
+    }
+    // SAFETY: the caller's obligation.
+    unsafe { *out = description };
+    SUCCESS
+}
+
+fn refuse_hevc(call: &str) {
+    static SAID: std::sync::Once = std::sync::Once::new();
+    SAID.call_once(|| {
+        eprintln!("rosemary: {call}: HEVC parameter sets are not read; no description is made");
+    });
+}
+
+/// `OSStatus CMVideoFormatDescriptionCreateFromHEVCParameterSets(
+/// CFAllocatorRef allocator, size_t parameterSetCount, const uint8_t *const
+/// *parameterSetPointers, const size_t *parameterSetSizes, int
+/// NALUnitHeaderLength, CFDictionaryRef extensions, CMFormatDescriptionRef
+/// *formatDescriptionOut)`
+///
+/// Refused: nothing here parses HEVC parameter sets or decodes HEVC, and a
+/// description with made-up dimensions would be worse than none.
+pub unsafe extern "C" fn CMVideoFormatDescriptionCreateFromHEVCParameterSets(
+    _allocator: CFAllocatorRef,
+    _count: usize,
+    _pointers: *const *const u8,
+    _sizes: *const usize,
+    _nal_length: i32,
+    _extensions: CFTypeRef,
+    out: *mut CFTypeRef,
+) -> i32 {
+    if !out.is_null() {
+        // SAFETY: the caller's out-parameter.
+        unsafe { *out = std::ptr::null() };
+    }
+    refuse_hevc("CMVideoFormatDescriptionCreateFromHEVCParameterSets");
+    INVALID_PARAMETER
+}
+
+/// `OSStatus CMVideoFormatDescriptionGetHEVCParameterSetAtIndex(
+/// CMFormatDescriptionRef videoDesc, size_t parameterSetIndex, const uint8_t
+/// **parameterSetPointerOut, size_t *parameterSetSizeOut, size_t
+/// *parameterSetCountOut, int *NALUnitHeaderLengthOut)`
+///
+/// No description made here is an HEVC one with parameter sets to give.
+pub unsafe extern "C" fn CMVideoFormatDescriptionGetHEVCParameterSetAtIndex(
+    description: CFTypeRef,
+    _index: usize,
+    _pointer_out: *mut *const u8,
+    _size_out: *mut usize,
+    _count_out: *mut usize,
+    _nal_length_out: *mut i32,
+) -> i32 {
+    match state(description) {
+        Some(_) => INCOMPATIBLE,
+        None => INVALID_PARAMETER,
+    }
 }
 
 /// `OSStatus CMVideoFormatDescriptionGetH264ParameterSetAtIndex(
@@ -448,12 +601,16 @@ pub unsafe extern "C" fn CMFormatDescriptionEqual(a: CFTypeRef, b: CFTypeRef) ->
     let (Some(a), Some(b)) = (state(a), state(b)) else {
         return 0;
     };
-    // The extensions are made from the sets and NAL length alone, so these
-    // decide what comparing the dictionaries would.
+    // Extensions made from the sets and NAL length are decided by those;
+    // anyone else's have to be compared.
     let same = a.media_type == b.media_type
         && a.subtype == b.subtype
+        && a.dimensions == b.dimensions
         && a.parameter_sets == b.parameter_sets
-        && a.nal_length == b.nal_length;
+        && a.nal_length == b.nal_length
+        && ((a.derived && b.derived)
+            // SAFETY: two live dictionaries.
+            || unsafe { corefoundation::api::CFEqual(a.extensions, b.extensions) } != 0);
     same as u8
 }
 
@@ -467,7 +624,10 @@ pub unsafe extern "C" fn CMVideoFormatDescriptionGetDimensions(
 
 exports::exports! {
     functions {
+        "CMVideoFormatDescriptionCreate" => CMVideoFormatDescriptionCreate,
         "CMVideoFormatDescriptionCreateFromH264ParameterSets" => CMVideoFormatDescriptionCreateFromH264ParameterSets,
+        "CMVideoFormatDescriptionCreateFromHEVCParameterSets" => CMVideoFormatDescriptionCreateFromHEVCParameterSets,
+        "CMVideoFormatDescriptionGetHEVCParameterSetAtIndex" => CMVideoFormatDescriptionGetHEVCParameterSetAtIndex,
         "CMVideoFormatDescriptionGetH264ParameterSetAtIndex" => CMVideoFormatDescriptionGetH264ParameterSetAtIndex,
         "CMVideoFormatDescriptionGetDimensions" => CMVideoFormatDescriptionGetDimensions,
         "CMFormatDescriptionGetTypeID" => CMFormatDescriptionGetTypeID,
@@ -611,6 +771,115 @@ mod tests {
             for d in [a, b, c] {
                 corefoundation::api::CFRelease(d);
             }
+        }
+    }
+
+    fn create_plain(codec: u32, extensions: CFTypeRef) -> CFTypeRef {
+        let mut out = std::ptr::null();
+        let status = unsafe {
+            CMVideoFormatDescriptionCreate(std::ptr::null(), codec, 64, 48, extensions, &mut out)
+        };
+        assert_eq!(status, SUCCESS);
+        out
+    }
+
+    #[test]
+    fn a_plain_description_keeps_its_size_codec_and_extensions() {
+        let jpeg = u32::from_be_bytes(*b"jpeg");
+        let d = create_plain(jpeg, std::ptr::null());
+        unsafe {
+            assert_eq!(CMFormatDescriptionGetMediaType(d), VIDEO);
+            assert_eq!(CMFormatDescriptionGetMediaSubType(d), jpeg);
+            assert_eq!(
+                CMVideoFormatDescriptionGetDimensions(d),
+                Dimensions {
+                    width: 64,
+                    height: 48
+                }
+            );
+            assert!(!CMFormatDescriptionGetExtensions(d).is_null());
+            assert_eq!(
+                CMVideoFormatDescriptionGetH264ParameterSetAtIndex(
+                    d,
+                    0,
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                ),
+                INCOMPATIBLE
+            );
+            let mut out = std::ptr::null();
+            assert_eq!(
+                CMVideoFormatDescriptionCreate(
+                    std::ptr::null(),
+                    jpeg,
+                    1,
+                    1,
+                    key("not a dictionary"),
+                    &mut out
+                ),
+                INVALID_PARAMETER
+            );
+            corefoundation::api::CFRelease(d);
+        }
+    }
+
+    #[test]
+    fn an_avcc_atom_in_the_extensions_gives_the_parameter_sets() {
+        let from_sets = create(&[SPS_1080P_HIGH, PPS_1080P_HIGH], 2).unwrap();
+        let extensions = unsafe { CMFormatDescriptionGetExtensions(from_sets) };
+        let d = create_plain(AVC1, extensions);
+        unsafe {
+            let (mut pointer, mut size, mut count, mut nal_length) = (std::ptr::null(), 0, 0, 0);
+            let status = CMVideoFormatDescriptionGetH264ParameterSetAtIndex(
+                d,
+                1,
+                &mut pointer,
+                &mut size,
+                &mut count,
+                &mut nal_length,
+            );
+            assert_eq!((status, count, nal_length), (SUCCESS, 2, 2));
+            assert_eq!(std::slice::from_raw_parts(pointer, size), PPS_1080P_HIGH);
+            assert_eq!(CMFormatDescriptionEqual(d, from_sets), 0, "another size");
+            corefoundation::api::CFRelease(d);
+            corefoundation::api::CFRelease(from_sets);
+        }
+        assert_eq!(parse_avcc(&[1, 100, 0, 40, 0xff, 0xe1, 0, 9]), None);
+    }
+
+    #[test]
+    fn hevc_descriptions_are_refused() {
+        let from_sets = create(&[SPS_1080P_HIGH, PPS_1080P_HIGH], 4).unwrap();
+        let mut out = 1 as CFTypeRef;
+        unsafe {
+            assert_eq!(
+                CMVideoFormatDescriptionCreateFromHEVCParameterSets(
+                    std::ptr::null(),
+                    0,
+                    std::ptr::null(),
+                    std::ptr::null(),
+                    4,
+                    std::ptr::null(),
+                    &mut out
+                ),
+                INVALID_PARAMETER
+            );
+            assert!(out.is_null());
+            let get = |d| {
+                CMVideoFormatDescriptionGetHEVCParameterSetAtIndex(
+                    d,
+                    0,
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                )
+            };
+            assert_eq!(get(from_sets), INCOMPATIBLE);
+            assert_eq!(get(std::ptr::null()), INVALID_PARAMETER);
+            corefoundation::api::CFRelease(from_sets);
         }
     }
 
