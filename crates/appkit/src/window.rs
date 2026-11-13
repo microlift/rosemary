@@ -326,7 +326,10 @@ pub(crate) fn desktop_mouse_state() -> Option<(f32, f32, u32)> {
         return sdl3::video::global_mouse_state();
     }
     let (x, y, buttons) = sdl3::video::mouse_state()?;
-    let origin = crate::event::pointer_window()
+    // SDL may already have pumped a focus change that our event loop has not
+    // delivered yet. Its cached position belongs to its current mouse window.
+    let origin = sdl3::video::mouse_focus()
+        .or_else(crate::event::pointer_window)
         .and_then(global_position)
         .unwrap_or((0, 0));
     Some((x + origin.0 as f32, y + origin.1 as f32, buttons))
