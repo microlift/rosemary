@@ -213,7 +213,7 @@ fn restore_guest_gl(api: &Api) {
     let window = sdl3::video::gl_current_window();
     // SAFETY: called on GTK's thread after its rendering work has returned.
     unsafe { (api.gdk_gl_context_clear_current)() };
-    if !context.is_null() {
+    if !context.is_null() && !sdl3::video::egl::backs(context) {
         sdl3::video::gl_make_current(std::ptr::null_mut(), std::ptr::null_mut());
         if !sdl3::video::gl_make_current(window, context) {
             warn_once("could not restore the guest OpenGL context after web rendering");
@@ -392,19 +392,19 @@ mod gl_tests {
         };
         // SAFETY: checked EGL entry points, with their declared prototypes.
         unsafe {
-            let current_display: unsafe extern "C" fn() -> Ptr = std::mem::transmute(libc::dlsym(
-                libc::RTLD_DEFAULT,
-                c"eglGetCurrentDisplay".as_ptr(),
-            ));
+            let current_display: unsafe extern "C" fn() -> Ptr =
+                std::mem::transmute(symbol(c"eglGetCurrentDisplay"));
             let current_surface: unsafe extern "C" fn(u32) -> Ptr =
                 std::mem::transmute(symbol(c"eglGetCurrentSurface"));
             let make_current: unsafe extern "C" fn(Ptr, Ptr, Ptr, Ptr) -> u32 =
                 std::mem::transmute(symbol(c"eglMakeCurrent"));
+            const EGL_DRAW: u32 = 0x3059;
+            const EGL_READ: u32 = 0x305A;
             assert_ne!(
                 make_current(
                     current_display(),
-                    current_surface(0x3059),
-                    current_surface(0x305A),
+                    current_surface(EGL_DRAW),
+                    current_surface(EGL_READ),
                     foreign
                 ),
                 0
