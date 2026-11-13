@@ -43,7 +43,7 @@ libc.workspace = true
 static_init.workspace = true
 clap = { version = "4", features = ["derive"] }
 iced-x86 = "1"
-microlift = { git = "https://github.com/microlift/microlift", features = ["disasm", "runtime"], rev = "39b9bf3fe40eda2ba690282b01e28c76b5957f28" }
+microlift = { git = "https://github.com/microlift/microlift", features = ["disasm", "runtime"], rev = "da2b3780cfbfadd6e9aade2ab6f47e4549837778" }
 # `override` feature disabled on macOS for now because it has a bug where it improperly sets `_malloc_fork` info,
 # causing child processes to get their memory allocator corrupted.
 [target.'cfg(target_os = "macos")'.dependencies]

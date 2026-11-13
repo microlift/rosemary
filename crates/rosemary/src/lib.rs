@@ -28,6 +28,7 @@ pub mod dispatch;
 pub mod dyld;
 pub mod exec;
 pub mod fault;
+pub mod fork;
 pub mod heapcheck;
 pub mod host;
 pub mod interp;

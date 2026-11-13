@@ -1,6 +1,7 @@
 use microlift::core::srcloc::{GuestCodeMap, GuestCodeRange};
 use static_init::dynamic;
 
+use std::collections::BTreeMap;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicUsize, Ordering};
 
@@ -38,8 +39,11 @@ const MAX_BLOB: u64 = 1 << 20;
 
 /// Compiled translations by the host address of their entry point.
 ///
-/// Global rather than per-thread even though the caches are per-thread.
-static PLACED: Mutex<Vec<Placed>> = Mutex::new(Vec::new());
+/// Global rather than per-thread even though the caches are per-thread. A map and
+/// not a sorted vector: code lands in the JIT's arena and in cache files mapped far
+/// from it, so translations do not arrive in address order, and an insert into a
+/// vector of hundreds of thousands moved megabytes with this lock held.
+static PLACED: Mutex<BTreeMap<u64, Placed>> = Mutex::new(BTreeMap::new());
 
 /// How many host-to-guest ranges to keep across the whole process.
 const MAP_BUDGET_MIB: usize = 64;
@@ -62,6 +66,15 @@ fn map_budget() -> usize {
 
 /// Ranges kept so far, against [`map_budget`].
 static MAPPED: AtomicUsize = AtomicUsize::new(0);
+
+/// The map of placed translations, held across a fork; see [`crate::fork`].
+pub(crate) struct ForkHold(
+    #[allow(dead_code)] std::sync::MutexGuard<'static, BTreeMap<u64, Placed>>,
+);
+
+pub(crate) fn hold_for_fork() -> ForkHold {
+    ForkHold(PLACED.lock().unwrap_or_else(|e| e.into_inner()))
+}
 
 /// Note where a translation's compiled code went, and what it came from.
 pub fn placed(
@@ -90,10 +103,7 @@ pub fn placed(
         },
     };
     let mut placed = PLACED.lock().unwrap_or_else(|e| e.into_inner());
-    match placed.binary_search_by_key(&code, |p| p.code) {
-        Ok(i) => placed[i] = entry,
-        Err(i) => placed.insert(i, entry),
-    }
+    placed.insert(code, entry);
     placed.len()
 }
 
@@ -138,16 +148,12 @@ pub enum Unnamed {
 /// The upper bound matters as much as the lower one: without it every host
 /// address above the last translation - a libc frame, most of them - is
 /// attributed to whichever translation happens to sit highest.
-fn covering(placed: &[Placed], pc: u64) -> Option<&Placed> {
-    let at = match placed.binary_search_by_key(&pc, |p| p.code) {
-        Ok(i) => i,
-        Err(0) => return None,
-        Err(i) => i - 1,
-    };
-    let entry = &placed[at];
+fn covering(placed: &BTreeMap<u64, Placed>, pc: u64) -> Option<&Placed> {
+    let (_, entry) = placed.range(..=pc).next_back()?;
     let end = placed
-        .get(at + 1)
-        .map_or(u64::MAX, |next| next.code)
+        .range(pc.saturating_add(1)..)
+        .next()
+        .map_or(u64::MAX, |(&next, _)| next)
         .min(entry.code.saturating_add(MAX_BLOB));
     (pc < end).then_some(entry)
 }
@@ -206,7 +212,7 @@ pub struct PlacedRegion {
 /// The lock is held for the whole walk, so `f` must not compile anything.
 pub fn for_each_placed(mut f: impl FnMut(&PlacedRegion, &[GuestCodeRange])) {
     let placed = PLACED.lock().unwrap_or_else(|e| e.into_inner());
-    for entry in placed.iter() {
+    for entry in placed.values() {
         let view = PlacedRegion {
             code: entry.code,
             code_end: entry.attributed_end(),
@@ -1498,7 +1504,7 @@ mod tests {
             &map(0x1_0000, 16),
         );
         let placed = PLACED.lock().unwrap();
-        let entry = placed.iter().find(|p| p.code == 0x40_0000).unwrap();
+        let entry = &placed[&0x40_0000];
 
         assert_eq!(lookup(&entry.map, 0), Some(0x1_0000));
         assert_eq!(lookup(&entry.map, 15), Some(0x1_0000));
@@ -1528,11 +1534,7 @@ mod tests {
             &map(0x2_0000, 4),
         );
         let placed = PLACED.lock().unwrap();
-        let find = |pc: u64| match placed.binary_search_by_key(&pc, |p| p.code) {
-            Ok(i) => Some(placed[i].guest),
-            Err(0) => None,
-            Err(i) => Some(placed[i - 1].guest),
-        };
+        let find = |pc: u64| placed.range(..=pc).next_back().map(|(_, p)| p.guest);
         assert_eq!(find(0x3fff), None);
         assert_eq!(find(0x4000), Some((0x1_0000, 0x1_0100)));
         assert_eq!(find(0x4010), Some((0x1_0000, 0x1_0100)));
@@ -1552,7 +1554,7 @@ mod tests {
             &map(0x3_0000, 4),
         );
         let placed = PLACED.lock().unwrap();
-        let entry = placed.iter().find(|p| p.code == 0x10_0000).unwrap();
+        let entry = &placed[&0x10_0000];
         assert_eq!(entry.attributed_end(), 0x10_0040);
         assert_eq!(lookup(&entry.map, 0x3f), Some(0x3_0003));
         assert_eq!(lookup(&entry.map, 0x40), None);

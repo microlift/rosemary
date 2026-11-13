@@ -17,6 +17,9 @@ const LOAD_SELECTOR: &str = "load";
 pub struct Entries {
     /// Slid addresses in priority order, each once.
     pub order: Vec<u64>,
+    /// How many of `order` start-up needs: what earlier runs executed and what runs
+    /// before `main`. The rest is every other function the image has.
+    pub hot: usize,
     /// Every `LC_FUNCTION_STARTS` entry and landing pad, slid and ascending: the
     /// addresses a region declares as resume points when it holds them.
     pub declared: Vec<u64>,
@@ -50,10 +53,10 @@ impl Layout {
 /// `report`'s entries, read from `memory` (its exception tables) and `layout`, with
 /// `profiled` the unslid addresses earlier runs had to JIT.
 ///
-/// The order is the roadmap's: Objective-C `IMP`s with every `+load` first, which
-/// realization reaches before `main`; initializers; functions with an exception
-/// table, then their landing pads; the entry point; what earlier runs executed; and
-/// every other function start.
+/// What earlier runs executed comes first, since it is what the next run will
+/// execute; then what start-up reaches before `main`: every `+load`, the other
+/// Objective-C `IMP`s, initializers and the entry point. Those are hot. Then, cold, functions
+/// with an exception table and their landing pads, and every other function start.
 pub fn of<M: AddressSpace + ?Sized>(
     report: &ImageReport,
     memory: &M,
@@ -62,6 +65,10 @@ pub fn of<M: AddressSpace + ?Sized>(
 ) -> Entries {
     let slide = report.slide;
     let mut order = Ordered::new(report);
+
+    for &address in profiled {
+        order.push(address.wrapping_add(slide));
+    }
 
     if let Some(objc) = &report.objc {
         let class_loads = objc
@@ -84,6 +91,11 @@ pub fn of<M: AddressSpace + ?Sized>(
         order.push(initializer);
     }
 
+    if let Some(entry) = report.entry {
+        order.push(entry);
+    }
+    let hot = order.addresses.len();
+
     let mut pads = Vec::new();
     for entry in layout.unwind.entries() {
         let Some(lsda) = entry.lsda else {
@@ -101,14 +113,6 @@ pub fn of<M: AddressSpace + ?Sized>(
         }
     }
 
-    if let Some(entry) = report.entry {
-        order.push(entry);
-    }
-
-    for &address in profiled {
-        order.push(address.wrapping_add(slide));
-    }
-
     let starts: Vec<u64> = layout
         .function_starts
         .iter()
@@ -124,6 +128,7 @@ pub fn of<M: AddressSpace + ?Sized>(
     declared.dedup();
     Entries {
         order: order.addresses,
+        hot,
         declared,
     }
 }
@@ -239,14 +244,18 @@ mod tests {
         assert_eq!(
             entries.order,
             [
+                TEXT + 0x70, // profiled
                 TEXT + 0x10, // +load
                 TEXT + 0x30, // instance method
                 TEXT + 0x20, // class method
                 TEXT + 0x40, // initializer
                 TEXT + 0x50, // entry point
-                TEXT + 0x70, // profiled
                 TEXT + 0x60, // remaining function start
             ]
+        );
+        assert_eq!(
+            entries.hot, 6,
+            "everything before the remaining start is hot"
         );
     }
 

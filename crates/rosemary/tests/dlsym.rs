@@ -55,3 +55,37 @@ fn rtld_next_reaches_a_builtin_dependency() {
 fn rtld_next_reaches_a_host_dependency() {
     assert_rtld_next_finds_everything(&[("ROSEMARY_PREFIX", "off"), ("ROSEMARY_LIBC", "native")]);
 }
+
+/// The executable opens itself by its own path, as Roblox does, and looks one of
+/// its own globals up through the handle.
+const DLOPEN_SELF_C: &str = r#"
+#include <dlfcn.h>
+#include <mach-o/dyld.h>
+#include <stdint.h>
+#include <stdio.h>
+
+__attribute__((visibility("default"))) int self_marker = 41;
+
+int main(void) {
+    char path[4096];
+    uint32_t size = sizeof path;
+    if (_NSGetExecutablePath(path, &size) != 0) return 2;
+    void *self = dlopen(path, RTLD_NOW);
+    if (!self) return 3;
+    int *found = (int *)dlsym(self, "self_marker");
+    printf("same %d\n", found == &self_marker);
+    self_marker += 1;
+    printf("value %d\n", found ? *found : -1);
+    return 0;
+}
+"#;
+
+#[test]
+fn an_executable_that_opens_itself_gets_itself_not_a_copy() {
+    let Some(guest) = common::build_x86_64("dlopen_self", DLOPEN_SELF_C, &[]) else {
+        skip!("cannot build x86_64 fixtures")
+    };
+    let (status, out, err) = common::run_guest_env(&[], &guest, &[]);
+    assert_eq!(status, Some(0), "stderr: {err}");
+    assert_eq!(out, "same 1\nvalue 42\n", "stderr: {err}");
+}

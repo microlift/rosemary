@@ -21,8 +21,11 @@ Binaries and apps installed in the prefix take priority over host filesystem pat
 ## Compiling ahead of time
 
 The `emulated` backend keeps an on-disk cache of x86-64 code compiled ahead of time
-(see `docs/aot.md`). A run that finds an image of its program uncached starts a
-build of it in the background, at the lowest priority, and does not wait for it.
+(see `docs/aot.md`). Cached code runs straight from the cache files' own pages, so it
+takes no memory of the process's own, and a region is published only when the run
+first reaches it. A run that finds an image of its program uncached, or that earlier
+runs have since compiled much uncached code for, starts a build in the background, at
+the lowest priority (in the background band on macOS), and does not wait for it.
 To build or rebuild the cache yourself, which also takes in the code earlier runs
 had to compile on the fly:
 
@@ -31,9 +34,14 @@ rosemary aot /some/app.app
 rosemary aot --deadline 300 --threads 4 /some/app.app/Contents/MacOS/App
 ```
 
-`--deadline` stops starting work after that many seconds and writes what finished,
-most important code first; `--only-missing` leaves images that already have a cache
-file alone.
+What earlier runs executed and what start-up needs is compiled first, into a file of
+its own that is usable as soon as it is written; everything else follows, compiled
+cheaply (a run recompiles what it actually uses, as it does its own code).
+`--deadline` stops starting work after that many seconds and writes what finished;
+`--hot-only` compiles only that first part; `--only-missing` leaves images that
+already have a cache file alone; `--refresh` builds images with no cache file and
+rebuilds the first part of those whose runs have outgrown it, which is what a
+background build does.
 
 ## Entering a shell
 
@@ -97,7 +105,7 @@ rosemary server --stop         # ask this prefix's server to exit
 | `ROSEMARY_PREFIX_HOME` | `prefix` | Where the guest's home directory is. `prefix` keeps it inside the prefix, so a prefix is one directory to copy, archive or delete. `host` mounts the guest's `/Users/<name>` onto the real `$HOME` instead, for a user who would rather keep one set of documents than two. |
 | `ROSEMARY_PREFIX_SETUP` | `ask` | What to do when a prefix needs its Darwin base and it is not cached. `ask` asks - a dialog under `rosemary run` when there is a display, then the terminal - and declines when there is nobody to ask. `download` fetches it without asking. `fail` never downloads. The base is verified against hashes compiled into Rosemary whichever route it takes. |
 | `ROSEMARY_AOT_CACHE` | `$XDG_CACHE_HOME/rosemary/aot` | Where code compiled ahead of time is cached, and where each run logs the image code it had to JIT (`profile/`). Falls back to `$HOME/.cache/rosemary/aot`; `0`, `off` or empty disables both. See `docs/aot.md`. |
-| `ROSEMARY_AOT_BACKGROUND` | on | `0` or `off` stops a run from starting `rosemary aot` in the background when an image of its program has no cache file. |
+| `ROSEMARY_AOT_BACKGROUND` | on | `0` or `off` stops a run from starting `rosemary aot` in the background when an image of its program has no cache file, or one built before runs compiled much uncached code. |
 | `ROSEMARY_AOT_CACHE_KEEP` | unset | Keep the AOT caches of other Rosemary builds instead of removing them when this build stores one, for bisecting between two builds. |
 | `ROSEMARY_ROOTFS_CACHE` | `$XDG_CACHE_HOME/rosemary/rootfs` | Where verified Darwin bases are cached, shared by every prefix. Falls back to `$HOME/.cache/rosemary/rootfs`. |
 | `ROSEMARY_ENVIRON` | unset | (builtin libc) Variables the guest starts with, one `NAME=VALUE` per line. A line that is a bare `NAME` copies the host's value, if it has one. Nothing else of the host's environment reaches the guest: it gets only `HOME`, `USER`, `LOGNAME`, `SHELL`, `PATH`, `TMPDIR` and `PWD` with its own values, plus the host's `TERM` and `COLORTERM`, and `LANG` and `LC_*` unless the guest is an application bundle (an app launched from the Finder has no locale variables; a bare `LANG` line still copies it). This keeps a Darwin program from following host settings such as `DISPLAY` or `QT_PLUGIN_PATH`. Example: `ROSEMARY_ENVIRON=$'FOO=bar\nDISPLAY'`. |

@@ -49,7 +49,7 @@ macro_rules! counters {
 }
 
 counters! {
-    REGIONS, INSTRUCTIONS, BYTES,
+    REGIONS, INSTRUCTIONS, BYTES, CODE_BYTES, CACHED_REGIONS, CACHED_CODE_BYTES,
     SELECT_NS, LIFT_NS, COMPILE_NS,
     REFUSED, TAIL_EXITS, STALE_LIFTS, RETIRED,
     ENTRIES, WINDOW_MISSES, TAIL_IMPORTS, LINKED,
@@ -281,6 +281,21 @@ pub fn record_lift(instructions: usize, bytes: usize, lift: Duration, compile: D
     }
 }
 
+/// Host code the JIT emitted for one region, its GOT entries included.
+pub fn record_code(bytes: usize) {
+    if enabled() {
+        CODE_BYTES.fetch_add(bytes as u64, Relaxed);
+    }
+}
+
+/// A region published from the code cache rather than compiled.
+pub fn record_cached(code_bytes: u32) {
+    if enabled() {
+        CACHED_REGIONS.fetch_add(1, Relaxed);
+        CACHED_CODE_BYTES.fetch_add(code_bytes.into(), Relaxed);
+    }
+}
+
 /// A region that could not be translated at all.
 pub fn record_refused() {
     REFUSED.fetch_add(1, Relaxed);
@@ -383,6 +398,13 @@ pub fn report() {
          {} byte(s), {:.1} instr/region",
         BYTES.load(Relaxed),
         instructions as f64 / regions as f64,
+    );
+    let mib = |c: &AtomicU64| c.load(Relaxed) as f64 / (1024.0 * 1024.0);
+    eprintln!(
+        "rosemary: stats  code {:.1} MiB compiled, {} region(s) and {:.1} MiB from the code cache",
+        mib(&CODE_BYTES),
+        CACHED_REGIONS.load(Relaxed),
+        mib(&CACHED_CODE_BYTES),
     );
     // What the *shared* cache saw, which is the other half of the linking story: the
     // counters above say how often the run loop was entered, and these say how often

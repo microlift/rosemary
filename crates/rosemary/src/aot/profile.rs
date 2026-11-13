@@ -146,9 +146,60 @@ pub fn read(path: &Path) -> std::io::Result<Vec<u64>> {
         .collect())
 }
 
+/// How many records a log holds, torn final record aside.
+pub fn records(path: &Path) -> u64 {
+    std::fs::metadata(path).map_or(0, |m| m.len() / RECORD as u64)
+}
+
+/// Every address a log holds, each once, in the order first logged; the log is
+/// rewritten so when it held repeats. Runs log every address they compile, so a log
+/// read by builds and never compacted grows by a run's worth each run.
+///
+/// A record another process appends while the log is rewritten may be lost, which
+/// costs a later run one JIT compile.
+pub fn compact(path: &Path) -> std::io::Result<Vec<u64>> {
+    let logged = read(path)?;
+    let mut seen = HashSet::with_capacity(logged.len());
+    let unique: Vec<u64> = logged.iter().copied().filter(|&a| seen.insert(a)).collect();
+    if unique.len() < logged.len() {
+        let bytes: Vec<u8> = unique.iter().flat_map(|a| a.to_le_bytes()).collect();
+        super::store::write_atomic(path, &bytes)?;
+    }
+    Ok(unique)
+}
+
+/// Whether a log of `now` records has grown enough past the `built` a cache was
+/// built from to be worth building again.
+pub fn grown(built: u64, now: u64) -> bool {
+    const MIN_GROWTH: u64 = 4096;
+    now > built + (built / 8).max(MIN_GROWTH)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn compacting_keeps_the_first_of_each_address_in_order() {
+        let dir = std::env::temp_dir().join(format!("rosemary-aot-compact-{}", std::process::id()));
+        let path = dir.join("p.log");
+        let mut log = open(&path).unwrap();
+        for address in [0x3000, 0x1000, 0x3000, 0x2000, 0x1000] {
+            append(&mut log, address).unwrap();
+        }
+        assert_eq!(compact(&path).unwrap(), [0x3000, 0x1000, 0x2000]);
+        assert_eq!(read(&path).unwrap(), [0x3000, 0x1000, 0x2000]);
+        assert_eq!(records(&path), 3);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_log_has_grown_once_it_gains_an_eighth_or_enough_records() {
+        assert!(!grown(0, 4096));
+        assert!(grown(0, 4097));
+        assert!(!grown(80_000, 90_000));
+        assert!(grown(80_000, 90_001));
+    }
 
     #[test]
     fn appended_addresses_read_back_in_order() {

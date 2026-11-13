@@ -1432,6 +1432,11 @@ impl Vm {
         self.cache.upgrade(&self.program, guest_va);
     }
 
+    /// The code cache's locks, held across a fork; see [`crate::fork`].
+    pub(crate) fn hold_cache_for_fork(&'static self) -> crate::cache::ForkHold {
+        self.cache.hold_for_fork()
+    }
+
     /// Whether the translation lifted for `guest_va` is still provisional.
     pub fn is_provisional(&self, guest_va: u64) -> bool {
         self.cache.is_provisional(guest_va)

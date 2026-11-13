@@ -121,6 +121,20 @@ impl OptLevel {
 
     /// The Cranelift flags to build a backend with.
     pub fn flags(self) -> settings::Flags {
+        settings::Flags::new(self.builder())
+    }
+
+    /// [`flags`](Self::flags) for guest regions, which load every host reference
+    /// from a GOT entry so the same code can run from the JIT or a cache file.
+    pub fn region_flags(self) -> settings::Flags {
+        let mut builder = self.builder();
+        builder
+            .set("is_pic", "true")
+            .expect("cranelift accepts its own is_pic values");
+        settings::Flags::new(builder)
+    }
+
+    fn builder(self) -> settings::Builder {
         let mut builder = settings::builder();
         // The only way this fails is a setting Cranelift does not have or a
         // value it does not accept, both of which are fixed constants above.
@@ -161,7 +175,7 @@ impl OptLevel {
                 .set("regalloc_algorithm", algorithm)
                 .expect("couldn't set the regalloc algorithm");
         }
-        settings::Flags::new(builder)
+        builder
     }
 
     /// The ISA-specific `(name, value)` pairs to build a backend with.
@@ -758,6 +772,37 @@ pub fn provisional_backend() -> microlift::Result<CraneliftBackend> {
     static FLAGS: settings::Flags = OptLevel::Fast.flags();
     let _errno = crate::thread::Errno::now();
     CraneliftBackend::with_flags(FLAGS.clone(), isa_settings())
+}
+
+/// The compiler for guest regions at `tier`: position-independent code placed in
+/// the arena every region shares. Built once per tier, since building an ISA
+/// detects the host's features.
+pub fn region_compiler(
+    tier: crate::cache::Tier,
+) -> microlift::Result<&'static microlift::runtime::jit::JitCompiler> {
+    use crate::cache::Tier;
+    use microlift::runtime::jit::JitCompiler;
+    use std::sync::OnceLock;
+    static FINAL: OnceLock<JitCompiler> = OnceLock::new();
+    static PROVISIONAL: OnceLock<JitCompiler> = OnceLock::new();
+    let (cell, level) = match tier {
+        Tier::Final => (&FINAL, opt_level()),
+        Tier::Provisional => (&PROVISIONAL, OptLevel::Fast),
+    };
+    if let Some(compiler) = cell.get() {
+        return Ok(compiler);
+    }
+    let _errno = crate::thread::Errno::now();
+    let isa = CraneliftBackend::native_isa(level.region_flags(), isa_settings())?;
+    let _ = cell.set(JitCompiler::new(isa)?);
+    Ok(cell.get().expect("just set"))
+}
+
+/// The ISA guest regions are compiled for at `tier`.
+pub fn region_isa(
+    tier: crate::cache::Tier,
+) -> microlift::Result<&'static dyn microlift::cranelift_codegen::isa::TargetIsa> {
+    Ok(region_compiler(tier)?.isa())
 }
 
 /// Every ISA setting the JIT's ISA resolved to, host CPU detection included.

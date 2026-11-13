@@ -17,6 +17,9 @@
 //! for - regions that ran before regions only lifted ahead. Oldest first, so code that
 //! ran early and is still running is not starved by the stream of new code a busy
 //! start-up compiles.
+//!
+//! A guest's `fork` waits for every running job and holds the queue across it
+//! ([`crate::fork`]).
 
 use std::collections::VecDeque;
 use std::sync::{Condvar, Mutex};
@@ -65,6 +68,10 @@ struct Queue {
     workers: usize,
     /// Workers running an upgrade now.
     upgrading: usize,
+    /// Workers running any job now.
+    active: usize,
+    /// A fork is waiting for the running jobs; no worker starts another.
+    forking: bool,
 }
 
 /// One unit of a worker's work.
@@ -102,8 +109,42 @@ static QUEUE: Mutex<Queue> = Mutex::new(Queue {
     upgrades: [VecDeque::new(), VecDeque::new()],
     workers: 0,
     upgrading: 0,
+    active: 0,
+    forking: false,
 });
 static READY: Condvar = Condvar::new();
+/// Signalled when the last running job finishes.
+static IDLE: Condvar = Condvar::new();
+
+/// The queue, held across a fork by the forking thread; see [`crate::fork`].
+pub(crate) struct ForkHold(std::sync::MutexGuard<'static, Queue>);
+
+/// Waits for every running job and keeps any other from starting, holding the
+/// queue until the hold is released.
+pub(crate) fn hold_for_fork() -> ForkHold {
+    let mut queue = QUEUE.lock().unwrap_or_else(|e| e.into_inner());
+    queue.forking = true;
+    while queue.active > 0 {
+        queue = IDLE.wait(queue).unwrap_or_else(|e| e.into_inner());
+    }
+    ForkHold(queue)
+}
+
+impl ForkHold {
+    /// Lets workers go on. The child has none, and starts none (see
+    /// [`crate::fork`]): what is queued there is lifted when first called.
+    pub(crate) fn release(mut self, in_child: bool) {
+        self.0.forking = false;
+        if in_child {
+            self.0.pending.clear();
+            self.0.upgrades.iter_mut().for_each(VecDeque::clear);
+        }
+        drop(self);
+        if !in_child {
+            READY.notify_all();
+        }
+    }
+}
 
 /// How many workers to run: one CPU is left to the thread realizing classes.
 fn wanted() -> usize {
@@ -113,6 +154,9 @@ fn wanted() -> usize {
 
 /// Start workers up to [`wanted`]. Returns whether there is at least one.
 fn spawn_workers(queue: &mut Queue, vm: &'static Vm) -> bool {
+    if crate::fork::in_child() {
+        return false;
+    }
     while queue.workers < wanted() {
         let spawned = std::thread::Builder::new()
             .name("rosemary-prelift".into())
@@ -191,20 +235,33 @@ fn work(vm: &'static Vm) {
         let job = {
             let mut queue = QUEUE.lock().unwrap_or_else(|e| e.into_inner());
             loop {
-                if let Some(next) = queue.pop() {
+                if !queue.forking
+                    && let Some(next) = queue.pop()
+                {
+                    queue.active += 1;
                     break next;
                 }
                 queue = READY.wait(queue).unwrap_or_else(|e| e.into_inner());
             }
         };
+        let upgrade = matches!(job, Job::Upgrade(_));
         match job {
             Job::Lift(va, depth) => vm.lift_ahead(va, depth),
-            Job::Upgrade(va) => {
-                vm.upgrade(va);
-                QUEUE.lock().unwrap_or_else(|e| e.into_inner()).upgrading -= 1;
-                // The slot this frees may be the only thing another worker waits on.
-                READY.notify_one();
-            }
+            Job::Upgrade(va) => vm.upgrade(va),
+        }
+        let mut queue = QUEUE.lock().unwrap_or_else(|e| e.into_inner());
+        queue.active -= 1;
+        if upgrade {
+            queue.upgrading -= 1;
+        }
+        let idle = queue.active == 0;
+        drop(queue);
+        if idle {
+            IDLE.notify_all();
+        }
+        // An upgrade's slot may be the only thing another worker waits on.
+        if upgrade {
+            READY.notify_one();
         }
     }
 }
@@ -219,6 +276,8 @@ mod tests {
             upgrades: [VecDeque::new(), VecDeque::new()],
             workers: 0,
             upgrading: 0,
+            active: 0,
+            forking: false,
         }
     }
 

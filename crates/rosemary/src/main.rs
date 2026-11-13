@@ -117,7 +117,7 @@ fn emulated(
     let vm: &'static Vm = Box::leak(Box::new(vm));
     rosemary::thunk::publish(vm);
     // Before any guest code runs; see `aot::spawn`.
-    rosemary::aot::spawn::if_missing(&vm.program, path);
+    rosemary::aot::spawn::if_stale(&vm.program, path);
 
     // Objective-C registration happens inside `startup::run`, in dyld's order.
     // It is driven from here first only so that its refusals reach the user.
@@ -333,6 +333,13 @@ struct AotOptions {
     /// Continue in a detached, lowest-priority process and return at once
     #[arg(long)]
     detach: bool,
+    /// Compile only what earlier runs executed and what start-up needs
+    #[arg(long)]
+    hot_only: bool,
+    /// Build images with no cache file, and rebuild the start-up part of those whose
+    /// runs have since compiled enough uncached code; leave the rest alone
+    #[arg(long)]
+    refresh: bool,
 }
 
 fn main() -> ExitCode {
@@ -601,6 +608,8 @@ fn aot(options: AotOptions) -> ExitCode {
             .map(|seconds| std::time::Instant::now() + std::time::Duration::from_secs(seconds)),
         threads,
         only_missing: options.only_missing,
+        hot_only: options.hot_only,
+        refresh: options.refresh,
     };
     let mut failed = false;
     for (image, outcome) in rosemary::aot::build::build(vm, layout, &build) {
@@ -609,9 +618,11 @@ fn aot(options: AotOptions) -> ExitCode {
             Outcome::Written {
                 regions,
                 refused,
+                planned,
+                parts,
                 complete,
             } => println!(
-                "{image}: {regions} region(s) cached, {refused} refused{}",
+                "{image}: {regions} of {planned} region(s) cached in {parts} file(s), {refused} refused{}",
                 if complete {
                     ""
                 } else {

@@ -205,6 +205,7 @@ pub(crate) fn with_current<R>(vm: &Vm, f: impl FnOnce() -> R) -> R {
 /// thunk on a thread that has never been inside [`with_current`].
 pub fn publish(vm: &'static Vm) {
     PUBLISHED.store(vm as *const Vm as *mut Vm, Ordering::Release);
+    crate::fork::guard();
     vm.start_tiering();
 }
 
