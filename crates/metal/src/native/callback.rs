@@ -15,16 +15,28 @@ const HAS_SIGNATURE: i32 = 1 << 30;
 struct HandlerCapture {
     guest_block: AtomicUsize,
     guest_command: AtomicUsize,
+    progress: Arc<crate::completion::CallbackProgress>,
+    scheduled: bool,
 }
 
 impl Drop for HandlerCapture {
     fn drop(&mut self) {
         let block = self.guest_block.swap(0, Ordering::AcqRel);
         let command = self.guest_command.swap(0, Ordering::AcqRel);
+        if block == 0 && command == 0 {
+            return; // Already transferred by invocation; do not account twice.
+        }
         // Host block disposal can run on an Apple-owned thread with no Darwin
         // TLS or guest autorelease pool. Transfer ownership; never finalize a
         // guest object here, even if no completion handler ever ran.
-        unsafe { crate::completion::retire_owned(block as Id, command as Id) };
+        unsafe {
+            crate::completion::retire_owned(
+                block as Id,
+                command as Id,
+                Arc::clone(&self.progress),
+                self.scheduled,
+            )
+        };
     }
 }
 
@@ -77,14 +89,27 @@ extern "C" fn finished(block: *const HostBlock, _host_command: HostId) {
     let capture = unsafe { &*capture };
     let guest_block = capture.guest_block.swap(0, Ordering::AcqRel);
     let guest_command = capture.guest_command.swap(0, Ordering::AcqRel);
+    if guest_block == 0 && guest_command == 0 {
+        return;
+    }
     // Both references were retained on the guest registration thread. Metal
     // may call this on an uninitialized native thread, so only queue the
     // owned references and do not touch guest Objective-C here.
     unsafe {
         if guest_block != 0 {
-            crate::completion::deliver_owned(guest_block as Id, guest_command as Id);
+            crate::completion::deliver_owned(
+                guest_block as Id,
+                guest_command as Id,
+                Arc::clone(&capture.progress),
+                capture.scheduled,
+            );
         } else {
-            crate::completion::retire_owned(std::ptr::null_mut(), guest_command as Id);
+            crate::completion::retire_owned(
+                std::ptr::null_mut(),
+                guest_command as Id,
+                Arc::clone(&capture.progress),
+                capture.scheduled,
+            );
         }
     }
 }
@@ -115,9 +140,14 @@ pub(super) fn register(host_command: HostId, guest_command: Id, guest_block: Id,
         objc::block::release(guest_block);
         return;
     }
+    let progress =
+        Arc::clone(&unsafe { object::body::<NativeCommandBuffer>(guest_command) }.progress);
+    progress.register(scheduled);
     let capture = Arc::new(HandlerCapture {
         guest_block: AtomicUsize::new(guest_block as usize),
         guest_command: AtomicUsize::new(objc::arc::retain(guest_command) as usize),
+        progress,
+        scheduled,
     });
     let raw = Arc::into_raw(capture);
     let block = HostBlock {
@@ -213,9 +243,14 @@ mod tests {
         };
         let guest_block = objc::block::copy((&raw const stack).cast_mut().cast());
         assert!(!guest_block.is_null());
+        let progress =
+            Arc::clone(&unsafe { object::body::<NativeCommandBuffer>(command) }.progress);
+        progress.register(false);
         let capture = Arc::new(HandlerCapture {
             guest_block: AtomicUsize::new(guest_block as usize),
             guest_command: AtomicUsize::new(objc::arc::retain(command) as usize),
+            progress,
+            scheduled: false,
         });
         let raw = Arc::into_raw(capture);
         let host_stack = HostBlock {

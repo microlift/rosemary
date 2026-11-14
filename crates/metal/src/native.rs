@@ -12,6 +12,7 @@ mod render;
 mod sampler;
 mod texture;
 use std::ffi::{CStr, c_char, c_void};
+use std::sync::Arc;
 
 type HostId = *mut c_void;
 type HostSel = *const c_void;
@@ -177,6 +178,7 @@ struct NativeCommandBuffer {
     queue: Id,
     scheduled_handlers: Vec<usize>,
     completed_handlers: Vec<usize>,
+    progress: Arc<crate::completion::CallbackProgress>,
 }
 
 pub(super) fn enabled() -> bool {
@@ -227,6 +229,7 @@ fn bootstrap() {
             "device" => queue_device, c"@16@0:8";
             "commandBuffer" => new_command_buffer, c"@16@0:8";
             "commandBufferWithUnretainedReferences" => new_command_buffer_with_unretained_references, c"@16@0:8";
+            "commandBufferWithDescriptor:" => new_command_buffer_with_descriptor, c"@24@0:8@16";
             "dealloc" => queue_dealloc, c"v16@0:8";
         });
         methods!(buffer, {
@@ -247,6 +250,8 @@ fn bootstrap() {
             "device" => command_device, c"@16@0:8";
             "commandQueue" => command_queue, c"@16@0:8";
             "commit" => command_commit, c"v16@0:8";
+            "enqueue" => command_enqueue, c"v16@0:8";
+            "waitUntilScheduled" => command_wait_scheduled, c"v16@0:8";
             "waitUntilCompleted" => command_wait, c"v16@0:8";
             "addCompletedHandler:" => add_command_handler, c"v24@0:8@?16";
             "addScheduledHandler:" => add_command_handler, c"v24@0:8@?16";
@@ -557,10 +562,68 @@ unsafe extern "C" fn new_command_buffer_with_unretained_references(receiver: Id,
     make_command_buffer(receiver, c"commandBufferWithUnretainedReferences")
 }
 
+unsafe extern "C" fn new_command_buffer_with_descriptor(
+    receiver: Id,
+    _sel: Sel,
+    descriptor: Id,
+) -> Id {
+    if !object::is_kind(descriptor, c"MTLCommandBufferDescriptor") {
+        gpu::trace("native Metal command buffer requires a valid descriptor".to_string());
+        return std::ptr::null_mut();
+    }
+    let guest_bool: unsafe extern "C" fn(Id, Sel) -> bool =
+        unsafe { std::mem::transmute(objc::msg::entry()) };
+    let guest_number: unsafe extern "C" fn(Id, Sel) -> u64 =
+        unsafe { std::mem::transmute(objc::msg::entry()) };
+    let retained = unsafe { guest_bool(descriptor, objc::sel::get("retainedReferences")) };
+    let errors = unsafe { guest_number(descriptor, objc::sel::get("errorOptions")) };
+    // MTLCommandBufferErrorOptionEncoderExecutionStatus is the sole public
+    // option bit. Never pass arbitrary guest values into host Metal.
+    if errors & !1 != 0 {
+        gpu::trace(
+            "native Metal command buffer descriptor has unsupported errorOptions".to_string(),
+        );
+        return std::ptr::null_mut();
+    }
+    let _pool = HostPool::new();
+    let queue = unsafe { object::body::<NativeQueue>(receiver) };
+    let selector = sel(c"commandBufferWithDescriptor:");
+    if !unsafe { host_send_bool_sel(queue.host, sel(c"respondsToSelector:"), selector) } {
+        // Older host devices support only the legacy creation entrypoints.
+        if errors != 0 {
+            return std::ptr::null_mut();
+        }
+        return if retained {
+            make_command_buffer(receiver, c"commandBuffer")
+        } else {
+            unsafe { new_command_buffer_with_unretained_references(receiver, std::ptr::null()) }
+        };
+    }
+    let host_class = unsafe { host_get_class(c"MTLCommandBufferDescriptor".as_ptr()) };
+    if host_class.is_null() {
+        return std::ptr::null_mut();
+    }
+    let host_descriptor = unsafe { host_send_id(host_class, sel(c"new")) };
+    if host_descriptor.is_null() {
+        return std::ptr::null_mut();
+    }
+    unsafe {
+        host_send_void_bool(host_descriptor, sel(c"setRetainedReferences:"), retained);
+        host_send_void_u64(host_descriptor, sel(c"setErrorOptions:"), errors);
+    }
+    let host = unsafe { host_send_id_id(queue.host, selector, host_descriptor) };
+    unsafe { host_release(host_descriptor) };
+    wrap_command_buffer(receiver, host)
+}
+
 fn make_command_buffer(receiver: Id, selector: &CStr) -> Id {
     let _pool = HostPool::new();
     let queue = unsafe { object::body::<NativeQueue>(receiver) };
     let host = unsafe { host_send_id(queue.host, sel(selector)) };
+    wrap_command_buffer(receiver, host)
+}
+
+fn wrap_command_buffer(receiver: Id, host: HostId) -> Id {
     if host.is_null() {
         return std::ptr::null_mut();
     }
@@ -573,6 +636,7 @@ fn make_command_buffer(receiver: Id, selector: &CStr) -> Id {
             queue: receiver,
             scheduled_handlers: Vec::new(),
             completed_handlers: Vec::new(),
+            progress: Arc::new(crate::completion::CallbackProgress::new()),
         },
     );
     if guest.is_null() {
@@ -648,6 +712,17 @@ unsafe extern "C" fn command_commit(receiver: Id, _sel: Sel) {
     }
     unsafe { host_send_void(host, sel(c"commit")) };
 }
+unsafe extern "C" fn command_enqueue(receiver: Id, _sel: Sel) {
+    let _pool = HostPool::new();
+    let host = unsafe { object::body::<NativeCommandBuffer>(receiver) }.host;
+    unsafe { host_send_void(host, sel(c"enqueue")) };
+}
+unsafe extern "C" fn command_wait_scheduled(receiver: Id, _sel: Sel) {
+    let _pool = HostPool::new();
+    let command = unsafe { object::body::<NativeCommandBuffer>(receiver) };
+    unsafe { host_send_void(command.host, sel(c"waitUntilScheduled")) };
+    command.progress.wait(true);
+}
 unsafe extern "C" fn command_wait(receiver: Id, _sel: Sel) {
     let _pool = HostPool::new();
     unsafe {
@@ -656,6 +731,9 @@ unsafe extern "C" fn command_wait(receiver: Id, _sel: Sel) {
             sel(c"waitUntilCompleted"),
         )
     };
+    unsafe { object::body::<NativeCommandBuffer>(receiver) }
+        .progress
+        .wait(false);
 }
 unsafe extern "C" fn command_status(receiver: Id, _sel: Sel) -> u64 {
     let _pool = HostPool::new();
@@ -1790,6 +1868,382 @@ mod tests {
             "native completed callback did not reach guest"
         );
         objc::arc::pool_pop(guest_pool);
+        objc::arc::release(queue);
+    }
+
+    #[test]
+    fn wait_scheduled_and_completed_include_blocked_guest_handlers() {
+        if !require_native_opt_in() {
+            return;
+        }
+        crate::bootstrap();
+        use std::sync::mpsc;
+        use std::sync::{Condvar, Mutex, OnceLock};
+        use std::time::Duration;
+
+        static GATE: OnceLock<(Mutex<(bool, bool)>, Condvar)> = OnceLock::new();
+        unsafe extern "C" fn blocked_handler(_block: Id, _command: Id) {
+            let (mutex, ready) = GATE.get().unwrap();
+            let mut guard = mutex.lock().unwrap();
+            guard.0 = true;
+            ready.notify_all();
+            while !guard.1 {
+                guard = ready.wait(guard).unwrap();
+            }
+        }
+        #[repr(C)]
+        struct GlobalBlock {
+            isa: *const c_void,
+            flags: i32,
+            reserved: i32,
+            invoke: unsafe extern "C" fn(Id, Id),
+            descriptor: *const [u64; 2],
+        }
+        static DESCRIPTOR: [u64; 2] = [0, std::mem::size_of::<GlobalBlock>() as u64];
+        let class = objc::class::lookup(c"__NSGlobalBlock__").unwrap();
+        let handler = GlobalBlock {
+            isa: objc::class::ptr(class).cast(),
+            flags: 1 << 28,
+            reserved: 0,
+            invoke: blocked_handler,
+            descriptor: &DESCRIPTOR,
+        };
+        let (mutex, ready) = GATE.get_or_init(|| (Mutex::new((false, false)), Condvar::new()));
+        let device = default_device();
+        let pool = objc::arc::pool_push();
+        let send_block: unsafe extern "C" fn(Id, Sel, Id) =
+            unsafe { std::mem::transmute(objc::msg::entry()) };
+        for scheduled in [true, false] {
+            *mutex.lock().unwrap() = (false, false);
+            let queue = unsafe { new_queue(device, std::ptr::null()) };
+            let command = unsafe { new_command_buffer(queue, std::ptr::null()) };
+            let selector = if scheduled {
+                "addScheduledHandler:"
+            } else {
+                "addCompletedHandler:"
+            };
+            unsafe {
+                send_block(
+                    command,
+                    objc::sel::get(selector),
+                    (&raw const handler).cast_mut().cast(),
+                );
+                command_commit(command, std::ptr::null());
+            }
+            let command_address = command as usize;
+            let (tx, rx) = mpsc::channel();
+            let waiter = std::thread::spawn(move || {
+                let _darwin = darwin::tls::DarwinThread::enter();
+                if scheduled {
+                    unsafe {
+                        command_wait_scheduled(command_address as Id, std::ptr::null());
+                    }
+                } else {
+                    unsafe {
+                        command_wait(command_address as Id, std::ptr::null());
+                    }
+                }
+                tx.send(()).unwrap();
+            });
+            let deadline = std::time::Instant::now() + Duration::from_secs(3);
+            let mut locked = mutex.lock().unwrap();
+            while !locked.0 && std::time::Instant::now() < deadline {
+                let (state, _) = ready
+                    .wait_timeout(locked, Duration::from_millis(20))
+                    .unwrap();
+                locked = state;
+            }
+            let started = locked.0;
+            drop(locked);
+            // Once the handler has entered the guest worker it is blocked on
+            // the gate. Host completion is already delivered, but wait must
+            // not return before the guest callback finishes.
+            let premature = rx.recv_timeout(Duration::from_millis(120)).is_ok();
+            {
+                let mut locked = mutex.lock().unwrap();
+                locked.1 = true;
+                ready.notify_all();
+            }
+            assert!(started, "Metal guest handler was not delivered");
+            assert!(
+                !premature,
+                "waitUntil{} returned before guest handler finished",
+                if scheduled { "Scheduled" } else { "Completed" }
+            );
+            assert!(
+                rx.recv_timeout(Duration::from_secs(3)).is_ok(),
+                "waiter did not return after guest handler released"
+            );
+            waiter.join().unwrap();
+            objc::arc::release(queue);
+        }
+        objc::arc::pool_pop(pool);
+    }
+
+    #[test]
+    fn completion_handler_waiting_on_its_own_buffer_does_not_deadlock() {
+        if !require_native_opt_in() {
+            return;
+        }
+        crate::bootstrap();
+        use std::sync::atomic::{AtomicBool, Ordering};
+        static CALLBACK_RETURNED: AtomicBool = AtomicBool::new(false);
+        unsafe extern "C" fn nested_own_wait(_block: Id, command: Id) {
+            unsafe { command_wait(command, std::ptr::null()) };
+            CALLBACK_RETURNED.store(true, Ordering::SeqCst);
+        }
+        #[repr(C)]
+        struct GlobalBlock {
+            isa: *const c_void,
+            flags: i32,
+            reserved: i32,
+            invoke: unsafe extern "C" fn(Id, Id),
+            descriptor: *const [u64; 2],
+        }
+        static DESCRIPTOR: [u64; 2] = [0, std::mem::size_of::<GlobalBlock>() as u64];
+        let cls = objc::class::lookup(c"__NSGlobalBlock__").unwrap();
+        let block = GlobalBlock {
+            isa: objc::class::ptr(cls).cast(),
+            flags: 1 << 28,
+            reserved: 0,
+            invoke: nested_own_wait,
+            descriptor: &DESCRIPTOR,
+        };
+        let pool = objc::arc::pool_push();
+        let queue = unsafe { new_queue(default_device(), std::ptr::null()) };
+        let command = unsafe { new_command_buffer(queue, std::ptr::null()) };
+        CALLBACK_RETURNED.store(false, Ordering::SeqCst);
+        let add: unsafe extern "C" fn(Id, Sel, Id) =
+            unsafe { std::mem::transmute(objc::msg::entry()) };
+        unsafe {
+            add(
+                command,
+                objc::sel::get("addCompletedHandler:"),
+                (&raw const block).cast_mut().cast(),
+            );
+            command_commit(command, std::ptr::null());
+            command_wait(command, std::ptr::null());
+        }
+        assert!(
+            CALLBACK_RETURNED.load(Ordering::SeqCst),
+            "completion callback waiting for its own host command buffer deadlocked"
+        );
+        objc::arc::pool_pop(pool);
+        objc::arc::release(queue);
+    }
+
+    #[test]
+    fn completion_callback_can_wait_for_a_different_command_without_early_return() {
+        if !require_native_opt_in() {
+            return;
+        }
+        crate::bootstrap();
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        use std::time::{Duration, Instant};
+        static SECOND_COMMAND: AtomicUsize = AtomicUsize::new(0);
+        static FIRST_ENTERED: AtomicBool = AtomicBool::new(false);
+        static SECOND_COMMITTED: AtomicBool = AtomicBool::new(false);
+        static SECOND_CALLBACK_DONE: AtomicBool = AtomicBool::new(false);
+        static FIRST_SAW_SECOND_COMPLETE: AtomicBool = AtomicBool::new(false);
+        unsafe extern "C" fn first_handler(_block: Id, _command: Id) {
+            FIRST_ENTERED.store(true, Ordering::SeqCst);
+            while !SECOND_COMMITTED.load(Ordering::SeqCst) {
+                std::thread::yield_now();
+            }
+            let second = SECOND_COMMAND.load(Ordering::SeqCst) as Id;
+            unsafe { command_wait(second, std::ptr::null()) };
+            FIRST_SAW_SECOND_COMPLETE.store(
+                SECOND_CALLBACK_DONE.load(Ordering::SeqCst),
+                Ordering::SeqCst,
+            );
+        }
+        unsafe extern "C" fn second_handler(_block: Id, _command: Id) {
+            SECOND_CALLBACK_DONE.store(true, Ordering::SeqCst);
+        }
+        #[repr(C)]
+        struct GlobalBlock {
+            isa: *const c_void,
+            flags: i32,
+            reserved: i32,
+            invoke: unsafe extern "C" fn(Id, Id),
+            descriptor: *const [u64; 2],
+        }
+        static DESC: [u64; 2] = [0, std::mem::size_of::<GlobalBlock>() as u64];
+        let cls = objc::class::lookup(c"__NSGlobalBlock__").unwrap();
+        let make = |invoke| GlobalBlock {
+            isa: objc::class::ptr(cls).cast(),
+            flags: 1 << 28,
+            reserved: 0,
+            invoke,
+            descriptor: &DESC,
+        };
+        let first_block = make(first_handler);
+        let second_block = make(second_handler);
+        FIRST_ENTERED.store(false, Ordering::SeqCst);
+        SECOND_COMMITTED.store(false, Ordering::SeqCst);
+        SECOND_CALLBACK_DONE.store(false, Ordering::SeqCst);
+        FIRST_SAW_SECOND_COMPLETE.store(false, Ordering::SeqCst);
+        let pool = objc::arc::pool_push();
+        let device = default_device();
+        let queue = unsafe { new_queue(device, std::ptr::null()) };
+        let first = unsafe { new_command_buffer(queue, std::ptr::null()) };
+        let second = unsafe { new_command_buffer(queue, std::ptr::null()) };
+        let add: unsafe extern "C" fn(Id, Sel, Id) =
+            unsafe { std::mem::transmute(objc::msg::entry()) };
+        SECOND_COMMAND.store(second as usize, Ordering::SeqCst);
+        unsafe {
+            add(
+                first,
+                objc::sel::get("addCompletedHandler:"),
+                (&raw const first_block).cast_mut().cast(),
+            );
+            add(
+                second,
+                objc::sel::get("addCompletedHandler:"),
+                (&raw const second_block).cast_mut().cast(),
+            );
+            command_commit(first, std::ptr::null());
+        }
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while !FIRST_ENTERED.load(Ordering::SeqCst) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            FIRST_ENTERED.load(Ordering::SeqCst),
+            "first handler did not start"
+        );
+        unsafe { command_commit(second, std::ptr::null()) };
+        SECOND_COMMITTED.store(true, Ordering::SeqCst);
+        unsafe { command_wait(first, std::ptr::null()) };
+        assert!(SECOND_CALLBACK_DONE.load(Ordering::SeqCst));
+        assert!(
+            FIRST_SAW_SECOND_COMPLETE.load(Ordering::SeqCst),
+            "a nested wait on another command returned before its guest completion callback"
+        );
+        objc::arc::pool_pop(pool);
+        objc::arc::release(queue);
+    }
+
+    #[test]
+    fn native_blit_rejects_buffers_owned_by_another_gpu() {
+        if !require_native_opt_in() {
+            return;
+        }
+        crate::bootstrap();
+        let all = devices();
+        if all.len() < 2 {
+            eprintln!("skipped: multi-GPU blit regression requires two Metal devices");
+            return;
+        }
+        let pool = objc::arc::pool_push();
+        let gpu_a = all[0] as Id;
+        let gpu_b = all[1] as Id;
+        let source = unsafe { new_buffer(gpu_b, std::ptr::null(), 64, 0) };
+        let destination = unsafe { new_buffer(gpu_b, std::ptr::null(), 64, 0) };
+        assert!(!source.is_null() && !destination.is_null());
+        let src = unsafe { buffer_contents(source, std::ptr::null()) } as *mut u8;
+        let dst = unsafe { buffer_contents(destination, std::ptr::null()) } as *mut u8;
+        assert!(!src.is_null() && !dst.is_null());
+        unsafe {
+            std::ptr::write_bytes(src, 0xAB, 64);
+            std::ptr::write_bytes(dst, 0x62, 64);
+        }
+        let queue = unsafe { new_queue(gpu_a, std::ptr::null()) };
+        let command = unsafe { new_command_buffer(queue, std::ptr::null()) };
+        let send_id: unsafe extern "C" fn(Id, Sel) -> Id =
+            unsafe { std::mem::transmute(objc::msg::entry()) };
+        let send_blit: unsafe extern "C" fn(Id, Sel, Id, u64, Id, u64, u64) =
+            unsafe { std::mem::transmute(objc::msg::entry()) };
+        let send_void: unsafe extern "C" fn(Id, Sel) =
+            unsafe { std::mem::transmute(objc::msg::entry()) };
+        let blit = unsafe { send_id(command, objc::sel::get("blitCommandEncoder")) };
+        assert!(!blit.is_null());
+        unsafe {
+            send_blit(
+                blit,
+                objc::sel::get("copyFromBuffer:sourceOffset:toBuffer:destinationOffset:size:"),
+                source,
+                0,
+                destination,
+                0,
+                64,
+            );
+            send_void(blit, objc::sel::get("endEncoding"));
+            send_void(command, objc::sel::get("commit"));
+            send_void(command, objc::sel::get("waitUntilCompleted"));
+        }
+        assert_eq!(
+            unsafe { command_status(command, std::ptr::null()) },
+            4,
+            "a cross-device copy must be rejected before native Metal validation"
+        );
+        assert_eq!(
+            unsafe { std::slice::from_raw_parts(dst, 64) },
+            &[0x62; 64],
+            "a rejected cross-GPU transfer changed destination memory"
+        );
+        objc::arc::pool_pop(pool);
+        for item in [queue, source, destination] {
+            objc::arc::release(item)
+        }
+    }
+
+    #[test]
+    fn native_queue_descriptor_enqueue_and_scheduled_wait_use_guest_selectors() {
+        if !require_native_opt_in() {
+            return;
+        }
+        crate::bootstrap();
+        let device = default_device();
+        let pool = objc::arc::pool_push();
+        let class = objc::class::lookup(c"MTLCommandBufferDescriptor").unwrap();
+        let send_id: unsafe extern "C" fn(Id, Sel) -> Id =
+            unsafe { std::mem::transmute(objc::msg::entry()) };
+        let send_with_id: unsafe extern "C" fn(Id, Sel, Id) -> Id =
+            unsafe { std::mem::transmute(objc::msg::entry()) };
+        let send_bool: unsafe extern "C" fn(Id, Sel, bool) =
+            unsafe { std::mem::transmute(objc::msg::entry()) };
+        let send_number: unsafe extern "C" fn(Id, Sel, u64) =
+            unsafe { std::mem::transmute(objc::msg::entry()) };
+        let send_void: unsafe extern "C" fn(Id, Sel) =
+            unsafe { std::mem::transmute(objc::msg::entry()) };
+        let queue = unsafe { new_queue(device, std::ptr::null()) };
+        for (retained, errors) in [(true, 0), (false, 0), (true, 1)] {
+            let descriptor =
+                unsafe { send_id(objc::class::ptr(class) as Id, objc::sel::get("alloc")) };
+            assert!(!descriptor.is_null());
+            let initialized = unsafe { send_id(descriptor, objc::sel::get("init")) };
+            assert_eq!(initialized, descriptor);
+            unsafe {
+                send_bool(
+                    descriptor,
+                    objc::sel::get("setRetainedReferences:"),
+                    retained,
+                );
+                send_number(descriptor, objc::sel::get("setErrorOptions:"), errors);
+            }
+            let command = unsafe {
+                send_with_id(
+                    queue,
+                    objc::sel::get("commandBufferWithDescriptor:"),
+                    descriptor,
+                )
+            };
+            assert!(
+                !command.is_null(),
+                "descriptor retained={retained} errors={errors}"
+            );
+            assert!(object::is_kind(command, c"RosemaryNativeMTLCommandBuffer"));
+            unsafe {
+                send_void(command, objc::sel::get("enqueue"));
+                send_void(command, objc::sel::get("commit"));
+                send_void(command, objc::sel::get("waitUntilScheduled"));
+                send_void(command, objc::sel::get("waitUntilCompleted"));
+            }
+            assert_eq!(unsafe { command_status(command, std::ptr::null()) }, 4);
+            objc::arc::release(descriptor);
+        }
+        objc::arc::pool_pop(pool);
         objc::arc::release(queue);
     }
 

@@ -93,15 +93,9 @@ fn forget(guest_layer: Id) {
 }
 
 fn request_attachment(layer: Id) {
-    // A full-window native view is attached once, not recreated per drawable.
-    if HOST_LAYERS
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .get(&(layer as usize))
-        .is_some_and(|entry| entry.attached.is_some())
-    {
-        return;
-    }
+    // Even already-attached views must be checked on the video thread: AppKit
+    // permits moving a live NSView between two still-valid NSWindows. A prior
+    // SDL Metal view must then be destroyed and attached to the new window.
     // nextDrawable is generally called from a guest render thread, not the
     // video thread. Do not touch SDL here; put a retained guest layer on a
     // queue the video owner services on its next event-pump iteration.
@@ -143,40 +137,60 @@ fn service_video_thread() {
 }
 
 fn attach_one(guest: Id) {
+    debug_assert!(sdl3::video::is_video_thread());
     let view = unsafe { appkit::layer::view_of(guest) };
-    if view.is_null() {
-        return;
-    }
-    let Some(frame) = (unsafe { appkit::view::presentation_frame(view) }) else {
-        return;
+    let candidate = if view.is_null() {
+        None
+    } else {
+        unsafe { appkit::view::presentation_frame(view) }.and_then(|frame| {
+            if !frame.covers_window() || frame.window.is_null() {
+                return None;
+            }
+            let window_id = sdl3::video::live_window_id(frame.window)?;
+            Some((frame.window, window_id))
+        })
     };
-    if !frame.covers_window() || frame.window.is_null() {
-        return;
-    }
-    let window = frame.window as usize;
-    let Some(window_id) = sdl3::video::live_window_id(frame.window) else {
-        return;
-    };
-    {
-        let entries = HOST_LAYERS.lock().unwrap_or_else(|e| e.into_inner());
-        let Some(entry) = entries.get(&(guest as usize)) else {
+    // Resolve the layer's currently owning window on the SDL video thread.
+    // A full-window layer may move without either window being destroyed.
+    let previous = {
+        let mut entries = HOST_LAYERS.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(entry) = entries.get_mut(&(guest as usize)) else {
             return;
         };
-        if entry.attached.is_some()
-            || entries.values().any(|item| {
-                item.attached
+        if entry.attached.is_some_and(|attached| {
+            candidate.is_some_and(|(window, id)| {
+                attached.window == window as usize && attached.window_id == id
+            })
+        }) {
+            return;
+        }
+        entry.attached.take()
+    };
+    if let Some(old) = previous {
+        // Do not keep an SDL view bound to a stale window. The HostLayer Arc
+        // remains retained for in-flight drawables while SDL retires its view.
+        destroy_views(vec![old]);
+    }
+    let Some((target_window, window_id)) = candidate else {
+        return;
+    };
+    let window = target_window as usize;
+    {
+        let entries = HOST_LAYERS.lock().unwrap_or_else(|e| e.into_inner());
+        if !entries.contains_key(&(guest as usize))
+            || entries.values().any(|entry| {
+                entry
+                    .attached
                     .is_some_and(|attached| attached.window == window)
             })
         {
             return;
         }
     }
-    let Some((native_view, native_layer)) = sdl3::video::metal::create(frame.window) else {
+    let Some((native_view, native_layer)) = sdl3::video::metal::create(target_window) else {
         gpu::trace("native Metal could not attach SDL Metal view".to_string());
         return;
     };
-    // SDL owns the view and a reference to its layer. Retain the layer for
-    // commands in flight, independently of SDL_Metal_DestroyView.
     let native_host = unsafe { host_retain(native_layer) };
     let attachment = Attachment {
         window,
@@ -195,8 +209,6 @@ fn attach_one(guest: Id) {
         }
     };
     if old.is_none() {
-        // There is no owner left for this view (e.g. the guest layer was
-        // retired during a host Cocoa callback). Undo the installation.
         destroy_views(vec![attachment]);
     } else {
         gpu::trace(format!(
@@ -459,4 +471,149 @@ pub(super) unsafe extern "C" fn present_drawable(receiver: Id, _sel: Sel, guest:
     let host_command = unsafe { object::body::<NativeCommandBuffer>(receiver) }.host;
     let _pool = HostPool::new();
     unsafe { host_send_void_id(host_command, sel(c"presentDrawable:"), host_drawable) };
+}
+
+#[cfg(test)]
+mod migration_tests {
+    use super::*;
+
+    #[test]
+    fn live_guest_metal_view_rebinds_from_first_live_window_to_second() {
+        if !super::super::enabled() {
+            eprintln!("skipped: set ROSEMARY_METAL_BACKEND=native");
+            return;
+        }
+        if !sdl3::isolated::run_here() {
+            return;
+        }
+        crate::bootstrap();
+        if !sdl3::may_pump() {
+            return;
+        }
+        let pool = objc::arc::pool_push();
+        let rect = foundation::geometry::NSRect {
+            origin: foundation::geometry::NSPoint { x: 0.0, y: 0.0 },
+            size: foundation::geometry::NSSize {
+                width: 320.0,
+                height: 240.0,
+            },
+        };
+        let probe =
+            sdl3::video::create_window(c"metal-move-probe", 1, 1, sdl3::video::flags::HIDDEN);
+        if probe.is_none() {
+            eprintln!(
+                "skipped: native SDL video is unavailable in test session: {}",
+                sdl3::error()
+            );
+            objc::arc::pool_pop(pool);
+            return;
+        }
+        let probe = probe.unwrap();
+        sdl3::video::destroy_window(probe);
+        let win_class = objc::class::lookup(c"NSWindow").unwrap();
+        let view_class = objc::class::lookup(c"NSView").unwrap();
+        let layer_class = objc::class::lookup(c"CAMetalLayer").unwrap();
+        let make_window: unsafe extern "C" fn(
+            Id,
+            Sel,
+            foundation::geometry::NSRect,
+            usize,
+            usize,
+            u8,
+        ) -> Id = unsafe { std::mem::transmute(objc::msg::entry()) };
+        let make_view: unsafe extern "C" fn(Id, Sel, foundation::geometry::NSRect) -> Id =
+            unsafe { std::mem::transmute(objc::msg::entry()) };
+        let send_id: unsafe extern "C" fn(Id, Sel) -> Id =
+            unsafe { std::mem::transmute(objc::msg::entry()) };
+        let send_void_id: unsafe extern "C" fn(Id, Sel, Id) =
+            unsafe { std::mem::transmute(objc::msg::entry()) };
+        let mut windows = [std::ptr::null_mut(); 2];
+        for window in &mut windows {
+            let obj = objc::object::create_instance(win_class, 0);
+            *window = unsafe {
+                make_window(
+                    obj,
+                    objc::sel::get("initWithContentRect:styleMask:backing:defer:"),
+                    rect,
+                    0,
+                    0,
+                    0,
+                )
+            };
+            assert!(!window.is_null());
+        }
+        let sdl_a = unsafe { appkit::window::sdl_window(windows[0]) };
+        let sdl_b = unsafe { appkit::window::sdl_window(windows[1]) };
+        assert!(!sdl_a.is_null() && !sdl_b.is_null() && sdl_a != sdl_b);
+        assert!(sdl3::video::is_video_thread());
+        sdl3::pump();
+        let content_a = unsafe { send_id(windows[0], objc::sel::get("contentView")) };
+        let content_b = unsafe { send_id(windows[1], objc::sel::get("contentView")) };
+        let view = unsafe {
+            make_view(
+                objc::object::create_instance(view_class, 0),
+                objc::sel::get("initWithFrame:"),
+                rect,
+            )
+        };
+        let metal =
+            unsafe { send_id(objc::class::ptr(layer_class) as Id, objc::sel::get("layer")) };
+        assert!(!view.is_null() && !metal.is_null());
+        unsafe {
+            send_void_id(view, objc::sel::get("setLayer:"), metal);
+            send_void_id(content_a, objc::sel::get("addSubview:"), view);
+        }
+        let before = unsafe { appkit::view::presentation_frame(view) }.unwrap();
+        assert_eq!(before.window, sdl_a);
+        assert!(before.covers_window());
+        let original = host_layer(metal).unwrap();
+        request_attachment(metal);
+        service_video_thread();
+        let first = HOST_LAYERS
+            .lock()
+            .unwrap()
+            .get(&(metal as usize))
+            .and_then(|entry| entry.attached)
+            .expect("first native Metal attachment");
+        assert_eq!(first.window, sdl_a as usize);
+        assert_eq!(first.window_id, sdl3::video::window_id(sdl_a));
+        let original_host_layer = original.get() as usize;
+        // Retain the previous host layer across the swap so its identity
+        // cannot be reused; SDL may recycle the view address after destroy.
+        unsafe { send_void_id(content_b, objc::sel::get("addSubview:"), view) };
+        sdl3::pump();
+        let moved = unsafe { appkit::view::presentation_frame(view) }.unwrap();
+        assert_eq!(moved.window, sdl_b);
+        assert!(moved.covers_window());
+        request_attachment(metal);
+        service_video_thread();
+        let second = HOST_LAYERS
+            .lock()
+            .unwrap()
+            .get(&(metal as usize))
+            .and_then(|entry| entry.attached)
+            .expect("rebound native Metal attachment");
+        assert_eq!(second.window, sdl_b as usize);
+        assert_eq!(second.window_id, sdl3::video::window_id(sdl_b));
+        assert_ne!(
+            host_layer(metal).unwrap().get() as usize,
+            original_host_layer,
+            "native host layer remained bound to the prior window"
+        );
+        drop(original);
+        assert!(
+            sdl3::video::live_window_id(sdl_a).is_some(),
+            "window A was destroyed"
+        );
+        assert!(
+            sdl3::video::live_window_id(sdl_b).is_some(),
+            "window B was destroyed"
+        );
+        objc::arc::release(view);
+        for window in windows {
+            objc::arc::release(window)
+        }
+        service_video_thread();
+        objc::arc::pool_pop(pool);
+    }
 }

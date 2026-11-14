@@ -66,8 +66,12 @@ unsafe extern "C" fn copy_buffer_to_buffer(
     }
     let from = unsafe { object::body::<NativeBuffer>(source) };
     let to = unsafe { object::body::<NativeBuffer>(destination) };
-    if from.device != to.device {
-        gpu::trace("native blit requires buffers on the same Metal device".to_string());
+    let blit = unsafe { object::body::<NativeBlitEncoder>(receiver) };
+    let encoder_device = unsafe { command_device(blit.command, std::ptr::null()) };
+    if from.device != to.device || from.device != encoder_device {
+        gpu::trace(
+            "native blit buffers must belong to the command encoder's Metal device".to_string(),
+        );
         return;
     }
     let _pool = HostPool::new();
@@ -83,7 +87,6 @@ unsafe extern "C" fn copy_buffer_to_buffer(
         gpu::trace("native blit buffer range is out of bounds".to_string());
         return;
     }
-    let blit = unsafe { object::body::<NativeBlitEncoder>(receiver) };
     unsafe {
         host_send_void_id_u64_id_u64_u64(
             blit.host,
