@@ -246,6 +246,22 @@ fn qsort_b(
     Ok(())
 }
 
+/// `void dyld_get_image_versions(const struct mach_header *, void (^)(dyld_platform_t,
+/// uint32_t, uint32_t))`: the block is called before the function returns.
+fn dyld_get_image_versions(
+    symbol: &str,
+    ctx: &mut RegisterContext,
+    mem: &mut dyn GuestMemory,
+    callbacks: &dyn Callbacks,
+) -> Result<()> {
+    let (header, block) = (ctx.rdi, ctx.rsi);
+    if block != 0 {
+        substitute_block(symbol, block, mem, callbacks)?;
+    }
+    call_block(symbol, host_or_refuse(symbol)?, &[header, block]);
+    Ok(())
+}
+
 /// `void *_Block_copy(const void *block)`
 fn block_copy(
     symbol: &str,
@@ -493,6 +509,9 @@ pub fn shim_for(name: &str) -> Option<Shim> {
             Some(bind!(callback "nw_path_enumerate_interfaces" => object_and_block))
         }
         "qsort_b" => Some(bind!(callback "qsort_b" => qsort_b)),
+        "dyld_get_image_versions" => {
+            Some(bind!(callback "dyld_get_image_versions" => dyld_get_image_versions))
+        }
         // Both spellings.
         "_Block_copy" => Some(bind!(callback "_Block_copy" => block_copy)),
         "Block_copy" => Some(bind!(callback "Block_copy" => block_copy)),

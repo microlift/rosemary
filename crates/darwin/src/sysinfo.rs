@@ -489,6 +489,87 @@ unsafe extern "C" fn gestalt(selector: u32, response: *mut i32) -> i16 {
     0
 }
 
+/// `void dyld_get_image_versions(const struct mach_header *mh,
+/// void (^)(dyld_platform_t platform, uint32_t sdk, uint32_t minos))`
+///
+/// The block hears each platform the image was built for, with its SDK and
+/// minimum OS: one `LC_BUILD_VERSION` each, or the one `LC_VERSION_MIN_*`
+/// an older image has. A null header has nothing to read and calls nothing.
+///
+/// # Safety
+///
+/// `mh` is null or a mapped Mach-O header; `block` is a live block whose
+/// invoke is callable from here (thunked first under emulation, by the
+/// runtime's block shim).
+pub unsafe extern "C" fn dyld_get_image_versions(mh: u64, block: u64) {
+    if mh == 0 || block == 0 {
+        return;
+    }
+    // SAFETY: the caller's.
+    let versions = unsafe { image_versions(mh) };
+    // SAFETY: `invoke` is at the Block ABI's offset, and this block is
+    // `void (^)(uint32_t, uint32_t, uint32_t)`.
+    let invoke = unsafe {
+        std::mem::transmute::<u64, unsafe extern "C" fn(u64, u32, u32, u32)>(
+            ((block + crate::dispatch::block::INVOKE_OFFSET) as *const u64).read(),
+        )
+    };
+    for (platform, sdk, minos) in versions {
+        // SAFETY: guest code, entered as Darwin code.
+        unsafe { crate::call_as_darwin!(invoke(block, platform, sdk, minos)) };
+    }
+}
+
+/// `(platform, sdk, minos)` for each platform the image at `mh` names, in its
+/// load commands' order.
+///
+/// # Safety
+///
+/// `mh` is a mapped 64-bit Mach-O header with its load commands after it.
+unsafe fn image_versions(mh: u64) -> Vec<(u32, u32, u32)> {
+    use machish::spec::constants::{
+        LC_BUILD_VERSION, LC_VERSION_MIN_IPHONEOS, LC_VERSION_MIN_MACOSX, LC_VERSION_MIN_TVOS,
+        LC_VERSION_MIN_WATCHOS, MH_MAGIC_64, PLATFORM_IOS, PLATFORM_MACOS, PLATFORM_TVOS,
+        PLATFORM_WATCHOS,
+    };
+    /// `mach_header_64`'s size, and the offsets of `ncmds` and `sizeofcmds`.
+    const HEADER_SIZE: u64 = 32;
+    const NCMDS: u64 = 16;
+    const SIZEOFCMDS: u64 = 20;
+    let read = |at: u64| unsafe { (at as *const u32).read_unaligned() };
+    let mut out = Vec::new();
+    if read(mh) != MH_MAGIC_64 {
+        return out;
+    }
+    let (count, size) = (read(mh + NCMDS), u64::from(read(mh + SIZEOFCMDS)));
+    let (mut at, end) = (mh + HEADER_SIZE, mh + HEADER_SIZE + size);
+    for _ in 0..count {
+        if at + 8 > end {
+            break;
+        }
+        let (cmd, cmdsize) = (read(at), u64::from(read(at + 4)));
+        if cmdsize < 8 || at + cmdsize > end {
+            break;
+        }
+        // `build_version_command`: cmd, cmdsize, platform, minos, sdk;
+        // `version_min_command`: cmd, cmdsize, version, sdk.
+        let min_platform = match cmd {
+            LC_VERSION_MIN_MACOSX => Some(PLATFORM_MACOS),
+            LC_VERSION_MIN_IPHONEOS => Some(PLATFORM_IOS),
+            LC_VERSION_MIN_TVOS => Some(PLATFORM_TVOS),
+            LC_VERSION_MIN_WATCHOS => Some(PLATFORM_WATCHOS),
+            _ => None,
+        };
+        if cmd == LC_BUILD_VERSION && cmdsize >= 24 {
+            out.push((read(at + 8), read(at + 16), read(at + 12)));
+        } else if let Some(platform) = min_platform.filter(|_| cmdsize >= 16) {
+            out.push((platform, read(at + 12), read(at + 8)));
+        }
+        at += cmdsize;
+    }
+    out
+}
+
 /// `dyld_build_version_t`
 #[repr(C)]
 struct BuildVersion {
@@ -713,6 +794,7 @@ exports::exports! {
         "_availability_version_check" => availability_version_check,
         "__isPlatformVersionAtLeast" => is_platform_version_at_least,
         "dyld_program_sdk_at_least" => program_sdk_at_least,
+        "dyld_get_image_versions" => dyld_get_image_versions,
         "__isPlatformOrVariantPlatformVersionAtLeast" => is_platform_or_variant_platform_version_at_least,
         "sysconf" => sysconf,
         "getrusage" => getrusage,
@@ -725,6 +807,31 @@ exports::exports! {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn libsystem_answers_dyld_get_image_versions() {
+        assert_eq!(
+            crate::symbol("_dyld_get_image_versions"),
+            Some(dyld_get_image_versions as *const () as u64)
+        );
+    }
+
+    /// A header with one `LC_BUILD_VERSION` and one `LC_VERSION_MIN_MACOSX`:
+    /// both are reported, each as (platform, sdk, minos).
+    #[test]
+    fn image_versions_reads_build_and_minimum_version_commands() {
+        let mut words: Vec<u32> = vec![0xfeed_facf, 0x0100_000c, 0, 2, 2, 24 + 16, 0, 0];
+        words.extend([0x32, 24, 1, 0x000f_0600, 0x001a_0600, 0]);
+        words.extend([0x24, 16, 0x000a_0f00, 0x000b_0000]);
+        // SAFETY: a header followed by exactly the load commands it declares.
+        let versions = unsafe { image_versions(words.as_ptr() as u64) };
+        assert_eq!(
+            versions,
+            [(1, 0x001a_0600, 0x000f_0600), (1, 0x000b_0000, 0x000a_0f00)]
+        );
+        // SAFETY: not a Mach-O header at all.
+        assert!(unsafe { image_versions([0u32; 8].as_ptr() as u64) }.is_empty());
+    }
     use crate::sysctl::{GuestArch, lock_guest_arch};
 
     fn field(u: &Utsname, index: usize) -> String {

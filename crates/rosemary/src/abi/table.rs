@@ -1805,6 +1805,9 @@ pub static SIGNATURES: &[FunctionAbi] = &[
     sig!("_dyld_get_image_vmaddr_slide", U64, U32),
     sig!("_dyld_image_containing_address", P, P),
     sig!("dyld_image_path_containing_address", P, P),
+    sig!("dyld_image_header_containing_address", P, P),
+    // The block is thunked by `crate::shims::block` before this is reached.
+    sig!("dyld_get_image_versions", V, P, P),
     sig!("dyld_shared_cache_some_image_overridden", BOOL),
     sig!("_dyld_get_shared_cache_range", P, P),
     sig!("_dyld_is_preoptimized_objc_image_loaded", BOOL, U16),

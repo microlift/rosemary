@@ -2453,6 +2453,83 @@ fn unwind_sections_of(addr: u64) -> Option<[u8; 40]> {
 }
 
 /// `(mach_header VA, slide)` for the guest image containing `va`.
+/// Whether `va` is in code the host loaded: this runtime and the host
+/// libraries it answers Darwin's system calls with. A guest image is checked
+/// first, so this is only reached for an address in no guest image.
+fn is_system_code(va: u64) -> bool {
+    let mut info: libc::Dl_info = unsafe { std::mem::zeroed() };
+    // SAFETY: `dladdr` only reads its address and writes `info`.
+    unsafe {
+        libc::dladdr(va as *const std::ffi::c_void, &mut info) != 0 && !info.dli_fbase.is_null()
+    }
+}
+
+/// The install name the system header stands for: where `dyld`'s own
+/// interface lives on a Mac.
+const SYSTEM_IMAGE: &[u8] = b"/usr/lib/system/libdyld.dylib";
+
+/// A Mach-O header for the Darwin system this runtime provides, built once.
+///
+/// A Mac's system libraries are built for the OS they ship in, so their
+/// `LC_BUILD_VERSION` names it, and programs read the running OS from it -
+/// Apple's `libxcrun` takes the host version from the image containing
+/// `dyld_image_header_containing_address`. This header says the same thing
+/// as every other version answer here: the guest's macOS, as minimum OS and
+/// SDK. It has an `LC_ID_DYLIB` and an `LC_BUILD_VERSION` and no segments,
+/// because there is no system image mapped to describe.
+fn system_header() -> u64 {
+    use machish::spec::constants::{LC_BUILD_VERSION, LC_ID_DYLIB, MH_MAGIC_64, PLATFORM_MACOS};
+    const MH_DYLIB: u32 = 6;
+    const CPU_TYPE_X86_64: u32 = 0x0100_0007;
+    const CPU_TYPE_ARM64: u32 = 0x0100_000c;
+    static HEADER: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *HEADER.get_or_init(|| {
+        let (major, minor, patch) = darwin::sysctl::macos_version();
+        let version = ((major as u32) << 16) | ((minor as u32) << 8) | patch as u32;
+        let cpu = match darwin::sysctl::guest_arch() {
+            darwin::sysctl::GuestArch::X86_64 => CPU_TYPE_X86_64,
+            darwin::sysctl::GuestArch::Arm64 => CPU_TYPE_ARM64,
+        };
+        // `dylib_command`: cmd, cmdsize, name offset, timestamp, current and
+        // compatibility versions, then the name, padded to eight bytes.
+        let name_len = (SYSTEM_IMAGE.len() + 1).next_multiple_of(8);
+        let id_size = 24 + name_len as u32;
+        // `build_version_command`: cmd, cmdsize, platform, minos, sdk, ntools.
+        let build_size = 24u32;
+        let mut words: Vec<u32> = vec![
+            MH_MAGIC_64,
+            cpu,
+            0,
+            MH_DYLIB,
+            2,
+            id_size + build_size,
+            0,
+            0,
+            LC_ID_DYLIB,
+            id_size,
+            24,
+            0,
+            1 << 16,
+            1 << 16,
+        ];
+        let mut name = SYSTEM_IMAGE.to_vec();
+        name.resize(name_len, 0);
+        words.extend(
+            name.chunks(4)
+                .map(|c| u32::from_le_bytes(c.try_into().unwrap())),
+        );
+        words.extend([
+            LC_BUILD_VERSION,
+            build_size,
+            PLATFORM_MACOS,
+            version,
+            version,
+            0,
+        ]);
+        Box::leak(words.into_boxed_slice()).as_ptr() as usize
+    }) as u64
+}
+
 fn guest_image_at(va: u64) -> Option<(u64, u64)> {
     with_guest_image_at(va, |header, slide, _| (header, slide))
 }
@@ -2806,8 +2883,20 @@ pub(crate) mod entry {
     }
 
     /// `const struct mach_header *_dyld_image_containing_address(const void *)`
+    ///
+    /// A guest image's own header, or, for code this runtime serves as Darwin's
+    /// system, the header standing for that system (see `system_header`).
     pub extern "C" fn dyld_image_containing_address(va: u64) -> u64 {
-        super::guest_image_at(va).map_or(0, |(header, _)| header)
+        super::guest_image_at(va)
+            .map(|(header, _)| header)
+            .or_else(|| super::is_system_code(va).then(super::system_header))
+            .unwrap_or(0)
+    }
+
+    /// `const struct mach_header *dyld_image_header_containing_address(const
+    /// void *)`: the current name of `_dyld_image_containing_address`.
+    pub extern "C" fn dyld_image_header_containing_address(va: u64) -> u64 {
+        dyld_image_containing_address(va)
     }
 
     /// `const char *dyld_image_path_containing_address(const void *)`
@@ -3439,7 +3528,7 @@ pub(crate) mod entry {
 }
 
 /// Every name [`provider`] defines, and the function it binds to.
-fn entries() -> [(&'static str, *const ()); 32] {
+fn entries() -> [(&'static str, *const ()); 33] {
     [
         ("_NSAddImage", entry::ns_add_image as *const ()),
         (
@@ -3488,6 +3577,10 @@ fn entries() -> [(&'static str, *const ()); 32] {
         (
             "_dyld_image_path_containing_address",
             entry::dyld_image_path_containing_address as *const (),
+        ),
+        (
+            "_dyld_image_header_containing_address",
+            entry::dyld_image_header_containing_address as *const (),
         ),
         (
             "_dyld_shared_cache_some_image_overridden",

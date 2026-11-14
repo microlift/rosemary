@@ -69,6 +69,15 @@ pub const LC_DATA_IN_CODE: u32 = 0x29;
 pub const LC_SOURCE_VERSION: u32 = 0x2a;
 pub const LC_BUILD_VERSION: u32 = 0x32;
 pub const LC_VERSION_MIN_MACOSX: u32 = 0x24;
+pub const LC_VERSION_MIN_IPHONEOS: u32 = 0x25;
+pub const LC_VERSION_MIN_TVOS: u32 = 0x2f;
+pub const LC_VERSION_MIN_WATCHOS: u32 = 0x30;
+
+/// `LC_BUILD_VERSION` platforms, from `<mach-o/loader.h>`.
+pub const PLATFORM_MACOS: u32 = 1;
+pub const PLATFORM_IOS: u32 = 2;
+pub const PLATFORM_TVOS: u32 = 3;
+pub const PLATFORM_WATCHOS: u32 = 4;
 
 pub const LC_RPATH: u32 = 0x1c | LC_REQ_DYLD;
 pub const LC_LOAD_WEAK_DYLIB: u32 = 0x18 | LC_REQ_DYLD;
