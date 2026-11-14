@@ -1247,7 +1247,8 @@ pub(crate) fn scene_shader() -> Vec<u32> {
 fn build_shader(scene: bool) -> Result<Vec<u32>, rspirv::dr::Error> {
     use spirv::{Decoration, StorageClass};
     let mut b = Builder::new();
-    b.set_version(1, 0);
+    // SPIR-V 1.3 makes the StorageBuffer class core; Vulkan 1.1 is our floor.
+    b.set_version(1, 3);
     b.capability(spirv::Capability::Shader);
     let glsl = b.ext_inst_import("GLSL.std.450");
     b.memory_model(spirv::AddressingModel::Logical, spirv::MemoryModel::GLSL450);
@@ -1665,6 +1666,13 @@ mod tests {
         let module = rspirv::dr::load_words(&words).expect("SPIR-V that loads back");
         assert_eq!(module.entry_points.len(), 1);
         assert_eq!(words[0], spirv::MAGIC_NUMBER);
+    }
+
+    #[test]
+    fn the_scene_shader_targets_a_version_with_core_storage_buffers() {
+        let module = rspirv::dr::load_words(scene_shader()).expect("SPIR-V that loads back");
+        let header = module.header.expect("a module header");
+        assert!(header.version() >= (1, 3));
     }
 
     #[test]
