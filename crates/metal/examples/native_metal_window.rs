@@ -165,22 +165,16 @@ fn main() {
             },
         );
     }
-    // First drawable is permitted to be offscreen; it queues a request to
-    // attach an SDL Metal view on the thread which created the host window.
-    let first = unsafe { send_id(layer, objc::sel::get("nextDrawable")) };
-    assert!(!first.is_null(), "first drawable unavailable");
-    appkit::event::pump(ptr::null_mut());
+    // One single initial drawable must already come from SDL's attached
+    // CAMetalLayer, without a discarded offscreen warm-up drawable or pump.
+    let drawable = unsafe { send_id(layer, objc::sel::get("nextDrawable")) };
+    assert!(!drawable.is_null(), "first on-screen drawable unavailable");
     assert!(
         sdl3::video::window_flags(sdl) & sdl3::video::flags::METAL != 0,
-        "SDL Metal view was not attached by the video-thread pump"
+        "first drawable did not synchronously attach the SDL Metal view"
     );
-    println!("SDL Metal attachment established");
+    println!("First drawable already attached to SDL Metal window");
 
-    let drawable = unsafe { send_id(layer, objc::sel::get("nextDrawable")) };
-    assert!(
-        !drawable.is_null(),
-        "attached host CAMetalLayer did not vend a drawable"
-    );
     let texture = unsafe { send_id(drawable, objc::sel::get("texture")) };
     assert!(!texture.is_null());
     let width: unsafe extern "C" fn(Id, Sel) -> u64 =
@@ -414,21 +408,10 @@ fn main() {
         appkit::event::pump(ptr::null_mut());
         std::thread::sleep(std::time::Duration::from_millis(33));
     }
-    // Explicitly destroy the first guest CALayer and every autoreleased
-    // drawable. The host SDL_MetalView must be removed on the video thread,
-    // while the SDL window itself remains alive and reusable.
-    unsafe { send_void_id(view, objc::sel::get("setLayer:"), ptr::null_mut()) };
-    objc::arc::pool_pop(pool);
-    appkit::event::pump(ptr::null_mut());
-    assert_eq!(
-        sdl3::video::window_id(sdl),
-        window_id,
-        "SDL window retired during Metal layer cleanup"
-    );
-    println!("First guest CAMetalLayer and its native drawable released");
-
-    // Reattach a different guest layer to the same SDL window. This catches
-    // stale window->view mappings and deferred native-layer destruction.
+    // Retain the original live CAMetalLayer *beyond* setLayer:B. Its still
+    // valid identity must not occupy the window after its view is detached.
+    objc::arc::retain(layer);
+    assert_eq!(sdl3::video::window_id(sdl), window_id);
     let next_pool = objc::arc::pool_push();
     let new_layer = unsafe { send_id(objc::class::ptr(layer_cls) as Id, objc::sel::get("layer")) };
     assert!(!new_layer.is_null());
@@ -446,14 +429,91 @@ fn main() {
     }
     let replacement = unsafe { send_id(new_layer, objc::sel::get("nextDrawable")) };
     assert!(!replacement.is_null());
-    appkit::event::pump(ptr::null_mut());
+    // Layer A remains alive: this is not a deallocation-based cleanup test.
+    assert!(!layer.is_null());
     assert!(
         sdl3::video::window_flags(sdl) & sdl3::video::flags::METAL != 0,
         "replacement CAMetalLayer failed to acquire SDL Metal view"
     );
-    println!("Replacement guest CAMetalLayer attached to original SDL window");
+    println!("Replacement guest CAMetalLayer attached while old layer remains retained");
     unsafe { send_void_id(view, objc::sel::get("setLayer:"), ptr::null_mut()) };
+
+    // Removing a retained child NSView must retire its SDL Metal view without
+    // changing the child's CAMetalLayer back-reference or deallocating either.
+    let detached = unsafe {
+        send_id_rect(
+            objc::object::create_instance(view_cls, 0),
+            objc::sel::get("initWithFrame:"),
+            view_frame,
+        )
+    };
+    let detached_layer =
+        unsafe { send_id(objc::class::ptr(layer_cls) as Id, objc::sel::get("layer")) };
+    assert!(!detached.is_null() && !detached_layer.is_null());
+    unsafe {
+        send_void_id(detached, objc::sel::get("setLayer:"), detached_layer);
+        send_void_id(view, objc::sel::get("addSubview:"), detached);
+        send_void_id(detached_layer, objc::sel::get("setDevice:"), device);
+        send_void_size(
+            detached_layer,
+            objc::sel::get("setDrawableSize:"),
+            view_frame.size,
+        );
+    }
+    assert!(
+        !unsafe { send_id(detached_layer, objc::sel::get("nextDrawable")) }.is_null(),
+        "detachable view did not obtain its first drawable",
+    );
+    objc::arc::retain(detached);
+    unsafe { send_void(detached, objc::sel::get("removeFromSuperview")) };
+    appkit::event::pump(ptr::null_mut());
+    assert_eq!(
+        unsafe { send_id(detached, objc::sel::get("layer")) },
+        detached_layer,
+        "detached NSView did not retain its CAMetalLayer",
+    );
+    assert_eq!(sdl3::video::window_id(sdl), window_id);
+    assert!(
+        !unsafe { send_id(detached_layer, objc::sel::get("nextDrawable")) }.is_null(),
+        "detached CAMetalLayer should still provide offscreen drawables",
+    );
+    // SDL_WINDOW_METAL can remain set after SDL_Metal_DestroyView; the
+    // replacement's first drawable is the actual ownership check.
+    let successor = unsafe {
+        send_id_rect(
+            objc::object::create_instance(view_cls, 0),
+            objc::sel::get("initWithFrame:"),
+            view_frame,
+        )
+    };
+    let successor_layer =
+        unsafe { send_id(objc::class::ptr(layer_cls) as Id, objc::sel::get("layer")) };
+    assert!(!successor.is_null() && !successor_layer.is_null());
+    unsafe {
+        send_void_id(successor, objc::sel::get("setLayer:"), successor_layer);
+        send_void_id(view, objc::sel::get("addSubview:"), successor);
+        send_void_id(successor_layer, objc::sel::get("setDevice:"), device);
+        send_void_size(
+            successor_layer,
+            objc::sel::get("setDrawableSize:"),
+            view_frame.size,
+        );
+    }
+    assert!(
+        !unsafe { send_id(successor_layer, objc::sel::get("nextDrawable")) }.is_null(),
+        "replacement view failed to acquire SDL Metal view after removal",
+    );
+    println!("Retained detached NSView released its SDL Metal slot for a new view");
+    unsafe {
+        send_void_id(detached, objc::sel::get("setLayer:"), ptr::null_mut());
+        send_void_id(successor, objc::sel::get("setLayer:"), ptr::null_mut());
+    }
+    objc::arc::release(detached);
+    objc::arc::release(detached);
+    objc::arc::release(successor);
+    objc::arc::release(layer);
     objc::arc::pool_pop(next_pool);
+    objc::arc::pool_pop(pool);
     appkit::event::pump(ptr::null_mut());
     println!("Native Metal SDL window smoke test and layer replacement complete");
 }

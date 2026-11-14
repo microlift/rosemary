@@ -5,7 +5,7 @@
 
 use super::*;
 use std::collections::HashMap;
-use std::sync::{Arc, LazyLock, Mutex};
+use std::sync::{Arc, Condvar, LazyLock, Mutex};
 
 struct HostLayer(usize);
 
@@ -41,7 +41,12 @@ static HOST_LAYERS: LazyLock<Mutex<HashMap<usize, Entry>>> =
 
 /// A request retains the guest CALayer until the video thread consumes it.
 /// The registry itself MUST NOT retain the guest, or dealloc would never run.
-static ATTACH_REQUESTS: LazyLock<Mutex<Vec<usize>>> = LazyLock::new(|| Mutex::new(Vec::new()));
+struct AttachRequest {
+    guest: usize,
+    ready: Arc<(Mutex<bool>, Condvar)>,
+}
+static ATTACH_REQUESTS: LazyLock<Mutex<Vec<AttachRequest>>> =
+    LazyLock::new(|| Mutex::new(Vec::new()));
 static PENDING_DESTROYS: LazyLock<Mutex<Vec<Attachment>>> =
     LazyLock::new(|| Mutex::new(Vec::new()));
 
@@ -71,8 +76,10 @@ pub(super) fn install() {
         "drawableID" => drawable_id, c"Q16@0:8";
         "dealloc" => drawable_dealloc, c"v16@0:8";
     });
+    appkit::layer::add_metal_view_hook(view_changed);
     appkit::layer::add_metal_dealloc_hook(forget);
     appkit::event::add_pump_hook(service_video_thread);
+    appkit::event::add_modal_presentation_hook(service_video_thread);
     appkit::window::add_destroy_hook(forget_window);
 }
 
@@ -92,25 +99,101 @@ fn forget(guest_layer: Id) {
     drop(removed);
 }
 
-fn request_attachment(layer: Id) {
-    // Even already-attached views must be checked on the video thread: AppKit
-    // permits moving a live NSView between two still-valid NSWindows. A prior
-    // SDL Metal view must then be destroyed and attached to the new window.
-    // nextDrawable is generally called from a guest render thread, not the
-    // video thread. Do not touch SDL here; put a retained guest layer on a
-    // queue the video owner services on its next event-pump iteration.
+fn view_changed(layer: Id) {
+    // The view's old back-reference has already been cleared. Reconcile its
+    // attachment even if the guest keeps the previous CALayer alive.
+    if !HOST_LAYERS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .contains_key(&(layer as usize))
+    {
+        return;
+    }
+    request_attachment(layer, false);
+}
+
+/// Reconcile the actual SDL window before acquiring a presentable drawable.
+/// Calls from the video thread attach immediately; render-thread callers wait
+/// until the video pump has consumed their request, never returning a drawable
+/// from the temporary offscreen layer for an on-screen NSView.
+fn request_attachment(layer: Id, wait: bool) -> bool {
     let view = unsafe { appkit::layer::view_of(layer) };
-    if view.is_null() {
-        return;
+    let attached = || {
+        HOST_LAYERS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&(layer as usize))
+            .is_some_and(|entry| entry.attached.is_some())
+    };
+    // Recalculate after a video-thread wake: a newly created NSWindow may
+    // not have a published presentation snapshot at the first request.
+    let destination = || {
+        unsafe { appkit::view::presentation_frame(view) }
+            .filter(|frame| frame.covers_window())
+            .and_then(|frame| {
+                sdl3::video::live_window_id(frame.window).map(|id| (frame.window as usize, id))
+            })
+    };
+    let offscreen = || {
+        if view.is_null() {
+            return true;
+        }
+        if destination().is_some() {
+            return false;
+        }
+        // A windowed layer awaiting its presentation snapshot is not offscreen.
+        let window = guest_object(view, "window");
+        window.is_null() || unsafe { appkit::window::sdl_window(window) }.is_null()
+    };
+    // Detached layers support offscreen drawables, but only after retiring
+    // any SDL view they previously occupied.
+    if wait && offscreen() && !attached() {
+        return true;
     }
-    let retained = objc::arc::retain(layer);
-    let mut requests = ATTACH_REQUESTS.lock().unwrap_or_else(|e| e.into_inner());
-    if requests.contains(&(layer as usize)) {
-        drop(requests);
-        objc::arc::release(retained);
-        return;
+    // Stable frame fast path: never enqueue or block a render thread after
+    // the correct SDL MetalView was installed. Both IDs come from safe caches.
+    let matching = || {
+        HOST_LAYERS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&(layer as usize))
+            .and_then(|entry| entry.attached)
+            .is_some_and(|attached| {
+                destination().is_some_and(|(window, id)| {
+                    attached.window == window && attached.window_id == id
+                })
+            })
+    };
+    if wait && matching() {
+        return true;
     }
-    requests.push(layer as usize);
+    if sdl3::video::is_video_thread() {
+        attach_one(layer);
+        return !wait || matching() || (offscreen() && !attached());
+    }
+    let ready = {
+        let mut requests = ATTACH_REQUESTS.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(previous) = requests.iter().find(|item| item.guest == layer as usize) {
+            Arc::clone(&previous.ready)
+        } else {
+            let token = Arc::new((Mutex::new(false), Condvar::new()));
+            objc::arc::retain(layer);
+            requests.push(AttachRequest {
+                guest: layer as usize,
+                ready: Arc::clone(&token),
+            });
+            token
+        }
+    };
+    if !wait {
+        return true;
+    }
+    let (lock, signal) = &*ready;
+    let done = lock.lock().unwrap_or_else(|e| e.into_inner());
+    let (done, _) = signal
+        .wait_timeout_while(done, std::time::Duration::from_secs(2), |done| !*done)
+        .unwrap_or_else(|e| e.into_inner());
+    *done && (matching() || (offscreen() && !attached()))
 }
 
 fn destroy_views(views: Vec<Attachment>) {
@@ -129,9 +212,12 @@ fn service_video_thread() {
     let deferred = std::mem::take(&mut *PENDING_DESTROYS.lock().unwrap_or_else(|e| e.into_inner()));
     destroy_views(deferred);
     let pending = std::mem::take(&mut *ATTACH_REQUESTS.lock().unwrap_or_else(|e| e.into_inner()));
-    for address in pending {
-        let guest = address as Id;
+    for request in pending {
+        let guest = request.guest as Id;
         attach_one(guest);
+        let (lock, signal) = &*request.ready;
+        *lock.lock().unwrap_or_else(|e| e.into_inner()) = true;
+        signal.notify_all();
         objc::arc::release(guest);
     }
 }
@@ -390,10 +476,20 @@ pub(super) unsafe extern "C" fn next_drawable(receiver: Id, _sel: Sel) -> Id {
     if device.is_null() {
         return std::ptr::null_mut();
     }
+    // Ensure a placeholder host layer exists before attachment, but never
+    // use it for an on-screen first frame once SDL replaces it.
+    let Some(_) = host_layer(receiver) else {
+        return std::ptr::null_mut();
+    };
+    if !request_attachment(receiver, true) {
+        gpu::trace_once(
+            "native Metal first drawable could not wait for SDL attachment".to_string(),
+        );
+        return std::ptr::null_mut();
+    }
     let Some(layer) = host_layer(receiver) else {
         return std::ptr::null_mut();
     };
-    request_attachment(receiver);
     configure_host(layer.get(), receiver, device);
     let _pool = HostPool::new();
     let host_drawable = unsafe { host_send_id(layer.get(), sel(c"nextDrawable")) };
@@ -487,6 +583,9 @@ mod migration_tests {
             return;
         }
         crate::bootstrap();
+        // Install native CAMetalLayer dispatch and AppKit view-change hooks
+        // before constructing either presentation layer.
+        assert!(!super::super::default_device().is_null());
         if !sdl3::may_pump() {
             return;
         }
@@ -567,7 +666,7 @@ mod migration_tests {
         assert_eq!(before.window, sdl_a);
         assert!(before.covers_window());
         let original = host_layer(metal).unwrap();
-        request_attachment(metal);
+        request_attachment(metal, true);
         service_video_thread();
         let first = HOST_LAYERS
             .lock()
@@ -585,7 +684,7 @@ mod migration_tests {
         let moved = unsafe { appkit::view::presentation_frame(view) }.unwrap();
         assert_eq!(moved.window, sdl_b);
         assert!(moved.covers_window());
-        request_attachment(metal);
+        request_attachment(metal, true);
         service_video_thread();
         let second = HOST_LAYERS
             .lock()
@@ -609,10 +708,245 @@ mod migration_tests {
             sdl3::video::live_window_id(sdl_b).is_some(),
             "window B was destroyed"
         );
+        // Retain A independently of the NSView. Replacing it must free the
+        // window's single SDL_MetalView slot without deallocating A.
+        objc::arc::retain(metal);
+        let replacement_layer =
+            unsafe { send_id(objc::class::ptr(layer_class) as Id, objc::sel::get("layer")) };
+        assert!(!replacement_layer.is_null());
+        unsafe { send_void_id(view, objc::sel::get("setLayer:"), replacement_layer) };
+        let detached = HOST_LAYERS
+            .lock()
+            .unwrap()
+            .get(&(metal as usize))
+            .and_then(|entry| entry.attached);
+        assert!(
+            detached.is_none(),
+            "retained detached CAMetalLayer A still occupies the window"
+        );
+        let initial = unsafe { next_drawable(replacement_layer, std::ptr::null()) };
+        assert!(
+            !initial.is_null(),
+            "the first drawable of replacement CAMetalLayer B is unavailable"
+        );
+        let live = HOST_LAYERS
+            .lock()
+            .unwrap()
+            .get(&(replacement_layer as usize))
+            .and_then(|entry| entry.attached)
+            .expect("replacement B must attach on the first drawable");
+        assert_eq!(live.window, sdl_b as usize);
+        assert_eq!(live.window_id, sdl3::video::window_id(sdl_b));
+        assert!(sdl3::video::live_window_id(sdl_a).is_some());
+        assert!(sdl3::video::live_window_id(sdl_b).is_some());
+
+        // The first frame may originate on the guest's render thread while
+        // SDL presentation is owned by the main video thread. Verify that
+        // this call waits for the pump's attachment, rather than handing out
+        // a drawable from a temporary offscreen host CAMetalLayer.
+        let worker_layer =
+            unsafe { send_id(objc::class::ptr(layer_class) as Id, objc::sel::get("layer")) };
+        assert!(!worker_layer.is_null());
+        unsafe { send_void_id(view, objc::sel::get("setLayer:"), worker_layer) };
+        let key = worker_layer as usize;
+        let (tx, rx) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let _darwin = darwin::tls::DarwinThread::enter();
+            let pool = objc::arc::pool_push();
+            let initial = unsafe { next_drawable(key as Id, std::ptr::null()) };
+            let owned = objc::arc::retain(initial) as usize;
+            objc::arc::pool_pop(pool);
+            tx.send(owned).unwrap();
+        });
+        let mut first_from_worker = None;
+        for _ in 0..200 {
+            appkit::event::pump(std::ptr::null_mut());
+            if let Ok(initial) = rx.try_recv() {
+                first_from_worker = Some(initial);
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(
+            first_from_worker.is_some(),
+            "first drawable did not reach the renderer after SDL video-pump attachment"
+        );
+        worker.join().unwrap();
+        let initial = first_from_worker.unwrap() as Id;
+        assert!(
+            !initial.is_null(),
+            "render-thread first drawable returned nil"
+        );
+        let worker_attachment = HOST_LAYERS
+            .lock()
+            .unwrap()
+            .get(&key)
+            .and_then(|entry| entry.attached)
+            .expect("first render-thread drawable must have an SDL view");
+        assert_eq!(worker_attachment.window, sdl_b as usize);
+        assert_eq!(worker_attachment.window_id, sdl3::video::window_id(sdl_b));
+        objc::arc::release(initial);
+        unsafe { send_void_id(view, objc::sel::get("setLayer:"), std::ptr::null_mut()) };
+        objc::arc::release(metal);
         objc::arc::release(view);
         for window in windows {
             objc::arc::release(window)
         }
+        service_video_thread();
+        objc::arc::pool_pop(pool);
+    }
+
+    #[test]
+    fn removing_a_retained_metal_view_frees_its_sdl_slot_for_replacement() {
+        if !super::super::enabled() {
+            eprintln!("skipped: set ROSEMARY_METAL_BACKEND=native");
+            return;
+        }
+        if !sdl3::isolated::run_here() {
+            return;
+        }
+        crate::bootstrap();
+        assert!(!super::super::default_device().is_null());
+        if !sdl3::may_pump() {
+            return;
+        }
+        let pool = objc::arc::pool_push();
+        let rect = foundation::geometry::NSRect {
+            origin: foundation::geometry::NSPoint { x: 0.0, y: 0.0 },
+            size: foundation::geometry::NSSize {
+                width: 320.0,
+                height: 240.0,
+            },
+        };
+        let probe =
+            sdl3::video::create_window(c"metal-detach-probe", 1, 1, sdl3::video::flags::HIDDEN);
+        let Some(probe) = probe else {
+            eprintln!("skipped: SDL video is unavailable: {}", sdl3::error());
+            objc::arc::pool_pop(pool);
+            return;
+        };
+        sdl3::video::destroy_window(probe);
+        let window_class = objc::class::lookup(c"NSWindow").unwrap();
+        let view_class = objc::class::lookup(c"NSView").unwrap();
+        let layer_class = objc::class::lookup(c"CAMetalLayer").unwrap();
+        let make_window: unsafe extern "C" fn(
+            Id,
+            Sel,
+            foundation::geometry::NSRect,
+            usize,
+            usize,
+            u8,
+        ) -> Id = unsafe { std::mem::transmute(objc::msg::entry()) };
+        let make_view: unsafe extern "C" fn(Id, Sel, foundation::geometry::NSRect) -> Id =
+            unsafe { std::mem::transmute(objc::msg::entry()) };
+        let send_id: unsafe extern "C" fn(Id, Sel) -> Id =
+            unsafe { std::mem::transmute(objc::msg::entry()) };
+        let send_void_id: unsafe extern "C" fn(Id, Sel, Id) =
+            unsafe { std::mem::transmute(objc::msg::entry()) };
+        let send_void: unsafe extern "C" fn(Id, Sel) =
+            unsafe { std::mem::transmute(objc::msg::entry()) };
+
+        let window = unsafe {
+            make_window(
+                objc::object::create_instance(window_class, 0),
+                objc::sel::get("initWithContentRect:styleMask:backing:defer:"),
+                rect,
+                0,
+                0,
+                0,
+            )
+        };
+        assert!(!window.is_null());
+        let sdl = unsafe { appkit::window::sdl_window(window) };
+        assert!(!sdl.is_null());
+        sdl3::pump();
+        let content = unsafe { send_id(window, objc::sel::get("contentView")) };
+        let view = unsafe {
+            make_view(
+                objc::object::create_instance(view_class, 0),
+                objc::sel::get("initWithFrame:"),
+                rect,
+            )
+        };
+        let metal =
+            unsafe { send_id(objc::class::ptr(layer_class) as Id, objc::sel::get("layer")) };
+        assert!(!view.is_null() && !metal.is_null());
+        unsafe {
+            send_void_id(view, objc::sel::get("setLayer:"), metal);
+            send_void_id(content, objc::sel::get("addSubview:"), view);
+        }
+        let first = unsafe { next_drawable(metal, std::ptr::null()) };
+        assert!(
+            !first.is_null(),
+            "initial Metal drawable must attach to SDL"
+        );
+        assert_eq!(
+            HOST_LAYERS
+                .lock()
+                .unwrap()
+                .get(&(metal as usize))
+                .and_then(|entry| entry.attached)
+                .unwrap()
+                .window,
+            sdl as usize,
+        );
+
+        // Keep the NSView (and its assigned CAMetalLayer) alive after removal.
+        objc::arc::retain(view);
+        unsafe { send_void(view, objc::sel::get("removeFromSuperview")) };
+        appkit::event::pump(std::ptr::null_mut());
+        assert_eq!(unsafe { appkit::layer::view_of(metal) }, view);
+        assert!(unsafe { appkit::view::presentation_frame(view) }.is_none());
+        assert!(
+            HOST_LAYERS
+                .lock()
+                .unwrap()
+                .get(&(metal as usize))
+                .and_then(|entry| entry.attached)
+                .is_none(),
+            "detached live NSView still holds an SDL Metal view",
+        );
+
+        let replacement = unsafe {
+            make_view(
+                objc::object::create_instance(view_class, 0),
+                objc::sel::get("initWithFrame:"),
+                rect,
+            )
+        };
+        let replacement_layer =
+            unsafe { send_id(objc::class::ptr(layer_class) as Id, objc::sel::get("layer")) };
+        unsafe {
+            send_void_id(replacement, objc::sel::get("setLayer:"), replacement_layer);
+            send_void_id(content, objc::sel::get("addSubview:"), replacement);
+        }
+        assert!(
+            !unsafe { next_drawable(replacement_layer, std::ptr::null()) }.is_null(),
+            "replacement Metal layer could not acquire its first drawable",
+        );
+        assert_eq!(
+            HOST_LAYERS
+                .lock()
+                .unwrap()
+                .get(&(replacement_layer as usize))
+                .and_then(|entry| entry.attached)
+                .unwrap()
+                .window,
+            sdl as usize,
+        );
+
+        unsafe {
+            send_void_id(view, objc::sel::get("setLayer:"), std::ptr::null_mut());
+            send_void_id(
+                replacement,
+                objc::sel::get("setLayer:"),
+                std::ptr::null_mut(),
+            );
+        }
+        objc::arc::release(view);
+        objc::arc::release(view);
+        objc::arc::release(replacement);
+        objc::arc::release(window);
         service_video_thread();
         objc::arc::pool_pop(pool);
     }
