@@ -127,24 +127,54 @@ pub(crate) fn compose(
                 }
                 continue;
             }
-            let pixels = source
-                .as_chunks::<BYTES_PER_PIXEL>()
-                .0
-                .iter()
-                .zip(destination.as_chunks_mut::<BYTES_PER_PIXEL>().0);
-            for (source, destination) in pixels {
+            let source = source.as_chunks::<BYTES_PER_PIXEL>().0;
+            let destination = destination.as_chunks_mut::<BYTES_PER_PIXEL>().0;
+            if opacity == OPAQUE {
+                over(source, destination);
+                continue;
+            }
+            for (source, destination) in source.iter().zip(destination) {
                 let mut source = *source;
                 if !layer.alpha {
                     source[ALPHA] = OPAQUE as u8;
                 }
-                let coverage = scaled(u32::from(source[ALPHA]), opacity);
-                for channel in 0..BYTES_PER_PIXEL {
-                    let over = scaled(u32::from(source[channel]), opacity);
-                    let under = scaled(u32::from(destination[channel]), OPAQUE - coverage);
-                    destination[channel] = (over + under).min(OPAQUE) as u8;
-                }
+                blend(source, destination, opacity);
             }
         }
+    }
+}
+
+/// A row of a picture whose alpha counts over `destination`, at full
+/// opacity. Most of a window's pixels are opaque or clear, and blending
+/// gives back exactly the one and leaves what is under the other: runs of
+/// them are copied or passed over whole.
+fn over(source: &[[u8; BYTES_PER_PIXEL]], destination: &mut [[u8; BYTES_PER_PIXEL]]) {
+    let run = |from: &[[u8; BYTES_PER_PIXEL]], each: fn(&[u8; BYTES_PER_PIXEL]) -> bool| {
+        from.iter().take_while(|pixel| each(pixel)).count()
+    };
+    let mut at = 0;
+    while at < source.len() {
+        let opaque = run(&source[at..], |pixel| u32::from(pixel[ALPHA]) == OPAQUE);
+        destination[at..at + opaque].copy_from_slice(&source[at..at + opaque]);
+        at += opaque;
+        at += run(&source[at..], |pixel| *pixel == CLEAR);
+        let partial = run(&source[at..], |pixel| {
+            u32::from(pixel[ALPHA]) != OPAQUE && *pixel != CLEAR
+        });
+        for (source, destination) in source[at..at + partial].iter().zip(&mut destination[at..]) {
+            blend(*source, destination, OPAQUE);
+        }
+        at += partial;
+    }
+}
+
+/// A premultiplied pixel at `opacity` over `destination`.
+fn blend(source: [u8; BYTES_PER_PIXEL], destination: &mut [u8; BYTES_PER_PIXEL], opacity: u32) {
+    let coverage = scaled(u32::from(source[ALPHA]), opacity);
+    for channel in 0..BYTES_PER_PIXEL {
+        let over = scaled(u32::from(source[channel]), opacity);
+        let under = scaled(u32::from(destination[channel]), OPAQUE - coverage);
+        destination[channel] = (over + under).min(OPAQUE) as u8;
     }
 }
 
@@ -278,6 +308,28 @@ mod tests {
             WHOLE,
         );
         assert_eq!(drawn[..3], [RED, CLEAR, CLEAR]);
+    }
+
+    #[test]
+    fn a_row_of_opaque_clear_and_partly_clear_pixels_blends_each() {
+        let half = [0x40, 0x40, 0x40, 0x80];
+        let row = Buffer {
+            width: 4,
+            height: 1,
+            pixels: [RED, CLEAR, half, RED].concat(),
+        };
+        let layer = Layer {
+            buffer: &row,
+            x: 0,
+            y: 0,
+            alpha: true,
+            opacity: 1.0,
+        };
+        // Half of the background's grey under half a darker grey.
+        assert_eq!(
+            draw(&[layer], WHOLE)[..4],
+            [RED, BACKGROUND, [0x80, 0x80, 0x80, 0xff], RED]
+        );
     }
 
     #[test]
