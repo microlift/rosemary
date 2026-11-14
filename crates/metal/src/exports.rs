@@ -1,6 +1,15 @@
 use super::*;
 
 pub(super) fn devices() -> &'static [usize] {
+    #[cfg(not(target_os = "macos"))]
+    if std::env::var("ROSEMARY_METAL_BACKEND").as_deref() == Ok("native") {
+        eprintln!("rosemary: native Metal backend requires macOS");
+        return &[];
+    }
+    #[cfg(target_os = "macos")]
+    if native::enabled() {
+        return native::devices();
+    }
     static DEVICES: OnceLock<Vec<usize>> = OnceLock::new();
     DEVICES.get_or_init(|| {
         bootstrap();
@@ -47,6 +56,10 @@ pub(super) fn devices() -> &'static [usize] {
 ///
 /// Called through the Metal framework ABI.
 pub unsafe extern "C" fn MTLCreateSystemDefaultDevice() -> Id {
+    #[cfg(target_os = "macos")]
+    if native::enabled() {
+        return native::default_device();
+    }
     devices()
         .first()
         .copied()

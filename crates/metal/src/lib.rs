@@ -12,6 +12,8 @@ mod gpu;
 mod hash;
 mod heap;
 mod library;
+#[cfg(target_os = "macos")]
+mod native;
 mod object;
 mod overlay;
 mod pipeline;

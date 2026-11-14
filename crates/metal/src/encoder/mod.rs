@@ -30,6 +30,8 @@ use visibility::*;
 
 use objc::address::AddressSet;
 
+#[cfg(target_os = "macos")]
+pub(crate) use pass::AttachmentDescriptor;
 pub(crate) use pass::RenderPassDescriptor;
 pub(crate) use queue::new_command_queue;
 pub(crate) use retire::Submission;

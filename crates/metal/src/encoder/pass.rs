@@ -1080,14 +1080,19 @@ pub(super) unsafe extern "C" fn set_attachment_object(receiver: Id, sel: Sel, va
     // A texture buffer has no image to attach: Metal refuses it as a render
     // target, and every attachment path here reads the image.
     // SAFETY: only a texture of this crate's is attached.
-    let value =
-        match !value.is_null() && unsafe { object::body::<Texture>(value) }.is_texture_buffer() {
-            true => {
-                gpu::trace("rejecting a texture buffer as a render pass attachment");
-                std::ptr::null_mut()
-            }
-            false => value,
-        };
+    // A native-Metal passthrough texture uses a different guest object layout.
+    // Only Vulkan-backed textures have the private `Texture` body and its
+    // Vulkan texture-buffer restriction; do not interpret a native wrapper
+    // as that body. The native backend validates render target compatibility.
+    let value = match object::is_kind(value, c"RosemaryMTLTexture")
+        && unsafe { object::body::<Texture>(value) }.is_texture_buffer()
+    {
+        true => {
+            gpu::trace("rejecting a texture buffer as a render pass attachment");
+            std::ptr::null_mut()
+        }
+        false => value,
+    };
     objc::arc::release(std::mem::replace(slot, objc::arc::retain(value)));
 }
 
