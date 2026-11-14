@@ -95,7 +95,6 @@ pub mod progname;
 pub mod pthread;
 pub mod random;
 pub mod regex;
-mod resolv;
 pub mod rlimit;
 pub mod rosemary;
 pub mod sched;
@@ -360,7 +359,6 @@ static SHARED_MODULES: &[exports::Module] = &[
     clock::MODULE,
     glob::MODULE,
     regex::MODULE,
-    resolv::MODULE,
     string::MODULE,
     strtofp::MODULE,
     stdlib::MODULE,
