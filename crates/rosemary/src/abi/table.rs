@@ -2418,6 +2418,35 @@ pub static SIGNATURES: &[FunctionAbi] = &[
     sig!("glFenceSync", P, U32, U32),
     sig!("glGetTexLevelParameteriv", V, U32, I32, U32, P),
     //
+    // The legacy calls the Darwin base's libGLU makes, which an emulated
+    // libGLU reaches here.
+    sig!("glColor3f", V, F32, F32, F32),
+    sig!("glEvalCoord1f", V, F32),
+    sig!("glEvalCoord2f", V, F32, F32),
+    sig!("glEvalMesh1", V, U32, I32, I32),
+    sig!("glEvalMesh2", V, U32, I32, I32, I32, I32),
+    sig!("glEvalPoint1", V, I32),
+    sig!("glEvalPoint2", V, I32, I32),
+    sig!("glMap1f", V, U32, F32, F32, I32, I32, P),
+    sig!("glMap2f", V, U32, F32, F32, I32, I32, F32, F32, I32, I32, P),
+    sig!("glMapGrid1f", V, I32, F32, F32),
+    sig!("glMapGrid2d", V, I32, F64, F64, I32, F64, F64),
+    sig!("glMapGrid2f", V, I32, F32, F32, I32, F32, F32),
+    sig!("glMultMatrixd", V, P),
+    sig!("glMultMatrixf", V, P),
+    sig!("glNormal3f", V, F32, F32, F32),
+    sig!("glNormal3fv", V, P),
+    sig!("glOrtho", V, F64, F64, F64, F64, F64, F64),
+    sig!("glPopAttrib", V),
+    sig!("glPushAttrib", V, U32),
+    sig!("glScalef", V, F32, F32, F32),
+    sig!("glTexImage1D", V, U32, I32, I32, I32, I32, U32, U32, P),
+    sig!("glTranslated", V, F64, F64, F64),
+    sig!("glTranslatef", V, F32, F32, F32),
+    sig!("glVertex2fv", V, P),
+    sig!("glVertex3f", V, F32, F32, F32),
+    sig!("glVertex3fv", V, P),
+    //
     // Almost nothing below is a static import.
     sig!("glBeginQuery", V, U32, U32),
     sig!("glBindBufferBase", V, U32, U32, U32),
@@ -2864,7 +2893,6 @@ pub static SIGNATURES: &[FunctionAbi] = &[
     // Frees what `glob` allocated, and must be the shim's own: the host's would
     // read `gl_pathv` out of a Darwin `glob_t` at the wrong offset.
     sig!("globfree", V, P),
-    sig!("gluOrtho2D", V, F64, F64, F64, F64),
     sig!("gmtime", P, P),
     sig!("gmtime_r", P, P, P),
     sig!("group_from_gid", P, U32, I32),

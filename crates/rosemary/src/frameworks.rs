@@ -549,7 +549,7 @@ fn register_opengl_framework() {
         opengl::INSTALL_PATHS,
         crate::gl::symbol,
         Links {
-            reexports: &[],
+            reexports: &[opengl::LIBGLU],
             dependencies: &[framework!("CoreFoundation"), framework!("IOKit"), LIBSYSTEM],
         },
     );
@@ -613,6 +613,14 @@ pub fn base_reexports() -> Vec<SyntheticDylib> {
     if !using_builtin() {
         return Vec::new();
     }
+    let opengl = crate::gl::interposed().then(|| {
+        let mut lib = SyntheticDylib::new(opengl::INSTALL_PATHS[0]);
+        for path in &opengl::INSTALL_PATHS[1..] {
+            lib.alias(path);
+        }
+        lib.reexport(opengl::LIBGLU);
+        lib
+    });
     FRAMEWORKS
         .iter()
         .filter_map(|framework| {
@@ -636,6 +644,7 @@ pub fn base_reexports() -> Vec<SyntheticDylib> {
             }
             Some(lib)
         })
+        .chain(opengl)
         .collect()
 }
 

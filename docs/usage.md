@@ -259,5 +259,7 @@ contexts GL 2.1 with GLSL 1.20, and both list only the extensions a Mac lists
 for that profile and the driver also has. `ROSEMARY_GL_HOST_FEATURES=1` offers
 the driver's own version, extensions and functions instead.
 
-The built-in GLU surface provides `gluOrtho2D` through the driver's `glOrtho`;
-other GLU functions are unbound. No host GLU library is required.
+GLU is the Darwin base's `/usr/lib/libGLU.1.dylib`, which the framework
+re-exports and which draws through the GL above; no host GLU library is used. A
+prefix whose base is not the guest's architecture leaves GLU unbound. Apple's
+private `CTX` and `CFM` GLU variants are not provided.

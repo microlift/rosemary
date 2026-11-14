@@ -20,14 +20,6 @@ pub fn address(name: &str) -> Option<u64> {
     Some(f as usize as u64)
 }
 
-/// This crate's own `libGLU` function `name`, where it has one.
-pub fn glu(name: &str) -> Option<u64> {
-    match name {
-        "gluOrtho2D" => Some(ortho_2d as *const () as usize as u64),
-        _ => None,
-    }
-}
-
 const ELEMENT_ARRAY_BUFFER_BINDING: u32 = 0x8895;
 const VERTEX_ARRAY_BINDING: u32 = 0x85B5;
 
@@ -41,8 +33,6 @@ static GET_INTEGERV: Entry<unsafe extern "C" fn(u32, *mut i32)> =
     unsafe { Entry::new(c"glGetIntegerv") };
 static FLUSH: Entry<unsafe extern "C" fn()> = unsafe { Entry::new(c"glFlush") };
 static FINISH: Entry<unsafe extern "C" fn()> = unsafe { Entry::new(c"glFinish") };
-static ORTHO: Entry<unsafe extern "C" fn(f64, f64, f64, f64, f64, f64)> =
-    unsafe { Entry::new(c"glOrtho") };
 
 /// Keep a malformed indexed draw from taking the host driver down with it.
 ///
@@ -127,13 +117,4 @@ unsafe extern "C" fn finish() {
         unsafe { real() };
     }
     appkit::opengl::present_single_buffered();
-}
-
-/// `gluOrtho2D`, which GLU defines as `glOrtho` with a near and far plane of
-/// -1 and 1.
-unsafe extern "C" fn ortho_2d(left: f64, right: f64, bottom: f64, top: f64) {
-    if let Some(ortho) = ORTHO.get() {
-        // SAFETY: the guest's call, as GLU forwards it.
-        unsafe { ortho(left, right, bottom, top, -1.0, 1.0) };
-    }
 }

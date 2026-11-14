@@ -1,5 +1,6 @@
-//! OpenGL.framework: CGL, and the GL and GLU entry points of the two libraries
-//! it re-exports.
+//! OpenGL.framework: CGL, and the GL entry points of `libGL`. The framework's
+//! other re-export, `libGLU`, is the Darwin base's own image ([`LIBGLU`]),
+//! drawing through the GL answered here.
 //!
 //! A Mac program was only ever tested against Apple's GL - at most version 4.1,
 //! the functions `libGL.dylib` exports, the extensions Apple's drivers list. A
@@ -33,6 +34,10 @@ pub const INSTALL_PATHS: &[&str] = &[
     "OpenGL",
 ];
 
+/// The Darwin base's GLU, which the framework re-exports in place of Apple's
+/// `Libraries/libGLU.dylib`.
+pub const LIBGLU: &str = "/usr/lib/libGLU.1.dylib";
+
 /// `ROSEMARY_GL_HOST_FEATURES`: offer the driver's own version, extensions and
 /// entry points instead of a Mac's.
 pub const HOST_FEATURES: &str = "ROSEMARY_GL_HOST_FEATURES";
@@ -57,7 +62,8 @@ pub fn symbol(name: &str) -> Option<u64> {
     match names::library(name) {
         Some(Library::OpenGL) => cgl::symbol(name),
         Some(Library::Gl) => cgl::symbol(name).or_else(|| gl(name)),
-        Some(Library::Glu) => entry::glu(name).filter(|_| driver::open()),
+        // Answered by [`LIBGLU`], never by this crate or the host.
+        Some(Library::Glu) => None,
         None if host_features() && is_gl_function(name) => gl(name),
         None => None,
     }
@@ -99,8 +105,10 @@ mod tests {
     }
 
     #[test]
-    fn unimplemented_glu_is_unbound() {
-        assert_eq!(symbol("gluPerspective"), None);
-        assert_eq!(symbol("gluNotAFunction"), None);
+    fn glu_is_left_to_the_base_image() {
+        for name in ["gluOrtho2D", "gluPerspective"] {
+            assert!(owns(name), "{name}");
+            assert_eq!(symbol(name), None, "{name}");
+        }
     }
 }
