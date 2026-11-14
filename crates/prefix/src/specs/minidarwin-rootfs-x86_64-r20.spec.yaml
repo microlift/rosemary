@@ -1,0 +1,29 @@
+# minidarwin rootfs spec. Format: docs/rootfs-spec.md
+format: 1
+identity:
+  arch: "x86_64"
+  libsystem: "Libsystem-1356"
+  min_os: "26.0"
+  project: "minidarwin"
+  xnu: "xnu-12377.121.6"
+release:
+  sequence: 20
+  tag: "v20.0.0"
+  commit: "e6c82ff4e4c2ecf53cd2d1592f1cad70d8f0c1c9"
+  repository: "microlift/minidarwin"
+artifact:
+  name: "minidarwin-rootfs-x86_64-r20.tar.gz"
+  format: "tar+gzip"
+  size: 57180843
+  sha256: "6872aa2d64deac3bfccab7c43531d841da94fe68d916b286d0364cf5862d3fb7"
+  sources:
+    - "https://github.com/microlift/minidarwin/releases/download/v20.0.0/minidarwin-rootfs-x86_64-r20.tar.gz"
+manifest:
+  name: "minidarwin-rootfs-x86_64-r20.manifest.yaml"
+  size: 1952932
+  sha256: "ff0b51809c332eb550079679dab2ce4fea8239fc30ed56c3f40eff1c07ca9be7"
+  tree: "fa9dcf3e182d2179c99e9bac00d1e39f52648008c65611d0158e1056cca3622a"
+  sources:
+    - "https://github.com/microlift/minidarwin/releases/download/v20.0.0/minidarwin-rootfs-x86_64-r20.manifest.yaml"
+verification:
+  policy: "strict"
