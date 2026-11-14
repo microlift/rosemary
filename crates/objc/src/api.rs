@@ -728,8 +728,12 @@ pub unsafe extern "C" fn objc_copyClassList(out_count: *mut u32) -> *mut *const 
     unsafe { copied_handles(values.collect(), out_count) }
 }
 
+/// Apple's answers the `isa` as it stands and realizes nothing. Swift asks it
+/// of a generic class it is still building, for the metaclass whose RO data it
+/// fills in next; realizing the pair then would adopt a class whose ivars are
+/// not laid out yet.
 pub unsafe extern "C" fn object_getClass(object: Id) -> *mut c_void {
-    as_ptr(unsafe { crate::object::class_of(object) })
+    unsafe { crate::object::isa(object) }.cast_mut().cast()
 }
 
 pub unsafe extern "C" fn object_setClass(object: Id, cls: *const c_void) -> *mut c_void {

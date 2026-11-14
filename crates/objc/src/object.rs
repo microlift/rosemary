@@ -102,6 +102,20 @@ pub unsafe fn dispose_instance(object: Id) {
     unsafe { crate::allocator::guest_free(object) }
 }
 
+/// `object`'s first word, realized or not.
+///
+/// # Safety
+///
+/// As [`class_of`].
+pub unsafe fn isa(object: Id) -> *const Class {
+    if object.is_null() {
+        return std::ptr::null();
+    }
+    crate::debug::validate(object, "object_getClass");
+    // SAFETY: the caller's obligation; the first word is the `isa`.
+    unsafe { *(object as *const *const Class) }
+}
+
 /// The class of `object`.
 ///
 /// A class is an object whose `isa` is its metaclass, so this is the same read
@@ -115,9 +129,7 @@ pub unsafe fn class_of(object: Id) -> Option<&'static Class> {
     if object.is_null() {
         return None;
     }
-    crate::debug::validate(object, "object_getClass");
-    // SAFETY: the caller's obligation; the first word is the `isa`.
-    let isa = unsafe { *(object as *const *const Class) };
+    let isa = unsafe { isa(object) };
     if crate::class::is_known(isa) {
         // SAFETY: a class this runtime built or adopted.
         return Some(unsafe { &*isa });

@@ -1413,6 +1413,19 @@ mod tests {
         assert!(is_known(class));
     }
 
+    /// Swift asks for the metaclass of a generic class it is still laying
+    /// out, and writes into both next: `object_getClass` answers the `isa`
+    /// and realizes nothing, as Apple's does.
+    #[test]
+    fn object_get_class_leaves_a_waiting_pair_unrealized() {
+        let (class, meta) = waiting_pair(c"RosemaryLeftWaiting");
+        // SAFETY: a compiled header, readable as an object.
+        let found = unsafe { crate::api::object_getClass(class.cast()) };
+        assert_eq!(found, meta.cast());
+        assert!(!is_known(class));
+        assert!(!is_known(meta));
+    }
+
     #[test]
     fn a_disposed_adopted_class_gets_its_compiled_header_back() {
         let (header, meta, class) = adopt_under_nsobject(c"RosemaryDisposedClass", COMPILED_RO);
