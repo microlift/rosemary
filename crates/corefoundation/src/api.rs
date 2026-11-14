@@ -172,7 +172,7 @@ pub unsafe extern "C" fn CFAllocatorCreate(
 /// # Safety
 ///
 /// `buffer` is non-null and is the caller's to give away under `deallocator`.
-unsafe fn give_back(deallocator: CFAllocatorRef, buffer: *mut c_void) {
+pub(crate) unsafe fn give_back(deallocator: CFAllocatorRef, buffer: *mut c_void) {
     if deallocator == standard_allocator(StandardAllocator::Null) {
         return;
     }

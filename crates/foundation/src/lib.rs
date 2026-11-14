@@ -268,6 +268,9 @@ pub const CLASSES: &[&str] = &[
     "NSMutableString",
     "NSArray",
     "NSMutableArray",
+    // CoreFoundation's, as on macOS, where a read stream is toll-free bridged.
+    "NSStream",
+    "NSInputStream",
     "NSSet",
     "NSMutableSet",
     "NSDictionary",
