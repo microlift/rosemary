@@ -254,6 +254,10 @@ impl SymbolProvider for Namespace {
         self.find(install_name).is_some()
     }
 
+    fn stands_for(&self, install_name: &str) -> bool {
+        self.find(install_name).is_some()
+    }
+
     fn resolve(&self, sym: &SymbolRef<'_>) -> Option<Resolved> {
         match sym.library {
             LibraryRef::InstallName(name) => self.lookup(self.find(name)?, sym.name, 0),

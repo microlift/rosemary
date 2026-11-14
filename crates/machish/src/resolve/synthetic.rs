@@ -229,6 +229,23 @@ mod tests {
         assert!(umbrella.reexports("/usr/lib/libobjc.A.dylib").is_empty());
     }
 
+    /// A re-export is the image it names: a flat provider ahead of that image
+    /// answers any name, and must not answer for it.
+    #[test]
+    fn a_reexport_resolves_in_the_image_it_names_not_a_flat_provider() {
+        let mut umbrella = SyntheticDylib::new("/usr/lib/libSystem.B.dylib");
+        umbrella.reexport("/usr/lib/libcopyfile.dylib");
+        let mut host = SyntheticDylib::new("host");
+        host.flat(true).define_fn("_copyfile", 0x3333 as *const ());
+        let mut copyfile = SyntheticDylib::new("/usr/lib/libcopyfile.dylib");
+        copyfile.define_fn("_copyfile", 0x2222 as *const ());
+        let providers: [&dyn SymbolProvider; 3] = [&umbrella, &host, &copyfile];
+
+        let system = LibraryRef::InstallName("/usr/lib/libSystem.B.dylib");
+        let found = resolve_in(&providers, &sym("_copyfile", system)).map(|r| r.addr);
+        assert_eq!(found, Some(0x2222));
+    }
+
     #[test]
     fn earlier_providers_win() {
         let mut shim = SyntheticDylib::new("shims");

@@ -141,7 +141,15 @@ fn resolve_at_depth(
                             library: LibraryRef::InstallName(target),
                             ..*sym
                         };
-                        resolve_at_depth(providers, &forwarded, depth + 1)
+                        // Only the image itself: a flat provider answers any
+                        // name, and would find the symbol in a library the
+                        // stand-in does not re-export.
+                        let images: Vec<&dyn SymbolProvider> = providers
+                            .iter()
+                            .copied()
+                            .filter(|q| q.stands_for(target))
+                            .collect();
+                        resolve_at_depth(&images, &forwarded, depth + 1)
                     })
                 })
             })
