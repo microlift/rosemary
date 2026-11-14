@@ -30,6 +30,7 @@ avfoundation.workspace = true
 security.workspace = true
 gamecontroller.workspace = true
 webkit.workspace = true
+coreanalytics.workspace = true
 forcefeedback.workspace = true
 network.workspace = true
 opencl.workspace = true

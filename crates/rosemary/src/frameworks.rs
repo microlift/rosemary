@@ -128,6 +128,18 @@ static FRAMEWORKS: &[Framework] = &[
         },
     },
     Framework {
+        leaf: "CoreAnalytics",
+        version: 'A',
+        umbrellas: &[],
+        provide: Some(coreanalytics::provide),
+        data: None,
+        symbol: Some(coreanalytics::symbol),
+        links: Links {
+            reexports: &[],
+            dependencies: &[LIBSYSTEM],
+        },
+    },
+    Framework {
         leaf: "Network",
         version: 'A',
         umbrellas: &[],
@@ -479,6 +491,17 @@ static FRAMEWORKS: &[Framework] = &[
     },
 ];
 
+/// Frameworks that macOS keeps in `/System/Library/PrivateFrameworks`.
+const PRIVATE_FRAMEWORKS: &[&str] = &["CoreAnalytics"];
+
+/// The directory `leaf`'s framework is installed in.
+fn framework_dir(leaf: &str) -> &'static str {
+    match PRIVATE_FRAMEWORKS.contains(&leaf) {
+        true => "/System/Library/PrivateFrameworks",
+        false => "/System/Library/Frameworks",
+    }
+}
+
 fn paths_of(framework: &Framework) -> Vec<String> {
     let mut out = Vec::new();
     for leaf in std::iter::once(framework.leaf).chain(framework.umbrellas.iter().copied()) {
@@ -487,12 +510,9 @@ fn paths_of(framework: &Framework) -> Vec<String> {
         } else {
             'A'
         };
-        out.push(format!(
-            "/System/Library/Frameworks/{leaf}.framework/Versions/{version}/{leaf}"
-        ));
-        out.push(format!(
-            "/System/Library/Frameworks/{leaf}.framework/{leaf}"
-        ));
+        let dir = framework_dir(leaf);
+        out.push(format!("{dir}/{leaf}.framework/Versions/{version}/{leaf}"));
+        out.push(format!("{dir}/{leaf}.framework/{leaf}"));
         out.push(leaf.to_string());
     }
     out
@@ -1135,9 +1155,9 @@ mod tests {
             for leaf in std::iter::once(framework.leaf).chain(framework.umbrellas.iter().copied()) {
                 assert!(paths.iter().any(|p| p == leaf), "{leaf}");
                 assert!(
-                    paths.iter().any(
-                        |p| p == &format!("/System/Library/Frameworks/{leaf}.framework/{leaf}")
-                    ),
+                    paths
+                        .iter()
+                        .any(|p| p == &format!("{}/{leaf}.framework/{leaf}", framework_dir(leaf))),
                     "{leaf}: the install name"
                 );
             }
