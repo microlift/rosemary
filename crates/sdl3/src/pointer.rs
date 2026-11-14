@@ -153,7 +153,7 @@ impl Lifted {
 
 /// `SDL_HINT_VIDEO_WAYLAND_SCALE_TO_DISPLAY`: window coordinates are then
 /// buffer pixels, which SDL divides by a scale it does not publish.
-fn scales_to_display() -> bool {
+pub(crate) fn scales_to_display() -> bool {
     video::get_hint(c"SDL_VIDEO_WAYLAND_SCALE_TO_DISPLAY")
         .is_some_and(|value| !matches!(value.to_bytes(), b"0" | b"false" | b""))
 }

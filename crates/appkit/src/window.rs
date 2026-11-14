@@ -1500,7 +1500,9 @@ fn creation_flags(style_mask: usize, api: Api) -> u64 {
     // Room for the chrome's rounded corners. Only on Wayland: an X11 window
     // with alpha needs a compositing manager to be anything but black there,
     // and its GL and Vulkan visuals would pass the guest's alpha through.
-    if style_mask & style::TITLED != 0 && draws_own_titlebar() && sdl3::video::is_wayland() {
+    // The virtual desktop composites with alpha itself, whatever shows it.
+    let alpha = sdl3::video::is_wayland() || sdl3::desktop::active();
+    if style_mask & style::TITLED != 0 && draws_own_titlebar() && alpha {
         flags |= sdl3::video::flags::TRANSPARENT;
     }
     flags
@@ -2306,6 +2308,8 @@ fn order_front(receiver: Id, make_key: bool) {
     let window = window_of(receiver);
     let sdl = window.sdl;
     apply_style(receiver);
+    // Told again here: a window remade above has a new SDL window.
+    tell_desktop_level(window);
     // The frame again, now that the window is the kind it is going to be: a
     // popup made a moment ago was placed against whatever its parent's position
     // was then, and a toplevel remade as a popup was never placed at all.
@@ -2818,7 +2822,19 @@ unsafe extern "C" fn set_level(receiver: Id, _sel: Sel, level: isize) {
         "{receiver:p} level {} -> {level}",
         window_of(receiver).level
     );
-    window_of(receiver).level = level;
+    let window = window_of(receiver);
+    window.level = level;
+    tell_desktop_level(window);
+}
+
+/// Stacking by level is the window server's, which on the virtual desktop is
+/// this runtime's own and is told as a Mac's is.
+fn tell_desktop_level(window: &Window) {
+    if !window.sdl.is_null() {
+        // A `CGWindowLevel` is an `int32_t`.
+        let level = window.level.clamp(i32::MIN as isize, i32::MAX as isize) as i32;
+        sdl3::desktop::set_window_level(window.sdl, level);
+    }
 }
 
 unsafe extern "C" fn level(receiver: Id, _sel: Sel) -> isize {

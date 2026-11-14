@@ -83,7 +83,7 @@ pub trait Wire: Sized {
     fn take(input: &mut Decoder<'_>) -> Result<Self, Malformed>;
 }
 
-macro_rules! integer {
+macro_rules! number {
     ($($ty:ty),*) => {$(
         impl Wire for $ty {
             fn put(&self, out: &mut Encoder) {
@@ -97,7 +97,7 @@ macro_rules! integer {
     )*};
 }
 
-integer!(u8, u16, u32, u64, i8, i16, i32, i64);
+number!(u8, u16, u32, u64, i8, i16, i32, i64, f32);
 
 impl Wire for bool {
     fn put(&self, out: &mut Encoder) {

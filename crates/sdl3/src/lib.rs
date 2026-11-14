@@ -4,6 +4,7 @@ use std::ffi::{CStr, CString, c_char, c_int, c_void};
 use std::sync::OnceLock;
 
 pub mod compositor;
+pub mod desktop;
 #[cfg(any(test, feature = "test-support"))]
 pub mod isolated;
 pub mod keycodes;
@@ -86,6 +87,60 @@ pub struct Rect {
 }
 
 impl Rect {
+    pub fn is_empty(self) -> bool {
+        self.w <= 0 || self.h <= 0
+    }
+
+    pub fn contains(self, x: c_int, y: c_int) -> bool {
+        x >= self.x && y >= self.y && x - self.x < self.w && y - self.y < self.h
+    }
+
+    /// What both rectangles cover, empty when they do not meet.
+    pub fn intersection(self, other: Rect) -> Rect {
+        let x = self.x.max(other.x);
+        let y = self.y.max(other.y);
+        let right = self
+            .x
+            .saturating_add(self.w)
+            .min(other.x.saturating_add(other.w));
+        let bottom = self
+            .y
+            .saturating_add(self.h)
+            .min(other.y.saturating_add(other.h));
+        Rect {
+            x,
+            y,
+            w: (right - x).max(0),
+            h: (bottom - y).max(0),
+        }
+    }
+
+    /// The smallest rectangle holding both; an empty one adds nothing.
+    pub fn bounding(self, other: Rect) -> Rect {
+        if self.is_empty() {
+            return other;
+        }
+        if other.is_empty() {
+            return self;
+        }
+        let x = self.x.min(other.x);
+        let y = self.y.min(other.y);
+        let right = self
+            .x
+            .saturating_add(self.w)
+            .max(other.x.saturating_add(other.w));
+        let bottom = self
+            .y
+            .saturating_add(self.h)
+            .max(other.y.saturating_add(other.h));
+        Rect {
+            x,
+            y,
+            w: right - x,
+            h: bottom - y,
+        }
+    }
+
     /// The parts of a `width` by `height` surface outside this rectangle:
     /// full-height columns left and right, then the strips above and below
     /// between them. Every mask and blackout uses these, so they agree on
@@ -225,11 +280,13 @@ struct Api {
     SDL_GetWindowFromID: Option<unsafe extern "C" fn(u32) -> Window>,
     SDL_GetWindowFlags: Option<unsafe extern "C" fn(Window) -> u64>,
     SDL_SetWindowIcon: Option<unsafe extern "C" fn(Window, *mut c_void) -> bool>,
+    SDL_SetWindowShape: Option<unsafe extern "C" fn(Window, *mut c_void) -> bool>,
     SDL_CreateSurfaceFrom:
         Option<unsafe extern "C" fn(c_int, c_int, u32, *mut c_void, c_int) -> *mut c_void>,
     SDL_DestroySurface: Option<unsafe extern "C" fn(*mut c_void)>,
     SDL_GetWindowSurface: Option<unsafe extern "C" fn(Window) -> *mut Surface>,
     SDL_UpdateWindowSurface: Option<unsafe extern "C" fn(Window) -> bool>,
+    SDL_UpdateWindowSurfaceRects: Option<unsafe extern "C" fn(Window, *const Rect, c_int) -> bool>,
     SDL_LockSurface: Option<unsafe extern "C" fn(*mut Surface) -> bool>,
     SDL_UnlockSurface: Option<unsafe extern "C" fn(*mut Surface)>,
 
@@ -474,10 +531,12 @@ fn api() -> Option<&'static Api> {
             SDL_GetWindowFromID,
             SDL_GetWindowFlags,
             SDL_SetWindowIcon,
+            SDL_SetWindowShape,
             SDL_CreateSurfaceFrom,
             SDL_DestroySurface,
             SDL_GetWindowSurface,
             SDL_UpdateWindowSurface,
+            SDL_UpdateWindowSurfaceRects,
             SDL_LockSurface,
             SDL_UnlockSurface,
             SDL_Vulkan_LoadLibrary,
@@ -1169,6 +1228,9 @@ pub mod clipboard {
     use super::*;
 
     pub fn set_text(text: &[u8]) -> bool {
+        if let Some(done) = crate::desktop::set_clipboard(text) {
+            return done;
+        }
         let Ok(text) = CString::new(text) else {
             return false;
         };
@@ -1186,6 +1248,9 @@ pub mod clipboard {
     }
 
     pub fn text() -> Option<Vec<u8>> {
+        if let Some(text) = crate::desktop::clipboard() {
+            return text;
+        }
         let handle = library()?;
         // SAFETY: SDL3 declares this exact prototype.
         let get = unsafe {
@@ -1207,6 +1272,9 @@ pub mod clipboard {
     /// Whether SDL currently has a text payload. This distinguishes an empty
     /// desktop clipboard from an unavailable video/clipboard backend.
     pub fn has_text() -> Option<bool> {
+        if let Some(text) = crate::desktop::clipboard() {
+            return Some(text.is_some());
+        }
         let handle = library()?;
         // SAFETY: SDL3 declares this exact prototype.
         let has =
@@ -1695,10 +1763,19 @@ pub mod video {
         pub const NOT_FOCUSABLE: u64 = 0x0000_0000_8000_0000;
     }
 
+    /// `SDL_PixelFormat`, for the two a window's surface comes in.
+    pub mod pixel_format {
+        pub const XRGB8888: u32 = 0x1616_1804;
+        pub const ARGB8888: u32 = 0x1636_2004;
+    }
+
     /// The flags a window actually has, which is not always the set it was
     /// asked for: SDL clears `OPENGL` and sets `VULKAN` on a window converted
     /// by `SDL_Vulkan_CreateSurface`.
     pub fn window_flags(window: Window) -> u64 {
+        if let Some(flags) = crate::desktop::window_flags(window) {
+            return flags;
+        }
         let Some(f) = api().and_then(|a| a.SDL_GetWindowFlags) else {
             return 0;
         };
@@ -2021,20 +2098,32 @@ pub mod video {
     /// The next event, or `None` when the queue is empty.
     pub fn poll() -> Option<Event> {
         let poll = api()?.SDL_PollEvent?;
-        let mut raw = super::Event::default();
-        // Polling pumps, and dispatching configure and frame events can
-        // commit a window.
-        let commits = crate::compositor::guard();
-        // SAFETY: a writable event of SDL's own size.
-        let polled = unsafe { poll(&mut raw) };
-        drop(commits);
-        if !polled {
-            return None;
+        loop {
+            if let Some(event) = crate::desktop::take_event() {
+                return Some(event);
+            }
+            let mut raw = super::Event::default();
+            // Polling pumps, and dispatching configure and frame events can
+            // commit a window.
+            let commits = crate::compositor::guard();
+            // SAFETY: a writable event of SDL's own size.
+            let polled = unsafe { poll(&mut raw) };
+            drop(commits);
+            if !polled {
+                return None;
+            }
+            // An event about the desktop's host window is read back above as
+            // the events it made for the windows on it.
+            if let Some(event) = crate::desktop::route(translate(&raw)) {
+                return Some(event);
+            }
         }
-        Some(translate(&raw))
     }
 
     pub fn take_next_text() -> Option<String> {
+        if let Some(text) = crate::desktop::take_next_text() {
+            return text;
+        }
         let peep = api()?.SDL_PeepEvents?;
         let mut raw = super::Event::default();
         // SAFETY: room for one event; `SDL_PEEKEVENT` over every type.
@@ -2226,7 +2315,7 @@ pub mod video {
                     };
                     // SDL 3.4's Wayland and X11 backends forward cumulative
                     // native scales; Cocoa and the mobile backends send deltas.
-                    let scale = if is_wayland() || is_x11() {
+                    let scale = if host_is_wayland() || host_is_x11() {
                         PINCH_SCALES.with_borrow_mut(|scales| {
                             let previous = scales.entry(e.window).or_insert(1.0);
                             let delta = incremental_pinch_scale(previous, phase, e.scale);
@@ -2864,7 +2953,7 @@ pub mod video {
             instance: u64,
             library: Option<&CStr>,
         ) -> Option<u64> {
-            if !super::is_video_thread() {
+            if !super::is_video_thread() || crate::desktop::refuses_surface(window) {
                 return None;
             }
             let api = super::api()?;
@@ -2986,9 +3075,29 @@ pub mod video {
     ///
     /// The calling thread's GL context is kept; see [`keep_gl_context`].
     pub fn present_window(window: Window, body: impl FnOnce(&Presentation) -> bool) -> bool {
+        if !is_video_thread() {
+            return false;
+        }
+        let body = match crate::desktop::draw(window, body) {
+            Ok(drew) => return drew,
+            Err(body) => body,
+        };
         // SDL explicitly forbids mixing SDL_GetWindowSurface with Vulkan.
         // Losing the Vulkan WSI surface does not undo the conversion.
-        if !is_video_thread() || vulkan::owns_window(window) {
+        if vulkan::owns_window(window) {
+            return false;
+        }
+        present_native(window, None, body)
+    }
+
+    /// [`present_window`] on a window that is SDL's alone, showing only
+    /// `damage` of what was written when given one.
+    pub(crate) fn present_native(
+        window: Window,
+        damage: Option<Rect>,
+        body: impl FnOnce(&Presentation) -> bool,
+    ) -> bool {
+        if !is_video_thread() {
             return false;
         }
         // A window's store and a Metal layer read back for it present from
@@ -2996,7 +3105,7 @@ pub mod video {
         // can be current on only one of them at a time.
         static PRESENTING: std::sync::Mutex<()> = std::sync::Mutex::new(());
         let _presenting = PRESENTING.lock().unwrap_or_else(|e| e.into_inner());
-        keep_gl_context(|| present_window_surface(window, body))
+        keep_gl_context(|| present_window_surface(window, damage, body))
     }
 
     /// Run `f`, then put back the calling thread's GL context if SDL changed
@@ -3017,7 +3126,11 @@ pub mod video {
         result
     }
 
-    fn present_window_surface(window: Window, body: impl FnOnce(&Presentation) -> bool) -> bool {
+    fn present_window_surface(
+        window: Window,
+        damage: Option<Rect>,
+        body: impl FnOnce(&Presentation) -> bool,
+    ) -> bool {
         let Some(api) = api() else {
             return false;
         };
@@ -3058,8 +3171,12 @@ pub mod video {
         unsafe { unlock(surface) };
         drew && {
             let _commits = crate::compositor::guard();
-            // SAFETY: a window this crate created.
-            unsafe { update(window) }
+            match (damage, api.SDL_UpdateWindowSurfaceRects) {
+                // SAFETY: a window this crate created and one live rectangle.
+                (Some(damage), Some(update_rects)) => unsafe { update_rects(window, &damage, 1) },
+                // SAFETY: a window this crate created.
+                _ => unsafe { update(window) },
+            }
         }
     }
 
@@ -3232,19 +3349,52 @@ pub mod video {
         if !init_video() {
             return None;
         }
+        let window = match crate::desktop::active() {
+            true => crate::desktop::create_window(title, width, height, flags, None)?,
+            false => create_native_window(title, width, height, flags)?,
+        };
+        register_live_window(window, None);
+        Some(window)
+    }
+
+    /// A window of SDL's own, which the desktop's host window and the
+    /// never-shown windows behind the ones on it are too.
+    pub(crate) fn create_native_window(
+        title: &CStr,
+        width: i32,
+        height: i32,
+        flags: u64,
+    ) -> Option<Window> {
         let create = api()?.SDL_CreateWindow?;
         // SAFETY: a NUL-terminated title and SDL's own flags.
         let window = unsafe { create(title.as_ptr(), width, height, flags) };
         if window.is_null() {
             return None;
         }
-        register_live_window(window, None);
         // Before the first warp: `crate::pointer` needs to know where the
         // pointer is, and the watch's seats arrive a roundtrip later.
         if let Some((display, _)) = wayland_surface(window) {
             crate::wayland::watch(display);
         }
         Some(window)
+    }
+
+    /// `SDL_DestroyWindow` on a window no table here knows of yet.
+    pub(crate) fn destroy_native_window(window: Window) {
+        if let Some(f) = api().and_then(|a| a.SDL_DestroyWindow) {
+            // SAFETY: a window this crate created and handed to nobody.
+            unsafe { f(window) };
+        }
+    }
+
+    /// `SDL_SetWindowParent`, which is also what has SDL destroy `window`
+    /// with `parent`.
+    pub(crate) fn set_native_parent(window: Window, parent: Window) -> bool {
+        let Some(f) = api().and_then(|a| a.SDL_SetWindowParent) else {
+            return false;
+        };
+        // SAFETY: two windows this crate created.
+        unsafe { f(window, parent) }
     }
 
     pub fn create_popup_window(
@@ -3266,9 +3416,18 @@ pub mod video {
         {
             return None;
         }
-        // SAFETY: the live registry prevents logical parent teardown until
-        // the child has been inserted.
-        let window = unsafe { create(parent, offset_x, offset_y, width, height, flags) };
+        let window = match crate::desktop::active() {
+            true => crate::desktop::create_window(
+                c"",
+                width,
+                height,
+                flags,
+                Some((parent, offset_x, offset_y)),
+            )?,
+            // SAFETY: the live registry prevents logical parent teardown until
+            // the child has been inserted.
+            false => unsafe { create(parent, offset_x, offset_y, width, height, flags) },
+        };
         if window.is_null() {
             return None;
         }
@@ -3314,11 +3473,17 @@ pub mod video {
             .expect("checked live child")
             .parent = Some(parent as usize);
         drop(live);
+        if let Some(done) = crate::desktop::set_window_modal_for(window, parent) {
+            return done;
+        }
         unsafe { set_modal(window, true) }
     }
 
     /// The window a popup is positioned against, or null for a toplevel.
     pub fn window_parent(window: Window) -> Window {
+        if let Some(parent) = crate::desktop::window_parent(window) {
+            return parent;
+        }
         match api().and_then(|a| a.SDL_GetWindowParent) {
             // SAFETY: a window this crate created.
             Some(f) => unsafe { f(window) },
@@ -3328,9 +3493,13 @@ pub mod video {
 
     /// One-argument window calls that answer whether they worked.
     macro_rules! window_call {
-        ($($name:ident => $entry:ident),* $(,)?) => {
+        ($($name:ident => $entry:ident, $desktop:expr);* $(;)?) => {
             $(
                 pub fn $name(window: Window) -> bool {
+                    let on_desktop: fn(Window) -> Option<bool> = $desktop;
+                    if let Some(done) = on_desktop(window) {
+                        return done;
+                    }
                     let Some(f) = api().and_then(|a| a.$entry) else {
                         return false;
                     };
@@ -3343,9 +3512,14 @@ pub mod video {
 
     /// [`window_call`]s that change what [`presentation_window`] reports.
     macro_rules! window_state_call {
-        ($($name:ident => $entry:ident),* $(,)?) => {
+        ($($name:ident => $entry:ident, $desktop:expr);* $(;)?) => {
             $(
                 pub fn $name(window: Window) -> bool {
+                    let on_desktop: fn(Window) -> Option<bool> = $desktop;
+                    if let Some(done) = on_desktop(window) {
+                        resample_presentation_window(window);
+                        return done;
+                    }
                     let Some(f) = api().and_then(|a| a.$entry) else {
                         return false;
                     };
@@ -3360,19 +3534,24 @@ pub mod video {
         };
     }
 
+    // Each with what the desktop does for a window of its own.
     window_state_call! {
-        show_window => SDL_ShowWindow,
-        hide_window => SDL_HideWindow,
+        show_window => SDL_ShowWindow, crate::desktop::show_window;
+        hide_window => SDL_HideWindow, crate::desktop::hide_window;
+        // The desktop has nowhere to keep a minimized window, and says so.
         minimize_window => SDL_MinimizeWindow,
+            |window| crate::desktop::owns(window).then_some(false);
         maximize_window => SDL_MaximizeWindow,
+            |window| crate::desktop::set_window_covering(window, flags::MAXIMIZED, true);
         restore_window => SDL_RestoreWindow,
+            |window| crate::desktop::set_window_covering(window, flags::MAXIMIZED, false);
     }
 
     window_call! {
-        raise_window => SDL_RaiseWindow,
-        start_text_input => SDL_StartTextInput,
-        stop_text_input => SDL_StopTextInput,
-        text_input_active => SDL_TextInputActive,
+        raise_window => SDL_RaiseWindow, |window| crate::desktop::raise_window(window, true);
+        start_text_input => SDL_StartTextInput, crate::desktop::start_text_input;
+        stop_text_input => SDL_StopTextInput, crate::desktop::stop_text_input;
+        text_input_active => SDL_TextInputActive, crate::desktop::text_input_active;
     }
 
     /// `SDL_GL_SwapWindow`: present `window`'s back buffer.
@@ -3390,6 +3569,9 @@ pub mod video {
     /// SDL measures both in window coordinates, not drawable pixels. `cursor`
     /// is the horizontal offset from the area's left edge.
     pub fn set_text_input_area(window: Window, area: Rect, cursor: i32) -> bool {
+        if let Some(done) = crate::desktop::set_text_input_area(window, area, cursor) {
+            return done;
+        }
         let Some(f) = api().and_then(|a| a.SDL_SetTextInputArea) else {
             return false;
         };
@@ -3414,6 +3596,7 @@ pub mod video {
         let pending = vulkan::forget_window_family(window, &family);
         for member in family {
             forget_cached_window_refresh_rate(member);
+            crate::desktop::destroyed(member);
         }
         vulkan::service_surface_requests();
         if !pending {
@@ -3495,6 +3678,84 @@ pub mod video {
         ok
     }
 
+    /// Whether [`set_window_input_region`] can do what it says on this host.
+    pub(crate) fn has_window_input_regions() -> bool {
+        match host_is_wayland() {
+            // SDL divides window coordinates by a scale it does not publish.
+            true => !crate::pointer::scales_to_display(),
+            false => host_is_x11(),
+        }
+    }
+
+    /// Take pointer input on `window` only inside `rects`, in its
+    /// coordinates: what lands anywhere else goes to whatever the host has
+    /// under the window. The window must have been made
+    /// [`flags::TRANSPARENT`].
+    ///
+    /// False when it was not done, which on Wayland includes the time before
+    /// the first turn of the event pump.
+    pub(crate) fn set_window_input_region(window: Window, rects: &[Rect]) -> bool {
+        // SDL shapes no Wayland window, so there the surface is asked.
+        if !has_window_input_regions() {
+            return false;
+        }
+        if host_is_wayland() {
+            return wayland_surface(window)
+                .is_some_and(|(_, surface)| crate::wayland::set_input_region(surface, rects));
+        }
+        let Some((width, height)) = window_size(window).filter(|(w, h)| *w > 0 && *h > 0) else {
+            return false;
+        };
+        let Some(api) = api() else {
+            return false;
+        };
+        let (Some(create), Some(set), Some(destroy)) = (
+            api.SDL_CreateSurfaceFrom,
+            api.SDL_SetWindowShape,
+            api.SDL_DestroySurface,
+        ) else {
+            return false;
+        };
+        // SDL takes input wherever the shape is not fully transparent.
+        const BYTES_PER_PIXEL: usize = 4;
+        const TAKEN: u8 = 0xff;
+        let pitch = width as usize * BYTES_PER_PIXEL;
+        let mut pixels = vec![0u8; pitch * height as usize];
+        let whole = Rect {
+            x: 0,
+            y: 0,
+            w: width,
+            h: height,
+        };
+        let inside = rects.iter().map(|rect| rect.intersection(whole));
+        for rect in inside.filter(|rect| !rect.is_empty()) {
+            for row in rect.y..rect.y + rect.h {
+                let start = row as usize * pitch + rect.x as usize * BYTES_PER_PIXEL;
+                pixels[start..start + rect.w as usize * BYTES_PER_PIXEL].fill(TAKEN);
+            }
+        }
+        // SAFETY: the buffer is `pitch * height` bytes, as the format and
+        // pitch say, and outlives the surface, which borrows it.
+        let surface = unsafe {
+            create(
+                width,
+                height,
+                pixel_format::ARGB8888,
+                pixels.as_mut_ptr().cast(),
+                pitch as c_int,
+            )
+        };
+        if surface.is_null() {
+            return false;
+        }
+        // SAFETY: a window this crate created and a surface just made, of
+        // which SDL takes its own copy.
+        let ok = unsafe { set(window, surface) };
+        // SAFETY: as above.
+        unsafe { destroy(surface) };
+        ok
+    }
+
     /// The small integer SDL puts in an event to name a window.
     pub fn window_id(window: Window) -> u32 {
         let Some(f) = api().and_then(|a| a.SDL_GetWindowID) else {
@@ -3531,6 +3792,9 @@ pub mod video {
     }
 
     pub fn window_size(window: Window) -> Option<(i32, i32)> {
+        if let Some(size) = crate::desktop::window_size(window) {
+            return Some(size);
+        }
         let f = api()?.SDL_GetWindowSize?;
         let (mut w, mut h) = (0, 0);
         // SAFETY: a window and two writable ints.
@@ -3538,16 +3802,24 @@ pub mod video {
     }
 
     pub fn set_window_size(window: Window, width: i32, height: i32) -> bool {
-        let Some(f) = api().and_then(|a| a.SDL_SetWindowSize) else {
-            return false;
+        let done = match crate::desktop::set_window_size(window, width, height) {
+            Some(done) => done,
+            None => {
+                let Some(f) = api().and_then(|a| a.SDL_SetWindowSize) else {
+                    return false;
+                };
+                // SAFETY: a window this crate created.
+                unsafe { f(window, width, height) }
+            }
         };
-        // SAFETY: a window this crate created.
-        let done = unsafe { f(window, width, height) };
         resample_presentation_window(window);
         done
     }
 
     pub fn window_size_in_pixels(window: Window) -> Option<(i32, i32)> {
+        if let Some(size) = crate::desktop::window_size_in_pixels(window) {
+            return Some(size);
+        }
         let f = api()?.SDL_GetWindowSizeInPixels?;
         let (mut w, mut h) = (0, 0);
         // SAFETY: a window and two writable ints.
@@ -3555,6 +3827,9 @@ pub mod video {
     }
 
     pub fn window_position(window: Window) -> Option<(i32, i32)> {
+        if let Some(position) = crate::desktop::window_position(window) {
+            return Some(position);
+        }
         let f = api()?.SDL_GetWindowPosition?;
         let (mut x, mut y) = (0, 0);
         // SAFETY: a window and two writable ints.
@@ -3562,11 +3837,16 @@ pub mod video {
     }
 
     pub fn set_window_position(window: Window, x: i32, y: i32) -> bool {
-        let Some(f) = api().and_then(|a| a.SDL_SetWindowPosition) else {
-            return false;
+        let done = match crate::desktop::set_window_position(window, x, y) {
+            Some(done) => done,
+            None => {
+                let Some(f) = api().and_then(|a| a.SDL_SetWindowPosition) else {
+                    return false;
+                };
+                // SAFETY: a window this crate created.
+                unsafe { f(window, x, y) }
+            }
         };
-        // SAFETY: a window this crate created.
-        let done = unsafe { f(window, x, y) };
         resample_presentation_window(window);
         done
     }
@@ -3577,6 +3857,9 @@ pub mod video {
     /// which is a thing a caller has to be able to tell: AppKit's alpha is a
     /// property that reads back whatever was set, and this is not.
     pub fn set_window_opacity(window: Window, opacity: f32) -> bool {
+        if let Some(done) = crate::desktop::set_window_opacity(window, opacity) {
+            return done;
+        }
         let Some(f) = api().and_then(|a| a.SDL_SetWindowOpacity) else {
             return false;
         };
@@ -3587,6 +3870,9 @@ pub mod video {
     /// The window's opacity, or `None` when SDL cannot say - it answers a
     /// negative number for a window it has no opacity for.
     pub fn window_opacity(window: Window) -> Option<f32> {
+        if let Some(opacity) = crate::desktop::window_opacity(window) {
+            return Some(opacity);
+        }
         let f = api()?.SDL_GetWindowOpacity?;
         // SAFETY: a window this crate created.
         let opacity = unsafe { f(window) };
@@ -3594,6 +3880,10 @@ pub mod video {
     }
 
     pub fn set_window_fullscreen(window: Window, on: bool) -> bool {
+        if let Some(done) = crate::desktop::set_window_covering(window, flags::FULLSCREEN, on) {
+            resample_presentation_window(window);
+            return done;
+        }
         let Some(f) = api().and_then(|a| a.SDL_SetWindowFullscreen) else {
             return false;
         };
@@ -3611,17 +3901,25 @@ pub mod video {
     /// A guest that draws its own title bar - which is what a toolkit does for
     /// a borderless window - gets two of them without this.
     pub fn set_window_bordered(window: Window, on: bool) -> bool {
-        let Some(f) = api().and_then(|a| a.SDL_SetWindowBordered) else {
-            return false;
+        let done = match crate::desktop::set_window_flag(window, flags::BORDERLESS, !on) {
+            Some(done) => done,
+            None => {
+                let Some(f) = api().and_then(|a| a.SDL_SetWindowBordered) else {
+                    return false;
+                };
+                // SAFETY: a window this crate created.
+                unsafe { f(window, on) }
+            }
         };
-        // SAFETY: a window this crate created.
-        let done = unsafe { f(window, on) };
         resample_presentation_window(window);
         done
     }
 
     /// `SDL_SetWindowMinimumSize`, in window coordinates.
     pub fn set_window_minimum_size(window: Window, width: i32, height: i32) -> bool {
+        if let Some(done) = crate::desktop::set_window_minimum_size(window, width, height) {
+            return done;
+        }
         let Some(f) = api().and_then(|a| a.SDL_SetWindowMinimumSize) else {
             return false;
         };
@@ -3632,6 +3930,10 @@ pub mod video {
     /// `SDL_ShowWindowSystemMenu`: the window manager's own menu for the
     /// window, at a point in window coordinates.
     pub fn show_window_system_menu(window: Window, x: i32, y: i32) -> bool {
+        // The desktop is the window manager there, and has no menu of its own.
+        if crate::desktop::owns(window) {
+            return false;
+        }
         let Some(f) = api().and_then(|a| a.SDL_ShowWindowSystemMenu) else {
             return false;
         };
@@ -3671,6 +3973,9 @@ pub mod video {
     /// `SDL_SetWindowHitTest`: let the window manager move and resize a
     /// borderless window from regions `callback` names, or stop with `None`.
     pub fn set_window_hit_test(window: Window, callback: Option<HitTest>) -> bool {
+        if let Some(done) = crate::desktop::set_window_hit_test(window, callback) {
+            return done;
+        }
         let Some(f) = api().and_then(|a| a.SDL_SetWindowHitTest) else {
             return false;
         };
@@ -3680,6 +3985,9 @@ pub mod video {
     }
 
     pub fn set_window_always_on_top(window: Window, on: bool) -> bool {
+        if let Some(done) = crate::desktop::set_window_flag(window, flags::ALWAYS_ON_TOP, on) {
+            return done;
+        }
         let Some(f) = api().and_then(|a| a.SDL_SetWindowAlwaysOnTop) else {
             return false;
         };
@@ -3688,6 +3996,9 @@ pub mod video {
     }
 
     pub fn set_window_focusable(window: Window, on: bool) -> bool {
+        if let Some(done) = crate::desktop::set_window_flag(window, flags::NOT_FOCUSABLE, !on) {
+            return done;
+        }
         let Some(f) = api().and_then(|a| a.SDL_SetWindowFocusable) else {
             return false;
         };
@@ -3696,6 +4007,9 @@ pub mod video {
     }
 
     pub fn set_window_resizable(window: Window, on: bool) -> bool {
+        if let Some(done) = crate::desktop::set_window_flag(window, flags::RESIZABLE, on) {
+            return done;
+        }
         let Some(f) = api().and_then(|a| a.SDL_SetWindowResizable) else {
             return false;
         };
@@ -3708,6 +4022,9 @@ pub mod video {
     /// One when SDL cannot say: a scale of zero would divide a window's size to
     /// nothing, and a guest sizing a framebuffer by it would ask for none.
     pub fn window_pixel_density(window: Window) -> f32 {
+        if let Some(density) = crate::desktop::window_pixel_density(window) {
+            return density;
+        }
         let Some(f) = api().and_then(|a| a.SDL_GetWindowPixelDensity) else {
             return 1.0;
         };
@@ -3746,6 +4063,10 @@ pub mod video {
     }
 
     pub fn gl_create_context(window: Window) -> Option<GlContext> {
+        // Never made for OpenGL: the desktop refuses such a window.
+        if crate::desktop::owns(window) {
+            return None;
+        }
         let create = api()?.SDL_GL_CreateContext?;
         // SAFETY: a window created with `flags::OPENGL`.
         let context = unsafe { create(window) };
@@ -4087,6 +4408,10 @@ pub mod video {
         // SAFETY: SDL allocated it.
         unsafe { free(ids as *mut c_void) };
         let primary = primary_display();
+        // The desktop is the one screen there is, under the primary's id.
+        if crate::desktop::active() {
+            return vec![primary];
+        }
         if let Some(at) = out.iter().position(|id| *id == primary) {
             out.swap(0, at);
         }
@@ -4094,6 +4419,14 @@ pub mod video {
     }
 
     pub fn display_bounds(display: u32) -> Option<Rect> {
+        if let Some(bounds) = crate::desktop::bounds() {
+            return Some(bounds);
+        }
+        native_display_bounds(display)
+    }
+
+    /// The host's display, whatever the desktop is.
+    pub(crate) fn native_display_bounds(display: u32) -> Option<Rect> {
         let f = api()?.SDL_GetDisplayBounds?;
         let mut rect = Rect::default();
         // SAFETY: a display id and a writable rect.
@@ -4101,6 +4434,10 @@ pub mod video {
     }
 
     pub fn display_usable_bounds(display: u32) -> Option<Rect> {
+        // Nothing of the host's takes room on the desktop.
+        if let Some(bounds) = crate::desktop::bounds() {
+            return Some(bounds);
+        }
         let f = api()?.SDL_GetDisplayUsableBounds?;
         let mut rect = Rect::default();
         // SAFETY: a display id and a writable rect.
@@ -4752,7 +5089,16 @@ pub mod video {
         // SAFETY: a display id.
         let mode = unsafe { f(display) };
         // SAFETY: SDL's own mode record, valid until the display changes.
-        (!mode.is_null()).then(|| unsafe { *mode })
+        (!mode.is_null()).then(|| on_desktop(unsafe { *mode }))
+    }
+
+    /// `mode` at the virtual desktop's size, which is the one size its
+    /// screen has; unchanged without a desktop.
+    fn on_desktop(mut mode: DisplayMode) -> DisplayMode {
+        if let Some(bounds) = crate::desktop::bounds() {
+            (mode.w, mode.h) = (bounds.w, bounds.h);
+        }
+        mode
     }
 
     /// The mode `display` is showing now, copied out of SDL's record: the
@@ -4762,11 +5108,14 @@ pub mod video {
         // SAFETY: a display id.
         let mode = unsafe { f(display) };
         // SAFETY: SDL's own mode record, valid until the display changes.
-        (!mode.is_null()).then(|| unsafe { *mode })
+        (!mode.is_null()).then(|| on_desktop(unsafe { *mode }))
     }
 
     /// The display most of `window` is on, or `None` when SDL cannot say.
     pub fn display_for_window(window: Window) -> Option<u32> {
+        if crate::desktop::owns(window) {
+            return Some(primary_display());
+        }
         let f = api()?.SDL_GetDisplayForWindow?;
         // SAFETY: a window this crate created.
         let display = unsafe { f(window) };
@@ -4789,6 +5138,10 @@ pub mod video {
 
     /// Every fullscreen mode SDL lists for `display`, largest first.
     pub fn fullscreen_modes(display: u32) -> Vec<DisplayMode> {
+        // A virtual screen has the one mode, and no other to switch to.
+        if crate::desktop::active() {
+            return desktop_mode(display).into_iter().collect();
+        }
         let Some(api) = api() else {
             return Vec::new();
         };
@@ -4812,6 +5165,9 @@ pub mod video {
     }
 
     pub fn set_cursor_visible(visible: bool) -> bool {
+        if let Some(done) = crate::desktop::set_cursor_visible(visible) {
+            return done;
+        }
         let Some(api) = api() else {
             return false;
         };
@@ -4861,7 +5217,11 @@ pub mod video {
         let cursor = unsafe { create(surface, hot_x, hot_y) };
         // SAFETY: as above; SDL has taken its own copy by now.
         unsafe { destroy(surface) };
-        (!cursor.is_null()).then_some(cursor)
+        if cursor.is_null() {
+            return None;
+        }
+        crate::desktop::colour_cursor_made(cursor, (width, height), &pixels, (hot_x, hot_y));
+        Some(cursor)
     }
 
     /// `SDL_SystemCursor`, for [`create_system_cursor`].
@@ -4892,11 +5252,18 @@ pub mod video {
         let create = api()?.SDL_CreateSystemCursor?;
         // SAFETY: SDL rejects an id outside its enumeration with null.
         let cursor = unsafe { create(id) };
-        (!cursor.is_null()).then_some(cursor)
+        if cursor.is_null() {
+            return None;
+        }
+        crate::desktop::system_cursor_made(cursor, id);
+        Some(cursor)
     }
 
     /// Show `cursor`, or the desktop's own when it is null.
     pub fn set_cursor(cursor: Cursor) -> bool {
+        if let Some(done) = crate::desktop::set_cursor(cursor) {
+            return done;
+        }
         let Some(api) = api() else {
             return false;
         };
@@ -4922,6 +5289,7 @@ pub mod video {
     /// `cursor` must come from [`create_color_cursor`] and not be destroyed
     /// twice.
     pub unsafe fn destroy_cursor(cursor: Cursor) {
+        crate::desktop::cursor_destroyed(cursor);
         let Some(f) = api().and_then(|a| a.SDL_DestroyCursor) else {
             return;
         };
@@ -4930,6 +5298,9 @@ pub mod video {
 
     /// Which modifier keys are held right now, as `SDL_Keymod` bits.
     pub fn keyboard_modifiers() -> u16 {
+        if let Some(modifiers) = crate::desktop::modifiers() {
+            return modifiers;
+        }
         api()
             .and_then(|a| a.SDL_GetModState)
             .map_or(0, |f| unsafe { f() })
@@ -4947,6 +5318,9 @@ pub mod video {
 
     /// The pointer in desktop coordinates, and which buttons are down.
     pub fn global_mouse_state() -> Option<(f32, f32, u32)> {
+        if let Some(state) = crate::desktop::global_mouse_state() {
+            return Some(state);
+        }
         let f = api()?.SDL_GetGlobalMouseState?;
         let (mut x, mut y) = (0.0, 0.0);
         // SAFETY: two writable floats.
@@ -4956,6 +5330,9 @@ pub mod video {
 
     /// The pointer in the focused window's coordinates, and held buttons.
     pub fn mouse_state() -> Option<(f32, f32, u32)> {
+        if let Some(state) = crate::desktop::mouse_state() {
+            return Some(state);
+        }
         let f = api()?.SDL_GetMouseState?;
         let (mut x, mut y) = (0.0, 0.0);
         // SAFETY: two writable floats.
@@ -4964,6 +5341,9 @@ pub mod video {
     }
 
     pub fn warp_mouse_global(x: f32, y: f32) -> bool {
+        if let Some(done) = crate::desktop::warp_mouse_global(x, y) {
+            return done;
+        }
         let Some(f) = api().and_then(|a| a.SDL_WarpMouseGlobal) else {
             return false;
         };
@@ -4976,6 +5356,9 @@ pub mod video {
     /// Unlike the global spelling, SDL exposes no result, so `false` means
     /// only that the host SDL does not publish the function.
     pub fn warp_mouse_in_window(window: Window, x: f32, y: f32) -> bool {
+        if let Some(done) = crate::desktop::warp_mouse_in_window(window, x, y) {
+            return done;
+        }
         let Some(f) = api().and_then(|a| a.SDL_WarpMouseInWindow) else {
             return false;
         };
@@ -5006,13 +5389,25 @@ pub mod video {
 
     /// Whether SDL's video driver is Wayland's. False until video has
     /// started, as SDL has no driver to name before then.
+    ///
+    /// False on the virtual desktop too: a window there is placed, stacked
+    /// and given the pointer by the desktop, whatever shows the desktop.
     pub fn is_wayland() -> bool {
+        !crate::desktop::active() && host_is_wayland()
+    }
+
+    /// Whether the host's own windows are Wayland's.
+    pub(crate) fn host_is_wayland() -> bool {
         is_video_driver(c"wayland")
     }
 
     /// Whether SDL's video driver is X11's. Its window hit-test events
     /// report left-button presses rather than arbitrary hit tests.
     pub fn is_x11() -> bool {
+        !crate::desktop::active() && host_is_x11()
+    }
+
+    fn host_is_x11() -> bool {
         is_video_driver(c"x11")
     }
 
@@ -5053,6 +5448,10 @@ pub mod video {
 
     /// A window's `wl_display` and `wl_surface`, on Wayland.
     pub fn wayland_surface(window: Window) -> Option<(*mut c_void, *mut c_void)> {
+        // The surface behind a window on the desktop is never shown.
+        if crate::desktop::owns(window) {
+            return None;
+        }
         let api = api()?;
         let (props, get) = (api.SDL_GetWindowProperties?, api.SDL_GetPointerProperty?);
         // SAFETY: a window from SDL, and property names SDL documents.
@@ -5111,6 +5510,9 @@ pub mod video {
     /// Raise `window` without moving input focus to it, which is all
     /// `-orderFront:` does on a Mac.
     pub fn raise_window_keeping_focus(window: Window) {
+        if crate::desktop::raise_window(window, false).is_some() {
+            return;
+        }
         set_hint(HINT_ACTIVATE_WHEN_RAISED, c"0");
         raise_window(window);
         set_hint(HINT_ACTIVATE_WHEN_RAISED, c"1");
@@ -5133,6 +5535,9 @@ pub mod video {
     /// the call, which is a host too old for the mode rather than a failure to
     /// enter it.
     pub fn set_relative_mouse_mode(window: Window, enabled: bool) -> bool {
+        if let Some(done) = crate::desktop::set_relative_mouse_mode(window, enabled) {
+            return done;
+        }
         let Some(f) = api().and_then(|a| a.SDL_SetWindowRelativeMouseMode) else {
             return false;
         };
@@ -5145,6 +5550,9 @@ pub mod video {
     /// Keep the pointer inside `window` while it has focus, still moving and
     /// still reporting positions, or let it go.
     pub fn set_mouse_grab(window: Window, grabbed: bool) -> bool {
+        if let Some(done) = crate::desktop::set_mouse_grab(window, grabbed) {
+            return done;
+        }
         let Some(f) = api().and_then(|a| a.SDL_SetWindowMouseGrab) else {
             return false;
         };
@@ -5155,6 +5563,9 @@ pub mod video {
     /// Keep the pointer inside `rect` of `window` while it has focus, or
     /// anywhere in the window for `None`. In window coordinates.
     pub fn set_mouse_rect(window: Window, rect: Option<Rect>) -> bool {
+        if let Some(done) = crate::desktop::set_mouse_rect(window, rect) {
+            return done;
+        }
         let Some(f) = api().and_then(|a| a.SDL_SetWindowMouseRect) else {
             return false;
         };
@@ -5166,6 +5577,9 @@ pub mod video {
     /// The current pointer-confinement rectangle, if any. SDL owns the
     /// returned memory, so copy the rectangle before returning it to a caller.
     pub fn get_mouse_rect(window: Window) -> Option<Rect> {
+        if let Some(rect) = crate::desktop::get_mouse_rect(window) {
+            return rect;
+        }
         let f = api()?.SDL_GetWindowMouseRect?;
         // SAFETY: this is a valid SDL window, and the returned pointer, if
         // non-null, refers to SDL-owned memory valid through this call.
@@ -5175,6 +5589,9 @@ pub mod video {
     /// Whether `window` is holding the pointer, asked of SDL rather than
     /// remembered: SDL drops the mode itself when a window loses focus.
     pub fn relative_mouse_mode(window: Window) -> bool {
+        if let Some(on) = crate::desktop::relative_mouse_mode(window) {
+            return on;
+        }
         let Some(f) = api().and_then(|a| a.SDL_GetWindowRelativeMouseMode) else {
             return false;
         };

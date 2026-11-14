@@ -73,6 +73,19 @@ rosemary server --foreground   # run this prefix's server in the terminal
 rosemary server --stop         # ask this prefix's server to exit
 ```
 
+## The virtual desktop
+
+With `ROSEMARY_DESKTOP` set, the windows of every guest in a prefix are drawn
+into one host window, the way a Mac's window server draws every program's. The
+desktop is a process of its own, `rosemary desktop`, which the first guest to
+make a window starts with that guest's `ROSEMARY_DESKTOP` size; later guests
+join it whatever size they ask for. It exits a few seconds after the last guest
+has gone. It can also be run by hand, keeping its diagnostics in the terminal:
+
+```sh
+ROSEMARY_DESKTOP=1600x900 rosemary desktop --foreground
+```
+
 ## Environment variables
 
 
@@ -119,6 +132,7 @@ rosemary server --stop         # ask this prefix's server to exit
 | `ROSEMARY_SERVER_LINGER` | `5` | Seconds a process server stays up with no guest connected, so a shell running one short guest after another keeps one server rather than starting a new one each time. Fractions are accepted; `0` exits as soon as the last guest leaves. |
 | `ROSEMARY_DECORATIONS` | `client` | Who draws a titled window's titlebar. `client` draws a Mac-style titlebar (window buttons, title, and the application's menus) in the window itself, and keeps SDL from loading libdecor, whose GTK 3 plugin cannot share a process with the GTK 4 that WebKit loads. `server` leaves the titlebar to the host's window manager. Applies to the `builtin` AppKit on every host, including macOS with `ROSEMARY_OBJC=builtin`. |
 | `ROSEMARY_MENU` | `titlebar` (`client`), `strip` (`server`) | Where the application's main menu is shown. `titlebar` puts it in the titlebar after the window buttons; `strip` puts it in a row of its own under the titlebar, which is the only placement under `server` decorations; `none` shows no menus. Key equivalents work whichever is chosen. |
+| `ROSEMARY_DESKTOP` | unset | Show the windows of every guest of the prefix inside one host window, a virtual desktop, instead of one host window each. `fullscreen` makes the desktop the size of the display; `<width>x<height>` (for example `1600x900`) makes it a window of that size, in points. On the desktop Rosemary places, stacks, focuses, moves and resizes the guests' windows itself, so what a host's window system withholds from separate windows (Wayland gives a program neither its windows' positions nor a way to set them) works as on a Mac: global window frames, the global pointer position, window levels, child and docking windows. It is the guests' only screen. On Wayland and X11 the desktop is clear between the guests' windows and takes no pointer input there, so the host's own windows behind it are seen and used as usual (X11 needs a compositing window manager for the first, and a Wayland compositor may show nothing behind a `fullscreen` window, as the protocol asks of it); on any other host, and under `SDL_VIDEO_WAYLAND_SCALE_TO_DISPLAY`, it is an opaque grey that takes the clicks made on it. All guests of a prefix share one desktop (see [The virtual desktop](#the-virtual-desktop)); the first to make a window gives it its size. Windows drawn with OpenGL and Vulkan surfaces are refused (Metal presents through readback, as with `ROSEMARY_PRESENT_READBACK`), a window cannot be minimized, titlebars are always the `client` ones, and host file dialogs stay host windows. |
 | `ROSEMARY_COMMAND_KEY` | `super` | Which host key the guest sees as Command, everywhere it reads modifiers: key codes, `-modifierFlags` and Carbon's `GetCurrentKeyModifiers`. `super`, `ctrl` or `alt`; the key named takes Command's place and Super takes the role that key had, so `ctrl` swaps Control and Super and `alt` (Command where a Mac keyboard has it) swaps Option and Super. Add `+ctrl:<keys>` to also let Control stand in for Command in chords with those keys only, and stay Control everywhere else, for a program that reads Control as a key of its own: `<keys>` is `edit` (A, C, V, X, Y and Z: select all, copy, paste, cut, redo, undo) or a run of letters and digits, as in `super+ctrl:edit` or `super+ctrl:acvxyzs`. From the chord key until Control is let go, the guest sees Control released and Command held; any other key or a click pressed meanwhile gets Control back first. Meant for desktops that keep Super's letter chords for themselves, where Command-V never reaches the guest. Not with `ctrl`, where Control is Command already. The deprecated `ROSEMARY_SWAP_CTRL_CMD=1` still means `ctrl` when this is unset. |
 | `ROSEMARY_CONTROL_EDIT_KEYS` | unset | Shorthand for `ROSEMARY_COMMAND_KEY=super+ctrl:edit`: Control acts as Command in the editing shortcuts only. Ignored when `ROSEMARY_COMMAND_KEY` or `ROSEMARY_SWAP_CTRL_CMD` is set. Any value but `0` turns it on. |
 | `ROSEMARY_PLAIN_CTRL_CLICK` | `0` | Deliver a left click made with Control held as a plain left click, Control taken out of its `-modifierFlags`. Mac programs read Control-click as the secondary click, which on a PC turns every left click made while Control is held (crouch, in many games) into a right click; the right button is still a right click. Set to `0` to give the guest Control-clicks as a Mac would. |

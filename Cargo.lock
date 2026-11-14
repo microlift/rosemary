@@ -2831,6 +2831,8 @@ name = "sdl3"
 version = "0.5.0"
 dependencies = [
  "libc",
+ "server",
+ "starnix",
 ]
 
 [[package]]
