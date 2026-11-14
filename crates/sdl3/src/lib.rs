@@ -1228,6 +1228,9 @@ pub mod clipboard {
     use super::*;
 
     pub fn set_text(text: &[u8]) -> bool {
+        if let Some(done) = crate::desktop::set_clipboard(text) {
+            return done;
+        }
         let Ok(text) = CString::new(text) else {
             return false;
         };
@@ -1245,6 +1248,9 @@ pub mod clipboard {
     }
 
     pub fn text() -> Option<Vec<u8>> {
+        if let Some(text) = crate::desktop::clipboard() {
+            return text;
+        }
         let handle = library()?;
         // SAFETY: SDL3 declares this exact prototype.
         let get = unsafe {
@@ -1266,6 +1272,9 @@ pub mod clipboard {
     /// Whether SDL currently has a text payload. This distinguishes an empty
     /// desktop clipboard from an unavailable video/clipboard backend.
     pub fn has_text() -> Option<bool> {
+        if let Some(text) = crate::desktop::clipboard() {
+            return Some(text.is_some());
+        }
         let handle = library()?;
         // SAFETY: SDL3 declares this exact prototype.
         let has =
@@ -2112,6 +2121,9 @@ pub mod video {
     }
 
     pub fn take_next_text() -> Option<String> {
+        if let Some(text) = crate::desktop::take_next_text() {
+            return text;
+        }
         let peep = api()?.SDL_PeepEvents?;
         let mut raw = super::Event::default();
         // SAFETY: room for one event; `SDL_PEEKEVENT` over every type.
@@ -5153,6 +5165,9 @@ pub mod video {
     }
 
     pub fn set_cursor_visible(visible: bool) -> bool {
+        if let Some(done) = crate::desktop::set_cursor_visible(visible) {
+            return done;
+        }
         let Some(api) = api() else {
             return false;
         };
@@ -5202,7 +5217,11 @@ pub mod video {
         let cursor = unsafe { create(surface, hot_x, hot_y) };
         // SAFETY: as above; SDL has taken its own copy by now.
         unsafe { destroy(surface) };
-        (!cursor.is_null()).then_some(cursor)
+        if cursor.is_null() {
+            return None;
+        }
+        crate::desktop::colour_cursor_made(cursor, (width, height), &pixels, (hot_x, hot_y));
+        Some(cursor)
     }
 
     /// `SDL_SystemCursor`, for [`create_system_cursor`].
@@ -5233,11 +5252,18 @@ pub mod video {
         let create = api()?.SDL_CreateSystemCursor?;
         // SAFETY: SDL rejects an id outside its enumeration with null.
         let cursor = unsafe { create(id) };
-        (!cursor.is_null()).then_some(cursor)
+        if cursor.is_null() {
+            return None;
+        }
+        crate::desktop::system_cursor_made(cursor, id);
+        Some(cursor)
     }
 
     /// Show `cursor`, or the desktop's own when it is null.
     pub fn set_cursor(cursor: Cursor) -> bool {
+        if let Some(done) = crate::desktop::set_cursor(cursor) {
+            return done;
+        }
         let Some(api) = api() else {
             return false;
         };
@@ -5263,6 +5289,7 @@ pub mod video {
     /// `cursor` must come from [`create_color_cursor`] and not be destroyed
     /// twice.
     pub unsafe fn destroy_cursor(cursor: Cursor) {
+        crate::desktop::cursor_destroyed(cursor);
         let Some(f) = api().and_then(|a| a.SDL_DestroyCursor) else {
             return;
         };
@@ -5271,6 +5298,9 @@ pub mod video {
 
     /// Which modifier keys are held right now, as `SDL_Keymod` bits.
     pub fn keyboard_modifiers() -> u16 {
+        if let Some(modifiers) = crate::desktop::modifiers() {
+            return modifiers;
+        }
         api()
             .and_then(|a| a.SDL_GetModState)
             .map_or(0, |f| unsafe { f() })

@@ -32,8 +32,6 @@ pub fn pump(app: Id) {
     }
     crate::application::check_last_window_closed();
     crate::backing::pump();
-    // After every window has drawn: the virtual desktop shows them together.
-    sdl3::desktop::present();
 }
 
 /// Service SDL surface work and publication on the video thread. Both the
@@ -72,7 +70,6 @@ pub(crate) fn service_modal_presentation() {
     for hook in hooks {
         hook();
     }
-    sdl3::desktop::present();
 }
 
 /// Never keep a timer guard across guest callbacks or a nested event pump.

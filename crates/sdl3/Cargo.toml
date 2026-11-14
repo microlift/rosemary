@@ -7,6 +7,10 @@ license.workspace = true
 
 [dependencies]
 libc.workspace = true
+# The virtual desktop's host and its clients talk as the process server and
+# its guests do: over a private socket, in the same encoding.
+server.workspace = true
+starnix.workspace = true
 
 [features]
 # What the crates driving SDL in their own tests share.
