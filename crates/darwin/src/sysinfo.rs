@@ -93,12 +93,43 @@ unsafe extern "C" fn fpathconf(fd: i32, name: i32) -> i64 {
     }
 }
 
+/// Darwin's `confstr` names: POSIX's `_CS_PATH`, and the per-user temporary
+/// directory launchd makes for each user.
+const CS_PATH: i32 = 1;
+const CS_DARWIN_USER_TEMP_DIR: i32 = 65537;
+
+/// `size_t confstr(int name, char *buf, size_t len)`: the length the whole
+/// value needs, NUL included, with as much as fits copied into `buf`.
 unsafe extern "C" fn confstr(name: i32, out: *mut libc::c_char, len: usize) -> usize {
-    if name == 1 {
-        unsafe { libc::confstr(libc::_CS_PATH, out, len) }
-    } else {
-        crate::errno::set(libc::EINVAL);
-        0
+    match name {
+        CS_PATH => unsafe { libc::confstr(libc::_CS_PATH, out, len) },
+        // macOS sets `TMPDIR` from this very directory, so they agree.
+        CS_DARWIN_USER_TEMP_DIR => match crate::env::guest_value("TMPDIR") {
+            Some(dir) => {
+                let mut value = dir.into_encoded_bytes();
+                if !value.ends_with(b"/") {
+                    value.push(b'/');
+                }
+                value.push(0);
+                if len > 0 && !out.is_null() {
+                    let n = value.len().min(len);
+                    // SAFETY: the caller's buffer holds `len` bytes.
+                    unsafe {
+                        std::ptr::copy_nonoverlapping(value.as_ptr().cast(), out, n);
+                        *out.add(n - 1) = 0;
+                    }
+                }
+                value.len()
+            }
+            None => {
+                crate::errno::set(libc::EINVAL);
+                0
+            }
+        },
+        _ => {
+            crate::errno::set(libc::EINVAL);
+            0
+        }
     }
 }
 

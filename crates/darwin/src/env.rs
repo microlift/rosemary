@@ -215,7 +215,7 @@ pub unsafe fn hand_off(envp: *const *const c_char) -> Vec<CString> {
 /// In identity mode that is this host's, if it has one: with no prefix the
 /// guest's paths are this host's, and correcting them would only make them
 /// wrong.
-fn guest_value(name: &str) -> Option<std::ffi::OsString> {
+pub(crate) fn guest_value(name: &str) -> Option<std::ffi::OsString> {
     if prefix::ns::current().is_none() {
         return std::env::var_os(name);
     }
