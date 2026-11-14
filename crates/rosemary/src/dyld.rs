@@ -920,6 +920,7 @@ pub fn open(path: &str) -> std::result::Result<u64, String> {
     // A library this runtime *is* has no file, so this has to come before
     // anything that looks for one. See [`synthetic`].
     if let Some(library) = synthetic::find(path) {
+        open_reexports(library);
         return Ok(library.handle);
     }
     let resolved = resolve_path(path).ok_or_else(|| format!("no such file: {path}"))?;
@@ -945,6 +946,26 @@ pub fn open(path: &str) -> std::result::Result<u64, String> {
             Ok(handle)
         }
         None => Err("no execution backend is active".to_string()),
+    }
+}
+
+/// Load the real images `library` re-exports that nothing has loaded yet, as
+/// dyld loads an umbrella's re-exports with it. A library this runtime is is
+/// never unloaded, so neither are they.
+///
+/// A base without one is not an error, as it is not for the loader: its
+/// symbols stay unbound.
+fn open_reexports(library: &synthetic::Library) {
+    for &image in library.links.reexports {
+        if Scope::named(image).is_none()
+            && let Err(why) = open(image)
+            && crate::shims::vmmap::tracing()
+        {
+            eprintln!(
+                "rosemary: dlopen: {image}, re-exported by {}: {why}",
+                library.names[0]
+            );
+        }
     }
 }
 
