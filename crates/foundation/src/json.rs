@@ -587,6 +587,28 @@ unsafe extern "C" fn is_valid_json_object(_class: Id, _sel: Sel, object: Id) -> 
     is_container(root) && write(root, &mut Vec::new(), 0, 0).is_ok()
 }
 
+/// `+JSONObjectWithStream:options:error:`: the open stream read to its end,
+/// then parsed as `+JSONObjectWithData:options:error:` parses.
+unsafe extern "C" fn json_object_with_stream(
+    class: Id,
+    sel: Sel,
+    stream: Id,
+    options: usize,
+    error: *mut Id,
+) -> Id {
+    // SAFETY: a live object; the reader is type-checked.
+    let Some(bytes) = (unsafe { corefoundation::stream::read_to_end(stream as CFTypeRef, 0) })
+    else {
+        fail(error, "the stream is not an open, readable NSInputStream");
+        return std::ptr::null_mut();
+    };
+    let data = corefoundation::collections::new_data(bytes) as Id;
+    // SAFETY: an `NSData` of this runtime, and the caller's own arguments.
+    let object = unsafe { json_object_with_data(class, sel, data, options, error) };
+    objc::arc::release(data);
+    object
+}
+
 /// `+dataWithJSONObject:options:error:` under its older spelling, which takes a
 /// stream this runtime has no `NSOutputStream` for.
 unsafe extern "C" fn write_to_stream(
@@ -610,6 +632,7 @@ pub(crate) fn install() {
     class_methods!(class, {
         "dataWithJSONObject:options:error:" => data_with_json_object, c"@40@0:8@16Q24^@32";
         "JSONObjectWithData:options:error:" => json_object_with_data, c"@40@0:8@16Q24^@32";
+        "JSONObjectWithStream:options:error:" => json_object_with_stream, c"@40@0:8@16Q24^@32";
         "isValidJSONObject:" => is_valid_json_object, c"B24@0:8@16";
         "writeJSONObject:toStream:options:error:" => write_to_stream, c"q48@0:8@16^v24Q32^@40";
     });
@@ -664,6 +687,36 @@ mod tests {
             data as Id,
             options,
         )
+    }
+
+    #[test]
+    fn json_reads_from_an_input_stream() {
+        crate::bootstrap();
+        let source = br#"{"answer":42}"#;
+        let data = corefoundation::collections::new_data(source.to_vec()) as Id;
+        let class = objc::class::lookup(c"NSInputStream").expect("a class");
+        // SAFETY: `+inputStreamWithData:` is `id (Class, SEL, id)` and `-open`
+        // is `void (id, SEL)`.
+        let stream = unsafe {
+            let make: unsafe extern "C" fn(Id, Sel, Id) -> Id =
+                std::mem::transmute(objc::msg::entry());
+            let stream = make(
+                objc::class::ptr(class) as Id,
+                objc::sel::get("inputStreamWithData:"),
+                data,
+            );
+            let open: unsafe extern "C" fn(Id, Sel) = std::mem::transmute(objc::msg::entry());
+            open(stream, objc::sel::get("open"));
+            stream
+        };
+        let object = send3(
+            "NSJSONSerialization",
+            "JSONObjectWithStream:options:error:",
+            stream,
+            0,
+        );
+        assert!(!object.is_null());
+        assert_eq!(encode(object, 0), source);
     }
 
     /// The property the message bus depends on: whatever
