@@ -1695,6 +1695,14 @@ fn global_lookup(name: &str, mangled: &str) -> Option<u64> {
     {
         return Some(addr);
     }
+    // Then what it was linked with, in load order.
+    for image in PROGRAM_IMAGES.get().map(Vec::as_slice).unwrap_or_default() {
+        if let Some(export) = image.exports().and_then(|exports| exports.get(mangled))
+            && let Some(addr) = export.address(image.slide)
+        {
+            return Some(addr);
+        }
+    }
 
     // Then the libraries this runtime is.
     if let Some(addr) = crate::frameworks::symbol(name) {
