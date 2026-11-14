@@ -1179,6 +1179,13 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "da7c62ceae207dd37ea5b845da6a0696c799f85e97da1ab5b7910be3c1c80223"
 
 [[package]]
+name = "ffmpeg"
+version = "0.5.0"
+dependencies = [
+ "libc",
+]
+
+[[package]]
 name = "filetime"
 version = "0.2.29"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2010,6 +2017,7 @@ dependencies = [
 name = "mediabackend"
 version = "0.5.0"
 dependencies = [
+ "ffmpeg",
  "gstreamer",
  "gstreamer-app",
  "gstreamer-video",
@@ -3501,7 +3509,10 @@ version = "0.5.0"
 dependencies = [
  "corefoundation",
  "coremedia",
+ "corevideo",
  "exports",
+ "mediabackend",
+ "objc",
 ]
 
 [[package]]

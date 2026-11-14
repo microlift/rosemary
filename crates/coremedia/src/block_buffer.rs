@@ -32,6 +32,9 @@ pub struct CustomBlockSource {
 struct Allocation {
     memory: *mut u8,
     capacity: usize,
+    /// Whether `memory` is this module's to free. Memory lent with
+    /// `kCFAllocatorNull` as its block allocator is the caller's.
+    owned: bool,
 }
 
 // The backing pointer and all framework-mediated byte accesses are protected
@@ -56,7 +59,7 @@ impl Allocation {
 
 impl Drop for Allocation {
     fn drop(&mut self) {
-        if !self.memory.is_null() {
+        if self.owned && !self.memory.is_null() {
             // SAFETY: the last buffer retaining the allocation owns the free.
             unsafe { free(self.memory.cast()) };
         }
@@ -196,8 +199,11 @@ pub(crate) unsafe fn is_buffer(handle: *const c_void) -> bool {
     unsafe { storage(handle) }.is_some()
 }
 
-/// Creates a single-block buffer. Unsupported ambiguous raw-memory ownership
-/// is rejected: caller-owned memory and callback lifetimes are unsupported.
+/// Creates a single-block buffer. Caller memory is taken only with
+/// `kCFAllocatorNull` as its block allocator, which says nobody frees it: the
+/// caller keeps it alive and the buffer only reads and writes it. Memory some
+/// allocator should free at release, and custom block sources, whose
+/// callbacks are guest code, are refused.
 ///
 /// # Safety
 /// Output must be writable. Embedded callbacks are explicitly rejected
@@ -237,13 +243,35 @@ pub unsafe extern "C" fn CMBlockBufferCreateWithMemoryBlock(
         return BAD_LENGTH;
     }
     // Guest embedded CustomBlockSource callback pointers are not ABI-thunked.
-    // Reject borrowed external memory rather than guessing who releases it.
-    if !memory.is_null() || !custom_source.is_null() {
+    if !custom_source.is_null() {
         return BAD_CUSTOM_SOURCE;
     }
-    if block_allocator
-        == corefoundation::api::standard_allocator(corefoundation::api::StandardAllocator::Null)
-    {
+    let null_allocator =
+        corefoundation::api::standard_allocator(corefoundation::api::StandardAllocator::Null);
+    if !memory.is_null() {
+        // Memory another allocator is to free at release is refused rather
+        // than guessing whose heap it came from.
+        if block_allocator != null_allocator {
+            return BAD_CUSTOM_SOURCE;
+        }
+        let lent = Storage {
+            allocation: Arc::new(Mutex::new(Allocation {
+                memory: memory.cast(),
+                capacity: block_length,
+                owned: false,
+            })),
+            start: offset,
+            length,
+        };
+        let result = new_buffer(lent);
+        if result.is_null() {
+            return STRUCT_ALLOC_FAILED;
+        }
+        // SAFETY: out is a writable result slot.
+        unsafe { *out = result };
+        return 0;
+    }
+    if block_allocator == null_allocator {
         // NULL supplied memory necessarily requires backing allocation, which
         // the distinguished null allocator explicitly cannot provide.
         return ALLOC_FAILED;
@@ -255,6 +283,7 @@ pub unsafe extern "C" fn CMBlockBufferCreateWithMemoryBlock(
         allocation: Arc::new(Mutex::new(Allocation {
             memory: core::ptr::null_mut(),
             capacity: block_length,
+            owned: true,
         })),
         start: offset,
         length,
@@ -1518,6 +1547,66 @@ mod tests {
                 BAD_POINTER
             );
         }
+    }
+
+    #[test]
+    fn memory_lent_with_the_null_allocator_is_read_in_place_and_never_freed() {
+        use corefoundation::api::{StandardAllocator, standard_allocator};
+        let mut memory = *b"..abcd..";
+        let (mut lent, mut copy) = (core::ptr::null(), core::ptr::null());
+        unsafe {
+            assert_eq!(
+                CMBlockBufferCreateWithMemoryBlock(
+                    core::ptr::null(),
+                    memory.as_mut_ptr().cast(),
+                    memory.len(),
+                    standard_allocator(StandardAllocator::Null),
+                    core::ptr::null(),
+                    2,
+                    4,
+                    0,
+                    &mut lent,
+                ),
+                0
+            );
+            assert_eq!(CMBlockBufferGetDataLength(lent), 4);
+            let mut pointer = core::ptr::null_mut();
+            assert_eq!(
+                CMBlockBufferGetDataPointer(
+                    lent,
+                    0,
+                    core::ptr::null_mut(),
+                    core::ptr::null_mut(),
+                    &mut pointer
+                ),
+                0
+            );
+            assert_eq!(pointer.cast::<u8>(), memory.as_mut_ptr().add(2));
+            assert_eq!(
+                CMBlockBufferCreateContiguous(
+                    core::ptr::null(),
+                    lent,
+                    core::ptr::null(),
+                    core::ptr::null(),
+                    0,
+                    0,
+                    ALWAYS_COPY_DATA,
+                    &mut copy,
+                ),
+                0
+            );
+            corefoundation::api::CFRelease(lent);
+            memory.fill(b'x');
+            let mut bytes = [0u8; 4];
+            assert_eq!(
+                CMBlockBufferCopyDataBytes(copy, 0, 4, bytes.as_mut_ptr().cast()),
+                0
+            );
+            assert_eq!(&bytes, b"abcd", "the copy is its own");
+            corefoundation::api::CFRelease(copy);
+        }
+        // Still the caller's to use, and to drop.
+        assert_eq!(memory, *b"xxxxxxxx");
     }
 
     #[test]
