@@ -145,6 +145,108 @@ unsafe fn units(receiver: Id) -> Vec<u16> {
         .unwrap_or_default()
 }
 
+/// `NSStringEncodingConversionOptions`.
+mod conversion {
+    pub const ALLOW_LOSSY: usize = 1;
+    pub const EXTERNAL_REPRESENTATION: usize = 2;
+}
+
+/// What a lossy conversion writes for a character the encoding lacks, as
+/// Foundation's does.
+const LOSS_BYTE: u8 = b'?';
+
+/// `-_fastCStringContents:`: the characters in place when they are ASCII, which
+/// is how libswiftCore reads a bridged string without copying it. Null asks the
+/// caller to copy, which is always allowed.
+unsafe extern "C" fn fast_c_string_contents(
+    receiver: Id,
+    _sel: Sel,
+    _nul_terminated: i8,
+) -> *const c_char {
+    let s = receiver as CFTypeRef;
+    // SAFETY: an `NSString`; an 8-bit one keeps its characters NUL-terminated.
+    unsafe {
+        let ptr = api::CFStringGetCStringPtr(s, encoding::ASCII);
+        if ptr.is_null() {
+            return ptr;
+        }
+        let count = api::CFStringGetLength(s).max(0) as usize;
+        let bytes = std::slice::from_raw_parts(ptr as *const u8, count);
+        match bytes.is_ascii() {
+            true => ptr,
+            false => std::ptr::null(),
+        }
+    }
+}
+
+/// `-_fastCharacterContents`: the UTF-16 code units in place, or null.
+unsafe extern "C" fn fast_character_contents(receiver: Id, _sel: Sel) -> *const u16 {
+    unsafe { api::CFStringGetCharactersPtr(receiver as CFTypeRef) }
+}
+
+/// `-getBytes:maxLength:usedLength:encoding:options:range:remainingRange:`:
+/// `range` in `encoding`, as much as `max_length` bytes hold. A null `buffer`
+/// counts the bytes instead, whatever `max_length` says.
+///
+/// # Safety
+///
+/// `buffer` is null or covers `max_length` bytes; the out-parameters are null
+/// or writable.
+#[allow(clippy::too_many_arguments)]
+unsafe extern "C" fn get_bytes_in_range(
+    receiver: Id,
+    _sel: Sel,
+    buffer: *mut u8,
+    max_length: usize,
+    used_length: *mut usize,
+    ns_encoding: usize,
+    options: usize,
+    range: NSRange,
+    remaining: *mut NSRange,
+) -> bool {
+    let loss_byte = match options & conversion::ALLOW_LOSSY {
+        0 => 0,
+        _ => LOSS_BYTE,
+    };
+    let external = u8::from(options & conversion::EXTERNAL_REPRESENTATION != 0);
+    let mut used: corefoundation::base::CFIndex = 0;
+    // SAFETY: the caller's buffer and range, as this method's own contract.
+    let converted = unsafe {
+        api::CFStringGetBytes(
+            receiver as CFTypeRef,
+            range.location as corefoundation::base::CFIndex,
+            range.length as corefoundation::base::CFIndex,
+            cf_encoding(ns_encoding),
+            loss_byte,
+            external,
+            buffer,
+            max_length as corefoundation::base::CFIndex,
+            &mut used,
+        )
+    }
+    .max(0) as usize;
+    if !used_length.is_null() {
+        // SAFETY: a writable out-parameter.
+        unsafe { *used_length = used as usize };
+    }
+    if !remaining.is_null() {
+        // SAFETY: a writable out-parameter.
+        unsafe {
+            *remaining = NSRange {
+                location: range.location + converted,
+                length: range.length.saturating_sub(converted),
+            }
+        };
+    }
+    converted > 0
+}
+
+/// `-isNSString__`, which libswiftCore asks to tell an NSString from another
+/// object it was handed as one.
+unsafe extern "C" fn is_ns_string(_receiver: Id, _sel: Sel) -> i8 {
+    1
+}
+
 /// A new autoreleased string of `units[from..to]`, clamped to its length.
 fn unit_slice(units: &[u16], from: usize, to: usize) -> Id {
     let (from, to) = (from.min(units.len()), to.min(units.len()));
@@ -206,6 +308,27 @@ unsafe extern "C" fn string_with_utf8(_class: Id, _sel: Sel, cstr: *const c_char
     unsafe {
         let s = api::CFStringCreateWithCString(std::ptr::null(), cstr, encoding::UTF8);
         api::CFAutorelease(s) as Id
+    }
+}
+
+/// `+newTaggedNSStringWithASCIIBytes_:length_:`, which libswiftCore sends
+/// `__StringStorage` (an NSString subclass once Foundation is loaded) to bridge
+/// a small ASCII `String`. The answer is owned by the caller, or nil.
+///
+/// FIXME (ACCURACY): Apple's answers a tagged pointer, and nil for what does not
+/// fit one; this answers an ordinary string with the same contents.
+///
+/// # Safety
+///
+/// `bytes` covers `length` bytes.
+unsafe extern "C" fn new_tagged_ascii(
+    _class: Id,
+    _sel: Sel,
+    bytes: *const u8,
+    length: isize,
+) -> Id {
+    unsafe {
+        api::CFStringCreateWithBytes(std::ptr::null(), bytes, length, encoding::ASCII, 0) as Id
     }
 }
 
@@ -1725,6 +1848,11 @@ pub(crate) fn install() {
         "characterAtIndex:" => character_at_index, c"S24@0:8Q16";
         "getCharacters:range:" => get_characters_range, c"v40@0:8^S16{_NSRange=QQ}24";
         "getCharacters:" => get_characters, c"v24@0:8^S16";
+        "_fastCStringContents:" => fast_c_string_contents, c"r*20@0:8c16";
+        "_fastCharacterContents" => fast_character_contents, c"r^S16@0:8";
+        "getBytes:maxLength:usedLength:encoding:options:range:remainingRange:"
+            => get_bytes_in_range, c"B80@0:8^v16Q24^Q32Q40Q48{_NSRange=QQ}56^{_NSRange=QQ}72";
+        "isNSString__" => is_ns_string, c"c16@0:8";
         "description" => description, c"@16@0:8";
         "copy" => copy, c"@16@0:8";
         "copyWithZone:" => copy, c"@24@0:8^v16";
@@ -1824,6 +1952,7 @@ pub(crate) fn install() {
         "stringWithString:" => string_with_string, c"@24@0:8@16";
         "stringWithCharacters:length:" => string_with_characters, c"@32@0:8^S16Q24";
         "pathWithComponents:" => path_with_components, c"@24@0:8@16";
+        "newTaggedNSStringWithASCIIBytes_:length_:" => new_tagged_ascii, c"@32@0:8r*16q24";
     });
     methods!(class, {
         "initWithString:" => init_with_string, c"@24@0:8@16";
@@ -1865,6 +1994,80 @@ mod tests {
         assert!(like("isCaseInsensitiveLike:", "ROSE*.APP"));
         assert!(!like("isCaseInsensitiveLike:", "rose?.app"));
         objc::arc::release(text);
+    }
+
+    /// libswiftCore reads a bridged string's ASCII in place, and asks for a
+    /// copy of anything else.
+    #[test]
+    fn fast_contents_lend_ascii_and_decline_the_rest() {
+        crate::bootstrap();
+        let sel = objc::sel::get("_fastCStringContents:");
+        let ascii = from_str("plain");
+        let accented = from_str("caf\u{e9}");
+        // SAFETY: two strings and the method's own prototype.
+        unsafe {
+            let lent = fast_c_string_contents(ascii, sel, 1);
+            assert_eq!(CStr::from_ptr(lent).to_bytes(), b"plain");
+            assert!(fast_c_string_contents(accented, sel, 1).is_null());
+        }
+        objc::arc::release(ascii);
+        objc::arc::release(accented);
+    }
+
+    /// The bytes of a range, what is left of it when the buffer runs out, and
+    /// with no buffer the count alone, which is how libswiftCore sizes a copy.
+    #[test]
+    fn get_bytes_reports_what_it_converted_and_what_remains() {
+        crate::bootstrap();
+        let sel =
+            objc::sel::get("getBytes:maxLength:usedLength:encoding:options:range:remainingRange:");
+        let text = from_str("hello");
+        let whole = NSRange {
+            location: 0,
+            length: 5,
+        };
+        let get = |buffer: *mut u8, max: usize| {
+            let mut used = 0usize;
+            let mut remaining = NSRange {
+                location: 0,
+                length: 0,
+            };
+            // SAFETY: a string, a buffer of `max` bytes or none, and out-parameters.
+            let ok = unsafe {
+                get_bytes_in_range(
+                    text,
+                    sel,
+                    buffer,
+                    max,
+                    &mut used,
+                    ns_encoding::UTF8,
+                    0,
+                    whole,
+                    &mut remaining,
+                )
+            };
+            (ok, used, remaining.location, remaining.length)
+        };
+        assert_eq!(get(std::ptr::null_mut(), 0), (true, 5, 5, 0));
+        let mut buffer = [0u8; 3];
+        assert_eq!(get(buffer.as_mut_ptr(), buffer.len()), (true, 3, 3, 2));
+        assert_eq!(&buffer, b"hel");
+        objc::arc::release(text);
+    }
+
+    #[test]
+    fn a_small_ascii_string_bridges_to_an_owned_equal_string() {
+        crate::bootstrap();
+        let sel = objc::sel::get("newTaggedNSStringWithASCIIBytes_:length_:");
+        // SAFETY: five ASCII bytes and the method's own prototype.
+        let made = unsafe { new_tagged_ascii(std::ptr::null_mut(), sel, b"small".as_ptr(), 5) };
+        // SAFETY: a string this runtime made.
+        assert_eq!(unsafe { bytes(made) }, b"small");
+        assert_eq!(
+            unsafe { is_ns_string(made, objc::sel::get("isNSString__")) },
+            1
+        );
+        objc::arc::release(made);
     }
 
     #[test]
