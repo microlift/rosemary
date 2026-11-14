@@ -4,8 +4,12 @@
   <img alt="Discord" src="https://img.shields.io/discord/1558958766211338350?label=discord&cacheSeconds=3600">
 </a>
 
-Rosemary runs macOS applications across architectures and operating systems. It
-combines two closely related projects:
+Rosemary is a compatibility layer and high level emulator hybrid that 
+runs macOS applications across architectures and operating systems, pairing
+up as both a replacement to Rosetta 2 when Apple removes it, and a way to run
+macOS apps on non-macOS systems.
+
+It combines two closely related projects:
 
 * a high-level x86-64 emulator built on the [Microlift](https://github.com/microlift/microlift) binary lifter and JIT
 * a macOS compatibility layer that reimplements Darwin APIs and Apple frameworks on non-macOS hosts.
