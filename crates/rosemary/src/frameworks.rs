@@ -62,6 +62,9 @@ macro_rules! framework {
 const LIBSYSTEM: &str = "/usr/lib/libSystem.B.dylib";
 const LIBOBJC: &str = "/usr/lib/libobjc.A.dylib";
 const LIBOBJC_NAMES: &[&str] = &[LIBOBJC, "/usr/lib/libobjc.dylib"];
+/// Foundation's Swift half, which Apple links into the framework itself and a
+/// Darwin base builds from swift-foundation as an image of its own.
+const SWIFT_FOUNDATION: &str = "/usr/lib/swift/libswiftFoundation.dylib";
 
 // FIXME (ACCURACY): each row's `links` is a recollection of that framework's
 // `otool -L` on macOS, cut to libraries this runtime provides, and not checked
@@ -89,7 +92,7 @@ static FRAMEWORKS: &[Framework] = &[
         data: Some(foundation::data_symbols),
         symbol: Some(foundation::symbol),
         links: Links {
-            reexports: &[],
+            reexports: &[SWIFT_FOUNDATION],
             dependencies: &[
                 framework!("CoreFoundation"),
                 LIBOBJC,
@@ -595,6 +598,47 @@ fn withheld(name: &str) -> bool {
     out
 }
 
+/// Whether `install_name` is one of the frameworks [`FRAMEWORKS`] stands for.
+fn is_row(install_name: &str) -> bool {
+    FRAMEWORKS
+        .iter()
+        .any(|framework| paths_of(framework).iter().any(|p| p == install_name))
+}
+
+/// A stand-in for each framework that re-exports an image of the Darwin base,
+/// which the loader then fetches: an import of the framework that this tree
+/// does not define is looked for there.
+pub fn base_reexports() -> Vec<SyntheticDylib> {
+    install();
+    if !using_builtin() {
+        return Vec::new();
+    }
+    FRAMEWORKS
+        .iter()
+        .filter_map(|framework| {
+            let images: Vec<&str> = framework
+                .links
+                .reexports
+                .iter()
+                .copied()
+                .filter(|image| !is_row(image))
+                .collect();
+            if images.is_empty() {
+                return None;
+            }
+            let paths = paths_of(framework);
+            let mut lib = SyntheticDylib::new(&paths[0]);
+            for path in &paths[1..] {
+                lib.alias(path);
+            }
+            for image in images {
+                lib.reexport(image);
+            }
+            Some(lib)
+        })
+        .collect()
+}
+
 pub fn provider() -> SyntheticDylib {
     install();
     let mut lib = SyntheticDylib::new("<rosemary frameworks>");
@@ -1045,6 +1089,34 @@ mod tests {
             }
         }
         assert!(twice.is_empty(), "defined more than once: {twice:?}");
+    }
+
+    /// Foundation's Swift half is an image of the base; AppKit's re-exports
+    /// are frameworks of this table, which need no stand-in to be fetched.
+    #[test]
+    fn foundation_stands_in_for_its_swift_half_alone() {
+        use machish::resolve::SymbolProvider;
+        if !using_builtin() {
+            return;
+        }
+        let stand_ins = base_reexports();
+        let foundation = framework!("Foundation");
+        let found: Vec<_> = stand_ins
+            .iter()
+            .filter(|s| s.stands_for(foundation))
+            .collect();
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].reexports(foundation), [SWIFT_FOUNDATION]);
+        assert!(
+            found[0].stands_for(
+                "/System/Library/Frameworks/Foundation.framework/Versions/C/Foundation"
+            )
+        );
+        assert!(
+            !stand_ins
+                .iter()
+                .any(|s| s.stands_for(framework!("ApplicationServices")))
+        );
     }
 
     #[test]

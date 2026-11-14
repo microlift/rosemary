@@ -168,6 +168,7 @@ impl Native {
         let platform = darwin::provider();
         let objc = crate::objc::dispatch::provider();
         let frameworks = crate::frameworks::provider();
+        let base_reexports = crate::frameworks::base_reexports();
         let dyld = crate::dyld::provider();
         let libc_lookup = crate::dyld::native_libc_provider();
         let steam = crate::steam::provider();
@@ -187,6 +188,9 @@ impl Native {
             ],
             false => vec![&eager, &runtime, &platform, &libc_lookup, &steam],
         };
+        if crate::frameworks::using_builtin() {
+            providers.extend(base_reexports.iter().map(|lib| lib as &dyn SymbolProvider));
+        }
         match darwin::strict::enabled() {
             true => crate::program::announce_strict(),
             false => providers.push(&host),
