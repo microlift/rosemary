@@ -164,6 +164,12 @@ runtime's own reimplementations; the base is there for a guest that stats,
 reads or `dlopen`s a system file, and so that a prefix has a real Darwin
 filesystem shape. A prefix without one still runs guests.
 
+The exception is Swift. A Swift guest loads the base's `/usr/lib/swift`
+libraries as it would on a Mac, and the Swift half of Foundation (`Data`, `URL`,
+`JSONEncoder`, ...) is the base's `libswiftFoundation.dylib`, which this
+runtime's Foundation re-exports when the built-in Objective-C runtime is in use.
+In a prefix whose base predates it, those imports are unbound.
+
 A new prefix gets its base when it is created, and nothing is downloaded
 without consent: `rosemary run` asks with a dialog or on the terminal, and
 `ROSEMARY_PREFIX_SETUP` answers in advance. The download (about 2 MB) is
