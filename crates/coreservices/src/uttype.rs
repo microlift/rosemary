@@ -23,9 +23,16 @@ const CONFORMS: &[(&str, &[&str])] = &[
     ("public.data", &["public.item"]),
     ("public.directory", &["public.item"]),
     ("public.folder", &["public.directory"]),
+    ("public.volume", &["public.folder"]),
+    ("public.symlink", &["public.item"]),
     ("com.apple.package", &["public.directory"]),
     ("com.apple.bundle", &["public.directory"]),
+    ("com.apple.framework", &["com.apple.bundle"]),
     ("public.executable", &["public.item"]),
+    (
+        "public.unix-executable",
+        &["public.data", "public.executable"],
+    ),
     ("com.apple.application", &["public.executable"]),
     (
         "com.apple.application-bundle",
@@ -109,7 +116,9 @@ fn class() -> &'static Class {
 
 fn is_declared(identifier: &str) -> bool {
     CONFORMS.iter().any(|(id, _)| *id == identifier)
-        || crate::uti::TYPES.iter().any(|row| row.0 == identifier)
+        || corefoundation::uti::TYPES
+            .iter()
+            .any(|row| row.0 == identifier)
 }
 
 /// The one object for `identifier`, made on first use and never freed.
@@ -133,7 +142,7 @@ fn intern(identifier: &str) -> Id {
 /// The type for `identifier`, or nil for one that is neither declared nor
 /// dynamic.
 fn lookup(identifier: &str) -> Id {
-    match is_declared(identifier) || identifier.starts_with(crate::uti::DYNAMIC) {
+    match is_declared(identifier) || identifier.starts_with(corefoundation::uti::DYNAMIC) {
         true => intern(identifier),
         false => std::ptr::null_mut(),
     }
@@ -161,7 +170,7 @@ unsafe fn text(text: Id) -> Option<String> {
 }
 
 /// Whether `identifier` is `other` or reaches it through [`CONFORMS`].
-fn conforms(identifier: &str, other: &str) -> bool {
+pub(crate) fn conforms(identifier: &str, other: &str) -> bool {
     identifier == other
         || CONFORMS
             .iter()
@@ -244,7 +253,7 @@ unsafe extern "C" fn is_supertype_of_type(receiver: Id, sel: Sel, other: Id) -> 
 
 unsafe extern "C" fn is_dynamic(receiver: Id, _sel: Sel) -> u8 {
     // SAFETY: one of this module's types.
-    u8::from(unsafe { identifier_of(receiver) }.starts_with(crate::uti::DYNAMIC))
+    u8::from(unsafe { identifier_of(receiver) }.starts_with(corefoundation::uti::DYNAMIC))
 }
 
 unsafe extern "C" fn is_declared_type(receiver: Id, _sel: Sel) -> u8 {

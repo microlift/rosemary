@@ -10,34 +10,7 @@ use std::ffi::c_void;
 
 use corefoundation::base::CFTypeRef;
 
-/// `kUTTagClassMIMEType` and `kUTTagClassFilenameExtension`, as published by
-/// AppKit's string globals - the same characters, which is what is compared.
-pub(crate) const MIME_TYPE: &str = "public.mime-type";
-pub(crate) const FILENAME_EXTENSION: &str = "public.filename-extension";
-
-/// Identifier, preferred MIME type, preferred extension.
-pub(crate) type Row = (&'static str, &'static str, &'static str);
-
-pub(crate) const TYPES: &[Row] = &[
-    ("public.utf8-plain-text", "text/plain;charset=utf-8", "txt"),
-    ("public.plain-text", "text/plain", "txt"),
-    ("public.html", "text/html", "html"),
-    ("public.rtf", "text/rtf", "rtf"),
-    ("public.url", "text/uri-list", "url"),
-    ("public.png", "image/png", "png"),
-    ("public.jpeg", "image/jpeg", "jpeg"),
-    ("com.compuserve.gif", "image/gif", "gif"),
-    ("public.tiff", "image/tiff", "tiff"),
-    ("com.microsoft.bmp", "image/bmp", "bmp"),
-    ("public.json", "application/json", "json"),
-    ("com.adobe.pdf", "application/pdf", "pdf"),
-    ("public.zip-archive", "application/zip", "zip"),
-    ("public.vcard", "text/vcard", "vcf"),
-];
-
-/// The prefix of an identifier made up for a tag the table lacks. Apple's
-/// encode the tag opaquely after `dyn.`; this one keeps it readable.
-pub(crate) const DYNAMIC: &str = "dyn.rosemary.";
+pub(crate) use corefoundation::uti::{FILENAME_EXTENSION, MIME_TYPE, identifier_for, tag_for};
 
 fn read(string: *const c_void) -> Option<String> {
     // SAFETY: a CoreFoundation string or null, by the callers' contracts.
@@ -47,42 +20,6 @@ fn read(string: *const c_void) -> Option<String> {
 
 fn make(text: &str) -> *const c_void {
     corefoundation::string::from_bytes(text.as_bytes(), false)
-}
-
-fn column(tag_class: &str) -> Option<fn(&Row) -> &'static str> {
-    match tag_class {
-        MIME_TYPE => Some(|t| t.1),
-        FILENAME_EXTENSION => Some(|t| t.2),
-        _ => None,
-    }
-}
-
-/// The identifier for `tag`, matched case-insensitively, as MIME types and
-/// extensions both are. A MIME type's parameters only narrow it.
-pub(crate) fn identifier_for(tag_class: &str, tag: &str) -> Option<String> {
-    let of = column(tag_class)?;
-    let tag = tag.to_ascii_lowercase();
-    let found = TYPES
-        .iter()
-        .find(|t| of(t) == tag)
-        .or_else(|| {
-            let bare = tag.split(';').next().unwrap_or_default().trim();
-            TYPES.iter().find(|t| of(t) == bare)
-        })
-        .map(|t| t.0.to_string());
-    Some(found.unwrap_or_else(|| format!("{DYNAMIC}{tag_class}.{tag}")))
-}
-
-pub(crate) fn tag_for(identifier: &str, tag_class: &str) -> Option<String> {
-    let of = column(tag_class)?;
-    if let Some(t) = TYPES.iter().find(|t| t.0 == identifier) {
-        return Some(of(t).to_string());
-    }
-    identifier
-        .strip_prefix(DYNAMIC)?
-        .strip_prefix(tag_class)?
-        .strip_prefix('.')
-        .map(str::to_string)
 }
 
 /// `CFStringRef UTTypeCreatePreferredIdentifierForTag(CFStringRef inTagClass,
@@ -118,46 +55,22 @@ pub unsafe extern "C" fn UTTypeCopyPreferredTagWithClass(
     }
 }
 
-exports::exports! {
-    functions {
-        "UTTypeCreatePreferredIdentifierForTag" => UTTypeCreatePreferredIdentifierForTag,
-        "UTTypeCopyPreferredTagWithClass" => UTTypeCopyPreferredTagWithClass,
+/// `Boolean UTTypeConformsTo(CFStringRef inUTI, CFStringRef inConformsToUTI)`
+///
+/// Against the declared types' table, so a type only an application declares
+/// - which Launch Services would know from that application - conforms only
+/// to itself, as on a Mac without that application.
+pub unsafe extern "C" fn UTTypeConformsTo(identifier: *const c_void, other: *const c_void) -> u8 {
+    match (read(identifier), read(other)) {
+        (Some(identifier), Some(other)) => u8::from(crate::uttype::conforms(&identifier, &other)),
+        _ => 0,
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn maps_known_mime_types_both_ways() {
-        assert_eq!(
-            identifier_for(MIME_TYPE, "image/PNG").as_deref(),
-            Some("public.png")
-        );
-        assert_eq!(
-            identifier_for(MIME_TYPE, "text/plain;charset=utf-8").as_deref(),
-            Some("public.utf8-plain-text")
-        );
-        assert_eq!(
-            tag_for("public.png", MIME_TYPE).as_deref(),
-            Some("image/png")
-        );
-        assert_eq!(
-            tag_for("public.png", FILENAME_EXTENSION).as_deref(),
-            Some("png")
-        );
-    }
-
-    #[test]
-    fn an_unknown_tag_round_trips_through_a_dynamic_identifier() {
-        let id = identifier_for(MIME_TYPE, "application/x-terraria").unwrap();
-        assert!(id.starts_with("dyn."));
-        assert_eq!(
-            tag_for(&id, MIME_TYPE).as_deref(),
-            Some("application/x-terraria")
-        );
-        assert_eq!(tag_for(&id, FILENAME_EXTENSION), None);
-        assert_eq!(identifier_for("public.bogus", "x"), None);
+exports::exports! {
+    functions {
+        "UTTypeConformsTo" => UTTypeConformsTo,
+        "UTTypeCreatePreferredIdentifierForTag" => UTTypeCreatePreferredIdentifierForTag,
+        "UTTypeCopyPreferredTagWithClass" => UTTypeCopyPreferredTagWithClass,
     }
 }

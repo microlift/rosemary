@@ -33,6 +33,7 @@ pub mod timezone;
 pub mod tzif;
 pub mod url;
 pub mod urlresource;
+pub mod uti;
 pub mod uuid;
 
 /// Install the classes this crate owns. Idempotent.

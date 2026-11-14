@@ -72,6 +72,8 @@ pub const KEYS: &[(&str, &str)] = &[
     ("_kCFURLHasHiddenExtensionKey", HAS_HIDDEN_EXTENSION),
     ("_NSURLHasHiddenExtensionKey", HAS_HIDDEN_EXTENSION),
     ("_kCFURLIsApplicationKey", IS_APPLICATION),
+    ("_kCFURLTypeIdentifierKey", TYPE_IDENTIFIER),
+    ("_NSURLTypeIdentifierKey", TYPE_IDENTIFIER),
     ("_NSURLIsApplicationKey", IS_APPLICATION),
     ("_kCFURLParentDirectoryURLKey", PARENT_DIRECTORY_URL),
     ("_NSURLParentDirectoryURLKey", PARENT_DIRECTORY_URL),
@@ -138,6 +140,7 @@ pub const ADDED_TO_DIRECTORY_DATE: &str = "NSURLAddedToDirectoryDateKey";
 const FILE_RESOURCE_TYPE: &str = "NSURLFileResourceTypeKey";
 const HAS_HIDDEN_EXTENSION: &str = "NSURLHasHiddenExtensionKey";
 const IS_APPLICATION: &str = "NSURLIsApplicationKey";
+const TYPE_IDENTIFIER: &str = "NSURLTypeIdentifierKey";
 const PARENT_DIRECTORY_URL: &str = "NSURLParentDirectoryURLKey";
 const TAG_NAMES: &str = "NSURLTagNamesKey";
 const VOLUME_IS_INTERNAL: &str = "NSURLVolumeIsInternalKey";
@@ -171,6 +174,15 @@ fn guest_volume(guest: &str) -> &str {
     }
 }
 
+/// Whether `guest` is the root of the volume it is on.
+fn is_volume_root(guest: &str) -> bool {
+    let trimmed = match guest.trim_end_matches('/') {
+        "" => "/",
+        other => other,
+    };
+    guest_volume(trimmed) == trimmed
+}
+
 /// The extensions that make a *directory* a package - a bundle the user sees as
 /// one file rather than as a folder.
 ///
@@ -199,6 +211,43 @@ const PACKAGE_EXTENSIONS: &[&str] = &[
     "logicx",
     "band",
 ];
+
+/// The type identifier of the item at `path`, as Finder's own types name it.
+///
+/// Launch Services would also know the types installed applications declare
+/// for their documents; with no such database here, a package or file whose
+/// extension only an application declares is a plain package, or has the
+/// dynamic identifier [`crate::uti`] makes for its extension.
+fn type_identifier(guest: &str, path: &std::path::Path, metadata: &std::fs::Metadata) -> String {
+    use std::os::unix::fs::PermissionsExt;
+    let extension = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(str::to_ascii_lowercase);
+    if metadata.is_symlink() {
+        return "public.symlink".to_string();
+    }
+    if metadata.is_dir() {
+        let identifier = match extension.as_deref() {
+            _ if is_volume_root(guest) => "public.volume",
+            Some("app") => "com.apple.application-bundle",
+            Some("framework") => "com.apple.framework",
+            Some("bundle") => "com.apple.bundle",
+            _ if is_package(path) => "com.apple.package",
+            _ => "public.folder",
+        };
+        return identifier.to_string();
+    }
+    if !metadata.is_file() {
+        return "public.item".to_string();
+    }
+    match extension {
+        Some(ext) => crate::uti::identifier_for(crate::uti::FILENAME_EXTENSION, &ext)
+            .expect("a filename extension is a tag class with a column"),
+        None if metadata.permissions().mode() & 0o111 != 0 => "public.unix-executable".to_string(),
+        None => "public.data".to_string(),
+    }
+}
 
 /// Whether `path` names a package: a directory whose extension says the user
 /// should see it as one file.
@@ -285,6 +334,10 @@ pub fn property(guest: &str, key: &str) -> Option<CFTypeRef> {
             crate::string::from_bytes(name.as_bytes(), false)
         }
         IS_HIDDEN => crate::collections::boolean(is_hidden(path)),
+        TYPE_IDENTIFIER => {
+            let identifier = type_identifier(guest, path, &metadata()?);
+            crate::string::from_bytes(identifier.as_bytes(), false)
+        }
         IS_PACKAGE => crate::collections::boolean(is_package(path)),
         // A Finder alias is a file whose *contents* are a bookmark, and nothing
         // on this host writes one - so this is false rather than absent: the
@@ -301,13 +354,7 @@ pub fn property(guest: &str, key: &str) -> Option<CFTypeRef> {
         // telling whether two URLs are on the same volume.
         VOLUME_IDENTIFIER => number(device_of(path)?),
         PATH => crate::string::from_bytes(guest.as_bytes(), false),
-        IS_VOLUME => {
-            let trimmed = match guest.trim_end_matches('/') {
-                "" => "/",
-                other => other,
-            };
-            crate::collections::boolean(guest_volume(trimmed) == trimmed)
-        }
+        IS_VOLUME => crate::collections::boolean(is_volume_root(guest)),
         VOLUME_NAME => {
             let name = match guest_volume(guest) {
                 "/" => ROOT_VOLUME_NAME,
@@ -641,15 +688,103 @@ struct EnumeratorBody {
     contents: *mut Enumerator,
 }
 
+/// `CFURLEnumeratorOptions`.
+mod options {
+    pub const DESCEND_RECURSIVELY: u64 = 1 << 0;
+    pub const SKIP_INVISIBLES: u64 = 1 << 1;
+    pub const SKIP_PACKAGE_CONTENTS: u64 = 1 << 3;
+    pub const INCLUDE_DIRECTORIES_PRE_ORDER: u64 = 1 << 4;
+    /// One of the options outside `SUPPORTED` (with file reference URLs,
+    /// `1 << 2`, and post-order directories, `1 << 5`).
+    #[cfg(test)]
+    pub const GENERATE_RELATIVE_PATH_URLS: u64 = 1 << 6;
+    /// Pre-order is how a recursive walk reports directories anyway.
+    pub const SUPPORTED: u64 = DESCEND_RECURSIVELY
+        | SKIP_INVISIBLES
+        | SKIP_PACKAGE_CONTENTS
+        | INCLUDE_DIRECTORIES_PRE_ORDER;
+}
+
+/// `CFURLEnumeratorResult`.
+const SUCCESS: CFIndex = 1;
+const END: CFIndex = 2;
+const ERROR: CFIndex = 3;
+
+/// One guest path still to be reported.
+struct Pending {
+    guest: String,
+    is_dir: bool,
+}
+
 struct Enumerator {
-    root: CFTypeRef,
-    yielded: bool,
+    /// What is left, last first, so `pop` yields in order.
+    pending: Vec<Pending>,
+    options: u64,
+    /// The URL last handed out: the caller borrows it until the next call.
+    current: CFTypeRef,
+}
+
+impl Enumerator {
+    fn new(pending: Vec<Pending>, options: u64) -> Self {
+        let mut pending = pending;
+        pending.reverse();
+        Enumerator {
+            pending,
+            options,
+            current: std::ptr::null(),
+        }
+    }
+
+    /// Queue `dir`'s entries ahead of everything else, or `Err` if it cannot
+    /// be read.
+    fn push_children(&mut self, dir: &str) -> std::io::Result<()> {
+        let host = prefix::ns::host_path(dir);
+        let mut children = Vec::new();
+        for entry in std::fs::read_dir(&host)? {
+            let entry = entry?;
+            let name = entry.file_name().to_string_lossy().into_owned();
+            let path = entry.path();
+            if self.options & options::SKIP_INVISIBLES != 0 && is_hidden(&path) {
+                continue;
+            }
+            let is_dir = std::fs::metadata(&path).is_ok_and(|m| m.is_dir());
+            let guest = match dir {
+                "/" => format!("/{name}"),
+                _ => format!("{}/{name}", dir.trim_end_matches('/')),
+            };
+            children.push(Pending { guest, is_dir });
+        }
+        self.pending.extend(children.into_iter().rev());
+        Ok(())
+    }
+
+    fn next(&mut self) -> CFIndex {
+        if !self.current.is_null() {
+            // SAFETY: the enumerator owns the URL it last handed out.
+            unsafe { crate::api::CFRelease(self.current) };
+            self.current = std::ptr::null();
+        }
+        let Some(next) = self.pending.pop() else {
+            return END;
+        };
+        let descend = next.is_dir
+            && self.options & options::DESCEND_RECURSIVELY != 0
+            && !(self.options & options::SKIP_PACKAGE_CONTENTS != 0
+                && is_package(&prefix::ns::host_path(&next.guest)));
+        if descend && self.push_children(&next.guest).is_err() {
+            return ERROR;
+        }
+        self.current = crate::url::new_file_url(&next.guest, next.is_dir);
+        SUCCESS
+    }
 }
 
 impl Drop for Enumerator {
     fn drop(&mut self) {
-        // SAFETY: the enumerator owns the create-rule reference to its URL.
-        unsafe { crate::api::CFRelease(self.root) };
+        if !self.current.is_null() {
+            // SAFETY: the enumerator owns the URL it last handed out.
+            unsafe { crate::api::CFRelease(self.current) };
+        }
     }
 }
 
@@ -684,6 +819,17 @@ fn enumerator_class() -> &'static Class {
     unsafe { objc::class::from_ptr(pointer as *const Class).expect("a class") }
 }
 
+fn new_enumerator(enumerator: Enumerator) -> CFTypeRef {
+    // SAFETY: the body begins with `isa` and matches the registered size.
+    let body: *mut EnumeratorBody = unsafe { crate::base::allocate(enumerator_class()) };
+    if body.is_null() {
+        return std::ptr::null();
+    }
+    // SAFETY: `body` is a live instance with a writable contents word.
+    unsafe { (*body).contents = Box::into_raw(Box::new(enumerator)) };
+    body as CFTypeRef
+}
+
 /// Enumerate the host's mounted volumes. The root filesystem is the portable
 /// volume every supported host has and is enough for Qt's storage accounting.
 pub unsafe extern "C" fn CFURLEnumeratorCreateForMountedVolumes(
@@ -691,25 +837,56 @@ pub unsafe extern "C" fn CFURLEnumeratorCreateForMountedVolumes(
     _options: u64,
     _property_keys: CFTypeRef,
 ) -> CFTypeRef {
-    let root = crate::url::new_file_url("/", true);
-    // SAFETY: the body begins with `isa` and matches the registered size.
-    let body: *mut EnumeratorBody = unsafe { crate::base::allocate(enumerator_class()) };
-    if body.is_null() {
-        // SAFETY: `root` is this call's create-rule reference.
-        unsafe { crate::api::CFRelease(root) };
-        return std::ptr::null();
-    }
-    // SAFETY: `body` is a live instance with a writable contents word.
-    unsafe {
-        (*body).contents = Box::into_raw(Box::new(Enumerator {
-            root,
-            yielded: false,
-        }))
-    };
-    body as CFTypeRef
+    new_enumerator(Enumerator::new(
+        vec![Pending {
+            guest: "/".to_string(),
+            is_dir: true,
+        }],
+        0,
+    ))
 }
 
-/// Return the root volume once, then `kCFURLEnumeratorEnd`.
+/// `CFURLEnumeratorRef CFURLEnumeratorCreateForDirectoryURL(CFAllocatorRef,
+/// CFURLRef directoryURL, CFURLEnumeratorOptions, CFArrayRef propertyKeys)`
+///
+/// The directory's entries in the file system's order, descending into
+/// subdirectories after reporting them when asked to. Property keys are only a
+/// prefetching hint, so they change nothing a caller can see. File reference
+/// URLs, post-order directories and relative URLs are not supported, and an
+/// enumerator asked for them is refused (null) with a diagnostic rather than
+/// made to behave differently.
+///
+/// # Safety
+///
+/// `url` is null or an object this runtime allocated.
+pub unsafe extern "C" fn CFURLEnumeratorCreateForDirectoryURL(
+    _allocator: CFTypeRef,
+    url: CFTypeRef,
+    options: u64,
+    _property_keys: CFTypeRef,
+) -> CFTypeRef {
+    if options & !options::SUPPORTED != 0 {
+        eprintln!(
+            "rosemary: CFURLEnumeratorCreateForDirectoryURL: unsupported options {:#x}",
+            options & !options::SUPPORTED
+        );
+        return std::ptr::null();
+    }
+    // SAFETY: the caller's.
+    let Some(dir) = (unsafe { crate::url::as_url(url) }).and_then(|u| u.file_path()) else {
+        return std::ptr::null();
+    };
+    let mut enumerator = Enumerator::new(Vec::new(), options);
+    if enumerator.push_children(&dir).is_err() {
+        // An unreadable directory is the first call's error, as on macOS.
+        enumerator.pending.clear();
+        enumerator.options = u64::MAX;
+    }
+    new_enumerator(enumerator)
+}
+
+/// `CFURLEnumeratorResult CFURLEnumeratorGetNextURL(CFURLEnumeratorRef,
+/// CFURLRef *url, CFErrorRef *error)`: the URL is borrowed until the next call.
 pub unsafe extern "C" fn CFURLEnumeratorGetNextURL(
     enumerator: CFTypeRef,
     url: *mut CFTypeRef,
@@ -725,23 +902,49 @@ pub unsafe extern "C" fn CFURLEnumeratorGetNextURL(
     }
     // SAFETY: the caller's handle must be null or a runtime object.
     if !unsafe { crate::base::is_kind_of(enumerator, enumerator_class()) } {
-        return 2;
+        return END;
     }
     let body = enumerator as *mut EnumeratorBody;
     // SAFETY: an instance of this class has the body above.
-    let state = unsafe { (*body).contents.as_mut() };
-    let Some(state) = state else {
-        return 2;
+    let Some(state) = (unsafe { (*body).contents.as_mut() }) else {
+        return END;
     };
-    if state.yielded {
-        return 2;
+    if state.options == u64::MAX {
+        state.options = 0;
+        return ERROR;
     }
-    state.yielded = true;
-    if !url.is_null() {
-        // Borrowed for as long as the enumerator remains alive.
-        unsafe { url.write(state.root) };
+    let result = state.next();
+    if result == SUCCESS && !url.is_null() {
+        // SAFETY: the caller supplied the result word.
+        unsafe { url.write(state.current) };
     }
-    1
+    result
+}
+
+/// `void CFURLEnumeratorSkipDescendents(CFURLEnumeratorRef)`: drop what is
+/// queued from inside the directory just returned.
+pub unsafe extern "C" fn CFURLEnumeratorSkipDescendents(enumerator: CFTypeRef) {
+    // SAFETY: the caller's handle must be null or a runtime object.
+    if !unsafe { crate::base::is_kind_of(enumerator, enumerator_class()) } {
+        return;
+    }
+    // SAFETY: an instance of this class has the body above.
+    let Some(state) = (unsafe { (*(enumerator as *mut EnumeratorBody)).contents.as_mut() }) else {
+        return;
+    };
+    // SAFETY: the current URL, if any, is this enumerator's.
+    let Some(dir) = (unsafe { crate::url::as_url(state.current) }).and_then(|u| u.file_path())
+    else {
+        return;
+    };
+    let inside = format!("{}/", dir.trim_end_matches('/'));
+    while state
+        .pending
+        .last()
+        .is_some_and(|p| p.guest.starts_with(&inside))
+    {
+        state.pending.pop();
+    }
 }
 
 exports::exports! {
@@ -753,7 +956,9 @@ exports::exports! {
         "CFURLCreateDataAndPropertiesFromResource" => CFURLCreateDataAndPropertiesFromResource,
         "CFURLCreateWithBytes" => CFURLCreateWithBytes,
         "CFURLEnumeratorCreateForMountedVolumes" => CFURLEnumeratorCreateForMountedVolumes,
+        "CFURLEnumeratorCreateForDirectoryURL" => CFURLEnumeratorCreateForDirectoryURL,
         "CFURLEnumeratorGetNextURL" => CFURLEnumeratorGetNextURL,
+        "CFURLEnumeratorSkipDescendents" => CFURLEnumeratorSkipDescendents,
     }
 }
 
@@ -821,10 +1026,123 @@ mod tests {
     }
 
     #[test]
+    fn items_have_finders_type_identifiers() {
+        crate::bootstrap();
+        let dir = std::env::temp_dir().join(format!("rosemary-types-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("Thing.app")).expect("an app");
+        std::fs::create_dir_all(dir.join("Plain")).expect("a folder");
+        std::fs::write(dir.join("notes.txt"), b"x").expect("a text file");
+        std::fs::write(dir.join("blob"), b"x").expect("a file without an extension");
+        std::os::unix::fs::symlink("notes.txt", dir.join("link")).expect("a symlink");
+        let type_of = |name: &str| {
+            let guest = dir.join(name).to_str().expect("UTF-8").to_string();
+            let value = property(&guest, TYPE_IDENTIFIER).expect("a type identifier");
+            // SAFETY: a string this module made.
+            let text = unsafe { crate::string::as_string(value) }
+                .expect("a string")
+                .utf8();
+            String::from_utf8(text).expect("UTF-8")
+        };
+        assert_eq!(type_of("Thing.app"), "com.apple.application-bundle");
+        assert_eq!(type_of("Plain"), "public.folder");
+        assert_eq!(type_of("notes.txt"), "public.plain-text");
+        assert_eq!(type_of("blob"), "public.data");
+        assert_eq!(type_of("link"), "public.symlink");
+        assert_eq!(type_of("/").as_str(), "public.volume");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn a_volume_reports_case_insensitive_names() {
         crate::bootstrap();
         let value = property("/", VOLUME_SUPPORTS_CASE_SENSITIVE_NAMES);
         assert_eq!(value, Some(crate::collections::boolean(false)));
+    }
+
+    fn walk(dir: &std::path::Path, options: u64) -> Vec<String> {
+        let url = crate::url::new_file_url(dir.to_str().expect("UTF-8"), true);
+        // SAFETY: a file URL this test made.
+        let enumerator = unsafe {
+            CFURLEnumeratorCreateForDirectoryURL(std::ptr::null(), url, options, std::ptr::null())
+        };
+        let mut out = Vec::new();
+        let mut next = std::ptr::null();
+        // SAFETY: a live enumerator and writable words.
+        while unsafe { CFURLEnumeratorGetNextURL(enumerator, &mut next, std::ptr::null_mut()) }
+            == SUCCESS
+        {
+            // SAFETY: a URL the enumerator lends until the next call.
+            let path = unsafe { crate::url::as_url(next) }.and_then(|u| u.file_path());
+            let path = path.expect("a file URL");
+            let relative = path
+                .strip_prefix(dir.to_str().expect("UTF-8"))
+                .expect("inside");
+            out.push(relative.trim_end_matches('/').to_string());
+        }
+        // SAFETY: both are this test's.
+        unsafe {
+            crate::api::CFRelease(enumerator);
+            crate::api::CFRelease(url);
+        }
+        out.sort();
+        out
+    }
+
+    #[test]
+    fn a_directory_enumerator_lists_and_descends() {
+        crate::bootstrap();
+        let dir = std::env::temp_dir().join(format!("rosemary-enumerate-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("sub/deeper")).expect("a tree");
+        std::fs::create_dir_all(dir.join("Thing.app/Contents")).expect("a package");
+        std::fs::write(dir.join("a"), b"").expect("a file");
+        std::fs::write(dir.join(".hidden"), b"").expect("a dotfile");
+        std::fs::write(dir.join("sub/b"), b"").expect("a nested file");
+
+        assert_eq!(walk(&dir, 0), ["/.hidden", "/Thing.app", "/a", "/sub"]);
+        assert_eq!(
+            walk(
+                &dir,
+                options::DESCEND_RECURSIVELY | options::SKIP_INVISIBLES
+            ),
+            [
+                "/Thing.app",
+                "/Thing.app/Contents",
+                "/a",
+                "/sub",
+                "/sub/b",
+                "/sub/deeper"
+            ]
+        );
+        assert_eq!(
+            walk(
+                &dir,
+                options::DESCEND_RECURSIVELY | options::SKIP_PACKAGE_CONTENTS
+            ),
+            [
+                "/.hidden",
+                "/Thing.app",
+                "/a",
+                "/sub",
+                "/sub/b",
+                "/sub/deeper"
+            ]
+        );
+        let url = crate::url::new_file_url(dir.to_str().expect("UTF-8"), true);
+        // SAFETY: a file URL this test made; an unsupported option is refused.
+        let refused = unsafe {
+            CFURLEnumeratorCreateForDirectoryURL(
+                std::ptr::null(),
+                url,
+                options::GENERATE_RELATIVE_PATH_URLS,
+                std::ptr::null(),
+            )
+        };
+        assert!(refused.is_null());
+        // SAFETY: this test's.
+        unsafe { crate::api::CFRelease(url) };
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
