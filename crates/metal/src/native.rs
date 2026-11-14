@@ -1333,6 +1333,104 @@ mod tests {
     }
 
     #[test]
+    fn native_compute_vertex_and_fragment_bindings_support_nil_unbind() {
+        if !require_native_opt_in() {
+            return;
+        }
+        crate::bootstrap();
+        let device = default_device();
+        let pool = objc::arc::pool_push();
+        let send_id: unsafe extern "C" fn(Id, Sel) -> Id =
+            unsafe { std::mem::transmute(objc::msg::entry()) };
+        let send_id_arg: unsafe extern "C" fn(Id, Sel, Id) -> Id =
+            unsafe { std::mem::transmute(objc::msg::entry()) };
+        let send_buffer: unsafe extern "C" fn(Id, Sel, Id, u64, u64) =
+            unsafe { std::mem::transmute(objc::msg::entry()) };
+        let send_void: unsafe extern "C" fn(Id, Sel) =
+            unsafe { std::mem::transmute(objc::msg::entry()) };
+        let queue = unsafe { new_queue(device, std::ptr::null()) };
+        let buffer = unsafe { new_buffer(device, std::ptr::null(), 128, 0) };
+        assert!(!queue.is_null() && !buffer.is_null());
+
+        // Compute encoder: bind then clear the identical argument index.
+        let compute_command = unsafe { new_command_buffer(queue, std::ptr::null()) };
+        let compute = unsafe { send_id(compute_command, objc::sel::get("computeCommandEncoder")) };
+        assert!(!compute.is_null());
+        unsafe {
+            for guest_buffer in [buffer, std::ptr::null_mut()] {
+                send_buffer(
+                    compute,
+                    objc::sel::get("setBuffer:offset:atIndex:"),
+                    guest_buffer,
+                    0,
+                    3,
+                );
+            }
+            send_void(compute, objc::sel::get("endEncoding"));
+            send_void(compute_command, objc::sel::get("commit"));
+            send_void(compute_command, objc::sel::get("waitUntilCompleted"));
+        }
+        assert_eq!(
+            unsafe { command_status(compute_command, std::ptr::null()) },
+            4
+        );
+
+        // Vertex and fragment slots on the same render encoder must be
+        // independently clearable without invalidating a render pass.
+        let descriptor = object::make(
+            c"MTLTextureDescriptor",
+            resource::TextureDescriptor {
+                texture_type: MTL_TEXTURE_TYPE_2D,
+                pixel_format: MTL_PIXEL_FORMAT_RGBA8_UNORM,
+                width: 4,
+                height: 4,
+                depth: 1,
+                mipmap_level_count: 1,
+                sample_count: 1,
+                array_length: 1,
+                storage_mode: 0,
+                usage: 4,
+            },
+        );
+        let texture = unsafe { texture::new_texture(device, std::ptr::null(), descriptor) };
+        assert!(!texture.is_null());
+        let mut pass_body = encoder::RenderPassDescriptor::default();
+        pass_body.colors[0].texture = objc::arc::retain(texture);
+        pass_body.colors[0].load_action = 2;
+        pass_body.colors[0].store_action = 1;
+        let pass = object::make(c"MTLRenderPassDescriptor", pass_body);
+        let render_command = unsafe { new_command_buffer(queue, std::ptr::null()) };
+        let render = unsafe {
+            send_id_arg(
+                render_command,
+                objc::sel::get("renderCommandEncoderWithDescriptor:"),
+                pass,
+            )
+        };
+        assert!(!render.is_null());
+        unsafe {
+            for method in [
+                "setVertexBuffer:offset:atIndex:",
+                "setFragmentBuffer:offset:atIndex:",
+            ] {
+                send_buffer(render, objc::sel::get(method), buffer, 0, 3);
+                send_buffer(render, objc::sel::get(method), std::ptr::null_mut(), 0, 3);
+            }
+            send_void(render, objc::sel::get("endEncoding"));
+            send_void(render_command, objc::sel::get("commit"));
+            send_void(render_command, objc::sel::get("waitUntilCompleted"));
+        }
+        assert_eq!(
+            unsafe { command_status(render_command, std::ptr::null()) },
+            4
+        );
+        objc::arc::pool_pop(pool);
+        for object in [pass, texture, descriptor, buffer, queue] {
+            objc::arc::release(object);
+        }
+    }
+
+    #[test]
     fn builtin_texture_to_buffer_blit_verifies_gpu_copy() {
         if !require_native_opt_in() {
             return;
@@ -1430,6 +1528,57 @@ mod tests {
             unsafe { std::slice::from_raw_parts(memory.add(256), 8) },
             &pixels[8..]
         );
+        // Metal ignores destinationBytesPerImage for a single 2D image.
+        // Zero and a nonzero inter-image stride smaller than the copied data
+        // are both valid for one 2D image. Check both rows and guard bytes.
+        for image_stride in [0, 1] {
+            let output_zero = unsafe { new_buffer(device, std::ptr::null(), 544, 0) };
+            let zero_memory = unsafe { buffer_contents(output_zero, std::ptr::null()) } as *mut u8;
+            assert!(!zero_memory.is_null());
+            unsafe { std::ptr::write_bytes(zero_memory, 0xA5, 544) };
+            let zero_command = unsafe { new_command_buffer(queue, std::ptr::null()) };
+            let zero_blit = unsafe { send_id(zero_command, objc::sel::get("blitCommandEncoder")) };
+            assert!(!zero_blit.is_null());
+            unsafe {
+                send_copy(
+                    zero_blit,
+                    objc::sel::get(
+                        "copyFromTexture:sourceSlice:sourceLevel:sourceOrigin:sourceSize:toBuffer:destinationOffset:destinationBytesPerRow:destinationBytesPerImage:",
+                    ),
+                    texture,
+                    0,
+                    0,
+                    encoder::MtlOrigin { x: 0, y: 0, z: 0 },
+                    encoder::MtlSize {
+                        width: 2,
+                        height: 2,
+                        depth: 1,
+                    },
+                    output_zero,
+                    16,
+                    256,
+                    image_stride,
+                );
+                send_void(zero_blit, objc::sel::get("endEncoding"));
+                send_void(zero_command, objc::sel::get("commit"));
+                send_void(zero_command, objc::sel::get("waitUntilCompleted"));
+            }
+            assert_eq!(unsafe { command_status(zero_command, std::ptr::null()) }, 4);
+            assert_eq!(
+                unsafe { std::slice::from_raw_parts(zero_memory.add(16), 8) },
+                &pixels[..8]
+            );
+            assert_eq!(
+                unsafe { std::slice::from_raw_parts(zero_memory.add(272), 8) },
+                &pixels[8..]
+            );
+            assert_eq!(
+                unsafe { std::slice::from_raw_parts(zero_memory, 16) },
+                &[0xA5; 16]
+            );
+            assert_eq!(unsafe { *zero_memory.add(543) }, 0xA5);
+            objc::arc::release(output_zero);
+        }
         objc::arc::pool_pop(pool);
         for object in [output, texture, desc, queue] {
             objc::arc::release(object);

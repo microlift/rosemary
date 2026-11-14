@@ -14,16 +14,17 @@ const HAS_SIGNATURE: i32 = 1 << 30;
 
 struct HandlerCapture {
     guest_block: AtomicUsize,
-    guest_command: usize,
+    guest_command: AtomicUsize,
 }
 
 impl Drop for HandlerCapture {
     fn drop(&mut self) {
         let block = self.guest_block.swap(0, Ordering::AcqRel);
-        if block != 0 {
-            objc::block::release(block as Id);
-        }
-        objc::arc::release(self.guest_command as Id);
+        let command = self.guest_command.swap(0, Ordering::AcqRel);
+        // Host block disposal can run on an Apple-owned thread with no Darwin
+        // TLS or guest autorelease pool. Transfer ownership; never finalize a
+        // guest object here, even if no completion handler ever ran.
+        unsafe { crate::completion::retire_owned(block as Id, command as Id) };
     }
 }
 
@@ -75,12 +76,15 @@ extern "C" fn finished(block: *const HostBlock, _host_command: HostId) {
     }
     let capture = unsafe { &*capture };
     let guest_block = capture.guest_block.swap(0, Ordering::AcqRel);
-    if guest_block != 0 {
-        // The existing Metal worker owns the block and retains the guest
-        // command until the callback has finished. It enters Darwin TLS and
-        // an autorelease pool before invoking guest code.
-        unsafe {
-            crate::completion::deliver(guest_block as Id, capture.guest_command as Id);
+    let guest_command = capture.guest_command.swap(0, Ordering::AcqRel);
+    // Both references were retained on the guest registration thread. Metal
+    // may call this on an uninitialized native thread, so only queue the
+    // owned references and do not touch guest Objective-C here.
+    unsafe {
+        if guest_block != 0 {
+            crate::completion::deliver_owned(guest_block as Id, guest_command as Id);
+        } else {
+            crate::completion::retire_owned(std::ptr::null_mut(), guest_command as Id);
         }
     }
 }
@@ -113,7 +117,7 @@ pub(super) fn register(host_command: HostId, guest_command: Id, guest_block: Id,
     }
     let capture = Arc::new(HandlerCapture {
         guest_block: AtomicUsize::new(guest_block as usize),
-        guest_command: objc::arc::retain(guest_command) as usize,
+        guest_command: AtomicUsize::new(objc::arc::retain(guest_command) as usize),
     });
     let raw = Arc::into_raw(capture);
     let block = HostBlock {
@@ -140,4 +144,127 @@ pub(super) fn register(host_command: HostId, guest_command: Id, guest_block: Id,
     // The retained host copy now owns its Arc strong count. The stack
     // literal's reference was only needed for the duration of registration.
     unsafe { drop(Arc::from_raw(raw)) };
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+    static DISPOSALS: AtomicUsize = AtomicUsize::new(0);
+    static RELEASED_ON_WORKER: AtomicBool = AtomicBool::new(false);
+
+    #[repr(C)]
+    struct GuestStackBlock {
+        isa: *const c_void,
+        flags: i32,
+        reserved: i32,
+        invoke: unsafe extern "C" fn(Id, Id),
+        descriptor: &'static GuestBlockDescriptor,
+    }
+
+    #[repr(C)]
+    struct GuestBlockDescriptor {
+        reserved: usize,
+        size: usize,
+        copy: unsafe extern "C" fn(*mut c_void, *const c_void),
+        dispose: unsafe extern "C" fn(*mut c_void),
+    }
+
+    unsafe extern "C" fn do_nothing(_block: Id, _command: Id) {}
+    unsafe extern "C" fn copied_guest_block(_to: *mut c_void, _from: *const c_void) {}
+    unsafe extern "C" fn disposed_guest_block(_block: *mut c_void) {
+        RELEASED_ON_WORKER.store(
+            std::thread::current().name() == Some("metal:completed"),
+            Ordering::SeqCst,
+        );
+        DISPOSALS.fetch_add(1, Ordering::SeqCst);
+    }
+
+    static GUEST_DESCRIPTOR: GuestBlockDescriptor = GuestBlockDescriptor {
+        reserved: 0,
+        size: std::mem::size_of::<GuestStackBlock>(),
+        copy: copied_guest_block,
+        dispose: disposed_guest_block,
+    };
+
+    #[test]
+    fn last_host_block_disposal_on_foreign_thread_retires_guest_references_on_worker() {
+        if !super::super::enabled() {
+            eprintln!("skipped: set ROSEMARY_METAL_BACKEND=native");
+            return;
+        }
+        crate::bootstrap();
+        DISPOSALS.store(0, Ordering::SeqCst);
+        RELEASED_ON_WORKER.store(false, Ordering::SeqCst);
+        let pool = objc::arc::pool_push();
+        let device = super::super::default_device();
+        let queue = unsafe { super::super::new_queue(device, std::ptr::null()) };
+        let command = unsafe { super::super::new_command_buffer(queue, std::ptr::null()) };
+        assert!(!command.is_null());
+
+        let stack_class = objc::class::lookup(c"__NSStackBlock__").unwrap();
+        let stack = GuestStackBlock {
+            isa: objc::class::ptr(stack_class).cast(),
+            flags: HAS_COPY_DISPOSE,
+            reserved: 0,
+            invoke: do_nothing,
+            descriptor: &GUEST_DESCRIPTOR,
+        };
+        let guest_block = objc::block::copy((&raw const stack).cast_mut().cast());
+        assert!(!guest_block.is_null());
+        let capture = Arc::new(HandlerCapture {
+            guest_block: AtomicUsize::new(guest_block as usize),
+            guest_command: AtomicUsize::new(objc::arc::retain(command) as usize),
+        });
+        let raw = Arc::into_raw(capture);
+        let host_stack = HostBlock {
+            isa: native_stack_block_isa(),
+            flags: HAS_COPY_DISPOSE | HAS_SIGNATURE,
+            reserved: 0,
+            invoke: finished,
+            descriptor: &DESCRIPTOR,
+            capture: raw,
+        };
+        assert!(!host_stack.isa.is_null());
+        // Use Apple's actual Blocks runtime. The host copy helper holds the
+        // capture, and its dispose helper runs on a foreign host thread.
+        let library = unsafe {
+            libc::dlopen(
+                c"/usr/lib/libSystem.B.dylib".as_ptr(),
+                libc::RTLD_NOW | libc::RTLD_LOCAL,
+            )
+        };
+        assert!(!library.is_null());
+        let copy_symbol = unsafe { libc::dlsym(library, c"_Block_copy".as_ptr()) };
+        let release_symbol = unsafe { libc::dlsym(library, c"_Block_release".as_ptr()) };
+        assert!(!copy_symbol.is_null() && !release_symbol.is_null());
+        let host_copy: unsafe extern "C" fn(*const c_void) -> *mut c_void =
+            unsafe { std::mem::transmute(copy_symbol) };
+        let host_release_block: unsafe extern "C" fn(*const c_void) =
+            unsafe { std::mem::transmute(release_symbol) };
+        let copied = unsafe { host_copy((&raw const host_stack).cast()) };
+        assert!(!copied.is_null());
+        unsafe { drop(Arc::from_raw(raw)) };
+        let host_address = copied as usize;
+        std::thread::Builder::new()
+            .name("uninitialized-host-metal-callback".into())
+            .spawn(move || unsafe { host_release_block(host_address as *const c_void) })
+            .unwrap()
+            .join()
+            .unwrap();
+        for _ in 0..200 {
+            if DISPOSALS.load(Ordering::SeqCst) != 0 {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert_eq!(DISPOSALS.load(Ordering::SeqCst), 1);
+        assert!(
+            RELEASED_ON_WORKER.load(Ordering::SeqCst),
+            "guest block dispose helper ran outside the Darwin completion worker"
+        );
+        objc::arc::pool_pop(pool);
+        objc::arc::release(queue);
+    }
 }

@@ -868,19 +868,23 @@ unsafe extern "C" fn set_fragment_buffer_offset(receiver: Id, _sel: Sel, offset:
 }
 
 fn set_buffer(receiver: Id, selector: &CStr, buffer: Id, offset: u64, index: u64) {
-    if !object::is_kind(buffer, c"RosemaryNativeMTLBuffer") {
+    let native_buffer = if buffer.is_null() {
+        // Passing nil unbinds the vertex/fragment slot in Apple Metal.
+        std::ptr::null_mut()
+    } else if object::is_kind(buffer, c"RosemaryNativeMTLBuffer") {
+        let guest = unsafe { object::body::<NativeBuffer>(buffer) };
+        if guest.device != unsafe { encoder_device(receiver, std::ptr::null()) } {
+            gpu::trace("native render buffer belongs to another device".to_string());
+            return;
+        }
+        guest.host
+    } else {
         gpu::trace("native render encoder requires a native buffer".to_string());
         return;
-    }
-    if unsafe { object::body::<NativeBuffer>(buffer) }.device
-        != unsafe { encoder_device(receiver, std::ptr::null()) }
-    {
-        gpu::trace("native render buffer belongs to another device".to_string());
-        return;
-    }
-    let native_buffer = unsafe { object::body::<NativeBuffer>(buffer) }.host;
+    };
     let _pool = HostPool::new();
-    if offset > unsafe { host_send_u64(native_buffer, sel(c"length")) } {
+    if !native_buffer.is_null() && offset > unsafe { host_send_u64(native_buffer, sel(c"length")) }
+    {
         gpu::trace("native render buffer offset out of bounds".to_string());
         return;
     }

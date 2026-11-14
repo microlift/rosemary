@@ -137,6 +137,8 @@ unsafe extern "C" fn copy_texture_to_buffer(
     let texture_height = unsafe { host_send_u64(source.host, sel(c"height")) };
     let texture_type = unsafe { host_send_u64(source.host, sel(c"textureType")) };
     let samples = unsafe { host_send_u64(source.host, sel(c"sampleCount")) };
+    // For a single 2D image Apple Metal ignores destinationBytesPerImage;
+    // the row-stride-based size still bounds the actual destination buffer.
     let image_end = bytes_per_row.checked_mul(size.height);
     let byte_end = offset.checked_add(image_end.unwrap_or(u64::MAX));
     let dest_len = unsafe { host_send_u64(destination.host, sel(c"length")) };
@@ -159,7 +161,6 @@ unsafe extern "C" fn copy_texture_to_buffer(
         || size.height == 0
         || !within_texture
         || bytes_per_row < size.width.saturating_mul(4)
-        || bytes_per_image < image_end.unwrap_or(u64::MAX)
         || !byte_end.is_some_and(|end| end <= dest_len)
     {
         gpu::trace(

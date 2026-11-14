@@ -538,20 +538,24 @@ unsafe extern "C" fn set_pipeline(receiver: Id, _sel: Sel, pipeline: Id) {
 }
 
 unsafe extern "C" fn set_buffer(receiver: Id, _sel: Sel, buffer: Id, offset: u64, index: u64) {
-    if !object::is_kind(buffer, c"RosemaryNativeMTLBuffer") {
+    let native_buffer = if buffer.is_null() {
+        // Metal permits nil to unbind a buffer slot; do not leave the old
+        // resource bound when the guest explicitly clears it.
+        std::ptr::null_mut()
+    } else if object::is_kind(buffer, c"RosemaryNativeMTLBuffer") {
+        let guest = unsafe { object::body::<NativeBuffer>(buffer) };
+        if guest.device != unsafe { encoder_device(receiver, std::ptr::null()) } {
+            gpu::trace("native compute buffer belongs to another device".to_string());
+            return;
+        }
+        guest.host
+    } else {
         gpu::trace("native compute encoder requires a native buffer".to_string());
         return;
-    }
-    if unsafe { object::body::<NativeBuffer>(buffer) }.device
-        != unsafe { encoder_device(receiver, std::ptr::null()) }
-    {
-        gpu::trace("native compute buffer belongs to another device".to_string());
-        return;
-    }
-    let native_buffer = unsafe { object::body::<NativeBuffer>(buffer) }.host;
+    };
     let _pool = HostPool::new();
-    let length = unsafe { host_send_u64(native_buffer, sel(c"length")) };
-    if offset > length {
+    if !native_buffer.is_null() && offset > unsafe { host_send_u64(native_buffer, sel(c"length")) }
+    {
         gpu::trace("native compute buffer offset is out of bounds".to_string());
         return;
     }

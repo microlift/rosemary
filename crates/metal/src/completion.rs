@@ -9,6 +9,7 @@ use objc::object::Id;
 struct Pending {
     block: usize,
     command_buffer: usize,
+    invoke: bool,
     /// When it was queued, while statistics are on.
     queued: Option<std::time::Instant>,
 }
@@ -31,6 +32,40 @@ static WORKER: Once = Once::new();
 /// `block` is a block this crate copied and now gives away, and
 /// `command_buffer` a live `MTLCommandBuffer` the caller has not released.
 pub(crate) unsafe fn deliver(block: Id, command_buffer: Id) {
+    enqueue_owned(block, objc::arc::retain(command_buffer), true);
+}
+
+/// Transfer one already-retained guest block *and* command-buffer reference
+/// from an Apple Metal callback thread. No guest retain/release or block
+/// operation is permitted on the calling thread.
+///
+/// # Safety
+///
+/// The caller gives the worker ownership of exactly one guest reference to
+/// each object; both must remain live until the worker processes this entry.
+#[cfg(target_os = "macos")]
+pub(crate) unsafe fn deliver_owned(block: Id, command_buffer: Id) {
+    debug_assert!(!block.is_null() && !command_buffer.is_null());
+    enqueue_owned(block, command_buffer, true);
+}
+
+/// Transfer any remaining guest-owned references after an Apple host block is
+/// disposed (including disposal without the callback ever being invoked).
+/// This is safe to call from a native Metal callback thread, because the
+/// worker alone finalizes the guest references with Darwin TLS installed.
+///
+/// # Safety
+///
+/// Non-null arguments are each exactly one live, owned guest reference.
+#[cfg(target_os = "macos")]
+pub(crate) unsafe fn retire_owned(block: Id, command_buffer: Id) {
+    if block.is_null() && command_buffer.is_null() {
+        return;
+    }
+    enqueue_owned(block, command_buffer, false);
+}
+
+fn enqueue_owned(block: Id, command_buffer: Id, invoke: bool) {
     WORKER.call_once(|| {
         // Detached deliberately: it runs for the life of the process, and there
         // is no point in the process at which Metal is known to be finished.
@@ -41,9 +76,8 @@ pub(crate) unsafe fn deliver(block: Id, command_buffer: Id) {
     });
     let entry = Pending {
         block: block as usize,
-        // The guest may release the command buffer the moment `-commit` returns,
-        // and the handler is handed it as its argument.
-        command_buffer: objc::arc::retain(command_buffer) as usize,
+        command_buffer: command_buffer as usize,
+        invoke,
         queued: crate::stats::timer(),
     };
     let mut pending = QUEUE.pending.lock().expect("the completion queue");
@@ -93,7 +127,9 @@ unsafe fn run(entry: Pending) {
         // each one; without it whatever the handler autoreleases leaks.
         let pool = objc::arc::pool_push();
         // SAFETY: `block` was copied by `objc_retainBlock` and is still live.
-        if let Some(invoke) = unsafe { objc::block::invoke(block) } {
+        if entry.invoke
+            && let Some(invoke) = unsafe { objc::block::invoke(block) }
+        {
             // SAFETY: a completion handler is `void (^)(id<MTLCommandBuffer>)`.
             let call: unsafe extern "C" fn(Id, Id) = unsafe { std::mem::transmute(invoke) };
             // SAFETY: the guest's handler, given the buffer it was registered on.
@@ -103,8 +139,12 @@ unsafe fn run(entry: Pending) {
         // The references this entry owned, now spent. The last reference to
         // either may run guest code: the block's dispose helper, or whatever
         // the guest associated with the command buffer.
-        objc::block::release(block);
-        objc::arc::release(command_buffer);
+        if !block.is_null() {
+            objc::block::release(block);
+        }
+        if !command_buffer.is_null() {
+            objc::arc::release(command_buffer);
+        }
     }
     crate::stats::finish_timer(crate::stats::Counter::HandlerRunMicros, running);
 }
