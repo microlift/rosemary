@@ -3143,6 +3143,7 @@ pub static SIGNATURES: &[FunctionAbi] = &[
     sig!("mkdtemp", P, P),
     sig!("mknod", I32, P, U32, I32),
     sig!("mkstemp", I32, P),
+    sig!("mkstemps", I32, P, I32),
     sig!("mktemp", P, P),
     sig!("_mktemp", P, P),
     sig!("mktime", I64, P),

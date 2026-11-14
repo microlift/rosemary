@@ -29,22 +29,31 @@ pub fn build() -> &'static str {
     BUILD.get_or_init(|| env_or("ROSEMARY_DARWIN_BUILD", "24A335"))
 }
 
+/// The first Darwin of macOS 11, the first major version after 10.x.
+const DARWIN_BIG_SUR: i32 = 20;
+/// The first Darwin of macOS 26, numbered for its year rather than in sequence.
+const DARWIN_TAHOE: i32 = 25;
+
 /// The macOS version [`darwin`] implies, as `(major, minor, patch)`.
 ///
-/// Darwin 20 is macOS 11 and each is one apart after that; before it, every
-/// Darwin was some 10.x.
+/// Darwin 20 is macOS 11 and each is one apart up to Darwin 24 (macOS 15);
+/// Darwin 25 is macOS 26, when macOS took the year's number. Before Darwin 20,
+/// every Darwin was some 10.x.
 pub fn macos_version() -> (i32, i32, i32) {
     static VERSION: OnceLock<(i32, i32, i32)> = OnceLock::new();
-    *VERSION.get_or_init(|| {
-        let mut parts = darwin().split('.').map(|p| p.parse::<i32>().unwrap_or(0));
-        let darwin = parts.next().unwrap_or(24);
-        let minor = parts.next().unwrap_or(0);
-        let patch = parts.next().unwrap_or(0);
-        match darwin >= 20 {
-            true => (darwin - 9, minor, patch),
-            false => (10, darwin - 4, minor),
-        }
-    })
+    *VERSION.get_or_init(|| macos_version_of(darwin()))
+}
+
+fn macos_version_of(release: &str) -> (i32, i32, i32) {
+    let mut parts = release.split('.').map(|p| p.parse::<i32>().unwrap_or(0));
+    let darwin = parts.next().unwrap_or(24);
+    let minor = parts.next().unwrap_or(0);
+    let patch = parts.next().unwrap_or(0);
+    match darwin {
+        DARWIN_TAHOE.. => (darwin + 1, minor, patch),
+        DARWIN_BIG_SUR.. => (darwin - 9, minor, patch),
+        _ => (10, darwin - 4, minor),
+    }
 }
 
 /// `kern.osproductversion`, spelled as macOS does: no patch component when it
@@ -119,6 +128,15 @@ mod tests {
         assert_eq!(darwin(), first);
         assert_eq!(macos_version(), version);
         unsafe { std::env::remove_var("ROSEMARY_DARWIN_RELEASE") };
+    }
+
+    #[test]
+    fn darwin_releases_name_their_macos_versions() {
+        assert_eq!(macos_version_of("19.6.0"), (10, 15, 6));
+        assert_eq!(macos_version_of("20.1.0"), (11, 1, 0));
+        assert_eq!(macos_version_of("24.6.0"), (15, 6, 0));
+        assert_eq!(macos_version_of("25.0.0"), (26, 0, 0));
+        assert_eq!(macos_version_of("25.2.0"), (26, 2, 0));
     }
 
     #[test]

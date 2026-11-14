@@ -23,6 +23,7 @@ const ATTR_CMN_OBJTYPE: u32 = 0x0000_0008;
 const ATTR_CMN_MODTIME: u32 = 0x0000_0400;
 const ATTR_CMN_CHGTIME: u32 = 0x0000_0800;
 const ATTR_CMN_ACCTIME: u32 = 0x0000_1000;
+const ATTR_CMN_FNDRINFO: u32 = 0x0000_4000;
 const ATTR_CMN_OWNERID: u32 = 0x0000_8000;
 const ATTR_CMN_GRPID: u32 = 0x0001_0000;
 const ATTR_CMN_ACCESSMASK: u32 = 0x0002_0000;
@@ -30,6 +31,9 @@ const ATTR_CMN_FLAGS: u32 = 0x0004_0000;
 const ATTR_CMN_FILEID: u32 = 0x0200_0000;
 const ATTR_CMN_ERROR: u32 = 0x2000_0000;
 const ATTR_CMN_RETURNED_ATTRS: u32 = 0x8000_0000;
+
+const ATTR_VOL_CAPABILITIES: u32 = 0x0002_0000;
+const ATTR_VOL_INFO: u32 = 0x8000_0000;
 
 const ATTR_DIR_LINKCOUNT: u32 = 0x0000_0001;
 const ATTR_DIR_ENTRYCOUNT: u32 = 0x0000_0002;
@@ -46,6 +50,7 @@ const COMMON: u32 = ATTR_CMN_DEVID
     | ATTR_CMN_MODTIME
     | ATTR_CMN_CHGTIME
     | ATTR_CMN_ACCTIME
+    | ATTR_CMN_FNDRINFO
     | ATTR_CMN_OWNERID
     | ATTR_CMN_GRPID
     | ATTR_CMN_ACCESSMASK
@@ -55,6 +60,8 @@ const COMMON: u32 = ATTR_CMN_DEVID
 /// What only `getattrlistbulk` answers: an entry's name is the one thing a
 /// listing does not already know, and its error is per entry.
 const BULK_ONLY: u32 = ATTR_CMN_NAME | ATTR_CMN_ERROR;
+/// `ATTR_VOL_INFO` asks for nothing itself; it marks a volume request.
+const VOLUME: u32 = ATTR_VOL_CAPABILITIES | ATTR_VOL_INFO;
 const DIR: u32 = ATTR_DIR_LINKCOUNT | ATTR_DIR_ENTRYCOUNT;
 const FILE: u32 = ATTR_FILE_LINKCOUNT
     | ATTR_FILE_TOTALSIZE
@@ -82,6 +89,50 @@ fn object_type(mode: u16) -> u32 {
     }
 }
 
+// `vol_capabilities_attr_t`'s words: the volume format's, then its interfaces'.
+const VOL_CAPABILITIES_FORMAT: usize = 0;
+const VOL_CAPABILITIES_INTERFACES: usize = 1;
+
+const VOL_CAP_FMT_SYMBOLICLINKS: u32 = 0x0000_0002;
+const VOL_CAP_FMT_HARDLINKS: u32 = 0x0000_0004;
+const VOL_CAP_FMT_NO_IMMUTABLE_FILES: u32 = 0x0020_0000;
+const VOL_CAP_FMT_NO_PERMISSIONS: u32 = 0x0040_0000;
+const VOL_CAP_INT_ATTRLIST: u32 = 0x0000_0002;
+const VOL_CAP_INT_EXTENDED_SECURITY: u32 = 0x0000_0400;
+
+/// `ATTR_VOL_CAPABILITIES`: the capabilities, then which of them are known.
+///
+/// Only what holds for every volume this runtime puts under `/` is claimed;
+/// the rest, case sensitivity among it, is left invalid, which a caller reads
+/// as unknown. The format bits are the ones xnu marks valid for a filesystem
+/// that does not; ACLs are refused by `setattrlist`, so extended security is
+/// known to be absent.
+fn volume_capabilities() -> [u32; 8] {
+    let mut caps = [0u32; 8];
+    let (capabilities, valid) = caps.split_at_mut(4);
+    capabilities[VOL_CAPABILITIES_FORMAT] = VOL_CAP_FMT_SYMBOLICLINKS | VOL_CAP_FMT_HARDLINKS;
+    valid[VOL_CAPABILITIES_FORMAT] = VOL_CAP_FMT_SYMBOLICLINKS
+        | VOL_CAP_FMT_HARDLINKS
+        | VOL_CAP_FMT_NO_IMMUTABLE_FILES
+        | VOL_CAP_FMT_NO_PERMISSIONS;
+    capabilities[VOL_CAPABILITIES_INTERFACES] = VOL_CAP_INT_ATTRLIST;
+    valid[VOL_CAPABILITIES_INTERFACES] = VOL_CAP_INT_ATTRLIST | VOL_CAP_INT_EXTENDED_SECURITY;
+    caps
+}
+
+/// A file's Finder info, as `read` gets the `com.apple.FinderInfo` attribute
+/// into the buffer it is given: thirty-two zero bytes for a file without one,
+/// which is how xnu reports it.
+fn finder_info(read: impl FnOnce(&mut [u8]) -> isize) -> [u8; 32] {
+    let saved = crate::errno::get();
+    let mut info = [0u8; 32];
+    if read(&mut info) != info.len() as isize {
+        info = [0; 32];
+    }
+    crate::errno::set(saved);
+    info
+}
+
 /// Why a request was refused, before anything was looked up.
 fn check(list: &AttrList, options: u64, bulk: bool) -> Result<(), c_int> {
     if list.bitmapcount != ATTR_BIT_MAP_COUNT || options & !OPTIONS != 0 {
@@ -91,13 +142,19 @@ fn check(list: &AttrList, options: u64, bulk: bool) -> Result<(), c_int> {
     if bulk && list.commonattr & ATTR_CMN_RETURNED_ATTRS == 0 {
         return Err(libc::EINVAL);
     }
+    // Volume attributes describe the volume, not an object on it, so xnu
+    // refuses them beside an object's own and in a listing.
+    let object_attrs = list.dirattr | list.fileattr | list.forkattr;
+    if list.volattr != 0 && (bulk || object_attrs != 0) {
+        return Err(libc::EINVAL);
+    }
     let common = match bulk {
         true => COMMON | BULK_ONLY,
         false => COMMON,
     };
     let unsupported = [
         ("common", list.commonattr & !common),
-        ("volume", list.volattr),
+        ("volume", list.volattr & !VOLUME),
         ("directory", list.dirattr & !DIR),
         ("file", list.fileattr & !FILE),
         ("fork", list.forkattr),
@@ -128,6 +185,7 @@ fn pack(
     found: Result<&Stat, c_int>,
     name: Option<&[u8]>,
     entries: impl FnOnce() -> u32,
+    finder: impl FnOnce() -> [u8; 32],
 ) -> Vec<u8> {
     let zero = Stat::default();
     let (st, error) = match found {
@@ -146,16 +204,25 @@ fn pack(
         (0, false) => (common_asked & !ATTR_CMN_ERROR, 0, list.fileattr),
         _ => (common_asked & (ATTR_CMN_NAME | ATTR_CMN_ERROR), 0, 0),
     };
-    let (common, dir, file) = match pack_invalid {
-        true => (common_asked, list.dirattr, list.fileattr),
-        false => (common_valid, dir_valid, file_valid),
+    let volume_valid = match error {
+        0 => list.volattr & ATTR_VOL_CAPABILITIES,
+        _ => 0,
+    };
+    let (common, volume, dir, file) = match pack_invalid {
+        true => (
+            common_asked,
+            list.volattr & ATTR_VOL_CAPABILITIES,
+            list.dirattr,
+            list.fileattr,
+        ),
+        false => (common_valid, volume_valid, dir_valid, file_valid),
     };
 
     let mut out = vec![0u8; 4];
     if list.commonattr & ATTR_CMN_RETURNED_ATTRS != 0 {
         // `attribute_set_t`: what is actually valid, then its own padding
         // word. The flag itself is not listed as returned.
-        for bits in [common_valid, 0, dir_valid, file_valid, 0] {
+        for bits in [common_valid, volume_valid, dir_valid, file_valid, 0] {
             out.extend_from_slice(&bits.to_ne_bytes());
         }
     }
@@ -185,6 +252,10 @@ fn pack(
     if common & ATTR_CMN_ACCTIME != 0 {
         time(&mut out, st.atime);
     }
+    if common & ATTR_CMN_FNDRINFO != 0 {
+        let info = if error == 0 { finder() } else { [0; 32] };
+        out.extend_from_slice(&info);
+    }
     if common & ATTR_CMN_OWNERID != 0 {
         u32_(&mut out, st.uid);
     }
@@ -202,6 +273,11 @@ fn pack(
     }
     if common & ATTR_CMN_ERROR != 0 {
         u32_(&mut out, error as u32);
+    }
+    if volume & ATTR_VOL_CAPABILITIES != 0 {
+        for word in volume_capabilities() {
+            u32_(&mut out, word);
+        }
     }
     if dir & ATTR_DIR_LINKCOUNT != 0 {
         // Hard links *to the directory*, not `st_nlink`: a Linux directory's
@@ -297,6 +373,21 @@ pub unsafe extern "C" fn getattrlist(
         crate::errno::set(errno);
         return -1;
     }
+    // The volume's attributes are its root's, the one volume `getmntinfo`
+    // reports, once the path is known to lead somewhere.
+    let root = c"/";
+    // SAFETY: the caller's NUL-terminated path.
+    if list.volattr != 0 && unsafe { CStr::from_ptr(path) } != root {
+        if Target::Path(path, options & FSOPT_NOFOLLOW == 0)
+            .stat()
+            .is_none()
+        {
+            return -1;
+        }
+        // SAFETY: a NUL-terminated path, and the caller's other obligations.
+        return unsafe { getattrlist(root.as_ptr(), &list, buf, size, options) };
+    }
+    let nofollow = options & FSOPT_NOFOLLOW != 0;
     let found = crate::stat::with_fallback(path, |host| {
         // SAFETY: a zeroed `struct stat` for the host to fill, and the path
         // `with_fallback` translated.
@@ -310,9 +401,21 @@ pub unsafe extern "C" fn getattrlist(
         // SAFETY: `host` is the NUL-terminated path just used.
         let answer = (rc == 0).then(|| {
             let st = crate::stat::from_host(&st);
-            pack(&list, options, Ok(&st), None, || {
-                count_entries(unsafe { CStr::from_ptr(host) })
-            })
+            // SAFETY: `host` is the NUL-terminated path just used.
+            let host = unsafe { CStr::from_ptr(host) };
+            pack(
+                &list,
+                options,
+                Ok(&st),
+                None,
+                || count_entries(host),
+                // SAFETY: as above, and a name this module owns.
+                || {
+                    finder_info(|info| unsafe {
+                        crate::xattr::get_on_host(host, FINDER_INFO, info, nofollow)
+                    })
+                },
+            )
         });
         (answer, rc == 0)
     });
@@ -349,13 +452,26 @@ pub unsafe extern "C" fn fgetattrlist(
     if unsafe { libc::fstat(fd, &mut st) } != 0 {
         return -1;
     }
+    if list.volattr != 0 {
+        // SAFETY: a NUL-terminated path, and the caller's other obligations.
+        return unsafe { getattrlist(c"/".as_ptr(), &list, buf, size, options) };
+    }
     let st = crate::stat::from_host(&st);
-    let answer = pack(&list, options, Ok(&st), None, || {
-        let path = starnix::fd::path(fd).unwrap_or_default();
-        count_entries(
-            &std::ffi::CString::new(path.into_os_string().into_encoded_bytes()).unwrap_or_default(),
-        )
-    });
+    let answer = pack(
+        &list,
+        options,
+        Ok(&st),
+        None,
+        || {
+            let path = starnix::fd::path(fd).unwrap_or_default();
+            count_entries(
+                &std::ffi::CString::new(path.into_os_string().into_encoded_bytes())
+                    .unwrap_or_default(),
+            )
+        },
+        // SAFETY: the caller's descriptor, and a name this module owns.
+        || finder_info(|info| unsafe { crate::xattr::get_on_fd(fd, FINDER_INFO, info) }),
+    );
     unsafe { copy_out(answer, options, buf, size) }
 }
 
@@ -479,7 +595,16 @@ pub unsafe extern "C" fn getattrlistbulk(
             0 => Ok(&st),
             _ => Err(crate::errno::from_host(crate::errno::get())),
         };
-        let packed = pack(&list, options, found, Some(name.to_bytes()), || {
+        let finder = || {
+            use std::os::unix::ffi::OsStrExt;
+            let mut path = starnix::fd::path(fd).unwrap_or_default();
+            path.push(std::ffi::OsStr::from_bytes(name.to_bytes()));
+            let path = std::ffi::CString::new(path.into_os_string().into_encoded_bytes())
+                .unwrap_or_default();
+            // SAFETY: a NUL-terminated path, and a name this module owns.
+            finder_info(|info| unsafe { crate::xattr::get_on_host(&path, FINDER_INFO, info, true) })
+        };
+        let entries = || {
             // SAFETY: as for the `stat` above.
             let at = unsafe { libc::openat(fd, name.as_ptr(), libc::O_RDONLY | libc::O_DIRECTORY) };
             let n = match at < 0 {
@@ -499,7 +624,15 @@ pub unsafe extern "C" fn getattrlistbulk(
                 unsafe { libc::close(at) };
             }
             n
-        });
+        };
+        let packed = pack(
+            &list,
+            options,
+            found,
+            Some(name.to_bytes()),
+            entries,
+            finder,
+        );
         if out.len() + packed.len() > size {
             state.pending = Some(entry);
             if count == 0 {
@@ -524,14 +657,12 @@ pub unsafe extern "C" fn getattrlistbulk(
 const ATTR_CMN_SCRIPT: u32 = 0x0000_0100;
 const ATTR_CMN_CRTIME: u32 = 0x0000_0200;
 const ATTR_CMN_BKUPTIME: u32 = 0x0000_2000;
-const ATTR_CMN_FNDRINFO: u32 = 0x0000_4000;
 const ATTR_CMN_EXTENDED_SECURITY: u32 = 0x0040_0000;
 const ATTR_CMN_UUID: u32 = 0x0080_0000;
 const ATTR_CMN_GRPUUID: u32 = 0x0100_0000;
 const ATTR_CMN_ADDEDTIME: u32 = 0x1000_0000;
 const ATTR_CMN_DATA_PROTECT_FLAGS: u32 = 0x4000_0000;
 const ATTR_VOL_NAME: u32 = 0x0000_2000;
-const ATTR_VOL_INFO: u32 = 0x8000_0000;
 const ATTR_FILE_DEVTYPE: u32 = 0x0000_0020;
 
 // `sys/attr.h`'s `ATTR_*_SETMASK`: what may be set at all. Anything outside is
@@ -1186,6 +1317,50 @@ mod tests {
         assert_eq!((cleared, after), (0, -1));
     }
 
+    /// What `setattrlist` writes, `getattrlist` reads back, after the access
+    /// time and before the owner; a file with none has thirty-two zero bytes.
+    #[test]
+    fn getattrlist_reads_finder_info_back() {
+        let (file, path) = scratch_file("getattrlist-finderinfo");
+        let l = list(ATTR_CMN_FNDRINFO | ATTR_CMN_OWNERID, 0, 0);
+        let none = ask(&path, l, 0).unwrap();
+        let mut info = [0u8; 32];
+        info[8..10].copy_from_slice(&0x4000u16.to_be_bytes());
+        let set = list(ATTR_CMN_FNDRINFO, 0, 0);
+        // SAFETY: live locals of the sizes passed.
+        let rc = unsafe { setattrlist(path.as_ptr(), &set, info.as_ptr().cast(), 32, 0) };
+        let some = ask(&path, l, 0);
+        std::fs::remove_file(&file).unwrap();
+        assert_eq!(none.len(), 4 + 32 + 4);
+        assert_eq!(none[4..36], [0; 32]);
+        if rc != 0 {
+            return;
+        }
+        let some = some.unwrap();
+        assert_eq!(some[4..36], info);
+        // SAFETY: a scalar.
+        assert_eq!(word(&some, 36), unsafe { libc::getuid() });
+    }
+
+    #[test]
+    fn volume_capabilities_are_the_roots_from_any_path() {
+        let (file, path) = scratch_file("getattrlist-volume");
+        let mut l = list(ATTR_CMN_RETURNED_ATTRS, 0, 0);
+        l.volattr = ATTR_VOL_INFO | ATTR_VOL_CAPABILITIES;
+        let b = ask(&path, l, 0).unwrap();
+        l.fileattr = ATTR_FILE_TOTALSIZE;
+        let mixed = ask(&path, l, 0);
+        std::fs::remove_file(&file).unwrap();
+        // Length, returned set, then the capabilities and which are known.
+        assert_eq!(b.len(), 4 + 20 + 32);
+        assert_eq!(word(&b, 8), ATTR_VOL_CAPABILITIES);
+        let format = word(&b, 24);
+        let format_valid = word(&b, 40);
+        assert_eq!(format & !format_valid, 0, "only known bits are claimed");
+        assert_ne!(format & VOL_CAP_FMT_SYMBOLICLINKS, 0);
+        assert_eq!(mixed, Err(libc::EINVAL));
+    }
+
     /// A change that fails puts back the ones made before it: a link's new
     /// time is undone when the Finder info after it cannot be written, which
     /// Linux refuses on a symlink.
@@ -1369,7 +1544,7 @@ mod tests {
             ATTR_DIR_LINKCOUNT,
             ATTR_FILE_LINKCOUNT | ATTR_FILE_ALLOCSIZE,
         );
-        let b = pack(&l, 0, Ok(&st), None, || unreachable!());
+        let b = pack(&l, 0, Ok(&st), None, || unreachable!(), || unreachable!());
         // Length, returned set, OBJTYPE, OWNERID, FILE_LINKCOUNT, ALLOCSIZE;
         // the directory attribute is left out for a file.
         assert_eq!(b.len(), 4 + 20 + 4 + 4 + 4 + 8);
@@ -1500,7 +1675,7 @@ mod tests {
         let root = c"/";
         assert_eq!(ask(root, list(0x1, 0, 0), 0), Err(libc::ENOTSUP));
         let mut l = list(ATTR_CMN_OBJTYPE, 0, 0);
-        l.volattr = 0x8000_0000;
+        l.volattr = ATTR_VOL_INFO | ATTR_VOL_NAME;
         assert_eq!(ask(root, l, 0), Err(libc::ENOTSUP));
         l = list(ATTR_CMN_OBJTYPE, 0, 0);
         l.bitmapcount = 4;

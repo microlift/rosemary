@@ -48,6 +48,7 @@ pub mod dirent;
 pub mod dispatch;
 pub mod distnote;
 pub mod divergent;
+pub mod dslocal;
 pub mod env;
 pub mod err;
 pub mod errno;

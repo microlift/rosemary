@@ -59,7 +59,45 @@ pub fn me() -> Option<String> {
     .clone()
 }
 
+/// The prefix's own users: its local node's records first, then the built-in
+/// ones they do not replace.
 fn system_users() -> Vec<User> {
+    let mut users: Vec<User> = crate::dslocal::records(crate::dslocal::Kind::Users)
+        .iter()
+        .filter_map(local_user)
+        .collect();
+    for user in builtin_users() {
+        if !users
+            .iter()
+            .any(|u| u.name == user.name || u.uid == user.uid)
+        {
+            users.push(user);
+        }
+    }
+    users
+}
+
+/// A local record as a user; one without a name or ids is not one.
+fn local_user(record: &crate::dslocal::Record) -> Option<User> {
+    Some(User {
+        name: record.first("name")?.to_owned(),
+        uid: record.first("uid")?.parse().ok()?,
+        gid: record.first("gid")?.parse().ok()?,
+        gecos: record.first("realname").unwrap_or_default().to_owned(),
+        home: record.first("home").unwrap_or_default().to_owned(),
+        shell: record.first("shell").unwrap_or_default().to_owned(),
+    })
+}
+
+fn local_group(record: &crate::dslocal::Record) -> Option<Group> {
+    Some(Group {
+        name: record.first("name")?.to_owned(),
+        gid: record.first("gid")?.parse().ok()?,
+        members: record.values("users").to_vec(),
+    })
+}
+
+fn builtin_users() -> Vec<User> {
     vec![User {
         name: "root".into(),
         uid: ROOT,
@@ -70,7 +108,24 @@ fn system_users() -> Vec<User> {
     }]
 }
 
+/// The prefix's own groups, as [`system_users`] are its users.
 fn system_groups() -> Vec<Group> {
+    let mut groups: Vec<Group> = crate::dslocal::records(crate::dslocal::Kind::Groups)
+        .iter()
+        .filter_map(local_group)
+        .collect();
+    for group in builtin_groups() {
+        if !groups
+            .iter()
+            .any(|g| g.name == group.name || g.gid == group.gid)
+        {
+            groups.push(group);
+        }
+    }
+    groups
+}
+
+fn builtin_groups() -> Vec<Group> {
     let mut admins = vec!["root".to_string()];
     admins.extend(me());
     vec![
