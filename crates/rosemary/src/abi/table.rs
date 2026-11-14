@@ -220,6 +220,8 @@ pub static SIGNATURES: &[FunctionAbi] = &[
     sig!("getsectiondata", P, P, P, P, P),
     sig!("get_etext", U64),
     sig!("get_end", U64),
+    sig!("swap_fat_header", V, P, U32),
+    sig!("swap_fat_arch", V, P, U32, U32),
     // OpenAL 1.1. Its scalar typedefs are fixed-width even on Darwin.
     sig!("alBufferData", V, U32, I32, P, I32, I32),
     sig!("alDeleteBuffers", V, I32, P),
@@ -2125,6 +2127,7 @@ pub static SIGNATURES: &[FunctionAbi] = &[
     sig!("fgetpos", I32, P, P),
     sig!("fgets", P, P, I32, P),
     sig!("fgetln", P, P, P),
+    sig!("fparseln", P, P, P, P, P, I32),
     sig!("fileno", I32, P),
     //
     // Each entry stopped an initializer by name and was added for it.
@@ -3144,6 +3147,8 @@ pub static SIGNATURES: &[FunctionAbi] = &[
     sig!("mkdir", I32, P, U32),
     sig!("mkdirat", I32, I32, P, U16),
     sig!("mkdtemp", P, P),
+    sig!("mkpath_np", I32, P, U16),
+    sig!("mkpathat_np", I32, I32, P, U16),
     sig!("mknod", I32, P, U32, I32),
     sig!("mkstemp", I32, P),
     sig!("mkstemps", I32, P, I32),

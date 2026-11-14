@@ -7,12 +7,14 @@ mod backend;
 mod engine;
 mod format;
 mod open;
+mod parseln;
 mod wide;
 
 pub use api::*;
 pub use backend::{fmemopen, funopen, open_memstream, open_wmemstream};
 pub use format::*;
 pub use open::{fclose, fdopen, fopen, freopen, pclose, popen, tmpfile};
+pub use parseln::fparseln;
 pub use wide::*;
 
 pub type ReadFn = unsafe extern "C" fn(*mut c_void, *mut c_char, c_int) -> c_int;
@@ -522,6 +524,7 @@ exports::exports! {
         "getline" => getline,
         "getdelim" => getdelim,
         "fgetln" => fgetln,
+        "fparseln" => fparseln,
         "perror" => perror,
 
         "fflush" => fflush,

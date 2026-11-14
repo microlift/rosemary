@@ -76,6 +76,7 @@ pub mod kqueue;
 pub mod langinfo;
 pub mod libc_backend;
 pub mod libgen;
+pub mod libmacho;
 pub mod libproc;
 pub mod locale;
 pub mod mach;
@@ -376,6 +377,7 @@ static SHARED_MODULES: &[exports::Module] = &[
     mach::MODULE,
     fs::MODULE,
     libgen::MODULE,
+    libmacho::MODULE,
     xattr::MODULE,
     passwd::MODULE,
     audit::MODULE,

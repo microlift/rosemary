@@ -1121,6 +1121,158 @@ impl Template {
     }
 }
 
+/// `int mkpath_np(const char *path, mode_t omode)`
+///
+/// # Safety
+///
+/// `path` is a NUL-terminated string.
+pub unsafe extern "C" fn mkpath_np(path: *const c_char, omode: libc::mode_t) -> c_int {
+    // SAFETY: the caller's.
+    unsafe { mkpathat_np(crate::stat::DARWIN_AT_FDCWD, path, omode) }
+}
+
+/// `int mkpathat_np(int dfd, const char *path, mode_t omode)`
+///
+/// `mkdir -p`: the answer is a Darwin errno, not -1, and `errno` is left as
+/// it was.
+///
+/// # Safety
+///
+/// `path` is a NUL-terminated string and `dfd` a directory descriptor or
+/// Darwin's `AT_FDCWD`.
+pub unsafe extern "C" fn mkpathat_np(
+    dfd: c_int,
+    path: *const c_char,
+    omode: libc::mode_t,
+) -> c_int {
+    if path.is_null() {
+        return crate::errno::from_host(libc::EFAULT);
+    }
+    let saved = crate::errno::get();
+    // SAFETY: non-null, and NUL-terminated by contract.
+    let path = unsafe { CStr::from_ptr(path) }.to_bytes();
+    let rc = match make_path(dfd, path, omode) {
+        Ok(()) => 0,
+        Err(host) => crate::errno::from_host(host),
+    };
+    crate::errno::set(saved);
+    rc
+}
+
+/// Apple's `_mkpath`: create the missing ancestors of `path` with `0777`
+/// (widened to `u+wx` when the umask denies them, as POSIX's `mkdir -p` does),
+/// then `path` itself with `omode`. Failures are host errnos.
+fn make_path(dfd: c_int, path: &[u8], omode: libc::mode_t) -> Result<(), c_int> {
+    const ANCESTOR_MODE: libc::mode_t = libc::S_IRWXU | libc::S_IRWXG | libc::S_IRWXO;
+    const USER_WX: libc::mode_t = libc::S_IWUSR | libc::S_IXUSR;
+
+    let mkdir = |path: &[u8], mode| {
+        let path = CString::new(path).expect("a prefix of a C string");
+        // SAFETY: a NUL-terminated path and the caller's descriptor.
+        match unsafe { mkdirat(dfd, path.as_ptr(), mode) } {
+            0 => Ok(()),
+            _ => Err(crate::errno::get()),
+        }
+    };
+    let mode_of = |path: &[u8]| {
+        let path = CString::new(path).expect("a prefix of a C string");
+        let mut st = crate::stat::Stat::default();
+        // SAFETY: a NUL-terminated path, the caller's descriptor, a local stat.
+        let rc = unsafe { crate::stat::fstatat(dfd, path.as_ptr(), &mut st, 0) };
+        (rc == 0).then_some(libc::mode_t::from(st.mode))
+    };
+    let is_dir = |path: &[u8]| mode_of(path).map(|m| m & libc::S_IFMT == libc::S_IFDIR);
+    let chmod = |path: &[u8], mode| {
+        let path = CString::new(path).expect("a prefix of a C string");
+        // SAFETY: a NUL-terminated path and the caller's descriptor.
+        unsafe { fchmodat(dfd, path.as_ptr(), mode, 0) == 0 }
+    };
+
+    match mkdir(path, omode) {
+        Ok(()) => return Ok(()),
+        Err(libc::ENOENT) => {}
+        Err(libc::EEXIST) => {
+            return Err(match is_dir(path) {
+                Some(true) => libc::EEXIST,
+                Some(false) => libc::ENOTDIR,
+                None => libc::EIO,
+            });
+        }
+        Err(libc::EISDIR) => return Err(libc::EEXIST),
+        Err(e) => return Err(e),
+    }
+
+    // Trailing "/." and "/" name the same directory but would make the walk
+    // below try to create it twice.
+    let mut end = path.len();
+    loop {
+        let before = end;
+        if end > 2 && path[end - 1] == b'.' && path[end - 2] == b'/' {
+            end -= 2;
+        }
+        if end > 1 && path[end - 1] == b'/' {
+            end -= 1;
+        }
+        if end == before {
+            break;
+        }
+    }
+    let path = &path[..end];
+    if mkdir(path, omode).is_ok() {
+        return Ok(());
+    }
+
+    // Walk up to the deepest ancestor that exists or can be made...
+    let mut cuts = Vec::new();
+    let mut chmod_mode = None;
+    loop {
+        let here = cuts.last().map_or(path, |&cut| &path[..cut]);
+        let Some(cut) = here.iter().rposition(|&b| b == b'/') else {
+            return Err(libc::ENOENT);
+        };
+        cuts.push(cut);
+        let here = &path[..cut];
+        match mkdir(here, ANCESTOR_MODE) {
+            Ok(()) => {
+                let mode = mode_of(here).ok_or(libc::ENOENT)?;
+                if mode & USER_WX != USER_WX {
+                    let widened = mode | USER_WX;
+                    if !chmod(here, widened) {
+                        return Err(libc::ENOENT);
+                    }
+                    chmod_mode = Some(widened);
+                }
+                break;
+            }
+            // Another process made it first.
+            Err(libc::EEXIST) if is_dir(here) == Some(true) => break,
+            Err(libc::EEXIST) => return Err(libc::ENOTDIR),
+            Err(libc::ENOENT) => {}
+            Err(e) => return Err(e),
+        }
+    }
+    // ...then back down, making each one below it.
+    cuts.pop();
+    for &cut in cuts.iter().rev() {
+        let here = &path[..cut];
+        match mkdir(here, ANCESTOR_MODE) {
+            Ok(()) => {}
+            // A "." or ".." component.
+            Err(libc::EEXIST) => continue,
+            Err(e) => return Err(e),
+        }
+        if let Some(mode) = chmod_mode
+            && !chmod(here, mode)
+        {
+            return Err(libc::ENOENT);
+        }
+    }
+    match mkdir(path, omode) {
+        Err(libc::EEXIST) if is_dir(path) == Some(false) => Err(libc::ENOTDIR),
+        result => result,
+    }
+}
+
 /// `FSIOC_SYNC_VOLUME`, `_IOW('A', 1, uint32_t)`.
 const FSIOC_SYNC_VOLUME: u64 = 0x8004_4101;
 /// `FSOPT_NOFOLLOW`.
@@ -1250,6 +1402,8 @@ exports::exports! {
         "mkstemps" => mkstemps,
         "mkdtemp" => mkdtemp,
         "mkdtempat_np" => mkdtempat_np,
+        "mkpath_np" => mkpath_np,
+        "mkpathat_np" => mkpathat_np,
         "_mktemp" => _mktemp,
         "mktemp" => _mktemp,
     }
@@ -1348,6 +1502,42 @@ mod tests {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.0);
         }
+    }
+
+    #[test]
+    fn mkpath_np_makes_every_missing_ancestor() {
+        let scratch = Scratch::new("mkpath-ancestors");
+        let path = scratch.c_path("a/b/c/./");
+        assert_eq!(unsafe { mkpath_np(path.as_ptr(), 0o700) }, 0);
+        let made = scratch.0.join("a/b/c");
+        assert!(made.is_dir());
+        assert_eq!(
+            std::fs::metadata(&made).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+    }
+
+    #[test]
+    fn mkpath_np_answers_errno_and_leaves_errno_alone() {
+        let scratch = Scratch::new("mkpath-errors");
+        std::fs::write(scratch.0.join("file"), b"").unwrap();
+        crate::errno::set(libc::EINTR);
+        let dir = scratch.c_path("");
+        assert_eq!(
+            unsafe { mkpath_np(dir.as_ptr(), 0o755) },
+            crate::errno::from_host(libc::EEXIST)
+        );
+        let file = scratch.c_path("file");
+        assert_eq!(
+            unsafe { mkpath_np(file.as_ptr(), 0o755) },
+            crate::errno::from_host(libc::ENOTDIR)
+        );
+        let under = scratch.c_path("file/x/y");
+        assert_eq!(
+            unsafe { mkpath_np(under.as_ptr(), 0o755) },
+            crate::errno::from_host(libc::ENOTDIR)
+        );
+        assert_eq!(crate::errno::get(), libc::EINTR);
     }
 
     #[test]
