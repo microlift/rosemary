@@ -13,6 +13,7 @@ use microlift::core::lift_to_function;
 
 use mimalloc::MiMalloc;
 
+mod desktop_cli;
 mod prefix_cli;
 mod server_cli;
 
@@ -75,6 +76,7 @@ fn run(
     if darwin::libc_backend::using_builtin() {
         server_cli::join(guest, &argv);
     }
+    desktop_cli::configure();
 
     match startup::run(exec) {
         // `exit` rather than returning the status. Returning goes back through
@@ -313,6 +315,12 @@ enum Command {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<OsString>,
     },
+    /// Run this prefix's virtual desktop, which guests start by themselves
+    #[command(disable_help_flag = true)]
+    Desktop {
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<OsString>,
+    },
     /// Compile a program's x86-64 code into the on-disk code cache without running it
     Aot(AotOptions),
 }
@@ -345,6 +353,7 @@ fn main() -> ExitCode {
     match cli.command {
         Some(Command::Prefix { args }) => prefix_cli::command(args.into_iter()),
         Some(Command::Server { args }) => server_cli::command(args.into_iter()),
+        Some(Command::Desktop { args }) => desktop_cli::command(args.into_iter()),
         Some(Command::Aot(options)) => aot(options),
         Some(Command::Run {
             options,
