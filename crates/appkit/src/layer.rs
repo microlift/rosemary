@@ -106,7 +106,26 @@ pub unsafe fn set_view(layer: Id, view: Id) {
     if layer.is_null() || !is_layer(layer) {
         return;
     }
+    if layer_of(layer).view == view {
+        return;
+    }
     layer_of(layer).view = view;
+    // A retained CAMetalLayer can outlive its NSView attachment.
+    notify_metal_view_changed(layer);
+}
+
+/// Notify native presenters after a layer's view or its view's window changes.
+pub(crate) fn notify_metal_view_changed(layer: Id) {
+    if !is_metal(layer) {
+        return;
+    }
+    let hooks = METAL_VIEW_HOOKS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone();
+    for hook in hooks {
+        hook(layer);
+    }
 }
 
 /// The view a layer was given to, or null.
@@ -419,6 +438,35 @@ unsafe extern "C" fn action_for_key(receiver: Id, _sel: Sel, key: Id) -> Id {
     }
 }
 
+/// External Metal presenter cleanup is registered here instead of replacing
+/// the guest CALayer deallocator: AppKit must still release its device and
+/// weak delegate in the normal order.
+static METAL_VIEW_HOOKS: std::sync::Mutex<Vec<fn(Id)>> = std::sync::Mutex::new(Vec::new());
+
+/// A callback on every CAMetalLayer/NSView attachment change. The native
+/// presenter uses this to retire stale SDL views even when the old CALayer is
+/// legitimately retained by the guest. Callbacks run without the hook lock.
+pub fn add_metal_view_hook(hook: fn(Id)) {
+    let mut hooks = METAL_VIEW_HOOKS.lock().unwrap_or_else(|e| e.into_inner());
+    if !hooks.iter().any(|item| std::ptr::fn_addr_eq(*item, hook)) {
+        hooks.push(hook);
+    }
+}
+
+static METAL_DEALLOC_HOOKS: std::sync::Mutex<Vec<fn(Id)>> = std::sync::Mutex::new(Vec::new());
+
+pub fn add_metal_dealloc_hook(hook: fn(Id)) {
+    let mut hooks = METAL_DEALLOC_HOOKS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    if !hooks
+        .iter()
+        .any(|existing| std::ptr::fn_addr_eq(*existing, hook))
+    {
+        hooks.push(hook);
+    }
+}
+
 /// `-dealloc`, which must unregister the weak delegate slot before the memory
 /// holding it is freed.
 unsafe extern "C" fn dealloc(receiver: Id, _sel: Sel) {
@@ -434,6 +482,15 @@ unsafe extern "C" fn dealloc(receiver: Id, _sel: Sel) {
                 .any(|candidate| std::ptr::eq(candidate, metal))
         })
     }) {
+        // Never invoke a foreign presenter while holding the registry mutex:
+        // releasing host layers can invoke arbitrary Objective-C teardown.
+        let hooks = METAL_DEALLOC_HOOKS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        for hook in hooks {
+            hook(receiver);
+        }
         let device = std::mem::replace(&mut metal_layer_of(receiver).device, std::ptr::null_mut());
         objc::arc::release(device);
     }

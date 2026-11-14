@@ -189,6 +189,12 @@ struct Api {
     SDL_GetGamepadButton: Option<unsafe extern "C" fn(Gamepad, c_int) -> bool>,
     SDL_free: Option<unsafe extern "C" fn(*mut c_void)>,
 
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    SDL_Metal_CreateView: Option<unsafe extern "C" fn(Window) -> *mut c_void>,
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    SDL_Metal_DestroyView: Option<unsafe extern "C" fn(*mut c_void)>,
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    SDL_Metal_GetLayer: Option<unsafe extern "C" fn(*mut c_void) -> *mut c_void>,
     SDL_CreateWindow: Option<unsafe extern "C" fn(*const c_char, c_int, c_int, u64) -> Window>,
     SDL_CreatePopupWindow:
         Option<unsafe extern "C" fn(Window, c_int, c_int, c_int, c_int, u64) -> Window>,
@@ -440,6 +446,9 @@ fn api() -> Option<&'static Api> {
             SDL_GetGamepadAxis,
             SDL_GetGamepadButton,
             SDL_free,
+            SDL_Metal_CreateView,
+            SDL_Metal_DestroyView,
+            SDL_Metal_GetLayer,
             SDL_CreateWindow,
             SDL_CreatePopupWindow,
             SDL_GetWindowParent,
@@ -1672,6 +1681,46 @@ pub mod video {
     use std::{ffi::CString, sync::LazyLock};
 
     use super::*;
+
+    /// Native SDL Metal view and backing Apple CAMetalLayer. SDL owns the
+    /// NSView; the caller must destroy it on the SDL video thread before its
+    /// window is destroyed. All pointers refer to *host* Objective-C objects.
+    #[cfg(target_os = "macos")]
+    pub mod metal {
+        use super::*;
+
+        pub fn create(window: Window) -> Option<(*mut c_void, *mut c_void)> {
+            if !is_video_thread() || window.is_null() {
+                return None;
+            }
+            let api = api()?;
+            let view = unsafe { (api.SDL_Metal_CreateView?)(window) };
+            if view.is_null() {
+                return None;
+            }
+            let layer = api.SDL_Metal_GetLayer.map(|get| unsafe { get(view) });
+            match layer {
+                Some(layer) if !layer.is_null() => Some((view, layer)),
+                _ => {
+                    if let Some(destroy) = api.SDL_Metal_DestroyView {
+                        unsafe { destroy(view) };
+                    }
+                    None
+                }
+            }
+        }
+
+        /// Safety: `view` is a live SDL Metal view, created on the video thread.
+        /// Destroy it before destroying the SDL window that owns it.
+        pub unsafe fn destroy(view: *mut c_void) {
+            if !is_video_thread() || view.is_null() {
+                return;
+            }
+            if let Some(destroy) = api().and_then(|api| api.SDL_Metal_DestroyView) {
+                unsafe { destroy(view) };
+            }
+        }
+    }
 
     /// `SDL_WindowFlags`.
     pub mod flags {

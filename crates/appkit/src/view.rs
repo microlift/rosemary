@@ -3068,6 +3068,19 @@ pub(crate) fn did_move_to_window(view: Id, old: Id, new: Id) {
         crate::layout::note_tree_changed();
         tell_tree_bare(view, "viewDidMoveToWindow");
     }
+    // Reparenting also changes the presentation frame when the window is unchanged.
+    // Retire Metal views from the old SDL window after the hierarchy is updated.
+    notify_metal_view_tree(view);
+}
+
+fn notify_metal_view_tree(view: Id) {
+    if !is_view(view) {
+        return;
+    }
+    crate::layer::notify_metal_view_changed(view_of(view).layer);
+    for child in subviews_of(view) {
+        notify_metal_view_tree(child);
+    }
 }
 
 /// `-enclosingScrollView`: the nearest scroll view above this one.
