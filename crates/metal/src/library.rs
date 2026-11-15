@@ -25,14 +25,14 @@ pub(super) unsafe extern "C" fn new_default_library(receiver: Id, _sel: Sel) -> 
         report_library_error("Metal device has no Vulkan target profile");
         return std::ptr::null_mut();
     };
-    let (translated, air, entry_modules) = match translate_metallib(&bytes, target) {
+    let (translated, input) = match translate_metallib(&bytes, target) {
         Ok(result) => result,
         Err(error) => {
             report_library_error(error);
             return std::ptr::null_mut();
         }
     };
-    let library = retain_library(receiver, translated, Some(air), entry_modules, Some(target));
+    let library = retain_library(receiver, translated, input, Some(target));
     label_metallib(library, &bytes);
     library
 }
@@ -57,11 +57,11 @@ pub(super) unsafe extern "C" fn new_library_with_data(
     let Some(target) = (unsafe { target.as_ref() }) else {
         return fail_library(error, "Metal device has no Vulkan target profile");
     };
-    let (translated, air, entry_modules) = match translate_metallib(bytes, target) {
+    let (translated, input) = match translate_metallib(bytes, target) {
         Ok(result) => result,
         Err(failure) => return fail_library(error, &failure.to_string()),
     };
-    let library = retain_library(receiver, translated, Some(air), entry_modules, Some(target));
+    let library = retain_library(receiver, translated, input, Some(target));
     label_metallib(library, bytes);
     library
 }
@@ -87,15 +87,11 @@ fn label_metallib(library: Id, bytes: &[u8]) {
     }
 }
 
-fn translate_metallib<'a>(
-    bytes: &'a [u8],
+fn translate_metallib(
+    bytes: &[u8],
     target: &metal_translate::TargetProfile,
 ) -> Result<
-    (
-        metal_translate::TranslatedLibrary,
-        Vec<&'a [u8]>,
-        Vec<usize>,
-    ),
+    (metal_translate::TranslatedLibrary, Option<LibraryInput>),
     metal_translate::TranslateError,
 > {
     let modules = metal_translate::metallib_airs(bytes)?;
@@ -111,14 +107,18 @@ fn translate_metallib<'a>(
         function_constants.extend(translated.function_constants);
         rejected.extend(translated.rejected);
     }
+    // Only a library with function constants is ever translated again.
+    let input = (!function_constants.is_empty()).then(|| LibraryInput::Air {
+        modules: modules.into_iter().map(<[u8]>::to_vec).collect(),
+        entry_modules,
+    });
     Ok((
         metal_translate::TranslatedLibrary {
             entries,
             function_constants,
             rejected,
         },
-        modules,
-        entry_modules,
+        input,
     ))
 }
 
@@ -126,8 +126,7 @@ fn translate_metallib<'a>(
 pub(super) fn retain_library(
     device: Id,
     translated: metal_translate::TranslatedLibrary,
-    air: Option<Vec<&[u8]>>,
-    entry_modules: Vec<usize>,
+    input: Option<LibraryInput>,
     target: Option<&'static metal_translate::TargetProfile>,
 ) -> Id {
     if let Some(target) = target
@@ -142,16 +141,11 @@ pub(super) fn retain_library(
         ));
         return std::ptr::null_mut();
     }
-    // Only a library with function constants is ever translated again.
-    let air = air
-        .filter(|_| !translated.function_constants.is_empty())
-        .map(|modules| modules.into_iter().map(<[u8]>::to_vec).collect());
     let library = object::make(
         c"RosemaryMTLLibrary",
         Library {
             translated,
-            air,
-            entry_modules,
+            input,
             target,
             device,
         },
@@ -244,8 +238,12 @@ pub(super) unsafe fn library_from_source(
         Ok(translated) => translated,
         Err(translation_error) => return fail_library(error, &translation_error.to_string()),
     };
-    let entry_modules = vec![0; translated.entries.len()];
-    let library = retain_library(receiver, translated, None, entry_modules, Some(target));
+    // Only a library with function constants is ever translated again.
+    let input = (!translated.function_constants.is_empty()).then(|| LibraryInput::Msl {
+        source: source.to_owned(),
+        macros: macros.to_vec(),
+    });
+    let library = retain_library(receiver, translated, input, Some(target));
     if library.is_null() {
         return fail_library(error, "could not allocate MTL source library");
     }
@@ -276,6 +274,8 @@ pub(super) unsafe extern "C" fn new_function_with_name(receiver: Id, _sel: Sel, 
         .iter()
         .position(|entry| entry.name == name)
     else {
+        // FIXME (ACCURACY): Metal vends a source function reading a constant with
+        // no value unspecialized (and lists it in functionNames); this rejects it.
         report_rejected(library, name);
         return std::ptr::null_mut();
     };
@@ -283,7 +283,7 @@ pub(super) unsafe extern "C" fn new_function_with_name(receiver: Id, _sel: Sel, 
         c"RosemaryMTLFunction",
         Function {
             library: objc::arc::retain(receiver),
-            entry,
+            entry: Some(entry),
             specialized: None,
         },
     )
@@ -352,88 +352,124 @@ pub(super) unsafe fn function_with_constants(
     };
     // SAFETY: an `RosemaryMTLLibrary`.
     let library = unsafe { object::body::<Library>(receiver) };
-    let Some(entry) = library
+    let entry = library
         .translated
         .entries
         .iter()
-        .position(|entry| entry.name == name)
-    else {
-        let reason = library
-            .translated
-            .rejected
-            .iter()
-            .find(|rejected| rejected.name == name)
-            .map_or_else(
-                || format!("the library has no function named {name}"),
-                |rejected| {
-                    format!(
-                        "function {name} could not be translated: {}",
-                        rejected.reason
-                    )
-                },
-            );
-        return fail_library(error, &reason);
-    };
+        .position(|entry| entry.name == name);
     // A library which declares no function constants has nothing to
     // specialize: Metal ignores the values, and so does this.
-    let specialized = match (&library.air, library.target) {
-        (Some(modules), Some(target)) => {
-            let Some(air) = library
-                .entry_modules
+    let (Some(input), Some(target)) = (&library.input, library.target) else {
+        let Some(entry) = entry else {
+            return fail_library(error, &missing_function(&library.translated, name));
+        };
+        return object::make(
+            c"RosemaryMTLFunction",
+            Function {
+                library: objc::arc::retain(receiver),
+                entry: Some(entry),
+                specialized: None,
+            },
+        );
+    };
+    let translated = match input {
+        LibraryInput::Air {
+            modules,
+            entry_modules,
+        } => {
+            let Some(entry) = entry else {
+                return fail_library(error, &missing_function(&library.translated, name));
+            };
+            let Some(air) = entry_modules
                 .get(entry)
                 .and_then(|module| modules.get(*module))
             else {
                 return fail_library(error, "the function has no owning AIR module");
             };
-            let translated = metal_translate::translate_specialized_cached(
+            metal_translate::translate_specialized_cached(
                 metal_translate::AirInput::Bitcode(air),
                 target,
                 metal_translate::PassPipeline::from_env(),
                 &values,
-            );
-            match translated {
-                Ok(mut translated) => {
-                    let Some(position) = translated
-                        .entries
-                        .iter()
-                        .position(|entry| entry.name == name)
-                    else {
-                        return fail_library(error, "specialization lost the function");
-                    };
-                    let entry = translated.entries.swap_remove(position);
-                    if let Some(requirement) = target.unsupported_requirement(&entry.required) {
-                        return fail_library(
-                            error,
-                            &format!(
-                                "entry point {name} requires {requirement}, which the Vulkan device did not enable"
-                            ),
-                        );
-                    }
-                    Some(entry)
-                }
-                Err(translation) => return fail_library(error, &translation.to_string()),
-            }
+            )
         }
-        _ => None,
+        // A source function which reads a constant with no value of its own
+        // is rejected from the library, and is translated once values are given.
+        LibraryInput::Msl { source, macros } => {
+            let declared = entry.is_some()
+                || library
+                    .translated
+                    .rejected
+                    .iter()
+                    .any(|rejected| rejected.name == name);
+            if !declared {
+                return fail_library(error, &missing_function(&library.translated, name));
+            }
+            metal_translate::translate_msl_specialized_cached(
+                source,
+                macros,
+                target,
+                metal_translate::PassPipeline::from_env(),
+                &values,
+            )
+        }
     };
+    let mut translated = match translated {
+        Ok(translated) => translated,
+        Err(translation) => return fail_library(error, &translation.to_string()),
+    };
+    let Some(position) = translated
+        .entries
+        .iter()
+        .position(|entry| entry.name == name)
+    else {
+        return fail_library(error, &missing_function(&translated, name));
+    };
+    let specialized = translated.entries.swap_remove(position);
+    if let Some(requirement) = target.unsupported_requirement(&specialized.required) {
+        return fail_library(
+            error,
+            &format!(
+                "entry point {name} requires {requirement}, which the Vulkan device did not enable"
+            ),
+        );
+    }
     let function = object::make(
         c"RosemaryMTLFunction",
         Function {
             library: objc::arc::retain(receiver),
             entry,
-            specialized,
+            specialized: Some(specialized),
         },
     );
     if crate::profile::enabled() && !function.is_null() {
         // SAFETY: the function just made, whose library is alive.
         let function = unsafe { object::body::<Function>(function) };
-        if let (Some(specialized), Some(base)) =
-            (&function.specialized, library.translated.entries.get(entry))
-        {
+        if let (Some(specialized), Some(base)) = (
+            &function.specialized,
+            entry.and_then(|entry| library.translated.entries.get(entry)),
+        ) {
             crate::profile::label_specialized(specialized, base);
         }
     }
     function
+}
+
+/// Why `translated` has no entry point `name`.
+fn missing_function(translated: &metal_translate::TranslatedLibrary, name: &str) -> String {
+    translated
+        .rejected
+        .iter()
+        .find(|rejected| rejected.name == name)
+        .map_or_else(
+            || format!("the library has no function named {name}"),
+            |rejected| {
+                format!(
+                    "function {name} could not be translated: {}",
+                    rejected.reason
+                )
+            },
+        )
 }
 
 /// `-[MTLLibrary functionNames]`: the entry points the translation produced,
@@ -465,9 +501,9 @@ pub(super) unsafe extern "C" fn library_device(receiver: Id, _sel: Sel) -> Id {
 pub(super) unsafe extern "C" fn function_name(receiver: Id, _sel: Sel) -> Id {
     // SAFETY: an `RosemaryMTLFunction`.
     let function = unsafe { object::body::<Function>(receiver) };
-    // SAFETY: the library which vended the function.
-    let library = unsafe { object::body::<Library>(function.library) };
-    foundation::string::from_str(&library.translated.entries[function.entry].name)
+    // SAFETY: the function's library is alive while the function holds it.
+    let artifact = unsafe { function.artifact() }.expect("a function has a translation");
+    foundation::string::from_str(&artifact.name)
 }
 
 /// `-[MTLFunction functionType]`: `MTLFunctionTypeVertex`, `Fragment` or

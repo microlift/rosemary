@@ -21,6 +21,8 @@ macro_rules! isolate_metal_fixture {
     };
 }
 
+mod source_constants;
+
 fn device_for_tests() -> Id {
     bootstrap();
     let target = Box::leak(Box::new(metal_translate::TargetProfile::vulkan_1_3()));
@@ -1378,7 +1380,7 @@ fn check_depth_resolve(device: Id) {
         return;
     }
 
-    let library = retain_library(device, triangle_library(), None, vec![0, 0], None);
+    let library = retain_library(device, triangle_library(), None, None);
     // SAFETY: as in `a_translated_triangle_draws_on_the_gpu`.
     let (vertex, fragment) = unsafe {
         (
@@ -1550,7 +1552,7 @@ fn check_depth_resolve(device: Id) {
 /// A render pipeline descriptor drawing `triangle_library`'s triangle into
 /// one BGRA8 target, owned by the caller.
 fn triangle_pipeline_descriptor(device: Id) -> Id {
-    let library = retain_library(device, triangle_library(), None, vec![0, 0], None);
+    let library = retain_library(device, triangle_library(), None, None);
     // SAFETY: a library this test made.
     let (vertex, fragment) = unsafe {
         (
@@ -1712,7 +1714,7 @@ fn a_translated_triangle_draws_on_the_gpu() {
         return;
     };
     const SIZE: u64 = 8;
-    let library = retain_library(device, triangle_library(), None, vec![0, 0], None);
+    let library = retain_library(device, triangle_library(), None, None);
     // SAFETY: a library this test made.
     let (vertex, fragment) = unsafe {
         (
@@ -2398,7 +2400,7 @@ fn recording_cost() {
     };
     objc::arc::pool_pop(pool);
 
-    let library = retain_library(device, triangle_library(), None, vec![0, 0], None);
+    let library = retain_library(device, triangle_library(), None, None);
     // SAFETY: as in `a_translated_triangle_draws_on_the_gpu`.
     let render = unsafe {
         let vertex = new_function_with_name(
@@ -3625,7 +3627,7 @@ fn covering_draw_with_depth(device: Id, depth_format: u64, z: f32) -> Option<Cov
     if !gpu.occlusion_precise {
         return None;
     }
-    let library = retain_library(device, triangle_library(), None, vec![0, 0], None);
+    let library = retain_library(device, triangle_library(), None, None);
     // SAFETY: a library this test made.
     let (vertex, fragment) = unsafe {
         (

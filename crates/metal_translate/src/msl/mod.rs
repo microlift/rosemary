@@ -6,6 +6,9 @@ mod lower;
 mod parse;
 mod preprocess;
 mod types;
+mod validate;
+
+pub(crate) use validate::reject_undefined_constants;
 
 use std::collections::HashMap;
 

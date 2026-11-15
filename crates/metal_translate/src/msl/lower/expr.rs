@@ -25,6 +25,10 @@ impl Lowerer<'_, '_> {
     /// Evaluate an expression for its effect alone.
     pub fn effect(&mut self, expr: &Expr) -> Result<()> {
         match &expr.kind {
+            ExprKind::Binary(",", lhs, rhs) => {
+                self.effect(lhs)?;
+                self.effect(rhs)
+            }
             // `discard_fragment()` and other void calls have no value.
             ExprKind::Call { name, args, .. } if name == "discard_fragment" => {
                 if !args.is_empty() || self.stage != Stage::Fragment {
@@ -960,6 +964,10 @@ impl Lowerer<'_, '_> {
     }
 
     fn binary(&mut self, op: &str, lhs: &Expr, rhs: &Expr, line: usize) -> Result<Value> {
+        if op == "," {
+            self.effect(lhs)?;
+            return self.rvalue(rhs);
+        }
         if op == "&&" || op == "||" {
             return self.logical(op, lhs, rhs, line);
         }
@@ -1588,6 +1596,7 @@ pub(super) fn describe(ty: &Ty) -> String {
         Ty::ByteBool => "bool".into(),
         Ty::Param(name) => name.clone(),
         Ty::Array(element, count) => format!("{}[{count}]", describe(element)),
+        Ty::ArrayParam(element, count) => format!("{}[{count}]", describe(element)),
         Ty::Struct(_) => "a structure".into(),
         Ty::Texture(_) => "a texture".into(),
         Ty::Sampler => "a sampler".into(),

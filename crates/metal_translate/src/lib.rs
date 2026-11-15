@@ -12,12 +12,16 @@ use std::fmt;
 pub use air::{AirInput, parse_air};
 pub use cache::{
     CACHE_VERSION, translate_cached, translate_cached_with, translate_msl_cached,
-    translate_msl_cached_with, translate_msl_cached_with_macros, translate_specialized_cached,
+    translate_msl_cached_with, translate_msl_cached_with_macros, translate_msl_specialized_cached,
+    translate_specialized_cached,
 };
 pub use msl::parse_msl;
 pub use passes::{Pass, PassPipeline};
 pub use specialize::{
-    FunctionConstantValues, metal_data_type_of_encoding, metal_data_type_size, specialize,
+    FunctionConstantValues, MTL_DATA_TYPE_BOOL, MTL_DATA_TYPE_CHAR, MTL_DATA_TYPE_FLOAT,
+    MTL_DATA_TYPE_HALF, MTL_DATA_TYPE_INT, MTL_DATA_TYPE_LONG, MTL_DATA_TYPE_SHORT,
+    MTL_DATA_TYPE_UCHAR, MTL_DATA_TYPE_UINT, MTL_DATA_TYPE_ULONG, MTL_DATA_TYPE_USHORT,
+    metal_data_type_of_encoding, metal_data_type_size, specialize,
 };
 pub use spirv::{
     EntryArtifact, FunctionConstantInfo, RejectedEntry, RequiredFeatures, ResourceBinding,
@@ -153,6 +157,23 @@ pub fn translate_msl_with_macros(
     target: &TargetProfile,
     passes: &PassPipeline,
 ) -> Result<TranslatedLibrary, TranslateError> {
+    translate_msl_specialized(
+        source,
+        macros,
+        target,
+        passes,
+        &FunctionConstantValues::new(),
+    )
+}
+
+/// Translate source with the macro definitions and function constants supplied by Metal.
+pub fn translate_msl_specialized(
+    source: &str,
+    macros: &[(String, String)],
+    target: &TargetProfile,
+    passes: &PassPipeline,
+    constants: &FunctionConstantValues,
+) -> Result<TranslatedLibrary, TranslateError> {
     let with_context = |mut error: TranslateError| {
         for diagnostic in &mut error.diagnostics {
             if let Some(line) = diagnostic.line {
@@ -164,10 +185,12 @@ pub fn translate_msl_with_macros(
         error
     };
     let (mut module, rejected) = msl::parse_msl_partial(source, macros).map_err(with_context)?;
-    specialize(&mut module, &FunctionConstantValues::new())?;
+    specialize(&mut module, constants)?;
     passes.run(&mut module)?;
+    let unspecialized = msl::reject_undefined_constants(&mut module);
     let mut library = emit_spirv(&module, target)?;
     library.rejected.extend(rejected);
+    library.rejected.extend(unspecialized);
     Ok(library)
 }
 
