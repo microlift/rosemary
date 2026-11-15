@@ -390,6 +390,14 @@ struct Published {
     provisional: HashSet<u64>,
 }
 
+/// What a lift learned about the code around the region it translated.
+#[derive(Default)]
+pub struct Fresh {
+    /// Where calls the region ends at would return to; see
+    /// [`Region::returns`](crate::region::Region::returns).
+    pub returns: Vec<u64>,
+}
+
 /// How hard the JIT works on a region. See [`crate::jit::tiered`].
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Tier {
@@ -496,15 +504,15 @@ impl CodeCache {
             .map(|(translation, _)| translation)
     }
 
-    /// [`get_or_lift`](Self::get_or_lift), and whether this call is the one that
-    /// lifted it.
+    /// [`get_or_lift`](Self::get_or_lift), and what the lift found when this call is
+    /// the one that lifted it.
     pub fn get_or_lift_fresh<M: Regions>(
         &self,
         program: &Program<M>,
         pc: u64,
-    ) -> Result<(Arc<Translation>, bool), VmError> {
+    ) -> Result<(Arc<Translation>, Option<Fresh>), VmError> {
         if let Some(hit) = self.lookup(pc) {
-            return Ok((hit, false));
+            return Ok((hit, None));
         }
         self.adopt_cached(program, pc);
         loop {
@@ -512,12 +520,12 @@ impl CodeCache {
                 Turn::Lift(claim) => {
                     return self
                         .lift_claimed(program, &claim)
-                        .map(|translation| (translation, true));
+                        .map(|(translation, fresh)| (translation, Some(fresh)));
                 }
                 Turn::Wait(lift) => {
                     lift.wait();
                     if let Some(hit) = self.lookup(pc) {
-                        return Ok((hit, false));
+                        return Ok((hit, None));
                     }
                     // The other lift failed. Lifting again reports the failure here.
                 }
@@ -531,7 +539,7 @@ impl CodeCache {
         &self,
         program: &Program<M>,
         pc: u64,
-    ) -> Option<Arc<Translation>> {
+    ) -> Option<(Arc<Translation>, Fresh)> {
         if self.lookup(pc).is_some() {
             return None;
         }
@@ -576,13 +584,13 @@ impl CodeCache {
         &self,
         program: &Program<M>,
         claim: &Claim<'_>,
-    ) -> Result<Arc<Translation>, VmError> {
+    ) -> Result<(Arc<Translation>, Fresh), VmError> {
         // A lift that finished between the miss and the claim.
         if let Some(hit) = self.lookup(claim.pc) {
-            return Ok(hit);
+            return Ok((hit, Fresh::default()));
         }
         if let Some(cached) = self.publish_cached(program, claim.pc) {
-            return Ok(cached);
+            return Ok((cached, Fresh::default()));
         }
         // Recorded for the AOT profile, lifted ahead or not: code the JIT compiles is
         // code a later run's cache can hold instead.
@@ -594,9 +602,9 @@ impl CodeCache {
         let mut attempt = 0;
         loop {
             match self.lift_and_publish(program, claim.pc, attempt >= STALE_RETRIES, tier)? {
-                Some(translation) => return Ok(translation),
+                Some(lifted) => return Ok(lifted),
                 None => match self.lookup(claim.pc) {
-                    Some(hit) => return Ok(hit),
+                    Some(hit) => return Ok((hit, Fresh::default())),
                     None => attempt += 1,
                 },
             }
@@ -676,7 +684,7 @@ impl CodeCache {
         path: &str,
         slide: u64,
     ) {
-        let Ok(bytes) = std::fs::read(path) else {
+        let Ok(bytes) = std::fs::read(crate::aot::image_file(path)) else {
             return;
         };
         let id = crate::aot::ImageId::of(&bytes);
@@ -834,7 +842,7 @@ impl CodeCache {
         pc: u64,
         last: bool,
         tier: Tier,
-    ) -> Result<Option<Arc<Translation>>, VmError> {
+    ) -> Result<Option<(Arc<Translation>, Fresh)>, VmError> {
         let selecting = crate::stats::enabled().then(std::time::Instant::now);
         // A region always begins at the address it was made for, so its cache
         // key is `pc` and two entry points into one function are two keys.
@@ -846,12 +854,6 @@ impl CodeCache {
         }
         let start = region.range.start;
         let generated = crate::shims::vmmap::contains(start);
-        // Code the guest wrote is never upgraded: a write may retire it at any time,
-        // and its replacement is lifted from bytes nobody compared.
-        let tier = match generated {
-            true => Tier::Final,
-            false => tier,
-        };
 
         // How long one region took to compile, when tracing. Not curiosity. A
         // big region is not slow in proportion to its size.
@@ -865,27 +867,28 @@ impl CodeCache {
         declared.dedup();
 
         // A region that will not compile is refused outright.
-        let compiled = match compile_region(&self.config, &bytes, &region, &declared, tier) {
-            Ok(compiled) => compiled,
-            Err(source) => {
-                crate::stats::record_refused();
-                if crate::shims::vmmap::tracing() {
-                    let head: Vec<String> =
-                        bytes.iter().take(64).map(|b| format!("{b:02x}")).collect();
-                    eprintln!(
-                        "rosemary: region {start:#x}..{:#x} would not compile, bytes {}",
-                        region.range.end,
-                        head.join(" ")
-                    );
+        let compiled =
+            match compile_region(&self.config, &bytes, &region, &declared, tier, generated) {
+                Ok(compiled) => compiled,
+                Err(source) => {
+                    crate::stats::record_refused();
+                    if crate::shims::vmmap::tracing() {
+                        let head: Vec<String> =
+                            bytes.iter().take(64).map(|b| format!("{b:02x}")).collect();
+                        eprintln!(
+                            "rosemary: region {start:#x}..{:#x} would not compile, bytes {}",
+                            region.range.end,
+                            head.join(" ")
+                        );
+                    }
+                    return Err(VmError::Lift {
+                        pc,
+                        start,
+                        source,
+                        at: program.locate(start),
+                    });
                 }
-                return Err(VmError::Lift {
-                    pc,
-                    start,
-                    source,
-                    at: program.locate(start),
-                });
-            }
-        };
+            };
         let end = region.range.end;
 
         if let Some(started) = started {
@@ -1000,7 +1003,10 @@ impl CodeCache {
                     .push((Arc::clone(&translation), Arc::clone(&snapshot)));
             }
         }
-        Ok(Some(translation))
+        let fresh = Fresh {
+            returns: region.returns,
+        };
+        Ok(Some((translation, fresh)))
     }
 
     /// Retire every translation whose guest bytes a write has changed since it was
@@ -1024,6 +1030,8 @@ impl CodeCache {
             for (at, len) in changed {
                 for pc in published.cache.invalidate_range(at, len) {
                     self.index.retract(pc);
+                    // An upgrade would lift whatever the guest has put there since.
+                    published.provisional.remove(&pc);
                     retired.push(pc);
                 }
             }
@@ -1074,11 +1082,20 @@ impl CodeCache {
     }
 }
 
-/// What a translation of generated code was made from: the region's own bytes, as
-/// lifted, and any data it read outside them, as they are now.
+/// What a translation of generated code was made from: the bytes of the region it
+/// derives from, as lifted, and any data it read outside them, as they are now.
 fn snapshot_of(translation: &Translation, start: u64, bytes: &[u8]) -> crate::smc::Snapshot {
     let end = start + bytes.len() as u64;
-    let mut ranges: Vec<(u64, Box<[u8]>)> = vec![(start, bytes.into())];
+    let mut ranges: Vec<(u64, Box<[u8]>)> = translation
+        .covered
+        .iter()
+        .map(|r| r.start.max(start)..r.end.min(end))
+        .filter(|r| r.start < r.end)
+        .map(|r| {
+            let lifted = &bytes[(r.start - start) as usize..(r.end - start) as usize];
+            (r.start, lifted.into())
+        })
+        .collect();
     for dep in &translation.data_dependencies {
         if dep.start >= start && dep.end <= end {
             continue;
@@ -1111,6 +1128,7 @@ fn compile_region(
     region: &crate::region::Region,
     declared: &[u64],
     tier: Tier,
+    generated: bool,
 ) -> microlift::Result<Compiled> {
     let clock = crate::stats::enabled().then(std::time::Instant::now);
     crate::stats::record_extent(region.range.start, region.range.end);
@@ -1123,6 +1141,9 @@ fn compile_region(
     config.resume_points = declared.to_vec();
     // Which of these bytes are code.
     config.block_ranges = region.blocks.clone();
+    // A JIT repoints its calls by storing new 64-bit immediates; read them as data
+    // so that does not retire the region.
+    config.live_immediates = generated;
 
     let lifted = lift_to_code::<X86_64>(bytes, region.range.start, config)?;
     let lift_took = clock.map(|c| c.elapsed());

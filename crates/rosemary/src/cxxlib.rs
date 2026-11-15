@@ -213,6 +213,19 @@ pub fn is_libstdcxx(install_name: &str) -> bool {
     LIBSTDCXX_NAMES.contains(&install_name)
 }
 
+/// The file [`BaseCxx`] reads for an image it reports at `path`, which is the
+/// install name the image stands in for and not a file of its own.
+pub fn file_of(flavor: Flavor, path: &str) -> Option<PathBuf> {
+    let guest = match path {
+        AS_PATH => LIBCXX_FILE,
+        CXXABI_PATH => LIBCXXABI_FILE,
+        UNWIND_PATH => LIBUNWIND_FILE,
+        LIBSTDCXX_FILE => LIBSTDCXX_FILE,
+        _ => return None,
+    };
+    Some(locate(flavor).ok()?.file(guest))
+}
+
 /// A [`DylibSource`] that answers `/usr/lib/libc++` and its two companions from
 /// the base [`locate`] found, and delegates everything else.
 pub struct BaseCxx<S> {
@@ -435,6 +448,27 @@ pub fn source(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_the_runtime_names_map_to_a_base_file() {
+        assert_eq!(file_of(Flavor::Intel, "/usr/lib/libSystem.B.dylib"), None);
+        let Ok(source) = locate(Flavor::Intel) else {
+            eprintln!("skipped: no x86_64 MiniDarwin base is available");
+            return;
+        };
+        assert_eq!(
+            file_of(Flavor::Intel, AS_PATH),
+            Some(source.file(LIBCXX_FILE))
+        );
+        assert_eq!(
+            file_of(Flavor::Intel, CXXABI_PATH),
+            Some(source.file(LIBCXXABI_FILE))
+        );
+        assert_eq!(
+            file_of(Flavor::Intel, UNWIND_PATH),
+            Some(source.file(LIBUNWIND_FILE))
+        );
+    }
 
     /// A flavor's three images, or `None` on a machine with no such base cached.
     ///

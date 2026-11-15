@@ -967,8 +967,8 @@ impl Vm {
                             .cache
                             .get_or_lift_fresh(&self.program, pc)
                             .map(|(lifted, fresh)| {
-                                if fresh {
-                                    self.lift_successors(&lifted, 1);
+                                if let Some(fresh) = fresh {
+                                    self.lift_successors(&lifted, &fresh, 1);
                                     self.queue_upgrade(pc, true);
                                 }
                                 lifted
@@ -1410,7 +1410,7 @@ impl Vm {
     /// Lift the code at `guest_va` if it is not already, ignoring a failure: the
     /// call that reaches it reports the same failure where it can be raised.
     pub(crate) fn lift_now(&self, guest_va: u64) {
-        if let Ok((_, true)) = self.cache.get_or_lift_fresh(&self.program, guest_va) {
+        if let Ok((_, Some(_))) = self.cache.get_or_lift_fresh(&self.program, guest_va) {
             self.queue_upgrade(guest_va, false);
         }
     }
@@ -1451,40 +1451,57 @@ impl Vm {
     /// Lift the code at `guest_va`, `depth` hops from code that ran, unless it is
     /// translated or being translated already. Called by [`crate::prelift`]'s workers.
     pub(crate) fn lift_ahead(&self, guest_va: u64, depth: usize) {
-        if self.cache.has_or_lifting(guest_va) || !self.lifts_ahead_at(guest_va) {
+        if self.cache.has_or_lifting(guest_va) || !self.lifts_ahead_at(guest_va, depth) {
             return;
         }
-        if let Some(lifted) = self.cache.lift_ahead(&self.program, guest_va) {
-            self.lift_successors(&lifted, depth + 1);
+        if let Some((lifted, fresh)) = self.cache.lift_ahead(&self.program, guest_va) {
+            self.lift_successors(&lifted, &fresh, depth + 1);
             self.queue_upgrade(guest_va, false);
         }
     }
 
     /// Queue the constant targets `lifted` can leave for, `depth` hops from code
-    /// that ran, to be lifted ahead on workers.
-    fn lift_successors(&self, lifted: &crate::cache::Translation, depth: usize) {
+    /// that ran, to be lifted ahead on workers - and where the calls it ends at
+    /// return to, which continue the code `lifted` came from and so are as near as it.
+    fn lift_successors(
+        &self,
+        lifted: &crate::cache::Translation,
+        fresh: &crate::cache::Fresh,
+        depth: usize,
+    ) {
         let Some(vm) = self.as_published() else {
             return;
         };
         if depth > crate::prelift::ahead_depth() {
             return;
         }
+        // Lock-free: a worker's `lift_ahead` checks again, claims included.
+        let returns = fresh
+            .returns
+            .iter()
+            .copied()
+            .filter(|&target| !self.cache.is_translated(target));
+        crate::prelift::ahead(vm, returns, (depth - 1).max(1));
         let targets = lifted
             .link_sites
             .iter()
             .filter(|site| site.kind == microlift::core::link::LinkSiteKind::StaticEdge)
             .map(|site| site.target)
-            // Lock-free: a worker's `lift_ahead` checks again, claims included.
             .filter(|&target| !self.cache.is_translated(target));
         crate::prelift::ahead(vm, targets, depth);
     }
 
-    /// Whether `guest_va` is image code a lift ahead may translate: never an import,
-    /// which the run loop services rather than lifts, and never code the guest
-    /// wrote, which may not be finished.
-    fn lifts_ahead_at(&self, guest_va: u64) -> bool {
-        self.program.code_image(guest_va).is_some()
-            && !crate::shims::vmmap::contains(guest_va)
+    /// Whether a lift ahead `depth` hops from code that ran may translate `guest_va`:
+    /// never an import, which the run loop services rather than lifts, and code the
+    /// guest wrote only one hop from code that ran, which is code the guest finished
+    /// writing; further out it may be memory the guest is still filling.
+    fn lifts_ahead_at(&self, guest_va: u64, depth: usize) -> bool {
+        let written = crate::shims::vmmap::contains(guest_va);
+        let reachable = match written {
+            true => depth <= 1,
+            false => self.program.code_image(guest_va).is_some(),
+        };
+        reachable
             && self.program.import_at(guest_va).is_none()
             && self.program.import_by_target(guest_va).is_none()
     }

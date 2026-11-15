@@ -65,8 +65,11 @@ pub(crate) fn hold_for_fork() -> ForkHold {
 /// The id of the image file at `path`, hashed once per process.
 pub fn image_id(path: &str) -> Option<ImageId> {
     let mut ids = IDS.lock().unwrap_or_else(|e| e.into_inner());
-    *ids.entry(path.to_string())
-        .or_insert_with(|| std::fs::read(path).ok().map(|bytes| ImageId::of(&bytes)))
+    *ids.entry(path.to_string()).or_insert_with(|| {
+        std::fs::read(super::image_file(path))
+            .ok()
+            .map(|bytes| ImageId::of(&bytes))
+    })
 }
 
 /// Records `id` for `path`, hashed by a caller that read the file anyway.

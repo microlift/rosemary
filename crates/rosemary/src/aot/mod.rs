@@ -315,6 +315,12 @@ fn usable(config: &LifterConfig, region: &LoadedRegion, moved: u64) -> bool {
         && resolve::decisions_hold(config, &region.import_decisions)
 }
 
+/// The file holding the image a report names at `path`: `path` itself, except for
+/// the C++ runtime, which is loaded under Apple's install names from a base.
+pub fn image_file(path: &str) -> PathBuf {
+    crate::cxxlib::file_of(crate::cxxlib::Flavor::Intel, path).unwrap_or_else(|| path.into())
+}
+
 /// Whether the code `memory` holds for `report` is the code in `bytes`, the file
 /// it was read from: every executable segment byte for byte.
 ///

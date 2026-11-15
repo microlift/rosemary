@@ -338,7 +338,7 @@ fn prepare<'a>(
     if !report.segments.iter().any(|segment| segment.executable) {
         return Err(Outcome::Skipped("no code"));
     }
-    let Ok(bytes) = std::fs::read(&report.path) else {
+    let Ok(bytes) = std::fs::read(super::image_file(&report.path)) else {
         return Err(Outcome::Skipped("its file cannot be read"));
     };
     let id = ImageId::of(&bytes);

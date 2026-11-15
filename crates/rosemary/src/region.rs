@@ -132,6 +132,9 @@ pub struct Region {
     /// Where control can arrive from outside: the address the region was made for, and
     /// the resume point after every call that leaves it.
     pub entries: Vec<u64>,
+    /// Where calls the Mono rule ends a block at would return to, ascending. Not part
+    /// of the region; whatever comes back there is a region of its own.
+    pub returns: Vec<u64>,
 }
 
 impl Region {
@@ -179,6 +182,8 @@ struct Walk<'a> {
     current_targets: BTreeSet<u64>,
     /// Where control can arrive from outside. See [`Region::entries`].
     entries: BTreeSet<u64>,
+    /// See [`Region::returns`].
+    returns: BTreeSet<u64>,
     /// The lowest address the current block must stop before: the next entry on
     /// the worklist, or the next block already decoded, whichever is nearer.
     next_block_start: u64,
@@ -208,6 +213,7 @@ impl<'a> Walk<'a> {
             visited: BTreeSet::new(),
             current_targets: BTreeSet::new(),
             entries: BTreeSet::from([pc]),
+            returns: BTreeSet::new(),
             next_block_start: u64::MAX,
             total: 0,
             max: max_instructions(),
@@ -353,7 +359,9 @@ impl<'a> Walk<'a> {
             FlowControl::Call | FlowControl::IndirectCall => {
                 // The callee is a region of its own - following it would inline
                 // the program into one translation unit.
-                if !(self.writable && mono_rule()) {
+                if self.writable && mono_rule() {
+                    self.returns.insert(next);
+                } else {
                     self.add_branch_target(next, next);
                     self.entries.insert(next);
                 }
@@ -459,11 +467,20 @@ impl<'a> Walk<'a> {
         let mut entries: Vec<u64> = self.entries.into_iter().collect();
         entries.retain(|e| starts.binary_search(e).is_ok());
 
+        // A call cut off by the instruction cap, or one whose return lands in a block
+        // of this region, needs nothing of its own.
+        let returns: Vec<u64> = self
+            .returns
+            .into_iter()
+            .filter(|r| starts.binary_search(r).is_err())
+            .collect();
+
         Some(Region {
             range: first..last,
             blocks: self.blocks.into_iter().map(|b| b.range).collect(),
             starts,
             entries,
+            returns,
         })
     }
 }
@@ -559,6 +576,11 @@ mod tests {
         let r = region_for(&code, BASE, BASE, true).unwrap();
         assert_eq!(r.blocks, vec![BASE..BASE + 5]);
         assert!(!r.entries.contains(&(BASE + 5)));
+        assert_eq!(
+            r.returns,
+            vec![BASE + 5],
+            "where the call would come back to"
+        );
 
         // The same bytes in an image: the resume point is followed, because
         // almost every call does return to it.
