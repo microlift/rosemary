@@ -182,6 +182,7 @@ native_send!(host_send_void_scissor(rect: encoder::ScissorRect) -> ());
 native_send!(host_send_void_id(argument: HostId) -> ());
 native_send!(host_send_void_id_id(first: HostId, second: HostId) -> ());
 native_send!(host_send_void_size(size: foundation::geometry::NSSize) -> ());
+native_send!(host_send_void_rect(rect: foundation::geometry::NSRect) -> ());
 native_send!(host_send_void_bool(value: bool) -> ());
 native_send!(host_send_void_id_u64_u64(argument: HostId, offset: u64, index: u64) -> ());
 native_send!(host_send_void_ptr_u64_u64(bytes: *const c_void, length: u64, index: u64) -> ());

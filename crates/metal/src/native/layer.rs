@@ -4,6 +4,8 @@
 //! creation, so an unpresentable/unknown layer does not corrupt an SDL window.
 
 use super::*;
+use appkit::view::Frame;
+use foundation::geometry::{NSPoint, NSRect, NSSize};
 use std::collections::HashMap;
 use std::sync::{Arc, LazyLock, Mutex};
 
@@ -29,6 +31,33 @@ struct Attachment {
     window: usize,
     window_id: u32,
     view: usize,
+    /// Where the SDL view was last placed, so a moved or resized guest view
+    /// is placed again rather than left over its old rectangle.
+    placement: Placement,
+}
+
+/// A presentation frame's geometry, without its window.
+#[derive(Clone, Copy, PartialEq)]
+struct Placement {
+    x: i32,
+    y: i32,
+    width: u32,
+    height: u32,
+    window_width: u32,
+    window_height: u32,
+}
+
+impl From<&Frame> for Placement {
+    fn from(frame: &Frame) -> Self {
+        Self {
+            x: frame.x,
+            y: frame.y,
+            width: frame.width,
+            height: frame.height,
+            window_width: frame.window_width,
+            window_height: frame.window_height,
+        }
+    }
 }
 
 struct Entry {
@@ -126,13 +155,12 @@ fn request_attachment(layer: Id) {
     let destination = (!view.is_null())
         .then(|| unsafe { appkit::view::presentation_frame(view) })
         .flatten()
-        .filter(|frame| frame.covers_window())
-        .and_then(|frame| {
-            sdl3::video::live_window_id(frame.window).map(|id| (frame.window as usize, id))
-        });
+        .and_then(|frame| sdl3::video::live_window_id(frame.window).map(|id| (frame, id)));
     let settled = match (attached, destination) {
-        (Some(attached), Some((window, id))) => {
-            attached.window == window && attached.window_id == id
+        (Some(attached), Some((frame, id))) => {
+            attached.window == frame.window as usize
+                && attached.window_id == id
+                && attached.placement == Placement::from(&frame)
         }
         // Detached and nowhere to go. A windowed view still awaiting its
         // presentation snapshot is not settled: the pump publishes it.
@@ -182,25 +210,29 @@ fn attach_one(guest: Id) {
         None
     } else {
         unsafe { appkit::view::presentation_frame(view) }.and_then(|frame| {
-            if !frame.covers_window() || frame.window.is_null() {
+            if frame.window.is_null() {
                 return None;
             }
             let window_id = sdl3::video::live_window_id(frame.window)?;
-            Some((frame.window, window_id))
+            Some((frame, window_id))
         })
     };
     // Resolve the layer's currently owning window on the SDL video thread.
-    // A full-window layer may move without either window being destroyed.
+    // A layer may move without either window being destroyed.
     let previous = {
         let mut entries = HOST_LAYERS.lock().unwrap_or_else(|e| e.into_inner());
         let Some(entry) = entries.get_mut(&(guest as usize)) else {
             return;
         };
-        if entry.attached.is_some_and(|attached| {
-            candidate.is_some_and(|(window, id)| {
-                attached.window == window as usize && attached.window_id == id
-            })
-        }) {
+        if let (Some(attached), Some((frame, id))) = (entry.attached.as_mut(), candidate)
+            && attached.window == frame.window as usize
+            && attached.window_id == id
+        {
+            let placement = Placement::from(&frame);
+            if attached.placement != placement {
+                place(attached.view as *mut c_void, &frame);
+                attached.placement = placement;
+            }
             return;
         }
         entry.attached.take()
@@ -210,9 +242,10 @@ fn attach_one(guest: Id) {
         // remains retained for in-flight drawables while SDL retires its view.
         destroy_views(vec![old]);
     }
-    let Some((target_window, window_id)) = candidate else {
+    let Some((frame, window_id)) = candidate else {
         return;
     };
+    let target_window = frame.window;
     let window = target_window as usize;
     {
         let entries = HOST_LAYERS.lock().unwrap_or_else(|e| e.into_inner());
@@ -230,11 +263,13 @@ fn attach_one(guest: Id) {
         gpu::trace("native Metal could not attach SDL Metal view".to_string());
         return;
     };
+    place(native_view, &frame);
     let native_host = unsafe { host_retain(native_layer) };
     let attachment = Attachment {
         window,
         window_id,
         view: native_view as usize,
+        placement: Placement::from(&frame),
     };
     let replacement = Arc::new(HostLayer(native_host as usize));
     let old = {
@@ -255,6 +290,44 @@ fn attach_one(guest: Id) {
         ));
     }
     drop(old);
+}
+
+/// Put SDL's Metal view over the guest view's rectangle. SDL sizes it to the
+/// whole content view, which in a titled window also spans the title bar.
+fn place(native_view: *mut c_void, frame: &Frame) {
+    debug_assert!(sdl3::video::is_video_thread());
+    let Some(snapshot) = sdl3::video::presentation_window(frame.window) else {
+        return;
+    };
+    let (points_w, points_h) = snapshot.logical_size;
+    let (pixels_w, pixels_h) = snapshot.pixel_size;
+    if pixels_w <= 0 || pixels_h <= 0 {
+        return;
+    }
+    let sx = f64::from(points_w) / f64::from(pixels_w);
+    let sy = f64::from(points_h) / f64::from(pixels_h);
+    let width = f64::from(frame.width) * sx;
+    let height = f64::from(frame.height) * sy;
+    let top = f64::from(frame.y) * sy;
+    let _pool = HostPool::new();
+    let view = native_view as HostId;
+    let superview = unsafe { host_send_id(view, sel(c"superview")) };
+    // The frame counts from the top left; an unflipped superview's origin
+    // is its bottom left.
+    let flipped = !superview.is_null() && unsafe { host_send_bool(superview, sel(c"isFlipped")) };
+    let y = if flipped {
+        top
+    } else {
+        f64::from(points_h) - top - height
+    };
+    let rect = NSRect {
+        origin: NSPoint {
+            x: f64::from(frame.x) * sx,
+            y,
+        },
+        size: NSSize { width, height },
+    };
+    unsafe { host_send_void_rect(view, sel(c"setFrame:"), rect) };
 }
 
 fn forget_window(window: sdl3::Window) {
