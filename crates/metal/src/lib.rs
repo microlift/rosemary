@@ -77,7 +77,9 @@ struct Library {
 
 struct Function {
     library: Id,
-    entry: usize,
+    /// The library's own translation, which a source function reading a
+    /// constant with no value of its own does not have.
+    entry: Option<usize>,
     /// The entry point translated for the function constants this function
     /// was made with, in place of the library's own.
     specialized: Option<metal_translate::EntryArtifact>,
@@ -97,7 +99,7 @@ impl Function {
             return Some(unsafe { &*(artifact as *const metal_translate::EntryArtifact) });
         }
         let library = unsafe { object::body::<Library>(self.library) };
-        library.translated.entries.get(self.entry)
+        library.translated.entries.get(self.entry?)
     }
 }
 

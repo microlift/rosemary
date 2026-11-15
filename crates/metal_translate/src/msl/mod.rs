@@ -8,7 +8,7 @@ mod preprocess;
 mod types;
 mod validate;
 
-pub(crate) use validate::validate_specialized;
+pub(crate) use validate::reject_undefined_constants;
 
 use std::collections::HashMap;
 

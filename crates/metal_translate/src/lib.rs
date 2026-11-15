@@ -187,9 +187,10 @@ pub fn translate_msl_specialized(
     let (mut module, rejected) = msl::parse_msl_partial(source, macros).map_err(with_context)?;
     specialize(&mut module, constants)?;
     passes.run(&mut module)?;
-    msl::validate_specialized(&module)?;
+    let unspecialized = msl::reject_undefined_constants(&mut module);
     let mut library = emit_spirv(&module, target)?;
     library.rejected.extend(rejected);
+    library.rejected.extend(unspecialized);
     Ok(library)
 }
 

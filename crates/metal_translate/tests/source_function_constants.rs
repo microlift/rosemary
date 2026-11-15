@@ -1,6 +1,7 @@
 use metal_translate::ir::Operand;
 use metal_translate::{
-    FunctionConstantValues, MTL_DATA_TYPE_FLOAT, MTL_DATA_TYPE_UINT, parse_msl, specialize,
+    FunctionConstantValues, MTL_DATA_TYPE_FLOAT, MTL_DATA_TYPE_UINT, PassPipeline, TargetProfile,
+    parse_msl, specialize, translate_msl_specialized,
 };
 
 const SOURCE: &str = "
@@ -72,7 +73,7 @@ fn source_constant_declarations_reject_invalid_indices_types_and_initializers() 
 
 #[test]
 fn source_specialization_cache_separates_values_and_macro_defaults() {
-    use metal_translate::{PassPipeline, TargetProfile, translate_msl_specialized_cached};
+    use metal_translate::translate_msl_specialized_cached;
     let source = SOURCE.replace("8u", "DEFAULT_WIDTH");
     let target = TargetProfile::vulkan_1_3();
     let passes = PassPipeline::default();
@@ -97,26 +98,42 @@ fn source_specialization_cache_separates_values_and_macro_defaults() {
 }
 
 #[test]
-fn a_source_constant_used_without_a_value_is_rejected_before_emission() {
-    use metal_translate::{PassPipeline, TargetProfile, translate_msl_specialized};
+fn a_function_reading_a_constant_without_a_value_is_rejected_alone() {
     let target = TargetProfile::vulkan_1_3();
     for expression in ["width", "width * 2u"] {
         let source = format!(
             "constant uint width [[function_constant(3)]];
             constant uint required_value = {expression};
-            fragment float4 result() {{ return float4(float(required_value)); }}"
+            fragment float4 required() {{ return float4(float(required_value)); }}
+            fragment float4 independent() {{ return float4(1.0); }}"
         );
+        let names = |library: &metal_translate::TranslatedLibrary| {
+            let entries: Vec<_> = library.entries.iter().map(|e| e.name.clone()).collect();
+            let rejected: Vec<_> = library.rejected.iter().map(|e| e.name.clone()).collect();
+            (entries, rejected)
+        };
         let empty = FunctionConstantValues::new();
-        assert!(
+        let unspecialized =
             translate_msl_specialized(&source, &[], &target, &PassPipeline::default(), &empty)
-                .is_err()
+                .unwrap();
+        assert_eq!(
+            names(&unspecialized),
+            (vec!["independent".to_owned()], vec!["required".to_owned()])
         );
         let mut values = FunctionConstantValues::new();
         values
             .set_index(3, MTL_DATA_TYPE_UINT, &4u32.to_le_bytes())
             .unwrap();
-        translate_msl_specialized(&source, &[], &target, &PassPipeline::default(), &values)
-            .unwrap();
+        let specialized =
+            translate_msl_specialized(&source, &[], &target, &PassPipeline::default(), &values)
+                .unwrap();
+        assert_eq!(
+            names(&specialized),
+            (
+                vec!["required".to_owned(), "independent".to_owned()],
+                vec![]
+            )
+        );
     }
 }
 
