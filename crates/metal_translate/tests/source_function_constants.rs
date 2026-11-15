@@ -119,3 +119,33 @@ fn a_source_constant_used_without_a_value_is_rejected_before_emission() {
             .unwrap();
     }
 }
+
+#[test]
+fn literal_global_initializers_keep_their_diagnostics() {
+    let error = parse_msl(
+        "constant float table[4] = {1.0, 2.0};
+        fragment float4 color() { return float4(table[0]); }",
+    )
+    .unwrap_err();
+    assert!(
+        error.to_string().contains("initialized with 2 items"),
+        "{error}"
+    );
+}
+
+#[test]
+fn globals_derived_from_other_globals_are_computed() {
+    let mut module = parse_msl(
+        "constant uint base = 3u;
+        constant uint derived = base * 2u;
+        fragment float4 color() { return float4(float(derived)); }",
+    )
+    .unwrap();
+    specialize(&mut module, &FunctionConstantValues::new()).unwrap();
+    let derived = module
+        .globals
+        .iter()
+        .find(|global| global.name == "derived")
+        .unwrap();
+    assert_eq!(derived.initializer, Some(Operand::u32(6)));
+}

@@ -56,12 +56,42 @@ impl Context<'_> {
             };
             match self.constant(expression, &global.ty, global.line) {
                 Ok(value) => module.globals[index as usize].initializer = Some(value),
-                Err(_) => module
+                // Only a value read from another program-scope constant can
+                // wait for specialization; anything else is malformed here.
+                Err(_) if self.reads_global(expression) => module
                     .static_initializers
                     .push(Lowerer::global_initializer(self, global, index)?),
+                Err(error) => return Err(error),
             }
         }
         Ok(())
+    }
+
+    fn reads_global(&self, expr: &Expr) -> bool {
+        let any = |exprs: &[Expr]| exprs.iter().any(|expr| self.reads_global(expr));
+        match &expr.kind {
+            ExprKind::Ident(name) => self.globals.contains_key(name),
+            ExprKind::Int { .. } | ExprKind::Float { .. } | ExprKind::Bool(_) => false,
+            ExprKind::Unary(_, inner)
+            | ExprKind::Postfix(_, inner)
+            | ExprKind::Cast(_, inner)
+            | ExprKind::AtomicCast(_, inner)
+            | ExprKind::PointerCast(_, _, inner)
+            | ExprKind::Member(inner, _) => self.reads_global(inner),
+            ExprKind::Binary(_, lhs, rhs)
+            | ExprKind::Assign(_, lhs, rhs)
+            | ExprKind::Index(lhs, rhs) => self.reads_global(lhs) || self.reads_global(rhs),
+            ExprKind::Ternary(condition, yes, no) => {
+                self.reads_global(condition) || self.reads_global(yes) || self.reads_global(no)
+            }
+            ExprKind::Call { args, .. }
+            | ExprKind::Construct(_, args)
+            | ExprKind::InitList(args) => any(args),
+            ExprKind::CompoundLiteral(_, fields) => {
+                fields.iter().any(|(_, expr)| self.reads_global(expr))
+            }
+            ExprKind::Method { object, args, .. } => self.reads_global(object) || any(args),
+        }
     }
 }
 
