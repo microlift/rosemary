@@ -26,25 +26,22 @@ unsafe extern "C" fn chkstk() {
 #[unsafe(naked)]
 unsafe extern "C" fn chkstk() {
     core::arch::naked_asm!(
-        // Darwin arm64 passes the number of bytes to probe in w9.
-        //
-        // Unlike x86-64, the return address lives in x30 rather than on the
-        // stack, so SP already points at the caller's current stack boundary.
-        //
-        // x9 and x10 are scratch registers according to the special stack
-        // probe calling convention. SP itself is not modified.
-        "cmp w9, #4096",
-        "mov x10, sp",
-        "b.lo 3f",
+        // Darwin arm64 passes the number of bytes to probe in x9, below the
+        // current SP. Only x16 and x17 are touched: a caller may still hold
+        // the size in x9 to move SP itself, and every call through a stub
+        // already gives up the intra-procedure-call registers.
+        "mov x16, x9",
+        "mov x17, sp",
         "2:",
-        "sub x10, x10, #4096",
-        "ldr xzr, [x10]",
-        "sub w9, w9, #4096",
-        "cmp w9, #4096",
-        "b.hi 2b",
+        "cmp x16, #4096",
+        "b.ls 3f",
+        "sub x17, x17, #4096",
+        "ldr xzr, [x17]",
+        "sub x16, x16, #4096",
+        "b 2b",
         "3:",
-        "sub x10, x10, x9",
-        "ldr xzr, [x10]",
+        "sub x17, x17, x16",
+        "ldr xzr, [x17]",
         "ret",
     );
 }
@@ -52,7 +49,7 @@ unsafe extern "C" fn chkstk() {
 #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 exports::exports! {
     functions {
-        "___chkstk_darwin" => chkstk,
+        "__chkstk_darwin" => chkstk,
     }
 }
 
