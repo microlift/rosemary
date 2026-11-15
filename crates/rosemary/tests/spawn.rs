@@ -315,3 +315,63 @@ fn framework_tasks_preserve_emulation_cwd_and_redirected_stdio() {
         );
     }
 }
+
+const ARCH_PARENT_SOURCE: &str = r#"
+#include <spawn.h>
+#include <stdio.h>
+#include <sys/wait.h>
+#include <crt_externs.h>
+
+int main(int argc, char **argv) {
+    if (argc != 2) return 10;
+    char *args[] = { argv[1], NULL };
+    pid_t pid;
+    int status;
+    if (posix_spawn(&pid, argv[1], NULL, NULL, args, *_NSGetEnviron())) return 11;
+    if (waitpid(pid, &status, 0) != pid) return 12;
+    printf("child status %d\n", WIFEXITED(status) ? WEXITSTATUS(status) : -1);
+    return 0;
+}
+"#;
+
+const ARCH_CHILD_SOURCE: &str = r#"
+#include <stdio.h>
+#include <sys/sysctl.h>
+
+int main(void) {
+    int translated = -1;
+    size_t size = sizeof translated;
+    if (sysctlbyname("sysctl.proc_translated", &translated, &size, NULL, 0)) return 20;
+    printf("child translated %d\n", translated);
+    return 17;
+}
+"#;
+
+/// Only a host whose native slices are not x86-64 has a child without one.
+#[cfg(target_arch = "aarch64")]
+#[test]
+fn emulated_children_without_an_x86_64_slice_run_natively_unless_strict() {
+    let Some(parent) = common::build_x86_64("spawn-arch-parent", ARCH_PARENT_SOURCE, &[]) else {
+        skip!("cannot build x86_64 spawn fixtures")
+    };
+    let Some(child) = common::build_native("spawn-arch-child", ARCH_CHILD_SOURCE) else {
+        skip!("cannot build native spawn fixtures")
+    };
+    let run = |mode: &str| {
+        let output = common::driver_command()
+            .env("ROSEMARY_PREFIX", "off")
+            .args(["run", mode, &parent, &child])
+            .output()
+            .expect("run arch fixture");
+        assert_eq!(output.status.code(), Some(0), "{mode}: {output:?}");
+        String::from_utf8_lossy(&output.stdout).into_owned()
+    };
+    for mode in ["--emulated", "--emulated=x86-64"] {
+        let out = run(mode);
+        assert!(out.contains("child translated 0"), "{mode}: {out}");
+        assert!(out.contains("child status 17"), "{mode}: {out}");
+    }
+    let out = run("--emulated=x86-64-strict");
+    assert!(!out.contains("child translated"), "{out}");
+    assert!(out.contains("child status 1\n"), "{out}");
+}

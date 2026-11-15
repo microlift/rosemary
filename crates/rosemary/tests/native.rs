@@ -359,7 +359,7 @@ fn forcing_emulated_on_a_native_binary_names_the_architecture() {
     let Some(path) = build_native("native_hello_emulated", common::HELLO_C) else {
         skip!("cannot build native fixtures")
     };
-    let (status, _, err) = run_guest_with(&["--emulated"], &path, &[]);
+    let (status, _, err) = run_guest_with(&["--emulated=x86-64-strict"], &path, &[]);
 
     if HOST_RUNS_X86_64 {
         // The "native" fixture is an x86-64 one here, so it is also a fixture
@@ -369,6 +369,11 @@ fn forcing_emulated_on_a_native_binary_names_the_architecture() {
     }
     assert_eq!(status, Some(1));
     assert!(err.contains("emulated backend"), "{err}");
+
+    // Without `strict`, a binary with no x86-64 slice runs natively, as
+    // Rosetta 2 runs an arm64-only child of a translated process.
+    let (status, _, err) = run_guest_with(&["--emulated"], &path, &[]);
+    assert_eq!(status, Some(0), "{err}");
 }
 
 /// `/bin/ls` is x86-64 plus arm64e. The arm64e slice runs natively: its

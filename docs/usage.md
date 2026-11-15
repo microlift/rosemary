@@ -237,6 +237,15 @@ Rosemary has two execution modes currently:
 
 If not specified at the CLI, Rosemary will automatically try to see if there is a slice available in the app for your native architecture and run it without getting Microlift involved. Otherwise, it will check if it has an emulated implementation for the architecture.
 
+`--emulated` takes an optional mode, which the Mach-Os the guest executes inherit:
+
+* `--emulated=x86-64` (the default for a bare `--emulated`) - as under Rosetta 2, a child
+  with an x86-64 slice runs it emulated, and one without any (such as `/usr/bin/unzip` in an
+  arm64 prefix) runs natively. That native child's own children choose their backend
+  automatically again.
+* `--emulated=x86-64-strict` - every executed Mach-O must have an x86-64 slice; one without
+  fails to launch.
+
 ARM emulation is not supported yet, but the groundwork is laid for it.
 
 ## Built-in OpenGL

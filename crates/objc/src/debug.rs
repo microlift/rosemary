@@ -103,6 +103,7 @@ fn requested_at_launch(mut arguments: impl Iterator<Item = std::ffi::OsString>) 
         match argument.to_str() {
             Some("--objc-debug") => return true,
             Some("--slow" | "--native" | "--emulated") => {}
+            Some(option) if option.starts_with("--emulated=") => {}
             // This is the guest path. Everything after it belongs to the
             // guest, including an argument with the same spelling.
             _ => return false,
@@ -566,6 +567,12 @@ mod tests {
         assert!(requested_at_launch(arguments(&[
             "run",
             "--emulated",
+            "--objc-debug",
+            "guest"
+        ])));
+        assert!(requested_at_launch(arguments(&[
+            "run",
+            "--emulated=x86-64-strict",
             "--objc-debug",
             "guest"
         ])));

@@ -1,5 +1,5 @@
 use std::ffi::{CStr, CString, VaList, c_char, c_int, c_void};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Mutex, MutexGuard};
 
 use crate::signal::signal_to_host;
@@ -292,22 +292,65 @@ unsafe fn argv_of(argv: *const *const c_char) -> Vec<CString> {
     }
 }
 
-/// Whether the driver explicitly requested emulation for this process.
-static EMULATED: AtomicBool = AtomicBool::new(false);
+/// How an explicitly emulated process treats the Mach-Os it executes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Emulation {
+    /// As Rosetta 2 does: a child prefers its x86-64 slice, and one without
+    /// any runs natively.
+    X86_64,
+    /// A child must have an x86-64 slice.
+    X86_64Strict,
+}
+
+impl Emulation {
+    /// The driver option that requests this mode.
+    pub const fn option(self) -> &'static CStr {
+        match self {
+            Emulation::X86_64 => c"--emulated=x86-64",
+            Emulation::X86_64Strict => c"--emulated=x86-64-strict",
+        }
+    }
+}
+
+const NOT_EMULATED: u8 = 0;
+const EMULATED_X86_64: u8 = 1;
+const EMULATED_X86_64_STRICT: u8 = 2;
+
+/// The emulation the driver explicitly requested for this process.
+static EMULATION: AtomicU8 = AtomicU8::new(NOT_EMULATED);
 
 /// Preserve an explicit `--emulated` choice in child Rosemary launches.
 ///
-/// Set by the driver before loading guest code. Automatic backend selection
-/// remains automatic for children, which may have different Mach-O slices.
-pub fn set_emulated(emulated: bool) {
-    EMULATED.store(emulated, Ordering::Relaxed);
+/// Set by the driver before loading guest code, and only for a process that
+/// is emulated: automatic backend selection, and a native process an
+/// emulated parent started, stay automatic for children.
+pub fn set_emulation(emulation: Option<Emulation>) {
+    let value = match emulation {
+        None => NOT_EMULATED,
+        Some(Emulation::X86_64) => EMULATED_X86_64,
+        Some(Emulation::X86_64Strict) => EMULATED_X86_64_STRICT,
+    };
+    EMULATION.store(value, Ordering::Relaxed);
+}
+
+fn emulation() -> Option<Emulation> {
+    match EMULATION.load(Ordering::Relaxed) {
+        EMULATED_X86_64 => Some(Emulation::X86_64),
+        EMULATED_X86_64_STRICT => Some(Emulation::X86_64Strict),
+        _ => None,
+    }
 }
 
 /// The runtime's arguments for a child, without the guest's `argv[0]`.
-fn runtime_argv(runtime: &CStr, path: &CStr, argv: &[CString], emulated: bool) -> Vec<CString> {
+fn runtime_argv(
+    runtime: &CStr,
+    path: &CStr,
+    argv: &[CString],
+    emulation: Option<Emulation>,
+) -> Vec<CString> {
     let mut rewritten = vec![runtime.to_owned(), c"run".to_owned()];
-    if emulated {
-        rewritten.push(c"--emulated".to_owned());
+    if let Some(emulation) = emulation {
+        rewritten.push(emulation.option().to_owned());
     }
     rewritten.push(path.to_owned());
     rewritten.extend(argv.iter().skip(1).cloned());
@@ -320,7 +363,7 @@ fn rewrite(path: &CStr, on_disk: &CStr, argv: &[CString]) -> Option<(CString, Ve
         return None;
     }
     let runtime = runtime_path()?;
-    let rewritten = runtime_argv(&runtime, path, argv, EMULATED.load(Ordering::Relaxed));
+    let rewritten = runtime_argv(&runtime, path, argv, emulation());
     Some((runtime, rewritten))
 }
 
@@ -1428,8 +1471,8 @@ pub fn spawn_application(
 ) -> Result<libc::pid_t, c_int> {
     let runtime = runtime_path().ok_or(libc::ENOENT)?;
     let mut argv = vec![runtime.clone(), c"run".to_owned()];
-    if EMULATED.load(Ordering::Relaxed) {
-        argv.push(c"--emulated".to_owned());
+    if let Some(emulation) = emulation() {
+        argv.push(emulation.option().to_owned());
     }
     if new_instance {
         argv.push(c"--new-instance".to_owned());
@@ -1571,11 +1614,16 @@ mod tests {
             c"argument".to_owned(),
         ];
         assert_eq!(
-            runtime_argv(c"rosemary", c"/guest/helper", &argv, true),
+            runtime_argv(
+                c"rosemary",
+                c"/guest/helper",
+                &argv,
+                Some(Emulation::X86_64Strict)
+            ),
             [
                 c"rosemary",
                 c"run",
-                c"--emulated",
+                c"--emulated=x86-64-strict",
                 c"/guest/helper",
                 c"--native",
                 c"argument"
@@ -1583,7 +1631,7 @@ mod tests {
             .map(CStr::to_owned)
         );
         assert_eq!(
-            runtime_argv(c"rosemary", c"/guest/helper", &argv, false),
+            runtime_argv(c"rosemary", c"/guest/helper", &argv, None),
             [
                 c"rosemary",
                 c"run",

@@ -7,7 +7,8 @@ use rosemary::{
     startup,
 };
 
-use clap::{Args, Parser, Subcommand};
+use clap::{Args, Parser, Subcommand, ValueEnum};
+use darwin::spawn::Emulation;
 use microlift::arch::x86_64::X86_64;
 use microlift::core::lift_to_function;
 
@@ -29,20 +30,23 @@ fn run(
     guest: &str,
     args: Vec<OsString>,
     policy: ImportPolicy,
-    forced: Option<Engine>,
+    backend: Backend,
 ) -> ExitCode {
-    darwin::spawn::set_emulated(forced == Some(Engine::Emulated));
     let mut argv = vec![OsString::from(guest)];
     argv.extend(args);
     rosemary::stats::start();
 
-    let engine = match choose(path, forced) {
+    let engine = match choose(path, backend) {
         Ok(engine) => engine,
         Err(e) => {
             eprintln!("rosemary: {path}: {e}");
             return ExitCode::FAILURE;
         }
     };
+    darwin::spawn::set_emulation(match (backend, engine) {
+        (Backend::Emulated(emulation), Engine::Emulated) => Some(emulation),
+        _ => None,
+    });
     if let Err(e) = prefix_cli::ensure_cxx_runtime(engine) {
         eprintln!("rosemary: {path}: {e}");
         return ExitCode::FAILURE;
@@ -92,16 +96,32 @@ fn run(
     }
 }
 
+/// The backend a run was asked for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Backend {
+    /// Whatever the file's slices allow, native first.
+    Auto,
+    Native,
+    Emulated(Emulation),
+}
+
 /// The backend for `path`: what was asked for, or what the file's slices allow.
-fn choose(path: &str, forced: Option<Engine>) -> Result<Engine, String> {
+fn choose(path: &str, backend: Backend) -> Result<Engine, String> {
     let bytes = std::fs::read(path).map_err(|e| e.to_string())?;
-    match forced {
-        Some(engine) => match engine.refusal(&bytes) {
-            Some(why) => Err(why),
-            None => Ok(engine),
-        },
-        None => Engine::select(&bytes)
+    let forced = |engine: Engine| match engine.refusal(&bytes) {
+        Some(why) => Err(why),
+        None => Ok(engine),
+    };
+    match backend {
+        Backend::Auto => Engine::select(&bytes)
             .ok_or_else(|| "no slice this runtime can run or recompile".to_string()),
+        Backend::Native => forced(Engine::Native),
+        Backend::Emulated(Emulation::X86_64Strict) => forced(Engine::Emulated),
+        // A translated process on an Apple silicon Mac runs a child's x86-64
+        // slice when it has one, and an arm64-only child natively.
+        Backend::Emulated(Emulation::X86_64) => {
+            forced(Engine::Emulated).or_else(|why| forced(Engine::Native).map_err(|_| why))
+        }
     }
 }
 
@@ -228,6 +248,24 @@ fn imply_builtin_runtime() {
     }
 }
 
+/// The `--emulated` modes.
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum EmulatedMode {
+    #[value(name = "x86-64")]
+    X86_64,
+    #[value(name = "x86-64-strict")]
+    X86_64Strict,
+}
+
+impl From<EmulatedMode> for Emulation {
+    fn from(mode: EmulatedMode) -> Self {
+        match mode {
+            EmulatedMode::X86_64 => Emulation::X86_64,
+            EmulatedMode::X86_64Strict => Emulation::X86_64Strict,
+        }
+    }
+}
+
 /// How a guest is run; shared by `rosemary run` and the bare form.
 #[derive(Args, Debug, Default)]
 struct RunOptions {
@@ -237,9 +275,17 @@ struct RunOptions {
     /// Run the host-architecture slice directly, never through the lifter
     #[arg(long, conflicts_with = "emulated")]
     native: bool,
-    /// Recompile the x86-64 slice through Microlift even when a native slice exists
-    #[arg(long)]
-    emulated: bool,
+    /// Recompile the x86-64 slice through Microlift even when a native slice
+    /// exists. `x86-64` (the default) lets a Mach-O with no x86-64 slice run
+    /// natively, as Rosetta 2 does; `x86-64-strict` refuses it
+    #[arg(
+        long,
+        value_name = "MODE",
+        num_args = 0..=1,
+        require_equals = true,
+        default_missing_value = "x86-64"
+    )]
+    emulated: Option<EmulatedMode>,
     /// Enable the built-in Objective-C runtime's fail-fast checks (needs ROSEMARY_OBJC=builtin)
     #[arg(long)]
     objc_debug: bool,
@@ -389,10 +435,10 @@ fn launch(path: OsString, options: &RunOptions, args: Vec<OsString>) -> ExitCode
         true => ImportPolicy::AlwaysSlow,
         false => ImportPolicy::FastWhenKnown,
     };
-    let engine = match (options.native, options.emulated) {
-        (true, _) => Some(Engine::Native),
-        (_, true) => Some(Engine::Emulated),
-        _ => None,
+    let backend = match (options.native, options.emulated) {
+        (true, _) => Backend::Native,
+        (_, Some(mode)) => Backend::Emulated(mode.into()),
+        _ => Backend::Auto,
     };
     let objc_debug = options.objc_debug;
     // Before anything can ask which prefix this is, including the paths
@@ -476,7 +522,7 @@ fn launch(path: OsString, options: &RunOptions, args: Vec<OsString>) -> ExitCode
         // strictly better than not running.
         eprintln!("rosemary: could not re-execute from the bundle mirror: {e}");
     }
-    run(path, &guest, args, policy, engine)
+    run(path, &guest, args, policy, backend)
 }
 
 /// LaunchServices' rule that an application runs once, before the program is
@@ -571,7 +617,7 @@ fn aot(options: AotOptions) -> ExitCode {
         eprintln!("rosemary: the bundle executable's path is not valid UTF-8");
         return ExitCode::FAILURE;
     };
-    if let Err(e) = choose(path, Some(Engine::Emulated)) {
+    if let Err(e) = choose(path, Backend::Emulated(Emulation::X86_64Strict)) {
         eprintln!("rosemary: {path}: {e}");
         return ExitCode::FAILURE;
     }
