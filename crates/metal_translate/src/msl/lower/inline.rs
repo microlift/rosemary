@@ -329,7 +329,7 @@ impl<'p> Lowerer<'_, 'p> {
                 })?;
                 deduce(declared, &lvalue.ty(), types, values, line)?;
                 let ty = &substitute(declared, types, values, line)?;
-                if lvalue.ty() != ty.in_memory().unpacked() {
+                if lvalue.ty().in_memory() != ty.in_memory() {
                     return Err(syntax_error(
                         line,
                         format!(

@@ -74,3 +74,21 @@ fn comma_expressions_sequence_effects_and_return_the_right_value() {
         translate_msl(&separate, &target).unwrap().entries[0].words
     );
 }
+
+#[test]
+fn bool_arrays_bind_to_array_references() {
+    for signature in [
+        "void set_last(thread bool (&flags)[4])",
+        "template<uint N> void set_last(thread bool (&flags)[N])",
+    ] {
+        let source = format!(
+            "{signature} {{ flags[3] = true; }}
+            fragment float4 probe() {{
+                bool flags[4] = {{}};
+                set_last(flags);
+                return float4(flags[3] ? 1.0 : 0.0);
+            }}"
+        );
+        translate_msl(&source, &TargetProfile::vulkan_1_3()).unwrap();
+    }
+}
