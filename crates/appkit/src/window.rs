@@ -234,6 +234,37 @@ fn takes_key(receiver: Id, want: Presentation) -> bool {
     want != Presentation::Tooltip && crate::event::answers(receiver, "canBecomeKeyWindow")
 }
 
+/// The window AppKit makes key when the key window goes: the main window,
+/// else the frontmost one that can become key.
+fn key_after(leaving: &[Id]) -> Id {
+    let eligible = |window: Id| {
+        !window.is_null()
+            && !leaving.contains(&window)
+            && is_shown(window)
+            && takes_key(window, presentation(window_of(window)))
+    };
+    let main = crate::event::main_window();
+    if eligible(main) {
+        return main;
+    }
+    all()
+        .into_iter()
+        .filter(|window| eligible(*window))
+        .max_by_key(|window| window_of(*window).ordered)
+        .unwrap_or(std::ptr::null_mut())
+}
+
+/// Make the window after `leaving` key, once a key popup among them is gone.
+// FIXME (ACCURACY): AppKit does this for every key window. When a toplevel
+// goes, the host picks the window it focuses next.
+fn hand_key_on(leaving: &[Id]) {
+    let next = key_after(leaving);
+    if !next.is_null() {
+        KEY.store(next as usize, std::sync::atomic::Ordering::Release);
+        crate::event::announce_key(next);
+    }
+}
+
 /// The toplevel a popup hangs off, through any popups between.
 fn toplevel_under(mut sdl: sdl3::Window) -> sdl3::Window {
     while !sdl.is_null() && presentation_of_sdl(sdl) != Presentation::Toplevel {
@@ -534,6 +565,7 @@ fn destroy_sdl_window(sdl: sdl3::Window) {
                 if KEY.load(std::sync::atomic::Ordering::Acquire) == object as usize {
                     KEY.store(0, std::sync::atomic::Ordering::Release);
                     crate::event::announce_resign(object);
+                    hand_key_on(&[object]);
                 }
                 crate::event::forget_announced(object);
             }
@@ -2401,12 +2433,7 @@ unsafe extern "C" fn set_is_visible(receiver: Id, _sel: Sel, visible: u8) {
 unsafe extern "C" fn order_out(receiver: Id, _sel: Sel, _sender: Id) {
     trace!("{receiver:p} ordered out");
     let sdl = window_of(receiver).sdl;
-    // The host moves focus on when a toplevel goes. A popup never had it, so
-    // the window under a key popup is made key here.
-    let under_popup = match !sdl.is_null() && presentation_of_sdl(sdl) != Presentation::Toplevel {
-        true => window_for(sdl3::video::window_parent(sdl)),
-        false => std::ptr::null_mut(),
-    };
+    let is_popup = !sdl.is_null() && presentation_of_sdl(sdl) != Presentation::Toplevel;
     if !sdl.is_null() {
         sdl3::video::hide_window(sdl);
     }
@@ -2420,12 +2447,8 @@ unsafe extern "C" fn order_out(receiver: Id, _sel: Sel, _sender: Id) {
         )
         .is_ok();
     crate::event::announce_resign(receiver);
-    if was_key
-        && !under_popup.is_null()
-        && takes_key(under_popup, presentation(window_of(under_popup)))
-    {
-        KEY.store(under_popup as usize, std::sync::atomic::Ordering::Release);
-        crate::event::announce_key(under_popup);
+    if was_key && is_popup {
+        hand_key_on(&[receiver]);
     }
 }
 
@@ -4127,6 +4150,10 @@ mod tests {
     /// property reads back what the program set, whether or not the host
     /// composites it.
     fn titled_window() -> Id {
+        made_window(c"NSWindow", style::TITLED)
+    }
+
+    fn made_window(class: &std::ffi::CStr, style_mask: usize) -> Id {
         crate::bootstrap();
         let rect = NSRect {
             origin: NSPoint { x: 20.0, y: 20.0 },
@@ -4135,14 +4162,13 @@ mod tests {
                 height: 120.0,
             },
         };
-        let object =
-            objc::object::create_instance(objc::class::lookup(c"NSWindow").expect("NSWindow"), 0);
+        let object = objc::object::create_instance(objc::class::lookup(class).expect("a class"), 0);
         unsafe {
             init_with_content_rect(
                 object,
                 objc::sel::get("initWithContentRect:styleMask:backing:defer:"),
                 rect,
-                style::TITLED,
+                style_mask,
                 0,
                 0,
             )
@@ -4235,6 +4261,33 @@ mod tests {
 
             crate::event::announce_resign(document);
             assert_eq!(is_main_window(document, is_main), 0);
+        }
+    }
+
+    #[test]
+    fn key_goes_to_the_main_window_when_a_key_popup_is_ordered_out() {
+        if !sdl3::isolated::run_here() {
+            return;
+        }
+        crate::bootstrap();
+        let Some(probe) = sdl3::video::create_window(c"key after preflight", 32, 32, 0) else {
+            return; // no graphical SDL display available
+        };
+        sdl3::video::destroy_window(probe);
+        let main = titled_window();
+        let later = titled_window();
+        let popup = made_window(c"NSPanel", style::RESIZABLE);
+        window_of(popup).level = window_level::POPUP_MENU;
+        let order = objc::sel::get("makeKeyAndOrderFront:");
+        unsafe {
+            make_key_and_order_front(later, order, std::ptr::null_mut());
+            make_key_and_order_front(main, order, std::ptr::null_mut());
+            order_front_regardless(later, objc::sel::get("orderFrontRegardless"));
+            make_key_and_order_front(popup, order, std::ptr::null_mut());
+            assert_eq!(key_window(), popup);
+
+            order_out(popup, objc::sel::get("orderOut:"), std::ptr::null_mut());
+            assert_eq!(key_window(), main);
         }
     }
 
