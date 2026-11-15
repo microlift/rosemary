@@ -1006,6 +1006,10 @@ unsafe extern "C" fn key_window(_receiver: Id, _sel: Sel) -> Id {
     crate::window::key_window()
 }
 
+unsafe extern "C" fn main_window(_receiver: Id, _sel: Sel) -> Id {
+    crate::event::main_window()
+}
+
 /// The four settable menus, each kept for the program to read back.
 ///
 /// One implementation for all of them, resolved by the selector: the bodies would
@@ -1424,7 +1428,7 @@ pub(crate) fn install() {
         "enumerateWindowsWithOptions:usingBlock:" => enumerate_windows, c"v32@0:8Q16@?24";
         "windowWithWindowNumber:" => window_with_window_number, c"@24@0:8q16";
         "keyWindow" => key_window, c"@16@0:8";
-        "mainWindow" => key_window, c"@16@0:8";
+        "mainWindow" => main_window, c"@16@0:8";
         "servicesMenu" => menu_for, c"@16@0:8";
         "setServicesMenu:" => set_menu_for, c"v24@0:8@16";
         "windowsMenu" => menu_for, c"@16@0:8";

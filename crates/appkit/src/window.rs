@@ -2711,8 +2711,17 @@ unsafe extern "C" fn is_key_window(receiver: Id, _sel: Sel) -> u8 {
     (key_window() == receiver) as u8
 }
 
+unsafe extern "C" fn is_main_window(receiver: Id, _sel: Sel) -> u8 {
+    (crate::event::main_window() == receiver) as u8
+}
+
+unsafe extern "C" fn make_main_window(receiver: Id, _sel: Sel) {
+    crate::event::announce_main(receiver);
+}
+
 /// AppKit's rule: a window with a title bar or a resize bar can be key (and
-/// main); a borderless one cannot unless a subclass says so.
+/// main, unless it is a panel); a borderless one cannot unless a subclass
+/// says so.
 unsafe extern "C" fn can_become_key(receiver: Id, _sel: Sel) -> u8 {
     (window_of(receiver).style_mask & (style::TITLED | style::RESIZABLE) != 0) as u8
 }
@@ -3797,6 +3806,7 @@ pub(crate) fn install() {
     methods!(panel, {
         "becomesKeyOnlyIfNeeded" => becomes_key_only_if_needed, c"c16@0:8";
         "setBecomesKeyOnlyIfNeeded:" => set_becomes_key_only_if_needed, c"v20@0:8c16";
+        "canBecomeMainWindow" => no, c"c16@0:8";
     });
     let class = objc::class::lookup(c"NSWindow").expect("declared before its methods");
     class_methods!(class, {
@@ -3867,7 +3877,7 @@ pub(crate) fn install() {
         "setTitle:" => set_title, c"v24@0:8@16";
         "makeKeyAndOrderFront:" => make_key_and_order_front, c"v24@0:8@16";
         "makeKeyWindow" => make_key_window, c"v16@0:8";
-        "makeMainWindow" => ignored, c"v16@0:8";
+        "makeMainWindow" => make_main_window, c"v16@0:8";
         // Private. The number is SDL's window id and cannot be reassigned;
         // Gecko sets -1 then the old number back to reset a reshown popup in
         // the window server's cache, which this runtime has no counterpart of.
@@ -3885,7 +3895,7 @@ pub(crate) fn install() {
         "canBecomeMainWindow" => can_become_key, c"c16@0:8";
         "constrainFrameRect:toScreen:" => constrain_frame_rect,
             c"{CGRect={CGPoint=dd}{CGSize=dd}}56@0:8{CGRect={CGPoint=dd}{CGSize=dd}}16@48";
-        "isMainWindow" => is_key_window, c"c16@0:8";
+        "isMainWindow" => is_main_window, c"c16@0:8";
         "isVisible" => is_visible, c"c16@0:8";
         "setIsVisible:" => set_is_visible, c"v20@0:8c16";
         // One space: ordering any window in puts it on the active one.
@@ -4198,6 +4208,33 @@ mod tests {
             order_out(popup, objc::sel::get("orderOut:"), std::ptr::null_mut());
             assert_eq!(key_window(), under);
             assert_eq!(key_target(under), under);
+        }
+    }
+
+    #[test]
+    #[cfg_attr(
+        target_os = "macos",
+        ignore = "SDL's Cocoa video needs the main thread, which libtest gives no test"
+    )]
+    fn a_panel_taking_key_leaves_the_main_window_main() {
+        if !sdl3::isolated::run_here_with_dummy_video() {
+            return;
+        }
+        let document = titled_window();
+        let panel =
+            objc::object::create_instance(objc::class::lookup(c"NSPanel").expect("NSPanel"), 0);
+        window_of(panel).style_mask = style::TITLED;
+        let is_main = objc::sel::get("isMainWindow");
+        unsafe {
+            crate::event::announce_key(document);
+            assert_eq!(is_main_window(document, is_main), 1);
+
+            crate::event::announce_key(panel);
+            assert_eq!(is_main_window(document, is_main), 1);
+            assert_eq!(is_main_window(panel, is_main), 0);
+
+            crate::event::announce_resign(document);
+            assert_eq!(is_main_window(document, is_main), 0);
         }
     }
 

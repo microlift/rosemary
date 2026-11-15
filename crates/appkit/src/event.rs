@@ -1747,11 +1747,19 @@ fn post(id: u32, name: &str) {
     post_for(object, name);
 }
 
-/// The window last announced as key and main, which is not always
+/// The window last announced as key, which is not always
 /// [`window::key_window`]: that one follows every ordering, and this one only
 /// changes with a pair of notifications, so no window becomes key twice
 /// without resigning in between.
 static ANNOUNCED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// The main window: the last key window that could become main. A panel
+/// taking key leaves it where it was.
+static MAIN: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+pub(crate) fn main_window() -> Id {
+    MAIN.load(std::sync::atomic::Ordering::Acquire) as Id
+}
 
 pub(crate) fn answers(object: Id, selector: &str) -> bool {
     // SAFETY: a window this crate made; both selectors are `BOOL (id, SEL)`,
@@ -1763,38 +1771,68 @@ pub(crate) fn answers(object: Id, selector: &str) -> bool {
     }
 }
 
-/// `object` becomes the key window, and the main one when it can: the window
-/// before it resigns both first, as AppKit orders them. Toolkits activate on
+/// `object` becomes the key window, and the main one when it can: the
+/// windows before it resign first, as AppKit orders them. Toolkits activate on
 /// these - Gecko only fires DOM focus events in a window it was told is key.
 pub(crate) fn announce_key(object: Id) {
     if object.is_null() || !answers(object, "canBecomeKeyWindow") {
         return;
     }
-    let previous = ANNOUNCED.swap(object as usize, std::sync::atomic::Ordering::AcqRel) as Id;
-    if previous == object {
-        return;
+    let key = ANNOUNCED.swap(object as usize, std::sync::atomic::Ordering::AcqRel) as Id;
+    let main = match answers(object, "canBecomeMainWindow") {
+        true => MAIN.swap(object as usize, std::sync::atomic::Ordering::AcqRel) as Id,
+        false => object,
+    };
+    if key != object && !key.is_null() {
+        post_for(key, window::DID_RESIGN_KEY);
     }
-    if !previous.is_null() {
-        post_for(previous, window::DID_RESIGN_KEY);
-        post_for(previous, window::DID_RESIGN_MAIN);
+    if main != object && !main.is_null() {
+        post_for(main, window::DID_RESIGN_MAIN);
     }
-    post_for(object, window::DID_BECOME_KEY);
-    if answers(object, "canBecomeMainWindow") {
+    if key != object {
+        post_for(object, window::DID_BECOME_KEY);
+    }
+    if main != object {
         post_for(object, window::DID_BECOME_MAIN);
     }
 }
 
-/// `object` stops being key and main, if it was: focus left it, or it left
-/// the screen.
+/// `-makeMainWindow`: `object` becomes main without becoming key.
+pub(crate) fn announce_main(object: Id) {
+    if object.is_null() || !answers(object, "canBecomeMainWindow") {
+        return;
+    }
+    let main = MAIN.swap(object as usize, std::sync::atomic::Ordering::AcqRel) as Id;
+    if main == object {
+        return;
+    }
+    if !main.is_null() {
+        post_for(main, window::DID_RESIGN_MAIN);
+    }
+    post_for(object, window::DID_BECOME_MAIN);
+}
+
+fn forget(announced: &std::sync::atomic::AtomicUsize, object: Id) -> bool {
+    announced
+        .compare_exchange(
+            object as usize,
+            0,
+            std::sync::atomic::Ordering::AcqRel,
+            std::sync::atomic::Ordering::Acquire,
+        )
+        .is_ok()
+}
+
+/// `object` stops being key and main, whichever it was: focus left it, or it
+/// left the screen.
 pub(crate) fn announce_resign(object: Id) {
-    let was = ANNOUNCED.compare_exchange(
-        object as usize,
-        0,
-        std::sync::atomic::Ordering::AcqRel,
-        std::sync::atomic::Ordering::Acquire,
-    );
-    if was.is_ok() && !object.is_null() {
+    if object.is_null() {
+        return;
+    }
+    if forget(&ANNOUNCED, object) {
         post_for(object, window::DID_RESIGN_KEY);
+    }
+    if forget(&MAIN, object) {
         post_for(object, window::DID_RESIGN_MAIN);
     }
 }
@@ -1802,12 +1840,8 @@ pub(crate) fn announce_resign(object: Id) {
 /// A window being freed is no longer the announced one; nothing is posted
 /// about an object that is going.
 pub(crate) fn forget_announced(object: Id) {
-    let _ = ANNOUNCED.compare_exchange(
-        object as usize,
-        0,
-        std::sync::atomic::Ordering::AcqRel,
-        std::sync::atomic::Ordering::Acquire,
-    );
+    forget(&ANNOUNCED, object);
+    forget(&MAIN, object);
 }
 
 /// Send the window notification `name` about `object` to its delegate and to
