@@ -562,7 +562,7 @@ pub(crate) fn deliver_past_modal(event: sdl3::video::Event) {
             start,
             length,
         } => {
-            let window = object_for(window);
+            let window = window::key_target(object_for(window));
             let responder = responder_of(window);
             if crate::text::accepts_host_text(responder) {
                 crate::text::compose(responder, &text, start, length);
