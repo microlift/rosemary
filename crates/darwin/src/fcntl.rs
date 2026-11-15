@@ -490,9 +490,13 @@ pub mod entry {
         );
     }
 
+    crate::stack_args! {
+        darwin_fcntl = fcntl, 2, 1;
+    }
+
     exports::exports! {
         functions {
-            "fcntl" => fcntl,
+            "fcntl" => darwin_fcntl,
         }
     }
 }

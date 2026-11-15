@@ -123,6 +123,14 @@ fn index() -> &'static std::collections::HashMap<&'static str, Described> {
     &INDEX
 }
 
+/// Every C-variadic function the table describes.
+pub fn variadic_names() -> impl Iterator<Item = &'static str> {
+    SIGNATURES
+        .iter()
+        .filter(|abi| abi.variadic)
+        .map(|abi| abi.name)
+}
+
 /// Signatures reachable by a provider-assigned tag. Empty today.
 fn by_tag(_tag: u64) -> Option<&'static FunctionAbi> {
     None

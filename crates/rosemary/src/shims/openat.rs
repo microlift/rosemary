@@ -201,9 +201,21 @@ unsafe extern "C" fn native_fcntl(fd: i32, command: i32, mut args: ...) -> i32 {
     unsafe { host_fcntl(fd, command, arg) }
 }
 
-/// Claim `_open`, `_openat` and `_sem_open` for this module's wrappers.
+#[cfg(all(target_arch = "aarch64", not(target_vendor = "apple")))]
+use darwin::shm::shm_open;
+
+#[cfg(all(target_arch = "aarch64", not(target_vendor = "apple")))]
+darwin::stack_args! {
+    native_open = open_with_mode, 2, 1;
+    native_openat = openat_with_mode, 3, 1;
+    native_sem_open = sem_open_with_mode, 2, 2;
+    native_shm_open = shm_open, 2, 1;
+}
+
+/// Claim `_open`, `_openat`, `_sem_open` and, natively on an AAPCS64 host,
+/// `_shm_open` for this module's wrappers.
 pub(crate) fn provide(lib: &mut SyntheticDylib) {
-    for name in ["open", "openat", "sem_open", "fcntl"] {
+    for name in ["open", "openat", "sem_open", "shm_open", "fcntl"] {
         // The fcntl wrapper only exists for Apple arm64's variadic ABI.
         #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
         let skip = name == "fcntl" && !crate::trampoline::running_natively();
@@ -235,6 +247,18 @@ pub(crate) fn host_substitute(name: &str) -> Option<u64> {
                 Some(libc::fcntl as *const () as u64)
             }
             "fcntl" => Some(native_fcntl as *const () as u64),
+            _ => None,
+        };
+    }
+    // An AAPCS64 host passes optional arguments in registers, so a native
+    // Darwin caller's are read off the stack into the ones these take.
+    #[cfg(all(target_arch = "aarch64", not(target_vendor = "apple")))]
+    if crate::trampoline::running_natively() {
+        return match name {
+            "open" => Some(native_open as *const () as u64),
+            "openat" => Some(native_openat as *const () as u64),
+            "sem_open" => Some(native_sem_open as *const () as u64),
+            "shm_open" => Some(native_shm_open as *const () as u64),
             _ => None,
         };
     }

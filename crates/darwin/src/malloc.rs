@@ -1693,15 +1693,20 @@ fn report(message: &str) {
     );
 }
 
-/// `void malloc_printf(const char *format, ...)`
-///
-/// libmalloc's own printer, prefixed as its reports are. Interposing
-/// allocators (mimalloc, jemalloc) print their diagnostics through it.
-///
-/// # Safety
-///
-/// `format` is a NUL-terminated string the arguments match.
-pub unsafe extern "C" fn malloc_printf(format: *const c_char, args: ...) {
+crate::variadic! {
+    /// `void malloc_printf(const char *format, ...)`
+    ///
+    /// libmalloc's own printer, prefixed as its reports are. Interposing
+    /// allocators (mimalloc, jemalloc) print their diagnostics through it.
+    ///
+    /// # Safety
+    ///
+    /// `format` is a NUL-terminated string the arguments match.
+    pub fn malloc_printf(format: *const c_char) => malloc_vprintf;
+}
+
+/// [`malloc_printf`]'s arguments as a `va_list`.
+unsafe extern "C" fn malloc_vprintf(format: *const c_char, args: std::ffi::VaList) {
     unsafe extern "C" {
         fn vasprintf(out: *mut *mut c_char, format: *const c_char, ap: std::ffi::VaList) -> c_int;
     }

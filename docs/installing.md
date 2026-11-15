@@ -89,3 +89,30 @@ This links the tool into `~/.local/share/Steam/compatibilitytools.d/Rosemary`. I
 | `programs.rosemary.steam.root` | `.local/share/Steam` | Steam root, relative to `$HOME` |
 
 > **Note:** Rosemary pins its own Rust toolchain (via `rust-overlay` and `crane`). Avoid `inputs.rosemary.inputs.nixpkgs.follows = "nixpkgs"` unless you want to rebuild against your own nixpkgs revision.
+
+## Native arm64 on aarch64 Linux
+
+Darwin arm64 code finds its thread-specific data through `TPIDRRO_EL0`, which Linux does not let a program set.
+To run arm64 slices natively instead of falling back to the x86-64 slice, load Rosemary's kernel module from
+`kernel/linux` (GPL-2.0-only, separate from the rest of the tree). It needs your kernel's headers and a kernel
+with `CONFIG_PREEMPT_NOTIFIERS`, which `CONFIG_KVM` selects.
+
+Build and load it once:
+
+```sh
+make -C kernel/linux
+sudo insmod kernel/linux/rosemary.ko
+```
+
+Or install it through DKMS, so that kernel updates rebuild it (and Secure Boot hosts sign it with the DKMS key):
+
+```sh
+sudo cp -r kernel/linux /usr/src/rosemary-1
+sudo dkms install rosemary/1
+sudo modprobe rosemary
+```
+
+Rosemary checks the module on start-up, before it picks a backend: it sets a value and reads it back after a
+syscall, a reschedule and a move to another CPU. Kernels that enter through an exception trampoline (KPTI, or
+some Spectre-BHB mitigations) clear the register on every syscall, so on those native arm64 stays off.
+`rosemary run --native` names the reason.

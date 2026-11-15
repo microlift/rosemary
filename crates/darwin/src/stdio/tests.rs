@@ -355,10 +355,38 @@ fn open_memstream_keeps_the_caller_s_variables_current() {
 }
 
 /// The variadic entry points, as a guest's call reaches them.
+#[cfg(not(all(target_arch = "aarch64", not(target_vendor = "apple"))))]
 fn variadic<T>(name: &str) -> T {
     let at = symbol(name).unwrap_or_else(|| panic!("{name} is published"));
     assert_eq!(size_of::<T>(), size_of::<usize>());
     // SAFETY: the caller names the symbol's real C type.
+    unsafe { std::mem::transmute_copy(&(at as usize)) }
+}
+
+/// The published entries take Darwin's convention here, which this host's
+/// ellipsis is not, so each is reached through its `va_list` form instead.
+#[cfg(all(target_arch = "aarch64", not(target_vendor = "apple")))]
+fn variadic<T>(name: &str) -> T {
+    unsafe extern "C" fn fprintf(fp: *mut File, format: *const c_char, args: ...) -> c_int {
+        // SAFETY: the caller's obligations.
+        unsafe { vfprintf(fp, format, args) }
+    }
+    unsafe extern "C" fn fscanf(fp: *mut File, format: *const c_char, args: ...) -> c_int {
+        // SAFETY: the caller's obligations.
+        unsafe { vfscanf(fp, format, args) }
+    }
+    unsafe extern "C" fn fwprintf(fp: *mut File, format: *const u32, args: ...) -> c_int {
+        // SAFETY: the caller's obligations.
+        unsafe { vfwprintf(fp, format, args) }
+    }
+    let at = match name {
+        "fprintf" => fprintf as *const (),
+        "fscanf" => fscanf as *const (),
+        "fwprintf" => fwprintf as *const (),
+        _ => panic!("{name} has no host-convention form here"),
+    };
+    assert_eq!(size_of::<T>(), size_of::<usize>());
+    // SAFETY: the caller names the function's real C type.
     unsafe { std::mem::transmute_copy(&(at as usize)) }
 }
 

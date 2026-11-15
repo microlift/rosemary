@@ -23,7 +23,7 @@ pub(super) fn entry(engine: Engine) -> u64 {
 fn native_entry() -> u64 {
     #[cfg(any(
         target_arch = "x86_64",
-        all(target_os = "macos", target_arch = "aarch64")
+        all(any(target_os = "macos", target_os = "linux"), target_arch = "aarch64")
     ))]
     if darwin::tls::key::addressable() {
         return tlv_get_addr as *const () as usize as u64;
@@ -137,8 +137,9 @@ preserving! {
 }
 
 /// Apple's arm64 `tlv_get_addr`. `x16` and `x17` are the intra-procedure scratch
-/// registers, which a callee may clobber without saving.
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+/// registers, which a callee may clobber without saving. Off macOS the native
+/// backend runs only once `TPIDRRO_EL0` holds the Darwin array.
+#[cfg(all(any(target_os = "macos", target_os = "linux"), target_arch = "aarch64"))]
 #[unsafe(naked)]
 unsafe extern "C" fn tlv_get_addr(_descriptor: *const u8) -> *mut u8 {
     core::arch::naked_asm!(

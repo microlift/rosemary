@@ -1,3 +1,5 @@
+use std::ffi::VaList;
+
 use crate::syscall::ScopedHostSyscallContext;
 use libffi::middle::{Arg, Cif, CodePtr, Type, arg};
 
@@ -15,23 +17,19 @@ pub unsafe fn call_host(addr: usize, args: &[usize]) -> usize {
     unsafe { cif.call(CodePtr(addr as *mut _), &ffi_args) }
 }
 
-/// The native backend's entry point; the emulated backend reads the guest's
-/// variadic tail itself and calls [`call_host`].
-///
-/// FIXME: Assumes the VaList ABI matches the host, NOT safe for aarch64!
-///
-/// # Safety
-///
-/// Highly dangerous. Heavily review all code using this function.
-unsafe extern "C" fn rosemary_host_call_trampoline(
-    addr: usize,
-    argcount: usize,
-    mut args: ...
-) -> usize {
-    if !cfg!(target_arch = "x86_64") && !cfg!(target_os = "macos") {
-        panic!("This function is not safe to call on your platform due to VaList ABI differences.")
-    }
+crate::variadic! {
+    /// `usize rosemary_host_call_trampoline(usize addr, usize argcount, ...)`, the
+    /// native backend's entry point; the emulated backend reads the guest's
+    /// variadic tail itself and calls [`call_host`].
+    ///
+    /// # Safety
+    ///
+    /// Highly dangerous. Heavily review all code using this function.
+    fn rosemary_host_call_trampoline(addr: usize, argcount: usize) -> usize => host_call_list;
+}
 
+/// [`rosemary_host_call_trampoline`]'s `argcount` words, as a `va_list`.
+unsafe extern "C" fn host_call_list(addr: usize, argcount: usize, mut args: VaList) -> usize {
     let copied_args: Vec<usize> = (0..argcount)
         .map(|_| unsafe { args.next_arg::<usize>() })
         .collect();

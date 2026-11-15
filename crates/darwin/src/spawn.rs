@@ -1,4 +1,4 @@
-use std::ffi::{CStr, CString, c_char, c_int, c_void};
+use std::ffi::{CStr, CString, VaList, c_char, c_int, c_void};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, MutexGuard};
 
@@ -565,37 +565,56 @@ unsafe fn variadic_argv(
     argv
 }
 
-/// `int execl(const char *path, const char *arg, ..., NULL)`.
-///
-/// # Safety
-///
-/// `path` and arguments are C strings, followed by a null pointer.
-pub unsafe extern "C" fn execl(path: *const c_char, first: *const c_char, mut args: ...) -> c_int {
+// The argument lists after `first`, which is what each `...` reads.
+unsafe extern "C" fn execl_list(
+    path: *const c_char,
+    first: *const c_char,
+    mut args: VaList,
+) -> c_int {
     let argv = unsafe { variadic_argv(first, &mut args) };
     // SAFETY: the vector holds the caller's strings and terminating null.
     unsafe { execv(path, argv.as_ptr()) }
 }
 
-/// `int execlp(const char *file, const char *arg, ..., NULL)`.
-///
-/// # Safety
-///
-/// As [`execl`].
-pub unsafe extern "C" fn execlp(file: *const c_char, first: *const c_char, mut args: ...) -> c_int {
+unsafe extern "C" fn execlp_list(
+    file: *const c_char,
+    first: *const c_char,
+    mut args: VaList,
+) -> c_int {
     let argv = unsafe { variadic_argv(first, &mut args) };
     unsafe { execvp(file, argv.as_ptr()) }
 }
 
-/// `int execle(const char *path, const char *arg, ..., NULL, char *const envp[])`.
-///
-/// # Safety
-///
-/// As [`execl`], with a null-terminated environment vector after the null argument.
-pub unsafe extern "C" fn execle(path: *const c_char, first: *const c_char, mut args: ...) -> c_int {
+unsafe extern "C" fn execle_list(
+    path: *const c_char,
+    first: *const c_char,
+    mut args: VaList,
+) -> c_int {
     let argv = unsafe { variadic_argv(first, &mut args) };
     // SAFETY: `execle` places its environment after the terminating null.
     let envp = unsafe { args.next_arg::<*const *const c_char>() };
     unsafe { execve(path, argv.as_ptr(), envp) }
+}
+
+crate::variadic! {
+    /// `int execl(const char *path, const char *arg, ..., NULL)`.
+    ///
+    /// # Safety
+    ///
+    /// `path` and arguments are C strings, followed by a null pointer.
+    pub fn execl(path: *const c_char, first: *const c_char) -> c_int => execl_list;
+    /// `int execlp(const char *file, const char *arg, ..., NULL)`.
+    ///
+    /// # Safety
+    ///
+    /// As [`execl`].
+    pub fn execlp(file: *const c_char, first: *const c_char) -> c_int => execlp_list;
+    /// `int execle(const char *path, const char *arg, ..., NULL, char *const envp[])`.
+    ///
+    /// # Safety
+    ///
+    /// As [`execl`], with a null-terminated environment vector after the null argument.
+    pub fn execle(path: *const c_char, first: *const c_char) -> c_int => execle_list;
 }
 
 /// `pid_t vfork(void)`, as `fork`, which POSIX allows.

@@ -59,9 +59,14 @@ pub unsafe extern "C" fn ioctl(fd: libc::c_int, guest_request: u64, arg: usize) 
 }
 
 #[cfg(not(target_os = "macos"))]
+crate::stack_args! {
+    darwin_ioctl = ioctl, 2, 1;
+}
+
+#[cfg(not(target_os = "macos"))]
 exports::exports! {
     functions {
-        "ioctl" => ioctl,
+        "ioctl" => darwin_ioctl,
     }
 }
 

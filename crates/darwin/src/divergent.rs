@@ -18,6 +18,9 @@ mod why {
     pub const OBJC: &str = "the Objective-C runtime is macOS-only";
     pub const REGEX: &str = "regex_t and regmatch_t are laid out differently, and REG_NEWLINE and REG_NOSUB have \
          each other's values; see darwin::regex";
+    #[cfg(all(target_arch = "aarch64", not(target_vendor = "apple")))]
+    pub const VARIADIC: &str = "Darwin's arm64 variadic arguments are all on the stack and its va_list is a \
+         char *; see darwin::vararg";
     pub const PTHREAD: &str = "no Darwin-compatible implementation; see darwin::pthread for the family this \
          crate does implement";
 }
@@ -258,6 +261,122 @@ pub const NAMES: &[(&str, &str)] = &[
         "ioctl",
         "BSD ioctl requests need translation before reaching the host",
     ),
+    // Variadic or `va_list`-taking. The runtime above denies every variadic its
+    // signature table names as well; these are the ones it cannot tell apart.
+    #[cfg(all(target_arch = "aarch64", not(target_vendor = "apple")))]
+    ("semctl", VARIADIC),
+    #[cfg(all(target_arch = "aarch64", not(target_vendor = "apple")))]
+    ("syscall", VARIADIC),
+    #[cfg(all(target_arch = "aarch64", not(target_vendor = "apple")))]
+    ("ulimit", VARIADIC),
+    #[cfg(all(target_arch = "aarch64", not(target_vendor = "apple")))]
+    ("mq_open", VARIADIC),
+    #[cfg(all(target_arch = "aarch64", not(target_vendor = "apple")))]
+    ("strfmon", VARIADIC),
+    #[cfg(all(target_arch = "aarch64", not(target_vendor = "apple")))]
+    ("strfmon_l", VARIADIC),
+    #[cfg(all(target_arch = "aarch64", not(target_vendor = "apple")))]
+    ("wscanf", VARIADIC),
+    #[cfg(all(target_arch = "aarch64", not(target_vendor = "apple")))]
+    ("fwscanf", VARIADIC),
+    #[cfg(all(target_arch = "aarch64", not(target_vendor = "apple")))]
+    ("vwscanf", VARIADIC),
+    #[cfg(all(target_arch = "aarch64", not(target_vendor = "apple")))]
+    ("vfwscanf", VARIADIC),
+    #[cfg(all(target_arch = "aarch64", not(target_vendor = "apple")))]
+    ("printf", VARIADIC),
+    #[cfg(all(target_arch = "aarch64", not(target_vendor = "apple")))]
+    ("fprintf", VARIADIC),
+    #[cfg(all(target_arch = "aarch64", not(target_vendor = "apple")))]
+    ("sprintf", VARIADIC),
+    #[cfg(all(target_arch = "aarch64", not(target_vendor = "apple")))]
+    ("snprintf", VARIADIC),
+    #[cfg(all(target_arch = "aarch64", not(target_vendor = "apple")))]
+    ("asprintf", VARIADIC),
+    #[cfg(all(target_arch = "aarch64", not(target_vendor = "apple")))]
+    ("dprintf", VARIADIC),
+    #[cfg(all(target_arch = "aarch64", not(target_vendor = "apple")))]
+    ("vprintf", VARIADIC),
+    #[cfg(all(target_arch = "aarch64", not(target_vendor = "apple")))]
+    ("vfprintf", VARIADIC),
+    #[cfg(all(target_arch = "aarch64", not(target_vendor = "apple")))]
+    ("vsprintf", VARIADIC),
+    #[cfg(all(target_arch = "aarch64", not(target_vendor = "apple")))]
+    ("vsnprintf", VARIADIC),
+    #[cfg(all(target_arch = "aarch64", not(target_vendor = "apple")))]
+    ("vasprintf", VARIADIC),
+    #[cfg(all(target_arch = "aarch64", not(target_vendor = "apple")))]
+    ("vdprintf", VARIADIC),
+    #[cfg(all(target_arch = "aarch64", not(target_vendor = "apple")))]
+    ("scanf", VARIADIC),
+    #[cfg(all(target_arch = "aarch64", not(target_vendor = "apple")))]
+    ("fscanf", VARIADIC),
+    #[cfg(all(target_arch = "aarch64", not(target_vendor = "apple")))]
+    ("sscanf", VARIADIC),
+    #[cfg(all(target_arch = "aarch64", not(target_vendor = "apple")))]
+    ("vscanf", VARIADIC),
+    #[cfg(all(target_arch = "aarch64", not(target_vendor = "apple")))]
+    ("vfscanf", VARIADIC),
+    #[cfg(all(target_arch = "aarch64", not(target_vendor = "apple")))]
+    ("vsscanf", VARIADIC),
+    #[cfg(all(target_arch = "aarch64", not(target_vendor = "apple")))]
+    ("wprintf", VARIADIC),
+    #[cfg(all(target_arch = "aarch64", not(target_vendor = "apple")))]
+    ("fwprintf", VARIADIC),
+    #[cfg(all(target_arch = "aarch64", not(target_vendor = "apple")))]
+    ("swprintf", VARIADIC),
+    #[cfg(all(target_arch = "aarch64", not(target_vendor = "apple")))]
+    ("vwprintf", VARIADIC),
+    #[cfg(all(target_arch = "aarch64", not(target_vendor = "apple")))]
+    ("vfwprintf", VARIADIC),
+    #[cfg(all(target_arch = "aarch64", not(target_vendor = "apple")))]
+    ("vswprintf", VARIADIC),
+    #[cfg(all(target_arch = "aarch64", not(target_vendor = "apple")))]
+    ("swscanf", VARIADIC),
+    #[cfg(all(target_arch = "aarch64", not(target_vendor = "apple")))]
+    ("vswscanf", VARIADIC),
+    #[cfg(all(target_arch = "aarch64", not(target_vendor = "apple")))]
+    ("syslog", VARIADIC),
+    #[cfg(all(target_arch = "aarch64", not(target_vendor = "apple")))]
+    ("vsyslog", VARIADIC),
+    #[cfg(all(target_arch = "aarch64", not(target_vendor = "apple")))]
+    ("err", VARIADIC),
+    #[cfg(all(target_arch = "aarch64", not(target_vendor = "apple")))]
+    ("errx", VARIADIC),
+    #[cfg(all(target_arch = "aarch64", not(target_vendor = "apple")))]
+    ("errc", VARIADIC),
+    #[cfg(all(target_arch = "aarch64", not(target_vendor = "apple")))]
+    ("verr", VARIADIC),
+    #[cfg(all(target_arch = "aarch64", not(target_vendor = "apple")))]
+    ("verrx", VARIADIC),
+    #[cfg(all(target_arch = "aarch64", not(target_vendor = "apple")))]
+    ("verrc", VARIADIC),
+    #[cfg(all(target_arch = "aarch64", not(target_vendor = "apple")))]
+    ("warn", VARIADIC),
+    #[cfg(all(target_arch = "aarch64", not(target_vendor = "apple")))]
+    ("warnx", VARIADIC),
+    #[cfg(all(target_arch = "aarch64", not(target_vendor = "apple")))]
+    ("warnc", VARIADIC),
+    #[cfg(all(target_arch = "aarch64", not(target_vendor = "apple")))]
+    ("vwarn", VARIADIC),
+    #[cfg(all(target_arch = "aarch64", not(target_vendor = "apple")))]
+    ("vwarnx", VARIADIC),
+    #[cfg(all(target_arch = "aarch64", not(target_vendor = "apple")))]
+    ("vwarnc", VARIADIC),
+    #[cfg(all(target_arch = "aarch64", not(target_vendor = "apple")))]
+    ("execl", VARIADIC),
+    #[cfg(all(target_arch = "aarch64", not(target_vendor = "apple")))]
+    ("execlp", VARIADIC),
+    #[cfg(all(target_arch = "aarch64", not(target_vendor = "apple")))]
+    ("execle", VARIADIC),
+    #[cfg(all(target_arch = "aarch64", not(target_vendor = "apple")))]
+    ("open", VARIADIC),
+    #[cfg(all(target_arch = "aarch64", not(target_vendor = "apple")))]
+    ("openat", VARIADIC),
+    #[cfg(all(target_arch = "aarch64", not(target_vendor = "apple")))]
+    ("fcntl", VARIADIC),
+    #[cfg(all(target_arch = "aarch64", not(target_vendor = "apple")))]
+    ("sem_open", VARIADIC),
 ];
 
 #[cfg(target_os = "macos")]

@@ -4,7 +4,7 @@
 //! numbering; these report the guest's own, in Darwin's words, on the guest's
 //! `stderr`.
 
-use std::ffi::{CStr, VaList, c_char, c_int};
+use std::ffi::{VaList, c_char, c_int};
 
 use crate::stdio::File;
 
@@ -18,18 +18,18 @@ unsafe fn report(code: Option<c_int>, format: *const c_char, ap: VaList) {
     // SAFETY: the guest's `stderr`; `getprogname` and `strerror` answer
     // NUL-terminated strings, and the format is the caller's.
     unsafe {
-        crate::stdio::fprintf(fp, c"%s: ".as_ptr(), crate::progname::getprogname());
+        crate::stdio::fputs(crate::progname::getprogname(), fp);
+        crate::stdio::fputs(c": ".as_ptr(), fp);
         if !format.is_null() {
             crate::stdio::vfprintf(fp, format, ap);
             if code.is_some() {
-                crate::stdio::fprintf(fp, c": ".as_ptr());
+                crate::stdio::fputs(c": ".as_ptr(), fp);
             }
         }
         if let Some(code) = code {
-            let reason = CStr::from_ptr(crate::string::strerror(code));
-            crate::stdio::fprintf(fp, c"%s".as_ptr(), reason.as_ptr());
+            crate::stdio::fputs(crate::string::strerror(code), fp);
         }
-        crate::stdio::fprintf(fp, c"\n".as_ptr());
+        crate::stdio::fputs(c"\n".as_ptr(), fp);
     }
 }
 
@@ -64,35 +64,13 @@ pub unsafe extern "C" fn vwarnx(format: *const c_char, ap: VaList) {
     unsafe { report(None, format, ap) }
 }
 
-/// `void warnc(int code, const char *fmt, ...)`
-///
-/// # Safety
-///
-/// As [`report`].
-pub unsafe extern "C" fn warnc(code: c_int, format: *const c_char, args: ...) {
-    // SAFETY: the caller's obligations.
-    unsafe { report(Some(code), format, args) }
-}
-
-/// `void warn(const char *fmt, ...)`
-///
-/// # Safety
-///
-/// As [`report`].
-pub unsafe extern "C" fn warn(format: *const c_char, args: ...) {
-    let code = crate::errno::guest_errno();
-    // SAFETY: the caller's obligations.
-    unsafe { report(Some(code), format, args) }
-}
-
-/// `void warnx(const char *fmt, ...)`
-///
-/// # Safety
-///
-/// As [`report`].
-pub unsafe extern "C" fn warnx(format: *const c_char, args: ...) {
-    // SAFETY: the caller's obligations.
-    unsafe { report(None, format, args) }
+crate::variadic! {
+    /// `void warnc(int code, const char *fmt, ...)`
+    pub fn warnc(code: c_int, format: *const c_char) => vwarnc;
+    /// `void warn(const char *fmt, ...)`
+    pub fn warn(format: *const c_char) => vwarn;
+    /// `void warnx(const char *fmt, ...)`
+    pub fn warnx(format: *const c_char) => vwarnx;
 }
 
 /// `void verrc(int eval, int code, const char *fmt, va_list ap)`
@@ -129,38 +107,22 @@ pub unsafe extern "C" fn verrx(eval: c_int, format: *const c_char, ap: VaList) -
     crate::bsd::posix::exit(eval)
 }
 
-/// `void errc(int eval, int code, const char *fmt, ...)`
-///
-/// # Safety
-///
-/// As [`report`].
-pub unsafe extern "C" fn errc(eval: c_int, code: c_int, format: *const c_char, args: ...) -> ! {
-    // SAFETY: the caller's obligations.
-    unsafe { report(Some(code), format, args) };
-    crate::bsd::posix::exit(eval)
+crate::variadic! {
+    /// `void errc(int eval, int code, const char *fmt, ...)`
+    pub fn errc(eval: c_int, code: c_int, format: *const c_char) -> ! => verrc;
+    /// `void err(int eval, const char *fmt, ...)`
+    pub fn err(eval: c_int, format: *const c_char) -> ! => verr;
+    /// `void errx(int eval, const char *fmt, ...)`
+    pub fn errx(eval: c_int, format: *const c_char) -> ! => verrx;
 }
 
-/// `void err(int eval, const char *fmt, ...)`
-///
-/// # Safety
-///
-/// As [`report`].
-pub unsafe extern "C" fn err(eval: c_int, format: *const c_char, args: ...) -> ! {
-    let code = crate::errno::guest_errno();
-    // SAFETY: the caller's obligations.
-    unsafe { report(Some(code), format, args) };
-    crate::bsd::posix::exit(eval)
-}
-
-/// `void errx(int eval, const char *fmt, ...)`
-///
-/// # Safety
-///
-/// As [`report`].
-pub unsafe extern "C" fn errx(eval: c_int, format: *const c_char, args: ...) -> ! {
-    // SAFETY: the caller's obligations.
-    unsafe { report(None, format, args) };
-    crate::bsd::posix::exit(eval)
+crate::va_list! {
+    darwin_vwarnc = vwarnc, 2;
+    darwin_vwarn = vwarn, 1;
+    darwin_vwarnx = vwarnx, 1;
+    darwin_verrc = verrc, 3;
+    darwin_verr = verr, 2;
+    darwin_verrx = verrx, 2;
 }
 
 exports::exports! {
@@ -168,14 +130,14 @@ exports::exports! {
         "warn" => warn,
         "warnc" => warnc,
         "warnx" => warnx,
-        "vwarn" => vwarn,
-        "vwarnc" => vwarnc,
-        "vwarnx" => vwarnx,
+        "vwarn" => darwin_vwarn,
+        "vwarnc" => darwin_vwarnc,
+        "vwarnx" => darwin_vwarnx,
         "err" => err,
         "errc" => errc,
         "errx" => errx,
-        "verr" => verr,
-        "verrc" => verrc,
-        "verrx" => verrx,
+        "verr" => darwin_verr,
+        "verrc" => darwin_verrc,
+        "verrx" => darwin_verrx,
     }
 }

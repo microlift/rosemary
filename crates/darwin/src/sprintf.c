@@ -3,8 +3,9 @@
 // Darwin's vfprintf (FreeBSD's) prints a NaN with no sign at all: not the
 // sign bit, and not a '+' or ' ' flag. glibc prints "-nan" for a NaN with its
 // sign bit set, which is every NaN x86's 0/0 makes. A format that formats a
-// NaN is rendered here one conversion at a time, each through the host with
-// the sign taken off; every other format goes to the host whole.
+// NaN, or a `long double` that is Darwin's `double`, is rendered here one
+// conversion at a time, each through the host with the sign taken off and the
+// `L` dropped; every other format goes to the host whole.
 
 #define _GNU_SOURCE // vasprintf
 
@@ -347,6 +348,18 @@ static bool formats_a_nan(const struct plan *plan) {
   return false;
 }
 
+// A `%Lf` the host would render reading its own, wider `long double`.
+static bool narrows_a_long_double(const struct plan *plan) {
+  if (!LONG_DOUBLE_IS_DOUBLE)
+    return false;
+  for (size_t i = 0; i < plan->nconversions; i++) {
+    const struct conversion *c = &plan->conversions[i];
+    if (c->arg >= 0 && is_float(c->conv) && c->length == LEN_BIG_L)
+      return true;
+  }
+  return false;
+}
+
 struct buffer {
   char *data;
   size_t len;
@@ -523,7 +536,8 @@ static bool darwin_rendering(const char *format, va_list ap, char **out,
   struct plan plan;
   if (!has_float_conversion(format) || !parse(format, &plan))
     return false;
-  if (!fetch(&plan, ap) || !formats_a_nan(&plan)) {
+  if (!fetch(&plan, ap) ||
+      !(formats_a_nan(&plan) || narrows_a_long_double(&plan))) {
     plan_free(&plan);
     return false;
   }

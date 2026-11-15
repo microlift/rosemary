@@ -29,15 +29,6 @@ int rosemary_vsprintf_chk(char *s, int flags __attribute__((unused)),
   return done;
 }
 
-int rosemary_sprintf_chk(char *s, int flags, size_t slen, const char *format,
-                         ...) {
-  va_list arg;
-  va_start(arg, format);
-  int done = rosemary_vsprintf_chk(s, flags, slen, format, arg);
-  va_end(arg);
-  return done;
-}
-
 int rosemary_vsnprintf_chk(char *s, size_t maxlen,
                            int flags __attribute__((unused)), size_t slen,
                            const char *format, va_list arg) {
@@ -46,11 +37,3 @@ int rosemary_vsnprintf_chk(char *s, size_t maxlen,
   return rosemary_vsnprintf(s, maxlen, format, arg);
 }
 
-int rosemary_snprintf_chk(char *s, size_t maxlen, int flags, size_t slen,
-                          const char *format, ...) {
-  va_list arg;
-  va_start(arg, format);
-  int done = rosemary_vsnprintf_chk(s, maxlen, flags, slen, format, arg);
-  va_end(arg);
-  return done;
-}

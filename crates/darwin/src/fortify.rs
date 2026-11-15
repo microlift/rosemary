@@ -128,21 +128,12 @@ unsafe extern "C" fn strlcat_chk(
 }
 
 unsafe extern "C" {
-    fn rosemary_sprintf_chk(s: *mut c_char, flags: c_int, slen: size_t, format: *const c_char, ...);
     fn rosemary_vsprintf_chk(
         s: *mut c_char,
         flags: c_int,
         slen: size_t,
         format: *const c_char,
         ap: std::ffi::VaList,
-    ) -> c_int;
-    fn rosemary_snprintf_chk(
-        s: *mut c_char,
-        maxlen: size_t,
-        flags: c_int,
-        slen: size_t,
-        format: *const c_char,
-        ...
     ) -> c_int;
     fn rosemary_vsnprintf_chk(
         s: *mut c_char,
@@ -154,15 +145,34 @@ unsafe extern "C" {
     ) -> c_int;
 }
 
+crate::variadic! {
+    /// `int __sprintf_chk(char *, int, size_t, const char *, ...)`
+    fn sprintf_chk(s: *mut c_char, flags: c_int, slen: size_t, format: *const c_char) -> c_int
+        => rosemary_vsprintf_chk;
+    /// `int __snprintf_chk(char *, size_t, int, size_t, const char *, ...)`
+    fn snprintf_chk(
+        s: *mut c_char,
+        maxlen: size_t,
+        flags: c_int,
+        slen: size_t,
+        format: *const c_char,
+    ) -> c_int => rosemary_vsnprintf_chk;
+}
+
+crate::va_list! {
+    darwin_vsprintf_chk = rosemary_vsprintf_chk, 4;
+    darwin_vsnprintf_chk = rosemary_vsnprintf_chk, 5;
+}
+
 exports::exports! {
     functions {
         "__memcpy_chk" => memcpy_chk,
         "__memmove_chk" => memmove_chk,
         "__memset_chk" => memset_chk,
-        "__sprintf_chk" => rosemary_sprintf_chk,
-        "__snprintf_chk" => rosemary_snprintf_chk,
-        "__vsprintf_chk" => rosemary_vsprintf_chk,
-        "__vsnprintf_chk" => rosemary_vsnprintf_chk,
+        "__sprintf_chk" => sprintf_chk,
+        "__snprintf_chk" => snprintf_chk,
+        "__vsprintf_chk" => darwin_vsprintf_chk,
+        "__vsnprintf_chk" => darwin_vsnprintf_chk,
         "__strcat_chk" => strcat_chk,
         "__strcpy_chk" => strcpy_chk,
         "__strlcat_chk" => strlcat_chk,
@@ -177,7 +187,7 @@ mod tests {
 
     #[test]
     fn checked_string_functions_have_darwin_results() {
-        let mut dst = [0i8; 8];
+        let mut dst = [0 as c_char; 8];
         unsafe {
             assert_eq!(strlcpy_chk(dst.as_mut_ptr(), c"abcdef".as_ptr(), 4, 8), 6);
             assert_eq!(std::ffi::CStr::from_ptr(dst.as_ptr()).to_bytes(), b"abc");
@@ -216,7 +226,7 @@ mod tests {
         type Sprintf = unsafe extern "C" fn(*mut c_char, c_int, usize, *const c_char, ...) -> c_int;
         let function: Sprintf =
             unsafe { std::mem::transmute(symbol("__sprintf_chk").expect("published") as usize) };
-        let mut dst = [0i8; 32];
+        let mut dst = [0 as c_char; 32];
         let written = unsafe {
             function(
                 dst.as_mut_ptr(),

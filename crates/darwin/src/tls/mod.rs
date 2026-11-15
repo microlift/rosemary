@@ -1,5 +1,7 @@
 mod helpers;
 pub mod key;
+#[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+mod tpidrro;
 
 pub mod slot {
     pub const SELF: usize = 0;
@@ -76,15 +78,13 @@ fn first_tsd_base() -> u64 {
     // SAFETY: as above; `base` is a leaked allocation this thread now owns, and
     // `release` frees it when the thread ends.
     unsafe { libc::pthread_setspecific(key, base as usize as *const core::ffi::c_void) };
-    // A new thread starts with its parent's thread pointer - `clone` copies it -
-    // so a host thread that runs Darwin code without entering reads the parent's
-    // `pthread_self`, thread-locals and allocator identity. Installed here so that
-    // the first Darwin call on such a thread ends the sharing. Host code never
-    // reads this register.
-    #[cfg(all(
-        any(target_os = "linux", target_os = "freebsd"),
-        target_arch = "x86_64"
-    ))]
+    // A new thread starts with its parent's `%gs` - `clone` copies it - so a
+    // host thread that runs Darwin code without entering reads the parent's
+    // `pthread_self`, thread-locals and allocator identity; on aarch64 Linux it
+    // starts with no `TPIDRRO_EL0` at all. Installed here so that the first
+    // Darwin call on such a thread finds its own. Host code never reads this
+    // register.
+    #[cfg(installs_tsd_register)]
     if INSTALLED.with(|at| at.get()) == 0 {
         set_thread_pointer(base);
     }
@@ -119,10 +119,7 @@ unsafe extern "C" fn release(block: *mut core::ffi::c_void) {
     // SAFETY: the key is this module's own and `block` is the array it held.
     if unsafe { libc::pthread_setspecific(synthetic_key(), block as *const _) } == 0 {
         // SAFETY: just installed as this thread's array.
-        #[cfg(all(
-            any(target_os = "linux", target_os = "freebsd"),
-            target_arch = "x86_64"
-        ))]
+        #[cfg(installs_tsd_register)]
         unsafe {
             key::run_destructors(words)
         };
@@ -222,15 +219,32 @@ pub struct DarwinThread {
     _syscalls: crate::syscall::ScopedGuestSyscallContext,
 }
 
-pub const fn can_enter_darwin() -> bool {
-    cfg!(target_os = "macos")
-        || cfg!(all(
-            any(target_os = "linux", target_os = "freebsd"),
-            target_arch = "x86_64"
-        ))
+/// Whether Darwin code can find this thread's array where it looks for it. On
+/// aarch64 Linux that takes Rosemary's kernel module, probed on first ask.
+pub fn can_enter_darwin() -> bool {
+    #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+    {
+        tpidrro::available()
+    }
+    #[cfg(not(all(target_os = "linux", target_arch = "aarch64")))]
+    {
+        cfg!(any(target_os = "macos", installs_tsd_register))
+    }
 }
 
-const fn swaps() -> bool {
+/// Why [`can_enter_darwin`] is false, where the host could say.
+pub fn darwin_entry_refusal() -> Option<String> {
+    #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+    {
+        tpidrro::refusal()
+    }
+    #[cfg(not(all(target_os = "linux", target_arch = "aarch64")))]
+    {
+        None
+    }
+}
+
+fn swaps() -> bool {
     can_enter_darwin() && !cfg!(target_os = "macos")
 }
 
@@ -327,35 +341,31 @@ fn set_thread_pointer(base: u64) {
     INSTALLED.with(|at| at.set(base));
 }
 
-#[cfg(all(
-    any(target_os = "linux", target_os = "freebsd"),
-    target_arch = "x86_64"
-))]
+#[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+#[inline(always)]
+fn set_thread_pointer(base: u64) {
+    if tpidrro::set(base) {
+        INSTALLED.with(|at| at.set(base));
+    }
+}
+
+#[cfg(installs_tsd_register)]
 thread_local! {
     static INSTALLED: core::cell::Cell<u64> = const { core::cell::Cell::new(0) };
 }
 
 pub fn entered() -> bool {
-    #[cfg(all(
-        any(target_os = "linux", target_os = "freebsd"),
-        target_arch = "x86_64"
-    ))]
+    #[cfg(installs_tsd_register)]
     {
         INSTALLED.with(|at| at.get()) == tsd_base()
     }
-    #[cfg(not(all(
-        any(target_os = "linux", target_os = "freebsd"),
-        target_arch = "x86_64"
-    )))]
+    #[cfg(not(installs_tsd_register))]
     {
         !swaps()
     }
 }
 
-#[cfg(not(all(
-    any(target_os = "linux", target_os = "freebsd"),
-    target_arch = "x86_64"
-)))]
+#[cfg(not(installs_tsd_register))]
 fn set_thread_pointer(_base: u64) {
     debug_assert!(!swaps(), "a host that swaps must say how");
 }
@@ -414,10 +424,7 @@ mod tests {
     /// Mono's `mono_mach_init` finds a thread's values this way, and falls back to
     /// guessing when no offset it probes holds the value it set.
     #[test]
-    #[cfg(all(
-        any(target_os = "linux", target_os = "freebsd"),
-        target_arch = "x86_64"
-    ))]
+    #[cfg(installs_tsd_register)]
     fn a_value_is_at_its_key_in_pthread_self() {
         let key = key::Key::create(None).unwrap();
         key.set(0xdead_beef as *mut core::ffi::c_void);

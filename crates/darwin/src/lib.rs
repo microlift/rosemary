@@ -109,6 +109,7 @@ pub mod stackprobe;
 pub mod stat;
 pub mod stdio;
 pub mod stdlib;
+pub mod strfmt;
 pub mod strict;
 pub mod string;
 pub mod strtofp;
@@ -116,6 +117,8 @@ pub mod syscall;
 pub mod sysctl;
 pub mod sysdir;
 pub mod sysinfo;
+#[cfg(not(target_os = "macos"))]
+mod syslog;
 #[cfg(not(target_os = "macos"))]
 pub mod termios;
 pub mod tls;
@@ -125,6 +128,7 @@ mod unfair_lock;
 #[cfg(not(target_os = "macos"))]
 pub mod utmpx;
 pub mod uuid;
+pub mod vararg;
 #[cfg(not(target_os = "macos"))]
 pub mod vis;
 pub mod vmmap;
@@ -416,10 +420,10 @@ static NONPORTABLE_MODULES: &[exports::Module] = &[
     shm::MODULE,
     oslog::MODULE,
     backtrace::MODULE,
-    #[cfg(target_arch = "x86_64")]
     printf_l::MODULE,
     sprintf::MODULE,
-    #[cfg(target_arch = "x86_64")]
+    strfmt::MODULE,
+    syslog::MODULE,
     asl::MODULE,
     #[cfg(target_arch = "x86_64")]
     fenv::MODULE,

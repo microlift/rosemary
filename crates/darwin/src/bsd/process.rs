@@ -40,15 +40,20 @@ unsafe fn title(fmt: *const c_char, ap: VaList) -> Option<CString> {
     CString::new(full).ok()
 }
 
-/// `void setproctitle(const char *fmt, ...)`
+crate::variadic! {
+    /// `void setproctitle(const char *fmt, ...)`
+    ///
+    /// # Safety
+    ///
+    /// `fmt` is null or a format that the arguments match.
+    pub fn setproctitle(fmt: *const c_char) => vsetproctitle;
+}
+
+/// [`setproctitle`]'s arguments as a `va_list`.
 ///
 /// FIXME (ACCURACY): BSD rewrites the argument area `ps` shows; the host only
 /// lets us rename the process, which it may truncate (15 bytes on Linux).
-///
-/// # Safety
-///
-/// `fmt` is null or a format that the arguments match.
-pub unsafe extern "C" fn setproctitle(fmt: *const c_char, args: ...) {
+unsafe extern "C" fn vsetproctitle(fmt: *const c_char, args: VaList) {
     // SAFETY: the caller's obligations.
     let Some(title) = (unsafe { title(fmt, args) }) else {
         return;

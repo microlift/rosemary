@@ -118,6 +118,14 @@ impl Engine {
         if slices.iter().any(accepts) {
             return None;
         }
+        if self == Engine::Native
+            && slices
+                .iter()
+                .any(|s| s.cputype == <native::HostSpec as machish::spec::MachSpec>::CPU_TYPE)
+            && let Some(why) = darwin::tls::darwin_entry_refusal()
+        {
+            return Some(format!("the native backend cannot run here: {why}"));
+        }
         let found: Vec<String> = slices.iter().map(slice_name).collect();
         Some(format!(
             "the {} backend needs {}; this binary has {}",

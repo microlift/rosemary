@@ -45,13 +45,7 @@ pub struct Key(u32);
 /// pointer addresses - which is what lets a descriptor carry a key for `tlv_get_addr`
 /// to read directly.
 pub const fn addressable() -> bool {
-    cfg!(any(
-        target_os = "macos",
-        all(
-            any(target_os = "linux", target_os = "freebsd"),
-            target_arch = "x86_64"
-        )
-    ))
+    cfg!(any(target_os = "macos", installs_tsd_register))
 }
 
 impl Key {
@@ -92,10 +86,7 @@ impl Key {
     }
 }
 
-#[cfg(not(all(
-    any(target_os = "linux", target_os = "freebsd"),
-    target_arch = "x86_64"
-)))]
+#[cfg(not(installs_tsd_register))]
 mod imp {
     use super::*;
 
@@ -143,10 +134,7 @@ mod imp {
     }
 }
 
-#[cfg(all(
-    any(target_os = "linux", target_os = "freebsd"),
-    target_arch = "x86_64"
-))]
+#[cfg(installs_tsd_register)]
 mod imp {
     use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
@@ -306,10 +294,7 @@ mod imp {
     }
 }
 
-#[cfg(all(
-    any(target_os = "linux", target_os = "freebsd"),
-    target_arch = "x86_64"
-))]
+#[cfg(installs_tsd_register)]
 pub(crate) use imp::run_destructors;
 
 #[cfg(test)]
@@ -330,13 +315,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(any(
-        target_os = "macos",
-        all(
-            any(target_os = "linux", target_os = "freebsd"),
-            target_arch = "x86_64"
-        )
-    ))]
+    #[cfg(any(target_os = "macos", installs_tsd_register))]
     fn dynamic_keys_are_numbered_as_darwin_numbers_them() {
         let key = Key::create(None).unwrap();
         assert!(
@@ -348,13 +327,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(any(
-        target_os = "macos",
-        all(
-            any(target_os = "linux", target_os = "freebsd"),
-            target_arch = "x86_64"
-        )
-    ))]
+    #[cfg(any(target_os = "macos", installs_tsd_register))]
     fn the_value_is_the_word_the_thread_pointer_addresses() {
         let key = Key::create(None).unwrap();
         key.set(0x5eed as *mut c_void);
@@ -424,10 +397,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(all(
-        any(target_os = "linux", target_os = "freebsd"),
-        target_arch = "x86_64"
-    ))]
+    #[cfg(installs_tsd_register)]
     fn a_static_key_destructor_runs_at_thread_exit() {
         static SEEN: AtomicUsize = AtomicUsize::new(0);
         unsafe extern "C" fn record(value: *mut c_void) {
@@ -450,10 +420,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(all(
-        any(target_os = "linux", target_os = "freebsd"),
-        target_arch = "x86_64"
-    ))]
+    #[cfg(installs_tsd_register)]
     fn an_uncreated_dynamic_key_cannot_be_set() {
         let key = Key::create(None).unwrap();
         assert_eq!(key.delete(), 0);

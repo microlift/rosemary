@@ -10,8 +10,9 @@ use std::ffi::{VaList, c_char, c_int, c_long, c_short, c_void};
 use super::backend::{mbrtowc, wcrtomb};
 use super::{EOF, File, Locked, STDINP, STDOUTP, engine};
 
+use crate::strfmt::vswprintf;
+
 unsafe extern "C" {
-    fn vswprintf(out: *mut u32, n: usize, format: *const u32, ap: VaList) -> c_int;
     fn iswspace(wc: u32) -> c_int;
 }
 
@@ -108,24 +109,16 @@ pub unsafe extern "C" fn vprintf(format: *const c_char, ap: VaList) -> c_int {
     unsafe { emit(STDOUTP.get(), None, format, ap) }
 }
 
-/// `int fprintf(FILE *stream, const char *format, ...)`
-///
-/// # Safety
-///
-/// As [`vfprintf`].
-pub unsafe extern "C" fn fprintf(fp: *mut File, format: *const c_char, args: ...) -> c_int {
-    // SAFETY: the caller's obligations.
-    unsafe { emit(fp, None, format, args) }
-}
-
-/// `int printf(const char *format, ...)`
-///
-/// # Safety
-///
-/// As [`vprintf`].
-pub unsafe extern "C" fn printf(format: *const c_char, args: ...) -> c_int {
-    // SAFETY: the guest's `stdout`, and the caller's obligations.
-    unsafe { emit(STDOUTP.get(), None, format, args) }
+crate::variadic! {
+    /// `int fprintf(FILE *stream, const char *format, ...)`
+    pub fn fprintf(fp: *mut File, format: *const c_char) -> c_int => vfprintf;
+    /// `int printf(const char *format, ...)`
+    pub fn printf(format: *const c_char) -> c_int => vprintf;
+    /// `int fprintf_l(FILE *stream, locale_t loc, const char *format, ...)`
+    pub fn fprintf_l(fp: *mut File, loc: *mut c_void, format: *const c_char) -> c_int
+        => vfprintf_l;
+    /// `int printf_l(locale_t loc, const char *format, ...)`
+    pub fn printf_l(loc: *mut c_void, format: *const c_char) -> c_int => vprintf_l;
 }
 
 /// `int vfprintf_l(FILE *stream, locale_t loc, const char *format, va_list ap)`
@@ -151,31 +144,6 @@ pub unsafe extern "C" fn vfprintf_l(
 pub unsafe extern "C" fn vprintf_l(loc: *mut c_void, format: *const c_char, ap: VaList) -> c_int {
     // SAFETY: the guest's `stdout`, and the caller's obligations.
     unsafe { emit(STDOUTP.get(), Some(loc), format, ap) }
-}
-
-/// `int fprintf_l(FILE *stream, locale_t loc, const char *format, ...)`
-///
-/// # Safety
-///
-/// As [`vfprintf_l`].
-pub unsafe extern "C" fn fprintf_l(
-    fp: *mut File,
-    loc: *mut c_void,
-    format: *const c_char,
-    args: ...
-) -> c_int {
-    // SAFETY: the caller's obligations.
-    unsafe { emit(fp, Some(loc), format, args) }
-}
-
-/// `int printf_l(locale_t loc, const char *format, ...)`
-///
-/// # Safety
-///
-/// As [`vfprintf_l`].
-pub unsafe extern "C" fn printf_l(loc: *mut c_void, format: *const c_char, args: ...) -> c_int {
-    // SAFETY: the guest's `stdout`, and the caller's obligations.
-    unsafe { emit(STDOUTP.get(), Some(loc), format, args) }
 }
 
 /// `int vfwprintf(FILE *stream, const wchar_t *format, va_list ap)`
@@ -221,24 +189,11 @@ pub unsafe extern "C" fn vwprintf(format: *const u32, ap: VaList) -> c_int {
     unsafe { vfwprintf(STDOUTP.get(), format, ap) }
 }
 
-/// `int fwprintf(FILE *stream, const wchar_t *format, ...)`
-///
-/// # Safety
-///
-/// As [`vfwprintf`].
-pub unsafe extern "C" fn fwprintf(fp: *mut File, format: *const u32, args: ...) -> c_int {
-    // SAFETY: the caller's obligations.
-    unsafe { vfwprintf(fp, format, args) }
-}
-
-/// `int wprintf(const wchar_t *format, ...)`
-///
-/// # Safety
-///
-/// As [`vwprintf`].
-pub unsafe extern "C" fn wprintf(format: *const u32, args: ...) -> c_int {
-    // SAFETY: the guest's `stdout`, and the caller's obligations.
-    unsafe { vfwprintf(STDOUTP.get(), format, args) }
+crate::variadic! {
+    /// `int fwprintf(FILE *stream, const wchar_t *format, ...)`
+    pub fn fwprintf(fp: *mut File, format: *const u32) -> c_int => vfwprintf;
+    /// `int wprintf(const wchar_t *format, ...)`
+    pub fn wprintf(format: *const u32) -> c_int => vwprintf;
 }
 
 /// Longest numeric field collected; longer input stops the field there.
@@ -924,24 +879,29 @@ pub unsafe extern "C" fn vscanf(format: *const c_char, ap: VaList) -> c_int {
     unsafe { scan_list(STDINP.get(), None, format, ap) }
 }
 
-/// `int fscanf(FILE *stream, const char *format, ...)`
-///
-/// # Safety
-///
-/// As [`vfscanf`].
-pub unsafe extern "C" fn fscanf(fp: *mut File, format: *const c_char, args: ...) -> c_int {
-    // SAFETY: the caller's obligations.
-    unsafe { scan_list(fp, None, format, args) }
+crate::variadic! {
+    /// `int fscanf(FILE *stream, const char *format, ...)`
+    pub fn fscanf(fp: *mut File, format: *const c_char) -> c_int => vfscanf;
+    /// `int scanf(const char *format, ...)`
+    pub fn scanf(format: *const c_char) -> c_int => vscanf;
+    /// `int fscanf_l(FILE *stream, locale_t loc, const char *format, ...)`
+    pub fn fscanf_l(fp: *mut File, loc: *mut c_void, format: *const c_char) -> c_int
+        => vfscanf_l;
+    /// `int scanf_l(locale_t loc, const char *format, ...)`
+    pub fn scanf_l(loc: *mut c_void, format: *const c_char) -> c_int => vscanf_l;
 }
 
-/// `int scanf(const char *format, ...)`
-///
-/// # Safety
-///
-/// As [`vfscanf`].
-pub unsafe extern "C" fn scanf(format: *const c_char, args: ...) -> c_int {
-    // SAFETY: the guest's `stdin`, and the caller's obligations.
-    unsafe { scan_list(STDINP.get(), None, format, args) }
+crate::va_list! {
+    pub(super) darwin_vfprintf = vfprintf, 2;
+    pub(super) darwin_vprintf = vprintf, 1;
+    pub(super) darwin_vfprintf_l = vfprintf_l, 3;
+    pub(super) darwin_vprintf_l = vprintf_l, 2;
+    pub(super) darwin_vfwprintf = vfwprintf, 2;
+    pub(super) darwin_vwprintf = vwprintf, 1;
+    pub(super) darwin_vfscanf = vfscanf, 2;
+    pub(super) darwin_vscanf = vscanf, 1;
+    pub(super) darwin_vfscanf_l = vfscanf_l, 3;
+    pub(super) darwin_vscanf_l = vscanf_l, 2;
 }
 
 /// `int vfscanf_l(FILE *stream, locale_t loc, const char *format, va_list ap)`
@@ -967,29 +927,4 @@ pub unsafe extern "C" fn vfscanf_l(
 pub unsafe extern "C" fn vscanf_l(loc: *mut c_void, format: *const c_char, ap: VaList) -> c_int {
     // SAFETY: the guest's `stdin`, and the caller's obligations.
     unsafe { scan_list(STDINP.get(), Some(loc), format, ap) }
-}
-
-/// `int fscanf_l(FILE *stream, locale_t loc, const char *format, ...)`
-///
-/// # Safety
-///
-/// As [`vfscanf_l`].
-pub unsafe extern "C" fn fscanf_l(
-    fp: *mut File,
-    loc: *mut c_void,
-    format: *const c_char,
-    args: ...
-) -> c_int {
-    // SAFETY: the caller's obligations.
-    unsafe { scan_list(fp, Some(loc), format, args) }
-}
-
-/// `int scanf_l(locale_t loc, const char *format, ...)`
-///
-/// # Safety
-///
-/// As [`vfscanf_l`].
-pub unsafe extern "C" fn scanf_l(loc: *mut c_void, format: *const c_char, args: ...) -> c_int {
-    // SAFETY: the guest's `stdin`, and the caller's obligations.
-    unsafe { scan_list(STDINP.get(), Some(loc), format, args) }
 }

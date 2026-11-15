@@ -59,46 +59,40 @@ pub(crate) unsafe fn vasprintf_into_guest(
     written
 }
 
-/// `int sprintf(char *, const char *, ...)`
-///
-/// # Safety
-///
-/// `buffer` holds the rendering, and the arguments match `format`.
-pub unsafe extern "C" fn sprintf(buffer: *mut c_char, format: *const c_char, args: ...) -> c_int {
-    // SAFETY: the caller's obligations.
-    unsafe { rosemary_vsprintf(buffer, format, args) }
+crate::variadic! {
+    /// `int sprintf(char *, const char *, ...)`
+    pub fn sprintf(buffer: *mut c_char, format: *const c_char) -> c_int => vsprintf;
+    /// `int snprintf(char *, size_t, const char *, ...)`
+    pub fn snprintf(buffer: *mut c_char, size: usize, format: *const c_char) -> c_int
+        => vsnprintf;
+    /// `int asprintf(char **, const char *, ...)`
+    fn asprintf(out: *mut *mut c_char, format: *const c_char) -> c_int => vasprintf;
+    /// `int dprintf(int, const char *, ...)`
+    fn dprintf(fd: c_int, format: *const c_char) -> c_int => vdprintf;
+}
+
+crate::va_list! {
+    darwin_vsprintf = vsprintf, 2;
+    darwin_vsnprintf = vsnprintf, 3;
+    darwin_vasprintf = vasprintf, 2;
+    darwin_vdprintf = vdprintf, 2;
 }
 
 /// `int vsprintf(char *, const char *, va_list)`
 ///
 /// # Safety
 ///
-/// As [`sprintf`].
+/// `buffer` holds the rendering, and the arguments match `format`.
 pub unsafe extern "C" fn vsprintf(buffer: *mut c_char, format: *const c_char, ap: VaList) -> c_int {
     // SAFETY: the caller's obligations.
     unsafe { rosemary_vsprintf(buffer, format, ap) }
-}
-
-/// `int snprintf(char *, size_t, const char *, ...)`
-///
-/// # Safety
-///
-/// `buffer` holds `size` bytes, and the arguments match `format`.
-pub unsafe extern "C" fn snprintf(
-    buffer: *mut c_char,
-    size: usize,
-    format: *const c_char,
-    args: ...
-) -> c_int {
-    // SAFETY: the caller's obligations.
-    unsafe { rosemary_vsnprintf(buffer, size, format, args) }
 }
 
 /// `int vsnprintf(char *, size_t, const char *, va_list)`
 ///
 /// # Safety
 ///
-/// As [`snprintf`].
+/// `buffer` holds `size` bytes, and the arguments match `format`.
 pub unsafe extern "C" fn vsnprintf(
     buffer: *mut c_char,
     size: usize,
@@ -107,16 +101,6 @@ pub unsafe extern "C" fn vsnprintf(
 ) -> c_int {
     // SAFETY: the caller's obligations.
     unsafe { rosemary_vsnprintf(buffer, size, format, ap) }
-}
-
-/// `int asprintf(char **, const char *, ...)`
-///
-/// # Safety
-///
-/// As [`vasprintf_into_guest`].
-unsafe extern "C" fn asprintf(out: *mut *mut c_char, format: *const c_char, args: ...) -> c_int {
-    // SAFETY: the caller's obligations.
-    unsafe { vasprintf_into_guest(out, format, args) }
 }
 
 /// `int vasprintf(char **, const char *, va_list)`
@@ -129,21 +113,11 @@ unsafe extern "C" fn vasprintf(out: *mut *mut c_char, format: *const c_char, ap:
     unsafe { vasprintf_into_guest(out, format, ap) }
 }
 
-/// `int dprintf(int, const char *, ...)`
-///
-/// # Safety
-///
-/// The arguments match `format`.
-unsafe extern "C" fn dprintf(fd: c_int, format: *const c_char, args: ...) -> c_int {
-    // SAFETY: the caller's obligations.
-    unsafe { rosemary_vdprintf(fd, format, args) }
-}
-
 /// `int vdprintf(int, const char *, va_list)`
 ///
 /// # Safety
 ///
-/// As [`dprintf`].
+/// The arguments match `format`.
 unsafe extern "C" fn vdprintf(fd: c_int, format: *const c_char, ap: VaList) -> c_int {
     // SAFETY: the caller's obligations.
     unsafe { rosemary_vdprintf(fd, format, ap) }
@@ -152,13 +126,13 @@ unsafe extern "C" fn vdprintf(fd: c_int, format: *const c_char, ap: VaList) -> c
 exports::exports! {
     functions {
         "sprintf" => sprintf,
-        "vsprintf" => vsprintf,
+        "vsprintf" => darwin_vsprintf,
         "snprintf" => snprintf,
-        "vsnprintf" => vsnprintf,
+        "vsnprintf" => darwin_vsnprintf,
         "asprintf" => asprintf,
-        "vasprintf" => vasprintf,
+        "vasprintf" => darwin_vasprintf,
         "dprintf" => dprintf,
-        "vdprintf" => vdprintf,
+        "vdprintf" => darwin_vdprintf,
     }
 }
 
@@ -170,16 +144,101 @@ mod tests {
     type Snprintf = unsafe extern "C" fn(*mut c_char, usize, *const c_char, ...) -> c_int;
 
     /// Called through the published symbol, as a guest would reach it.
+    #[cfg(not(all(target_arch = "aarch64", not(target_vendor = "apple"))))]
     fn published_snprintf() -> Snprintf {
         // SAFETY: the export is a variadic function of this shape.
         unsafe { std::mem::transmute(symbol("snprintf").expect("published")) }
     }
 
+    /// The published symbol takes Darwin's convention here, so this host's own
+    /// ellipsis reaches the same `va_list` form; the entry is tested below.
+    #[cfg(all(target_arch = "aarch64", not(target_vendor = "apple")))]
+    fn published_snprintf() -> Snprintf {
+        unsafe extern "C" fn host(
+            buffer: *mut c_char,
+            size: usize,
+            format: *const c_char,
+            args: ...
+        ) -> c_int {
+            // SAFETY: the caller's obligations.
+            unsafe { vsnprintf(buffer, size, format, args) }
+        }
+        host
+    }
+
+    /// `bash`'s own version string, which is what first showed the host's
+    /// registers being read for Darwin's stack.
+    #[test]
+    #[cfg(target_arch = "aarch64")]
+    fn a_darwin_caller_reaches_the_published_entries() {
+        let mut buffer = [0 as c_char; 32];
+        let tail = [c"3.2".as_ptr() as u64, 57, 1, c"release".as_ptr() as u64];
+        let format = c"%s.%d(%d)-%s".as_ptr() as u64;
+        let named = [buffer.as_mut_ptr() as u64, buffer.len() as u64, format];
+        // SAFETY: a buffer this test sized and a tail matching the format.
+        let n = unsafe {
+            crate::vararg::call_darwin(symbol("snprintf").expect("published"), &named, &tail)
+        };
+        assert_eq!(n as c_int, 17);
+        // SAFETY: `snprintf` terminated it.
+        assert_eq!(
+            unsafe { CStr::from_ptr(buffer.as_ptr()) }.to_bytes(),
+            b"3.2.57(1)-release"
+        );
+
+        // `vsnprintf` with Darwin's `va_list`: a pointer to the same slots.
+        let mut again = [0 as c_char; 32];
+        let named = [
+            again.as_mut_ptr() as u64,
+            again.len() as u64,
+            format,
+            tail.as_ptr() as u64,
+        ];
+        // SAFETY: as above, with the slots passed by address.
+        let n = unsafe {
+            crate::vararg::call_darwin(symbol("vsnprintf").expect("published"), &named, &[])
+        };
+        assert_eq!(n as c_int, 17);
+        // SAFETY: as above.
+        assert_eq!(
+            unsafe { CStr::from_ptr(again.as_ptr()) }.to_bytes(),
+            b"3.2.57(1)-release"
+        );
+    }
+
+    /// Darwin's arm64 `long double` is `double`, so `%Lf` reads one slot.
+    #[test]
+    #[cfg(all(target_arch = "aarch64", not(target_vendor = "apple")))]
+    fn a_long_double_conversion_reads_darwins_double() {
+        let mut buffer = [0 as c_char; 32];
+        let named = [
+            buffer.as_mut_ptr() as u64,
+            buffer.len() as u64,
+            c"%.2Lf|%d".as_ptr() as u64,
+        ];
+        // SAFETY: a buffer this test sized and a tail matching the format.
+        let n = unsafe {
+            crate::vararg::call_darwin(
+                symbol("snprintf").expect("published"),
+                &named,
+                &[2.5f64.to_bits(), 7],
+            )
+        };
+        // SAFETY: `snprintf` terminated it.
+        assert_eq!(
+            unsafe { CStr::from_ptr(buffer.as_ptr()) }.to_bytes(),
+            b"2.50|7"
+        );
+        assert_eq!(n as c_int, 6);
+    }
+
     fn render_double(format: &CStr, value: f64) -> String {
         let mut buffer = [0 as c_char; 64];
-        // SAFETY: a buffer this test sized, and one double for one conversion.
+        // SAFETY: a buffer this test sized, a double for the first conversion
+        // and a zero for a `%d` after it, which would otherwise read an
+        // argument nobody passed.
         let n = unsafe {
-            published_snprintf()(buffer.as_mut_ptr(), buffer.len(), format.as_ptr(), value)
+            published_snprintf()(buffer.as_mut_ptr(), buffer.len(), format.as_ptr(), value, 0)
         };
         // SAFETY: `snprintf` terminated it.
         let text = unsafe { CStr::from_ptr(buffer.as_ptr()) };
@@ -270,10 +329,24 @@ mod tests {
 
     #[test]
     fn asprintf_hands_back_a_nan_without_a_sign() {
-        type Asprintf = unsafe extern "C" fn(*mut *mut c_char, *const c_char, ...) -> c_int;
-        // SAFETY: the export is a variadic function of this shape.
-        let asprintf: Asprintf =
-            unsafe { std::mem::transmute(symbol("asprintf").expect("published")) };
+        #[cfg(not(all(target_arch = "aarch64", not(target_vendor = "apple"))))]
+        let asprintf = {
+            type Asprintf = unsafe extern "C" fn(*mut *mut c_char, *const c_char, ...) -> c_int;
+            // SAFETY: the export is a variadic function of this shape.
+            let f: Asprintf =
+                unsafe { std::mem::transmute(symbol("asprintf").expect("published")) };
+            f
+        };
+        // The published entry takes Darwin's convention here; see above.
+        #[cfg(all(target_arch = "aarch64", not(target_vendor = "apple")))]
+        unsafe extern "C" fn asprintf(
+            out: *mut *mut c_char,
+            format: *const c_char,
+            args: ...
+        ) -> c_int {
+            // SAFETY: the caller's obligations.
+            unsafe { vasprintf(out, format, args) }
+        }
         let mut out: *mut c_char = std::ptr::null_mut();
         // SAFETY: a writable slot and one double for one conversion.
         let n = unsafe { asprintf(&raw mut out, c"[%g]".as_ptr(), -f64::NAN) };

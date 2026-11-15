@@ -26,8 +26,9 @@ directly and recompiling them.
 
 A matching instruction set is not enough for `native`. The code is still Darwin's, and it reads its
 thread-specific data straight out of the thread pointer register, so `darwin::tls::can_enter_darwin` has to
-agree that the host can give it that array. On aarch64 Linux it cannot - Darwin arm64 code reads `TPIDRRO_EL0`,
-which Linux does not let userspace write - so a universal binary there takes its x86-64 slice instead.
+agree that the host can give it that array. On aarch64 Linux Darwin arm64 code reads `TPIDRRO_EL0`, which
+Linux does not let userspace write, so that takes Rosemary's kernel module (`kernel/linux`, see
+`docs/installing.md`). Rosemary probes it once; without it a universal binary takes its x86-64 slice instead.
 
 An `arm64e` slice is accepted only when pointer authentication is inert in this process (probed, not
 assumed), since the loader stores pointers unsigned.

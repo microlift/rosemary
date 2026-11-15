@@ -86,9 +86,9 @@ fn pointer_auth_is_inert() -> bool {
 /// still Darwin's: it reads its thread-specific data straight out of the
 /// thread pointer register. [`darwin::tls::can_enter_darwin`] is what says the
 /// host can give it that array, and it is the narrower of the two conditions.
-/// On aarch64 Linux it is false - Darwin arm64 code reads `TPIDRRO_EL0`, which
-/// Linux does not let userspace write - so a universal Mach-O there takes the
-/// emulated backend's x86-64 slice instead.
+/// On aarch64 Linux Darwin arm64 code reads `TPIDRRO_EL0`, which Linux does
+/// not let userspace write, so it holds only with Rosemary's kernel module
+/// loaded; without it a universal Mach-O takes its x86-64 slice instead.
 pub fn runnable(slice: &machish::fat::Slice) -> bool {
     darwin::tls::can_enter_darwin()
         && slice.cputype == HostSpec::CPU_TYPE
@@ -158,6 +158,14 @@ impl Native {
         let mut host = NativeDylibProvider::system();
         host.allow_everything();
         darwin::divergent::deny_in(&mut host);
+        // The host's variadics read their arguments from registers that a Darwin
+        // arm64 caller leaves undefined; what this runtime answers itself is
+        // published in Darwin's convention instead. See `darwin::vararg`.
+        #[cfg(all(target_arch = "aarch64", not(target_vendor = "apple")))]
+        for name in crate::abi::table::variadic_names() {
+            host.deny(name);
+            host.deny(&format!("_{name}"));
+        }
         crate::objc::host::deny_foreign_classes(&mut host);
         crate::frameworks::deny_host_frameworks(&mut host);
         crate::gl::deny_host_gl(&mut host);
