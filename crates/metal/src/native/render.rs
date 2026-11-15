@@ -49,6 +49,8 @@ pub(super) fn install() {
             c"v48@0:8Q16Q24Q32Q40";
         "drawPrimitives:vertexStart:vertexCount:instanceCount:baseInstance:" => draw_primitives_base,
             c"v56@0:8Q16Q24Q32Q40Q48";
+        "drawIndexedPrimitives:indexCount:indexType:indexBuffer:indexBufferOffset:" => draw_indexed,
+            c"v56@0:8Q16Q24Q32@40Q48";
         "drawIndexedPrimitives:indexCount:indexType:indexBuffer:indexBufferOffset:instanceCount:" => draw_indexed_instanced,
             c"v64@0:8Q16Q24Q32@40Q48Q56";
         "drawIndexedPrimitives:indexCount:indexType:indexBuffer:indexBufferOffset:instanceCount:baseVertex:baseInstance:" => draw_indexed_base,
@@ -84,7 +86,7 @@ fn host_vertex_descriptor(guest: Id) -> Result<HostId, &'static str> {
         return Err("Apple MTLVertexDescriptor has no layouts or attributes");
     }
     for (index, attr) in guest.attributes.iter().enumerate() {
-        if attr.format == 0 {
+        if attr.format == MTL_VERTEX_FORMAT_INVALID {
             continue;
         }
         if attr.buffer_index >= resource::VERTEX_SLOTS as u64 {
@@ -115,11 +117,13 @@ fn host_vertex_descriptor(guest: Id) -> Result<HostId, &'static str> {
         if !guest
             .attributes
             .iter()
-            .any(|a| a.format != 0 && a.buffer_index == index as u64)
+            .any(|a| a.format != MTL_VERTEX_FORMAT_INVALID && a.buffer_index == index as u64)
         {
             continue;
         }
-        if layout.step_function > 4 || layout.step_rate == 0 {
+        if layout.step_function > MTL_VERTEX_STEP_FUNCTION_PER_PATCH_CONTROL_POINT
+            || layout.step_rate == 0
+        {
             unsafe { host_release(native) };
             return Err("vertex buffer layout has an unsupported step function or zero step rate");
         }
@@ -150,8 +154,8 @@ fn configure_host_color_attachment(
     described: &pipeline::ColorAttachment,
 ) -> Result<(), &'static str> {
     if described.write_mask > MTL_COLOR_WRITE_MASK_ALL
-        || described.rgb_operation > 4
-        || described.alpha_operation > 4
+        || described.rgb_operation > MTL_BLEND_OPERATION_MAX
+        || described.alpha_operation > MTL_BLEND_OPERATION_MAX
         || [
             described.source_rgb,
             described.destination_rgb,
@@ -159,7 +163,7 @@ fn configure_host_color_attachment(
             described.destination_alpha,
         ]
         .iter()
-        .any(|&v| v > 18)
+        .any(|&factor| factor > MTL_BLEND_FACTOR_ONE_MINUS_SOURCE1_ALPHA)
     {
         return Err("invalid Metal render color blend factor, operation, or write mask");
     }
@@ -204,7 +208,7 @@ pub(super) unsafe extern "C" fn new_render_pipeline(
     if !error.is_null() {
         unsafe { *error = std::ptr::null_mut() };
     }
-    let fail = |reason: &str| compute::fail(error, "MTLRenderPipelineErrorDomain", reason);
+    let fail = |reason: &str| compute::fail(error, compute::Failure::RenderPipeline, reason);
     if !object::is_kind(descriptor, c"MTLRenderPipelineDescriptor") {
         return fail("expected a render pipeline descriptor");
     }
@@ -230,7 +234,10 @@ pub(super) unsafe extern "C" fn new_render_pipeline(
     {
         return fail("native render functions belong to another device");
     }
-    if !matches!(described.sample_count, 1 | 2 | 4 | 8 | 16) || described.input_topology > 3 {
+    if !described.sample_count.is_power_of_two()
+        || described.sample_count > MAX_RASTER_SAMPLE_COUNT
+        || described.input_topology > MTL_PRIMITIVE_TOPOLOGY_CLASS_TRIANGLE
+    {
         return fail("invalid Metal raster sample count or input topology");
     }
     let host_device = unsafe { object::body::<NativeDevice>(receiver) }.host;
@@ -359,6 +366,13 @@ unsafe extern "C" fn pipeline_dealloc(receiver: Id, _sel: Sel) {
     objc::arc::finalize(receiver);
 }
 
+#[derive(Clone, Copy)]
+enum AttachmentKind {
+    Color,
+    Depth,
+    Stencil,
+}
+
 /// Copy one Rosemary render attachment to Apple's descriptor. A pass can
 /// have multiple colors, a depth/stencil-only target, or a multisample resolve;
 /// copying the whole snapshot is necessary for genuine Metal rendering.
@@ -367,7 +381,7 @@ fn host_render_attachment(
     host_attachment: HostId,
     guest: &encoder::AttachmentDescriptor,
     device: Id,
-    kind: u8, // 0 color, 1 depth, 2 stencil
+    kind: AttachmentKind,
 ) -> Result<Option<(u64, u64)>, &'static str> {
     if guest.texture.is_null() {
         if !guest.resolve_texture.is_null() {
@@ -382,26 +396,21 @@ fn host_render_attachment(
     if texture.device != device {
         return Err("a render attachment belongs to another Metal device");
     }
-    if !matches!(guest.load_action, 0..=2) || guest.store_action > 5 {
+    if guest.load_action > MTL_LOAD_ACTION_CLEAR
+        || guest.store_action > MTL_STORE_ACTION_CUSTOM_SAMPLE_DEPTH_STORE
+    {
         return Err("a render pass has an invalid load or store action");
     }
     let _pool = HostPool::new();
     let query = |host: HostId, selector: &CStr| unsafe { host_send_u64(host, sel(selector)) };
     let level_extent =
         |host: HostId, level: u64, selector: &CStr| (query(host, selector) >> level.min(63)).max(1);
+    // A 1D texture is not a render target.
     let check_texture = |host: HostId, level: u64, slice: u64| {
-        if level >= query(host, c"mipmapLevelCount") {
-            return false;
-        }
         let kind = query(host, c"textureType");
-        let slices = match kind {
-            2 | 4 | 7 => 1,
-            3 | 8 => query(host, c"arrayLength"),
-            5 => 6,
-            6 => query(host, c"arrayLength").saturating_mul(6),
-            _ => 0,
-        };
-        slice < slices
+        level < query(host, c"mipmapLevelCount")
+            && !matches!(kind, MTL_TEXTURE_TYPE_1D | MTL_TEXTURE_TYPE_1D_ARRAY)
+            && texture::slice_count(host, kind).is_some_and(|slices| slice < slices)
     };
     if !check_texture(texture.host, guest.level, guest.slice) {
         return Err("a render texture mip level or slice is out of range");
@@ -441,7 +450,7 @@ fn host_render_attachment(
         }
     }
     match kind {
-        0 => unsafe {
+        AttachmentKind::Color => unsafe {
             host_send_void_clear_color(
                 host_attachment,
                 sel(c"setClearColor:"),
@@ -453,12 +462,12 @@ fn host_render_attachment(
                 },
             )
         },
-        1 => {
+        AttachmentKind::Depth => {
             unsafe {
                 host_send_void_f64(host_attachment, sel(c"setClearDepth:"), guest.clear_depth)
             };
             if guest.resolve_filter != 0 {
-                if guest.resolve_filter > 2 {
+                if guest.resolve_filter > MTL_MULTISAMPLE_DEPTH_RESOLVE_FILTER_MAX {
                     return Err("invalid Metal depth resolve filter");
                 }
                 unsafe {
@@ -470,7 +479,7 @@ fn host_render_attachment(
                 };
             }
         }
-        2 => {
+        AttachmentKind::Stencil => {
             unsafe {
                 host_send_void_u64(
                     host_attachment,
@@ -479,7 +488,9 @@ fn host_render_attachment(
                 )
             };
             if guest.resolve_filter != 0 {
-                if guest.resolve_filter > 1 {
+                if guest.resolve_filter
+                    > MTL_MULTISAMPLE_STENCIL_RESOLVE_FILTER_DEPTH_RESOLVED_SAMPLE
+                {
                     return Err("invalid Metal stencil resolve filter");
                 }
                 unsafe {
@@ -491,7 +502,6 @@ fn host_render_attachment(
                 };
             }
         }
-        _ => unreachable!(),
     }
     Ok(Some((
         level_extent(texture.host, guest.level, c"width"),
@@ -531,7 +541,9 @@ pub(super) unsafe extern "C" fn new_render_encoder(receiver: Id, _sel: Sel, desc
             if host_attachment.is_null() {
                 return Err("host Metal render color slot is missing");
             }
-            if let Some(size) = host_render_attachment(host_attachment, guest, guest_device, 0)? {
+            if let Some(size) =
+                host_render_attachment(host_attachment, guest, guest_device, AttachmentKind::Color)?
+            {
                 if extent.is_some_and(|old| old != size) {
                     return Err("render attachments disagree on their dimensions");
                 }
@@ -539,8 +551,16 @@ pub(super) unsafe extern "C" fn new_render_encoder(receiver: Id, _sel: Sel, desc
             }
         }
         for (selector, guest, kind) in [
-            (c"depthAttachment".as_ref(), &pass.depth, 1),
-            (c"stencilAttachment".as_ref(), &pass.stencil, 2),
+            (
+                c"depthAttachment".as_ref(),
+                &pass.depth,
+                AttachmentKind::Depth,
+            ),
+            (
+                c"stencilAttachment".as_ref(),
+                &pass.stencil,
+                AttachmentKind::Stencil,
+            ),
         ] {
             if guest.texture.is_null() && guest.resolve_texture.is_null() {
                 continue;
@@ -706,7 +726,7 @@ unsafe extern "C" fn set_blend_color(
 }
 
 unsafe extern "C" fn set_depth_clip_mode(receiver: Id, _sel: Sel, mode: u64) {
-    if mode > 1 {
+    if mode > MTL_DEPTH_CLIP_MODE_CLAMP {
         gpu::trace("native Metal rejected invalid depth clip mode".to_string());
         return;
     }
@@ -805,13 +825,23 @@ fn set_render_enum(receiver: Id, selector: &CStr, value: u64, max: u64) {
 }
 
 unsafe extern "C" fn set_cull_mode(receiver: Id, _sel: Sel, value: u64) {
-    set_render_enum(receiver, c"setCullMode:", value, 2);
+    set_render_enum(receiver, c"setCullMode:", value, MTL_CULL_MODE_BACK);
 }
 unsafe extern "C" fn set_front_facing_winding(receiver: Id, _sel: Sel, value: u64) {
-    set_render_enum(receiver, c"setFrontFacingWinding:", value, 1);
+    set_render_enum(
+        receiver,
+        c"setFrontFacingWinding:",
+        value,
+        MTL_WINDING_COUNTER_CLOCKWISE,
+    );
 }
 unsafe extern "C" fn set_triangle_fill_mode(receiver: Id, _sel: Sel, value: u64) {
-    set_render_enum(receiver, c"setTriangleFillMode:", value, 1);
+    set_render_enum(
+        receiver,
+        c"setTriangleFillMode:",
+        value,
+        MTL_TRIANGLE_FILL_MODE_LINES,
+    );
 }
 
 fn set_buffer_offset(receiver: Id, selector: &CStr, offset: u64, index: u64) {
@@ -820,7 +850,7 @@ fn set_buffer_offset(receiver: Id, selector: &CStr, offset: u64, index: u64) {
     unsafe { host_send_void_u64_u64(host, sel(selector), offset, index) };
 }
 fn set_inline_bytes(receiver: Id, selector: &CStr, bytes: *const c_void, length: u64, index: u64) {
-    if (length > 0 && bytes.is_null()) || length > 4096 {
+    if (length > 0 && bytes.is_null()) || length > MAX_INLINE_BYTES {
         gpu::trace("native Metal render inline bytes invalid or over 4 KiB".to_string());
         return;
     }
@@ -1053,7 +1083,12 @@ fn native_index_buffer(
     count: u64,
     index_type: u64,
 ) -> Option<HostId> {
-    if index_type > 1 || !object::is_kind(buffer, c"RosemaryNativeMTLBuffer") {
+    let stride = match index_type {
+        MTL_INDEX_TYPE_UINT16 => size_of::<u16>() as u64,
+        MTL_INDEX_TYPE_UINT32 => size_of::<u32>() as u64,
+        _ => 0,
+    };
+    if stride == 0 || !object::is_kind(buffer, c"RosemaryNativeMTLBuffer") {
         gpu::trace(
             "native indexed draw requires UInt16/UInt32 indices and a native buffer".to_string(),
         );
@@ -1064,7 +1099,6 @@ fn native_index_buffer(
         gpu::trace("native index buffer belongs to another Metal device".to_string());
         return None;
     }
-    let stride = if index_type == 0 { 2u64 } else { 4u64 };
     let _pool = HostPool::new();
     let capacity = unsafe { host_send_u64(native.host, sel(c"length")) };
     if offset % stride != 0
@@ -1077,6 +1111,33 @@ fn native_index_buffer(
         return None;
     }
     Some(native.host)
+}
+
+unsafe extern "C" fn draw_indexed(
+    receiver: Id,
+    _sel: Sel,
+    primitive: u64,
+    count: u64,
+    index_type: u64,
+    buffer: Id,
+    offset: u64,
+) {
+    let Some(host_buffer) = native_index_buffer(receiver, buffer, offset, count, index_type) else {
+        return;
+    };
+    let _pool = HostPool::new();
+    let host = unsafe { object::body::<NativeRenderEncoder>(receiver) }.host;
+    unsafe {
+        host_send_void_indexed_once(
+            host,
+            sel(c"drawIndexedPrimitives:indexCount:indexType:indexBuffer:indexBufferOffset:"),
+            primitive,
+            count,
+            index_type,
+            host_buffer,
+            offset,
+        )
+    };
 }
 
 unsafe extern "C" fn draw_indexed_instanced(

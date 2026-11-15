@@ -24,7 +24,11 @@ fn set_host_stencil(
     selector: &CStr,
     state: &resource::StencilState,
 ) -> bool {
-    if state.compare > 7 || state.fail > 7 || state.depth_fail > 7 || state.pass > 7 {
+    if state.compare > MTL_COMPARE_FUNCTION_ALWAYS
+        || [state.fail, state.depth_fail, state.pass]
+            .iter()
+            .any(|&operation| operation > MTL_STENCIL_OPERATION_DECREMENT_WRAP)
+    {
         gpu::trace("native Metal rejected invalid stencil descriptor enum".to_string());
         return false;
     }
@@ -59,7 +63,7 @@ pub(super) unsafe extern "C" fn new_state(receiver: Id, _sel: Sel, descriptor: I
         return std::ptr::null_mut();
     }
     let state = *unsafe { object::body::<resource::DepthStencilState>(descriptor) };
-    if state.depth_compare > 7 {
+    if state.depth_compare > MTL_COMPARE_FUNCTION_ALWAYS {
         gpu::trace("native Metal rejected invalid depth compare function".to_string());
         return std::ptr::null_mut();
     }

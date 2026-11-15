@@ -25,13 +25,16 @@ pub(super) unsafe extern "C" fn new_sampler(receiver: Id, _sel: Sel, descriptor:
     let values = *unsafe { object::body::<resource::SamplerDescriptor>(descriptor) };
     // Passing an invalid enum to an Apple Metal setter can raise a host ObjC
     // exception, which cannot safely unwind into the guest runtime.
-    let valid = values.min_filter <= 1
-        && values.mag_filter <= 1
-        && values.mip_filter <= 2
-        && values.address.iter().all(|&v| v <= 6)
-        && (1..=16).contains(&values.max_anisotropy)
-        && values.compare_function <= 7
-        && values.border_color <= 2
+    let valid = values.min_filter <= MTL_SAMPLER_MIN_MAG_FILTER_LINEAR
+        && values.mag_filter <= MTL_SAMPLER_MIN_MAG_FILTER_LINEAR
+        && values.mip_filter <= MTL_SAMPLER_MIP_FILTER_LINEAR
+        && values
+            .address
+            .iter()
+            .all(|&mode| mode <= MTL_SAMPLER_ADDRESS_MODE_CLAMP_TO_BORDER_COLOR)
+        && (1..=MAX_SAMPLER_ANISOTROPY).contains(&values.max_anisotropy)
+        && values.compare_function <= MTL_COMPARE_FUNCTION_ALWAYS
+        && values.border_color <= MTL_SAMPLER_BORDER_COLOR_OPAQUE_WHITE
         && values.lod_min_clamp.is_finite()
         && values.lod_min_clamp >= 0.0
         && !values.lod_max_clamp.is_nan()

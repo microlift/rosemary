@@ -50,7 +50,9 @@ pub(super) fn install() {
         "setBytes:length:atIndex:" => set_bytes, c"v40@0:8^v16Q24Q32";
         "setTexture:atIndex:" => set_texture, c"v32@0:8@16Q24";
         "setSamplerState:atIndex:" => set_sampler, c"v32@0:8@16Q24";
-        "dispatchThreadgroups:threadsPerThreadgroup:" => dispatch_threadgroups,
+        "dispatchThreadgroups:threadsPerThreadgroup:" => dispatch,
+            c"v64@0:8{MTLSize=QQQ}16{MTLSize=QQQ}40";
+        "dispatchThreads:threadsPerThreadgroup:" => dispatch,
             c"v64@0:8{MTLSize=QQQ}16{MTLSize=QQQ}40";
         "endEncoding" => end_encoding, c"v16@0:8";
         "dealloc" => encoder_dealloc, c"v16@0:8";
@@ -89,10 +91,35 @@ pub(super) fn native_error(error: HostId, fallback: &str) -> String {
         .into_owned()
 }
 
-pub(super) fn fail(error: *mut Id, domain: &str, message: &str) -> Id {
+/// Which kind of object a native failure was creating, for its `NSError`.
+#[derive(Clone, Copy)]
+pub(super) enum Failure {
+    Library,
+    ComputePipeline,
+    RenderPipeline,
+}
+
+impl Failure {
+    fn domain_and_code(self) -> (&'static str, i64) {
+        match self {
+            Failure::Library => ("MTLLibraryErrorDomain", MTL_LIBRARY_ERROR_UNSUPPORTED),
+            Failure::ComputePipeline => (
+                "MTLComputePipelineErrorDomain",
+                MTL_RENDER_PIPELINE_ERROR_INTERNAL,
+            ),
+            Failure::RenderPipeline => (
+                "MTLRenderPipelineErrorDomain",
+                MTL_RENDER_PIPELINE_ERROR_INTERNAL,
+            ),
+        }
+    }
+}
+
+pub(super) fn fail(error: *mut Id, failure: Failure, message: &str) -> Id {
     gpu::trace(format!("native Metal: {message}"));
     if !error.is_null() {
-        unsafe { *error = foundation::error::make(domain, 1, message) };
+        let (domain, code) = failure.domain_and_code();
+        unsafe { *error = foundation::error::make(domain, code, message) };
     }
     std::ptr::null_mut()
 }
@@ -118,7 +145,7 @@ fn wrap_library(host: HostId, device: Id) -> Id {
 /// into the guest dispatch implementation. This never touches the filesystem.
 fn library_from_bytes(receiver: Id, bytes: &[u8], error: *mut Id) -> Id {
     if bytes.is_empty() {
-        return fail(error, "MTLLibraryErrorDomain", "empty precompiled metallib");
+        return fail(error, Failure::Library, "empty precompiled metallib");
     }
     let _pool = HostPool::new();
     let host_data = unsafe {
@@ -130,11 +157,7 @@ fn library_from_bytes(receiver: Id, bytes: &[u8], error: *mut Id) -> Id {
         )
     };
     if host_data.is_null() {
-        return fail(
-            error,
-            "MTLLibraryErrorDomain",
-            "host dispatch_data_create failed",
-        );
+        return fail(error, Failure::Library, "host dispatch_data_create failed");
     }
     let mut host_error = std::ptr::null_mut();
     let host = unsafe {
@@ -149,7 +172,7 @@ fn library_from_bytes(receiver: Id, bytes: &[u8], error: *mut Id) -> Id {
     if host.is_null() {
         return fail(
             error,
-            "MTLLibraryErrorDomain",
+            Failure::Library,
             &native_error(host_error, "native Metal rejected precompiled metallib"),
         );
     }
@@ -166,18 +189,10 @@ pub(super) unsafe extern "C" fn new_library_with_data(
         unsafe { *error = std::ptr::null_mut() };
     }
     let Some((bytes, length)) = darwin::dispatch::data::bytes(guest_data) else {
-        return fail(
-            error,
-            "MTLLibraryErrorDomain",
-            "expected guest dispatch_data_t",
-        );
+        return fail(error, Failure::Library, "expected guest dispatch_data_t");
     };
     if bytes.is_null() || length == 0 {
-        return fail(
-            error,
-            "MTLLibraryErrorDomain",
-            "empty guest dispatch_data_t",
-        );
+        return fail(error, Failure::Library, "empty guest dispatch_data_t");
     }
     // SAFETY: the guest dispatch object retains these bytes for the call;
     // host_dispatch_data_create copies them synchronously before returning.
@@ -299,17 +314,13 @@ pub(super) unsafe extern "C" fn new_library_with_source(
     let _pool = HostPool::new();
     let host_options = match host_compile_options(options) {
         Ok(value) => value,
-        Err(reason) => return fail(error, "MTLLibraryErrorDomain", &reason),
+        Err(reason) => return fail(error, Failure::Library, &reason),
     };
     let Some(host_source) = host_string(source) else {
         if !host_options.is_null() {
             unsafe { host_release(host_options) };
         }
-        return fail(
-            error,
-            "MTLLibraryErrorDomain",
-            "expected a valid source NSString",
-        );
+        return fail(error, Failure::Library, "expected a valid source NSString");
     };
     let mut host_error = std::ptr::null_mut();
     let host = unsafe {
@@ -327,7 +338,7 @@ pub(super) unsafe extern "C" fn new_library_with_source(
     if host.is_null() {
         return fail(
             error,
-            "MTLLibraryErrorDomain",
+            Failure::Library,
             &native_error(host_error, "Metal source compilation failed"),
         );
     }
@@ -432,7 +443,7 @@ pub(super) unsafe extern "C" fn new_compute_pipeline(
     {
         return fail(
             error,
-            "MTLComputePipelineErrorDomain",
+            Failure::ComputePipeline,
             "expected a native function of this device",
         );
     }
@@ -450,7 +461,7 @@ pub(super) unsafe extern "C" fn new_compute_pipeline(
     if host.is_null() {
         return fail(
             error,
-            "MTLComputePipelineErrorDomain",
+            Failure::ComputePipeline,
             &native_error(host_error, "native compute pipeline creation failed"),
         );
     }
@@ -578,7 +589,7 @@ unsafe extern "C" fn set_bytes(
     length: u64,
     index: u64,
 ) {
-    if (length > 0 && bytes.is_null()) || length > 4096 {
+    if (length > 0 && bytes.is_null()) || length > MAX_INLINE_BYTES {
         gpu::trace("native Metal compute inline bytes invalid or over 4 KiB".to_string());
         return;
     }
@@ -627,22 +638,17 @@ unsafe extern "C" fn set_sampler(receiver: Id, _sel: Sel, sampler: Id, index: u6
     unsafe { host_send_void_id_u64(host, sel(c"setSamplerState:atIndex:"), native, index) };
 }
 
-unsafe extern "C" fn dispatch_threadgroups(
+/// Both dispatch forms share one ABI; the guest's selector names the host's.
+unsafe extern "C" fn dispatch(
     receiver: Id,
-    _sel: Sel,
-    groups: encoder::MtlSize,
+    method: Sel,
+    grid: encoder::MtlSize,
     size: encoder::MtlSize,
 ) {
     let _pool = HostPool::new();
     let host = unsafe { object::body::<NativeComputeEncoder>(receiver) }.host;
-    unsafe {
-        host_send_void_size_size(
-            host,
-            sel(c"dispatchThreadgroups:threadsPerThreadgroup:"),
-            groups,
-            size,
-        )
-    };
+    let selector = unsafe { CStr::from_ptr(method) };
+    unsafe { host_send_void_size_size(host, sel(selector), grid, size) };
 }
 
 unsafe extern "C" fn end_encoding(receiver: Id, _sel: Sel) {

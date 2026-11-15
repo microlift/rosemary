@@ -54,11 +54,12 @@ impl CallbackProgress {
     fn complete(&self, scheduled: bool) {
         let mut count = self.pending.lock().unwrap_or_else(|e| e.into_inner());
         let slot = &mut count[usize::from(!scheduled)];
-        assert!(
-            *slot > 0,
-            "native Metal handler progress accounting underflow"
-        );
-        *slot -= 1;
+        // A panic here would end the only completion worker and strand every
+        // later handler and waiter in the process, so report and go on.
+        match slot.checked_sub(1) {
+            Some(remaining) => *slot = remaining,
+            None => eprintln!("rosemary: Metal: a command buffer handler finished twice"),
+        }
         self.finished.notify_all();
     }
 
@@ -73,10 +74,9 @@ impl CallbackProgress {
                 // impossible; Metal permits a handler to inspect its status.
                 return;
             }
-            // A guest completion callback may wait for *another* buffer.
-            // Pump only that buffer's queued handlers reentrantly, in their
-            // registration order, rather than either deadlocking the sole
-            // worker or returning before their guest code has run.
+            // A guest completion callback may wait for *another* buffer. This
+            // is the sole worker, so it delivers queued handlers itself until
+            // that buffer's are done, oldest first, as it would have anyway.
             loop {
                 let pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
                 let unfinished = pending[0] != 0 || (!scheduled_only && pending[1] != 0);
@@ -84,22 +84,8 @@ impl CallbackProgress {
                 if !unfinished {
                     return;
                 }
-                let entry = {
-                    let mut queue = QUEUE.pending.lock().expect("the completion queue");
-                    loop {
-                        if let Some(index) = queue.iter().position(|entry| {
-                            entry.progress.as_ref().is_some_and(|(progress, _)| {
-                                std::ptr::eq(Arc::as_ptr(progress), self as *const _)
-                            })
-                        }) {
-                            break queue.remove(index).expect("position was present");
-                        }
-                        queue = QUEUE.ready.wait(queue).expect("the completion queue");
-                    }
-                };
-                // The worker has already entered Darwin TLS. Reentrant
-                // delivery preserves order among handlers of this buffer.
-                unsafe { run(entry) };
+                // The worker has already entered Darwin TLS.
+                unsafe { run(next_entry()) };
             }
         }
         let mut count = self.pending.lock().unwrap_or_else(|e| e.into_inner());
@@ -198,19 +184,19 @@ fn enqueue(entry: Pending) {
 
 fn worker() {
     loop {
-        let entry = {
-            let mut pending = QUEUE.pending.lock().expect("the completion queue");
-            loop {
-                match pending.pop_front() {
-                    Some(entry) => break entry,
-                    None => {
-                        pending = QUEUE.ready.wait(pending).expect("the completion queue");
-                    }
-                }
-            }
-        };
         // SAFETY: one reference to each arrived with the entry.
-        unsafe { run(entry) };
+        unsafe { run(next_entry()) };
+    }
+}
+
+/// The oldest queued handler, waiting for one if there is none.
+fn next_entry() -> Pending {
+    let mut pending = QUEUE.pending.lock().expect("the completion queue");
+    loop {
+        match pending.pop_front() {
+            Some(entry) => return entry,
+            None => pending = QUEUE.ready.wait(pending).expect("the completion queue"),
+        }
     }
 }
 

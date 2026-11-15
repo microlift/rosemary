@@ -17,6 +17,46 @@ use std::sync::Arc;
 type HostId = *mut c_void;
 type HostSel = *const c_void;
 
+const MTL_TEXTURE_TYPE_1D: u64 = 0;
+const MTL_TEXTURE_TYPE_1D_ARRAY: u64 = 1;
+const MTL_TEXTURE_TYPE_2D_ARRAY: u64 = 3;
+const MTL_TEXTURE_TYPE_2D_MULTISAMPLE: u64 = 4;
+const MTL_TEXTURE_TYPE_CUBE_ARRAY: u64 = 6;
+const MTL_TEXTURE_TYPE_3D: u64 = 7;
+const MTL_TEXTURE_TYPE_2D_MULTISAMPLE_ARRAY: u64 = 8;
+
+// Apple Metal setters raise an Objective-C exception, which cannot unwind
+// into the guest, for an unknown enumerator. Guest values are checked
+// against the last enumerator of each enum before they reach the host.
+const MTL_COMPARE_FUNCTION_ALWAYS: u64 = 7;
+const MTL_STENCIL_OPERATION_DECREMENT_WRAP: u64 = 7;
+const MTL_VERTEX_FORMAT_INVALID: u64 = 0;
+const MTL_VERTEX_STEP_FUNCTION_PER_PATCH_CONTROL_POINT: u64 = 4;
+const MTL_BLEND_FACTOR_ONE_MINUS_SOURCE1_ALPHA: u64 = 18;
+const MTL_BLEND_OPERATION_MAX: u64 = 4;
+const MTL_PRIMITIVE_TOPOLOGY_CLASS_TRIANGLE: u64 = 3;
+const MTL_LOAD_ACTION_CLEAR: u64 = 2;
+const MTL_STORE_ACTION_CUSTOM_SAMPLE_DEPTH_STORE: u64 = 5;
+const MTL_MULTISAMPLE_DEPTH_RESOLVE_FILTER_MAX: u64 = 2;
+const MTL_MULTISAMPLE_STENCIL_RESOLVE_FILTER_DEPTH_RESOLVED_SAMPLE: u64 = 1;
+const MTL_CULL_MODE_BACK: u64 = 2;
+const MTL_WINDING_COUNTER_CLOCKWISE: u64 = 1;
+const MTL_TRIANGLE_FILL_MODE_LINES: u64 = 1;
+const MTL_INDEX_TYPE_UINT16: u64 = 0;
+const MTL_INDEX_TYPE_UINT32: u64 = 1;
+const MTL_SAMPLER_MIN_MAG_FILTER_LINEAR: u64 = 1;
+const MTL_SAMPLER_MIP_FILTER_LINEAR: u64 = 2;
+const MTL_SAMPLER_ADDRESS_MODE_CLAMP_TO_BORDER_COLOR: u64 = 5;
+const MTL_SAMPLER_BORDER_COLOR_OPAQUE_WHITE: u64 = 2;
+const MTL_COMMAND_BUFFER_ERROR_OPTION_ENCODER_EXECUTION_STATUS: u64 = 1;
+const MTL_LIBRARY_ERROR_UNSUPPORTED: i64 = 1;
+const MTL_RENDER_PIPELINE_ERROR_INTERNAL: i64 = 1;
+
+/// The most `setBytes:` and its vertex/fragment forms accept.
+const MAX_INLINE_BYTES: u64 = 4096;
+const MAX_SAMPLER_ANISOTROPY: u64 = 16;
+const MAX_RASTER_SAMPLE_COUNT: u64 = 16;
+
 #[link(name = "Metal", kind = "framework")]
 unsafe extern "C" {
     #[link_name = "MTLCopyAllDevices"]
@@ -60,7 +100,7 @@ unsafe extern "C" {
 // Each selector is dispatched with its declared Objective-C method ABI.
 // A single symbol declaration avoids conflicting extern signatures.
 macro_rules! native_send {
-    ($name:ident($($arg:ident: $ty:ty),*) -> $ret:ty) => {
+    ($name:ident($($arg:ident: $ty:ty),* $(,)?) -> $ret:ty) => {
         unsafe fn $name(receiver: HostId, selector: HostSel, $($arg: $ty),*) -> $ret {
             let send: unsafe extern "C" fn(HostId, HostSel, $($ty),*) -> $ret =
                 unsafe { std::mem::transmute(host_msg_send as unsafe extern "C" fn()) };
@@ -87,20 +127,55 @@ native_send!(host_send_void_u64(value: u64) -> ());
 native_send!(host_send_void_f32(value: f32) -> ());
 native_send!(host_send_void_f64(value: f64) -> ());
 native_send!(host_send_void_f32_f32_f32(first: f32, second: f32, third: f32) -> ());
-native_send!(host_send_void_f32_f32_f32_f32(first: f32, second: f32, third: f32, fourth: f32) -> ());
+native_send!(
+    host_send_void_f32_f32_f32_f32(first: f32, second: f32, third: f32, fourth: f32) -> ()
+);
 native_send!(host_send_void_id_u64(argument: HostId, index: u64) -> ());
 native_send!(host_send_void_u64_u64_u64(first: u64, second: u64, third: u64) -> ());
 native_send!(host_send_void_u64_u64(first: u64, second: u64) -> ());
-native_send!(host_send_void_u64_u64_u64_u64(first: u64, second: u64, third: u64, fourth: u64) -> ());
-native_send!(host_send_void_u64_u64_u64_u64_u64(first: u64, second: u64, third: u64, fourth: u64, fifth: u64) -> ());
-native_send!(host_send_void_indexed(
-    primitive: u64, index_count: u64, index_type: u64, index_buffer: HostId,
-    index_offset: u64, instance_count: u64
-) -> ());
-native_send!(host_send_void_indexed_base(
-    primitive: u64, index_count: u64, index_type: u64, index_buffer: HostId,
-    index_offset: u64, instance_count: u64, base_vertex: i64, base_instance: u64
-) -> ());
+native_send!(
+    host_send_void_u64_u64_u64_u64(first: u64, second: u64, third: u64, fourth: u64) -> ()
+);
+native_send!(
+    host_send_void_u64_u64_u64_u64_u64(
+        first: u64,
+        second: u64,
+        third: u64,
+        fourth: u64,
+        fifth: u64,
+    ) -> ()
+);
+native_send!(
+    host_send_void_indexed_once(
+        primitive: u64,
+        index_count: u64,
+        index_type: u64,
+        index_buffer: HostId,
+        index_offset: u64,
+    ) -> ()
+);
+native_send!(
+    host_send_void_indexed(
+        primitive: u64,
+        index_count: u64,
+        index_type: u64,
+        index_buffer: HostId,
+        index_offset: u64,
+        instance_count: u64,
+    ) -> ()
+);
+native_send!(
+    host_send_void_indexed_base(
+        primitive: u64,
+        index_count: u64,
+        index_type: u64,
+        index_buffer: HostId,
+        index_offset: u64,
+        instance_count: u64,
+        base_vertex: i64,
+        base_instance: u64,
+    ) -> ()
+);
 native_send!(host_send_void_clear_color(color: encoder::ClearColor) -> ());
 native_send!(host_send_void_viewport(viewport: encoder::Viewport) -> ());
 native_send!(host_send_void_scissor(rect: encoder::ScissorRect) -> ());
@@ -111,34 +186,90 @@ native_send!(host_send_void_bool(value: bool) -> ());
 native_send!(host_send_void_id_u64_u64(argument: HostId, offset: u64, index: u64) -> ());
 native_send!(host_send_void_ptr_u64_u64(bytes: *const c_void, length: u64, index: u64) -> ());
 native_send!(host_send_void_size_size(groups: encoder::MtlSize, threads: encoder::MtlSize) -> ());
-native_send!(host_send_void_region_u64_ptr_u64(region: texture::Region, mip_level: u64, bytes: *const c_void, bytes_per_row: u64) -> ());
-native_send!(host_send_void_region_u64_u64_ptr_u64_u64(
-    region: texture::Region, mip_level: u64, slice: u64,
-    bytes: *const c_void, bytes_per_row: u64, bytes_per_image: u64
-) -> ());
-native_send!(host_send_void_ptr_u64_u64_region_u64_u64(
-    bytes: *mut c_void, bytes_per_row: u64, bytes_per_image: u64,
-    region: texture::Region, mip_level: u64, slice: u64
-) -> ());
-native_send!(host_send_void_ptr_u64_region_u64(bytes: *mut c_void, bytes_per_row: u64, region: texture::Region, mip_level: u64) -> ());
-native_send!(host_send_void_id_u64_id_u64_u64(source: HostId, source_offset: u64, destination: HostId, destination_offset: u64, size: u64) -> ());
-native_send!(host_send_void_texture_to_texture(
-    source: HostId, source_slice: u64, source_level: u64,
-    source_origin: encoder::MtlOrigin, size: encoder::MtlSize,
-    destination: HostId, destination_slice: u64, destination_level: u64,
-    destination_origin: encoder::MtlOrigin
-) -> ());
-native_send!(host_send_void_texture_to_buffer(
-    texture: HostId,
-    slice: u64,
-    mip_level: u64,
-    origin: encoder::MtlOrigin,
-    size: encoder::MtlSize,
-    buffer: HostId,
-    offset: u64,
-    bytes_per_row: u64,
-    bytes_per_image: u64
-) -> ());
+native_send!(
+    host_send_void_region_u64_ptr_u64(
+        region: texture::Region,
+        mip_level: u64,
+        bytes: *const c_void,
+        bytes_per_row: u64,
+    ) -> ()
+);
+native_send!(
+    host_send_void_region_u64_u64_ptr_u64_u64(
+        region: texture::Region,
+        mip_level: u64,
+        slice: u64,
+        bytes: *const c_void,
+        bytes_per_row: u64,
+        bytes_per_image: u64,
+    ) -> ()
+);
+native_send!(
+    host_send_void_ptr_u64_u64_region_u64_u64(
+        bytes: *mut c_void,
+        bytes_per_row: u64,
+        bytes_per_image: u64,
+        region: texture::Region,
+        mip_level: u64,
+        slice: u64,
+    ) -> ()
+);
+native_send!(
+    host_send_void_ptr_u64_region_u64(
+        bytes: *mut c_void,
+        bytes_per_row: u64,
+        region: texture::Region,
+        mip_level: u64,
+    ) -> ()
+);
+native_send!(
+    host_send_void_id_u64_id_u64_u64(
+        source: HostId,
+        source_offset: u64,
+        destination: HostId,
+        destination_offset: u64,
+        size: u64,
+    ) -> ()
+);
+native_send!(
+    host_send_void_texture_to_texture(
+        source: HostId,
+        source_slice: u64,
+        source_level: u64,
+        source_origin: encoder::MtlOrigin,
+        size: encoder::MtlSize,
+        destination: HostId,
+        destination_slice: u64,
+        destination_level: u64,
+        destination_origin: encoder::MtlOrigin,
+    ) -> ()
+);
+native_send!(
+    host_send_void_buffer_to_texture(
+        buffer: HostId,
+        offset: u64,
+        bytes_per_row: u64,
+        bytes_per_image: u64,
+        size: encoder::MtlSize,
+        texture: HostId,
+        slice: u64,
+        mip_level: u64,
+        origin: encoder::MtlOrigin,
+    ) -> ()
+);
+native_send!(
+    host_send_void_texture_to_buffer(
+        texture: HostId,
+        slice: u64,
+        mip_level: u64,
+        origin: encoder::MtlOrigin,
+        size: encoder::MtlSize,
+        buffer: HostId,
+        offset: u64,
+        bytes_per_row: u64,
+        bytes_per_image: u64,
+    ) -> ()
+);
 
 struct HostPool(*mut c_void);
 
@@ -181,6 +312,15 @@ struct NativeCommandBuffer {
     progress: Arc<crate::completion::CallbackProgress>,
 }
 
+/// Whether a native Metal test should run its body in this process. Native
+/// mode replaces CAMetalLayer methods process-wide, so it must never share a
+/// process with the Vulkan-backed tests: outside a native-mode process, the
+/// test runs again in a child of its own with the mode selected.
+#[cfg(test)]
+fn run_native_test_here() -> bool {
+    enabled() || sdl3::isolated::run_here_with_env(&[("ROSEMARY_METAL_BACKEND", "native")])
+}
+
 pub(super) fn enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| std::env::var("ROSEMARY_METAL_BACKEND").as_deref() == Ok("native"))
@@ -202,6 +342,8 @@ fn bootstrap() {
             "isHeadless" => device_headless, c"B16@0:8";
             "recommendedMaxWorkingSetSize" => device_working_set, c"Q16@0:8";
             "maxBufferLength" => device_max_buffer_length, c"Q16@0:8";
+            "maxThreadgroupMemoryLength" => device_max_threadgroup_memory, c"Q16@0:8";
+            "isRemovable" => device_removable, c"B16@0:8";
             "supportsFamily:" => device_supports_family, c"B24@0:8Q16";
             "supportsFeatureSet:" => device_supports_feature_set, c"B24@0:8Q16";
             "supportsTextureSampleCount:" => device_supports_texture_sample_count, c"B24@0:8Q16";
@@ -260,10 +402,46 @@ fn bootstrap() {
             "blitCommandEncoder" => blit::new_blit_encoder, c"@16@0:8";
             "computeCommandEncoder" => compute::new_compute_encoder, c"@16@0:8";
             "renderCommandEncoderWithDescriptor:" => render::new_render_encoder, c"@24@0:8@16";
+            "pushDebugGroup:" => crate::no_op, c"v24@0:8@16";
+            "popDebugGroup" => crate::no_op, c"v16@0:8";
             "dealloc" => command_dealloc, c"v16@0:8";
         });
+        for name in ENCODER_CLASSES {
+            let class = objc::class::lookup(name).expect("native encoders are registered");
+            methods!(class, {
+                "pushDebugGroup:" => crate::no_op, c"v24@0:8@16";
+                "popDebugGroup" => crate::no_op, c"v16@0:8";
+                "insertDebugSignpost:" => crate::no_op, c"v24@0:8@16";
+            });
+        }
+        crate::add_labels(&LABELED_CLASSES);
     });
 }
+
+const ENCODER_CLASSES: [&CStr; 3] = [
+    c"RosemaryNativeMTLBlitCommandEncoder",
+    c"RosemaryNativeMTLComputeCommandEncoder",
+    c"RosemaryNativeMTLRenderCommandEncoder",
+];
+
+/// Every guest-visible native Metal object answers `-label`/`-setLabel:`.
+const LABELED_CLASSES: [&CStr; 15] = [
+    c"RosemaryNativeMTLDevice",
+    c"RosemaryNativeMTLCommandQueue",
+    c"RosemaryNativeMTLBuffer",
+    c"RosemaryNativeMTLCommandBuffer",
+    c"RosemaryNativeMTLBlitCommandEncoder",
+    c"RosemaryNativeMTLComputeCommandEncoder",
+    c"RosemaryNativeMTLRenderCommandEncoder",
+    c"RosemaryNativeMTLLibrary",
+    c"RosemaryNativeMTLFunction",
+    c"RosemaryNativeMTLComputePipelineState",
+    c"RosemaryNativeMTLRenderPipelineState",
+    c"RosemaryNativeMTLDepthStencilState",
+    c"RosemaryNativeMTLSamplerState",
+    c"RosemaryNativeMTLTexture",
+    c"RosemaryNativeCAMetalDrawable",
+];
 
 // The caller transfers one host retain to the guest-facing wrapper.
 fn wrap_device(host: HostId) -> Id {
@@ -337,6 +515,8 @@ pub(super) fn devices() -> &'static [usize] {
                 let retained = unsafe { host_retain(host) };
                 let guest = wrap_device(retained);
                 if !guest.is_null() {
+                    // Cached and handed out at +0; see `default_device`.
+                    objc::arc::make_immortal(guest);
                     devices.push(guest as usize);
                 }
             }
@@ -346,6 +526,9 @@ pub(super) fn devices() -> &'static [usize] {
     })
 }
 
+/// The device `MTLCreateSystemDefaultDevice` returns. Every device wrapper
+/// is cached and handed out at +0, so each is pinned: a guest releasing its
+/// create-rule reference must not free the host device under the cache.
 pub(super) fn default_device() -> Id {
     static DEFAULT: OnceLock<usize> = OnceLock::new();
     *DEFAULT.get_or_init(|| {
@@ -362,7 +545,9 @@ pub(super) fn default_device() -> Id {
             unsafe { host_release(default) };
             guest
         } else {
-            wrap_device(default) as usize
+            let guest = wrap_device(default);
+            objc::arc::make_immortal(guest);
+            guest as usize
         }
     }) as Id
 }
@@ -395,6 +580,24 @@ unsafe extern "C" fn device_max_buffer_length(receiver: Id, _sel: Sel) -> u64 {
         host_send_u64(
             object::body::<NativeDevice>(receiver).host,
             sel(c"maxBufferLength"),
+        )
+    }
+}
+unsafe extern "C" fn device_max_threadgroup_memory(receiver: Id, _sel: Sel) -> u64 {
+    let _pool = HostPool::new();
+    unsafe {
+        host_send_u64(
+            object::body::<NativeDevice>(receiver).host,
+            sel(c"maxThreadgroupMemoryLength"),
+        )
+    }
+}
+unsafe extern "C" fn device_removable(receiver: Id, _sel: Sel) -> bool {
+    let _pool = HostPool::new();
+    unsafe {
+        host_send_bool(
+            object::body::<NativeDevice>(receiver).host,
+            sel(c"isRemovable"),
         )
     }
 }
@@ -577,9 +780,8 @@ unsafe extern "C" fn new_command_buffer_with_descriptor(
         unsafe { std::mem::transmute(objc::msg::entry()) };
     let retained = unsafe { guest_bool(descriptor, objc::sel::get("retainedReferences")) };
     let errors = unsafe { guest_number(descriptor, objc::sel::get("errorOptions")) };
-    // MTLCommandBufferErrorOptionEncoderExecutionStatus is the sole public
-    // option bit. Never pass arbitrary guest values into host Metal.
-    if errors & !1 != 0 {
+    // The sole public option bit; never pass arbitrary guest bits to Metal.
+    if errors & !MTL_COMMAND_BUFFER_ERROR_OPTION_ENCODER_EXECUTION_STATUS != 0 {
         gpu::trace(
             "native Metal command buffer descriptor has unsupported errorOptions".to_string(),
         );
@@ -763,14 +965,8 @@ unsafe extern "C" fn command_dealloc(receiver: Id, _sel: Sel) {
 mod tests {
     use super::*;
 
-    /// Never install native CAMetalLayer dispatch while testing the default
-    /// Vulkan-backed Metal implementation in the same process.
     fn require_native_opt_in() -> bool {
-        if enabled() {
-            return true;
-        }
-        eprintln!("skipped: set ROSEMARY_METAL_BACKEND=native for host Metal tests");
-        false
+        run_native_test_here()
     }
 
     #[test]
@@ -3173,16 +3369,27 @@ mod tests {
         }
     }
 
-    #[test]
-    fn builtin_offscreen_render_draws_native_metal_triangle() {
-        if !require_native_opt_in() {
-            return;
-        }
-        crate::bootstrap();
-        let device = default_device();
-        let pool = objc::arc::pool_push();
-        let source = foundation::string::from_str(
-            "#include <metal_stdlib>\nusing namespace metal;\n\
+    const MTL_TEXTURE_USAGE_SHADER_READ: u64 = 1;
+    const MTL_TEXTURE_USAGE_RENDER_TARGET: u64 = 4;
+    const MTL_STORE_ACTION_STORE: u64 = 1;
+    const MTL_PRIMITIVE_TYPE_TRIANGLE: u64 = 3;
+    const MTL_COMMAND_BUFFER_STATUS_COMPLETED: u64 = 4;
+
+    /// A 16x16 RGBA8 render target cleared to opaque black each pass, a
+    /// vertex function whose one triangle covers it, and three indices.
+    struct OffscreenTarget {
+        device: Id,
+        queue: Id,
+        library: Id,
+        vertex: Id,
+        target: Id,
+        pass: Id,
+        indices: Id,
+    }
+
+    impl OffscreenTarget {
+        const SIDE: usize = 16;
+        const SHADERS: &str = "#include <metal_stdlib>\nusing namespace metal;\n\
              struct TriangleVertex { float4 position [[position]]; };\n\
              vertex TriangleVertex triangle_vertex(uint i [[vertex_id]]) {\n\
                float2 p[3] = {float2(-1,-1), float2(3,-1), float2(-1,3)};\n\
@@ -3192,265 +3399,293 @@ mod tests {
              fragment float4 sample_fragment(texture2d<float, access::sample> image [[texture(0)]],\n\
                                              sampler sampling [[sampler(0)]]) {\n\
                  return image.sample(sampling, float2(0.75, 0.25));\n\
-             }",
-        );
-        let vertex_name = foundation::string::from_str("triangle_vertex");
-        let fragment_name = foundation::string::from_str("triangle_fragment");
-        let sample_name = foundation::string::from_str("sample_fragment");
-        let send_id: unsafe extern "C" fn(Id, Sel) -> Id =
-            unsafe { std::mem::transmute(objc::msg::entry()) };
-        let send_id_arg: unsafe extern "C" fn(Id, Sel, Id) -> Id =
-            unsafe { std::mem::transmute(objc::msg::entry()) };
-        let send_library: unsafe extern "C" fn(Id, Sel, Id, Id, *mut Id) -> Id =
-            unsafe { std::mem::transmute(objc::msg::entry()) };
-        let send_pipeline: unsafe extern "C" fn(Id, Sel, Id, *mut Id) -> Id =
-            unsafe { std::mem::transmute(objc::msg::entry()) };
-        let send_void_id: unsafe extern "C" fn(Id, Sel, Id) =
-            unsafe { std::mem::transmute(objc::msg::entry()) };
-        let send_resource: unsafe extern "C" fn(Id, Sel, Id, u64) =
-            unsafe { std::mem::transmute(objc::msg::entry()) };
-        let draw_indexed: unsafe extern "C" fn(Id, Sel, u64, u64, u64, Id, u64, u64) =
-            unsafe { std::mem::transmute(objc::msg::entry()) };
-        let draw_indexed_base: unsafe extern "C" fn(
-            Id,
-            Sel,
-            u64,
-            u64,
-            u64,
-            Id,
-            u64,
-            u64,
-            i64,
-            u64,
-        ) = unsafe { std::mem::transmute(objc::msg::entry()) };
-        let send_u64: unsafe extern "C" fn(Id, Sel, u64) =
-            unsafe { std::mem::transmute(objc::msg::entry()) };
-        let send_scissor: unsafe extern "C" fn(Id, Sel, encoder::ScissorRect) =
-            unsafe { std::mem::transmute(objc::msg::entry()) };
-        let send_void: unsafe extern "C" fn(Id, Sel) =
-            unsafe { std::mem::transmute(objc::msg::entry()) };
+             }";
 
-        let mut error = std::ptr::null_mut();
-        let library = unsafe {
-            send_library(
+        fn new() -> Self {
+            crate::bootstrap();
+            let device = default_device();
+            let source = foundation::string::from_str(Self::SHADERS);
+            let mut error = std::ptr::null_mut();
+            let library = unsafe {
+                compute::new_library_with_source(
+                    device,
+                    std::ptr::null(),
+                    source,
+                    std::ptr::null_mut(),
+                    &mut error,
+                )
+            };
+            objc::arc::release(source);
+            assert!(
+                !library.is_null(),
+                "native shader library failed: {error:p}"
+            );
+            let vertex = Self::function(library, "triangle_vertex");
+            let descriptor = object::make(
+                c"MTLTextureDescriptor",
+                resource::TextureDescriptor {
+                    texture_type: MTL_TEXTURE_TYPE_2D,
+                    pixel_format: MTL_PIXEL_FORMAT_RGBA8_UNORM,
+                    width: Self::SIDE as u64,
+                    height: Self::SIDE as u64,
+                    depth: 1,
+                    mipmap_level_count: 1,
+                    sample_count: 1,
+                    array_length: 1,
+                    storage_mode: 0,
+                    usage: MTL_TEXTURE_USAGE_RENDER_TARGET,
+                },
+            );
+            let target = unsafe { texture::new_texture(device, std::ptr::null(), descriptor) };
+            objc::arc::release(descriptor);
+            assert!(!target.is_null());
+            let mut pass = encoder::RenderPassDescriptor::default();
+            pass.colors[0].texture = objc::arc::retain(target);
+            pass.colors[0].load_action = MTL_LOAD_ACTION_CLEAR;
+            pass.colors[0].store_action = MTL_STORE_ACTION_STORE;
+            let indices = [0u16, 1, 2];
+            let indices = unsafe {
+                new_buffer_with_bytes(
+                    device,
+                    std::ptr::null(),
+                    indices.as_ptr().cast(),
+                    std::mem::size_of_val(&indices),
+                    0,
+                )
+            };
+            assert!(!indices.is_null());
+            Self {
                 device,
-                objc::sel::get("newLibraryWithSource:options:error:"),
-                source,
-                std::ptr::null_mut(),
-                &mut error,
-            )
-        };
-        assert!(
-            !library.is_null(),
-            "native render shader library failed: {error:p}"
-        );
-        let vertex =
-            unsafe { send_id_arg(library, objc::sel::get("newFunctionWithName:"), vertex_name) };
-        let fragment = unsafe {
-            send_id_arg(
+                queue: unsafe { new_queue(device, std::ptr::null()) },
                 library,
-                objc::sel::get("newFunctionWithName:"),
-                fragment_name,
-            )
-        };
-        assert!(!vertex.is_null() && !fragment.is_null());
-        let sampled_fragment =
-            unsafe { send_id_arg(library, objc::sel::get("newFunctionWithName:"), sample_name) };
-        assert!(!sampled_fragment.is_null());
-        let mut colors = [pipeline::ColorAttachment::fresh(); pipeline::COLOR_ATTACHMENTS];
-        colors[0].pixel_format = MTL_PIXEL_FORMAT_RGBA8_UNORM;
-        let pipeline_desc = object::make(
-            c"MTLRenderPipelineDescriptor",
-            pipeline::RenderPipelineDescriptor {
-                vertex_function: objc::arc::retain(vertex),
-                fragment_function: objc::arc::retain(fragment),
-                vertex_descriptor: std::ptr::null_mut(),
-                colors,
-                depth_format: 0,
-                stencil_format: 0,
-                sample_count: 1,
-                alpha_to_coverage: false,
-                alpha_to_one: false,
-                rasterization: true,
-                input_topology: 0,
-                color_objects: std::ptr::null_mut(),
-            },
-        );
-        let pipeline = unsafe {
-            send_pipeline(
-                device,
-                objc::sel::get("newRenderPipelineStateWithDescriptor:error:"),
-                pipeline_desc,
-                &mut error,
-            )
-        };
-        assert!(
-            !pipeline.is_null(),
-            "native render pipeline failed: {error:p}"
-        );
-        const SIDE: usize = 16;
-        let texture_desc = object::make(
-            c"MTLTextureDescriptor",
-            resource::TextureDescriptor {
-                texture_type: MTL_TEXTURE_TYPE_2D,
-                pixel_format: MTL_PIXEL_FORMAT_RGBA8_UNORM,
-                width: SIDE as u64,
-                height: SIDE as u64,
-                depth: 1,
-                mipmap_level_count: 1,
-                sample_count: 1,
-                array_length: 1,
-                storage_mode: 0,
-                usage: 4,
-            },
-        );
-        let target = unsafe {
-            send_id_arg(
-                device,
-                objc::sel::get("newTextureWithDescriptor:"),
-                texture_desc,
-            )
-        };
-        assert!(!target.is_null());
-        let mut pass_body = encoder::RenderPassDescriptor::default();
-        pass_body.colors[0].texture = objc::arc::retain(target);
-        pass_body.colors[0].load_action = 2;
-        pass_body.colors[0].store_action = 1;
-        let pass = object::make(c"MTLRenderPassDescriptor", pass_body);
+                vertex,
+                target,
+                pass: object::make(c"MTLRenderPassDescriptor", pass),
+                indices,
+            }
+        }
 
-        let indices = [0u16, 1, 2];
-        let index_buffer = unsafe {
-            new_buffer_with_bytes(
-                device,
-                std::ptr::null(),
-                indices.as_ptr().cast(),
-                std::mem::size_of_val(&indices),
-                0,
-            )
-        };
-        assert!(!index_buffer.is_null());
-        let queue = unsafe { send_id(device, objc::sel::get("newCommandQueue")) };
-        let command = unsafe { send_id(queue, objc::sel::get("commandBuffer")) };
-        let depth_desc = object::make(
-            c"MTLDepthStencilDescriptor",
-            resource::DepthStencilState::default(),
-        );
-        let depth_state = unsafe {
-            send_id_arg(
-                device,
-                objc::sel::get("newDepthStencilStateWithDescriptor:"),
-                depth_desc,
-            )
-        };
-        assert!(!depth_state.is_null());
-        let render = unsafe {
-            send_id_arg(
-                command,
-                objc::sel::get("renderCommandEncoderWithDescriptor:"),
-                pass,
-            )
-        };
-        assert!(!render.is_null());
-        assert!(object::is_kind(
-            render,
-            c"RosemaryNativeMTLRenderCommandEncoder"
-        ));
-        unsafe {
-            send_void_id(render, objc::sel::get("setRenderPipelineState:"), pipeline);
-            send_void_id(render, objc::sel::get("setDepthStencilState:"), depth_state);
-            send_u64(render, objc::sel::get("setStencilReferenceValue:"), 0);
-            send_u64(render, objc::sel::get("setCullMode:"), 0);
-            send_u64(render, objc::sel::get("setFrontFacingWinding:"), 1);
-            send_u64(render, objc::sel::get("setTriangleFillMode:"), 0);
-            // An empty scissor is a valid Metal state and must suppress every
-            // fragment, not leave an earlier scissor enabled. DOORS uses this.
-            for empty in [
-                encoder::ScissorRect {
-                    x: 5,
-                    y: 6,
-                    width: 8,
-                    height: 0,
+        fn function(library: Id, name: &str) -> Id {
+            let name = foundation::string::from_str(name);
+            let new_function: unsafe extern "C" fn(Id, Sel, Id) -> Id =
+                unsafe { std::mem::transmute(objc::msg::entry()) };
+            let function =
+                unsafe { new_function(library, objc::sel::get("newFunctionWithName:"), name) };
+            objc::arc::release(name);
+            assert!(!function.is_null());
+            function
+        }
+
+        /// A pipeline drawing this target's triangle with `fragment`.
+        fn pipeline(&self, fragment: &str) -> Id {
+            let fragment = Self::function(self.library, fragment);
+            let mut colors = [pipeline::ColorAttachment::fresh(); pipeline::COLOR_ATTACHMENTS];
+            colors[0].pixel_format = MTL_PIXEL_FORMAT_RGBA8_UNORM;
+            let descriptor = object::make(
+                c"MTLRenderPipelineDescriptor",
+                pipeline::RenderPipelineDescriptor {
+                    vertex_function: objc::arc::retain(self.vertex),
+                    fragment_function: fragment,
+                    vertex_descriptor: std::ptr::null_mut(),
+                    colors,
+                    depth_format: 0,
+                    stencil_format: 0,
+                    sample_count: 1,
+                    alpha_to_coverage: false,
+                    alpha_to_one: false,
+                    rasterization: true,
+                    input_topology: 0,
+                    color_objects: std::ptr::null_mut(),
                 },
-                encoder::ScissorRect {
-                    x: 5,
-                    y: 6,
-                    width: 0,
-                    height: 8,
-                },
-            ] {
-                send_scissor(render, objc::sel::get("setScissorRect:"), empty);
-                draw_indexed(
+            );
+            let mut error = std::ptr::null_mut();
+            let pipeline = unsafe {
+                render::new_render_pipeline(self.device, std::ptr::null(), descriptor, &mut error)
+            };
+            objc::arc::release(descriptor);
+            assert!(
+                !pipeline.is_null(),
+                "native render pipeline failed: {error:p}"
+            );
+            pipeline
+        }
+
+        /// Run one pass: `encode` gets the render encoder with `pipeline` set.
+        fn render(&self, pipeline: Id, encode: impl FnOnce(Id)) {
+            let send_id: unsafe extern "C" fn(Id, Sel) -> Id =
+                unsafe { std::mem::transmute(objc::msg::entry()) };
+            let send_id_arg: unsafe extern "C" fn(Id, Sel, Id) -> Id =
+                unsafe { std::mem::transmute(objc::msg::entry()) };
+            let send_void: unsafe extern "C" fn(Id, Sel) =
+                unsafe { std::mem::transmute(objc::msg::entry()) };
+            let pool = objc::arc::pool_push();
+            let command = unsafe { send_id(self.queue, objc::sel::get("commandBuffer")) };
+            let render = unsafe {
+                send_id_arg(
+                    command,
+                    objc::sel::get("renderCommandEncoderWithDescriptor:"),
+                    self.pass,
+                )
+            };
+            assert!(object::is_kind(
+                render,
+                c"RosemaryNativeMTLRenderCommandEncoder"
+            ));
+            unsafe {
+                send_id_arg(render, objc::sel::get("setRenderPipelineState:"), pipeline);
+            }
+            encode(render);
+            unsafe {
+                send_void(render, objc::sel::get("endEncoding"));
+                send_void(command, objc::sel::get("commit"));
+                send_void(command, objc::sel::get("waitUntilCompleted"));
+            }
+            assert_eq!(
+                unsafe { command_status(command, std::ptr::null()) },
+                MTL_COMMAND_BUFFER_STATUS_COMPLETED
+            );
+            objc::arc::pool_pop(pool);
+        }
+
+        fn draw_indexed(&self, render: Id) {
+            let draw: unsafe extern "C" fn(Id, Sel, u64, u64, u64, Id, u64, u64) =
+                unsafe { std::mem::transmute(objc::msg::entry()) };
+            unsafe {
+                draw(
                     render,
                     objc::sel::get(
                         "drawIndexedPrimitives:indexCount:indexType:indexBuffer:indexBufferOffset:instanceCount:",
                     ),
+                    MTL_PRIMITIVE_TYPE_TRIANGLE,
                     3,
-                    3,
-                    0,
-                    index_buffer,
+                    MTL_INDEX_TYPE_UINT16,
+                    self.indices,
                     0,
                     1,
+                )
+            };
+        }
+
+        fn pixel(&self, x: usize, y: usize) -> [u8; 4] {
+            let mut pixels = [0_u8; Self::SIDE * Self::SIDE * 4];
+            let region = texture::Region {
+                origin: [0, 0, 0],
+                size: [Self::SIDE as u64, Self::SIDE as u64, 1],
+            };
+            unsafe {
+                texture::get_bytes(
+                    self.target,
+                    std::ptr::null(),
+                    pixels.as_mut_ptr().cast(),
+                    (Self::SIDE * 4) as u64,
+                    region,
+                    0,
                 );
             }
-            // A following nonempty scissor must still work: the lower right
-            // is colored, while the corner outside it remains clear.
-            send_scissor(
-                render,
-                objc::sel::get("setScissorRect:"),
-                encoder::ScissorRect {
-                    x: 8,
-                    y: 8,
-                    width: 8,
-                    height: 8,
-                },
-            );
-            draw_indexed(
-                render,
-                objc::sel::get(
-                    "drawIndexedPrimitives:indexCount:indexType:indexBuffer:indexBufferOffset:instanceCount:",
-                ),
-                3,
-                3,
-                0,
-                index_buffer,
-                0,
-                1,
-            );
-            send_void(render, objc::sel::get("endEncoding"));
-            send_void(command, objc::sel::get("commit"));
-            send_void(command, objc::sel::get("waitUntilCompleted"));
+            let at = (y * Self::SIDE + x) * 4;
+            pixels[at..at + 4].try_into().unwrap()
         }
-        let region = texture::Region {
-            origin: [0, 0, 0],
-            size: [SIDE as u64, SIDE as u64, 1],
-        };
-        let mut pixels = [0_u8; SIDE * SIDE * 4];
-        unsafe {
-            texture::get_bytes(
-                target,
-                std::ptr::null(),
-                pixels.as_mut_ptr().cast(),
-                (SIDE * 4) as u64,
-                region,
-                0,
-            );
+
+        fn center(&self) -> [u8; 4] {
+            self.pixel(Self::SIDE / 2, Self::SIDE / 2)
         }
-        let center = (SIDE / 2 * SIDE + SIDE / 2) * 4;
-        let pixel = &pixels[center..center + 4];
+    }
+
+    impl Drop for OffscreenTarget {
+        fn drop(&mut self) {
+            for object in [
+                self.indices,
+                self.pass,
+                self.target,
+                self.vertex,
+                self.library,
+                self.queue,
+            ] {
+                objc::arc::release(object);
+            }
+        }
+    }
+
+    fn assert_triangle_color(pixel: [u8; 4]) {
         assert!(pixel[0] > 200, "red {pixel:?}");
         assert!((20..70).contains(&pixel[1]), "green {pixel:?}");
         assert!((35..95).contains(&pixel[2]), "blue {pixel:?}");
         assert_eq!(pixel[3], 255);
-        assert!(
-            pixels[..3].iter().all(|value| *value < 5),
-            "empty scissors must not render outside the subsequent clipped region: {:?}",
-            &pixels[..4]
-        );
+    }
 
-        // Second render pass: bind an actual guest texture and sampler to a
-        // fragment shader. This is also the ObjC selector path Roblox's
-        // Metal renderer uses to source color from texture resources.
-        let source_desc = object::make(
+    #[test]
+    fn empty_scissor_discards_fragments_and_a_later_scissor_still_clips() {
+        if !require_native_opt_in() {
+            return;
+        }
+        let target = OffscreenTarget::new();
+        let pipeline = target.pipeline("triangle_fragment");
+        let send_scissor: unsafe extern "C" fn(Id, Sel, encoder::ScissorRect) =
+            unsafe { std::mem::transmute(objc::msg::entry()) };
+        target.render(pipeline, |render| {
+            // Zero-area scissors are valid and must discard every fragment.
+            for (width, height) in [(8, 0), (0, 8)] {
+                let empty = encoder::ScissorRect {
+                    x: 5,
+                    y: 6,
+                    width,
+                    height,
+                };
+                unsafe { send_scissor(render, objc::sel::get("setScissorRect:"), empty) };
+                target.draw_indexed(render);
+            }
+            let lower_right = encoder::ScissorRect {
+                x: 8,
+                y: 8,
+                width: 8,
+                height: 8,
+            };
+            unsafe { send_scissor(render, objc::sel::get("setScissorRect:"), lower_right) };
+            target.draw_indexed(render);
+        });
+        assert_triangle_color(target.center());
+        assert_eq!(
+            target.pixel(0, 0),
+            [0, 0, 0, 255],
+            "empty scissors must not render outside the later clipped region"
+        );
+        objc::arc::release(pipeline);
+    }
+
+    #[test]
+    fn indexed_draw_without_instance_count_reaches_the_gpu() {
+        if !require_native_opt_in() {
+            return;
+        }
+        let target = OffscreenTarget::new();
+        let pipeline = target.pipeline("triangle_fragment");
+        let draw: unsafe extern "C" fn(Id, Sel, u64, u64, u64, Id, u64) =
+            unsafe { std::mem::transmute(objc::msg::entry()) };
+        target.render(pipeline, |render| unsafe {
+            draw(
+                render,
+                objc::sel::get(
+                    "drawIndexedPrimitives:indexCount:indexType:indexBuffer:indexBufferOffset:",
+                ),
+                MTL_PRIMITIVE_TYPE_TRIANGLE,
+                3,
+                MTL_INDEX_TYPE_UINT16,
+                target.indices,
+                0,
+            )
+        });
+        assert_triangle_color(target.center());
+        objc::arc::release(pipeline);
+    }
+
+    #[test]
+    fn fragment_texture_and_sampler_bindings_reach_the_gpu() {
+        if !require_native_opt_in() {
+            return;
+        }
+        let target = OffscreenTarget::new();
+        let pipeline = target.pipeline("sample_fragment");
+        let descriptor = object::make(
             c"MTLTextureDescriptor",
             resource::TextureDescriptor {
                 texture_type: MTL_TEXTURE_TYPE_2D,
@@ -3462,161 +3697,479 @@ mod tests {
                 sample_count: 1,
                 array_length: 1,
                 storage_mode: 0,
-                usage: 1,
+                usage: MTL_TEXTURE_USAGE_SHADER_READ,
             },
         );
-        let source_tex = unsafe { texture::new_texture(device, std::ptr::null(), source_desc) };
-        assert!(!source_tex.is_null());
-        let colors = [
+        let image = unsafe { texture::new_texture(target.device, std::ptr::null(), descriptor) };
+        assert!(!image.is_null());
+        // Red, green / blue, white: the shader samples the green texel.
+        let texels = [
             255_u8, 0, 0, 255, 0, 255, 0, 255, 0, 0, 255, 255, 255, 255, 255, 255,
         ];
         unsafe {
             texture::replace_region(
-                source_tex,
+                image,
                 std::ptr::null(),
                 texture::Region {
                     origin: [0, 0, 0],
                     size: [2, 2, 1],
                 },
                 0,
-                colors.as_ptr().cast(),
+                texels.as_ptr().cast(),
                 8,
             );
         }
-        let sampler_desc = object::make(
+        let sampler_descriptor = object::make(
             c"MTLSamplerDescriptor",
             resource::SamplerDescriptor::default(),
         );
-        let sampler = unsafe { sampler::new_sampler(device, std::ptr::null(), sampler_desc) };
+        let sampler =
+            unsafe { sampler::new_sampler(target.device, std::ptr::null(), sampler_descriptor) };
         assert!(!sampler.is_null());
-        let mut color_formats = [pipeline::ColorAttachment::fresh(); pipeline::COLOR_ATTACHMENTS];
-        color_formats[0].pixel_format = MTL_PIXEL_FORMAT_RGBA8_UNORM;
-        let sampled_desc = object::make(
-            c"MTLRenderPipelineDescriptor",
-            pipeline::RenderPipelineDescriptor {
-                vertex_function: objc::arc::retain(vertex),
-                fragment_function: objc::arc::retain(sampled_fragment),
-                vertex_descriptor: std::ptr::null_mut(),
-                colors: color_formats,
-                depth_format: 0,
-                stencil_format: 0,
-                sample_count: 1,
-                alpha_to_coverage: false,
-                alpha_to_one: false,
-                rasterization: true,
-                input_topology: 0,
-                color_objects: std::ptr::null_mut(),
-            },
-        );
-        let sampled_pipeline = unsafe {
-            send_pipeline(
-                device,
-                objc::sel::get("newRenderPipelineStateWithDescriptor:error:"),
-                sampled_desc,
-                &mut error,
-            )
-        };
-        assert!(
-            !sampled_pipeline.is_null(),
-            "native sampled render pipeline failed: {error:p}"
-        );
-        let second_command = unsafe { send_id(queue, objc::sel::get("commandBuffer")) };
-        let second_render = unsafe {
-            send_id_arg(
-                second_command,
-                objc::sel::get("renderCommandEncoderWithDescriptor:"),
-                pass,
-            )
-        };
-        assert!(!second_render.is_null());
-        unsafe {
-            send_void_id(
-                second_render,
-                objc::sel::get("setRenderPipelineState:"),
-                sampled_pipeline,
-            );
-            send_resource(
-                second_render,
-                objc::sel::get("setFragmentTexture:atIndex:"),
-                source_tex,
-                0,
-            );
-            send_resource(
-                second_render,
+        let bind: unsafe extern "C" fn(Id, Sel, Id, u64) =
+            unsafe { std::mem::transmute(objc::msg::entry()) };
+        let draw_base: unsafe extern "C" fn(Id, Sel, u64, u64, u64, Id, u64, u64, i64, u64) =
+            unsafe { std::mem::transmute(objc::msg::entry()) };
+        target.render(pipeline, |render| unsafe {
+            bind(render, objc::sel::get("setFragmentTexture:atIndex:"), image, 0);
+            bind(
+                render,
                 objc::sel::get("setFragmentSamplerState:atIndex:"),
                 sampler,
                 0,
             );
-            draw_indexed_base(
-                second_render,
+            draw_base(
+                render,
                 objc::sel::get(
                     "drawIndexedPrimitives:indexCount:indexType:indexBuffer:indexBufferOffset:instanceCount:baseVertex:baseInstance:",
                 ),
+                MTL_PRIMITIVE_TYPE_TRIANGLE,
                 3,
-                3,
-                0,
-                index_buffer,
+                MTL_INDEX_TYPE_UINT16,
+                target.indices,
                 0,
                 1,
                 0,
                 0,
             );
-            send_void(second_render, objc::sel::get("endEncoding"));
-            send_void(second_command, objc::sel::get("commit"));
-            send_void(second_command, objc::sel::get("waitUntilCompleted"));
-        }
+        });
         assert_eq!(
-            unsafe { command_status(second_command, std::ptr::null()) },
-            4
-        );
-        let mut sampled_pixels = [0_u8; SIDE * SIDE * 4];
-        unsafe {
-            texture::get_bytes(
-                target,
-                std::ptr::null(),
-                sampled_pixels.as_mut_ptr().cast(),
-                (SIDE * 4) as u64,
-                region,
-                0,
-            );
-        }
-        assert_eq!(
-            &sampled_pixels[center..center + 4],
-            &[0, 255, 0, 255],
+            target.center(),
+            [0, 255, 0, 255],
             "native fragment texture and sampler binding did not reach the GPU",
         );
+        for object in [sampler, sampler_descriptor, image, descriptor, pipeline] {
+            objc::arc::release(object);
+        }
+    }
+
+    /// A guest global block whose invoke is `void (^)(id<MTLCommandBuffer>)`.
+    #[repr(C)]
+    struct HandlerBlock {
+        isa: *const c_void,
+        flags: i32,
+        reserved: i32,
+        invoke: unsafe extern "C" fn(Id, Id),
+        descriptor: *const [u64; 2],
+    }
+
+    fn handler_block(invoke: unsafe extern "C" fn(Id, Id)) -> HandlerBlock {
+        const BLOCK_IS_GLOBAL: i32 = 1 << 28;
+        static DESCRIPTOR: [u64; 2] = [0, std::mem::size_of::<HandlerBlock>() as u64];
+        let class = objc::class::lookup(c"__NSGlobalBlock__").expect("guest global block class");
+        HandlerBlock {
+            isa: objc::class::ptr(class).cast(),
+            flags: BLOCK_IS_GLOBAL,
+            reserved: 0,
+            invoke,
+            descriptor: &DESCRIPTOR,
+        }
+    }
+
+    #[test]
+    fn native_objects_answer_label_and_debug_group_selectors() {
+        if !require_native_opt_in() {
+            return;
+        }
+        crate::bootstrap();
+        assert!(!default_device().is_null());
+        for name in LABELED_CLASSES {
+            let class = objc::class::lookup(name).expect("native class registered");
+            for selector in ["label", "setLabel:"] {
+                assert!(
+                    class.method(objc::sel::get(selector)).is_some(),
+                    "{name:?} lacks -{selector}"
+                );
+            }
+        }
+        let pool = objc::arc::pool_push();
+        let send_id: unsafe extern "C" fn(Id, Sel) -> Id =
+            unsafe { std::mem::transmute(objc::msg::entry()) };
+        let send_id_arg: unsafe extern "C" fn(Id, Sel, Id) -> Id =
+            unsafe { std::mem::transmute(objc::msg::entry()) };
+        let send_void: unsafe extern "C" fn(Id, Sel) =
+            unsafe { std::mem::transmute(objc::msg::entry()) };
+        let label = foundation::string::from_str("labelled");
+        let device = default_device();
+        let queue = unsafe { new_queue(device, std::ptr::null()) };
+        let command = unsafe { send_id(queue, objc::sel::get("commandBuffer")) };
+        for object in [device, queue, command] {
+            unsafe { send_id_arg(object, objc::sel::get("setLabel:"), label) };
+        }
+        unsafe {
+            send_id_arg(command, objc::sel::get("pushDebugGroup:"), label);
+            send_void(command, objc::sel::get("popDebugGroup"));
+        }
+        for factory in ["blitCommandEncoder", "computeCommandEncoder"] {
+            let encoder = unsafe { send_id(command, objc::sel::get(factory)) };
+            assert!(!encoder.is_null());
+            unsafe {
+                send_id_arg(encoder, objc::sel::get("setLabel:"), label);
+                send_id_arg(encoder, objc::sel::get("pushDebugGroup:"), label);
+                send_id_arg(encoder, objc::sel::get("insertDebugSignpost:"), label);
+                send_void(encoder, objc::sel::get("popDebugGroup"));
+                send_void(encoder, objc::sel::get("endEncoding"));
+            }
+        }
         objc::arc::pool_pop(pool);
-        for object in [
-            index_buffer,
-            depth_state,
-            depth_desc,
-            source_tex,
-            source_desc,
-            sampler,
-            sampler_desc,
-            sampled_pipeline,
-            sampled_desc,
-            sampled_fragment,
-            sample_name,
+        objc::arc::release(label);
+        objc::arc::release(queue);
+    }
+
+    #[test]
+    fn released_create_rule_device_stays_cached_and_usable() {
+        if !require_native_opt_in() {
+            return;
+        }
+        crate::bootstrap();
+        // Create-rule callers own what they get and release it.
+        let first = unsafe { crate::MTLCreateSystemDefaultDevice() };
+        assert!(!first.is_null());
+        objc::arc::release(first);
+        objc::arc::release(first);
+        let second = unsafe { crate::MTLCreateSystemDefaultDevice() };
+        assert_eq!(first, second);
+        assert!(!unsafe { device_name(second, std::ptr::null()) }.is_null());
+        let queue = unsafe { new_queue(second, std::ptr::null()) };
+        assert!(!queue.is_null());
+        objc::arc::release(queue);
+    }
+
+    #[test]
+    fn sampler_rejects_an_address_mode_past_clamp_to_border_color() {
+        if !require_native_opt_in() {
+            return;
+        }
+        crate::bootstrap();
+        let device = default_device();
+        for (mode, accepted) in [
+            (MTL_SAMPLER_ADDRESS_MODE_CLAMP_TO_BORDER_COLOR, true),
+            (MTL_SAMPLER_ADDRESS_MODE_CLAMP_TO_BORDER_COLOR + 1, false),
         ] {
+            let mut values = resource::SamplerDescriptor::default();
+            values.address = [mode; 3];
+            let descriptor = object::make(c"MTLSamplerDescriptor", values);
+            let state = unsafe { sampler::new_sampler(device, std::ptr::null(), descriptor) };
+            assert_eq!(!state.is_null(), accepted, "address mode {mode}");
+            objc::arc::release(state);
+            objc::arc::release(descriptor);
+        }
+    }
+
+    #[test]
+    fn buffer_texture_blits_use_metal_linear_layout_for_any_format_and_mip() {
+        if !require_native_opt_in() {
+            return;
+        }
+        const MTL_PIXEL_FORMAT_R32_FLOAT: u64 = 55;
+        const ROW_STRIDE: u64 = 256;
+        const TEXEL: usize = size_of::<f32>();
+        crate::bootstrap();
+        let device = default_device();
+        let pool = objc::arc::pool_push();
+        let descriptor = object::make(
+            c"MTLTextureDescriptor",
+            resource::TextureDescriptor {
+                texture_type: MTL_TEXTURE_TYPE_2D,
+                pixel_format: MTL_PIXEL_FORMAT_R32_FLOAT,
+                width: 4,
+                height: 4,
+                depth: 1,
+                mipmap_level_count: 2,
+                sample_count: 1,
+                array_length: 1,
+                storage_mode: 0,
+                usage: MTL_TEXTURE_USAGE_SHADER_READ,
+            },
+        );
+        let image = unsafe { texture::new_texture(device, std::ptr::null(), descriptor) };
+        assert!(!image.is_null());
+        // Padded rows, and buffers holding only the last row's own bytes:
+        // Metal needs (rows - 1) * bytesPerRow + width * texelSize.
+        let mip = encoder::MtlSize {
+            width: 2,
+            height: 2,
+            depth: 1,
+        };
+        let tight = ROW_STRIDE as usize + 2 * TEXEL;
+        let upload = unsafe { new_buffer(device, std::ptr::null(), tight, 0) };
+        let readback = unsafe { new_buffer(device, std::ptr::null(), tight, 0) };
+        let values = [1.5_f32, -2.0, 3.25, 4.0];
+        let source = unsafe { buffer_contents(upload, std::ptr::null()) } as *mut u8;
+        unsafe {
+            std::ptr::copy_nonoverlapping(values[..2].as_ptr().cast(), source, 2 * TEXEL);
+            std::ptr::copy_nonoverlapping(
+                values[2..].as_ptr().cast(),
+                source.add(ROW_STRIDE as usize),
+                2 * TEXEL,
+            );
+        }
+        let origin = encoder::MtlOrigin { x: 0, y: 0, z: 0 };
+        let upload_copy: unsafe extern "C" fn(
+            Id,
+            Sel,
+            Id,
+            u64,
+            u64,
+            u64,
+            encoder::MtlSize,
+            Id,
+            u64,
+            u64,
+            encoder::MtlOrigin,
+        ) = unsafe { std::mem::transmute(objc::msg::entry()) };
+        let readback_copy: unsafe extern "C" fn(
+            Id,
+            Sel,
+            Id,
+            u64,
+            u64,
+            encoder::MtlOrigin,
+            encoder::MtlSize,
+            Id,
+            u64,
+            u64,
+            u64,
+        ) = unsafe { std::mem::transmute(objc::msg::entry()) };
+        let send_id: unsafe extern "C" fn(Id, Sel) -> Id =
+            unsafe { std::mem::transmute(objc::msg::entry()) };
+        let send_void: unsafe extern "C" fn(Id, Sel) =
+            unsafe { std::mem::transmute(objc::msg::entry()) };
+        let queue = unsafe { new_queue(device, std::ptr::null()) };
+        let command = unsafe { send_id(queue, objc::sel::get("commandBuffer")) };
+        let blit = unsafe { send_id(command, objc::sel::get("blitCommandEncoder")) };
+        unsafe {
+            upload_copy(
+                blit,
+                objc::sel::get(
+                    "copyFromBuffer:sourceOffset:sourceBytesPerRow:sourceBytesPerImage:sourceSize:toTexture:destinationSlice:destinationLevel:destinationOrigin:",
+                ),
+                upload,
+                0,
+                ROW_STRIDE,
+                0,
+                mip,
+                image,
+                0,
+                1,
+                origin,
+            );
+            readback_copy(
+                blit,
+                objc::sel::get(
+                    "copyFromTexture:sourceSlice:sourceLevel:sourceOrigin:sourceSize:toBuffer:destinationOffset:destinationBytesPerRow:destinationBytesPerImage:",
+                ),
+                image,
+                0,
+                1,
+                origin,
+                mip,
+                readback,
+                0,
+                ROW_STRIDE,
+                0,
+            );
+            send_void(blit, objc::sel::get("endEncoding"));
+            send_void(command, objc::sel::get("commit"));
+            send_void(command, objc::sel::get("waitUntilCompleted"));
+        }
+        let read = unsafe { buffer_contents(readback, std::ptr::null()) } as *const f32;
+        let row = |start: usize| unsafe { std::slice::from_raw_parts(read.byte_add(start), 2) };
+        assert_eq!(row(0), &values[..2]);
+        assert_eq!(row(ROW_STRIDE as usize), &values[2..]);
+        objc::arc::pool_pop(pool);
+        for object in [queue, readback, upload, image, descriptor] {
             objc::arc::release(object);
         }
-        for object in [
-            pass,
-            target,
-            texture_desc,
-            pipeline,
-            pipeline_desc,
-            fragment,
-            vertex,
-            library,
-            fragment_name,
-            vertex_name,
-            source,
-            queue,
-        ] {
+    }
+
+    #[test]
+    fn dispatch_threads_runs_a_grid_that_is_not_a_threadgroup_multiple() {
+        if !require_native_opt_in() {
+            return;
+        }
+        crate::bootstrap();
+        let device = default_device();
+        let pool = objc::arc::pool_push();
+        let source = foundation::string::from_str(
+            "#include <metal_stdlib>\nusing namespace metal;\n\
+             kernel void ids(device uint *out [[buffer(0)]], uint id [[thread_position_in_grid]]) {\n\
+                 out[id] = id + 1;\n\
+             }",
+        );
+        let mut error = std::ptr::null_mut();
+        let library = unsafe {
+            compute::new_library_with_source(
+                device,
+                std::ptr::null(),
+                source,
+                std::ptr::null_mut(),
+                &mut error,
+            )
+        };
+        assert!(!library.is_null(), "kernel library failed: {error:p}");
+        let send_id: unsafe extern "C" fn(Id, Sel) -> Id =
+            unsafe { std::mem::transmute(objc::msg::entry()) };
+        let send_id_arg: unsafe extern "C" fn(Id, Sel, Id) -> Id =
+            unsafe { std::mem::transmute(objc::msg::entry()) };
+        let send_pipeline: unsafe extern "C" fn(Id, Sel, Id, *mut Id) -> Id =
+            unsafe { std::mem::transmute(objc::msg::entry()) };
+        let send_buffer: unsafe extern "C" fn(Id, Sel, Id, u64, u64) =
+            unsafe { std::mem::transmute(objc::msg::entry()) };
+        let send_dispatch: unsafe extern "C" fn(Id, Sel, encoder::MtlSize, encoder::MtlSize) =
+            unsafe { std::mem::transmute(objc::msg::entry()) };
+        let send_void: unsafe extern "C" fn(Id, Sel) =
+            unsafe { std::mem::transmute(objc::msg::entry()) };
+        let name = foundation::string::from_str("ids");
+        let function =
+            unsafe { send_id_arg(library, objc::sel::get("newFunctionWithName:"), name) };
+        let pipeline = unsafe {
+            send_pipeline(
+                device,
+                objc::sel::get("newComputePipelineStateWithFunction:error:"),
+                function,
+                &mut error,
+            )
+        };
+        assert!(!pipeline.is_null(), "compute pipeline failed: {error:p}");
+        const SLOTS: usize = 8;
+        let output = unsafe { new_buffer(device, std::ptr::null(), SLOTS * size_of::<u32>(), 0) };
+        let queue = unsafe { new_queue(device, std::ptr::null()) };
+        let command = unsafe { send_id(queue, objc::sel::get("commandBuffer")) };
+        let compute = unsafe { send_id(command, objc::sel::get("computeCommandEncoder")) };
+        unsafe {
+            send_id_arg(
+                compute,
+                objc::sel::get("setComputePipelineState:"),
+                pipeline,
+            );
+            send_buffer(
+                compute,
+                objc::sel::get("setBuffer:offset:atIndex:"),
+                output,
+                0,
+                0,
+            );
+            send_dispatch(
+                compute,
+                objc::sel::get("dispatchThreads:threadsPerThreadgroup:"),
+                encoder::MtlSize {
+                    width: 5,
+                    height: 1,
+                    depth: 1,
+                },
+                encoder::MtlSize {
+                    width: 4,
+                    height: 1,
+                    depth: 1,
+                },
+            );
+            send_void(compute, objc::sel::get("endEncoding"));
+            send_void(command, objc::sel::get("commit"));
+            send_void(command, objc::sel::get("waitUntilCompleted"));
+        }
+        let written = unsafe {
+            std::slice::from_raw_parts(
+                buffer_contents(output, std::ptr::null()) as *const u32,
+                SLOTS,
+            )
+        };
+        assert_eq!(written, &[1, 2, 3, 4, 5, 0, 0, 0]);
+        objc::arc::pool_pop(pool);
+        for object in [queue, output, pipeline, function, name, library, source] {
             objc::arc::release(object);
         }
+    }
+
+    #[test]
+    fn nested_wait_delivers_earlier_queued_handlers_first() {
+        if !require_native_opt_in() {
+            return;
+        }
+        crate::bootstrap();
+        use std::sync::Mutex;
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        use std::time::{Duration, Instant};
+        static ORDER: Mutex<Vec<&str>> = Mutex::new(Vec::new());
+        static WAITER_ENTERED: AtomicBool = AtomicBool::new(false);
+        static OTHERS_COMMITTED: AtomicBool = AtomicBool::new(false);
+        static LATER: AtomicUsize = AtomicUsize::new(0);
+        unsafe extern "C" fn waiter(_block: Id, _command: Id) {
+            WAITER_ENTERED.store(true, Ordering::SeqCst);
+            while !OTHERS_COMMITTED.load(Ordering::SeqCst) {
+                std::thread::yield_now();
+            }
+            unsafe { command_wait(LATER.load(Ordering::SeqCst) as Id, std::ptr::null()) };
+            ORDER.lock().unwrap().push("waiter");
+        }
+        unsafe extern "C" fn earlier(_block: Id, _command: Id) {
+            ORDER.lock().unwrap().push("earlier");
+        }
+        unsafe extern "C" fn later(_block: Id, _command: Id) {
+            ORDER.lock().unwrap().push("later");
+        }
+        let blocks = [
+            handler_block(waiter),
+            handler_block(earlier),
+            handler_block(later),
+        ];
+        let pool = objc::arc::pool_push();
+        let queue = unsafe { new_queue(default_device(), std::ptr::null()) };
+        let commands = blocks.each_ref().map(|block| {
+            let command = unsafe { new_command_buffer(queue, std::ptr::null()) };
+            let add: unsafe extern "C" fn(Id, Sel, Id) =
+                unsafe { std::mem::transmute(objc::msg::entry()) };
+            unsafe {
+                add(
+                    command,
+                    objc::sel::get("addCompletedHandler:"),
+                    (&raw const *block).cast_mut().cast(),
+                )
+            };
+            command
+        });
+        LATER.store(commands[2] as usize, Ordering::SeqCst);
+        unsafe { command_commit(commands[0], std::ptr::null()) };
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while !WAITER_ENTERED.load(Ordering::SeqCst) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(
+            WAITER_ENTERED.load(Ordering::SeqCst),
+            "waiting handler did not start"
+        );
+        // Commit order on one queue is completion order, so the earlier
+        // buffer's handler is queued ahead of the one the waiter waits for.
+        unsafe {
+            command_commit(commands[1], std::ptr::null());
+            command_commit(commands[2], std::ptr::null());
+        }
+        OTHERS_COMMITTED.store(true, Ordering::SeqCst);
+        unsafe { command_wait(commands[0], std::ptr::null()) };
+        unsafe { command_wait(commands[1], std::ptr::null()) };
+        assert_eq!(*ORDER.lock().unwrap(), ["earlier", "later", "waiter"]);
+        objc::arc::pool_pop(pool);
+        objc::arc::release(queue);
     }
 
     #[test]

@@ -220,8 +220,7 @@ mod tests {
 
     #[test]
     fn last_host_block_disposal_on_foreign_thread_retires_guest_references_on_worker() {
-        if !super::super::enabled() {
-            eprintln!("skipped: set ROSEMARY_METAL_BACKEND=native");
+        if !super::super::run_native_test_here() {
             return;
         }
         crate::bootstrap();

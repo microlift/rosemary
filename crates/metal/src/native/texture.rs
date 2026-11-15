@@ -7,6 +7,30 @@ pub(super) struct Region {
     pub size: [u64; 3],
 }
 
+/// The largest 1D/2D/cube extent of every supported Apple Metal device.
+const MAX_TEXTURE_DIMENSION: u64 = 16384;
+/// The largest extent of a 3D texture on the same devices.
+const MAX_3D_TEXTURE_DIMENSION: u64 = 2048;
+const CUBE_FACES: u64 = 6;
+
+/// The slices a texture of `kind` addresses: its array layers, times six
+/// faces for a cube. None for a texture buffer, which has no slices.
+pub(super) fn slice_count(host: HostId, kind: u64) -> Option<u64> {
+    let layers = || unsafe { host_send_u64(host, sel(c"arrayLength")) };
+    match kind {
+        MTL_TEXTURE_TYPE_1D
+        | MTL_TEXTURE_TYPE_2D
+        | MTL_TEXTURE_TYPE_2D_MULTISAMPLE
+        | MTL_TEXTURE_TYPE_3D => Some(1),
+        MTL_TEXTURE_TYPE_1D_ARRAY
+        | MTL_TEXTURE_TYPE_2D_ARRAY
+        | MTL_TEXTURE_TYPE_2D_MULTISAMPLE_ARRAY => Some(layers()),
+        MTL_TEXTURE_TYPE_CUBE => Some(CUBE_FACES),
+        MTL_TEXTURE_TYPE_CUBE_ARRAY => Some(layers().saturating_mul(CUBE_FACES)),
+        _ => None,
+    }
+}
+
 pub(super) struct NativeTexture {
     pub(super) host: HostId,
     pub(super) device: Id,
@@ -61,13 +85,12 @@ pub(super) unsafe extern "C" fn new_texture(receiver: Id, _sel: Sel, descriptor:
     let described = *unsafe { object::body::<resource::TextureDescriptor>(descriptor) };
     // Apple's Metal framework raises an uncaught Objective-C assertion for
     // impossible texture dimensions instead of returning nil. Validate
-    // guest-controlled sizes before constructing a host descriptor. The 2D
-    // 16K and 3D 2K ceilings are the limits of the supported Apple Metal
-    // devices; additional device-specific restrictions remain the host's job.
-    let maximum_dimension = if described.texture_type == 7 {
-        2048
+    // guest-controlled sizes before constructing a host descriptor; further
+    // device-specific restrictions remain the host's job.
+    let maximum_dimension = if described.texture_type == MTL_TEXTURE_TYPE_3D {
+        MAX_3D_TEXTURE_DIMENSION
     } else {
-        16384
+        MAX_TEXTURE_DIMENSION
     };
     if described.width == 0
         || described.height == 0

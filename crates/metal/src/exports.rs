@@ -46,6 +46,9 @@ pub(super) fn devices() -> &'static [usize] {
                 ) as usize
             })
             .filter(|device| *device != 0)
+            // Cached and handed out at +0, so a guest that releases what
+            // `MTLCreateSystemDefaultDevice` returned must not free it.
+            .inspect(|device| objc::arc::make_immortal(*device as Id))
             .collect()
     })
 }

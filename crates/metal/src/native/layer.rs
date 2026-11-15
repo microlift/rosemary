@@ -5,7 +5,7 @@
 
 use super::*;
 use std::collections::HashMap;
-use std::sync::{Arc, Condvar, LazyLock, Mutex};
+use std::sync::{Arc, LazyLock, Mutex};
 
 struct HostLayer(usize);
 
@@ -39,14 +39,10 @@ struct Entry {
 static HOST_LAYERS: LazyLock<Mutex<HashMap<usize, Entry>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
-/// A request retains the guest CALayer until the video thread consumes it.
-/// The registry itself MUST NOT retain the guest, or dealloc would never run.
-struct AttachRequest {
-    guest: usize,
-    ready: Arc<(Mutex<bool>, Condvar)>,
-}
-static ATTACH_REQUESTS: LazyLock<Mutex<Vec<AttachRequest>>> =
-    LazyLock::new(|| Mutex::new(Vec::new()));
+/// Guest CALayers awaiting the video thread, each retained until it is
+/// serviced. The registry itself MUST NOT retain the guest, or dealloc would
+/// never run.
+static ATTACH_REQUESTS: LazyLock<Mutex<Vec<usize>>> = LazyLock::new(|| Mutex::new(Vec::new()));
 static PENDING_DESTROYS: LazyLock<Mutex<Vec<Attachment>>> =
     LazyLock::new(|| Mutex::new(Vec::new()));
 
@@ -109,91 +105,52 @@ fn view_changed(layer: Id) {
     {
         return;
     }
-    request_attachment(layer, false);
+    request_attachment(layer);
 }
 
-/// Reconcile the actual SDL window before acquiring a presentable drawable.
-/// Calls from the video thread attach immediately; render-thread callers wait
-/// until the video pump has consumed their request, never returning a drawable
-/// from the temporary offscreen layer for an on-screen NSView.
-fn request_attachment(layer: Id, wait: bool) -> bool {
-    let view = unsafe { appkit::layer::view_of(layer) };
-    let attached = || {
-        HOST_LAYERS
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .get(&(layer as usize))
-            .is_some_and(|entry| entry.attached.is_some())
-    };
-    // Recalculate after a video-thread wake: a newly created NSWindow may
-    // not have a published presentation snapshot at the first request.
-    let destination = || {
-        unsafe { appkit::view::presentation_frame(view) }
-            .filter(|frame| frame.covers_window())
-            .and_then(|frame| {
-                sdl3::video::live_window_id(frame.window).map(|id| (frame.window as usize, id))
-            })
-    };
-    let offscreen = || {
-        if view.is_null() {
-            return true;
-        }
-        if destination().is_some() {
-            return false;
-        }
-        // A windowed layer awaiting its presentation snapshot is not offscreen.
-        let window = guest_object(view, "window");
-        window.is_null() || unsafe { appkit::window::sdl_window(window) }.is_null()
-    };
-    // Detached layers support offscreen drawables, but only after retiring
-    // any SDL view they previously occupied.
-    if wait && offscreen() && !attached() {
-        return true;
-    }
-    // Stable frame fast path: never enqueue or block a render thread after
-    // the correct SDL MetalView was installed. Both IDs come from safe caches.
-    let matching = || {
-        HOST_LAYERS
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .get(&(layer as usize))
-            .and_then(|entry| entry.attached)
-            .is_some_and(|attached| {
-                destination().is_some_and(|(window, id)| {
-                    attached.window == window && attached.window_id == id
-                })
-            })
-    };
-    if wait && matching() {
-        return true;
-    }
+/// Reconcile the layer's SDL attachment. The video thread attaches at once.
+/// Any other thread queues the layer for the next pump and keeps drawing to
+/// the host layer it has, as a CAMetalLayer not yet on screen still vends
+/// drawables; blocking instead could stall a video thread waiting on it.
+fn request_attachment(layer: Id) {
     if sdl3::video::is_video_thread() {
         attach_one(layer);
-        return !wait || matching() || (offscreen() && !attached());
+        return;
     }
-    let ready = {
-        let mut requests = ATTACH_REQUESTS.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(previous) = requests.iter().find(|item| item.guest == layer as usize) {
-            Arc::clone(&previous.ready)
-        } else {
-            let token = Arc::new((Mutex::new(false), Condvar::new()));
-            objc::arc::retain(layer);
-            requests.push(AttachRequest {
-                guest: layer as usize,
-                ready: Arc::clone(&token),
-            });
-            token
+    let view = unsafe { appkit::layer::view_of(layer) };
+    let attached = HOST_LAYERS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&(layer as usize))
+        .and_then(|entry| entry.attached);
+    let destination = (!view.is_null())
+        .then(|| unsafe { appkit::view::presentation_frame(view) })
+        .flatten()
+        .filter(|frame| frame.covers_window())
+        .and_then(|frame| {
+            sdl3::video::live_window_id(frame.window).map(|id| (frame.window as usize, id))
+        });
+    let settled = match (attached, destination) {
+        (Some(attached), Some((window, id))) => {
+            attached.window == window && attached.window_id == id
         }
+        // Detached and nowhere to go. A windowed view still awaiting its
+        // presentation snapshot is not settled: the pump publishes it.
+        (None, None) => {
+            view.is_null() || {
+                let window = crate::present::send_id(view, "window");
+                window.is_null() || unsafe { appkit::window::sdl_window(window) }.is_null()
+            }
+        }
+        _ => false,
     };
-    if !wait {
-        return true;
+    if settled {
+        return;
     }
-    let (lock, signal) = &*ready;
-    let done = lock.lock().unwrap_or_else(|e| e.into_inner());
-    let (done, _) = signal
-        .wait_timeout_while(done, std::time::Duration::from_secs(2), |done| !*done)
-        .unwrap_or_else(|e| e.into_inner());
-    *done && (matching() || (offscreen() && !attached()))
+    let mut requests = ATTACH_REQUESTS.lock().unwrap_or_else(|e| e.into_inner());
+    if !requests.contains(&(layer as usize)) {
+        requests.push(objc::arc::retain(layer) as usize);
+    }
 }
 
 fn destroy_views(views: Vec<Attachment>) {
@@ -212,13 +169,9 @@ fn service_video_thread() {
     let deferred = std::mem::take(&mut *PENDING_DESTROYS.lock().unwrap_or_else(|e| e.into_inner()));
     destroy_views(deferred);
     let pending = std::mem::take(&mut *ATTACH_REQUESTS.lock().unwrap_or_else(|e| e.into_inner()));
-    for request in pending {
-        let guest = request.guest as Id;
-        attach_one(guest);
-        let (lock, signal) = &*request.ready;
-        *lock.lock().unwrap_or_else(|e| e.into_inner()) = true;
-        signal.notify_all();
-        objc::arc::release(guest);
+    for guest in pending {
+        attach_one(guest as Id);
+        objc::arc::release(guest as Id);
     }
 }
 
@@ -339,30 +292,6 @@ fn forget_window(window: sdl3::Window) {
     destroy_views(retired);
 }
 
-fn guest_object(guest: Id, name: &str) -> Id {
-    let call: unsafe extern "C" fn(Id, Sel) -> Id =
-        unsafe { std::mem::transmute(objc::msg::entry()) };
-    unsafe { call(guest, objc::sel::get(name)) }
-}
-
-fn guest_u64(guest: Id, name: &str) -> u64 {
-    let call: unsafe extern "C" fn(Id, Sel) -> u64 =
-        unsafe { std::mem::transmute(objc::msg::entry()) };
-    unsafe { call(guest, objc::sel::get(name)) }
-}
-
-fn guest_u8(guest: Id, name: &str) -> u8 {
-    let call: unsafe extern "C" fn(Id, Sel) -> u8 =
-        unsafe { std::mem::transmute(objc::msg::entry()) };
-    unsafe { call(guest, objc::sel::get(name)) }
-}
-
-fn guest_size(guest: Id, name: &str) -> foundation::geometry::NSSize {
-    let call: unsafe extern "C" fn(Id, Sel) -> foundation::geometry::NSSize =
-        unsafe { std::mem::transmute(objc::msg::entry()) };
-    unsafe { call(guest, objc::sel::get(name)) }
-}
-
 fn cocoa_layer_class() -> HostId {
     static QUARTZ_CORE: OnceLock<usize> = OnceLock::new();
     let handle = *QUARTZ_CORE.get_or_init(|| unsafe {
@@ -420,7 +349,7 @@ fn host_layer(guest_layer: Id) -> Option<Arc<HostLayer>> {
 }
 
 fn guest_device(layer: Id) -> Id {
-    let supplied = guest_object(layer, "device");
+    let supplied = crate::present::send_id(layer, "device");
     if supplied.is_null() {
         default_device()
     } else if object::is_kind(supplied, c"RosemaryNativeMTLDevice") {
@@ -434,7 +363,8 @@ fn guest_device(layer: Id) -> Id {
 fn configure_host(layer: HostId, guest: Id, device: Id) {
     let _pool = HostPool::new();
     let host_device = unsafe { object::body::<NativeDevice>(device) }.host;
-    let mut size = guest_size(guest, "drawableSize");
+    let (width, height) = crate::present::send_size(guest, "drawableSize");
+    let mut size = foundation::geometry::NSSize { width, height };
     if size.width <= 0.0 || size.height <= 0.0 {
         let view = unsafe { appkit::layer::view_of(guest) };
         if let Some(frame) = unsafe { appkit::view::presentation_frame(view) } {
@@ -452,18 +382,18 @@ fn configure_host(layer: HostId, guest: Id, device: Id) {
         host_send_void_u64(
             layer,
             sel(c"setPixelFormat:"),
-            guest_u64(guest, "pixelFormat"),
+            crate::present::send_u64(guest, "pixelFormat"),
         );
         host_send_void_size(layer, sel(c"setDrawableSize:"), size);
         host_send_void_bool(
             layer,
             sel(c"setFramebufferOnly:"),
-            guest_u8(guest, "framebufferOnly") != 0,
+            crate::present::send_bool(guest, "framebufferOnly"),
         );
         host_send_void_bool(
             layer,
             sel(c"setDisplaySyncEnabled:"),
-            guest_u8(guest, "displaySyncEnabled") != 0,
+            crate::present::send_bool(guest, "displaySyncEnabled"),
         );
     }
 }
@@ -476,17 +406,12 @@ pub(super) unsafe extern "C" fn next_drawable(receiver: Id, _sel: Sel) -> Id {
     if device.is_null() {
         return std::ptr::null_mut();
     }
-    // Ensure a placeholder host layer exists before attachment, but never
-    // use it for an on-screen first frame once SDL replaces it.
+    // The placeholder host layer must exist before attachment can replace
+    // it, so that a video-thread first frame already draws to SDL's layer.
     let Some(_) = host_layer(receiver) else {
         return std::ptr::null_mut();
     };
-    if !request_attachment(receiver, true) {
-        gpu::trace_once(
-            "native Metal first drawable could not wait for SDL attachment".to_string(),
-        );
-        return std::ptr::null_mut();
-    }
+    request_attachment(receiver);
     let Some(layer) = host_layer(receiver) else {
         return std::ptr::null_mut();
     };
@@ -575,8 +500,7 @@ mod migration_tests {
 
     #[test]
     fn live_guest_metal_view_rebinds_from_first_live_window_to_second() {
-        if !super::super::enabled() {
-            eprintln!("skipped: set ROSEMARY_METAL_BACKEND=native");
+        if !super::super::run_native_test_here() {
             return;
         }
         if !sdl3::isolated::run_here() {
@@ -666,7 +590,7 @@ mod migration_tests {
         assert_eq!(before.window, sdl_a);
         assert!(before.covers_window());
         let original = host_layer(metal).unwrap();
-        request_attachment(metal, true);
+        request_attachment(metal);
         service_video_thread();
         let first = HOST_LAYERS
             .lock()
@@ -684,7 +608,7 @@ mod migration_tests {
         let moved = unsafe { appkit::view::presentation_frame(view) }.unwrap();
         assert_eq!(moved.window, sdl_b);
         assert!(moved.covers_window());
-        request_attachment(metal, true);
+        request_attachment(metal);
         service_video_thread();
         let second = HOST_LAYERS
             .lock()
@@ -741,48 +665,38 @@ mod migration_tests {
         assert!(sdl3::video::live_window_id(sdl_b).is_some());
 
         // The first frame may originate on the guest's render thread while
-        // SDL presentation is owned by the main video thread. Verify that
-        // this call waits for the pump's attachment, rather than handing out
-        // a drawable from a temporary offscreen host CAMetalLayer.
+        // SDL presentation is owned by the video thread, which may itself be
+        // waiting on that render thread. Without any pump, the render thread
+        // must still get a drawable, and the next pump attaches the layer.
         let worker_layer =
             unsafe { send_id(objc::class::ptr(layer_class) as Id, objc::sel::get("layer")) };
         assert!(!worker_layer.is_null());
         unsafe { send_void_id(view, objc::sel::get("setLayer:"), worker_layer) };
         let key = worker_layer as usize;
-        let (tx, rx) = std::sync::mpsc::channel();
         let worker = std::thread::spawn(move || {
             let _darwin = darwin::tls::DarwinThread::enter();
             let pool = objc::arc::pool_push();
             let initial = unsafe { next_drawable(key as Id, std::ptr::null()) };
             let owned = objc::arc::retain(initial) as usize;
             objc::arc::pool_pop(pool);
-            tx.send(owned).unwrap();
+            owned
         });
-        let mut first_from_worker = None;
-        for _ in 0..200 {
-            appkit::event::pump(std::ptr::null_mut());
-            if let Ok(initial) = rx.try_recv() {
-                first_from_worker = Some(initial);
-                break;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(10));
-        }
-        assert!(
-            first_from_worker.is_some(),
-            "first drawable did not reach the renderer after SDL video-pump attachment"
-        );
-        worker.join().unwrap();
-        let initial = first_from_worker.unwrap() as Id;
+        let initial = worker.join().unwrap() as Id;
         assert!(
             !initial.is_null(),
             "render-thread first drawable returned nil"
         );
+        assert!(
+            ATTACH_REQUESTS.lock().unwrap().contains(&key),
+            "render-thread drawable did not queue its SDL attachment"
+        );
+        service_video_thread();
         let worker_attachment = HOST_LAYERS
             .lock()
             .unwrap()
             .get(&key)
             .and_then(|entry| entry.attached)
-            .expect("first render-thread drawable must have an SDL view");
+            .expect("the next pump must attach the render-thread layer");
         assert_eq!(worker_attachment.window, sdl_b as usize);
         assert_eq!(worker_attachment.window_id, sdl3::video::window_id(sdl_b));
         objc::arc::release(initial);
@@ -798,8 +712,7 @@ mod migration_tests {
 
     #[test]
     fn removing_a_retained_metal_view_frees_its_sdl_slot_for_replacement() {
-        if !super::super::enabled() {
-            eprintln!("skipped: set ROSEMARY_METAL_BACKEND=native");
+        if !super::super::run_native_test_here() {
             return;
         }
         if !sdl3::isolated::run_here() {

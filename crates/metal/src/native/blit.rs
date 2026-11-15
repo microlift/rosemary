@@ -14,6 +14,9 @@ pub(super) fn install() {
             c"v120@0:8@16Q24Q32{MTLOrigin=QQQ}40{MTLSize=QQQ}64@88Q96Q104Q112";
         "copyFromTexture:sourceSlice:sourceLevel:sourceOrigin:sourceSize:toTexture:destinationSlice:destinationLevel:destinationOrigin:" => copy_texture_to_texture,
             c"v144@0:8@16Q24Q32{MTLOrigin=QQQ}40{MTLSize=QQQ}64@88Q96Q104{MTLOrigin=QQQ}112";
+        "copyFromBuffer:sourceOffset:sourceBytesPerRow:sourceBytesPerImage:sourceSize:toTexture:destinationSlice:destinationLevel:destinationOrigin:" => copy_buffer_to_texture,
+            c"v120@0:8@16Q24Q32Q40{MTLSize=QQQ}48@72Q80Q88{MTLOrigin=QQQ}96";
+        "synchronizeResource:" => synchronize_resource, c"v24@0:8@16";
         "generateMipmapsForTexture:" => generate_mipmaps, c"v24@0:8@16";
         "endEncoding" => end_encoding, c"v16@0:8";
         "device" => device, c"@16@0:8";
@@ -100,9 +103,178 @@ unsafe extern "C" fn copy_buffer_to_buffer(
     }
 }
 
-/// Read back a 2D, single-sample RGBA8/BGRA8 render target to a shared
-/// buffer. The narrow format and extent restrictions prevent forwarding an
-/// unvalidated guest region into Apple's GPU driver.
+/// Copy between a texture region and linear buffer memory, the shared body
+/// of both buffer/texture blits. Every guest value is validated first: Apple
+/// Metal raises an Objective-C exception, which cannot unwind into the guest,
+/// for a region or buffer range it cannot copy.
+struct LinearCopy {
+    texture: Id,
+    slice: u64,
+    level: u64,
+    origin: encoder::MtlOrigin,
+    size: encoder::MtlSize,
+    buffer: Id,
+    offset: u64,
+    bytes_per_row: u64,
+    bytes_per_image: u64,
+}
+
+impl LinearCopy {
+    /// The host texture and buffer, if the copy is one Metal performs.
+    fn validate(&self, blit: &NativeBlitEncoder) -> Option<(HostId, HostId)> {
+        if !object::is_kind(self.texture, c"RosemaryNativeMTLTexture")
+            || !object::is_kind(self.buffer, c"RosemaryNativeMTLBuffer")
+        {
+            gpu::trace("native buffer/texture blit requires native texture and buffer".to_string());
+            return None;
+        }
+        let texture = unsafe { object::body::<texture::NativeTexture>(self.texture) };
+        let buffer = unsafe { object::body::<NativeBuffer>(self.buffer) };
+        let device = unsafe { command_device(blit.command, std::ptr::null()) };
+        if texture.device != device || buffer.device != device {
+            gpu::trace(
+                "native buffer/texture blit resources must belong to encoder device".to_string(),
+            );
+            return None;
+        }
+        let query = |host: HostId, selector: &CStr| unsafe { host_send_u64(host, sel(selector)) };
+        let pixel_format = query(texture.host, c"pixelFormat");
+        let kind = query(texture.host, c"textureType");
+        let layout = linear_layout(
+            pixel_format,
+            self.size,
+            self.bytes_per_row,
+            self.bytes_per_image,
+        );
+        let in_texture = layout.is_some_and(|layout| {
+            region_in_texture(
+                texture.host,
+                kind,
+                self.slice,
+                self.level,
+                self.origin,
+                self.size,
+                layout.block,
+            )
+        });
+        let in_buffer = layout.is_some_and(|layout| {
+            self.offset % layout.block_bytes == 0
+                && self
+                    .offset
+                    .checked_add(layout.bytes)
+                    .is_some_and(|end| end <= query(buffer.host, c"length"))
+        });
+        if query(texture.host, c"sampleCount") != 1 || !in_texture || !in_buffer {
+            gpu::trace_once(format!(
+                "native buffer/texture blit rejected: format={pixel_format} type={kind} \
+                 level={} slice={} origin=({},{},{}) size={}x{}x{} offset={} \
+                 bytesPerRow={} bytesPerImage={}",
+                self.level,
+                self.slice,
+                self.origin.x,
+                self.origin.y,
+                self.origin.z,
+                self.size.width,
+                self.size.height,
+                self.size.depth,
+                self.offset,
+                self.bytes_per_row,
+                self.bytes_per_image,
+            ));
+            return None;
+        }
+        Some((texture.host, buffer.host))
+    }
+}
+
+/// How a buffer lays out `size` texels of a format: whole compression blocks
+/// per row, `bytes_per_row` apart, and images `bytes_per_image` apart.
+#[derive(Clone, Copy)]
+struct LinearLayout {
+    block: (u64, u64),
+    block_bytes: u64,
+    /// The bytes the copy touches, from its first block to its last.
+    bytes: u64,
+}
+
+fn linear_layout(
+    pixel_format: u64,
+    size: encoder::MtlSize,
+    bytes_per_row: u64,
+    bytes_per_image: u64,
+) -> Option<LinearLayout> {
+    let format = gpu::pixel_format(pixel_format);
+    // A packed depth/stencil texture copies one aspect at a time, which only
+    // the `options:` variants can name.
+    if matches!(
+        format,
+        ash::vk::Format::UNDEFINED
+            | ash::vk::Format::D24_UNORM_S8_UINT
+            | ash::vk::Format::D32_SFLOAT_S8_UINT
+    ) || size.width == 0
+        || size.height == 0
+        || size.depth == 0
+    {
+        return None;
+    }
+    let (block_width, block_height) = gpu::block_extent(format);
+    let block = (u64::from(block_width), u64::from(block_height));
+    let block_bytes = u64::from(gpu::texel_size(format));
+    let row_bytes = size.width.div_ceil(block.0).checked_mul(block_bytes)?;
+    let rows = size.height.div_ceil(block.1);
+    let image_bytes = (rows - 1)
+        .checked_mul(bytes_per_row)?
+        .checked_add(row_bytes)?;
+    if bytes_per_row < row_bytes {
+        return None;
+    }
+    // Metal reads bytesPerImage only when the copy spans several images.
+    let bytes = if size.depth == 1 {
+        image_bytes
+    } else {
+        if bytes_per_image < rows.checked_mul(bytes_per_row)? {
+            return None;
+        }
+        (size.depth - 1)
+            .checked_mul(bytes_per_image)?
+            .checked_add(image_bytes)?
+    };
+    Some(LinearLayout {
+        block,
+        block_bytes,
+        bytes,
+    })
+}
+
+/// Whether `origin`/`size` at `slice` and `level` lies inside the texture,
+/// counting the whole compression blocks a mip tail is copied in.
+fn region_in_texture(
+    host: HostId,
+    kind: u64,
+    slice: u64,
+    level: u64,
+    origin: encoder::MtlOrigin,
+    size: encoder::MtlSize,
+    block: (u64, u64),
+) -> bool {
+    let query = |selector: &CStr| unsafe { host_send_u64(host, sel(selector)) };
+    let Some(slices) = texture::slice_count(host, kind) else {
+        return false;
+    };
+    if level >= query(c"mipmapLevelCount") || slice >= slices {
+        return false;
+    }
+    let depth_ok = if kind == MTL_TEXTURE_TYPE_3D {
+        within_mip_axis(query(c"depth"), level, 1, origin.z, size.depth)
+    } else {
+        origin.z == 0 && size.depth == 1
+    };
+    depth_ok
+        && within_mip_axis(query(c"width"), level, block.0, origin.x, size.width)
+        && within_mip_axis(query(c"height"), level, block.1, origin.y, size.height)
+}
+
+#[allow(clippy::too_many_arguments)]
 unsafe extern "C" fn copy_texture_to_buffer(
     receiver: Id,
     _sel: Sel,
@@ -116,69 +288,95 @@ unsafe extern "C" fn copy_texture_to_buffer(
     bytes_per_row: u64,
     bytes_per_image: u64,
 ) {
-    if !object::is_kind(texture, c"RosemaryNativeMTLTexture")
-        || !object::is_kind(buffer, c"RosemaryNativeMTLBuffer")
-    {
-        gpu::trace("native texture readback requires native texture and buffer".to_string());
-        return;
-    }
-    let source = unsafe { object::body::<texture::NativeTexture>(texture) };
-    let destination = unsafe { object::body::<NativeBuffer>(buffer) };
     let blit = unsafe { object::body::<NativeBlitEncoder>(receiver) };
-    let command_device = unsafe { command_device(blit.command, std::ptr::null()) };
-    if source.device != command_device || destination.device != command_device {
-        gpu::trace("native texture readback resources must belong to encoder device".to_string());
-        return;
-    }
+    let copy = LinearCopy {
+        texture,
+        slice,
+        level,
+        origin,
+        size,
+        buffer,
+        offset,
+        bytes_per_row,
+        bytes_per_image,
+    };
     let _pool = HostPool::new();
-    let pixel_format = unsafe { host_send_u64(source.host, sel(c"pixelFormat")) };
-    let format_supported = matches!(
-        pixel_format,
-        MTL_PIXEL_FORMAT_RGBA8_UNORM | MTL_PIXEL_FORMAT_BGRA8_UNORM
-    );
-    let texture_width = unsafe { host_send_u64(source.host, sel(c"width")) };
-    let texture_height = unsafe { host_send_u64(source.host, sel(c"height")) };
-    let texture_type = unsafe { host_send_u64(source.host, sel(c"textureType")) };
-    let samples = unsafe { host_send_u64(source.host, sel(c"sampleCount")) };
-    // For a single 2D image Apple Metal ignores destinationBytesPerImage;
-    // the row-stride-based size still bounds the actual destination buffer.
-    let image_end = bytes_per_row.checked_mul(size.height);
-    let byte_end = offset.checked_add(image_end.unwrap_or(u64::MAX));
-    let dest_len = unsafe { host_send_u64(destination.host, sel(c"length")) };
-    let within_texture = origin
-        .x
-        .checked_add(size.width)
-        .is_some_and(|n| n <= texture_width)
-        && origin
-            .y
-            .checked_add(size.height)
-            .is_some_and(|n| n <= texture_height);
-    if !format_supported
-        || texture_type != MTL_TEXTURE_TYPE_2D
-        || samples != 1
-        || slice != 0
-        || level != 0
-        || origin.z != 0
-        || size.depth != 1
-        || size.width == 0
-        || size.height == 0
-        || !within_texture
-        || bytes_per_row < size.width.saturating_mul(4)
-        || !byte_end.is_some_and(|end| end <= dest_len)
-    {
-        gpu::trace(
-            "native texture readback unsupported region, format or buffer range".to_string(),
-        );
+    let Some((host_texture, host_buffer)) = copy.validate(blit) else {
         return;
-    }
+    };
     unsafe {
         host_send_void_texture_to_buffer(
             blit.host,
             sel(c"copyFromTexture:sourceSlice:sourceLevel:sourceOrigin:sourceSize:toBuffer:destinationOffset:destinationBytesPerRow:destinationBytesPerImage:"),
-            source.host, slice, level, origin, size, destination.host, offset,
+            host_texture, slice, level, origin, size, host_buffer, offset,
             bytes_per_row, bytes_per_image,
         );
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+unsafe extern "C" fn copy_buffer_to_texture(
+    receiver: Id,
+    _sel: Sel,
+    buffer: Id,
+    offset: u64,
+    bytes_per_row: u64,
+    bytes_per_image: u64,
+    size: encoder::MtlSize,
+    texture: Id,
+    slice: u64,
+    level: u64,
+    origin: encoder::MtlOrigin,
+) {
+    let blit = unsafe { object::body::<NativeBlitEncoder>(receiver) };
+    let copy = LinearCopy {
+        texture,
+        slice,
+        level,
+        origin,
+        size,
+        buffer,
+        offset,
+        bytes_per_row,
+        bytes_per_image,
+    };
+    let _pool = HostPool::new();
+    let Some((host_texture, host_buffer)) = copy.validate(blit) else {
+        return;
+    };
+    unsafe {
+        host_send_void_buffer_to_texture(
+            blit.host,
+            sel(c"copyFromBuffer:sourceOffset:sourceBytesPerRow:sourceBytesPerImage:sourceSize:toTexture:destinationSlice:destinationLevel:destinationOrigin:"),
+            host_buffer, offset, bytes_per_row, bytes_per_image, size,
+            host_texture, slice, level, origin,
+        );
+    }
+}
+
+/// Only a managed resource has a CPU copy to bring up to date; for any other
+/// storage mode there is nothing to synchronize.
+unsafe extern "C" fn synchronize_resource(receiver: Id, _sel: Sel, resource: Id) {
+    let host_resource = if object::is_kind(resource, c"RosemaryNativeMTLBuffer") {
+        let buffer = unsafe { object::body::<NativeBuffer>(resource) };
+        (buffer.device, buffer.host)
+    } else if object::is_kind(resource, c"RosemaryNativeMTLTexture") {
+        let texture = unsafe { object::body::<texture::NativeTexture>(resource) };
+        (texture.device, texture.host)
+    } else {
+        gpu::trace("native Metal can only synchronize a native resource".to_string());
+        return;
+    };
+    let blit = unsafe { object::body::<NativeBlitEncoder>(receiver) };
+    if host_resource.0 != unsafe { command_device(blit.command, std::ptr::null()) } {
+        gpu::trace("native synchronized resource belongs to another device".to_string());
+        return;
+    }
+    let _pool = HostPool::new();
+    if unsafe { host_send_u64(host_resource.1, sel(c"storageMode")) } != MTL_STORAGE_MODE_MANAGED {
+        return;
+    }
+    unsafe { host_send_void_id(blit.host, sel(c"synchronizeResource:"), host_resource.1) };
 }
 
 /// Metal copies block-compressed mip tails in whole compression blocks.
@@ -238,60 +436,31 @@ unsafe extern "C" fn copy_texture_to_texture(
     let to_format = query(to.host, c"pixelFormat");
     let from_type = query(from.host, c"textureType");
     let to_type = query(to.host, c"textureType");
-    let supported_type = |kind| matches!(kind, 2 | 3 | 5 | 6 | 7);
     let (block_width, block_height) = gpu::block_extent(gpu::pixel_format(from_format));
-    let (block_width, block_height) = (u64::from(block_width), u64::from(block_height));
-    let slice_count = |host: HostId, kind: u64| match kind {
-        2 | 7 => 1,
-        5 => 6,
-        6 => query(host, c"arrayLength").saturating_mul(6),
-        _ => query(host, c"arrayLength"),
-    };
-    let region_ok =
-        |host: HostId, kind: u64, slice: u64, level: u64, origin: encoder::MtlOrigin| {
-            let mipmaps = query(host, c"mipmapLevelCount");
-            if level >= mipmaps || slice >= slice_count(host, kind) {
-                return false;
-            }
-            (kind == 7 || (origin.z == 0 && size.depth == 1))
-                && within_mip_axis(
-                    query(host, c"width"),
-                    level,
-                    block_width,
-                    origin.x,
-                    size.width,
-                )
-                && within_mip_axis(
-                    query(host, c"height"),
-                    level,
-                    block_height,
-                    origin.y,
-                    size.height,
-                )
-                && (kind != 7
-                    || within_mip_axis(query(host, c"depth"), level, 1, origin.z, size.depth))
-        };
+    let block = (u64::from(block_width), u64::from(block_height));
     if from_format != to_format
-        || !supported_type(from_type)
-        || !supported_type(to_type)
         || query(from.host, c"sampleCount") != 1
         || query(to.host, c"sampleCount") != 1
         || size.width == 0
         || size.height == 0
         || size.depth == 0
-        || !region_ok(
+        || !region_in_texture(
             from.host,
             from_type,
             source_slice,
             source_level,
             source_origin,
+            size,
+            block,
         )
-        || !region_ok(
+        || !region_in_texture(
             to.host,
             to_type,
             destination_slice,
             destination_level,
             destination_origin,
+            size,
+            block,
         )
     {
         gpu::trace_once(format!(
@@ -351,6 +520,49 @@ unsafe extern "C" fn dealloc(receiver: Id, _sel: Sel) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const MTL_PIXEL_FORMAT_R32_FLOAT: u64 = 55;
+    const MTL_PIXEL_FORMAT_BC1_RGBA: u64 = 130;
+    const MTL_PIXEL_FORMAT_DEPTH32_FLOAT_STENCIL8: u64 = 260;
+
+    fn size(width: u64, height: u64, depth: u64) -> encoder::MtlSize {
+        encoder::MtlSize {
+            width,
+            height,
+            depth,
+        }
+    }
+
+    #[test]
+    fn linear_layout_spans_padded_rows_but_only_the_last_rows_own_bytes() {
+        let layout = |format, extent, row, image| {
+            linear_layout(format, extent, row, image).map(|layout| layout.bytes)
+        };
+        let rgba = MTL_PIXEL_FORMAT_RGBA8_UNORM;
+        assert_eq!(layout(rgba, size(2, 2, 1), 256, 0), Some(256 + 8));
+        assert_eq!(
+            layout(MTL_PIXEL_FORMAT_R32_FLOAT, size(3, 1, 1), 12, 0),
+            Some(12)
+        );
+        // One image ignores bytesPerImage; several need room for each row.
+        assert_eq!(layout(rgba, size(2, 2, 2), 256, 512), Some(512 + 256 + 8));
+        assert_eq!(layout(rgba, size(2, 2, 2), 256, 511), None);
+        // A row stride shorter than one row of texels.
+        assert_eq!(layout(rgba, size(2, 2, 1), 7, 0), None);
+        // 6x6 BC1 is 2x2 blocks of eight bytes.
+        assert_eq!(
+            layout(MTL_PIXEL_FORMAT_BC1_RGBA, size(6, 6, 1), 16, 0),
+            Some(32)
+        );
+        // A packed depth/stencil copy needs an aspect option; empty copies
+        // and unknown formats copy nothing Metal accepts.
+        assert_eq!(
+            layout(MTL_PIXEL_FORMAT_DEPTH32_FLOAT_STENCIL8, size(1, 1, 1), 8, 0),
+            None
+        );
+        assert_eq!(layout(rgba, size(0, 2, 1), 256, 0), None);
+        assert_eq!(layout(u64::MAX, size(1, 1, 1), 256, 0), None);
+    }
 
     #[test]
     fn compressed_mip_tail_uses_the_full_block_while_uncompressed_stays_logical() {
