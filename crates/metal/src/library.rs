@@ -25,14 +25,14 @@ pub(super) unsafe extern "C" fn new_default_library(receiver: Id, _sel: Sel) -> 
         report_library_error("Metal device has no Vulkan target profile");
         return std::ptr::null_mut();
     };
-    let (translated, air, entry_modules) = match translate_metallib(&bytes, target) {
+    let (translated, input) = match translate_metallib(&bytes, target) {
         Ok(result) => result,
         Err(error) => {
             report_library_error(error);
             return std::ptr::null_mut();
         }
     };
-    let library = retain_library(receiver, translated, Some(air), entry_modules, Some(target));
+    let library = retain_library(receiver, translated, input, Some(target));
     label_metallib(library, &bytes);
     library
 }
@@ -57,11 +57,11 @@ pub(super) unsafe extern "C" fn new_library_with_data(
     let Some(target) = (unsafe { target.as_ref() }) else {
         return fail_library(error, "Metal device has no Vulkan target profile");
     };
-    let (translated, air, entry_modules) = match translate_metallib(bytes, target) {
+    let (translated, input) = match translate_metallib(bytes, target) {
         Ok(result) => result,
         Err(failure) => return fail_library(error, &failure.to_string()),
     };
-    let library = retain_library(receiver, translated, Some(air), entry_modules, Some(target));
+    let library = retain_library(receiver, translated, input, Some(target));
     label_metallib(library, bytes);
     library
 }
@@ -87,15 +87,11 @@ fn label_metallib(library: Id, bytes: &[u8]) {
     }
 }
 
-fn translate_metallib<'a>(
-    bytes: &'a [u8],
+fn translate_metallib(
+    bytes: &[u8],
     target: &metal_translate::TargetProfile,
 ) -> Result<
-    (
-        metal_translate::TranslatedLibrary,
-        Vec<&'a [u8]>,
-        Vec<usize>,
-    ),
+    (metal_translate::TranslatedLibrary, Option<LibraryInput>),
     metal_translate::TranslateError,
 > {
     let modules = metal_translate::metallib_airs(bytes)?;
@@ -111,14 +107,18 @@ fn translate_metallib<'a>(
         function_constants.extend(translated.function_constants);
         rejected.extend(translated.rejected);
     }
+    // Only a library with function constants is ever translated again.
+    let input = (!function_constants.is_empty()).then(|| LibraryInput::Air {
+        modules: modules.into_iter().map(<[u8]>::to_vec).collect(),
+        entry_modules,
+    });
     Ok((
         metal_translate::TranslatedLibrary {
             entries,
             function_constants,
             rejected,
         },
-        modules,
-        entry_modules,
+        input,
     ))
 }
 
@@ -126,8 +126,7 @@ fn translate_metallib<'a>(
 pub(super) fn retain_library(
     device: Id,
     translated: metal_translate::TranslatedLibrary,
-    air: Option<Vec<&[u8]>>,
-    entry_modules: Vec<usize>,
+    input: Option<LibraryInput>,
     target: Option<&'static metal_translate::TargetProfile>,
 ) -> Id {
     if let Some(target) = target
@@ -142,13 +141,6 @@ pub(super) fn retain_library(
         ));
         return std::ptr::null_mut();
     }
-    // Only a library with function constants is ever translated again.
-    let input = air
-        .filter(|_| !translated.function_constants.is_empty())
-        .map(|modules| LibraryInput::Air {
-            modules: modules.into_iter().map(<[u8]>::to_vec).collect(),
-            entry_modules,
-        });
     let library = object::make(
         c"RosemaryMTLLibrary",
         Library {
@@ -247,18 +239,14 @@ pub(super) unsafe fn library_from_source(
         Ok(translated) => translated,
         Err(translation_error) => return fail_library(error, &translation_error.to_string()),
     };
-    let entry_modules = vec![0; translated.entries.len()];
-    let library = retain_library(receiver, translated, None, entry_modules, Some(target));
+    // Only a library with function constants is ever translated again.
+    let input = (!translated.function_constants.is_empty()).then(|| LibraryInput::Msl {
+        source: source.to_owned(),
+        macros: macros.to_vec(),
+    });
+    let library = retain_library(receiver, translated, input, Some(target));
     if library.is_null() {
         return fail_library(error, "could not allocate MTL source library");
-    }
-    // SAFETY: the new library has not been published to the caller.
-    let contents = unsafe { object::body::<Library>(library) };
-    if !contents.translated.function_constants.is_empty() {
-        contents.input = Some(LibraryInput::Msl {
-            source: source.to_owned(),
-            macros: macros.to_vec(),
-        });
     }
     if crate::profile::enabled() {
         let hash = fnv1a64(source.as_bytes());
