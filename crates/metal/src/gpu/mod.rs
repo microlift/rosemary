@@ -53,6 +53,9 @@ struct DeviceCapabilities {
     sampler_mirror_clamp_to_edge: bool,
     host_query_reset: bool,
     timeline_semaphores: bool,
+    /// Whether culling, winding, depth and stencil state may be set per draw,
+    /// as `VK_EXT_extended_dynamic_state` - core in Vulkan 1.3 - allows.
+    extended_dynamic_state: bool,
     dynamic_rendering: bool,
     dynamic_raster: bool,
 }
@@ -379,6 +382,10 @@ fn create_device(
         dynamic_rendering: capabilities.dynamic_rendering.into(),
         ..Default::default()
     };
+    let mut extended_dynamic_state = vk::PhysicalDeviceExtendedDynamicStateFeaturesEXT {
+        extended_dynamic_state: capabilities.extended_dynamic_state.into(),
+        ..Default::default()
+    };
     let mut dynamic_raster = vk::PhysicalDeviceExtendedDynamicState3FeaturesEXT {
         extended_dynamic_state3_polygon_mode: vk::TRUE,
         extended_dynamic_state3_depth_clamp_enable: vk::TRUE,
@@ -476,6 +483,9 @@ fn create_device(
     }
     if capabilities.swapchain_maintenance1 {
         create_info = create_info.push_next(&mut swapchain_maintenance1);
+    }
+    if capabilities.extended_dynamic_state {
+        create_info = create_info.push_next(&mut extended_dynamic_state);
     }
     if capabilities.dynamic_raster {
         create_info = create_info.push_next(&mut dynamic_raster);
@@ -780,8 +790,13 @@ impl Gpu {
         if host_import {
             enabled.push(ash::ext::external_memory_host::NAME.as_ptr());
         }
-        // Both are core in Vulkan 1.3, as are the other dynamic draw states;
-        // dynamic rendering alone has a feature bit.
+        // Dynamic rendering and extended dynamic state are core in Vulkan 1.3,
+        // but RADV gates its PS epilog cache on the EXT feature bit, which is
+        // not promoted even though the commands are. A 1.3 device drawing with
+        // the core commands therefore faults in RADV unless the extension and
+        // its feature are enabled. Enabling them is legal on 1.3 and makes the
+        // PS epilog path work; keep it behind the feature query so a driver
+        // which does not offer it falls back to pipeline-per-state.
         let dynamic_rendering = target.vulkan_version >= (1, 3) && {
             let mut v13 = vk::PhysicalDeviceVulkan13Features::default();
             let mut features = vk::PhysicalDeviceFeatures2::default().push_next(&mut v13);
@@ -793,6 +808,15 @@ impl Gpu {
         #[cfg(test)]
         let dynamic_rendering = dynamic_rendering
             && !TEST_WITHOUT_DYNAMIC_RENDERING.load(std::sync::atomic::Ordering::Acquire);
+        let extended_dynamic_state =
+            target.vulkan_version >= (1, 3) && has(ash::ext::extended_dynamic_state::NAME) && {
+                let mut extended = vk::PhysicalDeviceExtendedDynamicStateFeaturesEXT::default();
+                let mut features = vk::PhysicalDeviceFeatures2::default().push_next(&mut extended);
+                // SAFETY: the extension is advertised and both structures live
+                // across the query.
+                unsafe { instance.get_physical_device_features2(physical, &mut features) };
+                extended.extended_dynamic_state == vk::TRUE
+            };
         let dynamic_raster =
             target.vulkan_version >= (1, 3) && has(ash::ext::extended_dynamic_state3::NAME) && {
                 let mut state3 = vk::PhysicalDeviceExtendedDynamicState3FeaturesEXT::default();
@@ -806,6 +830,9 @@ impl Gpu {
         #[cfg(test)]
         let dynamic_raster = dynamic_raster
             && !TEST_WITHOUT_DYNAMIC_RENDERING.load(std::sync::atomic::Ordering::Acquire);
+        if extended_dynamic_state {
+            enabled.push(ash::ext::extended_dynamic_state::NAME.as_ptr());
+        }
         if dynamic_raster {
             enabled.push(ash::ext::extended_dynamic_state3::NAME.as_ptr());
         }
@@ -845,6 +872,7 @@ impl Gpu {
                 sampler_mirror_clamp_to_edge: mirror_clamp_feature,
                 host_query_reset,
                 timeline_semaphores,
+                extended_dynamic_state,
                 dynamic_rendering,
                 dynamic_raster,
             },
@@ -929,7 +957,7 @@ impl Gpu {
             occlusion_pools: Mutex::new(Vec::new()),
             occlusion_precise: features.occlusion_query_precise == vk::TRUE,
             alpha_to_one: features.alpha_to_one == vk::TRUE,
-            dynamic_render_state: target.vulkan_version >= (1, 3),
+            dynamic_render_state: extended_dynamic_state,
             dynamic_rendering,
             dynamic_raster,
             host_query_reset,
