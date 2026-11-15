@@ -71,6 +71,9 @@ pub struct TargetProfile {
     /// `variablePointers`, which widens the above to `Workgroup` memory - a
     /// pointer into a Metal `threadgroup` array.
     pub variable_pointers: bool,
+    /// The driver compiles SPIR-V to Metal Shading Language (MoltenVK), so
+    /// GLSL's `FMix` becomes Metal's own `mix`.
+    pub fmix_is_metal_mix: bool,
 }
 
 impl TargetProfile {
@@ -107,6 +110,7 @@ impl TargetProfile {
             image_query: true,
             variable_pointers_storage_buffer: false,
             variable_pointers: false,
+            fmix_is_metal_mix: false,
         }
     }
 

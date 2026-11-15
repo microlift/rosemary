@@ -294,6 +294,7 @@ fn encode_target(target: &TargetProfile) -> Vec<u8> {
         image_query,
         variable_pointers_storage_buffer,
         variable_pointers,
+        fmix_is_metal_mix,
     } = target;
 
     let mut bytes = Vec::with_capacity(16);
@@ -329,6 +330,7 @@ fn encode_target(target: &TargetProfile) -> Vec<u8> {
         image_query,
         variable_pointers_storage_buffer,
         variable_pointers,
+        fmix_is_metal_mix,
     ] {
         bytes.push(u8::from(*flag));
     }

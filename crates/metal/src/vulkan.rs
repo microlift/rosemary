@@ -478,6 +478,11 @@ fn query_target(
         target.storage_push_constant8 = v12.storage_push_constant8 == vk::TRUE;
         target.shader_float16 = v12.shader_float16 == vk::TRUE;
         target.shader_int8 = v12.shader_int8 == vk::TRUE;
+        let mut driver = vk::PhysicalDeviceDriverProperties::default();
+        let mut properties = vk::PhysicalDeviceProperties2::default().push_next(&mut driver);
+        // SAFETY: driver properties are core in Vulkan 1.2; the chain lives here.
+        unsafe { instance.get_physical_device_properties2(physical, &mut properties) };
+        target.fmix_is_metal_mix = driver.driver_id == vk::DriverId::MOLTENVK && std::env::var_os("ROSEMARY_METAL_ALWAYS_EMULATE_FMIX").is_none();
     } else {
         let mut storage16 = vk::PhysicalDevice16BitStorageFeatures::default();
         let mut pointers = vk::PhysicalDeviceVariablePointersFeatures::default();
@@ -569,6 +574,7 @@ fn target_profile(version: (u8, u8)) -> metal_translate::TargetProfile {
         image_query: true,
         variable_pointers_storage_buffer: false,
         variable_pointers: false,
+        fmix_is_metal_mix: false,
     }
 }
 

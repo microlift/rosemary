@@ -468,6 +468,21 @@ impl Emitter {
                 first,
                 second,
                 weight,
+            } if self.target.fmix_is_metal_mix => {
+                // The rewrite below would cost MoltenVK an unoptimized helper
+                // call per NoContraction operation.
+                self.emit_ext_inst(
+                    function,
+                    instruction,
+                    values,
+                    GlslStd450Op::FMix,
+                    [first, second, weight],
+                )?;
+            }
+            InstructionKind::FloatMix {
+                first,
+                second,
+                weight,
             } => {
                 // Metal's mix is exact at its ends: a weight of 1 gives y
                 // whatever x is. GLSL's FMix leaves the form to the driver, and
