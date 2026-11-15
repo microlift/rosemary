@@ -226,6 +226,14 @@ fn presentation(window: &Window) -> Presentation {
     }
 }
 
+/// Whether a request to make this window key is honoured. AppKit asks the
+/// window, whatever its level.
+fn takes_key(receiver: Id, want: Presentation) -> bool {
+    // FIXME (ACCURACY): AppKit has no such exception; the host cannot give a
+    // tooltip the keyboard.
+    want != Presentation::Tooltip && crate::event::answers(receiver, "canBecomeKeyWindow")
+}
+
 /// The window a popup is positioned against: the key window, else the largest
 /// window on the screen.
 ///
@@ -2250,11 +2258,14 @@ unsafe extern "C" fn make_key_and_order_front(receiver: Id, _sel: Sel, _sender: 
     order_front(receiver, true);
 }
 
-/// `-orderFront:`: AppKit does not change the key window for this. A window's
-/// first ordering still takes key here, as it always has; reordering one that
-/// is already on screen must not.
+/// `-orderFront:`: AppKit does not change the key window for this.
 unsafe extern "C" fn order_front_selector(receiver: Id, _sel: Sel, _sender: Id) {
-    order_front(receiver, window_of(receiver).shown == 0);
+    let window = window_of(receiver);
+    // FIXME (ACCURACY): a toplevel's first ordering takes key, because the
+    // compositor focuses a toplevel it has just mapped.
+    let first_toplevel_ordering =
+        window.shown == 0 && presentation(window) == Presentation::Toplevel;
+    order_front(receiver, first_toplevel_ordering);
 }
 
 /// `-makeKeyWindow`: `-orderFront:` no longer does this for a window already on
@@ -2263,15 +2274,17 @@ unsafe extern "C" fn make_key_window(receiver: Id, _sel: Sel) {
     let window = window_of(receiver);
     if window.sdl.is_null()
         || window.shown == 0
-        || presentation(window) != Presentation::Toplevel
         || key_window() == receiver
-        || !crate::event::answers(receiver, "canBecomeKeyWindow")
+        || !takes_key(receiver, presentation(window))
     {
         return;
     }
     KEY.store(receiver as usize, std::sync::atomic::Ordering::Release);
     crate::event::announce_key(receiver);
-    sdl3::video::raise_window(window.sdl);
+    // A popup is already above its parent, and SDL refuses to raise one.
+    if presentation(window) == Presentation::Toplevel {
+        sdl3::video::raise_window(window.sdl);
+    }
 }
 
 unsafe extern "C" fn order_front_regardless(receiver: Id, _sel: Sel) {
@@ -2333,7 +2346,7 @@ fn order_front(receiver: Id, make_key: bool) {
         sdl3::video::window_size(sdl),
     );
     set_up_first_responder(receiver);
-    if make_key && want != Presentation::Tooltip {
+    if make_key && takes_key(receiver, want) {
         KEY.store(receiver as usize, std::sync::atomic::Ordering::Release);
         crate::event::announce_key(receiver);
     }
@@ -3974,6 +3987,26 @@ mod fullscreen_tests;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_window_takes_key_only_when_it_can_become_key_at_any_level() {
+        crate::bootstrap();
+        let window =
+            objc::object::create_instance(objc::class::lookup(c"NSWindow").expect("NSWindow"), 0);
+        let body = window_of(window);
+
+        for level in [0, window_level::FLOATING, window_level::POPUP_MENU] {
+            body.level = level;
+            body.style_mask = 0;
+            assert!(!takes_key(window, presentation(body)), "level {level}");
+            body.style_mask = style::RESIZABLE;
+            assert!(takes_key(window, presentation(body)), "level {level}");
+        }
+
+        body.level = window_level::SCREEN_SAVER;
+        assert!(!takes_key(window, presentation(body)));
+        objc::arc::release(window);
+    }
 
     /// What a window is, is read off its style mask and its level together -
     /// and is read again at every ordering, because a toolkit reuses one window
