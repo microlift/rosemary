@@ -235,11 +235,26 @@ impl From<&DepthStencilState> for DepthStencilKey {
 /// `MTLCompileOptions`.
 pub(crate) struct CompileOptions {
     pub macros: Vec<(String, String)>,
+    // The Vulkan translator only needs macros; native Metal also needs the
+    // values the guest explicitly configured. None means host defaults.
+    pub fast_math: Option<bool>,
+    pub preserve_invariance: Option<bool>,
+    pub language_version: Option<u64>,
 }
 
 unsafe extern "C" fn compile_options_init(receiver: Id, _sel: Sel) -> Id {
     // SAFETY: a freshly allocated options object.
-    unsafe { object::init(receiver, CompileOptions { macros: Vec::new() }) };
+    unsafe {
+        object::init(
+            receiver,
+            CompileOptions {
+                macros: Vec::new(),
+                fast_math: None,
+                preserve_invariance: None,
+                language_version: None,
+            },
+        )
+    };
     receiver
 }
 
@@ -298,6 +313,19 @@ unsafe extern "C" fn set_preprocessor_macros(receiver: Id, _sel: Sel, dictionary
     unsafe { object::body::<CompileOptions>(receiver) }.macros = macros;
 }
 
+unsafe extern "C" fn set_compile_options_flag(receiver: Id, sel: Sel, value: u8) {
+    let options = unsafe { object::body::<CompileOptions>(receiver) };
+    match unsafe { std::ffi::CStr::from_ptr(sel) }.to_bytes() {
+        b"setFastMathEnabled:" => options.fast_math = Some(value != 0),
+        b"setPreserveInvariance:" => options.preserve_invariance = Some(value != 0),
+        _ => unreachable!("only compile option flag setters use this callback"),
+    }
+}
+
+unsafe extern "C" fn set_compile_language_version(receiver: Id, _sel: Sel, value: u64) {
+    unsafe { object::body::<CompileOptions>(receiver) }.language_version = Some(value);
+}
+
 pub(crate) fn install() {
     compute_descriptor::install();
     let descriptor = object::register::<RenderPipelineDescriptor>(c"MTLRenderPipelineDescriptor");
@@ -311,9 +339,9 @@ pub(crate) fn install() {
     methods!(options, {
         "init" => compile_options_init, c"@16@0:8";
         "dealloc" => compile_options_dealloc, c"v16@0:8";
-        "setFastMathEnabled:" => crate::no_op, c"v20@0:8c16";
-        "setPreserveInvariance:" => crate::no_op, c"v20@0:8c16";
-        "setLanguageVersion:" => crate::no_op, c"v24@0:8Q16";
+        "setFastMathEnabled:" => set_compile_options_flag, c"v20@0:8c16";
+        "setPreserveInvariance:" => set_compile_options_flag, c"v20@0:8c16";
+        "setLanguageVersion:" => set_compile_language_version, c"v24@0:8Q16";
         "setPreprocessorMacros:" => set_preprocessor_macros, c"v24@0:8@16";
     });
     methods!(descriptor, {

@@ -12,6 +12,8 @@ mod gpu;
 mod hash;
 mod heap;
 mod library;
+#[cfg(target_os = "macos")]
+mod native;
 mod object;
 mod overlay;
 mod pipeline;
@@ -360,7 +362,12 @@ fn install_labels() {
         c"RosemaryMTLTexture",
         c"RosemaryMTLVertexElement",
     ];
-    for name in names {
+    add_labels(&names);
+}
+
+/// Give each named class, where it exists, the no-op `-label`/`-setLabel:`.
+pub(crate) fn add_labels(names: &[&std::ffi::CStr]) {
+    for &name in names {
         let Some(class) = objc::class::lookup(name) else {
             continue;
         };
