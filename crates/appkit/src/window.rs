@@ -265,6 +265,16 @@ fn hand_key_on(leaving: &[Id]) {
     }
 }
 
+/// Whether the host has the keyboard on any window of this program, which is
+/// what AppKit calls the application being active.
+pub fn has_host_focus() -> bool {
+    all().into_iter().any(|window| {
+        // SAFETY: a window this crate made.
+        let sdl = unsafe { sdl_window(window) };
+        !sdl.is_null() && sdl3::video::window_flags(sdl) & sdl3::video::flags::INPUT_FOCUS != 0
+    })
+}
+
 /// The toplevel a popup hangs off, through any popups between.
 fn toplevel_under(mut sdl: sdl3::Window) -> sdl3::Window {
     while !sdl.is_null() && presentation_of_sdl(sdl) != Presentation::Toplevel {
@@ -4289,6 +4299,41 @@ mod tests {
             order_out(popup, objc::sel::get("orderOut:"), std::ptr::null_mut());
             assert_eq!(key_window(), main);
         }
+    }
+
+    #[test]
+    fn a_key_popup_resigns_with_the_host_focus_and_is_key_again_when_it_returns() {
+        if !sdl3::isolated::run_here() {
+            return;
+        }
+        crate::bootstrap();
+        let Some(probe) = sdl3::video::create_window(c"key restore preflight", 32, 32, 0) else {
+            return; // no graphical SDL display available
+        };
+        sdl3::video::destroy_window(probe);
+        let under = titled_window();
+        let popup = made_window(c"NSPanel", style::RESIZABLE);
+        window_of(popup).level = window_level::POPUP_MENU;
+        let order = objc::sel::get("makeKeyAndOrderFront:");
+        let focus = |gained| {
+            crate::event::deliver_past_modal(sdl3::video::Event::WindowFocus {
+                window: sdl3::video::window_id(unsafe { sdl_window(under) }),
+                gained,
+            });
+        };
+        unsafe {
+            make_key_and_order_front(under, order, std::ptr::null_mut());
+            make_key_and_order_front(popup, order, std::ptr::null_mut());
+        }
+        assert_eq!(crate::event::announced_key(), popup);
+
+        focus(false);
+        assert!(crate::event::announced_key().is_null());
+
+        focus(true);
+        assert_eq!(key_window(), popup);
+        assert_eq!(crate::event::announced_key(), popup);
+        assert_eq!(crate::event::main_window(), under);
     }
 
     #[test]

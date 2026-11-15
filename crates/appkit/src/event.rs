@@ -465,16 +465,31 @@ pub(crate) fn deliver_past_modal(event: sdl3::video::Event) {
                 crate::screen::forget_recentring();
                 crate::screen::release_relative_pointer(window);
             }
+            // A key popup over this window keeps key across the program
+            // losing the host's focus and getting it back.
+            let key = window::key_target(object);
             if !object.is_null() && gained {
-                window::set_key_window(object);
+                if key == object {
+                    window::set_key_window(object);
+                }
                 // SDL drops relative mouse mode when focus goes, and a window
                 // made while the guest was disassociated never entered it.
                 crate::screen::apply_mouse_association();
                 crate::screen::confine_pointer(object);
             }
             match gained {
-                true => announce_key(object),
-                false => announce_resign(object),
+                true => {
+                    announce_key(key);
+                    announce_main(object);
+                }
+                false => {
+                    resign_key(key);
+                    // The main window stays main while focus is on another
+                    // window of this program.
+                    if !window::has_host_focus() {
+                        resign_main(main_window());
+                    }
+                }
             }
         }
         Event::Key {
@@ -1826,15 +1841,25 @@ fn forget(announced: &std::sync::atomic::AtomicUsize, object: Id) -> bool {
 /// `object` stops being key and main, whichever it was: focus left it, or it
 /// left the screen.
 pub(crate) fn announce_resign(object: Id) {
-    if object.is_null() {
-        return;
-    }
-    if forget(&ANNOUNCED, object) {
+    resign_key(object);
+    resign_main(object);
+}
+
+fn resign_key(object: Id) {
+    if !object.is_null() && forget(&ANNOUNCED, object) {
         post_for(object, window::DID_RESIGN_KEY);
     }
-    if forget(&MAIN, object) {
+}
+
+fn resign_main(object: Id) {
+    if !object.is_null() && forget(&MAIN, object) {
         post_for(object, window::DID_RESIGN_MAIN);
     }
+}
+
+#[cfg(test)]
+pub(crate) fn announced_key() -> Id {
+    ANNOUNCED.load(std::sync::atomic::Ordering::Acquire) as Id
 }
 
 /// A window being freed is no longer the announced one; nothing is posted
