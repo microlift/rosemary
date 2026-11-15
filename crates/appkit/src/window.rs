@@ -234,6 +234,30 @@ fn takes_key(receiver: Id, want: Presentation) -> bool {
     want != Presentation::Tooltip && crate::event::answers(receiver, "canBecomeKeyWindow")
 }
 
+/// The toplevel a popup hangs off, through any popups between.
+fn toplevel_under(mut sdl: sdl3::Window) -> sdl3::Window {
+    while !sdl.is_null() && presentation_of_sdl(sdl) != Presentation::Toplevel {
+        sdl = sdl3::video::window_parent(sdl);
+    }
+    sdl
+}
+
+/// The window a keystroke goes to when the host has `focused` focused. AppKit
+/// sends keys to the key window; the host never focuses a popup, so a key
+/// popup's keys arrive at the toplevel under it.
+pub fn key_target(focused: Id) -> Id {
+    let key = key_window();
+    if focused.is_null() || key.is_null() || !is_shown(key) {
+        return focused;
+    }
+    // SAFETY: windows of this crate's.
+    let (key_sdl, focused_sdl) = unsafe { (sdl_window(key), sdl_window(focused)) };
+    match toplevel_under(key_sdl) == focused_sdl {
+        true => key,
+        false => focused,
+    }
+}
+
 /// The window a popup is positioned against: the key window, else the largest
 /// window on the screen.
 ///
@@ -2377,17 +2401,32 @@ unsafe extern "C" fn set_is_visible(receiver: Id, _sel: Sel, visible: u8) {
 unsafe extern "C" fn order_out(receiver: Id, _sel: Sel, _sender: Id) {
     trace!("{receiver:p} ordered out");
     let sdl = window_of(receiver).sdl;
+    // The host moves focus on when a toplevel goes. A popup never had it, so
+    // the window under a key popup is made key here.
+    let under_popup = match !sdl.is_null() && presentation_of_sdl(sdl) != Presentation::Toplevel {
+        true => window_for(sdl3::video::window_parent(sdl)),
+        false => std::ptr::null_mut(),
+    };
     if !sdl.is_null() {
         sdl3::video::hide_window(sdl);
     }
     window_of(receiver).shown = 0;
-    let _ = KEY.compare_exchange(
-        receiver as usize,
-        0,
-        std::sync::atomic::Ordering::AcqRel,
-        std::sync::atomic::Ordering::Acquire,
-    );
+    let was_key = KEY
+        .compare_exchange(
+            receiver as usize,
+            0,
+            std::sync::atomic::Ordering::AcqRel,
+            std::sync::atomic::Ordering::Acquire,
+        )
+        .is_ok();
     crate::event::announce_resign(receiver);
+    if was_key
+        && !under_popup.is_null()
+        && takes_key(under_popup, presentation(window_of(under_popup)))
+    {
+        KEY.store(under_popup as usize, std::sync::atomic::Ordering::Release);
+        crate::event::announce_key(under_popup);
+    }
 }
 
 /// `-dealloc`. The content view is told it has no window before it is released,
@@ -4129,6 +4168,36 @@ mod tests {
             window_of(second).style_mask = 0;
             make_key_window(second, objc::sel::get("makeKeyWindow"));
             assert_eq!(key_window(), first);
+        }
+    }
+
+    #[test]
+    fn a_key_popup_gets_the_keys_of_the_window_under_it_and_returns_key_when_ordered_out() {
+        if !sdl3::isolated::run_here() {
+            return;
+        }
+        crate::bootstrap();
+        let Some(probe) = sdl3::video::create_window(c"key popup preflight", 32, 32, 0) else {
+            return; // no graphical SDL display available
+        };
+        sdl3::video::destroy_window(probe);
+        let under = titled_window();
+        let popup = titled_window();
+        window_of(popup).style_mask = style::RESIZABLE;
+        window_of(popup).level = window_level::POPUP_MENU;
+        let order = objc::sel::get("makeKeyAndOrderFront:");
+        unsafe {
+            make_key_and_order_front(under, order, std::ptr::null_mut());
+            assert_eq!(key_target(under), under);
+
+            make_key_and_order_front(popup, order, std::ptr::null_mut());
+            assert_eq!(presentation_of_sdl(sdl_window(popup)), Presentation::Menu);
+            assert_eq!(key_window(), popup);
+            assert_eq!(key_target(under), popup);
+
+            order_out(popup, objc::sel::get("orderOut:"), std::ptr::null_mut());
+            assert_eq!(key_window(), under);
+            assert_eq!(key_target(under), under);
         }
     }
 

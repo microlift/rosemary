@@ -498,7 +498,7 @@ pub(crate) fn deliver_past_modal(event: sdl3::video::Event) {
                 scancode,
                 crate::keymap::typed_key(scancode, key, modifiers),
             );
-            let window = object_for(id);
+            let window = window::key_target(object_for(id));
             if window.is_null() {
                 key_withheld(&event);
                 return;
@@ -550,7 +550,7 @@ pub(crate) fn deliver_past_modal(event: sdl3::video::Event) {
         // layout- and IME-resolved commit, and must go to the focused
         // `NSTextInputClient`; `-characters` is not a substitute for it.
         Event::Text { window, text } => {
-            let window = object_for(window);
+            let window = window::key_target(object_for(window));
             let responder = responder_of(window);
             if crate::text::accepts_host_text(responder) {
                 crate::text::commit(responder, &text);
