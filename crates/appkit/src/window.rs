@@ -275,6 +275,28 @@ pub fn has_host_focus() -> bool {
     })
 }
 
+/// A mouse-down in `view` makes its window key, unless the window is a panel
+/// that becomes key only for a view that needs it. The host does this for a
+/// toplevel by focusing it; a popup it never focuses, and a toplevel already
+/// focused under a key popup it does not focus again.
+pub fn mouse_down(receiver: Id, view: Id) {
+    let window = window_of(receiver);
+    if window.sdl.is_null()
+        || key_window() == receiver
+        || (presentation_of_sdl(window.sdl) == Presentation::Toplevel
+            && key_target(receiver) == receiver)
+        || !takes_key(receiver, presentation(window))
+    {
+        return;
+    }
+    let needed = !view.is_null() && crate::event::answers(view, "needsPanelToBecomeKey");
+    if window.becomes_key_only_if_needed != 0 && !needed {
+        return;
+    }
+    KEY.store(receiver as usize, std::sync::atomic::Ordering::Release);
+    crate::event::announce_key(receiver);
+}
+
 /// The toplevel a popup hangs off, through any popups between.
 fn toplevel_under(mut sdl: sdl3::Window) -> sdl3::Window {
     while !sdl.is_null() && presentation_of_sdl(sdl) != Presentation::Toplevel {
@@ -2711,11 +2733,10 @@ pub(crate) fn end_drag() {
 ///
 /// A palette that says yes wants clicks to reach its controls without taking key
 /// away from the document window - a tool palette whose buttons work while the
-/// text caret stays where it is. This runtime does not choose which window is
-/// key: SDL does, from the window the host's compositor focuses, and
-/// [`set_key_window`] follows it. So the flag is stored and answered rather than
-/// acted on, which keeps a guest's own `-becomesKeyOnlyIfNeeded` read - it sets
-/// it while building a palette and asks later - agreeing with what it set.
+/// text caret stays where it is. [`mouse_down`] honours it for a popup.
+///
+/// FIXME (ACCURACY): a toplevel panel takes key on any click, because the
+/// host's compositor focuses it and [`set_key_window`] follows.
 unsafe extern "C" fn becomes_key_only_if_needed(receiver: Id, _sel: Sel) -> u8 {
     (window_of(receiver).becomes_key_only_if_needed != 0) as u8
 }
@@ -4334,6 +4355,46 @@ mod tests {
         assert_eq!(key_window(), popup);
         assert_eq!(crate::event::announced_key(), popup);
         assert_eq!(crate::event::main_window(), under);
+    }
+
+    #[test]
+    fn a_mouse_down_makes_a_popup_key_unless_it_becomes_key_only_if_needed() {
+        if !sdl3::isolated::run_here() {
+            return;
+        }
+        crate::bootstrap();
+        let Some(probe) = sdl3::video::create_window(c"click key preflight", 32, 32, 0) else {
+            return; // no graphical SDL display available
+        };
+        sdl3::video::destroy_window(probe);
+        let under = titled_window();
+        let popup = made_window(c"NSPanel", style::RESIZABLE);
+        window_of(popup).level = window_level::POPUP_MENU;
+        let view = objc::object::create_instance(objc::class::lookup(c"NSView").unwrap(), 0);
+        let text = objc::object::create_instance(objc::class::lookup(c"NSText").unwrap(), 0);
+        unsafe {
+            make_key_and_order_front(
+                under,
+                objc::sel::get("makeKeyAndOrderFront:"),
+                std::ptr::null_mut(),
+            );
+            order_front_selector(popup, objc::sel::get("orderFront:"), std::ptr::null_mut());
+        }
+        assert_eq!(key_window(), under);
+
+        window_of(popup).becomes_key_only_if_needed = 1;
+        mouse_down(popup, view);
+        assert_eq!(key_window(), under);
+        mouse_down(popup, text);
+        assert_eq!(key_window(), popup);
+
+        unsafe { make_key_window(under, objc::sel::get("makeKeyWindow")) };
+        window_of(popup).becomes_key_only_if_needed = 0;
+        mouse_down(popup, view);
+        assert_eq!(key_window(), popup);
+
+        mouse_down(under, view);
+        assert_eq!(key_window(), under);
     }
 
     #[test]

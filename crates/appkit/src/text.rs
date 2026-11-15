@@ -1099,6 +1099,11 @@ unsafe extern "C" fn accepts_first_responder(_receiver: Id, _sel: Sel) -> u8 {
     1
 }
 
+/// Text is typed into, so clicking it makes even a reluctant panel key.
+unsafe extern "C" fn needs_panel_to_become_key(_receiver: Id, _sel: Sel) -> u8 {
+    1
+}
+
 /// A text field's text, for drawing and measuring it.
 pub(crate) fn field_text(receiver: Id) -> String {
     field(receiver).text
@@ -1646,6 +1651,7 @@ pub(crate) fn install() {
         "validAttributesForMarkedText" => valid_attributes, c"@16@0:8";
         "doCommandBySelector:" => do_command_by_selector, c"v24@0:8:16";
         "acceptsFirstResponder" => accepts_first_responder, c"c16@0:8";
+        "needsPanelToBecomeKey" => needs_panel_to_become_key, c"c16@0:8";
     });
     let view = objc::class::lookup(c"NSTextView").expect("declared before its methods");
     methods!(view, {

@@ -1357,6 +1357,7 @@ pub fn route(window: Id, event: Id) {
     };
     let start = target.view;
     if kind == kind::LEFT_MOUSE_DOWN {
+        window::mouse_down(window, start);
         focus_clicked(window, start);
     }
     let Some((responder, method)) = chain(start, sel) else {

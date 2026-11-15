@@ -3631,6 +3631,7 @@ pub(crate) fn install() {
         "wantsBestResolutionOpenGLSurface" => wants_best_resolution, c"c16@0:8";
         "backingScaleFactor" => backing_scale_factor, c"d16@0:8";
         "acceptsFirstResponder" => yes, c"c16@0:8";
+        "needsPanelToBecomeKey" => no, c"c16@0:8";
         "canBecomeKeyView" => yes, c"c16@0:8";
         "isOpaque" => yes, c"c16@0:8";
         "isFlipped" => no, c"c16@0:8";
