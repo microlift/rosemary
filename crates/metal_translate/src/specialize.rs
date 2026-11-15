@@ -88,21 +88,33 @@ fn value(data_type: u64, bytes: &[u8]) -> Result<ConstantValue, String> {
     })
 }
 
+pub const MTL_DATA_TYPE_FLOAT: u64 = 3;
+pub const MTL_DATA_TYPE_HALF: u64 = 16;
+pub const MTL_DATA_TYPE_INT: u64 = 29;
+pub const MTL_DATA_TYPE_UINT: u64 = 33;
+pub const MTL_DATA_TYPE_SHORT: u64 = 37;
+pub const MTL_DATA_TYPE_USHORT: u64 = 41;
+pub const MTL_DATA_TYPE_CHAR: u64 = 45;
+pub const MTL_DATA_TYPE_UCHAR: u64 = 49;
+pub const MTL_DATA_TYPE_BOOL: u64 = 53;
+pub const MTL_DATA_TYPE_LONG: u64 = 81;
+pub const MTL_DATA_TYPE_ULONG: u64 = 85;
+
 /// The `MTLDataType`s a function constant can have: each scalar's first
 /// value, its Itanium spelling and its size. The two-, three- and four-lane
 /// vectors follow each scalar in the enumeration.
 const SCALARS: [(u64, &str, usize); 11] = [
-    (3, "f", 4),   // float
-    (16, "Dh", 2), // half
-    (29, "i", 4),  // int
-    (33, "j", 4),  // uint
-    (37, "s", 2),  // short
-    (41, "t", 2),  // ushort
-    (45, "c", 1),  // char
-    (49, "h", 1),  // uchar
-    (53, "b", 1),  // bool
-    (81, "l", 8),  // long
-    (85, "m", 8),  // ulong
+    (MTL_DATA_TYPE_FLOAT, "f", 4),
+    (MTL_DATA_TYPE_HALF, "Dh", 2),
+    (MTL_DATA_TYPE_INT, "i", 4),
+    (MTL_DATA_TYPE_UINT, "j", 4),
+    (MTL_DATA_TYPE_SHORT, "s", 2),
+    (MTL_DATA_TYPE_USHORT, "t", 2),
+    (MTL_DATA_TYPE_CHAR, "c", 1),
+    (MTL_DATA_TYPE_UCHAR, "h", 1),
+    (MTL_DATA_TYPE_BOOL, "b", 1),
+    (MTL_DATA_TYPE_LONG, "l", 8),
+    (MTL_DATA_TYPE_ULONG, "m", 8),
 ];
 
 fn layout(data_type: u64) -> Option<(&'static str, usize, usize)> {
@@ -137,7 +149,7 @@ pub fn metal_data_type_of_encoding(encoding: &str) -> Option<u64> {
 }
 
 /// The Itanium spelling AIR gives a constant of an `MTLDataType`.
-fn metal_data_type_encoding(data_type: u64) -> Option<String> {
+pub(crate) fn metal_data_type_encoding(data_type: u64) -> Option<String> {
     let (encoding, _, lanes) = layout(data_type)?;
     Some(if lanes == 1 {
         encoding.to_owned()

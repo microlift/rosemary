@@ -18,7 +18,10 @@ pub use cache::{
 pub use msl::parse_msl;
 pub use passes::{Pass, PassPipeline};
 pub use specialize::{
-    FunctionConstantValues, metal_data_type_of_encoding, metal_data_type_size, specialize,
+    FunctionConstantValues, MTL_DATA_TYPE_BOOL, MTL_DATA_TYPE_CHAR, MTL_DATA_TYPE_FLOAT,
+    MTL_DATA_TYPE_HALF, MTL_DATA_TYPE_INT, MTL_DATA_TYPE_LONG, MTL_DATA_TYPE_SHORT,
+    MTL_DATA_TYPE_UCHAR, MTL_DATA_TYPE_UINT, MTL_DATA_TYPE_ULONG, MTL_DATA_TYPE_USHORT,
+    metal_data_type_of_encoding, metal_data_type_size, specialize,
 };
 pub use spirv::{
     EntryArtifact, FunctionConstantInfo, RejectedEntry, RequiredFeatures, ResourceBinding,

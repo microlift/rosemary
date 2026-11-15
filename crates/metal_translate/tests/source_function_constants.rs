@@ -1,5 +1,7 @@
 use metal_translate::ir::Operand;
-use metal_translate::{FunctionConstantValues, parse_msl, specialize};
+use metal_translate::{
+    FunctionConstantValues, MTL_DATA_TYPE_FLOAT, MTL_DATA_TYPE_UINT, parse_msl, specialize,
+};
 
 const SOURCE: &str = "
 constant uint width [[function_constant(3)]];
@@ -24,9 +26,13 @@ fn optional_source_constants_specialize_derived_globals_by_index_and_name() {
         let mut values = FunctionConstantValues::new();
         if let Some(value) = supplied {
             if by_name {
-                values.set_name("width", 33, &value.to_le_bytes()).unwrap();
+                values
+                    .set_name("width", MTL_DATA_TYPE_UINT, &value.to_le_bytes())
+                    .unwrap();
             } else {
-                values.set_index(3, 33, &value.to_le_bytes()).unwrap();
+                values
+                    .set_index(3, MTL_DATA_TYPE_UINT, &value.to_le_bytes())
+                    .unwrap();
             }
         }
         specialize(&mut module, &values).unwrap();
@@ -58,7 +64,9 @@ fn source_constant_declarations_reject_invalid_indices_types_and_initializers() 
     }
     let mut module = parse_msl(SOURCE).unwrap();
     let mut values = FunctionConstantValues::new();
-    values.set_index(3, 3, &1.0f32.to_le_bytes()).unwrap();
+    values
+        .set_index(3, MTL_DATA_TYPE_FLOAT, &1.0f32.to_le_bytes())
+        .unwrap();
     assert!(specialize(&mut module, &values).is_err());
 }
 
@@ -76,7 +84,9 @@ fn source_specialization_cache_separates_values_and_macro_defaults() {
         translate_msl_specialized_cached(&source, &macros("9u"), &target, &passes, &empty).unwrap();
     assert_ne!(first.entries[0].words, second.entries[0].words);
     let mut values = FunctionConstantValues::new();
-    values.set_index(3, 33, &12u32.to_le_bytes()).unwrap();
+    values
+        .set_index(3, MTL_DATA_TYPE_UINT, &12u32.to_le_bytes())
+        .unwrap();
     let overridden =
         translate_msl_specialized_cached(&source, &macros("8u"), &target, &passes, &values)
             .unwrap();
@@ -102,7 +112,9 @@ fn a_source_constant_used_without_a_value_is_rejected_before_emission() {
                 .is_err()
         );
         let mut values = FunctionConstantValues::new();
-        values.set_index(3, 33, &4u32.to_le_bytes()).unwrap();
+        values
+            .set_index(3, MTL_DATA_TYPE_UINT, &4u32.to_le_bytes())
+            .unwrap();
         translate_msl_specialized(&source, &[], &target, &PassPipeline::default(), &values)
             .unwrap();
     }

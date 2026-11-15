@@ -147,53 +147,38 @@ impl Lowerer<'_, '_> {
     }
 }
 
+/// The Itanium spelling of a function constant's type, as AIR names it.
 fn constant_encoding(ty: &Ty) -> Option<String> {
+    use crate::specialize::{
+        MTL_DATA_TYPE_BOOL, MTL_DATA_TYPE_CHAR, MTL_DATA_TYPE_FLOAT, MTL_DATA_TYPE_HALF,
+        MTL_DATA_TYPE_INT, MTL_DATA_TYPE_LONG, MTL_DATA_TYPE_SHORT, MTL_DATA_TYPE_UCHAR,
+        MTL_DATA_TYPE_UINT, MTL_DATA_TYPE_ULONG, MTL_DATA_TYPE_USHORT, metal_data_type_encoding,
+    };
     let (scalar, lanes) = match ty {
         Ty::Scalar(scalar) => (scalar, 1),
         Ty::Vector(scalar, lanes) => (scalar, *lanes),
         _ => return None,
     };
-    let encoding = match *scalar {
-        Scalar::Bool => "b",
-        Scalar::Float { bits: 16 } => "Dh",
-        Scalar::Float { bits: 32 } => "f",
-        Scalar::Int {
-            signed: true,
-            bits: 8,
-        } => "c",
-        Scalar::Int {
-            signed: false,
-            bits: 8,
-        } => "h",
-        Scalar::Int {
-            signed: true,
-            bits: 16,
-        } => "s",
-        Scalar::Int {
-            signed: false,
-            bits: 16,
-        } => "t",
-        Scalar::Int {
-            signed: true,
-            bits: 32,
-        } => "i",
-        Scalar::Int {
-            signed: false,
-            bits: 32,
-        } => "j",
-        Scalar::Int {
-            signed: true,
-            bits: 64,
-        } => "l",
-        Scalar::Int {
-            signed: false,
-            bits: 64,
-        } => "m",
+    let scalar = match *scalar {
+        Scalar::Bool => MTL_DATA_TYPE_BOOL,
+        Scalar::Float { bits: 16 } => MTL_DATA_TYPE_HALF,
+        Scalar::Float { bits: 32 } => MTL_DATA_TYPE_FLOAT,
+        Scalar::Int { signed, bits } => match (signed, bits) {
+            (true, 8) => MTL_DATA_TYPE_CHAR,
+            (false, 8) => MTL_DATA_TYPE_UCHAR,
+            (true, 16) => MTL_DATA_TYPE_SHORT,
+            (false, 16) => MTL_DATA_TYPE_USHORT,
+            (true, 32) => MTL_DATA_TYPE_INT,
+            (false, 32) => MTL_DATA_TYPE_UINT,
+            (true, 64) => MTL_DATA_TYPE_LONG,
+            (false, 64) => MTL_DATA_TYPE_ULONG,
+            _ => return None,
+        },
         _ => return None,
     };
-    match lanes {
-        1 => Some(encoding.to_owned()),
-        2..=4 => Some(format!("Dv{lanes}_{encoding}")),
-        _ => None,
-    }
+    // An `MTLDataType`'s vectors of two to four lanes follow its scalar.
+    (1..=4)
+        .contains(&lanes)
+        .then(|| metal_data_type_encoding(scalar + u64::from(lanes) - 1))
+        .flatten()
 }
