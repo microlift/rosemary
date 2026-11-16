@@ -251,3 +251,43 @@ int main(void) {
         "pthread types differ between architectures (stderr: {err})"
     );
 }
+
+/// A thread that leaves through `pthread_exit` with cleanup handlers pushed, as
+/// Boehm GC's thread start routine does inside Mono.
+const CLEANUP_ON_EXIT_C: &str = r#"
+#include <pthread.h>
+#include <stdio.h>
+
+static void cleanup(void *arg) { printf("cleanup %s\n", (const char *)arg); }
+
+static void *body(void *arg) {
+    pthread_cleanup_push(cleanup, "outer");
+    pthread_cleanup_push(cleanup, "inner");
+    pthread_exit((void *)42);
+    pthread_cleanup_pop(0);
+    pthread_cleanup_pop(0);
+    return NULL;
+}
+
+int main(void) {
+    pthread_t thread;
+    void *value = NULL;
+    if (pthread_create(&thread, NULL, body, NULL) != 0) return 2;
+    pthread_join(thread, &value);
+    printf("joined %ld\n", (long)value);
+    return 0;
+}
+"#;
+
+#[test]
+fn pthread_exit_runs_the_guests_cleanup_handlers() {
+    let Some(path) = common::build_x86_64("thread_cleanup_exit", CLEANUP_ON_EXIT_C, &[]) else {
+        skip!("cannot build x86_64 fixtures")
+    };
+    let (status, out, err) = run_guest(&path, &[]);
+    assert_eq!(status, Some(0), "stderr: {err}");
+    assert_eq!(
+        out, "cleanup inner\ncleanup outer\njoined 42\n",
+        "stderr: {err}"
+    );
+}

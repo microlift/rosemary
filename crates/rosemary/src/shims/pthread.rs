@@ -166,6 +166,50 @@ fn pthread_key_create(
     Ok(())
 }
 
+/// Where `struct _opaque_pthread_t` keeps `__cleanup_stack`, after `__sig`.
+const CLEANUP_STACK_OFFSET: u64 = 8;
+
+/// `struct __darwin_pthread_handler_rec`: `__routine`, `__arg`, `__next`.
+const HANDLER_ARG_OFFSET: u64 = 8;
+const HANDLER_NEXT_OFFSET: u64 = 16;
+
+/// `void pthread_exit(void *)`.
+///
+/// `pthread_cleanup_push` is a macro that links the guest's handler record into
+/// its `pthread_t` inline, so the handlers are guest code, which the host's
+/// `pthread_exit` must never call itself. They run here first, innermost first,
+/// each unlinked before it runs, as Darwin's `_pthread_exit` runs them.
+fn pthread_exit(
+    symbol: &str,
+    ctx: &mut RegisterContext,
+    mem: &mut dyn GuestMemory,
+    callbacks: &dyn Callbacks,
+) -> Result<()> {
+    let value = ctx.rdi;
+    let stack = darwin::pthread::handle::current() + CLEANUP_STACK_OFFSET;
+    loop {
+        let record = mem.read_u64(stack, symbol)?;
+        if record == 0 {
+            break;
+        }
+        let routine = mem.read_u64(record, symbol)?;
+        let arg = mem.read_u64(record + HANDLER_ARG_OFFSET, symbol)?;
+        let next = mem.read_u64(record + HANDLER_NEXT_OFFSET, symbol)?;
+        mem.write_u64(stack, next, symbol)?;
+        if routine != 0 {
+            let entry = callbacks.substitute(symbol, routine)?;
+            // SAFETY: `entry` is a thunk this runtime handed out for a guest
+            // function taking one pointer, which is what a cleanup handler is.
+            let handler: extern "C" fn(u64) =
+                unsafe { core::mem::transmute(entry as usize as *const ()) };
+            handler(arg);
+        }
+    }
+    // SAFETY: ends the calling thread, as the guest asked, with no guest handler
+    // left for the host to find.
+    unsafe { libc::pthread_exit(value as usize as *mut core::ffi::c_void) }
+}
+
 pub type Shim = crate::signal::Shim;
 
 /// Whether `name` (underscore already stripped) is one of this module's.
@@ -183,6 +227,7 @@ pub fn shim_for(name: &str) -> Option<Shim> {
     }
     match name {
         "pthread_create" => Some(bind!(callback "pthread_create" => pthread_create)),
+        "pthread_exit" => Some(bind!(callback "pthread_exit" => pthread_exit)),
         // Off unless asked for: this turns every lock in the program into a VM
         // exit, which is not a price to pay for a diagnostic nobody is reading.
         "pthread_mutex_lock" if debug_mutex() => {
