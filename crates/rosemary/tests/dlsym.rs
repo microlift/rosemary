@@ -136,3 +136,82 @@ fn opening_a_linked_library_gets_the_loaded_image() {
     assert_eq!(out, "same 1\ncount 1\nclose 0\n", "stderr: {err}");
 }
 
+/// The executable rebinds its own `dlsym` import by rewriting the pointer slot
+/// its stub jumps through, as fishhook and Unity Doorstop's plthook do.
+const REBIND_C: &str = r#"
+#include <dlfcn.h>
+#include <mach-o/dyld.h>
+#include <mach-o/loader.h>
+#include <mach-o/nlist.h>
+#include <stdio.h>
+#include <string.h>
+#include <sys/mman.h>
+
+static void *hooked_dlsym(void *handle, const char *name) {
+    if (strcmp(name, "rebind_probe") == 0) return (void *)0x1234;
+    return NULL;
+}
+
+static int rebind(const char *symbol, void *replacement) {
+    const struct mach_header_64 *mh = (const void *)_dyld_get_image_header(0);
+    intptr_t slide = _dyld_get_image_vmaddr_slide(0);
+    const struct load_command *lc = (const void *)(mh + 1);
+    const struct segment_command_64 *linkedit = NULL;
+    const struct symtab_command *symtab = NULL;
+    const struct dysymtab_command *dysymtab = NULL;
+    const struct segment_command_64 *segments[16];
+    int nsegments = 0;
+    for (uint32_t i = 0; i < mh->ncmds; i++) {
+        if (lc->cmd == LC_SEGMENT_64) {
+            const struct segment_command_64 *seg = (const void *)lc;
+            if (strcmp(seg->segname, SEG_LINKEDIT) == 0) linkedit = seg;
+            else if (nsegments < 16) segments[nsegments++] = seg;
+        } else if (lc->cmd == LC_SYMTAB) {
+            symtab = (const void *)lc;
+        } else if (lc->cmd == LC_DYSYMTAB) {
+            dysymtab = (const void *)lc;
+        }
+        lc = (const void *)((const char *)lc + lc->cmdsize);
+    }
+    if (!linkedit || !symtab || !dysymtab) return 0;
+    uintptr_t base = slide + linkedit->vmaddr - linkedit->fileoff;
+    const struct nlist_64 *syms = (const void *)(base + symtab->symoff);
+    const char *strings = (const char *)(base + symtab->stroff);
+    const uint32_t *indirect = (const void *)(base + dysymtab->indirectsymoff);
+    int rebound = 0;
+    for (int s = 0; s < nsegments; s++) {
+        const struct section_64 *sect = (const void *)(segments[s] + 1);
+        for (uint32_t j = 0; j < segments[s]->nsects; j++, sect++) {
+            uint32_t type = sect->flags & SECTION_TYPE;
+            if (type != S_LAZY_SYMBOL_POINTERS && type != S_NON_LAZY_SYMBOL_POINTERS) continue;
+            void **slots = (void **)(slide + sect->addr);
+            for (uint64_t k = 0; k < sect->size / sizeof(void *); k++) {
+                uint32_t index = indirect[sect->reserved1 + k];
+                if (index & (INDIRECT_SYMBOL_ABS | INDIRECT_SYMBOL_LOCAL)) continue;
+                if (strcmp(strings + syms[index].n_un.n_strx, symbol) != 0) continue;
+                uintptr_t page = (uintptr_t)&slots[k] & ~(uintptr_t)0xfff;
+                mprotect((void *)page, 0x1000, PROT_READ | PROT_WRITE);
+                slots[k] = replacement;
+                rebound++;
+            }
+        }
+    }
+    return rebound;
+}
+
+int main(void) {
+    if (!rebind("_dlsym", (void *)hooked_dlsym)) return 2;
+    printf("hooked %d\n", dlsym(RTLD_DEFAULT, "rebind_probe") == (void *)0x1234);
+    return 0;
+}
+"#;
+
+#[test]
+fn a_rewritten_import_slot_rebinds_the_import() {
+    let Some(guest) = common::build_x86_64("dlsym_rebind", REBIND_C, &[]) else {
+        skip!("cannot build x86_64 fixtures")
+    };
+    let (status, out, err) = common::run_guest_env(&[], &guest, &[]);
+    assert_eq!(status, Some(0), "stderr: {err}");
+    assert_eq!(out, "hooked 1\n", "stderr: {err}");
+}

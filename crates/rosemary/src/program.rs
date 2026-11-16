@@ -204,6 +204,22 @@ pub(crate) fn build_import_filter(keys: impl Iterator<Item = u64>, count: usize)
     filter.into_boxed_slice()
 }
 
+/// [`Program::seal_import_slots`] over any link's sites and memory.
+pub(crate) fn seal_import_slots<'a>(
+    sites: impl IntoIterator<Item = &'a mut ImportSite>,
+    memory: &impl Regions,
+) {
+    let read = |va: u64| {
+        let (base, bytes) = memory.region_at(va)?;
+        let at = va.checked_sub(base)? as usize;
+        let word = bytes.get(at..at.checked_add(8)?)?;
+        Some(u64::from_le_bytes(word.try_into().ok()?))
+    };
+    for site in sites {
+        site.binding.bound = read(site.binding.slot);
+    }
+}
+
 /// One address microlift should treat as a call out of the guest.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ImportSite {
@@ -216,8 +232,27 @@ pub struct ImportSite {
     pub tag: u64,
     /// Whether this address is the `__stubs` entry rather than the pointer slot.
     pub is_stub: bool,
+    /// The pointer slot behind the site, and what the link left in it.
+    pub binding: SlotBinding,
     /// How a call through this site is serviced, once it has been.
     pub(crate) plan: PlanCell,
+}
+
+/// The pointer slot a call through an import goes by, and what the link left
+/// in it. A guest that later stores another address there, as fishhook and
+/// Unity Doorstop's plthook do, has rebound the import.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SlotBinding {
+    pub slot: u64,
+    /// `None` until [`Program::seal_import_slots`] reads it, and for sites
+    /// with no slot of their own.
+    pub bound: Option<u64>,
+}
+
+impl SlotBinding {
+    pub fn at(slot: u64) -> Self {
+        SlotBinding { slot, bound: None }
+    }
 }
 
 impl ImportSite {
@@ -231,6 +266,21 @@ impl ImportSite {
             resolves_to_guest: self.resolved != 0 && is_guest(self.resolved),
             call: crate::abi::plan(&self.symbol, self.tag, self.resolved),
         })
+    }
+
+    /// What the guest rebound this import to, if its slot no longer holds what
+    /// the link left there.
+    pub(crate) fn rebound(&self) -> Option<u64> {
+        let bound = self.binding.bound?;
+        // SAFETY: a sealed slot is an aligned pointer in a writable segment of
+        // the program's own link, mapped for as long as the program runs, and
+        // guest addresses are host addresses. Another guest thread may be
+        // storing to it, hence the atomic load.
+        let now = unsafe {
+            (*(self.binding.slot as usize as *const std::sync::atomic::AtomicU64))
+                .load(std::sync::atomic::Ordering::Relaxed)
+        };
+        (now != bound).then_some(now)
     }
 }
 
@@ -854,6 +904,7 @@ impl<M: Regions> Program<M> {
                 resolved: b.resolved,
                 tag: b.tag,
                 is_stub: false,
+                binding: SlotBinding::at(b.slot_va),
                 plan: Default::default(),
             };
             imports.insert(b.slot_va, site.clone());
@@ -878,6 +929,7 @@ impl<M: Regions> Program<M> {
                     resolved: 0,
                     tag: 0,
                     is_stub: false,
+                    binding: SlotBinding::at(m.slot_va),
                     plan: Default::default(),
                 };
                 imports.insert(m.slot_va, site.clone());
@@ -1130,6 +1182,13 @@ impl<M: Regions> Program<M> {
             .or_else(|| crate::trampoline::locate(va))
             .or_else(|| crate::retstub::locate(va))
             .or_else(|| crate::tls::locate(va))
+    }
+
+    /// Record what each import slot holds once the link has finished writing
+    /// them, so that a guest's later store to one reads as a rebinding. See
+    /// [`SlotBinding`].
+    pub fn seal_import_slots(&mut self) {
+        seal_import_slots(self.imports.values_mut(), &self.memory);
     }
 
     /// Point this program's import slots at [trampolines](crate::trampoline).

@@ -1235,7 +1235,7 @@ fn link<S: MachSpec + 'static>(
             || contains(va)
             || vm.is_some_and(|vm| vm.program.is_guest_address(va))
     };
-    let (imports, imports_by_target) = collect_imports(&report, is_guest);
+    let (mut imports, imports_by_target) = collect_imports(&report, is_guest);
 
     // The same substitution the program's own slots get - see
     // [`crate::trampoline`] - and a `dlopen`ed plugin is where it pays most.
@@ -1249,6 +1249,7 @@ fn link<S: MachSpec + 'static>(
         &|_| false,
         &mut memory,
     );
+    crate::program::seal_import_slots(imports.values_mut(), &memory);
 
     let regions = memory
         .regions()
@@ -1453,6 +1454,7 @@ fn collect_imports(
             resolved: b.resolved,
             tag: b.tag,
             is_stub: false,
+            binding: crate::program::SlotBinding::at(b.slot_va),
             plan: Default::default(),
         };
         imports.insert(b.slot_va, site.clone());
@@ -1474,6 +1476,7 @@ fn collect_imports(
                 resolved: 0,
                 tag: 0,
                 is_stub: false,
+                binding: crate::program::SlotBinding::at(m.slot_va),
                 plan: Default::default(),
             };
             imports.insert(m.slot_va, site.clone());
@@ -2290,6 +2293,7 @@ fn remember_native_symbol(addr: u64, name: &str, library: Option<String>) -> u64
             resolved: addr,
             tag: 0,
             is_stub: false,
+            binding: Default::default(),
             plan: Default::default(),
         }))
     });

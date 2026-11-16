@@ -261,6 +261,7 @@ pub(super) mod guest {
             resolved: super::super::block::tlv_allocate as *const () as usize as u64,
             tag: 0,
             is_stub: false,
+            binding: Default::default(),
             plan: Default::default(),
         });
         Some((page + SLOT, site))
