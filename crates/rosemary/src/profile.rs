@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::ffi::CStr;
 use std::io::Write as _;
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::Relaxed};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering::Relaxed};
 use std::time::{Duration, Instant};
 
 use static_init::dynamic;
@@ -326,9 +326,22 @@ fn attribute(counts: &mut Counts, pc: u64) {
 /// Called from [`crate::startup::run`] beside [`crate::fault::install`] and for the
 /// same reason.
 pub fn start() {
+    MAIN.store(crate::thread::key(), Relaxed);
     if configured_hz().is_some() {
         set_sampling(true);
     }
+}
+
+/// The guest's main thread, which [`start`] runs on.
+static MAIN: AtomicU32 = AtomicU32::new(0);
+
+/// Whether `ROSEMARY_PROFILE_THREAD=main` asked for the main thread alone: the
+/// one a game's frame rate usually waits on, which the other threads' samples
+/// would otherwise bury.
+fn main_only() -> bool {
+    #[dynamic]
+    static MAIN_ONLY: bool = std::env::var("ROSEMARY_PROFILE_THREAD").is_ok_and(|v| v == "main");
+    *MAIN_ONLY
 }
 
 /// Whether the sampler is taking samples right now.
@@ -457,7 +470,7 @@ fn sweep_forever(period: Duration, every: Option<Duration>) {
         // The registry is scanned with the counts held, which is safe in the
         // one direction that matters.
         crate::thread::each_key(|port| {
-            if port == mine {
+            if port == mine || (main_only() && port != MAIN.load(Relaxed)) {
                 return;
             }
             found += 1;
