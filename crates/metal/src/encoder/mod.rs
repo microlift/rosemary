@@ -11,6 +11,7 @@ mod render;
 mod retire;
 mod state;
 mod target;
+mod viewport;
 mod visibility;
 
 use bind::*;
@@ -26,6 +27,7 @@ use render::*;
 use retire::*;
 use state::*;
 use target::*;
+use viewport::*;
 use visibility::*;
 
 use objc::address::AddressSet;
@@ -319,6 +321,7 @@ pub(crate) struct Encoder {
     fill_mode: u64,
     depth_clip: u64,
     depth_bias: RecordedDepthBias,
+    viewports: ViewportState,
     in_render_pass: bool,
     /// A render pass whose Vulkan pass begins at its first draw and is
     /// ordered against earlier passes by what it touches; `None` for every
@@ -746,7 +749,9 @@ pub(crate) fn install() {
         "setDepthStencilState:" => set_depth_stencil_state, c"v24@0:8@16";
         "setStencilReferenceValue:" => set_stencil_reference, c"v20@0:8I16";
         "setViewport:" => set_viewport, c"v64@0:8{MTLViewport=dddddd}16";
+        "setViewports:count:" => set_viewports, c"v32@0:8r^{MTLViewport=dddddd}16Q24";
         "setScissorRect:" => set_scissor, c"v48@0:8{MTLScissorRect=QQQQ}16";
+        "setScissorRects:count:" => set_scissors, c"v32@0:8r^{MTLScissorRect=QQQQ}16Q24";
         "setDepthBias:slopeScale:clamp:" => set_depth_bias, c"v28@0:8f16f20f24";
         "setBlendColorRed:green:blue:alpha:" => set_blend_color, c"v32@0:8f16f20f24f28";
         "dispatchThreadgroups:threadsPerThreadgroup:" => dispatch_threadgroups,

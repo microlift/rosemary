@@ -5,6 +5,7 @@ use crate::constants::*;
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub(crate) struct RenderVariantKey {
     pub topology: u64,
+    pub viewport_count: u32,
     pub cull_mode: u64,
     pub winding: u64,
     pub fill_mode: u64,
@@ -488,6 +489,7 @@ impl RenderPipeline {
             };
             let expected = RenderVariantKey {
                 topology,
+                viewport_count: 1,
                 cull_mode: 0,
                 winding: 0,
                 fill_mode: 0,
@@ -552,8 +554,8 @@ impl RenderPipeline {
         let assembly =
             vk::PipelineInputAssemblyStateCreateInfo::default().topology(topology(key.topology));
         let viewport = vk::PipelineViewportStateCreateInfo::default()
-            .viewport_count(1)
-            .scissor_count(1);
+            .viewport_count(key.viewport_count)
+            .scissor_count(key.viewport_count);
         let raster = vk::PipelineRasterizationStateCreateInfo::default()
             .depth_clamp_enable(key.depth_clip == MTL_DEPTH_CLIP_MODE_CLAMP)
             .polygon_mode(polygon_mode(key.fill_mode))

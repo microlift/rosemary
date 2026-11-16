@@ -642,26 +642,12 @@ pub(super) fn record_pass_defaults(
     command_buffer: vk::CommandBuffer,
     area: vk::Rect2D,
     depth_bias: &mut RecordedDepthBias,
+    viewports: &mut ViewportState,
 ) {
     depth_bias.record(device, command_buffer, DepthBias::NONE);
-    let (width, height) = (area.extent.width, area.extent.height);
+    *viewports = ViewportState::new(area);
     // SAFETY: recording into a command buffer inside the pass.
     unsafe {
-        // Metal's default viewport and scissor cover the attachments, and the
-        // viewport is flipped for the same reason `-setViewport:` flips.
-        device.cmd_set_viewport(
-            command_buffer,
-            0,
-            &[vk::Viewport {
-                x: 0.0,
-                y: height as f32,
-                width: width as f32,
-                height: -(height as f32),
-                min_depth: 0.0,
-                max_depth: 1.0,
-            }],
-        );
-        device.cmd_set_scissor(command_buffer, 0, &[area]);
         device.cmd_set_blend_constants(command_buffer, &[0.0; 4]);
         device.cmd_set_stencil_reference(command_buffer, vk::StencilFaceFlags::FRONT_AND_BACK, 0);
     }
@@ -745,6 +731,7 @@ pub(crate) fn begin_render_pass(
             command.command_buffer,
             area,
             &mut encoder.depth_bias,
+            &mut encoder.viewports,
         );
         let is_clear = |op: vk::AttachmentLoadOp| op == vk::AttachmentLoadOp::CLEAR;
         let works_undrawn = key.colors.iter().any(|color| is_clear(color.1))
@@ -784,6 +771,7 @@ pub(crate) fn begin_render_pass(
             command.command_buffer,
             area,
             &mut encoder.depth_bias,
+            &mut encoder.viewports,
         );
     }
     gpu::milestone("render pass");

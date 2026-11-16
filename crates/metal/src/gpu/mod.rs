@@ -116,6 +116,7 @@ pub struct Gpu {
     pub(crate) lost: AtomicBool,
     memory: vk::PhysicalDeviceMemoryProperties,
     pub limits: vk::PhysicalDeviceLimits,
+    pub(crate) max_viewports: u32,
     /// One layout per distinct set of Metal binding indices, so pipelines
     /// sharing a resource shape share a layout.
     layouts: Mutex<DescriptorLayouts>,
@@ -372,6 +373,7 @@ fn create_device(
         storage_push_constant8: target.storage_push_constant8.into(),
         shader_float16: target.shader_float16.into(),
         shader_int8: target.shader_int8.into(),
+        shader_output_viewport_index: target.shader_output_viewport_index.into(),
         sampler_mirror_clamp_to_edge: capabilities.sampler_mirror_clamp_to_edge.into(),
         host_query_reset: capabilities.host_query_reset.into(),
         timeline_semaphore: capabilities.timeline_semaphores.into(),
@@ -650,6 +652,9 @@ impl Gpu {
             if target.shader_float16 || target.shader_int8 {
                 enabled.push(ash::khr::shader_float16_int8::NAME.as_ptr());
             }
+        }
+        if target.vulkan_version < (1, 2) && target.shader_output_viewport_index {
+            enabled.push(ash::ext::shader_viewport_index_layer::NAME.as_ptr());
         }
         if target.vulkan_version < (1, 3) && target.demote_to_helper_invocation {
             enabled.push(ash::ext::shader_demote_to_helper_invocation::NAME.as_ptr());
@@ -957,6 +962,11 @@ impl Gpu {
             occlusion_pools: Mutex::new(Vec::new()),
             occlusion_precise: features.occlusion_query_precise == vk::TRUE,
             alpha_to_one: features.alpha_to_one == vk::TRUE,
+            max_viewports: if features.multi_viewport == vk::TRUE {
+                properties.limits.max_viewports
+            } else {
+                1
+            },
             dynamic_render_state: extended_dynamic_state,
             dynamic_rendering,
             dynamic_raster,

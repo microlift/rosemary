@@ -25,6 +25,7 @@ mod control_flow;
 mod geometry;
 mod pipeline_buffers;
 mod source_constants;
+mod viewports;
 
 fn device_for_tests() -> Id {
     bootstrap();

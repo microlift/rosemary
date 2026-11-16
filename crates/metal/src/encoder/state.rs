@@ -205,51 +205,6 @@ raster_setter!(set_front_facing_winding, winding);
 raster_setter!(set_triangle_fill_mode, fill_mode);
 raster_setter!(set_depth_clip_mode, depth_clip);
 
-pub(super) unsafe extern "C" fn set_viewport(receiver: Id, _sel: Sel, viewport: Viewport) {
-    // SAFETY: an encoder of this crate's.
-    let command = unsafe { object::body::<Encoder>(receiver) }.command();
-    // Metal's clip space has Y up and its framebuffer origin is top left;
-    // Vulkan's clip space has Y down. A negative viewport height, core since
-    // Vulkan 1.1, is the exact correction.
-    let flipped = vk::Viewport {
-        x: viewport.origin_x as f32,
-        y: (viewport.origin_y + viewport.height) as f32,
-        width: viewport.width as f32,
-        height: -(viewport.height as f32),
-        min_depth: viewport.znear as f32,
-        max_depth: viewport.zfar as f32,
-    };
-    // SAFETY: recording into this command buffer.
-    unsafe {
-        command
-            .gpu
-            .device
-            .cmd_set_viewport(command.command_buffer, 0, &[flipped])
-    };
-}
-
-pub(super) unsafe extern "C" fn set_scissor(receiver: Id, _sel: Sel, rect: ScissorRect) {
-    // SAFETY: an encoder of this crate's.
-    let command = unsafe { object::body::<Encoder>(receiver) }.command();
-    let scissor = vk::Rect2D {
-        offset: vk::Offset2D {
-            x: rect.x as i32,
-            y: rect.y as i32,
-        },
-        extent: vk::Extent2D {
-            width: rect.width as u32,
-            height: rect.height as u32,
-        },
-    };
-    // SAFETY: recording into this command buffer.
-    unsafe {
-        command
-            .gpu
-            .device
-            .cmd_set_scissor(command.command_buffer, 0, &[scissor])
-    };
-}
-
 pub(super) unsafe extern "C" fn set_depth_bias(
     receiver: Id,
     _sel: Sel,

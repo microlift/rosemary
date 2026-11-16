@@ -58,6 +58,7 @@ pub struct TargetProfile {
     pub sample_rate_shading: bool,
     pub geometry_shader: bool,
     pub multi_viewport: bool,
+    pub shader_output_viewport_index: bool,
     pub demote_to_helper_invocation: bool,
     /// Vulkan 1.1 subgroup operations support `GroupNonUniform` when the
     /// physical device reports the basic operation for the shader stage.
@@ -104,6 +105,7 @@ impl TargetProfile {
             sample_rate_shading: false,
             geometry_shader: false,
             multi_viewport: false,
+            shader_output_viewport_index: false,
             demote_to_helper_invocation: false,
             group_non_uniform: false,
             image_1d: true,
@@ -138,6 +140,10 @@ impl TargetProfile {
             "SampleRateShading" => self.sample_rate_shading,
             "Geometry" => self.geometry_shader,
             "MultiViewport" => self.multi_viewport,
+            "ShaderViewportIndex" => self.shader_output_viewport_index,
+            "ShaderViewportIndexLayerEXT" => {
+                self.shader_output_viewport_index && self.vulkan_version < (1, 2)
+            }
             "DemoteToHelperInvocation" => self.demote_to_helper_invocation,
             "GroupNonUniform" => self.group_non_uniform,
             "Image1D" => self.image_1d,
@@ -158,6 +164,9 @@ impl TargetProfile {
                 self.variable_pointers_storage_buffer || self.variable_pointers
             }
             "SPV_EXT_demote_to_helper_invocation" => self.demote_to_helper_invocation,
+            "SPV_EXT_shader_viewport_index_layer" => {
+                self.shader_output_viewport_index && self.vulkan_version < (1, 2)
+            }
             "SPV_KHR_8bit_storage" => {
                 self.storage_buffer8_bit_access
                     || self.uniform_and_storage_buffer8_bit_access

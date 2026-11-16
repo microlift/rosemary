@@ -30,6 +30,7 @@ pub(crate) fn new_encoder(command_buffer: Id, kind: Kind) -> Id {
             fill_mode: 0,
             depth_clip: 0,
             depth_bias: RecordedDepthBias::default(),
+            viewports: ViewportState::default(),
             in_render_pass: false,
             lazy: None,
             sub_encoder: false,
@@ -840,6 +841,7 @@ impl Encoder {
         };
         let key = RenderVariantKey {
             topology: primitive,
+            viewport_count: self.viewports.count(),
             cull_mode: self.cull_mode,
             winding: self.winding,
             fill_mode: self.fill_mode,
@@ -870,6 +872,7 @@ impl Encoder {
         let command = self.command();
         let device = &command.gpu.device;
         let vk_command = command.command_buffer;
+        self.viewports.record(device, vk_command);
         if command.gpu.dynamic_render_state && self.render_dynamic != Some(wanted) {
             wanted.record(command.gpu, vk_command, self.render_dynamic.as_ref());
             self.render_dynamic = Some(wanted);
