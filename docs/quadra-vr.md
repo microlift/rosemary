@@ -6,7 +6,7 @@ Quadra gives Roblox's macOS client an OpenXR headset by injecting a library into
 those sources run here, how Quadra builds and starts the library, and what has
 and has not been checked. It documents the `quadra-vr` branch of this fork; none
 of it is upstream. "Quadra" is the Rust launcher
-([QuadraHQ/quadra-rewrite](https://github.com/QuadraHQ/quadra-rewrite)); the
+([QuadraHQ/Quadra](https://github.com/QuadraHQ/Quadra)); the
 Python launcher it replaced, which ran the same sources under Darling, is
 discontinued.
 
