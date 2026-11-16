@@ -22,6 +22,7 @@ macro_rules! isolate_metal_fixture {
 }
 
 mod control_flow;
+mod depth_stencil;
 mod geometry;
 mod nonshared_events;
 mod pipeline_buffers;
@@ -3940,6 +3941,7 @@ fn check_fill_and_depth_clip_modes(device: Id) {
 }
 
 const MTL_PIXEL_FORMAT_DEPTH32_FLOAT: u64 = 252;
+const MTL_PIXEL_FORMAT_STENCIL8: u64 = 253;
 const MTL_STORAGE_MODE_PRIVATE: u64 = 2;
 const MTL_COMPARE_FUNCTION_LESS_EQUAL: u64 = 3;
 const MTL_LOAD_ACTION_CLEAR: u64 = 2;
@@ -3971,6 +3973,17 @@ fn covering_draw(device: Id) -> Option<CoveringDraw> {
 /// A covering draw whose pipeline has `depth_format`, with its triangle at
 /// depth `z`.
 fn covering_draw_with_depth(device: Id, depth_format: u64, z: f32) -> Option<CoveringDraw> {
+    covering_draw_with_formats(device, depth_format, MTL_PIXEL_FORMAT_INVALID, z)
+}
+
+/// A covering draw whose pipeline declares independent depth and stencil
+/// formats, with its triangle at depth `z`.
+fn covering_draw_with_formats(
+    device: Id,
+    depth_format: u64,
+    stencil_format: u64,
+    z: f32,
+) -> Option<CoveringDraw> {
     let gpu = gpu_of(device).expect("a Vulkan device");
     if !gpu.occlusion_precise {
         return None;
@@ -4010,7 +4023,7 @@ fn covering_draw_with_depth(device: Id, depth_format: u64, z: f32) -> Option<Cov
             vertex_descriptor,
             colors: [pipeline::ColorAttachment::fresh(); pipeline::COLOR_ATTACHMENTS],
             depth_format,
-            stencil_format: 0,
+            stencil_format,
             sample_count: 1,
             alpha_to_coverage: false,
             alpha_to_one: false,
@@ -4109,6 +4122,210 @@ impl CoveringDraw {
                 0,
             );
         }
+    }
+}
+
+/// Metal's depth and stencil attachment descriptors are independent. A draw
+/// must update both when they name a D32 texture and a separate S8 texture.
+#[test]
+fn separate_depth_and_stencil_attachments_are_both_written() {
+    isolate_metal_fixture!();
+    if let Some(device) = gpu_device() {
+        check_separate_depth_and_stencil_attachments(device);
+    }
+}
+
+#[test]
+fn separate_depth_and_stencil_attachments_work_without_dynamic_rendering() {
+    isolate_metal_fixture!();
+    if let Some(device) = gpu_device_without_dynamic_rendering() {
+        check_separate_depth_and_stencil_attachments(device);
+    }
+}
+
+fn check_separate_depth_and_stencil_attachments(device: Id) {
+    let gpu = gpu_of(device).expect("a Vulkan device");
+    let Some(fixture) = covering_draw_with_formats(
+        device,
+        MTL_PIXEL_FORMAT_DEPTH32_FLOAT,
+        MTL_PIXEL_FORMAT_STENCIL8,
+        0.5,
+    ) else {
+        return;
+    };
+    let texture = |pixel_format| {
+        resource::new_texture(
+            gpu,
+            resource::TextureDescriptor {
+                texture_type: MTL_TEXTURE_TYPE_2D,
+                pixel_format,
+                width: COVERING_SIZE,
+                height: COVERING_SIZE,
+                depth: 1,
+                mipmap_level_count: 1,
+                sample_count: 1,
+                array_length: 1,
+                storage_mode: MTL_STORAGE_MODE_PRIVATE,
+                usage: gpu::USAGE_RENDER_TARGET,
+            },
+        )
+    };
+    let depth = texture(MTL_PIXEL_FORMAT_DEPTH32_FLOAT);
+    let stencil = texture(MTL_PIXEL_FORMAT_STENCIL8);
+    assert!(!depth.is_null() && !stencil.is_null());
+    let invert = resource::StencilState {
+        pass: 5, // MTLStencilOperationInvert
+        ..resource::StencilState::default()
+    };
+    let depth_stencil = resource::new_depth_stencil_state(resource::DepthStencilState {
+        depth_compare: MTL_COMPARE_FUNCTION_LESS_EQUAL,
+        depth_write: true,
+        front: invert,
+        back: invert,
+        stencil_enabled: true,
+    });
+    let pass = fixture.pass(std::ptr::null_mut());
+    // SAFETY: objects this test made, sent the selectors they implement.
+    unsafe {
+        let attachment = send(pass, "depthAttachment");
+        send_with_object(attachment, "setTexture:", depth);
+        send_number(attachment, "setLoadAction:", MTL_LOAD_ACTION_CLEAR);
+        send_number(attachment, "setStoreAction:", MTL_STORE_ACTION_STORE);
+        let attachment = send(pass, "stencilAttachment");
+        send_with_object(attachment, "setTexture:", stencil);
+        send_number(attachment, "setLoadAction:", MTL_LOAD_ACTION_CLEAR);
+        send_number(attachment, "setStoreAction:", MTL_STORE_ACTION_STORE);
+        send_number(attachment, "setClearStencil:", 0x5a);
+
+        let command = send(fixture.queue, "commandBuffer");
+        let render = render_encoder(command, pass);
+        fixture.bind(render);
+        send_with_object(render, "setDepthStencilState:", depth_stencil);
+        draw(render, 3);
+        send_void(render, "endEncoding");
+        send_void(command, "commit");
+        send_void(command, "waitUntilCompleted");
+    }
+
+    let mut depth_bytes = [0u8; (COVERING_SIZE * COVERING_SIZE * 4) as usize];
+    let mut stencil_bytes = [0u8; (COVERING_SIZE * COVERING_SIZE) as usize];
+    // SAFETY: each output buffer covers the complete texture region.
+    unsafe {
+        get_bytes(
+            depth,
+            [0, 0, COVERING_SIZE, COVERING_SIZE],
+            &mut depth_bytes,
+            COVERING_SIZE * 4,
+        );
+        get_bytes(
+            stencil,
+            [0, 0, COVERING_SIZE, COVERING_SIZE],
+            &mut stencil_bytes,
+            COVERING_SIZE,
+        );
+    }
+    let depths = depth_bytes
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|bytes| f32::from_ne_bytes(*bytes))
+        .collect::<Vec<_>>();
+    assert!(
+        stencil_bytes.iter().all(|&value| value == 0xa5),
+        "depth values: {depths:?}; stencil values: {stencil_bytes:?}"
+    );
+    assert!(
+        depths.iter().all(|depth| (*depth - 0.5).abs() < 0.0001),
+        "depth values: {depths:?}"
+    );
+
+    // A second, undrawn pass exercises the inbound bridge: Load must preserve
+    // both independent images through the temporary combined attachment.
+    let loaded = object::make(
+        c"MTLRenderPassDescriptor",
+        encoder::RenderPassDescriptor::default(),
+    );
+    // SAFETY: objects this test made, sent the selectors they implement.
+    unsafe {
+        for (selector, texture) in [("depthAttachment", depth), ("stencilAttachment", stencil)] {
+            let attachment = send(loaded, selector);
+            send_with_object(attachment, "setTexture:", texture);
+            send_number(attachment, "setLoadAction:", 1); // Load
+            send_number(attachment, "setStoreAction:", MTL_STORE_ACTION_STORE);
+        }
+        let command = send(fixture.queue, "commandBuffer");
+        let render = render_encoder(command, loaded);
+        send_void(render, "endEncoding");
+        send_void(command, "commit");
+        send_void(command, "waitUntilCompleted");
+        let expected_depth = depth_bytes;
+        let expected_stencil = stencil_bytes;
+        depth_bytes.fill(0);
+        stencil_bytes.fill(0);
+        get_bytes(
+            depth,
+            [0, 0, COVERING_SIZE, COVERING_SIZE],
+            &mut depth_bytes,
+            COVERING_SIZE * 4,
+        );
+        get_bytes(
+            stencil,
+            [0, 0, COVERING_SIZE, COVERING_SIZE],
+            &mut stencil_bytes,
+            COVERING_SIZE,
+        );
+        assert_eq!(depth_bytes, expected_depth);
+        assert_eq!(stencil_bytes, expected_stencil);
+    }
+
+    // One-sample StoreAndMultisampleResolve is a copy. Its two Metal
+    // destinations remain independent even though the Vulkan pass uses one
+    // temporary combined attachment.
+    let resolved_depth = texture(MTL_PIXEL_FORMAT_DEPTH32_FLOAT);
+    let resolved_stencil = texture(MTL_PIXEL_FORMAT_STENCIL8);
+    let resolving = object::make(
+        c"MTLRenderPassDescriptor",
+        encoder::RenderPassDescriptor::default(),
+    );
+    // SAFETY: objects this test made, sent the selectors they implement.
+    unsafe {
+        for (selector, source, destination) in [
+            ("depthAttachment", depth, resolved_depth),
+            ("stencilAttachment", stencil, resolved_stencil),
+        ] {
+            let attachment = send(resolving, selector);
+            send_with_object(attachment, "setTexture:", source);
+            send_number(attachment, "setLoadAction:", 1); // Load
+            send_number(attachment, "setStoreAction:", 3); // StoreAndMultisampleResolve
+            send_with_object(attachment, "setResolveTexture:", destination);
+        }
+        let command = send(fixture.queue, "commandBuffer");
+        let render = render_encoder(command, resolving);
+        send_void(render, "endEncoding");
+        send_void(command, "commit");
+        send_void(command, "waitUntilCompleted");
+        depth_bytes.fill(0);
+        stencil_bytes.fill(0);
+        get_bytes(
+            resolved_depth,
+            [0, 0, COVERING_SIZE, COVERING_SIZE],
+            &mut depth_bytes,
+            COVERING_SIZE * 4,
+        );
+        get_bytes(
+            resolved_stencil,
+            [0, 0, COVERING_SIZE, COVERING_SIZE],
+            &mut stencil_bytes,
+            COVERING_SIZE,
+        );
+        assert!(
+            depth_bytes
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .all(|bytes| (f32::from_ne_bytes(*bytes) - 0.5).abs() < 0.0001)
+        );
+        assert!(stencil_bytes.iter().all(|&value| value == 0xa5));
     }
 }
 

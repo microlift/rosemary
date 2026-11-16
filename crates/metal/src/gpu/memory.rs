@@ -449,7 +449,11 @@ impl Gpu {
         }
         if description.usage & USAGE_RENDER_TARGET != 0 || description.usage == 0 {
             usage |= match aspect_of(description.format) {
-                aspect if aspect.contains(vk::ImageAspectFlags::DEPTH) => {
+                aspect
+                    if aspect.intersects(
+                        vk::ImageAspectFlags::DEPTH | vk::ImageAspectFlags::STENCIL,
+                    ) =>
+                {
                     vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT
                 }
                 _ => vk::ImageUsageFlags::COLOR_ATTACHMENT,
@@ -913,11 +917,46 @@ impl Gpu {
                 None => vk::AttachmentReference::default().attachment(vk::ATTACHMENT_UNUSED),
             })
             .collect::<Vec<_>>();
-        let depth = key.depth.map(|(format, load, store)| {
-            let (stencil_load, stencil_store) = key.stencil.unwrap_or((
+        if key.depth.is_some() && key.stencil.is_some() && !key.depth_stencil_shared {
+            return Err(
+                "Vulkan requires depth and stencil to share one attachment image".to_owned(),
+            );
+        }
+        let depth_stencil = match (key.depth, key.stencil) {
+            (
+                Some((depth_format, depth_load, depth_store)),
+                Some((stencil_format, stencil_load, stencil_store)),
+            ) => {
+                if depth_format != stencil_format {
+                    return Err(
+                        "one legacy depth/stencil attachment cannot have two formats".to_owned(),
+                    );
+                }
+                Some((
+                    depth_format,
+                    depth_load,
+                    depth_store,
+                    stencil_load,
+                    stencil_store,
+                ))
+            }
+            (Some((format, load, store)), None) => Some((
+                format,
+                load,
+                store,
                 vk::AttachmentLoadOp::DONT_CARE,
                 vk::AttachmentStoreOp::DONT_CARE,
-            ));
+            )),
+            (None, Some((format, load, store))) => Some((
+                format,
+                vk::AttachmentLoadOp::DONT_CARE,
+                vk::AttachmentStoreOp::DONT_CARE,
+                load,
+                store,
+            )),
+            (None, None) => None,
+        };
+        let depth = depth_stencil.map(|(format, load, store, stencil_load, stencil_store)| {
             let reference = vk::AttachmentReference::default()
                 .attachment(attachments.len() as u32)
                 .layout(vk::ImageLayout::GENERAL);

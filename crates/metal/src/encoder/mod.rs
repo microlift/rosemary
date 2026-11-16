@@ -343,6 +343,9 @@ pub(crate) struct Encoder {
     /// Resolves a subpass cannot perform because the attachment has one sample,
     /// recorded as image copies once the pass has ended.
     pending_copies: Vec<PendingCopy>,
+    /// Separate Metal depth/stencil images copied back from their combined
+    /// Vulkan attachment once the pass ends.
+    pending_depth_stencil_bridges: Vec<DepthStencilBridge>,
     /// `ROSEMARY_PASS_OUT`: the attachments to read back when this pass ends,
     /// and the ordinal the capture of this pass is named by.
     capture_targets: Vec<crate::capture::Target>,

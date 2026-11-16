@@ -36,6 +36,134 @@ pub(crate) struct PendingCopy {
     pub aspect: vk::ImageAspectFlags,
 }
 
+/// One aspect copied through a buffer between a Metal depth/stencil texture
+/// and the temporary combined Vulkan attachment used for a pass.
+#[derive(Clone, Copy)]
+pub(crate) struct DepthStencilBridge {
+    pub original: vk::Image,
+    pub original_level: u32,
+    pub original_slice: u32,
+    pub combined: vk::Image,
+    pub width: u32,
+    pub height: u32,
+    pub aspect: vk::ImageAspectFlags,
+    pub bytes_per_texel: u64,
+    /// One transfer buffer reused for the inbound and outbound copies.
+    pub staging: vk::Buffer,
+    /// Preserve the original aspect before the pass. Clear and DontCare do
+    /// not need an inbound copy.
+    pub load: bool,
+}
+
+/// Record one direction of a separate-depth/stencil bridge.
+///
+/// The buffer is owned by the command until its submission retires. Going
+/// through it is required because Vulkan image copies require the standalone
+/// and combined depth/stencil formats to match.
+pub(super) fn record_depth_stencil_bridge(
+    command: &mut CommandBuffer,
+    bridge: &mut DepthStencilBridge,
+    into_combined: bool,
+) -> Result<(), String> {
+    let length = u64::from(bridge.width)
+        .checked_mul(u64::from(bridge.height))
+        .and_then(|pixels| pixels.checked_mul(bridge.bytes_per_texel))
+        .ok_or("depth/stencil bridge size overflow")?;
+    let buffer = if bridge.staging == vk::Buffer::null() {
+        let staging = command.gpu.create_staging_buffer(length)?;
+        let buffer = staging.buffer;
+        command.staging.push(staging);
+        bridge.staging = buffer;
+        buffer
+    } else {
+        bridge.staging
+    };
+    let original = vk::ImageSubresourceLayers {
+        aspect_mask: bridge.aspect,
+        mip_level: bridge.original_level,
+        base_array_layer: bridge.original_slice,
+        layer_count: 1,
+    };
+    let combined = vk::ImageSubresourceLayers {
+        aspect_mask: bridge.aspect,
+        mip_level: 0,
+        base_array_layer: 0,
+        layer_count: 1,
+    };
+    let extent = vk::Extent3D {
+        width: bridge.width,
+        height: bridge.height,
+        depth: 1,
+    };
+    let (source_image, source_subresource, destination_image, destination_subresource) =
+        if into_combined {
+            (bridge.original, original, bridge.combined, combined)
+        } else {
+            (bridge.combined, combined, bridge.original, original)
+        };
+    let from = vk::BufferImageCopy::default()
+        .image_subresource(source_subresource)
+        .image_extent(extent);
+    let to = vk::BufferImageCopy::default()
+        .image_subresource(destination_subresource)
+        .image_extent(extent);
+    let before = vk::MemoryBarrier::default()
+        .src_access_mask(vk::AccessFlags::MEMORY_WRITE)
+        .dst_access_mask(vk::AccessFlags::TRANSFER_READ);
+    let between = vk::MemoryBarrier::default()
+        .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+        .dst_access_mask(vk::AccessFlags::TRANSFER_READ);
+    let after = vk::MemoryBarrier::default()
+        .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+        .dst_access_mask(vk::AccessFlags::MEMORY_READ | vk::AccessFlags::MEMORY_WRITE);
+    // SAFETY: recording outside a pass; both images stay in GENERAL and the
+    // command owns the staging buffer until this submission retires.
+    unsafe {
+        command.gpu.device.cmd_pipeline_barrier(
+            command.command_buffer,
+            vk::PipelineStageFlags::ALL_COMMANDS,
+            vk::PipelineStageFlags::TRANSFER,
+            vk::DependencyFlags::empty(),
+            &[before],
+            &[],
+            &[],
+        );
+        command.gpu.device.cmd_copy_image_to_buffer(
+            command.command_buffer,
+            source_image,
+            vk::ImageLayout::GENERAL,
+            buffer,
+            &[from],
+        );
+        command.gpu.device.cmd_pipeline_barrier(
+            command.command_buffer,
+            vk::PipelineStageFlags::TRANSFER,
+            vk::PipelineStageFlags::TRANSFER,
+            vk::DependencyFlags::empty(),
+            &[between],
+            &[],
+            &[],
+        );
+        command.gpu.device.cmd_copy_buffer_to_image(
+            command.command_buffer,
+            buffer,
+            destination_image,
+            vk::ImageLayout::GENERAL,
+            &[to],
+        );
+        command.gpu.device.cmd_pipeline_barrier(
+            command.command_buffer,
+            vk::PipelineStageFlags::TRANSFER,
+            vk::PipelineStageFlags::ALL_COMMANDS,
+            vk::DependencyFlags::empty(),
+            &[after],
+            &[],
+            &[],
+        );
+    }
+    Ok(())
+}
+
 pub(crate) const RENDER_TARGETS: usize = 8;
 
 pub(crate) struct RenderPassDescriptor {
@@ -266,6 +394,34 @@ pub(super) fn resolve_modes(
     Ok((depth_mode, stencil_mode))
 }
 
+/// Resolve filters on a one-sample attachment all select its only sample.
+/// Validate the Metal enums, but no Vulkan depth/stencil-resolve feature is
+/// needed because the operation is recorded as a plain copy.
+fn one_sample_resolve_modes(
+    depth: Option<u64>,
+    stencil: Option<u64>,
+) -> Result<(vk::ResolveModeFlags, vk::ResolveModeFlags), String> {
+    let depth = match depth {
+        Some(0..=2) => vk::ResolveModeFlags::SAMPLE_ZERO,
+        Some(filter) => {
+            return Err(format!(
+                "MTLMultisampleDepthResolveFilter {filter} is not a filter"
+            ));
+        }
+        None => vk::ResolveModeFlags::NONE,
+    };
+    let stencil = match stencil {
+        Some(0..=1) => vk::ResolveModeFlags::SAMPLE_ZERO,
+        Some(filter) => {
+            return Err(format!(
+                "MTLMultisampleStencilResolveFilter {filter} is not a filter"
+            ));
+        }
+        None => vk::ResolveModeFlags::NONE,
+    };
+    Ok((depth, stencil))
+}
+
 /// Where the depth/stencil attachment is resolved to, when the pass asks for a
 /// resolve and the device and the destination can carry it.
 pub(super) struct DepthResolveTarget {
@@ -277,36 +433,65 @@ pub(super) struct DepthResolveTarget {
     pub texture: Id,
 }
 
-/// The depth/stencil resolve one `MTLRenderPassDescriptor` asks for.
+/// Texture views can name the same attachment without sharing a Metal handle.
+fn same_texture_subresource(a: (Id, u64, u64), b: (Id, u64, u64)) -> bool {
+    let ((a, a_level, a_slice), (b, b_level, b_slice)) = (a, b);
+    if a.is_null() || b.is_null() {
+        return false;
+    }
+    // SAFETY: only textures of this crate's are attached.
+    let (a, b) = unsafe {
+        (
+            object::body_ref::<Texture>(a),
+            object::body_ref::<Texture>(b),
+        )
+    };
+    std::ptr::eq(a.gpu, b.gpu)
+        && a.image.image == b.image.image
+        && a.image.format == b.image.format
+        && a_level
+            .checked_add(u64::from(a.image.base_level))
+            .zip(b_level.checked_add(u64::from(b.image.base_level)))
+            .is_some_and(|(a, b)| a == b)
+        && a_slice
+            .checked_add(u64::from(a.image.base_layer))
+            .zip(b_slice.checked_add(u64::from(b.image.base_layer)))
+            .is_some_and(|(a, b)| a == b)
+}
+
+/// The resolve for a shared multisampled depth/stencil attachment.
 ///
 /// Metal names a resolve destination on the depth attachment and another on
 /// the stencil one; a Vulkan subpass has a single depth/stencil resolve
-/// attachment with a mode per aspect, so the two must name the same texture.
+/// attachment with a mode per aspect, so the two must name the same subresource.
 /// A resolve this cannot express is reported and dropped, which leaves the
 /// destination as it was rather than holding one arbitrary sample.
-///
-/// `attached` is the texture the pass attached, which is the depth one where
-/// it has both: the aspect whose texture is not attached is not resolved
-/// either, because it is not rendered into.
 fn depth_resolve(
     gpu: &Gpu,
     descriptor: &RenderPassDescriptor,
-    attached: Id,
-    format: vk::Format,
-    aspect: vk::ImageAspectFlags,
+    source: &Texture,
 ) -> Option<DepthResolveTarget> {
     let wants = |attachment: &AttachmentDescriptor| {
-        attachment.texture == attached
-            && resolves(attachment.store_action)
-            && !attachment.resolve_texture.is_null()
+        resolves(attachment.store_action) && !attachment.resolve_texture.is_null()
     };
     let depth = wants(&descriptor.depth).then_some(&descriptor.depth);
     let mut stencil = wants(&descriptor.stencil).then_some(&descriptor.stencil);
     if let (Some(from_depth), Some(from_stencil)) = (depth, stencil)
-        && from_depth.resolve_texture != from_stencil.resolve_texture
+        && !same_texture_subresource(
+            (
+                from_depth.resolve_texture,
+                from_depth.resolve_level,
+                from_depth.resolve_slice,
+            ),
+            (
+                from_stencil.resolve_texture,
+                from_stencil.resolve_level,
+                from_stencil.resolve_slice,
+            ),
+        )
     {
         gpu::trace_once(
-            "a render pass names separate depth and stencil resolve textures, which one Vulkan \
+            "a render pass names separate depth and stencil resolve subresources, which one Vulkan \
              resolve attachment cannot hold: the stencil one is ignored",
         );
         stencil = None;
@@ -314,6 +499,7 @@ fn depth_resolve(
     let named = depth.or(stencil)?;
     // SAFETY: only a texture of this crate's is attached.
     let destination = unsafe { object::body_ref::<Texture>(named.resolve_texture) };
+    let format = source.image.format;
     if destination.image.format != format {
         gpu::trace_once(format!(
             "render pass resolves depth {format:?} into {:?}, which Vulkan cannot do",
@@ -333,7 +519,7 @@ fn depth_resolve(
     // what the pass writes, so the whole resolve is reported instead.
     let (depth_mode, stencil_mode) = match resolve_modes(
         resolving.support,
-        aspect,
+        source.image.aspect,
         depth.map(|attachment| attachment.resolve_filter),
         stencil.map(|attachment| attachment.resolve_filter),
     ) {
@@ -359,6 +545,92 @@ fn depth_resolve(
     })
 }
 
+/// The resolve destination one independently described depth or stencil
+/// aspect names. A one-sample bridge uses this for the post-pass copy from
+/// the original image; a lone aspect can use it directly.
+fn aspect_resolve(
+    gpu: &Gpu,
+    attachment: &AttachmentDescriptor,
+    format: vk::Format,
+    aspect: vk::ImageAspectFlags,
+) -> Option<DepthResolveTarget> {
+    if !resolves(attachment.store_action) || attachment.resolve_texture.is_null() {
+        return None;
+    }
+    let wanted = if aspect == vk::ImageAspectFlags::DEPTH {
+        (Some(attachment.resolve_filter), None)
+    } else if aspect == vk::ImageAspectFlags::STENCIL {
+        (None, Some(attachment.resolve_filter))
+    } else {
+        gpu::trace_once(format!(
+            "a separate depth/stencil resolve has unsupported aspect {aspect:?}"
+        ));
+        return None;
+    };
+    // SAFETY: only a texture of this crate's is attached.
+    let destination = unsafe { object::body_ref::<Texture>(attachment.resolve_texture) };
+    if destination.image.format != format {
+        gpu::trace_once(format!(
+            "render pass resolves {format:?} into {:?}, which Vulkan cannot do",
+            destination.image.format
+        ));
+        return None;
+    }
+    // SAFETY: only a texture of this crate's is attached.
+    let source = unsafe { object::body_ref::<Texture>(attachment.texture) };
+    if source.image.samples == vk::SampleCountFlags::TYPE_1 {
+        let (depth_mode, stencil_mode) = match one_sample_resolve_modes(wanted.0, wanted.1) {
+            Ok(modes) => modes,
+            Err(reason) => {
+                gpu::trace_once(format!("a render pass asks for {reason}"));
+                return None;
+            }
+        };
+        let level = attachment.resolve_level as u32 + destination.image.base_level;
+        let slice = attachment.resolve_slice as u32 + destination.image.base_layer;
+        return Some(DepthResolveTarget {
+            resolve: DepthResolve {
+                format: destination.image.format,
+                depth_mode,
+                stencil_mode,
+            },
+            view: destination.attachment_view(level, slice),
+            image: destination.image.image,
+            level,
+            slice,
+            texture: attachment.resolve_texture,
+        });
+    }
+    let Some(resolving) = &gpu.depth_stencil_resolve else {
+        gpu::trace_once(
+            "a render pass asks for a depth or stencil resolve, which this Vulkan device cannot perform",
+        );
+        return None;
+    };
+    let (depth_mode, stencil_mode) =
+        match resolve_modes(resolving.support, aspect, wanted.0, wanted.1) {
+            Ok(modes) => modes,
+            Err(reason) => {
+                gpu::trace_once(format!("a render pass asks for {reason}"));
+                return None;
+            }
+        };
+    let level = attachment.resolve_level as u32 + destination.image.base_level;
+    let slice = attachment.resolve_slice as u32 + destination.image.base_layer;
+    Some(DepthResolveTarget {
+        resolve: DepthResolve {
+            format: destination.image.format,
+            depth_mode,
+            stencil_mode,
+        },
+        view: destination.attachment_view(level, slice),
+        image: destination.image.image,
+        level,
+        slice,
+        texture: attachment.resolve_texture,
+    })
+}
+
 /// What one `MTLRenderPassDescriptor`'s attachments amount to in Vulkan.
 struct Attachments {
     key: RenderPassKey,
@@ -370,8 +642,13 @@ struct Attachments {
     resolve_mask: u32,
     /// The view the depth/stencil attachment resolves into.
     depth_resolve_view: Option<vk::ImageView>,
+    /// The independently attached stencil image's resolve view.
+    stencil_resolve_view: Option<vk::ImageView>,
     /// Copies Metal's `MTLStoreActionStoreAndMultisampleResolve` implies.
     copies: Vec<PendingCopy>,
+    /// Separate Metal depth/stencil images bridged through one combined
+    /// Vulkan attachment before and after the pass.
+    bridges: Vec<DepthStencilBridge>,
     capture_targets: Vec<crate::capture::Target>,
     clears: Vec<vk::ClearValue>,
     /// The smallest attachment extent, which is the pass's own.
@@ -379,6 +656,9 @@ struct Attachments {
     height: u32,
     /// The textures the pass reads or writes, retained for its lifetime.
     textures: Vec<Id>,
+    /// Fresh private textures whose creating references are transferred to
+    /// the command after it retains them.
+    owned_textures: Vec<Id>,
 }
 
 /// Record the sample count one attachment brings to a pass.
@@ -399,13 +679,17 @@ fn samples(key: &mut RenderPassKey, count: vk::SampleCountFlags, first: bool) {
 
 /// Gather what a descriptor's attachments amount to, without touching the
 /// command buffer: the caller decides what to do when there are none.
-fn gather_attachments(gpu: &Gpu, descriptor: &RenderPassDescriptor) -> Attachments {
+fn gather_attachments(
+    gpu: &'static Gpu,
+    descriptor: &RenderPassDescriptor,
+) -> Result<Attachments, String> {
     let mut key = RenderPassKey {
         colors: Vec::new(),
         color_slots: Vec::new(),
         color_resolves: Vec::new(),
         depth: None,
         stencil: None,
+        depth_stencil_shared: false,
         depth_resolve: None,
         samples: vk::SampleCountFlags::TYPE_1,
     };
@@ -413,12 +697,15 @@ fn gather_attachments(gpu: &Gpu, descriptor: &RenderPassDescriptor) -> Attachmen
     let mut resolve_views = Vec::new();
     let mut resolve_mask = 0u32;
     let mut depth_resolve_view = None;
+    let mut stencil_resolve_view = None;
     let mut copies: Vec<PendingCopy> = Vec::new();
+    let mut bridges = Vec::new();
     let mut capture_targets: Vec<crate::capture::Target> = Vec::new();
     let mut clears = Vec::new();
     let mut width = u32::MAX;
     let mut height = u32::MAX;
     let mut textures = Vec::new();
+    let mut owned_textures = Vec::new();
     // The targets only matter to `ROSEMARY_PASS_OUT`, and naming each one
     // formats a string.
     let capturing = crate::capture::enabled();
@@ -517,80 +804,220 @@ fn gather_attachments(gpu: &Gpu, descriptor: &RenderPassDescriptor) -> Attachmen
         height = height.min(level_extent(base_height, level));
         textures.push(color.texture);
     }
-    // FIXME (ACCURACY): Metal allows a depth texture and a separate stencil
-    // texture on one pass; a Vulkan subpass has one depth/stencil attachment,
-    // so only the depth one is attached and the stencil texture is neither
-    // loaded nor stored. A combined depth/stencil texture named in both slots
-    // - which is what a game that wants both normally does - is unaffected.
-    if !descriptor.depth.texture.is_null()
-        && !descriptor.stencil.texture.is_null()
-        && descriptor.depth.texture != descriptor.stencil.texture
-    {
-        gpu::trace_once(
-            "a render pass names separate depth and stencil textures, which one Vulkan \
-             attachment cannot hold: the stencil texture is ignored",
-        );
+    if !descriptor.depth.texture.is_null() {
+        // SAFETY: only textures of this crate's are attached.
+        let texture = unsafe { object::body_ref::<Texture>(descriptor.depth.texture) };
+        if !texture.image.aspect.contains(vk::ImageAspectFlags::DEPTH) {
+            return Err(format!(
+                "depth attachment format {:?} has no depth aspect",
+                texture.image.format
+            ));
+        }
     }
-    let depth_attachment = if !descriptor.depth.texture.is_null() {
-        Some(&descriptor.depth)
-    } else if !descriptor.stencil.texture.is_null() {
-        Some(&descriptor.stencil)
+    if !descriptor.stencil.texture.is_null() {
+        // SAFETY: only textures of this crate's are attached.
+        let texture = unsafe { object::body_ref::<Texture>(descriptor.stencil.texture) };
+        if !texture.image.aspect.contains(vk::ImageAspectFlags::STENCIL) {
+            return Err(format!(
+                "stencil attachment format {:?} has no stencil aspect",
+                texture.image.format
+            ));
+        }
+    }
+    // Vulkan always requires depth and stencil to be aspects of one image.
+    // Separate subresources are bridged through a temporary combined image.
+    let depth = &descriptor.depth;
+    let stencil = &descriptor.stencil;
+    let shared_depth_stencil = same_texture_subresource(
+        (depth.texture, depth.level, depth.slice),
+        (stencil.texture, stencil.level, stencil.slice),
+    );
+    let bridge_texture = if !descriptor.depth.texture.is_null()
+        && !descriptor.stencil.texture.is_null()
+        && !shared_depth_stencil
+    {
+        // SAFETY: only textures of this crate's are attached.
+        let depth = unsafe { object::body_ref::<Texture>(descriptor.depth.texture) };
+        let stencil = unsafe { object::body_ref::<Texture>(descriptor.stencil.texture) };
+        let combined_format = gpu::combined_depth_stencil_format(
+            depth.image.format,
+            stencil.image.format,
+        )
+        .ok_or_else(|| {
+            format!(
+                "separate depth {:?} and stencil {:?} textures have no lossless combined bridge",
+                depth.image.format, stencil.image.format
+            )
+        })?;
+        let depth_bytes = match depth.image.format {
+            vk::Format::D16_UNORM | vk::Format::D16_UNORM_S8_UINT => 2,
+            vk::Format::D32_SFLOAT
+            | vk::Format::D32_SFLOAT_S8_UINT
+            | vk::Format::X8_D24_UNORM_PACK32
+            | vk::Format::D24_UNORM_S8_UINT => 4,
+            format => {
+                return Err(format!(
+                    "depth format {format:?} has no bridge buffer representation"
+                ));
+            }
+        };
+        if depth.image.samples != vk::SampleCountFlags::TYPE_1
+            || stencil.image.samples != vk::SampleCountFlags::TYPE_1
+        {
+            return Err(
+                "multisampled separate depth and stencil textures have no lossless Vulkan bridge"
+                    .to_owned(),
+            );
+        }
+        let depth_level = descriptor.depth.level as u32 + depth.image.base_level;
+        let stencil_level = descriptor.stencil.level as u32 + stencil.image.base_level;
+        let depth_extent = (
+            level_extent(depth.image.width, depth_level),
+            level_extent(depth.image.height, depth_level),
+        );
+        let stencil_extent = (
+            level_extent(stencil.image.width, stencil_level),
+            level_extent(stencil.image.height, stencil_level),
+        );
+        if depth_extent != stencil_extent {
+            return Err(format!(
+                "separate depth and stencil extents differ: {depth_extent:?} and {stencil_extent:?}"
+            ));
+        }
+        let combined = crate::resource::new_internal_attachment(
+            gpu,
+            combined_format,
+            depth_extent.0,
+            depth_extent.1,
+        )?;
+        // SAFETY: the texture this function just made.
+        let image = unsafe { object::body_ref::<Texture>(combined) }.image.image;
+        bridges.extend([
+            DepthStencilBridge {
+                original: depth.image.image,
+                original_level: depth_level,
+                original_slice: descriptor.depth.slice as u32 + depth.image.base_layer,
+                combined: image,
+                width: depth_extent.0,
+                height: depth_extent.1,
+                aspect: vk::ImageAspectFlags::DEPTH,
+                bytes_per_texel: depth_bytes,
+                staging: vk::Buffer::null(),
+                load: load_op(descriptor.depth.load_action) == vk::AttachmentLoadOp::LOAD,
+            },
+            DepthStencilBridge {
+                original: stencil.image.image,
+                original_level: stencil_level,
+                original_slice: descriptor.stencil.slice as u32 + stencil.image.base_layer,
+                combined: image,
+                width: stencil_extent.0,
+                height: stencil_extent.1,
+                aspect: vk::ImageAspectFlags::STENCIL,
+                bytes_per_texel: 1,
+                staging: vk::Buffer::null(),
+                load: load_op(descriptor.stencil.load_action) == vk::AttachmentLoadOp::LOAD,
+            },
+        ]);
+        textures.push(combined);
+        owned_textures.push(combined);
+        Some(combined)
     } else {
         None
     };
+    let pass_depth_stencil_shared = shared_depth_stencil || bridge_texture.is_some();
+    key.depth_stencil_shared = pass_depth_stencil_shared;
+    let depth_attachment = (!descriptor.depth.texture.is_null()).then_some(&descriptor.depth);
     if let Some(attachment) = depth_attachment {
         // SAFETY: only a texture of this crate's is attached.
         let texture = unsafe { object::body_ref::<Texture>(attachment.texture) };
+        // SAFETY: the bridge, when present, was made above and is a texture.
+        let pass_texture = bridge_texture.map_or(texture, |bridge| unsafe {
+            object::body_ref::<Texture>(bridge)
+        });
         key.depth = Some((
-            texture.image.format,
+            pass_texture.image.format,
             load_op(attachment.load_action),
             store_op(),
         ));
-        if !descriptor.stencil.texture.is_null() {
-            key.stencil = Some((load_op(descriptor.stencil.load_action), store_op()));
-        }
         let first = key.colors.is_empty();
-        samples(&mut key, texture.image.samples, first);
+        samples(&mut key, pass_texture.image.samples, first);
         let level = attachment.level as u32 + texture.image.base_level;
         let depth_slice = attachment.slice as u32 + texture.image.base_layer;
-        views.push(texture.attachment_view(level, depth_slice));
-        let (format, aspect) = (texture.image.format, texture.image.aspect);
+        views.push(match bridge_texture {
+            Some(_) => pass_texture.attachment_view(0, 0),
+            None => texture.attachment_view(level, depth_slice),
+        });
+        let format = texture.image.format;
         let multisampled = texture.image.samples != vk::SampleCountFlags::TYPE_1;
         let (base_width, base_height) = (texture.image.width, texture.image.height);
         let source_image = texture.image.image;
-        if let Some(resolve) = depth_resolve(gpu, descriptor, attachment.texture, format, aspect) {
+        let resolve = if shared_depth_stencil && multisampled {
+            depth_resolve(gpu, descriptor, texture)
+        } else {
+            aspect_resolve(gpu, attachment, format, vk::ImageAspectFlags::DEPTH)
+        };
+        if let Some(resolve) = resolve {
             textures.push(resolve.texture);
             if multisampled {
                 key.depth_resolve = Some(resolve.resolve);
-                depth_resolve_view = Some(resolve.view);
+                if !resolve.resolve.depth_mode.is_empty() {
+                    depth_resolve_view = Some(resolve.view);
+                }
+                if !resolve.resolve.stencil_mode.is_empty() {
+                    stencil_resolve_view = Some(resolve.view);
+                }
             } else {
                 // A subpass resolves only a multisampled attachment; with one
                 // sample the same store action means a plain copy, as it does
                 // for a colour attachment.
-                copies.push(PendingCopy {
-                    source: source_image,
-                    source_level: level,
-                    source_slice: depth_slice,
-                    destination: resolve.image,
-                    destination_level: resolve.level,
-                    destination_slice: resolve.slice,
-                    width: level_extent(base_width, level),
-                    height: level_extent(base_height, level),
-                    aspect,
-                });
+                for copied_aspect in [
+                    (!resolve.resolve.depth_mode.is_empty()).then_some(vk::ImageAspectFlags::DEPTH),
+                    (!resolve.resolve.stencil_mode.is_empty())
+                        .then_some(vk::ImageAspectFlags::STENCIL),
+                ]
+                .into_iter()
+                .flatten()
+                {
+                    copies.push(PendingCopy {
+                        source: source_image,
+                        source_level: level,
+                        source_slice: depth_slice,
+                        destination: resolve.image,
+                        destination_level: resolve.level,
+                        destination_slice: resolve.slice,
+                        width: level_extent(base_width, level),
+                        height: level_extent(base_height, level),
+                        aspect: copied_aspect,
+                    });
+                }
             }
             if capturing {
-                capture_targets.push(crate::capture::Target {
-                    image: resolve.image,
-                    aspect: vk::ImageAspectFlags::DEPTH,
-                    level: resolve.level,
-                    slice: resolve.slice,
-                    width: level_extent(base_width, level),
-                    height: level_extent(base_height, level),
-                    format,
-                    samples: vk::SampleCountFlags::TYPE_1,
-                    role: "rd".to_owned(),
-                });
+                for (resolved_aspect, role, enabled) in [
+                    (
+                        vk::ImageAspectFlags::DEPTH,
+                        "rd",
+                        !resolve.resolve.depth_mode.is_empty(),
+                    ),
+                    (
+                        vk::ImageAspectFlags::STENCIL,
+                        "rs",
+                        !resolve.resolve.stencil_mode.is_empty(),
+                    ),
+                ] {
+                    if enabled {
+                        capture_targets.push(crate::capture::Target {
+                            image: resolve.image,
+                            aspect: resolved_aspect,
+                            level: resolve.level,
+                            slice: resolve.slice,
+                            width: level_extent(base_width, level),
+                            height: level_extent(base_height, level),
+                            format,
+                            samples: vk::SampleCountFlags::TYPE_1,
+                            role: role.to_owned(),
+                        });
+                    }
+                }
             }
         }
         clears.push(vk::ClearValue {
@@ -616,19 +1043,142 @@ fn gather_attachments(gpu: &Gpu, descriptor: &RenderPassDescriptor) -> Attachmen
         }
         textures.push(attachment.texture);
     }
-    Attachments {
+    if !descriptor.stencil.texture.is_null() {
+        let attachment = &descriptor.stencil;
+        // SAFETY: only a texture of this crate's is attached.
+        let texture = unsafe { object::body_ref::<Texture>(attachment.texture) };
+        // SAFETY: the bridge, when present, was made above and is a texture.
+        let pass_texture = bridge_texture.map_or(texture, |bridge| unsafe {
+            object::body_ref::<Texture>(bridge)
+        });
+        key.stencil = Some((
+            pass_texture.image.format,
+            load_op(attachment.load_action),
+            store_op(),
+        ));
+        let first = key.colors.is_empty() && key.depth.is_none();
+        samples(&mut key, pass_texture.image.samples, first);
+        let level = attachment.level as u32 + texture.image.base_level;
+        let stencil_slice = attachment.slice as u32 + texture.image.base_layer;
+        if !pass_depth_stencil_shared {
+            views.push(texture.attachment_view(level, stencil_slice));
+            clears.push(vk::ClearValue {
+                depth_stencil: vk::ClearDepthStencilValue {
+                    depth: descriptor.depth.clear_depth as f32,
+                    stencil: attachment.clear_stencil,
+                },
+            });
+            let format = texture.image.format;
+            let multisampled = texture.image.samples != vk::SampleCountFlags::TYPE_1;
+            let source_image = texture.image.image;
+            if let Some(resolve) =
+                aspect_resolve(gpu, attachment, format, vk::ImageAspectFlags::STENCIL)
+            {
+                textures.push(resolve.texture);
+                if multisampled {
+                    match &mut key.depth_resolve {
+                        Some(combined) => combined.stencil_mode = resolve.resolve.stencil_mode,
+                        None => key.depth_resolve = Some(resolve.resolve),
+                    }
+                    stencil_resolve_view = Some(resolve.view);
+                } else {
+                    copies.push(PendingCopy {
+                        source: source_image,
+                        source_level: level,
+                        source_slice: stencil_slice,
+                        destination: resolve.image,
+                        destination_level: resolve.level,
+                        destination_slice: resolve.slice,
+                        width: level_extent(texture.image.width, level),
+                        height: level_extent(texture.image.height, level),
+                        aspect: vk::ImageAspectFlags::STENCIL,
+                    });
+                }
+                if capturing {
+                    capture_targets.push(crate::capture::Target {
+                        image: resolve.image,
+                        aspect: vk::ImageAspectFlags::STENCIL,
+                        level: resolve.level,
+                        slice: resolve.slice,
+                        width: level_extent(texture.image.width, level),
+                        height: level_extent(texture.image.height, level),
+                        format,
+                        samples: vk::SampleCountFlags::TYPE_1,
+                        role: "rs".to_owned(),
+                    });
+                }
+            }
+        } else if (bridge_texture.is_some()
+            || (shared_depth_stencil && texture.image.samples == vk::SampleCountFlags::TYPE_1))
+            && let Some(resolve) = aspect_resolve(
+                gpu,
+                attachment,
+                texture.image.format,
+                vk::ImageAspectFlags::STENCIL,
+            )
+        {
+            // A one-sample store-resolve is a post-pass copy. With a bridge it
+            // runs after the aspect was copied back into the original image;
+            // a combined source can copy its stencil aspect directly.
+            textures.push(resolve.texture);
+            copies.push(PendingCopy {
+                source: texture.image.image,
+                source_level: level,
+                source_slice: stencil_slice,
+                destination: resolve.image,
+                destination_level: resolve.level,
+                destination_slice: resolve.slice,
+                width: level_extent(texture.image.width, level),
+                height: level_extent(texture.image.height, level),
+                aspect: vk::ImageAspectFlags::STENCIL,
+            });
+            if capturing {
+                capture_targets.push(crate::capture::Target {
+                    image: resolve.image,
+                    aspect: vk::ImageAspectFlags::STENCIL,
+                    level: resolve.level,
+                    slice: resolve.slice,
+                    width: level_extent(texture.image.width, level),
+                    height: level_extent(texture.image.height, level),
+                    format: texture.image.format,
+                    samples: vk::SampleCountFlags::TYPE_1,
+                    role: "rs".to_owned(),
+                });
+            }
+        }
+        width = width.min(level_extent(texture.image.width, level));
+        height = height.min(level_extent(texture.image.height, level));
+        if capturing {
+            capture_targets.push(crate::capture::Target {
+                image: texture.image.image,
+                aspect: vk::ImageAspectFlags::STENCIL,
+                level,
+                slice: stencil_slice,
+                width: level_extent(texture.image.width, level),
+                height: level_extent(texture.image.height, level),
+                format: texture.image.format,
+                samples: texture.image.samples,
+                role: "s".to_owned(),
+            });
+        }
+        textures.push(attachment.texture);
+    }
+    Ok(Attachments {
         key,
         views,
         resolve_views,
         resolve_mask,
         depth_resolve_view,
+        stencil_resolve_view,
         copies,
+        bridges,
         capture_targets,
         clears,
         width,
         height,
         textures,
-    }
+        owned_textures,
+    })
 }
 
 /// Metal's default render state for a pass, which a Vulkan command buffer
@@ -662,20 +1212,33 @@ pub(crate) fn begin_render_pass(
     let command = encoder.command();
     let gpu = command.gpu;
 
+    let attachments = match gather_attachments(gpu, descriptor) {
+        Ok(attachments) => attachments,
+        Err(reason) => {
+            gpu::trace(format!("renderCommandEncoderWithDescriptor: {reason}"));
+            return;
+        }
+    };
     let Attachments {
         key,
         views,
         resolve_views,
         resolve_mask,
         depth_resolve_view,
+        stencil_resolve_view,
         copies,
+        mut bridges,
         capture_targets,
         clears,
         width,
         height,
         textures,
-    } = gather_attachments(gpu, descriptor);
+        owned_textures,
+    } = attachments;
     if views.is_empty() {
+        for texture in owned_textures {
+            objc::arc::release(texture);
+        }
         gpu::trace("renderCommandEncoderWithDescriptor: has no attachments");
         return;
     }
@@ -685,11 +1248,17 @@ pub(crate) fn begin_render_pass(
         views,
         resolve_views,
         depth_resolve_view,
+        stencil_resolve_view,
         clears,
     };
     let target = match PassTarget::new(gpu, &key, attachment_views, width, height) {
         Ok(target) => target,
-        Err(reason) => return gpu::trace(reason),
+        Err(reason) => {
+            for texture in owned_textures {
+                objc::arc::release(texture);
+            }
+            return gpu::trace(reason);
+        }
     };
     command.framebuffers.extend(target.framebuffer());
     for texture in textures {
@@ -702,11 +1271,16 @@ pub(crate) fn begin_render_pass(
         encoder.writes_elsewhere |= hazards::tracked_image(texture).is_none();
         command.retain(texture);
     }
+    for texture in owned_textures {
+        objc::arc::release(texture);
+    }
     // Sub-encoders record into command buffers of their own, query results
     // land in a buffer, and a resolve copy writes through a transfer: each
     // reaches memory other than through the attachments.
-    encoder.writes_elsewhere |=
-        secondary || !descriptor.visibility_result_buffer.is_null() || !copies.is_empty();
+    encoder.writes_elsewhere |= secondary
+        || !descriptor.visibility_result_buffer.is_null()
+        || !copies.is_empty()
+        || !bridges.is_empty();
     encoder.visibility = VisibilityTarget::of(descriptor);
     command.retain(descriptor.visibility_result_buffer);
     let area = vk::Rect2D {
@@ -721,7 +1295,11 @@ pub(crate) fn begin_render_pass(
     // Queries and captures run in the pass as it is begun, and a parallel
     // pass's sub-encoders inherit it, so those begin now, behind every pass
     // before them. Every other pass begins at its first draw.
-    if !secondary && encoder.visibility.is_none() && encoder.capture_pass.is_none() {
+    if !secondary
+        && encoder.visibility.is_none()
+        && encoder.capture_pass.is_none()
+        && bridges.is_empty()
+    {
         record_pass_defaults(
             &gpu.device,
             command.command_buffer,
@@ -732,7 +1310,7 @@ pub(crate) fn begin_render_pass(
         let is_clear = |op: vk::AttachmentLoadOp| op == vk::AttachmentLoadOp::CLEAR;
         let works_undrawn = key.colors.iter().any(|color| is_clear(color.1))
             || key.depth.is_some_and(|depth| is_clear(depth.1))
-            || key.stencil.is_some_and(|stencil| is_clear(stencil.0))
+            || key.stencil.is_some_and(|stencil| is_clear(stencil.1))
             || resolve_mask != 0
             || key.depth_resolve.is_some()
             || !copies.is_empty();
@@ -749,6 +1327,15 @@ pub(crate) fn begin_render_pass(
         return;
     }
     command.flush_hazards();
+    for bridge in bridges.iter_mut().filter(|bridge| bridge.load) {
+        if let Err(reason) = record_depth_stencil_bridge(command, bridge, true) {
+            gpu::trace(format!("depth/stencil bridge load failed: {reason}"));
+            encoder.in_render_pass = false;
+            encoder.capture_pass = None;
+            encoder.visibility = None;
+            return;
+        }
+    }
     if let Some(pass) = encoder.capture_pass {
         for target in &capture_targets {
             if let Some(capture) =
@@ -772,6 +1359,7 @@ pub(crate) fn begin_render_pass(
     }
     gpu::milestone("render pass");
     encoder.pending_copies = copies;
+    encoder.pending_depth_stencil_bridges = bridges;
     encoder.capture_targets = capture_targets;
 }
 
@@ -1323,6 +1911,18 @@ mod tests {
             assert_eq!(depth, mode);
             assert_eq!(stencil, vk::ResolveModeFlags::NONE);
         }
+    }
+
+    #[test]
+    fn one_sample_resolves_need_no_device_resolve_feature() {
+        for depth_filter in 0..=2 {
+            let (depth, stencil) =
+                one_sample_resolve_modes(Some(depth_filter), Some(1)).expect("valid filters");
+            assert_eq!(depth, vk::ResolveModeFlags::SAMPLE_ZERO);
+            assert_eq!(stencil, vk::ResolveModeFlags::SAMPLE_ZERO);
+        }
+        assert!(one_sample_resolve_modes(Some(3), None).is_err());
+        assert!(one_sample_resolve_modes(None, Some(2)).is_err());
     }
 
     #[test]

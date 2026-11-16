@@ -181,6 +181,59 @@ pub(crate) fn new_texture(gpu: &'static Gpu, descriptor: TextureDescriptor) -> I
     new_texture_in(gpu, descriptor, None)
 }
 
+/// A private attachment texture whose Vulkan format has no standalone Metal
+/// pixel-format spelling, used only by compatibility bridges.
+pub(crate) fn new_internal_attachment(
+    gpu: &'static Gpu,
+    format: vk::Format,
+    width: u32,
+    height: u32,
+) -> Result<Id, String> {
+    let image = gpu.create_image(&ImageDescription {
+        image_type: vk::ImageType::TYPE_2D,
+        view_type: vk::ImageViewType::TYPE_2D,
+        format,
+        width,
+        height,
+        depth: 1,
+        levels: 1,
+        layers: 1,
+        samples: 1,
+        usage: gpu::USAGE_RENDER_TARGET,
+        cube: false,
+        components: vk::ComponentMapping::default(),
+    })?;
+    let texture = object::make(
+        c"RosemaryMTLTexture",
+        Texture {
+            gpu,
+            descriptor: TextureDescriptor {
+                texture_type: MTL_TEXTURE_TYPE_2D,
+                width: u64::from(width),
+                height: u64::from(height),
+                depth: 1,
+                mipmap_level_count: 1,
+                sample_count: 1,
+                array_length: 1,
+                storage_mode: MTL_STORAGE_MODE_PRIVATE,
+                usage: gpu::USAGE_RENDER_TARGET,
+                ..TextureDescriptor::default()
+            },
+            image,
+            parent: std::ptr::null_mut(),
+            attachment_views: Mutex::default(),
+            texel_view: vk::BufferView::null(),
+            buffer: std::ptr::null_mut(),
+        },
+    );
+    if texture.is_null() {
+        return Err("could not allocate a Metal object for an internal attachment".to_owned());
+    }
+    // SAFETY: the texture this function just made.
+    crate::account(unsafe { object::body_ref::<Texture>(texture) }.accounted());
+    Ok(texture)
+}
+
 /// A texture in memory of its own, or at an offset into a placement heap's.
 pub(crate) fn new_texture_in(
     gpu: &'static Gpu,

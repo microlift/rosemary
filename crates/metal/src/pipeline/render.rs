@@ -404,29 +404,36 @@ impl RenderPipeline {
         }
         let depth_format = gpu::pixel_format(descriptor.depth_format);
         let stencil_format = gpu::pixel_format(descriptor.stencil_format);
-        let attachment_depth = if depth_format != vk::Format::UNDEFINED {
-            Some(depth_format)
-        } else if stencil_format != vk::Format::UNDEFINED {
-            Some(stencil_format)
-        } else {
-            None
-        };
+        let attachment_format = gpu::combined_depth_stencil_format(depth_format, stencil_format);
+        if depth_format != vk::Format::UNDEFINED
+            && stencil_format != vk::Format::UNDEFINED
+            && attachment_format.is_none()
+        {
+            return Err(format!(
+                "Metal depth format {depth_format:?} and stencil format {stencil_format:?} has no combined Vulkan attachment format"
+            ));
+        }
         let pass = RenderPassKey {
             color_resolves: vec![None; color_formats.len()],
             depth_resolve: None,
             colors: color_formats,
             color_slots,
-            depth: attachment_depth.map(|format| {
+            depth: (depth_format != vk::Format::UNDEFINED).then(|| {
                 (
-                    format,
+                    attachment_format.expect("a depth attachment format"),
                     vk::AttachmentLoadOp::DONT_CARE,
                     vk::AttachmentStoreOp::STORE,
                 )
             }),
-            stencil: (stencil_format != vk::Format::UNDEFINED).then_some((
-                vk::AttachmentLoadOp::DONT_CARE,
-                vk::AttachmentStoreOp::STORE,
-            )),
+            stencil: (stencil_format != vk::Format::UNDEFINED).then(|| {
+                (
+                    attachment_format.expect("a stencil attachment format"),
+                    vk::AttachmentLoadOp::DONT_CARE,
+                    vk::AttachmentStoreOp::STORE,
+                )
+            }),
+            depth_stencil_shared: depth_format != vk::Format::UNDEFINED
+                && stencil_format != vk::Format::UNDEFINED,
             samples,
         };
         if !gpu.dynamic_rendering {
@@ -662,8 +669,12 @@ impl RenderPipeline {
         }
         // The resolve destination has the attachment's format, which the
         // pipeline declared; the modes come from the pass being recorded.
-        shape.depth_resolve = match (key.depth_resolve, shape.depth) {
-            (Some(resolve), Some((format, _, _))) => Some(DepthResolve { format, ..resolve }),
+        let depth_stencil_format = shape
+            .depth
+            .map(|(format, _, _)| format)
+            .or_else(|| shape.stencil.map(|(format, _, _)| format));
+        shape.depth_resolve = match (key.depth_resolve, depth_stencil_format) {
+            (Some(resolve), Some(format)) => Some(DepthResolve { format, ..resolve }),
             _ => None,
         };
         self.gpu.render_pass(&shape)
@@ -697,8 +708,8 @@ impl RenderPipeline {
 
     /// The state a draw under `key` sets per draw on a device which can.
     pub fn dynamic_state(&self, key: &RenderVariantKey) -> RenderDynamicState {
-        let has_depth = self.depth_format != vk::Format::UNDEFINED
-            || self.stencil_format != vk::Format::UNDEFINED;
+        let has_depth = self.depth_format != vk::Format::UNDEFINED;
+        let has_stencil = self.stencil_format != vk::Format::UNDEFINED;
         RenderDynamicState {
             cull_mode: cull_mode(key.cull_mode),
             front_face: front_face(key.winding),
@@ -708,7 +719,7 @@ impl RenderPipeline {
             depth_test: has_depth,
             depth_write: has_depth && key.depth.write,
             depth_compare: compare_op(key.depth.compare),
-            stencil_test: has_depth && key.depth.stencil,
+            stencil_test: has_stencil && key.depth.stencil,
             front: StencilFace::of(&key.depth.front),
             back: StencilFace::of(&key.depth.back),
             polygon_mode: polygon_mode(key.fill_mode),

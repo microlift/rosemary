@@ -38,6 +38,7 @@ pub(crate) fn new_encoder(command_buffer: Id, kind: Kind) -> Id {
             resolve_mask: 0,
             depth_resolve: None,
             pending_copies: Vec::new(),
+            pending_depth_stencil_bridges: Vec::new(),
             capture_targets: Vec::new(),
             capture_pass: None,
             visibility: None,
@@ -112,13 +113,21 @@ pub(super) unsafe extern "C" fn end_encoding(receiver: Id, _sel: Sel) {
         }
         encoder.in_render_pass = false;
         visibility::resolve(encoder);
+        let mut bridges = std::mem::take(&mut encoder.pending_depth_stencil_bridges);
         let copies = std::mem::take(&mut encoder.pending_copies);
-        if !copies.is_empty() {
+        if !bridges.is_empty() || !copies.is_empty() {
             // The copies read what the pass just drew.
             for &(image, aspect) in &encoder.attachments {
                 command.hazards.note_written(image, aspect);
             }
             command.flush_hazards();
+        }
+        for bridge in &mut bridges {
+            if let Err(reason) = record_depth_stencil_bridge(command, bridge, false) {
+                gpu::trace(format!("depth/stencil bridge store failed: {reason}"));
+                continue;
+            }
+            command.hazards.note_written(bridge.original, bridge.aspect);
         }
         for copy in copies {
             let source = vk::ImageSubresourceLayers {
