@@ -428,6 +428,12 @@ pub fn report() {
             cache.cells_retracted,
             cache.links_followed,
         );
+        let (ran, ahead) = crate::prelift::queued_upgrades();
+        eprintln!(
+            "rosemary: stats  tiers  {} provisional translation(s), upgrades queued for \
+             {ran} that ran and {ahead} lifted ahead",
+            vm.provisional_count(),
+        );
     }
     eprintln!(
         "rosemary: stats  select {select:.2?} ({:.1}%)  lift {lift:.2?} ({:.1}%)  \

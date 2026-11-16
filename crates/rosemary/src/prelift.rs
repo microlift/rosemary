@@ -183,6 +183,12 @@ pub fn ahead(vm: &'static Vm, targets: impl IntoIterator<Item = u64>, depth: usi
     push(vm, targets, depth);
 }
 
+/// Upgrades waiting for a worker: `(ran, only lifted ahead)`.
+pub fn queued_upgrades() -> (usize, usize) {
+    let queue = QUEUE.lock().unwrap_or_else(|e| e.into_inner());
+    (queue.upgrades[0].len(), queue.upgrades[1].len())
+}
+
 /// Recompile the provisional translation at `va` at the run's own level, on a worker.
 /// `ran` says whether a thread has entered it, which puts it ahead of the regions that
 /// were only lifted ahead.

@@ -617,6 +617,11 @@ impl CodeCache {
         self.tiered.store(crate::jit::tiered(), Ordering::Relaxed);
     }
 
+    /// How many published translations are still [`Tier::Provisional`].
+    pub fn provisional_count(&self) -> usize {
+        self.read().provisional.len()
+    }
+
     /// Whether the translation at `pc` is still [`Tier::Provisional`].
     pub fn is_provisional(&self, pc: u64) -> bool {
         self.read().provisional.contains(&pc)

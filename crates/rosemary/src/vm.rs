@@ -694,6 +694,11 @@ impl Vm {
         self.cache.stats()
     }
 
+    /// How many translations still wait for an upgrade. See [`crate::jit::tiered`].
+    pub fn provisional_count(&self) -> usize {
+        self.cache.provisional_count()
+    }
+
     /// `(installed, pending)` link cells. See [`crate::cache::CodeCache::cell_counts`].
     pub fn cell_counts(&self) -> (usize, usize) {
         self.cache.cell_counts()
