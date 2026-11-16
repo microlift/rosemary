@@ -70,6 +70,11 @@ impl Lowerer<'_, '_> {
         }
         let order = match &order.kind {
             ExprKind::Ident(order) if order == "memory_order_relaxed" => ir::MemoryOrder::Relaxed,
+            ExprKind::Ident(order) if order == "memory_order_acquire" => ir::MemoryOrder::Acquire,
+            ExprKind::Ident(order) if order == "memory_order_release" => ir::MemoryOrder::Release,
+            ExprKind::Ident(order) if order == "memory_order_acq_rel" => {
+                ir::MemoryOrder::AcquireRelease
+            }
             ExprKind::Ident(order) if order == "memory_order_seq_cst" => {
                 ir::MemoryOrder::SequentiallyConsistent
             }

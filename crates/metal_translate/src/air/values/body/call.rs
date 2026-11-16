@@ -140,27 +140,22 @@ impl BodyLowering<'_> {
                 return Ok(Lowered::Done);
             }
             let kind = if name.starts_with("air.normalize_function_constant_predicate.") {
-                // A static initializer turns a function-constant
-                // predicate into the one or zero a gated binding
-                // is tested against. On an unsigned integer that
-                // is exactly a clamp to [0, 1].
-                // FIXME (ACCURACY): the meaning is read from the
-                // intrinsic's name; no Apple library in reach
-                // calls it with anything but zero or one.
+                // A static initializer turns an integer expression derived
+                // from function constants into the zero or one a gated
+                // binding is tested against. Apple's CoreDisplay AIR passes
+                // an unmasked i32 feature bitset here, while its i8 calls
+                // include both Boolean loads and computed predicates: the
+                // operation is `value != 0`, widened back to its input type.
                 let [value] = actual.as_slice() else {
                     return Err(semantic(format!("LLVM intrinsic {name} takes one operand")));
                 };
                 let ty = ir_type(*result, self.types)?;
-                let bound = |value| Operand::Integer {
-                    ty: ty.clone(),
-                    value,
-                };
-                InstructionKind::IntegerClamp {
-                    signed: false,
-                    value: value.clone(),
-                    min: bound(0),
-                    max: bound(1),
-                }
+                normalize_function_constant_predicate(
+                    value.clone(),
+                    ty,
+                    &mut self.function,
+                    &mut self.instructions,
+                )?
             } else {
                 known_helper(&name, &actual).unwrap_or_else(|| air_intrinsic(&name, &actual))?
             };
@@ -173,10 +168,6 @@ impl BodyLowering<'_> {
         Ok(Lowered::Value(ty, kind))
     }
 
-    /// The pointee type and address of one `llvm.memcpy` operand.
-    ///
-    /// A widening bitcast records the type its pointer really addresses; the
-    /// copy is of that, not of what the cast claimed.
     /// The pointee type and address of one `llvm.memcpy` operand.
     ///
     /// A widening bitcast records the type its pointer really addresses; the
@@ -195,6 +186,96 @@ impl BodyLowering<'_> {
         match self.types[ty] {
             DecodedType::Pointer { pointee, .. } => Ok((pointee, value)),
             _ => Err(semantic("llvm.memcpy operand is not a pointer")),
+        }
+    }
+}
+
+/// Lower AIR's integer predicate normalization without treating it as a
+/// numeric clamp. The comparison records the intrinsic's actual truth table;
+/// the extension preserves Apple's i8 or i32 result representation.
+fn normalize_function_constant_predicate(
+    value: Operand,
+    ty: Type,
+    function: &mut Function,
+    instructions: &mut Vec<Instruction>,
+) -> Result<InstructionKind, TranslateError> {
+    if !matches!(ty, Type::Int { .. }) {
+        return Err(semantic(
+            "AIR function-constant predicate normalization is not scalar integer",
+        ));
+    }
+    let predicate = emit(
+        function,
+        instructions,
+        Type::Bool,
+        InstructionKind::IntegerCompare {
+            predicate: IntegerPredicate::NotEqual,
+            lhs: value,
+            rhs: Operand::Integer {
+                ty: ty.clone(),
+                value: 0,
+            },
+        },
+    );
+    Ok(InstructionKind::Convert {
+        op: ConvertOp::ZeroExtend,
+        value: predicate,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{Pass, PassPipeline};
+
+    /// Recovery CoreDisplay AIR sends an i32 feature bitset straight to the
+    /// intrinsic. Every nonzero bit pattern is true, not just literal one.
+    #[test]
+    fn a_function_constant_predicate_normalizes_every_nonzero_integer() {
+        for (input, expected) in [(0, 0), (1, 1), (2, 1), (u32::MAX as u64, 1)] {
+            let ty = Type::u32();
+            let mut function = Function {
+                name: "normalize".to_owned(),
+                result: ty.clone(),
+                parameters: Vec::new(),
+                values: Vec::new(),
+                blocks: Vec::new(),
+            };
+            let mut instructions = Vec::new();
+            let kind = normalize_function_constant_predicate(
+                Operand::Integer {
+                    ty: ty.clone(),
+                    value: input,
+                },
+                ty.clone(),
+                &mut function,
+                &mut instructions,
+            )
+            .expect("an integer predicate");
+            let result = emit(&mut function, &mut instructions, ty.clone(), kind);
+            function.blocks.push(Block {
+                id: BlockId(0),
+                name: "entry".to_owned(),
+                instructions,
+                terminator: Terminator::Return(Some(result)),
+            });
+            let mut module = Module {
+                static_initializers: Vec::new(),
+                globals: Vec::new(),
+                functions: vec![function],
+                entries: Vec::new(),
+            };
+            module.verify().expect("the lowered intrinsic is valid");
+            PassPipeline::new([Pass::FoldConstants])
+                .run(&mut module)
+                .expect("the predicate folds");
+            assert_eq!(
+                module.functions[0].blocks[0].terminator,
+                Terminator::Return(Some(Operand::Integer {
+                    ty: ty.clone(),
+                    value: expected,
+                }))
+            );
         }
     }
 }

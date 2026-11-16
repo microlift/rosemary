@@ -92,10 +92,21 @@ impl Emitter {
                     Some(Type::Pointer { space, .. }) => space,
                     _ => return Err(emission("atomic operand is not a pointer")),
                 };
-                let semantics = match order {
+                let ordering = match order {
                     MemoryOrder::Relaxed => 0,
+                    MemoryOrder::Acquire => MemorySemantics::ACQUIRE.bits(),
+                    MemoryOrder::Release => MemorySemantics::RELEASE.bits(),
+                    MemoryOrder::AcquireRelease => MemorySemantics::ACQUIRE_RELEASE.bits(),
                     MemoryOrder::SequentiallyConsistent => {
-                        MemorySemantics::SEQUENTIALLY_CONSISTENT.bits()
+                        return Err(emission(
+                            "Metal sequentially-consistent atomics cannot be represented by Vulkan's memory model",
+                        ));
+                    }
+                };
+                let semantics = match ordering {
+                    0 => 0,
+                    ordering => {
+                        ordering
                             | match space {
                                 AddressSpace::Threadgroup => {
                                     MemorySemantics::WORKGROUP_MEMORY.bits()

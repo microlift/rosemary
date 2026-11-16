@@ -8,7 +8,7 @@ use metal_translate::{
     AirInput, Phase, TargetProfile, emit_spirv, metallib_air, parse_air, parse_msl, translate,
     translate_msl,
 };
-use rspirv::spirv::{Op, Scope};
+use rspirv::spirv::{MemorySemantics, Op, Scope};
 
 const STORE: &str = include_str!("fixtures/kernel_store_const.ll");
 const COPY: &str = include_str!("fixtures/kernel_copy_word.ll");
@@ -906,6 +906,58 @@ fn source_msl_threadgroup_atomics_reach_workgroup_and_buffer_memory() {
     assert_eq!(body_instructions(&module, Op::AtomicIAdd).len(), 1);
     // `atomic_int` makes the maximum signed, whatever the place declared.
     assert_eq!(body_instructions(&module, Op::AtomicSMax).len(), 1);
+}
+
+#[test]
+fn source_atomic_memory_orders_reach_spirv_unchanged() {
+    let memory = MemorySemantics::UNIFORM_MEMORY.bits();
+    for (name, ordering) in [
+        ("relaxed", 0),
+        ("acquire", MemorySemantics::ACQUIRE.bits() | memory),
+        ("release", MemorySemantics::RELEASE.bits() | memory),
+        ("acq_rel", MemorySemantics::ACQUIRE_RELEASE.bits() | memory),
+    ] {
+        let source = format!(
+            "#include <metal_stdlib>\nusing namespace metal;
+             kernel void ordered(device uint *value [[buffer(0)]]) {{
+                 atomic_fetch_add_explicit(
+                     reinterpret_cast<device atomic_uint *>(&value[0]), 1,
+                     memory_order::memory_order_{name});
+             }}"
+        );
+        let library = translate_msl(&source, &TargetProfile::vulkan_1_3()).unwrap();
+        let module = rspirv::dr::load_words(&library.entries[0].words).unwrap();
+        let atomics = body_instructions(&module, Op::AtomicIAdd);
+        let atomic = &atomics[0];
+        let semantics = atomic.operands[2]
+            .id_ref_any()
+            .and_then(|id| {
+                module
+                    .types_global_values
+                    .iter()
+                    .find(|instruction| instruction.result_id == Some(id))
+            })
+            .and_then(|instruction| instruction.operands.first())
+            .and_then(|operand| match operand {
+                rspirv::dr::Operand::LiteralBit32(value) => Some(*value),
+                _ => None,
+            })
+            .expect("constant memory semantics");
+        assert_eq!(semantics, ordering, "{name}");
+    }
+    let sequential = "#include <metal_stdlib>
+        using namespace metal;
+        kernel void ordered(device uint *value [[buffer(0)]]) {
+            atomic_fetch_add_explicit(
+                reinterpret_cast<device atomic_uint *>(&value[0]), 1,
+                memory_order::memory_order_seq_cst);
+        }";
+    assert!(
+        translate_msl(sequential, &TargetProfile::vulkan_1_3())
+            .unwrap_err()
+            .to_string()
+            .contains("cannot be represented by Vulkan")
+    );
 }
 
 fn workgroup_variables(words: &[u32]) -> usize {
@@ -2152,6 +2204,49 @@ fn threadgroup_barrier_becomes_a_control_barrier() {
     };
     assert_eq!(scope(&barrier.operands[0]), Scope::Workgroup as u32);
     assert_eq!(scope(&barrier.operands[1]), Scope::Workgroup as u32);
+}
+
+#[test]
+fn work_item_memory_scope_becomes_spirv_invocation() {
+    let module = buffer_kernel(
+        Vec::new(),
+        vec![Instruction {
+            result: None,
+            kind: InstructionKind::Barrier {
+                scope: BarrierScope::Invocation,
+                memory: BarrierMemory {
+                    threadgroup: true,
+                    ..BarrierMemory::default()
+                },
+            },
+        }],
+    );
+    module.verify().unwrap();
+    let artifact = emit_spirv(&module, &TargetProfile::vulkan_1_3())
+        .unwrap()
+        .entries
+        .remove(0);
+    let parsed = rspirv::dr::load_words(&artifact.words).unwrap();
+    let barrier = parsed.functions[0].blocks[0]
+        .instructions
+        .iter()
+        .find(|instruction| instruction.class.opcode == Op::ControlBarrier)
+        .expect("a control barrier");
+    let scope = |operand: &rspirv::dr::Operand| {
+        let id = operand.id_ref_any().expect("a scope operand");
+        parsed
+            .types_global_values
+            .iter()
+            .find(|instruction| instruction.result_id == Some(id))
+            .and_then(|instruction| instruction.operands.first())
+            .and_then(|operand| match operand {
+                rspirv::dr::Operand::LiteralBit32(value) => Some(*value),
+                _ => None,
+            })
+            .expect("a constant scope")
+    };
+    assert_eq!(scope(&barrier.operands[0]), Scope::Workgroup as u32);
+    assert_eq!(scope(&barrier.operands[1]), Scope::Invocation as u32);
 }
 
 #[test]

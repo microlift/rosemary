@@ -328,12 +328,7 @@ pub(super) fn barrier_memory(
 /// than one SIMD-group is no barrier at all.
 pub(super) fn barrier_scope(operand: &Operand, name: &str) -> Result<BarrierScope, TranslateError> {
     match air_enumerator(operand, name, "scope")? {
-        // `memory_scope_work_item` orders one invocation against itself, which
-        // is narrower than anything SPIR-V spells.
-        //
-        // FIXME (ACCURACY): it is widened to the SIMD-group. A wider scope
-        // costs a stronger barrier than Metal asked for, never a weaker one.
-        0 => Ok(BarrierScope::Simdgroup),
+        0 => Ok(BarrierScope::Invocation),
         1 => Ok(BarrierScope::Threadgroup),
         // `memory_scope_all_gpus` reaches further than one device, and this
         // runtime drives one. Widening it costs ordering, not correctness.
@@ -388,14 +383,17 @@ pub(super) fn air_atomic(
     })
 }
 
-/// Metal's `memory_order`, of which the language exposes two.
+/// Metal's `memory_order` enumeration, in its declared C++ order.
 pub(super) fn memory_order(operand: &Operand, name: &str) -> Result<MemoryOrder, TranslateError> {
     match air_enumerator(operand, name, "memory order")? {
         0 => Ok(MemoryOrder::Relaxed),
-        // FIXME (ACCURACY): every other ordering is raised to sequential
-        // consistency. Metal's own `memory_order` has only `relaxed` and
-        // `seq_cst`, and a stronger order costs ordering, not correctness.
-        _ => Ok(MemoryOrder::SequentiallyConsistent),
+        1 => Ok(MemoryOrder::Acquire),
+        2 => Ok(MemoryOrder::Release),
+        3 => Ok(MemoryOrder::AcquireRelease),
+        4 => Ok(MemoryOrder::SequentiallyConsistent),
+        order => Err(semantic(format!(
+            "LLVM intrinsic {name} names unknown Metal memory order {order}"
+        ))),
     }
 }
 
@@ -456,12 +454,27 @@ pub(super) fn air_texture_intrinsic(
                 rest => (None, rest),
             };
             if access == "gather" {
-                let [_component] = rest else {
-                    return Err(malformed());
+                let (component, trailing) = match rest {
+                    [component] => (component, None),
+                    [component, trailing] => (component, Some(trailing)),
+                    _ => return Err(malformed()),
                 };
-                // FIXME (ACCURACY): the gathered component is a runtime
-                // operand in AIR but a literal in SPIR-V. Lower the common
-                // red-channel gather and reject any other selector.
+                if let Some(trailing) = trailing
+                    && air_enumerator(trailing, operation, "gather qualifier")? != 0
+                {
+                    return Err(semantic(format!(
+                        "AIR intrinsic air.{operation} has a nonzero gather qualifier"
+                    )));
+                }
+                let component = air_enumerator(component, operation, "gather component")?;
+                let component = u32::try_from(component)
+                    .ok()
+                    .filter(|component| *component < 4)
+                    .ok_or_else(|| {
+                        semantic(format!(
+                            "AIR intrinsic air.{operation} names gather component {component}"
+                        ))
+                    })?;
                 return Ok(Some(InstructionKind::TextureSample {
                     texture: texture.clone(),
                     sampler: sampler.clone(),
@@ -471,7 +484,7 @@ pub(super) fn air_texture_intrinsic(
                     lod: None,
                     gradient: None,
                     bias: None,
-                    gather: Some(0),
+                    gather: Some(component),
                     compare: None,
                 }));
             }

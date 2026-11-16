@@ -859,6 +859,8 @@ pub enum InstructionKind {
 /// What a barrier makes wait, and how far an atomic's ordering reaches.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum BarrierScope {
+    /// One Metal work-item, which is one SPIR-V invocation.
+    Invocation,
     /// Metal's SIMD-group: the invocations which execute in lockstep.
     Simdgroup,
     /// Metal's threadgroup, which is a Vulkan workgroup.
@@ -875,10 +877,13 @@ pub struct BarrierMemory {
     pub texture: bool,
 }
 
-/// Metal's `memory_order`, of which only `relaxed` and `seq_cst` exist.
+/// Metal's C++ memory ordering for an atomic operation.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum MemoryOrder {
     Relaxed,
+    Acquire,
+    Release,
+    AcquireRelease,
     SequentiallyConsistent,
 }
 

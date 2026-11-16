@@ -42,6 +42,62 @@ fn a_device_atomic_names_the_device_scope() {
 }
 
 #[test]
+fn a_work_item_memory_scope_stays_with_one_invocation() {
+    let kind = air_intrinsic(
+        "air.atomic.local.add.u.i32",
+        &[
+            Operand::Value(ValueId(0)),
+            Operand::u32(1),
+            Operand::u32(0),
+            Operand::u32(0),
+        ],
+    )
+    .expect("the atomic is lowered");
+    let InstructionKind::Atomic { scope, .. } = kind else {
+        panic!("an atomic read-modify-write");
+    };
+    assert_eq!(scope, BarrierScope::Invocation);
+}
+
+#[test]
+fn air_atomic_memory_orders_keep_their_declared_strength() {
+    for (enumerator, expected) in [
+        (0, MemoryOrder::Relaxed),
+        (1, MemoryOrder::Acquire),
+        (2, MemoryOrder::Release),
+        (3, MemoryOrder::AcquireRelease),
+        (4, MemoryOrder::SequentiallyConsistent),
+    ] {
+        let kind = air_intrinsic(
+            "air.atomic.global.add.u.i32",
+            &[
+                Operand::Value(ValueId(0)),
+                Operand::u32(1),
+                Operand::u32(enumerator),
+                Operand::u32(2),
+            ],
+        )
+        .expect("the atomic is lowered");
+        let InstructionKind::Atomic { order, .. } = kind else {
+            panic!("an atomic read-modify-write");
+        };
+        assert_eq!(order, expected);
+    }
+    assert!(
+        air_intrinsic(
+            "air.atomic.global.add.u.i32",
+            &[
+                Operand::Value(ValueId(0)),
+                Operand::u32(1),
+                Operand::u32(5),
+                Operand::u32(2),
+            ],
+        )
+        .is_err()
+    );
+}
+
+#[test]
 fn a_modern_texture_write_accepts_its_trailing_qualifier() {
     let texture = Operand::Value(ValueId(0));
     let coordinate = Operand::Value(ValueId(1));
@@ -126,6 +182,60 @@ fn a_modern_sample_accepts_its_trailing_zero_and_refuses_others() {
     };
     assert_eq!((lod, bias), (Some(Operand::f32(3.0)), None));
     assert!(sample(1).is_err());
+}
+
+#[test]
+fn official_air_gathers_keep_each_literal_component() {
+    let zero_offset = Operand::Composite {
+        ty: Type::Vector {
+            element: Box::new(Type::Int {
+                bits: 32,
+                signed: true,
+            }),
+            lanes: 2,
+        },
+        elements: vec![
+            Operand::Integer {
+                ty: Type::Int {
+                    bits: 32,
+                    signed: true,
+                },
+                value: 0,
+            };
+            2
+        ],
+    };
+    let gather = |component: Operand, trailing: Option<u32>| {
+        let mut arguments = vec![
+            Operand::Value(ValueId(0)),
+            Operand::Value(ValueId(1)),
+            Operand::Value(ValueId(2)),
+            Operand::Bool(true),
+            zero_offset.clone(),
+            component,
+        ];
+        arguments.extend(trailing.map(Operand::u32));
+        air_intrinsic("air.gather_texture_2d.v4f32", &arguments)
+    };
+    for component in 0..4 {
+        let InstructionKind::TextureSample {
+            gather: selected, ..
+        } = gather(Operand::u32(component), Some(0)).expect("an official modern gather")
+        else {
+            panic!("a texture gather");
+        };
+        assert_eq!(selected, Some(component));
+    }
+    let InstructionKind::TextureSample {
+        gather: selected, ..
+    } = gather(Operand::u32(2), None).expect("an older gather")
+    else {
+        panic!("a texture gather");
+    };
+    assert_eq!(selected, Some(2));
+    assert!(gather(Operand::u32(4), Some(0)).is_err());
+    assert!(gather(Operand::Value(ValueId(3)), Some(0)).is_err());
+    assert!(gather(Operand::u32(0), Some(1)).is_err());
 }
 
 #[test]
