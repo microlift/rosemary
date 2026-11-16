@@ -262,6 +262,8 @@ pub struct TranslatedLibrary {
     /// any has to be translated again for each set of values a function is
     /// made with.
     pub function_constants: Vec<FunctionConstantInfo>,
+    /// Entry names and their constant uses before specialization and folding.
+    pub function_reflection: Vec<FunctionReflection>,
     /// Entry points the source declares which could not be translated, and
     /// why: the rest of the library is usable, and asking for one of these
     /// reports its reason.
@@ -281,6 +283,15 @@ pub struct FunctionConstantInfo {
     pub name: String,
     /// The Itanium spelling of its Metal type.
     pub encoding: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FunctionReflection {
+    pub name: String,
+    pub stage: Stage,
+    pub constants: Vec<FunctionConstantInfo>,
+    /// The emitted entry index, or `None` for a source template without code.
+    pub entry: Option<usize>,
 }
 
 pub fn emit_spirv(
@@ -337,6 +348,7 @@ pub fn emit_spirv(
     Ok(TranslatedLibrary {
         entries,
         function_constants,
+        function_reflection: Vec::new(),
         rejected,
     })
 }

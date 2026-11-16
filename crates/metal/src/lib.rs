@@ -60,10 +60,7 @@ enum LibraryInput {
         modules: Vec<Vec<u8>>,
         entry_modules: Vec<usize>,
     },
-    Msl {
-        source: String,
-        macros: Vec<(String, String)>,
-    },
+    Msl(metal_translate::MslSource),
 }
 
 struct Library {
@@ -79,9 +76,11 @@ struct Library {
 
 struct Function {
     library: Id,
-    /// The library's own translation, which a source function reading a
-    /// constant with no value of its own does not have.
-    entry: Option<usize>,
+    name: String,
+    stage: metal_translate::ir::Stage,
+    base_entry: Option<usize>,
+    /// Only the library constants this entry point uses.
+    constants: Vec<metal_translate::FunctionConstantInfo>,
     /// The entry point translated for the function constants this function
     /// was made with, in place of the library's own.
     specialized: Option<metal_translate::EntryArtifact>,
@@ -101,7 +100,8 @@ impl Function {
             return Some(unsafe { &*(artifact as *const metal_translate::EntryArtifact) });
         }
         let library = unsafe { object::body::<Library>(self.library) };
-        library.translated.entries.get(self.entry?)
+        self.base_entry
+            .and_then(|entry| library.translated.entries.get(entry))
     }
 }
 

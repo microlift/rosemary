@@ -38,6 +38,16 @@ fn library() -> TranslatedLibrary {
             name: "useFog".to_owned(),
             encoding: "b".to_owned(),
         }],
+        function_reflection: vec![FunctionReflection {
+            name: "kernel_store_const".to_owned(),
+            stage: Stage::Kernel,
+            constants: vec![FunctionConstantInfo {
+                index: 3,
+                name: "useFog".to_owned(),
+                encoding: "b".to_owned(),
+            }],
+            entry: Some(0),
+        }],
         entries: vec![
             EntryArtifact {
                 name: "kernel_store_const".to_owned(),
@@ -107,6 +117,70 @@ fn an_entry_round_trips_through_its_file_encoding() {
 }
 
 #[test]
+fn source_cache_hit_reflects_and_specializes_without_reparsing() {
+    let scratch = Scratch::new("source-reflection");
+    let root = Some(scratch.0.as_path());
+    let source = "constant uint width [[function_constant(3)]];
+        fragment float4 required_width() { return float4(float(width)); }
+        fragment float4 independent() { return float4(1.0); }";
+    let target = TargetProfile::vulkan_1_3();
+    let passes = PassPipeline::default();
+    let load = || {
+        let (library, source) = MslSource::load_in(root, source, &[], &target, &passes).unwrap();
+        (library, source.unwrap())
+    };
+    let (cold, first) = load();
+    assert_eq!(cold.entries.len(), 1);
+    assert_eq!(cold.function_reflection[0].name, "required_width");
+    assert_eq!(cold.function_reflection[0].entry, None);
+    assert_eq!(cold.function_reflection[0].constants[0].name, "width");
+    assert_eq!(cold.function_reflection[1].entry, Some(0));
+    assert!(cold.function_reflection[1].constants.is_empty());
+
+    let mut values = FunctionConstantValues::new();
+    values
+        .set_index(3, crate::MTL_DATA_TYPE_UINT, &5u32.to_le_bytes())
+        .unwrap();
+    let specialized = first
+        .specialize_in(root, &target, &passes, &values)
+        .unwrap();
+    assert!(
+        specialized
+            .entries
+            .iter()
+            .any(|entry| entry.name == "required_width")
+    );
+    flush();
+
+    let (warm, second) = load();
+    assert_eq!(warm, cold);
+    assert_eq!(
+        second
+            .specialize_in(root, &target, &passes, &values)
+            .unwrap(),
+        specialized
+    );
+    assert!(
+        second.template.get().is_none(),
+        "cache hits must not parse the template"
+    );
+
+    values
+        .set_index(3, crate::MTL_DATA_TYPE_UINT, &7u32.to_le_bytes())
+        .unwrap();
+    assert_ne!(
+        second
+            .specialize_in(root, &target, &passes, &values)
+            .unwrap(),
+        specialized
+    );
+    assert!(
+        second.template.get().is_some(),
+        "new values must compile a variant"
+    );
+}
+
+#[test]
 fn a_corrupt_or_foreign_entry_decodes_to_nothing() {
     let key = [0x5a; 32];
     let encoded = encode(&key, &library());
@@ -169,7 +243,6 @@ fn a_key_covers_the_input_the_target_the_frontend_and_the_passes() {
             &FunctionConstantValues::new()
         )
     );
-
     let mut wider = TargetProfile::vulkan_1_3();
     wider.variable_pointers = true;
     assert_ne!(

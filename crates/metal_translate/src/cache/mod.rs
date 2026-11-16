@@ -13,9 +13,9 @@ use std::sync::{Arc, Condvar, LazyLock, Mutex, OnceLock, mpsc};
 use crate::ir::{Access, ResourceKind, Stage};
 use crate::sha256::{self, Sha256};
 use crate::{
-    AirInput, EntryArtifact, FunctionConstantInfo, FunctionConstantValues, PassPipeline,
-    RequiredFeatures, ResourceBinding, StageVariable, TargetProfile, TranslateError,
-    TranslatedLibrary,
+    AirInput, EntryArtifact, FunctionConstantInfo, FunctionConstantValues, FunctionReflection,
+    MslTemplate, PassPipeline, RequiredFeatures, ResourceBinding, StageVariable, TargetProfile,
+    TranslateError, TranslatedLibrary,
 };
 use codec::{decode, encode};
 pub use store::flush;
@@ -27,7 +27,7 @@ use store::{entry_path, pending_entry, queue_entry, read_entry, root};
 pub const CACHE_VERSION: &str = env!("METAL_TRANSLATE_CACHE_VERSION");
 
 /// The container magic, which changes when the entry encoding does.
-const MAGIC: &[u8; 8] = b"RMMTLC02";
+const MAGIC: &[u8; 8] = b"RMMTLC03";
 
 /// Directory to hold the cache, overriding the user's cache directory.
 ///
@@ -171,6 +171,121 @@ pub fn translate_msl_specialized_cached(
     passes: &PassPipeline,
     constants: &FunctionConstantValues,
 ) -> Result<TranslatedLibrary, TranslateError> {
+    msl_cached(root(), source, macros, target, passes, constants, || {
+        crate::translate_msl_specialized(source, macros, target, passes, constants)
+    })
+}
+
+/// Source retained so a library can specialize with new values. Its parsed
+/// template is needed only when a variant misses the disk cache.
+pub struct MslSource {
+    source: String,
+    macros: Vec<(String, String)>,
+    template: OnceLock<Result<MslTemplate, TranslateError>>,
+}
+
+impl MslSource {
+    /// Load a library with its reflection, retaining source only if it can
+    /// specialize. The existing cache entry is enough to do both.
+    pub fn load_cached(
+        source: &str,
+        macros: &[(String, String)],
+        target: &TargetProfile,
+        passes: &PassPipeline,
+    ) -> Result<(TranslatedLibrary, Option<Self>), TranslateError> {
+        Self::load_in(root(), source, macros, target, passes)
+    }
+
+    fn load_in(
+        root: Option<&Path>,
+        source: &str,
+        macros: &[(String, String)],
+        target: &TargetProfile,
+        passes: &PassPipeline,
+    ) -> Result<(TranslatedLibrary, Option<Self>), TranslateError> {
+        let mut parsed = None;
+        let library = msl_cached(
+            root,
+            source,
+            macros,
+            target,
+            passes,
+            &FunctionConstantValues::new(),
+            || {
+                let template = crate::compile_msl_template(source, macros)?;
+                let library = crate::translate_msl_template(&template, target, passes)?;
+                parsed = Some(template);
+                Ok(library)
+            },
+        )?;
+        let retained = (!library.function_constants.is_empty()).then(|| Self {
+            source: source.to_owned(),
+            macros: macros.to_vec(),
+            template: parsed.map_or_else(OnceLock::new, |template| OnceLock::from(Ok(template))),
+        });
+        Ok((library, retained))
+    }
+
+    pub fn specialize_cached(
+        &self,
+        target: &TargetProfile,
+        passes: &PassPipeline,
+        constants: &FunctionConstantValues,
+    ) -> Result<TranslatedLibrary, TranslateError> {
+        self.specialize_in(root(), target, passes, constants)
+    }
+
+    fn specialize_in(
+        &self,
+        root: Option<&Path>,
+        target: &TargetProfile,
+        passes: &PassPipeline,
+        constants: &FunctionConstantValues,
+    ) -> Result<TranslatedLibrary, TranslateError> {
+        msl_cached(
+            root,
+            &self.source,
+            &self.macros,
+            target,
+            passes,
+            constants,
+            || {
+                let template = self
+                    .template
+                    .get_or_init(|| crate::compile_msl_template(&self.source, &self.macros))
+                    .as_ref()
+                    .map_err(Clone::clone)?;
+                crate::translate_msl_template_specialized(template, target, passes, constants)
+            },
+        )
+    }
+}
+
+fn msl_cached(
+    root: Option<&Path>,
+    source: &str,
+    macros: &[(String, String)],
+    target: &TargetProfile,
+    passes: &PassPipeline,
+    constants: &FunctionConstantValues,
+    translate: impl FnOnce() -> Result<TranslatedLibrary, TranslateError>,
+) -> Result<TranslatedLibrary, TranslateError> {
+    let Some(root) = root else {
+        return translate();
+    };
+    let bytes = msl_bytes(source, macros);
+    cached_in(
+        root,
+        Frontend::Msl,
+        &bytes,
+        target,
+        passes,
+        constants,
+        translate,
+    )
+}
+
+fn msl_bytes(source: &str, macros: &[(String, String)]) -> Vec<u8> {
     let mut bytes = Vec::new();
     for (name, value) in macros {
         for text in [name, value] {
@@ -183,9 +298,7 @@ pub fn translate_msl_specialized_cached(
         bytes.extend_from_slice(b"\0macros\0");
     }
     bytes.extend_from_slice(source.as_bytes());
-    cached(Frontend::Msl, &bytes, target, passes, constants, || {
-        crate::translate_msl_specialized(source, macros, target, passes, constants)
-    })
+    bytes
 }
 
 fn cached(
