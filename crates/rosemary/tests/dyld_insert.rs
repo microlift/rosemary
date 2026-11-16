@@ -24,6 +24,26 @@ fn host_variable_inserts_a_library() {
 }
 
 #[test]
+fn inserts_a_library_whose_path_has_spaces() {
+    let Some(lib) = common::build_x86_64("insert_spaced_lib", INSERTED, &["-dynamiclib"]) else {
+        return;
+    };
+    let Some(main) = common::build_x86_64("insert_spaced_main", MAIN, &[]) else {
+        return;
+    };
+    let dir = std::path::Path::new(env!("CARGO_TARGET_TMPDIR")).join("insert with spaces");
+    std::fs::create_dir_all(&dir).expect("create spaced dir");
+    let spaced = dir.join("insert lib.dylib");
+    std::fs::copy(&lib, &spaced).expect("copy library");
+    let (_, out, _) = common::run_guest_env(
+        &[("ROSEMARY_DYLD_INSERT_LIBRARIES", spaced.to_str().unwrap())],
+        &main,
+        &[],
+    );
+    assert_eq!(out, "inserted\nmain\n");
+}
+
+#[test]
 fn guest_variable_is_the_one_that_counts() {
     let Some(lib) = common::build_x86_64("insert_lib", INSERTED, &["-dynamiclib"]) else {
         return;

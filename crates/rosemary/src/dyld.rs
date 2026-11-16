@@ -1502,7 +1502,8 @@ pub fn inserted_libraries<S: machish::spec::MachSpec + 'static>(
     let requested: Vec<String> = host
         .iter()
         .chain(guest.iter())
-        .flat_map(|list| list.split([':', ' ']))
+        // dyld separates entries with colons only: a path may contain spaces.
+        .flat_map(|list| list.split(':'))
         .filter(|lib| !lib.is_empty())
         .map(str::to_string)
         .collect();
