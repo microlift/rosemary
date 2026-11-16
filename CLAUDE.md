@@ -35,7 +35,7 @@ Debug builds are fine, and useful for iteration, when running a *native* guest w
 extra checks have caught real bugs. Avoid debug builds whenever emulation is in play (no native slice for the host
 CPU), since that path is already slow and debug makes it much worse. Use release builds to judge performance.
 
-Rust 2024 edition, requires Rust 1.96+. Microlift and Microlift-Wasmtime are Git dependencies, so the build
+Rust 2024 edition, requires Rust 1.99+. Microlift and Microlift-Wasmtime are Git dependencies, so the build
 environment needs network access to fetch them. On Debian-based Linux, install `build-essential pkg-config
 libcurl4-openssl-dev zlib1g-dev libsdl3-dev libglu1-mesa libxkbcommon-dev` first. On macOS, install the Xcode command-line tools.
 
