@@ -31,6 +31,7 @@ pub(crate) fn instruction_name(kind: &InstructionKind) -> &'static str {
         InstructionKind::IntegerUnary { .. } => "integer math call",
         InstructionKind::FloatMix { .. } => "mix",
         InstructionKind::FloatDot { .. } => "dot product",
+        InstructionKind::FloatRefract { .. } => "refraction",
         InstructionKind::VectorSplat { .. } => "vector splat",
         InstructionKind::TextureSample { .. } => "texture sample",
         InstructionKind::TextureRead { .. } => "texture read",
@@ -112,6 +113,11 @@ pub(crate) fn instruction_operands(kind: &InstructionKind) -> Vec<&Operand> {
             second,
             weight,
         } => vec![first, second, weight],
+        InstructionKind::FloatRefract {
+            incident,
+            normal,
+            ratio,
+        } => vec![incident, normal, ratio],
         InstructionKind::All { vector }
         | InstructionKind::Any { vector }
         | InstructionKind::Convert { value: vector, .. }
@@ -222,6 +228,11 @@ pub(crate) fn instruction_operands_mut(kind: &mut InstructionKind) -> Vec<&mut O
             second,
             weight,
         } => vec![first, second, weight],
+        InstructionKind::FloatRefract {
+            incident,
+            normal,
+            ratio,
+        } => vec![incident, normal, ratio],
         InstructionKind::All { vector }
         | InstructionKind::Any { vector }
         | InstructionKind::Convert { value: vector, .. }

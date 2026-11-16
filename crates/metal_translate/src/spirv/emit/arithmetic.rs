@@ -455,6 +455,19 @@ impl Emitter {
                 values,
                 |builder, ty, id, a, b| builder.dot(ty, id, a, b),
             )?,
+            InstructionKind::FloatRefract {
+                incident,
+                normal,
+                ratio,
+            } => {
+                self.emit_ext_inst(
+                    function,
+                    instruction,
+                    values,
+                    GlslStd450Op::Refract,
+                    [incident, normal, ratio],
+                )?;
+            }
             InstructionKind::FloatClamp { value, min, max } => {
                 self.emit_ext_inst(
                     function,

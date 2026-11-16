@@ -762,6 +762,11 @@ pub enum InstructionKind {
         lhs: Operand,
         rhs: Operand,
     },
+    FloatRefract {
+        incident: Operand,
+        normal: Operand,
+        ratio: Operand,
+    },
     VectorSplat {
         value: Operand,
         lanes: u8,

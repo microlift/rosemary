@@ -305,6 +305,7 @@ fn verify_instruction_types(
         | InstructionKind::FloatCompare { .. }
         | InstructionKind::FloatFma { .. }
         | InstructionKind::FloatDot { .. }
+        | InstructionKind::FloatRefract { .. }
         | InstructionKind::FloatClamp { .. }
         | InstructionKind::FloatMix { .. } => {
             arithmetic_is_well_typed(function, &instruction.kind, result)
@@ -659,6 +660,25 @@ fn arithmetic_is_well_typed(
             operand_type(function, lhs) == operand_type(function, rhs)
                 && matches!(operand_type(function, lhs), Some(Type::Vector { element, .. }) if matches!(element.as_ref(), Type::Float { .. }))
                 && result == Some(Type::Float { bits: 32 })
+        }
+        InstructionKind::FloatRefract {
+            incident,
+            normal,
+            ratio,
+        } => {
+            let component = match &result {
+                Some(Type::Vector {
+                    element,
+                    lanes: 2..=4,
+                }) if matches!(element.as_ref(), Type::Float { .. }) => {
+                    Some(element.as_ref().clone())
+                }
+                _ => None,
+            };
+            component.is_some()
+                && result == operand_type(function, incident)
+                && result == operand_type(function, normal)
+                && component == operand_type(function, ratio)
         }
         InstructionKind::FloatClamp { value, min, max } => {
             result == operand_type(function, value)

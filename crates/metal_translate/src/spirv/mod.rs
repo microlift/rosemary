@@ -402,6 +402,7 @@ fn emit_entry(
     }
     hoist_phis(&mut function);
     reverse_post_order(&mut function);
+    function.verify()?;
     let function = &function;
     let mut emitter = Emitter::new(target);
     emitter.declare_globals(module, function)?;

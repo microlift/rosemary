@@ -234,6 +234,7 @@ impl Emitter {
             | InstructionKind::FloatUnary { .. }
             | InstructionKind::FloatFma { .. }
             | InstructionKind::FloatDot { .. }
+            | InstructionKind::FloatRefract { .. }
             | InstructionKind::FloatClamp { .. }
             | InstructionKind::FloatMix { .. } => {
                 self.emit_arithmetic(function, instruction, values, result_id)

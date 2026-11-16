@@ -449,6 +449,31 @@ impl Lowerer<'_, '_> {
                 let scaled = self.arithmetic("*", n, twice, line)?;
                 self.arithmetic("-", i, scaled, line)
             }
+            ("refract", [incident, normal, ratio]) => {
+                if !matches!(incident.ty, Ty::Vector(Scalar::Float { .. }, 2..=4))
+                    || !matches!(normal.ty, Ty::Vector(Scalar::Float { .. }, 2..=4))
+                    || incident.ty.lanes() != normal.ty.lanes()
+                    || ratio.ty.lanes() != Some(1)
+                {
+                    return Err(syntax_error(
+                        line,
+                        "refract needs matching floating vectors and a scalar ratio",
+                    ));
+                }
+                let ty = self.float_common(&[incident, normal], line)?;
+                let incident = self.convert(incident.clone(), &ty, line)?;
+                let normal = self.convert(normal.clone(), &ty, line)?;
+                let ratio = self.convert(ratio.clone(), &Ty::Scalar(ty.scalar().unwrap()), line)?;
+                let op = self.emit(
+                    self.context.ir(&ty),
+                    InstructionKind::FloatRefract {
+                        incident: incident.op,
+                        normal: normal.op,
+                        ratio: ratio.op,
+                    },
+                );
+                Ok(Value { op, ty })
+            }
             ("select", [a, b, c]) => {
                 let ty = if a.ty == b.ty {
                     a.ty.clone()

@@ -21,6 +21,8 @@ macro_rules! isolate_metal_fixture {
     };
 }
 
+mod control_flow;
+mod geometry;
 mod source_constants;
 
 fn device_for_tests() -> Id {
