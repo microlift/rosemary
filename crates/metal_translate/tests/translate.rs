@@ -1221,6 +1221,41 @@ fn source_msl_a_half_texture_computes_at_half_precision() {
     );
 }
 
+/// A target without native half arithmetic still rounds each half producer,
+/// rather than keeping an accumulating float result. The fallback is integer
+/// IEEE-754 conversion so its tie and subnormal behavior is driver-independent.
+#[test]
+fn source_msl_a_half_texture_rounds_in_software_without_shader_float16() {
+    let source = "#include <metal_stdlib>\n\
+        using namespace metal;\n\
+        struct Varyings { float4 pos [[position]]; float2 uv; };\n\
+        fragment half4 shade(Varyings input [[stage_in]],\n\
+            texture2d<half, access::sample> tex [[ texture(0) ]],\n\
+            sampler s [[ sampler(0) ]])\n\
+        {\n\
+            return tex.sample(s, input.uv) * 3.0h;\n\
+        }\0";
+    let library = translate_msl(source, &TargetProfile::vulkan_1_3()).unwrap();
+    let module = rspirv::dr::load_words(&library.entries[0].words).unwrap();
+    assert_eq!(image_sampled_width(&module), Some(32));
+    let [multiply] = &body_instructions(&module, Op::FMul)[..] else {
+        panic!("expected one multiply");
+    };
+    assert_eq!(
+        scalar_width(&module, multiply.result_type.unwrap()),
+        Some(32)
+    );
+    assert!(
+        body_instructions(&module, Op::Bitcast).iter().any(|cast| {
+            cast.operands
+                .first()
+                .and_then(|operand| operand.id_ref_any())
+                == multiply.result_id
+        }),
+        "the widened multiply must enter the software half quantizer"
+    );
+}
+
 /// A `ushort` texture reads and writes 32-bit texels and computes with
 /// 16-bit ones, so an addition wraps as Metal's does.
 #[test]
@@ -1253,8 +1288,8 @@ fn source_msl_a_short_texture_computes_at_short_width() {
     assert_eq!(scalar_width(&module, widen.result_type.unwrap()), Some(32));
 }
 
-/// Without `shaderInt16` a `ushort` texture's texels are computed as `uint`
-/// rather than rejected.
+/// Without `shaderInt16` a `ushort` texture's texels are computed as `uint`,
+/// but every 16-bit result still wraps before its next use.
 #[test]
 fn source_msl_a_short_texture_widens_without_shader_int16() {
     let target = TargetProfile {
@@ -1268,6 +1303,16 @@ fn source_msl_a_short_texture_widens_without_shader_int16() {
         panic!("expected one addition");
     };
     assert_eq!(scalar_width(&module, add.result_type.unwrap()), Some(32));
+    let [write] = &body_instructions(&module, Op::ImageWrite)[..] else {
+        panic!("expected one write");
+    };
+    let written = write.operands[2].unwrap_id_ref();
+    assert!(
+        body_instructions(&module, Op::BitwiseAnd)
+            .iter()
+            .any(|wrap| wrap.result_id == Some(written)),
+        "the widened addition must wrap to ushort before the write"
+    );
     assert!(body_instructions(&module, Op::UConvert).is_empty());
 }
 
@@ -1278,6 +1323,96 @@ const SHORT_TEXTURE_KERNEL: &str = "#include <metal_stdlib>\n\
     {\n\
         counts.write(counts.read(gid) + ushort4(1), gid);\n\
     }\0";
+
+/// A signed 16-bit add has the same low-bit modulo result as an unsigned one;
+/// the texture write consumes that canonical representation.
+#[test]
+fn source_msl_a_signed_short_texture_wraps_without_shader_int16() {
+    let source = "#include <metal_stdlib>\n\
+        using namespace metal;\n\
+        kernel void add(texture2d<short, access::read_write> counts [[ texture(0) ]],\n\
+            uint2 gid [[ thread_position_in_grid ]])\n\
+        {\n\
+            counts.write(counts.read(gid) + short4(1), gid);\n\
+        }\0";
+    let target = TargetProfile {
+        shader_storage_image_read_without_format: true,
+        shader_storage_image_write_without_format: true,
+        ..TargetProfile::vulkan_1_3()
+    };
+    let library = translate_msl(source, &target).unwrap();
+    let module = rspirv::dr::load_words(&library.entries[0].words).unwrap();
+    assert_eq!(image_sampled_width(&module), Some(32));
+    let [write] = &body_instructions(&module, Op::ImageWrite)[..] else {
+        panic!("expected one write");
+    };
+    let written = write.operands[2].unwrap_id_ref();
+    let retyped = body_instructions(&module, Op::Bitcast)
+        .into_iter()
+        .find(|bitcast| bitcast.result_id == Some(written))
+        .expect("a signed image retypes the signless wrapped value");
+    let wrapped = retyped.operands[0].unwrap_id_ref();
+    assert!(
+        body_instructions(&module, Op::BitwiseAnd)
+            .iter()
+            .any(|wrap| wrap.result_id == Some(wrapped)),
+        "the widened signed addition must wrap before the write"
+    );
+}
+
+/// A signed consumer must reinterpret the canonical low 16 bits before doing
+/// 32-bit arithmetic. Otherwise -32768 would be divided as +32768.
+#[test]
+fn source_msl_a_signed_short_divide_sign_extends_its_operands() {
+    let source = "#include <metal_stdlib>\n\
+        using namespace metal;\n\
+        kernel void divide(texture2d<short, access::read_write> counts [[ texture(0) ]],\n\
+            uint2 gid [[ thread_position_in_grid ]])\n\
+        {\n\
+            counts.write(counts.read(gid) / short4(-2), gid);\n\
+        }\0";
+    let target = TargetProfile {
+        shader_storage_image_read_without_format: true,
+        shader_storage_image_write_without_format: true,
+        ..TargetProfile::vulkan_1_3()
+    };
+    let library = translate_msl(source, &target).unwrap();
+    let module = rspirv::dr::load_words(&library.entries[0].words).unwrap();
+    let [divide] = &body_instructions(&module, Op::SDiv)[..] else {
+        panic!("expected one signed divide");
+    };
+    let extended: Vec<_> = body_instructions(&module, Op::ShiftRightArithmetic)
+        .into_iter()
+        .filter_map(|instruction| instruction.result_id)
+        .collect();
+    assert!(extended.contains(&divide.operands[0].unwrap_id_ref()));
+    assert!(extended.contains(&divide.operands[1].unwrap_id_ref()));
+}
+
+#[test]
+fn source_msl_a_signed_short_to_float_sign_extends_before_conversion() {
+    let source = "#include <metal_stdlib>\n\
+        using namespace metal;\n\
+        kernel void convert(texture2d<short, access::read> counts [[ texture(0) ]],\n\
+            device float4* output [[ buffer(0) ]], uint2 gid [[ thread_position_in_grid ]])\n\
+        {\n\
+            output[0] = float4(counts.read(gid));\n\
+        }\0";
+    let target = TargetProfile {
+        shader_storage_image_read_without_format: true,
+        ..TargetProfile::vulkan_1_3()
+    };
+    let library = translate_msl(source, &target).unwrap();
+    let module = rspirv::dr::load_words(&library.entries[0].words).unwrap();
+    let [convert] = &body_instructions(&module, Op::ConvertSToF)[..] else {
+        panic!("expected one signed conversion");
+    };
+    let extended: Vec<_> = body_instructions(&module, Op::ShiftRightArithmetic)
+        .into_iter()
+        .filter_map(|instruction| instruction.result_id)
+        .collect();
+    assert!(extended.contains(&convert.operands[0].unwrap_id_ref()));
+}
 
 #[test]
 fn source_msl_loops_leave_through_one_block() {

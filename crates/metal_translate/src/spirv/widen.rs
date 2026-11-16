@@ -1,15 +1,17 @@
 //! Compute `half` as `float` on targets without `shaderFloat16`, and a
 //! `short` texture's texels as `int` on targets without `shaderInt16`.
-//!
-//! FIXME (ACCURACY): the wider type keeps the precision and range the narrow
-//! one would round or wrap away.
+//! Every half-producing operation is rounded through an integer IEEE-754
+//! binary16 conversion, and every short producer is wrapped to its low 16
+//! bits; signed short consumers sign-extend those bits before operating.
 //!
 //! A narrow type in a buffer keeps the guest's layout, so a module with one is
 //! left unchanged and still needs the capability.
 
 use super::*;
-use crate::ir::{StructField, StructType, TextureType};
+use crate::ir::{Instruction, StructField, StructType, TextureType};
 use crate::passes::Substitution;
+
+mod half;
 
 /// The narrow types a target cannot compute with.
 #[derive(Clone, Copy)]
@@ -21,21 +23,9 @@ struct Narrow {
 /// The module with each narrow type `target` lacks widened, or `None` if
 /// there is nothing to change or it can't be changed.
 pub(super) fn widen(module: &Module, target: &TargetProfile) -> Option<Module> {
-    // Widening changes a `short`'s arithmetic, so it is kept to modules
-    // reading a `short` texture, which have no other way to run there.
-    let short_texture = |ty: &Type| match ty {
-        Type::Texture(texture) => matches!(*texture.texel, Type::Int { bits: 16, .. }),
-        _ => false,
-    };
     let narrow = Narrow {
         half: !target.shader_float16,
-        short: !target.shader_int16
-            && module.functions.iter().any(|function| {
-                function
-                    .parameters
-                    .iter()
-                    .any(|parameter| short_texture(&parameter.ty))
-            }),
+        short: !target.shader_int16,
     };
     let any = module.globals.iter().any(|global| narrow.has(&global.ty))
         || module.functions.iter().any(|function| {
@@ -62,14 +52,80 @@ pub(super) fn widen(module: &Module, target: &TargetProfile) -> Option<Module> {
 
 impl Narrow {
     fn widen_function(self, function: &mut Function) -> Option<()> {
+        let original_values = function.values.clone();
+        let mut parameter_wraps = Vec::new();
+        for parameter in &mut function.parameters {
+            let ty = original_values.get(parameter.value.0 as usize)?;
+            if self.has(ty)
+                && matches!(
+                    ty,
+                    Type::Array { .. } | Type::Matrix { .. } | Type::Struct(_)
+                )
+            {
+                // A scalar/vector parameter can be normalized at function
+                // entry. A composite needs per-field interface lowering.
+                return None;
+            }
+            if !self.short_value(ty) && !self.half_value(ty) {
+                continue;
+            }
+            let result = parameter.value;
+            let raw = ValueId(function.values.len() as u32);
+            function.values.push(ty.clone());
+            parameter.value = raw;
+            if self.short_value(ty) {
+                self.wrap_short(
+                    Operand::Value(raw),
+                    ty,
+                    result,
+                    &mut function.values,
+                    &mut parameter_wraps,
+                )?;
+            } else {
+                half::quantize(
+                    Operand::Value(raw),
+                    ty,
+                    result,
+                    &mut function.values,
+                    &mut parameter_wraps,
+                )?;
+            }
+        }
+
         let mut substitution = Substitution::default();
-        let values = &function.values;
         for block in &mut function.blocks {
+            let mut phis = Vec::new();
+            let mut phi_wraps = Vec::new();
             let mut kept = Vec::with_capacity(block.instructions.len());
             for mut instruction in std::mem::take(&mut block.instructions) {
+                let result = instruction.result;
+                let result_type = result
+                    .and_then(|result| original_values.get(result.0 as usize))
+                    .cloned();
+                let result_is_short = result_type.as_ref().is_some_and(|ty| self.short_value(ty));
+                let result_is_half = result_type.as_ref().is_some_and(|ty| self.half_value(ty));
+                self.prepare_signed_short_operands(
+                    &mut instruction.kind,
+                    &original_values,
+                    &mut function.values,
+                    &mut kept,
+                )?;
                 if let InstructionKind::Convert { op, value } = &mut instruction.kind {
-                    let source = type_of(values, value)?;
-                    let result = values.get(instruction.result?.0 as usize)?.clone();
+                    let source = type_of(&function.values, value)?;
+                    let result = result_type.clone()?;
+                    if *op == ConvertOp::FloatResize
+                        && result_is_half
+                        && self.widen_type(&source)? == self.widen_type(&result)?
+                    {
+                        half::quantize(
+                            value.clone(),
+                            &result,
+                            instruction.result?,
+                            &mut function.values,
+                            &mut kept,
+                        )?;
+                        continue;
+                    }
                     match op {
                         ConvertOp::Bitcast if self.has(&source) || self.has(&result) => {
                             *op = match (&source, &result) {
@@ -94,15 +150,90 @@ impl Narrow {
                         | ConvertOp::IntegerTruncate
                             if self.widen_type(&source)? == self.widen_type(&result)? =>
                         {
-                            substitution.insert(instruction.result?, value.clone());
+                            let id = instruction.result?;
+                            if result_is_short {
+                                self.wrap_short(
+                                    value.clone(),
+                                    &result,
+                                    id,
+                                    &mut function.values,
+                                    &mut kept,
+                                )?;
+                            } else {
+                                substitution.insert(id, value.clone());
+                            }
                             continue;
                         }
                         _ => {}
                     }
                 }
-                kept.push(instruction);
+                let is_phi = matches!(instruction.kind, InstructionKind::Phi { .. });
+                let rounds_half = result_is_half && self.half_result_needs_round(&instruction.kind);
+                if rounds_half || result_is_short {
+                    let result = result?;
+                    let ty = result_type.as_ref()?;
+                    let raw = ValueId(function.values.len() as u32);
+                    function.values.push(ty.clone());
+                    instruction.result = Some(raw);
+                    if is_phi {
+                        phis.push(instruction);
+                        if rounds_half {
+                            half::quantize(
+                                Operand::Value(raw),
+                                ty,
+                                result,
+                                &mut function.values,
+                                &mut phi_wraps,
+                            )?;
+                        } else {
+                            self.wrap_short(
+                                Operand::Value(raw),
+                                ty,
+                                result,
+                                &mut function.values,
+                                &mut phi_wraps,
+                            )?;
+                        }
+                    } else {
+                        kept.push(instruction);
+                        if rounds_half {
+                            half::quantize(
+                                Operand::Value(raw),
+                                ty,
+                                result,
+                                &mut function.values,
+                                &mut kept,
+                            )?;
+                        } else {
+                            self.wrap_short(
+                                Operand::Value(raw),
+                                ty,
+                                result,
+                                &mut function.values,
+                                &mut kept,
+                            )?;
+                        }
+                    }
+                } else if is_phi {
+                    phis.push(instruction);
+                } else {
+                    kept.push(instruction);
+                }
             }
-            block.instructions = kept;
+            phis.append(&mut phi_wraps);
+            phis.append(&mut kept);
+            block.instructions = phis;
+        }
+        if !parameter_wraps.is_empty() {
+            let entry = function.blocks.first_mut()?;
+            let after_phis = entry
+                .instructions
+                .iter()
+                .position(|instruction| !matches!(instruction.kind, InstructionKind::Phi { .. }))
+                .unwrap_or(entry.instructions.len());
+            entry
+                .instructions
+                .splice(after_phis..after_phis, parameter_wraps);
         }
         substitution.apply(function);
 
@@ -128,6 +259,178 @@ impl Narrow {
                 _ => {}
             }
         }
+        Some(())
+    }
+
+    /// Whether this is a scalar or vector integer whose 16-bit arithmetic is
+    /// being emulated at 32 bits. Other composite shapes are rejected rather
+    /// than partly wrapped.
+    fn short_value(self, ty: &Type) -> bool {
+        if !self.short {
+            return false;
+        }
+        match ty {
+            Type::Int { bits: 16, .. } => true,
+            Type::Vector { element, .. } => matches!(element.as_ref(), Type::Int { bits: 16, .. }),
+            _ => false,
+        }
+    }
+
+    fn half_value(self, ty: &Type) -> bool {
+        if !self.half {
+            return false;
+        }
+        match ty {
+            Type::Float { bits: 16 } => true,
+            Type::Vector { element, .. } => **element == Type::Float { bits: 16 },
+            _ => false,
+        }
+    }
+
+    fn half_result_needs_round(self, kind: &InstructionKind) -> bool {
+        matches!(
+            kind,
+            InstructionKind::FloatBinary { .. }
+                | InstructionKind::FloatUnary { .. }
+                | InstructionKind::FloatClamp { .. }
+                | InstructionKind::FloatMix { .. }
+                | InstructionKind::FloatFma { .. }
+                | InstructionKind::FloatDot { .. }
+                | InstructionKind::FloatRefract { .. }
+                | InstructionKind::TextureSample { .. }
+                | InstructionKind::TextureRead { .. }
+        )
+    }
+
+    /// A widened short is kept as its low 16 bits. Operations which interpret
+    /// those bits as signed receive a temporary sign extension; unsigned and
+    /// bitwise operations consume the canonical value directly.
+    fn prepare_signed_short_operands(
+        self,
+        kind: &mut InstructionKind,
+        original_values: &[Type],
+        values: &mut Vec<Type>,
+        instructions: &mut Vec<Instruction>,
+    ) -> Option<()> {
+        let mut signed = |operand: &mut Operand| {
+            self.sign_extend_short(operand, original_values, values, instructions)
+        };
+        match kind {
+            InstructionKind::IntegerBinary { op, lhs, rhs } => match op {
+                IntegerBinaryOp::DivideSigned
+                | IntegerBinaryOp::RemainderSigned
+                | IntegerBinaryOp::MinimumSigned
+                | IntegerBinaryOp::MaximumSigned => {
+                    signed(lhs)?;
+                    signed(rhs)?;
+                }
+                IntegerBinaryOp::ShiftRightArithmetic => signed(lhs)?,
+                _ => {}
+            },
+            InstructionKind::IntegerCompare {
+                predicate:
+                    IntegerPredicate::SignedLessThan
+                    | IntegerPredicate::SignedLessEqual
+                    | IntegerPredicate::SignedGreaterThan
+                    | IntegerPredicate::SignedGreaterEqual,
+                lhs,
+                rhs,
+            } => {
+                signed(lhs)?;
+                signed(rhs)?;
+            }
+            InstructionKind::IntegerUnary {
+                op: IntegerUnaryOp::AbsoluteSigned | IntegerUnaryOp::SignSigned,
+                value,
+            } => signed(value)?,
+            InstructionKind::IntegerClamp {
+                signed: true,
+                value,
+                min,
+                max,
+            } => {
+                signed(value)?;
+                signed(min)?;
+                signed(max)?;
+            }
+            InstructionKind::Convert {
+                op: ConvertOp::SignExtend | ConvertOp::SignedToFloat,
+                value,
+            } => signed(value)?,
+            // Widening the pointed-to storage would make a 16-bit atomic a
+            // different atomic object. A compare-exchange emulation is needed
+            // before that can be represented exactly.
+            InstructionKind::Atomic { pointer, value, .. } => {
+                let narrow_pointer =
+                    type_of(original_values, pointer).is_some_and(|ty| self.has(&ty));
+                let narrow_value = type_of(original_values, value).is_some_and(|ty| self.has(&ty));
+                if narrow_pointer || narrow_value {
+                    return None;
+                }
+            }
+            _ => {}
+        }
+        Some(())
+    }
+
+    fn sign_extend_short(
+        self,
+        operand: &mut Operand,
+        original_values: &[Type],
+        values: &mut Vec<Type>,
+        instructions: &mut Vec<Instruction>,
+    ) -> Option<()> {
+        let ty = type_of(original_values, operand)?;
+        if !self.short_value(&ty) {
+            return Some(());
+        }
+        let shifted = ValueId(values.len() as u32);
+        values.push(ty.clone());
+        let extended = ValueId(values.len() as u32);
+        values.push(ty.clone());
+        let amount = integer_constant(&ty, 16)?;
+        instructions.push(Instruction {
+            result: Some(shifted),
+            kind: InstructionKind::IntegerBinary {
+                op: IntegerBinaryOp::ShiftLeft,
+                lhs: operand.clone(),
+                rhs: amount.clone(),
+            },
+        });
+        instructions.push(Instruction {
+            result: Some(extended),
+            kind: InstructionKind::IntegerBinary {
+                op: IntegerBinaryOp::ShiftRightArithmetic,
+                lhs: Operand::Value(shifted),
+                rhs: amount,
+            },
+        });
+        *operand = Operand::Value(extended);
+        Some(())
+    }
+
+    /// Wrap a widened integer back to Metal's canonical low 16 bits. The final
+    /// instruction deliberately keeps `result`, so every original use sees
+    /// the wrapped value while `source` remains the raw widened operation.
+    fn wrap_short(
+        self,
+        source: Operand,
+        ty: &Type,
+        result: ValueId,
+        _values: &mut Vec<Type>,
+        instructions: &mut Vec<Instruction>,
+    ) -> Option<()> {
+        if !self.short_value(ty) {
+            return None;
+        }
+        instructions.push(Instruction {
+            result: Some(result),
+            kind: InstructionKind::IntegerBinary {
+                op: IntegerBinaryOp::And,
+                lhs: source,
+                rhs: integer_constant(ty, u16::MAX.into())?,
+            },
+        });
         Some(())
     }
 
@@ -232,6 +535,27 @@ impl Narrow {
             Type::Texture(texture) => self.has(&texture.texel),
             _ => false,
         }
+    }
+}
+
+fn integer_constant(ty: &Type, value: u64) -> Option<Operand> {
+    match ty {
+        Type::Int { .. } => Some(Operand::Integer {
+            ty: ty.clone(),
+            value,
+        }),
+        Type::Vector { element, lanes } if matches!(element.as_ref(), Type::Int { .. }) => {
+            Some(Operand::Composite {
+                ty: ty.clone(),
+                elements: (0..*lanes)
+                    .map(|_| Operand::Integer {
+                        ty: element.as_ref().clone(),
+                        value,
+                    })
+                    .collect(),
+            })
+        }
+        _ => None,
     }
 }
 

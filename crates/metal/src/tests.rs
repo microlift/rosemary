@@ -24,9 +24,11 @@ macro_rules! isolate_metal_fixture {
 mod control_flow;
 mod depth_stencil;
 mod geometry;
+mod half_fallback;
 mod nonshared_events;
 mod pipeline_buffers;
 mod queue_order;
+mod short_fallback;
 mod source_constants;
 mod texture_threads;
 mod viewports;
