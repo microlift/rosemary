@@ -105,6 +105,9 @@ and AArch64 ABIs differ enough that bridging isn't attempted — most C++ calls 
 * Put platform-specific behavior in `starnix` if it's something UNIX-esque, not behind conditionals scattered through the runtime.
   For other platform-specific behavior that doesn't necessarily belong in `starnix`, design clean abstractions about the underlying
   goal of the behavior that minimizes code duplication where possible.
+* Prefer to use `static_init` over OnceLock or LazyLock if safe to do so. `static_init` acts like C++ magic constructors, it is zero
+  overhead compared to a OnceLock or LazyLock but needs consideration of if it's safe to use it. Examples of where this is safe include
+  initializing a global boolean based on an environment variable.
 * Keep `machish` free of `std`.
 * Comments should be short, ASCII-only, and explain *why* a constraint exists — not narrate what the code does.
 * Semantic accuracy, simplicity, and self-explanatory code is prioritized over everything else. Do not write program-specific
