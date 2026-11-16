@@ -2271,6 +2271,7 @@ dependencies = [
  "exports",
  "libc",
  "sdl3",
+ "static_init",
 ]
 
 [[package]]

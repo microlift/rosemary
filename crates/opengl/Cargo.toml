@@ -12,6 +12,7 @@ sdl3.workspace = true
 
 [target.'cfg(target_os = "macos")'.dependencies]
 libc.workspace = true
+static_init.workspace = true
 
 [lints]
 workspace = true

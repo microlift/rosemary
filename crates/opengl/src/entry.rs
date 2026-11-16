@@ -3,7 +3,15 @@
 
 use std::ffi::{CStr, c_void};
 
+use static_init::dynamic;
+
 use crate::driver::Entry;
+
+fn enable_mipmap_perf_hack() -> bool {
+    #[dynamic]
+    static ENABLED: bool = std::env::var("ROSEMARY_GL_MIPMAP_PERF_HACK").as_deref() == Ok("1");
+    *ENABLED
+}
 
 /// This crate's own `libGL` function `name`, where it has one.
 pub fn address(name: &str) -> Option<u64> {
@@ -17,7 +25,9 @@ pub fn address(name: &str) -> Option<u64> {
         "glShaderSource" => crate::glsl::shader_source as *const (),
         // SDL's GL on a macOS host is Apple's; see [`crate::mipmap`].
         #[cfg(target_os = "macos")]
-        "glGenerateMipmap" if apple_gl().is_some() => generate_mipmap as *const (),
+        "glGenerateMipmap" if apple_gl().is_some() && enable_mipmap_perf_hack() => {
+            generate_mipmap as *const ()
+        }
         _ => return crate::profile::address(name),
     };
     Some(f as usize as u64)
