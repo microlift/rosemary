@@ -103,11 +103,10 @@ struct MappedImage {
     segments: Vec<(u64, u64)>,
 }
 
-/// The images the native backend mapped.
+/// The images the program's launch mapped, the executable first, under either
+/// backend.
 ///
-/// The emulated backend's are reachable through [`crate::thunk::current`], which
-/// is a `Vm` and so is absent under `native`. Nothing else answers for them:
-/// dyld never saw these mappings, so its `_dyld_find_unwind_sections` reports no
+/// Nothing else answers for them under `native`: dyld never saw these mappings, so its `_dyld_find_unwind_sections` reports no
 /// unwind info for a guest frame and a throw terminates instead of unwinding.
 /// Written once, before the program runs, and read once per frame of every
 /// unwind - so a lock rather than a `OnceLock` would put the unwinder's frame
@@ -635,13 +634,29 @@ fn indexed_image(index: u32) -> Option<(u64, u64, String)> {
         let header = MAIN_HEADER.load(Ordering::Acquire);
         return (header != 0).then_some((header, slide, path));
     }
+    // The executable's own link comes next, as dyld lists everything it mapped
+    // at launch before anything `dlopen` adds. Its first image is the executable.
+    let linked = launch_dependencies();
+    let index = index as usize - 1;
+    if let Some(image) = linked.get(index) {
+        return Some((image.header, image.slide, image.path.clone()));
+    }
     snapshot()
-        .get(index as usize - 1)
+        .get(index - linked.len())
         .map(|image| (image.handle, image.slide, image.path.clone()))
+}
+
+/// The images the executable was linked against at launch, the executable left
+/// out.
+fn launch_dependencies() -> &'static [MappedImage] {
+    MAPPED
+        .get()
+        .map_or(&[], |images| images.get(1..).unwrap_or_default())
 }
 
 fn image_count() -> u32 {
     u32::from(MAIN_HEADER.load(Ordering::Acquire) != 0)
+        .saturating_add(launch_dependencies().len() as u32)
         .saturating_add(IMAGE_COUNT.load(Ordering::Acquire) as u32)
 }
 
