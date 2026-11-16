@@ -7,7 +7,24 @@ pub fn interposed() -> bool {
 
 /// Names the framework answers or refuses, and no host library may.
 pub fn owns(name: &str) -> bool {
-    interposed() && opengl::owns(name)
+    (interposed() && opengl::owns(name)) || host_override(name).is_some()
+}
+
+/// A function of the host's own OpenGL.framework that this runtime answers
+/// instead, when the guest draws through that framework. See
+/// [`opengl::mipmap`].
+pub fn host_override(name: &str) -> Option<u64> {
+    #[cfg(target_os = "macos")]
+    if !interposed() {
+        return opengl::mipmap::host::symbol(name);
+    }
+    let _ = name;
+    None
+}
+
+/// Whether the provider has anything to answer under this backend.
+fn answers() -> bool {
+    interposed() || cfg!(target_os = "macos")
 }
 
 /// The framework as a provider, for the link chains in [`crate::program`] and
@@ -18,7 +35,7 @@ pub fn owns(name: &str) -> bool {
 /// placement would otherwise open a display connection and a GL driver in every
 /// process, including the ones that never draw.
 pub fn provider() -> LazyDylib {
-    let mut lib = LazyDylib::new(opengl::INSTALL_PATHS[0], interposed, resolve);
+    let mut lib = LazyDylib::new(opengl::INSTALL_PATHS[0], answers, resolve);
     for name in &opengl::INSTALL_PATHS[1..] {
         lib.alias(name);
     }
@@ -47,7 +64,10 @@ pub fn deny_host_gl(provider: &mut NativeDylibProvider) {
 /// The address a `dlsym` of the C name `name` should answer, for
 /// [`crate::frameworks`].
 pub fn symbol(name: &str) -> Option<u64> {
-    interposed().then(|| opengl::symbol(name)).flatten()
+    match interposed() {
+        true => opengl::symbol(name),
+        false => host_override(name),
+    }
 }
 
 fn resolve(name: &str) -> Option<Resolved> {

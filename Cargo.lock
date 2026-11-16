@@ -2269,6 +2269,7 @@ version = "0.5.0"
 dependencies = [
  "appkit",
  "exports",
+ "libc",
  "sdl3",
 ]
 

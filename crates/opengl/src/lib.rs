@@ -14,6 +14,7 @@ pub mod cgl;
 mod driver;
 mod entry;
 mod glsl;
+pub mod mipmap;
 mod names;
 mod profile;
 

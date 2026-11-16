@@ -1776,6 +1776,11 @@ fn global_lookup(name: &str, mangled: &str) -> Option<u64> {
     if let Some(addr) = crate::frameworks::symbol(name) {
         return Some(remember_native_symbol(addr, name, None));
     }
+    // Ahead of the native Objective-C runtime's answer, which is a search of
+    // every host library.
+    if let Some(addr) = crate::gl::host_override(name) {
+        return Some(remember_native_symbol(addr, name, None));
+    }
     if let Some(addr) = crate::objc::host::symbol(name) {
         return Some(remember_native_symbol(addr, name, None));
     }
