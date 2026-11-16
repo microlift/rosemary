@@ -102,7 +102,9 @@ and AArch64 ABIs differ enough that bridging isn't attempted — most C++ calls 
 
 * `rustfmt` defaults: 4-space indent, `snake_case` for modules/functions/variables, `PascalCase` for types,
   `SCREAMING_SNAKE_CASE` for constants.
-* Put platform-specific behavior in `darwin`, not behind conditionals scattered through the runtime.
+* Put platform-specific behavior in `starnix` if it's something UNIX-esque, not behind conditionals scattered through the runtime.
+  For other platform-specific behavior that doesn't necessarily belong in `starnix`, design clean abstractions about the underlying
+  goal of the behavior that minimizes code duplication where possible.
 * Keep `machish` free of `std`.
 * Comments should be short, ASCII-only, and explain *why* a constraint exists — not narrate what the code does.
 * Semantic accuracy, simplicity, and self-explanatory code is prioritized over everything else. Do not write program-specific
