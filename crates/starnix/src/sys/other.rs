@@ -55,6 +55,10 @@ pub fn threads(pid: i32) -> Option<Vec<Thread>> {
     exists(pid).then(Vec::new)
 }
 
+pub fn thread(_pid: i32, _tid: i32) -> Option<Thread> {
+    None
+}
+
 pub fn has_thread(_tid: i32) -> bool {
     false
 }
@@ -65,6 +69,10 @@ pub fn command_line(_pid: i32) -> Option<Vec<u8>> {
 
 pub fn descriptors() -> io::Result<Vec<Descriptor>> {
     Err(unsupported())
+}
+
+pub fn region_count(pid: i32) -> Option<u32> {
+    regions(pid).ok().map(|regions| regions.len() as u32)
 }
 
 pub fn regions(_pid: i32) -> io::Result<Vec<Region>> {

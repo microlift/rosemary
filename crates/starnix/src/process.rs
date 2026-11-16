@@ -212,6 +212,11 @@ pub fn threads(pid: i32) -> Option<Vec<Thread>> {
     Some(threads)
 }
 
+/// One of `pid`'s threads, without reading the others.
+pub fn thread(pid: i32, tid: i32) -> Option<Thread> {
+    sys::thread(pid, tid)
+}
+
 /// Whether `tid` is one of this process's threads.
 pub fn has_thread(tid: i32) -> bool {
     sys::has_thread(tid)
@@ -233,6 +238,12 @@ pub fn descriptors() -> io::Result<Vec<Descriptor>> {
 /// This process's mappings, in address order.
 pub fn regions() -> io::Result<Vec<Region>> {
     regions_of(me())
+}
+
+/// How many mappings `pid` has, which costs far less than [`regions_of`] where the
+/// host can count without listing.
+pub fn region_count(pid: i32) -> Option<u32> {
+    sys::region_count(pid)
 }
 
 /// `pid`'s mappings, in address order. Reading another process's map is a
@@ -388,6 +399,33 @@ mod tests {
         // threads that way, outlives any test.
         assert!(threads.iter().any(|thread| has_thread(thread.tid)));
         assert!(!has_thread(i32::MAX));
+    }
+
+    #[test]
+    fn one_thread_reads_back_as_the_listing_has_it() {
+        let blocker = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let held = blocker.clone();
+        let other = std::thread::Builder::new()
+            .name("starnix-single".into())
+            .spawn(move || {
+                held.wait();
+                held.wait();
+            })
+            .unwrap();
+        blocker.wait();
+        let listed = threads(me())
+            .unwrap()
+            .into_iter()
+            .find(|thread| thread.name == "starnix-single");
+        let alone = listed.as_ref().and_then(|listed| thread(me(), listed.tid));
+        blocker.wait();
+        other.join().unwrap();
+        if cfg!(any(target_os = "linux", target_os = "macos", target_os = "freebsd")) {
+            let (listed, alone) = (listed.unwrap(), alone.unwrap());
+            assert_eq!(alone.tid, listed.tid);
+            assert_eq!(alone.name, listed.name);
+        }
+        assert!(thread(me(), i32::MAX).is_none());
     }
 
     #[test]

@@ -56,7 +56,19 @@ struct Timebase {
 unsafe extern "C" {
     fn mach_timebase_info(info: *mut Timebase) -> c_int;
     fn mach_host_self() -> libc::mach_port_t;
+    fn task_info(
+        task: libc::mach_port_t,
+        flavor: c_int,
+        info: *mut i32,
+        count: *mut libc::mach_msg_type_number_t,
+    ) -> c_int;
+    static mach_task_self_: libc::mach_port_t;
 }
+
+/// `<mach/task_info.h>`'s `TASK_VM_INFO`, whose `struct task_vm_info` starts with a
+/// 64-bit `virtual_size` and then the `region_count`.
+const TASK_VM_INFO: c_int = 22;
+const TASK_VM_INFO_REGION_COUNT_WORD: usize = 2;
 
 /// `NODEV`: no controlling terminal.
 const NODEV: u32 = u32::MAX;
@@ -275,6 +287,24 @@ fn regions_of(pid: i32) -> Vec<Region> {
     regions
 }
 
+/// How many mappings `pid` has. This process asks its own task, in one call, rather
+/// than walking every mapping with a call each: an emulated program's JIT keeps
+/// thousands, and engines poll the count with their memory figures every frame.
+pub fn region_count(pid: i32) -> Option<u32> {
+    if pid == crate::process::me() {
+        let mut info = [0i32; 128];
+        let mut count = info.len() as libc::mach_msg_type_number_t;
+        // SAFETY: `info` holds `count` words, which is all the kernel writes, and
+        // `mach_task_self_` is this task's own send right.
+        let rc = unsafe { task_info(mach_task_self_, TASK_VM_INFO, info.as_mut_ptr(), &mut count) };
+        if rc == 0 && count as usize > TASK_VM_INFO_REGION_COUNT_WORD {
+            return Some(info[TASK_VM_INFO_REGION_COUNT_WORD] as u32);
+        }
+    }
+    bsdinfo(pid)?;
+    Some(regions_of(pid).len() as u32)
+}
+
 pub fn footprint(pid: i32) -> Option<Footprint> {
     let task: libc::proc_taskinfo = pidinfo(pid, libc::PROC_PIDTASKINFO, 0)?;
     Some(Footprint {
@@ -317,7 +347,7 @@ pub fn usage(pid: i32) -> Option<Usage> {
         involuntary_switches: 0,
         threads: task.pti_threadnum.max(0) as u32,
         running_threads: task.pti_numrunning.max(0) as u32,
-        regions: regions_of(pid).len() as u32,
+        regions: region_count(pid).unwrap_or(0),
         read_bytes: rusage.ri_diskio_bytesread,
         write_bytes: rusage.ri_diskio_byteswritten,
         start_ns: abstime_ns(rusage.ri_proc_start_abstime),
@@ -332,35 +362,49 @@ pub fn threads(pid: i32) -> Option<Vec<Thread>> {
         PROC_PIDLISTTHREADIDS,
         task.pti_threadnum.max(0) as usize,
     )?;
+    // A thread that exited between the listing and this read is gone, not an error.
     Some(
         ids.into_iter()
-            .filter_map(|id| {
-                // A thread that exited between the listing and this read is
-                // gone, not an error.
-                let info: libc::proc_threadinfo = pidinfo(pid, PROC_PIDTHREADID64INFO, id)?;
-                let name = unsafe { CStr::from_ptr(info.pth_name.as_ptr()) };
-                Some(Thread {
-                    tid: id as i32,
-                    name: name.to_string_lossy().into_owned(),
-                    user_ns: info.pth_user_time,
-                    system_ns: info.pth_system_time,
-                    // `TH_STATE_*`: running, stopped, waiting,
-                    // uninterruptible, halted.
-                    state: match info.pth_run_state {
-                        1 => State::Running,
-                        2 | 5 => State::Stopped,
-                        4 => State::Waiting,
-                        _ => State::Sleeping,
-                    },
-                    nice,
-                })
-            })
+            .filter_map(|id| thread_by_id(pid, id, nice))
             .collect(),
     )
 }
 
+fn thread_by_id(pid: i32, id: u64, nice: i32) -> Option<Thread> {
+    let info: libc::proc_threadinfo = pidinfo(pid, PROC_PIDTHREADID64INFO, id)?;
+    let name = unsafe { CStr::from_ptr(info.pth_name.as_ptr()) };
+    Some(Thread {
+        tid: id as i32,
+        name: name.to_string_lossy().into_owned(),
+        user_ns: info.pth_user_time,
+        system_ns: info.pth_system_time,
+        // `TH_STATE_*`: running, stopped, waiting, uninterruptible, halted.
+        state: match info.pth_run_state {
+            1 => State::Running,
+            2 | 5 => State::Stopped,
+            4 => State::Waiting,
+            _ => State::Sleeping,
+        },
+        nice,
+    })
+}
+
+/// One of `pid`'s threads, read on its own: a `thread_info` poll would otherwise
+/// cost two reads for every thread in the process.
+///
+/// A [`Thread::tid`] is the low half of the kernel's 64-bit thread id, which is the
+/// whole id until the system has made four billion threads; past that, the id is
+/// found by listing them all.
+pub fn thread(pid: i32, tid: i32) -> Option<Thread> {
+    let nice = bsdinfo(pid).map_or(0, |info| info.pbi_nice);
+    thread_by_id(pid, u64::from(tid as u32), nice)
+        .or_else(|| threads(pid)?.into_iter().find(|thread| thread.tid == tid))
+}
+
 pub fn has_thread(tid: i32) -> bool {
-    threads(crate::process::me()).is_some_and(|threads| threads.iter().any(|t| t.tid == tid))
+    let me = crate::process::me();
+    pidinfo::<libc::proc_threadinfo>(me, PROC_PIDTHREADID64INFO, u64::from(tid as u32)).is_some()
+        || threads(me).is_some_and(|threads| threads.iter().any(|t| t.tid == tid))
 }
 
 /// `KERN_PROCARGS2`: `argc`, the executable path, padding, then the arguments,

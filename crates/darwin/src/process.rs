@@ -199,6 +199,17 @@ pub fn threads(pid: i32) -> Option<Vec<Thread>> {
     }
 }
 
+/// One of `pid`'s threads.
+pub fn thread(pid: i32, tid: i32) -> Option<Thread> {
+    let _host = crate::syscall::ScopedHostSyscallContext::new();
+    match host_pid(pid) == host_self() {
+        true => starnix::process::thread(host_self(), tid),
+        false => server::client::threads(pid)?
+            .into_iter()
+            .find(|thread| thread.tid == tid),
+    }
+}
+
 /// Whether `pid` is a guest process this one may hold a task port for.
 pub fn visible(pid: i32) -> bool {
     let _host = crate::syscall::ScopedHostSyscallContext::new();

@@ -219,6 +219,10 @@ pub fn threads(pid: i32) -> Option<Vec<Thread>> {
     )
 }
 
+pub fn thread(pid: i32, tid: i32) -> Option<Thread> {
+    threads(pid)?.into_iter().find(|thread| thread.tid == tid)
+}
+
 pub fn has_thread(tid: i32) -> bool {
     threads(crate::process::me()).is_some_and(|threads| threads.iter().any(|t| t.tid == tid))
 }
@@ -241,6 +245,10 @@ fn vmentries(bytes: &[u8]) -> impl Iterator<Item = libc::kinfo_vmentry> + '_ {
         offset += record.len();
         Some(self::record::<libc::kinfo_vmentry>(record))
     })
+}
+
+pub fn region_count(pid: i32) -> Option<u32> {
+    regions(pid).ok().map(|regions| regions.len() as u32)
 }
 
 pub fn regions(pid: i32) -> io::Result<Vec<Region>> {

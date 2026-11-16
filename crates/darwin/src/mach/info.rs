@@ -222,7 +222,7 @@ fn own_sizes(regions: bool) -> Option<Usage> {
 fn region_count() -> u32 {
     let _host = crate::syscall::ScopedHostSyscallContext::new();
 
-    starnix::process::regions().map_or(0, |regions| regions.len() as u32)
+    starnix::process::region_count(starnix::process::me()).unwrap_or(0)
 }
 
 /// Resident memory the task does not share with another, which is the

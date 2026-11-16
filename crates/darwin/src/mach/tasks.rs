@@ -14,7 +14,7 @@ use server::task::TaskOp;
 use super::info::{TimeValue, publish};
 use super::kern::*;
 use super::space::{self, HOST_SELF, Name, PSET_CONTROL, PSET_NAME, Target};
-use server::protocol::{State, Thread};
+use server::protocol::State;
 
 /// Copy `names` into fresh pages, as the kernel hands an out-of-line array
 /// back: the caller releases it with `vm_deallocate`, which unmaps it.
@@ -327,9 +327,7 @@ pub unsafe extern "C" fn thread_info(
     let Some((pid, tid)) = space::thread_of(thread) else {
         return KERN_INVALID_ARGUMENT;
     };
-    let found: Option<Thread> = crate::process::threads(pid)
-        .and_then(|threads| threads.into_iter().find(|candidate| candidate.tid == tid));
-    let Some(found) = found else {
+    let Some(found) = crate::process::thread(pid, tid) else {
         // The thread has ended, which is the ordinary race for anything
         // walking another task's threads.
         return KERN_INVALID_ARGUMENT;

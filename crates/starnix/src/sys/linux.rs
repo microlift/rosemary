@@ -197,7 +197,7 @@ pub fn usage(pid: i32) -> Option<Usage> {
     })
 }
 
-fn thread(pid: i32, tid: i32) -> Option<Thread> {
+pub fn thread(pid: i32, tid: i32) -> Option<Thread> {
     let base = format!("/proc/{pid}/task/{tid}");
     let stat = Stat::read(&format!("{base}/stat"))?;
     let name = std::fs::read_to_string(format!("{base}/comm"))
@@ -343,6 +343,10 @@ fn mapped_files(base: &str) -> Vec<FileId> {
     files.sort_unstable();
     files.dedup();
     files
+}
+
+pub fn region_count(pid: i32) -> Option<u32> {
+    regions(pid).ok().map(|regions| regions.len() as u32)
 }
 
 pub fn regions(pid: i32) -> io::Result<Vec<Region>> {

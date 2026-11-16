@@ -809,6 +809,23 @@ pub unsafe extern "C" fn set_qos_class_self_np(class: u32, relative: i32) -> i32
     }
     #[cfg(not(target_os = "linux"))]
     let _ = nice;
+    // A Darwin host takes the class itself, which decides between performance and
+    // efficiency cores as it would for the program running natively.
+    #[cfg(target_os = "macos")]
+    {
+        use libc::qos_class_t as Host;
+        let host = match class {
+            QOS_CLASS_USER_INTERACTIVE => Host::QOS_CLASS_USER_INTERACTIVE,
+            QOS_CLASS_USER_INITIATED => Host::QOS_CLASS_USER_INITIATED,
+            QOS_CLASS_DEFAULT => Host::QOS_CLASS_DEFAULT,
+            QOS_CLASS_UTILITY => Host::QOS_CLASS_UTILITY,
+            QOS_CLASS_BACKGROUND => Host::QOS_CLASS_BACKGROUND,
+            _ => Host::QOS_CLASS_UNSPECIFIED,
+        };
+        // SAFETY: a class and relative priority validated above, applied to the
+        // calling thread only. A refusal is a scheduling hint not taken.
+        unsafe { libc::pthread_set_qos_class_self_np(host, relative) };
+    }
     let packed = u64::from(class) | ((relative as u32 as u64) << 32);
     CURRENT_QOS.with(|qos| qos.set(packed));
     thread_ids::set_qos(thread_bits(unsafe { libc::pthread_self() }), packed);
@@ -1641,6 +1658,26 @@ mod tests {
             );
             assert_eq!((class, relative), (QOS_CLASS_UTILITY, -4));
         }
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn a_requested_qos_class_reaches_a_darwin_host_thread() {
+        std::thread::spawn(|| {
+            // SAFETY: a valid class and relative priority, for this thread.
+            assert_eq!(unsafe { set_qos_class_self_np(QOS_CLASS_UTILITY, -2) }, 0);
+            let mut class = libc::qos_class_t::QOS_CLASS_UNSPECIFIED;
+            let mut relative = 0;
+            // SAFETY: this thread's own handle and two writable outputs.
+            let rc = unsafe {
+                libc::pthread_get_qos_class_np(libc::pthread_self(), &mut class, &mut relative)
+            };
+            assert_eq!(rc, 0);
+            assert_eq!(class as u32, QOS_CLASS_UTILITY);
+            assert_eq!(relative, -2);
+        })
+        .join()
+        .unwrap();
     }
 
     /// `PTHREAD_MUTEX_INITIALIZER` is written by the guest's compiler, so no call of
