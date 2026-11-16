@@ -241,6 +241,7 @@ struct BindPoint {
 pub(crate) struct CommandQueue {
     pub gpu: &'static Gpu,
     pub device: Id,
+    pending: Mutex<std::collections::VecDeque<PendingCommand>>,
 }
 
 pub(crate) struct CommandBuffer {
@@ -732,7 +733,7 @@ pub(crate) fn install() {
         "dealloc" => command_buffer_dealloc, c"v16@0:8";
         "waitUntilCompleted" => wait_until_completed, c"v16@0:8";
         "waitUntilScheduled" => wait_until_scheduled, c"v16@0:8";
-        "enqueue" => crate::no_op, c"v16@0:8";
+        "enqueue" => enqueue, c"v16@0:8";
         "presentDrawable:" => present_drawable, c"v24@0:8@16";
         "presentDrawable:atTime:" => present_drawable_at_time, c"v32@0:8@16d24";
         "setLabel:" => crate::no_op, c"v24@0:8@16";

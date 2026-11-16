@@ -30,7 +30,7 @@ pub(crate) use guard::{Guard, GuardedVec};
 pub use host::HostPages;
 pub use memory::Fill;
 pub use placement::Placement;
-pub use submit::{Batch, Commit};
+pub use submit::{Batch, Commit, EventSignal};
 use trace::dump_spirv;
 pub use trace::{milestone, trace, trace_once};
 

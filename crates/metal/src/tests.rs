@@ -23,8 +23,11 @@ macro_rules! isolate_metal_fixture {
 
 mod control_flow;
 mod geometry;
+mod nonshared_events;
 mod pipeline_buffers;
+mod queue_order;
 mod source_constants;
+mod texture_threads;
 mod viewports;
 
 fn device_for_tests() -> Id {

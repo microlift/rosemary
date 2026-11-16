@@ -1,5 +1,6 @@
 use super::*;
 use crate::constants::*;
+use std::sync::Mutex;
 
 pub(crate) struct Texture {
     pub gpu: &'static Gpu,
@@ -11,7 +12,7 @@ pub(crate) struct Texture {
     /// One view per mip level and array slice a render pass has attached,
     /// made on first use. A texture usually has one and a blur pyramid has one
     /// per level, so this is a short list rather than a map.
-    attachment_views: Vec<((u32, u32), vk::ImageView)>,
+    attachment_views: Mutex<Vec<((u32, u32), vk::ImageView)>>,
     /// A texture buffer's view of its buffer's memory, and that buffer,
     /// retained; null for a texture with an image.
     pub texel_view: vk::BufferView,
@@ -20,17 +21,18 @@ pub(crate) struct Texture {
 
 impl Texture {
     /// The framebuffer attachment for one mip level and array slice.
-    pub fn attachment_view(&mut self, level: u32, slice: u32) -> vk::ImageView {
-        if let Some((_, view)) = self
+    pub fn attachment_view(&self, level: u32, slice: u32) -> vk::ImageView {
+        // Independent command buffers may attach the same texture concurrently.
+        let mut views = self
             .attachment_views
-            .iter()
-            .find(|(at, _)| *at == (level, slice))
-        {
+            .lock()
+            .expect("texture attachment views");
+        if let Some((_, view)) = views.iter().find(|(at, _)| *at == (level, slice)) {
             return *view;
         }
         match self.gpu.create_attachment_view(&self.image, level, slice) {
             Ok(view) => {
-                self.attachment_views.push(((level, slice), view));
+                views.push(((level, slice), view));
                 view
             }
             Err(reason) => {
@@ -134,7 +136,11 @@ pub(super) unsafe extern "C" fn texture_dealloc(receiver: Id, _sel: Sel) {
     let texture = unsafe { object::body::<Texture>(receiver) };
     crate::account(-texture.accounted());
     heap::leave(receiver);
-    for (_, view) in std::mem::take(&mut texture.attachment_views) {
+    let views = texture
+        .attachment_views
+        .get_mut()
+        .expect("texture attachment views");
+    for (_, view) in std::mem::take(views) {
         // SAFETY: the last reference is gone, so nothing can attach it again,
         // and a command buffer which did holds a reference until it completes.
         if !leaking() {
@@ -152,6 +158,8 @@ pub(super) unsafe extern "C" fn texture_dealloc(receiver: Id, _sel: Sel) {
             };
         }
         objc::arc::release(std::mem::replace(&mut texture.buffer, std::ptr::null_mut()));
+        // SAFETY: the last reference owns all remaining Rust fields.
+        unsafe { std::ptr::drop_in_place(texture as *mut Texture) };
         objc::arc::finalize(receiver);
         return;
     }
@@ -164,6 +172,8 @@ pub(super) unsafe extern "C" fn texture_dealloc(receiver: Id, _sel: Sel) {
         }
     }
     objc::arc::release(std::mem::replace(&mut texture.parent, std::ptr::null_mut()));
+    // SAFETY: the last reference owns all remaining Rust fields.
+    unsafe { std::ptr::drop_in_place(texture as *mut Texture) };
     objc::arc::finalize(receiver);
 }
 
@@ -198,14 +208,14 @@ pub(crate) fn new_texture_in(
             descriptor,
             image,
             parent: std::ptr::null_mut(),
-            attachment_views: Vec::new(),
+            attachment_views: Mutex::default(),
             texel_view: vk::BufferView::null(),
             buffer: std::ptr::null_mut(),
         },
     );
     if !texture.is_null() {
         // SAFETY: the texture this call just made.
-        crate::account(unsafe { object::body::<Texture>(texture) }.accounted());
+        crate::account(unsafe { object::body_ref::<Texture>(texture) }.accounted());
     }
     texture
 }
@@ -260,7 +270,7 @@ pub(crate) fn drawable_texture(gpu: &'static Gpu, image: GpuImage, pixel_format:
             descriptor,
             image,
             parent: std::ptr::null_mut(),
-            attachment_views: Vec::new(),
+            attachment_views: Mutex::default(),
             texel_view: vk::BufferView::null(),
             buffer: std::ptr::null_mut(),
         },
@@ -316,7 +326,7 @@ pub(super) unsafe extern "C" fn set_descriptor_value(receiver: Id, sel: Sel, val
 pub(super) unsafe extern "C" fn texture_value(receiver: Id, sel: Sel) -> u64 {
     // SAFETY: a texture of this crate's.
     descriptor_field(
-        &unsafe { object::body::<Texture>(receiver) }.descriptor,
+        &unsafe { object::body_ref::<Texture>(receiver) }.descriptor,
         sel,
     )
 }
@@ -439,7 +449,7 @@ pub(super) unsafe extern "C" fn replace_region(
         return;
     }
     // SAFETY: a texture of this crate's.
-    let texture = unsafe { object::body::<Texture>(receiver) };
+    let texture = unsafe { object::body_ref::<Texture>(receiver) };
     if texture.is_texture_buffer() {
         // Its bytes are its buffer's, which a guest writes through
         // `-contents`; an image copy here would name a null `VkImage`.
@@ -603,7 +613,7 @@ pub(super) unsafe extern "C" fn get_bytes_slice(
         return;
     }
     // SAFETY: a texture of this crate's.
-    let texture = unsafe { object::body::<Texture>(receiver) };
+    let texture = unsafe { object::body_ref::<Texture>(receiver) };
     if texture.is_texture_buffer() {
         // As for `-replaceRegion:`: there is no image to copy from.
         return gpu::trace("getBytes: of a texture buffer is not supported".to_string());
@@ -784,7 +794,7 @@ pub(super) struct ViewRange {
 /// `-newTextureViewWithPixelFormat:`: every level and slice, another format.
 pub(super) unsafe extern "C" fn new_texture_view(receiver: Id, sel: Sel, pixel_format: u64) -> Id {
     // SAFETY: a texture of this crate's.
-    let texture = unsafe { object::body::<Texture>(receiver) };
+    let texture = unsafe { object::body_ref::<Texture>(receiver) };
     let (levels, slices) = (texture.image.levels, texture.image.layers);
     let texture_type = texture.descriptor.texture_type;
     unsafe {
@@ -910,7 +920,7 @@ fn texture_view(
     swizzle: SwizzleChannels,
 ) -> Id {
     // SAFETY: a texture of this crate's.
-    let texture = unsafe { object::body::<Texture>(receiver) };
+    let texture = unsafe { object::body_ref::<Texture>(receiver) };
     if texture.is_texture_buffer() {
         gpu::trace("rejecting newTextureViewWithPixelFormat: of a texture buffer");
         return std::ptr::null_mut();
@@ -989,7 +999,7 @@ fn texture_view(
             descriptor,
             image,
             parent: objc::arc::retain(owner),
-            attachment_views: Vec::new(),
+            attachment_views: Mutex::default(),
             texel_view: vk::BufferView::null(),
             buffer: std::ptr::null_mut(),
         },
@@ -998,7 +1008,7 @@ fn texture_view(
 
 pub(super) unsafe extern "C" fn texture_parent(receiver: Id, _sel: Sel) -> Id {
     // SAFETY: a texture of this crate's.
-    unsafe { object::body::<Texture>(receiver) }.parent
+    unsafe { object::body_ref::<Texture>(receiver) }.parent
 }
 
 /// `+[MTLTextureDescriptor textureBufferDescriptorWithPixelFormat:width:resourceOptions:usage:]`.
@@ -1087,7 +1097,7 @@ pub(super) unsafe extern "C" fn buffer_new_texture(
                 ..GpuImage::none()
             },
             parent: std::ptr::null_mut(),
-            attachment_views: Vec::new(),
+            attachment_views: Mutex::default(),
             texel_view,
             buffer: objc::arc::retain(receiver),
         },

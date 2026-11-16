@@ -1086,7 +1086,7 @@ pub(crate) fn enqueue_swapchain(drawable: Id) -> PresentAttempt {
     // SAFETY: a drawable of this crate's, checked above.
     let described = unsafe { object::body::<Drawable>(drawable) };
     // SAFETY: a drawable's texture is this crate's.
-    let texture = unsafe { object::body::<Texture>(described.texture) };
+    let texture = unsafe { object::body_ref::<Texture>(described.texture) };
     // SAFETY: a `CAMetalLayer` this runtime made.
     let view = unsafe { appkit::layer::view_of(described.layer) };
     if appkit::view::is_hidden_or_has_hidden_ancestor(view) {
@@ -1278,7 +1278,7 @@ fn present_inner(drawable: Id) {
     // SAFETY: a drawable of this crate's, checked above.
     let described = unsafe { object::body::<Drawable>(drawable) };
     // SAFETY: a drawable's texture is this crate's.
-    let texture = unsafe { object::body::<Texture>(described.texture) };
+    let texture = unsafe { object::body_ref::<Texture>(described.texture) };
     let gpu = described.gpu;
     // SAFETY: a `CAMetalLayer` this runtime made.
     let view = unsafe { appkit::layer::view_of(described.layer) };

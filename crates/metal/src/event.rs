@@ -6,7 +6,7 @@
 //! can call a block once it reaches a value, which one worker thread watches
 //! for on behalf of every listener.
 
-use std::sync::{Mutex, Once};
+use std::sync::{Arc, Mutex, Once, atomic::AtomicU64};
 
 use ash::vk;
 
@@ -15,6 +15,7 @@ use super::*;
 pub(crate) struct Event {
     gpu: &'static Gpu,
     pub(crate) semaphore: vk::Semaphore,
+    pub(crate) submitted_value: Option<Arc<AtomicU64>>,
     device: Id,
 }
 
@@ -30,14 +31,25 @@ pub(super) fn new_event(gpu: &'static Gpu, device: Id, class: &std::ffi::CStr) -
     let info = vk::SemaphoreCreateInfo::default().push_next(&mut kind);
     // SAFETY: a well-formed create info on a device with timeline semaphores.
     match unsafe { gpu.device.create_semaphore(&info, None) } {
-        Ok(semaphore) => object::make(
-            class,
-            Event {
-                gpu,
-                semaphore,
-                device: objc::arc::retain(device),
-            },
-        ),
+        Ok(semaphore) => {
+            let device = objc::arc::retain(device);
+            let event = object::make(
+                class,
+                Event {
+                    gpu,
+                    semaphore,
+                    submitted_value: (class == c"RosemaryMTLEvent")
+                        .then(|| Arc::new(AtomicU64::new(0))),
+                    device,
+                },
+            );
+            if event.is_null() {
+                // SAFETY: allocation failed before the semaphore could be published.
+                unsafe { gpu.device.destroy_semaphore(semaphore, None) };
+                objc::arc::release(device);
+            }
+            event
+        }
         Err(error) => {
             gpu::trace(format!(
                 "vkCreateSemaphore for an MTLEvent failed with {error:?}"
@@ -49,7 +61,7 @@ pub(super) fn new_event(gpu: &'static Gpu, device: Id, class: &std::ffi::CStr) -
 
 unsafe extern "C" fn event_device(receiver: Id, _sel: Sel) -> Id {
     // SAFETY: an event of this crate's.
-    unsafe { object::body::<Event>(receiver) }.device
+    unsafe { object::body_ref::<Event>(receiver) }.device
 }
 
 unsafe extern "C" fn event_dealloc(receiver: Id, _sel: Sel) {
@@ -59,12 +71,14 @@ unsafe extern "C" fn event_dealloc(receiver: Id, _sel: Sel) {
     let event = unsafe { object::body::<Event>(receiver) };
     unsafe { event.gpu.device.destroy_semaphore(event.semaphore, None) };
     objc::arc::release(event.device);
+    // SAFETY: the Objective-C finalizer does not run Rust field destructors.
+    unsafe { std::ptr::drop_in_place(event) };
     objc::arc::finalize(receiver);
 }
 
 unsafe extern "C" fn signaled_value(receiver: Id, _sel: Sel) -> u64 {
     // SAFETY: an event of this crate's.
-    let event = unsafe { object::body::<Event>(receiver) };
+    let event = unsafe { object::body_ref::<Event>(receiver) };
     // SAFETY: a timeline semaphore of this device's.
     unsafe {
         event
@@ -80,7 +94,7 @@ unsafe extern "C" fn signaled_value(receiver: Id, _sel: Sel) -> u64 {
 
 unsafe extern "C" fn set_signaled_value(receiver: Id, sel: Sel, value: u64) {
     // SAFETY: an event of this crate's.
-    let event = unsafe { object::body::<Event>(receiver) };
+    let event = unsafe { object::body_ref::<Event>(receiver) };
     // SAFETY: as above.
     if value <= unsafe { signaled_value(receiver, sel) } {
         // A timeline only moves forward, so a value at or below the current
@@ -107,7 +121,7 @@ unsafe extern "C" fn wait_until_signaled(
     milliseconds: u64,
 ) -> bool {
     // SAFETY: an event of this crate's.
-    let event = unsafe { object::body::<Event>(receiver) };
+    let event = unsafe { object::body_ref::<Event>(receiver) };
     let semaphores = [event.semaphore];
     let values = [value];
     let info = vk::SemaphoreWaitInfo::default()
@@ -181,7 +195,7 @@ unsafe extern "C" fn notify_listener(receiver: Id, _sel: Sel, listener: Id, valu
         return;
     }
     // SAFETY: an event of this crate's, and the guest passed a block.
-    let event = unsafe { object::body::<Event>(receiver) };
+    let event = unsafe { object::body_ref::<Event>(receiver) };
     let block = unsafe { objc::shorthand::objc_retainBlock(block) };
     if block.is_null() {
         return;

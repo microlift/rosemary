@@ -80,7 +80,7 @@ pub(super) fn tracked_image(texture: Id) -> Option<vk::Image> {
     while !texture.is_null() {
         // SAFETY: only textures of this crate's are bound or attached, and
         // a view retains the texture it sees into.
-        let body = unsafe { object::body::<Texture>(texture) };
+        let body = unsafe { object::body_ref::<Texture>(texture) };
         if body.parent.is_null() {
             let image = &body.image;
             return (image.image != vk::Image::null() && image.placement.is_none())
@@ -201,7 +201,7 @@ impl Encoder {
         };
         let wrote = self.command().hazards.wrote(image);
         // SAFETY: a texture of this crate's, as `tracked_image` found.
-        let usage = unsafe { object::body::<Texture>(texture) }.image.usage;
+        let usage = unsafe { object::body_ref::<Texture>(texture) }.image.usage;
         let lazy = self.lazy.as_mut().expect("a lazy pass");
         lazy.read_hazard |= wrote;
         if usage.intersects(

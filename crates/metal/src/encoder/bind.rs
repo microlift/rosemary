@@ -403,7 +403,7 @@ impl Encoder {
                         (0, 0, 0)
                     } else {
                         // SAFETY: only a texture of this crate's is ever bound.
-                        let texture = unsafe { object::body::<Texture>(bound) };
+                        let texture = unsafe { object::body_ref::<Texture>(bound) };
                         use vk::Handle;
                         let is_texel_buffer = texture.texel_view != vk::BufferView::null();
                         if is_texel_buffer != binding.texel_buffer {

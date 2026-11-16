@@ -153,7 +153,7 @@ pub(super) fn resolve_attachment(
         return None;
     }
     // SAFETY: only a texture of this crate's is attached.
-    let texture = unsafe { object::body::<Texture>(color.resolve_texture) };
+    let texture = unsafe { object::body_ref::<Texture>(color.resolve_texture) };
     if texture.image.format != format {
         gpu::trace_once(format!(
             "render pass resolves {format:?} into {:?}, which Vulkan cannot do",
@@ -313,7 +313,7 @@ fn depth_resolve(
     }
     let named = depth.or(stencil)?;
     // SAFETY: only a texture of this crate's is attached.
-    let destination = unsafe { object::body::<Texture>(named.resolve_texture) };
+    let destination = unsafe { object::body_ref::<Texture>(named.resolve_texture) };
     if destination.image.format != format {
         gpu::trace_once(format!(
             "render pass resolves depth {format:?} into {:?}, which Vulkan cannot do",
@@ -442,7 +442,7 @@ fn gather_attachments(gpu: &Gpu, descriptor: &RenderPassDescriptor) -> Attachmen
             continue;
         }
         // SAFETY: only a texture of this crate's is attached.
-        let texture = unsafe { object::body::<Texture>(color.texture) };
+        let texture = unsafe { object::body_ref::<Texture>(color.texture) };
         let format = texture.image.format;
         let first = key.colors.is_empty();
         samples(&mut key, texture.image.samples, first);
@@ -544,7 +544,7 @@ fn gather_attachments(gpu: &Gpu, descriptor: &RenderPassDescriptor) -> Attachmen
     };
     if let Some(attachment) = depth_attachment {
         // SAFETY: only a texture of this crate's is attached.
-        let texture = unsafe { object::body::<Texture>(attachment.texture) };
+        let texture = unsafe { object::body_ref::<Texture>(attachment.texture) };
         key.depth = Some((
             texture.image.format,
             load_op(attachment.load_action),
@@ -698,7 +698,7 @@ pub(crate) fn begin_render_pass(
     command.framebuffers.extend(target.framebuffer());
     for texture in textures {
         // SAFETY: only textures of this crate's are attached.
-        let image = &unsafe { object::body::<Texture>(texture) }.image;
+        let image = &unsafe { object::body_ref::<Texture>(texture) }.image;
         encoder
             .attachments
             .push((image.image, gpu::aspect_of(image.format)));
@@ -1073,7 +1073,7 @@ pub(super) unsafe extern "C" fn set_attachment_object(receiver: Id, sel: Sel, va
     // Vulkan texture-buffer restriction; do not interpret a native wrapper
     // as that body. The native backend validates render target compatibility.
     let value = match object::is_kind(value, c"RosemaryMTLTexture")
-        && unsafe { object::body::<Texture>(value) }.is_texture_buffer()
+        && unsafe { object::body_ref::<Texture>(value) }.is_texture_buffer()
     {
         true => {
             gpu::trace("rejecting a texture buffer as a render pass attachment");
