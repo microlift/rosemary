@@ -423,9 +423,13 @@ static CONTEXTS: Mutex<Option<HashMap<usize, Resources>>> = Mutex::new(None);
 /// The context that is actually current on this thread.
 fn current_context(fallback: usize) -> usize {
     type GetCurrent = unsafe extern "C" fn() -> *mut c_void;
+    // Looked up once: this runs on every frame the guest presents.
+    static GET: std::sync::OnceLock<Option<GetCurrent>> = std::sync::OnceLock::new();
     // SAFETY: `CGLGetCurrentContext`'s prototype from `<OpenGL/CGLCurrent.h>`;
     // it takes nothing and returns the thread's current context or null.
-    let Some(get) = (unsafe { sys::function::<GetCurrent>("CGLGetCurrentContext") }) else {
+    let Some(get) =
+        *GET.get_or_init(|| unsafe { sys::function::<GetCurrent>("CGLGetCurrentContext") })
+    else {
         return fallback;
     };
     match unsafe { get() } as usize {
