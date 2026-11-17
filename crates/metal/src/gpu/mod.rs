@@ -220,6 +220,8 @@ pub struct Gpu {
     /// Larger host-visible buffers for texture uploads and readbacks.
     /// Each with when it was handed back, so idle ones can be freed.
     staging_buffers: Mutex<Vec<(GpuBuffer, std::time::Instant)>>,
+    /// When the pools above are next checked for idle buffers.
+    staging_trim_due: Mutex<std::time::Instant>,
     /// `VK_KHR_push_descriptor`, where advertised, and the descriptor limit
     /// which decides whether one set in a pipeline can use it.
     push_descriptor_api: Option<ash::khr::push_descriptor::Device>,
@@ -364,6 +366,10 @@ const ZERO_SOURCE: u64 = 1 << 20;
 /// How long a pooled staging buffer may sit unused before it is freed, so a
 /// burst of large transfers does not keep its memory for good.
 const STAGING_IDLE: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// How often the submission path looks for idle staging buffers. Looking on
+/// every commit cost two locks and a clock read per pooled buffer.
+const STAGING_TRIM_INTERVAL: std::time::Duration = std::time::Duration::from_millis(500);
 
 /// Makes the next device behave as one without `VK_KHR_push_descriptor`, so
 /// its descriptor paths are tested on a device which has the extension.
@@ -1008,6 +1014,7 @@ impl Gpu {
             descriptor_pools: Mutex::new(Vec::new()),
             upload_chunks: Mutex::new(Vec::new()),
             staging_buffers: Mutex::new(Vec::new()),
+            staging_trim_due: Mutex::new(std::time::Instant::now()),
             push_descriptor_api,
             max_push_descriptors,
             null_descriptors,

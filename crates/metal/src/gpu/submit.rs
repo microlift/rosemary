@@ -27,6 +27,11 @@ impl Batch {
             signals: Vec::new(),
         }
     }
+
+    /// Whether no event orders it against other work.
+    fn is_plain(&self) -> bool {
+        self.waits.is_empty() && self.signals.is_empty()
+    }
 }
 
 /// A committed command buffer on its way to the queue.
@@ -114,17 +119,9 @@ impl Gpu {
             // One fence for all of them: it signals once the last is done,
             // and they retire in order, so it outlives every wait on it.
             let fence = last.fence;
-            let batches: Vec<Batch> = commits
-                .iter()
-                .flat_map(|commit| commit.batches.iter())
-                .map(|batch| Batch {
-                    waits: batch.waits.clone(),
-                    command_buffer: batch.command_buffer,
-                    signals: batch.signals.clone(),
-                })
-                .collect();
+            let batches = commits.iter().flat_map(|commit| &commit.batches);
             let result = crate::stats::timed(crate::stats::Counter::SubmitMicros, || {
-                self.submit_locked(*queue, &batches, fence)
+                self.submit_locked(*queue, batches, fence)
             });
             for commit in commits {
                 (commit.submitted)(self.submissions.next_serial(), result.clone(), fence);
@@ -160,7 +157,7 @@ impl Gpu {
             let waiting = crate::stats::timer();
             let queue = self.lock_queue();
             crate::stats::finish_timer(crate::stats::Counter::SubmitLockMicros, waiting);
-            self.submit_locked(*queue, batches, fence)
+            self.submit_locked(*queue, batches.iter(), fence)
         };
         // Outside the queue lock: this destroys buffers and images.
         self.retire_deferred();
@@ -168,14 +165,21 @@ impl Gpu {
     }
 
     /// [`Self::submit_batches`], with the queue already held.
-    fn submit_locked(
+    fn submit_locked<'a>(
         &self,
         queue: vk::Queue,
-        batches: &[Batch],
+        batches: impl Iterator<Item = &'a Batch> + Clone,
         fence: vk::Fence,
     ) -> Result<(), String> {
         if self.lost.load(Ordering::Acquire) {
             return Err("Vulkan logical device is lost".into());
+        }
+        // Most commits encode no events; skip the grouping below, since this
+        // runs with the queue held and presentation waits on it.
+        if batches.clone().all(Batch::is_plain) {
+            let buffers: Vec<_> = batches.map(|batch| batch.command_buffer).collect();
+            let submit = vk::SubmitInfo::default().command_buffers(&buffers);
+            return self.queue_submit_locked(queue, &[submit], fence);
         }
         // Batches nothing separates - no event signalled after the first or
         // waited for before the second - share one `VkSubmitInfo`, which the
@@ -251,6 +255,21 @@ impl Gpu {
                 }
             })
             .collect();
+        self.queue_submit_locked(queue, &submits, fence)?;
+        // Queue serialization keeps this publication in actual submission order.
+        for (_, (state, value)) in submitted_values {
+            state.store(value, Ordering::Relaxed);
+        }
+        Ok(())
+    }
+
+    /// Run the deferred transfers, then `submits`, with the queue held.
+    fn queue_submit_locked(
+        &self,
+        queue: vk::Queue,
+        submits: &[vk::SubmitInfo<'_>],
+        fence: vk::Fence,
+    ) -> Result<(), String> {
         crate::stats::timed(crate::stats::Counter::SubmitFlushMicros, || {
             self.flush_deferred(queue)
         });
@@ -259,18 +278,14 @@ impl Gpu {
         unsafe { self.device.reset_fences(&[fence]) }
             .map_err(|error| format!("vkResetFences failed with {error:?}"))?;
         // SAFETY: as above; the command buffers have finished recording and
-        // every borrowed array lives across the call.
-        let submitted = unsafe { self.device.queue_submit(queue, &submits, fence) };
+        // every array `submits` borrows lives across the call.
+        let submitted = unsafe { self.device.queue_submit(queue, submits, fence) };
         crate::stats::finish_timer(crate::stats::Counter::SubmitDriverMicros, driver);
         if let Err(error) = submitted {
             if error == vk::Result::ERROR_DEVICE_LOST {
                 crate::swapchain::record_device_loss(self);
             }
             return Err(format!("vkQueueSubmit failed with {error:?}"));
-        }
-        // Queue serialization keeps this publication in actual submission order.
-        for (_, (state, value)) in submitted_values {
-            state.store(value, Ordering::Relaxed);
         }
         Ok(())
     }
