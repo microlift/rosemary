@@ -956,7 +956,7 @@ fn source_atomic_memory_orders_reach_spirv_unchanged() {
         translate_msl(sequential, &TargetProfile::vulkan_1_3())
             .unwrap_err()
             .to_string()
-            .contains("cannot be represented by Vulkan")
+            .contains("single total order")
     );
 }
 
@@ -2382,6 +2382,8 @@ fn work_item_memory_scope_becomes_spirv_invocation() {
     };
     assert_eq!(scope(&barrier.operands[0]), Scope::Workgroup as u32);
     assert_eq!(scope(&barrier.operands[1]), Scope::Invocation as u32);
+    // Vulkan allows no memory semantics on the Invocation scope.
+    assert_eq!(scope(&barrier.operands[2]), 0);
 }
 
 #[test]
