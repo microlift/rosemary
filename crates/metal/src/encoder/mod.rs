@@ -39,7 +39,7 @@ pub(crate) use queue::new_command_queue;
 pub(crate) use retire::Submission;
 
 use ash::vk;
-use metal_translate::ir::{ResourceKind, Stage};
+use metal_translate::ir::ResourceKind;
 use objc::object::Id;
 use objc::sel::Sel;
 use std::sync::atomic::Ordering;
@@ -51,7 +51,7 @@ use crate::gpu::{
 use crate::object::{self, methods};
 use crate::pipeline::{
     BUFFER_SET, ComputePipeline, DepthStencilKey, Layouts, RenderDynamicState, RenderPipeline,
-    RenderVariantKey, SETS, binding_type,
+    RenderVariantKey, SETS, STAGES, SlotSet, Table, binding_type, stage_slot,
 };
 use crate::resource::{Buffer, DepthStencilState, SamplerState, Texture};
 use crate::stats::{self, Counter};
@@ -60,9 +60,11 @@ use crate::stats::{self, Counter};
 pub(crate) static TEST_RECORDED_BARRIERS: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
-/// Metal's per-stage binding tables. Index by `Stage::ordinal`.
-const STAGES: usize = 3;
+/// The slots of each of a stage's binding tables. Index the tables by
+/// `stage_slot`.
 const SLOTS: usize = 32;
+// `Encoder::dirty` has a bit for every slot.
+const _: () = assert!(SLOTS <= SlotSet::CAPACITY);
 
 /// A bound buffer, resolved to its Vulkan handle when it is bound so a draw
 /// does not reach through the object for it.
@@ -355,6 +357,10 @@ pub(crate) struct Encoder {
     /// The pipeline variant the last draw or dispatch used, with the state
     /// which chose it, so a run of draws with one state asks no cache.
     render_variant: Option<(Id, RenderVariantKey, vk::Pipeline, RenderDynamicState)>,
+    /// Whether the pipeline, depth/stencil or raster state was set since
+    /// `render_variant` was chosen. The pass's resolves, which the variant
+    /// also depends on, are fixed before the first draw.
+    variant_stale: bool,
     /// The per-draw state this encoder last recorded, where the device sets
     /// it per draw; `None` until the first draw, as nothing is inherited.
     render_dynamic: Option<RenderDynamicState>,
@@ -373,6 +379,13 @@ pub(crate) struct Encoder {
     set_cache: [SetCache; SETS],
     /// Scratch for the entries a draw needs, kept to avoid an allocation.
     wanted: [Vec<DescriptorEntry>; SETS],
+    /// The layouts of the pipeline whose resources the bind point holds in
+    /// full, or null. The command buffer retains every pipeline bound, so
+    /// the address names one pipeline for as long as the encoder lives.
+    resolved: *const Layouts,
+    /// The binding slots set since `resolved` was bound: a set which reads
+    /// none of them still holds what its next draw needs.
+    dirty: SlotSet,
     /// The buffer set's dynamic offsets for the draw, in binding order.
     dynamic_offsets: Vec<u32>,
     vertex_buffers: [(vk::Buffer, u64); SLOTS],

@@ -9,14 +9,24 @@ pub(super) unsafe extern "C" fn set_compute_pipeline(receiver: Id, _sel: Sel, pi
 
 pub(super) unsafe extern "C" fn set_render_pipeline(receiver: Id, _sel: Sel, pipeline: Id) {
     let encoder = unsafe { object::body::<Encoder>(receiver) };
+    // Retained when it was set before.
+    if encoder.render_pipeline == pipeline {
+        return;
+    }
     encoder.command().retain(pipeline);
     encoder.render_pipeline = pipeline;
+    encoder.variant_stale = true;
 }
 
 pub(super) unsafe extern "C" fn set_depth_stencil_state(receiver: Id, _sel: Sel, state: Id) {
     let encoder = unsafe { object::body::<Encoder>(receiver) };
+    // Retained when it was set before.
+    if encoder.depth_state == state {
+        return;
+    }
     encoder.command().retain(state);
     encoder.depth_state = state;
+    encoder.variant_stale = true;
 }
 
 pub(super) const COMPUTE: usize = 0;
@@ -34,6 +44,7 @@ pub(super) unsafe extern "C" fn set_buffer<const STAGE: usize>(
 ) {
     // SAFETY: an encoder of this crate's.
     let encoder = unsafe { object::body::<Encoder>(receiver) };
+    encoder.dirty.insert(Table::Buffers, STAGE, index as usize);
     let Some(slot) = encoder.buffers[STAGE].get_mut(index as usize) else {
         // Metal retains what an encoder binds, and a guest is entitled to
         // release its own reference the moment the call returns. The command
@@ -97,6 +108,7 @@ pub(super) unsafe extern "C" fn set_bytes<const STAGE: usize>(
     let Some((buffer, offset)) = encoder.command().upload(source) else {
         return;
     };
+    encoder.dirty.insert(Table::Buffers, STAGE, index as usize);
     if let Some(slot) = encoder.buffers[STAGE].get_mut(index as usize) {
         *slot = BufferBinding {
             buffer,
@@ -117,6 +129,7 @@ pub(super) unsafe extern "C" fn set_buffer_offset<const STAGE: usize>(
 ) {
     // SAFETY: an encoder of this crate's.
     let encoder = unsafe { object::body::<Encoder>(receiver) };
+    encoder.dirty.insert(Table::Buffers, STAGE, index as usize);
     if let Some(slot) = encoder.buffers[STAGE].get_mut(index as usize) {
         slot.offset = offset;
         // Metal allows this only on a buffer set with `-setBuffer:`. On a
@@ -140,6 +153,7 @@ pub(super) unsafe extern "C" fn set_texture<const STAGE: usize>(
             return;
         }
         *slot = texture;
+        encoder.dirty.insert(Table::Textures, STAGE, index as usize);
     }
     encoder.command().retain(texture);
     encoder.note_read(texture);
@@ -169,6 +183,7 @@ pub(super) unsafe extern "C" fn set_sampler<const STAGE: usize>(
             return;
         }
         *slot = sampler;
+        encoder.dirty.insert(Table::Samplers, STAGE, index as usize);
     }
     encoder.command().retain(sampler);
 }
@@ -195,7 +210,11 @@ macro_rules! raster_setter {
     ($name:ident, $field:ident) => {
         pub(super) unsafe extern "C" fn $name(receiver: Id, _sel: Sel, value: u64) {
             // SAFETY: an encoder of this crate's.
-            unsafe { object::body::<Encoder>(receiver) }.$field = value;
+            let encoder = unsafe { object::body::<Encoder>(receiver) };
+            if encoder.$field != value {
+                encoder.$field = value;
+                encoder.variant_stale = true;
+            }
         }
     };
 }

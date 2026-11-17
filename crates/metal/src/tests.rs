@@ -5485,6 +5485,119 @@ fn each_dispatch_reads_its_own_set_bytes_without_push_descriptors() {
     }
 }
 
+fn check_dispatches_follow_single_binding_changes(device: Id) {
+    let add = kernel_from_source(
+        device,
+        "kernel void add(device uint* output [[buffer(0)]],\n\
+                         constant uint& amount [[buffer(1)]],\n\
+                         texture2d<uint> source [[texture(0)]]) {\n\
+             output[0] = output[0] + amount + source.read(uint2(0, 0)).x;\n\
+         }",
+        "add",
+    );
+    let scale = kernel_from_source(
+        device,
+        "kernel void scale(device uint* output [[buffer(0)]],\n\
+                           constant uint& amount [[buffer(1)]],\n\
+                           texture2d<uint> source [[texture(0)]]) {\n\
+             output[0] = output[0] + amount * source.read(uint2(0, 0)).x;\n\
+         }",
+        "scale",
+    );
+    const CHOICES: usize = 3;
+    const STEPS: usize = 60;
+    let texels: [u32; CHOICES] = [3, 50, 700];
+    let mut expected = [0u32; CHOICES];
+    // SAFETY: objects this test made, sent the selectors they implement.
+    unsafe {
+        let textures: [Id; CHOICES] = std::array::from_fn(|at| {
+            let texture =
+                readable_texture(device, TEXTURE_TYPE_2D, PIXEL_FORMAT_R32_UINT, [1, 1, 1]);
+            replace_region(texture, [0, 0, 1, 1], &texels[at].to_ne_bytes(), 4);
+            texture
+        });
+        let outputs: [Id; CHOICES] =
+            std::array::from_fn(|_| new_buffer(device, std::ptr::null(), 16, 0));
+        let queue = new_command_queue(device, std::ptr::null());
+        let command = send(queue, "commandBuffer");
+        let encoder = send(command, "computeCommandEncoder");
+        let (bind, sel) =
+            method::<unsafe extern "C" fn(Id, Sel, Id, u64)>(encoder, "setTexture:atIndex:");
+        let (mut output, mut texture, mut amount, mut scaled) = (0, 0, 1u32, false);
+        send_with_object(encoder, "setComputePipelineState:", add);
+        set_buffer_at(encoder, outputs[output], 0, 0);
+        set_bytes_named(
+            encoder,
+            "setBytes:length:atIndex:",
+            &amount.to_ne_bytes(),
+            1,
+        );
+        bind(encoder, sel, textures[texture], 0);
+        for step in 0..STEPS {
+            // One binding changes between dispatches, or none at all.
+            match step % 5 {
+                0 => {
+                    texture = (texture + 1) % CHOICES;
+                    bind(encoder, sel, textures[texture], 0);
+                }
+                1 => {
+                    amount += 7;
+                    set_bytes_named(
+                        encoder,
+                        "setBytes:length:atIndex:",
+                        &amount.to_ne_bytes(),
+                        1,
+                    );
+                }
+                2 => {
+                    output = (output + 1) % CHOICES;
+                    set_buffer_at(encoder, outputs[output], 0, 0);
+                }
+                3 => {
+                    scaled = !scaled;
+                    let kernel = if scaled { scale } else { add };
+                    send_with_object(encoder, "setComputePipelineState:", kernel);
+                }
+                _ => {}
+            }
+            dispatch(encoder, 1);
+            expected[output] += match scaled {
+                true => amount * texels[texture],
+                false => amount + texels[texture],
+            };
+        }
+        send_void(encoder, "endEncoding");
+        send_void(command, "commit");
+        send_void(command, "waitUntilCompleted");
+        for at in 0..CHOICES {
+            let contents = object::body::<resource::Buffer>(outputs[at]).inner.contents;
+            assert_eq!(
+                std::ptr::read(contents as *const u32),
+                expected[at],
+                "output {at}"
+            );
+        }
+    }
+}
+
+/// A dispatch which follows a change to one binding, to the pipeline, or to
+/// nothing reads every binding as it was last set.
+#[test]
+fn a_dispatch_reads_each_binding_as_last_set_when_one_changed() {
+    isolate_metal_fixture!();
+    if let Some(device) = gpu_device() {
+        check_dispatches_follow_single_binding_changes(device);
+    }
+}
+
+#[test]
+fn a_dispatch_reads_each_binding_as_last_set_without_push_descriptors() {
+    isolate_metal_fixture!();
+    if let Some(device) = gpu_device_without_push_descriptors() {
+        check_dispatches_follow_single_binding_changes(device);
+    }
+}
+
 /// Samplers are resolved when the pipeline is made and read by position when
 /// binding, so each must reach the shader as the one it declared.
 #[test]

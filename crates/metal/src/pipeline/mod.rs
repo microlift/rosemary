@@ -45,6 +45,78 @@ pub(crate) struct Layouts {
     /// The binding numbers of the buffer set (0) declared as dynamic storage
     /// buffers, in ascending order - the order Vulkan takes their offsets in.
     pub dynamic: Vec<u32>,
+    /// The binding slots each set's resources are read from.
+    pub reads: [SlotSet; SETS],
+}
+
+/// Metal's per-stage binding tables: compute, vertex and fragment.
+pub(crate) const STAGES: usize = 3;
+
+/// The index of `stage`'s binding tables.
+pub(crate) fn stage_slot(stage: Stage) -> usize {
+    match stage {
+        Stage::Vertex => 1,
+        Stage::Fragment => 2,
+        _ => 0,
+    }
+}
+
+/// One of a stage's three binding tables.
+#[derive(Clone, Copy)]
+pub(crate) enum Table {
+    Buffers,
+    Textures,
+    Samplers,
+}
+
+const TABLES: usize = 3;
+
+/// A set of binding slots across every stage's tables, one bit a slot.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct SlotSet {
+    slots: [[u32; STAGES]; TABLES],
+}
+
+impl SlotSet {
+    /// The most slots of one table a set can name.
+    pub(crate) const CAPACITY: usize = u32::BITS as usize;
+
+    /// Add a slot. One past [`Self::CAPACITY`] is not a slot an encoder has.
+    pub(crate) fn insert(&mut self, table: Table, stage: usize, index: usize) {
+        if index < Self::CAPACITY {
+            self.slots[table as usize][stage] |= 1 << index;
+        }
+    }
+
+    pub(crate) fn intersects(&self, other: &Self) -> bool {
+        self.slots
+            .as_flattened()
+            .iter()
+            .zip(other.slots.as_flattened())
+            .any(|(mine, theirs)| mine & theirs != 0)
+    }
+}
+
+/// The binding slots the resources of each descriptor set are read from. A
+/// `constexpr sampler` is made with the pipeline and reads none.
+fn slot_reads(resources: &[&[ResourceBinding]]) -> [SlotSet; SETS] {
+    let mut reads = [SlotSet::default(); SETS];
+    for binding in resources.iter().copied().flatten() {
+        let table = match binding.kind {
+            ResourceKind::Buffer => Table::Buffers,
+            ResourceKind::Texture => Table::Textures,
+            ResourceKind::Sampler if binding.inline_sampler.is_none() => Table::Samplers,
+            _ => continue,
+        };
+        if let Some(set) = reads.get_mut(binding.descriptor_set as usize) {
+            set.insert(
+                table,
+                stage_slot(binding.stage),
+                binding.metal_index as usize,
+            );
+        }
+    }
+    reads
 }
 
 /// The sampler each resource's `constexpr sampler` describes, null for every
@@ -150,6 +222,7 @@ pub(crate) fn layouts_for(gpu: &Gpu, resources: &[&[ResourceBinding]]) -> Result
         pipeline,
         push_set,
         dynamic,
+        reads: slot_reads(resources),
     })
 }
 
@@ -463,8 +536,69 @@ pub(crate) fn install() {
 
 #[cfg(test)]
 mod tests {
-    use super::{choose_push_set, dynamic_bindings};
+    use super::{
+        ResourceBinding, ResourceKind, SETS, SlotSet, Stage, Table, choose_push_set,
+        dynamic_bindings, slot_reads, stage_slot,
+    };
     use ash::vk;
+
+    fn resource(stage: Stage, kind: ResourceKind, metal_index: u32, set: u32) -> ResourceBinding {
+        ResourceBinding {
+            stage,
+            kind,
+            metal_index,
+            descriptor_set: set,
+            binding: metal_index,
+            count: 1,
+            access: metal_translate::ir::Access::Read,
+            sampled: true,
+            texel_buffer: false,
+            inline_sampler: None,
+        }
+    }
+
+    #[test]
+    fn each_set_reads_the_slots_of_its_own_resources() {
+        let vertex = [resource(Stage::Vertex, ResourceKind::Buffer, 3, 0)];
+        let fragment = [
+            resource(Stage::Fragment, ResourceKind::Texture, 3, 1),
+            resource(Stage::Fragment, ResourceKind::Sampler, 0, 2),
+            // Past the slots an encoder has, so no slot at all.
+            resource(Stage::Fragment, ResourceKind::Buffer, 40, 0),
+        ];
+        let reads = slot_reads(&[&vertex, &fragment]);
+        let slot = |table, stage, index| {
+            let mut set = SlotSet::default();
+            set.insert(table, stage_slot(stage), index);
+            set
+        };
+        let which = |changed: SlotSet| reads.map(|set| set.intersects(&changed));
+        assert_eq!(
+            which(slot(Table::Buffers, Stage::Vertex, 3)),
+            [true, false, false, false]
+        );
+        assert_eq!(
+            which(slot(Table::Textures, Stage::Fragment, 3)),
+            [false, true, false, false]
+        );
+        assert_eq!(
+            which(slot(Table::Samplers, Stage::Fragment, 0)),
+            [false, false, true, false]
+        );
+        // The same index of another stage's table, or of another table.
+        assert_eq!(
+            which(slot(Table::Buffers, Stage::Fragment, 3)),
+            [false; SETS]
+        );
+        assert_eq!(
+            which(slot(Table::Samplers, Stage::Fragment, 3)),
+            [false; SETS]
+        );
+        assert_eq!(
+            which(slot(Table::Buffers, Stage::Fragment, 40)),
+            [false; SETS]
+        );
+    }
 
     #[test]
     fn the_lowest_buffer_bindings_become_dynamic_up_to_the_limit() {
