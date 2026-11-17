@@ -1324,8 +1324,9 @@ const SHORT_TEXTURE_KERNEL: &str = "#include <metal_stdlib>\n\
         counts.write(counts.read(gid) + ushort4(1), gid);\n\
     }\0";
 
-/// A signed 16-bit add has the same low-bit modulo result as an unsigned one;
-/// the texture write consumes that canonical representation.
+/// A signed 16-bit add has the same low-bit modulo result as an unsigned one,
+/// but a signed image needs it sign-extended: Vulkan leaves an integer the
+/// format cannot represent, such as 65535 for R16_SINT, undefined.
 #[test]
 fn source_msl_a_signed_short_texture_wraps_without_shader_int16() {
     let source = "#include <metal_stdlib>\n\
@@ -1351,13 +1352,117 @@ fn source_msl_a_signed_short_texture_wraps_without_shader_int16() {
         .into_iter()
         .find(|bitcast| bitcast.result_id == Some(written))
         .expect("a signed image retypes the signless wrapped value");
-    let wrapped = retyped.operands[0].unwrap_id_ref();
+    let producer = |op: Op, id: u32| {
+        body_instructions(&module, op)
+            .into_iter()
+            .find(|instruction| instruction.result_id == Some(id))
+    };
+    let extended = producer(
+        Op::ShiftRightArithmetic,
+        retyped.operands[0].unwrap_id_ref(),
+    )
+    .expect("the write sign-extends the canonical low bits");
+    let shifted = producer(Op::ShiftLeftLogical, extended.operands[0].unwrap_id_ref())
+        .expect("sign extension shifts the low bits up first");
     assert!(
-        body_instructions(&module, Op::BitwiseAnd)
-            .iter()
-            .any(|wrap| wrap.result_id == Some(wrapped)),
+        producer(Op::BitwiseAnd, shifted.operands[0].unwrap_id_ref()).is_some(),
         "the widened signed addition must wrap before the write"
     );
+}
+
+/// A widened short holds its low 16 bits, so a negative short constant must
+/// too: -1 compares equal to a short read back as 0xFFFF, not to 0xFFFFFFFF.
+#[test]
+fn a_negative_short_constant_widens_to_its_low_sixteen_bits() {
+    let short = Type::Int {
+        bits: 16,
+        signed: true,
+    };
+    let element = Type::Pointer {
+        space: AddressSpace::Device,
+        pointee: Box::new(Type::u32()),
+    };
+    let module = buffer_kernel(
+        vec![
+            element,
+            Type::u32(),
+            Type::i32(),
+            short.clone(),
+            Type::Bool,
+            Type::u32(),
+        ],
+        vec![
+            Instruction {
+                result: Some(ValueId(1)),
+                kind: InstructionKind::BufferAddress {
+                    pointer: Operand::Value(ValueId(0)),
+                    indices: vec![Operand::u32(0), Operand::u32(0)],
+                },
+            },
+            Instruction {
+                result: Some(ValueId(2)),
+                kind: InstructionKind::Load {
+                    pointer: Operand::Value(ValueId(1)),
+                },
+            },
+            Instruction {
+                result: Some(ValueId(3)),
+                kind: InstructionKind::Convert {
+                    op: ConvertOp::Bitcast,
+                    value: Operand::Value(ValueId(2)),
+                },
+            },
+            Instruction {
+                result: Some(ValueId(4)),
+                kind: InstructionKind::Convert {
+                    op: ConvertOp::IntegerTruncate,
+                    value: Operand::Value(ValueId(3)),
+                },
+            },
+            Instruction {
+                result: Some(ValueId(5)),
+                kind: InstructionKind::IntegerCompare {
+                    predicate: metal_translate::ir::IntegerPredicate::Equal,
+                    lhs: Operand::Value(ValueId(4)),
+                    rhs: Operand::Integer {
+                        ty: short,
+                        value: u64::from(u16::MAX),
+                    },
+                },
+            },
+            Instruction {
+                result: Some(ValueId(6)),
+                kind: InstructionKind::Select {
+                    condition: Operand::Value(ValueId(5)),
+                    on_true: Operand::u32(1),
+                    on_false: Operand::u32(0),
+                },
+            },
+            Instruction {
+                result: None,
+                kind: InstructionKind::Store {
+                    pointer: Operand::Value(ValueId(1)),
+                    value: Operand::Value(ValueId(6)),
+                },
+            },
+        ],
+    );
+    module.verify().unwrap();
+    let artifact = emit_spirv(&module, &TargetProfile::vulkan_1_3())
+        .unwrap()
+        .entries
+        .remove(0);
+    let parsed = rspirv::dr::load_words(&artifact.words).unwrap();
+    let [compare] = &body_instructions(&parsed, Op::IEqual)[..] else {
+        panic!("expected one comparison");
+    };
+    let constant = compare.operands[1].unwrap_id_ref();
+    let value = parsed
+        .types_global_values
+        .iter()
+        .find(|instruction| instruction.result_id == Some(constant))
+        .map(|instruction| instruction.operands[0].unwrap_literal_bit32());
+    assert_eq!(value, Some(0xffff));
 }
 
 /// A signed consumer must reinterpret the canonical low 16 bits before doing

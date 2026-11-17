@@ -299,6 +299,10 @@ impl Narrow {
                 | InstructionKind::FloatRefract { .. }
                 | InstructionKind::TextureSample { .. }
                 | InstructionKind::TextureRead { .. }
+                | InstructionKind::Convert {
+                    op: ConvertOp::SignedToFloat | ConvertOp::UnsignedToFloat,
+                    ..
+                }
         )
     }
 
@@ -357,6 +361,15 @@ impl Narrow {
                 op: ConvertOp::SignExtend | ConvertOp::SignedToFloat,
                 value,
             } => signed(value)?,
+            // A signed image's texels are written as sign-extended integers.
+            InstructionKind::TextureWrite { texture, value, .. }
+                if matches!(
+                    type_of(original_values, texture),
+                    Some(Type::Texture(texture)) if texture.signed
+                ) =>
+            {
+                signed(value)?
+            }
             // Widening the pointed-to storage would make a 16-bit atomic a
             // different atomic object. A compare-exchange emulation is needed
             // before that can be represented exactly.
@@ -441,9 +454,9 @@ impl Narrow {
                 *ty = Type::Float { bits: 32 };
             }
             Operand::Integer { ty, value } if self.has(ty) => {
-                if let Type::Int { signed: true, .. } = ty {
-                    *value = u64::from(*value as u16 as i16 as i32 as u32);
-                }
+                // The canonical low 16 bits every widened short holds; signed
+                // consumers sign-extend them.
+                *value = u64::from(*value as u16);
                 *ty = self.widen_type(ty)?;
             }
             Operand::Composite { ty, elements } => {

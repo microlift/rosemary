@@ -16,6 +16,7 @@ fn software_short_wrap_and_signed_consumers_run_on_the_gpu() {
             short divided = short(signed_value / short(-2));
             output[id] = uint(wrapped);
             output[6 + id] = as_type<uint>(int(divided));
+            output[12 + id] = signed_value == short(-1) ? 1u : 0u;
         }";
     let translated =
         metal_translate::translate_msl(source, &metal_translate::TargetProfile::vulkan_1_3())
@@ -23,11 +24,12 @@ fn software_short_wrap_and_signed_consumers_run_on_the_gpu() {
     let library = library::retain_library(device, translated, None, None);
     assert!(!library.is_null());
     let input = [0u32, 1, 0x7fff, 0x8000, 0xfffe, 0xffff];
-    let mut expected = [0u32; 12];
+    let mut expected = [0u32; 18];
     for (index, value) in input.iter().copied().enumerate() {
         expected[index] = u32::from((value as u16).wrapping_add(1));
         let signed = value as u16 as i16;
         expected[6 + index] = u32::from_ne_bytes(i32::from(signed / -2).to_ne_bytes());
+        expected[12 + index] = u32::from(signed == -1);
     }
 
     // SAFETY: test-owned Metal objects and mapped shared buffers.
