@@ -314,25 +314,27 @@ pub(super) fn barrier_memory(
     })
 }
 
-/// Metal's `memory_scope`, which says what a barrier makes wait and how far an
+// Metal's `__METAL_MEMORY_SCOPE_*__` values, as its compiler defines them.
+const MEMORY_SCOPE_THREAD: u64 = 0;
+const MEMORY_SCOPE_THREADGROUP: u64 = 1;
+const MEMORY_SCOPE_DEVICE: u64 = 2;
+const MEMORY_SCOPE_SYSTEM: u64 = 3;
+const MEMORY_SCOPE_SIMDGROUP: u64 = 4;
+
+/// Metal's `thread_scope`, which says what a barrier makes wait and how far an
 /// atomic's ordering reaches.
 ///
-/// The enumerator is Metal's `memory_scope`, which AIR numbers
-/// `work_item`, `threadgroup`, `device`, `all_gpus`. Two shapes in Apple's own
-/// output fix that numbering: a plain `threadgroup_barrier(mem_threadgroup)`
-/// is `air.wg.barrier(2, 1)`, and an `atomic_fetch_add_explicit` on a `device`
-/// pointer - whose scope defaults to the device - is `air.atomic.global.add(...,
-/// 2)`. Reading 1 as the SIMD-group and 2 as the threadgroup, as this did,
-/// makes every scope one level narrower than Metal asked for: a threadgroup
-/// barrier then synchronises only a SIMD-group, which on a threadgroup wider
-/// than one SIMD-group is no barrier at all.
+/// A plain `threadgroup_barrier(mem_threadgroup)` is `air.wg.barrier(2, 1)`,
+/// and an `atomic_fetch_add_explicit` on a `device` pointer - whose scope
+/// defaults to the device - is `air.atomic.global.add(..., 2)`.
 pub(super) fn barrier_scope(operand: &Operand, name: &str) -> Result<BarrierScope, TranslateError> {
     match air_enumerator(operand, name, "scope")? {
-        0 => Ok(BarrierScope::Invocation),
-        1 => Ok(BarrierScope::Threadgroup),
-        // `memory_scope_all_gpus` reaches further than one device, and this
-        // runtime drives one. Widening it costs ordering, not correctness.
-        2 | 3 => Ok(BarrierScope::Device),
+        MEMORY_SCOPE_THREAD => Ok(BarrierScope::Invocation),
+        MEMORY_SCOPE_SIMDGROUP => Ok(BarrierScope::Simdgroup),
+        MEMORY_SCOPE_THREADGROUP => Ok(BarrierScope::Threadgroup),
+        // The system scope reaches further than one device, and this runtime
+        // drives one. Widening it costs ordering, not correctness.
+        MEMORY_SCOPE_DEVICE | MEMORY_SCOPE_SYSTEM => Ok(BarrierScope::Device),
         scope => Err(semantic(format!(
             "LLVM intrinsic {name} names unknown Metal memory scope {scope}"
         ))),
@@ -383,14 +385,22 @@ pub(super) fn air_atomic(
     })
 }
 
-/// Metal's `memory_order` enumeration, in its declared C++ order.
+// Metal's `__METAL_MEMORY_ORDER_*__` values, which follow C11's
+// `__ATOMIC_*` numbering; Metal has no `memory_order_consume` (1).
+const MEMORY_ORDER_RELAXED: u64 = 0;
+const MEMORY_ORDER_ACQUIRE: u64 = 2;
+const MEMORY_ORDER_RELEASE: u64 = 3;
+const MEMORY_ORDER_ACQ_REL: u64 = 4;
+const MEMORY_ORDER_SEQ_CST: u64 = 5;
+
+/// Metal's `memory_order` enumeration.
 pub(super) fn memory_order(operand: &Operand, name: &str) -> Result<MemoryOrder, TranslateError> {
     match air_enumerator(operand, name, "memory order")? {
-        0 => Ok(MemoryOrder::Relaxed),
-        1 => Ok(MemoryOrder::Acquire),
-        2 => Ok(MemoryOrder::Release),
-        3 => Ok(MemoryOrder::AcquireRelease),
-        4 => Ok(MemoryOrder::SequentiallyConsistent),
+        MEMORY_ORDER_RELAXED => Ok(MemoryOrder::Relaxed),
+        MEMORY_ORDER_ACQUIRE => Ok(MemoryOrder::Acquire),
+        MEMORY_ORDER_RELEASE => Ok(MemoryOrder::Release),
+        MEMORY_ORDER_ACQ_REL => Ok(MemoryOrder::AcquireRelease),
+        MEMORY_ORDER_SEQ_CST => Ok(MemoryOrder::SequentiallyConsistent),
         order => Err(semantic(format!(
             "LLVM intrinsic {name} names unknown Metal memory order {order}"
         ))),

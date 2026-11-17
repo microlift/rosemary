@@ -59,14 +59,16 @@ fn a_work_item_memory_scope_stays_with_one_invocation() {
     assert_eq!(scope, BarrierScope::Invocation);
 }
 
+/// Metal's compiler defines `__METAL_MEMORY_ORDER_*__` with C11's
+/// `__ATOMIC_*` values and leaves out `consume`.
 #[test]
-fn air_atomic_memory_orders_keep_their_declared_strength() {
+fn air_atomic_memory_orders_follow_metal_enumerators() {
     for (enumerator, expected) in [
         (0, MemoryOrder::Relaxed),
-        (1, MemoryOrder::Acquire),
-        (2, MemoryOrder::Release),
-        (3, MemoryOrder::AcquireRelease),
-        (4, MemoryOrder::SequentiallyConsistent),
+        (2, MemoryOrder::Acquire),
+        (3, MemoryOrder::Release),
+        (4, MemoryOrder::AcquireRelease),
+        (5, MemoryOrder::SequentiallyConsistent),
     ] {
         let kind = air_intrinsic(
             "air.atomic.global.add.u.i32",
@@ -89,12 +91,31 @@ fn air_atomic_memory_orders_keep_their_declared_strength() {
             &[
                 Operand::Value(ValueId(0)),
                 Operand::u32(1),
-                Operand::u32(5),
+                Operand::u32(1),
                 Operand::u32(2),
             ],
         )
         .is_err()
     );
+}
+
+/// `__METAL_MEMORY_SCOPE_SIMDGROUP__` is 4, after the system scope.
+#[test]
+fn a_simdgroup_memory_scope_names_the_simdgroup() {
+    let kind = air_intrinsic(
+        "air.atomic.local.add.u.i32",
+        &[
+            Operand::Value(ValueId(0)),
+            Operand::u32(1),
+            Operand::u32(0),
+            Operand::u32(4),
+        ],
+    )
+    .expect("the atomic is lowered");
+    let InstructionKind::Atomic { scope, .. } = kind else {
+        panic!("an atomic read-modify-write");
+    };
+    assert_eq!(scope, BarrierScope::Simdgroup);
 }
 
 #[test]
