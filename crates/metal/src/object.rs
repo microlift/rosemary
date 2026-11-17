@@ -53,6 +53,14 @@ pub(crate) unsafe fn body<'a, T>(receiver: Id) -> &'a mut T {
     unsafe { &mut (*(receiver as *mut Object<T>)).body }
 }
 
+/// Read a live body's fields without claiming exclusive access.
+///
+/// # Safety
+/// `receiver` has this layout; concurrent mutation must use interior mutability.
+pub(crate) unsafe fn body_ref<'a, T>(receiver: Id) -> &'a T {
+    unsafe { &(*(receiver as *const Object<T>)).body }
+}
+
 /// Whether `object` is an instance of `name` or one of its subclasses.
 pub(crate) fn is_kind(object: Id, name: &CStr) -> bool {
     let Some(class) = objc::class::lookup(name) else {

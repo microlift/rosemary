@@ -34,11 +34,16 @@ pub(super) fn encode(key: &[u8; 32], library: &TranslatedLibrary) -> Vec<u8> {
             }
         }
     }
-    write_u32(&mut payload, library.function_constants.len() as u32);
-    for constant in &library.function_constants {
-        write_u32(&mut payload, constant.index);
-        write_string(&mut payload, &constant.name);
-        write_string(&mut payload, &constant.encoding);
+    write_function_constants(&mut payload, &library.function_constants);
+    write_u32(&mut payload, library.function_reflection.len() as u32);
+    for function in &library.function_reflection {
+        write_string(&mut payload, &function.name);
+        payload.push(stage_tag(function.stage));
+        write_u32(
+            &mut payload,
+            function.entry.map_or(u32::MAX, |entry| entry as u32),
+        );
+        write_function_constants(&mut payload, &function.constants);
     }
     write_u32(&mut payload, library.rejected.len() as u32);
     for rejected in &library.rejected {
@@ -129,13 +134,28 @@ pub(super) fn decode(bytes: &[u8], key: &[u8; 32]) -> Option<TranslatedLibrary> 
             varyings,
         });
     }
+    let function_constants = reader.function_constants()?;
     let count = reader.u32()? as usize;
-    let mut function_constants = Vec::with_capacity(count.min(256));
+    let mut function_reflection = Vec::with_capacity(count.min(256));
     for _ in 0..count {
-        function_constants.push(FunctionConstantInfo {
-            index: reader.u32()?,
-            name: reader.string()?,
-            encoding: reader.string()?,
+        let name = reader.string()?;
+        let stage = stage_of_tag(reader.u8()?)?;
+        let index = reader.u32()?;
+        let entry = if index == u32::MAX {
+            None
+        } else {
+            let index = index as usize;
+            let artifact = entries.get(index)?;
+            if artifact.name != name || artifact.stage != stage {
+                return None;
+            }
+            Some(index)
+        };
+        function_reflection.push(FunctionReflection {
+            name,
+            stage,
+            constants: reader.function_constants()?,
+            entry,
         });
     }
     let count = reader.u32()? as usize;
@@ -149,6 +169,7 @@ pub(super) fn decode(bytes: &[u8], key: &[u8; 32]) -> Option<TranslatedLibrary> 
     reader.at_end().then_some(TranslatedLibrary {
         entries,
         function_constants,
+        function_reflection,
         rejected,
     })
 }
@@ -166,6 +187,15 @@ fn write_strings(bytes: &mut Vec<u8>, texts: &[String]) {
     write_u32(bytes, texts.len() as u32);
     for text in texts {
         write_string(bytes, text);
+    }
+}
+
+fn write_function_constants(bytes: &mut Vec<u8>, constants: &[FunctionConstantInfo]) {
+    write_u32(bytes, constants.len() as u32);
+    for constant in constants {
+        write_u32(bytes, constant.index);
+        write_string(bytes, &constant.name);
+        write_string(bytes, &constant.encoding);
     }
 }
 
@@ -198,6 +228,19 @@ impl<'a> Reader<'a> {
 
     fn u64(&mut self) -> Option<u64> {
         Some(u64::from_le_bytes(self.take(8)?.try_into().ok()?))
+    }
+
+    fn function_constants(&mut self) -> Option<Vec<FunctionConstantInfo>> {
+        let count = self.u32()? as usize;
+        let mut constants = Vec::with_capacity(count.min(256));
+        for _ in 0..count {
+            constants.push(FunctionConstantInfo {
+                index: self.u32()?,
+                name: self.string()?,
+                encoding: self.string()?,
+            });
+        }
+        Some(constants)
     }
 
     fn boolean(&mut self) -> Option<bool> {

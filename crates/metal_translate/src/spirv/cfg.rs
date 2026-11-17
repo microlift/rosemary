@@ -36,6 +36,41 @@ impl ControlFlow {
     ) -> Dominance {
         Dominance::new(roots, edges)
     }
+
+    pub(super) fn post_dominance(&self) -> Dominance {
+        let exits: Vec<_> = self
+            .blocks
+            .iter()
+            .copied()
+            .filter(|block| self.successors[block].is_empty())
+            .collect();
+        self.dominance(&exits, &self.successors)
+    }
+
+    pub(super) fn structural_dominance(
+        &self,
+        entry: BlockId,
+        merges: &HashMap<BlockId, Merge>,
+    ) -> Dominance {
+        let mut predecessors = self.predecessors.clone();
+        for (header, merge) in merges {
+            let target = match merge {
+                Merge::Selection { merge } => merge,
+                Merge::Loop {
+                    merge,
+                    continue_target,
+                } => {
+                    predecessors
+                        .entry(*continue_target)
+                        .or_default()
+                        .push(*header);
+                    merge
+                }
+            };
+            predecessors.entry(*target).or_default().push(*header);
+        }
+        self.dominance(&[entry], &predecessors)
+    }
 }
 
 /// Recover the structured constructs of a function's control-flow graph.
@@ -45,13 +80,7 @@ pub(super) fn control_flow_merges(
     let graph = ControlFlow::new(function);
     let entry = function.blocks[0].id;
     let dominators = graph.dominance(&[entry], &graph.predecessors);
-    let exits: Vec<_> = graph
-        .blocks
-        .iter()
-        .copied()
-        .filter(|block| graph.successors[block].is_empty())
-        .collect();
-    let post_dominators = graph.dominance(&exits, &graph.successors);
+    let post_dominators = graph.post_dominance();
     // Loops first: a selection inside one may branch out of it, and that
     // choice depends on where the loop continues.
     let mut loops = Vec::new();
@@ -72,18 +101,16 @@ pub(super) fn control_flow_merges(
                 "a loop with several back edges needs restructuring",
             ));
         };
-        let body = natural_loop(&graph, block.id, *continue_target);
-        let mut leaving: Vec<_> = body
-            .iter()
-            .flat_map(|member| graph.successors[member].iter().copied())
-            .filter(|successor| !body.contains(successor))
-            .collect();
-        leaving.sort_unstable();
-        leaving.dedup();
-        let [merge] = leaving.as_slice() else {
+        let Some((body, merge)) = loop_region(
+            &graph,
+            &dominators,
+            &post_dominators,
+            block.id,
+            *continue_target,
+        ) else {
             return Err(emission("a loop with several exits needs restructuring"));
         };
-        loops.push((block.id, body, *merge, *continue_target));
+        loops.push((block.id, body, merge, *continue_target));
     }
     let mut merges = HashMap::new();
     for (header, _, merge, continue_target) in &loops {
@@ -139,13 +166,37 @@ pub(super) fn control_flow_merges(
                     .collect();
                 match staying.as_slice() {
                     [only] => *only,
+                    [] => {
+                        let inside: Vec<_> = successors_of(&block.terminator)
+                            .into_iter()
+                            .filter(|successor| {
+                                !structureless(successor) && body.contains(successor)
+                            })
+                            .collect();
+                        match inside.as_slice() {
+                            [only] => *only,
+                            _ => {
+                                return Err(emission(
+                                    "a loop exit selection has no unique inner arm",
+                                ));
+                            }
+                        }
+                    }
                     // Two arms which both run more of the body before
                     // leaving it do not rejoin inside the loop. Expressing
                     // that needs real restructuring, not a merge choice.
                     _ => {
-                        return Err(emission(
-                            "a conditional which leaves its loop has no single continuing arm",
-                        ));
+                        return Err(emission(format!(
+                            "conditional {} ({}) in {} has no single continuing arm: successors {:?}, continuing {:?}, loop {:?}, merge {:?}, latch {:?}",
+                            block.id.0,
+                            block.name,
+                            function.name,
+                            successors_of(&block.terminator),
+                            staying,
+                            header,
+                            loop_merge,
+                            continue_target,
+                        )));
                     }
                 }
             }
@@ -199,6 +250,44 @@ pub(super) fn natural_loop(
         );
     }
     body
+}
+
+/// Include terminating paths which cannot reach the back edge in the loop region.
+pub(super) fn loop_region(
+    graph: &ControlFlow,
+    dominators: &Dominance,
+    post_dominators: &Dominance,
+    header: BlockId,
+    latch: BlockId,
+) -> Option<(BTreeSet<BlockId>, BlockId)> {
+    let body = natural_loop(graph, header, latch);
+    let leaving: BTreeSet<_> = body
+        .iter()
+        .flat_map(|block| graph.successors[block].iter().copied())
+        .filter(|block| !body.contains(block))
+        .collect();
+    if leaving.len() == 1 {
+        return Some((body, *leaving.first()?));
+    }
+    if leaving.is_empty() {
+        return None;
+    }
+    let mut merge = post_dominators.immediate(header)?;
+    while body.contains(&merge) {
+        merge = post_dominators.immediate(merge)?;
+    }
+    let mut region = BTreeSet::new();
+    let mut pending = vec![header];
+    while let Some(block) = pending.pop() {
+        if block == merge || !region.insert(block) {
+            continue;
+        }
+        if !dominators.dominates(header, block) {
+            return None;
+        }
+        pending.extend(graph.successors[&block].iter().copied());
+    }
+    Some((region, merge))
 }
 
 /// The structured construct a block with two successors introduces.

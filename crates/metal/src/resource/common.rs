@@ -24,12 +24,12 @@ pub(super) unsafe extern "C" fn buffer_resource_options(receiver: Id, _sel: Sel)
 
 pub(super) unsafe extern "C" fn texture_allocated_size(receiver: Id, _sel: Sel) -> u64 {
     // SAFETY: a texture of this crate's.
-    unsafe { object::body::<Texture>(receiver) }.accounted() as u64
+    unsafe { object::body_ref::<Texture>(receiver) }.accounted() as u64
 }
 
 pub(super) unsafe extern "C" fn texture_resource_options(receiver: Id, _sel: Sel) -> u64 {
     // SAFETY: a texture of this crate's.
-    unsafe { object::body::<Texture>(receiver) }
+    unsafe { object::body_ref::<Texture>(receiver) }
         .descriptor
         .storage_mode
         << 4

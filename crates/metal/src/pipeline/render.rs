@@ -5,6 +5,7 @@ use crate::constants::*;
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub(crate) struct RenderVariantKey {
     pub topology: u64,
+    pub viewport_count: u32,
     pub cull_mode: u64,
     pub winding: u64,
     pub fill_mode: u64,
@@ -241,6 +242,8 @@ impl ColorAttachment {
 pub(crate) const COLOR_ATTACHMENTS: usize = 8;
 
 pub(crate) struct RenderPipelineDescriptor {
+    pub vertex_buffers: Id,
+    pub fragment_buffers: Id,
     pub vertex_function: objc::object::Id,
     pub fragment_function: objc::object::Id,
     pub vertex_descriptor: objc::object::Id,
@@ -373,29 +376,18 @@ impl RenderPipeline {
             }
         }
 
-        // FIXME (ACCURACY): the colour list stops at the first render-target
-        // index with no format, matching the way a render pass closes a gap
-        // up rather than keeping it. A pipeline which declares targets 0 and 2
-        // therefore loses target 2. See the MRT gap in the known gaps.
-        if descriptor
-            .colors
-            .iter()
-            .skip_while(|color| color.pixel_format != 0)
-            .any(|color| color.pixel_format != 0)
-        {
-            gpu::trace_once(
-                "a render pipeline leaves a gap in its colour attachments, which this runtime \
-                 closes up: the targets after the gap are dropped",
-            );
-        }
         let colors = descriptor
             .colors
             .iter()
-            .take_while(|color| color.pixel_format != 0)
-            .copied()
-            .collect::<Vec<_>>();
+            .rposition(|color| color.pixel_format != 0)
+            .map_or_else(Vec::new, |last| descriptor.colors[..=last].to_vec());
         let mut color_formats = Vec::new();
+        let mut color_slots = Vec::with_capacity(colors.len());
         for color in &colors {
+            if color.pixel_format == 0 {
+                color_slots.push(None);
+                continue;
+            }
             let format = gpu::pixel_format(color.pixel_format);
             if format == vk::Format::UNDEFINED {
                 return Err(format!(
@@ -403,6 +395,7 @@ impl RenderPipeline {
                     color.pixel_format
                 ));
             }
+            color_slots.push(Some(color_formats.len() as u32));
             color_formats.push((
                 format,
                 vk::AttachmentLoadOp::DONT_CARE,
@@ -411,28 +404,36 @@ impl RenderPipeline {
         }
         let depth_format = gpu::pixel_format(descriptor.depth_format);
         let stencil_format = gpu::pixel_format(descriptor.stencil_format);
-        let attachment_depth = if depth_format != vk::Format::UNDEFINED {
-            Some(depth_format)
-        } else if stencil_format != vk::Format::UNDEFINED {
-            Some(stencil_format)
-        } else {
-            None
-        };
+        let attachment_format = gpu::combined_depth_stencil_format(depth_format, stencil_format);
+        if depth_format != vk::Format::UNDEFINED
+            && stencil_format != vk::Format::UNDEFINED
+            && attachment_format.is_none()
+        {
+            return Err(format!(
+                "Metal depth format {depth_format:?} and stencil format {stencil_format:?} has no combined Vulkan attachment format"
+            ));
+        }
         let pass = RenderPassKey {
             color_resolves: vec![None; color_formats.len()],
             depth_resolve: None,
             colors: color_formats,
-            depth: attachment_depth.map(|format| {
+            color_slots,
+            depth: (depth_format != vk::Format::UNDEFINED).then(|| {
                 (
-                    format,
+                    attachment_format.expect("a depth attachment format"),
                     vk::AttachmentLoadOp::DONT_CARE,
                     vk::AttachmentStoreOp::STORE,
                 )
             }),
-            stencil: (stencil_format != vk::Format::UNDEFINED).then_some((
-                vk::AttachmentLoadOp::DONT_CARE,
-                vk::AttachmentStoreOp::STORE,
-            )),
+            stencil: (stencil_format != vk::Format::UNDEFINED).then(|| {
+                (
+                    attachment_format.expect("a stencil attachment format"),
+                    vk::AttachmentLoadOp::DONT_CARE,
+                    vk::AttachmentStoreOp::STORE,
+                )
+            }),
+            depth_stencil_shared: depth_format != vk::Format::UNDEFINED
+                && stencil_format != vk::Format::UNDEFINED,
             samples,
         };
         if !gpu.dynamic_rendering {
@@ -486,6 +487,7 @@ impl RenderPipeline {
             };
             let expected = RenderVariantKey {
                 topology,
+                viewport_count: 1,
                 cull_mode: 0,
                 winding: 0,
                 fill_mode: 0,
@@ -520,9 +522,13 @@ impl RenderPipeline {
         };
         let color_formats = self
             .pass
-            .colors
+            .color_slots
             .iter()
-            .map(|color| color.0)
+            .map(|slot| {
+                slot.map_or(vk::Format::UNDEFINED, |index| {
+                    self.pass.colors[index as usize].0
+                })
+            })
             .collect::<Vec<_>>();
         let (depth_format, stencil_format) = self.pass.depth_stencil_formats();
         let mut rendering = vk::PipelineRenderingCreateInfo::default()
@@ -550,8 +556,8 @@ impl RenderPipeline {
         let assembly =
             vk::PipelineInputAssemblyStateCreateInfo::default().topology(topology(key.topology));
         let viewport = vk::PipelineViewportStateCreateInfo::default()
-            .viewport_count(1)
-            .scissor_count(1);
+            .viewport_count(key.viewport_count)
+            .scissor_count(key.viewport_count);
         let raster = vk::PipelineRasterizationStateCreateInfo::default()
             .depth_clamp_enable(key.depth_clip == MTL_DEPTH_CLIP_MODE_CLAMP)
             .polygon_mode(polygon_mode(key.fill_mode))
@@ -663,8 +669,12 @@ impl RenderPipeline {
         }
         // The resolve destination has the attachment's format, which the
         // pipeline declared; the modes come from the pass being recorded.
-        shape.depth_resolve = match (key.depth_resolve, shape.depth) {
-            (Some(resolve), Some((format, _, _))) => Some(DepthResolve { format, ..resolve }),
+        let depth_stencil_format = shape
+            .depth
+            .map(|(format, _, _)| format)
+            .or_else(|| shape.stencil.map(|(format, _, _)| format));
+        shape.depth_resolve = match (key.depth_resolve, depth_stencil_format) {
+            (Some(resolve), Some(format)) => Some(DepthResolve { format, ..resolve }),
             _ => None,
         };
         self.gpu.render_pass(&shape)
@@ -698,8 +708,8 @@ impl RenderPipeline {
 
     /// The state a draw under `key` sets per draw on a device which can.
     pub fn dynamic_state(&self, key: &RenderVariantKey) -> RenderDynamicState {
-        let has_depth = self.depth_format != vk::Format::UNDEFINED
-            || self.stencil_format != vk::Format::UNDEFINED;
+        let has_depth = self.depth_format != vk::Format::UNDEFINED;
+        let has_stencil = self.stencil_format != vk::Format::UNDEFINED;
         RenderDynamicState {
             cull_mode: cull_mode(key.cull_mode),
             front_face: front_face(key.winding),
@@ -709,7 +719,7 @@ impl RenderPipeline {
             depth_test: has_depth,
             depth_write: has_depth && key.depth.write,
             depth_compare: compare_op(key.depth.compare),
-            stencil_test: has_depth && key.depth.stencil,
+            stencil_test: has_stencil && key.depth.stencil,
             front: StencilFace::of(&key.depth.front),
             back: StencilFace::of(&key.depth.back),
             polygon_mode: polygon_mode(key.fill_mode),

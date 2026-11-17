@@ -26,11 +26,47 @@ pub use format::{
     aspect_of, block_extent, is_integer, is_srgb, pixel_format, pixel_format_components,
     shader_aspect, srgb_twin, texel_size,
 };
+
+/// The Vulkan attachment format which can carry Metal's independently
+/// declared depth and stencil formats in one image.
+pub(crate) fn combined_depth_stencil_format(
+    depth: vk::Format,
+    stencil: vk::Format,
+) -> Option<vk::Format> {
+    use vk::Format as F;
+    match (depth, stencil) {
+        (F::UNDEFINED, F::UNDEFINED) => None,
+        (format, F::UNDEFINED) | (F::UNDEFINED, format) => Some(format),
+        (left, right)
+            if left == right
+                && aspect_of(left)
+                    .contains(vk::ImageAspectFlags::DEPTH | vk::ImageAspectFlags::STENCIL) =>
+        {
+            Some(left)
+        }
+        (F::D16_UNORM | F::D16_UNORM_S8_UINT, stencil)
+            if aspect_of(stencil).contains(vk::ImageAspectFlags::STENCIL) =>
+        {
+            Some(F::D16_UNORM_S8_UINT)
+        }
+        (F::D32_SFLOAT | F::D32_SFLOAT_S8_UINT, stencil)
+            if aspect_of(stencil).contains(vk::ImageAspectFlags::STENCIL) =>
+        {
+            Some(F::D32_SFLOAT_S8_UINT)
+        }
+        (F::X8_D24_UNORM_PACK32 | F::D24_UNORM_S8_UINT, stencil)
+            if aspect_of(stencil).contains(vk::ImageAspectFlags::STENCIL) =>
+        {
+            Some(F::D24_UNORM_S8_UINT)
+        }
+        _ => None,
+    }
+}
 pub(crate) use guard::{Guard, GuardedVec};
 pub use host::HostPages;
 pub use memory::Fill;
 pub use placement::Placement;
-pub use submit::{Batch, Commit};
+pub use submit::{Batch, Commit, EventSignal};
 use trace::dump_spirv;
 pub use trace::{milestone, trace, trace_once};
 
@@ -116,6 +152,7 @@ pub struct Gpu {
     pub(crate) lost: AtomicBool,
     memory: vk::PhysicalDeviceMemoryProperties,
     pub limits: vk::PhysicalDeviceLimits,
+    pub(crate) max_viewports: u32,
     /// One layout per distinct set of Metal binding indices, so pipelines
     /// sharing a resource shape share a layout.
     layouts: Mutex<DescriptorLayouts>,
@@ -372,6 +409,7 @@ fn create_device(
         storage_push_constant8: target.storage_push_constant8.into(),
         shader_float16: target.shader_float16.into(),
         shader_int8: target.shader_int8.into(),
+        shader_output_viewport_index: target.shader_output_viewport_index.into(),
         sampler_mirror_clamp_to_edge: capabilities.sampler_mirror_clamp_to_edge.into(),
         host_query_reset: capabilities.host_query_reset.into(),
         timeline_semaphore: capabilities.timeline_semaphores.into(),
@@ -522,17 +560,22 @@ fn mirror_clamp_support(core_feature: bool, extension: bool) -> (bool, bool) {
 /// descriptor.
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub struct RenderPassKey {
-    /// The pass's colour attachments, packed. See the MRT gap in
-    /// [the known gaps](../../../../docs/metal.md): an unattached render-target
-    /// index closes up rather than becoming a `VK_ATTACHMENT_UNUSED`
-    /// reference, so a pass which skips an index misroutes the ones after it.
+    /// The pass's actual colour attachment descriptions, packed for the
+    /// framebuffer and Vulkan attachment table.
     pub colors: Vec<(vk::Format, vk::AttachmentLoadOp, vk::AttachmentStoreOp)>,
+    /// Metal render-target index to packed attachment index. A gap becomes
+    /// `VK_ATTACHMENT_UNUSED` in a render pass or a null dynamic attachment.
+    pub color_slots: Vec<Option<u32>>,
     /// The single-sample attachment each colour is resolved into, where the
     /// Metal store action asks for a resolve, and `None` where it does not.
     /// One entry per colour, because Vulkan's resolve list is positional.
     pub color_resolves: Vec<Option<vk::Format>>,
     pub depth: Option<(vk::Format, vk::AttachmentLoadOp, vk::AttachmentStoreOp)>,
-    pub stencil: Option<(vk::AttachmentLoadOp, vk::AttachmentStoreOp)>,
+    pub stencil: Option<(vk::Format, vk::AttachmentLoadOp, vk::AttachmentStoreOp)>,
+    /// Whether the depth and stencil slots use one image subresource. Vulkan
+    /// requires this under both render-pass APIs; separate Metal textures are
+    /// copied through a temporary combined image before this key is made.
+    pub depth_stencil_shared: bool,
     /// The single-sample attachment the depth/stencil attachment resolves
     /// into. Vulkan carries one for the whole subpass rather than one per
     /// aspect, which is why Metal's two resolve destinations must be the same
@@ -542,24 +585,13 @@ pub struct RenderPassKey {
 }
 
 impl RenderPassKey {
-    /// The depth and stencil attachment formats of a pass of this shape: its
-    /// one depth/stencil attachment, under each aspect the format has, as a
-    /// render pass attachment of that format holds both.
+    /// The Vulkan formats declared for the depth and stencil slots. They are
+    /// the same when both are present, including a bridged Metal pair.
     pub fn depth_stencil_formats(&self) -> (vk::Format, vk::Format) {
-        let Some((format, _, _)) = self.depth else {
-            return (vk::Format::UNDEFINED, vk::Format::UNDEFINED);
-        };
-        let aspect = aspect_of(format);
-        let under = |wanted| {
-            if aspect.contains(wanted) {
-                format
-            } else {
-                vk::Format::UNDEFINED
-            }
-        };
         (
-            under(vk::ImageAspectFlags::DEPTH),
-            under(vk::ImageAspectFlags::STENCIL),
+            self.depth.map_or(vk::Format::UNDEFINED, |depth| depth.0),
+            self.stencil
+                .map_or(vk::Format::UNDEFINED, |stencil| stencil.0),
         )
     }
 }
@@ -650,6 +682,9 @@ impl Gpu {
             if target.shader_float16 || target.shader_int8 {
                 enabled.push(ash::khr::shader_float16_int8::NAME.as_ptr());
             }
+        }
+        if target.vulkan_version < (1, 2) && target.shader_output_viewport_index {
+            enabled.push(ash::ext::shader_viewport_index_layer::NAME.as_ptr());
         }
         if target.vulkan_version < (1, 3) && target.demote_to_helper_invocation {
             enabled.push(ash::ext::shader_demote_to_helper_invocation::NAME.as_ptr());
@@ -957,6 +992,11 @@ impl Gpu {
             occlusion_pools: Mutex::new(Vec::new()),
             occlusion_precise: features.occlusion_query_precise == vk::TRUE,
             alpha_to_one: features.alpha_to_one == vk::TRUE,
+            max_viewports: if features.multi_viewport == vk::TRUE {
+                properties.limits.max_viewports
+            } else {
+                1
+            },
             dynamic_render_state: extended_dynamic_state,
             dynamic_rendering,
             dynamic_raster,
@@ -1265,6 +1305,23 @@ mod tests {
     #[test]
     fn mirror_clamp_is_unsupported_without_either_spelling() {
         assert_eq!(mirror_clamp_support(false, false), (false, false));
+    }
+
+    #[test]
+    fn standalone_depth_and_stencil_formats_select_a_lossless_combined_format() {
+        use vk::Format as F;
+        assert_eq!(
+            combined_depth_stencil_format(F::D16_UNORM, F::S8_UINT),
+            Some(F::D16_UNORM_S8_UINT)
+        );
+        assert_eq!(
+            combined_depth_stencil_format(F::D32_SFLOAT, F::S8_UINT),
+            Some(F::D32_SFLOAT_S8_UINT)
+        );
+        assert_eq!(
+            combined_depth_stencil_format(F::D32_SFLOAT, F::R8_UINT),
+            None
+        );
     }
 
     #[test]

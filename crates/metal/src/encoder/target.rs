@@ -59,6 +59,7 @@ pub(super) struct AttachmentViews {
     /// One per colour `RenderPassKey::color_resolves` names, in order.
     pub resolve_views: Vec<vk::ImageView>,
     pub depth_resolve_view: Option<vk::ImageView>,
+    pub stencil_resolve_view: Option<vk::ImageView>,
     pub clears: Vec<vk::ClearValue>,
 }
 
@@ -77,13 +78,19 @@ impl PassTarget {
             mut views,
             resolve_views,
             depth_resolve_view,
+            stencil_resolve_view,
             clears,
         } = attachments;
+        if key.depth.is_some() && key.stencil.is_some() && !key.depth_stencil_shared {
+            return Err(
+                "Vulkan requires depth and stencil to share one attachment image".to_owned(),
+            );
+        }
         if !gpu.dynamic_rendering {
             // The render pass declares the colour resolve attachments after
             // the depth one, and the depth resolve after those.
             views.extend(resolve_views);
-            views.extend(depth_resolve_view);
+            views.extend(depth_resolve_view.or(stencil_resolve_view));
             let pass = gpu
                 .render_pass(key)
                 .map_err(|reason| format!("render pass creation failed: {reason}"))?;
@@ -98,7 +105,7 @@ impl PassTarget {
             });
         }
         let mut resolve_views = resolve_views.into_iter();
-        let colors = key
+        let packed_colors = key
             .colors
             .iter()
             .zip(&key.color_resolves)
@@ -127,57 +134,62 @@ impl PassTarget {
                 }
             })
             .collect::<Vec<_>>();
-        let (depth_format, stencil_format) = key.depth_stencil_formats();
-        let depth_stencil = key.depth.map(|(_, load, store)| {
-            let index = key.colors.len();
-            let attachment = RenderingAttachment {
+        let colors = key
+            .color_slots
+            .iter()
+            .map(|slot| match slot {
+                Some(index) => packed_colors[*index as usize],
+                None => RenderingAttachment {
+                    view: vk::ImageView::null(),
+                    load: vk::AttachmentLoadOp::DONT_CARE,
+                    store: vk::AttachmentStoreOp::DONT_CARE,
+                    clear: vk::ClearValue::default(),
+                    resolve_mode: vk::ResolveModeFlags::NONE,
+                    resolve_view: vk::ImageView::null(),
+                },
+            })
+            .collect();
+        let depth_mode = key
+            .depth_resolve
+            .map_or(vk::ResolveModeFlags::NONE, |resolve| resolve.depth_mode);
+        let stencil_mode = key
+            .depth_resolve
+            .map_or(vk::ResolveModeFlags::NONE, |resolve| resolve.stencil_mode);
+        let attachment = |index: usize,
+                          load,
+                          store,
+                          mode: vk::ResolveModeFlags,
+                          resolve_view: Option<vk::ImageView>| {
+            RenderingAttachment {
                 view: views[index],
                 load,
                 store,
                 clear: clears[index],
-                resolve_mode: vk::ResolveModeFlags::NONE,
-                resolve_view: vk::ImageView::null(),
-            };
-            let resolving = |mode: vk::ResolveModeFlags| {
-                if mode.is_empty() {
-                    attachment
-                } else {
-                    RenderingAttachment {
-                        resolve_mode: mode,
-                        resolve_view: depth_resolve_view.expect("a depth resolve view"),
-                        ..attachment
-                    }
-                }
-            };
-            let depth_mode = key
-                .depth_resolve
-                .map_or(vk::ResolveModeFlags::NONE, |r| r.depth_mode);
-            let stencil_mode = key
-                .depth_resolve
-                .map_or(vk::ResolveModeFlags::NONE, |r| r.stencil_mode);
-            // A render pass attachment holds both aspects of its format, and
-            // one the pass did not name is neither loaded nor stored.
-            let (stencil_load, stencil_store) = key.stencil.unwrap_or((
-                vk::AttachmentLoadOp::DONT_CARE,
-                vk::AttachmentStoreOp::DONT_CARE,
-            ));
-            (
-                resolving(depth_mode),
-                RenderingAttachment {
-                    load: stencil_load,
-                    store: stencil_store,
-                    ..resolving(stencil_mode)
+                resolve_mode: mode,
+                resolve_view: match mode.is_empty() {
+                    true => vk::ImageView::null(),
+                    false => resolve_view.expect("an attachment resolve view"),
                 },
+            }
+        };
+        let depth = key.depth.map(|(_, load, store)| {
+            attachment(
+                key.colors.len(),
+                load,
+                store,
+                depth_mode,
+                depth_resolve_view,
             )
+        });
+        let stencil = key.stencil.map(|(_, load, store)| {
+            let index =
+                key.colors.len() + usize::from(key.depth.is_some() && !key.depth_stencil_shared);
+            attachment(index, load, store, stencil_mode, stencil_resolve_view)
         });
         Ok(Self::Rendering {
             colors,
-            depth: depth_stencil
-                .filter(|_| depth_format != vk::Format::UNDEFINED)
-                .map(|(depth, _)| depth),
-            stencil: depth_stencil
-                .filter(|_| stencil_format != vk::Format::UNDEFINED)
-                .map(|(_, stencil)| stencil),
+            depth,
+            stencil,
         })
     }
 
@@ -219,7 +231,7 @@ impl PassTarget {
                     depth.1 = vk::AttachmentLoadOp::LOAD;
                 }
                 if let Some(stencil) = &mut key.stencil {
-                    stencil.0 = vk::AttachmentLoadOp::LOAD;
+                    stencil.1 = vk::AttachmentLoadOp::LOAD;
                 }
                 // Load operations aside the pass is the same one, so the
                 // framebuffer and every pipeline made for it still fit.
@@ -310,7 +322,13 @@ impl PassTarget {
             Self::Rendering { .. } => {
                 let (depth, stencil) = key.depth_stencil_formats();
                 Inheritance::Rendering {
-                    colors: key.colors.iter().map(|color| color.0).collect(),
+                    colors: key
+                        .color_slots
+                        .iter()
+                        .map(|slot| {
+                            slot.map_or(vk::Format::UNDEFINED, |index| key.colors[index as usize].0)
+                        })
+                        .collect(),
                     depth,
                     stencil,
                     samples: key.samples,

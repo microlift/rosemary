@@ -314,30 +314,27 @@ pub(super) fn barrier_memory(
     })
 }
 
-/// Metal's `memory_scope`, which says what a barrier makes wait and how far an
+// Metal's `__METAL_MEMORY_SCOPE_*__` values, as its compiler defines them.
+const MEMORY_SCOPE_THREAD: u64 = 0;
+const MEMORY_SCOPE_THREADGROUP: u64 = 1;
+const MEMORY_SCOPE_DEVICE: u64 = 2;
+const MEMORY_SCOPE_SYSTEM: u64 = 3;
+const MEMORY_SCOPE_SIMDGROUP: u64 = 4;
+
+/// Metal's `thread_scope`, which says what a barrier makes wait and how far an
 /// atomic's ordering reaches.
 ///
-/// The enumerator is Metal's `memory_scope`, which AIR numbers
-/// `work_item`, `threadgroup`, `device`, `all_gpus`. Two shapes in Apple's own
-/// output fix that numbering: a plain `threadgroup_barrier(mem_threadgroup)`
-/// is `air.wg.barrier(2, 1)`, and an `atomic_fetch_add_explicit` on a `device`
-/// pointer - whose scope defaults to the device - is `air.atomic.global.add(...,
-/// 2)`. Reading 1 as the SIMD-group and 2 as the threadgroup, as this did,
-/// makes every scope one level narrower than Metal asked for: a threadgroup
-/// barrier then synchronises only a SIMD-group, which on a threadgroup wider
-/// than one SIMD-group is no barrier at all.
+/// A plain `threadgroup_barrier(mem_threadgroup)` is `air.wg.barrier(2, 1)`,
+/// and an `atomic_fetch_add_explicit` on a `device` pointer - whose scope
+/// defaults to the device - is `air.atomic.global.add(..., 2)`.
 pub(super) fn barrier_scope(operand: &Operand, name: &str) -> Result<BarrierScope, TranslateError> {
     match air_enumerator(operand, name, "scope")? {
-        // `memory_scope_work_item` orders one invocation against itself, which
-        // is narrower than anything SPIR-V spells.
-        //
-        // FIXME (ACCURACY): it is widened to the SIMD-group. A wider scope
-        // costs a stronger barrier than Metal asked for, never a weaker one.
-        0 => Ok(BarrierScope::Simdgroup),
-        1 => Ok(BarrierScope::Threadgroup),
-        // `memory_scope_all_gpus` reaches further than one device, and this
-        // runtime drives one. Widening it costs ordering, not correctness.
-        2 | 3 => Ok(BarrierScope::Device),
+        MEMORY_SCOPE_THREAD => Ok(BarrierScope::Invocation),
+        MEMORY_SCOPE_SIMDGROUP => Ok(BarrierScope::Simdgroup),
+        MEMORY_SCOPE_THREADGROUP => Ok(BarrierScope::Threadgroup),
+        // The system scope reaches further than one device, and this runtime
+        // drives one. Widening it costs ordering, not correctness.
+        MEMORY_SCOPE_DEVICE | MEMORY_SCOPE_SYSTEM => Ok(BarrierScope::Device),
         scope => Err(semantic(format!(
             "LLVM intrinsic {name} names unknown Metal memory scope {scope}"
         ))),
@@ -388,14 +385,25 @@ pub(super) fn air_atomic(
     })
 }
 
-/// Metal's `memory_order`, of which the language exposes two.
+// Metal's `__METAL_MEMORY_ORDER_*__` values, which follow C11's
+// `__ATOMIC_*` numbering; Metal has no `memory_order_consume` (1).
+const MEMORY_ORDER_RELAXED: u64 = 0;
+const MEMORY_ORDER_ACQUIRE: u64 = 2;
+const MEMORY_ORDER_RELEASE: u64 = 3;
+const MEMORY_ORDER_ACQ_REL: u64 = 4;
+const MEMORY_ORDER_SEQ_CST: u64 = 5;
+
+/// Metal's `memory_order` enumeration.
 pub(super) fn memory_order(operand: &Operand, name: &str) -> Result<MemoryOrder, TranslateError> {
     match air_enumerator(operand, name, "memory order")? {
-        0 => Ok(MemoryOrder::Relaxed),
-        // FIXME (ACCURACY): every other ordering is raised to sequential
-        // consistency. Metal's own `memory_order` has only `relaxed` and
-        // `seq_cst`, and a stronger order costs ordering, not correctness.
-        _ => Ok(MemoryOrder::SequentiallyConsistent),
+        MEMORY_ORDER_RELAXED => Ok(MemoryOrder::Relaxed),
+        MEMORY_ORDER_ACQUIRE => Ok(MemoryOrder::Acquire),
+        MEMORY_ORDER_RELEASE => Ok(MemoryOrder::Release),
+        MEMORY_ORDER_ACQ_REL => Ok(MemoryOrder::AcquireRelease),
+        MEMORY_ORDER_SEQ_CST => Ok(MemoryOrder::SequentiallyConsistent),
+        order => Err(semantic(format!(
+            "LLVM intrinsic {name} names unknown Metal memory order {order}"
+        ))),
     }
 }
 
@@ -456,12 +464,27 @@ pub(super) fn air_texture_intrinsic(
                 rest => (None, rest),
             };
             if access == "gather" {
-                let [_component] = rest else {
-                    return Err(malformed());
+                let (component, trailing) = match rest {
+                    [component] => (component, None),
+                    [component, trailing] => (component, Some(trailing)),
+                    _ => return Err(malformed()),
                 };
-                // FIXME (ACCURACY): the gathered component is a runtime
-                // operand in AIR but a literal in SPIR-V. Lower the common
-                // red-channel gather and reject any other selector.
+                if let Some(trailing) = trailing
+                    && air_enumerator(trailing, operation, "gather qualifier")? != 0
+                {
+                    return Err(semantic(format!(
+                        "AIR intrinsic air.{operation} has a nonzero gather qualifier"
+                    )));
+                }
+                let component = air_enumerator(component, operation, "gather component")?;
+                let component = u32::try_from(component)
+                    .ok()
+                    .filter(|component| *component < 4)
+                    .ok_or_else(|| {
+                        semantic(format!(
+                            "AIR intrinsic air.{operation} names gather component {component}"
+                        ))
+                    })?;
                 return Ok(Some(InstructionKind::TextureSample {
                     texture: texture.clone(),
                     sampler: sampler.clone(),
@@ -471,7 +494,7 @@ pub(super) fn air_texture_intrinsic(
                     lod: None,
                     gradient: None,
                     bias: None,
-                    gather: Some(0),
+                    gather: Some(component),
                     compare: None,
                 }));
             }

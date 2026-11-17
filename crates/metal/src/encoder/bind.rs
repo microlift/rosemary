@@ -30,6 +30,7 @@ pub(crate) fn new_encoder(command_buffer: Id, kind: Kind) -> Id {
             fill_mode: 0,
             depth_clip: 0,
             depth_bias: RecordedDepthBias::default(),
+            viewports: ViewportState::default(),
             in_render_pass: false,
             lazy: None,
             sub_encoder: false,
@@ -37,6 +38,7 @@ pub(crate) fn new_encoder(command_buffer: Id, kind: Kind) -> Id {
             resolve_mask: 0,
             depth_resolve: None,
             pending_copies: Vec::new(),
+            pending_depth_stencil_bridges: Vec::new(),
             capture_targets: Vec::new(),
             capture_pass: None,
             visibility: None,
@@ -111,13 +113,21 @@ pub(super) unsafe extern "C" fn end_encoding(receiver: Id, _sel: Sel) {
         }
         encoder.in_render_pass = false;
         visibility::resolve(encoder);
+        let mut bridges = std::mem::take(&mut encoder.pending_depth_stencil_bridges);
         let copies = std::mem::take(&mut encoder.pending_copies);
-        if !copies.is_empty() {
+        if !bridges.is_empty() || !copies.is_empty() {
             // The copies read what the pass just drew.
             for &(image, aspect) in &encoder.attachments {
                 command.hazards.note_written(image, aspect);
             }
             command.flush_hazards();
+        }
+        for bridge in &mut bridges {
+            if let Err(reason) = record_depth_stencil_bridge(command, bridge, false) {
+                gpu::trace(format!("depth/stencil bridge store failed: {reason}"));
+                continue;
+            }
+            command.hazards.note_written(bridge.original, bridge.aspect);
         }
         for copy in copies {
             let source = vk::ImageSubresourceLayers {
@@ -402,7 +412,7 @@ impl Encoder {
                         (0, 0, 0)
                     } else {
                         // SAFETY: only a texture of this crate's is ever bound.
-                        let texture = unsafe { object::body::<Texture>(bound) };
+                        let texture = unsafe { object::body_ref::<Texture>(bound) };
                         use vk::Handle;
                         let is_texel_buffer = texture.texel_view != vk::BufferView::null();
                         if is_texel_buffer != binding.texel_buffer {
@@ -840,6 +850,7 @@ impl Encoder {
         };
         let key = RenderVariantKey {
             topology: primitive,
+            viewport_count: self.viewports.count(),
             cull_mode: self.cull_mode,
             winding: self.winding,
             fill_mode: self.fill_mode,
@@ -870,6 +881,7 @@ impl Encoder {
         let command = self.command();
         let device = &command.gpu.device;
         let vk_command = command.command_buffer;
+        self.viewports.record(device, vk_command);
         if command.gpu.dynamic_render_state && self.render_dynamic != Some(wanted) {
             wanted.record(command.gpu, vk_command, self.render_dynamic.as_ref());
             self.render_dynamic = Some(wanted);

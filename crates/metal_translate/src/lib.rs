@@ -7,11 +7,12 @@ mod sha256;
 pub mod specialize;
 pub mod spirv;
 
+use std::collections::BTreeSet;
 use std::fmt;
 
 pub use air::{AirInput, parse_air};
 pub use cache::{
-    CACHE_VERSION, translate_cached, translate_cached_with, translate_msl_cached,
+    CACHE_VERSION, MslSource, translate_cached, translate_cached_with, translate_msl_cached,
     translate_msl_cached_with, translate_msl_cached_with_macros, translate_msl_specialized_cached,
     translate_specialized_cached,
 };
@@ -24,9 +25,203 @@ pub use specialize::{
     metal_data_type_of_encoding, metal_data_type_size, specialize,
 };
 pub use spirv::{
-    EntryArtifact, FunctionConstantInfo, RejectedEntry, RequiredFeatures, ResourceBinding,
-    StageVariable, TargetProfile, TranslatedLibrary, WORKGROUP_SIZE_SPEC_IDS, emit_spirv,
+    EntryArtifact, FunctionConstantInfo, FunctionReflection, RejectedEntry, RequiredFeatures,
+    ResourceBinding, StageVariable, TargetProfile, TranslatedLibrary, WORKGROUP_SIZE_SPEC_IDS,
+    emit_spirv,
 };
+
+/// One entry point declared by a parsed source library.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MslFunctionInfo {
+    pub name: String,
+    pub stage: ir::Stage,
+}
+
+/// A source library after preprocessing, parsing and semantic lowering, but
+/// before function constants choose one of its executable variants.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MslTemplate {
+    module: ir::Module,
+    rejected: Vec<RejectedEntry>,
+}
+
+impl MslTemplate {
+    /// Entry points which reached the common IR, in declaration order.
+    pub fn functions(&self) -> impl Iterator<Item = MslFunctionInfo> + '_ {
+        self.module.entries.iter().filter_map(|entry| {
+            Some(MslFunctionInfo {
+                name: self.module.functions.get(entry.function)?.name.clone(),
+                stage: entry.stage,
+            })
+        })
+    }
+
+    /// Function constants declared by the library, in source order.
+    pub fn function_constants(&self) -> impl Iterator<Item = FunctionConstantInfo> + '_ {
+        self.module.globals.iter().filter_map(|global| {
+            let slot = global.function_constant.as_ref()?;
+            Some(FunctionConstantInfo {
+                index: slot.index,
+                name: slot.name.clone(),
+                encoding: slot.encoding.clone(),
+            })
+        })
+    }
+
+    /// Function constants the named entry point reads, in declaration order.
+    pub fn function_constants_for(&self, name: &str) -> Vec<FunctionConstantInfo> {
+        self.module
+            .entries
+            .iter()
+            .position(|entry| {
+                self.module
+                    .functions
+                    .get(entry.function)
+                    .is_some_and(|function| function.name == name)
+            })
+            .and_then(|position| {
+                entry_function_constants(&self.module)
+                    .into_iter()
+                    .nth(position)
+            })
+            .unwrap_or_default()
+    }
+}
+
+fn operand_globals(operand: &ir::Operand, globals: &mut BTreeSet<usize>) {
+    match operand {
+        ir::Operand::Global { index, .. } => {
+            globals.insert(*index as usize);
+        }
+        ir::Operand::Composite { elements, .. } => {
+            for element in elements {
+                operand_globals(element, globals);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn function_globals(function: &ir::Function) -> BTreeSet<usize> {
+    let mut globals = BTreeSet::new();
+    for block in &function.blocks {
+        for operand in block
+            .instructions
+            .iter()
+            .flat_map(|instruction| ir::instruction_operands(&instruction.kind))
+            .chain(ir::terminator_operands(&block.terminator))
+        {
+            operand_globals(operand, &mut globals);
+        }
+    }
+    globals
+}
+
+/// Function constants used by each entry point, in entry/declaration order.
+pub fn entry_function_constants(module: &ir::Module) -> Vec<Vec<FunctionConstantInfo>> {
+    let mut dependencies = vec![BTreeSet::new(); module.globals.len()];
+    for (index, global) in module.globals.iter().enumerate() {
+        if global.function_constant.is_some() {
+            dependencies[index].insert(index);
+        }
+    }
+    loop {
+        let mut changed = false;
+        for initializer in &module.static_initializers {
+            let reads = function_globals(initializer);
+            let inherited: BTreeSet<_> = reads
+                .iter()
+                .flat_map(|index| dependencies[*index].iter().copied())
+                .collect();
+            let targets: Vec<_> = initializer
+                .blocks
+                .iter()
+                .flat_map(|block| &block.instructions)
+                .filter_map(|instruction| match &instruction.kind {
+                    ir::InstructionKind::Store {
+                        pointer: ir::Operand::Global { index, .. },
+                        ..
+                    } => Some(*index as usize),
+                    _ => None,
+                })
+                .collect();
+            for target in targets {
+                let before = dependencies[target].len();
+                dependencies[target].extend(&inherited);
+                changed |= dependencies[target].len() != before;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    module
+        .entries
+        .iter()
+        .map(|entry| {
+            let used: BTreeSet<_> = module
+                .functions
+                .get(entry.function)
+                .into_iter()
+                .flat_map(function_globals)
+                .flat_map(|index| dependencies[index].iter().copied())
+                .collect();
+            module
+                .globals
+                .iter()
+                .enumerate()
+                .filter_map(|(index, global)| {
+                    let slot = global.function_constant.as_ref()?;
+                    used.contains(&index).then(|| FunctionConstantInfo {
+                        index: slot.index,
+                        name: slot.name.clone(),
+                        encoding: slot.encoding.clone(),
+                    })
+                })
+                .collect()
+        })
+        .collect()
+}
+
+fn reflect_functions(module: &ir::Module) -> Vec<FunctionReflection> {
+    if !module
+        .globals
+        .iter()
+        .any(|global| global.function_constant.is_some())
+    {
+        return Vec::new();
+    }
+    module
+        .entries
+        .iter()
+        .zip(entry_function_constants(module))
+        .filter_map(|(entry, constants)| {
+            Some(FunctionReflection {
+                name: module.functions.get(entry.function)?.name.clone(),
+                stage: entry.stage,
+                constants,
+                entry: None,
+            })
+        })
+        .collect()
+}
+
+fn attach_function_reflection(
+    library: &mut TranslatedLibrary,
+    mut reflection: Vec<FunctionReflection>,
+    include_unemitted: bool,
+) {
+    for function in &mut reflection {
+        function.entry = library
+            .entries
+            .iter()
+            .position(|entry| entry.name == function.name && entry.stage == function.stage);
+    }
+    if !include_unemitted {
+        reflection.retain(|function| function.entry.is_some());
+    }
+    library.function_reflection = reflection;
+}
 
 /// The phase which reported a translation diagnostic.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -123,9 +318,12 @@ pub fn translate_specialized(
     constants: &FunctionConstantValues,
 ) -> Result<TranslatedLibrary, TranslateError> {
     let mut module = parse_air(input)?;
+    let reflection = reflect_functions(&module);
     specialize(&mut module, constants)?;
     passes.run(&mut module)?;
-    emit_spirv(&module, target)
+    let mut library = emit_spirv(&module, target)?;
+    attach_function_reflection(&mut library, reflection, false);
+    Ok(library)
 }
 
 /// Parse and translate the supported source-MSL subset.
@@ -166,6 +364,56 @@ pub fn translate_msl_with_macros(
     )
 }
 
+/// Parse and lower a source library without requiring values for its function
+/// constants. Code generation happens from a clone when a variant is needed.
+pub fn compile_msl_template(
+    source: &str,
+    macros: &[(String, String)],
+) -> Result<MslTemplate, TranslateError> {
+    let (module, rejected) = msl::parse_msl_partial(source, macros)
+        .map_err(|error| with_msl_source_context(source, error))?;
+    Ok(MslTemplate { module, rejected })
+}
+
+/// Translate a parsed source template with one concrete constant-value set,
+/// rejecting only entries whose constants remain undefined.
+pub fn translate_msl_template_specialized(
+    template: &MslTemplate,
+    target: &TargetProfile,
+    passes: &PassPipeline,
+    constants: &FunctionConstantValues,
+) -> Result<TranslatedLibrary, TranslateError> {
+    translate_msl_template_inner(template, target, passes, constants)
+}
+
+/// Produce the base library while retaining entries whose required constants
+/// are not supplied as template-only functions.
+pub fn translate_msl_template(
+    template: &MslTemplate,
+    target: &TargetProfile,
+    passes: &PassPipeline,
+) -> Result<TranslatedLibrary, TranslateError> {
+    translate_msl_template_inner(template, target, passes, &FunctionConstantValues::new())
+}
+
+fn translate_msl_template_inner(
+    template: &MslTemplate,
+    target: &TargetProfile,
+    passes: &PassPipeline,
+    constants: &FunctionConstantValues,
+) -> Result<TranslatedLibrary, TranslateError> {
+    let dependencies = msl::function_constant_dependencies(&template.module);
+    let mut module = template.module.clone();
+    specialize(&mut module, constants)?;
+    passes.run(&mut module)?;
+    let mut rejected = template.rejected.clone();
+    rejected.extend(msl::reject_undefined_entries(&mut module, &dependencies)?);
+    let mut library = emit_spirv(&module, target)?;
+    library.rejected.extend(rejected);
+    attach_function_reflection(&mut library, reflect_functions(&template.module), true);
+    Ok(library)
+}
+
 /// Translate source with the macro definitions and function constants supplied by Metal.
 pub fn translate_msl_specialized(
     source: &str,
@@ -174,24 +422,19 @@ pub fn translate_msl_specialized(
     passes: &PassPipeline,
     constants: &FunctionConstantValues,
 ) -> Result<TranslatedLibrary, TranslateError> {
-    let with_context = |mut error: TranslateError| {
-        for diagnostic in &mut error.diagnostics {
-            if let Some(line) = diagnostic.line {
-                diagnostic
-                    .message
-                    .push_str(&format_msl_source_context(source, line));
-            }
+    let template = compile_msl_template(source, macros)?;
+    translate_msl_template_specialized(&template, target, passes, constants)
+}
+
+fn with_msl_source_context(source: &str, mut error: TranslateError) -> TranslateError {
+    for diagnostic in &mut error.diagnostics {
+        if let Some(line) = diagnostic.line {
+            diagnostic
+                .message
+                .push_str(&format_msl_source_context(source, line));
         }
-        error
-    };
-    let (mut module, rejected) = msl::parse_msl_partial(source, macros).map_err(with_context)?;
-    specialize(&mut module, constants)?;
-    passes.run(&mut module)?;
-    let unspecialized = msl::reject_undefined_constants(&mut module);
-    let mut library = emit_spirv(&module, target)?;
-    library.rejected.extend(rejected);
-    library.rejected.extend(unspecialized);
-    Ok(library)
+    }
+    error
 }
 
 /// Render a small source window under an MSL diagnostic.

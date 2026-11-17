@@ -1661,6 +1661,37 @@ mod tests {
     use super::*;
 
     #[test]
+    fn overlay_modules_pass_spirv_validation_when_available() {
+        for (name, words) in [("dma", shader()), ("scene", scene_shader())] {
+            let file = std::env::temp_dir().join(format!(
+                "rosemary-overlay-{}-{name}.spv",
+                std::process::id()
+            ));
+            let bytes: Vec<_> = words.iter().flat_map(|word| word.to_le_bytes()).collect();
+            std::fs::write(&file, bytes).unwrap();
+            let result = std::process::Command::new("spirv-val")
+                .args(["--target-env", "vulkan1.3"])
+                .arg(&file)
+                .output();
+            std::fs::remove_file(file).unwrap();
+            match result {
+                Ok(output) => {
+                    assert!(
+                        output.status.success(),
+                        "{name}: {}",
+                        String::from_utf8_lossy(&output.stderr)
+                    );
+                    eprintln!("validated {name} overlay with spirv-val");
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    eprintln!("spirv-val unavailable; {name} validation skipped")
+                }
+                Err(error) => panic!("spirv-val failed: {error}"),
+            }
+        }
+    }
+
+    #[test]
     fn the_overlay_shader_is_one_compute_entry_point() {
         let words = shader();
         let module = rspirv::dr::load_words(&words).expect("SPIR-V that loads back");

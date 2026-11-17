@@ -118,6 +118,8 @@ pub fn data_symbols() -> Vec<(String, u64)> {
         "MTLRenderPassStencilAttachmentDescriptor",
         "MTLCompileOptions",
         "MTLComputePipelineDescriptor",
+        "MTLPipelineBufferDescriptor",
+        "MTLPipelineBufferDescriptorArray",
         "MTLFunctionConstantValues",
         "MTLStageInputOutputDescriptor",
         "MTLSharedEventListener",

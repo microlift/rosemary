@@ -2,7 +2,7 @@ use super::*;
 
 pub(super) unsafe extern "C" fn new_command_buffer(receiver: Id, _sel: Sel) -> Id {
     // SAFETY: a command queue of this crate's.
-    let queue = unsafe { object::body::<CommandQueue>(receiver) };
+    let queue = unsafe { object::body_ref::<CommandQueue>(receiver) };
     let gpu = queue.gpu;
     let context = match gpu.acquire_context() {
         Ok(context) => context,
@@ -304,6 +304,8 @@ fn resolve_snapshots(command: &mut CommandBuffer) -> Option<vk::CommandBuffer> {
 
 /// `-[MTLCommandBuffer commit]`: end recording and submit asynchronously.
 pub(super) unsafe extern "C" fn commit(receiver: Id, _sel: Sel) {
+    // SAFETY: commit implicitly reserves a place if enqueue was not called.
+    unsafe { enqueue(receiver, _sel) };
     // SAFETY: a command buffer of this crate's.
     let command = unsafe { object::body::<CommandBuffer>(receiver) };
     if !command.recording {
@@ -406,13 +408,15 @@ pub(super) unsafe extern "C" fn commit(receiver: Id, _sel: Sel) {
             .take()
             .expect("unrecorded command")
             .finish(Err(format!("vkEndCommandBuffer failed with {error:?}")));
+        // SAFETY: the command buffer retains its queue.
+        unsafe { object::body_ref::<CommandQueue>(command.queue) }.submit_ready(receiver, None);
         return;
     }
     command.completion.set(2); // MTLCommandBufferStatusCommitted
     gpu.submissions.start(gpu);
     let mut submission = submission.take().expect("pending submission");
     let scheduled_handlers = std::mem::take(&mut command.scheduled_handlers);
-    gpu.commit(gpu::Commit {
+    let commit = gpu::Commit {
         batches,
         fence: command.fence,
         submitted: Box::new(move |serial, result, signal| {
@@ -442,7 +446,9 @@ pub(super) unsafe extern "C" fn commit(receiver: Id, _sel: Sel) {
             }
             gpu.submissions.push(submission);
         }),
-    });
+    };
+    // SAFETY: the command buffer retains its queue.
+    unsafe { object::body_ref::<CommandQueue>(command.queue) }.submit_ready(receiver, Some(commit));
 }
 
 pub(super) unsafe extern "C" fn wait_until_completed(receiver: Id, _sel: Sel) {
@@ -491,7 +497,19 @@ pub(super) unsafe extern "C" fn encode_signal_event(
     // SAFETY: a command buffer of this crate's.
     let command = unsafe { object::body::<CommandBuffer>(receiver) };
     if let Some(semaphore) = event_semaphore(command, event) {
-        split(command, vec![(semaphore, value)], Vec::new());
+        // SAFETY: event_semaphore checked the class and retained its live body.
+        let submitted_value = unsafe { object::body_ref::<crate::event::Event>(event) }
+            .submitted_value
+            .clone();
+        split(
+            command,
+            vec![gpu::EventSignal {
+                semaphore,
+                value,
+                submitted_value,
+            }],
+            Vec::new(),
+        );
     }
 }
 
@@ -524,7 +542,7 @@ fn event_semaphore(command: &mut CommandBuffer, event: Id) -> Option<vk::Semapho
     }
     command.retain(event);
     // SAFETY: an event of this crate's, checked above.
-    Some(unsafe { object::body::<crate::event::Event>(event) }.semaphore)
+    Some(unsafe { object::body_ref::<crate::event::Event>(event) }.semaphore)
 }
 
 /// End the recording so far as one batch, signalling `signals` once it is
@@ -533,7 +551,7 @@ fn event_semaphore(command: &mut CommandBuffer, event: Id) -> Option<vk::Semapho
 /// either between any two encoders.
 fn split(
     command: &mut CommandBuffer,
-    signals: Vec<(vk::Semaphore, u64)>,
+    signals: Vec<gpu::EventSignal>,
     waits: Vec<(vk::Semaphore, u64)>,
 ) {
     let gpu = command.gpu;

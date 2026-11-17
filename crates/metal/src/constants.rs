@@ -9,6 +9,7 @@ pub(crate) const MTL_TEXTURE_TYPE_CUBE: u64 = 5;
 pub(crate) const MTL_TEXTURE_TYPE_TEXTURE_BUFFER: u64 = 9;
 
 pub(crate) const MTL_STORAGE_MODE_MANAGED: u64 = 1;
+pub(crate) const MTL_STORAGE_MODE_PRIVATE: u64 = 2;
 
 pub(crate) const MTL_GPU_FAMILY_MAC_1: u64 = 2001;
 pub(crate) const MTL_GPU_FAMILY_MAC_2: u64 = 2002;

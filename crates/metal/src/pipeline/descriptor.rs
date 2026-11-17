@@ -91,7 +91,23 @@ pub(super) unsafe extern "C" fn descriptor_init(receiver: Id, _sel: Sel) -> Id {
     // A `-colorAttachments` taken before the reset stays this descriptor's,
     // and its elements read the reset values through it.
     let color_objects = descriptor.color_objects;
+    let vertex_buffers = if descriptor.vertex_buffers.is_null() {
+        buffer_descriptor::new_array()
+    } else {
+        descriptor.vertex_buffers
+    };
+    let fragment_buffers = if descriptor.fragment_buffers.is_null() {
+        buffer_descriptor::new_array()
+    } else {
+        descriptor.fragment_buffers
+    };
+    unsafe {
+        buffer_descriptor::reset(vertex_buffers);
+        buffer_descriptor::reset(fragment_buffers);
+    }
     *descriptor = RenderPipelineDescriptor {
+        vertex_buffers,
+        fragment_buffers,
         vertex_function: std::ptr::null_mut(),
         fragment_function: std::ptr::null_mut(),
         vertex_descriptor: std::ptr::null_mut(),
@@ -106,6 +122,18 @@ pub(super) unsafe extern "C" fn descriptor_init(receiver: Id, _sel: Sel) -> Id {
         color_objects,
     };
     receiver
+}
+
+pub(super) unsafe extern "C" fn descriptor_reset(receiver: Id, sel: Sel) {
+    unsafe { descriptor_init(receiver, sel) };
+}
+
+pub(super) unsafe extern "C" fn descriptor_buffers(receiver: Id, sel: Sel) -> Id {
+    let descriptor = unsafe { object::body_ref::<RenderPipelineDescriptor>(receiver) };
+    match unsafe { std::ffi::CStr::from_ptr(sel) }.to_bytes() {
+        b"vertexBuffers" => descriptor.vertex_buffers,
+        _ => descriptor.fragment_buffers,
+    }
 }
 
 /// Give up the functions and vertex descriptor a render pipeline descriptor
@@ -133,7 +161,7 @@ unsafe fn release_descriptor_objects(receiver: Id) {
 /// `source` must be a `MTLRenderPipelineDescriptor` of this crate's.
 pub(crate) unsafe fn copy_render_pipeline_descriptor(source: Id) -> Id {
     // SAFETY: the caller's contract.
-    let source = unsafe { object::body::<RenderPipelineDescriptor>(source) };
+    let source = unsafe { object::body_ref::<RenderPipelineDescriptor>(source) };
     let vertex_descriptor = if source.vertex_descriptor.is_null() {
         std::ptr::null_mut()
     } else {
@@ -143,6 +171,8 @@ pub(crate) unsafe fn copy_render_pipeline_descriptor(source: Id) -> Id {
     object::make(
         c"MTLRenderPipelineDescriptor",
         RenderPipelineDescriptor {
+            vertex_buffers: unsafe { buffer_descriptor::copy_array(source.vertex_buffers) },
+            fragment_buffers: unsafe { buffer_descriptor::copy_array(source.fragment_buffers) },
             vertex_function: objc::arc::retain(source.vertex_function),
             fragment_function: objc::arc::retain(source.fragment_function),
             vertex_descriptor,
@@ -156,6 +186,15 @@ pub(crate) unsafe fn copy_render_pipeline_descriptor(source: Id) -> Id {
 pub(super) unsafe extern "C" fn descriptor_dealloc(receiver: Id, _sel: Sel) {
     // SAFETY: a render pipeline descriptor of this crate's.
     unsafe { release_descriptor_objects(receiver) };
+    let descriptor = unsafe { object::body::<RenderPipelineDescriptor>(receiver) };
+    objc::arc::release(std::mem::replace(
+        &mut descriptor.vertex_buffers,
+        std::ptr::null_mut(),
+    ));
+    objc::arc::release(std::mem::replace(
+        &mut descriptor.fragment_buffers,
+        std::ptr::null_mut(),
+    ));
     // The colour attachments point back at this descriptor, and a guest may
     // hold one after releasing it: orphan them before the body goes.
     let collection = std::mem::replace(
@@ -298,6 +337,8 @@ mod tests {
         let descriptor = object::make(
             c"MTLRenderPipelineDescriptor",
             RenderPipelineDescriptor {
+                vertex_buffers: std::ptr::null_mut(),
+                fragment_buffers: std::ptr::null_mut(),
                 vertex_function: std::ptr::null_mut(),
                 fragment_function: std::ptr::null_mut(),
                 vertex_descriptor: std::ptr::null_mut(),

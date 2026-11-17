@@ -31,7 +31,9 @@ pub(crate) use heap::{heap_buffer_size_and_align, heap_texture_size_and_align};
 pub(crate) use sampler::{SamplerDescriptor, SamplerState, compare_op, new_sampler};
 #[cfg(test)]
 pub(crate) use texture::Region;
-pub(crate) use texture::{Texture, TextureDescriptor, drawable_texture, new_texture};
+pub(crate) use texture::{
+    Texture, TextureDescriptor, drawable_texture, new_internal_attachment, new_texture,
+};
 pub(crate) use vertex::{
     Element, IndexedCollection, VERTEX_SLOTS, VertexAttribute, VertexDescriptor, VertexLayout,
     copy_vertex_descriptor, new_empty_vertex_descriptor, orphan, orphan_element,

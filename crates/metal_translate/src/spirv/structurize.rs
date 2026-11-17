@@ -1,4 +1,4 @@
-use super::cfg::{ControlFlow, Merge, natural_loop, reaches, successors_of};
+use super::cfg::{ControlFlow, Merge, loop_region, reaches, successors_of};
 use super::*;
 
 /// Give a function a single returning block.
@@ -112,6 +112,45 @@ pub(super) fn isolate_shared_selection_paths(
     let entry = function.blocks[0].id;
     let dominators = graph.dominance(&[entry], &graph.predecessors);
     let merges = control_flow_merges(function)?;
+    let structural = graph.structural_dominance(entry, &merges);
+    for header in merges.keys().copied().collect::<BTreeSet<_>>() {
+        let Merge::Selection { merge } = merges[&header] else {
+            continue;
+        };
+        let inside: BTreeSet<_> = graph
+            .blocks
+            .iter()
+            .copied()
+            .filter(|block| {
+                structural.dominates(header, *block) && !structural.dominates(merge, *block)
+            })
+            .collect();
+        let redirects: Vec<_> = graph
+            .blocks
+            .iter()
+            .filter(|block| !inside.contains(block))
+            .flat_map(|source| {
+                graph.successors[source]
+                    .iter()
+                    .copied()
+                    .map(|target| (*source, target))
+            })
+            .filter(|(_, target)| *target != header && inside.contains(target))
+            .collect();
+        if redirects.is_empty() {
+            continue;
+        }
+        let mut region = BTreeSet::new();
+        let mut pending: Vec<_> = redirects.iter().map(|(_, target)| *target).collect();
+        while let Some(block) = pending.pop() {
+            if !inside.contains(&block) || !region.insert(block) {
+                continue;
+            }
+            pending.extend(graph.successors[&block].iter().copied());
+        }
+        clone_region(function, &region, &redirects)?;
+        return Ok(true);
+    }
     let mut claims: BTreeMap<BlockId, Vec<BlockId>> = BTreeMap::new();
     for (header, merge) in &merges {
         if let Merge::Selection { merge } = merge {
@@ -154,7 +193,7 @@ pub(super) fn isolate_shared_selection_paths(
             }
             pending.extend(graph.successors[&block].iter().copied());
         }
-        clone_region(function, &region, &redirects, merge)?;
+        clone_region(function, &region, &redirects)?;
         return Ok(true);
     }
     Ok(false)
@@ -164,8 +203,14 @@ fn clone_region(
     function: &mut Function,
     region: &BTreeSet<BlockId>,
     redirects: &[(BlockId, BlockId)],
-    merge: BlockId,
 ) -> Result<(), TranslateError> {
+    let exits: BTreeSet<_> = function
+        .blocks
+        .iter()
+        .filter(|block| region.contains(&block.id))
+        .flat_map(|block| successors_of(&block.terminator))
+        .filter(|target| !region.contains(target))
+        .collect();
     let mut next_block = function
         .blocks
         .iter()
@@ -239,28 +284,29 @@ fn clone_region(
             }
         }
     }
-    // A cloned exit contributes the cloned SSA value to the old merge until
-    // the following merge-splitting pass places an inner merge in between.
-    let merge_block = function
-        .blocks
-        .iter_mut()
-        .find(|block| block.id == merge)
-        .ok_or_else(|| emission("a cloned region's merge block is missing"))?;
-    for instruction in &mut merge_block.instructions {
-        let InstructionKind::Phi { incomings } = &mut instruction.kind else {
-            continue;
-        };
-        let additions: Vec<_> = incomings
-            .iter()
-            .filter_map(|(from, value)| {
-                block_map.get(from).map(|cloned| {
-                    let mut value = value.clone();
-                    remap_value(&mut value, &value_map);
-                    (*cloned, value)
+    // Every cloned exit contributes its own SSA values at the boundary.
+    for exit in exits {
+        let merge_block = function
+            .blocks
+            .iter_mut()
+            .find(|block| block.id == exit)
+            .ok_or_else(|| emission("a cloned region's merge block is missing"))?;
+        for instruction in &mut merge_block.instructions {
+            let InstructionKind::Phi { incomings } = &mut instruction.kind else {
+                continue;
+            };
+            let additions: Vec<_> = incomings
+                .iter()
+                .filter_map(|(from, value)| {
+                    block_map.get(from).map(|cloned| {
+                        let mut value = value.clone();
+                        remap_value(&mut value, &value_map);
+                        (*cloned, value)
+                    })
                 })
-            })
-            .collect();
-        incomings.extend(additions);
+                .collect();
+            incomings.extend(additions);
+        }
     }
     for (source, target) in redirects {
         let block = function
@@ -342,6 +388,31 @@ fn redirect_edge(terminator: &mut Terminator, from: BlockId, to: BlockId) {
 /// merge.
 pub(super) fn split_shared_merges(function: &mut Function) -> Result<bool, TranslateError> {
     let merges = control_flow_merges(function)?;
+    let graph = ControlFlow::new(function);
+    let dominators = graph.dominance(&[function.blocks[0].id], &graph.predecessors);
+    for header in merges.keys().copied().collect::<BTreeSet<_>>() {
+        let Merge::Selection { merge } = merges[&header] else {
+            continue;
+        };
+        if dominators.dominates(header, merge) {
+            continue;
+        }
+        let sources: Vec<_> = graph
+            .predecessors
+            .get(&merge)
+            .into_iter()
+            .flatten()
+            .copied()
+            .filter(|source| dominators.dominates(header, *source))
+            .collect();
+        if sources.is_empty() {
+            return Err(emission(
+                "a selection merge has no incoming edge dominated by its header",
+            ));
+        }
+        split_merge(function, merge, &sources);
+        return Ok(true);
+    }
     let mut claims: BTreeMap<BlockId, Vec<BlockId>> = BTreeMap::new();
     for (header, merge) in &merges {
         let block = match merge {
@@ -352,8 +423,6 @@ pub(super) fn split_shared_merges(function: &mut Function) -> Result<bool, Trans
     let Some((merge, headers)) = claims.into_iter().find(|(_, headers)| headers.len() > 1) else {
         return Ok(false);
     };
-    let graph = ControlFlow::new(function);
-    let dominators = graph.dominance(&[function.blocks[0].id], &graph.predecessors);
     // The innermost header is the one every other claimant dominates.
     let inner = headers
         .iter()
@@ -417,19 +486,14 @@ pub(super) fn separate_loop_latches(function: &mut Function) -> Result<bool, Tra
             let [continue_target] = latches.as_slice() else {
                 continue;
             };
-            let body = natural_loop(&graph, block.id, *continue_target);
-            let mut leaving: Vec<_> = body
-                .iter()
-                .flat_map(|member| graph.successors[member].iter().copied())
-                .filter(|successor| !body.contains(successor))
-                .collect();
-            leaving.sort_unstable();
-            leaving.dedup();
-            let exit = match leaving.as_slice() {
-                [merge] => Some(*merge),
-                // A loop with several exits is rejected later, by name; there
-                // is no single merge block here to compare against.
-                _ => None,
+            let Some((body, exit)) = loop_region(
+                &graph,
+                &dominators,
+                &post_dominators,
+                block.id,
+                *continue_target,
+            ) else {
+                continue;
             };
             loops.push((block.id, body, *continue_target, exit));
         }
@@ -438,9 +502,6 @@ pub(super) fn separate_loop_latches(function: &mut Function) -> Result<bool, Tra
         // outer continue target as its merge, which lies outside the outer
         // loop construct.
         for (inner, inner_body, _, exit) in &loops {
-            let Some(exit) = exit else {
-                continue;
-            };
             let enclosing = loops
                 .iter()
                 .filter(|(header, body, ..)| header != inner && body.contains(inner))
@@ -511,6 +572,7 @@ pub(super) fn isolate_loop_merges(function: &mut Function) -> Result<bool, Trans
         let graph = ControlFlow::new(function);
         let entry = function.blocks[0].id;
         let dominators = graph.dominance(&[entry], &graph.predecessors);
+        let post_dominators = graph.post_dominance();
         let mut split = None;
         for block in &function.blocks {
             let latches: Vec<_> = graph
@@ -524,29 +586,27 @@ pub(super) fn isolate_loop_merges(function: &mut Function) -> Result<bool, Trans
             let [continue_target] = latches.as_slice() else {
                 continue;
             };
-            let body = natural_loop(&graph, block.id, *continue_target);
-            let mut leaving: Vec<_> = body
-                .iter()
-                .flat_map(|member| graph.successors[member].iter().copied())
-                .filter(|successor| !body.contains(successor))
-                .collect();
-            leaving.sort_unstable();
-            leaving.dedup();
-            let [merge] = leaving.as_slice() else {
+            let Some((body, merge)) = loop_region(
+                &graph,
+                &dominators,
+                &post_dominators,
+                block.id,
+                *continue_target,
+            ) else {
                 continue;
             };
-            if dominators.dominates(block.id, *merge) {
+            if dominators.dominates(block.id, merge) {
                 continue;
             }
             let inside: Vec<_> = graph
                 .predecessors
-                .get(merge)
+                .get(&merge)
                 .into_iter()
                 .flatten()
                 .copied()
                 .filter(|predecessor| body.contains(predecessor))
                 .collect();
-            split = Some((*merge, inside));
+            split = Some((merge, inside));
             break;
         }
         let Some((merge, inside)) = split else {
@@ -574,6 +634,7 @@ pub(super) fn normalize_loop_headers(function: &mut Function) -> Result<bool, Tr
         let graph = ControlFlow::new(function);
         let entry = function.blocks[0].id;
         let dominators = graph.dominance(&[entry], &graph.predecessors);
+        let post_dominators = graph.post_dominance();
         let mut split = None;
         for block in &function.blocks {
             if !matches!(block.terminator, Terminator::CondBranch { .. }) {
@@ -594,22 +655,20 @@ pub(super) fn normalize_loop_headers(function: &mut Function) -> Result<bool, Tr
             let [continue_target] = latches.as_slice() else {
                 continue;
             };
-            let body = natural_loop(&graph, block.id, *continue_target);
-            let mut leaving: Vec<_> = body
-                .iter()
-                .flat_map(|member| graph.successors[member].iter().copied())
-                .filter(|successor| !body.contains(successor))
-                .collect();
-            leaving.sort_unstable();
-            leaving.dedup();
-            let [merge] = leaving.as_slice() else {
+            let Some((_, merge)) = loop_region(
+                &graph,
+                &dominators,
+                &post_dominators,
+                block.id,
+                *continue_target,
+            ) else {
                 continue;
             };
             // A header which leaves the loop or reaches its latch directly is
             // already the loop's own test and needs no separate block.
             if successors_of(&block.terminator)
                 .iter()
-                .any(|successor| successor == merge || successor == continue_target)
+                .any(|successor| *successor == merge || successor == continue_target)
             {
                 continue;
             }

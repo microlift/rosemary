@@ -234,6 +234,7 @@ impl Emitter {
             | InstructionKind::FloatUnary { .. }
             | InstructionKind::FloatFma { .. }
             | InstructionKind::FloatDot { .. }
+            | InstructionKind::FloatRefract { .. }
             | InstructionKind::FloatClamp { .. }
             | InstructionKind::FloatMix { .. } => {
                 self.emit_arithmetic(function, instruction, values, result_id)
@@ -387,6 +388,7 @@ impl Emitter {
             BarrierScope::Device => rspirv::spirv::Scope::Device,
             BarrierScope::Threadgroup => rspirv::spirv::Scope::Workgroup,
             BarrierScope::Simdgroup => rspirv::spirv::Scope::Subgroup,
+            BarrierScope::Invocation => rspirv::spirv::Scope::Invocation,
         };
         self.constant(&Type::u32(), value as u64)
     }
@@ -628,5 +630,23 @@ fn small_storage_widths(ty: &Type, widths: &mut BTreeSet<u8>) {
             }
         }
         _ => {}
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn work_item_scope_emits_spirv_invocation() {
+        let mut emitter = Emitter::new(&TargetProfile::default());
+        let id = emitter
+            .scope_id(BarrierScope::Invocation)
+            .expect("an invocation scope constant");
+        assert_eq!(
+            emitter.constants.get(&(Type::u32(), 4)),
+            Some(&id),
+            "SPIR-V Scope::Invocation is enumerator 4"
+        );
     }
 }

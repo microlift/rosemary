@@ -1,5 +1,14 @@
 use super::*;
+use std::collections::BTreeMap;
+use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
+
+#[derive(Clone)]
+pub struct EventSignal {
+    pub semaphore: vk::Semaphore,
+    pub value: u64,
+    pub(crate) submitted_value: Option<Arc<AtomicU64>>,
+}
 
 /// One `VkSubmitInfo`: a command buffer, the timeline values it waits for
 /// before it starts, and those it signals once it is done. A Metal command
@@ -7,7 +16,7 @@ use std::sync::atomic::Ordering;
 pub struct Batch {
     pub waits: Vec<(vk::Semaphore, u64)>,
     pub command_buffer: vk::CommandBuffer,
-    pub signals: Vec<(vk::Semaphore, u64)>,
+    pub signals: Vec<EventSignal>,
 }
 
 impl Batch {
@@ -189,9 +198,27 @@ impl Gpu {
             .iter()
             .map(|(_, first, _)| split(&first.waits))
             .collect();
-        let signals: Vec<_> = groups
+        let mut submitted_values: BTreeMap<usize, (&AtomicU64, u64)> = BTreeMap::new();
+        let signals: Vec<(Vec<vk::Semaphore>, Vec<u64>)> = groups
             .iter()
-            .map(|(_, _, last)| split(&last.signals))
+            .map(|(_, _, last)| {
+                last.signals
+                    .iter()
+                    .filter_map(|signal| {
+                        if let Some(state) = &signal.submitted_value {
+                            let (_, maximum) = submitted_values
+                                .entry(Arc::as_ptr(state) as usize)
+                                .or_insert_with(|| (state.as_ref(), state.load(Ordering::Relaxed)));
+                            // IOAccel's default event ignores non-increasing submitted values.
+                            if signal.value <= *maximum {
+                                return None;
+                            }
+                            *maximum = signal.value;
+                        }
+                        Some((signal.semaphore, signal.value))
+                    })
+                    .unzip()
+            })
             .collect();
         let stages: Vec<_> = groups
             .iter()
@@ -240,6 +267,10 @@ impl Gpu {
                 crate::swapchain::record_device_loss(self);
             }
             return Err(format!("vkQueueSubmit failed with {error:?}"));
+        }
+        // Queue serialization keeps this publication in actual submission order.
+        for (_, (state, value)) in submitted_values {
+            state.store(value, Ordering::Relaxed);
         }
         Ok(())
     }

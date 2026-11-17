@@ -117,7 +117,13 @@ pub(super) unsafe extern "C" fn new_sub_encoder(receiver: Id, _sel: Sel) -> Id {
     sub.resolve_mask = inner.resolve_mask;
     sub.depth_resolve = inner.depth_resolve;
     sub.visibility = inner.visibility;
-    record_pass_defaults(&gpu.device, command_buffer, area, &mut sub.depth_bias);
+    record_pass_defaults(
+        &gpu.device,
+        command_buffer,
+        area,
+        &mut sub.depth_bias,
+        &mut sub.viewports,
+    );
     parallel.children.push(child);
     encoder
 }

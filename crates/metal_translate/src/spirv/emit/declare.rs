@@ -271,6 +271,9 @@ impl Emitter {
             }
             StageBinding::Builtin(builtin) => {
                 let builtin = self.spirv_builtin(builtin, stage)?;
+                if stage == Stage::Fragment && builtin == BuiltIn::ViewportIndex {
+                    self.builder.decorate(variable, Decoration::Flat, []);
+                }
                 self.builder.decorate(
                     variable,
                     Decoration::BuiltIn,
@@ -325,6 +328,14 @@ impl Emitter {
             }
             (Builtin::ViewportArrayIndex, _) => {
                 self.capability(Capability::MultiViewport)?;
+                if stage == Stage::Vertex {
+                    if self.spirv_version >= (1, 5) {
+                        self.capability(Capability::ShaderViewportIndex)?;
+                    } else {
+                        self.capability(Capability::ShaderViewportIndexLayerEXT)?;
+                        self.extension("SPV_EXT_shader_viewport_index_layer");
+                    }
+                }
                 BuiltIn::ViewportIndex
             }
             (Builtin::ThreadPositionInGrid, _) => BuiltIn::GlobalInvocationId,

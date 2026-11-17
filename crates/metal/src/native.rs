@@ -3002,6 +3002,8 @@ mod tests {
         let descriptor = object::make(
             c"MTLRenderPipelineDescriptor",
             pipeline::RenderPipelineDescriptor {
+                vertex_buffers: std::ptr::null_mut(),
+                fragment_buffers: std::ptr::null_mut(),
                 vertex_function: objc::arc::retain(vertex),
                 fragment_function: objc::arc::retain(fragment),
                 vertex_descriptor: std::ptr::null_mut(),
@@ -3238,6 +3240,8 @@ mod tests {
         let descriptor = object::make(
             c"MTLRenderPipelineDescriptor",
             pipeline::RenderPipelineDescriptor {
+                vertex_buffers: std::ptr::null_mut(),
+                fragment_buffers: std::ptr::null_mut(),
                 vertex_function: objc::arc::retain(vertex),
                 fragment_function: objc::arc::retain(fragment),
                 vertex_descriptor: vertex_desc,
@@ -3485,6 +3489,8 @@ mod tests {
             let descriptor = object::make(
                 c"MTLRenderPipelineDescriptor",
                 pipeline::RenderPipelineDescriptor {
+                    vertex_buffers: std::ptr::null_mut(),
+                    fragment_buffers: std::ptr::null_mut(),
                     vertex_function: objc::arc::retain(self.vertex),
                     fragment_function: fragment,
                     vertex_descriptor: std::ptr::null_mut(),

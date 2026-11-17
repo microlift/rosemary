@@ -187,7 +187,7 @@ pub(super) unsafe extern "C" fn copy_buffer_to_texture_options(
     let (from, to) = unsafe {
         (
             object::body::<Buffer>(source),
-            object::body::<Texture>(destination),
+            object::body_ref::<Texture>(destination),
         )
     };
     if to.is_texture_buffer() {
@@ -310,7 +310,7 @@ pub(super) unsafe extern "C" fn copy_texture_to_buffer_options(
     // SAFETY: only resources of this crate's reach a blit encoder.
     let (from, to) = unsafe {
         (
-            object::body::<Texture>(source),
+            object::body_ref::<Texture>(source),
             object::body::<Buffer>(destination),
         )
     };
@@ -401,8 +401,8 @@ pub(super) unsafe extern "C" fn copy_texture_to_texture(
     // SAFETY: only textures of this crate's reach a blit encoder.
     let (from, to) = unsafe {
         (
-            object::body::<Texture>(source),
-            object::body::<Texture>(destination),
+            object::body_ref::<Texture>(source),
+            object::body_ref::<Texture>(destination),
         )
     };
     if from.is_texture_buffer() || to.is_texture_buffer() {
@@ -490,7 +490,7 @@ pub(super) unsafe extern "C" fn generate_mipmaps(receiver: Id, _sel: Sel, textur
     let encoder = unsafe { object::body::<Encoder>(receiver) };
     let command = encoder.command();
     // SAFETY: only a texture of this crate's reaches a blit encoder.
-    let image = unsafe { object::body::<Texture>(texture) };
+    let image = unsafe { object::body_ref::<Texture>(texture) };
     if image.is_texture_buffer() {
         return gpu::trace("generateMipmapsForTexture: of a texture buffer, which has no image");
     }

@@ -88,6 +88,22 @@ pub fn adapters() -> Result<&'static [Adapter], &'static str> {
     }
 }
 
+/// A second logical device over the first test adapter, for cross-device
+/// ownership tests. Leaked because every production GPU is process-lifetime.
+#[cfg(test)]
+pub fn duplicate_first_gpu() -> Option<&'static Gpu> {
+    let state = STATE.get_or_init(initialize).as_ref().ok()?;
+    let adapter = state.adapters.first()?;
+    Gpu::create(
+        &state.entry,
+        &state.instance,
+        vk::PhysicalDevice::from_raw(adapter.handle as u64),
+        &adapter.target,
+    )
+    .ok()
+    .map(|gpu| &*Box::leak(Box::new(gpu)))
+}
+
 fn initialize() -> Result<State, String> {
     let (entry, library) = load_entry()?;
     // A loader predating Vulkan 1.1 returns `None`; this runtime's descriptor
@@ -482,7 +498,9 @@ fn query_target(
         let mut properties = vk::PhysicalDeviceProperties2::default().push_next(&mut driver);
         // SAFETY: driver properties are core in Vulkan 1.2; the chain lives here.
         unsafe { instance.get_physical_device_properties2(physical, &mut properties) };
-        target.fmix_is_metal_mix = driver.driver_id == vk::DriverId::MOLTENVK && std::env::var_os("ROSEMARY_METAL_ALWAYS_EMULATE_FMIX").is_none();
+        target.fmix_is_metal_mix = driver.driver_id == vk::DriverId::MOLTENVK
+            && std::env::var_os("ROSEMARY_METAL_ALWAYS_EMULATE_FMIX").is_none();
+        target.shader_output_viewport_index = v12.shader_output_viewport_index == vk::TRUE;
     } else {
         let mut storage16 = vk::PhysicalDevice16BitStorageFeatures::default();
         let mut pointers = vk::PhysicalDeviceVariablePointersFeatures::default();
@@ -503,6 +521,8 @@ fn query_target(
         target.variable_pointers = pointers.variable_pointers == vk::TRUE;
         target.shader_draw_parameters = draw.shader_draw_parameters == vk::TRUE;
 
+        target.shader_output_viewport_index =
+            has_extension(extensions, ash::ext::shader_viewport_index_layer::NAME);
         if has_extension(extensions, ash::khr::_8bit_storage::NAME) {
             let mut storage8 = vk::PhysicalDevice8BitStorageFeatures::default();
             let mut features = vk::PhysicalDeviceFeatures2::default().push_next(&mut storage8);
@@ -568,6 +588,7 @@ fn target_profile(version: (u8, u8)) -> metal_translate::TargetProfile {
         sample_rate_shading: false,
         geometry_shader: false,
         multi_viewport: false,
+        shader_output_viewport_index: false,
         demote_to_helper_invocation: false,
         group_non_uniform: false,
         image_1d: true,

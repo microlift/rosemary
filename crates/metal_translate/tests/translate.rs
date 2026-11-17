@@ -8,7 +8,7 @@ use metal_translate::{
     AirInput, Phase, TargetProfile, emit_spirv, metallib_air, parse_air, parse_msl, translate,
     translate_msl,
 };
-use rspirv::spirv::{Op, Scope};
+use rspirv::spirv::{MemorySemantics, Op, Scope};
 
 const STORE: &str = include_str!("fixtures/kernel_store_const.ll");
 const COPY: &str = include_str!("fixtures/kernel_copy_word.ll");
@@ -908,6 +908,58 @@ fn source_msl_threadgroup_atomics_reach_workgroup_and_buffer_memory() {
     assert_eq!(body_instructions(&module, Op::AtomicSMax).len(), 1);
 }
 
+#[test]
+fn source_atomic_memory_orders_reach_spirv_unchanged() {
+    let memory = MemorySemantics::UNIFORM_MEMORY.bits();
+    for (name, ordering) in [
+        ("relaxed", 0),
+        ("acquire", MemorySemantics::ACQUIRE.bits() | memory),
+        ("release", MemorySemantics::RELEASE.bits() | memory),
+        ("acq_rel", MemorySemantics::ACQUIRE_RELEASE.bits() | memory),
+    ] {
+        let source = format!(
+            "#include <metal_stdlib>\nusing namespace metal;
+             kernel void ordered(device uint *value [[buffer(0)]]) {{
+                 atomic_fetch_add_explicit(
+                     reinterpret_cast<device atomic_uint *>(&value[0]), 1,
+                     memory_order::memory_order_{name});
+             }}"
+        );
+        let library = translate_msl(&source, &TargetProfile::vulkan_1_3()).unwrap();
+        let module = rspirv::dr::load_words(&library.entries[0].words).unwrap();
+        let atomics = body_instructions(&module, Op::AtomicIAdd);
+        let atomic = &atomics[0];
+        let semantics = atomic.operands[2]
+            .id_ref_any()
+            .and_then(|id| {
+                module
+                    .types_global_values
+                    .iter()
+                    .find(|instruction| instruction.result_id == Some(id))
+            })
+            .and_then(|instruction| instruction.operands.first())
+            .and_then(|operand| match operand {
+                rspirv::dr::Operand::LiteralBit32(value) => Some(*value),
+                _ => None,
+            })
+            .expect("constant memory semantics");
+        assert_eq!(semantics, ordering, "{name}");
+    }
+    let sequential = "#include <metal_stdlib>
+        using namespace metal;
+        kernel void ordered(device uint *value [[buffer(0)]]) {
+            atomic_fetch_add_explicit(
+                reinterpret_cast<device atomic_uint *>(&value[0]), 1,
+                memory_order::memory_order_seq_cst);
+        }";
+    assert!(
+        translate_msl(sequential, &TargetProfile::vulkan_1_3())
+            .unwrap_err()
+            .to_string()
+            .contains("single total order")
+    );
+}
+
 fn workgroup_variables(words: &[u32]) -> usize {
     let module = rspirv::dr::load_words(words).unwrap();
     module
@@ -1169,6 +1221,41 @@ fn source_msl_a_half_texture_computes_at_half_precision() {
     );
 }
 
+/// A target without native half arithmetic still rounds each half producer,
+/// rather than keeping an accumulating float result. The fallback is integer
+/// IEEE-754 conversion so its tie and subnormal behavior is driver-independent.
+#[test]
+fn source_msl_a_half_texture_rounds_in_software_without_shader_float16() {
+    let source = "#include <metal_stdlib>\n\
+        using namespace metal;\n\
+        struct Varyings { float4 pos [[position]]; float2 uv; };\n\
+        fragment half4 shade(Varyings input [[stage_in]],\n\
+            texture2d<half, access::sample> tex [[ texture(0) ]],\n\
+            sampler s [[ sampler(0) ]])\n\
+        {\n\
+            return tex.sample(s, input.uv) * 3.0h;\n\
+        }\0";
+    let library = translate_msl(source, &TargetProfile::vulkan_1_3()).unwrap();
+    let module = rspirv::dr::load_words(&library.entries[0].words).unwrap();
+    assert_eq!(image_sampled_width(&module), Some(32));
+    let [multiply] = &body_instructions(&module, Op::FMul)[..] else {
+        panic!("expected one multiply");
+    };
+    assert_eq!(
+        scalar_width(&module, multiply.result_type.unwrap()),
+        Some(32)
+    );
+    assert!(
+        body_instructions(&module, Op::Bitcast).iter().any(|cast| {
+            cast.operands
+                .first()
+                .and_then(|operand| operand.id_ref_any())
+                == multiply.result_id
+        }),
+        "the widened multiply must enter the software half quantizer"
+    );
+}
+
 /// A `ushort` texture reads and writes 32-bit texels and computes with
 /// 16-bit ones, so an addition wraps as Metal's does.
 #[test]
@@ -1201,8 +1288,8 @@ fn source_msl_a_short_texture_computes_at_short_width() {
     assert_eq!(scalar_width(&module, widen.result_type.unwrap()), Some(32));
 }
 
-/// Without `shaderInt16` a `ushort` texture's texels are computed as `uint`
-/// rather than rejected.
+/// Without `shaderInt16` a `ushort` texture's texels are computed as `uint`,
+/// but every 16-bit result still wraps before its next use.
 #[test]
 fn source_msl_a_short_texture_widens_without_shader_int16() {
     let target = TargetProfile {
@@ -1216,6 +1303,16 @@ fn source_msl_a_short_texture_widens_without_shader_int16() {
         panic!("expected one addition");
     };
     assert_eq!(scalar_width(&module, add.result_type.unwrap()), Some(32));
+    let [write] = &body_instructions(&module, Op::ImageWrite)[..] else {
+        panic!("expected one write");
+    };
+    let written = write.operands[2].unwrap_id_ref();
+    assert!(
+        body_instructions(&module, Op::BitwiseAnd)
+            .iter()
+            .any(|wrap| wrap.result_id == Some(written)),
+        "the widened addition must wrap to ushort before the write"
+    );
     assert!(body_instructions(&module, Op::UConvert).is_empty());
 }
 
@@ -1226,6 +1323,201 @@ const SHORT_TEXTURE_KERNEL: &str = "#include <metal_stdlib>\n\
     {\n\
         counts.write(counts.read(gid) + ushort4(1), gid);\n\
     }\0";
+
+/// A signed 16-bit add has the same low-bit modulo result as an unsigned one,
+/// but a signed image needs it sign-extended: Vulkan leaves an integer the
+/// format cannot represent, such as 65535 for R16_SINT, undefined.
+#[test]
+fn source_msl_a_signed_short_texture_wraps_without_shader_int16() {
+    let source = "#include <metal_stdlib>\n\
+        using namespace metal;\n\
+        kernel void add(texture2d<short, access::read_write> counts [[ texture(0) ]],\n\
+            uint2 gid [[ thread_position_in_grid ]])\n\
+        {\n\
+            counts.write(counts.read(gid) + short4(1), gid);\n\
+        }\0";
+    let target = TargetProfile {
+        shader_storage_image_read_without_format: true,
+        shader_storage_image_write_without_format: true,
+        ..TargetProfile::vulkan_1_3()
+    };
+    let library = translate_msl(source, &target).unwrap();
+    let module = rspirv::dr::load_words(&library.entries[0].words).unwrap();
+    assert_eq!(image_sampled_width(&module), Some(32));
+    let [write] = &body_instructions(&module, Op::ImageWrite)[..] else {
+        panic!("expected one write");
+    };
+    let written = write.operands[2].unwrap_id_ref();
+    let retyped = body_instructions(&module, Op::Bitcast)
+        .into_iter()
+        .find(|bitcast| bitcast.result_id == Some(written))
+        .expect("a signed image retypes the signless wrapped value");
+    let producer = |op: Op, id: u32| {
+        body_instructions(&module, op)
+            .into_iter()
+            .find(|instruction| instruction.result_id == Some(id))
+    };
+    let extended = producer(
+        Op::ShiftRightArithmetic,
+        retyped.operands[0].unwrap_id_ref(),
+    )
+    .expect("the write sign-extends the canonical low bits");
+    let shifted = producer(Op::ShiftLeftLogical, extended.operands[0].unwrap_id_ref())
+        .expect("sign extension shifts the low bits up first");
+    assert!(
+        producer(Op::BitwiseAnd, shifted.operands[0].unwrap_id_ref()).is_some(),
+        "the widened signed addition must wrap before the write"
+    );
+}
+
+/// A widened short holds its low 16 bits, so a negative short constant must
+/// too: -1 compares equal to a short read back as 0xFFFF, not to 0xFFFFFFFF.
+#[test]
+fn a_negative_short_constant_widens_to_its_low_sixteen_bits() {
+    let short = Type::Int {
+        bits: 16,
+        signed: true,
+    };
+    let element = Type::Pointer {
+        space: AddressSpace::Device,
+        pointee: Box::new(Type::u32()),
+    };
+    let module = buffer_kernel(
+        vec![
+            element,
+            Type::u32(),
+            Type::i32(),
+            short.clone(),
+            Type::Bool,
+            Type::u32(),
+        ],
+        vec![
+            Instruction {
+                result: Some(ValueId(1)),
+                kind: InstructionKind::BufferAddress {
+                    pointer: Operand::Value(ValueId(0)),
+                    indices: vec![Operand::u32(0), Operand::u32(0)],
+                },
+            },
+            Instruction {
+                result: Some(ValueId(2)),
+                kind: InstructionKind::Load {
+                    pointer: Operand::Value(ValueId(1)),
+                },
+            },
+            Instruction {
+                result: Some(ValueId(3)),
+                kind: InstructionKind::Convert {
+                    op: ConvertOp::Bitcast,
+                    value: Operand::Value(ValueId(2)),
+                },
+            },
+            Instruction {
+                result: Some(ValueId(4)),
+                kind: InstructionKind::Convert {
+                    op: ConvertOp::IntegerTruncate,
+                    value: Operand::Value(ValueId(3)),
+                },
+            },
+            Instruction {
+                result: Some(ValueId(5)),
+                kind: InstructionKind::IntegerCompare {
+                    predicate: metal_translate::ir::IntegerPredicate::Equal,
+                    lhs: Operand::Value(ValueId(4)),
+                    rhs: Operand::Integer {
+                        ty: short,
+                        value: u64::from(u16::MAX),
+                    },
+                },
+            },
+            Instruction {
+                result: Some(ValueId(6)),
+                kind: InstructionKind::Select {
+                    condition: Operand::Value(ValueId(5)),
+                    on_true: Operand::u32(1),
+                    on_false: Operand::u32(0),
+                },
+            },
+            Instruction {
+                result: None,
+                kind: InstructionKind::Store {
+                    pointer: Operand::Value(ValueId(1)),
+                    value: Operand::Value(ValueId(6)),
+                },
+            },
+        ],
+    );
+    module.verify().unwrap();
+    let artifact = emit_spirv(&module, &TargetProfile::vulkan_1_3())
+        .unwrap()
+        .entries
+        .remove(0);
+    let parsed = rspirv::dr::load_words(&artifact.words).unwrap();
+    let [compare] = &body_instructions(&parsed, Op::IEqual)[..] else {
+        panic!("expected one comparison");
+    };
+    let constant = compare.operands[1].unwrap_id_ref();
+    let value = parsed
+        .types_global_values
+        .iter()
+        .find(|instruction| instruction.result_id == Some(constant))
+        .map(|instruction| instruction.operands[0].unwrap_literal_bit32());
+    assert_eq!(value, Some(0xffff));
+}
+
+/// A signed consumer must reinterpret the canonical low 16 bits before doing
+/// 32-bit arithmetic. Otherwise -32768 would be divided as +32768.
+#[test]
+fn source_msl_a_signed_short_divide_sign_extends_its_operands() {
+    let source = "#include <metal_stdlib>\n\
+        using namespace metal;\n\
+        kernel void divide(texture2d<short, access::read_write> counts [[ texture(0) ]],\n\
+            uint2 gid [[ thread_position_in_grid ]])\n\
+        {\n\
+            counts.write(counts.read(gid) / short4(-2), gid);\n\
+        }\0";
+    let target = TargetProfile {
+        shader_storage_image_read_without_format: true,
+        shader_storage_image_write_without_format: true,
+        ..TargetProfile::vulkan_1_3()
+    };
+    let library = translate_msl(source, &target).unwrap();
+    let module = rspirv::dr::load_words(&library.entries[0].words).unwrap();
+    let [divide] = &body_instructions(&module, Op::SDiv)[..] else {
+        panic!("expected one signed divide");
+    };
+    let extended: Vec<_> = body_instructions(&module, Op::ShiftRightArithmetic)
+        .into_iter()
+        .filter_map(|instruction| instruction.result_id)
+        .collect();
+    assert!(extended.contains(&divide.operands[0].unwrap_id_ref()));
+    assert!(extended.contains(&divide.operands[1].unwrap_id_ref()));
+}
+
+#[test]
+fn source_msl_a_signed_short_to_float_sign_extends_before_conversion() {
+    let source = "#include <metal_stdlib>\n\
+        using namespace metal;\n\
+        kernel void convert(texture2d<short, access::read> counts [[ texture(0) ]],\n\
+            device float4* output [[ buffer(0) ]], uint2 gid [[ thread_position_in_grid ]])\n\
+        {\n\
+            output[0] = float4(counts.read(gid));\n\
+        }\0";
+    let target = TargetProfile {
+        shader_storage_image_read_without_format: true,
+        ..TargetProfile::vulkan_1_3()
+    };
+    let library = translate_msl(source, &target).unwrap();
+    let module = rspirv::dr::load_words(&library.entries[0].words).unwrap();
+    let [convert] = &body_instructions(&module, Op::ConvertSToF)[..] else {
+        panic!("expected one signed conversion");
+    };
+    let extended: Vec<_> = body_instructions(&module, Op::ShiftRightArithmetic)
+        .into_iter()
+        .filter_map(|instruction| instruction.result_id)
+        .collect();
+    assert!(extended.contains(&convert.operands[0].unwrap_id_ref()));
+}
 
 #[test]
 fn source_msl_loops_leave_through_one_block() {
@@ -2152,6 +2444,51 @@ fn threadgroup_barrier_becomes_a_control_barrier() {
     };
     assert_eq!(scope(&barrier.operands[0]), Scope::Workgroup as u32);
     assert_eq!(scope(&barrier.operands[1]), Scope::Workgroup as u32);
+}
+
+#[test]
+fn work_item_memory_scope_becomes_spirv_invocation() {
+    let module = buffer_kernel(
+        Vec::new(),
+        vec![Instruction {
+            result: None,
+            kind: InstructionKind::Barrier {
+                scope: BarrierScope::Invocation,
+                memory: BarrierMemory {
+                    threadgroup: true,
+                    ..BarrierMemory::default()
+                },
+            },
+        }],
+    );
+    module.verify().unwrap();
+    let artifact = emit_spirv(&module, &TargetProfile::vulkan_1_3())
+        .unwrap()
+        .entries
+        .remove(0);
+    let parsed = rspirv::dr::load_words(&artifact.words).unwrap();
+    let barrier = parsed.functions[0].blocks[0]
+        .instructions
+        .iter()
+        .find(|instruction| instruction.class.opcode == Op::ControlBarrier)
+        .expect("a control barrier");
+    let scope = |operand: &rspirv::dr::Operand| {
+        let id = operand.id_ref_any().expect("a scope operand");
+        parsed
+            .types_global_values
+            .iter()
+            .find(|instruction| instruction.result_id == Some(id))
+            .and_then(|instruction| instruction.operands.first())
+            .and_then(|operand| match operand {
+                rspirv::dr::Operand::LiteralBit32(value) => Some(*value),
+                _ => None,
+            })
+            .expect("a constant scope")
+    };
+    assert_eq!(scope(&barrier.operands[0]), Scope::Workgroup as u32);
+    assert_eq!(scope(&barrier.operands[1]), Scope::Invocation as u32);
+    // Vulkan allows no memory semantics on the Invocation scope.
+    assert_eq!(scope(&barrier.operands[2]), 0);
 }
 
 #[test]

@@ -8,7 +8,7 @@ mod preprocess;
 mod types;
 mod validate;
 
-pub(crate) use validate::reject_undefined_constants;
+pub(crate) use validate::{function_constant_dependencies, reject_undefined_entries};
 
 use std::collections::HashMap;
 

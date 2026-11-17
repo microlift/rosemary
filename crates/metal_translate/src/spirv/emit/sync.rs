@@ -60,7 +60,11 @@ impl Emitter {
                 let memory_scope = self.scope_id(*scope)?;
                 // Metal's barrier orders the memory its flags name; SPIR-V
                 // spells that as memory semantics against a memory scope.
+                // A thread-scope barrier orders memory only against the
+                // invocation itself, which program order already does; Vulkan
+                // requires no semantics on the Invocation scope.
                 let semantics = match memory_semantics(*memory) {
+                    _ if *scope == BarrierScope::Invocation => 0,
                     0 => 0,
                     bits => bits | MemorySemantics::ACQUIRE_RELEASE.bits(),
                 };
@@ -92,10 +96,27 @@ impl Emitter {
                     Some(Type::Pointer { space, .. }) => space,
                     _ => return Err(emission("atomic operand is not a pointer")),
                 };
-                let semantics = match order {
+                let ordering = match order {
+                    // As for a barrier, Vulkan requires no semantics on the
+                    // Invocation scope, where ordering is program order.
+                    _ if *scope == BarrierScope::Invocation => 0,
                     MemoryOrder::Relaxed => 0,
+                    MemoryOrder::Acquire => MemorySemantics::ACQUIRE.bits(),
+                    MemoryOrder::Release => MemorySemantics::RELEASE.bits(),
+                    MemoryOrder::AcquireRelease => MemorySemantics::ACQUIRE_RELEASE.bits(),
+                    // Vulkan executes SequentiallyConsistent as AcquireRelease,
+                    // so the single total order Metal promises is lost.
                     MemoryOrder::SequentiallyConsistent => {
-                        MemorySemantics::SEQUENTIALLY_CONSISTENT.bits()
+                        return Err(emission(
+                            "Metal sequentially-consistent atomics need a single total order, \
+                             which Vulkan's acquire-release execution of them does not give",
+                        ));
+                    }
+                };
+                let semantics = match ordering {
+                    0 => 0,
+                    ordering => {
+                        ordering
                             | match space {
                                 AddressSpace::Threadgroup => {
                                     MemorySemantics::WORKGROUP_MEMORY.bits()
