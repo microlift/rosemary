@@ -47,9 +47,6 @@ const NAP: Duration = Duration::from_millis(2);
 /// this is short: a guest that is busy must not hold the others' pointer.
 const PROBE_PATIENCE: Duration = Duration::from_millis(500);
 
-/// What a guest may leave unread before it is taken for dead.
-const MAX_BACKLOG: usize = 8 << 20;
-
 pub struct Options {
     /// Where the desktop listens: its prefix's rendezvous directory.
     pub directory: PathBuf,
@@ -70,7 +67,10 @@ type PeerId = u32;
 struct Peer {
     stream: UnixStream,
     unread: Vec<u8>,
+    /// Bytes on their way, and the messages behind them, which are encoded
+    /// once those have gone and can still be merged until then.
     unsent: Vec<u8>,
+    queue: VecDeque<Message>,
     greeted: bool,
     /// The cursors it defined, by its own numbers.
     cursors: HashMap<u32, usize>,
@@ -79,24 +79,146 @@ struct Peer {
     gone: bool,
 }
 
+/// What a newer message of the same slot makes stale: a state of which only
+/// the latest matters, or motion whose steps add up.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Slot {
+    Desktop,
+    Modifiers,
+    Window(WindowId),
+    Moved(WindowId),
+    Resized(WindowId),
+    Backing(WindowId),
+    Display(WindowId),
+    Motion(WindowId, u32),
+}
+
+fn slot(message: &Message) -> Option<Slot> {
+    Some(match message {
+        Message::Desktop { .. } => Slot::Desktop,
+        Message::Modifiers { .. } => Slot::Modifiers,
+        Message::Window { window, .. } => Slot::Window(*window),
+        Message::Event { event } => match *event {
+            Event::WindowMoved { window } => Slot::Moved(window),
+            Event::WindowResized { window, .. } => Slot::Resized(window),
+            Event::WindowBackingChanged { window } => Slot::Backing(window),
+            Event::WindowDisplayChanged { window } => Slot::Display(window),
+            Event::MouseMotion {
+                window, buttons, ..
+            } => Slot::Motion(window, buttons),
+            _ => return None,
+        },
+        _ => return None,
+    })
+}
+
+/// Fold `newer` into `older`, of the same slot.
+fn merge(older: &mut Message, newer: &Message) {
+    match (older, newer) {
+        (
+            Message::Event {
+                event: Event::MouseMotion { x, y, dx, dy, .. },
+            },
+            Message::Event {
+                event:
+                    Event::MouseMotion {
+                        x: to_x,
+                        y: to_y,
+                        dx: by_x,
+                        dy: by_y,
+                        ..
+                    },
+            },
+        ) => {
+            (*x, *y) = (*to_x, *to_y);
+            *dx += by_x;
+            *dy += by_y;
+        }
+        (older, newer) => *older = newer.clone(),
+    }
+}
+
 impl Peer {
+    fn new(stream: UnixStream) -> Peer {
+        Peer {
+            stream,
+            unread: Vec::new(),
+            unsent: Vec::new(),
+            queue: VecDeque::new(),
+            greeted: false,
+            cursors: HashMap::new(),
+            cursor: CursorChoice::Standard,
+            cursor_hidden: false,
+            gone: false,
+        }
+    }
+
+    /// Queue `message`. A guest too busy to read has what it is owed
+    /// merged, as a Mac's window server merges an unresponsive program's
+    /// motion, rather than piled up: back to the last message that has to
+    /// arrive as itself, one per slot.
     fn post(&mut self, message: &Message) {
-        if protocol::put_frame(&mut self.unsent, message).is_ok() {
+        if !self.unsent.is_empty()
+            && let Some(wanted) = slot(message)
+            && let Some(older) = self
+                .queue
+                .iter_mut()
+                .rev()
+                .map_while(|queued| slot(queued).map(|found| (found, queued)))
+                .find_map(|(found, queued)| (found == wanted).then_some(queued))
+        {
+            merge(older, message);
             return;
         }
-        // Only a reply carries something of unbounded size, the clipboard,
-        // and the guest is waiting on it: it is told why it gets none.
-        let refusal = Message::Reply {
-            reply: Reply::Refused {
-                why: "the answer is too large to send".into(),
-            },
-        };
-        match message {
-            Message::Reply { .. } => {
-                let _ = protocol::put_frame(&mut self.unsent, &refusal);
+        self.queue.push_back(message.clone());
+    }
+
+    /// Encode what is queued behind the bytes already sent.
+    fn encode(&mut self) {
+        for message in std::mem::take(&mut self.queue) {
+            if protocol::put_frame(&mut self.unsent, &message).is_ok() {
+                continue;
             }
-            _ => eprintln!("rosemary desktop: a message too large to send was dropped"),
+            // Only a reply carries something of unbounded size, the
+            // clipboard, and the guest is waiting on it: it is told why it
+            // gets none.
+            let refusal = Message::Reply {
+                reply: Reply::Refused {
+                    why: "the answer is too large to send".into(),
+                },
+            };
+            match message {
+                Message::Reply { .. } => {
+                    let _ = protocol::put_frame(&mut self.unsent, &refusal);
+                }
+                _ => eprintln!("rosemary desktop: a message too large to send was dropped"),
+            }
         }
+    }
+
+    /// Write what the guest is owed, as far as it will take it now.
+    fn flush(&mut self) {
+        while !self.gone {
+            if self.unsent.is_empty() {
+                if self.queue.is_empty() {
+                    return;
+                }
+                self.encode();
+            }
+            match self.stream.write(&self.unsent) {
+                Ok(0) => self.gone = true,
+                Ok(written) => {
+                    self.unsent.drain(..written);
+                }
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => return,
+                Err(_) => self.gone = true,
+            }
+        }
+    }
+
+    fn owes(&self) -> bool {
+        !self.unsent.is_empty() || !self.queue.is_empty()
     }
 }
 
@@ -323,9 +445,9 @@ impl Host {
             revents: 0,
         }];
         for peer in self.peers.values() {
-            let writing = match peer.unsent.is_empty() {
-                true => 0,
-                false => libc::POLLOUT,
+            let writing = match peer.owes() {
+                true => libc::POLLOUT,
+                false => 0,
             };
             fds.push(libc::pollfd {
                 fd: peer.stream.as_raw_fd(),
@@ -354,19 +476,7 @@ impl Host {
                 continue;
             }
             self.last_peer += 1;
-            self.peers.insert(
-                self.last_peer,
-                Peer {
-                    stream,
-                    unread: Vec::new(),
-                    unsent: Vec::new(),
-                    greeted: false,
-                    cursors: HashMap::new(),
-                    cursor: CursorChoice::Standard,
-                    cursor_hidden: false,
-                    gone: false,
-                },
-            );
+            self.peers.insert(self.last_peer, Peer::new(stream));
         }
     }
 
@@ -427,20 +537,7 @@ impl Host {
     /// Write what the guests are owed, as far as each will take it now.
     fn flush(&mut self) {
         for peer in self.peers.values_mut() {
-            while !peer.unsent.is_empty() && !peer.gone {
-                match peer.stream.write(&peer.unsent) {
-                    Ok(0) => peer.gone = true,
-                    Ok(written) => {
-                        peer.unsent.drain(..written);
-                    }
-                    Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
-                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
-                    Err(_) => peer.gone = true,
-                }
-            }
-            if peer.unsent.len() > MAX_BACKLOG {
-                peer.gone = true;
-            }
+            peer.flush();
         }
     }
 
@@ -1303,5 +1400,81 @@ impl Host {
             true
         });
         self.drawn_size = size;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn motion(dx: f32) -> Message {
+        Message::Event {
+            event: Event::MouseMotion {
+                window: 1,
+                x: 0.0,
+                y: 0.0,
+                dx,
+                dy: 0.0,
+                buttons: 0,
+            },
+        }
+    }
+
+    #[test]
+    fn a_guest_that_stops_reading_has_its_motion_merged_and_stays() {
+        let (ours, theirs) = UnixStream::pair().unwrap();
+        ours.set_nonblocking(true).unwrap();
+        let mut peer = Peer::new(ours);
+        const MOVES: usize = 1 << 20;
+        for _ in 0..MOVES {
+            peer.post(&motion(1.0));
+            peer.flush();
+        }
+        assert!(!peer.gone);
+        assert_eq!(peer.queue.len(), 1);
+
+        theirs.set_nonblocking(true).unwrap();
+        let mut unread = Vec::new();
+        let mut moved = 0.0;
+        loop {
+            peer.flush();
+            let mut chunk = [0u8; 4096];
+            match (&theirs).read(&mut chunk) {
+                Ok(read) => unread.extend_from_slice(&chunk[..read]),
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock && !peer.owes() => break,
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {}
+                Err(e) => panic!("{e}"),
+            }
+            while let Some(frame) = protocol::take_frame(&mut unread).unwrap() {
+                match codec::decode::<Message>(&frame).unwrap() {
+                    Message::Event {
+                        event: Event::MouseMotion { dx, .. },
+                    } => moved += dx,
+                    other => panic!("{other:?}"),
+                }
+            }
+        }
+        assert_eq!(moved, MOVES as f32);
+    }
+
+    #[test]
+    fn a_press_between_motions_keeps_them_apart() {
+        let (ours, _theirs) = UnixStream::pair().unwrap();
+        let mut peer = Peer::new(ours);
+        peer.unsent.push(0);
+        let press = Message::Event {
+            event: Event::MouseButton {
+                window: 1,
+                button: 1,
+                down: true,
+                clicks: 1,
+                x: 0.0,
+                y: 0.0,
+            },
+        };
+        for message in [motion(1.0), press.clone(), motion(2.0), motion(3.0)] {
+            peer.post(&message);
+        }
+        assert_eq!(Vec::from(peer.queue), [motion(1.0), press, motion(5.0)]);
     }
 }
