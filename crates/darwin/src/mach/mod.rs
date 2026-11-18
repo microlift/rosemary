@@ -61,16 +61,17 @@ pub unsafe extern "C" fn wait_until(deadline: u64) -> i32 {
     }
 }
 
+/// The host clock `mach_continuous_time` reads: `CLOCK_BOOTTIME` where there
+/// is one; `CLOCK_MONOTONIC` otherwise, which differs only across a suspend
+/// and is the closer of the two answers available.
+#[cfg(target_os = "linux")]
+pub(crate) const CONTINUOUS_CLOCK: libc::clockid_t = libc::CLOCK_BOOTTIME;
+#[cfg(not(target_os = "linux"))]
+pub(crate) const CONTINUOUS_CLOCK: libc::clockid_t = libc::CLOCK_MONOTONIC;
+
 /// Ticks including time the machine spent asleep.
-///
-/// `CLOCK_BOOTTIME` where there is one; `CLOCK_MONOTONIC` otherwise, which
-/// differs only across a suspend and is the closer of the two answers available.
 unsafe extern "C" fn continuous_time() -> u64 {
-    #[cfg(target_os = "linux")]
-    let clock = libc::CLOCK_BOOTTIME;
-    #[cfg(not(target_os = "linux"))]
-    let clock = libc::CLOCK_MONOTONIC;
-    nanoseconds(clock)
+    nanoseconds(CONTINUOUS_CLOCK)
 }
 
 /// `kern_return_t mach_timebase_info(mach_timebase_info_t)`.

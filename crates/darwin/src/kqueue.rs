@@ -11,11 +11,11 @@ use static_init::dynamic;
 use crate::mach::space::{self, Name};
 use crate::mach::wire::Receiver;
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "freebsd"))]
 mod sources;
-/// Only Linux has the host objects these filters are built on, so elsewhere
-/// they stay refused.
-#[cfg(not(target_os = "linux"))]
+/// Only Linux and FreeBSD have the host objects these filters are built on,
+/// so elsewhere they stay refused.
+#[cfg(not(any(target_os = "linux", target_os = "freebsd")))]
 mod sources {
     use super::Kevent;
     use std::ffi::c_int;
@@ -73,13 +73,13 @@ const HOST_WAIT_BATCH: usize = 1024;
 
 const EVFILT_READ: i16 = -1;
 const EVFILT_WRITE: i16 = -2;
-/// Answered by `sources`, which only a Linux host has.
-#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+/// Answered by `sources`, which only Linux and FreeBSD hosts have.
+#[cfg_attr(not(any(target_os = "linux", target_os = "freebsd")), allow(dead_code))]
 const EVFILT_VNODE: i16 = -4;
-#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+#[cfg_attr(not(any(target_os = "linux", target_os = "freebsd")), allow(dead_code))]
 const EVFILT_PROC: i16 = -5;
 const EVFILT_SIGNAL: i16 = -6;
-#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+#[cfg_attr(not(any(target_os = "linux", target_os = "freebsd")), allow(dead_code))]
 const EVFILT_TIMER: i16 = -7;
 const EVFILT_MACHPORT: i16 = -8;
 const EVFILT_USER: i16 = -10;
