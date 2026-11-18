@@ -349,6 +349,7 @@ fn bootstrap() {
             "supportsFeatureSet:" => device_supports_feature_set, c"B24@0:8Q16";
             "supportsTextureSampleCount:" => device_supports_texture_sample_count, c"B24@0:8Q16";
             "argumentBuffersSupport" => device_argument_buffers_support, c"Q16@0:8";
+            "currentAllocatedSize" => current_allocated_size, c"Q16@0:8";
             "isDepth24Stencil8PixelFormatSupported" => device_depth24_stencil8_supported, c"B16@0:8";
             "newCommandQueue" => new_queue, c"@16@0:8";
             "newCommandQueueWithMaxCommandBufferCount:" => new_queue_with_count, c"@24@0:8Q16";
@@ -629,6 +630,17 @@ unsafe extern "C" fn device_headless(receiver: Id, _sel: Sel) -> bool {
         )
     }
 }
+
+unsafe extern "C" fn currentAllocatedSize(receiver: Id, _sel: Sel) -> u64 {
+    let _pool = HostPool::new();
+    unsafe {
+        host_send_u64(
+            object::body::<NativeDevice>(receiver).host,
+            sel(c"currentAllocatedSize"),
+        )
+    }
+}
+
 /// The deprecated MTLFeatureSet check is still used by older Metal clients
 /// such as Roblox. Ask the host driver directly; it may report a different
 /// capability set on each supported device generation.
