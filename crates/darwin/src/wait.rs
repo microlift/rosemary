@@ -257,6 +257,7 @@ mod tests {
         // Killed by the host's SIGUSR1, Darwin's 30, with a core.
         assert_eq!(status_to_darwin(libc::SIGUSR1 | 0x80), 30 | 0x80);
         // Continued, which each host spells its own way.
+        #[cfg(any(target_os = "linux", target_os = "freebsd"))]
         assert_eq!(status_to_darwin(HOST_CONTINUED), DARWIN_CONTINUED);
     }
 
