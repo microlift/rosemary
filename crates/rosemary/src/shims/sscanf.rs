@@ -328,10 +328,7 @@ fn scan(
                 Some((invert, set)) => {
                     let end = (ii..input.len())
                         .take(width)
-                        .find(|&n| {
-                            let yes = set[input[n] as usize];
-                            if invert { !yes } else { yes }
-                        })
+                        .find(|&n| set[input[n] as usize] == invert)
                         .unwrap_or((ii + width).min(input.len()));
                     (end > ii).then(|| {
                         (end - ii, {
@@ -378,4 +375,90 @@ fn scan(
     );
     let _ = consumed;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const BASE: u64 = 0x1000;
+
+    /// One flat region of guest memory starting at `BASE`.
+    struct Flat(Vec<u8>);
+
+    impl Flat {
+        fn place(&mut self, bytes: &[u8]) -> u64 {
+            let at = BASE + self.0.len() as u64;
+            self.0.extend_from_slice(bytes);
+            at
+        }
+
+        fn slice(&self, va: u64, len: usize) -> &[u8] {
+            let at = (va - BASE) as usize;
+            &self.0[at..at + len]
+        }
+    }
+
+    impl GuestMemory for Flat {
+        fn read(&self, va: u64, out: &mut [u8]) -> core::result::Result<(), machish::Error> {
+            let at = va.wrapping_sub(BASE) as usize;
+            let bytes = self
+                .0
+                .get(at..at + out.len())
+                .ok_or(machish::Error::OutOfBounds {
+                    addr: va,
+                    len: out.len(),
+                })?;
+            out.copy_from_slice(bytes);
+            Ok(())
+        }
+
+        fn write(&mut self, va: u64, data: &[u8]) -> core::result::Result<(), machish::Error> {
+            let at = va.wrapping_sub(BASE) as usize;
+            self.0
+                .get_mut(at..at + data.len())
+                .ok_or(machish::Error::OutOfBounds {
+                    addr: va,
+                    len: data.len(),
+                })?
+                .copy_from_slice(data);
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn negated_scanset_stops_at_the_first_excluded_character() {
+        let mut mem = Flat(Vec::new());
+        let input = mem.place(b"type=Asset&id=134289558904675&w=384&h=216&filters=\0");
+        let format = mem.place(b"type=%[^&]&id=%lld&w=%d&h=%d\0");
+        let kind = mem.place(&[0; 16]);
+        let id = mem.place(&[0; 8]);
+        let w = mem.place(&[0; 4]);
+        let h = mem.place(&[0; 4]);
+
+        let mut ctx = RegisterContext::new();
+        (ctx.rdi, ctx.rsi, ctx.rdx, ctx.rcx, ctx.r8, ctx.r9) = (input, format, kind, id, w, h);
+        sscanf("sscanf", &mut ctx, &mut mem).expect("scan");
+
+        assert_eq!(ctx.rax as i32, 4);
+        assert_eq!(mem.slice(kind, 6), b"Asset\0");
+        assert_eq!(mem.slice(id, 8), 134289558904675i64.to_le_bytes());
+        assert_eq!(mem.slice(w, 4), 384i32.to_le_bytes());
+        assert_eq!(mem.slice(h, 4), 216i32.to_le_bytes());
+    }
+
+    #[test]
+    fn scanset_stops_at_the_first_character_outside_it() {
+        let mut mem = Flat(Vec::new());
+        let input = mem.place(b"abcabX\0");
+        let format = mem.place(b"%[abc]\0");
+        let out = mem.place(&[0xff; 8]);
+
+        let mut ctx = RegisterContext::new();
+        (ctx.rdi, ctx.rsi, ctx.rdx) = (input, format, out);
+        sscanf("sscanf", &mut ctx, &mut mem).expect("scan");
+
+        assert_eq!(ctx.rax as i32, 1);
+        assert_eq!(mem.slice(out, 6), b"abcab\0");
+    }
 }
