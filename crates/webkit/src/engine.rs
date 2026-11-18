@@ -69,6 +69,15 @@ fn start() -> Result<Engine, String> {
     // host's C library formats numbers under the guest's feet.
     // SAFETY: safe to call before anything else in GTK.
     unsafe { (api.gtk_disable_setlocale)() };
+    if let Some(app_id) = flatpak_app_id() {
+        // Inside Flatpak, WebKit starts its web processes through the Flatpak
+        // portal, which only lets them own a11y bus names under the sandbox's
+        // app ID. WebKit names them after the program name when that is a
+        // valid app ID, and after a hash of the executable path otherwise.
+        let app_id = gtk::c_string(&app_id);
+        // SAFETY: a NUL-terminated name, which GLib copies.
+        unsafe { (api.g_set_prgname)(app_id.as_ptr()) };
+    }
     // GTK's display is the compositor, never the host's. GTK opens its
     // display in `gtk_init` from the environment alone, and refuses to have
     // one opened for it earlier, so the environment says where the compositor
@@ -123,6 +132,31 @@ fn start() -> Result<Engine, String> {
         session: session as usize,
         thread: darwin::pthread::id(),
     })
+}
+
+/// The app ID of the Flatpak sandbox this process runs in, if it runs in one.
+fn flatpak_app_id() -> Option<String> {
+    let info = std::fs::read_to_string(FLATPAK_INFO).ok()?;
+    flatpak_info_app_id(&info)
+}
+
+/// Where Flatpak describes the sandbox to the processes inside it.
+const FLATPAK_INFO: &str = "/.flatpak-info";
+
+/// The `name` key of the `[Application]` group of a `.flatpak-info` key file.
+fn flatpak_info_app_id(info: &str) -> Option<String> {
+    let mut in_application = false;
+    for line in info.lines().map(str::trim) {
+        if line.starts_with('[') {
+            in_application = line == "[Application]";
+        } else if in_application
+            && let Some((key, value)) = line.split_once('=')
+            && key.trim() == "name"
+        {
+            return Some(value.trim().to_string()).filter(|name| !name.is_empty());
+        }
+    }
+    None
 }
 
 /// Run `f` with `variables` set in the host's environment, then put back

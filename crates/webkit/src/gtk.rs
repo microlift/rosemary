@@ -72,6 +72,7 @@ macro_rules! api {
 
 api! {
     g_main_context_iteration: fn(Ptr, c_int) -> c_int;
+    g_set_prgname: fn(*const c_char);
     g_object_ref_sink: fn(Ptr) -> Ptr;
     g_object_unref: fn(Ptr);
     g_object_ref: fn(Ptr) -> Ptr;
