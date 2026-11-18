@@ -19,31 +19,42 @@ fn enabled() -> bool {
     )
 }
 
-/// The server directory for the prefix this process runs in.
-fn directory() -> PathBuf {
+/// The server directory for the prefix this process runs in, which is where
+/// the prefix's other rendezvous points live too.
+pub(crate) fn directory() -> PathBuf {
     let prefix = prefix::ns::current().map(|prefix| prefix.directory());
     server::location::directory_for(prefix)
 }
 
-/// Start a detached server for `directory`.
+/// Run this binary with `args`, as a subcommand that daemonizes itself.
 ///
-/// The child daemonizes itself and its first half exits at once, so waiting
-/// for it here costs nothing and leaves no zombie behind in a guest that
-/// never reaps children it did not make.
-fn launch(directory: &Path) -> std::io::Result<()> {
+/// The child's first half exits at once, so waiting for it here costs
+/// nothing and leaves no zombie behind in a guest that never reaps children
+/// it did not make.
+pub(crate) fn launch_detached(args: &[&OsStr]) -> std::io::Result<()> {
     let exe = darwin::exe::current()?;
     let status = std::process::Command::new(exe)
-        .arg("server")
-        .arg("--directory")
-        .arg(directory)
+        .args(args)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .status()?;
     match status.success() {
         true => Ok(()),
-        false => Err(std::io::Error::other(format!("server launch {status}"))),
+        false => Err(std::io::Error::other(format!(
+            "{} launch {status}",
+            args[0].display()
+        ))),
     }
+}
+
+/// Start a detached server for `directory`.
+fn launch(directory: &Path) -> std::io::Result<()> {
+    launch_detached(&[
+        "server".as_ref(),
+        "--directory".as_ref(),
+        directory.as_os_str(),
+    ])
 }
 
 /// Point this process at its prefix's server, unless guests are kept apart.
@@ -134,7 +145,7 @@ fn linger() -> Duration {
 /// started from a terminal must not die with it or take its signals.
 ///
 /// Returns in the daemon only; the first half exits here.
-fn detach() {
+pub(crate) fn detach() {
     // SAFETY: `setsid` and `fork` have no memory-safety preconditions; nothing
     // in this process has started a thread yet.
     unsafe {

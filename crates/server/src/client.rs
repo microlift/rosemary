@@ -71,7 +71,7 @@ impl Client {
 }
 
 /// Whether `peer` is this user; a peer the host cannot name is not.
-fn is_this_user(peer: Option<starnix::socket::Peer>) -> bool {
+pub fn is_this_user(peer: Option<starnix::socket::Peer>) -> bool {
     // SAFETY: `getuid` has no preconditions.
     peer.is_some_and(|peer| peer.uid == unsafe { libc::getuid() })
 }

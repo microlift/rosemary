@@ -44,6 +44,8 @@ struct Client {
     wl_registry_interface: *const c_void,
     wl_seat_interface: *const c_void,
     wl_pointer_interface: *const c_void,
+    wl_compositor_interface: *const c_void,
+    wl_region_interface: *const c_void,
 }
 
 /// `struct wl_message`.
@@ -207,6 +209,8 @@ fn client() -> Option<&'static Client> {
                     wl_registry_interface: symbol(c"wl_registry_interface")?,
                     wl_seat_interface: symbol(c"wl_seat_interface")?,
                     wl_pointer_interface: symbol(c"wl_pointer_interface")?,
+                    wl_compositor_interface: symbol(c"wl_compositor_interface")?,
+                    wl_region_interface: symbol(c"wl_region_interface")?,
                 })
             }
         })
@@ -216,6 +220,10 @@ fn client() -> Option<&'static Client> {
 const WL_DISPLAY_GET_REGISTRY: u32 = 1;
 const WL_REGISTRY_BIND: u32 = 0;
 const WL_SEAT_GET_POINTER: u32 = 0;
+const WL_COMPOSITOR_CREATE_REGION: u32 = 1;
+const WL_REGION_DESTROY: u32 = 0;
+const WL_REGION_ADD: u32 = 1;
+const WL_SURFACE_SET_INPUT_REGION: u32 = 5;
 const WL_SURFACE_COMMIT: u32 = 6;
 const WL_MARSHAL_FLAG_DESTROY: u32 = 1;
 const ZWP_POINTER_CONSTRAINTS_V1_LOCK_POINTER: u32 = 1;
@@ -234,6 +242,8 @@ struct State {
     seats: Vec<usize>,
     /// The display's `zwp_pointer_constraints_v1`, once bound.
     constraints: usize,
+    /// The display's `wl_compositor`, once bound.
+    compositor: usize,
     /// Surfaces a pointer came onto since [`take_entered`] last asked.
     entered: Vec<usize>,
     events: Vec<PointerEvent>,
@@ -321,6 +331,70 @@ pub(crate) fn commit(surface: *mut c_void) {
             0,
         );
     }
+}
+
+/// Take pointer input on `surface` only inside `rects`, surface-local: what
+/// lands anywhere else goes to whatever the compositor has under it. Takes
+/// effect at once rather than with the surface's next frame.
+///
+/// False until the display's `wl_compositor` is known, a turn of SDL's event
+/// pump after the first window is made.
+pub(crate) fn set_input_region(surface: *mut c_void, rects: &[crate::Rect]) -> bool {
+    let Some(client) = client() else {
+        return false;
+    };
+    let compositor = with_state(|state| state.compositor) as *mut c_void;
+    if compositor.is_null() {
+        return false;
+    }
+    let _commits = crate::compositor::guard();
+    // SAFETY: the caller's live surface and this module's live compositor;
+    // each request is spelled as the header's inline wrapper spells it.
+    unsafe {
+        let region = (client.wl_proxy_marshal_flags)(
+            compositor,
+            WL_COMPOSITOR_CREATE_REGION,
+            client.wl_region_interface,
+            (client.wl_proxy_get_version)(compositor),
+            0,
+            std::ptr::null_mut::<c_void>(),
+        );
+        if region.is_null() {
+            return false;
+        }
+        let version = (client.wl_proxy_get_version)(region);
+        for rect in rects {
+            (client.wl_proxy_marshal_flags)(
+                region,
+                WL_REGION_ADD,
+                std::ptr::null(),
+                version,
+                0,
+                rect.x,
+                rect.y,
+                rect.w,
+                rect.h,
+            );
+        }
+        (client.wl_proxy_marshal_flags)(
+            surface,
+            WL_SURFACE_SET_INPUT_REGION,
+            std::ptr::null(),
+            (client.wl_proxy_get_version)(surface),
+            0,
+            region,
+        );
+        // The surface keeps a copy.
+        (client.wl_proxy_marshal_flags)(
+            region,
+            WL_REGION_DESTROY,
+            std::ptr::null(),
+            version,
+            WL_MARSHAL_FLAG_DESTROY,
+        );
+    }
+    commit(surface);
+    true
 }
 
 /// Put the pointer at `(x, y)` on `surface`, surface-local, by locking it
@@ -473,6 +547,10 @@ unsafe extern "C" fn global(
         bind_pointer_constraints(client, registry, name);
         return;
     }
+    if interface == c"wl_compositor" {
+        bind_compositor(client, registry, name);
+        return;
+    }
     if interface != c"wl_seat" {
         return;
     }
@@ -521,6 +599,29 @@ fn bind_pointer_constraints(client: &Client, registry: Proxy, name: u32) {
     };
     if !constraints.is_null() {
         with_state(|state| state.constraints = constraints as usize);
+    }
+}
+
+fn bind_compositor(client: &Client, registry: Proxy, name: u32) {
+    // Regions are all this asks of it, and version 1 makes them.
+    let version = 1u32;
+    // SAFETY: `wl_registry_bind` as the header's inline wrapper spells it;
+    // the interface's first field is its name.
+    let compositor = unsafe {
+        (client.wl_proxy_marshal_flags)(
+            registry,
+            WL_REGISTRY_BIND,
+            client.wl_compositor_interface,
+            version,
+            0,
+            name,
+            *(client.wl_compositor_interface as *const *const c_char),
+            version,
+            std::ptr::null_mut::<c_void>(),
+        )
+    };
+    if !compositor.is_null() {
+        with_state(|state| state.compositor = compositor as usize);
     }
 }
 

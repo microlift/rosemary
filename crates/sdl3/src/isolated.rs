@@ -23,6 +23,12 @@ pub fn run_here_with_dummy_video() -> bool {
     run_here_with_env(&[("SDL_VIDEODRIVER", "dummy")])
 }
 
+/// As [`run_here_with_dummy_video`], with every window made on a virtual
+/// desktop of `extent`, which is a value of `ROSEMARY_DESKTOP`.
+pub fn run_here_on_dummy_desktop(extent: &str) -> bool {
+    run_here_with_env(&[("SDL_VIDEO_DRIVER", "dummy"), (crate::desktop::ENV, extent)])
+}
+
 /// As [`run_here`], with `vars` set in the child: for a test that needs a
 /// process-wide mode chosen before anything in the process starts.
 pub fn run_here_with_env(vars: &[(&str, &str)]) -> bool {
