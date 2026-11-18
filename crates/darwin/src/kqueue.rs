@@ -766,6 +766,19 @@ struct KqueueBackend {
     wake_write: c_int,
     /// What the host's `EVFILT_SIGNAL` has reported, per Darwin signal.
     generated: [std::sync::atomic::AtomicU64; 32],
+    /// Write watches the host refused, by descriptor.
+    #[cfg(target_os = "freebsd")]
+    widowed: Mutex<HashMap<c_int, Widowed>>,
+}
+
+/// A pipe end FreeBSD will not watch for writing because its reader is gone.
+/// Darwin registers it, and it stays writable with EOF for good, so it is
+/// reported without the host: every wait for a plain registration, once for
+/// an `EV_CLEAR` one.
+#[cfg(target_os = "freebsd")]
+struct Widowed {
+    edge: bool,
+    pending: bool,
 }
 
 #[cfg(any(target_os = "macos", target_os = "freebsd"))]
@@ -790,6 +803,24 @@ impl KqueueBackend {
     const EDGE_TOKEN: usize = 1;
     const PORT_TOKEN: usize = 2;
     const SIGNAL_TOKEN: usize = 3;
+
+    /// What the widowed write watches report now, consuming each edge.
+    #[cfg(target_os = "freebsd")]
+    fn take_widowed(&self) -> Vec<Ready> {
+        let mut widowed = self.widowed.lock().unwrap_or_else(|e| e.into_inner());
+        widowed
+            .iter_mut()
+            .filter(|(_, watch)| !watch.edge || std::mem::take(&mut watch.pending))
+            .map(|(fd, watch)| Ready {
+                fd: *fd,
+                revents: libc::POLLOUT | libc::POLLHUP,
+                source: match watch.edge {
+                    true => Source::Edge,
+                    false => Source::Level,
+                },
+            })
+            .collect()
+    }
 
     fn change(&self, fd: c_int, filter: i16, flags: u16, token: usize) -> Result<(), c_int> {
         let change = host_kevent(fd as usize, filter, flags, token);
@@ -858,6 +889,8 @@ impl ReadinessBackend for KqueueBackend {
             wake_read: ends[0],
             wake_write: ends[1],
             generated: [const { std::sync::atomic::AtomicU64::new(0) }; 32],
+            #[cfg(target_os = "freebsd")]
+            widowed: Mutex::new(HashMap::new()),
         };
         let wake = host_kevent(
             backend.wake_read as usize,
@@ -930,6 +963,13 @@ impl ReadinessBackend for KqueueBackend {
             // Deleted and added again rather than modified, so the host
             // re-reads `EV_CLEAR` and the token rather than keeping the old.
             if was.is_some() {
+                #[cfg(target_os = "freebsd")]
+                if filter == libc::EVFILT_WRITE {
+                    self.widowed
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .remove(&fd);
+                }
                 // Closing a watched descriptor removes its filters. Keep
                 // Darwin's deletion semantics even if the host already has.
                 match self.change(fd, filter, libc::EV_DELETE, 0) {
@@ -939,14 +979,26 @@ impl ReadinessBackend for KqueueBackend {
                     _ => {}
                 }
             }
-            // FIXME (ACCURACY): FreeBSD refuses `EVFILT_WRITE` with `EPIPE` on
-            // a pipe whose other end is closed, where Darwin registers it.
             if let Some(edge) = now {
                 let (flags, token) = match edge {
                     true => (libc::EV_ADD | libc::EV_CLEAR, Self::EDGE_TOKEN),
                     false => (libc::EV_ADD, Self::LEVEL_TOKEN),
                 };
-                self.change(fd, filter, flags, token)?;
+                match self.change(fd, filter, flags, token) {
+                    #[cfg(target_os = "freebsd")]
+                    Err(libc::EPIPE) if filter == libc::EVFILT_WRITE => {
+                        let widowed = Widowed {
+                            edge,
+                            pending: true,
+                        };
+                        self.widowed
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .insert(fd, widowed);
+                        self.wake();
+                    }
+                    other => other?,
+                }
             }
         }
         Ok(())
@@ -991,6 +1043,12 @@ impl ReadinessBackend for KqueueBackend {
         capacity: usize,
         mut timeout: c_int,
     ) -> Result<Vec<Ready>, c_int> {
+        #[cfg(target_os = "freebsd")]
+        let widowed = self.take_widowed();
+        #[cfg(target_os = "freebsd")]
+        if !widowed.is_empty() {
+            timeout = 0;
+        }
         // The ports' sockets are not in the host queue (a port set's members
         // can change under a registration), so wait on both with `poll` - a
         // kqueue descriptor polls readable while it has events - and then
@@ -1037,6 +1095,9 @@ impl ReadinessBackend for KqueueBackend {
         }
         // The host reports each filter on its own; `kevent` matches every
         // registration on a descriptor against one entry, so fold them.
+        #[cfg(target_os = "freebsd")]
+        let mut result = widowed;
+        #[cfg(not(target_os = "freebsd"))]
         let mut result: Vec<Ready> = Vec::new();
         for event in events.iter().take(count as usize) {
             if event.udata as usize == Self::SIGNAL_TOKEN {
@@ -2187,10 +2248,6 @@ mod tests {
     /// A closed writer is readiness with `EV_EOF`, reported once even when the
     /// reader also watches for writability.
     #[test]
-    #[cfg_attr(
-        target_os = "freebsd",
-        ignore = "FreeBSD refuses EVFILT_WRITE on a widowed pipe with EPIPE"
-    )]
     fn a_hangup_is_reported_once_with_eof() {
         let queue = kqueue();
         let (read_end, write_end) = pipe();
@@ -2219,6 +2276,41 @@ mod tests {
             assert_eq!(reads.len(), 1);
             assert_eq!(reads[0].flags & EV_EOF, EV_EOF);
             libc::close(read_end);
+            crate::net::descriptor::close(queue);
+        }
+    }
+
+    /// A pipe whose reader is gone is writable with `EV_EOF`, and an
+    /// `EV_CLEAR` watch on it is told once.
+    #[cfg(any(target_os = "macos", target_os = "freebsd"))]
+    #[test]
+    fn a_widowed_pipe_is_writable_with_eof() {
+        let queue = kqueue();
+        let (read_end, write_end) = pipe();
+        let change = Kevent {
+            ident: write_end as usize,
+            filter: EVFILT_WRITE,
+            flags: EV_ADD | EV_CLEAR,
+            ..Kevent::default()
+        };
+        let mut got = [Kevent::default(); 2];
+        // SAFETY: one change and room for two events.
+        unsafe {
+            libc::close(read_end);
+            let n = kevent(queue, &change, 1, got.as_mut_ptr(), 2, &raw const NO_WAIT);
+            assert_eq!(n, 1);
+            assert_eq!(got[0].filter, EVFILT_WRITE);
+            assert_eq!(got[0].flags & EV_EOF, EV_EOF);
+            let n = kevent(
+                queue,
+                std::ptr::null(),
+                0,
+                got.as_mut_ptr(),
+                2,
+                &raw const NO_WAIT,
+            );
+            assert_eq!(n, 0, "an edge is reported once");
+            libc::close(write_end);
             crate::net::descriptor::close(queue);
         }
     }
