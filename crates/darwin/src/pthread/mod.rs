@@ -43,7 +43,13 @@ pub fn id() -> u32 {
         let _host = crate::syscall::ScopedHostSyscallContext::new();
         rustix::thread::gettid().as_raw_pid() as u32
     }
-    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    #[cfg(target_os = "freebsd")]
+    {
+        // SAFETY: takes nothing and answers this thread's kernel id, the one
+        // `KERN_PROC_INC_THREAD` lists it under.
+        unsafe { libc::pthread_getthreadid_np() as u32 }
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "freebsd")))]
     {
         unsafe { libc::pthread_self() as u32 }
     }
