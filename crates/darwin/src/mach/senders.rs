@@ -259,7 +259,6 @@ unsafe fn accept(listener: c_int) -> Option<c_int> {
         // SAFETY: the caller's listener.
         let fd = unsafe { accept_any(listener) }?;
         // A claim from another user would hold off no-senders forever.
-        #[cfg(target_os = "linux")]
         if !peer_is_this_user(fd) {
             // SAFETY: the descriptor just accepted, never handed on.
             unsafe { libc::close(fd) };
@@ -318,6 +317,13 @@ fn peer_is_this_user(fd: c_int) -> bool {
         )
     };
     rc == 0 && super::wire::same_user(credentials.uid)
+}
+
+/// Elsewhere the listener is a socket in this user's private runtime
+/// directory, which no other user can reach.
+#[cfg(not(target_os = "linux"))]
+fn peer_is_this_user(_: c_int) -> bool {
+    true
 }
 
 /// Whether the holder end of a claim has gone. Nothing is ever written to a
