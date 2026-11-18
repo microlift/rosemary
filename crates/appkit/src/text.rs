@@ -1671,6 +1671,7 @@ pub(crate) fn install() {
         "currentEditor" => current_editor, c"@16@0:8";
         "mouseDown:" => field_mouse_down, c"v24@0:8@16";
         "textDidChange:" => field_text_did_change, c"v24@0:8@16";
+        "needsPanelToBecomeKey" => needs_panel_to_become_key, c"c16@0:8";
     });
 }
 

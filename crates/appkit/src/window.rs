@@ -259,10 +259,58 @@ fn key_after(leaving: &[Id]) -> Id {
 // goes, the host picks the window it focuses next.
 fn hand_key_on(leaving: &[Id]) {
     let next = key_after(leaving);
-    if !next.is_null() {
-        KEY.store(next as usize, std::sync::atomic::Ordering::Release);
-        crate::event::announce_key(next);
+    if next.is_null() {
+        return;
     }
+    // An inactive program's key window is announced once it is active again,
+    // and raising one then would take the focus from another program.
+    if !has_host_focus() {
+        store_key(next);
+        return;
+    }
+    become_key(next);
+    // The host's keyboard has to follow, or keys keep arriving at the
+    // toplevel under the popup that went.
+    let host = toplevel_under(window_of(next).sdl);
+    if sdl3::video::window_flags(host) & sdl3::video::flags::INPUT_FOCUS == 0 {
+        sdl3::video::raise_window(host);
+    }
+}
+
+/// `receiver` becomes the key window, and is announced as it.
+fn become_key(receiver: Id) {
+    store_key(receiver);
+    crate::event::announce_key(receiver);
+}
+
+/// Record `receiver` as the key window. The host input method of a toplevel
+/// under a popup that gains or loses key follows the window its keys go to.
+fn store_key(receiver: Id) {
+    let previous = KEY.swap(receiver as usize, std::sync::atomic::Ordering::AcqRel) as Id;
+    follow_keys_with_text_input(previous);
+    follow_keys_with_text_input(receiver);
+}
+
+/// Give the host input method of the toplevel under `popup` to whichever
+/// window that toplevel's keys now go to.
+fn follow_keys_with_text_input(popup: Id) {
+    // SAFETY: null or a window this crate made.
+    let sdl = unsafe { sdl_window(popup) };
+    if sdl.is_null() || presentation_of_sdl(sdl) == Presentation::Toplevel {
+        return;
+    }
+    let target = key_target(window_for(toplevel_under(sdl)));
+    if !target.is_null() {
+        update_text_input(target);
+    }
+}
+
+/// The SDL window whose host input method `receiver`'s keys go through, if
+/// its keys are the ones arriving there: a key popup's arrive at the toplevel
+/// under it.
+fn text_input_host(receiver: Id) -> Option<sdl3::Window> {
+    let host = toplevel_under(window_of(receiver).sdl);
+    (!host.is_null() && key_target(window_for(host)) == receiver).then_some(host)
 }
 
 /// Whether the host has the keyboard on any window of this program, which is
@@ -293,8 +341,7 @@ pub fn mouse_down(receiver: Id, view: Id) {
     if window.becomes_key_only_if_needed != 0 && !needed {
         return;
     }
-    KEY.store(receiver as usize, std::sync::atomic::Ordering::Release);
-    crate::event::announce_key(receiver);
+    become_key(receiver);
 }
 
 /// The toplevel a popup hangs off, through any popups between.
@@ -571,6 +618,12 @@ fn destroy_sdl_window(sdl: sdl3::Window) {
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .clone();
+    // Key is not handed to a window going in the same destruction.
+    let leaving: Vec<Id> = family
+        .iter()
+        .map(|member| window_for(*member))
+        .filter(|object| !object.is_null())
+        .collect();
     for member in family.into_iter().rev() {
         // Remove fullscreen native overlays before retiring each member,
         // including SDL popups which SDL otherwise destroys recursively.
@@ -594,10 +647,9 @@ fn destroy_sdl_window(sdl: sdl3::Window) {
                 let child = window_of(object);
                 child.sdl = std::ptr::null_mut();
                 child.shown = 0;
-                if KEY.load(std::sync::atomic::Ordering::Acquire) == object as usize {
-                    KEY.store(0, std::sync::atomic::Ordering::Release);
+                if crate::event::forget(&KEY, object) {
                     crate::event::announce_resign(object);
-                    hand_key_on(&[object]);
+                    hand_key_on(&leaving);
                 }
                 crate::event::forget_announced(object);
             }
@@ -2367,8 +2419,7 @@ unsafe extern "C" fn make_key_window(receiver: Id, _sel: Sel) {
     {
         return;
     }
-    KEY.store(receiver as usize, std::sync::atomic::Ordering::Release);
-    crate::event::announce_key(receiver);
+    become_key(receiver);
     // A popup is already above its parent, and SDL refuses to raise one.
     if presentation(window) == Presentation::Toplevel {
         sdl3::video::raise_window(window.sdl);
@@ -2435,8 +2486,7 @@ fn order_front(receiver: Id, make_key: bool) {
     );
     set_up_first_responder(receiver);
     if make_key && takes_key(receiver, want) {
-        KEY.store(receiver as usize, std::sync::atomic::Ordering::Release);
-        crate::event::announce_key(receiver);
+        become_key(receiver);
     }
     // Where the window actually ended up. On a Mac a window is placed exactly
     // where it was asked to be, so a toolkit has no reason to look again; here
@@ -2470,17 +2520,11 @@ unsafe extern "C" fn order_out(receiver: Id, _sel: Sel, _sender: Id) {
         sdl3::video::hide_window(sdl);
     }
     window_of(receiver).shown = 0;
-    let was_key = KEY
-        .compare_exchange(
-            receiver as usize,
-            0,
-            std::sync::atomic::Ordering::AcqRel,
-            std::sync::atomic::Ordering::Acquire,
-        )
-        .is_ok();
+    let was_key = crate::event::forget(&KEY, receiver);
     crate::event::announce_resign(receiver);
     if was_key && is_popup {
         hand_key_on(&[receiver]);
+        follow_keys_with_text_input(receiver);
     }
 }
 
@@ -3110,17 +3154,17 @@ unsafe extern "C" fn make_first_responder(receiver: Id, _sel: Sel, responder: Id
 /// which made text appear to work at the engine layer while every committed
 /// character and IME composition was silently absent from the text client.
 fn update_text_input(receiver: Id) {
-    let window = window_of(receiver);
-    if window.sdl.is_null() {
+    let Some(host) = text_input_host(receiver) else {
         return;
-    }
+    };
+    let window = window_of(receiver);
     match crate::text::is_input_client(window.first_responder) {
         true => {
-            set_text_input_area(window);
-            sdl3::video::start_text_input(window.sdl);
+            set_text_input_area(window, host);
+            sdl3::video::start_text_input(host);
         }
         false => {
-            sdl3::video::stop_text_input(window.sdl);
+            sdl3::video::stop_text_input(host);
         }
     }
 }
@@ -3134,37 +3178,49 @@ fn update_text_input(receiver: Id) {
 /// left on would keep composing and offering accents for those keys.
 pub(crate) fn follow_key_interpretation(receiver: Id) {
     let window = window_of(receiver);
-    if window.sdl.is_null() || !crate::text::is_input_client(window.first_responder) {
+    let Some(host) = text_input_host(receiver) else {
+        return;
+    };
+    if !crate::text::is_input_client(window.first_responder) {
         return;
     }
     let interpreting = crate::text::accepts_host_text(window.first_responder);
-    if interpreting == sdl3::video::text_input_active(window.sdl) {
+    if interpreting == sdl3::video::text_input_active(host) {
         return;
     }
     match interpreting {
         true => {
-            set_text_input_area(window);
-            sdl3::video::start_text_input(window.sdl);
+            set_text_input_area(window, host);
+            sdl3::video::start_text_input(host);
         }
         false => {
-            sdl3::video::stop_text_input(window.sdl);
+            sdl3::video::stop_text_input(host);
         }
     }
 }
 
 /// Whether the host input method is resolving this window's keys into text.
 pub(crate) fn host_text_input_active(receiver: Id) -> bool {
-    let window = window_of(receiver);
-    !window.sdl.is_null() && sdl3::video::text_input_active(window.sdl)
+    text_input_host(receiver).is_some_and(sdl3::video::text_input_active)
 }
 
-fn set_text_input_area(window: &Window) {
+fn set_text_input_area(window: &Window, host: sdl3::Window) {
     let area = crate::text::input_area(window.first_responder);
     // SAFETY: an input client or the text field whose editor it is; both are
     // live views from this runtime.
-    if let Some((_, area)) = unsafe { crate::view::input_frame(area) } {
-        sdl3::video::set_text_input_area(window.sdl, area, 0);
+    let Some((sdl, mut area)) = (unsafe { crate::view::input_frame(area) }) else {
+        return;
+    };
+    // A key popup's editor is placed on the toplevel its keys arrive at.
+    if sdl != host {
+        let (Some((x, y)), Some((host_x, host_y))) = (global_position(sdl), global_position(host))
+        else {
+            return;
+        };
+        area.x += x - host_x;
+        area.y += y - host_y;
     }
+    sdl3::video::set_text_input_area(host, area, 0);
 }
 
 /// Refresh SDL's IME rectangle after the visible editor changes geometry.
@@ -3178,11 +3234,13 @@ pub(crate) unsafe fn refresh_text_input_area_for(view: Id) {
         return;
     }
     let window = window_of(receiver);
-    if !window.sdl.is_null()
-        && crate::text::is_input_client(window.first_responder)
+    let Some(host) = text_input_host(receiver) else {
+        return;
+    };
+    if crate::text::is_input_client(window.first_responder)
         && crate::text::input_area(window.first_responder) == view
     {
-        set_text_input_area(window);
+        set_text_input_area(window, host);
     }
 }
 
@@ -4092,7 +4150,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn a_window_takes_key_only_when_it_can_become_key_at_any_level() {
+    fn a_window_takes_key_when_it_can_become_key_unless_it_is_a_tooltip() {
         crate::bootstrap();
         let window =
             objc::object::create_instance(objc::class::lookup(c"NSWindow").expect("NSWindow"), 0);

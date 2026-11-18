@@ -479,15 +479,26 @@ pub(crate) fn deliver_past_modal(event: sdl3::video::Event) {
             }
             match gained {
                 true => {
+                    let resigned = RESIGNED_MAIN.swap(0, std::sync::atomic::Ordering::AcqRel) as Id;
                     announce_key(key);
-                    announce_main(object);
+                    // A key window that cannot be main leaves main to the
+                    // window it was focused through, else to the one main
+                    // when the program last lost focus.
+                    if !key.is_null() && !answers(key, "canBecomeMainWindow") {
+                        announce_main(object);
+                        if main_window().is_null() {
+                            announce_main(resigned);
+                        }
+                    }
                 }
                 false => {
                     resign_key(key);
                     // The main window stays main while focus is on another
                     // window of this program.
                     if !window::has_host_focus() {
-                        resign_main(main_window());
+                        let main = main_window();
+                        resign_main(main);
+                        RESIGNED_MAIN.store(main as usize, std::sync::atomic::Ordering::Release);
                     }
                 }
             }
@@ -1773,6 +1784,11 @@ static ANNOUNCED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsiz
 /// taking key leaves it where it was.
 static MAIN: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
+/// The main window when the program last lost the host's focus, given main
+/// back on its return when the window taking key cannot be main. Focus can
+/// leave one window of the program a pump before it reaches another.
+static RESIGNED_MAIN: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
 pub(crate) fn main_window() -> Id {
     MAIN.load(std::sync::atomic::Ordering::Acquire) as Id
 }
@@ -1828,15 +1844,15 @@ pub(crate) fn announce_main(object: Id) {
     post_for(object, window::DID_BECOME_MAIN);
 }
 
-fn forget(announced: &std::sync::atomic::AtomicUsize, object: Id) -> bool {
-    announced
-        .compare_exchange(
-            object as usize,
-            0,
-            std::sync::atomic::Ordering::AcqRel,
-            std::sync::atomic::Ordering::Acquire,
-        )
-        .is_ok()
+/// Clear `slot` if it holds `object`, answering whether it did.
+pub(crate) fn forget(slot: &std::sync::atomic::AtomicUsize, object: Id) -> bool {
+    slot.compare_exchange(
+        object as usize,
+        0,
+        std::sync::atomic::Ordering::AcqRel,
+        std::sync::atomic::Ordering::Acquire,
+    )
+    .is_ok()
 }
 
 /// `object` stops being key and main, whichever it was: focus left it, or it
@@ -1844,6 +1860,7 @@ fn forget(announced: &std::sync::atomic::AtomicUsize, object: Id) -> bool {
 pub(crate) fn announce_resign(object: Id) {
     resign_key(object);
     resign_main(object);
+    forget(&RESIGNED_MAIN, object);
 }
 
 fn resign_key(object: Id) {
@@ -1868,6 +1885,7 @@ pub(crate) fn announced_key() -> Id {
 pub(crate) fn forget_announced(object: Id) {
     forget(&ANNOUNCED, object);
     forget(&MAIN, object);
+    forget(&RESIGNED_MAIN, object);
 }
 
 /// Send the window notification `name` about `object` to its delegate and to
