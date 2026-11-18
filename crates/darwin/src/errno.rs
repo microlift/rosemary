@@ -113,6 +113,8 @@ const NUMBERS: &[(i32, i32)] = &[
     (102, libc::EOPNOTSUPP),
     (104, libc::ENOTRECOVERABLE),
     (105, libc::EOWNERDEAD),
+    #[cfg(target_os = "freebsd")]
+    (107, libc::ENOTCAPABLE),
 ];
 
 /// Darwin's `EINVAL`, and what a number with no Darwin name is reported as.
@@ -370,6 +372,22 @@ mod tests {
         assert_eq!(libc::ENAMETOOLONG, 36, "which is Darwin's EINPROGRESS");
         assert_eq!(to_host(35), libc::EAGAIN);
         assert_eq!(to_host(60), libc::ETIMEDOUT);
+    }
+
+    /// FreeBSD shares Darwin's numbers up to `EOVERFLOW` and renumbers past it.
+    #[test]
+    #[cfg(target_os = "freebsd")]
+    fn the_numbers_past_eoverflow_are_translated() {
+        assert_eq!(from_host(libc::ECANCELED), 89);
+        assert_eq!(libc::ECANCELED, 85, "which is Darwin's EBADEXEC");
+        assert_eq!(from_host(libc::EILSEQ), 92);
+        assert_eq!(from_host(libc::EBADMSG), 94);
+        assert_eq!(from_host(libc::ENOLINK), 97);
+        assert_eq!(from_host(libc::EPROTO), 100);
+        assert_eq!(from_host(libc::ENOTCAPABLE), 107);
+        assert_eq!(libc::ENOTCAPABLE, 93, "which is Darwin's ENOATTR");
+        assert_eq!(to_host(89), libc::ECANCELED);
+        assert_eq!(to_host(107), libc::ENOTCAPABLE);
     }
 
     #[test]

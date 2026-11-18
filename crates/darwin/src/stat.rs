@@ -1604,7 +1604,7 @@ mod tests {
 
     /// `unzip` looks up and opens every path it extracts beneath its target
     /// directory this way, and refuses to extract when the lookup fails.
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "freebsd"))]
     #[test]
     fn resolve_beneath_finds_what_is_inside_and_refuses_what_is_not() {
         const AT_RESOLVE_BENEATH: c_int = 0x2000;
