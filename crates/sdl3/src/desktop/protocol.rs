@@ -231,6 +231,8 @@ pub(crate) enum Request {
         text: Vec<u8>,
     },
     Clipboard,
+    /// Whether the clipboard holds text, without fetching it.
+    HasClipboardText,
     /// What the window's hit test made of the point in [`Message::Probe`].
     Probed {
         serial: u32,
@@ -281,10 +283,11 @@ wire_enum!(Request {
     29 => SetClipboard { text },
     30 => Clipboard,
     31 => Probed { serial, hit },
+    32 => HasClipboardText,
     #[cfg(test)]
-    32 => Inject { event },
+    33 => Inject { event },
     #[cfg(test)]
-    33 => Shown { x, y },
+    34 => Shown { x, y },
 });
 
 #[derive(Clone, Debug, PartialEq)]
@@ -365,6 +368,7 @@ impl Request {
             | Request::SetCursorVisible { .. }
             | Request::SetClipboard { .. }
             | Request::Clipboard
+            | Request::HasClipboardText
             | Request::Probed { .. } => None,
             #[cfg(test)]
             Request::Inject { .. } | Request::Shown { .. } => None,
@@ -665,12 +669,30 @@ impl Wire for Event {
 
 const FRAME_HEADER: usize = size_of::<u32>();
 
+/// A message larger than [`server::codec::MAX_FRAME`], which the other end
+/// would take for a corrupt length and hang up over.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct TooLarge;
+
+impl From<TooLarge> for std::io::Error {
+    fn from(_: TooLarge) -> Self {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "desktop message too large",
+        )
+    }
+}
+
 /// Add `value` to `out` as one length-prefixed frame, which is what
 /// `server::codec::write_frame` writes.
-pub(crate) fn put_frame<T: Wire>(out: &mut Vec<u8>, value: &T) {
+pub(crate) fn put_frame<T: Wire>(out: &mut Vec<u8>, value: &T) -> Result<(), TooLarge> {
     let payload = server::codec::encode(value);
+    if payload.len() > server::codec::MAX_FRAME {
+        return Err(TooLarge);
+    }
     out.extend_from_slice(&(payload.len() as u32).to_le_bytes());
     out.extend_from_slice(&payload);
+    Ok(())
 }
 
 /// A whole frame off the front of `unread`, if all of one has arrived.
@@ -817,8 +839,8 @@ mod tests {
     #[test]
     fn frames_come_off_a_stream_whole_however_it_was_cut() {
         let mut stream = Vec::new();
-        put_frame(&mut stream, &Request::Pointer);
-        put_frame(&mut stream, &Request::Show { window: 3 });
+        put_frame(&mut stream, &Request::Pointer).unwrap();
+        put_frame(&mut stream, &Request::Show { window: 3 }).unwrap();
         let mut unread = Vec::new();
         let mut frames = Vec::new();
         for byte in stream {
@@ -829,6 +851,17 @@ mod tests {
         }
         assert_eq!(frames, [Request::Pointer, Request::Show { window: 3 }]);
         assert!(unread.is_empty());
+    }
+
+    #[test]
+    fn a_frame_too_large_for_the_other_end_is_not_written() {
+        let mut stream = Vec::new();
+        let text = vec![0; server::codec::MAX_FRAME];
+        assert_eq!(
+            put_frame(&mut stream, &Request::SetClipboard { text }),
+            Err(TooLarge)
+        );
+        assert!(stream.is_empty());
     }
 
     #[test]

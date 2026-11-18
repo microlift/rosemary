@@ -84,8 +84,13 @@ impl Connection {
         other: &mut dyn FnMut(Message),
     ) -> io::Result<Reply> {
         let mut frame = Vec::new();
-        protocol::put_frame(&mut frame, request);
-        self.stream.write_all(&frame)?;
+        protocol::put_frame(&mut frame, request)?;
+        self.exchange(&frame, other)
+    }
+
+    /// Send a request already framed, and wait for the answer.
+    fn exchange(&mut self, frame: &[u8], other: &mut dyn FnMut(Message)) -> io::Result<Reply> {
+        self.stream.write_all(frame)?;
         loop {
             match self.next(true)? {
                 Some(Message::Reply { reply }) => return Ok(reply),
@@ -292,10 +297,17 @@ fn disown(guard: &mut MutexGuard<'static, Option<Link>>) {
 }
 
 fn call(request: &Request) -> Option<Reply> {
+    // Refused here, before anything is sent: the host would take the frame
+    // for a corrupt one and hang up.
+    let mut frame = Vec::new();
+    if protocol::put_frame(&mut frame, request).is_err() {
+        eprintln!("rosemary: sdl3: a request too large for the virtual desktop was not sent");
+        return None;
+    }
     let mut guard = link();
     disown(&mut guard);
     let link = guard.as_mut()?;
-    match link.connection.call(request, &mut apply) {
+    match link.connection.exchange(&frame, &mut apply) {
         Ok(reply) => Some(reply),
         Err(e) => {
             *guard = None;
@@ -932,8 +944,18 @@ pub(crate) fn clipboard() -> Option<Option<Vec<u8>>> {
     }
     match call(&Request::Clipboard) {
         Some(Reply::Clipboard { text }) => Some(text),
+        Some(Reply::Refused { why }) => {
+            eprintln!("rosemary: sdl3: the virtual desktop kept its clipboard: {why}");
+            Some(None)
+        }
         _ => Some(None),
     }
+}
+
+/// Whether the clipboard holds text, without carrying the text across.
+pub(crate) fn has_clipboard_text() -> Option<bool> {
+    UP.load(Ordering::Acquire)
+        .then(|| done(Request::HasClipboardText))
 }
 
 /// `cursor` is one of SDL's own, made for this process.

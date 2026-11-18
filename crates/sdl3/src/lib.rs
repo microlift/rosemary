@@ -1272,8 +1272,8 @@ pub mod clipboard {
     /// Whether SDL currently has a text payload. This distinguishes an empty
     /// desktop clipboard from an unavailable video/clipboard backend.
     pub fn has_text() -> Option<bool> {
-        if let Some(text) = crate::desktop::clipboard() {
-            return Some(text.is_some());
+        if let Some(has) = crate::desktop::has_clipboard_text() {
+            return Some(has);
         }
         let handle = library()?;
         // SAFETY: SDL3 declares this exact prototype.

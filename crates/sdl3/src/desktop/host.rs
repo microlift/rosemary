@@ -79,6 +79,27 @@ struct Peer {
     gone: bool,
 }
 
+impl Peer {
+    fn post(&mut self, message: &Message) {
+        if protocol::put_frame(&mut self.unsent, message).is_ok() {
+            return;
+        }
+        // Only a reply carries something of unbounded size, the clipboard,
+        // and the guest is waiting on it: it is told why it gets none.
+        let refusal = Message::Reply {
+            reply: Reply::Refused {
+                why: "the answer is too large to send".into(),
+            },
+        };
+        match message {
+            Message::Reply { .. } => {
+                let _ = protocol::put_frame(&mut self.unsent, &refusal);
+            }
+            _ => eprintln!("rosemary desktop: a message too large to send was dropped"),
+        }
+    }
+}
+
 /// What the host keeps for one window besides its place in the scene.
 struct Surface {
     owner: PeerId,
@@ -393,13 +414,13 @@ impl Host {
 
     fn send(&mut self, id: PeerId, message: &Message) {
         if let Some(peer) = self.peers.get_mut(&id) {
-            protocol::put_frame(&mut peer.unsent, message);
+            peer.post(message);
         }
     }
 
     fn broadcast(&mut self, message: &Message) {
         for peer in self.peers.values_mut().filter(|peer| peer.greeted) {
-            protocol::put_frame(&mut peer.unsent, message);
+            peer.post(message);
         }
     }
 
@@ -852,6 +873,7 @@ impl Host {
             Request::Clipboard => Reply::Clipboard {
                 text: crate::clipboard::text(),
             },
+            Request::HasClipboardText => done(crate::clipboard::has_text() == Some(true)),
             Request::Probed { serial, hit } => {
                 let ours = self
                     .probe
