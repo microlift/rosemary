@@ -35,6 +35,8 @@ use std::io;
 use std::os::fd::RawFd;
 use std::os::unix::fs::MetadataExt;
 use std::path::PathBuf;
+use std::sync::{Mutex, PoisonError};
+use std::time::{Duration, Instant};
 
 use super::{kinfo, sysctl};
 use crate::process::{
@@ -169,8 +171,7 @@ pub fn usage(pid: i32) -> Option<Usage> {
     let proc = kinfo_proc(pid)?;
     let usage = proc.ki_rusage;
     let resident_size = (proc.ki_rssize.max(0) as u64).saturating_mul(page_size());
-    let regions = sysctl::bytes(&proc_mib(libc::KERN_PROC_VMMAP, pid))
-        .map_or(0, |bytes| vmentries(&bytes).count() as u32);
+    let regions = region_count(pid).unwrap_or(0);
     let threads = threads(pid).unwrap_or_default();
     // The monotonic clock counts from boot, and the start time is wall-clock.
     let start_ns = boot_time().map_or(0, |boot| {
@@ -247,8 +248,27 @@ fn vmentries(bytes: &[u8]) -> impl Iterator<Item = libc::kinfo_vmentry> + '_ {
     })
 }
 
+/// How long a region count is reused. `KERN_PROC_VMMAP` also counts every
+/// entry's resident pages under the map lock, tens of milliseconds in a game's
+/// address space, and engines poll the count several times a second.
+const REGION_COUNT_REUSE: Duration = Duration::from_secs(1);
+
 pub fn region_count(pid: i32) -> Option<u32> {
-    regions(pid).ok().map(|regions| regions.len() as u32)
+    // FIXME (ACCURACY): the count can be up to `REGION_COUNT_REUSE` old.
+    // Held across the walk so concurrent callers share one instead of each
+    // contending for the map lock.
+    static LAST: Mutex<Option<(i32, Instant, u32)>> = Mutex::new(None);
+    let mut last = LAST.lock().unwrap_or_else(PoisonError::into_inner);
+    if let Some((counted, when, count)) = *last
+        && counted == pid
+        && when.elapsed() < REGION_COUNT_REUSE
+    {
+        return Some(count);
+    }
+    let bytes = sysctl::bytes(&proc_mib(libc::KERN_PROC_VMMAP, pid)).ok()?;
+    let count = vmentries(&bytes).count() as u32;
+    *last = Some((pid, Instant::now(), count));
+    Some(count)
 }
 
 // `<sys/user.h>` flags the libc crate does not declare.
