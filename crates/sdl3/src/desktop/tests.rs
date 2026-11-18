@@ -315,7 +315,13 @@ impl Guest {
         let (x, y) = at;
         assert_eq!(self.ask(Request::SetPosition { window, x, y }), done);
         assert_eq!(self.ask(Request::Commit { window }), done);
-        assert_eq!(self.ask(Request::Show { window }), done);
+        assert_eq!(
+            self.ask(Request::Show {
+                window,
+                focus: true
+            }),
+            done
+        );
         window
     }
 

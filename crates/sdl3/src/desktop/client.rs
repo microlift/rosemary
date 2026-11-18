@@ -599,9 +599,10 @@ pub(crate) fn window_parent(window: Window) -> Option<Window> {
     Some(carrier.map_or(std::ptr::null_mut(), |carrier| carrier.handle as Window))
 }
 
-pub(crate) fn show_window(window: Window) -> Option<bool> {
+/// Show a window, with the keyboard for `focus`.
+pub(crate) fn show_window(window: Window, focus: bool) -> Option<bool> {
     let window = id_of(window)?;
-    Some(done(Request::Show { window }))
+    Some(done(Request::Show { window, focus }))
 }
 
 pub(crate) fn hide_window(window: Window) -> Option<bool> {

@@ -3536,7 +3536,7 @@ pub mod video {
 
     // Each with what the desktop does for a window of its own.
     window_state_call! {
-        show_window => SDL_ShowWindow, crate::desktop::show_window;
+        show_window => SDL_ShowWindow, |window| crate::desktop::show_window(window, true);
         hide_window => SDL_HideWindow, crate::desktop::hide_window;
         // The desktop has nowhere to keep a minimized window, and says so.
         minimize_window => SDL_MinimizeWindow,
@@ -5516,6 +5516,22 @@ pub mod video {
         set_hint(HINT_ACTIVATE_WHEN_RAISED, c"0");
         raise_window(window);
         set_hint(HINT_ACTIVATE_WHEN_RAISED, c"1");
+    }
+
+    /// `SDL_HINT_WINDOW_ACTIVATE_WHEN_SHOWN`.
+    pub const HINT_ACTIVATE_WHEN_SHOWN: &CStr = c"SDL_WINDOW_ACTIVATE_WHEN_SHOWN";
+
+    /// Show `window` without moving input focus to it, which is what
+    /// `-orderFront:` does on a Mac when it is not asked to make it key.
+    pub fn show_window_keeping_focus(window: Window) -> bool {
+        if let Some(done) = crate::desktop::show_window(window, false) {
+            resample_presentation_window(window);
+            return done;
+        }
+        set_hint(HINT_ACTIVATE_WHEN_SHOWN, c"0");
+        let done = show_window(window);
+        set_hint(HINT_ACTIVATE_WHEN_SHOWN, c"1");
+        done
     }
 
     /// `SDL_HINT_VIDEO_ALLOW_SCREENSAVER`.

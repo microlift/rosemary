@@ -240,7 +240,7 @@ impl Scene {
             minimum: (1, 1),
         });
         if flags & flags::HIDDEN == 0 {
-            self.show(id);
+            self.show(id, true);
         }
     }
 
@@ -555,7 +555,8 @@ impl Scene {
         self.set_frame(id, frame);
     }
 
-    pub(crate) fn show(&mut self, id: WindowId) {
+    /// Show a window in front, giving it the keyboard when `focus` says to.
+    pub(crate) fn show(&mut self, id: WindowId, focus: bool) {
         let Some(window) = self.window_mut(id) else {
             return;
         };
@@ -563,7 +564,7 @@ impl Scene {
             return;
         }
         window.shown = true;
-        self.raise(id, true);
+        self.raise(id, focus);
     }
 
     pub(crate) fn hide(&mut self, id: WindowId) {
@@ -854,7 +855,7 @@ mod tests {
 
     fn add(scene: &mut Scene, id: WindowId, at: (i32, i32)) {
         scene.add(id, None, flags::HIDDEN, at, (200, 100));
-        scene.show(id);
+        scene.show(id, true);
     }
 
     fn events(scene: &mut Scene) -> Vec<Event> {
@@ -874,7 +875,7 @@ mod tests {
         add(&mut scene, 3, (300, 300));
         scene.hide(3);
         scene.add(4, Some(2), flags::TOOLTIP | flags::HIDDEN, (5, 5), (50, 20));
-        scene.show(4);
+        scene.show(4, true);
         let rect = |x, y, w, h| Rect { x, y, w, h };
         assert_eq!(
             scene.pointer_region(),
@@ -906,6 +907,16 @@ mod tests {
                 },
             ]
         );
+    }
+
+    #[test]
+    fn a_window_shown_without_focus_goes_in_front_and_leaves_the_keyboard() {
+        let mut scene = scene();
+        add(&mut scene, 1, (0, 0));
+        scene.add(2, None, flags::HIDDEN, (50, 50), (200, 100));
+        scene.show(2, false);
+        assert_eq!(scene.stack(), [1, 2]);
+        assert_eq!(scene.keyboard(), 1);
     }
 
     #[test]

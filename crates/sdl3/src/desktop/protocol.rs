@@ -123,8 +123,10 @@ pub(crate) enum Request {
         x: i32,
         y: i32,
     },
+    /// Show a window, giving it the keyboard when `focus` says to.
     Show {
         window: WindowId,
+        focus: bool,
     },
     Hide {
         window: WindowId,
@@ -256,7 +258,7 @@ wire_enum!(Request {
     2 => Destroy { window },
     3 => SetSize { window, width, height },
     4 => SetPosition { window, x, y },
-    5 => Show { window },
+    5 => Show { window, focus },
     6 => Hide { window },
     7 => Raise { window, focus },
     8 => SetCovering { window, state, on },
@@ -341,7 +343,7 @@ impl Request {
             Request::Destroy { window }
             | Request::SetSize { window, .. }
             | Request::SetPosition { window, .. }
-            | Request::Show { window }
+            | Request::Show { window, .. }
             | Request::Hide { window }
             | Request::Raise { window, .. }
             | Request::SetCovering { window, .. }
@@ -840,7 +842,14 @@ mod tests {
     fn frames_come_off_a_stream_whole_however_it_was_cut() {
         let mut stream = Vec::new();
         put_frame(&mut stream, &Request::Pointer).unwrap();
-        put_frame(&mut stream, &Request::Show { window: 3 }).unwrap();
+        put_frame(
+            &mut stream,
+            &Request::Show {
+                window: 3,
+                focus: true,
+            },
+        )
+        .unwrap();
         let mut unread = Vec::new();
         let mut frames = Vec::new();
         for byte in stream {
@@ -849,7 +858,16 @@ mod tests {
                 frames.push(decode::<Request>(&frame).unwrap());
             }
         }
-        assert_eq!(frames, [Request::Pointer, Request::Show { window: 3 }]);
+        assert_eq!(
+            frames,
+            [
+                Request::Pointer,
+                Request::Show {
+                    window: 3,
+                    focus: true
+                }
+            ]
+        );
         assert!(unread.is_empty());
     }
 

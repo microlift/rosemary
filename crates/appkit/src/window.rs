@@ -2319,7 +2319,10 @@ fn order_front(receiver: Id, make_key: bool) {
         sdl3::video::set_window_size(sdl, width.max(1), height.max(1));
         sdl3::video::set_window_position(sdl, local_x, local_y);
     }
-    sdl3::video::show_window(sdl);
+    match make_key {
+        true => sdl3::video::show_window(sdl),
+        false => sdl3::video::show_window_keeping_focus(sdl),
+    };
     if want == Presentation::Toplevel {
         // A popup cannot be raised - it is already above its parent, and SDL
         // refuses - and asking would only log a failure.

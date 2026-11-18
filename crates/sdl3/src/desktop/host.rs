@@ -688,8 +688,8 @@ impl Host {
                 self.scene.set_position(window, x, y);
                 done(true)
             }
-            Request::Show { window } => {
-                self.scene.show(window);
+            Request::Show { window, focus } => {
+                self.scene.show(window, focus);
                 done(true)
             }
             Request::Hide { window } => {
