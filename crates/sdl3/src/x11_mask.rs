@@ -17,6 +17,14 @@ use std::sync::{Mutex, OnceLock};
 type Display = *mut c_void;
 type NativeWindow = c_ulong;
 
+/// `<X11/extensions/shape.h>`: the shapes a window has, and how a shape is
+/// combined with the one it had.
+const SHAPE_BOUNDING: c_int = 0;
+const SHAPE_INPUT: c_int = 2;
+const SHAPE_SET: c_int = 0;
+/// `<X11/X.h>`: rectangles in no particular order.
+const UNSORTED: c_int = 0;
+
 #[repr(C)]
 #[derive(Clone, Copy)]
 struct XRectangle {
@@ -109,6 +117,22 @@ fn xlib() -> Option<&'static Xlib> {
     .as_ref()
 }
 
+/// Whether the display has the Shape extension at a version with input
+/// shapes (1.1).
+///
+/// # Safety
+///
+/// `display` is live and locked by the caller.
+unsafe fn has_input_shapes(x: &Xlib, display: Display) -> bool {
+    let (mut event, mut error, mut major, mut minor) = (0, 0, 0, 0);
+    // SAFETY: as the caller promises; the out-parameters are locals.
+    let answered = unsafe {
+        (x.shape_query)(display, &mut event, &mut error) != 0
+            && (x.shape_version)(display, &mut major, &mut minor) != 0
+    };
+    answered && (major, minor) >= (1, 1)
+}
+
 #[derive(Clone, Copy)]
 struct Mask {
     display: usize,
@@ -157,19 +181,11 @@ pub fn update(window: Window, clip: Option<Rect>) -> bool {
         return true;
     }
     if let std::collections::hash_map::Entry::Vacant(vacant) = map.entry(window as usize) {
-        let mut event = 0;
-        let mut error = 0;
         // SAFETY: SDL supplies a live X11 Display and native window; access is
         // guarded by Xlib on the same display. Child is input-transparent.
         let overlay = unsafe {
             (x.lock)(display);
-            let supported = (x.shape_query)(display, &mut event, &mut error) != 0;
-            let mut major = 0;
-            let mut minor = 0;
-            let supported = supported
-                && (x.shape_version)(display, &mut major, &mut minor) != 0
-                && (major > 1 || (major == 1 && minor >= 1));
-            let overlay = if supported {
+            let overlay = if has_input_shapes(x, display) {
                 (x.create)(
                     display,
                     host as NativeWindow,
@@ -185,7 +201,17 @@ pub fn update(window: Window, clip: Option<Rect>) -> bool {
                 0
             };
             if overlay != 0 {
-                (x.shape)(display, overlay, 2, 0, 0, std::ptr::null(), 0, 0, 0);
+                (x.shape)(
+                    display,
+                    overlay,
+                    SHAPE_INPUT,
+                    0,
+                    0,
+                    std::ptr::null(),
+                    0,
+                    SHAPE_SET,
+                    UNSORTED,
+                );
             }
             (x.unlock)(display);
             overlay
@@ -222,13 +248,13 @@ pub fn update(window: Window, clip: Option<Rect>) -> bool {
         (x.shape)(
             display,
             entry.overlay,
-            0,
+            SHAPE_BOUNDING,
             0,
             0,
             mask_bands.as_ptr(),
             mask_bands.len() as c_int,
-            0,
-            0,
+            SHAPE_SET,
+            UNSORTED,
         );
         if mask_bands.is_empty() {
             if entry.shown {
@@ -244,6 +270,59 @@ pub fn update(window: Window, clip: Option<Rect>) -> bool {
     entry.size = size;
     entry.shown = !mask_bands.is_empty();
     true
+}
+
+/// Take pointer input on `window` only inside `rects`, in its coordinates.
+/// False when X11 or its Shape extension is not there.
+pub fn set_input_region(window: Window, rects: &[Rect]) -> bool {
+    let Some(x) = xlib() else {
+        return false;
+    };
+    let Some((display, host)) = video::x11_native_window(window) else {
+        return false;
+    };
+    let Some((width, height)) = video::window_size(window) else {
+        return false;
+    };
+    let whole = Rect {
+        x: 0,
+        y: 0,
+        w: width,
+        h: height,
+    };
+    let rects: Vec<XRectangle> = rects
+        .iter()
+        .map(|rect| rect.intersection(whole))
+        .filter(|rect| !rect.is_empty())
+        .map(|rect| XRectangle {
+            x: rect.x as i16,
+            y: rect.y as i16,
+            width: rect.w as u16,
+            height: rect.h as u16,
+        })
+        .collect();
+    // SAFETY: SDL's live display and window, used under the display's lock;
+    // the rectangles are copied before the call returns.
+    unsafe {
+        (x.lock)(display);
+        let supported = has_input_shapes(x, display);
+        if supported {
+            (x.shape)(
+                display,
+                host as NativeWindow,
+                SHAPE_INPUT,
+                0,
+                0,
+                rects.as_ptr(),
+                rects.len() as c_int,
+                SHAPE_SET,
+                UNSORTED,
+            );
+            (x.sync)(display, 0);
+        }
+        (x.unlock)(display);
+        supported
+    }
 }
 
 /// Destroy a child mask while its SDL parent and X11 display are still alive.

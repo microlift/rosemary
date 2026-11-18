@@ -14,7 +14,6 @@ pub mod tray;
 pub mod wayland;
 #[cfg(target_os = "linux")]
 pub mod wayland_mask;
-#[cfg(target_os = "linux")]
 pub mod x11_mask;
 
 pub mod init {
@@ -280,7 +279,6 @@ struct Api {
     SDL_GetWindowFromID: Option<unsafe extern "C" fn(u32) -> Window>,
     SDL_GetWindowFlags: Option<unsafe extern "C" fn(Window) -> u64>,
     SDL_SetWindowIcon: Option<unsafe extern "C" fn(Window, *mut c_void) -> bool>,
-    SDL_SetWindowShape: Option<unsafe extern "C" fn(Window, *mut c_void) -> bool>,
     SDL_CreateSurfaceFrom:
         Option<unsafe extern "C" fn(c_int, c_int, u32, *mut c_void, c_int) -> *mut c_void>,
     SDL_DestroySurface: Option<unsafe extern "C" fn(*mut c_void)>,
@@ -531,7 +529,6 @@ fn api() -> Option<&'static Api> {
             SDL_GetWindowFromID,
             SDL_GetWindowFlags,
             SDL_SetWindowIcon,
-            SDL_SetWindowShape,
             SDL_CreateSurfaceFrom,
             SDL_DestroySurface,
             SDL_GetWindowSurface,
@@ -3695,65 +3692,16 @@ pub mod video {
     /// False when it was not done, which on Wayland includes the time before
     /// the first turn of the event pump.
     pub(crate) fn set_window_input_region(window: Window, rects: &[Rect]) -> bool {
-        // SDL shapes no Wayland window, so there the surface is asked.
+        // Given to the window system as rectangles: SDL's own shape is a
+        // whole-window mask, made again for every change.
         if !has_window_input_regions() {
             return false;
         }
-        if host_is_wayland() {
-            return wayland_surface(window)
-                .is_some_and(|(_, surface)| crate::wayland::set_input_region(surface, rects));
+        match host_is_wayland() {
+            true => wayland_surface(window)
+                .is_some_and(|(_, surface)| crate::wayland::set_input_region(surface, rects)),
+            false => crate::x11_mask::set_input_region(window, rects),
         }
-        let Some((width, height)) = window_size(window).filter(|(w, h)| *w > 0 && *h > 0) else {
-            return false;
-        };
-        let Some(api) = api() else {
-            return false;
-        };
-        let (Some(create), Some(set), Some(destroy)) = (
-            api.SDL_CreateSurfaceFrom,
-            api.SDL_SetWindowShape,
-            api.SDL_DestroySurface,
-        ) else {
-            return false;
-        };
-        // SDL takes input wherever the shape is not fully transparent.
-        const BYTES_PER_PIXEL: usize = 4;
-        const TAKEN: u8 = 0xff;
-        let pitch = width as usize * BYTES_PER_PIXEL;
-        let mut pixels = vec![0u8; pitch * height as usize];
-        let whole = Rect {
-            x: 0,
-            y: 0,
-            w: width,
-            h: height,
-        };
-        let inside = rects.iter().map(|rect| rect.intersection(whole));
-        for rect in inside.filter(|rect| !rect.is_empty()) {
-            for row in rect.y..rect.y + rect.h {
-                let start = row as usize * pitch + rect.x as usize * BYTES_PER_PIXEL;
-                pixels[start..start + rect.w as usize * BYTES_PER_PIXEL].fill(TAKEN);
-            }
-        }
-        // SAFETY: the buffer is `pitch * height` bytes, as the format and
-        // pitch say, and outlives the surface, which borrows it.
-        let surface = unsafe {
-            create(
-                width,
-                height,
-                pixel_format::ARGB8888,
-                pixels.as_mut_ptr().cast(),
-                pitch as c_int,
-            )
-        };
-        if surface.is_null() {
-            return false;
-        }
-        // SAFETY: a window this crate created and a surface just made, of
-        // which SDL takes its own copy.
-        let ok = unsafe { set(window, surface) };
-        // SAFETY: as above.
-        unsafe { destroy(surface) };
-        ok
     }
 
     /// The small integer SDL puts in an event to name a window.
@@ -5423,7 +5371,6 @@ pub mod video {
 
     /// X11's live display and native window handle. Borrowed from SDL; do
     /// not close the display, and finish host requests before destroying SDL.
-    #[cfg(target_os = "linux")]
     pub(crate) fn x11_native_window(window: Window) -> Option<(*mut c_void, u64)> {
         if !is_x11() {
             return None;
