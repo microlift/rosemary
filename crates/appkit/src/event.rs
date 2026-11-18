@@ -465,16 +465,42 @@ pub(crate) fn deliver_past_modal(event: sdl3::video::Event) {
                 crate::screen::forget_recentring();
                 crate::screen::release_relative_pointer(window);
             }
+            // A key popup over this window keeps key across the program
+            // losing the host's focus and getting it back.
+            let key = window::key_target(object);
             if !object.is_null() && gained {
-                window::set_key_window(object);
+                if key == object {
+                    window::set_key_window(object);
+                }
                 // SDL drops relative mouse mode when focus goes, and a window
                 // made while the guest was disassociated never entered it.
                 crate::screen::apply_mouse_association();
                 crate::screen::confine_pointer(object);
             }
             match gained {
-                true => announce_key(object),
-                false => announce_resign(object),
+                true => {
+                    let resigned = RESIGNED_MAIN.swap(0, std::sync::atomic::Ordering::AcqRel) as Id;
+                    announce_key(key);
+                    // A key window that cannot be main leaves main to the
+                    // window it was focused through, else to the one main
+                    // when the program last lost focus.
+                    if !key.is_null() && !answers(key, "canBecomeMainWindow") {
+                        announce_main(object);
+                        if main_window().is_null() {
+                            announce_main(resigned);
+                        }
+                    }
+                }
+                false => {
+                    resign_key(key);
+                    // The main window stays main while focus is on another
+                    // window of this program.
+                    if !window::has_host_focus() {
+                        let main = main_window();
+                        resign_main(main);
+                        RESIGNED_MAIN.store(main as usize, std::sync::atomic::Ordering::Release);
+                    }
+                }
             }
         }
         Event::Key {
@@ -498,7 +524,7 @@ pub(crate) fn deliver_past_modal(event: sdl3::video::Event) {
                 scancode,
                 crate::keymap::typed_key(scancode, key, modifiers),
             );
-            let window = object_for(id);
+            let window = window::key_target(object_for(id));
             if window.is_null() {
                 key_withheld(&event);
                 return;
@@ -550,7 +576,7 @@ pub(crate) fn deliver_past_modal(event: sdl3::video::Event) {
         // layout- and IME-resolved commit, and must go to the focused
         // `NSTextInputClient`; `-characters` is not a substitute for it.
         Event::Text { window, text } => {
-            let window = object_for(window);
+            let window = window::key_target(object_for(window));
             let responder = responder_of(window);
             if crate::text::accepts_host_text(responder) {
                 crate::text::commit(responder, &text);
@@ -562,7 +588,7 @@ pub(crate) fn deliver_past_modal(event: sdl3::video::Event) {
             start,
             length,
         } => {
-            let window = object_for(window);
+            let window = window::key_target(object_for(window));
             let responder = responder_of(window);
             if crate::text::accepts_host_text(responder) {
                 crate::text::compose(responder, &text, start, length);
@@ -1342,6 +1368,7 @@ pub fn route(window: Id, event: Id) {
     };
     let start = target.view;
     if kind == kind::LEFT_MOUSE_DOWN {
+        window::mouse_down(window, start);
         focus_clicked(window, start);
     }
     let Some((responder, method)) = chain(start, sel) else {
@@ -1747,11 +1774,24 @@ fn post(id: u32, name: &str) {
     post_for(object, name);
 }
 
-/// The window last announced as key and main, which is not always
+/// The window last announced as key, which is not always
 /// [`window::key_window`]: that one follows every ordering, and this one only
 /// changes with a pair of notifications, so no window becomes key twice
 /// without resigning in between.
 static ANNOUNCED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// The main window: the last key window that could become main. A panel
+/// taking key leaves it where it was.
+static MAIN: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// The main window when the program last lost the host's focus, given main
+/// back on its return when the window taking key cannot be main. Focus can
+/// leave one window of the program a pump before it reaches another.
+static RESIGNED_MAIN: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+pub(crate) fn main_window() -> Id {
+    MAIN.load(std::sync::atomic::Ordering::Acquire) as Id
+}
 
 pub(crate) fn answers(object: Id, selector: &str) -> bool {
     // SAFETY: a window this crate made; both selectors are `BOOL (id, SEL)`,
@@ -1763,51 +1803,89 @@ pub(crate) fn answers(object: Id, selector: &str) -> bool {
     }
 }
 
-/// `object` becomes the key window, and the main one when it can: the window
-/// before it resigns both first, as AppKit orders them. Toolkits activate on
+/// `object` becomes the key window, and the main one when it can: the
+/// windows before it resign first, as AppKit orders them. Toolkits activate on
 /// these - Gecko only fires DOM focus events in a window it was told is key.
 pub(crate) fn announce_key(object: Id) {
     if object.is_null() || !answers(object, "canBecomeKeyWindow") {
         return;
     }
-    let previous = ANNOUNCED.swap(object as usize, std::sync::atomic::Ordering::AcqRel) as Id;
-    if previous == object {
-        return;
+    let key = ANNOUNCED.swap(object as usize, std::sync::atomic::Ordering::AcqRel) as Id;
+    let main = match answers(object, "canBecomeMainWindow") {
+        true => MAIN.swap(object as usize, std::sync::atomic::Ordering::AcqRel) as Id,
+        false => object,
+    };
+    if key != object && !key.is_null() {
+        post_for(key, window::DID_RESIGN_KEY);
     }
-    if !previous.is_null() {
-        post_for(previous, window::DID_RESIGN_KEY);
-        post_for(previous, window::DID_RESIGN_MAIN);
+    if main != object && !main.is_null() {
+        post_for(main, window::DID_RESIGN_MAIN);
     }
-    post_for(object, window::DID_BECOME_KEY);
-    if answers(object, "canBecomeMainWindow") {
+    if key != object {
+        post_for(object, window::DID_BECOME_KEY);
+    }
+    if main != object {
         post_for(object, window::DID_BECOME_MAIN);
     }
 }
 
-/// `object` stops being key and main, if it was: focus left it, or it left
-/// the screen.
-pub(crate) fn announce_resign(object: Id) {
-    let was = ANNOUNCED.compare_exchange(
+/// `-makeMainWindow`: `object` becomes main without becoming key.
+pub(crate) fn announce_main(object: Id) {
+    if object.is_null() || !answers(object, "canBecomeMainWindow") {
+        return;
+    }
+    let main = MAIN.swap(object as usize, std::sync::atomic::Ordering::AcqRel) as Id;
+    if main == object {
+        return;
+    }
+    if !main.is_null() {
+        post_for(main, window::DID_RESIGN_MAIN);
+    }
+    post_for(object, window::DID_BECOME_MAIN);
+}
+
+/// Clear `slot` if it holds `object`, answering whether it did.
+pub(crate) fn forget(slot: &std::sync::atomic::AtomicUsize, object: Id) -> bool {
+    slot.compare_exchange(
         object as usize,
         0,
         std::sync::atomic::Ordering::AcqRel,
         std::sync::atomic::Ordering::Acquire,
-    );
-    if was.is_ok() && !object.is_null() {
+    )
+    .is_ok()
+}
+
+/// `object` stops being key and main, whichever it was: focus left it, or it
+/// left the screen.
+pub(crate) fn announce_resign(object: Id) {
+    resign_key(object);
+    resign_main(object);
+    forget(&RESIGNED_MAIN, object);
+}
+
+fn resign_key(object: Id) {
+    if !object.is_null() && forget(&ANNOUNCED, object) {
         post_for(object, window::DID_RESIGN_KEY);
+    }
+}
+
+fn resign_main(object: Id) {
+    if !object.is_null() && forget(&MAIN, object) {
         post_for(object, window::DID_RESIGN_MAIN);
     }
+}
+
+#[cfg(test)]
+pub(crate) fn announced_key() -> Id {
+    ANNOUNCED.load(std::sync::atomic::Ordering::Acquire) as Id
 }
 
 /// A window being freed is no longer the announced one; nothing is posted
 /// about an object that is going.
 pub(crate) fn forget_announced(object: Id) {
-    let _ = ANNOUNCED.compare_exchange(
-        object as usize,
-        0,
-        std::sync::atomic::Ordering::AcqRel,
-        std::sync::atomic::Ordering::Acquire,
-    );
+    forget(&ANNOUNCED, object);
+    forget(&MAIN, object);
+    forget(&RESIGNED_MAIN, object);
 }
 
 /// Send the window notification `name` about `object` to its delegate and to
