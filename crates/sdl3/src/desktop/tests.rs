@@ -2,6 +2,7 @@
 //! dummy video driver.
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{Duration, Instant};
 
 use super::client::{Connection, ask};
@@ -65,6 +66,10 @@ fn the_host_serves_until_its_guests_have_gone() {
 /// Whether the calling test should run here: alone in its process, as a
 /// guest pointed at a desktop of its own.
 fn on_a_desktop() -> bool {
+    on_a_desktop_launched_by(launch)
+}
+
+fn on_a_desktop_launched_by(launch: super::Launcher) -> bool {
     if !crate::isolated::run_here_on_dummy_desktop("320x200") {
         return false;
     }
@@ -410,4 +415,50 @@ fn the_extent_is_fullscreen_or_a_size() {
     assert_eq!(parse("1280"), None);
     assert_eq!(parse("on"), None);
     assert_eq!(Extent::Sized(1280, 800).to_string(), "1280x800");
+}
+
+static LAUNCHES: AtomicU32 = AtomicU32::new(0);
+
+/// A desktop that fails to start the first time it is asked for.
+fn launch_on_the_second_try(directory: &Path, extent: Extent) -> std::io::Result<()> {
+    match LAUNCHES.fetch_add(1, Ordering::Relaxed) {
+        0 => Err(std::io::Error::other("not this time")),
+        _ => launch(directory, extent),
+    }
+}
+
+#[test]
+fn a_guest_that_could_not_join_tries_again_later() {
+    if !on_a_desktop_launched_by(launch_on_the_second_try) {
+        return;
+    }
+    assert!(video::create_window(c"window", 100, 50, flags::HIDDEN).is_none());
+    assert!(video::create_window(c"window", 100, 50, flags::HIDDEN).is_none());
+    assert_eq!(LAUNCHES.load(Ordering::Relaxed), 1);
+    std::thread::sleep(super::client::RETRY);
+    window((10, 10), RED);
+    assert_eq!(shown_at(15, 15), RED);
+}
+
+#[test]
+fn a_fork_child_joins_the_desktop_itself() {
+    if !on_a_desktop() {
+        return;
+    }
+    window((10, 10), RED);
+    // SAFETY: the child only makes a window and leaves with `_exit`.
+    let child = unsafe { libc::fork() };
+    if child == 0 {
+        let shown = std::panic::catch_unwind(|| {
+            window((60, 30), BLUE);
+            shown_at(70, 40) == BLUE
+        });
+        // SAFETY: ends the child without running the parent's destructors.
+        unsafe { libc::_exit(i32::from(!matches!(shown, Ok(true)))) };
+    }
+    let mut status = 0;
+    // SAFETY: a child of this process, waited for once.
+    assert_eq!(unsafe { libc::waitpid(child, &mut status, 0) }, child);
+    assert!(libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0);
+    assert_eq!(shown_at(15, 15), RED);
 }

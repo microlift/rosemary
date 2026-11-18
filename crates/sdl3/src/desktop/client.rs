@@ -17,7 +17,7 @@ use std::os::unix::ffi::OsStrExt;
 use std::os::unix::net::UnixStream;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{LazyLock, Mutex, MutexGuard, TryLockError};
+use std::sync::{LazyLock, Mutex, MutexGuard, Once, TryLockError};
 use std::time::{Duration, Instant};
 
 use server::codec;
@@ -225,12 +225,29 @@ struct Link {
 
 static LINK: Mutex<Option<Link>> = Mutex::new(None);
 
-/// Whether this process has a desktop now, and whether it ever had one or
-/// was refused one: checked before either lock on paths every window call
-/// and every event poll takes.
+/// Whether this process has a desktop now, and whether it ever had one:
+/// checked before either lock on paths every window call and every event
+/// poll takes. A `fork` child has neither (see [`forked`]).
 static UP: AtomicBool = AtomicBool::new(false);
 static JOINED: AtomicBool = AtomicBool::new(false);
-static UNAVAILABLE: AtomicBool = AtomicBool::new(false);
+
+/// How long after failing to join this process waits before trying again,
+/// so a desktop that will not start is not launched for every window.
+pub(super) const RETRY: Duration = Duration::from_secs(2);
+
+/// When joining last failed, and whether the user has been told why.
+static FAILED_AT: Mutex<Option<Instant>> = Mutex::new(None);
+static WARNED: AtomicBool = AtomicBool::new(false);
+
+static FORK_HANDLER: Once = Once::new();
+
+/// In a `fork` child: the parent's desktop is not its own, and it may join
+/// one itself. Only atomics, as nothing else is safe to touch here; the
+/// connection and table are dropped by [`disown`].
+extern "C" fn forked() {
+    UP.store(false, Ordering::Release);
+    JOINED.store(false, Ordering::Release);
+}
 
 fn client() -> MutexGuard<'static, Client> {
     CLIENT.lock().unwrap_or_else(|e| e.into_inner())
@@ -377,7 +394,11 @@ fn join() -> bool {
     }
     // One desktop for the life of the process: its windows cannot follow it
     // to another.
-    if JOINED.load(Ordering::Acquire) || UNAVAILABLE.load(Ordering::Acquire) {
+    if JOINED.load(Ordering::Acquire) {
+        return false;
+    }
+    let mut failed_at = FAILED_AT.lock().unwrap_or_else(|e| e.into_inner());
+    if failed_at.is_some_and(|at| at.elapsed() < RETRY) {
         return false;
     }
     let Some(extent) = extent() else {
@@ -389,6 +410,13 @@ fn join() -> bool {
     };
     match joined {
         Ok(connection) => {
+            *failed_at = None;
+            drop(failed_at);
+            // SAFETY: `forked` is an `extern "C" fn()` that only stores to
+            // atomics, which is safe in a child of a threaded process.
+            FORK_HANDLER.call_once(|| unsafe {
+                libc::pthread_atfork(None, None, Some(forked));
+            });
             *guard = Some(Link {
                 connection,
                 pid: std::process::id(),
@@ -404,11 +432,13 @@ fn join() -> bool {
             true
         }
         Err(e) => {
-            UNAVAILABLE.store(true, Ordering::Release);
-            eprintln!(
-                "rosemary: sdl3: no virtual desktop to make windows on ({ENV}): {e}; run \
-                 `rosemary desktop --foreground` to see why it does not start"
-            );
+            *failed_at = Some(Instant::now());
+            if !WARNED.swap(true, Ordering::AcqRel) {
+                eprintln!(
+                    "rosemary: sdl3: no virtual desktop to make windows on ({ENV}): {e}; run \
+                     `rosemary desktop --foreground` to see why it does not start"
+                );
+            }
             false
         }
     }
