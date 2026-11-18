@@ -396,6 +396,9 @@ static SHARED_MODULES: &[exports::Module] = &[
     net::MODULE,
     kqueue::MODULE,
     modes::MODULE,
+    printf_l::MODULE,
+    sprintf::MODULE,
+    strfmt::MODULE,
 ];
 
 /// Builtin modules whose guest exports are not yet ported to macOS.
@@ -420,9 +423,6 @@ static NONPORTABLE_MODULES: &[exports::Module] = &[
     shm::MODULE,
     oslog::MODULE,
     backtrace::MODULE,
-    printf_l::MODULE,
-    sprintf::MODULE,
-    strfmt::MODULE,
     syslog::MODULE,
     asl::MODULE,
     #[cfg(target_arch = "x86_64")]
