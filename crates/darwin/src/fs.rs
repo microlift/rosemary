@@ -1737,8 +1737,14 @@ mod tests {
         crate::errno::set(0);
     }
 
-    #[test]
+    /// The host error an escape from `RESOLVE_BENEATH` fails with.
     #[cfg(target_os = "linux")]
+    const ESCAPED: c_int = libc::EXDEV;
+    #[cfg(target_os = "freebsd")]
+    const ESCAPED: c_int = libc::ENOTCAPABLE;
+
+    #[test]
+    #[cfg(any(target_os = "linux", target_os = "freebsd"))]
     fn unlinkat_resolve_beneath_removes_inside_and_refuses_an_escape() {
         let flag = crate::stat::beneath::SUPPORTED;
         let scratch = Scratch::new("unlinkat-beneath");
@@ -1758,7 +1764,7 @@ mod tests {
             for escape in [c"../outside", c"up/outside", c"sub/../..", c"/tmp/x"] {
                 crate::errno::set(0);
                 assert_eq!(unlinkat(fd, escape.as_ptr(), flag), -1, "{escape:?}");
-                assert_eq!(crate::errno::get(), libc::EXDEV, "{escape:?}");
+                assert_eq!(crate::errno::get(), ESCAPED, "{escape:?}");
             }
             // The symlink itself is inside, and removing it does not follow it.
             assert_eq!(unlinkat(fd, c"up".as_ptr(), flag), 0);

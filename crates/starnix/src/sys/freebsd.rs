@@ -272,10 +272,16 @@ pub fn regions(pid: i32) -> io::Result<Vec<Region>> {
 
 /// Whether an entry maps its object `MAP_SHARED`. The map does not record the
 /// flag, but a private mapping of a file or a shared memory object is
-/// copy-on-write, and a shared one is not.
+/// copy-on-write, and a shared one is not. A device can only be mapped shared.
 // FIXME (ACCURACY): anonymous memory is never copy-on-write and has no object
 // of its own to name, so a shared anonymous mapping reads as private.
 fn shared(entry: &libc::kinfo_vmentry) -> bool {
+    if matches!(
+        entry.kve_type,
+        libc::KVME_TYPE_DEVICE | libc::KVME_TYPE_MGTDEVICE
+    ) {
+        return true;
+    }
     let object = entry.kve_type == libc::KVME_TYPE_VNODE
         || entry.kve_flags & (KVME_FLAG_POSIXSHM | KVME_FLAG_SYSVSHM) != 0;
     object && entry.kve_flags & libc::KVME_FLAG_COW == 0

@@ -6,19 +6,18 @@
 //! `linux` and `freebsd`. This module holds what Darwin means by each filter.
 
 use std::ffi::c_int;
-use std::os::fd::{FromRawFd, OwnedFd};
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 
-use super::{EVFILT_PROC, EVFILT_TIMER, EVFILT_VNODE, Kevent};
+use super::{EV_CLEAR, EV_EOF, EV_ONESHOT, EVFILT_PROC, EVFILT_TIMER, EVFILT_VNODE, Kevent};
 
 #[cfg(target_os = "freebsd")]
 mod freebsd;
+#[cfg(target_os = "freebsd")]
+use freebsd as host;
 #[cfg(target_os = "linux")]
 mod linux;
-
-#[cfg(target_os = "freebsd")]
-pub(super) use freebsd::Source;
 #[cfg(target_os = "linux")]
-pub(super) use linux::Source;
+use linux as host;
 
 /// The filters this module answers.
 pub(super) const FILTERS: [i16; 3] = [EVFILT_TIMER, EVFILT_VNODE, EVFILT_PROC];
@@ -64,10 +63,8 @@ const PROC_REFUSED: &[(u32, &str)] = &[
     (0x0200_0000, "NOTE_EXIT_DETAIL"),
 ];
 
-/// Darwin's wait status: `WCOREFLAG` for a core dump, and an exit code
-/// as `W_EXITCODE` places it.
-const WCOREFLAG: u32 = 0x80;
-const EXIT_CODE_MASK: u32 = 0xff;
+/// Where Darwin's `W_EXITCODE` places an exit code in a wait status.
+#[cfg_attr(not(any(target_os = "linux", test)), allow(dead_code))]
 const EXIT_CODE_SHIFT: u32 = 8;
 
 const NANOS_PER_SEC: u64 = 1_000_000_000;
@@ -226,6 +223,196 @@ fn exit_status_refused() -> c_int {
         "NOTE_EXITSTATUS for a process that is not a child",
     );
     libc::ENOTSUP
+}
+
+pub(super) struct Source {
+    /// What the backend watches.
+    fd: OwnedFd,
+    kind: Kind,
+    /// The `NOTE_*` bits that happened and are not yet reported.
+    fflags: u32,
+    /// Timer expirations, or the exit status, not yet reported.
+    data: u64,
+    /// The watched object is gone: the event ends the registration.
+    eof: bool,
+}
+
+enum Kind {
+    Timer {
+        absolute: bool,
+    },
+    Vnode {
+        requested: u32,
+        watch: host::VnodeWatch,
+    },
+    Proc {
+        requested: u32,
+        /// The host pid, for hosts that cannot ask the watch itself.
+        pid: libc::pid_t,
+    },
+}
+
+impl Source {
+    /// The host object behind a new registration. Errors are host `errno`s.
+    pub(super) fn open(change: &Kevent) -> Result<Self, c_int> {
+        let (fd, kind) = match change.filter {
+            EVFILT_TIMER => {
+                let schedule = schedule(change)?;
+                let absolute = schedule.absolute;
+                (host::timer(schedule)?, Kind::Timer { absolute })
+            }
+            EVFILT_VNODE => {
+                refuse("EVFILT_VNODE", change.fflags, VNODE_REFUSED)?;
+                let (guest, kind) = vnode_target(change)?;
+                let (fd, watch) = host::vnode(guest, kind)?;
+                let requested = change.fflags;
+                (fd, Kind::Vnode { requested, watch })
+            }
+            EVFILT_PROC => process(change)?,
+            _ => return Err(libc::EINVAL),
+        };
+        Ok(Self {
+            fd,
+            kind,
+            fflags: 0,
+            data: 0,
+            eof: false,
+        })
+    }
+
+    /// `EV_ADD` on an existing registration: the new `fflags` take over. A
+    /// timer is re-armed from scratch, which Darwin does too, so the answer is
+    /// a replacement source.
+    pub(super) fn touch(&mut self, change: &Kevent) -> Result<Option<Self>, c_int> {
+        match &mut self.kind {
+            Kind::Timer { absolute } => {
+                if *absolute != (change.fflags & NOTE_ABSOLUTE != 0) {
+                    return Err(libc::EINVAL);
+                }
+                Self::open(change).map(Some)
+            }
+            Kind::Vnode { requested, .. } => {
+                refuse("EVFILT_VNODE", change.fflags, VNODE_REFUSED)?;
+                *requested = change.fflags;
+                Ok(None)
+            }
+            Kind::Proc { requested, pid } => {
+                check_process_notes(change.fflags)?;
+                if change.fflags & NOTE_EXITSTATUS != 0
+                    && !host::is_child(self.fd.as_raw_fd(), *pid)
+                {
+                    return Err(exit_status_refused());
+                }
+                *requested = change.fflags;
+                Ok(None)
+            }
+        }
+    }
+
+    pub(super) fn fd(&self) -> c_int {
+        self.fd.as_raw_fd()
+    }
+
+    /// The `flags` Darwin forces on a registration of this kind.
+    pub(super) fn forced_flags(&self) -> u16 {
+        match self.kind {
+            Kind::Timer { absolute: true } => EV_CLEAR | EV_ONESHOT,
+            Kind::Timer { absolute: false } | Kind::Proc { .. } => EV_CLEAR,
+            Kind::Vnode { .. } => 0,
+        }
+    }
+
+    /// Read what the host reported since the last call into the pending event.
+    pub(super) fn collect(&mut self) {
+        let fd = self.fd.as_raw_fd();
+        match &mut self.kind {
+            Kind::Timer { .. } => {
+                self.data = self.data.saturating_add(host::expirations(fd));
+            }
+            Kind::Vnode { requested, watch } => {
+                let (hints, revoked) = watch.collect(fd);
+                // Darwin records every bit of an event the registration asked
+                // for any part of, and a revoke whatever was asked.
+                if *requested & hints != 0 {
+                    self.fflags |= hints;
+                }
+                if revoked {
+                    self.fflags |= *requested & NOTE_REVOKE;
+                    self.eof = true;
+                }
+            }
+            Kind::Proc { requested, .. } => {
+                if self.eof {
+                    return;
+                }
+                let Some(status) = host::exit_status(fd) else {
+                    return;
+                };
+                self.eof = true;
+                self.fflags = *requested & (NOTE_EXIT | NOTE_EXITSTATUS);
+                if *requested & NOTE_EXITSTATUS != 0 {
+                    self.data = status as u64;
+                }
+            }
+        }
+    }
+
+    /// Whether there is an event to report.
+    pub(super) fn pending(&self) -> bool {
+        match self.kind {
+            Kind::Timer { .. } => self.data != 0,
+            Kind::Vnode { .. } => self.fflags != 0 || self.eof,
+            Kind::Proc { .. } => self.fflags != 0,
+        }
+    }
+
+    /// The event `fired` (the registration's own) becomes, if one is pending,
+    /// and what is left pending afterwards. Darwin clears what it reported
+    /// only for an `EV_CLEAR` registration.
+    pub(super) fn take(&mut self, mut fired: Kevent, flags: u16) -> Option<Kevent> {
+        if !self.pending() {
+            return None;
+        }
+        match self.kind {
+            Kind::Timer { .. } => {
+                fired.fflags = 0;
+                fired.data = std::mem::take(&mut self.data) as isize;
+            }
+            Kind::Vnode { .. } => {
+                fired.fflags = self.fflags;
+                if self.eof {
+                    fired.flags |= EV_EOF | EV_ONESHOT;
+                }
+                if flags & EV_CLEAR != 0 {
+                    self.fflags = 0;
+                }
+            }
+            Kind::Proc { .. } => {
+                fired.fflags = std::mem::take(&mut self.fflags);
+                fired.data = (self.data as u32 & NOTE_PDATAMASK) as isize;
+                fired.flags |= EV_EOF | EV_ONESHOT;
+            }
+        }
+        Some(fired)
+    }
+}
+
+/// `EVFILT_PROC`: the host's watch on the process `change.ident` names.
+fn process(change: &Kevent) -> Result<(OwnedFd, Kind), c_int> {
+    check_process_notes(change.fflags)?;
+    let guest = i32::try_from(change.ident).map_err(|_| libc::ESRCH)?;
+    if guest <= 0 {
+        return Err(libc::ESRCH);
+    }
+    let pid = crate::process::host_pid(guest);
+    let fd = host::process(pid)?;
+    // FIXME (ACCURACY): Darwin also gives the status to a process allowed to
+    // signal the target; only a parent can read it here.
+    if change.fflags & NOTE_EXITSTATUS != 0 && !host::is_child(fd.as_raw_fd(), pid) {
+        return Err(exit_status_refused());
+    }
+    let requested = change.fflags;
+    Ok((fd, Kind::Proc { requested, pid }))
 }
 
 #[cfg(test)]
