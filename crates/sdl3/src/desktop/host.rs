@@ -26,6 +26,7 @@ use super::compose::{self, Buffer, Layer, Target};
 use super::protocol::{self, CursorChoice, Message, Reply, Request, State, window_of};
 use super::scene::{Scene, WindowId};
 use super::shared::Shared;
+use super::waker::Waker;
 use super::{Extent, lock_in, socket_in};
 use crate::video::{self, Event, HitTestResult, flags};
 use crate::{Cursor, Rect, Window};
@@ -38,9 +39,9 @@ pub const DEFAULT_LINGER: Duration = Duration::from_secs(5);
 /// started by hand comes up well before the program it was started for.
 const FIRST_GUEST: Duration = Duration::from_secs(30);
 
-/// How long the loop sleeps when no guest has anything to say: SDL's events
-/// are only seen by asking, as in [`video::wait`].
-const NAP: Duration = Duration::from_millis(2);
+/// How long the loop waits before asking the window system again for what it
+/// was not ready to do.
+const RETRY: Duration = Duration::from_millis(2);
 
 /// How long a guest has to say what a press landed on before the press is
 /// taken as a plain click. Everybody's input waits behind it meanwhile, so
@@ -408,6 +409,7 @@ impl Host {
     }
 
     fn serve(&mut self, listener: &UnixListener, linger: Duration) -> io::Result<()> {
+        let waker = Waker::new()?;
         let mut idle_since = Instant::now();
         let mut patience = FIRST_GUEST.max(linger);
         while !self.stop {
@@ -436,14 +438,21 @@ impl Host {
                     patience = linger;
                 }
             }
-            self.wait(listener);
+            let deadlines = [
+                self.peers.is_empty().then(|| idle_since + patience),
+                self.probe
+                    .as_ref()
+                    .map(|probe| probe.since + PROBE_PATIENCE),
+                self.input_region_pending().then(|| Instant::now() + RETRY),
+            ];
+            self.wait(listener, &waker, deadlines.into_iter().flatten().min());
         }
         Ok(())
     }
 
-    /// Sleep until a guest says something or can be written to again, or
-    /// for [`NAP`], after which SDL is asked again.
-    fn wait(&self, listener: &UnixListener) {
+    /// Sleep until SDL has an event, a guest says something or can be
+    /// written to again, or `until`.
+    fn wait(&self, listener: &UnixListener, waker: &Waker, until: Option<Instant>) {
         let mut fds = vec![libc::pollfd {
             fd: listener.as_raw_fd(),
             events: libc::POLLIN,
@@ -460,14 +469,10 @@ impl Host {
                 revents: 0,
             });
         }
-        // SAFETY: `fds` holds that many descriptors, each open in `self`.
-        unsafe {
-            libc::poll(
-                fds.as_mut_ptr(),
-                fds.len() as libc::nfds_t,
-                NAP.as_millis() as i32,
-            )
-        };
+        waker.watch(fds);
+        video::wait_for_event(until.map(|until| until.saturating_duration_since(Instant::now())));
+        // The descriptors stay open until the waker is done with them.
+        waker.settle();
     }
 
     fn accept(&mut self, listener: &UnixListener) {
@@ -1281,6 +1286,14 @@ impl Host {
 
     /// Leave the host everything between the windows now showing: a click
     /// there is for whatever it has behind the desktop.
+    /// Whether the input region the host has is not yet the scene's, as
+    /// on Wayland before the event pump has first run.
+    fn input_region_pending(&self) -> bool {
+        self.see_through
+            && self.scene.buttons() == 0
+            && self.input.as_ref() != Some(&self.scene.pointer_region())
+    }
+
     fn sync_input_region(&mut self) {
         // While a button is held the host sends the pointer here wherever it
         // goes, so a window being dragged is followed once it is let go.

@@ -36,6 +36,7 @@ mod scene;
 mod shared;
 #[cfg(test)]
 mod tests;
+mod waker;
 
 pub use client::set_window_level;
 pub(crate) use client::*;

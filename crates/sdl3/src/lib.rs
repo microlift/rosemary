@@ -329,6 +329,8 @@ struct Api {
         Option<unsafe extern "C" fn(u32, *mut c_int) -> *mut *mut DisplayMode>,
 
     SDL_PollEvent: Option<unsafe extern "C" fn(*mut Event) -> bool>,
+    SDL_WaitEventTimeout: Option<unsafe extern "C" fn(*mut Event, i32) -> bool>,
+    SDL_PushEvent: Option<unsafe extern "C" fn(*mut Event) -> bool>,
     SDL_PeepEvents: Option<unsafe extern "C" fn(*mut Event, c_int, c_int, u32, u32) -> c_int>,
     SDL_StartTextInput: Option<unsafe extern "C" fn(Window) -> bool>,
     SDL_StopTextInput: Option<unsafe extern "C" fn(Window) -> bool>,
@@ -566,6 +568,8 @@ fn api() -> Option<&'static Api> {
             SDL_GetDisplayName,
             SDL_GetFullscreenDisplayModes,
             SDL_PollEvent,
+            SDL_WaitEventTimeout,
+            SDL_PushEvent,
             SDL_PeepEvents,
             SDL_StartTextInput,
             SDL_StopTextInput,
@@ -1809,6 +1813,8 @@ pub mod video {
     /// The `SDL_EventType` values this tree acts on.
     pub mod event_type {
         pub const QUIT: u32 = 0x100;
+        /// The first of the types SDL leaves to the program.
+        pub const USER: u32 = 0x8000;
         pub const SYSTEM_THEME_CHANGED: u32 = 0x108;
         pub const DISPLAY_DESKTOP_MODE_CHANGED: u32 = 0x155;
         pub const DISPLAY_CURRENT_MODE_CHANGED: u32 = 0x156;
@@ -2167,6 +2173,37 @@ pub mod video {
             }
             std::thread::sleep(left.min(NAP));
         }
+    }
+
+    /// Sleep until SDL has an event, leaving it queued, or for `timeout`;
+    /// `None` waits for as long as it takes. For a loop with nothing else to
+    /// wait on, or that is woken by [`wake`] when it has.
+    ///
+    /// Holds [`crate::compositor::guard`] for the whole wait, so it is for a
+    /// process that presents only from the waiting thread.
+    pub fn wait_for_event(timeout: Option<std::time::Duration>) {
+        let Some(wait) = api().and_then(|api| api.SDL_WaitEventTimeout) else {
+            return;
+        };
+        // Rounded up: a wait cut to nothing would spin until the deadline.
+        let milliseconds = timeout.map_or(-1, |timeout| {
+            timeout.as_nanos().div_ceil(1_000_000).min(i32::MAX as u128) as i32
+        });
+        let _commits = crate::compositor::guard();
+        // SAFETY: a null event asks SDL to leave the event queued.
+        unsafe { wait(std::ptr::null_mut(), milliseconds) };
+    }
+
+    /// End a [`wait_for_event`] on another thread, with an event of no
+    /// meaning to it.
+    pub fn wake() -> bool {
+        let Some(push) = api().and_then(|api| api.SDL_PushEvent) else {
+            return false;
+        };
+        let mut raw = super::Event::default();
+        raw.bytes[..size_of::<u32>()].copy_from_slice(&event_type::USER.to_ne_bytes());
+        // SAFETY: an event of SDL's own size, which SDL copies.
+        unsafe { push(&mut raw) }
     }
 
     fn translate(raw: &super::Event) -> Event {
