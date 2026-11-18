@@ -310,8 +310,9 @@ pub(crate) struct Encoder {
     /// `MTLDispatchTypeConcurrent`: dispatches may overlap, and the guest
     /// orders them with memory barriers. Every other compute encoder is serial.
     concurrent: bool,
-    /// Whether a full memory barrier follows everything this encoder recorded.
-    barrier_is_last: std::cell::Cell<bool>,
+    /// What orders the work this encoder recorded last against what it
+    /// records next.
+    ordered: std::cell::Cell<Ordered>,
     compute_pipeline: Id,
     render_pipeline: Id,
     depth_state: Id,
@@ -367,10 +368,13 @@ pub(crate) struct Encoder {
     compute_variant: Option<(Id, [u32; 3], vk::Pipeline)>,
     /// A render encoder's attachment images, all of them written.
     attachments: Vec<(vk::Image, vk::ImageAspectFlags)>,
-    /// Whether this encoder may write anything but its attachments: a
-    /// resource a shader writes, a resolve copy, query results, an attachment
-    /// whose memory another resource can share. It then waits for every
-    /// earlier pass and ends with a barrier over all memory.
+    /// The tracked images a blit encoder's copies wrote and read.
+    copies: Hazards,
+    /// Whether this encoder may write anything but its attachments or
+    /// tracked images: a resource a shader writes, a resolve copy, query
+    /// results, an attachment whose memory another resource can share, a
+    /// copy to a buffer. It then waits for all the work before it and ends
+    /// with a barrier over all memory.
     writes_elsewhere: bool,
     /// Index by `bind_point_slot`.
     bound: [BindPoint; 2],
@@ -390,6 +394,20 @@ pub(crate) struct Encoder {
     dynamic_offsets: Vec<u32>,
     vertex_buffers: [(vk::Buffer, u64); SLOTS],
     index_buffer: (vk::Buffer, u64, vk::IndexType),
+}
+
+/// What orders an encoder's last recorded work against what it records next.
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum Ordered {
+    /// Nothing: later work may overlap it.
+    Not,
+    /// Nothing yet, but the encoder's next dispatch waits for it: dispatches
+    /// of a serial encoder, or of any after `-memoryBarrierWithScope:`.
+    DispatchesOwed,
+    /// A barrier which orders dispatches.
+    Dispatches,
+    /// A full barrier.
+    All,
 }
 
 #[derive(Clone, Copy, Eq, PartialEq)]

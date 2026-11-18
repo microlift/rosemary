@@ -160,13 +160,17 @@ pub(super) unsafe extern "C" fn set_texture<const STAGE: usize>(
 }
 
 /// `-waitForFence:`, `-useResource:` and `-useHeap:` and their forms with
-/// stages: a render pass reads what an earlier pass wrote through a resource
-/// it does not bind, so it waits for every pass before it. A compute or blit
-/// encoder already does.
+/// stages: an encoder reads what earlier work wrote through a resource it
+/// does not name, so it waits for all the work before it. A compute encoder
+/// already does.
 pub(super) unsafe extern "C" fn order_after_earlier_passes(receiver: Id, _sel: Sel) {
     // SAFETY: an encoder of this crate's.
     let encoder = unsafe { object::body::<Encoder>(receiver) };
-    encoder.writes_elsewhere = true;
+    match encoder.kind {
+        // A blit's copies wait as they are recorded, so this one waits now.
+        Kind::Blit => encoder.command().flush_hazards(),
+        Kind::Compute | Kind::Render => encoder.writes_elsewhere = true,
+    }
 }
 
 pub(super) unsafe extern "C" fn set_sampler<const STAGE: usize>(

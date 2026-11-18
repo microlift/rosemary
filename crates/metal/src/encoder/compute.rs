@@ -72,6 +72,7 @@ pub(super) unsafe extern "C" fn dispatch_threadgroups(
         )
         .into()
     });
+    encoder.order_dispatches();
     encoder.record_as(label, || unsafe {
         command
             .gpu
@@ -80,7 +81,7 @@ pub(super) unsafe extern "C" fn dispatch_threadgroups(
     });
     // A serial encoder's next dispatch sees everything this one wrote.
     if !encoder.concurrent {
-        encoder.barrier();
+        encoder.ordered.set(Ordered::DispatchesOwed);
     }
 }
 
@@ -91,7 +92,38 @@ pub(super) unsafe extern "C" fn dispatch_threadgroups(
 pub(super) unsafe extern "C" fn memory_barrier(receiver: Id, _sel: Sel) {
     // SAFETY: an encoder of this crate's.
     let encoder = unsafe { object::body::<Encoder>(receiver) };
-    if encoder.kind == Kind::Compute {
-        encoder.barrier();
+    if encoder.kind == Kind::Compute && encoder.ordered.get() == Ordered::Not {
+        encoder.ordered.set(Ordered::DispatchesOwed);
+    }
+}
+
+impl Encoder {
+    /// Order the next dispatch after the ones before it, where it must wait
+    /// for them. The barrier is recorded only once another dispatch follows,
+    /// so the encoder's last one is ordered by the full barrier at
+    /// `endEncoding` alone. A compute encoder records nothing but dispatches,
+    /// so only compute work waits.
+    fn order_dispatches(&self) {
+        if self.ordered.get() != Ordered::DispatchesOwed {
+            return;
+        }
+        let command = self.command();
+        let memory = vk::MemoryBarrier::default()
+            .src_access_mask(vk::AccessFlags::MEMORY_WRITE)
+            .dst_access_mask(vk::AccessFlags::MEMORY_READ | vk::AccessFlags::MEMORY_WRITE);
+        // SAFETY: recording into this command buffer, outside a render pass.
+        unsafe {
+            command.gpu.device.cmd_pipeline_barrier(
+                command.command_buffer,
+                vk::PipelineStageFlags::COMPUTE_SHADER,
+                vk::PipelineStageFlags::COMPUTE_SHADER,
+                vk::DependencyFlags::empty(),
+                &[memory],
+                &[],
+                &[],
+            )
+        };
+        self.ordered.set(Ordered::Dispatches);
+        count_barrier();
     }
 }

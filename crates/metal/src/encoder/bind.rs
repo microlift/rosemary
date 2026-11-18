@@ -2,9 +2,9 @@ use super::*;
 
 pub(crate) fn new_encoder(command_buffer: Id, kind: Kind) -> Id {
     stats::count(Counter::Encoders);
-    if kind != Kind::Render {
-        // Blits and dispatches are not tracked by what they touch, so they
-        // wait for every render pass before them.
+    if kind == Kind::Compute {
+        // Dispatches are not tracked by what they touch, so they wait for
+        // all the work before them. Blits wait copy by copy.
         // SAFETY: an encoder is only made by a command buffer of this crate's.
         unsafe { object::body::<CommandBuffer>(command_buffer) }.flush_hazards();
     }
@@ -17,7 +17,7 @@ pub(crate) fn new_encoder(command_buffer: Id, kind: Kind) -> Id {
             command_buffer: objc::arc::retain(command_buffer),
             kind,
             concurrent: false,
-            barrier_is_last: std::cell::Cell::new(false),
+            ordered: std::cell::Cell::new(Ordered::Not),
             compute_pipeline: std::ptr::null_mut(),
             render_pipeline: std::ptr::null_mut(),
             depth_state: std::ptr::null_mut(),
@@ -47,6 +47,7 @@ pub(crate) fn new_encoder(command_buffer: Id, kind: Kind) -> Id {
             render_dynamic: None,
             compute_variant: None,
             attachments: Vec::new(),
+            copies: Hazards::default(),
             writes_elsewhere: false,
             bound: Default::default(),
             set_cache: Default::default(),
@@ -113,7 +114,9 @@ pub(super) unsafe extern "C" fn end_encoding(receiver: Id, _sel: Sel) {
         if !bridges.is_empty() || !copies.is_empty() {
             // The copies read what the pass just drew.
             for &(image, aspect) in &encoder.attachments {
-                command.hazards.note_written(image, aspect);
+                command
+                    .hazards
+                    .note_written(image, aspect, ATTACHMENT_WRITES);
             }
             command.flush_hazards();
         }
@@ -122,7 +125,11 @@ pub(super) unsafe extern "C" fn end_encoding(receiver: Id, _sel: Sel) {
                 gpu::trace(format!("depth/stencil bridge store failed: {reason}"));
                 continue;
             }
-            command.hazards.note_written(bridge.original, bridge.aspect);
+            command.hazards.note_written(
+                bridge.original,
+                bridge.aspect,
+                vk::AccessFlags::TRANSFER_WRITE,
+            );
         }
         for copy in copies {
             let source = vk::ImageSubresourceLayers {
@@ -182,6 +189,10 @@ pub(super) unsafe extern "C" fn end_encoding(receiver: Id, _sel: Sel) {
         encoder.lazy = None;
         return;
     }
+    if encoder.kind == Kind::Blit && !encoder.writes_elsewhere {
+        encoder.leave_copies_pending();
+        return;
+    }
     encoder.lazy = None;
     if recorded {
         encoder.barrier();
@@ -222,7 +233,7 @@ impl Encoder {
 
     /// Record one draw or dispatch, timed under `ROSEMARY_METAL_PROFILE`.
     pub(super) fn record(&self, body: impl FnOnce()) {
-        self.barrier_is_last.set(false);
+        self.ordered.set(Ordered::Not);
         let command = self.command();
         let Some(profile) = &command.profile else {
             return body();
@@ -245,7 +256,7 @@ impl Encoder {
 
     /// Record work timed under a fixed name rather than the bound pipeline's.
     pub(super) fn record_named(&self, name: &'static str, body: impl FnOnce()) {
-        self.barrier_is_last.set(false);
+        self.ordered.set(Ordered::Not);
         let command = self.command();
         match &command.profile {
             Some(profile) => profile.span(
@@ -260,7 +271,7 @@ impl Encoder {
 
     /// Record work timed under an explicit label, or untimed without one.
     pub(super) fn record_as(&self, label: Option<std::sync::Arc<str>>, body: impl FnOnce()) {
-        self.barrier_is_last.set(false);
+        self.ordered.set(Ordered::Not);
         let command = self.command();
         match (&command.profile, label) {
             (Some(profile), Some(label)) => {
@@ -824,14 +835,14 @@ impl Encoder {
 
     /// A full barrier: everything recorded before it completes, and its
     /// writes are visible, before anything after it runs. It closes compute
-    /// and blit encoders, which are not tracked by what they touch, and
-    /// render passes which wrote more than their attachments; see
-    /// [`hazards`](super::hazards) for the passes which did not.
+    /// encoders, which are not tracked by what they touch, and render passes
+    /// and blit encoders which wrote more than tracked images; see
+    /// [`hazards`](super::hazards) for those which did not.
     ///
     /// A second barrier with no work recorded since the first orders
     /// nothing more and is skipped.
     pub(super) fn barrier(&self) {
-        if self.barrier_is_last.replace(true) {
+        if self.ordered.replace(Ordered::All) == Ordered::All {
             return;
         }
         let command = self.command();

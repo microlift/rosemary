@@ -105,6 +105,7 @@ pub(super) unsafe extern "C" fn copy_buffer_to_buffer(
         .src_offset(source_offset)
         .dst_offset(destination_offset)
         .size(size);
+    encoder.track_copy(Operand::Buffer, Operand::Buffer);
     // SAFETY: recording into this command buffer.
     encoder.record_named("blit copyBuffer", || unsafe {
         command
@@ -220,12 +221,13 @@ pub(super) unsafe extern "C" fn copy_buffer_to_texture_options(
         );
     }
     let (buffer, source_offset) = command.copy_source(source, source_offset, total);
+    let aspect = blit_aspect(&to.image, options);
     let region = vk::BufferImageCopy::default()
         .buffer_offset(source_offset)
         .buffer_row_length(row_texels as u32)
         .buffer_image_height(rows as u32)
         .image_subresource(vk::ImageSubresourceLayers {
-            aspect_mask: blit_aspect(&to.image, options),
+            aspect_mask: aspect,
             mip_level: checked.level,
             base_array_layer: checked.slice,
             layer_count: 1,
@@ -240,6 +242,7 @@ pub(super) unsafe extern "C" fn copy_buffer_to_texture_options(
             height: checked.size[1],
             depth: checked.size[2],
         });
+    encoder.track_copy(Operand::Buffer, Operand::Texture(destination, aspect));
     // SAFETY: recording into this command buffer; the image is in GENERAL.
     encoder.record_named("blit copyBufferToTexture", || unsafe {
         command.gpu.device.cmd_copy_buffer_to_image(
@@ -344,12 +347,13 @@ pub(super) unsafe extern "C" fn copy_texture_to_buffer_options(
         );
     }
     let (buffer, destination_offset) = to.device_range(destination_offset, total);
+    let aspect = blit_aspect(&from.image, options);
     let region = vk::BufferImageCopy::default()
         .buffer_offset(destination_offset)
         .buffer_row_length(row_texels as u32)
         .buffer_image_height(rows as u32)
         .image_subresource(vk::ImageSubresourceLayers {
-            aspect_mask: blit_aspect(&from.image, options),
+            aspect_mask: aspect,
             mip_level: checked.level,
             base_array_layer: checked.slice,
             layer_count: 1,
@@ -364,6 +368,7 @@ pub(super) unsafe extern "C" fn copy_texture_to_buffer_options(
             height: checked.size[1],
             depth: checked.size[2],
         });
+    encoder.track_copy(Operand::Texture(source, aspect), Operand::Buffer);
     // SAFETY: recording into this command buffer; the image is in GENERAL.
     encoder.record_named("blit copyTextureToBuffer", || unsafe {
         command.gpu.device.cmd_copy_image_to_buffer(
@@ -465,6 +470,10 @@ pub(super) unsafe extern "C" fn copy_texture_to_texture(
             height: source_checked.size[1].min(destination_checked.size[1]),
             depth: source_checked.size[2].min(destination_checked.size[2]),
         });
+    encoder.track_copy(
+        Operand::Texture(source, from.image.aspect),
+        Operand::Texture(destination, to.image.aspect),
+    );
     // SAFETY: recording into this command buffer; both images are in GENERAL.
     encoder.record_named("blit copyTexture", || unsafe {
         command.gpu.device.cmd_copy_image(
@@ -494,6 +503,8 @@ pub(super) unsafe extern "C" fn generate_mipmaps(receiver: Id, _sel: Sel, textur
     if image.is_texture_buffer() {
         return gpu::trace("generateMipmapsForTexture: of a texture buffer, which has no image");
     }
+    let whole = Operand::Texture(texture, image.image.aspect);
+    encoder.track_copy(whole, whole);
     let device = &command.gpu.device;
     let vk_command = command.command_buffer;
     let mut width = image.image.width as i32;
@@ -502,6 +513,10 @@ pub(super) unsafe extern "C" fn generate_mipmaps(receiver: Id, _sel: Sel, textur
     width = (width >> base).max(1);
     height = (height >> base).max(1);
     for level in base + 1..base + image.image.levels {
+        if level > base + 1 {
+            // Each level is made from the one the last blit made.
+            wait_for_previous_blit(command);
+        }
         let next_width = (width / 2).max(1);
         let next_height = (height / 2).max(1);
         let blit = vk::ImageBlit::default()
@@ -545,9 +560,27 @@ pub(super) unsafe extern "C" fn generate_mipmaps(receiver: Id, _sel: Sel, textur
                 vk::Filter::LINEAR,
             );
         });
-        encoder.barrier();
         width = next_width;
         height = next_height;
     }
     command.retain(texture);
+}
+
+fn wait_for_previous_blit(command: &CommandBuffer) {
+    let memory = vk::MemoryBarrier::default()
+        .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+        .dst_access_mask(vk::AccessFlags::TRANSFER_READ);
+    // SAFETY: recording into this command buffer, outside a render pass.
+    unsafe {
+        command.gpu.device.cmd_pipeline_barrier(
+            command.command_buffer,
+            vk::PipelineStageFlags::TRANSFER,
+            vk::PipelineStageFlags::TRANSFER,
+            vk::DependencyFlags::empty(),
+            &[memory],
+            &[],
+            &[],
+        )
+    };
+    count_barrier();
 }
