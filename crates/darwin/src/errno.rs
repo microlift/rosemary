@@ -361,7 +361,7 @@ mod tests {
     /// platform, so an untranslated one is a different error rather than an
     /// unrecognised one.
     #[test]
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(target_os = "linux")]
     fn the_numbers_that_collide_are_translated() {
         assert_eq!(from_host(libc::EAGAIN), 35);
         assert_eq!(libc::EAGAIN, 11, "which is Darwin's EDEADLK");

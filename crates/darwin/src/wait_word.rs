@@ -445,6 +445,10 @@ mod tests {
 
     /// Waking nobody says so, which is what Darwin's `ENOENT` means to its callers.
     #[test]
+    #[cfg_attr(
+        target_os = "freebsd",
+        ignore = "FreeBSD's umtx wake does not say how many it woke"
+    )]
     fn waking_nobody_is_reported_as_nobody() {
         let word = AtomicU32::new(0);
         assert_eq!(

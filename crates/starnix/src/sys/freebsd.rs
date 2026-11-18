@@ -121,7 +121,7 @@ pub fn identity(pid: i32) -> Option<Identity> {
 
 pub fn process(pid: i32) -> Option<Process> {
     let proc = kinfo_proc(pid)?;
-    let (tty_major, tty_minor) = match proc.ki_tdev as u64 {
+    let (tty_major, tty_minor) = match proc.ki_tdev {
         NODEV => (-1, -1),
         dev => (libc::major(dev as _), libc::minor(dev as _)),
     };
@@ -144,7 +144,7 @@ pub fn process(pid: i32) -> Option<Process> {
         sgid: proc.ki_svgid,
         state: state(proc.ki_stat),
         nice: proc.ki_nice as i32,
-        start_sec: proc.ki_start.tv_sec as i64,
+        start_sec: proc.ki_start.tv_sec,
         start_usec: proc.ki_start.tv_usec as i32,
     })
 }
@@ -251,6 +251,10 @@ pub fn region_count(pid: i32) -> Option<u32> {
     regions(pid).ok().map(|regions| regions.len() as u32)
 }
 
+// `<sys/user.h>` flags the libc crate does not declare.
+const KVME_FLAG_SYSVSHM: i32 = 0x0000_0080;
+const KVME_FLAG_POSIXSHM: i32 = 0x0000_0100;
+
 pub fn regions(pid: i32) -> io::Result<Vec<Region>> {
     let bytes = sysctl::bytes(&proc_mib(libc::KERN_PROC_VMMAP, pid))?;
     Ok(vmentries(&bytes)
@@ -260,12 +264,21 @@ pub fn regions(pid: i32) -> io::Result<Vec<Region>> {
             read: entry.kve_protection & libc::KVME_PROT_READ != 0,
             write: entry.kve_protection & libc::KVME_PROT_WRITE != 0,
             execute: entry.kve_protection & libc::KVME_PROT_EXEC != 0,
-            // The map entry does not record `MAP_SHARED`, and nothing beside
-            // it stands for it reliably.
-            shared: false,
+            shared: shared(&entry),
             offset: entry.kve_offset,
         })
         .collect())
+}
+
+/// Whether an entry maps its object `MAP_SHARED`. The map does not record the
+/// flag, but a private mapping of a file or a shared memory object is
+/// copy-on-write, and a shared one is not.
+// FIXME (ACCURACY): anonymous memory is never copy-on-write and has no object
+// of its own to name, so a shared anonymous mapping reads as private.
+fn shared(entry: &libc::kinfo_vmentry) -> bool {
+    let object = entry.kve_type == libc::KVME_TYPE_VNODE
+        || entry.kve_flags & (KVME_FLAG_POSIXSHM | KVME_FLAG_SYSVSHM) != 0;
+    object && entry.kve_flags & libc::KVME_FLAG_COW == 0
 }
 
 /// FreeBSD's audit ids are behind `getaudit_addr`, which needs the audit

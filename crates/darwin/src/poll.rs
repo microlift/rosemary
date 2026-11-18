@@ -156,6 +156,7 @@ mod tests {
     /// The collision this module exists for: Darwin's `POLLWRBAND` is Linux's
     /// `POLLWRNORM`, so the mapping must not be the identity.
     #[test]
+    #[cfg(target_os = "linux")]
     fn the_write_bits_are_translated_rather_than_passed_through() {
         assert_eq!(bit::WRBAND, libc::POLLWRNORM);
         assert_eq!(events_to_host(bit::WRBAND), libc::POLLWRBAND);
@@ -163,6 +164,7 @@ mod tests {
 
     /// The Darwin-only vnode bits collide with real Linux ones and are dropped.
     #[test]
+    #[cfg(target_os = "linux")]
     fn a_bit_this_host_has_not_got_is_dropped_rather_than_aimed_at_a_neighbour() {
         const EXTEND: i16 = 0x0200;
         assert_eq!(EXTEND, libc::POLLWRBAND, "the collision being avoided");
