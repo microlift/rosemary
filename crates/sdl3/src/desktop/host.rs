@@ -24,8 +24,8 @@ use server::location;
 
 use super::compose::{self, Buffer, Layer, Target};
 use super::protocol::{self, CursorChoice, Message, Reply, Request, State, window_of};
-use super::scene::{Scene, WindowId};
-use super::shared::Shared;
+use super::scene::{Scene, WindowId, union};
+use super::shared::{Shared, copy_top_left};
 use super::waker::Waker;
 use super::{Extent, lock_in, socket_in};
 use crate::video::{self, Event, HitTestResult, flags};
@@ -299,13 +299,6 @@ struct Host {
     stop: bool,
 }
 
-fn union(damage: Option<Rect>, rect: Rect) -> Option<Rect> {
-    match damage {
-        Some(damage) => Some(damage.bounding(rect)),
-        None => (!rect.is_empty()).then_some(rect),
-    }
-}
-
 /// Take this directory's desktop lock and be its desktop until the last
 /// guest has been gone for `linger`.
 pub fn run(options: &Options) -> io::Result<Outcome> {
@@ -479,9 +472,7 @@ impl Host {
         while let Ok((stream, _)) = listener.accept() {
             // Whoever draws on this user's screen and reads their keys must
             // be this user, as the process server asks of its guests.
-            let ours = starnix::socket::peer(&stream)
-                // SAFETY: `getuid` has no preconditions.
-                .is_some_and(|peer| peer.uid == unsafe { libc::getuid() });
+            let ours = server::client::is_this_user(starnix::socket::peer(&stream));
             if !ours || stream.set_nonblocking(true).is_err() {
                 continue;
             }
@@ -1068,12 +1059,15 @@ impl Host {
         };
         // A guest that has not caught up with a resize still shows what it
         // has, from the top-left, as a window resized before it redraws does.
-        let bytes = surface.picture.pitch().min(shared.pitch());
-        let (to_pitch, from_pitch) = (surface.picture.pitch(), shared.pitch());
-        for row in 0..surface.picture.height.min(shared.height).max(0) as usize {
-            let source = &shared.pixels()[row * from_pitch..row * from_pitch + bytes];
-            surface.picture.pixels[row * to_pitch..row * to_pitch + bytes].copy_from_slice(source);
-        }
+        let picture = &mut surface.picture;
+        let (to_pitch, rows) = (picture.pitch(), picture.height.min(shared.height) as usize);
+        copy_top_left(
+            &mut picture.pixels,
+            to_pitch,
+            shared.pixels(),
+            shared.pitch(),
+            rows,
+        );
         surface.drawn = true;
         self.damage = union(self.damage, damage);
         true

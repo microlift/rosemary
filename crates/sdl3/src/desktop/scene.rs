@@ -100,7 +100,8 @@ pub(crate) struct Scene {
     damage: Option<Rect>,
 }
 
-fn union(damage: Option<Rect>, rect: Rect) -> Option<Rect> {
+/// `damage` grown to cover `rect`.
+pub(crate) fn union(damage: Option<Rect>, rect: Rect) -> Option<Rect> {
     match damage {
         Some(damage) => Some(damage.bounding(rect)),
         None => (!rect.is_empty()).then_some(rect),

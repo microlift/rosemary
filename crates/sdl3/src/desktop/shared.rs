@@ -14,6 +14,22 @@ use std::sync::atomic::{AtomicU32, Ordering};
 
 pub(crate) const BYTES_PER_PIXEL: usize = 4;
 
+/// Copy the top-left of one picture into another, as far as both reach:
+/// what a window resized before it redraws shows.
+pub(crate) fn copy_top_left(
+    to: &mut [u8],
+    to_pitch: usize,
+    from: &[u8],
+    from_pitch: usize,
+    rows: usize,
+) {
+    let bytes = to_pitch.min(from_pitch);
+    for row in 0..rows {
+        let source = &from[row * from_pitch..row * from_pitch + bytes];
+        to[row * to_pitch..row * to_pitch + bytes].copy_from_slice(source);
+    }
+}
+
 /// The mode of a buffer's file: this user's alone, as its directory is.
 const PRIVATE_MODE: u32 = 0o600;
 
@@ -133,12 +149,14 @@ impl Shared {
 
     /// Copy `from`'s top-left into this one's, as far as both reach.
     pub(crate) fn keep(&mut self, from: &Shared) {
-        let bytes = self.pitch().min(from.pitch());
-        let (to_pitch, from_pitch) = (self.pitch(), from.pitch());
-        for row in 0..self.height.min(from.height) as usize {
-            let source = &from.pixels()[row * from_pitch..row * from_pitch + bytes];
-            self.pixels_mut()[row * to_pitch..row * to_pitch + bytes].copy_from_slice(source);
-        }
+        let (to_pitch, rows) = (self.pitch(), self.height.min(from.height) as usize);
+        copy_top_left(
+            self.pixels_mut(),
+            to_pitch,
+            from.pixels(),
+            from.pitch(),
+            rows,
+        );
     }
 }
 

@@ -7,7 +7,7 @@
 
 use crate::Rect;
 
-const BYTES_PER_PIXEL: usize = 4;
+use super::shared::{BYTES_PER_PIXEL, copy_top_left};
 const ALPHA: usize = 3;
 const OPAQUE: u32 = 255;
 
@@ -43,11 +43,8 @@ impl Buffer {
             height,
             pixels: vec![0; width as usize * height as usize * BYTES_PER_PIXEL],
         };
-        let kept = self.width.min(width).max(0) as usize * BYTES_PER_PIXEL;
-        for row in 0..self.height.min(height).max(0) as usize {
-            let (from, to) = (row * self.pitch(), row * next.pitch());
-            next.pixels[to..to + kept].copy_from_slice(&self.pixels[from..from + kept]);
-        }
+        let (to_pitch, rows) = (next.pitch(), self.height.min(height) as usize);
+        copy_top_left(&mut next.pixels, to_pitch, &self.pixels, self.pitch(), rows);
         *self = next;
     }
 }

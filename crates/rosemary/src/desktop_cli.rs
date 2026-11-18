@@ -13,26 +13,15 @@ use std::process::ExitCode;
 use sdl3::desktop::{Extent, host};
 
 /// Start a detached desktop of `extent` listening in `directory`.
-///
-/// The child daemonizes itself and its first half exits at once, so waiting
-/// for it here costs nothing and leaves no zombie behind in a guest that
-/// never reaps children it did not make.
 fn launch(directory: &Path, extent: Extent) -> std::io::Result<()> {
-    let exe = darwin::exe::current()?;
-    let status = std::process::Command::new(exe)
-        .arg("desktop")
-        .arg("--directory")
-        .arg(directory)
-        .arg("--extent")
-        .arg(extent.to_string())
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()?;
-    match status.success() {
-        true => Ok(()),
-        false => Err(std::io::Error::other(format!("desktop launch {status}"))),
-    }
+    let extent = extent.to_string();
+    crate::server_cli::launch_detached(&[
+        "desktop".as_ref(),
+        "--directory".as_ref(),
+        directory.as_os_str(),
+        "--extent".as_ref(),
+        extent.as_ref(),
+    ])
 }
 
 /// Point this process at its prefix's desktop, which it joins only if it is

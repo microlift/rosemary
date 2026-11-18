@@ -51,10 +51,7 @@ impl Connection {
         let stream = UnixStream::connect(socket)?;
         // The desktop reads this user's keys and draws on their screen, so
         // whoever listens must be this user, as with the process server.
-        let ours = starnix::socket::peer(&stream)
-            // SAFETY: `getuid` has no preconditions.
-            .is_some_and(|peer| peer.uid == unsafe { libc::getuid() });
-        if !ours {
+        if !server::client::is_this_user(starnix::socket::peer(&stream)) {
             return Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,
                 format!("{} is served by another user", socket.display()),
