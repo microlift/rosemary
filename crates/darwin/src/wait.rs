@@ -29,7 +29,7 @@ fn options_to_host(options: c_int) -> Option<c_int> {
 }
 
 /// This host's status word as Darwin's.
-fn status_to_darwin(status: c_int) -> c_int {
+pub(crate) fn status_to_darwin(status: c_int) -> c_int {
     let signal = |host: c_int| crate::signal::signal_from_host(host).unwrap_or(host);
     if libc::WIFCONTINUED(status) {
         DARWIN_CONTINUED
