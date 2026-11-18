@@ -28,6 +28,8 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, OnceLock};
 
+use static_init::dynamic;
+
 mod client;
 mod compose;
 pub mod host;
@@ -80,18 +82,22 @@ impl std::fmt::Display for Extent {
 }
 
 fn extent() -> Option<Extent> {
-    static EXTENT: OnceLock<Option<Extent>> = OnceLock::new();
-    *EXTENT.get_or_init(|| {
-        let value = std::env::var(ENV).ok()?;
-        if value.trim().is_empty() {
-            return None;
+    #[dynamic]
+    static EXTENT: Option<Extent> = {
+        match std::env::var(ENV) {
+            Ok(value) if !value.trim().is_empty() => {
+                let extent = value.parse().ok();
+                if extent.is_none() {
+                    eprintln!(
+                        "rosemary: sdl3: {ENV}={value} is not recognised; running without a desktop"
+                    );
+                }
+                extent
+            }
+            _ => None,
         }
-        let extent = value.parse().ok();
-        if extent.is_none() {
-            eprintln!("rosemary: sdl3: {ENV}={value} is not recognised; running without a desktop");
-        }
-        extent
-    })
+    };
+    *EXTENT
 }
 
 /// Set in the process that is the desktop: its window is the screen, not a

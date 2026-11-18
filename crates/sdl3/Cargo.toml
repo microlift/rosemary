@@ -11,6 +11,7 @@ libc.workspace = true
 # its guests do: over a private socket, in the same encoding.
 server.workspace = true
 starnix.workspace = true
+static_init.workspace = true
 
 [features]
 # What the crates driving SDL in their own tests share.

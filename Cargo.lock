@@ -2830,6 +2830,7 @@ dependencies = [
  "libc",
  "server",
  "starnix",
+ "static_init",
 ]
 
 [[package]]
