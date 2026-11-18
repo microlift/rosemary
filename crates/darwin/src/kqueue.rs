@@ -2331,8 +2331,8 @@ mod tests {
         let host = crate::signal::signal_to_host(SIGWINCH).expect("a host signal");
         // SAFETY: a signal this process takes by default as a no-op.
         unsafe {
-            libc::kill(libc::getpid(), host);
-            libc::kill(libc::getpid(), host);
+            libc::pthread_kill(libc::pthread_self(), host);
+            libc::pthread_kill(libc::pthread_self(), host);
         }
         let (n, event) = collect(queue, None);
         assert_eq!(n, 1);
@@ -2362,7 +2362,7 @@ mod tests {
         };
         assert_eq!(collect(queue, Some(&change)).0, 0);
         // SAFETY: ignored, so this returns.
-        unsafe { libc::kill(libc::getpid(), host) };
+        unsafe { libc::pthread_kill(libc::pthread_self(), host) };
         let (n, event) = collect(queue, None);
         assert_eq!((n, event.data), (1, 1));
 
@@ -2499,6 +2499,33 @@ mod tests {
     /// sends.
     const STOPS: isize = 2;
 
+    /// Whether `host`, a stop signal, stops a child in a group of its own
+    /// here. FreeBSD discards it when the tests run without job control, as
+    /// from `ssh` or `script`, so there is nothing to watch.
+    fn stop_signals_stop_here(host: c_int) -> bool {
+        use std::os::unix::process::CommandExt;
+        let Ok(mut child) = std::process::Command::new("sleep")
+            .arg("2")
+            .process_group(0)
+            .spawn()
+        else {
+            return false;
+        };
+        let pid = child.id() as libc::pid_t;
+        let mut status = 0;
+        // SAFETY: this function's own child.
+        let stopped = unsafe {
+            libc::kill(pid, host);
+            libc::waitpid(pid, &mut status, libc::WUNTRACED) == pid && libc::WIFSTOPPED(status)
+        };
+        if stopped {
+            // SAFETY: still this function's child, stopped and not reaped.
+            unsafe { libc::kill(pid, libc::SIGKILL) };
+            let _ = child.wait();
+        }
+        stopped
+    }
+
     /// Marks the process running [`stop_watcher_child`].
     const STOP_WATCHER: &str = "ROSEMARY_KQUEUE_TEST_STOP_WATCHER";
 
@@ -2514,6 +2541,12 @@ mod tests {
         use std::os::unix::process::CommandExt;
         let host =
             crate::signal::signal_to_host(crate::signal::signum::SIGTSTP).expect("a host signal");
+        if !stop_signals_stop_here(host) {
+            eprintln!(
+                "skipped: this host discards stop signals here, as FreeBSD does without job control"
+            );
+            return;
+        }
         let (report_read, report_write) = pipe();
         let start = child_start();
         let mut child = std::process::Command::new(std::env::current_exe().unwrap())
