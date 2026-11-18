@@ -573,7 +573,7 @@ mod tests {
     /// The lock family is translated rather than forwarded, and the structure is
     /// the reason: the two platforms hold the same fields in a different order.
     #[test]
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(target_os = "linux")]
     fn a_darwin_lock_is_not_this_host_s_lock() {
         assert_eq!(std::mem::offset_of!(Flock, start), 0);
         assert_eq!(std::mem::offset_of!(Flock, kind), 20);
