@@ -211,11 +211,18 @@ fn nosigpipe(level: i32, name: i32) -> bool {
 /// On Linux, there is no direct `IP_DONTFRAG` socket option; the DF bit is
 /// controlled via Path MTU Discovery (`IP_MTU_DISCOVER` / `IPV6_MTU_DISCOVER`).
 /// Setting `IP_DONTFRAG` to 1 maps to `IP_PMTUDISC_DO`, and 0 maps to
-/// `IP_PMTUDISC_DONT`. On Darwin and BSDs, the option is native.
+/// `IP_PMTUDISC_DONT`. On Darwin and FreeBSD, the option is native.
 fn is_dontfrag(level: i32, name: i32) -> bool {
     (level == IPPROTO_IP && name == ip::DONTFRAG)
         || (level == IPPROTO_IPV6 && name == ipv6::DONTFRAG)
 }
+
+/// This host's number for `IP_DONTFRAG`, which FreeBSD gives a different one.
+/// `IPV6_DONTFRAG` is the same everywhere it exists.
+#[cfg(any(target_os = "macos", target_os = "freebsd"))]
+const HOST_IP_DONTFRAG: i32 = libc::IP_DONTFRAG;
+#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "freebsd")))]
+const HOST_IP_DONTFRAG: i32 = ip::DONTFRAG;
 
 /// # Safety
 ///
@@ -264,7 +271,7 @@ unsafe fn set_dontfrag(fd: i32, level: i32, value: *const c_void, len: u32) -> i
     #[cfg(not(target_os = "linux"))]
     {
         let (host_level, host_opt) = if level == IPPROTO_IP {
-            (libc::IPPROTO_IP, ip::DONTFRAG)
+            (libc::IPPROTO_IP, HOST_IP_DONTFRAG)
         } else {
             (libc::IPPROTO_IPV6, ipv6::DONTFRAG)
         };
@@ -330,7 +337,7 @@ unsafe fn get_dontfrag(fd: i32, level: i32, value: *mut c_void, len: *mut u32) -
     #[cfg(not(target_os = "linux"))]
     {
         let (host_level, host_opt) = if level == IPPROTO_IP {
-            (libc::IPPROTO_IP, ip::DONTFRAG)
+            (libc::IPPROTO_IP, HOST_IP_DONTFRAG)
         } else {
             (libc::IPPROTO_IPV6, ipv6::DONTFRAG)
         };
