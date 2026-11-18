@@ -20,22 +20,6 @@ unsafe extern "C" fn vsnprintf_l(
     unsafe { rosemary_vsnprintf(buffer, size, format, ap) }
 }
 
-/// `int vsscanf_l(const char *, locale_t, const char *, va_list)`
-///
-/// # Safety
-///
-/// As [`vsnprintf_l`].
-unsafe extern "C" fn vsscanf_l(
-    input: *const c_char,
-    locale: libc::locale_t,
-    format: *const c_char,
-    ap: VaList,
-) -> c_int {
-    let _switched = crate::xlocale::switch(locale);
-    // SAFETY: the caller's input, format and arguments.
-    unsafe { crate::strfmt::vsscanf(input, format, ap) }
-}
-
 /// `int vasprintf_l(char **, locale_t, const char *, va_list)`
 ///
 /// The result is in the guest's allocator, as [`vasprintf_into_guest`] says.
@@ -62,9 +46,6 @@ crate::variadic! {
         locale: libc::locale_t,
         format: *const c_char,
     ) -> c_int => vsnprintf_l;
-    /// `int sscanf_l(const char *, locale_t, const char *, ...)`
-    fn sscanf_l(input: *const c_char, locale: libc::locale_t, format: *const c_char) -> c_int
-        => vsscanf_l;
     /// `int asprintf_l(char **, locale_t, const char *, ...)`
     fn asprintf_l(out: *mut *mut c_char, locale: libc::locale_t, format: *const c_char) -> c_int
         => vasprintf_l;
@@ -72,17 +53,16 @@ crate::variadic! {
 
 crate::va_list! {
     darwin_vsnprintf_l = vsnprintf_l, 4;
-    darwin_vsscanf_l = vsscanf_l, 3;
     darwin_vasprintf_l = vasprintf_l, 3;
 }
 
 exports::exports! {
     functions {
         "snprintf_l" => snprintf_l,
-        "sscanf_l" => sscanf_l,
+        "sscanf_l" => crate::stdio::sscanf_l,
         "asprintf_l" => asprintf_l,
         "vsnprintf_l" => darwin_vsnprintf_l,
-        "vsscanf_l" => darwin_vsscanf_l,
+        "vsscanf_l" => crate::stdio::darwin_vsscanf_l,
         "vasprintf_l" => darwin_vasprintf_l,
     }
 }

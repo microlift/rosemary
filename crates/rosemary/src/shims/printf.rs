@@ -16,6 +16,7 @@ const FP_REGS: usize = 8;
 const SLOT: u64 = 8;
 
 /// A walk over the variadic tail of a call.
+#[derive(Clone)]
 pub struct VarArgs<'a> {
     symbol: &'a str,
     mem: &'a dyn GuestMemory,
@@ -25,6 +26,7 @@ pub struct VarArgs<'a> {
 }
 
 /// Where the arguments are.
+#[derive(Clone)]
 enum Source<'a> {
     /// The guest's own registers and stack, as SysV lays them out: how many of
     /// each register file the walk has consumed, and how far down the stack.

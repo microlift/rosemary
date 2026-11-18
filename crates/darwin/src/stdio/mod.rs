@@ -8,6 +8,7 @@ mod engine;
 mod format;
 mod open;
 mod parseln;
+mod scan;
 mod wide;
 
 pub use api::*;
@@ -15,6 +16,7 @@ pub use backend::{fmemopen, funopen, open_memstream, open_wmemstream};
 pub use format::*;
 pub use open::{fclose, fdopen, fopen, freopen, pclose, popen, tmpfile};
 pub use parseln::fparseln;
+pub use scan::*;
 pub use wide::*;
 
 pub type ReadFn = unsafe extern "C" fn(*mut c_void, *mut c_char, c_int) -> c_int;
@@ -580,12 +582,12 @@ exports::exports! {
         "vfprintf_l" => format::darwin_vfprintf_l,
         "scanf" => scanf,
         "fscanf" => fscanf,
-        "vscanf" => format::darwin_vscanf,
-        "vfscanf" => format::darwin_vfscanf,
+        "vscanf" => scan::darwin_vscanf,
+        "vfscanf" => scan::darwin_vfscanf,
         "scanf_l" => scanf_l,
         "fscanf_l" => fscanf_l,
-        "vscanf_l" => format::darwin_vscanf_l,
-        "vfscanf_l" => format::darwin_vfscanf_l,
+        "vscanf_l" => scan::darwin_vscanf_l,
+        "vfscanf_l" => scan::darwin_vfscanf_l,
         "wprintf" => wprintf,
         "fwprintf" => fwprintf,
         "vwprintf" => format::darwin_vwprintf,

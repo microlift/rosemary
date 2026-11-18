@@ -33,7 +33,6 @@ pub mod printf;
 pub mod process;
 pub mod pthread;
 pub mod runtime;
-pub mod sscanf;
 pub mod stackprobe;
 pub mod stdio;
 pub mod sysvsem;
@@ -200,11 +199,6 @@ pub fn resolve(symbol: &str) -> Option<Resolved> {
         "asl_log" => bind!("asl_log" => printf::asl_log),
         "syslog$DARWIN_EXTSN" => bind!("syslog$DARWIN_EXTSN" => printf::syslog),
         "__vsnprintf_chk" => bind!("__vsnprintf_chk" => printf::vsnprintf_chk),
-        "sscanf" => bind!("sscanf" => sscanf::sscanf),
-        // The locale-aware and `va_list` spellings, which are the same parser
-        // reached with the destinations somewhere else.
-        "sscanf_l" => bind!("sscanf_l" => sscanf::sscanf_l),
-        "vsscanf" => bind!("vsscanf" => sscanf::vsscanf),
         // libsystem_malloc's own printer, which the interposing mimalloc uses.
         "malloc_printf" => bind!("malloc_printf" => printf::malloc_printf),
         "ioctl" => bind!("ioctl" => ioctl::ioctl),
@@ -293,9 +287,6 @@ pub fn is_shimmed(symbol: &str) -> bool {
             | "vswprintf"
             | "vasprintf"
             | "__vsnprintf_chk"
-            | "sscanf"
-            | "sscanf_l"
-            | "vsscanf"
             | "malloc_printf"
             | "ioctl"
             | "fcntl"

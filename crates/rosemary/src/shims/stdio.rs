@@ -43,41 +43,81 @@ fn builtin_or_refuse(symbol: &str) -> Result<()> {
     }
 }
 
-/// Scan `stream` with `format`, storing through the tail's pointers.
+/// An emulated guest's pointer arguments, as the scanner takes them.
+struct Guest<'a> {
+    first: VarArgs<'a>,
+    args: VarArgs<'a>,
+    /// The first argument that could not be read; the scanner saw a null.
+    failed: Option<AbiError>,
+}
+
+impl darwin::stdio::Destinations for Guest<'_> {
+    fn next(&mut self) -> *mut c_void {
+        match self.args.next_int() {
+            Ok(at) => at as usize as *mut c_void,
+            Err(error) => {
+                self.failed.get_or_insert(error);
+                std::ptr::null_mut()
+            }
+        }
+    }
+
+    fn rewind(&mut self) {
+        self.args = self.first.clone();
+    }
+
+    fn long_double(&self) -> darwin::stdio::LongDouble {
+        darwin::stdio::LongDouble::X87
+    }
+}
+
+/// What a scan reads.
+enum Scanned {
+    Stream(*mut c_void),
+    Text(u64),
+}
+
+/// Scan with `format`, storing through the tail's pointers.
 fn scan(
     symbol: &str,
     ctx: &mut RegisterContext,
     mem: &mut dyn GuestMemory,
-    stream: *mut c_void,
+    input: Scanned,
     loc: Option<u64>,
     format: u64,
     tail: Tail,
 ) -> Result<()> {
-    builtin_or_refuse(symbol)?;
+    match input {
+        Scanned::Stream(_) => builtin_or_refuse(symbol)?,
+        Scanned::Text(0) => return Err(bad_pointer(symbol, 0)),
+        Scanned::Text(_) => {}
+    }
     if format == 0 {
         return Err(bad_pointer(symbol, 0));
     }
     let assigned = {
-        let mut args = args(symbol, ctx, &*mem, tail)?;
-        let mut failed = None;
-        let mut next = || match args.next_int() {
-            Ok(at) => at as usize as *mut c_void,
-            Err(error) => {
-                failed.get_or_insert(error);
-                std::ptr::null_mut()
+        let args = args(symbol, ctx, &*mem, tail)?;
+        let mut out = Guest {
+            first: args.clone(),
+            args,
+            failed: None,
+        };
+        let loc = loc.map(|loc| loc as usize as *mut c_void);
+        let format = format as usize as *const c_char;
+        // SAFETY: the guest's input and format, and destinations it passed; a
+        // pointer that could not be read is null, which the scanner skips.
+        let assigned = unsafe {
+            match input {
+                Scanned::Stream(fp) => darwin::stdio::scan_with(fp, loc, format, &mut out),
+                Scanned::Text(text) => darwin::stdio::scan_str_with(
+                    text as usize as *const c_char,
+                    loc,
+                    format,
+                    &mut out,
+                ),
             }
         };
-        // SAFETY: the guest's stream and format, and destinations it passed;
-        // a pointer that could not be read is null, which the scanner skips.
-        let assigned = unsafe {
-            darwin::stdio::scan_with(
-                stream,
-                loc.map(|loc| loc as usize as *mut c_void),
-                format as usize as *const c_char,
-                &mut next,
-            )
-        };
-        if let Some(error) = failed {
+        if let Some(error) = out.failed {
             return Err(error);
         }
         assigned
@@ -93,7 +133,15 @@ fn stream(at: u64) -> *mut c_void {
 /// `int fscanf(FILE *stream, const char *format, ...)`
 pub fn fscanf(symbol: &str, ctx: &mut RegisterContext, mem: &mut dyn GuestMemory) -> Result<()> {
     let (fp, format) = (stream(ctx.rdi), ctx.rsi);
-    scan(symbol, ctx, mem, fp, None, format, Tail::Registers(2))
+    scan(
+        symbol,
+        ctx,
+        mem,
+        Scanned::Stream(fp),
+        None,
+        format,
+        Tail::Registers(2),
+    )
 }
 
 /// `int scanf(const char *format, ...)`
@@ -103,7 +151,7 @@ pub fn scanf(symbol: &str, ctx: &mut RegisterContext, mem: &mut dyn GuestMemory)
         symbol,
         ctx,
         mem,
-        darwin::stdio::stdin(),
+        Scanned::Stream(darwin::stdio::stdin()),
         None,
         format,
         Tail::Registers(1),
@@ -113,7 +161,15 @@ pub fn scanf(symbol: &str, ctx: &mut RegisterContext, mem: &mut dyn GuestMemory)
 /// `int vfscanf(FILE *stream, const char *format, va_list ap)`
 pub fn vfscanf(symbol: &str, ctx: &mut RegisterContext, mem: &mut dyn GuestMemory) -> Result<()> {
     let (fp, format, list) = (stream(ctx.rdi), ctx.rsi, ctx.rdx);
-    scan(symbol, ctx, mem, fp, None, format, Tail::List(list))
+    scan(
+        symbol,
+        ctx,
+        mem,
+        Scanned::Stream(fp),
+        None,
+        format,
+        Tail::List(list),
+    )
 }
 
 /// `int vscanf(const char *format, va_list ap)`
@@ -123,7 +179,7 @@ pub fn vscanf(symbol: &str, ctx: &mut RegisterContext, mem: &mut dyn GuestMemory
         symbol,
         ctx,
         mem,
-        darwin::stdio::stdin(),
+        Scanned::Stream(darwin::stdio::stdin()),
         None,
         format,
         Tail::List(list),
@@ -133,27 +189,109 @@ pub fn vscanf(symbol: &str, ctx: &mut RegisterContext, mem: &mut dyn GuestMemory
 /// `int fscanf_l(FILE *stream, locale_t loc, const char *format, ...)`
 pub fn fscanf_l(symbol: &str, ctx: &mut RegisterContext, mem: &mut dyn GuestMemory) -> Result<()> {
     let (fp, loc, format) = (stream(ctx.rdi), ctx.rsi, ctx.rdx);
-    scan(symbol, ctx, mem, fp, Some(loc), format, Tail::Registers(3))
+    scan(
+        symbol,
+        ctx,
+        mem,
+        Scanned::Stream(fp),
+        Some(loc),
+        format,
+        Tail::Registers(3),
+    )
 }
 
 /// `int scanf_l(locale_t loc, const char *format, ...)`
 pub fn scanf_l(symbol: &str, ctx: &mut RegisterContext, mem: &mut dyn GuestMemory) -> Result<()> {
     let (loc, format) = (ctx.rdi, ctx.rsi);
     let fp = darwin::stdio::stdin();
-    scan(symbol, ctx, mem, fp, Some(loc), format, Tail::Registers(2))
+    scan(
+        symbol,
+        ctx,
+        mem,
+        Scanned::Stream(fp),
+        Some(loc),
+        format,
+        Tail::Registers(2),
+    )
 }
 
 /// `int vfscanf_l(FILE *stream, locale_t loc, const char *format, va_list ap)`
 pub fn vfscanf_l(symbol: &str, ctx: &mut RegisterContext, mem: &mut dyn GuestMemory) -> Result<()> {
     let (fp, loc, format, list) = (stream(ctx.rdi), ctx.rsi, ctx.rdx, ctx.rcx);
-    scan(symbol, ctx, mem, fp, Some(loc), format, Tail::List(list))
+    scan(
+        symbol,
+        ctx,
+        mem,
+        Scanned::Stream(fp),
+        Some(loc),
+        format,
+        Tail::List(list),
+    )
 }
 
 /// `int vscanf_l(locale_t loc, const char *format, va_list ap)`
 pub fn vscanf_l(symbol: &str, ctx: &mut RegisterContext, mem: &mut dyn GuestMemory) -> Result<()> {
     let (loc, format, list) = (ctx.rdi, ctx.rsi, ctx.rdx);
     let fp = darwin::stdio::stdin();
-    scan(symbol, ctx, mem, fp, Some(loc), format, Tail::List(list))
+    scan(
+        symbol,
+        ctx,
+        mem,
+        Scanned::Stream(fp),
+        Some(loc),
+        format,
+        Tail::List(list),
+    )
+}
+
+/// `int sscanf(const char *str, const char *format, ...)`
+pub fn sscanf(symbol: &str, ctx: &mut RegisterContext, mem: &mut dyn GuestMemory) -> Result<()> {
+    let (text, format) = (ctx.rdi, ctx.rsi);
+    scan(
+        symbol,
+        ctx,
+        mem,
+        Scanned::Text(text),
+        None,
+        format,
+        Tail::Registers(2),
+    )
+}
+
+/// `int vsscanf(const char *str, const char *format, va_list ap)`
+pub fn vsscanf(symbol: &str, ctx: &mut RegisterContext, mem: &mut dyn GuestMemory) -> Result<()> {
+    let (text, format, list) = (ctx.rdi, ctx.rsi, ctx.rdx);
+    scan(
+        symbol,
+        ctx,
+        mem,
+        Scanned::Text(text),
+        None,
+        format,
+        Tail::List(list),
+    )
+}
+
+/// `int sscanf_l(const char *str, locale_t loc, const char *format, ...)`
+pub fn sscanf_l(symbol: &str, ctx: &mut RegisterContext, mem: &mut dyn GuestMemory) -> Result<()> {
+    let (text, loc, format) = (ctx.rdi, ctx.rsi, ctx.rdx);
+    let text = Scanned::Text(text);
+    scan(
+        symbol,
+        ctx,
+        mem,
+        text,
+        Some(loc),
+        format,
+        Tail::Registers(3),
+    )
+}
+
+/// `int vsscanf_l(const char *str, locale_t loc, const char *format, va_list ap)`
+pub fn vsscanf_l(symbol: &str, ctx: &mut RegisterContext, mem: &mut dyn GuestMemory) -> Result<()> {
+    let (text, loc, format, list) = (ctx.rdi, ctx.rsi, ctx.rdx, ctx.rcx);
+    let text = Scanned::Text(text);
+    scan(symbol, ctx, mem, text, Some(loc), format, Tail::List(list))
 }
 
 /// Write a rendering and return its length, or -1 if the stream refused it.
@@ -272,6 +410,10 @@ pub fn shim_for(name: &str) -> Option<super::Shim> {
         "scanf_l" => bind!("scanf_l" => scanf_l),
         "vfscanf_l" => bind!("vfscanf_l" => vfscanf_l),
         "vscanf_l" => bind!("vscanf_l" => vscanf_l),
+        "sscanf" => bind!("sscanf" => sscanf),
+        "vsscanf" => bind!("vsscanf" => vsscanf),
+        "sscanf_l" => bind!("sscanf_l" => sscanf_l),
+        "vsscanf_l" => bind!("vsscanf_l" => vsscanf_l),
         "fprintf_l" => bind!("fprintf_l" => fprintf_l),
         "printf_l" => bind!("printf_l" => printf_l),
         "vfprintf_l" => bind!("vfprintf_l" => vfprintf_l),
@@ -282,4 +424,73 @@ pub fn shim_for(name: &str) -> Option<super::Shim> {
         "vwprintf" => bind!("vwprintf" => vwprintf),
         _ => return None,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Guest memory that is this process's memory, as it is for a guest.
+    struct Identity;
+
+    impl GuestMemory for Identity {
+        fn read(&self, va: u64, out: &mut [u8]) -> core::result::Result<(), machish::Error> {
+            // SAFETY: the tests only pass the addresses of live locals.
+            unsafe { core::ptr::copy_nonoverlapping(va as *const u8, out.as_mut_ptr(), out.len()) };
+            Ok(())
+        }
+
+        fn write(&mut self, va: u64, data: &[u8]) -> core::result::Result<(), machish::Error> {
+            // SAFETY: as above.
+            unsafe { core::ptr::copy_nonoverlapping(data.as_ptr(), va as *mut u8, data.len()) };
+            Ok(())
+        }
+    }
+
+    fn at<T>(value: &mut T) -> u64 {
+        value as *mut T as u64
+    }
+
+    #[test]
+    fn sscanf_reads_its_destinations_from_the_guest_s_registers() {
+        let (mut kind, mut id, mut w, mut h) = ([0u8; 16], 0i64, 0i32, 0i32);
+        let mut ctx = RegisterContext::new();
+        ctx.rdi = c"type=Asset&id=134289558904675&w=384&h=216&filters=".as_ptr() as u64;
+        ctx.rsi = c"type=%[^&]&id=%lld&w=%d&h=%d".as_ptr() as u64;
+        (ctx.rdx, ctx.rcx, ctx.r8, ctx.r9) = (at(&mut kind), at(&mut id), at(&mut w), at(&mut h));
+
+        sscanf("sscanf", &mut ctx, &mut Identity).expect("scan");
+
+        assert_eq!(ctx.rax as i32, 4);
+        assert_eq!(&kind[..6], b"Asset\0");
+        assert_eq!((id, w, h), (134289558904675, 384, 216));
+    }
+
+    #[test]
+    fn a_position_rewinds_to_the_guest_s_first_destination() {
+        let (mut a, mut b) = (0i32, 0i32);
+        let mut ctx = RegisterContext::new();
+        ctx.rdi = c"7 9".as_ptr() as u64;
+        ctx.rsi = c"%2$d %1$d".as_ptr() as u64;
+        (ctx.rdx, ctx.rcx) = (at(&mut a), at(&mut b));
+
+        sscanf("sscanf", &mut ctx, &mut Identity).expect("scan");
+
+        assert_eq!((ctx.rax as i32, a, b), (2, 9, 7));
+    }
+
+    #[test]
+    fn a_long_double_is_stored_in_the_guest_s_x87_format() {
+        let mut value = [0u8; 16];
+        let mut ctx = RegisterContext::new();
+        ctx.rdi = c"2.5".as_ptr() as u64;
+        ctx.rsi = c"%Lf".as_ptr() as u64;
+        ctx.rdx = at(&mut value);
+
+        sscanf("sscanf", &mut ctx, &mut Identity).expect("scan");
+
+        // 2.5 is 1.25 * 2^1: an explicit integer bit and a biased exponent.
+        let x87 = [0, 0, 0, 0, 0, 0, 0, 0xa0, 0x00, 0x40];
+        assert_eq!((ctx.rax as i32, &value[..10]), (1, &x87[..]));
+    }
 }
