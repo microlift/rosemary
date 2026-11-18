@@ -106,8 +106,11 @@ pub fn sched_priority_to_host(darwin: i32, host_policy: libc::c_int) -> Option<i
         return Some(min);
     }
     Some(
-        min + (darwin - DARWIN_PRIORITY_MIN) * (max - min)
-            / (DARWIN_PRIORITY_MAX - DARWIN_PRIORITY_MIN),
+        min + scale(
+            darwin - DARWIN_PRIORITY_MIN,
+            max - min,
+            DARWIN_PRIORITY_MAX - DARWIN_PRIORITY_MIN,
+        ),
     )
 }
 
@@ -124,7 +127,17 @@ pub fn sched_priority_from_host(host: i32, host_policy: libc::c_int) -> i32 {
         return DARWIN_PRIORITY_DEFAULT;
     }
     DARWIN_PRIORITY_MIN
-        + (host.clamp(min, max) - min) * (DARWIN_PRIORITY_MAX - DARWIN_PRIORITY_MIN) / (max - min)
+        + scale(
+            host.clamp(min, max) - min,
+            DARWIN_PRIORITY_MAX - DARWIN_PRIORITY_MIN,
+            max - min,
+        )
+}
+
+/// `offset * to / from`, rounded to the nearest, so that a priority taken
+/// to a range at least as wide and back is the one it started as.
+fn scale(offset: i32, to: i32, from: i32) -> i32 {
+    (offset * to + from / 2) / from
 }
 
 #[cfg(test)]
@@ -144,7 +157,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(target_os = "linux")]
     fn the_two_mutex_types_that_matter_are_swapped() {
         assert_ne!(
             PTHREAD_MUTEX_RECURSIVE,
@@ -189,5 +202,26 @@ mod tests {
         assert_eq!(high, unsafe { libc::sched_get_priority_max(fifo) });
         assert_eq!(sched_priority_from_host(low, fifo), DARWIN_PRIORITY_MIN);
         assert_eq!(sched_priority_from_host(high, fifo), DARWIN_PRIORITY_MAX);
+    }
+
+    /// A host range with at least Darwin's number of steps keeps every one.
+    #[test]
+    fn every_priority_comes_back_from_a_range_as_wide_as_darwin_s() {
+        for policy in [SCHED_OTHER, SCHED_FIFO, SCHED_RR] {
+            let host = sched_policy_to_host(policy).unwrap();
+            let (min, max) = unsafe {
+                (
+                    libc::sched_get_priority_min(host),
+                    libc::sched_get_priority_max(host),
+                )
+            };
+            if max - min < DARWIN_PRIORITY_MAX - DARWIN_PRIORITY_MIN {
+                continue;
+            }
+            for darwin in DARWIN_PRIORITY_MIN..=DARWIN_PRIORITY_MAX {
+                let there = sched_priority_to_host(darwin, host).unwrap();
+                assert_eq!(sched_priority_from_host(there, host), darwin, "{policy}");
+            }
+        }
     }
 }
