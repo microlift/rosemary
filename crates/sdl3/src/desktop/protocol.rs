@@ -181,8 +181,6 @@ pub(crate) enum Request {
     Commit {
         window: WindowId,
     },
-    /// Where the pointer is and what it holds.
-    Pointer,
     Warp {
         x: f32,
         y: f32,
@@ -245,6 +243,9 @@ pub(crate) enum Request {
     Inject {
         event: Event,
     },
+    /// Nothing, answered after everything the host owes the guest.
+    #[cfg(test)]
+    Sync,
     /// The pixel the host shows at a point of the desktop.
     #[cfg(test)]
     Shown {
@@ -270,26 +271,27 @@ wire_enum!(Request {
     14 => SetHitTest { window, on },
     15 => Attach { window, name, width, height },
     16 => Commit { window },
-    17 => Pointer,
-    18 => Warp { x, y },
-    19 => SetRelative { window, on },
-    20 => SetMouseRect { window, rect },
-    21 => SetGrab { window, on },
-    22 => StartTextInput { window },
-    23 => StopTextInput { window },
-    24 => SetTextInputArea { window, area, cursor },
-    25 => DefineCursor { cursor, width, height, hot_x, hot_y, pixels },
-    26 => ForgetCursor { cursor },
-    27 => SetCursor { choice },
-    28 => SetCursorVisible { visible },
-    29 => SetClipboard { text },
-    30 => Clipboard,
-    31 => Probed { serial, hit },
-    32 => HasClipboardText,
+    17 => Warp { x, y },
+    18 => SetRelative { window, on },
+    19 => SetMouseRect { window, rect },
+    20 => SetGrab { window, on },
+    21 => StartTextInput { window },
+    22 => StopTextInput { window },
+    23 => SetTextInputArea { window, area, cursor },
+    24 => DefineCursor { cursor, width, height, hot_x, hot_y, pixels },
+    25 => ForgetCursor { cursor },
+    26 => SetCursor { choice },
+    27 => SetCursorVisible { visible },
+    28 => SetClipboard { text },
+    29 => Clipboard,
+    30 => Probed { serial, hit },
+    31 => HasClipboardText,
     #[cfg(test)]
-    33 => Inject { event },
+    32 => Inject { event },
     #[cfg(test)]
-    34 => Shown { x, y },
+    33 => Shown { x, y },
+    #[cfg(test)]
+    34 => Sync,
 });
 
 #[derive(Clone, Debug, PartialEq)]
@@ -303,14 +305,6 @@ pub(crate) enum Reply {
     },
     Created {
         window: Option<WindowId>,
-    },
-    /// The pointer on the desktop, the held buttons, and the asking guest's
-    /// window it is over or held by, if it is one of its.
-    Pointer {
-        x: f32,
-        y: f32,
-        buttons: u32,
-        over: Option<WindowId>,
     },
     Clipboard {
         text: Option<Vec<u8>>,
@@ -328,10 +322,9 @@ wire_enum!(Reply {
     1 => Refused { why },
     2 => Done { ok },
     3 => Created { window },
-    4 => Pointer { x, y, buttons, over },
-    5 => Clipboard { text },
+    4 => Clipboard { text },
     #[cfg(test)]
-    6 => Pixel { blue, green, red, alpha },
+    5 => Pixel { blue, green, red, alpha },
 });
 
 impl Request {
@@ -362,7 +355,6 @@ impl Request {
             | Request::StopTextInput { window }
             | Request::SetTextInputArea { window, .. } => Some(*window),
             Request::Hello { .. }
-            | Request::Pointer
             | Request::Warp { .. }
             | Request::DefineCursor { .. }
             | Request::ForgetCursor { .. }
@@ -373,7 +365,7 @@ impl Request {
             | Request::HasClipboardText
             | Request::Probed { .. } => None,
             #[cfg(test)]
-            Request::Inject { .. } | Request::Shown { .. } => None,
+            Request::Inject { .. } | Request::Shown { .. } | Request::Sync => None,
         }
     }
 }
@@ -409,6 +401,14 @@ pub(crate) enum Message {
         x: i32,
         y: i32,
     },
+    /// The pointer on the desktop, the held buttons, and the guest's window
+    /// it is over or held by, if it is one of its.
+    Pointer {
+        x: f32,
+        y: f32,
+        buttons: u32,
+        over: Option<WindowId>,
+    },
 }
 wire_enum!(Message {
     0 => Reply { reply },
@@ -417,6 +417,7 @@ wire_enum!(Message {
     3 => Modifiers { modifiers },
     4 => Event { event },
     5 => Probe { serial, window, x, y },
+    6 => Pointer { x, y, buttons, over },
 });
 
 impl Wire for Rect {
@@ -801,7 +802,7 @@ mod tests {
                 width: 10,
                 height: 20,
             },
-            Request::Pointer,
+            Request::Warp { x: 1.5, y: -2.0 },
         ];
         for request in requests {
             assert_eq!(decode::<Request>(&encode(&request)), Ok(request));
@@ -841,7 +842,7 @@ mod tests {
     #[test]
     fn frames_come_off_a_stream_whole_however_it_was_cut() {
         let mut stream = Vec::new();
-        put_frame(&mut stream, &Request::Pointer).unwrap();
+        put_frame(&mut stream, &Request::Clipboard).unwrap();
         put_frame(
             &mut stream,
             &Request::Show {
@@ -861,7 +862,7 @@ mod tests {
         assert_eq!(
             frames,
             [
-                Request::Pointer,
+                Request::Clipboard,
                 Request::Show {
                     window: 3,
                     focus: true

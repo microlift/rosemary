@@ -72,6 +72,8 @@ struct Peer {
     unsent: Vec<u8>,
     queue: VecDeque<Message>,
     greeted: bool,
+    /// The last [`Message::Pointer`] it was sent.
+    told_pointer: Option<Message>,
     /// The cursors it defined, by its own numbers.
     cursors: HashMap<u32, usize>,
     cursor: CursorChoice,
@@ -91,6 +93,7 @@ enum Slot {
     Backing(WindowId),
     Display(WindowId),
     Motion(WindowId, u32),
+    Pointer,
 }
 
 fn slot(message: &Message) -> Option<Slot> {
@@ -98,6 +101,7 @@ fn slot(message: &Message) -> Option<Slot> {
         Message::Desktop { .. } => Slot::Desktop,
         Message::Modifiers { .. } => Slot::Modifiers,
         Message::Window { window, .. } => Slot::Window(*window),
+        Message::Pointer { .. } => Slot::Pointer,
         Message::Event { event } => match *event {
             Event::WindowMoved { window } => Slot::Moved(window),
             Event::WindowResized { window, .. } => Slot::Resized(window),
@@ -146,6 +150,7 @@ impl Peer {
             unsent: Vec::new(),
             queue: VecDeque::new(),
             greeted: false,
+            told_pointer: None,
             cursors: HashMap::new(),
             cursor: CursorChoice::Standard,
             cursor_hidden: false,
@@ -644,9 +649,9 @@ impl Host {
         })
     }
 
-    /// Tell each guest what changed for it: the desktop, its windows, and
-    /// the events the scene made, in that order, so that an event is read
-    /// against the state it came of.
+    /// Tell each guest what changed for it: the desktop, its windows, the
+    /// pointer, and the events the scene made, in that order, so that an
+    /// event is read against the state it came of.
     fn publish(&mut self) {
         let desktop = (self.scene.size(), self.density);
         if self.told_desktop != Some(desktop) {
@@ -669,6 +674,7 @@ impl Host {
             self.fit_picture(window);
             self.send(owner, &Message::Window { window, state });
         }
+        self.publish_pointer();
         while let Some(event) = self.scene.take_event() {
             let about = window_of(&event);
             let message = Message::Event { event };
@@ -679,6 +685,29 @@ impl Host {
                     }
                 }
                 None => self.broadcast(&message),
+            }
+        }
+    }
+
+    /// Every guest is told where the pointer is whenever it moves, so that
+    /// asking costs it nothing; only its own window is named as under it.
+    fn publish_pointer(&mut self) {
+        let (x, y) = self.scene.pointer();
+        let buttons = self.scene.buttons();
+        let window = self.scene.pointer_window();
+        let owner = window
+            .and_then(|window| self.surfaces.get(&window))
+            .map(|surface| surface.owner);
+        for (id, peer) in self.peers.iter_mut().filter(|(_, peer)| peer.greeted) {
+            let pointer = Message::Pointer {
+                x,
+                y,
+                buttons,
+                over: window.filter(|_| owner == Some(*id)),
+            };
+            if peer.told_pointer.as_ref() != Some(&pointer) {
+                peer.post(&pointer);
+                peer.told_pointer = Some(pointer);
             }
         }
     }
@@ -841,18 +870,6 @@ impl Host {
                 height,
             } => done(self.attach(window, &name, width, height)),
             Request::Commit { window } => done(self.commit(window)),
-            Request::Pointer => {
-                let (x, y) = self.scene.pointer();
-                Reply::Pointer {
-                    x,
-                    y,
-                    buttons: self.scene.buttons(),
-                    over: self
-                        .scene
-                        .pointer_window()
-                        .filter(|window| self.owns(peer, *window)),
-                }
-            }
             Request::Warp { x, y } => done(match video::host_is_wayland() {
                 // What SDL can do only where the compositor has a protocol.
                 true => crate::pointer::warp(self.window, x, y).is_some(),
@@ -986,6 +1003,8 @@ impl Host {
                 self.take(protocol::about(event, self.window_id));
                 done(true)
             }
+            #[cfg(test)]
+            Request::Sync => done(true),
             #[cfg(test)]
             Request::Shown { x, y } => {
                 self.present();

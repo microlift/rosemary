@@ -235,7 +235,7 @@ fn host_input_reaches_the_window_under_the_pointer() {
     inject(motion(170.0, 130.0));
     inject(button(false, 170.0, 130.0));
     let mut seen = events();
-    assert_eq!(ask(Request::Pointer).map(|_| ()), Some(()));
+    assert_eq!(ask(Request::Sync), Some(Reply::Done { ok: true }));
     seen.extend(events());
     assert_eq!(video::window_position(titled), Some((160, 120)));
     assert!(seen.contains(&Event::WindowMoved {
@@ -327,7 +327,7 @@ impl Guest {
 
     fn events(&mut self) -> Vec<Event> {
         // An answer comes after everything sent before it.
-        self.ask(Request::Pointer);
+        self.ask(Request::Sync);
         std::mem::take(&mut self.heard)
             .into_iter()
             .filter_map(|message| match message {

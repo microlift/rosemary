@@ -190,6 +190,9 @@ struct Client {
     size: (i32, i32),
     density: f32,
     modifiers: u16,
+    /// Where the host last said the pointer is, what it holds, and the
+    /// window of this process's it is in.
+    pointer: (f32, f32, u32, Option<WindowId>),
     cursors: HashMap<usize, CursorKind>,
     last_cursor: u32,
     /// The cursor this process wants shown, null for the host's own.
@@ -273,6 +276,12 @@ fn apply(message: Message) {
             client.states.insert(window, state);
         }
         Message::Modifiers { modifiers } => client.modifiers = modifiers,
+        Message::Pointer {
+            x,
+            y,
+            buttons,
+            over,
+        } => client.pointer = (x, y, buttons, over),
         Message::Event { event } => client.queue.push_back(Item::Event(event)),
         Message::Probe {
             serial,
@@ -861,16 +870,9 @@ fn pointer() -> Option<(f32, f32, u32, Option<(i32, i32)>)> {
     if !UP.load(Ordering::Acquire) {
         return None;
     }
-    let Some(Reply::Pointer {
-        x,
-        y,
-        buttons,
-        over,
-    }) = call(&Request::Pointer)
-    else {
-        return None;
-    };
+    pump();
     let client = client();
+    let (x, y, buttons, over) = client.pointer;
     let origin = over
         .and_then(|window| client.states.get(&window))
         .map(|state| (state.frame.x, state.frame.y));
