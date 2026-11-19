@@ -810,14 +810,15 @@ impl KqueueBackend {
         let mut widowed = self.widowed.lock().unwrap_or_else(|e| e.into_inner());
         widowed
             .iter_mut()
-            .filter(|(_, watch)| !watch.edge || std::mem::take(&mut watch.pending))
-            .map(|(fd, watch)| Ready {
-                fd: *fd,
-                revents: libc::POLLOUT | libc::POLLHUP,
-                source: match watch.edge {
-                    true => Source::Edge,
-                    false => Source::Level,
-                },
+            .filter_map(|(fd, watch)| {
+                (!watch.edge || std::mem::take(&mut watch.pending)).then(|| Ready {
+                    fd: *fd,
+                    revents: libc::POLLOUT | libc::POLLHUP,
+                    source: match watch.edge {
+                        true => Source::Edge,
+                        false => Source::Level,
+                    },
+                })
             })
             .collect()
     }
