@@ -193,6 +193,9 @@ jobs:
             export TZ=UTC
             rustup-init -y --profile minimal --default-toolchain stable
             . "$HOME/.cargo/env"
+            # The synced checkout is owned by the runner's user, not root, and
+            # git refuses a repository it does not own.
+            git config --global --add safe.directory "$PWD"
             # Outside the workspace, which is copied back to the runner.
             export CARGO_TARGET_DIR=/var/tmp/target
             cargo build --locked --release --bin rosemary
