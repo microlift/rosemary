@@ -497,19 +497,19 @@ pub unsafe extern "C" fn alphasort(a: *const *const Dirent, b: *const *const Dir
 /// Where `__getdirentries64` stands in a directory's mount points, by the
 /// descriptor it reads. Keyed by the directory's identity too, so a descriptor
 /// number reused for another directory starts afresh.
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "freebsd"))]
 static BLOCK_SHOWN: Mutex<Option<HashMap<c_int, ((u64, u64), usize)>>> = Mutex::new(None);
 
 /// xnu's `DIRENT64_LEN`: a record holds the used name bytes and its NUL, and is
 /// padded to an 8-byte boundary.
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "freebsd"))]
 fn block_record_len(namlen: usize) -> usize {
     const MAXPATHLEN: usize = 1024;
     (size_of::<Dirent>() + namlen - (MAXPATHLEN - 1)).next_multiple_of(8)
 }
 
 /// Append `entry` to the block at `out`, or `false` if it would not fit.
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "freebsd"))]
 fn push_block_record(out: &mut [u8], written: &mut usize, entry: &Dirent) -> bool {
     let namlen = entry.namlen as usize;
     let len = block_record_len(namlen);
@@ -531,25 +531,34 @@ fn push_block_record(out: &mut [u8], written: &mut usize, entry: &Dirent) -> boo
 
 /// `ssize_t __getdirentries64(int fd, void *buf, size_t bufsize, off_t *basep)`
 ///
-/// Darwin's directory block: the host's `getdents64` records, re-packed into
-/// Darwin's layout, then the mount points the namespace adds to the directory.
+/// Darwin's directory block: the host's `getdents64` (Linux) or
+/// `getdirentries` (FreeBSD) records, re-packed into Darwin's layout, then the
+/// mount points the namespace adds to the directory.
 /// A record that does not fit is left for the next call by seeking back to it.
 ///
 /// # Safety
 ///
 /// `buf` is writable for `size` bytes and `base` is null or writable.
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "freebsd"))]
 pub unsafe extern "C" fn getdirentries64(
     fd: c_int,
     buf: *mut u8,
     size: usize,
     base: *mut i64,
 ) -> isize {
-    /// `struct linux_dirent64`'s field offsets.
+    /// `struct linux_dirent64`'s field offsets, which FreeBSD's `struct
+    /// dirent` shares up to the name: it puts `d_namlen` and padding first.
     const HOST_OFF: usize = 8;
     const HOST_RECLEN: usize = 16;
     const HOST_TYPE: usize = 18;
+    #[cfg(target_os = "linux")]
     const HOST_NAME: usize = 19;
+    #[cfg(target_os = "freebsd")]
+    const HOST_NAME: usize = 24;
+    #[cfg(target_os = "freebsd")]
+    unsafe extern "C" {
+        fn getdirentries(fd: c_int, buf: *mut c_char, nbytes: usize, basep: *mut i64) -> isize;
+    }
 
     let mut stat: libc::stat = unsafe { std::mem::zeroed() };
     // SAFETY: a writable buffer.
@@ -564,7 +573,11 @@ pub unsafe extern "C" fn getdirentries64(
     }
     let mut host = vec![0u8; size];
     // SAFETY: a writable buffer of the stated length.
+    #[cfg(target_os = "linux")]
     let read = unsafe { libc::syscall(libc::SYS_getdents64, fd, host.as_mut_ptr(), host.len()) };
+    // SAFETY: a writable buffer of the stated length, and a live base.
+    #[cfg(target_os = "freebsd")]
+    let read = unsafe { getdirentries(fd, host.as_mut_ptr().cast(), host.len(), &mut 0) };
     if read < 0 {
         return -1;
     }
@@ -648,7 +661,7 @@ exports::exports! {
         "closedir" => closedir,
         "scandir" => scandir,
         "alphasort" => alphasort,
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", target_os = "freebsd"))]
         "__getdirentries64" => getdirentries64,
     }
 }
@@ -665,7 +678,7 @@ mod tests {
     }
 
     /// The names in a Darwin directory block, walked by `d_reclen`.
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "freebsd"))]
     fn block_names(block: &[u8]) -> Vec<String> {
         let mut names = Vec::new();
         let mut at = 0;
@@ -679,7 +692,7 @@ mod tests {
         names
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "freebsd"))]
     #[test]
     fn getdirentries64_resumes_where_a_full_block_stopped() {
         use std::os::fd::AsRawFd;
@@ -754,6 +767,8 @@ mod tests {
         assert_eq!(std::mem::offset_of!(Dirent, name), 21);
         #[cfg(target_os = "linux")]
         assert_eq!(std::mem::offset_of!(libc::dirent, d_name), 19);
+        #[cfg(target_os = "freebsd")]
+        assert_eq!(std::mem::offset_of!(libc::dirent, d_name), 24);
         #[cfg(target_os = "macos")]
         assert_eq!(std::mem::offset_of!(libc::dirent, d_name), 21);
         assert_eq!(size_of::<Dirent>(), 1048);
