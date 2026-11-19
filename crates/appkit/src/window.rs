@@ -627,9 +627,9 @@ fn destroy_sdl_window(sdl: sdl3::Window) {
     for member in family.into_iter().rev() {
         // Remove fullscreen native overlays before retiring each member,
         // including SDL popups which SDL otherwise destroys recursively.
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", target_os = "freebsd"))]
         sdl3::x11_mask::forget(member);
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", target_os = "freebsd"))]
         sdl3::wayland_mask::forget(member);
         // A separately retired child has already received its own cleanup.
         if sdl3::video::live_window_id(member).is_none() {
@@ -1267,7 +1267,7 @@ pub(crate) fn refresh_idle_opengl_clip(sdl: sdl3::Window) {
     if sdl.is_null() || !draws_with_opengl(sdl) {
         return;
     }
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "freebsd"))]
     {
         if !sdl3::video::is_x11() && !sdl3::video::is_wayland() {
             return;
