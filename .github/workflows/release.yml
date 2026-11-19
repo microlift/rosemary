@@ -185,8 +185,9 @@ jobs:
           release: "14.4"
           mem: 12288
           envs: NAME SOURCE_DATE_EPOCH
+          # git for the commit `rosemary --version` reports.
           prepare: |
-            pkg install -y curl sdl3 pkgconf rustup-init
+            pkg install -y curl sdl3 pkgconf rustup-init git
           run: |
             set -eu
             export TZ=UTC
