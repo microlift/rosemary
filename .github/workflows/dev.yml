@@ -1,0 +1,105 @@
+name: dev
+
+on:
+  push:
+    branches: ['**']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: dev-${{ github.sha }}
+  cancel-in-progress: false
+
+jobs:
+  # No Nix, no dependencies: the launcher's own tests, before anything slow.
+  launcher:
+    name: launcher tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - run: |
+          rustc --edition 2024 --test crates/launcher/src/main.rs -o launcher-tests
+          ./launcher-tests
+
+  build:
+    name: package (${{ matrix.arch }})
+    needs: launcher
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 180
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            runner: ubuntu-latest
+          # - arch: aarch64
+          #   runner: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/lib/android /opt/hostedtoolcache/CodeQL
+          df -h /
+
+      - uses: cachix/install-nix-action@v31
+        with:
+          extra_nix_config: |
+            experimental-features = nix-command flakes
+            access-tokens = github.com=${{ github.token }}
+            keep-outputs = true
+            keep-derivations = true
+
+      # Restore always. Save only on main: feature branches must not
+      # eat the 10 GB repo cache.
+      - uses: nix-community/cache-nix-action@v7
+        with:
+          primary-key: nix-v1-${{ runner.os }}-${{ runner.arch }}-${{ matrix.arch }}-${{ hashFiles('flake.lock', 'Cargo.lock', 'nix/**', 'flake.nix') }}
+          restore-prefixes-first-match: nix-v1-${{ runner.os }}-${{ runner.arch }}-${{ matrix.arch }}-
+          save: ${{ github.ref == 'refs/heads/main' }}
+          gc-max-store-size-linux: 8G
+          purge: true
+          purge-prefixes: nix-v1-${{ runner.os }}-${{ runner.arch }}-${{ matrix.arch }}-
+          purge-created: 0
+          purge-primary-key: never
+
+      - name: Build Rosemary Steam tool
+        run: nix build --print-build-logs -o result-steam .#rosemary-steam-tool-archive
+
+      - name: Build Rosemary AppImage
+        run: nix build --print-build-logs -o result-appimage .#rosemary-appimage
+
+      - name: Test
+        run: |
+          set -euo pipefail
+          export HOME="$RUNNER_TEMP/home" ROSEMARY_PREFIX_SETUP=none ROSEMARY_LAUNCHER_TRACE=1
+          mkdir -p "$HOME" smoke
+          tar -xzf result-steam/*.tar.gz -C smoke
+          out=$(smoke/Rosemary/bin/rosemary run /nonexistent 2>&1 || true)
+          echo "$out"
+          grep -q "bundled glibc" <<<"$out"
+          grep -q "No such file" <<<"$out"
+          out=$(APPIMAGE_EXTRACT_AND_RUN=1 ./result-appimage run /nonexistent 2>&1 || true)
+          echo "$out"
+          grep -q "No such file" <<<"$out"
+          smoke/Rosemary/rosemary-steam getnativepath /some/path | grep -qx /some/path
+
+      - name: Collect
+        id: collect
+        run: |
+          set -euo pipefail
+          name="Rosemary-dev-${GITHUB_SHA::8}-${{ matrix.arch }}"
+          mkdir dist
+          cp result-steam/*.tar.gz result-steam/*.tar.zst dist/
+          cp result-appimage "dist/${name}.AppImage"
+          chmod u+w dist/*
+          echo "name=${name}" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: ${{ steps.collect.outputs.name }}
+          path: dist/
+          retention-days: 7
+          if-no-files-found: error
