@@ -9,6 +9,8 @@
 //! -> Call guest code -> Call reimplementations (PE side) -> Make a host/Unix call
 //! -> Restores host profile -> Trampoline restores guest profile -> Returns to PE side
 
+// Only the Linux interposer dispatches raw syscalls itself.
+#[cfg(all(target_os = "linux", target_arch = "x86_64", target_env = "gnu"))]
 mod generic;
 mod interpose;
 pub mod numbers;
