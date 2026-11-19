@@ -2045,7 +2045,7 @@ pub(crate) fn backing_upload_submissions_for_test() -> usize {
     TEST_STORE_UPLOAD_SUBMISSIONS.load(std::sync::atomic::Ordering::Relaxed)
 }
 
-#[cfg(test)]
+#[cfg(all(test, target_os = "linux"))]
 pub(crate) fn hold_every_blended_source_for_test(
     window: sdl3::Window,
 ) -> Vec<std::sync::Arc<crate::swapchain::BackingImageLease>> {
@@ -2068,7 +2068,7 @@ pub(crate) fn hold_every_blended_source_for_test(
     retained
 }
 
-#[cfg(test)]
+#[cfg(all(test, target_os = "linux"))]
 pub(crate) fn backing_store_blended_for_test(
     window: sdl3::Window,
 ) -> Option<std::sync::Arc<crate::swapchain::BackingImageLease>> {
@@ -2358,7 +2358,7 @@ fn forget_window(window: sdl3::Window) {
     crate::swapchain::forget_window(window);
 }
 
-#[cfg(test)]
+#[cfg(all(test, target_os = "linux"))]
 pub(crate) fn store_upload_completed_outcome_for_test(
     window: sdl3::Window,
 ) -> Option<appkit::backing::PresentOutcome> {
@@ -2876,7 +2876,7 @@ pub(crate) fn present_store_synchronous(
 static TEST_ACCEPTED_DMA_BLENDS: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
 
-#[cfg(test)]
+#[cfg(all(test, target_os = "linux"))]
 pub(crate) fn accepted_dma_blends_for_test() -> usize {
     TEST_ACCEPTED_DMA_BLENDS.load(std::sync::atomic::Ordering::SeqCst)
 }
@@ -2884,12 +2884,12 @@ pub(crate) fn accepted_dma_blends_for_test() -> usize {
 #[cfg(test)]
 static TEST_BLEND_FAILURE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
-#[cfg(test)]
+#[cfg(all(test, target_os = "linux"))]
 pub(crate) fn inject_blend_failure_for_test(mode: usize) {
     TEST_BLEND_FAILURE.store(mode, std::sync::atomic::Ordering::SeqCst);
 }
 
-#[cfg(test)]
+#[cfg(all(test, target_os = "linux"))]
 pub(crate) fn blend_failure_pending_for_test() -> usize {
     TEST_BLEND_FAILURE.load(std::sync::atomic::Ordering::SeqCst)
 }

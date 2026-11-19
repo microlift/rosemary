@@ -2103,7 +2103,7 @@ fn native_scene_source(
 /// Upload native AppKit pixels exclusively on the window's worker, then copy
 /// to the same fence-retained scene snapshot used for Metal drawables. AppKit
 /// publishes immutable bytes but never blocks on a Vulkan queue.
-#[cfg(test)]
+#[cfg(all(test, target_os = "linux"))]
 static TEST_BLOCK_LINEAR_DMA_FALLBACK: AtomicBool = AtomicBool::new(false);
 #[cfg(test)]
 static TEST_NATIVE_RETRYABLE_FAILURES: std::sync::atomic::AtomicUsize =

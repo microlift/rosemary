@@ -58,7 +58,7 @@ pub unsafe extern "C" fn UTTypeCopyPreferredTagWithClass(
 /// `Boolean UTTypeConformsTo(CFStringRef inUTI, CFStringRef inConformsToUTI)`
 ///
 /// Against the declared types' table, so a type only an application declares
-/// - which Launch Services would know from that application - conforms only
+/// (which Launch Services would know from that application) conforms only
 /// to itself, as on a Mac without that application.
 pub unsafe extern "C" fn UTTypeConformsTo(identifier: *const c_void, other: *const c_void) -> u8 {
     match (read(identifier), read(other)) {

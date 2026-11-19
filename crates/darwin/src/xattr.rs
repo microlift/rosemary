@@ -6,6 +6,7 @@ use std::ffi::{CStr, CString, c_char, c_void};
 const NOFOLLOW: i32 = 0x0001;
 const CREATE: i32 = 0x0002;
 const REPLACE: i32 = 0x0004;
+#[cfg(target_os = "linux")]
 const ENOATTR: i32 = 93;
 
 /// Whether this host's `errno` means the attribute named is not on the file.

@@ -36,7 +36,7 @@ impl DarwinTranslation<libc::stat> for Stat {
     fn to_host(&self) -> libc::stat {
         let mut stat: libc::stat = unsafe { std::mem::zeroed() };
         stat.st_dev = self.dev as _;
-        stat.st_mode = self.mode.into();
+        stat.st_mode = self.mode as _;
         stat.st_nlink = self.nlink.into();
         stat.st_ino = self.ino;
         stat.st_uid = self.uid;
@@ -50,7 +50,7 @@ impl DarwinTranslation<libc::stat> for Stat {
         stat.st_ctime_nsec = self.ctime.nsec;
         stat.st_size = self.size;
         stat.st_blocks = self.blocks;
-        stat.st_blksize = self.blksize.into();
+        stat.st_blksize = self.blksize as _;
         #[cfg(target_os = "macos")]
         {
             stat.st_birthtime = self.birthtime.sec;
