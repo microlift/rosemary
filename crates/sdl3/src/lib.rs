@@ -12,7 +12,7 @@ pub mod mouse;
 pub mod pointer;
 pub mod tray;
 pub mod wayland;
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "freebsd"))]
 pub mod wayland_mask;
 pub mod x11_mask;
 
@@ -2497,7 +2497,9 @@ pub mod video {
     pub fn init_video() -> bool {
         let mut up = VIDEO_UP.lock().unwrap_or_else(|e| e.into_inner());
         if !*up {
-            if cfg!(target_os = "linux") && get_hint(c"SDL_VIDEO_DRIVER").is_none() {
+            if cfg!(any(target_os = "linux", target_os = "freebsd"))
+                && get_hint(c"SDL_VIDEO_DRIVER").is_none()
+            {
                 // Hack for an SDL bug where SDL mistakenly classifies Niri as incapable of being
                 // a Wayland compositor, yet somehow capable of being an Xwayland one.
                 // Unsure if this is a Niri or SDL bug to be honest, it literally ONLY happens on Niri.
