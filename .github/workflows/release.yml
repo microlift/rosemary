@@ -153,9 +153,102 @@ jobs:
           path: dist/
           if-no-files-found: error
 
+  # FreeBSD has no Nix to bundle from: the binary links the base system and
+  # packages, so it is built on the oldest supported FreeBSD release and runs
+  # on every later one. See packaging/freebsd/README.txt.
+  build-freebsd:
+    name: package (x86_64-freebsd)
+    needs: launcher
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Version
+        id: version
+        run: |
+          version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n 1)
+          echo "name=Rosemary-${version}-x86_64-freebsd" >> "$GITHUB_OUTPUT"
+          echo "SOURCE_DATE_EPOCH=$(git log -1 --format=%ct)" >> "$GITHUB_ENV"
+
+      # FreeBSD's rust package can trail the toolchain this tree needs, as
+      # nixpkgs' can; rustup brings the current stable, as the flake does.
+      - name: Build and test in FreeBSD
+        uses: vmactions/freebsd-vm@v1
+        env:
+          NAME: ${{ steps.version.outputs.name }}
+        with:
+          release: "14.4"
+          mem: 12288
+          envs: NAME SOURCE_DATE_EPOCH
+          prepare: |
+            pkg install -y curl sdl3 pkgconf rustup-init
+          run: |
+            set -eu
+            export TZ=UTC
+            rustup-init -y --profile minimal --default-toolchain stable
+            . "$HOME/.cargo/env"
+            # Outside the workspace, which is copied back to the runner.
+            export CARGO_TARGET_DIR=/var/tmp/target
+            cargo build --locked --release --bin rosemary
+            bin=$CARGO_TARGET_DIR/release/rosemary
+
+            # Every library it needs must be one 14.x and 15.x both carry
+            # under the same name: libutil, for one, changed soname in 15.
+            readelf -d "$bin" | grep NEEDED
+            if readelf -d "$bin" | grep NEEDED | grep -q libutil; then
+              echo "rosemary links libutil, whose soname differs across releases"
+              exit 1
+            fi
+
+            export ROSEMARY_PREFIX_SETUP=none
+            out=$("$bin" run /nonexistent 2>&1 || true)
+            echo "$out"
+            echo "$out" | grep -q "No such file"
+
+            mkdir -p "stage/Rosemary/bin" "stage/Rosemary/share/doc/rosemary" dist
+            install -m755 "$bin" stage/Rosemary/bin/rosemary
+            cp packaging/freebsd/README.txt stage/Rosemary/README.txt
+            cp LICENSE stage/Rosemary/share/doc/rosemary/LICENSE
+            # Sorted entries, fixed owners and the commit's time, as the Linux
+            # archives have.
+            stamp=$(date -r "$SOURCE_DATE_EPOCH" +%Y%m%d%H%M.%S)
+            cd stage
+            find Rosemary -exec touch -h -t "$stamp" {} +
+            find Rosemary | sort \
+              | tar -cf - -n --uid 0 --gid 0 --numeric-owner -T - \
+              | gzip -9n > "../dist/${NAME}.tar.gz"
+
+      - name: Collect
+        run: |
+          set -euo pipefail
+          cd dist
+          sha256sum -- * | tee SHA256SUMS.x86_64-freebsd
+
+      - name: Attest
+        if: github.event_name == 'push'
+        id: attest
+        uses: actions/attest-build-provenance@v4
+        with:
+          subject-path: dist/*.tar.gz
+
+      - name: Copy attestation to the correct directory
+        if: github.event_name == 'push'
+        run: cp '${{ steps.attest.outputs.bundle-path }}' 'dist/${{ steps.version.outputs.name }}.intoto.jsonl'
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: ${{ steps.version.outputs.name }}
+          path: dist/
+          if-no-files-found: error
+
   release:
     name: release
-    needs: build
+    needs: [build, build-freebsd]
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     permissions:

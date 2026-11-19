@@ -18,6 +18,16 @@ Rosemary has official releases as a Steam compatibility tool, similar to Proton 
 
 To install it, head over to [releases](https://github.com/microlift/rosemary/releases), download rosemary-steam-tool in your preferred format, and follow the README in the "Rosemary" folder.
 
+## FreeBSD
+
+Releases include `Rosemary-<version>-x86_64-freebsd.tar.gz`, built on FreeBSD 14.4 for amd64 and running on 14.4 and every later release. Unlike the AppImage it bundles nothing, so install the libraries Rosemary uses from packages first:
+
+```sh
+sudo pkg install curl sdl3 vulkan-loader mesa-libs
+```
+
+With an NVIDIA card, `nvidia-driver` provides Vulkan and OpenGL in place of `mesa-libs`. Then extract the archive anywhere and run `Rosemary/bin/rosemary`; the README inside has the details.
+
 ## Nix
 
 Rosemary ships a flake for `x86_64-linux`, `aarch64-linux`, `x86_64-darwin`, and `aarch64-darwin`. It exposes `packages.<system>.default` (alias `rosemary`) and a Home Manager module. There is no overlay or NixOS module.
