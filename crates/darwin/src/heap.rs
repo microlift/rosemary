@@ -84,9 +84,16 @@ mod tests {
         use std::sync::atomic::AtomicU32;
 
         static FREED: AtomicU32 = AtomicU32::new(0);
+        // Only this test's block is counted: every other test's `free` reaches
+        // the registered allocator too while it is in place.
+        static WATCHED: AtomicUsize = AtomicUsize::new(0);
 
         unsafe extern "C" fn counting_free(block: *mut c_void) {
-            FREED.fetch_add(1, Ordering::Relaxed);
+            let watched =
+                WATCHED.compare_exchange(block as usize, 0, Ordering::Relaxed, Ordering::Relaxed);
+            if watched.is_ok() {
+                FREED.fetch_add(1, Ordering::Relaxed);
+            }
             // SAFETY: a block Darwin's `malloc` returned.
             unsafe { darwin_free(block) };
         }
@@ -100,7 +107,11 @@ mod tests {
         );
         assert!(is_registered());
         // SAFETY: a size this test asks for and immediately frees.
-        unsafe { free(malloc(16)) };
+        unsafe {
+            let block = malloc(16);
+            WATCHED.store(block as usize, Ordering::Relaxed);
+            free(block);
+        }
         assert_eq!(FREED.load(Ordering::Relaxed), 1);
         register(was_malloc, was_free);
     }

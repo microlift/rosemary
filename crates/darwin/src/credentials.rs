@@ -281,6 +281,11 @@ exports::exports! {
     }
 }
 
+/// Held for writing while a test changes this process's ids, and for reading
+/// by a test elsewhere that expects the host user's.
+#[cfg(test)]
+pub(crate) static IDS: RwLock<()> = RwLock::new(());
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -289,6 +294,7 @@ mod tests {
     /// runs tests on threads that share them.
     #[test]
     fn a_set_user_id_start_can_become_root_and_give_it_back() {
+        let _ids = IDS.write().unwrap_or_else(|e| e.into_inner());
         // SAFETY: no arguments.
         let host = unsafe { libc::getuid() };
         assert_eq!(getuid(), host, "the host's user to begin with");
