@@ -87,6 +87,7 @@ exports::exports! {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(target_arch = "aarch64")]
     use std::ffi::c_char;
 
     fn narrowed(format: &std::ffi::CStr) -> Option<String> {

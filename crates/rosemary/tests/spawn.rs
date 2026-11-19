@@ -316,6 +316,7 @@ fn framework_tasks_preserve_emulation_cwd_and_redirected_stdio() {
     }
 }
 
+#[cfg(target_arch = "aarch64")]
 const ARCH_PARENT_SOURCE: &str = r#"
 #include <spawn.h>
 #include <stdio.h>
@@ -334,6 +335,7 @@ int main(int argc, char **argv) {
 }
 "#;
 
+#[cfg(target_arch = "aarch64")]
 const ARCH_CHILD_SOURCE: &str = r#"
 #include <stdio.h>
 #include <sys/sysctl.h>

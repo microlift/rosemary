@@ -3,10 +3,12 @@
 
 use std::ffi::{CStr, c_void};
 
+#[cfg(target_os = "macos")]
 use static_init::dynamic;
 
 use crate::driver::Entry;
 
+#[cfg(target_os = "macos")]
 fn enable_mipmap_perf_hack() -> bool {
     #[dynamic]
     static ENABLED: bool = std::env::var("ROSEMARY_GL_MIPMAP_PERF_HACK").as_deref() == Ok("1");
