@@ -35,7 +35,7 @@ use std::io;
 use std::os::fd::RawFd;
 use std::os::unix::fs::MetadataExt;
 use std::path::PathBuf;
-use std::sync::{Mutex, PoisonError};
+use std::sync::{Mutex, OnceLock, PoisonError};
 use std::time::{Duration, Instant};
 
 use super::{kinfo, sysctl};
@@ -248,12 +248,25 @@ fn vmentries(bytes: &[u8]) -> impl Iterator<Item = libc::kinfo_vmentry> + '_ {
     })
 }
 
-/// How long a region count is reused. `KERN_PROC_VMMAP` also counts every
-/// entry's resident pages under the map lock, tens of milliseconds in a game's
-/// address space, and engines poll the count several times a second.
+/// `ROSEMARY_REGION_COUNT_REUSE=1`: reuse a region count for up to
+/// [`REGION_COUNT_REUSE`]. `KERN_PROC_VMMAP` also counts every entry's resident
+/// pages under the map lock, tens of milliseconds in a game's address space,
+/// and engines poll the count several times a second. Off by default, as the
+/// count can then be out of date.
+const REGION_COUNT_REUSE_ENV: &str = "ROSEMARY_REGION_COUNT_REUSE";
+
+/// How long a region count is reused when [`REGION_COUNT_REUSE_ENV`] asks.
 const REGION_COUNT_REUSE: Duration = Duration::from_secs(1);
 
+fn reuse_region_count() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os(REGION_COUNT_REUSE_ENV).is_some_and(|v| v != "0"))
+}
+
 pub fn region_count(pid: i32) -> Option<u32> {
+    if !reuse_region_count() {
+        return regions(pid).ok().map(|regions| regions.len() as u32);
+    }
     // FIXME (ACCURACY): the count can be up to `REGION_COUNT_REUSE` old.
     // Held across the walk so concurrent callers share one instead of each
     // contending for the map lock.
@@ -471,4 +484,46 @@ pub fn xattr_remove_path(_: &std::ffi::CStr, _: &std::ffi::CStr, _: bool) -> io:
 
 pub fn xattr_is_missing(_: &io::Error) -> bool {
     false
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Without `ROSEMARY_REGION_COUNT_REUSE`, a count follows the map at once.
+    #[test]
+    fn a_new_mapping_is_counted_at_once() {
+        if reuse_region_count() {
+            return;
+        }
+        let pid = crate::process::me();
+        let page = page_size() as usize;
+        // A mapping of an object of its own, which the kernel never merges
+        // into a neighbouring entry.
+        // SAFETY: a name and no flags.
+        let fd = unsafe { libc::memfd_create(c"region-count".as_ptr(), 0) };
+        assert!(fd >= 0);
+        // SAFETY: this test's own descriptor.
+        assert_eq!(unsafe { libc::ftruncate(fd, page as libc::off_t) }, 0);
+        let before = region_count(pid).expect("a count");
+        // SAFETY: a fresh mapping of that object, unmapped below.
+        let at = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                page,
+                libc::PROT_READ,
+                libc::MAP_SHARED,
+                fd,
+                0,
+            )
+        };
+        assert_ne!(at, libc::MAP_FAILED);
+        let after = region_count(pid).expect("a count");
+        // SAFETY: the mapping and descriptor made above.
+        unsafe {
+            libc::munmap(at, page);
+            libc::close(fd);
+        }
+        assert!(after > before, "{before} then {after}");
+    }
 }
