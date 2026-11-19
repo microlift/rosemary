@@ -84,16 +84,26 @@ const FD_SETSIZE: c_int = 1024;
 
 /// Whether `fd_set` lies on the calling thread's stack.
 ///
-/// Unknown off Linux, and answered "yes": the check exists to stop a write
-/// past a fixed-size set, and a stack set is where that write does damage.
+/// Unknown off Linux and FreeBSD, and answered "yes": the check exists to stop
+/// a write past a fixed-size set, and a stack set is where that write does
+/// damage.
 fn on_this_stack(fd_set: *const c_void) -> bool {
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "freebsd"))]
     {
         // SAFETY: the calling thread's own attributes, read into a local and
         // destroyed afterwards.
         unsafe {
             let mut attr: libc::pthread_attr_t = std::mem::zeroed();
-            if libc::pthread_getattr_np(libc::pthread_self(), &mut attr) != 0 {
+            // FreeBSD spells this `pthread_attr_get_np`, and fills in an
+            // attribute object the caller has already initialised.
+            #[cfg(target_os = "freebsd")]
+            let rc = match libc::pthread_attr_init(&mut attr) {
+                0 => libc::pthread_attr_get_np(libc::pthread_self(), &mut attr),
+                rc => rc,
+            };
+            #[cfg(target_os = "linux")]
+            let rc = libc::pthread_getattr_np(libc::pthread_self(), &mut attr);
+            if rc != 0 {
                 return true;
             }
             let mut base: *mut c_void = std::ptr::null_mut();
@@ -108,7 +118,7 @@ fn on_this_stack(fd_set: *const c_void) -> bool {
             start >= lo && end <= hi
         }
     }
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(not(any(target_os = "linux", target_os = "freebsd")))]
     {
         let _ = fd_set;
         true
@@ -154,7 +164,7 @@ mod tests {
         assert_eq!(check_fd_set_overflow(3, set.as_ptr().cast(), 0), 1);
         assert_eq!(check_fd_set_overflow(2000, set.as_ptr().cast(), 0), 0);
         assert_eq!(check_fd_set_overflow(2000, set.as_ptr().cast(), 1), 1);
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", target_os = "freebsd"))]
         assert_eq!(check_fd_set_overflow(2000, heap.as_ptr().cast(), 0), 1);
         let _ = heap;
     }
