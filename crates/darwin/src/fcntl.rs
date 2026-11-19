@@ -427,11 +427,48 @@ pub mod entry {
         };
         // `posix_fallocate` returns an errno value directly.
         let error = unsafe { libc::posix_fallocate(fd, offset, request.length) };
+        if error == libc::EOPNOTSUPP {
+            // SAFETY: as above.
+            return unsafe { extend_instead(fd, offset, request.length, store) };
+        }
         if error != 0 {
             crate::errno::set(error);
             return -1;
         }
         unsafe { (*store).bytes_allocated = request.length };
+        0
+    }
+
+    /// `F_PREALLOCATE` on a file system that cannot reserve blocks, such as
+    /// FreeBSD's ZFS, which is copy-on-write and refuses `posix_fallocate`.
+    ///
+    /// FIXME (ACCURACY): the file reaches the size `posix_fallocate` would have
+    /// given it, but no space is reserved, so a later write can still fail
+    /// with `ENOSPC`.
+    ///
+    /// # Safety
+    ///
+    /// `store` is the caller's writable `fstore_t`.
+    unsafe fn extend_instead(
+        fd: libc::c_int,
+        offset: libc::off_t,
+        length: libc::off_t,
+        store: *mut Fstore,
+    ) -> libc::c_int {
+        let Some(end) = offset.checked_add(length) else {
+            crate::errno::set(libc::EFBIG);
+            return -1;
+        };
+        let mut status: libc::stat = unsafe { std::mem::zeroed() };
+        // SAFETY: `status` is writable and `fd` is the caller's descriptor.
+        if unsafe { libc::fstat(fd, &mut status) } < 0 {
+            return -1;
+        }
+        // SAFETY: the caller's descriptor; only ever grown.
+        if status.st_size < end && unsafe { libc::ftruncate(fd, end) } < 0 {
+            return -1;
+        }
+        unsafe { (*store).bytes_allocated = length };
         0
     }
 
@@ -687,6 +724,37 @@ mod tests {
         assert_eq!(result, 0);
         assert_eq!(store.bytes_allocated, 102_400);
         assert_eq!(file.metadata().unwrap().len(), 102_400);
+        drop(file);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn f_preallocate_inside_the_file_keeps_its_size() {
+        use std::os::fd::AsRawFd;
+
+        let path = std::env::temp_dir().join(format!(
+            "rosemary-preallocate-inside-{}",
+            std::process::id()
+        ));
+        let file = std::fs::File::create(&path).expect("a temporary file");
+        file.set_len(8192).expect("a sized file");
+        let mut store = Fstore {
+            flags: preallocate::F_ALLOCATEALL,
+            posmode: preallocate::F_VOLPOSMODE,
+            length: 4096,
+            ..Fstore::default()
+        };
+        // SAFETY: a live descriptor and writable Darwin `fstore_t`.
+        let result = unsafe {
+            entry::fcntl(
+                file.as_raw_fd(),
+                cmd::F_PREALLOCATE,
+                (&raw mut store) as usize,
+            )
+        };
+        assert_eq!(result, 0);
+        assert_eq!(store.bytes_allocated, 4096);
+        assert_eq!(file.metadata().unwrap().len(), 8192);
         drop(file);
         let _ = std::fs::remove_file(path);
     }
