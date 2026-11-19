@@ -726,8 +726,8 @@ pub unsafe extern "C" fn clonefile(from: *const c_char, to: *const c_char, flags
 /// `int renameatx_np(int, const char *, int, const char *, unsigned int)`
 ///
 /// `RENAME_SWAP` and `RENAME_EXCL` are Linux's `RENAME_EXCHANGE` and
-/// `RENAME_NOREPLACE`; a host without `renameat2` refuses them rather than
-/// rename without the guarantee asked for.
+/// `RENAME_NOREPLACE`, and FreeBSD's `RENAME_NOREPLACE` too; a host without
+/// the flag refuses it rather than rename without the guarantee asked for.
 ///
 /// # Safety
 ///
@@ -780,7 +780,33 @@ pub unsafe extern "C" fn renameatx_np(
             )
         }
     }
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(target_os = "freebsd")]
+    {
+        // FreeBSD has `RENAME_NOREPLACE` but nothing that swaps.
+        if flags & RENAME_SWAP != 0 {
+            crate::errno::set(libc::ENOTSUP);
+            return -1;
+        }
+        if flags & RENAME_EXCL != 0 {
+            let Some(renameat2) = freebsd_renameat2() else {
+                crate::errno::set(libc::ENOTSUP);
+                return -1;
+            };
+            // SAFETY: two NUL-terminated host paths.
+            return unsafe {
+                renameat2(
+                    libc::AT_FDCWD,
+                    from.as_ptr(),
+                    libc::AT_FDCWD,
+                    to.as_ptr(),
+                    libc::RENAME_NOREPLACE,
+                )
+            };
+        }
+        // SAFETY: two NUL-terminated host paths.
+        unsafe { libc::rename(from.as_ptr(), to.as_ptr()) }
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "freebsd")))]
     {
         if flags != 0 {
             crate::errno::set(libc::ENOTSUP);
@@ -789,6 +815,23 @@ pub unsafe extern "C" fn renameatx_np(
         // SAFETY: two NUL-terminated host paths.
         unsafe { libc::rename(from.as_ptr(), to.as_ptr()) }
     }
+}
+
+/// The host's `renameat2`, which FreeBSD's libc has from 15.0 on.
+///
+/// Looked up rather than linked, so that a build made on 14 - the oldest
+/// release a binary is meant to run on - still loads there and refuses only
+/// the exclusive rename.
+#[cfg(target_os = "freebsd")]
+fn freebsd_renameat2()
+-> Option<unsafe extern "C" fn(c_int, *const c_char, c_int, *const c_char, u32) -> c_int> {
+    static FOUND: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    let found = *FOUND.get_or_init(|| {
+        // SAFETY: a NUL-terminated name looked up in the global scope.
+        unsafe { libc::dlsym(libc::RTLD_DEFAULT, c"renameat2".as_ptr()) as usize }
+    });
+    // SAFETY: a non-null `renameat2` from FreeBSD's libc has this signature.
+    (found != 0).then(|| unsafe { std::mem::transmute::<usize, _>(found) })
 }
 
 /// `int renameat(int, const char *, int, const char *)`
@@ -1560,6 +1603,30 @@ mod tests {
         let rc = unsafe { renameat(here, from.as_ptr(), here, to.as_ptr()) };
         assert_eq!(rc, 0, "renameat: {}", std::io::Error::last_os_error());
         assert_eq!(std::fs::read(scratch.0.join("to")).unwrap(), b"x");
+    }
+
+    #[test]
+    fn renameatx_np_excl_keeps_an_existing_target() {
+        let scratch = Scratch::new("renameatx-excl");
+        std::fs::write(scratch.0.join("from"), b"new").expect("a file");
+        std::fs::write(scratch.0.join("to"), b"old").expect("a file");
+        let (from, to) = (scratch.c_path("from"), scratch.c_path("to"));
+        let here = crate::stat::DARWIN_AT_FDCWD;
+        const RENAME_EXCL: u32 = 4;
+        // SAFETY: two NUL-terminated paths and Darwin's AT_FDCWD.
+        let rc = unsafe { renameatx_np(here, from.as_ptr(), here, to.as_ptr(), RENAME_EXCL) };
+        if rc != 0 && crate::errno::get() == libc::ENOTSUP {
+            // A host without an exclusive rename refuses it outright.
+            return;
+        }
+        assert_eq!(rc, -1);
+        assert_eq!(crate::errno::get(), libc::EEXIST);
+        assert_eq!(std::fs::read(scratch.0.join("to")).unwrap(), b"old");
+        std::fs::remove_file(scratch.0.join("to")).unwrap();
+        // SAFETY: as above.
+        let rc = unsafe { renameatx_np(here, from.as_ptr(), here, to.as_ptr(), RENAME_EXCL) };
+        assert_eq!(rc, 0, "renameatx_np: {}", std::io::Error::last_os_error());
+        assert_eq!(std::fs::read(scratch.0.join("to")).unwrap(), b"new");
     }
 
     #[test]
