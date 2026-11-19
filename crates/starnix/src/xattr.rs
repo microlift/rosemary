@@ -70,3 +70,36 @@ pub fn remove(target: Target<'_>, name: &CStr) -> io::Result<()> {
 pub fn is_missing(error: &io::Error) -> bool {
     sys::xattr_is_missing(error)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_value_is_read_whole_or_not_at_all() {
+        let dir = std::env::temp_dir().join(format!("starnix-xattr-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("f");
+        std::fs::write(&file, b"").unwrap();
+        let path = CString::new(file.to_str().unwrap()).unwrap();
+        let target = Target::Path(&path, true);
+        match set(target, c"user.starnix.test", b"0123456789") {
+            // A filesystem without user attributes has nowhere to keep one.
+            Err(e) if e.raw_os_error() == Some(libc::ENOTSUP) => {}
+            Err(e) => panic!("{e}"),
+            Ok(()) => {
+                assert_eq!(get(target, c"user.starnix.test", &mut []).unwrap(), 10);
+                let mut short = [0u8; 4];
+                let error = get(target, c"user.starnix.test", &mut short).unwrap_err();
+                assert_eq!(error.raw_os_error(), Some(libc::ERANGE));
+                let mut whole = [0u8; 16];
+                let got = get(target, c"user.starnix.test", &mut whole).unwrap();
+                assert_eq!(&whole[..got], b"0123456789");
+                remove(target, c"user.starnix.test").unwrap();
+                let error = get(target, c"user.starnix.test", &mut whole).unwrap_err();
+                assert!(is_missing(&error), "{error}");
+            }
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+}
