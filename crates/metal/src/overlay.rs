@@ -169,7 +169,7 @@ static IMPORTED: Mutex<Vec<Imported>> = Mutex::new(Vec::new());
 #[cfg(test)]
 static TEST_IMPORT_ATTEMPTS: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
-#[cfg(test)]
+#[cfg(all(test, target_os = "linux"))]
 pub(crate) fn import_attempts_for_test() -> usize {
     TEST_IMPORT_ATTEMPTS.load(std::sync::atomic::Ordering::Relaxed)
 }
@@ -181,11 +181,11 @@ static INJECT_IMPORT_FAILURE_ONCE: std::sync::atomic::AtomicBool =
 static INJECT_UNSUPPORTED_IMPORT_ONCE: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
-#[cfg(test)]
+#[cfg(all(test, target_os = "linux"))]
 pub(crate) fn fail_next_dma_import_for_test() {
     INJECT_IMPORT_FAILURE_ONCE.store(true, std::sync::atomic::Ordering::Release);
 }
-#[cfg(test)]
+#[cfg(all(test, target_os = "linux"))]
 pub(crate) fn fail_next_unsupported_dma_import_for_test() {
     INJECT_UNSUPPORTED_IMPORT_ONCE.store(true, std::sync::atomic::Ordering::Release);
 }
@@ -594,7 +594,7 @@ impl Drop for PassLease {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, target_os = "linux"))]
 pub(crate) fn available_passes_for_test(gpu: &'static Gpu) -> usize {
     PASSES
         .lock()
