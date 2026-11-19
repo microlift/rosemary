@@ -94,22 +94,19 @@ fn entry(host: &libc::passwd, at: impl Fn(usize) -> *mut c_char) -> Passwd {
     }
 }
 
-/// A host `struct passwd` as Darwin's, in this thread's storage.
+/// A host lookup's answer as Darwin's, in this thread's storage.
 ///
-/// # Safety
-///
-/// `host` is a live `struct passwd` this process's libc returned.
-unsafe fn publish(host: *const libc::passwd) -> *mut Passwd {
-    let host = unsafe { &*host };
-    // A host account a system one hides is not there at all.
-    // SAFETY: libc's own NUL-terminated name.
-    if !host.pw_name.is_null()
-        && crate::accounts::shadows_user(unsafe { CStr::from_ptr(host.pw_name) }.to_bytes())
-    {
-        return std::ptr::null_mut();
+/// The host's reentrant calls, because its `getpwuid` and `getpwnam` share
+/// one static entry between threads on FreeBSD, where Darwin's are per thread.
+fn published(answer: Result<Option<([CString; 6], u32, u32)>, c_int>) -> *mut Passwd {
+    match answer {
+        Ok(Some((strings, uid, gid))) => publish_strings(strings, uid, gid),
+        Ok(None) => std::ptr::null_mut(),
+        Err(error) => {
+            crate::errno::set(error);
+            std::ptr::null_mut()
+        }
     }
-    let strings = unsafe { strings_of(host) };
-    publish_strings(strings, host.pw_uid, host.pw_gid)
 }
 
 /// A system account's strings, in [`Passwd`]'s order.
@@ -202,13 +199,10 @@ pub unsafe extern "C" fn getpwuid(uid: u32) -> *mut Passwd {
     if let Some(user) = crate::accounts::system_user_by_uid(uid) {
         return publish_strings(system_strings(&user), user.uid, user.gid);
     }
-    // SAFETY: takes a scalar and returns libc's own storage or null.
-    let host = unsafe { libc::getpwuid(uid) };
-    if host.is_null() {
-        return std::ptr::null_mut();
-    }
-    // SAFETY: non-null, and libc's own entry.
-    unsafe { publish(host) }
+    // SAFETY: the host's reentrant lookup into buffers `lookup_r` owns.
+    published(lookup_r(|h, b, n, r| unsafe {
+        libc::getpwuid_r(uid, h, b, n, r)
+    }))
 }
 
 /// `struct passwd *getpwnam(const char *)`
@@ -228,13 +222,10 @@ pub unsafe extern "C" fn getpwnam(name: *const c_char) -> *mut Passwd {
     {
         return publish_strings(system_strings(&user), user.uid, user.gid);
     }
-    // SAFETY: the caller's string.
-    let host = unsafe { libc::getpwnam(name) };
-    if host.is_null() {
-        return std::ptr::null_mut();
-    }
-    // SAFETY: non-null, and libc's own entry.
-    unsafe { publish(host) }
+    // SAFETY: the caller's string, and buffers `lookup_r` owns.
+    published(lookup_r(|h, b, n, r| unsafe {
+        libc::getpwnam_r(name, h, b, n, r)
+    }))
 }
 
 /// The directory `~` or `~name` stands for, or `None` for a user this host has
@@ -250,15 +241,14 @@ pub fn home(user: Option<&CStr>) -> Option<CString> {
     {
         return CString::new(user.home).ok();
     }
-    // SAFETY: a scalar, or the caller's NUL-terminated name; both return libc's
-    // own storage or null.
-    let host = unsafe {
+    // SAFETY: the caller's NUL-terminated name, and buffers `lookup_r` owns.
+    let host = lookup_r(|h, b, n, r| unsafe {
         match user {
-            Some(name) => libc::getpwnam(name.as_ptr()),
-            None => libc::getpwuid(libc::getuid()),
+            Some(name) => libc::getpwnam_r(name.as_ptr(), h, b, n, r),
+            None => libc::getpwuid_r(libc::getuid(), h, b, n, r),
         }
-    };
-    if host.is_null() {
+    });
+    let Ok(Some(([_, _, _, _, home, _], _, _))) = host else {
         // A container often has no passwd entry for the uid it runs as, and
         // `$HOME` is still the answer for the calling user.
         return match user {
@@ -267,9 +257,7 @@ pub fn home(user: Option<&CStr>) -> Option<CString> {
             // and the guest's own home is still the answer for the caller.
             None => CString::new(prefix::ns::home()).ok(),
         };
-    }
-    // SAFETY: non-null, and libc's own entry.
-    let home = home_of(unsafe { &*host });
+    };
     (!home.as_bytes().is_empty()).then_some(home)
 }
 
@@ -452,10 +440,9 @@ pub extern "C" fn user_from_uid(uid: u32, nouser: c_int) -> *const c_char {
         if let Some(user) = crate::accounts::system_user_by_uid(uid) {
             return CString::new(user.name).ok();
         }
-        // SAFETY: a scalar, answered with libc's own entry or null.
-        let host = unsafe { libc::getpwuid(uid) };
-        // SAFETY: libc's own NUL-terminated name.
-        (!host.is_null()).then(|| unsafe { CString::from(CStr::from_ptr((*host).pw_name)) })
+        // SAFETY: the host's reentrant lookup into buffers `lookup_r` owns.
+        let host = lookup_r(|h, b, n, r| unsafe { libc::getpwuid_r(uid, h, b, n, r) });
+        host.ok().flatten().map(|([name, ..], _, _)| name)
     });
     match name {
         Some(name) => name.as_ptr(),
@@ -928,11 +915,11 @@ mod tests {
     fn getgrouplist_2_allocates_the_users_groups_base_first() {
         // SAFETY: this process's own user, and a list this test frees.
         unsafe {
-            let me = libc::getpwuid(libc::getuid());
+            let me = getpwuid(libc::getuid());
             assert!(!me.is_null());
-            let base = (*me).pw_gid;
+            let base = (*me).gid;
             let mut groups: *mut u32 = std::ptr::null_mut();
-            let count = getgrouplist_2((*me).pw_name, base, &mut groups);
+            let count = getgrouplist_2((*me).name, base, &mut groups);
             assert!(count >= 1);
             let list = std::slice::from_raw_parts(groups, count as usize);
             assert_eq!(list[0], base);
