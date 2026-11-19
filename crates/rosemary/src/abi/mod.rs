@@ -481,6 +481,25 @@ pub struct Promotion {
 /// `name` as an inlined native call, if this host has a table that says so.
 pub fn promotion(name: &str, resolved: u64) -> Option<Promotion> {
     crate::objc::fast::promotion(name, resolved)
+        .or_else(|| crate::shims::function(name)?.promotion(resolved))
+}
+
+/// `site` as an inlined native call, if it may be one: a shimmed symbol only
+/// through its shim's [`promotion`], anything else at the address it resolved to.
+pub fn site_promotion(site: &crate::program::ImportSite) -> Option<Promotion> {
+    if classify(site.tag, &site.symbol) != Classification::Fast {
+        return None;
+    }
+    if crate::shims::is_shimmed(&site.symbol) {
+        return promotion(&site.symbol, site.resolved);
+    }
+    match table::lookup(site.tag, &site.symbol) {
+        Lookup::Known(abi) => Some(Promotion {
+            abi,
+            address: site.resolved,
+        }),
+        _ => None,
+    }
 }
 
 /// The signature of a promotable entry, for a caller that only wants to classify it.
@@ -488,7 +507,7 @@ pub fn promotion(name: &str, resolved: u64) -> Option<Promotion> {
 /// [`classify`] asks this so the audit reports how an import will really be reached;
 /// [`promotion`] is what actually decides, because only it knows the resolved address.
 pub fn promotable_abi(name: &str) -> Option<&'static FunctionAbi> {
-    crate::objc::fast::abi_of(name)
+    crate::objc::fast::abi_of(name).or_else(|| Some(crate::shims::function(name)?.abi))
 }
 
 /// The library a promoted import's callee comes from: the one that bound the site,

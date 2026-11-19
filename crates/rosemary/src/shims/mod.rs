@@ -1,6 +1,6 @@
 use microlift::arch::x86_64::context::RegisterContext;
 
-use crate::abi::{AbiError, GuestMemory, Result};
+use crate::abi::{AbiError, FunctionAbi, GuestMemory, Lookup, Result};
 
 /// Not gated, for the reason [`coregraphics`] is not: the tree's own AppKit
 /// takes these structs by value too.
@@ -62,6 +62,75 @@ pub type Shim = fn(&mut RegisterContext, &mut dyn GuestMemory) -> Result<()>;
 pub type CallbackShim =
     fn(&mut RegisterContext, &mut dyn GuestMemory, &dyn crate::abi::Callbacks) -> Result<()>;
 
+/// A shim that is a C function of its import's own signature.
+///
+/// Needs neither guest registers nor guest memory, so the lifter may inline a
+/// call to it instead of exiting. An exit marshals to the same function, so
+/// both paths run the same code.
+#[derive(Clone, Copy)]
+pub struct Function {
+    pub abi: &'static FunctionAbi,
+    pub address: u64,
+    /// The function this one calls through to. An import bound to anything
+    /// else is not one this shim may be inlined in front of.
+    pub target: fn() -> Result<u64>,
+}
+
+impl Function {
+    /// `address` as the shim for `name`, with the table's row for its signature.
+    ///
+    /// `None` for a row an inlined call could not honor, which would leave the
+    /// symbol unshimmed; the tests below catch that.
+    pub fn new(name: &str, address: u64, target: fn() -> Result<u64>) -> Option<Self> {
+        let Lookup::Known(abi) = crate::abi::table::lookup(0, name) else {
+            return None;
+        };
+        let inlinable =
+            !abi.variadic && abi.callbacks.is_empty() && !abi.reenters_guest && !abi.reads_caller;
+        inlinable.then_some(Function {
+            abi,
+            address,
+            target,
+        })
+    }
+
+    /// Run it at an exit.
+    fn call(self, ctx: &mut RegisterContext, mem: &mut dyn GuestMemory) -> Result<()> {
+        // Asked first so a host with no target refuses by name, as an
+        // inlined call never could have been made.
+        (self.target)()?;
+        crate::abi::marshal::call(self.abi.name, self.abi, self.address, ctx, mem)
+    }
+
+    /// The inlined call for an import bound to `resolved`.
+    pub fn promotion(self, resolved: u64) -> Option<crate::abi::Promotion> {
+        ((self.target)().ok() == Some(resolved)).then_some(crate::abi::Promotion {
+            abi: self.abi,
+            address: self.address,
+        })
+    }
+}
+
+/// The C-function shims, on either host.
+fn function_for(name: &str) -> Option<Function> {
+    opengl::function_for(name).or_else(|| macos_function_for(name))
+}
+
+#[cfg(target_os = "macos")]
+fn macos_function_for(name: &str) -> Option<Function> {
+    crate::gui::hook::function_for(name)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn macos_function_for(_name: &str) -> Option<Function> {
+    None
+}
+
+/// The C-function shim for `symbol`, if it has one.
+pub fn function(symbol: &str) -> Option<Function> {
+    function_for(symbol.strip_prefix('_').unwrap_or(symbol))
+}
+
 /// `f` as a [`Shim`] (or, with `callback`, a [`CallbackShim`]) bound to `name`.
 ///
 /// Implementations still take the name - for their diagnostics, for what they
@@ -99,7 +168,6 @@ fn platform_shim_for(name: &str) -> Option<Shim> {
     component::shim_for(name)
         .or_else(|| coregraphics::shim_for(name))
         .or_else(|| appkit::shim_for(name))
-        .or_else(|| opengl::shim_for(name))
         .or_else(|| coremedia::shim_for(name))
         .or_else(|| cfuuid::shim_for(name))
         .or_else(|| macos_shim_for(name))
@@ -109,7 +177,7 @@ fn platform_shim_for(name: &str) -> Option<Shim> {
 /// and no Mach.
 #[cfg(target_os = "macos")]
 fn macos_shim_for(name: &str) -> Option<Shim> {
-    machthread::shim_for(name).or_else(|| crate::gui::hook::shim_for(name))
+    machthread::shim_for(name)
 }
 
 #[cfg(not(target_os = "macos"))]
@@ -144,6 +212,7 @@ fn foundation_variadic(name: &str) -> Option<Shim> {
 pub enum Resolved {
     Plain(Shim),
     WithCallbacks(CallbackShim),
+    Function(Function),
     /// The Objective-C runtime's, resolved past the name so a message send does
     /// not search its tables again.
     Objc(crate::objc::dispatch::Entry),
@@ -160,6 +229,7 @@ impl Resolved {
         match self {
             Resolved::Plain(f) => f(ctx, mem),
             Resolved::WithCallbacks(f) => f(ctx, mem, callbacks),
+            Resolved::Function(f) => f.call(ctx, mem),
             Resolved::Objc(entry) => entry.call(ctx, mem),
         }
     }
@@ -231,6 +301,9 @@ pub fn resolve(symbol: &str) -> Option<Resolved> {
             if let Some(f) = platform_shim_for(name) {
                 return Some(Resolved::Plain(f));
             }
+            if let Some(f) = function_for(name) {
+                return Some(Resolved::Function(f));
+            }
             // And the families that need one thing more than the rest.
             return crate::signal::shim_for(name)
                 .or_else(|| pthread::shim_for(name))
@@ -268,6 +341,7 @@ pub fn is_shimmed(symbol: &str) -> bool {
         || foundation_variadic(name).is_some()
         || crate::objc::dispatch::resolve(name).is_some()
         || platform_shim_for(name).is_some()
+        || function_for(name).is_some()
         || callback_shim_for(name).is_some()
     {
         return true;
@@ -303,5 +377,24 @@ pub(crate) fn bad_pointer(symbol: &str, addr: u64) -> AbiError {
     AbiError::Memory {
         symbol: symbol.to_string(),
         addr,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::abi::Classification;
+
+    #[test]
+    fn a_function_shim_is_inlined_only_in_front_of_its_target() {
+        let f =
+            super::function("_CGLFlushDrawable").expect("CGLFlushDrawable has a C-function shim");
+        let target = (f.target)().expect("this host has a CGLFlushDrawable");
+        let promotion = crate::abi::promotion("_CGLFlushDrawable", target).unwrap();
+        assert_eq!(promotion.address, f.address);
+        assert!(crate::abi::promotion("_CGLFlushDrawable", target + 1).is_none());
+        assert_eq!(
+            crate::abi::classify(0, "_CGLFlushDrawable"),
+            Classification::Fast
+        );
     }
 }

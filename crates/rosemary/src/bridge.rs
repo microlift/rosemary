@@ -271,30 +271,13 @@ fn fast_import(site: &crate::program::ImportSite) -> Option<ImportKind> {
     if site.resolved == 0 || crate::trace::watching(&site.symbol) {
         return None;
     }
-    if crate::abi::classify(site.tag, &site.symbol) != crate::abi::Classification::Fast {
-        return None;
-    }
     // Guest-resolved is the exclusion that cannot be skipped, and it is not
     // hypothetical.
     let vm = crate::thunk::current()?;
     if vm.program.is_guest_address(site.resolved) {
         return None;
     }
-    // An Objective-C runtime entry point is inlined against a *substituting*
-    // address rather than the host's own; everything else against the host's.
-    let promotion = match crate::abi::promotion(&site.symbol, site.resolved) {
-        Some(promotion) => promotion,
-        None => {
-            let crate::abi::Lookup::Known(abi) = crate::abi::table::lookup(site.tag, &site.symbol)
-            else {
-                return None;
-            };
-            crate::abi::Promotion {
-                abi,
-                address: site.resolved,
-            }
-        }
-    };
+    let promotion = crate::abi::site_promotion(site)?;
     Some(ImportKind::Fast(crate::abi::fast_import(site, &promotion)))
 }
 

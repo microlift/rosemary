@@ -1,23 +1,23 @@
-use microlift::arch::x86_64::context::RegisterContext;
+use std::ffi::c_void;
 
-use crate::abi::{GuestMemory, Result};
-use crate::shims::bind;
+use crate::abi::Result;
 
-/// Count CGL presentation without passing compatibility handles to the native
-/// overlay. Register and memory handling stays in the runtime bridge.
-fn flush_drawable(
-    _symbol: &str,
-    ctx: &mut RegisterContext,
-    _mem: &mut dyn GuestMemory,
-) -> Result<()> {
+/// `CGLError CGLFlushDrawable(CGLContextObj ctx)`, counting the frame.
+///
+/// Compatibility handles are never passed to the native overlay.
+unsafe extern "C" fn flush_drawable(context: *mut c_void) -> i32 {
     crate::stats::record_frame();
-    // SAFETY: CGLFlushDrawable takes one opaque context and returns CGLError.
-    let error = unsafe { appkit::opengl::CGLFlushDrawable(ctx.rdi as *mut std::ffi::c_void) };
-    crate::shims::set_int_return(ctx, error);
-    Ok(())
+    // SAFETY: the caller's own context, passed through as `CGLFlushDrawable`
+    // takes it.
+    unsafe { appkit::opengl::CGLFlushDrawable(context) }
 }
 
-pub fn shim_for(name: &str) -> Option<super::Shim> {
+fn target() -> Result<u64> {
+    Ok(appkit::opengl::CGLFlushDrawable as *const () as u64)
+}
+
+pub fn function_for(name: &str) -> Option<super::Function> {
     (crate::frameworks::using_builtin() && name == "CGLFlushDrawable")
-        .then_some(bind!("CGLFlushDrawable" => flush_drawable))
+        .then(|| super::Function::new(name, flush_drawable as *const () as u64, target))
+        .flatten()
 }

@@ -4,7 +4,6 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use microlift::core::bridge::ImportKind;
 use static_init::dynamic;
 
-use crate::abi::{Classification, FunctionAbi, Lookup};
 use crate::program::{AddrMap, ImportSite};
 
 /// `ROSEMARY_TRAMPOLINES=0` turns the whole thing off.
@@ -29,8 +28,8 @@ struct Entry {
     /// lifetime - the same thing [`crate::dyld`] does with a `dlsym` result, and for
     /// the same reason.
     site: &'static ImportSite,
-    /// Its signature, resolved once when the entry was made.
-    abi: &'static FunctionAbi,
+    /// The call to inline, resolved once when the entry was made.
+    promotion: crate::abi::Promotion,
 }
 
 /// Everything that needs a lock: allocation, and the two directions of lookup.
@@ -159,12 +158,7 @@ pub fn for_site(site: &ImportSite) -> Option<u64> {
     if crate::trace::watching(&site.symbol) {
         return None;
     }
-    if crate::abi::classify(site.tag, &site.symbol) != Classification::Fast {
-        return None;
-    }
-    let Lookup::Known(abi) = crate::abi::table::lookup(site.tag, &site.symbol) else {
-        return None;
-    };
+    let promotion = crate::abi::site_promotion(site)?;
 
     let mut guard = STATE.write().unwrap_or_else(|e| e.into_inner());
     // Under the lock, so the reservation happens once however many threads
@@ -186,7 +180,7 @@ pub fn for_site(site: &ImportSite) -> Option<u64> {
     write_jmp(va);
     state.entries.push(Entry {
         site: Box::leak(Box::new(site.clone())),
-        abi,
+        promotion,
     });
     state.by_target.insert(site.resolved, va);
     MADE.fetch_add(1, Ordering::Relaxed);
@@ -273,13 +267,7 @@ pub fn lift_region(va: u64) -> Option<(crate::region::Region, Vec<u8>)> {
 pub fn import_kind(va: u64) -> Option<ImportKind> {
     let slot = import_slot(va)?;
     with_entry(slot, |entry| {
-        ImportKind::Fast(crate::abi::fast_import(
-            entry.site,
-            &crate::abi::Promotion {
-                abi: entry.abi,
-                address: entry.site.resolved,
-            },
-        ))
+        ImportKind::Fast(crate::abi::fast_import(entry.site, &entry.promotion))
     })
 }
 

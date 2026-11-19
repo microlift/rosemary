@@ -1,8 +1,5 @@
-use microlift::arch::x86_64::context::RegisterContext;
-
-use crate::abi::{GuestMemory, Result};
-use crate::shims::bind;
-use crate::shims::coregraphics::Shim;
+use crate::abi::Result;
+use crate::shims::Function;
 
 /// The selectors a present goes through, uniqued once.
 struct Selectors {
@@ -147,37 +144,42 @@ pub fn before_send(sel: u64, receiver: u64, argument: u64) {
     }
 }
 
-/// `CGLError CGLFlushDrawable(CGLContextObj ctx)`
-fn flush_drawable(
-    symbol: &str,
-    ctx: &mut RegisterContext,
-    _mem: &mut dyn GuestMemory,
-) -> Result<()> {
-    let context = ctx.rdi;
+/// `CGLError CGLFlushDrawable(CGLContextObj ctx)`, counting the frame and
+/// drawing the overlay over it.
+unsafe extern "C" fn flush_drawable(context: *mut std::ffi::c_void) -> i32 {
     // As in [`before_send`]: the frame is counted whether or not the overlay is
     // drawing on it.
     crate::stats::record_frame();
-    if !crate::frameworks::using_builtin() && super::armed() {
+    if super::armed() {
         super::guarded(|| super::gl::present(context as usize));
     }
-    let host = crate::shims::host::host_or_refuse(symbol)?;
-    // SAFETY: the symbol [`shim_for`] matched, whose declaration in
-    // `<OpenGL/OpenGL.h>` is `CGLError (*)(CGLContextObj)`. The selected
-    // framework provider supplies the matching implementation and handle.
-    let f: extern "C" fn(u64) -> i32 =
-        unsafe { core::mem::transmute::<u64, extern "C" fn(u64) -> i32>(host) };
-    crate::shims::set_int_return(ctx, f(context));
-    Ok(())
+    let Ok(host) = target() else {
+        // Unreachable: both an exit and an inlined call ask `target` first.
+        eprintln!("rosemary: fatal: CGLFlushDrawable was reached with no host function");
+        std::process::abort();
+    };
+    // SAFETY: the address the selected framework provider gives for
+    // `CGLFlushDrawable`, whose declaration in `<OpenGL/OpenGL.h>` is
+    // `CGLError (*)(CGLContextObj)`.
+    let host: unsafe extern "C" fn(*mut std::ffi::c_void) -> i32 =
+        unsafe { core::mem::transmute(host as *const ()) };
+    // SAFETY: the caller's own context, passed through.
+    unsafe { host(context) }
+}
+
+fn target() -> Result<u64> {
+    crate::shims::host::host_or_refuse("CGLFlushDrawable")
 }
 
 /// Whether `name` (underscore already stripped) is one of this module's.
-pub fn shim_for(name: &str) -> Option<Shim> {
+pub fn function_for(name: &str) -> Option<Function> {
     match name {
         // Installed even with the overlay off, because it is also where a frame
-        // is counted on the CGL path. The shim calls straight through to the
-        // selected framework's `CGLFlushDrawable`, so the only cost of taking it
-        // when nothing is drawing is one indirection per presented frame.
-        "CGLFlushDrawable" => Some(bind!("CGLFlushDrawable" => flush_drawable)),
+        // is counted on the CGL path. The builtin frameworks count theirs in
+        // [`crate::shims::opengl`] and have no native overlay to draw.
+        "CGLFlushDrawable" if !crate::frameworks::using_builtin() => {
+            Function::new(name, flush_drawable as *const () as u64, target)
+        }
         _ => None,
     }
 }

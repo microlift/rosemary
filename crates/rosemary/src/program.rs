@@ -15,7 +15,7 @@ use microlift::core::optimize::Optimizations;
 use microlift::core::specialize::Specialization;
 use microlift::core::{AddressMode, Atomic128Mode, LifterConfig, VmResumptionPoints};
 
-use crate::abi::{AbiError, Classification, Lookup};
+use crate::abi::{AbiError, Classification};
 
 /// Whether an import with a known signature is inlined by the lifter or left to
 /// a VM exit.
@@ -41,26 +41,7 @@ impl ImportPolicy {
         if crate::trace::watching(&site.symbol) {
             return None;
         }
-        // A shimmed symbol must never be promoted: the whole reason it has a
-        // shim is that calling the host function directly would be wrong.
-        if crate::shims::is_shimmed(&site.symbol) {
-            let promotion = crate::abi::promotion(&site.symbol, site.resolved)?;
-            // Classified as well as described, so a promoted entry passes the
-            // same marshallability test every other fast import passes rather
-            // than being taken on the table's word.
-            return (crate::abi::classify(site.tag, &site.symbol) == Classification::Fast)
-                .then_some(promotion);
-        }
-        if crate::abi::classify(site.tag, &site.symbol) != Classification::Fast {
-            return None;
-        }
-        match crate::abi::table::lookup(site.tag, &site.symbol) {
-            Lookup::Known(abi) => Some(crate::abi::Promotion {
-                abi,
-                address: site.resolved,
-            }),
-            _ => None,
-        }
+        crate::abi::site_promotion(site)
     }
 }
 
