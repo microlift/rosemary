@@ -398,6 +398,7 @@ mod record {
     #[cfg(test)]
     mod tests {
         use super::*;
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
         use std::ffi::CString;
 
         #[test]
