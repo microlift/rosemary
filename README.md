@@ -124,10 +124,14 @@ sudo pkg install curl sdl3 mesa-libs
 cargo build --release --bin rosemary
 ```
 
+Releases also carry a prebuilt FreeBSD binary; see
+[docs/installing.md](docs/installing.md#freebsd).
+
 FreeBSD support is newer than the Linux port, and might not be at parity.
 In particular, some code paths are not updated to use our `starnix` abstraction,
-and may result in inconsistencies. Bug reports are welcome, they are generally
-a sign of unportable code.
+and may result in inconsistencies, and web views (`WKWebView`) are not available
+yet, since the WebKit compositor is built on Linux's smithay. Bug reports are
+welcome, they are generally a sign of unportable code.
 
 Development from a macOS host can also use the configured Debian container:
 
