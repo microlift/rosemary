@@ -384,6 +384,70 @@ unsafe extern "C" fn cfmakeraw(term: *mut Termios) {
     term.c_cc[VTIME] = 0;
 }
 
+/// Opens a pty pair on the host, copying the follower's path into `name`
+/// when it is not null, as `openpty` does.
+///
+/// # Safety
+///
+/// `name` is null or has room for the path.
+#[cfg(not(target_os = "freebsd"))]
+unsafe fn host_openpty(name: *mut libc::c_char) -> Option<(c_int, c_int)> {
+    let (mut leader, mut follower) = (0, 0);
+    // SAFETY: two slots this frame owns; the caller's name buffer.
+    let made = unsafe {
+        libc::openpty(
+            &mut leader,
+            &mut follower,
+            name,
+            // glibc's binding takes `*const` for both; others take `*mut`.
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+        )
+    };
+    (made == 0).then_some((leader, follower))
+}
+
+/// FreeBSD keeps `openpty` in libutil, whose soname changed from 14 to 15, so
+/// a build calling it runs only on the release it was built on. The pair is
+/// opened with libc alone instead, the way libutil's `openpty` does it.
+///
+/// # Safety
+///
+/// `name` is null or has room for the path.
+#[cfg(target_os = "freebsd")]
+unsafe fn host_openpty(name: *mut libc::c_char) -> Option<(c_int, c_int)> {
+    let flags = libc::O_RDWR | libc::O_NOCTTY;
+    // SAFETY: plain calls on a descriptor this function opened.
+    let leader = unsafe { libc::posix_openpt(flags) };
+    if leader < 0 {
+        return None;
+    }
+    let mut path = [0 as libc::c_char; 64];
+    // SAFETY: the leader just opened, and a buffer of `path.len()` bytes.
+    let follower = unsafe {
+        if libc::grantpt(leader) == 0
+            && libc::unlockpt(leader) == 0
+            && libc::ptsname_r(leader, path.as_mut_ptr(), path.len()) == 0
+        {
+            libc::open(path.as_ptr(), flags)
+        } else {
+            -1
+        }
+    };
+    if follower < 0 {
+        let error = crate::errno::get();
+        // SAFETY: a descriptor this function opened and has not handed out.
+        unsafe { libc::close(leader) };
+        crate::errno::set(error);
+        return None;
+    }
+    if !name.is_null() {
+        // SAFETY: `path` is terminated and the caller has room for it.
+        unsafe { libc::strcpy(name, path.as_ptr()) };
+    }
+    Some((leader, follower))
+}
+
 /// `int openpty(int *, int *, char *, const struct termios *, const struct winsize *)`
 ///
 /// The host opens the pair; the terminal settings are Darwin's layout and go
@@ -401,22 +465,11 @@ unsafe extern "C" fn openpty(
     term: *const Termios,
     size: *const libc::winsize,
 ) -> c_int {
-    let (mut master, mut slave) = (0, 0);
     // The host would read `term` in its own layout, so none is passed on.
-    // SAFETY: two slots this frame owns; the caller's name buffer.
-    let made = unsafe {
-        libc::openpty(
-            &mut master,
-            &mut slave,
-            name,
-            // FreeBSD's binding takes `*mut` for both; Linux's takes `*const`.
-            std::ptr::null_mut(),
-            std::ptr::null_mut(),
-        )
+    // SAFETY: the caller's name buffer.
+    let Some((master, slave)) = (unsafe { host_openpty(name) }) else {
+        return -1;
     };
-    if made != 0 {
-        return made;
-    }
     // SAFETY: the caller's structures, and descriptors just opened.
     let configured = unsafe {
         (term.is_null() || tcsetattr(slave, 0, term) == 0)
@@ -484,19 +537,9 @@ mod tests {
         const ICANON: u64 = 0x100;
         const OPOST: u64 = 0x1;
         const TCSADRAIN_SOFT: c_int = 0x11;
-        let (mut leader, mut follower) = (0, 0);
-        // SAFETY: two slots for the descriptors, and no name, terminal
-        // settings or window size asked for.
-        let made = unsafe {
-            libc::openpty(
-                &mut leader,
-                &mut follower,
-                std::ptr::null_mut(),
-                std::ptr::null_mut(),
-                std::ptr::null_mut(),
-            )
-        };
-        assert_eq!(made, 0, "no pty to test with");
+        // SAFETY: no name asked for.
+        let (leader, follower) =
+            unsafe { host_openpty(std::ptr::null_mut()) }.expect("no pty to test with");
         // SAFETY: an all-zero Darwin `struct termios`, then the follower's.
         let mut term: Termios = unsafe { std::mem::zeroed() };
         unsafe {
@@ -541,6 +584,8 @@ mod tests {
                 ),
                 0
             );
+            let path = std::ffi::CStr::from_ptr(name.as_ptr());
+            assert!(path.to_bytes().starts_with(b"/dev/"), "{path:?}");
             assert_eq!(tcgetattr(follower, &mut raw), 0);
             libc::close(leader);
             libc::close(follower);
