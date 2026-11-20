@@ -257,6 +257,7 @@ pub trait VideoDecoder {
     fn is_drained(&mut self) -> Result<bool, Error>;
 }
 
+pub mod ffmpeg;
 #[cfg(feature = "gstreamer")]
 pub mod gstreamer;
 

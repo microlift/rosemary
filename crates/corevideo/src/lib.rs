@@ -407,6 +407,12 @@ exports::exports! {
         "CVPixelBufferPoolCreatePixelBuffer" => pixel_buffer::CVPixelBufferPoolCreatePixelBuffer,
         "CVPixelBufferPoolCreatePixelBufferWithAuxAttributes" => pixel_buffer::CVPixelBufferPoolCreatePixelBufferWithAuxAttributes,
         "CVPixelBufferPoolFlush" => pixel_buffer::CVPixelBufferPoolFlush,
+        "CVMetalTextureCacheCreate" => pixel_buffer::CVMetalTextureCacheCreate,
+        "CVMetalTextureCacheCreateTextureFromImage" => pixel_buffer::CVMetalTextureCacheCreateTextureFromImage,
+        "CVMetalTextureGetTexture" => pixel_buffer::CVMetalTextureGetTexture,
+        "CVMetalTextureCacheFlush" => pixel_buffer::CVMetalTextureCacheFlush,
+        "CVMetalTextureCacheGetTypeID" => pixel_buffer::CVMetalTextureCacheGetTypeID,
+        "CVMetalTextureGetTypeID" => pixel_buffer::CVMetalTextureGetTypeID,
     }
 }
 
