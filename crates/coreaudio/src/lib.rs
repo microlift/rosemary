@@ -5,6 +5,7 @@ use std::collections::BTreeSet;
 use std::ffi::c_void;
 use std::sync::{Arc, Mutex};
 
+mod aac;
 mod capture;
 mod converter;
 mod foreign;
