@@ -160,6 +160,8 @@ mod style {
 /// A Wayland compositor does not - a menu has to be a popup surface, positioned
 /// against its parent - so the level is what this tree classifies by.
 mod window_level {
+    /// `NSNormalWindowLevel`: an ordinary document window.
+    pub const NORMAL: isize = 0;
     /// `NSFloatingWindowLevel`: a tool palette, above its document.
     pub const FLOATING: isize = 3;
     /// `NSPopUpMenuWindowLevel`: a menu, a combo box's list, a popover.
@@ -222,6 +224,11 @@ fn presentation(window: &Window) -> Presentation {
     match window.level {
         level if level >= window_level::SCREEN_SAVER => Presentation::Tooltip,
         level if level >= window_level::POPUP_MENU => Presentation::Menu,
+        // A transient floating window, such as a drag indicator, is placed by
+        // the program; the host tiles and focuses a toplevel as it likes.
+        level if level > window_level::NORMAL && window.hides_on_deactivate != 0 => {
+            Presentation::Menu
+        }
         _ => Presentation::Toplevel,
     }
 }
@@ -4209,6 +4216,16 @@ mod tests {
         body.style_mask = 0;
         body.level = 0;
         assert_eq!(presentation(body), Presentation::Toplevel);
+
+        // Borderless above the ordinary level is a popup when it hides on
+        // deactivation, and a toplevel otherwise.
+        body.level = window_level::FLOATING;
+        assert_eq!(presentation(body), Presentation::Toplevel);
+        body.hides_on_deactivate = 1;
+        assert_eq!(presentation(body), Presentation::Menu);
+        body.level = window_level::NORMAL;
+        assert_eq!(presentation(body), Presentation::Toplevel);
+        body.hides_on_deactivate = 0;
 
         // Borderless at menu level and above are the two popups.
         body.level = window_level::POPUP_MENU;
