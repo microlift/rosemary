@@ -1572,13 +1572,19 @@ mod tests {
             0
         }
 
-        pub fn hooks(found: &mut Glob) {
+        /// Held for as long as a test's hooks are in use, as the counters
+        /// above are shared and another test's `hooks` would reset them.
+        static IN_USE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+        pub fn hooks(found: &mut Glob) -> std::sync::MutexGuard<'static, ()> {
+            let held = IN_USE.lock().unwrap_or_else(|e| e.into_inner());
             found.gl_opendir = Some(opendir);
             found.gl_readdir = Some(readdir);
             found.gl_closedir = Some(closedir);
             found.gl_lstat = Some(stat);
             found.gl_stat = Some(stat);
             OPENED.store(0, std::sync::atomic::Ordering::Relaxed);
+            held
         }
 
         pub fn opens() -> usize {
@@ -1589,7 +1595,7 @@ mod tests {
     #[test]
     fn altdirfunc_reads_the_callers_directory() {
         let mut found = zeroed();
-        alt::hooks(&mut found);
+        let _hooks = alt::hooks(&mut found);
         // SAFETY: a static pattern, a live structure and five live hooks.
         unsafe {
             assert_eq!(
@@ -1612,7 +1618,7 @@ mod tests {
     #[test]
     fn altdirfunc_without_every_hook_is_refused() {
         let mut found = zeroed();
-        alt::hooks(&mut found);
+        let _hooks = alt::hooks(&mut found);
         found.gl_stat = None;
         // SAFETY: as above, with one hook missing.
         let status = unsafe {

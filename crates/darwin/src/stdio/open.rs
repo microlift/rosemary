@@ -171,7 +171,14 @@ pub unsafe extern "C" fn freopen(
             was_open = open;
         }
         let error = crate::errno::get();
-        if was_open && let Some(close) = (*fp).close {
+        // The `dup2` below closes the old descriptor as it replaces it. Closing
+        // it first would free its number for another thread's `open`, whose
+        // descriptor the `dup2` would then close instead.
+        let replaced = was_open && wanted >= 0 && fd >= 0 && wanted != fd;
+        if was_open
+            && !replaced
+            && let Some(close) = (*fp).close
+        {
             close((*fp).cookie);
         }
         engine::reset_buffers(fp);
@@ -182,9 +189,13 @@ pub unsafe extern "C" fn freopen(
             return std::ptr::null_mut();
         }
         let mut fd = fd;
-        if wanted >= 0 && wanted != fd && crate::net::descriptor::dup2(fd, wanted) >= 0 {
-            crate::net::descriptor::close(fd);
-            fd = wanted;
+        if wanted >= 0 && wanted != fd {
+            if crate::net::descriptor::dup2(fd, wanted) >= 0 {
+                crate::net::descriptor::close(fd);
+                fd = wanted;
+            } else if replaced && let Some(close) = (*fp).close {
+                close((*fp).cookie);
+            }
         }
         if !fits(fd) {
             crate::net::descriptor::close(fd);

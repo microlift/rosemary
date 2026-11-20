@@ -572,6 +572,9 @@ mod tests {
 
     #[test]
     fn a_test_process_is_not_setuid() {
+        let _ids = crate::credentials::IDS
+            .read()
+            .unwrap_or_else(|e| e.into_inner());
         assert_eq!(crate::credentials::issetugid(), 0);
     }
 
