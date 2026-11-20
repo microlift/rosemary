@@ -164,6 +164,28 @@ pub fn set_general_text_and_html(text: Option<Vec<u8>>, html: Option<Vec<u8>>) -
 /// text. See [`crate::pasteboard_manager`].
 pub(crate) const CLIPBOARD: &[u8] = GENERAL.as_bytes();
 
+/// `NSPasteboardNameDrag`, the board a dragging session carries.
+const DRAG: &str = "Apple CFPasteboard drag";
+
+/// The drag pasteboard, which is the same object every time it is asked for.
+pub(crate) fn drag_board() -> Id {
+    named(DRAG.as_bytes())
+}
+
+/// The types a pasteboard object holds, for matching a drag against the types
+/// a destination registered.
+pub(crate) fn types_of(receiver: Id) -> Vec<Vec<u8>> {
+    let mut all = boards().lock().unwrap_or_else(|e| e.into_inner());
+    if is_general(&all, receiver)
+        && let Some(board) = board_mut(&mut all, receiver)
+    {
+        sync_system_text(board);
+    }
+    board_mut(&mut all, receiver)
+        .map(|board| board.entries.iter().map(|entry| entry.ty.clone()).collect())
+        .unwrap_or_default()
+}
+
 /// The flavour types a named board currently holds.
 ///
 /// The general board is synchronised with the desktop's clipboard first, for the
@@ -273,7 +295,7 @@ fn entry_mut<'a>(board: &'a mut Board, ty: &[u8]) -> &'a mut Entry {
     board.entries.last_mut().expect("entry just pushed")
 }
 
-fn strings(values: impl IntoIterator<Item = Vec<u8>>) -> Id {
+pub(crate) fn strings(values: impl IntoIterator<Item = Vec<u8>>) -> Id {
     let values: Vec<CFTypeRef> = values
         .into_iter()
         .map(|value| corefoundation::string::from_bytes(&value, false))

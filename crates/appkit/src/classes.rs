@@ -145,6 +145,18 @@ static HIERARCHY: &[(&str, Option<&str>, usize)] = &[
         None,
         crate::pasteboard::ITEM_INSTANCE_SIZE,
     ),
+    (
+        "NSDraggingSession",
+        None,
+        crate::dragging::SESSION_INSTANCE_SIZE,
+    ),
+    // AppKit's private `NSDraggingInfo`, the sender a destination is handed.
+    (
+        "NSDraggingDestinationInfo",
+        None,
+        crate::dragging::SESSION_INSTANCE_SIZE,
+    ),
+    ("NSDraggingItem", None, crate::dragging::ITEM_INSTANCE_SIZE),
     ("NSWorkspace", None, 0),
     ("NSRunningApplication", None, 0),
     ("NSAlert", None, crate::alert::INSTANCE_SIZE),

@@ -42,6 +42,7 @@ mod define;
 pub mod dialog;
 mod displaylink;
 pub mod dock;
+pub mod dragging;
 pub mod event;
 mod font;
 pub mod hitheme;
@@ -161,6 +162,8 @@ pub fn bootstrap() {
         darwin::idle::on_idle(opengl::going_idle);
         responder::install();
         pasteboard::install();
+        // After the views and windows: it replaces their registration stubs.
+        dragging::install();
         nsevent::install();
         monitor::install();
         status::install();
