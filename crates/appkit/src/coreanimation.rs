@@ -2612,22 +2612,20 @@ fn composite_identity_bgra(store: &mut Store, source: &Source<'_>, area: Rect, x
         let source_row = &source.bytes[from..from + length];
         let to = (row as usize * store.width as usize + area.x as usize) * 4;
         let target_row = &mut store.pixels[to..to + length];
-        if source_row
-            .as_chunks::<4>()
-            .0
-            .iter()
-            .all(|pixel| pixel[3] == 255)
-        {
+        let pixels = source_row.as_chunks::<4>().0;
+        if pixels.iter().all(|pixel| pixel[3] == 255) {
             target_row.copy_from_slice(source_row);
+        } else if pixels.iter().all(|pixel| *pixel == [0; 4]) {
+            // Clear premultiplied pixels leave the target as it is. Toolkit
+            // layers are mostly this, and blending them byte by byte is what
+            // made compositing a large window slow.
+            continue;
         } else {
-            for (target, src) in target_row
-                .as_chunks_mut::<4>()
-                .0
-                .iter_mut()
-                .zip(source_row.as_chunks::<4>().0)
-            {
+            for (target, src) in target_row.as_chunks_mut::<4>().0.iter_mut().zip(pixels) {
                 if src[3] == 255 {
                     *target = *src;
+                } else if *src == [0; 4] {
+                    continue;
                 } else {
                     let keep = 255 - u32::from(src[3]);
                     for channel in 0..4 {
