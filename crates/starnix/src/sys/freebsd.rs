@@ -30,7 +30,7 @@ pub mod memory {
     }
 }
 
-use std::ffi::{CStr, c_char};
+use std::ffi::{CStr, c_char, c_void};
 use std::io;
 use std::os::fd::RawFd;
 use std::os::unix::fs::MetadataExt;
@@ -418,37 +418,133 @@ pub fn errno_location() -> *mut libc::c_int {
     unsafe { libc::__error() }
 }
 
-// FIXME (PORTABILITY): FreeBSD keeps these with `extattr_*`, not wired up yet.
+/// The only namespace [`xattr_name`] lets through.
+const NAMESPACE: libc::c_int = libc::EXTATTR_NAMESPACE_USER;
 
-pub fn xattr_get_fd(_: RawFd, _: &std::ffi::CStr, _: &mut [u8]) -> io::Result<usize> {
-    Err(io::ErrorKind::Unsupported.into())
+/// The file an attribute is on: an open descriptor, or a path and whether a
+/// final symlink is followed.
+#[derive(Clone, Copy)]
+enum XattrFile<'a> {
+    Fd(RawFd),
+    Path(&'a CStr, bool),
 }
 
-pub fn xattr_get_path(
-    _: &std::ffi::CStr,
-    _: &std::ffi::CStr,
-    _: &mut [u8],
-    _: bool,
-) -> io::Result<usize> {
-    Err(io::ErrorKind::Unsupported.into())
+/// Every attribute this crate is asked for is spelled as Linux does, and only
+/// the `user.` namespace is one a caller may touch without privilege. FreeBSD
+/// carries the namespace beside the name rather than inside it.
+fn xattr_name(name: &CStr) -> io::Result<&CStr> {
+    match name.to_bytes_with_nul().strip_prefix(b"user.") {
+        Some(rest) if rest.len() > 1 => {
+            Ok(CStr::from_bytes_with_nul(rest).map_err(|_| io::ErrorKind::InvalidInput)?)
+        }
+        _ => Err(io::Error::from_raw_os_error(libc::EOPNOTSUPP)),
+    }
 }
 
-pub fn xattr_set_fd(_: RawFd, _: &std::ffi::CStr, _: &[u8]) -> io::Result<()> {
-    Err(io::ErrorKind::Unsupported.into())
+/// `extattr_get_*` on `file`: up to `n` bytes into `p`, or the length for a
+/// null `p`.
+///
+/// # Safety
+///
+/// `p` is null or `n` writable bytes.
+unsafe fn xattr_read(file: XattrFile<'_>, name: &CStr, p: *mut c_void, n: usize) -> isize {
+    // SAFETY: NUL-terminated strings, and the caller's buffer.
+    unsafe {
+        match file {
+            XattrFile::Fd(fd) => libc::extattr_get_fd(fd, NAMESPACE, name.as_ptr(), p, n),
+            XattrFile::Path(path, true) => {
+                libc::extattr_get_file(path.as_ptr(), NAMESPACE, name.as_ptr(), p, n)
+            }
+            XattrFile::Path(path, false) => {
+                libc::extattr_get_link(path.as_ptr(), NAMESPACE, name.as_ptr(), p, n)
+            }
+        }
+    }
 }
 
-pub fn xattr_set_path(_: &std::ffi::CStr, _: &std::ffi::CStr, _: &[u8], _: bool) -> io::Result<()> {
-    Err(io::ErrorKind::Unsupported.into())
+fn xattr_result(rc: isize) -> io::Result<usize> {
+    usize::try_from(rc).map_err(|_| io::Error::last_os_error())
 }
 
-pub fn xattr_remove_fd(_: RawFd, _: &std::ffi::CStr) -> io::Result<()> {
-    Err(io::ErrorKind::Unsupported.into())
+fn xattr_get(file: XattrFile<'_>, name: &CStr, buf: &mut [u8]) -> io::Result<usize> {
+    let name = xattr_name(name)?;
+    // FreeBSD truncates into a short buffer where Linux refuses with `ERANGE`,
+    // and a truncated value reported as a whole one is the answer a caller
+    // cannot tell is wrong: ask for the length first.
+    // SAFETY: a null buffer asks for the length.
+    let length = xattr_result(unsafe { xattr_read(file, name, std::ptr::null_mut(), 0) })?;
+    if buf.is_empty() {
+        return Ok(length);
+    }
+    if length > buf.len() {
+        return Err(io::Error::from_raw_os_error(libc::ERANGE));
+    }
+    // SAFETY: a buffer of its own length.
+    xattr_result(unsafe { xattr_read(file, name, buf.as_mut_ptr().cast(), buf.len()) })
 }
 
-pub fn xattr_remove_path(_: &std::ffi::CStr, _: &std::ffi::CStr, _: bool) -> io::Result<()> {
-    Err(io::ErrorKind::Unsupported.into())
+fn xattr_set(file: XattrFile<'_>, name: &CStr, value: &[u8]) -> io::Result<()> {
+    let name = xattr_name(name)?;
+    let (p, n) = (value.as_ptr().cast(), value.len());
+    // SAFETY: NUL-terminated strings and the value's own bytes.
+    let rc = unsafe {
+        match file {
+            XattrFile::Fd(fd) => libc::extattr_set_fd(fd, NAMESPACE, name.as_ptr(), p, n),
+            XattrFile::Path(path, true) => {
+                libc::extattr_set_file(path.as_ptr(), NAMESPACE, name.as_ptr(), p, n)
+            }
+            XattrFile::Path(path, false) => {
+                libc::extattr_set_link(path.as_ptr(), NAMESPACE, name.as_ptr(), p, n)
+            }
+        }
+    };
+    xattr_result(rc).map(drop)
 }
 
-pub fn xattr_is_missing(_: &io::Error) -> bool {
-    false
+fn xattr_remove(file: XattrFile<'_>, name: &CStr) -> io::Result<()> {
+    let name = xattr_name(name)?;
+    // SAFETY: NUL-terminated strings.
+    let rc = unsafe {
+        match file {
+            XattrFile::Fd(fd) => libc::extattr_delete_fd(fd, NAMESPACE, name.as_ptr()),
+            XattrFile::Path(path, true) => {
+                libc::extattr_delete_file(path.as_ptr(), NAMESPACE, name.as_ptr())
+            }
+            XattrFile::Path(path, false) => {
+                libc::extattr_delete_link(path.as_ptr(), NAMESPACE, name.as_ptr())
+            }
+        }
+    };
+    match rc {
+        0 => Ok(()),
+        _ => Err(io::Error::last_os_error()),
+    }
+}
+
+pub fn xattr_get_fd(fd: RawFd, name: &CStr, buf: &mut [u8]) -> io::Result<usize> {
+    xattr_get(XattrFile::Fd(fd), name, buf)
+}
+
+pub fn xattr_get_path(path: &CStr, name: &CStr, buf: &mut [u8], follow: bool) -> io::Result<usize> {
+    xattr_get(XattrFile::Path(path, follow), name, buf)
+}
+
+pub fn xattr_set_fd(fd: RawFd, name: &CStr, value: &[u8]) -> io::Result<()> {
+    xattr_set(XattrFile::Fd(fd), name, value)
+}
+
+pub fn xattr_set_path(path: &CStr, name: &CStr, value: &[u8], follow: bool) -> io::Result<()> {
+    xattr_set(XattrFile::Path(path, follow), name, value)
+}
+
+pub fn xattr_remove_fd(fd: RawFd, name: &CStr) -> io::Result<()> {
+    xattr_remove(XattrFile::Fd(fd), name)
+}
+
+pub fn xattr_remove_path(path: &CStr, name: &CStr, follow: bool) -> io::Result<()> {
+    xattr_remove(XattrFile::Path(path, follow), name)
+}
+
+pub fn xattr_is_missing(error: &io::Error) -> bool {
+    error.raw_os_error() == Some(libc::ENOATTR)
 }

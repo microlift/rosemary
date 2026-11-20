@@ -408,7 +408,7 @@ mod record {
             assert_eq!(parse(b"a:b"), None);
         }
 
-        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        #[cfg(any(target_os = "linux", target_os = "macos", target_os = "freebsd"))]
         #[test]
         fn a_record_round_trips_on_a_file() {
             let dir = std::env::temp_dir().join(format!("ownership-{}", std::process::id()));

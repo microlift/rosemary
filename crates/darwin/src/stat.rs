@@ -934,8 +934,28 @@ pub(crate) mod beneath {
     /// `path` is a NUL-terminated host path.
     #[cfg(any(target_os = "macos", target_os = "freebsd"))]
     pub unsafe fn unlinkat(dirfd: c_int, path: *const c_char, flags: c_int) -> c_int {
+        // FreeBSD refuses a last `..` before it checks where it leads, with
+        // `EPERM` or `EINVAL`. Removing one always fails, so asking the way
+        // there first only decides which error an escape is told.
+        #[cfg(target_os = "freebsd")]
+        if ends_in_dot_dot(unsafe { CStr::from_ptr(path) }.to_bytes()) {
+            let mut host: libc::stat = unsafe { std::mem::zeroed() };
+            let flags = HOST_AT_RESOLVE_BENEATH | libc::AT_SYMLINK_NOFOLLOW;
+            // SAFETY: the caller's path and a live `stat`.
+            if unsafe { libc::fstatat(dirfd, path, &mut host, flags) } < 0 {
+                return -1;
+            }
+        }
         // SAFETY: the caller's path.
         unsafe { libc::unlinkat(dirfd, path, flags | HOST_AT_RESOLVE_BENEATH) }
+    }
+
+    /// Whether the last component of `path` is `..`, trailing slashes aside.
+    #[cfg(target_os = "freebsd")]
+    fn ends_in_dot_dot(path: &[u8]) -> bool {
+        let end = path.iter().rposition(|b| *b != b'/').map_or(0, |at| at + 1);
+        let path = &path[..end];
+        path == b".." || path.ends_with(b"/..")
     }
 
     /// `openat2` beneath `dirfd` with host `flags`.

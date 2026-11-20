@@ -296,6 +296,13 @@ unsafe extern "C" {
     fn __sigsetjmp(env: *mut c_void, savemask: c_int) -> c_int;
 }
 
+#[cfg(all(target_os = "freebsd", target_arch = "x86_64"))]
+unsafe extern "C" {
+    /// FreeBSD's `sigsetjmp`, a function under its own name.
+    #[link_name = "sigsetjmp"]
+    fn __sigsetjmp(env: *mut c_void, savemask: c_int) -> c_int;
+}
+
 /// `int sigsetjmp(sigjmp_buf, int savemask)`, as a tail jump to the host's.
 ///
 /// A jump rather than a call: `sigsetjmp` records its caller's frame, and a
@@ -305,10 +312,15 @@ unsafe extern "C" {
 /// The buffers are compatible in size, which is the whole question: glibc
 /// writes 80 bytes on x86-64 (registers, the saved-mask flag, and the 8-byte
 /// kernel mask) into Darwin's 152, and 192 on arm64 into Darwin's 196.
+/// FreeBSD's `sigjmp_buf` is 96 bytes on x86-64; arm64's is 512, more than
+/// Darwin's 196, so it is left out.
 ///
 /// FIXME (ACCURACY): I hate this. This will definitely cause unpredictable issues
 /// on another OS or architecture. Please fix this. Please.
-#[cfg(target_os = "linux")]
+#[cfg(any(
+    target_os = "linux",
+    all(target_os = "freebsd", target_arch = "x86_64")
+))]
 #[unsafe(naked)]
 pub unsafe extern "C" fn sigsetjmp(_env: *mut c_void, _savemask: c_int) -> c_int {
     #[cfg(target_arch = "x86_64")]
@@ -394,7 +406,7 @@ pub extern "C" fn keymgr_dwarf2_register_sections() {}
 exports::exports! {
     functions {
         "abort_report_np" => abort_report_np,
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", all(target_os = "freebsd", target_arch = "x86_64")))]
         "sigsetjmp" => sigsetjmp,
         "csops" => csops,
         "__mac_syscall" => mac_syscall,
@@ -428,7 +440,10 @@ mod tests {
     /// The host's `sigsetjmp` must fit in a buffer the size of Darwin's. Only
     /// the first return is exercised: Rust has no `returns_twice`, so a test
     /// that `siglongjmp`s back into its own frame would be undefined.
-    #[cfg(target_os = "linux")]
+    #[cfg(any(
+        target_os = "linux",
+        all(target_os = "freebsd", target_arch = "x86_64")
+    ))]
     #[test]
     fn sigsetjmp_fits_a_darwin_sized_buffer() {
         #[cfg(target_arch = "x86_64")]
