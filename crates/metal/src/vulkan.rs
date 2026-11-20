@@ -498,8 +498,11 @@ fn query_target(
         let mut properties = vk::PhysicalDeviceProperties2::default().push_next(&mut driver);
         // SAFETY: driver properties are core in Vulkan 1.2; the chain lives here.
         unsafe { instance.get_physical_device_properties2(physical, &mut properties) };
-        target.fmix_is_metal_mix = driver.driver_id == vk::DriverId::MOLTENVK
-            && std::env::var_os("ROSEMARY_METAL_ALWAYS_EMULATE_FMIX").is_none();
+        target.fmix_is_metal_mix = {
+            std::env::var("ROSEMARY_METAL_MAP_MIX_TO_FMIX").as_deref() == Ok("1")
+                || driver.driver_id == vk::DriverId::MOLTENVK
+                    && std::env::var("ROSEMARY_METAL_ALWAYS_EMULATE_FMIX").as_deref() != Ok("1")
+        };
         target.shader_output_viewport_index = v12.shader_output_viewport_index == vk::TRUE;
     } else {
         let mut storage16 = vk::PhysicalDevice16BitStorageFeatures::default();
