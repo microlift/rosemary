@@ -1236,26 +1236,134 @@ unsafe extern "C" fn is_deletable(_receiver: Id, _sel: Sel, path: Id) -> u8 {
 
 /// Every descendant of `root`, depth first, as paths relative to it.
 fn subpaths(root: &std::path::Path) -> Option<Vec<String>> {
-    fn walk(dir: &std::path::Path, prefix: &str, out: &mut Vec<String>) {
-        for name in directory_names(dir).unwrap_or_default() {
+    Some(DirectoryWalk::new(root)?.collect())
+}
+
+/// The descendants of a directory, depth first, as paths relative to it: what
+/// an `NSDirectoryEnumerator` hands out.
+struct DirectoryWalk {
+    /// The directories being listed, innermost last, each with its path
+    /// relative to the root and the names it has yet to hand out.
+    stack: Vec<(std::path::PathBuf, String, std::vec::IntoIter<String>)>,
+    /// The directory last handed out, entered when the next name is asked for
+    /// unless `-skipDescendents` comes first.
+    pending: Option<(std::path::PathBuf, String)>,
+    /// How deep the name last handed out is; one for the root's own entries.
+    level: usize,
+}
+
+impl DirectoryWalk {
+    /// `None` when `root` cannot be listed.
+    fn new(root: &std::path::Path) -> Option<Self> {
+        let names = directory_names(root)?;
+        Some(Self {
+            stack: vec![(root.to_path_buf(), String::new(), names.into_iter())],
+            pending: None,
+            level: 0,
+        })
+    }
+
+    /// Nothing to hand out, for a path that is not a directory.
+    fn empty() -> Self {
+        Self {
+            stack: Vec::new(),
+            pending: None,
+            level: 0,
+        }
+    }
+
+    fn skip_descendants(&mut self) {
+        self.pending = None;
+    }
+}
+
+impl Iterator for DirectoryWalk {
+    type Item = String;
+
+    fn next(&mut self) -> Option<String> {
+        if let Some((dir, relative)) = self.pending.take()
+            && let Some(names) = directory_names(&dir)
+        {
+            self.stack.push((dir, relative, names.into_iter()));
+        }
+        loop {
+            let (dir, prefix, names) = self.stack.last_mut()?;
+            let Some(name) = names.next() else {
+                self.stack.pop();
+                continue;
+            };
             let relative = match prefix.is_empty() {
                 true => name.clone(),
                 false => format!("{prefix}/{name}"),
             };
-            out.push(relative.clone());
             let child = dir.join(&name);
             // A symlink to a directory is listed but not entered, which is how
             // Apple avoids cycles.
-            let is_real_dir = std::fs::symlink_metadata(&child).is_ok_and(|m| m.is_dir());
-            if is_real_dir {
-                walk(&child, &relative, out);
+            if std::fs::symlink_metadata(&child).is_ok_and(|m| m.is_dir()) {
+                self.pending = Some((child, relative.clone()));
             }
+            self.level = self.stack.len();
+            return Some(relative);
         }
     }
-    directory_names(root)?;
-    let mut out = Vec::new();
-    walk(root, "", &mut out);
-    Some(out)
+}
+
+fn directory_enumerator_class() -> &'static objc::class::Class {
+    crate::boxed::register::<DirectoryWalk>(
+        c"NSDirectoryEnumerator",
+        objc::class::lookup(c"NSEnumerator"),
+    )
+}
+
+/// # Safety
+///
+/// `object` must be null or an object this runtime allocated.
+unsafe fn directory_walk<'a>(object: Id) -> Option<&'a mut DirectoryWalk> {
+    unsafe { crate::boxed::contents(object, directory_enumerator_class()) }
+}
+
+/// `-enumeratorAtPath:`. A path that is not a directory enumerates nothing,
+/// as Apple documents for a file.
+unsafe extern "C" fn enumerator_at_path(_receiver: Id, _sel: Sel, path: Id) -> Id {
+    // SAFETY: an `NSString`, or nil.
+    let walk = (unsafe { path_of(path) })
+        .and_then(|p| DirectoryWalk::new(&p))
+        .unwrap_or_else(DirectoryWalk::empty);
+    objc::arc::autorelease(crate::boxed::make(directory_enumerator_class(), walk))
+}
+
+/// `-nextObject`: the next path relative to the enumerated directory.
+unsafe extern "C" fn directory_next_object(receiver: Id, _sel: Sel) -> Id {
+    // SAFETY: a directory enumerator.
+    match unsafe { directory_walk(receiver) }.and_then(Iterator::next) {
+        Some(relative) => objc::arc::autorelease(crate::string::from_str(&relative)),
+        None => std::ptr::null_mut(),
+    }
+}
+
+/// `-allObjects`: what the enumerator has not yet handed out.
+unsafe extern "C" fn directory_all_objects(receiver: Id, _sel: Sel) -> Id {
+    // SAFETY: a directory enumerator.
+    let rest: Vec<String> = match unsafe { directory_walk(receiver) } {
+        Some(walk) => walk.collect(),
+        None => Vec::new(),
+    };
+    string_array(&rest)
+}
+
+/// `-skipDescendents`, and its later spelling `-skipDescendants`: do not
+/// enter the directory last handed out.
+unsafe extern "C" fn directory_skip_descendants(receiver: Id, _sel: Sel) {
+    // SAFETY: a directory enumerator.
+    if let Some(walk) = unsafe { directory_walk(receiver) } {
+        walk.skip_descendants();
+    }
+}
+
+/// `-level`.
+unsafe extern "C" fn directory_level(receiver: Id, _sel: Sel) -> usize {
+    // SAFETY: a directory enumerator.
+    unsafe { directory_walk(receiver) }.map_or(0, |walk| walk.level)
 }
 
 fn string_array(strings: &[String]) -> Id {
@@ -1405,6 +1513,7 @@ pub(crate) fn install() {
         "isDeletableFileAtPath:" => is_deletable, c"B24@0:8@16";
         "subpathsOfDirectoryAtPath:error:" => subpaths_of_directory, c"@32@0:8@16^@24";
         "subpathsAtPath:" => subpaths_at_path, c"@24@0:8@16";
+        "enumeratorAtPath:" => enumerator_at_path, c"@24@0:8@16";
         "displayNameAtPath:" => display_name, c"@24@0:8@16";
         "destinationOfSymbolicLinkAtPath:error:"
             => destination_of_symlink, c"@32@0:8@16^@24";
@@ -1437,6 +1546,13 @@ pub(crate) fn install() {
             => get_relationship, c"B48@0:8^q16@24@32^@40";
         "URLForUbiquityContainerIdentifier:" => no_ubiquity_container, c"@24@0:8@16";
         "ubiquityIdentityToken" => no_ubiquity, c"@16@0:8";
+    });
+    methods!(directory_enumerator_class(), {
+        "nextObject" => directory_next_object, c"@16@0:8";
+        "allObjects" => directory_all_objects, c"@16@0:8";
+        "skipDescendents" => directory_skip_descendants, c"v16@0:8";
+        "skipDescendants" => directory_skip_descendants, c"v16@0:8";
+        "level" => directory_level, c"Q16@0:8";
     });
 
     // Foundation's `NSFileAttributes` category: how a program reads the result
@@ -1670,6 +1786,45 @@ mod tests {
 
             let name = display_name(manager, sel("displayNameAtPath:"), s("a.txt"));
             assert_eq!(crate::string::bytes(name), b"a.txt");
+        }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A directory enumerator walks depth first, does not enter a directory
+    /// it was told to skip, and enumerates nothing for a file.
+    #[test]
+    fn a_directory_enumerator_skips_the_descendants_it_is_told_to() {
+        let manager = manager();
+        let root = std::env::temp_dir().join(format!("rosemary-enum-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("kept/inner")).unwrap();
+        std::fs::create_dir_all(root.join("skipped/inner")).unwrap();
+        std::fs::write(root.join("file"), b"").unwrap();
+        let s = |name: &str| crate::string::from_str(&root.join(name).to_string_lossy());
+        let sel = objc::sel::get;
+
+        // SAFETY: each prototype is the one its selector declares.
+        unsafe {
+            let enumerator = enumerator_at_path(manager, sel("enumeratorAtPath:"), s(""));
+            let mut seen = Vec::new();
+            loop {
+                let next = directory_next_object(enumerator, sel("nextObject"));
+                if next.is_null() {
+                    break;
+                }
+                let name = String::from_utf8(crate::string::bytes(next)).unwrap();
+                if name == "skipped" {
+                    directory_skip_descendants(enumerator, sel("skipDescendents"));
+                }
+                let level = directory_level(enumerator, sel("level"));
+                assert_eq!(level, name.split('/').count(), "{name}");
+                seen.push(name);
+            }
+            seen.sort();
+            assert_eq!(seen, ["file", "kept", "kept/inner", "skipped"]);
+
+            let file = enumerator_at_path(manager, sel("enumeratorAtPath:"), s("file"));
+            assert!(directory_next_object(file, sel("nextObject")).is_null());
         }
         let _ = std::fs::remove_dir_all(&root);
     }
