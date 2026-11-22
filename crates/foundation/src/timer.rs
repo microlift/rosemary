@@ -31,6 +31,9 @@ pub struct Timer {
     interval: f64,
     repeats: usize,
     passes_timer: usize,
+    /// A copied `void (^)(NSTimer *)`, which fires in place of the selector;
+    /// held for the timer's life, as its target is.
+    block: Id,
 }
 
 pub const DATE_INSTANCE_SIZE: usize = size_of::<Date>();
@@ -192,7 +195,7 @@ static SCHEDULED: std::sync::Mutex<Vec<usize>> = std::sync::Mutex::new(Vec::new(
 /// One turn of a timer: send the selector to the target.
 unsafe extern "C" fn fire(_timer: *const c_void, info: *mut c_void) {
     let object = info as Id;
-    let (target, selector, repeats, user_info, passes_timer) = {
+    let (target, selector, repeats, user_info, passes_timer, block) = {
         let timer = timer_of(object);
         (
             timer.target,
@@ -200,8 +203,18 @@ unsafe extern "C" fn fire(_timer: *const c_void, info: *mut c_void) {
             timer.repeats,
             timer.user_info,
             timer.passes_timer,
+            timer.block,
         )
     };
+    if !block.is_null() {
+        // SAFETY: a copied `void (^)(NSTimer *)`.
+        unsafe { crate::block::call_with(block, object) };
+        if repeats == 0 {
+            // SAFETY: `-invalidate` is `void (id, SEL)`.
+            unsafe { invalidate(object, objc::sel::get("invalidate")) };
+        }
+        return;
+    }
     if target.is_null() || selector.is_null() {
         return;
     }
@@ -257,6 +270,7 @@ fn make(
         (*object).interval = interval;
         (*object).repeats = repeats as usize;
         (*object).passes_timer = passes_timer as usize;
+        (*object).block = std::ptr::null_mut();
         (*object).timer = std::ptr::null();
     }
     let object = object as Id;
@@ -326,6 +340,44 @@ unsafe extern "C" fn unscheduled_timer(
         false,
         true,
     )
+}
+
+/// A timer that calls `block` with itself, scheduled on the main loop if asked.
+fn make_with_block(interval: f64, repeats: bool, block: Id, schedule: bool) -> Id {
+    let object = make(
+        interval,
+        std::ptr::null_mut(),
+        std::ptr::null(),
+        std::ptr::null_mut(),
+        repeats,
+        false,
+        true,
+    );
+    timer_of(object).block = objc::block::copy(block);
+    if schedule {
+        add_to_main_loop(object);
+    }
+    object
+}
+
+unsafe extern "C" fn scheduled_block_timer(
+    _class: Id,
+    _sel: Sel,
+    interval: f64,
+    repeats: u8,
+    block: Id,
+) -> Id {
+    make_with_block(interval, repeats != 0, block, true)
+}
+
+unsafe extern "C" fn unscheduled_block_timer(
+    _class: Id,
+    _sel: Sel,
+    interval: f64,
+    repeats: u8,
+    block: Id,
+) -> Id {
+    make_with_block(interval, repeats != 0, block, false)
 }
 
 unsafe extern "C" fn perform_after_delay(
@@ -540,6 +592,10 @@ pub(crate) fn install() {
             => scheduled_timer, c"@48@0:8d16@24:32@40c48";
         "timerWithTimeInterval:target:selector:userInfo:repeats:"
             => unscheduled_timer, c"@48@0:8d16@24:32@40c48";
+        "scheduledTimerWithTimeInterval:repeats:block:"
+            => scheduled_block_timer, c"@36@0:8d16c24@?28";
+        "timerWithTimeInterval:repeats:block:"
+            => unscheduled_block_timer, c"@36@0:8d16c24@?28";
     });
     methods!(timer_class, {
         "invalidate" => invalidate, c"v16@0:8";
@@ -722,6 +778,47 @@ mod tests {
             1,
             "a one-shot fired more than once"
         );
+        // SAFETY: `-isValid` is `BOOL (id, SEL)`.
+        assert_eq!(unsafe { is_valid(timer, objc::sel::get("isValid")) }, 0);
+    }
+
+    static BLOCK_FIRED: AtomicUsize = AtomicUsize::new(0);
+    static BLOCK_TIMER: AtomicUsize = AtomicUsize::new(0);
+
+    unsafe extern "C" fn block_body(_block: Id, timer: Id) {
+        BLOCK_FIRED.fetch_add(1, Ordering::SeqCst);
+        BLOCK_TIMER.store(timer as usize, Ordering::SeqCst);
+    }
+
+    /// A block timer calls its block with the timer, and a one-shot stops
+    /// itself as the selector form does.
+    #[test]
+    fn a_block_timer_passes_itself_to_its_block() {
+        crate::bootstrap();
+        let block = crate::block::fake::block(block_body as *const c_void);
+        BLOCK_FIRED.store(0, Ordering::SeqCst);
+        // SAFETY: the prototype is the class method's.
+        let timer = unsafe {
+            scheduled_block_timer(
+                std::ptr::null_mut(),
+                objc::sel::get("scheduledTimerWithTimeInterval:repeats:block:"),
+                0.005,
+                0,
+                block.id(),
+            )
+        };
+        for _ in 0..100 {
+            if BLOCK_FIRED.load(Ordering::SeqCst) >= 1 {
+                break;
+            }
+            corefoundation::runloop::main().run_in_mode(
+                corefoundation::runloop::DEFAULT_MODE,
+                0.01,
+                false,
+            );
+        }
+        assert_eq!(BLOCK_FIRED.load(Ordering::SeqCst), 1);
+        assert_eq!(BLOCK_TIMER.load(Ordering::SeqCst), timer as usize);
         // SAFETY: `-isValid` is `BOOL (id, SEL)`.
         assert_eq!(unsafe { is_valid(timer, objc::sel::get("isValid")) }, 0);
     }
