@@ -158,6 +158,14 @@ unsafe extern "C" fn object_for_key(_receiver: Id, _sel: Sel, key: Id) -> Id {
     }
 }
 
+/// `-displayNameForKey:value:`, nil for the reason
+/// `CFLocaleCopyDisplayNameForPropertyValue` records: a display name is CLDR
+/// data this tree does not carry, and nil is the documented answer for a value
+/// the locale cannot name.
+unsafe extern "C" fn display_name_for_key(_receiver: Id, _sel: Sel, _key: Id, _value: Id) -> Id {
+    std::ptr::null_mut()
+}
+
 unsafe extern "C" fn locale_identifier(_receiver: Id, _sel: Sel) -> Id {
     autoreleased(&identifier())
 }
@@ -344,6 +352,7 @@ pub(crate) fn install() {
     methods!(class, {
         "objectForKey:" => object_for_key, c"@24@0:8@16";
         "localeIdentifier" => locale_identifier, c"@16@0:8";
+        "displayNameForKey:value:" => display_name_for_key, c"@32@0:8@16@24";
     });
 }
 
