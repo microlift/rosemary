@@ -894,10 +894,13 @@ mod tests {
     impl ObjcMemory for Flat {
         fn read(&self, addr: Word, out: &mut [u8]) -> Result<()> {
             let start = addr.wrapping_sub(BASE) as usize;
-            let src = self.0.get(start..start.wrapping_add(out.len())).ok_or(Error::OutOfBounds {
-                addr,
-                len: out.len(),
-            })?;
+            let src =
+                self.0
+                    .get(start..start.wrapping_add(out.len()))
+                    .ok_or(Error::OutOfBounds {
+                        addr,
+                        len: out.len(),
+                    })?;
             out.copy_from_slice(src);
             Ok(())
         }

@@ -4221,7 +4221,10 @@ mod no_copy_tests {
             block
         };
         // A reused address was freed as some earlier block, not as this one.
-        FREED.lock().unwrap().retain(|&freed| freed != block as usize);
+        FREED
+            .lock()
+            .unwrap()
+            .retain(|&freed| freed != block as usize);
         block
     }
 
