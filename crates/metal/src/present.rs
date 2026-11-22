@@ -243,7 +243,15 @@ pub(crate) unsafe extern "C" fn next_drawable(receiver: Id, _sel: Sel) -> Id {
         &CACHE,
         cache,
         matches,
-        || crate::swapchain::wait_copied(RECLAIM_POLL),
+        || {
+            // A slot comes back once its frame is presented, and part of that
+            // only the video thread may do; waiting on it there would wait
+            // for this thread itself.
+            if sdl3::video::is_video_thread() {
+                appkit::event::service_presentation_only();
+            }
+            crate::swapchain::wait_copied(RECLAIM_POLL)
+        },
         RECLAIM_POLL,
         deadline,
     ) else {
