@@ -392,7 +392,8 @@ impl<S: MachSpec + 'static> Loader<S> {
 
         // Loaded images come first, so a bundled dylib beats the host's copy of
         // the same name.
-        let mut chain: Vec<&dyn SymbolProvider> = alloc::vec![&namespace];
+        let within = namespace.within(providers);
+        let mut chain: Vec<&dyn SymbolProvider> = alloc::vec![&within];
         chain.extend_from_slice(providers);
 
         // The main executable is `mapped[0]` by construction, and is what
