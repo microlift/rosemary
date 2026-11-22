@@ -1330,6 +1330,31 @@ unsafe extern "C" fn lowercase(receiver: Id, _sel: Sel) -> Id {
     unsafe { api::CFAutorelease(s) as Id }
 }
 
+/// The receiver in a Unicode normalization form, autoreleased.
+fn normalized(receiver: Id, form: api::NormalizationForm) -> Id {
+    // SAFETY: an `NSString`.
+    let text = String::from_utf8_lossy(&unsafe { bytes(receiver) }).into_owned();
+    let s = corefoundation::string::from_bytes(api::normalize(&text, form).as_bytes(), false);
+    // SAFETY: a fresh object.
+    unsafe { api::CFAutorelease(s) as Id }
+}
+
+unsafe extern "C" fn precomposed_canonical(receiver: Id, _sel: Sel) -> Id {
+    normalized(receiver, api::NormalizationForm::C)
+}
+
+unsafe extern "C" fn decomposed_canonical(receiver: Id, _sel: Sel) -> Id {
+    normalized(receiver, api::NormalizationForm::D)
+}
+
+unsafe extern "C" fn precomposed_compatibility(receiver: Id, _sel: Sel) -> Id {
+    normalized(receiver, api::NormalizationForm::KC)
+}
+
+unsafe extern "C" fn decomposed_compatibility(receiver: Id, _sel: Sel) -> Id {
+    normalized(receiver, api::NormalizationForm::KD)
+}
+
 unsafe extern "C" fn uppercase(receiver: Id, _sel: Sel) -> Id {
     // SAFETY: an `NSString`.
     let mut whole = unsafe { bytes(receiver) };
@@ -1873,6 +1898,10 @@ pub(crate) fn install() {
         "componentsSeparatedByCharactersInSet:" => components_separated_by_characters, c"@24@0:8@16";
         "lowercaseString" => lowercase, c"@16@0:8";
         "uppercaseString" => uppercase, c"@16@0:8";
+        "precomposedStringWithCanonicalMapping" => precomposed_canonical, c"@16@0:8";
+        "decomposedStringWithCanonicalMapping" => decomposed_canonical, c"@16@0:8";
+        "precomposedStringWithCompatibilityMapping" => precomposed_compatibility, c"@16@0:8";
+        "decomposedStringWithCompatibilityMapping" => decomposed_compatibility, c"@16@0:8";
         "compare:" => compare, c"q24@0:8@16";
         "caseInsensitiveCompare:" => case_insensitive_compare, c"q24@0:8@16";
         "localizedCaseInsensitiveCompare:" => case_insensitive_compare, c"q24@0:8@16";

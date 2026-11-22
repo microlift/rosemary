@@ -1243,6 +1243,25 @@ pub fn strip_marks(text: &str) -> String {
     nfc(&bare)
 }
 
+/// `CFStringNormalizationForm`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum NormalizationForm {
+    D = 0,
+    KD = 1,
+    C = 2,
+    KC = 3,
+}
+
+/// `text` in a Unicode normalization form.
+pub fn normalize(text: &str, form: NormalizationForm) -> String {
+    match form {
+        NormalizationForm::D => nfd(text),
+        NormalizationForm::KD => nfkd(text),
+        NormalizationForm::C => nfc(text),
+        NormalizationForm::KC => nfkc(text),
+    }
+}
+
 /// `void CFStringNormalize(CFMutableStringRef, CFStringNormalizationForm)`.
 pub unsafe extern "C" fn CFStringNormalize(target: CFTypeRef, form: CFIndex) {
     let map: fn(&str) -> String = match form {
