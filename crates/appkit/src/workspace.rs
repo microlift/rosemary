@@ -544,6 +544,18 @@ unsafe extern "C" fn voice_over_enabled(_receiver: Id, _sel: Sel) -> u8 {
     0
 }
 
+/// `-setIcon:forFile:options:`: NO, the icon was not set. A custom icon is
+/// Finder metadata, which no host file manager reads.
+unsafe extern "C" fn set_icon_for_file(
+    _receiver: Id,
+    _sel: Sel,
+    _image: Id,
+    _path: Id,
+    _options: usize,
+) -> u8 {
+    0
+}
+
 pub(crate) fn install() {
     let class = objc::class::lookup(c"NSWorkspace").expect("declared before its methods");
     class_methods!(class, {
@@ -566,6 +578,7 @@ pub(crate) fn install() {
         "iconForFile:" => icon_for_file_type, c"@24@0:8@16";
         "iconForContentType:" => icon_for_file_type, c"@24@0:8@16";
         "isFilePackageAtPath:" => is_file_package, c"c24@0:8@16";
+        "setIcon:forFile:options:" => set_icon_for_file, c"c40@0:8@16@24Q32";
     });
 
     let running =
