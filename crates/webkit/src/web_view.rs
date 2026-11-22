@@ -50,6 +50,8 @@ struct View {
     cursor: Option<&'static str>,
     /// `-customUserAgent`, which replaces the configuration's agent.
     custom_user_agent: Option<String>,
+    /// `-pageZoom`, the scale of the whole page.
+    page_zoom: f64,
 }
 
 #[derive(Clone, PartialEq)]
@@ -899,6 +901,25 @@ unsafe extern "C" fn set_custom_user_agent(receiver: Id, _sel: Sel, agent: Id) {
     unsafe { apply_user_agent(engine, gtk, configuration, &agent) };
 }
 
+const DEFAULT_PAGE_ZOOM: f64 = 1.0;
+
+/// `-pageZoom`.
+unsafe extern "C" fn page_zoom(receiver: Id, _sel: Sel) -> f64 {
+    with_object(receiver, |v| v.page_zoom).unwrap_or(DEFAULT_PAGE_ZOOM)
+}
+
+/// `-setPageZoom:`. WebKitGTK's zoom level scales the whole page unless it is
+/// told to zoom text only, which nothing here tells it.
+unsafe extern "C" fn set_page_zoom(receiver: Id, _sel: Sel, zoom: f64) {
+    if with_object(receiver, |v| v.page_zoom = zoom).is_none() {
+        return;
+    }
+    if let Some((engine, gtk)) = gtk_of(receiver) {
+        // SAFETY: the view's live `WebKitWebView`.
+        unsafe { (engine.api.webkit_web_view_set_zoom_level)(gtk, zoom) };
+    }
+}
+
 /// `agent` as WebKitGTK accepts it for the `User-Agent` header.
 ///
 /// WebKitGTK refuses a user agent that is not a list of `product/version`
@@ -968,14 +989,16 @@ unsafe fn make_gtk_view(engine: &Engine, configuration: Id, id: usize) -> Ptr {
     };
     let agent = gtk::c_string(&header);
     // SAFETY: a configuration's preferences.
-    let developer =
-        unsafe { configuration::preferences(configuration::preferences_of(configuration)) }
-            .is_some_and(|p| p.developer_extras);
+    let preferences =
+        unsafe { configuration::preferences(configuration::preferences_of(configuration)) };
+    let developer = preferences.as_ref().is_some_and(|p| p.developer_extras);
+    let tabs_to_links = preferences.as_ref().is_some_and(|p| p.tab_focuses_links);
     // SAFETY: the view's own settings, and a string they copy.
     unsafe {
         let settings = (api.webkit_web_view_get_settings)(gtk);
         (api.webkit_settings_set_user_agent)(settings, agent.as_ptr());
         (api.webkit_settings_set_enable_developer_extras)(settings, c_int::from(developer));
+        (api.webkit_settings_set_enable_tabs_to_links)(settings, c_int::from(tabs_to_links));
         (api.webkit_settings_set_enable_write_console_messages_to_stdout)(
             settings,
             c_int::from(engine::tracing()),
@@ -1152,6 +1175,7 @@ unsafe extern "C" fn init_with_frame_configuration(
             modifier_flags: 0,
             cursor: None,
             custom_user_agent: None,
+            page_zoom: DEFAULT_PAGE_ZOOM,
         })
     });
     receiver
@@ -2077,6 +2101,8 @@ pub fn install() {
         "evaluateJavaScript:completionHandler:" => evaluate_javascript, c"v32@0:8@16@?24";
         "customUserAgent" => custom_user_agent, c"@16@0:8";
         "setCustomUserAgent:" => set_custom_user_agent, c"v24@0:8@16";
+        "pageZoom" => page_zoom, c"d16@0:8";
+        "setPageZoom:" => set_page_zoom, c"v24@0:8d16";
         "setValue:forKey:" => set_value_for_key, c"v32@0:8@16@24";
         "acceptsFirstResponder" => yes, c"c16@0:8";
         "becomeFirstResponder" => become_first_responder, c"c16@0:8";
