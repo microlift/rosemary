@@ -168,6 +168,8 @@ fn folder(kind: u32) -> Option<&'static str> {
         b"pubb" => "Public",
         b"temp" => "",
         b"cusr" => "",
+        // kRootFolderType: the root of the volume the domain is on.
+        b"root" => "",
         _ => return None,
     })
 }
@@ -195,6 +197,7 @@ pub unsafe extern "C" fn FSFindFolder(
     // Apple's is per-user and per-boot, and the guest's is `/tmp`.
     let guest = match &kind.to_be_bytes() {
         b"temp" => "/tmp".to_string(),
+        _ if relative.is_empty() && root.is_empty() => "/".to_string(),
         _ if relative.is_empty() => root,
         _ => format!("{root}/{relative}"),
     };
@@ -215,6 +218,47 @@ pub unsafe extern "C" fn FSFindFolder(
     }
     // SAFETY: checked non-null above.
     unsafe { store(result, path) };
+    NO_ERR as i16
+}
+
+/// `OSErr FindFolder(FSVolumeRefNum vRefNum, OSType folderType, Boolean
+/// createFolder, FSVolumeRefNum *foundVRefNum, SInt32 *foundDirID)`
+///
+/// [`FSFindFolder`]'s folder, named the way `FSGetCatalogInfo` names it: by
+/// its volume and its node ID.
+///
+/// # Safety
+///
+/// `found_volume` and `found_directory` are null or writable.
+pub unsafe extern "C" fn FindFolder(
+    volume: i16,
+    kind: u32,
+    create: u8,
+    found_volume: *mut i16,
+    found_directory: *mut i32,
+) -> i16 {
+    use std::os::unix::fs::MetadataExt;
+    let mut reference = [0_u8; FS_REF_BYTES];
+    // SAFETY: storage for a whole `FSRef`.
+    let status = unsafe { FSFindFolder(volume, kind, create, reference.as_mut_ptr().cast()) };
+    if status != NO_ERR as i16 {
+        return status;
+    }
+    // SAFETY: the reference just stored.
+    let Some(path) = (unsafe { load(reference.as_ptr().cast()) }) else {
+        return FNF_ERR as i16;
+    };
+    let Ok(metadata) = std::fs::metadata(&path) else {
+        return DIR_NF_ERR as i16;
+    };
+    if !found_volume.is_null() {
+        // SAFETY: the caller states it is writable.
+        unsafe { *found_volume = volume_of(metadata.dev(), &path) };
+    }
+    if !found_directory.is_null() {
+        // SAFETY: the caller states it is writable.
+        unsafe { *found_directory = metadata.ino() as i32 };
+    }
     NO_ERR as i16
 }
 
@@ -426,6 +470,7 @@ exports::exports! {
     functions {
         "FSCreateFileUnicode" => FSCreateFileUnicode,
         "FSFindFolder" => FSFindFolder,
+        "FindFolder" => FindFolder,
         "FSPathMakeRef" => FSPathMakeRef,
         "FSRefMakePath" => FSRefMakePath,
         "FSCompareFSRefs" => FSCompareFSRefs,
@@ -595,6 +640,42 @@ mod tests {
         };
         assert_eq!(status, FNF_ERR as i16);
     }
+
+    #[test]
+    fn the_system_disks_root_folder_is_on_a_volume_with_a_name() {
+        const ON_SYSTEM_DISK: i16 = -32765;
+        let (mut volume, mut directory) = (0_i16, 0_i32);
+        // SAFETY: both outputs are writable.
+        let status = unsafe {
+            FindFolder(
+                ON_SYSTEM_DISK,
+                u32::from_be_bytes(*b"root"),
+                0,
+                &mut volume,
+                &mut directory,
+            )
+        };
+        assert_eq!(status, NO_ERR as i16);
+        assert_ne!(directory, 0);
+        let mut name = UniStr255 {
+            length: u16::MAX,
+            unicode: [0; 255],
+        };
+        // SAFETY: the name is writable; the other outputs are not asked for.
+        let status = unsafe {
+            FSGetVolumeInfo(
+                volume,
+                0,
+                std::ptr::null_mut(),
+                0,
+                std::ptr::null_mut(),
+                &mut name,
+                std::ptr::null_mut(),
+            )
+        };
+        assert_eq!(status, NO_ERR as i16);
+        assert!(name.length > 0 && name.length <= 255);
+    }
 }
 
 /// `FSCatalogInfo`, whose layout is ABI: a guest declares one on its stack and
@@ -758,7 +839,14 @@ fn volume_of(device: u64, seen_at: &std::path::Path) -> i16 {
             table.len() - 1
         }
     };
-    -100_i16.saturating_sub(i16::try_from(index).unwrap_or(0))
+    volume_number(index)
+}
+
+/// The first volume's `FSVolumeRefNum`; later ones count down from it.
+const FIRST_VOLUME: i16 = -100;
+
+fn volume_number(index: usize) -> i16 {
+    FIRST_VOLUME.saturating_sub(i16::try_from(index).unwrap_or(i16::MAX))
 }
 
 /// One filesystem, as the volume calls see it.
@@ -811,7 +899,7 @@ fn mount_point(path: &std::path::Path, device: u64) -> PathBuf {
 fn volume_by_number(number: i16) -> Option<(i16, PathBuf)> {
     let mut held = VOLUMES.lock().unwrap_or_else(|e| e.into_inner());
     let table = volumes(&mut held);
-    let index = usize::try_from(-100_i16.saturating_sub(number)).ok()?;
+    let index = usize::try_from(i32::from(FIRST_VOLUME) - i32::from(number)).ok()?;
     table.get(index).map(|volume| (number, volume.root.clone()))
 }
 
@@ -821,10 +909,7 @@ fn volume_by_index(index: u64) -> Option<(i16, PathBuf)> {
     let table = volumes(&mut held);
     let at = usize::try_from(index.checked_sub(1)?).ok()?;
     let volume = table.get(at)?;
-    Some((
-        -100_i16.saturating_sub(i16::try_from(at).unwrap_or(0)),
-        volume.root.clone(),
-    ))
+    Some((volume_number(at), volume.root.clone()))
 }
 
 /// `OSErr FSGetVolumeInfo(FSVolumeRefNum volume, ItemCount volumeIndex,

@@ -1414,6 +1414,9 @@ pub static SIGNATURES: &[FunctionAbi] = &[
     sig!("SetSystemUIMode", I32, U32, U32),
     // `OSErr FSFindFolder(FSVolumeRefNum, OSType, Boolean, FSRef *)`.
     sig!("FSFindFolder", I16, I16, U32, U8, P),
+    // `OSErr FindFolder(FSVolumeRefNum, OSType, Boolean, FSVolumeRefNum *,
+    // SInt32 *)`.
+    sig!("FindFolder", I16, I16, U32, U8, P, P),
     sig!("GetIconRef", I16, I16, U32, U32, P),
     sig!("ReleaseIconRef", I16, P),
     sig!("LocaleRefFromLocaleString", I32, P, P),
