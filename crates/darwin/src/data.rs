@@ -19,6 +19,21 @@ struct DefaultLog([u8; 8]);
 #[cfg(not(target_os = "macos"))]
 static DEFAULT_LOG: DefaultLog = DefaultLog([0; 8]);
 
+/// A `const char *const` global.
+#[cfg(not(target_os = "macos"))]
+#[repr(transparent)]
+struct ConstString(*const std::ffi::c_char);
+
+// SAFETY: the pointee is an immutable static string.
+#[cfg(not(target_os = "macos"))]
+unsafe impl Sync for ConstString {}
+
+/// `kOSThermalNotificationPressureLevelName`, the notify(3) name of the
+/// thermal pressure level.
+#[cfg(not(target_os = "macos"))]
+static THERMAL_PRESSURE_LEVEL_NAME: ConstString =
+    ConstString(c"com.apple.system.thermalpressurelevel".as_ptr());
+
 #[cfg(target_os = "macos")]
 exports::exports! {}
 
@@ -28,6 +43,8 @@ exports::exports! {
     data {
         "__res" => (&raw const RESOLVER_STATE).cast::<u8>() as usize as u64,
         "__os_log_default" => &raw const DEFAULT_LOG as usize as u64,
+        "_kOSThermalNotificationPressureLevelName" =>
+            &raw const THERMAL_PRESSURE_LEVEL_NAME as usize as u64,
     }
 }
 
@@ -59,5 +76,17 @@ mod tests {
         let log = resolve(&lib, "__os_log_default");
         assert_eq!(log.kind, SymbolKind::Data);
         assert_eq!(log.addr, (&raw const DEFAULT_LOG) as usize as u64);
+    }
+
+    #[test]
+    fn thermal_pressure_name_is_a_pointer_to_the_notify_name() {
+        let mut lib = SyntheticDylib::new("<test>");
+        provide(&mut lib);
+
+        let name = resolve(&lib, "_kOSThermalNotificationPressureLevelName");
+        assert_eq!(name.kind, SymbolKind::Data);
+        // SAFETY: the resolved address is the static `const char *const`.
+        let value = unsafe { std::ffi::CStr::from_ptr(*(name.addr as *const *const _)) };
+        assert_eq!(value, c"com.apple.system.thermalpressurelevel");
     }
 }
