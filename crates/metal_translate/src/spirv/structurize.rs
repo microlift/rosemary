@@ -1,5 +1,6 @@
 use super::cfg::{ControlFlow, Merge, loop_region, reaches, successors_of};
 use super::*;
+use crate::ir::Dominance;
 
 /// Give a function a single returning block.
 ///
@@ -397,6 +398,13 @@ pub(super) fn split_shared_merges(function: &mut Function) -> Result<bool, Trans
         if dominators.dominates(header, merge) {
             continue;
         }
+        // A path the header shares with another construct reaches the merge
+        // through a block the header does not dominate. A new block on the
+        // dominated edges would not post-dominate the header, so it could
+        // never become the merge; the shared path has to be cloned first.
+        if !merge_entries_dominated(&graph, &dominators, header, merge) {
+            continue;
+        }
         let sources: Vec<_> = graph
             .predecessors
             .get(&merge)
@@ -449,6 +457,30 @@ pub(super) fn split_shared_merges(function: &mut Function) -> Result<bool, Trans
     }
     split_merge(function, merge, &sources);
     Ok(true)
+}
+
+/// Whether every edge by which `header`'s paths reach `merge` comes from a
+/// block `header` dominates.
+fn merge_entries_dominated(
+    graph: &ControlFlow,
+    dominators: &Dominance,
+    header: BlockId,
+    merge: BlockId,
+) -> bool {
+    let mut seen = BTreeSet::new();
+    let mut pending = vec![header];
+    while let Some(block) = pending.pop() {
+        if block == merge || !seen.insert(block) {
+            continue;
+        }
+        for successor in &graph.successors[&block] {
+            if *successor == merge && !dominators.dominates(header, block) {
+                return false;
+            }
+            pending.push(*successor);
+        }
+    }
+    true
 }
 
 /// Give a loop whose body rejoins at its latch an empty continue target.
