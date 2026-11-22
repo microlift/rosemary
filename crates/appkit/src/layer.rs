@@ -160,6 +160,18 @@ pub(crate) fn set_bounds_of(layer: Id, bounds: NSRect) {
     }
 }
 
+/// Give a view's layer the view's geometry, as AppKit does whenever the view's
+/// frame changes: the view's bounds, and the position that puts the layer's
+/// frame where the view's frame is. Updating the bounds alone leaves the
+/// layer's frame where the view's first frame put it, which is wrong for a
+/// program that sizes what it draws by `-[CALayer frame]`.
+pub(crate) fn set_geometry_of(layer: Id, bounds: NSRect, frame: NSRect) {
+    if is_layer(layer) {
+        store_bounds(layer, bounds);
+        crate::coreanimation::set_position_for_frame(layer, frame);
+    }
+}
+
 /// Set `-bounds`, and ask for display when the layer was told to on a change.
 fn store_bounds(receiver: Id, bounds: NSRect) {
     let layer = layer_of(receiver);

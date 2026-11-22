@@ -1394,10 +1394,10 @@ fn note_geometry_change(receiver: Id, before: NSRect) {
     if view.frame.size != before.size {
         resize_subviews(receiver, before.size);
     }
-    // AppKit keeps a view's layer the size of its bounds.
+    // AppKit keeps a view's layer where the view is.
     let layer = view_of(receiver).layer;
     if !layer.is_null() {
-        crate::layer::set_bounds_of(layer, bounds_of(receiver));
+        crate::layer::set_geometry_of(layer, bounds_of(receiver), view_of(receiver).frame);
     }
     crate::layout::solve();
     let view = view_of(receiver);
@@ -1705,7 +1705,7 @@ unsafe extern "C" fn set_wants_layer(receiver: Id, _sel: Sel, wants: u8) {
     if layer.is_null() {
         return;
     }
-    crate::layer::set_bounds_of(layer, bounds_of(receiver));
+    crate::layer::set_geometry_of(layer, bounds_of(receiver), view_of(receiver).frame);
     // A backing layer's delegate is its view, which is what routes the
     // layer's `-display` to the view.
     if crate::layer::delegate_of(layer).is_null() {
@@ -2234,6 +2234,41 @@ pub unsafe fn presentation_frame(view: Id) -> Option<Frame> {
         window_height: host_pixels.1.max(0) as u32,
     };
     Some(frame)
+}
+
+/// Where `layer`, the layer of `view`, shows contents of `size` pixels, in the
+/// window pixels [`presentation_frame`] answers in: the view's own frame under
+/// the default `resize` gravity, and otherwise the contents at their own size,
+/// placed by the layer's `contentsGravity`. The frame may overhang the view.
+///
+/// # Safety
+///
+/// As [`presentation_frame`], and `layer` is null or a layer of this crate's.
+pub unsafe fn contents_frame(view: Id, layer: Id, size: (u32, u32)) -> Option<Frame> {
+    // SAFETY: the caller's obligation.
+    let frame = unsafe { presentation_frame(view) }?;
+    let bounds = bounds_of(view).size;
+    if bounds.width <= 0.0 || bounds.height <= 0.0 {
+        return Some(frame);
+    }
+    let rect = crate::backing::Rect {
+        x: frame.x.into(),
+        y: frame.y.into(),
+        width: frame.width.into(),
+        height: frame.height.into(),
+    };
+    let scale = (
+        f64::from(frame.width) / bounds.width,
+        f64::from(frame.height) / bounds.height,
+    );
+    let placed = crate::coreanimation::contents_rect(layer, rect, scale, size)?;
+    Some(Frame {
+        x: i32::try_from(placed.x).ok()?,
+        y: i32::try_from(placed.y).ok()?,
+        width: u32::try_from(placed.width).ok()?,
+        height: u32::try_from(placed.height).ok()?,
+        ..frame
+    })
 }
 
 /// The part of a view its ancestors and its window leave on screen, in the

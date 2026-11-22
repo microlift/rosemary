@@ -687,12 +687,30 @@ unsafe extern "C" fn set_frame(receiver: Id, _sel: Sel, frame: NSRect) {
     bounds.size = frame.size;
     crate::layer::set_bounds_of(receiver, bounds);
     with_node(receiver, |node| {
-        node.position = NSPoint {
-            x: frame.origin.x + node.anchor.x * frame.size.width,
-            y: frame.origin.y + node.anchor.y * frame.size.height,
-        };
+        node.position = anchored(frame, node.anchor)
     });
     changed(receiver);
+}
+
+/// Where a layer whose frame is `frame` has its position.
+fn anchored(frame: NSRect, anchor: NSPoint) -> NSPoint {
+    NSPoint {
+        x: frame.origin.x + anchor.x * frame.size.width,
+        y: frame.origin.y + anchor.y * frame.size.height,
+    }
+}
+
+/// Move `layer` so its frame starts where `frame` does, for a layer whose
+/// bounds already have `frame`'s size: the half of `-setFrame:` that is not
+/// the bounds.
+pub(crate) fn set_position_for_frame(layer: Id, frame: NSRect) {
+    let moved = with_node(layer, |node| {
+        let position = anchored(frame, node.anchor);
+        std::mem::replace(&mut node.position, position) != position
+    });
+    if moved {
+        changed_metadata(layer);
+    }
 }
 
 unsafe extern "C" fn position(receiver: Id, _sel: Sel) -> NSPoint {
@@ -2458,6 +2476,29 @@ fn place(gravity: Gravity, bounds: Rect, width: f64, height: f64) -> (f64, f64, 
         _ => by + (bh - height) / 2.0,
     };
     (x, y, width, height)
+}
+
+/// The window pixels contents of `width` by `height` pixels cover when
+/// `layer`'s bounds fill `bounds`, `scale` window pixels to the point: the
+/// bounds themselves under the default `resize` gravity, and otherwise the
+/// contents at their own size, `contentsScale` pixels to the point, placed
+/// as the gravity says. `None` for contents with no area.
+pub(crate) fn contents_rect(
+    layer: Id,
+    bounds: Rect,
+    scale: (f64, f64),
+    (width, height): (u32, u32),
+) -> Option<Rect> {
+    let gravity = read_node(layer, |node| {
+        node.map_or(Gravity::Resize, |node| node.gravity)
+    });
+    let contents_scale = crate::layer::contents_scale_of(layer);
+    source_area(place(
+        gravity,
+        bounds,
+        f64::from(width) / contents_scale * scale.0,
+        f64::from(height) / contents_scale * scale.1,
+    ))
 }
 
 /// Use the same gravity and pixel-edge rounding as draw_contents, without
@@ -5956,6 +5997,74 @@ mod tests {
         }
         assert_eq!(objc::arc::retain_count(object), before - 1);
         objc::arc::release(object);
+        objc::arc::pool_pop(pool);
+    }
+
+    /// AppKit keeps a view's backing layer on the view's frame, so a program
+    /// that sizes what it draws by `-[CALayer frame]` sees every resize.
+    #[test]
+    fn a_backing_layer_frame_follows_its_view() {
+        crate::bootstrap();
+        let pool = objc::arc::pool_push();
+        let view = objc::object::create_instance(objc::class::lookup(c"NSView").unwrap(), 0);
+        let view: Id = send(view, "initWithFrame:", rect(0., 0., 100., 100.));
+        send::<u8, ()>(view, "setWantsLayer:", 1);
+        let layer: Id = send(view, "layer", ());
+        // SAFETY: `-frame` of a layer this test made.
+        let frame_of = |layer| unsafe { frame(layer, objc::sel::get("frame")) };
+        assert_eq!(frame_of(layer), rect(0., 0., 100., 100.));
+        let size = NSSize {
+            width: 1200.,
+            height: 750.,
+        };
+        send::<NSSize, ()>(view, "setFrameSize:", size);
+        assert_eq!(frame_of(layer), rect(0., 0., 1200., 750.));
+        send::<NSRect, ()>(view, "setFrame:", rect(10., 20., 30., 40.));
+        assert_eq!(frame_of(layer), rect(10., 20., 30., 40.));
+        objc::arc::release(view);
+        objc::arc::pool_pop(pool);
+    }
+
+    /// A drawable larger than its layer, as a program that rounds its drawable
+    /// size up allocates, shows at its own size from where the gravity puts
+    /// it; under the default gravity it is scaled to the bounds.
+    #[test]
+    fn oversized_contents_land_where_the_gravity_puts_them() {
+        crate::bootstrap();
+        let pool = objc::arc::pool_push();
+        let class = objc::class::ptr(objc::class::lookup(c"CAMetalLayer").unwrap()) as Id;
+        let layer: Id = send(class, "layer", ());
+        let bounds = Rect {
+            x: 0,
+            y: 28,
+            width: 1200,
+            height: 750,
+        };
+        let drawable = (1280, 768);
+        assert_eq!(
+            contents_rect(layer, bounds, (1., 1.), drawable),
+            Some(bounds)
+        );
+        set_gravity(layer, Gravity::TopLeft);
+        let natural = Rect {
+            width: 1280,
+            height: 768,
+            ..bounds
+        };
+        assert_eq!(
+            contents_rect(layer, bounds, (1., 1.), drawable),
+            Some(natural)
+        );
+        send::<f64, ()>(layer, "setContentsScale:", 2.);
+        let halved = Rect {
+            width: 640,
+            height: 384,
+            ..bounds
+        };
+        assert_eq!(
+            contents_rect(layer, bounds, (1., 1.), drawable),
+            Some(halved)
+        );
         objc::arc::pool_pop(pool);
     }
 }
