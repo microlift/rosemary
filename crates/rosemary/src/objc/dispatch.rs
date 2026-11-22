@@ -127,6 +127,10 @@ pub(super) static RUNTIME: &[Runtime] = &[
     //
     // Terraria reaches all three: Mono's Objective-C bridge builds an
     // `NSApplication` delegate class at start-up rather than declaring one.
+    // `BOOL class_addIvar(Class, const char *name, size_t size, uint8_t
+    // alignment, const char *types)`, on a class still being built: Max for
+    // Live adds its ivars to the classes it allocates at load.
+    rtc!([0], "class_addIvar", U8, P, P, U64, U8, P),
     rtcb!([0], [2], "class_addMethod", U8, P, P, P, P),
     //
     // Not methods and not ivars: a name and an attribute string beside them,
