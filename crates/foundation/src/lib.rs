@@ -129,6 +129,7 @@ exports::group! {
     timer::cf,
     appleevent,
     proxy,
+    url,
 }
 
 /// This user's home directory, as the guest spells it.

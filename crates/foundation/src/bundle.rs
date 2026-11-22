@@ -839,6 +839,68 @@ pub mod cf {
         object
     }
 
+    /// `CFArrayRef CFBundleCreateBundlesFromDirectory(CFAllocatorRef, CFURLRef
+    /// directoryURL, CFStringRef bundleType)`
+    ///
+    /// A bundle for each directory in `directoryURL` whose extension is
+    /// `bundleType`, or for every one when it is null. Entries are taken in
+    /// name order: the host's directory order is not the one macOS would give.
+    unsafe extern "C" fn CFBundleCreateBundlesFromDirectory(
+        _allocator: *const std::ffi::c_void,
+        url: Id,
+        bundle_type: Id,
+    ) -> Id {
+        // SAFETY: a `CFString` or null.
+        let bundle_type = (!bundle_type.is_null()).then(|| {
+            String::from_utf8_lossy(&unsafe { crate::string::bytes(bundle_type) }).into_owned()
+        });
+        // SAFETY: a `CFURL` or null.
+        let directory = unsafe { corefoundation::url::as_url(url as CFTypeRef) }
+            .and_then(|url| url.file_path());
+        let mut names: Vec<_> = directory
+            .as_deref()
+            .and_then(|directory| std::fs::read_dir(super::opened(directory.as_ref())).ok())
+            .into_iter()
+            .flatten()
+            .filter_map(Result::ok)
+            .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_dir()))
+            .filter_map(|entry| entry.file_name().into_string().ok())
+            .filter(|name| match &bundle_type {
+                Some(kind) => std::path::Path::new(name)
+                    .extension()
+                    .is_some_and(|extension| extension == kind.as_str()),
+                None => true,
+            })
+            .collect();
+        names.sort();
+        let bundles: Vec<CFTypeRef> = directory
+            .iter()
+            .flat_map(|directory| {
+                names
+                    .iter()
+                    .map(move |name| format!("{}/{name}", directory.trim_end_matches('/')))
+            })
+            .filter_map(|path| {
+                let url = corefoundation::url::new_file_url(&path, true);
+                // SAFETY: a file URL this function owns.
+                let bundle = unsafe { CFBundleCreate(std::ptr::null(), url as Id) };
+                // SAFETY: the reference made just above.
+                unsafe { corefoundation::api::CFRelease(url) };
+                (!bundle.is_null()).then_some(bundle as CFTypeRef)
+            })
+            .collect();
+        let array = corefoundation::collections::new_array(
+            &bundles,
+            corefoundation::callbacks::Policy::from_type_callbacks(),
+            false,
+        );
+        for bundle in bundles {
+            // The array retained each bundle this function created.
+            objc::arc::release(bundle as Id);
+        }
+        array as Id
+    }
+
     /// The loader's handle for a bundle's executable, loading it if it is not
     /// yet. The main bundle's is the program itself.
     pub(super) fn executable_handle(bundle: Id) -> Option<u64> {
@@ -975,6 +1037,7 @@ pub mod cf {
             "CFBundleCopyExecutableArchitectures" => CFBundleCopyExecutableArchitectures,
             "CFBundleCopyExecutableArchitecturesForURL" => CFBundleCopyExecutableArchitecturesForURL,
             "CFBundleCreate" => CFBundleCreate,
+            "CFBundleCreateBundlesFromDirectory" => CFBundleCreateBundlesFromDirectory,
             "CFBundleLoadExecutable" => CFBundleLoadExecutable,
             "CFBundleGetFunctionPointerForName" => CFBundleGetFunctionPointerForName,
             "CFBundleGetDataPointerForName" => CFBundleGetDataPointerForName,

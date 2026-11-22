@@ -433,6 +433,7 @@ pub static SIGNATURES: &[FunctionAbi] = &[
     sig!("CFBundleCopyLocalizedString", P, P, P, P, P),
     sig!("CFBundleCopyBundleURL", P, P),
     sig!("CFBundleCreate", P, P, P),
+    sig!("CFBundleCreateBundlesFromDirectory", P, P, P, P),
     sig!("CFBundleGetIdentifier", P, P),
     sig!("CFBundleGetInfoDictionary", P, P),
     sig!("CFBundleGetMainBundle", P),
@@ -461,6 +462,8 @@ pub static SIGNATURES: &[FunctionAbi] = &[
     sig!("CFURLCreateFromFSRef", P, P, P),
     sig!("CFURLGetFSRef", BOOL, P, P),
     sig!("CFURLSetResourcePropertyForKey", BOOL, P, P, P, P),
+    sig!("CFURLResourceIsReachable", BOOL, P, P),
+    sig!("CFURLCheckResourceIsReachable", BOOL, P, P),
     sig!("CFRunLoopTimerGetContext", V, P, P),
     sig!("CFURLCreateBookmarkData", P, P, P, U64, P, P, P),
     sig!(

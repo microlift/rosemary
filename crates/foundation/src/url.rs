@@ -587,6 +587,29 @@ unsafe extern "C" fn check_resource_is_reachable(receiver: Id, _sel: Sel, error:
     0
 }
 
+/// `Boolean CFURLResourceIsReachable(CFURLRef, CFErrorRef *error)`, and its
+/// current name `CFURLCheckResourceIsReachable`: `NSURL`'s check, with the
+/// error handed out at +1 as CF's are.
+// The C spelling is the interface.
+#[allow(non_snake_case)]
+unsafe extern "C" fn CFURLResourceIsReachable(url: Id, error: *mut Id) -> u8 {
+    let sel = objc::sel::get("checkResourceIsReachableAndReturnError:");
+    // SAFETY: a `CFURL` and the caller's error slot, as `NSURL` takes them.
+    let reachable = unsafe { check_resource_is_reachable(url, sel, error) };
+    // SAFETY: the slot was just written when it is not null.
+    if reachable == 0 && !error.is_null() && unsafe { !(*error).is_null() } {
+        objc::arc::retain(unsafe { *error });
+    }
+    reachable
+}
+
+exports::exports! {
+    functions {
+        "CFURLResourceIsReachable" => CFURLResourceIsReachable,
+        "CFURLCheckResourceIsReachable" => CFURLResourceIsReachable,
+    }
+}
+
 /// The value of one `NSURLResourceKey` for `path`, or `None` for a key this
 /// tree has no answer for.
 ///
