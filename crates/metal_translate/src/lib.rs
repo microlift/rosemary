@@ -476,17 +476,82 @@ pub fn metallib_air(bytes: &[u8]) -> Result<&[u8], TranslateError> {
 /// A metallib concatenates one sixteen-byte-aligned bitcode wrapper per
 /// exported module in the final section of its fixed header.
 pub fn metallib_airs(bytes: &[u8]) -> Result<Vec<&[u8]>, TranslateError> {
-    fn u64_at(bytes: &[u8], offset: usize) -> Option<u64> {
-        Some(u64::from_le_bytes(
-            bytes.get(offset..offset + 8)?.try_into().ok()?,
-        ))
-    }
-    fn u32_at(bytes: &[u8], offset: usize) -> Option<u32> {
-        Some(u32::from_le_bytes(
-            bytes.get(offset..offset + 4)?.try_into().ok()?,
-        ))
-    }
+    Ok(metallib_wrappers(bytes)?
+        .into_iter()
+        .map(|(_, payload)| payload)
+        .collect())
+}
 
+/// The names of the functions in each of [`metallib_airs`]'s modules, from
+/// the library's function list, in the same order.
+pub fn metallib_module_functions(bytes: &[u8]) -> Result<Vec<Vec<String>>, TranslateError> {
+    const FUNCTION_LIST: usize = 24;
+    // `OFFT` is the function's public metadata, private metadata and bitcode
+    // offsets; the last is relative to the bitcode-wrapper section.
+    const BITCODE_OFFSET: usize = 16;
+    let malformed = |message| TranslateError::one(Diagnostic::new(Phase::AirContainer, message));
+    let wrappers = metallib_wrappers(bytes)?;
+    let mut names = vec![Vec::new(); wrappers.len()];
+    let list = u64_at(bytes, FUNCTION_LIST)
+        .and_then(|offset| usize::try_from(offset).ok())
+        .ok_or_else(|| malformed("metallib has no function list"))?;
+    let count =
+        u32_at(bytes, list).ok_or_else(|| malformed("metallib function list is truncated"))?;
+    let mut entry = list + 4;
+    for _ in 0..count {
+        let size = u32_at(bytes, entry)
+            .and_then(|size| usize::try_from(size).ok())
+            .ok_or_else(|| malformed("metallib function entry is truncated"))?;
+        let (mut name, mut bitcode) = (None, None);
+        let mut tag = entry + 4;
+        while bytes.get(tag..tag + 4) != Some(b"ENDT") {
+            let length = bytes
+                .get(tag + 4..tag + 6)
+                .map(|length| usize::from(u16::from_le_bytes([length[0], length[1]])))
+                .ok_or_else(|| malformed("metallib function tag is truncated"))?;
+            let value = bytes
+                .get(tag + 6..tag + 6 + length)
+                .ok_or_else(|| malformed("metallib function tag is out of bounds"))?;
+            match &bytes[tag..tag + 4] {
+                b"NAME" => {
+                    name = std::str::from_utf8(value.strip_suffix(&[0]).unwrap_or(value))
+                        .ok()
+                        .map(str::to_owned)
+                }
+                b"OFFT" => bitcode = u64_at(value, BITCODE_OFFSET),
+                _ => {}
+            }
+            tag += 6 + length;
+        }
+        let (Some(name), Some(bitcode)) = (name, bitcode) else {
+            return Err(malformed("metallib function has no name or bitcode offset"));
+        };
+        let module = wrappers
+            .iter()
+            .position(|(offset, _)| u64::try_from(*offset).ok() == Some(bitcode))
+            .ok_or_else(|| malformed("metallib function names no bitcode module"))?;
+        names[module].push(name);
+        entry = entry
+            .checked_add(size)
+            .ok_or_else(|| malformed("metallib function entry size overflows"))?;
+    }
+    Ok(names)
+}
+
+fn u64_at(bytes: &[u8], offset: usize) -> Option<u64> {
+    Some(u64::from_le_bytes(
+        bytes.get(offset..offset.checked_add(8)?)?.try_into().ok()?,
+    ))
+}
+
+fn u32_at(bytes: &[u8], offset: usize) -> Option<u32> {
+    Some(u32::from_le_bytes(
+        bytes.get(offset..offset.checked_add(4)?)?.try_into().ok()?,
+    ))
+}
+
+/// Each bitcode payload with its wrapper's offset in the wrapper section.
+fn metallib_wrappers(bytes: &[u8]) -> Result<Vec<(usize, &[u8])>, TranslateError> {
     let malformed = |message| TranslateError::one(Diagnostic::new(Phase::AirContainer, message));
     if bytes.get(..4) != Some(b"MTLB") {
         return Err(malformed("input is not a metallib container"));
@@ -522,7 +587,7 @@ pub fn metallib_airs(bytes: &[u8]) -> Result<Vec<&[u8]>, TranslateError> {
         if payload.get(..4) != Some(&[b'B', b'C', 0xc0, 0xde]) {
             return Err(malformed("metallib AIR payload is not LLVM bitcode"));
         }
-        modules.push(payload);
+        modules.push((offset, payload));
         let length = if end == wrapper.len() {
             end
         } else {

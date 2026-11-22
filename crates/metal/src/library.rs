@@ -136,6 +136,9 @@ fn translate_metallib(
     metal_translate::TranslateError,
 > {
     let modules = metal_translate::metallib_airs(bytes)?;
+    // A module this translator cannot import only takes its own functions
+    // out of the library, when the function list says which they are.
+    let module_functions = metal_translate::metallib_module_functions(bytes).ok();
     let mut entries = Vec::new();
     let mut function_constants = Vec::new();
     let mut function_reflection = Vec::new();
@@ -143,7 +146,19 @@ fn translate_metallib(
     let mut entry_modules = Vec::new();
     for (module, air) in modules.iter().enumerate() {
         let input = metal_translate::AirInput::Bitcode(air);
-        let translated = metal_translate::translate_cached(input, target)?;
+        let translated = match metal_translate::translate_cached(input, target) {
+            Ok(translated) => translated,
+            Err(error) => match module_functions.as_ref().map(|names| &names[module]) {
+                Some(names) if !names.is_empty() => {
+                    rejected.extend(names.iter().map(|name| metal_translate::RejectedEntry {
+                        name: name.clone(),
+                        reason: error.to_string(),
+                    }));
+                    continue;
+                }
+                _ => return Err(error),
+            },
+        };
         let offset = entries.len();
         function_reflection.extend(translated.function_reflection.into_iter().map(
             |mut function| {
