@@ -1045,7 +1045,7 @@ fn visit_metal_scene(
     }
     if !layer.is_null()
         && crate::layer::is_metal(layer)
-        && let Some(frame) = unsafe { presentation_frame(view) }
+        && let Some(frame) = unsafe { metal_contents_frame(view, layer) }
         && frame.window == window
     {
         scene.push(MetalSceneLayer {
@@ -2269,6 +2269,23 @@ pub unsafe fn contents_frame(view: Id, layer: Id, size: (u32, u32)) -> Option<Fr
         height: u32::try_from(placed.height).ok()?,
         ..frame
     })
+}
+
+/// Where the drawables of `layer`, the `CAMetalLayer` of `view`, land: as
+/// [`contents_frame`] places a drawable of the layer's `-drawableSize`, and
+/// the view's own frame while the layer has no drawable size yet.
+///
+/// # Safety
+///
+/// As [`contents_frame`].
+unsafe fn metal_contents_frame(view: Id, layer: Id) -> Option<Frame> {
+    let size = crate::layer::drawable_size_of(layer);
+    if size.width < 1.0 || size.height < 1.0 {
+        // SAFETY: the caller's obligation.
+        return unsafe { presentation_frame(view) };
+    }
+    // SAFETY: the caller's obligation.
+    unsafe { contents_frame(view, layer, (size.width as u32, size.height as u32)) }
 }
 
 /// The part of a view its ancestors and its window leave on screen, in the
@@ -4356,6 +4373,91 @@ mod tests {
             "empty redraw left native pixels above the static Metal source"
         );
         crate::backing::forget(native);
+        objc::arc::release(window);
+    }
+
+    /// A drawable larger than its layer, under a gravity other than `resize`,
+    /// reaches the compositor at its own size from where the gravity puts it,
+    /// as the readback path presents it.
+    #[test]
+    fn metal_scene_places_an_oversized_drawable_by_gravity() {
+        if !sdl3::isolated::run_here() {
+            return;
+        }
+        crate::bootstrap();
+        if !sdl3::may_pump() {
+            return;
+        }
+        let window = objc::object::create_instance(objc::class::lookup(c"NSWindow").unwrap(), 0);
+        if !unsafe {
+            crate::window::init_with_content_rect_for_tests(window, rect(0.0, 0.0, 320.0, 240.0))
+        } {
+            return;
+        }
+        let sdl = unsafe { crate::window::sdl_window(window) };
+        let content = view(rect(0.0, 0.0, 320.0, 240.0));
+        let set_content: unsafe extern "C" fn(Id, objc::sel::Sel, Id) =
+            unsafe { std::mem::transmute(objc::msg::entry()) };
+        unsafe { set_content(window, objc::sel::get("setContentView:"), content) };
+        let metal_view = view(rect(0.0, 0.0, 320.0, 240.0));
+        let metal_cls = objc::class::lookup(c"CAMetalLayer").unwrap();
+        let maker = objc::sel::get("layer");
+        let make_metal: unsafe extern "C" fn(Id, objc::sel::Sel) -> Id = unsafe {
+            std::mem::transmute(
+                metal_cls
+                    .metaclass()
+                    .method(maker)
+                    .unwrap()
+                    .implementation(),
+            )
+        };
+        let metal = unsafe { make_metal(metal_cls as *const _ as Id, maker) };
+        unsafe {
+            set_layer(metal_view, objc::sel::get("setLayer:"), metal);
+            add_subview(content, objc::sel::get("addSubview:"), metal_view);
+        }
+        let set_drawable_size: unsafe extern "C" fn(Id, objc::sel::Sel, NSSize) =
+            unsafe { std::mem::transmute(objc::msg::entry()) };
+        unsafe {
+            set_drawable_size(
+                metal,
+                objc::sel::get("setDrawableSize:"),
+                NSSize {
+                    width: 512.0,
+                    height: 256.0,
+                },
+            );
+        }
+        let view_frame = unsafe { presentation_frame(metal_view) }.unwrap();
+        let scene_frame = || {
+            let (scene, _) = capture_metal_scene(sdl, darwin::mach::media_time()).unwrap();
+            scene
+                .iter()
+                .find(|item| item.layer == metal as usize)
+                .unwrap()
+                .frame
+        };
+        let unplaced = scene_frame();
+        assert_eq!(
+            (unplaced.x, unplaced.y, unplaced.width, unplaced.height),
+            (
+                view_frame.x,
+                view_frame.y,
+                view_frame.width,
+                view_frame.height
+            )
+        );
+        crate::coreanimation::set_gravity(metal, crate::coreanimation::Gravity::TopLeft);
+        let placed = scene_frame();
+        assert_eq!((placed.x, placed.y), (view_frame.x, view_frame.y));
+        let pixels_per_point = f64::from(view_frame.width) / 320.0;
+        assert_eq!(
+            (placed.width, placed.height),
+            (
+                (512.0 * pixels_per_point) as u32,
+                (256.0 * pixels_per_point) as u32
+            )
+        );
         objc::arc::release(window);
     }
 

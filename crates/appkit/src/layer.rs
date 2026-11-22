@@ -586,7 +586,17 @@ unsafe extern "C" fn pixel_format(receiver: Id, _sel: Sel) -> u64 {
 }
 
 unsafe extern "C" fn set_drawable_size(receiver: Id, _sel: Sel, size: NSSize) {
-    metal_layer_of(receiver).drawable_size = size;
+    let old = std::mem::replace(&mut metal_layer_of(receiver).drawable_size, size);
+    // Under any gravity but `resize` the drawable's size decides where it
+    // lands, which the compositor's scene must hear about.
+    if old != size {
+        crate::view::invalidate_metal_scene(false);
+    }
+}
+
+/// A `CAMetalLayer`'s `-drawableSize`.
+pub(crate) fn drawable_size_of(layer: Id) -> NSSize {
+    metal_layer_of(layer).drawable_size
 }
 
 unsafe extern "C" fn drawable_size(receiver: Id, _sel: Sel) -> NSSize {
