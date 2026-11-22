@@ -1967,9 +1967,9 @@ checksum = "11d3d7f243d5c5a8b9bb5d6dd2b1602c0cb0b9db1621bafc7ed66e35ff9fe092"
 
 [[package]]
 name = "llvm-bitcode"
-version = "0.4.0"
+version = "0.4.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f0b22996bbeff44d0b756679007f43a728d393ab9f6de5109c125fcf89f23e3c"
+checksum = "e81c545b8986967f5d96021ee724fc6a00630b177a22930c3843f2aac0fd19f8"
 dependencies = [
  "bitflags 2.13.1",
  "num_enum",

@@ -9,15 +9,24 @@ mod types;
 use super::*;
 
 use convert::{PointerAlias, cast_operation, narrow, reinterpretation, widen};
-use intrinsic::{air_intrinsic, known_helper};
+use intrinsic::{air_intrinsic, known_helper, typed_air_intrinsic};
 use switch::{PendingSwitch, PhiFixup, block_id, expand_switch, is_terminator};
 use types::{
     address_space_of, aggregate_types, boolean_type, emit, float_predicate, integer_predicate,
     ir_type, layout, member_type, zero_composite,
 };
 
+/// A `GLOBALVAR` flags bit: the record names the value type, not a pointer.
+const GLOBAL_EXPLICIT_TYPE: u64 = 1 << 1;
+/// Where an explicitly typed `GLOBALVAR` keeps its address space in its flags.
+const GLOBAL_ADDRESS_SPACE_SHIFT: u64 = 2;
+/// LLVM's `CE_CAST` opcode for `bitcast`.
+const CAST_BITCAST: u64 = 11;
+
 #[derive(Clone, Debug, PartialEq)]
 enum Constant {
+    /// A pointer `bitcast` of another constant.
+    Bitcast(usize),
     Null,
     Undef,
     Integer(u64),
@@ -98,15 +107,26 @@ impl ValueTable {
                 7 => {
                     let fields = record_values(record);
                     let index = if *version == 2 { 2 } else { 0 };
-                    let pointer = type_reference(fields.get(index), types.len())?;
+                    let declared = type_reference(fields.get(index), types.len())?;
                     let flags = fields.get(index + 1).copied().unwrap_or(0);
-                    // Bit 1 says the record names the value type and its own
-                    // address space; without it the type field is a pointer.
-                    if flags & 2 != 0 {
-                        return Err(semantic(
-                            "LLVM global variable with an explicit value type needs decoding",
-                        ));
-                    }
+                    // With the explicit-type bit the record names the value
+                    // type and its own address space; without it the type
+                    // field is the pointer.
+                    let pointer = match flags & GLOBAL_EXPLICIT_TYPE {
+                        0 => declared,
+                        _ => {
+                            let space = flags >> GLOBAL_ADDRESS_SPACE_SHIFT;
+                            types
+                                .iter()
+                                .position(|ty| {
+                                    matches!(ty, DecodedType::Pointer { pointee, address_space }
+                                        if *pointee == declared && *address_space == space)
+                                })
+                                .ok_or_else(|| {
+                                    semantic("LLVM global variable's pointer type is not in the type table")
+                                })?
+                        }
+                    };
                     let DecodedType::Pointer {
                         pointee,
                         address_space,
@@ -247,6 +267,14 @@ impl ValueTable {
         } as usize)
     }
 
+    /// The constant initializing the global module value `value` names.
+    pub(super) fn global_initializer(&self, value: usize) -> Option<usize> {
+        self.globals
+            .iter()
+            .find(|global| global.value_id == value)?
+            .initializer
+    }
+
     pub(super) fn integer(&self, id: usize, types: &[DecodedType]) -> Result<u64, TranslateError> {
         if !self
             .values
@@ -368,11 +396,19 @@ impl ValueTable {
             .values
             .get(id)
             .ok_or_else(|| semantic("missing LLVM constant"))?;
-        let ty = ir_type(value.ty, types)?;
         let constant = value
             .constant
             .as_ref()
             .ok_or_else(|| semantic("LLVM value has no lowered operand"))?;
+        // A cast to the opaque sampler pointer AIR passes samplers as is only
+        // made of an inline sampler's state, which the entry binds first.
+        if let Constant::Bitcast(source) = constant {
+            return operands
+                .get(source)
+                .cloned()
+                .ok_or_else(|| semantic("LLVM constant pointer bitcast needs lowering"));
+        }
+        let ty = ir_type(value.ty, types)?;
         active.push(id);
         let result = match constant {
             Constant::Integer(value) if ty == Type::Bool => Operand::Bool(*value != 0),
@@ -407,6 +443,7 @@ impl ValueTable {
             }
             Constant::Null => zero_composite(&ty)?,
             Constant::Global(index) => Operand::Global { index: *index, ty },
+            Constant::Bitcast(_) => unreachable!("answered before its type is needed"),
         };
         active.pop();
         operands.insert(id, result.clone());
@@ -423,6 +460,12 @@ pub(super) struct Signature<'a> {
     pub parameter_types: &'a [usize],
     pub result_type: usize,
     pub opaque_types: &'a HashMap<u32, Type>,
+    /// The module's own functions, which a call is inlined from. Without
+    /// them, a call to one is rejected.
+    pub callees: Option<&'a super::bitcode::Callees<'a>>,
+    /// The module values of inline sampler states, each passed as a sampler
+    /// parameter after the LLVM ones.
+    pub inline_samplers: &'a [usize],
 }
 
 /// Record the Metal IR operand an LLVM value lowered to.
@@ -482,6 +525,10 @@ fn decode_constant(
     ty: &DecodedType,
 ) -> Result<Constant, TranslateError> {
     match (code, fields, ty) {
+        // CE_CAST: opcode, source type, source.
+        (11, [CAST_BITCAST, _, source], DecodedType::Pointer { .. }) => Ok(Constant::Bitcast(
+            usize::try_from(*source).map_err(|_| semantic("LLVM constant reference overflows"))?,
+        )),
         (2 | 3, [], DecodedType::Void | DecodedType::Function { .. } | DecodedType::Metadata) => {
             Err(semantic("LLVM constant has a nonvalue type"))
         }

@@ -163,6 +163,25 @@ impl BodyLowering<'_> {
         record: &llvm_bitcode::bitcode::Record,
         fields: &[u64],
     ) -> Result<Lowered, TranslateError> {
+        let aggregate_id = self.table.operand_id(*aggregate)?;
+        if let Some(texel) = self.texels_with_status.get(&aggregate_id).cloned() {
+            let [0] = indices else {
+                return Err(semantic(
+                    "AIR texture access status needs Metal IR lowering",
+                ));
+            };
+            let ty = member_type(&self.types[self.table.values[aggregate_id].ty], 0)?;
+            define(
+                &mut self.forward,
+                self.table.values.len(),
+                texel,
+                &mut self.operands,
+                &self.function,
+                &mut self.instructions,
+            )?;
+            self.table.values.push(Value { ty, constant: None });
+            return Ok(Lowered::Done);
+        }
         let (mut ty, mut composite) = self.operand(*aggregate, None, record, fields)?;
         let mut extracted = None;
         for &index in indices {

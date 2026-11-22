@@ -20,6 +20,64 @@ pub(super) fn known_helper(
     }
 }
 
+/// AIR intrinsics whose lowering needs constants of the result type.
+///
+/// FIXME (ACCURACY): `saturate(NaN)` is 0 in Metal, but SPIR-V's `FClamp`
+/// leaves a NaN input undefined.
+pub(super) fn typed_air_intrinsic(
+    name: &str,
+    arguments: &[Operand],
+    result: &Type,
+) -> Option<Result<InstructionKind, TranslateError>> {
+    match air_operation(name)? {
+        "saturate" => Some(match arguments {
+            [value] => float_splat(result, 0.0).and_then(|min| {
+                Ok(InstructionKind::FloatClamp {
+                    value: value.clone(),
+                    min,
+                    max: float_splat(result, 1.0)?,
+                })
+            }),
+            _ => Err(semantic(format!("LLVM intrinsic {name} takes one operand"))),
+        }),
+        _ => None,
+    }
+}
+
+/// The operation of an `air.` intrinsic name, without its accuracy prefix.
+fn air_operation(name: &str) -> Option<&str> {
+    let operation = name.strip_prefix("air.")?.split('.').next()?;
+    Some(
+        operation
+            .strip_prefix("fast_")
+            .or_else(|| operation.strip_prefix("precise_"))
+            .unwrap_or(operation),
+    )
+}
+
+/// `value` in every lane of a floating scalar or vector type.
+fn float_splat(ty: &Type, value: f64) -> Result<Operand, TranslateError> {
+    match ty {
+        Type::Float { bits: 16 } => Ok(Operand::Float {
+            ty: ty.clone(),
+            bits: u64::from(half::f16::from_f64(value).to_bits()),
+        }),
+        Type::Float { bits: 32 } => Ok(Operand::Float {
+            ty: ty.clone(),
+            bits: u64::from((value as f32).to_bits()),
+        }),
+        Type::Float { bits: 64 } => Ok(Operand::Float {
+            ty: ty.clone(),
+            bits: value.to_bits(),
+        }),
+        Type::Vector { element, lanes } => Ok(Operand::Composite {
+            ty: ty.clone(),
+            elements: vec![float_splat(element, value)?; usize::from(*lanes)],
+        }),
+        _ => Err(semantic("AIR floating intrinsic has a non-floating type")),
+    }
+}
+
 /// Decode an AIR intrinsic name into a Metal IR operation.
 ///
 /// AIR names are `air.<operation>[.<type suffix>]*`, where the operation may
@@ -507,6 +565,20 @@ pub(super) fn air_texture_intrinsic(
                     value => {
                         return Err(semantic(format!(
                             "AIR intrinsic air.{operation} has trailing operand {value}, which needs Metal IR lowering"
+                        )));
+                    }
+                },
+                rest => rest,
+            };
+            // Newer AIR ends with a minimum level-of-detail clamp, where 0
+            // clamps nothing; Metal IR has no clamp to carry another.
+            let levels = usize::from(gradient.is_none()) * 2;
+            let rest = match rest {
+                [head @ .., clamp] if head.len() == levels => match clamp {
+                    Operand::Float { bits: 0, .. } => head,
+                    _ => {
+                        return Err(semantic(format!(
+                            "AIR intrinsic air.{operation} has a minimum level-of-detail clamp, which needs Metal IR lowering"
                         )));
                     }
                 },

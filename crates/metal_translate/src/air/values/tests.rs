@@ -398,6 +398,8 @@ fn lowers_extractelement_36_98_using_values_not_record_pattern() {
                 parameter_types: &[1],
                 result_type: 0,
                 opaque_types: &HashMap::new(),
+                callees: None,
+                inline_samplers: &[],
             },
         )
         .unwrap();
@@ -469,6 +471,8 @@ fn a_switch_expands_into_a_chain_of_comparisons() {
                 parameter_types: &[],
                 result_type: 2,
                 opaque_types: &HashMap::new(),
+                callees: None,
+                inline_samplers: &[],
             },
         )
         .unwrap();
@@ -552,6 +556,8 @@ fn lowers_multiple_blocks_with_a_phi_and_a_forward_reference() {
                 parameter_types: &[],
                 result_type: 2,
                 opaque_types: &HashMap::new(),
+                callees: None,
+                inline_samplers: &[],
             },
         )
         .unwrap();
@@ -621,6 +627,8 @@ fn rejects_a_forward_reference_whose_declared_type_is_wrong() {
                     parameter_types: &[],
                     result_type: 2,
                     opaque_types: &HashMap::new(),
+                    callees: None,
+                    inline_samplers: &[],
                 },
             )
             .is_err()
@@ -650,6 +658,8 @@ fn lowers_integer_resize_and_checks_its_direction() {
                 parameter_types: &[0],
                 result_type: 1,
                 opaque_types: &HashMap::new(),
+                callees: None,
+                inline_samplers: &[],
             },
         )
         .unwrap();
@@ -673,6 +683,8 @@ fn lowers_integer_resize_and_checks_its_direction() {
                     parameter_types: &[0],
                     result_type: 1,
                     opaque_types: &HashMap::new(),
+                    callees: None,
+                    inline_samplers: &[],
                 }
             )
             .is_err()
@@ -709,6 +721,8 @@ fn lowers_a_modern_load_with_an_explicit_result_type() {
                 parameter_types: &[1],
                 result_type: 0,
                 opaque_types: &HashMap::new(),
+                callees: None,
+                inline_samplers: &[],
             },
         )
         .unwrap();
@@ -729,6 +743,8 @@ fn lowers_a_modern_load_with_an_explicit_result_type() {
                     parameter_types: &[1],
                     result_type: 0,
                     opaque_types: &HashMap::new(),
+                    callees: None,
+                    inline_samplers: &[],
                 },
             )
             .is_err()
@@ -771,6 +787,8 @@ fn extraction_uses_constant_contents_and_rejects_bad_indices() {
                 parameter_types: &[1],
                 result_type: 0,
                 opaque_types: &HashMap::new(),
+                callees: None,
+                inline_samplers: &[],
             },
         )
         .unwrap();
@@ -789,6 +807,8 @@ fn extraction_uses_constant_contents_and_rejects_bad_indices() {
                     parameter_types: &[1],
                     result_type: 0,
                     opaque_types: &HashMap::new(),
+                    callees: None,
+                    inline_samplers: &[],
                 }
             )
             .is_err()
@@ -804,6 +824,8 @@ fn extraction_uses_constant_contents_and_rejects_bad_indices() {
                     parameter_types: &[1],
                     result_type: 0,
                     opaque_types: &HashMap::new(),
+                    callees: None,
+                    inline_samplers: &[],
                 }
             )
             .is_err()

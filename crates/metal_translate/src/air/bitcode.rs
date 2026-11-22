@@ -24,46 +24,40 @@ pub(super) fn parse_minimal_store_bitcode(bitcode: &Bitcode) -> Result<Module, T
     let string_table = descendant_block(&bitcode.elements, 23)
         .and_then(|block| first_payload(block, 1))
         .and_then(payload_bytes);
-    let legacy_names = legacy_function_names(module_block);
+    let names = module_value_names(module_block, string_table.as_deref());
+    let prefix = string_table_prefix(string_table.as_deref());
     let function_records: Vec<_> = all_function_records
         .iter()
         .enumerate()
-        // LLVM's older AIR writer puts `isproto` in field 2, while the
-        // string-table layout used by the initial fixture puts it in field 4.
-        .filter(|(_, record)| {
-            if string_table.is_some() {
-                record.fields().get(4) == Some(&0)
-            } else {
-                record.fields().get(2) == Some(&0)
-            }
-        })
+        // `[type, cc, isproto, ...]`, after the string-table prefix.
+        .filter(|(_, record)| record.fields().get(prefix + 2) == Some(&0))
         .collect();
     if function_blocks.len() != function_records.len() || function_records.is_empty() {
         return Err(semantic(
             "LLVM defined-function records do not match their function bodies",
         ));
     }
-    // The libraries in some applications are written by the older AIR producer.
     // Decode the tables before looking at a body: unlike the tiny LLVM 19
-    // fixture below, its function type and entry-point contract are not
-    // recoverable from a few strings.
-    if string_table.is_none()
-        && child_block(&module_block.elements, 17).is_some()
+    // fixture below, a real library's function type and entry-point contract
+    // are not recoverable from a few strings. That decoder reads pointee types
+    // from typed pointers, which Apple's AIR keeps; the fixture has opaque ones.
+    if let Some(type_table) = child_block(&module_block.elements, 17)
+        && !has_opaque_pointers(type_table)
         && metadata_entry_stage(module_block).is_some()
     {
         return parse_packed_air(
             module_block,
             &function_records,
             &function_blocks,
-            &legacy_names,
+            &names,
+            prefix,
         );
     }
     let entry_index = function_records
         .iter()
         .position(|(ordinal, record)| {
             let value_id = function_value_id(module_block, *ordinal).unwrap_or(*ordinal);
-            resolve_function_name(record, value_id, string_table.as_deref(), &legacy_names)
-                .as_deref()
+            resolve_function_name(record, value_id, string_table.as_deref(), &names).as_deref()
                 == Some("main0")
         })
         .or_else(|| (function_records.len() == 1).then_some(0))
@@ -73,7 +67,7 @@ pub(super) fn parse_minimal_store_bitcode(bitcode: &Bitcode) -> Result<Module, T
         function_value_id(module_block, function_records[entry_index].0)
             .unwrap_or(function_records[entry_index].0),
         string_table.as_deref(),
-        &legacy_names,
+        &names,
     )
     .ok_or_else(|| semantic("LLVM entry function has no resolvable name"))?;
 
@@ -202,7 +196,8 @@ fn parse_packed_air(
     module_block: &BitcodeBlock,
     function_records: &[(usize, &&llvm_bitcode::bitcode::Record)],
     function_blocks: &[&BitcodeBlock],
-    legacy_names: &HashMap<usize, String>,
+    names: &HashMap<usize, String>,
+    prefix: usize,
 ) -> Result<Module, TranslateError> {
     let types = decode_type_table(
         child_block(&module_block.elements, 17)
@@ -227,14 +222,14 @@ fn parse_packed_air(
     // the function records: module globals share that numbering, so a kernel
     // whose module declares `threadgroup` arrays was taking the name of the
     // first of them.
-    let name = legacy_names
+    let name = names
         .get(&interface.function)
         .cloned()
         .ok_or_else(|| semantic("packed AIR entry has no value-symbol name"))?;
     let signature_index = usize::try_from(
         *record
             .fields()
-            .first()
+            .get(prefix)
             .ok_or_else(|| semantic("packed AIR function has no type"))?,
     )
     .map_err(|_| semantic("packed AIR function type does not fit in memory"))?;
@@ -256,32 +251,68 @@ fn parse_packed_air(
         )));
     };
     let body = function_blocks[entry];
+    let callees = Callees {
+        module_block,
+        function_records,
+        function_blocks,
+        types: &types,
+        names,
+        prefix,
+        lowered: Default::default(),
+        active: Default::default(),
+    };
     let value_table = values::ValueTable::decode(module_block, body, &types, parameters)?;
+    let inline_samplers = metadata.inline_sampler_states();
+    let mut inline_resources = Vec::new();
+    for (position, &state) in inline_samplers.iter().enumerate() {
+        let word = value_table
+            .global_initializer(state)
+            .ok_or_else(|| semantic("AIR sampler state has no initializer"))
+            .and_then(|initializer| value_table.integer(initializer, &types))
+            .map_err(|_| semantic("AIR sampler state is not one 64-bit word"))?;
+        let index = u32::try_from(position)
+            .ok()
+            .and_then(|position| position.checked_add(crate::ir::INLINE_SAMPLER_BASE))
+            .ok_or_else(|| semantic("AIR module has too many inline samplers"))?;
+        inline_resources.push(Resource {
+            argument: (parameters.len() + position) as u32,
+            kind: ResourceKind::Sampler,
+            index,
+            count: 1,
+            access: Access::Read,
+            ty: Type::Sampler,
+            name: names.get(&state).cloned(),
+            inline_sampler: Some(super::sampler_state::decode(word)?),
+        });
+    }
     let opaque_types = interface
         .resources
         .iter()
         .filter_map(|resource| Some((resource.argument, resource.ty.clone()?)))
         .collect();
     let sections = section_names(module_block);
-    let globals = value_table.global_variables(&types, legacy_names, &sections)?;
+    let globals = value_table.global_variables(&types, names, &sections)?;
     let static_initializers = static_initializers(
         module_block,
         function_records,
         function_blocks,
         &types,
-        legacy_names,
+        names,
         &sections,
         entry,
+        prefix,
     )?;
     let function = value_table.lower_body(
         body,
         &types,
         &values::Signature {
-            names: legacy_names,
+            names,
             name,
             parameter_types: parameters,
             result_type: *result,
             opaque_types: &opaque_types,
+            callees: Some(&callees),
+            inline_samplers: &inline_samplers,
         },
     )?;
     let resources = interface
@@ -303,6 +334,7 @@ fn parse_packed_air(
                 inline_sampler: None,
             })
         })
+        .chain(inline_resources.into_iter().map(Ok))
         .collect::<Result<Vec<_>, TranslateError>>()?;
     // The metadata numbers outputs by position whatever the function returns;
     // an entry returning one unwrapped value has no field to name.
@@ -356,8 +388,8 @@ pub(super) fn section_name(field: u64, sections: &[String]) -> Option<&str> {
 ///
 /// They compute a module's derived constants into its globals before an
 /// entry point runs, and [`crate::specialize()`] runs them. A function
-/// record's section is its seventh field in the layout Apple's AIR writer
-/// uses: `[type, cc, isproto, linkage, paramattr, alignment, section, ...]`.
+/// record is `[type, cc, isproto, linkage, paramattr, alignment, section, ...]`
+/// after its string-table prefix.
 fn static_initializers(
     module_block: &BitcodeBlock,
     function_records: &[(usize, &&llvm_bitcode::bitcode::Record)],
@@ -366,25 +398,18 @@ fn static_initializers(
     names: &HashMap<usize, String>,
     sections: &[String],
     entry: usize,
+    prefix: usize,
 ) -> Result<Vec<crate::ir::Function>, TranslateError> {
     let mut initializers = Vec::new();
     for (position, (ordinal, record)) in function_records.iter().enumerate() {
-        let section = record.fields().get(6).copied().unwrap_or(0);
+        let section = record.fields().get(prefix + 6).copied().unwrap_or(0);
         if position == entry || section_name(section, sections) != Some("air.static_init") {
             continue;
         }
         let name = function_value_id(module_block, *ordinal)
             .and_then(|value| names.get(&value).cloned())
             .unwrap_or_else(|| format!("static initializer {position}"));
-        let signature = record
-            .fields()
-            .first()
-            .and_then(|index| types.get(usize::try_from(*index).ok()?));
-        let signature = match signature {
-            Some(DecodedType::Pointer { pointee, .. }) => types.get(*pointee),
-            signature => signature,
-        };
-        let Some(DecodedType::Function { parameters, result }) = signature else {
+        let Some((parameters, result)) = function_signature(record, types, prefix) else {
             return Err(semantic(format!(
                 "static initializer {name} has no function type"
             )));
@@ -404,12 +429,101 @@ fn static_initializers(
                 names,
                 name,
                 parameter_types: parameters,
-                result_type: *result,
+                result_type: result,
                 opaque_types: &no_opaque_types,
+                callees: None,
+                inline_samplers: &[],
             },
         )?);
     }
     Ok(initializers)
+}
+
+/// A function record's parameter types and result type.
+fn function_signature<'t>(
+    record: &llvm_bitcode::bitcode::Record,
+    types: &'t [DecodedType],
+    prefix: usize,
+) -> Option<(&'t [usize], usize)> {
+    let signature = types.get(usize::try_from(*record.fields().get(prefix)?).ok()?)?;
+    // Old LLVM module records name the pointer-to-function type.
+    let signature = match signature {
+        DecodedType::Pointer { pointee, .. } => types.get(*pointee)?,
+        signature => signature,
+    };
+    match signature {
+        DecodedType::Function { parameters, result } => Some((parameters, *result)),
+        _ => None,
+    }
+}
+
+/// The functions a module defines besides its entry point, lowered on demand
+/// for a call to inline: Metal IR has no call.
+pub(super) struct Callees<'a> {
+    module_block: &'a BitcodeBlock,
+    function_records: &'a [(usize, &'a &'a llvm_bitcode::bitcode::Record)],
+    function_blocks: &'a [&'a BitcodeBlock],
+    types: &'a [DecodedType],
+    names: &'a HashMap<usize, String>,
+    prefix: usize,
+    lowered: std::cell::RefCell<HashMap<usize, std::rc::Rc<Function>>>,
+    /// The callees being lowered, outermost first.
+    active: std::cell::RefCell<Vec<usize>>,
+}
+
+impl Callees<'_> {
+    /// The lowered body of the function module value `value` names, or `None`
+    /// when it is only a declaration, such as an AIR intrinsic.
+    pub(super) fn lower(
+        &self,
+        value: usize,
+    ) -> Result<Option<std::rc::Rc<Function>>, TranslateError> {
+        if let Some(function) = self.lowered.borrow().get(&value) {
+            return Ok(Some(function.clone()));
+        }
+        let Some(position) =
+            function_record_ordinal(self.module_block, value).and_then(|ordinal| {
+                self.function_records
+                    .iter()
+                    .position(|(record, _)| *record == ordinal)
+            })
+        else {
+            return Ok(None);
+        };
+        let name = self
+            .names
+            .get(&value)
+            .cloned()
+            .ok_or_else(|| semantic("AIR callee has no name"))?;
+        if self.active.borrow().contains(&value) {
+            return Err(semantic(format!(
+                "AIR function {name} calls itself, which Metal forbids"
+            )));
+        }
+        let (parameters, result) =
+            function_signature(self.function_records[position].1, self.types, self.prefix)
+                .ok_or_else(|| semantic(format!("AIR function {name} has no function type")))?;
+        let body = self.function_blocks[position];
+        let table = values::ValueTable::decode(self.module_block, body, self.types, parameters)?;
+        self.active.borrow_mut().push(value);
+        let lowered = table.lower_body(
+            body,
+            self.types,
+            &values::Signature {
+                names: self.names,
+                name,
+                parameter_types: parameters,
+                result_type: result,
+                opaque_types: &HashMap::new(),
+                callees: Some(self),
+                inline_samplers: &[],
+            },
+        );
+        self.active.borrow_mut().pop();
+        let function = std::rc::Rc::new(lowered?);
+        self.lowered.borrow_mut().insert(value, function.clone());
+        Ok(Some(function))
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -727,19 +841,64 @@ fn resolve_function_name(
     record: &llvm_bitcode::bitcode::Record,
     value_id: usize,
     string_table: Option<&[u8]>,
-    legacy_names: &HashMap<usize, String>,
+    names: &HashMap<usize, String>,
 ) -> Option<String> {
-    if let Some(string_table) = string_table {
-        let offset = usize::try_from(*record.fields().first()?).ok()?;
-        let length = usize::try_from(*record.fields().get(1)?).ok()?;
-        return std::str::from_utf8(string_table.get(offset..offset.checked_add(length)?)?)
-            .ok()
-            .map(str::to_owned);
+    match string_table {
+        Some(string_table) => string_table_name(record, string_table),
+        None => names.get(&value_id).cloned(),
     }
-    legacy_names.get(&value_id).cloned()
 }
 
-fn legacy_function_names(module_block: &BitcodeBlock) -> HashMap<usize, String> {
+fn has_opaque_pointers(type_table: &BitcodeBlock) -> bool {
+    const TYPE_CODE_OPAQUE_POINTER: u64 = 25;
+    type_table
+        .elements
+        .iter()
+        .filter_map(BitcodeElement::as_record)
+        .any(|record| record.id == TYPE_CODE_OPAQUE_POINTER)
+}
+
+/// The fields a string-table module puts before a module value record's own:
+/// the offset and size of its name in STRINGTABLE_BLOCK.
+fn string_table_prefix(string_table: Option<&[u8]>) -> usize {
+    match string_table {
+        Some(_) => 2,
+        None => 0,
+    }
+}
+
+fn string_table_name(
+    record: &llvm_bitcode::bitcode::Record,
+    string_table: &[u8],
+) -> Option<String> {
+    let offset = usize::try_from(*record.fields().first()?).ok()?;
+    let length = usize::try_from(*record.fields().get(1)?).ok()?;
+    std::str::from_utf8(string_table.get(offset..offset.checked_add(length)?)?)
+        .ok()
+        .map(str::to_owned)
+}
+
+/// Every named module value, keyed by its module value id.
+fn module_value_names(
+    module_block: &BitcodeBlock,
+    string_table: Option<&[u8]>,
+) -> HashMap<usize, String> {
+    match string_table {
+        Some(string_table) => module_block
+            .elements
+            .iter()
+            .filter_map(BitcodeElement::as_record)
+            // The records which allocate a module-level value id.
+            .filter(|record| matches!(record.id, 7 | 8 | 9 | 14 | 18))
+            .enumerate()
+            .filter_map(|(value, record)| Some((value, string_table_name(record, string_table)?)))
+            .filter(|(_, name)| !name.is_empty())
+            .collect(),
+        None => value_symbol_names(module_block),
+    }
+}
+
+fn value_symbol_names(module_block: &BitcodeBlock) -> HashMap<usize, String> {
     let Some(symbol_table) = child_block(&module_block.elements, 14) else {
         return HashMap::new();
     };
@@ -866,7 +1025,7 @@ mod tests {
         fields.extend(b"kernel".iter().copied().map(u64::from));
         let module = bitcode_block(block(8, vec![block(14, vec![record(3, &fields)])]));
         assert_eq!(
-            legacy_function_names(&module).get(&7),
+            value_symbol_names(&module).get(&7),
             Some(&"kernel".to_string())
         );
     }

@@ -63,7 +63,7 @@ owned_ttf_parser = "0.25"
 tiny-skia = { version = "0.11.4", default-features = false, features = ["std", "simd"] }
 ab_glyph_rasterizer = "0.1.9"
 rust-fontconfig = { version = "5.0.1", default-features = false, features = ["std", "parsing", "multithreading"] }
-llvm-bitcode = "0.4.0"
+llvm-bitcode = "0.4.2"
 rspirv = "0.13.0"
 sha2 = "0.11.0"
 sha1 = "0.11.0"

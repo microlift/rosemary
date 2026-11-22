@@ -90,69 +90,77 @@ impl BodyLowering<'_> {
         Ok(Lowered::Value(ty, kind))
     }
 
+    /// `CMP` and `CMP2`: `[lhs(+type), rhs, predicate, fast-math flags?]`.
+    /// The flags describe optimization latitude, not a different comparison.
     pub(super) fn compare(
         &mut self,
-        lhs: &u64,
-        rhs: &u64,
-        predicate: &u64,
         record: &llvm_bitcode::bitcode::Record,
         fields: &[u64],
     ) -> Result<Lowered, TranslateError> {
-        let (ty, kind) = {
-            let (ty, lhs) = match fields {
-                [_, declared, _, _] => self.operand(*lhs, Some(declared), record, fields)?,
-                _ => self.operand(*lhs, None, record, fields)?,
-            };
-            let (rhs_ty, rhs) = self.operand(*rhs, None, record, fields)?;
-            if ty != rhs_ty {
-                return Err(semantic("LLVM comparison type mismatch"));
-            }
-            let scalar = match self.types[ty] {
-                DecodedType::Vector { element, .. } => &self.types[element],
-                _ => &self.types[ty],
-            };
-            let kind = match scalar {
-                DecodedType::Float(_) => InstructionKind::FloatCompare {
-                    predicate: float_predicate(*predicate)?,
-                    lhs,
-                    rhs,
-                },
-                DecodedType::Integer(_) => InstructionKind::IntegerCompare {
-                    predicate: integer_predicate(*predicate)?,
-                    lhs,
-                    rhs,
-                },
-                _ => return Err(semantic("LLVM comparison operand is not numeric")),
-            };
-            (boolean_type(ty, self.types)?, kind)
+        let (lhs, declared, rest) = self.typed_operand_fields(fields)?;
+        let ([rhs, predicate] | [rhs, predicate, _]) = rest else {
+            return Err(semantic(format!(
+                "LLVM comparison record has operands {fields:?}"
+            )));
         };
-        Ok(Lowered::Value(ty, kind))
+        let (ty, lhs) = self.operand(*lhs, declared, record, fields)?;
+        // Both operands have one type, so a forward right operand has no type
+        // of its own.
+        let (rhs_ty, rhs) = self.operand(*rhs, Some(&(ty as u64)), record, fields)?;
+        if ty != rhs_ty {
+            return Err(semantic("LLVM comparison type mismatch"));
+        }
+        let scalar = match self.types[ty] {
+            DecodedType::Vector { element, .. } => &self.types[element],
+            _ => &self.types[ty],
+        };
+        let kind = match scalar {
+            DecodedType::Float(_) => InstructionKind::FloatCompare {
+                predicate: float_predicate(*predicate)?,
+                lhs,
+                rhs,
+            },
+            DecodedType::Integer(_) => InstructionKind::IntegerCompare {
+                predicate: integer_predicate(*predicate)?,
+                lhs,
+                rhs,
+            },
+            _ => return Err(semantic("LLVM comparison operand is not numeric")),
+        };
+        Ok(Lowered::Value(boolean_type(ty, self.types)?, kind))
     }
 
+    /// `VSELECT`: `[true(+type), false, condition(+type), fast-math flags?]`.
     pub(super) fn select(
         &mut self,
-        on_true: &u64,
-        on_false: &u64,
-        condition: &u64,
         record: &llvm_bitcode::bitcode::Record,
         fields: &[u64],
     ) -> Result<Lowered, TranslateError> {
-        let (ty, kind) = {
-            let (ty, on_true) = self.operand(*on_true, None, record, fields)?;
-            let (false_ty, on_false) = self.operand(*on_false, None, record, fields)?;
-            let (_, condition) = self.operand(*condition, None, record, fields)?;
-            if ty != false_ty {
-                return Err(semantic("LLVM select type mismatch"));
-            }
-            (
-                ty,
-                InstructionKind::Select {
-                    condition,
-                    on_true,
-                    on_false,
-                },
-            )
+        let (on_true, declared, rest) = self.typed_operand_fields(fields)?;
+        let [on_false, rest @ ..] = rest else {
+            return Err(semantic(format!(
+                "LLVM select record has operands {fields:?}"
+            )));
         };
-        Ok(Lowered::Value(ty, kind))
+        let (condition, condition_declared, rest) = self.typed_operand_fields(rest)?;
+        if rest.len() > 1 {
+            return Err(semantic(format!(
+                "LLVM select record has operands {fields:?}"
+            )));
+        }
+        let (ty, on_true) = self.operand(*on_true, declared, record, fields)?;
+        let (false_ty, on_false) = self.operand(*on_false, Some(&(ty as u64)), record, fields)?;
+        let (_, condition) = self.operand(*condition, condition_declared, record, fields)?;
+        if ty != false_ty {
+            return Err(semantic("LLVM select type mismatch"));
+        }
+        Ok(Lowered::Value(
+            ty,
+            InstructionKind::Select {
+                condition,
+                on_true,
+                on_false,
+            },
+        ))
     }
 }

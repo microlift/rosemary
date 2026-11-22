@@ -4,6 +4,7 @@ mod arith;
 mod call;
 mod composite;
 mod control;
+mod inline;
 mod memory;
 
 /// The bit of an LLVM call's marker field which says a function type precedes
@@ -57,6 +58,18 @@ struct BodyLowering<'a> {
     /// The value id the first instruction result of this body takes, for
     /// counting how far lowering got when a record needs work.
     first_result: usize,
+    callees: Option<&'a super::super::bitcode::Callees<'a>>,
+    /// The texel of each texture access whose result also carries a status,
+    /// by the LLVM value of that result.
+    texels_with_status: HashMap<usize, Operand>,
+    /// Blocks made by inlining, numbered from the LLVM blocks' end in the
+    /// order they are made.
+    inlined_blocks: Vec<Block>,
+    /// The part of the LLVM block being lowered before its first inlined
+    /// call, and the branch into that callee.
+    split: Option<(Vec<Instruction>, Terminator)>,
+    /// The block the rest of the LLVM block goes to after an inlined call.
+    continuation: Option<BlockId>,
 }
 
 impl ValueTable {
@@ -77,6 +90,8 @@ impl ValueTable {
             parameter_types,
             result_type,
             opaque_types,
+            callees,
+            inline_samplers,
         } = signature;
         let name = name.clone();
         let records: Vec<_> = body
@@ -161,6 +176,16 @@ impl ValueTable {
             });
             operands.insert(self.argument_start + index, Operand::Value(value));
         }
+        for &state in inline_samplers {
+            let value = ValueId(function.values.len() as u32);
+            function.values.push(Type::Sampler);
+            function.parameters.push(Parameter {
+                value,
+                name: format!("inline_sampler{}", function.parameters.len()),
+                ty: Type::Sampler,
+            });
+            operands.insert(state, Operand::Value(value));
+        }
         // Composite constants need instructions. They are emitted at the head
         // of the entry block so every later use is dominated by them.
         let mut constants = Vec::new();
@@ -182,7 +207,15 @@ impl ValueTable {
             block_index: 0,
             block_count,
             first_result,
+            callees,
+            texels_with_status: HashMap::new(),
+            inlined_blocks: Vec::new(),
+            split: None,
+            continuation: None,
         };
+        // The block each LLVM block's terminator ended up in, when an inlined
+        // call moved it out of the block's own.
+        let mut moved_terminators = HashMap::new();
         for (block_index, block) in block_records.iter().enumerate() {
             lowering.block_index = block_index;
             lowering.instructions = Vec::new();
@@ -212,19 +245,43 @@ impl ValueTable {
                 )?;
                 lowering.table.values.push(Value { ty, constant: None });
             }
-            blocks.push(Block {
-                id: BlockId(block_index as u32),
-                name: if block_index == 0 {
-                    "entry".to_string()
-                } else {
-                    format!("block{block_index}")
-                },
-                instructions: std::mem::take(&mut lowering.instructions),
-                terminator: lowering
-                    .terminator
-                    .take()
-                    .ok_or_else(|| semantic("LLVM basic block has no terminator"))?,
-            });
+            let name = if block_index == 0 {
+                "entry".to_string()
+            } else {
+                format!("block{block_index}")
+            };
+            let instructions = std::mem::take(&mut lowering.instructions);
+            let terminator = lowering
+                .terminator
+                .take()
+                .ok_or_else(|| semantic("LLVM basic block has no terminator"))?;
+            match lowering.split.take() {
+                None => blocks.push(Block {
+                    id: BlockId(block_index as u32),
+                    name,
+                    instructions,
+                    terminator,
+                }),
+                Some((head, into_callee)) => {
+                    let continuation = lowering
+                        .continuation
+                        .take()
+                        .ok_or_else(|| semantic("inlined call has no continuation"))?;
+                    lowering.inlined_blocks.push(Block {
+                        id: continuation,
+                        name: format!("{name}_after_call"),
+                        instructions,
+                        terminator,
+                    });
+                    blocks.push(Block {
+                        id: BlockId(block_index as u32),
+                        name,
+                        instructions: head,
+                        terminator: into_callee,
+                    });
+                    moved_terminators.insert(BlockId(block_index as u32), continuation);
+                }
+            }
         }
         let BodyLowering {
             table,
@@ -233,6 +290,7 @@ impl ValueTable {
             forward,
             phi_fixups,
             switches,
+            mut inlined_blocks,
             ..
         } = lowering;
         if !forward.is_empty() {
@@ -265,7 +323,31 @@ impl ValueTable {
                 ));
             }
         }
-        for switch in switches {
+        // A phi names the block its value arrives from, which is the one now
+        // holding the predecessor's terminator.
+        for block in blocks.iter_mut().chain(&mut inlined_blocks) {
+            for instruction in &mut block.instructions {
+                if let InstructionKind::Phi { incomings } = &mut instruction.kind {
+                    for (predecessor, _) in incomings {
+                        if let Some(moved) = moved_terminators.get(predecessor) {
+                            *predecessor = *moved;
+                        }
+                    }
+                }
+            }
+        }
+        blocks.extend(inlined_blocks);
+        if blocks
+            .iter()
+            .enumerate()
+            .any(|(index, block)| block.id.0 as usize != index)
+        {
+            return Err(semantic("inlined blocks are not numbered in order"));
+        }
+        for mut switch in switches {
+            if let Some(moved) = moved_terminators.get(&BlockId(switch.block as u32)) {
+                switch.block = moved.0 as usize;
+            }
             expand_switch(&mut function, &mut blocks, switch);
         }
         constants.append(&mut blocks[0].instructions);
@@ -319,6 +401,24 @@ impl BodyLowering<'_> {
             }
         };
         Ok((ty, Operand::Value(value)))
+    }
+
+    /// Split one LLVM value-and-type operand off the front of `fields`. The
+    /// type is written only after a value the record stream has not reached.
+    fn typed_operand_fields<'f>(
+        &self,
+        fields: &'f [u64],
+    ) -> Result<(&'f u64, Option<&'f u64>, &'f [u64]), TranslateError> {
+        let [value, rest @ ..] = fields else {
+            return Err(semantic("LLVM record is missing an operand"));
+        };
+        if self.table.reference(*value)? < self.table.values.len() {
+            return Ok((value, None, rest));
+        }
+        let [declared, rest @ ..] = rest else {
+            return Err(semantic("LLVM forward operand has no type"));
+        };
+        Ok((value, Some(declared), rest))
     }
 
     /// Lower one LLVM body record.
@@ -389,16 +489,12 @@ impl BodyLowering<'_> {
             {
                 self.call(None, callee, args, record, fields)
             }
-            (9 | 28, [lhs, rhs, predicate] | [lhs, _, rhs, predicate]) => {
-                self.compare(lhs, rhs, predicate, record, fields)
-            }
+            (9 | 28, _) => self.compare(record, fields),
             (26, [aggregate, indices @ ..]) if !indices.is_empty() => {
                 self.extract_value(aggregate, indices, record, fields)
             }
             (27, rest) if rest.len() >= 3 => self.insert_value(rest, record, fields),
-            (29, [on_true, on_false, condition]) => {
-                self.select(on_true, on_false, condition, record, fields)
-            }
+            (29, _) => self.select(record, fields),
             (10, []) => self.return_void(),
             (10, [value]) => self.return_value(value, record, fields),
             (11, [target]) => self.branch(target),

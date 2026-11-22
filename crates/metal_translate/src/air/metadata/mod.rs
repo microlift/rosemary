@@ -85,7 +85,9 @@ impl Metadata {
                         named.insert(name, members);
                     }
                     // METADATA_KIND declares an attachment kind, not a value.
-                    6 => {}
+                    // METADATA_GLOBAL_DECL_ATTACHMENT, METADATA_INDEX_OFFSET and
+                    // METADATA_INDEX attach or locate values without creating one.
+                    6 | 36 | 38 | 39 => {}
                     // METADATA_VALUE: a module value wrapped as metadata.
                     2 => {
                         let fields = record_values(record);
@@ -173,6 +175,22 @@ impl Metadata {
             MetadataValue::Node(operands) => Some(operands),
             _ => None,
         }
+    }
+
+    /// The module values of the globals `!air.sampler_states` lists: each
+    /// `constexpr sampler`'s packed state.
+    pub(super) fn inline_sampler_states(&self) -> Vec<usize> {
+        self.named("air.sampler_states")
+            .unwrap_or_default()
+            .iter()
+            .filter_map(|&node| match self.node(node)? {
+                [_, Some(MetadataOperand::Metadata(value))] => match self.values.get(*value)? {
+                    MetadataValue::Value(id) => Some(*id),
+                    _ => None,
+                },
+                _ => None,
+            })
+            .collect()
     }
 
     pub(super) fn string(&self, index: usize) -> Option<&str> {

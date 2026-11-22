@@ -16,6 +16,7 @@ mod bitcode;
 #[cfg(test)]
 pub(crate) mod fixtures;
 mod metadata;
+mod sampler_state;
 mod text;
 mod values;
 

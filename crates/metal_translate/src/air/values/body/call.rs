@@ -30,6 +30,32 @@ impl BodyLowering<'_> {
                 .get(&callee)
                 .ok_or_else(|| semantic("LLVM call target has no name"))?
                 .clone();
+            if let Some(callees) = self.callees
+                && let Some(function) = callees.lower(callee)?
+            {
+                if args.len() != parameters.len() {
+                    return Err(semantic("LLVM call arity mismatch"));
+                }
+                let mut actual = Vec::new();
+                for (&arg, &expected) in args.iter().zip(parameters) {
+                    let (ty, value) = self.operand(arg, None, record, fields)?;
+                    if ty != expected {
+                        return Err(semantic("LLVM call argument type mismatch"));
+                    }
+                    actual.push(value);
+                }
+                let returns = self.inline(&function, actual)?;
+                if matches!(self.types[*result], DecodedType::Void) {
+                    return Ok(Lowered::Done);
+                }
+                if returns.is_empty() {
+                    return Err(semantic(format!("AIR function {name} never returns")));
+                }
+                return Ok(Lowered::Value(
+                    *result,
+                    InstructionKind::Phi { incomings: returns },
+                ));
+            }
             // `llvm.memcpy` declares byte pointers, so its
             // arguments never match the declaration by type. Metal
             // reaches it by assigning one whole structure, which
@@ -157,10 +183,36 @@ impl BodyLowering<'_> {
                     &mut self.instructions,
                 )?
             } else {
-                known_helper(&name, &actual).unwrap_or_else(|| air_intrinsic(&name, &actual))?
+                let result_type = ir_type(*result, self.types)?;
+                known_helper(&name, &actual)
+                    .or_else(|| typed_air_intrinsic(&name, &actual, &result_type))
+                    .unwrap_or_else(|| air_intrinsic(&name, &actual))?
             };
             if matches!(self.types[*result], DecodedType::Void) {
                 self.instructions.push(Instruction { result: None, kind });
+                return Ok(Lowered::Done);
+            }
+            // Newer AIR returns a sample or read with a status byte beside the
+            // texel. Only the texel can be taken out of it: what the status
+            // says is not known, so the value is never given an operand.
+            if let InstructionKind::TextureSample { .. } | InstructionKind::TextureRead { .. } =
+                kind
+                && let DecodedType::Struct { fields, .. } = &self.types[*result]
+                && let [texel, status] = fields[..]
+                && matches!(self.types[status], DecodedType::Integer(8))
+            {
+                let texel = emit(
+                    &mut self.function,
+                    &mut self.instructions,
+                    ir_type(texel, self.types)?,
+                    kind,
+                );
+                self.texels_with_status
+                    .insert(self.table.values.len(), texel);
+                self.table.values.push(Value {
+                    ty: *result,
+                    constant: None,
+                });
                 return Ok(Lowered::Done);
             }
             (*result, kind)
