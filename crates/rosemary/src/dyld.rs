@@ -417,6 +417,65 @@ impl LoadedImages {
             (held && !i.unloading.load(Ordering::Acquire)).then_some(i)
         })
     }
+
+    /// `name` in the loaded image of leaf name `named` (any, when `None`), or
+    /// in what that image re-exports.
+    fn resolve_in(
+        &self,
+        named: Option<&str>,
+        name: &str,
+        depth: usize,
+    ) -> Option<machish::resolve::Resolved> {
+        if depth > MAX_REEXPORT_DEPTH {
+            return None;
+        }
+        find(|image| {
+            if image.unloading.load(Ordering::Acquire) {
+                return None;
+            }
+            let is_named = named.is_some_and(|n| n == leaf(&image.path));
+            let own = (named.is_none() || is_named)
+                .then(|| image.exports.get(name))
+                .flatten()
+                // A re-export has no address of its own; see [`MainExports`].
+                .and_then(|export| Some((export.address(image.slide)?, export.kind)))
+                .map(|(addr, kind)| machish::resolve::Resolved {
+                    addr,
+                    kind: match kind {
+                        machish::exports::ExportKind::ThreadLocal => {
+                            machish::resolve::SymbolKind::ThreadLocal
+                        }
+                        _ => machish::resolve::SymbolKind::Function,
+                    },
+                    tag: 0,
+                });
+            // Then what it carried, which unloads with it and so is bound
+            // through it.
+            let found = own
+                .or_else(|| {
+                    image
+                        .linked
+                        .iter()
+                        .filter(|l| named.is_none_or(|n| l.answers_to(n)))
+                        .find_map(|l| l.resolve(&image.linked, name, 0))
+                })
+                // A re-export its own link did not map, because an earlier
+                // `dlopen` already had: dyld binds through it all the same.
+                .or_else(|| {
+                    is_named.then(|| {
+                        image
+                            .reexported_dylibs
+                            .iter()
+                            .find_map(|target| self.resolve_in(Some(leaf(target)), name, depth + 1))
+                    })?
+                })?;
+            let mut bound = self.bound.lock().unwrap_or_else(|e| e.into_inner());
+            if !bound.iter().any(|b| std::ptr::eq(*b, image)) {
+                bound.push(image);
+            }
+            Some(found)
+        })
+    }
 }
 
 impl machish::resolve::SymbolProvider for LoadedImages {
@@ -443,42 +502,7 @@ impl machish::resolve::SymbolProvider for LoadedImages {
         // A two-level reference is a claim about *which* image defines the
         // symbol, and honouring it is the whole reason `machish` carries the
         // library through to here.
-        let named = sym.library.install_name().map(leaf);
-        find(|image| {
-            if image.unloading.load(Ordering::Acquire) {
-                return None;
-            }
-            let own = named
-                .is_none_or(|n| n == leaf(&image.path))
-                .then(|| image.exports.get(sym.name))
-                .flatten()
-                // A re-export has no address of its own; see [`MainExports`].
-                .and_then(|export| Some((export.address(image.slide)?, export.kind)))
-                .map(|(addr, kind)| machish::resolve::Resolved {
-                    addr,
-                    kind: match kind {
-                        machish::exports::ExportKind::ThreadLocal => {
-                            machish::resolve::SymbolKind::ThreadLocal
-                        }
-                        _ => machish::resolve::SymbolKind::Function,
-                    },
-                    tag: 0,
-                });
-            // Then what it carried, which unloads with it and so is bound
-            // through it.
-            let found = own.or_else(|| {
-                image
-                    .linked
-                    .iter()
-                    .filter(|l| named.is_none_or(|n| l.answers_to(n)))
-                    .find_map(|l| l.resolve(&image.linked, sym.name, 0))
-            })?;
-            let mut bound = self.bound.lock().unwrap_or_else(|e| e.into_inner());
-            if !bound.iter().any(|b| std::ptr::eq(*b, image)) {
-                bound.push(image);
-            }
-            Some(found)
-        })
+        self.resolve_in(sym.library.install_name().map(leaf), sym.name, 0)
     }
 }
 

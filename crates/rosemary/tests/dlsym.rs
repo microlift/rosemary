@@ -215,3 +215,121 @@ fn a_rewritten_import_slot_rebinds_the_import() {
     assert_eq!(status, Some(0), "stderr: {err}");
     assert_eq!(out, "hooked 1\n", "stderr: {err}");
 }
+
+const REEXPORTED_IMPL_C: &str = r#"
+__attribute__((visibility("default"))) int impl_value(void) { return 42; }
+"#;
+
+/// Exports nothing of its own; everything comes from the library it re-exports.
+const REEXPORTING_STUB_C: &str = r#"
+__attribute__((visibility("default"))) void stub_dummy(void) {}
+"#;
+
+/// Linked against the stub, so its import of `impl_value` names the stub.
+const STUB_CLIENT_C: &str = r#"
+int impl_value(void);
+__attribute__((visibility("default"))) int client_value(void) { return impl_value(); }
+"#;
+
+/// Opens each argument by path, then calls into the client.
+const OPEN_THROUGH_STUB_C: &str = r#"
+#include <dlfcn.h>
+#include <stdio.h>
+
+int main(int argc, char **argv) {
+    for (int i = 1; i < argc; i++) {
+        if (!dlopen(argv[i], RTLD_NOW)) {
+            printf("%s\n", dlerror());
+            return 3;
+        }
+    }
+    int (*value)(void) = (int (*)(void))dlsym(RTLD_DEFAULT, "client_value");
+    printf("value %d\n", value ? value() : -1);
+    return 0;
+}
+"#;
+
+/// The implementation, the stub re-exporting it, the stub's client, and the
+/// program that opens them. The client finds the stub through its rpath; the
+/// stub has none, so only an image already loaded satisfies its re-export, as
+/// with Max for Live's `MaxAudioAPI` stub and `MaxAudioAPIImpl`.
+#[derive(Clone)]
+struct StubFixture {
+    implementation: String,
+    stub: String,
+    client: String,
+    guest: String,
+}
+
+/// Built once: the tests share the output paths.
+fn stub_fixture() -> Option<StubFixture> {
+    static BUILT: std::sync::OnceLock<Option<StubFixture>> = std::sync::OnceLock::new();
+    BUILT.get_or_init(build_stub_fixture).clone()
+}
+
+fn build_stub_fixture() -> Option<StubFixture> {
+    // Install names whose leaf is the file's own name, as a framework's is.
+    let implementation = common::build_x86_64(
+        "reexported_impl",
+        REEXPORTED_IMPL_C,
+        &["-dynamiclib", "-install_name", "@rpath/reexported_impl"],
+    )?;
+    let reexport = format!("-Wl,-reexport_library,{implementation}");
+    let stub = common::build_x86_64(
+        "reexporting_stub",
+        REEXPORTING_STUB_C,
+        &[
+            "-dynamiclib",
+            "-install_name",
+            "@rpath/reexporting_stub",
+            &reexport,
+        ],
+    )?;
+    // Shown to the static linker only: no rpath leads to it at run time.
+    let reexported_file = format!("-Wl,-dylib_file,@rpath/reexported_impl:{implementation}");
+    let directory = std::path::Path::new(&stub).parent()?.to_str()?;
+    let rpath = format!("-Wl,-rpath,{directory}");
+    let client = common::build_x86_64(
+        "stub_client",
+        STUB_CLIENT_C,
+        &[
+            "-dynamiclib",
+            "-install_name",
+            "@rpath/stub_client",
+            &reexported_file,
+            &rpath,
+            &stub,
+        ],
+    )?;
+    let guest = common::build_x86_64("open_through_stub", OPEN_THROUGH_STUB_C, &[])?;
+    Some(StubFixture {
+        implementation,
+        stub,
+        client,
+        guest,
+    })
+}
+
+/// The stub was opened on its own, before the client bound to it.
+#[test]
+fn a_library_binds_through_a_loaded_stub_to_what_it_reexports() {
+    let Some(f) = stub_fixture() else {
+        skip!("cannot build x86_64 fixtures")
+    };
+    let (status, out, err) =
+        common::run_guest_env(&[], &f.guest, &[&f.implementation, &f.stub, &f.client]);
+    assert_eq!(status, Some(0), "stdout: {out} stderr: {err}");
+    assert_eq!(out, "value 42\n", "stderr: {err}");
+}
+
+/// The client's own link maps the stub, and the stub's re-export is the image
+/// opened before.
+#[test]
+fn a_stub_linked_with_its_client_reexports_an_opened_library() {
+    let Some(f) = stub_fixture() else {
+        skip!("cannot build x86_64 fixtures")
+    };
+    let (status, out, err) = common::run_guest_env(&[], &f.guest, &[&f.implementation, &f.client]);
+    assert_eq!(status, Some(0), "stdout: {out} stderr: {err}");
+    assert_eq!(out, "value 42\n", "stderr: {err}");
+}
