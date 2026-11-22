@@ -31,6 +31,7 @@ security.workspace = true
 gamecontroller.workspace = true
 webkit.workspace = true
 coreanalytics.workspace = true
+coremidi.workspace = true
 forcefeedback.workspace = true
 network.workspace = true
 opencl.workspace = true

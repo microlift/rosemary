@@ -275,8 +275,14 @@ fn proc_for(id: *mut c_void) -> Option<Arc<Mutex<Proc>>> {
 struct Listener {
     object: ObjectId,
     selector: u32,
+    /// The procedure, or for a block listener the block the caller passed,
+    /// which is what a removal names it by.
     call: usize,
+    /// The client data, or for a block listener its dispatch queue.
     client_data: usize,
+    /// A block listener's own copy, released when it is removed; zero for a
+    /// procedure.
+    block: u64,
 }
 
 static LISTENERS: Mutex<Vec<Listener>> = Mutex::new(Vec::new());
@@ -761,8 +767,81 @@ pub unsafe extern "C" fn AudioObjectAddPropertyListener(
             selector: address.selector,
             call: listener as usize,
             client_data: client_data as usize,
+            block: 0,
         });
     SUCCESS
+}
+
+/// `OSStatus AudioObjectAddPropertyListenerBlock(AudioObjectID,
+/// const AudioObjectPropertyAddress *, dispatch_queue_t,
+/// AudioObjectPropertyListenerBlock)`
+///
+/// # Safety
+///
+/// `address` is null or readable; `block` is null or a block.
+pub unsafe extern "C" fn AudioObjectAddPropertyListenerBlock(
+    object: ObjectId,
+    address: *const Address,
+    queue: u64,
+    block: u64,
+) -> i32 {
+    if address.is_null() || block == 0 {
+        return crate::status::PARAM_ERROR;
+    }
+    if !known(object) {
+        return BAD_OBJECT;
+    }
+    let Some(copy) = darwin::dispatch::block::copy(block) else {
+        return crate::status::PARAM_ERROR;
+    };
+    // SAFETY: the caller states it is readable.
+    let address = unsafe { *address };
+    LISTENERS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .push(Listener {
+            object,
+            selector: address.selector,
+            call: block as usize,
+            client_data: queue as usize,
+            block: copy,
+        });
+    SUCCESS
+}
+
+/// `OSStatus AudioObjectRemovePropertyListenerBlock(AudioObjectID,
+/// const AudioObjectPropertyAddress *, dispatch_queue_t,
+/// AudioObjectPropertyListenerBlock)`, given the block that was added.
+///
+/// # Safety
+///
+/// `address` is null or readable.
+pub unsafe extern "C" fn AudioObjectRemovePropertyListenerBlock(
+    object: ObjectId,
+    address: *const Address,
+    queue: u64,
+    block: u64,
+) -> i32 {
+    if address.is_null() {
+        return crate::status::PARAM_ERROR;
+    }
+    // SAFETY: the caller states it is readable.
+    let address = unsafe { *address };
+    let mut listeners = LISTENERS.lock().unwrap_or_else(|e| e.into_inner());
+    let found = listeners.iter().position(|l| {
+        l.block != 0
+            && l.object == object
+            && l.selector == address.selector
+            && l.call == block as usize
+            && l.client_data == queue as usize
+    });
+    match found {
+        Some(index) => {
+            darwin::dispatch::block::release(listeners.remove(index).block);
+            SUCCESS
+        }
+        None => crate::status::INVALID_PARAMETER,
+    }
 }
 
 /// `OSStatus AudioObjectRemovePropertyListener(...)`
@@ -783,7 +862,8 @@ pub unsafe extern "C" fn AudioObjectRemovePropertyListener(
     let mut listeners = LISTENERS.lock().unwrap_or_else(|e| e.into_inner());
     let before = listeners.len();
     listeners.retain(|l| {
-        !(l.object == object
+        !(l.block == 0
+            && l.object == object
             && l.selector == address.selector
             && l.call == listener as usize
             && l.client_data == client_data as usize)

@@ -20,6 +20,10 @@ const STATIC_CODE_NOT_FOUND: OSStatus = -67068;
 const UNSIGNED: OSStatus = -67062;
 /// `errSecCSReqFailed`: the code does not satisfy the requirement.
 const REQ_FAILED: OSStatus = -67050;
+/// `errSecCSReqInvalid`: a requirement that cannot be read.
+const REQ_INVALID: OSStatus = -67052;
+/// `errSecCSUnimplemented`.
+const UNIMPLEMENTED: OSStatus = -67072;
 
 /// `CSMAGIC_EMBEDDED_SIGNATURE`: the superblob `LC_CODE_SIGNATURE` points at.
 const CSMAGIC_EMBEDDED_SIGNATURE: u32 = 0xfade_0cc0;
@@ -29,6 +33,8 @@ const CSMAGIC_EMBEDDED_ENTITLEMENTS: u32 = 0xfade_7171;
 const CSMAGIC_CODEDIRECTORY: u32 = 0xfade_0c02;
 /// `CSSLOT_CODEDIRECTORY`.
 const CSSLOT_CODEDIRECTORY: u32 = 0;
+/// `CSSLOT_REQUIREMENTS`.
+const CSSLOT_REQUIREMENTS: u32 = 2;
 /// `CSSLOT_ENTITLEMENTS`.
 const CSSLOT_ENTITLEMENTS: u32 = 5;
 /// Where `CS_CodeDirectory.identOffset` sits: after `magic`, `length`,
@@ -37,14 +43,21 @@ const CODEDIRECTORY_IDENT_OFFSET: usize = 20;
 
 /// A `SecCodeRef` or a `SecRequirementRef`.
 ///
-/// One class for both: nothing here tells them apart, and a guest holds each
-/// only to pass it back. The payload is what the handle was made from - the
-/// requirement's text, or the running program's path - so that a report can say
-/// which requirement was not met rather than only that one was not.
+/// One class for both, told apart by `kind`. The payload is what the handle was
+/// made from - the requirement's text, or the code's path - so that a report can
+/// say which requirement was not met rather than only that one was not.
 #[repr(C)]
 struct Body {
     isa: *const Class,
+    kind: Kind,
     description: CFTypeRef,
+}
+
+#[derive(Clone, Copy, PartialEq)]
+#[repr(u8)]
+enum Kind {
+    Code,
+    Requirement,
 }
 
 fn class() -> &'static Class {
@@ -73,14 +86,17 @@ unsafe extern "C" fn dealloc(receiver: Id, _sel: objc::sel::Sel) {
 }
 
 /// A handle carrying `description`, owned by the caller.
-fn new(description: CFTypeRef) -> CFTypeRef {
+fn new(kind: Kind, description: CFTypeRef) -> CFTypeRef {
     // SAFETY: `Body` is the registered layout.
     let body = unsafe { corefoundation::base::allocate::<Body>(class()) };
     if body.is_null() {
         return std::ptr::null();
     }
     // SAFETY: a freshly allocated body.
-    unsafe { (*body).description = description };
+    unsafe {
+        (*body).kind = kind;
+        (*body).description = description;
+    }
     body as CFTypeRef
 }
 
@@ -89,6 +105,16 @@ fn new(description: CFTypeRef) -> CFTypeRef {
 /// `object` is null or an object this runtime allocated.
 unsafe fn is_ours(object: CFTypeRef) -> bool {
     unsafe { corefoundation::base::is_kind_of(object, class()) }
+}
+
+/// Whether `object` is one of this module's handles of `kind`.
+///
+/// # Safety
+///
+/// `object` is null or an object this runtime allocated.
+unsafe fn is(object: CFTypeRef, kind: Kind) -> bool {
+    // SAFETY: as the caller states; the layout is this class's once it is ours.
+    unsafe { is_ours(object) && (*(object as *const Body)).kind == kind }
 }
 
 /// `OSStatus SecRequirementCreateWithString(CFStringRef text, SecCSFlags flags,
@@ -115,29 +141,116 @@ pub unsafe extern "C" fn SecRequirementCreateWithString(
     }
     let held = objc::arc::retain(text as Id) as CFTypeRef;
     // SAFETY: the caller states it is writable.
-    unsafe { *requirement = new(held) };
+    unsafe { *requirement = new(Kind::Requirement, held) };
     SUCCESS
 }
 
 /// `OSStatus SecRequirementCreateWithData(CFDataRef data, SecCSFlags flags,
 /// SecRequirementRef *requirement)`
 ///
-/// The compiled form of the same thing. Kept with no description, because the
-/// bytes are a requirement blob this tree does not decode.
+/// The compiled form of the same thing, kept as its text. A blob this tree
+/// cannot decode is kept with no description, so it still checks the way any
+/// other requirement does - see [`SecCodeCheckValidity`].
 ///
 /// # Safety
 ///
-/// As [`SecRequirementCreateWithString`].
+/// As [`SecRequirementCreateWithString`]; `data` is null or a CF object.
 pub unsafe extern "C" fn SecRequirementCreateWithData(
-    _data: CFTypeRef,
+    data: CFTypeRef,
     _flags: u32,
     requirement: *mut CFTypeRef,
 ) -> OSStatus {
     if requirement.is_null() {
         return PARAM;
     }
+    // SAFETY: as the caller states.
+    let text = unsafe { corefoundation::collections::data(data) }
+        .and_then(|bytes| crate::requirement::decompile(bytes))
+        .map_or(std::ptr::null(), |text| {
+            corefoundation::string::from_bytes(text.as_bytes(), false)
+        });
     // SAFETY: the caller states it is writable.
-    unsafe { *requirement = new(std::ptr::null()) };
+    unsafe { *requirement = new(Kind::Requirement, text) };
+    SUCCESS
+}
+
+/// `OSStatus SecRequirementCopyString(SecRequirementRef requirement,
+/// SecCSFlags flags, CFStringRef *text)`
+///
+/// FIXME (ACCURACY): a requirement made from text answers that text as given,
+/// where macOS answers its canonical spelling (compiled, then written out).
+///
+/// # Safety
+///
+/// `requirement` is null or an object this runtime allocated; `text` is null
+/// or writable.
+pub unsafe extern "C" fn SecRequirementCopyString(
+    requirement: CFTypeRef,
+    _flags: u32,
+    text: *mut CFTypeRef,
+) -> OSStatus {
+    if text.is_null() {
+        return PARAM;
+    }
+    // SAFETY: as the caller states.
+    if !unsafe { is(requirement, Kind::Requirement) } {
+        return INVALID_OBJECT_REF;
+    }
+    // SAFETY: one of this module's handles.
+    let description = unsafe { (*(requirement as *const Body)).description };
+    if description.is_null() {
+        return REQ_INVALID;
+    }
+    // SAFETY: the caller states it is writable; the copy is the caller's.
+    unsafe { *text = objc::arc::retain(description as Id) as CFTypeRef };
+    SUCCESS
+}
+
+/// `OSStatus SecCodeCopyDesignatedRequirement(SecStaticCodeRef code,
+/// SecCSFlags flags, SecRequirementRef *requirement)`
+///
+/// The explicit designated requirement the code's signature carries, read from
+/// its requirement set.
+///
+/// # Safety
+///
+/// `code` is null or an object this runtime allocated; `requirement` is null or
+/// writable.
+pub unsafe extern "C" fn SecCodeCopyDesignatedRequirement(
+    code: CFTypeRef,
+    _flags: u32,
+    requirement: *mut CFTypeRef,
+) -> OSStatus {
+    if requirement.is_null() {
+        return OBJECT_REQUIRED;
+    }
+    // SAFETY: as the caller states.
+    if !unsafe { is(code, Kind::Code) } {
+        return INVALID_OBJECT_REF;
+    }
+    // SAFETY: a code handle, whose description is its path.
+    let Some(path) = (unsafe { description(code) }) else {
+        return INVALID_OBJECT_REF;
+    };
+    let Ok(bytes) = read_code(&path) else {
+        return STATIC_CODE_NOT_FOUND;
+    };
+    let Some(signature) = superblob(&bytes) else {
+        return UNSIGNED;
+    };
+    let explicit = blob_in_slot(signature, CSSLOT_REQUIREMENTS)
+        .and_then(|set| crate::requirement::in_set(set, crate::requirement::DESIGNATED));
+    // Without an explicit one macOS synthesizes it from the certificate chain,
+    // which this does not read.
+    let Some(explicit) = explicit else {
+        return UNIMPLEMENTED;
+    };
+    let Some(text) = crate::requirement::decompile(explicit) else {
+        return REQ_INVALID;
+    };
+    let text = corefoundation::string::from_bytes(text.as_bytes(), false);
+    // SAFETY: the caller states it is writable.
+    unsafe { *requirement = new(Kind::Requirement, text) };
     SUCCESS
 }
 
@@ -150,12 +263,10 @@ pub unsafe extern "C" fn SecCodeCopySelf(_flags: u32, out: *mut CFTypeRef) -> OS
     if out.is_null() {
         return PARAM;
     }
-    let path = std::env::current_exe()
-        .map(|path| path.to_string_lossy().into_owned())
-        .unwrap_or_default();
+    let path = darwin::process::me().map(|me| me.path).unwrap_or_default();
     let description = corefoundation::string::from_bytes(path.as_bytes(), false);
     // SAFETY: the caller states it is writable.
-    unsafe { *out = new(description) };
+    unsafe { *out = new(Kind::Code, description) };
     SUCCESS
 }
 
@@ -212,12 +323,12 @@ pub unsafe extern "C" fn SecStaticCodeCreateWithPath(
     else {
         return PARAM;
     };
-    if !std::path::Path::new(&path).exists() {
+    if !prefix::ns::existing_host_path(&path).exists() {
         return STATIC_CODE_NOT_FOUND;
     }
     let description = corefoundation::string::from_bytes(path.as_bytes(), false);
     // SAFETY: the caller states it is writable.
-    unsafe { *out = new(description) };
+    unsafe { *out = new(Kind::Code, description) };
     SUCCESS
 }
 
@@ -274,7 +385,7 @@ pub unsafe extern "C" fn SecStaticCodeCheckValidityWithErrors(
     let Some(path) = path else {
         return INVALID_OBJECT_REF;
     };
-    let Ok(bytes) = std::fs::read(&path) else {
+    let Ok(bytes) = read_code(&path) else {
         return STATIC_CODE_NOT_FOUND;
     };
     match entitlements(&bytes) {
@@ -282,6 +393,11 @@ pub unsafe extern "C" fn SecStaticCodeCheckValidityWithErrors(
         Some(held) if held.get(&entitlement).is_some() => SUCCESS,
         Some(_) => REQ_FAILED,
     }
+}
+
+/// The bytes of the code at `path`, as the guest spells it.
+pub(crate) fn read_code(path: &str) -> std::io::Result<Vec<u8>> {
+    std::fs::read(prefix::ns::existing_host_path(path))
 }
 
 /// The text a handle was made from.
@@ -400,6 +516,8 @@ exports::exports! {
         "SecStaticCodeCheckValidityWithErrors" => SecStaticCodeCheckValidityWithErrors,
         "SecRequirementCreateWithString" => SecRequirementCreateWithString,
         "SecRequirementCreateWithData" => SecRequirementCreateWithData,
+        "SecRequirementCopyString" => SecRequirementCopyString,
+        "SecCodeCopyDesignatedRequirement" => SecCodeCopyDesignatedRequirement,
         "SecCodeCopySelf" => SecCodeCopySelf,
         "SecCodeCheckValidity" => SecCodeCheckValidity,
     }

@@ -843,6 +843,8 @@ exports::exports! {
         "AudioObjectSetPropertyData" => hal::AudioObjectSetPropertyData,
         "AudioObjectAddPropertyListener" => hal::AudioObjectAddPropertyListener,
         "AudioObjectRemovePropertyListener" => hal::AudioObjectRemovePropertyListener,
+        "AudioObjectAddPropertyListenerBlock" => hal::AudioObjectAddPropertyListenerBlock,
+        "AudioObjectRemovePropertyListenerBlock" => hal::AudioObjectRemovePropertyListenerBlock,
         "AudioHardwareUnload" => hal::AudioHardwareUnload,
         "AudioHardwareGetPropertyInfo" => hal::AudioHardwareGetPropertyInfo,
         "AudioHardwareGetProperty" => hal::AudioHardwareGetProperty,

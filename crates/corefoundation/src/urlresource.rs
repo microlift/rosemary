@@ -78,6 +78,7 @@ pub const KEYS: &[(&str, &str)] = &[
     ("_kCFURLParentDirectoryURLKey", PARENT_DIRECTORY_URL),
     ("_NSURLParentDirectoryURLKey", PARENT_DIRECTORY_URL),
     ("_kCFURLTagNamesKey", TAG_NAMES),
+    ("_kCFURLIsExcludedFromBackupKey", IS_EXCLUDED_FROM_BACKUP),
     ("_NSURLTagNamesKey", TAG_NAMES),
     ("_kCFURLVolumeIsInternalKey", VOLUME_IS_INTERNAL),
     ("_NSURLVolumeIsInternalKey", VOLUME_IS_INTERNAL),
@@ -143,6 +144,7 @@ const IS_APPLICATION: &str = "NSURLIsApplicationKey";
 const TYPE_IDENTIFIER: &str = "NSURLTypeIdentifierKey";
 const PARENT_DIRECTORY_URL: &str = "NSURLParentDirectoryURLKey";
 const TAG_NAMES: &str = "NSURLTagNamesKey";
+const IS_EXCLUDED_FROM_BACKUP: &str = "NSURLIsExcludedFromBackupKey";
 const VOLUME_IS_INTERNAL: &str = "NSURLVolumeIsInternalKey";
 const VOLUME_IS_LOCAL: &str = "NSURLVolumeIsLocalKey";
 const VOLUME_SUPPORTS_CASE_SENSITIVE_NAMES: &str = "NSURLVolumeSupportsCaseSensitiveNamesKey";
@@ -478,6 +480,42 @@ pub unsafe extern "C" fn CFURLCopyResourcePropertyForKey(
         false => unsafe { *out = value },
     }
     1
+}
+
+/// `Boolean CFURLSetResourcePropertyForKey(CFURLRef, CFStringRef key,
+/// CFTypeRef propertyValue, CFErrorRef *error)`
+///
+/// Exclusion from backup is granted as asked: there is no backup on this host
+/// to take part in. Any other property is refused, and named once on stderr,
+/// rather than reported as set.
+///
+/// # Safety
+///
+/// `url` and `key` are null or objects this runtime allocated; `error` is null
+/// or writable for one pointer.
+pub unsafe extern "C" fn CFURLSetResourcePropertyForKey(
+    url: CFTypeRef,
+    key: CFTypeRef,
+    _value: CFTypeRef,
+    error: *mut CFTypeRef,
+) -> Boolean {
+    if !error.is_null() {
+        // SAFETY: the caller states it is writable.
+        unsafe { *error = std::ptr::null() };
+    }
+    let (Some(_), Some(key)) = (unsafe { path_of(url) }, unsafe { text_of(key) }) else {
+        return 0;
+    };
+    if key == IS_EXCLUDED_FROM_BACKUP {
+        return 1;
+    }
+    static REFUSED: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+    let mut refused = REFUSED.lock().unwrap_or_else(|e| e.into_inner());
+    if !refused.contains(&key) {
+        eprintln!("rosemary: corefoundation: CFURLSetResourcePropertyForKey refused {key}");
+        refused.push(key);
+    }
+    0
 }
 
 /// `CFDictionaryRef CFURLCopyResourcePropertiesForKeys(CFURLRef, CFArrayRef
@@ -950,6 +988,7 @@ pub unsafe extern "C" fn CFURLEnumeratorSkipDescendents(enumerator: CFTypeRef) {
 exports::exports! {
     functions {
         "CFURLCopyResourcePropertyForKey" => CFURLCopyResourcePropertyForKey,
+        "CFURLSetResourcePropertyForKey" => CFURLSetResourcePropertyForKey,
         "CFURLCopyResourcePropertiesForKeys" => CFURLCopyResourcePropertiesForKeys,
         "CFURLCreateFromFileSystemRepresentation" => CFURLCreateFromFileSystemRepresentation,
         "CFURLCreateFromFileSystemRepresentationRelativeToBase" => CFURLCreateFromFileSystemRepresentationRelativeToBase,

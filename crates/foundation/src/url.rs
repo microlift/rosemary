@@ -975,6 +975,91 @@ unsafe extern "C" fn url_by_resolving_symlinks_in_path(receiver: Id, sel: Sel) -
     }
 }
 
+/// `NSFileReadUnknownError` and `NSFileReadNoSuchFileError`.
+const FILE_READ_UNKNOWN: i64 = 256;
+const FILE_READ_NO_SUCH_FILE: i64 = 260;
+/// `kIsAlias` in the Finder flags, the big-endian word at byte 8 of the
+/// Finder info.
+const FINDER_FLAGS: std::ops::Range<usize> = 8..10;
+const IS_ALIAS: u16 = 0x8000;
+/// The first word of bookmark data.
+const BOOKMARK_MAGIC: &[u8] = b"book";
+
+/// `+bookmarkDataWithContentsOfURL:error:`: the bookmark an alias file holds.
+///
+/// A Finder alias is a file flagged as one whose contents are its bookmark.
+/// FIXME (ACCURACY): an alias of the pre-10.6 kind, whose record is in the
+/// resource fork, is read as a file that is not an alias.
+unsafe extern "C" fn bookmark_data_with_contents_of_url(
+    _class: Id,
+    _sel: Sel,
+    url: Id,
+    error: *mut Id,
+) -> Id {
+    // `autoreleased` is an error the caller does not own.
+    let fail = |autoreleased: Id| {
+        if !error.is_null() {
+            // SAFETY: the caller's `NSError **`.
+            unsafe { *error = autoreleased };
+        }
+        std::ptr::null_mut()
+    };
+    // SAFETY: an `NSURL`, or nil.
+    let Some(path) = (unsafe { file_path_of(url) }) else {
+        return fail(crate::error::make(
+            "NSCocoaErrorDomain",
+            FILE_READ_UNKNOWN,
+            "The file couldn\u{2019}t be opened.",
+        ));
+    };
+    let contents = match std::fs::read(prefix::ns::existing_host_path(&path)) {
+        Ok(contents) => Some(contents),
+        Err(cause) if cause.kind() == std::io::ErrorKind::NotFound => {
+            let name = path.rsplit('/').next().unwrap_or_default();
+            let description = format!(
+                "The file \u{201c}{name}\u{201d} couldn\u{2019}t be opened because there is no such file."
+            );
+            let shown = crate::string::from_str(&path);
+            let underlying = crate::error::make(
+                "NSPOSIXErrorDomain",
+                i64::from(darwin::errno::from_host(libc::ENOENT)),
+                &cause.to_string(),
+            );
+            let entries = [
+                ("NSFilePath", shown),
+                ("NSURL", url),
+                ("NSUnderlyingError", underlying),
+            ];
+            let made = crate::error::create(
+                "NSCocoaErrorDomain",
+                FILE_READ_NO_SUCH_FILE,
+                &description,
+                &entries,
+            );
+            objc::arc::release(shown);
+            return fail(objc::arc::autorelease(made));
+        }
+        Err(_) => None,
+    };
+    let alias = std::ffi::CString::new(path.as_bytes())
+        .ok()
+        .and_then(|guest| darwin::xattr::read(&guest, c"com.apple.FinderInfo"))
+        .and_then(|info| Some(u16::from_be_bytes(info.get(FINDER_FLAGS)?.try_into().ok()?)))
+        .is_some_and(|flags| flags & IS_ALIAS != 0);
+    match contents {
+        Some(contents) if alias && contents.starts_with(BOOKMARK_MAGIC) => {
+            let data = corefoundation::collections::new_data(contents);
+            // SAFETY: a fresh data object.
+            unsafe { corefoundation::api::CFAutorelease(data) as Id }
+        }
+        _ => fail(crate::error::make(
+            "NSCocoaErrorDomain",
+            FILE_READ_UNKNOWN,
+            "The file couldn\u{2019}t be opened.",
+        )),
+    }
+}
+
 pub(crate) fn install() {
     let class = corefoundation::url::class();
     // On `NSURL` rather than on the concrete class, so `+URLWithString:` reaches
@@ -989,6 +1074,8 @@ pub(crate) fn install() {
         "fileURLWithPath:isDirectory:relativeToURL:"
             => file_url_with_path_is_directory_relative_to_url, c"@36@0:8@16c24@28";
         "URLWithString:relativeToURL:" => url_with_string_relative_to_url, c"@32@0:8@16@24";
+        "bookmarkDataWithContentsOfURL:error:" => bookmark_data_with_contents_of_url,
+            c"@32@0:8@16^@24";
     });
     methods!(abstract_class, {
         "initWithString:" => init_with_string, c"@24@0:8@16";

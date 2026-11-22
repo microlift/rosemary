@@ -56,6 +56,11 @@ pub struct MenuItem {
     represented: Id,
     /// `-allowsKeyEquivalentWhenHidden`.
     key_equivalent_when_hidden: usize,
+    /// The inverse of `-allowsAutomaticKeyEquivalentLocalization`, so that a
+    /// new item has the default YES. Kept and not acted on: key equivalents
+    /// here are matched by character, with no keyboard-layout remapping to
+    /// turn off.
+    no_key_equivalent_localization: usize,
 }
 
 pub const MENU_INSTANCE_SIZE: usize = size_of::<Menu>();
@@ -520,6 +525,18 @@ unsafe extern "C" fn set_allows_key_equivalent_when_hidden(receiver: Id, _sel: S
     item_of(receiver).key_equivalent_when_hidden = allows as usize;
 }
 
+unsafe extern "C" fn allows_automatic_key_equivalent_localization(receiver: Id, _sel: Sel) -> u8 {
+    (item_of(receiver).no_key_equivalent_localization == 0) as u8
+}
+
+unsafe extern "C" fn set_allows_automatic_key_equivalent_localization(
+    receiver: Id,
+    _sel: Sel,
+    allows: u8,
+) {
+    item_of(receiver).no_key_equivalent_localization = (allows == 0) as usize;
+}
+
 /// The requests that describe how a menu *looks*, which nothing here draws.
 /// `+[NSMenuItem separatorItem]`, the divider in a menu.
 ///
@@ -821,6 +838,10 @@ pub(crate) fn install() {
         "setHidden:" => set_hidden, c"v20@0:8c16";
         "allowsKeyEquivalentWhenHidden" => allows_key_equivalent_when_hidden, c"c16@0:8";
         "setAllowsKeyEquivalentWhenHidden:" => set_allows_key_equivalent_when_hidden, c"v20@0:8c16";
+        "allowsAutomaticKeyEquivalentLocalization" => allows_automatic_key_equivalent_localization,
+            c"c16@0:8";
+        "setAllowsAutomaticKeyEquivalentLocalization:"
+            => set_allows_automatic_key_equivalent_localization, c"v20@0:8c16";
         "setKeyEquivalentModifierMask:" => set_key_equivalent_modifier_mask, c"v24@0:8Q16";
         "keyEquivalentModifierMask" => key_equivalent_modifier_mask, c"Q16@0:8";
         "userKeyEquivalent" => user_key_equivalent, c"@16@0:8";

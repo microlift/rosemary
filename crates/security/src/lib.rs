@@ -1,11 +1,14 @@
 pub mod codesign;
 pub mod keychain;
+mod requirement;
+pub mod status;
 pub mod task;
 pub mod trust;
 
 exports::group! {
     codesign,
     keychain,
+    status,
     task,
     trust,
 }

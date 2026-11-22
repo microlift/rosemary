@@ -1957,6 +1957,7 @@ fn delegate_selector(name: &str) -> &'static str {
         "NSWindowWillMiniaturizeNotification" => "windowWillMiniaturize:",
         "NSWindowWillMoveNotification" => "windowWillMove:",
         "NSWindowDidChangeOcclusionStateNotification" => "windowDidChangeOcclusionState:",
+        "NSWindowDidUpdateNotification" => "windowDidUpdate:",
         other => objc::fail!("appkit::event: {other} has no delegate method in this table"),
     }
 }

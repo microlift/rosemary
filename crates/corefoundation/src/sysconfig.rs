@@ -808,6 +808,13 @@ const KEY_STRINGS: &[(&str, &str)] = &[
     // The keys of the proxies entity, which a browser reads at startup.
     ("_kSCEntNetProxies", "Proxies"),
     ("_kSCPropNetProxiesExceptionsList", "ExceptionsList"),
+    (
+        "_kSCPropNetProxiesExcludeSimpleHostnames",
+        "ExcludeSimpleHostnames",
+    ),
+    ("_kSCPropNetProxiesGopherEnable", "GopherEnable"),
+    ("_kSCPropNetProxiesGopherPort", "GopherPort"),
+    ("_kSCPropNetProxiesGopherProxy", "GopherProxy"),
     ("_kSCPropNetProxiesFTPEnable", "FTPEnable"),
     ("_kSCPropNetProxiesFTPPort", "FTPPort"),
     ("_kSCPropNetProxiesFTPProxy", "FTPProxy"),

@@ -31,6 +31,8 @@ pub struct Layer {
     opaque: u8,
     needs_display: u8,
     needs_layout: u8,
+    /// `-needsDisplayOnBoundsChange`.
+    needs_display_on_bounds_change: u8,
 }
 
 pub const INSTANCE_SIZE: usize = size_of::<Layer>();
@@ -43,6 +45,9 @@ struct MetalLayer {
     drawable_size: NSSize,
     framebuffer_only: u8,
     display_sync_enabled: u8,
+    /// The inverse of `-allowsNextDrawableTimeout`, so that a layer made with
+    /// `alloc`/`init` has the default YES.
+    no_next_drawable_timeout: u8,
 }
 
 pub const METAL_INSTANCE_SIZE: usize = size_of::<MetalLayer>();
@@ -76,6 +81,7 @@ unsafe extern "C" fn new_layer(class: Id, _sel: Sel) -> Id {
     layer.opaque = 0;
     layer.needs_display = 0;
     layer.needs_layout = 0;
+    layer.needs_display_on_bounds_change = 0;
     if objc::class::lookup(c"CAMetalLayer").is_some_and(|metal| {
         // SAFETY: the receiver of a class method is a class object.
         unsafe { objc::class::from_ptr(class as *const objc::class::Class) }.is_some_and(|actual| {
@@ -150,7 +156,18 @@ pub(crate) fn bounds_of(layer: Id) -> NSRect {
 
 pub(crate) fn set_bounds_of(layer: Id, bounds: NSRect) {
     if is_layer(layer) {
-        layer_of(layer).bounds = bounds;
+        store_bounds(layer, bounds);
+    }
+}
+
+/// Set `-bounds`, and ask for display when the layer was told to on a change.
+fn store_bounds(receiver: Id, bounds: NSRect) {
+    let layer = layer_of(receiver);
+    let changed = layer.bounds != bounds;
+    layer.bounds = bounds;
+    if changed && layer.needs_display_on_bounds_change != 0 {
+        // SAFETY: a layer of this crate's.
+        unsafe { set_needs_display(receiver, objc::sel::get("setNeedsDisplay")) };
     }
 }
 
@@ -264,8 +281,16 @@ unsafe extern "C" fn bounds(receiver: Id, _sel: Sel) -> NSRect {
 }
 
 unsafe extern "C" fn set_bounds(receiver: Id, _sel: Sel, bounds: NSRect) {
-    layer_of(receiver).bounds = bounds;
+    store_bounds(receiver, bounds);
     crate::coreanimation::changed(receiver);
+}
+
+unsafe extern "C" fn set_needs_display_on_bounds_change(receiver: Id, _sel: Sel, value: u8) {
+    layer_of(receiver).needs_display_on_bounds_change = u8::from(value != 0);
+}
+
+unsafe extern "C" fn needs_display_on_bounds_change(receiver: Id, _sel: Sel) -> u8 {
+    layer_of(receiver).needs_display_on_bounds_change
 }
 
 unsafe extern "C" fn set_delegate(receiver: Id, _sel: Sel, delegate: Id) {
@@ -572,6 +597,14 @@ unsafe extern "C" fn display_sync_enabled(receiver: Id, _sel: Sel) -> u8 {
     metal_layer_of(receiver).display_sync_enabled
 }
 
+unsafe extern "C" fn set_allows_next_drawable_timeout(receiver: Id, _sel: Sel, value: u8) {
+    metal_layer_of(receiver).no_next_drawable_timeout = u8::from(value == 0);
+}
+
+unsafe extern "C" fn allows_next_drawable_timeout(receiver: Id, _sel: Sel) -> u8 {
+    u8::from(metal_layer_of(receiver).no_next_drawable_timeout == 0)
+}
+
 pub(crate) fn install() {
     let class = objc::class::lookup(c"CALayer").expect("declared before its methods");
     class_methods!(class, {
@@ -592,6 +625,8 @@ pub(crate) fn install() {
         "drawInContext:" => draw_in_context, c"v24@0:8^{CGContext=}16";
         "setNeedsDisplay" => set_needs_display, c"v16@0:8";
         "needsDisplay" => needs_display, c"c16@0:8";
+        "setNeedsDisplayOnBoundsChange:" => set_needs_display_on_bounds_change, c"v20@0:8c16";
+        "needsDisplayOnBoundsChange" => needs_display_on_bounds_change, c"c16@0:8";
         "displayIfNeeded" => display_if_needed, c"v16@0:8";
         "layoutSublayers" => layout_sublayers, c"v16@0:8";
         "setNeedsLayout" => set_needs_layout, c"v16@0:8";
@@ -618,6 +653,8 @@ pub(crate) fn install() {
         "framebufferOnly" => framebuffer_only, c"c16@0:8";
         "setDisplaySyncEnabled:" => set_display_sync_enabled, c"v20@0:8c16";
         "displaySyncEnabled" => display_sync_enabled, c"c16@0:8";
+        "setAllowsNextDrawableTimeout:" => set_allows_next_drawable_timeout, c"v20@0:8c16";
+        "allowsNextDrawableTimeout" => allows_next_drawable_timeout, c"c16@0:8";
         // Presentation here never joins a Core Animation transaction, and
         // every drawable is presented in the colour space it was drawn in.
         "setPresentsWithTransaction:" => ignore_flag, c"v20@0:8c16";

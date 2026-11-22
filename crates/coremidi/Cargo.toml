@@ -1,0 +1,14 @@
+[package]
+name = "coremidi"
+description = "CoreMIDI framework reimplementation: clients, ports and packet lists, with no devices"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+exports.workspace = true
+corefoundation.workspace = true
+darwin.workspace = true
+
+[lints]
+workspace = true

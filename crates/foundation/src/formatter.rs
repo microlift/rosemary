@@ -191,10 +191,31 @@ impl NumberFormat {
         self.settings.grouping_size.unwrap_or(3)
     }
 
+    fn maximum_fraction_digits(&self) -> usize {
+        let default = match self.style {
+            number_style::DECIMAL => 3,
+            _ => 0,
+        };
+        self.settings.maximum_fraction_digits.unwrap_or(default)
+    }
+
+    fn minimum_fraction_digits(&self) -> usize {
+        self.settings.minimum_fraction_digits.unwrap_or(0)
+    }
+
     /// Whether the Objective-C settings shape the digits, which they do for
     /// the plain and decimal styles; the others keep [`NumberFormat::format`].
     fn digit_style(&self) -> bool {
         matches!(self.style, number_style::NONE | number_style::DECIMAL)
+    }
+
+    /// `value` as the CF entry points write it, which honour the same digit
+    /// settings as `-stringFromNumber:`.
+    fn format_value(&self, value: f64, integral: bool) -> String {
+        match self.digit_style() {
+            true => self.format_decimal(&crate::decimal::Decimal::from_f64(value)),
+            false => self.format(value, integral),
+        }
     }
 
     /// `-stringFromNumber:` for the plain and decimal styles: `value` rounded
@@ -208,10 +229,8 @@ impl NumberFormat {
         }
         let decimal = self.style == number_style::DECIMAL;
         let settings = &self.settings;
-        let maximum = settings
-            .maximum_fraction_digits
-            .unwrap_or(if decimal { 3 } else { 0 });
-        let minimum = settings.minimum_fraction_digits.unwrap_or(0).min(maximum);
+        let maximum = self.maximum_fraction_digits();
+        let minimum = self.minimum_fraction_digits().min(maximum);
         let grouping = settings.uses_grouping_separator.unwrap_or(decimal);
         let size = self.grouping_size();
         let scale = i16::try_from(maximum).unwrap_or(i16::MAX - 1);
@@ -772,14 +791,7 @@ mod number_api {
     }
 
     unsafe extern "C" fn maximum_fraction_digits(receiver: Id, _sel: Sel) -> usize {
-        with_format!(receiver, 0, |f| f
-            .settings
-            .maximum_fraction_digits
-            .unwrap_or(if f.style == number_style::DECIMAL {
-                3
-            } else {
-                0
-            }))
+        with_format!(receiver, 0, |f| f.maximum_fraction_digits())
     }
 
     unsafe extern "C" fn set_minimum_fraction_digits(receiver: Id, _sel: Sel, digits: usize) {
@@ -788,10 +800,7 @@ mod number_api {
     }
 
     unsafe extern "C" fn minimum_fraction_digits(receiver: Id, _sel: Sel) -> usize {
-        with_format!(receiver, 0, |f| f
-            .settings
-            .minimum_fraction_digits
-            .unwrap_or(0))
+        with_format!(receiver, 0, |f| f.minimum_fraction_digits())
     }
 
     unsafe extern "C" fn set_uses_grouping_separator(receiver: Id, _sel: Sel, on: u8) {
@@ -1053,11 +1062,9 @@ pub mod cf {
     /// `void CFNumberFormatterSetProperty(CFNumberFormatterRef, CFStringRef key,
     /// CFTypeRef value)`
     ///
-    /// The currency symbol is the one property this honours, because it is the
-    /// one a caller sets: a price in a currency other than the locale's cannot be
-    /// written without it. Any other key is ignored rather than refused - a
-    /// formatter setting this tree does not model is a difference in the output,
-    /// not a reason to stop the guest.
+    /// Honours the currency symbol and the fraction digits. Any other key is
+    /// ignored rather than refused - a formatter setting this tree does not
+    /// model is a difference in the output, not a reason to stop the guest.
     ///
     /// # Safety
     ///
@@ -1074,11 +1081,20 @@ pub mod cf {
         };
         // SAFETY: as above - an `NSString` or nil.
         let key = unsafe { crate::string::bytes(key as Id) };
-        if key.as_slice() != CURRENCY_SYMBOL.as_bytes() {
-            return;
+        // SAFETY: as above - a `CFNumber` or nil for the digit keys.
+        let digits = || {
+            unsafe { corefoundation::collections::number(value) }
+                .and_then(|n| usize::try_from(n.as_i64()).ok())
+        };
+        match std::str::from_utf8(&key) {
+            Ok(CURRENCY_SYMBOL) => {
+                let text = unsafe { crate::string::bytes(value as Id) };
+                format.currency_symbol = String::from_utf8(text).ok();
+            }
+            Ok(MAX_FRACTION_DIGITS) => format.settings.maximum_fraction_digits = digits(),
+            Ok(MIN_FRACTION_DIGITS) => format.settings.minimum_fraction_digits = digits(),
+            _ => {}
         }
-        let text = unsafe { crate::string::bytes(value as Id) };
-        format.currency_symbol = String::from_utf8(text).ok();
     }
 
     /// `CFTypeRef CFNumberFormatterCopyProperty(CFNumberFormatterRef,
@@ -1104,6 +1120,16 @@ pub mod cf {
         match std::str::from_utf8(&key) {
             Ok(GROUPING_SIZE) => corefoundation::collections::new_number(
                 corefoundation::collections::Number::Integer(format.grouping_size() as i64),
+            ),
+            Ok(MAX_FRACTION_DIGITS) => corefoundation::collections::new_number(
+                corefoundation::collections::Number::Integer(
+                    format.maximum_fraction_digits() as i64
+                ),
+            ),
+            Ok(MIN_FRACTION_DIGITS) => corefoundation::collections::new_number(
+                corefoundation::collections::Number::Integer(
+                    format.minimum_fraction_digits() as i64
+                ),
             ),
             Ok(CURRENCY_SYMBOL) => format
                 .currency_symbol
@@ -1135,7 +1161,8 @@ pub mod cf {
         let Some(value) = (unsafe { corefoundation::collections::number(number) }) else {
             return std::ptr::null();
         };
-        crate::string::from_str(&format.format(value.as_f64(), !value.is_float())) as CFTypeRef
+        crate::string::from_str(&format.format_value(value.as_f64(), !value.is_float()))
+            as CFTypeRef
     }
 
     /// `CFStringRef CFNumberFormatterCreateStringWithValue(CFAllocatorRef,
@@ -1179,7 +1206,7 @@ pub mod cf {
                 ((raw << shift) >> shift) as f64
             }
         };
-        crate::string::from_str(&format.format(number, !is_float)) as CFTypeRef
+        crate::string::from_str(&format.format_value(number, !is_float)) as CFTypeRef
     }
 
     /// `CFDateFormatterRef CFDateFormatterCreate(CFAllocatorRef, CFLocaleRef,
@@ -1674,6 +1701,9 @@ pub mod cf {
     /// without the leading `k`, which is how CoreFoundation spells them.
     const CURRENCY_SYMBOL: &str = "kCFNumberFormatterCurrencySymbol";
     const GROUPING_SIZE: &str = "kCFNumberFormatterGroupingSize";
+    // These two carry a `Key` suffix their symbols do not.
+    const MAX_FRACTION_DIGITS: &str = "kCFNumberFormatterMaxFractionDigitsKey";
+    const MIN_FRACTION_DIGITS: &str = "kCFNumberFormatterMinFractionDigitsKey";
     const VERY_SHORT_MONTH_SYMBOLS: &str = "kCFDateFormatterVeryShortMonthSymbols";
     const VERY_SHORT_STANDALONE_MONTH_SYMBOLS: &str =
         "kCFDateFormatterVeryShortStandaloneMonthSymbols";
@@ -1699,6 +1729,8 @@ pub mod cf {
     pub const KEYS: &[(&str, &str)] = &[
         ("_kCFNumberFormatterCurrencySymbol", CURRENCY_SYMBOL),
         ("_kCFNumberFormatterGroupingSize", GROUPING_SIZE),
+        ("_kCFNumberFormatterMaxFractionDigits", MAX_FRACTION_DIGITS),
+        ("_kCFNumberFormatterMinFractionDigits", MIN_FRACTION_DIGITS),
         (
             "_kCFDateFormatterVeryShortMonthSymbols",
             VERY_SHORT_MONTH_SYMBOLS,

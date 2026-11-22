@@ -243,6 +243,8 @@ pub fn bootstrap() {
             "newDepthStencilStateWithDescriptor:" => new_depth_stencil_state, c"@24@0:8@16";
             "newDefaultLibrary" => new_default_library, c"@16@0:8";
             "newLibraryWithData:error:" => new_library_with_data, c"@32@0:8@16^@24";
+            "newLibraryWithFile:error:" => new_library_with_file, c"@32@0:8@16^@24";
+            "newLibraryWithURL:error:" => new_library_with_url, c"@32@0:8@16^@24";
             "newLibraryWithSource:options:error:" => new_library_with_source, c"@40@0:8@16@24^@32";
             "newLibraryWithSource:options:completionHandler:" => compile::new_library_with_source,
                 c"v40@0:8@16@24@?32";

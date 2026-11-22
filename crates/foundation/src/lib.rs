@@ -412,6 +412,7 @@ pub const STRING_GLOBALS: &[(&str, &str)] = &[
     ("_NSArgumentDomain", "NSArgumentDomain"),
     ("_NSGlobalDomain", "NSGlobalDomain"),
     ("_NSFilePosixPermissions", "NSFilePosixPermissions"),
+    ("_NSFileImmutable", "NSFileImmutable"),
     ("_NSFileSystemFreeSize", "NSFileSystemFreeSize"),
     ("_NSFileSystemSize", "NSFileSystemSize"),
     ("_NSFileSystemNumber", "NSFileSystemNumber"),

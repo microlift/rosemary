@@ -140,6 +140,18 @@ static FRAMEWORKS: &[Framework] = &[
         },
     },
     Framework {
+        leaf: "CoreMIDI",
+        version: 'A',
+        umbrellas: &[],
+        provide: Some(coremidi::provide),
+        data: Some(coremidi::data_symbols),
+        symbol: Some(coremidi::symbol),
+        links: Links {
+            reexports: &[],
+            dependencies: &[framework!("CoreFoundation"), LIBSYSTEM],
+        },
+    },
+    Framework {
         leaf: "Network",
         version: 'A',
         umbrellas: &[],

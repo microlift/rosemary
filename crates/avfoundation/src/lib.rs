@@ -169,6 +169,27 @@ const NAMED_STRINGS: &[&str] = &[
     "AVPlayerItemFailedToPlayToEndTimeErrorKey",
     "AVPlayerItemPlaybackStalledNotification",
     "AVURLAssetPreferPreciseDurationAndTimingKey",
+    // The keys of the audio and video settings dictionaries.
+    "AVChannelLayoutKey",
+    "AVEncoderBitRateKey",
+    "AVFormatIDKey",
+    "AVLinearPCMBitDepthKey",
+    "AVLinearPCMIsBigEndianKey",
+    "AVLinearPCMIsFloatKey",
+    "AVLinearPCMIsNonInterleaved",
+    "AVNumberOfChannelsKey",
+    "AVSampleRateKey",
+    "AVVideoCodecKey",
+    "AVVideoCompressionPropertiesKey",
+    "AVVideoHeightKey",
+    "AVVideoScalingModeKey",
+    "AVVideoScalingModeResizeAspect",
+    "AVVideoWidthKey",
+    "AVOutputSettingsPreset640x480",
+    "AVOutputSettingsPreset960x540",
+    "AVOutputSettingsPreset1280x720",
+    "AVOutputSettingsPreset1920x1080",
+    "AVOutputSettingsPreset3840x2160",
 ];
 
 /// AVFoundation's string constants whose text differs from their name.
@@ -176,6 +197,12 @@ const STRINGS: &[(&str, &str)] = &[
     ("_AVAudioTimePitchAlgorithmSpectral", "Spectral"),
     ("_AVAudioTimePitchAlgorithmTimeDomain", "TimeDomain"),
     ("_AVAudioTimePitchAlgorithmVarispeed", "Varispeed"),
+    ("_AVFileTypeAppleM4V", "com.apple.m4v-video"),
+    ("_AVFileTypeMPEG4", "public.mpeg-4"),
+    ("_AVFileTypeQuickTimeMovie", "com.apple.quicktime-movie"),
+    ("_AVVideoAverageBitRateKey", "AverageBitRate"),
+    ("_AVVideoCodecTypeH264", "avc1"),
+    ("_AVVideoExpectedSourceFrameRateKey", "ExpectedFrameRate"),
 ];
 
 /// The Objective-C class objects and constants exported by AVFoundation.framework.

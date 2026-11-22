@@ -51,6 +51,11 @@ pub(super) unsafe extern "C" fn new_library_with_data(
     };
     // SAFETY: dispatch reported this range as the data's bytes.
     let bytes = unsafe { std::slice::from_raw_parts(bytes, length) };
+    library_from_metallib(receiver, bytes, error)
+}
+
+/// A library of the precompiled `bytes`, or nil with `error` filled in.
+fn library_from_metallib(receiver: Id, bytes: &[u8], error: *mut Id) -> Id {
     // SAFETY: an `RosemaryMTLDevice`.
     let target = unsafe { object::body::<Device>(receiver) }.target;
     // SAFETY: the profile belongs to the process-wide adapter list.
@@ -64,6 +69,42 @@ pub(super) unsafe extern "C" fn new_library_with_data(
     let library = retain_library(receiver, translated, input, Some(target));
     label_metallib(library, bytes);
     library
+}
+
+/// A library of the `.metallib` the guest names at `path`.
+fn library_from_file(receiver: Id, path: Option<String>, error: *mut Id) -> Id {
+    let Some(path) = path else {
+        return fail_library(error, "no path to a metallib");
+    };
+    match std::fs::read(prefix::ns::existing_host_path(&path)) {
+        Ok(bytes) => library_from_metallib(receiver, &bytes, error),
+        Err(cause) => fail_library(error, &format!("could not read {path}: {cause}")),
+    }
+}
+
+/// `-[MTLDevice newLibraryWithFile:error:]`
+pub(super) unsafe extern "C" fn new_library_with_file(
+    receiver: Id,
+    _sel: Sel,
+    path: Id,
+    error: *mut Id,
+) -> Id {
+    // SAFETY: an `NSString`, or nil.
+    let path = String::from_utf8(unsafe { foundation::string::bytes(path) }).ok();
+    library_from_file(receiver, path.filter(|p| !p.is_empty()), error)
+}
+
+/// `-[MTLDevice newLibraryWithURL:error:]`
+pub(super) unsafe extern "C" fn new_library_with_url(
+    receiver: Id,
+    _sel: Sel,
+    url: Id,
+    error: *mut Id,
+) -> Id {
+    // SAFETY: an `NSURL`, or nil.
+    let path =
+        unsafe { corefoundation::url::as_url(url as CFTypeRef) }.and_then(|url| url.file_path());
+    library_from_file(receiver, path, error)
 }
 
 /// Name a precompiled library's entries for `ROSEMARY_METAL_PROFILE` by the

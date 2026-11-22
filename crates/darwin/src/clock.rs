@@ -190,6 +190,28 @@ unsafe extern "C" fn utimensat(
     })
 }
 
+/// Set the modification time of the guest's `path`, leaving its access time.
+pub fn set_modified(path: &std::ffi::CStr, time: crate::stat::Timespec) -> std::io::Result<()> {
+    let accessed = crate::stat::Timespec {
+        sec: 0,
+        nsec: DARWIN_UTIME_OMIT,
+    };
+    let times = [accessed, time];
+    // SAFETY: a NUL-terminated path and two readable timespecs.
+    let rc = unsafe {
+        utimensat(
+            crate::stat::DARWIN_AT_FDCWD,
+            path.as_ptr(),
+            times.as_ptr(),
+            0,
+        )
+    };
+    match rc {
+        0 => Ok(()),
+        _ => Err(std::io::Error::last_os_error()),
+    }
+}
+
 /// `int futimens(int fd, const struct timespec[2])`
 ///
 /// # Safety

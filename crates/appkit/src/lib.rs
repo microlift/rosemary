@@ -488,6 +488,8 @@ pub const NOTIFICATION_NAMES: &[&str] = &[
     "NSWindowWillMiniaturizeNotification",
     "NSWindowWillMoveNotification",
     "NSWindowDidChangeOcclusionStateNotification",
+    // Posted by AppKit after every -[NSWindow update]; nothing calls that here.
+    "NSWindowDidUpdateNotification",
     // Observed by Gecko's widget layer; no tint change, menu action broadcast
     // or global frame tracking posts them here.
     "NSControlTintDidChangeNotification",
@@ -570,6 +572,8 @@ pub const STRING_GLOBALS: &[(&str, &str)] = &[
     ),
     ("_kUTTypeImage", "public.image"),
     ("_kUTTypeMovie", "public.movie"),
+    ("_kUTTypeAudio", "public.audio"),
+    ("_kUTTypeMP3", "public.mp3"),
     ("_kUTTypePNG", "public.png"),
     ("_kUTTypeURL", "public.url"),
     ("_kUTTypePlainText", "public.plain-text"),
@@ -879,6 +883,25 @@ pub const STRING_GLOBALS: &[(&str, &str)] = &[
         "AXSecureTextField",
     ),
     ("_NSAccessibilityTabButtonSubrole", "AXTabButton"),
+    ("_NSAccessibilityDialogSubrole", "AXDialog"),
+    ("_NSAccessibilityOutlineRowSubrole", "AXOutlineRow"),
+    ("_NSAccessibilitySwitchSubrole", "AXSwitch"),
+    ("_NSAccessibilityUnknownSubrole", "AXUnknown"),
+    (
+        "_NSAccessibilityDisclosureTriangleRole",
+        "AXDisclosureTriangle",
+    ),
+    ("_NSAccessibilityLevelIndicatorRole", "AXLevelIndicator"),
+    (
+        "_NSAccessibilityLayoutChangedNotification",
+        "AXLayoutChanged",
+    ),
+    ("_NSAccessibilityRowCollapsedNotification", "AXRowCollapsed"),
+    ("_NSAccessibilityRowExpandedNotification", "AXRowExpanded"),
+    (
+        "_NSAccessibilityRowCountChangedNotification",
+        "AXRowCountChanged",
+    ),
     ("_NSAccessibilityDecrementAction", "AXDecrement"),
     ("_NSAccessibilityIncrementAction", "AXIncrement"),
     ("_NSAccessibilityRaiseAction", "AXRaise"),

@@ -658,6 +658,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "coremidi"
+version = "0.5.0"
+dependencies = [
+ "corefoundation",
+ "darwin",
+ "exports",
+]
+
+[[package]]
 name = "coreservices"
 version = "0.5.0"
 dependencies = [
@@ -2052,6 +2061,7 @@ dependencies = [
  "libc",
  "metal_translate",
  "objc",
+ "prefix",
  "rspirv",
  "sdl3",
  "sha2 0.11.0",
@@ -2666,6 +2676,7 @@ dependencies = [
  "coreaudio",
  "corefoundation",
  "coremedia",
+ "coremidi",
  "coreservices",
  "coretext",
  "corevideo",

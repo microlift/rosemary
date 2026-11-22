@@ -266,6 +266,8 @@ pub static SIGNATURES: &[FunctionAbi] = &[
     // ordinary pointer here and [`crate::shims::audiounit`] handles the
     // callback.
     cbsig!([2], "AudioObjectAddPropertyListener", I32, U32, P, P, P),
+    sig!("AudioObjectAddPropertyListenerBlock", I32, U32, P, P, P),
+    sig!("AudioObjectRemovePropertyListenerBlock", I32, U32, P, P, P),
     sig!("AudioObjectGetPropertyData", I32, U32, P, U32, P, P, P),
     sig!("AudioObjectGetPropertyDataSize", I32, U32, P, U32, P, P),
     // The removal takes the same listener, and it must be the *same pointer* the
@@ -458,6 +460,7 @@ pub static SIGNATURES: &[FunctionAbi] = &[
     sig!("CFURLEnumeratorGetNextURL", I64, P, P, P),
     sig!("CFURLCreateFromFSRef", P, P, P),
     sig!("CFURLGetFSRef", BOOL, P, P),
+    sig!("CFURLSetResourcePropertyForKey", BOOL, P, P, P, P),
     sig!("CFRunLoopTimerGetContext", V, P, P),
     sig!("CFURLCreateBookmarkData", P, P, P, U64, P, P, P),
     sig!(
@@ -1465,6 +1468,8 @@ pub static SIGNATURES: &[FunctionAbi] = &[
     sig!("GetCurrentProcess", I32, P),
     sig!("GetFrontProcess", I32, P),
     sig!("GetProcessBundleLocation", I32, P, P),
+    sig!("GetNextProcess", I32, P),
+    sig!("GetProcessInformation", I32, P, P),
     sig!("SameProcess", I32, P, P, P),
     sig!("SetFrontProcess", I32, P),
     sig!("TransformProcessType", I32, P, U32),
@@ -1648,6 +1653,28 @@ pub static SIGNATURES: &[FunctionAbi] = &[
     sig!("SecRequirementCreateWithString", I32, P, U64, P),
     sig!("SecRequirementCreateWithData", I32, P, U32, P),
     sig!("SecCodeCopySelf", I32, U32, P),
+    sig!("SecCodeCopyDesignatedRequirement", I32, P, U32, P),
+    sig!("SecRequirementCopyString", I32, P, U32, P),
+    sig!("SecCopyErrorMessageString", P, I32, P),
+    // CoreMIDI. No device exists, so neither the notify nor the read procedure
+    // is ever called and neither needs a callback thunk.
+    sig!("MIDIClientCreate", I32, P, P, P, P),
+    sig!("MIDIClientDispose", I32, U32),
+    sig!("MIDIInputPortCreate", I32, U32, P, P, P, P),
+    sig!("MIDIOutputPortCreate", I32, U32, P, P),
+    sig!("MIDIPortDispose", I32, U32),
+    sig!("MIDIPortConnectSource", I32, U32, U32, P),
+    sig!("MIDIPortDisconnectSource", I32, U32, U32),
+    sig!("MIDIGetNumberOfSources", U64),
+    sig!("MIDIGetNumberOfDestinations", U64),
+    sig!("MIDIGetSource", U32, U64),
+    sig!("MIDIGetDestination", U32, U64),
+    sig!("MIDIObjectGetIntegerProperty", I32, U32, P, P),
+    sig!("MIDIObjectGetStringProperty", I32, U32, P, P),
+    sig!("MIDISend", I32, U32, U32, P),
+    sig!("MIDISendSysex", I32, P),
+    sig!("MIDIPacketListInit", P, P),
+    sig!("MIDIPacketListAdd", P, P, U64, P, U64, U64, P),
     sig!("SecCodeCheckValidity", I32, P, U32, P),
     sig!("SecStaticCodeCheckValidity", I32, P, U32, P),
     sig!("SecStaticCodeCheckValidityWithErrors", I32, P, U64, P, P),
@@ -4088,6 +4115,7 @@ pub static SIGNATURES: &[FunctionAbi] = &[
     sig!("NSBestDepth", I32, P, I64, I64, BOOL, P),
     sig!("CGEventSourceKeyState", BOOL, I32, U16),
     sig!("UTTypeConformsTo", BOOL, P, P),
+    sig!("UTTypeCopyDescription", P, P),
     // `CFDictionaryRef _CFCopySystemVersionDictionary(void)` - private CF, and
     // the same question [`crate::compat`] answers for the SDK gates.
     sig!("_CFCopySystemVersionDictionary", P),

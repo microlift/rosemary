@@ -116,7 +116,7 @@ pub extern "C" fn SecTaskCreateFromSelf(_allocator: CFTypeRef) -> CFTypeRef {
     let Some(me) = darwin::process::me() else {
         return std::ptr::null();
     };
-    match std::fs::read(&me.path) {
+    match super::codesign::read_code(&me.path) {
         Ok(bytes) => from_executable(&bytes),
         Err(_) => std::ptr::null(),
     }

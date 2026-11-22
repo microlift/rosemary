@@ -626,13 +626,14 @@ unsafe extern "C" fn contents_of_directory(
 
 /// `-attributesOfItemAtPath:error:`, with the keys a program actually reads.
 ///
-/// Size, type and the two timestamps. A dictionary with only some of an item's
+/// Size, type, permissions, type and creator codes, and the two timestamps. A dictionary with only some of an item's
 /// attributes is the shape this tree refused `-[NSBundle infoDictionary]` over,
 /// and the reason it is allowed here is that these are *this runtime's* answers
 /// to a fixed question rather than a file's own contents: a key that is absent
 /// is one nothing in this tree can answer, and adding one later cannot change
 /// what the present ones mean.
 unsafe extern "C" fn attributes_of_item(_receiver: Id, _sel: Sel, path: Id, error: *mut Id) -> Id {
+    let guest_path = path;
     // SAFETY: null or writable.
     unsafe { no_error(error) };
     // SAFETY: an `NSString`, or nil.
@@ -662,6 +663,31 @@ unsafe extern "C" fn attributes_of_item(_receiver: Id, _sel: Sel, path: Id, erro
             true,
         ),
     ];
+    let number = |value: i64| {
+        corefoundation::collections::new_number(corefoundation::collections::Number::Integer(value))
+    };
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = metadata.permissions().mode() & PERMISSION_BITS;
+        values.push(("NSFilePosixPermissions", number(i64::from(mode)), true));
+    }
+    // SAFETY: an `NSString`, or nil, as above.
+    let guest = String::from_utf8(unsafe { crate::string::bytes(guest_path) })
+        .ok()
+        .and_then(|guest| std::ffi::CString::new(guest).ok());
+    let info = guest
+        .and_then(|guest| darwin::xattr::read(&guest, FINDER_INFO))
+        .unwrap_or_default();
+    for (key, range) in [
+        ("NSFileHFSTypeCode", FINDER_INFO_TYPE),
+        ("NSFileHFSCreatorCode", FINDER_INFO_CREATOR),
+    ] {
+        let code = info
+            .get(range)
+            .and_then(|bytes| <[u8; 4]>::try_from(bytes).ok())
+            .map_or(0, u32::from_be_bytes);
+        values.push((key, number(i64::from(code)), true));
+    }
     let timestamps = [
         ("NSFileModificationDate", metadata.modified()),
         ("NSFileCreationDate", metadata.created()),
@@ -703,6 +729,176 @@ unsafe extern "C" fn attributes_of_item(_receiver: Id, _sel: Sel, path: Id, erro
     }
     // SAFETY: a fresh dictionary.
     unsafe { corefoundation::api::CFAutorelease(dictionary) as Id }
+}
+
+/// The `NSFileAttributeKey`s `-setAttributes:ofItemAtPath:error:` cannot apply
+/// here: file flags, which no host keeps for a guest, and the rest, which this
+/// tree does not model yet. Asking for one is refused rather than dropped.
+const UNSETTABLE_ATTRIBUTES: &[&str] = &[
+    "NSFileOwnerAccountName",
+    "NSFileGroupOwnerAccountName",
+    "NSFileCreationDate",
+    "NSFileExtensionHidden",
+    "NSFileBusy",
+    "NSFileProtectionKey",
+];
+
+/// `S_ISUID | S_ISGID | S_ISVTX` and the permission bits: what
+/// `NSFilePosixPermissions` carries of a mode.
+const PERMISSION_BITS: u32 = 0o7777;
+
+/// The guest's attribute that holds a file's type and creator codes.
+const FINDER_INFO: &std::ffi::CStr = c"com.apple.FinderInfo";
+/// `FileInfo.fileType` and `FileInfo.fileCreator`: the first two big-endian
+/// words of the Finder info.
+const FINDER_INFO_TYPE: std::ops::Range<usize> = 0..4;
+const FINDER_INFO_CREATOR: std::ops::Range<usize> = 4..8;
+const FINDER_INFO_SIZE: usize = 32;
+
+/// The value under `key` in a guest dictionary, or nil.
+///
+/// # Safety
+///
+/// `dictionary` is an `NSDictionary` this runtime allocated.
+unsafe fn entry(dictionary: Id, key: &str) -> Id {
+    let key = corefoundation::string::from_bytes(key.as_bytes(), false);
+    // SAFETY: as the caller states, and a string this function owns.
+    let value = unsafe { corefoundation::api::CFDictionaryGetValue(dictionary as _, key as _) };
+    // SAFETY: the string made above.
+    unsafe { corefoundation::api::CFRelease(key) };
+    value as Id
+}
+
+/// An `NSNumber` attribute value, or `EINVAL` for anything else.
+///
+/// # Safety
+///
+/// `value` is null or an object this runtime allocated.
+unsafe fn integer_attribute(value: Id) -> std::io::Result<i64> {
+    // SAFETY: as the caller states.
+    unsafe { corefoundation::collections::number(value as CFTypeRef) }
+        .map(|number| number.as_i64())
+        .ok_or_else(|| std::io::Error::from_raw_os_error(libc::EINVAL))
+}
+
+fn status(rc: i32) -> std::io::Result<()> {
+    match rc {
+        0 => Ok(()),
+        _ => Err(std::io::Error::last_os_error()),
+    }
+}
+
+/// Apply `attributes` to the guest's `path`, in the order Foundation does.
+///
+/// # Safety
+///
+/// `attributes` is an `NSDictionary` this runtime allocated.
+unsafe fn apply_attributes(path: &std::ffi::CStr, attributes: Id) -> std::io::Result<()> {
+    let refused = || std::io::Error::from_raw_os_error(libc::ENOTSUP);
+    // SAFETY: as the caller states, for every lookup below.
+    let get = |key: &str| Some(unsafe { entry(attributes, key) }).filter(|v| !v.is_null());
+    if UNSETTABLE_ATTRIBUTES.iter().any(|key| get(key).is_some()) {
+        return Err(refused());
+    }
+    // There is no flag to clear on a host that keeps none, so only setting one
+    // is refused.
+    for flag in ["NSFileImmutable", "NSFileAppendOnly"] {
+        if let Some(value) = get(flag) {
+            // SAFETY: a value from the guest's dictionary.
+            if unsafe { integer_attribute(value) }? != 0 {
+                return Err(refused());
+            }
+        }
+    }
+    let owner = |key: &str| -> std::io::Result<libc::uid_t> {
+        match get(key) {
+            // SAFETY: a value from the guest's dictionary.
+            Some(value) => Ok(unsafe { integer_attribute(value) }? as libc::uid_t),
+            // `(uid_t)-1`: leave it as it is.
+            None => Ok(libc::uid_t::MAX),
+        }
+    };
+    let (uid, gid) = (
+        owner("NSFileOwnerAccountID")?,
+        owner("NSFileGroupOwnerAccountID")?,
+    );
+    if uid != libc::uid_t::MAX || gid != libc::uid_t::MAX {
+        // SAFETY: a NUL-terminated path.
+        status(unsafe { darwin::fs::chown(path.as_ptr(), uid, gid as libc::gid_t) })?;
+    }
+    if let Some(value) = get("NSFilePosixPermissions") {
+        // SAFETY: a value from the guest's dictionary.
+        let mode = unsafe { integer_attribute(value) }? as libc::mode_t;
+        // SAFETY: a NUL-terminated path.
+        status(unsafe { darwin::fs::chmod(path.as_ptr(), mode) })?;
+    }
+    if let Some(value) = get("NSFileModificationDate") {
+        let seconds = crate::timer::interval_since_1970(value)
+            .ok_or_else(|| std::io::Error::from_raw_os_error(libc::EINVAL))?;
+        let time = darwin::stat::Timespec {
+            sec: seconds.floor() as i64,
+            nsec: (seconds.fract().abs() * 1e9) as i64,
+        };
+        darwin::clock::set_modified(path, time)?;
+    }
+    let codes = [
+        ("NSFileHFSTypeCode", FINDER_INFO_TYPE),
+        ("NSFileHFSCreatorCode", FINDER_INFO_CREATOR),
+    ];
+    if codes.iter().any(|(key, _)| get(key).is_some()) {
+        let mut info = darwin::xattr::read(path, FINDER_INFO).unwrap_or_default();
+        info.resize(FINDER_INFO_SIZE, 0);
+        for (key, range) in codes {
+            if let Some(value) = get(key) {
+                // SAFETY: a value from the guest's dictionary.
+                let code = unsafe { integer_attribute(value) }? as u32;
+                info[range].copy_from_slice(&code.to_be_bytes());
+            }
+        }
+        darwin::xattr::write(path, FINDER_INFO, &info)?;
+    }
+    Ok(())
+}
+
+/// `-mountedVolumeURLsIncludingResourceValuesForKeys:options:`: the one mount
+/// `getfsstat` reports, the root. The keys only ask for values to be fetched
+/// ahead, which a later `-getResourceValue:forKey:error:` reads either way.
+unsafe extern "C" fn mounted_volume_urls(_receiver: Id, _sel: Sel, _keys: Id, _options: u64) -> Id {
+    let root = corefoundation::url::new_file_url("/", true);
+    let array = corefoundation::collections::new_array(
+        &[root],
+        corefoundation::callbacks::Policy::from_type_callbacks(),
+        false,
+    );
+    // SAFETY: the URL made above, which the array has retained.
+    unsafe { corefoundation::api::CFRelease(root) };
+    // SAFETY: a fresh array.
+    unsafe { corefoundation::api::CFAutorelease(array) as Id }
+}
+
+/// `-setAttributes:ofItemAtPath:error:`
+unsafe extern "C" fn set_attributes(
+    _receiver: Id,
+    _sel: Sel,
+    attributes: Id,
+    path: Id,
+    error: *mut Id,
+) -> u8 {
+    // SAFETY: null or writable.
+    unsafe { no_error(error) };
+    // SAFETY: an `NSString`, or nil.
+    let guest = String::from_utf8(unsafe { crate::string::bytes(path) }).ok();
+    let Some(guest) = guest.and_then(|guest| std::ffi::CString::new(guest).ok()) else {
+        return 0;
+    };
+    let host = prefix::ns::existing_host_path(&guest.to_string_lossy());
+    let applied = match attributes.is_null() {
+        true => Ok(()),
+        // SAFETY: an `NSDictionary`, as the method declares.
+        false => unsafe { apply_attributes(&guest, attributes) },
+    };
+    // SAFETY: null or writable.
+    unsafe { report(error, &host, applied) }
 }
 
 unsafe extern "C" fn attributes_of_file_system(
@@ -819,6 +1015,73 @@ unsafe extern "C" fn file_modification_date(receiver: Id, _sel: Sel) -> Id {
 unsafe extern "C" fn file_creation_date(receiver: Id, _sel: Sel) -> Id {
     // SAFETY: a dictionary.
     unsafe { attribute(receiver, "NSFileCreationDate") }
+}
+
+/// A numeric attribute, zero when it is absent as the category's accessors
+/// answer.
+///
+/// # Safety
+///
+/// `receiver` is a dictionary.
+unsafe fn integer_or_zero(receiver: Id, key: &str) -> i64 {
+    // SAFETY: as the caller states.
+    let value = unsafe { attribute(receiver, key) };
+    // SAFETY: a number, or nil.
+    unsafe { corefoundation::collections::number(value as CFTypeRef) }.map_or(0, |n| n.as_i64())
+}
+
+macro_rules! file_attribute_accessors {
+    ($($name:ident: $ty:ty = $key:literal;)*) => {
+        $(
+            unsafe extern "C" fn $name(receiver: Id, _sel: Sel) -> $ty {
+                // SAFETY: a dictionary.
+                unsafe { integer_or_zero(receiver, $key) as $ty }
+            }
+        )*
+    };
+}
+
+file_attribute_accessors! {
+    file_posix_permissions: u64 = "NSFilePosixPermissions";
+    file_system_number: i64 = "NSFileSystemNumber";
+    file_system_file_number: u64 = "NSFileSystemFileNumber";
+    file_hfs_creator_code: u32 = "NSFileHFSCreatorCode";
+    file_hfs_type_code: u32 = "NSFileHFSTypeCode";
+}
+
+unsafe extern "C" fn file_is_immutable(receiver: Id, _sel: Sel) -> u8 {
+    // SAFETY: a dictionary.
+    u8::from(unsafe { integer_or_zero(receiver, "NSFileImmutable") } != 0)
+}
+
+unsafe extern "C" fn file_is_append_only(receiver: Id, _sel: Sel) -> u8 {
+    // SAFETY: a dictionary.
+    u8::from(unsafe { integer_or_zero(receiver, "NSFileAppendOnly") } != 0)
+}
+
+unsafe extern "C" fn file_extension_hidden(receiver: Id, _sel: Sel) -> u8 {
+    // SAFETY: a dictionary.
+    u8::from(unsafe { integer_or_zero(receiver, "NSFileExtensionHidden") } != 0)
+}
+
+unsafe extern "C" fn file_owner_account_name(receiver: Id, _sel: Sel) -> Id {
+    // SAFETY: a dictionary.
+    unsafe { attribute(receiver, "NSFileOwnerAccountName") }
+}
+
+unsafe extern "C" fn file_group_owner_account_name(receiver: Id, _sel: Sel) -> Id {
+    // SAFETY: a dictionary.
+    unsafe { attribute(receiver, "NSFileGroupOwnerAccountName") }
+}
+
+unsafe extern "C" fn file_owner_account_id(receiver: Id, _sel: Sel) -> Id {
+    // SAFETY: a dictionary.
+    unsafe { attribute(receiver, "NSFileOwnerAccountID") }
+}
+
+unsafe extern "C" fn file_group_owner_account_id(receiver: Id, _sel: Sel) -> Id {
+    // SAFETY: a dictionary.
+    unsafe { attribute(receiver, "NSFileGroupOwnerAccountID") }
 }
 
 /// `-stringWithFileSystemRepresentation:length:`, the path a `readdir` or a
@@ -1149,6 +1412,9 @@ pub(crate) fn install() {
             => create_symlink, c"B40@0:8@16@24^@32";
         "linkItemAtPath:toPath:error:" => link_item, c"B40@0:8@16@24^@32";
         "attributesOfItemAtPath:error:" => attributes_of_item, c"@32@0:8@16^@24";
+        "setAttributes:ofItemAtPath:error:" => set_attributes, c"B40@0:8@16@24^@32";
+        "mountedVolumeURLsIncludingResourceValuesForKeys:options:" => mounted_volume_urls,
+            c"@32@0:8@16Q24";
         "attributesOfFileSystemForPath:error:" => attributes_of_file_system, c"@32@0:8@16^@24";
         "isWritableFileAtPath:" => is_writable, c"B24@0:8@16";
         "isReadableFileAtPath:" => file_exists, c"B24@0:8@16";
@@ -1182,6 +1448,18 @@ pub(crate) fn install() {
         "fileType" => file_type, c"@16@0:8";
         "fileModificationDate" => file_modification_date, c"@16@0:8";
         "fileCreationDate" => file_creation_date, c"@16@0:8";
+        "filePosixPermissions" => file_posix_permissions, c"Q16@0:8";
+        "fileSystemNumber" => file_system_number, c"q16@0:8";
+        "fileSystemFileNumber" => file_system_file_number, c"Q16@0:8";
+        "fileHFSCreatorCode" => file_hfs_creator_code, c"I16@0:8";
+        "fileHFSTypeCode" => file_hfs_type_code, c"I16@0:8";
+        "fileIsImmutable" => file_is_immutable, c"c16@0:8";
+        "fileIsAppendOnly" => file_is_append_only, c"c16@0:8";
+        "fileExtensionHidden" => file_extension_hidden, c"c16@0:8";
+        "fileOwnerAccountName" => file_owner_account_name, c"@16@0:8";
+        "fileGroupOwnerAccountName" => file_group_owner_account_name, c"@16@0:8";
+        "fileOwnerAccountID" => file_owner_account_id, c"@16@0:8";
+        "fileGroupOwnerAccountID" => file_group_owner_account_id, c"@16@0:8";
     });
 }
 

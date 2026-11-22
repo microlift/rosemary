@@ -523,6 +523,46 @@ unsafe fn get(
     }
 }
 
+/// The guest's attribute `name` on the guest's `path`, for the framework
+/// crates; `None` when it is absent or cannot be read.
+pub fn read(path: &CStr, name: &CStr) -> Option<Vec<u8>> {
+    // SAFETY: two NUL-terminated strings, and a null buffer of size zero.
+    let size = unsafe { getxattr(path.as_ptr(), name.as_ptr(), std::ptr::null_mut(), 0, 0, 0) };
+    let mut value = vec![0u8; usize::try_from(size).ok()?];
+    // SAFETY: as above, with a buffer of the size just asked for.
+    let got = unsafe {
+        getxattr(
+            path.as_ptr(),
+            name.as_ptr(),
+            value.as_mut_ptr().cast(),
+            value.len(),
+            0,
+            0,
+        )
+    };
+    value.truncate(usize::try_from(got).ok()?);
+    Some(value)
+}
+
+/// Set the guest's attribute `name` on the guest's `path` to `value`.
+pub fn write(path: &CStr, name: &CStr, value: &[u8]) -> std::io::Result<()> {
+    // SAFETY: two NUL-terminated strings and `value.len()` readable bytes.
+    let rc = unsafe {
+        setxattr(
+            path.as_ptr(),
+            name.as_ptr(),
+            value.as_ptr().cast(),
+            value.len(),
+            0,
+            0,
+        )
+    };
+    match rc {
+        0 => Ok(()),
+        _ => Err(std::io::Error::last_os_error()),
+    }
+}
+
 /// `int setxattr(const char *, const char *, const void *, size_t, u_int32_t, int)`
 ///
 /// # Safety

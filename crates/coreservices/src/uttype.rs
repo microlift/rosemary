@@ -63,6 +63,16 @@ const CONFORMS: &[(&str, &[&str])] = &[
         "com.adobe.pdf",
         &["public.data", "public.composite-content"],
     ),
+    (
+        "public.audiovisual-content",
+        &["public.data", "public.content"],
+    ),
+    ("public.audio", &["public.audiovisual-content"]),
+    ("public.mp3", &["public.audio"]),
+    ("public.movie", &["public.audiovisual-content"]),
+    ("public.mpeg-4", &["public.movie"]),
+    ("com.apple.m4v-video", &["public.movie"]),
+    ("com.apple.quicktime-movie", &["public.movie"]),
     ("public.archive", &["public.item"]),
     ("public.zip-archive", &["public.data", "public.archive"]),
 ];
