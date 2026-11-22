@@ -260,6 +260,14 @@ pub extern "C" fn issetugid() -> c_int {
     c_int::from(CURRENT.read().unwrap_or_else(|e| e.into_inner()).tainted)
 }
 
+/// `int pthread_getugid_np(uid_t *, gid_t *)`: the ids a thread assumed with
+/// `pthread_setugid_np`. No thread can assume any, so XNU's answer for a thread
+/// without them, `ESRCH`, is the only one.
+pub extern "C" fn pthread_getugid_np(_uid: *mut u32, _gid: *mut u32) -> c_int {
+    crate::errno::set(libc::ESRCH);
+    -1
+}
+
 exports::exports! {
     functions {
         "getuid" => getuid,
@@ -278,6 +286,7 @@ exports::exports! {
         "setgroups" => setgroups,
         "initgroups" => initgroups,
         "issetugid" => issetugid,
+        "pthread_getugid_np" => pthread_getugid_np,
     }
 }
 
@@ -289,6 +298,14 @@ pub(crate) static IDS: RwLock<()> = RwLock::new(());
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pthread_getugid_np_finds_no_assumed_identity() {
+        let (mut uid, mut gid) = (u32::MAX, u32::MAX);
+        assert_eq!(pthread_getugid_np(&mut uid, &mut gid), -1);
+        assert_eq!(crate::errno::get(), libc::ESRCH);
+        assert_eq!((uid, gid), (u32::MAX, u32::MAX), "nothing is written");
+    }
 
     /// One test, because the ids are the process's own and the test harness
     /// runs tests on threads that share them.

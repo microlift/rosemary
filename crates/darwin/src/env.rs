@@ -1,6 +1,6 @@
 use std::ffi::{CStr, CString, c_char, c_int, c_void};
-use std::sync::Mutex;
-use std::sync::atomic::{AtomicPtr, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicPtr, Ordering};
+use std::sync::{Condvar, Mutex};
 
 /// `char **environ` as the guest sees it: the *variable*, whose address is what
 /// is published and what `_NSGetEnviron` answers with.
@@ -9,17 +9,53 @@ static ENVIRON: AtomicPtr<*mut c_char> = AtomicPtr::new(std::ptr::null_mut());
 // Serialize our API calls, but keep the published vector authoritative:
 // guests can replace it, edit its entries, or lend strings through `putenv`.
 // Direct guest edits must not race environment API calls.
-static INITIALIZED: Mutex<bool> = Mutex::new(false);
+static LOCK: EnvironLock = EnvironLock {
+    held: Mutex::new(false),
+    released: Condvar::new(),
+};
+static INITIALIZED: AtomicBool = AtomicBool::new(false);
 
-/// Build the block, once.
+/// Darwin's environment lock. Guests hold it across `environ_lock_np` and
+/// `environ_unlock_np`, two calls a scoped guard cannot span.
+struct EnvironLock {
+    held: Mutex<bool>,
+    released: Condvar,
+}
+
+impl EnvironLock {
+    fn acquire(&self) {
+        let mut held = self.held.lock().unwrap_or_else(|e| e.into_inner());
+        while *held {
+            held = self.released.wait(held).unwrap_or_else(|e| e.into_inner());
+        }
+        *held = true;
+    }
+
+    fn release(&self) {
+        *self.held.lock().unwrap_or_else(|e| e.into_inner()) = false;
+        self.released.notify_one();
+    }
+}
+
+/// The environment lock, held until dropped.
+struct Held;
+
+impl Drop for Held {
+    fn drop(&mut self) {
+        LOCK.release();
+    }
+}
+
+/// Take the environment lock, building the block first if it has not been.
 ///
 /// Called by every entry point below rather than from a start-up hook: a guest
 /// can read `environ` before anything else runs, and a block that is empty
 /// until something initialises it is a guest that sees no environment at all.
-fn block() -> std::sync::MutexGuard<'static, bool> {
-    let mut initialized = INITIALIZED.lock().unwrap_or_else(|e| e.into_inner());
-    if *initialized {
-        return initialized;
+fn block() -> Held {
+    LOCK.acquire();
+    let held = Held;
+    if INITIALIZED.load(Ordering::Relaxed) {
+        return held;
     }
     let entries = handed_off().unwrap_or_else(|| {
         let host: Vec<_> = std::env::vars_os().collect();
@@ -34,8 +70,19 @@ fn block() -> std::sync::MutexGuard<'static, bool> {
         .map(CString::into_raw)
         .collect();
     publish(&entries);
-    *initialized = true;
-    initialized
+    INITIALIZED.store(true, Ordering::Relaxed);
+    held
+}
+
+/// `void environ_lock_np(void)`: the lock `getenv` and its siblings take, so
+/// calling one of them while holding it deadlocks, as it does on Darwin.
+pub extern "C" fn environ_lock_np() {
+    std::mem::forget(block());
+}
+
+/// `void environ_unlock_np(void)`
+pub extern "C" fn environ_unlock_np() {
+    LOCK.release();
 }
 
 /// The variables a guest is asked to start with, one `NAME=VALUE` per line.
@@ -631,6 +678,8 @@ exports::exports! {
         "_setenvp" => _setenvp,
         "_unsetenvp" => _unsetenvp,
         "_copyenv" => _copyenv,
+        "environ_lock_np" => environ_lock_np,
+        "environ_unlock_np" => environ_unlock_np,
     }
 }
 
@@ -1000,5 +1049,26 @@ mod tests {
             .output()
             .unwrap();
         assert!(output.status.success(), "{output:?}");
+    }
+
+    /// `environ_lock_np` holds the lock `setenv` takes until it is unlocked.
+    #[test]
+    fn environ_lock_np_holds_off_other_threads() {
+        let name = unique("ENVIRON_LOCK");
+        environ_lock_np();
+        let setter = {
+            let name = name.clone();
+            std::thread::spawn(move || {
+                // SAFETY: NUL-terminated strings.
+                unsafe { setenv(name.as_ptr(), c"set".as_ptr(), 1) }
+            })
+        };
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        assert!(!setter.is_finished(), "setenv waits for the lock");
+        environ_unlock_np();
+        assert_eq!(setter.join().unwrap(), 0);
+        // SAFETY: a NUL-terminated name.
+        let value = unsafe { getenv(name.as_ptr()) };
+        assert_eq!(unsafe { CStr::from_ptr(value) }, c"set");
     }
 }
