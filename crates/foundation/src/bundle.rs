@@ -742,7 +742,7 @@ pub mod cf {
     /// `CFArrayRef CFBundleCopyExecutableArchitectures(CFBundleRef)`
     ///
     /// The CPU types the executable has slices for, read from its header.
-    unsafe extern "C" fn CFBundleCopyExecutableArchitectures(bundle: Id) -> Id {
+    pub(crate) unsafe extern "C" fn CFBundleCopyExecutableArchitectures(bundle: Id) -> Id {
         let Some(layout) = layout(bundle) else {
             return std::ptr::null_mut();
         };
@@ -1856,6 +1856,13 @@ pub(crate) mod class {
         path(unsafe { layout_of(receiver) }.map(|b| b.executable.clone()))
     }
 
+    /// `-executableArchitectures`, which is CoreFoundation's answer.
+    unsafe extern "C" fn executable_architectures(receiver: Id, _sel: Sel) -> Id {
+        // SAFETY: an `NSBundle` is a `CFBundleRef`.
+        let array = unsafe { super::cf::CFBundleCopyExecutableArchitectures(receiver) };
+        objc::arc::autorelease(array)
+    }
+
     /// `-pathForAuxiliaryExecutable:`: a file of that name beside the main
     /// executable, or nil.
     unsafe extern "C" fn path_for_auxiliary_executable(receiver: Id, _sel: Sel, name: Id) -> Id {
@@ -1975,6 +1982,7 @@ pub(crate) mod class {
             "executableURL" => executable_url, c"@16@0:8";
             "resourcePath" => resource_path, c"@16@0:8";
             "executablePath" => executable_path, c"@16@0:8";
+            "executableArchitectures" => executable_architectures, c"@16@0:8";
             "pathForAuxiliaryExecutable:" => path_for_auxiliary_executable, c"@24@0:8@16";
             "privateFrameworksPath" => private_frameworks_path, c"@16@0:8";
             "builtInPlugInsPath" => built_in_plug_ins_path, c"@16@0:8";
