@@ -507,7 +507,10 @@ pub const NOTIFICATION_NAMES: &[&str] = &[
     // Observed by Qt's Cocoa platform plugin; no menu tracking or other
     // application's activation posts them here.
     "NSMenuDidBeginTrackingNotification",
+    "NSMenuDidEndTrackingNotification",
     "NSWorkspaceDidActivateApplicationNotification",
+    // Observed by Max; nothing hides the application here.
+    "NSApplicationWillUnhideNotification",
     // Keys and option names whose text is their own name.
     "NSApplicationLaunchUserNotificationKey",
     "NSAccessibilityException",
@@ -887,6 +890,22 @@ pub const STRING_GLOBALS: &[(&str, &str)] = &[
     ("_NSAccessibilityOutlineRowSubrole", "AXOutlineRow"),
     ("_NSAccessibilitySwitchSubrole", "AXSwitch"),
     ("_NSAccessibilityUnknownSubrole", "AXUnknown"),
+    ("_NSAccessibilityCloseButtonSubrole", "AXCloseButton"),
+    ("_NSAccessibilityMinimizeButtonSubrole", "AXMinimizeButton"),
+    (
+        "_NSAccessibilityFullScreenButtonSubrole",
+        "AXFullScreenButton",
+    ),
+    ("_NSAccessibilityStandardWindowSubrole", "AXStandardWindow"),
+    ("_NSAccessibilityFloatingWindowSubrole", "AXFloatingWindow"),
+    ("_NSAccessibilityTableRowSubrole", "AXTableRow"),
+    ("_NSAccessibilityToggleSubrole", "AXToggle"),
+    ("_NSAccessibilityCreatedNotification", "AXCreated"),
+    (
+        "_NSAccessibilityWindowCreatedNotification",
+        "AXWindowCreated",
+    ),
+    ("_NSAccessibilityUIElementsKey", "AXUIElementsKey"),
     (
         "_NSAccessibilityDisclosureTriangleRole",
         "AXDisclosureTriangle",
