@@ -283,6 +283,30 @@ fn vulkan_graphical_test_prerequisites_are_available() {
 }
 
 #[test]
+fn present_copy_requires_identical_format_and_unscaled_coordinates() {
+    let bgra = vk::Format::B8G8R8A8_UNORM;
+    let rgba = vk::Format::R8G8B8A8_UNORM;
+    let from = [vk::Offset3D::default(), vk::Offset3D { x: 5, y: 6, z: 1 }];
+    let to = [
+        vk::Offset3D { x: 3, y: 4, z: 0 },
+        vk::Offset3D { x: 8, y: 10, z: 1 },
+    ];
+    assert_eq!(
+        copy_extent(bgra, from, bgra, to),
+        Some(vk::Extent3D {
+            width: 5,
+            height: 6,
+            depth: 1
+        })
+    );
+    assert_eq!(copy_extent(bgra, from, rgba, to), None);
+    assert_eq!(copy_extent(bgra, from, bgra, [to[1], to[0]]), None);
+    let scaled = [to[0], vk::Offset3D { x: 9, ..to[1] }];
+    assert_eq!(copy_extent(bgra, from, bgra, scaled), None);
+    assert_eq!(copy_extent(bgra, from, bgra, [to[0]; 2]), None);
+}
+
+#[test]
 fn present_fences_are_not_awaited_after_unqueued_errors() {
     use vk::Result as R;
     for gamescope in [false, true] {
@@ -3073,6 +3097,70 @@ fn read_scene_pixel(
     let pixel = unsafe { std::slice::from_raw_parts(buffer.contents.add(offset), 4).to_vec() };
     gpu.destroy_buffer(buffer);
     pixel
+}
+
+#[test]
+#[cfg(not(target_os = "macos"))]
+fn present_copy_preserves_texels_and_converting_blit_swizzles_channels() {
+    if std::env::var_os("ROSEMARY_TEST_VULKAN").is_none() {
+        return;
+    }
+    let gpu = crate::vulkan::adapters()
+        .unwrap()
+        .first()
+        .unwrap()
+        .gpu()
+        .unwrap();
+    let source = test_render_target(gpu, 2, 2).unwrap();
+    let same = test_render_target(gpu, 4, 4).unwrap();
+    let converted = gpu
+        .create_image(&ImageDescription {
+            image_type: vk::ImageType::TYPE_2D,
+            view_type: vk::ImageViewType::TYPE_2D,
+            format: vk::Format::R8G8B8A8_UNORM,
+            width: 4,
+            height: 4,
+            depth: 1,
+            levels: 1,
+            layers: 1,
+            samples: 1,
+            usage: gpu::USAGE_RENDER_TARGET,
+            cube: false,
+            components: vk::ComponentMapping::default(),
+        })
+        .unwrap();
+    let from = [vk::Offset3D::default(), vk::Offset3D { x: 2, y: 2, z: 1 }];
+    let to = [
+        vk::Offset3D { x: 1, y: 1, z: 0 },
+        vk::Offset3D { x: 3, y: 3, z: 1 },
+    ];
+    gpu.one_shot(|device, cb| unsafe {
+        cmd_test_clear_color(device, cb, source.image, [1.0, 0.0, 0.0, 1.0]);
+        prepare_source(device, cb, source.image);
+        for target in [&same, &converted] {
+            copy_or_blit(
+                device,
+                cb,
+                (source.image, source.format),
+                from,
+                (target.image, target.format),
+                vk::ImageLayout::GENERAL,
+                to,
+            );
+        }
+    })
+    .unwrap();
+    assert_eq!(
+        read_scene_pixel(gpu, same.image, 4, 4, 2, 2),
+        [0, 0, 255, 255]
+    );
+    assert_eq!(
+        read_scene_pixel(gpu, converted.image, 4, 4, 2, 2),
+        [255, 0, 0, 255]
+    );
+    for image in [source, same, converted] {
+        gpu.destroy_image(image);
+    }
 }
 
 #[test]
