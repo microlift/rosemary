@@ -20,11 +20,13 @@
 //! * [`signal`] - what the kernel hands a signal handler.
 //! * [`memory`] - copies of this process's memory that fail instead of faulting,
 //!   and anonymous shared-memory objects.
+//! * [`ordering`] - whether this thread runs under x86's memory model in hardware.
 
 pub mod errno;
 pub mod fd;
 pub mod memory;
 pub mod net;
+pub mod ordering;
 pub mod process;
 pub mod signal;
 pub mod socket;

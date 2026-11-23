@@ -188,3 +188,7 @@ pub fn xattr_is_missing(_: &io::Error) -> bool {
 pub fn link_medium(_name: &std::ffi::CStr) -> Option<crate::net::Link> {
     None
 }
+
+pub fn enter_total_store_order() -> bool {
+    false
+}

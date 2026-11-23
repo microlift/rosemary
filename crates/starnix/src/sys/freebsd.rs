@@ -623,3 +623,7 @@ mod tests {
         assert!(after > before, "{before} then {after}");
     }
 }
+
+pub fn enter_total_store_order() -> bool {
+    false
+}

@@ -701,3 +701,7 @@ pub fn xattr_remove_path(path: &CStr, name: &CStr, follow: bool) -> io::Result<(
 pub fn xattr_is_missing(error: &io::Error) -> bool {
     error.raw_os_error() == Some(libc::ENOATTR)
 }
+
+pub fn enter_total_store_order() -> bool {
+    false
+}

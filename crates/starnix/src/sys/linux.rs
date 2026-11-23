@@ -631,3 +631,26 @@ pub fn link_medium(name: &std::ffi::CStr) -> Option<crate::net::Link> {
     let kind = std::fs::read_to_string(dir.join("type")).ok()?;
     (kind.trim() == "1" && dir.join("device").exists()).then_some(Link::Wired)
 }
+
+/// Asahi's `PR_{GET,SET}_MEM_MODEL`, which upstream `<linux/prctl.h>` lacks.
+const PR_GET_MEM_MODEL: libc::c_int = 0x6d4d_444c;
+const PR_SET_MEM_MODEL: libc::c_int = 0x4d4d_444c;
+const PR_SET_MEM_MODEL_TSO: libc::c_ulong = 1;
+
+pub fn enter_total_store_order() -> bool {
+    const UNUSED: libc::c_ulong = 0;
+    // SAFETY: neither option reads or writes memory.
+    let set = unsafe {
+        libc::prctl(
+            PR_SET_MEM_MODEL,
+            PR_SET_MEM_MODEL_TSO,
+            UNUSED,
+            UNUSED,
+            UNUSED,
+        )
+    };
+    // A kernel may grant a stricter model than asked for, so read back what it set.
+    // SAFETY: as above.
+    let model = unsafe { libc::prctl(PR_GET_MEM_MODEL, UNUSED, UNUSED, UNUSED, UNUSED) };
+    set == 0 && model as libc::c_ulong == PR_SET_MEM_MODEL_TSO
+}
