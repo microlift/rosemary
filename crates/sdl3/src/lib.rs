@@ -937,18 +937,48 @@ macro_rules! getter {
     };
 }
 
-getter!(/// The USB vendor id, or zero for a device that reports none.
-    vendor, SDL_GetJoystickVendor, u16, 0);
-getter!(/// The USB product id.
-    product, SDL_GetJoystickProduct, u16, 0);
-getter!(/// The device's version, which is the third word of a HID GUID.
-    version, SDL_GetJoystickProductVersion, u16, 0);
-getter!(/// How many axes it has.
-    axes, SDL_GetNumJoystickAxes, c_int, 0);
-getter!(/// How many buttons it has.
-    buttons, SDL_GetNumJoystickButtons, c_int, 0);
-getter!(/// How many hats it has.
-    hats, SDL_GetNumJoystickHats, c_int, 0);
+getter!(
+    /// The USB vendor id, or zero for a device that reports none.
+    vendor,
+    SDL_GetJoystickVendor,
+    u16,
+    0
+);
+getter!(
+    /// The USB product id.
+    product,
+    SDL_GetJoystickProduct,
+    u16,
+    0
+);
+getter!(
+    /// The device's version, which is the third word of a HID GUID.
+    version,
+    SDL_GetJoystickProductVersion,
+    u16,
+    0
+);
+getter!(
+    /// How many axes it has.
+    axes,
+    SDL_GetNumJoystickAxes,
+    c_int,
+    0
+);
+getter!(
+    /// How many buttons it has.
+    buttons,
+    SDL_GetNumJoystickButtons,
+    c_int,
+    0
+);
+getter!(
+    /// How many hats it has.
+    hats,
+    SDL_GetNumJoystickHats,
+    c_int,
+    0
+);
 
 /// One axis, in SDL's own `-32768..32767`.
 ///

@@ -460,14 +460,20 @@ impl LoadedImages {
                         .find_map(|l| l.resolve(&image.linked, name, 0))
                 })
                 // A re-export its own link did not map, because an earlier
-                // `dlopen` already had: dyld binds through it all the same.
+                // `dlopen` already had: dyld binds through it all the same,
+                // whether the re-exporter is this image or one it carried.
                 .or_else(|| {
-                    is_named.then(|| {
-                        image
-                            .reexported_dylibs
-                            .iter()
-                            .find_map(|target| self.resolve_in(Some(leaf(target)), name, depth + 1))
-                    })?
+                    let named = named?;
+                    let own = is_named.then_some(&image.reexported_dylibs);
+                    let carried = image
+                        .linked
+                        .iter()
+                        .filter(|l| l.answers_to(named))
+                        .filter_map(|l| Some(&l.parsed()?.reexports));
+                    own.into_iter()
+                        .chain(carried)
+                        .flatten()
+                        .find_map(|target| self.resolve_in(Some(leaf(target)), name, depth + 1))
                 })?;
             let mut bound = self.bound.lock().unwrap_or_else(|e| e.into_inner());
             if !bound.iter().any(|b| std::ptr::eq(*b, image)) {

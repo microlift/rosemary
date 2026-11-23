@@ -231,19 +231,26 @@ int impl_value(void);
 __attribute__((visibility("default"))) int client_value(void) { return impl_value(); }
 "#;
 
-/// Opens each argument by path, then calls into the client.
+/// A second client of the stub, opened after the first.
+const SECOND_STUB_CLIENT_C: &str = r#"
+int impl_value(void);
+__attribute__((visibility("default"))) int second_value(void) { return impl_value(); }
+"#;
+
+/// Opens each argument after the first by path, then calls the function the
+/// first names.
 const OPEN_THROUGH_STUB_C: &str = r#"
 #include <dlfcn.h>
 #include <stdio.h>
 
 int main(int argc, char **argv) {
-    for (int i = 1; i < argc; i++) {
+    for (int i = 2; i < argc; i++) {
         if (!dlopen(argv[i], RTLD_NOW)) {
             printf("%s\n", dlerror());
             return 3;
         }
     }
-    int (*value)(void) = (int (*)(void))dlsym(RTLD_DEFAULT, "client_value");
+    int (*value)(void) = (int (*)(void))dlsym(RTLD_DEFAULT, argv[1]);
     printf("value %d\n", value ? value() : -1);
     return 0;
 }
@@ -258,6 +265,7 @@ struct StubFixture {
     implementation: String,
     stub: String,
     client: String,
+    second_client: String,
     guest: String,
 }
 
@@ -289,23 +297,29 @@ fn build_stub_fixture() -> Option<StubFixture> {
     let reexported_file = format!("-Wl,-dylib_file,@rpath/reexported_impl:{implementation}");
     let directory = std::path::Path::new(&stub).parent()?.to_str()?;
     let rpath = format!("-Wl,-rpath,{directory}");
-    let client = common::build_x86_64(
-        "stub_client",
-        STUB_CLIENT_C,
-        &[
-            "-dynamiclib",
-            "-install_name",
-            "@rpath/stub_client",
-            &reexported_file,
-            &rpath,
-            &stub,
-        ],
-    )?;
+    let client_of_stub = |name: &str, source: &str| {
+        let install_name = format!("@rpath/{name}");
+        common::build_x86_64(
+            name,
+            source,
+            &[
+                "-dynamiclib",
+                "-install_name",
+                &install_name,
+                &reexported_file,
+                &rpath,
+                &stub,
+            ],
+        )
+    };
+    let client = client_of_stub("stub_client", STUB_CLIENT_C)?;
+    let second_client = client_of_stub("second_stub_client", SECOND_STUB_CLIENT_C)?;
     let guest = common::build_x86_64("open_through_stub", OPEN_THROUGH_STUB_C, &[])?;
     Some(StubFixture {
         implementation,
         stub,
         client,
+        second_client,
         guest,
     })
 }
@@ -316,8 +330,11 @@ fn a_library_binds_through_a_loaded_stub_to_what_it_reexports() {
     let Some(f) = stub_fixture() else {
         skip!("cannot build x86_64 fixtures")
     };
-    let (status, out, err) =
-        common::run_guest_env(&[], &f.guest, &[&f.implementation, &f.stub, &f.client]);
+    let (status, out, err) = common::run_guest_env(
+        &[],
+        &f.guest,
+        &["client_value", &f.implementation, &f.stub, &f.client],
+    );
     assert_eq!(status, Some(0), "stdout: {out} stderr: {err}");
     assert_eq!(out, "value 42\n", "stderr: {err}");
 }
@@ -329,7 +346,29 @@ fn a_stub_linked_with_its_client_reexports_an_opened_library() {
     let Some(f) = stub_fixture() else {
         skip!("cannot build x86_64 fixtures")
     };
-    let (status, out, err) = common::run_guest_env(&[], &f.guest, &[&f.implementation, &f.client]);
+    let (status, out, err) = common::run_guest_env(
+        &[],
+        &f.guest,
+        &["client_value", &f.implementation, &f.client],
+    );
+    assert_eq!(status, Some(0), "stdout: {out} stderr: {err}");
+    assert_eq!(out, "value 42\n", "stderr: {err}");
+}
+
+/// A later library binds to the stub the first client's link carried, and
+/// through it to the image opened before either.
+#[test]
+fn a_stub_carried_by_another_link_reexports_an_opened_library() {
+    let Some(f) = stub_fixture() else {
+        skip!("cannot build x86_64 fixtures")
+    };
+    let libraries = [
+        "second_value",
+        &f.implementation,
+        &f.client,
+        &f.second_client,
+    ];
+    let (status, out, err) = common::run_guest_env(&[], &f.guest, &libraries);
     assert_eq!(status, Some(0), "stdout: {out} stderr: {err}");
     assert_eq!(out, "value 42\n", "stderr: {err}");
 }
