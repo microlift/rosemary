@@ -227,6 +227,84 @@ pub(super) fn whole_color() -> vk::ImageSubresourceLayers {
     }
 }
 
+/// Image copies preserve texels without filtering. Scaled, flipped and
+/// format-converting transfers still need the blitter.
+pub(super) fn copy_extent(
+    source_format: vk::Format,
+    from: [vk::Offset3D; 2],
+    target_format: vk::Format,
+    to: [vk::Offset3D; 2],
+) -> Option<vk::Extent3D> {
+    let dimensions = |[a, b]: [vk::Offset3D; 2]| {
+        Some((
+            b.x.checked_sub(a.x)?,
+            b.y.checked_sub(a.y)?,
+            b.z.checked_sub(a.z)?,
+        ))
+    };
+    let (width, height, depth) = dimensions(from)?;
+    if source_format != target_format
+        || dimensions(to) != Some((width, height, depth))
+        || width <= 0
+        || height <= 0
+        || depth != 1
+    {
+        return None;
+    }
+    Some(vk::Extent3D {
+        width: width as u32,
+        height: height as u32,
+        depth: 1,
+    })
+}
+
+/// # Safety
+///
+/// Recording into `command_buffer`, with both images belonging to `device`
+/// and in the layouts named. The images are distinct single-sample 2D colour
+/// images with transfer source and destination usage, respectively.
+pub(super) unsafe fn copy_or_blit(
+    device: &ash::Device,
+    command_buffer: vk::CommandBuffer,
+    source: (vk::Image, vk::Format),
+    from: [vk::Offset3D; 2],
+    target: (vk::Image, vk::Format),
+    target_layout: vk::ImageLayout,
+    to: [vk::Offset3D; 2],
+) {
+    if let Some(extent) = copy_extent(source.1, from, target.1, to) {
+        let region = vk::ImageCopy::default()
+            .src_subresource(whole_color())
+            .src_offset(from[0])
+            .dst_subresource(whole_color())
+            .dst_offset(to[0])
+            .extent(extent);
+        unsafe {
+            device.cmd_copy_image(
+                command_buffer,
+                source.0,
+                vk::ImageLayout::GENERAL,
+                target.0,
+                target_layout,
+                &[region],
+            );
+        }
+        crate::stats::count(crate::stats::Counter::PresentImageCopies);
+    } else {
+        unsafe {
+            blit(
+                device,
+                command_buffer,
+                source.0,
+                from,
+                target.0,
+                target_layout,
+                to,
+            )
+        };
+    }
+}
+
 /// # Safety
 ///
 /// Recording into `command_buffer`, with both images belonging to `device`

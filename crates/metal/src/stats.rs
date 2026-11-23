@@ -53,6 +53,7 @@ counters!(
     PresentAcquireWaitMicros = "present_acquire_wait_micros",
     PresentAcquireWaitCalls = "present_acquire_wait_calls",
     PresentRecordMicros = "present_record_micros",
+    PresentImageCopies = "present_image_copies",
     PresentSubmitMicros = "present_submit_micros",
     QueuePresentMicros = "queue_present_micros",
     QueuePresentCalls = "queue_present_calls",

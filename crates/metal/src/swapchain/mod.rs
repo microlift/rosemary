@@ -5672,12 +5672,17 @@ impl Swapchain {
                         }
                     };
                     if let Some(clipped) = logical {
-                        blit(
+                        let shown_format = if self.corners.is_some() {
+                            corners::FORMAT
+                        } else {
+                            self.composite.as_ref().expect("made above").format
+                        };
+                        copy_or_blit(
                             device,
                             command_buffer,
-                            shown,
+                            (shown, shown_format),
                             clipped,
-                            target,
+                            (target, self.format),
                             vk::ImageLayout::TRANSFER_DST_OPTIMAL,
                             clipped,
                         );
@@ -5690,12 +5695,12 @@ impl Swapchain {
                         appkit::window::presentation_clip(frame.window),
                         (source.width, source.height),
                     ) {
-                        blit(
+                        copy_or_blit(
                             device,
                             command_buffer,
-                            source.image,
+                            (source.image, source.format),
                             from,
-                            target,
+                            (target, self.format),
                             vk::ImageLayout::TRANSFER_DST_OPTIMAL,
                             into,
                         );
