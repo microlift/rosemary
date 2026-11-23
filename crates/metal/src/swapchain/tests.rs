@@ -3134,6 +3134,10 @@ fn present_copy_preserves_texels_and_converting_blit_swizzles_channels() {
         vk::Offset3D { x: 1, y: 1, z: 0 },
         vk::Offset3D { x: 3, y: 3, z: 1 },
     ];
+    // An unscaled same-format blit gives the same texels, so the pixels
+    // alone cannot show which path each target took.
+    assert!(copy_extent(source.format, from, same.format, to).is_some());
+    assert!(copy_extent(source.format, from, converted.format, to).is_none());
     gpu.one_shot(|device, cb| unsafe {
         cmd_test_clear_color(device, cb, source.image, [1.0, 0.0, 0.0, 1.0]);
         prepare_source(device, cb, source.image);
