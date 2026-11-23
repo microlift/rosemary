@@ -2084,7 +2084,7 @@ dependencies = [
 [[package]]
 name = "microlift"
 version = "0.1.0"
-source = "git+https://github.com/microlift/microlift?rev=ef03e1f07f8c103f4bc3a59057d0a63c2efe8133#ef03e1f07f8c103f4bc3a59057d0a63c2efe8133"
+source = "git+https://github.com/microlift/microlift?rev=646e522e3a9633cfacb79c6814b3b040548ce602#646e522e3a9633cfacb79c6814b3b040548ce602"
 dependencies = [
  "capstone",
  "cranelift",
