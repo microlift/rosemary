@@ -3577,8 +3577,12 @@ pub mod video {
     /// with `parent`. A dialog's window belongs to its `NSWindow`, not to the
     /// window it was opened over, so it is not made part of `parent`'s family:
     /// [`destroy_window_now`] lets go of it before `parent` goes instead.
+    ///
+    /// Not on macOS, where SDL makes `window` a child window of `parent`, which
+    /// moves with it: a dialog there is a window of its own, as it is to the
+    /// guest.
     pub fn set_window_transient_for(window: Window, parent: Window) -> bool {
-        if crate::desktop::active() {
+        if cfg!(target_os = "macos") || crate::desktop::active() {
             return false;
         }
         let Some(set_parent) = api().and_then(|a| a.SDL_SetWindowParent) else {
