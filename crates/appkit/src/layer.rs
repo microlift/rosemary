@@ -1,4 +1,5 @@
 use std::ffi::c_void;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use foundation::geometry::{NSRect, NSSize};
 use objc::object::Id;
@@ -42,7 +43,8 @@ struct MetalLayer {
     layer: Layer,
     device: Id,
     pixel_format: u64,
-    drawable_size: NSSize,
+    /// Set on the guest's render thread and read by the compositor's capture.
+    drawable_size: DrawableSize,
     framebuffer_only: u8,
     display_sync_enabled: u8,
     /// The inverse of `-allowsNextDrawableTimeout`, so that a layer made with
@@ -51,6 +53,37 @@ struct MetalLayer {
 }
 
 pub const METAL_INSTANCE_SIZE: usize = size_of::<MetalLayer>();
+
+/// `-drawableSize` as bit patterns. A capture racing a write may pair an old
+/// width with a new height, which the write's scene invalidation repairs on
+/// the next capture.
+struct DrawableSize {
+    width: AtomicU64,
+    height: AtomicU64,
+}
+
+impl DrawableSize {
+    fn get(&self) -> NSSize {
+        NSSize {
+            width: f64::from_bits(self.width.load(Ordering::Acquire)),
+            height: f64::from_bits(self.height.load(Ordering::Acquire)),
+        }
+    }
+
+    fn replace(&self, size: NSSize) -> NSSize {
+        NSSize {
+            width: f64::from_bits(self.width.swap(size.width.to_bits(), Ordering::AcqRel)),
+            height: f64::from_bits(self.height.swap(size.height.to_bits(), Ordering::AcqRel)),
+        }
+    }
+}
+
+/// A `CAMetalLayer`'s drawable size, shared rather than through
+/// [`metal_layer_of`]: other threads read it while the guest writes it.
+fn drawable_size_cell<'a>(receiver: Id) -> &'a DrawableSize {
+    // SAFETY: a CAMetalLayer, whose registered layout is MetalLayer.
+    unsafe { &*std::ptr::addr_of!((*(receiver as *const MetalLayer)).drawable_size) }
+}
 
 fn layer_of<'a>(receiver: Id) -> &'a mut Layer {
     // SAFETY: a layer of this crate's, which is what every method here is sent
@@ -586,7 +619,7 @@ unsafe extern "C" fn pixel_format(receiver: Id, _sel: Sel) -> u64 {
 }
 
 unsafe extern "C" fn set_drawable_size(receiver: Id, _sel: Sel, size: NSSize) {
-    let old = std::mem::replace(&mut metal_layer_of(receiver).drawable_size, size);
+    let old = drawable_size_cell(receiver).replace(size);
     // Under any gravity but `resize` the drawable's size decides where it
     // lands, which the compositor's scene must hear about.
     if old != size {
@@ -596,11 +629,11 @@ unsafe extern "C" fn set_drawable_size(receiver: Id, _sel: Sel, size: NSSize) {
 
 /// A `CAMetalLayer`'s `-drawableSize`.
 pub(crate) fn drawable_size_of(layer: Id) -> NSSize {
-    metal_layer_of(layer).drawable_size
+    drawable_size_cell(layer).get()
 }
 
 unsafe extern "C" fn drawable_size(receiver: Id, _sel: Sel) -> NSSize {
-    metal_layer_of(receiver).drawable_size
+    drawable_size_cell(receiver).get()
 }
 
 unsafe extern "C" fn set_framebuffer_only(receiver: Id, _sel: Sel, value: u8) {

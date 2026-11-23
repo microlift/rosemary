@@ -1673,6 +1673,8 @@ unsafe extern "C" fn set_layer(receiver: Id, _sel: Sel, layer: Id) {
     if view.layer_backing & CLIPS_TO_BOUNDS != 0 && !layer.is_null() {
         crate::layer::set_masks_to_bounds_of(layer, true);
     }
+    // A hosted layer is kept where the view is, as a backing one is.
+    crate::layer::set_geometry_of(layer, bounds_of(receiver), view_of(receiver).frame);
     objc::arc::release(previous);
     notify_metal_scene(receiver);
 }
@@ -2279,6 +2281,9 @@ pub unsafe fn contents_frame(view: Id, layer: Id, size: (u32, u32)) -> Option<Fr
 ///
 /// As [`contents_frame`].
 unsafe fn metal_contents_frame(view: Id, layer: Id) -> Option<Frame> {
+    // FIXME (ACCURACY): placed by `-drawableSize`, not by the size of the
+    // drawable presented, so drawables still in flight across a resize land
+    // where the new size would under a gravity other than `resize`.
     let size = crate::layer::drawable_size_of(layer);
     if size.width < 1.0 || size.height < 1.0 {
         // SAFETY: the caller's obligation.
@@ -4454,8 +4459,8 @@ mod tests {
         assert_eq!(
             (placed.width, placed.height),
             (
-                (512.0 * pixels_per_point) as u32,
-                (256.0 * pixels_per_point) as u32
+                (512.0 * pixels_per_point).round() as u32,
+                (256.0 * pixels_per_point).round() as u32
             )
         );
         objc::arc::release(window);
