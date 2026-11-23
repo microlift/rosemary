@@ -243,7 +243,15 @@ pub(crate) unsafe extern "C" fn next_drawable(receiver: Id, _sel: Sel) -> Id {
         &CACHE,
         cache,
         matches,
-        || crate::swapchain::wait_copied(RECLAIM_POLL),
+        || {
+            // A slot comes back once its frame is presented, and part of that
+            // only the video thread may do; waiting on it there would wait
+            // for this thread itself.
+            if sdl3::video::is_video_thread() {
+                appkit::event::service_presentation_only();
+            }
+            crate::swapchain::wait_copied(RECLAIM_POLL)
+        },
         RECLAIM_POLL,
         deadline,
     ) else {
@@ -1105,7 +1113,7 @@ pub(crate) fn enqueue_swapchain(drawable: Id) -> PresentAttempt {
         complete(drawable);
         return PresentAttempt::Handled;
     }
-    let Some(frame) = layer_frame(described.layer) else {
+    let Some(frame) = drawable_frame(described.layer, &texture.image) else {
         // SDL window metadata is deliberately invalidated between resize,
         // movement, scale changes and the next video-thread publication.
         // A live window must not lose an already-submitted drawable during
@@ -1297,7 +1305,7 @@ fn present_inner(drawable: Id) {
     if appkit::view::is_hidden_or_has_hidden_ancestor(view) {
         return;
     }
-    let frame = layer_frame(described.layer);
+    let frame = drawable_frame(described.layer, &texture.image);
 
     // The layer's own window where it has one, and the first window
     // otherwise - which is a guess, but the only one available for a layer
@@ -1367,6 +1375,16 @@ pub(crate) fn layer_frame(layer: Id) -> Option<appkit::view::Frame> {
     let view = unsafe { appkit::layer::view_of(layer) };
     // SAFETY: null or a view of AppKit's.
     unsafe { appkit::view::presentation_frame(view) }
+}
+
+/// Where a drawable of `image`'s size lands in its layer's window: scaled over
+/// the layer under the default `contentsGravity`, and at its own size where
+/// any other gravity puts it, as Core Animation places any contents.
+fn drawable_frame(layer: Id, image: &gpu::GpuImage) -> Option<appkit::view::Frame> {
+    // SAFETY: a `CAMetalLayer` this runtime made, whose view outlives it.
+    let view = unsafe { appkit::layer::view_of(layer) };
+    // SAFETY: null or a view of AppKit's, and the layer it holds.
+    unsafe { appkit::view::contents_frame(view, layer, (image.width, image.height)) }
 }
 
 /// Write a presented frame to `ROSEMARY_FRAME_OUT` as a binary PPM.

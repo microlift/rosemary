@@ -209,7 +209,13 @@ impl Namespace {
     /// itself, and an image that binds against one gets a table of forwarding
     /// edges - treating a re-export as a definition would bind every such
     /// import to address zero and report success.
-    fn lookup(&self, image: &NamespaceImage, name: &str, depth: usize) -> Option<Resolved> {
+    fn lookup(
+        &self,
+        image: &NamespaceImage,
+        name: &str,
+        depth: usize,
+        outside: &[&dyn SymbolProvider],
+    ) -> Option<Resolved> {
         if depth > MAX_REEXPORT_DEPTH {
             return None;
         }
@@ -221,8 +227,7 @@ impl Namespace {
             return image
                 .reexports
                 .iter()
-                .filter_map(|target| self.find(target))
-                .find_map(|next| self.lookup(next, name, depth + 1));
+                .find_map(|target| self.forward(target, name, depth + 1, outside));
         };
 
         if let ExportValue::Reexport {
@@ -233,9 +238,8 @@ impl Namespace {
             let target = image
                 .dependencies
                 .get(usize::from(*ordinal).checked_sub(1)?)?;
-            let next = self.find(target)?;
             let name = imported_name.as_deref().unwrap_or(name);
-            return self.lookup(next, name, depth + 1);
+            return self.forward(target, name, depth + 1, outside);
         }
 
         Some(Resolved {
@@ -246,6 +250,79 @@ impl Namespace {
             },
             tag: 0,
         })
+    }
+
+    /// `name` in the library `target` names: an image of this namespace, or
+    /// one a provider in `outside` stands for, which is why the link did not
+    /// map it.
+    fn forward(
+        &self,
+        target: &str,
+        name: &str,
+        depth: usize,
+        outside: &[&dyn SymbolProvider],
+    ) -> Option<Resolved> {
+        if let Some(next) = self.find(target) {
+            return self.lookup(next, name, depth, outside);
+        }
+        let sym = SymbolRef {
+            name,
+            library: LibraryRef::InstallName(target),
+            weak_import: false,
+        };
+        outside
+            .iter()
+            .filter(|p| p.stands_for(target))
+            .find_map(|p| p.resolve(&sym))
+    }
+
+    fn resolve_with(
+        &self,
+        sym: &SymbolRef<'_>,
+        outside: &[&dyn SymbolProvider],
+    ) -> Option<Resolved> {
+        match sym.library {
+            LibraryRef::InstallName(name) => self.lookup(self.find(name)?, sym.name, 0, outside),
+            // A flat or unknown-ordinal reference searches every loaded image
+            // in load order, which is dyld's flat-namespace rule.
+            _ => self
+                .images
+                .iter()
+                .find_map(|i| self.lookup(i, sym.name, 0, outside)),
+        }
+    }
+
+    /// This namespace in front of `outside`, the providers its link was
+    /// resolved against, whose libraries its images may re-export.
+    pub fn within<'a>(&'a self, outside: &'a [&'a dyn SymbolProvider]) -> Within<'a> {
+        Within {
+            namespace: self,
+            outside,
+        }
+    }
+}
+
+/// A [`Namespace`] whose re-exports reach the providers its link deferred to.
+pub struct Within<'a> {
+    namespace: &'a Namespace,
+    outside: &'a [&'a dyn SymbolProvider],
+}
+
+impl SymbolProvider for Within<'_> {
+    fn provides(&self, install_name: &str) -> bool {
+        self.namespace.provides(install_name)
+    }
+
+    fn stands_for(&self, install_name: &str) -> bool {
+        self.namespace.stands_for(install_name)
+    }
+
+    fn resolve(&self, sym: &SymbolRef<'_>) -> Option<Resolved> {
+        self.namespace.resolve_with(sym, self.outside)
+    }
+
+    fn enumerate(&self, out: &mut dyn FnMut(&str, Resolved)) {
+        self.namespace.enumerate(out);
     }
 }
 
@@ -259,12 +336,7 @@ impl SymbolProvider for Namespace {
     }
 
     fn resolve(&self, sym: &SymbolRef<'_>) -> Option<Resolved> {
-        match sym.library {
-            LibraryRef::InstallName(name) => self.lookup(self.find(name)?, sym.name, 0),
-            // A flat or unknown-ordinal reference searches every loaded image
-            // in load order, which is dyld's flat-namespace rule.
-            _ => self.images.iter().find_map(|i| self.lookup(i, sym.name, 0)),
-        }
+        self.resolve_with(sym, &[])
     }
 
     fn enumerate(&self, out: &mut dyn FnMut(&str, Resolved)) {
@@ -446,6 +518,25 @@ mod tests {
             None
         );
         // Specifically: not `Some(0)`.
+    }
+
+    #[test]
+    fn a_reexport_reaches_a_library_a_provider_stands_for() {
+        let mut stub = image("libstub.dylib", vec![], &["libimpl.dylib"], 0);
+        stub.reexports = vec!["libimpl.dylib".to_string()];
+        let mut ns = Namespace::new();
+        ns.push(stub);
+        let mut loaded = crate::resolve::SyntheticDylib::new("libimpl.dylib");
+        loaded.define_data("_x", 0x1000);
+        let outside: [&dyn SymbolProvider; 1] = [&loaded];
+
+        let import = sym("_x", LibraryRef::InstallName("libstub.dylib"));
+        assert_eq!(
+            ns.within(&outside).resolve(&import).map(|r| r.addr),
+            Some(0x1000)
+        );
+        // Only through the stub: the provider is not asked for its own sake.
+        assert_eq!(ns.resolve(&import), None);
     }
 
     #[test]

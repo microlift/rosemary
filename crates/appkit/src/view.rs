@@ -1045,7 +1045,7 @@ fn visit_metal_scene(
     }
     if !layer.is_null()
         && crate::layer::is_metal(layer)
-        && let Some(frame) = unsafe { presentation_frame(view) }
+        && let Some(frame) = unsafe { metal_contents_frame(view, layer) }
         && frame.window == window
     {
         scene.push(MetalSceneLayer {
@@ -1394,10 +1394,10 @@ fn note_geometry_change(receiver: Id, before: NSRect) {
     if view.frame.size != before.size {
         resize_subviews(receiver, before.size);
     }
-    // AppKit keeps a view's layer the size of its bounds.
+    // AppKit keeps a view's layer where the view is.
     let layer = view_of(receiver).layer;
     if !layer.is_null() {
-        crate::layer::set_bounds_of(layer, bounds_of(receiver));
+        crate::layer::set_geometry_of(layer, bounds_of(receiver), view_of(receiver).frame);
     }
     crate::layout::solve();
     let view = view_of(receiver);
@@ -1673,6 +1673,8 @@ unsafe extern "C" fn set_layer(receiver: Id, _sel: Sel, layer: Id) {
     if view.layer_backing & CLIPS_TO_BOUNDS != 0 && !layer.is_null() {
         crate::layer::set_masks_to_bounds_of(layer, true);
     }
+    // A hosted layer is kept where the view is, as a backing one is.
+    crate::layer::set_geometry_of(layer, bounds_of(receiver), view_of(receiver).frame);
     objc::arc::release(previous);
     notify_metal_scene(receiver);
 }
@@ -1705,7 +1707,7 @@ unsafe extern "C" fn set_wants_layer(receiver: Id, _sel: Sel, wants: u8) {
     if layer.is_null() {
         return;
     }
-    crate::layer::set_bounds_of(layer, bounds_of(receiver));
+    crate::layer::set_geometry_of(layer, bounds_of(receiver), view_of(receiver).frame);
     // A backing layer's delegate is its view, which is what routes the
     // layer's `-display` to the view.
     if crate::layer::delegate_of(layer).is_null() {
@@ -2234,6 +2236,61 @@ pub unsafe fn presentation_frame(view: Id) -> Option<Frame> {
         window_height: host_pixels.1.max(0) as u32,
     };
     Some(frame)
+}
+
+/// Where `layer`, the layer of `view`, shows contents of `size` pixels, in the
+/// window pixels [`presentation_frame`] answers in: the view's own frame under
+/// the default `resize` gravity, and otherwise the contents at their own size,
+/// placed by the layer's `contentsGravity`. The frame may overhang the view.
+///
+/// # Safety
+///
+/// As [`presentation_frame`], and `layer` is null or a layer of this crate's.
+pub unsafe fn contents_frame(view: Id, layer: Id, size: (u32, u32)) -> Option<Frame> {
+    // SAFETY: the caller's obligation.
+    let frame = unsafe { presentation_frame(view) }?;
+    let bounds = bounds_of(view).size;
+    if bounds.width <= 0.0 || bounds.height <= 0.0 {
+        return Some(frame);
+    }
+    let rect = crate::backing::Rect {
+        x: frame.x.into(),
+        y: frame.y.into(),
+        width: frame.width.into(),
+        height: frame.height.into(),
+    };
+    let scale = (
+        f64::from(frame.width) / bounds.width,
+        f64::from(frame.height) / bounds.height,
+    );
+    let placed = crate::coreanimation::contents_rect(layer, rect, scale, size)?;
+    Some(Frame {
+        x: i32::try_from(placed.x).ok()?,
+        y: i32::try_from(placed.y).ok()?,
+        width: u32::try_from(placed.width).ok()?,
+        height: u32::try_from(placed.height).ok()?,
+        ..frame
+    })
+}
+
+/// Where the drawables of `layer`, the `CAMetalLayer` of `view`, land: as
+/// [`contents_frame`] places a drawable of the layer's `-drawableSize`, and
+/// the view's own frame while the layer has no drawable size yet.
+///
+/// # Safety
+///
+/// As [`contents_frame`].
+unsafe fn metal_contents_frame(view: Id, layer: Id) -> Option<Frame> {
+    // FIXME (ACCURACY): placed by `-drawableSize`, not by the size of the
+    // drawable presented, so drawables still in flight across a resize land
+    // where the new size would under a gravity other than `resize`.
+    let size = crate::layer::drawable_size_of(layer);
+    if size.width < 1.0 || size.height < 1.0 {
+        // SAFETY: the caller's obligation.
+        return unsafe { presentation_frame(view) };
+    }
+    // SAFETY: the caller's obligation.
+    unsafe { contents_frame(view, layer, (size.width as u32, size.height as u32)) }
 }
 
 /// The part of a view its ancestors and its window leave on screen, in the
@@ -4321,6 +4378,91 @@ mod tests {
             "empty redraw left native pixels above the static Metal source"
         );
         crate::backing::forget(native);
+        objc::arc::release(window);
+    }
+
+    /// A drawable larger than its layer, under a gravity other than `resize`,
+    /// reaches the compositor at its own size from where the gravity puts it,
+    /// as the readback path presents it.
+    #[test]
+    fn metal_scene_places_an_oversized_drawable_by_gravity() {
+        if !sdl3::isolated::run_here() {
+            return;
+        }
+        crate::bootstrap();
+        if !sdl3::may_pump() {
+            return;
+        }
+        let window = objc::object::create_instance(objc::class::lookup(c"NSWindow").unwrap(), 0);
+        if !unsafe {
+            crate::window::init_with_content_rect_for_tests(window, rect(0.0, 0.0, 320.0, 240.0))
+        } {
+            return;
+        }
+        let sdl = unsafe { crate::window::sdl_window(window) };
+        let content = view(rect(0.0, 0.0, 320.0, 240.0));
+        let set_content: unsafe extern "C" fn(Id, objc::sel::Sel, Id) =
+            unsafe { std::mem::transmute(objc::msg::entry()) };
+        unsafe { set_content(window, objc::sel::get("setContentView:"), content) };
+        let metal_view = view(rect(0.0, 0.0, 320.0, 240.0));
+        let metal_cls = objc::class::lookup(c"CAMetalLayer").unwrap();
+        let maker = objc::sel::get("layer");
+        let make_metal: unsafe extern "C" fn(Id, objc::sel::Sel) -> Id = unsafe {
+            std::mem::transmute(
+                metal_cls
+                    .metaclass()
+                    .method(maker)
+                    .unwrap()
+                    .implementation(),
+            )
+        };
+        let metal = unsafe { make_metal(metal_cls as *const _ as Id, maker) };
+        unsafe {
+            set_layer(metal_view, objc::sel::get("setLayer:"), metal);
+            add_subview(content, objc::sel::get("addSubview:"), metal_view);
+        }
+        let set_drawable_size: unsafe extern "C" fn(Id, objc::sel::Sel, NSSize) =
+            unsafe { std::mem::transmute(objc::msg::entry()) };
+        unsafe {
+            set_drawable_size(
+                metal,
+                objc::sel::get("setDrawableSize:"),
+                NSSize {
+                    width: 512.0,
+                    height: 256.0,
+                },
+            );
+        }
+        let view_frame = unsafe { presentation_frame(metal_view) }.unwrap();
+        let scene_frame = || {
+            let (scene, _) = capture_metal_scene(sdl, darwin::mach::media_time()).unwrap();
+            scene
+                .iter()
+                .find(|item| item.layer == metal as usize)
+                .unwrap()
+                .frame
+        };
+        let unplaced = scene_frame();
+        assert_eq!(
+            (unplaced.x, unplaced.y, unplaced.width, unplaced.height),
+            (
+                view_frame.x,
+                view_frame.y,
+                view_frame.width,
+                view_frame.height
+            )
+        );
+        crate::coreanimation::set_gravity(metal, crate::coreanimation::Gravity::TopLeft);
+        let placed = scene_frame();
+        assert_eq!((placed.x, placed.y), (view_frame.x, view_frame.y));
+        let pixels_per_point = f64::from(view_frame.width) / 320.0;
+        assert_eq!(
+            (placed.width, placed.height),
+            (
+                (512.0 * pixels_per_point).round() as u32,
+                (256.0 * pixels_per_point).round() as u32
+            )
+        );
         objc::arc::release(window);
     }
 

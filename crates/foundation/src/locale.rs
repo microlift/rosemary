@@ -158,6 +158,13 @@ unsafe extern "C" fn object_for_key(_receiver: Id, _sel: Sel, key: Id) -> Id {
     }
 }
 
+/// `-displayNameForKey:value:`.
+// FIXME (ACCURACY): nil for every key, where macOS names identifiers,
+// languages and regions; display names are CLDR data this tree does not carry.
+unsafe extern "C" fn display_name_for_key(_receiver: Id, _sel: Sel, _key: Id, _value: Id) -> Id {
+    std::ptr::null_mut()
+}
+
 unsafe extern "C" fn locale_identifier(_receiver: Id, _sel: Sel) -> Id {
     autoreleased(&identifier())
 }
@@ -344,6 +351,7 @@ pub(crate) fn install() {
     methods!(class, {
         "objectForKey:" => object_for_key, c"@24@0:8@16";
         "localeIdentifier" => locale_identifier, c"@16@0:8";
+        "displayNameForKey:value:" => display_name_for_key, c"@32@0:8@16@24";
     });
 }
 

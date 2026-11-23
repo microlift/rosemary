@@ -434,18 +434,48 @@ macro_rules! element_field {
     };
 }
 
-element_field!(/// The element's opaque identity, which a guest stores and looks up.
-    IOHIDElementGetCookie, u32, |e: &crate::hid::Element| e.cookie, 0);
-element_field!(/// `kHIDPage_GenericDesktop`, `kHIDPage_Button`, and so on.
-    IOHIDElementGetUsagePage, u32, |e: &crate::hid::Element| e.page, 0);
-element_field!(/// Which control on that page.
-    IOHIDElementGetUsage, u32, |e: &crate::hid::Element| e.usage, 0);
-element_field!(/// Axis, button, hat or collection.
-    IOHIDElementGetType, u32, |e: &crate::hid::Element| e.kind, 0);
-element_field!(/// The lowest value this element reports.
-    IOHIDElementGetLogicalMin, CFIndex, |e: &crate::hid::Element| e.logical_min as CFIndex, 0);
-element_field!(/// The highest.
-    IOHIDElementGetLogicalMax, CFIndex, |e: &crate::hid::Element| e.logical_max as CFIndex, 0);
+element_field!(
+    /// The element's opaque identity, which a guest stores and looks up.
+    IOHIDElementGetCookie,
+    u32,
+    |e: &crate::hid::Element| e.cookie,
+    0
+);
+element_field!(
+    /// `kHIDPage_GenericDesktop`, `kHIDPage_Button`, and so on.
+    IOHIDElementGetUsagePage,
+    u32,
+    |e: &crate::hid::Element| e.page,
+    0
+);
+element_field!(
+    /// Which control on that page.
+    IOHIDElementGetUsage,
+    u32,
+    |e: &crate::hid::Element| e.usage,
+    0
+);
+element_field!(
+    /// Axis, button, hat or collection.
+    IOHIDElementGetType,
+    u32,
+    |e: &crate::hid::Element| e.kind,
+    0
+);
+element_field!(
+    /// The lowest value this element reports.
+    IOHIDElementGetLogicalMin,
+    CFIndex,
+    |e: &crate::hid::Element| e.logical_min as CFIndex,
+    0
+);
+element_field!(
+    /// The highest.
+    IOHIDElementGetLogicalMax,
+    CFIndex,
+    |e: &crate::hid::Element| e.logical_max as CFIndex,
+    0
+);
 
 pub unsafe extern "C" fn IOHIDElementGetDevice(element: *const c_void) -> CFTypeRef {
     unsafe { value::element(element) }.map_or(std::ptr::null(), |(device, _)| {

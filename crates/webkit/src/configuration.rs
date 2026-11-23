@@ -158,6 +158,8 @@ fn unregister_handler(engine: &Engine, manager: Ptr, name: &str) {
 #[derive(Default)]
 pub struct Preferences {
     pub developer_extras: bool,
+    /// Off by default, as on macOS; WebKitGTK's own default is on.
+    pub tab_focuses_links: bool,
 }
 
 fn configuration_class() -> &'static Class {
@@ -614,6 +616,19 @@ unsafe extern "C" fn set_preference_value(receiver: Id, _sel: Sel, value: Id, ke
     }
 }
 
+unsafe extern "C" fn tab_focuses_links(receiver: Id, _sel: Sel) -> u8 {
+    // SAFETY: preferences.
+    unsafe { preferences(receiver) }.map_or(0, |p| u8::from(p.tab_focuses_links))
+}
+
+unsafe extern "C" fn set_tab_focuses_links(receiver: Id, _sel: Sel, value: u8) {
+    // SAFETY: preferences.
+    if let Some(preferences) = unsafe { preferences(receiver) } {
+        preferences.tab_focuses_links = value != 0;
+        crate::web_view::apply_tab_focuses_links(receiver, value != 0);
+    }
+}
+
 unsafe extern "C" fn yes(_receiver: Id, _sel: Sel) -> u8 {
     1
 }
@@ -664,6 +679,8 @@ pub fn install() {
         "javaScriptEnabled" => yes, c"c16@0:8";
         "setJavaScriptEnabled:" => ignore_flag, c"v20@0:8c16";
         "setJavaScriptCanOpenWindowsAutomatically:" => ignore_flag, c"v20@0:8c16";
+        "tabFocusesLinks" => tab_focuses_links, c"c16@0:8";
+        "setTabFocusesLinks:" => set_tab_focuses_links, c"v20@0:8c16";
     });
 
     corefoundation::base::abstract_class(c"WKProcessPool", None);

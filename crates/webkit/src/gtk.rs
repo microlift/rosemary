@@ -124,8 +124,10 @@ api! {
     webkit_web_view_go_back: fn(Ptr);
     webkit_web_view_go_forward: fn(Ptr);
     webkit_web_view_get_settings: fn(Ptr) -> Ptr;
+    webkit_web_view_set_zoom_level: fn(Ptr, f64);
     webkit_settings_set_user_agent: fn(Ptr, *const c_char);
     webkit_settings_set_enable_developer_extras: fn(Ptr, c_int);
+    webkit_settings_set_enable_tabs_to_links: fn(Ptr, c_int);
     webkit_settings_set_allow_file_access_from_file_urls: fn(Ptr, c_int);
     webkit_settings_set_allow_universal_access_from_file_urls: fn(Ptr, c_int);
     webkit_settings_set_enable_write_console_messages_to_stdout: fn(Ptr, c_int);

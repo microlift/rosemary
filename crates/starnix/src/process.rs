@@ -420,7 +420,11 @@ mod tests {
         let alone = listed.as_ref().and_then(|listed| thread(me(), listed.tid));
         blocker.wait();
         other.join().unwrap();
-        if cfg!(any(target_os = "linux", target_os = "macos", target_os = "freebsd")) {
+        if cfg!(any(
+            target_os = "linux",
+            target_os = "macos",
+            target_os = "freebsd"
+        )) {
             let (listed, alone) = (listed.unwrap(), alone.unwrap());
             assert_eq!(alone.tid, listed.tid);
             assert_eq!(alone.name, listed.name);
