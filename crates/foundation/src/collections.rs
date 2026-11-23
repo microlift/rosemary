@@ -310,6 +310,41 @@ unsafe extern "C" fn enumerator_enumerate(
     batch
 }
 
+/// `for (id x in enumerator)` for any `NSEnumerator`, which Foundation's
+/// abstract class implements on `-nextObject`.
+unsafe extern "C" fn next_object_enumerate(
+    receiver: Id,
+    _sel: Sel,
+    state: *mut FastEnumerationState,
+    buffer: *mut Id,
+    len: usize,
+) -> usize {
+    if state.is_null() || buffer.is_null() || len == 0 {
+        return 0;
+    }
+    // SAFETY: `-nextObject` is `id (id, SEL)`.
+    let next_object: unsafe extern "C" fn(Id, Sel) -> Id =
+        unsafe { std::mem::transmute(objc::msg::entry()) };
+    let selector = objc::sel::get("nextObject");
+    let mut batch = 0;
+    while batch < len {
+        // SAFETY: an enumerator, sent the message every subclass answers.
+        let object = unsafe { next_object(receiver, selector) };
+        if object.is_null() {
+            break;
+        }
+        // SAFETY: the caller said `buffer` holds `len` items.
+        unsafe { *buffer.add(batch) = object };
+        batch += 1;
+    }
+    // SAFETY: the guest's own state structure.
+    let state = unsafe { &mut *state };
+    state.state = 1;
+    state.items = buffer;
+    state.mutations = &NEVER_MUTATED as *const usize as *mut usize;
+    batch
+}
+
 unsafe extern "C" fn enumerator_dealloc(receiver: Id, _sel: Sel) {
     // SAFETY: an enumerator at the end of its lifetime, and the snapshot it owns.
     unsafe { api::CFRelease((*(receiver as *mut ArrayEnumerator)).values) };
@@ -2907,6 +2942,9 @@ pub(crate) fn install() {
     });
 
     let enumerator = corefoundation::base::abstract_class(c"NSEnumerator", None);
+    methods!(enumerator, {
+        "countByEnumeratingWithState:objects:count:" => next_object_enumerate, c"Q40@0:8^{?=Q^@^QQ5}16^@24Q32";
+    });
     let array_enumerator = corefoundation::base::register(
         c"__NSArrayEnumerator",
         Some(enumerator),

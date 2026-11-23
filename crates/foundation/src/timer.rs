@@ -192,9 +192,21 @@ fn timer_of<'a>(receiver: Id) -> &'a mut Timer {
 /// which is why `-invalidate` is the documented way to stop one.
 static SCHEDULED: std::sync::Mutex<Vec<usize>> = std::sync::Mutex::new(Vec::new());
 
-/// One turn of a timer: send the selector to the target.
+/// One turn of a timer, holding it throughout: the action may invalidate it,
+/// which drops what may be the last reference before this is done with it.
 unsafe extern "C" fn fire(_timer: *const c_void, info: *mut c_void) {
-    let object = info as Id;
+    let object = objc::arc::retain(info as Id);
+    // SAFETY: a timer, retained above.
+    unsafe { fire_held(object) };
+    objc::arc::release(object);
+}
+
+/// Send the selector to the target, or call the block.
+///
+/// # Safety
+///
+/// `object` is a live timer of this module's.
+unsafe fn fire_held(object: Id) {
     let (target, selector, repeats, user_info, passes_timer, block) = {
         let timer = timer_of(object);
         (
@@ -464,6 +476,19 @@ unsafe extern "C" fn invalidate(receiver: Id, _sel: Sel) {
     objc::arc::release(receiver);
 }
 
+/// `-dealloc`: what the timer held for its life. A scheduled timer is never
+/// reached here, since the run loop's table holds it.
+unsafe extern "C" fn timer_dealloc(receiver: Id, _sel: Sel) {
+    let timer = timer_of(receiver);
+    objc::arc::release(std::mem::replace(&mut timer.target, std::ptr::null_mut()));
+    objc::arc::release(std::mem::replace(
+        &mut timer.user_info,
+        std::ptr::null_mut(),
+    ));
+    objc::block::release(std::mem::replace(&mut timer.block, std::ptr::null_mut()));
+    objc::arc::finalize(receiver);
+}
+
 unsafe extern "C" fn is_valid(receiver: Id, _sel: Sel) -> u8 {
     !timer_of(receiver).timer.is_null() as u8
 }
@@ -598,6 +623,7 @@ pub(crate) fn install() {
             => unscheduled_block_timer, c"@36@0:8d16c24@?28";
     });
     methods!(timer_class, {
+        "dealloc" => timer_dealloc, c"v16@0:8";
         "invalidate" => invalidate, c"v16@0:8";
         "isValid" => is_valid, c"B16@0:8";
         "fire" => timer_fire, c"v16@0:8";

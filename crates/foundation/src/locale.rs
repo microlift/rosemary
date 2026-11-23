@@ -158,10 +158,9 @@ unsafe extern "C" fn object_for_key(_receiver: Id, _sel: Sel, key: Id) -> Id {
     }
 }
 
-/// `-displayNameForKey:value:`, nil for the reason
-/// `CFLocaleCopyDisplayNameForPropertyValue` records: a display name is CLDR
-/// data this tree does not carry, and nil is the documented answer for a value
-/// the locale cannot name.
+/// `-displayNameForKey:value:`.
+// FIXME (ACCURACY): nil for every key, where macOS names identifiers,
+// languages and regions; display names are CLDR data this tree does not carry.
 unsafe extern "C" fn display_name_for_key(_receiver: Id, _sel: Sel, _key: Id, _value: Id) -> Id {
     std::ptr::null_mut()
 }
