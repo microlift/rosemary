@@ -625,6 +625,7 @@ unsafe extern "C" fn set_tab_focuses_links(receiver: Id, _sel: Sel, value: u8) {
     // SAFETY: preferences.
     if let Some(preferences) = unsafe { preferences(receiver) } {
         preferences.tab_focuses_links = value != 0;
+        crate::web_view::apply_tab_focuses_links(receiver, value != 0);
     }
 }
 

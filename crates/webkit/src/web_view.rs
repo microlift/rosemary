@@ -901,6 +901,35 @@ unsafe extern "C" fn set_custom_user_agent(receiver: Id, _sel: Sel, agent: Id) {
     unsafe { apply_user_agent(engine, gtk, configuration, &agent) };
 }
 
+/// `-tabFocusesLinks` for the live views whose configuration holds
+/// `preferences`: a change on macOS reaches the views already made with them.
+pub(crate) fn apply_tab_focuses_links(preferences: Id, enabled: bool) {
+    let Some(engine) = engine::get() else {
+        return;
+    };
+    // Collected first: GTK may call back into a view while the list is borrowed.
+    let views: Vec<Ptr> = VIEWS.with(|views| {
+        views
+            .borrow()
+            .iter()
+            // SAFETY: a configuration each view retains.
+            .filter(|v| {
+                v.gtk != 0
+                    && unsafe { configuration::preferences_of(v.configuration as Id) }
+                        == preferences
+            })
+            .map(|v| v.gtk as Ptr)
+            .collect()
+    });
+    for gtk in views {
+        // SAFETY: a live `WebKitWebView` and its own settings.
+        unsafe {
+            let settings = (engine.api.webkit_web_view_get_settings)(gtk);
+            (engine.api.webkit_settings_set_enable_tabs_to_links)(settings, c_int::from(enabled));
+        }
+    }
+}
+
 const DEFAULT_PAGE_ZOOM: f64 = 1.0;
 
 /// `-pageZoom`.
