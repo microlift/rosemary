@@ -338,11 +338,45 @@ pub fn verify() -> bool {
 
 /// Whether guest memory accesses are fenced to keep x86's total store order.
 ///
+/// Only where the guest needs the order and the CPU does not keep it for us. See
+/// [`hardware_total_store_order`].
+pub fn total_store_order() -> bool {
+    guest_needs_total_store_order() && !hardware_total_store_order()
+}
+
+/// Whether every guest thread runs under the CPU's own total store order, which
+/// makes the lifter's fences redundant.
+///
+/// Asked once, by entering the mode on whichever thread asks first; every guest
+/// thread then enters it in [`enter_guest_memory_model`]. Lazy so that a native
+/// run, which lifts nothing, never pays for the stronger ordering.
+pub fn hardware_total_store_order() -> bool {
+    #[dynamic(lazy)]
+    static ON: bool =
+        guest_needs_total_store_order() && starnix::ordering::enter_total_store_order();
+    *ON
+}
+
+/// Put this thread under the memory model lifted code was compiled for.
+///
+/// Code lifted without fences on the strength of [`hardware_total_store_order`]
+/// races on a thread the host left weakly ordered, so failing here is fatal.
+pub fn enter_guest_memory_model() {
+    if hardware_total_store_order() {
+        assert!(
+            starnix::ordering::enter_total_store_order(),
+            "the host granted total store order once and refused it on this thread"
+        );
+    }
+}
+
+/// Whether the guest's memory accesses must keep x86's total store order.
+///
 /// On by default wherever the host is not x86: without it, lock-free guest code that
 /// publishes with plain stores (Unity's job queues, Mono's class setup) races on a
 /// weakly ordered host, which is how a loading screen ends up waiting on a job no
 /// thread holds.
-pub fn total_store_order() -> bool {
+fn guest_needs_total_store_order() -> bool {
     #[dynamic]
     static ON: bool = {
         let default = !cfg!(any(target_arch = "x86", target_arch = "x86_64"));

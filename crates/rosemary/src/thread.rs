@@ -675,6 +675,7 @@ pub fn install(state: ThreadState) -> &'static ThreadState {
     // Registered under this thread's Mach port, which is how a collector on
     // another thread finds it.
     register(key(), Arc::clone(&state.published));
+    crate::jit::enter_guest_memory_model();
     clear_errno();
     state
 }
