@@ -310,6 +310,21 @@ fn rounds(sdl: sdl3::Window) -> bool {
             .contains(&(sdl as usize))
 }
 
+/// Have the host's window server round a decorated window whose pixels are
+/// not cut to its corners. A Mac squares them only in full screen.
+fn round_host_corners(config: Config, facts: &Facts) {
+    let sdl = facts.sdl as sdl3::Window;
+    let rounded = config.decorations == Decorations::Client
+        && facts.titled
+        && !facts.fullscreen
+        && sdl3::video::window_flags(sdl) & sdl3::video::flags::TRANSPARENT == 0;
+    let radius = match rounded {
+        true => f64::from(theme().window_corner_radius),
+        false => 0.0,
+    };
+    sdl3::video::round_corners(sdl, radius);
+}
+
 /// The last press on a titlebar outside its controls, which the window
 /// manager took for a drag, as (SDL window, x, y, milliseconds).
 static LAST_TITLEBAR_PRESS: Mutex<Option<(usize, f32, f32, u64)>> = Mutex::new(None);
@@ -548,6 +563,7 @@ pub(crate) fn pump() {
         let Some(mut facts) = crate::window::facts(window) else {
             continue;
         };
+        round_host_corners(config, &facts);
         // A full-screen window's chrome is drawn only while it slides in, as
         // if the window were not full screen, and shown in a popup of its own.
         let revealed = facts.fullscreen && revealing == Some(window);

@@ -167,7 +167,7 @@ impl Dialog {
         }
 
         let transparent = sdl3::video::is_wayland();
-        let alert = Alert {
+        let mut alert = Alert {
             message: request.message.clone(),
             informative: request.informative.clone(),
             rich_informative: request.rich_informative.clone(),
@@ -210,6 +210,10 @@ impl Dialog {
             }
             return None;
         };
+        if !transparent {
+            alert.rounded =
+                sdl3::video::round_corners(window, f64::from(theme.alert_corner_radius));
+        }
         let parent = parent();
         if modal && !parent.is_null() {
             sdl3::video::set_window_modal_for(window, parent);

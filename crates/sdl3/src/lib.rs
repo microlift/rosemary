@@ -3,6 +3,8 @@
 use std::ffi::{CStr, CString, c_char, c_int, c_void};
 use std::sync::OnceLock;
 
+#[cfg(target_os = "macos")]
+mod cocoa;
 pub mod compositor;
 pub mod desktop;
 #[cfg(any(test, feature = "test-support"))]
@@ -5536,6 +5538,39 @@ pub mod video {
             )
         };
         (!display.is_null() && !surface.is_null()).then_some((display, surface))
+    }
+
+    /// A window's `NSWindow`, on macOS.
+    #[cfg(target_os = "macos")]
+    pub(crate) fn cocoa_window(window: Window) -> Option<*mut c_void> {
+        // The window behind a window on the desktop is never shown.
+        if crate::desktop::owns(window) {
+            return None;
+        }
+        let api = api()?;
+        let (props, get) = (api.SDL_GetWindowProperties?, api.SDL_GetPointerProperty?);
+        // SAFETY: a window from SDL, and a property name SDL documents.
+        let ns_window = unsafe {
+            get(
+                props(window),
+                c"SDL.window.cocoa.window".as_ptr(),
+                std::ptr::null_mut(),
+            )
+        };
+        (!ns_window.is_null()).then_some(ns_window)
+    }
+
+    /// Have the host's window server round `window`'s corners to `radius`
+    /// points, or square them for 0, without its pixels needing alpha. False
+    /// where the host cannot.
+    pub fn round_corners(window: Window, radius: f64) -> bool {
+        #[cfg(target_os = "macos")]
+        return crate::cocoa::round_corners(window, radius);
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = (window, radius);
+            false
+        }
     }
 
     /// `SDL_SystemTheme`.
