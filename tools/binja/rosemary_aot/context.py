@@ -7,7 +7,7 @@ checked with plain Python.
 
 import struct
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Tuple, Union
+from typing import Dict, List, Optional, Sequence, Tuple, Union
 
 
 @dataclass(frozen=True)
@@ -304,13 +304,21 @@ def guest_register_at(offset: int, size: int) -> Optional[str]:
     return None
 
 
-# AArch64 encodings the entry thunk uses to move the context into the pinned argument registers.
+# AArch64 encodings an entry thunk is made of: frame setup, context spills and reloads, loads of
+# guest registers from the context, and the GOT load of the body it calls.
 _LDR_X_UIMM = (0xFFC00000, 0xF9400000)  # ldr Xt, [Xn, #imm12 * 8]
 _LDR_Q_UIMM = (0xFFC00000, 0x3DC00000)  # ldr Qt, [Xn, #imm12 * 16]
-_LDR_X_UIMM_SP = 31
 _LDUR_X = (0xFFE00C00, 0xF8400000)  # ldur Xt, [Xn, #simm9]
+_STR_X_UIMM = (0xFFC00000, 0xF9000000)  # str Xt, [Xn, #imm12 * 8]
+_STUR_X = (0xFFE00C00, 0xF8000000)  # stur Xt, [Xn, #simm9]
+_STORE_PAIR = (0x3A400000, 0x28000000)  # stp, any size, any addressing
+_ADD_SUB_X_IMM = (0xBF800000, 0x91000000)  # add/sub Xd, Xn, #imm
+_ADRP = (0x9F000000, 0x90000000)  # adrp Xd, page
 _BLR = (0xFFFFFC1F, 0xD63F0000)
 _RET = 0xD65F03C0
+_ADRP_IMM = 0x60FFFFE0
+_LDR_IMM12 = 0x003FFC00
+_SP = 31
 # `extern "C"`: the host passes the context as the first argument.
 _AARCH64_HOST_CTX = 0
 
@@ -334,33 +342,115 @@ def _matches(word: int, encoding: Tuple[int, int]) -> bool:
     return word & encoding[0] == encoding[1]
 
 
-def decode_aarch64_thunk(text: bytes, entry: int) -> Optional[PinnedAbi]:
-    """Reads the pinned ABI off an entry thunk: the loads from the incoming context before the
-    call to the body, and the register the context is reloaded into right before that call.
+def _simm9(word: int) -> int:
+    value = (word >> 12) & 0x1FF
+    return value - 0x200 if value & 0x100 else value
 
-    None when the code does not have that shape, so callers type nothing rather than guess.
-    """
-    slots: List[PinnedSlot] = []
-    previous = None
-    for at in range(entry, len(text) - 3, 4):
-        (word,) = struct.unpack_from("<I", text, at)
+
+def _decode_thunk(words: Sequence[int]) -> Optional[Tuple[PinnedAbi, Optional[int], int]]:
+    """The thunk's ABI, the index of its GOT load (`adrp`, then `ldr` through the same register)
+    if it has one, and the index just past its `blr`."""
+    # Registers and stack offsets holding the incoming context.
+    context = {_AARCH64_HOST_CTX}
+    spills = set()
+    slots: Dict[str, PinnedSlot] = {}
+    got = None
+    reload = None
+
+    def write(register: int) -> None:
+        context.discard(register)
+        slots.pop(f"x{register}", None)
+
+    for index, word in enumerate(words):
         if word == _RET:
             return None
         if _matches(word, _BLR):
-            if previous is None or not _matches(previous, _LDUR_X) and not _matches(previous, _LDR_X_UIMM):
+            # The body takes the context in the register reloaded right before the call.
+            if reload is None:
                 return None
-            if (previous >> 5) & 0x1F != _LDR_X_UIMM_SP:
-                return None
-            return PinnedAbi(f"x{previous & 0x1F}", tuple(slots))
-        rn, rt, imm12 = (word >> 5) & 0x1F, word & 0x1F, (word >> 10) & 0xFFF
-        if rn == _AARCH64_HOST_CTX:
-            if _matches(word, _LDR_X_UIMM):
-                guest = guest_register_at(imm12 * 8, 8)
+            return PinnedAbi(f"x{reload}", tuple(slots.values())), got, index + 1
+        rn, rt = (word >> 5) & 0x1F, word & 0x1F
+        reload = None
+        if _matches(word, _LDR_X_UIMM) or _matches(word, _LDUR_X):
+            offset = ((word >> 10) & 0xFFF) * 8 if _matches(word, _LDR_X_UIMM) else _simm9(word)
+            from_context = rn != _SP and rn in context
+            write(rt)
+            if rn == _SP and offset in spills:
+                context.add(rt)
+                reload = rt
+            elif from_context:
+                guest = guest_register_at(offset, 8)
                 if guest is not None:
-                    slots.append(PinnedSlot(f"x{rt}", guest, False))
-            elif _matches(word, _LDR_Q_UIMM):
-                guest = guest_register_at(imm12 * 16, 16)
+                    slots[f"x{rt}"] = PinnedSlot(f"x{rt}", guest, False)
+        elif _matches(word, _LDR_Q_UIMM):
+            slots.pop(f"q{rt}", None)
+            if rn != _SP and rn in context:
+                guest = guest_register_at(((word >> 10) & 0xFFF) * 16, 16)
                 if guest is not None:
-                    slots.append(PinnedSlot(f"q{rt}", guest, True))
-        previous = word
+                    slots[f"q{rt}"] = PinnedSlot(f"q{rt}", guest, True)
+        elif _matches(word, _STR_X_UIMM) or _matches(word, _STUR_X):
+            if rn == _SP:
+                offset = ((word >> 10) & 0xFFF) * 8 if _matches(word, _STR_X_UIMM) else _simm9(word)
+                if rt in context:
+                    spills.add(offset)
+                else:
+                    spills.discard(offset)
+        elif _matches(word, _STORE_PAIR):
+            # Callee-saved registers; a context spilled this way is not followed, so the thunk is rejected.
+            pass
+        elif _matches(word, _ADD_SUB_X_IMM):
+            if rt != _SP:
+                write(rt)
+        elif _matches(word, _ADRP):
+            write(rt)
+            following = words[index + 1] if index + 1 < len(words) else 0
+            if got is None and _matches(following, _LDR_X_UIMM) and (following >> 5) & 0x1F == rt:
+                got = index
+        else:
+            return None
     return None
+
+
+def decode_aarch64_thunk(text: bytes, entry: int) -> Optional[PinnedAbi]:
+    """Reads the pinned ABI off an entry thunk: the guest registers it loads from the incoming
+    context, wherever it spills and reloads that context, and the register it reloads the context
+    into right before calling the body.
+
+    None when the code does not have that shape, or uses an instruction this does not model, so
+    callers type nothing rather than guess.
+    """
+    end = entry + (len(text) - entry) // 4 * 4
+    words = struct.unpack_from(f"<{(end - entry) // 4}I", text, entry)
+    decoded = _decode_thunk(words)
+    return decoded[0] if decoded else None
+
+
+class ThunkDecoder:
+    """`decode_aarch64_thunk` for many thunks. Thunks of one image differ only in where their GOT
+    load points, so each shape is decoded once and later thunks are matched against it by bytes."""
+
+    MAX_SHAPES = 16
+
+    def __init__(self) -> None:
+        # (bytes before the GOT load, its two words with their immediates cleared, bytes after it
+        # through the call, ABI)
+        self._shapes: List[Tuple[bytes, int, int, bytes, PinnedAbi]] = []
+
+    def decode(self, thunk: bytes) -> Optional[PinnedAbi]:
+        for prefix, adrp, ldr, suffix, abi in self._shapes:
+            at = len(prefix)
+            if len(thunk) >= at + 8 + len(suffix) and thunk.startswith(prefix) and thunk.startswith(suffix, at + 8):
+                got_page, got_load = struct.unpack_from("<II", thunk, at)
+                if got_page & ~_ADRP_IMM == adrp and got_load & ~_LDR_IMM12 == ldr:
+                    return abi
+        words = struct.unpack_from(f"<{len(thunk) // 4}I", thunk)
+        decoded = _decode_thunk(words)
+        if decoded is None:
+            return None
+        abi, got, end = decoded
+        if got is not None and len(self._shapes) < self.MAX_SHAPES:
+            at = got * 4
+            self._shapes.append(
+                (thunk[:at], words[got] & ~_ADRP_IMM, words[got + 1] & ~_LDR_IMM12, thunk[at + 8 : end * 4], abi)
+            )
+        return abi

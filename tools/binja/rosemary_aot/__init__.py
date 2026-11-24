@@ -18,12 +18,12 @@ if binaryninja is not None:
 
     def _annotate_function(bv, function):
         view = _view(bv)
-        found = view.region_at(function.start) if view else None
-        if found is None:
+        index = view.region_at(function.start) if view else None
+        if index is None:
             log.log_warn("Rosemary AOT: this function is not a lifted region")
             return
-        count = view.annotate_region(*found)
-        exits = view.annotate_region_exits(*found)
+        count = view.annotate_region(index)
+        exits = view.annotate_region_exits(index)
         log.log_info(f"Rosemary AOT: annotated {count} guest instructions and {exits} exit constants")
 
     def _find_guest(bv):
@@ -33,14 +33,11 @@ if binaryninja is not None:
             return
         found = view.regions_covering(va)
         if not found:
-            interaction.show_message_box("Rosemary AOT", f"No cached region covers guest {va:#x}.")
+            interaction.show_message_box(
+                "Rosemary AOT", f"No region in this file covers guest {va:#x}; other parts of the cache may."
+            )
             return
-        targets = []
-        for c, r in found:
-            region = view.cache.chunks[c].regions[r]
-            body = view.layout.chunks[c].text + region.link_target
-            host = [body + start for start, _end, guest in region.map if view.guest(guest) == va]
-            targets.append((f"region_{view.guest(region.lift_base):x}", min(host, default=body)))
+        targets = [(view.region_name(index), view.host_code_for(index, va)) for index in found]
         view.navigate(view.view, targets[0][1])
         if len(targets) > 1:
             lines = [f"{name}: host {addr:#x}" for name, addr in targets]

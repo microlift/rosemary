@@ -1,5 +1,6 @@
-"""The `RosemaryAOT` BinaryView: a Rosemary cache file as relocated, symbolized host code."""
+"""The `RosemaryAOT` BinaryView: a Rosemary cache file as mapped, symbolized host code."""
 
+import time
 import traceback
 from typing import Dict, List, Optional, Tuple
 
@@ -34,6 +35,9 @@ SETTING_ARCH = "rosemaryAot.architecture"
 SETTING_GUEST_ADDRESSES = "rosemaryAot.guestAddresses"
 SETTING_ANNOTATION_LIMIT = "rosemaryAot.annotationLimit"
 
+# Enough of an entry thunk to reach its call to the body.
+THUNK_READ = 512
+
 EXIT_REASON_OFFSET = cx.control_offset("exit_reason")
 EXIT_CODE_OFFSET = cx.control_offset("exit_code")
 EXIT_FIELD_SIZE = EXIT_CODE_OFFSET - EXIT_REASON_OFFSET
@@ -46,7 +50,6 @@ PLATFORMS = {
     ("x86_64", "windows_fastcall"): "windows-x86_64",
 }
 DEFAULT_PLATFORMS = {"aarch64": "linux-aarch64", "x86_64": "linux-x86_64"}
-
 
 
 def register_settings() -> None:
@@ -83,10 +86,10 @@ def register_settings() -> None:
         """{
             "title": "Annotation limit",
             "type": "number",
-            "default": 250000,
+            "default": 1000,
             "minValue": 0,
-            "maxValue": 100000000,
-            "description": "Per-instruction guest comments, exit names and relocation data variables are added on load only when a file has at most this many of them; use 'Rosemary AOT > Annotate guest addresses and exits' for single functions otherwise.",
+            "maxValue": 10000000,
+            "description": "Region comments, per-instruction guest comments and exit names are added on load only when a file has at most this many regions; use 'Rosemary AOT > Annotate guest addresses and exits' for single functions otherwise.",
             "ignore": ["SettingsProjectScope"]
         }""",
     )
@@ -114,18 +117,19 @@ def host_function_type(signature: str) -> Optional[Type]:
     return Type.function(ret, param_types)
 
 
-def _calling_convention(cache: rmc.CacheFile) -> Optional[str]:
-    for image in cache.chunks:
-        for symbol in image.symbols:
-            if isinstance(symbol, rmc.HostSymbol) and symbol.signature:
-                parsed = lay.parse_signature(symbol.signature)
-                if parsed:
-                    return parsed[2]
+def _calling_convention(image: rmc.Image) -> Optional[str]:
+    for entry in image.shared:
+        if isinstance(entry, rmc.HostSymbol) and entry.signature:
+            parsed = lay.parse_signature(entry.signature)
+            if parsed:
+                return parsed[2]
     return None
 
 
 def _ranges(ranges, guest) -> str:
     return ", ".join(f"{guest(a):#x}-{guest(b):#x}" for a, b in ranges)
+
+
 
 
 class RosemaryAotView(BinaryView):
@@ -134,41 +138,58 @@ class RosemaryAotView(BinaryView):
 
     @classmethod
     def is_valid_for_data(cls, data) -> bool:
-        return rmc.is_cache_file(data.read(0, len(rmc.CACHE_MAGIC)))
+        return rmc.is_cache_file(data.read, data.length)
 
     def __init__(self, data):
         settings = Settings()
-        self.cache = rmc.decode(data.read(0, data.length))
+        self.image = rmc.Image(data.read, data.length)
         lift = settings.get_string(SETTING_GUEST_ADDRESSES, data) == "lift"
-        slide = 0 if lift else lay.file_slide(self.cache)
-        self.layout = lay.build(self.cache, guest_slide=slide)
+        slide = 0 if lift else lay.file_slide(self.image)
+        self.layout = lay.build(self.image, guest_slide=slide)
         self.annotation_limit = settings.get_integer(SETTING_ANNOTATION_LIMIT, data)
         arch = settings.get_string(SETTING_ARCH, data)
         if arch == "auto":
-            arch = rmc.guess_arch(self.cache.chunks[0]) if self.cache.chunks else "aarch64"
+            arch = self.image.guess_arch()
         self.arch_name = arch
         BinaryView.__init__(self, file_metadata=data.file, parent_view=data)
-        # Entry and body address -> (chunk index, region index).
-        self.function_starts: Dict[int, Tuple[int, int]] = {}
+        # Entry and body address -> region index.
+        self.function_starts: Dict[int, int] = {}
         self.body_types: Dict[cx.PinnedAbi, Optional[Tuple[Type, List[str]]]] = {}
 
     def guest(self, lift_va: int) -> int:
         return lay.guest_va(self.layout, lift_va)
 
+    def lift(self, guest_va: int) -> int:
+        return (guest_va - self.layout.guest_slide) & lay.U64_MASK
+
+    def region_name(self, index: int) -> str:
+        return f"region_{self.guest(self.image.records.lift_base[index]):x}"
+
+    def body(self, index: int) -> int:
+        rec = self.image.records
+        return self.layout.text + rec.code[index] + rec.link_target[index]
+
     def init(self) -> bool:
         try:
+            started = time.perf_counter()
             self.arch = Architecture[self.arch_name]
-            platform = PLATFORMS.get((self.arch_name, _calling_convention(self.cache)))
+            platform = PLATFORMS.get((self.arch_name, _calling_convention(self.image)))
             self.platform = Platform[platform or DEFAULT_PLATFORMS[self.arch_name]]
             self._add_segments()
             self._add_types()
-            self._add_externs()
-            self._add_regions()
+            with self.bulk_modify_symbols():
+                self._add_got()
+                self._add_regions()
             self._store_metadata()
             if self.annotate:
+                for index in range(self.image.region_count):
+                    self.annotate_region(index)
                 self._exits_event = self.add_analysis_completion_event(self._annotate_all_exits)
-            if self.cache.source:
-                log.log_info(f"Rosemary AOT: cache of {self.cache.source}")
+            embedded = self.image.embedded
+            log.log_info(
+                f"Rosemary AOT: {self.image.region_count} regions of {embedded.source} "
+                f"({embedded.tier.name.lower()} tier), loaded in {time.perf_counter() - started:.1f}s"
+            )
             return True
         except Exception:
             log.log_error(f"Rosemary AOT: failed to load cache file\n{traceback.format_exc()}")
@@ -178,33 +199,25 @@ class RosemaryAotView(BinaryView):
         code = SegmentFlag.SegmentReadable | SegmentFlag.SegmentExecutable | SegmentFlag.SegmentContainsCode
         data = SegmentFlag.SegmentReadable | SegmentFlag.SegmentContainsData
         bss = data | SegmentFlag.SegmentWritable
-        blob = self.layout.blob
+        h, layout = self.image.header, self.layout
+        read_only = SectionSemantics.ReadOnlyDataSectionSemantics
+        # The code is never written at load, so it maps straight from the file. The GOT is the
+        # loader's, so it is synthesized; read-only, so analysis folds what each entry holds.
+        self.add_auto_segment(layout.text, h.text_len, h.text_offset, h.text_len, code)
+        self.add_auto_section("text", layout.text, h.text_len, SectionSemantics.ReadOnlyCodeSectionSemantics)
         memory = self.memory_map
-        # The relocated bytes exist only here, not in the file, so each section is a
-        # data-backed memory region rather than a segment over the parent view.
-        for i, (image, placed) in enumerate(zip(self.cache.chunks, self.layout.chunks)):
-            text = bytes(blob[placed.text_offset : placed.text_offset + len(image.text)])
-            memory.add_memory_region(f"chunk{i}.text", placed.text, text, code)
-            self.add_auto_section(
-                f"chunk{i}.text", placed.text, len(image.text), SectionSemantics.ReadOnlyCodeSectionSemantics
-            )
-            if image.rodata:
-                rodata = bytes(blob[placed.rodata_offset : placed.rodata_offset + len(image.rodata)])
-                memory.add_memory_region(f"chunk{i}.rodata", placed.rodata, rodata, data)
-                self.add_auto_section(
-                    f"chunk{i}.rodata",
-                    placed.rodata,
-                    len(image.rodata),
-                    SectionSemantics.ReadOnlyDataSectionSemantics,
-                )
-            if image.bss_len:
-                memory.add_memory_region(f"chunk{i}.bss", placed.bss, None, bss, length=image.bss_len)
-                self.add_auto_section(
-                    f"chunk{i}.bss", placed.bss, image.bss_len, SectionSemantics.ReadWriteDataSectionSemantics
-                )
-        extern_len = self.layout.end - self.layout.extern_start
-        memory.add_memory_region("extern", self.layout.extern_start, None, SegmentFlag.SegmentReadable, length=extern_len)
-        self.add_auto_section("extern", self.layout.extern_start, extern_len, SectionSemantics.ExternalSectionSemantics)
+        if layout.shared_values:
+            memory.add_memory_region("got.shared", layout.got, layout.shared_values, data)
+            self.add_auto_section("got.shared", layout.got, len(layout.shared_values), read_only)
+        if layout.own_values:
+            memory.add_memory_region("got.regions", layout.own_got, layout.own_values, data)
+            self.add_auto_section("got.regions", layout.own_got, len(layout.own_values), read_only)
+        if h.bss_len:
+            self.add_auto_segment(layout.bss, h.bss_len, 0, 0, bss)
+            self.add_auto_section("cells", layout.bss, h.bss_len, SectionSemantics.ReadWriteDataSectionSemantics)
+        extern_len = layout.end - layout.extern_start
+        memory.add_memory_region("extern", layout.extern_start, None, SegmentFlag.SegmentReadable, length=extern_len)
+        self.add_auto_section("extern", layout.extern_start, extern_len, SectionSemantics.ExternalSectionSemantics)
 
     def _named(self, name: str) -> Type:
         if name in cx.ENUMS:
@@ -246,78 +259,85 @@ class RosemaryAotView(BinaryView):
             self.define_type(name, name, Type.structure_type(builder))
         self.context_pointer = self._type(cx.Pointer(cx.Named(cx.REGISTER_CONTEXT)))
 
-    def _add_externs(self) -> None:
-        for extern in self.layout.externs:
+    def _add_got(self) -> None:
+        """Names each shared GOT entry after what it holds, so calls through it read as calls to
+        the host symbol."""
+        word = Type.int(8, sign=False)
+        for slot, (entry, extern) in enumerate(zip(self.image.shared, self.layout.slot_externs)):
+            addr = self.layout.shared_slot(slot)
+            if extern is None:
+                if isinstance(entry, rmc.GuestSlide):
+                    self.define_auto_symbol(Symbol(SymbolType.DataSymbol, addr, "__guest_slide"))
+                    self.define_data_var(addr, word)
+                else:
+                    self.define_data_var(addr, Type.pointer(self.arch, Type.void()))
+                continue
             host = extern.symbol
-            if host.kind == rmc.HostSymbolKind.DATA:
-                sym = Symbol(SymbolType.ExternalSymbol, extern.addr, extern.display)
-                self.define_auto_symbol_and_var_or_function(sym, Type.int(8, sign=False), self.platform)
-            else:
-                sym = Symbol(SymbolType.ExternalSymbol, extern.addr, extern.display)
-                func_type = host_function_type(host.signature) if host.signature else None
-                self.define_auto_symbol_and_var_or_function(sym, func_type, self.platform)
+            func_type = None
+            if host.kind != rmc.HostSymbolKind.DATA and host.signature:
+                func_type = host_function_type(host.signature)
+            target_type = word if host.kind == rmc.HostSymbolKind.DATA else func_type
+            self.define_auto_symbol_and_var_or_function(
+                Symbol(SymbolType.ExternalSymbol, extern.addr, extern.display), target_type, self.platform
+            )
+            self.define_auto_symbol(Symbol(SymbolType.ImportAddressSymbol, addr, extern.display))
+            pointee = target_type if target_type is not None else Type.void()
+            self.define_data_var(addr, Type.pointer(self.arch, pointee))
             provider = host.provider or "rosemary runtime"
             if host.kind == rmc.HostSymbolKind.LIBCALL:
                 provider = "Cranelift libcall"
-            note = f"{provider}" + (f"\n{host.signature}" if host.signature else "")
-            self.set_comment_at(extern.addr, note)
+            self.set_comment_at(extern.addr, provider + (f"\n{host.signature}" if host.signature else ""))
 
     def _add_regions(self) -> None:
-        annotations = sum(len(image.relocs) + sum(r.map_len for r in image.regions) for image in self.cache.chunks)
-        annotate = self.annotate = annotations <= self.annotation_limit
-        if not annotate:
+        image, layout, rec = self.image, self.layout, self.image.records
+        self.annotate = image.region_count <= self.annotation_limit
+        if not self.annotate:
             log.log_info(
-                f"Rosemary AOT: {annotations} annotations exceed the limit of {self.annotation_limit}; "
-                "use 'Rosemary AOT > Annotate guest addresses and exits' per function"
+                f"Rosemary AOT: {image.region_count} regions exceed the annotation limit of "
+                f"{self.annotation_limit}; use 'Rosemary AOT > Annotate guest addresses and exits' per function"
             )
         entry_type = Type.function(Type.void(), [FunctionParameter(self.context_pointer, "ctx")])
         link_entry = self._named(cx.LINK_ENTRY)
-        for c, (image, placed) in enumerate(zip(self.cache.chunks, self.layout.chunks)):
-            for r, region in enumerate(image.regions):
-                name = f"region_{self.guest(region.lift_base):x}"
-                entry = placed.text + region.entry
-                body = placed.text + region.link_target
-                self.define_auto_symbol_and_var_or_function(
-                    Symbol(SymbolType.FunctionSymbol, entry, name), entry_type, self.platform
-                )
-                if body != entry:
-                    self._add_body(image, region, body, f"{name}_body")
-                self.set_comment_at(body, self.describe_region(region))
-                self.function_starts[entry] = self.function_starts[body] = (c, r)
-                if region.cells is not None:
-                    cells = placed.bss + region.cells
-                    self.define_auto_symbol(Symbol(SymbolType.DataSymbol, cells, f"cells_{self.guest(region.lift_base):x}"))
-                    self.define_data_var(cells, Type.array(link_entry, len(region.link_sites)))
-                    for i, (target, kind) in enumerate(region.link_sites):
-                        self.set_comment_at(
-                            cells + i * rmc.LINK_ENTRY_SIZE, f"-> guest {self.guest(target):#x} ({kind.name.lower()})"
-                        )
-                if annotate:
-                    self.annotate_region(c, r)
-            if annotate:
-                pointer = Type.int(8, sign=False)
-                for reloc in image.relocs:
-                    self.define_data_var(placed.text + reloc.offset, pointer)
-        if self.function_starts:
+        thunks = cx.ThunkDecoder() if self.arch_name == "aarch64" else None
+        for index in range(image.region_count):
+            name = self.region_name(index)
+            code = layout.text + rec.code[index]
+            entry = code + rec.entry[index]
+            body = code + rec.link_target[index]
+            self.define_auto_symbol_and_var_or_function(
+                Symbol(SymbolType.FunctionSymbol, entry, name), entry_type, self.platform
+            )
+            if body != entry:
+                abi = None
+                if thunks is not None:
+                    length = min(THUNK_READ, rec.code_len[index] - rec.entry[index])
+                    abi = thunks.decode(image.text(rec.code[index] + rec.entry[index], length))
+                self._add_body(body, f"{name}_body", abi)
+            self.function_starts[entry] = self.function_starts[body] = index
+            cells = image.cell_counts[index]
+            if cells:
+                at = layout.bss + rec.cells[index]
+                self.define_auto_symbol(Symbol(SymbolType.DataSymbol, at, f"cells_{name[len('region_'):]}"))
+                self.define_data_var(at, Type.array(link_entry, cells))
+        if image.region_count:
             entry = self.perform_get_entry_point()
             self.add_entry_point(entry)
-            if self.cache.source:
-                self.set_comment_at(entry, f"compiled from {self.cache.source}")
+            self.set_comment_at(entry, f"compiled from {image.source}")
 
-    def _add_body(self, image: rmc.Image, region: rmc.Region, body: int, name: str) -> None:
+    def _add_body(self, body: int, name: str, abi: Optional[cx.PinnedAbi]) -> None:
         """Adds a body called through an entry thunk. Its context and pinned guest registers arrive,
         and leave, in the registers the thunk loads them into rather than where the platform ABI says."""
         typed = None
-        abi = cx.decode_aarch64_thunk(image.text, region.entry) if self.arch_name == "aarch64" else None
         if abi is not None:
             if abi not in self.body_types:
                 self.body_types[abi] = self._pinned_body_type(abi)
             typed = self.body_types[abi]
         symbol = Symbol(SymbolType.FunctionSymbol, body, name)
         self.define_auto_symbol_and_var_or_function(symbol, typed[0] if typed else None, self.platform)
-        function = self.get_function_at(body, self.platform)
-        if function is not None and typed:
-            function.set_auto_return_regs(typed[1])
+        if typed:
+            function = self.get_function_at(body, self.platform)
+            if function is not None:
+                function.set_auto_return_regs(typed[1])
 
     def _pinned_body_type(self, abi: cx.PinnedAbi) -> Optional[Tuple[Type, List[str]]]:
         params = [f"{cx.REGISTER_CONTEXT}* ctx @ {abi.context}"]
@@ -332,32 +352,38 @@ class RosemaryAotView(BinaryView):
         # them come back, but the body's own final values for them are not shown as results.
         return parsed, [s.register for s in abi.slots]
 
-    def describe_region(self, region: rmc.Region) -> str:
+    def describe_region(self, meta: rmc.RegionMeta) -> str:
         guest = self.guest
-        lines = [f"guest {guest(region.lift_base):#x}", f"covered: {_ranges(region.covered, guest)}"]
-        if region.resume_points:
-            lines.append("resume points: " + ", ".join(f"{guest(p):#x}" for p in region.resume_points))
-        if region.data_dependencies:
-            lines.append(f"data dependencies: {_ranges(region.data_dependencies, guest)}")
-        for i, (target, kind) in enumerate(region.link_sites):
+        lines = [f"guest {guest(meta.lift_base):#x}", f"covered: {_ranges(meta.covered, guest)}"]
+        if meta.resume_points:
+            lines.append("resume points: " + ", ".join(f"{guest(p):#x}" for p in meta.resume_points))
+        if meta.data_dependencies:
+            lines.append(f"data dependencies: {_ranges(meta.data_dependencies, guest)}")
+        for i, (target, kind) in enumerate(meta.link_sites):
             lines.append(f"link cell {i}: {guest(target):#x} ({kind.name.lower()})")
-        for va, decision in region.import_decisions:
+        for va, decision in meta.import_decisions:
             lines.append(f"import at {guest(va):#x}: {decision.describe()}")
         return "\n".join(lines)
 
-    def annotate_region(self, chunk: int, index: int) -> int:
-        """Comments each host run with the guest instruction it came from. Returns the count."""
-        region = self.cache.chunks[chunk].regions[index]
-        body = self.layout.chunks[chunk].text + region.link_target
+    def annotate_region(self, index: int) -> int:
+        """Describes region `index` at its body, its link cells, and each host run with the guest
+        instruction it came from. Returns the number of runs commented."""
+        meta = self.image.meta(index)
+        body = self.body(index)
+        self.set_comment_at(body, self.describe_region(meta))
+        if meta.link_sites:
+            cells = self.layout.bss + self.image.records.cells[index]
+            for i, (target, kind) in enumerate(meta.link_sites):
+                comment = f"-> guest {self.guest(target):#x} ({kind.name.lower()})"
+                self.set_comment_at(cells + i * rmc.LINK_ENTRY_SIZE, comment)
         previous = None
         count = 0
-        for start, _end, va in sorted(region.map):
+        for start, _end, va in sorted(meta.map):
             if va == previous:
                 continue
             previous = va
-            addr = body + start
-            if addr != body:
-                self.add_comment(addr, f"guest {self.guest(va):#x}")
+            if start:
+                self.add_comment(body + start, f"guest {self.guest(va):#x}")
                 count += 1
         return count
 
@@ -436,11 +462,11 @@ class RosemaryAotView(BinaryView):
                     enum_display_typeid=enum,
                 )
 
-    def annotate_region_exits(self, chunk: int, index: int) -> int:
+    def annotate_region_exits(self, index: int) -> int:
         """`annotate_exits` for a region's entry and body. Returns the count."""
-        region = self.cache.chunks[chunk].regions[index]
-        text = self.layout.chunks[chunk].text
-        return sum(self._annotate_exits_at(start) for start in {text + region.entry, text + region.link_target})
+        rec = self.image.records
+        code = self.layout.text + rec.code[index]
+        return sum(self._annotate_exits_at(start) for start in {code + rec.entry[index], code + rec.link_target[index]})
 
     def _annotate_exits_at(self, start: int) -> int:
         function = self.get_function_at(start, self.platform)
@@ -450,31 +476,36 @@ class RosemaryAotView(BinaryView):
         count = sum(self._annotate_exits_at(start) for start in self.function_starts)
         log.log_info(f"Rosemary AOT: named {count} exit reasons and codes")
 
-    def region_at(self, addr: int) -> Optional[Tuple[int, int]]:
-        """The (chunk, region) whose entry or body function holds `addr`."""
+    def region_at(self, addr: int) -> Optional[int]:
+        """The region whose entry or body function holds `addr`."""
         for function in self.get_functions_containing(addr) or []:
             found = self.function_starts.get(function.start)
             if found is not None:
                 return found
         return None
 
-    def regions_covering(self, guest_va: int) -> List[Tuple[int, int]]:
-        found = []
-        for c, image in enumerate(self.cache.chunks):
-            for r, region in enumerate(image.regions):
-                if any(self.guest(a) <= guest_va < self.guest(b) for a, b in region.covered):
-                    found.append((c, r))
-        return found
+    def regions_covering(self, guest_va: int) -> List[int]:
+        """Regions entered at `guest_va`, from the image's entry index, or failing that every
+        region whose covered ranges hold it."""
+        lift_va = self.lift(guest_va)
+        entered = self.image.lookup(lift_va)
+        return [entered] if entered is not None else self.image.regions_covering(lift_va)
+
+    def host_code_for(self, index: int, guest_va: int) -> int:
+        """The first host address compiled for `guest_va` in region `index`, or its body."""
+        body = self.body(index)
+        meta = self.image.meta(index)
+        return min((body + start for start, _end, va in meta.map if self.guest(va) == guest_va), default=body)
 
     def _store_metadata(self) -> None:
-        if self.cache.source:
-            self.store_metadata("rosemary_aot.source", self.cache.source, isAuto=True)
-        self.store_metadata("rosemary_aot.lift_slide", self.cache.lift_slide, isAuto=True)
+        embedded, header = self.image.embedded, self.image.header
+        self.store_metadata("rosemary_aot.source", embedded.source, isAuto=True)
+        self.store_metadata("rosemary_aot.lift_slide", embedded.lift_slide, isAuto=True)
         self.store_metadata("rosemary_aot.guest_slide", self.layout.guest_slide, isAuto=True)
-        fingerprints = sorted({(i.isa_fingerprint, i.config_fingerprint) for i in self.cache.chunks})
-        self.store_metadata(
-            "rosemary_aot.fingerprints", [f"isa {a:016x} config {b:016x}" for a, b in fingerprints], isAuto=True
-        )
+        self.store_metadata("rosemary_aot.tier", embedded.tier.name.lower(), isAuto=True)
+        self.store_metadata("rosemary_aot.profiled", embedded.profiled, isAuto=True)
+        fingerprints = f"isa {header.isa_fingerprint:016x} config {header.config_fingerprint:016x}"
+        self.store_metadata("rosemary_aot.fingerprints", fingerprints, isAuto=True)
 
     def perform_is_executable(self) -> bool:
         return True
@@ -483,6 +514,7 @@ class RosemaryAotView(BinaryView):
         return 8
 
     def perform_get_entry_point(self) -> int:
-        if self.cache.chunks and self.cache.chunks[0].regions:
-            return self.layout.chunks[0].text + self.cache.chunks[0].regions[0].entry
-        return self.layout.base
+        rec = self.image.records
+        if self.image.region_count:
+            return self.layout.text + rec.code[0] + rec.entry[0]
+        return self.layout.text
