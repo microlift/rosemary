@@ -3,6 +3,8 @@ name: release
 on:
   push:
     tags: ['v*']
+  schedule:
+    - cron: '0 */12 * * *'
   workflow_dispatch:
 
 permissions:
@@ -10,12 +12,38 @@ permissions:
 
 concurrency:
   group: release-${{ github.ref }}
-  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+  cancel-in-progress: ${{ github.event_name == 'schedule' }}
 
 jobs:
+  # Scheduled runs build only if default branch got commit in last 12h.
+  # Tag push and manual dispatch always build.
+  changes:
+    name: new commits check
+    runs-on: ubuntu-latest
+    outputs:
+      run: ${{ steps.check.outputs.run }}
+    steps:
+      - uses: actions/checkout@v7
+      - id: check
+        run: |
+          if [ "${{ github.event_name }}" != "schedule" ]; then
+            echo "run=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          last=$(git log -1 --format=%ct)
+          now=$(date +%s)
+          if [ $((now - last)) -lt $((12 * 3600)) ]; then
+            echo "run=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "run=false" >> "$GITHUB_OUTPUT"
+            echo "no commit in last 12h, skip"
+          fi
+
   # No Nix, no dependencies: the launcher's own tests, before anything slow.
   launcher:
     name: launcher tests
+    needs: changes
+    if: needs.changes.outputs.run == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -67,13 +95,13 @@ jobs:
       # Cargo.lock, the toolchain and the link-time libraries and nothing
       # else. The key is therefore those inputs, not the sources: a change to
       # Rosemary's own crates restores the store, recompiles only the
-      # workspace, and saves nothing. Pull requests restore main's cache but
-      # do not write one.
+      # workspace, and saves nothing. Manual dispatch restores but does not
+      # write a cache.
       - uses: nix-community/cache-nix-action@v7
         with:
           primary-key: nix-v1-${{ runner.os }}-${{ runner.arch }}-${{ matrix.arch }}-${{ hashFiles('flake.lock', 'Cargo.lock', 'nix/**', 'flake.nix') }}
           restore-prefixes-first-match: nix-v1-${{ runner.os }}-${{ runner.arch }}-${{ matrix.arch }}-
-          save: ${{ github.event_name == 'push' }}
+          save: ${{ github.event_name == 'push' || github.event_name == 'schedule' }}
           # Actions' cache is 10 GB for the whole repository. This collects
           # what went stale when a pin moved, without touching anything a
           # later run can still use; raise it if a full build outgrows it.
@@ -130,11 +158,12 @@ jobs:
           (cd dist && sha256sum -- * | tee SHA256SUMS.${{ matrix.arch }})
           echo "name=${name}" >> "$GITHUB_OUTPUT"
 
-      # Provenance for every push, so an Actions download can be traced to its
-      # run as well as a release can. Pull requests get no OIDC token.
+      # Provenance for every push and scheduled run, so an Actions download
+      # can be traced to its run as well as a release can. Manual dispatch
+      # gets no attestation.
       - name: Attest
         id: attest
-        if: github.event_name == 'push'
+        if: github.event_name == 'push' || github.event_name == 'schedule'
         uses: actions/attest-build-provenance@v4
         with:
           subject-path: |
@@ -143,7 +172,7 @@ jobs:
             dist/*.AppImage
 
       - name: Copy attestation to the correct directory
-        if: github.event_name == 'push'
+        if: github.event_name == 'push' || github.event_name == 'schedule'
         run: cp '${{ steps.attest.outputs.bundle-path }}' 'dist/${{ steps.collect.outputs.name }}.intoto.jsonl'
 
       - uses: actions/upload-artifact@v7
@@ -233,14 +262,14 @@ jobs:
           sha256sum -- * | tee SHA256SUMS.x86_64-freebsd
 
       - name: Attest
-        if: github.event_name == 'push'
         id: attest
+        if: github.event_name == 'push' || github.event_name == 'schedule'
         uses: actions/attest-build-provenance@v4
         with:
           subject-path: dist/*.tar.gz
 
       - name: Copy attestation to the correct directory
-        if: github.event_name == 'push'
+        if: github.event_name == 'push' || github.event_name == 'schedule'
         run: cp '${{ steps.attest.outputs.bundle-path }}' 'dist/${{ steps.version.outputs.name }}.intoto.jsonl'
 
       - uses: actions/upload-artifact@v7
@@ -249,10 +278,11 @@ jobs:
           path: dist/
           if-no-files-found: error
 
+  # Tag push only. Scheduled and manual runs never publish.
   release:
     name: release
     needs: [build, build-freebsd]
-    if: startsWith(github.ref, 'refs/tags/v')
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     permissions:
       contents: write
