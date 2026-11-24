@@ -64,8 +64,13 @@ const DARWIN_IP_TOS: i32 = 3;
 #[allow(dead_code)]
 const DARWIN_IP_PKTINFO: i32 = 26;
 const DARWIN_IP_RECVTOS: i32 = 27;
+/// The arriving interface's `sockaddr_dl`.
+const DARWIN_IP_RECVIF: i32 = 20;
 const DARWIN_IPV6_TCLASS: i32 = 36;
 const DARWIN_IPV6_PKTINFO: i32 = 46;
+/// RFC 2292's spelling, which a program built without `__APPLE_USE_RFC_3542`
+/// both sets and looks for.
+const DARWIN_IPV6_2292PKTINFO: i32 = 19;
 
 const SCM_RIGHTS: i32 = 0x01;
 /// Darwin's `SCM_TIMESTAMP`, which is this host's `SCM_CREDENTIALS`.
@@ -214,6 +219,20 @@ fn message_from_host(level: i32, kind: i32, payload: &[u8]) -> Option<Message> {
                 payload: payload.to_vec(),
             })
         }
+        (libc::IPPROTO_IP, host_kind) if host::IP_RECVIF == Some(host_kind) => Some(Message {
+            level,
+            kind: DARWIN_IP_RECVIF,
+            payload: payload.to_vec(),
+        }),
+        (libc::IPPROTO_IPV6, host_kind)
+            if payload.len() == IN6_PKTINFO_LEN && host::IPV6_2292PKTINFO == Some(host_kind) =>
+        {
+            Some(Message {
+                level,
+                kind: DARWIN_IPV6_2292PKTINFO,
+                payload: payload.to_vec(),
+            })
+        }
         (libc::IPPROTO_IPV6, libc::IPV6_TCLASS) if payload.len() == 4 => Some(Message {
             level,
             kind: DARWIN_IPV6_TCLASS,
@@ -228,6 +247,52 @@ fn message_from_host(level: i32, kind: i32, payload: &[u8]) -> Option<Message> {
         }
         _ => None,
     }
+}
+
+/// What `fd`'s guest is owed for one host message: usually its one Darwin
+/// counterpart, but on a host whose `IP_PKTINFO` stands in for Darwin's
+/// `IP_RECVIF` too, whichever of the two the socket asked for.
+#[cfg_attr(not(target_os = "linux"), allow(unused_variables))]
+fn messages_from_host(fd: i32, level: i32, kind: i32, payload: &[u8]) -> Vec<Message> {
+    #[cfg(target_os = "linux")]
+    if (level, kind) == (libc::IPPROTO_IP, libc::IP_PKTINFO) && payload.len() == IN_PKTINFO_LEN {
+        let wanted = super::sockopt::interface::wanted(fd);
+        let mut out = Vec::new();
+        if wanted.pktinfo {
+            out.push(Message {
+                level,
+                kind: DARWIN_IP_PKTINFO,
+                payload: payload.to_vec(),
+            });
+        }
+        if wanted.recvif {
+            // `ipi_ifindex` leads both hosts' `in_pktinfo`.
+            let index = u32::from_ne_bytes(payload[..4].try_into().expect("checked length"));
+            out.push(Message {
+                level,
+                kind: DARWIN_IP_RECVIF,
+                payload: super::ifaddrs::link_of_index(index).unwrap_or_else(unnamed_link),
+            });
+        }
+        return out;
+    }
+    message_from_host(level, kind, payload)
+        .into_iter()
+        .collect()
+}
+
+/// What xnu's `ip_savecontrol` reports for an interface it cannot name: a
+/// `sockaddr_dl` that is only its header, with index zero.
+#[cfg(target_os = "linux")]
+fn unnamed_link() -> Vec<u8> {
+    /// `offsetof(struct sockaddr_dl, sdl_data)`.
+    const HEADER_LEN: u8 = 8;
+    /// Darwin's `AF_LINK`.
+    const AF_LINK: u8 = 18;
+    let mut link = vec![0u8; HEADER_LEN as usize];
+    link[0] = HEADER_LEN;
+    link[1] = AF_LINK;
+    link
 }
 
 /// Close the descriptors a received `SCM_RIGHTS` carries.
@@ -245,7 +310,7 @@ fn discard(level: i32, kind: i32, payload: &[u8]) {
     }
 }
 
-/// Write the control messages `host` received into the guest's buffer.
+/// Write the control messages `host` received on `fd` into the guest's buffer.
 ///
 /// Answers with the bytes written and whether anything was dropped, which the
 /// caller reports as `MSG_CTRUNC` - the same thing the kernel says when a
@@ -255,7 +320,12 @@ fn discard(level: i32, kind: i32, payload: &[u8]) {
 ///
 /// `host` is a `msghdr` a `recvmsg` has just filled in, and `control` is
 /// `capacity` writable bytes or is null with `capacity` zero.
-pub unsafe fn from_host(host: &libc::msghdr, control: *mut c_void, capacity: u32) -> (u32, bool) {
+pub unsafe fn from_host(
+    fd: i32,
+    host: &libc::msghdr,
+    control: *mut c_void,
+    capacity: u32,
+) -> (u32, bool) {
     let mut written = 0usize;
     let mut dropped = false;
     let capacity = capacity as usize;
@@ -276,35 +346,39 @@ pub unsafe fn from_host(host: &libc::msghdr, control: *mut c_void, capacity: u32
                 ),
             )
         };
-        match message_from_host(level, kind, payload) {
-            Some(message) if written + DARWIN_HDR + message.payload.len() <= capacity => {
-                let len = DARWIN_HDR + message.payload.len();
-                // SAFETY: `len` bytes within the caller's capacity, just
-                // checked, written at Darwin's offsets and unaligned because
-                // the guest's buffer need only be four-byte aligned.
-                unsafe {
-                    let at = control.cast::<u8>().add(written);
-                    DarwinControlHeader {
-                        len: len as u32,
-                        level: message.level,
-                        kind: message.kind,
-                    }
-                    .write(at);
-                    core::ptr::copy_nonoverlapping(
-                        message.payload.as_ptr(),
-                        at.add(DARWIN_HDR),
-                        message.payload.len(),
-                    );
-                }
-                // The padding is not written: it is not part of the message,
-                // and the next one starting where the alignment says is the
-                // only thing that depends on it.
-                written = (written + darwin_align(len)).min(capacity);
-            }
-            _ => {
+        let messages = messages_from_host(fd, level, kind, payload);
+        if messages.is_empty() {
+            discard(level, kind, payload);
+            dropped = true;
+        }
+        for message in messages {
+            let len = DARWIN_HDR + message.payload.len();
+            if written + len > capacity {
                 discard(level, kind, payload);
                 dropped = true;
+                continue;
             }
+            // SAFETY: `len` bytes within the caller's capacity, just checked,
+            // written at Darwin's offsets and unaligned because the guest's
+            // buffer need only be four-byte aligned.
+            unsafe {
+                let at = control.cast::<u8>().add(written);
+                DarwinControlHeader {
+                    len: len as u32,
+                    level: message.level,
+                    kind: message.kind,
+                }
+                .write(at);
+                core::ptr::copy_nonoverlapping(
+                    message.payload.as_ptr(),
+                    at.add(DARWIN_HDR),
+                    message.payload.len(),
+                );
+            }
+            // The padding is not written: it is not part of the message, and
+            // the next one starting where the alignment says is the only
+            // thing that depends on it.
+            written = (written + darwin_align(len)).min(capacity);
         }
         entry = unsafe { libc::CMSG_NXTHDR(host, entry) };
     }
@@ -475,7 +549,7 @@ mod tests {
                 assert_eq!(libc::recvmsg(receiver.as_raw_fd(), &mut msg, 0), 1);
                 let mut output = [0u8; 128];
                 let (len, dropped) =
-                    from_host(&msg, output.as_mut_ptr().cast(), output.len() as u32);
+                    from_host(-1, &msg, output.as_mut_ptr().cast(), output.len() as u32);
                 assert!(!dropped);
                 let mut at = 0;
                 let mut kinds = Vec::new();
@@ -490,10 +564,103 @@ mod tests {
                 }
                 assert!(kinds.contains(&ecn_kind));
                 assert!(kinds.contains(&info_kind));
-                let (_, dropped) = from_host(&msg, output.as_mut_ptr().cast(), 12);
+                let (_, dropped) = from_host(-1, &msg, output.as_mut_ptr().cast(), 12);
                 assert!(dropped);
             }
         }
+    }
+
+    /// The Darwin control messages one loopback datagram arrives with, after
+    /// the guest set `options` at `level` on the receiving socket.
+    fn received_over_loopback(ipv6: bool, level: i32, options: &[i32]) -> Vec<(i32, Vec<u8>)> {
+        use std::os::fd::AsRawFd;
+        let address = if ipv6 { "[::1]:0" } else { "127.0.0.1:0" };
+        let receiver = std::net::UdpSocket::bind(address).unwrap();
+        receiver
+            .set_read_timeout(Some(std::time::Duration::from_secs(2)))
+            .unwrap();
+        let sender = std::net::UdpSocket::bind(address).unwrap();
+        let fd = receiver.as_raw_fd();
+        let on = 1i32;
+        for option in options {
+            // SAFETY: a live socket and a readable `int`.
+            let rc = unsafe {
+                super::super::sockopt::setsockopt(fd, level, *option, (&raw const on).cast(), 4)
+            };
+            assert_eq!(rc, 0, "option {option}");
+        }
+        sender
+            .send_to(b"x", receiver.local_addr().unwrap())
+            .unwrap();
+        let mut byte = 0u8;
+        let mut incoming = vec![0u8; 256];
+        let mut output = [0u8; 256];
+        // SAFETY: every buffer is live for the calls that use it.
+        let (len, dropped) = unsafe {
+            let mut iov = libc::iovec {
+                iov_base: (&raw mut byte).cast(),
+                iov_len: 1,
+            };
+            let mut msg: libc::msghdr = core::mem::zeroed();
+            msg.msg_iov = &mut iov;
+            msg.msg_iovlen = 1;
+            msg.msg_control = incoming.as_mut_ptr().cast();
+            msg.msg_controllen = incoming.len() as _;
+            assert_eq!(libc::recvmsg(fd, &mut msg, 0), 1);
+            from_host(fd, &msg, output.as_mut_ptr().cast(), output.len() as u32)
+        };
+        assert!(!dropped);
+        super::super::sockopt::forget(fd);
+        let mut messages = Vec::new();
+        let mut at = 0;
+        while at < len as usize {
+            let size = u32::from_ne_bytes(output[at..at + 4].try_into().unwrap()) as usize;
+            let kind = i32::from_ne_bytes(output[at + 8..at + 12].try_into().unwrap());
+            messages.push((kind, output[at + DARWIN_HDR..at + size].to_vec()));
+            at += darwin_align(size);
+        }
+        messages
+    }
+
+    /// libresolv's `recvmsg` is refused unless the arriving interface comes
+    /// with every answer: `IP_RECVIF`'s `sockaddr_dl`, naming it.
+    #[test]
+    fn ip_recvif_names_the_interface_a_datagram_arrived_on() {
+        /// Darwin's `IP_RECVIF` option and `AF_LINK`.
+        const IP_RECVIF: i32 = 20;
+        const AF_LINK: u8 = 18;
+        let messages = received_over_loopback(false, libc::IPPROTO_IP, &[IP_RECVIF]);
+        let kinds: Vec<i32> = messages.iter().map(|(k, _)| *k).collect();
+        assert_eq!(kinds, [DARWIN_IP_RECVIF], "only what was asked for");
+        let link = &messages[0].1;
+        assert_eq!(link[0] as usize, link.len(), "sdl_len");
+        assert_eq!(link[1], AF_LINK, "sdl_family");
+        let index = u16::from_ne_bytes([link[2], link[3]]);
+        let name = &link[8..8 + link[5] as usize];
+        let mut expected = [0 as libc::c_char; libc::IF_NAMESIZE];
+        // SAFETY: a buffer of `IF_NAMESIZE`, as `if_indextoname` wants.
+        let named = unsafe { libc::if_indextoname(index as u32, expected.as_mut_ptr()) };
+        assert!(!named.is_null(), "index {index} names an interface");
+        // SAFETY: just filled in with a NUL-terminated name.
+        let expected = unsafe { std::ffi::CStr::from_ptr(expected.as_ptr()) };
+        assert_eq!(name, expected.to_bytes(), "sdl_data starts with the name");
+
+        let both = received_over_loopback(false, libc::IPPROTO_IP, &[IP_RECVIF, DARWIN_IP_PKTINFO]);
+        let mut kinds: Vec<i32> = both.iter().map(|(k, _)| *k).collect();
+        kinds.sort();
+        assert_eq!(kinds, [DARWIN_IP_RECVIF, DARWIN_IP_PKTINFO]);
+    }
+
+    /// RFC 2292's spelling of `IPV6_PKTINFO`, which libresolv also sets.
+    #[test]
+    fn rfc_2292_packet_info_arrives_under_its_own_number() {
+        if host::IPV6_2292PKTINFO.is_none() {
+            return;
+        }
+        let messages = received_over_loopback(true, libc::IPPROTO_IPV6, &[DARWIN_IPV6_2292PKTINFO]);
+        assert_eq!(messages.len(), 1, "{messages:?}");
+        assert_eq!(messages[0].0, DARWIN_IPV6_2292PKTINFO);
+        assert_eq!(messages[0].1.len(), IN6_PKTINFO_LEN);
     }
 
     /// The claim the whole module rests on, as an assertion.

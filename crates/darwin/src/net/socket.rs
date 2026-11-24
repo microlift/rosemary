@@ -646,7 +646,7 @@ unsafe extern "C" fn recvmsg(fd: i32, message: *mut c_void, flags: i32) -> isize
         // SAFETY: a `msghdr` the kernel has just filled in, and the caller's
         // control buffer with the length they reserved.
         let (written, dropped) =
-            unsafe { super::control::from_host(&host, guest_control, guest_controllen) };
+            unsafe { super::control::from_host(fd, &host, guest_control, guest_controllen) };
         // SAFETY: the caller's own `msghdr`.
         unsafe { (*guest).controllen = written };
         if dropped {

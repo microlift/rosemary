@@ -53,6 +53,7 @@ mod ip {
     pub const MULTICAST_LOOP: i32 = 11;
     pub const ADD_MEMBERSHIP: i32 = 12;
     pub const DROP_MEMBERSHIP: i32 = 13;
+    pub const RECVIF: i32 = 20;
     pub const RECVTTL: i32 = 24;
     pub const PKTINFO: i32 = 26;
     pub const RECVTOS: i32 = 27;
@@ -68,6 +69,9 @@ mod ipv6 {
     pub const MULTICAST_LOOP: i32 = 11;
     pub const ADD_MEMBERSHIP: i32 = 12;
     pub const DROP_MEMBERSHIP: i32 = 13;
+    /// RFC 2292's `IPV6_PKTINFO`, which is what a program built without
+    /// `__APPLE_USE_RFC_3542` - libresolv among them - calls it.
+    pub const PKTINFO_2292: i32 = 19;
     pub const V6ONLY: i32 = 27;
     pub const RECVTCLASS: i32 = 35;
     pub const TCLASS: i32 = 36;
@@ -138,7 +142,16 @@ const IP_OPTIONS: &[(i32, i32)] = &[
 ];
 
 /// Entries only some hosts can answer; a `None` is refused, not approximated.
-const IP_OPTIONAL: &[(i32, Option<i32>)] = &[(ip::PKTINFO, host::IP_PKTINFO)];
+///
+/// Linux has no `IP_RECVIF`, and answers both of these through its
+/// `IP_PKTINFO`; see [`interface`], which takes them before this table.
+const IP_OPTIONAL: &[(i32, Option<i32>)] = &[
+    (ip::PKTINFO, host::IP_PKTINFO),
+    (ip::RECVIF, host::IP_RECVIF),
+];
+
+/// As [`IP_OPTIONAL`].
+const IPV6_OPTIONAL: &[(i32, Option<i32>)] = &[(ipv6::PKTINFO_2292, host::IPV6_2292PKTINFO)];
 
 /// Darwin's `IPV6_*`, paired with the host's.
 ///
@@ -464,14 +477,17 @@ pub fn suppresses_sigpipe(fd: i32) -> bool {
     is_socket
 }
 
-/// Give a successfully duplicated descriptor the source's suppression state.
+/// Give a successfully duplicated descriptor the source's recorded options.
 ///
-/// Darwin stores `SO_NOSIGPIPE` on the socket, so every descriptor referring
-/// to it observes the same value. The host has no option to inherit for us.
-pub fn inherit_sigpipe_suppression(from: i32, to: i32) {
+/// Darwin stores `SO_NOSIGPIPE` and `IP_RECVIF` on the socket, so every
+/// descriptor referring to it observes the same value. The host has neither
+/// option to inherit for us.
+pub fn inherit(from: i32, to: i32) {
     if from == to || to < 0 {
         return;
     }
+    #[cfg(target_os = "linux")]
+    interface::inherit(from, to);
     let suppressed = suppresses_sigpipe(from);
     if suppressed || any_suppress_sigpipe() {
         with_suppressed_mut(|held| match suppressed {
@@ -485,6 +501,146 @@ pub fn inherit_sigpipe_suppression(from: i32, to: i32) {
 pub fn forget(fd: i32) {
     if fd >= 0 && any_suppress_sigpipe() {
         with_suppressed_mut(|held| held.remove(&fd));
+    }
+    #[cfg(target_os = "linux")]
+    interface::forget(fd);
+}
+
+/// Darwin's `IP_PKTINFO` and `IP_RECVIF` on a host that has only the first.
+///
+/// Both ask the kernel to say which interface a datagram arrived on: the
+/// first as a `struct in_pktinfo`, the second as that interface's
+/// `sockaddr_dl`. Linux's `IP_PKTINFO` answers both, so it is on while either
+/// is, and each socket records which of the two the guest asked for so that
+/// [`super::control`] gives it exactly those.
+#[cfg(target_os = "linux")]
+pub mod interface {
+    use std::collections::HashMap;
+    use std::ffi::c_void;
+    use std::sync::Mutex;
+
+    use super::{IPPROTO_IP, ip};
+
+    #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+    pub struct Wanted {
+        pub pktinfo: bool,
+        pub recvif: bool,
+    }
+
+    /// A socket the guest set neither on, but whose host option is on - one
+    /// it inherited, or a test's - is answered as `IP_PKTINFO` alone, which is
+    /// what the host's own message is.
+    const UNRECORDED: Wanted = Wanted {
+        pktinfo: true,
+        recvif: false,
+    };
+
+    static WANTED: Mutex<Option<HashMap<i32, Wanted>>> = Mutex::new(None);
+
+    fn with<R>(f: impl FnOnce(&mut HashMap<i32, Wanted>) -> R) -> R {
+        let mut held = WANTED.lock().unwrap_or_else(|e| e.into_inner());
+        f(held.get_or_insert_with(HashMap::new))
+    }
+
+    pub fn is_one(level: i32, name: i32) -> bool {
+        level == IPPROTO_IP && matches!(name, ip::PKTINFO | ip::RECVIF)
+    }
+
+    pub fn wanted(fd: i32) -> Wanted {
+        with(|held| held.get(&fd).copied()).unwrap_or(UNRECORDED)
+    }
+
+    pub fn forget(fd: i32) {
+        with(|held| held.remove(&fd));
+    }
+
+    pub fn inherit(from: i32, to: i32) {
+        with(|held| match held.get(&from).copied() {
+            Some(wanted) => held.insert(to, wanted),
+            None => held.remove(&to),
+        });
+    }
+
+    /// # Safety
+    ///
+    /// `value` is `len` readable bytes, or is null with `len` zero.
+    pub unsafe fn set(fd: i32, name: i32, value: *const c_void, len: u32) -> i32 {
+        if value.is_null() || (len as usize) < core::mem::size_of::<i32>() {
+            crate::errno::set(libc::EINVAL);
+            return -1;
+        }
+        // SAFETY: at least an `int` of the caller's, just checked.
+        let on = unsafe { value.cast::<i32>().read_unaligned() } != 0;
+        let mut now = with(|held| held.get(&fd).copied()).unwrap_or(Wanted {
+            pktinfo: false,
+            recvif: false,
+        });
+        match name {
+            ip::RECVIF => now.recvif = on,
+            _ => now.pktinfo = on,
+        }
+        let host = (now.pktinfo || now.recvif) as i32;
+        // SAFETY: an `int` this function owns, with its own size.
+        let rc = unsafe {
+            libc::setsockopt(
+                fd,
+                libc::IPPROTO_IP,
+                libc::IP_PKTINFO,
+                (&raw const host).cast(),
+                core::mem::size_of::<i32>() as libc::socklen_t,
+            )
+        };
+        if rc == 0 {
+            with(|held| held.insert(fd, now));
+        }
+        rc
+    }
+
+    /// # Safety
+    ///
+    /// `value` is `*len` writable bytes and `len` is a writable `socklen_t`.
+    pub unsafe fn get(fd: i32, name: i32, value: *mut c_void, len: *mut u32) -> i32 {
+        if value.is_null() || len.is_null() {
+            crate::errno::set(libc::EFAULT);
+            return -1;
+        }
+        // SAFETY: the caller's length slot.
+        if (unsafe { len.read() } as usize) < core::mem::size_of::<i32>() {
+            crate::errno::set(libc::EINVAL);
+            return -1;
+        }
+        let held = with(|held| held.get(&fd).copied());
+        let on = match (held, name) {
+            (Some(w), ip::RECVIF) => w.recvif,
+            (Some(w), _) => w.pktinfo,
+            // Nothing recorded: the host's own option is the answer, and
+            // only `IP_PKTINFO` has one.
+            (None, ip::RECVIF) => false,
+            (None, _) => {
+                let mut host = 0i32;
+                let mut host_len = core::mem::size_of::<i32>() as libc::socklen_t;
+                // SAFETY: an `int` this function owns, with its own size.
+                let rc = unsafe {
+                    libc::getsockopt(
+                        fd,
+                        libc::IPPROTO_IP,
+                        libc::IP_PKTINFO,
+                        (&raw mut host).cast(),
+                        &mut host_len,
+                    )
+                };
+                if rc < 0 {
+                    return -1;
+                }
+                host != 0
+            }
+        };
+        // SAFETY: at least an `int` of the caller's, just checked.
+        unsafe {
+            value.cast::<i32>().write_unaligned(on as i32);
+            len.write(core::mem::size_of::<i32>() as u32);
+        }
+        0
     }
 }
 
@@ -556,6 +712,7 @@ fn option_to_host(level: i32, name: i32) -> Option<(i32, i32)> {
         };
         let optional = match level {
             IPPROTO_IP => IP_OPTIONAL,
+            IPPROTO_IPV6 => IPV6_OPTIONAL,
             IPPROTO_TCP => TCP_OPTIONAL,
             _ => &[],
         };
@@ -633,6 +790,11 @@ pub(crate) unsafe extern "C" fn setsockopt(
     if level == SOL_SOCKET && matches!(name, so::NREAD | so::NWRITE) {
         crate::errno::set(libc::ENOPROTOOPT);
         return -1;
+    }
+    #[cfg(target_os = "linux")]
+    if interface::is_one(level, name) {
+        // SAFETY: the caller's buffer, with the length they gave for it.
+        return unsafe { interface::set(fd, name, value, len) };
     }
     let Some((level, name)) = option_to_host(level, name) else {
         crate::errno::set(libc::ENOPROTOOPT);
@@ -788,6 +950,11 @@ unsafe extern "C" fn getsockopt(
     if level == SOL_LOCAL && is_local_socket(fd) {
         // SAFETY: the caller's buffer and length slot.
         return unsafe { local_option(fd, name, value, len) };
+    }
+    #[cfg(target_os = "linux")]
+    if interface::is_one(level, name) {
+        // SAFETY: the caller's buffer and length slot.
+        return unsafe { interface::get(fd, name, value, len) };
     }
     let Some((host_level, host_name)) = option_to_host(level, name) else {
         crate::errno::set(libc::ENOPROTOOPT);
