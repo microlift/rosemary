@@ -50,6 +50,7 @@ pub(super) fn install() {
         "mipmapLevelCount" => mipmap_level_count, c"Q16@0:8";
         "sampleCount" => sample_count, c"Q16@0:8";
         "arrayLength" => array_length, c"Q16@0:8";
+        "allocatedSize" => allocated_size, c"Q16@0:8";
         "replaceRegion:mipmapLevel:withBytes:bytesPerRow:" => replace_region,
             c"v88@0:8{MTLRegion={MTLOrigin=QQQ}{MTLSize=QQQ}}16Q64^v72Q80";
         "replaceRegion:mipmapLevel:slice:withBytes:bytesPerRow:bytesPerImage:" => replace_region_slice,
@@ -168,6 +169,7 @@ scalar!(usage, c"usage");
 scalar!(mipmap_level_count, c"mipmapLevelCount");
 scalar!(sample_count, c"sampleCount");
 scalar!(array_length, c"arrayLength");
+scalar!(allocated_size, c"allocatedSize");
 
 pub(super) unsafe extern "C" fn replace_region(
     receiver: Id,

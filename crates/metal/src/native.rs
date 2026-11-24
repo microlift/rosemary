@@ -1242,6 +1242,8 @@ mod tests {
             unsafe { std::mem::transmute(objc::msg::entry()) };
         assert_eq!(unsafe { getter(texture, objc::sel::get("width")) }, 2);
         assert_eq!(unsafe { getter(texture, objc::sel::get("height")) }, 2);
+        let allocated = unsafe { getter(texture, objc::sel::get("allocatedSize")) };
+        assert!(allocated >= pixels.len() as u64);
         objc::arc::pool_pop(pool);
         objc::arc::release(texture);
         objc::arc::release(descriptor);
