@@ -189,6 +189,14 @@ libraries as it would on a Mac, and the Swift half of Foundation (`Data`, `URL`,
 runtime's Foundation re-exports when the built-in Objective-C runtime is in use.
 In a prefix whose base predates it, those imports are unbound.
 
+libSystem is the other. Under the built-in libc it re-exports two of the base's
+own images as Apple's libSystem does: `libcopyfile.dylib`, and configd's client
+library `libsystem_configuration.dylib`, which is how libresolv asks for the
+DNS configuration. Apple never released libxpc, so XPC is this runtime's, over
+its Mach ports: a guest's `xpc_connection_create_mach_service` reaches a
+listener in any other guest of the same user, and either side's death reaches
+the other as `XPC_ERROR_CONNECTION_INTERRUPTED` or `XPC_ERROR_CONNECTION_INVALID`.
+
 A new prefix gets its base when it is created, and nothing is downloaded
 without consent: `rosemary run` asks with a dialog or on the terminal, and
 `ROSEMARY_PREFIX_SETUP` answers in advance. The download (about 2 MB) is
