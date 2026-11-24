@@ -267,6 +267,8 @@ pub fn resolve(symbol: &str) -> Option<Resolved> {
         "asprintf" => bind!("asprintf" => printf::asprintf),
         "syslog" => bind!("syslog" => printf::syslog),
         "asl_log" => bind!("asl_log" => printf::asl_log),
+        #[cfg(not(target_os = "macos"))]
+        "_os_log_internal" => bind!("_os_log_internal" => printf::os_log_internal),
         "syslog$DARWIN_EXTSN" => bind!("syslog$DARWIN_EXTSN" => printf::syslog),
         "__vsnprintf_chk" => bind!("__vsnprintf_chk" => printf::vsnprintf_chk),
         // libsystem_malloc's own printer, which the interposing mimalloc uses.

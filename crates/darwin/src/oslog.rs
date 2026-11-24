@@ -1,6 +1,6 @@
 #![cfg(not(target_os = "macos"))]
 
-use std::ffi::{CStr, c_char, c_void};
+use std::ffi::{CStr, VaList, c_char, c_void};
 use std::io::Write;
 
 /// `os_log_type_t`. Apple's values, because the caller passes one in.
@@ -309,12 +309,18 @@ unsafe extern "C" fn _os_log_impl(
     buffer: *const u8,
     size: u32,
 ) {
+    // SAFETY: the caller's format and buffer.
+    let message = unsafe { format_message(format, buffer, size) };
+    emit(log, kind, &message);
+}
+
+/// Write one message at `kind` to `log`, as a line on stderr.
+pub fn emit(log: *const c_void, kind: u8, message: &str) {
     // Checked here as well as at the call site: a caller is allowed to log
     // without asking first, and `os_log` itself drops a disabled message.
     if kind == log_type::DEBUG && !debug_enabled() {
         return;
     }
-    let message = unsafe { format_message(format, buffer, size) };
     let level = match kind {
         log_type::FAULT => "fault",
         log_type::ERROR => "error",
@@ -341,6 +347,90 @@ unsafe extern "C" fn _os_log_impl(
     // One write, so that a line from another thread cannot land inside this one.
     let line = format!("{prefix}{message}\n");
     let _ = std::io::stderr().write_all(line.as_bytes());
+}
+
+/// `format` as a plain printf format: `os_log`'s annotations dropped, as in
+/// [`format_message`], and `%@` - an object, whose description is
+/// Foundation's to give - written as its address.
+pub fn plain_format(format: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(format.len());
+    let mut bytes = format.iter().copied().peekable();
+    while let Some(byte) = bytes.next() {
+        out.push(byte);
+        if byte != b'%' {
+            continue;
+        }
+        if bytes.peek() == Some(&b'%') {
+            out.push(bytes.next().unwrap_or(b'%'));
+            continue;
+        }
+        if bytes.peek() == Some(&b'{') {
+            for byte in bytes.by_ref() {
+                if byte == b'}' {
+                    break;
+                }
+            }
+        }
+        let mut spec = Vec::new();
+        for byte in bytes.by_ref() {
+            spec.push(byte);
+            if byte.is_ascii_alphabetic() && !b"hljztqL".contains(&byte) || byte == b'@' {
+                break;
+            }
+        }
+        match spec.last() {
+            Some(b'@') => {
+                out.pop();
+                out.extend_from_slice(b"<object %p>");
+            }
+            _ => out.extend_from_slice(&spec),
+        }
+    }
+    out
+}
+
+/// `void _os_log_internal(void *dso, os_log_t log, os_log_type_t type,
+/// const char *message, ...)`: the call the open-source `<os/log.h>` makes,
+/// with the arguments as a C variadic list rather than an encoded buffer.
+///
+/// # Safety
+///
+/// `format` is NUL-terminated and `ap` matches it.
+unsafe extern "C" fn os_log_internal_v(
+    _dso: *const c_void,
+    log: *const c_void,
+    kind: u8,
+    format: *const c_char,
+    ap: VaList,
+) {
+    if format.is_null() || (kind == log_type::DEBUG && !debug_enabled()) {
+        return;
+    }
+    // SAFETY: the caller's NUL-terminated format.
+    let mut plain = plain_format(unsafe { CStr::from_ptr(format) }.to_bytes());
+    plain.push(0);
+    let mut text: *mut c_char = std::ptr::null_mut();
+    // SAFETY: a live slot, a NUL-terminated format, and the caller's arguments,
+    // which consume it as they did the original.
+    if unsafe { crate::sprintf::rosemary_vasprintf(&raw mut text, plain.as_ptr().cast(), ap) } < 0
+        || text.is_null()
+    {
+        return;
+    }
+    // SAFETY: the rendering, NUL-terminated, from this host's `malloc`.
+    unsafe {
+        emit(log, kind, &CStr::from_ptr(text).to_string_lossy());
+        libc::free(text.cast());
+    }
+}
+
+crate::variadic! {
+    fn _os_log_internal(
+        dso: *const c_void,
+        log: *const c_void,
+        kind: u8,
+        format: *const c_char,
+    ) => os_log_internal_v;
 }
 
 /// `void *os_retain(void *)` and `void os_release(void *)`
@@ -398,6 +488,7 @@ exports::exports! {
         // `_os_log_impl` and `_os_activity_create` begin with an underscore of
         // their own, in addition to Mach-O's.
         "_os_log_impl" => _os_log_impl,
+        "_os_log_internal" => _os_log_internal,
         // The level-specific entry points take the same arguments, the level
         // included, and differ only in what Apple records alongside.
         "_os_log_debug_impl" => _os_log_impl,
@@ -414,6 +505,18 @@ exports::exports! {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `_os_log_internal` takes the same format `_os_log_impl` does, and the
+    /// host's printf must not see the annotations or an object conversion.
+    #[test]
+    fn a_plain_format_keeps_conversions_and_drops_annotations() {
+        assert_eq!(
+            plain_format(b"%{public}s: %d%% of %{private,uuid_t}.16P"),
+            b"%s: %d%% of %.16P"
+        );
+        assert_eq!(plain_format(b"%lld then %{public}@"), b"%lld then <object %p>");
+        assert_eq!(plain_format(b"no conversions"), b"no conversions");
+    }
 
     /// Build a buffer the way the compiler does at an `os_log` call site.
     fn buffer(items: &[&[u8]]) -> Vec<u8> {

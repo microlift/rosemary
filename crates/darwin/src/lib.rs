@@ -84,7 +84,7 @@ pub mod malloc;
 pub mod math;
 pub mod modes;
 pub mod net;
-mod oslog;
+pub mod oslog;
 pub mod pam;
 pub mod passthrough;
 pub mod passwd;
