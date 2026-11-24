@@ -447,6 +447,50 @@ fn object_and_block(
     Ok(())
 }
 
+/// `bool xpc_dictionary_apply(xpc_object_t, applier)` and `xpc_array_apply`:
+/// an object and a block run before the call returns, whose answer is the
+/// call's.
+fn object_and_applier(
+    symbol: &str,
+    ctx: &mut RegisterContext,
+    mem: &mut dyn GuestMemory,
+    callbacks: &dyn Callbacks,
+) -> Result<()> {
+    let (object, block) = (ctx.rdi, ctx.rsi);
+    if block != 0 {
+        substitute_block(symbol, block, mem, callbacks)?;
+    }
+    let host = host_or_refuse(symbol)?;
+    // SAFETY: both appliers' entry points take an object and a block and
+    // answer a `bool`.
+    let completed = unsafe {
+        core::mem::transmute::<u64, extern "C" fn(u64, u64) -> bool>(host)(object, block)
+    };
+    ctx.rax = completed as u64;
+    Ok(())
+}
+
+/// `void xpc_connection_send_message_with_reply(xpc_connection_t, xpc_object_t,
+/// dispatch_queue_t, xpc_handler_t)`: the block is the fourth argument.
+fn xpc_send_with_reply(
+    symbol: &str,
+    ctx: &mut RegisterContext,
+    mem: &mut dyn GuestMemory,
+    callbacks: &dyn Callbacks,
+) -> Result<()> {
+    let (connection, message, queue, block) = (ctx.rdi, ctx.rsi, ctx.rdx, ctx.rcx);
+    if block == 0 {
+        return Err(bad_pointer(symbol, 0));
+    }
+    substitute_block(symbol, block, mem, callbacks)?;
+    call_block(
+        symbol,
+        host_or_refuse(symbol)?,
+        &[connection, message, queue, block],
+    );
+    Ok(())
+}
+
 /// `void CFRunLoopPerformBlock(CFRunLoopRef, CFTypeRef mode, block)`: two
 /// objects, then a block the run loop copies.
 fn run_loop_perform_block(
@@ -508,6 +552,19 @@ pub fn shim_for(name: &str) -> Option<Shim> {
         "nw_path_enumerate_interfaces" => {
             Some(bind!(callback "nw_path_enumerate_interfaces" => object_and_block))
         }
+        "xpc_connection_set_event_handler" => {
+            Some(bind!(callback "xpc_connection_set_event_handler" => object_and_block))
+        }
+        "xpc_connection_send_barrier" => {
+            Some(bind!(callback "xpc_connection_send_barrier" => object_and_block))
+        }
+        "xpc_connection_send_message_with_reply" => {
+            Some(bind!(callback "xpc_connection_send_message_with_reply" => xpc_send_with_reply))
+        }
+        "xpc_dictionary_apply" => {
+            Some(bind!(callback "xpc_dictionary_apply" => object_and_applier))
+        }
+        "xpc_array_apply" => Some(bind!(callback "xpc_array_apply" => object_and_applier)),
         "qsort_b" => Some(bind!(callback "qsort_b" => qsort_b)),
         "dyld_get_image_versions" => {
             Some(bind!(callback "dyld_get_image_versions" => dyld_get_image_versions))

@@ -137,6 +137,7 @@ pub mod wait;
 mod wait_word;
 pub mod xattr;
 pub mod xlocale;
+pub mod xpc;
 
 /// The environment a guest's `main` receives as `envp`, as `NAME=VALUE`.
 ///
@@ -399,6 +400,7 @@ static SHARED_MODULES: &[exports::Module] = &[
     printf_l::MODULE,
     sprintf::MODULE,
     strfmt::MODULE,
+    xpc::MODULE,
 ];
 
 /// Builtin modules whose guest exports are not yet ported to macOS.
@@ -516,6 +518,7 @@ pub const LIBRARY_NAMES: &[&str] = &[
     "/usr/lib/system/libsystem_malloc.dylib",
     "/usr/lib/system/libsystem_platform.dylib",
     "/usr/lib/system/libsystem_pthread.dylib",
+    "/usr/lib/system/libxpc.dylib",
     // An umbrella over libSystem, which is what a program that loads it as a
     // bundle to look up `free` or `malloc` by name expects to find there.
     "/System/Library/Frameworks/System.framework/Versions/B/System",
