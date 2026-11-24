@@ -2062,6 +2062,7 @@ pub static SIGNATURES: &[FunctionAbi] = &[
     sig!("dirname_r", P, P, P),
     sig!("dispatch_get_context", P, P),
     sig!("dispatch_get_global_queue", P, I64, U64),
+    sig!("_dispatch_is_fork_of_multithreaded_parent", BOOL),
     cbsig!([3], "dispatch_group_async_f", V, P, P, P, P),
     cbsig!([3], "dispatch_apply_f", V, U64, P, P, P),
     sig!("dispatch_group_create", P),
