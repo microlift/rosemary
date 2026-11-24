@@ -554,9 +554,11 @@ pub fn poll_any(fds: &[c_int], timeout_ms: i32) -> Option<usize> {
 
 /// The largest number of rights one message can carry.
 ///
-/// Mach has no such limit; `SCM_RIGHTS` does, and a fixed control buffer is what
-/// keeps the receive path from allocating on a length the sender chose.
-pub const MAX_RIGHTS: usize = 16;
+/// Mach has no such limit; `SCM_RIGHTS` does. Every right but a send-once one
+/// travels with at least one descriptor, so no message carries more rights than
+/// descriptors, and a fixed bound keeps the receive path from allocating on a
+/// count the sender chose.
+pub const MAX_RIGHTS: usize = MAX_FDS;
 
 /// The most descriptors one message can carry, just under the kernel's limit of
 /// 253 for one `SCM_RIGHTS`. A receive right is the port, its listener and the

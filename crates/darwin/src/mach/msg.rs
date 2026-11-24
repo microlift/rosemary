@@ -1,7 +1,9 @@
 use std::ffi::c_void;
-use std::os::fd::FromRawFd;
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 
 use super::kern::*;
+use super::local;
+use super::ool;
 use super::space::{self, MACH_PORT_DEAD, MACH_PORT_NULL, Name};
 use super::wire::{self, Datagram, MAX_RIGHTS, Receiver};
 
@@ -25,23 +27,41 @@ const RCV_LARGE: i32 = 0x0000_0004;
 const SEND_TIMEOUT: i32 = 0x0000_0010;
 const RCV_TIMEOUT: i32 = 0x0000_0100;
 
-/// `MACH_MSG_PORT_DESCRIPTOR`; every other descriptor type is refused.
+/// `MACH_MSG_*_DESCRIPTOR`, and where a 64-bit descriptor's fields sit.
 ///
-/// The type byte is at offset 11 of *every* 64-bit descriptor, whatever its
-/// kind and whatever its length - the headers lay the bitfields out that way on
-/// purpose, so a reader can tell what it is looking at before it knows how far
-/// to step. That is what makes refusing an unknown descriptor possible without
-/// first knowing its size.
-const DESCRIPTOR_TYPE_AT: usize = 11;
-/// The disposition byte, one before it.
-const DESCRIPTOR_DISPOSITION_AT: usize = 10;
-const DESCRIPTOR_PORT: u8 = 0;
+/// The type byte is at offset 11 of *every* descriptor, whatever its kind and
+/// whatever its length - the headers lay the bitfields out that way on purpose,
+/// so a reader can tell what it is looking at before it knows how far to step.
+mod descriptor {
+    pub const PORT: u8 = 0;
+    pub const OOL: u8 = 1;
+    pub const OOL_PORTS: u8 = 2;
+    /// Copied exactly as `OOL` is; only `mach_msg_destroy` tells them apart.
+    pub const OOL_VOLATILE: u8 = 3;
 
-/// `mach_msg_header_t`, `mach_msg_body_t` and `mach_msg_port_descriptor_t`, in
-/// bytes. All three are the same size on x86-64 and arm64.
+    pub const DEALLOCATE_AT: usize = 8;
+    pub const COPY_AT: usize = 9;
+    /// A port's, or a port array's, disposition.
+    pub const DISPOSITION_AT: usize = 10;
+    pub const TYPE_AT: usize = 11;
+    /// An out-of-line region's size, or a port array's count.
+    pub const SIZE_AT: usize = 12;
+
+    /// `mach_msg_port_descriptor_t`.
+    pub const PORT_LEN: usize = 12;
+    /// `mach_msg_ool_descriptor64_t` and `mach_msg_ool_ports_descriptor64_t`.
+    pub const OOL_LEN: usize = 16;
+}
+
+/// `MACH_MSG_PHYSICAL_COPY` and `MACH_MSG_VIRTUAL_COPY`, the only copy options
+/// a sender may give out-of-line memory.
+const PHYSICAL_COPY: u8 = 0;
+const VIRTUAL_COPY: u8 = 1;
+
+/// `mach_msg_header_t` and `mach_msg_body_t`, in bytes. Both are the same size
+/// on x86-64 and arm64.
 const HEADER: usize = 24;
 const BODY: usize = 4;
-const DESCRIPTOR: usize = 12;
 
 /// `mach_msg_trailer_t`: the eight bytes the kernel appends to a received
 /// message. `msgh_size` does not include it, but `rcv_size` has to - which is
@@ -97,17 +117,203 @@ fn audit_token(sender: Option<i32>) -> [u32; 8] {
     [0, euid, egid, uid, gid, pid as u32, 0, 0]
 }
 
-/// The envelope that crosses the socket, in front of the message's own bytes.
+/// The envelope that crosses the socket, in front of the message's own bytes:
+/// the fixed part, a [`Record`] per descriptor, every right the descriptors
+/// carry as a [`Reference`], then the payload.
 mod envelope {
     pub const MAGIC: u32 = 0x3372_4d43;
-    pub const VERSION: u32 = 1;
-    /// Fixed part: magic, version, bits, id, descriptor count, payload length,
-    /// then the reply reference.
-    pub const FIXED: usize = 24 + super::REFERENCE;
+    pub const VERSION: u32 = 2;
+    /// Offsets in the fixed part.
+    pub const BITS_AT: usize = 8;
+    pub const ID_AT: usize = 12;
+    pub const RECORDS_AT: usize = 16;
+    pub const REFERENCES_AT: usize = 20;
+    pub const PAYLOAD_AT: usize = 24;
+    /// Which of the datagram's descriptors is the out-of-line memory object,
+    /// and how many bytes of it the message uses.
+    pub const MEMORY_FD_AT: usize = 28;
+    pub const MEMORY_LEN_AT: usize = 32;
+    pub const REPLY_AT: usize = 40;
+    pub const FIXED: usize = REPLY_AT + super::REFERENCE;
 }
 
 /// A port reference as it crosses: 16 bytes, never a name.
 const REFERENCE: usize = 16;
+
+/// A descriptor as it crosses: its type, the disposition and copy option the
+/// receiver sees, a count, and where its contents are - the index of its first
+/// [`Reference`] for a port or a port array, its offset in the memory object for
+/// out-of-line memory.
+#[derive(Clone, Copy)]
+struct Record {
+    kind: u8,
+    disposition: u8,
+    copy: u8,
+    /// One for a port, the names in a port array, the bytes of a region.
+    count: u32,
+    at: u64,
+}
+
+const RECORD: usize = 16;
+
+impl Record {
+    fn encode(&self, out: &mut Vec<u8>) {
+        out.extend_from_slice(&[self.kind, self.disposition, self.copy, 0]);
+        out.extend_from_slice(&self.count.to_le_bytes());
+        out.extend_from_slice(&self.at.to_le_bytes());
+    }
+
+    fn decode(bytes: &[u8]) -> Option<Record> {
+        let bytes: &[u8; RECORD] = bytes.get(..RECORD)?.try_into().ok()?;
+        Some(Record {
+            kind: bytes[0],
+            disposition: bytes[1],
+            copy: bytes[2],
+            count: word(bytes, 4),
+            at: u64::from_le_bytes(bytes[8..16].try_into().ok()?),
+        })
+    }
+
+    /// The length of the descriptor the receiver is given for this.
+    fn received_len(&self) -> usize {
+        match self.kind {
+            descriptor::PORT => descriptor::PORT_LEN,
+            _ => descriptor::OOL_LEN,
+        }
+    }
+
+    /// Whether this stays within the `references` and `memory` bytes that
+    /// came with it.
+    fn fits(&self, references: usize, memory: u64) -> bool {
+        let end = self.at.checked_add(u64::from(self.count));
+        match self.kind {
+            descriptor::PORT => self.count == 1 && end.is_some_and(|end| end <= references as u64),
+            descriptor::OOL_PORTS => end.is_some_and(|end| end <= references as u64),
+            descriptor::OOL | descriptor::OOL_VOLATILE => end.is_some_and(|end| end <= memory),
+            _ => false,
+        }
+    }
+}
+
+/// A descriptor as it sits in a message, sent or received.
+#[derive(Clone, Copy)]
+enum Descriptor {
+    Port {
+        name: Name,
+        disposition: u32,
+    },
+    Memory {
+        address: u64,
+        size: u32,
+        copy: u8,
+        deallocate: bool,
+        volatile: bool,
+    },
+    Ports {
+        address: u64,
+        count: u32,
+        disposition: u32,
+        deallocate: bool,
+    },
+}
+
+impl Descriptor {
+    /// The descriptor at `at` in `bytes`, and its length.
+    ///
+    /// `MACH_SEND_INVALID_TYPE` for a kind this transport does not carry, and
+    /// `MACH_SEND_INVALID_DATA` for one that runs past the message.
+    fn parse(bytes: &[u8], at: usize) -> Result<(Descriptor, usize), i32> {
+        let kind = *bytes
+            .get(at + descriptor::TYPE_AT)
+            .ok_or(MACH_SEND_INVALID_DATA)?;
+        let len = match kind {
+            descriptor::PORT => descriptor::PORT_LEN,
+            descriptor::OOL | descriptor::OOL_PORTS | descriptor::OOL_VOLATILE => {
+                descriptor::OOL_LEN
+            }
+            _ => {
+                announce_unsupported(kind);
+                return Err(MACH_SEND_INVALID_TYPE);
+            }
+        };
+        let field = bytes.get(at..at + len).ok_or(MACH_SEND_INVALID_DATA)?;
+        let disposition = u32::from(field[descriptor::DISPOSITION_AT]);
+        if kind == descriptor::PORT {
+            let name = word(field, 0);
+            return Ok((Descriptor::Port { name, disposition }, len));
+        }
+        let address = u64::from_le_bytes(field[..8].try_into().unwrap());
+        let size = word(field, descriptor::SIZE_AT);
+        let deallocate = field[descriptor::DEALLOCATE_AT] != 0;
+        let parsed = match kind {
+            descriptor::OOL_PORTS => Descriptor::Ports {
+                address,
+                count: size,
+                disposition,
+                deallocate,
+            },
+            _ => Descriptor::Memory {
+                address,
+                size,
+                copy: field[descriptor::COPY_AT],
+                deallocate,
+                volatile: kind == descriptor::OOL_VOLATILE,
+            },
+        };
+        Ok((parsed, len))
+    }
+
+    /// Append this descriptor as a receiver is given it.
+    ///
+    /// A port array always arrives in pages of its own that the receiver is
+    /// told to deallocate; memory is to be deallocated when it was a virtual
+    /// copy, which is what `ipc_kmsg_deflate_memory_descriptor` says too.
+    fn write(&self, out: &mut Vec<u8>) {
+        match *self {
+            Descriptor::Port { name, disposition } => {
+                out.extend_from_slice(&name.to_le_bytes());
+                out.extend_from_slice(&[0; 6]);
+                out.extend_from_slice(&[disposition as u8, descriptor::PORT]);
+            }
+            Descriptor::Memory {
+                address,
+                size,
+                copy,
+                volatile,
+                ..
+            } => {
+                let kind = match volatile {
+                    true => descriptor::OOL_VOLATILE,
+                    false => descriptor::OOL,
+                };
+                out.extend_from_slice(&address.to_le_bytes());
+                out.extend_from_slice(&[u8::from(copy == VIRTUAL_COPY), copy, 0, kind]);
+                out.extend_from_slice(&size.to_le_bytes());
+            }
+            Descriptor::Ports {
+                address,
+                count,
+                disposition,
+                ..
+            } => {
+                out.extend_from_slice(&address.to_le_bytes());
+                out.extend_from_slice(&[1, VIRTUAL_COPY, disposition as u8, descriptor::OOL_PORTS]);
+                out.extend_from_slice(&count.to_le_bytes());
+            }
+        }
+    }
+}
+
+/// The disposition a right sent under `disposition` arrives with, as
+/// `ipc_object_copyin_type` answers it: zero for one that names no right.
+fn arrives_as(disposition: u32) -> u32 {
+    match disposition {
+        MOVE_RECEIVE => MOVE_RECEIVE,
+        MOVE_SEND | COPY_SEND | MAKE_SEND => MOVE_SEND,
+        MOVE_SEND_ONCE | MAKE_SEND_ONCE => MOVE_SEND_ONCE,
+        _ => 0,
+    }
+}
 
 /// What a [`Reference`] refers to.
 mod refkind {
@@ -231,13 +437,15 @@ enum Pending {
     /// A receive right already out of the space, with the descriptors to send:
     /// the port, and its listener or `-1`.
     Receive { moved: wire::Moved, address: u64 },
+    /// Out-of-line memory, or a port array, the sender asked to give up.
+    Deallocate { address: u64, size: u64 },
 }
 
 impl Pending {
     /// The send failed: put back whatever was taken.
     fn restore(self) {
         match self {
-            Pending::Copied | Pending::Moved(_) => {}
+            Pending::Copied | Pending::Moved(_) | Pending::Deallocate { .. } => {}
             Pending::Receive { moved, address } => {
                 // SAFETY: the descriptors taken out of the space above, never
                 // handed to anything else.
@@ -274,6 +482,10 @@ impl Pending {
                         libc::close(claim);
                     }
                 }
+            }
+            Pending::Deallocate { address, size } => {
+                // SAFETY: memory the sender said it was done with once sent.
+                unsafe { super::vm::vm_deallocate(space::TASK_SELF, address, size) };
             }
         }
     }
@@ -353,24 +565,51 @@ fn export(name: Name, disposition: u32) -> Result<(Reference, Option<Pending>), 
     }
 }
 
-/// The datagram for a message: the envelope, its references, then the payload.
-fn encode(
-    bits: u32,
-    id: i32,
-    reply: &Reference,
-    descriptors: &[Reference],
-    payload: &[u8],
-) -> Vec<u8> {
-    let mut wire_bytes =
-        Vec::with_capacity(envelope::FIXED + descriptors.len() * REFERENCE + payload.len());
+/// What a message carries besides its payload, ready to cross.
+struct Carried {
+    reply: Reference,
+    records: Vec<Record>,
+    references: Vec<Reference>,
+    /// The memory object's index among the datagram's descriptors, and how many
+    /// of its bytes the records use.
+    memory: Option<(usize, u64)>,
+}
+
+impl Carried {
+    const NOTHING: Carried = Carried {
+        reply: Reference::NONE,
+        records: Vec::new(),
+        references: Vec::new(),
+        memory: None,
+    };
+}
+
+/// The datagram for a message: the envelope, then the payload.
+fn encode(bits: u32, id: i32, carried: &Carried, payload: &[u8]) -> Vec<u8> {
+    let (memory_fd, memory_len) = match carried.memory {
+        Some((index, len)) => (index as i32, len),
+        None => (-1, 0),
+    };
+    let mut wire_bytes = Vec::with_capacity(
+        envelope::FIXED
+            + carried.records.len() * RECORD
+            + carried.references.len() * REFERENCE
+            + payload.len(),
+    );
     wire_bytes.extend_from_slice(&envelope::MAGIC.to_le_bytes());
     wire_bytes.extend_from_slice(&envelope::VERSION.to_le_bytes());
     wire_bytes.extend_from_slice(&bits.to_le_bytes());
     wire_bytes.extend_from_slice(&id.to_le_bytes());
-    wire_bytes.extend_from_slice(&(descriptors.len() as u32).to_le_bytes());
+    wire_bytes.extend_from_slice(&(carried.records.len() as u32).to_le_bytes());
+    wire_bytes.extend_from_slice(&(carried.references.len() as u32).to_le_bytes());
     wire_bytes.extend_from_slice(&(payload.len() as u32).to_le_bytes());
-    reply.encode(&mut wire_bytes);
-    for reference in descriptors {
+    wire_bytes.extend_from_slice(&memory_fd.to_le_bytes());
+    wire_bytes.extend_from_slice(&memory_len.to_le_bytes());
+    carried.reply.encode(&mut wire_bytes);
+    for record in &carried.records {
+        record.encode(&mut wire_bytes);
+    }
+    for reference in &carried.references {
         reference.encode(&mut wire_bytes);
     }
     wire_bytes.extend_from_slice(payload);
@@ -391,8 +630,7 @@ pub fn deliver_no_senders(destination: wire::Address, count: u32) {
     let bytes = encode(
         MOVE_SEND_ONCE,
         space::NOTIFY_NO_SENDERS,
-        &Reference::NONE,
-        &[],
+        &Carried::NOTHING,
         &payload,
     );
     // A destination that is gone has nothing left to tell.
@@ -490,51 +728,144 @@ unsafe fn send(msg: *const u8, send_size: u32) -> i32 {
     let local_disposition = (bits >> BITS_LOCAL_SHIFT) & BITS_PORTS_MASK;
     let mut fds = Vec::new();
     let mut claims = Vec::new();
-    let reply = match export(local_name, local_disposition) {
-        Ok((mut reference, held)) => {
-            attach(&mut reference, held.as_ref(), &mut fds, &mut claims);
-            pending.extend(held);
-            reference
-        }
+    // Every right leaves this task's space through here, and `failure` puts it
+    // back if the message never goes.
+    let mut take = |name: Name, disposition: u32, pending: &mut Vec<Pending>| {
+        let (mut reference, held) = export(name, disposition)?;
+        attach(&mut reference, held.as_ref(), &mut fds, &mut claims);
+        pending.extend(held);
+        Ok::<_, i32>(reference)
+    };
+    let reply = match take(local_name, local_disposition, &mut pending) {
+        Ok(reference) => reference,
         Err(code) => return failure(pending, code),
     };
 
-    let complex = bits & BITS_COMPLEX != 0;
-    let mut descriptors = Vec::new();
+    let mut records = Vec::new();
+    let mut references = Vec::new();
+    // Out-of-line memory as `(address, size)`, in the order the records use.
+    let mut regions = Vec::new();
+    let mut memory_len = 0u64;
     let mut payload_at = HEADER;
 
-    if complex {
+    if bits & BITS_COMPLEX != 0 {
         if size < HEADER + BODY {
             return failure(pending, MACH_SEND_INVALID_DATA);
         }
-        let count = word(&bytes, HEADER) as usize;
-        if count > MAX_RIGHTS {
-            return failure(pending, MACH_SEND_TOO_LARGE);
-        }
-        payload_at = HEADER + BODY + count * DESCRIPTOR;
-        if size < payload_at {
-            return failure(pending, MACH_SEND_INVALID_DATA);
-        }
-        for i in 0..count {
-            let at = HEADER + BODY + i * DESCRIPTOR;
-            if bytes[at + DESCRIPTOR_TYPE_AT] != DESCRIPTOR_PORT {
-                announce_out_of_line();
-                return failure(pending, MACH_SEND_INVALID_TYPE);
-            }
-            let name = word(&bytes, at);
-            let disposition = bytes[at + DESCRIPTOR_DISPOSITION_AT] as u32;
-            match export(name, disposition) {
-                Ok((mut reference, held)) => {
-                    attach(&mut reference, held.as_ref(), &mut fds, &mut claims);
-                    pending.extend(held);
-                    descriptors.push(reference);
-                }
+        let count = word(&bytes, HEADER);
+        let mut at = HEADER + BODY;
+        for _ in 0..count {
+            let (descriptor, len) = match Descriptor::parse(&bytes, at) {
+                Ok(parsed) => parsed,
                 Err(code) => return failure(pending, code),
-            }
+            };
+            at += len;
+            let first = references.len() as u64;
+            let record = match descriptor {
+                Descriptor::Port { name, disposition } => {
+                    if references.len() >= MAX_RIGHTS {
+                        return failure(pending, MACH_SEND_TOO_LARGE);
+                    }
+                    match take(name, disposition, &mut pending) {
+                        Ok(reference) => references.push(reference),
+                        Err(code) => return failure(pending, code),
+                    }
+                    Record {
+                        kind: descriptor::PORT,
+                        disposition: arrives_as(disposition) as u8,
+                        copy: 0,
+                        count: 1,
+                        at: first,
+                    }
+                }
+                Descriptor::Ports {
+                    address,
+                    count,
+                    disposition,
+                    deallocate,
+                } => {
+                    if references.len() + count as usize > MAX_RIGHTS {
+                        return failure(pending, MACH_SEND_TOO_LARGE);
+                    }
+                    let mut names = vec![0u8; count as usize * size_of::<Name>()];
+                    if local::read(address, &mut names).is_err() {
+                        return failure(pending, MACH_SEND_INVALID_MEMORY);
+                    }
+                    for name in names.chunks_exact(size_of::<Name>()) {
+                        match take(word(name, 0), disposition, &mut pending) {
+                            Ok(reference) => references.push(reference),
+                            Err(code) => return failure(pending, code),
+                        }
+                    }
+                    if deallocate {
+                        let size = names.len() as u64;
+                        pending.push(Pending::Deallocate { address, size });
+                    }
+                    Record {
+                        kind: descriptor::OOL_PORTS,
+                        disposition: arrives_as(disposition) as u8,
+                        copy: VIRTUAL_COPY,
+                        count,
+                        at: first,
+                    }
+                }
+                Descriptor::Memory {
+                    address,
+                    size,
+                    copy,
+                    deallocate,
+                    volatile,
+                } => {
+                    if copy != PHYSICAL_COPY && copy != VIRTUAL_COPY {
+                        return failure(pending, MACH_SEND_INVALID_TYPE);
+                    }
+                    let size_bytes = u64::from(size);
+                    regions.push((address, size_bytes));
+                    if deallocate {
+                        pending.push(Pending::Deallocate {
+                            address,
+                            size: size_bytes,
+                        });
+                    }
+                    let record = Record {
+                        kind: match volatile {
+                            true => descriptor::OOL_VOLATILE,
+                            false => descriptor::OOL,
+                        },
+                        disposition: 0,
+                        copy,
+                        count: size,
+                        at: memory_len,
+                    };
+                    memory_len += size_bytes;
+                    record
+                }
+            };
+            records.push(record);
         }
+        payload_at = at;
     }
 
-    let wire_bytes = encode(bits, id, &reply, &descriptors, &bytes[payload_at..]);
+    // Held until the send is done, so the receiver gets its own descriptor for
+    // the object before this one is closed.
+    let memory = match ool::gather(&regions) {
+        Ok(memory) => memory,
+        Err(code) => return failure(pending, code),
+    };
+    let memory_at = memory.as_ref().map(|object| {
+        fds.push(object.as_raw_fd());
+        (fds.len() - 1, memory_len)
+    });
+    let carried = Carried {
+        reply,
+        records,
+        references,
+        memory: memory_at,
+    };
+    let wire_bytes = encode(bits, id, &carried, &bytes[payload_at..]);
+    if wire_bytes.len() > wire::MAX_MESSAGE {
+        return failure(pending, MACH_SEND_TOO_LARGE);
+    }
 
     match wire::send(destination, &wire_bytes, &fds) {
         Ok(()) => {
@@ -557,15 +888,19 @@ unsafe fn send(msg: *const u8, send_size: u32) -> i32 {
     }
 }
 
-fn announce_out_of_line() {
+/// Say once that a descriptor of `kind` was refused, since a guest that sends
+/// one is left with nothing but `MACH_SEND_INVALID_TYPE` to go on.
+fn announce_unsupported(kind: u8) {
+    /// `MACH_MSG_GUARDED_PORT_DESCRIPTOR`.
+    const GUARDED_PORT: u8 = 4;
     static SAID: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
     if !SAID.swap(true, std::sync::atomic::Ordering::Relaxed) {
-        eprintln!(
-            "rosemary: mach_msg refused a message carrying out-of-line memory - a page mapped into \
-             the receiver is not something one unrelated process can do to another here, and \
-             copying the pointer across would hand the receiver an address that means something \
-             else in its own space"
-        );
+        match kind {
+            GUARDED_PORT => eprintln!(
+                "rosemary: mach_msg refused a guarded port descriptor, which is not supported"
+            ),
+            _ => eprintln!("rosemary: mach_msg refused a descriptor of unknown type {kind}"),
+        }
     }
 }
 
@@ -639,17 +974,35 @@ unsafe fn receive(
     {
         return MACH_RCV_BODY_ERROR;
     }
-    let sender_bits = word(bytes, 8);
-    let id = word(bytes, 12) as i32;
-    let count = word(bytes, 16) as usize;
-    let payload_len = word(bytes, 20) as usize;
-    if count > MAX_RIGHTS || bytes.len() < envelope::FIXED + count * REFERENCE + payload_len {
+    let sender_bits = word(bytes, envelope::BITS_AT);
+    let id = word(bytes, envelope::ID_AT) as i32;
+    let count = word(bytes, envelope::RECORDS_AT) as usize;
+    let reference_count = word(bytes, envelope::REFERENCES_AT) as usize;
+    let payload_len = word(bytes, envelope::PAYLOAD_AT) as usize;
+    let memory_fd = word(bytes, envelope::MEMORY_FD_AT) as i32;
+    let memory_len = u64::from_le_bytes(
+        bytes[envelope::MEMORY_LEN_AT..envelope::MEMORY_LEN_AT + 8]
+            .try_into()
+            .unwrap(),
+    );
+    let references_at = envelope::FIXED + count * RECORD;
+    let payload_at = references_at + reference_count * REFERENCE;
+    if reference_count > MAX_RIGHTS || bytes.len() < payload_at + payload_len {
+        return MACH_RCV_BODY_ERROR;
+    }
+    let records: Vec<Record> = (0..count)
+        .filter_map(|i| Record::decode(&bytes[envelope::FIXED + i * RECORD..]))
+        .collect();
+    if !records
+        .iter()
+        .all(|record| record.fits(reference_count, memory_len))
+    {
         return MACH_RCV_BODY_ERROR;
     }
 
     let complex = count > 0 || sender_bits & BITS_COMPLEX != 0;
     let body = match complex {
-        true => BODY + count * DESCRIPTOR,
+        true => BODY + records.iter().map(Record::received_len).sum::<usize>(),
         false => 0,
     };
     let size = HEADER + body + payload_len;
@@ -671,18 +1024,99 @@ unsafe fn receive(
         return MACH_RCV_TOO_LARGE;
     }
 
+    // A memory object that does not hold what its sender said makes the whole
+    // message unreadable, so it is refused before any right in it is adopted.
+    let memory = match memory_len {
+        0 => None,
+        len => {
+            let object = usize::try_from(memory_fd)
+                .ok()
+                .and_then(|index| message.take_fd(index))
+                // SAFETY: a descriptor that arrived over `SCM_RIGHTS`, now
+                // owned by this process.
+                .map(|fd| unsafe { OwnedFd::from_raw_fd(fd) });
+            match object.and_then(|object| ool::Arrived::map(object, len)) {
+                Some(arrived) => Some(arrived),
+                None => return MACH_RCV_BODY_ERROR,
+            }
+        }
+    };
+
     // Every right in the message enters this task's space before any of it is
     // written out, so a failure part-way cannot leave the caller holding names
     // for rights it was never told about.
-    let reply = Reference::decode(&bytes[24..]).unwrap_or(Reference::NONE);
+    let reply = Reference::decode(&message.bytes[envelope::REPLY_AT..]).unwrap_or(Reference::NONE);
     let reply_name = reply.adopt(&mut message);
-    let adopted: Vec<(Name, u8)> = (0..count)
+    let names: Vec<Name> = (0..reference_count)
         .map(|i| {
-            let at = envelope::FIXED + i * REFERENCE;
+            let at = references_at + i * REFERENCE;
             let reference = Reference::decode(&message.bytes[at..]).unwrap_or(Reference::NONE);
-            (reference.adopt(&mut message), reference.disposition)
+            reference.adopt(&mut message)
         })
         .collect();
+
+    // Out-of-line memory that cannot be placed arrives as nothing, and the
+    // receive says why, as `ipc_kmsg_copyout_body` does.
+    let mut unplaced = 0;
+    let mut place = |bytes: &[u8]| {
+        ool::place(bytes).unwrap_or_else(|code| {
+            unplaced |= match code {
+                KERN_RESOURCE_SHORTAGE => MACH_MSG_VM_KERNEL,
+                _ => MACH_MSG_VM_SPACE,
+            };
+            0
+        })
+    };
+    let mut descriptors = Vec::with_capacity(body);
+    if complex {
+        descriptors.extend_from_slice(&(records.len() as u32).to_le_bytes());
+    }
+    for record in &records {
+        let at = record.at as usize;
+        let disposition = u32::from(record.disposition);
+        let received = match record.kind {
+            descriptor::PORT => Descriptor::Port {
+                name: names[at],
+                disposition,
+            },
+            descriptor::OOL_PORTS => {
+                let carried = &names[at..at + record.count as usize];
+                let array: Vec<u8> = carried.iter().flat_map(|name| name.to_le_bytes()).collect();
+                let address = place(&array);
+                if address == 0 {
+                    for name in carried {
+                        destroy_port(*name, disposition);
+                    }
+                }
+                Descriptor::Ports {
+                    address,
+                    count: record.count,
+                    disposition,
+                    deallocate: true,
+                }
+            }
+            kind => {
+                let size = u64::from(record.count);
+                let bytes = match &memory {
+                    Some(memory) => memory.bytes(record.at, size),
+                    None => &[],
+                };
+                let address = place(bytes);
+                Descriptor::Memory {
+                    address,
+                    size: match address {
+                        0 => 0,
+                        _ => record.count,
+                    },
+                    copy: record.copy,
+                    deallocate: record.copy == VIRTUAL_COPY,
+                    volatile: kind == descriptor::OOL_VOLATILE,
+                }
+            }
+        };
+        received.write(&mut descriptors);
+    }
+    drop(memory);
 
     let mut bits =
         (reply.disposition as u32 & BITS_PORTS_MASK) | (MOVE_RECEIVE << BITS_LOCAL_SHIFT);
@@ -693,19 +1127,7 @@ unsafe fn receive(
     // SAFETY: `size + trailer_size` bytes of the caller's buffer, checked above.
     unsafe {
         write_header(msg, bits, size as u32, reply_name, arrived_on, id);
-        if complex {
-            write_word(msg, HEADER, count as u32);
-            for (i, (name, disposition)) in adopted.iter().enumerate() {
-                let at = HEADER + BODY + i * DESCRIPTOR;
-                write_word(msg, at, *name);
-                write_word(msg, at + 4, 0);
-                msg.add(at + 8).write(0);
-                msg.add(at + 9).write(0);
-                msg.add(at + DESCRIPTOR_DISPOSITION_AT).write(*disposition);
-                msg.add(at + DESCRIPTOR_TYPE_AT).write(DESCRIPTOR_PORT);
-            }
-        }
-        let payload_at = envelope::FIXED + count * REFERENCE;
+        core::ptr::copy_nonoverlapping(descriptors.as_ptr(), msg.add(HEADER), descriptors.len());
         core::ptr::copy_nonoverlapping(
             message.bytes.as_ptr().add(payload_at),
             msg.add(HEADER + body),
@@ -733,7 +1155,10 @@ unsafe fn receive(
             }
         }
     }
-    MACH_MSG_SUCCESS
+    match unplaced {
+        0 => MACH_MSG_SUCCESS,
+        why => MACH_RCV_BODY_ERROR | why,
+    }
 }
 
 /// # Safety
@@ -860,20 +1285,21 @@ pub unsafe extern "C" fn mach_msg_overwrite(
 
 /// `void mach_msg_destroy(mach_msg_header_t *)`
 ///
-/// Releases every right in a message the caller has decided not to act on. The
-/// rights are already in this task's space by the time a receiver sees them, so
-/// skipping this leaks a name per message - which is what turns a server loop
-/// that discards unknown messages into one that runs out of names.
+/// Releases every right and every out-of-line region in a message the caller
+/// has decided not to act on. The rights are already in this task's space by
+/// the time a receiver sees them, so skipping this leaks a name per message -
+/// which is what turns a server loop that discards unknown messages into one
+/// that runs out of names.
 ///
 /// # Safety
 ///
-/// `msg` addresses a received `mach_msg_header_t` and the body it describes.
+/// `msg` addresses a `mach_msg_header_t` and the body it describes.
 pub unsafe extern "C" fn mach_msg_destroy(msg: *mut c_void) {
     if msg.is_null() {
         return;
     }
     let msg = msg.cast::<u8>();
-    // SAFETY: a received message, whose header states its own size.
+    // SAFETY: a message whose header states its own size.
     let (bits, size) = unsafe {
         (
             msg.cast::<u32>().read_unaligned(),
@@ -883,33 +1309,74 @@ pub unsafe extern "C" fn mach_msg_destroy(msg: *mut c_void) {
     // SAFETY: as above, and the size is the message's own.
     let bytes = unsafe { read_message(msg, size.clamp(HEADER, wire::MAX_MESSAGE)) };
 
-    let remote = word(&bytes, 8);
-    if remote != MACH_PORT_NULL && remote != MACH_PORT_DEAD {
-        super::space::mach_port_deallocate(space::TASK_SELF, remote);
-    }
+    destroy_port(word(&bytes, 8), bits & BITS_PORTS_MASK);
     if bits & BITS_COMPLEX == 0 || bytes.len() < HEADER + BODY {
         return;
     }
-    let count = word(&bytes, HEADER) as usize;
-    for i in 0..count {
-        let at = HEADER + BODY + i * DESCRIPTOR;
-        if at + DESCRIPTOR > bytes.len() || bytes[at + DESCRIPTOR_TYPE_AT] != DESCRIPTOR_PORT {
+    let count = word(&bytes, HEADER);
+    let mut at = HEADER + BODY;
+    for _ in 0..count {
+        let Ok((descriptor, len)) = Descriptor::parse(&bytes, at) else {
             return;
-        }
-        let name = word(&bytes, at);
-        if name == MACH_PORT_NULL || name == MACH_PORT_DEAD {
-            continue;
-        }
-        match bytes[at + DESCRIPTOR_DISPOSITION_AT] as u32 {
-            // A receive right that arrived is destroyed, not deallocated: it is
-            // the port itself and nobody else in this task holds it.
-            MOVE_RECEIVE => {
-                space::destroy(name);
+        };
+        at += len;
+        match descriptor {
+            Descriptor::Port { name, disposition } => destroy_port(name, disposition),
+            // Volatile memory is left alone, as libsyscall's own leaves it.
+            Descriptor::Memory {
+                address,
+                size,
+                deallocate: true,
+                volatile: false,
+                ..
+            } => {
+                // SAFETY: memory the message said was the receiver's to free.
+                unsafe { super::vm::vm_deallocate(space::TASK_SELF, address, u64::from(size)) };
             }
-            _ => {
-                super::space::mach_port_deallocate(space::TASK_SELF, name);
+            Descriptor::Memory { .. } => {}
+            Descriptor::Ports {
+                address,
+                count,
+                disposition,
+                deallocate,
+            } => {
+                let step = size_of::<Name>() as u64;
+                for i in 0..u64::from(count) {
+                    let mut name = [0u8; size_of::<Name>()];
+                    if local::read(address + i * step, &mut name).is_err() {
+                        break;
+                    }
+                    destroy_port(Name::from_le_bytes(name), disposition);
+                }
+                if deallocate {
+                    let size = u64::from(count) * step;
+                    // SAFETY: the array the message said was the receiver's to free.
+                    unsafe { super::vm::vm_deallocate(space::TASK_SELF, address, size) };
+                }
             }
         }
+    }
+}
+
+/// Release the right a message holds in `name` under `disposition`, as
+/// libsyscall's `mach_msg_destroy_port` does.
+///
+/// FIXME (ACCURACY): Darwin makes a `MAKE_SEND` or `MAKE_SEND_ONCE` right only
+/// to destroy it, which a make-send count or a send-once notification can
+/// observe; here neither is made.
+fn destroy_port(name: Name, disposition: u32) {
+    if name == MACH_PORT_NULL || name == MACH_PORT_DEAD {
+        return;
+    }
+    match disposition {
+        MOVE_SEND | MOVE_SEND_ONCE => {
+            super::space::mach_port_deallocate(space::TASK_SELF, name);
+        }
+        // A receive right that arrived is the port itself, so it is destroyed.
+        MOVE_RECEIVE => {
+            space::destroy(name);
+        }
+        _ => {}
     }
 }
 
@@ -1237,7 +1704,7 @@ mod tests {
         descriptor.extend_from_slice(&1u32.to_le_bytes()); // one descriptor
         descriptor.extend_from_slice(&carried.to_le_bytes());
         descriptor.extend_from_slice(&0u32.to_le_bytes());
-        descriptor.extend_from_slice(&[0, 0, MOVE_RECEIVE as u8, DESCRIPTOR_PORT]);
+        descriptor.extend_from_slice(&[0, 0, MOVE_RECEIVE as u8, descriptor::PORT]);
         descriptor.extend_from_slice(&0xdead_beefu32.to_le_bytes()); // the payload
 
         let mut sent = message(BITS_COMPLEX, service, MACH_PORT_NULL, 7, &descriptor);
@@ -1277,7 +1744,7 @@ mod tests {
         assert_eq!(word(&buf, HEADER), 1, "one descriptor");
         let arrived = word(&buf, HEADER + BODY);
         assert_eq!(
-            buf[HEADER + BODY + DESCRIPTOR_DISPOSITION_AT] as u32,
+            buf[HEADER + BODY + descriptor::DISPOSITION_AT] as u32,
             MOVE_RECEIVE
         );
         assert_eq!(space::address_of(arrived), Some(address));
@@ -1286,7 +1753,7 @@ mod tests {
             "and it is a receive right"
         );
         assert_eq!(
-            word(&buf, HEADER + BODY + DESCRIPTOR),
+            word(&buf, HEADER + BODY + descriptor::PORT_LEN),
             0xdead_beef,
             "the payload follows the descriptors"
         );
@@ -1295,21 +1762,24 @@ mod tests {
         space::destroy(arrived);
     }
 
-    /// Out-of-line memory cannot cross, and is refused by name rather than sent
-    /// with the sender's pointer in it.
-    #[test]
-    fn a_message_carrying_out_of_line_memory_is_refused() {
-        let port = allocate_receive();
-        let mut descriptor = Vec::new();
-        descriptor.extend_from_slice(&1u32.to_le_bytes());
-        descriptor.extend_from_slice(&[0u8; 8]); // address
-        // `deallocate`, `copy`, `pad1`, `type` - the type byte at offset 11, as
-        // in a port descriptor.
-        descriptor.extend_from_slice(&[0, 0, 0, 1]); // MACH_MSG_OOL_DESCRIPTOR
-        descriptor.extend_from_slice(&8u32.to_le_bytes()); // size
-        let mut sent = message(BITS_COMPLEX, port, MACH_PORT_NULL, 1, &descriptor);
+    /// An out-of-line descriptor: 16 bytes, the type at offset 11 as in a port
+    /// descriptor.
+    fn out_of_line(kind: u8, address: u64, size: u32, flags: [u8; 3]) -> Vec<u8> {
+        let mut bytes = address.to_le_bytes().to_vec();
+        bytes.extend_from_slice(&[flags[0], flags[1], flags[2], kind]);
+        bytes.extend_from_slice(&size.to_le_bytes());
+        bytes
+    }
+
+    fn send_complex(port: Name, descriptors: &[Vec<u8>], payload: &[u8]) -> i32 {
+        let mut body = (descriptors.len() as u32).to_le_bytes().to_vec();
+        for descriptor in descriptors {
+            body.extend_from_slice(descriptor);
+        }
+        body.extend_from_slice(payload);
+        let mut sent = message(BITS_COMPLEX, port, MACH_PORT_NULL, 3, &body);
         // SAFETY: a whole message of the size in its header.
-        let rc = unsafe {
+        unsafe {
             mach_msg(
                 sent.as_mut_ptr().cast(),
                 SEND_MSG,
@@ -1319,8 +1789,193 @@ mod tests {
                 0,
                 MACH_PORT_NULL,
             )
-        };
-        assert_eq!(rc, MACH_SEND_INVALID_TYPE);
+        }
+    }
+
+    fn quad(bytes: &[u8], at: usize) -> u64 {
+        u64::from_le_bytes(bytes[at..at + 8].try_into().unwrap())
+    }
+
+    /// The receiver's copy is its own: fresh pages, not the sender's address,
+    /// and still there after the sender has changed its region.
+    #[test]
+    fn out_of_line_memory_arrives_as_a_copy_in_the_receivers_own_pages() {
+        let port = allocate_receive();
+        let mut region: Vec<u8> = (0..20_000u32).map(|i| (i * 7) as u8).collect();
+        let expected = region.clone();
+        let descriptor = out_of_line(
+            descriptor::OOL,
+            region.as_ptr() as u64,
+            region.len() as u32,
+            [0, VIRTUAL_COPY, 0],
+        );
+        assert_eq!(send_complex(port, &[descriptor], b"tail"), MACH_MSG_SUCCESS);
+        region.fill(0);
+
+        let arrived = take(port, 1000).expect("the message");
+        let at = HEADER + BODY;
+        assert_eq!(word(&arrived, HEADER), 1);
+        assert_eq!(arrived[at + descriptor::TYPE_AT], descriptor::OOL);
+        assert_eq!(arrived[at + descriptor::COPY_AT], VIRTUAL_COPY);
+        assert_eq!(
+            arrived[at + descriptor::DEALLOCATE_AT],
+            1,
+            "a virtual copy is the receiver's to deallocate"
+        );
+        assert_eq!(word(&arrived, at + descriptor::SIZE_AT), 20_000);
+        assert_eq!(
+            &arrived[at + descriptor::OOL_LEN..at + descriptor::OOL_LEN + 4],
+            b"tail"
+        );
+        let address = quad(&arrived, at);
+        assert_ne!(address, region.as_ptr() as u64);
+        // SAFETY: the 20000 bytes the receive placed at `address`.
+        let copy = unsafe { std::slice::from_raw_parts(address as *const u8, 20_000) };
+        assert_eq!(copy, &expected[..]);
+
+        // SAFETY: the region the message handed over.
+        let rc = unsafe { super::super::vm::vm_deallocate(space::TASK_SELF, address, 20_000) };
+        assert_eq!(rc, KERN_SUCCESS);
+        space::destroy(port);
+    }
+
+    #[test]
+    fn an_empty_out_of_line_region_arrives_with_no_address() {
+        let port = allocate_receive();
+        let descriptor = out_of_line(descriptor::OOL, 0x1000, 0, [0, PHYSICAL_COPY, 0]);
+        assert_eq!(send_complex(port, &[descriptor], &[]), MACH_MSG_SUCCESS);
+        let arrived = take(port, 1000).expect("the message");
+        assert_eq!(quad(&arrived, HEADER + BODY), 0);
+        assert_eq!(word(&arrived, HEADER + BODY + descriptor::SIZE_AT), 0);
+        space::destroy(port);
+    }
+
+    #[test]
+    fn a_sender_that_deallocates_out_of_line_memory_gives_its_pages_up() {
+        let port = allocate_receive();
+        let mut address = 0u64;
+        let page = super::super::info::page_size();
+        // SAFETY: a live local for the out-parameter.
+        let rc = unsafe { super::super::vm::vm_allocate(space::TASK_SELF, &mut address, page, 1) };
+        assert_eq!(rc, KERN_SUCCESS);
+        // SAFETY: the page just allocated.
+        unsafe { (address as *mut u8).write(0x5a) };
+        let descriptor = out_of_line(descriptor::OOL, address, 1, [1, VIRTUAL_COPY, 0]);
+        assert_eq!(send_complex(port, &[descriptor], &[]), MACH_MSG_SUCCESS);
+        assert!(
+            !starnix::memory::mapped(address as usize),
+            "the sender's page is gone"
+        );
+        let arrived = take(port, 1000).expect("the message");
+        // SAFETY: the byte the receive placed there.
+        assert_eq!(
+            unsafe { *(quad(&arrived, HEADER + BODY) as *const u8) },
+            0x5a
+        );
+        space::destroy(port);
+    }
+
+    #[test]
+    fn unreadable_out_of_line_memory_is_refused_and_the_sender_keeps_its_rights() {
+        let port = allocate_receive();
+        let target = allocate_receive();
+        let held = space::insert_send(space::address_of(target).unwrap());
+        let mut moved = held.to_le_bytes().to_vec();
+        moved.extend_from_slice(&[0; 6]);
+        moved.extend_from_slice(&[MOVE_SEND as u8, descriptor::PORT]);
+        let unreadable = out_of_line(descriptor::OOL, 8, 16, [0, PHYSICAL_COPY, 0]);
+        assert_eq!(
+            send_complex(port, &[moved, unreadable], &[]),
+            MACH_SEND_INVALID_MEMORY
+        );
+        assert_eq!(
+            space::address_of(held),
+            space::address_of(target),
+            "the moved right is still held"
+        );
+        assert!(take(port, 100).is_none(), "and nothing was sent");
+        space::mach_port_deallocate(space::TASK_SELF, held);
+        space::destroy(port);
+        space::destroy(target);
+    }
+
+    /// `MACH_MSG_ALLOCATE` and the rest describe a receive, not a send.
+    #[test]
+    fn a_copy_option_other_than_physical_or_virtual_is_refused() {
+        /// `MACH_MSG_ALLOCATE`.
+        const ALLOCATE: u8 = 2;
+        let port = allocate_receive();
+        let byte = 0u8;
+        let descriptor = out_of_line(descriptor::OOL, &raw const byte as u64, 1, [0, ALLOCATE, 0]);
+        assert_eq!(
+            send_complex(port, &[descriptor], &[]),
+            MACH_SEND_INVALID_TYPE
+        );
+        space::destroy(port);
+    }
+
+    /// Each name in a port array crosses as its own right, and the array
+    /// arrives in pages of the receiver's own.
+    #[test]
+    fn an_out_of_line_port_array_carries_each_right() {
+        let port = allocate_receive();
+        let first = allocate_receive();
+        let second = allocate_receive();
+        let names = [first, MACH_PORT_NULL, second];
+        let descriptor = out_of_line(
+            descriptor::OOL_PORTS,
+            names.as_ptr() as u64,
+            names.len() as u32,
+            [0, PHYSICAL_COPY, MAKE_SEND as u8],
+        );
+        assert_eq!(send_complex(port, &[descriptor], &[]), MACH_MSG_SUCCESS);
+
+        let arrived = take(port, 1000).expect("the message");
+        let at = HEADER + BODY;
+        assert_eq!(arrived[at + descriptor::TYPE_AT], descriptor::OOL_PORTS);
+        assert_eq!(
+            u32::from(arrived[at + descriptor::DISPOSITION_AT]),
+            MOVE_SEND
+        );
+        assert_eq!(word(&arrived, at + descriptor::SIZE_AT), 3);
+        let array = quad(&arrived, at);
+        assert_ne!(array, names.as_ptr() as u64);
+        // SAFETY: the three names the receive placed at `array`.
+        let received = unsafe { std::slice::from_raw_parts(array as *const Name, 3) };
+        assert_eq!(space::address_of(received[0]), space::address_of(first));
+        assert_eq!(received[1], MACH_PORT_NULL);
+        assert_eq!(space::address_of(received[2]), space::address_of(second));
+
+        // SAFETY: the message just received, in its own buffer.
+        unsafe { mach_msg_destroy(arrived.as_ptr().cast_mut().cast()) };
+        assert!(
+            !starnix::memory::mapped(array as usize),
+            "destroying the message frees the array"
+        );
+        space::destroy(port);
+        space::destroy(first);
+        space::destroy(second);
+    }
+
+    /// The message's out-of-line memory and the descriptor it travels as are
+    /// both released when the receiver throws the message away.
+    #[test]
+    fn destroying_a_received_message_frees_its_out_of_line_memory() {
+        let port = allocate_receive();
+        let region = [1u8; 64];
+        let descriptor = out_of_line(
+            descriptor::OOL,
+            region.as_ptr() as u64,
+            64,
+            [0, VIRTUAL_COPY, 0],
+        );
+        assert_eq!(send_complex(port, &[descriptor], &[]), MACH_MSG_SUCCESS);
+        let arrived = take(port, 1000).expect("the message");
+        let address = quad(&arrived, HEADER + BODY);
+        assert!(starnix::memory::mapped(address as usize));
+        // SAFETY: the message just received, in its own buffer.
+        unsafe { mach_msg_destroy(arrived.as_ptr().cast_mut().cast()) };
+        assert!(!starnix::memory::mapped(address as usize));
         space::destroy(port);
     }
 
@@ -1579,7 +2234,7 @@ mod tests {
         descriptor.extend_from_slice(&1u32.to_le_bytes());
         descriptor.extend_from_slice(&held.to_le_bytes());
         descriptor.extend_from_slice(&0u32.to_le_bytes());
-        descriptor.extend_from_slice(&[0, 0, MOVE_SEND as u8, DESCRIPTOR_PORT]);
+        descriptor.extend_from_slice(&[0, 0, MOVE_SEND as u8, descriptor::PORT]);
         let mut sent = message(BITS_COMPLEX, mailbox, MACH_PORT_NULL, 9, &descriptor);
         // SAFETY: a whole message of the size in its header.
         let rc = unsafe {
@@ -1667,7 +2322,7 @@ mod tests {
         descriptor.extend_from_slice(&1u32.to_le_bytes());
         descriptor.extend_from_slice(&port.to_le_bytes());
         descriptor.extend_from_slice(&0u32.to_le_bytes());
-        descriptor.extend_from_slice(&[0, 0, MOVE_RECEIVE as u8, DESCRIPTOR_PORT]);
+        descriptor.extend_from_slice(&[0, 0, MOVE_RECEIVE as u8, descriptor::PORT]);
         let mut sent = message(BITS_COMPLEX, mailbox, MACH_PORT_NULL, 11, &descriptor);
         // SAFETY: a whole message of the size in its header.
         let rc = unsafe {
