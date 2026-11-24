@@ -12,17 +12,61 @@ use machish::spec::arch::X86_64;
 /// The selector a class's `+load` is sent as.
 const LOAD_SELECTOR: &str = "load";
 
+/// Why an address is an entry, in the order [`of`] adds them.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum Source {
+    /// An earlier run had to JIT it.
+    Profiled,
+    /// A `+load` method.
+    Load,
+    /// Any other Objective-C method.
+    Method,
+    Initializer,
+    EntryPoint,
+    /// A function with an exception table.
+    Unwind,
+    LandingPad,
+    FunctionStart,
+}
+
+impl Source {
+    pub const ALL: [Source; 8] = [
+        Source::Profiled,
+        Source::Load,
+        Source::Method,
+        Source::Initializer,
+        Source::EntryPoint,
+        Source::Unwind,
+        Source::LandingPad,
+        Source::FunctionStart,
+    ];
+    pub const COUNT: usize = Self::ALL.len();
+}
+
 /// One image's entry points.
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct Entries {
     /// Slid addresses in priority order, each once.
     pub order: Vec<u64>,
+    /// Why each of `order` is an entry.
+    pub sources: Vec<Source>,
     /// How many of `order` start-up needs: what earlier runs executed and what runs
     /// before `main`. The rest is every other function the image has.
     pub hot: usize,
     /// Every `LC_FUNCTION_STARTS` entry and landing pad, slid and ascending: the
     /// addresses a region declares as resume points when it holds them.
     pub declared: Vec<u64>,
+}
+
+impl Entries {
+    /// How many entries came from each [`Source`].
+    pub fn by_source(&self) -> [usize; Source::COUNT] {
+        let mut counts = [0; Source::COUNT];
+        for &source in &self.sources {
+            counts[source as usize] += 1;
+        }
+        counts
+    }
 }
 
 /// What the file says about an image's code, independent of where it was placed.
@@ -67,7 +111,7 @@ pub fn of<M: AddressSpace + ?Sized>(
     let mut order = Ordered::new(report);
 
     for &address in profiled {
-        order.push(address.wrapping_add(slide));
+        order.push(address.wrapping_add(slide), Source::Profiled);
     }
 
     if let Some(objc) = &report.objc {
@@ -79,20 +123,20 @@ pub fn of<M: AddressSpace + ?Sized>(
         let category_loads = objc.categories.iter().flat_map(|c| c.class_methods.iter());
         for method in class_loads.chain(category_loads) {
             if method.name == LOAD_SELECTOR {
-                order.push(method.imp);
+                order.push(method.imp, Source::Load);
             }
         }
         for imp in objc.implementations() {
-            order.push(imp);
+            order.push(imp, Source::Method);
         }
     }
 
     for &initializer in &report.initializers {
-        order.push(initializer);
+        order.push(initializer, Source::Initializer);
     }
 
     if let Some(entry) = report.entry {
-        order.push(entry);
+        order.push(entry, Source::EntryPoint);
     }
     let hot = order.addresses.len();
 
@@ -101,14 +145,14 @@ pub fn of<M: AddressSpace + ?Sized>(
         let Some(lsda) = entry.lsda else {
             continue;
         };
-        order.push(entry.function);
+        order.push(entry.function, Source::Unwind);
         // A table that will not parse leaves only its function to compile; the
         // unwinder refuses the same table at run time.
         let Ok(table) = Lsda::parse(lsda, entry.function, memory) else {
             continue;
         };
         for pad in table.landing_pads(memory).unwrap_or_default() {
-            order.push(pad);
+            order.push(pad, Source::LandingPad);
             pads.push(pad);
         }
     }
@@ -119,7 +163,7 @@ pub fn of<M: AddressSpace + ?Sized>(
         .map(|start| start.wrapping_add(slide))
         .collect();
     for &start in &starts {
-        order.push(start);
+        order.push(start, Source::FunctionStart);
     }
 
     let mut declared = starts;
@@ -128,6 +172,7 @@ pub fn of<M: AddressSpace + ?Sized>(
     declared.dedup();
     Entries {
         order: order.addresses,
+        sources: order.sources,
         hot,
         declared,
     }
@@ -138,6 +183,7 @@ struct Ordered<'a> {
     report: &'a ImageReport,
     seen: HashSet<u64>,
     addresses: Vec<u64>,
+    sources: Vec<Source>,
 }
 
 impl<'a> Ordered<'a> {
@@ -146,13 +192,15 @@ impl<'a> Ordered<'a> {
             report,
             seen: HashSet::new(),
             addresses: Vec::new(),
+            sources: Vec::new(),
         }
     }
 
-    fn push(&mut self, address: u64) {
+    fn push(&mut self, address: u64, source: Source) {
         let in_image = crate::program::code_image_in(self.report, address).is_some();
         if in_image && self.seen.insert(address) {
             self.addresses.push(address);
+            self.sources.push(source);
         }
     }
 }
@@ -256,6 +304,18 @@ mod tests {
         assert_eq!(
             entries.hot, 6,
             "everything before the remaining start is hot"
+        );
+        assert_eq!(
+            entries.sources,
+            [
+                Source::Profiled,
+                Source::Load,
+                Source::Method,
+                Source::Method,
+                Source::Initializer,
+                Source::EntryPoint,
+                Source::FunctionStart,
+            ]
         );
     }
 

@@ -394,6 +394,9 @@ struct AotOptions {
     /// runs have since compiled enough uncached code; leave the rest alone
     #[arg(long)]
     refresh: bool,
+    /// Do not draw the live status panel on a terminal
+    #[arg(long)]
+    no_progress: bool,
 }
 
 fn main() -> ExitCode {
@@ -638,6 +641,14 @@ fn aot(options: AotOptions) -> ExitCode {
     rosemary::shims::runtime::set_executable_path(std::path::Path::new(path));
     rosemary::frameworks::set_main_bundle(std::path::Path::new(path));
 
+    use rosemary::aot::progress::{Board, Phase};
+    let panel = !options.detach && !options.no_progress && rosemary::aot::tui::available();
+    let board = std::sync::Arc::new(Board::new(path, panel));
+    board.set_phase(Phase::Loading, path);
+    let display = panel
+        .then(|| rosemary::aot::tui::start(board.clone()))
+        .flatten();
+
     let argv = [OsString::from(guest_spelling(path))];
     let vm = match Program::load_executable(path, &[])
         .map_err(|e| e.to_string())
@@ -647,6 +658,8 @@ fn aot(options: AotOptions) -> ExitCode {
         }) {
         Ok(vm) => vm,
         Err(e) => {
+            // The panel is redrawn in place, so it must be gone before anything prints.
+            drop(display);
             eprintln!("rosemary: {path}: {e}");
             return ExitCode::FAILURE;
         }
@@ -666,8 +679,14 @@ fn aot(options: AotOptions) -> ExitCode {
         hot_only: options.hot_only,
         refresh: options.refresh,
     };
+    board.set_deadline(build.deadline);
+    let outcomes = rosemary::aot::build::build(vm, layout, &build, &board);
+    board.set_phase(Phase::Done, "");
+    if let Some(display) = display {
+        display.finish();
+    }
     let mut failed = false;
-    for (image, outcome) in rosemary::aot::build::build(vm, layout, &build) {
+    for (image, outcome) in outcomes {
         use rosemary::aot::build::Outcome;
         match outcome {
             Outcome::Written {

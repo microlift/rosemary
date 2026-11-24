@@ -43,6 +43,14 @@ already have a cache file alone; `--refresh` builds images with no cache file an
 rebuilds the first part of those whose runs have outgrown it, which is what a
 background build does.
 
+On a terminal, `rosemary aot` draws a live panel on standard error: each image's
+progress (start-up regions in orange, the rest in blue), the entry points still
+being discovered, what each compiler thread is lifting or compiling and how its
+time is split, and an estimate of the time left. Its last frame stays as a
+summary. `--no-progress` turns it off; it is never drawn when standard error is
+not a terminal, under `--detach`, or with `TERM=dumb`, and `NO_COLOR` drops
+its colours.
+
 ## Entering a shell
 
 Rosemary ships a full MiniDarwin base system, including basic utilities like `bash` and `zsh`.

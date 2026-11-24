@@ -16,7 +16,7 @@
 
 use std::collections::{HashSet, VecDeque};
 use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
-use std::sync::{Condvar, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::Instant;
 
 use machish::memory::MmapSpace;
@@ -25,8 +25,10 @@ use microlift::arch::x86_64::X86_64;
 use microlift::core::{LiftedCode, LifterConfig, lift_to_code};
 use microlift::image::RegionObject;
 
-use super::entries::{self, Entries};
+use super::entries::{self, Entries, Source};
 use super::file::Embedded;
+use super::names::Names;
+use super::progress::{Activity, Board, ImageBoard, ImageState, Phase, WorkerBoard};
 use super::store::{AtomicFile, BuildLock};
 use super::{ImageId, Layout};
 use crate::cache::Tier;
@@ -79,43 +81,84 @@ pub enum Outcome {
 /// runs `dlopen`ed and what each brought in, reporting each by path.
 ///
 /// `vm` must be published (`thunk::publish`): linking a `dlopen`ed image asks it
-/// what is guest code, as a run does.
-pub fn build(vm: &Vm, layout: &Layout, options: &Options) -> Vec<(String, Outcome)> {
+/// what is guest code, as a run does. `board` follows the build as it goes.
+pub fn build(vm: &Vm, layout: &Layout, options: &Options, board: &Board) -> Vec<(String, Outcome)> {
+    board.set_phase(Phase::Discovering, "");
     let mut seen = HashSet::new();
     let mut prepared = Vec::new();
     for report in &vm.program.report.images {
         seen.insert(report.path.clone());
-        let job = prepare(vm, layout, report, &vm.program.memory, options);
-        prepared.push((report.path.clone(), job));
+        let image = board.image(&report.path);
+        let job = prepare(
+            vm,
+            layout,
+            report,
+            &vm.program.memory,
+            options,
+            board,
+            &image,
+        );
+        prepared.push((report.path.clone(), image, job));
     }
     for path in dlopened(layout) {
         // In the order runs opened them, so each binds as it did there.
+        board.set_phase(Phase::Discovering, &format!("linking {path}"));
         let image = match crate::dyld::link_without_running(&path) {
             Ok(image) => image,
             Err(e) => {
-                prepared.push((path, Err(Outcome::Failed(format!("dlopen: {e}")))));
+                let failed = Outcome::Failed(format!("dlopen: {e}"));
+                let image = board.image(&path);
+                settle(board, &image, &failed);
+                prepared.push((path, image, Err(failed)));
                 continue;
             }
         };
+        board.set_phase(Phase::Discovering, "");
         for report in &image.report.images {
             if !seen.insert(report.path.clone()) {
                 continue;
             }
+            let progress = board.image(&report.path);
             let job = image
-                .with_memory(|memory| prepare(vm, layout, report, memory, options))
+                .with_memory(|memory| {
+                    prepare(vm, layout, report, memory, options, board, &progress)
+                })
                 .unwrap_or(Err(Outcome::Skipped("unloaded")));
-            prepared.push((report.path.clone(), job));
+            if let Err(outcome) = &job {
+                settle(board, &progress, outcome);
+            }
+            prepared.push((report.path.clone(), progress, job));
         }
     }
     let jobs: Vec<&Job> = prepared
         .iter()
-        .filter_map(|(_, job)| job.as_ref().ok())
+        .filter_map(|(_, _, job)| job.as_ref().ok())
         .collect();
-    compile(vm, &jobs, options);
+    compile(vm, &jobs, options, board);
+    board.set_phase(Phase::Finishing, "");
     prepared
         .into_iter()
-        .map(|(path, job)| (path, job.map_or_else(|skipped| skipped, Job::finish)))
+        .map(|(path, image, job)| {
+            let outcome = match job {
+                Ok(job) => {
+                    let outcome = job.finish();
+                    settle(board, &image, &outcome);
+                    outcome
+                }
+                Err(outcome) => outcome,
+            };
+            (path, outcome)
+        })
         .collect()
+}
+
+/// Puts what became of `image` on the board.
+fn settle(board: &Board, image: &ImageBoard, outcome: &Outcome) {
+    match outcome {
+        Outcome::Written { complete, .. } => image.finished(board, *complete),
+        Outcome::Skipped(reason) => image.skipped(board, reason),
+        Outcome::Failed(e) => image.failed(board, e),
+    }
 }
 
 /// The images runs of this executable `dlopen`ed, in first-opened order.
@@ -132,12 +175,18 @@ struct Job<'a> {
     layout: &'a Layout,
     id: ImageId,
     plan: Vec<Planned>,
+    /// What its regions start in, for the board; empty when nobody shows them.
+    names: Names,
+    board: &'a Board,
+    progress: Arc<ImageBoard>,
     /// How many of `plan` are hot.
     hot: usize,
     /// Only the hot part is being built: the cold parts already there stay.
     hot_only: bool,
     /// Addresses the profile held when the plan was made.
     profiled: u64,
+    /// The lifter config's codegen fingerprint, recorded in every part.
+    fingerprint: u64,
     /// Part 0, then the cold parts.
     streams: [Mutex<Stream>; 2],
     /// The number the next part opened takes, past the one reserved for part 0:
@@ -189,25 +238,13 @@ impl Job<'_> {
     }
 
     /// Appends `object` to its stream, committing a part once it is full.
-    fn write(&self, hot: bool, object: &RegionObject, fingerprint: u64) -> bool {
+    fn write(&self, hot: bool, object: &RegionObject, worker: &WorkerBoard) -> bool {
         let mut stream = self.stream(hot);
-        if stream.error.is_some() {
+        if stream.open.is_none() && !self.open(&mut stream) {
             return false;
         }
-        if stream.open.is_none() {
-            let number = stream
-                .first
-                .take()
-                .unwrap_or_else(|| self.next_part.fetch_add(1, Ordering::Relaxed));
-            match self.open_part(stream.tier, number, fingerprint) {
-                Ok(part) => stream.open = Some(part),
-                Err(e) => {
-                    stream.error = Some(e);
-                    return false;
-                }
-            }
-        }
         let part = stream.open.as_mut().expect("opened above");
+        let before = part.writer.text_len();
         if let Err(e) = part.writer.add(object) {
             // A region the file cannot hold is refused; the file stays good.
             if part.writer.text_len() < ROLLOVER {
@@ -216,13 +253,36 @@ impl Job<'_> {
             stream.error = Some(e.to_string());
             return false;
         }
-        if part.writer.text_len() >= ROLLOVER {
-            self.commit(&mut stream);
+        let after = part.writer.text_len();
+        self.progress.wrote(after.saturating_sub(before));
+        if after >= ROLLOVER {
+            self.commit(&mut stream, Some(worker));
         }
         true
     }
 
-    fn open_part(&self, tier: Tier, number: u32, fingerprint: u64) -> Result<OpenPart, String> {
+    /// Opens the next part of `stream`, unless an earlier one failed.
+    fn open(&self, stream: &mut Stream) -> bool {
+        if stream.error.is_some() {
+            return false;
+        }
+        let number = stream
+            .first
+            .take()
+            .unwrap_or_else(|| self.next_part.fetch_add(1, Ordering::Relaxed));
+        match self.open_part(stream.tier, number) {
+            Ok(part) => {
+                stream.open = Some(part);
+                true
+            }
+            Err(e) => {
+                stream.error = Some(e);
+                false
+            }
+        }
+    }
+
+    fn open_part(&self, tier: Tier, number: u32) -> Result<OpenPart, String> {
         let path = self.layout.part(&self.id, number);
         let directory = path.parent().expect("cache files have a directory");
         let isa = crate::jit::region_isa(tier).map_err(|e| e.to_string())?;
@@ -231,7 +291,7 @@ impl Job<'_> {
             file.handle().map_err(|e| e.to_string())?,
             super::store::scratch(directory).map_err(|e| e.to_string())?,
             microlift::backend::isa_fingerprint(isa),
-            fingerprint,
+            self.fingerprint,
         )
         .map_err(|e| e.to_string())?;
         Ok(OpenPart {
@@ -241,11 +301,20 @@ impl Job<'_> {
         })
     }
 
-    /// Writes out and renames into place the part `stream` has open.
-    fn commit(&self, stream: &mut Stream) {
+    /// Writes out and renames into place the part `stream` has open, on `worker`
+    /// when a compiler thread does it.
+    fn commit(&self, stream: &mut Stream, worker: Option<&WorkerBoard>) {
+        // Part 0 is written even with no region in it: its presence says the image
+        // is cached, and a run reads parts only up to the first one missing.
+        if stream.open.is_none() && stream.first == Some(0) && !self.open(stream) {
+            return;
+        }
         let Some(part) = stream.open.take() else {
             return;
         };
+        if let Some(worker) = worker {
+            worker.set(Activity::Committing);
+        }
         let number = part.number;
         let embedded = Embedded {
             lift_slide: self.report.slide,
@@ -265,15 +334,16 @@ impl Job<'_> {
             Ok(()) => {
                 stream.written += 1;
                 warm(&self.layout.part(&self.id, number));
+                self.progress.committed(self.board, number == 0);
             }
             Err(e) => stream.error = Some(e),
         }
     }
 
     /// The last hot region is written: commit part 0, so runs can use it now.
-    fn hot_done(&self) {
+    fn hot_done(&self, worker: Option<&WorkerBoard>) {
         if self.hot_left.fetch_sub(1, Ordering::AcqRel) == 1 {
-            self.commit(&mut self.stream(true));
+            self.commit(&mut self.stream(true), worker);
         }
     }
 
@@ -284,7 +354,7 @@ impl Job<'_> {
         let mut error = None;
         for (index, stream) in self.streams.iter().enumerate() {
             let mut stream = stream.lock().unwrap_or_else(|e| e.into_inner());
-            self.commit(&mut stream);
+            self.commit(&mut stream, None);
             parts += stream.written;
             if let Some(e) = stream.error.take() {
                 error = Some(e);
@@ -334,6 +404,8 @@ fn prepare<'a>(
     report: &'a ImageReport,
     memory: &MmapSpace,
     options: &Options,
+    board: &'a Board,
+    progress: &Arc<ImageBoard>,
 ) -> Result<Job<'a>, Outcome> {
     if !report.segments.iter().any(|segment| segment.executable) {
         return Err(Outcome::Skipped("no code"));
@@ -368,14 +440,22 @@ fn prepare<'a>(
         Ok(None) => return Err(Outcome::Skipped("another process is building it")),
         Err(e) => return Err(Outcome::Failed(e.to_string())),
     };
+    progress.set_state(ImageState::Discovering);
     let image_layout =
         entries::Layout::parse(&bytes, report.slide).map_err(|e| Outcome::Failed(e.to_string()))?;
     let profiled = super::profile::compact(&layout.profile(&id)).unwrap_or_default();
     let mut entries = entries::of(report, memory, &image_layout, &profiled);
     if hot_only {
         entries.order.truncate(entries.hot);
+        entries.sources.truncate(entries.hot);
     }
-    let (plan, hot) = plan(vm, &entries);
+    let names = match board.detailed() {
+        true => Names::of(&bytes, report, &image_layout.function_starts),
+        false => Names::default(),
+    };
+    progress.discovered(entries.order.len(), &entries.by_source());
+    let (plan, hot) = plan(vm, &entries, progress);
+    progress.planned(plan.len(), hot);
     layout.prune();
     let cold_tier = match crate::jit::tiered() {
         true => Tier::Provisional,
@@ -388,8 +468,12 @@ fn prepare<'a>(
         hot,
         hot_only,
         profiled: profiled.len() as u64,
+        fingerprint: vm.lifter_config().codegen_fingerprint(),
         hot_left: AtomicUsize::new(hot),
         plan,
+        names,
+        board,
+        progress: progress.clone(),
         streams: [
             Mutex::new(Stream::new(Tier::Final, Some(0))),
             Mutex::new(Stream::new(cold_tier, None)),
@@ -404,6 +488,8 @@ fn prepare<'a>(
 /// One region to compile, as the JIT would select it.
 struct Planned {
     region: crate::region::Region,
+    /// Why its entry is one.
+    source: Source,
     bytes: Vec<u8>,
     /// Its resume points: the entry, and every declared address it holds.
     resume_points: Vec<u64>,
@@ -412,11 +498,12 @@ struct Planned {
 /// Selects a region for each entry in order, skipping an entry an earlier region
 /// already declared as a resume point: the run-time cache finds it there. Returns
 /// the plan and how many of its regions are hot.
-fn plan(vm: &Vm, entries: &Entries) -> (Vec<Planned>, usize) {
+fn plan(vm: &Vm, entries: &Entries, progress: &ImageBoard) -> (Vec<Planned>, usize) {
     let mut covered = std::collections::HashSet::new();
     let mut out = Vec::new();
     let mut hot = 0;
     for (n, &pc) in entries.order.iter().enumerate() {
+        progress.examining(n + 1, pc, out.len());
         if covered.contains(&pc) {
             continue;
         }
@@ -437,6 +524,7 @@ fn plan(vm: &Vm, entries: &Entries) -> (Vec<Planned>, usize) {
         covered.extend(resume_points.iter().copied());
         out.push(Planned {
             region,
+            source: entries.sources[n],
             bytes,
             resume_points,
         });
@@ -450,13 +538,13 @@ fn plan(vm: &Vm, entries: &Entries) -> (Vec<Planned>, usize) {
 /// Compiles every planned region of `jobs` on `options.threads` threads: every
 /// image's hot regions, then every image's cold ones, one at a time in the order
 /// planned.
-fn compile(vm: &Vm, jobs: &[&Job<'_>], options: &Options) {
+fn compile(vm: &Vm, jobs: &[&Job<'_>], options: &Options, board: &Board) {
     for job in jobs {
         // An image with nothing hot commits its first part now, empty, so a run
         // knows it is cached.
         if job.hot == 0 {
             job.hot_left.store(1, Ordering::Relaxed);
-            job.hot_done();
+            job.hot_done(None);
         }
     }
     let hot = jobs
@@ -472,43 +560,52 @@ fn compile(vm: &Vm, jobs: &[&Job<'_>], options: &Options) {
         deferred: Mutex::new(VecDeque::new()),
         budget: Budget::default(),
         deadline: options.deadline,
+        board,
     };
-    let fingerprint = vm.lifter_config().codegen_fingerprint();
     let threads = options.threads.clamp(1, queue.work.len().max(1));
+    board.set_budget_limit(LARGE_BUDGET);
+    board.set_phase(Phase::Compiling, "");
+    let workers = board.workers(threads);
+    let queue = &queue;
     std::thread::scope(|scope| {
-        for _ in 0..threads {
-            scope.spawn(|| {
+        for progress in &workers {
+            scope.spawn(move || {
                 let worker = Worker {
                     jobs,
                     // Each thread lifts under its own copy, which shares the
                     // program's segments and imports through `Arc`s.
                     config: vm.lifter_config().clone(),
+                    progress,
                 };
                 while let Some(next) = queue.take(&worker) {
                     let job = jobs[next.job];
                     let hot = next.region < job.hot;
                     let written = next.code.is_some_and(|code| {
                         let tier = job.stream(hot).tier;
-                        worker
-                            .compile(tier, code)
-                            .is_some_and(|object| job.write(hot, &object, fingerprint))
+                        progress.set(Activity::Compiling);
+                        let object = worker.compile(tier, code);
+                        progress.set(Activity::Writing);
+                        object.is_some_and(|object| job.write(hot, &object, progress))
                     });
                     match written {
                         true => job.regions.fetch_add(1, Ordering::Relaxed),
                         false => job.refused.fetch_add(1, Ordering::Relaxed),
                     };
+                    job.progress.region_finished(hot, written);
+                    progress.region_done();
                     if hot {
-                        job.hot_done();
+                        job.hot_done(Some(progress));
                     }
-                    queue.budget.give(next.cost);
+                    queue.give(next.cost);
                 }
+                progress.retire();
             });
         }
     });
 }
 
 /// The regions left to compile.
-struct Queue {
+struct Queue<'b> {
     /// Every planned region, as `(job, region)`, in the order compiled.
     work: Vec<(usize, usize)>,
     next: AtomicUsize,
@@ -518,6 +615,7 @@ struct Queue {
     deferred: Mutex<VecDeque<((usize, usize), usize)>>,
     budget: Budget,
     deadline: Option<Instant>,
+    board: &'b Board,
 }
 
 /// A region to compile, holding `cost` of the budget.
@@ -529,7 +627,7 @@ struct Lifted {
     cost: usize,
 }
 
-impl Queue {
+impl Queue<'_> {
     /// The next region to compile, its share of the budget taken.
     ///
     /// A large region the budget has no room for is deferred while this thread
@@ -538,6 +636,7 @@ impl Queue {
     fn take(&self, worker: &Worker<'_, '_>) -> Option<Lifted> {
         loop {
             if past(self.deadline) {
+                self.board.deadline_reached();
                 return None;
             }
             if let Some(((job, region), cost)) = self.deferred_that_fits() {
@@ -551,6 +650,7 @@ impl Queue {
             }
             let Some(&(job, region)) = self.work.get(self.next.fetch_add(1, Ordering::Relaxed))
             else {
+                worker.progress.set(Activity::Waiting);
                 let ((job, region), cost) = self.wait_for_deferred()?;
                 let code = worker.lift(job, region);
                 return Some(Lifted {
@@ -563,6 +663,7 @@ impl Queue {
             let code = worker.lift(job, region);
             let cost = code.as_ref().map_or(0, cost);
             if self.budget.try_take(cost) {
+                self.board.budget_taken(cost);
                 return Some(Lifted {
                     job,
                     region,
@@ -570,11 +671,16 @@ impl Queue {
                     cost,
                 });
             }
-            self.deferred
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .push_back(((job, region), cost));
+            let mut deferred = self.deferred.lock().unwrap_or_else(|e| e.into_inner());
+            deferred.push_back(((job, region), cost));
+            self.board.set_deferred(deferred.len());
         }
+    }
+
+    /// Returns a finished region's share of the budget.
+    fn give(&self, cost: usize) {
+        self.budget.give(cost);
+        self.board.budget_given(cost);
     }
 
     /// The first deferred region that fits, its share of the budget taken.
@@ -583,16 +689,21 @@ impl Queue {
         let at = deferred
             .iter()
             .position(|&(_, cost)| self.budget.try_take(cost))?;
-        deferred.remove(at)
+        let taken = deferred.remove(at)?;
+        self.board.budget_taken(taken.1);
+        self.board.set_deferred(deferred.len());
+        Some(taken)
     }
 
     fn wait_for_deferred(&self) -> Option<((usize, usize), usize)> {
-        let waiting = self
-            .deferred
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .pop_front()?;
+        let waiting = {
+            let mut deferred = self.deferred.lock().unwrap_or_else(|e| e.into_inner());
+            let waiting = deferred.pop_front()?;
+            self.board.set_deferred(deferred.len());
+            waiting
+        };
         self.budget.take(waiting.1);
+        self.board.budget_taken(waiting.1);
         Some(waiting)
     }
 }
@@ -649,12 +760,28 @@ impl Budget {
 struct Worker<'j, 'a> {
     jobs: &'j [&'j Job<'a>],
     config: LifterConfig,
+    progress: &'j WorkerBoard,
 }
 
 impl Worker<'_, '_> {
     fn lift(&self, job: usize, region: usize) -> Option<LiftedCode> {
         let job = self.jobs[job];
-        lift(&self.config, job.report, &job.plan[region])
+        let planned = &job.plan[region];
+        let address = planned.region.range.start;
+        self.progress.set(Activity::Lifting);
+        self.progress.begin(
+            job.progress.index,
+            address,
+            planned.source,
+            job.names.name(address),
+            region < job.hot,
+        );
+        job.progress.started();
+        let code = lift(&self.config, job.report, planned);
+        if let Some(code) = &code {
+            self.progress.lifted(code.func.dfg.num_insts());
+        }
+        code
     }
 
     /// Compiles `code` with the JIT's own compiler for `tier`, so the code cached is
@@ -692,6 +819,62 @@ fn past(deadline: Option<Instant>) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A job for an image with nothing planned, lifted under `fingerprint`.
+    fn empty_job<'a>(
+        layout: &'a Layout,
+        report: &'a ImageReport,
+        board: &'a Board,
+        fingerprint: u64,
+    ) -> Job<'a> {
+        let id = ImageId::of(b"an image with no hot regions");
+        let lock = super::super::store::try_lock(&layout.image(&id))
+            .unwrap()
+            .expect("nothing else builds it");
+        Job {
+            report,
+            layout,
+            id,
+            plan: Vec::new(),
+            names: Names::default(),
+            board,
+            progress: board.image("image"),
+            hot: 0,
+            hot_only: false,
+            profiled: 0,
+            fingerprint,
+            streams: [
+                Mutex::new(Stream::new(Tier::Final, Some(0))),
+                Mutex::new(Stream::new(Tier::Final, None)),
+            ],
+            next_part: AtomicU32::new(1),
+            hot_left: AtomicUsize::new(1),
+            regions: AtomicUsize::new(0),
+            refused: AtomicUsize::new(0),
+            _lock: lock,
+        }
+    }
+
+    #[test]
+    fn an_image_with_nothing_hot_still_writes_part_0() {
+        let base = std::env::temp_dir().join(format!("rosemary-aot-part0-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let layout = Layout::new(base.clone());
+        let report = ImageReport::default();
+        let board = Board::new("image", false);
+        let config = crate::program::lifter_config_base();
+        let job = empty_job(&layout, &report, &board, config.codegen_fingerprint());
+        let id = job.id;
+        job.hot_done(None);
+        match job.finish() {
+            Outcome::Written { parts, .. } => assert_eq!(parts, 1),
+            outcome => panic!("{outcome:?}"),
+        }
+        // A run must accept it: it reads parts only up to the first one missing.
+        let parts = super::super::open(&layout, &id, &config, 0).expect("an empty part loads");
+        assert_eq!(parts.len(), 1);
+        let _ = std::fs::remove_dir_all(&base);
+    }
 
     #[test]
     fn small_regions_never_wait_for_the_budget() {

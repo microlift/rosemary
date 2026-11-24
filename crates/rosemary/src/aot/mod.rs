@@ -10,10 +10,13 @@
 pub mod build;
 pub mod entries;
 pub mod file;
+pub mod names;
 pub mod profile;
+pub mod progress;
 pub mod resolve;
 pub mod spawn;
 pub mod store;
+pub mod tui;
 
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
