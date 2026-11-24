@@ -50,6 +50,53 @@ const TRAILER: usize = 8;
 /// `MACH_MSG_TRAILER_FORMAT_0`.
 const TRAILER_FORMAT_0: u32 = 0;
 
+/// `MACH_RCV_TRAILER_ELEMENTS(option)`: how much trailer a receiver asks for.
+const TRAILER_ELEMENTS_SHIFT: u32 = 24;
+const TRAILER_ELEMENTS_MASK: i32 = 0xf;
+
+/// The trailers `<mach/message.h>` defines, by `MACH_RCV_TRAILER_*` element
+/// count, and the size `REQUESTED_TRAILER_SIZE` gives each.
+mod trailer {
+    pub const SEQNO: u32 = 1;
+    pub const SENDER: u32 = 2;
+    pub const AUDIT: u32 = 3;
+    pub const SIZES: [usize; 8] = [8, 12, 20, 52, 60, 64, 68, 68];
+    /// Offsets of `msgh_seqno`, `msgh_sender` and `msgh_audit`.
+    pub const SEQNO_AT: usize = 8;
+    pub const SENDER_AT: usize = 12;
+    pub const AUDIT_AT: usize = 20;
+}
+
+/// What a trailer says about a message's sender: its `audit_token_t`.
+///
+/// The host pid is the kernel's word, through the socket; who that process is
+/// as a guest - its ids - is the process server's.
+fn audit_token(sender: Option<i32>) -> [u32; 8] {
+    let Some(host) = sender else {
+        return [0; 8];
+    };
+    let pid = crate::process::guest_pid(host);
+    let ids = match host == crate::process::host_self() {
+        true => {
+            let me = crate::credentials::current();
+            Some((me.ruid, me.euid, me.rgid, me.egid))
+        }
+        false => {
+            let _host = crate::syscall::ScopedHostSyscallContext::new();
+            server::client::process(host).map(|p| (p.uid, p.euid, p.gid, p.egid))
+        }
+    };
+    let Some((uid, euid, gid, egid)) = ids else {
+        // FIXME (ACCURACY): a sender the process server does not know has no
+        // ids to report, so only its pid is told.
+        return [0, 0, 0, 0, 0, pid as u32, 0, 0];
+    };
+    // `audit_token_to_au32`'s order: auid, euid, egid, ruid, rgid, pid, asid,
+    // pidversion. FIXME (ACCURACY): no audit sessions or pid versions are
+    // kept, so auid, asid and pidversion read zero.
+    [0, euid, egid, uid, gid, pid as u32, 0, 0]
+}
+
 /// The envelope that crosses the socket, in front of the message's own bytes.
 mod envelope {
     pub const MAGIC: u32 = 0x3372_4d43;
@@ -575,8 +622,11 @@ unsafe fn receive(
     rcv_size: u32,
     rcv_name: Name,
     timeout_ms: i32,
-    large: bool,
+    option: i32,
 ) -> i32 {
+    let large = option & RCV_LARGE != 0;
+    let elements = ((option >> TRAILER_ELEMENTS_SHIFT) & TRAILER_ELEMENTS_MASK) as usize;
+    let trailer_size = trailer::SIZES[elements.min(trailer::SIZES.len() - 1)];
     let (mut message, arrived_on) = match next_message(rcv_name, timeout_ms) {
         Ok(taken) => taken,
         Err(code) => return code,
@@ -603,7 +653,7 @@ unsafe fn receive(
         false => 0,
     };
     let size = HEADER + body + payload_len;
-    if size + TRAILER > rcv_size as usize {
+    if size + trailer_size > rcv_size as usize {
         // Without `MACH_RCV_LARGE` the message is destroyed, which is what
         // dropping `message` does - including any rights it carried. With it,
         // the caller means to come back with a bigger buffer, so the message is
@@ -640,7 +690,7 @@ unsafe fn receive(
         bits |= BITS_COMPLEX;
     }
 
-    // SAFETY: `size + TRAILER` bytes of the caller's buffer, checked above.
+    // SAFETY: `size + trailer_size` bytes of the caller's buffer, checked above.
     unsafe {
         write_header(msg, bits, size as u32, reply_name, arrived_on, id);
         if complex {
@@ -663,7 +713,25 @@ unsafe fn receive(
         );
         // The trailer, which `msgh_size` does not count and `rcv_size` must.
         write_word(msg, size, TRAILER_FORMAT_0);
-        write_word(msg, size + 4, TRAILER as u32);
+        write_word(msg, size + 4, trailer_size as u32);
+        // Zeroed first: the elements past the audit token are labels and
+        // contexts this transport never has, and Darwin leaves them zero too.
+        core::ptr::write_bytes(msg.add(size + TRAILER), 0, trailer_size - TRAILER);
+        if elements as u32 >= trailer::SEQNO {
+            // FIXME (ACCURACY): ports keep no sequence numbers, so it reads zero.
+            write_word(msg, size + trailer::SEQNO_AT, 0);
+        }
+        if elements as u32 >= trailer::SENDER {
+            let audit = audit_token(message.sender);
+            // `security_token_t` is the sender's euid and egid.
+            write_word(msg, size + trailer::SENDER_AT, audit[1]);
+            write_word(msg, size + trailer::SENDER_AT + 4, audit[2]);
+            if elements as u32 >= trailer::AUDIT {
+                for (i, word) in audit.iter().enumerate() {
+                    write_word(msg, size + trailer::AUDIT_AT + i * 4, *word);
+                }
+            }
+        }
     }
     MACH_MSG_SUCCESS
 }
@@ -733,7 +801,7 @@ pub unsafe extern "C" fn mach_msg(
             false => -1,
         };
         // SAFETY: the caller's buffer, of the size it passed.
-        return unsafe { receive(msg, rcv_size, rcv_name, timeout_ms, option & RCV_LARGE != 0) };
+        return unsafe { receive(msg, rcv_size, rcv_name, timeout_ms, option) };
     }
     MACH_MSG_SUCCESS
 }
@@ -783,7 +851,7 @@ pub unsafe extern "C" fn mach_msg_overwrite(
                 rcv_limit.min(rcv_size),
                 rcv_name,
                 timeout_ms,
-                option & RCV_LARGE != 0,
+                option,
             )
         };
     }
@@ -969,6 +1037,96 @@ mod tests {
         assert_eq!(&buf[HEADER..HEADER + 8], b"eight!!\0");
         // The trailer the kernel appends, which `msgh_size` does not count.
         assert_eq!(word(&buf, HEADER + 8 + 4) as usize, TRAILER);
+
+        space::destroy(port);
+    }
+
+    /// `MACH_RCV_TRAILER_ELEMENTS(MACH_RCV_TRAILER_AUDIT)` asks for the
+    /// sender's audit token, which is how a MIG or XPC server learns who
+    /// called it.
+    #[test]
+    fn an_audit_trailer_names_the_sender() {
+        const AUDIT: i32 = (trailer::AUDIT as i32) << TRAILER_ELEMENTS_SHIFT;
+        let port = allocate_receive();
+        let mut sent = message(0, port, MACH_PORT_NULL, 0x1234, b"four");
+        // SAFETY: `sent` is a whole message of the size in its header.
+        let rc = unsafe {
+            mach_msg(
+                sent.as_mut_ptr().cast(),
+                SEND_MSG,
+                sent.len() as u32,
+                0,
+                MACH_PORT_NULL,
+                0,
+                MACH_PORT_NULL,
+            )
+        };
+        assert_eq!(rc, MACH_MSG_SUCCESS);
+
+        let mut buf = vec![0u8; 256];
+        // SAFETY: 256 writable bytes for the message.
+        let rc = unsafe {
+            mach_msg(
+                buf.as_mut_ptr().cast(),
+                RCV_MSG | RCV_TIMEOUT | AUDIT,
+                0,
+                buf.len() as u32,
+                port,
+                1000,
+                MACH_PORT_NULL,
+            )
+        };
+        assert_eq!(rc, MACH_MSG_SUCCESS);
+        let size = word(&buf, 4) as usize;
+        assert_eq!(
+            word(&buf, size + 4) as usize,
+            trailer::SIZES[trailer::AUDIT as usize]
+        );
+        let pid = word(&buf, size + trailer::AUDIT_AT + 5 * 4) as i32;
+        // Only Linux's kernel says who sent a datagram.
+        if cfg!(target_os = "linux") {
+            assert_eq!(pid, crate::process::getpid(), "the audit token's pid");
+            let euid = word(&buf, size + trailer::AUDIT_AT + 4);
+            assert_eq!(
+                euid,
+                crate::credentials::current().euid,
+                "the audit token's euid"
+            );
+            assert_eq!(
+                word(&buf, size + trailer::SENDER_AT),
+                euid,
+                "the security token"
+            );
+        }
+
+        // A buffer with room for a plain trailer only is not enough for it.
+        let mut sent = message(0, port, MACH_PORT_NULL, 0x1234, b"four");
+        // SAFETY: as above.
+        unsafe {
+            mach_msg(
+                sent.as_mut_ptr().cast(),
+                SEND_MSG,
+                sent.len() as u32,
+                0,
+                MACH_PORT_NULL,
+                0,
+                MACH_PORT_NULL,
+            )
+        };
+        let mut small = vec![0u8; HEADER + 4 + TRAILER];
+        // SAFETY: the buffer's own length.
+        let rc = unsafe {
+            mach_msg(
+                small.as_mut_ptr().cast(),
+                RCV_MSG | RCV_TIMEOUT | AUDIT,
+                0,
+                small.len() as u32,
+                port,
+                1000,
+                MACH_PORT_NULL,
+            )
+        };
+        assert_eq!(rc, MACH_RCV_TOO_LARGE);
 
         space::destroy(port);
     }
