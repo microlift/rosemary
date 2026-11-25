@@ -44,6 +44,7 @@ static HIERARCHY: &[(&str, Option<&str>, usize)] = &[
     ("CAPropertyAnimation", Some("CAAnimation"), 0),
     ("CABasicAnimation", Some("CAPropertyAnimation"), 0),
     ("CAMediaTimingFunction", None, 0),
+    ("CATransaction", None, 0),
     ("NSControl", Some("NSView"), 0),
     ("NSButton", Some("NSControl"), 0),
     ("NSPopUpButton", Some("NSButton"), 0),
