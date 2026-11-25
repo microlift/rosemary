@@ -22,6 +22,8 @@ const KERN_BOOTTIME: i32 = 21;
 pub const KERN_OSVERSION: i32 = 65;
 const KERN_OSPRODUCTVERSION: i32 = 138;
 const KERN_OSPRODUCTVERSIONCOMPAT: i32 = 137;
+/// Darwin numbers this at boot (`OID_AUTO`); this is this module's number.
+const KERN_MEMORYSTATUS_LEVEL: i32 = 139;
 
 /// `CTL_VM` second-level identifiers.
 const VM_SWAPUSAGE: i32 = 5;
@@ -350,6 +352,11 @@ const KEYS: &[Key] = &[
         name: "kern.boottime",
         mib: &[CTL_KERN, KERN_BOOTTIME],
         source: Source::Host(boot_time),
+    },
+    Key {
+        name: "kern.memorystatus_level",
+        mib: &[CTL_KERN, KERN_MEMORYSTATUS_LEVEL],
+        source: Source::Host(|| Some(Value::U32(memorystatus_level()))),
     },
     Key {
         name: "vm.swapusage",
@@ -846,6 +853,15 @@ pub(crate) fn memsize() -> u64 {
     size
 }
 
+/// The percentage of physical memory available without paging anything out,
+/// which XNU counts as free plus inactive pages.
+fn memorystatus_level() -> u32 {
+    let memory = starnix::system::memory();
+    let available = memory.free.saturating_add(memory.inactive);
+    let total = memsize().max(1);
+    (available.saturating_mul(100) / total).min(100) as u32
+}
+
 #[cfg(not(target_os = "macos"))]
 pub(crate) fn memsize() -> u64 {
     // SAFETY: as above; both parameters are plain counts.
@@ -1188,7 +1204,7 @@ unsafe extern "C" fn sysctlnametomib(
     mibp: *mut libc::c_int,
     sizep: *mut libc::size_t,
 ) -> i32 {
-    if name.is_null() || mibp.is_null() || sizep.is_null() {
+    if name.is_null() || sizep.is_null() {
         crate::errno::set(libc::EFAULT);
         return -1;
     }
@@ -1207,6 +1223,12 @@ unsafe extern "C" fn sysctlnametomib(
     if key.value().is_none() {
         crate::errno::set(libc::ENOENT);
         return -1;
+    }
+    // A null buffer asks only for the MIB's length, as `sysctl` does.
+    if mibp.is_null() {
+        // SAFETY: the caller states `sizep` is a writable `size_t`.
+        unsafe { *sizep = key.mib.len() };
+        return 0;
     }
     // SAFETY: the caller states `sizep` is a writable `size_t`.
     let available = unsafe { *sizep };
@@ -1512,6 +1534,26 @@ mod tests {
         let rc = unsafe { sysctlnametomib(name.as_ptr(), mib.as_mut_ptr(), &mut len) };
         assert_eq!(rc, 0);
         assert_eq!(&mib[..len], &[CTL_HW, HW_MACHINE]);
+    }
+
+    /// CoreCLR's GC sizes its MIB buffer this way before resolving the name.
+    #[test]
+    fn a_null_mib_buffer_asks_for_the_mibs_length() {
+        let name = std::ffi::CString::new("hw.machine").unwrap();
+        let mut len: libc::size_t = 0;
+        // SAFETY: `name` outlives the call and `len` is a live local.
+        let rc = unsafe { sysctlnametomib(name.as_ptr(), std::ptr::null_mut(), &mut len) };
+        assert_eq!(rc, 0);
+        assert_eq!(len, 2);
+    }
+
+    #[test]
+    fn memorystatus_level_is_a_percentage() {
+        let Some(bytes) = ask_name("kern.memorystatus_level") else {
+            panic!("kern.memorystatus_level is unanswered");
+        };
+        let level = u32::from_ne_bytes(bytes[..4].try_into().unwrap());
+        assert!(level <= 100);
     }
 
     #[test]

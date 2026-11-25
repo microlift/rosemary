@@ -514,7 +514,10 @@ mod tests {
             plain_format(b"%{public}s: %d%% of %{private,uuid_t}.16P"),
             b"%s: %d%% of %.16P"
         );
-        assert_eq!(plain_format(b"%lld then %{public}@"), b"%lld then <object %p>");
+        assert_eq!(
+            plain_format(b"%lld then %{public}@"),
+            b"%lld then <object %p>"
+        );
         assert_eq!(plain_format(b"no conversions"), b"no conversions");
     }
 
