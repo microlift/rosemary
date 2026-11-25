@@ -121,6 +121,8 @@ struct Node {
     opacity: f64,
     /// `-cornerRadius`, in points.
     corner_radius: f64,
+    /// `-zPosition`, which orders this layer among its siblings when drawn.
+    z_position: f64,
     /// Metadata affecting CA sublayers may alter an ancestor's raster image,
     /// even though that sublayer's own opacity is a scene-only property.
     metadata_revision: u64,
@@ -155,6 +157,7 @@ impl Default for Node {
             hidden: false,
             opacity: 1.0,
             corner_radius: 0.0,
+            z_position: 0.0,
             metadata_revision: 0,
             animations: Vec::new(),
             contents: 0,
@@ -655,6 +658,15 @@ pub(crate) fn scene_animation_roots(now: f64) -> Vec<usize> {
     active
 }
 
+/// `sublayers` in the order they are drawn: by `zPosition`, and in array
+/// order among equals, as Core Animation draws them.
+fn drawing_order(nodes: &HashMap<usize, Node>, sublayers: &[usize]) -> Vec<usize> {
+    let z = |layer: &usize| nodes.get(layer).map_or(0.0, |node| node.z_position);
+    let mut ordered = sublayers.to_vec();
+    ordered.sort_by(|a, b| z(a).total_cmp(&z(b)));
+    ordered
+}
+
 fn read_all_nodes<T>(f: impl FnOnce(&HashMap<usize, Node>) -> T) -> T {
     let nodes = NODES.lock().unwrap_or_else(|e| e.into_inner());
     match nodes.as_ref() {
@@ -848,6 +860,22 @@ unsafe extern "C" fn corner_radius(receiver: Id, _sel: Sel) -> f64 {
 unsafe extern "C" fn set_corner_radius(receiver: Id, _sel: Sel, value: f64) {
     with_node(receiver, |node| node.corner_radius = value.max(0.0));
     changed_metadata(receiver);
+}
+
+unsafe extern "C" fn z_position(receiver: Id, _sel: Sel) -> f64 {
+    read_node(receiver, |node| node.map_or(0.0, |node| node.z_position))
+}
+
+unsafe extern "C" fn set_z_position(receiver: Id, _sel: Sel, value: f64) {
+    let superlayer = with_node(receiver, |node| {
+        node.z_position = value;
+        node.superlayer
+    });
+    changed_metadata(receiver);
+    // The order is the superlayer's to draw.
+    if superlayer != 0 {
+        changed_metadata(superlayer as Id);
+    }
 }
 
 unsafe extern "C" fn is_hidden(receiver: Id, _sel: Sel) -> u8 {
@@ -2092,9 +2120,9 @@ impl Presented {
 
 fn presentation(layer: Id, now: f64) -> Presented {
     let bounds = crate::layer::bounds_of(layer);
-    read_node(layer, |node| {
+    read_all_nodes(|nodes| {
         let fallback = Node::default();
-        let node = node.unwrap_or(&fallback);
+        let node = nodes.get(&(layer as usize)).unwrap_or(&fallback);
         let animations = &node.animations;
         let width = presented(animations, "bounds.size.width", bounds.size.width, now);
         let height = presented(animations, "bounds.size.height", bounds.size.height, now);
@@ -2115,7 +2143,7 @@ fn presentation(layer: Id, now: f64) -> Presented {
             masks_to_bounds: node.masks_to_bounds,
             corner_radius: node.corner_radius,
             gravity: node.gravity,
-            sublayers: node.sublayers.clone(),
+            sublayers: drawing_order(nodes, &node.sublayers),
         }
     })
 }
@@ -3245,7 +3273,7 @@ pub(crate) fn metal_paint_steps(root: Id, view_layers: &[usize], now: f64) -> Ve
                     }),
                 }
             }
-            for &child in &node.sublayers {
+            for child in drawing_order(nodes, &node.sublayers) {
                 walk(nodes, child, view_layers, now, groups, depth + 1, out);
             }
             if isolate {
@@ -3255,7 +3283,7 @@ pub(crate) fn metal_paint_steps(root: Id, view_layers: &[usize], now: f64) -> Ve
         let mut steps = Vec::new();
         if let Some(root) = nodes.get(&(root as usize)) {
             let mut groups = Vec::new();
-            for &child in &root.sublayers {
+            for child in drawing_order(nodes, &root.sublayers) {
                 walk(nodes, child, view_layers, now, &mut groups, 0, &mut steps);
             }
         }
@@ -3475,6 +3503,8 @@ pub(crate) fn install() {
         "setMasksToBounds:" => set_masks_to_bounds, c"v20@0:8c16";
         "cornerRadius" => corner_radius, c"d16@0:8";
         "setCornerRadius:" => set_corner_radius, c"v24@0:8d16";
+        "zPosition" => z_position, c"d16@0:8";
+        "setZPosition:" => set_z_position, c"v24@0:8d16";
         "isHidden" => is_hidden, c"c16@0:8";
         "setHidden:" => set_hidden, c"v20@0:8c16";
         "opacity" => opacity, c"f16@0:8";
