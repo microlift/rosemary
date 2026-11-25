@@ -13,7 +13,7 @@ pub mod boxed;
 pub mod bundle;
 pub mod calculate;
 mod cf_attributed_string;
-mod characterset;
+pub mod characterset;
 mod constant;
 pub mod cookies;
 pub mod decimal;

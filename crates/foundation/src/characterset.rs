@@ -167,6 +167,17 @@ pub(crate) unsafe fn contains_char(set: Id, c: char) -> bool {
     }
 }
 
+/// A character set of the inclusive code point `ranges`, which the caller
+/// owns: what `CTFontCopyCharacterSet` makes of a font's character map.
+pub fn create_with_ranges(ranges: Vec<(u32, u32)>) -> Id {
+    let set = make_custom(Members {
+        ranges,
+        inverted: false,
+    });
+    objc::arc::retain(set);
+    set
+}
+
 /// A new set of `members`, autoreleased.
 fn make_custom(members: Members) -> Id {
     let class = objc::class::lookup(c"NSCharacterSet").expect("installed NSCharacterSet");
@@ -374,6 +385,53 @@ pub unsafe extern "C" fn CFCharacterSetAddCharactersInRange(
     }
 }
 
+/// Bytes in one plane of a bitmap representation: a bit per code point.
+const PLANE_BYTES: usize = 0x10000 / 8;
+/// Unicode's planes past the Basic Multilingual Plane.
+const SUPPLEMENTARY_PLANES: std::ops::RangeInclusive<u32> = 1..=16;
+
+/// One plane of `set` as CF lays it out: code point `c`'s bit is
+/// `bytes[c / 8] & (1 << (c % 8))`.
+///
+/// # Safety
+///
+/// As [`contains_char`].
+unsafe fn plane_bitmap(set: Id, plane: u32) -> [u8; PLANE_BYTES] {
+    let mut bitmap = [0u8; PLANE_BYTES];
+    for low in 0..0x10000u32 {
+        let member =
+            char::from_u32((plane << 16) | low).is_some_and(|c| unsafe { contains_char(set, c) });
+        if member {
+            bitmap[(low / 8) as usize] |= 1 << (low % 8);
+        }
+    }
+    bitmap
+}
+
+/// `CFDataRef CFCharacterSetCreateBitmapRepresentation(CFAllocatorRef,
+/// CFCharacterSetRef)`: the Basic Multilingual Plane, then each other plane
+/// with a member as its plane number and its bitmap.
+#[allow(non_snake_case)]
+pub unsafe extern "C" fn CFCharacterSetCreateBitmapRepresentation(
+    _allocator: *const std::ffi::c_void,
+    set: Id,
+) -> Id {
+    if kind_of(set).is_none() {
+        return std::ptr::null_mut();
+    }
+    // SAFETY: a character set, checked above.
+    let mut bytes = unsafe { plane_bitmap(set, 0) }.to_vec();
+    for plane in SUPPLEMENTARY_PLANES {
+        // SAFETY: as above.
+        let bitmap = unsafe { plane_bitmap(set, plane) };
+        if bitmap.iter().any(|b| *b != 0) {
+            bytes.push(plane as u8);
+            bytes.extend_from_slice(&bitmap);
+        }
+    }
+    corefoundation::collections::new_data(bytes) as Id
+}
+
 /// `Boolean CFCharacterSetIsLongCharacterMember(CFCharacterSetRef, UTF32Char)`.
 #[allow(non_snake_case)]
 pub unsafe extern "C" fn CFCharacterSetIsLongCharacterMember(set: Id, code: u32) -> u8 {
@@ -393,6 +451,24 @@ pub unsafe extern "C" fn CFCharacterSetIsCharacterMember(set: Id, unit: u16) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_bitmap_has_a_plane_for_each_plane_with_members() {
+        crate::bootstrap();
+        // SAFETY: a set this test owns.
+        unsafe {
+            let set = CFCharacterSetCreateMutable(std::ptr::null());
+            CFCharacterSetAddCharactersInRange(set, 'A' as isize, 1);
+            CFCharacterSetAddCharactersInRange(set, 0x1F600, 1);
+            let data = CFCharacterSetCreateBitmapRepresentation(std::ptr::null(), set);
+            let bytes = corefoundation::collections::data(data as _).expect("a CFData");
+            assert_eq!(bytes.len(), 2 * PLANE_BYTES + 1);
+            assert_eq!(bytes['A' as usize / 8], 1 << ('A' as u32 % 8));
+            assert_eq!(bytes[PLANE_BYTES], 1);
+            let low = 0xF600usize;
+            assert_eq!(bytes[PLANE_BYTES + 1 + low / 8], 1 << (low % 8));
+        }
+    }
 
     #[test]
     fn a_range_past_the_last_character_is_clamped_or_empty_rather_than_wrapped() {

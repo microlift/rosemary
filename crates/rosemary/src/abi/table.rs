@@ -660,6 +660,7 @@ pub static SIGNATURES: &[FunctionAbi] = &[
     sig!("CFSetRemoveAllValues", V, P),
     sig!("CFSetContainsValue", BOOL, P, P),
     sig!("CFSetGetValue", P, P, P),
+    sig!("CFCharacterSetCreateBitmapRepresentation", P, P, P),
     sig!("CFRunLoopTimerGetTolerance", F64, P),
     sig!("CFRunLoopTimerSetTolerance", V, P, F64),
     sig!("CFStringAppendCharacters", V, P, P, I64),
