@@ -2797,6 +2797,26 @@ unsafe extern "C" fn convert_rect_from_backing(receiver: Id, _sel: Sel, rect: NS
     }
 }
 
+unsafe extern "C" fn convert_point_to_backing(receiver: Id, _sel: Sel, point: NSPoint) -> NSPoint {
+    let scale = scale(receiver);
+    NSPoint {
+        x: point.x * scale,
+        y: point.y * scale,
+    }
+}
+
+unsafe extern "C" fn convert_point_from_backing(
+    receiver: Id,
+    _sel: Sel,
+    point: NSPoint,
+) -> NSPoint {
+    let scale = scale(receiver);
+    NSPoint {
+        x: point.x / scale,
+        y: point.y / scale,
+    }
+}
+
 unsafe extern "C" fn convert_size_to_backing(receiver: Id, _sel: Sel, size: NSSize) -> NSSize {
     let scale = scale(receiver);
     NSSize {
@@ -3642,6 +3662,8 @@ pub(crate) fn install() {
         "convertRectFromBacking:" => convert_rect_from_backing,
             c"{CGRect={CGPoint=dd}{CGSize=dd}}48@0:8{CGRect={CGPoint=dd}{CGSize=dd}}16";
         "convertSizeToBacking:" => convert_size_to_backing, c"{CGSize=dd}32@0:8{CGSize=dd}16";
+        "convertPointToBacking:" => convert_point_to_backing, c"{CGPoint=dd}32@0:8{CGPoint=dd}16";
+        "convertPointFromBacking:" => convert_point_from_backing, c"{CGPoint=dd}32@0:8{CGPoint=dd}16";
         "convertPoint:fromView:" => convert_point_from_view, c"{CGPoint=dd}40@0:8{CGPoint=dd}16@32";
         "convertPoint:toView:" => convert_point_to_view, c"{CGPoint=dd}40@0:8{CGPoint=dd}16@32";
         "mouse:inRect:" => mouse_in_rect,
@@ -4217,6 +4239,11 @@ mod tests {
         let backing =
             unsafe { convert_rect_to_backing(v, objc::sel::get("convertRectToBacking:"), rect) };
         assert_eq!(backing, rect);
+        let point = NSPoint { x: 12.0, y: 34.0 };
+        // SAFETY: `-convertPointToBacking:` is `NSPoint (id, SEL, NSPoint)`.
+        let backing =
+            unsafe { convert_point_to_backing(v, objc::sel::get("convertPointToBacking:"), point) };
+        assert_eq!(backing, point);
     }
 
     /// A subview knows its superview, and the superview lists it.
