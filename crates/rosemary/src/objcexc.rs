@@ -261,6 +261,7 @@ pub fn bind<M: machish::memory::Regions>(
                 library: was.library,
                 symbol: was.symbol,
                 resolved: *record,
+                addend: 0,
                 kind: machish::fixups::BindKind::NonLazy,
                 weak_import: was.weak_import,
                 tag: 0,

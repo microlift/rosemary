@@ -295,6 +295,7 @@ mod tests {
                     library: None,
                     symbol: "_free".to_string(),
                     resolved: HOST_FREE,
+                    addend: 0,
                     kind: BindKind::NonLazy,
                     weak_import: false,
                     tag: 0,

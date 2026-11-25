@@ -120,6 +120,7 @@ impl<'s> Binder<'s> {
             library,
             symbol: symbol.name.to_string(),
             resolved: value,
+            addend,
             kind,
             weak_import: symbol.weak_import,
             tag: r.tag,

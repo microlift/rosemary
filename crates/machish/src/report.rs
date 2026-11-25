@@ -20,9 +20,12 @@ pub struct BindingRecord {
     pub library: Option<String>,
     /// Symbol name, leading underscore preserved.
     pub symbol: String,
-    /// The address written into the slot. Zero for a weak import that no
-    /// provider satisfied.
+    /// The address written into the slot, `addend` included. Zero for a weak
+    /// import that no provider satisfied.
     pub resolved: Word,
+    /// What the fixup adds to the symbol's address: a vtable reference names
+    /// the vtable symbol and adds the offset of its first virtual.
+    pub addend: i64,
     pub kind: BindKind,
     pub weak_import: bool,
     /// Verbatim echo of [`crate::resolve::Resolved::tag`].
