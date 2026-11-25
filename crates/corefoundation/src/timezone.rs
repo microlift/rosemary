@@ -284,6 +284,19 @@ pub unsafe fn name_of(timezone: CFTypeRef) -> Option<String> {
     Some(String::from_utf8_lossy(&text.utf8()).into_owned())
 }
 
+/// Seconds from 1970 to 2001, the reference date a `CFAbsoluteTime` counts from.
+const UNIX_TO_REFERENCE: f64 = 978_307_200.0;
+
+/// `CFTimeInterval CFTimeZoneGetSecondsFromGMT(CFTimeZoneRef, CFAbsoluteTime)`.
+pub unsafe extern "C" fn get_seconds_from_gmt(timezone: CFTypeRef, at: f64) -> f64 {
+    // SAFETY: a timezone from this runtime, or something `name_of` refuses.
+    let name = unsafe { name_of(timezone) };
+    let Some(zone) = name.as_deref().and_then(zone) else {
+        objc::fail!("CFTimeZoneGetSecondsFromGMT: no zone data for {name:?}");
+    };
+    zone.at((at + UNIX_TO_REFERENCE).floor() as i64).offset as f64
+}
+
 pub unsafe extern "C" fn get_name(timezone: CFTypeRef) -> CFTypeRef {
     // SAFETY: a timezone from this runtime.
     if !unsafe { crate::base::is_kind_of(timezone, class()) } {

@@ -157,6 +157,7 @@ exports::exports! {
         "CFTimeZoneCreateWithName" => timezone::create_with_name,
         "CFTimeZoneCreateWithTimeIntervalFromGMT" => timezone::create_with_time_interval_from_gmt,
         "CFTimeZoneGetName" => timezone::get_name,
+        "CFTimeZoneGetSecondsFromGMT" => timezone::get_seconds_from_gmt,
         "CFURLCreateFromFSRef" => api::CFURLCreateFromFSRef,
         "CFURLGetFSRef" => api::CFURLGetFSRef,
         "CFURLCreateBookmarkData" => api::CFURLCreateBookmarkData,
