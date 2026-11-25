@@ -23,6 +23,7 @@ pub const KERN_NOT_IN_SET: i32 = 23;
 pub const KERN_INVALID_OBJECT: i32 = 29;
 pub const KERN_TERMINATED: i32 = 37;
 pub const KERN_OPERATION_TIMED_OUT: i32 = 49;
+pub const KERN_INSUFFICIENT_BUFFER_SIZE: i32 = 52;
 
 /// The `mach_msg` half of the numbering. `0x1000_0xxx` is a send failure and
 /// `0x1000_4xxx` a receive one, which is why they cannot be folded into the

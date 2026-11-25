@@ -3720,6 +3720,7 @@ pub static SIGNATURES: &[FunctionAbi] = &[
     // `thread_get_state` and `thread_set_state` pass through and will not do
     // what a guest asking for `x86_THREAD_STATE64` means by them.
     sig!("thread_get_state", I32, U32, I32, P, P),
+    sig!("thread_get_register_pointer_values", I32, U32, P, P, P),
     sig!("thread_info", I32, U32, U32, P, P),
     // The scheduling policies, which pass through and *do* mean what the guest
     // means by them - unlike the register-state pair above.

@@ -834,6 +834,157 @@ pub unsafe extern "C" fn thread_get_state(
     rc
 }
 
+/// `kern_return_t thread_get_register_pointer_values(thread_t, uintptr_t *sp,
+/// size_t *length, uintptr_t *values)`
+///
+/// Callers such as CoreCLR's `FlushProcessWriteBuffers` want its side effect
+/// more than its answer: asking makes the thread pass a memory barrier.
+///
+/// # Safety
+///
+/// `length` is writable, `values` writable for `*length` words, and `sp` null
+/// or writable.
+pub unsafe extern "C" fn thread_get_register_pointer_values(
+    thread: Name,
+    sp: *mut u64,
+    length: *mut usize,
+    values: *mut u64,
+) -> i32 {
+    if length.is_null() {
+        return KERN_INVALID_ARGUMENT;
+    }
+    let Some(tid) = local_thread(thread) else {
+        return KERN_INVALID_ARGUMENT;
+    };
+    // SAFETY: the caller's obligation.
+    unsafe { pointer_values(thread, tid, sp, length, values) }
+}
+
+/// A macOS thread's id is its host thread port, which the host answers for.
+///
+/// # Safety
+///
+/// As [`thread_get_register_pointer_values`].
+#[cfg(target_os = "macos")]
+unsafe fn pointer_values(
+    _thread: Name,
+    tid: i32,
+    sp: *mut u64,
+    length: *mut usize,
+    values: *mut u64,
+) -> i32 {
+    unsafe extern "C" {
+        #[link_name = "thread_get_register_pointer_values"]
+        fn host(thread: u32, sp: *mut u64, length: *mut usize, values: *mut u64) -> i32;
+    }
+    // SAFETY: a live thread port of this process, and the caller's pointers.
+    unsafe { host(tid as u32, sp, length, values) }
+}
+
+/// libsyscall's own construction, over a brief suspension's saved context.
+///
+/// # Safety
+///
+/// As [`thread_get_register_pointer_values`].
+#[cfg(not(target_os = "macos"))]
+unsafe fn pointer_values(
+    thread: Name,
+    tid: i32,
+    sp: *mut u64,
+    length: *mut usize,
+    values: *mut u64,
+) -> i32 {
+    // SAFETY: the caller's obligation.
+    let capacity = unsafe { *length };
+    if capacity > 0 && values.is_null() {
+        return KERN_INVALID_ARGUMENT;
+    }
+    let (stack, registers) = if tid == crate::pthread::id() as i32 {
+        // FIXME (ACCURACY): Darwin answers for the calling thread with the
+        // registers it entered the kernel with; there is no saved context for
+        // it here, so it reports its stack pointer and no registers.
+        let here = 0u8;
+        (std::ptr::addr_of!(here) as u64, Vec::new())
+    } else {
+        let snapshot = !suspended(thread) && thread_suspend(thread) == KERN_SUCCESS;
+        let mut taken = None;
+        let rc = with_context(thread, |context, _| {
+            taken = pointer_registers(&context.machine);
+            match taken {
+                Some(_) => KERN_SUCCESS,
+                None => KERN_FAILURE,
+            }
+        });
+        if snapshot {
+            thread_resume(thread);
+        }
+        match taken {
+            Some(taken) if rc == KERN_SUCCESS => taken,
+            _ => return rc,
+        }
+    };
+    if !sp.is_null() {
+        // SAFETY: the caller's obligation.
+        unsafe { *sp = stack.checked_sub(RED_ZONE).unwrap_or(0) };
+    }
+    // Only values above the first page could be pointers, which is libsyscall's
+    // filter.
+    let page = starnix::system::page_size();
+    let pointers: Vec<u64> = registers.into_iter().filter(|v| *v > page).collect();
+    // SAFETY: the caller's obligation, for the first `capacity` words.
+    unsafe {
+        for (at, value) in pointers.iter().take(capacity).enumerate() {
+            *values.add(at) = *value;
+        }
+        *length = pointers.len();
+    }
+    match pointers.len() > capacity {
+        true => KERN_INSUFFICIENT_BUFFER_SIZE,
+        false => KERN_SUCCESS,
+    }
+}
+
+/// The 128 bytes below the stack pointer a leaf function may use, which the
+/// reported stack pointer is moved below so a scan of it covers them.
+#[cfg(not(target_os = "macos"))]
+const RED_ZONE: u64 = 128;
+
+/// The stack pointer, and the registers libsyscall offers as pointers: the
+/// program counter and the general registers but the stack pointer.
+#[cfg(all(not(target_os = "macos"), target_arch = "x86_64"))]
+fn pointer_registers(machine: &starnix::signal::Machine) -> Option<(u64, Vec<u64>)> {
+    /// rax, rbx, rcx, rdx, rdi, rsi, rbp, r8-r15, as indices into `gpr`.
+    const ORDER: [usize; 15] = [0, 3, 1, 2, 7, 6, 5, 8, 9, 10, 11, 12, 13, 14, 15];
+    /// `gpr`'s rsp.
+    const RSP: usize = 4;
+    let registers = std::iter::once(machine.rip)
+        .chain(ORDER.iter().map(|i| machine.gpr[*i]))
+        .collect();
+    Some((machine.gpr[RSP], registers))
+}
+
+/// The stack pointer, and the registers libsyscall offers as pointers: the
+/// link register and x0-x28.
+#[cfg(all(not(target_os = "macos"), target_arch = "aarch64"))]
+fn pointer_registers(machine: &starnix::signal::Machine) -> Option<(u64, Vec<u64>)> {
+    /// `x[30]`.
+    const LR: usize = 30;
+    /// x0-x28: the frame pointer and link register are not among them.
+    const GENERAL: usize = 29;
+    let registers = std::iter::once(machine.x[LR])
+        .chain(machine.x[..GENERAL].iter().copied())
+        .collect();
+    Some((machine.sp, registers))
+}
+
+#[cfg(all(
+    not(target_os = "macos"),
+    not(any(target_arch = "x86_64", target_arch = "aarch64"))
+))]
+fn pointer_registers(_machine: &starnix::signal::Machine) -> Option<(u64, Vec<u64>)> {
+    None
+}
+
 /// Whether `thread` is one of this process's and suspended now.
 fn suspended(thread: Name) -> bool {
     local_thread(thread).and_then(find).is_some_and(held)
