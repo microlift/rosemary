@@ -280,7 +280,11 @@ impl<S: DylibSource> DylibSource for BaseCxx<S> {
     }
 }
 
-/// Point every `_Unwind_*` binding at the runtime's `libunwind`.
+/// Point every `_Unwind_*` and `unw_*` binding at the runtime's `libunwind`.
+///
+/// `unw_*` is the same unwinder's frame-walking API, and like `_Unwind_*` it has
+/// to be the guest's: the host's finds unwind info only in images its own dyld
+/// mapped, which no guest image is.
 ///
 /// Slots are rewritten in guest memory *and* in the report, so everything built from
 /// the report afterwards - [`crate::Program`]'s import maps, the audit - describes what
@@ -298,7 +302,7 @@ pub fn bind_unwinder_to_the_runtime<M: machish::memory::Regions>(
         flavor,
         || flavor.libunwind(),
         &is_libunwind,
-        |symbol| symbol.starts_with("__Unwind_"),
+        |symbol| symbol.starts_with("__Unwind_") || symbol.starts_with("_unw_"),
     )
 }
 
@@ -339,7 +343,10 @@ fn is_cxx_abi_symbol(symbol: &str) -> bool {
         "__ZSt19uncaught_exceptionsv",
     ];
 
+    // `__dynamic_cast` walks the hierarchy through `type_info` virtuals, so it
+    // must be the same library's as the `type_info` vtables bound below.
     symbol.starts_with("___cxa_")
+        || symbol == "___dynamic_cast"
         || symbol.starts_with("___gxx_personality_")
         || symbol.starts_with("__ZN10__cxxabiv1")
         || symbol.starts_with("__ZTVN10__cxxabiv1")
@@ -358,12 +365,15 @@ fn rebind_to_runtime<M: machish::memory::Regions>(
     wanted: impl Fn(&str) -> bool,
 ) -> Result<usize> {
     // Where the runtime image landed, if this link wanted one at all. A C
-    // program does not, and neither does a C++ program that never throws.
+    // program does not, and neither does a C++ program that never throws. A
+    // `dlopen`ed image binds to the program's copy, which is in no report but
+    // the program's.
     let Some((base, slide)) = report
         .images
         .iter()
         .find(|i| is_image(&i.name))
-        .map(|i| (i.base, i.slide))
+        .map(|i| (Some(i.base), i.slide))
+        .or_else(|| crate::dyld::program_image_slide(is_image).map(|slide| (None, slide)))
     else {
         return Ok(0);
     };
@@ -383,7 +393,7 @@ fn rebind_to_runtime<M: machish::memory::Regions>(
     for image in &mut report.images {
         // The runtime image's own bindings are not rewritten: it is the thing
         // being bound *to*, and its internal references are already its own.
-        if image.base == base {
+        if Some(image.base) == base {
             continue;
         }
         for binding in &mut image.bindings {
@@ -399,6 +409,7 @@ fn rebind_to_runtime<M: machish::memory::Regions>(
             let Some(addr) = export.address(slide) else {
                 continue;
             };
+            let addr = addr.wrapping_add(binding.addend as u64);
             memory.write(binding.slot_va, &addr.to_le_bytes())?;
             binding.resolved = addr;
             // The tag is the *provider's*, and the provider that answered was
@@ -635,6 +646,9 @@ mod tests {
                 "__Unwind_DeleteException",
                 "__Unwind_GetLanguageSpecificData",
                 "__Unwind_SetIP",
+                "_unw_getcontext",
+                "_unw_init_local",
+                "_unw_step",
             ] {
                 assert!(
                     unwind.contains(symbol),
@@ -647,6 +661,7 @@ mod tests {
                 "___cxa_end_catch",
                 "___cxa_guard_acquire",
                 "___cxa_throw",
+                "___dynamic_cast",
                 "___gxx_personality_v0",
                 "__ZSt9terminatev",
                 "__ZTVN10__cxxabiv117__class_type_infoE",
