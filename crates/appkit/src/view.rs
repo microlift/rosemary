@@ -2663,10 +2663,26 @@ unsafe extern "C" fn frame(receiver: Id, _sel: Sel) -> NSRect {
     view_of(receiver).frame
 }
 
+/// `-setFrame:`, which AppKit carries out by sending `-setFrameOrigin:` and
+/// `-setFrameSize:`: a view that tracks its size overrides only the latter,
+/// as Avalonia's does, and must still hear of a resize made through this.
 unsafe extern "C" fn set_frame(receiver: Id, _sel: Sel, frame: NSRect) {
     let before = view_of(receiver).frame;
-    view_of(receiver).frame = frame;
-    note_geometry_change(receiver, before);
+    if before == frame {
+        note_geometry_change(receiver, before);
+        return;
+    }
+    // SAFETY: `void (id, SEL, NSPoint)` and `void (id, SEL, NSSize)`.
+    unsafe {
+        if before.origin != frame.origin {
+            let f: unsafe extern "C" fn(Id, Sel, NSPoint) = std::mem::transmute(objc::msg::entry());
+            f(receiver, objc::sel::get("setFrameOrigin:"), frame.origin);
+        }
+        if before.size != frame.size {
+            let f: unsafe extern "C" fn(Id, Sel, NSSize) = std::mem::transmute(objc::msg::entry());
+            f(receiver, objc::sel::get("setFrameSize:"), frame.size);
+        }
+    }
 }
 
 unsafe extern "C" fn set_frame_size(receiver: Id, _sel: Sel, size: NSSize) {
@@ -3829,6 +3845,61 @@ mod tests {
             origin: NSPoint { x, y },
             size: NSSize { width, height },
         }
+    }
+
+    static RESIZED_TO: std::sync::Mutex<Option<NSSize>> = std::sync::Mutex::new(None);
+
+    unsafe extern "C" fn recording_set_frame_size(receiver: Id, sel: Sel, size: NSSize) {
+        *RESIZED_TO.lock().unwrap() = Some(size);
+        // SAFETY: the superclass's own implementation, with the same arguments.
+        unsafe { set_frame_size(receiver, sel, size) };
+    }
+
+    #[test]
+    fn set_frame_reaches_a_set_frame_size_override() {
+        crate::bootstrap();
+        let class = objc::class::lookup(c"RosemarySizeTrackingTestView").unwrap_or_else(|| {
+            let class = objc::class::allocate_pair(
+                objc::class::lookup(c"NSView"),
+                c"RosemarySizeTrackingTestView",
+                0,
+            )
+            .expect("a subclass");
+            assert!(class.add_method(
+                objc::sel::get("setFrameSize:"),
+                recording_set_frame_size as objc::class::Imp,
+                c"v32@0:8{CGSize=dd}16",
+            ));
+            objc::class::register_pair(class);
+            class
+        });
+        // SAFETY: a fresh instance of an NSView subclass.
+        let tracked = unsafe {
+            init_with_frame(
+                objc::object::create_instance(class, 0),
+                objc::sel::get("initWithFrame:"),
+                rect(0.0, 0.0, 100.0, 100.0),
+            )
+        };
+        *RESIZED_TO.lock().unwrap() = None;
+        let send: unsafe extern "C" fn(Id, Sel, NSRect) =
+            unsafe { std::mem::transmute(objc::msg::entry()) };
+        // SAFETY: `-setFrame:` is `void (id, SEL, NSRect)`.
+        unsafe {
+            send(
+                tracked,
+                objc::sel::get("setFrame:"),
+                rect(5.0, 5.0, 900.0, 600.0),
+            )
+        };
+        assert_eq!(
+            *RESIZED_TO.lock().unwrap(),
+            Some(NSSize {
+                width: 900.0,
+                height: 600.0
+            })
+        );
+        assert_eq!(view_of(tracked).frame, rect(5.0, 5.0, 900.0, 600.0));
     }
 
     /// A superview and one subview of the given mask, wired as `-addSubview:`
