@@ -12,6 +12,16 @@ pub(super) unsafe extern "C" fn set_purgeable_state(_receiver: Id, _sel: Sel, _s
     MTL_PURGEABLE_STATE_NON_VOLATILE
 }
 
+unsafe extern "C" fn buffer_device(receiver: Id, _sel: Sel) -> Id {
+    // SAFETY: a buffer of this crate's.
+    crate::device_of_gpu(unsafe { object::body::<Buffer>(receiver) }.gpu)
+}
+
+unsafe extern "C" fn texture_device(receiver: Id, _sel: Sel) -> Id {
+    // SAFETY: a texture of this crate's.
+    crate::device_of_gpu(unsafe { object::body_ref::<Texture>(receiver) }.gpu)
+}
+
 pub(super) unsafe extern "C" fn buffer_allocated_size(receiver: Id, _sel: Sel) -> u64 {
     // SAFETY: a buffer of this crate's.
     unsafe { object::body::<Buffer>(receiver) }.inner.length
@@ -60,6 +70,7 @@ pub(super) fn install(class: &'static objc::class::Class) {
 /// makes a texture from.
 pub(super) fn install_texture(class: &'static objc::class::Class) {
     methods!(class, {
+        "device" => texture_device, c"@16@0:8";
         "allocatedSize" => texture_allocated_size, c"Q16@0:8";
         "resourceOptions" => texture_resource_options, c"Q16@0:8";
         "isFramebufferOnly" => no, c"B16@0:8";
@@ -76,6 +87,7 @@ pub(super) fn install_texture(class: &'static objc::class::Class) {
 
 pub(super) fn install_buffer(class: &'static objc::class::Class) {
     methods!(class, {
+        "device" => buffer_device, c"@16@0:8";
         "allocatedSize" => buffer_allocated_size, c"Q16@0:8";
         "resourceOptions" => buffer_resource_options, c"Q16@0:8";
     });

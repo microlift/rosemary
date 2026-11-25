@@ -180,6 +180,16 @@ pub(crate) fn gpu_of_device(device: Id) -> Option<&'static Gpu> {
     object::is_kind(device, c"RosemaryMTLDevice").then(|| gpu_of(device))?
 }
 
+/// The `MTLDevice` that owns `gpu`, which is what a resource made on it answers
+/// to `-device`. Devices are immortal, so the answer is at +0 for good.
+pub(crate) fn device_of_gpu(gpu: &'static Gpu) -> Id {
+    exports::devices()
+        .iter()
+        .map(|&device| device as Id)
+        .find(|&device| gpu_of_device(device).is_some_and(|owner| std::ptr::eq(owner, gpu)))
+        .unwrap_or(std::ptr::null_mut())
+}
+
 pub fn bootstrap() {
     static ONCE: std::sync::Once = std::sync::Once::new();
     ONCE.call_once(|| {

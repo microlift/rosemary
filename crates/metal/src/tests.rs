@@ -718,6 +718,39 @@ fn rebinding_between_dispatches_reaches_each_buffer() {
     }
 }
 
+/// `-device` on a resource is the device that made it, which is how a caller
+/// holding only a drawable's texture finds where to build its own resources.
+#[test]
+fn a_resource_answers_the_device_that_made_it() {
+    isolate_metal_fixture!();
+    let Some(device) = gpu_device() else {
+        return;
+    };
+    let gpu = gpu_of(device).expect("a Vulkan device");
+    let texture = resource::new_texture(
+        gpu,
+        resource::TextureDescriptor {
+            texture_type: 2,
+            pixel_format: 70, // RGBA8Unorm
+            width: 4,
+            height: 4,
+            depth: 1,
+            mipmap_level_count: 1,
+            sample_count: 1,
+            array_length: 1,
+            storage_mode: 0,
+            usage: gpu::USAGE_SHADER_READ,
+        },
+    );
+    assert!(!texture.is_null());
+    // SAFETY: objects this test made, sent the selectors they implement.
+    unsafe {
+        let buffer = new_buffer(device, std::ptr::null(), 16, 0);
+        assert_eq!(send(buffer, "device"), device);
+        assert_eq!(send(texture, "device"), device);
+    }
+}
+
 /// A private buffer lives where the host cannot map it, so its `-contents`
 /// is null; the bytes it was made with, the device's writes and a blit out of
 /// it must still all arrive, and a reused range must read back as zeros.
