@@ -4135,6 +4135,16 @@ pub static SIGNATURES: &[FunctionAbi] = &[
     sig!("CTFontCreateCopyWithAttributes", P, P, F64, P, P),
     sig!("CTFontCreateWithGraphicsFont", P, P, F64, P, P),
     sig!("CTGetCoreTextVersion", U32),
+    sig!("CTFontCopyFullName", P, P),
+    sig!("CTFontCopyLocalizedName", P, P, P, P),
+    sig!("CTFontCopyAvailableTables", P, P, U32),
+    sig!("CTFontCopyCharacterSet", P, P),
+    sig!("CTFontCopyVariation", P, P),
+    // `CTFontRef CTFontCreateForString(CTFontRef, CFStringRef, CFRange)`, the
+    // range flattened as `CFStringGetBytes` has it.
+    sig!("CTFontCreateForString", P, P, P, I64, I64),
+    sig!("CTFontCollectionCreateFromAvailableFonts", P, P),
+    sig!("CTFontCollectionCreateMatchingFontDescriptors", P, P),
     sig!("NSColorSpaceFromDepth", P, I32),
     sig!("NSBestDepth", I32, P, I64, I64, BOOL, P),
     sig!("CGEventSourceKeyState", BOOL, I32, U16),

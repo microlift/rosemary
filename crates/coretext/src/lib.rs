@@ -14,8 +14,13 @@ use foundation::geometry::{NSPoint, NSRect, NSSize};
 
 use chrome::fonts::{self, FaceInfo, LoadedFace};
 
+mod collection;
+mod face;
+
+pub use collection::*;
+pub use face::*;
+
 const ATTRIBUTE_GLOBALS: &[(&str, &str)] = &[
-    ("_kCTFontCopyrightNameKey", "CTFontCopyrightNameKey"),
     // The attributed-string keys are shared with AppKit's where both
     // exist, which is how one attributed string serves both frameworks.
     ("_kCTFontAttributeName", "NSFont"),
@@ -35,7 +40,6 @@ const ATTRIBUTE_GLOBALS: &[(&str, &str)] = &[
     ),
     ("_kCTFontLanguagesAttribute", "CTFontLanguagesAttribute"),
     ("_kCTFontNameAttribute", "CTFontNameAttribute"),
-    ("_kCTFontPostScriptNameKey", "CTFontPostScriptNameKey"),
     ("_kCTFontSizeAttribute", "CTFontSizeAttribute"),
     ("_kCTFontSlantTrait", "CTFontSlantTrait"),
     ("_kCTFontStyleNameAttribute", "CTFontStyleNameAttribute"),
@@ -61,7 +65,6 @@ const ATTRIBUTE_GLOBALS: &[(&str, &str)] = &[
     ),
     ("_kCTFontVariationAxisNameKey", VARIATION_AXIS_NAME),
     ("_kCTFontVariationAxisHiddenKey", VARIATION_AXIS_HIDDEN),
-    ("_kCTFontUniqueNameKey", "CTFontUniqueNameKey"),
     ("_kCTFontWeightTrait", "CTFontWeightTrait"),
     ("_kCTForegroundColorAttributeName", "CTForegroundColor"),
     (
@@ -462,6 +465,11 @@ fn copy_string_attribute(font: CFTypeRef, name: &'static str) -> CFTypeRef {
 }
 
 pub unsafe extern "C" fn CTFontCopyName(font: CFTypeRef, name_key: CFTypeRef) -> CFTypeRef {
+    if let Some(name) = face::copy_name(font, name_key) {
+        return name;
+    }
+    // A face without the record, or a font with no face: the names the font
+    // was described with.
     let wanted = [
         ("CTFontFamilyNameKey", "CTFontFamilyNameAttribute"),
         ("CTFontSubFamilyNameKey", "CTFontStyleNameAttribute"),
@@ -1047,7 +1055,7 @@ pub unsafe extern "C" fn CTFontManagerCopyAvailableFontFamilyNames() -> CFTypeRe
     array
 }
 
-fn descriptors_for(faces: &[FaceInfo]) -> CFTypeRef {
+pub(crate) fn descriptors_for(faces: &[FaceInfo]) -> CFTypeRef {
     if faces.is_empty() {
         return std::ptr::null();
     }
@@ -1155,11 +1163,25 @@ exports::exports! {
         "CTFontCreateCopyWithSymbolicTraits" => CTFontCreateCopyWithSymbolicTraits,
         "CTFontCreateWithGraphicsFont" => CTFontCreateWithGraphicsFont,
         "CTGetCoreTextVersion" => CTGetCoreTextVersion,
+        "CTFontCopyFullName" => CTFontCopyFullName,
+        "CTFontCopyLocalizedName" => CTFontCopyLocalizedName,
+        "CTFontCopyAvailableTables" => CTFontCopyAvailableTables,
+        "CTFontCopyCharacterSet" => CTFontCopyCharacterSet,
+        "CTFontCopyVariation" => CTFontCopyVariation,
+        "CTFontCreateForString" => CTFontCreateForString,
+        "CTFontCollectionCreateFromAvailableFonts" => CTFontCollectionCreateFromAvailableFonts,
+        "CTFontCollectionCreateMatchingFontDescriptors" => CTFontCollectionCreateMatchingFontDescriptors,
     }
 }
 
 pub fn data_symbols() -> Vec<(String, u64)> {
-    corefoundation::base::string_globals(ATTRIBUTE_GLOBALS)
+    let names: Vec<(&str, &str)> = face::NAME_KEYS
+        .iter()
+        .map(|(symbol, value, _)| (*symbol, *value))
+        .collect();
+    let mut symbols = corefoundation::base::string_globals(ATTRIBUTE_GLOBALS);
+    symbols.extend(corefoundation::base::string_globals(&names));
+    symbols
 }
 
 #[cfg(test)]
