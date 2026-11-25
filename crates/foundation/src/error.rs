@@ -366,6 +366,7 @@ pub(crate) fn install() {
         "code" => code, c"q16@0:8";
         "localizedDescription" => localized_description, c"@16@0:8";
         "description" => localized_description, c"@16@0:8";
+        "debugDescription" => localized_description, c"@16@0:8";
         "userInfo" => user_info, c"@16@0:8";
         "localizedFailureReason" => localized_failure_reason, c"@16@0:8";
         "localizedRecoverySuggestion" => localized_recovery_suggestion, c"@16@0:8";
