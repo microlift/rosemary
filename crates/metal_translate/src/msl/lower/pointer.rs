@@ -77,6 +77,10 @@ impl Lowerer<'_, '_> {
                 Some(Binding::Pointer(pointer)) => pointer,
                 _ => return Ok(None),
             },
+            ExprKind::Member(..) => match self.handle_member(expr) {
+                Some(Binding::Pointer(pointer)) => pointer,
+                _ => return Ok(None),
+            },
             ExprKind::Binary(op @ ("+" | "-"), lhs, rhs) => {
                 let (pointer, steps) = if let Some(pointer) = self.pointer(lhs)? {
                     (pointer, rhs)

@@ -121,7 +121,12 @@ impl<'p> Lowerer<'_, 'p> {
         }
         let fitting: Vec<_> = named
             .into_iter()
-            .filter(|function| function.params.len() == args.len())
+            .filter(|function| {
+                function.params.len() >= args.len()
+                    && function.params[args.len()..]
+                        .iter()
+                        .all(|param| param.default.is_some())
+            })
             .collect();
         let Some(first) = fitting.first() else {
             return Err(syntax_error(
@@ -151,7 +156,10 @@ impl<'p> Lowerer<'_, 'p> {
             .zip(args)
             .map(|(param, arg)| {
                 Ok(match param.indirection {
-                    Indirection::Value => Binding::Value(self.rvalue(arg)?),
+                    Indirection::Value => match self.handle_fields(arg) {
+                        Some(fields) => Binding::LValue(self.copy_handles(&fields, arg.line)?),
+                        None => Binding::Value(self.rvalue(arg)?),
+                    },
                     Indirection::Reference => {
                         Binding::LValue(self.lvalue(arg)?.ok_or_else(|| {
                             syntax_error(arg.line, "a reference argument is not in memory")
@@ -241,7 +249,14 @@ impl<'p> Lowerer<'_, 'p> {
         let mut scope = HashMap::new();
         let mut types = HashMap::new();
         let mut values = HashMap::new();
-        for (param, arg) in function.params.iter().zip(args) {
+        for (at, param) in function.params.iter().enumerate() {
+            // A parameter the call leaves out takes its default.
+            let arg = args.get(at).or(param.default.as_ref()).ok_or_else(|| {
+                syntax_error(
+                    line,
+                    format!("{} is not passed {}", function.name, param.name),
+                )
+            })?;
             let binding = self.argument(param, arg, &mut types, &mut values)?;
             scope.insert(param.name.clone(), binding);
         }
@@ -269,6 +284,15 @@ impl<'p> Lowerer<'_, 'p> {
         let exit = self.new_block("return");
         let result = match substitute(&function.ret, &types, &values, line)? {
             Ty::Void => None,
+            ty if self.context.has_handles(&ty) => {
+                return Err(syntax_error(
+                    line,
+                    format!(
+                        "{} returns a structure with a texture, sampler or pointer member, which is not supported",
+                        function.name
+                    ),
+                ));
+            }
             ty => Some((self.local_lvalue(&ty), ty)),
         };
         self.frames.push(Frame {
@@ -309,6 +333,27 @@ impl<'p> Lowerer<'_, 'p> {
         match (param.indirection, &param.ty) {
             (Indirection::Value, Ty::Texture(_) | Ty::Sampler) => {
                 Ok(Binding::Value(self.rvalue(arg)?))
+            }
+            // A copy, which shares the caller's resources: see `handle`.
+            (Indirection::Value, declared) if self.context.has_handles(declared) => {
+                let fields = self.handle_fields(arg).ok_or_else(|| {
+                    syntax_error(
+                        line,
+                        format!("{} is passed something not such a structure", param.name),
+                    )
+                })?;
+                if fields.ty() != *declared {
+                    return Err(syntax_error(
+                        line,
+                        format!(
+                            "{} takes {}, not {}",
+                            param.name,
+                            describe(declared),
+                            describe(&fields.ty())
+                        ),
+                    ));
+                }
+                Ok(Binding::LValue(self.copy_handles(&fields, line)?))
             }
             (Indirection::Value, declared) => {
                 let value = self.rvalue(arg)?;

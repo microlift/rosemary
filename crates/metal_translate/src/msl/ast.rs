@@ -69,6 +69,9 @@ pub(super) enum Ty {
     Struct(usize),
     Texture(TextureType),
     Sampler,
+    /// `SPACE T*` as a structure member, which a structure holds only as a
+    /// name for a buffer: see `Context::has_handles`.
+    Pointer(Space, Box<Ty>),
 }
 
 impl Ty {
@@ -293,6 +296,9 @@ pub(super) enum Indirection {
 pub(super) struct Param {
     pub ty: Ty,
     pub name: String,
+    /// `= value`: the argument a call that stops short of this parameter
+    /// passes.
+    pub default: Option<Expr>,
     pub space: Option<Space>,
     pub indirection: Indirection,
     pub attributes: Vec<Attribute>,

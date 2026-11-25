@@ -8,6 +8,7 @@
 
 mod expr;
 mod globals;
+mod handle;
 mod inline;
 mod library;
 mod matrix;
@@ -137,6 +138,10 @@ impl<'p> Context<'p> {
             Ty::Struct(index) => Type::Struct(self.layouts[*index].clone()),
             Ty::Texture(texture) => Type::Texture(texture.clone()),
             Ty::Sampler => Type::Sampler,
+            Ty::Pointer(space, pointee) => Type::Pointer {
+                space: address_space(*space),
+                pointee: Box::new(self.ir(pointee)),
+            },
         }
     }
 
@@ -166,6 +171,9 @@ impl<'p> Context<'p> {
                 (lane * u32::from(*lanes), lane)
             }
             Ty::ByteBool => (1, 1),
+            Ty::Struct(_) if self.has_handles(ty) => {
+                return Err(syntax_error(line, handle::IN_MEMORY));
+            }
             Ty::Struct(index) => {
                 let layout = self
                     .layouts
@@ -182,19 +190,18 @@ impl<'p> Context<'p> {
         let mut offset = 0u32;
         let mut alignment = 1u32;
         let mut fields = Vec::new();
+        // Such a structure is only ever its fields (see `handle`), so it has
+        // no layout; anything needing one refuses it through `size_align`.
+        if self.has_handles(&Ty::Struct(index)) {
+            return Ok(StructType {
+                fields,
+                size: 0,
+                alignment,
+                packed: false,
+            });
+        }
         for field in &definition.fields {
-            let ty = match &field.ty {
-                // A resource member is an argument buffer, which nothing
-                // here implements; a stage struct's fields are never laid out
-                // in memory, so give them a nominal size.
-                Ty::Texture(_) | Ty::Sampler => {
-                    return Err(syntax_error(
-                        field.line,
-                        "a structure with a texture or sampler member is an argument buffer, which is not supported",
-                    ));
-                }
-                ty => ty,
-            };
+            let ty = &field.ty;
             let (size, align) = self.size_align(ty, field.line)?;
             offset = offset.next_multiple_of(align);
             fields.push(StructField {
@@ -493,6 +500,9 @@ pub(super) enum LValue {
     Fields(usize, Vec<LValue>),
     /// A type viewed in a buffer of bytes.
     Bytes(pointer::Bytes),
+    /// A texture, sampler or pointer member of a structure, and its type:
+    /// the resource it was initialized with. See `handle`.
+    Handle(Box<Binding>, Ty),
 }
 
 impl LValue {
@@ -504,6 +514,7 @@ impl LValue {
             LValue::Lanes(_, _, ty) | LValue::Dynamic(_, _, ty) => ty.clone(),
             LValue::Fields(index, _) => Ty::Struct(*index),
             LValue::Bytes(bytes) => bytes.ty.unpacked(),
+            LValue::Handle(_, ty) => ty.clone(),
         }
     }
 
@@ -514,7 +525,7 @@ impl LValue {
             LValue::Memory(place) => Some(place.space),
             LValue::Bytes(bytes) => Some(bytes.space),
             LValue::Fields(..) => Some(AddressSpace::Thread),
-            LValue::Lanes(..) | LValue::Dynamic(..) => None,
+            LValue::Lanes(..) | LValue::Dynamic(..) | LValue::Handle(..) => None,
         }
     }
 }
@@ -695,6 +706,77 @@ impl<'c, 'p> Lowerer<'c, 'p> {
         }
     }
 
+    /// A local of `ty`, initialized from `init` as a declaration does.
+    pub(super) fn initialized_local(
+        &mut self,
+        ty: &Ty,
+        init: Option<&Expr>,
+        line: usize,
+    ) -> Result<LValue> {
+        let lvalue = self.local_lvalue(ty);
+        if let Some(init) = init {
+            match (&init.kind, ty) {
+                (ExprKind::InitList(items), Ty::Scalar(_) | Ty::Vector(..) | Ty::Matrix { .. })
+                    if items.is_empty() =>
+                {
+                    let value = Value {
+                        op: self.context.zero(ty, line)?,
+                        ty: ty.clone(),
+                    };
+                    self.store(&lvalue, value, line)?;
+                }
+                (ExprKind::InitList(items), Ty::Array(element, count)) => {
+                    if items.len() > *count as usize {
+                        return Err(syntax_error(line, "too many initializers"));
+                    }
+                    // Elements the list leaves out are zero, as C++
+                    // value-initializes them.
+                    for index in 0..*count as usize {
+                        let value = match items.get(index) {
+                            Some(item) => {
+                                let value = self.rvalue(item)?;
+                                self.convert(value, element, item.line)?
+                            }
+                            None => Value {
+                                op: self.context.zero(element, line)?,
+                                ty: (**element).clone(),
+                            },
+                        };
+                        let LValue::Memory(place) = &lvalue else {
+                            unreachable!("an array local is one variable");
+                        };
+                        let mut element_place = place.clone();
+                        if element_place.indices.is_empty() {
+                            element_place.indices.push(Operand::u32(0));
+                        }
+                        element_place.indices.push(Operand::u32(index as u32));
+                        element_place.ty = (**element).clone();
+                        self.store(&LValue::Memory(element_place), value, line)?;
+                    }
+                }
+                // `S s = { a, b };` is `(S){ a, b }`: the fields in
+                // declaration order.
+                (ExprKind::InitList(items), Ty::Struct(_)) => {
+                    let literal = Expr {
+                        kind: ExprKind::CompoundLiteral(
+                            ty.clone(),
+                            items.iter().map(|item| (None, item.clone())).collect(),
+                        ),
+                        line: init.line,
+                    };
+                    let value = self.rvalue(&literal)?;
+                    self.store(&lvalue, value, line)?;
+                }
+                _ => {
+                    let value = self.rvalue(init)?;
+                    let value = self.convert(value, ty, line)?;
+                    self.store(&lvalue, value, line)?;
+                }
+            }
+        }
+        Ok(lvalue)
+    }
+
     pub fn bind(&mut self, name: &str, binding: Binding) {
         self.scopes
             .last_mut()
@@ -828,68 +910,24 @@ impl<'c, 'p> Lowerer<'c, 'p> {
                         "a texture or sampler local is not supported",
                     ));
                 }
-                let lvalue = self.local_lvalue(ty);
-                if let Some(init) = init {
-                    match (&init.kind, ty) {
-                        (
-                            ExprKind::InitList(items),
-                            Ty::Scalar(_) | Ty::Vector(..) | Ty::Matrix { .. },
-                        ) if items.is_empty() => {
-                            let value = Value {
-                                op: self.context.zero(ty, *line)?,
-                                ty: ty.clone(),
-                            };
-                            self.store(&lvalue, value, *line)?;
-                        }
-                        (ExprKind::InitList(items), Ty::Array(element, count)) => {
-                            if items.len() > *count as usize {
-                                return Err(syntax_error(*line, "too many initializers"));
-                            }
-                            // Elements the list leaves out are zero, as C++
-                            // value-initializes them.
-                            for index in 0..*count as usize {
-                                let value = match items.get(index) {
-                                    Some(item) => {
-                                        let value = self.rvalue(item)?;
-                                        self.convert(value, element, item.line)?
-                                    }
-                                    None => Value {
-                                        op: self.context.zero(element, *line)?,
-                                        ty: (**element).clone(),
-                                    },
-                                };
-                                let LValue::Memory(place) = &lvalue else {
-                                    unreachable!("an array local is one variable");
-                                };
-                                let mut element_place = place.clone();
-                                if element_place.indices.is_empty() {
-                                    element_place.indices.push(Operand::u32(0));
-                                }
-                                element_place.indices.push(Operand::u32(index as u32));
-                                element_place.ty = (**element).clone();
-                                self.store(&LValue::Memory(element_place), value, *line)?;
-                            }
-                        }
-                        // `S s = { a, b };` is `(S){ a, b }`: the fields in
-                        // declaration order.
-                        (ExprKind::InitList(items), Ty::Struct(_)) => {
-                            let literal = Expr {
-                                kind: ExprKind::CompoundLiteral(
-                                    ty.clone(),
-                                    items.iter().map(|item| (None, item.clone())).collect(),
-                                ),
-                                line: init.line,
-                            };
-                            let value = self.rvalue(&literal)?;
-                            self.store(&lvalue, value, *line)?;
-                        }
-                        _ => {
-                            let value = self.rvalue(init)?;
-                            let value = self.convert(value, ty, *line)?;
-                            self.store(&lvalue, value, *line)?;
-                        }
+                let lvalue = match ty {
+                    Ty::Struct(index) if self.context.has_handles(ty) => {
+                        let init = init.as_ref().ok_or_else(|| {
+                            syntax_error(
+                                *line,
+                                "a structure with a texture, sampler or pointer member must be initialized",
+                            )
+                        })?;
+                        self.handle_struct(*index, init)?
                     }
-                }
+                    _ if self.context.has_handles(ty) => {
+                        return Err(syntax_error(
+                            *line,
+                            "an array of textures, samplers or pointers is not supported",
+                        ));
+                    }
+                    _ => self.initialized_local(ty, init.as_ref(), *line)?,
+                };
                 self.bind(name, Binding::LValue(lvalue));
             }
             Stmt::Auto { name, init, line } => {
@@ -1348,6 +1386,9 @@ impl<'c, 'p> Lowerer<'c, 'p> {
                     }
                 };
                 let element = param.ty.in_memory();
+                if self.context.has_handles(&element) {
+                    return Err(syntax_error(line, handle::IN_MEMORY));
+                }
                 let pointee = match element {
                     // A `void` buffer is bytes, reached through a cast.
                     Ty::Void => scalar_ir(Scalar::UCHAR),

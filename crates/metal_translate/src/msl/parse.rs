@@ -417,11 +417,22 @@ impl Parser<'_> {
         let mut fields = Vec::new();
         while !self.eat("}") {
             let line = self.line();
-            self.skip_qualifiers();
+            let leading = self.skip_qualifiers();
             let base = self.ty()?;
+            // `float device* p` spells the address space after the type.
+            let space = self.skip_qualifiers().or(leading);
             loop {
+                let pointer = self.eat("*");
+                self.skip_qualifiers();
                 let name = self.ident()?;
                 let ty = self.array_suffix(base.clone())?.in_memory();
+                let ty = match (pointer, space) {
+                    (false, _) => ty,
+                    (true, Some(space)) => Ty::Pointer(space, Box::new(ty)),
+                    (true, None) => {
+                        return Err(syntax_error(line, "a pointer member with no address space"));
+                    }
+                };
                 let attributes = self.attributes()?;
                 fields.push(Field {
                     name,
@@ -501,6 +512,7 @@ impl Parser<'_> {
                         params.push(Param {
                             ty: Ty::Sampler,
                             name: name.clone(),
+                            default: None,
                             space: None,
                             indirection: Indirection::Value,
                             attributes: vec![Attribute {
@@ -760,9 +772,14 @@ impl Parser<'_> {
             }
             let ty = self.array_suffix(ty)?;
             let attributes = self.attributes()?;
+            let default = match self.eat("=") {
+                true => Some(self.assignment()?),
+                false => None,
+            };
             params.push(Param {
                 ty,
                 name,
+                default,
                 space,
                 indirection,
                 attributes,
@@ -1227,6 +1244,19 @@ impl Parser<'_> {
                             kind: ExprKind::Construct(ty.clone(), args),
                             line,
                         })
+                    } else if self.is_punct("{") {
+                        // `T x{a, b}`: list initialization, which for an
+                        // aggregate is `T x = {a, b}` and for a vector or
+                        // scalar is construction.
+                        let init = self.initializer()?;
+                        match (&ty, init.kind) {
+                            (Ty::Struct(_) | Ty::Array(..), kind) => Some(Expr { kind, line }),
+                            (_, ExprKind::InitList(items)) => Some(Expr {
+                                kind: ExprKind::Construct(ty.clone(), items),
+                                line,
+                            }),
+                            (_, kind) => Some(Expr { kind, line }),
+                        }
                     } else {
                         None
                     };
@@ -1529,8 +1559,19 @@ impl Parser<'_> {
                         line,
                     };
                 }
-            } else if self.is_punct("->") {
-                return Err(self.error("`->` is not supported"));
+            } else if self.eat("->") {
+                // `p->m` is `(*p).m`.
+                let name = self.ident()?;
+                expr = Expr {
+                    kind: ExprKind::Member(
+                        Box::new(Expr {
+                            kind: ExprKind::Unary("*", Box::new(expr)),
+                            line,
+                        }),
+                        name,
+                    ),
+                    line,
+                };
             } else if self.is_punct("[") && !matches!(self.peek_at(1), Some(Kind::Punct("["))) {
                 self.at += 1;
                 let index = self.expression()?;

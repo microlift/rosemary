@@ -25,6 +25,15 @@ impl Lowerer<'_, '_> {
     /// Evaluate an expression for its effect alone.
     pub fn effect(&mut self, expr: &Expr) -> Result<()> {
         match &expr.kind {
+            // `(void) x;` marks a value as deliberately unused, as MojoShader
+            // and Skia write after declaring one; a name has no effect to keep.
+            ExprKind::Cast(Ty::Void, operand) => match &operand.kind {
+                ExprKind::Ident(name) => match self.lookup(name) {
+                    Some(_) => Ok(()),
+                    None => Err(self.unknown_name(name, operand.line)),
+                },
+                _ => self.effect(operand),
+            },
             ExprKind::Binary(",", lhs, rhs) => {
                 self.effect(lhs)?;
                 self.effect(rhs)
@@ -49,9 +58,6 @@ impl Lowerer<'_, '_> {
             {
                 self.barrier(name, args, expr.line)
             }
-            // `(void) x;` marks a value as deliberately unused; MojoShader
-            // writes one after every constant it declares.
-            ExprKind::Cast(Ty::Void, operand) => self.effect(operand),
             _ => self.rvalue(expr).map(|_| ()),
         }
     }
@@ -291,6 +297,16 @@ impl Lowerer<'_, '_> {
                 );
                 Ok(Value { op, ty: ty.clone() })
             }
+            LValue::Handle(binding, _) => match &**binding {
+                Binding::Value(value) => Ok(value.clone()),
+                _ => Err(syntax_error(line, "a pointer member used as a value")),
+            },
+            LValue::Fields(index, _) if self.context.has_handles(&Ty::Struct(*index)) => {
+                Err(syntax_error(
+                    line,
+                    "a structure with a texture, sampler or pointer member used as a value",
+                ))
+            }
             LValue::Fields(index, fields) => {
                 let ty = Ty::Struct(*index);
                 let mut op = Operand::Undef(self.context.ir(&ty));
@@ -383,6 +399,10 @@ impl Lowerer<'_, '_> {
                 let ty = old.ty;
                 self.store(base, Value { op, ty }, line)
             }
+            LValue::Handle(..) => Err(syntax_error(
+                line,
+                "a texture, sampler or pointer member assigned after its declaration",
+            )),
             LValue::Fields(index, fields) => {
                 let parts = self.split_struct(value, *index)?;
                 for (field, part) in fields.iter().zip(parts) {
@@ -1600,5 +1620,6 @@ pub(super) fn describe(ty: &Ty) -> String {
         Ty::Struct(_) => "a structure".into(),
         Ty::Texture(_) => "a texture".into(),
         Ty::Sampler => "a sampler".into(),
+        Ty::Pointer(_, pointee) => format!("{} *", describe(pointee)),
     }
 }
