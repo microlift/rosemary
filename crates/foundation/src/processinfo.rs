@@ -114,6 +114,13 @@ unsafe extern "C" fn process_identifier(_receiver: Id, _sel: Sel) -> i32 {
 /// `-processName`: the guest executable's name. The host's own `argv[0]` is
 /// this runtime, which a program would put in its log and lock file names.
 unsafe extern "C" fn process_name(_receiver: Id, _sel: Sel) -> Id {
+    if let Some(name) = PROCESS_NAME
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_deref()
+    {
+        return autoreleased(name);
+    }
     let guest = guest_arguments().into_iter().next();
     let name = guest
         .or_else(|| std::env::args_os().next())
@@ -124,6 +131,18 @@ unsafe extern "C" fn process_name(_receiver: Id, _sel: Sel) -> Id {
         })
         .unwrap_or_else(|| "rosemary".to_string());
     autoreleased(&name)
+}
+
+/// What `-setProcessName:` last set, which `-processName` answers from then on.
+static PROCESS_NAME: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+
+unsafe extern "C" fn set_process_name(_receiver: Id, _sel: Sel, name: Id) {
+    if name.is_null() {
+        return;
+    }
+    // SAFETY: an `NSString`.
+    let name = String::from_utf8_lossy(&unsafe { crate::string::bytes(name) }).into_owned();
+    *PROCESS_NAME.lock().unwrap_or_else(|e| e.into_inner()) = Some(name);
 }
 
 static GUEST_ARGUMENTS: std::sync::Mutex<Option<Vec<std::ffi::OsString>>> =
@@ -293,6 +312,7 @@ pub(crate) fn install() {
         "physicalMemory" => physical_memory, c"Q16@0:8";
         "processIdentifier" => process_identifier, c"i16@0:8";
         "processName" => process_name, c"@16@0:8";
+        "setProcessName:" => set_process_name, c"v24@0:8@16";
         "arguments" => arguments, c"@16@0:8";
         "environment" => environment, c"@16@0:8";
         "systemUptime" => system_uptime, c"d16@0:8";
