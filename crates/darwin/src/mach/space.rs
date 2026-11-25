@@ -626,8 +626,27 @@ pub extern "C" fn mach_port_insert_right(
     let Some(address) = address_of(right) else {
         return KERN_INVALID_CAPABILITY;
     };
+    let send = matches!(
+        disposition,
+        super::msg::MAKE_SEND | super::msg::COPY_SEND | super::msg::MOVE_SEND
+    );
     with(|space| {
-        if space.names.contains_key(&name) && name != right {
+        if name == right {
+            // Mach keeps send and receive rights to one port under one name, so
+            // a send right inserted at the receive right's own name joins it.
+            match space.names.get_mut(&name) {
+                Some(Right::Receive(_)) if send => return KERN_SUCCESS,
+                Some(Right::Send { refs, .. }) if send => {
+                    // A move onto its own name gives up the reference it adds.
+                    if disposition != super::msg::MOVE_SEND {
+                        *refs += 1;
+                    }
+                    return KERN_SUCCESS;
+                }
+                _ => {}
+            }
+        }
+        if space.names.contains_key(&name) {
             return KERN_RIGHT_EXISTS;
         }
         let inserted = match disposition {
@@ -900,6 +919,21 @@ mod tests {
         assert_eq!(mach_port_deallocate(TASK_SELF, name), KERN_INVALID_RIGHT);
         assert_eq!(mach_port_destroy(TASK_SELF, name), KERN_SUCCESS);
         assert_eq!(mach_port_destroy(TASK_SELF, name), KERN_INVALID_NAME);
+    }
+
+    /// CoreCLR's exception port: a send right made at the receive right's own
+    /// name, after which the name must still be receivable.
+    #[test]
+    fn a_send_right_inserted_at_its_receive_name_keeps_the_receive_right() {
+        let mut name = MACH_PORT_NULL;
+        // SAFETY: a live local for the out-parameter.
+        unsafe { mach_port_allocate(TASK_SELF, RIGHT_RECEIVE, &mut name) };
+        assert_eq!(
+            mach_port_insert_right(TASK_SELF, name, name, super::super::msg::MAKE_SEND),
+            KERN_SUCCESS
+        );
+        assert!(receiver(name).is_some());
+        assert_eq!(mach_port_destroy(TASK_SELF, name), KERN_SUCCESS);
     }
 
     /// Crashpad's sequence: allocate a receive right, extract a send right to
