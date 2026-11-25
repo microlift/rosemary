@@ -64,6 +64,9 @@ pub struct View {
 const WANTS_LAYER: usize = 1;
 const BACKING_LAYER: usize = 2;
 const CLIPS_TO_BOUNDS: usize = 4;
+/// `-setCanDrawSubviewsIntoLayer:`. Flattening subviews into this view's layer
+/// draws what compositing them separately does, so only the setting is kept.
+const DRAWS_SUBVIEWS_INTO_LAYER: usize = 16;
 const PLACEMENT_SHIFT: u32 = 8;
 
 /// The bits of [`View::posts`].
@@ -1754,6 +1757,18 @@ unsafe extern "C" fn make_backing_layer(_receiver: Id, _sel: Sel) -> Id {
 
 unsafe extern "C" fn wants_layer(receiver: Id, _sel: Sel) -> u8 {
     u8::from(view_of(receiver).layer_backing & WANTS_LAYER != 0)
+}
+
+unsafe extern "C" fn can_draw_subviews_into_layer(receiver: Id, _sel: Sel) -> u8 {
+    u8::from(view_of(receiver).layer_backing & DRAWS_SUBVIEWS_INTO_LAYER != 0)
+}
+
+unsafe extern "C" fn set_can_draw_subviews_into_layer(receiver: Id, _sel: Sel, flag: u8) {
+    let view = view_of(receiver);
+    match flag != 0 {
+        true => view.layer_backing |= DRAWS_SUBVIEWS_INTO_LAYER,
+        false => view.layer_backing &= !DRAWS_SUBVIEWS_INTO_LAYER,
+    }
 }
 
 /// `-layerContentsPlacement`, whose default of zero is
@@ -3776,6 +3791,8 @@ pub(crate) fn install() {
         "wantsUpdateLayer" => no, c"c16@0:8";
         "updateLayer" => ignored, c"v16@0:8";
         "wantsLayer" => wants_layer, c"c16@0:8";
+        "setCanDrawSubviewsIntoLayer:" => set_can_draw_subviews_into_layer, c"v20@0:8c16";
+        "canDrawSubviewsIntoLayer" => can_draw_subviews_into_layer, c"c16@0:8";
         "setAllowedTouchTypes:" => set_allowed_touch_types, c"v24@0:8Q16";
         "allowedTouchTypes" => allowed_touch_types, c"Q16@0:8";
         "setClipsToBounds:" => set_clips_to_bounds, c"v20@0:8c16";
