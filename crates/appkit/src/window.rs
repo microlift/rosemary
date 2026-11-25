@@ -2896,6 +2896,17 @@ unsafe extern "C" fn screen(receiver: Id, _sel: Sel) -> Id {
     }
 }
 
+/// `NSBackingStoreBuffered`.
+const BACKING_STORE_BUFFERED: usize = 2;
+
+/// `-backingType`. AppKit treats the deprecated retained and nonretained
+/// stores as buffered, which is the one kind every window here has.
+unsafe extern "C" fn backing_type(_receiver: Id, _sel: Sel) -> usize {
+    BACKING_STORE_BUFFERED
+}
+
+unsafe extern "C" fn set_backing_type(_receiver: Id, _sel: Sel, _backing: usize) {}
+
 /// `-userSpaceScaleFactor`: the backing factor, as `NSScreen`'s answers, so a
 /// window and its screen agree.
 unsafe extern "C" fn user_space_scale_factor(receiver: Id, sel: Sel) -> f64 {
@@ -4061,6 +4072,8 @@ pub(crate) fn install() {
         "setStyleMask:" => set_style_mask, c"v24@0:8Q16";
         "setReleasedWhenClosed:" => ignored_flag, c"v20@0:8c16";
         "isOpaque" => yes, c"c16@0:8";
+        "backingType" => backing_type, c"Q16@0:8";
+        "setBackingType:" => set_backing_type, c"v24@0:8Q16";
         "setOpaque:" => ignored_flag, c"v20@0:8c16";
         "setHidesOnDeactivate:" => set_hides_on_deactivate, c"v20@0:8c16";
         "hidesOnDeactivate" => hides_on_deactivate, c"c16@0:8";
