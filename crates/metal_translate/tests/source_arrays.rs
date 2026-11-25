@@ -92,3 +92,17 @@ fn bool_arrays_bind_to_array_references() {
         translate_msl(&source, &TargetProfile::vulkan_1_3()).unwrap();
     }
 }
+
+#[test]
+fn a_metal_array_member_is_the_c_array_it_spells() {
+    let spelled = |member: &str| {
+        format!(
+            "struct U {{ float4 x; {member}; }};
+            fragment float4 probe(constant U& u [[buffer(0)]]) {{ return u.a[1] + u.x; }}"
+        )
+    };
+    let target = TargetProfile::vulkan_1_3();
+    let template = translate_msl(&spelled("array<float4, 2> a"), &target).unwrap();
+    let c_array = translate_msl(&spelled("float4 a[2]"), &target).unwrap();
+    assert_eq!(template.entries[0].words, c_array.entries[0].words);
+}

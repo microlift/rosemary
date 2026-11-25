@@ -795,6 +795,7 @@ impl Parser<'_> {
                     || self.struct_named(word).is_some()
                     || self.aliases.contains_key(word)
                     || self.array_templates.contains(word)
+                    || (word == "array" && matches!(self.peek_at(1), Some(Kind::Punct("<"))))
                     || self.type_params.contains(word)
                     || standard_struct_fields(word, 0).is_some()
             }
@@ -897,7 +898,9 @@ impl Parser<'_> {
         if self.type_params.contains(&word) {
             return Ok(Ty::Param(word));
         }
-        if self.array_templates.contains(&word) {
+        // `metal::array<T, N>` is laid out and indexed as `T[N]`, as an
+        // array wrapper template is.
+        if self.array_templates.contains(&word) || (word == "array" && self.is_punct("<")) {
             self.expect("<")?;
             let element = self.ty()?;
             self.expect(",")?;
