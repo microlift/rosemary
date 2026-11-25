@@ -20,25 +20,15 @@ pub(crate) use crate::objc::send as objc;
 use draw::{DrawList, color};
 use panel::Model;
 
-/// Whether the overlay is switched on at all.
+/// Whether `ROSEMARY_GUI` switched the overlay on.
 ///
-/// Never under `ROSEMARY_OBJC=builtin`. Every class this module reaches -
-/// `NSEvent`, `MTLRenderPassDescriptor`, `NSString` - is the *host's*, found by
-/// name through [`objc::class`], which now looks in whichever runtime is
-/// selected. With the builtin one selected it would find none of them, and any
-/// it did find would be a foreign object handed to a runtime that would read it
-/// as its own.
+/// Off unless asked for: arming it hooks every present and takes the shift+F6
+/// through shift+F10 keystrokes away from the guest.
 pub fn enabled() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| {
-        if crate::objc::host::backend() != crate::objc::host::Backend::Native {
-            return false;
-        }
-        !matches!(
-            std::env::var("ROSEMARY_GUI").as_deref().map(str::trim),
-            Ok("0" | "no" | "off" | "false"),
-        )
-    })
+    #[static_init::dynamic]
+    static ON: bool = std::env::var("ROSEMARY_GUI")
+        .is_ok_and(|value| !matches!(value.trim(), "" | "0" | "no" | "off" | "false"));
+    *ON
 }
 
 /// Whether the present hooks should do anything.
@@ -62,6 +52,7 @@ pub fn install() {
     }
     let _errno = crate::thread::Errno::now();
     hotkey::install();
+    input::install();
     ARMED.store(true, Relaxed);
     // The panel, open from the first frame, without a keystroke. This exists to
     // **take the hotkeys out of the question**.

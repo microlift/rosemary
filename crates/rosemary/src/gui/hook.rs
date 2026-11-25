@@ -144,15 +144,21 @@ pub fn before_send(sel: u64, receiver: u64, argument: u64) {
     }
 }
 
+/// Draw the overlay over the frame a `CGLFlushDrawable` of `context` is about to
+/// show, if it is armed.
+pub fn before_flush(context: *mut std::ffi::c_void) {
+    if super::armed() {
+        super::guarded(|| super::gl::present(context as usize));
+    }
+}
+
 /// `CGLError CGLFlushDrawable(CGLContextObj ctx)`, counting the frame and
 /// drawing the overlay over it.
 unsafe extern "C" fn flush_drawable(context: *mut std::ffi::c_void) -> i32 {
     // As in [`before_send`]: the frame is counted whether or not the overlay is
     // drawing on it.
     crate::stats::record_frame();
-    if super::armed() {
-        super::guarded(|| super::gl::present(context as usize));
-    }
+    before_flush(context);
     let Ok(host) = target() else {
         // Unreachable: both an exit and an inlined call ask `target` first.
         eprintln!("rosemary: fatal: CGLFlushDrawable was reached with no host function");
@@ -175,8 +181,8 @@ fn target() -> Result<u64> {
 pub fn function_for(name: &str) -> Option<Function> {
     match name {
         // Installed even with the overlay off, because it is also where a frame
-        // is counted on the CGL path. The builtin frameworks count theirs in
-        // [`crate::shims::opengl`] and have no native overlay to draw.
+        // is counted on the CGL path. Under the builtin frameworks the shim is
+        // [`crate::shims::opengl`]'s, which calls [`before_flush`] itself.
         "CGLFlushDrawable" if !crate::frameworks::using_builtin() => {
             Function::new(name, flush_drawable as *const () as u64, target)
         }

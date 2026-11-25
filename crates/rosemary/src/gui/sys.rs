@@ -28,21 +28,39 @@ fn load_frameworks() {
     });
 }
 
-/// A host function by name, or `None` if this system does not export it.
+/// A function or variable by C name, from the frameworks this process selected,
+/// or `None` if they do not define it.
+///
+/// Under `builtin` the guest's objects are this tree's, so the answer must come
+/// from this tree's frameworks and libSystem: a host framework handed one of them
+/// would read a foreign structure as its own.
 pub fn symbol(name: &str) -> Option<*mut c_void> {
-    let c = CString::new(name).ok()?;
-    // SAFETY: `RTLD_DEFAULT` is a valid pseudo-handle, `c` outlives the call,
-    // and a name the process does not export comes back null, which is checked.
-    let found = unsafe { libc::dlsym(libc::RTLD_DEFAULT, c.as_ptr()) };
-    if !found.is_null() {
-        return Some(found);
-    }
-    load_frameworks();
-    let found = unsafe { libc::dlsym(libc::RTLD_DEFAULT, c.as_ptr()) };
-    (!found.is_null()).then_some(found)
+    let found = match crate::frameworks::using_builtin() {
+        true => builtin_symbol(name),
+        false => host_symbol(name),
+    };
+    found.map(|addr| addr as usize as *mut c_void)
 }
 
-/// A host function as a typed pointer, or `None`.
+fn builtin_symbol(name: &str) -> Option<u64> {
+    let mangled = format!("_{name}");
+    crate::frameworks::symbol(name)
+        .or_else(|| crate::dyld::libsystem_symbol(name))
+        .or_else(|| {
+            crate::objc::host::block_data()
+                .into_iter()
+                .find_map(|(symbol, addr)| (symbol == mangled).then_some(addr))
+        })
+}
+
+fn host_symbol(name: &str) -> Option<u64> {
+    crate::host::symbol(name).or_else(|| {
+        load_frameworks();
+        crate::host::symbol(name)
+    })
+}
+
+/// [`symbol`] as a typed function pointer, or `None`.
 ///
 /// # Safety
 ///

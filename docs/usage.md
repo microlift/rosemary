@@ -101,6 +101,7 @@ ROSEMARY_DESKTOP=1600x900 rosemary desktop --foreground
 | --- | ------- | ----------- |
 | `ROSEMARY_OBJC` | `native` (macOS), `builtin` (other) | Set the Objective-C runtime implementation to use. On Linux, there is only `builtin`. On macOS, `native` uses the real Objective-C, and `builtin` uses the compatibility implementation which can only talk to cross platform reimplementations. `native` yields better compatibility and performance, so use it if you can. It is only recommended you use `builtin` if you are differentially testing, or working upon the compatibility layer from a real macOS system. Make sure that if you're on macOS you also set `ROSEMARY_BUNDLED=1`. |
 | `ROSEMARY_BUNDLED` | `0` | (macOS only) - determines if Rosemary should re-execute from a virtual repackage of the application. Makes the real Objective-C runtime recognize plist registrations, unnecessary with `builtin` (and possibly problematic). |
+| `ROSEMARY_GUI` | `0` | (macOS only) Turn on the built in GUI and its hotkeys. See the GUI section. `ROSEMARY_GUI_OPEN=1` also shows it from the first frame. |
 | `ROSEMARY_LIBC` | `native` (macOS), `builtin` (other) | Select the libc shim implementation for guest imports. Guest-aware default modules remain active in both modes. |
 | `ROSEMARY_DEAD_FLAGS` | `0` | Enable Microlift's dead flag elimination pass. Improves performance in some applications, but not by a wide enough margin. **May have semantic accuracy bugs, use with extreme caution**. |
 | `ROSEMARY_TSO` | `1` (non-x86 hosts), `0` (x86 hosts) | Fence guest memory accesses so an AArch64 host keeps x86's total store order. Without it, lock-free guest code that publishes data with plain stores (Mono's class setup, for one) can see another thread's writes out of order; Subnautica aborts in Mono on `ac->rank` while loading the world. Where the host can run a thread under total store order in hardware (Apple silicon on an Asahi Linux kernel with `PR_SET_MEM_MODEL`), every guest thread does so and no fences are emitted; otherwise it costs a `dmb` on most guest memory accesses. macOS offers no way to ask for the hardware mode outside Rosetta. |
@@ -238,7 +239,7 @@ see which one is wrong.
 
 ## GUI
 
-On macOS with native Objective C, Rosemary has a built in GUI that can be toggled with `SHIFT` + `F7`. This GUI shows the framerate of the application, and has various profiling utilities built in, useful for narrowing down performance bottlenecks.
+On macOS, Rosemary has a built in GUI drawn over the guest's Metal or OpenGL frames, with either Objective-C runtime. It is off unless `ROSEMARY_GUI=1` is set; once on, `SHIFT` + `F7` shows or hides it. It shows the framerate of the application and has various profiling utilities built in, useful for narrowing down performance bottlenecks. `SHIFT` + `F8` gives it the mouse, and `SHIFT` + `F6`, `F9` and `F10` start an Instruments recording, region-entry counting and sampling. Under `ROSEMARY_OBJC=builtin` the hotkeys arrive only while the guest's window has the keyboard.
 
 ## Execution modes
 

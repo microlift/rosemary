@@ -2,11 +2,12 @@ use std::ffi::c_void;
 
 use crate::abi::Result;
 
-/// `CGLError CGLFlushDrawable(CGLContextObj ctx)`, counting the frame.
-///
-/// Compatibility handles are never passed to the native overlay.
+/// `CGLError CGLFlushDrawable(CGLContextObj ctx)`, counting the frame and
+/// drawing the overlay over it.
 unsafe extern "C" fn flush_drawable(context: *mut c_void) -> i32 {
     crate::stats::record_frame();
+    #[cfg(target_os = "macos")]
+    crate::gui::hook::before_flush(context);
     // SAFETY: the caller's own context, passed through as `CGLFlushDrawable`
     // takes it.
     unsafe { appkit::opengl::CGLFlushDrawable(context) }

@@ -14,8 +14,8 @@ const TYPE_KEY_DOWN: u64 = 10;
 const TYPE_SCROLL_WHEEL: u64 = 22;
 
 /// The events the monitor asks for: the pointer, the press-drag-release that
-/// moves windows about, a wheel for their contents, and keys for the one text
-/// box the overlay has.
+/// moves windows about, a wheel for their contents, and keys for the hotkeys and
+/// the one text box the overlay has.
 const MASK: u64 = (1 << TYPE_LEFT_MOUSE_DOWN)
     | (1 << TYPE_LEFT_MOUSE_UP)
     | (1 << TYPE_MOUSE_MOVED)
@@ -137,11 +137,11 @@ pub fn set_row_height(pixels: f32) {
 ///
 /// Returns the event to let it through, or nil to swallow it. Never unwinds.
 extern "C" fn on_event(_block: *mut c_void, event: Id) -> Id {
-    if event.is_null() || !focused() {
+    if event.is_null() {
         return event;
     }
     let mut consumed = false;
-    super::guarded(|| consumed = handle(event));
+    super::guarded(|| consumed = hot_key(event) || (focused() && handle(event)));
     match consumed {
         true => std::ptr::null_mut(),
         false => event,
@@ -200,6 +200,34 @@ fn typed(event: Id) -> Vec<u8> {
         }
         std::ffi::CStr::from_ptr(bytes).to_bytes().to_vec()
     }
+}
+
+/// Act on `event` if it is a hot key. Returns whether it was one.
+///
+/// The only route under the builtin frameworks, which have neither Carbon hot
+/// keys nor a window server whose key state could be polled.
+fn hot_key(event: Id) -> bool {
+    let sel = super::objc::sel;
+    // SAFETY: `-type`, `-isARepeat`, `-keyCode` and `-modifierFlags` are
+    // `NSEvent`'s, take nothing, and return an `NSEventType`, a `BOOL`, an
+    // `unsigned short` and an `NSEventModifierFlags`. The last three are asked
+    // only of a key-down event, which is the one kind they are defined on.
+    let key = unsafe {
+        if send0::<u64>(event, sel("type")) != TYPE_KEY_DOWN
+            || send0::<u8>(event, sel("isARepeat")) != 0
+        {
+            return false;
+        }
+        let code = send0::<u16>(event, sel("keyCode"));
+        let modifiers = send0::<u64>(event, sel("modifierFlags"));
+        super::hotkey::Key::from_key_event(code, modifiers)
+    };
+    let Some(key) = key else {
+        return false;
+    };
+    super::hotkey::delivered("the NSEvent monitor");
+    super::pressed(key);
+    true
 }
 
 /// Act on one event. Returns whether the guest should be denied it.
@@ -296,9 +324,11 @@ fn handle(event: Id) -> bool {
     }
 }
 
+/// Whether the monitor is in, or on its way in from the main queue.
+static ASKED: AtomicBool = AtomicBool::new(false);
+
 /// Put the monitor in, once, from the main thread.
-fn install() {
-    static ASKED: AtomicBool = AtomicBool::new(false);
+pub fn install() {
     if ASKED.swap(true, Relaxed) {
         return;
     }
@@ -313,6 +343,7 @@ fn install() {
         )
     }) else {
         super::say_once("no libdispatch: the overlay cannot take the mouse");
+        ASKED.store(false, Relaxed);
         return;
     };
     // SAFETY: a real queue and an `extern "C"` function of the right shape. The
@@ -325,7 +356,11 @@ extern "C" fn install_on_main(_context: *mut c_void) {
     super::guarded(|| {
         let class = super::objc::class("NSEvent");
         if class.is_null() {
-            super::say_once("no NSEvent: this guest has not loaded AppKit, so there is no mouse");
+            super::say_once(
+                "no NSEvent: this guest has not loaded AppKit yet, so there is no mouse; \
+                 shift+F8 asks again",
+            );
+            ASKED.store(false, Relaxed);
             return;
         }
         let descriptor = Box::leak(Box::new(Descriptor {
@@ -357,11 +392,8 @@ extern "C" fn install_on_main(_context: *mut c_void) {
                 block,
             )
         };
-        match monitor.is_null() {
-            true => super::say_once("AppKit refused the overlay's mouse monitor"),
-            false => eprintln!(
-                "rosemary: gui  the overlay has the mouse: scroll to scroll, drag to move"
-            ),
+        if monitor.is_null() {
+            super::say_once("AppKit refused the overlay's event monitor");
         }
     });
 }
