@@ -90,6 +90,10 @@ There are two Objective-C runtime implementations, selected by `ROSEMARY_OBJC`:
 finalized-object quarantine, refcount/weak-slot/autorelease/selector/class-handle validation); it requires
 `ROSEMARY_OBJC=builtin` and is a diagnostic tool, not for normal use.
 
+It is highly recommended that if you are using `ROSEMARY_OBJC=builtin` on macOS that you pair it with a prefix,
+via `ROSEMARY_PREFIX=...`. While code is generally designed to be portable across prefixed and unprefixed modes,
+macOS security restrictions sometimes forbid certain Rosemary functionalities out of prefix.
+
 ### ABI bridging
 
 Guest imports are declared with an ABI signature in `crates/rosemary/src/abi/table.rs` — never guess an unknown
