@@ -169,6 +169,25 @@ unsafe extern "C" fn locale_identifier(_receiver: Id, _sel: Sel) -> Id {
     autoreleased(&identifier())
 }
 
+unsafe extern "C" fn language_code(_receiver: Id, _sel: Sel) -> Id {
+    autoreleased(&language())
+}
+
+/// `-countryCode`, and `-regionCode`, its newer spelling.
+unsafe extern "C" fn country_code_property(_receiver: Id, _sel: Sel) -> Id {
+    autoreleased(&country())
+}
+
+/// `-scriptCode` and `-variantCode`: the environment's locale name carries
+/// neither, and nil is a locale's answer for a component it has no value for.
+unsafe extern "C" fn absent_component(_receiver: Id, _sel: Sel) -> Id {
+    std::ptr::null_mut()
+}
+
+unsafe extern "C" fn uses_metric_system(_receiver: Id, _sel: Sel) -> bool {
+    uses_metric()
+}
+
 fn autoreleased(text: &str) -> Id {
     let string = crate::string::from_str(text);
     // SAFETY: a fresh object.
@@ -351,6 +370,12 @@ pub(crate) fn install() {
     methods!(class, {
         "objectForKey:" => object_for_key, c"@24@0:8@16";
         "localeIdentifier" => locale_identifier, c"@16@0:8";
+        "languageCode" => language_code, c"@16@0:8";
+        "countryCode" => country_code_property, c"@16@0:8";
+        "regionCode" => country_code_property, c"@16@0:8";
+        "scriptCode" => absent_component, c"@16@0:8";
+        "variantCode" => absent_component, c"@16@0:8";
+        "usesMetricSystem" => uses_metric_system, c"B16@0:8";
         "displayNameForKey:value:" => display_name_for_key, c"@32@0:8@16@24";
     });
 }
