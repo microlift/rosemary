@@ -13,6 +13,10 @@ mod linux {
     pub const IP_OPTIONS: i32 = 4;
     pub const IP_RECVOPTS: i32 = 6;
     pub const IP_PKTINFO: Option<i32> = Some(libc::IP_PKTINFO);
+    /// No `IP_RECVIF`: `IP_PKTINFO`'s interface index stands in for it; see
+    /// `sockopt::interface`.
+    pub const IP_RECVIF: Option<i32> = None;
+    pub const IPV6_2292PKTINFO: Option<i32> = Some(libc::IPV6_2292PKTINFO);
     pub const IP_RECVTOS: i32 = libc::IP_RECVTOS;
     /// A received TOS arrives under the send-side name.
     pub const IP_TOS_MESSAGE: i32 = libc::IP_TOS;
@@ -43,6 +47,10 @@ mod freebsd {
     /// of which fills Darwin's `struct in_pktinfo`, so the option is refused
     /// rather than aimed at something that answers in a different shape.
     pub const IP_PKTINFO: Option<i32> = None;
+    /// Darwin's own option, answering with the same `sockaddr_dl` header.
+    pub const IP_RECVIF: Option<i32> = Some(libc::IP_RECVIF);
+    /// Not declared for FreeBSD by the `libc` crate; refused rather than assumed.
+    pub const IPV6_2292PKTINFO: Option<i32> = None;
     pub const IP_RECVTOS: i32 = libc::IP_RECVTOS;
     pub const IP_TOS_MESSAGE: i32 = libc::IP_RECVTOS;
     pub const IPV6_JOIN_GROUP: i32 = libc::IPV6_JOIN_GROUP;
@@ -68,6 +76,8 @@ mod macos {
     pub const IP_OPTIONS: i32 = 1;
     pub const IP_RECVOPTS: i32 = 5;
     pub const IP_PKTINFO: Option<i32> = Some(26);
+    pub const IP_RECVIF: Option<i32> = Some(20);
+    pub const IPV6_2292PKTINFO: Option<i32> = Some(19);
     pub const IP_RECVTOS: i32 = 27;
     pub const IP_TOS_MESSAGE: i32 = IP_RECVTOS;
     pub const IPV6_JOIN_GROUP: i32 = 12;

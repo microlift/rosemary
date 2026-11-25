@@ -83,8 +83,26 @@ unsafe fn once_with(predicate: *mut c_void, body: impl FnOnce()) {
     state.store(DONE, Ordering::Release);
 }
 
+/// Set in a `fork` child whose parent had threads other than the forking one.
+static FORK_OF_MULTITHREADED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Record, in a `fork` child, how many threads its parent had.
+pub fn forked(parent_threads: usize) {
+    FORK_OF_MULTITHREADED.store(parent_threads > 1, Ordering::Relaxed);
+}
+
+/// `bool _dispatch_is_fork_of_multithreaded_parent(void)`: whether this
+/// process is a `fork` child whose parent's other threads may have held locks
+/// and queues it now has copies of, which only `exec` makes safe again.
+extern "C" fn is_fork_of_multithreaded_parent() -> bool {
+    FORK_OF_MULTITHREADED.load(Ordering::Relaxed)
+}
+
 exports::exports! {
     functions {
+        // Its own underscore, in addition to Mach-O's.
+        "_dispatch_is_fork_of_multithreaded_parent" => is_fork_of_multithreaded_parent,
         "dispatch_queue_create" => queue::queue_create,
         "dispatch_queue_create_with_target" => queue::queue_create_with_target,
         "dispatch_queue_get_label" => queue::queue_get_label,

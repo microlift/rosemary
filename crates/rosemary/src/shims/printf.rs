@@ -926,6 +926,30 @@ pub fn syslog(symbol: &str, ctx: &mut RegisterContext, mem: &mut dyn GuestMemory
     Ok(())
 }
 
+/// `void _os_log_internal(void *dso, os_log_t, os_log_type_t, const char *, ...)`,
+/// which the open-source `<os/log.h>` calls: rendered as `darwin::oslog`
+/// renders the native form, through the same writer. Off Darwin only: a Mac's
+/// own logging answers there.
+#[cfg(not(target_os = "macos"))]
+pub fn os_log_internal(
+    symbol: &str,
+    ctx: &mut RegisterContext,
+    mem: &mut dyn GuestMemory,
+) -> Result<()> {
+    if ctx.rcx == 0 {
+        return Err(bad_pointer(symbol, 0));
+    }
+    let format = darwin::oslog::plain_format(&mem.read_cstr(ctx.rcx, symbol)?);
+    let mut args = VarArgs::new(symbol, ctx, &*mem, 4);
+    let out = render(&format, &mut args)?;
+    darwin::oslog::emit(
+        ctx.rsi as *const core::ffi::c_void,
+        ctx.rdx as u8,
+        &String::from_utf8_lossy(&out),
+    );
+    Ok(())
+}
+
 /// `int asl_log(aslclient, aslmsg, int level, const char *format, ...)`, sent to the
 /// host's logger as `syslog` would be: ASL's levels are syslog's priorities.
 pub fn asl_log(symbol: &str, ctx: &mut RegisterContext, mem: &mut dyn GuestMemory) -> Result<()> {

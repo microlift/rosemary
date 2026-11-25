@@ -14,7 +14,7 @@ pub(crate) unsafe extern "C" fn dup(fd: i32) -> i32 {
     // SAFETY: an integer descriptor; the call touches no caller memory.
     let copied = unsafe { libc::dup(fd) };
     if copied >= 0 {
-        super::sockopt::inherit_sigpipe_suppression(fd, copied);
+        super::sockopt::inherit(fd, copied);
         crate::kqueue::duplicate(fd, copied);
     }
     copied
@@ -29,7 +29,7 @@ pub(crate) unsafe extern "C" fn dup2(from: i32, to: i32) -> i32 {
         crate::attrlist::forget(to);
     }
     if copied >= 0 {
-        super::sockopt::inherit_sigpipe_suppression(from, copied);
+        super::sockopt::inherit(from, copied);
         crate::kqueue::duplicate(from, copied);
     }
     copied

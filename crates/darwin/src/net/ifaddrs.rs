@@ -212,6 +212,42 @@ unsafe fn node_from_host(host: &libc::ifaddrs) -> Option<*mut IfAddrs> {
 
 /// `int getifaddrs(struct ifaddrs **)`
 ///
+/// The Darwin `sockaddr_dl` of the interface numbered `index`: the link record
+/// `getifaddrs` lists for it, which is what Darwin's `IP_RECVIF` hands a
+/// receiver. `None` for an index no interface has.
+pub fn link_of_index(index: u32) -> Option<Vec<u8>> {
+    let mut list: *mut libc::ifaddrs = core::ptr::null_mut();
+    // SAFETY: a live slot this function owns.
+    if index == 0 || unsafe { libc::getifaddrs(&mut list) } != 0 {
+        return None;
+    }
+    let mut found = None;
+    let mut at = list;
+    while !at.is_null() && found.is_none() {
+        // SAFETY: a node of the list the host just returned.
+        let host = unsafe { &*at };
+        // SAFETY: the host's own address, which it says is live.
+        if !host.ifa_addr.is_null() && unsafe { host::is_link(host.ifa_addr.cast()) } {
+            // SAFETY: `is_link` just said this is one.
+            let link = unsafe { host::link_from_host(host.ifa_addr.cast()) };
+            if link.index == index {
+                // SAFETY: the host's NUL-terminated name.
+                let name = unsafe { CStr::from_ptr(host.ifa_name) }.to_bytes_with_nul();
+                let (address, len) = link_address(name, index, host.ifa_flags, Some(&link));
+                let mut bytes = vec![address.len, address.family];
+                bytes.extend_from_slice(&address.data);
+                bytes.truncate(len);
+                found = Some(bytes);
+            }
+        }
+        // SAFETY: as above.
+        at = unsafe { (*at).ifa_next };
+    }
+    // SAFETY: the host's list, read to the end or to the match.
+    unsafe { libc::freeifaddrs(list) };
+    found
+}
+
 /// # Safety
 ///
 /// `out` is a writable pointer slot.

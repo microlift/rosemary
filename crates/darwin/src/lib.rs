@@ -84,7 +84,7 @@ pub mod malloc;
 pub mod math;
 pub mod modes;
 pub mod net;
-mod oslog;
+pub mod oslog;
 pub mod pam;
 pub mod passthrough;
 pub mod passwd;
@@ -137,6 +137,7 @@ pub mod wait;
 mod wait_word;
 pub mod xattr;
 pub mod xlocale;
+pub mod xpc;
 
 /// The environment a guest's `main` receives as `envp`, as `NAME=VALUE`.
 ///
@@ -399,6 +400,7 @@ static SHARED_MODULES: &[exports::Module] = &[
     printf_l::MODULE,
     sprintf::MODULE,
     strfmt::MODULE,
+    xpc::MODULE,
 ];
 
 /// Builtin modules whose guest exports are not yet ported to macOS.
@@ -516,6 +518,7 @@ pub const LIBRARY_NAMES: &[&str] = &[
     "/usr/lib/system/libsystem_malloc.dylib",
     "/usr/lib/system/libsystem_platform.dylib",
     "/usr/lib/system/libsystem_pthread.dylib",
+    "/usr/lib/system/libxpc.dylib",
     // An umbrella over libSystem, which is what a program that loads it as a
     // bundle to look up `free` or `malloc` by name expects to find there.
     "/System/Library/Frameworks/System.framework/Versions/B/System",
@@ -524,12 +527,14 @@ pub const LIBRARY_NAMES: &[&str] = &[
 
 /// Where a MiniDarwin base keeps `libcopyfile`.
 const COPYFILE: &str = "/usr/lib/libcopyfile.dylib";
+/// configd's client library, which libresolv asks for the DNS configuration.
+const SYSTEM_CONFIGURATION: &str = "/usr/lib/system/libsystem_configuration.dylib";
 
-/// The real images [`LIBRARY_NAMES`] re-exports: libSystem's `libcopyfile` is
-/// the base's, Apple's own built against this crate. A native libc has its own.
+/// The real images [`LIBRARY_NAMES`] re-exports: Apple's own, from the base,
+/// built against this crate. A native libc has its own.
 pub fn reexports() -> &'static [&'static str] {
     match libc_backend::using_builtin() {
-        true => &[COPYFILE],
+        true => &[COPYFILE, SYSTEM_CONFIGURATION],
         false => &[],
     }
 }
@@ -597,9 +602,14 @@ mod tests {
         }
         assert_eq!(is_implemented("_kevent"), builtin);
         assert_eq!(published(&lib, "_kevent").is_some(), builtin);
-        // The real libcopyfile, in place of one of this crate's.
+        // The real libcopyfile and libsystem_configuration, in place of any
+        // of this crate's.
         let reexported = lib.reexports("/usr/lib/libSystem.B.dylib");
-        assert_eq!(reexported == [COPYFILE], builtin, "{reexported:?}");
+        assert_eq!(
+            reexported == [COPYFILE, SYSTEM_CONFIGURATION],
+            builtin,
+            "{reexported:?}"
+        );
         assert!(is_implemented("_sysctl"));
         for name in [
             "_clock_gettime",

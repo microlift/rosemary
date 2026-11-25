@@ -246,11 +246,13 @@ pub fn name_thread(name: &str) {
 /// anything, which a daemonising child usually does not.
 unsafe extern "C" fn fork() -> libc::pid_t {
     let _host = crate::syscall::ScopedHostSyscallContext::new();
+    let threads = starnix::process::threads(starnix::process::me()).map_or(0, |t| t.len());
     // SAFETY: the host's `fork`; the server's lock is held across it by the
     // client's own `pthread_atfork` handlers.
     let child = unsafe { libc::fork() };
     if child == 0 {
         server::client::forked();
+        crate::dispatch::forked(threads);
     }
     child
 }

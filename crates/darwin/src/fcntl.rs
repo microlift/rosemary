@@ -304,7 +304,7 @@ unsafe fn getpath(fd: libc::c_int, out: *mut libc::c_char) -> libc::c_int {
 /// State this crate keeps per descriptor follows a successful `F_DUPFD*` copy.
 fn duplicated(fd: libc::c_int, command: libc::c_int, rc: libc::c_int) {
     if rc >= 0 && matches!(command, cmd::F_DUPFD | cmd::F_DUPFD_CLOEXEC) {
-        crate::net::sockopt::inherit_sigpipe_suppression(fd, rc);
+        crate::net::sockopt::inherit(fd, rc);
         crate::kqueue::duplicate(fd, rc);
     }
 }

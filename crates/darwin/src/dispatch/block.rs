@@ -64,6 +64,48 @@ pub unsafe fn invoke(block: u64) {
     unsafe { std::mem::transmute::<u64, extern "C" fn(u64)>(entry)(block) };
 }
 
+/// Call a block taking one pointer-sized argument, as XPC's handlers do.
+///
+/// # Safety
+///
+/// As [`invoke`], for a block whose `invoke` is a `void (*)(void *, T)` with a
+/// pointer-sized `T`.
+pub unsafe fn invoke_with(block: u64, argument: u64) {
+    if block == 0 {
+        return;
+    }
+    // SAFETY: the caller's guarantee; `invoke` is at a fixed offset by the Block ABI.
+    let entry = unsafe { ((block + INVOKE_OFFSET) as *const u64).read() };
+    if entry == 0 {
+        return;
+    }
+    // SAFETY: the signature the caller vouches for.
+    unsafe { std::mem::transmute::<u64, extern "C" fn(u64, u64)>(entry)(block, argument) };
+}
+
+/// Call a block taking two pointer-sized arguments and answering a `bool`, as
+/// `xpc_dictionary_apply`'s and `xpc_array_apply`'s appliers do.
+///
+/// # Safety
+///
+/// As [`invoke`], for a block whose `invoke` is a `bool (*)(void *, A, B)`.
+pub unsafe fn invoke_applier(block: u64, first: u64, second: u64) -> bool {
+    if block == 0 {
+        return false;
+    }
+    // SAFETY: the caller's guarantee; `invoke` is at a fixed offset by the Block ABI.
+    let entry = unsafe { ((block + INVOKE_OFFSET) as *const u64).read() };
+    if entry == 0 {
+        return false;
+    }
+    // SAFETY: the signature the caller vouches for.
+    unsafe {
+        std::mem::transmute::<u64, extern "C" fn(u64, u64, u64) -> bool>(entry)(
+            block, first, second,
+        )
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

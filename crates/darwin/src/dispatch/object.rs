@@ -13,6 +13,8 @@ pub enum Kind {
     Semaphore,
     Data,
     Source,
+    /// An XPC object, which on Darwin is an OS_object like these.
+    Xpc,
 }
 
 /// The header every dispatch object begins with.
@@ -158,6 +160,7 @@ pub unsafe fn release(handle: u64) {
             Kind::Semaphore => drop(Box::from_raw(handle as *mut super::sync::Semaphore)),
             Kind::Data => drop(Box::from_raw(handle as *mut super::data::Data)),
             Kind::Source => drop(Box::from_raw(handle as *mut super::source::Source)),
+            Kind::Xpc => drop(Box::from_raw(handle as *mut crate::xpc::object::Object)),
         }
     }
     if finalizer != 0 && context != 0 {

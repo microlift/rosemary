@@ -10,6 +10,8 @@ pub type Address = u64;
 pub struct Datagram {
     pub bytes: Vec<u8>,
     pub fds: Vec<c_int>,
+    /// The sending process's host pid, where the host's kernel vouches for it.
+    pub sender: Option<i32>,
 }
 
 impl Drop for Datagram {
@@ -552,9 +554,11 @@ pub fn poll_any(fds: &[c_int], timeout_ms: i32) -> Option<usize> {
 
 /// The largest number of rights one message can carry.
 ///
-/// Mach has no such limit; `SCM_RIGHTS` does, and a fixed control buffer is what
-/// keeps the receive path from allocating on a length the sender chose.
-pub const MAX_RIGHTS: usize = 16;
+/// Mach has no such limit; `SCM_RIGHTS` does. Every right but a send-once one
+/// travels with at least one descriptor, so no message carries more rights than
+/// descriptors, and a fixed bound keeps the receive path from allocating on a
+/// count the sender chose.
+pub const MAX_RIGHTS: usize = MAX_FDS;
 
 /// The most descriptors one message can carry, just under the kernel's limit of
 /// 253 for one `SCM_RIGHTS`. A receive right is the port, its listener and the
@@ -682,7 +686,7 @@ fn receive_from(fd: c_int) -> std::io::Result<Option<Datagram>> {
     };
 
     // SAFETY: `msg` was just filled in by `recvmsg`.
-    let Some(fds) = (unsafe { admit(&msg) }) else {
+    let Some((fds, sender)) = (unsafe { admit(&msg) }) else {
         return Ok(None);
     };
 
@@ -697,20 +701,21 @@ fn receive_from(fd: c_int) -> std::io::Result<Option<Datagram>> {
         }
     }
     bytes.truncate(received);
-    Ok(Some(Datagram { bytes, fds }))
+    Ok(Some(Datagram { bytes, fds, sender }))
 }
 
-/// The descriptors in a received control block, or `None` - with every one of
-/// them closed - when the sender may not reach this process's ports.
+/// The descriptors in a received control block and the sender's host pid, or
+/// `None` - with every descriptor closed - when the sender may not reach this
+/// process's ports.
 ///
 /// # Safety
 ///
 /// `msg`'s control block is a well-formed sequence of `cmsghdr`, as `recvmsg`
 /// leaves it, and any `SCM_RIGHTS` in it are descriptors this process owns.
-unsafe fn admit(msg: &libc::msghdr) -> Option<Vec<c_int>> {
+unsafe fn admit(msg: &libc::msghdr) -> Option<(Vec<c_int>, Option<i32>)> {
     let mut fds = Vec::new();
     #[cfg(target_os = "linux")]
-    let mut sender = None;
+    let mut sender: Option<libc::ucred> = None;
     // SAFETY: the caller's control block.
     unsafe {
         let mut cmsg = libc::CMSG_FIRSTHDR(msg);
@@ -729,7 +734,7 @@ unsafe fn admit(msg: &libc::msghdr) -> Option<Vec<c_int>> {
                     if payload >= core::mem::size_of::<libc::ucred>() =>
                 {
                     let credentials = libc::CMSG_DATA(cmsg).cast::<libc::ucred>();
-                    sender = Some(credentials.read_unaligned().uid);
+                    sender = Some(credentials.read_unaligned());
                 }
                 _ => {}
             }
@@ -739,14 +744,17 @@ unsafe fn admit(msg: &libc::msghdr) -> Option<Vec<c_int>> {
     // Missing credentials are refused too: `SO_PASSCRED` is set before the port
     // is bound, so only a truncated control block arrives without them.
     #[cfg(target_os = "linux")]
-    if !sender.is_some_and(same_user) {
+    let Some(sender) = sender.filter(|sender| same_user(sender.uid)) else {
         for fd in fds {
             // SAFETY: a descriptor that just arrived and was never handed on.
             unsafe { libc::close(fd) };
         }
         return None;
-    }
-    Some(fds)
+    };
+    #[cfg(target_os = "linux")]
+    return Some((fds, Some(sender.pid)));
+    #[cfg(not(target_os = "linux"))]
+    Some((fds, None))
 }
 
 #[cfg(test)]
@@ -826,7 +834,7 @@ mod tests {
     /// A control block as `recvmsg` would leave it: `uid`'s credentials, when
     /// given, then `fds` as `SCM_RIGHTS`.
     #[cfg(target_os = "linux")]
-    fn admit_crafted(uid: Option<libc::uid_t>, fds: &[c_int]) -> Option<Vec<c_int>> {
+    fn admit_crafted(uid: Option<libc::uid_t>, fds: &[c_int]) -> Option<(Vec<c_int>, Option<i32>)> {
         let mut control = vec![0u8; receive_control_len()];
         // SAFETY: as in [`send`].
         let mut msg: libc::msghdr = unsafe { core::mem::zeroed() };
@@ -900,7 +908,13 @@ mod tests {
         let fd = open_descriptor();
         // SAFETY: `getuid` cannot fail.
         let admitted = admit_crafted(Some(unsafe { libc::getuid() }), &[fd]);
-        assert_eq!(admitted, Some(vec![fd]));
+        // SAFETY: `getpid` cannot fail.
+        let me = unsafe { libc::getpid() };
+        assert_eq!(
+            admitted,
+            Some((vec![fd], Some(me))),
+            "the rights and the sender"
+        );
         // SAFETY: the descriptor opened above, handed back by `admit`.
         unsafe { libc::close(fd) };
     }
