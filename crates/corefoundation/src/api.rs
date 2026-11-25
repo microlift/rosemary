@@ -1758,6 +1758,95 @@ pub unsafe extern "C" fn CFSetGetTypeID() -> CFTypeID {
     crate::base::type_id_of(collections::set_class())
 }
 
+/// `CFSetRef CFSetCreate(CFAllocatorRef, const void **values, CFIndex count,
+/// const CFSetCallBacks *)`. `CFSetCallBacks` is laid out as
+/// `CFDictionaryKeyCallBacks` is.
+pub unsafe extern "C" fn CFSetCreate(
+    _allocator: CFAllocatorRef,
+    values: *const CFTypeRef,
+    count: CFIndex,
+    callbacks: *const KeyCallBacks,
+) -> CFTypeRef {
+    if count < 0 || (values.is_null() && count > 0) {
+        return std::ptr::null();
+    }
+    // SAFETY: the caller says `values` covers `count` entries.
+    let slice = match count {
+        0 => &[][..],
+        _ => unsafe { std::slice::from_raw_parts(values, count as usize) },
+    };
+    // SAFETY: null, or a live callbacks structure.
+    collections::new_set(slice, unsafe { Policy::from_key(callbacks) })
+}
+
+/// `CFMutableSetRef CFSetCreateMutable(CFAllocatorRef, CFIndex capacity,
+/// const CFSetCallBacks *)`. The capacity is only a hint.
+pub unsafe extern "C" fn CFSetCreateMutable(
+    _allocator: CFAllocatorRef,
+    _capacity: CFIndex,
+    callbacks: *const KeyCallBacks,
+) -> CFTypeRef {
+    // SAFETY: null, or a live callbacks structure.
+    collections::new_set(&[], unsafe { Policy::from_key(callbacks) })
+}
+
+/// A new set of `set`'s members, with its callbacks.
+unsafe fn copy_set(set: CFTypeRef) -> CFTypeRef {
+    let Some(set) = (unsafe { collections::set(set) }) else {
+        return std::ptr::null();
+    };
+    collections::new_set(set.values(), set.policy)
+}
+
+pub unsafe extern "C" fn CFSetCreateCopy(_allocator: CFAllocatorRef, set: CFTypeRef) -> CFTypeRef {
+    unsafe { copy_set(set) }
+}
+
+pub unsafe extern "C" fn CFSetCreateMutableCopy(
+    _allocator: CFAllocatorRef,
+    _capacity: CFIndex,
+    set: CFTypeRef,
+) -> CFTypeRef {
+    unsafe { copy_set(set) }
+}
+
+pub unsafe extern "C" fn CFSetAddValue(set: CFTypeRef, value: CFTypeRef) {
+    if let Some(set) = unsafe { collections::set(set) } {
+        set.insert(value);
+    }
+}
+
+pub unsafe extern "C" fn CFSetRemoveValue(set: CFTypeRef, value: CFTypeRef) {
+    let Some(set) = (unsafe { collections::set(set) }) else {
+        return;
+    };
+    if let Some(removed) = set.remove(value) {
+        set.policy.release(removed);
+    }
+}
+
+pub unsafe extern "C" fn CFSetRemoveAllValues(set: CFTypeRef) {
+    let Some(set) = (unsafe { collections::set(set) }) else {
+        return;
+    };
+    let policy = set.policy;
+    for removed in set.take_all() {
+        policy.release(removed);
+    }
+}
+
+pub unsafe extern "C" fn CFSetContainsValue(set: CFTypeRef, value: CFTypeRef) -> Boolean {
+    unsafe { collections::set(set) }.is_some_and(|set| set.contains(value)) as Boolean
+}
+
+/// `const void *CFSetGetValue(CFSetRef, const void *candidate)`: the member
+/// equal to `candidate`, or null.
+pub unsafe extern "C" fn CFSetGetValue(set: CFTypeRef, value: CFTypeRef) -> CFTypeRef {
+    unsafe { collections::set(set) }
+        .and_then(|set| set.member(value))
+        .unwrap_or(std::ptr::null())
+}
+
 pub unsafe extern "C" fn CFSetGetCount(set: CFTypeRef) -> CFIndex {
     unsafe { collections::set(set) }.map_or(0, |set| set.len() as CFIndex)
 }

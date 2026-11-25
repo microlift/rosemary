@@ -651,6 +651,15 @@ pub static SIGNATURES: &[FunctionAbi] = &[
     cbsig!([1], "CFSetApplyFunction", V, P, P, P),
     sig!("CFSetGetCount", I64, P),
     sig!("CFSetGetValues", V, P, P),
+    sig!("CFSetCreate", P, P, P, I64, P),
+    sig!("CFSetCreateMutable", P, P, I64, P),
+    sig!("CFSetCreateCopy", P, P, P),
+    sig!("CFSetCreateMutableCopy", P, P, I64, P),
+    sig!("CFSetAddValue", V, P, P),
+    sig!("CFSetRemoveValue", V, P, P),
+    sig!("CFSetRemoveAllValues", V, P),
+    sig!("CFSetContainsValue", BOOL, P, P),
+    sig!("CFSetGetValue", P, P, P),
     sig!("CFStringAppendCharacters", V, P, P, I64),
     // `CFComparisonResult` is a `CFIndex`, so a signed doubleword, and
     // `CFStringCompareFlags` is a `CFOptionFlags` - both 64-bit on LP64.
