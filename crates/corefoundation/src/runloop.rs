@@ -1,7 +1,7 @@
 use std::any::TypeId;
 use std::collections::BTreeMap;
 use std::ffi::c_void;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
@@ -76,6 +76,28 @@ pub struct Timer {
     callback: Option<TimerCallback>,
     info: usize,
     valid: AtomicBool,
+    /// `CFRunLoopTimerSetTolerance`'s seconds, as `f64` bits. Only a hint:
+    /// firing on time is always within it.
+    tolerance: AtomicU64,
+    /// The block a `...WithHandler` creation copied, released with the timer.
+    _handler: OwnedBlock,
+}
+
+/// A block copied for the life of its owner.
+pub struct OwnedBlock(usize);
+
+impl OwnedBlock {
+    pub const NONE: OwnedBlock = OwnedBlock(0);
+
+    pub fn new(block: usize) -> Self {
+        OwnedBlock(block)
+    }
+}
+
+impl Drop for OwnedBlock {
+    fn drop(&mut self) {
+        objc::block::release(self.0 as objc::object::Id);
+    }
 }
 
 // SAFETY: as [`Source`].
@@ -94,6 +116,16 @@ impl Timer {
     /// The `info` word the timer was created with.
     pub fn info(&self) -> usize {
         self.info
+    }
+
+    pub fn tolerance(&self) -> f64 {
+        f64::from_bits(self.tolerance.load(Ordering::Relaxed))
+    }
+
+    /// A negative tolerance is no tolerance, as Apple's clamps it.
+    pub fn set_tolerance(&self, seconds: f64) {
+        self.tolerance
+            .store(seconds.max(0.0).to_bits(), Ordering::Relaxed);
     }
 
     /// The repeat interval in seconds, or zero for a one-shot - which is how
@@ -174,6 +206,7 @@ pub struct Observer {
     callback: Option<ObserverCallback>,
     info: usize,
     valid: AtomicBool,
+    _handler: OwnedBlock,
 }
 
 // SAFETY: as [`Source`].
@@ -708,6 +741,18 @@ pub fn new_observer(
     callback: Option<ObserverCallback>,
     info: usize,
 ) -> Arc<Observer> {
+    new_observer_owning(activities, repeats, order, callback, info, OwnedBlock::NONE)
+}
+
+/// [`new_observer`], keeping `handler` alive for as long as the observer is.
+pub fn new_observer_owning(
+    activities: u32,
+    repeats: bool,
+    order: i32,
+    callback: Option<ObserverCallback>,
+    info: usize,
+    handler: OwnedBlock,
+) -> Arc<Observer> {
     let observer = Arc::new(Observer {
         activities,
         repeats,
@@ -715,6 +760,7 @@ pub fn new_observer(
         callback,
         info,
         valid: AtomicBool::new(true),
+        _handler: handler,
     });
     note(Arc::as_ptr(&observer));
     observer
@@ -796,12 +842,25 @@ pub fn new_timer(
     callback: Option<TimerCallback>,
     info: usize,
 ) -> Arc<Timer> {
+    new_timer_owning(after, interval, callback, info, OwnedBlock::NONE)
+}
+
+/// [`new_timer`], keeping `handler` alive for as long as the timer is.
+pub fn new_timer_owning(
+    after: Duration,
+    interval: Option<Duration>,
+    callback: Option<TimerCallback>,
+    info: usize,
+    handler: OwnedBlock,
+) -> Arc<Timer> {
     let timer = Arc::new(Timer {
         next: Mutex::new(Instant::now() + after),
         interval,
         callback,
         info,
         valid: AtomicBool::new(true),
+        tolerance: AtomicU64::new(0),
+        _handler: handler,
     });
     note(Arc::as_ptr(&timer));
     timer

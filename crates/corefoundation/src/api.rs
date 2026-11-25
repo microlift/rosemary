@@ -3361,6 +3361,41 @@ pub unsafe extern "C" fn CFRunLoopObserverCreate(
     ))
 }
 
+/// `CFRunLoopObserverRef CFRunLoopObserverCreateWithHandler(CFAllocatorRef,
+/// CFOptionFlags activities, Boolean repeats, CFIndex order,
+/// void (^)(CFRunLoopObserverRef, CFRunLoopActivity))`
+pub unsafe extern "C" fn CFRunLoopObserverCreateWithHandler(
+    _allocator: CFAllocatorRef,
+    activities: u32,
+    repeats: Boolean,
+    order: CFIndex,
+    block: CFTypeRef,
+) -> CFTypeRef {
+    let block = objc::block::copy(block as objc::object::Id) as usize;
+    leak(runloop::new_observer_owning(
+        activities,
+        repeats != 0,
+        order as i32,
+        (block != 0).then_some(observer_handler as runloop::ObserverCallback),
+        block,
+        runloop::OwnedBlock::new(block),
+    ))
+}
+
+/// Run the block a `...WithHandler` observer was made with, which is its `info`.
+unsafe extern "C" fn observer_handler(observer: CFTypeRef, activity: u32, block: *mut c_void) {
+    let block = block as objc::object::Id;
+    // SAFETY: a `void (^)(CFRunLoopObserverRef, CFRunLoopActivity)` the observer
+    // owns, whose `invoke` takes the block and then the block's arguments.
+    unsafe {
+        if let Some(invoke) = objc::block::invoke(block) {
+            let f: unsafe extern "C" fn(objc::object::Id, CFTypeRef, usize) =
+                std::mem::transmute(invoke);
+            f(block, observer, activity as usize);
+        }
+    }
+}
+
 /// `CFRunLoopObserverContext`, of which only `info` is read.
 #[repr(C)]
 pub struct CFRunLoopObserverContext {
@@ -3532,6 +3567,50 @@ pub unsafe extern "C" fn CFRunLoopTimerCreate(
         callback,
         info,
     ))
+}
+
+/// `CFRunLoopTimerRef CFRunLoopTimerCreateWithHandler(CFAllocatorRef,
+/// CFAbsoluteTime fireDate, CFTimeInterval interval, CFOptionFlags, CFIndex order,
+/// void (^)(CFRunLoopTimerRef))`
+pub unsafe extern "C" fn CFRunLoopTimerCreateWithHandler(
+    _allocator: CFAllocatorRef,
+    fire_date: f64,
+    interval: f64,
+    _flags: u32,
+    _order: CFIndex,
+    block: CFTypeRef,
+) -> CFTypeRef {
+    let block = objc::block::copy(block as objc::object::Id) as usize;
+    let repeat = (interval > 0.0).then(|| Duration::from_secs_f64(interval.min(1e9)));
+    leak(runloop::new_timer_owning(
+        delay_until(fire_date),
+        repeat,
+        (block != 0).then_some(timer_handler as runloop::TimerCallback),
+        block,
+        runloop::OwnedBlock::new(block),
+    ))
+}
+
+/// Run the block a `...WithHandler` timer was made with, which is its `info`.
+unsafe extern "C" fn timer_handler(timer: CFTypeRef, block: *mut c_void) {
+    let block = block as objc::object::Id;
+    // SAFETY: a `void (^)(CFRunLoopTimerRef)` the timer owns.
+    unsafe {
+        if let Some(invoke) = objc::block::invoke(block) {
+            let f: unsafe extern "C" fn(objc::object::Id, CFTypeRef) = std::mem::transmute(invoke);
+            f(block, timer);
+        }
+    }
+}
+
+pub unsafe extern "C" fn CFRunLoopTimerGetTolerance(timer: CFTypeRef) -> CFTimeInterval {
+    unsafe { borrow::<Timer>(timer) }.map_or(0.0, |t| t.tolerance())
+}
+
+pub unsafe extern "C" fn CFRunLoopTimerSetTolerance(timer: CFTypeRef, tolerance: CFTimeInterval) {
+    if let Some(t) = unsafe { borrow::<Timer>(timer) } {
+        t.set_tolerance(tolerance);
+    }
 }
 
 pub unsafe extern "C" fn CFRunLoopAddTimer(loop_: CFTypeRef, timer: CFTypeRef, mode: CFTypeRef) {
